@@ -164,7 +164,51 @@ struct SolverParams
     uint32_t numSlabs;
     uint32_t numTotalBodies;
     uint32_t bodyOffset;
+    uint32_t totalBodyCount;
+    uint32_t deltaVOffset;
+    uint32_t outputOffsetIndex;
+    uint32_t numSolverBodies;
+    uint32_t averageOutputOffsets;
 };
+
+struct ThresholdElement
+{
+    uint64_t shapeInteraction;
+    float normalForce;
+    float threshold;
+    uint64_t nodeIndexA;
+    uint64_t nodeIndexB;
+    float accumulatedForce;
+    uint32_t pad;
+};
+static_assert(sizeof(ThresholdElement) == 40, "ThresholdStreamElement mirror");
+
+struct ConstraintWriteback
+{
+    Float4 linearImpulse_broken;
+    Float4 angularImpulse_residual;
+};
+
+struct FrictionPatchGPU
+{
+    Float3 points[2];
+    Float3 impulses[2];
+    uint32_t anchors;
+};
+static_assert(sizeof(FrictionPatchGPU) == 52, "PxgFrictionPatchGPU mirror");
+
+struct BlockFrictionPatch
+{
+    Float4 body0Normal[32];
+    Float4 body1Normal[32];
+    uint32_t anchorCount[32];
+    uint32_t broken[32];
+    uint32_t contactID[2][32];
+    Float4 anchorPoints[2][32];
+    uint32_t patchIndex[32];
+    uint32_t pad0[32];
+};
+static_assert(sizeof(BlockFrictionPatch) == 2816, "PxgBlockFrictionPatch mirror");
 
 // ---------------------------------------------------------------------------
 // CPU reference (transcriptions)
@@ -561,7 +605,8 @@ PXG_TEST(solverPGS_contactAndJointBatches)
     PxgBufferHandle velBuf = createBufferFrom(dev, velPool);
     PxgBufferHandle encBuf = createBufferFrom(dev, encoded);
 
-    const SolverParams params = { 0, numBatches, 1u, 1u, numSlabs, numTotalBodies, bodyOffset };
+    const SolverParams params = { 0, numBatches, 1u, 1u, numSlabs, numTotalBodies, bodyOffset,
+                                  0, 0, 0, 0, 0 };
     kernel.dispatch(numBatches, { batchBuf, chBuf, fhBuf, cpBuf, frBuf, jhBuf, jcBuf, jmBuf, velBuf, encBuf },
                     params);
     dev->flush();
@@ -657,6 +702,530 @@ PXG_TEST(solverPGS_contactAndJointBatches)
     dev->destroyBuffer(jmBuf);
     dev->destroyBuffer(velBuf);
     dev->destroyBuffer(encBuf);
+}
+
+// ---------------------------------------------------------------------------
+// concludeBlocks + writebackBlocks
+// ---------------------------------------------------------------------------
+PXG_TEST(solverPGS_concludeAndWriteback)
+{
+    std::mt19937 rng(3100);
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::uniform_real_distribution<float> sym(-2.f, 2.f);
+
+    const uint32_t numBatches = 12;
+    const uint32_t rowsPerBatch = 4;
+    const uint32_t numBodies = 64;
+    const float PX_MAX_REAL_F = 3.4028234663852885981170418348452e+38f;
+
+    std::vector<BlockConstraintBatch> batches(numBatches);
+    std::vector<BlockContactHeader> contactHeaders(numBatches);
+    std::vector<BlockFrictionHeader> frictionHeaders(numBatches);
+    std::vector<BlockContactPoint> contactPoints(numBatches * rowsPerBatch);
+    std::vector<BlockContactFriction> frictions(numBatches * rowsPerBatch);
+    std::vector<BlockJointHeader> jointHeaders(numBatches);
+    std::vector<BlockJointRowCon> jointRowsCon(numBatches * rowsPerBatch);
+    std::vector<BlockJointRowMod> jointRowsMod(numBatches * rowsPerBatch);
+    std::vector<BlockFrictionPatch> frictionPatchBlocks(numBatches);
+    std::memset(batches.data(), 0, batches.size() * sizeof(BlockConstraintBatch));
+    std::memset(contactHeaders.data(), 0, contactHeaders.size() * sizeof(BlockContactHeader));
+    std::memset(frictionHeaders.data(), 0, frictionHeaders.size() * sizeof(BlockFrictionHeader));
+    std::memset(contactPoints.data(), 0, contactPoints.size() * sizeof(BlockContactPoint));
+    std::memset(frictions.data(), 0, frictions.size() * sizeof(BlockContactFriction));
+    std::memset(jointHeaders.data(), 0, jointHeaders.size() * sizeof(BlockJointHeader));
+    std::memset(jointRowsCon.data(), 0, jointRowsCon.size() * sizeof(BlockJointRowCon));
+    std::memset(jointRowsMod.data(), 0, jointRowsMod.size() * sizeof(BlockJointRowMod));
+    std::memset(frictionPatchBlocks.data(), 0, frictionPatchBlocks.size() * sizeof(BlockFrictionPatch));
+
+    std::vector<SolverBodyData> bodyData(numBodies);
+    std::memset(bodyData.data(), 0, bodyData.size() * sizeof(SolverBodyData));
+    for (uint32_t b = 0; b < numBodies; ++b)
+    {
+        bodyData[b].reportThreshold = unit(rng) < 0.5f ? unit(rng) * 5.f : PX_MAX_REAL_F;
+        bodyData[b].islandNodeIndex = makeNodeIndex(rng() % 1000);
+    }
+
+    const uint32_t numPatches = numBatches * 32;
+    std::vector<FrictionPatchGPU> patches(numPatches);
+    std::memset(patches.data(), 0, patches.size() * sizeof(FrictionPatchGPU));
+
+    uint32_t forceBufCursor = 0;
+    uint32_t writebackCursor = 0;
+
+    for (uint32_t k = 0; k < numBatches; ++k)
+    {
+        BlockConstraintBatch& b = batches[k];
+        b.descStride = uint16_t(1 + rng() % 32);
+        b.constraintType = uint16_t(k % 2);
+        b.constraintBatchIndex = k;
+        b.startConstraintIndex = k * rowsPerBatch;
+        b.startFrictionIndex = k * rowsPerBatch;
+
+        for (uint32_t lane = 0; lane < 32; ++lane)
+        {
+            b.bodyAIndex[lane] = rng() % numBodies;
+            b.bodyBIndex[lane] = rng() % numBodies;
+            b.shapeInteraction[lane] = (uint64_t(rng()) << 32) | rng();
+
+            if (b.constraintType == 0)
+            {
+                contactHeaders[k].numNormalConstr[lane] = rng() % (rowsPerBatch + 1);
+                contactHeaders[k].restitution[lane] = unit(rng) < 0.5f ? unit(rng) : -unit(rng) * 50.f;
+                contactHeaders[k].flags[lane] = unit(rng) < 0.6f ? 1u /*eHAS_FORCE_THRESHOLDS*/ : 0u;
+                contactHeaders[k].forceWritebackOffset[lane] =
+                    unit(rng) < 0.8f ? (forceBufCursor += rowsPerBatch) - rowsPerBatch : 0xFFFFFFFFu;
+                frictionHeaders[k].numFrictionConstr[lane] =
+                    contactHeaders[k].numNormalConstr[lane] ? (rng() % 3) * 2 : 0; // 0, 2 or 4
+                frictionHeaders[k].broken[lane] = rng() & 1;
+                const Vec3 f0 = randUnit(rng), f1 = randUnit(rng);
+                frictionHeaders[k].frictionNormals0[lane] = Float4{ f0.x, f0.y, f0.z, 0 };
+                frictionHeaders[k].frictionNormals1[lane] = Float4{ f1.x, f1.y, f1.z, 0 };
+                frictionPatchBlocks[k].patchIndex[lane] = unit(rng) < 0.7f ? k * 32 + lane : 0xFFFFFFFFu;
+                frictionPatchBlocks[k].anchorPoints[0][lane] = Float4{ sym(rng), sym(rng), sym(rng), 0 };
+                frictionPatchBlocks[k].anchorPoints[1][lane] = Float4{ sym(rng), sym(rng), sym(rng), 0 };
+
+                for (uint32_t i = 0; i < rowsPerBatch; ++i)
+                {
+                    BlockContactPoint& c = contactPoints[b.startConstraintIndex + i];
+                    c.appliedForce[lane] = unit(rng) * 3.f;
+                    c.coeff0[lane] = unit(rng);
+                    c.coeff1[lane] = unit(rng);
+                    BlockContactFriction& f = frictions[b.startFrictionIndex + i];
+                    f.appliedForce[lane] = sym(rng);
+                    f.raXn_bias[lane] = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+                }
+            }
+            else
+            {
+                jointHeaders[k].rowCounts[lane] = uint16_t(rng() % (rowsPerBatch + 1));
+                jointHeaders[k].breakable[lane] = uint16_t(rng() & 1);
+                jointHeaders[k].angBreakImpulse[lane] = unit(rng) * 2.f;
+                jointHeaders[k].body0WorldOffset_linBreakImpulse[lane] =
+                    Float4{ sym(rng) * 0.2f, sym(rng) * 0.2f, sym(rng) * 0.2f, unit(rng) * 2.f };
+                jointHeaders[k].writeBackOffset[lane] =
+                    unit(rng) < 0.8f ? writebackCursor++ : 0xFFFFFFFFu;
+
+                for (uint32_t i = 0; i < rowsPerBatch; ++i)
+                {
+                    BlockJointRowCon& c = jointRowsCon[b.startConstraintIndex + i];
+                    BlockJointRowMod& m = jointRowsMod[b.startConstraintIndex + i];
+                    const Vec3 l0 = randUnit(rng);
+                    c.lin0XYZ_minImpulse[lane] = Float4{ l0.x, l0.y, l0.z, -10.f };
+                    m.ang0Writeback[lane * 3 + 0] = sym(rng) * 0.3f;
+                    m.ang0Writeback[lane * 3 + 1] = sym(rng) * 0.3f;
+                    m.ang0Writeback[lane * 3 + 2] = sym(rng) * 0.3f;
+                    m.appliedForce[lane] = sym(rng);
+                    m.residual[lane] = sym(rng) * 0.05f;
+                    m.flags[lane] = (unit(rng) < 0.7f ? 2u /*OUTPUT_FORCE*/ : 0u) |
+                                    (unit(rng) < 0.4f ? DY_SC_FLAG_SPRING : 0u);
+                    m.coeff0[lane] = unit(rng);
+                    m.coeff1[lane] = unit(rng);
+                }
+            }
+        }
+    }
+
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const std::vector<uint32_t> strides = {
+        sizeof(BlockConstraintBatch), sizeof(BlockContactHeader), sizeof(BlockFrictionHeader),
+        sizeof(BlockContactPoint), sizeof(BlockContactFriction), sizeof(BlockJointHeader),
+        sizeof(BlockJointRowCon), sizeof(BlockJointRowMod), 16, 4, sizeof(SolverBodyData),
+        sizeof(ConstraintWriteback), 4, 40, 4, sizeof(BlockFrictionPatch), sizeof(FrictionPatchGPU)
+    };
+
+    Kernel conclude("solverPGS.spv", "concludeBlocks",
+                    { strides[0], strides[1], strides[2], strides[3], strides[4], strides[5], strides[6], strides[7] },
+                    sizeof(SolverParams));
+    Kernel writeback("solverPGS.spv", "writebackBlocks", strides, sizeof(SolverParams));
+
+    PxgBufferHandle batchBuf = createBufferFrom(dev, batches);
+    PxgBufferHandle chBuf = createBufferFrom(dev, contactHeaders);
+    PxgBufferHandle fhBuf = createBufferFrom(dev, frictionHeaders);
+    PxgBufferHandle cpBuf = createBufferFrom(dev, contactPoints);
+    PxgBufferHandle frBuf = createBufferFrom(dev, frictions);
+    PxgBufferHandle jhBuf = createBufferFrom(dev, jointHeaders);
+    PxgBufferHandle jcBuf = createBufferFrom(dev, jointRowsCon);
+    PxgBufferHandle jmBuf = createBufferFrom(dev, jointRowsMod);
+    PxgBufferHandle bdBuf = createBufferFrom(dev, bodyData);
+    std::vector<ConstraintWriteback> wbInit(std::max(writebackCursor, 1u));
+    std::memset(wbInit.data(), 0, wbInit.size() * sizeof(ConstraintWriteback));
+    PxgBufferHandle wbBuf = createBufferFrom(dev, wbInit);
+    std::vector<float> forceInit(std::max(forceBufCursor, 1u), 0.f);
+    PxgBufferHandle forceBuf = createBufferFrom(dev, forceInit);
+    PxgBufferHandle tsBuf = dev->createBuffer(numBatches * 32 * sizeof(ThresholdElement));
+    std::vector<uint32_t> zero1 = { 0 };
+    PxgBufferHandle tsIdxBuf = createBufferFrom(dev, zero1);
+    PxgBufferHandle fpbBuf = createBufferFrom(dev, frictionPatchBlocks);
+    PxgBufferHandle fpBuf = createBufferFrom(dev, patches);
+
+    SolverParams params = {};
+    params.startIndex = 0;
+    params.endIndex = numBatches;
+
+    // conclude first (uses bindings 0-7), then writeback
+    conclude.dispatch(numBatches, { batchBuf, chBuf, fhBuf, cpBuf, frBuf, jhBuf, jcBuf, jmBuf }, params);
+    dev->barrier();
+    writeback.dispatch(numBatches,
+                       { batchBuf, chBuf, fhBuf, cpBuf, frBuf, jhBuf, jcBuf, jmBuf, bdBuf /*dummy at 8*/,
+                         bdBuf /*dummy at 9*/, bdBuf, wbBuf, forceBuf, tsBuf, tsIdxBuf, fpbBuf, fpBuf },
+                       params);
+    dev->flush();
+
+    // ---- reference ----
+    auto refContacts = contactPoints;
+    auto refFrictions = frictions;
+    auto refMods = jointRowsMod;
+    auto refPatchBlocks = frictionPatchBlocks;
+    std::vector<float> refForce = forceInit;
+    std::vector<ConstraintWriteback> refWb = wbInit;
+    std::vector<FrictionPatchGPU> refPatches = patches;
+    std::vector<ThresholdElement> refStream;
+
+    for (uint32_t k = 0; k < numBatches; ++k)
+    {
+        const BlockConstraintBatch& b = batches[k];
+        for (uint32_t lane = 0; lane < b.descStride; ++lane)
+        {
+            if (b.constraintType == 0)
+            {
+                // concludeContactBlock
+                const uint32_t nc = contactHeaders[k].numNormalConstr[lane];
+                const uint32_t nf = frictionHeaders[k].numFrictionConstr[lane];
+                if (nc && contactHeaders[k].restitution[lane] >= 0.f)
+                    for (uint32_t i = 0; i < nc; ++i)
+                        refContacts[b.startConstraintIndex + i].coeff0[lane] =
+                            refContacts[b.startConstraintIndex + i].coeff1[lane];
+                for (uint32_t i = 0; i < nf; ++i)
+                    refFrictions[b.startFrictionIndex + i].raXn_bias[lane].w = 0.f;
+
+                // writeBackContactBlock
+                float normalForce = 0.f;
+                const uint32_t fwo = contactHeaders[k].forceWritebackOffset[lane];
+                if (fwo != 0xFFFFFFFFu)
+                    for (uint32_t i = 0; i < nc; ++i)
+                    {
+                        const float af = refContacts[b.startConstraintIndex + i].appliedForce[lane];
+                        refForce[fwo + i] = af;
+                        normalForce += af;
+                    }
+
+                const uint32_t patchIndex = refPatchBlocks[k].patchIndex[lane];
+                if (patchIndex != 0xFFFFFFFFu)
+                {
+                    FrictionPatchGPU& fp = refPatches[patchIndex];
+                    const Float4 a0 = frictionHeaders[k].frictionNormals0[lane];
+                    const Float4 a1 = frictionHeaders[k].frictionNormals1[lane];
+                    fp.anchors = nf / 2;
+                    if (nf >= 2)
+                    {
+                        const Float4 an = refPatchBlocks[k].anchorPoints[0][lane];
+                        fp.points[0] = Float3{ an.x, an.y, an.z };
+                        const float i0 = refFrictions[b.startFrictionIndex].appliedForce[lane];
+                        const float i1 = refFrictions[b.startFrictionIndex + 1].appliedForce[lane];
+                        fp.impulses[0] = Float3{ a0.x * i0 + a1.x * i1, a0.y * i0 + a1.y * i1,
+                                                 a0.z * i0 + a1.z * i1 };
+                    }
+                    if (nf >= 4)
+                    {
+                        const Float4 an = refPatchBlocks[k].anchorPoints[1][lane];
+                        fp.points[1] = Float3{ an.x, an.y, an.z };
+                        const float i0 = refFrictions[b.startFrictionIndex + 2].appliedForce[lane];
+                        const float i1 = refFrictions[b.startFrictionIndex + 3].appliedForce[lane];
+                        fp.impulses[1] = Float3{ a0.x * i0 + a1.x * i1, a0.y * i0 + a1.y * i1,
+                                                 a0.z * i0 + a1.z * i1 };
+                    }
+                }
+                if (nf && frictionHeaders[k].broken[lane])
+                    refPatchBlocks[k].broken[lane] = 1;
+
+                const float rt0 = bodyData[b.bodyAIndex[lane]].reportThreshold;
+                const float rt1 = bodyData[b.bodyBIndex[lane]].reportThreshold;
+                const bool forceThreshold = (contactHeaders[k].flags[lane] & 1u) != 0;
+                if (forceThreshold && normalForce != 0.f && (rt0 < PX_MAX_REAL_F || rt1 < PX_MAX_REAL_F))
+                {
+                    ThresholdElement e = {};
+                    e.normalForce = normalForce;
+                    e.threshold = std::fmin(rt0, rt1);
+                    e.nodeIndexA = bodyData[b.bodyAIndex[lane]].islandNodeIndex;
+                    e.nodeIndexB = bodyData[b.bodyBIndex[lane]].islandNodeIndex;
+                    if (e.nodeIndexB < e.nodeIndexA)
+                        std::swap(e.nodeIndexA, e.nodeIndexB);
+                    e.shapeInteraction = b.shapeInteraction[lane];
+                    refStream.push_back(e);
+                }
+            }
+            else
+            {
+                // conclude1DBlock
+                const uint32_t rows = jointHeaders[k].rowCounts[lane];
+                for (uint32_t i = 0; i < rows; ++i)
+                    if (!(refMods[b.startConstraintIndex + i].flags[lane] & DY_SC_FLAG_SPRING))
+                        refMods[b.startConstraintIndex + i].coeff0[lane] =
+                            refMods[b.startConstraintIndex + i].coeff1[lane];
+
+                // writeBack1DBlock
+                const uint32_t fwo = jointHeaders[k].writeBackOffset[lane];
+                if (fwo != 0xFFFFFFFFu)
+                {
+                    Vec3 linVel(0.f), angVel(0.f);
+                    float errSq = 0.f;
+                    for (uint32_t i = 0; i < rows; ++i)
+                    {
+                        const BlockJointRowMod& m = refMods[b.startConstraintIndex + i];
+                        if (m.flags[lane] & 2u)
+                        {
+                            const Float4 l0 = jointRowsCon[b.startConstraintIndex + i].lin0XYZ_minImpulse[lane];
+                            linVel += Vec3(l0.x, l0.y, l0.z) * m.appliedForce[lane];
+                            angVel += Vec3(m.ang0Writeback[lane * 3], m.ang0Writeback[lane * 3 + 1],
+                                           m.ang0Writeback[lane * 3 + 2]) * m.appliedForce[lane];
+                        }
+                        errSq += m.residual[lane] * m.residual[lane];
+                    }
+                    const Float4 bwo = jointHeaders[k].body0WorldOffset_linBreakImpulse[lane];
+                    angVel = angVel - Vec3(bwo.x, bwo.y, bwo.z).cross(linVel);
+                    const uint32_t broken = jointHeaders[k].breakable[lane]
+                        ? uint32_t(linVel.magnitude() > bwo.w ||
+                                   angVel.magnitude() > jointHeaders[k].angBreakImpulse[lane])
+                        : 0;
+                    refWb[fwo].angularImpulse_residual = Float4{ angVel.x, angVel.y, angVel.z, errSq };
+                    refWb[fwo].linearImpulse_broken = Float4{ linVel.x, linVel.y, linVel.z, broken ? -0.0f : 0.0f };
+                }
+            }
+        }
+    }
+
+    // ---- compare ----
+    const auto gpuContacts = downloadBuffer<BlockContactPoint>(dev, cpBuf, contactPoints.size());
+    const auto gpuFrictions = downloadBuffer<BlockContactFriction>(dev, frBuf, frictions.size());
+    const auto gpuMods = downloadBuffer<BlockJointRowMod>(dev, jmBuf, jointRowsMod.size());
+    const auto gpuForce = downloadBuffer<float>(dev, forceBuf, refForce.size());
+    const auto gpuWb = downloadBuffer<ConstraintWriteback>(dev, wbBuf, refWb.size());
+    const auto gpuPatches = downloadBuffer<FrictionPatchGPU>(dev, fpBuf, patches.size());
+    const auto gpuPatchBlocks = downloadBuffer<BlockFrictionPatch>(dev, fpbBuf, frictionPatchBlocks.size());
+    const auto gpuTsCount = downloadBuffer<uint32_t>(dev, tsIdxBuf, 1)[0];
+    auto gpuStream = downloadBuffer<ThresholdElement>(dev, tsBuf, gpuTsCount);
+
+    size_t mismatches = 0;
+    for (size_t i = 0; i < contactPoints.size(); ++i)
+        for (int l = 0; l < 32; ++l)
+            if (gpuContacts[i].coeff0[l] != refContacts[i].coeff0[l])
+                ++mismatches;
+    for (size_t i = 0; i < frictions.size(); ++i)
+        for (int l = 0; l < 32; ++l)
+            if (gpuFrictions[i].raXn_bias[l].w != refFrictions[i].raXn_bias[l].w)
+                ++mismatches;
+    for (size_t i = 0; i < jointRowsMod.size(); ++i)
+        for (int l = 0; l < 32; ++l)
+            if (gpuMods[i].coeff0[l] != refMods[i].coeff0[l])
+                ++mismatches;
+    PXG_CHECK_MSG(mismatches == 0, "conclude: %zu mismatches", mismatches);
+
+    mismatches = 0;
+    for (size_t i = 0; i < refForce.size(); ++i)
+        if (gpuForce[i] != refForce[i])
+            ++mismatches;
+    for (size_t i = 0; i < refWb.size(); ++i)
+        if (std::memcmp(&gpuWb[i], &refWb[i], sizeof(ConstraintWriteback)) != 0)
+            ++mismatches;
+    for (size_t i = 0; i < patches.size(); ++i)
+        if (std::memcmp(&gpuPatches[i], &refPatches[i], sizeof(FrictionPatchGPU)) != 0)
+            ++mismatches;
+    for (size_t i = 0; i < frictionPatchBlocks.size(); ++i)
+        for (int l = 0; l < 32; ++l)
+            if (gpuPatchBlocks[i].broken[l] != refPatchBlocks[i].broken[l])
+                ++mismatches;
+    PXG_CHECK_MSG(mismatches == 0, "writeback: %zu mismatches", mismatches);
+
+    // threshold stream: order is nondeterministic -> sort both sides
+    PXG_CHECK_MSG(gpuTsCount == refStream.size(), "threshold stream count: gpu=%u ref=%zu", gpuTsCount,
+                  refStream.size());
+    auto tsLess = [](const ThresholdElement& a, const ThresholdElement& b) {
+        return std::memcmp(&a, &b, sizeof(ThresholdElement)) < 0;
+    };
+    std::sort(gpuStream.begin(), gpuStream.end(), tsLess);
+    std::sort(refStream.begin(), refStream.end(), tsLess);
+    mismatches = 0;
+    for (size_t i = 0; i < refStream.size() && i < gpuStream.size(); ++i)
+        if (std::memcmp(&gpuStream[i], &refStream[i], sizeof(ThresholdElement)) != 0)
+            ++mismatches;
+    PXG_CHECK_MSG(mismatches == 0, "threshold stream: %zu mismatches", mismatches);
+
+    for (PxgBufferHandle h : { batchBuf, chBuf, fhBuf, cpBuf, frBuf, jhBuf, jcBuf, jmBuf, bdBuf, wbBuf,
+                               forceBuf, tsBuf, tsIdxBuf, fpbBuf, fpBuf })
+        dev->destroyBuffer(h);
+}
+
+// ---------------------------------------------------------------------------
+// computeAverageSolverBodyVelocity + propagateSolverBodyVelocity + writeBackBodies
+// ---------------------------------------------------------------------------
+PXG_TEST(solverPGS_velocityAveraging)
+{
+    std::mt19937 rng(3200);
+    std::uniform_real_distribution<float> sym(-3.f, 3.f);
+
+    for (uint32_t numSlabs : { 4u, 12u, 40u })
+    {
+        const uint32_t totalBodyCount = 70; // dynamic bodies
+        const uint32_t bodyOffset = 8;
+        const uint32_t numTotalBodies = bodyOffset + totalBodyCount;
+        const uint32_t numBatches = 6;
+        const uint32_t averageOutputOffsets = numBatches * 32 * 2 * 2;
+        const uint32_t slabRegion = ((totalBodyCount * numSlabs + 31) / 32) * 64 + 64;
+        const uint32_t deltaVOffset = averageOutputOffsets + slabRegion;
+        const uint32_t propBase = deltaVOffset + 2 * (totalBodyCount + bodyOffset);
+        const uint32_t poolSize = propBase + slabRegion;
+
+        std::vector<Float4> velPool(poolSize);
+        for (Float4& v : velPool)
+            v = Float4{ sym(rng), sym(rng), sym(rng), 0.f };
+
+        // remapped write slots: unique (r, r+32) pairs per slab slot in the
+        // cluster-of-32 pattern, in a dedicated pool region (partitions keep
+        // these race-free in the real solver)
+        std::vector<uint32_t> references(totalBodyCount * numSlabs, 0xFFFFFFFFu);
+        for (uint32_t i = 0; i < references.size(); ++i)
+            if ((rng() & 3) != 0) // ~75% of slab slots active
+                references[i] = propBase + 2 * (i & ~31u) + (i & 31u);
+
+        const uint32_t num32Slabs = (numSlabs + 31) / 32;
+        std::vector<uint32_t> encoded(numTotalBodies * num32Slabs);
+        for (uint32_t& e : encoded)
+            e = rng();
+
+        PxgSlangComputeDevice* dev = testDevice();
+
+        Kernel average("solverPGS.spv", "computeAverageSolverBodyVelocity",
+                       { 64, 64, 64, 64, 64, 64, 64, 64, 16, 4, 4, 4, 4, 4, 4, 4, 4, 16, 4 },
+                       sizeof(SolverParams));
+        Kernel propagate("solverPGS.spv", "propagateSolverBodyVelocity",
+                         { 64, 64, 64, 64, 64, 64, 64, 64, 16, 4, 4, 4, 4, 4, 4, 4, 4, 16, 4 },
+                         sizeof(SolverParams));
+
+        std::vector<uint32_t> dummy(16, 0);
+        PxgBufferHandle dummyBuf = createBufferFrom(dev, dummy);
+        PxgBufferHandle velBuf = createBufferFrom(dev, velPool);
+        PxgBufferHandle encBuf = createBufferFrom(dev, encoded);
+        PxgBufferHandle refBuf = createBufferFrom(dev, references);
+
+        SolverParams params = {};
+        params.numSlabs = numSlabs;
+        params.numTotalBodies = numTotalBodies;
+        params.bodyOffset = bodyOffset;
+        params.totalBodyCount = totalBodyCount;
+        params.deltaVOffset = deltaVOffset;
+        params.averageOutputOffsets = averageOutputOffsets;
+
+        const uint32_t pow2 = [&] {
+            uint32_t x = numSlabs;
+            if ((x & (x - 1)) == 0)
+                return x;
+            x--; x |= x >> 1; x |= x >> 2; x |= x >> 4; x |= x >> 8; x |= x >> 16;
+            return x + 1;
+        }();
+        const uint32_t threadsPerBody = std::min(pow2, 32u);
+        const uint32_t bodiesPerWarp = 32 / threadsPerBody;
+        const uint32_t numGroups = (totalBodyCount + bodiesPerWarp - 1) / bodiesPerWarp;
+
+        std::vector<PxgBufferHandle> bufs = { dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf,
+                                              dummyBuf, dummyBuf, velBuf, encBuf, dummyBuf, dummyBuf,
+                                              dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf,
+                                              refBuf };
+        average.dispatch(numGroups, bufs, params);
+        dev->barrier();
+        propagate.dispatch(numGroups, bufs, params);
+        dev->flush();
+
+        // ---- reference ----
+        std::vector<Float4> refVel = velPool;
+        std::vector<uint32_t> refEnc = encoded;
+        auto popcount = [](uint32_t v) { uint32_t c = 0; while (v) { c += v & 1; v >>= 1; } return c; };
+
+        for (uint32_t bodyId = 0; bodyId < totalBodyCount; ++bodyId)
+        {
+            const uint32_t outputBody = deltaVOffset + bodyId + bodyOffset;
+            const Float4 lastLin = velPool[outputBody];
+            const Float4 lastAng = velPool[outputBody + totalBodyCount + bodyOffset];
+            Vec3 linDelta(0.f), angDelta(0.f);
+            bool hasRef = false;
+            for (uint32_t b = 0; b < numSlabs; ++b)
+            {
+                const uint32_t bodyIndex = bodyId * numSlabs + b;
+                if (references[bodyIndex] != 0xFFFFFFFFu)
+                {
+                    const uint32_t velIndex = averageOutputOffsets + 2 * (bodyIndex & ~31u) + (bodyIndex & 31u);
+                    linDelta += Vec3(velPool[velIndex].x - lastLin.x, velPool[velIndex].y - lastLin.y,
+                                     velPool[velIndex].z - lastLin.z);
+                    angDelta += Vec3(velPool[velIndex + 32].x - lastAng.x, velPool[velIndex + 32].y - lastAng.y,
+                                     velPool[velIndex + 32].z - lastAng.z);
+                    hasRef = true;
+                }
+            }
+            if (hasRef)
+            {
+                uint32_t refCount = 0;
+                for (uint32_t i = 0; i < num32Slabs; ++i)
+                    refCount += popcount(encoded[bodyOffset + bodyId + i * numTotalBodies]);
+                refCount = std::max(1u, refCount);
+                const float recip = 1.f / float(refCount);
+                linDelta *= recip;
+                angDelta *= recip;
+                for (uint32_t i = 0; i < num32Slabs; ++i)
+                    refEnc[bodyOffset + bodyId + i * numTotalBodies] = 0;
+                refVel[outputBody] = Float4{ lastLin.x + linDelta.x, lastLin.y + linDelta.y,
+                                             lastLin.z + linDelta.z, lastLin.w };
+                refVel[outputBody + totalBodyCount + bodyOffset] =
+                    Float4{ lastAng.x + angDelta.x, lastAng.y + angDelta.y, lastAng.z + angDelta.z, lastAng.w };
+            }
+        }
+
+        // propagate pass (separate, mirroring the barrier between dispatches)
+        for (uint32_t bodyId = 0; bodyId < totalBodyCount; ++bodyId)
+        {
+            const uint32_t outputBody = deltaVOffset + bodyId + bodyOffset;
+            Float4 linVel = refVel[outputBody];
+            const Float4 angVel = refVel[outputBody + totalBodyCount + bodyOffset];
+            linVel.w = 0.f;
+            for (uint32_t b = 0; b < numSlabs; ++b)
+            {
+                const uint32_t bodyIndex = bodyId * numSlabs + b;
+                const uint32_t remapped = references[bodyIndex];
+                if (remapped != 0xFFFFFFFFu)
+                {
+                    refVel[remapped] = linVel;
+                    refVel[remapped + 32] = angVel;
+                }
+            }
+        }
+
+        // ---- compare ----
+        const auto gpuVel = downloadBuffer<Float4>(dev, velBuf, poolSize);
+        const auto gpuEnc = downloadBuffer<uint32_t>(dev, encBuf, encoded.size());
+
+        size_t mismatches = 0;
+        for (size_t i = 0; i < poolSize; ++i)
+            if (!almostEqual(gpuVel[i].x, refVel[i].x, 1e-4f, 1e-4f) ||
+                !almostEqual(gpuVel[i].y, refVel[i].y, 1e-4f, 1e-4f) ||
+                !almostEqual(gpuVel[i].z, refVel[i].z, 1e-4f, 1e-4f))
+            {
+                if (mismatches < 3)
+                    PXG_CHECK_MSG(false, "slabs=%u vel[%zu]: gpu=(%g,%g,%g) ref=(%g,%g,%g)", numSlabs, i,
+                                  gpuVel[i].x, gpuVel[i].y, gpuVel[i].z, refVel[i].x, refVel[i].y, refVel[i].z);
+                ++mismatches;
+            }
+        PXG_CHECK_MSG(mismatches == 0, "slabs=%u: %zu velocity mismatches", numSlabs, mismatches);
+
+        mismatches = 0;
+        for (size_t i = 0; i < encoded.size(); ++i)
+            if (gpuEnc[i] != refEnc[i])
+                ++mismatches;
+        PXG_CHECK_MSG(mismatches == 0, "slabs=%u: %zu encoded-count mismatches", numSlabs, mismatches);
+
+        dev->destroyBuffer(dummyBuf);
+        dev->destroyBuffer(velBuf);
+        dev->destroyBuffer(encBuf);
+        dev->destroyBuffer(refBuf);
+    }
 }
 
 } // namespace

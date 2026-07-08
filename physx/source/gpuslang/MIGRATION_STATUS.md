@@ -29,7 +29,7 @@ Vulkan/D3D12 backends.
 | `integration.cu` + `integration.cuh` | integrateCoreParallelLaunch | ✅ | `integration.slang` (PGS variant incl. full sleep/freeze/wake state machine) |
 | `integrationTGS.cu` | integrateCoreParallelLaunchTGS | ✅ | `integration.slang` (integrateCoreTGS: absolute velocities, delta-transform pose accumulation) |
 | `preIntegrationTGS.cu` | preIntegrationLaunchTGS | ✅ | covered by `preIntegration.slang` — the TGS entry is the identical kernel with the runtime skipGravityApplication flag, which the port already exposes as a push constant |
-| `solverMultiBlock.cu` + `solverBlock.cuh` | solveBlockPartition (rigid PGS iteration) | 🟡 | `solverPGS.slang` — solveContactBlock (contacts + friction incl. compliant/accel-spring paths, mass-splitting reference counts) and solve1DBlock (joint rows incl. spring modes, residual writeback) ✅; remaining: conclude/writeback kernels, velocity averaging (`computeAverageSolverBodyVelocity`/`propagateSolverBodyVelocity`), TGS variant (`solverMultiBlockTGS.cu`), articulation paths (`solver.cu` artiSolveBlockPartition, solveExt* ) ⬜ |
+| `solverMultiBlock.cu` + `solverBlock.cuh` | rigid PGS pipeline | 🟡 | `solverPGS.slang` — solveBlockPartition (solveContactBlock + solve1DBlock incl. compliant/accel-spring paths, mass-splitting reference counts) ✅, concludeBlocks ✅, writebackBlocks ✅ (force buffer, joint impulse/break writeback, friction patch export, threshold stream via atomics), writeBackBodies ✅, computeAverageSolverBodyVelocity + propagateSolverBodyVelocity ✅ (multi-slab velocity averaging incl. slab-count reset); remaining: ZeroBodies/markActiveSlabPGS/initialization glue, TGS variant (`solverMultiBlockTGS.cu`), articulation paths (`solver.cu` artiSolveBlockPartition, solveExt*), contact-error accumulator stats ⬜ |
 | `constraintBlockPrePrep.cu`, `constraintBlockPrep.cu`, `constraintBlockPrepTGS.cu` | constraint prep | ⬜ | |
 | `artiConstraintPrep2.cu` | articulation constraint prep | ⬜ | |
 | `accumulateThresholdStream.cu` | threshold streams | ⬜ | needs radix sort + scan (both ported) |
@@ -64,7 +64,7 @@ Vulkan/D3D12 backends.
 
 ## Verification
 
-All ported kernels are covered by `tests/` (37 GPU test cases, run per commit
+All ported kernels are covered by `tests/` (39 GPU test cases, run per commit
 via ctest on a Vulkan device — llvmpipe in CI):
 
 | Kernel | Reference | Checks |
@@ -81,6 +81,8 @@ via ctest on a Vulkan device — llvmpipe in CI):
 | body/shape DMA | C++ transcription of `updateBodiesAndShapes.cu` | scatter by embedded index (bit-exact), direct-API partial copies (velocity .w-merge, first-transfer, body2Actor-change pose re-derivation), external velocity updates |
 | direct GPU API | C++ transcription | pose composition (body2World·body2Actor⁻¹ and inverse), velocity/acceleration getters, velocity/force/torque setters incl. world-space inertia transform, setGlobalPose with sorted node-index binary search + bounds/cache refresh |
 | PGS solver iteration | C++ transcription of `solverBlock.cuh` | mixed contact/joint batches with 1–32 lanes, rigid + compliant (accel-spring) restitution, static/dynamic friction clamping incl. broken flags, joint spring modes, impulse clamping, per-row residuals, >32-slab mass-splitting reference counts, velocity write-back |
+| PGS conclude/writeback | C++ transcription | bias removal (coeff swap / friction bias zeroing), force-buffer writeback, joint impulse + breakage writeback, friction patch export, threshold stream (order-independent compare), report-threshold gating |
+| velocity averaging | C++ transcription | per-slab delta averaging with active-slab counts (4/12/40 slabs incl. multi-word), slab-count reset, propagation into remapped slab slots |
 | clampMaxValue(s) | scalar clamp | in-place counter clamping |
 | skinning | C++ transcription of `utility.cu` | area-weighted vertex normals (atomic accumulation), Phong cloth interpolation incl. out-of-triangle uv projection and thickness clamping, barycentric softbody interpolation, buffer interleaving, strided-view addressing |
 
