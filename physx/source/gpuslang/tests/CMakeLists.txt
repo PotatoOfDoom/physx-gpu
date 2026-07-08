@@ -137,6 +137,7 @@ pxg_compile_shader(broadphaseAggregateFinalize aggCopyReports removeAggPairsStag
 pxg_compile_shader(broadphaseAggregatePairsRemove removeAggPairsStage1 removeAggPairsStage2)
 pxg_compile_shader(broadphaseAggregateBoxPruning aggregateBipartiteBoxPruning)
 pxg_compile_shader(broadphaseAggPairCollision doAggPairCollisions)
+pxg_compile_shader(broadphaseAggSelfCollision doSelfCollision)
 pxg_compile_shader(memCopy MemCopyBalanced)
 pxg_compile_shader(clampValues clampMaxValue clampMaxValues)
 pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeighted
@@ -190,7 +191,8 @@ add_executable(gpuslang-tests
     testBroadphaseAggregateFinalize.cpp
     testBroadphaseAggregatePairsRemove.cpp
     testBroadphaseAggregateBoxPruning.cpp
-    testBroadphaseAggPairCollision.cpp)
+    testBroadphaseAggPairCollision.cpp
+    testBroadphaseAggSelfCollision.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
@@ -203,7 +205,7 @@ foreach(suite scan radixSort preIntegration integration updateBounds memCopy cla
         broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
-        broadphaseAggregateBoxPruning broadphaseAggPairCollision)
+        broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -277,6 +279,7 @@ set(PXG_HLSL_ENTRIES
     "broadphaseAggregatePairsRemove:removeAggPairsStage2"
     "broadphaseAggregateBoxPruning:aggregateBipartiteBoxPruning"
     "broadphaseAggPairCollision:doAggPairCollisions"
+    "broadphaseAggSelfCollision:doSelfCollision"
     "solverPGS:computeAverageSolverBodyVelocity" "solverPGS:propagateSolverBodyVelocity"
     "scan4x4:scanPerBlockKernel4x4" "scan4x4:addBlockSumsKernel4x4"
     "radixFourBit:radixFourBitCountPerBlockKernel" "radixFourBit:radixFourBitReorderKernel"
