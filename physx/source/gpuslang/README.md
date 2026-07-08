@@ -27,6 +27,8 @@ gpuslang/
 │   ├── preIntegration.slang         solver pre-integration (PGS + TGS)
 │   ├── integration.slang            solver integration, PGS + TGS + sleep state machine
 │   ├── updateBounds.slang           transform cache + world AABB update
+│   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
+│   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
 │   ├── clampValues.slang            counter clamp utilities
 │   └── skinning.slang               deformable skinning (cloth Phong / softbody barycentric)
@@ -100,7 +102,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (31 GPU test cases + 24 DX12 cross-compile checks) verifies:
+The suite (36 GPU test cases + 33 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;

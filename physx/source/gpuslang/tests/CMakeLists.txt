@@ -88,7 +88,13 @@ pxg_compile_shader(radixSort radixSortHistogram radixSortCalculateRanks)
 pxg_compile_shader(radixSort64 radixSortCopyHigh32Bits)
 pxg_compile_shader(preIntegration preIntegrationLaunch initStaticKinematics)
 pxg_compile_shader(integration integrateCoreParallelLaunch integrateCoreParallelLaunchTGS)
-pxg_compile_shader(updateBounds updateTransformCacheAndBoundArrayLaunch)
+pxg_compile_shader(updateBounds updateTransformCacheAndBoundArrayLaunch setRigidDynamicGlobalPose)
+pxg_compile_shader(bodyUpdate updateBodiesLaunch updateBodiesLaunchDirectAPI updateShapesLaunch
+                   updateBodyExternalVelocitiesLaunch)
+pxg_compile_shader(directApi getRigidDynamicGlobalPose getRigidDynamicLinearVelocity
+                   getRigidDynamicAngularVelocity getRigidDynamicLinearAcceleration
+                   getRigidDynamicAngularAcceleration setRigidDynamicLinearVelocity
+                   setRigidDynamicAngularVelocity setRigidDynamicForce setRigidDynamicTorque)
 pxg_compile_shader(scan4x4 scanPerBlockKernel4x4 addBlockSumsKernel4x4)
 pxg_compile_shader(radixFourBit radixFourBitCountPerBlockKernel radixFourBitReorderKernel)
 pxg_compile_shader(reorderData reorderKernel)
@@ -121,13 +127,14 @@ add_executable(gpuslang-tests
     testIntegration.cpp
     testUpdateBounds.cpp
     testUtilities.cpp
-    testAlgorithms.cpp)
+    testAlgorithms.cpp
+    testBodyUpdate.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
 enable_testing()
 foreach(suite scan radixSort preIntegration integration updateBounds memCopy clamp skinning
-        scan4x4 gpuRadixSort reorderKernel)
+        scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -145,7 +152,11 @@ set(PXG_HLSL_ENTRIES
     "radixSort64:radixSortCopyHigh32Bits"
     "preIntegration:preIntegrationLaunch" "preIntegration:initStaticKinematics"
     "integration:integrateCoreParallelLaunch" "integration:integrateCoreParallelLaunchTGS"
-    "updateBounds:updateTransformCacheAndBoundArrayLaunch"
+    "updateBounds:updateTransformCacheAndBoundArrayLaunch" "updateBounds:setRigidDynamicGlobalPose"
+    "bodyUpdate:updateBodiesLaunch" "bodyUpdate:updateBodiesLaunchDirectAPI"
+    "bodyUpdate:updateShapesLaunch" "bodyUpdate:updateBodyExternalVelocitiesLaunch"
+    "directApi:getRigidDynamicGlobalPose" "directApi:getRigidDynamicLinearAcceleration"
+    "directApi:setRigidDynamicLinearVelocity" "directApi:setRigidDynamicTorque"
     "scan4x4:scanPerBlockKernel4x4" "scan4x4:addBlockSumsKernel4x4"
     "radixFourBit:radixFourBitCountPerBlockKernel" "radixFourBit:radixFourBitReorderKernel"
     "reorderData:reorderKernel"

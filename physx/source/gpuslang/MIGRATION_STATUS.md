@@ -40,7 +40,7 @@ Vulkan/D3D12 backends.
 |---|---|---|---|
 | `algorithms.cu` | scanPerBlockKernel, addBlockSumsKernel, scanPerBlockKernel4x4, addBlockSumsKernel4x4, radixFourBitCountPerBlockKernel, radixFourBitReorderKernel, reorderKernel | ✅ | `scan.slang`, `scan4x4.slang`, `radixFourBit.slang`, `reorderData.slang` — the complete PxGpuRadixSort pipeline (PxgAlgorithms.cpp); PxU64-packed rank scans become uint4-lane scans, the PxU16 offsets buffer is widened to 32-bit |
 | `updateTransformAndBoundArray.cu` | updateTransformCacheAndBoundArrayLaunch | 🟡 | `updateBounds.slang` — rigid-body path ✅ incl. all geometry types; articulation branch and `updateChangedAABBMgrHandlesLaunch`/`mergeTransformCacheAndBoundArrayChanges` ⬜ |
-| `updateBodiesAndShapes.cu` | body/shape DMA updates | ⬜ | |
+| `updateBodiesAndShapes.cu` | body/shape DMA + direct GPU API | 🟡 | `bodyUpdate.slang` (updateBodiesLaunch ✅, updateBodiesLaunchDirectAPI ✅ incl. CMassLocalPose body2World re-derivation, updateShapesLaunch ✅, updateBodyExternalVelocitiesLaunch ✅), `directApi.slang` (get/set pose, velocities, accelerations, force, torque ✅), setRigidDynamicGlobalPose ✅ in `updateBounds.slang` (incl. node-index binary search + per-shape bounds refresh); copyUserData = MemCopyBalanced ✅; articulation kernels (newArticulationsLaunch, updateArticulationsLaunch, updateJointsLaunch, D6 joint getters) ⬜ |
 | `rigidDeltaAccum.cu`, `SDFConstruction.cu`, `softBody*.cu`, `FEMCloth*.cu`, `particlesystem.cu`, `diffuseParticles.cu`, `anisotropy.cu`, `isosurfaceExtraction.cu`, `sparseGridStandalone.cu` | deformables / particles | ⬜ | |
 
 ## gpubroadphase / gpunarrowphase / gpuarticulation
@@ -64,7 +64,7 @@ Vulkan/D3D12 backends.
 
 ## Verification
 
-All ported kernels are covered by `tests/` (31 GPU test cases, run per commit
+All ported kernels are covered by `tests/` (36 GPU test cases, run per commit
 via ctest on a Vulkan device — llvmpipe in CI):
 
 | Kernel | Reference | Checks |
@@ -78,6 +78,8 @@ via ctest on a Vulkan device — llvmpipe in CI):
 | integration (TGS) | C++ transcription of `integrateCoreTGS` | TGS velocity-pool layout, delta-transform pose accumulation, sleep state machine (flags exact) |
 | updateBounds | C++ transcription of `updateCacheAndBound.cuh` | AABBs for 5 geometry classes, transform cache, frozen/unfrozen/updated/activate/deactivate (exact) |
 | MemCopyBalanced | `memcpy` | 40 random descriptors incl. empty payloads, byte-offset addressing |
+| body/shape DMA | C++ transcription of `updateBodiesAndShapes.cu` | scatter by embedded index (bit-exact), direct-API partial copies (velocity .w-merge, first-transfer, body2Actor-change pose re-derivation), external velocity updates |
+| direct GPU API | C++ transcription | pose composition (body2World·body2Actor⁻¹ and inverse), velocity/acceleration getters, velocity/force/torque setters incl. world-space inertia transform, setGlobalPose with sorted node-index binary search + bounds/cache refresh |
 | clampMaxValue(s) | scalar clamp | in-place counter clamping |
 | skinning | C++ transcription of `utility.cu` | area-weighted vertex normals (atomic accumulation), Phong cloth interpolation incl. out-of-triangle uv projection and thickness clamping, barycentric softbody interpolation, buffer interleaving, strided-view addressing |
 

@@ -53,7 +53,9 @@ static const uint BLOCK_SIZE = 256;
 
 struct UpdateBoundsParams
 {
-    uint numShapes;
+    uint numShapes;      // updateTransformCacheAndBoundArrayLaunch
+    uint nbElements;     // setRigidDynamicGlobalPose: number of pose updates
+    uint totalNumShapes; // setRigidDynamicGlobalPose: size of the node/shape index maps
 };
 
 [[vk::push_constant]]
@@ -72,6 +74,12 @@ RWStructuredBuffer<uint> gUpdated;                      // binding 9
 RWStructuredBuffer<uint> gActive;                       // binding 10
 RWStructuredBuffer<uint> gDeactivate;                   // binding 11
 RWStructuredBuffer<uint> gGeometryBlob;                 // binding 12 (cooked convex hulls, uint-addressed)
+
+// additional bindings for setRigidDynamicGlobalPose (direct GPU API)
+RWStructuredBuffer<uint2> gRigidNodeIndices;            // binding 13: sorted PxNodeIndex per shape
+RWStructuredBuffer<uint> gShapeIndices;                 // binding 14: shape index per sorted entry
+RWStructuredBuffer<float> gPoseData;                    // binding 15: user PxTransform array (7 floats each)
+RWStructuredBuffer<uint> gGpuIndices;                   // binding 16: PxRigidDynamicGPUIndex array
 
 // PxBounds3 is 24 bytes (min, max as PxVec3).  To keep the C++-compatible
 // tight packing independent of vector-alignment rules the bounds array is
@@ -297,5 +305,97 @@ void updateTransformCacheAndBoundArrayLaunch(uint3 dispatchThreadId : SV_Dispatc
             }
         }
         // else: articulation branch not yet ported (see file header)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// setRigidDynamicGlobalPose (direct GPU API, updateBodiesAndShapes.cu)
+// ---------------------------------------------------------------------------
+
+// mirrors binarySearch<PxNodeIndex>() in reduction.cuh: index of the last
+// element <= value (0 when the array is empty or all elements are greater;
+// the caller's backward walk handles both).
+uint binarySearchNodeIndex(uint totalCount, uint2 value)
+{
+    uint left = 0;
+    uint right = totalCount;
+
+    while (left < right)
+    {
+        const uint pos = (left + right) / 2;
+        const uint2 element = gRigidNodeIndices[pos];
+        // 64-bit compare: element <= value
+        const bool lessEqual = element.y < value.y || (element.y == value.y && element.x <= value.x);
+        if (lessEqual)
+            left = pos + 1;
+        else
+            right = pos;
+    }
+
+    return left != 0 ? left - 1 : 0;
+}
+
+// mirrors setRigidDynamicGlobalPose() in updateBodiesAndShapes.cu: writes the
+// new actor pose into the body sim (as body2World = pose * body2Actor) and
+// refreshes transform cache + bounds for every shape of the rigid body.
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void setRigidDynamicGlobalPose(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint i = dispatchThreadId.x;
+    if (i >= gParams.nbElements)
+        return;
+
+    const uint index = gGpuIndices[i];
+
+    // input PxTransform (7 tightly packed floats: q, p)
+    const float4 inQ = float4(gPoseData[i * 7 + 0], gPoseData[i * 7 + 1], gPoseData[i * 7 + 2],
+                              gPoseData[i * 7 + 3]);
+    const float3 inP = float3(gPoseData[i * 7 + 4], gPoseData[i * 7 + 5], gPoseData[i * 7 + 6]);
+
+    PxgBodySim bodySim = gBodySims[index];
+
+    // body2World = trans.transform(body2Actor) (PxAlignedTransform math)
+    const float4 b2aQ = bodySim.body2Actor_maxImpulseW.q;
+    const float4 b2aP = bodySim.body2Actor_maxImpulseW.p;
+    const float4 q = quatMul(inQ, b2aQ);
+    const float3 p = quatRotate(inQ, b2aP.xyz) + inP;
+    const PxgTransform28 body2World = makeTransform28(q, p);
+
+    gBodySims[index].body2World.p = float4(p, 0.0f);
+    gBodySims[index].body2World.q = q;
+
+    const PxgTransform28 body2Actor = makeTransform28(b2aQ, b2aP.xyz);
+
+    if (gParams.totalNumShapes == 0)
+    {
+        // guard against no actors having shapes in the scene
+        return;
+    }
+
+    // we know this is not an articulation link, so all fine
+    const uint2 nodeIndex = uint2(index, 0);
+
+    // search for the last position matching the node index, then walk
+    // backward over the sorted per-shape node index array
+    uint pos = binarySearchNodeIndex(gParams.totalNumShapes, nodeIndex);
+
+    while (pos != 0xFFFFFFFFu && all(gRigidNodeIndices[pos] == nodeIndex))
+    {
+        const uint shapeIndex = gShapeIndices[pos];
+        if (shapeIndex != 0xFFFFFFFFu)
+        {
+            const PxgShapeSim shapeSim = gShapeSims[shapeIndex];
+
+            const PxgTransform28 absPos = getAbsPose(body2World, shapeSim.mTransform, body2Actor);
+
+            // updateCacheAndBound(..., isBP = true)
+            gTransformCache[shapeIndex].transform = absPos;
+            gTransformCache[shapeIndex].flags = 0;
+            updateBounds(shapeSim, absPos, shapeIndex);
+
+            gUpdated[shapeIndex] = 1;
+        }
+        pos--;
     }
 }

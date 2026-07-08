@@ -44,7 +44,9 @@ using namespace pxgtest;
 
 struct UpdateBoundsParams
 {
-    uint32_t numShapes;
+    uint32_t numShapes;      // updateTransformCacheAndBoundArrayLaunch
+    uint32_t nbElements;     // setRigidDynamicGlobalPose
+    uint32_t totalNumShapes; // setRigidDynamicGlobalPose
 };
 
 // ---------------------------------------------------------------------------
@@ -423,7 +425,7 @@ PXG_TEST(updateBounds_allGeometryTypes)
     PxgBufferHandle deactivateBuf = createBufferFrom(dev, zerosNodes);
     PxgBufferHandle blobBuf = createBufferFrom(dev, geometryBlob);
 
-    const UpdateBoundsParams params = { numShapes };
+    const UpdateBoundsParams params = { numShapes, 0, 0 };
     const uint32_t blockSize = 256;
     kernel.dispatch((numShapes + blockSize - 1) / blockSize,
                     { shapeSimBuf, shapesBuf, bodySimBuf, bodyIdxBuf, sleepBuf, cacheBuf, boundsBuf,
@@ -491,6 +493,250 @@ PXG_TEST(updateBounds_allGeometryTypes)
     dev->destroyBuffer(activeBuf);
     dev->destroyBuffer(deactivateBuf);
     dev->destroyBuffer(blobBuf);
+}
+
+// ---------------------------------------------------------------------------
+// setRigidDynamicGlobalPose (direct GPU API entry in updateBounds.slang)
+// ---------------------------------------------------------------------------
+PXG_TEST(setRigidDynamicGlobalPose)
+{
+    std::mt19937 rng(778);
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::uniform_real_distribution<float> sym(-10.f, 10.f);
+
+    const uint32_t numBodies = 40;
+    const uint32_t nbUpdates = 25;
+
+    // bodies
+    std::vector<BodySim> bodySims(numBodies);
+    std::memset(bodySims.data(), 0, bodySims.size() * sizeof(BodySim));
+    for (BodySim& b : bodySims)
+    {
+        b.body2World.q = randomQuat(rng).toFloat4();
+        b.body2World.p = Float4{ sym(rng), sym(rng), sym(rng), 0 };
+        b.body2Actor_maxImpulseW.q = randomQuat(rng).toFloat4();
+        b.body2Actor_maxImpulseW.p = Float4{ sym(rng) * 0.1f, sym(rng) * 0.1f, sym(rng) * 0.1f, 0 };
+    }
+
+    // shapes: 0-4 per body, sorted per-shape node index array
+    std::vector<ShapeSim> shapeSims;
+    std::vector<uint64_t> nodeIndices;
+    std::vector<uint32_t> shapeIndices;
+    for (uint32_t bodyIdx = 0; bodyIdx < numBodies; ++bodyIdx)
+    {
+        const uint32_t nbShapes = rng() % 5;
+        for (uint32_t s = 0; s < nbShapes; ++s)
+        {
+            ShapeSim shape = {};
+            shape.transform.q = randomQuat(rng).toQuat();
+            shape.transform.p = Float3{ sym(rng) * 0.2f, sym(rng) * 0.2f, sym(rng) * 0.2f };
+            shape.bodySimIndex = makeNodeIndex(bodyIdx);
+            shape.shapeFlags = eSIMULATION_SHAPE;
+            const float roll = unit(rng);
+            if (roll < 0.4f)
+            {
+                shape.shapeType = eSPHERE;
+                const float r = 0.5f + unit(rng);
+                shape.localBoundsMin = Float3{ -r, -r, -r };
+                shape.localBoundsMax = Float3{ r, r, r };
+            }
+            else if (roll < 0.8f)
+            {
+                shape.shapeType = eBOX;
+                const Float3 he{ 0.2f + unit(rng), 0.2f + unit(rng), 0.2f + unit(rng) };
+                shape.localBoundsMin = Float3{ -he.x, -he.y, -he.z };
+                shape.localBoundsMax = he;
+            }
+            else
+            {
+                shape.shapeType = eCAPSULE;
+                const float r = 0.2f + unit(rng);
+                const float hh = 0.3f + unit(rng);
+                shape.localBoundsMin = Float3{ -(hh + r), -r, -r };
+                shape.localBoundsMax = Float3{ hh + r, r, r };
+            }
+            shape.hullDataIndex = 0xFFFFFFFFu;
+
+            // ~10% deleted entries in the map
+            const bool deleted = unit(rng) < 0.1f;
+            nodeIndices.push_back(makeNodeIndex(bodyIdx));
+            shapeIndices.push_back(deleted ? 0xFFFFFFFFu : uint32_t(shapeSims.size()));
+            shapeSims.push_back(shape);
+        }
+    }
+    const uint32_t totalNumShapes = uint32_t(nodeIndices.size());
+    const uint32_t numShapes = uint32_t(shapeSims.size());
+
+    // pose updates for a subset of bodies
+    std::vector<uint32_t> updateIndices(numBodies);
+    std::iota(updateIndices.begin(), updateIndices.end(), 0u);
+    std::shuffle(updateIndices.begin(), updateIndices.end(), rng);
+    updateIndices.resize(nbUpdates);
+
+    std::vector<float> poseData(nbUpdates * 7);
+    for (uint32_t i = 0; i < nbUpdates; ++i)
+    {
+        const QuatV q = randomQuat(rng);
+        poseData[i * 7 + 0] = q.x;
+        poseData[i * 7 + 1] = q.y;
+        poseData[i * 7 + 2] = q.z;
+        poseData[i * 7 + 3] = q.w;
+        poseData[i * 7 + 4] = sym(rng);
+        poseData[i * 7 + 5] = sym(rng);
+        poseData[i * 7 + 6] = sym(rng);
+    }
+
+    // ---- GPU ----
+    PxgSlangComputeDevice* dev = testDevice();
+
+    Kernel kernel("updateBounds.spv", "setRigidDynamicGlobalPose",
+                  { sizeof(ShapeSim), sizeof(Shape), sizeof(BodySim), 4, sizeof(SolverBodySleepData),
+                    sizeof(CachedTransform), 4, 4, 4, 4, 4, 4, 4, 8, 4, 4, 4 },
+                  sizeof(UpdateBoundsParams));
+
+    PxgBufferHandle shapeSimBuf = createBufferFrom(dev, shapeSims);
+    PxgBufferHandle dummyShapes = dev->createBuffer(sizeof(Shape));
+    PxgBufferHandle bodySimBuf = createBufferFrom(dev, bodySims);
+    PxgBufferHandle dummy4a = dev->createBuffer(16);
+    PxgBufferHandle dummySleep = dev->createBuffer(16);
+    std::vector<CachedTransform> cacheInit(numShapes);
+    std::memset(cacheInit.data(), 0, cacheInit.size() * sizeof(CachedTransform));
+    PxgBufferHandle cacheBuf = createBufferFrom(dev, cacheInit);
+    std::vector<float> boundsInit(numShapes * 6, 0.f);
+    PxgBufferHandle boundsBuf = createBufferFrom(dev, boundsInit);
+    std::vector<uint32_t> zerosShapes(numShapes, 0);
+    PxgBufferHandle dummyFrozen = dev->createBuffer(16);
+    PxgBufferHandle dummyUnfrozen = dev->createBuffer(16);
+    PxgBufferHandle updatedBuf = createBufferFrom(dev, zerosShapes);
+    PxgBufferHandle dummyActive = dev->createBuffer(16);
+    PxgBufferHandle dummyDeactivate = dev->createBuffer(16);
+    PxgBufferHandle dummyBlob = dev->createBuffer(16);
+    PxgBufferHandle nodeIdxBuf = createBufferFrom(dev, nodeIndices);
+    PxgBufferHandle shapeIdxBuf = createBufferFrom(dev, shapeIndices);
+    PxgBufferHandle poseBuf = createBufferFrom(dev, poseData);
+    PxgBufferHandle gpuIdxBuf = createBufferFrom(dev, updateIndices);
+
+    const UpdateBoundsParams params = { 0, nbUpdates, totalNumShapes };
+    kernel.dispatch((nbUpdates + 255) / 256,
+                    { shapeSimBuf, dummyShapes, bodySimBuf, dummy4a, dummySleep, cacheBuf, boundsBuf,
+                      dummyFrozen, dummyUnfrozen, updatedBuf, dummyActive, dummyDeactivate, dummyBlob,
+                      nodeIdxBuf, shapeIdxBuf, poseBuf, gpuIdxBuf },
+                    params);
+    dev->flush();
+
+    // ---- reference ----
+    std::vector<BodySim> refBodySims = bodySims;
+    std::vector<CachedTransform> refCache = cacheInit;
+    std::vector<Bounds3> refBounds(numShapes, Bounds3{});
+    std::vector<uint32_t> refUpdated(numShapes, 0);
+
+    for (uint32_t i = 0; i < nbUpdates; ++i)
+    {
+        const uint32_t index = updateIndices[i];
+        BodySim& bodySim = refBodySims[index];
+
+        const QuatV inQ(poseData[i * 7 + 0], poseData[i * 7 + 1], poseData[i * 7 + 2], poseData[i * 7 + 3]);
+        const Vec3 inP(poseData[i * 7 + 4], poseData[i * 7 + 5], poseData[i * 7 + 6]);
+
+        const QuatV b2aQ(bodySim.body2Actor_maxImpulseW.q);
+        const Vec3 b2aP(bodySim.body2Actor_maxImpulseW.p.x, bodySim.body2Actor_maxImpulseW.p.y,
+                        bodySim.body2Actor_maxImpulseW.p.z);
+
+        const QuatV q = inQ * b2aQ;
+        const Vec3 p = inQ.rotate(b2aP) + inP;
+        const TransformV body2World(q, p);
+
+        bodySim.body2World.q = q.toFloat4();
+        bodySim.body2World.p = Float4{ p.x, p.y, p.z, 0.f };
+
+        const TransformV body2Actor(b2aQ, b2aP);
+
+        // binarySearch: last pos with node <= value, then walk backward
+        const uint64_t nodeIndex = makeNodeIndex(index);
+        uint32_t left = 0, right = totalNumShapes;
+        while (left < right)
+        {
+            const uint32_t pos = (left + right) / 2;
+            if (nodeIndices[pos] <= nodeIndex)
+                left = pos + 1;
+            else
+                right = pos;
+        }
+        uint32_t pos = left != 0 ? left - 1 : 0;
+
+        while (pos != 0xFFFFFFFFu && nodeIndices[pos] == nodeIndex)
+        {
+            const uint32_t shapeIndex = shapeIndices[pos];
+            if (shapeIndex != 0xFFFFFFFFu)
+            {
+                const ShapeSim& shapeSim = shapeSims[shapeIndex];
+                const TransformV absPos = getAbsPose(body2World, TransformV(shapeSim.transform), body2Actor);
+                refCache[shapeIndex].transform = absPos.toTransform28();
+                refCache[shapeIndex].flags = 0;
+                refUpdateBounds(shapeSim, {}, {}, absPos, refBounds[shapeIndex]);
+                refUpdated[shapeIndex] = 1;
+            }
+            --pos;
+        }
+    }
+
+    // ---- compare ----
+    const std::vector<BodySim> gpuBodySims = downloadBuffer<BodySim>(dev, bodySimBuf, numBodies);
+    const std::vector<CachedTransform> gpuCache = downloadBuffer<CachedTransform>(dev, cacheBuf, numShapes);
+    const std::vector<float> gpuBounds = downloadBuffer<float>(dev, boundsBuf, numShapes * 6);
+    const std::vector<uint32_t> gpuUpdated = downloadBuffer<uint32_t>(dev, updatedBuf, numShapes);
+
+    for (uint32_t n = 0; n < numBodies; ++n)
+    {
+        const Float4& gq = gpuBodySims[n].body2World.q;
+        const Float4& rq = refBodySims[n].body2World.q;
+        const Float4& gp = gpuBodySims[n].body2World.p;
+        const Float4& rp = refBodySims[n].body2World.p;
+        PXG_CHECK_MSG(almostEqual(gq.x, rq.x) && almostEqual(gq.y, rq.y) && almostEqual(gq.z, rq.z) &&
+                          almostEqual(gq.w, rq.w) && almostEqual(gp.x, rp.x, 1e-4f, 1e-4f) &&
+                          almostEqual(gp.y, rp.y, 1e-4f, 1e-4f) && almostEqual(gp.z, rp.z, 1e-4f, 1e-4f),
+                      "setGlobalPose body2World[%u]", n);
+    }
+
+    for (uint32_t s = 0; s < numShapes; ++s)
+    {
+        PXG_CHECK_MSG(gpuUpdated[s] == refUpdated[s], "setGlobalPose updated[%u]: gpu=%u ref=%u", s,
+                      gpuUpdated[s], refUpdated[s]);
+        if (!refUpdated[s])
+            continue;
+
+        const Transform28& gt = gpuCache[s].transform;
+        const Transform28& rt = refCache[s].transform;
+        PXG_CHECK_MSG(almostEqual(gt.q.x, rt.q.x, 1e-4f, 1e-5f) && almostEqual(gt.q.y, rt.q.y, 1e-4f, 1e-5f) &&
+                          almostEqual(gt.q.z, rt.q.z, 1e-4f, 1e-5f) && almostEqual(gt.q.w, rt.q.w, 1e-4f, 1e-5f) &&
+                          almostEqual(gt.p.x, rt.p.x, 1e-4f, 1e-4f) && almostEqual(gt.p.y, rt.p.y, 1e-4f, 1e-4f) &&
+                          almostEqual(gt.p.z, rt.p.z, 1e-4f, 1e-4f),
+                      "setGlobalPose cache[%u]", s);
+
+        const float rb[6] = { refBounds[s].minimum.x, refBounds[s].minimum.y, refBounds[s].minimum.z,
+                              refBounds[s].maximum.x, refBounds[s].maximum.y, refBounds[s].maximum.z };
+        for (int c = 0; c < 6; ++c)
+            PXG_CHECK_MSG(almostEqual(gpuBounds[s * 6 + c], rb[c], 1e-4f, 1e-3f),
+                          "setGlobalPose bounds[%u][%d]: gpu=%g ref=%g", s, c, gpuBounds[s * 6 + c], rb[c]);
+    }
+
+    dev->destroyBuffer(shapeSimBuf);
+    dev->destroyBuffer(dummyShapes);
+    dev->destroyBuffer(bodySimBuf);
+    dev->destroyBuffer(dummy4a);
+    dev->destroyBuffer(dummySleep);
+    dev->destroyBuffer(cacheBuf);
+    dev->destroyBuffer(boundsBuf);
+    dev->destroyBuffer(dummyFrozen);
+    dev->destroyBuffer(dummyUnfrozen);
+    dev->destroyBuffer(updatedBuf);
+    dev->destroyBuffer(dummyActive);
+    dev->destroyBuffer(dummyDeactivate);
+    dev->destroyBuffer(dummyBlob);
+    dev->destroyBuffer(nodeIdxBuf);
+    dev->destroyBuffer(shapeIdxBuf);
+    dev->destroyBuffer(poseBuf);
+    dev->destroyBuffer(gpuIdxBuf);
 }
 
 } // namespace
