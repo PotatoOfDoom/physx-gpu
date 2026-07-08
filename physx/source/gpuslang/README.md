@@ -38,6 +38,7 @@ gpuslang/
 │   ├── broadphaseIncrementalHistogram.slang  incremental-SAP comparison-count histograms
 │   ├── broadphaseEndPtHistogram.slang        start/end-point projection histograms + ordered handles
 │   ├── broadphaseIncrementalSap.slang        incremental sweep-and-prune found/lost pair generation
+│   ├── broadphaseRegionHistogram.slang       region accumulator prefix-sum scan pair
 │   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
 │   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
@@ -113,7 +114,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (60 GPU test cases + 67 DX12 cross-compile checks) verifies:
+The suite (61 GPU test cases + 69 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
@@ -198,7 +199,13 @@ The suite (60 GPU test cases + 67 DX12 cross-compile checks) verifies:
   direction, with first-axis-of-separation dedup and group/environment-ID
   filtering) and the atomic-compacted found/lost pair emission, verified by
   comparing the produced pair sets and counts against a transcription of the
-  kernel logic.
+  kernel logic;
+- **broad-phase region histogram** — the region-accumulator prefix-sum scan pair
+  (the shared computeHistogram/outputHistogram helpers behind the four
+  start-region/region wrappers): a plain device-wide two-pass exclusive prefix
+  sum plus grand total over a flat integer array, verified against
+  `std::exclusive_scan` across warp/block/grid-stride boundary sizes and a
+  wide-value case.
 
 ## Known limitations
 

@@ -119,6 +119,7 @@ pxg_compile_shader(broadphaseIncrementalHistogram computeIncrementalComparisonHi
                    computeIncrementalComparisonHistograms_Stage2)
 pxg_compile_shader(broadphaseEndPtHistogram computeEndPtsHistogram outputEndPtsHistogram)
 pxg_compile_shader(broadphaseIncrementalSap performIncrementalSAP)
+pxg_compile_shader(broadphaseRegionHistogram computeRegionsHistogram outputRegionsHistogram)
 pxg_compile_shader(memCopy MemCopyBalanced)
 pxg_compile_shader(clampValues clampMaxValue clampMaxValues)
 pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeighted
@@ -158,7 +159,8 @@ add_executable(gpuslang-tests
     testBroadphaseReports.cpp
     testBroadphaseIncrementalHistogram.cpp
     testBroadphaseEndPtHistogram.cpp
-    testBroadphaseIncrementalSap.cpp)
+    testBroadphaseIncrementalSap.cpp
+    testBroadphaseRegionHistogram.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
@@ -166,7 +168,8 @@ enable_testing()
 foreach(suite scan radixSort preIntegration integration updateBounds memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
         constraintPrepPGS constraintPrepTGS thresholdStream broadphaseSetup broadphaseReports
-        broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap)
+        broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
+        broadphaseRegionHistogram)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -211,6 +214,8 @@ set(PXG_HLSL_ENTRIES
     "broadphaseEndPtHistogram:computeEndPtsHistogram"
     "broadphaseEndPtHistogram:outputEndPtsHistogram"
     "broadphaseIncrementalSap:performIncrementalSAP"
+    "broadphaseRegionHistogram:computeRegionsHistogram"
+    "broadphaseRegionHistogram:outputRegionsHistogram"
     "solverPGS:computeAverageSolverBodyVelocity" "solverPGS:propagateSolverBodyVelocity"
     "scan4x4:scanPerBlockKernel4x4" "scan4x4:addBlockSumsKernel4x4"
     "radixFourBit:radixFourBitCountPerBlockKernel" "radixFourBit:radixFourBitReorderKernel"
