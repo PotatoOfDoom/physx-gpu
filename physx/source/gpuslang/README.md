@@ -35,6 +35,7 @@ gpuslang/
 │   ├── solverApplyGravityTGS.slang   TGS substep gravity + external accel (lock flags, inertia)
 │   ├── solverDmaBack.slang           force-change elem DMA-back + constraint residual gather
 │   ├── npPairManagement.slang        narrow-phase sparse-remove keep/drop core + manifold init
+│   ├── npPairRemoveSwap.slang        narrow-phase sparse-remove Stage5 data swap (+ CvxTri)
 │   ├── pxgSlangPrepCommon.slang     constraint-prep inputs + Dy 1D solver-constant helpers
 │   ├── constraintPrepPGS.slang      PGS contact + 1D joint constraint prep
 │   ├── constraintPrepTGS.slang      TGS contact + 1D joint constraint prep
@@ -136,7 +137,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (91 GPU test cases + 119 DX12 cross-compile checks) verifies:
+The suite (93 GPU test cases + 121 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;

@@ -122,6 +122,7 @@ pxg_compile_shader(solverApplyGravityTGS applyTGSSubstepGravity)
 pxg_compile_shader(solverDmaBack dmaBackChangedElems dmaConstraintResidual)
 pxg_compile_shader(npPairManagement initializeKeepDropBuffer markKeepDropBuff processKeepDropBuff
                    accumulateKeepDrop initializeManifolds)
+pxg_compile_shader(npPairRemoveSwap removeContactManagers_Stage5 removeContactManagers_Stage5_CvxTri)
 pxg_compile_shader(broadphaseSetup translateAABBsLaunch markCreatedPairsLaunch initializeSapBox1DLaunch
                    initializeRadixRanks updateHandles)
 pxg_compile_shader(broadphaseReports accumulateReportsStage_1 accumulateReportsStage_2 copyReports)
@@ -191,6 +192,7 @@ add_executable(gpuslang-tests
     testSolverApplyGravityTGS.cpp
     testSolverDmaBack.cpp
     testNpPairManagement.cpp
+    testNpPairRemoveSwap.cpp
     testBroadphaseSetup.cpp
     testBroadphaseReports.cpp
     testBroadphaseIncrementalHistogram.cpp
@@ -218,7 +220,7 @@ add_dependencies(gpuslang-tests gpuslang-shaders)
 enable_testing()
 foreach(suite scan radixSort radixSortGather preIntegration integration updateBounds memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
-        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement broadphaseSetup broadphaseReports
+        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
         broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram
         broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
@@ -273,6 +275,8 @@ set(PXG_HLSL_ENTRIES
     "npPairManagement:initializeKeepDropBuffer" "npPairManagement:markKeepDropBuff"
     "npPairManagement:processKeepDropBuff" "npPairManagement:accumulateKeepDrop"
     "npPairManagement:initializeManifolds"
+    "npPairRemoveSwap:removeContactManagers_Stage5"
+    "npPairRemoveSwap:removeContactManagers_Stage5_CvxTri"
     "broadphaseSetup:translateAABBsLaunch" "broadphaseSetup:markCreatedPairsLaunch"
     "broadphaseSetup:initializeSapBox1DLaunch" "broadphaseSetup:initializeRadixRanks"
     "broadphaseSetup:updateHandles"
