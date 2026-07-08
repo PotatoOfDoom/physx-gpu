@@ -128,6 +128,7 @@ pxg_compile_shader(broadphaseOverlapCheckHistogram writeOutOverlapChecksForInser
 pxg_compile_shader(broadphaseNewBoundsPairs generateFoundPairsForNewBoundsRegion)
 pxg_compile_shader(broadphaseMarkPairs markRemovedPairsLaunch markRemovedPairsProjectionsLaunch
                    markUpdatedPairsLaunch markUpdatedPairsLaunch2)
+pxg_compile_shader(broadphaseClearNewFlag clearNewFlagLaunch bpSignalComplete)
 pxg_compile_shader(memCopy MemCopyBalanced)
 pxg_compile_shader(clampValues clampMaxValue clampMaxValues)
 pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeighted
@@ -173,7 +174,8 @@ add_executable(gpuslang-tests
     testBroadphaseActiveRegionHistogram.cpp
     testBroadphaseOverlapCheckHistogram.cpp
     testBroadphaseNewBoundsPairs.cpp
-    testBroadphaseMarkPairs.cpp)
+    testBroadphaseMarkPairs.cpp
+    testBroadphaseClearNewFlag.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
@@ -183,7 +185,8 @@ foreach(suite scan radixSort preIntegration integration updateBounds memCopy cla
         constraintPrepPGS constraintPrepTGS thresholdStream broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
         broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram
-        broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs)
+        broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
+        broadphaseClearNewFlag)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -242,6 +245,8 @@ set(PXG_HLSL_ENTRIES
     "broadphaseMarkPairs:markRemovedPairsProjectionsLaunch"
     "broadphaseMarkPairs:markUpdatedPairsLaunch"
     "broadphaseMarkPairs:markUpdatedPairsLaunch2"
+    "broadphaseClearNewFlag:clearNewFlagLaunch"
+    "broadphaseClearNewFlag:bpSignalComplete"
     "solverPGS:computeAverageSolverBodyVelocity" "solverPGS:propagateSolverBodyVelocity"
     "scan4x4:scanPerBlockKernel4x4" "scan4x4:addBlockSumsKernel4x4"
     "radixFourBit:radixFourBitCountPerBlockKernel" "radixFourBit:radixFourBitReorderKernel"
