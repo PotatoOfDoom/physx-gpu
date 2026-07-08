@@ -64,7 +64,8 @@ file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
 
 set(SHADER_COMMON_DEPS
     ${SHADER_DIR}/pxgSlangCommon.slang
-    ${SHADER_DIR}/pxgSlangScan.slang)
+    ${SHADER_DIR}/pxgSlangScan.slang
+    ${SHADER_DIR}/pxgSlangPrepCommon.slang)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
@@ -103,6 +104,10 @@ pxg_compile_shader(solverPGS solveBlockPartition concludeBlocks writebackBlocks 
 pxg_compile_shader(solverTGS solveBlockPartitionTGS concludeBlocksTGS writebackBlocksTGS
                    writeBackBodiesTGS computeAverageSolverBodyVelocityTGS
                    propagateAverageSolverBodyVelocityTGS)
+pxg_compile_shader(constraintPrepPGS contactConstraintBlockPrepareParallelLaunch
+                   jointConstraintBlockPrepareParallelLaunch)
+pxg_compile_shader(constraintPrepTGS contactConstraintBlockPrepareParallelLaunchTGS
+                   jointConstraintBlockPrepareParallelLaunchTGS)
 pxg_compile_shader(memCopy MemCopyBalanced)
 pxg_compile_shader(clampValues clampMaxValue clampMaxValues)
 pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeighted
@@ -135,13 +140,15 @@ add_executable(gpuslang-tests
     testAlgorithms.cpp
     testBodyUpdate.cpp
     testSolver.cpp
-    testSolverTGS.cpp)
+    testSolverTGS.cpp
+    testConstraintPrep.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
 enable_testing()
 foreach(suite scan radixSort preIntegration integration updateBounds memCopy clamp skinning
-        scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS)
+        scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
+        constraintPrepPGS constraintPrepTGS)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -168,6 +175,10 @@ set(PXG_HLSL_ENTRIES
     "solverTGS:solveBlockPartitionTGS" "solverTGS:concludeBlocksTGS" "solverTGS:writebackBlocksTGS"
     "solverTGS:writeBackBodiesTGS" "solverTGS:computeAverageSolverBodyVelocityTGS"
     "solverTGS:propagateAverageSolverBodyVelocityTGS"
+    "constraintPrepPGS:contactConstraintBlockPrepareParallelLaunch"
+    "constraintPrepPGS:jointConstraintBlockPrepareParallelLaunch"
+    "constraintPrepTGS:contactConstraintBlockPrepareParallelLaunchTGS"
+    "constraintPrepTGS:jointConstraintBlockPrepareParallelLaunchTGS"
     "solverPGS:computeAverageSolverBodyVelocity" "solverPGS:propagateSolverBodyVelocity"
     "scan4x4:scanPerBlockKernel4x4" "scan4x4:addBlockSumsKernel4x4"
     "radixFourBit:radixFourBitCountPerBlockKernel" "radixFourBit:radixFourBitReorderKernel"

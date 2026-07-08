@@ -29,6 +29,9 @@ gpuslang/
 │   ├── updateBounds.slang           transform cache + world AABB update
 │   ├── solverPGS.slang              PGS solver: iteration, conclude, writeback, averaging
 │   ├── solverTGS.slang              TGS solver: iteration, conclude, writeback, averaging
+│   ├── pxgSlangPrepCommon.slang     constraint-prep inputs + Dy 1D solver-constant helpers
+│   ├── constraintPrepPGS.slang      PGS contact + 1D joint constraint prep
+│   ├── constraintPrepTGS.slang      TGS contact + 1D joint constraint prep
 │   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
 │   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
@@ -104,7 +107,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (42 GPU test cases + 44 DX12 cross-compile checks) verifies:
+The suite (47 GPU test cases + 48 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
@@ -146,7 +149,13 @@ The suite (42 GPU test cases + 44 DX12 cross-compile checks) verifies:
   export and the threshold stream, the 6-component mass-splitting velocity
   averaging with slab-count reset, the per-substep delta-pose quaternion
   integration (including body lock flags and kinematics) and the
-  accumulated-delta motion-velocity writeback.
+  accumulated-delta motion-velocity writeback;
+- **constraint prep (PGS + TGS)** — the contact and 1D-joint block
+  preparation that turns cooked contact/joint data into the solver's block
+  SoA constraints: friction-patch correlation (including previous-frame
+  anchor carry-over), contact/friction Jacobians and response terms,
+  compliant and TGS coefficient derivations with torsional friction, and the
+  1D-joint row orthogonalization plus PGS/TGS solver-constant computation.
 
 ## Known limitations
 
