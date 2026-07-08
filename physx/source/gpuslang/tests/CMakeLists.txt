@@ -121,6 +121,8 @@ pxg_compile_shader(broadphaseEndPtHistogram computeEndPtsHistogram outputEndPtsH
 pxg_compile_shader(broadphaseIncrementalSap performIncrementalSAP)
 pxg_compile_shader(broadphaseRegionHistogram computeRegionsHistogram outputRegionsHistogram)
 pxg_compile_shader(broadphaseCreateRegions createRegionsKernel)
+pxg_compile_shader(broadphaseActiveRegionHistogram writeOutStartAndActiveRegionHistogram
+                   computeStartAndActiveRegionHistogram outputOrderedActiveRegionHistogram)
 pxg_compile_shader(memCopy MemCopyBalanced)
 pxg_compile_shader(clampValues clampMaxValue clampMaxValues)
 pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeighted
@@ -162,7 +164,8 @@ add_executable(gpuslang-tests
     testBroadphaseEndPtHistogram.cpp
     testBroadphaseIncrementalSap.cpp
     testBroadphaseRegionHistogram.cpp
-    testBroadphaseCreateRegions.cpp)
+    testBroadphaseCreateRegions.cpp
+    testBroadphaseActiveRegionHistogram.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
@@ -171,7 +174,7 @@ foreach(suite scan radixSort preIntegration integration updateBounds memCopy cla
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
         constraintPrepPGS constraintPrepTGS thresholdStream broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
-        broadphaseRegionHistogram broadphaseCreateRegions)
+        broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -219,6 +222,9 @@ set(PXG_HLSL_ENTRIES
     "broadphaseRegionHistogram:computeRegionsHistogram"
     "broadphaseRegionHistogram:outputRegionsHistogram"
     "broadphaseCreateRegions:createRegionsKernel"
+    "broadphaseActiveRegionHistogram:writeOutStartAndActiveRegionHistogram"
+    "broadphaseActiveRegionHistogram:computeStartAndActiveRegionHistogram"
+    "broadphaseActiveRegionHistogram:outputOrderedActiveRegionHistogram"
     "solverPGS:computeAverageSolverBodyVelocity" "solverPGS:propagateSolverBodyVelocity"
     "scan4x4:scanPerBlockKernel4x4" "scan4x4:addBlockSumsKernel4x4"
     "radixFourBit:radixFourBitCountPerBlockKernel" "radixFourBit:radixFourBitReorderKernel"

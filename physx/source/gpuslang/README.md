@@ -40,6 +40,7 @@ gpuslang/
 │   ├── broadphaseIncrementalSap.slang        incremental sweep-and-prune found/lost pair generation
 │   ├── broadphaseRegionHistogram.slang       region accumulator prefix-sum scan pair
 │   ├── broadphaseCreateRegions.slang         region-span + overlap-check-count producer
+│   ├── broadphaseActiveRegionHistogram.slang per-region handle compaction (flags/scan/scatter)
 │   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
 │   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
@@ -115,7 +116,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (62 GPU test cases + 70 DX12 cross-compile checks) verifies:
+The suite (63 GPU test cases + 73 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
@@ -211,7 +212,14 @@ The suite (62 GPU test cases + 70 DX12 cross-compile checks) verifies:
   that maps each box's per-axis endpoint positions through the total-end-point
   histogram into a coarse min/max region-index span, writing regionRange, the
   collision-free start-region scatter and the per-projection region
-  overlap-check counts that the region prefix-sum scan then accumulates.
+  overlap-check counts that the region prefix-sum scan then accumulates;
+- **broad-phase active-region histogram** — the per-region handle-compaction
+  pipeline: stamping start/new flags into each region slice a box touches
+  (binary-search work distribution + region-cell decode), the in-place
+  per-region exclusive prefix of the packed 16/16 start+active flags (a
+  512-thread block scan with block-accumulator carry), and the scatter of each
+  box's handle into the compacted ordered start/active handle arrays, verified
+  end-to-end against a transcription over a synthetic region layout.
 
 ## Known limitations
 
