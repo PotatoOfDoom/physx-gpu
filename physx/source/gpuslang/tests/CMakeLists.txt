@@ -135,6 +135,7 @@ pxg_compile_shader(broadphaseAggregatePairsAdd addAggPairsStage1 addAggPairsStag
 pxg_compile_shader(broadphaseAggregateFinalize aggCopyReports removeAggPairsStage3
                    markAddedAndDeletedAggregatedBounds)
 pxg_compile_shader(broadphaseAggregatePairsRemove removeAggPairsStage1 removeAggPairsStage2)
+pxg_compile_shader(broadphaseAggregateBoxPruning aggregateBipartiteBoxPruning)
 pxg_compile_shader(memCopy MemCopyBalanced)
 pxg_compile_shader(clampValues clampMaxValue clampMaxValues)
 pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeighted
@@ -186,7 +187,8 @@ add_executable(gpuslang-tests
     testBroadphaseAggregateDirty.cpp
     testBroadphaseAggregatePairsAdd.cpp
     testBroadphaseAggregateFinalize.cpp
-    testBroadphaseAggregatePairsRemove.cpp)
+    testBroadphaseAggregatePairsRemove.cpp
+    testBroadphaseAggregateBoxPruning.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
@@ -198,7 +200,8 @@ foreach(suite scan radixSort preIntegration integration updateBounds memCopy cla
         broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram
         broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
-        broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove)
+        broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
+        broadphaseAggregateBoxPruning)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -270,6 +273,7 @@ set(PXG_HLSL_ENTRIES
     "broadphaseAggregateFinalize:markAddedAndDeletedAggregatedBounds"
     "broadphaseAggregatePairsRemove:removeAggPairsStage1"
     "broadphaseAggregatePairsRemove:removeAggPairsStage2"
+    "broadphaseAggregateBoxPruning:aggregateBipartiteBoxPruning"
     "solverPGS:computeAverageSolverBodyVelocity" "solverPGS:propagateSolverBodyVelocity"
     "scan4x4:scanPerBlockKernel4x4" "scan4x4:addBlockSumsKernel4x4"
     "radixFourBit:radixFourBitCountPerBlockKernel" "radixFourBit:radixFourBitReorderKernel"
