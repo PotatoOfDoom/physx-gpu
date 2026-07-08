@@ -126,6 +126,7 @@ pxg_compile_shader(npPairRemoveSwap removeContactManagers_Stage5 removeContactMa
 pxg_compile_shader(npSphereCollision sphereNphase_sphereSphere sphereNphase_spherePlane
                    sphereNphase_sphereCapsule sphereNphase_sphereBox)
 pxg_compile_shader(npCapsuleCollision planeCapsule capsuleCapsule)
+pxg_compile_shader(npMaterialCombine combineMaterials)
 pxg_compile_shader(broadphaseSetup translateAABBsLaunch markCreatedPairsLaunch initializeSapBox1DLaunch
                    initializeRadixRanks updateHandles)
 pxg_compile_shader(broadphaseReports accumulateReportsStage_1 accumulateReportsStage_2 copyReports)
@@ -198,6 +199,7 @@ add_executable(gpuslang-tests
     testNpPairRemoveSwap.cpp
     testNpSphereCollision.cpp
     testNpCapsuleCollision.cpp
+    testNpMaterialCombine.cpp
     testBroadphaseSetup.cpp
     testBroadphaseReports.cpp
     testBroadphaseIncrementalHistogram.cpp
@@ -225,7 +227,7 @@ add_dependencies(gpuslang-tests gpuslang-shaders)
 enable_testing()
 foreach(suite scan radixSort radixSortGather preIntegration integration updateBounds memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
-        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision broadphaseSetup broadphaseReports
+        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
         broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram
         broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
@@ -285,6 +287,7 @@ set(PXG_HLSL_ENTRIES
     "npSphereCollision:sphereNphase_sphereSphere" "npSphereCollision:sphereNphase_spherePlane"
     "npSphereCollision:sphereNphase_sphereCapsule" "npSphereCollision:sphereNphase_sphereBox"
     "npCapsuleCollision:planeCapsule" "npCapsuleCollision:capsuleCapsule"
+    "npMaterialCombine:combineMaterials"
     "broadphaseSetup:translateAABBsLaunch" "broadphaseSetup:markCreatedPairsLaunch"
     "broadphaseSetup:initializeSapBox1DLaunch" "broadphaseSetup:initializeRadixRanks"
     "broadphaseSetup:updateHandles"
