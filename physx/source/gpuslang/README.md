@@ -48,6 +48,7 @@ gpuslang/
 │   ├── broadphaseAggregateBounds.slang       aggregate bounds union + changed-bitmap refresh
 │   ├── broadphaseAggregateDirty.slang        dirty-aggregate double-buffer merge + bound scatter
 │   ├── broadphaseAggregatePairsAdd.slang     agg-pair free-list slot alloc + overflow finalize
+│   ├── broadphaseAggregateFinalize.slang     agg report copy + free-count + added/deleted setEmpty
 │   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
 │   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
@@ -123,7 +124,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (73 GPU test cases + 89 DX12 cross-compile checks) verifies:
+The suite (76 GPU test cases + 92 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
