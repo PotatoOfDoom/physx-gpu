@@ -37,6 +37,7 @@ gpuslang/
 │   ├── broadphaseReports.slang      broad-phase found/lost pair report accumulation
 │   ├── broadphaseIncrementalHistogram.slang  incremental-SAP comparison-count histograms
 │   ├── broadphaseEndPtHistogram.slang        start/end-point projection histograms + ordered handles
+│   ├── broadphaseIncrementalSap.slang        incremental sweep-and-prune found/lost pair generation
 │   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
 │   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
@@ -112,7 +113,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (59 GPU test cases + 66 DX12 cross-compile checks) verifies:
+The suite (60 GPU test cases + 67 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
@@ -188,7 +189,16 @@ The suite (59 GPU test cases + 66 DX12 cross-compile checks) verifies:
   start/end/total-end point histograms and their per-block totals, and the
   compacting scatter of non-deleted handles into the ordered start/end point
   handle arrays, over incremental (with and without the removed-handle rescan)
-  and full-rebuild modes.
+  and full-rebuild modes;
+- **broad-phase incremental SAP** — the sweep-and-prune core
+  (performIncrementalSAP) that consumes the two histogram stages: binary-search
+  work distribution over the per-projection comparison prefix (grid-stride loop),
+  up/down-sweep swap-partner resolution through the ordered start/end handles,
+  integer-AABB overlap-change detection (new/old bounds inverted by sweep
+  direction, with first-axis-of-separation dedup and group/environment-ID
+  filtering) and the atomic-compacted found/lost pair emission, verified by
+  comparing the produced pair sets and counts against a transcription of the
+  kernel logic.
 
 ## Known limitations
 
