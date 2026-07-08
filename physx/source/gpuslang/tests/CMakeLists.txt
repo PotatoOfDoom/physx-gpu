@@ -123,6 +123,8 @@ pxg_compile_shader(solverDmaBack dmaBackChangedElems dmaConstraintResidual)
 pxg_compile_shader(npPairManagement initializeKeepDropBuffer markKeepDropBuff processKeepDropBuff
                    accumulateKeepDrop initializeManifolds)
 pxg_compile_shader(npPairRemoveSwap removeContactManagers_Stage5 removeContactManagers_Stage5_CvxTri)
+pxg_compile_shader(npSphereCollision sphereNphase_sphereSphere sphereNphase_spherePlane
+                   sphereNphase_sphereCapsule sphereNphase_sphereBox)
 pxg_compile_shader(broadphaseSetup translateAABBsLaunch markCreatedPairsLaunch initializeSapBox1DLaunch
                    initializeRadixRanks updateHandles)
 pxg_compile_shader(broadphaseReports accumulateReportsStage_1 accumulateReportsStage_2 copyReports)
@@ -193,6 +195,7 @@ add_executable(gpuslang-tests
     testSolverDmaBack.cpp
     testNpPairManagement.cpp
     testNpPairRemoveSwap.cpp
+    testNpSphereCollision.cpp
     testBroadphaseSetup.cpp
     testBroadphaseReports.cpp
     testBroadphaseIncrementalHistogram.cpp
@@ -220,7 +223,7 @@ add_dependencies(gpuslang-tests gpuslang-shaders)
 enable_testing()
 foreach(suite scan radixSort radixSortGather preIntegration integration updateBounds memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
-        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap broadphaseSetup broadphaseReports
+        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
         broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram
         broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
@@ -277,6 +280,8 @@ set(PXG_HLSL_ENTRIES
     "npPairManagement:initializeManifolds"
     "npPairRemoveSwap:removeContactManagers_Stage5"
     "npPairRemoveSwap:removeContactManagers_Stage5_CvxTri"
+    "npSphereCollision:sphereNphase_sphereSphere" "npSphereCollision:sphereNphase_spherePlane"
+    "npSphereCollision:sphereNphase_sphereCapsule" "npSphereCollision:sphereNphase_sphereBox"
     "broadphaseSetup:translateAABBsLaunch" "broadphaseSetup:markCreatedPairsLaunch"
     "broadphaseSetup:initializeSapBox1DLaunch" "broadphaseSetup:initializeRadixRanks"
     "broadphaseSetup:updateHandles"
