@@ -130,6 +130,7 @@ pxg_compile_shader(broadphaseMarkPairs markRemovedPairsLaunch markRemovedPairsPr
                    markUpdatedPairsLaunch markUpdatedPairsLaunch2)
 pxg_compile_shader(broadphaseClearNewFlag clearNewFlagLaunch bpSignalComplete)
 pxg_compile_shader(broadphaseAggregateBounds markAggregateBoundsUpdatedBitmap updateAggregateBounds)
+pxg_compile_shader(broadphaseAggregateDirty updateDirtyAggregate clearDirtyAggregates)
 pxg_compile_shader(memCopy MemCopyBalanced)
 pxg_compile_shader(clampValues clampMaxValue clampMaxValues)
 pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeighted
@@ -177,7 +178,8 @@ add_executable(gpuslang-tests
     testBroadphaseNewBoundsPairs.cpp
     testBroadphaseMarkPairs.cpp
     testBroadphaseClearNewFlag.cpp
-    testBroadphaseAggregateBounds.cpp)
+    testBroadphaseAggregateBounds.cpp
+    testBroadphaseAggregateDirty.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
@@ -188,7 +190,7 @@ foreach(suite scan radixSort preIntegration integration updateBounds memCopy cla
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
         broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram
         broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
-        broadphaseClearNewFlag broadphaseAggregateBounds)
+        broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -251,6 +253,8 @@ set(PXG_HLSL_ENTRIES
     "broadphaseClearNewFlag:bpSignalComplete"
     "broadphaseAggregateBounds:markAggregateBoundsUpdatedBitmap"
     "broadphaseAggregateBounds:updateAggregateBounds"
+    "broadphaseAggregateDirty:updateDirtyAggregate"
+    "broadphaseAggregateDirty:clearDirtyAggregates"
     "solverPGS:computeAverageSolverBodyVelocity" "solverPGS:propagateSolverBodyVelocity"
     "scan4x4:scanPerBlockKernel4x4" "scan4x4:addBlockSumsKernel4x4"
     "radixFourBit:radixFourBitCountPerBlockKernel" "radixFourBit:radixFourBitReorderKernel"
