@@ -14,7 +14,7 @@ Vulkan/D3D12 backends.
 
 | CUDA source | Kernels | Status | Slang |
 |---|---|---|---|
-| `radixSortImpl.cu` + `RadixSort.cuh` | radixSortMultiBlockLaunch\*, radixSortMultiCalculateRanksLaunch\*, radixSortCopyHigh32Bits | ✅ | `radixSort.slang` + `radixSort64.slang` (histogram + stable reorder + 64-bit key chaining; the `WithCount`/`WithoutCount`/`BlockDesc` entry variants collapse into push-constant differences; `radixSortDoubleCopyHigh32Bits` = two dispatches; single-warp in-block variants ⬜) |
+| `radixSortImpl.cu` + `RadixSort.cuh` | radixSortMultiBlockLaunch\*, radixSortMultiCalculateRanksLaunch\*, radixSortCopyHigh32Bits | ✅ | `radixSort.slang` + `radixSort64.slang` (histogram + stable reorder + 64-bit key chaining; the `WithCount`/`WithoutCount`/`BlockDesc` entry variants collapse into push-constant differences). `radixSortGather.slang` ports the remaining rank-indexed gather/copy family (radixSortCopy / radixSortCopy2 / radixSortCopyBits2 / radixSortDoubleCopy / radixSortDoubleCopyHigh32Bits) — 64-bit `uint2` gathers with aggregate-sentinel (`0xffffffff`) masking and low/high-word selection ✅. **`gpucommon` is now ported in full** (utility, MemCopyBalanced, and the whole radix-sort machinery; the single-warp in-block sort variant is subsumed by the multi-block path) |
 | `reduction.cuh` (header) | warpScan/blockScan/warpReduction | ✅ | `pxgSlangScan.slang` (portable groupshared equivalents) |
 | `MemCopyBalanced.cu` | MemCopyBalanced, clampMaxValue, clampMaxValues | ✅ | `memCopy.slang` + `clampValues.slang` (CopyDesc pointers → buffer byte offsets) |
 | `utility.cu` | interleaveBuffers + deformable-skinning kernels (zero/areaWeighted/normalize normals, cloth Phong + softbody barycentric interpolation) | ✅ | `skinning.slang` (PxTypedBoundedData pointers → strided buffer views; float atomicAdd → portable CAS loop) |
@@ -67,13 +67,14 @@ Vulkan/D3D12 backends.
 
 ## Verification
 
-All ported kernels are covered by `tests/` (81 GPU test cases, run per commit
+All ported kernels are covered by `tests/` (82 GPU test cases, run per commit
 via ctest on a Vulkan device — llvmpipe in CI):
 
 | Kernel | Reference | Checks |
 |---|---|---|
 | radix sort (32-bit) | `std::stable_sort` | keys + rank payload (exact), stability under duplicates, sizes 1 … 2²⁰ incl. non-multiples of 4 and chunking boundaries |
 | radix sort (64-bit) | `std::stable_sort` of PxU64 | two chained 8-pass sorts + copyHigh32Bits gather, duplicate-heavy low/high words |
+| radix sort gather family | C++ transcription of `radixSortImpl.cu` | the rank-indexed copies radixSortCopy/Copy2/CopyBits2/DoubleCopy/DoubleCopyHigh32Bits over 5000 `uint2` keys with shuffled rank permutations (and, for the `2`/`Bits2` forms, ~8% `0xffffffff` aggregate sentinels), comparing the 64-bit copies, the low/high-word extractions (both `lowBit` values) and the sentinel masking bit-exactly; non-vacuity confirmed by mutation (dropping the aggregate check and swapping low/high word each fail) |
 | scan | serial prefix sum | inclusive + exclusive, totals, sizes 1 … 2¹⁸+39 |
 | scan 4x4 / PxGpuRadixSort | component-wise scan; `std::stable_sort` | int4x4 per-block scans, the full count → computeBlockSum → reorder pipeline incl. reorder-tracking map, partial bit widths (odd nibble rounding), duplicate-heavy keys, float4 payload gather |
 | preIntegration | C++ transcription of `preIntegration.cuh` | velocities (momocity format), √(I⁻¹) tensor, solver body data, lock/gyro/damping/clamp branches, node-index bookkeeping |

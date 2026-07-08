@@ -87,6 +87,7 @@ endfunction()
 pxg_compile_shader(scan scanPerBlockKernel addBlockSumsKernel)
 pxg_compile_shader(radixSort radixSortHistogram radixSortCalculateRanks)
 pxg_compile_shader(radixSort64 radixSortCopyHigh32Bits)
+pxg_compile_shader(radixSortGather radixSortCopy radixSortCopy2 radixSortCopyBits2 radixSortDoubleCopy radixSortDoubleCopyHigh32Bits)
 pxg_compile_shader(preIntegration preIntegrationLaunch initStaticKinematics)
 pxg_compile_shader(integration integrateCoreParallelLaunch integrateCoreParallelLaunchTGS)
 pxg_compile_shader(updateBounds updateTransformCacheAndBoundArrayLaunch setRigidDynamicGlobalPose)
@@ -164,6 +165,7 @@ add_executable(gpuslang-tests
     main.cpp
     testScan.cpp
     testRadixSort.cpp
+    testRadixSortGather.cpp
     testPreIntegration.cpp
     testIntegration.cpp
     testUpdateBounds.cpp
@@ -199,7 +201,7 @@ target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
 enable_testing()
-foreach(suite scan radixSort preIntegration integration updateBounds memCopy clamp skinning
+foreach(suite scan radixSort radixSortGather preIntegration integration updateBounds memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
         constraintPrepPGS constraintPrepTGS thresholdStream broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
@@ -223,6 +225,8 @@ set(PXG_HLSL_ENTRIES
     "scan:scanPerBlockKernel" "scan:addBlockSumsKernel"
     "radixSort:radixSortHistogram" "radixSort:radixSortCalculateRanks"
     "radixSort64:radixSortCopyHigh32Bits"
+    "radixSortGather:radixSortCopy" "radixSortGather:radixSortCopy2" "radixSortGather:radixSortCopyBits2"
+    "radixSortGather:radixSortDoubleCopy" "radixSortGather:radixSortDoubleCopyHigh32Bits"
     "preIntegration:preIntegrationLaunch" "preIntegration:initStaticKinematics"
     "integration:integrateCoreParallelLaunch" "integration:integrateCoreParallelLaunchTGS"
     "updateBounds:updateTransformCacheAndBoundArrayLaunch" "updateBounds:setRigidDynamicGlobalPose"

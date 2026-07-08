@@ -20,6 +20,7 @@ gpuslang/
 │   ├── pxgSlangScan.slang           portable workgroup scan primitives
 │   ├── radixSort.slang              gpucommon radix sort (histogram + stable reorder)
 │   ├── radixSort64.slang            64-bit key support (copyHigh32Bits chaining)
+│   ├── radixSortGather.slang        rank-indexed 64-bit gather/copy family
 │   ├── scan.slang                   device-wide prefix sums (algorithms.cu)
 │   ├── scan4x4.slang                int4x4 16-counter scans (PxGpuRadixSort)
 │   ├── radixFourBit.slang           PxGpuRadixSort count/reorder passes
@@ -129,7 +130,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (81 GPU test cases + 98 DX12 cross-compile checks) verifies:
+The suite (82 GPU test cases + 103 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
