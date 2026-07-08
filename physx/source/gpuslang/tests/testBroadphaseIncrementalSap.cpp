@@ -323,7 +323,9 @@ PXG_TEST(broadphaseIncrementalSap_foundLostPairs)
                 !iaSeparatedBeforeAxis(ax, oldAABB, otherOld))
             {
                 const uint32_t id = 1u - willFindPair;
-                const uint64_t key = (uint64_t(handle) << 32) | otherHandle;
+                // PxgBroadPhasePair canonicalizes to (min, max)
+                const uint32_t lo = std::min(handle, otherHandle), hi = std::max(handle, otherHandle);
+                const uint64_t key = (uint64_t(lo) << 32) | hi;
                 (id == 0 ? refFound : refLost).push_back(key);
             }
         }

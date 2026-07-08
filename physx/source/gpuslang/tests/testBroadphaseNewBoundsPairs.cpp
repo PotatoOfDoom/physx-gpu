@@ -236,7 +236,11 @@ PXG_TEST(broadphaseNewBoundsPairs_foundPairs)
                         const bool inter = !(bb[0] > a[3] || a[0] > bb[3] || bb[1] > a[4] || a[1] > bb[4] ||
                                              bb[2] > a[5] || a[2] > bb[5]);
                         if (inter)
-                            refPairs.push_back((uint64_t(handle) << 32) | otherHandle);
+                        {
+                            // PxgBroadPhasePair canonicalizes to (min, max)
+                            const uint32_t lo = std::min(handle, otherHandle), hi = std::max(handle, otherHandle);
+                            refPairs.push_back((uint64_t(lo) << 32) | hi);
+                        }
                     }
                 }
             }

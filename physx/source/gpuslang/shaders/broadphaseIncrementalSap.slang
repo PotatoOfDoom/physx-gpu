@@ -308,15 +308,18 @@ void performIncrementalSAP(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
 
             if (writeIndex < maxPairs)
             {
+                // PxgBroadPhasePair canonicalizes to (min, max) so mVolA < mVolB
+                const uint volA = min(handle, otherHandle);
+                const uint volB = max(handle, otherHandle);
                 if (foundOrLostID == 0u)
                 {
-                    gFoundReport[writeIndex * 2u] = handle;
-                    gFoundReport[writeIndex * 2u + 1u] = otherHandle;
+                    gFoundReport[writeIndex * 2u] = volA;
+                    gFoundReport[writeIndex * 2u + 1u] = volB;
                 }
                 else
                 {
-                    gLostReport[writeIndex * 2u] = handle;
-                    gLostReport[writeIndex * 2u + 1u] = otherHandle;
+                    gLostReport[writeIndex * 2u] = volA;
+                    gLostReport[writeIndex * 2u + 1u] = volB;
                 }
             }
         }

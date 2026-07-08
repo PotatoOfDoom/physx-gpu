@@ -244,8 +244,9 @@ void generateFoundPairsForNewBoundsRegion(uint3 gtid : SV_GroupThreadID, uint3 g
             const uint position = gsBase + res + gsWarp[warpIndex];
             if (position < maxPairs)
             {
-                gFoundReport[position * 2u + 0u] = handle;
-                gFoundReport[position * 2u + 1u] = otherHandle;
+                // PxgBroadPhasePair canonicalizes to (min, max) so mVolA < mVolB
+                gFoundReport[position * 2u + 0u] = min(handle, otherHandle);
+                gFoundReport[position * 2u + 1u] = max(handle, otherHandle);
             }
         }
         GroupMemoryBarrierWithGroupSync();
