@@ -97,3 +97,25 @@ public uint warp32ScanTotal(uint tid)
 {
     return gsScanTemp[(tid & ~31u) | 31u];
 }
+
+groupshared uint4 gsScanTemp4[PXG_SCAN_MAX_BLOCK / 2];
+
+// Inclusive prefix sum of uint4 values over the whole workgroup (component
+// wise) — used by the int4/int4x4 scans of algorithms.cu.  BLOCK_SIZE must
+// be <= PXG_SCAN_MAX_BLOCK / 2 (the shared array budget).
+public uint4 blockInclusiveScanU4<let BLOCK_SIZE : uint>(uint tid, uint4 value)
+{
+    gsScanTemp4[tid] = value;
+    GroupMemoryBarrierWithGroupSync();
+
+    [ForceUnroll]
+    for (uint offset = 1; offset < BLOCK_SIZE; offset <<= 1)
+    {
+        const uint4 n = (tid >= offset) ? gsScanTemp4[tid - offset] : uint4(0);
+        GroupMemoryBarrierWithGroupSync();
+        gsScanTemp4[tid] += n;
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    return gsScanTemp4[tid];
+}

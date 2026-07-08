@@ -21,6 +21,9 @@ gpuslang/
 │   ├── radixSort.slang              gpucommon radix sort (histogram + stable reorder)
 │   ├── radixSort64.slang            64-bit key support (copyHigh32Bits chaining)
 │   ├── scan.slang                   device-wide prefix sums (algorithms.cu)
+│   ├── scan4x4.slang                int4x4 16-counter scans (PxGpuRadixSort)
+│   ├── radixFourBit.slang           PxGpuRadixSort count/reorder passes
+│   ├── reorderData.slang            float4 payload gather (reorderKernel)
 │   ├── preIntegration.slang         solver pre-integration (PGS + TGS)
 │   ├── integration.slang            solver integration, PGS + TGS + sleep state machine
 │   ├── updateBounds.slang           transform cache + world AABB update
@@ -97,7 +100,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (26 GPU test cases + 19 DX12 cross-compile checks) verifies:
+The suite (31 GPU test cases + 24 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
@@ -120,7 +123,11 @@ The suite (26 GPU test cases + 19 DX12 cross-compile checks) verifies:
   dispatcher over random descriptor batches;
 - **skinning** — area-weighted normal accumulation (portable CAS float
   atomics), Phong cloth interpolation and barycentric softbody interpolation
-  over strided vertex views.
+  over strided vertex views;
+- **PxGpuRadixSort** — the second, general-purpose radix sort
+  (algorithms.cu): int4x4 histogram scans, the count → computeBlockSum →
+  reorder pass composition with reorder-tracking, partial bit widths and the
+  float4 payload gather kernel.
 
 ## Known limitations
 

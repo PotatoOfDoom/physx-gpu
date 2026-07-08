@@ -89,6 +89,9 @@ pxg_compile_shader(radixSort64 radixSortCopyHigh32Bits)
 pxg_compile_shader(preIntegration preIntegrationLaunch initStaticKinematics)
 pxg_compile_shader(integration integrateCoreParallelLaunch integrateCoreParallelLaunchTGS)
 pxg_compile_shader(updateBounds updateTransformCacheAndBoundArrayLaunch)
+pxg_compile_shader(scan4x4 scanPerBlockKernel4x4 addBlockSumsKernel4x4)
+pxg_compile_shader(radixFourBit radixFourBitCountPerBlockKernel radixFourBitReorderKernel)
+pxg_compile_shader(reorderData reorderKernel)
 pxg_compile_shader(memCopy MemCopyBalanced)
 pxg_compile_shader(clampValues clampMaxValue clampMaxValues)
 pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeighted
@@ -117,12 +120,14 @@ add_executable(gpuslang-tests
     testPreIntegration.cpp
     testIntegration.cpp
     testUpdateBounds.cpp
-    testUtilities.cpp)
+    testUtilities.cpp
+    testAlgorithms.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
 enable_testing()
-foreach(suite scan radixSort preIntegration integration updateBounds memCopy clamp skinning)
+foreach(suite scan radixSort preIntegration integration updateBounds memCopy clamp skinning
+        scan4x4 gpuRadixSort reorderKernel)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -141,6 +146,9 @@ set(PXG_HLSL_ENTRIES
     "preIntegration:preIntegrationLaunch" "preIntegration:initStaticKinematics"
     "integration:integrateCoreParallelLaunch" "integration:integrateCoreParallelLaunchTGS"
     "updateBounds:updateTransformCacheAndBoundArrayLaunch"
+    "scan4x4:scanPerBlockKernel4x4" "scan4x4:addBlockSumsKernel4x4"
+    "radixFourBit:radixFourBitCountPerBlockKernel" "radixFourBit:radixFourBitReorderKernel"
+    "reorderData:reorderKernel"
     "memCopy:MemCopyBalanced"
     "clampValues:clampMaxValue" "clampValues:clampMaxValues"
     "skinning:interleaveBuffers" "skinning:zeroNormals" "skinning:normalVectorsAreaWeighted"

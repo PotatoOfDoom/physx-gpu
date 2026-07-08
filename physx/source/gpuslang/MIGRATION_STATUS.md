@@ -38,7 +38,7 @@ Vulkan/D3D12 backends.
 
 | CUDA source | Kernels | Status | Slang |
 |---|---|---|---|
-| `algorithms.cu` | scanPerBlockKernel, addBlockSumsKernel | ✅ | `scan.slang` (`4x4`/radix-reorder variants ⬜) |
+| `algorithms.cu` | scanPerBlockKernel, addBlockSumsKernel, scanPerBlockKernel4x4, addBlockSumsKernel4x4, radixFourBitCountPerBlockKernel, radixFourBitReorderKernel, reorderKernel | ✅ | `scan.slang`, `scan4x4.slang`, `radixFourBit.slang`, `reorderData.slang` — the complete PxGpuRadixSort pipeline (PxgAlgorithms.cpp); PxU64-packed rank scans become uint4-lane scans, the PxU16 offsets buffer is widened to 32-bit |
 | `updateTransformAndBoundArray.cu` | updateTransformCacheAndBoundArrayLaunch | 🟡 | `updateBounds.slang` — rigid-body path ✅ incl. all geometry types; articulation branch and `updateChangedAABBMgrHandlesLaunch`/`mergeTransformCacheAndBoundArrayChanges` ⬜ |
 | `updateBodiesAndShapes.cu` | body/shape DMA updates | ⬜ | |
 | `rigidDeltaAccum.cu`, `SDFConstruction.cu`, `softBody*.cu`, `FEMCloth*.cu`, `particlesystem.cu`, `diffuseParticles.cu`, `anisotropy.cu`, `isosurfaceExtraction.cu`, `sparseGridStandalone.cu` | deformables / particles | ⬜ | |
@@ -64,7 +64,7 @@ Vulkan/D3D12 backends.
 
 ## Verification
 
-All ported kernels are covered by `tests/` (26 GPU test cases, run per commit
+All ported kernels are covered by `tests/` (31 GPU test cases, run per commit
 via ctest on a Vulkan device — llvmpipe in CI):
 
 | Kernel | Reference | Checks |
@@ -72,6 +72,7 @@ via ctest on a Vulkan device — llvmpipe in CI):
 | radix sort (32-bit) | `std::stable_sort` | keys + rank payload (exact), stability under duplicates, sizes 1 … 2²⁰ incl. non-multiples of 4 and chunking boundaries |
 | radix sort (64-bit) | `std::stable_sort` of PxU64 | two chained 8-pass sorts + copyHigh32Bits gather, duplicate-heavy low/high words |
 | scan | serial prefix sum | inclusive + exclusive, totals, sizes 1 … 2¹⁸+39 |
+| scan 4x4 / PxGpuRadixSort | component-wise scan; `std::stable_sort` | int4x4 per-block scans, the full count → computeBlockSum → reorder pipeline incl. reorder-tracking map, partial bit widths (odd nibble rounding), duplicate-heavy keys, float4 payload gather |
 | preIntegration | C++ transcription of `preIntegration.cuh` | velocities (momocity format), √(I⁻¹) tensor, solver body data, lock/gyro/damping/clamp branches, node-index bookkeeping |
 | integration (PGS) | C++ transcription of `integration.cuh` | velocities, quaternion pose step, wake counter (tolerance), sleep/freeze flags (exact), bodySim write-back, non-zero deltaV offset |
 | integration (TGS) | C++ transcription of `integrateCoreTGS` | TGS velocity-pool layout, delta-transform pose accumulation, sleep state machine (flags exact) |
