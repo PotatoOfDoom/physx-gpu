@@ -35,7 +35,7 @@ Vulkan/D3D12 backends.
 | `constraintBlockPrepTGS.cu` + `jointConstraintBlockPrepTGS.cuh` | rigid TGS constraint prep | 🟡 | `constraintPrepTGS.slang` — contactConstraintBlockPrepareParallelLaunchTGS (restitutionXdt/scaledBias TGS coefficients, torsional friction anchor, kinematic target-velocity bias) ✅, jointConstraintBlockPrepareParallelLaunchTGS (setUp1DConstraintBlockTGS + intializeBlock1DTGS: biasScale/velMultiplier/targetVel constants, maxBiasVelocity, ortho-axis header setup, solve-hint promotion) ✅; articulation paths ⬜ |
 | `constraintBlockPrePrep.cu` | constraint pre-prep (partition remap, friction-patch counts) | ⬜ | produces the batch/partition layout the block prep consumes |
 | `artiConstraintPrep2.cu` | articulation constraint prep | ⬜ | |
-| `accumulateThresholdStream.cu` | threshold streams | ⬜ | needs radix sort + scan (both ported) |
+| `accumulateThresholdStream.cu` | force-threshold reporting | 🟡 | `thresholdStream.slang` — sort-key extraction for the two-pass (nodeIndexA, nodeIndexB) sort (initialRanksAndBodyIndexB/A) + stream reorganize ✅, device-wide segmented force accumulation (computeAccumulateThresholdStream + outputAccumulateThresholdStream + writeoutAccumulatedForcePerObject) ✅, exceeded-force detection + compaction (computeExceededForceThresholdElementIndice + outputExceededForceThresholdElementIndice) ✅; the cross-frame found/lost/persistent event diff (setThresholdElementsMask → createForceChangeThresholdElements) ⬜ |
 
 ## gpusimulationcontroller
 
@@ -67,7 +67,7 @@ Vulkan/D3D12 backends.
 
 ## Verification
 
-All ported kernels are covered by `tests/` (47 GPU test cases, run per commit
+All ported kernels are covered by `tests/` (49 GPU test cases, run per commit
 via ctest on a Vulkan device — llvmpipe in CI):
 
 | Kernel | Reference | Checks |
@@ -91,6 +91,7 @@ via ctest on a Vulkan device — llvmpipe in CI):
 | TGS velocity averaging | C++ transcription | 6-component per-slab delta averaging with active-slab counts (4/12/40 slabs), slab-count reset, propagation into 3-float4 slab slots, per-substep delta-pose quaternion integration incl. per-body lock flags and kinematic bodies (position + velocity iterations), accumulated-delta motion-velocity writeback |
 | constraint prep — contact (PGS + TGS) | C++ transcription of `contactConstraintBlockPrep.cuh` + `constraintPrepShared.cuh` | friction-patch correlation (correlate/getFrictionPatches previous-frame carry-over/growPatches anchor building), contact Jacobians with offset-slop zeroing, unit responses, rigid + compliant (accel-spring) coefficients, tangent friction rows, TGS restitutionXdt/scaledBias and torsional friction anchors, kinematic target-velocity bias; verified field-by-field incl. friction-anchor world transforms |
 | constraint prep — 1D joint (PGS + TGS) | C++ transcription of `jointConstraintBlockPrep(TGS).cuh` + `DyCpuGpu1dConstraint.h` | row sort + orthogonalization (in-place Jacobian modification checked), √(I⁻¹)-scaled angular Jacobians, PGS/TGS solver constants (spring/accel-spring/bounce/hard), min/max impulse with drive-limits-as-forces, break impulses, PxU16/uchar4-packed row counts, TGS ortho-axis header setup + angular solve-hint promotion |
+| threshold stream | C++ transcription of `accumulateThresholdStream.cu` | two-pass sort-key extraction (nodeIndexB then nodeIndexA) + word-exact stream reorganize (accumulatedForce preserved), device-wide segmented normal-force accumulation with per-pair write indices (37 … 2001 elements spanning the 32-block boundary), per-pair segment force via prefix-difference, exceeded-force flags/count and compacted exceeded-element array; parallel float-summation tolerances on prefix sums, exact on indices/flags/counts |
 | clampMaxValue(s) | scalar clamp | in-place counter clamping |
 | skinning | C++ transcription of `utility.cu` | area-weighted vertex normals (atomic accumulation), Phong cloth interpolation incl. out-of-triangle uv projection and thickness clamping, barycentric softbody interpolation, buffer interleaving, strided-view addressing |
 

@@ -108,6 +108,10 @@ pxg_compile_shader(constraintPrepPGS contactConstraintBlockPrepareParallelLaunch
                    jointConstraintBlockPrepareParallelLaunch)
 pxg_compile_shader(constraintPrepTGS contactConstraintBlockPrepareParallelLaunchTGS
                    jointConstraintBlockPrepareParallelLaunchTGS)
+pxg_compile_shader(thresholdStream initialRanksAndBodyIndexB initialRanksAndBodyIndexA
+                   reorganizeThresholdElements computeAccumulateThresholdStream
+                   outputAccumulateThresholdStream writeoutAccumulatedForcePerObject
+                   computeExceededForceThresholdElementIndice outputExceededForceThresholdElementIndice)
 pxg_compile_shader(memCopy MemCopyBalanced)
 pxg_compile_shader(clampValues clampMaxValue clampMaxValues)
 pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeighted
@@ -141,14 +145,15 @@ add_executable(gpuslang-tests
     testBodyUpdate.cpp
     testSolver.cpp
     testSolverTGS.cpp
-    testConstraintPrep.cpp)
+    testConstraintPrep.cpp
+    testThresholdStream.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
 enable_testing()
 foreach(suite scan radixSort preIntegration integration updateBounds memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
-        constraintPrepPGS constraintPrepTGS)
+        constraintPrepPGS constraintPrepTGS thresholdStream)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -179,6 +184,10 @@ set(PXG_HLSL_ENTRIES
     "constraintPrepPGS:jointConstraintBlockPrepareParallelLaunch"
     "constraintPrepTGS:contactConstraintBlockPrepareParallelLaunchTGS"
     "constraintPrepTGS:jointConstraintBlockPrepareParallelLaunchTGS"
+    "thresholdStream:initialRanksAndBodyIndexB" "thresholdStream:reorganizeThresholdElements"
+    "thresholdStream:computeAccumulateThresholdStream" "thresholdStream:outputAccumulateThresholdStream"
+    "thresholdStream:computeExceededForceThresholdElementIndice"
+    "thresholdStream:outputExceededForceThresholdElementIndice"
     "solverPGS:computeAverageSolverBodyVelocity" "solverPGS:propagateSolverBodyVelocity"
     "scan4x4:scanPerBlockKernel4x4" "scan4x4:addBlockSumsKernel4x4"
     "radixFourBit:radixFourBitCountPerBlockKernel" "radixFourBit:radixFourBitReorderKernel"

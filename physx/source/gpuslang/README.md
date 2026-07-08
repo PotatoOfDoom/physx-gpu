@@ -32,6 +32,7 @@ gpuslang/
 │   ├── pxgSlangPrepCommon.slang     constraint-prep inputs + Dy 1D solver-constant helpers
 │   ├── constraintPrepPGS.slang      PGS contact + 1D joint constraint prep
 │   ├── constraintPrepTGS.slang      TGS contact + 1D joint constraint prep
+│   ├── thresholdStream.slang        force-threshold reporting accumulation
 │   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
 │   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
@@ -107,7 +108,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (47 GPU test cases + 48 DX12 cross-compile checks) verifies:
+The suite (49 GPU test cases + 54 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
@@ -155,7 +156,12 @@ The suite (47 GPU test cases + 48 DX12 cross-compile checks) verifies:
   SoA constraints: friction-patch correlation (including previous-frame
   anchor carry-over), contact/friction Jacobians and response terms,
   compliant and TGS coefficient derivations with torsional friction, and the
-  1D-joint row orthogonalization plus PGS/TGS solver-constant computation.
+  1D-joint row orthogonalization plus PGS/TGS solver-constant computation;
+- **threshold stream** — the force-threshold reporting pipeline: two-pass
+  (nodeIndexA, nodeIndexB) sort-key extraction and stream reorganize, the
+  device-wide segmented scan that accumulates each body pair's normal force,
+  and the exceeded-force detection and compaction, verified across the
+  32-block boundary.
 
 ## Known limitations
 
