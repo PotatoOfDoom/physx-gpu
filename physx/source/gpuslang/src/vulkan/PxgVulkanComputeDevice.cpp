@@ -184,9 +184,20 @@ public:
         queueInfo.queueCount = 1;
         queueInfo.pQueuePriorities = &priority;
 
+        // Enable 64-bit integer support when the device offers it (needed by
+        // kernels that carry PxU64 accumulators, e.g. the broad-phase
+        // overlap-check region scan).  Guarded so devices without shaderInt64
+        // still create successfully.
+        VkPhysicalDeviceFeatures supported = {};
+        vkGetPhysicalDeviceFeatures(mPhysicalDevice, &supported);
+        VkPhysicalDeviceFeatures enabled = {};
+        enabled.shaderInt64 = supported.shaderInt64;
+        mHasShaderInt64 = supported.shaderInt64 == VK_TRUE;
+
         VkDeviceCreateInfo deviceInfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
         deviceInfo.queueCreateInfoCount = 1;
         deviceInfo.pQueueCreateInfos = &queueInfo;
+        deviceInfo.pEnabledFeatures = &enabled;
 
         if (vkCreateDevice(mPhysicalDevice, &deviceInfo, nullptr, &mDevice) != VK_SUCCESS)
             return false;
@@ -525,6 +536,7 @@ private:
     std::vector<VkDescriptorPool> mDescriptorPools;
     size_t mCurrentPool = 0;
     bool mRecording = false;
+    bool mHasShaderInt64 = false;
 
     std::string mDeviceName;
 };

@@ -41,6 +41,7 @@ gpuslang/
 │   ├── broadphaseRegionHistogram.slang       region accumulator prefix-sum scan pair
 │   ├── broadphaseCreateRegions.slang         region-span + overlap-check-count producer
 │   ├── broadphaseActiveRegionHistogram.slang per-region handle compaction (flags/scan/scatter)
+│   ├── broadphaseOverlapCheckHistogram.slang overlap-check counts + 64-bit region scan
 │   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
 │   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
@@ -116,7 +117,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (63 GPU test cases + 73 DX12 cross-compile checks) verifies:
+The suite (65 GPU test cases + 76 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
@@ -219,7 +220,13 @@ The suite (63 GPU test cases + 73 DX12 cross-compile checks) verifies:
   per-region exclusive prefix of the packed 16/16 start+active flags (a
   512-thread block scan with block-accumulator carry), and the scatter of each
   box's handle into the compacted ordered start/active handle arrays, verified
-  end-to-end against a transcription over a synthetic region layout.
+  end-to-end against a transcription over a synthetic region layout;
+- **broad-phase overlap-check histogram** — the overlap-check counting +
+  scan trio: the per-comparison overlap-candidate count from the ordered-handle
+  offset tables (with the handle/region record), and the device-wide **64-bit**
+  (`PxU64` → `uint64_t`) two-pass exclusive prefix sum + grand total, verified
+  against a `uint64` exclusive scan whose total exceeds 2³² to exercise the
+  64-bit path (the Vulkan device enables `shaderInt64` when available).
 
 ## Known limitations
 
