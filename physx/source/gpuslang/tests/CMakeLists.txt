@@ -85,9 +85,14 @@ endfunction()
 
 pxg_compile_shader(scan scanPerBlockKernel addBlockSumsKernel)
 pxg_compile_shader(radixSort radixSortHistogram radixSortCalculateRanks)
+pxg_compile_shader(radixSort64 radixSortCopyHigh32Bits)
 pxg_compile_shader(preIntegration preIntegrationLaunch initStaticKinematics)
-pxg_compile_shader(integration integrateCoreParallelLaunch)
+pxg_compile_shader(integration integrateCoreParallelLaunch integrateCoreParallelLaunchTGS)
 pxg_compile_shader(updateBounds updateTransformCacheAndBoundArrayLaunch)
+pxg_compile_shader(memCopy MemCopyBalanced)
+pxg_compile_shader(clampValues clampMaxValue clampMaxValues)
+pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeighted
+                   normalizeNormals interpolateSkinnedClothVertices interpolateSkinnedSoftBodyVertices)
 
 add_custom_target(gpuslang-shaders ALL DEPENDS ${PXG_SHADER_OUTPUTS})
 
@@ -111,12 +116,13 @@ add_executable(gpuslang-tests
     testRadixSort.cpp
     testPreIntegration.cpp
     testIntegration.cpp
-    testUpdateBounds.cpp)
+    testUpdateBounds.cpp
+    testUtilities.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
 enable_testing()
-foreach(suite scan radixSort preIntegration integration updateBounds)
+foreach(suite scan radixSort preIntegration integration updateBounds memCopy clamp skinning)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -131,9 +137,15 @@ file(MAKE_DIRECTORY ${HLSL_CHECK_DIR})
 set(PXG_HLSL_ENTRIES
     "scan:scanPerBlockKernel" "scan:addBlockSumsKernel"
     "radixSort:radixSortHistogram" "radixSort:radixSortCalculateRanks"
+    "radixSort64:radixSortCopyHigh32Bits"
     "preIntegration:preIntegrationLaunch" "preIntegration:initStaticKinematics"
-    "integration:integrateCoreParallelLaunch"
-    "updateBounds:updateTransformCacheAndBoundArrayLaunch")
+    "integration:integrateCoreParallelLaunch" "integration:integrateCoreParallelLaunchTGS"
+    "updateBounds:updateTransformCacheAndBoundArrayLaunch"
+    "memCopy:MemCopyBalanced"
+    "clampValues:clampMaxValue" "clampValues:clampMaxValues"
+    "skinning:interleaveBuffers" "skinning:zeroNormals" "skinning:normalVectorsAreaWeighted"
+    "skinning:normalizeNormals" "skinning:interpolateSkinnedClothVertices"
+    "skinning:interpolateSkinnedSoftBodyVertices")
 foreach(spec ${PXG_HLSL_ENTRIES})
     string(REPLACE ":" ";" parts ${spec})
     list(GET parts 0 stem)

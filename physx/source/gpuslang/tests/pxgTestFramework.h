@@ -158,6 +158,13 @@ public:
                                &params, sizeof(Params));
     }
 
+    void dispatchNoParams(uint32_t gridX, const std::vector<PxgBufferHandle>& buffers,
+                          uint32_t gridY = 1, uint32_t gridZ = 1) const
+    {
+        testDevice()->dispatch(mPipeline, gridX, gridY, gridZ, buffers.data(), uint32_t(buffers.size()),
+                               nullptr, 0);
+    }
+
 private:
     std::vector<uint32_t> mStrides;
     PxgPipelineHandle mPipeline;

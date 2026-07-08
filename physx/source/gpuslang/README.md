@@ -19,10 +19,14 @@ gpuslang/
 │   ├── pxgSlangCommon.slang         math + GPU struct layouts (mirrors CUDA headers)
 │   ├── pxgSlangScan.slang           portable workgroup scan primitives
 │   ├── radixSort.slang              gpucommon radix sort (histogram + stable reorder)
+│   ├── radixSort64.slang            64-bit key support (copyHigh32Bits chaining)
 │   ├── scan.slang                   device-wide prefix sums (algorithms.cu)
-│   ├── preIntegration.slang         PGS solver pre-integration
-│   ├── integration.slang            PGS solver integration + sleep state machine
-│   └── updateBounds.slang           transform cache + world AABB update
+│   ├── preIntegration.slang         solver pre-integration (PGS + TGS)
+│   ├── integration.slang            solver integration, PGS + TGS + sleep state machine
+│   ├── updateBounds.slang           transform cache + world AABB update
+│   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
+│   ├── clampValues.slang            counter clamp utilities
+│   └── skinning.slang               deformable skinning (cloth Phong / softbody barycentric)
 └── tests/                           verification suite (CMake + ctest)
 ```
 
@@ -93,7 +97,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (17 GPU test cases + 8 DX12 cross-compile checks) verifies:
+The suite (26 GPU test cases + 19 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
@@ -107,7 +111,16 @@ The suite (17 GPU test cases + 8 DX12 cross-compile checks) verifies:
   closed-form quaternion pose integration vs a C++ transcription;
 - **updateBounds** — world pose composition and AABBs for sphere / capsule /
   box / convex-hull / fallback geometry, plus frozen/unfrozen/updated/
-  activate/deactivate bookkeeping, compared field-by-field.
+  activate/deactivate bookkeeping, compared field-by-field;
+- **integration (TGS)** — the TGS velocity-pool layout and delta-transform
+  pose accumulation, sharing the verified sleep state machine;
+- **radix sort (64-bit)** — two chained 8-pass sorts through the
+  copyHigh32Bits gather, checked against `std::stable_sort` of PxU64;
+- **MemCopyBalanced / clamp utilities** — the PxgCopyManager balanced copy
+  dispatcher over random descriptor batches;
+- **skinning** — area-weighted normal accumulation (portable CAS float
+  atomics), Phong cloth interpolation and barycentric softbody interpolation
+  over strided vertex views.
 
 ## Known limitations
 

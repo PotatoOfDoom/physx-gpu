@@ -164,4 +164,85 @@ PXG_TEST(radixSort_largeRandom)
     checkRadixSort(1u << 20, 140);
 }
 
+// 64-bit keys: sort the low words (8 passes), gather the high words in rank
+// order via radixSortCopyHigh32Bits, then sort those stably (8 more passes).
+// The final rank array is the 64-bit stable order — the same chaining
+// PxgRadixSort uses with the CUDA kernels.
+void checkRadixSort64(uint32_t n, uint32_t seed, uint64_t keyMask = ~0ull)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    std::mt19937_64 rng(seed);
+    std::vector<uint64_t> keys64(n);
+    for (uint64_t& k : keys64)
+        k = rng() & keyMask;
+
+    // low words + identity ranks
+    std::vector<uint32_t> lowKeys(n), ranks(n);
+    for (uint32_t i = 0; i < n; ++i)
+        lowKeys[i] = uint32_t(keys64[i] & 0xFFFFFFFFu);
+    std::iota(ranks.begin(), ranks.end(), 0u);
+
+    // pass 1: sort by low word
+    runRadixSort(lowKeys, ranks);
+
+    // gather high words in rank order on the GPU
+    Kernel copyHigh("radixSort64.spv", "radixSortCopyHigh32Bits", { 8, 4, 4, 4 }, 0);
+
+    PxgBufferHandle keys64Buf = createBufferFrom(dev, keys64);
+    PxgBufferHandle highBuf = dev->createBuffer(n * sizeof(uint32_t));
+    PxgBufferHandle rankBuf = createBufferFrom(dev, ranks);
+    std::vector<uint32_t> numKeysHost = { n };
+    PxgBufferHandle numKeysBuf = createBufferFrom(dev, numKeysHost);
+
+    copyHigh.dispatchNoParams((n + 255) / 256, { keys64Buf, highBuf, rankBuf, numKeysBuf });
+    dev->flush();
+
+    std::vector<uint32_t> highKeys = downloadBuffer<uint32_t>(dev, highBuf, n);
+
+    // pass 2: stable sort of the high words, rank payload threads through
+    runRadixSort(highKeys, ranks);
+
+    // reference: stable sort of the 64-bit keys
+    std::vector<uint32_t> order(n);
+    std::iota(order.begin(), order.end(), 0u);
+    std::stable_sort(order.begin(), order.end(),
+                     [&](uint32_t a, uint32_t b) { return keys64[a] < keys64[b]; });
+
+    size_t mismatches = 0;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        const uint64_t gpuKey = keys64[ranks[i]];
+        const uint64_t refKey = keys64[order[i]];
+        if (gpuKey != refKey || ranks[i] != order[i])
+        {
+            if (mismatches < 5)
+                PXG_CHECK_MSG(false, "n=%u i=%u: gpu=(%016llx,%u) ref=(%016llx,%u)", n, i,
+                              (unsigned long long)gpuKey, ranks[i], (unsigned long long)refKey, order[i]);
+            ++mismatches;
+        }
+    }
+    PXG_CHECK_MSG(mismatches == 0, "64-bit n=%u seed=%u: %zu mismatches", n, seed, mismatches);
+
+    dev->destroyBuffer(keys64Buf);
+    dev->destroyBuffer(highBuf);
+    dev->destroyBuffer(rankBuf);
+    dev->destroyBuffer(numKeysBuf);
+}
+
+PXG_TEST(radixSort64_random)
+{
+    checkRadixSort64(1, 150);
+    checkRadixSort64(4097, 151);
+    checkRadixSort64(100003, 152);
+}
+
+PXG_TEST(radixSort64_duplicateHeavy)
+{
+    // duplicated high words force the stability of the second sort chain
+    checkRadixSort64(50000, 153, 0x0000000FFFFFFFFFull);
+    // duplicated low words
+    checkRadixSort64(50000, 154, 0xFFFFFFFF0000000Full);
+}
+
 } // namespace

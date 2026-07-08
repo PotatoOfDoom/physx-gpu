@@ -14,12 +14,12 @@ Vulkan/D3D12 backends.
 
 | CUDA source | Kernels | Status | Slang |
 |---|---|---|---|
-| `radixSortImpl.cu` + `RadixSort.cuh` | radixSortMultiBlockLaunch\*, radixSortMultiCalculateRanksLaunch\* | ✅ | `radixSort.slang` (histogram + stable reorder; the `WithCount`/`WithoutCount`/`BlockDesc` entry variants collapse into push-constant differences; single-warp variants + `radixSortCopyHigh32Bits` for 64-bit keys ⬜) |
+| `radixSortImpl.cu` + `RadixSort.cuh` | radixSortMultiBlockLaunch\*, radixSortMultiCalculateRanksLaunch\*, radixSortCopyHigh32Bits | ✅ | `radixSort.slang` + `radixSort64.slang` (histogram + stable reorder + 64-bit key chaining; the `WithCount`/`WithoutCount`/`BlockDesc` entry variants collapse into push-constant differences; `radixSortDoubleCopyHigh32Bits` = two dispatches; single-warp in-block variants ⬜) |
 | `reduction.cuh` (header) | warpScan/blockScan/warpReduction | ✅ | `pxgSlangScan.slang` (portable groupshared equivalents) |
-| `MemCopyBalanced.cu` | balanced copy dispatcher | ⬜ | |
-| `utility.cu` | fill/clear/misc utilities | ⬜ | |
+| `MemCopyBalanced.cu` | MemCopyBalanced, clampMaxValue, clampMaxValues | ✅ | `memCopy.slang` + `clampValues.slang` (CopyDesc pointers → buffer byte offsets) |
+| `utility.cu` | interleaveBuffers + deformable-skinning kernels (zero/areaWeighted/normalize normals, cloth Phong + softbody barycentric interpolation) | ✅ | `skinning.slang` (PxTypedBoundedData pointers → strided buffer views; float atomicAdd → portable CAS loop) |
 | `updateCacheAndBound.cuh` (header) | updateBounds/getAbsPose/setTransformCache | ✅ | `updateBounds.slang` |
-| other `.cuh` (atomic, copy, sparseRemove, contactReduction, gridCal, MemoryAllocator) | device helpers | ⬜ | ported on demand with their consumers |
+| other `.cuh` (atomic, copy, sparseRemove, contactReduction, gridCal, MemoryAllocator) | device helpers | ⬜ | ported on demand with their consumers (atomic.cuh AtomicAdd3 ✅ in `skinning.slang`) |
 
 ## gpusolver (rigid-body PGS/TGS solver)
 
@@ -27,8 +27,8 @@ Vulkan/D3D12 backends.
 |---|---|---|---|
 | `preIntegration.cu/.cuh` | preIntegrationLaunch, initStaticKinematics | ✅ | `preIntegration.slang` |
 | `integration.cu` + `integration.cuh` | integrateCoreParallelLaunch | ✅ | `integration.slang` (PGS variant incl. full sleep/freeze/wake state machine) |
-| `integrationTGS.cu` | integrateCoreParallelLaunchTGS | ⬜ | shares ~90% of `integration.slang`; needs the TGS deltaBody2World path |
-| `preIntegrationTGS.cu` | TGS pre-integration | ⬜ | analogous to `preIntegration.slang` |
+| `integrationTGS.cu` | integrateCoreParallelLaunchTGS | ✅ | `integration.slang` (integrateCoreTGS: absolute velocities, delta-transform pose accumulation) |
+| `preIntegrationTGS.cu` | preIntegrationLaunchTGS | ✅ | covered by `preIntegration.slang` — the TGS entry is the identical kernel with the runtime skipGravityApplication flag, which the port already exposes as a push constant |
 | `solver.cu`, `solverMultiBlock.cu`, `solverMultiBlockTGS.cu` | constraint solver iterations | ⬜ | largest remaining solver work item |
 | `constraintBlockPrePrep.cu`, `constraintBlockPrep.cu`, `constraintBlockPrepTGS.cu` | constraint prep | ⬜ | |
 | `artiConstraintPrep2.cu` | articulation constraint prep | ⬜ | |
@@ -64,16 +64,21 @@ Vulkan/D3D12 backends.
 
 ## Verification
 
-All ported kernels are covered by `tests/` (17 GPU test cases, run per commit
+All ported kernels are covered by `tests/` (26 GPU test cases, run per commit
 via ctest on a Vulkan device — llvmpipe in CI):
 
 | Kernel | Reference | Checks |
 |---|---|---|
-| radix sort | `std::stable_sort` | keys + rank payload (exact), stability under duplicates, sizes 1 … 2²⁰ incl. non-multiples of 4 and chunking boundaries |
+| radix sort (32-bit) | `std::stable_sort` | keys + rank payload (exact), stability under duplicates, sizes 1 … 2²⁰ incl. non-multiples of 4 and chunking boundaries |
+| radix sort (64-bit) | `std::stable_sort` of PxU64 | two chained 8-pass sorts + copyHigh32Bits gather, duplicate-heavy low/high words |
 | scan | serial prefix sum | inclusive + exclusive, totals, sizes 1 … 2¹⁸+39 |
 | preIntegration | C++ transcription of `preIntegration.cuh` | velocities (momocity format), √(I⁻¹) tensor, solver body data, lock/gyro/damping/clamp branches, node-index bookkeeping |
-| integration | C++ transcription of `integration.cuh` | velocities, quaternion pose step, wake counter (tolerance), sleep/freeze flags (exact), bodySim write-back, non-zero deltaV offset |
+| integration (PGS) | C++ transcription of `integration.cuh` | velocities, quaternion pose step, wake counter (tolerance), sleep/freeze flags (exact), bodySim write-back, non-zero deltaV offset |
+| integration (TGS) | C++ transcription of `integrateCoreTGS` | TGS velocity-pool layout, delta-transform pose accumulation, sleep state machine (flags exact) |
 | updateBounds | C++ transcription of `updateCacheAndBound.cuh` | AABBs for 5 geometry classes, transform cache, frozen/unfrozen/updated/activate/deactivate (exact) |
+| MemCopyBalanced | `memcpy` | 40 random descriptors incl. empty payloads, byte-offset addressing |
+| clampMaxValue(s) | scalar clamp | in-place counter clamping |
+| skinning | C++ transcription of `utility.cu` | area-weighted vertex normals (atomic accumulation), Phong cloth interpolation incl. out-of-triangle uv projection and thickness clamping, barycentric softbody interpolation, buffer interleaving, strided-view addressing |
 
 Floating-point comparisons use relative tolerance 1e-4…1e-5 (GPU `sin/cos/
 sqrt` and FMA contraction differ legitimately from the CPU); all integer,

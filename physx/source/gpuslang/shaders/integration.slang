@@ -26,10 +26,12 @@
 
 // integration.slang
 //
-// Slang port of the PGS solver integration kernel
-// (gpusolver/src/CUDA/integration.cu / integration.cuh):
-//   - integrateCoreParallelLaunch (integrateCore + sleepCheck +
+// Slang port of the solver integration kernels
+// (gpusolver/src/CUDA/integration.cu, integrationTGS.cu, integration.cuh):
+//   - integrateCoreParallelLaunch    (PGS: integrateCore + sleepCheck +
 //     updateWakeCounter)
+//   - integrateCoreParallelLaunchTGS (TGS: integrateCoreTGS — absolute
+//     velocities, delta-transform pose accumulation)
 //
 // Per solver body this kernel:
 //   - finalizes the post-solver velocities (adds initial velocities, converts
@@ -388,6 +390,76 @@ void integrateCore(float4 motionLinVelXYZW, float4 motionAngVelXYZW, float4 inve
     }
 }
 
+// mirrors integrateCoreTGS() in integration.cuh (compiled with IS_TGS_SOLVER):
+// velocities are absolute (no initial-velocity addition), and the pose is
+// advanced by the solver-accumulated deltaBody2World instead of the
+// closed-form quaternion integrator.
+void integrateCoreTGS(float4 motionLinVelXYZW, float4 motionAngVelXYZW, float4 inverseInertia,
+                      inout float4 solverBodyLinVel, inout float4 solverBodyAngVel,
+                      inout PxgAlignedTransform body2World, PxgTransform28 deltaBody2World,
+                      PxgSolverBodyData solverBodyData, inout PxgBodySim bodySim,
+                      out PxgSolverBodySleepData sleepData, PxgMat33 sqrtInvInertia,
+                      float dt, float invDt, bool enableStabilization, bool hasStaticTouch,
+                      uint numCountedInteractions)
+{
+    const uint lockFlags = bodySim.lockFlags_disableGravity & 0xFFFFu;
+
+    // KS - TODO - optimize this away
+    const float4 initialLinVelXYZ_invMassW = solverBodyData.initialLinVelXYZ_invMassW;
+
+    // update body lin and ang velocity
+    const float3 bodyLinearVelocity = solverBodyLinVel.xyz;
+    const float3 bodyAngVelocity = mat33Transform(sqrtInvInertia, solverBodyAngVel.xyz);
+
+    solverBodyLinVel = float4(
+        (lockFlags & PXG_LOCK_LINEAR_X) != 0 ? 0.0f : bodyLinearVelocity.x,
+        (lockFlags & PXG_LOCK_LINEAR_Y) != 0 ? 0.0f : bodyLinearVelocity.y,
+        (lockFlags & PXG_LOCK_LINEAR_Z) != 0 ? 0.0f : bodyLinearVelocity.z, 0.0f);
+    solverBodyAngVel = float4(
+        (lockFlags & PXG_LOCK_ANGULAR_X) != 0 ? 0.0f : bodyAngVelocity.x,
+        (lockFlags & PXG_LOCK_ANGULAR_Y) != 0 ? 0.0f : bodyAngVelocity.y,
+        (lockFlags & PXG_LOCK_ANGULAR_Z) != 0 ? 0.0f : bodyAngVelocity.z, 0.0f);
+
+    // we need to perform sleep check here to decide whether we want to update
+    // the body2World transform for the body
+    const float3 motionLinVel = float3(
+        (lockFlags & PXG_LOCK_LINEAR_X) != 0 ? 0.0f : motionLinVelXYZW.x,
+        (lockFlags & PXG_LOCK_LINEAR_Y) != 0 ? 0.0f : motionLinVelXYZW.y,
+        (lockFlags & PXG_LOCK_LINEAR_Z) != 0 ? 0.0f : motionLinVelXYZW.z);
+    const float3 motionAngVel = float3(
+        (lockFlags & PXG_LOCK_ANGULAR_X) != 0 ? 0.0f : motionAngVelXYZW.x,
+        (lockFlags & PXG_LOCK_ANGULAR_Y) != 0 ? 0.0f : motionAngVelXYZW.y,
+        (lockFlags & PXG_LOCK_ANGULAR_Z) != 0 ? 0.0f : motionAngVelXYZW.z);
+
+    const float3 linearMotionVel = motionLinVel;
+    float3 angularMotionVel = mat33Transform(sqrtInvInertia, motionAngVel);
+
+    // Integrate the rotation using closed form quaternion integrator
+    float w = dot(angularMotionVel, angularMotionVel);
+    w = sqrt(w);
+    const float maxW = 1e+7f;
+    if (w > maxW)
+    {
+        angularMotionVel = normalize(angularMotionVel) * maxW;
+        w = maxW;
+    }
+
+    const bool freeze = sleepCheck(solverBodyLinVel, solverBodyAngVel, body2World, bodySim, sleepData,
+                                   inverseInertia, linearMotionVel, angularMotionVel,
+                                   initialLinVelXYZ_invMassW.w, dt, invDt, enableStabilization,
+                                   hasStaticTouch, numCountedInteractions);
+
+    if (!freeze)
+    {
+        body2World.p.x += deltaBody2World.px;
+        body2World.p.y += deltaBody2World.py;
+        body2World.p.z += deltaBody2World.pz;
+
+        const float4 q = quatNormalize(quatMul(deltaBody2World.q(), body2World.q));
+        body2World.q = q;
+    }
+}
+
 // mirrors integrateCoreParallelLaunch() in integration.cu
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
@@ -424,6 +496,78 @@ void integrateCoreParallelLaunch(uint3 dispatchThreadId : SV_DispatchThreadID)
                   linVel, angVel, body2World, data, bodySim, sleepData, sqrtInvInertia,
                   gParams.dt, gParams.invDtF32, gParams.enableStabilization != 0, staticTouchCount != 0,
                   gNumCountedInteractions[nodeIndex]);
+
+    gSleepData[a] = sleepData;
+
+    gOutSolverVelocity[a] = linVel;
+    gOutSolverVelocity[a + numSolverBodies] = angVel;
+    gOutBody2World[a] = body2World;
+
+    // PT: for acceleration getters (eENABLE_BODY_ACCELERATIONS)
+    if (gParams.hasPrevVelocities != 0)
+    {
+        gPrevVelocities[nodeIndex * 2 + 0] = gBodySim[nodeIndex].linearVelocityXYZ_inverseMassW;
+        gPrevVelocities[nodeIndex * 2 + 1] = gBodySim[nodeIndex].angularVelocityXYZ_maxPenBiasW;
+    }
+
+    // write back linear velocity, angular velocity to pxgbodysim
+    bodySim.linearVelocityXYZ_inverseMassW.x = linVel.x;
+    bodySim.linearVelocityXYZ_inverseMassW.y = linVel.y;
+    bodySim.linearVelocityXYZ_inverseMassW.z = linVel.z;
+    bodySim.angularVelocityXYZ_maxPenBiasW.x = angVel.x;
+    bodySim.angularVelocityXYZ_maxPenBiasW.y = angVel.y;
+    bodySim.angularVelocityXYZ_maxPenBiasW.z = angVel.z;
+    bodySim.body2World = body2World;
+
+    gBodySim[nodeIndex] = bodySim;
+}
+
+// mirrors integrateCoreParallelLaunchTGS() in integrationTGS.cu
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void integrateCoreParallelLaunchTGS(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint idx = dispatchThreadId.x;
+    const uint numSolverBodies = gParams.numSolverBodies;
+    const uint a = idx + gParams.offset;
+
+    if (a >= numSolverBodies)
+        return;
+
+    const PxgSolverBodyData data = gSolverBodyData[a];
+
+    const uint nodeIndex = nodeIndexIndex(data.islandNodeIndex);
+
+    PxgBodySim bodySim = gBodySim[nodeIndex];
+
+    const PxgMat33 sqrtInvInertia = mat33Load(gTxIData[a].sqrtInvInertia);
+    const PxgTransform28 deltaTransform = gTxIData[a].deltaBody2World;
+
+    // PT: TODO: PGS version uses bodySim.body2World here, why?
+    PxgAlignedTransform body2World = gOutBody2World[a];
+
+    const float4 inverseInertia = bodySim.inverseInertiaXYZ_contactReportThresholdW;
+
+    const float4 motionLinVel = gMotionVelocityArray[a];
+    const float4 motionAngVel = gMotionVelocityArray[a + numSolverBodies];
+
+    const uint readIndex = gParams.accumulatedBodyDeltaVOffset + a;
+
+    // TGS velocity pool layout: v0 = (lin.xyz, ang.x), v1 = (ang.yz, ...)
+    const float4 v0 = gSolverBodyVelPool[readIndex];
+    const float4 v1 = gSolverBodyVelPool[readIndex + numSolverBodies];
+
+    float4 linVel = float4(v0.x, v0.y, v0.z, 0.0f);
+    float4 angVel = float4(v0.w, v1.x, v1.y, 0.0f);
+
+    const uint staticTouchCount = gIslandStaticTouchCounts[gIslandIds[nodeIndex]];
+
+    PxgSolverBodySleepData sleepData;
+
+    integrateCoreTGS(motionLinVel, motionAngVel, inverseInertia, linVel, angVel, body2World,
+                     deltaTransform, data, bodySim, sleepData, sqrtInvInertia,
+                     gParams.dt, gParams.invDtF32, gParams.enableStabilization != 0,
+                     staticTouchCount != 0, gNumCountedInteractions[nodeIndex]);
 
     gSleepData[a] = sleepData;
 

@@ -341,6 +341,62 @@ void refIntegrateCore(const Float4& motionLinVelXYZW, const Float4& motionAngVel
     }
 }
 
+// mirrors integrateCoreTGS() in integration.cuh (IS_TGS_SOLVER)
+void refIntegrateCoreTGS(const Float4& motionLinVelXYZW, const Float4& motionAngVelXYZW,
+                         const Float4& inverseInertia, Float4& solverBodyLinVel, Float4& solverBodyAngVel,
+                         AlignedTransform& body2World, const Transform28& deltaBody2World,
+                         const SolverBodyData& solverBodyData, BodySim& bodySim,
+                         SolverBodySleepData& sleepData, const Mat33& sqrtInvInertia, float dt,
+                         bool enableStabilization, bool hasStaticTouch, uint32_t numCountedInteractions)
+{
+    const uint32_t lockFlags = bodySim.lockFlags;
+
+    const Float4 initialLinVelXYZ_invMassW = solverBodyData.initialLinVelXYZ_invMassW;
+
+    const Vec3 bodyLinearVelocity(solverBodyLinVel.x, solverBodyLinVel.y, solverBodyLinVel.z);
+    const Vec3 bodyAngVelocity = sqrtInvInertia.transform(Vec3(solverBodyAngVel.x, solverBodyAngVel.y, solverBodyAngVel.z));
+
+    solverBodyLinVel = Float4{ (lockFlags & eLOCK_LINEAR_X) ? 0.f : bodyLinearVelocity.x,
+                               (lockFlags & eLOCK_LINEAR_Y) ? 0.f : bodyLinearVelocity.y,
+                               (lockFlags & eLOCK_LINEAR_Z) ? 0.f : bodyLinearVelocity.z, 0.f };
+    solverBodyAngVel = Float4{ (lockFlags & eLOCK_ANGULAR_X) ? 0.f : bodyAngVelocity.x,
+                               (lockFlags & eLOCK_ANGULAR_Y) ? 0.f : bodyAngVelocity.y,
+                               (lockFlags & eLOCK_ANGULAR_Z) ? 0.f : bodyAngVelocity.z, 0.f };
+
+    const Vec3 motionLinVel((lockFlags & eLOCK_LINEAR_X) ? 0.f : motionLinVelXYZW.x,
+                            (lockFlags & eLOCK_LINEAR_Y) ? 0.f : motionLinVelXYZW.y,
+                            (lockFlags & eLOCK_LINEAR_Z) ? 0.f : motionLinVelXYZW.z);
+    const Vec3 motionAngVel((lockFlags & eLOCK_ANGULAR_X) ? 0.f : motionAngVelXYZW.x,
+                            (lockFlags & eLOCK_ANGULAR_Y) ? 0.f : motionAngVelXYZW.y,
+                            (lockFlags & eLOCK_ANGULAR_Z) ? 0.f : motionAngVelXYZW.z);
+
+    const Vec3 linearMotionVel = motionLinVel;
+    Vec3 angularMotionVel = sqrtInvInertia.transform(motionAngVel);
+
+    float w = angularMotionVel.magnitudeSquared();
+    w = std::sqrt(w);
+    const float maxW = 1e+7f;
+    if (w > maxW)
+    {
+        angularMotionVel = angularMotionVel.getNormalized() * maxW;
+        w = maxW;
+    }
+
+    bool freeze = false;
+    refUpdateWakeCounter(freeze, solverBodyLinVel, solverBodyAngVel, body2World, bodySim, sleepData,
+                         inverseInertia, linearMotionVel, angularMotionVel, initialLinVelXYZ_invMassW.w,
+                         dt, enableStabilization, hasStaticTouch, numCountedInteractions);
+
+    if (!freeze)
+    {
+        body2World.p.x += deltaBody2World.p.x;
+        body2World.p.y += deltaBody2World.p.y;
+        body2World.p.z += deltaBody2World.p.z;
+        const QuatV q = (QuatV(deltaBody2World.q) * QuatV(body2World.q)).getNormalized();
+        body2World.q = q.toFloat4();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // test
 // ---------------------------------------------------------------------------
@@ -594,6 +650,244 @@ void checkIntegration(uint32_t nbBodies, uint32_t seed, bool enableStabilization
     dev->destroyBuffer(prevVelBuf);
 }
 
+// TGS variant: same population generator, but the pose comes from the
+// outBody2World pool, velocities are absolute in the (lin.xyz|ang.x),
+// (ang.yz|..) layout and the pose advances by the solver-accumulated delta
+// transform.
+void checkIntegrationTGS(uint32_t nbBodies, uint32_t seed, bool enableStabilization, bool sleepy)
+{
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::uniform_real_distribution<float> sym(-5.f, 5.f);
+
+    const float dt = 1.f / 60.f;
+    const float invDt = 60.f;
+    const uint32_t maxNodes = nbBodies + 16;
+    const uint32_t numIslands = 8;
+    const uint32_t deltaVOffset = 32;
+    const float velScale = sleepy ? 0.001f : 1.f;
+
+    std::vector<uint32_t> nodePool(maxNodes);
+    std::iota(nodePool.begin(), nodePool.end(), 0u);
+    std::shuffle(nodePool.begin(), nodePool.end(), rng);
+
+    std::vector<BodySim> bodySims(maxNodes);
+    std::memset(bodySims.data(), 0, bodySims.size() * sizeof(BodySim));
+    std::vector<SolverBodyData> solverData(nbBodies);
+    std::memset(solverData.data(), 0, solverData.size() * sizeof(SolverBodyData));
+    std::vector<SolverTxIData> txIData(nbBodies);
+    std::memset(txIData.data(), 0, txIData.size() * sizeof(SolverTxIData));
+    std::vector<Float4> motionVel(2 * nbBodies);
+    std::vector<Float4> velPool(deltaVOffset + 2 * nbBodies);
+    std::vector<AlignedTransform> outPoseInit(nbBodies);
+    std::vector<uint32_t> islandIds(maxNodes);
+    std::vector<uint32_t> staticTouchCounts(numIslands);
+    std::vector<uint32_t> numCountedInteractions(maxNodes);
+
+    for (uint32_t n = 0; n < maxNodes; ++n)
+    {
+        islandIds[n] = rng() % numIslands;
+        numCountedInteractions[n] = rng() % 12;
+    }
+    for (uint32_t i = 0; i < numIslands; ++i)
+        staticTouchCounts[i] = (unit(rng) < 0.5f) ? 0u : (rng() % 5 + 1);
+
+    for (uint32_t a = 0; a < nbBodies; ++a)
+    {
+        const uint32_t nodeIndex = nodePool[a];
+        BodySim& b = bodySims[nodeIndex];
+
+        const QuatV q = randomQuat(rng);
+        b.body2World.q = q.toFloat4();
+        b.body2World.p = Float4{ sym(rng), sym(rng), sym(rng), 0.f };
+        b.inverseInertiaXYZ_contactReportThresholdW =
+            Float4{ unit(rng) < 0.1f ? 0.f : unit(rng) * 4.f, unit(rng) < 0.1f ? 0.f : unit(rng) * 4.f,
+                    unit(rng) < 0.1f ? 0.f : unit(rng) * 4.f, unit(rng) };
+        b.linearVelocityXYZ_inverseMassW = Float4{ sym(rng), sym(rng), sym(rng), unit(rng) };
+        b.angularVelocityXYZ_maxPenBiasW = Float4{ sym(rng), sym(rng), sym(rng), -unit(rng) };
+        const float r = unit(rng);
+        const float wakeCounter = r < 0.25f ? 0.f : (r < 0.6f ? unit(rng) * 0.05f : unit(rng) * 4.f);
+        b.freezeThresholdX_wakeCounterY_sleepThresholdZ_bodySimIndex =
+            Float4{ unit(rng) * 0.05f, wakeCounter, unit(rng) * 0.05f, 0.f };
+        b.sleepLinVelAccXYZ_freezeCountW = Float4{ sym(rng) * 0.01f, sym(rng) * 0.01f, sym(rng) * 0.01f,
+                                                   unit(rng) < 0.3f ? 0.f : unit(rng) };
+        b.sleepAngVelAccXYZ_accelScaleW = Float4{ sym(rng) * 0.01f, sym(rng) * 0.01f, sym(rng) * 0.01f, unit(rng) };
+
+        uint32_t flags = 0;
+        if (unit(rng) < 0.3f)
+            flags |= eFROZEN;
+        if (unit(rng) < 0.2f)
+            flags |= eRETAIN_ACCELERATION;
+        b.internalFlags = flags;
+        b.lockFlags = uint16_t(rng() & 0x3Fu & (unit(rng) < 0.25f ? 0x3Fu : 0u));
+        b.externalLinearAcceleration = Float4{ sym(rng), sym(rng), sym(rng), 0 };
+        b.externalAngularAcceleration = Float4{ sym(rng), sym(rng), sym(rng), 0 };
+
+        SolverBodyData& d = solverData[a];
+        d.initialLinVelXYZ_invMassW = Float4{ sym(rng) * velScale, sym(rng) * velScale, sym(rng) * velScale,
+                                              b.linearVelocityXYZ_inverseMassW.w };
+        d.initialAngVelXYZ_penBiasClamp = Float4{ sym(rng) * velScale, sym(rng) * velScale,
+                                                  sym(rng) * velScale, -unit(rng) };
+        d.body2World = b.body2World;
+        d.islandNodeIndex = makeNodeIndex(nodeIndex);
+
+        const Vec3 invI(b.inverseInertiaXYZ_contactReportThresholdW.x,
+                        b.inverseInertiaXYZ_contactReportThresholdW.y,
+                        b.inverseInertiaXYZ_contactReportThresholdW.z);
+        const Vec3 safeSqrt(invI.x == 0.f ? 0.f : std::sqrt(invI.x), invI.y == 0.f ? 0.f : std::sqrt(invI.y),
+                            invI.z == 0.f ? 0.f : std::sqrt(invI.z));
+        const Mat33 rot(q);
+        const Mat33 sqrtInvInertia = Mat33(rot * Mat33(Vec3(safeSqrt.x, 0, 0), Vec3(0, safeSqrt.y, 0), Vec3(0, 0, safeSqrt.z)) * rot.getTranspose());
+        sqrtInvInertia.store(txIData[a].sqrtInvInertia);
+
+        // solver-accumulated delta transform: small translation + near-identity rotation
+        QuatV deltaQ(sym(rng) * 0.01f, sym(rng) * 0.01f, sym(rng) * 0.01f, 1.f);
+        deltaQ = deltaQ.getNormalized();
+        txIData[a].deltaBody2World.q = deltaQ.toQuat();
+        txIData[a].deltaBody2World.p = Float3{ sym(rng) * 0.02f, sym(rng) * 0.02f, sym(rng) * 0.02f };
+
+        // TGS pose pool: the solver iterated on outBody2World
+        outPoseInit[a] = b.body2World;
+        outPoseInit[a].p.x += sym(rng) * 0.01f;
+        outPoseInit[a].p.y += sym(rng) * 0.01f;
+        outPoseInit[a].p.z += sym(rng) * 0.01f;
+
+        motionVel[a] = Float4{ sym(rng) * velScale, sym(rng) * velScale, sym(rng) * velScale, 0 };
+        motionVel[a + nbBodies] = Float4{ sym(rng) * velScale, sym(rng) * velScale, sym(rng) * velScale, 0 };
+        // TGS layout: v0 = (lin.xyz, ang.x), v1 = (ang.y, ang.z, ..)
+        velPool[deltaVOffset + a] = Float4{ sym(rng) * velScale, sym(rng) * velScale, sym(rng) * velScale,
+                                            sym(rng) * velScale };
+        velPool[deltaVOffset + a + nbBodies] =
+            Float4{ sym(rng) * velScale, sym(rng) * velScale, sym(rng) * velScale, sym(rng) * velScale };
+    }
+    for (uint32_t i = 0; i < deltaVOffset; ++i)
+        velPool[i] = Float4{ 999.f, 999.f, 999.f, 999.f };
+
+    // ---- GPU ----
+    PxgSlangComputeDevice* dev = testDevice();
+
+    Kernel kernel("integration.spv", "integrateCoreParallelLaunchTGS",
+                  { 16, 16, sizeof(SolverTxIData), sizeof(SolverBodyData), sizeof(BodySim), 4, 4, 4,
+                    sizeof(SolverBodySleepData), 16, sizeof(AlignedTransform), 16 },
+                  sizeof(IntegrationParams));
+
+    PxgBufferHandle motionVelBuf = createBufferFrom(dev, motionVel);
+    PxgBufferHandle velPoolBuf = createBufferFrom(dev, velPool);
+    PxgBufferHandle txIBuf = createBufferFrom(dev, txIData);
+    PxgBufferHandle solverDataBuf = createBufferFrom(dev, solverData);
+    PxgBufferHandle bodySimBuf = createBufferFrom(dev, bodySims);
+    PxgBufferHandle islandIdsBuf = createBufferFrom(dev, islandIds);
+    PxgBufferHandle staticTouchBuf = createBufferFrom(dev, staticTouchCounts);
+    PxgBufferHandle countedBuf = createBufferFrom(dev, numCountedInteractions);
+    PxgBufferHandle sleepDataBuf = dev->createBuffer(nbBodies * sizeof(SolverBodySleepData));
+    PxgBufferHandle outVelBuf = dev->createBuffer(2 * nbBodies * sizeof(Float4));
+    PxgBufferHandle outPoseBuf = createBufferFrom(dev, outPoseInit);
+    PxgBufferHandle prevVelBuf = dev->createBuffer(maxNodes * 2 * sizeof(Float4));
+
+    const IntegrationParams params = { 0, nbBodies, deltaVOffset, dt, invDt,
+                                       enableStabilization ? 1u : 0u, 1u };
+    const uint32_t blockSize = 128;
+    kernel.dispatch((nbBodies + blockSize - 1) / blockSize,
+                    { motionVelBuf, velPoolBuf, txIBuf, solverDataBuf, bodySimBuf, islandIdsBuf,
+                      staticTouchBuf, countedBuf, sleepDataBuf, outVelBuf, outPoseBuf, prevVelBuf },
+                    params);
+    dev->flush();
+
+    // ---- reference ----
+    std::vector<BodySim> refBodySims = bodySims;
+    std::vector<SolverBodySleepData> refSleep(nbBodies);
+    std::vector<Float4> refOutVel(2 * nbBodies);
+    std::vector<AlignedTransform> refOutPose(nbBodies);
+
+    for (uint32_t a = 0; a < nbBodies; ++a)
+    {
+        const SolverBodyData& data = solverData[a];
+        const uint32_t nodeIndex = uint32_t(data.islandNodeIndex & 0xFFFFFFFFu);
+        BodySim& bodySim = refBodySims[nodeIndex];
+
+        const Mat33 sqrtInvInertia = Mat33::load(txIData[a].sqrtInvInertia);
+        AlignedTransform body2World = outPoseInit[a];
+        const Float4 inverseInertia = bodySim.inverseInertiaXYZ_contactReportThresholdW;
+
+        const Float4 v0 = velPool[deltaVOffset + a];
+        const Float4 v1 = velPool[deltaVOffset + a + nbBodies];
+        Float4 linVel = Float4{ v0.x, v0.y, v0.z, 0.f };
+        Float4 angVel = Float4{ v0.w, v1.x, v1.y, 0.f };
+
+        const bool hasStaticTouch = staticTouchCounts[islandIds[nodeIndex]] != 0;
+
+        SolverBodySleepData sleepData = {};
+        refIntegrateCoreTGS(motionVel[a], motionVel[a + nbBodies], inverseInertia, linVel, angVel,
+                            body2World, txIData[a].deltaBody2World, data, bodySim, sleepData,
+                            sqrtInvInertia, dt, enableStabilization, hasStaticTouch,
+                            numCountedInteractions[nodeIndex]);
+
+        refSleep[a] = sleepData;
+        refOutVel[a] = linVel;
+        refOutVel[a + nbBodies] = angVel;
+        refOutPose[a] = body2World;
+
+        bodySim.linearVelocityXYZ_inverseMassW.x = linVel.x;
+        bodySim.linearVelocityXYZ_inverseMassW.y = linVel.y;
+        bodySim.linearVelocityXYZ_inverseMassW.z = linVel.z;
+        bodySim.angularVelocityXYZ_maxPenBiasW.x = angVel.x;
+        bodySim.angularVelocityXYZ_maxPenBiasW.y = angVel.y;
+        bodySim.angularVelocityXYZ_maxPenBiasW.z = angVel.z;
+        bodySim.body2World = body2World;
+    }
+
+    // ---- compare ----
+    const std::vector<SolverBodySleepData> gpuSleep = downloadBuffer<SolverBodySleepData>(dev, sleepDataBuf, nbBodies);
+    const std::vector<Float4> gpuOutVel = downloadBuffer<Float4>(dev, outVelBuf, 2 * nbBodies);
+    const std::vector<AlignedTransform> gpuOutPose = downloadBuffer<AlignedTransform>(dev, outPoseBuf, nbBodies);
+    const std::vector<BodySim> gpuBodySims = downloadBuffer<BodySim>(dev, bodySimBuf, maxNodes);
+
+    auto eq4 = [&](const Float4& g, const Float4& r) {
+        return almostEqual(g.x, r.x, 1e-4f, 2e-5f) && almostEqual(g.y, r.y, 1e-4f, 2e-5f) &&
+               almostEqual(g.z, r.z, 1e-4f, 2e-5f) && almostEqual(g.w, r.w, 1e-4f, 2e-5f);
+    };
+
+    for (uint32_t a = 0; a < nbBodies; ++a)
+    {
+        PXG_CHECK_MSG(gpuSleep[a].internalFlags == refSleep[a].internalFlags,
+                      "tgs sleep.flags[%u]: gpu=0x%x ref=0x%x", a, gpuSleep[a].internalFlags,
+                      refSleep[a].internalFlags);
+        PXG_CHECK_MSG(almostEqual(gpuSleep[a].wakeCounter, refSleep[a].wakeCounter, 1e-4f, 1e-6f),
+                      "tgs sleep.wakeCounter[%u]", a);
+        PXG_CHECK_MSG(eq4(gpuOutVel[a], refOutVel[a]), "tgs outLinVel[%u]", a);
+        PXG_CHECK_MSG(eq4(gpuOutVel[a + nbBodies], refOutVel[a + nbBodies]), "tgs outAngVel[%u]", a);
+        PXG_CHECK_MSG(eq4(gpuOutPose[a].p, refOutPose[a].p), "tgs outPose.p[%u]: gpu=(%g,%g,%g) ref=(%g,%g,%g)",
+                      a, gpuOutPose[a].p.x, gpuOutPose[a].p.y, gpuOutPose[a].p.z, refOutPose[a].p.x,
+                      refOutPose[a].p.y, refOutPose[a].p.z);
+        PXG_CHECK_MSG(eq4(gpuOutPose[a].q, refOutPose[a].q), "tgs outPose.q[%u]", a);
+
+        const uint32_t nodeIndex = uint32_t(solverData[a].islandNodeIndex & 0xFFFFFFFFu);
+        const BodySim& gb = gpuBodySims[nodeIndex];
+        const BodySim& rb = refBodySims[nodeIndex];
+        PXG_CHECK_MSG(gb.internalFlags == rb.internalFlags, "tgs bodySim.flags[node %u]: gpu=0x%x ref=0x%x",
+                      nodeIndex, gb.internalFlags, rb.internalFlags);
+        PXG_CHECK_MSG(eq4(gb.linearVelocityXYZ_inverseMassW, rb.linearVelocityXYZ_inverseMassW),
+                      "tgs bodySim.linVel[node %u]", nodeIndex);
+        PXG_CHECK_MSG(eq4(gb.angularVelocityXYZ_maxPenBiasW, rb.angularVelocityXYZ_maxPenBiasW),
+                      "tgs bodySim.angVel[node %u]", nodeIndex);
+        PXG_CHECK_MSG(eq4(gb.body2World.p, rb.body2World.p), "tgs bodySim.pose.p[node %u]", nodeIndex);
+        PXG_CHECK_MSG(eq4(gb.body2World.q, rb.body2World.q), "tgs bodySim.pose.q[node %u]", nodeIndex);
+    }
+
+    dev->destroyBuffer(motionVelBuf);
+    dev->destroyBuffer(velPoolBuf);
+    dev->destroyBuffer(txIBuf);
+    dev->destroyBuffer(solverDataBuf);
+    dev->destroyBuffer(bodySimBuf);
+    dev->destroyBuffer(islandIdsBuf);
+    dev->destroyBuffer(staticTouchBuf);
+    dev->destroyBuffer(countedBuf);
+    dev->destroyBuffer(sleepDataBuf);
+    dev->destroyBuffer(outVelBuf);
+    dev->destroyBuffer(outPoseBuf);
+    dev->destroyBuffer(prevVelBuf);
+}
+
 PXG_TEST(integration_activeBodies)
 {
     checkIntegration(1000, 500, false, false);
@@ -615,6 +909,24 @@ PXG_TEST(integration_partialBlock)
 {
     checkIntegration(1, 504, true, false);
     checkIntegration(129, 505, false, true);
+}
+
+PXG_TEST(integrationTGS_activeBodies)
+{
+    checkIntegrationTGS(1000, 600, false, false);
+    checkIntegrationTGS(1000, 601, true, false);
+}
+
+PXG_TEST(integrationTGS_sleepyBodies)
+{
+    checkIntegrationTGS(1000, 602, false, true);
+    checkIntegrationTGS(1000, 603, true, true);
+}
+
+PXG_TEST(integrationTGS_partialBlock)
+{
+    checkIntegrationTGS(1, 604, true, false);
+    checkIntegrationTGS(127, 605, false, true);
 }
 
 } // namespace
