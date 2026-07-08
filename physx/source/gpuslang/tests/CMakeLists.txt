@@ -119,6 +119,7 @@ pxg_compile_shader(thresholdForceChange setThresholdElementsMask setPersistentFo
 pxg_compile_shader(solverZeroBodies ZeroBodies ZeroBodiesTGS)
 pxg_compile_shader(solverInitVelocitiesTGS initializeSolverVelocitiesTGS)
 pxg_compile_shader(solverApplyGravityTGS applyTGSSubstepGravity)
+pxg_compile_shader(solverDmaBack dmaBackChangedElems dmaConstraintResidual)
 pxg_compile_shader(broadphaseSetup translateAABBsLaunch markCreatedPairsLaunch initializeSapBox1DLaunch
                    initializeRadixRanks updateHandles)
 pxg_compile_shader(broadphaseReports accumulateReportsStage_1 accumulateReportsStage_2 copyReports)
@@ -186,6 +187,7 @@ add_executable(gpuslang-tests
     testSolverZeroBodies.cpp
     testSolverInitVelocitiesTGS.cpp
     testSolverApplyGravityTGS.cpp
+    testSolverDmaBack.cpp
     testBroadphaseSetup.cpp
     testBroadphaseReports.cpp
     testBroadphaseIncrementalHistogram.cpp
@@ -213,7 +215,7 @@ add_dependencies(gpuslang-tests gpuslang-shaders)
 enable_testing()
 foreach(suite scan radixSort radixSortGather preIntegration integration updateBounds memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
-        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS broadphaseSetup broadphaseReports
+        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
         broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram
         broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
@@ -264,6 +266,7 @@ set(PXG_HLSL_ENTRIES
     "solverZeroBodies:ZeroBodies" "solverZeroBodies:ZeroBodiesTGS"
     "solverInitVelocitiesTGS:initializeSolverVelocitiesTGS"
     "solverApplyGravityTGS:applyTGSSubstepGravity"
+    "solverDmaBack:dmaBackChangedElems" "solverDmaBack:dmaConstraintResidual"
     "broadphaseSetup:translateAABBsLaunch" "broadphaseSetup:markCreatedPairsLaunch"
     "broadphaseSetup:initializeSapBox1DLaunch" "broadphaseSetup:initializeRadixRanks"
     "broadphaseSetup:updateHandles"
