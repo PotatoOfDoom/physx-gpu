@@ -28,6 +28,7 @@ gpuslang/
 │   ├── integration.slang            solver integration, PGS + TGS + sleep state machine
 │   ├── updateBounds.slang           transform cache + world AABB update
 │   ├── solverPGS.slang              PGS solver: iteration, conclude, writeback, averaging
+│   ├── solverTGS.slang              TGS solver iteration (contacts + joints)
 │   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
 │   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
@@ -103,7 +104,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (39 GPU test cases + 39 DX12 cross-compile checks) verifies:
+The suite (40 GPU test cases + 40 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
@@ -135,7 +136,11 @@ The suite (39 GPU test cases + 39 DX12 cross-compile checks) verifies:
   batches: normal impulses with rigid and compliant (acceleration-spring)
   restitution, static/dynamic friction clamping with broken flags, 1D joint
   rows with spring modes and residual writeback, and the mass-splitting
-  slab reference counts.
+  slab reference counts;
+- **TGS solver iteration** — the sub-timestep solver: accumulated-delta
+  contact separations, paired anisotropic friction with torsional anchors,
+  and 1D joints re-anchored through per-body delta transforms with
+  ortho-axis projection.
 
 ## Known limitations
 
