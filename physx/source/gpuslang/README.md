@@ -34,6 +34,7 @@ gpuslang/
 │   ├── constraintPrepPGS.slang      PGS contact + 1D joint constraint prep
 │   ├── constraintPrepTGS.slang      TGS contact + 1D joint constraint prep
 │   ├── thresholdStream.slang        force-threshold reporting accumulation
+│   ├── thresholdForceChange.slang   cross-frame found/lost/persistent force-change diff
 │   ├── broadphaseSetup.slang        broad-phase integer-AABB + SAP-box setup
 │   ├── broadphaseReports.slang      broad-phase found/lost pair report accumulation
 │   ├── broadphaseIncrementalHistogram.slang  incremental-SAP comparison-count histograms
@@ -130,7 +131,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (82 GPU test cases + 103 DX12 cross-compile checks) verifies:
+The suite (83 GPU test cases + 108 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
@@ -184,6 +185,12 @@ The suite (82 GPU test cases + 103 DX12 cross-compile checks) verifies:
   device-wide segmented scan that accumulates each body pair's normal force,
   and the exceeded-force detection and compaction, verified across the
   32-block boundary;
+- **threshold force-change diff** — the cross-frame event pipeline: binary
+  searching the sorted previous-exceeded set (with the ThresholdStreamElement /
+  PxNodeIndex 64-bit comparators and the backward run-walk that matches
+  shapeInteraction), the persistent-mask complement, the two-pass device-wide
+  exclusive prefix over the previous|current|persistent mask, and the
+  compaction of the found / lost / persistent force-change events;
 - **broad-phase setup** — the incremental-SAP foundation: quantizing float
   AABBs into the sortable integer projection layout (contact-distance
   inflation, monotonic float encoding, axis bit-shifts and environment-ID

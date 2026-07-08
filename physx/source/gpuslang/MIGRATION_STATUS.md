@@ -35,7 +35,7 @@ Vulkan/D3D12 backends.
 | `constraintBlockPrepTGS.cu` + `jointConstraintBlockPrepTGS.cuh` | rigid TGS constraint prep | 🟡 | `constraintPrepTGS.slang` — contactConstraintBlockPrepareParallelLaunchTGS (restitutionXdt/scaledBias TGS coefficients, torsional friction anchor, kinematic target-velocity bias) ✅, jointConstraintBlockPrepareParallelLaunchTGS (setUp1DConstraintBlockTGS + intializeBlock1DTGS: biasScale/velMultiplier/targetVel constants, maxBiasVelocity, ortho-axis header setup, solve-hint promotion) ✅; articulation paths ⬜ |
 | `constraintBlockPrePrep.cu` | constraint pre-prep (partition remap, friction-patch counts) | ⬜ | produces the batch/partition layout the block prep consumes |
 | `artiConstraintPrep2.cu` | articulation constraint prep | ⬜ | |
-| `accumulateThresholdStream.cu` | force-threshold reporting | 🟡 | `thresholdStream.slang` — sort-key extraction for the two-pass (nodeIndexA, nodeIndexB) sort (initialRanksAndBodyIndexB/A) + stream reorganize ✅, device-wide segmented force accumulation (computeAccumulateThresholdStream + outputAccumulateThresholdStream + writeoutAccumulatedForcePerObject) ✅, exceeded-force detection + compaction (computeExceededForceThresholdElementIndice + outputExceededForceThresholdElementIndice) ✅; the cross-frame found/lost/persistent event diff (setThresholdElementsMask → createForceChangeThresholdElements) ⬜ |
+| `accumulateThresholdStream.cu` | force-threshold reporting | ✅ | `thresholdStream.slang` — sort-key extraction for the two-pass (nodeIndexA, nodeIndexB) sort (initialRanksAndBodyIndexB/A) + stream reorganize ✅, device-wide segmented force accumulation (computeAccumulateThresholdStream + outputAccumulateThresholdStream + writeoutAccumulatedForcePerObject) ✅, exceeded-force detection + compaction (computeExceededForceThresholdElementIndice + outputExceededForceThresholdElementIndice) ✅. `thresholdForceChange.slang` ports the cross-frame found/lost/persistent event diff: setThresholdElementsMask (binary-search the sorted previous set with the `ThresholdStreamElement`/`PxNodeIndex` 64-bit comparators + backward run-walk to match shapeInteraction, clearing the persistent pairs' previous/current masks), setPersistentForceElementMask (persistentMask = !previousMask), computeThresholdElementMaskIndices + outputThresholdPairsMaskIndices (two-pass device-wide exclusive prefix over the previous|current|persistent 0/1 mask) and createForceChangeThresholdElements (compact the found/lost/persistent events, lost pairs zeroing accumulatedForce) ✅. The CUDA in-kernel setPersistentForceElementMask device call — a cross-block read-after-write on the persistent region — is split into its own launch for globally-ordered, identical output. Only `bodyInputAndRanksSingleBlock/BlocksLaunch` (radix-sort setup subsumed by the generic radix path) remain outside this file's shaders |
 
 ## gpusimulationcontroller
 
@@ -67,7 +67,7 @@ Vulkan/D3D12 backends.
 
 ## Verification
 
-All ported kernels are covered by `tests/` (82 GPU test cases, run per commit
+All ported kernels are covered by `tests/` (83 GPU test cases, run per commit
 via ctest on a Vulkan device — llvmpipe in CI):
 
 | Kernel | Reference | Checks |
