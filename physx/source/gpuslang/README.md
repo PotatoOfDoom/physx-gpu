@@ -39,6 +39,7 @@ gpuslang/
 │   ├── broadphaseEndPtHistogram.slang        start/end-point projection histograms + ordered handles
 │   ├── broadphaseIncrementalSap.slang        incremental sweep-and-prune found/lost pair generation
 │   ├── broadphaseRegionHistogram.slang       region accumulator prefix-sum scan pair
+│   ├── broadphaseCreateRegions.slang         region-span + overlap-check-count producer
 │   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
 │   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
@@ -114,7 +115,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (61 GPU test cases + 69 DX12 cross-compile checks) verifies:
+The suite (62 GPU test cases + 70 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
@@ -205,7 +206,12 @@ The suite (61 GPU test cases + 69 DX12 cross-compile checks) verifies:
   start-region/region wrappers): a plain device-wide two-pass exclusive prefix
   sum plus grand total over a flat integer array, verified against
   `std::exclusive_scan` across warp/block/grid-stride boundary sizes and a
-  wide-value case.
+  wide-value case;
+- **broad-phase create regions** — the region producer (createRegionsKernel)
+  that maps each box's per-axis endpoint positions through the total-end-point
+  histogram into a coarse min/max region-index span, writing regionRange, the
+  collision-free start-region scatter and the per-projection region
+  overlap-check counts that the region prefix-sum scan then accumulates.
 
 ## Known limitations
 
