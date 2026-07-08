@@ -34,6 +34,8 @@ gpuslang/
 │   ├── constraintPrepTGS.slang      TGS contact + 1D joint constraint prep
 │   ├── thresholdStream.slang        force-threshold reporting accumulation
 │   ├── broadphaseSetup.slang        broad-phase integer-AABB + SAP-box setup
+│   ├── broadphaseReports.slang      broad-phase found/lost pair report accumulation
+│   ├── broadphaseIncrementalHistogram.slang  incremental-SAP comparison-count histograms
 │   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
 │   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
@@ -109,7 +111,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (55 GPU test cases + 62 DX12 cross-compile checks) verifies:
+The suite (56 GPU test cases + 64 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
@@ -167,7 +169,18 @@ The suite (55 GPU test cases + 62 DX12 cross-compile checks) verifies:
   AABBs into the sortable integer projection layout (contact-distance
   inflation, monotonic float encoding, axis bit-shifts and environment-ID
   packing), appending newly created bounds' projections and sort handles, and
-  building the 1D SAP boxes from the sorted handles.
+  building the 1D SAP boxes from the sorted handles;
+- **broad-phase reports** — the found/lost pair report accumulation: classifying
+  each pair as aggregate vs actor (VolumeData::isSingleActor), the two-stage
+  between-block prefix that stably compacts the four found/lost × agg/actor
+  categories, and the actor-report copy-out with overflow flagging;
+- **broad-phase incremental histograms** — the incremental-SAP comparison-count
+  stage: per-projection overlap-comparison counts derived as differences of two
+  prefix-sum histogram entries (selected from the 2×2×3 start/end ×
+  this/last-frame × axis table by each projection's start/end kind and down/up
+  pass, with the down-pass rank clamp and deleted-projection exclusion), and the
+  device-wide two-pass exclusive prefix (per-projection running total, per-block
+  totals and per-axis grand total) verified across the 32-block boundary.
 
 ## Known limitations
 

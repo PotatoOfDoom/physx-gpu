@@ -115,6 +115,8 @@ pxg_compile_shader(thresholdStream initialRanksAndBodyIndexB initialRanksAndBody
 pxg_compile_shader(broadphaseSetup translateAABBsLaunch markCreatedPairsLaunch initializeSapBox1DLaunch
                    initializeRadixRanks updateHandles)
 pxg_compile_shader(broadphaseReports accumulateReportsStage_1 accumulateReportsStage_2 copyReports)
+pxg_compile_shader(broadphaseIncrementalHistogram computeIncrementalComparisonHistograms_Stage1
+                   computeIncrementalComparisonHistograms_Stage2)
 pxg_compile_shader(memCopy MemCopyBalanced)
 pxg_compile_shader(clampValues clampMaxValue clampMaxValues)
 pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeighted
@@ -151,14 +153,16 @@ add_executable(gpuslang-tests
     testConstraintPrep.cpp
     testThresholdStream.cpp
     testBroadphaseSetup.cpp
-    testBroadphaseReports.cpp)
+    testBroadphaseReports.cpp
+    testBroadphaseIncrementalHistogram.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
 enable_testing()
 foreach(suite scan radixSort preIntegration integration updateBounds memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
-        constraintPrepPGS constraintPrepTGS thresholdStream broadphaseSetup broadphaseReports)
+        constraintPrepPGS constraintPrepTGS thresholdStream broadphaseSetup broadphaseReports
+        broadphaseIncrementalHistogram)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -198,6 +202,8 @@ set(PXG_HLSL_ENTRIES
     "broadphaseSetup:updateHandles"
     "broadphaseReports:accumulateReportsStage_1" "broadphaseReports:accumulateReportsStage_2"
     "broadphaseReports:copyReports"
+    "broadphaseIncrementalHistogram:computeIncrementalComparisonHistograms_Stage1"
+    "broadphaseIncrementalHistogram:computeIncrementalComparisonHistograms_Stage2"
     "solverPGS:computeAverageSolverBodyVelocity" "solverPGS:propagateSolverBodyVelocity"
     "scan4x4:scanPerBlockKernel4x4" "scan4x4:addBlockSumsKernel4x4"
     "radixFourBit:radixFourBitCountPerBlockKernel" "radixFourBit:radixFourBitReorderKernel"
