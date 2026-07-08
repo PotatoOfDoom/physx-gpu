@@ -31,6 +31,7 @@ gpuslang/
 │   ├── solverPGS.slang              PGS solver: iteration, conclude, writeback, averaging
 │   ├── solverTGS.slang              TGS solver: iteration, conclude, writeback, averaging
 │   ├── solverZeroBodies.slang       pre-solve body-velocity reset (PGS + TGS)
+│   ├── solverInitVelocitiesTGS.slang TGS pre-solve velocity seeding (slab scatter)
 │   ├── pxgSlangPrepCommon.slang     constraint-prep inputs + Dy 1D solver-constant helpers
 │   ├── constraintPrepPGS.slang      PGS contact + 1D joint constraint prep
 │   ├── constraintPrepTGS.slang      TGS contact + 1D joint constraint prep
@@ -132,7 +133,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (85 GPU test cases + 110 DX12 cross-compile checks) verifies:
+The suite (86 GPU test cases + 111 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;

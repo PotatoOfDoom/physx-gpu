@@ -117,6 +117,7 @@ pxg_compile_shader(thresholdForceChange setThresholdElementsMask setPersistentFo
                    computeThresholdElementMaskIndices outputThresholdPairsMaskIndices
                    createForceChangeThresholdElements)
 pxg_compile_shader(solverZeroBodies ZeroBodies ZeroBodiesTGS)
+pxg_compile_shader(solverInitVelocitiesTGS initializeSolverVelocitiesTGS)
 pxg_compile_shader(broadphaseSetup translateAABBsLaunch markCreatedPairsLaunch initializeSapBox1DLaunch
                    initializeRadixRanks updateHandles)
 pxg_compile_shader(broadphaseReports accumulateReportsStage_1 accumulateReportsStage_2 copyReports)
@@ -182,6 +183,7 @@ add_executable(gpuslang-tests
     testThresholdStream.cpp
     testThresholdForceChange.cpp
     testSolverZeroBodies.cpp
+    testSolverInitVelocitiesTGS.cpp
     testBroadphaseSetup.cpp
     testBroadphaseReports.cpp
     testBroadphaseIncrementalHistogram.cpp
@@ -209,7 +211,7 @@ add_dependencies(gpuslang-tests gpuslang-shaders)
 enable_testing()
 foreach(suite scan radixSort radixSortGather preIntegration integration updateBounds memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
-        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies broadphaseSetup broadphaseReports
+        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
         broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram
         broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
@@ -258,6 +260,7 @@ set(PXG_HLSL_ENTRIES
     "thresholdForceChange:outputThresholdPairsMaskIndices"
     "thresholdForceChange:createForceChangeThresholdElements"
     "solverZeroBodies:ZeroBodies" "solverZeroBodies:ZeroBodiesTGS"
+    "solverInitVelocitiesTGS:initializeSolverVelocitiesTGS"
     "broadphaseSetup:translateAABBsLaunch" "broadphaseSetup:markCreatedPairsLaunch"
     "broadphaseSetup:initializeSapBox1DLaunch" "broadphaseSetup:initializeRadixRanks"
     "broadphaseSetup:updateHandles"
