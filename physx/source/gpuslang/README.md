@@ -36,6 +36,7 @@ gpuslang/
 │   ├── broadphaseSetup.slang        broad-phase integer-AABB + SAP-box setup
 │   ├── broadphaseReports.slang      broad-phase found/lost pair report accumulation
 │   ├── broadphaseIncrementalHistogram.slang  incremental-SAP comparison-count histograms
+│   ├── broadphaseEndPtHistogram.slang        start/end-point projection histograms + ordered handles
 │   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
 │   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
@@ -111,7 +112,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (56 GPU test cases + 64 DX12 cross-compile checks) verifies:
+The suite (59 GPU test cases + 66 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
@@ -180,7 +181,14 @@ The suite (56 GPU test cases + 64 DX12 cross-compile checks) verifies:
   this/last-frame × axis table by each projection's start/end kind and down/up
   pass, with the down-pass rank clamp and deleted-projection exclusion), and the
   device-wide two-pass exclusive prefix (per-projection running total, per-block
-  totals and per-axis grand total) verified across the 32-block boundary.
+  totals and per-axis grand total) verified across the 32-block boundary;
+- **broad-phase endpoint histograms** — the upstream producer of those
+  histograms: per-projection start / end / all-end classification with a
+  packed three-counter block scan (10-bit fields), promoted to the device-wide
+  start/end/total-end point histograms and their per-block totals, and the
+  compacting scatter of non-deleted handles into the ordered start/end point
+  handle arrays, over incremental (with and without the removed-handle rescan)
+  and full-rebuild modes.
 
 ## Known limitations
 
