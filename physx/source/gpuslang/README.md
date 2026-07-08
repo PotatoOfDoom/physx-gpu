@@ -41,6 +41,7 @@ gpuslang/
 │   ├── npMaterialCombine.slang       contact-patch material combine (friction/restitution/damping)
 │   ├── npContactPatch.slang          contact-stream alloc + status-flag packing (atomic)
 │   ├── npInsertPatch.slang           PxContactPatch header write (material combine + pack)
+│   ├── npCompressContacts.slang      contact-count histogram + friction-patch offset rescale
 │   ├── pxgSlangPrepCommon.slang     constraint-prep inputs + Dy 1D solver-constant helpers
 │   ├── constraintPrepPGS.slang      PGS contact + 1D joint constraint prep
 │   ├── constraintPrepTGS.slang      TGS contact + 1D joint constraint prep
@@ -142,7 +143,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (102 GPU test cases + 131 DX12 cross-compile checks) verifies:
+The suite (104 GPU test cases + 133 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;

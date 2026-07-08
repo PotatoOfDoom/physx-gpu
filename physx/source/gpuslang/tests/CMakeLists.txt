@@ -129,6 +129,7 @@ pxg_compile_shader(npCapsuleCollision planeCapsule capsuleCapsule)
 pxg_compile_shader(npMaterialCombine combineMaterials)
 pxg_compile_shader(npContactPatch setContactPointAndForcePointers registerContactPatch)
 pxg_compile_shader(npInsertPatch insertIntoPatchStream)
+pxg_compile_shader(npCompressContacts compressContactStage1 updateFrictionPatches)
 pxg_compile_shader(broadphaseSetup translateAABBsLaunch markCreatedPairsLaunch initializeSapBox1DLaunch
                    initializeRadixRanks updateHandles)
 pxg_compile_shader(broadphaseReports accumulateReportsStage_1 accumulateReportsStage_2 copyReports)
@@ -204,6 +205,7 @@ add_executable(gpuslang-tests
     testNpMaterialCombine.cpp
     testNpContactPatch.cpp
     testNpInsertPatch.cpp
+    testNpCompressContacts.cpp
     testBroadphaseSetup.cpp
     testBroadphaseReports.cpp
     testBroadphaseIncrementalHistogram.cpp
@@ -231,7 +233,7 @@ add_dependencies(gpuslang-tests gpuslang-shaders)
 enable_testing()
 foreach(suite scan radixSort radixSortGather preIntegration integration updateBounds memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
-        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine npContactPatch npInsertPatch broadphaseSetup broadphaseReports
+        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine npContactPatch npInsertPatch npCompressContacts broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
         broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram
         broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
@@ -294,6 +296,7 @@ set(PXG_HLSL_ENTRIES
     "npMaterialCombine:combineMaterials"
     "npContactPatch:setContactPointAndForcePointers" "npContactPatch:registerContactPatch"
     "npInsertPatch:insertIntoPatchStream"
+    "npCompressContacts:compressContactStage1" "npCompressContacts:updateFrictionPatches"
     "broadphaseSetup:translateAABBsLaunch" "broadphaseSetup:markCreatedPairsLaunch"
     "broadphaseSetup:initializeSapBox1DLaunch" "broadphaseSetup:initializeRadixRanks"
     "broadphaseSetup:updateHandles"
