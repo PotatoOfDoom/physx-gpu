@@ -53,6 +53,7 @@ gpuslang/
 │   ├── broadphaseAggregateBoxPruning.slang   bipartite SAP box-pruning sweep (agg collision core)
 │   ├── broadphaseAggPairCollision.slang      aggregate-pair collision dispatch (found/lost)
 │   ├── broadphaseAggSelfCollision.slang      aggregate self-collision (found/lost within one agg)
+│   ├── broadphaseAggSortProjections.slang    build sorted aggregate projection SAP structure
 │   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
 │   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
@@ -128,7 +129,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (80 GPU test cases + 97 DX12 cross-compile checks) verifies:
+The suite (81 GPU test cases + 98 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
