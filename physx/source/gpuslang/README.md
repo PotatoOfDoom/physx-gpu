@@ -42,6 +42,7 @@ gpuslang/
 │   ├── broadphaseCreateRegions.slang         region-span + overlap-check-count producer
 │   ├── broadphaseActiveRegionHistogram.slang per-region handle compaction (flags/scan/scatter)
 │   ├── broadphaseOverlapCheckHistogram.slang overlap-check counts + 64-bit region scan
+│   ├── broadphaseNewBoundsPairs.slang        new-bounds region found-pair generation
 │   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
 │   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
@@ -117,7 +118,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (65 GPU test cases + 76 DX12 cross-compile checks) verifies:
+The suite (66 GPU test cases + 77 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
@@ -226,7 +227,15 @@ The suite (65 GPU test cases + 76 DX12 cross-compile checks) verifies:
   offset tables (with the handle/region record), and the device-wide **64-bit**
   (`PxU64` → `uint64_t`) two-pass exclusive prefix sum + grand total, verified
   against a `uint64` exclusive scan whose total exceeds 2³² to exercise the
-  64-bit path (the Vulkan device enables `shaderInt64` when available).
+  64-bit path (the Vulkan device enables `shaderInt64` when available);
+- **broad-phase new-bounds pairs** — the final region kernel
+  (generateFoundPairsForNewBoundsRegion) that consumes the whole region
+  pipeline: a 64-bit grid-stride binary-search over the overlap-check total,
+  region-slice candidate resolution from the compacted ordered handle lists, the
+  max-of-min-corners dedup, group/environment filtering, integer-AABB
+  intersection and atomic-compacted found-pair output — verified end-to-end by
+  rebuilding the entire region pipeline on the CPU to feed consistent inputs and
+  comparing the produced pair set against a transcription.
 
 ## Known limitations
 
