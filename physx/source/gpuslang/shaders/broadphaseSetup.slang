@@ -75,6 +75,8 @@ struct BpParams
     uint numPreviousHandles;
     // initializeSapBox1DLaunch
     uint numHandles;
+    // initializeRadixRanks / updateHandles
+    uint numProjections;
 }
 
 [[vk::push_constant]]
@@ -96,6 +98,12 @@ RWStructuredBuffer<PxgIntegerAABB> gOldIntegerBounds; // binding 12
 RWStructuredBuffer<PxgSapBox1D> gSapBoxX;          // binding 13
 RWStructuredBuffer<PxgSapBox1D> gSapBoxY;          // binding 14
 RWStructuredBuffer<PxgSapBox1D> gSapBoxZ;          // binding 15
+RWStructuredBuffer<uint> gBoxProjRanksX;           // binding 16
+RWStructuredBuffer<uint> gBoxProjRanksY;           // binding 17
+RWStructuredBuffer<uint> gBoxProjRanksZ;           // binding 18
+RWStructuredBuffer<uint> gTmpHandlesX;             // binding 19 (previous frame's handles)
+RWStructuredBuffer<uint> gTmpHandlesY;             // binding 20
+RWStructuredBuffer<uint> gTmpHandlesZ;             // binding 21
 
 // mirrors encodeFloat(): monotonic float -> uint mapping (order-preserving)
 uint encodeFloat(float f)
@@ -245,4 +253,38 @@ void initializeSapBox1DLaunch(uint3 dtid : SV_DispatchThreadID)
     gSapBoxX[handleX].mMinMax[isStartProjection(sortedHandleX) ? 0u : 1u] = i;
     gSapBoxY[handleY].mMinMax[isStartProjection(sortedHandleY) ? 0u : 1u] = i;
     gSapBoxZ[handleZ].mMinMax[isStartProjection(sortedHandleZ) ? 0u : 1u] = i;
+}
+
+// mirrors initializeRadixRanks(): fill the per-axis projection-rank arrays with
+// identity ranks (0,1,2,…) for the radix sort, padded up to a multiple of 4.
+// The CUDA original writes uint4 groups; one thread per element is identical.
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void initializeRadixRanks(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint nbProjections = gParams.numProjections; // numPreviousHandles * 2
+    const uint padded = ((nbProjections + 3) / 4) * 4;
+    const uint stride = 256 * 64;
+    for (uint i = dtid.x; i < padded; i += stride)
+    {
+        gBoxProjRanksX[i] = i;
+        gBoxProjRanksY[i] = i;
+        gBoxProjRanksZ[i] = i;
+    }
+}
+
+// mirrors updateHandles(): reorder the previous frame's handles into the
+// current frame's handle arrays using the sort permutation (projection ranks)
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void updateHandles(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint nbProjections = gParams.numProjections; // numPreviousHandles * 2
+    const uint stride = 256 * 64;
+    for (uint i = dtid.x; i < nbProjections; i += stride)
+    {
+        gBoxHandlesX[i] = gTmpHandlesX[gBoxProjRanksX[i]];
+        gBoxHandlesY[i] = gTmpHandlesY[gBoxProjRanksY[i]];
+        gBoxHandlesZ[i] = gTmpHandlesZ[gBoxProjRanksZ[i]];
+    }
 }

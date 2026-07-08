@@ -66,6 +66,7 @@ struct BpParams
     uint32_t numCreatedHandles;
     uint32_t numPreviousHandles;
     uint32_t numHandles;
+    uint32_t numProjections;
 };
 
 uint32_t encodeFloat(float f)
@@ -381,6 +382,116 @@ PXG_TEST(broadphaseSetup_initializeSapBox1D)
     PXG_CHECK_MSG(mism == 0, "%zu SAP box mismatches", mism);
 
     for (PxgBufferHandle h : { hxBuf, hyBuf, hzBuf, sxBuf, syBuf, szBuf, dummyBuf })
+        dev->destroyBuffer(h);
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: initializeRadixRanks
+// ---------------------------------------------------------------------------
+PXG_TEST(broadphaseSetup_initializeRadixRanks)
+{
+    const uint32_t numPrevious = 151; // odd; numProjections = 302, padded to 304
+    const uint32_t numProjections = numPrevious * 2;
+    const uint32_t padded = ((numProjections + 3) / 4) * 4;
+
+    std::vector<uint32_t> ranksX(padded, 0xeeeeeeeeu), ranksY(padded, 0xeeeeeeeeu), ranksZ(padded, 0xeeeeeeeeu);
+    std::vector<uint32_t> dummy(16, 0);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    PxgBufferHandle rxBuf = createBufferFrom(dev, ranksX);
+    PxgBufferHandle ryBuf = createBufferFrom(dev, ranksY);
+    PxgBufferHandle rzBuf = createBufferFrom(dev, ranksZ);
+    PxgBufferHandle dummyBuf = createBufferFrom(dev, dummy);
+
+    Kernel k("broadphaseSetup.spv", "initializeRadixRanks",
+             { 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4 }, sizeof(BpParams));
+    BpParams p = {};
+    p.numProjections = numProjections;
+    // bindings 16,17,18
+    std::vector<PxgBufferHandle> bufs(16, dummyBuf);
+    bufs.push_back(rxBuf);
+    bufs.push_back(ryBuf);
+    bufs.push_back(rzBuf);
+    k.dispatch((padded + 255) / 256, bufs, p);
+    dev->flush();
+
+    const auto gX = downloadBuffer<uint32_t>(dev, rxBuf, padded);
+    const auto gY = downloadBuffer<uint32_t>(dev, ryBuf, padded);
+    const auto gZ = downloadBuffer<uint32_t>(dev, rzBuf, padded);
+    size_t mism = 0;
+    for (uint32_t i = 0; i < padded; ++i)
+        if (gX[i] != i || gY[i] != i || gZ[i] != i) ++mism;
+    PXG_CHECK_MSG(mism == 0, "%zu radix-rank mismatches", mism);
+
+    for (PxgBufferHandle h : { rxBuf, ryBuf, rzBuf, dummyBuf })
+        dev->destroyBuffer(h);
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: updateHandles
+// ---------------------------------------------------------------------------
+PXG_TEST(broadphaseSetup_updateHandles)
+{
+    std::mt19937 rng(6400);
+    const uint32_t numPrevious = 220;
+    const uint32_t numProjections = numPrevious * 2;
+
+    // per-axis: a random permutation of [0, numProjections) as the sort ranks,
+    // and previous-frame handle arrays with distinct values
+    auto buildPerm = [&]() {
+        std::vector<uint32_t> perm(numProjections);
+        std::iota(perm.begin(), perm.end(), 0u);
+        std::shuffle(perm.begin(), perm.end(), rng);
+        return perm;
+    };
+    std::vector<uint32_t> ranksX = buildPerm(), ranksY = buildPerm(), ranksZ = buildPerm();
+    std::vector<uint32_t> tmpX(numProjections), tmpY(numProjections), tmpZ(numProjections);
+    for (uint32_t i = 0; i < numProjections; ++i)
+    {
+        tmpX[i] = 0x1000 + i;
+        tmpY[i] = 0x2000 + i;
+        tmpZ[i] = 0x3000 + i;
+    }
+    std::vector<uint32_t> handX(numProjections, 0), handY(numProjections, 0), handZ(numProjections, 0);
+    std::vector<uint32_t> dummy(16, 0);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    PxgBufferHandle hxBuf = createBufferFrom(dev, handX);
+    PxgBufferHandle hyBuf = createBufferFrom(dev, handY);
+    PxgBufferHandle hzBuf = createBufferFrom(dev, handZ);
+    PxgBufferHandle rxBuf = createBufferFrom(dev, ranksX);
+    PxgBufferHandle ryBuf = createBufferFrom(dev, ranksY);
+    PxgBufferHandle rzBuf = createBufferFrom(dev, ranksZ);
+    PxgBufferHandle txBuf = createBufferFrom(dev, tmpX);
+    PxgBufferHandle tyBuf = createBufferFrom(dev, tmpY);
+    PxgBufferHandle tzBuf = createBufferFrom(dev, tmpZ);
+    PxgBufferHandle dummyBuf = createBufferFrom(dev, dummy);
+
+    Kernel k("broadphaseSetup.spv", "updateHandles",
+             { 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4 }, sizeof(BpParams));
+    BpParams p = {};
+    p.numProjections = numProjections;
+    // bindings 8,9,10 (dest) + 16,17,18 (ranks) + 19,20,21 (prev)
+    std::vector<PxgBufferHandle> bufs(22, dummyBuf);
+    bufs[8] = hxBuf; bufs[9] = hyBuf; bufs[10] = hzBuf;
+    bufs[16] = rxBuf; bufs[17] = ryBuf; bufs[18] = rzBuf;
+    bufs[19] = txBuf; bufs[20] = tyBuf; bufs[21] = tzBuf;
+    k.dispatch((numProjections + 255) / 256, bufs, p);
+    dev->flush();
+
+    const auto gX = downloadBuffer<uint32_t>(dev, hxBuf, numProjections);
+    const auto gY = downloadBuffer<uint32_t>(dev, hyBuf, numProjections);
+    const auto gZ = downloadBuffer<uint32_t>(dev, hzBuf, numProjections);
+    size_t mism = 0;
+    for (uint32_t i = 0; i < numProjections; ++i)
+    {
+        if (gX[i] != tmpX[ranksX[i]]) ++mism;
+        if (gY[i] != tmpY[ranksY[i]]) ++mism;
+        if (gZ[i] != tmpZ[ranksZ[i]]) ++mism;
+    }
+    PXG_CHECK_MSG(mism == 0, "%zu updateHandles mismatches", mism);
+
+    for (PxgBufferHandle h : { hxBuf, hyBuf, hzBuf, rxBuf, ryBuf, rzBuf, txBuf, tyBuf, tzBuf, dummyBuf })
         dev->destroyBuffer(h);
 }
 

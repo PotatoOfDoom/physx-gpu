@@ -112,7 +112,8 @@ pxg_compile_shader(thresholdStream initialRanksAndBodyIndexB initialRanksAndBody
                    reorganizeThresholdElements computeAccumulateThresholdStream
                    outputAccumulateThresholdStream writeoutAccumulatedForcePerObject
                    computeExceededForceThresholdElementIndice outputExceededForceThresholdElementIndice)
-pxg_compile_shader(broadphaseSetup translateAABBsLaunch markCreatedPairsLaunch initializeSapBox1DLaunch)
+pxg_compile_shader(broadphaseSetup translateAABBsLaunch markCreatedPairsLaunch initializeSapBox1DLaunch
+                   initializeRadixRanks updateHandles)
 pxg_compile_shader(memCopy MemCopyBalanced)
 pxg_compile_shader(clampValues clampMaxValue clampMaxValues)
 pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeighted
@@ -191,7 +192,8 @@ set(PXG_HLSL_ENTRIES
     "thresholdStream:computeExceededForceThresholdElementIndice"
     "thresholdStream:outputExceededForceThresholdElementIndice"
     "broadphaseSetup:translateAABBsLaunch" "broadphaseSetup:markCreatedPairsLaunch"
-    "broadphaseSetup:initializeSapBox1DLaunch"
+    "broadphaseSetup:initializeSapBox1DLaunch" "broadphaseSetup:initializeRadixRanks"
+    "broadphaseSetup:updateHandles"
     "solverPGS:computeAverageSolverBodyVelocity" "solverPGS:propagateSolverBodyVelocity"
     "scan4x4:scanPerBlockKernel4x4" "scan4x4:addBlockSumsKernel4x4"
     "radixFourBit:radixFourBitCountPerBlockKernel" "radixFourBit:radixFourBitReorderKernel"
