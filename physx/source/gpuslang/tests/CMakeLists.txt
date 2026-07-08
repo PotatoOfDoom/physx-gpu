@@ -112,6 +112,7 @@ pxg_compile_shader(thresholdStream initialRanksAndBodyIndexB initialRanksAndBody
                    reorganizeThresholdElements computeAccumulateThresholdStream
                    outputAccumulateThresholdStream writeoutAccumulatedForcePerObject
                    computeExceededForceThresholdElementIndice outputExceededForceThresholdElementIndice)
+pxg_compile_shader(broadphaseSetup translateAABBsLaunch markCreatedPairsLaunch initializeSapBox1DLaunch)
 pxg_compile_shader(memCopy MemCopyBalanced)
 pxg_compile_shader(clampValues clampMaxValue clampMaxValues)
 pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeighted
@@ -146,14 +147,15 @@ add_executable(gpuslang-tests
     testSolver.cpp
     testSolverTGS.cpp
     testConstraintPrep.cpp
-    testThresholdStream.cpp)
+    testThresholdStream.cpp
+    testBroadphaseSetup.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
 enable_testing()
 foreach(suite scan radixSort preIntegration integration updateBounds memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
-        constraintPrepPGS constraintPrepTGS thresholdStream)
+        constraintPrepPGS constraintPrepTGS thresholdStream broadphaseSetup)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -188,6 +190,8 @@ set(PXG_HLSL_ENTRIES
     "thresholdStream:computeAccumulateThresholdStream" "thresholdStream:outputAccumulateThresholdStream"
     "thresholdStream:computeExceededForceThresholdElementIndice"
     "thresholdStream:outputExceededForceThresholdElementIndice"
+    "broadphaseSetup:translateAABBsLaunch" "broadphaseSetup:markCreatedPairsLaunch"
+    "broadphaseSetup:initializeSapBox1DLaunch"
     "solverPGS:computeAverageSolverBodyVelocity" "solverPGS:propagateSolverBodyVelocity"
     "scan4x4:scanPerBlockKernel4x4" "scan4x4:addBlockSumsKernel4x4"
     "radixFourBit:radixFourBitCountPerBlockKernel" "radixFourBit:radixFourBitReorderKernel"

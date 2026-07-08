@@ -33,6 +33,7 @@ gpuslang/
 │   ├── constraintPrepPGS.slang      PGS contact + 1D joint constraint prep
 │   ├── constraintPrepTGS.slang      TGS contact + 1D joint constraint prep
 │   ├── thresholdStream.slang        force-threshold reporting accumulation
+│   ├── broadphaseSetup.slang        broad-phase integer-AABB + SAP-box setup
 │   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
 │   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
@@ -108,7 +109,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (49 GPU test cases + 54 DX12 cross-compile checks) verifies:
+The suite (52 GPU test cases + 57 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
@@ -161,7 +162,12 @@ The suite (49 GPU test cases + 54 DX12 cross-compile checks) verifies:
   (nodeIndexA, nodeIndexB) sort-key extraction and stream reorganize, the
   device-wide segmented scan that accumulates each body pair's normal force,
   and the exceeded-force detection and compaction, verified across the
-  32-block boundary.
+  32-block boundary;
+- **broad-phase setup** — the incremental-SAP foundation: quantizing float
+  AABBs into the sortable integer projection layout (contact-distance
+  inflation, monotonic float encoding, axis bit-shifts and environment-ID
+  packing), appending newly created bounds' projections and sort handles, and
+  building the 1D SAP boxes from the sorted handles.
 
 ## Known limitations
 
