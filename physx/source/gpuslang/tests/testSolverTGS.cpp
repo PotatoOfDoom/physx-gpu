@@ -41,6 +41,8 @@ namespace
 
 using namespace pxgtest;
 
+const uint32_t DY_SC_FLAG_OUTPUT_FORCE = 1u << 1;
+const uint32_t DY_SC_FLAG_KEEP_BIAS = 1u << 2;
 const uint32_t DY_SC_FLAG_ORTHO_TARGET = 1u << 4;
 const uint32_t DY_SC_FLAG_SPRING = 1u << 5;
 const uint32_t DY_SC_FLAG_INEQUALITY = 1u << 6;
@@ -161,7 +163,53 @@ struct SolverTGSParams
     uint32_t bodyOffset;
     float elapsedTime;
     float minPen;
+    // conclude/writeback/averaging kernels:
+    uint32_t totalBodyCount;
+    uint32_t deltaVOffset;
+    uint32_t averageOutputOffsets;
+    uint32_t isVelocityIteration;
+    float invDt;
+    float stepDt;
 };
+
+struct ThresholdElement
+{
+    uint64_t shapeInteraction;
+    float normalForce;
+    float threshold;
+    uint64_t nodeIndexA;
+    uint64_t nodeIndexB;
+    float accumulatedForce;
+    uint32_t pad;
+};
+static_assert(sizeof(ThresholdElement) == 40, "threshold element mirror");
+
+struct ConstraintWriteback
+{
+    Float4 linearImpulse_broken;
+    Float4 angularImpulse_residual;
+};
+
+struct FrictionPatchGPU
+{
+    Float3 points[2];
+    Float3 impulses[2];
+    uint32_t anchors;
+};
+static_assert(sizeof(FrictionPatchGPU) == 52, "friction patch mirror");
+
+struct BlockFrictionPatch
+{
+    Float4 body0Normal[32];
+    Float4 body1Normal[32];
+    uint32_t anchorCount[32];
+    uint32_t broken[32];
+    uint32_t contactID[2][32];
+    Float4 anchorPoints[2][32];
+    uint32_t patchIndex[32];
+    uint32_t pad0[32];
+};
+static_assert(sizeof(BlockFrictionPatch) == 2816, "block friction patch mirror");
 
 // ---------------------------------------------------------------------------
 // CPU reference
@@ -774,6 +822,685 @@ PXG_TEST(solverTGS_contactAndJointBatches)
 
     for (PxgBufferHandle h : { batchBuf, chBuf, fhBuf, cpBuf, frBuf, jhBuf, jrBuf, txBuf, velBuf, encBuf })
         dev->destroyBuffer(h);
+}
+
+// ---------------------------------------------------------------------------
+// concludeBlocksTGS + writebackBlocksTGS
+// ---------------------------------------------------------------------------
+PXG_TEST(solverTGS_concludeAndWriteback)
+{
+    std::mt19937 rng(3400);
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::uniform_real_distribution<float> sym(-2.f, 2.f);
+
+    const uint32_t numBatches = 12;
+    const uint32_t rowsPerBatch = 4;
+    const uint32_t numBodies = 64;
+
+    std::vector<BatchTGS> batches(numBatches);
+    std::vector<TGSContactHeader> chs(numBatches);
+    std::vector<TGSFrictionHeader> fhs(numBatches);
+    std::vector<TGSContactPoint> cps(numBatches * rowsPerBatch);
+    std::vector<TGSFriction> frs(numBatches * (rowsPerBatch + 1));
+    std::vector<TGSJointHeader> jhs(numBatches);
+    std::vector<TGSJointRowCon> jrows(numBatches * rowsPerBatch);
+    std::vector<BlockFrictionPatch> patchBlocks(numBatches);
+    std::memset(batches.data(), 0, batches.size() * sizeof(BatchTGS));
+    std::memset(chs.data(), 0, chs.size() * sizeof(TGSContactHeader));
+    std::memset(fhs.data(), 0, fhs.size() * sizeof(TGSFrictionHeader));
+    std::memset(cps.data(), 0, cps.size() * sizeof(TGSContactPoint));
+    std::memset(frs.data(), 0, frs.size() * sizeof(TGSFriction));
+    std::memset(jhs.data(), 0, jhs.size() * sizeof(TGSJointHeader));
+    std::memset(jrows.data(), 0, jrows.size() * sizeof(TGSJointRowCon));
+    std::memset(patchBlocks.data(), 0, patchBlocks.size() * sizeof(BlockFrictionPatch));
+
+    std::vector<SolverBodyData> bodyData(numBodies);
+    std::memset(bodyData.data(), 0, bodyData.size() * sizeof(SolverBodyData));
+    for (uint32_t b = 0; b < numBodies; ++b)
+    {
+        bodyData[b].reportThreshold = unit(rng) < 0.5f ? unit(rng) * 5.f : PX_MAX_F32V;
+        bodyData[b].islandNodeIndex = makeNodeIndex(rng() % 1000);
+    }
+
+    const uint32_t numPatches = numBatches * 32;
+    std::vector<FrictionPatchGPU> patches(numPatches);
+    std::memset(patches.data(), 0, patches.size() * sizeof(FrictionPatchGPU));
+
+    uint32_t forceBufCursor = 0;
+    uint32_t writebackCursor = 0;
+
+    for (uint32_t k = 0; k < numBatches; ++k)
+    {
+        BatchTGS& b = batches[k];
+        b.descStride = uint16_t(1 + rng() % 32);
+        b.constraintType = uint16_t(k % 2);
+        b.scalars[1] = k;
+        b.scalars[2] = k * rowsPerBatch;
+        b.scalars[3] = k * (rowsPerBatch + 1);
+
+        for (uint32_t lane = 0; lane < 32; ++lane)
+        {
+            b.bodyAIndex[lane] = rng() % numBodies;
+            b.bodyBIndex[lane] = rng() % numBodies;
+            b.shapeInteraction[lane] = (uint64_t(rng()) << 32) | rng();
+
+            if (b.constraintType == 0)
+            {
+                chs[k].numNormalConstr[lane] = rng() % (rowsPerBatch + 1);
+                chs[k].flags[lane] = unit(rng) < 0.6f ? 1u /*eHAS_FORCE_THRESHOLDS*/ : 0u;
+                chs[k].forceWritebackOffset[lane] =
+                    unit(rng) < 0.8f ? (forceBufCursor += rowsPerBatch) - rowsPerBatch : 0xFFFFFFFFu;
+                // 0, 2, 4 rows, optionally + torsional anchor
+                const uint32_t fr =
+                    chs[k].numNormalConstr[lane] ? (rng() % 3) * 2 + (unit(rng) < 0.3f ? 1 : 0) : 0;
+                fhs[k].numFrictionConstr[lane] = std::min(fr, rowsPerBatch + 1);
+                fhs[k].broken[lane] = rng() & 1;
+                const Vec3 f0 = randUnitV(rng), f1 = randUnitV(rng);
+                fhs[k].frictionNormals0[lane] = Float4{ f0.x, f0.y, f0.z, 0 };
+                fhs[k].frictionNormals1[lane] = Float4{ f1.x, f1.y, f1.z, 0 };
+                patchBlocks[k].patchIndex[lane] = unit(rng) < 0.7f ? k * 32 + lane : 0xFFFFFFFFu;
+                patchBlocks[k].anchorPoints[0][lane] = Float4{ sym(rng), sym(rng), sym(rng), 0 };
+                patchBlocks[k].anchorPoints[1][lane] = Float4{ sym(rng), sym(rng), sym(rng), 0 };
+
+                for (uint32_t i = 0; i < rowsPerBatch; ++i)
+                    cps[b.scalars[2] + i].appliedForce[lane] = unit(rng) * 3.f;
+                for (uint32_t i = 0; i < rowsPerBatch + 1; ++i)
+                    frs[b.scalars[3] + i].appliedForce[lane] = sym(rng);
+            }
+            else
+            {
+                const uint32_t rows = rng() % (rowsPerBatch + 1);
+                const uint32_t breakable = rng() & 1;
+                jhs[k].rowCounts_breakable_orthoAxisCount[lane] = rows | (breakable << 8);
+                jhs[k].linBreakImpulse[lane] = unit(rng) * 2.f;
+                jhs[k].angBreakImpulse[lane] = unit(rng) * 2.f;
+                jhs[k].rAWorld_invMass0D0[lane] =
+                    Float4{ sym(rng) * 0.2f, sym(rng) * 0.2f, sym(rng) * 0.2f, unit(rng) };
+                jhs[k].writeBackOffset[lane] = unit(rng) < 0.8f ? writebackCursor++ : 0xFFFFFFFFu;
+
+                for (uint32_t i = 0; i < rowsPerBatch; ++i)
+                {
+                    TGSJointRowCon& c = jrows[b.scalars[2] + i];
+                    const Vec3 l0 = randUnitV(rng);
+                    c.lin0XYZ_initBiasOrCoeff0[lane] = Float4{ l0.x, l0.y, l0.z, sym(rng) };
+                    c.lin1XYZ_biasScaleOrCoeff1[lane] = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+                    c.ang0XYZ_velMultiplierOrCoeff2[lane] =
+                        Float4{ sym(rng) * 0.3f, sym(rng) * 0.3f, sym(rng) * 0.3f, sym(rng) };
+                    c.ang1XYZ_velTargetOrCoeff3[lane] = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+                    c.appliedForce[lane] = sym(rng);
+                    c.residual[lane] = sym(rng) * 0.05f;
+                    c.flags[lane] = (unit(rng) < 0.7f ? DY_SC_FLAG_OUTPUT_FORCE : 0u) |
+                                    (unit(rng) < 0.4f ? DY_SC_FLAG_SPRING : 0u) |
+                                    (unit(rng) < 0.4f ? DY_SC_FLAG_KEEP_BIAS : 0u);
+                }
+            }
+        }
+    }
+
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const std::vector<uint32_t> strides = {
+        sizeof(BatchTGS), sizeof(TGSContactHeader), sizeof(TGSFrictionHeader), sizeof(TGSContactPoint),
+        sizeof(TGSFriction), sizeof(TGSJointHeader), sizeof(TGSJointRowCon), sizeof(SolverTxIData), 16, 4,
+        sizeof(SolverBodyData), sizeof(ConstraintWriteback), 4, 40, 4, sizeof(BlockFrictionPatch),
+        sizeof(FrictionPatchGPU)
+    };
+
+    Kernel conclude("solverTGS.spv", "concludeBlocksTGS",
+                    { strides[0], strides[1], strides[2], strides[3], strides[4], strides[5], strides[6] },
+                    sizeof(SolverTGSParams));
+    Kernel writeback("solverTGS.spv", "writebackBlocksTGS", strides, sizeof(SolverTGSParams));
+
+    PxgBufferHandle batchBuf = createBufferFrom(dev, batches);
+    PxgBufferHandle chBuf = createBufferFrom(dev, chs);
+    PxgBufferHandle fhBuf = createBufferFrom(dev, fhs);
+    PxgBufferHandle cpBuf = createBufferFrom(dev, cps);
+    PxgBufferHandle frBuf = createBufferFrom(dev, frs);
+    PxgBufferHandle jhBuf = createBufferFrom(dev, jhs);
+    PxgBufferHandle jrBuf = createBufferFrom(dev, jrows);
+    PxgBufferHandle bdBuf = createBufferFrom(dev, bodyData);
+    std::vector<ConstraintWriteback> wbInit(std::max(writebackCursor, 1u));
+    std::memset(wbInit.data(), 0, wbInit.size() * sizeof(ConstraintWriteback));
+    PxgBufferHandle wbBuf = createBufferFrom(dev, wbInit);
+    std::vector<float> forceInit(std::max(forceBufCursor, 1u), 0.f);
+    PxgBufferHandle forceBuf = createBufferFrom(dev, forceInit);
+    PxgBufferHandle tsBuf = dev->createBuffer(numBatches * 32 * sizeof(ThresholdElement));
+    std::vector<uint32_t> zero1 = { 0 };
+    PxgBufferHandle tsIdxBuf = createBufferFrom(dev, zero1);
+    PxgBufferHandle fpbBuf = createBufferFrom(dev, patchBlocks);
+    PxgBufferHandle fpBuf = createBufferFrom(dev, patches);
+
+    SolverTGSParams params = {};
+    params.startIndex = 0;
+    params.endIndex = numBatches;
+
+    conclude.dispatch(numBatches, { batchBuf, chBuf, fhBuf, cpBuf, frBuf, jhBuf, jrBuf }, params);
+    dev->barrier();
+    writeback.dispatch(numBatches,
+                       { batchBuf, chBuf, fhBuf, cpBuf, frBuf, jhBuf, jrBuf, bdBuf /*dummy at 7*/,
+                         bdBuf /*dummy at 8*/, bdBuf /*dummy at 9*/, bdBuf, wbBuf, forceBuf, tsBuf,
+                         tsIdxBuf, fpbBuf, fpBuf },
+                       params);
+    dev->flush();
+
+    // ---- reference ----
+    auto refRows = jrows;
+    auto refPatchBlocks = patchBlocks;
+    std::vector<float> refForce = forceInit;
+    std::vector<ConstraintWriteback> refWb = wbInit;
+    std::vector<FrictionPatchGPU> refPatches = patches;
+    std::vector<ThresholdElement> refStream;
+
+    for (uint32_t k = 0; k < numBatches; ++k)
+    {
+        const BatchTGS& b = batches[k];
+        for (uint32_t lane = 0; lane < b.descStride; ++lane)
+        {
+            if (b.constraintType == 0)
+            {
+                // concludeContactBlockTGS is "#if 0" in CUDA: no contact changes.
+                // writeBackContactBlockTGS
+                const uint32_t nc = chs[k].numNormalConstr[lane];
+                const uint32_t nf = fhs[k].numFrictionConstr[lane];
+                float normalForce = 0.f;
+                const uint32_t fwo = chs[k].forceWritebackOffset[lane];
+                if (fwo != 0xFFFFFFFFu)
+                    for (uint32_t i = 0; i < nc; ++i)
+                    {
+                        const float af = cps[b.scalars[2] + i].appliedForce[lane];
+                        refForce[fwo + i] = af;
+                        normalForce += af;
+                    }
+
+                const uint32_t patchIndex = refPatchBlocks[k].patchIndex[lane];
+                if (patchIndex != 0xFFFFFFFFu)
+                {
+                    FrictionPatchGPU& fp = refPatches[patchIndex];
+                    const Float4 a0 = fhs[k].frictionNormals0[lane];
+                    const Float4 a1 = fhs[k].frictionNormals1[lane];
+                    fp.anchors = nf / 2;
+                    if (nf >= 2)
+                    {
+                        const Float4 an = refPatchBlocks[k].anchorPoints[0][lane];
+                        fp.points[0] = Float3{ an.x, an.y, an.z };
+                        const float i0 = frs[b.scalars[3]].appliedForce[lane];
+                        const float i1 = frs[b.scalars[3] + 1].appliedForce[lane];
+                        fp.impulses[0] = Float3{ a0.x * i0 + a1.x * i1, a0.y * i0 + a1.y * i1,
+                                                 a0.z * i0 + a1.z * i1 };
+                    }
+                    if (nf >= 4)
+                    {
+                        const Float4 an = refPatchBlocks[k].anchorPoints[1][lane];
+                        fp.points[1] = Float3{ an.x, an.y, an.z };
+                        const float i0 = frs[b.scalars[3] + 2].appliedForce[lane];
+                        const float i1 = frs[b.scalars[3] + 3].appliedForce[lane];
+                        fp.impulses[1] = Float3{ a0.x * i0 + a1.x * i1, a0.y * i0 + a1.y * i1,
+                                                 a0.z * i0 + a1.z * i1 };
+                    }
+                }
+                if (nf && fhs[k].broken[lane])
+                    refPatchBlocks[k].broken[lane] = 1;
+
+                const float rt0 = bodyData[b.bodyAIndex[lane]].reportThreshold;
+                const float rt1 = bodyData[b.bodyBIndex[lane]].reportThreshold;
+                const bool forceThreshold = (chs[k].flags[lane] & 1u) != 0;
+                if (forceThreshold && normalForce != 0.f && (rt0 < PX_MAX_F32V || rt1 < PX_MAX_F32V))
+                {
+                    ThresholdElement e = {};
+                    e.normalForce = normalForce;
+                    e.threshold = std::fmin(rt0, rt1);
+                    e.nodeIndexA = bodyData[b.bodyAIndex[lane]].islandNodeIndex;
+                    e.nodeIndexB = bodyData[b.bodyBIndex[lane]].islandNodeIndex;
+                    if (e.nodeIndexB < e.nodeIndexA)
+                        std::swap(e.nodeIndexA, e.nodeIndexB);
+                    e.shapeInteraction = b.shapeInteraction[lane];
+                    refStream.push_back(e);
+                }
+            }
+            else
+            {
+                // conclude1DBlockTGS
+                const uint32_t rows = jhs[k].rowCounts_breakable_orthoAxisCount[lane] & 0xFFu;
+                for (uint32_t i = 0; i < rows; ++i)
+                {
+                    TGSJointRowCon& c = refRows[b.scalars[2] + i];
+                    if (!(c.flags[lane] & DY_SC_FLAG_KEEP_BIAS))
+                        c.lin1XYZ_biasScaleOrCoeff1[lane].w = 0.f;
+                    if (c.flags[lane] & DY_SC_FLAG_SPRING)
+                    {
+                        c.lin0XYZ_initBiasOrCoeff0[lane].w = 0.f;
+                        c.lin1XYZ_biasScaleOrCoeff1[lane].w = 0.f;
+                        c.ang0XYZ_velMultiplierOrCoeff2[lane].w = 0.f;
+                        c.ang1XYZ_velTargetOrCoeff3[lane].w = 0.f;
+                    }
+                }
+
+                // writeBack1DBlockTGS
+                const uint32_t fwo = jhs[k].writeBackOffset[lane];
+                const uint32_t breakable = (jhs[k].rowCounts_breakable_orthoAxisCount[lane] >> 8) & 0xFFu;
+                if (fwo != 0xFFFFFFFFu)
+                {
+                    Vec3 linVel(0.f), angVel(0.f);
+                    float errSq = 0.f;
+                    for (uint32_t i = 0; i < rows; ++i)
+                    {
+                        const TGSJointRowCon& c = refRows[b.scalars[2] + i];
+                        if (c.flags[lane] & DY_SC_FLAG_OUTPUT_FORCE)
+                        {
+                            const Float4 l0 = c.lin0XYZ_initBiasOrCoeff0[lane];
+                            const Float4 a0 = c.ang0XYZ_velMultiplierOrCoeff2[lane];
+                            linVel += Vec3(l0.x, l0.y, l0.z) * c.appliedForce[lane];
+                            angVel += Vec3(a0.x, a0.y, a0.z) * c.appliedForce[lane];
+                        }
+                        errSq += c.residual[lane] * c.residual[lane];
+                    }
+                    const Float4 rAW = jhs[k].rAWorld_invMass0D0[lane];
+                    angVel = angVel - Vec3(rAW.x, rAW.y, rAW.z).cross(linVel);
+                    const uint32_t broken = breakable
+                        ? uint32_t(linVel.magnitude() > jhs[k].linBreakImpulse[lane] ||
+                                   angVel.magnitude() > jhs[k].angBreakImpulse[lane])
+                        : 0;
+                    refWb[fwo].angularImpulse_residual = Float4{ angVel.x, angVel.y, angVel.z, errSq };
+                    refWb[fwo].linearImpulse_broken =
+                        Float4{ linVel.x, linVel.y, linVel.z, broken ? -0.0f : 0.0f };
+                }
+            }
+        }
+    }
+
+    // ---- compare ----
+    const auto gpuRows = downloadBuffer<TGSJointRowCon>(dev, jrBuf, jrows.size());
+    const auto gpuCps = downloadBuffer<TGSContactPoint>(dev, cpBuf, cps.size());
+    const auto gpuForce = downloadBuffer<float>(dev, forceBuf, refForce.size());
+    const auto gpuWb = downloadBuffer<ConstraintWriteback>(dev, wbBuf, refWb.size());
+    const auto gpuPatches = downloadBuffer<FrictionPatchGPU>(dev, fpBuf, patches.size());
+    const auto gpuPatchBlocks = downloadBuffer<BlockFrictionPatch>(dev, fpbBuf, patchBlocks.size());
+    const auto gpuTsCount = downloadBuffer<uint32_t>(dev, tsIdxBuf, 1)[0];
+    auto gpuStream = downloadBuffer<ThresholdElement>(dev, tsBuf, gpuTsCount);
+
+    size_t mismatches = 0;
+    for (size_t i = 0; i < jrows.size(); ++i)
+        for (int l = 0; l < 32; ++l)
+        {
+            const Float4* g[] = { &gpuRows[i].lin0XYZ_initBiasOrCoeff0[l],
+                                  &gpuRows[i].lin1XYZ_biasScaleOrCoeff1[l],
+                                  &gpuRows[i].ang0XYZ_velMultiplierOrCoeff2[l],
+                                  &gpuRows[i].ang1XYZ_velTargetOrCoeff3[l] };
+            const Float4* r[] = { &refRows[i].lin0XYZ_initBiasOrCoeff0[l],
+                                  &refRows[i].lin1XYZ_biasScaleOrCoeff1[l],
+                                  &refRows[i].ang0XYZ_velMultiplierOrCoeff2[l],
+                                  &refRows[i].ang1XYZ_velTargetOrCoeff3[l] };
+            for (int c = 0; c < 4; ++c)
+                if (std::memcmp(g[c], r[c], sizeof(Float4)) != 0)
+                    ++mismatches;
+        }
+    // contact conclude is a no-op: the contact coefficients must be untouched
+    for (size_t i = 0; i < cps.size(); ++i)
+        for (int l = 0; l < 32; ++l)
+            if (gpuCps[i].biasCoefficient[l] != cps[i].biasCoefficient[l] ||
+                gpuCps[i].appliedForce[l] != cps[i].appliedForce[l])
+                ++mismatches;
+    PXG_CHECK_MSG(mismatches == 0, "conclude: %zu mismatches", mismatches);
+
+    mismatches = 0;
+    for (size_t i = 0; i < refForce.size(); ++i)
+        if (gpuForce[i] != refForce[i])
+            ++mismatches;
+    for (size_t i = 0; i < refWb.size(); ++i)
+        if (std::memcmp(&gpuWb[i], &refWb[i], sizeof(ConstraintWriteback)) != 0)
+            ++mismatches;
+    for (size_t i = 0; i < patches.size(); ++i)
+        if (std::memcmp(&gpuPatches[i], &refPatches[i], sizeof(FrictionPatchGPU)) != 0)
+            ++mismatches;
+    for (size_t i = 0; i < patchBlocks.size(); ++i)
+        for (int l = 0; l < 32; ++l)
+            if (gpuPatchBlocks[i].broken[l] != refPatchBlocks[i].broken[l])
+                ++mismatches;
+    PXG_CHECK_MSG(mismatches == 0, "writeback: %zu mismatches", mismatches);
+
+    // threshold stream: order is nondeterministic -> sort both sides
+    PXG_CHECK_MSG(gpuTsCount == refStream.size(), "threshold stream count: gpu=%u ref=%zu", gpuTsCount,
+                  refStream.size());
+    auto tsLess = [](const ThresholdElement& a, const ThresholdElement& b) {
+        return std::memcmp(&a, &b, sizeof(ThresholdElement)) < 0;
+    };
+    std::sort(gpuStream.begin(), gpuStream.end(), tsLess);
+    std::sort(refStream.begin(), refStream.end(), tsLess);
+    mismatches = 0;
+    for (size_t i = 0; i < refStream.size() && i < gpuStream.size(); ++i)
+        if (std::memcmp(&gpuStream[i], &refStream[i], sizeof(ThresholdElement)) != 0)
+            ++mismatches;
+    PXG_CHECK_MSG(mismatches == 0, "threshold stream: %zu mismatches", mismatches);
+
+    for (PxgBufferHandle h : { batchBuf, chBuf, fhBuf, cpBuf, frBuf, jhBuf, jrBuf, bdBuf, wbBuf, forceBuf,
+                               tsBuf, tsIdxBuf, fpbBuf, fpBuf })
+        dev->destroyBuffer(h);
+}
+
+// ---------------------------------------------------------------------------
+// computeAverageSolverBodyVelocityTGS + propagateAverageSolverBodyVelocityTGS
+// + writeBackBodiesTGS
+// ---------------------------------------------------------------------------
+PXG_TEST(solverTGS_velocityAveragingAndPropagate)
+{
+    std::mt19937 rng(3500);
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::uniform_real_distribution<float> sym(-3.f, 3.f);
+
+    for (uint32_t isVelocityIteration : { 0u, 1u })
+    for (uint32_t numSlabs : { 4u, 12u, 40u })
+    {
+        const uint32_t totalBodyCount = 70; // dynamic bodies
+        const uint32_t bodyOffset = 8;      // world body + kinematics
+        const uint32_t T = totalBodyCount + bodyOffset;
+        const uint32_t numTotalBodies = T;  // no articulations
+        const uint32_t numBatches = 6;
+        const float stepDt = 1.f / 240.f;
+        const float invDt = 60.f;
+
+        const uint32_t averageOutputOffsets = numBatches * 32 * 3 * 2;
+        // three float4 per slab slot, grouped in clusters of 32
+        const uint32_t slabRegion = ((totalBodyCount * numSlabs + 31) / 32) * 96 + 96;
+        const uint32_t deltaVOffset = averageOutputOffsets + slabRegion;
+        const uint32_t propBase = deltaVOffset + 3 * T;
+        const uint32_t poolSize = propBase + slabRegion;
+
+        std::vector<Float4> velPool(poolSize);
+        for (Float4& v : velPool)
+            v = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+
+        // remapped write slots: unique (r, r+32, r+64) triples per slab slot in
+        // the cluster-of-32 pattern, in a dedicated pool region (partitions
+        // keep these race-free in the real solver)
+        std::vector<uint32_t> references(totalBodyCount * numSlabs, 0xFFFFFFFFu);
+        for (uint32_t i = 0; i < references.size(); ++i)
+            if ((rng() & 3) != 0) // ~75% of slab slots active
+                references[i] = propBase + 3 * (i & ~31u) + (i & 31u);
+
+        const uint32_t num32Slabs = (numSlabs + 31) / 32;
+        std::vector<uint32_t> encoded(numTotalBodies * num32Slabs);
+        for (uint32_t& e : encoded)
+            e = rng();
+
+        // per-body delta poses + sqrt inertia, node indices and lock flags
+        std::vector<SolverTxIData> txi(T);
+        std::memset(txi.data(), 0, txi.size() * sizeof(SolverTxIData));
+        for (SolverTxIData& t : txi)
+        {
+            t.deltaBody2World.q = randomQuatTGS(rng).toQuat();
+            t.deltaBody2World.p = Float3{ sym(rng) * 0.01f, sym(rng) * 0.01f, sym(rng) * 0.01f };
+            const Mat33 rot(randomQuatTGS(rng));
+            const Vec3 d(unit(rng), unit(rng), unit(rng));
+            const Mat33 m = rot * Mat33(Vec3(d.x, 0, 0), Vec3(0, d.y, 0), Vec3(0, 0, d.z)) * rot.getTranspose();
+            m.store(t.sqrtInvInertia);
+        }
+
+        const uint32_t numBodySims = 128;
+        std::vector<BodySim> bodySims(numBodySims);
+        std::memset(bodySims.data(), 0, bodySims.size() * sizeof(BodySim));
+        for (BodySim& s : bodySims)
+            s.lockFlags = uint16_t(unit(rng) < 0.3f ? rng() % 64 : 0);
+
+        std::vector<SolverBodyData> bodyData(T);
+        std::memset(bodyData.data(), 0, bodyData.size() * sizeof(SolverBodyData));
+        for (SolverBodyData& d : bodyData)
+            d.islandNodeIndex = makeNodeIndex(rng() % numBodySims);
+
+        std::vector<Float4> motionVel(2 * T);
+        for (Float4& v : motionVel)
+            v = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+
+        PxgSlangComputeDevice* dev = testDevice();
+
+        const std::vector<uint32_t> strides = { 1536, 2048, 1664, 1792, 1408, 4992, 3328,
+                                                sizeof(SolverTxIData), 16, 4, sizeof(SolverBodyData), 32,
+                                                4, 40, 4, 2816, 52, 16, 4, sizeof(BodySim) };
+
+        Kernel average("solverTGS.spv", "computeAverageSolverBodyVelocityTGS",
+                       std::vector<uint32_t>(strides.begin(), strides.begin() + 19),
+                       sizeof(SolverTGSParams));
+        Kernel propagate("solverTGS.spv", "propagateAverageSolverBodyVelocityTGS", strides,
+                         sizeof(SolverTGSParams));
+        Kernel writeBackBodies("solverTGS.spv", "writeBackBodiesTGS",
+                               std::vector<uint32_t>(strides.begin(), strides.begin() + 18),
+                               sizeof(SolverTGSParams));
+
+        std::vector<uint32_t> dummy(16, 0);
+        PxgBufferHandle dummyBuf = createBufferFrom(dev, dummy);
+        PxgBufferHandle velBuf = createBufferFrom(dev, velPool);
+        PxgBufferHandle encBuf = createBufferFrom(dev, encoded);
+        PxgBufferHandle refBuf = createBufferFrom(dev, references);
+        PxgBufferHandle txBuf = createBufferFrom(dev, txi);
+        PxgBufferHandle bdBuf = createBufferFrom(dev, bodyData);
+        PxgBufferHandle bsBuf = createBufferFrom(dev, bodySims);
+        PxgBufferHandle mvBuf = createBufferFrom(dev, motionVel);
+
+        SolverTGSParams params = {};
+        params.numSlabs = numSlabs;
+        params.numTotalBodies = numTotalBodies;
+        params.bodyOffset = bodyOffset;
+        params.totalBodyCount = totalBodyCount;
+        params.deltaVOffset = deltaVOffset;
+        params.averageOutputOffsets = averageOutputOffsets;
+        params.isVelocityIteration = isVelocityIteration;
+        params.invDt = invDt;
+        params.stepDt = stepDt;
+
+        const uint32_t pow2 = [&] {
+            uint32_t x = numSlabs;
+            if ((x & (x - 1)) == 0)
+                return x;
+            x--; x |= x >> 1; x |= x >> 2; x |= x >> 4; x |= x >> 8; x |= x >> 16;
+            return x + 1;
+        }();
+        const uint32_t threadsPerBody = std::min(pow2, 32u);
+        const uint32_t bodiesPerWarp = 32 / threadsPerBody;
+        const uint32_t avgGroups = (totalBodyCount + bodiesPerWarp - 1) / bodiesPerWarp;
+        const uint32_t propGroups = (T + bodiesPerWarp - 1) / bodiesPerWarp;
+
+        std::vector<PxgBufferHandle> bufs = { dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf,
+                                              dummyBuf, txBuf, velBuf, encBuf, bdBuf, dummyBuf, dummyBuf,
+                                              dummyBuf, dummyBuf, dummyBuf, dummyBuf, mvBuf, refBuf, bsBuf };
+        average.dispatch(avgGroups, std::vector<PxgBufferHandle>(bufs.begin(), bufs.begin() + 19), params);
+        dev->barrier();
+        propagate.dispatch(propGroups, bufs, params);
+        dev->barrier();
+        writeBackBodies.dispatch((totalBodyCount + 127) / 128,
+                                 std::vector<PxgBufferHandle>(bufs.begin(), bufs.begin() + 18), params);
+        dev->flush();
+
+        // ---- reference ----
+        std::vector<Float4> refVel = velPool;
+        std::vector<uint32_t> refEnc = encoded;
+        std::vector<SolverTxIData> refTxi = txi;
+        std::vector<Float4> refMotion = motionVel;
+        auto popcount = [](uint32_t v) { uint32_t c = 0; while (v) { c += v & 1; v >>= 1; } return c; };
+
+        // average pass (dynamic bodies only)
+        for (uint32_t bodyId = 0; bodyId < totalBodyCount; ++bodyId)
+        {
+            const Float4 vel0 = velPool[bodyOffset + deltaVOffset + bodyId];
+            const Float4 vel1 = velPool[bodyOffset + deltaVOffset + bodyId + T];
+            float acc[6] = {};
+            bool hasRef = false;
+            for (uint32_t b = 0; b < numSlabs; ++b)
+            {
+                const uint32_t bodyIndex = bodyId * numSlabs + b;
+                if (references[bodyIndex] != 0xFFFFFFFFu)
+                {
+                    const uint32_t velIndex = averageOutputOffsets + 3 * (bodyIndex & ~31u) + (bodyIndex & 31u);
+                    acc[0] += velPool[velIndex].x - vel0.x;
+                    acc[1] += velPool[velIndex].y - vel0.y;
+                    acc[2] += velPool[velIndex].z - vel0.z;
+                    acc[3] += velPool[velIndex].w - vel0.w;
+                    acc[4] += velPool[velIndex + 32].x - vel1.x;
+                    acc[5] += velPool[velIndex + 32].y - vel1.y;
+                    hasRef = true;
+                }
+            }
+            if (hasRef)
+            {
+                uint32_t refCount = 0;
+                for (uint32_t i = 0; i < num32Slabs; ++i)
+                    refCount += popcount(encoded[bodyOffset + bodyId + i * numTotalBodies]);
+                refCount = std::max(1u, refCount);
+                const float recip = 1.f / float(refCount);
+                for (float& a : acc)
+                    a *= recip;
+                for (uint32_t i = 0; i < num32Slabs; ++i)
+                    refEnc[bodyOffset + bodyId + i * numTotalBodies] = 0;
+                refVel[bodyOffset + deltaVOffset + bodyId] =
+                    Float4{ vel0.x + acc[0], vel0.y + acc[1], vel0.z + acc[2], vel0.w + acc[3] };
+                refVel[bodyOffset + deltaVOffset + bodyId + T] =
+                    Float4{ vel1.x + acc[4], vel1.y + acc[5], vel1.z, vel1.w };
+            }
+        }
+
+        // propagate pass (all bodies incl. kinematics; separate pass mirrors
+        // the barrier between the dispatches)
+        for (uint32_t bodyId = 0; bodyId < T; ++bodyId)
+        {
+            const Float4 curVel0 = refVel[deltaVOffset + bodyId];
+            Float4 curVel1 = refVel[deltaVOffset + bodyId + T];
+            Float4 curVel2 = refVel[deltaVOffset + bodyId + 2 * T];
+
+            if (!isVelocityIteration && bodyId > 0)
+            {
+                const uint32_t nodeIndex = uint32_t(bodyData[bodyId].islandNodeIndex & 0xFFFFFFFFu);
+                const uint32_t lockFlags = bodySims[nodeIndex].lockFlags;
+
+                Vec3 linVel(curVel0.x, curVel0.y, curVel0.z);
+                const Vec3 angVel(curVel0.w, curVel1.x, curVel1.y);
+
+                Vec3 amv = angVel;
+                if (bodyId >= bodyOffset)
+                    amv = Mat33::load(refTxi[bodyId].sqrtInvInertia).transform(angVel);
+
+                if (lockFlags & (1u << 3)) amv.x = 0.f;
+                if (lockFlags & (1u << 4)) amv.y = 0.f;
+                if (lockFlags & (1u << 5)) amv.z = 0.f;
+                if (lockFlags & (1u << 0)) linVel.x = 0.f;
+                if (lockFlags & (1u << 1)) linVel.y = 0.f;
+                if (lockFlags & (1u << 2)) linVel.z = 0.f;
+
+                const Vec3 deltaP = linVel * stepDt;
+                curVel1.z += deltaP.x;
+                curVel1.w += deltaP.y;
+                curVel2.x += deltaP.z;
+                curVel2.y += angVel.x * stepDt;
+                curVel2.z += angVel.y * stepDt;
+                curVel2.w += angVel.z * stepDt;
+
+                QuatV q(refTxi[bodyId].deltaBody2World.q);
+                const float w2 = amv.dot(amv);
+                if (w2 != 0.f)
+                {
+                    const float w = std::sqrt(w2);
+                    const float v = w * 0.5f * stepDt;
+                    const float s = std::sin(v) / w;
+                    const float c = std::cos(v);
+                    const Vec3 pqr = amv * s;
+                    const QuatV quatVel(pqr.x, pqr.y, pqr.z, 0.f);
+                    q = (quatVel * q + q * c).getNormalized();
+                }
+                refTxi[bodyId].deltaBody2World.q = q.toQuat();
+                refTxi[bodyId].deltaBody2World.p.x += deltaP.x;
+                refTxi[bodyId].deltaBody2World.p.y += deltaP.y;
+                refTxi[bodyId].deltaBody2World.p.z += deltaP.z;
+            }
+
+            if (bodyId >= bodyOffset)
+            {
+                for (uint32_t b = 0; b < numSlabs; ++b)
+                {
+                    const uint32_t bodyIndex = (bodyId - bodyOffset) * numSlabs + b;
+                    const uint32_t remapped = references[bodyIndex];
+                    if (remapped != 0xFFFFFFFFu)
+                    {
+                        refVel[remapped] = curVel0;
+                        refVel[remapped + 32] = curVel1;
+                        refVel[remapped + 64] = curVel2;
+                    }
+                }
+            }
+
+            if (!isVelocityIteration)
+            {
+                refVel[deltaVOffset + bodyId + T] = curVel1;
+                refVel[deltaVOffset + bodyId + 2 * T] = curVel2;
+            }
+        }
+
+        // writeBackBodiesTGS
+        for (uint32_t a = 0; a < totalBodyCount; ++a)
+        {
+            const Float4 vel1 = refVel[bodyOffset + deltaVOffset + a + T];
+            const Float4 vel2 = refVel[bodyOffset + deltaVOffset + a + 2 * T];
+            refMotion[a + bodyOffset] = Float4{ vel1.z * invDt, vel1.w * invDt, vel2.x * invDt, 0.f };
+            refMotion[a + bodyOffset + T] = Float4{ vel2.y * invDt, vel2.z * invDt, vel2.w * invDt, 0.f };
+        }
+
+        // ---- compare ----
+        const auto gpuVel = downloadBuffer<Float4>(dev, velBuf, poolSize);
+        const auto gpuEnc = downloadBuffer<uint32_t>(dev, encBuf, encoded.size());
+        const auto gpuTxi = downloadBuffer<SolverTxIData>(dev, txBuf, txi.size());
+        const auto gpuMotion = downloadBuffer<Float4>(dev, mvBuf, motionVel.size());
+
+        size_t mismatches = 0;
+        for (size_t i = 0; i < poolSize; ++i)
+        {
+            const float* g = &gpuVel[i].x;
+            const float* r = &refVel[i].x;
+            for (int c = 0; c < 4; ++c)
+                if (!almostEqual(g[c], r[c], 1e-4f, 1e-4f))
+                {
+                    if (mismatches < 3)
+                        PXG_CHECK_MSG(false, "slabs=%u velIt=%u vel[%zu].%d: gpu=%g ref=%g", numSlabs,
+                                      isVelocityIteration, i, c, g[c], r[c]);
+                    ++mismatches;
+                }
+        }
+        PXG_CHECK_MSG(mismatches == 0, "slabs=%u velIt=%u: %zu velocity mismatches", numSlabs,
+                      isVelocityIteration, mismatches);
+
+        mismatches = 0;
+        for (size_t i = 0; i < encoded.size(); ++i)
+            if (gpuEnc[i] != refEnc[i])
+                ++mismatches;
+        PXG_CHECK_MSG(mismatches == 0, "slabs=%u: %zu encoded-count mismatches", numSlabs, mismatches);
+
+        mismatches = 0;
+        for (size_t i = 0; i < txi.size(); ++i)
+        {
+            const float* g = &gpuTxi[i].deltaBody2World.q.x;
+            const float* r = &refTxi[i].deltaBody2World.q.x;
+            for (int c = 0; c < 7; ++c)
+                if (!almostEqual(g[c], r[c], 1e-4f, 1e-4f))
+                {
+                    if (mismatches < 3)
+                        PXG_CHECK_MSG(false, "slabs=%u velIt=%u txi[%zu].%d: gpu=%g ref=%g", numSlabs,
+                                      isVelocityIteration, i, c, g[c], r[c]);
+                    ++mismatches;
+                }
+        }
+        PXG_CHECK_MSG(mismatches == 0, "slabs=%u velIt=%u: %zu delta-pose mismatches", numSlabs,
+                      isVelocityIteration, mismatches);
+
+        mismatches = 0;
+        for (size_t i = 0; i < motionVel.size(); ++i)
+        {
+            const float* g = &gpuMotion[i].x;
+            const float* r = &refMotion[i].x;
+            for (int c = 0; c < 4; ++c)
+                if (!almostEqual(g[c], r[c], 1e-4f, 1e-4f))
+                    ++mismatches;
+        }
+        PXG_CHECK_MSG(mismatches == 0, "slabs=%u velIt=%u: %zu motion-velocity mismatches", numSlabs,
+                      isVelocityIteration, mismatches);
+
+        for (PxgBufferHandle h : { dummyBuf, velBuf, encBuf, refBuf, txBuf, bdBuf, bsBuf, mvBuf })
+            dev->destroyBuffer(h);
+    }
 }
 
 } // namespace

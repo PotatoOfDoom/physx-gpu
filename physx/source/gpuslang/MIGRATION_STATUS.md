@@ -30,7 +30,7 @@ Vulkan/D3D12 backends.
 | `integrationTGS.cu` | integrateCoreParallelLaunchTGS | ✅ | `integration.slang` (integrateCoreTGS: absolute velocities, delta-transform pose accumulation) |
 | `preIntegrationTGS.cu` | preIntegrationLaunchTGS | ✅ | covered by `preIntegration.slang` — the TGS entry is the identical kernel with the runtime skipGravityApplication flag, which the port already exposes as a push constant |
 | `solverMultiBlock.cu` + `solverBlock.cuh` | rigid PGS pipeline | 🟡 | `solverPGS.slang` — solveBlockPartition (solveContactBlock + solve1DBlock incl. compliant/accel-spring paths, mass-splitting reference counts) ✅, concludeBlocks ✅, writebackBlocks ✅ (force buffer, joint impulse/break writeback, friction patch export, threshold stream via atomics), writeBackBodies ✅, computeAverageSolverBodyVelocity + propagateSolverBodyVelocity ✅ (multi-slab velocity averaging incl. slab-count reset); remaining: ZeroBodies/markActiveSlab/initialization glue, articulation paths (`solver.cu` artiSolveBlockPartition, solveExt*), contact-error accumulator stats ⬜ |
-| `solverMultiBlockTGS.cu` + `solverBlockTGS.cuh` | rigid TGS iteration | 🟡 | `solverTGS.slang` — solveBlockPartitionTGS (rigid path of solveBlockUnified): solveContactBlockTGS (accumulated-delta separation, compliant/accel-spring restitutionXdt path, paired anisotropic friction + torsional anchors) and solve1DBlockTGS (delta-transform Jacobian re-anchoring, ortho-axis projection, spring modes, residuals) ✅; TGS conclude/writeback/averaging kernels, solveStaticBlockTGS, articulation paths ⬜ |
+| `solverMultiBlockTGS.cu` + `solverBlockTGS.cuh` | rigid TGS pipeline | 🟡 | `solverTGS.slang` — solveBlockPartitionTGS (rigid path of solveBlockUnified): solveContactBlockTGS (accumulated-delta separation, compliant/accel-spring restitutionXdt path, paired anisotropic friction + torsional anchors) and solve1DBlockTGS (delta-transform Jacobian re-anchoring, ortho-axis projection, spring modes, residuals) ✅; concludeBlocksTGS ✅ (conclude1DBlockTGS bias removal; the CUDA contact conclude body is compiled out and stays a no-op), writebackBlocksTGS ✅ (force buffer, joint impulse/break writeback, friction patch export, threshold stream), writeBackBodiesTGS ✅ (accumulated deltas → motion velocities), computeAverageSolverBodyVelocityTGS + propagateAverageSolverBodyVelocityTGS ✅ (6-component mass-splitting velocity averaging incl. slab-count reset, per-substep delta-pose quaternion integration with lock flags); remaining: ZeroBodiesTGS/initializeSolverVelocitiesTGS/applyTGSSubstepGravity glue, solveStaticBlockTGS, articulation paths ⬜ |
 | `constraintBlockPrePrep.cu`, `constraintBlockPrep.cu`, `constraintBlockPrepTGS.cu` | constraint prep | ⬜ | |
 | `artiConstraintPrep2.cu` | articulation constraint prep | ⬜ | |
 | `accumulateThresholdStream.cu` | threshold streams | ⬜ | needs radix sort + scan (both ported) |
@@ -65,7 +65,7 @@ Vulkan/D3D12 backends.
 
 ## Verification
 
-All ported kernels are covered by `tests/` (40 GPU test cases, run per commit
+All ported kernels are covered by `tests/` (42 GPU test cases, run per commit
 via ctest on a Vulkan device — llvmpipe in CI):
 
 | Kernel | Reference | Checks |
@@ -85,6 +85,8 @@ via ctest on a Vulkan device — llvmpipe in CI):
 | PGS conclude/writeback | C++ transcription | bias removal (coeff swap / friction bias zeroing), force-buffer writeback, joint impulse + breakage writeback, friction patch export, threshold stream (order-independent compare), report-threshold gating |
 | velocity averaging | C++ transcription | per-slab delta averaging with active-slab counts (4/12/40 slabs incl. multi-word), slab-count reset, propagation into remapped slab slots |
 | TGS solver iteration | C++ transcription of `solverBlockTGS.cuh` | 6-float4 velocity+delta lane layout, delta-derived separations, compliant (accel-spring) contacts, paired friction with sqrt-clamping + torsional anchors, joint re-anchoring through delta transforms, ortho-target projection, inequality/spring bias modes |
+| TGS conclude/writeback | C++ transcription | joint bias-scale removal (KEEP_BIAS gating, spring coefficient zeroing; contact conclude verified as the CUDA no-op), force-buffer writeback, joint impulse + breakage writeback (uchar4-packed row counts), friction patch export incl. torsional-anchor row counts, threshold stream (order-independent compare) |
+| TGS velocity averaging | C++ transcription | 6-component per-slab delta averaging with active-slab counts (4/12/40 slabs), slab-count reset, propagation into 3-float4 slab slots, per-substep delta-pose quaternion integration incl. per-body lock flags and kinematic bodies (position + velocity iterations), accumulated-delta motion-velocity writeback |
 | clampMaxValue(s) | scalar clamp | in-place counter clamping |
 | skinning | C++ transcription of `utility.cu` | area-weighted vertex normals (atomic accumulation), Phong cloth interpolation incl. out-of-triangle uv projection and thickness clamping, barycentric softbody interpolation, buffer interleaving, strided-view addressing |
 

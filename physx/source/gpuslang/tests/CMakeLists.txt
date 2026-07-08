@@ -100,7 +100,9 @@ pxg_compile_shader(radixFourBit radixFourBitCountPerBlockKernel radixFourBitReor
 pxg_compile_shader(reorderData reorderKernel)
 pxg_compile_shader(solverPGS solveBlockPartition concludeBlocks writebackBlocks writeBackBodies
                    computeAverageSolverBodyVelocity propagateSolverBodyVelocity)
-pxg_compile_shader(solverTGS solveBlockPartitionTGS)
+pxg_compile_shader(solverTGS solveBlockPartitionTGS concludeBlocksTGS writebackBlocksTGS
+                   writeBackBodiesTGS computeAverageSolverBodyVelocityTGS
+                   propagateAverageSolverBodyVelocityTGS)
 pxg_compile_shader(memCopy MemCopyBalanced)
 pxg_compile_shader(clampValues clampMaxValue clampMaxValues)
 pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeighted
@@ -163,7 +165,9 @@ set(PXG_HLSL_ENTRIES
     "directApi:getRigidDynamicGlobalPose" "directApi:getRigidDynamicLinearAcceleration"
     "directApi:setRigidDynamicLinearVelocity" "directApi:setRigidDynamicTorque"
     "solverPGS:solveBlockPartition" "solverPGS:concludeBlocks" "solverPGS:writebackBlocks"
-    "solverTGS:solveBlockPartitionTGS"
+    "solverTGS:solveBlockPartitionTGS" "solverTGS:concludeBlocksTGS" "solverTGS:writebackBlocksTGS"
+    "solverTGS:writeBackBodiesTGS" "solverTGS:computeAverageSolverBodyVelocityTGS"
+    "solverTGS:propagateAverageSolverBodyVelocityTGS"
     "solverPGS:computeAverageSolverBodyVelocity" "solverPGS:propagateSolverBodyVelocity"
     "scan4x4:scanPerBlockKernel4x4" "scan4x4:addBlockSumsKernel4x4"
     "radixFourBit:radixFourBitCountPerBlockKernel" "radixFourBit:radixFourBitReorderKernel"
