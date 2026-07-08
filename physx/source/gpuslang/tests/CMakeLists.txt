@@ -131,6 +131,7 @@ pxg_compile_shader(npContactPatch setContactPointAndForcePointers registerContac
 pxg_compile_shader(npInsertPatch insertIntoPatchStream)
 pxg_compile_shader(npCompressContacts compressContactStage1 updateFrictionPatches)
 pxg_compile_shader(npBoxClip boxContains boxIntersectSegmentAABB)
+pxg_compile_shader(npBoxIncident boxIncidentPolygon4 boxCalculateBounds4)
 pxg_compile_shader(broadphaseSetup translateAABBsLaunch markCreatedPairsLaunch initializeSapBox1DLaunch
                    initializeRadixRanks updateHandles)
 pxg_compile_shader(broadphaseReports accumulateReportsStage_1 accumulateReportsStage_2 copyReports)
@@ -208,6 +209,7 @@ add_executable(gpuslang-tests
     testNpInsertPatch.cpp
     testNpCompressContacts.cpp
     testNpBoxClip.cpp
+    testNpBoxIncident.cpp
     testBroadphaseSetup.cpp
     testBroadphaseReports.cpp
     testBroadphaseIncrementalHistogram.cpp
@@ -235,7 +237,7 @@ add_dependencies(gpuslang-tests gpuslang-shaders)
 enable_testing()
 foreach(suite scan radixSort radixSortGather preIntegration integration updateBounds memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
-        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine npContactPatch npInsertPatch npCompressContacts npBoxClip broadphaseSetup broadphaseReports
+        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine npContactPatch npInsertPatch npCompressContacts npBoxClip npBoxIncident broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
         broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram
         broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
@@ -300,6 +302,7 @@ set(PXG_HLSL_ENTRIES
     "npInsertPatch:insertIntoPatchStream"
     "npCompressContacts:compressContactStage1" "npCompressContacts:updateFrictionPatches"
     "npBoxClip:boxContains" "npBoxClip:boxIntersectSegmentAABB"
+    "npBoxIncident:boxIncidentPolygon4" "npBoxIncident:boxCalculateBounds4"
     "broadphaseSetup:translateAABBsLaunch" "broadphaseSetup:markCreatedPairsLaunch"
     "broadphaseSetup:initializeSapBox1DLaunch" "broadphaseSetup:initializeRadixRanks"
     "broadphaseSetup:updateHandles"
