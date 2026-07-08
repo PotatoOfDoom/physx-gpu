@@ -98,6 +98,7 @@ pxg_compile_shader(directApi getRigidDynamicGlobalPose getRigidDynamicLinearVelo
 pxg_compile_shader(scan4x4 scanPerBlockKernel4x4 addBlockSumsKernel4x4)
 pxg_compile_shader(radixFourBit radixFourBitCountPerBlockKernel radixFourBitReorderKernel)
 pxg_compile_shader(reorderData reorderKernel)
+pxg_compile_shader(solverPGS solveBlockPartition)
 pxg_compile_shader(memCopy MemCopyBalanced)
 pxg_compile_shader(clampValues clampMaxValue clampMaxValues)
 pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeighted
@@ -128,13 +129,14 @@ add_executable(gpuslang-tests
     testUpdateBounds.cpp
     testUtilities.cpp
     testAlgorithms.cpp
-    testBodyUpdate.cpp)
+    testBodyUpdate.cpp
+    testSolver.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
 enable_testing()
 foreach(suite scan radixSort preIntegration integration updateBounds memCopy clamp skinning
-        scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose)
+        scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -157,6 +159,7 @@ set(PXG_HLSL_ENTRIES
     "bodyUpdate:updateShapesLaunch" "bodyUpdate:updateBodyExternalVelocitiesLaunch"
     "directApi:getRigidDynamicGlobalPose" "directApi:getRigidDynamicLinearAcceleration"
     "directApi:setRigidDynamicLinearVelocity" "directApi:setRigidDynamicTorque"
+    "solverPGS:solveBlockPartition"
     "scan4x4:scanPerBlockKernel4x4" "scan4x4:addBlockSumsKernel4x4"
     "radixFourBit:radixFourBitCountPerBlockKernel" "radixFourBit:radixFourBitReorderKernel"
     "reorderData:reorderKernel"

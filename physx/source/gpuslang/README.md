@@ -27,6 +27,7 @@ gpuslang/
 │   ├── preIntegration.slang         solver pre-integration (PGS + TGS)
 │   ├── integration.slang            solver integration, PGS + TGS + sleep state machine
 │   ├── updateBounds.slang           transform cache + world AABB update
+│   ├── solverPGS.slang              PGS constraint solver iteration (contacts + joints)
 │   ├── bodyUpdate.slang             CPU->GPU body/shape DMA mirrors
 │   ├── directApi.slang              Direct GPU API rigid-body get/set kernels
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
@@ -102,7 +103,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (36 GPU test cases + 33 DX12 cross-compile checks) verifies:
+The suite (37 GPU test cases + 34 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
@@ -129,7 +130,12 @@ The suite (36 GPU test cases + 33 DX12 cross-compile checks) verifies:
 - **PxGpuRadixSort** — the second, general-purpose radix sort
   (algorithms.cu): int4x4 histogram scans, the count → computeBlockSum →
   reorder pass composition with reorder-tracking, partial bit widths and the
-  float4 payload gather kernel.
+  float4 payload gather kernel;
+- **PGS solver iteration** — solveBlockPartition over mixed contact/joint
+  batches: normal impulses with rigid and compliant (acceleration-spring)
+  restitution, static/dynamic friction clamping with broken flags, 1D joint
+  rows with spring modes and residual writeback, and the mass-splitting
+  slab reference counts.
 
 ## Known limitations
 
