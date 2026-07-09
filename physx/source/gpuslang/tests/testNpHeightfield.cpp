@@ -254,4 +254,163 @@ PXG_TEST(npHeightfield_getAdjacency)
     dev->destroyBuffer(bSamples); dev->destroyBuffer(bTri); dev->destroyBuffer(bOut); dev->destroyBuffer(bAdj);
 }
 
+// ---------------------------------------------------------------------------
+// hfGetTriangleScaled: getTriangle — vertex-index + adjacency-index cores combined
+// with the PxMeshScale handedness fix.  When exactly one of rowScale/columnScale
+// is negative ("wrongHanded"), vertices 1/2 and adjacency neighbours 0/2 swap so
+// the emitted triangle stays consistently wound after the (possibly negative)
+// scale.  Both indices (bit-exact) and the scaled verts (exact i16->float x single
+// multiply, even for negative scales) are compared bit-exactly.  All four sign
+// combinations of (rowScale, columnScale) — hence both wrongHanded outcomes — are
+// exercised.
+// ---------------------------------------------------------------------------
+static void refTriVertexIndices(uint32_t tri, uint32_t columns, const std::vector<uint32_t>& samples,
+                                uint32_t& i0, uint32_t& i1, uint32_t& i2)
+{
+    const uint32_t cell = tri >> 1;
+    const bool firstTri = (tri & 1u) == 0u;
+    const bool shared = (samples[cell] & 0x800000u) != 0u;
+    if (shared)
+    {
+        if (firstTri) { i0 = cell + columns; i1 = cell; i2 = cell + columns + 1; }
+        else          { i0 = cell + 1; i1 = cell + columns + 1; i2 = cell; }
+    }
+    else
+    {
+        if (firstTri) { i0 = cell; i1 = cell + 1; i2 = cell + columns; }
+        else          { i0 = cell + columns + 1; i1 = cell + columns; i2 = cell + 1; }
+    }
+}
+static void refTriAdjacency(uint32_t tri, uint32_t columns, uint32_t rows, const std::vector<uint32_t>& samples,
+                            uint32_t& a0, uint32_t& a1, uint32_t& a2)
+{
+    const uint32_t cell = tri >> 1;
+    const bool firstTri = (tri & 1u) == 0u;
+    const bool shared = (samples[cell] & 0x800000u) != 0u;
+    if (shared)
+    {
+        if (firstTri)
+        {
+            a0 = HF_BOUNDARY; a1 = tri + 1; a2 = HF_BOUNDARY;
+            if (cell % columns != 0) a0 = tri - 1;
+            if (cell / columns != rows - 2) a2 = ((cell + columns) * 2) + 1;
+        }
+        else
+        {
+            a0 = HF_BOUNDARY; a1 = tri - 1; a2 = HF_BOUNDARY;
+            if (cell % columns < columns - 2) a0 = tri + 1;
+            if (cell >= columns - 1) a2 = (cell - columns) * 2;
+        }
+    }
+    else
+    {
+        if (firstTri)
+        {
+            a0 = HF_BOUNDARY; a1 = tri + 1; a2 = HF_BOUNDARY;
+            if (cell >= columns - 1) a0 = ((cell - columns) * 2) + 1;
+            if (cell % columns != 0) a2 = tri - 1;
+        }
+        else
+        {
+            a0 = HF_BOUNDARY; a1 = tri - 1; a2 = HF_BOUNDARY;
+            if (cell / columns != rows - 2) a0 = (cell + columns) * 2;
+            if (cell % columns < columns - 2) a2 = tri + 1;
+        }
+    }
+}
+
+PXG_TEST(npHeightfield_getTriangleScaled)
+{
+    std::mt19937 rng(60037);
+    const uint32_t rows = 64, columns = 48;
+    const uint32_t NV = rows * columns;
+
+    std::vector<uint32_t> samples(NV);
+    for (uint32_t i = 0; i < NV; ++i)
+    {
+        const int16_t h = (int16_t)(rng() % 65536);
+        const uint32_t m0 = rng() % 256; // tess flag = 0x80 ~50%
+        const uint32_t m1 = rng() % 256;
+        samples[i] = (uint32_t(uint16_t(h))) | (m0 << 16) | (m1 << 24);
+    }
+
+    // The four sign combinations of (rowScale, columnScale): wrongHanded is the XOR.
+    const float signs[4][2] = { { +0.5f, +0.75f }, { -0.5f, +0.75f }, { +0.5f, -0.75f }, { -0.5f, -0.75f } };
+    const float heightScale = 0.01f;
+
+    for (int sc = 0; sc < 4; ++sc)
+    {
+        const float rowScale = signs[sc][0], columnScale = signs[sc][1];
+        const bool wrongHanded = (rowScale < 0.0f) != (columnScale < 0.0f);
+
+        const uint32_t N = 12000;
+        std::vector<uint32_t> triIdx(N);
+        std::vector<HfOut> refV(N);
+        std::vector<U4> refA(N);
+        size_t sharedC = 0, unsharedC = 0, firstC = 0, secondC = 0;
+        for (uint32_t t = 0; t < N; ++t)
+        {
+            const uint32_t crow = rng() % (rows - 1), ccol = rng() % (columns - 1);
+            const uint32_t cell = crow * columns + ccol;
+            const uint32_t first = rng() & 1u;
+            const uint32_t tri = cell * 2u + first;
+            triIdx[t] = tri;
+
+            uint32_t v0, v1, v2; refTriVertexIndices(tri, columns, samples, v0, v1, v2);
+            uint32_t a0, a1, a2; refTriAdjacency(tri, columns, rows, samples, a0, a1, a2);
+
+            // getTriangle handedness fix
+            const uint32_t sv1 = wrongHanded ? v2 : v1;
+            const uint32_t sv2 = wrongHanded ? v1 : v2;
+            refA[t] = { wrongHanded ? a2 : a0, a1, wrongHanded ? a0 : a2, 0 };
+
+            HfOut o{}; o.idx = { v0, sv1, sv2, 0 };
+            float x, y, z;
+            refVertex(v0, columns, samples, x, y, z); o.v0 = { x * rowScale, y * heightScale, z * columnScale, 0 };
+            refVertex(sv1, columns, samples, x, y, z); o.v1 = { x * rowScale, y * heightScale, z * columnScale, 0 };
+            refVertex(sv2, columns, samples, x, y, z); o.v2 = { x * rowScale, y * heightScale, z * columnScale, 0 };
+            refV[t] = o;
+
+            const bool shared = (samples[cell] & 0x800000u) != 0u;
+            if (shared) ++sharedC; else ++unsharedC;
+            if ((tri & 1u) == 0u) ++firstC; else ++secondC;
+        }
+
+        PxgSlangComputeDevice* dev = testDevice();
+        const uint32_t GROUPS = (N + 255) / 256;
+        std::vector<HfOut> outInit(N);
+        std::vector<U4> adjInit(N);
+        PxgBufferHandle bSamples = createBufferFrom(dev, samples);
+        PxgBufferHandle bTri = createBufferFrom(dev, triIdx);
+        PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+        PxgBufferHandle bAdj = createBufferFrom(dev, adjInit);
+
+        struct HfParams { uint32_t numTests, columns, rows, pad; float rowScale, heightScale, columnScale, pad2; }
+        prm = { N, columns, rows, 0, rowScale, heightScale, columnScale, 0 };
+        Kernel k("npHeightfield.spv", "hfGetTriangleScaled", { 4, 4, (uint32_t)sizeof(HfOut), (uint32_t)sizeof(U4) }, sizeof(HfParams));
+        k.dispatch(GROUPS, { bSamples, bTri, bOut, bAdj }, prm);
+        dev->flush();
+
+        const auto gv = downloadBuffer<HfOut>(dev, bOut, N);
+        const auto ga = downloadBuffer<U4>(dev, bAdj, N);
+        auto eqV = [](const F4& a, const F4& b) { return a.x == b.x && a.y == b.y && a.z == b.z; };
+        size_t mmIdx = 0, mmVert = 0, mmAdj = 0;
+        for (uint32_t t = 0; t < N; ++t)
+        {
+            const HfOut& r = refV[t]; const HfOut& v = gv[t];
+            if (r.idx.x != v.idx.x || r.idx.y != v.idx.y || r.idx.z != v.idx.z) ++mmIdx;
+            if (!eqV(r.v0, v.v0) || !eqV(r.v1, v.v1) || !eqV(r.v2, v.v2)) ++mmVert;
+            const U4& ra = refA[t]; const U4& va = ga[t];
+            if (ra.x != va.x || ra.y != va.y || ra.z != va.z) ++mmAdj;
+        }
+        PXG_CHECK_MSG(mmIdx == 0, "getTriangleScaled[wh=%d]: %zu vertex-index mismatches", (int)wrongHanded, mmIdx);
+        PXG_CHECK_MSG(mmVert == 0, "getTriangleScaled[wh=%d]: %zu vertex-value mismatches", (int)wrongHanded, mmVert);
+        PXG_CHECK_MSG(mmAdj == 0, "getTriangleScaled[wh=%d]: %zu adjacency mismatches", (int)wrongHanded, mmAdj);
+        PXG_CHECK_MSG(sharedC > N / 4 && unsharedC > N / 4 && firstC > N / 4 && secondC > N / 4,
+                      "getTriangleScaled: branch coverage thin (shared=%zu first=%zu)", sharedC, firstC);
+
+        dev->destroyBuffer(bSamples); dev->destroyBuffer(bTri); dev->destroyBuffer(bOut); dev->destroyBuffer(bAdj);
+    }
+}
+
 } // namespace

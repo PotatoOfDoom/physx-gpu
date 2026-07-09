@@ -47,7 +47,7 @@ gpuslang/
 │   ├── npSegTriangle.slang           segment-vs-triangle squared distance (capsule/mesh)
 │   ├── npCapTriangle.slang           capsule-triangle contacts (endpoint + edge-edge)
 │   ├── npTriTri.slang                triangle-triangle SAT separation test
-│   ├── npHeightfield.slang           heightfield triangle extraction (vertex indices + verts) + adjacency
+│   ├── npHeightfield.slang           heightfield triangle extraction (vertex indices + verts) + adjacency + scaled getTriangle
 │   ├── npBoxClip.slang               box-box clipping primitives (point-in-poly, segment-AABB)
 │   ├── npBoxIncident.slang           box-box width-4 incident-face select + bounds4 reduction
 │   ├── npBoxContacts.slang           box-box clipping core (calculateContacts: area/corner/edge)
@@ -155,7 +155,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (121 GPU test cases + 150 DX12 cross-compile checks) verifies:
+The suite (127 GPU test cases + 151 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;

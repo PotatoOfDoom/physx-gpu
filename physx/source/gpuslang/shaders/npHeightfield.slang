@@ -91,6 +91,62 @@ float3 hf2shapep(float3 v, float rowScale, float heightScale, float columnScale)
     return float3(v.x * rowScale, v.y * heightScale, v.z * columnScale);
 }
 
+// getTriangleVertexIndices: the three sample-vertex indices of a triangle, with
+// the quad diagonal chosen by the tessellation (shared/unshared) flag.
+void triVertexIndices(uint triangleIndex, uint columns, out uint i0, out uint i1, out uint i2)
+{
+    const uint cell = triangleIndex >> 1;
+    const bool firstTri = (triangleIndex & 0x1u) == 0u;
+    if (isZerothVertexShared(cell))
+    {
+        if (firstTri) { i0 = cell + columns; i1 = cell; i2 = cell + columns + 1u; }
+        else          { i0 = cell + 1u; i1 = cell + columns + 1u; i2 = cell; }
+    }
+    else
+    {
+        if (firstTri) { i0 = cell; i1 = cell + 1u; i2 = cell + columns; }
+        else          { i0 = cell + columns + 1u; i1 = cell + columns; i2 = cell + 1u; }
+    }
+}
+
+// getTriangleAdjacencyIndices: the three edge-adjacent triangle indices, with a
+// HF_BOUNDARY sentinel for grid-edge neighbours.
+void triAdjacencyIndices(uint triangleIndex, uint columns, uint rows, out uint a0, out uint a1, out uint a2)
+{
+    const uint cell = triangleIndex >> 1;
+    const bool firstTri = (triangleIndex & 0x1u) == 0u;
+    if (isZerothVertexShared(cell))
+    {
+        if (firstTri)
+        {
+            a0 = HF_BOUNDARY; a1 = triangleIndex + 1u; a2 = HF_BOUNDARY;
+            if (cell % columns != 0u)          a0 = triangleIndex - 1u;
+            if (cell / columns != rows - 2u)    a2 = ((cell + columns) * 2u) + 1u;
+        }
+        else
+        {
+            a0 = HF_BOUNDARY; a1 = triangleIndex - 1u; a2 = HF_BOUNDARY;
+            if (cell % columns < columns - 2u)  a0 = triangleIndex + 1u;
+            if (cell >= columns - 1u)           a2 = (cell - columns) * 2u;
+        }
+    }
+    else
+    {
+        if (firstTri)
+        {
+            a0 = HF_BOUNDARY; a1 = triangleIndex + 1u; a2 = HF_BOUNDARY;
+            if (cell >= columns - 1u)           a0 = ((cell - columns) * 2u) + 1u;
+            if (cell % columns != 0u)          a2 = triangleIndex - 1u;
+        }
+        else
+        {
+            a0 = HF_BOUNDARY; a1 = triangleIndex - 1u; a2 = HF_BOUNDARY;
+            if (cell / columns != rows - 2u)    a0 = (cell + columns) * 2u;
+            if (cell % columns < columns - 2u)  a2 = triangleIndex + 1u;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // hfGetTriangle: mirrors getTriangleVertexIndices + getVertex + hf2shapep
 // ---------------------------------------------------------------------------
@@ -103,40 +159,8 @@ void hfGetTriangle(uint3 dtid : SV_DispatchThreadID)
     const uint columns = gParams.columns;
     const uint triangleIndex = gTriIndex[t];
 
-    const uint cell = triangleIndex >> 1;
-    const bool firstTri = (triangleIndex & 0x1u) == 0u;
-
     uint i0, i1, i2;
-    if (isZerothVertexShared(cell))
-    {
-        if (firstTri)
-        {
-            i0 = cell + columns;
-            i1 = cell;
-            i2 = cell + columns + 1u;
-        }
-        else
-        {
-            i0 = cell + 1u;
-            i1 = cell + columns + 1u;
-            i2 = cell;
-        }
-    }
-    else
-    {
-        if (firstTri)
-        {
-            i0 = cell;
-            i1 = cell + 1u;
-            i2 = cell + columns;
-        }
-        else
-        {
-            i0 = cell + columns + 1u;
-            i1 = cell + columns;
-            i2 = cell + 1u;
-        }
-    }
+    triVertexIndices(triangleIndex, columns, i0, i1, i2);
 
     const float rs = gParams.rowScale, hs = gParams.heightScale, cs = gParams.columnScale;
     const float3 p0 = hf2shapep(getVertex(i0, columns), rs, hs, cs);
@@ -167,48 +191,57 @@ void hfGetAdjacency(uint3 dtid : SV_DispatchThreadID)
     const uint rows = gParams.rows;
     const uint triangleIndex = gTriIndex[t];
 
-    const uint cell = triangleIndex >> 1;
-    const bool firstTri = (triangleIndex & 0x1u) == 0u;
-
     uint a0, a1, a2;
-    if (isZerothVertexShared(cell))
-    {
-        if (firstTri)
-        {
-            a0 = HF_BOUNDARY;
-            a1 = triangleIndex + 1u;
-            a2 = HF_BOUNDARY;
-            if (cell % columns != 0u)          a0 = triangleIndex - 1u;
-            if (cell / columns != rows - 2u)    a2 = ((cell + columns) * 2u) + 1u;
-        }
-        else
-        {
-            a0 = HF_BOUNDARY;
-            a1 = triangleIndex - 1u;
-            a2 = HF_BOUNDARY;
-            if (cell % columns < columns - 2u)  a0 = triangleIndex + 1u;
-            if (cell >= columns - 1u)           a2 = (cell - columns) * 2u;
-        }
-    }
-    else
-    {
-        if (firstTri)
-        {
-            a0 = HF_BOUNDARY;
-            a1 = triangleIndex + 1u;
-            a2 = HF_BOUNDARY;
-            if (cell >= columns - 1u)           a0 = ((cell - columns) * 2u) + 1u;
-            if (cell % columns != 0u)          a2 = triangleIndex - 1u;
-        }
-        else
-        {
-            a0 = HF_BOUNDARY;
-            a1 = triangleIndex - 1u;
-            a2 = HF_BOUNDARY;
-            if (cell / columns != rows - 2u)    a0 = (cell + columns) * 2u;
-            if (cell % columns < columns - 2u)  a2 = triangleIndex + 1u;
-        }
-    }
+    triAdjacencyIndices(triangleIndex, columns, rows, a0, a1, a2);
 
     gAdjOut[t] = uint4(a0, a1, a2, 0u);
+}
+
+// ---------------------------------------------------------------------------
+// hfGetTriangleScaled: mirrors getTriangle — combines the vertex-index and
+// adjacency-index cores with the PxMeshScale handedness fix.  A negative row or
+// column scale flips the triangle's winding, so when exactly one of them is
+// negative ("wrongHanded") the two non-anchor vertices (1,2) and the two
+// non-shared-edge adjacency neighbours (0,2) are swapped, keeping the emitted
+// triangle consistently wound after the (possibly negative) scale is applied.
+// Only scale.scale.xyz is consulted (getTriangle ignores scale.rotation).
+// ---------------------------------------------------------------------------
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void hfGetTriangleScaled(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint t = dtid.x;
+    if (t >= gParams.numTests) return;
+    const uint columns = gParams.columns;
+    const uint rows = gParams.rows;
+    const uint triangleIndex = gTriIndex[t];
+
+    const float rowScale = gParams.rowScale;
+    const float heightScale = gParams.heightScale;
+    const float columnScale = gParams.columnScale;
+
+    bool wrongHanded = false;
+    if (columnScale < 0.0f) wrongHanded = !wrongHanded;
+    if (rowScale < 0.0f)    wrongHanded = !wrongHanded;
+
+    uint tVert0, tVert1, tVert2;
+    triVertexIndices(triangleIndex, columns, tVert0, tVert1, tVert2);
+
+    uint tAdj0, tAdj1, tAdj2;
+    triAdjacencyIndices(triangleIndex, columns, rows, tAdj0, tAdj1, tAdj2);
+    gAdjOut[t] = uint4(wrongHanded ? tAdj2 : tAdj0,
+                       tAdj1,
+                       wrongHanded ? tAdj0 : tAdj2,
+                       0u);
+
+    const float3 vertex0 = getVertex(tVert0, columns);
+    const float3 vertex1 = getVertex(wrongHanded ? tVert2 : tVert1, columns);
+    const float3 vertex2 = getVertex(wrongHanded ? tVert1 : tVert2, columns);
+
+    HfOut o;
+    o.idx = uint4(tVert0, wrongHanded ? tVert2 : tVert1, wrongHanded ? tVert1 : tVert2, 0u);
+    o.v0 = float4(hf2shapep(vertex0, rowScale, heightScale, columnScale), 0.0f);
+    o.v1 = float4(hf2shapep(vertex1, rowScale, heightScale, columnScale), 0.0f);
+    o.v2 = float4(hf2shapep(vertex2, rowScale, heightScale, columnScale), 0.0f);
+    gOut[t] = o;
 }

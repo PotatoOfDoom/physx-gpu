@@ -135,7 +135,7 @@ pxg_compile_shader(npTriangle triPointDistance triLineIntersect)
 pxg_compile_shader(npSegTriangle segTriDistance)
 pxg_compile_shader(npCapTriangle capTriGenContacts capTriGenEE)
 pxg_compile_shader(npTriTri triTriSat)
-pxg_compile_shader(npHeightfield hfGetTriangle hfGetAdjacency)
+pxg_compile_shader(npHeightfield hfGetTriangle hfGetAdjacency hfGetTriangleScaled)
 pxg_compile_shader(npBoxClip boxContains boxIntersectSegmentAABB)
 pxg_compile_shader(npBoxIncident boxIncidentPolygon4 boxCalculateBounds4)
 pxg_compile_shader(npBoxContacts boxCalculateContacts)
@@ -326,7 +326,7 @@ set(PXG_HLSL_ENTRIES
     "npSegTriangle:segTriDistance"
     "npCapTriangle:capTriGenContacts" "npCapTriangle:capTriGenEE"
     "npTriTri:triTriSat"
-    "npHeightfield:hfGetTriangle"
+    "npHeightfield:hfGetTriangle" "npHeightfield:hfGetAdjacency" "npHeightfield:hfGetTriangleScaled"
     "npBoxClip:boxContains" "npBoxClip:boxIntersectSegmentAABB"
     "npBoxIncident:boxIncidentPolygon4" "npBoxIncident:boxCalculateBounds4"
     "npBoxContacts:boxCalculateContacts"
