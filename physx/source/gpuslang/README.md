@@ -47,6 +47,7 @@ gpuslang/
 │   ├── npBoxContacts.slang           box-box clipping core (calculateContacts: area/corner/edge)
 │   ├── npBoxSat.slang                box-box 15-axis SAT + feature/sign selection
 │   ├── npBoxFeature.slang            box-box feature->newTransform reference-frame setup
+│   ├── npBoxReduce.slang             box-box Stage-2 contact compaction + 4-point reduction
 │   ├── pxgSlangPrepCommon.slang     constraint-prep inputs + Dy 1D solver-constant helpers
 │   ├── constraintPrepPGS.slang      PGS contact + 1D joint constraint prep
 │   ├── constraintPrepTGS.slang      TGS contact + 1D joint constraint prep
@@ -148,7 +149,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (111 GPU test cases + 140 DX12 cross-compile checks) verifies:
+The suite (112 GPU test cases + 141 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
