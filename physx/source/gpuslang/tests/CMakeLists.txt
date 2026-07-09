@@ -136,6 +136,7 @@ pxg_compile_shader(npSegTriangle segTriDistance)
 pxg_compile_shader(npCapTriangle capTriGenContacts capTriGenEE)
 pxg_compile_shader(npTriTri triTriSat)
 pxg_compile_shader(npHeightfield hfGetTriangle hfGetAdjacency hfGetTriangleScaled)
+pxg_compile_shader(npHfMidphase hfmComputePairs hfmOutputPairs)
 pxg_compile_shader(npBoxClip boxContains boxIntersectSegmentAABB)
 pxg_compile_shader(npBoxIncident boxIncidentPolygon4 boxCalculateBounds4)
 pxg_compile_shader(npBoxContacts boxCalculateContacts)
@@ -224,6 +225,7 @@ add_executable(gpuslang-tests
     testNpCapTriangle.cpp
     testNpTriTri.cpp
     testNpHeightfield.cpp
+    testNpHfMidphase.cpp
     testNpBoxClip.cpp
     testNpBoxIncident.cpp
     testNpBoxContacts.cpp
@@ -257,7 +259,7 @@ add_dependencies(gpuslang-tests gpuslang-shaders)
 enable_testing()
 foreach(suite scan radixSort radixSortGather preIntegration integration updateBounds memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
-        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine npContactPatch npInsertPatch npCompressContacts npCompressContacts2 npTriangle npSegTriangle npCapTriangle npTriTri npHeightfield npBoxClip npBoxIncident npBoxContacts npBoxSat npBoxFeature npBoxReduce broadphaseSetup broadphaseReports
+        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine npContactPatch npInsertPatch npCompressContacts npCompressContacts2 npTriangle npSegTriangle npCapTriangle npTriTri npHeightfield npHfMidphase npBoxClip npBoxIncident npBoxContacts npBoxSat npBoxFeature npBoxReduce broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
         broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram
         broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
@@ -327,6 +329,7 @@ set(PXG_HLSL_ENTRIES
     "npCapTriangle:capTriGenContacts" "npCapTriangle:capTriGenEE"
     "npTriTri:triTriSat"
     "npHeightfield:hfGetTriangle" "npHeightfield:hfGetAdjacency" "npHeightfield:hfGetTriangleScaled"
+    "npHfMidphase:hfmComputePairs" "npHfMidphase:hfmOutputPairs"
     "npBoxClip:boxContains" "npBoxClip:boxIntersectSegmentAABB"
     "npBoxIncident:boxIncidentPolygon4" "npBoxIncident:boxCalculateBounds4"
     "npBoxContacts:boxCalculateContacts"
