@@ -132,6 +132,7 @@ pxg_compile_shader(npInsertPatch insertIntoPatchStream)
 pxg_compile_shader(npCompressContacts compressContactStage1 updateFrictionPatches)
 pxg_compile_shader(npCompressContacts2 compressContactStage2)
 pxg_compile_shader(npTriangle triPointDistance triLineIntersect)
+pxg_compile_shader(npSegTriangle segTriDistance)
 pxg_compile_shader(npBoxClip boxContains boxIntersectSegmentAABB)
 pxg_compile_shader(npBoxIncident boxIncidentPolygon4 boxCalculateBounds4)
 pxg_compile_shader(npBoxContacts boxCalculateContacts)
@@ -216,6 +217,7 @@ add_executable(gpuslang-tests
     testNpCompressContacts.cpp
     testNpCompressContacts2.cpp
     testNpTriangle.cpp
+    testNpSegTriangle.cpp
     testNpBoxClip.cpp
     testNpBoxIncident.cpp
     testNpBoxContacts.cpp
@@ -249,7 +251,7 @@ add_dependencies(gpuslang-tests gpuslang-shaders)
 enable_testing()
 foreach(suite scan radixSort radixSortGather preIntegration integration updateBounds memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
-        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine npContactPatch npInsertPatch npCompressContacts npCompressContacts2 npTriangle npBoxClip npBoxIncident npBoxContacts npBoxSat npBoxFeature npBoxReduce broadphaseSetup broadphaseReports
+        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine npContactPatch npInsertPatch npCompressContacts npCompressContacts2 npTriangle npSegTriangle npBoxClip npBoxIncident npBoxContacts npBoxSat npBoxFeature npBoxReduce broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
         broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram
         broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
@@ -315,6 +317,7 @@ set(PXG_HLSL_ENTRIES
     "npCompressContacts:compressContactStage1" "npCompressContacts:updateFrictionPatches"
     "npCompressContacts2:compressContactStage2"
     "npTriangle:triPointDistance" "npTriangle:triLineIntersect"
+    "npSegTriangle:segTriDistance"
     "npBoxClip:boxContains" "npBoxClip:boxIntersectSegmentAABB"
     "npBoxIncident:boxIncidentPolygon4" "npBoxIncident:boxCalculateBounds4"
     "npBoxContacts:boxCalculateContacts"
