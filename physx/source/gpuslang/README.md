@@ -58,6 +58,7 @@ gpuslang/
 │   ├── npTriMask.slang               triangle barycentric coords + active-edge/vertex feature masks
 │   ├── npNpUtils.slang               narrowphase predicates: next3/prev3, edge flags, delayGenerateContact
 │   ├── npConvexReduce.slang          convex-core 4-point manifold reduction (reducePoints)
+│   ├── npTriMesh.slang               scaled-triangle normal + Cramer's-rule barycentric (mesh scale)
 │   ├── npBoxClip.slang               box-box clipping primitives (point-in-poly, segment-AABB)
 │   ├── npBoxIncident.slang           box-box width-4 incident-face select + bounds4 reduction
 │   ├── npBoxContacts.slang           box-box clipping core (calculateContacts: area/corner/edge)
@@ -165,7 +166,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (149 GPU test cases + 173 DX12 cross-compile checks) verifies:
+The suite (151 GPU test cases + 175 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
