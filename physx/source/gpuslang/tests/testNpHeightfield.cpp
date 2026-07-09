@@ -112,14 +112,16 @@ PXG_TEST(npHeightfield_getTriangle)
     PxgSlangComputeDevice* dev = testDevice();
     const uint32_t GROUPS = (N + 255) / 256;
     std::vector<HfOut> outInit(N);
+    std::vector<U4> adjInit(N);
     PxgBufferHandle bSamples = createBufferFrom(dev, samples);
     PxgBufferHandle bTri = createBufferFrom(dev, triIdx);
     PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+    PxgBufferHandle bAdj = createBufferFrom(dev, adjInit);
 
     struct HfParams { uint32_t numTests, columns, rows, pad; float rowScale, heightScale, columnScale, pad2; }
     prm = { N, columns, rows, 0, rowScale, heightScale, columnScale, 0 };
-    Kernel k("npHeightfield.spv", "hfGetTriangle", { 4, 4, (uint32_t)sizeof(HfOut) }, sizeof(HfParams));
-    k.dispatch(GROUPS, { bSamples, bTri, bOut }, prm);
+    Kernel k("npHeightfield.spv", "hfGetTriangle", { 4, 4, (uint32_t)sizeof(HfOut), (uint32_t)sizeof(U4) }, sizeof(HfParams));
+    k.dispatch(GROUPS, { bSamples, bTri, bOut, bAdj }, prm);
     dev->flush();
 
     const auto g = downloadBuffer<HfOut>(dev, bOut, N);
@@ -136,7 +138,120 @@ PXG_TEST(npHeightfield_getTriangle)
     PXG_CHECK_MSG(sharedC > N / 4 && unsharedC > N / 4 && firstC > N / 4 && secondC > N / 4,
                   "hfGetTriangle: branch coverage thin (shared=%zu/%zu first=%zu/%zu)", sharedC, unsharedC, firstC, secondC);
 
-    dev->destroyBuffer(bSamples); dev->destroyBuffer(bTri); dev->destroyBuffer(bOut);
+    dev->destroyBuffer(bSamples); dev->destroyBuffer(bTri); dev->destroyBuffer(bOut); dev->destroyBuffer(bAdj);
+}
+
+// ---------------------------------------------------------------------------
+// hfGetAdjacency: the three edge-adjacent triangle indices (getTriangleAdjacencyIndices).
+// Pure integer arithmetic with a BOUNDARY sentinel for grid edges — compared
+// BIT-EXACTLY.  The grid is chosen so all four diagonal/parity patterns and all
+// four grid-edge conditionals (left/right column, top/bottom row) are exercised.
+// ---------------------------------------------------------------------------
+static const uint32_t HF_BOUNDARY = 0xffffffffu;
+
+PXG_TEST(npHeightfield_getAdjacency)
+{
+    std::mt19937 rng(59021);
+    const uint32_t rows = 64, columns = 48;
+    const float rowScale = 0.5f, heightScale = 0.01f, columnScale = 0.75f;
+    const uint32_t NV = rows * columns;
+
+    std::vector<uint32_t> samples(NV);
+    for (uint32_t i = 0; i < NV; ++i)
+    {
+        const int16_t h = (int16_t)(rng() % 65536);
+        const uint32_t m0 = rng() % 256; // tess flag = 0x80 ~50%
+        const uint32_t m1 = rng() % 256;
+        samples[i] = (uint32_t(uint16_t(h))) | (m0 << 16) | (m1 << 24);
+    }
+
+    const uint32_t N = 12000;
+    std::vector<uint32_t> triIdx(N);
+    std::vector<U4> ref(N);
+    size_t sharedC = 0, unsharedC = 0, firstC = 0, secondC = 0;
+    // coverage of the four grid-edge conditionals actually taking the non-BOUNDARY branch
+    size_t edgeLeft = 0, edgeRight = 0, edgeTop = 0, edgeBottom = 0, boundaryHits = 0;
+    for (uint32_t t = 0; t < N; ++t)
+    {
+        const uint32_t crow = rng() % (rows - 1), ccol = rng() % (columns - 1);
+        const uint32_t cell = crow * columns + ccol;
+        const uint32_t first = rng() & 1u;
+        const uint32_t tri = cell * 2u + first;
+        triIdx[t] = tri;
+
+        const bool shared = (samples[cell] & 0x800000u) != 0u;
+        const bool firstTri = (tri & 1u) == 0u;
+        uint32_t a0, a1, a2;
+        if (shared)
+        {
+            if (firstTri)
+            {
+                a0 = HF_BOUNDARY; a1 = tri + 1; a2 = HF_BOUNDARY;
+                if (cell % columns != 0) a0 = tri - 1;
+                if (cell / columns != rows - 2) a2 = ((cell + columns) * 2) + 1;
+            }
+            else
+            {
+                a0 = HF_BOUNDARY; a1 = tri - 1; a2 = HF_BOUNDARY;
+                if (cell % columns < columns - 2) a0 = tri + 1;
+                if (cell >= columns - 1) a2 = (cell - columns) * 2;
+            }
+        }
+        else
+        {
+            if (firstTri)
+            {
+                a0 = HF_BOUNDARY; a1 = tri + 1; a2 = HF_BOUNDARY;
+                if (cell >= columns - 1) a0 = ((cell - columns) * 2) + 1;
+                if (cell % columns != 0) a2 = tri - 1;
+            }
+            else
+            {
+                a0 = HF_BOUNDARY; a1 = tri - 1; a2 = HF_BOUNDARY;
+                if (cell / columns != rows - 2) a0 = (cell + columns) * 2;
+                if (cell % columns < columns - 2) a2 = tri + 1;
+            }
+        }
+        ref[t] = { a0, a1, a2, 0 };
+        if (shared) ++sharedC; else ++unsharedC;
+        if (firstTri) ++firstC; else ++secondC;
+        if (cell % columns == 0) ++edgeLeft;
+        if (cell % columns == columns - 2) ++edgeRight;
+        if (cell / columns == 0) ++edgeTop;
+        if (cell / columns == rows - 2) ++edgeBottom;
+        if (a0 == HF_BOUNDARY || a1 == HF_BOUNDARY || a2 == HF_BOUNDARY) ++boundaryHits;
+    }
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t GROUPS = (N + 255) / 256;
+    std::vector<HfOut> outInit(N);
+    std::vector<U4> adjInit(N);
+    PxgBufferHandle bSamples = createBufferFrom(dev, samples);
+    PxgBufferHandle bTri = createBufferFrom(dev, triIdx);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+    PxgBufferHandle bAdj = createBufferFrom(dev, adjInit);
+
+    struct HfParams { uint32_t numTests, columns, rows, pad; float rowScale, heightScale, columnScale, pad2; }
+    prm = { N, columns, rows, 0, rowScale, heightScale, columnScale, 0 };
+    Kernel k("npHeightfield.spv", "hfGetAdjacency", { 4, 4, (uint32_t)sizeof(HfOut), (uint32_t)sizeof(U4) }, sizeof(HfParams));
+    k.dispatch(GROUPS, { bSamples, bTri, bOut, bAdj }, prm);
+    dev->flush();
+
+    const auto g = downloadBuffer<U4>(dev, bAdj, N);
+    size_t mm = 0;
+    for (uint32_t t = 0; t < N; ++t)
+    {
+        const U4& r = ref[t]; const U4& v = g[t];
+        if (r.x != v.x || r.y != v.y || r.z != v.z) ++mm;
+    }
+    PXG_CHECK_MSG(mm == 0, "hfGetAdjacency: %zu adjacency mismatches", mm);
+    PXG_CHECK_MSG(sharedC > N / 4 && unsharedC > N / 4 && firstC > N / 4 && secondC > N / 4,
+                  "hfGetAdjacency: diagonal/parity coverage thin (shared=%zu first=%zu)", sharedC, firstC);
+    PXG_CHECK_MSG(edgeLeft > 20 && edgeRight > 20 && edgeTop > 20 && edgeBottom > 20 && boundaryHits > 20,
+                  "hfGetAdjacency: grid-edge coverage thin (L=%zu R=%zu T=%zu B=%zu bnd=%zu)",
+                  edgeLeft, edgeRight, edgeTop, edgeBottom, boundaryHits);
+
+    dev->destroyBuffer(bSamples); dev->destroyBuffer(bTri); dev->destroyBuffer(bOut); dev->destroyBuffer(bAdj);
 }
 
 } // namespace

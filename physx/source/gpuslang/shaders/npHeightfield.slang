@@ -59,9 +59,12 @@ struct HfOut
 [[vk::push_constant]]
 ConstantBuffer<HfParams> gParams;
 
+static const uint HF_BOUNDARY = 0xffffffffu;
+
 RWStructuredBuffer<uint> gSamples;   // binding 0  packed PxHeightFieldSample per vertex
 RWStructuredBuffer<uint> gTriIndex;  // binding 1  triangle index per test
 RWStructuredBuffer<HfOut> gOut;      // binding 2
+RWStructuredBuffer<uint4> gAdjOut;   // binding 3  (adj0, adj1, adj2, 0)
 
 // getHeight: sign-extended PxI16 in the low 16 bits
 float getHeight(uint vertexIndex)
@@ -146,4 +149,66 @@ void hfGetTriangle(uint3 dtid : SV_DispatchThreadID)
     o.v1 = float4(p1, 0.0f);
     o.v2 = float4(p2, 0.0f);
     gOut[t] = o;
+}
+
+// ---------------------------------------------------------------------------
+// hfGetAdjacency: mirrors getTriangleAdjacencyIndices — the three edge-adjacent
+// triangle indices of a heightfield triangle.  A missing neighbour (grid edge)
+// is HF_BOUNDARY.  The diagonal orientation (shared vs unshared zeroth vertex)
+// and the sub-triangle parity select one of four index patterns.
+// ---------------------------------------------------------------------------
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void hfGetAdjacency(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint t = dtid.x;
+    if (t >= gParams.numTests) return;
+    const uint columns = gParams.columns;
+    const uint rows = gParams.rows;
+    const uint triangleIndex = gTriIndex[t];
+
+    const uint cell = triangleIndex >> 1;
+    const bool firstTri = (triangleIndex & 0x1u) == 0u;
+
+    uint a0, a1, a2;
+    if (isZerothVertexShared(cell))
+    {
+        if (firstTri)
+        {
+            a0 = HF_BOUNDARY;
+            a1 = triangleIndex + 1u;
+            a2 = HF_BOUNDARY;
+            if (cell % columns != 0u)          a0 = triangleIndex - 1u;
+            if (cell / columns != rows - 2u)    a2 = ((cell + columns) * 2u) + 1u;
+        }
+        else
+        {
+            a0 = HF_BOUNDARY;
+            a1 = triangleIndex - 1u;
+            a2 = HF_BOUNDARY;
+            if (cell % columns < columns - 2u)  a0 = triangleIndex + 1u;
+            if (cell >= columns - 1u)           a2 = (cell - columns) * 2u;
+        }
+    }
+    else
+    {
+        if (firstTri)
+        {
+            a0 = HF_BOUNDARY;
+            a1 = triangleIndex + 1u;
+            a2 = HF_BOUNDARY;
+            if (cell >= columns - 1u)           a0 = ((cell - columns) * 2u) + 1u;
+            if (cell % columns != 0u)          a2 = triangleIndex - 1u;
+        }
+        else
+        {
+            a0 = HF_BOUNDARY;
+            a1 = triangleIndex - 1u;
+            a2 = HF_BOUNDARY;
+            if (cell / columns != rows - 2u)    a0 = (cell + columns) * 2u;
+            if (cell % columns < columns - 2u)  a2 = triangleIndex + 1u;
+        }
+    }
+
+    gAdjOut[t] = uint4(a0, a1, a2, 0u);
 }
