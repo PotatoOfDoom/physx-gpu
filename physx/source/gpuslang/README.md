@@ -52,6 +52,7 @@ gpuslang/
 │   ├── npHfPointQuery.slang          heightfield grid-range helpers + testLocalPoint (bilinear height)
 │   ├── npConvexTri.slang             convex-triangle edge-edge SAT (Minkowski-face + edge-pair test)
 │   ├── npConvexSat.slang             convex support functions + triangle-normal SAT axis
+│   ├── npConvexFaceSat.slang         convex-face-normal SAT (per-polygon plane axes vs triangle)
 │   ├── npBoxClip.slang               box-box clipping primitives (point-in-poly, segment-AABB)
 │   ├── npBoxIncident.slang           box-box width-4 incident-face select + bounds4 reduction
 │   ├── npBoxContacts.slang           box-box clipping core (calculateContacts: area/corner/edge)
@@ -159,7 +160,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (136 GPU test cases + 160 DX12 cross-compile checks) verifies:
+The suite (137 GPU test cases + 161 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
