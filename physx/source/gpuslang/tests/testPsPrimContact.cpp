@@ -208,7 +208,9 @@ static bool refSphere(V3& normal, float& dist, V3 pointPos, V3 spherePos, float 
         if (dcSq > mdc * mdc) return false;
     }
     const float dc = std::sqrt(dcSq);
-    if (dc != 0.0f) sl.noteSc(dc, EPSR, 1.0f); // exact zero is deterministic both sides
+    // grazing shield consistent with capsule/box (~1e-2 window); exact zero
+    // stays checked - deterministic both sides
+    if (dc != 0.0f) sl.noteSc(dc, 0.0f, 1000.0f);
     normal = (dc > EPSR) ? muls(rel, 1.0f / dc) : V3{ 1, 0, 0 };
     dist = dc - radius;
     return true;
