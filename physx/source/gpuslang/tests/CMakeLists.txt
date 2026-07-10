@@ -152,6 +152,7 @@ pxg_compile_shader(npTetra ctTriBBox ctTetBBox ctTetBary)
 pxg_compile_shader(npDefFilter ctFindParticleRigid ctFindRigid ctFindNonRigid ctFindRange ctEdgeAuth)
 pxg_compile_shader(npBv32 ctBv32Query)
 pxg_compile_shader(npMidphaseCvx ctMidphaseCvx)
+pxg_compile_shader(npMidphaseDeform ctClothTri ctSoftbodyTet ctSoftbodyBoxTet)
 pxg_compile_shader(npEdgeEdge ctLineLine ctEdgeEdge)
 pxg_compile_shader(npBoxClip boxContains boxIntersectSegmentAABB)
 pxg_compile_shader(npBoxIncident boxIncidentPolygon4 boxCalculateBounds4)
@@ -258,6 +259,7 @@ add_executable(gpuslang-tests
     testNpDefFilter.cpp
     testNpBv32.cpp
     testNpMidphaseCvx.cpp
+    testNpMidphaseDeform.cpp
     testNpBoxClip.cpp
     testNpBoxIncident.cpp
     testNpBoxContacts.cpp
@@ -291,7 +293,7 @@ add_dependencies(gpuslang-tests gpuslang-shaders)
 enable_testing()
 foreach(suite scan radixSort radixSortGather preIntegration integration updateBounds memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
-        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine npContactPatch npInsertPatch npCompressContacts npCompressContacts2 npTriangle npSegTriangle npCapTriangle npTriTri npHeightfield npHfMidphase npHfPointQuery npConvexTri npConvexSat npConvexFaceSat npManifold npSegDist npTriMask npNpUtils npConvexReduce npTriMesh npClosest npTetra npEdgeEdge npDefFilter npBv32 npMidphaseCvx npBoxClip npBoxIncident npBoxContacts npBoxSat npBoxFeature npBoxReduce broadphaseSetup broadphaseReports
+        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine npContactPatch npInsertPatch npCompressContacts npCompressContacts2 npTriangle npSegTriangle npCapTriangle npTriTri npHeightfield npHfMidphase npHfPointQuery npConvexTri npConvexSat npConvexFaceSat npManifold npSegDist npTriMask npNpUtils npConvexReduce npTriMesh npClosest npTetra npEdgeEdge npDefFilter npBv32 npMidphaseCvx npMidphaseDeform npBoxClip npBoxIncident npBoxContacts npBoxSat npBoxFeature npBoxReduce broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
         broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram
         broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
@@ -378,6 +380,7 @@ set(PXG_HLSL_ENTRIES
     "npDefFilter:ctFindParticleRigid" "npDefFilter:ctFindRigid" "npDefFilter:ctFindNonRigid" "npDefFilter:ctFindRange" "npDefFilter:ctEdgeAuth"
     "npBv32:ctBv32Query"
     "npMidphaseCvx:ctMidphaseCvx"
+    "npMidphaseDeform:ctClothTri" "npMidphaseDeform:ctSoftbodyTet" "npMidphaseDeform:ctSoftbodyBoxTet"
     "npBoxClip:boxContains" "npBoxClip:boxIntersectSegmentAABB"
     "npBoxIncident:boxIncidentPolygon4" "npBoxIncident:boxCalculateBounds4"
     "npBoxContacts:boxCalculateContacts"
