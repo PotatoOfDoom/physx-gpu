@@ -105,6 +105,7 @@ gpuslang/
 │   ├── memCopy.slang                balanced copy dispatcher (PxgCopyManager)
 │   ├── clampValues.slang            counter clamp utilities
 │   ├── gridCal.slang                particle hash-grid helpers (cell coords, wrap/periodic hash, ranges)
+│   ├── contactReduce.slang          warp contact-manifold reduction (dupe cull, anchors, clustering)
 │   └── skinning.slang               deformable skinning (cloth Phong / softbody barycentric)
 └── tests/                           verification suite (CMake + ctest)
 ```
@@ -176,7 +177,7 @@ On a machine with a discrete GPU, set `PXG_PREFER_SOFTWARE_DEVICE=0` to run
 the suite on the real device. On Windows, `PXG_TEST_BACKEND=dx12` selects the
 D3D12 backend (kernels compiled with `slangc -target dxil`).
 
-The suite (174 GPU test cases + 196 DX12 cross-compile checks) verifies:
+The suite (175 GPU test cases + 197 DX12 cross-compile checks) verifies:
 
 - **scan** — device-wide inclusive/exclusive prefix sums vs serial reference,
   including block-boundary sizes and multi-hundred-thousand element inputs;
