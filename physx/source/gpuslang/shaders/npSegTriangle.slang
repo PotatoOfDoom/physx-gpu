@@ -48,6 +48,13 @@ ConstantBuffer<SegTriParams> gParams;
 RWStructuredBuffer<SegTriIn> gIn;    // binding 0
 RWStructuredBuffer<float4>   gOut;   // binding 1  (sqDist, t, u, v)
 
+// PxVec3::getNormalized (zero fallback for degenerate triangles)
+float3 getNormalized(float3 v)
+{
+    const float m = dot(v, v);
+    return m > 0.0f ? v * rsqrt(m) : float3(0, 0, 0);
+}
+
 bool isValidBary(float v, float w)
 {
     const float eps = 1e-6f;
@@ -106,7 +113,7 @@ void segTriDistance(uint3 dtid : SV_DispatchThreadID)
     const float tDenom = d00 * d11 - d01 * d01;
     const float bdenom = tDenom > 0.0f ? 1.0f / tDenom : PXG_MAX_F32;
 
-    const float3 n = normalize(cross(ab, ac));
+    const float3 n = getNormalized(cross(ab, ac)); // PxVec3::getNormalized zero fallback
 
     const float dist3 = dot(ap, n);
     const float sqDist3 = dist3 * dist3;

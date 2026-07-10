@@ -168,6 +168,7 @@ pxg_compile_shader(psDiffuseCollide ctPsDiffuseCollide)
 pxg_compile_shader(fcPrim ctFcPrim)
 pxg_compile_shader(psMeshMid ctPsMeshMid)
 pxg_compile_shader(psHfCollide ctPsHfCollide)
+pxg_compile_shader(fcPrim2 ctFcPrim2)
 pxg_compile_shader(npEdgeEdge ctLineLine ctEdgeEdge)
 pxg_compile_shader(npBoxClip boxContains boxIntersectSegmentAABB)
 pxg_compile_shader(npBoxIncident boxIncidentPolygon4 boxCalculateBounds4)
@@ -290,6 +291,7 @@ add_executable(gpuslang-tests
     testFcPrim.cpp
     testPsMeshMid.cpp
     testPsHfCollide.cpp
+    testFcPrim2.cpp
     testNpBoxClip.cpp
     testNpBoxIncident.cpp
     testNpBoxContacts.cpp
@@ -323,7 +325,7 @@ add_dependencies(gpuslang-tests gpuslang-shaders)
 enable_testing()
 foreach(suite scan radixSort radixSortGather preIntegration integration updateBounds memCopy clamp skinning
         scan4x4 gpuRadixSort reorderKernel bodyUpdate directApi setRigidDynamicGlobalPose solverPGS solverTGS
-        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine npContactPatch npInsertPatch npCompressContacts npCompressContacts2 npTriangle npSegTriangle npCapTriangle npTriTri npHeightfield npHfMidphase npHfPointQuery npConvexTri npConvexSat npConvexFaceSat npManifold npSegDist npTriMask npNpUtils npConvexReduce npTriMesh npClosest npTetra npEdgeEdge npDefFilter npBv32 npMidphaseCvx npMidphaseDeform npMidphaseAlloc npClothCloth gridCal contactReduce npSbTet npSbSelf npSbSb npTetTriMid psPrimContact psBounds psPrimCollide psDiffuseCollide fcPrim psMeshMid psHfCollide npBoxClip npBoxIncident npBoxContacts npBoxSat npBoxFeature npBoxReduce broadphaseSetup broadphaseReports
+        constraintPrepPGS constraintPrepTGS thresholdStream thresholdForceChange solverZeroBodies solverInitVelocitiesTGS solverApplyGravityTGS solverDmaBack npPairManagement npPairRemoveSwap npSphereCollision npCapsuleCollision npMaterialCombine npContactPatch npInsertPatch npCompressContacts npCompressContacts2 npTriangle npSegTriangle npCapTriangle npTriTri npHeightfield npHfMidphase npHfPointQuery npConvexTri npConvexSat npConvexFaceSat npManifold npSegDist npTriMask npNpUtils npConvexReduce npTriMesh npClosest npTetra npEdgeEdge npDefFilter npBv32 npMidphaseCvx npMidphaseDeform npMidphaseAlloc npClothCloth gridCal contactReduce npSbTet npSbSelf npSbSb npTetTriMid psPrimContact psBounds psPrimCollide psDiffuseCollide fcPrim psMeshMid psHfCollide fcPrim2 npBoxClip npBoxIncident npBoxContacts npBoxSat npBoxFeature npBoxReduce broadphaseSetup broadphaseReports
         broadphaseIncrementalHistogram broadphaseEndPtHistogram broadphaseIncrementalSap
         broadphaseRegionHistogram broadphaseCreateRegions broadphaseActiveRegionHistogram
         broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
@@ -426,6 +428,7 @@ set(PXG_HLSL_ENTRIES
     "fcPrim:ctFcPrim"
     "psMeshMid:ctPsMeshMid"
     "psHfCollide:ctPsHfCollide"
+    "fcPrim2:ctFcPrim2"
     "npBoxClip:boxContains" "npBoxClip:boxIntersectSegmentAABB"
     "npBoxIncident:boxIncidentPolygon4" "npBoxIncident:boxCalculateBounds4"
     "npBoxContacts:boxCalculateContacts"
