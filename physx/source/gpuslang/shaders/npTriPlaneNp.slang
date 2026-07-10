@@ -138,12 +138,6 @@ float3 vertex2Shape(float3 v, float3 scale, float4 rot)
 {
     return quatRotateInv(rot, quatRotate(rot, v) * scale);
 }
-float3 getBasisVector0(float4 q)
-{
-    const float x2 = q.x * 2.0f;
-    const float w2 = q.w * 2.0f;
-    return float3((q.w * w2) - 1.0f + q.x * x2, (q.z * w2) + q.y * x2, (-q.y * w2) + q.z * x2);
-}
 float calculatePCMConvexMargin(float3 extents_, float3 scale, float toleranceLength)
 {
     const float3 extents = extents_ * scale;
@@ -151,6 +145,9 @@ float calculatePCMConvexMargin(float3 extents_, float3 scale, float toleranceLen
     return min(mn * BOX_MARGIN_RATIO, toleranceLength * MESH_MANIFOLD_EPSILON);
 }
 
+// NOTE: with an empty mask (or all masked values at the sentinel) these
+// return idx 0, unlike CUDA maxIndex/minIndex (lowest MASKED index); every
+// call site below provably passes a nonempty mask with finite values
 uint lowestArgMax(float vals[32], uint mask, out float best)
 {
     best = -FLT_MAX_LOCAL;
@@ -188,7 +185,12 @@ uint contactReduce6(float3 ptRaw[32], float sep[32], float3 normal, uint allMask
     const uint i0 = lowestArgMax(vals, allMask, v);
     uint mask = 1u << i0;
 
-    for (uint j = 0; j < 32; ++j) vals[j] = length(point[i0] - point[j]);
+    for (uint j = 0; j < 32; ++j)
+    {
+        const float3 d = point[i0] - point[j];
+        vals[j] = sqrt(dot(d, d)); // PxVec3::magnitude(); sqrt(dot) keeps the
+                                   // IEEE-sqrt assumption minimal vs OpLength
+    }
     const uint i1 = lowestArgMax(vals, allMask & ~mask, v);
     mask |= 1u << i1;
 
@@ -265,7 +267,7 @@ void tpNarrowphase(uint3 dtid : SV_DispatchThreadID)
     // 1. extents from the BV32 root node (min/max over <= 32 child slots)
     float3 mn = float3(FLT_MAX_LOCAL, FLT_MAX_LOCAL, FLT_MAX_LOCAL);
     float3 mx = float3(-FLT_MAX_LOCAL, -FLT_MAX_LOCAL, -FLT_MAX_LOCAL);
-    for (uint s = 0; s < cs.rootMeta.x; ++s)
+    for (uint s = 0; s < min(cs.rootMeta.x, 32u); ++s) // one warp in CUDA
     {
         const float3 bmn = gRoot[(cs.rootMeta.y + s) * 2 + 0].xyz;
         const float3 bmx = gRoot[(cs.rootMeta.y + s) * 2 + 1].xyz;
@@ -324,7 +326,7 @@ void tpNarrowphase(uint3 dtid : SV_DispatchThreadID)
     }
     const bool doFullContactGen = invalidate || lostContacts;
 
-    const float3 worldNormal = getBasisVector0(cs.planeQ);
+    const float3 worldNormal = quatBasisVector0(cs.planeQ);
 
     // shared contacts buffer: (32 + 1) * 6 slots
     float3 contacts[198];
@@ -338,7 +340,6 @@ void tpNarrowphase(uint3 dtid : SV_DispatchThreadID)
         for (uint iter = 0; iter < numIterationsRequired; ++iter)
         {
             // stage 1: 32 warps, each reducing its 32 lanes
-            uint warpMask[32];
             float3 warpPts[32][6];
             float warpSeps[32][6];
             uint counters[32];
@@ -373,7 +374,6 @@ void tpNarrowphase(uint3 dtid : SV_DispatchThreadID)
                     warpSeps[w][k] = laneSep[l];
                     ++k;
                 }
-                warpMask[w] = mask;
             }
             // block scan: exclusive prefix of warp counters, contacts behind retainedCount
             uint offset = 0;
@@ -458,7 +458,9 @@ void tpNarrowphase(uint3 dtid : SV_DispatchThreadID)
         if (manMeta.x != 0)
         {
             const uint base = ci * 24;
-            for (uint k = 0; k < manMeta.y; ++k)
+            // CUDA loads with one warp (threadIdx.x < mNbContacts[0]): at
+            // most 32 slots even for hostile counts; retainedCount stays raw
+            for (uint k = 0; k < manMeta.y && k < 32u; ++k)
             {
                 const float3 pointA = gManPointA[base + k].xyz;
                 contacts[k] = quatRotate(cs.meshQ, pointA) + cs.meshP.xyz;
@@ -491,7 +493,9 @@ void tpNarrowphase(uint3 dtid : SV_DispatchThreadID)
     uint4 rec;
     if (contactByteOffset != 0xFFFFFFFFu)
     {
-        for (uint k = 0; k < nbContacts; ++k)
+        // CUDA writes with one warp (threadIndexInWarp < nbContacts): at
+        // most 32 float4s; the reservation and the record keep the raw count
+        for (uint k = 0; k < nbContacts && k < 32u; ++k)
             gContactStream[contactByteOffset / 16u + k] = float4(contacts[k], seps[k]);
         rec = uint4(contactByteOffset, forceAndIndiceByteOffset, nbContacts, doFullContactGen ? 1 : 0);
     }

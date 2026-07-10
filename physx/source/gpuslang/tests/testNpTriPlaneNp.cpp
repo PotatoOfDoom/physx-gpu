@@ -45,11 +45,14 @@
 // second pins the retainedCount carry), threshold-window probes
 // (deltaP one ulp above / exactly at minMargin*0.1), and a two-manifold
 // cached case (refresh write-backs beyond manifold 0, reload from
-// manifold 0 only).  A second test pins the contact-stream overflow
+// manifold 0 only; three seeded manifolds pin the manifold-1/2 refresh
+// arms).  A second test pins the contact-stream overflow
 // tail: contact-buffer overflow poisons the offset and zeroes
 // nbContacts, while a force-buffer-only overflow FAITHFULLY keeps the
 // contacts and the count, carrying the poisoned force offset;
-// reservations are ungated in both runs.
+// reservations are ungated; single-case runs with limits exactly at /
+// one short of the reservation pin the strict > gates and the combined
+// overflow flag.
 //
 // KNOWN LIMITS: the 0.9998 quat gate strictness is unpinnable with
 // exact quats (dots land on quarters); manifold 3 refresh write-backs
@@ -636,7 +639,9 @@ static TpFixture buildFixture(uint32_t NC, uint32_t seed)
         // penNew = penOld - t pins the refresh write-back
         const uint32_t seedNb = probe ? 6 : 3 + i % 4;
         U4 meta = { 1, seedNb, 0, 0 };
-        if (i % 16 == 5) meta = { 2, seedNb, 2, 0 };
+        // three manifolds pin the mi==1 AND mi==2 refresh arms (write-backs
+        // on slots 6..7 and 12..15) plus the mi >= nbManifolds cut at 3
+        if (i % 16 == 5) meta = { 3, seedNb, 2, 4 };
         if (i % 16 == 13) meta = { 0, seedNb, 0, 0 };
         fx.meta[i] = meta;
         // t must stay below the breaking threshold (>= minMargin*0.5 >=
@@ -886,6 +891,44 @@ PXG_TEST(npTriPlaneNp_overflow)
             }
         }
         PXG_CHECK_MSG(bad == 0 && nPoisonF > 0, "overflow B: %zu bad, %zu force-poisoned", bad, nPoisonF);
+    }
+
+    // runs C/D: single case -> deterministic offsets pin the STRICT > gates
+    {
+        const std::vector<TpCase> one = { fx.cases[0] };
+        const std::vector<F4> mA(fx.manA.begin(), fx.manA.begin() + 24);
+        const std::vector<F4> mB(fx.manB.begin(), fx.manB.begin() + 24);
+        const std::vector<F4> mN(fx.manN.begin(), fx.manN.begin() + 24);
+        const std::vector<U4> mt = { fx.meta[0] };
+        const std::vector<F4> rl(fx.rel.begin(), fx.rel.begin() + 2);
+        const TpRef& ro = fx.ref[0];
+        const uint32_t nb = ro.retained;
+        // C: reservation ends EXACTLY at both limits -> kept under strict >
+        {
+            const TpRun r = runTp(one, fx.verts, fx.root, mA, mB, mN, mt, rl,
+                                  nb + 4, 16 * nb, 4 * nb);
+            size_t bad = 0;
+            if (r.counters[2] != 0) ++bad;
+            if (r.rec[0].x != 0 || r.rec[0].y != 0 || r.rec[0].z != nb) ++bad;
+            for (uint32_t k = 0; k < nb; ++k)
+            {
+                const F4 got = r.stream[k];
+                if (got.x != ro.pts[k].x || got.y != ro.pts[k].y || got.z != ro.pts[k].z ||
+                    got.w != ro.seps[k]) ++bad;
+            }
+            PXG_CHECK_MSG(bad == 0, "overflow C (exact-limit fit): %zu bad", bad);
+        }
+        // D: both buffers one contact short -> both flags, poisoned record
+        {
+            const TpRun r = runTp(one, fx.verts, fx.root, mA, mB, mN, mt, rl,
+                                  nb + 4, 16 * nb - 16, 4 * nb - 4);
+            size_t bad = 0;
+            if (r.counters[2] != (OVERFLOW_CONTACT | OVERFLOW_FORCE)) ++bad;
+            if (r.rec[0].x != 0xFFFFFFFFu || r.rec[0].y != 0xFFFFFFFFu || r.rec[0].z != 0) ++bad;
+            for (uint32_t k = 0; k < nb + 4; ++k)
+                if (r.stream[k].x != -777.0f) ++bad;
+            PXG_CHECK_MSG(bad == 0, "overflow D (both overflow): %zu bad", bad);
+        }
     }
 }
 
