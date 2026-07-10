@@ -63,9 +63,13 @@
 //   dispatch (isDiffuseParticlesThread).
 //
 // Engine glue not ported (documented): LoadShapePair/transform-cache reads,
-// the SDF-mesh variant, the per-pair particle-system resolution, and the
+// the SDF-mesh variant, the per-pair particle-system resolution, the
 // grid-stride batching of particle groups (work items carry poses, scale,
-// flags and the particle range directly).
+// flags and the particle range directly), and the driver's PER-PARTICLE
+// rigid-filter early-out (find(particleSystem, rigidId, particleMask)
+// before the traverser runs) - the eventual driver must reapply it.
+// NOTE: flag bit 8 (rigid is static) must stay consistent with the rigid
+// node index in the real driver (isStaticBody == PX_INVALID_NODE).
 
 import pxgSlangCommon;
 

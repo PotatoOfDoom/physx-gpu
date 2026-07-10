@@ -213,7 +213,7 @@ PXG_TEST(psMeshMid_traverser)
     std::uniform_real_distribution<float> u01(0, 1);
     std::uniform_real_distribution<float> uv(-1, 1);
 
-    const uint32_t NR = 250, NP = 96, SYS = 5;
+    const uint32_t NR = 250, NP = 97, SYS = 5; // non-multiple of 32: partial last group
     const bool CCD = true, TGS = true, STATIC_RIGID = true;
 
     // mesh (VERTEX space) + Morton + BV32
@@ -283,11 +283,34 @@ PXG_TEST(psMeshMid_traverser)
     const float contactDist = mesh.scale.w, restDist = mesh.misc.x;
     const bool flipNormal = (mesh.scale.x * mesh.scale.y * mesh.scale.z) < 0.0f;
 
+    // densest mesh spot (vertex space): anchor for the overflow fixtures
+    uint32_t denseTri = 0;
+    {
+        size_t bestCnt = 0;
+        for (uint32_t t = 0; t < NR; ++t)
+        {
+            V3 tc = { 0, 0, 0 };
+            for (int k = 0; k < 3; ++k) tc = add(tc, v3(verts[tris[t].x + k]));
+            tc = muls(tc, 1.0f / 3.0f);
+            size_t cnt = 0;
+            for (uint32_t u = 0; u < NR; ++u)
+            {
+                V3 uc = { 0, 0, 0 };
+                for (int k = 0; k < 3; ++k) uc = add(uc, v3(verts[tris[u].x + k]));
+                uc = muls(uc, 1.0f / 3.0f);
+                const V3 d = sub(uc, tc);
+                if (dot3(d, d) < 0.35f * 0.35f) ++cnt;
+            }
+            if (cnt > bestCnt) { bestCnt = cnt; denseTri = t; }
+        }
+    }
+
     // particles (world): placed near shape-space triangle positions
-    std::vector<F4> curPos(NP), predPos(NP);
+    const uint32_t NPPAD = ((NP + 31) / 32) * 32;
+    std::vector<F4> curPos(NPPAD, { 100, 100, 100, 1 }), predPos(NPPAD, { 100, 100, 100, 1 });
     for (uint32_t p = 0; p < NP; ++p)
     {
-        const uint32_t t = (p * 29) % NR;
+        const uint32_t t = (p % 5 == 2) ? denseTri : (p * 29) % NR;
         V3 tc = { 0, 0, 0 };
         for (int k = 0; k < 3; ++k) tc = add(tc, v3(verts[tris[t].x + k]));
         tc = muls(tc, 1.0f / 3.0f);
@@ -299,7 +322,7 @@ PXG_TEST(psMeshMid_traverser)
         dir = muls(dir, 1.0f / m);
         // p%12==7: dense fixtures sit ON the surface amid a Morton-adjacent
         // cluster so more than MaxStaticContactsPerMesh triangles qualify
-        const float off = (p % 12 == 7) ? 0.01f * u01(rng)
+        const float off = (p % 5 == 2) ? 0.02f + 0.13f * u01(rng)
                           : (p % 4 == 0) ? 0.9f * u01(rng) : 0.25f * u01(rng);
         const V3 c = add(wp, muls(dir, off));
         curPos[p] = { c.x, c.y, c.z, 1 };
@@ -307,20 +330,23 @@ PXG_TEST(psMeshMid_traverser)
     }
 
     // ---- reference ----
-    struct PRef { std::vector<V3> n; std::vector<float> d; uint32_t contactCount = 0; };
+    struct PRef { std::vector<V3> n; std::vector<float> d; uint32_t contactCount = 0; uint32_t overflowRounds = 0, rejects = 0; };
     std::vector<PRef> pref(NP);
     std::vector<uint8_t> taint(NP, 0);
 
-    const uint32_t numGroups = NP / 32;
+    const uint32_t numGroups = (NP + 31) / 32;
     for (uint32_t g = 0; g < numGroups; ++g)
     {
         // per-lane state
         V3 pShape[32], cvShape[32], cvVert[32];
         float cvR[32];
         Slack laneSl[32];
+        bool valid[32];
         for (uint32_t l = 0; l < 32; ++l)
         {
             const uint32_t gp = g * 32 + l;
+            valid[l] = gp < NP;
+            if (!valid[l]) { cvR[l] = 0; cvVert[l] = { 0, 0, 0 }; continue; }
             const V3 cur = v3(curPos[gp]);
             pShape[l] = quatRotateInv(mesh.meshQ, sub(cur, v3(mesh.meshP)));
             if (CCD)
@@ -361,6 +387,7 @@ PXG_TEST(psMeshMid_traverser)
                         bool any = false;
                         for (uint32_t l = 0; l < 32; ++l)
                         {
+                            if (!valid[l]) continue; // not in the active mask
                             const V3 mn = v3(node.mMin[i]), mx = v3(node.mMax[i]);
                             V3 cl = { std::max(mn.x, std::min(mx.x, cvVert[l].x)),
                                       std::max(mn.y, std::min(mx.y, cvVert[l].y)),
@@ -388,6 +415,7 @@ PXG_TEST(psMeshMid_traverser)
         {
             for (uint32_t p = 0; p < 32; ++p) // particle order = lowest lane first
             {
+                if (!valid[p]) continue;
                 // each lane evaluates its triangle vs particle p
                 bool inter[32] = {};
                 V3 nrm[32];
@@ -453,12 +481,15 @@ PXG_TEST(psMeshMid_traverser)
                             pr.d[best] = dst[l];
                             outSep[best] = dst[l];
                         }
+                        else
+                            pr.rejects++;
                     }
                     pr.contactCount = MAXMESH;
+                    pr.overflowRounds++;
                 }
             }
         }
-        for (uint32_t l = 0; l < 32; ++l)
+        for (uint32_t l = 0; l < 32 && g * 32 + l < NP; ++l)
             taint[g * 32 + l] = (laneSl[l].near || groupNear) ? 1 : 0;
     }
 
@@ -495,7 +526,7 @@ PXG_TEST(psMeshMid_traverser)
     const std::vector<uint32_t> strides = { (uint32_t)sizeof(PmMesh), (uint32_t)sizeof(Bv32Node), 16, 16, 16, 16,
                                             16, 8, 4, (uint32_t)sizeof(PsC), 8, 4, 4, 8, 4, 4, 4 };
     Kernel k("psMeshMid.spv", "ctPsMeshMid", strides, sizeof(PmParams));
-    k.dispatch(NP / 32, { bM, bN, bT, bV, bCur, bPred, bI, bNi, bC, bW, bBR, bTBR, bIBR, bSP, bTBP, bIBP, bWc }, prm);
+    k.dispatch((NP + 31) / 32, { bM, bN, bT, bV, bCur, bPred, bI, bNi, bC, bW, bBR, bTBR, bIBR, bSP, bTBP, bIBP, bWc }, prm);
     dev->flush();
 
     const auto gI = downloadBuffer<F4>(dev, bI, NP * MAXPART);
@@ -505,7 +536,7 @@ PXG_TEST(psMeshMid_traverser)
     for (PxgBufferHandle h : { bM, bN, bT, bV, bCur, bPred, bI, bNi, bC, bW, bBR, bTBR, bIBR, bSP, bTBP, bIBP, bWc })
         dev->destroyBuffer(h);
 
-    size_t mm = 0, checked = 0, skipped = 0, contactsP = 0, replaced = 0;
+    size_t mm = 0, checked = 0, skipped = 0, contactsP = 0, replaced = 0, rejectsN = 0;
     for (uint32_t p = 0; p < NP; ++p)
     {
         if (taint[p]) { ++skipped; continue; }
@@ -514,7 +545,8 @@ PXG_TEST(psMeshMid_traverser)
         // static path: counts, then the stored slots (single mesh -> start 0)
         if (gC[p] != pr.contactCount) { ++mm; continue; }
         if (pr.contactCount) ++contactsP;
-        if (pr.contactCount >= MAXMESH) ++replaced;
+        if (pr.overflowRounds) ++replaced;
+        rejectsN += pr.rejects;
         const uint32_t stored = std::min<uint32_t>(std::min<uint32_t>(pr.contactCount, MAXMESH), MAXPART);
         bool ok = true;
         for (uint32_t s = 0; s < stored && ok; ++s)
@@ -536,8 +568,177 @@ PXG_TEST(psMeshMid_traverser)
     // for the writer
     PXG_CHECK_MSG(gWCount == 0, "psMeshMid: writer path unexpectedly used (%u)", gWCount);
     PXG_CHECK_MSG(checked > NP * 3 / 4, "psMeshMid: too many tainted (%zu)", skipped);
-    PXG_CHECK_MSG(contactsP > 30 && replaced >= 2,
+    (void)rejectsN; // the deterministic micro-scene below pins the reject branch
+    PXG_CHECK_MSG(contactsP > 30 && replaced >= 1,
                   "psMeshMid: coverage thin (cp=%zu repl=%zu)", contactsP, replaced);
+
+    // ---- deterministic replacement micro-scene: one leaf, one particle ----
+    // Triangles at plane distances 0.05..0.10 (slots), then 0.30 (MUST be
+    // REJECTED by the depth < worst gate) and 0.07 (replaces the 0.10 slot).
+    // Identity pose, unit scale, no CCD (also exercises the non-CCD volume).
+    {
+        const float dep[8] = { 0.05f, 0.06f, 0.08f, 0.09f, 0.095f, 0.10f, 0.07f, 0.30f };
+        std::vector<F4> mv(24);
+        std::vector<U4> mt(8);
+        for (uint32_t t = 0; t < 8; ++t)
+        {
+            // big triangle in the plane z = -dep[t], normal +z (towards the particle)
+            mv[t * 3 + 0] = { -2.0f, -2.0f, -dep[t], 0 };
+            mv[t * 3 + 1] = { 3.0f, -2.0f, -dep[t], 0 };
+            mv[t * 3 + 2] = { -2.0f, 3.0f, -dep[t], 0 };
+            mt[t] = { t * 3, t * 3 + 1, t * 3 + 2, 0 };
+        }
+        std::vector<Bv32Node> mn(1);
+        mn[0].mNbNodes = 1;
+        mn[0].mData[0] = (0u << 7) | (8u << 1) | 1u; // one leaf, prims [0,8)
+        mn[0].mMin[0] = { -2, -2, -0.4f, 0 };
+        mn[0].mMax[0] = { 3, 3, 0, 0 };
+        PmMesh mm2;
+        mm2.meshP = { 0, 0, 0, 0 };
+        mm2.meshQ = { 0, 0, 0, 1 };
+        mm2.scale = { 1, 1, 1, 0.5f };
+        mm2.scaleRot = { 0, 0, 0, 1 };
+        mm2.misc = { 0.01f, 0, 0, 0 };
+        mm2.rigid = { 0x55u, 3u, 0, 0 };
+        std::vector<PmMesh> mmV(1, mm2);
+        std::vector<F4> mcur(32, { 50, 50, 50, 1 }), mpred(32, { 50, 50, 50, 1 });
+        mcur[0] = { 0, 0, 0, 1 }; // particle 0 at the origin
+        std::vector<F4> mInfo(1 * MAXPART, { -9, -9, -9, -9 });
+        std::vector<uint32_t> mNode(1 * MAXPART * 2, 0xcccccccc), mCnt(1, 0), mW(1, 0);
+        std::vector<PsC> mCt(64);
+        std::vector<uint32_t> mz2(64 * 2, 0), mz1(64, 0);
+        PxgBufferHandle qM = createBufferFrom(dev, mmV);
+        PxgBufferHandle qN = createBufferFrom(dev, mn);
+        PxgBufferHandle qT = createBufferFrom(dev, mt);
+        PxgBufferHandle qV = createBufferFrom(dev, mv);
+        PxgBufferHandle qCur = createBufferFrom(dev, mcur);
+        PxgBufferHandle qPred = createBufferFrom(dev, mpred);
+        PxgBufferHandle qI = createBufferFrom(dev, mInfo);
+        PxgBufferHandle qNi = createBufferFrom(dev, mNode);
+        PxgBufferHandle qC = createBufferFrom(dev, mCnt);
+        PxgBufferHandle qW = createBufferFrom(dev, mCt);
+        PxgBufferHandle qBR = createBufferFrom(dev, mz2);
+        PxgBufferHandle qTBR = createBufferFrom(dev, mz1);
+        PxgBufferHandle qIBR = createBufferFrom(dev, mz1);
+        PxgBufferHandle qSP = createBufferFrom(dev, mz2);
+        PxgBufferHandle qTBP = createBufferFrom(dev, mz1);
+        PxgBufferHandle qIBP = createBufferFrom(dev, mz1);
+        PxgBufferHandle qWc = createBufferFrom(dev, mW);
+        PmParams mprm = { 1, 64, 8u /* static, no CCD */, SYS };
+        Kernel kq("psMeshMid.spv", "ctPsMeshMid", strides, sizeof(PmParams));
+        kq.dispatch(1, { qM, qN, qT, qV, qCur, qPred, qI, qNi, qC, qW, qBR, qTBR, qIBR, qSP, qTBP, qIBP, qWc }, mprm);
+        dev->flush();
+        const auto qGI = downloadBuffer<F4>(dev, qI, MAXPART);
+        const auto qGC = downloadBuffer<uint32_t>(dev, qC, 1);
+        // expected: slots 0-4 = dep[0..4], slot 5 = 0.07 (replaced the 0.10);
+        // the trailing 0.30 REJECTED (a flipped reject gate would replace the
+        // 0.095 slot with it); count saturated at 6
+        const float expDep[6] = { 0.05f, 0.06f, 0.08f, 0.09f, 0.095f, 0.07f };
+        size_t mmq = 0;
+        if (qGC[0] != 6) ++mmq;
+        for (uint32_t sIdx = 0; sIdx < 6; ++sIdx)
+            if (!almostEqual(qGI[sIdx].w, expDep[sIdx] - 0.01f, 1e-4f, 1e-4f)) ++mmq;
+        PXG_CHECK_MSG(mmq == 0, "psMeshMid: micro replacement scene wrong (%zu)", mmq);
+        for (PxgBufferHandle h : { qM, qN, qT, qV, qCur, qPred, qI, qNi, qC, qW, qBR, qTBR, qIBR, qSP, qTBP, qIBP, qWc })
+            dev->destroyBuffer(h);
+    }
+
+    // ---- dispatch 2: SAME one-way buffers again (static path accumulation:
+    // nonzero startIndex, the 12 cap binding when 2*count > 12) ----
+    // ---- dispatch 3: dynamic rigid -> EVERYTHING flows through the writer ----
+    {
+        std::vector<F4> infoInit2(NPPAD * MAXPART, { -9, -9, -9, -9 });
+        std::vector<uint32_t> nodeInit2(NPPAD * MAXPART * 2, 0xcccccccc), cnt2(NPPAD, 0), wcnt2(1, 0);
+        std::vector<PsC> ctInit2(CAP);
+        std::vector<uint32_t> zz2(CAP * 2, 0xabababab), zz1(CAP, 0xabababab);
+        PxgBufferHandle dM = createBufferFrom(dev, meshV);
+        PxgBufferHandle dN = createBufferFrom(dev, nodes);
+        PxgBufferHandle dT = createBufferFrom(dev, tris);
+        PxgBufferHandle dV = createBufferFrom(dev, verts);
+        PxgBufferHandle dCur = createBufferFrom(dev, curPos);
+        PxgBufferHandle dPred = createBufferFrom(dev, predPos);
+        PxgBufferHandle dI = createBufferFrom(dev, infoInit2);
+        PxgBufferHandle dNi = createBufferFrom(dev, nodeInit2);
+        PxgBufferHandle dC = createBufferFrom(dev, cnt2);
+        PxgBufferHandle dW = createBufferFrom(dev, ctInit2);
+        PxgBufferHandle dBR = createBufferFrom(dev, zz2);
+        PxgBufferHandle dTBR = createBufferFrom(dev, zz1);
+        PxgBufferHandle dIBR = createBufferFrom(dev, zz1);
+        PxgBufferHandle dSP = createBufferFrom(dev, zz2);
+        PxgBufferHandle dTBP = createBufferFrom(dev, zz1);
+        PxgBufferHandle dIBP = createBufferFrom(dev, zz1);
+        PxgBufferHandle dWc = createBufferFrom(dev, wcnt2);
+        Kernel k2("psMeshMid.spv", "ctPsMeshMid", strides, sizeof(PmParams));
+        // twice static (accumulation)
+        k2.dispatch((NP + 31) / 32, { dM, dN, dT, dV, dCur, dPred, dI, dNi, dC, dW, dBR, dTBR, dIBR, dSP, dTBP, dIBP, dWc }, prm);
+        k2.dispatch((NP + 31) / 32, { dM, dN, dT, dV, dCur, dPred, dI, dNi, dC, dW, dBR, dTBR, dIBR, dSP, dTBP, dIBP, dWc }, prm);
+        dev->flush();
+        const auto dGI = downloadBuffer<F4>(dev, dI, NPPAD * MAXPART);
+        const auto dGC = downloadBuffer<uint32_t>(dev, dC, NPPAD);
+        size_t mm2 = 0;
+        for (uint32_t p = 0; p < NP; ++p)
+        {
+            if (taint[p]) continue;
+            const PRef& pr = pref[p];
+            if (dGC[p] != 2 * pr.contactCount) { ++mm2; continue; }
+            const uint32_t storedEach = std::min<uint32_t>(pr.contactCount, MAXMESH);
+            const uint32_t total = std::min<uint32_t>(2 * storedEach, MAXPART);
+            bool ok = true;
+            for (uint32_t sIdx = 0; sIdx < total && ok; ++sIdx)
+            {
+                const uint32_t src = sIdx < storedEach ? sIdx : sIdx - storedEach;
+                const uint32_t oi = p + sIdx * NPPAD;
+                // NOTE: strided by numParticles = NP in the shader
+                const uint32_t oiNP = p + sIdx * NP;
+                ok = almostEqual(dGI[oiNP].w, pr.d[src] - restDist, 1e-4f, 1e-4f);
+                (void)oi;
+            }
+            if (!ok) ++mm2;
+        }
+        PXG_CHECK_MSG(mm2 == 0, "psMeshMid: %zu accumulation mismatches", mm2);
+        // dynamic rigid: writer path
+        std::vector<uint32_t> cnt3(NPPAD, 0), wcnt3(1, 0);
+        PxgBufferHandle eC = createBufferFrom(dev, cnt3);
+        PxgBufferHandle eW = createBufferFrom(dev, ctInit2);
+        PxgBufferHandle eWc = createBufferFrom(dev, wcnt3);
+        PmParams prmDyn = { NP, CAP, (CCD ? 1u : 0) | (TGS ? 2u : 0), SYS }; // static bit clear
+        k2.dispatch((NP + 31) / 32, { dM, dN, dT, dV, dCur, dPred, dI, dNi, eC, eW, dBR, dTBR, dIBR, dSP, dTBP, dIBP, eWc }, prmDyn);
+        dev->flush();
+        const auto eGW = downloadBuffer<PsC>(dev, eW, CAP);
+        const uint32_t eCount = downloadBuffer<uint32_t>(dev, eWc, 1)[0];
+        // group writer contacts by particle (unique pLo), compare in order
+        uint32_t sumChecked = 0, sumAll = 0;
+        for (uint32_t p = 0; p < NP; ++p) { sumAll += std::min<uint32_t>(pref[p].contactCount, MAXMESH); }
+        size_t mm3 = 0;
+        std::vector<std::vector<uint32_t>> slots(NP);
+        for (uint32_t i = 0; i < std::min(eCount, CAP); ++i)
+            if (eGW[i].pLo < NP && eGW[i].pHi == SYS && eGW[i].rLo == 0x77u && eGW[i].rHi == 9u)
+                slots[eGW[i].pLo].push_back(i);
+            else ++mm3;
+        for (uint32_t p = 0; p < NP; ++p)
+        {
+            if (taint[p]) continue;
+            const PRef& pr = pref[p];
+            const uint32_t expect = std::min<uint32_t>(pr.contactCount, MAXMESH);
+            sumChecked += expect;
+            if (slots[p].size() != expect) { ++mm3; continue; }
+            std::sort(slots[p].begin(), slots[p].end()); // sequential per particle
+            for (uint32_t sIdx = 0; sIdx < expect; ++sIdx)
+            {
+                const PsC& g2 = eGW[slots[p][sIdx]];
+                if (!almostEqual(g2.normal_pen.w, pr.d[sIdx] - restDist, 1e-4f, 1e-4f) ||
+                    !almostEqual(g2.normal_pen.x, pr.n[sIdx].x, 1e-4f, 1e-4f) ||
+                    !almostEqual(g2.normal_pen.y, pr.n[sIdx].y, 1e-4f, 1e-4f) ||
+                    !almostEqual(g2.normal_pen.z, pr.n[sIdx].z, 1e-4f, 1e-4f)) { ++mm3; break; }
+            }
+        }
+        PXG_CHECK_MSG(mm3 == 0, "psMeshMid: %zu writer-path mismatches", mm3);
+        PXG_CHECK_MSG(eCount >= sumChecked && eCount <= sumAll,
+                      "psMeshMid: writer counter %u outside [%u, %u]", eCount, sumChecked, sumAll);
+        PXG_CHECK_MSG(eCount > 40, "psMeshMid: writer path thin (%u)", eCount);
+        for (PxgBufferHandle h : { dM, dN, dT, dV, dCur, dPred, dI, dNi, dC, dW, dBR, dTBR, dIBR, dSP, dTBP, dIBP, dWc, eC, eW, eWc })
+            dev->destroyBuffer(h);
+    }
 }
 
 } // namespace
