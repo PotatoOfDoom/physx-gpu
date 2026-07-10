@@ -19,7 +19,7 @@ Vulkan/D3D12 backends.
 | `MemCopyBalanced.cu` | MemCopyBalanced, clampMaxValue, clampMaxValues | ✅ | `memCopy.slang` + `clampValues.slang` (CopyDesc pointers → buffer byte offsets) |
 | `utility.cu` | interleaveBuffers + deformable-skinning kernels (zero/areaWeighted/normalize normals, cloth Phong + softbody barycentric interpolation) | ✅ | `skinning.slang` (PxTypedBoundedData pointers → strided buffer views; float atomicAdd → portable CAS loop) |
 | `updateCacheAndBound.cuh` (header) | updateBounds/getAbsPose/setTransformCache | ✅ | `updateBounds.slang` |
-| other `.cuh` (atomic, copy, sparseRemove, contactReduction, gridCal, MemoryAllocator) | device helpers | ⬜ | ported on demand with their consumers (atomic.cuh AtomicAdd3 ✅ in `skinning.slang`) |
+| other `.cuh` (atomic, copy, sparseRemove, contactReduction, gridCal, MemoryAllocator) | device helpers | 🟡 | ported on demand with their consumers (atomic.cuh AtomicAdd3 ✅ in `skinning.slang`; sparseRemove ✅ in `npPairManagement`/`npPairRemoveSwap`).  `gridCal.slang` ports gridCal.cuh in full ✅ — calcGridPos (floor cell coords), calcGridHash (pow2 `&`-wrap + z-major linear address), calcGridHashPeriodic (single-wrap periodic adjust, addressed over the non-periodic size), calcWrappedGridRangeSize (clamped [0, gridSize]), calcGridOffsetInRange (linear→3D decode), calcGridRange (bounds corners) and getParticleSpeculativeContactVolume (forward-projection midpoint + covering radius, PGS/TGS/diffuse scales) — the particle-system spatial-query foundation; grid outputs verified bit-exactly (positions generated away from cell boundaries so floor is deterministic; negative cells, both periodic wrap directions and range clamping exercised), the speculative volume to tolerance with all three scale branches exercised |
 
 ## gpusolver (rigid-body PGS/TGS solver)
 
@@ -67,7 +67,7 @@ Vulkan/D3D12 backends.
 
 ## Verification
 
-All ported kernels are covered by `tests/` (173 GPU test cases, run per commit
+All ported kernels are covered by `tests/` (174 GPU test cases, run per commit
 via ctest on a Vulkan device — llvmpipe in CI):
 
 | Kernel | Reference | Checks |
