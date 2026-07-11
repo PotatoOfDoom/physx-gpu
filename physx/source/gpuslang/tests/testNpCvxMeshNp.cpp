@@ -798,12 +798,23 @@ static CmFixture buildFixture(uint32_t NC, uint32_t seed, bool capsule)
         // C = the sphere / capsule-segment center in shape (mesh-local) space;
         // wantZ picks a perpendicular capsule axis (segment pierces / stands
         // beside) vs an in-plane axis (parallel to the triangle)
+        // dropBatch (batch 2): ALL lanes deferred with zero contacts -> the
+        // whole warp is contact-less and dropped.  mixedBatch (batch 3): odd
+        // lanes are deferred-zero-contact, even lanes are face contacts, so
+        // the warp is LIVE (totalContacts>0) yet contains zero-contact
+        // deferred lanes whose outMask must still be emitted — pins that the
+        // second-pass write gates on outMask alone, not on nbContacts.
         const bool dropBatch = capsule && (i / 32 == 2);
+        const bool mixedBatch = capsule && (i / 32 == 3);
         V3 C;
         bool wantZ = false;
-        if (dropBatch)
+        if (dropBatch || (mixedBatch && (i % 2 == 1)))
         {
             C = { 0.5f, -0.5f, 0 }; wantZ = false; // coplanar beside e01 -> 0 contacts
+        }
+        else if (mixedBatch)
+        {
+            C = { 0.5f, 0.4f, 0.25f }; wantZ = false; // face contact (nb==2, om==0)
         }
         else
         {
@@ -814,7 +825,14 @@ static CmFixture buildFixture(uint32_t NC, uint32_t seed, bool capsule)
                     wantZ = false; break;                            // face-2 / vertex defer
             case 2: C = { 1.0f, -0.5f, 0 }; wantZ = true; break;     // edge e01 deferral
             case 3: C = { 0.5f, 0.5f, capsule ? -0.125f : -1.0f }; wantZ = false; break; // below (capsule: CLOSE below -> only the gate rejects, pins it)
-            case 4: C = { 0.5f, 0.5f, 4.0f }; wantZ = false; break;  // too far
+            case 4:
+                // capsule accept-gate boundary: an in-plane segment at height
+                // 0.75 gives sqDist == (radius+cd)^2 == 0.5625 EXACTLY, so the
+                // STRICT sqInflatedRadius > sqDist excludes it (nb==0,
+                // patchNormal stays 0); a >= mutant enters the block and
+                // writes a non-zero patchNormal -> ni.normal mismatch
+                C = (capsule && i % 16 == 12) ? V3{ 0.5f, 0.4f, 0.75f } : V3{ 0.5f, 0.5f, 4.0f };
+                wantZ = false; break;                                // too far / accept boundary
             case 5: C = capsule ? V3{ 0.5f, 0.5f, 0 } : V3{ 1.0f, -0.375f, 0 };
                     wantZ = true; break;                             // pierce / eE01 blocked+swap
             case 6:
