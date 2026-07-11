@@ -100,6 +100,32 @@
 // essentially forever (the CUDA would hang identically); the faithful
 // port keeps min and max on the same per-axis scales.
 //
+// sbHfBound (sbHeightfieldMidphaseCore, softbodyHFMidPhase.cu :172-279,
+// tranche 105): the softbody twin of fmHfBound — the element is a
+// TETRAHEDRON (bound = min/max of the four world vertices, fattenFast
+// by contactDist) and the element gate is `hint && tetrahedronIdx <
+// numTets` where hint is the per-tet SURFACE flag (PxU8 truthiness,
+// != 0): non-surface tets generate nothing.  Everything downstream —
+// the two-rotation transformFast(getInverse(), bound) decomposition,
+// the per-axis inverse scales (negative-scale swaps dead upstream),
+// the FAITHFUL mis-parenthesised admit gate, the tranche-62 clamps,
+// the implicit float->uint y-range conversion and the
+// heightfieldComputePairs / heightfieldOutputPairs pair emission with
+// payload uint4(cmIdx, tetrahedronIdx, triangleIdx, 0) — is the exact
+// machinery fmHfBound already transcribed, shared verbatim.  The warp
+// reservation differs only cosmetically upstream (explicit
+// warp-wide startIndex != 0xffffffff guard instead of the cloth
+// core's per-lane nbPairs != 0 guard; zero-pair lanes write nothing
+// either way — zero-trip ranges, or nonzero ranges whose re-evaluated
+// predicates emit nothing — and the forms could differ only if the
+// global counter sat at exactly 0xffffffff, i.e. 2^32 reserved pairs),
+// which serializes to the identical single-reservation batch.  FmCase mapping: a/b/c/g.xyz = the four
+// world tet vertices (a.w = contactDist), g.w = surface hint,
+// d/e/f = heightfield transform + scale, ids = (cmIdx, tetIdx, 0,
+// numTets).  Launch glue (LoadShapePairWarp, softbody/tetmesh blob
+// walk, nbWarpsPerCm=64 wrapped-thread partitioning) is documented,
+// not ported.
+//
 // WARP SERIALIZATION: fmVertexAabb and fmHfBound are one-CASE-per-thread
 // kernels whose only cross-lane effect is the slot-packing ballot/scan —
 // serialized as one 32-case batch per thread with a single reservation
@@ -126,14 +152,14 @@ struct FmParams { uint numCases; uint stackSize; uint nbRows; uint nbCols; }
 
 struct FmCase
 {
-    float4 a;   // vertexAabb: cloth vertex | sphereTree: query center (world) | hfBound: tri v0 (w = contactDist)
-    float4 b;   // vertexAabb: aabb min     | sphereTree: x = radius           | hfBound: tri v1
-    float4 c;   // vertexAabb: aabb max (w = tolerance = cd^2)                 | hfBound: tri v2
-    float4 d;   // sphereTree: mesh transform quat | hfBound: hf transform quat
-    float4 e;   // sphereTree: mesh transform pos  | hfBound: hf transform pos
-    float4 f;   // sphereTree: mesh scale (xyz)    | hfBound: hf scale (xyz)
-    float4 g;   // sphereTree: mesh scale rotation quat
-    uint4 ids;  // x = cmIdx, y = element/vertex/query index, z = doTransform (sphereTree) / kind (hfBound: 0 tri, 1 vertex), w = numElements (hfBound gate)
+    float4 a;   // vertexAabb: cloth vertex | sphereTree: query center (world) | hfBound: tri v0 (w = contactDist) | sbHfBound: tet v0 (w = contactDist)
+    float4 b;   // vertexAabb: aabb min     | sphereTree: x = radius           | hfBound: tri v1 | sbHfBound: tet v1
+    float4 c;   // vertexAabb: aabb max (w = tolerance = cd^2)                 | hfBound: tri v2 | sbHfBound: tet v2
+    float4 d;   // sphereTree: mesh transform quat | hf/sbHfBound: hf transform quat
+    float4 e;   // sphereTree: mesh transform pos  | hf/sbHfBound: hf transform pos
+    float4 f;   // sphereTree: mesh scale (xyz)    | hf/sbHfBound: hf scale (xyz)
+    float4 g;   // sphereTree: mesh scale rotation quat | sbHfBound: tet v3 (w = surface hint, PxU8 truthiness)
+    uint4 ids;  // x = cmIdx, y = element/vertex/query index, z = doTransform (sphereTree) / kind (hfBound: 0 tri, 1 vertex), w = numElements/numTets gate
 }
 
 // Gu::BV32DataPacked (1168 bytes)
@@ -567,6 +593,114 @@ void fmHfBound(uint3 dtid : SV_DispatchThreadID)
         laneRange[lane] = r;
     }
 
+    uint startIndex = 0;
+    if (totalCount > 0)
+        InterlockedAdd(gCounter[0], totalCount, startIndex);
+
+    for (uint lane = 0; lane < 32; ++lane)
+    {
+        if (laneRange[lane].nbPairs != 0)
+            hfOutputPairs(laneRange[lane], laneCm[lane], laneElem[lane],
+                          startIndex + laneOffsets[lane], gParams.stackSize);
+    }
+}
+
+// ============================================================================
+// sbHfBound — sbHeightfieldMidphaseCore (softbodyHFMidPhase.cu)
+// ============================================================================
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void sbHfBound(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint base = dtid.x * 32;
+    if (base >= gParams.numCases) return;
+
+    HfRange laneRange[32];
+    uint laneCm[32];
+    uint laneElem[32];
+
+    uint totalCount = 0;
+    uint laneOffsets[32];
+    for (uint lane = 0; lane < 32; ++lane)
+    {
+        const uint i = base + lane;
+        HfRange r;
+        r.minRow = 0; r.maxRow = 0; r.minColumn = 0; r.maxColumn = 0;
+        r.minyF = 0; r.maxyF = 0; r.nbPairs = 0;
+        laneCm[lane] = 0;
+        laneElem[lane] = 0;
+        laneOffsets[lane] = totalCount; // exclusive scan of per-lane pair counts
+        if (i >= gParams.numCases)
+        {
+            laneRange[lane] = r;
+            continue;
+        }
+        const FmCase cs = gCase[i];
+        laneCm[lane] = cs.ids.x;
+        laneElem[lane] = cs.ids.y;
+        const uint tetrahedronIdx = cs.ids.y;
+        const uint numTets = cs.ids.w;
+        const bool hint = cs.g.w != 0.0f; // PxU8 surface hint truthiness
+
+        if (hint && tetrahedronIdx < numTets) // sb surface gate
+        {
+            // tetBoundingBox(v0..v3).fattenFast(contactDist), world space
+            const float3 v0 = cs.a.xyz, v1 = cs.b.xyz, v2 = cs.c.xyz, v3 = cs.g.xyz;
+            const float cd = cs.a.w;
+            float3 bmn = min(min(v0, v1), min(v2, v3)) - float3(cd, cd, cd);
+            float3 bmx = max(max(v0, v1), max(v2, v3)) + float3(cd, cd, cd);
+
+            // identical transformFast(getInverse(), bound) chain as fmHfBound
+            const float4 qinv = float4(-cs.d.x, -cs.d.y, -cs.d.z, cs.d.w);
+            const float3 centerW = (bmn + bmx) * 0.5f;
+            const float3 extentW = (bmx - bmn) * 0.5f;
+            const float3 invP = quatRotateInv(cs.d, -cs.e.xyz);
+            const float3 center = quatRotateInv(cs.d, centerW) + invP;
+            float3 c0, c1, c2;
+            quatBasis(qinv, c0, c1, c2);
+            const float3 e0 = c0 * extentW.x;
+            const float3 e1 = c1 * extentW.y;
+            const float3 e2 = c2 * extentW.z;
+            const float3 wext = float3(abs(e0.x) + abs(e1.x) + abs(e2.x),
+                                       abs(e0.y) + abs(e1.y) + abs(e2.y),
+                                       abs(e0.z) + abs(e1.z) + abs(e2.z));
+            float3 lmn = center - wext;
+            float3 lmx = center + wext;
+            const float oneOverHeightScale = 1.0f / cs.f.y;
+            const float oneOverRowScale = 1.0f / abs(cs.f.x);
+            const float oneOverColScale = 1.0f / abs(cs.f.z);
+            lmn.x *= oneOverRowScale;
+            lmn.y *= oneOverHeightScale;
+            lmn.z *= oneOverColScale;
+            lmx.x *= oneOverRowScale;
+            lmx.y *= oneOverHeightScale;
+            lmx.z *= oneOverColScale;
+
+            // FAITHFUL upstream quirk: the ! binds only to the FIRST comparison (sb)
+            if (!(lmn.x > float(gParams.nbRows - 1)) || (lmn.z > float(gParams.nbCols - 1)) ||
+                (lmx.x < 0.0f) || (lmx.z < 0.0f))
+            {
+                r.minRow = getMinRow(lmn.x, gParams.nbRows);
+                r.maxRow = getMaxRow(lmx.x, gParams.nbRows);
+                r.minColumn = getMinColumn(lmn.z, gParams.nbCols);
+                r.maxColumn = getMaxColumn(lmx.z, gParams.nbCols);
+                r.minyF = float(f2uSat(lmn.y));
+                r.maxyF = float(f2uSat(lmx.y));
+
+                if ((2u * (r.maxColumn - r.minColumn) * (r.maxRow - r.minRow)) > 0u)
+                    r.nbPairs = hfComputePairs(r);
+            }
+            gDebug[i] = float4(float(r.nbPairs), lmn.y, lmx.y, float((r.maxColumn - r.minColumn) * (r.maxRow - r.minRow)));
+        }
+        else
+            gDebug[i] = float4(-1, cs.g.w, 0, 0);
+
+        totalCount += r.nbPairs;
+        laneRange[lane] = r;
+    }
+
+    // upstream: lane-0 atomic when validCount > 0, then the explicit
+    // startIndex != 0xffffffff guard — serialized to the same skip
     uint startIndex = 0;
     if (totalCount > 0)
         InterlockedAdd(gCounter[0], totalCount, startIndex);

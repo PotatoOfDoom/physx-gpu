@@ -173,7 +173,7 @@ pxg_compile_shader(npPolyClip4 ctPolyClip4)
 pxg_compile_shader(fcConvexTri ctFcConvexTri)
 pxg_compile_shader(fcVertexConvex ctFcVertexConvex)
 pxg_compile_shader(fcStaticTriCloth fcStaticTriClothKernel)
-pxg_compile_shader(fcMidphase fmVertexAabb fmSphereTree fmHfBound)
+pxg_compile_shader(fcMidphase fmVertexAabb fmSphereTree fmHfBound sbHfBound)
 pxg_compile_shader(npSbPrim sbTetPlane sbEmit sbParticle sbClothVert)
 pxg_compile_shader(npSbRemap rmOther rmFem rmReorder)
 pxg_compile_shader(npCvxHfMid chMidphase sbShrink)
@@ -456,6 +456,7 @@ set(PXG_HLSL_ENTRIES
     "fcMidphase:fmVertexAabb"
     "fcMidphase:fmSphereTree"
     "fcMidphase:fmHfBound"
+    "fcMidphase:sbHfBound"
     "npSbPrim:sbTetPlane"
     "npSbPrim:sbEmit"
     "npSbPrim:sbParticle"

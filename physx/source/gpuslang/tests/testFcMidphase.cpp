@@ -778,4 +778,292 @@ PXG_TEST(fcMidphase_hfBound)
                   offZPairs, negY, gatedN, culledXN);
 }
 
+// ============================================================================
+// PXG_TEST 4: sbHfBound (sbHeightfieldMidphaseCore, tranche 105)
+// ============================================================================
+// The softbody twin of hfBound: TET bound (min/max of four world verts,
+// fattened by contactDist) and the surface-hint gate `hint &&
+// tetrahedronIdx < numTets` (PxU8 truthiness: hint 255 counts, hint 0
+// culls).  The element-gate boundary is pinned with tetIdx == numTets
+// exactly.  The transform chain, quirk gate, clamps, y-conversion and
+// pair emission reuse the fmHfBound machinery (same CPU transcription).
+static HfRangeRef refSbHfRange(const FmCase& cs, const std::vector<uint32_t>& smp, std::vector<U4>* pairs)
+{
+    HfRangeRef r;
+    if (!(cs.g.w != 0.0f) || cs.ids.y >= cs.ids.w) return r; // hint + element gate
+
+    const float cd = cs.a.w;
+    const V3 v0 = v3(cs.a), v1 = v3(cs.b), v2 = v3(cs.c), vv3 = v3(cs.g);
+    V3 bmn = { std::min(std::min(v0.x, v1.x), std::min(v2.x, vv3.x)) - cd,
+               std::min(std::min(v0.y, v1.y), std::min(v2.y, vv3.y)) - cd,
+               std::min(std::min(v0.z, v1.z), std::min(v2.z, vv3.z)) - cd };
+    V3 bmx = { std::max(std::max(v0.x, v1.x), std::max(v2.x, vv3.x)) + cd,
+               std::max(std::max(v0.y, v1.y), std::max(v2.y, vv3.y)) + cd,
+               std::max(std::max(v0.z, v1.z), std::max(v2.z, vv3.z)) + cd };
+
+    const F4 q = cs.d;
+    const F4 qinv = { -q.x, -q.y, -q.z, q.w };
+    const V3 centerW = mul(add(bmn, bmx), 0.5f);
+    const V3 extentW = mul(sub(bmx, bmn), 0.5f);
+    const V3 invP = quatRotateInv(q, { -cs.e.x, -cs.e.y, -cs.e.z });
+    const V3 center = add(quatRotateInv(q, centerW), invP);
+    const float x = qinv.x, y = qinv.y, z = qinv.z, w = qinv.w;
+    const float x2 = x + x, y2 = y + y, z2 = z + z;
+    const float xx = x2 * x, yy = y2 * y, zz = z2 * z;
+    const float xy = x2 * y, xz = x2 * z, xw = x2 * w;
+    const float yz = y2 * z, yw = y2 * w, zw = z2 * w;
+    const V3 c0 = { 1.0f - yy - zz, xy + zw, xz - yw };
+    const V3 c1 = { xy - zw, 1.0f - xx - zz, yz + xw };
+    const V3 c2 = { xz + yw, yz - xw, 1.0f - xx - yy };
+    const V3 e0 = mul(c0, extentW.x), e1 = mul(c1, extentW.y), e2 = mul(c2, extentW.z);
+    const V3 wext = { std::fabs(e0.x) + std::fabs(e1.x) + std::fabs(e2.x),
+                      std::fabs(e0.y) + std::fabs(e1.y) + std::fabs(e2.y),
+                      std::fabs(e0.z) + std::fabs(e1.z) + std::fabs(e2.z) };
+    V3 lmn = sub(center, wext);
+    V3 lmx = add(center, wext);
+    lmn = { lmn.x / std::fabs(cs.f.x), lmn.y / cs.f.y, lmn.z / std::fabs(cs.f.z) };
+    lmx = { lmx.x / std::fabs(cs.f.x), lmx.y / cs.f.y, lmx.z / std::fabs(cs.f.z) };
+
+    if (!(lmn.x > float(HF_ROWS - 1)) || (lmn.z > float(HF_COLS - 1)) || (lmx.x < 0.0f) || (lmx.z < 0.0f))
+    {
+        r.minRow = clampI(int(std::floor(lmn.x)), 0, int(HF_ROWS) - 2);
+        r.maxRow = clampI(int(std::ceil(lmx.x)), 0, int(HF_ROWS) - 1);
+        r.minColumn = clampI(int(std::floor(lmn.z)), 0, int(HF_COLS) - 2);
+        r.maxColumn = clampI(int(std::ceil(lmx.z)), 0, int(HF_COLS) - 1);
+        r.minyF = float(f2uSatRef(lmn.y));
+        r.maxyF = float(f2uSatRef(lmx.y));
+        if (2u * (r.maxColumn - r.minColumn) * (r.maxRow - r.minRow) > 0u)
+        {
+            const uint32_t columnSpan = r.maxColumn - r.minColumn;
+            const uint32_t totalNumProcessed = (r.maxRow - r.minRow) * columnSpan * 2u;
+            for (uint32_t i = 0; i < totalNumProcessed; ++i)
+            {
+                const uint32_t index = i / 2u;
+                const uint32_t vertexIndex = (r.minRow + index / columnSpan) * HF_COLS + (r.minColumn + index % columnSpan);
+                const float h0 = hfHeightRef(smp, vertexIndex);
+                const float h1 = hfHeightRef(smp, vertexIndex + 1u);
+                const float h2 = hfHeightRef(smp, vertexIndex + HF_COLS);
+                const float h3 = hfHeightRef(smp, vertexIndex + HF_COLS + 1u);
+                const bool con0 = r.maxyF < h0 && r.maxyF < h1 && r.maxyF < h2 && r.maxyF < h3;
+                const bool con1 = r.minyF > h0 && r.minyF > h1 && r.minyF > h2 && r.minyF > h3;
+                if (!(con0 || con1))
+                {
+                    const bool isM1 = (i & 1u) != 0u;
+                    const uint32_t material = isM1 ? hfMat1(smp, vertexIndex) : hfMat0(smp, vertexIndex);
+                    if (material != 127u)
+                    {
+                        ++r.nbPairs;
+                        if (pairs)
+                            pairs->push_back({ cs.ids.x, cs.ids.y,
+                                               isM1 ? ((vertexIndex << 1) + 1u) : (vertexIndex << 1), 0 });
+                    }
+                }
+            }
+        }
+    }
+    return r;
+}
+
+PXG_TEST(fcMidphase_sbHfBound)
+{
+    std::mt19937 rng(1050701);
+    std::vector<uint32_t> samples(HF_ROWS * HF_COLS);
+    for (uint32_t s = 0; s < samples.size(); ++s)
+    {
+        const int16_t h = int16_t(int(rng() % 101) - 40);
+        uint32_t m0 = (s % 13 == 3) ? 127u : (rng() % 5);
+        uint32_t m1 = (s % 17 == 5) ? 127u : (rng() % 5);
+        if (rng() % 3 == 0) m0 |= 0x80u;
+        if (rng() % 4 == 0) m1 |= 0x80u;
+        samples[s] = (uint32_t(uint16_t(h))) | (m0 << 16) | (m1 << 24);
+    }
+
+    const uint32_t NC = 1024;
+    std::vector<FmCase> cases(NC);
+    size_t offGridZ = 0, offGridXZ = 0, negY = 0, gatedN = 0, culledXN = 0, hint0N = 0, hint255N = 0;
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        FmCase& cs = cases[i];
+        std::memset(&cs, 0, sizeof(cs));
+        cs.d = exactQuat(rng);
+        cs.e = { float(int(rng() % 9)) - 4.0f, float(int(rng() % 9)) - 4.0f, float(int(rng() % 9)) - 4.0f, 0 };
+        const float sc[3] = { 0.5f, 1.0f, 2.0f };
+        cs.f = { sc[rng() % 3], sc[rng() % 3], sc[rng() % 3], 0 };
+        const float cd = 0.25f + float(i % 3) * 0.25f;
+
+        V3 hfP;
+        switch (i % 8)
+        {
+        case 3: hfP = { grid64(rng, 2, 20), grid64(rng, -20, -1), grid64(rng, 2, 14) }; ++negY; break;
+        case 5: hfP = { grid64(rng, 2, 20), grid64(rng, -5, 55), float(HF_COLS) + grid64(rng, 1, 4) }; ++offGridZ; break;
+        case 6: // off-grid +x AND +z: ONLY the (lmn.z > cols-1) disjunct admits
+                // (pins the sb copy of the mis-parenthesised gate's B term:
+                // clamped-corner pairs at rows 28-29 x cols 20-21 vanish if
+                // that disjunct is dropped)
+            hfP = { float(HF_ROWS) + grid64(rng, 1, 3), grid64(rng, -5, 55), float(HF_COLS) + grid64(rng, 1, 3) };
+            ++offGridXZ;
+            break;
+        case 7: // off-grid +x with IN-GRID z: the only culling branch fires
+            hfP = { float(HF_ROWS) + grid64(rng, 2, 4), grid64(rng, -5, 55), grid64(rng, 2, 14) };
+            cs.f.x = 1.0f + float(rng() % 2);
+            ++culledXN;
+            break;
+        default: hfP = { grid64(rng, 1, 25), grid64(rng, -5, 55), grid64(rng, 1, 18) }; break;
+        }
+        const V3 scaled = { hfP.x * cs.f.x, hfP.y * cs.f.y, hfP.z * cs.f.z };
+        const V3 world = add(quatRotate(cs.d, scaled), v3(cs.e));
+
+        // hint families: 0 culls, 255 counts (PxU8 truthiness), 1 default;
+        // element-gate boundary pinned with tetIdx == numTets EXACTLY
+        float hint = 1.0f;
+        if (i % 16 == 11) { hint = 0.0f; ++hint0N; }
+        if (i % 16 == 13) { hint = 255.0f; ++hint255N; }
+        cs.ids = { i, (i % 16 == 9) ? 50u : i, 0, (i % 16 == 9) ? 50u : NC + 100u };
+        if (i % 16 == 9) ++gatedN;
+
+        // tet verts: world + three exact rotated/scaled hf-space offsets;
+        // v3 is the UNIQUE y extreme so a 3-vert-bound mutant shrinks rows
+        const V3 b = add(world, quatRotate(cs.d, V3{ grid64(rng, 0.25f, 2) * cs.f.x, 0, 0 }));
+        const V3 c = add(world, quatRotate(cs.d, V3{ 0, 0, grid64(rng, 0.25f, 2) * cs.f.z }));
+        const V3 dl = add(world, quatRotate(cs.d, V3{ 0, grid64(rng, 1, 3) * cs.f.y, 0 }));
+        cs.a = { world.x, world.y, world.z, cd };
+        cs.b = { b.x, b.y, b.z, 0 };
+        cs.c = { c.x, c.y, c.z, 0 };
+        cs.g = { dl.x, dl.y, dl.z, hint };
+    }
+
+    std::vector<U4> expect;
+    std::vector<HfRangeRef> refR(NC);
+    std::vector<std::pair<size_t, size_t>> caseRange(NC);
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        const size_t b = expect.size();
+        refR[i] = refSbHfRange(cases[i], samples, &expect);
+        caseRange[i] = { b, expect.size() };
+    }
+    const uint32_t total = (uint32_t)expect.size();
+    PXG_CHECK_MSG(total > 800, "sbHfBound: scene too sparse (%u)", total);
+    size_t hint255Pairs = 0, offZPairs = 0, offXZPairs = 0;
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        if (i % 16 == 13) hint255Pairs += refR[i].nbPairs;
+        if (i % 8 == 5) offZPairs += refR[i].nbPairs;
+        if (i % 8 == 6) offXZPairs += refR[i].nbPairs;
+    }
+
+    PxgSlangComputeDevice* dev = testDevice();
+    auto run = [&](uint32_t stackSize, uint32_t bufCap) -> std::tuple<std::vector<U4>, uint32_t, std::vector<F4>>
+    {
+        std::vector<U4> outInit(bufCap, { PAIRPOISON, PAIRPOISON, PAIRPOISON, PAIRPOISON });
+        std::vector<uint32_t> cnt0(1, 0);
+        std::vector<F4> dbgInit(NC, { -7, -7, -7, -7 });
+        std::vector<F4> dumF4(4, { 0, 0, 0, 0 });
+        std::vector<U4> dumU4(4, { 0, 0, 0, 0 });
+        std::vector<Bv32Node> dumNodes(1);
+        std::memset(dumNodes.data(), 0, sizeof(Bv32Node));
+        PxgBufferHandle bC = createBufferFrom(dev, cases);
+        PxgBufferHandle bV = createBufferFrom(dev, dumF4);
+        PxgBufferHandle bP = createBufferFrom(dev, dumU4);
+        PxgBufferHandle bN = createBufferFrom(dev, dumNodes);
+        PxgBufferHandle bS = createBufferFrom(dev, samples);
+        PxgBufferHandle bO = createBufferFrom(dev, outInit);
+        PxgBufferHandle bW = createBufferFrom(dev, cnt0);
+        PxgBufferHandle bD = createBufferFrom(dev, dbgInit);
+        Kernel k("fcMidphase.spv", "sbHfBound",
+                 { (uint32_t)sizeof(FmCase), 16, 16, (uint32_t)sizeof(Bv32Node), 4, 16, 4, 16 },
+                 sizeof(FmParams));
+        FmParams prm = { NC, stackSize, HF_ROWS, HF_COLS };
+        const uint32_t batches = (NC + 31) / 32;
+        k.dispatch((batches + 63) / 64, { bC, bV, bP, bN, bS, bO, bW, bD }, prm);
+        dev->flush();
+        auto pairs = downloadBuffer<U4>(dev, bO, bufCap);
+        const uint32_t wc = downloadBuffer<uint32_t>(dev, bW, 1)[0];
+        auto dbg = downloadBuffer<F4>(dev, bD, NC);
+        for (PxgBufferHandle h : { bC, bV, bP, bN, bS, bO, bW, bD }) dev->destroyBuffer(h);
+        return { pairs, wc, dbg };
+    };
+
+    const uint32_t CAP = total + 64;
+    const auto full = run(CAP, CAP);
+    const auto& gOut = std::get<0>(full);
+    const uint32_t gWc = std::get<1>(full);
+    const auto& gDbg = std::get<2>(full);
+    PXG_CHECK_MSG(gWc == total, "sbHfBound: counter %u != %u", gWc, total);
+
+    std::vector<std::vector<std::pair<uint32_t, U4>>> byCase(NC);
+    size_t mm = 0;
+    for (uint32_t s = 0; s < std::min(gWc, CAP); ++s)
+    {
+        if (gOut[s].x >= NC) { ++mm; continue; }
+        byCase[gOut[s].x].push_back({ s, gOut[s] });
+    }
+    size_t mmB = 0;
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        const size_t n = caseRange[i].second - caseRange[i].first;
+        if (byCase[i].size() != n) { ++mm; continue; }
+        const bool gatedOut = !(cases[i].g.w != 0.0f) || cases[i].ids.y >= cases[i].ids.w;
+        if ((gDbg[i].x < 0.0f) != gatedOut) ++mm;
+        if (gDbg[i].x >= 0.0f && uint32_t(gDbg[i].x) != refR[i].nbPairs) ++mm;
+        for (size_t j = 0; j < n; ++j)
+        {
+            const U4& e = expect[caseRange[i].first + j];
+            const U4& g = byCase[i][j].second;
+            if (g.x != e.x || g.y != e.y || g.z != e.z || g.w != e.w) ++mm;
+            if (j > 0 && byCase[i][j].first != byCase[i][j - 1].first + 1) ++mmB;
+        }
+    }
+    for (uint32_t b = 0; b * 32 < NC; ++b)
+    {
+        long prevEnd = -1;
+        for (uint32_t l = 0; l < 32 && b * 32 + l < NC; ++l)
+        {
+            const uint32_t i = b * 32 + l;
+            if (byCase[i].empty()) continue;
+            if (prevEnd != -1 && (long)byCase[i].front().first != prevEnd) ++mmB;
+            prevEnd = (long)byCase[i].back().first + 1;
+        }
+    }
+    size_t dirty = 0;
+    for (uint32_t s = gWc; s < CAP; ++s) if (gOut[s].x != PAIRPOISON) ++dirty;
+    PXG_CHECK_MSG(mm == 0 && mmB == 0 && dirty == 0,
+                  "sbHfBound: %zu mismatches, %zu contiguity breaks, %zu dirty", mm, mmB, dirty);
+
+    const uint32_t TINY = total / 4;
+    const auto capped = run(TINY, CAP);
+    size_t bad = 0;
+    if (std::get<1>(capped) != total) ++bad;
+    for (uint32_t s = TINY; s < CAP; ++s) if (std::get<0>(capped)[s].x != PAIRPOISON) ++bad;
+    // the written prefix is a per-case PREFIX of the expected sequence
+    // (batch order is nondeterministic, per-case emission order is not)
+    {
+        std::vector<size_t> seen(NC, 0);
+        for (uint32_t s = 0; s < TINY; ++s)
+        {
+            const U4 g = std::get<0>(capped)[s];
+            if (g.x == PAIRPOISON) continue; // slot cut by the cap mid-batch
+            if (g.x >= NC) { ++bad; continue; }
+            const size_t j = seen[g.x]++;
+            if (caseRange[g.x].first + j >= caseRange[g.x].second) { ++bad; continue; }
+            const U4& e = expect[caseRange[g.x].first + j];
+            if (g.y != e.y || g.z != e.z || g.w != e.w) ++bad;
+        }
+    }
+    PXG_CHECK_MSG(bad == 0, "sbHfBound cap: %zu capacity leaks", bad);
+
+    size_t culledPairs = 0, hint0Pairs = 0, gatedPairs = 0;
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        if (i % 8 == 7) culledPairs += refR[i].nbPairs;
+        if (i % 16 == 11) hint0Pairs += refR[i].nbPairs;
+        if (i % 16 == 9) gatedPairs += refR[i].nbPairs;
+    }
+    PXG_CHECK_MSG(culledPairs == 0 && hint0Pairs == 0 && gatedPairs == 0,
+                  "sbHfBound: culled families leaked (%zu %zu %zu)", culledPairs, hint0Pairs, gatedPairs);
+    PXG_CHECK_MSG(offZPairs > 30 && offXZPairs > 30 && offGridXZ > 100 && negY > 100 &&
+                  gatedN > 50 && culledXN > 100 && hint0N > 50 && hint255N > 50 && hint255Pairs > 30,
+                  "sbHfBound coverage thin (offZ=%zu offXZ=%zu negY=%zu gated=%zu culled=%zu h0=%zu h255=%zu h255p=%zu)",
+                  offZPairs, offXZPairs, negY, gatedN, culledXN, hint0N, hint255N, hint255Pairs);
+}
+
 } // namespace
