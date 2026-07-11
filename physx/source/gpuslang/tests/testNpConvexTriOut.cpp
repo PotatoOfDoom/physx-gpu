@@ -55,7 +55,6 @@ struct CoParams { uint32_t numPairs, pad0, pad1, pad2; };
 static const uint32_t DeferredContactMask = 0x80000000u;
 static const uint32_t NbContactsShift = 27u;
 static const uint32_t POISON = 0xCDCDCDCDu;
-static const uint32_t eMasks[7] = { 0u, 1u << 29, 2u << 29, 3u << 29, 4u << 29, 5u << 29, 6u << 29 }; // 0,eV0..
 
 static float dotX(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 static V3 crossX(V3 a, V3 b)
@@ -140,8 +139,15 @@ PXG_TEST(npConvexTriOut_output)
         uint32_t region = 0;
         if (fam == 0) { delay = false; nb = 0; }               // zero contact
         else if (fam == 1) { delay = false; nb = 1 + rng() % 4; } // face, not deferred
-        else { delay = true; nb = 1 + rng() % 4; region = 1 + (p % 6); } // deferred, cycle regions incl interior via p
-        if (fam >= 2) region = p % 7; // spread all 7 regions across deferred pairs
+        else                                                    // deferred pairs
+        {
+            delay = true;
+            // FAITHFUL: the tempContactSize-overflow path (convexTriangle.cuh
+            // :1820) forces nbOutputContacts=0 while delayContacts stays true,
+            // so exercise nb==0 with delay too (every 8th deferred pair)
+            nb = (p % 8 == 2) ? 0u : (1 + rng() % 4);
+            region = p % 7; // spread all 7 barycentric regions across deferred pairs
+        }
 
         // build pa from barycentric coords of the chosen region
         const float* abc = baryABC[region];
