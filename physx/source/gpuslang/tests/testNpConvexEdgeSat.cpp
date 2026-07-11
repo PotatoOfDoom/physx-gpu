@@ -27,13 +27,16 @@
 // Verification of npConvexEdgeSat.slang: ctEdgeCrossSat (satEdgeCrossDirection2)
 // — the convex-edge x triangle-edge separating-axis driver.  The hull is an
 // axis-aligned box (8 verts, 12 edges, 6 faces) at power-of-two half-extents and
-// the triangle has AXIS-ALIGNED edges (a right triangle in a coordinate plane,
-// possibly signed-permutation rotated), so every box-edge x tri-edge cross
-// product is either degenerate (parallel) or an EXACT axis-aligned unit axis and
-// the integer/power-of-two vertex projections are bit-exact.  The whole
-// separation / faceNormal / feature / passed output is therefore compared
-// BIT-EXACTLY against an exact CPU transcription that mirrors the shader's serial
-// loop pair-for-pair (so even running-max ties resolve identically).
+// the triangle is a right triangle in a coordinate plane (possibly signed-
+// permutation rotated).  Two of its edges are axis-aligned; the HYPOTENUSE is
+// diagonal, so a box-edge x hypotenuse cross can be an IRRATIONAL axis (e.g.
+// 1/sqrt(2), 1/sqrt(5)).  The bit-exact comparison still holds because IEEE sqrt
+// and division are correctly rounded and the explicit dotX/crossX contract
+// identically on both sides (the same FMA-avoidance doctrine as the earlier
+// tranches) — NOT because every axis is axis-aligned.  The whole separation /
+// faceNormal / feature / passed output is compared BIT-EXACTLY against an exact
+// CPU transcription that mirrors the shader's 32-lane bucketed running max
+// pair-for-pair, so even ties resolve to the identical (lowest-lane) winner.
 
 #include "pxgTestFramework.h"
 
@@ -126,8 +129,9 @@ static EdgeRef edgeSatRef(const Box& box, uint32_t nbVerts, uint32_t nbEdges,
                           const V3 tri[3], const uint32_t triAdj[3], V3 shapeNormal,
                           float contactDist, float seedSep, V3 seedFN, uint32_t seedFeat)
 {
-    V3 accFN = seedFN;
-    float accSep = seedSep;
+    // per-lane running max (lane L owns indices L, L+32, ...) mirroring the warp
+    float laneSep[32]; V3 laneFN[32];
+    for (uint32_t L = 0; L < 32; ++L) { laneSep[L] = seedSep; laneFN[L] = seedFN; }
     bool passed = true;
     const uint32_t total = nbEdges * 3u;
     for (uint32_t index = 0; index < total; ++index)
@@ -156,13 +160,20 @@ static EdgeRef edgeSatRef(const Box& box, uint32_t nbVerts, uint32_t nbEdges,
             { const V3 vv = { box.verts[i].x, box.verts[i].y, box.verts[i].z }; const float d = dotX(vv, axis); minConv = std::min(d, minConv); maxConv = std::max(d, maxConv); }
             const float o0 = minTri - maxConv;
             const float o1 = minConv - maxTri;
-            if (minConv > (maxTri + contactDist) || minTri > (maxConv + contactDist)) { passed = false; break; }
-            if (accSep < o0) { accSep = o0; accFN = axis; }
-            if (accSep < o1) { accSep = o1; accFN = neg(axis); }
+            if (minConv > (maxTri + contactDist) || minTri > (maxConv + contactDist)) { passed = false; }
+            else
+            {
+                const uint32_t L = index % 32u;
+                if (laneSep[L] < o0) { laneSep[L] = o0; laneFN[L] = axis; }
+                if (laneSep[L] < o1) { laneSep[L] = o1; laneFN[L] = neg(axis); }
+            }
         }
     }
     EdgeRef r;
     if (!passed) { r.separation = seedSep; r.faceNormal = seedFN; r.feature = seedFeat; r.passed = false; return r; }
+    // lowest-lane winner on a tie
+    float accSep = laneSep[0]; V3 accFN = laneFN[0];
+    for (uint32_t L = 1; L < 32; ++L) if (laneSep[L] > accSep) { accSep = laneSep[L]; accFN = laneFN[L]; }
     r.separation = seedSep; r.faceNormal = seedFN; r.feature = seedFeat; r.passed = true;
     if (seedSep < accSep) { r.faceNormal = accFN; r.separation = accSep; r.feature = EDGE_FEATURE_IDX; }
     return r;
@@ -241,10 +252,9 @@ PXG_TEST(npConvexEdgeSat_edgeCross)
 
     // family B: OVERLAPPING box vs a small triangle centred near the origin so
     // NO axis separates (passed stays true) and the edge SAT computes real
-    // overlaps.  The triangle normal is +-z, so the Gauss-map cull keeps the
-    // x/y edges (which cross to the z axis) and drops the z edges (which cross
-    // to x/y axes) — flipping the cull therefore changes the WINNING axis, which
-    // pins the cull DIRECTION.  seedSep = -MAX makes the edge axis always win.
+    // overlaps with the edge axis winning over the seed (seedSep = -MAX).  (Note
+    // this does NOT pin the cull DIRECTION — see the KNOWN-EQUIVALENT note below
+    // — it exercises the accept path / running-max / edge-win output.)
     for (uint32_t iter = 0; iter < 400; ++iter)
     {
         const Box box = makeBox(dims[rng() % 3], dims[rng() % 3], dims[rng() % 3]);

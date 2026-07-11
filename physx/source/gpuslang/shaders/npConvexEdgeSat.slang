@@ -44,21 +44,28 @@
 // then warp-argmax-reduces the separation, and if it beats the seed sets the
 // contact normal to the winning axis and the feature to EDGE_FEATURE_IDX.
 //
-// Serialisation: one thread walks all numConvexEdges*3 pairs.  The max over the
-// candidate axes is order-independent, so the serial running-max is identical
-// to the warp reduction; the boolean "any pair separated -> whole test fails"
-// is likewise order-independent (once separated it stays separated), so an
-// immediate early return matches __any_sync.  The seed separation/faceNormal/
-// feature are only overwritten when an edge axis strictly beats the seed.
+// Serialisation: one thread walks all numConvexEdges*3 pairs.  The max
+// SEPARATION is order-independent, but the winning AXIS on a TIE is not: the
+// CUDA warpReduction picks the LOWEST LANE reaching the max, and lane L
+// processes indices L, L+32, L+64, ...  So the serial loop reproduces the warp
+// exactly by bucketing each pair's update into laneSep[index % 32] (a strict-<
+// running max keeps the lowest index WITHIN a lane) and then taking the lowest-
+// lane maximum across the 32 buckets.  The boolean "any pair separated -> whole
+// test fails" is order-independent (once separated it stays separated), so
+// processing every pair and returning the seed on failure matches __any_sync +
+// the early return (the discarded running max is unused on failure).  The seed
+// separation/faceNormal/feature are only overwritten when an edge axis strictly
+// beats the seed.
 //
 // The hull is passed pre-decoded (as the tranche-63/64/65 ports do): scaled
 // vertices, plane normals, the per-edge (v0,v1) vertex table and (f0,f1) face
 // table, and the vertex/edge counts — the hull-blob bit unpacking is engine
 // glue and not re-ported here.
 //
-// Determinism: with perpendicular integer edges the cross product is axis-
-// aligned (exact unit axis) and the integer/power-of-two vertex projections are
-// bit-exact; explicit dotX/crossX match the CPU FMA contraction and the
+// Determinism: the edge-cross axis can be axis-aligned (box edge x an axis-
+// aligned tri edge) OR irrational (box edge x the tri hypotenuse); either way
+// the bit-exact CPU/GPU match holds because IEEE sqrt/division are correctly
+// rounded and the explicit dotX/crossX contract identically on both sides — the
 // normalisation uses v*(1/sqrt(m)) (llvmpipe's rsqrt is not correctly rounded).
 
 import pxgSlangCommon;
@@ -164,8 +171,10 @@ void ctEdgeCrossSat(uint3 dtid : SV_DispatchThreadID)
     uint feature = e.triAdj.w;
     float separation = seedSeparation;
 
-    float3 accFaceNormal = e.seedFaceNormal.xyz;
-    float accSeparation = seedSeparation;
+    // per-lane running max (lane L processes indices L, L+32, L+64, ...)
+    float laneSep[32];
+    float3 laneFN[32];
+    for (uint L = 0u; L < 32u; ++L) { laneSep[L] = seedSeparation; laneFN[L] = e.seedFaceNormal.xyz; }
     bool passed = true;
 
     const uint total = nbEdges * 3u;
@@ -200,18 +209,21 @@ void ctEdgeCrossSat(uint3 dtid : SV_DispatchThreadID)
             const float tempOverlap1 = minConv - maxTri;
             if (minConv > (maxTri + contactDist) || minTri > (maxConv + contactDist))
             {
-                passed = false;
-                break; // once separated the whole test fails (order-independent)
+                passed = false; // once separated the whole test fails
             }
-            if (accSeparation < tempOverlap0)
+            else
             {
-                accSeparation = tempOverlap0;
-                accFaceNormal = axis;
-            }
-            if (accSeparation < tempOverlap1)
-            {
-                accSeparation = tempOverlap1;
-                accFaceNormal = -axis;
+                const uint L = index % 32u; // warp lane owning this pair
+                if (laneSep[L] < tempOverlap0)
+                {
+                    laneSep[L] = tempOverlap0;
+                    laneFN[L] = axis;
+                }
+                if (laneSep[L] < tempOverlap1)
+                {
+                    laneSep[L] = tempOverlap1;
+                    laneFN[L] = -axis;
+                }
             }
         }
     }
@@ -225,6 +237,18 @@ void ctEdgeCrossSat(uint3 dtid : SV_DispatchThreadID)
         o.q0 = 0u; o.q1 = 0u; o.q2 = 0u;
         gOut[t] = o;
         return;
+    }
+
+    // warpReduction<MaxOpFloat>: global max with the LOWEST-LANE winner on a tie
+    float accSeparation = laneSep[0];
+    float3 accFaceNormal = laneFN[0];
+    for (uint L = 1u; L < 32u; ++L)
+    {
+        if (laneSep[L] > accSeparation)
+        {
+            accSeparation = laneSep[L];
+            accFaceNormal = laneFN[L];
+        }
     }
 
     if (seedSeparation < accSeparation)
