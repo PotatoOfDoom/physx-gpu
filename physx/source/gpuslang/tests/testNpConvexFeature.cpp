@@ -230,6 +230,26 @@ PXG_TEST(npConvexFeature_selectFeature)
         emit(corner, tn, feat);
     }
 
+    // family F: FACE feature with a controlled cosTheta straddling the 45-degree
+    // delay threshold, to PIN its value (0.707) — family A only produced
+    // cosTheta in {-1,0,+1}, so any threshold in (0,1) matched, including CUDA's
+    // commented-out 0.985.  For a face feature selectPolygonFeatureIndex is
+    // skipped, so minNormal feeds ONLY the delay dot: with triLocNormal = -axis
+    // the gate reads cosTheta = minNormal.axis exactly (an exact float, well off
+    // the boundary, so no near-boundary flake).
+    const float cosVals[10] = { -0.9f, -0.4f, 0.4f, 0.5f, 0.65f, 0.72f, 0.8f, 0.9f, 0.97f, 0.99f };
+    for (uint32_t iter = 0; iter < 300; ++iter)
+    {
+        const uint32_t feat = rng() % 6;
+        const uint32_t ax = rng() % 3;
+        const float sgn = (rng() & 1) ? 1.0f : -1.0f;
+        const float c = cosVals[rng() % 10];
+        V3 axis = { 0, 0, 0 }; (&axis.x)[ax] = sgn;                 // +-e_ax
+        V3 triN = { 0, 0, 0 }; (&triN.x)[ax] = -sgn;               // -axis -> -triN = axis
+        V3 mn = { 0, 0, 0 }; (&mn.x)[ax] = sgn * c;                // cosTheta = mn.axis = c
+        emit(mn, triN, feat);
+    }
+
     // KNOWN-EQUIVALENT mutants under the exact box-hull regime (each would need a
     // non-box hull to observe, which forfeits the exact integer-output match):
     //  * the FACE-argmax tie-break: a minNormal that ties two faces is exactly an
