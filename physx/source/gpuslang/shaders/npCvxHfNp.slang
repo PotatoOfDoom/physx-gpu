@@ -77,7 +77,9 @@
 // Determinism: integer heights and power-of-two scales make hf2shapep
 // exact; shape-space sphere placement keeps every patch normal N or an
 // exact axis-aligned unit vector, so the NI normal is bit-exact.  The
-// only rounding ops are sqrt / division (IEEE, both sides).
+// only rounding ops are sqrt / division (IEEE, both sides) — the face
+// closest point uses reciprocal-THEN-multiply (matching PxVec3::operator/)
+// so it is identical to the CPU reference on a general denominator too.
 
 import pxgSlangCommon;
 
@@ -297,7 +299,10 @@ float distancePointTriangleSquared(float3 p, float3 a, float3 b, float3 c, uint4
     generateContact = true;
     faceContact = true;
     mask = 0u;
-    closestP = a + (ab * vb + ac * vc) / (va + vb + vc);
+    // reciprocal-then-multiply to match PxVec3::operator/ (f = 1.0f/f; x*f,...)
+    // exactly, NOT a per-component divide (they differ by up to 1 ULP for a
+    // non-power-of-two denominator, and the CPU reference uses 1.0f/den)
+    closestP = a + (ab * vb + ac * vc) * (1.0f / (va + vb + vc));
     return dotX(closestP - p, closestP - p);
 }
 

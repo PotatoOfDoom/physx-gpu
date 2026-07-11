@@ -284,7 +284,10 @@ float distancePointTriangleSquared(float3 p, float3 a, float3 b, float3 c, uint4
     generateContact = true;
     faceContact = true;
     mask = 0u;
-    closestP = a + (ab * vb + ac * vc) / (va + vb + vc);
+    // reciprocal-then-multiply to match PxVec3::operator/ (f = 1.0f/f; x*f,...)
+    // exactly, NOT a per-component divide (they differ by up to 1 ULP for a
+    // non-power-of-two denominator, and the CPU reference uses 1.0f/den)
+    closestP = a + (ab * vb + ac * vc) * (1.0f / (va + vb + vc));
     return dot(closestP - p, closestP - p);
 }
 

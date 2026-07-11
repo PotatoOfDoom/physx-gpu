@@ -128,7 +128,15 @@ static V3 getNormalizedRef(V3 v)
 static bool isEdgeNonconvexRef(uint32_t a) { return (a != BOUNDARY) && ((a & NONCONVEX) != 0u); }
 
 // ---- heightfield ------------------------------------------------------------
-static const uint32_t HF_ROWS = 8, HF_COLS = 8;
+// NON-SQUARE (rows != columns) so any row/column transposition in the index
+// math (getVertex row=vi/cols col=vi%cols, the rows-2 / columns-2 adjacency
+// guards) is observable; the pit/peak sit at ASYMMETRIC (row != col) cells so
+// a transposed grid relocates them and changes the concavity structure.
+static const uint32_t HF_ROWS = 9, HF_COLS = 6;
+// pit/peak at ASYMMETRIC cells with the SAME (even) parity as the original
+// square fixture, so the alternating tessellation rings them with the same mix
+// of concave/convex edges across all three eE arms
+static const uint32_t PIT_R = 2, PIT_C = 4, PEAK_R = 5, PEAK_C = 3;
 
 static float hfHeight(const std::vector<uint32_t>& smp, uint32_t v) { return float(int16_t(smp[v] & 0xffffu)); }
 static bool hfShared(const std::vector<uint32_t>& smp, uint32_t cell) { return (smp[cell] & 0x800000u) != 0u; }
@@ -348,7 +356,11 @@ static uint32_t asU32(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 
 PXG_TEST(npCvxHfNp_sphere)
 {
-    const uint32_t NC = 1024;
+    // NC deliberately NOT a multiple of 32 so the last warp is PARTIAL: its
+    // high lanes are inactive (ci >= numCases), exercising the laneActive
+    // masking in warpOutputStage (a bug counting inactive lanes into
+    // count/total would otherwise slip through a full-warp-only test).
+    const uint32_t NC = 1000;
     std::mt19937 rng(1070701);
 
     // heightfield: left half flat plateau at height 4 (tessFlag varied),
@@ -363,8 +375,8 @@ PXG_TEST(npCvxHfNp_sphere)
         {
             const uint32_t vi = rIdx * HF_COLS + c;
             int16_t h = 0;
-            if (rIdx == 2 && c == 2) h = -3;   // pit
-            if (rIdx == 5 && c == 5) h = 3;    // peak
+            if (rIdx == PIT_R && c == PIT_C) h = -3;    // pit
+            if (rIdx == PEAK_R && c == PEAK_C) h = 3;   // peak
             const uint32_t tess = ((rIdx + c) & 1u) ? 0x80u : 0u;
             samples[vi] = uint32_t(uint16_t(h)) | (tess << 16);
         }
@@ -410,7 +422,11 @@ PXG_TEST(npCvxHfNp_sphere)
     // exercised on all three arms with BOTH accept (concave) and reject (convex)
     // outcomes.  maskIdx>>29: 4=eE01,6=eE12,5=eE02; lambda edge 0=adj.x(eE01),
     // 1=adj.y(eE12), 2=adj.z(eE02).
-    std::vector<std::pair<uint32_t, V3>> concaveArm[3], convexArm[3];
+    // flatEdgeArm[arm]: a COPLANAR interior edge (concavity dot EXACTLY 0), so
+    // the switch's `dot < 0` rejects it — pinning the strict `<` (a `<=` mutant
+    // would flip the flat edge from reject to accept).  Bucketed per arm so all
+    // three switch arms get a flat-edge reject.
+    std::vector<std::pair<uint32_t, V3>> concaveArm[3], convexArm[3], flatEdgeArm[3];
     for (uint32_t r = 0; r + 1 < HF_ROWS; ++r)
         for (uint32_t c = 0; c + 1 < HF_COLS; ++c)
             for (uint32_t sub = 0; sub < 2; ++sub)
@@ -432,18 +448,53 @@ PXG_TEST(npCvxHfNp_sphere)
                     const float cc = concavity(tri, lamEdge);
                     if (cc < -0.05f) concaveArm[arm].push_back({ tri, C });
                     else if (cc > 0.05f) convexArm[arm].push_back({ tri, C });
+                    else if (cc == 0.0f) flatEdgeArm[arm].push_back({ tri, C });
                 }
             }
     for (uint32_t a = 0; a < 3; ++a)
-        PXG_CHECK_MSG(!concaveArm[a].empty() && !convexArm[a].empty(),
-                      "chSphere: concavity arm %u lacks concave/convex coverage (%zu/%zu)",
-                      a, concaveArm[a].size(), convexArm[a].size());
+        PXG_CHECK_MSG(!concaveArm[a].empty() && !convexArm[a].empty() && !flatEdgeArm[a].empty(),
+                      "chSphere: switch arm %u coverage thin (concave %zu convex %zu flat %zu)",
+                      a, concaveArm[a].size(), convexArm[a].size(), flatEdgeArm[a].size());
+
+    const uint32_t pitVi = PIT_R * HF_COLS + PIT_C, peakVi = PEAK_R * HF_COLS + PEAK_C;
+
+    // BOUNDARY-edge placements: an edge closest-feature whose adjacency IS
+    // BOUNDARY, so the concavity switch takes its "keep the contact" branch
+    // (the shader's `&& adj.x != BOUNDARY` guard — the DELIBERATE resolution of
+    // the upstream unguarded getTriangle(0xFFFFFFFF) read).  Restricted to flat
+    // grid-edge triangles for clean geometry; IDENTITY transform keeps the
+    // irrational edge-contact patch normal bit-exact CPU vs GPU.
+    std::vector<std::pair<uint32_t, V3>> boundaryEdge;
+    for (uint32_t r = 0; r + 1 < HF_ROWS; ++r)
+        for (uint32_t c = 0; c + 1 < HF_COLS; ++c)
+            for (uint32_t sub = 0; sub < 2; ++sub)
+            {
+                const uint32_t tri = (r * HF_COLS + c) * 2u + sub;
+                uint32_t t0, t1, t2; triVertIdx(samples, tri, t0, t1, t2);
+                const bool flatTri = t0 != pitVi && t1 != pitVi && t2 != pitVi &&
+                                     t0 != peakVi && t1 != peakVi && t2 != peakVi;
+                if (!flatTri) continue;
+                for (uint32_t e = 0; e < 3; ++e)
+                {
+                    V3 v0, v1, v2; U4 adj;
+                    getTriangleHf(samples, tri, { 1, 1, 1 }, v0, v1, v2, adj);
+                    const V3 C = edgePlace(tri, e);
+                    V3 cp; bool g, f; uint32_t mk;
+                    distPointTriRef(C, v0, v1, v2, adj, cp, g, f, mk);
+                    const uint32_t mi = mk >> 29;
+                    if (mi != 4 && mi != 5 && mi != 6) continue;
+                    const uint32_t lamEdge = (mi == 4) ? 0 : (mi == 6) ? 1 : 2;
+                    const uint32_t at = (lamEdge == 0) ? adj.x : (lamEdge == 1) ? adj.y : adj.z;
+                    if (at == BOUNDARY) boundaryEdge.push_back({ tri, C });
+                }
+            }
+    PXG_CHECK_MSG(!boundaryEdge.empty(), "chSphere: no boundary-edge placements found");
 
     // fully-flat cells: every one of the four 2x2 vertices is at height 0 (no
     // pit (2,2) / peak (5,5)), so the triangle normal is axis-aligned (0,+-1,0)
     // and stays exact under a signed-permutation rotation
     auto vertexIsFlat = [&](uint32_t vr, uint32_t vc) {
-        return !((vr == 2 && vc == 2) || (vr == 5 && vc == 5));
+        return !((vr == PIT_R && vc == PIT_C) || (vr == PEAK_R && vc == PEAK_C));
     };
     std::vector<uint32_t> flatCells;
     for (uint32_t r = 0; r + 1 < HF_ROWS; ++r)
@@ -456,21 +507,54 @@ PXG_TEST(npCvxHfNp_sphere)
         return flatCells[g() % flatCells.size()];
     };
 
+    // TILTED triangles: any triangle touching the pit or peak vertex has an
+    // irrational (non-axis-aligned) normal and a general (non-power-of-two)
+    // barycentric denominator, so a FACE contact on one exercises the
+    // reciprocal-then-multiply of the face-region closest point (the divide-vs-
+    // reciprocal difference is invisible on flat power-of-two triangles)
+    std::vector<uint32_t> tiltedTris;
+    for (uint32_t r = 0; r + 1 < HF_ROWS; ++r)
+        for (uint32_t c = 0; c + 1 < HF_COLS; ++c)
+            for (uint32_t sub = 0; sub < 2; ++sub)
+            {
+                const uint32_t tri = (r * HF_COLS + c) * 2u + sub;
+                uint32_t t0, t1, t2; triVertIdx(samples, tri, t0, t1, t2);
+                if (t0 == pitVi || t1 == pitVi || t2 == pitVi ||
+                    t0 == peakVi || t1 == peakVi || t2 == peakVi)
+                    tiltedTris.push_back(tri);
+            }
+    PXG_CHECK_MSG(tiltedTris.size() > 4, "chSphere: too few tilted tris (%zu)", tiltedTris.size());
+
     std::vector<ChCase> cases(NC);
     for (uint32_t i = 0; i < NC; ++i)
     {
         ChCase& cs = cases[i];
         std::memset(&cs, 0, sizeof(cs));
         const float cd = 0.25f;
-        const uint32_t fam = i % 8;
+        const uint32_t fam = i % 9;
+        const bool flatEdgeFam = (fam == 2);
         const bool concavityFam = (fam == 5 || fam == 6);
+        const bool tiltedFaceFam = (fam == 7);
+        const bool boundaryFam = (fam == 8);
+        // families whose geometry is an EDGE or a tilted face MUST use an
+        // IDENTITY transform: the edge patch normal / tilted normal is
+        // irrational and NI = -patchNormal has no rotation rounding, so it
+        // stays bit-exact CPU vs GPU.  Flat FACE/VERTEX families use signed-perm
+        // transforms (axis-aligned normals -> rotation is an exact permutation)
+        // with +-scales for handedness.  (flatEdgeFam is rejected, so its
+        // outputs are integer/clean, but its edge placement is bucketed at
+        // scale 1 so it also takes the identity frame.)
+        // Residual coverage note: the concavity switch's adjTriNormal/adjTriV0
+        // take `scale`, but the switch families run at scale (1,1,1); a mutant
+        // that substituted a DIFFERENT non-unit scale there is still caught (the
+        // adjacent geometry changes), only one substituting another variable
+        // that also equals (1,1,1) would survive — a scaled-switch fixture is
+        // deferred because a tilted edge under a non-identity rotation loses
+        // bit-exactness.
+        const bool identityFam = flatEdgeFam || concavityFam || tiltedFaceFam || boundaryFam;
 
-        // concavity families use IDENTITY transforms (NI = -patchNormal, exact
-        // even for the tilted pit/peak normals); flat families use signed-perm
-        // transforms (patch normals are axis-aligned -> rotation is an exact
-        // permutation) with +-scales to exercise the handedness flip
         const float sc[3] = { 0.5f, 1.0f, 2.0f };
-        if (concavityFam)
+        if (identityFam)
         {
             cs.mQ = { 0, 0, 0, 1 }; cs.aQ = { 0, 0, 0, 1 };
             cs.mP = { 0, 0, 0, 0 };
@@ -488,16 +572,42 @@ PXG_TEST(npCvxHfNp_sphere)
         }
 
         // concavity families select a pre-bucketed edge placement (arm cycles
-        // 0/1/2 so all three switch arms are hit); flat families a flat cell
+        // 0/1/2 so all three switch arms are hit; if an arm happens to be empty
+        // for this grid the next non-empty arm is used, never a %0); the
+        // boundary family a grid-edge placement; the tilted-face family a
+        // pit/peak triangle; flat families a flat cell.  specialC carries the
+        // pre-computed identity-frame placement for the edge/boundary families.
         uint32_t tri;
-        V3 concC{};
+        V3 specialC{};
         if (concavityFam)
         {
-            const uint32_t arm = (i / 8) % 3;
-            auto& bucket = (fam == 5) ? concaveArm[arm] : convexArm[arm];
-            const auto& pick = bucket[(i / 8) % bucket.size()];
+            auto* arms = (fam == 5) ? concaveArm : convexArm;
+            const uint32_t sel = i / 9;
+            std::pair<uint32_t, V3> pick{ 0u, V3{ 0, 0, 0 } };
+            for (uint32_t k = 0; k < 3; ++k)
+            {
+                auto& b = arms[(sel + k) % 3];
+                if (!b.empty()) { pick = b[(sel / 3) % b.size()]; break; }
+            }
             tri = pick.first;
-            concC = pick.second;
+            specialC = pick.second;
+        }
+        else if (flatEdgeFam)
+        {
+            auto& b = flatEdgeArm[(i / 9) % 3];
+            const auto& pick = b[(i / 27) % b.size()];
+            tri = pick.first;
+            specialC = pick.second;
+        }
+        else if (boundaryFam)
+        {
+            const auto& pick = boundaryEdge[(i / 9) % boundaryEdge.size()];
+            tri = pick.first;
+            specialC = pick.second;
+        }
+        else if (tiltedFaceFam)
+        {
+            tri = tiltedTris[(i / 9) % tiltedTris.size()];
         }
         else
         {
@@ -520,22 +630,11 @@ PXG_TEST(npCvxHfNp_sphere)
         case 1: // flat vertex deferral: beside v0 along (v0 - centroid) in-plane
             C = add(v0, mul(getNormalizedRef(sub(v0, centroid)), 0.375f));
             break;
-        case 2: // flat INTERIOR edge contact -> concavity dot==0 -> REJECTED:
-                // pick an edge with a non-boundary adjacency and flat concavity
-        {
-            uint32_t pe = 0;
-            for (uint32_t e = 0; e < 3; ++e)
-            {
-                const uint32_t at = (e == 0) ? adj.x : (e == 1) ? adj.y : adj.z;
-                if (at != BOUNDARY && std::fabs(concavity(tri, e)) < 0.05f) { pe = e + 1; break; }
-            }
-            if (pe == 0) { C = add(centroid, mul(tn, 0.25f)); break; } // fallback: face
-            const uint32_t e = pe - 1;
-            const V3 mid = (e == 0) ? mul(add(v0, v1), 0.5f)
-                         : (e == 1) ? mul(add(v1, v2), 0.5f) : mul(add(v0, v2), 0.5f);
-            C = add(mid, mul(getNormalizedRef(sub(mid, centroid)), 0.375f));
+        case 2: // flat INTERIOR (coplanar) edge -> concavity dot EXACTLY 0 ->
+                // REJECTED by the switch's strict `< 0`; the per-arm flatEdgeArm
+                // bucket cycles all three arms so `<` vs `<=` is pinned on each.
+            C = specialC;
             break;
-        }
         case 3: // just BELOW the plane (dist<0) but WITHIN the inflated radius
                 // (sqDist 0.25 < sqInflated 0.5625): the dist>=0 one-sided gate
                 // is the ONLY thing rejecting it, so dropping that gate flips nb
@@ -550,7 +649,10 @@ PXG_TEST(npCvxHfNp_sphere)
                         // arms; fam5 concave->accept, fam6 convex->reject.  The
                         // IDENTITY transform keeps the irrational edge geometry
                         // bit-exact CPU vs GPU.
-            C = concC;
+        case 8:         // boundary edge: closest feature is a grid-edge whose
+                        // adjacency is BOUNDARY -> the switch's keep-contact
+                        // guard fires (accepted, delayed edge contact).
+            C = specialC;
             break;
         default: C = add(centroid, mul(tn, 0.25f)); break;
         }
@@ -563,8 +665,8 @@ PXG_TEST(npCvxHfNp_sphere)
     for (uint32_t i = 0; i < NC; ++i)
         ref[i] = refSphere(cases[i], samples, pairRec);
 
-    // batch aggregation
-    const uint32_t NB = NC / 32;
+    // batch aggregation (ceil: the last warp is partial when NC % 32 != 0)
+    const uint32_t NB = (NC + 31) / 32;
     std::vector<uint32_t> batchContacts(NB, 0), batchMasks(NB, 0);
     for (uint32_t i = 0; i < NC; ++i)
     {
