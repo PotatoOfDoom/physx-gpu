@@ -177,7 +177,7 @@ void ctPolyClip(uint3 dtid : SV_DispatchThreadID)
     float e0planeD[32];
     for (uint L = 0u; L < 32u; ++L)
     {
-        const uint nxt = (L + 1u == nbVerts0) ? 0u : L + 1u;
+        const uint nxt = ((L + 1u == nbVerts0) ? 0u : (L + 1u)) & 31u; // & 31: match CUDA mod-32 shfl, avoid OOB at lane 31
         e0[L] = v0[nxt] - v0[L];
         e0planeN[L] = crossX(e0[L], axis);
         e0planeD[L] = dotX(e0planeN[L], v0[L]);
@@ -223,7 +223,7 @@ void ctPolyClip(uint3 dtid : SV_DispatchThreadID)
     float e1planeD[32];
     for (uint L = 0u; L < 32u; ++L)
     {
-        const uint nxt = (L + 1u == 3u) ? 0u : L + 1u;
+        const uint nxt = ((L + 1u == 3u) ? 0u : (L + 1u)) & 31u; // & 31: match CUDA mod-32 shfl, avoid OOB at lane 31
         e1[L] = v1[nxt] - v1[L];
         e1planeN[L] = crossX(axis, e1[L]);
         e1planeD[L] = dotX(e1planeN[L], v1[L]);
@@ -257,7 +257,7 @@ void ctPolyClip(uint3 dtid : SV_DispatchThreadID)
     uint e0cross[32];
     for (uint L = 0u; L < 32u; ++L)
     {
-        const uint nxt = (L + 1u == nbVerts0) ? 0u : L + 1u;
+        const uint nxt = ((L + 1u == nbVerts0) ? 0u : (L + 1u)) & 31u; // & 31: match CUDA mod-32 shfl, avoid OOB at lane 31
         e0cross[L] = (in0[L] & out0[nxt]) | (in0[nxt] & out0[L]);
     }
 

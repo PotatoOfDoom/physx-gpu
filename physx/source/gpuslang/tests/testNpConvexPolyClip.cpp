@@ -113,7 +113,7 @@ static WarpRef polyClipRef(F4 plane0, F4 plane1, V3 axis, float maxSep, uint32_t
     V3 e0[32], e0planeN[32]; float e0planeD[32];
     for (uint32_t L = 0; L < 32; ++L)
     {
-        const uint32_t nxt = (L + 1u == nbVerts0) ? 0u : L + 1u;
+        const uint32_t nxt = ((L + 1u == nbVerts0) ? 0u : (L + 1u)) & 31u; // match CUDA mod-32 shfl, avoid OOB
         e0[L] = sub(v0[nxt], v0[L]);
         e0planeN[L] = crossX(e0[L], axis);
         e0planeD[L] = dotX(e0planeN[L], v0[L]);
@@ -146,7 +146,7 @@ static WarpRef polyClipRef(F4 plane0, F4 plane1, V3 axis, float maxSep, uint32_t
     V3 e1[32], e1planeN[32]; float e1planeD[32];
     for (uint32_t L = 0; L < 32; ++L)
     {
-        const uint32_t nxt = (L + 1u == 3u) ? 0u : L + 1u;
+        const uint32_t nxt = ((L + 1u == 3u) ? 0u : (L + 1u)) & 31u; // match CUDA mod-32 shfl, avoid OOB
         e1[L] = sub(v1[nxt], v1[L]);
         e1planeN[L] = crossX(axis, e1[L]);
         e1planeD[L] = dotX(e1planeN[L], v1[L]);
@@ -174,7 +174,7 @@ static WarpRef polyClipRef(F4 plane0, F4 plane1, V3 axis, float maxSep, uint32_t
     uint32_t e0cross[32];
     for (uint32_t L = 0; L < 32; ++L)
     {
-        const uint32_t nxt = (L + 1u == nbVerts0) ? 0u : L + 1u;
+        const uint32_t nxt = ((L + 1u == nbVerts0) ? 0u : (L + 1u)) & 31u; // match CUDA mod-32 shfl, avoid OOB
         e0cross[L] = (in0[L] & out0[nxt]) | (in0[nxt] & out0[L]);
     }
     uint32_t c[32]; uint32_t a = 0u;
@@ -235,6 +235,23 @@ PXG_TEST(npConvexPolyClip_clip)
         nbList.push_back(nb);
     };
 
+    // general emitter with EXPLICIT plane0/plane1/axis (non-degenerate dnoms)
+    auto emitG = [&](const std::vector<V3>& poly0, const V3 tri[3], F4 plane0, F4 plane1,
+                     V3 axis, float maxSep, uint32_t initC)
+    {
+        const uint32_t nb = (uint32_t)poly0.size();
+        for (uint32_t i = 0; i < MAXV; ++i)
+            poly0Flat.push_back(i < nb ? F4{ poly0[i].x, poly0[i].y, poly0[i].z, 0.0f } : F4{ 0, 0, 0, 0 });
+        for (uint32_t i = 0; i < 3; ++i) triFlat.push_back({ tri[i].x, tri[i].y, tri[i].z, 0.0f });
+        PcIn e;
+        e.plane0 = plane0; e.plane1 = plane1;
+        e.axis = { axis.x, axis.y, axis.z, maxSep };
+        e.cfg = { nb, initC, 0, 0 };
+        in.push_back(e);
+        ref.push_back(polyClipRef(plane0, plane1, axis, maxSep, nb, initC, poly0, tri));
+        nbList.push_back(nb);
+    };
+
     // varied axis-aligned squares/rects vs triangles.  The triangle is anchored
     // NEAR the rectangle (its first vertex inside/around the rect centre) so most
     // configs partially overlap -> phase-3 edge-edge crossings, with some fully-
@@ -271,6 +288,63 @@ PXG_TEST(npConvexPolyClip_clip)
         const float zOff = float(int(rng() % 5) - 2) * 0.5f;
         const uint32_t initC = 28u + rng() % 5; // 28..32
         emit(rect, tri, zOff, 8.0f, initC);
+    }
+
+    // family H (non-degenerate projection): TILTED plane1 normal and/or axis so
+    // dnom0 (=plane1.n.axis) != dnom1 (=plane0.n.axis) and neither is 1 -> the
+    // separations are REAL divisions that vary per vertex (pinning a dnom0<->dnom1
+    // or plane0<->plane1 swap), and a SMALL maxSep makes some t>maxSep / sep>maxSep
+    // -> the PC_MAX gates and the addContacts sep>maxSep drop actually fire.  All
+    // arithmetic still has an identical counterpart on both sides, so bit-exact.
+    for (uint32_t iter = 0; iter < 300; ++iter)
+    {
+        std::vector<V3> rect = { { -3, -3, 0 }, { 3, -3, 0 }, { 3, 3, 0 }, { -3, 3, 0 } };
+        const float ox = float(int(rng() % 5) - 2), oy = float(int(rng() % 5) - 2);
+        const float leg = float(2 + rng() % 4);
+        V3 tri[3] = { { ox, oy, 0 }, { ox + leg, oy, 0 }, { ox, oy + leg, 0 } };
+        const F4 plane0 = { 0, 0, 1, 0 };
+        // tilted plane1 normal (Pythagorean-ish, not exactly unit -> a genuine
+        // non-1 dnom0); a few variants including an axis tilt for dnom1 != 1 too
+        const uint32_t v = rng() % 3;
+        F4 plane1; V3 axis;
+        if (v == 0) { plane1 = { 0.6f, 0.0f, 0.8f, 0.0f }; axis = { 0, 0, 1 }; }        // dnom0=0.8, dnom1=1
+        else if (v == 1) { plane1 = { 0.0f, 0.6f, 0.8f, -0.5f }; axis = { 0, 0, 1 }; }   // dnom0=0.8, dnom1=1
+        else { plane1 = { 0.0f, 0.0f, 1.0f, 0.0f }; axis = { 0.0f, 0.6f, 0.8f }; }        // dnom0=0.8, dnom1=0.8
+        const float maxSep = float(1 + rng() % 3) * 0.5f; // 0.5, 1.0, 1.5 -> some drops
+        const uint32_t initC = rng() % 3;
+        emitG(rect, tri, plane0, plane1, axis, maxSep, initC);
+    }
+
+    // family I (phase-2 poly0-vertex separations that genuinely vary per vertex
+    // AND straddle maxSep): a SMALL square poly0 fully contained in a LARGE
+    // coplanar triangle, so EVERY poly0 vertex classifies inside the triangle
+    // (out0 == 0 => flag2 = all four) and becomes a phase-2 contact carrying
+    // sep = s0 = -t0/dnom0.  With a TILTED plane1 each vertex's t0 = plane1.n.v0
+    // differs, so (a) s0 is a real division by dnom0 (NOT dnom1) -> a
+    // dnom0<->dnom1 swap changes a surviving contact, and (b) the far verts have
+    // t0 > maxSep so the PC_MAX gate legitimately drops them while the near verts
+    // survive -> widening/removing that gate changes the contact set.  The big
+    // triangle is wound CW so its interior is the out0==0 side.  Everything stays
+    // coplanar at z=0 with the same ops on both sides -> still bit-exact.
+    for (uint32_t iter = 0; iter < 240; ++iter)
+    {
+        // small square, verts at differing x so plane1 distances differ and the
+        // far edge reaches past maxSep
+        const float x0 = float(int(rng() % 3) - 1);        // -1..1
+        const float x1 = x0 + float(2 + rng() % 3);        // span 2..4
+        const float y0 = float(int(rng() % 3) - 1);        // -1..1
+        const float y1 = y0 + float(2 + rng() % 2);        // span 2..3
+        std::vector<V3> rect = { { x0, y0, 0 }, { x1, y0, 0 }, { x1, y1, 0 }, { x0, y1, 0 } };
+        // large CW triangle containing the square (interior => out0 == 0)
+        V3 tri[3] = { { -12, -12, 0 }, { 0, 24, 0 }, { 12, -12, 0 } };
+        const F4 plane0 = { 0, 0, 1, 0 };
+        F4 plane1; V3 axis = { 0, 0, 1 };
+        // tilted plane1 => dnom0 (=plane1.n.axis) in {0.8, 0.6} != dnom1 (=1)
+        if (rng() % 2 == 0) plane1 = { 0.6f, 0.0f, 0.8f, 0.0f };  // dnom0 = 0.8
+        else                plane1 = { 0.8f, 0.0f, 0.6f, 0.0f };  // dnom0 = 0.6
+        const float maxSep = float(1 + rng() % 2);  // 1 or 2 => far verts (t0>maxSep) dropped
+        const uint32_t initC = rng() % 2;
+        emitG(rect, tri, plane0, plane1, axis, maxSep, initC);
     }
 
     const uint32_t N = (uint32_t)in.size();
