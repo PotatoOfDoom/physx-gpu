@@ -211,7 +211,7 @@ void ctGjkWarm(uint3 dtid : SV_DispatchThreadID)
             }
 
             float supportVertexV[32];
-            if (candidates == 0u)
+            if (candidates != 0u)
             {
                 warmStarted = true;
                 const uint lowBit = candidates & (0u - candidates);
