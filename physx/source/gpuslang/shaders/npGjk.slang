@@ -341,6 +341,16 @@ void ctGjk(uint3 dtid : SV_DispatchThreadID)
     }
     float upperBound = PX_MAX_F32, lowerBound = -PX_MAX_F32;
     float cmA[32]; magW(closestPointV, cmA);
+    // Note (deliberate hardening of a CUDA UB): the CUDA declares `bool degenerate;`
+    // uninitialised (gjk.cuh:268) and only assigns it at :337, inside the loop and
+    // after the support-step convergence break.  On the first iteration, a distant
+    // pair whose first support already gives lowerBound>minSep breaks at :307-308
+    // BEFORE :337, so `output.degenerate = degenerate` (:375) reads an indeterminate
+    // register.  Since PhysX documents that `degenerate` can only accompany a result
+    // of CLOSE (schlockShared.h:202-203) — the caller ignores it for DISTANT/OVERLAP
+    // — we make it well-defined here as false.  This is the sole point where the port
+    // is intentionally not bit-identical to (nondeterministic) CUDA; it is unobservable
+    // to any correct caller.
     bool degenerate = false;
 
     int size = 0;
