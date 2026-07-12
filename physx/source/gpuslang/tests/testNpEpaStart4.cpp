@@ -67,7 +67,8 @@ static EsOut start4Ref(const float input[32])
     for (uint32_t L = 0; L < 16; ++L)
     {
         if ((L & 3u) < 3u) o.verts[L - L / 4u] = input[L];
-        else o.indices[L >> 2] = asU32(input[L]);
+        else o.indices[L >> 2] = asU32(input[L]) & 0xffffu; // CUDA S.indices is PxU16
+
     }
     float d[32]; dotW(input, input, d);
     float rs[32]; for (uint32_t L = 0; L < 32; ++L) rs[L] = 1.0f / std::sqrt(d[L]);

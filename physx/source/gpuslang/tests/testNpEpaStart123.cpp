@@ -85,7 +85,7 @@ static void newPoint(V3 dir, V3 ref, const std::vector<float>& VA, const std::ve
 static Es3Out start123Ref(const float input[32], const Es3Scalars& s, const std::vector<float>& VA, const std::vector<float>& VB, uint32_t vbase)
 {
     float verts[12]; uint32_t indices[4];
-    for (uint32_t L = 0; L < 16; ++L) { if ((L & 3u) < 3u) verts[L - L / 4u] = input[L]; else indices[L >> 2] = asU32(input[L]); }
+    for (uint32_t L = 0; L < 16; ++L) { if ((L & 3u) < 3u) verts[L - L / 4u] = input[L]; else indices[L >> 2] = asU32(input[L]) & 0xffffu; } // CUDA S.indices is PxU16
 
     V3 vertex0 = { verts[0], verts[1], verts[2] };
     V3 vertex1 = { verts[3], verts[4], verts[5] };

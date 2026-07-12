@@ -132,7 +132,7 @@ void ctEpaStart123(uint3 dtid : SV_DispatchThreadID)
     for (uint L = 0u; L < 16u; ++L)
     {
         if ((L & 3u) < 3u) verts[L - L / 4u] = input[L];
-        else indices[L >> 2] = asuint(input[L]);
+        else indices[L >> 2] = asuint(input[L]) & 0xffffu; // CUDA S.indices is PxU16 -> 16-bit truncation
     }
 
     float3 vertex0 = float3(verts[0], verts[1], verts[2]);

@@ -103,7 +103,7 @@ void ctEpaStart4(uint3 dtid : SV_DispatchThreadID)
     for (uint L = 0u; L < 16u; ++L)
     {
         if ((L & 3u) < 3u) o.verts[L - L / 4u] = input[L];
-        else o.indices[L >> 2] = asuint(input[L]);
+        else o.indices[L >> 2] = asuint(input[L]) & 0xffffu; // CUDA S.indices is PxU16 -> 16-bit truncation
     }
 
     // d = dot(input,input); m = 1/sqrt(d) read at the comp-0 lane of each normal
