@@ -406,7 +406,7 @@ static F4 qMul(const F4& a, const F4& b) // PxQuat::operator* (this = a)
     return F4{ a.w * b.x + b.w * a.x + a.y * b.z - a.z * b.y,
                a.w * b.y + b.w * a.y + a.z * b.x - a.x * b.z,
                a.w * b.z + b.w * a.z + a.x * b.y - a.y * b.x,
-               a.w * b.w - (a.x * b.x + a.y * b.y + a.z * b.z) };
+               a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z }; // sequential like PxQuat.h:390
 }
 static V3 v2s(V3 v, V3 sc, const F4& rot) // vertex2Shape, multiply transform
 {
@@ -537,6 +537,12 @@ PXG_TEST(npTriTriOverlap_overlaps)
     size_t mmO = 0, mmV = 0, mmR = 0;
     for (uint32_t i = 0; i < N; ++i)
     {
+        for (uint32_t j = 0; j < MAXV * 4; ++j)
+        {
+            if ((j & 3) == 3) continue;
+            if (asU32(refVA[i * MAXV * 4 + j]) != asU32(gva[i * MAXV * 4 + j]) ||
+                asU32(refVB[i * MAXV * 4 + j]) != asU32(gvb[i * MAXV * 4 + j])) { ++mmV; break; }
+        }
         if (skip[i]) continue;
         const bool refOv = ref[i].ret != GJK_DISTANT, gOv = g[i].ret != GJK_DISTANT;
         if (refOv != gOv) ++mmO;
@@ -544,12 +550,6 @@ PXG_TEST(npTriTriOverlap_overlaps)
         // the iteration is bit-reproducible: the bounds must match EXACTLY
         else if (asU32(g[i].lowerBound) != asU32(ref[i].lowerBound) ||
                  asU32(g[i].upperBound) != asU32(ref[i].upperBound)) ++mmR;
-        for (uint32_t j = 0; j < MAXV * 4; ++j)
-        {
-            if ((j & 3) == 3) continue;
-            if (!eqF(refVA[i * MAXV * 4 + j], gva[i * MAXV * 4 + j]) ||
-                !eqF(refVB[i * MAXV * 4 + j], gvb[i * MAXV * 4 + j])) { ++mmV; break; }
-        }
     }
     PXG_CHECK_MSG(mmO == 0, "triTriOverlap: %zu overlap-flag mismatches", mmO);
     PXG_CHECK_MSG(mmR == 0, "triTriOverlap: %zu gjk-result mismatches", mmR);

@@ -337,7 +337,7 @@ float4 quatMulQ(float4 a, float4 b) // PxQuat::operator* (this = a)
     return float4(a.w * b.x + b.w * a.x + a.y * b.z - a.z * b.y,
                   a.w * b.y + b.w * a.y + a.z * b.x - a.x * b.z,
                   a.w * b.z + b.w * a.z + a.x * b.y - a.y * b.x,
-                  a.w * b.w - (a.x * b.x + a.y * b.y + a.z * b.z));
+                  a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z); // sequential like PxQuat.h:390 -- NOT regrouped
 }
 float3 quatRotQ(float4 q, float3 v)
 {
