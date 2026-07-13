@@ -174,7 +174,7 @@ PXG_TEST(npCvxTriNpSetup_setup)
 
     std::vector<SetIn> in(N);
     std::vector<SetOut> ref(N);
-    size_t cFlip = 0, cBv32 = 0;
+    size_t cFlip = 0, cBv32 = 0, cBv32Deep = 0, cBigV = 0, cBigT = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -189,9 +189,17 @@ PXG_TEST(npCvxTriNpSetup_setup)
         s.cvxBlob[0] = F4{ rf(-1, 1), rf(-1, 1), rf(-1, 1), 0 };
         s.cvxBlob[1] = F4{ u2f(uint32_t(rng())), 0, 0, 0 };
 
-        const uint32_t numVerts = 6 + rng() % 7, numTris = 4 + rng() % 5;
-        const uint32_t nbPacked = (i % 4 == 0) ? 1u : 0u;
+        // sizes chosen to defeat cap/saturate defects (review 160): nbPacked
+        // reaches 2 (kills min(nbPacked,1)), numVerts reaches 16+ (kills &15),
+        // numTris reaches 9+ (kills min(...,8)); large-mesh combos alternate
+        // with the BV32 skip so everything still fits blob[192] (3072 bytes)
+        const uint32_t nbPacked = (i % 4 == 0) ? ((i % 8 == 0) ? 2u : 1u) : 0u;
+        const uint32_t numVerts = nbPacked == 2 ? 6 + rng() % 3 : 6 + rng() % 15;
+        const uint32_t numTris = nbPacked == 2 ? 4 + rng() % 3 : 4 + rng() % 17;
         if (nbPacked) ++cBv32;
+        if (nbPacked == 2) ++cBv32Deep;
+        if (numVerts > 15) ++cBigV;
+        if (numTris > 8) ++cBigT;
         word(s.blob, 0) = numVerts; word(s.blob, 1) = numTris;
         word(s.blob, 2) = uint32_t(rng()); word(s.blob, 3) = nbPacked;
         uint32_t off = 16 + BV32B * nbPacked;
@@ -248,7 +256,9 @@ PXG_TEST(npCvxTriNpSetup_setup)
         if (!ok) ++mm;
     }
     PXG_CHECK_MSG(mm == 0, "cvxTriNpSetup: %zu mismatches", mm);
-    PXG_CHECK_MSG(cFlip > N / 5 && cBv32 > N / 5, "cvxTriNpSetup: coverage thin (flip %zu bv32 %zu)", cFlip, cBv32);
+    PXG_CHECK_MSG(cFlip > N / 5 && cBv32 > N / 5 && cBv32Deep > N / 16 && cBigV > N / 8 && cBigT > N / 8,
+                  "cvxTriNpSetup: coverage thin (flip %zu bv32 %zu deep %zu bigV %zu bigT %zu)",
+                  cFlip, cBv32, cBv32Deep, cBigV, cBigT);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }
