@@ -329,7 +329,7 @@ PXG_TEST(npCvxTrimeshOut_finish)
         {
             s.contacts[c * 3 + 0] = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), rf(-0.5f, 0.5f) };
             s.contacts[c * 3 + 1] = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), u2f(rng() & 0x07FFFFFFu) };
-            const F4 q = randQuat(); // unit normal
+            const F4 q = randQuat(); // xyz of a unit quat: genuinely NON-unit, so getNormalized is load-bearing
             s.contacts[c * 3 + 2] = F4{ q.x, q.y, q.z, 0 };
         }
 
@@ -340,7 +340,7 @@ PXG_TEST(npCvxTrimeshOut_finish)
         if (v == 1) limP = initP + 64 * (nbMan ? rng() % nbMan : 0);          // patch overflow
         else if (v == 2 && total0) limC = initC + 16 * (rng() % total0);      // contact overflow
         else if (v == 3 && total0) limF = initF + 8 * (rng() % total0);       // force overflow
-        else if (v == 4) { limP = initP + 64 * nbMan; limC = initC + 16 * total0; limF = initF + 8 * total0; ++cExact; } // exact fits
+        else if (v == 4) { limP = initP + 64 * nbMan; limC = initC + 16 * total0; limF = initF + 8 * total0; if (total0) ++cExact; } // exact fits
         else if (v == 5) { limP = initP + 64 * (nbMan ? rng() % nbMan : 0); limC = initC; } // patch AND contact both tight: the chained else-if must report only the FIRST overflow
         s.cfg = U4{ limP, limC, limF, 0 };
         s.counters = U4{ initP, initC, initF, 0 };
