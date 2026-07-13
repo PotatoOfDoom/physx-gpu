@@ -433,6 +433,37 @@ PXG_TEST(npCvxCorrelate_correlate)
             s.tempC[jj] = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), rf(-0.5f, 0.5f) };
         if (i % 23 == 7) // force the zero-triangle early-out
             for (uint32_t jj = 0; jj < 64; ++jj) (&s.depth[jj / 4].x)[jj & 3] = FLTMAX;
+        else if ((i % 31 == 6 || i % 31 == 17) && !cached)
+        {
+            // exact depth ties pinning the deterministic tie-breaks.  All
+            // slots valid (identity purge, depths in [-1,1], nb 1..7), then
+            // the tied pair gets the strict global minimum and DIFFERENT
+            // cluster normals, so a wrong tie-break changes the first patch.
+            start = 0; count = 56;
+            s.hdr = U4{ count, 0, cmIndex, 0 };
+            for (uint32_t jj = 0; jj < 64; ++jj)
+            {
+                float& d = (&s.depth[jj / 4].x)[jj & 3];
+                if (d == FLTMAX) d = rf(-1.f, 1.f);
+                uint32_t& w = (&s.nicIdx[jj / 4].x)[jj & 3];
+                const uint32_t nb = getNb(w);
+                if (nb == 0 || nb > 7) w = (w & ~(15u << 27)) | ((1 + rng() % 7) << 27);
+            }
+            if (i % 31 == 6)
+            {
+                // slots 2 and 37: tie ACROSS lanes (2 vs 5) -- lowest lane wins the warp min
+                (&s.depth[0].x)[2] = -2.0f; s.depth[9].y = -2.0f;
+                s.nrm[2] = F4{ cn[0].x, cn[0].y, cn[0].z, 0 };
+                s.nrm[37] = F4{ cn[1].x, cn[1].y, cn[1].z, 0 };
+            }
+            else
+            {
+                // slots 3 and 35: tie WITHIN lane 3 -- first strided index wins the strict <
+                (&s.depth[0].x)[3] = -2.0f; s.depth[8].w = -2.0f;
+                s.nrm[3] = F4{ cn[1].x, cn[1].y, cn[1].z, 0 };
+                s.nrm[35] = F4{ cn[2].x, cn[2].y, cn[2].z, 0 };
+            }
+        }
 
         in[i] = s;
         bool marg = false;
