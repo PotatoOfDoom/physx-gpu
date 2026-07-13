@@ -27,7 +27,8 @@
 // Verification of npCvxPlaneRefresh.slang: the convex-plane manifold refresh
 // (reversed v, transformInv on the plane-space A points, x-axis working
 // normal, NO compaction), the rerun decision (invalidate_BoxConvex with
-// radiusA = radiusB and the ConvexPlane 0.99996 quat table), and the
+// radiusA = radiusB = |RAW blob extents| and the ConvexPlane 0.99996 quat
+// table), and the
 // no-rerun contact reload.  Reference transcribes the CUDA; counts/flags
 // exact, floats to tolerance, all boundaries margin-skipped.
 
@@ -114,7 +115,9 @@ static void refPlaneRefresh(const PrIn& s, PrOut& o, bool& marg)
         const V3 preP{ u2f(s.md0.x), u2f(s.md0.y), u2f(s.md0.z) };
         const F4 preQA{ u2f(s.md1.x), u2f(s.md1.y), u2f(s.md1.z), u2f(s.md1.w) };
         const F4 preQB{ u2f(s.md2.x), u2f(s.md2.y), u2f(s.md2.z), u2f(s.md2.w) };
-        const float radiusB = std::sqrt(ext.x * ext.x + ext.y * ext.y + ext.z * ext.z);
+        // RAW blob extents (cu L2946), not the scaled margin extents
+        const V3 re = v3(s.extents);
+        const float radiusB = std::sqrt(re.x * re.x + re.y * re.y + re.z * re.z);
         const float ratio = thC[nbContacts], thQ = qthCP[nbContacts];
         const float thP = minMargin * ratio;
         const V3 curRel = mul(bToAp, -1.f);

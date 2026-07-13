@@ -44,16 +44,16 @@
 //     invalidate_BoxConvex(-bToA.p, planeQ, convexQ, prevRelPos, prevQuatA,
 //     prevQuatB, minMargin, radiusB, radiusB, nbContacts,
 //     local_invalidateThresholdsConvex, local_invalidateQuatThresholdsConvexPlane)
-//     -- BOTH radii are |extents*scale| of the convex (radiusA = radiusB) and
-//     the quat table is the ConvexPlane one (five 0.99996 entries);
+//     -- BOTH radius arguments are |RAW blob extents| (radiusA = radiusB; the
+//     CUDA never scales extents1 here, unlike the stage1 path which
+//     pre-scales -- only calculatePCMConvexMargin scales internally) and the
+//     quat table is the ConvexPlane one (five 0.99996 entries);
 //   - when not rerunning, each lane < nbContacts reloads p =
 //     bToA.transform(pointB) and sep = dist (its refreshed separation), and
 //     mask = (1 << nbContacts) - 1 -- these feed the output stage.
 //
 // One pair per test (32 lanes serialized).  extents arrive as direct inputs
 // (blob reads are tranche 142).
-
-static const float FLT_MAXV = 3.4028235e38f;
 
 static const float thresholdsConvex[5] = { 0.5f, 0.125f, 0.25f, 0.375f, 0.375f };
 static const float quatThresholdsConvexPlane[5] = { 0.99996f, 0.99996f, 0.99996f, 0.99996f, 0.99996f };
@@ -180,7 +180,9 @@ void cvxPlaneRefresh(uint3 dtid : SV_DispatchThreadID)
         const float4 preQuatA = float4(asfloat(s.moreData1.x), asfloat(s.moreData1.y), asfloat(s.moreData1.z), asfloat(s.moreData1.w));
         const float4 preQuatB = float4(asfloat(s.moreData2.x), asfloat(s.moreData2.y), asfloat(s.moreData2.z), asfloat(s.moreData2.w));
 
-        const float radiusB = sqrt(ext.x * ext.x + ext.y * ext.y + ext.z * ext.z);
+        // RAW blob extents (cu L2946) -- NOT the scaled ones used for the margin
+        const float3 re = s.extents.xyz;
+        const float radiusB = sqrt(re.x * re.x + re.y * re.y + re.z * re.z);
 
         const float ratio = thresholdsConvex[nbContacts];
         const float thresholdQ = quatThresholdsConvexPlane[nbContacts];
