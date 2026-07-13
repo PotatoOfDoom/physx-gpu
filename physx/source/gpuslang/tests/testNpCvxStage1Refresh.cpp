@@ -294,7 +294,13 @@ PXG_TEST(npCvxStage1Refresh_refresh)
         for (int j = 0; j < 4; ++j)
             if (!eqF4(ref[i].mNp[j], g[i].mNp[j]) || !eqF4(ref[i].mA[j], g[i].mA[j]) || !eqF4(ref[i].mB[j], g[i].mB[j])) { ++mmM; break; }
         if (g[i].md3.x != ref[i].md3.x || g[i].md3.y != ref[i].md3.y || g[i].md3.z != ref[i].md3.z || g[i].md3.w != ref[i].md3.w) ++mmD;
-        else if (ref[i].result.x) { if (!eqU4f(ref[i].md0, g[i].md0) || g[i].md1.x != ref[i].md1.x || g[i].md2.x != ref[i].md2.x || g[i].md0.w != 0) ++mmD; }
+        else if (ref[i].result.x)
+        {
+            // rewritten quats are bit-copies of t0q/t1q: compare all 4 components exactly
+            if (!eqU4f(ref[i].md0, g[i].md0) || g[i].md0.w != 0 ||
+                g[i].md1.x != ref[i].md1.x || g[i].md1.y != ref[i].md1.y || g[i].md1.z != ref[i].md1.z || g[i].md1.w != ref[i].md1.w ||
+                g[i].md2.x != ref[i].md2.x || g[i].md2.y != ref[i].md2.y || g[i].md2.z != ref[i].md2.z || g[i].md2.w != ref[i].md2.w) ++mmD;
+        }
         else { if (g[i].md0.x != ref[i].md0.x || g[i].md1.x != ref[i].md1.x || g[i].md2.x != ref[i].md2.x) ++mmD; }
     }
     PXG_CHECK_MSG(mmR == 0, "stage1: %zu result mismatches", mmR);
