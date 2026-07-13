@@ -46,13 +46,13 @@ struct F4 { float x, y, z, w; };
 struct V3 { float x, y, z; };
 struct PrepIn
 {
-    F4 rawA[32], rawB[32];
+    F4 rawA[64], rawB[64];
     F4 scale0, rot0, scale1, rot1, aToBq, aToBp;
     uint32_t wsLane13, wsLane14, wsLane15, pad0;
 };
 struct PrepOut
 {
-    F4 vA[32], vB[32];
+    F4 vA[64], vB[64];
     F4 cachedV[4];
     uint32_t cachedIdx[4];
     uint32_t cachedSize, rePack13, rePack14, rePack15;
@@ -76,8 +76,8 @@ static void refPrep(const PrepIn& s, PrepOut& o)
     const uint32_t nbV1 = (uint32_t)s.scale1.w;
     const V3 aToBp = v3(s.aToBp);
 
-    V3 vA[32], vB[32];
-    for (uint32_t i = 0; i < 32; ++i) { vA[i] = V3{ 0, 0, 0 }; vB[i] = V3{ 0, 0, 0 }; }
+    V3 vA[64], vB[64];
+    for (uint32_t i = 0; i < 64; ++i) { vA[i] = V3{ 0, 0, 0 }; vB[i] = V3{ 0, 0, 0 }; }
     for (uint32_t i = 0; i < nbV0; ++i)
         vA[i] = add(qRot(s.aToBq, vertex2Shape(v3(s.rawA[i]), v3(s.scale0), s.rot0)), aToBp);
     for (uint32_t i = 0; i < nbV1; ++i)
@@ -106,7 +106,7 @@ static void refPrep(const PrepIn& s, PrepOut& o)
     V3 initialDir{ 1, 0, 0 };
     if (dot3(aToBp, aToBp) > 0.f) initialDir = aToBp;
 
-    for (uint32_t i = 0; i < 32; ++i)
+    for (uint32_t i = 0; i < 64; ++i)
     {
         o.vA[i] = F4{ vA[i].x, vA[i].y, vA[i].z, 0 };
         o.vB[i] = F4{ vB[i].x, vB[i].y, vB[i].z, 0 };
@@ -133,9 +133,9 @@ PXG_TEST(npCvxCollidePrep_prep)
     for (uint32_t i = 0; i < N; ++i)
     {
         PrepIn s{};
-        const uint32_t nbV0 = 4 + rng() % 29; // 4..32
-        const uint32_t nbV1 = 4 + rng() % 29;
-        for (uint32_t j = 0; j < 32; ++j)
+        const uint32_t nbV0 = 4 + rng() % 61; // 4..64 (CONVEX_MAX_VERTICES_POLYGONS)
+        const uint32_t nbV1 = 4 + rng() % 61;
+        for (uint32_t j = 0; j < 64; ++j)
         {
             s.rawA[j] = { rf(-2, 2), rf(-2, 2), rf(-2, 2), 0 };
             s.rawB[j] = { rf(-2, 2), rf(-2, 2), rf(-2, 2), 0 };

@@ -69,8 +69,8 @@ float3 vertex2Shape(float3 v, float3 scale, float4 rot)
 
 struct CollidePrepIn
 {
-    float4 rawA[32];  // raw hull vertices A (.xyz)
-    float4 rawB[32];  // raw hull vertices B (.xyz)
+    float4 rawA[64];  // raw hull vertices A (.xyz)
+    float4 rawB[64];  // raw hull vertices B (.xyz)
     float4 scale0;    // .xyz; .w = nbVertices0 (as float)
     float4 rot0;
     float4 scale1;    // .xyz; .w = nbVertices1 (as float)
@@ -85,8 +85,8 @@ struct CollidePrepIn
 
 struct CollidePrepOut
 {
-    float4 vA[32];       // prepared vertices A (.xyz, .w=0)
-    float4 vB[32];       // prepared vertices B (.xyz, .w=0)
+    float4 vA[64];       // prepared vertices A (.xyz, .w=0)
+    float4 vB[64];       // prepared vertices B (.xyz, .w=0)
     float4 cachedV[4];   // seeded cachedData.vertices[j].v (.xyz), .w = 0
     uint cachedIdx[4];   // seeded cachedData.vertices[j].indices
     uint cachedSize;     // seeded cachedData.size
@@ -117,8 +117,8 @@ void cvxCollidePrep(uint3 dtid : SV_DispatchThreadID)
     const float3 aToBp = s.aToBp.xyz;
 
     // 1. prepareVertices (A overload applies aToB.transform = q.rotate(v)+p)
-    float3 vA[32], vB[32];
-    for (uint i = 0u; i < 32u; ++i) { vA[i] = float3(0, 0, 0); vB[i] = float3(0, 0, 0); }
+    float3 vA[64], vB[64];
+    for (uint i = 0u; i < 64u; ++i) { vA[i] = float3(0, 0, 0); vB[i] = float3(0, 0, 0); }
     for (uint i = 0u; i < nbV0; ++i)
         vA[i] = quatRotate(s.aToBq, vertex2Shape(s.rawA[i].xyz, s.scale0.xyz, s.rot0)) + aToBp;
     for (uint i = 0u; i < nbV1; ++i)
@@ -158,7 +158,7 @@ void cvxCollidePrep(uint3 dtid : SV_DispatchThreadID)
         initialDir = aToBp;
 
     CollidePrepOut r;
-    for (uint i = 0u; i < 32u; ++i) { r.vA[i] = float4(vA[i], 0.0f); r.vB[i] = float4(vB[i], 0.0f); }
+    for (uint i = 0u; i < 64u; ++i) { r.vA[i] = float4(vA[i], 0.0f); r.vB[i] = float4(vB[i], 0.0f); }
     for (uint j = 0u; j < 4u; ++j) { r.cachedV[j] = float4(cachedV[j], 0.0f); r.cachedIdx[j] = cachedIdx[j]; }
     r.cachedSize = cachedSize;
     r.rePack13 = cachedSize;
