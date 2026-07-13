@@ -299,7 +299,8 @@ static void refCorrelate(const CorrIn& s, CorrOut& o, bool& marg)
                     for (int L = 0; L < 32; ++L)
                     {
                         const float dp = dot3(nrmL[L], bestNormal);
-                        if (std::fabs(dp - EPS_ACC) < TIE) marg = true;
+                        const float de = std::fabs(dp - EPS_ACC);
+                        if (de != 0.f && de < TIE) marg = true; // exact equality is deterministic (rejected by strict >)
                         const bool accept = dp > EPS_ACC;
                         if (!accept) nbCts[L] = 0;
                         else acceptMask |= 1u << L;
@@ -462,6 +463,47 @@ PXG_TEST(npCvxCorrelate_correlate)
                 (&s.depth[0].x)[3] = -2.0f; s.depth[8].w = -2.0f;
                 s.nrm[3] = F4{ cn[1].x, cn[1].y, cn[1].z, 0 };
                 s.nrm[35] = F4{ cn[2].x, cn[2].y, cn[2].z, 0 };
+            }
+        }
+        else if (i % 41 == 13 && !cached)
+        {
+            // exact-EPS acceptance boundary: bestNormal is bitwise (1,0,0), so
+            // slot 5's dot is exactly its normal.x == PATCH_ACCEPTANCE_EPS.
+            // Strict > must REJECT it (dd == 0 is not a near-tie: deterministic
+            // on both sides).
+            start = 0; count = 24;
+            s.hdr = U4{ count, 0, cmIndex, 0 };
+            const V3 ex{ 1.f, 0.f, 0.f };
+            for (uint32_t jj = 0; jj < 64; ++jj)
+            {
+                float& d = (&s.depth[jj / 4].x)[jj & 3];
+                if (d == FLTMAX) d = rf(-1.f, 1.f);
+                uint32_t& w = (&s.nicIdx[jj / 4].x)[jj & 3];
+                const uint32_t nb = getNb(w);
+                if (nb == 0 || nb > 7) w = (w & ~(15u << 27)) | ((1 + rng() % 7) << 27);
+                if (rng() % 2) s.nrm[jj] = F4{ ex.x, ex.y, ex.z, 0 };
+            }
+            (&s.depth[0].x)[2] = -2.0f;                         // global min -> bestNormal = (1,0,0)
+            s.nrm[2] = F4{ ex.x, ex.y, ex.z, 0 };
+            s.nrm[5] = F4{ EPS_ACC, 0.08715574f, 0.f, 0 };      // dot == EPS_ACC bitwise
+            s.depth[1].y = -1.0f;                                // slot 5 stays off the min
+        }
+        else if (i % 41 == 27 && !cached)
+        {
+            // exactly-6-held state with duplicate contact points: two 3-contact
+            // triangles sharing one normal AND one contact pool range.  No
+            // reduce may run at exactly 6 (strict >); a reduce here would
+            // collapse the duplicate anchors' clusters and drop contacts.
+            start = 0; count = 2;
+            s.hdr = U4{ count, 0, cmIndex, 0 };
+            (&s.depth[0].x)[0] = -0.5f; (&s.depth[0].x)[1] = -0.6f;
+            s.nrm[0] = F4{ cn[0].x, cn[0].y, cn[0].z, 0 };
+            s.nrm[1] = F4{ cn[0].x, cn[0].y, cn[0].z, 0 };
+            for (int jj = 0; jj < 2; ++jj)
+            {
+                uint32_t& w = (&s.nicIdx[0].x)[jj];
+                w = (w & ~(15u << 27) & 0x87FFFFFFu) | (3u << 27);
+                (&s.cbuf[0].x)[jj] = 0;                          // identical pool base
             }
         }
 
