@@ -97,6 +97,31 @@ static void runOne(uint32_t numPairs, uint32_t seed, float density)
     const auto gCompact = downloadBuffer<uint32_t>(dev, bCompact, n);
     const auto gPtrs = downloadBuffer<uint32_t>(dev, bPtrs, n);
     const auto gLT = downloadBuffer<uint32_t>(dev, bLT, 2);
+    const auto gRun = downloadBuffer<uint32_t>(dev, bRunSum, n);
+    const auto gBlk = downloadBuffer<uint32_t>(dev, bBlocks, NUM_BLOCKS);
+
+    // intermediate buffers must match CUDA's 512-thread-block chunking exactly:
+    // tempRunsum[i] = exclusive prefix within the owning block's chunk,
+    // blockAccumulation[b] = that chunk's total
+    {
+        const uint32_t BLOCK = 512;
+        const uint32_t totalBlockRequired = (n + BLOCK - 1) / BLOCK;
+        const uint32_t iters = (totalBlockRequired + NUM_BLOCKS - 1) / NUM_BLOCKS;
+        const uint32_t chunk = BLOCK * iters;
+        size_t mmR = 0, mmB = 0;
+        for (uint32_t b = 0; b < NUM_BLOCKS; ++b)
+        {
+            uint32_t acc = 0;
+            for (uint32_t idx = b * chunk; idx < (b + 1) * chunk && idx < n; ++idx)
+            {
+                if (gRun[idx] != acc) ++mmR;
+                acc += flags[idx];
+            }
+            if (gBlk[b] != acc) ++mmB;
+        }
+        PXG_CHECK_MSG(mmR == 0, "lostFound(%u): %zu tempRunsum mismatches", numPairs, mmR);
+        PXG_CHECK_MSG(mmB == 0, "lostFound(%u): %zu blockAccumulation mismatches", numPairs, mmB);
+    }
 
     size_t mmC = 0, mmP = 0;
     for (uint32_t i = 0; i < n; ++i)
@@ -117,9 +142,9 @@ PXG_TEST(npCvxLostFound_compact)
 {
     runOne(1, 150001, 0.5f);       // minimal
     runOne(5, 150002, 0.8f);       // tiny, dense
-    runOne(128, 150003, 0.4f);     // exact block fraction
+    runOne(256, 150003, 0.4f);     // n = 512: exactly one block chunk
     runOne(300, 150004, 0.3f);     // non-multiple
-    runOne(4096, 150005, 0.5f);    // exactly one iteration per block
+    runOne(8192, 150005, 0.5f);    // n = 16384 = 32*512: exactly one iteration per block
     runOne(6000, 150006, 0.35f);   // multi-iteration, non-multiple
     runOne(9000, 150007, 0.02f);   // sparse flags
     runOne(7777, 150008, 0.97f);   // nearly all flagged

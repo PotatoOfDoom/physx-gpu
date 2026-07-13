@@ -48,10 +48,12 @@
 // (nbPatches | prevPatches<<8 | statusFlag<<16, unused byte 0).  Contact-manager
 // pointers are modelled as opaque 32-bit handles (the kernel only copies them).
 
-static const uint BLOCK = 256;
+// launch config: PxgNarrowPhaseBlockDims::COMPACT_LOST_FOUND_PAIRS = 512,
+// PxgNarrowPhaseGridDims::COMPACT_LOST_FOUND_PAIRS = 32 (PxgNpKernelIndices.h)
+static const uint BLOCK = 512;
 static const uint NUM_BLOCKS = 32;
 static const uint WARP = 32;
-static const uint WARPS_PER_BLOCK = BLOCK / WARP; // 8
+static const uint WARPS_PER_BLOCK = BLOCK / WARP; // 16
 
 struct LostFoundParams
 {
@@ -111,7 +113,7 @@ void scanWarpTotalsPairs(uint tid)
 // Stage 1: per-block exclusive scan of the flags, block totals out
 // ---------------------------------------------------------------------------
 [shader("compute")]
-[numthreads(256, 1, 1)]
+[numthreads(512, 1, 1)]
 void lostFoundStage1(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     const uint tid = gtid.x;
@@ -162,7 +164,7 @@ void lostFoundStage1(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 // Stage 2: cross-block prefix + compact + counters
 // ---------------------------------------------------------------------------
 [shader("compute")]
-[numthreads(256, 1, 1)]
+[numthreads(512, 1, 1)]
 void lostFoundStage2(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     const uint tid = gtid.x;
