@@ -241,8 +241,19 @@ PXG_TEST(npCvxStage1Refresh_refresh)
         {
             const float eps = rf(0, 0.02f);
             s.md0 = U4{ f2u(curRel.x + rf(-eps, eps)), f2u(curRel.y + rf(-eps, eps)), f2u(curRel.z + rf(-eps, eps)), 0 };
-            s.md1 = U4{ f2u(s.t0q.x), f2u(s.t0q.y), f2u(s.t0q.z), f2u(s.t0q.w) };
-            s.md2 = U4{ f2u(s.t1q.x), f2u(s.t1q.y), f2u(s.t1q.z), f2u(s.t1q.w) };
+            F4 pqa = s.t0q, pqb = s.t1q;
+            // small-angle perturbation of EXACTLY ONE previous quat: sweeps the
+            // quat-threshold and travel-distance bands (with the sphere path's
+            // radiusA = 0, only one side of each || can fire)
+            if (i % 8 == 4)
+            {
+                const V3 ax = unit(V3{ rf(-1, 1), rf(-1, 1), rf(-1, 1) });
+                const float a = rf(0.004f, 0.07f); // ~0.2..4 degrees
+                const F4 rot{ ax.x * std::sin(a * .5f), ax.y * std::sin(a * .5f), ax.z * std::sin(a * .5f), std::cos(a * .5f) };
+                if (i % 16 == 4) pqa = qMul(rot, pqa); else pqb = qMul(rot, pqb);
+            }
+            s.md1 = U4{ f2u(pqa.x), f2u(pqa.y), f2u(pqa.z), f2u(pqa.w) };
+            s.md2 = U4{ f2u(pqb.x), f2u(pqb.y), f2u(pqb.z), f2u(pqb.w) };
         }
         else
         {
