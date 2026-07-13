@@ -119,7 +119,7 @@ static uint32_t reduce4(const V3 pt[32], const float sep[32], const V3& n, uint3
     return mask;
 }
 
-static void refPlaneGen(const GenIn& s, GenOut& o, bool& marg)
+static void refPlaneGen(const GenIn& s, GenOut& o, bool& marg, bool& sparseRan)
 {
     const uint32_t nbP = (uint32_t)s.scale.w;
     const uint32_t nbE = (uint32_t)s.n.w;
@@ -214,6 +214,7 @@ static void refPlaneGen(const GenIn& s, GenOut& o, bool& marg)
         {
             if (nbC > 16)
             {
+                sparseRan = true;
                 flags = reduce4(pips, sd, localNormal, flags, marg);
                 nbC = popc(flags);
             }
@@ -239,7 +240,10 @@ static void refPlaneGen(const GenIn& s, GenOut& o, bool& marg)
 
     if (nbContacts)
     {
-        mask = (1u << total) - 1;
+        // PTX shl clamps shifts >= 32, so CUDA computes (1 << 32) - 1 == 0xFFFFFFFF
+        // at total == 32 (edge path duplicating a 16-verts-in-contact face);
+        // C++ << is UB there, so the clamp is explicit
+        mask = (total >= 32) ? 0xFFFFFFFFu : ((1u << total) - 1);
         for (uint32_t L = 0; L < 32 && L < nbContacts; ++L) { pL[L] = shPos[L]; sepL[L] = shSep[L]; }
         if (nbContacts > 4)
         {
@@ -284,7 +288,7 @@ PXG_TEST(npCvxPlaneGen_gen)
     std::vector<GenIn> in(N);
     std::vector<uint8_t> skip(N, 0);
     std::vector<GenOut> ref(N);
-    size_t nSkip = 0, cEdgePath = 0, cZero = 0, cRed = 0, cBig = 0;
+    size_t nSkip = 0, cEdgePath = 0, cZero = 0, cRed = 0, cBig = 0, cSparse = 0, c32 = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -340,16 +344,58 @@ PXG_TEST(npCvxPlaneGen_gen)
         s.bToAp = F4{ rf(-3.f, 2.f), rf(-1, 1), rf(-1, 1), rf(0.05f, 0.5f) };
         s.planeTq = randQuat();
         s.convexTq = randQuat();
+        if (i % 53 == 7)
+        {
+            // rigged totalContacts == 32 fixture: edge path selected, and the
+            // loop-invariant polyDesc read re-emits face 0 (16 verts, all in
+            // contact) on both iterations -> 16 + 16 = 32.  Pins the PTX shl
+            // clamp semantics of mask = (1 << 32) - 1 == 0xFFFFFFFF.
+            GenIn r{};
+            for (uint32_t v = 0; v < 64; ++v)
+                r.verts[v] = F4{ rf(-1, 1), rf(-1, 1), rf(-1, 1), 0 };
+            r.polyDesc[0] = (0u << 16) | (16u << 8);            // face 0: 16 verts at byte 0
+            for (uint32_t p2 = 1; p2 < 4; ++p2)
+                r.polyDesc[p2] = ((16 + 4 * (p2 - 1)) << 16) | (4u << 8);
+            for (uint32_t b = 0; b < 28; ++b)
+            {
+                uint32_t* w = &(&r.vtxData[b / 16].x)[(b / 4) & 3];
+                *w |= (rng() % 64) << (8 * (b & 3));
+            }
+            const V3 pnA = unit(V3{ 1.f, 0.2f, 0.f });          // face dot selN = 0.9806
+            const V3 pnB = unit(V3{ 1.f, -0.4f, 0.f });         // face dot selN = 0.9285
+            r.planes[0] = F4{ pnA.x, pnA.y, pnA.z, rf(-2, 2) };
+            r.planes[1] = F4{ pnB.x, pnB.y, pnB.z, rf(-2, 2) };
+            for (uint32_t p2 = 2; p2 < 4; ++p2)
+            {
+                const V3 pn = unit(V3{ -1.f, (p2 == 2) ? 0.3f : -0.3f, 0.f });
+                r.planes[p2] = F4{ pn.x, pn.y, pn.z, rf(-2, 2) };
+            }
+            for (uint32_t b = 1; b < 80; b += 2)                // 40 edges, all (f0=0, f1=1)
+            {
+                uint32_t* w = &(&r.fbe[b / 16].x)[(b / 4) & 3];
+                *w |= 1u << (8 * (b & 3));
+            }
+            r.scale = F4{ 1, 1, 1, 4 };                         // nbP = 4, identity scale
+            r.rot = F4{ 0, 0, 0, 1 };
+            r.n = F4{ -1, 0, 0, 40 };                           // selN = (1,0,0); nbE = 40 (multi-round lanes)
+            r.bToAq = F4{ 0, 0, 0, 1 };
+            r.bToAp = F4{ -2.f, 0, 0, 0.25f };                  // all 16 verts at x-2 < contactDist
+            r.planeTq = randQuat();
+            r.convexTq = randQuat();
+            s = r;
+        }
         in[i] = s;
 
-        bool marg = false;
-        refPlaneGen(s, ref[i], marg);
+        bool marg = false, sparseRan = false;
+        refPlaneGen(s, ref[i], marg, sparseRan);
         skip[i] = marg ? 1u : 0u;
         if (marg) { ++nSkip; continue; }
         if (ref[i].aux.y != 0xFFFFFFFFu) ++cEdgePath;
         if (ref[i].result.x == 0) ++cZero;
         if (ref[i].result.z > 4) ++cRed;
         if (ref[i].result.z > 16) ++cBig;
+        if (sparseRan) ++cSparse;
+        if (ref[i].result.z == 32) ++c32;
     }
 
     PxgSlangComputeDevice* dev = testDevice();
@@ -378,8 +424,11 @@ PXG_TEST(npCvxPlaneGen_gen)
         {
             // moreData quat words are bit-copies; md0 floats compared as floats
             F4 rp, gp; std::memcpy(&rp, &ref[i].md0, 16); std::memcpy(&gp, &g[i].md0, 16);
-            if (!eqF4(rp, gp) || g[i].md1.x != ref[i].md1.x || g[i].md1.w != ref[i].md1.w ||
-                g[i].md2.x != ref[i].md2.x || g[i].md2.w != ref[i].md2.w) ++mmD;
+            if (!eqF4(rp, gp) ||
+                g[i].md1.x != ref[i].md1.x || g[i].md1.y != ref[i].md1.y ||
+                g[i].md1.z != ref[i].md1.z || g[i].md1.w != ref[i].md1.w ||
+                g[i].md2.x != ref[i].md2.x || g[i].md2.y != ref[i].md2.y ||
+                g[i].md2.z != ref[i].md2.z || g[i].md2.w != ref[i].md2.w) ++mmD;
         }
         else if (g[i].md0.x != 0 || g[i].md1.x != 0 || g[i].md2.x != 0) ++mmD;
         for (int L = 0; L < 32; ++L) if (!eqF4(ref[i].p[L], g[i].p[L])) { ++mmP; break; }
@@ -389,8 +438,10 @@ PXG_TEST(npCvxPlaneGen_gen)
     PXG_CHECK_MSG(mmD == 0, "planeGen: %zu moreData mismatches", mmD);
     PXG_CHECK_MSG(mmP == 0, "planeGen: %zu reload mismatches", mmP);
     PXG_CHECK_MSG(nSkip < N / 2, "planeGen: too many marginal (%zu/%u)", nSkip, N);
-    PXG_CHECK_MSG(cEdgePath > N / 30 && cZero > N / 30 && cRed > N / 20 && cBig > N / 100,
-                  "planeGen: coverage thin (edge %zu zero %zu red %zu big %zu)", cEdgePath, cZero, cRed, cBig);
+    PXG_CHECK_MSG(cEdgePath > N / 30 && cZero > N / 30 && cRed > N / 20 && cBig > N / 100 &&
+                  cSparse > N / 500 && c32 > N / 200,
+                  "planeGen: coverage thin (edge %zu zero %zu red %zu big %zu sparse %zu tot32 %zu)",
+                  cEdgePath, cZero, cRed, cBig, cSparse, c32);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }

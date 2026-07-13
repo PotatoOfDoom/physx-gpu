@@ -308,7 +308,10 @@ void cvxPlaneGen(uint3 dtid : SV_DispatchThreadID)
 
     if (nbContacts != 0u)
     {
-        mask = (1u << totalContacts) - 1u;
+        // PTX shl clamps shifts >= 32 (1 << 32 == 0), so CUDA gets 0xFFFFFFFF at
+        // totalContacts == 32 (reachable: edge path duplicates the face, 16 + 16);
+        // SPIR-V wraps the shift mod 32, so the clamp must be explicit.
+        mask = (totalContacts >= 32u) ? 0xFFFFFFFFu : ((1u << totalContacts) - 1u);
         for (uint L = 0u; L < 32u; ++L)
         {
             if (L < nbContacts) { pL[L] = shPos[L]; sepL[L] = shSep[L]; }
