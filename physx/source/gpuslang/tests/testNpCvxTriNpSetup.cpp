@@ -32,7 +32,7 @@
 // pair's adjacency row and faceRemap entry, the three triangle vertices with
 // the negative-determinant writeIndex permutation (tid ^ 3 for threads 1/2),
 // the local normal over the permuted winding, and the pair offsets.
-// Transform floats to tight tolerance, everything integer exact.
+// ALL outputs compare bitwise (identical op sequences, proven bit-identical).
 
 #include "pxgTestFramework.h"
 
@@ -160,7 +160,9 @@ static void refSetup(const SetIn& s, SetOut& o)
     o.offsets = U4{ s.pairInfo.y + s.pairInfo.w, s.pairInfo.z + s.pairInfo.w, 0, 0 };
 }
 
-static bool eqF(float a, float b) { return almostEqual(a, b, 2e-4f, 2e-5f); }
+// bitwise compares throughout: both sides execute identical op sequences and
+// llvmpipe/gcc have proven bit-identical on this framework (tranche 159's GJK)
+static bool eqF(float a, float b) { return f2u(a) == f2u(b); }
 static bool eq4(const F4& a, const F4& b) { return eqF(a.x, b.x) && eqF(a.y, b.y) && eqF(a.z, b.z) && eqF(a.w, b.w); }
 
 PXG_TEST(npCvxTriNpSetup_setup)
