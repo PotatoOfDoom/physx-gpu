@@ -183,7 +183,7 @@ PXG_TEST(npCvxTriNpSetup_setup)
         s.tq = randQuat(); s.tp = F4{ rf(-5, 5), rf(-5, 5), rf(-5, 5), 0 };
         s.cScaleS = F4{ rf(0.5f, 2), rf(0.5f, 2), rf(0.5f, 2), 0 }; s.cScaleR = randQuat();
         const float sx = (rng() % 3 == 0) ? -rf(0.5f, 2) : rf(0.5f, 2);
-        s.tScaleS = F4{ sx, rf(0.5f, 2), (rng() % 5 == 0) ? -rf(0.5f, 2) : rf(0.5f, 2), 0 };
+        s.tScaleS = F4{ sx, (rng() % 4 == 0) ? -rf(0.5f, 2) : rf(0.5f, 2), (rng() % 5 == 0) ? -rf(0.5f, 2) : rf(0.5f, 2), 0 }; // all three axes can go negative: the determinant must use every component
         s.tScaleR = randQuat();
         s.dists = F4{ rf(0.01f, 0.5f), rf(0.01f, 0.5f), 0, 0 };
         s.cvxBlob[0] = F4{ rf(-1, 1), rf(-1, 1), rf(-1, 1), 0 };
