@@ -541,6 +541,9 @@ PXG_TEST(npTriTriOverlap_overlaps)
         const bool refOv = ref[i].ret != GJK_DISTANT, gOv = g[i].ret != GJK_DISTANT;
         if (refOv != gOv) ++mmO;
         if (g[i].ret != ref[i].ret || g[i].degenerate != ref[i].degenerate) ++mmR;
+        // the iteration is bit-reproducible: the bounds must match EXACTLY
+        else if (asU32(g[i].lowerBound) != asU32(ref[i].lowerBound) ||
+                 asU32(g[i].upperBound) != asU32(ref[i].upperBound)) ++mmR;
         for (uint32_t j = 0; j < MAXV * 4; ++j)
         {
             if ((j & 3) == 3) continue;
