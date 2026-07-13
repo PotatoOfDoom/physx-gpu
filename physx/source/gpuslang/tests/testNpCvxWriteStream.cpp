@@ -236,6 +236,10 @@ PXG_TEST(npCvxWriteStream_write)
                 p.tp[k] = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), rf(0.05f, 0.4f) }; // .w = contactDistance
             }
             uint32_t nb = rng() % 5;
+            // cancellation fixture: exactly two opposing normals sum to zero,
+            // driving the magSq < 1e-5 fallback (avgNorm = lane 0's own normal)
+            const bool cancelG = (i % 17 == 0) && (g == int((i / 17) % 8));
+            if (cancelG) nb = 2;
             uint32_t raw = nb;
             if (i % 7 == 0 && g == int(i % 8)) { raw |= 0x80000000u; ++cInval; }
             const bool validG = !(i % 11 == 0 && g == int((i / 11) % 8));
@@ -247,6 +251,8 @@ PXG_TEST(npCvxWriteStream_write)
                 p.normPen[j] = F4{ n.x, n.y, n.z, rf(-0.6f, 0.9f) };
                 p.pointB[j] = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), 0 };
             }
+            if (cancelG)
+                p.normPen[1] = F4{ -p.normPen[0].x, -p.normPen[0].y, -p.normPen[0].z, p.normPen[1].w };
             if (p.meta.z < p.meta.x) ++cFlip;
         }
         const bool insertAvg = (i % 2 == 0);
