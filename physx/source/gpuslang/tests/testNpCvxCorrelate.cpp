@@ -192,10 +192,10 @@ static uint32_t binarySearch32(const uint32_t data[32], uint32_t value)
     return left != 0 ? left - 1 : 0;
 }
 
-static void refCorrelate(const CorrIn& s, CorrOut& o, bool& marg)
+static void refCorrelate(const CorrIn& s, CorrOut& o, bool& marg, bool& reduceRan)
 {
     for (int j = 0; j < 72; ++j) o.contacts[j] = F4{ 0, 0, 0, 0 };
-    o.nbC = U4{ 0, 0, 0, 0 };
+    o.nbC = U4{ UNTOUCHED, UNTOUCHED, UNTOUCHED, UNTOUCHED }; // stale-buffer sentinel: the per-patch write must show
     o.relQ = F4{ 0, 0, 0, 0 }; o.relP = F4{ 0, 0, 0, 0 };
     o.misc = U4{ UNTOUCHED, UNTOUCHED, 0, 0 };
 
@@ -333,7 +333,10 @@ static void refCorrelate(const CorrIn& s, CorrOut& o, bool& marg)
                         curMask = nm;
                         c += popc(readMask);
                         if (popc(curMask) > 6)
+                        {
+                            reduceRan = true;
                             curMask = contactReduce6(pA, sepL, bestNormal, curMask, clusterBias, marg);
+                        }
                         for (int L = 0; L < 32; ++L) hasC[L] = (curMask & (1u << L)) != 0;
                     }
 
@@ -422,7 +425,7 @@ PXG_TEST(npCvxCorrelate_correlate)
             s.nrm[jj] = F4{ n.x, n.y, n.z, 0 };
 
             uint32_t nb = rng() % 8;                       // 0..7
-            if (i % 17 == 4 && (jj & 7) == 3) { nb = 8 + rng() % 8; ++cQuirk8; } // 4-bit purge vs 3-bit read quirk
+            if (i % 17 == 4 && (jj & 7) == 3) nb = 8 + rng() % 8; // 4-bit purge vs 3-bit read quirk
             const uint32_t tri = rng() & 0x07FFFFFFu;
             const uint32_t defBit = (rng() & 1u) << 31;
             (&s.nicIdx[jj / 4].x)[jj & 3] = defBit | (nb << 27) | tri;
@@ -508,14 +511,19 @@ PXG_TEST(npCvxCorrelate_correlate)
         }
 
         in[i] = s;
-        bool marg = false;
-        refCorrelate(s, ref[i], marg);
+        bool marg = false, reduceRan = false;
+        refCorrelate(s, ref[i], marg, reduceRan);
         skip[i] = marg ? 1 : 0;
         if (marg) { ++nSkip; continue; }
         if (cached) ++cCached;
         else if (ref[i].misc.z == 0) ++cZeroTri;
         if (cmIndex == 1) ++cCm1;
         if (ref[i].misc.z > 32) ++cTwoBlocks;
+        if (reduceRan) ++cReduce;
+        // exercised 4-bit/3-bit quirk: a purged slot whose stored count bits
+        // exceed 7 is never accepted/cleared, so it survives in the final state
+        for (int jj = 0; jj < 64; ++jj)
+            if ((u32At(ref[i].tempOut, (uint32_t)jj) & 15u) > 7u) { ++cQuirk8; break; }
         const uint32_t nbMan = (cmIndex == 0) ? ref[i].misc.x : ref[i].misc.y;
         if (!cached && ref[i].misc.z > 0 && nbMan != UNTOUCHED)
         {
@@ -523,7 +531,6 @@ PXG_TEST(npCvxCorrelate_correlate)
             for (uint32_t p = 0; p < nbMan && p < 4; ++p)
             {
                 const uint32_t nb = (&ref[i].nbC.x)[p];
-                if (nb == 6) ++cReduce;
                 if (nb == 0) ++cEmptyPatch;
             }
         }
@@ -580,7 +587,7 @@ PXG_TEST(npCvxCorrelate_correlate)
     PXG_CHECK_MSG(mmD == 0, "correlate: %zu depth mismatches", mmD);
     PXG_CHECK_MSG(nSkip < N / 2, "correlate: too many marginal (%zu/%u)", nSkip, N);
     PXG_CHECK_MSG(cCached > N / 50 && cZeroTri > N / 50 && cCm1 > N / 5 && cReduce > N / 60 &&
-                  cMultiPatch > N / 10 && cQuirk8 > 0 && cTwoBlocks > N / 30 && cEmptyPatch > 0,
+                  cMultiPatch > N / 10 && cQuirk8 > N / 150 && cTwoBlocks > N / 30 && cEmptyPatch > 0,
                   "correlate: coverage thin (cached %zu zeroTri %zu cm1 %zu reduce %zu multi %zu quirk8 %zu blocks2 %zu emptyP %zu)",
                   cCached, cZeroTri, cCm1, cReduce, cMultiPatch, cQuirk8, cTwoBlocks, cEmptyPatch);
 

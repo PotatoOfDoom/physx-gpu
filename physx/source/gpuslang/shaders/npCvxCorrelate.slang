@@ -233,7 +233,9 @@ void cvxCorrelate(uint3 dtid : SV_DispatchThreadID)
 
     CorrOut r;
     for (uint j = 0; j < 72; ++j) r.contacts[j] = float4(0, 0, 0, 0);
-    r.nbC = uint4(0, 0, 0, 0);
+    // sentinel-init: CUDA's mNbContacts buffer holds stale data, so the
+    // unconditional per-patch write (0 for empty patches) must be observable
+    r.nbC = uint4(UNTOUCHED, UNTOUCHED, UNTOUCHED, UNTOUCHED);
     r.relQ = float4(0, 0, 0, 0); r.relP = float4(0, 0, 0, 0);
     r.misc = uint4(UNTOUCHED, UNTOUCHED, 0, 0);
 
