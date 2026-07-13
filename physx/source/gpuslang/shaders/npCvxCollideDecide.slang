@@ -53,8 +53,11 @@ static const uint GJK_OVERLAP = 2u; // GjkResult::eOVERLAP
 
 struct CollideDecideIn
 {
-    float4 closestPointDir; // gjkOutput.closestPointDir (.xyz)
-    float4 direction;       // gjkOutput.direction (.xyz)
+    float4 closestPointDir; // gjkOutput.closestPointDir (.xyz) after the FIRST GJK
+    float4 direction;       // gjkOutput.direction (.xyz) after the FIRST GJK (anomaly gate)
+    float4 directionFinal;  // gjkOutput.direction (.xyz) after the final GJK/EPA -- EPA
+                            // overwrites output.direction, so the sphere store reads a
+                            // potentially different vector than the anomaly gate
     float4 witnessA;        // gjkOutput.closestPointA (.xyz), post final GJK/EPA
     float4 witnessB;        // gjkOutput.closestPointB (.xyz)
     uint gjkResult;         // first GJK result
@@ -125,17 +128,19 @@ void cvxCollideDecide(uint3 dtid : SV_DispatchThreadID)
     }
     r.separated = separated ? 1u : 0u;
 
-    // sphere-path witness store: sep = ((x + y) + z) of per-component products
+    // sphere-path witness store: sep = ((x + y) + z) of per-component products.
+    // Uses the FINAL direction (post-EPA when EPA ran), not the anomaly-gate one.
+    const float3 dirF = s.directionFinal.xyz;
     const float3 wA = s.witnessA.xyz;
     const float3 wB = s.witnessB.xyz;
-    const float sepX = (wB.x - wA.x) * dir.x;
-    const float sepY = (wB.y - wA.y) * dir.y;
-    const float sepZ = (wB.z - wA.z) * dir.z;
+    const float sepX = (wB.x - wA.x) * dirF.x;
+    const float sepY = (wB.y - wA.y) * dirF.y;
+    const float sepZ = (wB.z - wA.z) * dirF.z;
     const float sep = (sepX + sepY) + sepZ;
 
     r.mA0 = float4(0, 0, 0, 0); // sphere centre
     r.mB0 = float4(wB, 0.0f);
-    r.mNp0 = float4(-dir, sep);
+    r.mNp0 = float4(-dirF, sep);
     r.numManifold = 1u;
 
     gOut[t] = r;

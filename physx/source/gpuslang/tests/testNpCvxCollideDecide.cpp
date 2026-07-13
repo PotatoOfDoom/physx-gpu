@@ -45,7 +45,7 @@ using namespace pxgtest;
 
 struct F4 { float x, y, z, w; };
 struct V3 { float x, y, z; };
-struct DecIn { F4 closestPointDir, direction, witnessA, witnessB; uint32_t gjkResult, epaResult1, degenerate, epaResult2; };
+struct DecIn { F4 closestPointDir, direction, directionFinal, witnessA, witnessB; uint32_t gjkResult, epaResult1, degenerate, epaResult2; };
 struct DecOut { F4 mA0, mB0, mNp0; uint32_t proceed, ranEpa, ranRetry, separated, numManifold, pad0, pad1, pad2; };
 
 const float TIE = 2e-4f;
@@ -79,11 +79,13 @@ static void refDecide(const DecIn& s, DecOut& o, bool& marg)
     }
     o.separated = separated ? 1u : 0u;
 
+    // sphere store reads the FINAL direction (EPA overwrites gjkOutput.direction)
+    const V3 dirF = v3(s.directionFinal);
     const V3 wA = v3(s.witnessA), wB = v3(s.witnessB);
-    const float sep = ((wB.x - wA.x) * dir.x + (wB.y - wA.y) * dir.y) + (wB.z - wA.z) * dir.z;
+    const float sep = ((wB.x - wA.x) * dirF.x + (wB.y - wA.y) * dirF.y) + (wB.z - wA.z) * dirF.z;
     o.mA0 = F4{ 0, 0, 0, 0 };
     o.mB0 = F4{ wB.x, wB.y, wB.z, 0 };
-    o.mNp0 = F4{ -dir.x, -dir.y, -dir.z, sep };
+    o.mNp0 = F4{ -dirF.x, -dirF.y, -dirF.z, sep };
     o.numManifold = 1;
 }
 
@@ -117,6 +119,12 @@ PXG_TEST(npCvxCollideDecide_decide)
         else
             cpd = unit(V3{ rf(-1, 1), rf(-1, 1), rf(-1, 1) });
         s.direction = { dir.x, dir.y, dir.z, 0 };
+        // EPA overwrites gjkOutput.direction: when the EPA gate can fire, feed a
+        // DISTINCT final direction so conflating the two inputs is observable;
+        // when EPA cannot run the final direction equals the first-GJK one.
+        const bool epaPossible = !(s.gjkResult == 1 && (i % 2 == 0)); // aligned cpd + eCLOSE -> no EPA
+        const V3 dirF = (epaPossible && s.gjkResult != 0) ? unit(V3{ rf(-1, 1), rf(-1, 1), rf(-1, 1) }) : dir;
+        s.directionFinal = { dirF.x, dirF.y, dirF.z, 0 };
         s.closestPointDir = { cpd.x, cpd.y, cpd.z, 0 };
         s.witnessA = { rf(-2, 2), rf(-2, 2), rf(-2, 2), 0 };
         s.witnessB = { rf(-2, 2), rf(-2, 2), rf(-2, 2), 0 };
