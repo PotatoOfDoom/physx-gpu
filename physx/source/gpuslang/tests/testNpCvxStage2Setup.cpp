@@ -46,7 +46,7 @@ struct F4 { float x, y, z, w; };
 struct U4 { uint32_t x, y, z, w; };
 struct V3 { float x, y, z; };
 struct S2In { U4 meta0, meta1; F4 scale0, rot0, scale1, rot1, extents0, extents1, t0q, t0p, t1q, t1p; U4 misc; };
-struct S2Out { F4 aToBq, aToBp, verts0[2]; U4 counts0, counts1; F4 params; U4 result; };
+struct S2Out { F4 rotOut0, rotOut1, tBq, tBp, aToBq, aToBp, verts0[2]; U4 counts0, counts1; F4 params; U4 result, materials; };
 
 static inline V3 v3(const F4& f) { return V3{ f.x, f.y, f.z }; }
 static inline V3 sub(const V3& a, const V3& b) { return V3{ a.x - b.x, a.y - b.y, a.z - b.z }; }
@@ -67,6 +67,8 @@ static float pcmMargin(const V3& e, float tol) { return std::fmin(std::fmin(std:
 static void refSetup(const S2In& s, S2Out& o)
 {
     uint32_t type0 = s.meta0.x, type1 = s.meta1.x, hdr0 = s.meta0.z, hdr1 = s.meta1.z;
+    uint32_t mat0 = s.meta0.y, mat1 = s.meta1.y;
+    F4 rot0 = s.rot0, rot1 = s.rot1;
     V3 sc0 = v3(s.scale0), sc1 = v3(s.scale1);
     F4 e0 = s.extents0, e1 = s.extents1;
     F4 t0q = s.t0q, t1q = s.t1q;
@@ -78,6 +80,7 @@ static void refSetup(const S2In& s, S2Out& o)
     if (flip)
     {
         std::swap(type0, type1); std::swap(hdr0, hdr1); std::swap(sc0, sc1);
+        std::swap(mat0, mat1); std::swap(rot0, rot1);
         std::swap(e0, e1); std::swap(t0q, t1q); std::swap(t0p, t1p); std::swap(cd0, cd1);
     }
 
@@ -118,6 +121,9 @@ static void refSetup(const S2In& s, S2Out& o)
     const uint32_t cw = s.misc.x;
     const uint32_t writeback = s.misc.z | (s.misc.y ? 0u : 0x80000000u);
 
+    o.rotOut0 = rot0; o.rotOut1 = rot1;
+    o.tBq = t1q; o.tBp = F4{ t1p.x, t1p.y, t1p.z, 0 };
+    o.materials = U4{ mat0, mat1, 0, 0 };
     o.aToBq = aq;
     o.aToBp = F4{ ap.x, ap.y, ap.z, cd };
     o.counts0 = U4{ nv0, np0, ne0, type0 };
@@ -143,7 +149,7 @@ PXG_TEST(npCvxStage2Setup_setup)
     for (uint32_t i = 0; i < N; ++i)
     {
         S2In s{};
-        const uint32_t kinds[4] = { 0u, 2u, 3u, 4u }; // sphere, capsule, box, convex
+        const uint32_t kinds[4] = { 0u, 2u, 3u, 5u }; // sphere, capsule, box, convex mesh
         const uint32_t ty0 = kinds[rng() % 4], ty1 = kinds[rng() % 4];
         if (ty0 == 0 || ty1 == 0) ++cSphere;
         if (ty0 == 2 || ty1 == 2) ++cCapsule;
@@ -183,7 +189,10 @@ PXG_TEST(npCvxStage2Setup_setup)
     size_t mm = 0;
     for (uint32_t i = 0; i < N; ++i)
     {
-        if (!eqF4(ref[i].aToBq, g[i].aToBq) || !eqF4(ref[i].aToBp, g[i].aToBp) ||
+        if (!eqF4(ref[i].rotOut0, g[i].rotOut0) || !eqF4(ref[i].rotOut1, g[i].rotOut1) ||
+            !eqF4(ref[i].tBq, g[i].tBq) || !eqF4(ref[i].tBp, g[i].tBp) ||
+            !eqU4(ref[i].materials, g[i].materials) ||
+            !eqF4(ref[i].aToBq, g[i].aToBq) || !eqF4(ref[i].aToBp, g[i].aToBp) ||
             !eqF4(ref[i].verts0[0], g[i].verts0[0]) || !eqF4(ref[i].verts0[1], g[i].verts0[1]) ||
             !eqU4(ref[i].counts0, g[i].counts0) || !eqU4(ref[i].counts1, g[i].counts1) ||
             !eqF4(ref[i].params, g[i].params) || !eqU4(ref[i].result, g[i].result)) ++mm;

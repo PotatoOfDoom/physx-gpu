@@ -49,9 +49,11 @@
 //   - the stage-1 counts word (manifold moreData lane 12): refreshed count =
 //     & 0xFF, initialNbContacts = >> 8;
 //   - writeback: mNbContacts = numManifoldContacts | (bIntersection ? 0 :
-//     0x80000000) (the invalidation bit consumed by the stream writer);
-//     lanes 13..15 (warm-start words) are written back by collide()'s own
-//     runGJK (tranche 148) and pass through here.
+//     0x80000000) (the invalidation bit consumed by the stream writer).  The
+//     CUDA memory store covers words 9..12 only (the quatB tail is a no-op
+//     rewrite of the values read earlier); runGJK updates the warm-start words
+//     13..15 in LANE REGISTERS which stage2 never stores, so memory keeps
+//     stage1's values -- modelled as pass-through.
 
 static const uint EGT_SPHERE = 0u;
 static const uint EGT_CAPSULE = 2u;
@@ -99,6 +101,8 @@ struct Stage2In
 
 struct Stage2Out
 {
+    float4 rotOut0, rotOut1; // post-flip mesh-scale rotations (scratch rot0/rot1)
+    float4 tBq, tBp;         // scratch tB = post-flip transf1
     float4 aToBq;
     float4 aToBp;          // .w = contactDistance (with expandedMargin)
     float4 verts0[2];      // synthetic sphere/capsule vertices (zero for convex path)
@@ -106,6 +110,7 @@ struct Stage2Out
     uint4 counts1;         // x=nbVertices1 y=nbPolygons1 z=nbEdges1 w=type1(post-flip)
     float4 params;         // x=inSphereRadius0 y=inSphereRadius1 z=replaceBreakingThreshold w=expandedMargin
     uint4 result;          // x=refreshedNbContacts y=initialNbContacts z=mNbContacts writeback word w=flip
+    uint4 materials;       // x=shape0MaterialIndex y=shape1MaterialIndex (post-flip) z,w pad
 }
 
 struct Stage2Params { uint numTests; }
@@ -127,6 +132,8 @@ void cvxStage2Setup(uint3 dtid : SV_DispatchThreadID)
     // shape structs (modelled): swap wholesale on flip
     uint type0 = s.meta0.x, type1 = s.meta1.x;
     uint hdr0 = s.meta0.z, hdr1 = s.meta1.z;
+    uint mat0 = s.meta0.y, mat1 = s.meta1.y;
+    float4 rot0 = s.rot0, rot1 = s.rot1;
     float3 scale0 = s.scale0.xyz, scale1 = s.scale1.xyz;
     float4 ext0 = s.extents0, ext1 = s.extents1;
     float4 t0q = s.t0q, t1q = s.t1q;
@@ -139,6 +146,8 @@ void cvxStage2Setup(uint3 dtid : SV_DispatchThreadID)
     {
         uint tu = type0; type0 = type1; type1 = tu;
         tu = hdr0; hdr0 = hdr1; hdr1 = tu;
+        tu = mat0; mat0 = mat1; mat1 = tu;
+        float4 tr = rot0; rot0 = rot1; rot1 = tr;
         float3 tf = scale0; scale0 = scale1; scale1 = tf;
         float4 te = ext0; ext0 = ext1; ext1 = te;
         te = t0q; t0q = t1q; t1q = te;
@@ -212,6 +221,11 @@ void cvxStage2Setup(uint3 dtid : SV_DispatchThreadID)
     const uint bIntersection = s.misc.y;
     const uint writeback = numAfter | ((bIntersection != 0u) ? 0u : 0x80000000u);
 
+    r.rotOut0 = rot0;
+    r.rotOut1 = rot1;
+    r.tBq = t1q;
+    r.tBp = float4(t1p, 0.0f);
+    r.materials = uint4(mat0, mat1, 0u, 0u);
     r.aToBq = aToBq;
     r.aToBp = float4(aToBp, contactDist);
     r.counts0 = uint4(nbV0, nbP0, nbE0, type0);
