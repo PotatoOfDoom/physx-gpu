@@ -170,14 +170,60 @@ PXG_TEST(npCvxPlanePolyIndex_select)
             uint32_t* w1 = &(&s.fbe[b1 / 16].x)[(b1 / 4) & 3];
             *w1 |= (f1 & 0xFF) << (8 * (b1 & 3));
         }
+        F4 scaleQ{ rf(0.5f, 2), rf(0.5f, 2), rf(0.5f, 2), 0 };
+        F4 rotQ = randQuat();
+        V3 n = unit(V3{ rf(-1, 1), rf(-1, 1), rf(-1, 1) });
         if (i % 13 == 0 && nbP > 33)
         {
-            s.planes[32] = s.planes[0]; // same lane (0): exact per-lane tie
-            s.planes[7] = s.planes[2];  // lanes 2 vs 7: exact cross-lane tie
+            // identity transform so vertex-space normals ARE shape-space normals:
+            // exact-tie fixtures for the per-lane (0 vs 32) and cross-lane
+            // (lanes 2 vs 17 -- ALSO distinguishes a halved lane mask, 17&15=1)
+            // argmax tie-breaks; edges off so the face path decides
+            scaleQ = F4{ 1, 1, 1, 0 }; rotQ = F4{ 0, 0, 0, 1 };
+            s.planes[32] = s.planes[0];
+            s.planes[2] = F4{ n.x, n.y, n.z, rf(-2, 2) }; // the global best
+            s.planes[17] = s.planes[2];
+            nbE = 0; ++cZeroE;
         }
-        s.scale = F4{ rf(0.5f, 2), rf(0.5f, 2), rf(0.5f, 2), float(nbP) };
-        s.rot = randQuat();
-        const V3 n = unit(V3{ rf(-1, 1), rf(-1, 1), rf(-1, 1) });
+        else if (i % 17 == 3 && nbP > 33)
+        {
+            // duplicate-edge fixture: two edges in the SAME lane (0 and 32) with
+            // bitwise-identical averaged normals but DIFFERENT face pairs -- the
+            // per-lane strict-> first-wins tie-break picks different faces
+            scaleQ = F4{ 1, 1, 1, 0 }; rotQ = F4{ 0, 0, 0, 1 };
+            V3 arb{ 0.3f, -0.7f, 0.64f };
+            V3 u = unit(V3{ n.y * arb.z - n.z * arb.y, n.z * arb.x - n.x * arb.z, n.x * arb.y - n.y * arb.x });
+            const float c25 = std::cos(25.f * 3.14159265f / 180.f), s25 = std::sin(25.f * 3.14159265f / 180.f);
+            const float c35 = std::cos(35.f * 3.14159265f / 180.f), s35 = std::sin(35.f * 3.14159265f / 180.f);
+            const V3 A = add(mul(n, c25), mul(u, s25));
+            const V3 B = add(mul(n, c35), mul(u, -s35));
+            s.planes[4] = F4{ A.x, A.y, A.z, rf(-2, 2) }; s.planes[5] = s.planes[4];
+            s.planes[6] = F4{ B.x, B.y, B.z, rf(-2, 2) }; s.planes[8] = s.planes[6];
+            // other faces weakly aligned so the edge (average ~5 deg off n) wins
+            for (uint32_t j = 0; j < 64; ++j)
+            {
+                if (j == 4 || j == 5 || j == 6 || j == 8) continue;
+                V3 pn = unit(V3{ rf(-1, 1), rf(-1, 1), rf(-1, 1) });
+                if (dot3(pn, n) > 0.6f) pn = mul(pn, -1.f);
+                s.planes[j] = F4{ pn.x, pn.y, pn.z, rf(-2, 2) };
+            }
+            nbE = 33 + rng() % 60;
+            // edge 0 = (4,6), edge 32 = (5,8): same lane 0, identical dp
+            for (uint32_t e = 0; e < 96; ++e)
+            {
+                uint32_t f0, f1;
+                if (e == 0) { f0 = 4; f1 = 6; }
+                else if (e == 32) { f0 = 5; f1 = 8; }
+                else { f0 = 9 + rng() % (nbP - 9); f1 = 9 + rng() % (nbP - 9); if (f1 == f0) f1 = 9 + (f1 - 8) % (nbP - 9); }
+                const uint32_t b0 = 2 * e, b1 = 2 * e + 1;
+                uint32_t* w0 = &(&s.fbe[b0 / 16].x)[(b0 / 4) & 3];
+                *w0 = (*w0 & ~(0xFFu << (8 * (b0 & 3)))) | ((f0 & 0xFF) << (8 * (b0 & 3)));
+                uint32_t* w1 = &(&s.fbe[b1 / 16].x)[(b1 / 4) & 3];
+                *w1 = (*w1 & ~(0xFFu << (8 * (b1 & 3)))) | ((f1 & 0xFF) << (8 * (b1 & 3)));
+            }
+        }
+        s.scale = F4{ scaleQ.x, scaleQ.y, scaleQ.z, float(nbP) };
+        s.rot = rotQ;
         s.n = F4{ n.x, n.y, n.z, float(nbE) };
         in[i] = s;
 
