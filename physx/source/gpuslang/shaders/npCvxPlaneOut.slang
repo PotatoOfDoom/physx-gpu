@@ -51,7 +51,11 @@
 //     planeShape, convexShape, patchIndex, planeTransform.rotate(localNormal),
 //     nbContacts) -- the stream write itself is the separately-verified
 //     tranche-45 shader, so this port emits the call arguments (patchIndex,
-//     the world normal, the surviving nbContacts and the material indices).
+//     the world normal, and the ORIGINAL local nbContacts: the patch rollback
+//     only zeroes the cmOutputs field, not the local passed to the call);
+//   - the overflow comparisons promote to 64 bits in CUDA (offset +
+//     sizeof(...) is size_t arithmetic), so counters within one element of
+//     2^32 overflow instead of wrapping -- ported with explicit uint64_t.
 //
 // One pair per test.  NULL pointers are modelled as the 0xFFFFFFFE sentinel
 // (distinct from the 0xFFFFFFFF overflow value that can legitimately wrap).
@@ -78,7 +82,7 @@ struct PlaneOutIn
 {
     float4 planeTq, planeTp;  // plane transform
     float4 p[32];             // per-lane p (.xyz) / sep (.w) from 155b/c
-    uint4 misc;               // x = mask, y = nbContacts, z = allflags word, w = materialIndices packed (mat0 | mat1<<16)
+    uint4 misc;               // x = mask, y = nbContacts, z = allflags word, w = unused pad
     uint4 cfg;                // x = contactBytesLimit, y = forceBytesLimit, z = patchBytesLimit, w pad
     uint4 counters;           // x = initial contactsBytes, y = initial forceBytes, z = initial patchesBytes, w pad
 }
@@ -130,8 +134,8 @@ void cvxPlaneOut(uint3 dtid : SV_DispatchThreadID)
         contactsBytes += 16u * nbContacts;
         forceByteOffset = forceBytes;
         forceBytes += 4u * nbContacts;
-        if ((contactByteOffset + 16u) > s.cfg.x) { ovf |= CONTACT_BUFFER_OVERFLOW; contactByteOffset = 0xFFFFFFFFu; }
-        if ((forceByteOffset + 4u) > s.cfg.y) { ovf |= FORCE_BUFFER_OVERFLOW; forceByteOffset = 0xFFFFFFFFu; }
+        if ((uint64_t(contactByteOffset) + 16ULL) > uint64_t(s.cfg.x)) { ovf |= CONTACT_BUFFER_OVERFLOW; contactByteOffset = 0xFFFFFFFFu; }
+        if ((uint64_t(forceByteOffset) + 4ULL) > uint64_t(s.cfg.y)) { ovf |= FORCE_BUFFER_OVERFLOW; forceByteOffset = 0xFFFFFFFFu; }
     }
 
     uint outForces, outPoints;
@@ -181,7 +185,7 @@ void cvxPlaneOut(uint3 dtid : SV_DispatchThreadID)
     {
         patchIndex = patchesBytes;
         patchesBytes += 64u; // sizeof(PxContactPatch)
-        if ((patchIndex + 64u) > s.cfg.z)
+        if ((uint64_t(patchIndex) + 64ULL) > uint64_t(s.cfg.z))
         {
             ovf |= PATCH_BUFFER_OVERFLOW;
             patchIndex = 0xFFFFFFFFu;

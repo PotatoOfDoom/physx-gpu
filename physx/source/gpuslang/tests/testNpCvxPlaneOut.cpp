@@ -96,8 +96,9 @@ static void refPlaneOut(const PlaneOutIn& s, PlaneOutOut& o)
         contactsBytes += 16u * nbContacts;      // sizeof(PxContact) * nb
         forceByteOffset = forceBytes;
         forceBytes += 4u * nbContacts;          // sizeof(PxU32) * nb
-        if ((contactByteOffset + 16u) > s.cfg.x) { ovf |= 1u; contactByteOffset = 0xFFFFFFFFu; }
-        if ((forceByteOffset + 4u) > s.cfg.y) { ovf |= 2u; forceByteOffset = 0xFFFFFFFFu; }
+        // CUDA: offset + sizeof(...) promotes to size_t -> 64-bit compare, no wrap
+        if ((uint64_t(contactByteOffset) + 16u) > s.cfg.x) { ovf |= 1u; contactByteOffset = 0xFFFFFFFFu; }
+        if ((uint64_t(forceByteOffset) + 4u) > s.cfg.y) { ovf |= 2u; forceByteOffset = 0xFFFFFFFFu; }
     }
 
     // L3099-3117: world-space stream write / output pointers
@@ -145,7 +146,7 @@ static void refPlaneOut(const PlaneOutIn& s, PlaneOutOut& o)
     {
         patchIndex = patchesBytes;
         patchesBytes += 64u; // sizeof(PxContactPatch)
-        if ((patchIndex + 64u) > s.cfg.z)
+        if ((uint64_t(patchIndex) + 64u) > s.cfg.z)
         {
             ovf |= 4u;
             patchIndex = 0xFFFFFFFFu;
@@ -179,7 +180,7 @@ PXG_TEST(npCvxPlaneOut_outputTail)
 
     std::vector<PlaneOutIn> in(N);
     std::vector<PlaneOutOut> ref(N);
-    size_t cOvfC = 0, cOvfF = 0, cOvfP = 0, cBoth = 0, cWrapForce = 0, cEmpty = 0, cExactC = 0, cExactP = 0, cSparse = 0;
+    size_t cOvfC = 0, cOvfF = 0, cOvfP = 0, cBoth = 0, cWrapForce = 0, cEmpty = 0, cExactC = 0, cExactF = 0, cExactP = 0, cSparse = 0, cHigh = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -209,15 +210,18 @@ PXG_TEST(npCvxPlaneOut_outputTail)
         s.misc = U4{ mask, nb, uint32_t(rng()), mats }; // fully random allflags word
 
         // initial counters and limits per buffer: ample / tight / exact-single-element
-        const uint32_t initC = 16 * (rng() % 64), initF = 4 * (rng() % 64), initP = 64 * (rng() % 32);
+        uint32_t initC = 16 * (rng() % 64), initF = 4 * (rng() % 64), initP = 64 * (rng() % 32);
         uint32_t limC = initC + 16 * 40, limF = initF + 4 * 40, limP = initP + 64 * 8;
-        const uint32_t vC = rng() % 5, vF = rng() % 5, vP = rng() % 5;
+        const uint32_t vC = rng() % 6, vF = rng() % 6, vP = rng() % 6;
         if (vC == 1) limC = initC + rng() % 16;            // (initC + 16) > lim -> overflow
         else if (vC == 2) { limC = initC + 16; ++cExactC; }  // exact single-element fit: NO overflow even for nb > 1 (quirk)
+        else if (vC == 3) { initC = 0xFFFFFFF0u + rng() % 16; limC = 0xFFFFFF00u + rng() % 256; ++cHigh; } // 64-bit compare region: initC + 16 >= 2^32 > any limit (a 32-bit wrap would see a tiny offset and pass)
         if (vF == 1) limF = initF + rng() % 4;
-        else if (vF == 2) limF = initF + 4;
+        else if (vF == 2) { limF = initF + 4; ++cExactF; }
+        else if (vF == 3) { initF = 0xFFFFFFFCu + rng() % 4; limF = 0xFFFFFF00u + rng() % 256; ++cHigh; }
         if (vP == 1) limP = initP + rng() % 64;            // (initP + 64) > lim -> rollback
         else if (vP == 2) { limP = initP + 64; ++cExactP; }
+        else if (vP == 3) { initP = 0xFFFFFFC0u + rng() % 64; limP = 0xFFFFFF00u + rng() % 256; ++cHigh; }
         s.cfg = U4{ limC, limF, limP, 0 };
         s.counters = U4{ initC, initF, initP, 0 };
 
@@ -268,9 +272,10 @@ PXG_TEST(npCvxPlaneOut_outputTail)
     PXG_CHECK_MSG(mmFl == 0, "planeOut: %zu flag mismatches", mmFl);
     PXG_CHECK_MSG(mmA == 0, "planeOut: %zu patch-arg mismatches", mmA);
     PXG_CHECK_MSG(cOvfC > N / 20 && cOvfF > N / 20 && cOvfP > N / 20 && cBoth > N / 100 &&
-                  cWrapForce > N / 100 && cEmpty > N / 20 && cExactC > N / 12 && cExactP > N / 12 && cSparse > N / 8,
-                  "planeOut: coverage thin (ovfC %zu ovfF %zu ovfP %zu both %zu wrapF %zu empty %zu exactC %zu exactP %zu sparse %zu)",
-                  cOvfC, cOvfF, cOvfP, cBoth, cWrapForce, cEmpty, cExactC, cExactP, cSparse);
+                  cWrapForce > N / 100 && cEmpty > N / 20 && cExactC > N / 15 && cExactF > N / 15 &&
+                  cExactP > N / 15 && cSparse > N / 8 && cHigh > N / 10,
+                  "planeOut: coverage thin (ovfC %zu ovfF %zu ovfP %zu both %zu wrapF %zu empty %zu exactC %zu exactF %zu exactP %zu sparse %zu high %zu)",
+                  cOvfC, cOvfF, cOvfP, cBoth, cWrapForce, cEmpty, cExactC, cExactF, cExactP, cSparse, cHigh);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }
