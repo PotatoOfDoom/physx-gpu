@@ -106,6 +106,10 @@ void cvxClipEmit(uint3 dtid : SV_DispatchThreadID)
     float3 pt[32]; float sep[32];
     for (uint L = 0u; L < 32u; ++L) { pt[L] = s.clipPt[L].xyz; sep[L] = s.clipPt[L].w; }
 
+    // nbContacts==32 is clamped to a full mask rather than replicating CUDA's
+    // (1<<32)-1, which is C++ shift-by-width UB (yields 0 on NVIDIA HW → empty
+    // set); the clamp is the portable/correct behaviour and the boundary is
+    // unreachable in practice (NUM_TMP_CONTACTS_PER_PAIR caps emission before 32).
     const uint allMask = (nbContacts >= 32u) ? 0xffffffffu : ((1u << nbContacts) - 1u);
 
     // mask: reduce to <=4 when nbContacts>4 (schlock::reduce over clip points, normal=clipN)
