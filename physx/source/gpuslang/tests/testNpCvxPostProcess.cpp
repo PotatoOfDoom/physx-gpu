@@ -62,7 +62,7 @@ struct PostIn
 struct PostOut { U4 res, aux; };
 
 const uint32_t EV0 = 1u << 29, EV1 = 2u << 29, EV2 = 3u << 29;
-const uint32_t EE01 = 4u << 29, EE12 = 5u << 29, EE02 = 6u << 29;
+const uint32_t EE01 = 4u << 29, EE02 = 5u << 29, EE12 = 6u << 29; // enum declares eE02 before eE12
 const uint32_t FACE_FLAG = 0x80000000u, EDGE_FLAG = 0xC0000000u;
 const uint32_t BOUNDARY = 0xFFFFFFFFu;
 const uint32_t BV32_BYTES = 1168;
@@ -274,7 +274,7 @@ static void refPostProcess(const PostIn& s, PostOut& o)
     }
 
     if (!needsProcessing)
-        niWord &= 0x0FFFFFFu; // seven F's
+        niWord &= 0x0FFFFFFu; // six F's (0x00FFFFFF)
 
     o.res = U4{ niWord, needsProcessing ? 1u : 0u, triangleIndex, vertexIdx };
 }

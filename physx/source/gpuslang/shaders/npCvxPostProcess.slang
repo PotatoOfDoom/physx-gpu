@@ -31,7 +31,8 @@
 // per-thread second-pass silhouette culling that clears contacts generated on
 // inactive mesh features.  One second-pass pair per test.  Ported verbatim:
 //   - pairIdx = word & 0x1FFFFFFF, voronoi mask = word & eMASK (0xE0000000),
-//     with eV0/eV1/eV2 = 1/2/3 << 29 and eE01/eE12/eE02 = 4/5/6 << 29;
+//     with eV0/eV1/eV2 = 1/2/3 << 29 and eE01/eE02/eE12 = 4/5/6 << 29 (the
+//     enum declares eE02 BEFORE eE12 -- not the branch order of the cores);
 //   - the early return when getNbContacts(cvxni.index) == 0;
 //   - TRIMESH: the real byte-offset blob walk (header uint4, skip
 //     hdr.w * sizeof(BV32DataPacked) = 1168 bytes, skip numVerts float4
@@ -55,8 +56,8 @@
 //     neighbourhood (clamped rows/cols) over both cell triangles, matching
 //     any of the three (permuted) vertex indices, findTriangle with the
 //     plain 0x80000000 flag;
-//   - the clear is cvxni.index &= 0x0FFFFFF -- SEVEN F's: it zeroes the
-//     nbContacts/deferred bits AND bits 24-26 of the 27-bit triangle index.
+//   - the clear is cvxni.index &= 0x0FFFFFF -- SIX F's (0x00FFFFFF): it zeroes
+//     the nbContacts/deferred bits AND bits 24-26 of the 27-bit triangle index.
 // findTriangle/findFaceContactTriangle/findEdgeContactTriangle and
 // binarySearch are the tranche-113 ports; the HF vertex/adjacency helpers are
 // the tranche-59 ports (copied verbatim from npHeightfield.slang).
@@ -66,8 +67,8 @@ static const uint EV0 = 1u << 29;
 static const uint EV1 = 2u << 29;
 static const uint EV2 = 3u << 29;
 static const uint EE01 = 4u << 29;
-static const uint EE12 = 5u << 29;
-static const uint EE02 = 6u << 29;
+static const uint EE02 = 5u << 29; // declaration order: eE02 before eE12
+static const uint EE12 = 6u << 29;
 static const uint FACE_CONTACT_FLAG = 0x80000000u;  // TriangleSearchFlags::eFACE_CONTACT
 static const uint EDGE_CONTACT_FLAG = 0xC0000000u;  // TriangleSearchFlags::eEDGE_CONTACT
 static const uint BOUNDARY = 0xFFFFFFFFu;
@@ -378,7 +379,7 @@ void cvxPostProcess(uint3 dtid : SV_DispatchThreadID)
     }
 
     if (!needsProcessing)
-        niWord = niWord & 0x0FFFFFFu; // SEVEN F's: clears count/deferred AND triangle-index bits 24-26
+        niWord = niWord & 0x0FFFFFFu; // six F's: clears count/deferred AND triangle-index bits 24-26
 
     r.res = uint4(niWord, needsProcessing ? 1u : 0u, triangleIndex, vertexIdx);
     gOut[t] = r;
