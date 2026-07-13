@@ -86,15 +86,16 @@ static void refPlanePoly(const PpIn& s, PpOut& o, bool& marg)
     {
         const int L = i & 31;
         const float proj = dot3(getNormalized(shape2Vertex(v3(s.planes[i]), sc, rot)), n);
+        const float dl = std::fabs(proj - laneBest[L]);
         if (laneBest[L] < proj) { laneIdx[L] = i; laneBest[L] = proj; }
-        else if (std::fabs(proj - laneBest[L]) < TIE) marg = true; // per-lane near-tie
+        else if (dl != 0.f && dl < TIE) marg = true; // near-tie (exact ties are deterministic)
     }
     float bestProj = -FLTMAX;
     for (int L = 0; L < 32; ++L) bestProj = std::fmax(bestProj, laneBest[L]);
     uint32_t bestLane = 0;
     for (int L = 0; L < 32; ++L) if (laneBest[L] == bestProj) { bestLane = (uint32_t)L; break; }
     for (int L = 0; L < 32; ++L)
-        if ((uint32_t)L != bestLane && laneBest[L] > -FLTMAX && std::fabs(laneBest[L] - bestProj) < TIE) marg = true;
+        { const float dl = std::fabs(laneBest[L] - bestProj); if ((uint32_t)L != bestLane && laneBest[L] > -FLTMAX && dl != 0.f && dl < TIE) marg = true; }
     uint32_t index = laneIdx[bestLane];
 
     float laneE[32]; uint32_t laneEIdx[32];
@@ -105,15 +106,16 @@ static void refPlanePoly(const PpIn& s, PpOut& o, bool& marg)
         const uint32_t f0 = fbeByte(s, 2 * i), f1 = fbeByte(s, 2 * i + 1);
         const V3 e = getNormalized(add(loadNormal(s.planes[f0], sc, rot), loadNormal(s.planes[f1], sc, rot)));
         const float dp = dot3(e, n);
+        const float de = std::fabs(dp - laneE[L]);
         if (dp > laneE[L]) { laneE[L] = dp; laneEIdx[L] = i; }
-        else if (std::fabs(dp - laneE[L]) < TIE) marg = true;
+        else if (de != 0.f && de < TIE) marg = true;
     }
     float bestEMax = -FLTMAX;
     for (int L = 0; L < 32; ++L) bestEMax = std::fmax(bestEMax, laneE[L]);
     uint32_t bestELane = 0;
     for (int L = 0; L < 32; ++L) if (laneE[L] == bestEMax) { bestELane = (uint32_t)L; break; }
     for (int L = 0; L < 32; ++L)
-        if ((uint32_t)L != bestELane && laneE[L] > -FLTMAX && std::fabs(laneE[L] - bestEMax) < TIE) marg = true;
+        { const float de = std::fabs(laneE[L] - bestEMax); if ((uint32_t)L != bestELane && laneE[L] > -FLTMAX && de != 0.f && de < TIE) marg = true; }
     const float bestEdge = bestEMax + 5e-4f;
     const uint32_t closestEdge = laneEIdx[bestELane];
 
@@ -167,6 +169,11 @@ PXG_TEST(npCvxPlanePolyIndex_select)
             *w0 |= (f0 & 0xFF) << (8 * (b0 & 3));
             uint32_t* w1 = &(&s.fbe[b1 / 16].x)[(b1 / 4) & 3];
             *w1 |= (f1 & 0xFF) << (8 * (b1 & 3));
+        }
+        if (i % 13 == 0 && nbP > 33)
+        {
+            s.planes[32] = s.planes[0]; // same lane (0): exact per-lane tie
+            s.planes[7] = s.planes[2];  // lanes 2 vs 7: exact cross-lane tie
         }
         s.scale = F4{ rf(0.5f, 2), rf(0.5f, 2), rf(0.5f, 2), float(nbP) };
         s.rot = randQuat();
