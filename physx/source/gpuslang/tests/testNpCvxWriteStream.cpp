@@ -163,13 +163,14 @@ static void refWriteStream(const WsIn& s, WsOut& o, bool& marg)
 
         if (cOff0 != 0xFFFFFFFFu)
         {
-            F4 avgPt{ 0, 0, 0, 0 };
+            // CUDA butterfly association: (p0+p2)+(p1+p3) over lane-index-masked terms
+            F4 pv[4];
             for (uint32_t j = 0; j < 4; ++j)
-                if (j < numKeptG)
-                {
-                    avgPt.x += pbL[4 * g + j].x; avgPt.y += pbL[4 * g + j].y;
-                    avgPt.z += pbL[4 * g + j].z; avgPt.w += pbL[4 * g + j].w;
-                }
+                pv[j] = (j < numKeptG) ? pbL[4 * g + j] : F4{ 0, 0, 0, 0 };
+            const F4 avgPt{ (pv[0].x + pv[2].x) + (pv[1].x + pv[3].x),
+                            (pv[0].y + pv[2].y) + (pv[1].y + pv[3].y),
+                            (pv[0].z + pv[2].z) + (pv[1].z + pv[3].z),
+                            (pv[0].w + pv[2].w) + (pv[1].w + pv[3].w) };
 
             for (uint32_t j = 0; j < 4; ++j)
             {

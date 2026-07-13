@@ -224,7 +224,7 @@ void cvxWriteStream(uint3 dtid : SV_DispatchThreadID)
         const float magSq = dot(sum, sum);
         float3 avgNorm;
         if (magSq >= 1e-5f)
-            avgNorm = sum / sqrt(magSq);
+            avgNorm = sum * (1.0f / sqrt(magSq)); // PxVec3::operator/= is reciprocal-multiply
         else
             avgNorm = normPenL[4u * g].xyz; // storing lane's own normal (tidInGroup 0)
         avgNorm = quatRotate(t1q[g], avgNorm);
@@ -287,10 +287,12 @@ void cvxWriteStream(uint3 dtid : SV_DispatchThreadID)
             // group average point: CUDA sums lanes tidInGroup < numManifoldContacts,
             // where numManifoldContacts is the RE-derived kept count -- a lane-INDEX
             // test, not the kept bitmask, so an unkept low lane can contribute while
-            // a kept high lane does not (ported exactly)
-            float4 avgPt = float4(0, 0, 0, 0);
+            // a kept high lane does not (ported exactly).  The shfl_xor(2)+shfl_xor(1)
+            // butterfly associates (p0+p2)+(p1+p3).
+            float4 pv[4];
             for (uint j = 0u; j < 4u; ++j)
-                if (j < numKeptG) avgPt += pointBL[4u * g + j];
+                pv[j] = (j < numKeptG) ? pointBL[4u * g + j] : float4(0, 0, 0, 0);
+            const float4 avgPt = (pv[0] + pv[2]) + (pv[1] + pv[3]);
 
             for (uint j = 0u; j < 4u; ++j)
             {
@@ -306,7 +308,8 @@ void cvxWriteStream(uint3 dtid : SV_DispatchThreadID)
                 {
                     if (j == 0u)
                     {
-                        const float4 a = avgPt / float(numKeptG);
+                        // cutil operator/=(float4, float) is reciprocal-multiply
+                        const float4 a = avgPt * (1.0f / float(numKeptG));
                         r.stream[(cb - streamBase) / 16u] = a; // avgPoint first
                         offset += 16u;
                     }
