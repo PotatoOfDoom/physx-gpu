@@ -87,8 +87,8 @@ static void refPlanePoly(const PpIn& s, PpOut& o, bool& marg)
         const int L = i & 31;
         const float proj = dot3(getNormalized(shape2Vertex(v3(s.planes[i]), sc, rot)), n);
         const float dl = std::fabs(proj - laneBest[L]);
+        if (laneBest[L] > -FLTMAX && dl != 0.f && dl < TIE) marg = true; // near-tie EITHER way (exact ties are deterministic)
         if (laneBest[L] < proj) { laneIdx[L] = i; laneBest[L] = proj; }
-        else if (dl != 0.f && dl < TIE) marg = true; // near-tie (exact ties are deterministic)
     }
     float bestProj = -FLTMAX;
     for (int L = 0; L < 32; ++L) bestProj = std::fmax(bestProj, laneBest[L]);
@@ -107,8 +107,8 @@ static void refPlanePoly(const PpIn& s, PpOut& o, bool& marg)
         const V3 e = getNormalized(add(loadNormal(s.planes[f0], sc, rot), loadNormal(s.planes[f1], sc, rot)));
         const float dp = dot3(e, n);
         const float de = std::fabs(dp - laneE[L]);
+        if (laneE[L] > -FLTMAX && de != 0.f && de < TIE) marg = true; // near-tie either way
         if (dp > laneE[L]) { laneE[L] = dp; laneEIdx[L] = i; }
-        else if (de != 0.f && de < TIE) marg = true;
     }
     float bestEMax = -FLTMAX;
     for (int L = 0; L < 32; ++L) bestEMax = std::fmax(bestEMax, laneE[L]);
@@ -173,16 +173,16 @@ PXG_TEST(npCvxPlanePolyIndex_select)
         F4 scaleQ{ rf(0.5f, 2), rf(0.5f, 2), rf(0.5f, 2), 0 };
         F4 rotQ = randQuat();
         V3 n = unit(V3{ rf(-1, 1), rf(-1, 1), rf(-1, 1) });
-        if (i % 13 == 0 && nbP > 33)
+        if (i % 13 == 0 && nbP > 34)
         {
             // identity transform so vertex-space normals ARE shape-space normals:
             // exact-tie fixtures for the per-lane (0 vs 32) and cross-lane
             // (lanes 2 vs 17 -- ALSO distinguishes a halved lane mask, 17&15=1)
             // argmax tie-breaks; edges off so the face path decides
             scaleQ = F4{ 1, 1, 1, 0 }; rotQ = F4{ 0, 0, 0, 1 };
-            s.planes[32] = s.planes[0];
             s.planes[2] = F4{ n.x, n.y, n.z, rf(-2, 2) }; // the global best
-            s.planes[17] = s.planes[2];
+            s.planes[17] = s.planes[2]; // cross-lane tie (lanes 2 vs 17)
+            s.planes[34] = s.planes[2]; // SAME-lane tie on the winner (34 & 31 == 2)
             nbE = 0; ++cZeroE;
         }
         else if (i % 17 == 3 && nbP > 33)
