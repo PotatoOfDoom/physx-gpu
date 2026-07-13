@@ -48,7 +48,7 @@ using namespace pxgtest;
 struct F4 { float x, y, z, w; };
 struct U4 { uint32_t x, y, z, w; };
 struct V3 { float x, y, z; };
-struct GenIn { F4 planes[64], verts[64]; uint32_t polyDesc[64]; U4 vtxData[16], fbe[12]; F4 scale, rot, n, bToAq, bToAp, planeTq, convexTq; };
+struct GenIn { F4 planes[64], verts[64]; uint32_t polyDesc[64]; U4 vtxData[32], fbe[12]; F4 scale, rot, n, bToAq, bToAp, planeTq, convexTq; };
 struct GenOut { F4 mNp[4], mA[4], mB[4]; U4 md0, md1, md2; F4 p[32]; U4 result, aux; };
 
 const float FLTMAX = 3.4028235e38f;
@@ -296,12 +296,14 @@ PXG_TEST(npCvxPlaneGen_gen)
         for (uint32_t v = 0; v < 64; ++v)
             s.verts[v] = F4{ rf(-1, 1), rf(-1, 1), rf(-1, 1), 0 };
         // polygons: descriptor packs vRef8 (byte offset into vtxData) and vert count
-        uint32_t cursor = 0;
-        for (uint32_t p = 0; p < nbP && cursor < 250; ++p)
+        // start deep into the byte table every few tests so vRef8 exceeds 255
+        // (it is a full PxU16 in the blob -- pins the shift/mask extraction)
+        uint32_t cursor = (i % 5 == 0) ? 260 + rng() % 100 : 0;
+        for (uint32_t p = 0; p < nbP && cursor < 500; ++p)
         {
             uint32_t nv = 3 + rng() % 18;         // up to 20 verts (drives the >16 reduce)
             if (i % 6 != 0) nv = 3 + rng() % 6;   // mostly small faces
-            if (cursor + nv > 250) nv = 250 - cursor;
+            if (cursor + nv > 500) nv = 500 - cursor;
             s.polyDesc[p] = (cursor << 16) | (nv << 8) | 0;
             for (uint32_t k = 0; k < nv; ++k)
             {

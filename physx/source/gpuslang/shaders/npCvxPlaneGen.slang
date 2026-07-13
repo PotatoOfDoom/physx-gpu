@@ -100,7 +100,7 @@ struct PlaneGenIn
     float4 planes[64];   // hull polygon planes (vertex space)
     float4 verts[64];    // hull vertices (vertex space)
     uint polyDesc[64];   // vRef8NbVertsMinIndex per polygon
-    uint4 vtxData[16];   // polyData_vertexData8, byte-packed (256 bytes)
+    uint4 vtxData[32];   // polyData_vertexData8, byte-packed (512 bytes -- vRef8 is a full PxU16)
     uint4 fbe[12];       // facesByEdges8, byte-packed (max 96 edges)
     float4 scale;        // .xyz mesh scale; .w = nbPolygons
     float4 rot;          // mesh-scale rotation quat
@@ -132,7 +132,7 @@ ConstantBuffer<PlaneGenParams> gParams;
 RWStructuredBuffer<PlaneGenIn> gIn;    // binding 0
 RWStructuredBuffer<PlaneGenOut> gOut;  // binding 1
 
-uint byteAt(uint4 words[16], uint byteIdx)
+uint byteAt(uint4 words[32], uint byteIdx)
 {
     return (words[byteIdx / 16u][(byteIdx / 4u) & 3u] >> (8u * (byteIdx & 3u))) & 0xFFu;
 }
