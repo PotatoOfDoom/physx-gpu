@@ -54,9 +54,10 @@
 //     targetVel_maxImpulseW), the latter (0,0,0,PX_MAX_REAL) unless
 //     modifiable.
 // ALL outputs bitwise.  CUDA reads UNINITIALIZED dynamic/staticFriction +
-// mSolverFlags when gContactPatch is NULL (the data image is still stored)
-// -- the port zero-initializes those lanes; deterministic-and-documented
-// replacement of UB.  CUDA also leaves the prepData lanes (invMass, normal,
+// mSolverFlags when gContactPatch is NULL (the data image is still stored),
+// and NEVER writes data.pad, so byte 15 of the stored image is stack
+// garbage in every case -- the port zero-initializes those lanes/bytes;
+// deterministic-and-documented replacement of UB.  CUDA also leaves the prepData lanes (invMass, normal,
 // damping) UNWRITTEN outside the response gate; the port zeroes them
 // (consumers read them only when mNumContacts > 0).
 

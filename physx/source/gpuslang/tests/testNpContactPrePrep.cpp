@@ -150,19 +150,22 @@ PXG_TEST(npContactPrePrep_pack)
 
         // work-unit flags: salt irrelevant bits + the four load-bearing ones
         uint32_t wu = (rng() % 2 ? (1u << 0) : 0u) | (rng() % 2 ? (1u << 5) : 0u) |
-                      (rng() % 2 ? (1u << 10) : 0u);
+                      (rng() % 2 ? (1u << 8) : 0u) | (rng() % 2 ? (1u << 10) : 0u);
         if (rng() % 3 == 0) wu |= (1u << 2);    // eDISABLE_STRONG_FRICTION
         if (rng() % 2) wu |= (1u << 9);         // eFORCE_THRESHOLD
         if (rng() % 3 == 0) wu |= (1u << 14);   // eDOMINANCE_0
         if (rng() % 3 == 0) wu |= (1u << 15);   // eDOMINANCE_1
 
-        // patch internal flags: salt irrelevant bits (1<<0, 1<<5) + gates
-        uint32_t internalFlags = (rng() % 2 ? 1u : 0u) | (rng() % 2 ? 32u : 0u);
+        // patch internal flags: salt irrelevant bits (1<<0, 1<<3, 1<<5, 1<<6)
+        // + gates (review-177: neighbor bits of every tested mask salted)
+        uint32_t internalFlags = (rng() % 2 ? 1u : 0u) | (rng() % 2 ? 8u : 0u) |
+                                 (rng() % 2 ? 32u : 0u) | (rng() % 2 ? 64u : 0u);
         if (i % 7 == 3) internalFlags |= 4u;    // eFORCE_NO_RESPONSE
         if (rng() % 4 == 0) internalFlags |= 16u;   // eHAS_TARGET_VELOCITY
         if (i % 3 == 1) internalFlags |= 128u;  // eCOMPRESSED_MODIFIED_CONTACT
 
-        uint32_t materialFlags = (rng() % 2 ? 2u : 0u);  // salt an irrelevant bit
+        uint32_t materialFlags = (rng() % 2 ? 2u : 0u) | (rng() % 2 ? 4u : 0u) |
+                                 (rng() % 2 ? 8u : 0u) | (rng() % 2 ? 32u : 0u);  // salt bits
         if (rng() % 3 == 0) materialFlags |= 1u;    // eDISABLE_FRICTION
         if (rng() % 3 == 0) materialFlags |= 16u;   // eCOMPLIANT_ACCELERATION_SPRING
 
@@ -176,7 +179,9 @@ PXG_TEST(npContactPrePrep_pack)
         const uint32_t startIdx = rng() % (maxStart + 1u);
         const uint32_t nb = rng() % 7u;                   // 0..6 contacts
         const uint32_t forceIdx = (i % 5 == 2) ? 0xFFFFFFFFu : rng() % 100000u;
-        s.cnt = U4{ startIdx, nb, rng() % 256u, forceIdx };
+        // prevFriction up to 399: pins the & 0xFF truncation (CUDA's PxU8
+        // cast; review-177 x4 showed the mask was dead under < 256 fixtures)
+        s.cnt = U4{ startIdx, nb, rng() % 400u, forceIdx };
 
         for (uint32_t p = 0; p < MAX_PTS; ++p)
             s.pts[p] = F4{ rf(-5, 5), rf(-5, 5), rf(-5, 5), rf(-1, 1) };
