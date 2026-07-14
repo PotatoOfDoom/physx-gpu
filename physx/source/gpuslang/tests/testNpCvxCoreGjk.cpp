@@ -178,7 +178,9 @@ static V3 supportLocal(const ShapeRefC& s, V3 dir)
         const float eps = 1e-5f;
         if (std::fabs(d.y) < eps && std::fabs(d.z) < eps) return V3{ pxSign(d.x) * h, r, 0 };
         const V3 dr = nrmz(V3{ 0, d.y, d.z });
-        return V3{ pxSign(d.x) * h + dr.x * r, dr.y * r, dr.z * r };
+        // CUDA form is PxVec3(sign*h,0,0) + dr*r: keep the 0 + adds (review
+        // 169: they flip -0 radial components to +0, the eqFZ-visible side)
+        return V3{ pxSign(d.x) * h + dr.x * r, 0.0f + dr.y * r, 0.0f + dr.z * r };
     }
     if (type == CORE_CONE)
     {
@@ -190,7 +192,7 @@ static V3 supportLocal(const ShapeRefC& s, V3 dir)
         if (d.x > sinA) return V3{ halfH, 0, 0 };
         if (std::fabs(d.y) < eps && std::fabs(d.z) < eps) return V3{ -halfH, r, 0 };
         const V3 dr = nrmz(V3{ 0, d.y, d.z });
-        return V3{ -halfH + dr.x * r, dr.y * r, dr.z * r };
+        return V3{ -halfH + dr.x * r, 0.0f + dr.y * r, 0.0f + dr.z * r };
     }
     if (type == CORE_POINTS)
     {
@@ -480,6 +482,9 @@ static void refGjk(const GjkIn& in, GjkOut& o, RefStats& st)
         }
         }
 
+        // (t0+t1)+(t2+t3) vs CUDA's ((t0+t1)+t2)+t3: w[3].s is never set by
+        // any case (always 0), so t3 is an exact +-0 and both associations
+        // agree bitwise in every reachable configuration (review 169)
         const V3 closest = vadd(vadd(vscl(w[0].p, w[0].s), vscl(w[1].p, w[1].s)),
                                 vadd(vscl(w[2].p, w[2].s), vscl(w[3].p, w[3].s)));
         if (mag(closest) < mag(mClosest) - FLT_EPSILON)
@@ -572,6 +577,7 @@ PXG_TEST(npCvxCoreGjk_distance)
     size_t cType[7] = { 0, 0, 0, 0, 0, 0, 0 };
     size_t cTag[3] = { 0, 0, 0 };
     size_t cFallback = 0, cWeld = 0, cDup = 0, cIterCap = 0, cFull = 0, cNear = 0, cPtPt = 0;
+    size_t cNullPts = 0, cTinyS = 0;
     uint32_t gMaxCache = 0;
 
     for (uint32_t i = 0; i < N; ++i)
@@ -622,11 +628,11 @@ PXG_TEST(npCvxCoreGjk_distance)
             pB = vadd(pA, vscl(sepDir, rA + rB + rf(-2e-3f, 2e-2f)));
             s.metaA = U4{ typeA, 0, 0, 0 };
             s.metaB = U4{ typeB, 0, 0, 0 };
-            ++cType[typeA]; ++cType[typeB];
             s.poseAp = F4{ pA.x, pA.y, pA.z, 0 };
             s.poseBp = F4{ pB.x, pB.y, pB.z, 0 };
             s.cfg = F4{ maxDist, 0, 0, 0 };
             in[i] = s;
+            ++cType[s.metaA.x]; ++cType[s.metaB.x];
             RefStats st;
             refGjk(s, ref[i], st);
             ++cTag[st.tag];
@@ -640,7 +646,6 @@ PXG_TEST(npCvxCoreGjk_distance)
 
         s.metaA = U4{ typeA, 0, 0, 0 };
         s.metaB = U4{ typeB, 0, 0, 0 };
-        ++cType[typeA]; ++cType[typeB];
         fillCore(rng, typeA, s.coreA, s.ptsA, rf);
         fillCore(rng, typeB, s.coreB, s.ptsB, rf);
         if (i % 19 == 7)
@@ -650,6 +655,27 @@ PXG_TEST(npCvxCoreGjk_distance)
         s.poseBp = F4{ pB.x, pB.y, pB.z, 0 };
         s.cfg = F4{ maxDist, 0, 0, 0 };
 
+        if (i % 61 == 13)
+        {
+            // review-169 gap: the ePOINTS 64-bit NULL-pointer image branch
+            typeA = CORE_POINTS;
+            s.metaA = U4{ typeA, 0, 0, 0 };
+            fillCore(rng, typeA, s.coreA, s.ptsA, rf);
+            s.coreA[0].x = 0; s.coreA[0].y = 0; // NULL: supportLocal -> (0,0,0)
+            ++cNullPts;
+        }
+        if (i % 67 == 29)
+        {
+            // review-169 gap: the |d| < FLT_EPSILON degenerate-scale guard --
+            // S ~ 1e-8 collapses S*(R*dir) below FLT_EPSILON for every unit
+            // query dir, so the guard (not the argmax) must answer
+            typeB = CORE_POINTS;
+            s.metaB = U4{ typeB, 0, 0, 0 };
+            fillCore(rng, typeB, s.coreB, s.ptsB, rf);
+            s.coreB[0].z = f2u(1e-8f); s.coreB[0].w = f2u(1e-8f);
+            s.coreB[1].x = f2u(1e-8f);
+            ++cTinyS;
+        }
         if (i % 97 == 31)
         {
             // fat coaxial cylinder/cone caps facing across a tiny gap, with a
@@ -802,6 +828,7 @@ PXG_TEST(npCvxCoreGjk_distance)
         }
 
         in[i] = s;
+        ++cType[s.metaA.x]; ++cType[s.metaB.x]; // counted from what dispatches
         RefStats st;
         refGjk(s, ref[i], st);
         ++cTag[st.tag];
@@ -843,7 +870,7 @@ PXG_TEST(npCvxCoreGjk_distance)
     PXG_CHECK_MSG(mm == 0, "cgjDistance: %zu mismatches", mm);
 
     bool cov = cTag[0] > N / 10 && cTag[1] > N / 10 && cTag[2] > N / 20 &&
-               cFallback > 8 && cWeld > N / 20 && cDup > N / 20 && cNear > N / 8 && cPtPt > 8 &&
+               cFallback > 8 && cWeld > N / 20 && cDup > N / 20 && cPtPt > 8 && cNullPts > 8 && cTinyS > 8 &&
                cFull >= 1 && cIterCap >= 1;
     for (int k2 = 0; k2 < 7; ++k2) cov = cov && cType[k2] > N / 16;
     PXG_CHECK_MSG(cov, "cgjDistance: coverage thin (tags %zu/%zu/%zu fb %zu weld %zu dup %zu cap %zu full %zu)",
