@@ -255,6 +255,70 @@ PXG_TEST(npCvxCoreContact_addPoints)
             s.nrm[0] = F4{ 1.f, 0.f, 0.f, 0 };
             s.nrm[1] = F4{ 0.999f, 0.0447101779f, 0.f, 0 };
         }
+        if (i % 1000 == 137)
+        {
+            // review-168 m5 kill: after add 3 the reduce-gather leaves the
+            // pool depth-UNSORTED behind the head; add 4 breaks the faithful
+            // bubble at i=0, and the exact farthest-distance tie from the new
+            // head (9+16 == 25+0, both dist^2 = 25 in float) makes first-wins
+            // pick a different pi1 if the mutant's full pass reorders slots
+            // 2/3 (np 3 vs 4)
+            std::memset(&s, 0, sizeof(s));
+            s.meta = U4{ 4, 0, 0, 0 };
+            for (int a = 0; a < 4; ++a) s.nrm[a] = F4{ 0, 0, 1, 0 };
+            s.pts[0] = F4{ 0, 1, 0, 0.0f };
+            s.pts[1] = F4{ 3, 4, 0, 0.2f };
+            s.pts[2] = F4{ 5, 0, 0, 0.5f };
+            s.pts[3] = F4{ 0, 0, 0, -1.0f };
+        }
+        if (i % 1000 == 251)
+        {
+            // review-168 yx2: capacity replacement where the closest pair's
+            // min depths are BITWISE EQUAL -- depth0 > depth1 is false on the
+            // tie so pi1 (patch 1) is replaced; a >= mutant would take pi0
+            std::memset(&s, 0, sizeof(s));
+            s.meta = U4{ 17, 0, 0, 0 };
+            const float sN = 0.43588989f; // ~sqrt(1 - 0.9^2)
+            s.nrm[0] = F4{ 1.f, 0.f, 0.f, 0 };  // pair (0,1) dot = 0.9 exactly
+            s.nrm[1] = F4{ 0.9f, sN, 0.f, 0 };
+            for (int a = 0; a < 14; ++a)
+            {
+                const float ang = float(a) * 0.44879895f; // 2*pi/14
+                const float z = (a & 1) ? -0.8f : 0.8f;   // alternating z keeps filler pair dots <= ~0.87
+                s.nrm[2 + a] = F4{ 0.6f * std::cos(ang), 0.6f * std::sin(ang), z, 0 };
+            }
+            s.nrm[16] = F4{ 0.f, 0.f, -1.f, 0 }; // maxDot0 = 0.8 < 0.9: not dropped
+            for (int a = 0; a < 17; ++a)
+                s.pts[a] = F4{ float(a), float(a) * 0.5f, 0.f, 0.3f + 0.01f * float(a) };
+            s.pts[0].w = 0.25f; s.pts[1].w = 0.25f; // the exact depth tie
+            s.pts[16].w = -0.5f;
+        }
+        if (i % 1000 == 613)
+        {
+            // review-168 yx3: TWO patch pairs with bitwise-equal dots 0.9 --
+            // (1,0,0)*(0.9,s,0) and (-1,0,0)*(-0.9,-s,0) both reduce to the
+            // single product 0.9f; the strict > keeps the FIRST pair (0,1)
+            // (replacing patch 1); a >= mutant would take (2,3) (patch 2)
+            std::memset(&s, 0, sizeof(s));
+            s.meta = U4{ 17, 0, 0, 0 };
+            const float sN = 0.43588989f;
+            s.nrm[0] = F4{ 1.f, 0.f, 0.f, 0 };
+            s.nrm[1] = F4{ 0.9f, sN, 0.f, 0 };
+            s.nrm[2] = F4{ -1.f, 0.f, 0.f, 0 };
+            s.nrm[3] = F4{ -0.9f, -sN, 0.f, 0 };
+            for (int a = 0; a < 12; ++a)
+            {
+                const float ang = float(a) * 0.52359878f; // 2*pi/12
+                const float z = (a & 1) ? -0.8f : 0.8f;
+                s.nrm[4 + a] = F4{ 0.6f * std::cos(ang), 0.6f * std::sin(ang), z, 0 };
+            }
+            s.nrm[16] = F4{ 0.f, 0.f, -1.f, 0 };
+            for (int a = 0; a < 17; ++a)
+                s.pts[a] = F4{ float(a), 0.f, float(a) * 0.25f, 0.2f };
+            s.pts[0].w = 0.3f; s.pts[1].w = 0.7f; // faithful replaces patch 1
+            s.pts[2].w = 0.6f; s.pts[3].w = 0.1f; // the (2,3) pick would replace patch 2
+            s.pts[16].w = -0.5f;
+        }
         in[i] = s;
         refAcc(s, ref[i]);
         if (ref[i].counts.x == MAXP) ++cFull;
