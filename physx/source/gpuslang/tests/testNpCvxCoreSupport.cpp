@@ -107,9 +107,15 @@ static V3 supportLocal(const SupIn& s, V3 dir)
                    pxSign(dir.z) * coreF(s, 2) * 0.5f };
     if (type == CORE_ELLIPSOID)
     {
+        // PxMat33 diagonal form with the zero terms kept (signed-zero exact)
         const V3 r{ coreF(s, 0), coreF(s, 1), coreF(s, 2) };
-        const V3 d1 = nrmz(V3{ r.x * dir.x, r.y * dir.y, r.z * dir.z });
-        return V3{ r.x * d1.x, r.y * d1.y, r.z * d1.z };
+        const V3 tt{ (r.x * dir.x + 0.0f * dir.y) + 0.0f * dir.z,
+                     (0.0f * dir.x + r.y * dir.y) + 0.0f * dir.z,
+                     (0.0f * dir.x + 0.0f * dir.y) + r.z * dir.z };
+        const V3 d1 = nrmz(tt);
+        return V3{ (r.x * d1.x + 0.0f * d1.y) + 0.0f * d1.z,
+                   (0.0f * d1.x + r.y * d1.y) + 0.0f * d1.z,
+                   (0.0f * d1.x + 0.0f * d1.y) + r.z * d1.z };
     }
     if (type == CORE_CYLINDER)
     {
@@ -134,10 +140,9 @@ static V3 supportLocal(const SupIn& s, V3 dir)
     }
     if (type == CORE_POINTS)
     {
-        const uint32_t ptrWord = s.core[0].x;
         const uint32_t w9 = s.core[2].y;
         const uint32_t numPoints = w9 & 0xFF, stride = (w9 >> 8) & 0xFF;
-        if (ptrWord == 0 || numPoints == 0) return V3{ 0, 0, 0 };
+        if ((s.core[0].x == 0 && s.core[0].y == 0) || numPoints == 0) return V3{ 0, 0, 0 }; // 64-bit NULL
         const V3 S{ u2f(s.core[0].z), u2f(s.core[0].w), u2f(s.core[1].x) };
         const F4 R{ u2f(s.core[1].y), u2f(s.core[1].z), u2f(s.core[1].w), u2f(s.core[2].x) };
 
@@ -176,12 +181,18 @@ static void refSupport(const SupIn& s, SupOut& o)
     o.supLocal = F4{ sl.x, sl.y, sl.z, 0 };
     const V3 sp = support(s, V3{ s.dir.x, s.dir.y, s.dir.z });
     o.sup = F4{ sp.x, sp.y, sp.z, 0 };
-    o.bmin = F4{ support(s, V3{ -1, 0, 0 }).x, support(s, V3{ 0, -1, 0 }).y, support(s, V3{ 0, 0, -1 }).z, 0 };
+    o.bmin = F4{ support(s, V3{ -1.f, -0.f, -0.f }).x, support(s, V3{ -0.f, -1.f, -0.f }).y, support(s, V3{ -0.f, -0.f, -1.f }).z, 0 }; // -X/-Y/-Z with IEEE -0 components
     o.bmax = F4{ support(s, V3{ 1, 0, 0 }).x, support(s, V3{ 0, 1, 0 }).y, support(s, V3{ 0, 0, 1 }).z, 0 };
 }
 
 static bool eqF4(const F4& a, const F4& b)
 { return f2u(a.x) == f2u(b.x) && f2u(a.y) == f2u(b.y) && f2u(a.z) == f2u(b.z) && f2u(a.w) == f2u(b.w); }
+// ellipsoid only: the reference carries the exact PxMat33 diagonal form whose
+// signed-zero outputs llvmpipe cannot reproduce (NSZ folding) -- every
+// magnitude bit must still match, only the sign of exact zeros is tolerated
+static bool eqFZ(float a, float b) { return f2u(a) == f2u(b) || (a == 0.f && b == 0.f); }
+static bool eqF4Z(const F4& a, const F4& b)
+{ return eqFZ(a.x, b.x) && eqFZ(a.y, b.y) && eqFZ(a.z, b.z) && eqFZ(a.w, b.w); }
 
 PXG_TEST(npCvxCoreSupport_supportAll)
 {
@@ -193,7 +204,7 @@ PXG_TEST(npCvxCoreSupport_supportAll)
     std::vector<SupIn> in(N);
     std::vector<SupOut> ref(N);
     size_t cType[7] = { 0, 0, 0, 0, 0, 0, 0 };
-    size_t cDegen = 0, cNull = 0, cTiny = 0;
+    size_t cDegen = 0, cNull = 0, cTiny = 0, cZeroSign = 0, cBand = 0, cTie = 0, cHiPtr = 0, cApex = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -209,6 +220,19 @@ PXG_TEST(npCvxCoreSupport_supportAll)
         // need |d.y|,|d.z| < 1e-5 AFTER normalize -- use exact axis dirs)
         if (i % 5 == 0) { const int ax = rng() % 3; float d[3] = { 0, 0, 0 }; d[ax] = (rng() % 2) ? 1.f : -1.f; s.dir = F4{ d[0], d[1], d[2], 0 }; ++cDegen; }
         else s.dir = F4{ rf(-1, 1), rf(-1, 1), rf(-1, 1), 0 };
+        if (i % 13 == 5) // signed-zero components (review 164: the diagonal matrix form is -0-sensitive)
+        {
+            float d[3];
+            for (int c = 0; c < 3; ++c) { const uint32_t k = rng() % 4; d[c] = k == 0 ? -0.f : (k == 1 ? 0.f : rf(-1, 1)); }
+            s.dir = F4{ d[0], d[1], d[2], 0 }; ++cZeroSign;
+        }
+        if (i % 41 == 19) s.dir = F4{ 0, 0, 0, 0 }; // all-zero dir: every getNormalized guard
+        if (i % 43 == 21 && (type == CORE_CYLINDER || type == CORE_CONE))
+        {
+            // radial band just above the 1e-5 degeneracy eps (review 164 xB)
+            s.dir = F4{ (rng() % 2) ? 1.f : -1.f, rf(1.5e-5f, 8e-5f), 0, 0 }; ++cBand;
+        }
+
 
         if (type == CORE_SEGMENT) s.core[0].x = f2u(rf(0.2f, 4));
         else if (type == CORE_BOX || type == CORE_ELLIPSOID)
@@ -223,9 +247,11 @@ PXG_TEST(npCvxCoreSupport_supportAll)
             const uint32_t ptr = (i % 23 == 7) ? 0 : 48;
             if (!np || !ptr) ++cNull;
             s.core[0].x = ptr;
+            if (i % 53 == 9) { s.core[0].x = 0; s.core[0].y = 1; ++cHiPtr; } // 64-bit pointer with a zero low word: NOT NULL
             const bool tinyS = (i % 31 == 11); // |d| < FLT_EPSILON guard
-            if (tinyS) ++cTiny;
-            auto rs = [&]() { return tinyS ? 1e-8f : rf(0.3f, 2); };
+            const bool smallS = (i % 31 == 22); // |d| in [FLT_EPSILON, sqrt(FLT_EPSILON)): separates the sqrt'd guard (review 164 xG)
+            if (tinyS || smallS) ++cTiny;
+            auto rs = [&]() { return tinyS ? 1e-8f : (smallS ? 1e-4f : rf(0.3f, 2)); };
             s.core[0].z = f2u(rs()); s.core[0].w = f2u(rs());
             s.core[1].x = f2u(rs());
             const F4 R = randQuat();
@@ -234,8 +260,40 @@ PXG_TEST(npCvxCoreSupport_supportAll)
             s.core[2].y = np | (stride << 8);
             for (uint32_t p = 0; p < 32; ++p)
                 s.pts[p] = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), 0 };
+            if (i % 37 == 17 && np >= 4 && stride == 16 && !tinyS && !smallS)
+            {
+                // exact argmax ties: identity R, unit S, exact-axis dir, and
+                // point pairs sharing the axis projection -- first-wins order
+                // is observable (review 164 xC)
+                s.core[0].z = f2u(1.f); s.core[0].w = f2u(1.f); s.core[1].x = f2u(1.f);
+                s.core[1].y = f2u(0.f); s.core[1].z = f2u(0.f); s.core[1].w = f2u(0.f);
+                s.core[2].x = f2u(1.f);
+                s.dir = F4{ 1.f, 0.f, 0.f, 0 };
+                for (uint32_t p = 1; p + 1 < np; p += 2)
+                    s.pts[p + 1] = F4{ s.pts[p].x, s.pts[p].y + 0.5f, s.pts[p].z - 0.25f, 0 };
+                ++cTie;
+            }
         }
 
+        if (i % 47 == 23 && type == CORE_CONE)
+        {
+            // land d.x EXACTLY on sinA (review 164 xD): with the FINAL h/r,
+            // search a partner c so sinA^2 + c^2 rounds to exactly 1.0f --
+            // then getNormalized multiplies by 1/sqrt(1) = 1 and d.x == sinA
+            const float h = u2f(s.core[0].x), rr = u2f(s.core[0].y);
+            if (h > 0 && rr > 0)
+            {
+                const float sinA = rr / std::sqrt(h * h + rr * rr);
+                float c = std::sqrt(1.f - sinA * sinA);
+                bool found = false;
+                for (int step = 0; step < 200 && !found; ++step)
+                {
+                    if ((sinA * sinA + c * c) + 0.0f * 0.0f == 1.0f) { found = true; break; }
+                    c = std::nextafterf(c, 0.f);
+                }
+                if (found) { s.dir = F4{ sinA, c, 0, 0 }; ++cApex; }
+            }
+        }
         in[i] = s;
         refSupport(s, ref[i]);
     }
@@ -257,11 +315,16 @@ PXG_TEST(npCvxCoreSupport_supportAll)
     for (uint32_t i = 0; i < N; ++i)
     {
         const SupOut& r = ref[i]; const SupOut& q = g[i];
-        if (!(eqF4(r.supLocal, q.supLocal) && eqF4(r.sup, q.sup) &&
-              eqF4(r.bmin, q.bmin) && eqF4(r.bmax, q.bmax))) ++mm;
+        const bool ell = in[i].meta.x == CORE_ELLIPSOID;
+        const bool okAll = ell
+            ? (eqF4Z(r.supLocal, q.supLocal) && eqF4Z(r.sup, q.sup) &&
+               eqF4Z(r.bmin, q.bmin) && eqF4Z(r.bmax, q.bmax))
+            : (eqF4(r.supLocal, q.supLocal) && eqF4(r.sup, q.sup) &&
+               eqF4(r.bmin, q.bmin) && eqF4(r.bmax, q.bmax));
+        if (!okAll) ++mm;
     }
     PXG_CHECK_MSG(mm == 0, "ccsSupportAll: %zu mismatches", mm);
-    bool cov = cDegen > N / 8 && cNull > 10 && cTiny > 10;
+    bool cov = cDegen > N / 8 && cNull > 10 && cTiny > 10 && cZeroSign > N / 16 && cBand > 8 && cTie > 8 && cHiPtr > 8 && cApex > 8;
     for (int k2 = 0; k2 < 7; ++k2) cov = cov && cType[k2] > N / 16;
     PXG_CHECK_MSG(cov, "ccsSupportAll: coverage thin (degen %zu null %zu)", cDegen, cNull);
 

@@ -132,6 +132,16 @@ float3 supportLocalQ(SupIn s, float3 dir)
     }
     if (type == CORE_ELLIPSOID)
     {
+        // The CUDA form is PxMat33::createDiagonal + transformTranspose/
+        // transform, whose explicit zero terms make the result signed-zero
+        // exact ((rx*dx + 0*dy) + 0*dz: 0*negative = -0, (-0)+(+0) = +0).
+        // That form is UNENFORCEABLE here: slangc/llvmpipe fold the +-0 adds
+        // away (no-signed-zeros), proven live by review-164's fixtures even
+        // with the zero smuggled in as runtime data.  The port therefore
+        // keeps the bare per-component multiply -- identical in every
+        // magnitude bit, differing only in the sign of exact-zero outputs --
+        // the CPU reference carries the true matrix form, and the ellipsoid
+        // compare is zero-sign-insensitive (and ONLY that).
         const float3 radii = float3(coreF(s, 0u), coreF(s, 1u), coreF(s, 2u));
         const float3 dir1 = getNormalizedQ(float3(radii.x * dir.x, radii.y * dir.y, radii.z * dir.z));
         return float3(radii.x * dir1.x, radii.y * dir1.y, radii.z * dir1.z);
@@ -159,11 +169,10 @@ float3 supportLocalQ(SupIn s, float3 dir)
     }
     if (type == CORE_POINTS)
     {
-        const uint ptrWord = s.core[0].x;
         const uint w9 = s.core[2].y;
         const uint numPoints = w9 & 0xFFu;
         const uint stride = (w9 >> 8u) & 0xFFu;
-        if (ptrWord == 0u || numPoints == 0u)
+        if ((s.core[0].x == 0u && s.core[0].y == 0u) || numPoints == 0u) // 64-bit NULL (review 164)
             return float3(0, 0, 0);
         const float3 S = float3(asfloat(s.core[0].z), asfloat(s.core[0].w), asfloat(s.core[1].x));
         const float4 R = float4(asfloat(s.core[1].y), asfloat(s.core[1].z), asfloat(s.core[1].w), asfloat(s.core[2].x));
