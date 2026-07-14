@@ -218,8 +218,8 @@ struct CeacTgsIn
     CTRow contacts[6];
 }
 
-RWStructuredBuffer<CeacTgsIn> gInT;    // binding 0
-RWStructuredBuffer<CeacOut> gOutT;     // binding 1
+RWStructuredBuffer<CeacTgsIn> gInT;    // binding 2 (gInP/gOutP occupy 0/1)
+RWStructuredBuffer<CeacOut> gOutT;     // binding 3
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
