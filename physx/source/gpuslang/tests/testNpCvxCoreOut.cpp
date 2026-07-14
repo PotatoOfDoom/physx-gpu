@@ -295,7 +295,8 @@ static bool eqOut(const CoreOutOut& r, const CoreOutOut& q)
 }
 
 static void fillCommon(CoreOutIn& s, std::mt19937& rng, uint32_t i,
-                       size_t& cOvfC, size_t& cOvfF, size_t& cOvfP, size_t& cHigh)
+                       size_t& cOvfC, size_t& cOvfF, size_t& cOvfP, size_t& cHigh,
+                       size_t& cHighF, size_t& cHighP)
 {
     auto rf = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng() % 1000000) / 1000000.f); };
 
@@ -310,6 +311,8 @@ static void fillCommon(CoreOutIn& s, std::mt19937& rng, uint32_t i,
     if (i % 7 == 2) { limF = initF + 4 * (rng() % 3); ++cOvfF; }          // force tight
     if (i % 6 == 3) { limP = initP + 64 * (rng() % 3); ++cOvfP; }         // patch tight
     if (i % 11 == 4) { initC = 0xFFFFFFF0u; limC = 0xFFFFFFFFu; ++cHigh; } // 64-bit promote region
+    if (i % 11 == 7) { initF = 0xFFFFFFFCu; limF = 0xFFFFFFFFu; ++cHighF; } // force counter high region (review 162)
+    if (i % 11 == 9) { initP = 0xFFFFFFC0u; limP = 0xFFFFFFFFu; ++cHighP; } // patch counter high region (review 162)
     s.counters = U4{ initC, initF, initP, 0 };
     s.cfg = U4{ limC, limF, limP, 0 };
 
@@ -330,12 +333,12 @@ PXG_TEST(npCvxCoreOut_writeContacts)
 
     std::vector<CoreOutIn> in(N);
     std::vector<CoreOutOut> ref(N);
-    size_t cOvfC = 0, cOvfF = 0, cOvfP = 0, cHigh = 0, cZero = 0;
+    size_t cOvfC = 0, cOvfF = 0, cOvfP = 0, cHigh = 0, cHighF = 0, cHighP = 0, cZero = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
         CoreOutIn s{};
-        fillCommon(s, rng, i, cOvfC, cOvfF, cOvfP, cHigh);
+        fillCommon(s, rng, i, cOvfC, cOvfF, cOvfP, cHigh, cHighF, cHighP);
         const uint32_t nb = (i % 9 == 0) ? 0 : 1 + rng() % 4; // MAX_CONVEX_CONTACTS = 4
         if (!nb) ++cZero;
         s.misc.x = nb;
@@ -363,9 +366,10 @@ PXG_TEST(npCvxCoreOut_writeContacts)
     for (uint32_t i = 0; i < N; ++i)
         if (!eqOut(ref[i], g[i])) ++mm;
     PXG_CHECK_MSG(mm == 0, "ccoWriteContacts: %zu mismatches", mm);
-    PXG_CHECK_MSG(cZero > N / 16 && cOvfC > N / 8 && cOvfF > N / 10 && cOvfP > N / 8 && cHigh > N / 16,
-                  "ccoWriteContacts: coverage thin (zero %zu ovfC %zu ovfF %zu ovfP %zu high %zu)",
-                  cZero, cOvfC, cOvfF, cOvfP, cHigh);
+    PXG_CHECK_MSG(cZero > N / 16 && cOvfC > N / 8 && cOvfF > N / 10 && cOvfP > N / 8 &&
+                  cHigh > N / 16 && cHighF > N / 16 && cHighP > N / 16,
+                  "ccoWriteContacts: coverage thin (zero %zu ovfC %zu ovfF %zu ovfP %zu high %zu/%zu/%zu)",
+                  cZero, cOvfC, cOvfF, cOvfP, cHigh, cHighF, cHighP);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }
@@ -378,12 +382,12 @@ PXG_TEST(npCvxCoreOut_writeContact)
 
     std::vector<CoreOutIn> in(N);
     std::vector<CoreOutOut> ref(N);
-    size_t cOvfC = 0, cOvfF = 0, cOvfP = 0, cHigh = 0, cZero = 0, cMany = 0;
+    size_t cOvfC = 0, cOvfF = 0, cOvfP = 0, cHigh = 0, cHighF = 0, cHighP = 0, cZero = 0, cMany = 0, cSplit = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
         CoreOutIn s{};
-        fillCommon(s, rng, i, cOvfC, cOvfF, cOvfP, cHigh);
+        fillCommon(s, rng, i, cOvfC, cOvfF, cOvfP, cHigh, cHighF, cHighP);
         const uint32_t nPatches = (i % 9 == 0) ? 0 : 1 + rng() % 16; // MAX_PATCHES = 16
         if (!nPatches) ++cZero;
         if (nPatches > 8) ++cMany;
@@ -399,6 +403,8 @@ PXG_TEST(npCvxCoreOut_writeContact)
         }
         s.misc.z = nPatches;
         s.misc.w = nPoints;
+        if (i % 23 == 5) { s.misc.w = 0; ++cSplit; }               // patches without points
+        if (i % 23 == 16) { s.misc.z = 0; s.misc.w = 3; ++cSplit; } // points without patches
         in[i] = s;
         refWriteContact(s, ref[i]);
     }
@@ -420,9 +426,10 @@ PXG_TEST(npCvxCoreOut_writeContact)
     for (uint32_t i = 0; i < N; ++i)
         if (!eqOut(ref[i], g[i])) ++mm;
     PXG_CHECK_MSG(mm == 0, "ccoWriteContact: %zu mismatches", mm);
-    PXG_CHECK_MSG(cZero > N / 16 && cMany > N / 4 && cOvfC > N / 8 && cOvfF > N / 10 && cOvfP > N / 8 && cHigh > N / 16,
-                  "ccoWriteContact: coverage thin (zero %zu many %zu ovfC %zu ovfF %zu ovfP %zu high %zu)",
-                  cZero, cMany, cOvfC, cOvfF, cOvfP, cHigh);
+    PXG_CHECK_MSG(cZero > N / 16 && cMany > N / 4 && cOvfC > N / 8 && cOvfF > N / 10 && cOvfP > N / 8 &&
+                  cHigh > N / 16 && cHighF > N / 16 && cHighP > N / 16 && cSplit > N / 16,
+                  "ccoWriteContact: coverage thin (zero %zu many %zu ovfC %zu ovfF %zu ovfP %zu high %zu/%zu/%zu split %zu)",
+                  cZero, cMany, cOvfC, cOvfF, cOvfP, cHigh, cHighF, cHighP, cSplit);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }
