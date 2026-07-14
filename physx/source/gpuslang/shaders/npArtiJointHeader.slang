@@ -91,7 +91,7 @@ RWStructuredBuffer<JhIn> gIn;      // binding 0
 RWStructuredBuffer<JhPgOut> gPg;   // binding 1
 RWStructuredBuffer<JhTgOut> gTg;   // binding 2
 
-float pxMaxQ(float a, float b) { return (a < b) ? b : a; }
+float pxMaxQ(float a, float b) { return (a > b) ? a : b; }  // PxMax float = intrinsics::selectMax
 
 uint breakableQ(float linBreakForce, float angBreakForce)
 {

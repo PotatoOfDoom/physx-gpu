@@ -113,7 +113,7 @@ RWStructuredBuffer<J1Out> gOut;  // binding 1
 
 float dot3Q(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 
-float pxMaxQ(float a, float b) { return (a < b) ? b : a; }
+float pxMaxQ(float a, float b) { return (a > b) ? a : b; }  // PxMax float = intrinsics::selectMax
 
 // column[j][i] flattened at j*6+i over resp[9] float4 lanes
 float respAt(float4 m[9], uint j, uint i)

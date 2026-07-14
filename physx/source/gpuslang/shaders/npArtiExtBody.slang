@@ -117,7 +117,7 @@ float3 quatRotQ(float4 q, float3 v)
                   vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * dot2);
 }
 
-float pxMaxQ(float a, float b) { return (a < b) ? b : a; }
+float pxMaxQ(float a, float b) { return (a > b) ? a : b; }  // PxMax float = intrinsics::selectMax
 float pxMinQ(float a, float b) { return (a < b) ? a : b; }
 
 // column[j][i] flattened at j*6+i over resp[9] float4 lanes
