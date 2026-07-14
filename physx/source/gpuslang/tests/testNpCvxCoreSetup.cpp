@@ -213,7 +213,7 @@ static void fillBase(CssIn& s, std::mt19937& rng)
     s.s0ScaleS = F4{ rf(0.1f, 3), rf(0.1f, 3), rf(0.1f, 3), 0 }; s.s0ScaleR = randQuat(rng);
     s.s1ScaleS = F4{ rf(0.1f, 3), rf(0.1f, 3), rf(0.1f, 3), 0 }; s.s1ScaleR = randQuat(rng);
     s.dists = F4{ rf(0.01f, 0.5f), rf(0.01f, 0.5f), rf(0, 0.2f), 0 };
-    s.misc = U4{ uint32_t(rng() % 1024), uint32_t(rng() % 1024), uint32_t(rng() % 2), 0 };
+    s.misc = U4{ uint32_t(rng()), uint32_t(rng()), uint32_t(rng() % 2), 0 }; // full-width cacheRef passthrough (review 163)
 }
 
 PXG_TEST(npCvxCoreSetup_planePrep)
@@ -231,7 +231,7 @@ PXG_TEST(npCvxCoreSetup_planePrep)
         fillBase(s, rng);
         const bool planeFirst = (rng() % 2) == 0;
         U4 planeInfo{ GEOM_PLANE, uint32_t(rng()), uint32_t(rng()), 0 };
-        U4 coreInfo{ GEOM_CONVEXCORE, uint32_t(rng() % 7), uint32_t(rng()), 0 }; // hull ptr carries the core enum
+        U4 coreInfo{ GEOM_CONVEXCORE, uint32_t(rng()), uint32_t(rng()), 0 }; // hull ptr carries the core enum; full 32-bit passthrough (review 163)
         s.s0Info = planeFirst ? planeInfo : coreInfo;
         s.s1Info = planeFirst ? coreInfo : planeInfo;
         if (!planeFirst) ++cSwap;
@@ -282,8 +282,8 @@ PXG_TEST(npCvxCoreSetup_convexPrep)
         const uint32_t k1 = (i % 17 == 0) ? 5 : rng() % 5;
         if (k0 < 5) ++cTypes[k0]; else ++cBad;
         if (k1 < 5) ++cTypes[k1]; else ++cBad;
-        s.s0Info = U4{ types[k0], uint32_t(rng() % 7), uint32_t(rng()), 0 };
-        s.s1Info = U4{ types[k1], uint32_t(rng() % 7), uint32_t(rng()), 0 };
+        s.s0Info = U4{ types[k0], uint32_t(rng()), uint32_t(rng()), 0 };
+        s.s1Info = U4{ types[k1], uint32_t(rng()), uint32_t(rng()), 0 };
         in[i] = s;
         refConvexPrep(s, ref[i]);
     }
