@@ -287,4 +287,493 @@ PXG_TEST(npArtiExtBody_body)
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }
 
+// ---- setupFinalizeExtSolverConstraintsBlock, PGS (tranche 180) ----
+
+struct FzIn
+{
+    U4 bMeta;
+    F4 b0resp[9];
+    F4 b0velTop, b0velBot, b0q, b0p;
+    F4 b1resp[9];
+    F4 b1velTop, b1velBot, b1q, b1p;
+    U4 cfgU;
+    F4 invMassScale, normalRest, mat, scal;
+    F4 cPts[12];
+    F4 anchors0[2], anchors1[2];
+    U4 contactIDs;
+};
+
+struct FzOut
+{
+    U4 hdrU;
+    U4 writeMask;
+    F4 invMassOut, normalSF, hdrF;
+    F4 fricN[2];
+    F4 cOut[18];
+    F4 artiC[18];
+    F4 fOut[12];
+    F4 artiF[12];
+};
+
+struct RBody
+{
+    const F4* resp;
+    float velTop[3], velBot[3], p[3];
+    F4 q;
+    float penBiasClamp, maxImpulse, cfm;
+    bool isArt, isKin;
+};
+
+static void rCross(const float* a, const float* b, float* o)
+{
+    o[0] = a[1] * b[2] - a[2] * b[1];
+    o[1] = a[2] * b[0] - a[0] * b[2];
+    o[2] = a[0] * b[1] - a[1] * b[0];
+}
+static float rDot(const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+static void rQuatRot(const F4& q, const float* v, float* o)
+{
+    const float vx = 2.f * v[0], vy = 2.f * v[1], vz = 2.f * v[2];
+    const float w2 = q.w * q.w - 0.5f;
+    const float d2 = q.x * vx + q.y * vy + q.z * vz;
+    o[0] = vx * w2 + (q.y * vz - q.z * vy) * q.w + q.x * d2;
+    o[1] = vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * d2;
+    o[2] = vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * d2;
+}
+static float rmAt(const F4* m, int j, int i) { return rAt(m, j, i); }
+static void rSpatialMul(const F4* resp, const float* vt, const float* vb, float* ot, float* ob)
+{
+    float st[6] = { vt[0], vt[1], vt[2], vb[0], vb[1], vb[2] };
+    float res[6];
+    for (int i = 0; i < 6; ++i)
+    {
+        res[i] = 0.f;
+        for (int j = 0; j < 6; ++j)
+            res[i] += rmAt(resp, j, i) * st[j];
+    }
+    ot[0] = res[0]; ot[1] = res[1]; ot[2] = res[2];
+    ob[0] = res[3]; ob[1] = res[4]; ob[2] = res[5];
+}
+static void rCirv(const RBody& b, const float* top, const float* bot, float* ot, float* ob)
+{
+    if (b.isArt || b.isKin)
+    {
+        for (int k = 0; k < 3; ++k) { ot[k] = top[k]; ob[k] = bot[k]; }
+    }
+    else
+    {
+        ot[0] = rmAt(b.resp, 3, 0) * top[0] + rmAt(b.resp, 3, 1) * top[1] + rmAt(b.resp, 3, 2) * top[2];
+        ot[1] = rmAt(b.resp, 4, 0) * top[0] + rmAt(b.resp, 4, 1) * top[1] + rmAt(b.resp, 4, 2) * top[2];
+        ot[2] = rmAt(b.resp, 5, 0) * top[0] + rmAt(b.resp, 5, 1) * top[1] + rmAt(b.resp, 5, 2) * top[2];
+        for (int k = 0; k < 3; ++k) ob[k] = bot[k];
+    }
+}
+static void rSlopZero(float* v, float slop)
+{
+    for (int k = 0; k < 3; ++k) v[k] = std::fabs(v[k]) < slop ? 0.f : v[k];
+}
+static float pxMaxR(float a, float b) { return (a < b) ? b : a; }
+static float pxMinR(float a, float b) { return (a < b) ? a : b; }
+
+// exact transcription of setupFinalizeExtSolverConstraintsBlock PGS
+// (artiConstraintPrep2.cu L169-613)
+static void refFinalizePGS(const FzIn& s, FzOut& o)
+{
+    std::memset(&o, 0, sizeof(o));
+
+    RBody b0{ s.b0resp, { s.b0velTop.x, s.b0velTop.y, s.b0velTop.z },
+              { s.b0velBot.x, s.b0velBot.y, s.b0velBot.z }, { s.b0p.x, s.b0p.y, s.b0p.z }, s.b0q,
+              s.b0velTop.w, s.b0velBot.w, s.b0p.w, s.bMeta.x != 0, s.bMeta.y != 0 };
+    RBody b1{ s.b1resp, { s.b1velTop.x, s.b1velTop.y, s.b1velTop.z },
+              { s.b1velBot.x, s.b1velBot.y, s.b1velBot.z }, { s.b1p.x, s.b1p.y, s.b1p.z }, s.b1q,
+              s.b1velTop.w, s.b1velBot.w, s.b1p.w, s.bMeta.z != 0, s.bMeta.w != 0 };
+
+    const uint32_t flags = s.cfgU.x;
+    const uint32_t contactCount = s.cfgU.y;
+    const uint32_t aCount = s.cfgU.z;
+    const bool perPointFriction = s.cfgU.w != 0;
+    const float restDistance = s.mat.x;
+    const float invDt = s.scal.x, dt = s.scal.y, bounceThreshold = s.scal.z,
+                solverOffsetSlop = s.scal.w;
+    const float ccdMaxSeparation = 3.402823466e+38f;  // isCCD hard-false
+
+    const float maxPenBias = pxMaxR(b0.penBiasClamp, b1.penBiasClamp);
+    const float invDtp8 = invDt * 0.8f;
+    const F4 ims = s.invMassScale;
+    const float cfm = pxMaxR(b0.cfm, b1.cfm);
+    const uint32_t anchorCount = aCount * 2;
+
+    if (contactCount == 0)
+    {
+        o.hdrU = U4{ 0xFFFFFFFFu, 0, 0, 0 };
+        o.writeMask.x = 1;
+        return;
+    }
+
+    const float maxImpulse = pxMinR(b0.maxImpulse, b1.maxImpulse);
+    o.invMassOut = F4{ ims.x, ims.z, ims.y, ims.w };
+
+    const float normal[3] = { s.normalRest.x, s.normalRest.y, s.normalRest.z };
+    const float restitution = s.normalRest.w;
+    const float damping = s.mat.y;
+    const float norVel0 = rDot(normal, b0.velBot);
+    const float norVel1 = rDot(normal, b1.velBot);
+    const float linNorVel = norVel0 - norVel1;
+
+    float normalForce = 0.f;
+
+    for (uint32_t j = 0; j < contactCount && j < 6; ++j)
+    {
+        const F4& p4 = s.cPts[j * 2 + 0];
+        const F4& tv4 = s.cPts[j * 2 + 1];
+        const float point[3] = { p4.x, p4.y, p4.z };
+        const float separation = p4.w;
+        const float targetVel3[3] = { tv4.x, tv4.y, tv4.z };
+        const float cTargetVel = rDot(normal, targetVel3);
+
+        float ra[3], rb[3], raXn[3], rbXn[3];
+        for (int k = 0; k < 3; ++k) { ra[k] = point[k] - b0.p[k]; rb[k] = point[k] - b1.p[k]; }
+        rCross(ra, normal, raXn);
+        rCross(rb, normal, rbXn);
+
+        const float angNorVel = rDot(raXn, b0.velTop) - rDot(rbXn, b1.velTop);
+        const float slop =
+            solverOffsetSlop * pxMaxR(linNorVel == 0.f ? 1.f : angNorVel / linNorVel, 1.f);
+        rSlopZero(raXn, slop);
+        rSlopZero(rbXn, slop);
+
+        float nraXn[3] = { -rbXn[0], -rbXn[1], -rbXn[2] };
+        float nNormal[3] = { -normal[0], -normal[1], -normal[2] };
+        float r0t[3], r0b[3], r1t[3], r1b[3];
+        rCirv(b0, raXn, normal, r0t, r0b);
+        rCirv(b1, nraXn, nNormal, r1t, r1b);
+
+        float in0t[3], in0b[3], in1t[3], in1b[3];
+        for (int k = 0; k < 3; ++k)
+        {
+            in0t[k] = normal[k] * ims.x; in0b[k] = raXn[k] * ims.y;
+            in1t[k] = -normal[k] * ims.z; in1b[k] = -rbXn[k] * ims.w;
+        }
+        float dV0t[3], dV0b[3], dV1t[3], dV1b[3];
+        rSpatialMul(b0.resp, in0t, in0b, dV0t, dV0b);
+        rSpatialMul(b1.resp, in1t, in1b, dV1t, dV1b);
+
+        const float resp0 = rDot(dV0t, r0t) + rDot(dV0b, r0b);
+        const float resp1 = rDot(dV1t, r1t) + rDot(dV1b, r1b);
+        const float unitResponse = resp0 + resp1;
+
+        const float vrel1 = norVel0 + rDot(b0.velTop, raXn);
+        const float vrel2 = norVel1 + rDot(b1.velTop, rbXn);
+        const float vrel = vrel1 - vrel2;
+
+        const float penetration = separation - restDistance;
+        const bool isSeparated = penetration >= 0.f;
+        const float penetrationInvDt = penetration * invDt;
+        const float penetrationInvDtPt8 = pxMaxR(maxPenBias, penetration * invDtp8);
+
+        const bool collidingWithVrel = (-vrel) > penetrationInvDt;
+        const bool isGreater2 = (restitution > 0.f) && (bounceThreshold > vrel) && collidingWithVrel;
+        const bool ccdSeparationCondition = ccdMaxSeparation >= penetration;
+
+        float targetVelocity = cTargetVel + (isGreater2 ? (-vrel) * restitution : 0.f);
+        const float tvel = targetVelocity;
+        if (!b0.isArt) targetVelocity -= vrel1;
+        if (!b1.isArt) targetVelocity += vrel2;
+
+        const float recipResponse = (unitResponse > 0.f) ? (1.f / (unitResponse + cfm)) : 0.f;
+        float velMultiplier = recipResponse;
+
+        float coeff0, coeff1;
+        if (restitution < 0.f)
+        {
+            const bool accelSpring = (flags & 8u) != 0;
+            const float massIfAccelElseOne = accelSpring ? recipResponse : 1.f;
+            const float oneIfAccelElseR = accelSpring ? 1.f : unitResponse;
+            const float nrdt = dt * restitution;
+            const float dampingIfEnabled = (isSeparated && !collidingWithVrel) ? 0.f : damping;
+            const float a = dt * (dampingIfEnabled - nrdt);
+            const float x = 1.f / (a * oneIfAccelElseR + 1.f);
+            velMultiplier = x * a * massIfAccelElseOne;
+            coeff0 = a;
+            coeff1 = -nrdt * penetration;
+        }
+        else
+        {
+            float scaledBias = isSeparated ? penetrationInvDt : penetrationInvDtPt8;
+            if (ccdSeparationCondition && isGreater2)
+                scaledBias = 0.f;
+            float unbiasedErr = targetVelocity;
+            const float biasedErr = unbiasedErr - scaledBias;
+            if (!isGreater2)
+                unbiasedErr -= pxMaxR(0.f, scaledBias);
+            coeff0 = biasedErr;
+            coeff1 = unbiasedErr;
+        }
+
+        o.cOut[j * 3 + 0] = F4{ r0t[0], r0t[1], r0t[2], targetVelocity };
+        o.cOut[j * 3 + 1] = F4{ -r1t[0], -r1t[1], -r1t[2], pxMinR(maxImpulse, tv4.w) };
+        o.cOut[j * 3 + 2] = F4{ resp0, resp1, coeff0, coeff1 };
+
+        const float deltaF =
+            pxMaxR((tvel - (vrel + pxMaxR(penetrationInvDt, 0.f))) * velMultiplier, 0.f);
+        normalForce += deltaF;
+
+        o.artiC[j * 3 + 0] = F4{ dV0b[0], dV0b[1], dV0b[2], dV0t[0] };
+        o.artiC[j * 3 + 1] = F4{ dV0t[1], dV0t[2], dV1b[0], dV1b[1] };
+        o.artiC[j * 3 + 2] = F4{ dV1b[2], dV1t[0], dV1t[1], dV1t[2] };
+    }
+
+    o.hdrF.z = (normalForce / float(contactCount)) * 0.25f;
+
+    const float frictionScale = (aCount == 2) ? 0.5f : 1.f;
+    const float staticFriction = s.mat.z * frictionScale;
+    const float dynamicFriction = s.mat.w * frictionScale;
+    const bool haveFriction = anchorCount != 0;
+
+    o.hdrU = U4{ 0, flags, contactCount, anchorCount };
+    o.hdrF.x = restitution;
+    o.hdrF.y = cfm;
+    o.hdrF.w = dynamicFriction;
+    o.normalSF = F4{ normal[0], normal[1], normal[2], staticFriction };
+    o.writeMask.x = 2;
+
+    if (haveFriction)
+    {
+        o.writeMask.x |= 4;
+        float vrelV[3];
+        for (int k = 0; k < 3; ++k) vrelV[k] = b0.velBot[k] - b1.velBot[k];
+
+        const float orthoThreshold = 0.70710678f;
+        const float p1 = 0.0001f;
+        float t0[3];
+        {
+            const float fb1[3] = { 0.f, -normal[2], normal[1] };
+            const float fb2[3] = { -normal[1], normal[0], 0.f };
+            const float* fb = orthoThreshold > std::fabs(normal[0]) ? fb1 : fb2;
+            const float nv = rDot(normal, vrelV);
+            for (int k = 0; k < 3; ++k) t0[k] = vrelV[k] - normal[k] * nv;
+            if (!(rDot(t0, t0) > p1))
+                for (int k = 0; k < 3; ++k) t0[k] = fb[k];
+            const float m = std::sqrt(rDot(t0, t0));
+            if (m > 0.f)
+            {
+                const float inv = 1.f / m;
+                for (int k = 0; k < 3; ++k) t0[k] *= inv;
+            }
+        }
+        float t1[3];
+        rCross(normal, t0, t1);
+
+        o.fricN[0] = F4{ t0[0], t0[1], t0[2], 0.f };
+        o.fricN[1] = F4{ t1[0], t1[1], t1[2], 0.f };
+
+        for (uint32_t j = 0; j < aCount && j < 2; ++j)
+        {
+            const float a0[3] = { s.anchors0[j].x, s.anchors0[j].y, s.anchors0[j].z };
+            const float a1[3] = { s.anchors1[j].x, s.anchors1[j].y, s.anchors1[j].z };
+            float ra[3], rb[3], error[3];
+            rQuatRot(b0.q, a0, ra);
+            rQuatRot(b1.q, a1, rb);
+            for (int k = 0; k < 3; ++k) error[k] = (ra[k] + b0.p[k]) - (rb[k] + b1.p[k]);
+
+            const uint32_t index = perPointFriction ? (j == 0 ? s.contactIDs.x : s.contactIDs.y) : 0;
+            const float tvel3[3] = { s.cPts[index * 2 + 1].x, s.cPts[index * 2 + 1].y,
+                                     s.cPts[index * 2 + 1].z };
+
+            for (int rrow = 0; rrow < 2; ++rrow)
+            {
+                const float* t = rrow == 0 ? t0 : t1;
+                float raXn[3], rbXn[3];
+                rCross(ra, t, raXn);
+                rCross(rb, t, rbXn);
+                rSlopZero(raXn, solverOffsetSlop);
+                rSlopZero(rbXn, solverOffsetSlop);
+
+                float nrbXn[3] = { -rbXn[0], -rbXn[1], -rbXn[2] };
+                float nt[3] = { -t[0], -t[1], -t[2] };
+                float r0t[3], r0b[3], r1t[3], r1b[3];
+                rCirv(b0, raXn, t, r0t, r0b);
+                rCirv(b1, nrbXn, nt, r1t, r1b);
+
+                float in0t[3], in0b[3], in1t[3], in1b[3];
+                for (int k = 0; k < 3; ++k)
+                {
+                    in0t[k] = t[k] * s.invMassScale.x; in0b[k] = raXn[k] * s.invMassScale.y;
+                    in1t[k] = -t[k] * s.invMassScale.z; in1b[k] = -rbXn[k] * s.invMassScale.w;
+                }
+                float dV0t[3], dV0b[3], dV1t[3], dV1b[3];
+                rSpatialMul(b0.resp, in0t, in0b, dV0t, dV0b);
+                rSpatialMul(b1.resp, in1t, in1b, dV1t, dV1b);
+
+                const float resp0 = rDot(dV0t, r0t) + rDot(dV0b, r0b);
+                const float resp1 = rDot(dV1t, r1t) + rDot(dV1b, r1b);
+
+                float targetVel = rDot(tvel3, t);
+                if (!b0.isArt)
+                    targetVel -= rDot(b0.velTop, raXn) + rDot(b0.velBot, t);
+                if (!b1.isArt)
+                    targetVel += rDot(b1.velTop, rbXn) + rDot(b1.velBot, t);
+
+                const float bias = rDot(t, error) * invDt;
+                const uint32_t slot = j * 2 + rrow;
+                o.fOut[slot * 3 + 0] = F4{ r0t[0], r0t[1], r0t[2], bias };
+                o.fOut[slot * 3 + 1] = F4{ -r1t[0], -r1t[1], -r1t[2], targetVel };
+                o.fOut[slot * 3 + 2] = F4{ resp0, resp1, 0.f, 0.f };
+
+                o.artiF[slot * 3 + 0] = F4{ dV0b[0], dV0b[1], dV0b[2], dV0t[0] };
+                o.artiF[slot * 3 + 1] = F4{ dV0t[1], dV0t[2], dV1b[0], dV1b[1] };
+                o.artiF[slot * 3 + 2] = F4{ dV1b[2], dV1t[0], dV1t[1], dV1t[2] };
+            }
+        }
+    }
+}
+
+PXG_TEST(npArtiExtBody_finalizePGS)
+{
+    std::mt19937 rng(180001);
+    const uint32_t N = 3000;
+    auto rf = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng() % 1000000) / 1000000.f); };
+    auto rq = [&]() {
+        float a[4]; float m2 = 0;
+        for (int k = 0; k < 4; ++k) { a[k] = rf(-1, 1); m2 += a[k] * a[k]; }
+        const float i = 1.f / std::sqrt(m2 > 0 ? m2 : 1.f);
+        return F4{ a[0] * i, a[1] * i, a[2] * i, a[3] * i };
+    };
+
+    std::vector<FzIn> in(N);
+    std::vector<FzOut> ref(N);
+    size_t cEarly = 0, cCompliant = 0, cBounce = 0, cFric = 0, cNoFric = 0, cFall = 0, cZeroLNV = 0,
+           cArtArt = 0, cMixed = 0, cKin = 0, cPPF = 0, cA2 = 0;
+
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        FzIn s{};
+        // body kinds: 0 arti, 1 dynamic, 2 kinematic
+        const uint32_t k0 = rng() % 3, k1 = rng() % 3;
+        s.bMeta = U4{ k0 == 0 ? 1u : 0u, k0 == 2 ? 1u : 0u, k1 == 0 ? 1u : 0u, k1 == 2 ? 1u : 0u };
+        if (k0 == 0 && k1 == 0) ++cArtArt; else if (k0 == 0 || k1 == 0) ++cMixed;
+        if (k0 == 2 || k1 == 2) ++cKin;
+
+        auto fillBody = [&](F4* resp, F4& vt, F4& vb, F4& q, F4& p) {
+            for (int f = 0; f < 9; ++f)
+                resp[f] = F4{ rf(-1, 1), rf(-1, 1), rf(-1, 1), rf(-1, 1) };
+            vt = F4{ rf(-3, 3), rf(-3, 3), rf(-3, 3), rf(-10, 0) };
+            vb = F4{ rf(-3, 3), rf(-3, 3), rf(-3, 3), rf(0.5f, 1e5f) };
+            q = rq();
+            p = F4{ rf(-5, 5), rf(-5, 5), rf(-5, 5), rf(0, 0.1f) };
+        };
+        fillBody(s.b0resp, s.b0velTop, s.b0velBot, s.b0q, s.b0p);
+        fillBody(s.b1resp, s.b1velTop, s.b1velBot, s.b1q, s.b1p);
+
+        const uint32_t contactCount = (i % 13 == 7) ? 0u : (1u + rng() % 6u);
+        const uint32_t aCount = rng() % 3u;
+        const bool ppf = (rng() % 2) != 0;
+        uint32_t solverFlags = (rng() % 2 ? 1u : 0u) | (rng() % 2 ? 2u : 0u) |
+                               (rng() % 2 ? 4u : 0u) | (rng() % 2 ? 8u : 0u);
+        s.cfgU = U4{ solverFlags, contactCount, aCount, ppf ? 1u : 0u };
+        if (contactCount == 0) ++cEarly;
+        if (aCount > 0 && contactCount) ++cFric; else if (contactCount) ++cNoFric;
+        if (aCount == 2) ++cA2;
+        if (ppf && aCount && contactCount) ++cPPF;
+
+        s.invMassScale = F4{ rf(0, 1.5f), rf(0, 1.5f), rf(0, 1.5f), rf(0, 1.5f) };
+        float n[3] = { rf(-1, 1), rf(-1, 1), rf(-1, 1) };
+        if (i % 5 == 2) { n[0] = (rng() % 2) ? 0.9f : -0.9f; }  // |normal.x| > ortho
+        const float nm = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        for (int k = 0; k < 3; ++k) n[k] /= (nm > 0 ? nm : 1.f);
+        // restitution: <0 compliant, 0, >0 bounce
+        const int rMode = rng() % 4;
+        const float restitution = rMode == 0 ? rf(-500.f, -1.f) : (rMode == 1 ? 0.f : rf(0.1f, 1.f));
+        if (rMode == 0) ++cCompliant;
+        if (rMode >= 2) ++cBounce;
+        s.normalRest = F4{ n[0], n[1], n[2], restitution };
+        s.mat = F4{ rf(-0.05f, 0.1f), rf(0, 50.f), rf(0, 2.f), rf(0, 2.f) };
+        s.scal = F4{ rf(30.f, 120.f), rf(0.008f, 0.033f), rf(-2.f, 0.5f),
+                     (rng() % 3 == 0) ? 0.f : rf(0.f, 0.02f) };
+
+        if (i % 17 == 5)
+        {
+            // linNorVel == 0 exactly: equal linear velocities
+            s.b1velBot.x = s.b0velBot.x; s.b1velBot.y = s.b0velBot.y; s.b1velBot.z = s.b0velBot.z;
+            ++cZeroLNV;
+        }
+        if (i % 19 == 9)
+        {
+            // t0 fallback: relative linear velocity parallel to the normal
+            const float kk = rf(0.5f, 2.f);
+            s.b1velBot.x = s.b0velBot.x - n[0] * kk;
+            s.b1velBot.y = s.b0velBot.y - n[1] * kk;
+            s.b1velBot.z = s.b0velBot.z - n[2] * kk;
+            ++cFall;
+        }
+
+        for (int c = 0; c < 12; ++c)
+            s.cPts[c] = F4{ rf(-3, 3), rf(-3, 3), rf(-3, 3),
+                            (c & 1) ? rf(0.1f, 1e4f) : rf(-0.2f, 0.2f) };
+        for (int a = 0; a < 2; ++a)
+        {
+            s.anchors0[a] = F4{ rf(-1, 1), rf(-1, 1), rf(-1, 1), 0 };
+            s.anchors1[a] = F4{ rf(-1, 1), rf(-1, 1), rf(-1, 1), 0 };
+        }
+        s.contactIDs = U4{ contactCount ? rng() % contactCount : 0u,
+                           contactCount ? rng() % contactCount : 0u, 0, 0 };
+
+        in[i] = s;
+        refFinalizePGS(s, ref[i]);
+    }
+
+    std::printf("[ info ] fz cov: early %zu compliant %zu bounce %zu fric %zu nofric %zu fall %zu "
+                "zeroLNV %zu artArt %zu mixed %zu kin %zu ppf %zu a2 %zu\n",
+                cEarly, cCompliant, cBounce, cFric, cNoFric, cFall, cZeroLNV, cArtArt, cMixed, cKin,
+                cPPF, cA2);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t GROUPS = (N + 63) / 64;
+    std::vector<EbIn> dummyIn(1);
+    std::vector<EbOut> dummyOut(1);
+    std::vector<FzOut> outInit(N);
+    PxgBufferHandle bDIn = createBufferFrom(dev, dummyIn);
+    PxgBufferHandle bDOut = createBufferFrom(dev, dummyOut);
+    PxgBufferHandle bIn = createBufferFrom(dev, in);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+
+    struct P { uint32_t numTests; } prm = { N };
+    Kernel k("npArtiExtBody.spv", "aebFinalizePGS",
+             { (uint32_t)sizeof(EbIn), (uint32_t)sizeof(EbOut), (uint32_t)sizeof(FzIn),
+               (uint32_t)sizeof(FzOut) },
+             sizeof(P));
+    k.dispatch(GROUPS, { bDIn, bDOut, bIn, bOut }, prm);
+    dev->flush();
+
+    const auto g = downloadBuffer<FzOut>(dev, bOut, N);
+    size_t mm = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const FzOut& r = ref[i]; const FzOut& q = g[i];
+        bool ok = std::memcmp(&r.hdrU, &q.hdrU, sizeof(U4) * 2) == 0;
+        const float* rf2 = &r.invMassOut.x;
+        const float* qf = &q.invMassOut.x;
+        const size_t nf = (sizeof(FzOut) - 2 * sizeof(U4)) / 4;
+        for (size_t x = 0; x < nf && ok; ++x)
+            ok = eqFZ(rf2[x], qf[x]);
+        if (!ok)
+        {
+            if (mm < 5)
+                std::printf("MM %u wmR %u wmG %u c0R (%g %g %g %g) c0G (%g %g %g %g)\n", i,
+                            r.writeMask.x, q.writeMask.x, r.cOut[0].x, r.cOut[0].y, r.cOut[0].z,
+                            r.cOut[0].w, q.cOut[0].x, q.cOut[0].y, q.cOut[0].z, q.cOut[0].w);
+            ++mm;
+        }
+    }
+    PXG_CHECK_MSG(mm == 0, "aebFinalizePGS: %zu mismatches", mm);
+
+    const bool cov = cEarly > 150 && cCompliant > 500 && cBounce > 800 && cFric > 1000 &&
+                     cNoFric > 500 && cFall > 100 && cZeroLNV > 100 && cArtArt > 200 &&
+                     cMixed > 800 && cKin > 1000 && cPPF > 400 && cA2 > 700;
+    PXG_CHECK_MSG(cov, "aebFinalizePGS: coverage thin (early %zu compliant %zu fric %zu fall %zu)",
+                  cEarly, cCompliant, cFric, cFall);
+
+    for (PxgBufferHandle h : { bDIn, bDOut, bIn, bOut }) dev->destroyBuffer(h);
+}
+
 } // namespace
