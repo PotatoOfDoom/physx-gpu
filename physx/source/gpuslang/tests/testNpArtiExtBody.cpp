@@ -1124,7 +1124,7 @@ PXG_TEST(npArtiExtBody_finalizeTGS)
     std::vector<TzIn> in(N);
     std::vector<TzOut> ref(N);
     size_t cEarly = 0, cCompliant = 0, cBounce = 0, cTors = 0, cFric = 0, cFall = 0, cZeroLNV = 0,
-           cKin = 0, cPPF = 0, cA2 = 0, cBiasLo = 0;
+           cKin = 0, cPPF = 0, cA2 = 0, cBiasLo = 0, cZeroTV = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -1194,6 +1194,16 @@ PXG_TEST(npArtiExtBody_finalizeTGS)
         for (int c = 0; c < 12; ++c)
             s.cPts[c] = F4{ rf(-3, 3), rf(-3, 3), rf(-3, 3),
                             (c & 1) ? rf(0.1f, 1e4f) : rf(-0.2f, 0.2f) };
+        // exact-zero contact target velocities: the dominant production path,
+        // and the ONLY way to reach the precedence trap's 0.f arm
+        // (cTargetVel + (isGreater2?1:0) == 0 requires cTargetVel == 0 exactly)
+        if (i % 7 == 3)
+        {
+            for (int c = 1; c < 12; c += 2)
+                s.cPts[c].x = s.cPts[c].y = s.cPts[c].z = 0.f;
+            if (contactCount)
+                ++cZeroTV;
+        }
         for (int a = 0; a < 2; ++a)
         {
             s.anchors0[a] = F4{ rf(-1, 1), rf(-1, 1), rf(-1, 1), 0 };
@@ -1207,9 +1217,9 @@ PXG_TEST(npArtiExtBody_finalizeTGS)
     }
 
     std::printf("[ info ] tz cov: early %zu compliant %zu bounce %zu tors %zu fric %zu fall %zu "
-                "zeroLNV %zu kin %zu ppf %zu a2 %zu biasLo %zu\n",
+                "zeroLNV %zu kin %zu ppf %zu a2 %zu biasLo %zu zeroTV %zu\n",
                 cEarly, cCompliant, cBounce, cTors, cFric, cFall, cZeroLNV, cKin, cPPF, cA2,
-                cBiasLo);
+                cBiasLo, cZeroTV);
 
     PxgSlangComputeDevice* dev = testDevice();
     const uint32_t GROUPS = (N + 63) / 64;
