@@ -229,7 +229,7 @@ pxg_compile_shader(npRemapIndex remapIndex)
 pxg_compile_shader(npContactPrePrep cppPack)
 pxg_compile_shader(npRigidSumBatches rsBatches1 rsBatches2)
 pxg_compile_shader(npArtiExtBody aebBody aebFinalizePGS aebFinalizeTGS)
-pxg_compile_shader(npArti1DPrep a1dPGS)
+pxg_compile_shader(npArti1DPrep a1dPGS a1dTGS)
 pxg_compile_shader(npManifold mfRefresh mfInvalidate)
 pxg_compile_shader(npSegDist sdPointSegment sdSegmentSegment)
 pxg_compile_shader(npTriMask ctBarycentric ctActiveMaskVW ctActiveMaskFromNormal ctActiveMaskPoint)
@@ -674,6 +674,7 @@ set(PXG_HLSL_ENTRIES
     "npArtiExtBody:aebFinalizePGS"
     "npArtiExtBody:aebFinalizeTGS"
     "npArti1DPrep:a1dPGS"
+    "npArti1DPrep:a1dTGS"
     "npManifold:mfRefresh" "npManifold:mfInvalidate"
     "npSegDist:sdPointSegment" "npSegDist:sdSegmentSegment"
     "npTriMask:ctBarycentric" "npTriMask:ctActiveMaskVW" "npTriMask:ctActiveMaskFromNormal" "npTriMask:ctActiveMaskPoint"

@@ -351,3 +351,258 @@ void a1dPGS(uint3 dtid : SV_DispatchThreadID)
     o.hdr.x = outCount;
     gOut[tid] = o;
 }
+
+
+// TGS variant: setUpArti1DConstraintBlock (artiConstraintPrep2.cu L1594-1714)
+// + intializeTGSBlock1D (L1545-1591) + queryReduced1dConstraintSolverConstantsTGS
+// (DyCpuGpu1dConstraint.h L489-539).  Caller argument map (TGS
+// setupArtiSolverConstraintBlockGPU L1821-1824 + fillJointBlockParams L1846-1859):
+// stepDt = sharedDesc->stepDt, simDt = sharedDesc->dt, recipStepDt =
+// stepInvDtF32, recipSimDt = invDtF32, lengthScale, biasCoefficient.
+//
+// TGS-vs-PGS differences (all verified against the CUDA):
+//   - erp = 0.5f * biasCoefficient (PGS: 1.0f);
+//   - NO ang0Writeback and NO pre-skip write of any kind: a degenerate row
+//     (unitResponse <= DY_ARTICULATION_MIN_RESPONSE) writes nothing;
+//   - resp0/resp1 stored into the row (L1658) after the skip;
+//   - computeJointSpeedTGS runs UNGATED and keys on isKinematic (not
+//     rigid-dynamic): initJointSpeed = -vel0*kin0 + vel1*kin1;
+//   - computeMaxBiasVelocityTGS called with isExtendedConstraint = TRUE
+//     (the rigid joint path passes false);
+//   - reduced 4-coefficient store (coeff0..coeff3 in the w lanes);
+//   - angularErrorScale = eANGULAR_CONSTRAINT ? 1 : 0 (rigid TGS also zeroes
+//     the angular Jacobian lanes -- the ARTI variant does NOT);
+//   - min/maxImpulse via computeMinMaxImpulseOrForceAsImpulse(simDt) (no
+//     fminf clamp, unlike the arti PGS driveScale);
+//   - flags = raiseInternalFlagsTGS(rpFlags, rpSolveHint) fresh from 0;
+//   - intializeTGSBlock1D's resp0/resp1/minRowResponse params are dead in
+//     its body (kept dead here).
+
+// mirrors Dy::queryReduced1dConstraintSolverConstantsTGS (DyCpuGpu1dConstraint.h L489-539)
+void queryReduced1dTGSQ(uint constraintFlags, float springStiffness, float springDamping,
+                        float restitution, float bounceThreshold, float geometricError,
+                        float velocityTarget, float jointSpeedForRestitutionBounce,
+                        float initJointSpeed, float erp, float stepDt, float recipStepDt,
+                        out float coeff0, out float coeff1, out float coeff2, out float coeff3)
+{
+    // coeff0: initJointSpeed, coeff1: biasScale
+    coeff0 = initJointSpeed;
+
+    if ((constraintFlags & PX1D_FLAG_SPRING) != 0u)
+    {
+        // coeff2: a, coeff3: b
+        const float a = stepDt * (stepDt * springStiffness + springDamping);
+        const float b = stepDt * (springDamping * velocityTarget);
+        coeff2 = a;
+        coeff3 = b;
+
+        if ((constraintFlags & PX1D_FLAG_ACCELERATION_SPRING) != 0u)
+        {
+            const float x = 1.0f / (1.0f + a);
+            coeff1 = -x * springStiffness * stepDt;  // biasScale * unitResponse recovered later
+        }
+        else
+        {
+            coeff1 = -springStiffness * stepDt;  // to recover biasScale, multiply by x
+        }
+    }
+    else
+    {
+        // coeff2: bounceVel, coeff3: velocityTarget
+        const float bounceVel = computeBounceVelocity(constraintFlags, jointSpeedForRestitutionBounce,
+                                                      bounceThreshold, restitution, geometricError);
+        coeff2 = bounceVel;
+        coeff3 = velocityTarget;
+
+        if (bounceVel != 0.0f)
+        {
+            coeff1 = 0.0f;
+        }
+        else
+        {
+            coeff1 = -recipStepDt * erp;
+        }
+    }
+}
+
+struct T1In
+{
+    uint4 bMeta;        // b0 isArticulation, b0 isKinematic, b1 isArticulation, b1 isKinematic
+    float4 b0resp[9];
+    float4 b0velTop;
+    float4 b0velBot;
+    float4 b0q;
+    float4 b0p;         // w = cfm
+    float4 b1resp[9];
+    float4 b1velTop;
+    float4 b1velBot;
+    float4 b1q;
+    float4 b1p;
+    uint4 cfg;          // numRows, constraintData->mFlags, 0, 0
+    float4 invMassScale;
+    float4 scal;        // stepDt, simDt (totalDt), recipStepDt, recipSimDt
+    float4 scal2;       // lengthScale, biasCoefficient, 0, 0
+    float4 rvel[80];
+    uint4 rparU[20];    // x = flags, y = solveHint
+    float4 rparF[20];   // springStiffness, springDamping, restitution, velocityThreshold
+}
+
+struct T1Out
+{
+    uint4 hdr;          // x = outCount
+    uint4 sorted[5];
+    uint4 conFlags[5];  // ccon.flags per output slot
+    float4 conOut[120]; // 6 per output slot:
+                        //   lin0XYZ_initBiasOrCoeff0 = (resp0.bottom, coeff0)
+                        //   lin1XYZ_biasScaleOrCoeff1 = (-resp1.bottom, coeff1)
+                        //   ang0XYZ_velMultiplierOrCoeff2 = (resp0.top, coeff2)
+                        //   ang1XYZ_velTargetOrCoeff3 = (-resp1.top, coeff3)
+                        //   (geometricError, maxBias, appliedForce=0, angularErrorScale)
+                        //   (resp0, resp1, minImpulse, maxImpulse)
+    float4 artiR[60];
+}
+
+RWStructuredBuffer<T1In> gIn2;    // binding 2
+RWStructuredBuffer<T1Out> gOut2;  // binding 3
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void a1dTGS(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint tid = dtid.x;
+    if (tid >= gParams.numTests) return;
+    const T1In s = gIn2[tid];
+
+    T1Out o;
+    o.hdr = uint4(0, 0, 0, 0);
+    for (uint z = 0u; z < 5u; ++z) { o.sorted[z] = uint4(0, 0, 0, 0); o.conFlags[z] = uint4(0, 0, 0, 0); }
+    for (uint z = 0u; z < 120u; ++z) o.conOut[z] = float4(0, 0, 0, 0);
+    for (uint z = 0u; z < 60u; ++z) o.artiR[z] = float4(0, 0, 0, 0);
+
+    const ExtBodyQ b0 = loadBody(s.bMeta.x, s.bMeta.y, s.b0resp, s.b0velTop, s.b0velBot, s.b0p);
+    const ExtBodyQ b1 = loadBody(s.bMeta.z, s.bMeta.w, s.b1resp, s.b1velTop, s.b1velBot, s.b1p);
+
+    const uint numRows = min(s.cfg.x, MAX_ROWS_Q);
+    const uint cdFlags = s.cfg.y;
+    const float stepDt = s.scal.x;
+    const float simDt = s.scal.y;
+    const float recipStepDt = s.scal.z;
+    const float recipSimDt = s.scal.w;
+    const float lengthScale = s.scal2.x;
+    const float biasCoefficient = s.scal2.y;
+    const float4 ims = s.invMassScale;
+
+    // preprocessRowsBlock (shared with the PGS entry)
+    uint sortedRows[MAX_ROWS_Q];
+    for (uint i = 0u; i < numRows; ++i)
+    {
+        const uint hintI = s.rparU[i].y;
+        uint j = i;
+        for (; j > 0u && hintI < s.rparU[sortedRows[j - 1u]].y; --j)
+            sortedRows[j] = sortedRows[j - 1u];
+        sortedRows[j] = i;
+    }
+    for (uint i = 0u; i < numRows; ++i)
+        o.sorted[i / 4u][i & 3u] = sortedRows[i];
+
+    // ---- setUpArti1DConstraintBlock, TGS (cu L1594-1714) ----
+    const float erp = 0.5f * biasCoefficient;
+    uint outCount = 0u;
+
+    // cfm = PxMax(b0.cfm, b1.cfm) (cu L1621) feeds intializeTGSBlock1D's cfm
+    // parameter, which is unused in its body -- no observable effect.
+    const float cfmDead = pxMaxQ(b0.cfm, b1.cfm);
+
+    for (uint i = 0u; i < numRows; ++i)
+    {
+        const uint index = sortedRows[i];
+        const uint rpFlags = s.rparU[index].x;
+        const uint rpSolveHint = s.rparU[index].y;
+
+        const float4 lin0XYZ_geomError = s.rvel[index * 4u + 0u];
+        const float4 lin1XYZ_minImpulse = s.rvel[index * 4u + 1u];
+        const float4 ang0XYZ_velTarget = s.rvel[index * 4u + 2u];
+        const float4 ang1XYZ_maxImpulse = s.rvel[index * 4u + 3u];
+
+        const float3 clin0 = lin0XYZ_geomError.xyz;
+        const float3 clin1 = lin1XYZ_minImpulse.xyz;
+        const float3 cang0 = ang0XYZ_velTarget.xyz;
+        const float3 cang1 = ang1XYZ_maxImpulse.xyz;
+
+        float3 r0Top, r0Bot, r1Top, r1Bot;
+        cirvQ(b0, cang0, clin0, r0Top, r0Bot);
+        cirvQ(b1, -cang1, -clin1, r1Top, r1Bot);
+
+        float3 dV0Top, dV0Bot, dV1Top, dV1Bot;
+        spatialMulQ(b0.resp, clin0 * ims.x, cang0 * ims.y, dV0Top, dV0Bot);
+        spatialMulQ(b1.resp, -clin1 * ims.z, -cang1 * ims.w, dV1Top, dV1Bot);
+
+        const float resp0 = dot3Q(dV0Top, r0Top) + dot3Q(dV0Bot, r0Bot);
+        const float resp1 = dot3Q(dV1Top, r1Top) + dot3Q(dV1Bot, r1Bot);
+        const float unitResponse = resp0 + resp1;
+
+        if (unitResponse <= DY_ARTI_MIN_RESPONSE_Q)
+            continue;  // degenerate constraint -- nothing written in TGS
+
+        packArtiQ(o.artiR, outCount, dV0Bot, dV0Top, dV1Bot, dV1Top);
+
+        // computeJointSpeedTGS: ungated, keyed on isKinematic
+        float jointSpeedForRestitutionBounce, initJointSpeed;
+        {
+            const float vel0 = projVelQ(b0, cang0, clin0);
+            const float vel1 = projVelQ(b1, cang1, clin1);
+            computeJointSpeedTGS(vel0, b0.isKinematic != 0u, vel1, b1.isKinematic != 0u,
+                                 jointSpeedForRestitutionBounce, initJointSpeed);
+        }
+
+        // ---- intializeTGSBlock1D (cu L1545-1591) ----
+        const float geometricError = lin0XYZ_geomError.w;
+        const float velocityTarget = ang0XYZ_velTarget.w;
+        const float stiffness = s.rparF[index].x;
+        const float damping = s.rparF[index].y;
+        const float restitution = s.rparF[index].z;
+        const float bounceVelocityThreshold = s.rparF[index].w;
+
+        const float maxBiasVelocity = computeMaxBiasVelocityTGS(
+            rpFlags, jointSpeedForRestitutionBounce, bounceVelocityThreshold, restitution,
+            geometricError, true /* isExtendedConstraint */, lengthScale, recipSimDt);
+
+        float coeff0, coeff1, coeff2, coeff3;
+        queryReduced1dTGSQ(rpFlags, stiffness, damping, restitution, bounceVelocityThreshold,
+                           geometricError, velocityTarget, jointSpeedForRestitutionBounce,
+                           initJointSpeed, erp, stepDt, recipStepDt, coeff0, coeff1, coeff2,
+                           coeff3);
+
+        o.conOut[outCount * 6u + 0u] = float4(r0Bot, coeff0);
+        o.conOut[outCount * 6u + 1u] = float4(-r1Bot, coeff1);
+        o.conOut[outCount * 6u + 2u] = float4(r0Top, coeff2);
+        o.conOut[outCount * 6u + 3u] = float4(-r1Top, coeff3);
+
+        // angularErrorScale = eANGULAR_CONSTRAINT ? 1 : 0 (cu L1696)
+        const float angularErrorScale =
+            (rpFlags & PX1D_FLAG_ANGULAR_CONSTRAINT) != 0u ? 1.0f : 0.0f;
+        o.conOut[outCount * 6u + 4u] =
+            float4(geometricError, maxBiasVelocity, 0.0f, angularErrorScale);
+
+        // computeMinMaxImpulseOrForceAsImpulse(simDt) (cu L1700-1703)
+        const bool hasDriveLimit = (rpFlags & PX1D_FLAG_HAS_DRIVE_LIMIT) != 0u;
+        const bool driveLimitsAreForces =
+            (cdFlags & PX_CONSTRAINT_FLAG_DRIVE_LIMITS_ARE_FORCES) != 0u;
+        float minImpulse, maxImpulse;
+        computeMinMaxImpulseOrForceAsImpulse(lin1XYZ_minImpulse.w, ang1XYZ_maxImpulse.w,
+                                             hasDriveLimit, driveLimitsAreForces, simDt,
+                                             minImpulse, maxImpulse);
+
+        o.conOut[outCount * 6u + 5u] = float4(resp0, resp1, minImpulse, maxImpulse);
+
+        // flags = raiseInternalFlagsTGS(rpFlags, rpSolveHint) fresh from 0 (cu L1705-1708)
+        uint rowFlags = 0u;
+        raiseInternalFlagsTGS(rpFlags, rpSolveHint, rowFlags);
+        o.conFlags[outCount / 4u][outCount & 3u] = rowFlags;
+
+        outCount += 1u;
+    }
+
+    o.hdr.x = outCount;
+    gOut2[tid] = o;
+}
