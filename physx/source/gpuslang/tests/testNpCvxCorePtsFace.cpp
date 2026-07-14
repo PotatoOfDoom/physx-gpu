@@ -296,7 +296,7 @@ PXG_TEST(npCvxCorePtsFace_reduce)
 
     std::vector<PtsIn> in(N);
     std::vector<PtsOut> ref(N);
-    size_t cKeep = 0, cDup = 0, cOne = 0;
+    size_t cKeep = 0, cDup = 0, cOne = 0, cTight = 0, cColl = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -324,6 +324,24 @@ PXG_TEST(npCvxCorePtsFace_reduce)
                 s.pts[p] = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), 0 };
 
         if (i % 11 == 5 && count >= 2) { s.pts[1] = s.pts[0]; ++cDup; }         // duplicates
+        if (i % 9 == 2)
+        {
+            // ALL points within ~3e-4 of each other: the farthest scan's
+            // +FLT_EPSILON acceptance window decides the outcome (review 166)
+            const F4 c0{ rf(-1, 1), rf(-1, 1), rf(-1, 1), 0 };
+            for (uint32_t p = 0; p < count; ++p)
+                s.pts[p] = F4{ c0.x + rf(-2e-4f, 2e-4f), c0.y + rf(-2e-4f, 2e-4f), c0.z + rf(-2e-4f, 2e-4f), 0 };
+            ++cTight;
+        }
+        if (i % 9 == 7 && count >= 3)
+        {
+            // near-collinear triple: the band scan's -eps window decides
+            // whether a third point is emitted (review 166 xE)
+            s.pts[0] = F4{ 0, 0, 0, 0 };
+            s.pts[1] = F4{ rf(1.5f, 2.5f), 0, 0, 0 };
+            s.pts[2] = F4{ rf(0.8f, 1.2f), -rf(1e-8f, 5e-7f), 0, 0 };
+            ++cColl;
+        }
         if (i % 13 == 7) { for (uint32_t p = 1; p < count; ++p) s.pts[p] = s.pts[0]; ++cOne; } // all identical -> pi0 == pi1
 
         in[i] = s;
@@ -347,8 +365,8 @@ PXG_TEST(npCvxCorePtsFace_reduce)
     for (uint32_t i = 0; i < N; ++i)
         if (!(eqU4(ref[i].counts, g[i].counts) && eqU4(ref[i].inds, g[i].inds))) ++mm;
     PXG_CHECK_MSG(mm == 0, "ccpReduce: %zu mismatches", mm);
-    PXG_CHECK_MSG(cKeep > N / 3 && cDup > N / 16 && cOne > N / 16,
-                  "ccpReduce: coverage thin (keep %zu dup %zu one %zu)", cKeep, cDup, cOne);
+    PXG_CHECK_MSG(cKeep > N / 3 && cDup > N / 16 && cOne > N / 16 && cTight > N / 16 && cColl > N / 32,
+                  "ccpReduce: coverage thin (keep %zu dup %zu one %zu tight %zu coll %zu)", cKeep, cDup, cOne, cTight, cColl);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }
@@ -362,7 +380,7 @@ PXG_TEST(npCvxCorePtsFace_pointsFace)
 
     std::vector<PtsIn> in(N);
     std::vector<PtsOut> ref(N);
-    size_t cHit = 0, cPlanar = 0, cNull = 0, cTinyPool = 0, cLone = 0;
+    size_t cHit = 0, cPlanar = 0, cNull = 0, cTinyPool = 0, cLone = 0, cGate = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -443,6 +461,23 @@ PXG_TEST(npCvxCorePtsFace_pointsFace)
             ++cLone;
         }
 
+        if (i % 43 == 21 && poolN >= 4)
+        {
+            // tight top cluster (three points within ~1e-4) + deep filler:
+            // the accepted normal's band holds only the cluster, and
+            // reducePolygon collapses it to ONE point -- the numPoints >= 2
+            // gate (LIVE, review 166) must zero the result
+            s.core[0].z = f2u(1.f); s.core[0].w = f2u(1.f); s.core[1].x = f2u(1.f);
+            s.core[1].y = f2u(0.f); s.core[1].z = f2u(0.f); s.core[1].w = f2u(0.f);
+            s.core[2].x = f2u(1.f);
+            s.pts[0] = F4{ 0.f, 0.f, 1.f, 0 };
+            s.pts[1] = F4{ rf(5e-5f, 1e-4f), 0.f, 1.f - rf(5e-7f, 1e-6f), 0 };
+            s.pts[2] = F4{ 0.f, rf(5e-5f, 1e-4f), 1.f - rf(1e-6f, 2e-6f), 0 };
+            for (uint32_t p = 3; p < poolN; ++p)
+                s.pts[p] = F4{ rf(-1, 1), rf(-1, 1), -rf(0.5f, 1.f), 0 };
+            localDir = V3{ 0, 0, 1 };
+            ++cGate;
+        }
         const V3 world = qRot(s.poseQ, localDir);
         s.dir = F4{ world.x, world.y, world.z, 0 };
 
@@ -476,8 +511,8 @@ PXG_TEST(npCvxCorePtsFace_pointsFace)
                         ref[i].normal.x, ref[i].normal.y, ref[i].normal.z);
     }
     PXG_CHECK_MSG(mm == 0, "ccpPointsFace: %zu mismatches", mm);
-    PXG_CHECK_MSG(cHit > N / 8 && cPlanar > N / 3 && cNull > 10 && cTinyPool > N / 32 && cLone > 20,
-                  "ccpPointsFace: coverage thin (hit %zu planar %zu null %zu tiny %zu lone %zu)", cHit, cPlanar, cNull, cTinyPool, cLone);
+    PXG_CHECK_MSG(cHit > N / 8 && cPlanar > N / 3 && cNull > 10 && cTinyPool > N / 32 && cLone > 20 && cGate > 20,
+                  "ccpPointsFace: coverage thin (hit %zu planar %zu null %zu tiny %zu lone %zu gate %zu)", cHit, cPlanar, cNull, cTinyPool, cLone, cGate);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }
