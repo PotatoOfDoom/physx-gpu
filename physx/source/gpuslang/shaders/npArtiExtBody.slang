@@ -708,3 +708,382 @@ void aebFinalizePGS(uint3 dtid : SV_DispatchThreadID)
 
     gOut2[tid] = o;
 }
+
+// ============================================================================
+// entry 3: setupFinalizeExtSolverConstraintsBlock, TGS variant (tranche 181)
+// (artiConstraintPrep2.cu L617-1112).  Differences from the PGS overload,
+// all ported verbatim:
+//   - p8 = PxMin(0.8, biasCoefficient); header stores maxPenBias,
+//     restitutionXdt = restitution * stepDt, p8, and the friction header's
+//     biasCoefficient = invDt; the early-out ALSO zeroes invMass0_1_angDom0_1;
+//   - isSeparated = penetration > 0 (STRICT, PGS uses >=);
+//     penetrationInvDt = penetration * invTotalDt;
+//   - compliant branch: collidingWithVrel = (-vrel * totalDt) > penetration,
+//     computeCompliantContactCoefficientsTGS (constraintPrepShared.cuh
+//     L344-362: velMultiplier = x*a*massIfAccelElseOne, scaledBias =
+//     nrdt*x*oneIfAccelElseR, returns a); else velMultiplier = recipResponse,
+//     scaledBias = isSeparated ? -invDt : -invDtp8;
+//   - minPen = PxMin(penetration, minPen) across contacts;
+//   - isGreater2 tests restitution > 1e-5f;
+//   - CUDA PRECEDENCE TRAP (cu L837), ported as shipped: `targetVelocity =
+//     cTargetVel + isGreater2 ? (-vrel)*restitution : 0.f` parses as
+//     `(cTargetVel + (isGreater2 ? 1 : 0)) != 0 ? (-vrel)*restitution : 0`
+//     -- the ternary has LOWER precedence than +, so cTargetVel itself is
+//     discarded and the bounce term is selected whenever cTargetVel plus the
+//     bool is nonzero;
+//   - deltaF = fmaxf((targetVelocity + (-penetrationInvDt - vrel)) *
+//     velMultiplier, 0) computed BEFORE the kinematic biases;
+//   - the velocity biases gate on isKinematic (NOT !isArticulation);
+//   - isGreater2 adds (totalDt + penetration/vrel) * targetVelocity (the
+//     POST-bias value) into totalError = penetration + ...;
+//   - contact stores: raXn_extraCoeff (w = compliant a), rbXn_targetVelW,
+//     maxImpulse, separation = totalError, biasCoefficient = scaledBias;
+//   - friction: relTr = p0 - p1 and error = (ra - rb) + relTr (a DIFFERENT
+//     association than PGS's (ra+p0)-(rb+p1) -- bitwise distinct);
+//     frictionError = error.dot(t) WITHOUT invDt; kinematic-gated target
+//     biases;
+//   - torsional friction when (tf.x != 0 || tf.y != 0) && aCount == 1:
+//     anchorCount becomes 3, torsionalFrictionScale = PxMax(tf.y,
+//     sqrt(PxMax(0, -minPen) * tf.x)), a row at friction slot 2 with
+//     response = cirv(normal, 0), deltaV = gir((0, normal).scale), zero
+//     error/targetVel.
+// ============================================================================
+
+struct TzIn
+{
+    uint4 bMeta;
+    float4 b0resp[9];
+    float4 b0velTop, b0velBot, b0q, b0p;
+    float4 b1resp[9];
+    float4 b1velTop, b1velBot, b1q, b1p;
+    uint4 cfgU;         // solverFlags, contactCount, aCount, perPointFriction
+    float4 invMassScale;
+    float4 normalRest;
+    float4 mat;         // restDistance, damping, staticFriction, dynamicFriction
+    float4 scal;        // invDt (step), stepDt, bounceThreshold, solverOffsetSlop
+    float4 scal2;       // invTotalDt, biasCoefficient, totalDt, 0
+    float4 scal3;       // torsional.x, torsional.y, 0, 0
+    float4 cPts[12];
+    float4 anchors0[2];
+    float4 anchors1[2];
+    uint4 contactIDs;
+}
+
+struct TzOut
+{
+    uint4 hdrU;         // fwbOffset, flags, numNormalConstr, numFrictionConstr
+    uint4 writeMask;
+    float4 invMassOut;
+    float4 normalSF;
+    float4 hdrF;        // restitutionXdt, cfm, minNormalForce, dynamicFriction
+    float4 hdrF2;       // maxPenBias, p8, frictionBiasCoefficient (= invDt), torsionalFrictionScale
+    float4 fricN[2];
+    float4 cOut[24];    // per contact: (r0Top, compliantCoeff), (-r1Top, targetVelocity),
+                        //   (resp0, resp1, maxImpulse, totalError), (scaledBias, 0, 0, 0)
+    float4 artiC[18];
+    float4 fOut[12];    // per row: (r0Top, frictionError), (-r1Top, targetVel), (resp0, resp1, 0, 0)
+    float4 artiF[12];
+}
+
+RWStructuredBuffer<TzIn> gIn3;    // binding 4
+RWStructuredBuffer<TzOut> gOut3;  // binding 5
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void aebFinalizeTGS(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint tid = dtid.x;
+    if (tid >= gParams.numTests) return;
+    const TzIn s = gIn3[tid];
+
+    TzOut o;
+    o.hdrU = uint4(0, 0, 0, 0);
+    o.writeMask = uint4(0, 0, 0, 0);
+    o.invMassOut = float4(0, 0, 0, 0);
+    o.normalSF = float4(0, 0, 0, 0);
+    o.hdrF = float4(0, 0, 0, 0);
+    o.hdrF2 = float4(0, 0, 0, 0);
+    o.fricN[0] = float4(0, 0, 0, 0);
+    o.fricN[1] = float4(0, 0, 0, 0);
+    for (uint z = 0u; z < 24u; ++z) o.cOut[z] = float4(0, 0, 0, 0);
+    for (uint z = 0u; z < 18u; ++z) o.artiC[z] = float4(0, 0, 0, 0);
+    for (uint z = 0u; z < 12u; ++z) { o.fOut[z] = float4(0, 0, 0, 0); o.artiF[z] = float4(0, 0, 0, 0); }
+
+    const ExtBodyQ b0 = loadBody(s.bMeta.x, s.bMeta.y, s.b0resp, s.b0velTop, s.b0velBot, s.b0q, s.b0p);
+    const ExtBodyQ b1 = loadBody(s.bMeta.z, s.bMeta.w, s.b1resp, s.b1velTop, s.b1velBot, s.b1q, s.b1p);
+
+    const uint flags = s.cfgU.x;
+    const uint contactCount = s.cfgU.y;
+    const uint aCount = s.cfgU.z;
+    const bool perPointFriction = s.cfgU.w != 0u;
+    const float restDistance = s.mat.x;
+    const float invDt = s.scal.x;
+    const float stepDt = s.scal.y;
+    const float bounceThreshold = s.scal.z;
+    const float solverOffsetSlop = s.scal.w;
+    const float invTotalDt = s.scal2.x;
+    const float biasCoefficient = s.scal2.y;
+    const float totalDt = s.scal2.z;
+    const float2 torsional = float2(s.scal3.x, s.scal3.y);
+
+    const float cfm = pxMaxQ(b0.cfm, b1.cfm);
+    const float maxPenBias = max(b0.penBiasClamp, b1.penBiasClamp);  // fmaxf
+    const float p8 = pxMinQ(0.8f, biasCoefficient);
+    const float invDtp8 = invDt * p8;
+    const float4 lin0X_ang0Y_lin1Z_ang1W = s.invMassScale;
+
+    uint anchorCount = aCount * 2u;
+    const bool hasTorsional = (torsional.x != 0.0f || torsional.y != 0.0f) && aCount == 1u;
+    if (hasTorsional)
+        anchorCount += 1u;
+
+    if (contactCount == 0u)
+    {
+        // early-out: TGS also zeroes the invMass lanes
+        o.hdrU = uint4(0xFFFFFFFFu, 0u, 0u, 0u);
+        o.invMassOut = float4(0, 0, 0, 0);
+        o.writeMask.x = 1u;
+        gOut3[tid] = o;
+        return;
+    }
+
+    const float maxImpulse = pxMinQ(b0.maxImpulse, b1.maxImpulse);
+
+    o.invMassOut = float4(lin0X_ang0Y_lin1Z_ang1W.x, lin0X_ang0Y_lin1Z_ang1W.z,
+                          lin0X_ang0Y_lin1Z_ang1W.y, lin0X_ang0Y_lin1Z_ang1W.w);
+
+    const float3 normal = s.normalRest.xyz;
+    const float restitution = s.normalRest.w;
+    const float damping = s.mat.y;
+    const float3 linVel0 = b0.velBot, linVel1 = b1.velBot;
+    const float norVel0 = dot3Q(normal, linVel0);
+    const float norVel1 = dot3Q(normal, linVel1);
+    const float linNorVel = norVel0 - norVel1;
+
+    o.hdrF2 = float4(maxPenBias, p8, invDt, 0.0f);
+    o.hdrF.x = restitution * stepDt;  // restitutionXdt
+    o.hdrF.y = cfm;
+
+    float normalForce = 0.0f;
+    float minPen = 0.0f;
+
+    for (uint j = 0u; j < contactCount && j < MAX_CTS; ++j)
+    {
+        const float4 point4 = s.cPts[j * 2u + 0u];
+        const float3 point = point4.xyz;
+        const float separation = point4.w;
+        const float4 tv4 = s.cPts[j * 2u + 1u];
+        const float3 targetVel3 = tv4.xyz;
+
+        const float cTargetVel = dot3Q(normal, targetVel3);
+
+        const float3 ra = point - b0.p;
+        const float3 rb = point - b1.p;
+        float3 raXn = crossQ(ra, normal);
+        float3 rbXn = crossQ(rb, normal);
+
+        const float angNorVel = dot3Q(raXn, b0.velTop) - dot3Q(rbXn, b1.velTop);
+        const float slop =
+            solverOffsetSlop * pxMaxQ(linNorVel == 0.0f ? 1.0f : angNorVel / linNorVel, 1.0f);
+
+        raXn = slopZero(raXn, slop);
+        rbXn = slopZero(rbXn, slop);
+
+        float3 r0Top, r0Bot, r1Top, r1Bot;
+        cirvQ(b0, raXn, normal, r0Top, r0Bot);
+        cirvQ(b1, -rbXn, -normal, r1Top, r1Bot);
+
+        float3 dV0Top, dV0Bot, dV1Top, dV1Bot;
+        spatialMulQ(b0.resp, normal * lin0X_ang0Y_lin1Z_ang1W.x,
+                    raXn * lin0X_ang0Y_lin1Z_ang1W.y, dV0Top, dV0Bot);
+        spatialMulQ(b1.resp, -normal * lin0X_ang0Y_lin1Z_ang1W.z,
+                    -rbXn * lin0X_ang0Y_lin1Z_ang1W.w, dV1Top, dV1Bot);
+
+        const float resp0 = dot3Q(dV0Top, r0Top) + dot3Q(dV0Bot, r0Bot);
+        const float resp1 = dot3Q(dV1Top, r1Top) + dot3Q(dV1Bot, r1Bot);
+        const float unitResponse = resp0 + resp1;
+
+        const float vrel1 = norVel0 + projAngQ(b0, raXn);
+        const float vrel2 = norVel1 + projAngQ(b1, rbXn);
+        const float vrel = vrel1 - vrel2;
+
+        const float penetration = separation - restDistance;
+        const bool isSeparated = penetration > 0.0f;  // STRICT in TGS
+        const float penetrationInvDt = penetration * invTotalDt;
+
+        float scaledBias, velMultiplier;
+        const float recipResponse = (unitResponse > 0.0f) ? (1.0f / (unitResponse + cfm)) : 0.0f;
+
+        float compliantContactCoeff = 0.0f;
+        if (restitution < 0.0f)
+        {
+            const bool collidingWithVrel = ((-vrel) * totalDt) > penetration;
+            // computeCompliantContactCoefficientsTGS
+            const bool accelSpring = (flags & 8u) != 0u;
+            const float massIfAccelElseOne = accelSpring ? recipResponse : 1.0f;
+            const float oneIfAccelElseR = accelSpring ? 1.0f : unitResponse;
+            const float dampingIfEnabled = compliantDampingQ(isSeparated, collidingWithVrel, damping);
+            const float nrdt = stepDt * restitution;
+            const float a = stepDt * (dampingIfEnabled - nrdt);
+            const float x = 1.0f / (a * oneIfAccelElseR + 1.0f);
+            velMultiplier = x * a * massIfAccelElseOne;
+            scaledBias = nrdt * x * oneIfAccelElseR;
+            compliantContactCoeff = a;
+        }
+        else
+        {
+            velMultiplier = recipResponse;
+            scaledBias = isSeparated ? -invDt : -invDtp8;
+        }
+
+        minPen = pxMinQ(penetration, minPen);
+
+        const bool isGreater2 =
+            ((restitution > 1e-5f) && (bounceThreshold > vrel)) && ((-vrel) > penetrationInvDt);
+
+        float totalError = penetration;
+
+        // CUDA precedence trap, ported as shipped (cu L837): the ternary
+        // binds LOWER than +, so the condition is (cTargetVel + bool) != 0
+        float targetVelocity =
+            ((cTargetVel + (isGreater2 ? 1.0f : 0.0f)) != 0.0f) ? (-vrel) * restitution : 0.0f;
+
+        const float deltaF =
+            max((targetVelocity + (-penetrationInvDt - vrel)) * velMultiplier, 0.0f);  // fmaxf
+        normalForce += deltaF;
+
+        if (b0.isKinematic != 0u)
+            targetVelocity -= vrel1;
+        if (b1.isKinematic != 0u)
+            targetVelocity += vrel2;
+
+        if (isGreater2)
+        {
+            const float ratio = totalDt + penetration / vrel;
+            totalError += ratio * targetVelocity;
+        }
+
+        o.cOut[j * 4u + 0u] = float4(r0Top, compliantContactCoeff);
+        o.cOut[j * 4u + 1u] = float4(-r1Top, targetVelocity);
+        o.cOut[j * 4u + 2u] = float4(resp0, resp1, pxMinQ(maxImpulse, tv4.w), totalError);
+        o.cOut[j * 4u + 3u] = float4(scaledBias, 0.0f, 0.0f, 0.0f);
+
+        packArti(o.artiC, j, dV0Bot, dV0Top, dV1Bot, dV1Top);
+    }
+
+    o.hdrF.z = (normalForce / float(contactCount)) * 0.25f;
+
+    const float frictionScale = (aCount == 2u) ? 0.5f : 1.0f;
+    const float staticFriction = s.mat.z * frictionScale;
+    const float dynamicFriction = s.mat.w * frictionScale;
+    const bool haveFriction = anchorCount != 0u;
+
+    o.hdrU = uint4(0u, flags, contactCount, anchorCount);
+    o.hdrF.w = dynamicFriction;
+    o.normalSF = float4(normal, staticFriction);
+    o.writeMask.x = 2u;
+
+    if (haveFriction)
+    {
+        o.writeMask.x |= 4u;
+        const float3 vrelV = linVel0 - linVel1;
+
+        const float orthoThreshold = 0.70710678f;
+        const float p1 = 0.0001f;
+        const float3 t0Fallback1 = float3(0.0f, -normal.z, normal.y);
+        const float3 t0Fallback2 = float3(-normal.y, normal.x, 0.0f);
+        const float3 t0Fallback = orthoThreshold > abs(normal.x) ? t0Fallback1 : t0Fallback2;
+
+        float3 t0 = vrelV - normal * dot3Q(normal, vrelV);
+        t0 = dot3Q(t0, t0) > p1 ? t0 : t0Fallback;
+        t0 = normalizeQ(t0);
+
+        const float3 t1 = crossQ(normal, t0);
+
+        o.fricN[0] = float4(t0, 0.0f);
+        o.fricN[1] = float4(t1, 0.0f);
+
+        // TGS: relTr association differs from PGS
+        const float3 relTr = b0.p - b1.p;
+
+        for (uint j = 0u; j < aCount && j < MAX_ANCH; ++j)
+        {
+            const float3 body0Anchor = s.anchors0[j].xyz;
+            const float3 body1Anchor = s.anchors1[j].xyz;
+
+            const float3 ra = quatRotQ(b0.q, body0Anchor);
+            const float3 rb = quatRotQ(b1.q, body1Anchor);
+            const float3 error = (ra - rb) + relTr;
+
+            const uint index = perPointFriction ? (j == 0u ? s.contactIDs.x : s.contactIDs.y) : 0u;
+            const float3 tvel3 = s.cPts[index * 2u + 1u].xyz;
+
+            for (uint rrow = 0u; rrow < 2u; ++rrow)
+            {
+                const float3 t = rrow == 0u ? t0 : t1;
+
+                float3 raXn = slopZero(crossQ(ra, t), solverOffsetSlop);
+                float3 rbXn = slopZero(crossQ(rb, t), solverOffsetSlop);
+
+                float3 r0Top, r0Bot, r1Top, r1Bot;
+                cirvQ(b0, raXn, t, r0Top, r0Bot);
+                cirvQ(b1, -rbXn, -t, r1Top, r1Bot);
+
+                float3 dV0Top, dV0Bot, dV1Top, dV1Bot;
+                spatialMulQ(b0.resp, t * lin0X_ang0Y_lin1Z_ang1W.x,
+                            raXn * lin0X_ang0Y_lin1Z_ang1W.y, dV0Top, dV0Bot);
+                spatialMulQ(b1.resp, -t * lin0X_ang0Y_lin1Z_ang1W.z,
+                            -rbXn * lin0X_ang0Y_lin1Z_ang1W.w, dV1Top, dV1Bot);
+
+                const float resp0 = dot3Q(dV0Top, r0Top) + dot3Q(dV0Bot, r0Bot);
+                const float resp1 = dot3Q(dV1Top, r1Top) + dot3Q(dV1Bot, r1Bot);
+
+                float targetVel = dot3Q(tvel3, t);
+                if (b0.isKinematic != 0u)
+                    targetVel -= projVelQ(b0, raXn, t);
+                if (b1.isKinematic != 0u)
+                    targetVel += projVelQ(b1, rbXn, t);
+
+                const float frictionError = dot3Q(error, t);
+
+                const uint slot = j * 2u + rrow;
+                o.fOut[slot * 3u + 0u] = float4(r0Top, frictionError);
+                o.fOut[slot * 3u + 1u] = float4(-r1Top, targetVel);
+                o.fOut[slot * 3u + 2u] = float4(resp0, resp1, 0.0f, 0.0f);
+
+                packArtiF(o.artiF, slot, dV0Bot, dV0Top, dV1Bot, dV1Top);
+            }
+        }
+
+        if (hasTorsional)
+        {
+            // torsional row at friction slot 2
+            const float torsionalScale =
+                pxMaxQ(torsional.y, sqrt(pxMaxQ(0.0f, -minPen) * torsional.x));
+            o.hdrF2.w = torsionalScale;
+
+            float3 r0Top, r0Bot, r1Top, r1Bot;
+            cirvQ(b0, normal, float3(0, 0, 0), r0Top, r0Bot);
+            cirvQ(b1, -normal, float3(0, 0, 0), r1Top, r1Bot);
+
+            float3 dV0Top, dV0Bot, dV1Top, dV1Bot;
+            // (0, normal).scale(lin, ang) = (0*lin, normal*ang)
+            spatialMulQ(b0.resp, float3(0, 0, 0) * lin0X_ang0Y_lin1Z_ang1W.x,
+                        normal * lin0X_ang0Y_lin1Z_ang1W.y, dV0Top, dV0Bot);
+            spatialMulQ(b1.resp, float3(0, 0, 0) * lin0X_ang0Y_lin1Z_ang1W.z,
+                        -normal * lin0X_ang0Y_lin1Z_ang1W.w, dV1Top, dV1Bot);
+
+            const float resp0 = dot3Q(dV0Top, r0Top) + dot3Q(dV0Bot, r0Bot);
+            const float resp1 = dot3Q(dV1Top, r1Top) + dot3Q(dV1Bot, r1Bot);
+
+            const uint slot = 2u;
+            o.fOut[slot * 3u + 0u] = float4(r0Top, 0.0f);
+            o.fOut[slot * 3u + 1u] = float4(-r1Top, 0.0f);
+            o.fOut[slot * 3u + 2u] = float4(resp0, resp1, 0.0f, 0.0f);
+
+            packArtiF(o.artiF, slot, dV0Bot, dV0Top, dV1Bot, dV1Top);
+        }
+    }
+
+    gOut3[tid] = o;
+}
