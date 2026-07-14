@@ -66,7 +66,7 @@ public static const uint PX_SOLVE_HINT_INEQUALITY = 2049;
 
 // PxConstraintFlag (PxConstraint.h)
 public static const uint PX_CONSTRAINT_FLAG_DRIVE_LIMITS_ARE_FORCES = 1u << 5;
-public static const uint PX_CONSTRAINT_FLAG_DISABLE_PREPROCESSING = 1u << 6;
+public static const uint PX_CONSTRAINT_FLAG_DISABLE_PREPROCESSING = 1u << 8;
 
 // PxRigidBodyFlag (PxRigidBody.h)
 public static const uint PX_RIGID_BODY_FLAG_KINEMATIC = 1u << 0;

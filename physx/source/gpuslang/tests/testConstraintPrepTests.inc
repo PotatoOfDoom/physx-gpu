@@ -643,8 +643,11 @@ JointSetup buildJointSetup(std::mt19937& rng, bool tgs)
             const float angBreak = breakable ? 10.f + u(rng) * 100.f : PX_MAX_F32;
             js.jdata[k].mRAWorld_linBreakForce[lane] = Float4{ s(rng) * 0.3f, s(rng) * 0.3f, s(rng) * 0.3f, linBreak };
             js.jdata[k].mRBWorld_AngBreakForce[lane] = Float4{ s(rng) * 0.3f, s(rng) * 0.3f, s(rng) * 0.3f, angBreak };
+            // bit 6 is UNDEFINED in PxConstraintFlag -- salted as noise to pin
+            // that eDISABLE_PREPROCESSING is bit 8, not bit 6 (review-182 find)
             js.jdata[k].mFlags[lane] = (u(rng) < 0.2f ? CFLAG_DRIVE_LIMITS_ARE_FORCES : 0u) |
-                                       (u(rng) < 0.2f ? CFLAG_DISABLE_PREPROCESSING : 0u);
+                                       (u(rng) < 0.2f ? CFLAG_DISABLE_PREPROCESSING : 0u) |
+                                       (u(rng) < 0.1f ? (1u << 6) : 0u);
 
             for (uint32_t r = 0; r < numRows; ++r)
             {

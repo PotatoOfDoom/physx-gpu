@@ -59,7 +59,7 @@ const uint32_t HINT_EQ = 2048;
 const uint32_t HINT_INEQ = 2049;
 
 const uint32_t CFLAG_DRIVE_LIMITS_ARE_FORCES = 1u << 5;
-const uint32_t CFLAG_DISABLE_PREPROCESSING = 1u << 6;
+const uint32_t CFLAG_DISABLE_PREPROCESSING = 1u << 8;  // PxConstraintFlag::eDISABLE_PREPROCESSING
 
 const uint32_t RB_KINEMATIC = 1u << 0;
 const uint32_t RB_SPEC_CCD = 1u << 4;

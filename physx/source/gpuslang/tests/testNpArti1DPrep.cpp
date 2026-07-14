@@ -394,7 +394,9 @@ PXG_TEST(npArti1DPrep_pgs)
         const uint32_t cdFlags = (rng() % 2) ? CF_DRIVE_LIMITS_ARE_FORCES : 0u;
         s.cfg = U4{ numRows, cdFlags, 0, 0 };
         s.invMassScale = F4{ rf(0, 1.5f), rf(0, 1.5f), rf(0, 1.5f), rf(0, 1.5f) };
-        s.scal = F4{ rf(0.002f, 0.02f), rf(50.f, 500.f), 0, 0 };
+        // dt > 1 stripe: unphysical but representable; the ONLY way the
+        // fminf(dt, 1) clamp in driveScale is observable (review-182 find)
+        s.scal = F4{ (i % 9 == 7) ? rf(1.2f, 2.5f) : rf(0.002f, 0.02f), rf(50.f, 500.f), 0, 0 };
 
         static const uint32_t hintPool[6] = { 0u, 1u, 2u, 5u, 6u, 256u };
         bool dupHint = false;
