@@ -103,11 +103,14 @@ float3 getNormalizedQ(float3 v) // PxVec3::getNormalized: reciprocal multiply
     const float m = v.x * v.x + v.y * v.y + v.z * v.z;
     return m > 0.0f ? v * (1.0f / sqrt(m)) : float3(0, 0, 0);
 }
-float normalizeQ(inout float3 v) // PxVec3::normalize: DIVISION, returns magnitude
-{
-    const float m = sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-    if (m > 0.0f)
-        v = float3(v.x / m, v.y / m, v.z / m);
+float normalizeQ(inout float3 v) // PxVec3::normalize -> operator/=: ONE division
+{                                // then three multiplies (PxVec3.h L260-267);
+    const float m = sqrt(v.x * v.x + v.y * v.y + v.z * v.z); // NOT per-component
+    if (m > 0.0f)                                            // division (review 165)
+    {
+        const float inv = 1.0f / m;
+        v = float3(v.x * inv, v.y * inv, v.z * inv);
+    }
     return m;
 }
 float3 quatRotQ(float4 q, float3 v)
@@ -155,7 +158,7 @@ bool rotatePointsQ(float3 center, float3 refp, float3 normal, inout float3 pts[4
     if (normalizeQ(axis) < FLT_EPS)
         return false;
     axis = dot3Q(normal, axis) > 0.0f ? normal : -normal;
-    const float angle = acos(dot3Q(dir0, dir1));
+    const float angle = acos(clamp(dot3Q(dir0, dir1), -1.0f, 1.0f)); // PxAcos clamps (review 165)
     // PxQuat(angle, unitAxis): half angle sin/cos
     const float a = angle * 0.5f;
     const float sh = sin(a), ch = cos(a);

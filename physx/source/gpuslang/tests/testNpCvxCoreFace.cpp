@@ -79,10 +79,10 @@ static V3 nrmz(V3 v)
     if (m > 0) { const float i = 1.f / std::sqrt(m); return V3{ v.x * i, v.y * i, v.z * i }; }
     return V3{ 0, 0, 0 };
 }
-static float normDiv(V3& v) // PxVec3::normalize -- division form
-{
+static float normDiv(V3& v) // PxVec3::normalize -> operator/=: one division then
+{                            // three multiplies (PxVec3.h L260-267), review 165
     const float m = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-    if (m > 0) { v.x /= m; v.y /= m; v.z /= m; }
+    if (m > 0) { const float inv = 1.0f / m; v.x *= inv; v.y *= inv; v.z *= inv; }
     return m;
 }
 static V3 qRot(const F4& q, V3 v)
@@ -121,7 +121,8 @@ static bool rotatePointsRef(V3 center, V3 refp, V3 normal, V3 pts[4], uint32_t c
     V3 axis = cross3(dir0, dir1);
     if (normDiv(axis) < FLT_EPSILON) return false;
     axis = dot3(normal, axis) > 0 ? normal : neg(normal);
-    const float angle = std::acos(dot3(dir0, dir1));
+    const float d01 = dot3(dir0, dir1);
+    const float angle = std::acos(d01 < -1.f ? -1.f : (d01 > 1.f ? 1.f : d01)); // PxAcos clamps (review 165)
     const float a = angle * 0.5f;
     const float sh = std::sin(a), ch = std::cos(a);
     const F4 rot{ axis.x * sh, axis.y * sh, axis.z * sh, ch };
@@ -309,7 +310,7 @@ PXG_TEST(npCvxCoreFace_contactFace)
 
     std::vector<FaceIn> in(N);
     std::vector<FaceOut> ref(N);
-    size_t cTrig = 0, c4 = 0, c2 = 0, c0 = 0;
+    size_t cTrig = 0, c4 = 0, c2 = 0, c0 = 0, cGuard = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -367,6 +368,49 @@ PXG_TEST(npCvxCoreFace_contactFace)
             s.core[0].y = f2u((rng() % 7 == 3) ? 0.f : rf(0.1f, 2));
         }
 
+        if (i % 59 == 29 && (type == CORE_CYLINDER || type == CORE_CONE))
+        {
+            // rotatePoints guard early-outs (review 165 x1/x1b): identity
+            // pose, exact -X dir (cone caps face -x), ref at the cap centre
+            // (dir1 == 0) or straight above fp[0] (axis cross == 0)
+            s.poseQ = F4{ 0, 0, 0, 1 };
+            s.poseP = F4{ 0, 0, 0, s.poseP.w };
+            s.dir = F4{ -1.f, 0.f, 0.f, 0 };
+            const float h = u2f(s.core[0].x);
+            const float cx = -h * 0.5f;
+            const uint32_t variant = uint32_t(rng() % 3);
+            if (variant == 0)
+            {
+                // dir1 guard with a LIVE micro offset (0 < |dir1| < FLT_EPS):
+                // an exact-zero ref is masked by the axis guard, one ulp is not
+                s.refp = F4{ std::nextafterf(cx, 1.f), 0.f, 0.f, 0 };
+            }
+            else if (variant == 1)
+                s.refp = F4{ cx, rf(0.5f, 2.f), 0.f, 0 };     // axis guard (dir1 parallel dir0)
+            else
+            {
+                // acos argument EXCEEDING 1 by rounding (PxAcos clamp case):
+                // find r with r*(1/sqrt(r*r)) > 1, keep dir1 = (0,1,delta)
+                // with delta small enough that |dir1| rounds to exactly 1
+                // but large enough to keep the axis cross above FLT_EPSILON
+                float r = 0.7f;
+                bool found = false;
+                for (int t = 0; t < 200 && !found; ++t)
+                {
+                    r = rf(0.3f, 2.f);
+                    const float inv = 1.f / std::sqrt(r * r);
+                    if (r * inv > 1.f) found = true;
+                }
+                if (found)
+                {
+                    s.core[0].y = f2u(r);
+                    s.refp = F4{ cx, 1.f, 1e-5f, 0 };
+                }
+                else
+                    s.refp = F4{ cx, rf(0.5f, 2.f), 0.f, 0 };
+            }
+            ++cGuard;
+        }
         in[i] = s;
         refFace(s, ref[i]);
         if (ref[i].counts.y) ++cTrig;
@@ -400,8 +444,8 @@ PXG_TEST(npCvxCoreFace_contactFace)
         if (!ok) ++mm;
     }
     PXG_CHECK_MSG(mm == 0, "ccfContactFace: %zu mismatches", mm);
-    PXG_CHECK_MSG(cTrig > N / 40 && c4 > N / 20 && c2 > N / 20 && c0 > N / 20,
-                  "ccfContactFace: coverage thin (trig %zu c4 %zu c2 %zu c0 %zu)", cTrig, c4, c2, c0);
+    PXG_CHECK_MSG(cTrig > N / 40 && c4 > N / 20 && c2 > N / 20 && c0 > N / 20 && cGuard > 20,
+                  "ccfContactFace: coverage thin (trig %zu c4 %zu c2 %zu c0 %zu guard %zu)", cTrig, c4, c2, c0, cGuard);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }
