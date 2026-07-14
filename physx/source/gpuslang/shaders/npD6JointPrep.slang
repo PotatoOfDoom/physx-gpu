@@ -96,6 +96,10 @@ struct D6Out
     uint4 counts;                 // x = numConstraints, y = trig bits
     float4 cAoutW;                // cA2wOut (ra + bA2w.p)
     float4 cBoutW;                // cB2wOut (cB2w.p)
+    uint4 nrfs;                   // c1dPrePrep: mNumRows_Flags_StartIndex image
+    float4 invMass;               // c1dPrePrep: mInvMassScale passthrough
+    float4 raW;                   // c1dPrePrep: mRaWorld_linBreakForceW
+    float4 rbW;                   // c1dPrePrep: mRbWorld_angBreakForceW
     float4 rows[120];             // MAX_ROWS x 5 float4s per Px1DConstraint:
                                   //  (linear0, geometricError) (angular0, velocityTarget)
                                   //  (linear1, minImpulse) (angular1, maxImpulse)
@@ -446,21 +450,13 @@ void chAnglePair(inout RowBuf buf, float angle, float lower, float upper, float3
         chAngularLimit(buf, axis, upper - angle, lp);
 }
 
-// ---- entry ----
+// ---- D6JointSolverPrep driver (constraintBlockPrePrep.cu L516-737) ----
+// raOut is the internal ra of prepareLockedAxes (cA2wOut = raOut + bA2w.p);
+// cB2wpOut = cB2w.p
 
-[shader("compute")]
-[numthreads(64, 1, 1)]
-void d6jPrep(uint3 dtid : SV_DispatchThreadID)
+void d6SolveQ(const D6In s, uint useExtendedLimits, inout RowBuf buf, inout uint trig,
+              out float3 raOut, out float3 cB2wpOut)
 {
-    const uint tid = dtid.x;
-    if (tid >= gParams.numTests) return;
-    const D6In s = gIn[tid];
-
-    uint trig = 0u;
-    RowBuf buf;
-    buf.n = 0u;
-
-    const uint useExtendedLimits = asuint(s.c2bAp.w);
     const uint useBits = asuint(s.c2bBp.w);
     const bool useDistanceLimit = (useBits & 1u) != 0u;
     const bool useNewLinearLimits = (useBits & 2u) != 0u;
@@ -786,11 +782,12 @@ void d6jPrep(uint3 dtid : SV_DispatchThreadID)
         }
     }
 
-    // ---- outputs ----
-    D6Out o;
-    o.counts = uint4(buf.n, trig, 0u, 0u);
-    o.cAoutW = float4(ra + s.bA2wp.xyz, 0.0f);
-    o.cBoutW = float4(cB2wp, 0.0f);
+    raOut = ra;
+    cB2wpOut = cB2wp;
+}
+
+void packRows(const RowBuf buf, inout D6Out o)
+{
     for (uint i = 0u; i < MAX_ROWS; ++i)
     {
         if (i < buf.n)
@@ -811,5 +808,104 @@ void d6jPrep(uint3 dtid : SV_DispatchThreadID)
             o.rows[i * 5u + 4u] = float4(0, 0, 0, 0);
         }
     }
+}
+
+// ---- entry: bare D6JointSolverPrep (tranche 174) ----
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void d6jPrep(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint tid = dtid.x;
+    if (tid >= gParams.numTests) return;
+    const D6In s = gIn[tid];
+
+    uint trig = 0u;
+    RowBuf buf;
+    buf.n = 0u;
+    float3 ra, cB2wp;
+    d6SolveQ(s, asuint(s.c2bAp.w), buf, trig, ra, cB2wp);
+
+    D6Out o;
+    o.counts = uint4(buf.n, trig, 0u, 0u);
+    o.cAoutW = float4(ra + s.bA2wp.xyz, 0.0f);
+    o.cBoutW = float4(cB2wp, 0.0f);
+    o.nrfs = uint4(0, 0, 0, 0);
+    o.invMass = float4(0, 0, 0, 0);
+    o.raW = float4(0, 0, 0, 0);
+    o.rbW = float4(0, 0, 0, 0);
+    packRows(buf, o);
+    gOut[tid] = o;
+}
+
+// ---- entry: constraint1DPrePrep wrapper (constraintBlockPrePrep.cu
+// L1059-1166, tranche 175) ----
+// The pose fetch (solver body data / articulation link poses,
+// PxAlignedTransform::getTransform = arithmetic-free repack) is data
+// plumbing; the ported compute: the removed-joint gate (both node indices
+// PX_INVALID_NODE -> NO output write), the eDISABLE_CONSTRAINT branch
+// (numRows = 0, ra = rb = 0), useExtendedLimits derived from the prePrep
+// flags, the D6JointSolverPrep call, ra/rb = cX2w - poseX.p (the exact
+// add-then-subtract roundtrip through cA2wOut = ra + bA2w.p), and the
+// PxgConstraintData image (invMassScale passthrough,
+// mRaWorld_linBreakForceW / mRbWorld_angBreakForceW,
+// mNumRows_Flags_StartIndex with startIndex = jointDataIndex *
+// Dy::MAX_CONSTRAINT_ROWS = 20).
+// Extra input lanes: angVel.w = asuint(prePrep mFlags), swingV.z =
+// asuint(removed), distV.y/z = lin/ang break force, distV.w =
+// asuint(jointDataIndex), linXV.zw + linYV.zw = invMassScale.
+
+static const uint E_DISABLE_CONSTRAINT = 4096u;    // PxConstraintFlag 1<<12
+static const uint E_EXTENDED_LIMITS = 512u;        // PxConstraintFlag 1<<9
+static const uint DY_MAX_CONSTRAINT_ROWS = 20u;    // DyConstraintPrep.h L55
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void c1dPrePrep(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint tid = dtid.x;
+    if (tid >= gParams.numTests) return;
+    const D6In s = gIn[tid];
+
+    // removed joint: both node indices PX_INVALID_NODE -> nothing written
+    if (asuint(s.swingV.z) != 0u)
+        return;
+
+    const uint prePrepFlags = asuint(s.angVel.w);
+    const bool disableConstraints = (prePrepFlags & E_DISABLE_CONSTRAINT) != 0u;
+    const uint useExtendedLimits = (prePrepFlags & E_EXTENDED_LIMITS) != 0u ? 1u : 0u;
+    const uint jointDataIndex = asuint(s.distV.w);
+
+    uint trig = 0u;
+    RowBuf buf;
+    buf.n = 0u;
+
+    float3 ra, rb;
+    if (!disableConstraints)
+    {
+        float3 raInner, cB2wp;
+        d6SolveQ(s, useExtendedLimits, buf, trig, raInner, cB2wp);
+        const float3 ca2w = raInner + s.bA2wp.xyz;  // cA2wOut of D6JointSolverPrep
+        const float3 cb2w = cB2wp;                  // cB2wOut
+        ra = ca2w - s.bA2wp.xyz;                    // pose0.p
+        rb = cb2w - s.bB2wp.xyz;                    // pose1.p
+    }
+    else
+    {
+        ra = float3(0, 0, 0);
+        rb = float3(0, 0, 0);
+    }
+
+    const uint constraintsStartIndex = jointDataIndex * DY_MAX_CONSTRAINT_ROWS;
+
+    D6Out o;
+    o.counts = uint4(buf.n, trig, 0u, 0u);
+    o.cAoutW = float4(0, 0, 0, 0);
+    o.cBoutW = float4(0, 0, 0, 0);
+    o.nrfs = uint4(buf.n, prePrepFlags, constraintsStartIndex, 0u);
+    o.invMass = float4(s.linXV.z, s.linXV.w, s.linYV.z, s.linYV.w);
+    o.raW = float4(ra, s.distV.y);   // mLinBreakForce
+    o.rbW = float4(rb, s.distV.z);   // mAngBreakForce
+    packRows(buf, o);
     gOut[tid] = o;
 }

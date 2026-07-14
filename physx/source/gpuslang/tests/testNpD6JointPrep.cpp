@@ -82,6 +82,10 @@ struct D6Out
     U4 counts;   // x = numConstraints, y = trig bits
     F4 cAoutW;
     F4 cBoutW;
+    U4 nrfs;     // c1dPrePrep: mNumRows_Flags_StartIndex image
+    F4 invMass;  // c1dPrePrep: mInvMassScale passthrough
+    F4 raW;      // c1dPrePrep: mRaWorld_linBreakForceW
+    F4 rbW;      // c1dPrePrep: mRbWorld_angBreakForceW
     F4 rows[120];
 };
 
@@ -710,34 +714,31 @@ void solverPrep(const D6In& s, D6Out& o)
 
 } // namespace d6ref
 
-PXG_TEST(npD6JointPrep_prep)
+static float rfS(std::mt19937& rng, float lo, float hi)
+{ return lo + (hi - lo) * (float(rng() % 1000000) / 1000000.f); }
+static F4 randQuatS(std::mt19937& rng)
 {
-    std::mt19937 rng(174001);
-    const uint32_t N = 4000;
-    auto rf = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng() % 1000000) / 1000000.f); };
-    auto randQuat = [&]() {
-        float a[4]; float m2 = 0;
-        for (int k = 0; k < 4; ++k) { a[k] = rf(-1, 1); m2 += a[k] * a[k]; }
-        const float i = 1.f / std::sqrt(m2 > 0 ? m2 : 1.f);
-        return F4{ a[0] * i, a[1] * i, a[2] * i, a[3] * i };
-    };
-    auto asF = [](uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; };
-    auto limitParams = [&](bool hard) {
-        // (restitution, bounceThreshold, stiffness, damping)
-        if (hard) return F4{ (rng() % 2) ? rf(0.f, 1.f) : 0.f, rf(0.f, 1.f), 0.f, 0.f };
-        return F4{ 0.f, 0.f, (rng() % 4) ? rf(1.f, 500.f) : 0.f, rf(0.5f, 50.f) };
-    };
+    float a[4]; float m2 = 0;
+    for (int k = 0; k < 4; ++k) { a[k] = rfS(rng, -1, 1); m2 += a[k] * a[k]; }
+    const float i = 1.f / std::sqrt(m2 > 0 ? m2 : 1.f);
+    return F4{ a[0] * i, a[1] * i, a[2] * i, a[3] * i };
+}
+static float asF(uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; }
+static F4 limitParamsS(std::mt19937& rng, bool hard)
+{
+    // (restitution, bounceThreshold, stiffness, damping)
+    if (hard) return F4{ (rng() % 2) ? rfS(rng, 0.f, 1.f) : 0.f, rfS(rng, 0.f, 1.f), 0.f, 0.f };
+    return F4{ 0.f, 0.f, (rng() % 4) ? rfS(rng, 1.f, 500.f) : 0.f, rfS(rng, 0.5f, 50.f) };
+}
 
-    std::vector<D6In> in(N);
-    std::vector<D6Out> ref(N);
-    size_t cTrig = 0, cSlerp = 0, cCone = 0, cPyr = 0, cDual = 0, cSingle = 0, cTwistL = 0,
-           cDist = 0, cNewLin = 0, cSpecial = 0, cLockRows = 0, cHard = 0, cSoft = 0,
-           cRows = 0, cZeroRows = 0, cLinDrv = 0, cAngDrv = 0, cExt = 0;
+// shared fixture generator (both suites); returns the hard/soft pick
+static bool genFixture(std::mt19937& rng, uint32_t i, D6In& s)
+{
+    auto rf = [&](float lo, float hi) { return rfS(rng, lo, hi); };
+    auto randQuat = [&]() { return randQuatS(rng); };
+    auto limitParams = [&](bool h) { return limitParamsS(rng, h); };
 
-    for (uint32_t i = 0; i < N; ++i)
     {
-        D6In s{};
-
         // joint-frame and body poses
         s.c2bAq = (i % 6 == 0) ? F4{ 0, 0, 0, 1 } : randQuat();
         s.c2bAp = F4{ rf(-0.5f, 0.5f), rf(-0.5f, 0.5f), rf(-0.5f, 0.5f), 0 };
@@ -840,7 +841,6 @@ PXG_TEST(npD6JointPrep_prep)
         }
 
         const bool hard = (rng() % 2) == 0;
-        if (hard) ++cHard; else ++cSoft;
         s.distP = limitParams(hard);
         s.distV = F4{ rf(0.01f, 1.5f), 0, 0, 0 };
         s.linXP = limitParams(hard);
@@ -860,6 +860,33 @@ PXG_TEST(npD6JointPrep_prep)
         s.pyrP = limitParams(hard);
         { float ylo = rf(-2.5f, 0.5f), zlo = rf(-2.5f, 0.5f);
           s.pyrV = F4{ ylo, ylo + rf(0.05f, 2.f), zlo, zlo + rf(0.05f, 2.f) }; }
+
+        return hard;
+    }
+}
+
+PXG_TEST(npD6JointPrep_prep)
+{
+    std::mt19937 rng(174001);
+    const uint32_t N = 4000;
+
+    std::vector<D6In> in(N);
+    std::vector<D6Out> ref(N);
+    size_t cTrig = 0, cSlerp = 0, cCone = 0, cPyr = 0, cDual = 0, cSingle = 0, cTwistL = 0,
+           cDist = 0, cNewLin = 0, cSpecial = 0, cLockRows = 0, cHard = 0, cSoft = 0,
+           cRows = 0, cZeroRows = 0, cLinDrv = 0, cAngDrv = 0, cExt = 0;
+
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        D6In s{};
+        const bool hard = genFixture(rng, i, s);
+        if (hard) ++cHard; else ++cSoft;
+
+        const uint32_t locked = f2u(s.bA2wp.w);
+        const uint32_t limited = f2u(s.bB2wp.w);
+        const uint32_t driving = f2u(s.drvPp.w);
+        const uint32_t useBits = f2u(s.c2bBp.w);
+        const uint32_t useExt = f2u(s.c2bAp.w);
 
         in[i] = s;
         d6ref::solverPrep(s, ref[i]);
@@ -983,6 +1010,169 @@ PXG_TEST(npD6JointPrep_prep)
     PXG_CHECK_MSG(cov, "d6jPrep: coverage thin (rows %zu trig %zu cone %zu pyr %zu dual %zu "
                        "single %zu special %zu)",
                   cRows, cTrig, cCone, cPyr, cDual, cSingle, cSpecial);
+
+    for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
+}
+
+// ---- constraint1DPrePrep wrapper (constraintBlockPrePrep.cu L1059-1166,
+// tranche 175): removed-joint gate (NO output write), eDISABLE_CONSTRAINT
+// branch, useExtendedLimits derived from the prePrep flags, ra/rb =
+// cX2w - poseX.p add-then-subtract roundtrip, PxgConstraintData image ----
+
+PXG_TEST(npD6JointPrep_c1dPrePrep)
+{
+    std::mt19937 rng(175001);
+    const uint32_t N = 2000;
+    const uint32_t F_EXT = 1u << 9, F_DISABLE = 1u << 12;  // PxConstraintFlag
+
+    std::vector<D6In> in(N);
+    std::vector<D6Out> ref(N);
+    std::vector<uint8_t> removed(N);
+    size_t cRem = 0, cDis = 0, cExtF = 0, cRun = 0, cTrig = 0, cRows = 0;
+
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        D6In s{};
+        genFixture(rng, i, s);
+
+        // prePrep flags: irrelevant bits + independent extended-limits pick
+        // (deliberately decoupled from the fixture's c2bAp.w, which the
+        // wrapper entry must IGNORE)
+        uint32_t ppFlags = ((rng() % 2) ? (1u << 3) : 0u) | ((rng() % 2) ? (1u << 5) : 0u);
+        if (rng() % 3 == 0) ppFlags |= F_EXT;
+        if (i % 5 == 1) ppFlags |= F_DISABLE;
+        const bool rem = (i % 7 == 3);
+
+        s.angVel.w = asF(ppFlags);
+        s.swingV.z = asF(rem ? 1u : 0u);
+        s.distV.y = rfS(rng, 0.f, 1e5f);   // mLinBreakForce
+        s.distV.z = rfS(rng, 0.f, 1e5f);   // mAngBreakForce
+        s.distV.w = asF(i);                // jointDataIndex
+        s.linXV.z = rfS(rng, 0.f, 2.f); s.linXV.w = rfS(rng, 0.f, 2.f);  // invMassScale
+        s.linYV.z = rfS(rng, 0.f, 2.f); s.linYV.w = rfS(rng, 0.f, 2.f);
+
+        in[i] = s;
+        removed[i] = rem ? 1 : 0;
+
+        D6Out& o = ref[i];
+        std::memset(&o, 0, sizeof(o));
+        if (rem)
+        {
+            ++cRem;
+        }
+        else
+        {
+            uint32_t numRows = 0;
+            F4 raW{ 0, 0, 0, s.distV.y }, rbW{ 0, 0, 0, s.distV.z };
+            if (!(ppFlags & F_DISABLE))
+            {
+                D6In t = s;
+                t.c2bAp.w = asF((ppFlags & F_EXT) ? 1u : 0u);
+                d6ref::solverPrep(t, o);
+                numRows = o.counts.x;
+                // ra = ca2w - pose0.p; rb = cb2w - pose1.p (cu L1150-1151)
+                raW.x = o.cAoutW.x - s.bA2wp.x; raW.y = o.cAoutW.y - s.bA2wp.y;
+                raW.z = o.cAoutW.z - s.bA2wp.z;
+                rbW.x = o.cBoutW.x - s.bB2wp.x; rbW.y = o.cBoutW.y - s.bB2wp.y;
+                rbW.z = o.cBoutW.z - s.bB2wp.z;
+                ++cRun;
+                if (o.counts.y) ++cTrig;
+                cRows += numRows;
+            }
+            else
+            {
+                ++cDis;
+            }
+            o.counts = U4{ numRows, (ppFlags & F_DISABLE) ? 0u : o.counts.y, 0, 0 };
+            o.cAoutW = F4{ 0, 0, 0, 0 };
+            o.cBoutW = F4{ 0, 0, 0, 0 };
+            o.nrfs = U4{ numRows, ppFlags, i * 20u, 0 };  // Dy::MAX_CONSTRAINT_ROWS
+            o.invMass = F4{ s.linXV.z, s.linXV.w, s.linYV.z, s.linYV.w };
+            o.raW = raW;
+            o.rbW = rbW;
+        }
+        if (ppFlags & F_EXT) ++cExtF;
+    }
+
+    std::printf("[ info ] c1d cov: run %zu dis %zu rem %zu extF %zu trig %zu rows %zu\n",
+                cRun, cDis, cRem, cExtF, cTrig, cRows);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t GROUPS = (N + 63) / 64;
+    std::vector<D6Out> outInit(N);
+    std::memset(outInit.data(), 0xCD, N * sizeof(D6Out));  // sentinel: removed = untouched
+    PxgBufferHandle bIn = createBufferFrom(dev, in);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+
+    struct P { uint32_t numTests; } prm = { N };
+    Kernel k("npD6JointPrep.spv", "c1dPrePrep",
+             { (uint32_t)sizeof(D6In), (uint32_t)sizeof(D6Out) }, sizeof(P));
+    k.dispatch(GROUPS, { bIn, bOut }, prm);
+    dev->flush();
+
+    const auto g = downloadBuffer<D6Out>(dev, bOut, N);
+    D6Out sentinel;
+    std::memset(&sentinel, 0xCD, sizeof(sentinel));
+    size_t mm = 0, unstable = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const D6Out& r = ref[i]; const D6Out& q = g[i];
+
+        if (removed[i])
+        {
+            // the removed-joint gate writes NOTHING
+            if (std::memcmp(&q, &sentinel, sizeof(D6Out)) != 0)
+            {
+                if (mm < 5) std::printf("MM %u removed case was written\n", i);
+                ++mm;
+            }
+            continue;
+        }
+
+        // trig-free meta: trig bits, PxgConstraintData image scalars, ra/rb
+        bool meta = r.counts.y == q.counts.y && r.nrfs.x == q.nrfs.x && r.nrfs.y == q.nrfs.y &&
+                    r.nrfs.z == q.nrfs.z && r.nrfs.w == q.nrfs.w && eqF4FZ(r.invMass, q.invMass) &&
+                    eqF4FZ(r.raW, q.raW) && eqF4FZ(r.rbW, q.rbW) && r.counts.x == q.counts.x;
+        if (!meta)
+        {
+            if (r.counts.y != 0 && r.counts.y == q.counts.y)
+            {
+                ++unstable;  // trig-flipped anglePair gate (capped class)
+                continue;
+            }
+            if (mm < 5)
+                std::printf("MM %u c1d meta: nR %u nG %u raR (%g %g %g) raG (%g %g %g)\n", i,
+                            r.nrfs.x, q.nrfs.x, r.raW.x, r.raW.y, r.raW.z, q.raW.x, q.raW.y,
+                            q.raW.z);
+            ++mm;
+            continue;
+        }
+
+        const bool trig = r.counts.y != 0;
+        bool ok = true;
+        for (uint32_t j = 0; j < r.counts.x * 5 && ok; ++j)
+        {
+            const F4& a = r.rows[j]; const F4& b = q.rows[j];
+            if ((j % 5) == 4)
+                ok = (trig ? (eqTol(a.x, b.x) && eqTol(a.y, b.y))
+                           : (eqFZ(a.x, b.x) && eqFZ(a.y, b.y))) && eqBits(a.z, b.z);
+            else
+                ok = trig ? (eqTol(a.x, b.x) && eqTol(a.y, b.y) && eqTol(a.z, b.z) && eqTol(a.w, b.w))
+                          : eqF4FZ(a, b);
+        }
+        if (!ok)
+        {
+            if (mm < 5) std::printf("MM %u c1d rows: n %u trig %u\n", i, r.counts.x, r.counts.y);
+            ++mm;
+        }
+    }
+    PXG_CHECK_MSG(mm == 0, "c1dPrePrep: %zu mismatches", mm);
+    PXG_CHECK_MSG(unstable <= 8, "c1dPrePrep: %zu trig-unstable cases (cap 8)", unstable);
+
+    const bool cov = cRun > N / 2 && cDis > 100 && cRem > 100 && cExtF > N / 5 && cTrig > 100 &&
+                     cRows > 2000;
+    PXG_CHECK_MSG(cov, "c1dPrePrep: coverage thin (run %zu dis %zu rem %zu extF %zu trig %zu)",
+                  cRun, cDis, cRem, cExtF, cTrig);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }

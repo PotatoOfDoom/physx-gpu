@@ -224,7 +224,7 @@ pxg_compile_shader(npCvxCorePlaneGen cpgContacts)
 pxg_compile_shader(npCvxCoreCvxGen cvgContacts)
 pxg_compile_shader(npCvxBvhGlue cbgGlue)
 pxg_compile_shader(npCvxCoreWarpAcc cwaAddPoints)
-pxg_compile_shader(npD6JointPrep d6jPrep)
+pxg_compile_shader(npD6JointPrep d6jPrep c1dPrePrep)
 pxg_compile_shader(npManifold mfRefresh mfInvalidate)
 pxg_compile_shader(npSegDist sdPointSegment sdSegmentSegment)
 pxg_compile_shader(npTriMask ctBarycentric ctActiveMaskVW ctActiveMaskFromNormal ctActiveMaskPoint)
@@ -655,6 +655,7 @@ set(PXG_HLSL_ENTRIES
     "npCvxBvhGlue:cbgGlue"
     "npCvxCoreWarpAcc:cwaAddPoints"
     "npD6JointPrep:d6jPrep"
+    "npD6JointPrep:c1dPrePrep"
     "npManifold:mfRefresh" "npManifold:mfInvalidate"
     "npSegDist:sdPointSegment" "npSegDist:sdSegmentSegment"
     "npTriMask:ctBarycentric" "npTriMask:ctActiveMaskVW" "npTriMask:ctActiveMaskFromNormal" "npTriMask:ctActiveMaskPoint"
