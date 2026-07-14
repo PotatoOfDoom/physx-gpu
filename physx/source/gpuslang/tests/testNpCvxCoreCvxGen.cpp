@@ -2175,19 +2175,22 @@ PXG_TEST(npCvxCoreCvxGen_contacts)
         // itself) can flip a FaceClipper band decision downstream, changing
         // the emitted point count.  Those razor cases are excluded from the
         // bitwise compare but counted and CAPPED below.
-        if (r.counts.y != 0 && r.counts.x != q.counts.x)
+        const bool trigMeta = r.counts.y == q.counts.y && r.counts.z == q.counts.z &&
+                              eqFZ(r.normal.x, q.normal.x) && eqFZ(r.normal.y, q.normal.y) &&
+                              eqFZ(r.normal.z, q.normal.z); // trig can't alter flags/normal (review 171)
+        if (r.counts.y != 0 && trigMeta && r.counts.x != q.counts.x)
         {
             ++trigUnstable;
             continue;
         }
-        bool ok = r.counts.x == q.counts.x && r.counts.y == q.counts.y &&
+        bool ok = r.counts.x == q.counts.x && r.counts.y == q.counts.y && r.counts.z == q.counts.z &&
                   eqFZ(r.normal.x, q.normal.x) && eqFZ(r.normal.y, q.normal.y) && eqFZ(r.normal.z, q.normal.z);
         const bool trig = r.counts.y != 0;
         for (uint32_t j = 0; j < 4 && ok; ++j)
             ok = trig ? faceref::eqF4Tol(*(const faceref::F4*)&r.points[j], *(const faceref::F4*)&q.points[j])
                       : (eqFZ(r.points[j].x, q.points[j].x) && eqFZ(r.points[j].y, q.points[j].y) &&
                          eqFZ(r.points[j].z, q.points[j].z) && eqFZ(r.points[j].w, q.points[j].w));
-        if (!ok && r.counts.y != 0)
+        if (!ok && r.counts.y != 0 && trigMeta)
         {
             // same class: a trig-flipped reduce decision can also REORDER
             // the emitted points at equal counts
