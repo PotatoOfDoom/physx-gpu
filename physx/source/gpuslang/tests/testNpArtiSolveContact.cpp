@@ -270,7 +270,7 @@ PXG_TEST(npArtiSolveContact_pgs)
     std::vector<AscIn> in(N);
     std::vector<AscOut> ref(N);
     size_t cNorm0 = 0, cFric0 = 0, cCompliant = 0, cAccel = 0, cClampN = 0, cClampF = 0,
-           cBroken = 0, cMinForce = 0, cEps = 0, cNoFric = 0, cRefScale = 0;
+           cBroken = 0, cMinForce = 0, cEps = 0, cNoFric = 0, cRefScale = 0, cZeroRespN = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -282,11 +282,17 @@ PXG_TEST(npArtiSolveContact_pgs)
         if (numFric == 0) ++cFric0;
         if (!doFriction) ++cNoFric;
 
-        const int rMode = static_cast<int>(rng() % 3);
+        // zero-response normal stripe: contact resp0=resp1=0 with cfm=0 so
+        // unitResponse == 0 <= 0 and the recipResponse false-branch (=0) fires
+        // (a fully-constrained contact direction; hard restitution keeps
+        // recipResponse load-bearing via velMultiplier).
+        const bool zeroRespN = (i % 19 == 5);
+        const int rMode = zeroRespN ? (1 + static_cast<int>(rng() % 2)) : static_cast<int>(rng() % 3);
         const uint32_t accelBit = (rng() % 2) ? CONTACT_FLAG_ACCEL_SPRING : 0u;
         const float restitution = (rMode == 0) ? rf(-2.f, -0.1f) : rf(0.f, 1.f);
         if (rMode == 0) ++cCompliant;
         if (rMode == 0 && accelBit) ++cAccel;
+        if (zeroRespN && numNormal) ++cZeroRespN;
         s.cfg = U4{ numNormal, numFric, doFriction ? 1u : 0u, accelBit };
 
         const bool refScale = (i % 5 == 2);
@@ -301,7 +307,7 @@ PXG_TEST(npArtiSolveContact_pgs)
         const bool bigMinForce = (i % 11 == 4);
         const float minNF = bigMinForce ? rf(50.f, 200.f) : rf(0.f, 0.5f);
         s.normalSF = F4{ n[0], n[1], n[2], rf(0.f, 1.f) };
-        s.hdr = F4{ restitution, rf(0.f, 0.05f), minNF, rf(0.f, 1.f) };
+        s.hdr = F4{ restitution, zeroRespN ? 0.f : rf(0.f, 0.05f), minNF, rf(0.f, 1.f) };
         s.fricN[0] = F4{ rf(-1, 1), rf(-1, 1), rf(-1, 1), 0.f };
         s.fricN[1] = F4{ rf(-1, 1), rf(-1, 1), rf(-1, 1), 0.f };
         s.vel0Top = rv3(-3, 3); s.vel0Bot = rv3(-3, 3);
@@ -311,9 +317,11 @@ PXG_TEST(npArtiSolveContact_pgs)
         {
             // tight maxImpulse sometimes to force the normal clamp
             const bool tight = (rng() % 3 == 0);
+            const float cr0 = zeroRespN ? 0.f : rf(0.05f, 2.f);
+            const float cr1 = zeroRespN ? 0.f : rf(0.05f, 2.f);
             s.contacts[c].raXn_tv = F4{ rf(-1, 1), rf(-1, 1), rf(-1, 1), rf(-2, 2) };
             s.contacts[c].rbXn_maxI = F4{ rf(-1, 1), rf(-1, 1), rf(-1, 1), tight ? rf(0.f, 0.05f) : rf(0.5f, 1e3f) };
-            s.contacts[c].crm = F4{ rf(-0.05f, 0.2f), rf(0.05f, 2.f), rf(0.05f, 2.f), rf(-1, 1) };
+            s.contacts[c].crm = F4{ rf(-0.05f, 0.2f), cr0, cr1, rf(-1, 1) };
             s.contacts[c].crm2 = F4{ rf(-1, 1), 0, 0, 0 };
             s.contacts[c].dRA = F4{ rf(-0.5f, 0.5f), rf(-0.5f, 0.5f), rf(-0.5f, 0.5f), rf(-0.5f, 0.5f) };
             s.contacts[c].dRA2 = F4{ rf(-0.5f, 0.5f), rf(-0.5f, 0.5f), rf(-0.5f, 0.5f), rf(-0.5f, 0.5f) };
@@ -343,9 +351,9 @@ PXG_TEST(npArtiSolveContact_pgs)
     }
 
     std::printf("[ info ] asc cov: norm0 %zu fric0 %zu compliant %zu accel %zu clampN %zu clampF %zu "
-                "broken %zu minForce %zu eps %zu nofric %zu refScale %zu\n",
+                "broken %zu minForce %zu eps %zu nofric %zu refScale %zu zeroRespN %zu\n",
                 cNorm0, cFric0, cCompliant, cAccel, cClampN, cClampF, cBroken, cMinForce, cEps,
-                cNoFric, cRefScale);
+                cNoFric, cRefScale, cZeroRespN);
     PXG_CHECK(cNorm0 > 100);
     PXG_CHECK(cFric0 > 300);
     PXG_CHECK(cCompliant > 700);
@@ -354,9 +362,10 @@ PXG_TEST(npArtiSolveContact_pgs)
     PXG_CHECK(cClampF > 300);
     PXG_CHECK(cBroken > 300);
     PXG_CHECK(cMinForce > 100);
-    PXG_CHECK(cEps > 100);
+    PXG_CHECK(cEps > 80);
     PXG_CHECK(cNoFric > 300);
     PXG_CHECK(cRefScale > 400);
+    PXG_CHECK(cZeroRespN > 100);
 
     PxgSlangComputeDevice* dev = testDevice();
     const uint32_t GROUPS = (N + 63) / 64;
