@@ -796,12 +796,24 @@ PXG_TEST(npD6JointPrep_prep)
         for (int a = 0; a < 3; ++a)
             if (motion[a] != 0 && rng() % 3 == 0) driving |= (1u << a);
         const uint32_t angDrvKind = rng() % 5;
-        if (angDrvKind == 1) driving |= (1u << 5);                       // SLERP
+        if (angDrvKind == 1)
+        {
+            driving |= (1u << 5);                                        // SLERP
+            // review-174 gap: SLERP together with SWING/TWIST bits pins the
+            // if/else precedence (SLERP wins, cu L579-591)
+            if (rng() % 2) driving |= (1u << 4) | (1u << 3);
+        }
         else if (angDrvKind == 2) driving |= (1u << 4) | (rng() % 2 ? (1u << 3) : 0u);
         else if (angDrvKind == 3) driving |= (1u << 3);                  // SWING
         else if (angDrvKind == 4)
             driving |= (rng() % 2 ? (1u << 6) : 0u) | (rng() % 2 ? (1u << 7) : 0u) |
                        (rng() % 3 == 0 ? (1u << 4) : 0u);                // SWING1/SWING2 (+TWIST)
+
+        if (i % 43 == 21)
+        {
+            // review-174 gap: all-free undriven joints -> zero rows
+            locked = 0; limited = 0; driving = 0;
+        }
 
         const uint32_t useExt = (i % 4 == 2) ? 1u : 0u;
         uint32_t useBits = rng() % 16u;
@@ -967,7 +979,7 @@ PXG_TEST(npD6JointPrep_prep)
     bool cov = cRows > N && cTrig > N / 8 && cCone > 50 && cPyr > 50 && cDual > 50 &&
                cSingle > 20 && cTwistL > N / 8 && cDist > 50 && cNewLin > 50 && cSpecial > 50 &&
                cLockRows > N / 4 && cSlerp > N / 10 && cLinDrv > N / 10 && cAngDrv > N / 4 &&
-               cHard > N / 4 && cSoft > N / 4 && cExt > N / 8;
+               cHard > N / 4 && cSoft > N / 4 && cExt > N / 8 && cZeroRows > 50;
     PXG_CHECK_MSG(cov, "d6jPrep: coverage thin (rows %zu trig %zu cone %zu pyr %zu dual %zu "
                        "single %zu special %zu)",
                   cRows, cTrig, cCone, cPyr, cDual, cSingle, cSpecial);
