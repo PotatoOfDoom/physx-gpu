@@ -376,7 +376,7 @@ PXG_TEST(npArtiSolveContactTGS_pgs)
     std::vector<AtcOut> ref(N);
     size_t cNorm0 = 0, cFric0 = 0, cCompliant = 0, cAccel = 0, cClampN = 0, cClampF = 0,
            cBroken = 0, cMinForce = 0, cEps = 0, cTorsional = 0, cTorClamp = 0, cRefScale = 0,
-           cZeroRespN = 0;
+           cZeroRespN = 0, cTinyResp = 0;
 
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -386,6 +386,13 @@ PXG_TEST(npArtiSolveContactTGS_pgs)
         const uint32_t numFric = (i % 7 == 3) ? 0u : (rng() % 7u);
         if (numNormal == 0) ++cNorm0;
         if (numFric == 0) ++cFric0;
+        // tiny-friction-response stripe: seeds friction resp in the OPEN
+        // interval (0, PX_EPS_REAL] so the paired guard `resp > PX_EPS_REAL`
+        // and the torsional guard `resp > 0` DIVERGE (they agree at resp==0
+        // and resp>=0.015; only this interval separates them).  ref0*r0 stays
+        // < PX_EPS since 1.5f * 7e-8f = 1.05e-7 < 1.192e-7.
+        const bool tinyResp = (i % 23 == 7);
+        if (tinyResp && numFric) ++cTinyResp;
 
         const bool zeroRespN = (i % 19 == 5);
         const int rMode = zeroRespN ? (1 + static_cast<int>(rng() % 2)) : static_cast<int>(rng() % 3);
@@ -434,9 +441,9 @@ PXG_TEST(npArtiSolveContactTGS_pgs)
         }
         for (uint32_t fr = 0; fr < numFric; ++fr)
         {
-            const bool zeroResp = (i % 17 == 8);  // eps-guard: respF ~ 0
-            const float r0 = zeroResp ? 0.f : rf(0.05f, 2.f);
-            const float r1 = zeroResp ? 0.f : rf(0.05f, 2.f);
+            const bool zeroResp = (i % 17 == 8);  // eps-guard: respF == 0
+            const float r0 = tinyResp ? rf(1e-9f, 7e-8f) : (zeroResp ? 0.f : rf(0.05f, 2.f));
+            const float r1 = tinyResp ? 0.f : (zeroResp ? 0.f : rf(0.05f, 2.f));
             s.frictions[fr].raXn_err = F4{ rf(-1, 1), rf(-1, 1), rf(-1, 1), rf(-1, 1) };
             s.frictions[fr].rbXn_tv = F4{ rf(-1, 1), rf(-1, 1), rf(-1, 1), rf(-1, 1) };
             s.frictions[fr].frm = F4{ rf(-0.2f, 0.2f), r0, r1, 0 };
@@ -458,9 +465,10 @@ PXG_TEST(npArtiSolveContactTGS_pgs)
     }
 
     std::printf("[ info ] atc cov: norm0 %zu fric0 %zu compliant %zu accel %zu clampN %zu clampF %zu "
-                "broken %zu minForce %zu eps %zu torsional %zu torClamp %zu refScale %zu zeroRespN %zu\n",
+                "broken %zu minForce %zu eps %zu torsional %zu torClamp %zu refScale %zu zeroRespN %zu "
+                "tinyResp %zu\n",
                 cNorm0, cFric0, cCompliant, cAccel, cClampN, cClampF, cBroken, cMinForce, cEps,
-                cTorsional, cTorClamp, cRefScale, cZeroRespN);
+                cTorsional, cTorClamp, cRefScale, cZeroRespN, cTinyResp);
     PXG_CHECK(cNorm0 > 100);
     PXG_CHECK(cFric0 > 300);
     PXG_CHECK(cCompliant > 700);
@@ -474,6 +482,7 @@ PXG_TEST(npArtiSolveContactTGS_pgs)
     PXG_CHECK(cTorClamp > 80);
     PXG_CHECK(cRefScale > 400);
     PXG_CHECK(cZeroRespN > 80);
+    PXG_CHECK(cTinyResp > 60);
 
     PxgSlangComputeDevice* dev = testDevice();
     const uint32_t GROUPS = (N + 63) / 64;
