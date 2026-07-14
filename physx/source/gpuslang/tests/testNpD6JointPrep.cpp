@@ -1047,7 +1047,9 @@ PXG_TEST(npD6JointPrep_c1dPrePrep)
         s.swingV.z = asF(rem ? 1u : 0u);
         s.distV.y = rfS(rng, 0.f, 1e5f);   // mLinBreakForce
         s.distV.z = rfS(rng, 0.f, 1e5f);   // mAngBreakForce
-        s.distV.w = asF(i);                // jointDataIndex
+        s.distV.w = asF(i * 3u + 7u);      // jointDataIndex, DECOUPLED from the
+                                           // thread id (review-175 x5: tid-tied
+                                           // fixtures let a hard-wired index pass)
         s.linXV.z = rfS(rng, 0.f, 2.f); s.linXV.w = rfS(rng, 0.f, 2.f);  // invMassScale
         s.linYV.z = rfS(rng, 0.f, 2.f); s.linYV.w = rfS(rng, 0.f, 2.f);
 
@@ -1086,7 +1088,7 @@ PXG_TEST(npD6JointPrep_c1dPrePrep)
             o.counts = U4{ numRows, (ppFlags & F_DISABLE) ? 0u : o.counts.y, 0, 0 };
             o.cAoutW = F4{ 0, 0, 0, 0 };
             o.cBoutW = F4{ 0, 0, 0, 0 };
-            o.nrfs = U4{ numRows, ppFlags, i * 20u, 0 };  // Dy::MAX_CONSTRAINT_ROWS
+            o.nrfs = U4{ numRows, ppFlags, (i * 3u + 7u) * 20u, 0 };  // Dy::MAX_CONSTRAINT_ROWS
             o.invMass = F4{ s.linXV.z, s.linXV.w, s.linYV.z, s.linYV.w };
             o.raW = raW;
             o.rbW = rbW;
@@ -1129,21 +1131,33 @@ PXG_TEST(npD6JointPrep_c1dPrePrep)
             continue;
         }
 
-        // trig-free meta: trig bits, PxgConstraintData image scalars, ra/rb
-        bool meta = r.counts.y == q.counts.y && r.nrfs.x == q.nrfs.x && r.nrfs.y == q.nrfs.y &&
-                    r.nrfs.z == q.nrfs.z && r.nrfs.w == q.nrfs.w && eqF4FZ(r.invMass, q.invMass) &&
-                    eqF4FZ(r.raW, q.raW) && eqF4FZ(r.rbW, q.rbW) && r.counts.x == q.counts.x;
-        if (!meta)
+        // trig-FREE meta (review-175 hardening: never excludable, even under
+        // trig): trig bits, ra/rb, invMassScale, flags/startIndex words
+        const bool metaHard = r.counts.y == q.counts.y && r.nrfs.y == q.nrfs.y &&
+                              r.nrfs.z == q.nrfs.z && r.nrfs.w == q.nrfs.w &&
+                              eqF4FZ(r.invMass, q.invMass) && eqF4FZ(r.raW, q.raW) &&
+                              eqF4FZ(r.rbW, q.rbW);
+        if (!metaHard)
         {
-            if (r.counts.y != 0 && r.counts.y == q.counts.y)
+            if (mm < 5)
+                std::printf("MM %u c1d meta: tR %u tG %u raR (%g %g %g) raG (%g %g %g)\n", i,
+                            r.counts.y, q.counts.y, r.raW.x, r.raW.y, r.raW.z, q.raW.x, q.raW.y,
+                            q.raW.z);
+            ++mm;
+            continue;
+        }
+
+        // row-count structure: only THIS may fall under the capped
+        // trig-unstable class (a trig deviation flipping a hard anglePair gate)
+        if (!(r.counts.x == q.counts.x && r.nrfs.x == q.nrfs.x))
+        {
+            if (r.counts.y != 0)
             {
-                ++unstable;  // trig-flipped anglePair gate (capped class)
+                ++unstable;
                 continue;
             }
             if (mm < 5)
-                std::printf("MM %u c1d meta: nR %u nG %u raR (%g %g %g) raG (%g %g %g)\n", i,
-                            r.nrfs.x, q.nrfs.x, r.raW.x, r.raW.y, r.raW.z, q.raW.x, q.raW.y,
-                            q.raW.z);
+                std::printf("MM %u c1d struct: nR %u nG %u\n", i, r.nrfs.x, q.nrfs.x);
             ++mm;
             continue;
         }
