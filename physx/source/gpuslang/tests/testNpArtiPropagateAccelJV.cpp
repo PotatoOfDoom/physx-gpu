@@ -76,7 +76,10 @@ static void refApAccelJV(const JvIn& s, JvOut& o)
     float pdT[3] = { paT[0], paT[1], paT[2] };
     float pdB[3] = { s.paBot.x + crx[0], s.paBot.y + crx[1], s.paBot.z + crx[2] };
 
-    float tjd[3] = { s.qstz.x, s.qstz.y, s.qstz.z };
+    // tJointDelta zeroed, seeded with mDeferredQstZ only for active dofs (CUDA
+    // L341/L353) -> inactive-lane qstz is a don't-care, correctly ignored.
+    const float qm[3] = { s.qstz.x, s.qstz.y, s.qstz.z };
+    float tjd[3] = { 0.f, 0.f, 0.f };
     const float jv[3] = { s.jvel.x, s.jvel.y, s.jvel.z };
     float jvo[3] = { jv[0], jv[1], jv[2] };
 
@@ -86,7 +89,7 @@ static void refApAccelJV(const JvIn& s, JvOut& o)
         {
             const float isB[3] = { s.isBot[ind].x, s.isBot[ind].y, s.isBot[ind].z };
             const float isT[3] = { s.isTop[ind].x, s.isTop[ind].y, s.isTop[ind].z };
-            tjd[ind] -= dot3(isB, pdT) + dot3(isT, pdB);  // innerProduct duality
+            tjd[ind] = qm[ind] - (dot3(isB, pdT) + dot3(isT, pdB));  // innerProduct duality
         }
     }
 

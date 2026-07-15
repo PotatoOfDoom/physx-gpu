@@ -100,17 +100,20 @@ void apAccelJV(uint3 dtid : SV_DispatchThreadID)
     float3 pdT = paT;
     float3 pdB = s.paBot.xyz + cross3(negP2c, paT);
 
-    // tJointDelta starts at mDeferredQstZ, joint velocities start at jVel
-    float tjd[3] = { s.qstz.x, s.qstz.y, s.qstz.z };
+    // tJointDelta is ZEROED (CUDA L341 `{0,0,0}`) and seeded with mDeferredQstZ
+    // ONLY for active dofs (CUDA L353 gated assign), so inactive lanes stay 0 and
+    // never leak into the jDelta 3-dot below.  joint velocities start at jVel.
+    const float qm[3] = { s.qstz.x, s.qstz.y, s.qstz.z };
+    float tjd[3] = { 0.0f, 0.0f, 0.0f };
     const float jv[3] = { s.jvel.x, s.jvel.y, s.jvel.z };
     float jvo[3] = { jv[0], jv[1], jv[2] };
 
-    // pass 1: tJointDelta[i] -= IsW[i].innerProduct(pDeltaV)
+    // pass 1: tJointDelta[i] = mDeferredQstZ[i] - IsW[i].innerProduct(pDeltaV)
     for (uint ind = 0u; ind < MAX_DOF; ++ind)
     {
         if (ind < dofCount)
         {
-            tjd[ind] -= dot3(s.isBot[ind].xyz, pdT) + dot3(s.isTop[ind].xyz, pdB);
+            tjd[ind] = qm[ind] - (dot3(s.isBot[ind].xyz, pdT) + dot3(s.isTop[ind].xyz, pdB));
         }
     }
 
