@@ -35,10 +35,11 @@
 //                           return kCohesion1*cube(w) + kCohesion2*sqr(w) - 1
 //                           (sqr(x) = x*x)
 //
-// The oct staging (x2=x*x; x4=x2*x2; x4*x4) is preserved exactly -- for a general
-// float it is bit-identical to a naive left-fold of eight multiplies here (each
-// step is a single rounded multiply of previously-rounded values), but the
-// staged form is transcribed literally to be faithful.  All float mul/add/sub
+// The oct staging (x2=x*x; x4=x2*x2; x4*x4 = ((x^2)^2)^2) is preserved exactly
+// because it is NOT bit-identical to a flat left-fold of eight multiplies
+// (((((((x*x)*x)*x)*x)*x)*x)*x): the two round differently for most inputs
+// (~68% of x in [-3,3] differ bitwise), so the staged squaring form must be
+// transcribed literally to match the CUDA source.  All float mul/add/sub
 // NoContraction-stamped; +-0 compared with eqFZ.
 
 float cube(float x) { return x * x * x; }
