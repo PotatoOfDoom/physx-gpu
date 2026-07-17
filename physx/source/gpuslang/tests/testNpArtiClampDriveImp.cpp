@@ -138,8 +138,8 @@ PXG_TEST(npArtiClampDriveImp)
     for (uint32_t i = 0; i < N; ++i)
     {
         CdIn s{};
-        const float jointVel0 = rf(-3.f, 3.f);
-        const float driveImpulse0 = rf(-3.f, 3.f);
+        float jointVel0 = rf(-3.f, 3.f);
+        float driveImpulse0 = rf(-3.f, 3.f);
         float driveImpulse = rf(-3.f, 3.f);
         if ((i % 2u) == 0u) driveImpulse = pabs(driveImpulse) + 0.01f;   // > 0 path
         else driveImpulse = -pabs(driveImpulse) - 0.01f;                 // <= 0 path
@@ -150,9 +150,25 @@ PXG_TEST(npArtiClampDriveImp)
         float vdr = ((i % 3u) == 0u) ? 0.f : rf(0.2f, 3.f);              // vdr==0 branch
 
         // denom-epsilon stripe: make response == speedImpulseGradient so one denom is 0
+        // (neg-path denom2 == response-sig, pos-path denom1 == response-sig)
         if ((i % 5u) == 1u) speedImpulseGradient = response;
         // velDeviation +/- max near zero stripe (combine with a denom-zero to reach it)
         if ((i % 7u) == 2u) { maxJointVel = 0.f; }
+        // FIRST-guard stripe: speedImpulseGradient = -response zeroes the response+gradient
+        // denom (neg-path denom1 / pos-path denom2), hitting the |denom1|<EPS (boundsNeg) and
+        // |denom2|<EPS (boundsPos) early-return first guards.
+        if ((i % 17u) == 9u) speedImpulseGradient = -response;
+        // SENTINEL-EPS stripe: force velDeviation == -maxv (neg path, boundsNeg) or +maxv (pos
+        // path, boundsPos) with maxv != 0 and the response-gradient denom zeroed, so the second
+        // |denom|<EPS block's |velDeviation +/- max|<EPS sentinel sub-branch fires AND its value
+        // is observable (max!=0 keeps bound1 nonzero and vdr==0 keeps bounds2 a clean band).
+        if ((i % 19u) == 4u)
+        {
+            maxJointVel = 2.f; maxImpulse = 4.f; vdr = 0.f;
+            driveImpulse0 = 0.f;
+            speedImpulseGradient = response;               // zeroes response-gradient denom
+            jointVel0 = (driveImpulse > 0.f) ? -2.f : 2.f; // velDeviation = -jointVel0 = +/-maxv
+        }
 
         s.a = F4{ jointVel0, driveImpulse0, driveImpulse, response };
         s.b = F4{ maxJointVel, maxImpulse, speedImpulseGradient, vdr };
