@@ -90,11 +90,15 @@ PXG_TEST(npPsSpecVolume)
         SvIn s{};
         s.cur = F4{ rf(-10.f, 10.f), rf(-10.f, 10.f), rf(-10.f, 10.f), 0.f };
         s.pred = F4{ rf(-10.f, 10.f), rf(-10.f, 10.f), rf(-10.f, 10.f), 0.f };
-        // cover all three (isDiffuse, isTGS) selections: diffuse (scale 1),
-        // TGS non-diffuse (scale 2), PGS non-diffuse (scale 1).
-        const uint32_t sel = i % 3u;
-        const uint32_t isDiffuse = (sel == 0u) ? 1u : 0u;
-        const uint32_t isTGS = (sel == 1u) ? 1u : 0u;
+        // cover all four (isDiffuse, isTGS) combinations: diffuse-only (scale 1),
+        // TGS-only (scale 2), PGS/neither (scale 1), and BOTH set (scale 1 via the
+        // isDiffuse-priority branch).  The both-set case is what makes the
+        // isDiffuse-over-isTGS precedence observable: a precedence-swapping mutant
+        // would pick TGS (2.0) there and diverge (SCALE_DIFFUSE==SCALE_PGS==1.0, so
+        // the guard is otherwise invisible).
+        const uint32_t sel = i % 4u;
+        const uint32_t isDiffuse = (sel == 0u || sel == 3u) ? 1u : 0u;
+        const uint32_t isTGS = (sel == 1u || sel == 3u) ? 1u : 0u;
         s.misc = F4{ rf(0.f, 2.f), u2f(isDiffuse), u2f(isTGS), 0.f };
         // zero-motion stripe: predicted == current -> offset 0 -> radius = contactDist
         if ((i % 11u) == 4u) s.pred = s.cur;
