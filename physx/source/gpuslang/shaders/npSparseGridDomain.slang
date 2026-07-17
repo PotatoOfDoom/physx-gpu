@@ -38,10 +38,13 @@
 //             (int)floor(pos.y/domainSize.y),
 //             (int)floor(pos.z/domainSize.z))
 //
-// The (subgridSize - 2*haloSize) is unsigned integer arithmetic, converted to
-// float before the dx multiply.  PxFloor is IEEE floor; the (int) cast
-// truncates a floor-integral float exactly.  Float mul/div NoContraction-
-// stamped; +-0 eqFZ on domainSize; exact match on the int subgrid id.
+// The (subgridSize - 2*haloSize) is SIGNED integer arithmetic in CUDA (the
+// PxU16 fields promote to int), converted to float before the dx multiply; we
+// mirror that with int(subX) - 2*int(haloSize) so the transcription matches
+// CUDA's integer model exactly (bit-identical to the unsigned form for the
+// non-negative values that arise, since float(v) agrees for v >= 0).  PxFloor
+// is IEEE floor; the (int) cast truncates a floor-integral float exactly.
+// Float mul/div NoContraction-stamped; +-0 eqFZ on domainSize; exact int id.
 
 struct GdIn
 {
@@ -78,9 +81,10 @@ void sparseGridDomain(uint3 dtid : SV_DispatchThreadID)
     const float3 pos = s.pos.xyz;
 
     // getSubgridDomainSize
-    const float3 domainSize = float3(dx * float(subX - 2u * haloSize),
-                                     dx * float(subY - 2u * haloSize),
-                                     dx * float(subZ - 2u * haloSize));
+    const int halo = int(haloSize);
+    const float3 domainSize = float3(dx * float(int(subX) - 2 * halo),
+                                     dx * float(int(subY) - 2 * halo),
+                                     dx * float(int(subZ) - 2 * halo));
 
     // calcSubgridId
     const int3 subgridId = int3(int(floor(pos.x / domainSize.x)),

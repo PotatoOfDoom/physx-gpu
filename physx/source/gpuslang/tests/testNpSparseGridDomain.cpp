@@ -58,9 +58,11 @@ static void refDomain(const GdIn& s, GdOut& o)
     const uint32_t subX = f2u(s.sub.x), subY = f2u(s.sub.y), subZ = f2u(s.sub.z);
     const float px = s.pos.x, py = s.pos.y, pz = s.pos.z;
 
-    const float dsx = dx * float(subX - 2u * haloSize);
-    const float dsy = dx * float(subY - 2u * haloSize);
-    const float dsz = dx * float(subZ - 2u * haloSize);
+    // CUDA promotes the PxU16 subgridSize/haloSize to signed int; mirror that.
+    const int32_t halo = (int32_t)haloSize;
+    const float dsx = dx * float((int32_t)subX - 2 * halo);
+    const float dsy = dx * float((int32_t)subY - 2 * halo);
+    const float dsz = dx * float((int32_t)subZ - 2 * halo);
 
     const int32_t idx = (int32_t)std::floor(px / dsx);
     const int32_t idy = (int32_t)std::floor(py / dsy);
