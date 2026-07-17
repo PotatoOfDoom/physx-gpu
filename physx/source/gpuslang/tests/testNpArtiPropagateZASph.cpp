@@ -211,8 +211,18 @@ PXG_TEST(npArtiPropagateZASph)
         s.zaiTop = rv(-3, 3); s.zaiBot = rv(-3, 3);
         s.armature = F4{ rf(0.f, 2.f), rf(0.f, 2.f), rf(0.f, 2.f), 0.f };
         s.jf = F4{ rf(-4.f, 4.f), rf(-4.f, 4.f), rf(-4.f, 4.f), 0.f };
-        const uint32_t dofs = 1u + (i % 3u);          // 1, 2, 3
+        uint32_t dofs = 1u + (i % 3u);                // 1, 2, 3
         const bool jFnull = (i % 4u) == 0u;
+        // Singular-matrix stripe: zero the active motion matrices and their
+        // armature so the padded coupling matrix has det==0, exercising the
+        // getInverse identity fallback (shader/ref must agree on it).
+        if ((i % 37u) == 11u)
+        {
+            dofs = 2u;
+            s.sa0Top = F4{ 0, 0, 0, 0 }; s.sa0Bot = F4{ 0, 0, 0, 0 };
+            s.sa1Top = F4{ 0, 0, 0, 0 }; s.sa1Bot = F4{ 0, 0, 0, 0 };
+            s.armature.x = 0.f; s.armature.y = 0.f;
+        }
         s.misc = F4{ (float)dofs, u2f(jFnull ? 1u : 0u), 0.f, 0.f };
         in[i] = s;
         refPropZASph(s, ref[i]);
