@@ -136,11 +136,21 @@ PXG_TEST(npArtiInvertInertia)
         s.blC1 = F4{ rf(-1,1), ad, rf(-1,1), 0.f };
         s.blC2 = F4{ rf(-1,1), rf(-1,1), ad, 0.f };
 
-        // Singular stripe: zero bottomLeft so aa==0 and invertSym33 hits the
-        // det==0 identity fallback (shader/ref must agree on it).
+        // Singular stripe: zero bottomLeft so aa==0 and the FIRST invertSym33
+        // (on aa) hits the det==0 identity fallback (shader/ref must agree).
         if ((i % 41u) == 13u)
         {
             s.blC0 = F4{ 0,0,0,0 }; s.blC1 = F4{ 0,0,0,0 }; s.blC2 = F4{ 0,0,0,0 };
+        }
+        // Schur-singular stripe: zero topRight (ll==0) and the whole z-ROW of
+        // topLeft (la row 2 == 0).  Then la^T has an exact zero column, so
+        // S = z*la^T has an exact zero third column and det(S)==0.0f exactly,
+        // driving the SECOND invertSym33 (on the Schur complement) into its
+        // det==0 identity fallback (shader/ref must agree).
+        else if ((i % 53u) == 17u)
+        {
+            s.trC0 = F4{ 0,0,0,0 }; s.trC1 = F4{ 0,0,0,0 }; s.trC2 = F4{ 0,0,0,0 };
+            s.tlC0.z = 0.f; s.tlC1.z = 0.f; s.tlC2.z = 0.f;  // la row 2 == 0
         }
         in[i] = s;
         refInvertInertia(s, ref[i]);
