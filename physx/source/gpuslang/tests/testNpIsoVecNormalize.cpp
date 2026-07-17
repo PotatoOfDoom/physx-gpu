@@ -62,10 +62,11 @@ static void refNv(const NvIn& s, NvOut& o)
     const float crz = v1x * v2y - v1y * v2x;
     const float area = std::sqrt(crx * crx + cry * cry + crz * crz);
 
-    // normalize(PxVec3): m = |v|; if m>0 v/m else v
+    // normalize(PxVec3): m = |v|; PxVec3::operator/=(m) is reciprocal-multiply
+    // (f = 1/m; x*=f; y*=f; z*=f), NOT per-component division.
     float n3x = v1x, n3y = v1y, n3z = v1z;
     const float m = std::sqrt(v1x * v1x + v1y * v1y + v1z * v1z);
-    if (m > 0.0f) { n3x = v1x / m; n3y = v1y / m; n3z = v1z / m; }
+    if (m > 0.0f) { const float invM = 1.0f / m; n3x = v1x * invM; n3y = v1y * invM; n3z = v1z * invM; }
 
     // normalize(PxVec4): reciprocal of eps-clamped xyz magnitude, keep w
     const float sc = 1.0f / pmax(1.0e-6f, std::sqrt(s.v4.x * s.v4.x + s.v4.y * s.v4.y + s.v4.z * s.v4.z));
