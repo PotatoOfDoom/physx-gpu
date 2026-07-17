@@ -138,6 +138,18 @@ PXG_TEST(npPsSolvePCTGS)
             s.adh = F4{ rf(0.5f, 2.f), 2.0f, rf(0.001f, 0.03f), u2f(1u) };  // adhesion, adhScale=2, dt, isVelIter=1
             s.applied = F4{ 0.f, rf(0.f, 3.f), 0.f, 0.f };
         }
+        // degenerate-guard stripe: adhScale=1, restOffset=0.5 -> adhesionRadius=0, adhesion=0,
+        // isVelIter=1 (projectionDt=0), normal=0, normalDelta=0 -> separation=error in (0,1)<adhScale.
+        // The correct `&&` guard SKIPS (adhesion>0 false) so no division-by-zero; a `||` guard
+        // mutant ENTERS -> separation/0 = inf -> 0*inf = NaN -> divergent output.  Makes the
+        // &&->|| guard mutant observable (NOT a true equivalent, only unobservable off-degenerate).
+        if ((i % 29u) == 13u)
+        {
+            s.normal = F4{ 0.f, 0.f, 0.f, rf(0.2f, 0.9f) };
+            s.tan = F4{ rf(-1.f, 1.f), rf(-1.f, 1.f), 0.f, rf(0.1f, 5.f) };  // normalDelta=0
+            s.vm = F4{ rf(0.1f, 5.f), rf(0.1f, 5.f), rf(0.f, 1.f), 0.5f };   // restOffset=0.5
+            s.adh = F4{ 0.f, 1.0f, rf(0.001f, 0.03f), u2f(1u) };  // adhesion=0, adhScale=1, isVelIter=1
+        }
         in[i] = s;
         refPc(s, ref[i]);
     }

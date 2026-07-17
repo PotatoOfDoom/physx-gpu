@@ -139,6 +139,17 @@ PXG_TEST(npPsSolvePC)
             s.vm = F4{ 5.0f, rf(0.1f, 5.f), rf(0.1f, 5.f), rf(0.f, 1.f) }; // velMult=5 large
             s.applied = F4{ 0.f, rf(0.f, 3.f), 0.f, 0.f }; // appliedForce.x = 0 so the tiny adhesionTerm binds
         }
+        // degenerate-guard stripe: adhScale=1, restOffset=0.5 -> adhesionRadius=0, adhesion=0,
+        // 0<separation<1.  The correct `&&` guard (adhesionRadiusScale>0 && adhesion>0) SKIPS
+        // the block (adhesion>0 false), so no division-by-zero; a `||` guard mutant would ENTER,
+        // hit separation/adhesionRadius = x/0 = inf, and 0*inf = NaN -> divergent output.  This
+        // makes the &&->|| guard mutant observable (it is NOT a true equivalent mutant, only
+        // unobservable in the non-degenerate domain).
+        if ((i % 29u) == 13u)
+        {
+            s.normal = F4{ 0.f, 0.f, 0.f, rf(0.2f, 0.9f) };  // separation = error in (0,1) < adhScale
+            s.adh = F4{ 0.5f, 0.f, 1.0f, rf(0.001f, 0.03f) };  // restOffset=0.5, adhesion=0, adhScale=1
+        }
         in[i] = s;
         refPc(s, ref[i]);
     }
