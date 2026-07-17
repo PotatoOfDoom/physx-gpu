@@ -130,6 +130,15 @@ PXG_TEST(npJacobiRotate)
         s.rC0 = F4{ 1, 0, 0, 0 };
         s.rC1 = F4{ 0, 1, 0, 0 };
         s.rC2 = F4{ 0, 0, 1, 0 };
+        // Dense-R stripe: a non-identity R (as in eigenDecomposition's 2nd-4th
+        // sweeps) so the R-accumulation loop evaluates c*R[k][p]+sn*R[k][q] with
+        // BOTH addends simultaneously nonzero, not just one.
+        if ((i % 7u) == 3u)
+        {
+            s.rC0 = F4{ rf(-2,2), rf(-2,2), rf(-2,2), 0.f };
+            s.rC1 = F4{ rf(-2,2), rf(-2,2), rf(-2,2), 0.f };
+            s.rC2 = F4{ rf(-2,2), rf(-2,2), rf(-2,2), 0.f };
+        }
         s.pq = I4{ p, q, 0, 0 };
         in[i] = s;
         refJacobi(s, ref[i]);
