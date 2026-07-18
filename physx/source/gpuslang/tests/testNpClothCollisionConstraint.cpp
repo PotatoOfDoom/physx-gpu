@@ -180,8 +180,15 @@ PXG_TEST(npClothCollisionConstraint)
             s.a1 = F4{ rf(-2.f, 2.f), rf(-2.f, 2.f), rf(-2.f, 2.f), rf(0.f, 3.f) };
             s.a2 = F4{ rf(-2.f, 2.f), rf(-2.f, 2.f), rf(-2.f, 2.f), rf(0.f, 3.f) };
             s.b0 = F4{ rf(0.f, 1.f), rf(0.f, 1.f), rf(0.f, 1.f), 0.f };
-            // exact-zero inverse mass: the PxMax(1e-18, w) clamp arm
-            if ((i % 17u) == 3u) s.a0.w = 0.f;
+            // exact-zero inverse mass: the PxMax(1e-18, w) clamp arm, the
+            // zeroed vertex rotating so all three clamps are observable
+            if ((i % 17u) == 3u)
+            {
+                const uint32_t ax = (i / 17u) % 3u;
+                if (ax == 0u) s.a0.w = 0.f;
+                else if (ax == 1u) s.a1.w = 0.f;
+                else s.a2.w = 0.f;
+            }
             // zero thickness: thicknessSq = 0
             if ((i % 19u) == 5u) s.misc.z = 0.f;
         }
