@@ -184,25 +184,67 @@ public:
         queueInfo.queueCount = 1;
         queueInfo.pQueuePriorities = &priority;
 
-        // Enable 64-bit integer support when the device offers it (needed by
-        // kernels that carry PxU64 accumulators, e.g. the broad-phase
-        // overlap-check region scan).  Guarded so devices without shaderInt64
-        // still create successfully.
-        VkPhysicalDeviceFeatures supported = {};
-        vkGetPhysicalDeviceFeatures(mPhysicalDevice, &supported);
-        VkPhysicalDeviceFeatures enabled = {};
-        enabled.shaderInt64 = supported.shaderInt64;
+        // Query core + extended features so the Phase-2 runtime profile
+        // (RUNTIME_PLAN.md section 1) can be enabled where offered; everything
+        // is guarded so reduced devices still create successfully.
+        VkPhysicalDeviceSubgroupSizeControlFeatures sgSizeSupported = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES
+        };
+        VkPhysicalDeviceVulkan12Features supported12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+        supported12.pNext = &sgSizeSupported;
+        VkPhysicalDeviceFeatures2 supported2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        supported2.pNext = &supported12;
+        vkGetPhysicalDeviceFeatures2(mPhysicalDevice, &supported2);
+        const VkPhysicalDeviceFeatures& supported = supported2.features;
+
+        // Core features: shaderInt64 (PxU64 accumulators, e.g. the broad-phase
+        // overlap-check region scan) and shaderFloat64 (kernels transcribing
+        // CUDA code that mixes double literals into float expressions, e.g.
+        // the sb_extractRotationAPD Rodrigues update '(1.0 - l2)/(1.0f + l2)',
+        // must perform those spots in f64 to match the C++ reference rounding).
+        VkPhysicalDeviceFeatures2 enabled2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        enabled2.features.shaderInt64 = supported.shaderInt64;
         mHasShaderInt64 = supported.shaderInt64 == VK_TRUE;
-        // Enable 64-bit float support when offered: kernels transcribing CUDA
-        // code that mixes double literals into float expressions (e.g. the
-        // sb_extractRotationAPD Rodrigues update '(1.0 - l2) / (1.0f + l2)')
-        // must perform those spots in f64 to match the C++ reference rounding.
-        enabled.shaderFloat64 = supported.shaderFloat64;
+        enabled2.features.shaderFloat64 = supported.shaderFloat64;
+
+        // Vulkan 1.2 features: buffer device address carries the CUDA
+        // device-pointer argument model; timeline semaphores back the v2
+        // submission path.
+        VkPhysicalDeviceVulkan12Features enabled12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
+        enabled12.bufferDeviceAddress = supported12.bufferDeviceAddress;
+        enabled12.timelineSemaphore = supported12.timelineSemaphore;
+        mHasBufferDeviceAddress = supported12.bufferDeviceAddress == VK_TRUE;
+
+        // Subgroup size control: the warp-32 primitive library requires an
+        // exact subgroup size on hardware targets (llvmpipe emulates instead).
+        VkPhysicalDeviceSubgroupSizeControlFeatures enabledSgSize = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES
+        };
+        enabledSgSize.subgroupSizeControl = sgSizeSupported.subgroupSizeControl;
+        enabledSgSize.computeFullSubgroups = sgSizeSupported.computeFullSubgroups;
+
+        enabled2.pNext = &enabled12;
+        enabled12.pNext = &enabledSgSize;
+
+        VkPhysicalDeviceSubgroupSizeControlProperties sgSizeProps = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES
+        };
+        VkPhysicalDeviceSubgroupProperties sgProps = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES };
+        sgProps.pNext = &sgSizeProps;
+        VkPhysicalDeviceProperties2 props2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+        props2.pNext = &sgProps;
+        vkGetPhysicalDeviceProperties2(mPhysicalDevice, &props2);
+        mSubgroupCaps.defaultSize = sgProps.subgroupSize;
+        mSubgroupCaps.minSize = sgSizeProps.minSubgroupSize;
+        mSubgroupCaps.maxSize = sgSizeProps.maxSubgroupSize;
+        mSubgroupCaps.canRequireSize = enabledSgSize.subgroupSizeControl == VK_TRUE &&
+                                       (sgSizeProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+        mSubgroupCaps.fullSubgroups = enabledSgSize.computeFullSubgroups == VK_TRUE;
 
         VkDeviceCreateInfo deviceInfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
         deviceInfo.queueCreateInfoCount = 1;
         deviceInfo.pQueueCreateInfos = &queueInfo;
-        deviceInfo.pEnabledFeatures = &enabled;
+        deviceInfo.pNext = &enabled2;
 
         if (vkCreateDevice(mPhysicalDevice, &deviceInfo, nullptr, &mDevice) != VK_SUCCESS)
             return false;
@@ -243,6 +285,8 @@ public:
         bufferInfo.size = sizeBytes;
         bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                            VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (mHasBufferDeviceAddress)
+            bufferInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
         Buffer buf = {};
@@ -256,11 +300,22 @@ public:
             memReq.memoryTypeBits,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
+        VkMemoryAllocateFlagsInfo allocFlags = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+        allocFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+
         VkMemoryAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        allocInfo.pNext = mHasBufferDeviceAddress ? &allocFlags : nullptr;
         allocInfo.allocationSize = memReq.size;
         allocInfo.memoryTypeIndex = memoryType;
         PXG_VK_CHECK(vkAllocateMemory(mDevice, &allocInfo, nullptr, &buf.memory));
         PXG_VK_CHECK(vkBindBufferMemory(mDevice, buf.buffer, buf.memory, 0));
+
+        if (mHasBufferDeviceAddress)
+        {
+            VkBufferDeviceAddressInfo addrInfo = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+            addrInfo.buffer = buf.buffer;
+            buf.deviceAddress = vkGetBufferDeviceAddress(mDevice, &addrInfo);
+        }
 
         const PxgBufferHandle handle = mNextBufferHandle++;
         mBuffers[handle] = buf;
@@ -301,6 +356,33 @@ public:
     PxgPipelineHandle createPipeline(const void* code, size_t codeSize, const char* entryName,
                                      uint32_t numBuffers, const uint32_t* bufferStrides,
                                      uint32_t pushConstantSize) override
+    {
+        return createPipelineInternal(code, codeSize, entryName, numBuffers, bufferStrides, pushConstantSize, 0);
+    }
+
+    PxgPipelineHandle createPipelineEx(const void* code, size_t codeSize, const char* entryName,
+                                       uint32_t numBuffers, const uint32_t* bufferStrides,
+                                       uint32_t pushConstantSize, uint32_t requiredSubgroupSize) override
+    {
+        if (requiredSubgroupSize != 0 &&
+            (!mSubgroupCaps.canRequireSize || requiredSubgroupSize < mSubgroupCaps.minSize ||
+             requiredSubgroupSize > mSubgroupCaps.maxSize))
+            return 0;
+        return createPipelineInternal(code, codeSize, entryName, numBuffers, bufferStrides, pushConstantSize,
+                                      requiredSubgroupSize);
+    }
+
+    SubgroupCaps getSubgroupCaps() const override { return mSubgroupCaps; }
+
+    uint64_t getBufferDeviceAddress(PxgBufferHandle handle) const override
+    {
+        auto it = mBuffers.find(handle);
+        return it == mBuffers.end() ? 0 : it->second.deviceAddress;
+    }
+
+    PxgPipelineHandle createPipelineInternal(const void* code, size_t codeSize, const char* entryName,
+                                             uint32_t numBuffers, const uint32_t* bufferStrides,
+                                             uint32_t pushConstantSize, uint32_t requiredSubgroupSize)
     {
         (void)bufferStrides; // SPIR-V carries the layout; strides are for D3D12
 
@@ -343,6 +425,19 @@ public:
         stageInfo.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         stageInfo.module = pipe.module;
         stageInfo.pName = entryName;
+
+        // Exact-subgroup-size request (warp-32 primitive library on hardware
+        // targets; validated against SubgroupCaps by createPipelineEx).
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo sgSizeInfo = {
+            VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO
+        };
+        if (requiredSubgroupSize != 0)
+        {
+            sgSizeInfo.requiredSubgroupSize = requiredSubgroupSize;
+            stageInfo.pNext = &sgSizeInfo;
+            if (mSubgroupCaps.fullSubgroups)
+                stageInfo.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+        }
 
         VkComputePipelineCreateInfo pipelineInfo = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         pipelineInfo.stage = stageInfo;
@@ -450,6 +545,7 @@ private:
         VkBuffer buffer;
         VkDeviceMemory memory;
         size_t size;
+        uint64_t deviceAddress = 0;
     };
 
     struct Pipeline
@@ -542,6 +638,8 @@ private:
     size_t mCurrentPool = 0;
     bool mRecording = false;
     bool mHasShaderInt64 = false;
+    bool mHasBufferDeviceAddress = false;
+    SubgroupCaps mSubgroupCaps;
 
     std::string mDeviceName;
 };

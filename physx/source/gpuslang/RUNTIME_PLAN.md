@@ -96,6 +96,39 @@ Deliverable P0: a `pxg-caps` probe tool + a committed compatibility matrix,
 and a spike proving required-subgroup-size-32 subgroup scan/ballot/shuffle
 works on at least one real driver and on the CI device.
 
+### P0 results (executed; CI device = llvmpipe, LLVM 20.1.2, Vulkan 1.4)
+
+Probe (`tools/pxgCaps.cpp`, target `pxg-caps`) matrix on the CI device:
+
+| capability | llvmpipe |
+|---|---|
+| subgroup default / min / max | 8 / 8 / 8 (fixed) |
+| requiredSubgroupSizeStages incl. compute | yes |
+| computeFullSubgroups | yes |
+| subgroup ops (basic/vote/arith/ballot/shuffle+rel) | yes |
+| bufferDeviceAddress | yes |
+| timelineSemaphore | yes |
+| shaderInt64 / shaderFloat64 | yes / yes |
+| shaderBufferInt64Atomics | yes |
+| VK_EXT_shader_atomic_float (buffer+shared f32 add) | yes |
+| vulkanMemoryModel | yes |
+| maxComputeSharedMemorySize | 32 KiB |
+
+Spike outcomes (tests `p0Subgroup`, `p0Bda`, both green):
+- Wave invariants (prefix-sum/ballot/active-sum) hold at the default AND at a
+  `requiredSubgroupSize` pipeline; out-of-window requests are rejected at
+  pipeline creation.  The `createPipelineEx` mechanism is proven end-to-end.
+- **Risk R1 is CONFIRMED for CI**: llvmpipe's subgroup window is [8,8] —
+  required-32 is impossible there.  Decision locked in: the P2.1 primitive
+  library ships TWO code paths selected at pipeline-build time — native
+  subgroup ops under required-32 (hardware), and a shared-memory emulation of
+  the warp-32 semantics (any subgroup size; used by CI and any <32 device).
+  Both paths are bit-identical by construction (integer/exact-float ops).
+- BDA argument marshalling works exactly as §4 assumes: a CUDA-shaped param
+  block of raw `uint64_t` device addresses travels via push constants, the
+  dispatch binds ZERO descriptors, and Slang `Ptr<float>(addr)` dereferences
+  produce bitwise-correct results.  The P3 shim's launch model is validated.
+
 
 ## 2. Phase P1 — Device layer productization (gpuslang-backend v2)
 

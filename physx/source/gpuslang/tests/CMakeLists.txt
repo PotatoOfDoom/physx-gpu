@@ -388,6 +388,11 @@ pxg_compile_shader(memCopy MemCopyBalanced)
 pxg_compile_shader(clampValues clampMaxValue clampMaxValues)
 pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeighted
                    normalizeNormals interpolateSkinnedClothVertices interpolateSkinnedSoftBodyVertices)
+# RUNTIME_PLAN.md P0 spikes (Vulkan-only: BDA does not lower to HLSL cs_6_0,
+# so deliberately absent from PXG_HLSL_ENTRIES; not bit-exactness kernels, so
+# absent from PXG_NOCONTRACT_SHADERS).
+pxg_compile_shader(npSpikeSubgroup spikeSubgroup)
+pxg_compile_shader(npSpikeBda spikeBda)
 
 add_custom_target(gpuslang-shaders ALL DEPENDS ${PXG_SHADER_OUTPUTS})
 
@@ -667,8 +672,15 @@ add_executable(gpuslang-tests
     testBroadphaseAggregateBoxPruning.cpp
     testBroadphaseAggPairCollision.cpp
     testBroadphaseAggSelfCollision.cpp
-    testBroadphaseAggSortProjections.cpp)
+    testBroadphaseAggSortProjections.cpp
+    testP0Subgroup.cpp
+    testP0Bda.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
+
+# pxg-caps: standalone device-profile probe (RUNTIME_PLAN.md P0)
+add_executable(pxg-caps ${GPUSLANG_ROOT}/tools/pxgCaps.cpp)
+target_link_libraries(pxg-caps PRIVATE Vulkan::Vulkan)
+set_target_properties(pxg-caps PROPERTIES CXX_STANDARD 17)
 # The CPU references are the bitwise ground truth: forbid the compiler from
 # contracting their separately-rounded mul+add chains into FMA (GCC defaults
 # to -ffp-contract=fast; harmless on non-FMA baselines but load-bearing on
@@ -687,7 +699,8 @@ foreach(suite scan radixSort radixSortGather preIntegration integration updateBo
         broadphaseOverlapCheckHistogram broadphaseNewBoundsPairs broadphaseMarkPairs
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
-        broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections)
+        broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
+        p0Subgroup p0Bda)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")

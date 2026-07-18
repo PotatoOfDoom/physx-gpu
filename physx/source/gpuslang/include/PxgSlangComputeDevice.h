@@ -104,6 +104,37 @@ public:
 
     // Submits all recorded work and waits for completion.
     virtual void flush() = 0;
+
+    // ---- Phase-2 runtime capabilities (RUNTIME_PLAN.md) ----
+    // Additive with conservative defaults so backends opt in individually.
+
+    struct SubgroupCaps
+    {
+        uint32_t defaultSize = 0;   // 0 = subgroup queries unsupported
+        uint32_t minSize = 0;
+        uint32_t maxSize = 0;
+        bool canRequireSize = false; // subgroupSizeControl usable on compute
+        bool fullSubgroups = false;  // computeFullSubgroups
+    };
+    virtual SubgroupCaps getSubgroupCaps() const { return SubgroupCaps(); }
+
+    // Like createPipeline, but requests an exact subgroup size (with full
+    // subgroups) for the entry point.  requiredSubgroupSize == 0 behaves
+    // exactly like createPipeline.  Returns 0 when the size cannot be
+    // honored on this device.
+    virtual PxgPipelineHandle createPipelineEx(const void* code, size_t codeSize, const char* entryName,
+                                               uint32_t numBuffers, const uint32_t* bufferStrides,
+                                               uint32_t pushConstantSize, uint32_t requiredSubgroupSize)
+    {
+        if (requiredSubgroupSize != 0)
+            return 0;
+        return createPipeline(code, codeSize, entryName, numBuffers, bufferStrides, pushConstantSize);
+    }
+
+    // Buffer device address (CUDA device-pointer parity, used by the
+    // buffer-device-address argument-marshalling model).  0 when the
+    // backend/device has no address support.
+    virtual uint64_t getBufferDeviceAddress(PxgBufferHandle) const { return 0; }
 };
 
 // Factory functions; each returns NULL when the backend is unavailable.
