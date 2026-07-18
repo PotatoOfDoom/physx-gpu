@@ -191,10 +191,20 @@ tests for the sub-allocator (fragmentation/deferred-free/resize properties).
   additionally covers ring-crossing 20 MiB round-trips, offset semantics,
   ticket monotonicity, and a kernel dispatch on device-local storage on
   every normal suite run.
-- Still open in P1: buddy sub-allocator with `PxgHeapMemoryAllocator`
-  semantics (+ unit tests), pipeline cache on disk, specialization
-  constants, `vkCmdFillBuffer`/copy utilities, timestamp queries,
-  SubmissionContexts (per-stream ordering), indirect dispatch plumbing.
+- **P1.2 sub-allocator DONE** — `PxgSlangHeapAllocator`
+  (include/PxgSlangHeapAllocator.h): buddy allocator over device-buffer
+  roots with `PxgHeapMemoryAllocator` semantics — 128 B minimum class and
+  alignment, buddy coalescing, growth by whole roots, exceptional oversize
+  allocations on dedicated buffers, deferred frees flushed at step
+  boundaries, per-group statistics.  Unit test `p1HeapAlloc` covers the
+  invariants (alignment/non-overlap via a shadow interval model over a
+  4000-op randomized stress, coalescing recovery after full drain, root
+  growth, deferred-free visibility, exceptional round-trip through real
+  device memory) in both memory modes.
+- Still open in P1: pipeline cache on disk, specialization constants,
+  `vkCmdFillBuffer`/copy utilities (memset/DtoD parity), timestamp
+  queries, SubmissionContexts (per-stream ordering), indirect dispatch
+  plumbing.
 
 
 ## 3. Phase P2 — Kernel completion (the non-portable remainder)
