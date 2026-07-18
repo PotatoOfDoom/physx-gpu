@@ -193,6 +193,11 @@ public:
         VkPhysicalDeviceFeatures enabled = {};
         enabled.shaderInt64 = supported.shaderInt64;
         mHasShaderInt64 = supported.shaderInt64 == VK_TRUE;
+        // Enable 64-bit float support when offered: kernels transcribing CUDA
+        // code that mixes double literals into float expressions (e.g. the
+        // sb_extractRotationAPD Rodrigues update '(1.0 - l2) / (1.0f + l2)')
+        // must perform those spots in f64 to match the C++ reference rounding.
+        enabled.shaderFloat64 = supported.shaderFloat64;
 
         VkDeviceCreateInfo deviceInfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
         deviceInfo.queueCreateInfoCount = 1;
