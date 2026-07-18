@@ -182,7 +182,9 @@ PXG_TEST(npSdfHoles)
             // adjacent Morton-style keys, incl. negative (priority) patterns
             uint32_t a = rng() & 0x3fffffffu;
             uint32_t b = rng() & 0x3fffffffu;
-            if ((i % 7u) == 2u) { a |= 0xf8000000u; b |= 0xf0000000u; }  // sign bits differ
+            // sign-bit stripe: only ONE key gets the priority bits, so the
+            // XOR is negative and float(negative int) is exercised
+            if ((i % 7u) == 2u) a |= 0xf8000000u;
             s.misc.w = u2f(a);
             s.misc2.x = u2f(b);
             // identical-keys stripe: XOR = 0 -> float(0)
