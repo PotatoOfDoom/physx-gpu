@@ -165,7 +165,11 @@ PXG_TEST(npSbExtractRotAPD)
         }
         else if (sel == 3u)
         {
-            // exact rotation of q0: gradient ~ 0 -> w > threshold immediate break
+            // exact rotation of q0: B = R^T*R ~ identity so the iteration-0
+            // gradient magnitude^2 falls below 1e-16 and the DISTORTION branch
+            // fires (kicking omega ~ 0.25 about x), exercising recovery from a
+            // converged start.  (The w > threshold early exit is covered by the
+            // near-rotation rows, ~2300 hits.)
             V3 c0, c1, c2;
             mat33FromQuat(q0, c0, c1, c2);
             F0 = c0; F1 = c1; F2 = c2;
