@@ -65,7 +65,8 @@ file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
 set(SHADER_COMMON_DEPS
     ${SHADER_DIR}/pxgSlangCommon.slang
     ${SHADER_DIR}/pxgSlangScan.slang
-    ${SHADER_DIR}/pxgSlangPrepCommon.slang)
+    ${SHADER_DIR}/pxgSlangPrepCommon.slang
+    ${SHADER_DIR}/pxgSlangWarpInc.slang)
 
 # Shaders whose SPIR-V gets NoContraction decorations stamped onto every
 # float arithmetic op (tools/spv_nocontract.py).  slangc emits none and its
@@ -393,6 +394,8 @@ pxg_compile_shader(skinning interleaveBuffers zeroNormals normalVectorsAreaWeigh
 # absent from PXG_NOCONTRACT_SHADERS).
 pxg_compile_shader(npSpikeSubgroup spikeSubgroup)
 pxg_compile_shader(npSpikeBda spikeBda)
+# RUNTIME_PLAN.md P2.1: warp-32 primitive library battery (emulation path).
+pxg_compile_shader(npWarpLib wlShuffle wlBallot)
 
 add_custom_target(gpuslang-shaders ALL DEPENDS ${PXG_SHADER_OUTPUTS})
 
@@ -676,7 +679,8 @@ add_executable(gpuslang-tests
     testP0Subgroup.cpp
     testP0Bda.cpp
     testP1DeviceV2.cpp
-    testP1HeapAlloc.cpp)
+    testP1HeapAlloc.cpp
+    testNpWarpLib.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 
 # pxg-caps: standalone device-profile probe (RUNTIME_PLAN.md P0)
@@ -702,7 +706,7 @@ foreach(suite scan radixSort radixSortGather preIntegration integration updateBo
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")

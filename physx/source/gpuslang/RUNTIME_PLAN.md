@@ -220,6 +220,45 @@ tests for the sub-allocator (fragmentation/deferred-free/resize properties).
   one queue in submission order), indirect dispatch plumbing.
 
 
+### P2.1 progress
+
+- **Primitive library v1 SHIPPED** (`shaders/pxgSlangWarpInc.slang`,
+  preprocessor-included so the path switch + groupshared scratch land in
+  each kernel): CUDA-exact `pxgShfl{,Up,Down,Xor}Sync` (width-segmented,
+  wrap/clamp semantics), `pxgBallotSync`/`pxgAnySync`/`pxgAllSync` (mask
+  honored the CUDA way), rank-in-mask, count-and-broadcast, XOR-butterfly
+  reductions (add/min/max/or/and, width-parameterized, winner-lane
+  variant), inclusive/exclusive add-scans, and the `__ffs`/`lowestSetIndex`
+  /`highestSetIndex` bit conventions including their zero cases.
+  Two paths: shared-memory emulation (default; bit-exact at ANY subgroup
+  size, workgroup-uniform call sites required — warp-divergent call sites
+  must restructure when ported) and native subgroup ops behind
+  `PXG_WARP_NATIVE=1` (requires required-32 pipelines; validated on
+  hardware in P5 — llvmpipe cannot execute it at 32).
+- **Battery** (`npWarpLib` / `testNpWarpLib.cpp`): 256 scripted tests x
+  two tiles per workgroup (tile isolation) x 32 lanes, sweeping widths
+  1..32, partial masks (0x3F contact patch, 4-lane nibbles, random),
+  wrapped/negative shuffle indices and out-of-segment XORs; every output
+  bitwise against a lockstep CPU model of the CUDA semantics.  Sensitivity
+  proven by four caught mutants (shfl-up clamp off-by-one, ballot mask
+  dropped, scan guard off-by-one, xor clamp removed); green in both
+  memory modes.
+- Survey grounding (agent inventory of the CUDA layer): FULL_MASK
+  dominates (741 trivial vs a handful of live partial-mask sites: 6-lane
+  0x3F in vector.cuh/particlesystem.cu, 4-lane nibble masks in
+  cudaBox.cu, ballot-derived masks in reduction.cuh + loop-convergence
+  masks in updateBodiesAndShapes.cu); ~90% of intrinsic call sites live
+  OUTSIDE the five primitive headers, so kernel ports call the
+  intrinsic-parity layer directly.  Two legacy non-sync `shfl.up.b32`
+  inline-PTX sites (warpHelpers.cuh) map to `pxgShflUpSyncU`; float
+  atomic min/max are already CAS loops in CUDA (atomic.cuh) and port
+  directly.
+- Still open in P2.1: 64-bit helpers (`__popcll`/`__ffsll`/`__clzll`,
+  64-bit ballot compositions), `PXG_WARP_NATIVE` compile validation +
+  hardware execution (P5), block-scope collectives (blockReduction /
+  threadBlockScanExclusive family) which need workgroup barriers and are
+  ported with their kernels.
+
 ## 3. Phase P2 — Kernel completion (the non-portable remainder)
 
 Goal: all 501 registry kernels exist as Slang entry points compiled to
