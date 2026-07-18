@@ -62,6 +62,12 @@ struct PxgSlangDeviceDesc
     // When true, prefer a software/CPU device (llvmpipe, WARP) if present —
     // used by the verification test suite.
     bool preferSoftwareDevice = false;
+    // When true, storage buffers live in device-local memory and all
+    // host<->device transfers go through persistently mapped staging rings
+    // (the production path for discrete GPUs).  When false, buffers are
+    // host-visible and transfers are direct maps (fast on UMA/software
+    // devices).  Kernel results are identical either way.
+    bool useDeviceLocalMemory = false;
 };
 
 class PxgSlangComputeDevice
@@ -102,8 +108,24 @@ public:
     // (the ordering CUDA guarantees implicitly on a single stream).
     virtual void barrier() = 0;
 
-    // Submits all recorded work and waits for completion.
+    // Submits all recorded work and waits for completion.  Equivalent to
+    // wait(submit()).
     virtual void flush() = 0;
+
+    // ---- v2 submission (RUNTIME_PLAN.md P1.1) ----
+    // submit() hands all recorded work to the device WITHOUT waiting and
+    // returns a ticket; tickets are monotonic per device and 0 means
+    // "already complete".  wait() blocks until the ticketed submission has
+    // retired; poll() is the non-blocking query.  Calling submit() with
+    // nothing recorded returns the most recent ticket.  Backends without a
+    // non-blocking path may submit synchronously and return 0.
+    virtual uint64_t submit()
+    {
+        flush();
+        return 0;
+    }
+    virtual void wait(uint64_t /*ticket*/) {}
+    virtual bool poll(uint64_t /*ticket*/) { return true; }
 
     // ---- Phase-2 runtime capabilities (RUNTIME_PLAN.md) ----
     // Additive with conservative defaults so backends opt in individually.

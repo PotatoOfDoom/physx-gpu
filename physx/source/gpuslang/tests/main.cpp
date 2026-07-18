@@ -50,6 +50,11 @@ PxgSlangComputeDevice* testDevice()
         // PXG_PREFER_SOFTWARE_DEVICE is not set.
         const char* preferSw = std::getenv("PXG_PREFER_SOFTWARE_DEVICE");
         desc.preferSoftwareDevice = preferSw == nullptr || std::strcmp(preferSw, "0") != 0;
+        // v2 device mode (RUNTIME_PLAN.md P1): device-local buffers + staged
+        // transfers; lets the whole bit-exact suite re-run through the
+        // production memory path.
+        const char* v2 = std::getenv("PXG_DEVICE_V2");
+        desc.useDeviceLocalMemory = v2 != nullptr && std::strcmp(v2, "0") != 0;
 #if defined(_WIN32)
         const char* backend = std::getenv("PXG_TEST_BACKEND");
         if (backend && std::strcmp(backend, "dx12") == 0)
@@ -60,8 +65,9 @@ PxgSlangComputeDevice* testDevice()
         device = physx::gpuslang::PxgCreateVulkanComputeDevice(desc);
 #endif
         if (device)
-            std::printf("[gpuslang-tests] backend: %s, device: %s\n", device->getBackendName(),
-                        device->getDeviceName());
+            std::printf("[gpuslang-tests] backend: %s, device: %s%s\n", device->getBackendName(),
+                        device->getDeviceName(),
+                        desc.useDeviceLocalMemory ? " [v2: device-local + staged]" : "");
     }
     return device;
 }

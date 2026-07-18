@@ -674,7 +674,8 @@ add_executable(gpuslang-tests
     testBroadphaseAggSelfCollision.cpp
     testBroadphaseAggSortProjections.cpp
     testP0Subgroup.cpp
-    testP0Bda.cpp)
+    testP0Bda.cpp
+    testP1DeviceV2.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 
 # pxg-caps: standalone device-profile probe (RUNTIME_PLAN.md P0)
@@ -700,7 +701,7 @@ foreach(suite scan radixSort radixSortGather preIntegration integration updateBo
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda)
+        p0Subgroup p0Bda p1DeviceV2)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")

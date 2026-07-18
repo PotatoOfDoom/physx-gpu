@@ -172,6 +172,30 @@ re-run all 673 bit-exact tests through device-local memory + timeline
 submission (proves the new paths don't disturb kernel results); add unit
 tests for the sub-allocator (fragmentation/deferred-free/resize properties).
 
+### P1 progress
+
+- **P1.1 DONE** — the Vulkan backend now runs N-buffered command buffers
+  (4 frames in flight, per-frame descriptor pools recycled on slot reuse)
+  retired through one timeline semaphore per queue.  `submit()` returns a
+  monotonic ticket without waiting; `wait(ticket)`/`poll(ticket)`
+  synchronize; `flush()` == `wait(submit())`.  Fence fallback retained for
+  devices without timeline semaphores (blocking submit, ticket 0).
+- **P1.2 memory path DONE** (sub-allocator still open) —
+  `PxgSlangDeviceDesc.useDeviceLocalMemory` selects DEVICE_LOCAL storage
+  buffers; all host<->device transfers stage through a persistently mapped
+  8 MiB per-frame ring with per-buffer transfer<->compute barriers (P1.3's
+  readback/upload edges).  The staged path is deliberately taken even when
+  the memory type is host-visible (UMA/llvmpipe) so CI exercises the
+  production path.  Env `PXG_DEVICE_V2=1` re-runs the ENTIRE bit-exact
+  suite through device-local + staged + timeline mode; test `p1DeviceV2`
+  additionally covers ring-crossing 20 MiB round-trips, offset semantics,
+  ticket monotonicity, and a kernel dispatch on device-local storage on
+  every normal suite run.
+- Still open in P1: buddy sub-allocator with `PxgHeapMemoryAllocator`
+  semantics (+ unit tests), pipeline cache on disk, specialization
+  constants, `vkCmdFillBuffer`/copy utilities, timestamp queries,
+  SubmissionContexts (per-stream ordering), indirect dispatch plumbing.
+
 
 ## 3. Phase P2 — Kernel completion (the non-portable remainder)
 

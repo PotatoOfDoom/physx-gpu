@@ -26,14 +26,20 @@
 
 // Vulkan compute backend for the Slang port of the PhysX GPU kernels.
 //
-// Simplicity-first implementation notes:
-//   - Buffers are HOST_VISIBLE|HOST_COHERENT with DEVICE_LOCAL preferred when
-//     available in a combined heap.  A production integration would use
-//     device-local memory plus staging rings; for kernel verification and
-//     software devices (llvmpipe) host-visible memory is both simpler and
-//     faster.
-//   - One descriptor set per dispatch, allocated from a growing pool that is
-//     reset on flush().
+// Implementation notes:
+//   - Submission (RUNTIME_PLAN.md P1.1): command buffers are N-buffered and
+//     retired through ONE timeline semaphore per queue.  submit() hands work
+//     to the device without waiting and returns a monotonic ticket;
+//     wait()/poll() synchronize on tickets; flush() == wait(submit()).  A
+//     blocking-fence fallback covers devices without timeline semaphores.
+//   - Memory (RUNTIME_PLAN.md P1.2): PxgSlangDeviceDesc.useDeviceLocalMemory
+//     selects DEVICE_LOCAL storage buffers with all host<->device transfers
+//     staged through a persistently mapped per-frame ring (the discrete-GPU
+//     production path; transfer<->compute edges use per-buffer barriers).
+//     Otherwise buffers are HOST_VISIBLE|HOST_COHERENT and transfers are
+//     direct maps (fast on UMA/software devices such as llvmpipe).
+//   - One descriptor set per dispatch, allocated from per-frame pools that
+//     are reset when the frame slot is recycled.
 //   - All shader buffer parameters are storage buffers (the Slang kernels
 //     declare RWStructuredBuffer uniformly), so every descriptor is
 //     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER.
@@ -89,8 +95,18 @@ public:
                 vkDestroyDescriptorSetLayout(mDevice, kv.second.setLayout, nullptr);
                 vkDestroyShaderModule(mDevice, kv.second.module, nullptr);
             }
-            for (VkDescriptorPool pool : mDescriptorPools)
-                vkDestroyDescriptorPool(mDevice, pool, nullptr);
+            for (Frame& frame : mFrames)
+            {
+                for (VkDescriptorPool pool : frame.pools)
+                    vkDestroyDescriptorPool(mDevice, pool, nullptr);
+                if (frame.staging)
+                {
+                    vkDestroyBuffer(mDevice, frame.staging, nullptr);
+                    vkFreeMemory(mDevice, frame.stagingMemory, nullptr);
+                }
+            }
+            if (mTimeline)
+                vkDestroySemaphore(mDevice, mTimeline, nullptr);
             if (mCommandPool)
                 vkDestroyCommandPool(mDevice, mCommandPool, nullptr);
             if (mFence)
@@ -260,11 +276,30 @@ public:
         VkCommandBufferAllocateInfo cmdInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
         cmdInfo.commandPool = mCommandPool;
         cmdInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmdInfo.commandBufferCount = 1;
-        PXG_VK_CHECK(vkAllocateCommandBuffers(mDevice, &cmdInfo, &mCommandBuffer));
+        cmdInfo.commandBufferCount = kFramesInFlight;
+        VkCommandBuffer cmds[kFramesInFlight] = {};
+        PXG_VK_CHECK(vkAllocateCommandBuffers(mDevice, &cmdInfo, cmds));
+        for (uint32_t i = 0; i < kFramesInFlight; ++i)
+            mFrames[i].cmd = cmds[i];
 
         VkFenceCreateInfo fenceInfo = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
         PXG_VK_CHECK(vkCreateFence(mDevice, &fenceInfo, nullptr, &mFence));
+
+        // One timeline semaphore per queue: every submit signals the next
+        // monotonic value, so any past submission can be waited on or polled
+        // by value without fences (RUNTIME_PLAN.md P1.1).
+        if (enabled12.timelineSemaphore)
+        {
+            VkSemaphoreTypeCreateInfo typeInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO };
+            typeInfo.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+            typeInfo.initialValue = 0;
+            VkSemaphoreCreateInfo semInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+            semInfo.pNext = &typeInfo;
+            PXG_VK_CHECK(vkCreateSemaphore(mDevice, &semInfo, nullptr, &mTimeline));
+            mHasTimeline = mTimeline != VK_NULL_HANDLE;
+        }
+
+        mDesc = desc;
 
         vkGetPhysicalDeviceMemoryProperties(mPhysicalDevice, &mMemoryProperties);
 
@@ -296,9 +331,15 @@ public:
         VkMemoryRequirements memReq;
         vkGetBufferMemoryRequirements(mDevice, buf.buffer, &memReq);
 
-        const uint32_t memoryType = findMemoryType(
-            memReq.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        // v2 memory mode: DEVICE_LOCAL storage with staged transfers.  The
+        // staged path is taken even when the winning memory type happens to
+        // also be host-visible (UMA/software devices) so the production
+        // transfer path is exercised everywhere, CI included.
+        buf.hostVisible = !mDesc.useDeviceLocalMemory;
+        const uint32_t memoryType = buf.hostVisible
+            ? findMemoryType(memReq.memoryTypeBits,
+                             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+            : findMemoryType(memReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
         VkMemoryAllocateFlagsInfo allocFlags = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
         allocFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
@@ -335,20 +376,97 @@ public:
 
     void upload(PxgBufferHandle handle, const void* data, size_t sizeBytes, size_t dstOffset) override
     {
+        if (sizeBytes == 0)
+            return;
         Buffer& buf = mBuffers[handle];
-        void* mapped = nullptr;
-        PXG_VK_CHECK(vkMapMemory(mDevice, buf.memory, dstOffset, sizeBytes, 0, &mapped));
-        memcpy(mapped, data, sizeBytes);
-        vkUnmapMemory(mDevice, buf.memory);
+        if (buf.hostVisible)
+        {
+            void* mapped = nullptr;
+            PXG_VK_CHECK(vkMapMemory(mDevice, buf.memory, dstOffset, sizeBytes, 0, &mapped));
+            memcpy(mapped, data, sizeBytes);
+            vkUnmapMemory(mDevice, buf.memory);
+            return;
+        }
+
+        // Staged path: copy through the current frame's persistently mapped
+        // staging ring, recorded into the open command buffer so the copy
+        // orders exactly like a stream-ordered H2D copy — after previously
+        // recorded dispatches, before subsequent ones.
+        const uint8_t* src = static_cast<const uint8_t*>(data);
+        size_t remaining = sizeBytes;
+        size_t off = dstOffset;
+        while (remaining)
+        {
+            beginRecording();
+            Frame& f = mFrames[mFrameIndex];
+            ensureStaging(f);
+            const size_t avail = kStagingBytes - f.stagingOffset;
+            if (avail == 0)
+            {
+                flush(); // ring exhausted: retire this batch, continue on a fresh frame
+                continue;
+            }
+            const size_t chunk = remaining < avail ? remaining : avail;
+            memcpy(f.stagingMapped + f.stagingOffset, src, chunk);
+
+            bufferBarrier(buf.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            VkBufferCopy region = { f.stagingOffset, off, chunk };
+            vkCmdCopyBuffer(mCommandBuffer, f.staging, buf.buffer, 1, &region);
+            bufferBarrier(buf.buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+
+            f.stagingOffset += chunk;
+            src += chunk;
+            off += chunk;
+            remaining -= chunk;
+        }
     }
 
     void download(PxgBufferHandle handle, void* data, size_t sizeBytes, size_t srcOffset) override
     {
+        if (sizeBytes == 0)
+            return;
         Buffer& buf = mBuffers[handle];
-        void* mapped = nullptr;
-        PXG_VK_CHECK(vkMapMemory(mDevice, buf.memory, srcOffset, sizeBytes, 0, &mapped));
-        memcpy(data, mapped, sizeBytes);
-        vkUnmapMemory(mDevice, buf.memory);
+        if (buf.hostVisible)
+        {
+            void* mapped = nullptr;
+            PXG_VK_CHECK(vkMapMemory(mDevice, buf.memory, srcOffset, sizeBytes, 0, &mapped));
+            memcpy(data, mapped, sizeBytes);
+            vkUnmapMemory(mDevice, buf.memory);
+            return;
+        }
+
+        // Staged path: everything recorded so far must have retired before
+        // the readback copy of a device-local buffer is recorded.
+        flush();
+        uint8_t* dst = static_cast<uint8_t*>(data);
+        size_t remaining = sizeBytes;
+        size_t off = srcOffset;
+        while (remaining)
+        {
+            beginRecording();
+            Frame& f = mFrames[mFrameIndex];
+            ensureStaging(f);
+            const size_t chunk = remaining < kStagingBytes ? remaining : kStagingBytes;
+
+            bufferBarrier(buf.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            VkBufferCopy region = { off, 0, chunk };
+            vkCmdCopyBuffer(mCommandBuffer, buf.buffer, f.staging, 1, &region);
+            bufferBarrier(f.staging, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+
+            Frame* recorded = &f;
+            flush();
+            memcpy(dst, recorded->stagingMapped, chunk);
+
+            dst += chunk;
+            off += chunk;
+            remaining -= chunk;
+        }
     }
 
     // ---- pipelines ----
@@ -517,26 +635,69 @@ public:
                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memBarrier, 0, nullptr, 0, nullptr);
     }
 
-    void flush() override
+    uint64_t submit() override
     {
         if (!mRecording)
-            return;
+            return mLastTicket;
 
         PXG_VK_CHECK(vkEndCommandBuffer(mCommandBuffer));
+        Frame& f = mFrames[mFrameIndex];
 
         VkSubmitInfo submitInfo = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &mCommandBuffer;
-        PXG_VK_CHECK(vkQueueSubmit(mQueue, 1, &submitInfo, mFence));
-        PXG_VK_CHECK(vkWaitForFences(mDevice, 1, &mFence, VK_TRUE, UINT64_MAX));
-        PXG_VK_CHECK(vkResetFences(mDevice, 1, &mFence));
 
-        // Recycle descriptor pools for the next batch.
-        for (VkDescriptorPool pool : mDescriptorPools)
-            PXG_VK_CHECK(vkResetDescriptorPool(mDevice, pool, 0));
-        mCurrentPool = 0;
+        if (mHasTimeline)
+        {
+            const uint64_t ticket = ++mTimelineValue;
+            VkTimelineSemaphoreSubmitInfo timelineInfo = { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+            timelineInfo.signalSemaphoreValueCount = 1;
+            timelineInfo.pSignalSemaphoreValues = &ticket;
+            submitInfo.pNext = &timelineInfo;
+            submitInfo.signalSemaphoreCount = 1;
+            submitInfo.pSignalSemaphores = &mTimeline;
+            PXG_VK_CHECK(vkQueueSubmit(mQueue, 1, &submitInfo, VK_NULL_HANDLE));
+            f.retireValue = ticket;
+            mLastTicket = ticket;
+        }
+        else
+        {
+            // No timeline semaphores: blocking submit, so every returned
+            // ticket is already retired (0 == "complete" by convention).
+            PXG_VK_CHECK(vkQueueSubmit(mQueue, 1, &submitInfo, mFence));
+            PXG_VK_CHECK(vkWaitForFences(mDevice, 1, &mFence, VK_TRUE, UINT64_MAX));
+            PXG_VK_CHECK(vkResetFences(mDevice, 1, &mFence));
+            f.retireValue = 0;
+        }
 
+        ++mSubmitCount;
         mRecording = false;
+        return mLastTicket;
+    }
+
+    void wait(uint64_t ticket) override
+    {
+        if (ticket == 0 || !mHasTimeline)
+            return;
+        VkSemaphoreWaitInfo waitInfo = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+        waitInfo.semaphoreCount = 1;
+        waitInfo.pSemaphores = &mTimeline;
+        waitInfo.pValues = &ticket;
+        PXG_VK_CHECK(vkWaitSemaphores(mDevice, &waitInfo, UINT64_MAX));
+    }
+
+    bool poll(uint64_t ticket) override
+    {
+        if (ticket == 0 || !mHasTimeline)
+            return true;
+        uint64_t value = 0;
+        PXG_VK_CHECK(vkGetSemaphoreCounterValue(mDevice, mTimeline, &value));
+        return value >= ticket;
+    }
+
+    void flush() override
+    {
+        wait(submit());
     }
 
 private:
@@ -546,6 +707,24 @@ private:
         VkDeviceMemory memory;
         size_t size;
         uint64_t deviceAddress = 0;
+        bool hostVisible = true;
+    };
+
+    static const uint32_t kFramesInFlight = 4;
+    static const size_t kStagingBytes = 8u * 1024u * 1024u;
+
+    // One in-flight submission: command buffer, its descriptor pools, and its
+    // slice of the staging ring, all recycled once retireValue has signaled.
+    struct Frame
+    {
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        std::vector<VkDescriptorPool> pools;
+        size_t currentPool = 0;
+        uint64_t retireValue = 0;
+        VkBuffer staging = VK_NULL_HANDLE;
+        VkDeviceMemory stagingMemory = VK_NULL_HANDLE;
+        uint8_t* stagingMapped = nullptr;
+        size_t stagingOffset = 0;
     };
 
     struct Pipeline
@@ -570,21 +749,76 @@ private:
         return 0;
     }
 
+    // Acquire the next frame slot and open its command buffer.  Waiting on
+    // the slot's retire ticket makes N-buffering safe: descriptor sets and
+    // staging bytes of a frame are only recycled once the device is done
+    // with that frame's submission.
     void beginRecording()
     {
         if (mRecording)
             return;
+        mFrameIndex = uint32_t(mSubmitCount % kFramesInFlight);
+        Frame& f = mFrames[mFrameIndex];
+        wait(f.retireValue);
+        for (VkDescriptorPool pool : f.pools)
+            PXG_VK_CHECK(vkResetDescriptorPool(mDevice, pool, 0));
+        f.currentPool = 0;
+        f.stagingOffset = 0;
+        mCommandBuffer = f.cmd;
+
         VkCommandBufferBeginInfo beginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         PXG_VK_CHECK(vkBeginCommandBuffer(mCommandBuffer, &beginInfo));
         mRecording = true;
     }
 
+    void ensureStaging(Frame& f)
+    {
+        if (f.staging)
+            return;
+        VkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        info.size = kStagingBytes;
+        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        PXG_VK_CHECK(vkCreateBuffer(mDevice, &info, nullptr, &f.staging));
+
+        VkMemoryRequirements req;
+        vkGetBufferMemoryRequirements(mDevice, f.staging, &req);
+        VkMemoryAllocateInfo alloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        alloc.allocationSize = req.size;
+        alloc.memoryTypeIndex = findMemoryType(
+            req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        PXG_VK_CHECK(vkAllocateMemory(mDevice, &alloc, nullptr, &f.stagingMemory));
+        PXG_VK_CHECK(vkBindBufferMemory(mDevice, f.staging, f.stagingMemory, 0));
+
+        void* mapped = nullptr;
+        PXG_VK_CHECK(vkMapMemory(mDevice, f.stagingMemory, 0, VK_WHOLE_SIZE, 0, &mapped));
+        f.stagingMapped = static_cast<uint8_t*>(mapped);
+    }
+
+    // Per-buffer memory dependency on the readback/upload edges
+    // (RUNTIME_PLAN.md P1.3); compute<->compute ordering stays on the global
+    // barrier() to match stream-ordered CUDA semantics.
+    void bufferBarrier(VkBuffer buffer, VkPipelineStageFlags srcStage, VkAccessFlags srcAccess,
+                       VkPipelineStageFlags dstStage, VkAccessFlags dstAccess)
+    {
+        VkBufferMemoryBarrier b = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+        b.srcAccessMask = srcAccess;
+        b.dstAccessMask = dstAccess;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.buffer = buffer;
+        b.offset = 0;
+        b.size = VK_WHOLE_SIZE;
+        vkCmdPipelineBarrier(mCommandBuffer, srcStage, dstStage, 0, 0, nullptr, 1, &b, 0, nullptr);
+    }
+
     VkDescriptorSet allocateDescriptorSet(VkDescriptorSetLayout layout, uint32_t numBuffers)
     {
+        Frame& f = mFrames[mFrameIndex];
         for (;;)
         {
-            if (mCurrentPool == mDescriptorPools.size())
+            if (f.currentPool == f.pools.size())
             {
                 VkDescriptorPoolSize poolSize = {};
                 poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -597,11 +831,11 @@ private:
 
                 VkDescriptorPool pool;
                 PXG_VK_CHECK(vkCreateDescriptorPool(mDevice, &poolInfo, nullptr, &pool));
-                mDescriptorPools.push_back(pool);
+                f.pools.push_back(pool);
             }
 
             VkDescriptorSetAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-            allocInfo.descriptorPool = mDescriptorPools[mCurrentPool];
+            allocInfo.descriptorPool = f.pools[f.currentPool];
             allocInfo.descriptorSetCount = 1;
             allocInfo.pSetLayouts = &layout;
 
@@ -611,7 +845,7 @@ private:
                 return set;
             if (res == VK_ERROR_OUT_OF_POOL_MEMORY || res == VK_ERROR_FRAGMENTED_POOL)
             {
-                ++mCurrentPool;
+                ++f.currentPool;
                 continue;
             }
             PXG_VK_CHECK(res);
@@ -634,8 +868,15 @@ private:
     PxgBufferHandle mNextBufferHandle = 1;
     PxgPipelineHandle mNextPipelineHandle = 1;
 
-    std::vector<VkDescriptorPool> mDescriptorPools;
-    size_t mCurrentPool = 0;
+    Frame mFrames[kFramesInFlight];
+    uint32_t mFrameIndex = 0;
+    uint64_t mSubmitCount = 0;
+    VkSemaphore mTimeline = VK_NULL_HANDLE;
+    bool mHasTimeline = false;
+    uint64_t mTimelineValue = 0;
+    uint64_t mLastTicket = 0;
+    PxgSlangDeviceDesc mDesc;
+
     bool mRecording = false;
     bool mHasShaderInt64 = false;
     bool mHasBufferDeviceAddress = false;
