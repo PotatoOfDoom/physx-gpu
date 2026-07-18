@@ -161,11 +161,11 @@ PXG_TEST(npSdfBvhMorton)
             if ((i % 19u) == 5u)
             {
                 s.va = F4{ 1.f, 1.f, 1.f, 0.f }; s.vb = F4{ 1.f, 1.f, 1.f, 0.f };
-                s.vc = F4{ ((i / 19u) % 2u) ? 1.f : 0.f, 0.f, 1.f, 0.f };
+                s.vc = F4{ ((i / 38u) % 2u) ? 1.f : 0.f, 0.f, 1.f, 0.f };
                 s.vd = F4{ 1.f, 1.f, 1.f, 0.f };
             }
             // priority extremes: 0 and 31
-            if ((i % 23u) == 7u) s.misc.z = u2f(((i / 23u) % 2u) ? 31u : 0u);
+            if ((i % 23u) == 7u) s.misc.z = u2f(((i / 46u) % 2u) ? 31u : 0u);
         }
         in[i] = s;
         refBm(s, ref[i]);
