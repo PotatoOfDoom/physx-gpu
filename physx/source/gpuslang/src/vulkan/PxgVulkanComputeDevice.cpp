@@ -368,6 +368,9 @@ public:
         auto it = mBuffers.find(handle);
         if (it == mBuffers.end())
             return;
+        // An open recording may reference this buffer (staged uploads record
+        // copies); submit it so the wait below actually covers that work.
+        flush();
         vkDeviceWaitIdle(mDevice);
         vkDestroyBuffer(mDevice, it->second.buffer, nullptr);
         vkFreeMemory(mDevice, it->second.memory, nullptr);
@@ -572,6 +575,8 @@ public:
         auto it = mPipelines.find(handle);
         if (it == mPipelines.end())
             return;
+        // An open recording may reference this pipeline; submit it first.
+        flush();
         vkDeviceWaitIdle(mDevice);
         vkDestroyPipeline(mDevice, it->second.pipeline, nullptr);
         vkDestroyPipelineLayout(mDevice, it->second.layout, nullptr);
@@ -650,10 +655,23 @@ public:
         if (mHasTimeline)
         {
             const uint64_t ticket = ++mTimelineValue;
+            // Stream ordering: every batch waits on the previous ticket, so
+            // consecutive submissions execute (and become visible) in order
+            // exactly like work on one CUDA stream.  Same-queue submissions
+            // are NOT execution-ordered by submission order alone, and a
+            // wait on value 0 (first batch) is trivially satisfied.
+            const uint64_t waitValue = ticket - 1;
+            const VkPipelineStageFlags waitStage =
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
             VkTimelineSemaphoreSubmitInfo timelineInfo = { VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO };
+            timelineInfo.waitSemaphoreValueCount = 1;
+            timelineInfo.pWaitSemaphoreValues = &waitValue;
             timelineInfo.signalSemaphoreValueCount = 1;
             timelineInfo.pSignalSemaphoreValues = &ticket;
             submitInfo.pNext = &timelineInfo;
+            submitInfo.waitSemaphoreCount = 1;
+            submitInfo.pWaitSemaphores = &mTimeline;
+            submitInfo.pWaitDstStageMask = &waitStage;
             submitInfo.signalSemaphoreCount = 1;
             submitInfo.pSignalSemaphores = &mTimeline;
             PXG_VK_CHECK(vkQueueSubmit(mQueue, 1, &submitInfo, VK_NULL_HANDLE));

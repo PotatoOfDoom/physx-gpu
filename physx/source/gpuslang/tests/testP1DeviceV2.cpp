@@ -116,14 +116,19 @@ PXG_TEST(p1DeviceV2)
 
         dev->dispatch(pipe, GROUPS, 1, 1, &bOut, 1, &prm, sizeof(P));
         const uint64_t t1 = dev->submit();
-        PXG_CHECK_MSG(t1 != 0, "submit() returns a live ticket on the timeline path");
-        dev->wait(t1);
-        PXG_CHECK_MSG(dev->poll(t1), "poll() confirms a waited ticket has retired");
-
-        dev->dispatch(pipe, GROUPS, 1, 1, &bOut, 1, &prm, sizeof(P));
-        const uint64_t t2 = dev->submit();
-        PXG_CHECK_MSG(t2 > t1, "tickets are monotonic");
-        dev->wait(t2);
+        if (t1 == 0)
+        {
+            std::printf("  NOTE: synchronous-submit backend (no timeline) -> ticket checks skipped\n");
+        }
+        else
+        {
+            dev->wait(t1);
+            PXG_CHECK_MSG(dev->poll(t1), "poll() confirms a waited ticket has retired");
+            dev->dispatch(pipe, GROUPS, 1, 1, &bOut, 1, &prm, sizeof(P));
+            const uint64_t t2 = dev->submit();
+            PXG_CHECK_MSG(t2 > t1, "tickets are monotonic");
+            dev->wait(t2);
+        }
 
         std::vector<SgOut> g(N);
         dev->download(bOut, g.data(), N * sizeof(SgOut));
@@ -140,6 +145,69 @@ PXG_TEST(p1DeviceV2)
 
         dev->destroyBuffer(bOut);
         dev->destroyPipeline(pipe);
+    }
+
+    // --- cross-submission ordering (single-stream contract) ---
+    // Batch 1 computes d = a + b; batch 2 (submitted WITHOUT a host wait)
+    // computes e = d + d.  The ordering contract alone must make batch 1's
+    // results visible to batch 2, like back-to-back kernels on one CUDA
+    // stream.
+    {
+        const uint32_t N = 4096;
+        const uint32_t GROUPS = N / 64;
+        std::vector<float> a(N), b(N), zero(N, 0.f);
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            a[i] = -3.f + 0.001f * float(i % 6007);
+            b[i] = 2.5f - 0.0007f * float(i % 5003);
+        }
+        PxgBufferHandle bA = createBufferFrom(dev.get(), a);
+        PxgBufferHandle bB = createBufferFrom(dev.get(), b);
+        PxgBufferHandle bD = createBufferFrom(dev.get(), zero);
+        PxgBufferHandle bE = createBufferFrom(dev.get(), zero);
+
+        const uint64_t addrA = dev->getBufferDeviceAddress(bA);
+        const uint64_t addrB = dev->getBufferDeviceAddress(bB);
+        const uint64_t addrD = dev->getBufferDeviceAddress(bD);
+        const uint64_t addrE = dev->getBufferDeviceAddress(bE);
+        if (addrA && addrB && addrD && addrE)
+        {
+            struct BdaP { uint64_t srcA, srcB, dst; uint32_t count, pad; };
+            const std::vector<uint8_t> blob = loadShaderBlob("npSpikeBda.spv");
+            const PxgPipelineHandle pipe = dev->createPipeline(blob.data(), blob.size(), "spikeBda",
+                                                               0, nullptr, sizeof(BdaP));
+            const BdaP p1 = { addrA, addrB, addrD, N, 0 };
+            dev->dispatch(pipe, GROUPS, 1, 1, nullptr, 0, &p1, sizeof(BdaP));
+            dev->submit();
+            const BdaP p2 = { addrD, addrD, addrE, N, 0 };
+            dev->dispatch(pipe, GROUPS, 1, 1, nullptr, 0, &p2, sizeof(BdaP));
+            dev->wait(dev->submit());
+
+            std::vector<float> e(N, 0.f);
+            dev->download(bE, e.data(), N * 4);
+            size_t mm = 0;
+            for (uint32_t i = 0; i < N; ++i)
+            {
+                const float d = a[i] + b[i];
+                const float ref = d + d;
+                uint32_t ur, ug;
+                std::memcpy(&ur, &ref, 4);
+                std::memcpy(&ug, &e[i], 4);
+                if (ur != ug)
+                    ++mm;
+            }
+            PXG_CHECK_MSG(mm == 0, "dependent dispatch across submit() sees prior batch results (%zu mismatches)", mm);
+            dev->destroyPipeline(pipe);
+        }
+        else
+        {
+            std::printf("  NOTE: no buffer device addresses -> cross-submission chain check skipped\n");
+        }
+
+        dev->destroyBuffer(bA);
+        dev->destroyBuffer(bB);
+        dev->destroyBuffer(bD);
+        dev->destroyBuffer(bE);
     }
 }
 

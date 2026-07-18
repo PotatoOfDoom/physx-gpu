@@ -201,10 +201,23 @@ tests for the sub-allocator (fragmentation/deferred-free/resize properties).
   4000-op randomized stress, coalescing recovery after full drain, root
   growth, deferred-free visibility, exceptional round-trip through real
   device memory) in both memory modes.
+- **P1.1 follow-up (adversarial review)** — every timeline submission now
+  waits on the previous ticket, so consecutive `submit()` batches execute
+  and become visible in submission order (single-CUDA-stream semantics;
+  Vulkan does NOT order same-queue submissions by itself, which made
+  dependent dispatches split across batches a latent hazard on hardware
+  that overlaps compute submissions).  `destroyBuffer`/`destroyPipeline`
+  flush any open recording before waiting idle (staged uploads record
+  copies into the open command buffer).  Regression test: chained BDA
+  dispatches across two submits with no host wait.  Known tooling note:
+  Khronos validation-layer syncval up to 1.3.275 does not model
+  `vkWaitSemaphores` HOST waits and false-positives WAW on staging-ring
+  reuse; a fence-based probe of the identical pattern is clean (layer
+  limitation, fixed in newer layers).
 - Still open in P1: pipeline cache on disk, specialization constants,
   `vkCmdFillBuffer`/copy utilities (memset/DtoD parity), timestamp
-  queries, SubmissionContexts (per-stream ordering), indirect dispatch
-  plumbing.
+  queries, SubmissionContexts (multi-stream; P1 serializes all work on
+  one queue in submission order), indirect dispatch plumbing.
 
 
 ## 3. Phase P2 — Kernel completion (the non-portable remainder)

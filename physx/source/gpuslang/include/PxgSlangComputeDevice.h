@@ -119,6 +119,11 @@ public:
     // retired; poll() is the non-blocking query.  Calling submit() with
     // nothing recorded returns the most recent ticket.  Backends without a
     // non-blocking path may submit synchronously and return 0.
+    //
+    // Ordering contract: consecutive submissions on one device execute and
+    // become visible in submission order (single-CUDA-stream semantics), so
+    // a dispatch recorded after submit() may safely consume the results of
+    // the submitted batch without a host-side wait().
     virtual uint64_t submit()
     {
         flush();
