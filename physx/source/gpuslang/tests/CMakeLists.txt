@@ -643,6 +643,13 @@ add_executable(gpuslang-tests
     testBroadphaseAggSelfCollision.cpp
     testBroadphaseAggSortProjections.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
+# The CPU references are the bitwise ground truth: forbid the compiler from
+# contracting their separately-rounded mul+add chains into FMA (GCC defaults
+# to -ffp-contract=fast; harmless on non-FMA baselines but load-bearing on
+# any -march with FMA).  Mirrors the NoContraction stamping on the shaders.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(gpuslang-tests PRIVATE -ffp-contract=off)
+endif()
 add_dependencies(gpuslang-tests gpuslang-shaders)
 
 enable_testing()
