@@ -145,51 +145,60 @@ PXG_TEST(npSparseGridCellFromPos)
         s.sizes = U4{ sX, sY, sZ, numSubgrids };
 
         bool stripeRow = false;
-        // division-boundary stripe: place pos.x within a few ulps of a subgrid
-        // boundary k*domainSize where floor(p/d) != floor(p*(1/d)) -- the two
-        // quotient roundings straddle the integer.  The CORRECT code (plain
-        // division, both shader and ref) agrees on these rows; a mutant using
-        // reciprocal-multiply in calcSubgridId picks a different subgrid ->
-        // different hash -> found-status flips -> divergent output.  This makes
-        // the plain-division faithfulness observable (it is measure-zero under
-        // purely random positions).
+        // stripe axis rotates across rows so ALL THREE axes exercise the
+        // boundary/clamp behavior (an x-only stripe would leave y/z clamp
+        // mutants unobservable)
+        const uint32_t ax = (i / 13u) % 3u;
+        float* posAx = (ax == 0u) ? &s.pos.x : (ax == 1u) ? &s.pos.y : &s.pos.z;
+        const uint32_t szAx = (ax == 0u) ? sX : (ax == 1u) ? sY : sZ;
+        // division-boundary stripe: place the axis coordinate within a few ulps
+        // of a subgrid boundary k*domainSize where floor(p/d) != floor(p*(1/d))
+        // -- the two quotient roundings straddle the integer.  The CORRECT code
+        // (plain division, both shader and ref) agrees on these rows; a mutant
+        // using reciprocal-multiply in calcSubgridId picks a different subgrid
+        // -> different hash -> found-status flips -> divergent output.  This
+        // makes the plain-division faithfulness observable (it is measure-zero
+        // under purely random positions).  Incidentally these rows also make
+        // the LO clamp bind (origin rounding pushes the local coordinate
+        // slightly negative -> floor -1 -> clamped to 0).
         if ((i % 13u) == 5u)
         {
-            const float dsx = dx * float(sX);
+            const float ds = dx * float(szAx);
             bool got = false;
             for (int32_t kk = 1; kk <= 6 && !got; ++kk)
             {
-                float cand = float(kk) * dsx;
+                float cand = float(kk) * ds;
                 for (int j = 0; j < 64 && !got; ++j)
                 {
-                    if (std::floor(cand / dsx) != std::floor(cand * (1.0f / dsx))) { s.pos.x = cand; got = true; }
+                    if (std::floor(cand / ds) != std::floor(cand * (1.0f / ds))) { *posAx = cand; got = true; }
                     cand = std::nextafterf(cand, 0.0f);
                 }
-                cand = std::nextafterf(float(kk) * dsx, 1e30f);
+                cand = std::nextafterf(float(kk) * ds, 1e30f);
                 for (int j = 0; j < 64 && !got; ++j)
                 {
-                    if (std::floor(cand / dsx) != std::floor(cand * (1.0f / dsx))) { s.pos.x = cand; got = true; }
+                    if (std::floor(cand / ds) != std::floor(cand * (1.0f / ds))) { *posAx = cand; got = true; }
                     cand = std::nextafterf(cand, 1e30f);
                 }
             }
             stripeRow = got;   // fallback: plain random row
         }
-        // clamp-hi stripe: place pos.x a few ulps below the TOP of its subgrid so
-        // that floor((p - origin) * invDx) lands on sX (fp rounding pushes the
-        // local coordinate to the far face) and the [0, sX-1] hi clamp BINDS.
-        // The correct code clamps to sX-1; a widened-bound mutant outputs sX.
+        // clamp-hi stripe: place the axis coordinate a few ulps below the TOP of
+        // its subgrid so that floor((p - origin) * invDx) lands on size (fp
+        // rounding pushes the local coordinate to the far face) and the
+        // [0, size-1] hi clamp BINDS.  The correct code clamps to size-1; a
+        // widened-bound mutant outputs size.
         if ((i % 13u) == 9u)
         {
-            const float dsx = dx * float(sX);
-            const float idf = std::floor(s.pos.x / dsx);
-            float cand = (idf + 1.0f) * dsx;
+            const float ds = dx * float(szAx);
+            const float idf = std::floor(*posAx / ds);
+            float cand = (idf + 1.0f) * ds;
             for (int j = 0; j < 96; ++j)
             {
                 cand = std::nextafterf(cand, -1e30f);
-                if (std::floor(cand / dsx) != idf) continue;        // must stay in the same subgrid
-                const float ox = idf * dx * float(sX);              // (id*dx)*sX, left-to-right as in the code
-                const int32_t rx = int32_t(std::floor((cand - ox) * (1.0f / dx)));
-                if (rx >= int32_t(sX)) { s.pos.x = cand; stripeRow = true; break; }
+                if (std::floor(cand / ds) != idf) continue;         // must stay in the same subgrid
+                const float ox = idf * dx * float(szAx);            // (id*dx)*size, left-to-right as in the code
+                const int32_t rr = int32_t(std::floor((cand - ox) * (1.0f / dx)));
+                if (rr >= int32_t(szAx)) { *posAx = cand; stripeRow = true; break; }
             }
         }
 
