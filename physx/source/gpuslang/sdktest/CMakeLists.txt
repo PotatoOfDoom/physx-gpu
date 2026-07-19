@@ -30,6 +30,13 @@ file(GLOB_RECURSE SDK_SRC
 list(FILTER SDK_SRC EXCLUDE REGEX "/CUDA/")
 list(FILTER SDK_SRC EXCLUDE REGEX "/windows/")
 list(FILTER SDK_SRC EXCLUDE REGEX "windows")
+# PxGpu.cpp exports the app-facing CUDA C-ABI wrappers (PxCreateCudaContextManager
+# et al.) that forward to the dlopen module loader.  Those are the SAME extern "C"
+# symbols the Vulkan bridge (PhysXGpuVulkan.cpp) provides, so linking both into the
+# GPU test would double-define them; the bridge is authoritative here.  Nothing in
+# the SDK references these internally (engine GPU access goes through PxvGetPhysXGpu
+# / the g_* pointers), so the CPU-only sdk-step is unaffected by the exclusion.
+list(FILTER SDK_SRC EXCLUDE REGEX "/gpu/PxGpu.cpp")
 
 add_library(physx-sdk STATIC ${SDK_SRC})
 target_compile_definitions(physx-sdk PUBLIC PX_PHYSX_STATIC_LIB PXG_NO_CUDA_TOOLKIT PX_PUBLIC_RELEASE=1)
@@ -140,3 +147,71 @@ target_include_directories(physx-sdk PUBLIC
 add_executable(sdk-step ${CMAKE_CURRENT_SOURCE_DIR}/testSdkStep.cpp)
 target_link_libraries(sdk-step PRIVATE physx-sdk Threads::Threads ${CMAKE_DL_LIBS})
 set_target_properties(sdk-step PROPERTIES CXX_STANDARD 17)
+
+#=============================================================================#
+# RUNTIME_PLAN.md P5 milestone B: the GPU pipeline linked against the CPU SDK.
+# Builds every gpu* host module (broadphase / common / narrowphase / solver /
+# simulationcontroller / articulation) no-CUDA-toolkit, plus the Vulkan bridge
+# and gpuslang backend, then a GPU-enabled PxScene test that constructs the
+# whole Pxg* pipeline through the bridge factories and steps it.
+#=============================================================================#
+find_package(Vulkan)
+if(Vulkan_FOUND)
+    set(GPUSLANG_ROOT ${SRC}/gpuslang)
+
+    # gpuslang backend (Vulkan compute device + CUDA-driver shim over Vulkan).
+    add_library(gpuslang-backend STATIC
+        ${GPUSLANG_ROOT}/src/vulkan/PxgVulkanComputeDevice.cpp
+        ${GPUSLANG_ROOT}/src/PxgCudaShim.cpp)
+    set_target_properties(gpuslang-backend PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_STANDARD 17)
+    target_include_directories(gpuslang-backend PUBLIC ${GPUSLANG_ROOT}/include)
+    target_link_libraries(gpuslang-backend PUBLIC Vulkan::Vulkan)
+
+    # Every gpu* host module, minus the .cu-adjacent CUDA/ device trees.
+    file(GLOB_RECURSE GPUHOST_SRC
+        ${SRC}/gpucommon/src/*.cpp
+        ${SRC}/gpubroadphase/src/*.cpp
+        ${SRC}/gpunarrowphase/src/*.cpp
+        ${SRC}/gpusimulationcontroller/src/*.cpp
+        ${SRC}/gpusolver/src/*.cpp
+        ${SRC}/gpuarticulation/src/*.cpp)
+    list(FILTER GPUHOST_SRC EXCLUDE REGEX "/CUDA/")
+    list(FILTER GPUHOST_SRC EXCLUDE REGEX "/windows/")
+
+    add_library(physx-gpuhost STATIC
+        ${GPUHOST_SRC}
+        # The Vulkan bridge: the C-ABI PxPhysXGpu drop-in + its CUDA-context /
+        # kernel-table / driver / kernel-init shims (replaces physxgpu + the real
+        # CUDA CudaContextManager, which are deliberately excluded).
+        ${GPUSLANG_ROOT}/bridge/PhysXGpuVulkan.cpp
+        ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp
+        ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelTable.cpp
+        ${GPUSLANG_ROOT}/bridge/PxgVulkanDriverShim.cpp
+        ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelInit.cpp
+        # The engine KernelWrangler base the manager derives from.
+        ${SRC}/cudamanager/src/CudaKernelWrangler.cpp)
+    set_target_properties(physx-gpuhost PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_STANDARD 17)
+    target_compile_options(physx-gpuhost PRIVATE -w -fno-strict-aliasing)
+    # PX_PHYSX_GPU_EXPORTS (not STATIC_LIB): matches the proven drop-in .so recipe and
+    # gates out the `#if !PX_PHYSX_GPU_EXPORTS` CUDA cubin force-linkage calls
+    # (init*Kernels*), which have no definition in the SPIR-V/Vulkan world.
+    target_compile_definitions(physx-gpuhost PRIVATE
+        PX_PHYSX_GPU_EXPORTS PXG_NO_CUDA_TOOLKIT PX_PUBLIC_RELEASE=1)
+    # physx-sdk's PUBLIC includes carry foundation/common/lowlevel/geomutils; add
+    # the gpu-module include roots + the no-CUDA header stand-ins.
+    target_include_directories(physx-gpuhost PRIVATE
+        ${GPUSLANG_ROOT}/include ${GPUSLANG_ROOT}/bridge ${GPUSLANG_ROOT}/nocuda
+        ${SRC}/gpucommon/include ${SRC}/gpubroadphase/include ${SRC}/gpunarrowphase/include
+        ${SRC}/gpusimulationcontroller/include ${SRC}/gpusolver/include ${SRC}/gpuarticulation/include
+        ${SRC}/physxgpu/include)
+    target_link_libraries(physx-gpuhost PUBLIC physx-sdk gpuslang-backend)
+
+    # The GPU-scene test.
+    add_executable(gpu-sdk-step ${CMAKE_CURRENT_SOURCE_DIR}/testGpuSdkStep.cpp)
+    target_compile_definitions(gpu-sdk-step PRIVATE PX_PHYSX_STATIC_LIB PXG_NO_CUDA_TOOLKIT PX_PUBLIC_RELEASE=1)
+    target_include_directories(gpu-sdk-step PRIVATE
+        ${GPUSLANG_ROOT}/include ${GPUSLANG_ROOT}/bridge ${GPUSLANG_ROOT}/nocuda
+        ${SRC}/gpucommon/include ${SRC}/physxgpu/include)
+    target_link_libraries(gpu-sdk-step PRIVATE physx-gpuhost physx-sdk gpuslang-backend Vulkan::Vulkan Threads::Threads ${CMAKE_DL_LIBS})
+    set_target_properties(gpu-sdk-step PROPERTIES CXX_STANDARD 17)
+endif()

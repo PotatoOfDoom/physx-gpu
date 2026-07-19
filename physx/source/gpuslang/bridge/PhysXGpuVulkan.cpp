@@ -63,6 +63,14 @@
 #include "PxgHeapMemAllocator.h"      // gpucommon: the REAL buddy heap allocator manager (reused)
 #include "PxgKernelWrangler.h"        // gpucommon: the REAL PxgCudaKernelWranglerManager (reused)
 
+// P5 GPU-scene wiring: the concrete Pxg* subsystem types the factories construct.
+#include "PxgCudaBroadPhaseSap.h"           // gpubroadphase
+#include "PxgAABBManager.h"                 // gpubroadphase (PxgAABBManager + PxgBoundsArray)
+#include "PxgNphaseImplementationContext.h" // gpunarrowphase
+#include "PxgSimulationController.h"        // gpusimulationcontroller
+#include "PxgDynamicsContext.h"             // gpusolver (PGS)
+#include "PxgTGSDynamicsContext.h"          // gpusolver (TGS)
+
 #include "foundation/PxAllocator.h"   // PX_NEW
 #include "foundation/PxErrorCallback.h"
 #include "foundation/PxFoundation.h"  // PxGetErrorCallback
@@ -223,34 +231,73 @@ public:
         return s;
     }
 
-    Bp::BroadPhase* createGpuBroadPhase(const PxGpuBroadPhaseDesc&, PxsKernelWranglerManager*, PxCudaContextManager*,
-                                        PxU32, const PxGpuDynamicsMemoryConfig&, PxsHeapMemoryAllocatorManager*, PxU64) PX_OVERRIDE { warnNotImplemented("createGpuBroadPhase"); return NULL; }
+    // P5 GPU-scene factories (real): each placement-news the concrete Pxg* type,
+    // verbatim as physxgpu/src/PxgPhysXGpu.cpp wires them.  gpuComputeVersion==0 is
+    // the only path the CUDA reference takes too (the else returns NULL there).
+    Bp::BroadPhase* createGpuBroadPhase(const PxGpuBroadPhaseDesc& desc, PxsKernelWranglerManager* gpuKernelWrangler, PxCudaContextManager* cudaContextManager,
+                                        PxU32 gpuComputeVersion, const PxGpuDynamicsMemoryConfig& config, PxsHeapMemoryAllocatorManager* heapMemoryManager, PxU64 contextID) PX_OVERRIDE
+    {
+        if (gpuComputeVersion == 0)
+            return PX_PLACEMENT_NEW(PX_ALLOC(sizeof(PxgCudaBroadPhaseSap), "PxgCudaBroadPhaseSap"), PxgCudaBroadPhaseSap)(desc,
+                static_cast<PxgCudaKernelWranglerManager*>(gpuKernelWrangler), cudaContextManager, config, static_cast<PxgHeapMemoryAllocatorManager*>(heapMemoryManager), contextID);
+        return NULL;
+    }
 
-    Bp::AABBManagerBase* createGpuAABBManager(PxsKernelWranglerManager*, PxCudaContextManager*, const PxU32,
-                                              const PxGpuDynamicsMemoryConfig&, PxsHeapMemoryAllocatorManager*,
-                                              Bp::BroadPhase&, Bp::BoundsArray&, PxFloatArrayPinnedSafe&,
-                                              PxU32, PxU32, PxVirtualAllocator&, PxU64,
-                                              PxPairFilteringMode::Enum, PxPairFilteringMode::Enum) PX_OVERRIDE { warnNotImplemented("createGpuAABBManager"); return NULL; }
+    Bp::AABBManagerBase* createGpuAABBManager(PxsKernelWranglerManager* gpuKernelWrangler, PxCudaContextManager* cudaContextManager, const PxU32 gpuComputeVersion,
+                                              const PxGpuDynamicsMemoryConfig& config, PxsHeapMemoryAllocatorManager* heapMemoryManager,
+                                              Bp::BroadPhase& bp, Bp::BoundsArray& boundsArray, PxFloatArrayPinnedSafe& contactDistance,
+                                              PxU32 maxNbAggregates, PxU32 maxNbShapes, PxVirtualAllocator& allocator, PxU64 contextID,
+                                              PxPairFilteringMode::Enum kineKineFilteringMode, PxPairFilteringMode::Enum staticKineFilteringMode) PX_OVERRIDE
+    {
+        if (gpuComputeVersion == 0)
+            return PX_PLACEMENT_NEW(PX_ALLOC(sizeof(PxgAABBManager), "PxgAABBManager"), PxgAABBManager)(
+                static_cast<PxgCudaKernelWranglerManager*>(gpuKernelWrangler), cudaContextManager, static_cast<PxgHeapMemoryAllocatorManager*>(heapMemoryManager),
+                config, bp, boundsArray, contactDistance, maxNbAggregates, maxNbShapes, allocator, contextID, kineKineFilteringMode, staticKineFilteringMode);
+        return NULL;
+    }
 
-    Bp::BoundsArray* createGpuBounds(PxVirtualAllocator&) PX_OVERRIDE { warnNotImplemented("createGpuBounds"); return NULL; }
+    Bp::BoundsArray* createGpuBounds(PxVirtualAllocator& allocator) PX_OVERRIDE
+    {
+        return PX_PLACEMENT_NEW(PX_ALLOC(sizeof(PxgBoundsArray), "PxgBoundsArray"), PxgBoundsArray)(allocator);
+    }
 
-    PxvNphaseImplementationContext* createGpuNphaseImplementationContext(PxsContext&, PxsKernelWranglerManager*,
-                                                                         PxvNphaseImplementationFallback*,
-                                                                         const PxGpuDynamicsMemoryConfig&, void*, void*, void*,
-                                                                         PxBoundsArrayPinned&, IG::IslandSim*,
-                                                                         physx::Dy::Context*, const PxU32,
-                                                                         PxsHeapMemoryAllocatorManager*, bool) PX_OVERRIDE { warnNotImplemented("createGpuNphaseImplementationContext"); return NULL; }
+    PxvNphaseImplementationContext* createGpuNphaseImplementationContext(PxsContext& context, PxsKernelWranglerManager* gpuKernelWrangler,
+                                                                         PxvNphaseImplementationFallback* fallbackForUnsupportedCMs,
+                                                                         const PxGpuDynamicsMemoryConfig& gpuDynamicsConfig, void* contactStreamBase, void* patchStreamBase, void* forceAndIndiceStreamBase,
+                                                                         PxBoundsArrayPinned& bounds, IG::IslandSim* islandSim,
+                                                                         physx::Dy::Context* dynamicsContext, const PxU32 /*gpuComputeVersion*/,
+                                                                         PxsHeapMemoryAllocatorManager* heapMemoryManager, bool useGPUBP) PX_OVERRIDE
+    {
+        return PX_PLACEMENT_NEW(PX_ALLOC(sizeof(PxgNphaseImplementationContext), "PxgNphaseImplementationContext"), PxgNphaseImplementationContext)(context, gpuKernelWrangler, fallbackForUnsupportedCMs, gpuDynamicsConfig, contactStreamBase, patchStreamBase, forceAndIndiceStreamBase,
+            bounds, islandSim, dynamicsContext, static_cast<PxgHeapMemoryAllocatorManager*>(heapMemoryManager), useGPUBP);
+    }
 
-    PxsSimulationController* createGpuSimulationController(PxsKernelWranglerManager*, PxCudaContextManager*,
-                                                          Dy::Context*, PxvNphaseImplementationContext*, Bp::BroadPhase*,
-                                                          bool, PxsSimulationControllerCallback*, PxU32,
-                                                          PxsHeapMemoryAllocatorManager*, PxU32, PxU32, PxU32,
-                                                          PxU32, bool) PX_OVERRIDE { warnNotImplemented("createGpuSimulationController"); return NULL; }
+    PxsSimulationController* createGpuSimulationController(PxsKernelWranglerManager* gpuWranglerManagers, PxCudaContextManager* cudaContextManager,
+                                                          Dy::Context* dynamicContext, PxvNphaseImplementationContext* npContext, Bp::BroadPhase* bp,
+                                                          const bool useGpuBroadphase, PxsSimulationControllerCallback* callback, const PxU32 /*gpuComputeVersion*/,
+                                                          PxsHeapMemoryAllocatorManager* heapMemoryManager, const PxU32 maxSoftBodyContacts, const PxU32 maxFemClothContacts,
+                                                          const PxU32 maxParticleContacts, const PxU32 collisionStackSizeBytes, bool enableBodyAccelerations) PX_OVERRIDE
+    {
+        return PX_PLACEMENT_NEW(PX_ALLOC(sizeof(PxgSimulationController), "PxgSimulationController"),
+            PxgSimulationController)(gpuWranglerManagers, cudaContextManager, static_cast<PxgDynamicsContext*>(dynamicContext), static_cast<PxgNphaseImplementationContext*>(npContext),
+            bp, useGpuBroadphase, callback, static_cast<PxgHeapMemoryAllocatorManager*>(heapMemoryManager), maxSoftBodyContacts,
+            maxFemClothContacts, maxParticleContacts, collisionStackSizeBytes, enableBodyAccelerations);
+    }
 
-    Dy::Context* createGpuDynamicsContext(Cm::FlushPool&, PxsKernelWranglerManager*, PxCudaContextManager*,
-                                          const PxGpuDynamicsMemoryConfig&, IG::SimpleIslandManager&, PxU32, PxU32,
-                                          bool, bool, bool, PxReal, PxU32, PxvSimStats&, PxsHeapMemoryAllocatorManager*,
-                                          bool, bool, PxSolverType::Enum, PxReal, bool, PxU64, bool) PX_OVERRIDE { warnNotImplemented("createGpuDynamicsContext"); return NULL; }
+    Dy::Context* createGpuDynamicsContext(Cm::FlushPool& taskPool, PxsKernelWranglerManager* gpuKernelWrangler, PxCudaContextManager* cudaContextManager,
+                                          const PxGpuDynamicsMemoryConfig& config, IG::SimpleIslandManager& islandManager, PxU32 maxNumPartitions, PxU32 maxNumStaticPartitions,
+                                          bool enableStabilization, bool useEnhancedDeterminism, bool solveArticulationContactLast, PxReal maxBiasCoefficient, PxU32 /*gpuComputeVersion*/,
+                                          PxvSimStats& simStats, PxsHeapMemoryAllocatorManager* heapMemoryManager, bool frictionEveryIteration, bool externalForcesEveryTgsIterationEnabled,
+                                          PxSolverType::Enum solverType, PxReal lengthScale, bool enableDirectGPUAPI, PxU64 contextID, bool isResidualReportingEnabled) PX_OVERRIDE
+    {
+        if (solverType == PxSolverType::eTGS)
+            return PX_PLACEMENT_NEW(PX_ALLOC(sizeof(PxgTGSDynamicsContext), "PxgDynamicsContext"), PxgTGSDynamicsContext)(taskPool, gpuKernelWrangler, cudaContextManager, config, islandManager,
+                maxNumPartitions, maxNumStaticPartitions, enableStabilization, useEnhancedDeterminism, solveArticulationContactLast, maxBiasCoefficient, simStats,
+                static_cast<PxgHeapMemoryAllocatorManager*>(heapMemoryManager), externalForcesEveryTgsIterationEnabled, lengthScale, enableDirectGPUAPI, contextID, isResidualReportingEnabled);
+        return PX_PLACEMENT_NEW(PX_ALLOC(sizeof(PxgDynamicsContext), "PxgDynamicsContext"), PxgDynamicsContext)(taskPool, gpuKernelWrangler, cudaContextManager, config, islandManager,
+            maxNumPartitions, maxNumStaticPartitions, enableStabilization, useEnhancedDeterminism, solveArticulationContactLast, maxBiasCoefficient, simStats,
+            static_cast<PxgHeapMemoryAllocatorManager*>(heapMemoryManager), frictionEveryIteration, lengthScale, enableDirectGPUAPI, contextID, isResidualReportingEnabled);
+    }
 };
 
 } // anonymous namespace
