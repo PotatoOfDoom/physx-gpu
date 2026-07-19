@@ -226,9 +226,18 @@ tests for the sub-allocator (fragmentation/deferred-free/resize properties).
   when idle.  Coverage: `p1DeviceV2` gains sub-range fill + offset copy
   checks (both memory modes); mutants caught (copy offset swap, fill
   offset dropped, download-without-flush regression).
-- Still open in P1: pipeline cache on disk, specialization constants,
-  timestamp queries, SubmissionContexts (multi-stream; P1 serializes all
-  work on one queue in submission order), indirect dispatch plumbing.
+- **P1.5 pipeline cache SHIPPED**: one `VkPipelineCache` per device, always
+  used by `vkCreateComputePipelines`; when `PxgSlangDeviceDesc.pipelineCachePath`
+  is set it is seeded from that blob at creation and written back at
+  destruction, so shader/pipeline compilation is reused across runs.  A
+  foreign or corrupt blob is rejected by the driver's header check and simply
+  starts empty (verified).  Test `p1PipelineCache`: first device writes a
+  header-valid blob, a second device seeded from it produces bitwise-identical
+  kernel results, and a garbage blob neither crashes creation nor changes
+  results; mutant caught (no-save fails the written-blob check).
+- Still open in P1: specialization constants, timestamp queries,
+  SubmissionContexts (multi-stream; P1 serializes all work on one queue in
+  submission order), indirect dispatch plumbing.
 
 
 ### P2.1 progress

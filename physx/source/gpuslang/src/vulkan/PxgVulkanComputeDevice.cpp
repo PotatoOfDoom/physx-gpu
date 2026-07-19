@@ -107,6 +107,11 @@ public:
                     vkFreeMemory(mDevice, frame.stagingMemory, nullptr);
                 }
             }
+            if (mPipelineCache)
+            {
+                savePipelineCache();
+                vkDestroyPipelineCache(mDevice, mPipelineCache, nullptr);
+            }
             if (mTimeline)
                 vkDestroySemaphore(mDevice, mTimeline, nullptr);
             if (mCommandPool)
@@ -302,6 +307,33 @@ public:
         }
 
         mDesc = desc;
+        if (desc.pipelineCachePath)
+            mPipelineCachePath = desc.pipelineCachePath;
+
+        // Pipeline cache: seed from the on-disk blob when present.  An invalid
+        // or foreign blob is rejected by the driver's header check, which
+        // simply starts an empty cache — safe by design.
+        std::vector<uint8_t> cacheSeed;
+        if (!mPipelineCachePath.empty())
+        {
+            if (FILE* f = fopen(mPipelineCachePath.c_str(), "rb"))
+            {
+                fseek(f, 0, SEEK_END);
+                const long sz = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                if (sz > 0)
+                {
+                    cacheSeed.resize(size_t(sz));
+                    if (fread(cacheSeed.data(), 1, size_t(sz), f) != size_t(sz))
+                        cacheSeed.clear();
+                }
+                fclose(f);
+            }
+        }
+        VkPipelineCacheCreateInfo cacheInfo = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO };
+        cacheInfo.initialDataSize = cacheSeed.size();
+        cacheInfo.pInitialData = cacheSeed.empty() ? nullptr : cacheSeed.data();
+        PXG_VK_CHECK(vkCreatePipelineCache(mDevice, &cacheInfo, nullptr, &mPipelineCache));
 
         vkGetPhysicalDeviceMemoryProperties(mPhysicalDevice, &mMemoryProperties);
 
@@ -747,7 +779,7 @@ public:
         VkComputePipelineCreateInfo pipelineInfo = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
         pipelineInfo.stage = stageInfo;
         pipelineInfo.layout = pipe.layout;
-        PXG_VK_CHECK(vkCreateComputePipelines(mDevice, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &pipe.pipeline));
+        PXG_VK_CHECK(vkCreateComputePipelines(mDevice, mPipelineCache, 1, &pipelineInfo, nullptr, &pipe.pipeline));
 
         const PxgPipelineHandle handle = mNextPipelineHandle++;
         mPipelines[handle] = pipe;
@@ -1068,6 +1100,23 @@ private:
         vkCmdPipelineBarrier(mCommandBuffer, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
     }
 
+    void savePipelineCache()
+    {
+        if (mPipelineCachePath.empty())
+            return;
+        size_t sz = 0;
+        if (vkGetPipelineCacheData(mDevice, mPipelineCache, &sz, nullptr) != VK_SUCCESS || sz == 0)
+            return;
+        std::vector<uint8_t> data(sz);
+        if (vkGetPipelineCacheData(mDevice, mPipelineCache, &sz, data.data()) != VK_SUCCESS)
+            return;
+        if (FILE* f = fopen(mPipelineCachePath.c_str(), "wb"))
+        {
+            fwrite(data.data(), 1, sz, f);
+            fclose(f);
+        }
+    }
+
     void releaseTexture(Texture& tex)
     {
         if (tex.sampler)
@@ -1166,6 +1215,8 @@ private:
     uint64_t mTimelineValue = 0;
     uint64_t mLastTicket = 0;
     PxgSlangDeviceDesc mDesc;
+    VkPipelineCache mPipelineCache = VK_NULL_HANDLE;
+    std::string mPipelineCachePath;
 
     bool mRecording = false;
     bool mHasShaderInt64 = false;

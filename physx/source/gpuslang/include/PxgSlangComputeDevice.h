@@ -70,6 +70,11 @@ struct PxgSlangDeviceDesc
     // host-visible and transfers are direct maps (fast on UMA/software
     // devices).  Kernel results are identical either way.
     bool useDeviceLocalMemory = false;
+    // Optional path to a VkPipelineCache blob on disk.  When set, the cache
+    // is loaded at device creation and written back at destruction, so
+    // pipeline (shader) compilation is reused across runs.  NULL disables
+    // the on-disk cache (an in-memory cache is still used within a run).
+    const char* pipelineCachePath = nullptr;
 };
 
 class PxgSlangComputeDevice
