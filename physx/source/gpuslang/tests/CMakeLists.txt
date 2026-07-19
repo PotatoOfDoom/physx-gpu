@@ -699,11 +699,12 @@ add_executable(gpuslang-tests
     testP6Indirect.cpp
     testP3Shim.cpp
     testP3CudaContext.cpp
+    testP4Manifest.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 # The P3.1 CUDA-context bridge builds against the real PhysX headers
 # (foundation + cudamanager) with PX_SUPPORT_GPU_PHYSX; no CUDA toolkit needed.
-target_include_directories(gpuslang-tests PRIVATE ${GPUSLANG_ROOT}/../../include ${GPUSLANG_ROOT}/bridge)
+target_include_directories(gpuslang-tests PRIVATE ${GPUSLANG_ROOT}/../../include ${GPUSLANG_ROOT}/bridge ${GPUSLANG_ROOT}/../gpucommon/include)
 
 # pxg-caps: standalone device-profile probe (RUNTIME_PLAN.md P0)
 add_executable(pxg-caps ${GPUSLANG_ROOT}/tools/pxgCaps.cpp)
@@ -728,7 +729,7 @@ foreach(suite scan radixSort radixSortGather preIntegration integration updateBo
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p4Manifest)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")

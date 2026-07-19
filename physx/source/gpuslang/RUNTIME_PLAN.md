@@ -446,9 +446,20 @@ as soon as its kernels exist.
   must be rebuilt against the Vulkan context plus a Vulkan kernel-wrangler.  P3.1
   de-risks the load-bearing seam; the module bring-up (P4) and the
   `PhysXGpuVulkan` C-ABI export layer (P3.4/P3.5) are the large remaining effort.
-- Still open in P3: `PxCudaContextManager` wrapper + Vulkan kernel-wrangler, the
-  generated 501-entry manifest (next mechanical step), the `PhysXGpuVulkan`
-  C-ABI export library, and P4 module bring-up.
+- **501-entry manifest SHIPPED**: `tools/gen_kernel_manifest.py` parses the
+  live `PxgKernelNames.h` registry + the compiled Slang entries and emits the
+  generated `include/PxgSlangKernelManifest.h` — kernel-ID (enum order) ->
+  {cudaName, spirvFile, entry}, the index table the Vulkan kernel-wrangler
+  will use.  Launch kernels are matched by exact CUDA-name == Slang-entry
+  equality.  **Coverage: 123/501 registry launch kernels (24.6%)** already
+  map to a ported Slang entry by exact name; the remaining 378 are either
+  renamed helper-level ports P4 maps by hand, or not yet ported at the launch
+  level.  Test `p4Manifest` cross-checks the manifest against the live
+  registry header (via the X-macro) for exact count + order, validates every
+  mapped module's SPIR-V magic, and reports coverage; 2 drift mutants caught.
+- Still open in P3/P4: `PxCudaContextManager` wrapper + Vulkan kernel-wrangler,
+  the `PhysXGpuVulkan` C-ABI export library, filling the manifest's
+  pushConstantSize + the 378 unmapped rows during per-module bring-up.
 
 ## 4. Phase P3 — Orchestration shim (the CUDA-context replacement)
 
