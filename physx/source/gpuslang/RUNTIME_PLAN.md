@@ -427,10 +427,28 @@ as soon as its kernels exist.
   after `eventSynchronize`, `eventQuery` then complete), a second stream
   waiting on the event, and negative-handle rejection; mutants caught
   (record captures a zero ticket, eventSynchronize skips its handle guard).
-- Still open in P3: the actual `PxCudaContext`/`PxCudaContextManager`
-  virtual wrappers forwarding onto this shim, the generated 501-entry
-  manifest, and the `PhysXGpuVulkan` C-ABI bridge library — all needing
-  the PhysX headers in the build, landing with P4 module bring-up.
+- **P3.1 PxCudaContext bridge SHIPPED**: `bridge/PxgVulkanCudaContext.{h,cpp}`
+  implements the REAL `physx::PxCudaContext` (~40 virtuals) forwarding onto the
+  shim, built against the actual PhysX headers (foundation + cudamanager) with
+  `PX_SUPPORT_GPU_PHYSX=1` but WITHOUT the CUDA toolkit.  `PxCudaTypes.h` makes
+  this feasible: `CUdeviceptr` is a 64-bit int (= device address),
+  `CUstream`/`CUevent`/`CUfunction`/`CUmodule` are opaque pointers reinterpreted
+  as shim handles; `launchKernel` concatenates the `PxCudaKernelParam{data,size}`
+  arguments into the push-constant blob exactly as CUDA's own impl extracts
+  `.data` (`CudaContextManager.cpp:1165`).  Test `p3CudaContext` drives a real
+  Slang kernel end-to-end through the abstract `PxCudaContext*`
+  (memAlloc/memcpyHtoD/moduleGetFunction/launchKernel/streamSynchronize/
+  memcpyDtoH), bitwise-correct in both memory modes; 3 mutants caught.
+- Scope note (integration survey): a full drop-in replacement of the `PhysXGpu`
+  DLL is NOT just the context — `PxgPhysXGpu.cpp` `static_cast`s the abstract
+  `PxsKernelWranglerManager*`/heap manager to concrete `Pxg*` types, so the whole
+  gpu-module suite (broadphase/narrowphase/solver/articulation/simcontroller)
+  must be rebuilt against the Vulkan context plus a Vulkan kernel-wrangler.  P3.1
+  de-risks the load-bearing seam; the module bring-up (P4) and the
+  `PhysXGpuVulkan` C-ABI export layer (P3.4/P3.5) are the large remaining effort.
+- Still open in P3: `PxCudaContextManager` wrapper + Vulkan kernel-wrangler, the
+  generated 501-entry manifest (next mechanical step), the `PhysXGpuVulkan`
+  C-ABI export library, and P4 module bring-up.
 
 ## 4. Phase P3 — Orchestration shim (the CUDA-context replacement)
 
