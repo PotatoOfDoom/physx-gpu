@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **681/681** green in both modes.
+Test count: **685/685** green in both modes.
 
 ## Done
 
@@ -23,6 +23,11 @@ Test count: **681/681** green in both modes.
 | P3 shim core | bbc00d3 | `PxgCudaShim`: flat-address allocs (interior-pointer resolve), HtoD/DtoH/DtoD/memset, kernel launch via manifest + BDA nested-pointer marshalling. |
 | P3 stream/event | b39004d | streamCreate/Destroy/Synchronize, eventCreate/Destroy/Record/Synchronize/Query, streamWaitEvent — streams as ordering handles, events as timeline tickets. |
 | P1.6 copy/fill | 7b75b66 | Device-side `vkCmdCopyBuffer` (DtoD) + `vkCmdFillBuffer` (D32); fixed a latent host-visible stream-ordering gap (upload/download now drain prior GPU work, per cuMemcpy*'s stream ordering). |
+| P2.1 native val. | 1a2bfe2 | `npWarpNative.slang` (`PXG_WARP_NATIVE=1`) compile/lowering/driver validation of the native WaveShuffle/WaveActiveBallot path; hardware exec of 32-lane semantics stays P5. |
+| P1.5 pipeline cache | 7b84aaf | Per-device `VkPipelineCache`, seeded from / written back to an on-disk blob; corrupt blob tolerated. |
+| P6 indirect | f394c31 | `dispatchIndirect` (`vkCmdDispatchIndirect`) with a device-computed grid + compute→indirect barrier; all buffers gain INDIRECT usage. |
+| review follow-up | 9ca8957 | Device→host domain barrier on host-visible `download`; cache short-write cleanup; fillBuffer/dispatchIndirect alignment asserts (adversarial review, no BLOCKER/MAJOR). |
+| P1.6 timestamps | 1b68913 | Per-device timestamp `VkQueryPool`; `writeTimestamp`/`getTimestampNanos` (wrap-safe, order-independent) for per-stage GPU timing. |
 
 ## Empirical device profile (CI = llvmpipe, LLVM 20.1.2)
 
@@ -32,11 +37,12 @@ shaderFloat64/Int64 yes; vulkanMemoryModel yes; 32 KiB shared.
 
 ## Open
 
-- **P2 native path** — `PXG_WARP_NATIVE=1` compile validation + hardware
-  execution at subgroup 32 (P5; CI cannot run it).
-- **P1 remainder** — pipeline cache to disk, specialization constants,
-  timestamp queries, multi-queue SubmissionContexts (P1 serializes on one
-  queue), indirect dispatch (P6 count-readback elimination).
+- **P2 native path** — hardware execution at subgroup 32 (P5; CI's llvmpipe
+  is fixed at 8).  Compile/lowering/driver validation is done (1a2bfe2).
+- **P1 remainder** — specialization constants (per-module block-size
+  variants), multi-queue SubmissionContexts (P1 serializes on one queue in
+  submission order).  Pipeline cache, copy/fill utilities, indirect dispatch,
+  and timestamp queries are done.
 - **P3 tail / P4** — the real `PxCudaContext`/`PxCudaContextManager` virtual
   wrappers forwarding onto the shim, the generated 501-entry kernel manifest,
   and the `PhysXGpuVulkan` C-ABI bridge (`PxCreatePhysXGpu` /
