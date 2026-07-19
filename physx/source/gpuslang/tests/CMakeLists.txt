@@ -743,6 +743,7 @@ add_executable(gpuslang-tests
     testP4Foundation.cpp
     testP4Heap.cpp
     testP4Wrangler.cpp
+    testP4Broadphase.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp
     # P4: the REAL gpucommon buddy allocator, reused over the Vulkan memory
     # manager (PxgVulkanMemoryManager) — compiles cuda-free against real headers.
@@ -751,7 +752,16 @@ add_executable(gpuslang-tests
     # kernel ids to our encoding via the live manifest-driven function table.
     ${GPUSLANG_ROOT}/../gpucommon/src/PxgKernelWrangler.cpp
     ${GPUSLANG_ROOT}/../cudamanager/src/CudaKernelWrangler.cpp
-    ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelTable.cpp)
+    ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelTable.cpp
+    # P4.4 broadphase subsystem seam: the REAL concrete PxgCudaBroadPhaseSap + its
+    # gpucommon buffer/pinned-allocator support, plus the no-toolkit driver shim
+    # (cuCtxGetStreamPriorityRange) and the empty kernel-registration anchors.
+    ${GPUSLANG_ROOT}/../gpucommon/src/PxgCudaBuffer.cpp
+    ${GPUSLANG_ROOT}/../gpucommon/src/PxgCudaMemoryAllocator.cpp
+    ${GPUSLANG_ROOT}/../gpubroadphase/src/PxgBroadPhase.cpp
+    ${GPUSLANG_ROOT}/../gpubroadphase/src/PxgCudaBroadPhaseSap.cpp
+    ${GPUSLANG_ROOT}/bridge/PxgVulkanDriverShim.cpp
+    ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelInit.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend physx-foundation ${CMAKE_DL_LIBS})
 # PXG_NO_CUDA_TOOLKIT lets the real CudaKernelWrangler.cpp compile without <cuda.h>
 # and without the CUDART registration shims (only the ctor is needed here).
@@ -765,7 +775,18 @@ target_include_directories(gpuslang-tests PRIVATE ${GPUSLANG_ROOT}/../../include
     ${GPUSLANG_ROOT}/../gpucommon/include ${GPUSLANG_ROOT}/../physxgpu/include
     ${GPUSLANG_ROOT}/../foundation/include ${GPUSLANG_ROOT}/../common/include
     ${GPUSLANG_ROOT}/../lowlevel/software/include ${GPUSLANG_ROOT}/../lowlevelaabb/include
-    ${GPUSLANG_ROOT}/../cudamanager/include)
+    ${GPUSLANG_ROOT}/../cudamanager/include
+    # P4.4: no-toolkit CUDA header stand-ins (vector_types/vector_functions/host_defines)
+    # + the gpu-module + lowlevel/geomutils include dirs the real broadphase pulls.
+    ${GPUSLANG_ROOT}/nocuda
+    ${GPUSLANG_ROOT}/../gpubroadphase/include ${GPUSLANG_ROOT}/../gpunarrowphase/include
+    ${GPUSLANG_ROOT}/../gpusimulationcontroller/include ${GPUSLANG_ROOT}/../gpusolver/include
+    ${GPUSLANG_ROOT}/../common/src
+    ${GPUSLANG_ROOT}/../lowlevel/api/include
+    ${GPUSLANG_ROOT}/../lowlevel/common/include/pipeline ${GPUSLANG_ROOT}/../lowlevel/common/include/utils
+    ${GPUSLANG_ROOT}/../lowleveldynamics/include ${GPUSLANG_ROOT}/../lowleveldynamics/shared
+    ${GPUSLANG_ROOT}/../geomutils/include ${GPUSLANG_ROOT}/../geomutils/src
+    ${GPUSLANG_ROOT}/../geomutils/src/contact ${GPUSLANG_ROOT}/../geomutils/src/pcm)
 # The P3.5 loader test dlopen's the built PhysXGpuVulkan drop-in by its real path.
 add_dependencies(gpuslang-tests PhysXGpuVulkan)
 target_compile_definitions(gpuslang-tests PRIVATE PXG_PHYSXGPUVULKAN_SO="$<TARGET_FILE:PhysXGpuVulkan>")
@@ -792,14 +813,32 @@ add_library(PhysXGpuVulkan SHARED
     # P4 wrangler seam: the real engine KernelWrangler + manager + the live table.
     ${GPUSLANG_ROOT}/../gpucommon/src/PxgKernelWrangler.cpp
     ${GPUSLANG_ROOT}/../cudamanager/src/CudaKernelWrangler.cpp
-    ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelTable.cpp)
+    ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelTable.cpp
+    # P4.4 broadphase subsystem seam: the real concrete broadphase (backing
+    # createGpuBroadPhase) + gpucommon buffer/allocator support + driver/init shims.
+    ${GPUSLANG_ROOT}/../gpucommon/src/PxgCudaBuffer.cpp
+    ${GPUSLANG_ROOT}/../gpucommon/src/PxgCudaMemoryAllocator.cpp
+    ${GPUSLANG_ROOT}/../gpubroadphase/src/PxgBroadPhase.cpp
+    ${GPUSLANG_ROOT}/../gpubroadphase/src/PxgCudaBroadPhaseSap.cpp
+    ${GPUSLANG_ROOT}/bridge/PxgVulkanDriverShim.cpp
+    ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelInit.cpp)
 target_link_libraries(PhysXGpuVulkan PRIVATE gpuslang-backend physx-foundation)
 target_include_directories(PhysXGpuVulkan PRIVATE
     ${GPUSLANG_ROOT}/../../include ${GPUSLANG_ROOT}/include ${GPUSLANG_ROOT}/bridge
     ${GPUSLANG_ROOT}/../gpucommon/include ${GPUSLANG_ROOT}/../physxgpu/include
     ${GPUSLANG_ROOT}/../foundation/include ${GPUSLANG_ROOT}/../common/include
     ${GPUSLANG_ROOT}/../lowlevel/software/include ${GPUSLANG_ROOT}/../lowlevelaabb/include
-    ${GPUSLANG_ROOT}/../cudamanager/include)
+    ${GPUSLANG_ROOT}/../cudamanager/include
+    # P4.4: no-toolkit CUDA header stand-ins + gpu-module/lowlevel/geomutils dirs.
+    ${GPUSLANG_ROOT}/nocuda
+    ${GPUSLANG_ROOT}/../gpubroadphase/include ${GPUSLANG_ROOT}/../gpunarrowphase/include
+    ${GPUSLANG_ROOT}/../gpusimulationcontroller/include ${GPUSLANG_ROOT}/../gpusolver/include
+    ${GPUSLANG_ROOT}/../common/src
+    ${GPUSLANG_ROOT}/../lowlevel/api/include
+    ${GPUSLANG_ROOT}/../lowlevel/common/include/pipeline ${GPUSLANG_ROOT}/../lowlevel/common/include/utils
+    ${GPUSLANG_ROOT}/../lowleveldynamics/include ${GPUSLANG_ROOT}/../lowleveldynamics/shared
+    ${GPUSLANG_ROOT}/../geomutils/include ${GPUSLANG_ROOT}/../geomutils/src
+    ${GPUSLANG_ROOT}/../geomutils/src/contact ${GPUSLANG_ROOT}/../geomutils/src/pcm)
 target_compile_definitions(PhysXGpuVulkan PRIVATE PX_PHYSX_GPU_EXPORTS PXG_NO_CUDA_TOOLKIT)
 set_target_properties(PhysXGpuVulkan PROPERTIES OUTPUT_NAME PhysXGpuVulkan_64 CXX_STANDARD 17)
 # The CPU references are the bitwise ground truth: forbid the compiler from
@@ -821,7 +860,7 @@ foreach(suite scan radixSort radixSortGather preIntegration integration updateBo
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")

@@ -30,7 +30,11 @@
 #define PXG_INTRINSICS_H
 
 #include "foundation/PxSimpleTypes.h"
+#ifndef PXG_NO_CUDA_TOOLKIT
 #include "cuda.h"
+#else
+#include "PxgCudaToolkitShim.h"
+#endif
 
 #if (defined(_MSC_VER) && defined(_WIN64)) || defined(__LP64__) || defined(__CUDACC_RTC__)
 	#define __STG_PTR   "l"

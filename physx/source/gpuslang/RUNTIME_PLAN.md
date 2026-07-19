@@ -602,13 +602,35 @@ as soon as its kernels exist.
   entry/cudaName mismatches, 0 duplicate names).  2 mutants caught (bridge
   encoding `id+1`→`id+2` → 0/123; table row poison → 61/123).  The export's
   `getGpuKernelWranglerManager` is now real (no longer a stub).
-- Still open in P4 (per the de-risked plan): the concrete `Pxg*` subsystems
-  (broadphase, AABB, narrowphase, sim controller, dynamics) reused over the
-  Vulkan context and driven through the memory + wrangler seams; the ~10
-  direct-driver seams mopped up (`cuCtxGetStreamPriorityRange`, texture trio,
-  `cuStreamQuery`, raw `cuLaunchKernel`); the manifest's `pushConstantSize` + the
-  378 unmapped rows filled during per-module bring-up; and verification on real
-  ScScene scenes.
+- **P4.4 broadphase subsystem seam SHIPPED**: the FIRST concrete gpu subsystem
+  over Vulkan.  The REAL `PxgCudaBroadPhaseSap` (the exact type
+  `PxgPhysXGpu::createGpuBroadPhase` `static_cast`s to) constructs on the Vulkan
+  context, driven by BOTH prior seams — its ctor takes a `PxScopedCudaLock`,
+  allocates ~40 device buffers + host-mapped descriptors through the real buddy
+  allocator, and creates its stream + event through the bridge.  This forced (and
+  built, as reusable groundwork for every remaining subsystem) two things: (a) the
+  no-CUDA-toolkit header layer — `gpuslang/nocuda/{vector_types,vector_functions,
+  host_defines}.h` (ABI-exact stand-ins for the toolkit's POD vector types + the
+  `__device__`/`__host__`/`__align__` host macros, verified size-and-alignment
+  identical to cuda.h for all 26 types) plus `gpucommon/PxgCudaToolkitShim.h`
+  (`CUresult`/`CUDA_SUCCESS`, the stream/event/host-alloc flag enumerators,
+  `CUarray`/`CUtexObject`, and the direct-driver decls), selected via
+  `PXG_NO_CUDA_TOOLKIT` on 6 gpu headers; and (b) the first **direct-driver seam**
+  — `cuCtxGetStreamPriorityRange`, defined by `bridge/PxgVulkanDriverShim.cpp` to
+  report a degenerate `[0,0]` range (the Vulkan backend has one compute queue with
+  no priority tiers; the bridge ignores stream priority regardless).  The `.cu`
+  fatbin-registration anchors (`initBroadphaseKernels0/1`) become empty stubs
+  (`bridge/PxgVulkanKernelInit.cpp`) since kernels resolve via the live table.
+  Test `p4Broadphase` constructs the real broadphase, checks device bytes charged
+  to the `eBROADPHASE` heap group, and round-trips real data through a probe buffer
+  from the shared pool (so a broken memory seam fails — 2 mutants caught).
+  Kernel LAUNCHES (`update()`) need full scene data and stay for later.
+- Still open in P4 (per the de-risked plan): the other concrete `Pxg*` subsystems
+  (AABB, narrowphase, sim controller, dynamics) brought up over the Vulkan context
+  the same way; the remaining direct-driver seams mopped up (texture trio,
+  `cuStreamQuery`, raw `cuLaunchKernel`); each subsystem's `update()`/launch path
+  exercised on real data; the manifest's `pushConstantSize` + the 378 unmapped rows
+  filled during per-module bring-up; and verification on real ScScene scenes.
 
 ## 4. Phase P3 — Orchestration shim (the CUDA-context replacement)
 

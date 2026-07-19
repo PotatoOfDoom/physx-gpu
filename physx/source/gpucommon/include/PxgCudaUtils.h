@@ -29,7 +29,11 @@
 #ifndef PXG_CUDA_UTILS_H
 #define PXG_CUDA_UTILS_H
 
+#ifndef PXG_NO_CUDA_TOOLKIT
 #include "cuda.h"
+#else
+#include "PxgCudaToolkitShim.h"
+#endif
 
 #include "foundation/PxErrors.h"
 #include "foundation/PxAssert.h"

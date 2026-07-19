@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **694/694** green in both modes.
+Test count: **695/695** green in both modes.
 
 ## Done
 
@@ -34,7 +34,8 @@ Test count: **694/694** green in both modes.
 | P3.5 C-ABI export | 1cbebd9 | `bridge/PhysXGpuVulkan.cpp`: the `libPhysXGpuVulkan_64.so` drop-in — exports the loader's C symbols (`PxCreateCudaContextManager` wired to the bridge, the CUDA function/module table getters, `PxGpuCreatePhysicsGpu`); `p4Loader` dlopen test. `CudaKernelWrangler.h` de-coupled from `<cuda.h>`. |
 | P4.1 foundation | 8f94208 | `physx-foundation` static lib (15 Fd*/unix files, PIC) built in the harness — the engine-build keystone: real PhysX engine `.cpp` files now compile+link against the bridge with no CUDA toolkit. `p4Foundation` creates a `PxFoundation` + `PX_NEW`/`PxArray`. |
 | P4.2 memory seam | c6a65eb | The REAL gpucommon `PxgHeapMemoryAllocatorManager` buddy allocator (unmodified engine code) runs over `PxgVulkanMemoryManager : PxsMemoryManager` on the Vulkan context; flat-address device allocs resolved at interior pointers. `p4Heap` roundtrips 6 device buffers. |
-| P4.3 wrangler seam | (this commit) | The REAL cudamanager `KernelWrangler` + gpucommon `PxgCudaKernelWranglerManager` (the exact concrete types the gpu-subsystem ctors demand) run over the Vulkan context. `PxgVulkanKernelTable.cpp` builds the live CUDA function table from the 123 mapped manifest rows; the wrangler ctor name-resolves every kernel through our `moduleGetFunction` -> `toFunc(id)=id+1`. `p4Wrangler` proves the engine wrangler resolves all 123 mapped registry kernels to our launch encoding — which also pins manifest↔gpucommon enum alignment and `entry==cudaName`. `PXG_NO_CUDA_TOOLKIT` guards the toolkit-only includes + CUDART shims in `CudaKernelWrangler.cpp`. |
+| P4.3 wrangler seam | a34e9d7 | The REAL cudamanager `KernelWrangler` + gpucommon `PxgCudaKernelWranglerManager` (the exact concrete types the gpu-subsystem ctors demand) run over the Vulkan context. `PxgVulkanKernelTable.cpp` builds the live CUDA function table from the 123 mapped manifest rows; the wrangler ctor name-resolves every kernel through our `moduleGetFunction` -> `toFunc(id)=id+1`. `p4Wrangler` proves the engine wrangler resolves all 123 mapped registry kernels to our launch encoding — which also pins manifest↔gpucommon enum alignment and `entry==cudaName`. `PXG_NO_CUDA_TOOLKIT` guards the toolkit-only includes + CUDART shims in `CudaKernelWrangler.cpp`. |
+| P4.4 broadphase seam | (this commit) | The FIRST concrete gpu subsystem over Vulkan: the REAL `PxgCudaBroadPhaseSap` (the type `createGpuBroadPhase` static_casts to) constructs on the Vulkan context via both prior seams, taking the context lock, allocating its ~40 device buffers + host-mapped descriptors through the buddy allocator, and creating its stream+event through the bridge — including the first direct-driver seam, `cuCtxGetStreamPriorityRange`, shimmed by `PxgVulkanDriverShim.cpp`. Needed the no-CUDA-toolkit header stand-ins (`nocuda/vector_types.h` etc., ABI-exact vs cuda.h) + a small `PxgCudaToolkitShim.h`, and `PXG_NO_CUDA_TOOLKIT` guards on 6 gpu headers. `p4Broadphase` constructs it, proves device bytes are charged to the eBROADPHASE heap group, and round-trips real data through the shared pool. |
 
 ## Empirical device profile (CI = llvmpipe, LLVM 20.1.2)
 
@@ -65,13 +66,19 @@ shaderFloat64/Int64 yes; vulkanMemoryModel yes; 32 KiB shared.
   resolving all 123 mapped kernels to our launch encoding).  Remaining: the
   concrete `Pxg*` subsystems (broadphase / AABB / narrowphase / simulation
   controller / dynamics) rebuilt on the Vulkan context and driven through these
-  two seams; the ~10 direct CUDA-driver call-sites in the gpu modules
-  (`cuCtxGetStreamPriorityRange` ×5, the `cuTexObject` trio, `cuStreamQuery`, one
-  raw `cuLaunchKernel`, scattered `cuStreamSynchronize`/`cuMemcpyDtoH`); and the
-  manifest's `pushConstantSize` + the 378 unmapped kernel rows filled during
-  per-module bring-up.  This moves verification from harness batteries to real
-  ScScene scenes — the qualitative shift from isolated tranches to full-engine
-  integration.
+  two seams.  The **first concrete subsystem is now up (P4.4)**: the real
+  `PxgCudaBroadPhaseSap` constructs over Vulkan through both seams, which also
+  built the reusable no-CUDA-toolkit header layer (`nocuda/` ABI-exact vector-type
+  stand-ins + `PxgCudaToolkitShim.h`) and closed the first direct-driver seam
+  (`cuCtxGetStreamPriorityRange`).  Remaining: the other concrete subsystems (AABB
+  manager, narrowphase, sim controller, dynamics) brought up the same way; the
+  remaining ~direct CUDA-driver call-sites (the `cuTexObject` trio, `cuStreamQuery`,
+  one raw `cuLaunchKernel`, scattered `cuStreamSynchronize`/`cuMemcpyDtoH`); each
+  subsystem's `update()`/kernel-launch path exercised (construction is proven,
+  stepping is not); and the manifest's `pushConstantSize` + the 378 unmapped kernel
+  rows filled during per-module bring-up.  This moves verification from harness
+  batteries to real ScScene scenes — the qualitative shift from isolated tranches
+  to full-engine integration.
 - **P5** — cross-vendor validation (NVIDIA/AMD RDNA+/Intel Xe+), per-device
   tex3D filter tolerance calibration.
 - **P6/P7** — async compute, indirect dispatch, DX12 backend, interop.

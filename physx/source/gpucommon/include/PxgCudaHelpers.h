@@ -31,6 +31,7 @@
 
 #include "foundation/PxPreprocessor.h"
 
+#ifndef PXG_NO_CUDA_TOOLKIT
 #if PX_LINUX && PX_CLANG
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdocumentation"
@@ -38,6 +39,9 @@
 #include <cuda.h>
 #if PX_LINUX && PX_CLANG
 #pragma clang diagnostic pop
+#endif
+#else
+#include "PxgCudaToolkitShim.h"
 #endif
 
 #include "cudamanager/PxCudaContextManager.h"
