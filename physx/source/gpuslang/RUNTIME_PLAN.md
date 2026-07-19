@@ -328,6 +328,40 @@ Order of porting mirrors P4's bring-up order so each module becomes testable
 as soon as its kernels exist.
 
 
+### P3 progress
+
+- **Shim core SHIPPED** (`include/PxgCudaShim.h` + `src/PxgCudaShim.cpp`,
+  compiled into `gpuslang-backend`, isolated from the PhysX build): the
+  load-bearing middle of the CUDA-context replacement — the parts ScScene
+  actually exercises — on the v2 device layer.  `PxgCudaShim` reproduces:
+  - flat device-address allocation (`memAlloc`/`memFree` returning
+    `CUdeviceptr`-parity `uint64_t` addresses from `vkGetBufferDeviceAddress`),
+    with an interval map so ANY interior address resolves to (buffer, offset)
+    — the CUDA flat-address-space lookup;
+  - `memcpyHtoD`/`DtoH`/`DtoD` and `memsetD32` keyed on device addresses
+    (with correct sub-range offsets; DtoD stages through host in P3.1, a
+    `vkCmdCopyBuffer` fast path is a later device-layer follow-up);
+  - `launchKernel(id, grid, paramBlob)` — a manifest (`PxgKernelDef`:
+    spirv/entry/pushConstantSize/numTextures) drives lazy, cached pipeline
+    creation; the parameter blob is forwarded verbatim as push constants and
+    the dispatch binds ZERO storage descriptors (every buffer argument is a
+    device address inside the blob, incl. addresses NESTED in aggregate
+    structs — the PxgSoftBody pointer-passing model, 1:1).
+- **Conformance test** (`p3Shim` / `testP3Shim.cpp`): drives the shim the
+  way ScScene drives PxCudaContext — alloc, HtoD, memsetD32, build a nested
+  device-address param blob, launchKernel by id, streamSync, DtoH — and
+  checks bitwise AXPY (`npShimAxpy.slang`, three pointers nested in a
+  struct), interior/one-past-end pointer resolution, sub-range offset
+  HtoD/DtoH round-trips, DtoD copy, and base-vs-interior memFree parity.
+  Mutants caught: interval end-inclusive, missing predecessor step, and
+  dropped HtoD/DtoH offsets (the last exposed and fixed a real coverage gap
+  — all copies had used base pointers).  Green in both memory modes.
+- Still open in P3: the actual `PxCudaContext`/`PxCudaContextManager`
+  virtual wrappers forwarding onto this shim, stream/event objects
+  (multi-SubmissionContext), the generated 501-entry manifest, and the
+  `PhysXGpuVulkan` C-ABI bridge library — all needing the PhysX headers in
+  the build, landing with P4 module bring-up.
+
 ## 4. Phase P3 — Orchestration shim (the CUDA-context replacement)
 
 Goal: PhysX's CPU side runs UNMODIFIED against a Vulkan backend library.

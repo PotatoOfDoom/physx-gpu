@@ -1,0 +1,199 @@
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+//  * Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+//  * Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in the
+//    documentation and/or other materials provided with the distribution.
+//  * Neither the name of NVIDIA CORPORATION nor the names of its
+//    contributors may be used to endorse or promote products derived
+//    from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
+// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+// Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
+
+#include "PxgCudaShim.h"
+
+#include <cstring>
+
+namespace physx
+{
+namespace gpuslang
+{
+
+PxgCudaShim::PxgCudaShim(PxgSlangComputeDevice* device, const PxgKernelDef* manifest,
+                         uint32_t manifestCount, PxgSpirvLoader loader)
+    : mDevice(device), mManifest(manifest), mManifestCount(manifestCount), mLoader(loader)
+{
+}
+
+PxgCudaShim::~PxgCudaShim()
+{
+    for (auto& kv : mPipelines)
+        if (kv.second)
+            mDevice->destroyPipeline(kv.second);
+    for (auto& kv : mAllocs)
+        mDevice->destroyBuffer(kv.second.buffer);
+}
+
+// ---- memory ----
+
+PxgResult PxgCudaShim::memAlloc(PxgDevicePtr* out, size_t bytes)
+{
+    if (!out || bytes == 0)
+        return PxgResult::InvalidValue;
+    const PxgBufferHandle buf = mDevice->createBuffer(bytes);
+    if (buf == 0)
+        return PxgResult::OutOfMemory;
+    const PxgDevicePtr base = mDevice->getBufferDeviceAddress(buf);
+    if (base == 0)
+    {
+        // No BDA on this device: the shim's flat-address model is unavailable.
+        // The binding-table fallback (RUNTIME_PLAN.md P3.2) would take over
+        // here; not exercised on BDA-capable devices/CI.
+        mDevice->destroyBuffer(buf);
+        return PxgResult::InvalidValue;
+    }
+    mAllocs[base] = Alloc{ buf, base, bytes };
+    *out = base;
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::memFree(PxgDevicePtr ptr)
+{
+    auto it = mAllocs.find(ptr);
+    if (it == mAllocs.end())
+        return PxgResult::NotFound; // CUDA requires the base pointer, not an interior one
+    mDevice->destroyBuffer(it->second.buffer);
+    mAllocs.erase(it);
+    return PxgResult::Success;
+}
+
+bool PxgCudaShim::resolve(PxgDevicePtr ptr, PxgBufferHandle* buffer, size_t* offset) const
+{
+    if (ptr == 0 || mAllocs.empty())
+        return false;
+    // First allocation whose base is > ptr; the candidate is its predecessor.
+    auto it = mAllocs.upper_bound(ptr);
+    if (it == mAllocs.begin())
+        return false;
+    --it;
+    const Alloc& a = it->second;
+    if (ptr < a.base || ptr >= a.base + a.size)
+        return false;
+    if (buffer)
+        *buffer = a.buffer;
+    if (offset)
+        *offset = size_t(ptr - a.base);
+    return true;
+}
+
+PxgResult PxgCudaShim::memcpyHtoD(PxgDevicePtr dst, const void* src, size_t bytes)
+{
+    PxgBufferHandle buf;
+    size_t off;
+    if (!resolve(dst, &buf, &off))
+        return PxgResult::InvalidValue;
+    mDevice->upload(buf, src, bytes, off);
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::memcpyDtoH(void* dst, PxgDevicePtr src, size_t bytes)
+{
+    PxgBufferHandle buf;
+    size_t off;
+    if (!resolve(src, &buf, &off))
+        return PxgResult::InvalidValue;
+    mDevice->download(buf, dst, bytes, off);
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::memcpyDtoD(PxgDevicePtr dst, PxgDevicePtr src, size_t bytes)
+{
+    PxgBufferHandle sBuf, dBuf;
+    size_t sOff, dOff;
+    if (!resolve(src, &sBuf, &sOff) || !resolve(dst, &dBuf, &dOff))
+        return PxgResult::InvalidValue;
+    // P3.1 correctness path: stage through host.  A vkCmdCopyBuffer DtoD
+    // fast path is a device-layer follow-up (kept off the critical path).
+    std::vector<uint8_t> tmp(bytes);
+    mDevice->download(sBuf, tmp.data(), bytes, sOff);
+    mDevice->upload(dBuf, tmp.data(), bytes, dOff);
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::memsetD32(PxgDevicePtr dst, uint32_t value, size_t numWords)
+{
+    PxgBufferHandle buf;
+    size_t off;
+    if (!resolve(dst, &buf, &off))
+        return PxgResult::InvalidValue;
+    std::vector<uint32_t> fill(numWords, value);
+    mDevice->upload(buf, fill.data(), numWords * sizeof(uint32_t), off);
+    return PxgResult::Success;
+}
+
+// ---- launch ----
+
+PxgPipelineHandle PxgCudaShim::pipelineFor(PxgKernelId id)
+{
+    auto it = mPipelines.find(id);
+    if (it != mPipelines.end())
+        return it->second;
+
+    const PxgKernelDef& def = mManifest[id];
+    const std::vector<uint8_t> blob = mLoader(def.spirvFile);
+    PxgPipelineHandle pipe = 0;
+    if (def.numTextures > 0)
+        pipe = mDevice->createPipelineTex(blob.data(), blob.size(), def.entry, 0, nullptr,
+                                          def.pushConstantSize, def.numTextures);
+    else
+        // Zero storage-buffer bindings: every buffer argument travels as a
+        // device address inside the parameter blob (BDA model).
+        pipe = mDevice->createPipeline(blob.data(), blob.size(), def.entry, 0, nullptr,
+                                       def.pushConstantSize);
+    mPipelines[id] = pipe;
+    return pipe;
+}
+
+PxgResult PxgCudaShim::launchKernel(PxgKernelId id, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
+                                    const void* paramBlob, uint32_t paramBlobSize,
+                                    const PxgTextureHandle* textures, uint32_t numTextures)
+{
+    if (id >= mManifestCount)
+        return PxgResult::NotFound;
+    if (paramBlobSize != mManifest[id].pushConstantSize || numTextures != mManifest[id].numTextures)
+        return PxgResult::InvalidValue;
+
+    const PxgPipelineHandle pipe = pipelineFor(id);
+    if (pipe == 0)
+        return PxgResult::NotFound;
+
+    if (numTextures > 0)
+        mDevice->dispatchTex(pipe, gridX, gridY, gridZ, nullptr, 0, textures, numTextures,
+                             paramBlob, paramBlobSize);
+    else
+        mDevice->dispatch(pipe, gridX, gridY, gridZ, nullptr, 0, paramBlob, paramBlobSize);
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::streamSynchronize()
+{
+    mDevice->flush();
+    return PxgResult::Success;
+}
+
+} // namespace gpuslang
+} // namespace physx

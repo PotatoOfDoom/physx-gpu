@@ -399,11 +399,14 @@ pxg_compile_shader(npWarpLib wlShuffle wlBallot)
 pxg_compile_shader(npAtomicLib alAtomics)
 # RUNTIME_PLAN.md P2: tex3D replacement (Vulkan-only sampled-image path).
 pxg_compile_shader(npTex3d tex3dSample)
+# RUNTIME_PLAN.md P3 shim proof kernel (nested BDA params).
+pxg_compile_shader(npShimAxpy shimAxpy)
 
 add_custom_target(gpuslang-shaders ALL DEPENDS ${PXG_SHADER_OUTPUTS})
 
 # ---- backend library ----
-set(BACKEND_SOURCES ${GPUSLANG_ROOT}/src/vulkan/PxgVulkanComputeDevice.cpp)
+set(BACKEND_SOURCES ${GPUSLANG_ROOT}/src/vulkan/PxgVulkanComputeDevice.cpp
+    ${GPUSLANG_ROOT}/src/PxgCudaShim.cpp)
 if(WIN32)
     list(APPEND BACKEND_SOURCES ${GPUSLANG_ROOT}/src/dx12/PxgDx12ComputeDevice.cpp)
 endif()
@@ -685,7 +688,8 @@ add_executable(gpuslang-tests
     testP1HeapAlloc.cpp
     testNpWarpLib.cpp
     testNpAtomicLib.cpp
-    testNpTex3d.cpp)
+    testNpTex3d.cpp
+    testP3Shim.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 
 # pxg-caps: standalone device-profile probe (RUNTIME_PLAN.md P0)
@@ -711,7 +715,7 @@ foreach(suite scan radixSort radixSortGather preIntegration integration updateBo
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d p3Shim)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
