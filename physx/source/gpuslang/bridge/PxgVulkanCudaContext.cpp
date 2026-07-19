@@ -302,12 +302,142 @@ private:
     bool mAbort = false;
 };
 
+// The PxCudaContextManager the scene receives.  It owns a PxgVulkanCudaContext
+// and reports device properties; the per-thread acquire/release is a no-op
+// because a single Vulkan device is not a per-thread-current CUDA context.
+class PxgVulkanCudaContextManager : public physx::PxCudaContextManager
+{
+public:
+    PxgVulkanCudaContextManager(PxgSlangComputeDevice* device, PxgCudaShim* shim,
+                                const PxgKernelDef* manifest, uint32_t manifestCount)
+        : mDevice(device)
+    {
+        mContext = new PxgVulkanCudaContext(shim, manifest, manifestCount);
+    }
+
+    // ---- context access ----
+    CUdeviceptr getMappedDevicePtr(void* /*pinnedHostBuffer*/) override { return 0; }
+    void acquireContext() override { ++mAcquireCount; }
+    bool tryAcquireContext() override { ++mAcquireCount; return true; }
+    void releaseContext() override { if (mAcquireCount > 0) --mAcquireCount; }
+    CUcontext getContext() override { return reinterpret_cast<CUcontext>(uintptr_t(1)); }
+    PxCudaContext* getCudaContext() override { return mContext; }
+    bool contextIsValid() const override { return mContext != nullptr; }
+
+    // ---- capability queries: the Vulkan port implements the modern kernels,
+    // so it reports at least the SM levels the GPU code paths gate on ----
+    bool supportsArchSM10() const override { return true; }
+    bool supportsArchSM11() const override { return true; }
+    bool supportsArchSM12() const override { return true; }
+    bool supportsArchSM13() const override { return true; }
+    bool supportsArchSM20() const override { return true; }
+    bool supportsArchSM30() const override { return true; }
+    bool supportsArchSM35() const override { return true; }
+    bool supportsArchSM50() const override { return true; }
+    bool supportsArchSM52() const override { return true; }
+    bool supportsArchSM60() const override { return true; }
+    bool isIntegrated() const override { return false; }     // staged device-local model
+    bool canMapHostMemory() const override { return false; } // no zero-copy mapped host
+    int getDriverVersion() const override { return 12000; }
+    size_t getDeviceTotalMemBytes() const override { return size_t(4) << 30; }
+    int getMultiprocessorCount() const override { return 16; }
+    unsigned int getClockRate() const override { return 1000000; }
+    int getSharedMemPerBlock() const override { return 32 * 1024; }
+    int getSharedMemPerMultiprocessor() const override { return 64 * 1024; }
+    unsigned int getMaxThreadsPerBlock() const override { return 1024; }
+    const char* getDeviceName() const override { return mDevice ? mDevice->getDeviceName() : "PhysXGpuVulkan"; }
+    CUdevice getDevice() const override { return 0; }
+    void setUsingConcurrentStreams(bool v) override { mConcurrentStreams = v; }
+    bool getUsingConcurrentStreams() const override { return mConcurrentStreams; }
+    void getDeviceMemoryInfo(size_t& free, size_t& total) const override
+    {
+        total = getDeviceTotalMemBytes();
+        free = total;
+    }
+    CUmodule* getCuModules() override { return nullptr; } // kernels are precompiled SPIR-V
+    void release() override { delete this; }
+
+protected:
+    ~PxgVulkanCudaContextManager() override
+    {
+        if (mContext)
+            mContext->release();
+    }
+
+    // ---- deprecated Internal buffer helpers: forward onto the context ----
+    void* allocDeviceBufferInternal(PxU64 numBytes, const char* /*f*/, PxI32 /*l*/) override
+    {
+        CUdeviceptr p = 0;
+        return mContext->memAlloc(&p, size_t(numBytes)) == 0 ? reinterpret_cast<void*>(uintptr_t(p)) : nullptr;
+    }
+    void* allocPinnedHostBufferInternal(PxU64 numBytes, const char* /*f*/, PxI32 /*l*/) override
+    {
+        void* p = nullptr;
+        mContext->memHostAlloc(&p, size_t(numBytes), 0);
+        return p;
+    }
+    void freeDeviceBufferInternal(void* deviceBuffer) override
+    {
+        mContext->memFree(CUdeviceptr(uintptr_t(deviceBuffer)));
+    }
+    void freePinnedHostBufferInternal(void* pinnedHostBuffer) override
+    {
+        mContext->memFreeHost(pinnedHostBuffer);
+    }
+    void clearDeviceBufferAsyncInternal(void* deviceBuffer, PxU32 numBytes, CUstream stream, PxI32 value) override
+    {
+        mContext->memsetD32Async(CUdeviceptr(uintptr_t(deviceBuffer)), PxU32(value), numBytes / 4, stream);
+    }
+    void copyDToHAsyncInternal(void* hostBuffer, const void* deviceBuffer, PxU32 numBytes, CUstream stream) override
+    {
+        mContext->memcpyDtoHAsync(hostBuffer, CUdeviceptr(uintptr_t(deviceBuffer)), numBytes, stream);
+    }
+    void copyHToDAsyncInternal(void* deviceBuffer, const void* hostBuffer, PxU32 numBytes, CUstream stream) override
+    {
+        mContext->memcpyHtoDAsync(CUdeviceptr(uintptr_t(deviceBuffer)), hostBuffer, numBytes, stream);
+    }
+    void copyDToDAsyncInternal(void* dst, const void* src, PxU32 numBytes, CUstream stream) override
+    {
+        mContext->memcpyDtoDAsync(CUdeviceptr(uintptr_t(dst)), CUdeviceptr(uintptr_t(src)), numBytes, stream);
+    }
+    void copyDToHInternal(void* hostBuffer, const void* deviceBuffer, PxU32 numBytes) override
+    {
+        mContext->memcpyDtoH(hostBuffer, CUdeviceptr(uintptr_t(deviceBuffer)), numBytes);
+    }
+    void copyHToDInternal(void* deviceBuffer, const void* hostBuffer, PxU32 numBytes) override
+    {
+        mContext->memcpyHtoD(CUdeviceptr(uintptr_t(deviceBuffer)), hostBuffer, numBytes);
+    }
+    void memsetD8AsyncInternal(void* dst, const PxU8& value, PxU32 numBytes, CUstream stream) override
+    {
+        mContext->memsetD8Async(CUdeviceptr(uintptr_t(dst)), value, numBytes, stream);
+    }
+    void memsetD32AsyncInternal(void* dst, const PxU32& value, PxU32 numIntegers, CUstream stream) override
+    {
+        mContext->memsetD32Async(CUdeviceptr(uintptr_t(dst)), value, numIntegers, stream);
+    }
+
+private:
+    PxgSlangComputeDevice* mDevice;
+    PxgVulkanCudaContext* mContext;
+    unsigned mAcquireCount = 0;
+    bool mConcurrentStreams = false;
+};
+
 } // anonymous namespace
 
 physx::PxCudaContext* PxgCreateVulkanCudaContext(PxgCudaShim* shim, const PxgKernelDef* manifest,
                                                  uint32_t manifestCount)
 {
     return new PxgVulkanCudaContext(shim, manifest, manifestCount);
+}
+
+physx::PxCudaContextManager* PxgCreateVulkanCudaContextManager(PxgSlangComputeDevice* device,
+                                                               PxgCudaShim* shim,
+                                                               const PxgKernelDef* manifest,
+                                                               uint32_t manifestCount)
+{
+    return new PxgVulkanCudaContextManager(device, shim, manifest, manifestCount);
 }
 
 } // namespace gpuslang

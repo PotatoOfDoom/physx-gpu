@@ -51,6 +51,7 @@
 #if PX_SUPPORT_GPU_PHYSX
 
 #include "cudamanager/PxCudaContext.h"
+#include "cudamanager/PxCudaContextManager.h"
 
 namespace physx
 {
@@ -63,6 +64,16 @@ namespace gpuslang
 // PxCudaContext::release().  Neither the shim nor the manifest is owned.
 physx::PxCudaContext* PxgCreateVulkanCudaContext(PxgCudaShim* shim, const PxgKernelDef* manifest,
                                                  uint32_t manifestCount);
+
+// Creates the PxCudaContextManager the scene receives via
+// PxSceneDesc::cudaContextManager.  It owns an internal PxCudaContext (the one
+// above), reports device properties from `device`, and is a no-op for the
+// per-thread CUDA-context acquire/release (a single Vulkan device needs none).
+// Released via PxCudaContextManager::release(); does not own device/shim/manifest.
+physx::PxCudaContextManager* PxgCreateVulkanCudaContextManager(PxgSlangComputeDevice* device,
+                                                               PxgCudaShim* shim,
+                                                               const PxgKernelDef* manifest,
+                                                               uint32_t manifestCount);
 
 } // namespace gpuslang
 } // namespace physx

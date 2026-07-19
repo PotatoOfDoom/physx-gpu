@@ -457,9 +457,22 @@ as soon as its kernels exist.
   level.  Test `p4Manifest` cross-checks the manifest against the live
   registry header (via the X-macro) for exact count + order, validates every
   mapped module's SPIR-V magic, and reports coverage; 2 drift mutants caught.
-- Still open in P3/P4: `PxCudaContextManager` wrapper + Vulkan kernel-wrangler,
-  the `PhysXGpuVulkan` C-ABI export library, filling the manifest's
-  pushConstantSize + the 378 unmapped rows during per-module bring-up.
+- **P3.4 PxCudaContextManager wrapper SHIPPED**: `PxgVulkanCudaContextManager`
+  (same bridge) implements the REAL `physx::PxCudaContextManager` — the object
+  the scene receives via `PxSceneDesc::cudaContextManager`.  It owns an internal
+  PxCudaContext, reports device properties (SM levels, shared-mem/thread limits,
+  device name from the Slang device), makes the per-thread acquire/release a
+  balanced no-op (a single Vulkan device is not a per-thread-current CUDA
+  context), and forwards the 12 deprecated protected `*Internal` buffer helpers
+  onto the context.  Test `p3CudaContextManager` runs a kernel end-to-end
+  through the manager's context AND exercises the `allocDeviceBuffer`/`copyHToD`/
+  `copyDToH` template helpers (which drive the `*Internal` virtuals) with an
+  exact round-trip; both memory modes, 2 mutants caught.
+- Still open in P3/P4: a Vulkan kernel-wrangler (`KernelWrangler` replacement
+  resolving kernel IDs -> manifest entries), the `PhysXGpuVulkan` C-ABI export
+  library (`PxCreatePhysXGpu`/`PxCreateCudaContextManager`/
+  `PxGetSuggestedCudaDeviceOrdinal`), filling the manifest's pushConstantSize +
+  the 378 unmapped rows during per-module bring-up.
 
 ## 4. Phase P3 — Orchestration shim (the CUDA-context replacement)
 
