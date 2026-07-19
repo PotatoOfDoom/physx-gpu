@@ -744,6 +744,7 @@ add_executable(gpuslang-tests
     testP4Heap.cpp
     testP4Wrangler.cpp
     testP4Broadphase.cpp
+    testP4Aabb.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp
     # P4: the REAL gpucommon buddy allocator, reused over the Vulkan memory
     # manager (PxgVulkanMemoryManager) — compiles cuda-free against real headers.
@@ -761,7 +762,17 @@ add_executable(gpuslang-tests
     ${GPUSLANG_ROOT}/../gpubroadphase/src/PxgBroadPhase.cpp
     ${GPUSLANG_ROOT}/../gpubroadphase/src/PxgCudaBroadPhaseSap.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanDriverShim.cpp
-    ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelInit.cpp)
+    ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelInit.cpp
+    # P4.5 AABB-manager subsystem seam: the real PxgAABBManager (wrapping the
+    # broadphase) + its lowlevelaabb CPU base (AABBManagerBase + BpFiltering).
+    ${GPUSLANG_ROOT}/../gpubroadphase/src/PxgAABBManager.cpp
+    ${GPUSLANG_ROOT}/../lowlevelaabb/src/BpAABBManagerBase.cpp
+    ${GPUSLANG_ROOT}/../lowlevelaabb/src/BpFiltering.cpp
+    # PxgBoundsArray::updateBounds (via the bounds-array vtable) needs the CPU
+    # geometry bounds path: Gu::computeBounds + its convex-shape helpers.
+    ${GPUSLANG_ROOT}/../geomutils/src/GuBounds.cpp
+    ${GPUSLANG_ROOT}/../geomutils/src/convex/GuConvexUtilsInternal.cpp
+    ${GPUSLANG_ROOT}/../geomutils/src/GuConvexGeometry.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend physx-foundation ${CMAKE_DL_LIBS})
 # PXG_NO_CUDA_TOOLKIT lets the real CudaKernelWrangler.cpp compile without <cuda.h>
 # and without the CUDART registration shims (only the ctor is needed here).
@@ -786,7 +797,12 @@ target_include_directories(gpuslang-tests PRIVATE ${GPUSLANG_ROOT}/../../include
     ${GPUSLANG_ROOT}/../lowlevel/common/include/pipeline ${GPUSLANG_ROOT}/../lowlevel/common/include/utils
     ${GPUSLANG_ROOT}/../lowleveldynamics/include ${GPUSLANG_ROOT}/../lowleveldynamics/shared
     ${GPUSLANG_ROOT}/../geomutils/include ${GPUSLANG_ROOT}/../geomutils/src
-    ${GPUSLANG_ROOT}/../geomutils/src/contact ${GPUSLANG_ROOT}/../geomutils/src/pcm)
+    ${GPUSLANG_ROOT}/../geomutils/src/contact ${GPUSLANG_ROOT}/../geomutils/src/pcm
+    ${GPUSLANG_ROOT}/../geomutils/src/convex ${GPUSLANG_ROOT}/../geomutils/src/common
+    ${GPUSLANG_ROOT}/../geomutils/src/mesh ${GPUSLANG_ROOT}/../geomutils/src/distance
+    ${GPUSLANG_ROOT}/../geomutils/src/intersection ${GPUSLANG_ROOT}/../geomutils/src/gjk
+    ${GPUSLANG_ROOT}/../geomutils/src/sweep ${GPUSLANG_ROOT}/../geomutils/src/ccd ${GPUSLANG_ROOT}/../geomutils/src/hf
+    ${GPUSLANG_ROOT}/../lowlevelaabb/src)
 # The P3.5 loader test dlopen's the built PhysXGpuVulkan drop-in by its real path.
 add_dependencies(gpuslang-tests PhysXGpuVulkan)
 target_compile_definitions(gpuslang-tests PRIVATE PXG_PHYSXGPUVULKAN_SO="$<TARGET_FILE:PhysXGpuVulkan>")
@@ -821,7 +837,15 @@ add_library(PhysXGpuVulkan SHARED
     ${GPUSLANG_ROOT}/../gpubroadphase/src/PxgBroadPhase.cpp
     ${GPUSLANG_ROOT}/../gpubroadphase/src/PxgCudaBroadPhaseSap.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanDriverShim.cpp
-    ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelInit.cpp)
+    ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelInit.cpp
+    # P4.5 AABB-manager subsystem seam (backing createGpuAABBManager).
+    ${GPUSLANG_ROOT}/../gpubroadphase/src/PxgAABBManager.cpp
+    ${GPUSLANG_ROOT}/../lowlevelaabb/src/BpAABBManagerBase.cpp
+    ${GPUSLANG_ROOT}/../lowlevelaabb/src/BpFiltering.cpp
+    # CPU geometry bounds path for PxgBoundsArray::updateBounds.
+    ${GPUSLANG_ROOT}/../geomutils/src/GuBounds.cpp
+    ${GPUSLANG_ROOT}/../geomutils/src/convex/GuConvexUtilsInternal.cpp
+    ${GPUSLANG_ROOT}/../geomutils/src/GuConvexGeometry.cpp)
 target_link_libraries(PhysXGpuVulkan PRIVATE gpuslang-backend physx-foundation)
 target_include_directories(PhysXGpuVulkan PRIVATE
     ${GPUSLANG_ROOT}/../../include ${GPUSLANG_ROOT}/include ${GPUSLANG_ROOT}/bridge
@@ -838,7 +862,12 @@ target_include_directories(PhysXGpuVulkan PRIVATE
     ${GPUSLANG_ROOT}/../lowlevel/common/include/pipeline ${GPUSLANG_ROOT}/../lowlevel/common/include/utils
     ${GPUSLANG_ROOT}/../lowleveldynamics/include ${GPUSLANG_ROOT}/../lowleveldynamics/shared
     ${GPUSLANG_ROOT}/../geomutils/include ${GPUSLANG_ROOT}/../geomutils/src
-    ${GPUSLANG_ROOT}/../geomutils/src/contact ${GPUSLANG_ROOT}/../geomutils/src/pcm)
+    ${GPUSLANG_ROOT}/../geomutils/src/contact ${GPUSLANG_ROOT}/../geomutils/src/pcm
+    ${GPUSLANG_ROOT}/../geomutils/src/convex ${GPUSLANG_ROOT}/../geomutils/src/common
+    ${GPUSLANG_ROOT}/../geomutils/src/mesh ${GPUSLANG_ROOT}/../geomutils/src/distance
+    ${GPUSLANG_ROOT}/../geomutils/src/intersection ${GPUSLANG_ROOT}/../geomutils/src/gjk
+    ${GPUSLANG_ROOT}/../geomutils/src/sweep ${GPUSLANG_ROOT}/../geomutils/src/ccd ${GPUSLANG_ROOT}/../geomutils/src/hf
+    ${GPUSLANG_ROOT}/../lowlevelaabb/src)
 target_compile_definitions(PhysXGpuVulkan PRIVATE PX_PHYSX_GPU_EXPORTS PXG_NO_CUDA_TOOLKIT)
 set_target_properties(PhysXGpuVulkan PROPERTIES OUTPUT_NAME PhysXGpuVulkan_64 CXX_STANDARD 17)
 # The CPU references are the bitwise ground truth: forbid the compiler from
@@ -860,7 +889,7 @@ foreach(suite scan radixSort radixSortGather preIntegration integration updateBo
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")

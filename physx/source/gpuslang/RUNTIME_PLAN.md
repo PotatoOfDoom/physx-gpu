@@ -625,9 +625,18 @@ as soon as its kernels exist.
   to the `eBROADPHASE` heap group, and round-trips real data through a probe buffer
   from the shared pool (so a broken memory seam fails — 2 mutants caught).
   Kernel LAUNCHES (`update()`) need full scene data and stay for later.
+- **P4.5 AABB-manager subsystem seam SHIPPED**: the real `PxgAABBManager` (the type
+  `createGpuAABBManager` `static_cast`s to) constructs over the Vulkan context,
+  wrapping the real `PxgCudaBroadPhaseSap` and driven by both prior seams.  It reused
+  the P4.4 no-toolkit mechanism verbatim — no new shim, no new direct-driver seam —
+  adding only the CPU-side `Bp::AABBManagerBase`/`BpFiltering` base and the geometry
+  bounds path (`Gu::computeBounds` + `GuConvexUtilsInternal`/`GuConvexGeometry`) that
+  `PxgBoundsArray`'s vtable pulls.  Test `p4Aabb` constructs the manager and proves
+  the bp↔aabb coupling — the broadphase's `getAABBManager()` points back at it after
+  the ctor's `setGPUAABBManager(this)` (mutation caught).
 - Still open in P4 (per the de-risked plan): the other concrete `Pxg*` subsystems
-  (AABB, narrowphase, sim controller, dynamics) brought up over the Vulkan context
-  the same way; the remaining direct-driver seams mopped up (texture trio,
+  (narrowphase, sim controller, dynamics) brought up over the Vulkan context the
+  same way; the remaining direct-driver seams mopped up (texture trio,
   `cuStreamQuery`, raw `cuLaunchKernel`); each subsystem's `update()`/launch path
   exercised on real data; the manifest's `pushConstantSize` + the 378 unmapped rows
   filled during per-module bring-up; and verification on real ScScene scenes.
