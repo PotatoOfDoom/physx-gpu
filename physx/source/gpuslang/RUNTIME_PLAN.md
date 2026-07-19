@@ -634,12 +634,35 @@ as soon as its kernels exist.
   `PxgBoundsArray`'s vtable pulls.  Test `p4Aabb` constructs the manager and proves
   the bp↔aabb coupling — the broadphase's `getAABBManager()` points back at it after
   the ctor's `setGPUAABBManager(this)` (mutation caught).
-- Still open in P4 (per the de-risked plan): the other concrete `Pxg*` subsystems
-  (narrowphase, sim controller, dynamics) brought up over the Vulkan context the
-  same way; the remaining direct-driver seams mopped up (texture trio,
-  `cuStreamQuery`, raw `cuLaunchKernel`); each subsystem's `update()`/launch path
-  exercised on real data; the manifest's `pushConstantSize` + the 378 unmapped rows
-  filled during per-module bring-up; and verification on real ScScene scenes.
+- **P4.6 coupling boundary — the remaining trio needs the CPU sim core (scoped, not
+  yet built)**.  Broadphase (P4.4) and the AABB manager (P4.5) construct cleanly in
+  isolation because their ctors take ONLY the two GPU seams (+ each other).  The
+  remaining three subsystems do not — their ctors are bound to the CPU simulation
+  core, which is the true boundary between "GPU subsystem" and "full engine":
+  - `PxgNphaseImplementationContext` (narrowphase) needs a live `PxsContext`, an
+    `IG::IslandSim*`, AND a constructed `Dy::Context*` — its ctor immediately reads
+    `dynamicsContext->getGpuSolverCore()->getStream()`.  Its GPU workhorse
+    `PxgGpuNarrowphaseCore` also pulls the CUDA **texture-object / array driver API**
+    (`cuTexObjectCreate`/`cuArray3DCreate`/`cuMemcpy3DAsync` + `CUDA_TEXTURE_DESC`/
+    `CUDA_RESOURCE_DESC`/`CUarray_format` in `PxgGeometryManager.cpp`) for SDF/
+    heightfield textures — the last major direct-driver seam.  Backing it *for real*
+    means bridging the engine's `CUarray`/`CUtexObject` onto the gpuslang Vulkan
+    sampled-image layer that already exists (tex3D, 28e2805); a stub would only
+    appease the compiler, so it is deliberately deferred rather than faked.
+  - `PxgTGSDynamicsContext`/`PxgDynamicsContext` (dynamics) needs a `Cm::FlushPool`,
+    an `IG::SimpleIslandManager&`, and `PxvSimStats&`.
+  - `PxgSimulationController` needs the dynamics context, the narrowphase context,
+    and the broadphase together.
+  These are mutually recursive (`PxgGpuNarrowphaseCore` ↔ `PxgGpuContext` ↔
+  `PxgSimulationCore`) and all root in `PxsContext`/`SimpleIslandManager`/`IslandSim`.
+  The honest way to construct and STEP them is therefore not another isolated
+  ctor test but a **full-PhysX-SDK integration**: link the CPU SDK (PhysXCommon +
+  PhysX core + the LowLevel/Sc simulation core) alongside the GPU modules, create a
+  `PxScene` whose `cudaContextManager` is our Vulkan bridge, and run a real step.
+  That link is the natural next phase (a large but bounded build — essentially
+  compiling PhysX itself against the bridge); the texture-object seam + the manifest
+  `pushConstantSize` + the 378 unmapped rows + `cuStreamQuery`/raw `cuLaunchKernel`
+  all get closed during that bring-up, verified by the scene actually stepping.
 
 ## 4. Phase P3 — Orchestration shim (the CUDA-context replacement)
 

@@ -73,8 +73,17 @@ shaderFloat64/Int64 yes; vulkanMemoryModel yes; 32 KiB shared.
   stand-ins + `PxgCudaToolkitShim.h`) and closed the first direct-driver seam
   (`cuCtxGetStreamPriorityRange`).  The **AABB manager is up too (P4.5)** — the
   real `PxgAABBManager` constructs over Vulkan wrapping the broadphase, reusing the
-  P4.4 mechanism with no new shim.  Remaining: the other concrete subsystems
-  (narrowphase, sim controller, dynamics) brought up the same way; the
+  P4.4 mechanism with no new shim.
+  **Coupling boundary found (P4.6):** broadphase + AABB construct in isolation
+  because their ctors take only the two GPU seams; the remaining trio (narrowphase,
+  dynamics, sim controller) is mutually recursive and rooted in the CPU sim core
+  (`PxsContext`/`SimpleIslandManager`/`IslandSim`), so they cannot be meaningfully
+  constructed alone — the narrowphase ctor even reads the dynamics context's solver
+  stream.  The honest path to constructing and STEPPING them is a full-PhysX-SDK
+  link (CPU core + GPU modules + a `PxScene` on the Vulkan bridge), during which the
+  last direct-driver seam (the CUDA texture-object/array API for SDF/heightfield,
+  to be backed by the existing gpuslang tex3D Vulkan images — not stubbed) also
+  closes.  See RUNTIME_PLAN.md P4.6 for the full scoping.  Also remaining: the
   remaining ~direct CUDA-driver call-sites (the `cuTexObject` trio, `cuStreamQuery`,
   one raw `cuLaunchKernel`, scattered `cuStreamSynchronize`/`cuMemcpyDtoH`); each
   subsystem's `update()`/kernel-launch path exercised (construction is proven,
