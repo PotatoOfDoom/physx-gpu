@@ -55,6 +55,7 @@ namespace gpuslang
 
 typedef uint32_t PxgBufferHandle;   // 0 = invalid
 typedef uint32_t PxgPipelineHandle; // 0 = invalid
+typedef uint32_t PxgTextureHandle;  // 0 = invalid
 
 struct PxgSlangDeviceDesc
 {
@@ -162,6 +163,31 @@ public:
     // buffer-device-address argument-marshalling model).  0 when the
     // backend/device has no address support.
     virtual uint64_t getBufferDeviceAddress(PxgBufferHandle) const { return 0; }
+
+    // ---- 3D sampled textures (RUNTIME_PLAN.md P2: the tex3D replacement) ----
+    // Single-channel float volumes with trilinear filtering and
+    // clamp-to-edge addressing — the configuration the CUDA SDF path uses
+    // (cudaFilterModeLinear / cudaAddressModeClamp / element read mode).
+    // Coordinates are normalized in the shader; sampling at voxel centers
+    // ((p + 0.5) / dim with power-of-two dims) is exact, interior points
+    // carry the implementation's filtering precision (documented tolerance,
+    // NOT bit-exact across vendors).
+    virtual PxgTextureHandle createTexture3D(uint32_t /*width*/, uint32_t /*height*/, uint32_t /*depth*/,
+                                             const float* /*texels*/) { return 0; }
+    virtual void destroyTexture3D(PxgTextureHandle) {}
+
+    // Like createPipeline/dispatch, but the kernel additionally declares
+    // numTextures Texture3D+SamplerState pairs AFTER its storage buffers
+    // (descriptor bindings numBuffers+2t and numBuffers+2t+1).
+    virtual PxgPipelineHandle createPipelineTex(const void* /*code*/, size_t /*codeSize*/,
+                                                const char* /*entryName*/, uint32_t /*numBuffers*/,
+                                                const uint32_t* /*bufferStrides*/,
+                                                uint32_t /*pushConstantSize*/, uint32_t /*numTextures*/)
+    { return 0; }
+    virtual void dispatchTex(PxgPipelineHandle /*pipeline*/, uint32_t /*gridX*/, uint32_t /*gridY*/,
+                             uint32_t /*gridZ*/, const PxgBufferHandle* /*buffers*/, uint32_t /*numBuffers*/,
+                             const PxgTextureHandle* /*textures*/, uint32_t /*numTextures*/,
+                             const void* /*pushConstants*/, uint32_t /*pushConstantSize*/) {}
 };
 
 // Factory functions; each returns NULL when the backend is unavailable.

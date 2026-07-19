@@ -88,6 +88,8 @@ public:
                 vkDestroyBuffer(mDevice, kv.second.buffer, nullptr);
                 vkFreeMemory(mDevice, kv.second.memory, nullptr);
             }
+            for (auto& kv : mTextures)
+                releaseTexture(kv.second);
             for (auto& kv : mPipelines)
             {
                 vkDestroyPipeline(mDevice, kv.second.pipeline, nullptr);
@@ -472,13 +474,118 @@ public:
         }
     }
 
+    // ---- textures ----
+
+    PxgTextureHandle createTexture3D(uint32_t width, uint32_t height, uint32_t depth,
+                                     const float* texels) override
+    {
+        Texture tex;
+        tex.width = width;
+        tex.height = height;
+        tex.depth = depth;
+
+        VkImageCreateInfo imageInfo = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+        imageInfo.imageType = VK_IMAGE_TYPE_3D;
+        imageInfo.format = VK_FORMAT_R32_SFLOAT;
+        imageInfo.extent = { width, height, depth };
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        PXG_VK_CHECK(vkCreateImage(mDevice, &imageInfo, nullptr, &tex.image));
+
+        VkMemoryRequirements req;
+        vkGetImageMemoryRequirements(mDevice, tex.image, &req);
+        VkMemoryAllocateInfo alloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        alloc.allocationSize = req.size;
+        alloc.memoryTypeIndex = findMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        PXG_VK_CHECK(vkAllocateMemory(mDevice, &alloc, nullptr, &tex.memory));
+        PXG_VK_CHECK(vkBindImageMemory(mDevice, tex.image, tex.memory, 0));
+
+        // One-shot staging upload with the required layout transitions.
+        const size_t bytes = size_t(width) * height * depth * sizeof(float);
+        VkBuffer staging = VK_NULL_HANDLE;
+        VkDeviceMemory stagingMem = VK_NULL_HANDLE;
+        {
+            VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+            bi.size = bytes;
+            bi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            PXG_VK_CHECK(vkCreateBuffer(mDevice, &bi, nullptr, &staging));
+            VkMemoryRequirements sreq;
+            vkGetBufferMemoryRequirements(mDevice, staging, &sreq);
+            VkMemoryAllocateInfo sa = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+            sa.allocationSize = sreq.size;
+            sa.memoryTypeIndex = findMemoryType(
+                sreq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            PXG_VK_CHECK(vkAllocateMemory(mDevice, &sa, nullptr, &stagingMem));
+            PXG_VK_CHECK(vkBindBufferMemory(mDevice, staging, stagingMem, 0));
+            void* mapped = nullptr;
+            PXG_VK_CHECK(vkMapMemory(mDevice, stagingMem, 0, VK_WHOLE_SIZE, 0, &mapped));
+            memcpy(mapped, texels, bytes);
+            vkUnmapMemory(mDevice, stagingMem);
+        }
+
+        beginRecording();
+        imageBarrier(tex.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                     0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkBufferImageCopy region = {};
+        region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region.imageExtent = { width, height, depth };
+        vkCmdCopyBufferToImage(mCommandBuffer, staging, tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        imageBarrier(tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+        flush();
+
+        vkDestroyBuffer(mDevice, staging, nullptr);
+        vkFreeMemory(mDevice, stagingMem, nullptr);
+
+        VkImageViewCreateInfo viewInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        viewInfo.image = tex.image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
+        viewInfo.format = VK_FORMAT_R32_SFLOAT;
+        viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        PXG_VK_CHECK(vkCreateImageView(mDevice, &viewInfo, nullptr, &tex.view));
+
+        // The CUDA SDF sampler configuration: trilinear, clamp-to-edge,
+        // element-type reads, no mips.
+        VkSamplerCreateInfo samplerInfo = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        PXG_VK_CHECK(vkCreateSampler(mDevice, &samplerInfo, nullptr, &tex.sampler));
+
+        const PxgTextureHandle handle = mNextTextureHandle++;
+        mTextures[handle] = tex;
+        return handle;
+    }
+
+    void destroyTexture3D(PxgTextureHandle handle) override
+    {
+        auto it = mTextures.find(handle);
+        if (it == mTextures.end())
+            return;
+        flush();
+        vkDeviceWaitIdle(mDevice);
+        releaseTexture(it->second);
+        mTextures.erase(it);
+    }
+
     // ---- pipelines ----
 
     PxgPipelineHandle createPipeline(const void* code, size_t codeSize, const char* entryName,
                                      uint32_t numBuffers, const uint32_t* bufferStrides,
                                      uint32_t pushConstantSize) override
     {
-        return createPipelineInternal(code, codeSize, entryName, numBuffers, bufferStrides, pushConstantSize, 0);
+        return createPipelineInternal(code, codeSize, entryName, numBuffers, bufferStrides, pushConstantSize, 0, 0);
     }
 
     PxgPipelineHandle createPipelineEx(const void* code, size_t codeSize, const char* entryName,
@@ -490,7 +597,15 @@ public:
              requiredSubgroupSize > mSubgroupCaps.maxSize))
             return 0;
         return createPipelineInternal(code, codeSize, entryName, numBuffers, bufferStrides, pushConstantSize,
-                                      requiredSubgroupSize);
+                                      requiredSubgroupSize, 0);
+    }
+
+    PxgPipelineHandle createPipelineTex(const void* code, size_t codeSize, const char* entryName,
+                                        uint32_t numBuffers, const uint32_t* bufferStrides,
+                                        uint32_t pushConstantSize, uint32_t numTextures) override
+    {
+        return createPipelineInternal(code, codeSize, entryName, numBuffers, bufferStrides, pushConstantSize,
+                                      0, numTextures);
     }
 
     SubgroupCaps getSubgroupCaps() const override { return mSubgroupCaps; }
@@ -503,12 +618,14 @@ public:
 
     PxgPipelineHandle createPipelineInternal(const void* code, size_t codeSize, const char* entryName,
                                              uint32_t numBuffers, const uint32_t* bufferStrides,
-                                             uint32_t pushConstantSize, uint32_t requiredSubgroupSize)
+                                             uint32_t pushConstantSize, uint32_t requiredSubgroupSize,
+                                             uint32_t numTextures)
     {
         (void)bufferStrides; // SPIR-V carries the layout; strides are for D3D12
 
         Pipeline pipe = {};
         pipe.numBuffers = numBuffers;
+        pipe.numTextures = numTextures;
         pipe.pushConstantSize = pushConstantSize;
 
         VkShaderModuleCreateInfo moduleInfo = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
@@ -516,7 +633,11 @@ public:
         moduleInfo.pCode = reinterpret_cast<const uint32_t*>(code);
         PXG_VK_CHECK(vkCreateShaderModule(mDevice, &moduleInfo, nullptr, &pipe.module));
 
-        std::vector<VkDescriptorSetLayoutBinding> bindings(numBuffers);
+        // Storage buffers at 0..numBuffers-1; each texture is a sampled
+        // image + sampler pair right after (Slang emits Texture3D and
+        // SamplerState as separate descriptors in declaration order).
+        const uint32_t numBindings = numBuffers + 2 * numTextures;
+        std::vector<VkDescriptorSetLayoutBinding> bindings(numBindings);
         for (uint32_t i = 0; i < numBuffers; ++i)
         {
             bindings[i].binding = i;
@@ -524,9 +645,22 @@ public:
             bindings[i].descriptorCount = 1;
             bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
         }
+        for (uint32_t t = 0; t < numTextures; ++t)
+        {
+            VkDescriptorSetLayoutBinding& img = bindings[numBuffers + 2 * t];
+            img.binding = numBuffers + 2 * t;
+            img.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            img.descriptorCount = 1;
+            img.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            VkDescriptorSetLayoutBinding& smp = bindings[numBuffers + 2 * t + 1];
+            smp.binding = numBuffers + 2 * t + 1;
+            smp.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            smp.descriptorCount = 1;
+            smp.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
 
         VkDescriptorSetLayoutCreateInfo setLayoutInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
-        setLayoutInfo.bindingCount = numBuffers;
+        setLayoutInfo.bindingCount = numBindings;
         setLayoutInfo.pBindings = bindings.empty() ? nullptr : bindings.data();
         PXG_VK_CHECK(vkCreateDescriptorSetLayout(mDevice, &setLayoutInfo, nullptr, &pipe.setLayout));
 
@@ -591,16 +725,37 @@ public:
                   const PxgBufferHandle* buffers, uint32_t numBuffers,
                   const void* pushConstants, uint32_t pushConstantSize) override
     {
+        dispatchInternal(pipelineHandle, gridX, gridY, gridZ, buffers, numBuffers, nullptr, 0,
+                         pushConstants, pushConstantSize);
+    }
+
+    void dispatchTex(PxgPipelineHandle pipelineHandle, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
+                     const PxgBufferHandle* buffers, uint32_t numBuffers,
+                     const PxgTextureHandle* textures, uint32_t numTextures,
+                     const void* pushConstants, uint32_t pushConstantSize) override
+    {
+        dispatchInternal(pipelineHandle, gridX, gridY, gridZ, buffers, numBuffers, textures, numTextures,
+                         pushConstants, pushConstantSize);
+    }
+
+    void dispatchInternal(PxgPipelineHandle pipelineHandle, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
+                          const PxgBufferHandle* buffers, uint32_t numBuffers,
+                          const PxgTextureHandle* textures, uint32_t numTextures,
+                          const void* pushConstants, uint32_t pushConstantSize)
+    {
         Pipeline& pipe = mPipelines[pipelineHandle];
         assert(numBuffers == pipe.numBuffers);
+        assert(numTextures == pipe.numTextures);
         assert(pushConstantSize == pipe.pushConstantSize);
 
         beginRecording();
 
-        VkDescriptorSet set = allocateDescriptorSet(pipe.setLayout, numBuffers);
+        const uint32_t numBindings = numBuffers + 2 * numTextures;
+        VkDescriptorSet set = allocateDescriptorSet(pipe.setLayout, numBindings);
 
         std::vector<VkDescriptorBufferInfo> bufferInfos(numBuffers);
-        std::vector<VkWriteDescriptorSet> writes(numBuffers);
+        std::vector<VkDescriptorImageInfo> imageInfos(2 * numTextures);
+        std::vector<VkWriteDescriptorSet> writes(numBindings);
         for (uint32_t i = 0; i < numBuffers; ++i)
         {
             const Buffer& buf = mBuffers[buffers[i]];
@@ -615,11 +770,34 @@ public:
             writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[i].pBufferInfo = &bufferInfos[i];
         }
-        if (numBuffers > 0)
-            vkUpdateDescriptorSets(mDevice, numBuffers, writes.data(), 0, nullptr);
+        for (uint32_t t = 0; t < numTextures; ++t)
+        {
+            const Texture& tex = mTextures[textures[t]];
+            imageInfos[2 * t].imageView = tex.view;
+            imageInfos[2 * t].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfos[2 * t + 1].sampler = tex.sampler;
+
+            VkWriteDescriptorSet& wImg = writes[numBuffers + 2 * t];
+            wImg = VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            wImg.dstSet = set;
+            wImg.dstBinding = numBuffers + 2 * t;
+            wImg.descriptorCount = 1;
+            wImg.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            wImg.pImageInfo = &imageInfos[2 * t];
+
+            VkWriteDescriptorSet& wSmp = writes[numBuffers + 2 * t + 1];
+            wSmp = VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            wSmp.dstSet = set;
+            wSmp.dstBinding = numBuffers + 2 * t + 1;
+            wSmp.descriptorCount = 1;
+            wSmp.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            wSmp.pImageInfo = &imageInfos[2 * t + 1];
+        }
+        if (numBindings > 0)
+            vkUpdateDescriptorSets(mDevice, numBindings, writes.data(), 0, nullptr);
 
         vkCmdBindPipeline(mCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline);
-        if (numBuffers > 0)
+        if (numBindings > 0)
             vkCmdBindDescriptorSets(mCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.layout, 0, 1, &set, 0, nullptr);
         if (pushConstantSize > 0)
             vkCmdPushConstants(mCommandBuffer, pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantSize, pushConstants);
@@ -728,6 +906,15 @@ private:
         bool hostVisible = true;
     };
 
+    struct Texture
+    {
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        VkSampler sampler = VK_NULL_HANDLE;
+        uint32_t width = 0, height = 0, depth = 0;
+    };
+
     static const uint32_t kFramesInFlight = 4;
     static const size_t kStagingBytes = 8u * 1024u * 1024u;
 
@@ -752,6 +939,7 @@ private:
         VkPipelineLayout layout;
         VkPipeline pipeline;
         uint32_t numBuffers;
+        uint32_t numTextures;
         uint32_t pushConstantSize;
     };
 
@@ -814,6 +1002,34 @@ private:
         f.stagingMapped = static_cast<uint8_t*>(mapped);
     }
 
+    void imageBarrier(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout,
+                      VkAccessFlags srcAccess, VkAccessFlags dstAccess,
+                      VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage)
+    {
+        VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+        b.srcAccessMask = srcAccess;
+        b.dstAccessMask = dstAccess;
+        b.oldLayout = oldLayout;
+        b.newLayout = newLayout;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = image;
+        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        vkCmdPipelineBarrier(mCommandBuffer, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &b);
+    }
+
+    void releaseTexture(Texture& tex)
+    {
+        if (tex.sampler)
+            vkDestroySampler(mDevice, tex.sampler, nullptr);
+        if (tex.view)
+            vkDestroyImageView(mDevice, tex.view, nullptr);
+        if (tex.image)
+            vkDestroyImage(mDevice, tex.image, nullptr);
+        if (tex.memory)
+            vkFreeMemory(mDevice, tex.memory, nullptr);
+    }
+
     // Per-buffer memory dependency on the readback/upload edges
     // (RUNTIME_PLAN.md P1.3); compute<->compute ordering stays on the global
     // barrier() to match stream-ordered CUDA semantics.
@@ -838,14 +1054,18 @@ private:
         {
             if (f.currentPool == f.pools.size())
             {
-                VkDescriptorPoolSize poolSize = {};
-                poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                poolSize.descriptorCount = 1024;
+                VkDescriptorPoolSize poolSizes[3] = {};
+                poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                poolSizes[0].descriptorCount = 1024;
+                poolSizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                poolSizes[1].descriptorCount = 128;
+                poolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+                poolSizes[2].descriptorCount = 128;
 
                 VkDescriptorPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
                 poolInfo.maxSets = 256;
-                poolInfo.poolSizeCount = 1;
-                poolInfo.pPoolSizes = &poolSize;
+                poolInfo.poolSizeCount = 3;
+                poolInfo.pPoolSizes = poolSizes;
 
                 VkDescriptorPool pool;
                 PXG_VK_CHECK(vkCreateDescriptorPool(mDevice, &poolInfo, nullptr, &pool));
@@ -883,8 +1103,10 @@ private:
 
     std::unordered_map<PxgBufferHandle, Buffer> mBuffers;
     std::unordered_map<PxgPipelineHandle, Pipeline> mPipelines;
+    std::unordered_map<PxgTextureHandle, Texture> mTextures;
     PxgBufferHandle mNextBufferHandle = 1;
     PxgPipelineHandle mNextPipelineHandle = 1;
+    PxgTextureHandle mNextTextureHandle = 1;
 
     Frame mFrames[kFramesInFlight];
     uint32_t mFrameIndex = 0;

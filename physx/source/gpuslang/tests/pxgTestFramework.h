@@ -46,6 +46,7 @@ namespace pxgtest
 
 using physx::gpuslang::PxgBufferHandle;
 using physx::gpuslang::PxgPipelineHandle;
+using physx::gpuslang::PxgTextureHandle;
 using physx::gpuslang::PxgSlangComputeDevice;
 using physx::gpuslang::PxgSlangDeviceDesc;
 

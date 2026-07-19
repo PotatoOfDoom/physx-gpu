@@ -270,6 +270,20 @@ tests for the sub-allocator (fragmentation/deferred-free/resize properties).
   modes.  Native `VK_EXT_shader_atomic_float` fast paths (and the
   `red.global.add.f32` PTX site) remain a P6 perf item — the CAS forms
   are the semantic baseline.
+- **tex3D replacement SHIPPED**: `createTexture3D` (R32F volume, optimal
+  tiling, staged upload with layout transitions), trilinear clamp-to-edge
+  sampler, `createPipelineTex`/`dispatchTex` bind Texture3D+SamplerState
+  pairs after the storage buffers (Slang emits them as separate sampled
+  image + sampler descriptors).  Kernel-side convention: CUDA tex3D
+  unnormalized coordinates normalized by inverse extents (exact for
+  power-of-two dims).  Battery `npTex3d`: all voxel centers BITWISE
+  (frac==0 degenerates the filter on any conformant implementation) +
+  2048 arbitrary points incl. all six clamp faces against a double
+  trilinear reference (llvmpipe worst abs error 3.9e-07; tolerance 1e-4,
+  `PXG_TEX3D_TOL` override for fixed-point hardware filters in P5).
+  Mutants caught: coordinate half-offset, clamp-as-repeat.  As planned,
+  this path is a documented REPLACEMENT of CUDA tex3D (Vulkan does not
+  pin filter weight precision), not a bit-exact port.
 - Still open in P2.1/P2.2: `PXG_WARP_NATIVE` compile validation +
   hardware execution (P5), block-scope collectives (blockReduction /
   threadBlockScanExclusive family) which need workgroup barriers and are
