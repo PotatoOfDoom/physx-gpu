@@ -522,11 +522,36 @@ as soon as its kernels exist.
     replicated-word math and word-count conversions are correct).  A functional
     sub-word fill site needs a small fill compute shader (or a staged head/tail
     copy) added to the device layer.
-- Still open in P3/P4: the `PhysXGpuVulkan` C-ABI export library
-  (`PxCreatePhysXGpu`/`PxCreateCudaContextManager`/
-  `PxGetSuggestedCudaDeviceOrdinal`), the engine-source de-coupling of the
-  concrete wrangler/heap types, filling the manifest's pushConstantSize +
-  the 378 unmapped rows during per-module bring-up.
+- **P3.5 `PhysXGpuVulkan` C-ABI export library SHIPPED**: `bridge/PhysXGpuVulkan.cpp`
+  is the drop-in shared object the PhysX module loader dlopen's.  It exports all
+  the unmangled C symbols the loader dlsym's — the three mandatory ones the Linux
+  compatibility gate null-checks (`PxCreatePhysXGpu`, `PxCreateCudaContextManager`,
+  `PxGetSuggestedCudaDeviceOrdinal`), the profiler/foundation setters, and the
+  CUDART fatbin/function-table shims (inert: a SPIR-V world has no fatbins; the
+  bridge resolves kernels through the manifest).  `PxCreateCudaContextManager`
+  stands up a process Vulkan device + shim + enum-indexed manifest (env-resolved
+  SPIR-V loader) and returns the bridge manager; `PxGetSuggestedCudaDeviceOrdinal`
+  returns 0 when the device comes up.  `PxCreatePhysXGpu` returns a valid
+  `PxPhysXGpu` whose ~13 subsystem factories are stubs (see next bullet) — the
+  symbol must exist and return non-null or the loader disables GPU entirely.
+  Built as a SHARED compile-check target (`libPhysXGpuVulkan_64.so`, real PhysX
+  headers, no CUDA toolkit).  Test `p4Loader` dlopen's the built module, enforces
+  the SAME mandatory-symbol gate the engine applies, and drives the two
+  foundation-free exports (device bring-up via the ordinal, non-null PxPhysXGpu);
+  2 mutants caught.
+- **`CudaKernelWrangler.h` de-coupled from `<cuda.h>`** (one line: include
+  `cudamanager/PxCudaTypes.h` instead): the only cuda.h symbol the header uses is
+  `CUfunction`, which `PxCudaTypes.h` defines identically when the toolkit is
+  absent — so the real `KernelWrangler` header now compiles in the Vulkan config.
+- Still open in P4 (the concrete gpu-module suite on Vulkan — the big remaining
+  effort): `PxCreatePhysXGpu`'s ~13 subsystem factories (broadphase, AABB,
+  narrowphase, simulation controller, dynamics) each need their concrete `Pxg*`
+  type rebuilt on the Vulkan context — the `PxgPhysXGpu.cpp` `static_cast` sites
+  hard-type consumers to `PxgCudaKernelWranglerManager*`/`PxgHeapMemoryAllocatorManager*`,
+  so a Vulkan wrangler/heap manager must substitute for (derive from) those exact
+  types or the whole cast surface must be virtualized.  Plus filling the
+  manifest's `pushConstantSize` + the 378 unmapped rows during per-module
+  bring-up, then verification moves to real ScScene scenes.
 
 ## 4. Phase P3 — Orchestration shim (the CUDA-context replacement)
 

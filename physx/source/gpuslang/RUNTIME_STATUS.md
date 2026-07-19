@@ -46,12 +46,21 @@ shaderFloat64/Int64 yes; vulkanMemoryModel yes; 32 KiB shared.
   variants), multi-queue SubmissionContexts (P1 serializes on one queue in
   submission order).  Pipeline cache, copy/fill utilities, indirect dispatch,
   and timestamp queries are done.
-- **P3 tail / P4** — the real `PxCudaContext`/`PxCudaContextManager` virtual
-  wrappers forwarding onto the shim, the generated 501-entry kernel manifest,
-  and the `PhysXGpuVulkan` C-ABI bridge (`PxCreatePhysXGpu` /
-  `PxCreateCudaContextManager`).  These need the PhysX headers in the build
-  and move verification from harness batteries to real ScScene scenes — the
-  qualitative shift from isolated tranches to full-engine integration.
+- **P3 DONE** — the real `PxCudaContext`/`PxCudaContextManager` virtual wrappers
+  + kernel-wrangler forwarding onto the shim (P3.1/2/4, hardened per adversarial
+  review), the generated 501-entry kernel manifest (P4 manifest), and the
+  `PhysXGpuVulkan` C-ABI export library (P3.5: exports the loader's C symbols,
+  `PxCreateCudaContextManager` wired to the bridge, `p4Loader` dlopen test).
+  `CudaKernelWrangler.h` is de-coupled from `<cuda.h>`.  All against the real
+  PhysX headers with no CUDA toolkit.
+- **P4** — the concrete gpu-module suite on Vulkan: `PxCreatePhysXGpu`'s ~13
+  subsystem factories (broadphase / AABB / narrowphase / simulation controller /
+  dynamics) each need their concrete `Pxg*` type rebuilt on the Vulkan context
+  (the `PxgPhysXGpu.cpp` `static_cast` sites hard-type consumers to the concrete
+  wrangler/heap manager), plus the manifest's `pushConstantSize` + the 378
+  unmapped kernel rows filled during per-module bring-up.  This moves
+  verification from harness batteries to real ScScene scenes — the qualitative
+  shift from isolated tranches to full-engine integration.
 - **P5** — cross-vendor validation (NVIDIA/AMD RDNA+/Intel Xe+), per-device
   tex3D filter tolerance calibration.
 - **P6/P7** — async compute, indirect dispatch, DX12 backend, interop.
