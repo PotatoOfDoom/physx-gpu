@@ -75,6 +75,31 @@ physx::PxCudaContextManager* PxgCreateVulkanCudaContextManager(PxgSlangComputeDe
                                                                const PxgKernelDef* manifest,
                                                                uint32_t manifestCount);
 
+// Vulkan replacement for the engine's KernelWrangler: turns a kernel id
+// (PxgKernelIds::X, the manifest index) into the CUfunction the PxCudaContext
+// launches.  The returned handle is the SAME encoding this bridge's
+// moduleGetFunction produces, so a launch driven by
+//   ctx->launchKernel(wrangler.getFunction(id), ...)
+// resolves back to manifest[id] — the exact id -> launch path the engine's
+// getCuFunction(id) -> launchKernel path uses.  Unmapped (spirvFile == null)
+// or out-of-range ids return null.  Does not own the manifest.
+class PxgVulkanKernelWrangler
+{
+public:
+    PxgVulkanKernelWrangler(const PxgKernelDef* manifest, uint32_t count)
+        : mManifest(manifest), mCount(count) {}
+
+    CUfunction getFunction(uint32_t kernelId) const;          // null if unmapped
+    const char* getFunctionName(uint32_t kernelId) const;     // Slang entry, or null
+    bool isMapped(uint32_t kernelId) const;
+    uint32_t count() const { return mCount; }
+    uint32_t mappedCount() const;
+
+private:
+    const PxgKernelDef* mManifest;
+    uint32_t mCount;
+};
+
 } // namespace gpuslang
 } // namespace physx
 

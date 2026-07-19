@@ -405,6 +405,8 @@ pxg_compile_shader(npAtomicLib alAtomics)
 pxg_compile_shader(npTex3d tex3dSample)
 # RUNTIME_PLAN.md P3 shim proof kernel (nested BDA params).
 pxg_compile_shader(npShimAxpy shimAxpy)
+# RUNTIME_PLAN.md P3 launch-marshalling proof kernel (multi-arg natural alignment).
+pxg_compile_shader(npShimMisalign shimMisAdd)
 
 add_custom_target(gpuslang-shaders ALL DEPENDS ${PXG_SHADER_OUTPUTS})
 
@@ -701,6 +703,8 @@ add_executable(gpuslang-tests
     testP3CudaContext.cpp
     testP4Manifest.cpp
     testP3CudaContextManager.cpp
+    testP3KernelWrangler.cpp
+    testP3ContextHardening.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 # The P3.1 CUDA-context bridge builds against the real PhysX headers
@@ -730,7 +734,7 @@ foreach(suite scan radixSort radixSortGather preIntegration integration updateBo
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p4Manifest)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")

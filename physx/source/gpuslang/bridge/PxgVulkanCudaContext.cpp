@@ -71,6 +71,24 @@ inline PxCUresult toResult(PxgResult r)
 }
 inline PxCUresult okResult() { return PxCUresult(PxU32(PXG_CUDA_SUCCESS)); }
 inline PxCUresult invalidResult() { return PxCUresult(PxU32(PXG_CUDA_ERROR_INVALID_VALUE)); }
+inline PxCUresult oomResult() { return PxCUresult(PxU32(PXG_CUDA_ERROR_OUT_OF_MEMORY)); }
+
+// CUDA lays each kernel parameter out in the .param bank at its type's natural
+// alignment, which the driver reads from the compiled function signature
+// (cuLaunchKernel; see CudaContextManager.cpp:1165-1179).  The bridge only has
+// the argument size, from which the alignment is exact for scalars, pointers,
+// and power-of-two vector types — the argument kinds PhysX GPU launch sites
+// use.  (A by-value struct whose size is not a power of two — e.g. a 12-byte
+// float3 — would need its Slang push-constant field authored to match; PhysX
+// passes such aggregates by device pointer, not by value.)
+inline size_t paramAlign(size_t size)
+{
+    if (size >= 16) return 16;
+    if (size >= 8)  return 8;
+    if (size >= 4)  return 4;
+    if (size >= 2)  return 2;
+    return 1;
+}
 
 class PxgVulkanCudaContext : public physx::PxCudaContext
 {
@@ -86,42 +104,69 @@ public:
     // ---- memory ----
     PxCUresult memAlloc(CUdeviceptr* dptr, size_t bytesize) override
     {
+        if (mAbort) return mLastResult;
         PxgDevicePtr p = 0;
         const PxgResult r = mShim->memAlloc(&p, bytesize);
         if (dptr)
             *dptr = CUdeviceptr(p);
         return record(r);
     }
-    PxCUresult memFree(CUdeviceptr dptr) override { return record(mShim->memFree(PxgDevicePtr(dptr))); }
+    PxCUresult memFree(CUdeviceptr dptr) override
+    {
+        if (mAbort) return mLastResult;
+        return record(mShim->memFree(PxgDevicePtr(dptr)));
+    }
 
     PxCUresult memHostAlloc(void** pp, size_t bytesize, unsigned int /*Flags*/) override
     {
+        if (mAbort) return mLastResult;
         void* p = std::malloc(bytesize ? bytesize : 1);
         if (pp)
             *pp = p;
         return p ? record(PxgResult::Success) : record(PxgResult::OutOfMemory);
     }
-    PxCUresult memFreeHost(void* p) override { std::free(p); return record(PxgResult::Success); }
-    PxCUresult memHostGetDevicePointer(CUdeviceptr* /*pdptr*/, void* /*p*/, unsigned int /*Flags*/) override
+    PxCUresult memFreeHost(void* p) override
+    {
+        if (mAbort) return mLastResult;
+        std::free(p);
+        return record(PxgResult::Success);
+    }
+    PxCUresult memHostGetDevicePointer(CUdeviceptr* pdptr, void* p, unsigned int /*Flags*/) override
     {
         // Zero-copy mapped-host device pointers are not part of the P3 single-
-        // device model; callers use explicit staged copies instead.
-        return record(PxgResult::InvalidValue);
+        // device model; callers use explicit staged copies instead.  Write a
+        // null result so a caller that ignores the error code cannot read an
+        // uninitialised device address.  Like CudaCtx this does NOT touch
+        // mLastResult (so an unsupported call — even one made mid-abort — never
+        // clobbers the sticky abort/OOM state); a null host pointer mirrors the
+        // reference's SUCCESS path.  (P4: the engine's pinned-host paths that
+        // assume a mapped device pointer must be routed through explicit staged
+        // copies — see RUNTIME_PLAN.md.)
+        if (pdptr)
+            *pdptr = 0;
+        return p ? invalidResult() : okResult();
     }
 
     // ---- modules / functions ----
     PxCUresult moduleLoadDataEx(CUmodule* module, const void* /*image*/, unsigned int /*numOptions*/,
                                 PxCUjit_option* /*options*/, void** /*optionValues*/) override
     {
+        if (mAbort) return mLastResult;
         if (module)
             *module = sentinelModule();
         return record(PxgResult::Success);
     }
     PxCUresult moduleGetFunction(CUfunction* hfunc, CUmodule /*hmod*/, const char* name) override
     {
+        if (mAbort) return mLastResult;
         for (uint32_t i = 0; i < mManifestCount; ++i)
         {
-            if (mManifest[i].entry && name && std::strcmp(mManifest[i].entry, name) == 0)
+            // Require a compiled module (spirvFile), not just a reserved entry
+            // name, so name resolution agrees with the wrangler's launchability
+            // gate (PxgVulkanKernelWrangler::isMapped): a name is only handed a
+            // launchable handle if the kernel is actually mapped to SPIR-V.
+            if (mManifest[i].spirvFile && mManifest[i].entry && name &&
+                std::strcmp(mManifest[i].entry, name) == 0)
             {
                 if (hfunc)
                     *hfunc = toFunc(i);
@@ -135,6 +180,7 @@ public:
     // ---- streams ----
     PxCUresult streamCreate(CUstream* phStream, unsigned int /*Flags*/) override
     {
+        if (mAbort) return mLastResult;
         PxgStreamId id = 0;
         const PxgResult r = mShim->streamCreate(&id);
         if (phStream)
@@ -147,28 +193,34 @@ public:
     }
     PxCUresult streamFlush(CUstream hStream) override
     {
+        if (mAbort) return mLastResult;
         return record(mShim->streamSynchronize(fromStream(hStream)));
     }
     PxCUresult streamWaitEvent(CUstream hStream, CUevent hEvent, unsigned int /*Flags*/) override
     {
+        if (mAbort) return mLastResult;
         return record(mShim->streamWaitEvent(fromStream(hStream), fromEvent(hEvent)));
     }
     PxCUresult streamWaitEvent(CUstream hStream, CUevent hEvent) override
     {
+        if (mAbort) return mLastResult;
         return record(mShim->streamWaitEvent(fromStream(hStream), fromEvent(hEvent)));
     }
     PxCUresult streamDestroy(CUstream hStream) override
     {
+        if (mAbort) return mLastResult;
         return record(mShim->streamDestroy(fromStream(hStream)));
     }
     PxCUresult streamSynchronize(CUstream hStream) override
     {
+        if (mAbort) return mLastResult;
         return record(mShim->streamSynchronize(fromStream(hStream)));
     }
 
     // ---- events ----
     PxCUresult eventCreate(CUevent* phEvent, unsigned int /*Flags*/) override
     {
+        if (mAbort) return mLastResult;
         uint32_t id = 0;
         const PxgResult r = mShim->eventCreate(&id);
         if (phEvent)
@@ -177,14 +229,24 @@ public:
     }
     PxCUresult eventRecord(CUevent hEvent, CUstream hStream) override
     {
+        if (mAbort) return mLastResult;
         return record(mShim->eventRecord(fromEvent(hEvent), fromStream(hStream)));
     }
-    PxCUresult eventQuery(CUevent hEvent) override { return record(mShim->eventQuery(fromEvent(hEvent))); }
+    PxCUresult eventQuery(CUevent hEvent) override
+    {
+        if (mAbort) return mLastResult;
+        return record(mShim->eventQuery(fromEvent(hEvent)));
+    }
     PxCUresult eventSynchronize(CUevent hEvent) override
     {
+        if (mAbort) return mLastResult;
         return record(mShim->eventSynchronize(fromEvent(hEvent)));
     }
-    PxCUresult eventDestroy(CUevent hEvent) override { return record(mShim->eventDestroy(fromEvent(hEvent))); }
+    PxCUresult eventDestroy(CUevent hEvent) override
+    {
+        if (mAbort) return mLastResult;
+        return record(mShim->eventDestroy(fromEvent(hEvent)));
+    }
 
     // ---- launch ----
     PxCUresult launchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
@@ -193,19 +255,28 @@ public:
                             size_t kernelParamsSizeInBytes, void** /*extra*/, const char* /*file*/,
                             int /*line*/) override
     {
+        if (mAbort) return mLastResult;
         PxgKernelId id = 0;
         if (!fromFunc(f, &id))
             return record(PxgResult::InvalidValue);
 
-        // CUDA passes each argument as its own pointer and reads sizeof(arg)
-        // from the function signature; PhysX carries those sizes in the
-        // PxCudaKernelParam.size fields.  The Slang kernel receives one push-
-        // constant blob, so concatenate the arguments in declaration order —
-        // the identity copy for the common single-descriptor-struct kernel.
+        // CUDA hands each argument to the driver as its own pointer; the driver
+        // lays each out in the .param bank at the NATURAL alignment declared by
+        // the compiled function signature (CudaContextManager.cpp:1165-1179).
+        // The Slang kernel takes ONE push-constant blob whose struct fields use
+        // that same natural alignment, so reproduce CUDA's layout here: place
+        // each argument at its type alignment (paramAlign, reconstructed from
+        // the PxCudaKernelParam.size field).  Tight concatenation would misplace
+        // any argument that follows a smaller one (e.g. a device pointer after a
+        // PxU32), handing the kernel a shifted blob and a garbage buffer-device
+        // address.  For the single-descriptor-struct kernel (count == 1) the
+        // first argument starts at offset 0, so the blob is an identity copy.
         const uint32_t count = uint32_t(kernelParamsSizeInBytes / sizeof(PxCudaKernelParam));
         std::vector<uint8_t> blob;
         for (uint32_t i = 0; i < count; ++i)
         {
+            const size_t a = paramAlign(kernelParams[i].size);
+            blob.resize((blob.size() + (a - 1)) & ~(a - 1));   // pad to natural alignment
             const uint8_t* d = static_cast<const uint8_t*>(kernelParams[i].data);
             blob.insert(blob.end(), d, d + kernelParams[i].size);
         }
@@ -220,46 +291,56 @@ public:
         // The void** form carries no per-argument sizes, so the push-constant
         // blob cannot be assembled generically; PhysX GPU launches use the
         // PxCudaKernelParam form above.  (P4 revisits any void** call sites.)
+        if (mAbort) return mLastResult;
         return record(PxgResult::InvalidValue);
     }
 
     // ---- copies (async == sync: P3 serializes on one queue) ----
     PxCUresult memcpyDtoH(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount) override
     {
+        if (mAbort) return mLastResult;
         return record(mShim->memcpyDtoH(dstHost, PxgDevicePtr(srcDevice), ByteCount));
     }
     PxCUresult memcpyDtoHAsync(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount, CUstream /*hStream*/) override
     {
+        if (mAbort) return mLastResult;
         return record(mShim->memcpyDtoH(dstHost, PxgDevicePtr(srcDevice), ByteCount));
     }
     PxCUresult memcpyHtoD(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount) override
     {
+        if (mAbort) return mLastResult;
         return record(mShim->memcpyHtoD(PxgDevicePtr(dstDevice), srcHost, ByteCount));
     }
     PxCUresult memcpyHtoDAsync(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount, CUstream /*hStream*/) override
     {
+        if (mAbort) return mLastResult;
         return record(mShim->memcpyHtoD(PxgDevicePtr(dstDevice), srcHost, ByteCount));
     }
     PxCUresult memcpyDtoDAsync(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount, CUstream /*hStream*/) override
     {
+        if (mAbort) return mLastResult;
         return record(mShim->memcpyDtoD(PxgDevicePtr(dstDevice), PxgDevicePtr(srcDevice), ByteCount));
     }
     PxCUresult memcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount) override
     {
+        if (mAbort) return mLastResult;
         return record(mShim->memcpyDtoD(PxgDevicePtr(dstDevice), PxgDevicePtr(srcDevice), ByteCount));
     }
     PxCUresult memcpyPeerAsync(CUdeviceptr, CUcontext, CUdeviceptr, CUcontext, size_t, CUstream) override
     {
+        if (mAbort) return mLastResult;
         return record(PxgResult::InvalidValue); // single device: no peer copies
     }
 
     // ---- memset ----
     PxCUresult memsetD32Async(CUdeviceptr dstDevice, unsigned int ui, size_t N, CUstream /*hStream*/) override
     {
+        if (mAbort) return mLastResult;
         return record(mShim->memsetD32(PxgDevicePtr(dstDevice), ui, N));
     }
     PxCUresult memsetD32(CUdeviceptr dstDevice, unsigned int ui, size_t N) override
     {
+        if (mAbort) return mLastResult;
         return record(mShim->memsetD32(PxgDevicePtr(dstDevice), ui, N));
     }
     PxCUresult memsetD8Async(CUdeviceptr dstDevice, unsigned char uc, size_t N, CUstream /*hStream*/) override
@@ -268,8 +349,12 @@ public:
     }
     PxCUresult memsetD8(CUdeviceptr dstDevice, unsigned char uc, size_t N) override
     {
+        if (mAbort) return mLastResult;
         // vkCmdFillBuffer is 32-bit; a byte fill maps to it only when the run
-        // is 4-byte aligned (replicate the byte across the word).
+        // is 4-byte aligned (replicate the byte across the word).  Sub-word
+        // byte fills (unaligned address or count not a multiple of 4) are
+        // reported as InvalidValue rather than silently mis-filled — see
+        // RUNTIME_PLAN.md for the P4 sub-word fill path.
         if ((N % 4u) != 0u || (uint64_t(dstDevice) % 4u) != 0u)
             return record(PxgResult::InvalidValue);
         const uint32_t word = uint32_t(uc) * 0x01010101u;
@@ -277,6 +362,7 @@ public:
     }
     PxCUresult memsetD16(CUdeviceptr dstDevice, unsigned short uh, size_t N) override
     {
+        if (mAbort) return mLastResult;
         if ((N % 2u) != 0u || (uint64_t(dstDevice) % 4u) != 0u)
             return record(PxgResult::InvalidValue);
         const uint32_t word = (uint32_t(uh) << 16) | uint32_t(uh);
@@ -284,8 +370,18 @@ public:
     }
 
     // ---- misc ----
-    PxCUresult getLastError() override { return mLastResult; }
-    void setAbortMode(bool abort) override { mAbort = abort; }
+    // Matches CudaCtx::getLastError: in abort mode report OUT_OF_MEMORY (the
+    // sticky terminal state the engine polls for) rather than the last recorded
+    // op result, which a benign forwarded call could otherwise have cleared.
+    PxCUresult getLastError() override { return mAbort ? oomResult() : mLastResult; }
+    void setAbortMode(bool abort) override
+    {
+        mAbort = abort;
+        // When abort clears, recover from the sticky OUT_OF_MEMORY so the next
+        // getLastError() reads healthy again (matches CudaCtx::setAbortMode).
+        if (!abort && mLastResult.value == uint32_t(PXG_CUDA_ERROR_OUT_OF_MEMORY))
+            mLastResult = okResult();
+    }
     bool isInAbortMode() override { return mAbort; }
 
 private:
@@ -438,6 +534,37 @@ physx::PxCudaContextManager* PxgCreateVulkanCudaContextManager(PxgSlangComputeDe
                                                                uint32_t manifestCount)
 {
     return new PxgVulkanCudaContextManager(device, shim, manifest, manifestCount);
+}
+
+// ---- PxgVulkanKernelWrangler ----
+// getFunction uses the SAME id->CUfunction encoding as the anonymous-namespace
+// toFunc above (kernel id + 1 in the pointer bits), so a handle it returns
+// decodes back to manifest[id] inside PxgVulkanCudaContext::launchKernel.
+
+CUfunction PxgVulkanKernelWrangler::getFunction(uint32_t kernelId) const
+{
+    if (kernelId >= mCount || !mManifest[kernelId].spirvFile)
+        return nullptr;
+    return toFunc(kernelId);
+}
+
+const char* PxgVulkanKernelWrangler::getFunctionName(uint32_t kernelId) const
+{
+    return kernelId < mCount ? mManifest[kernelId].entry : nullptr;
+}
+
+bool PxgVulkanKernelWrangler::isMapped(uint32_t kernelId) const
+{
+    return kernelId < mCount && mManifest[kernelId].spirvFile != nullptr;
+}
+
+uint32_t PxgVulkanKernelWrangler::mappedCount() const
+{
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < mCount; ++i)
+        if (mManifest[i].spirvFile)
+            ++n;
+    return n;
 }
 
 } // namespace gpuslang

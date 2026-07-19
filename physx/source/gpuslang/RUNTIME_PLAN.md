@@ -468,10 +468,64 @@ as soon as its kernels exist.
   through the manager's context AND exercises the `allocDeviceBuffer`/`copyHToD`/
   `copyDToH` template helpers (which drive the `*Internal` virtuals) with an
   exact round-trip; both memory modes, 2 mutants caught.
-- Still open in P3/P4: a Vulkan kernel-wrangler (`KernelWrangler` replacement
-  resolving kernel IDs -> manifest entries), the `PhysXGpuVulkan` C-ABI export
-  library (`PxCreatePhysXGpu`/`PxCreateCudaContextManager`/
-  `PxGetSuggestedCudaDeviceOrdinal`), filling the manifest's pushConstantSize +
+- **P3.2 Vulkan kernel-wrangler SHIPPED**: `PxgVulkanKernelWrangler` (the
+  engine's `KernelWrangler` replacement) turns a kernel id (manifest index)
+  into the CUfunction the context launches, using the SAME encoding
+  moduleGetFunction produces — so `ctx->launchKernel(wrangler.getFunction(id))`
+  resolves back to manifest[id], the exact `getCuFunction(id) -> launchKernel`
+  path the engine uses.  Test `p3KernelWrangler` launches a kernel BY ID
+  end-to-end (bitwise correct), rejects unmapped/OOB ids, and — built over the
+  generated 501-entry registry manifest — resolves exactly 123/501 kernel ids
+  to a handle (ties the wrangler to the audited coverage); both modes, 2
+  mutants caught.  Engine-faithful integration note: the engine's
+  `CudaKernelWrangler.h` hard-includes `<cuda.h>` only for `CUfunction`
+  (which `PxCudaTypes.h` defines identically when cuda.h is absent), so a
+  one-line header de-coupling would let the real `KernelWrangler` build in the
+  Vulkan config; that (plus the concrete `PxgCudaKernelWranglerManager`
+  static_cast site) is the P4 engine-source step.
+- **P3.1 bridge HARDENED (adversarial review outcome)**: a review over the full
+  bridge (context + manager + wrangler) drove three fixes, each proved by a
+  teeth-bearing test (`p3ContextHardening`, both memory modes, 4 mutants caught):
+  1. **Multi-argument launch marshalling** now reproduces CUDA's natural-
+     alignment `.param` layout (the reference hands the driver per-arg pointers
+     and CUDA reads alignment from the compiled signature; `CudaContextManager.cpp:1165`).
+     The previous tight concatenation misplaced any argument following a smaller
+     one (e.g. a device pointer after a `PxU32`) — a garbage buffer-device
+     address on the common multi-arg launch sites.  `launchKernel` now aligns
+     each `PxCudaKernelParam` to its type alignment (`paramAlign`, from `.size`);
+     single-descriptor-struct kernels stay an identity copy.  Kernel
+     `npShimMisalign` (a uint64 value after a uint32) fails under tight packing,
+     passes under natural alignment.
+  2. **Abort mode** now matches `CudaCtx`: `getLastError()` reports
+     `OUT_OF_MEMORY` while aborted (was reporting the last op result — a false-
+     healthy read), every op no-ops in abort mode (returns the sticky result
+     without touching the GPU, so a post-allocation-failure abort stops the
+     cascade instead of launching against null device pointers), and clearing
+     abort recovers `mLastResult` from the sticky OOM.
+  3. **Name-resolution / launchability agreement**: `moduleGetFunction` now
+     requires a compiled `spirvFile`, not just a reserved `entry` name, so it
+     agrees with the wrangler's `isMapped()` gate — a not-yet-ported kernel
+     resolves to NotFound rather than a launchable-but-empty handle.
+- **P4 items surfaced by the review (design gaps, not bridge bugs)** — must be
+  resolved during per-module bring-up, before real-scene verification:
+  - **Mapped-host device pointers**: `memHostGetDevicePointer` is InvalidValue
+    in the P3 single-device model (it now writes a null result defensively).
+    The engine's pinned-host paths (`getMappedDevicePtr`, shape/geometry/AABB
+    managers) assume a valid mapped device address and do NOT gate on
+    `canMapHostMemory()`/`isIntegrated()` (both have zero engine consumers), so
+    those call sites must be routed through explicit staged copies — or the
+    bridge must back pinned host allocations with host-visible buffer-device-
+    address memory (ReBAR / `VK_EXT_external_memory_host`).
+  - **Sub-word memset**: `memsetD8`/`memsetD16` map onto 32-bit
+    `vkCmdFillBuffer`, so a byte/short fill with an unaligned address or a count
+    not a multiple of 4 is reported InvalidValue rather than mis-filled (the
+    replicated-word math and word-count conversions are correct).  A functional
+    sub-word fill site needs a small fill compute shader (or a staged head/tail
+    copy) added to the device layer.
+- Still open in P3/P4: the `PhysXGpuVulkan` C-ABI export library
+  (`PxCreatePhysXGpu`/`PxCreateCudaContextManager`/
+  `PxGetSuggestedCudaDeviceOrdinal`), the engine-source de-coupling of the
+  concrete wrangler/heap types, filling the manifest's pushConstantSize +
   the 378 unmapped rows during per-module bring-up.
 
 ## 4. Phase P3 — Orchestration shim (the CUDA-context replacement)
