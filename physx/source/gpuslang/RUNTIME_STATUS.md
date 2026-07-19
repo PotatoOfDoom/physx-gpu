@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **688/688** green in both modes.
+Test count: **694/694** green in both modes.
 
 ## Done
 
@@ -31,6 +31,10 @@ Test count: **688/688** green in both modes.
 | P3.1 PxCudaContext | dad70a6 | `bridge/PxgVulkanCudaContext` implements the REAL `physx::PxCudaContext` against actual PhysX headers (no CUDA toolkit); a Slang kernel runs end-to-end through the abstract interface. |
 | P3/P4 manifest | 8b55cbc | `tools/gen_kernel_manifest.py` -> generated `PxgSlangKernelManifest.h`; 501 registry kernels, 123 (24.6%) mapped to a ported Slang entry by exact name. |
 | P3.4 PxCudaContextManager | 1e13214 | `PxgVulkanCudaContextManager` implements the REAL `physx::PxCudaContextManager` (the object `PxSceneDesc::cudaContextManager` receives); hands out the context, reports device props, drives the deprecated `*Internal` buffer helpers. |
+| P3.5 C-ABI export | 1cbebd9 | `bridge/PhysXGpuVulkan.cpp`: the `libPhysXGpuVulkan_64.so` drop-in — exports the loader's C symbols (`PxCreateCudaContextManager` wired to the bridge, the CUDA function/module table getters, `PxGpuCreatePhysicsGpu`); `p4Loader` dlopen test. `CudaKernelWrangler.h` de-coupled from `<cuda.h>`. |
+| P4.1 foundation | 8f94208 | `physx-foundation` static lib (15 Fd*/unix files, PIC) built in the harness — the engine-build keystone: real PhysX engine `.cpp` files now compile+link against the bridge with no CUDA toolkit. `p4Foundation` creates a `PxFoundation` + `PX_NEW`/`PxArray`. |
+| P4.2 memory seam | c6a65eb | The REAL gpucommon `PxgHeapMemoryAllocatorManager` buddy allocator (unmodified engine code) runs over `PxgVulkanMemoryManager : PxsMemoryManager` on the Vulkan context; flat-address device allocs resolved at interior pointers. `p4Heap` roundtrips 6 device buffers. |
+| P4.3 wrangler seam | (this commit) | The REAL cudamanager `KernelWrangler` + gpucommon `PxgCudaKernelWranglerManager` (the exact concrete types the gpu-subsystem ctors demand) run over the Vulkan context. `PxgVulkanKernelTable.cpp` builds the live CUDA function table from the 123 mapped manifest rows; the wrangler ctor name-resolves every kernel through our `moduleGetFunction` -> `toFunc(id)=id+1`. `p4Wrangler` proves the engine wrangler resolves all 123 mapped registry kernels to our launch encoding — which also pins manifest↔gpucommon enum alignment and `entry==cudaName`. `PXG_NO_CUDA_TOOLKIT` guards the toolkit-only includes + CUDART shims in `CudaKernelWrangler.cpp`. |
 
 ## Empirical device profile (CI = llvmpipe, LLVM 20.1.2)
 
@@ -53,14 +57,21 @@ shaderFloat64/Int64 yes; vulkanMemoryModel yes; 32 KiB shared.
   `PxCreateCudaContextManager` wired to the bridge, `p4Loader` dlopen test).
   `CudaKernelWrangler.h` is de-coupled from `<cuda.h>`.  All against the real
   PhysX headers with no CUDA toolkit.
-- **P4** — the concrete gpu-module suite on Vulkan: `PxCreatePhysXGpu`'s ~13
-  subsystem factories (broadphase / AABB / narrowphase / simulation controller /
-  dynamics) each need their concrete `Pxg*` type rebuilt on the Vulkan context
-  (the `PxgPhysXGpu.cpp` `static_cast` sites hard-type consumers to the concrete
-  wrangler/heap manager), plus the manifest's `pushConstantSize` + the 378
-  unmapped kernel rows filled during per-module bring-up.  This moves
-  verification from harness batteries to real ScScene scenes — the qualitative
-  shift from isolated tranches to full-engine integration.
+- **P4** — full-engine integration.  The two load-bearing coupling seams the
+  `PxgPhysXGpu.cpp` `static_cast` sites demand are now CLOSED against the real,
+  unmodified engine code over the Vulkan context: the **memory manager**
+  (P4.2 — real `PxgHeapMemoryAllocatorManager` buddy allocator) and the
+  **kernel wrangler** (P4.3 — real `KernelWrangler` + `PxgCudaKernelWranglerManager`,
+  resolving all 123 mapped kernels to our launch encoding).  Remaining: the
+  concrete `Pxg*` subsystems (broadphase / AABB / narrowphase / simulation
+  controller / dynamics) rebuilt on the Vulkan context and driven through these
+  two seams; the ~10 direct CUDA-driver call-sites in the gpu modules
+  (`cuCtxGetStreamPriorityRange` ×5, the `cuTexObject` trio, `cuStreamQuery`, one
+  raw `cuLaunchKernel`, scattered `cuStreamSynchronize`/`cuMemcpyDtoH`); and the
+  manifest's `pushConstantSize` + the 378 unmapped kernel rows filled during
+  per-module bring-up.  This moves verification from harness batteries to real
+  ScScene scenes — the qualitative shift from isolated tranches to full-engine
+  integration.
 - **P5** — cross-vendor validation (NVIDIA/AMD RDNA+/Intel Xe+), per-device
   tex3D filter tolerance calibration.
 - **P6/P7** — async compute, indirect dispatch, DX12 backend, interop.

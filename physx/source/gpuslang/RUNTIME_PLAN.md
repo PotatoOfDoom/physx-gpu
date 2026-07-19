@@ -580,14 +580,35 @@ as soon as its kernels exist.
   checks distinctness, and frees them (1 mutant caught — a non-device host
   pointer fails the round-trip).  This is the first real engine-code-over-Vulkan
   integration.
-- Still open in P4 (per the de-risked plan): the wrangler seam (live
-  function-table exports + `getCuModules()` sentinel so the real `KernelWrangler`
-  populates `mCuFunctions[id]` with our `id+1` encoding, plus a one-line
-  `CudaKernelWrangler.cpp` toolkit guard), then the concrete `Pxg*` subsystems
+- **P4.3 kernel-wrangler seam SHIPPED**: the REAL cudamanager `KernelWrangler`
+  and gpucommon `PxgCudaKernelWranglerManager` (the exact concrete types the
+  `PxgPhysXGpu.cpp` subsystem ctors `static_cast` to) now run over the Vulkan
+  context with no engine edits to the wrangler logic.  Three glue pieces:
+  (1) `bridge/PxgVulkanKernelTable.cpp` supplies the live CUDA function table the
+  ctor name-scans — one `{moduleIndex=0, functionName=cudaName}` entry per MAPPED
+  manifest row (123 of 501), built lazily under a mutex; (2) the context's
+  `getCuModules()` returns a one-element non-null sentinel array (the ctor indexes
+  `[moduleIndex]` and passes the handle straight to `moduleGetFunction`, which
+  ignores it); (3) `CudaKernelWrangler.cpp` guards its toolkit-only includes and
+  the CUDART `__cudaRegister*` shim block behind `PXG_NO_CUDA_TOOLKIT` (the ctor
+  itself is unchanged and compiles in both builds).  The ctor's
+  `moduleGetFunction` returns `toFunc(id)=id+1`, so `mCuFunctions[id]` holds our
+  launch encoding — the exact `getCuFunction(id)` → `launchKernel` path every
+  `gpu*` launch site uses, now driven by real engine code.  Test `p4Wrangler`
+  proves the engine wrangler resolves all 123 mapped registry kernels to that
+  encoding, which simultaneously pins two invariants the seam depends on:
+  manifest↔gpucommon kernel-enum alignment, and `entry==cudaName` for every
+  mapped row (both independently re-verified: 501 rows, 123 mapped, 0
+  entry/cudaName mismatches, 0 duplicate names).  2 mutants caught (bridge
+  encoding `id+1`→`id+2` → 0/123; table row poison → 61/123).  The export's
+  `getGpuKernelWranglerManager` is now real (no longer a stub).
+- Still open in P4 (per the de-risked plan): the concrete `Pxg*` subsystems
   (broadphase, AABB, narrowphase, sim controller, dynamics) reused over the
-  Vulkan context, the ~10 direct-driver seams mopped up, the manifest's
-  `pushConstantSize` + the 378 unmapped rows filled during per-module bring-up,
-  and verification on real ScScene scenes.
+  Vulkan context and driven through the memory + wrangler seams; the ~10
+  direct-driver seams mopped up (`cuCtxGetStreamPriorityRange`, texture trio,
+  `cuStreamQuery`, raw `cuLaunchKernel`); the manifest's `pushConstantSize` + the
+  378 unmapped rows filled during per-module bring-up; and verification on real
+  ScScene scenes.
 
 ## 4. Phase P3 — Orchestration shim (the CUDA-context replacement)
 

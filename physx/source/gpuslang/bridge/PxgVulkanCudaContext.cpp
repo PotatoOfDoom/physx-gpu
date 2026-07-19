@@ -450,7 +450,16 @@ public:
         total = getDeviceTotalMemBytes();
         free = total;
     }
-    CUmodule* getCuModules() override { return nullptr; } // kernels are precompiled SPIR-V
+    CUmodule* getCuModules() override
+    {
+        // Kernels are precompiled SPIR-V, so there is no CUmodule table — but the
+        // engine's KernelWrangler ctor indexes getCuModules()[moduleIndex] (all
+        // moduleIndex==0 in our manifest-driven function table) and hands the
+        // result to moduleGetFunction, which ignores it.  Return a one-element
+        // array holding the non-null module sentinel so that read is valid.
+        static CUmodule sModule = reinterpret_cast<CUmodule>(uintptr_t(1));
+        return &sModule;
+    }
     void release() override { delete this; }
 
 protected:

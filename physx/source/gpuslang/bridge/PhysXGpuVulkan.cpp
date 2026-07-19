@@ -61,9 +61,11 @@
 #include "PxgSlangComputeDevice.h"    // gpuslang/include: PxgCreateVulkanComputeDevice
 #include "PxgSlangKernelManifest.h"   // gpuslang/include: generated enum-indexed registry manifest
 #include "PxgHeapMemAllocator.h"      // gpucommon: the REAL buddy heap allocator manager (reused)
+#include "PxgKernelWrangler.h"        // gpucommon: the REAL PxgCudaKernelWranglerManager (reused)
 
 #include "foundation/PxAllocator.h"   // PX_NEW
 #include "foundation/PxErrorCallback.h"
+#include "foundation/PxFoundation.h"  // PxGetErrorCallback
 
 #include <cstdint>
 #include <cstdio>
@@ -209,7 +211,17 @@ public:
     {
         return PX_NEW(PxgHeapMemoryAllocatorManager)(heapCapacity, memoryManager);
     }
-    PxsKernelWranglerManager* getGpuKernelWranglerManager(PxCudaContextManager*) PX_OVERRIDE { warnNotImplemented("getGpuKernelWranglerManager"); return NULL; }
+    // P4 wrangler seam (real): the REAL gpucommon PxgCudaKernelWranglerManager,
+    // whose KernelWrangler resolves each mapped kernel id to our toFunc(id)
+    // encoding via the live function table + our moduleGetFunction.  Cached for
+    // the process (single-context model) as the interface contract expects the
+    // same instance back and the singleton PxPhysXGpu owns it until process exit.
+    PxsKernelWranglerManager* getGpuKernelWranglerManager(PxCudaContextManager* cudaContextManager) PX_OVERRIDE
+    {
+        static PxsKernelWranglerManager* s =
+            PX_NEW(PxgCudaKernelWranglerManager)(*cudaContextManager, PxGetFoundation().getErrorCallback());
+        return s;
+    }
 
     Bp::BroadPhase* createGpuBroadPhase(const PxGpuBroadPhaseDesc&, PxsKernelWranglerManager*, PxCudaContextManager*,
                                         PxU32, const PxGpuDynamicsMemoryConfig&, PxsHeapMemoryAllocatorManager*, PxU64) PX_OVERRIDE { warnNotImplemented("createGpuBroadPhase"); return NULL; }
@@ -298,25 +310,9 @@ void** PxGpuCudaRegisterFatBinary(void* /*fatBin*/)
     return NULL;
 }
 
-physx::PxKernelIndex* PxGpuGetCudaFunctionTable()
-{
-    return NULL;
-}
-
-physx::PxU32 PxGpuGetCudaFunctionTableSize()
-{
-    return 0;
-}
-
-void** PxGpuGetCudaModuleTable()
-{
-    return NULL;
-}
-
-physx::PxU32 PxGpuGetCudaModuleTableSize()
-{
-    return 0;
-}
+// PxGpuGetCudaFunctionTable / ...Size / PxGpuGetCudaModuleTable / ...Size live in
+// PxgVulkanKernelTable.cpp — the function table is populated from the manifest so
+// the real engine KernelWrangler resolves the mapped kernels through our context.
 
 physx::PxPhysicsGpu* PxGpuCreatePhysicsGpu()
 {

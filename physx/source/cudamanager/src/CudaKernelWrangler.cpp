@@ -37,6 +37,14 @@
 #endif
 #include "PxPhysXGpu.h"
 
+// PXG_NO_CUDA_TOOLKIT (RUNTIME_PLAN.md P4): in the Vulkan / no-CUDA-toolkit build
+// this TU compiles without <cuda.h> and without the CUDART registration shims.
+// The KernelWrangler ctor below needs only CUmodule / CUfunction / PxCUresult /
+// CUDA_SUCCESS, which PxCudaTypes.h (via PxCudaContext.h) supplies as opaque
+// handles; the CUDART shim block at the end — only there to satisfy the
+// link-time dependencies of nvcc-compiled .cu object files, which do not exist
+// in a SPIR-V build — is guarded out.
+#ifndef PXG_NO_CUDA_TOOLKIT
 #if PX_LINUX && PX_CLANG
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdocumentation"
@@ -49,6 +57,9 @@
 
 #include <texture_types.h>
 #include <vector_types.h>
+#else
+#define CUDA_SUCCESS 0
+#endif
 
 #include "cudamanager/PxCudaContextManager.h"
 #include "cudamanager/PxCudaContext.h"
@@ -131,6 +142,7 @@ KernelWrangler::KernelWrangler(PxCudaContextManager& cudaContextManager, PxError
 	}
 }
 
+#ifndef PXG_NO_CUDA_TOOLKIT
 /*
  * Workaround hacks for using nvcc --compiler output object files
  * without linking with CUDART.  We must implement our own versions
@@ -221,7 +233,7 @@ struct cudaChannelFormatDesc CUDARTAPI cudaCreateChannelDesc(
 	return desc;
 }
 
-extern "C" 
+extern "C"
 cudaError_t CUDARTAPI __cudaPopCallConfiguration(
   dim3         *,
   dim3         *,
@@ -230,3 +242,4 @@ cudaError_t CUDARTAPI __cudaPopCallConfiguration(
 {
 	return cudaSuccess;
 }
+#endif // !PXG_NO_CUDA_TOOLKIT
