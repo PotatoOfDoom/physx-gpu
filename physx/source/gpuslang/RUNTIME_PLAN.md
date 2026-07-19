@@ -736,6 +736,24 @@ friction.
     garbage addresses.  So `gpu-sdk-step` asserts CONSTRUCTION and gates stepping behind
     `PXG_GPU_STEP` — the whole-scene step lights up only at the end of the phase, not
     incrementally.
+  - **Strategy decision — BDA rewrite (A), not generic descriptor-binding (B).**  Before
+    committing the phase to rewriting ~275 shaders, a feasibility spike weighed reusing the
+    descriptor-bound shaders unchanged by having the shim bind buffers from the engine's
+    launch pointers (B).  B is NOT viable: the engine passes most kernels an AGGREGATE
+    DESCRIPTOR STRUCT BY POINTER (e.g. `markCreatedPairsLaunch` gets one `bpDesc*`, whose
+    struct holds the device pointers to 9+ sub-buffers), and the descriptor-binding port
+    UNPACKED that struct into individually-bound buffers using layout knowledge the engine
+    never provides at launch.  A generic shim cannot reconstruct that unpacking without
+    per-kernel struct-layout metadata — more work, and silent-failure-prone, versus A.
+    (`translateAABBsLaunch` is the minority case that passes explicit buffers, and even
+    there they are bound in engine-param order — but the aggregate-struct-pointer pattern
+    dominates.)  BDA (A) handles this natively: the shader takes the same pointer the engine
+    passes and walks the nested pointers via `Ptr<T>`, mirroring the `.cu` exactly — which
+    is precisely what the P3 `npShimAxpy` proof kernel was built to validate ("pointers
+    embedded in aggregate parameter structs — PxgSoftBody, PxgParticleSystem, …").  So the
+    descriptor-binding form was only ever a test-harness convenience; the production launch
+    path was always BDA.  The phase proceeds A, tranche by tranche, each kernel bit-exact in
+    isolation, converting the shared `*Desc`-struct buffer access to BDA-pointer walks.
 
 ## 4. Phase P3 — Orchestration shim (the CUDA-context replacement)
 
