@@ -113,8 +113,24 @@ public:
                            const void* paramBlob, uint32_t paramBlobSize,
                            const PxgTextureHandle* textures = nullptr, uint32_t numTextures = 0);
 
-    // ---- synchronization (stream/event parity, single-queue in P3) ----
-    PxgResult streamSynchronize();   // flush + wait: CUstream sync on the one queue
+    // ---- streams & events (PxCudaContext stream*/event* parity) ----
+    // P3 runs every stream on ONE VkQueue in submission order (the P1
+    // correctness-first serialization), so a stream is a logical ordering
+    // handle and an event is a timeline ticket.  Cross-stream ordering is
+    // automatically satisfied by that serialization; true multi-queue async
+    // compute is deferred to P6.  streamSynchronize() (no arg) syncs the
+    // default stream.
+    PxgResult streamCreate(PxgStreamId* out);
+    PxgResult streamDestroy(PxgStreamId stream);
+    PxgResult streamSynchronize(PxgStreamId stream = 0);
+
+    // Event as a timeline ticket captured at record time.
+    PxgResult eventCreate(uint32_t* out);
+    PxgResult eventDestroy(uint32_t event);
+    PxgResult eventRecord(uint32_t event, PxgStreamId stream = 0);
+    PxgResult eventSynchronize(uint32_t event);
+    PxgResult eventQuery(uint32_t event);              // Success = complete, InvalidValue = pending
+    PxgResult streamWaitEvent(PxgStreamId stream, uint32_t event);
 
     // Address resolution helper (exposed for the geometry/SDF manager).
     bool resolve(PxgDevicePtr ptr, PxgBufferHandle* buffer, size_t* offset) const;
@@ -138,6 +154,14 @@ private:
     // upper_bound (the CUDA flat-address-space lookup).
     std::map<PxgDevicePtr, Alloc> mAllocs;
     std::unordered_map<PxgKernelId, PxgPipelineHandle> mPipelines;
+
+    // Stream/event bookkeeping.  Streams are logical handles (all serialize
+    // on the one queue); an event stores the submission ticket at record time.
+    std::unordered_map<PxgStreamId, bool> mStreams;   // id -> alive
+    std::unordered_map<uint32_t, uint64_t> mEvents;   // id -> recorded ticket
+    PxgStreamId mNextStream = 1;
+    uint32_t mNextEvent = 1;
+    uint64_t mLastLaunchTicket = 0;                   // ticket of the last submitted work
 };
 
 } // namespace gpuslang

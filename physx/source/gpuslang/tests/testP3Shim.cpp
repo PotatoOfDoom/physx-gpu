@@ -46,6 +46,7 @@ using namespace pxgtest;
 using physx::gpuslang::PxgCudaShim;
 using physx::gpuslang::PxgKernelDef;
 using physx::gpuslang::PxgDevicePtr;
+using physx::gpuslang::PxgStreamId;
 using physx::gpuslang::PxgResult;
 
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
@@ -171,6 +172,53 @@ PXG_TEST(p3Shim)
     shim.memcpyDtoH(outNow.data(), dout, N * 4);
     shim.memcpyDtoH(copied.data(), dcopy, N * 4);
     PXG_CHECK_MSG(std::memcmp(copied.data(), outNow.data(), N * 4) == 0, "DtoD copy is bitwise identical");
+
+    // Stream/event surface: run a launch and synchronize on it through the
+    // event API instead of streamSynchronize; the result must be visible
+    // after eventSynchronize, and eventQuery must then report completion.
+    {
+        PxgStreamId s1 = 0, s2 = 0;
+        PXG_CHECK_MSG(shim.streamCreate(&s1) == PxgResult::Success && s1 != 0, "streamCreate s1");
+        PXG_CHECK_MSG(shim.streamCreate(&s2) == PxgResult::Success && s2 != 0 && s2 != s1, "streamCreate s2");
+
+        uint32_t ev = 0;
+        PXG_CHECK_MSG(shim.eventCreate(&ev) == PxgResult::Success && ev != 0, "eventCreate");
+
+        PxgDevicePtr d2 = 0;
+        PXG_CHECK_MSG(shim.memAlloc(&d2, N * 4) == PxgResult::Success, "memAlloc stream out");
+        shim.memsetD32(d2, 0, N);
+        AxpyParams p2;      // dx/dy are still alive here (freed at the very end)
+        p2.bufs.x = dx;
+        p2.bufs.y = dy;
+        p2.bufs.out = d2;
+        p2.alpha = alpha;
+        p2.count = N;
+        PXG_CHECK_MSG(shim.launchKernel(0, (N + 63) / 64, 1, 1, &p2, sizeof(p2)) == PxgResult::Success,
+                      "launchKernel on stream");
+        PXG_CHECK_MSG(shim.eventRecord(ev, s1) == PxgResult::Success, "eventRecord");
+        // A second stream waiting on the event then a dependent sync: on the
+        // single serialized queue the dependency is already honored.
+        PXG_CHECK_MSG(shim.streamWaitEvent(s2, ev) == PxgResult::Success, "streamWaitEvent");
+        PXG_CHECK_MSG(shim.eventSynchronize(ev) == PxgResult::Success, "eventSynchronize");
+        PXG_CHECK_MSG(shim.eventQuery(ev) == PxgResult::Success, "eventQuery reports complete after sync");
+
+        std::vector<float> s(N, 0.f);
+        shim.memcpyDtoH(s.data(), d2, N * 4);
+        size_t sb = 0;
+        for (uint32_t i = 0; i < N; ++i)
+            if (f2u(alpha * x[i] + y[i]) != f2u(s[i]))
+                ++sb;
+        PXG_CHECK_MSG(sb == 0, "event-synchronized launch result is visible and correct (%zu bad)", sb);
+
+        // Negative handles.
+        PXG_CHECK_MSG(shim.eventSynchronize(9999) == PxgResult::NotFound, "eventSynchronize rejects bad handle");
+        PXG_CHECK_MSG(shim.streamDestroy(9999) == PxgResult::NotFound, "streamDestroy rejects bad handle");
+
+        shim.eventDestroy(ev);
+        shim.streamDestroy(s1);
+        shim.streamDestroy(s2);
+        shim.memFree(d2);
+    }
 
     // memFree parity: interior pointer must NOT free; base must.
     PXG_CHECK_MSG(shim.memFree(dx + 4) == PxgResult::NotFound, "memFree rejects an interior pointer");

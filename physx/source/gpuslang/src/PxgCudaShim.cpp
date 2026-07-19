@@ -189,9 +189,96 @@ PxgResult PxgCudaShim::launchKernel(PxgKernelId id, uint32_t gridX, uint32_t gri
     return PxgResult::Success;
 }
 
-PxgResult PxgCudaShim::streamSynchronize()
+// ---- streams & events ----
+
+PxgResult PxgCudaShim::streamCreate(PxgStreamId* out)
 {
+    if (!out)
+        return PxgResult::InvalidValue;
+    const PxgStreamId id = mNextStream++;
+    mStreams[id] = true;
+    *out = id;
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::streamDestroy(PxgStreamId stream)
+{
+    auto it = mStreams.find(stream);
+    if (it == mStreams.end())
+        return PxgResult::NotFound;
+    mStreams.erase(it);
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::streamSynchronize(PxgStreamId /*stream*/)
+{
+    // One queue: syncing any stream drains all recorded + submitted work.
     mDevice->flush();
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::eventCreate(uint32_t* out)
+{
+    if (!out)
+        return PxgResult::InvalidValue;
+    const uint32_t id = mNextEvent++;
+    mEvents[id] = 0;
+    *out = id;
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::eventDestroy(uint32_t event)
+{
+    auto it = mEvents.find(event);
+    if (it == mEvents.end())
+        return PxgResult::NotFound;
+    mEvents.erase(it);
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::eventRecord(uint32_t event, PxgStreamId /*stream*/)
+{
+    auto it = mEvents.find(event);
+    if (it == mEvents.end())
+        return PxgResult::NotFound;
+    // Enqueue a marker after all prior work: submit the recorded batch
+    // (non-blocking) and capture its ticket.  submit() with nothing recorded
+    // returns the most recent ticket, so back-to-back records are harmless.
+    const uint64_t ticket = mDevice->submit();
+    it->second = ticket;
+    mLastLaunchTicket = ticket;
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::eventSynchronize(uint32_t event)
+{
+    auto it = mEvents.find(event);
+    if (it == mEvents.end())
+        return PxgResult::NotFound;
+    mDevice->wait(it->second);
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::eventQuery(uint32_t event)
+{
+    auto it = mEvents.find(event);
+    if (it == mEvents.end())
+        return PxgResult::NotFound;
+    return mDevice->poll(it->second) ? PxgResult::Success : PxgResult::InvalidValue;
+}
+
+PxgResult PxgCudaShim::streamWaitEvent(PxgStreamId stream, uint32_t event)
+{
+    if (stream != 0 && mStreams.find(stream) == mStreams.end())
+        return PxgResult::NotFound;
+    auto it = mEvents.find(event);
+    if (it == mEvents.end())
+        return PxgResult::NotFound;
+    // The event's captured work was already submitted at record time; on the
+    // single serialized queue every later submission waits on the previous
+    // ticket (submit()'s stream ordering), so the cross-stream dependency is
+    // already satisfied — this validates the handles and is otherwise a
+    // no-op.  A real cross-queue wait lands with P6 async compute.
     return PxgResult::Success;
 }
 

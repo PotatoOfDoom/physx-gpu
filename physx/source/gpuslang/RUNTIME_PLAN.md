@@ -356,11 +356,24 @@ as soon as its kernels exist.
   Mutants caught: interval end-inclusive, missing predecessor step, and
   dropped HtoD/DtoH offsets (the last exposed and fixed a real coverage gap
   — all copies had used base pointers).  Green in both memory modes.
+- **Stream/event surface SHIPPED** (same shim): `streamCreate/Destroy`,
+  `eventCreate/Destroy/Record/Synchronize/Query`, `streamWaitEvent`,
+  `streamSynchronize(stream)` — the PxCudaContext stream*/event* parity.
+  P3 serializes every stream on ONE VkQueue in submission order (the P1
+  correctness-first design), so a stream is a logical ordering handle and
+  an event is a timeline ticket captured at record time; cross-stream
+  ordering is already satisfied by the submission-order serialization
+  (true multi-queue async compute is P6).  `eventRecord` submits the
+  recorded batch non-blocking and stores its ticket; `eventSynchronize` =
+  `wait(ticket)`, `eventQuery` = `poll(ticket)`.  Test extends `p3Shim`:
+  a launch synchronized through the event API (result visible + correct
+  after `eventSynchronize`, `eventQuery` then complete), a second stream
+  waiting on the event, and negative-handle rejection; mutants caught
+  (record captures a zero ticket, eventSynchronize skips its handle guard).
 - Still open in P3: the actual `PxCudaContext`/`PxCudaContextManager`
-  virtual wrappers forwarding onto this shim, stream/event objects
-  (multi-SubmissionContext), the generated 501-entry manifest, and the
-  `PhysXGpuVulkan` C-ABI bridge library — all needing the PhysX headers in
-  the build, landing with P4 module bring-up.
+  virtual wrappers forwarding onto this shim, the generated 501-entry
+  manifest, and the `PhysXGpuVulkan` C-ABI bridge library — all needing
+  the PhysX headers in the build, landing with P4 module bring-up.
 
 ## 4. Phase P3 — Orchestration shim (the CUDA-context replacement)
 
