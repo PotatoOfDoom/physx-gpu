@@ -35,6 +35,15 @@
 #if PX_SUPPORT_GPU_PHYSX
 
 #include "PxgCudaToolkitShim.h"
+#include "cudamanager/PxCudaContext.h"
+#include <cstdio>
+
+// The live PxCudaContext, registered by PxgVulkanCudaContext on construction, so the
+// raw (context-less) driver entry points below can route through the Vulkan bridge.
+namespace physx { namespace gpuslang {
+static physx::PxCudaContext* gDriverShimContext = nullptr;
+void pxgSetVulkanDriverContext(physx::PxCudaContext* ctx) { gDriverShimContext = ctx; }
+} }
 
 // cuCtxGetStreamPriorityRange: the engine calls this to pick a priority for
 // streamCreateWithPriority.  The Vulkan backend exposes a single compute queue
@@ -49,5 +58,58 @@ extern "C" CUresult cuCtxGetStreamPriorityRange(int* leastPriority, int* greates
         *greatestPriority = 0;
     return CUDA_SUCCESS;
 }
+
+// cuStreamQuery: report the stream's work complete.  The Vulkan submission model
+// drains a stream's work synchronously at the bridge's flush/synchronize points, so
+// by the time the engine polls, the work is done -> "ready".
+extern "C" CUresult cuStreamQuery(CUstream /*hStream*/)
+{
+    return CUDA_SUCCESS;
+}
+
+// Raw memcpys route through the live bridge context (interior flat-address resolve).
+extern "C" CUresult cuMemcpyDtoH(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount)
+{
+    if (!physx::gpuslang::gDriverShimContext) return CUDA_ERROR_NOT_READY;
+    return CUresult(physx::gpuslang::gDriverShimContext->memcpyDtoH(dstHost, srcDevice, ByteCount));
+}
+extern "C" CUresult cuMemcpyHtoD(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount)
+{
+    if (!physx::gpuslang::gDriverShimContext) return CUDA_ERROR_NOT_READY;
+    return CUresult(physx::gpuslang::gDriverShimContext->memcpyHtoD(dstDevice, srcHost, ByteCount));
+}
+extern "C" CUresult cuMemcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount)
+{
+    if (!physx::gpuslang::gDriverShimContext) return CUDA_ERROR_NOT_READY;
+    return CUresult(physx::gpuslang::gDriverShimContext->memcpyDtoD(dstDevice, srcDevice, ByteCount));
+}
+
+// --- Texture-object / CUDA-array API: SDF + heightfield 3D textures only.  These
+// are NOT on the rigid-body pipeline.  Backing them with real Vulkan sampled images
+// (via the gpuslang tex3D layer) is the SDF/heightfield bring-up; until then they
+// error clearly if a scene actually registers such geometry, rather than silently
+// returning bad handles. ---
+static CUresult pxgTextureNotWired(const char* what)
+{
+    std::fprintf(stderr,
+        "[PxgVulkan] %s is not yet wired (SDF/heightfield GPU textures); "
+        "rigid/convex geometry does not use this path.\n", what);
+    return CUDA_ERROR_NOT_READY;
+}
+extern "C" CUresult cuArray3DCreate(CUarray* pHandle, const CUDA_ARRAY3D_DESCRIPTOR*)
+{
+    if (pHandle) *pHandle = nullptr;
+    return pxgTextureNotWired("cuArray3DCreate");
+}
+extern "C" CUresult cuArrayDestroy(CUarray) { return CUDA_SUCCESS; }
+extern "C" CUresult cuTexObjectCreate(CUtexObject* pTexObject, const CUDA_RESOURCE_DESC*,
+                                      const CUDA_TEXTURE_DESC*, const CUDA_RESOURCE_VIEW_DESC*)
+{
+    if (pTexObject) *pTexObject = 0;
+    return pxgTextureNotWired("cuTexObjectCreate");
+}
+extern "C" CUresult cuTexObjectDestroy(CUtexObject) { return CUDA_SUCCESS; }
+extern "C" CUresult cuMemcpy3D(const CUDA_MEMCPY3D*) { return pxgTextureNotWired("cuMemcpy3D"); }
+extern "C" CUresult cuMemcpy3DAsync(const CUDA_MEMCPY3D*, CUstream) { return pxgTextureNotWired("cuMemcpy3DAsync"); }
 
 #endif // PX_SUPPORT_GPU_PHYSX

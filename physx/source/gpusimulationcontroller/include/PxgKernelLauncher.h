@@ -35,6 +35,13 @@
 #include "cudamanager/PxCudaContext.h"
 #include "foundation/PxString.h"
 
+// In the Vulkan / no-CUDA-toolkit build the wrangler header no longer transitively
+// pulls <cuda.h>, so the raw CUresult / CUDA_SUCCESS this header compares against
+// come from the driver-API shim instead.
+#ifdef PXG_NO_CUDA_TOOLKIT
+#include "PxgCudaToolkitShim.h"
+#endif
+
 #define KERNEL_LAUNCH_ERROR_CHECK 0
 
 namespace physx

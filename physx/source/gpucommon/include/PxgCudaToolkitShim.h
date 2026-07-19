@@ -89,6 +89,73 @@ typedef int CUresult;
 #define CU_MEMHOSTALLOC_WRITECOMBINED 0x4
 #endif
 
+// A few driver result codes the modules compare against by name (beyond
+// CUDA_SUCCESS).  Values mirror cuda.h's CUresult enum.
+#ifndef CUDA_ERROR_INVALID_VALUE
+#define CUDA_ERROR_INVALID_VALUE    1
+#define CUDA_ERROR_OUT_OF_MEMORY    2
+#define CUDA_ERROR_NOT_READY        600
+#endif
+
+// --- CUDA array / texture-object API (used by PxgGeometryManager for SDF and
+// heightfield 3D textures).  Structs/enums mirror cuda.h; only host-referenced
+// fields are reproduced.  The Vulkan backing lives in the gpuslang tex3D layer and
+// is wired during SDF/heightfield bring-up — these entry points are not on the
+// rigid-body pipeline, so the driver shim provides inert definitions for now. ---
+#ifndef PXG_SHIM_TEXTURE_API
+#define PXG_SHIM_TEXTURE_API
+typedef enum CUarray_format_enum {
+    CU_AD_FORMAT_UNSIGNED_INT8  = 0x01,
+    CU_AD_FORMAT_UNSIGNED_INT16 = 0x02,
+    CU_AD_FORMAT_UNSIGNED_INT32 = 0x03,
+    CU_AD_FORMAT_SIGNED_INT8    = 0x08,
+    CU_AD_FORMAT_SIGNED_INT16   = 0x09,
+    CU_AD_FORMAT_SIGNED_INT32   = 0x0a,
+    CU_AD_FORMAT_HALF           = 0x10,
+    CU_AD_FORMAT_FLOAT          = 0x20
+} CUarray_format;
+typedef enum CUaddress_mode_enum {
+    CU_TR_ADDRESS_MODE_WRAP = 0, CU_TR_ADDRESS_MODE_CLAMP = 1,
+    CU_TR_ADDRESS_MODE_MIRROR = 2, CU_TR_ADDRESS_MODE_BORDER = 3
+} CUaddress_mode;
+typedef enum CUfilter_mode_enum { CU_TR_FILTER_MODE_POINT = 0, CU_TR_FILTER_MODE_LINEAR = 1 } CUfilter_mode;
+typedef enum CUresourcetype_enum {
+    CU_RESOURCE_TYPE_ARRAY = 0, CU_RESOURCE_TYPE_MIPMAPPED_ARRAY = 1,
+    CU_RESOURCE_TYPE_LINEAR = 2, CU_RESOURCE_TYPE_PITCH2D = 3
+} CUresourcetype;
+typedef enum CUmemorytype_enum {
+    CU_MEMORYTYPE_HOST = 1, CU_MEMORYTYPE_DEVICE = 2, CU_MEMORYTYPE_ARRAY = 3, CU_MEMORYTYPE_UNIFIED = 4
+} CUmemorytype;
+#define CU_TRSF_READ_AS_INTEGER 1
+typedef struct CUDA_ARRAY3D_DESCRIPTOR_st {
+    size_t Width; size_t Height; size_t Depth;
+    CUarray_format Format; unsigned int NumChannels; unsigned int Flags;
+} CUDA_ARRAY3D_DESCRIPTOR;
+typedef struct CUDA_RESOURCE_DESC_st {
+    CUresourcetype resType;
+    union { struct { CUarray hArray; } array; struct { CUmipmappedArray hMipmappedArray; } mipmap;
+            struct { CUdeviceptr devPtr; CUarray_format format; unsigned int numChannels; size_t sizeInBytes; } linear;
+            struct { CUdeviceptr devPtr; CUarray_format format; unsigned int numChannels; size_t width, height, pitchInBytes; } pitch2D;
+            struct { int reserved[32]; } reserved; } res;
+    unsigned int flags;
+} CUDA_RESOURCE_DESC;
+typedef struct CUDA_TEXTURE_DESC_st {
+    CUaddress_mode addressMode[3]; CUfilter_mode filterMode; unsigned int flags;
+    unsigned int maxAnisotropy; CUfilter_mode mipmapFilterMode;
+    float mipmapLevelBias; float minMipmapLevelClamp; float maxMipmapLevelClamp;
+    float borderColor[4]; int reserved[12];
+} CUDA_TEXTURE_DESC;
+typedef struct CUDA_RESOURCE_VIEW_DESC_st { int format; size_t width, height, depth; unsigned int firstMipmapLevel, lastMipmapLevel, firstLayer, lastLayer, reserved[16]; } CUDA_RESOURCE_VIEW_DESC;
+typedef struct CUDA_MEMCPY3D_st {
+    size_t srcXInBytes, srcY, srcZ, srcLOD; CUmemorytype srcMemoryType;
+    const void* srcHost; CUdeviceptr srcDevice; CUarray srcArray; void* reserved0;
+    size_t srcPitch, srcHeight;
+    size_t dstXInBytes, dstY, dstZ, dstLOD; CUmemorytype dstMemoryType;
+    void* dstHost; CUdeviceptr dstDevice; CUarray dstArray; void* reserved1;
+    size_t dstPitch, dstHeight; size_t WidthInBytes, Height, Depth;
+} CUDA_MEMCPY3D;
+#endif // PXG_SHIM_TEXTURE_API
+
 // Direct CUDA-driver entry points the gpu modules call outside the PxCudaContext
 // virtual surface.  Defined by the Vulkan driver shim (bridge/PxgVulkanDriverShim.cpp).
 #ifdef __cplusplus
@@ -99,6 +166,24 @@ extern "C" {
 // priority for streamCreateWithPriority.  The Vulkan backend has a single compute
 // queue with no priority tiers; the shim reports a degenerate [0,0] range.
 CUresult cuCtxGetStreamPriorityRange(int* leastPriority, int* greatestPriority);
+
+// Raw memcpy / stream-query entry points a few modules call outside the context
+// surface.  The shim routes memcpys through the live PxCudaContext (registered by
+// PxgVulkanCudaContext); cuStreamQuery reports ready (the Vulkan submission model
+// drains synchronously).
+CUresult cuStreamQuery(CUstream hStream);
+CUresult cuMemcpyDtoH(void* dstHost, CUdeviceptr srcDevice, size_t ByteCount);
+CUresult cuMemcpyHtoD(CUdeviceptr dstDevice, const void* srcHost, size_t ByteCount);
+CUresult cuMemcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice, size_t ByteCount);
+
+// Texture-object / array entry points (SDF + heightfield only; see note above).
+CUresult cuArray3DCreate(CUarray* pHandle, const CUDA_ARRAY3D_DESCRIPTOR* pAllocateArray);
+CUresult cuArrayDestroy(CUarray hArray);
+CUresult cuTexObjectCreate(CUtexObject* pTexObject, const CUDA_RESOURCE_DESC* pResDesc,
+                           const CUDA_TEXTURE_DESC* pTexDesc, const CUDA_RESOURCE_VIEW_DESC* pResViewDesc);
+CUresult cuTexObjectDestroy(CUtexObject texObject);
+CUresult cuMemcpy3D(const CUDA_MEMCPY3D* pCopy);
+CUresult cuMemcpy3DAsync(const CUDA_MEMCPY3D* pCopy, CUstream hStream);
 
 #ifdef __cplusplus
 }

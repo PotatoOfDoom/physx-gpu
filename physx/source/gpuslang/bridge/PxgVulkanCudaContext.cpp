@@ -37,6 +37,10 @@ namespace physx
 namespace gpuslang
 {
 
+// Defined in bridge/PxgVulkanDriverShim.cpp: registers the live context so the raw
+// (context-less) CUDA-driver shim entry points can route memcpys through the bridge.
+void pxgSetVulkanDriverContext(physx::PxCudaContext* ctx);
+
 namespace
 {
 // ---- handle <-> shim id encodings (see header) ----
@@ -97,9 +101,12 @@ public:
         : mShim(shim), mManifest(manifest), mManifestCount(manifestCount)
     {
         mAllocatorCallback = nullptr;
+        // Register as the live context so the raw (context-less) CUDA-driver shim
+        // entry points (bridge/PxgVulkanDriverShim.cpp) route memcpys through us.
+        pxgSetVulkanDriverContext(this);
     }
 
-    void release() override { delete this; }
+    void release() override { pxgSetVulkanDriverContext(nullptr); delete this; }
 
     // ---- memory ----
     PxCUresult memAlloc(CUdeviceptr* dptr, size_t bytesize) override
