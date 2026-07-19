@@ -253,9 +253,19 @@ tests for the sub-allocator (fragmentation/deferred-free/resize properties).
   `savePipelineCache` removes a truncated blob on a short write; 4-byte
   alignment asserts on `fillBuffer`/`dispatchIndirect` offsets (the
   cuMemset/indirect-command contract).
-- Still open in P1/P6: specialization constants, timestamp queries,
-  SubmissionContexts (multi-stream; P1 serializes all work on one queue in
-  submission order), async compute (second queue).
+- **Timestamp queries SHIPPED** (P1.6): a per-device `VkQueryPool`
+  (TIMESTAMP), reset per recording batch, gated on the compute queue's
+  `timestampValidBits` and a nonzero `timestampPeriod`.  `writeTimestamp()`
+  records a bottom-of-pipe timestamp and returns its index;
+  `getTimestampNanos(begin, end)` reads the pair after retirement and returns
+  elapsed ns via masked modular subtraction ordered by query index (wrap-safe,
+  argument-order-independent).  Test `p1Timestamps`: a dispatch bracketed by
+  two timestamps yields a non-negative, finite ns count (~1.1 ms on llvmpipe),
+  index monotonicity holds, symmetry holds, and out-of-range indices are
+  rejected; mutants caught (index not advancing, reversed subtraction).
+- Still open in P1/P6: specialization constants, SubmissionContexts
+  (multi-stream; P1 serializes all work on one queue in submission order),
+  async compute (second queue).
 
 
 ### P2.1 progress

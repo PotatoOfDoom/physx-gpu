@@ -107,6 +107,8 @@ public:
                     vkFreeMemory(mDevice, frame.stagingMemory, nullptr);
                 }
             }
+            if (mQueryPool)
+                vkDestroyQueryPool(mDevice, mQueryPool, nullptr);
             if (mPipelineCache)
             {
                 savePipelineCache();
@@ -181,6 +183,7 @@ public:
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(mPhysicalDevice, &props);
         mDeviceName = props.deviceName;
+        mTimestampPeriod = props.limits.timestampPeriod;   // ns per tick, 0 => timestamps unusable
 
         // ---- queue family ----
         uint32_t queueFamilyCount = 0;
@@ -194,6 +197,7 @@ public:
             if (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT)
             {
                 mQueueFamily = i;
+                mTimestampValidBits = families[i].timestampValidBits;
                 break;
             }
         }
@@ -309,6 +313,17 @@ public:
         mDesc = desc;
         if (desc.pipelineCachePath)
             mPipelineCachePath = desc.pipelineCachePath;
+
+        // Timestamp query pool for per-stage GPU timing.  Only usable when the
+        // compute queue reports valid timestamp bits and a nonzero period.
+        if (mTimestampValidBits > 0 && mTimestampPeriod > 0.0f)
+        {
+            VkQueryPoolCreateInfo qpInfo = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+            qpInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qpInfo.queryCount = kMaxTimestamps;
+            if (vkCreateQueryPool(mDevice, &qpInfo, nullptr, &mQueryPool) == VK_SUCCESS)
+                mHasTimestamps = true;
+        }
 
         // Pipeline cache: seed from the on-disk blob when present.  An invalid
         // or foreign blob is rejected by the driver's header check, which
@@ -900,6 +915,44 @@ public:
 
     bool supportsIndirectDispatch() const override { return true; }
 
+    bool supportsTimestamps() const override { return mHasTimestamps; }
+
+    uint32_t writeTimestamp() override
+    {
+        if (!mHasTimestamps || mTimestampCount >= kMaxTimestamps)
+            return 0xffffffffu;
+        beginRecording();
+        const uint32_t idx = mTimestampCount++;
+        // Bottom-of-pipe: the timestamp is written once all prior commands
+        // have completed, so a begin/end pair brackets the work between them.
+        vkCmdWriteTimestamp(mCommandBuffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, mQueryPool, idx);
+        return idx;
+    }
+
+    double getTimestampNanos(uint32_t begin, uint32_t end) override
+    {
+        if (!mHasTimestamps || begin == 0xffffffffu || end == 0xffffffffu ||
+            begin >= kMaxTimestamps || end >= kMaxTimestamps)
+            return -1.0;
+        // The lower query index was written earlier in the stream, so its
+        // tick is the earlier time; masked modular subtraction (late - early)
+        // yields the elapsed ticks and is correct across a counter wrap.  The
+        // result is therefore independent of the argument order.
+        const uint32_t lo = begin < end ? begin : end;
+        const uint32_t hi = begin < end ? end : begin;
+        const uint32_t count = hi - lo + 1u;
+        std::vector<uint64_t> results(count, 0);
+        if (vkGetQueryPoolResults(mDevice, mQueryPool, lo, count, count * sizeof(uint64_t),
+                                  results.data(), sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) != VK_SUCCESS)
+            return -1.0;
+        const uint64_t mask = mTimestampValidBits >= 64 ? ~0ull : ((1ull << mTimestampValidBits) - 1ull);
+        const uint64_t early = results[0] & mask;
+        const uint64_t late = results[count - 1] & mask;
+        const uint64_t diff = (late - early) & mask;
+        return double(diff) * double(mTimestampPeriod);
+    }
+
     void dispatchIndirect(PxgPipelineHandle pipelineHandle, PxgBufferHandle argBuffer, size_t argOffset,
                           const PxgBufferHandle* buffers, uint32_t numBuffers,
                           const void* pushConstants, uint32_t pushConstantSize) override
@@ -1118,6 +1171,13 @@ private:
         VkCommandBufferBeginInfo beginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         PXG_VK_CHECK(vkBeginCommandBuffer(mCommandBuffer, &beginInfo));
+        // Timestamps are recorded per batch: reset the whole pool up front so
+        // query indices restart at 0 for this recording.
+        if (mHasTimestamps)
+        {
+            vkCmdResetQueryPool(mCommandBuffer, mQueryPool, 0, kMaxTimestamps);
+            mTimestampCount = 0;
+        }
         mRecording = true;
     }
 
@@ -1283,6 +1343,13 @@ private:
     PxgSlangDeviceDesc mDesc;
     VkPipelineCache mPipelineCache = VK_NULL_HANDLE;
     std::string mPipelineCachePath;
+
+    static const uint32_t kMaxTimestamps = 256;
+    VkQueryPool mQueryPool = VK_NULL_HANDLE;
+    bool mHasTimestamps = false;
+    uint32_t mTimestampCount = 0;
+    uint32_t mTimestampValidBits = 0;
+    float mTimestampPeriod = 0.0f;
 
     bool mRecording = false;
     bool mHasShaderInt64 = false;

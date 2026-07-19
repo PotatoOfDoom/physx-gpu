@@ -141,6 +141,17 @@ public:
                                   uint32_t /*pushConstantSize*/) {}
     virtual bool supportsIndirectDispatch() const { return false; }
 
+    // ---- GPU timestamps (per-stage timing, RUNTIME_PLAN.md P1.6) ----
+    // writeTimestamp() records a GPU timestamp at the current point in the
+    // recorded stream and returns its query index (UINT32_MAX if
+    // unsupported).  After the work is submitted and retired (flush / wait),
+    // getTimestampNanos(a, b) returns the elapsed nanoseconds between two
+    // recorded timestamps.  Query indices are valid only until the next
+    // recording batch begins (the pool is reset per batch).
+    virtual bool supportsTimestamps() const { return false; }
+    virtual uint32_t writeTimestamp() { return 0xffffffffu; }
+    virtual double getTimestampNanos(uint32_t /*begin*/, uint32_t /*end*/) { return -1.0; }
+
     // Compute->compute execution + memory barrier between recorded dispatches
     // (the ordering CUDA guarantees implicitly on a single stream).
     virtual void barrier() = 0;
