@@ -687,20 +687,41 @@ friction.
   context; `cuStreamQuery`→ready; the `CUDA_ERROR_*` codes), **all ~50 GPU host
   `.cpp` compile no-toolkit too** — the whole engine (CPU + GPU) now assembles
   against the Vulkan bridge.
-- **Remaining to a GPU scene stepping on Vulkan** (precisely de-risked, mechanical
-  except the last item): (1) copy the ~6 concrete subsystem factory bodies from
-  `PxgPhysXGpu.cpp` into `bridge/PhysXGpuVulkan.cpp` (they currently `return NULL`;
-  the concrete types all compile+link now); (2) extend the harness CMake to
-  statically link the GPU host modules + the bridge + the 2-file `gpuslang-backend`
-  (Vulkan device) + the compiled shaders into the SDK test; (3) create a
-  GPU-enabled `PxScene` (`cudaContextManager` = the Vulkan bridge, `eENABLE_GPU_
-  DYNAMICS`, `broadPhaseType eGPU`) — the scene now supplies the `PxsContext` /
-  `IslandSim` the narrowphase/dynamics/sim-controller ctors demanded, so the P4.6
-  wall dissolves; (4) the one genuine frontier: the per-kernel launch marshalling
-  (the CUDA param pack → Slang binding reconciliation, e.g. the 4-vs-5 binding
-  case seen in `interleaveBuffers`) + filling the manifest `pushConstantSize` for
-  the rigid-body pipeline kernels, so `simulate()` launches them correctly.  Steps
-  (1)–(3) construct the GPU pipeline over Vulkan; step (4) makes it actually run.
+- **P5 milestone B SHIPPED (`gpu-sdk-step`, commit 9affdee)** — steps (1)–(3) done:
+  (1) the 6 concrete subsystem factories in `bridge/PhysXGpuVulkan.cpp` now
+  placement-new the real `Pxg*` types verbatim as `PxgPhysXGpu.cpp`; (2) the harness
+  links `physx-gpuhost` (all 48 gpu\* host `.cpp` + the bridge + `gpuslang-backend`)
+  statically against the CPU SDK — the `#if !PX_PHYSX_GPU_EXPORTS` CUDA cubin
+  force-linkage glue (`init*Kernels*`) is gated out by building with
+  `PX_PHYSX_GPU_EXPORTS`, and `physx/src/gpu/PxGpu.cpp` is excluded so its `extern "C"`
+  `PxCreateCudaContextManager` does not collide with the bridge's; (3) a `PxScene`
+  with the Vulkan `cudaContextManager` + `eENABLE_GPU_DYNAMICS` + `eGPU` broadphase +
+  TGS **constructs the whole `Pxg*` pipeline live over Vulkan** (llvmpipe), two actors
+  add, and `simulate()`/`fetchResults()` drive the real GPU broadphase to the first
+  kernel launch.  `PxvGetPhysXGpu` is pointed at the static bridge factory by
+  pre-setting `g_PxCreatePhysXGpu_Func` (the Linux module loader would otherwise
+  `dlopen` libcuda).
+- **The one genuine frontier — step (4), the per-kernel launch-ABI reconciliation
+  (P5 Step 4, a multi-tranche phase, NOT mechanical).**  Concretely characterized at
+  the first launch (`MemCopyBalanced`): the shim (`PxgCudaShim::launchKernel`) rejects
+  every launch with `InvalidValue` because `paramBlobSize != manifest[id].pushConstantSize`
+  and the bridge manifest sets **all** `pushConstantSize = 0`.  Filling those sizes is
+  necessary but not sufficient — there is a deeper **ABI split**: the shim builds
+  pipelines with **zero descriptor bindings, pure BDA** (`PxgCudaShim.cpp:161` — "every
+  buffer argument travels as a device address inside the parameter blob"), matching the
+  engine's CUDA call convention (raw device pointers packed into the param blob, e.g.
+  `PxgCopyManager::dispatchCopy` passes `(CopyDesc* descsGPU, numDescs)`).  But most
+  rigid-pipeline **shaders were ported for the isolated test harness in the
+  descriptor-binding style** — `memCopy.slang` binds `gCopyDst`/`gCopySrc` storage
+  buffers and stores byte *offsets* in the descriptor, not the raw pointers the engine
+  writes.  So step (4) is, per rigid-path kernel: (a) fill `manifest[id].pushConstantSize`
+  (+ `numTextures`); (b) re-express the shader's buffer access to the BDA push-constant
+  model so the engine's pointer-passing convention drives it unchanged (the P0 BDA spike
+  + the P3 `npShimAxpy`/`npShimMisalign` proof kernels already validate this model); (c)
+  verify the bridge's natural-alignment param blob matches the shader's push-constant
+  struct.  This is the qualitative shift from "the pipeline is built" to "the kernels
+  run", and it is genuinely the size of a phase — dozens of rigid kernels
+  (broadphase → AABB → narrowphase → solver → integration), each bit-exact-verified.
 
 ## 4. Phase P3 — Orchestration shim (the CUDA-context replacement)
 
