@@ -295,10 +295,19 @@ tests for the sub-allocator (fragmentation/deferred-free/resize properties).
   Mutants caught: coordinate half-offset, clamp-as-repeat.  As planned,
   this path is a documented REPLACEMENT of CUDA tex3D (Vulkan does not
   pin filter weight precision), not a bit-exact port.
-- Still open in P2.1/P2.2: `PXG_WARP_NATIVE` compile validation +
-  hardware execution (P5), block-scope collectives (blockReduction /
-  threadBlockScanExclusive family) which need workgroup barriers and are
-  ported with their kernels.
+- **P2.1 native-path compile validation SHIPPED**: `npWarpNative.slang`
+  (`PXG_WARP_NATIVE=1`) calls every native-lowering primitive so slangc +
+  spirv-val + driver pipeline creation exercise the WaveShuffle /
+  WaveActiveBallot lowerings the emulation battery cannot reach.  SPIR-V
+  validates with GroupNonUniform/Shuffle/Ballot capabilities; test
+  `warpNative` proves the driver accepts and dispatches the native module
+  (and builds it at required-32 where the device allows).  Teeth: a broken
+  native intrinsic fails the native compile while the emulation path still
+  builds.  Hardware execution of the 32-lane semantics stays P5 (llvmpipe
+  fixed at 8).
+- Still open in P2.1/P2.2: native-path **hardware execution** (P5),
+  block-scope collectives (blockReduction / threadBlockScanExclusive
+  family) which need workgroup barriers and are ported with their kernels.
 
 ## 3. Phase P2 — Kernel completion (the non-portable remainder)
 
