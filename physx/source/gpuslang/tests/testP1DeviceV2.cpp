@@ -97,6 +97,48 @@ PXG_TEST(p1DeviceV2)
         dev->destroyBuffer(b);
     }
 
+    // --- device-side fill + copy (cuMemsetD32 / cuMemcpyDtoD parity) ---
+    {
+        const uint32_t N = 8192;
+        std::vector<uint32_t> seed(N);
+        for (uint32_t i = 0; i < N; ++i)
+            seed[i] = i * 2246822519u + 1u;
+        PxgBufferHandle a = createBufferFrom(dev.get(), seed);
+        PxgBufferHandle b = dev->createBuffer(N * 4);
+
+        // fillBuffer over a sub-range: [1024, 3072) set to a sentinel, ends
+        // untouched.
+        dev->fillBuffer(b, 0, 0u, N * 4);
+        dev->fillBuffer(b, 1024 * 4, 0xdeadbeefu, 2048 * 4);
+        std::vector<uint32_t> fb(N);
+        dev->download(b, fb.data(), N * 4);
+        size_t fbad = 0;
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            const uint32_t want = (i >= 1024 && i < 1024 + 2048) ? 0xdeadbeefu : 0u;
+            if (fb[i] != want)
+                ++fbad;
+        }
+        PXG_CHECK_MSG(fbad == 0, "fillBuffer sets exactly the requested sub-range (%zu bad)", fbad);
+
+        // copyBuffer a sub-range of a into the middle of b, offsets differ.
+        dev->fillBuffer(b, 0, 0u, N * 4);
+        dev->copyBuffer(b, 512 * 4, a, 256 * 4, 4096 * 4);
+        std::vector<uint32_t> cb(N);
+        dev->download(b, cb.data(), N * 4);
+        size_t cbad = 0;
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            const uint32_t want = (i >= 512 && i < 512 + 4096) ? seed[256 + (i - 512)] : 0u;
+            if (cb[i] != want)
+                ++cbad;
+        }
+        PXG_CHECK_MSG(cbad == 0, "copyBuffer moves exactly the requested range at both offsets (%zu bad)", cbad);
+
+        dev->destroyBuffer(a);
+        dev->destroyBuffer(b);
+    }
+
     // --- dispatch through device-local storage + ticket semantics ---
     {
         const uint32_t N = 4096;

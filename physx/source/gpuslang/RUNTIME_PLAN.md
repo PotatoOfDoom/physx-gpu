@@ -214,10 +214,21 @@ tests for the sub-allocator (fragmentation/deferred-free/resize properties).
   `vkWaitSemaphores` HOST waits and false-positives WAW on staging-ring
   reuse; a fence-based probe of the identical pattern is clean (layer
   limitation, fixed in newer layers).
+- **P1.6 copy/fill utilities SHIPPED**: `copyBuffer` (`vkCmdCopyBuffer`,
+  cuMemcpyDtoD parity) and `fillBuffer` (`vkCmdFillBuffer`, cuMemsetD32
+  parity) recorded into the current stream with compute<->transfer
+  barriers; the shim's `memcpyDtoD`/`memsetD32` now route through them
+  instead of host-staging.  Base-class defaults host-stage so backends
+  without a device path still work.  This surfaced and fixed a latent
+  stream-ordering gap: host-visible `upload`/`download` now drain prior
+  recorded/in-flight GPU work first (cuMemcpyHtoD/DtoH are stream-ordered)
+  so a recorded fill/copy/dispatch cannot race a direct host map — cheap
+  when idle.  Coverage: `p1DeviceV2` gains sub-range fill + offset copy
+  checks (both memory modes); mutants caught (copy offset swap, fill
+  offset dropped, download-without-flush regression).
 - Still open in P1: pipeline cache on disk, specialization constants,
-  `vkCmdFillBuffer`/copy utilities (memset/DtoD parity), timestamp
-  queries, SubmissionContexts (multi-stream; P1 serializes all work on
-  one queue in submission order), indirect dispatch plumbing.
+  timestamp queries, SubmissionContexts (multi-stream; P1 serializes all
+  work on one queue in submission order), indirect dispatch plumbing.
 
 
 ### P2.1 progress

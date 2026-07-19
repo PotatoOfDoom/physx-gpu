@@ -386,6 +386,11 @@ public:
         Buffer& buf = mBuffers[handle];
         if (buf.hostVisible)
         {
+            // cuMemcpyHtoD is stream-ordered: drain prior recorded/in-flight
+            // GPU work before the direct host write, so a fillBuffer/copyBuffer
+            // or dispatch cannot clobber this upload out of order.  Cheap when
+            // idle (submit returns the last ticket, already retired).
+            flush();
             void* mapped = nullptr;
             PXG_VK_CHECK(vkMapMemory(mDevice, buf.memory, dstOffset, sizeBytes, 0, &mapped));
             memcpy(mapped, data, sizeBytes);
@@ -437,6 +442,10 @@ public:
         Buffer& buf = mBuffers[handle];
         if (buf.hostVisible)
         {
+            // cuMemcpyDtoH is stream-ordered: drain any recorded GPU work
+            // (dispatches, copyBuffer/fillBuffer) that may write this buffer
+            // before the host reads the mapping.
+            flush();
             void* mapped = nullptr;
             PXG_VK_CHECK(vkMapMemory(mDevice, buf.memory, srcOffset, sizeBytes, 0, &mapped));
             memcpy(data, mapped, sizeBytes);
@@ -472,6 +481,47 @@ public:
             off += chunk;
             remaining -= chunk;
         }
+    }
+
+    // Device-to-device copy recorded into the current stream (cuMemcpyDtoD
+    // parity): compute<->transfer barriers bracket the copy so it orders
+    // after prior writes and before subsequent reads on either buffer.
+    void copyBuffer(PxgBufferHandle dstHandle, size_t dstOffset, PxgBufferHandle srcHandle,
+                    size_t srcOffset, size_t sizeBytes) override
+    {
+        if (sizeBytes == 0)
+            return;
+        const Buffer& src = mBuffers[srcHandle];
+        const Buffer& dst = mBuffers[dstHandle];
+        beginRecording();
+        bufferBarrier(src.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        bufferBarrier(dst.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkBufferCopy region = { srcOffset, dstOffset, sizeBytes };
+        vkCmdCopyBuffer(mCommandBuffer, src.buffer, dst.buffer, 1, &region);
+        bufferBarrier(dst.buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
+
+    // 32-bit fill (cuMemsetD32 parity) via vkCmdFillBuffer; offset/size are
+    // 4-byte aligned by contract.
+    void fillBuffer(PxgBufferHandle dstHandle, size_t dstOffset, uint32_t value, size_t sizeBytes) override
+    {
+        if (sizeBytes == 0)
+            return;
+        const Buffer& dst = mBuffers[dstHandle];
+        beginRecording();
+        bufferBarrier(dst.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        vkCmdFillBuffer(mCommandBuffer, dst.buffer, dstOffset, sizeBytes, value);
+        bufferBarrier(dst.buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                      VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     }
 
     // ---- textures ----

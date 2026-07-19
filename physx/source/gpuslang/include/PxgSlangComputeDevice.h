@@ -47,6 +47,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace physx
 {
@@ -85,6 +86,24 @@ public:
 
     virtual void upload(PxgBufferHandle buffer, const void* data, size_t sizeBytes, size_t dstOffset = 0) = 0;
     virtual void download(PxgBufferHandle buffer, void* data, size_t sizeBytes, size_t srcOffset = 0) = 0;
+
+    // Device-to-device copy (CUDA cuMemcpyDtoD parity) and 32-bit fill
+    // (cuMemsetD32 parity).  Recorded into the current stream in submission
+    // order.  Offsets and sizes are byte counts; fillBuffer's must be
+    // 4-byte aligned.  Base defaults stage through the host so backends
+    // without a device path still work.
+    virtual void copyBuffer(PxgBufferHandle dst, size_t dstOffset, PxgBufferHandle src, size_t srcOffset,
+                            size_t sizeBytes)
+    {
+        std::vector<uint8_t> tmp(sizeBytes);
+        download(src, tmp.data(), sizeBytes, srcOffset);
+        upload(dst, tmp.data(), sizeBytes, dstOffset);
+    }
+    virtual void fillBuffer(PxgBufferHandle dst, size_t dstOffset, uint32_t value, size_t sizeBytes)
+    {
+        std::vector<uint32_t> fill(sizeBytes / 4, value);
+        upload(dst, fill.data(), fill.size() * 4, dstOffset);
+    }
 
     // ---- pipelines ----
     // `code` is backend-specific precompiled shader code (SPIR-V for Vulkan,

@@ -126,11 +126,9 @@ PxgResult PxgCudaShim::memcpyDtoD(PxgDevicePtr dst, PxgDevicePtr src, size_t byt
     size_t sOff, dOff;
     if (!resolve(src, &sBuf, &sOff) || !resolve(dst, &dBuf, &dOff))
         return PxgResult::InvalidValue;
-    // P3.1 correctness path: stage through host.  A vkCmdCopyBuffer DtoD
-    // fast path is a device-layer follow-up (kept off the critical path).
-    std::vector<uint8_t> tmp(bytes);
-    mDevice->download(sBuf, tmp.data(), bytes, sOff);
-    mDevice->upload(dBuf, tmp.data(), bytes, dOff);
+    // Device-side copy (vkCmdCopyBuffer), stream-ordered; the base class
+    // stages through host on backends without a device path.
+    mDevice->copyBuffer(dBuf, dOff, sBuf, sOff, bytes);
     return PxgResult::Success;
 }
 
@@ -140,8 +138,8 @@ PxgResult PxgCudaShim::memsetD32(PxgDevicePtr dst, uint32_t value, size_t numWor
     size_t off;
     if (!resolve(dst, &buf, &off))
         return PxgResult::InvalidValue;
-    std::vector<uint32_t> fill(numWords, value);
-    mDevice->upload(buf, fill.data(), numWords * sizeof(uint32_t), off);
+    // Device-side fill (vkCmdFillBuffer), stream-ordered.
+    mDevice->fillBuffer(buf, off, value, numWords * sizeof(uint32_t));
     return PxgResult::Success;
 }
 
