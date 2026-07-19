@@ -543,15 +543,36 @@ as soon as its kernels exist.
   `cudamanager/PxCudaTypes.h` instead): the only cuda.h symbol the header uses is
   `CUfunction`, which `PxCudaTypes.h` defines identically when the toolkit is
   absent — so the real `KernelWrangler` header now compiles in the Vulkan config.
-- Still open in P4 (the concrete gpu-module suite on Vulkan — the big remaining
-  effort): `PxCreatePhysXGpu`'s ~13 subsystem factories (broadphase, AABB,
-  narrowphase, simulation controller, dynamics) each need their concrete `Pxg*`
-  type rebuilt on the Vulkan context — the `PxgPhysXGpu.cpp` `static_cast` sites
-  hard-type consumers to `PxgCudaKernelWranglerManager*`/`PxgHeapMemoryAllocatorManager*`,
-  so a Vulkan wrangler/heap manager must substitute for (derive from) those exact
-  types or the whole cast surface must be virtualized.  Plus filling the
-  manifest's `pushConstantSize` + the 378 unmapped rows during per-module
-  bring-up, then verification moves to real ScScene scenes.
+- **P4 feasibility ESTABLISHED (parallel build-probe survey)** — the concrete
+  gpu-module suite is far more tractable than "rebuild everything": (1) gpucommon's
+  buddy allocator (`PxgHeapMemoryAllocator.cpp`) and kernel-wrangler-manager
+  (`PxgKernelWrangler.cpp`) already reach clean `-fsyntax-only` cuda-free against
+  the real headers (the `CudaKernelWrangler.h` decouple was the enabler); (2) host
+  CUDA coupling across all 6 GPU modules is CONCENTRATED — only 2 files `#include
+  <cuda.h>` (the CUDA allocator wrappers we replace anyway) and ~10 files have
+  ~15 direct driver call-sites (stream sync/query, DtoH readback, texture create,
+  one raw `cuLaunchKernel`); everything else routes through our virtual
+  `PxCudaContext`; (3) both coupling seams REUSE the real engine types with tiny
+  glue — the real `KernelWrangler` populates `mCuFunctions[id]` with our `id+1`
+  encoding once the export's function-table is made live + `getCuModules()`
+  returns a sentinel; the real `PxgHeapMemoryAllocator` buddy allocator works
+  VERBATIM over a ~30-line `PxgVulkanMemoryManager` (2 virtuals) because it does
+  flat-address arithmetic our shim's interval map resolves; (4) build strategy:
+  extend the hand-rolled harness CMake (no packman, no CUDA — proven), not the
+  SDK build (blocked by packman network + a CUDA configure gate).
+- **P4.1 engine-build keystone SHIPPED**: `PhysXFoundation` now builds as a
+  static lib in the harness from the SDK's authoritative 15-file source list
+  (plain C++, no packman, no CUDA), and `PxCreateFoundation` + `PX_NEW` + the
+  engine containers RUN in the harness (test `p4Foundation`).  This opens the
+  door to linking real PhysX engine code against the Vulkan bridge — the shift
+  from isolated harness kernels to full-engine integration.
+- Still open in P4 (per the now-de-risked plan): the two coupling seams
+  (`PxgVulkanMemoryManager` + real heap allocator; the live function-table +
+  real `KernelWrangler` with a one-line `CudaKernelWrangler.cpp` toolkit guard),
+  then the concrete `Pxg*` subsystems (broadphase, AABB, narrowphase, sim
+  controller, dynamics) reused over the Vulkan context, the ~10 direct-driver
+  seams mopped up, the manifest's `pushConstantSize` + the 378 unmapped rows
+  filled during per-module bring-up, and verification on real ScScene scenes.
 
 ## 4. Phase P3 — Orchestration shim (the CUDA-context replacement)
 

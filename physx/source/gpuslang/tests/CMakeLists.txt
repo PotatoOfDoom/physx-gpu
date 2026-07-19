@@ -410,6 +410,37 @@ pxg_compile_shader(npShimMisalign shimMisAdd)
 
 add_custom_target(gpuslang-shaders ALL DEPENDS ${PXG_SHADER_OUTPUTS})
 
+# ---- PhysXFoundation (RUNTIME_PLAN.md P4: the engine base) ----
+# The keystone for linking real PhysX engine code (gpucommon heap allocator /
+# kernel wrangler, and eventually the gpu subsystems) against the Vulkan bridge.
+# Built from the SDK's authoritative foundation source list — plain C++, no
+# packman, no CUDA.  Static + PIC so it links into both the test exe and the
+# PhysXGpuVulkan drop-in.  PX_PHYSX_STATIC_LIB keeps it PRIVATE so it does not
+# alter the export visibility of the PhysXGpuVulkan C-ABI symbols.
+set(PXFND_ROOT ${GPUSLANG_ROOT}/../foundation)
+add_library(physx-foundation STATIC
+    ${PXFND_ROOT}/FdAllocator.cpp
+    ${PXFND_ROOT}/FdString.cpp
+    ${PXFND_ROOT}/FdTempAllocator.cpp
+    ${PXFND_ROOT}/FdAssert.cpp
+    ${PXFND_ROOT}/FdMathUtils.cpp
+    ${PXFND_ROOT}/FdFoundation.cpp
+    ${PXFND_ROOT}/unix/FdUnixAtomic.cpp
+    ${PXFND_ROOT}/unix/FdUnixMutex.cpp
+    ${PXFND_ROOT}/unix/FdUnixSync.cpp
+    ${PXFND_ROOT}/unix/FdUnixThread.cpp
+    ${PXFND_ROOT}/unix/FdUnixPrintString.cpp
+    ${PXFND_ROOT}/unix/FdUnixSList.cpp
+    ${PXFND_ROOT}/unix/FdUnixSocket.cpp
+    ${PXFND_ROOT}/unix/FdUnixTime.cpp
+    ${PXFND_ROOT}/unix/FdUnixFPU.cpp)
+set_target_properties(physx-foundation PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_STANDARD 17)
+target_compile_definitions(physx-foundation PRIVATE PX_PHYSX_STATIC_LIB)
+target_include_directories(physx-foundation PUBLIC ${GPUSLANG_ROOT}/../../include
+    PRIVATE ${PXFND_ROOT} ${PXFND_ROOT}/include)
+find_package(Threads REQUIRED)
+target_link_libraries(physx-foundation PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+
 # ---- backend library ----
 set(BACKEND_SOURCES ${GPUSLANG_ROOT}/src/vulkan/PxgVulkanComputeDevice.cpp
     ${GPUSLANG_ROOT}/src/PxgCudaShim.cpp)
@@ -709,8 +740,9 @@ add_executable(gpuslang-tests
     testP3KernelWrangler.cpp
     testP3ContextHardening.cpp
     testP4Loader.cpp
+    testP4Foundation.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp)
-target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend ${CMAKE_DL_LIBS})
+target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend physx-foundation ${CMAKE_DL_LIBS})
 # The P3.1 CUDA-context bridge builds against the real PhysX headers
 # (foundation + cudamanager) with PX_SUPPORT_GPU_PHYSX; no CUDA toolkit needed.
 # physxgpu/include adds the PxPhysXGpu interface the P3.5 loader test dlsym's.
@@ -761,7 +793,7 @@ foreach(suite scan radixSort radixSortGather preIntegration integration updateBo
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
