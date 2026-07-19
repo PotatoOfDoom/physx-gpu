@@ -1,2 +1,4 @@
 # gpuslang verification-suite build output (CMake + ctest scratch tree)
 /build-gpuslang/
+# full-SDK integration test build output (P5)
+/build-sdk/
