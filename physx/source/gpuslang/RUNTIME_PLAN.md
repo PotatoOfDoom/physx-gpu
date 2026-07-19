@@ -664,6 +664,44 @@ as soon as its kernels exist.
   `pushConstantSize` + the 378 unmapped rows + `cuStreamQuery`/raw `cuLaunchKernel`
   all get closed during that bring-up, verified by the scene actually stepping.
 
+## 3b. Phase P5 — Full-SDK integration (the coupling boundary, dissolved)
+
+The P4.6 boundary above turned out to be far softer than feared: the PhysX CPU
+SDK is vendor-neutral C++ that compiles against our foundation with essentially no
+friction.
+
+- **P5 milestone A SHIPPED (`sdk-step`, commit 30e9508)**: the entire unmodified
+  PhysX CPU SDK — foundation, common, geomutils, lowlevel, lowlevelaabb,
+  lowleveldynamics, scenequery, simulationcontroller, and the Np core, ~340 `.cpp` —
+  builds from source in the harness as one static lib, **no packman, no CUDA
+  toolkit**, needing only `PX_PHYSX_STATIC_LIB` + `PX_PUBLIC_RELEASE=1` (the public
+  source `#if`s out the internal `PhysXIndicator.h`) and `common/include` for the
+  OmniPvd prefix — **zero engine-source edits**.  A real `PxScene` (own synchronous
+  CPU dispatcher + filter shader, no extensions) drops a dynamic box on a static
+  ground and steps 4 s @ 60 Hz: it falls on step 1 (y 5.000→4.997), reaches the
+  ground, settles at centre y = 0.500, and comes to rest (|v| = 0.000).  The engine's
+  CPU pipeline links and simulates correctly in the harness.
+- **P5 driver-seam closure SHIPPED (commit a71b28b)**: with the remaining direct-
+  driver API shimmed (the CUDA texture/array API for SDF/heightfield — inert, off
+  the rigid path; raw `cuMemcpyDtoH/HtoD/DtoD` routed through the live bridge
+  context; `cuStreamQuery`→ready; the `CUDA_ERROR_*` codes), **all ~50 GPU host
+  `.cpp` compile no-toolkit too** — the whole engine (CPU + GPU) now assembles
+  against the Vulkan bridge.
+- **Remaining to a GPU scene stepping on Vulkan** (precisely de-risked, mechanical
+  except the last item): (1) copy the ~6 concrete subsystem factory bodies from
+  `PxgPhysXGpu.cpp` into `bridge/PhysXGpuVulkan.cpp` (they currently `return NULL`;
+  the concrete types all compile+link now); (2) extend the harness CMake to
+  statically link the GPU host modules + the bridge + the 2-file `gpuslang-backend`
+  (Vulkan device) + the compiled shaders into the SDK test; (3) create a
+  GPU-enabled `PxScene` (`cudaContextManager` = the Vulkan bridge, `eENABLE_GPU_
+  DYNAMICS`, `broadPhaseType eGPU`) — the scene now supplies the `PxsContext` /
+  `IslandSim` the narrowphase/dynamics/sim-controller ctors demanded, so the P4.6
+  wall dissolves; (4) the one genuine frontier: the per-kernel launch marshalling
+  (the CUDA param pack → Slang binding reconciliation, e.g. the 4-vs-5 binding
+  case seen in `interleaveBuffers`) + filling the manifest `pushConstantSize` for
+  the rigid-body pipeline kernels, so `simulate()` launches them correctly.  Steps
+  (1)–(3) construct the GPU pipeline over Vulkan; step (4) makes it actually run.
+
 ## 4. Phase P3 — Orchestration shim (the CUDA-context replacement)
 
 Goal: PhysX's CPU side runs UNMODIFIED against a Vulkan backend library.
