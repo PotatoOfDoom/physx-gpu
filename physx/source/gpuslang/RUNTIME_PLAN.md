@@ -253,8 +253,24 @@ tests for the sub-allocator (fragmentation/deferred-free/resize properties).
   inline-PTX sites (warpHelpers.cuh) map to `pxgShflUpSyncU`; float
   atomic min/max are already CAS loops in CUDA (atomic.cuh) and port
   directly.
-- Still open in P2.1: 64-bit helpers (`__popcll`/`__ffsll`/`__clzll`,
-  64-bit ballot compositions), `PXG_WARP_NATIVE` compile validation +
+- **P2.2 atomic layer SHIPPED** (same include): `pxgAtomicMinF/MaxF/AddF`
+  as CAS loops via `InterlockedCompareExchange` — the min/max loops are a
+  direct transcription of atomic.cuh's own CAS emulations (CUDA has no
+  native float min/max atomic either), the add applies each contribution
+  exactly once with unspecified ordering, exactly like CUDA's native
+  float `atomicAdd`; `pxgAtomicOr64` reproduces the split 32-bit OR of
+  `AtomicOr(PxU64)`.  64-bit bit conventions `pxgPopcll/pxgFfsll/pxgClzll`
+  with exact zero-half/zero-value cases.  Battery `npAtomicLib`: 4096
+  threads contending 64 float cells + 32 OR cells with order-invariant
+  designs (min/max; integer-valued float sums that are exactly
+  associative; ORs), all final cell values compared bitwise; data
+  includes deliberate zero halves and zero pairs for the 64-bit branch
+  coverage.  Seven mutants caught (min-as-max, CAS retry dropped, OR64
+  index, ffsll/clzll offsets, clzll zero case); green in both memory
+  modes.  Native `VK_EXT_shader_atomic_float` fast paths (and the
+  `red.global.add.f32` PTX site) remain a P6 perf item — the CAS forms
+  are the semantic baseline.
+- Still open in P2.1/P2.2: `PXG_WARP_NATIVE` compile validation +
   hardware execution (P5), block-scope collectives (blockReduction /
   threadBlockScanExclusive family) which need workgroup barriers and are
   ported with their kernels.

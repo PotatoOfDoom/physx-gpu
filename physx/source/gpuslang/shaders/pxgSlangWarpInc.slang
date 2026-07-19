@@ -339,4 +339,82 @@ uint pxgWarpScanAddExclusiveU(uint tid, uint value)
     return inclusive - value;
 }
 
+// ---- 64-bit bit conventions (__popcll / __ffsll / __clzll) ----
+
+uint pxgPopcll(uint lo, uint hi) { return countbits(lo) + countbits(hi); }
+
+// __ffsll: 1-based index of lowest set bit; 0 when the value is 0.
+uint pxgFfsll(uint lo, uint hi)
+{
+    if (lo != 0u) return firstbitlow(lo) + 1u;
+    if (hi != 0u) return firstbitlow(hi) + 33u;
+    return 0u;
+}
+
+// __clzll: leading zeros; 64 when the value is 0.
+uint pxgClzll(uint lo, uint hi)
+{
+    if (hi != 0u) return 31u - firstbithigh(hi);
+    if (lo != 0u) return 63u - firstbithigh(lo);
+    return 64u;
+}
+
+// ---- atomics (atomic.cuh parity) ----
+// AtomicMin/AtomicMax on float are CAS loops in CUDA itself (no native
+// float min/max atomic exists there either); this is a direct transcription
+// including the fminf/fmaxf combine.  Buffers carry float BITS as uint so
+// one buffer type serves compare-exchange.  AtomicAdd uses the same CAS
+// shape: each contribution is applied exactly once; ordering across lanes
+// is unspecified exactly as with CUDA's native float atomicAdd.
+
+void pxgAtomicMinF(RWStructuredBuffer<uint> buf, uint index, float value)
+{
+    uint assumed = buf[index];
+    for (;;)
+    {
+        const uint newBits = asuint(min(value, asfloat(assumed)));
+        uint old;
+        InterlockedCompareExchange(buf[index], assumed, newBits, old);
+        if (old == assumed)
+            return;
+        assumed = old;
+    }
+}
+
+void pxgAtomicMaxF(RWStructuredBuffer<uint> buf, uint index, float value)
+{
+    uint assumed = buf[index];
+    for (;;)
+    {
+        const uint newBits = asuint(max(value, asfloat(assumed)));
+        uint old;
+        InterlockedCompareExchange(buf[index], assumed, newBits, old);
+        if (old == assumed)
+            return;
+        assumed = old;
+    }
+}
+
+float pxgAtomicAddF(RWStructuredBuffer<uint> buf, uint index, float value)
+{
+    uint assumed = buf[index];
+    for (;;)
+    {
+        const uint newBits = asuint(asfloat(assumed) + value);
+        uint old;
+        InterlockedCompareExchange(buf[index], assumed, newBits, old);
+        if (old == assumed)
+            return asfloat(assumed);
+        assumed = old;
+    }
+}
+
+// atomic.cuh AtomicOr(PxU64): two independent 32-bit ORs on the halves.
+void pxgAtomicOr64(RWStructuredBuffer<uint> buf, uint indexLo, uint maskLo, uint maskHi)
+{
+    uint prev;
+    InterlockedOr(buf[indexLo], maskLo, prev);
+    InterlockedOr(buf[indexLo + 1u], maskHi, prev);
+}
+
 #endif // PXG_SLANG_WARP_INC

@@ -396,6 +396,7 @@ pxg_compile_shader(npSpikeSubgroup spikeSubgroup)
 pxg_compile_shader(npSpikeBda spikeBda)
 # RUNTIME_PLAN.md P2.1: warp-32 primitive library battery (emulation path).
 pxg_compile_shader(npWarpLib wlShuffle wlBallot)
+pxg_compile_shader(npAtomicLib alAtomics)
 
 add_custom_target(gpuslang-shaders ALL DEPENDS ${PXG_SHADER_OUTPUTS})
 
@@ -680,7 +681,8 @@ add_executable(gpuslang-tests
     testP0Bda.cpp
     testP1DeviceV2.cpp
     testP1HeapAlloc.cpp
-    testNpWarpLib.cpp)
+    testNpWarpLib.cpp
+    testNpAtomicLib.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 
 # pxg-caps: standalone device-profile probe (RUNTIME_PLAN.md P0)
@@ -706,7 +708,7 @@ foreach(suite scan radixSort radixSortGather preIntegration integration updateBo
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
