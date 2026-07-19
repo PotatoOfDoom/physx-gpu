@@ -353,7 +353,7 @@ public:
         VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
         bufferInfo.size = sizeBytes;
         bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                           VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                           VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
         if (mHasBufferDeviceAddress)
             bufferInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -885,6 +885,53 @@ public:
             vkCmdPushConstants(mCommandBuffer, pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantSize, pushConstants);
 
         vkCmdDispatch(mCommandBuffer, gridX, gridY, gridZ);
+    }
+
+    bool supportsIndirectDispatch() const override { return true; }
+
+    void dispatchIndirect(PxgPipelineHandle pipelineHandle, PxgBufferHandle argBuffer, size_t argOffset,
+                          const PxgBufferHandle* buffers, uint32_t numBuffers,
+                          const void* pushConstants, uint32_t pushConstantSize) override
+    {
+        Pipeline& pipe = mPipelines[pipelineHandle];
+        assert(numBuffers == pipe.numBuffers);
+        assert(pipe.numTextures == 0);
+        assert(pushConstantSize == pipe.pushConstantSize);
+
+        beginRecording();
+
+        VkDescriptorSet set = allocateDescriptorSet(pipe.setLayout, numBuffers);
+        std::vector<VkDescriptorBufferInfo> bufferInfos(numBuffers);
+        std::vector<VkWriteDescriptorSet> writes(numBuffers);
+        for (uint32_t i = 0; i < numBuffers; ++i)
+        {
+            const Buffer& buf = mBuffers[buffers[i]];
+            bufferInfos[i].buffer = buf.buffer;
+            bufferInfos[i].offset = 0;
+            bufferInfos[i].range = VK_WHOLE_SIZE;
+            writes[i] = VkWriteDescriptorSet{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+            writes[i].dstSet = set;
+            writes[i].dstBinding = i;
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &bufferInfos[i];
+        }
+        if (numBuffers > 0)
+            vkUpdateDescriptorSets(mDevice, numBuffers, writes.data(), 0, nullptr);
+
+        // The arg buffer was produced by a prior compute dispatch; make its
+        // workgroup counts visible to the indirect-command read stage.
+        const Buffer& arg = mBuffers[argBuffer];
+        bufferBarrier(arg.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+
+        vkCmdBindPipeline(mCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline);
+        if (numBuffers > 0)
+            vkCmdBindDescriptorSets(mCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.layout, 0, 1, &set, 0, nullptr);
+        if (pushConstantSize > 0)
+            vkCmdPushConstants(mCommandBuffer, pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantSize, pushConstants);
+
+        vkCmdDispatchIndirect(mCommandBuffer, arg.buffer, argOffset);
     }
 
     void barrier() override

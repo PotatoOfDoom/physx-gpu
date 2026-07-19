@@ -398,6 +398,8 @@ pxg_compile_shader(npSpikeBda spikeBda)
 pxg_compile_shader(npWarpLib wlShuffle wlBallot)
 # P2.1 native-path compile/lowering validation (WaveShuffle/WaveActiveBallot).
 pxg_compile_shader(npWarpNative warpNativeProbe)
+# RUNTIME_PLAN.md P6: indirect dispatch plumbing.
+pxg_compile_shader(npIndirect writeArgs fillGrid)
 pxg_compile_shader(npAtomicLib alAtomics)
 # RUNTIME_PLAN.md P2: tex3D replacement (Vulkan-only sampled-image path).
 pxg_compile_shader(npTex3d tex3dSample)
@@ -693,6 +695,7 @@ add_executable(gpuslang-tests
     testNpTex3d.cpp
     testWarpNative.cpp
     testP1PipelineCache.cpp
+    testP6Indirect.cpp
     testP3Shim.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend)
 
@@ -719,7 +722,7 @@ foreach(suite scan radixSort radixSortGather preIntegration integration updateBo
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p3Shim)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p6Indirect p3Shim)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")

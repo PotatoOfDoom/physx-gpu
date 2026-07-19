@@ -129,6 +129,18 @@ public:
                           const PxgBufferHandle* buffers, uint32_t numBuffers,
                           const void* pushConstants, uint32_t pushConstantSize) = 0;
 
+    // Indirect dispatch (cuLaunchKernel with a device-computed grid): the
+    // workgroup counts are read from `argBuffer` at `argOffset` as three
+    // consecutive uint32 (x, y, z) — the VkDispatchIndirectCommand /
+    // D3D12 dispatch-args layout.  Lets a kernel compute the next grid on
+    // device without a count readback (RUNTIME_PLAN.md P6).  Base default
+    // is unsupported (returns without recording); backends override.
+    virtual void dispatchIndirect(PxgPipelineHandle /*pipeline*/, PxgBufferHandle /*argBuffer*/,
+                                  size_t /*argOffset*/, const PxgBufferHandle* /*buffers*/,
+                                  uint32_t /*numBuffers*/, const void* /*pushConstants*/,
+                                  uint32_t /*pushConstantSize*/) {}
+    virtual bool supportsIndirectDispatch() const { return false; }
+
     // Compute->compute execution + memory barrier between recorded dispatches
     // (the ordering CUDA guarantees implicitly on a single stream).
     virtual void barrier() = 0;

@@ -235,9 +235,19 @@ tests for the sub-allocator (fragmentation/deferred-free/resize properties).
   header-valid blob, a second device seeded from it produces bitwise-identical
   kernel results, and a garbage blob neither crashes creation nor changes
   results; mutant caught (no-save fails the written-blob check).
-- Still open in P1: specialization constants, timestamp queries,
+- **Indirect dispatch SHIPPED** (P6 plumbing): `dispatchIndirect(pipeline,
+  argBuffer, argOffset, ...)` reads the workgroup counts as a
+  VkDispatchIndirectCommand from a device buffer (`vkCmdDispatchIndirect`),
+  with a compute-write -> indirect-read barrier on the arg buffer; all
+  buffers now carry `INDIRECT_BUFFER_BIT`.  Test `p6Indirect`: a producer
+  kernel computes and writes the grid on device, the consumer is launched
+  indirectly, and covering all elements proves the device-decided grid was
+  honored — mutant caught (a fixed 1-group dispatch writes only 64/4096).
+  (The indirect-read barrier's absence is not observable on llvmpipe, same
+  class as the timeline syncval limitation; it is spec-correct for hardware.)
+- Still open in P1/P6: specialization constants, timestamp queries,
   SubmissionContexts (multi-stream; P1 serializes all work on one queue in
-  submission order), indirect dispatch plumbing.
+  submission order), async compute (second queue).
 
 
 ### P2.1 progress
