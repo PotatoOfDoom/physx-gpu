@@ -741,12 +741,21 @@ add_executable(gpuslang-tests
     testP3ContextHardening.cpp
     testP4Loader.cpp
     testP4Foundation.cpp
-    ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp)
+    testP4Heap.cpp
+    ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp
+    # P4: the REAL gpucommon buddy allocator, reused over the Vulkan memory
+    # manager (PxgVulkanMemoryManager) — compiles cuda-free against real headers.
+    ${GPUSLANG_ROOT}/../gpucommon/src/PxgHeapMemoryAllocator.cpp)
 target_link_libraries(gpuslang-tests PRIVATE gpuslang-backend physx-foundation ${CMAKE_DL_LIBS})
 # The P3.1 CUDA-context bridge builds against the real PhysX headers
 # (foundation + cudamanager) with PX_SUPPORT_GPU_PHYSX; no CUDA toolkit needed.
-# physxgpu/include adds the PxPhysXGpu interface the P3.5 loader test dlsym's.
-target_include_directories(gpuslang-tests PRIVATE ${GPUSLANG_ROOT}/../../include ${GPUSLANG_ROOT}/bridge ${GPUSLANG_ROOT}/../gpucommon/include ${GPUSLANG_ROOT}/../physxgpu/include)
+# physxgpu/include adds the PxPhysXGpu interface the P3.5 loader test dlsym's;
+# the foundation/common/lowlevel include dirs let the real gpucommon engine
+# source (heap allocator) compile in the harness (P4).
+target_include_directories(gpuslang-tests PRIVATE ${GPUSLANG_ROOT}/../../include ${GPUSLANG_ROOT}/bridge
+    ${GPUSLANG_ROOT}/../gpucommon/include ${GPUSLANG_ROOT}/../physxgpu/include
+    ${GPUSLANG_ROOT}/../foundation/include ${GPUSLANG_ROOT}/../common/include
+    ${GPUSLANG_ROOT}/../lowlevel/software/include ${GPUSLANG_ROOT}/../lowlevelaabb/include)
 # The P3.5 loader test dlopen's the built PhysXGpuVulkan drop-in by its real path.
 add_dependencies(gpuslang-tests PhysXGpuVulkan)
 target_compile_definitions(gpuslang-tests PRIVATE PXG_PHYSXGPUVULKAN_SO="$<TARGET_FILE:PhysXGpuVulkan>")
@@ -767,11 +776,15 @@ set_target_properties(pxg-caps PROPERTIES CXX_STANDARD 17)
 # the whole export surface builds against the real ABI with no CUDA toolkit.
 add_library(PhysXGpuVulkan SHARED
     ${GPUSLANG_ROOT}/bridge/PhysXGpuVulkan.cpp
-    ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp)
-target_link_libraries(PhysXGpuVulkan PRIVATE gpuslang-backend)
+    ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp
+    # P4: the real gpucommon buddy allocator, backing createGpuHeapMemoryAllocatorManager.
+    ${GPUSLANG_ROOT}/../gpucommon/src/PxgHeapMemoryAllocator.cpp)
+target_link_libraries(PhysXGpuVulkan PRIVATE gpuslang-backend physx-foundation)
 target_include_directories(PhysXGpuVulkan PRIVATE
     ${GPUSLANG_ROOT}/../../include ${GPUSLANG_ROOT}/include ${GPUSLANG_ROOT}/bridge
-    ${GPUSLANG_ROOT}/../gpucommon/include ${GPUSLANG_ROOT}/../physxgpu/include)
+    ${GPUSLANG_ROOT}/../gpucommon/include ${GPUSLANG_ROOT}/../physxgpu/include
+    ${GPUSLANG_ROOT}/../foundation/include ${GPUSLANG_ROOT}/../common/include
+    ${GPUSLANG_ROOT}/../lowlevel/software/include ${GPUSLANG_ROOT}/../lowlevelaabb/include)
 target_compile_definitions(PhysXGpuVulkan PRIVATE PX_PHYSX_GPU_EXPORTS)
 set_target_properties(PhysXGpuVulkan PROPERTIES OUTPUT_NAME PhysXGpuVulkan_64 CXX_STANDARD 17)
 # The CPU references are the bitwise ground truth: forbid the compiler from
@@ -793,7 +806,7 @@ foreach(suite scan radixSort radixSortGather preIntegration integration updateBo
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")

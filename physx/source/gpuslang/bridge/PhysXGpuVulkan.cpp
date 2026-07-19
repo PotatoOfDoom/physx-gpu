@@ -56,10 +56,13 @@
 
 #include "PxPhysXGpu.h"               // physx/source/physxgpu/include: the interface + export decls
 #include "PxgVulkanCudaContext.h"     // bridge: PxgCreateVulkanCudaContextManager
+#include "PxgVulkanMemoryManager.h"   // bridge: the Vulkan PxsMemoryManager (P4 memory seam)
 #include "PxgCudaShim.h"              // gpuslang/include: PxgCudaShim, PxgKernelDef, PxgSpirvLoader
 #include "PxgSlangComputeDevice.h"    // gpuslang/include: PxgCreateVulkanComputeDevice
 #include "PxgSlangKernelManifest.h"   // gpuslang/include: generated enum-indexed registry manifest
+#include "PxgHeapMemAllocator.h"      // gpucommon: the REAL buddy heap allocator manager (reused)
 
+#include "foundation/PxAllocator.h"   // PX_NEW
 #include "foundation/PxErrorCallback.h"
 
 #include <cstdint>
@@ -195,8 +198,17 @@ public:
     PxsParticleClothBuffer* createParticleClothBuffer(PxU32, PxU32, PxU32, PxU32, PxU32, PxCudaContextManager&) PX_OVERRIDE { warnNotImplemented("createParticleClothBuffer"); return NULL; }
     PxsParticleRigidBuffer* createParticleRigidBuffer(PxU32, PxU32, PxU32, PxCudaContextManager&) PX_OVERRIDE { warnNotImplemented("createParticleRigidBuffer"); return NULL; }
 
-    PxsMemoryManager* createGpuMemoryManager(PxCudaContextManager*) PX_OVERRIDE { warnNotImplemented("createGpuMemoryManager"); return NULL; }
-    PxsHeapMemoryAllocatorManager* createGpuHeapMemoryAllocatorManager(const PxU32, PxsMemoryManager*, const PxU32) PX_OVERRIDE { warnNotImplemented("createGpuHeapMemoryAllocatorManager"); return NULL; }
+    // P4 memory seam (real): the Vulkan PxsMemoryManager (device->shim,
+    // host->malloc) feeding the REAL gpucommon buddy allocator manager, verbatim
+    // as the reference wires createGpuMemoryManager -> createGpuHeapMemoryAllocatorManager.
+    PxsMemoryManager* createGpuMemoryManager(PxCudaContextManager* cudaContextManager) PX_OVERRIDE
+    {
+        return PX_NEW(PxgVulkanMemoryManager)(cudaContextManager->getCudaContext());
+    }
+    PxsHeapMemoryAllocatorManager* createGpuHeapMemoryAllocatorManager(const PxU32 heapCapacity, PxsMemoryManager* memoryManager, const PxU32 /*gpuComputeVersion*/) PX_OVERRIDE
+    {
+        return PX_NEW(PxgHeapMemoryAllocatorManager)(heapCapacity, memoryManager);
+    }
     PxsKernelWranglerManager* getGpuKernelWranglerManager(PxCudaContextManager*) PX_OVERRIDE { warnNotImplemented("getGpuKernelWranglerManager"); return NULL; }
 
     Bp::BroadPhase* createGpuBroadPhase(const PxGpuBroadPhaseDesc&, PxsKernelWranglerManager*, PxCudaContextManager*,

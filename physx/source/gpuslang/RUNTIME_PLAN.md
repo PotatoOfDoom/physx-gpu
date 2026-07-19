@@ -566,13 +566,28 @@ as soon as its kernels exist.
   engine containers RUN in the harness (test `p4Foundation`).  This opens the
   door to linking real PhysX engine code against the Vulkan bridge — the shift
   from isolated harness kernels to full-engine integration.
-- Still open in P4 (per the now-de-risked plan): the two coupling seams
-  (`PxgVulkanMemoryManager` + real heap allocator; the live function-table +
-  real `KernelWrangler` with a one-line `CudaKernelWrangler.cpp` toolkit guard),
-  then the concrete `Pxg*` subsystems (broadphase, AABB, narrowphase, sim
-  controller, dynamics) reused over the Vulkan context, the ~10 direct-driver
-  seams mopped up, the manifest's `pushConstantSize` + the 378 unmapped rows
-  filled during per-module bring-up, and verification on real ScScene scenes.
+- **P4.2 memory-manager seam SHIPPED**: `bridge/PxgVulkanMemoryManager.h` — a
+  ~30-line `PxsMemoryManager` whose device callback wraps the `PxCudaContext`'s
+  `memAlloc`/`memFree` and whose host callback wraps `memHostAlloc`/`memFreeHost`
+  (the exact mirror of gpucommon's `PxgMemoryManager` over `cuMemAlloc`).  The
+  REAL gpucommon buddy allocator (`PxgHeapMemoryAllocator` /
+  `PxgHeapMemoryAllocatorManager`) is REUSED VERBATIM on top of it — it does flat
+  device-address arithmetic that the shim's interval map resolves, so no engine
+  edit is needed.  The export's `createGpuMemoryManager` /
+  `createGpuHeapMemoryAllocatorManager` are now real (no longer stubs).  Test
+  `p4Heap` runs the real buddy allocator over Vulkan: allocates several device
+  buffers, round-trips host<->device through each interior (buddy-split) address,
+  checks distinctness, and frees them (1 mutant caught — a non-device host
+  pointer fails the round-trip).  This is the first real engine-code-over-Vulkan
+  integration.
+- Still open in P4 (per the de-risked plan): the wrangler seam (live
+  function-table exports + `getCuModules()` sentinel so the real `KernelWrangler`
+  populates `mCuFunctions[id]` with our `id+1` encoding, plus a one-line
+  `CudaKernelWrangler.cpp` toolkit guard), then the concrete `Pxg*` subsystems
+  (broadphase, AABB, narrowphase, sim controller, dynamics) reused over the
+  Vulkan context, the ~10 direct-driver seams mopped up, the manifest's
+  `pushConstantSize` + the 378 unmapped rows filled during per-module bring-up,
+  and verification on real ScScene scenes.
 
 ## 4. Phase P3 — Orchestration shim (the CUDA-context replacement)
 
