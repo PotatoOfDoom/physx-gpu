@@ -722,6 +722,20 @@ friction.
   struct.  This is the qualitative shift from "the pipeline is built" to "the kernels
   run", and it is genuinely the size of a phase — dozens of rigid kernels
   (broadphase → AABB → narrowphase → solver → integration), each bit-exact-verified.
+  - **Step 4 tranche 1 SHIPPED — MemCopyBalanced, the first kernel on the engine path.**
+    `memCopy.slang` is rewritten to the BDA model (CopyDesc carries the real device
+    pointers, dereferenced via `Ptr<T>`, matching PxgCopyManager's CUDA CopyDesc), its
+    test drives it through `PxgCudaShim` exactly as the engine does (bitwise-correct over
+    40 random ranges; mutation-checked), the bridge rounds the param blob to the struct's
+    trailing padding, and a per-kernel `pushConstantSizeFor` table feeds the shim's launch
+    gate.  The engine now *accepts and dispatches* MemCopyBalanced from a real `simulate()`.
+  - **Bring-up granularity finding:** a converted kernel can only be verified in ISOLATION
+    (the gpuslang suite), not by the whole-scene step, until the entire producing chain is
+    up: MemCopyBalanced launched correctly but faulted at runtime because its descriptor
+    buffer is filled by upstream kernels that are not yet converted, so it dereferenced
+    garbage addresses.  So `gpu-sdk-step` asserts CONSTRUCTION and gates stepping behind
+    `PXG_GPU_STEP` — the whole-scene step lights up only at the end of the phase, not
+    incrementally.
 
 ## 4. Phase P3 — Orchestration shim (the CUDA-context replacement)
 

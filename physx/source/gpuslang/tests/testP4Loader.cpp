@@ -82,8 +82,16 @@ typedef int (*GetOrdinalFn)(physx::PxErrorCallback&);
 
 PXG_TEST(p4Loader)
 {
-    // dlopen exactly as the engine does (RTLD_NOW resolves all symbols eagerly).
-    void* lib = dlopen(PXG_PHYSXGPUVULKAN_SO, RTLD_NOW | RTLD_LOCAL);
+    // Load lazily (RTLD_LAZY): this checks that the C-ABI export surface is present
+    // and the module loads.  Once the subsystem factories became real (P5 milestone B),
+    // the drop-in .so legitimately depends on the rest of the engine — the concrete
+    // Pxg* constructors and the CPU-SDK symbols they pull in — exactly as the production
+    // PhysXGpu_64.so depends on the loaded PhysX core.  So it is a link-time fragment,
+    // not a self-contained module; a bare RTLD_NOW here would (correctly) fail to eagerly
+    // resolve those engine symbols with no PhysX core present.  The full eager-resolution
+    // load-AND-run proof is build-sdk's gpu-sdk-step, which statically links the whole GPU
+    // host layer + CPU SDK and actually constructs the pipeline.
+    void* lib = dlopen(PXG_PHYSXGPUVULKAN_SO, RTLD_LAZY | RTLD_LOCAL);
     PXG_CHECK_MSG(lib != nullptr, "dlopen(%s) succeeds: %s", PXG_PHYSXGPUVULKAN_SO,
                   lib ? "" : dlerror());
     if (!lib)

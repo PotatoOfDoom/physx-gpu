@@ -140,6 +140,25 @@ std::mutex& runtimeMutex()
     return m;
 }
 
+// Per-kernel push-constant blob size (the compiled Slang push-constant struct size),
+// keyed by the CUDA __global__ name.  Filled as each kernel's engine-path launch is
+// brought up (RUNTIME_PLAN.md P5 Step 4); the shim validates every launch blob against
+// this, so an unlisted kernel (0) is refused rather than dispatched with a bad blob.
+uint32_t pushConstantSizeFor(const char* cudaName)
+{
+    struct Row { const char* name; uint32_t size; };
+    // { uint64 descs; uint count; } rounds up to 16 (uint64 alignment); the engine's
+    // (CopyDesc* descsGPU, PxU32 numDescs) param pack is padded to match in the bridge.
+    static const Row kRows[] = {
+        { "MemCopyBalanced", 16u },
+    };
+    if (cudaName)
+        for (const Row& row : kRows)
+            if (std::strcmp(row.name, cudaName) == 0)
+                return row.size;
+    return 0u;
+}
+
 // Returns the runtime, creating it once; null if no Vulkan device is available.
 VulkanGpuRuntime* ensureRuntime()
 {
@@ -163,12 +182,17 @@ VulkanGpuRuntime* ensureRuntime()
 
     // Build the enum-indexed kernel manifest from the generated registry.  The
     // spirvFile/entry pointers reference static string data in the generated
-    // header; pushConstantSize and numTextures stay 0 until the owning module is
-    // brought up on Vulkan (P4).  Index stays aligned with PxgKernelIds.
+    // header; numTextures stays 0 (only SDF/heightfield 3D-texture kernels set it).
+    // pushConstantSize is the compiled push-constant struct size the shim validates
+    // each launch blob against; it is filled per kernel as that kernel's launch is
+    // brought up on the engine path (RUNTIME_PLAN.md P5 Step 4).  0 means "not yet
+    // wired" — the shim rejects the launch with a clear InvalidValue rather than
+    // dispatching a mismatched blob.  Index stays aligned with PxgKernelIds.
     r.manifest.resize(PXG_SLANG_KERNEL_COUNT);
     for (unsigned i = 0; i < PXG_SLANG_KERNEL_COUNT; ++i)
         r.manifest[i] = PxgKernelDef{ gPxgSlangKernelManifest[i].spirvFile,
-                                      gPxgSlangKernelManifest[i].entry, 0u, 0u };
+                                      gPxgSlangKernelManifest[i].entry,
+                                      pushConstantSizeFor(gPxgSlangKernelManifest[i].cudaName), 0u };
 
     static PxgSpirvLoader loader = &envSpirvLoader;
     r.shim = new PxgCudaShim(r.device, r.manifest.data(), uint32_t(r.manifest.size()), loader);

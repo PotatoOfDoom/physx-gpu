@@ -30,7 +30,9 @@
 #include "pxgTestFramework.h"
 #include "pxgGpuStructs.h"
 #include "pxgRefMath.h"
+#include "PxgCudaShim.h"
 
+#include <cstring>
 #include <numeric>
 #include <random>
 
@@ -43,10 +45,15 @@ using namespace pxgtest;
 // MemCopyBalanced
 // ---------------------------------------------------------------------------
 
+// RUNTIME_PLAN.md P5 Step 4: MemCopyBalanced is now driven the way the engine drives
+// it — through PxgCudaShim (memAlloc device addresses, launch with a param blob of raw
+// pointers), NOT the descriptor-binding Kernel harness.  So CopyDesc.dest/source are the
+// REAL device addresses the kernel dereferences via BDA (mirroring PxgCopyManager::CopyDesc
+// = 4 x size_t), matching the production ABI exactly.
 struct CopyDesc
 {
-    uint64_t dest;   // byte offset into the destination buffer
-    uint64_t source; // byte offset into the source buffer
+    uint64_t dest;   // device address of the destination words
+    uint64_t source; // device address of the source words
     uint64_t bytes;
     uint64_t pad;
 };
@@ -54,11 +61,19 @@ static_assert(sizeof(CopyDesc) == 32, "CopyDesc mirror must be 32 bytes");
 
 struct MemCopyParams
 {
+    uint64_t descs; // device address of CopyDesc[count]
     uint32_t count;
 };
 
+static std::vector<uint8_t> memCopyLoader(const char* file) { return loadShaderBlob(file); }
+
 PXG_TEST(memCopyBalanced_randomDescriptors)
 {
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(900);
 
     const uint32_t numWords = 200000;
@@ -68,37 +83,63 @@ PXG_TEST(memCopyBalanced_randomDescriptors)
     const std::vector<uint32_t> dstOriginal = dst;
 
     // carve non-overlapping destination ranges with random sizes (including
-    // empty and single-word copies)
-    std::vector<CopyDesc> descs;
+    // empty and single-word copies), recorded as word offsets for the reference
+    struct Range { uint32_t destWord, srcWord, words; };
+    std::vector<Range> ranges;
     uint32_t cursor = 0;
-    while (cursor + 70 < numWords && descs.size() < 40)
+    while (cursor + 70 < numWords && ranges.size() < 40)
     {
         const uint32_t words = rng() % 60; // may be 0
-        CopyDesc d = {};
-        d.dest = uint64_t(cursor) * 4;
-        d.source = uint64_t(rng() % (numWords - words)) * 4;
-        d.bytes = uint64_t(words) * 4;
-        descs.push_back(d);
+        Range r;
+        r.destWord = cursor;
+        r.srcWord = rng() % (numWords - words);
+        r.words = words;
+        ranges.push_back(r);
         cursor += words + rng() % 10;
     }
 
     PxgSlangComputeDevice* dev = testDevice();
-    Kernel kernel("memCopy.spv", "MemCopyBalanced", { sizeof(CopyDesc), 4, 4 }, sizeof(MemCopyParams));
+    const PxgKernelDef manifest[] = {
+        { "memCopy.spv", "MemCopyBalanced", uint32_t(sizeof(MemCopyParams)), 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &memCopyLoader);
 
-    PxgBufferHandle descBuf = createBufferFrom(dev, descs);
-    PxgBufferHandle srcBuf = createBufferFrom(dev, src);
-    PxgBufferHandle dstBuf = createBufferFrom(dev, dst);
+    PxgDevicePtr dsrc = 0, ddst = 0, ddescs = 0;
+    PXG_CHECK_MSG(shim.memAlloc(&dsrc, numWords * 4) == PxgResult::Success, "memAlloc src");
+    PXG_CHECK_MSG(shim.memAlloc(&ddst, numWords * 4) == PxgResult::Success, "memAlloc dst");
+    if (dsrc == 0 || ddst == 0)
+    {
+        std::printf("  NOTE: shim has no device-address allocations (no BDA) -> skip\n");
+        return;
+    }
+    PXG_CHECK_MSG(shim.memcpyHtoD(dsrc, src.data(), numWords * 4) == PxgResult::Success, "HtoD src");
+    PXG_CHECK_MSG(shim.memcpyHtoD(ddst, dst.data(), numWords * 4) == PxgResult::Success, "HtoD dst");
 
-    const MemCopyParams params = { uint32_t(descs.size()) };
-    kernel.dispatch(uint32_t(descs.size()), { descBuf, srcBuf, dstBuf }, params);
-    dev->flush();
+    // descriptors carry absolute device addresses into the src/dst allocations
+    std::vector<CopyDesc> descs;
+    for (const Range& r : ranges)
+    {
+        CopyDesc d = {};
+        d.dest = ddst + uint64_t(r.destWord) * 4;
+        d.source = dsrc + uint64_t(r.srcWord) * 4;
+        d.bytes = uint64_t(r.words) * 4;
+        descs.push_back(d);
+    }
+    PXG_CHECK_MSG(shim.memAlloc(&ddescs, descs.size() * sizeof(CopyDesc)) == PxgResult::Success, "memAlloc descs");
+    PXG_CHECK_MSG(shim.memcpyHtoD(ddescs, descs.data(), descs.size() * sizeof(CopyDesc)) == PxgResult::Success, "HtoD descs");
 
-    const std::vector<uint32_t> gpuDst = downloadBuffer<uint32_t>(dev, dstBuf, numWords);
+    const MemCopyParams params = { ddescs, uint32_t(descs.size()) };
+    PXG_CHECK_MSG(shim.launchKernel(0, uint32_t(descs.size()), 1, 1, &params, sizeof(params)) == PxgResult::Success,
+                  "launchKernel MemCopyBalanced through BDA marshalling");
+    shim.streamSynchronize();
+
+    std::vector<uint32_t> gpuDst(numWords, 0);
+    PXG_CHECK_MSG(shim.memcpyDtoH(gpuDst.data(), ddst, numWords * 4) == PxgResult::Success, "DtoH dst");
 
     // reference
     std::vector<uint32_t> refDst = dstOriginal;
-    for (const CopyDesc& d : descs)
-        std::memcpy(refDst.data() + d.dest / 4, src.data() + d.source / 4, size_t(d.bytes));
+    for (const Range& r : ranges)
+        std::memcpy(refDst.data() + r.destWord, src.data() + r.srcWord, size_t(r.words) * 4);
 
     size_t mismatches = 0;
     for (uint32_t i = 0; i < numWords; ++i)
@@ -112,9 +153,9 @@ PXG_TEST(memCopyBalanced_randomDescriptors)
     }
     PXG_CHECK_MSG(mismatches == 0, "%zu mismatched words", mismatches);
 
-    dev->destroyBuffer(descBuf);
-    dev->destroyBuffer(srcBuf);
-    dev->destroyBuffer(dstBuf);
+    shim.memFree(dsrc);
+    shim.memFree(ddst);
+    shim.memFree(ddescs);
 }
 
 // ---------------------------------------------------------------------------

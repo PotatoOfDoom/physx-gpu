@@ -280,13 +280,20 @@ public:
         // first argument starts at offset 0, so the blob is an identity copy.
         const uint32_t count = uint32_t(kernelParamsSizeInBytes / sizeof(PxCudaKernelParam));
         std::vector<uint8_t> blob;
+        size_t maxAlign = 1;
         for (uint32_t i = 0; i < count; ++i)
         {
             const size_t a = paramAlign(kernelParams[i].size);
+            if (a > maxAlign) maxAlign = a;
             blob.resize((blob.size() + (a - 1)) & ~(a - 1));   // pad to natural alignment
             const uint8_t* d = static_cast<const uint8_t*>(kernelParams[i].data);
             blob.insert(blob.end(), d, d + kernelParams[i].size);
         }
+        // Trailing struct padding: a compiled push-constant struct's size is rounded
+        // up to its largest member's alignment (e.g. { uint64 ptr; uint count; } is 16,
+        // not 12).  The Slang side sees exactly that struct, so round the blob to match,
+        // otherwise the shim's blobSize == pushConstantSize gate rejects the launch.
+        blob.resize((blob.size() + (maxAlign - 1)) & ~(maxAlign - 1));
         return record(mShim->launchKernel(id, gridDimX, gridDimY, gridDimZ, blob.data(),
                                           uint32_t(blob.size())));
     }
