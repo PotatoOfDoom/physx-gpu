@@ -245,6 +245,14 @@ tests for the sub-allocator (fragmentation/deferred-free/resize properties).
   honored — mutant caught (a fixed 1-group dispatch writes only 64/4096).
   (The indirect-read barrier's absence is not observable on llvmpipe, same
   class as the timeline syncval limitation; it is spec-correct for hardware.)
+- **Adversarial review follow-up** (copy/fill + cache + indirect batches):
+  review found no BLOCKER/MAJOR.  Applied fixes: host-visible `download`
+  now issues a device->host domain barrier (`HOST_READ`) before the map,
+  closing the visibility edge that HOST_COHERENT alone does not guarantee
+  and that routing memset/DtoD through device transfers had widened;
+  `savePipelineCache` removes a truncated blob on a short write; 4-byte
+  alignment asserts on `fillBuffer`/`dispatchIndirect` offsets (the
+  cuMemset/indirect-command contract).
 - Still open in P1/P6: specialization constants, timestamp queries,
   SubmissionContexts (multi-stream; P1 serializes all work on one queue in
   submission order), async compute (second queue).

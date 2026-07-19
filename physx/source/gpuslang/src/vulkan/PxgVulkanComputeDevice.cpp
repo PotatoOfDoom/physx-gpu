@@ -476,7 +476,15 @@ public:
         {
             // cuMemcpyDtoH is stream-ordered: drain any recorded GPU work
             // (dispatches, copyBuffer/fillBuffer) that may write this buffer
-            // before the host reads the mapping.
+            // and, with a device->host domain barrier, make those writes
+            // visible to the host read.  On same-queue submission order the
+            // barrier's first scope covers prior submitted batches, so this
+            // closes the device->host visibility edge that HOST_COHERENT alone
+            // does not guarantee.
+            beginRecording();
+            bufferBarrier(buf.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
             flush();
             void* mapped = nullptr;
             PXG_VK_CHECK(vkMapMemory(mDevice, buf.memory, srcOffset, sizeBytes, 0, &mapped));
@@ -545,6 +553,9 @@ public:
     {
         if (sizeBytes == 0)
             return;
+        // vkCmdFillBuffer requires 4-byte aligned offset and size (the
+        // cuMemsetD32 contract); a misaligned device pointer is caller error.
+        assert((dstOffset % 4) == 0 && (sizeBytes % 4) == 0);
         const Buffer& dst = mBuffers[dstHandle];
         beginRecording();
         bufferBarrier(dst.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
@@ -897,6 +908,9 @@ public:
         assert(numBuffers == pipe.numBuffers);
         assert(pipe.numTextures == 0);
         assert(pushConstantSize == pipe.pushConstantSize);
+        // vkCmdDispatchIndirect requires a 4-byte aligned arg offset holding
+        // a VkDispatchIndirectCommand (3 x uint32).
+        assert((argOffset % 4) == 0);
 
         beginRecording();
 
@@ -1159,8 +1173,13 @@ private:
             return;
         if (FILE* f = fopen(mPipelineCachePath.c_str(), "wb"))
         {
-            fwrite(data.data(), 1, sz, f);
+            const size_t wrote = fwrite(data.data(), 1, sz, f);
             fclose(f);
+            // Don't leave a truncated blob behind (disk full / short write):
+            // a partial file would be rejected on next load anyway, but
+            // removing it keeps the cache path clean.
+            if (wrote != sz)
+                remove(mPipelineCachePath.c_str());
         }
     }
 
