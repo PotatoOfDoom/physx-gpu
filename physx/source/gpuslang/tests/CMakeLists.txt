@@ -1188,9 +1188,10 @@ set(PXG_HLSL_ENTRIES
     "npBoxSat:boxSat"
     "npBoxFeature:boxFeatureSetup"
     "npBoxReduce:boxCompactContacts"
-    "broadphaseSetup:translateAABBsLaunch" "broadphaseSetup:markCreatedPairsLaunch"
-    "broadphaseSetup:initializeSapBox1DLaunch" "broadphaseSetup:initializeRadixRanks"
-    "broadphaseSetup:updateHandles"
+    # markCreatedPairs/initializeRadixRanks/updateHandles: BDA + WorkgroupCount — Vulkan-only (P0 policy).
+    "broadphaseSetup:translateAABBsLaunch"
+    "broadphaseSetup:initializeSapBox1DLaunch" 
+    
     "broadphaseReports:accumulateReportsStage_1" "broadphaseReports:accumulateReportsStage_2"
     "broadphaseReports:copyReports"
     "broadphaseIncrementalHistogram:computeIncrementalComparisonHistograms_Stage1"

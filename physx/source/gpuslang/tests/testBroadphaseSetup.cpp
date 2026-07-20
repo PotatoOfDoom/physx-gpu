@@ -32,6 +32,9 @@
 #include "pxgGpuStructs.h"
 #include "PxgCudaShim.h"
 
+#include "foundation/PxBounds3.h"
+#include "PxgBroadPhaseDesc.h"
+
 #include <algorithm>
 #include <cstring>
 #include <numeric>
@@ -269,22 +272,51 @@ PXG_TEST(broadphaseSetup_translateAABBs)
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: markCreatedPairsLaunch
+// Tests 2-5: the bpDesc-aggregate kernels on the ENGINE ABI — each fills a
+// REAL PxgBroadPhaseDesc with live device addresses and launches through
+// PxgCudaShim exactly as the engine does (one bpDesc pointer, void** form).
 // ---------------------------------------------------------------------------
+
+struct BpDescRig
+{
+    physx::gpuslang::PxgCudaShim* shim;
+    physx::PxgBroadPhaseDesc desc;
+
+    explicit BpDescRig(physx::gpuslang::PxgCudaShim* s) : shim(s) { std::memset(&desc, 0, sizeof(desc)); }
+
+    physx::gpuslang::PxgDevicePtr alloc(const void* data, size_t bytes)
+    {
+        physx::gpuslang::PxgDevicePtr p = 0;
+        shim->memAlloc(&p, bytes);
+        if (p && data)
+            shim->memcpyHtoD(p, data, bytes);
+        return p;
+    }
+    physx::gpuslang::PxgDevicePtr upload()
+    {
+        physx::gpuslang::PxgDevicePtr p = alloc(&desc, sizeof(desc));
+        return p;
+    }
+};
+
 PXG_TEST(broadphaseSetup_markCreatedPairs)
 {
+    using namespace physx;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(6200);
     const uint32_t numPrevious = 37; // odd on purpose so total may be odd
     const uint32_t numCreated = 90;
     const uint32_t numBounds = 256;
 
-    // new integer bounds (arbitrary but distinct so gathers are checkable)
     std::vector<IntegerAABB> newBounds(numBounds);
     for (uint32_t h = 0; h < numBounds; ++h)
         for (uint32_t a = 0; a < 6; ++a)
-            newBounds[h].mMinMax[a] = (h << 8) | (a << 4) | 0x3; // even/odd not required here
+            newBounds[h].mMinMax[a] = (h << 8) | (a << 4) | 0x3;
 
-    // created handles: distinct box indices
     std::vector<uint32_t> createdHandles(numCreated);
     std::vector<uint32_t> perm(numBounds);
     std::iota(perm.begin(), perm.end(), 0u);
@@ -302,27 +334,38 @@ PXG_TEST(broadphaseSetup_markCreatedPairs)
     std::memset(oldBounds.data(), 0, oldBounds.size() * sizeof(IntegerAABB));
 
     PxgSlangComputeDevice* dev = testDevice();
-    PxgBufferHandle chBuf = createBufferFrom(dev, createdHandles);
-    PxgBufferHandle pxBuf = createBufferFrom(dev, projX);
-    PxgBufferHandle pyBuf = createBufferFrom(dev, projY);
-    PxgBufferHandle pzBuf = createBufferFrom(dev, projZ);
-    PxgBufferHandle hxBuf = createBufferFrom(dev, handX);
-    PxgBufferHandle hyBuf = createBufferFrom(dev, handY);
-    PxgBufferHandle hzBuf = createBufferFrom(dev, handZ);
-    PxgBufferHandle nbBuf = createBufferFrom(dev, newBounds);
-    PxgBufferHandle obBuf = createBufferFrom(dev, oldBounds);
-    std::vector<uint32_t> dummy(16, 0);
-    PxgBufferHandle dummyBuf = createBufferFrom(dev, dummy);
+    const PxgKernelDef manifest[] = { { "broadphaseSetup.spv", "markCreatedPairsLaunch", 8u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &bpShimLoader);
 
-    Kernel k("broadphaseSetup.spv", "markCreatedPairsLaunch", { 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 24, 24 },
-             sizeof(BpParams));
-    BpParams p = {};
-    p.numCreatedHandles = numCreated;
-    p.numPreviousHandles = numPrevious;
-    // bindings 4..12
-    k.dispatch((numCreated + 255) / 256, { dummyBuf, dummyBuf, dummyBuf, dummyBuf, chBuf, pxBuf, pyBuf, pzBuf,
-                                           hxBuf, hyBuf, hzBuf, nbBuf, obBuf }, p);
-    dev->flush();
+    BpDescRig rig(&shim);
+    const PxgDevicePtr dCh = rig.alloc(createdHandles.data(), createdHandles.size() * 4);
+    const PxgDevicePtr dPX = rig.alloc(projX.data(), projX.size() * 4);
+    const PxgDevicePtr dPY = rig.alloc(projY.data(), projY.size() * 4);
+    const PxgDevicePtr dPZ = rig.alloc(projZ.data(), projZ.size() * 4);
+    const PxgDevicePtr dHX = rig.alloc(handX.data(), handX.size() * 4);
+    const PxgDevicePtr dHY = rig.alloc(handY.data(), handY.size() * 4);
+    const PxgDevicePtr dHZ = rig.alloc(handZ.data(), handZ.size() * 4);
+    const PxgDevicePtr dNB = rig.alloc(newBounds.data(), newBounds.size() * sizeof(IntegerAABB));
+    const PxgDevicePtr dOB = rig.alloc(oldBounds.data(), oldBounds.size() * sizeof(IntegerAABB));
+    if (!dCh) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    rig.desc.numCreatedHandles = numCreated;
+    rig.desc.numPreviousHandles = numPrevious;
+    rig.desc.updateData_createdHandles = reinterpret_cast<PxU32*>(dCh);
+    rig.desc.boxProjections[0] = reinterpret_cast<PxU32*>(dPX);
+    rig.desc.boxProjections[1] = reinterpret_cast<PxU32*>(dPY);
+    rig.desc.boxProjections[2] = reinterpret_cast<PxU32*>(dPZ);
+    rig.desc.boxHandles[0][0] = reinterpret_cast<PxU32*>(dHX);
+    rig.desc.boxHandles[0][1] = reinterpret_cast<PxU32*>(dHY);
+    rig.desc.boxHandles[0][2] = reinterpret_cast<PxU32*>(dHZ);
+    rig.desc.newIntegerBounds = reinterpret_cast<PxgIntegerAABB*>(dNB);
+    rig.desc.oldIntegerBounds = reinterpret_cast<PxgIntegerAABB*>(dOB);
+    const PxgDevicePtr dDesc = rig.upload();
+
+    struct { uint64_t bpDesc; } prm = { dDesc };
+    // engine grid: BP_UPDATE_CREATEDPAIRS = 32 blocks x 256 (grid-stride)
+    PXG_CHECK_MSG(shim.launchKernel(0, 32, 1, 1, &prm, sizeof(prm)) == PxgResult::Success, "launch markCreatedPairs");
+    shim.streamSynchronize();
 
     // ---- reference ----
     std::vector<uint32_t> rPX = projX, rPY = projY, rPZ = projZ, rHX = handX, rHY = handY, rHZ = handZ;
@@ -352,13 +395,15 @@ PXG_TEST(broadphaseSetup_markCreatedPairs)
         rHZ[index * 2 + 0] = rHZ[index * 2 + 1] = INVALID_HANDLE;
     }
 
-    const auto gPX = downloadBuffer<uint32_t>(dev, pxBuf, projLen);
-    const auto gPY = downloadBuffer<uint32_t>(dev, pyBuf, projLen);
-    const auto gPZ = downloadBuffer<uint32_t>(dev, pzBuf, projLen);
-    const auto gHX = downloadBuffer<uint32_t>(dev, hxBuf, projLen);
-    const auto gHY = downloadBuffer<uint32_t>(dev, hyBuf, projLen);
-    const auto gHZ = downloadBuffer<uint32_t>(dev, hzBuf, projLen);
-    const auto gOld = downloadBuffer<IntegerAABB>(dev, obBuf, numBounds);
+    std::vector<uint32_t> gPX(projLen), gPY(projLen), gPZ(projLen), gHX(projLen), gHY(projLen), gHZ(projLen);
+    std::vector<IntegerAABB> gOld(numBounds);
+    shim.memcpyDtoH(gPX.data(), dPX, projLen * 4);
+    shim.memcpyDtoH(gPY.data(), dPY, projLen * 4);
+    shim.memcpyDtoH(gPZ.data(), dPZ, projLen * 4);
+    shim.memcpyDtoH(gHX.data(), dHX, projLen * 4);
+    shim.memcpyDtoH(gHY.data(), dHY, projLen * 4);
+    shim.memcpyDtoH(gHZ.data(), dHZ, projLen * 4);
+    shim.memcpyDtoH(gOld.data(), dOB, numBounds * sizeof(IntegerAABB));
 
     size_t mism = 0;
     for (uint32_t i = 0; i < projLen; ++i)
@@ -371,21 +416,22 @@ PXG_TEST(broadphaseSetup_markCreatedPairs)
             if (gOld[h].mMinMax[a] != rOld[h].mMinMax[a]) ++mism;
     PXG_CHECK_MSG(mism == 0, "%zu markCreated mismatches", mism);
 
-    for (PxgBufferHandle h : { chBuf, pxBuf, pyBuf, pzBuf, hxBuf, hyBuf, hzBuf, nbBuf, obBuf, dummyBuf })
-        dev->destroyBuffer(h);
+    for (PxgDevicePtr pfree : { dCh, dPX, dPY, dPZ, dHX, dHY, dHZ, dNB, dOB, dDesc })
+        shim.memFree(pfree);
 }
 
-// ---------------------------------------------------------------------------
-// Test 3: initializeSapBox1DLaunch
-// ---------------------------------------------------------------------------
 PXG_TEST(broadphaseSetup_initializeSapBox1D)
 {
+    using namespace physx;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(6300);
     const uint32_t numHandles = 200;
     const uint32_t numProjections = numHandles * 2;
 
-    // build per-axis sorted handle arrays: each box contributes a start and an
-    // end handle; place them in a random order per axis
     auto buildAxis = [&](std::vector<uint32_t>& handles) {
         std::vector<uint32_t> order(numProjections);
         std::iota(order.begin(), order.end(), 0u);
@@ -403,119 +449,137 @@ PXG_TEST(broadphaseSetup_initializeSapBox1D)
     buildAxis(handY);
     buildAxis(handZ);
 
-    std::vector<SapBox1D> sapX(numHandles), sapY(numHandles), sapZ(numHandles);
-    std::memset(sapX.data(), 0xff, sapX.size() * sizeof(SapBox1D));
-    std::memset(sapY.data(), 0xff, sapY.size() * sizeof(SapBox1D));
-    std::memset(sapZ.data(), 0xff, sapZ.size() * sizeof(SapBox1D));
+    std::vector<SapBox1D> sapInit(numHandles);
+    std::memset(sapInit.data(), 0xff, sapInit.size() * sizeof(SapBox1D));
 
     PxgSlangComputeDevice* dev = testDevice();
-    PxgBufferHandle hxBuf = createBufferFrom(dev, handX);
-    PxgBufferHandle hyBuf = createBufferFrom(dev, handY);
-    PxgBufferHandle hzBuf = createBufferFrom(dev, handZ);
-    PxgBufferHandle sxBuf = createBufferFrom(dev, sapX);
-    PxgBufferHandle syBuf = createBufferFrom(dev, sapY);
-    PxgBufferHandle szBuf = createBufferFrom(dev, sapZ);
-    std::vector<uint32_t> dummy(16, 0);
-    PxgBufferHandle dummyBuf = createBufferFrom(dev, dummy);
+    const PxgKernelDef manifest[] = { { "broadphaseSetup.spv", "initializeSapBox1DLaunch", 16u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &bpShimLoader);
 
-    Kernel k("broadphaseSetup.spv", "initializeSapBox1DLaunch", { 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 8, 8, 8 },
-             sizeof(BpParams));
-    BpParams p = {};
-    p.numHandles = numHandles;
-    // bindings 8,9,10 (handles) + 13,14,15 (sapbox)
-    k.dispatch((numProjections + 255) / 256, { dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf,
-                                               dummyBuf, dummyBuf, hxBuf, hyBuf, hzBuf, dummyBuf, dummyBuf,
-                                               sxBuf, syBuf, szBuf }, p);
-    dev->flush();
-
-    // ---- reference ----
-    auto refAxis = [&](const std::vector<uint32_t>& handles, std::vector<SapBox1D>& sap) {
-        for (uint32_t i = 0; i < numProjections; ++i)
-        {
-            const uint32_t sh = handles[i];
-            const uint32_t handle = sh >> 3;
-            const bool isStart = (sh & 1) != 0;
-            sap[handle].mMinMax[isStart ? 0 : 1] = i;
-        }
-    };
-    std::vector<SapBox1D> rX(numHandles), rY(numHandles), rZ(numHandles);
-    std::memset(rX.data(), 0xff, rX.size() * sizeof(SapBox1D));
-    std::memset(rY.data(), 0xff, rY.size() * sizeof(SapBox1D));
-    std::memset(rZ.data(), 0xff, rZ.size() * sizeof(SapBox1D));
-    refAxis(handX, rX);
-    refAxis(handY, rY);
-    refAxis(handZ, rZ);
-
-    const auto gX = downloadBuffer<SapBox1D>(dev, sxBuf, numHandles);
-    const auto gY = downloadBuffer<SapBox1D>(dev, syBuf, numHandles);
-    const auto gZ = downloadBuffer<SapBox1D>(dev, szBuf, numHandles);
-
-    size_t mism = 0;
-    for (uint32_t h = 0; h < numHandles; ++h)
+    // both variants: isNew=false -> boxSapBox1D, isNew=true -> boxNewSapBox1D
+    for (uint32_t variant = 0; variant < 2; ++variant)
     {
-        if (gX[h].mMinMax[0] != rX[h].mMinMax[0] || gX[h].mMinMax[1] != rX[h].mMinMax[1]) ++mism;
-        if (gY[h].mMinMax[0] != rY[h].mMinMax[0] || gY[h].mMinMax[1] != rY[h].mMinMax[1]) ++mism;
-        if (gZ[h].mMinMax[0] != rZ[h].mMinMax[0] || gZ[h].mMinMax[1] != rZ[h].mMinMax[1]) ++mism;
-    }
-    PXG_CHECK_MSG(mism == 0, "%zu SAP box mismatches", mism);
+        const bool isNew = variant == 1;
+        BpDescRig rig(&shim);
+        const PxgDevicePtr dHX = rig.alloc(handX.data(), handX.size() * 4);
+        const PxgDevicePtr dHY = rig.alloc(handY.data(), handY.size() * 4);
+        const PxgDevicePtr dHZ = rig.alloc(handZ.data(), handZ.size() * 4);
+        const PxgDevicePtr dSX = rig.alloc(sapInit.data(), sapInit.size() * sizeof(SapBox1D));
+        const PxgDevicePtr dSY = rig.alloc(sapInit.data(), sapInit.size() * sizeof(SapBox1D));
+        const PxgDevicePtr dSZ = rig.alloc(sapInit.data(), sapInit.size() * sizeof(SapBox1D));
+        if (!dHX) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+        rig.desc.boxHandles[0][0] = reinterpret_cast<PxU32*>(dHX);
+        rig.desc.boxHandles[0][1] = reinterpret_cast<PxU32*>(dHY);
+        rig.desc.boxHandles[0][2] = reinterpret_cast<PxU32*>(dHZ);
+        PxgSapBox1D** sapArr = isNew ? rig.desc.boxNewSapBox1D : rig.desc.boxSapBox1D;
+        sapArr[0] = reinterpret_cast<PxgSapBox1D*>(dSX);
+        sapArr[1] = reinterpret_cast<PxgSapBox1D*>(dSY);
+        sapArr[2] = reinterpret_cast<PxgSapBox1D*>(dSZ);
+        const PxgDevicePtr dDesc = rig.upload();
 
-    for (PxgBufferHandle h : { hxBuf, hyBuf, hzBuf, sxBuf, syBuf, szBuf, dummyBuf })
-        dev->destroyBuffer(h);
+        // engine ABI: (bpDesc*, PxU32 numHandles, bool isNew) via the bridge blob rule
+        EngineBlob blob;
+        blob.add<uint64_t>(dDesc);
+        blob.add<uint32_t>(numHandles);
+        blob.add<uint8_t>(isNew ? 1u : 0u);
+        blob.finish();
+        PXG_CHECK_MSG(blob.bytes.size() == 16, "sapbox blob is 16 bytes (got %zu)", blob.bytes.size());
+        PXG_CHECK_MSG(shim.launchKernel(0, (numProjections + 255) / 256, 1, 1, blob.bytes.data(),
+                                        uint32_t(blob.bytes.size())) == PxgResult::Success, "launch sapbox init");
+        shim.streamSynchronize();
+
+        auto refAxis = [&](const std::vector<uint32_t>& handles, std::vector<SapBox1D>& sap) {
+            for (uint32_t i = 0; i < numProjections; ++i)
+            {
+                const uint32_t sh = handles[i];
+                const uint32_t handle = sh >> 3;
+                const bool isStart = (sh & 1) != 0;
+                sap[handle].mMinMax[isStart ? 0 : 1] = i;
+            }
+        };
+        std::vector<SapBox1D> rX = sapInit, rY = sapInit, rZ = sapInit;
+        refAxis(handX, rX);
+        refAxis(handY, rY);
+        refAxis(handZ, rZ);
+
+        std::vector<SapBox1D> gX(numHandles), gY(numHandles), gZ(numHandles);
+        shim.memcpyDtoH(gX.data(), dSX, numHandles * sizeof(SapBox1D));
+        shim.memcpyDtoH(gY.data(), dSY, numHandles * sizeof(SapBox1D));
+        shim.memcpyDtoH(gZ.data(), dSZ, numHandles * sizeof(SapBox1D));
+
+        size_t mism = 0;
+        for (uint32_t h = 0; h < numHandles; ++h)
+        {
+            if (gX[h].mMinMax[0] != rX[h].mMinMax[0] || gX[h].mMinMax[1] != rX[h].mMinMax[1]) ++mism;
+            if (gY[h].mMinMax[0] != rY[h].mMinMax[0] || gY[h].mMinMax[1] != rY[h].mMinMax[1]) ++mism;
+            if (gZ[h].mMinMax[0] != rZ[h].mMinMax[0] || gZ[h].mMinMax[1] != rZ[h].mMinMax[1]) ++mism;
+        }
+        PXG_CHECK_MSG(mism == 0, "variant %u: %zu SAP box mismatches", variant, mism);
+
+        for (PxgDevicePtr pfree : { dHX, dHY, dHZ, dSX, dSY, dSZ, dDesc })
+            shim.memFree(pfree);
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Test 4: initializeRadixRanks
-// ---------------------------------------------------------------------------
 PXG_TEST(broadphaseSetup_initializeRadixRanks)
 {
+    using namespace physx;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     const uint32_t numPrevious = 151; // odd; numProjections = 302, padded to 304
     const uint32_t numProjections = numPrevious * 2;
     const uint32_t padded = ((numProjections + 3) / 4) * 4;
 
-    std::vector<uint32_t> ranksX(padded, 0xeeeeeeeeu), ranksY(padded, 0xeeeeeeeeu), ranksZ(padded, 0xeeeeeeeeu);
-    std::vector<uint32_t> dummy(16, 0);
+    std::vector<uint32_t> init(padded, 0xeeeeeeeeu);
 
     PxgSlangComputeDevice* dev = testDevice();
-    PxgBufferHandle rxBuf = createBufferFrom(dev, ranksX);
-    PxgBufferHandle ryBuf = createBufferFrom(dev, ranksY);
-    PxgBufferHandle rzBuf = createBufferFrom(dev, ranksZ);
-    PxgBufferHandle dummyBuf = createBufferFrom(dev, dummy);
+    const PxgKernelDef manifest[] = { { "broadphaseSetup.spv", "initializeRadixRanks", 8u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &bpShimLoader);
 
-    Kernel k("broadphaseSetup.spv", "initializeRadixRanks",
-             { 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4 }, sizeof(BpParams));
-    BpParams p = {};
-    p.numProjections = numProjections;
-    // bindings 16,17,18
-    std::vector<PxgBufferHandle> bufs(16, dummyBuf);
-    bufs.push_back(rxBuf);
-    bufs.push_back(ryBuf);
-    bufs.push_back(rzBuf);
-    k.dispatch((padded + 255) / 256, bufs, p);
-    dev->flush();
+    BpDescRig rig(&shim);
+    const PxgDevicePtr dRX = rig.alloc(init.data(), init.size() * 4);
+    const PxgDevicePtr dRY = rig.alloc(init.data(), init.size() * 4);
+    const PxgDevicePtr dRZ = rig.alloc(init.data(), init.size() * 4);
+    if (!dRX) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+    rig.desc.numPreviousHandles = numPrevious;
+    rig.desc.boxProjectionRanks[0] = reinterpret_cast<PxU32*>(dRX);
+    rig.desc.boxProjectionRanks[1] = reinterpret_cast<PxU32*>(dRY);
+    rig.desc.boxProjectionRanks[2] = reinterpret_cast<PxU32*>(dRZ);
+    const PxgDevicePtr dDesc = rig.upload();
 
-    const auto gX = downloadBuffer<uint32_t>(dev, rxBuf, padded);
-    const auto gY = downloadBuffer<uint32_t>(dev, ryBuf, padded);
-    const auto gZ = downloadBuffer<uint32_t>(dev, rzBuf, padded);
+    struct { uint64_t bpDesc; } prm = { dDesc };
+    // engine grid: BP_INITIALIZE_RANKS = 64 blocks x 256 (grid-stride over N/4)
+    PXG_CHECK_MSG(shim.launchKernel(0, 64, 1, 1, &prm, sizeof(prm)) == PxgResult::Success, "launch radix ranks");
+    shim.streamSynchronize();
+
+    std::vector<uint32_t> gX(padded), gY(padded), gZ(padded);
+    shim.memcpyDtoH(gX.data(), dRX, padded * 4);
+    shim.memcpyDtoH(gY.data(), dRY, padded * 4);
+    shim.memcpyDtoH(gZ.data(), dRZ, padded * 4);
     size_t mism = 0;
     for (uint32_t i = 0; i < padded; ++i)
         if (gX[i] != i || gY[i] != i || gZ[i] != i) ++mism;
     PXG_CHECK_MSG(mism == 0, "%zu radix-rank mismatches", mism);
 
-    for (PxgBufferHandle h : { rxBuf, ryBuf, rzBuf, dummyBuf })
-        dev->destroyBuffer(h);
+    for (PxgDevicePtr pfree : { dRX, dRY, dRZ, dDesc })
+        shim.memFree(pfree);
 }
 
-// ---------------------------------------------------------------------------
-// Test 5: updateHandles
-// ---------------------------------------------------------------------------
 PXG_TEST(broadphaseSetup_updateHandles)
 {
+    using namespace physx;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(6400);
     const uint32_t numPrevious = 220;
     const uint32_t numProjections = numPrevious * 2;
 
-    // per-axis: a random permutation of [0, numProjections) as the sort ranks,
-    // and previous-frame handle arrays with distinct values
     auto buildPerm = [&]() {
         std::vector<uint32_t> perm(numProjections);
         std::iota(perm.begin(), perm.end(), 0u);
@@ -530,36 +594,45 @@ PXG_TEST(broadphaseSetup_updateHandles)
         tmpY[i] = 0x2000 + i;
         tmpZ[i] = 0x3000 + i;
     }
-    std::vector<uint32_t> handX(numProjections, 0), handY(numProjections, 0), handZ(numProjections, 0);
-    std::vector<uint32_t> dummy(16, 0);
+    std::vector<uint32_t> zero(numProjections, 0);
 
     PxgSlangComputeDevice* dev = testDevice();
-    PxgBufferHandle hxBuf = createBufferFrom(dev, handX);
-    PxgBufferHandle hyBuf = createBufferFrom(dev, handY);
-    PxgBufferHandle hzBuf = createBufferFrom(dev, handZ);
-    PxgBufferHandle rxBuf = createBufferFrom(dev, ranksX);
-    PxgBufferHandle ryBuf = createBufferFrom(dev, ranksY);
-    PxgBufferHandle rzBuf = createBufferFrom(dev, ranksZ);
-    PxgBufferHandle txBuf = createBufferFrom(dev, tmpX);
-    PxgBufferHandle tyBuf = createBufferFrom(dev, tmpY);
-    PxgBufferHandle tzBuf = createBufferFrom(dev, tmpZ);
-    PxgBufferHandle dummyBuf = createBufferFrom(dev, dummy);
+    const PxgKernelDef manifest[] = { { "broadphaseSetup.spv", "updateHandles", 8u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &bpShimLoader);
 
-    Kernel k("broadphaseSetup.spv", "updateHandles",
-             { 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4 }, sizeof(BpParams));
-    BpParams p = {};
-    p.numProjections = numProjections;
-    // bindings 8,9,10 (dest) + 16,17,18 (ranks) + 19,20,21 (prev)
-    std::vector<PxgBufferHandle> bufs(22, dummyBuf);
-    bufs[8] = hxBuf; bufs[9] = hyBuf; bufs[10] = hzBuf;
-    bufs[16] = rxBuf; bufs[17] = ryBuf; bufs[18] = rzBuf;
-    bufs[19] = txBuf; bufs[20] = tyBuf; bufs[21] = tzBuf;
-    k.dispatch((numProjections + 255) / 256, bufs, p);
-    dev->flush();
+    BpDescRig rig(&shim);
+    const PxgDevicePtr dRX = rig.alloc(ranksX.data(), ranksX.size() * 4);
+    const PxgDevicePtr dRY = rig.alloc(ranksY.data(), ranksY.size() * 4);
+    const PxgDevicePtr dRZ = rig.alloc(ranksZ.data(), ranksZ.size() * 4);
+    const PxgDevicePtr dTX = rig.alloc(tmpX.data(), tmpX.size() * 4);
+    const PxgDevicePtr dTY = rig.alloc(tmpY.data(), tmpY.size() * 4);
+    const PxgDevicePtr dTZ = rig.alloc(tmpZ.data(), tmpZ.size() * 4);
+    const PxgDevicePtr dCX = rig.alloc(zero.data(), zero.size() * 4);
+    const PxgDevicePtr dCY = rig.alloc(zero.data(), zero.size() * 4);
+    const PxgDevicePtr dCZ = rig.alloc(zero.data(), zero.size() * 4);
+    if (!dRX) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+    rig.desc.numPreviousHandles = numPrevious;
+    rig.desc.boxProjectionRanks[0] = reinterpret_cast<PxU32*>(dRX);
+    rig.desc.boxProjectionRanks[1] = reinterpret_cast<PxU32*>(dRY);
+    rig.desc.boxProjectionRanks[2] = reinterpret_cast<PxU32*>(dRZ);
+    rig.desc.boxHandles[0][0] = reinterpret_cast<PxU32*>(dCX);
+    rig.desc.boxHandles[0][1] = reinterpret_cast<PxU32*>(dCY);
+    rig.desc.boxHandles[0][2] = reinterpret_cast<PxU32*>(dCZ);
+    rig.desc.boxHandles[1][0] = reinterpret_cast<PxU32*>(dTX);
+    rig.desc.boxHandles[1][1] = reinterpret_cast<PxU32*>(dTY);
+    rig.desc.boxHandles[1][2] = reinterpret_cast<PxU32*>(dTZ);
+    const PxgDevicePtr dDesc = rig.upload();
 
-    const auto gX = downloadBuffer<uint32_t>(dev, hxBuf, numProjections);
-    const auto gY = downloadBuffer<uint32_t>(dev, hyBuf, numProjections);
-    const auto gZ = downloadBuffer<uint32_t>(dev, hzBuf, numProjections);
+    struct { uint64_t bpDesc; } prm = { dDesc };
+    // engine grid: BP_UDPATE_HANDLES = 64 blocks x 256 (grid-stride)
+    PXG_CHECK_MSG(shim.launchKernel(0, 64, 1, 1, &prm, sizeof(prm)) == PxgResult::Success, "launch updateHandles");
+    shim.streamSynchronize();
+
+    std::vector<uint32_t> gX(numProjections), gY(numProjections), gZ(numProjections);
+    shim.memcpyDtoH(gX.data(), dCX, numProjections * 4);
+    shim.memcpyDtoH(gY.data(), dCY, numProjections * 4);
+    shim.memcpyDtoH(gZ.data(), dCZ, numProjections * 4);
+
     size_t mism = 0;
     for (uint32_t i = 0; i < numProjections; ++i)
     {
@@ -569,8 +642,8 @@ PXG_TEST(broadphaseSetup_updateHandles)
     }
     PXG_CHECK_MSG(mism == 0, "%zu updateHandles mismatches", mism);
 
-    for (PxgBufferHandle h : { hxBuf, hyBuf, hzBuf, rxBuf, ryBuf, rzBuf, txBuf, tyBuf, tzBuf, dummyBuf })
-        dev->destroyBuffer(h);
+    for (PxgDevicePtr pfree : { dRX, dRY, dRZ, dTX, dTY, dTZ, dCX, dCY, dCZ, dDesc })
+        shim.memFree(pfree);
 }
 
 } // namespace

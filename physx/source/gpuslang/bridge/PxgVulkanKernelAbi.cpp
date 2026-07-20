@@ -55,11 +55,18 @@ static const uint8_t kTranslateAABBs[] = { 8, 8, 8, 8, 4, 1, 1, 1, 1, 1, 1 };
 // broadphase.cu: clearNewFlagLaunch(const PxgBroadPhaseDesc*) / bpSignalComplete(PxU32*)
 static const uint8_t kOnePtr[] = { 8 };
 
+// broadphase.cu: initializeSapBox1DLaunch(const PxgBroadPhaseDesc*, PxU32 numHandles, bool isNew)
+static const uint8_t kSapBoxInit[] = { 8, 4, 1 };
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },
     { "clearNewFlagLaunch", kOnePtr, 1u },
     { "bpSignalComplete", kOnePtr, 1u },
+    { "markCreatedPairsLaunch", kOnePtr, 1u },
+    { "initializeSapBox1DLaunch", kSapBoxInit, uint32_t(sizeof(kSapBoxInit)) },
+    { "initializeRadixRanks", kOnePtr, 1u },
+    { "updateHandles", kOnePtr, 1u },
 };
 
 inline size_t abiAlign(size_t size)
