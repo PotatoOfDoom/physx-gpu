@@ -115,6 +115,15 @@ static const uint8_t kBoxBoxNphase[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 
 //   contactBytesLimit, forceBytesLimit) — the sphere/capsule/plane/box primitive
 //   contact generator.  Note toleranceLength is the 2nd arg (unlike box-box's last).
 static const uint8_t kSphereNphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4 };
+// gpunarrowphase cudaGJKEPA.cu: convexPlaneNphase_Kernel(PxU32 numTests, 15
+//   device pointers (cmInputs, cmOutputs, shapes, transformCache,
+//   contactDistance, materials, contactStream, patchStream, cmManifolds,
+//   patchAndContactCounters, touchChangeFlags, patchChangeFlags,
+//   startContactPatches, startContactPoints, startContactForces), PxU32
+//   patchBytesLimit, contactBytesLimit, forceBytesLimit, PxReal
+//   toleranceLength) — the convex/box-vs-plane PCM contact generator (144-byte
+//   push blob).
+static const uint8_t kConvexPlaneNphase[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4 };
 
 // gpunarrowphase convex-convex core (cudaGJKEPA.cu):
 //   convexConvexNphase_stage1Kernel(PxU32 numTests, PxReal toleranceLength,
@@ -224,6 +233,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "prepareLostFoundPairs_Stage2", kLostFound2, uint32_t(sizeof(kLostFound2)) },
     { "boxBoxNphase_Kernel", kBoxBoxNphase, uint32_t(sizeof(kBoxBoxNphase)) },
     { "sphereNphase_Kernel", kSphereNphase, uint32_t(sizeof(kSphereNphase)) },
+    { "convexPlaneNphase_Kernel", kConvexPlaneNphase, uint32_t(sizeof(kConvexPlaneNphase)) },
 };
 
 inline size_t abiAlign(size_t size)

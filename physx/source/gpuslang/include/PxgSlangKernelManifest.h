@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 143;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 144;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -74,7 +74,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "prepareLostFoundPairs_Stage2", "npCvxLostFound.spv", "prepareLostFoundPairs_Stage2" },  // COMPACT_LOST_FOUND_PAIRS_2
     { "sphereNphase_Kernel", "npSphereNphase.spv", "sphereNphase_Kernel" },  // SPHERE_KERNEL_MAIN
     { "boxBoxNphase_Kernel", "boxBoxNphase.spv", "boxBoxNphase_Kernel" },  // BOX_BOX_KERNEL_MAIN
-    { "convexPlaneNphase_Kernel", nullptr, nullptr },  // CONVEX_PLANE_KERNEL_MAIN (unmapped)
+    { "convexPlaneNphase_Kernel", "npCvxPlaneNphase.spv", "convexPlaneNphase_Kernel" },  // CONVEX_PLANE_KERNEL_MAIN (P5 Step 5 tranche C BDA)
     { "convexCorePlaneNphase_Kernel", nullptr, nullptr },  // CONVEXCORE_PLANE_KERNEL_MAIN (unmapped)
     { "convexCoreConvexNphase_Kernel", nullptr, nullptr },  // CONVEXCORE_CONVEX_KERNEL_MAIN (unmapped)
     { "convexCoreTrimeshNphase_Kernel32", nullptr, nullptr },  // CONVEXCORE_TRIMESH_KERNEL32_MAIN (unmapped)
