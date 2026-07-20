@@ -506,7 +506,7 @@ PXG_TEST(solverPGS_contactAndJointBatches)
             b.remappedBodyAIndex[lane] = k * 128 + lane;
             b.remappedBodyBIndex[lane] = k * 128 + lane + 64;
 
-            if (b.constraintType == 0)
+            if (b.constraintType == 1) // engine encoding: eCONTACT=1 (was inverted 0)
             {
                 BlockContactHeader& h = contactHeaders[k];
                 h.invMass0_1_angDom0_1[lane] = Float4{ unit(rng), unit(rng), unit(rng), unit(rng) };
@@ -630,7 +630,7 @@ PXG_TEST(solverPGS_contactAndJointBatches)
             if (b.bodyBIndex[lane] >= bodyOffset)
                 ref1 = float(refCountActiveSlabs(b.bodyBIndex[lane], numSlabs, numTotalBodies, encoded));
 
-            if (b.constraintType == 0)
+            if (b.constraintType == 1) // engine encoding: eCONTACT=1 (was inverted 0)
                 refSolveContact(b, lv0, av0, lv1, av1, true, lane, contactHeaders, frictionHeaders,
                                 contactPoints, frictions, ref0, ref1);
             else
@@ -767,7 +767,7 @@ PXG_TEST(solverPGS_concludeAndWriteback)
             b.bodyBIndex[lane] = rng() % numBodies;
             b.shapeInteraction[lane] = (uint64_t(rng()) << 32) | rng();
 
-            if (b.constraintType == 0)
+            if (b.constraintType == 1) // engine encoding: eCONTACT=1 (was inverted 0)
             {
                 contactHeaders[k].numNormalConstr[lane] = rng() % (rowsPerBatch + 1);
                 contactHeaders[k].restitution[lane] = unit(rng) < 0.5f ? unit(rng) : -unit(rng) * 50.f;
@@ -887,7 +887,7 @@ PXG_TEST(solverPGS_concludeAndWriteback)
         const BlockConstraintBatch& b = batches[k];
         for (uint32_t lane = 0; lane < b.descStride; ++lane)
         {
-            if (b.constraintType == 0)
+            if (b.constraintType == 1) // engine encoding: eCONTACT=1 (was inverted 0)
             {
                 // concludeContactBlock
                 const uint32_t nc = contactHeaders[k].numNormalConstr[lane];

@@ -64,8 +64,19 @@ static const uint DY_SC_FLAG_ACCELERATION_SPRING = 1u << 7;
 // PxgSolverFlags.h
 static const uint PXG_CONTACT_FLAG_COMPLIANT_ACCELERATION_SPRING = 1u << 3;
 
-// PxgSolverConstraintDesc.h
-static const uint PXG_CONSTRAINT_CONTACT = 0; // PxgSolverConstraintDesc::eCONTACT
+// PxgSolverConstraintDesc.h — PxgConstraintType, the encoding the engine's block
+// prep writes into descStride_constraintType>>16: eCONSTRAINT_1D=0, eCONTACT=1,
+// eARTICULATION_CONSTRAINT_1D=2, eARTICULATION_CONTACT=3.  A batch is a CONTACT iff
+// its type is eCONTACT(1) or eARTICULATION_CONTACT(3); 0/2 are 1D joints.  (The
+// legacy PXG_CONSTRAINT_CONTACT=0 name below is inverted vs the engine and kept
+// only for reference — do NOT branch on it; use pxgIsContactType.)
+static const uint PXG_CONSTRAINT_CONTACT = 0; // PxgSolverConstraintDesc::eCONTACT (legacy/inverted — unused)
+static const uint PXG_SOLVER_CONSTRAINT_TYPE_CONTACT = 1u;
+static const uint PXG_SOLVER_CONSTRAINT_TYPE_ARTI_CONTACT = 3u;
+bool pxgIsContactType(uint t)
+{
+    return t == PXG_SOLVER_CONSTRAINT_TYPE_CONTACT || t == PXG_SOLVER_CONSTRAINT_TYPE_ARTI_CONTACT;
+}
 
 // ---------------------------------------------------------------------------
 // Block SoA data structures (byte-identical mirrors incl. alignment padding)
@@ -658,7 +669,7 @@ void solveBlockPartition(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId :
             curRef1 = float(countActiveSlabs(gBatches[k].bodyBIndex[threadIndexInWarp], gParams.numSlabs,
                                              gParams.numTotalBodies));
 
-        if (constraintType == PXG_CONSTRAINT_CONTACT)
+        if (pxgIsContactType(constraintType))
             solveContactBlock(k, lv0, av0, lv1, av1, gParams.doFriction != 0, threadIndexInWarp, curRef0, curRef1);
         else
             solve1DBlock(k, lv0, av0, lv1, av1, threadIndexInWarp, gParams.residualReportingEnabled != 0,
@@ -704,7 +715,7 @@ void concludeBlocks(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_G
     const uint startConstraintIndex = gBatches[k].startConstraintIndex;
     const uint startFrictionIndex = gBatches[k].startFrictionIndex;
 
-    if (constraintType == PXG_CONSTRAINT_CONTACT)
+    if (pxgIsContactType(constraintType))
     {
         // concludeContactBlock()
         const uint numNormalConstr = gContactHeaders[batchIndex].numNormalConstr[threadIndex];
@@ -817,7 +828,7 @@ void writebackBlocks(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_
     const uint startConstraintIndex = gBatches[k].startConstraintIndex;
     const uint startFrictionIndex = gBatches[k].startFrictionIndex;
 
-    if (constraintType == PXG_CONSTRAINT_CONTACT)
+    if (pxgIsContactType(constraintType))
     {
         // writeBackContactBlock()
         const uint bodyAIndex = gBatches[k].bodyAIndex[threadIndex];
