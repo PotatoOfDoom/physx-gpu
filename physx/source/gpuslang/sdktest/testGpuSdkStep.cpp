@@ -14,6 +14,9 @@
 
 #include <cstdio>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 
 using namespace physx;
 
@@ -71,6 +74,103 @@ PxFilterFlags stepFilterShader(PxFilterObjectAttributes, PxFilterData, PxFilterO
 {
     pairFlags = PxPairFlag::eCONTACT_DEFAULT;
     return PxFilterFlag::eDEFAULT;
+}
+
+// A dynamic body expected to come to rest at a known centre height on the GPU.
+struct RestTarget
+{
+    PxRigidDynamic* body;
+    float startY;   // spawn centre height
+    float restY;    // expected resting centre height
+    const char* label;
+};
+
+// Solid-box mass-space inertia (about the centre): I_axis = m/3 * (sum of the two
+// perpendicular half-extents squared).  For half 0.5 / m 1000 this is 166.67 per
+// axis, matching the single-box scene.
+PxVec3 boxInertia(const PxVec3& h, float mass)
+{
+    const float k = mass / 3.0f;
+    return PxVec3(k * (h.y * h.y + h.z * h.z),
+                  k * (h.x * h.x + h.z * h.z),
+                  k * (h.x * h.x + h.y * h.y));
+}
+
+PxRigidStatic* addGroundBox(PxPhysics* physics, PxScene* scene, PxMaterial* material)
+{
+    PxRigidStatic* ground = physics->createRigidStatic(PxTransform(PxVec3(0.0f, -0.5f, 0.0f)));
+    PxShape* gs = physics->createShape(PxBoxGeometry(50.0f, 0.5f, 50.0f), *material);
+    ground->attachShape(*gs);
+    scene->addActor(*ground);
+    return ground;
+}
+
+PxRigidDynamic* addDynamic(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                           const PxGeometry& geom, const PxVec3& inertia, float y)
+{
+    PxRigidDynamic* b = physics->createRigidDynamic(PxTransform(PxVec3(0.0f, y, 0.0f)));
+    PxShape* s = physics->createShape(geom, *material);
+    b->attachShape(*s);
+    b->setMass(1000.0f);
+    b->setMassSpaceInertiaTensor(inertia);
+    scene->addActor(*b);
+    return b;
+}
+
+// PXG_SCENE=box (default): one dynamic box (half 0.5) dropped from y=5 onto a static
+// ground box; rests at centre y=0.5.  The original single-body scene.
+void buildBoxScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                   std::vector<RestTarget>& targets)
+{
+    addGroundBox(physics, scene, material);
+    PxRigidDynamic* b = addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                   boxInertia(PxVec3(0.5f), 1000.0f), 5.0f);
+    targets.push_back({ b, 5.0f, 0.5f, "box" });
+}
+
+// PXG_SCENE=stack: a static ground box + three dynamic boxes spawned with gaps so
+// they settle into a stack.  Exercises dynamic-vs-dynamic box-box contacts and the
+// TGS partition solve path (solveBlockUnified) — the multi-body island case.
+void buildStackScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                     std::vector<RestTarget>& targets)
+{
+    addGroundBox(physics, scene, material);
+    const char* labels[3] = { "stack0", "stack1", "stack2" };
+    const float restY[3]  = { 0.5f, 1.5f, 2.5f };
+    const float startY[3] = { 2.0f, 3.4f, 4.8f };
+    for (int i = 0; i < 3; ++i)
+    {
+        PxRigidDynamic* b = addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                       boxInertia(PxVec3(0.5f), 1000.0f), startY[i]);
+        targets.push_back({ b, startY[i], restY[i], labels[i] });
+    }
+}
+
+// PXG_SCENE=plane: one dynamic box resting on a static infinite PxPlaneGeometry
+// (y=0).  Exercises the convex/box-plane narrowphase path.
+void buildPlaneScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                     std::vector<RestTarget>& targets)
+{
+    PxRigidStatic* ground = physics->createRigidStatic(PxTransformFromPlaneEquation(PxPlane(0.0f, 1.0f, 0.0f, 0.0f)));
+    PxShape* ps = physics->createShape(PxPlaneGeometry(), *material);
+    ground->attachShape(*ps);
+    scene->addActor(*ground);
+    PxRigidDynamic* b = addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                   boxInertia(PxVec3(0.5f), 1000.0f), 5.0f);
+    targets.push_back({ b, 5.0f, 0.5f, "boxOnPlane" });
+}
+
+// PXG_SCENE=sphere: one dynamic sphere (radius 0.5) resting on the static ground box.
+// Exercises the sphere narrowphase path (sphere-box sub-case).
+void buildSphereScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                      std::vector<RestTarget>& targets)
+{
+    addGroundBox(physics, scene, material);
+    const float r = 0.5f;
+    const float sphereI = 0.4f * 1000.0f * r * r; // solid sphere: 2/5 m r^2
+    PxRigidDynamic* b = addDynamic(physics, scene, material, PxSphereGeometry(r),
+                                   PxVec3(sphereI, sphereI, sphereI), 5.0f);
+    targets.push_back({ b, 5.0f, 0.5f, "sphere" });
 }
 } // namespace
 
@@ -133,19 +233,19 @@ int main()
 
     PxMaterial* material = physics->createMaterial(0.5f, 0.5f, 0.1f);
 
-    PxRigidStatic* ground = physics->createRigidStatic(PxTransform(PxVec3(0.0f, -0.5f, 0.0f)));
-    PxShape* groundShape = physics->createShape(PxBoxGeometry(50.0f, 0.5f, 50.0f), *material);
-    ground->attachShape(*groundShape);
-    scene->addActor(*ground);
-
-    const float startY = 5.0f;
-    PxRigidDynamic* box = physics->createRigidDynamic(PxTransform(PxVec3(0.0f, startY, 0.0f)));
-    PxShape* boxShape = physics->createShape(PxBoxGeometry(0.5f, 0.5f, 0.5f), *material);
-    box->attachShape(*boxShape);
-    box->setMass(1000.0f);
-    box->setMassSpaceInertiaTensor(PxVec3(166.67f, 166.67f, 166.67f));
-    scene->addActor(*box);
-    std::printf("  [  OK  ] two actors added to the GPU scene (static ground + dynamic box)\n");
+    // Scene selection: PXG_SCENE picks which rigid scene to build (default "box").
+    // Each builder adds its actors and pushes the dynamic bodies it wants rest-checked.
+    const char* sceneName = std::getenv("PXG_SCENE");
+    if (!sceneName) sceneName = "box";
+    std::vector<RestTarget> targets;
+    if      (!std::strcmp(sceneName, "box"))    buildBoxScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "stack"))  buildStackScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "plane"))  buildPlaneScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "sphere")) buildSphereScene(physics, scene, material, targets);
+    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere)\n", sceneName);
+           scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
+    std::printf("  [  OK  ] scene '%s' built: %zu dynamic body(ies) + ground on the GPU\n",
+                sceneName, targets.size());
 
     // The asserted milestone is a CONSTRUCTED, live GPU pipeline (above).  Actually
     // STEPPING it is RUNTIME_PLAN.md P5 Step 4 — a per-kernel launch-ABI bring-up that
@@ -169,26 +269,33 @@ int main()
 
     const float dt = 1.0f / 60.0f;
     const int steps = 240;
-    float yAfterOne = startY;
-    std::printf("  stepping the GPU scene (%d x %.4fs)...\n", steps, dt);
+    std::vector<float> yAfterOne(targets.size());
+    for (size_t t = 0; t < targets.size(); ++t) yAfterOne[t] = targets[t].startY;
+    std::printf("  stepping the GPU scene '%s' (%d x %.4fs)...\n", sceneName, steps, dt);
     for (int i = 0; i < steps; ++i)
     {
         scene->simulate(dt);
         scene->fetchResults(true);
         if (i == 0)
-            yAfterOne = box->getGlobalPose().p.y;
+            for (size_t t = 0; t < targets.size(); ++t)
+                yAfterOne[t] = targets[t].body->getGlobalPose().p.y;
     }
 
-    const float finalY = box->getGlobalPose().p.y;
-    const PxVec3 finalV = box->getLinearVelocity();
-    std::printf("  box start y=%.3f, y after 1 step=%.4f, final y=%.4f, final |v|=%.4f\n",
-                startY, yAfterOne, finalY, finalV.magnitude());
-
+    // Per-body rest checks: began falling, reached its resting band (restY within a
+    // generous tolerance — stacks settle with some jitter), did not sink through, at rest.
     int failures = 0;
-    if (!(yAfterOne < startY)) { std::printf("FAIL: box did not begin falling on the GPU\n"); ++failures; }
-    if (!(finalY < 1.5f))      { std::printf("FAIL: box did not reach the ground (finalY=%.3f)\n", finalY); ++failures; }
-    if (!(finalY > 0.0f))      { std::printf("FAIL: box fell through the ground (finalY=%.3f)\n", finalY); ++failures; }
-    if (!(finalV.magnitude() < 0.5f)) { std::printf("FAIL: box not at rest (|v|=%.3f)\n", finalV.magnitude()); ++failures; }
+    for (size_t t = 0; t < targets.size(); ++t)
+    {
+        const RestTarget& tg = targets[t];
+        const float finalY = tg.body->getGlobalPose().p.y;
+        const float speed = tg.body->getLinearVelocity().magnitude();
+        std::printf("  [%s] start y=%.3f, y after 1 step=%.4f, final y=%.4f (rest %.3f), |v|=%.4f\n",
+                    tg.label, tg.startY, yAfterOne[t], finalY, tg.restY, speed);
+        if (!(yAfterOne[t] < tg.startY)) { std::printf("FAIL: [%s] did not begin falling\n", tg.label); ++failures; }
+        if (!(finalY < tg.restY + 0.75f)) { std::printf("FAIL: [%s] above rest band (finalY=%.3f)\n", tg.label, finalY); ++failures; }
+        if (!(finalY > tg.restY - 0.75f)) { std::printf("FAIL: [%s] below rest band / sank (finalY=%.3f)\n", tg.label, finalY); ++failures; }
+        if (!(speed < 0.75f)) { std::printf("FAIL: [%s] not at rest (|v|=%.3f)\n", tg.label, speed); ++failures; }
+    }
 
     scene->release();
     physics->release();
@@ -197,10 +304,11 @@ int main()
 
     if (failures == 0)
     {
-        std::printf("[  OK  ] gpu-sdk-step: real PhysX scene stepped on the Vulkan GPU pipeline (box fell + rested)\n");
+        std::printf("[  OK  ] gpu-sdk-step: scene '%s' stepped on the Vulkan GPU pipeline "
+                    "(all %zu body(ies) fell + rested)\n", sceneName, targets.size());
         return 0;
     }
-    std::printf("[ PARTIAL ] gpu-sdk-step: GPU pipeline constructed; %d step check(s) failed "
-                "(kernel-launch marshalling frontier)\n", failures);
+    std::printf("[ PARTIAL ] gpu-sdk-step: scene '%s' constructed; %d step check(s) failed "
+                "(kernel-launch marshalling frontier)\n", sceneName, failures);
     return 2;
 }
