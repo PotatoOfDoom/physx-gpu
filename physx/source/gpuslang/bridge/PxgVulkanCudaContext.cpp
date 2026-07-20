@@ -29,6 +29,7 @@
 
 #if PX_SUPPORT_GPU_PHYSX
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -257,6 +258,21 @@ public:
     }
 
     // ---- launch ----
+    // PXG_LAUNCH_TRACE=1: append one line per launch attempt to stderr —
+    // "form kernelName result" — the ground truth of what the engine actually
+    // launches (and in what order) during a stepped scene.  Drives the P5
+    // Step 4 bring-up work list; costs nothing when the env var is unset.
+    void traceLaunch(const char* form, PxgKernelId id, bool ok)
+    {
+        static const bool on = std::getenv("PXG_LAUNCH_TRACE") != nullptr;
+        if (!on)
+            return;
+        const char* name = id < mManifestCount && mManifest[id].cudaName
+            ? mManifest[id].cudaName
+            : (id < mManifestCount && mManifest[id].entry ? mManifest[id].entry : "?");
+        std::fprintf(stderr, "[pxg-launch] %s %s %s\n", form, name, ok ? "OK" : "REFUSED");
+    }
+
     PxCUresult launchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
                             unsigned int /*blockDimX*/, unsigned int /*blockDimY*/, unsigned int /*blockDimZ*/,
                             unsigned int /*sharedMemBytes*/, CUstream /*hStream*/, PxCudaKernelParam* kernelParams,
@@ -295,8 +311,10 @@ public:
         // not 12).  The Slang side sees exactly that struct, so round the blob to match,
         // otherwise the shim's blobSize == pushConstantSize gate rejects the launch.
         blob.resize((blob.size() + (maxAlign - 1)) & ~(maxAlign - 1));
-        return record(mShim->launchKernel(id, gridDimX, gridDimY, gridDimZ, blob.data(),
-                                          uint32_t(blob.size())));
+        const PxgResult res = mShim->launchKernel(id, gridDimX, gridDimY, gridDimZ, blob.data(),
+                                                  uint32_t(blob.size()));
+        traceLaunch("sized", id, res == PxgResult::Success);
+        return record(res);
     }
     PxCUresult launchKernel(CUfunction f, PxU32 gridDimX, PxU32 gridDimY, PxU32 gridDimZ,
                             PxU32 /*blockDimX*/, PxU32 /*blockDimY*/, PxU32 /*blockDimZ*/, PxU32 /*sharedMemBytes*/,
@@ -315,7 +333,10 @@ public:
             return record(PxgResult::InvalidValue);
         const PxgKernelAbiRow* abi = id < mManifestCount ? pxgFindKernelAbi(mManifest[id].cudaName) : nullptr;
         if (!abi || !kernelParams)
+        {
+            traceLaunch("void**", id, false);
             return record(PxgResult::InvalidValue);
+        }
 
         std::vector<uint8_t> blob;
         size_t maxAlign = 1;
@@ -328,8 +349,10 @@ public:
             blob.insert(blob.end(), d, d + abi->argSizes[i]);
         }
         blob.resize((blob.size() + (maxAlign - 1)) & ~(maxAlign - 1));
-        return record(mShim->launchKernel(id, gridDimX, gridDimY, gridDimZ, blob.data(),
-                                          uint32_t(blob.size())));
+        const PxgResult res = mShim->launchKernel(id, gridDimX, gridDimY, gridDimZ, blob.data(),
+                                                  uint32_t(blob.size()));
+        traceLaunch("void**", id, res == PxgResult::Success);
+        return record(res);
     }
 
     // ---- copies (async == sync: P3 serializes on one queue) ----

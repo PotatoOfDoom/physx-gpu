@@ -66,7 +66,8 @@ set(SHADER_COMMON_DEPS
     ${SHADER_DIR}/pxgSlangCommon.slang
     ${SHADER_DIR}/pxgSlangScan.slang
     ${SHADER_DIR}/pxgSlangPrepCommon.slang
-    ${SHADER_DIR}/pxgSlangWarpInc.slang)
+    ${SHADER_DIR}/pxgSlangWarpInc.slang
+    ${SHADER_DIR}/pxgSlangBpDesc.slang)
 
 # Shaders whose SPIR-V gets NoContraction decorations stamped onto every
 # float arithmetic op (tools/spv_nocontract.py).  slangc emits none and its
@@ -405,6 +406,8 @@ pxg_compile_shader(npAtomicLib alAtomics)
 pxg_compile_shader(npTex3d tex3dSample)
 # RUNTIME_PLAN.md P3 shim proof kernel (nested BDA params).
 pxg_compile_shader(npShimAxpy shimAxpy)
+# P5 Step 4: PxgBroadPhaseDesc mirror layout proof (BDA).
+pxg_compile_shader(npBpDescProbe bpDescProbe)
 # RUNTIME_PLAN.md P3 launch-marshalling proof kernel (multi-arg natural alignment).
 pxg_compile_shader(npShimMisalign shimMisAdd)
 
@@ -744,6 +747,7 @@ add_executable(gpuslang-tests
     testP4Heap.cpp
     testP4Wrangler.cpp
     testP4Broadphase.cpp
+    testBpDescLayout.cpp
     testP4Aabb.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelAbi.cpp
