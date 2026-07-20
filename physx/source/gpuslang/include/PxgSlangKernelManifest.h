@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 142;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 143;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -72,7 +72,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "removeContactManagers_Stage5", "npPairRemoveSwap.spv", "removeContactManagers_Stage5" },  // REMOVE_CONTACT_MANAGERS_5
     { "prepareLostFoundPairs_Stage1", "npCvxLostFound.spv", "prepareLostFoundPairs_Stage1" },  // COMPACT_LOST_FOUND_PAIRS_1
     { "prepareLostFoundPairs_Stage2", "npCvxLostFound.spv", "prepareLostFoundPairs_Stage2" },  // COMPACT_LOST_FOUND_PAIRS_2
-    { "sphereNphase_Kernel", nullptr, nullptr },  // SPHERE_KERNEL_MAIN (unmapped)
+    { "sphereNphase_Kernel", "npSphereNphase.spv", "sphereNphase_Kernel" },  // SPHERE_KERNEL_MAIN
     { "boxBoxNphase_Kernel", "boxBoxNphase.spv", "boxBoxNphase_Kernel" },  // BOX_BOX_KERNEL_MAIN
     { "convexPlaneNphase_Kernel", nullptr, nullptr },  // CONVEX_PLANE_KERNEL_MAIN (unmapped)
     { "convexCorePlaneNphase_Kernel", nullptr, nullptr },  // CONVEXCORE_PLANE_KERNEL_MAIN (unmapped)

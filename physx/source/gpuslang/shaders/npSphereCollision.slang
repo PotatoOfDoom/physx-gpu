@@ -40,6 +40,7 @@
 // boxExtents.xyz, or an x-axis capsule of radius1/halfHeight).
 
 import pxgSlangCommon;
+import npSpherePrimitives; // sphere*/spherePlane/sphereCapsule/sphereBox contact routines + PrimContact
 
 struct Xform
 {
@@ -68,24 +69,9 @@ RWStructuredBuffer<float4>      gOutPointPen; // binding 3  (world point, penetr
 RWStructuredBuffer<float4>      gOutNormal;   // binding 4  (world normal, w unused)
 RWStructuredBuffer<uint>        gNbContacts;  // binding 5
 
-static const float PX_EPS_REAL = 1.192092896e-07f;
-
-float3 xformInv(Xform t, float3 pt) { return quatRotateInv(t.q, pt - t.p.xyz); }
-float3 xformPt(Xform t, float3 pt) { return quatRotate(t.q, pt) + t.p.xyz; }
-
-// mirrors sphereCollision.cuh distancePointSegmentSquared
-float distancePointSegmentSquared(float3 a, float3 b, float3 p, out float param)
-{
-    const float3 ap = p - a;
-    const float3 ab = b - a;
-    const float nom = dot(ap, ab);
-    const float denom = dot(ab, ab);
-    const float tValue = clamp(nom / denom, 0.0f, 1.0f);
-    const float t = denom > 0.0f ? tValue : 0.0f;
-    const float3 v = ap - (ab * t);
-    param = t;
-    return dot(v, v);
-}
+// The contact math lives in npSpherePrimitives (single source of truth shared with
+// the engine-ABI dispatcher sphereNphase_Kernel); each entry point below just marshals
+// the bound buffers into the shared routine and writes the result back.
 
 // ---------------------------------------------------------------------------
 [shader("compute")]
@@ -95,27 +81,17 @@ void sphereNphase_sphereSphere(uint3 dtid : SV_DispatchThreadID)
     const uint i = dtid.x;
     if (i >= gParams.numTests) return;
     const SphereTest s = gTests[i];
-    const float3 p0 = gXform0[i].p.xyz;
-    const float3 p1 = gXform1[i].p.xyz;
+    const Xform t0 = gXform0[i];
+    const Xform t1 = gXform1[i];
 
-    const float3 delta = p0 - p1;
-    const float distanceSq = dot(delta, delta);
-    const float radiusSum = s.sphereRadius + s.radius1;
-    const float inflatedSum = radiusSum + s.contactDist;
-
-    uint nb = 0;
-    if ((inflatedSum * inflatedSum) > distanceSq)
+    const PrimContact c = sphereSphereContact(t0.q, t0.p.xyz, s.sphereRadius,
+                                              t1.q, t1.p.xyz, s.radius1, s.contactDist);
+    if (c.nbContacts != 0u)
     {
-        const float eps = 1e-4f;
-        const float dist = sqrt(distanceSq);
-        const float3 normal = (eps >= dist) ? float3(1.0f, 0.0f, 0.0f) : (delta * (1.0f / dist));
-        const float3 point = p1 + (normal * s.radius1);
-        const float pen = dist - radiusSum;
-        gOutPointPen[i] = float4(point, pen);
-        gOutNormal[i] = float4(normal, 0.0f);
-        nb = 1;
+        gOutPointPen[i] = c.pointPen0;
+        gOutNormal[i] = float4(c.normal, 0.0f);
     }
-    gNbContacts[i] = nb;
+    gNbContacts[i] = c.nbContacts;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,19 +105,14 @@ void sphereNphase_spherePlane(uint3 dtid : SV_DispatchThreadID)
     const Xform t0 = gXform0[i];
     const Xform t1 = gXform1[i];
 
-    const float3 sphereCenterInPlaneSpace = xformInv(t1, t0.p.xyz);
-    const float separation = sphereCenterInPlaneSpace.x - s.sphereRadius;
-
-    uint nb = 0;
-    if (s.contactDist >= separation)
+    const PrimContact c = spherePlaneContact(t0.q, t0.p.xyz, s.sphereRadius,
+                                             t1.q, t1.p.xyz, s.contactDist);
+    if (c.nbContacts != 0u)
     {
-        const float3 worldNormal = quatBasisVector0(t1.q);
-        const float3 worldPoint = t0.p.xyz - worldNormal * s.sphereRadius;
-        gOutPointPen[i] = float4(worldPoint, separation);
-        gOutNormal[i] = float4(worldNormal, 0.0f);
-        nb = 1;
+        gOutPointPen[i] = c.pointPen0;
+        gOutNormal[i] = float4(c.normal, 0.0f);
     }
-    gNbContacts[i] = nb;
+    gNbContacts[i] = c.nbContacts;
 }
 
 // ---------------------------------------------------------------------------
@@ -155,33 +126,14 @@ void sphereNphase_sphereCapsule(uint3 dtid : SV_DispatchThreadID)
     const Xform t0 = gXform0[i];
     const Xform t1 = gXform1[i];
 
-    const float3 sphereCenter = t0.p.xyz;
-    const float3 basisVector0 = quatBasisVector0(t1.q);
-    const float3 tmp0 = basisVector0 * s.halfHeight;
-    const float3 segS = t1.p.xyz + tmp0;
-    const float3 segE = t1.p.xyz - tmp0;
-
-    const float radiusSum = s.sphereRadius + s.radius1;
-    const float inflatedSum = radiusSum + s.contactDist;
-
-    float t;
-    const float squareDist = distancePointSegmentSquared(segS, segE, sphereCenter, t);
-    const float sqInflatedSum = inflatedSum * inflatedSum;
-
-    uint nb = 0;
-    if (sqInflatedSum > squareDist)
+    const PrimContact c = sphereCapsuleContact(t0.q, t0.p.xyz, s.sphereRadius,
+                                               t1.q, t1.p.xyz, s.radius1, s.halfHeight, s.contactDist);
+    if (c.nbContacts != 0u)
     {
-        const float3 p = segS + (segE - segS) * t;
-        const float3 dir = sphereCenter - p;
-        const float length = sqrt(dot(dir, dir));
-        const float3 normal = length > PX_EPS_REAL ? (dir * (1.0f / length)) : float3(1.0f, 0.0f, 0.0f);
-        const float3 point = sphereCenter - normal * s.sphereRadius;
-        const float pen = sqrt(squareDist) - radiusSum;
-        gOutPointPen[i] = float4(point, pen);
-        gOutNormal[i] = float4(normal, 0.0f);
-        nb = 1;
+        gOutPointPen[i] = c.pointPen0;
+        gOutNormal[i] = float4(c.normal, 0.0f);
     }
-    gNbContacts[i] = nb;
+    gNbContacts[i] = c.nbContacts;
 }
 
 // ---------------------------------------------------------------------------
@@ -194,66 +146,13 @@ void sphereNphase_sphereBox(uint3 dtid : SV_DispatchThreadID)
     const SphereTest s = gTests[i];
     const Xform t0 = gXform0[i];
     const Xform t1 = gXform1[i];
-    const float3 boxExtents = s.boxExtents.xyz;
 
-    const float3 sphereOrigin = t0.p.xyz;
-    const float3 sphereCenter = xformInv(t1, sphereOrigin);
-    const float3 nBoxExtents = -boxExtents;
-
-    const float inflatedSum = s.sphereRadius + s.contactDist;
-    const float sqInflatedSum = inflatedSum * inflatedSum;
-
-    const float px = clamp(sphereCenter.x, nBoxExtents.x, boxExtents.x);
-    const float py = clamp(sphereCenter.y, nBoxExtents.y, boxExtents.y);
-    const float pz = clamp(sphereCenter.z, nBoxExtents.z, boxExtents.z);
-    const float3 p = float3(px, py, pz);
-    const float3 v = sphereCenter - p;
-    const float lengthSq = dot(v, v);
-
-    uint nb = 0;
-    if (sqInflatedSum > lengthSq)
+    const PrimContact c = sphereBoxContact(t0.q, t0.p.xyz, s.sphereRadius,
+                                           t1.q, t1.p.xyz, s.boxExtents.xyz, s.contactDist);
+    if (c.nbContacts != 0u)
     {
-        const bool bX = boxExtents.x >= abs(sphereCenter.x);
-        const bool bY = boxExtents.y >= abs(sphereCenter.y);
-        const bool bZ = boxExtents.z >= abs(sphereCenter.z);
-        const bool bInsideBox = bX && bY && bZ;
-
-        if (bInsideBox)
-        {
-            const float3 absP = float3(abs(p.x), abs(p.y), abs(p.z));
-            const float3 distToSurface = boxExtents - absP;
-
-            float3 localNorm = p.z >= 0.0f ? float3(0.0f, 0.0f, 1.0f) : float3(0.0f, 0.0f, -1.0f);
-            float dist = -distToSurface.z;
-            if (distToSurface.x <= distToSurface.y && distToSurface.x <= distToSurface.z)
-            {
-                localNorm = p.x >= 0.0f ? float3(1.0f, 0.0f, 0.0f) : float3(-1.0f, 0.0f, 0.0f);
-                dist = -distToSurface.x;
-            }
-            else if (distToSurface.y <= distToSurface.z)
-            {
-                localNorm = p.y >= 0.0f ? float3(0.0f, 1.0f, 0.0f) : float3(0.0f, -1.0f, 0.0f);
-                dist = -distToSurface.y;
-            }
-
-            const float3 normal = quatRotate(t1.q, localNorm);
-            const float penetration = dist - s.sphereRadius;
-            const float3 point = sphereOrigin - normal * dist;
-            gOutPointPen[i] = float4(point, penetration);
-            gOutNormal[i] = float4(normal, 0.0f);
-        }
-        else
-        {
-            const float recipLength = rsqrt(lengthSq);
-            const float length = 1.0f / recipLength;
-            const float3 locNorm = v * recipLength;
-            const float penetration = length - s.sphereRadius;
-            const float3 normal = quatRotate(t1.q, locNorm);
-            const float3 point = xformPt(t1, p);
-            gOutPointPen[i] = float4(point, penetration);
-            gOutNormal[i] = float4(normal, 0.0f);
-        }
-        nb = 1;
+        gOutPointPen[i] = c.pointPen0;
+        gOutNormal[i] = float4(c.normal, 0.0f);
     }
-    gNbContacts[i] = nb;
+    gNbContacts[i] = c.nbContacts;
 }

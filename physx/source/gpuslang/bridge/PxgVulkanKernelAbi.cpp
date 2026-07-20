@@ -110,6 +110,12 @@ static const uint8_t kUpdateShapes[] = { 8, 8, 4 };
 //   PxReal toleranceLength) — the box-vs-box contact generator.
 static const uint8_t kBoxBoxNphase[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4 };
 
+// gpunarrowphase cudaSphere.cu: sphereNphase_Kernel(PxU32 numTests,
+//   PxReal toleranceLength, 14 device pointers, PxU32 patchBytesLimit,
+//   contactBytesLimit, forceBytesLimit) — the sphere/capsule/plane/box primitive
+//   contact generator.  Note toleranceLength is the 2nd arg (unlike box-box's last).
+static const uint8_t kSphereNphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4 };
+
 // gpunarrowphase convex-convex core (cudaGJKEPA.cu):
 //   convexConvexNphase_stage1Kernel(PxU32 numTests, PxReal toleranceLength,
 //     cmInputs*, transformCache*, shapes*, cmManifolds*, tempKeepPairArray*)
@@ -217,6 +223,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "prepareLostFoundPairs_Stage1", kLostFound1, uint32_t(sizeof(kLostFound1)) },
     { "prepareLostFoundPairs_Stage2", kLostFound2, uint32_t(sizeof(kLostFound2)) },
     { "boxBoxNphase_Kernel", kBoxBoxNphase, uint32_t(sizeof(kBoxBoxNphase)) },
+    { "sphereNphase_Kernel", kSphereNphase, uint32_t(sizeof(kSphereNphase)) },
 };
 
 inline size_t abiAlign(size_t size)
