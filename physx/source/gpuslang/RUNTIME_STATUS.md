@@ -154,7 +154,28 @@ function" set (rigid-only; ignore cloth/particle/arti/bvh/sdf):
 - `clearFrictionPatchCounts` — UNMAPPED, needs port.
 - Already mapped and working: solveWholeIslandTGS (solves the contact once
   batches exist), contact/jointConstraintBlockPrepareParallelLaunchTGS.
-Merge doctrine (proven 4x this session): worktree agent -> git diff HEAD >
+UPDATE (tranches 13-15 merged, commits 7d0c860/48e3e2f/5c44c1c): the contact
+GENERATORS + prep + stream-compress are now all on the engine ABI —
+rigidSum1/2, constraintContactBlockPrePrep, contactConstraintBlockPrepareTGS
+(tranche 13); convexConvex stage1/2, finishContacts, compress1/2 (tranche 14);
+boxBoxNphase_Kernel (tranche 15).  Suite 675/675 both modes, PXG_SLANG_KERNEL_
+MAPPED = 136.  BUT the engine step still falls through and boxBoxNphase
+launches ZERO times: the narrowphase DRIVER never dispatches.  Per-frame the
+trace shows only updateTransformCacheAndBoundArray + the solver; broadphase
+ran once (setup), narrowphase never.  So the true remaining frontier is the
+whole NP DRIVER pipeline that turns a broadphase pair into a solved contact,
+NOT the generators (which are ready):
+- `clearFrictionPatchCounts` (NP per-frame reset) — unmapped
+- `midphaseGeneratePairs` / `convexHeightFieldMidphase` (midphase pair gen) — unmapped
+- `removeContactManagers_Stage1-4` (contact-manager lifecycle) — unmapped
+- the per-frame broadphase re-run + contact-manager management + the NP
+  dispatch driver (PxgNarrowphaseCore) — investigate why NP isn't dispatched
+  at all (a single top-of-pipeline gate kernel may unblock the chain).
+Next continuation: trace-driven — map the NP-driver entry kernels one tranche
+at a time until boxBoxNphase actually launches and a contact constraint
+reaches solveWholeIslandTGS; then the box rests.
+
+Merge doctrine (proven 6x this session): worktree agent -> git diff HEAD >
 patch -> git apply in main tree -> add reported ABI rows to bridge/
 PxgVulkanKernelAbi.cpp -> retire reported PXG_HLSL_ENTRIES -> reconcile
 PXG_SLANG_KERNEL_MAPPED -> rebuild both build trees -> suite both modes ->
