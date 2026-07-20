@@ -591,3 +591,49 @@ void setRigidDynamicGlobalPose(uint3 dispatchThreadId : SV_DispatchThreadID)
         pos--;
     }
 }
+
+// mirrors updateChangedAABBMgrHandlesLaunch() in updateTransformAndBoundArray.cu:
+// pack the per-shape "updated" flags into the AABB-manager changed-handle
+// bitmap (one bit per shape, 32 shapes per word).  This is the kernel that
+// tells the broadphase which shapes moved this frame; without it the BP
+// early-outs and never re-sweeps (P5 Step 4 root-cause fix).  Engine ABI:
+// one device pointer to PxgSimulationCoreDesc (gSimCoreAbi.scDesc), the same
+// mirror updateTransformCacheAndBoundArrayLaunch uses.
+//
+// CUDA uses __ballot_sync(FULL_MASK, updated[i]) so lane j of a 32-lane warp
+// contributes bit j; lane 0 writes the packed word.  The llvmpipe subgroup
+// width is not a fixed 32, so reproduce the ballot with a groupshared OR over
+// a 32-thread workgroup (one output word per group), grid-strided over words.
+groupshared uint gAabbMgrWord;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void updateChangedAABBMgrHandlesLaunch(uint3 groupThreadId : SV_GroupThreadID,
+                                       uint3 groupId : SV_GroupID)
+{
+    const PxgSimulationCoreDescGpu scDesc = (Ptr<PxgSimulationCoreDescGpu>(gSimCoreAbi.scDesc))[0];
+
+    const uint numWords = scDesc.mBitMapWordCounts;
+    const uint numElements = numWords * 32u;
+
+    Ptr<uint> updated = Ptr<uint>(scDesc.mUpdated);
+    Ptr<uint> changed = Ptr<uint>(scDesc.mChangedAABBMgrHandles);
+
+    const uint lane = groupThreadId.x;
+
+    for (uint w = groupId.x; w < numWords; w += WorkgroupCount().x)
+    {
+        if (lane == 0)
+            gAabbMgrWord = 0u;
+        GroupMemoryBarrierWithGroupSync();
+
+        const uint i = w * 32u + lane;
+        if (i < numElements && updated[i] != 0u)
+            InterlockedOr(gAabbMgrWord, 1u << lane);
+        GroupMemoryBarrierWithGroupSync();
+
+        if (lane == 0)
+            changed[w] = gAabbMgrWord;
+        GroupMemoryBarrierWithGroupSync();
+    }
+}

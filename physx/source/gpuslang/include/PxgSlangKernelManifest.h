@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 136;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 137;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -29,7 +29,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "updateJointsLaunch", nullptr, nullptr },  // UPDATE_JOINTS (unmapped)
     { "updateTransformCacheAndBoundArrayLaunch", "updateBounds.spv", "updateTransformCacheAndBoundArrayLaunch" },  // UPDATE_TRANSFORMCACHE_AND_BOUNDARRAY
     { "mergeTransformCacheAndBoundArrayChanges", nullptr, nullptr },  // MERGE_TRANSFORMCACHE_AND_BOUNDARRAY_CHANGES (unmapped)
-    { "updateChangedAABBMgrHandlesLaunch", nullptr, nullptr },  // UPDATE_AABBMGR_HANDLES (unmapped)
+    { "updateChangedAABBMgrHandlesLaunch", "updateBounds.spv", "updateChangedAABBMgrHandlesLaunch" },  // UPDATE_AABBMGR_HANDLES (P5 Step 4 BDA)
     { "computeFrozenAndUnfrozenHistogramLaunch", nullptr, nullptr },  // COMPUTE_FROZEN_UNFROZEN_HISTOGRAM (unmapped)
     { "outputFrozenAndUnfrozenHistogram", nullptr, nullptr },  // OUTPUT_FROZEN_UNFROZEN_HISTOGRAM (unmapped)
     { "createFrozenAndUnfrozenArray", nullptr, nullptr },  // CREATE_FROZEN_UNFROZEN_ARRAY (unmapped)

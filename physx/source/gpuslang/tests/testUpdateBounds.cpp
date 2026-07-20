@@ -946,4 +946,76 @@ PXG_TEST(setRigidDynamicGlobalPose)
     dev->destroyBuffer(gpuIdxBuf);
 }
 
+// updateChangedAABBMgrHandlesLaunch on the ENGINE ABI (P5 Step 4 root-cause
+// fix): pack the per-shape "updated" flags into the AABB-manager changed-handle
+// bitmap (bit j of word w = updated[w*32+j] != 0).  Without this the broadphase
+// never learns which shapes moved and early-outs forever.  ABI = one desc
+// pointer {8}; verified bit-exact against a CPU reference of the __ballot pack.
+PXG_TEST(updateBounds_changedAABBMgrHandles)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    std::mt19937 rng(0xB17B17);
+    const uint32_t numWords = 37;                 // 37 words -> 1184 shape bits
+    const uint32_t numElements = numWords * 32;
+
+    std::vector<uint32_t> updated(numElements);
+    for (uint32_t i = 0; i < numElements; ++i)
+        updated[i] = (rng() & 3u) == 0u ? (rng() | 0u) : 0u;   // ~25% nonzero, arbitrary values
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = { { "updateBounds.spv", "updateChangedAABBMgrHandlesLaunch", 8u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &updateBoundsAbiLoader);
+
+    PxgDevicePtr dUpdated = 0, dChanged = 0, dDesc = 0;
+    shim.memAlloc(&dUpdated, numElements * 4);
+    shim.memAlloc(&dChanged, numWords * 4);
+    shim.memAlloc(&dDesc, sizeof(physx::PxgSimulationCoreDesc));
+    if (!dUpdated || !dChanged || !dDesc) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    std::vector<uint32_t> changedInit(numWords, 0xDEADBEEFu);
+    shim.memcpyHtoD(dUpdated, updated.data(), numElements * 4);
+    shim.memcpyHtoD(dChanged, changedInit.data(), numWords * 4);
+
+    physx::PxgSimulationCoreDesc desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.mUpdated = reinterpret_cast<physx::PxU32*>(dUpdated);
+    desc.mChangedAABBMgrHandles = reinterpret_cast<physx::PxU32*>(dChanged);
+    desc.mBitMapWordCounts = numWords;
+    shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
+
+    EngineBlob blob;
+    blob.add<uint64_t>(dDesc);
+    blob.finish();
+    PXG_CHECK_MSG(blob.bytes.size() == 8, "engine blob is 8 bytes (got %zu)", blob.bytes.size());
+
+    // engine grid: UPDATE_AABBMGR_HANDLES is a fixed grid; the kernel is
+    // grid-strided over words, so any group count covers all words.
+    PXG_CHECK_MSG(shim.launchKernel(0, 8, 1, 1, blob.bytes.data(), uint32_t(blob.bytes.size())) ==
+                      PxgResult::Success, "launch updateChangedAABBMgrHandlesLaunch");
+    shim.streamSynchronize();
+
+    // CPU reference: bit j of word w set iff updated[w*32+j] != 0
+    std::vector<uint32_t> ref(numWords, 0);
+    for (uint32_t w = 0; w < numWords; ++w)
+        for (uint32_t j = 0; j < 32; ++j)
+            if (updated[w * 32 + j] != 0u)
+                ref[w] |= (1u << j);
+
+    std::vector<uint32_t> got(numWords);
+    shim.memcpyDtoH(got.data(), dChanged, numWords * 4);
+
+    size_t bad = 0;
+    for (uint32_t w = 0; w < numWords; ++w)
+        if (got[w] != ref[w]) ++bad;
+    PXG_CHECK_MSG(bad == 0, "changed-handle bitmap mismatch (%zu / %u words)", bad, numWords);
+
+    shim.memFree(dUpdated);
+    shim.memFree(dChanged);
+    shim.memFree(dDesc);
+}
+
 } // namespace

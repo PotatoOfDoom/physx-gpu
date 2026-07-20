@@ -162,6 +162,7 @@ static const PxgKernelAbiRow kRows[] = {
     // gpusimulationcontroller: updateTransformAndBoundArray.cu / updateBodiesAndShapes.cu
     { "updateTransformCacheAndBoundArrayLaunch", kOnePtr, 1u },
     { "updateBodiesLaunch", kOnePtr, 1u },
+    { "updateChangedAABBMgrHandlesLaunch", kOnePtr, 1u },
     { "updateShapesLaunch", kUpdateShapes, uint32_t(sizeof(kUpdateShapes)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA)
