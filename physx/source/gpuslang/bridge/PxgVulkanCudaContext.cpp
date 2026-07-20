@@ -274,6 +274,21 @@ public:
         std::fprintf(stderr, "[pxg-launch] %s %s %s\n", form, name, ok ? "OK" : "REFUSED");
     }
 
+    // PXG_LAUNCH_TRACE=1: name the kernel BEFORE the dispatch, so a shader-side
+    // GPU fault (which never returns to print the "OK" line) is still attributed
+    // to the exact launch that triggered it.
+    void traceDispatch(const char* form, PxgKernelId id)
+    {
+        static const bool on = std::getenv("PXG_LAUNCH_TRACE") != nullptr;
+        if (!on)
+            return;
+        const char* name = id < mManifestCount && mManifest[id].cudaName
+            ? mManifest[id].cudaName
+            : (id < mManifestCount && mManifest[id].entry ? mManifest[id].entry : "?");
+        std::fprintf(stderr, "[pxg-dispatch] %s %s ...\n", form, name);
+        std::fflush(stderr);
+    }
+
     PxCUresult launchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
                             unsigned int /*blockDimX*/, unsigned int /*blockDimY*/, unsigned int /*blockDimZ*/,
                             unsigned int /*sharedMemBytes*/, CUstream /*hStream*/, PxCudaKernelParam* kernelParams,
@@ -312,6 +327,7 @@ public:
         // not 12).  The Slang side sees exactly that struct, so round the blob to match,
         // otherwise the shim's blobSize == pushConstantSize gate rejects the launch.
         blob.resize((blob.size() + (maxAlign - 1)) & ~(maxAlign - 1));
+        traceDispatch("sized", id);
         const PxgResult res = mShim->launchKernel(id, gridDimX, gridDimY, gridDimZ, blob.data(),
                                                   uint32_t(blob.size()));
         traceLaunch("sized", id, res == PxgResult::Success);
@@ -350,6 +366,7 @@ public:
             blob.insert(blob.end(), d, d + abi->argSizes[i]);
         }
         blob.resize((blob.size() + (maxAlign - 1)) & ~(maxAlign - 1));
+        traceDispatch("void**", id);
         const PxgResult res = mShim->launchKernel(id, gridDimX, gridDimY, gridDimZ, blob.data(),
                                                   uint32_t(blob.size()));
         traceLaunch("void**", id, res == PxgResult::Success);

@@ -126,7 +126,8 @@ pxg_compile_shader(solverPGS solveBlockPartition concludeBlocks writebackBlocks 
                    computeAverageSolverBodyVelocity propagateSolverBodyVelocity)
 pxg_compile_shader(solverTGS solveBlockPartitionTGS concludeBlocksTGS writebackBlocksTGS
                    writeBackBodiesTGS computeAverageSolverBodyVelocityTGS
-                   propagateAverageSolverBodyVelocityTGS solveWholeIslandTGS)
+                   propagateAverageSolverBodyVelocityTGS solveWholeIslandTGS
+                   solveStaticBlockTGS propagateStaticSolverBodyVelocitiesTGS)
 pxg_compile_shader(constraintPrepPGS contactConstraintBlockPrepareParallelLaunch
                    jointConstraintBlockPrepareParallelLaunch)
 pxg_compile_shader(constraintPrepTGS contactConstraintBlockPrepareParallelLaunchTGS
@@ -952,7 +953,7 @@ set(PXG_HLSL_ENTRIES
     "directApi:getRigidDynamicGlobalPose" "directApi:getRigidDynamicLinearAcceleration"
     "directApi:setRigidDynamicLinearVelocity" "directApi:setRigidDynamicTorque"
     "solverPGS:solveBlockPartition" "solverPGS:concludeBlocks" "solverPGS:writebackBlocks"
-    "solverTGS:solveBlockPartitionTGS" "solverTGS:concludeBlocksTGS" "solverTGS:writebackBlocksTGS"
+    "solverTGS:solveBlockPartitionTGS" "solverTGS:writebackBlocksTGS"
     "solverTGS:writeBackBodiesTGS" "solverTGS:computeAverageSolverBodyVelocityTGS"
     "solverTGS:propagateAverageSolverBodyVelocityTGS"
     "constraintPrepPGS:contactConstraintBlockPrepareParallelLaunch"

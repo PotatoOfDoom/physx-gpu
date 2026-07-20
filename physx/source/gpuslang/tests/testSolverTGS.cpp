@@ -982,9 +982,37 @@ PXG_TEST(solverTGS_concludeAndWriteback)
         sizeof(FrictionPatchGPU)
     };
 
-    Kernel conclude("solverTGS.spv", "concludeBlocksTGS",
-                    { strides[0], strides[1], strides[2], strides[3], strides[4], strides[5], strides[6] },
-                    sizeof(SolverTGSParams));
+    // concludeBlocksTGS is now an engine-ABI (BDA push-constant) kernel, no
+    // longer a bound-buffer harness entry; a dedicated shim-driven test
+    // (solverTGS_concludeBlocksAbi) exercises it.  Production runs conclude
+    // before writeback, so emulate the conclude pass on the joint rows here (it
+    // only zeroes repacked .w coefficients — inputs the writeback path never
+    // reads — so the observable writeback output is unchanged) to keep the
+    // uploaded joint-row buffer faithful to production.
+    for (uint32_t k = 0; k < numBatches; ++k)
+    {
+        const BatchTGS& b = batches[k];
+        if (b.constraintType == 0)
+            continue; // contact: concludeContactBlockTGS is a no-op ("#if 0")
+        for (uint32_t lane = 0; lane < b.descStride; ++lane)
+        {
+            const uint32_t rows = jhs[k].rowCounts_breakable_orthoAxisCount[lane] & 0xFFu;
+            for (uint32_t i = 0; i < rows; ++i)
+            {
+                TGSJointRowCon& c = jrows[b.scalars[2] + i];
+                if (!(c.flags[lane] & DY_SC_FLAG_KEEP_BIAS))
+                    c.lin1XYZ_biasScaleOrCoeff1[lane].w = 0.f;
+                if (c.flags[lane] & DY_SC_FLAG_SPRING)
+                {
+                    c.lin0XYZ_initBiasOrCoeff0[lane].w = 0.f;
+                    c.lin1XYZ_biasScaleOrCoeff1[lane].w = 0.f;
+                    c.ang0XYZ_velMultiplierOrCoeff2[lane].w = 0.f;
+                    c.ang1XYZ_velTargetOrCoeff3[lane].w = 0.f;
+                }
+            }
+        }
+    }
+
     Kernel writeback("solverTGS.spv", "writebackBlocksTGS", strides, sizeof(SolverTGSParams));
 
     PxgBufferHandle batchBuf = createBufferFrom(dev, batches);
@@ -1010,8 +1038,6 @@ PXG_TEST(solverTGS_concludeAndWriteback)
     params.startIndex = 0;
     params.endIndex = numBatches;
 
-    conclude.dispatch(numBatches, { batchBuf, chBuf, fhBuf, cpBuf, frBuf, jhBuf, jrBuf }, params);
-    dev->barrier();
     writeback.dispatch(numBatches,
                        { batchBuf, chBuf, fhBuf, cpBuf, frBuf, jhBuf, jrBuf, bdBuf /*dummy at 7*/,
                          bdBuf /*dummy at 8*/, bdBuf /*dummy at 9*/, bdBuf, wbBuf, forceBuf, tsBuf,
@@ -1850,7 +1876,8 @@ PXG_TEST(solverTGS_wholeIslandSolve)
 
     // batches 1,2 -> partition 0 (warp 0/1), batches 3,4 -> partition 1
     std::vector<uint32_t> cpp = { 123u, 3u, 5u }; // index 0 is a decoy (mStartPartitionIndex = 1)
-    const uint16_t types[5] = { 0, 0, 1, 1, 0 };  // k: 1=contact 2=1D 3=1D 4=contact
+    // engine PxgConstraintType encoding: eCONTACT=1, eCONSTRAINT_1D=0
+    const uint16_t types[5] = { 1, 1, 0, 0, 1 };  // k: 1=contact 2=1D 3=1D 4=contact
     const uint16_t strides[5] = { 0, 32, 27, 32, 20 };
 
     std::vector<BatchTGS> batches(numAllBatches);
@@ -1917,7 +1944,7 @@ PXG_TEST(solverTGS_wholeIslandSolve)
             b.bodyAIndex[lane] = 2 * (pairId / numSlabs);
             b.bodyBIndex[lane] = 2 * (pairId / numSlabs) + 1;
 
-            if (b.constraintType == 0)
+            if (b.constraintType == 1) // eCONTACT
             {
                 TGSContactHeader& h = chs[b.scalars[1]];
                 h.invMass0_1_angDom0_1[lane] = Float4{ unit(rng), unit(rng), unit(rng), unit(rng) };
@@ -2153,7 +2180,7 @@ PXG_TEST(solverTGS_wholeIslandSolve)
                 if (b.bodyBIndex[lane] >= bodyOffset)
                     ref1 = float(std::max(1u, popcount(encoded[b.bodyBIndex[lane]])));
 
-                if (b.constraintType == 0)
+                if (b.constraintType == 1) // eCONTACT
                     refSolveContactTGS(b, s, lane, chs, fhs, cps, frs, elapsedTime, minPen, ref0, ref1,
                                        &errAcc[warp][lane]);
                 else
@@ -2279,6 +2306,647 @@ PXG_TEST(solverTGS_wholeIslandSolve)
 
     for (PxgDevicePtr pfree : { dVel, dEnc, dRef, dTx, dCpp, dIsl, dBatch, dCh, dFh, dCp, dFr, dJh, dJr,
                                 dDesc, dShared })
+        shim.memFree(pfree);
+}
+
+// ---------------------------------------------------------------------------
+// solveStaticBlockTGS + propagateStaticSolverBodyVelocitiesTGS (ENGINE ABI)
+// ---------------------------------------------------------------------------
+// The dynamic-vs-static rigid contact/joint solve.  Two dynamic bodies (lanes
+// 0 and 1 of shared static batches, exercising warpScanExclusive), each with 3
+// static contact batches split across 2 slabs (maxStaticPartitions = 2) plus a
+// shared static 1D joint batch.  solveStaticBlockTGS writes per-slab body
+// velocities to tempStaticBodyOutputs; propagateStaticSolverBodyVelocitiesTGS
+// averages them back into the deltaV pool.  Both are checked bit-exact (2e-4)
+// against the proven refSolveContactTGS / refSolve1DTGS transcriptions, and the
+// contact-residual accumulator is checked (mutation + value).
+PXG_TEST(solverTGS_staticContactSolve)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    std::mt19937 rng(3900);
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::uniform_real_distribution<float> sym(-2.f, 2.f);
+
+    const uint32_t numDynamicBodies = 2;
+    const uint32_t bodyOffset = 1;
+    const uint32_t T = numDynamicBodies + bodyOffset; // 3
+    const uint32_t nbStaticSlabs = 2;
+    const uint32_t maxStaticPartitions = 2;
+    const uint32_t numDynamicBodiesRounded = 32; // (2 + 31) & ~31
+    const uint32_t rowsPerBatch = 4;
+    const float elapsedTime = 0.005f;
+    const float minPen = -0.02f;
+    const uint32_t deltaVOffset = 100;
+    const uint32_t poolSize = 200;
+
+    // batch 0 = decoy; 1,2,3 = contacts (eCONTACT=1); 4 = joint (eCONSTRAINT_1D=0)
+    const uint32_t numAllBatches = 5;
+    const uint32_t contactStart = 1; // shared by both bodies
+    const uint32_t jointStart = 4;
+
+    std::vector<BatchTGS> batches(numAllBatches);
+    std::vector<TGSContactHeader> chs(3);
+    std::vector<TGSFrictionHeader> fhs(3);
+    std::vector<TGSContactPoint> cps(3 * rowsPerBatch);
+    std::vector<TGSFriction> frs(3 * (rowsPerBatch + 1));
+    std::vector<TGSJointHeader> jhs(1);
+    std::vector<TGSJointRowCon> jrows(rowsPerBatch);
+    std::vector<SolverTxIData> txi(T);
+    std::memset(batches.data(), 0, batches.size() * sizeof(BatchTGS));
+    std::memset(chs.data(), 0, chs.size() * sizeof(TGSContactHeader));
+    std::memset(fhs.data(), 0, fhs.size() * sizeof(TGSFrictionHeader));
+    std::memset(cps.data(), 0, cps.size() * sizeof(TGSContactPoint));
+    std::memset(frs.data(), 0, frs.size() * sizeof(TGSFriction));
+    std::memset(jhs.data(), 0, jhs.size() * sizeof(TGSJointHeader));
+    std::memset(jrows.data(), 0, jrows.size() * sizeof(TGSJointRowCon));
+    std::memset(txi.data(), 0, txi.size() * sizeof(SolverTxIData));
+
+    for (uint32_t b = bodyOffset; b < T; ++b)
+    {
+        SolverTxIData& t = txi[b];
+        t.deltaBody2World.q = randomQuatTGS(rng).toQuat();
+        t.deltaBody2World.p = Float3{ sym(rng) * 0.01f, sym(rng) * 0.01f, sym(rng) * 0.01f };
+        const Mat33 rot(randomQuatTGS(rng));
+        const Vec3 d(unit(rng), unit(rng), unit(rng));
+        const Mat33 m = rot * Mat33(Vec3(d.x, 0, 0), Vec3(0, d.y, 0), Vec3(0, 0, d.z)) * rot.getTranspose();
+        m.store(t.sqrtInvInertia);
+    }
+
+    std::vector<Float4> velPool(poolSize);
+    for (Float4& v : velPool)
+        v = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+
+    // ---- contact / joint batch data (lanes 0 and 1 = bodies 0 and 1) ----
+    auto fillContactLane = [&](uint32_t header, uint32_t lane) {
+        TGSContactHeader& h = chs[header];
+        h.invMass0_1_angDom0_1[lane] = Float4{ unit(rng), 0.f, unit(rng), 0.f }; // static B: invMassB=angDom1=0
+        const Vec3 n = randUnitV(rng);
+        h.normal_staticFriction[lane] = Float4{ n.x, n.y, n.z, unit(rng) };
+        h.maxPenBias[lane] = -unit(rng) * 5.f;
+        h.flags[lane] = unit(rng) < 0.5f ? COMPLIANT_ACCEL_SPRING : 0;
+        h.numNormalConstr[lane] = 1 + rng() % rowsPerBatch; // >=1 so the solve does work
+        h.restitutionXdt[lane] = unit(rng) < 0.5f ? 0.f : -unit(rng);
+        h.p8[lane] = 0.8f;
+
+        TGSFrictionHeader& fh = fhs[header];
+        const uint32_t fr = (rng() % 3) * 2 + (unit(rng) < 0.3f ? 1 : 0);
+        fh.numFrictionConstr[lane] = std::min(fr, rowsPerBatch + 1);
+        fh.dynamicFriction[lane] = unit(rng);
+        fh.biasCoefficient[lane] = unit(rng) * 10.f;
+        fh.torsionalFrictionScale[lane] = 0.5f + unit(rng);
+        const Vec3 f0 = randUnitV(rng), f1 = randUnitV(rng);
+        fh.frictionNormals0[lane] = Float4{ f0.x, f0.y, f0.z, 0 };
+        fh.frictionNormals1[lane] = Float4{ f1.x, f1.y, f1.z, 0 };
+
+        for (uint32_t i = 0; i < rowsPerBatch; ++i)
+        {
+            TGSContactPoint& c = cps[header * rowsPerBatch + i];
+            const Vec3 ra = Vec3(sym(rng), sym(rng), sym(rng)) * 0.3f;
+            const Vec3 rb = Vec3(sym(rng), sym(rng), sym(rng)) * 0.3f;
+            c.raXn_extraCoeff[lane] = Float4{ ra.x, ra.y, ra.z, unit(rng) * 0.3f };
+            c.rbXn_targetVelW[lane] = Float4{ rb.x, rb.y, rb.z, sym(rng) * 0.05f };
+            c.separation[lane] = sym(rng) * 0.05f;
+            c.maxImpulse[lane] = 10.f + unit(rng) * 100.f;
+            c.appliedForce[lane] = unit(rng);
+            c.biasCoefficient[lane] = unit(rng) * 20.f;
+            c.resp0[lane] = 0.1f + unit(rng);
+            c.resp1[lane] = 0.1f + unit(rng);
+        }
+        for (uint32_t i = 0; i < rowsPerBatch + 1; ++i)
+        {
+            TGSFriction& f = frs[header * (rowsPerBatch + 1) + i];
+            const Vec3 ra = Vec3(sym(rng), sym(rng), sym(rng)) * 0.3f;
+            const Vec3 rb = Vec3(sym(rng), sym(rng), sym(rng)) * 0.3f;
+            f.raXn_error[lane] = Float4{ ra.x, ra.y, ra.z, sym(rng) * 0.02f };
+            f.rbXn_targetVelW[lane] = Float4{ rb.x, rb.y, rb.z, sym(rng) * 0.05f };
+            f.appliedForce[lane] = sym(rng) * 0.2f;
+            f.resp0[lane] = 0.1f + unit(rng);
+            f.resp1[lane] = 0.1f + unit(rng);
+        }
+    };
+    auto fillJointLane = [&](uint32_t lane) {
+        TGSJointHeader& h = jhs[0];
+        h.rowCounts_breakable_orthoAxisCount[lane] = 1 + rng() % rowsPerBatch;
+        const Vec3 raw = Vec3(sym(rng), sym(rng), sym(rng)) * 0.3f;
+        const Vec3 rbw = Vec3(sym(rng), sym(rng), sym(rng)) * 0.3f;
+        h.rAWorld_invMass0D0[lane] = Float4{ raw.x, raw.y, raw.z, unit(rng) };
+        h.rBWorld_invMass1D1[lane] = Float4{ rbw.x, rbw.y, rbw.z, 0.f }; // static B invMass1=0
+        h.invInertiaScale0[lane] = unit(rng);
+        h.invInertiaScale1[lane] = 0.f; // static B
+        for (int kk = 0; kk < 3; ++kk)
+        {
+            const Vec3 o0 = randUnitV(rng), o1 = randUnitV(rng);
+            h.angOrthoAxis0_recipResponseW[kk][lane] = Float4{ o0.x, o0.y, o0.z, unit(rng) * 0.5f };
+            h.angOrthoAxis1_ErrorW[kk][lane] = Float4{ o1.x, o1.y, o1.z, sym(rng) * 0.02f };
+        }
+        for (uint32_t i = 0; i < rowsPerBatch; ++i)
+        {
+            TGSJointRowCon& c = jrows[i];
+            const Vec3 l0 = randUnitV(rng), l1 = randUnitV(rng);
+            const Vec3 a0 = Vec3(sym(rng), sym(rng), sym(rng)) * 0.4f;
+            const Vec3 a1 = Vec3(sym(rng), sym(rng), sym(rng)) * 0.4f;
+            c.lin0XYZ_initBiasOrCoeff0[lane] = Float4{ l0.x, l0.y, l0.z, sym(rng) * 0.05f };
+            c.lin1XYZ_biasScaleOrCoeff1[lane] =
+                Float4{ l1.x, l1.y, l1.z, unit(rng) < 0.2f ? 0.f : unit(rng) * 5.f };
+            c.ang0XYZ_velMultiplierOrCoeff2[lane] = Float4{ a0.x, a0.y, a0.z, 0.5f + unit(rng) * 0.5f };
+            c.ang1XYZ_velTargetOrCoeff3[lane] = Float4{ a1.x, a1.y, a1.z, sym(rng) * 0.05f };
+            c.minImpulse[lane] = -50.f - unit(rng) * 50.f;
+            c.maxImpulse[lane] = 50.f + unit(rng) * 50.f;
+            c.maxBias[lane] = unit(rng) * 10.f;
+            c.angularErrorScale[lane] = unit(rng);
+            uint32_t fl = 0;
+            if (unit(rng) < 0.4f) fl |= DY_SC_FLAG_SPRING;
+            if (unit(rng) < 0.4f) fl |= DY_SC_FLAG_ORTHO_TARGET;
+            if (unit(rng) < 0.3f) fl |= DY_SC_FLAG_INEQUALITY;
+            c.flags[lane] = fl;
+            c.appliedForce[lane] = sym(rng) * 0.2f;
+        }
+    };
+
+    for (uint32_t k = 1; k <= 3; ++k) // contact batches
+    {
+        BatchTGS& b = batches[k];
+        b.descStride = 2;
+        b.constraintType = 1; // eCONTACT
+        b.scalars[1] = k - 1;                        // mConstraintBatchIndex -> chs/fhs index
+        b.scalars[2] = (k - 1) * rowsPerBatch;       // startConstraintIndex -> cps
+        b.scalars[3] = (k - 1) * (rowsPerBatch + 1); // startFrictionIndex   -> frs
+        b.scalars[6] = 0x3u;                         // mask: lanes 0,1 active
+        fillContactLane(k - 1, 0);
+        fillContactLane(k - 1, 1);
+    }
+    {
+        BatchTGS& b = batches[4]; // joint batch
+        b.descStride = 2;
+        b.constraintType = 0; // eCONSTRAINT_1D
+        b.scalars[1] = 0;     // jhs index
+        b.scalars[2] = 0;     // jrows start
+        b.scalars[6] = 0x3u;  // mask
+        fillJointLane(0);
+        fillJointLane(1);
+    }
+
+    std::vector<uint32_t> contactCounts = { 3, 3 };
+    std::vector<uint32_t> jointCounts = { 1, 1 };
+    std::vector<uint32_t> contactStarts = { contactStart, contactStart };
+    std::vector<uint32_t> jointStarts = { jointStart, jointStart };
+
+    // ---- GPU (engine ABI through the shim) ----
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "solverTGS.spv", "solveStaticBlockTGS", 40u, 0 },
+        { "solverTGS.spv", "propagateStaticSolverBodyVelocitiesTGS", 40u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 2, &solverTgsAbiLoader);
+
+    const uint32_t bodyOutCount = nbStaticSlabs * T * 2 + T; // slabIdx*T*2 + bodyIndex + T max
+    std::vector<Float4> bodyOutInit(bodyOutCount, Float4{ 9.f, 9.f, 9.f, 9.f }); // sentinel
+
+    PxgDevicePtr dVel = 0, dBodyOut = 0, dTx = 0, dIsl = 0, dCC = 0, dJC = 0, dCS = 0, dJS = 0;
+    PxgDevicePtr dBatch = 0, dCh = 0, dFh = 0, dCp = 0, dFr = 0, dJh = 0, dJr = 0, dDesc = 0, dShared = 0;
+    shim.memAlloc(&dVel, velPool.size() * sizeof(Float4));
+    shim.memAlloc(&dBodyOut, bodyOutInit.size() * sizeof(Float4));
+    shim.memAlloc(&dTx, txi.size() * sizeof(SolverTxIData));
+    shim.memAlloc(&dCC, contactCounts.size() * 4);
+    shim.memAlloc(&dJC, jointCounts.size() * 4);
+    shim.memAlloc(&dCS, contactStarts.size() * 4);
+    shim.memAlloc(&dJS, jointStarts.size() * 4);
+    shim.memAlloc(&dBatch, batches.size() * sizeof(BatchTGS));
+    shim.memAlloc(&dCh, chs.size() * sizeof(TGSContactHeader));
+    shim.memAlloc(&dFh, fhs.size() * sizeof(TGSFrictionHeader));
+    shim.memAlloc(&dCp, cps.size() * sizeof(TGSContactPoint));
+    shim.memAlloc(&dFr, frs.size() * sizeof(TGSFriction));
+    shim.memAlloc(&dJh, jhs.size() * sizeof(TGSJointHeader));
+    shim.memAlloc(&dJr, jrows.size() * sizeof(TGSJointRowCon));
+    if (!dVel || !dBodyOut || !dTx || !dCC || !dJC || !dCS || !dJS || !dBatch || !dCh || !dFh || !dCp ||
+        !dFr || !dJh || !dJr)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+    shim.memcpyHtoD(dVel, velPool.data(), velPool.size() * sizeof(Float4));
+    shim.memcpyHtoD(dBodyOut, bodyOutInit.data(), bodyOutInit.size() * sizeof(Float4));
+    shim.memcpyHtoD(dTx, txi.data(), txi.size() * sizeof(SolverTxIData));
+    shim.memcpyHtoD(dCC, contactCounts.data(), contactCounts.size() * 4);
+    shim.memcpyHtoD(dJC, jointCounts.data(), jointCounts.size() * 4);
+    shim.memcpyHtoD(dCS, contactStarts.data(), contactStarts.size() * 4);
+    shim.memcpyHtoD(dJS, jointStarts.data(), jointStarts.size() * 4);
+    shim.memcpyHtoD(dBatch, batches.data(), batches.size() * sizeof(BatchTGS));
+    shim.memcpyHtoD(dCh, chs.data(), chs.size() * sizeof(TGSContactHeader));
+    shim.memcpyHtoD(dFh, fhs.data(), fhs.size() * sizeof(TGSFrictionHeader));
+    shim.memcpyHtoD(dCp, cps.data(), cps.size() * sizeof(TGSContactPoint));
+    shim.memcpyHtoD(dFr, frs.data(), frs.size() * sizeof(TGSFriction));
+    shim.memcpyHtoD(dJh, jhs.data(), jhs.size() * sizeof(TGSJointHeader));
+    shim.memcpyHtoD(dJr, jrows.data(), jrows.size() * sizeof(TGSJointRowCon));
+
+    physx::PxgIslandContext islands[2];
+    std::memset(islands, 0, sizeof(islands));
+    islands[0].mBodyStartIndex = 77u; // decoy
+    islands[0].mBodyCount = 5u;
+    islands[1].mBodyStartIndex = bodyOffset;
+    islands[1].mBodyCount = numDynamicBodies;
+    shim.memAlloc(&dIsl, sizeof(islands));
+    shim.memcpyHtoD(dIsl, islands, sizeof(islands));
+
+    physx::PxgSolverCoreDesc desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.islandContextPool = reinterpret_cast<physx::PxgIslandContext*>(dIsl);
+    desc.solverBodyTxIDataPool = reinterpret_cast<physx::PxgSolverTxIData*>(dTx);
+    desc.accumulatedBodyDeltaVOffset = deltaVOffset;
+    desc.mRigidStaticContactCounts = reinterpret_cast<physx::PxU32*>(dCC);
+    desc.mRigidStaticJointCounts = reinterpret_cast<physx::PxU32*>(dJC);
+    desc.mRigidStaticContactStartIndices = reinterpret_cast<physx::PxU32*>(dCS);
+    desc.mRigidStaticJointStartIndices = reinterpret_cast<physx::PxU32*>(dJS);
+    desc.contactErrorAccumulator.mErrorSumOfSquares = 0.5f;
+    desc.contactErrorAccumulator.mCounter = 0; // >= 0: residual accumulation ON
+    desc.contactErrorAccumulator.mMaxError = 0.0625f;
+
+    physx::PxgSolverSharedDesc<physx::IterativeSolveDataTGS> shared;
+    std::memset(&shared, 0, sizeof(shared));
+    shared.iterativeData.solverBodyVelPool = reinterpret_cast<float4*>(dVel);
+    shared.iterativeData.tempStaticBodyOutputs = reinterpret_cast<float4*>(dBodyOut);
+    shared.iterativeData.blockConstraintBatch = reinterpret_cast<physx::PxgBlockConstraintBatch*>(dBatch);
+    shared.iterativeData.blockContactHeaders = reinterpret_cast<physx::PxgTGSBlockSolverContactHeader*>(dCh);
+    shared.iterativeData.blockFrictionHeaders = reinterpret_cast<physx::PxgTGSBlockSolverFrictionHeader*>(dFh);
+    shared.iterativeData.blockContactPoints = reinterpret_cast<physx::PxgTGSBlockSolverContactPoint*>(dCp);
+    shared.iterativeData.blockFrictions = reinterpret_cast<physx::PxgTGSBlockSolverContactFriction*>(dFr);
+    shared.iterativeData.blockJointConstraintHeaders =
+        reinterpret_cast<physx::PxgTGSBlockSolverConstraint1DHeader*>(dJh);
+    shared.iterativeData.blockJointConstraintRowsCon =
+        reinterpret_cast<physx::PxgTGSBlockSolverConstraint1DCon*>(dJr);
+
+    shim.memAlloc(&dDesc, sizeof(desc));
+    shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
+    shim.memAlloc(&dShared, sizeof(shared));
+    shim.memcpyHtoD(dShared, &shared, sizeof(shared));
+
+    auto makeBlob = [&]() {
+        EngineBlob blob;
+        blob.add<uint64_t>(dDesc);
+        blob.add<uint64_t>(dShared);
+        blob.add<uint32_t>(1u);                   // islandIndex
+        blob.add<uint32_t>(nbStaticSlabs);
+        blob.add<uint32_t>(maxStaticPartitions);
+        blob.add<float>(elapsedTime);
+        blob.add<float>(minPen);
+        blob.finish();
+        return blob;
+    };
+    EngineBlob solveBlob = makeBlob();
+    PXG_CHECK_MSG(solveBlob.bytes.size() == 40, "static-solve blob is 40 bytes (got %zu)",
+                  solveBlob.bytes.size());
+
+    const uint32_t nbBlocksRequired = ((numDynamicBodies + 63) / 64) * nbStaticSlabs;
+    PXG_CHECK_MSG(shim.launchKernel(0, nbBlocksRequired, 1, 1, solveBlob.bytes.data(),
+                                    uint32_t(solveBlob.bytes.size())) == PxgResult::Success,
+                  "launch solveStaticBlockTGS");
+    shim.streamSynchronize();
+
+    EngineBlob propBlob = makeBlob();
+    PXG_CHECK_MSG(shim.launchKernel(1, nbBlocksRequired, 1, 1, propBlob.bytes.data(),
+                                    uint32_t(propBlob.bytes.size())) == PxgResult::Success,
+                  "launch propagateStaticSolverBodyVelocitiesTGS");
+    shim.streamSynchronize();
+
+    // ---- reference ----
+    SolverTxIData idTx;
+    std::memset(&idTx, 0, sizeof(idTx));
+    idTx.deltaBody2World.q = Quat{ 0.f, 0.f, 0.f, 1.f };
+
+    RefErrAcc errAcc; // single accumulator: final = sum over all threads (order-independent under tol)
+    std::vector<Float4> refBodyOut = bodyOutInit;
+
+    auto solveOneBodySlab = [&](uint32_t bodyIndex, uint32_t slabIdx) {
+        const uint32_t idx = bodyIndex; // lane 0 or 1 via warpScanExclusive(0b11, tIW=bodyIndex)
+        const uint32_t startIndex = slabIdx * maxStaticPartitions;
+        const uint32_t rawC = contactCounts[bodyIndex], rawJ = jointCounts[bodyIndex];
+        const uint32_t contactCount = std::min(maxStaticPartitions, std::max(startIndex, rawC) - startIndex);
+        const uint32_t jointCount = std::min(maxStaticPartitions, std::max(startIndex, rawJ) - startIndex);
+        if (contactCount == 0 && jointCount == 0)
+            return;
+
+        const uint32_t inputBody = deltaVOffset + bodyIndex + bodyOffset;
+        const Float4 v0 = velPool[inputBody], v1 = velPool[inputBody + T], v2 = velPool[inputBody + 2 * T];
+        BodyStateTGS s;
+        s.lv0 = Vec3(v0.x, v0.y, v0.z);
+        s.av0 = Vec3(v0.w, v1.x, v1.y);
+        s.ld0 = Vec3(v1.z, v1.w, v2.x);
+        s.ad0 = Vec3(v2.y, v2.z, v2.w);
+        s.lv1 = s.av1 = s.ld1 = s.ad1 = Vec3(0.f);
+
+        const uint32_t startContactIndex = contactStarts[bodyIndex] + startIndex;
+        const uint32_t startJointIndex = jointStarts[bodyIndex] + startIndex;
+        const SolverTxIData iData0 = jointCount ? txi[bodyIndex + bodyOffset] : idTx;
+
+        for (uint32_t i = 0; i < jointCount; ++i)
+            refSolve1DTGS(batches[startJointIndex + i], s, idx, jhs, jrows, iData0, idTx, elapsedTime, true,
+                          1.f, 1.f);
+        for (uint32_t i = 0; i < contactCount; ++i)
+            refSolveContactTGS(batches[startContactIndex + i], s, idx, chs, fhs, cps, frs, elapsedTime,
+                               minPen, 1.f, 1.f, &errAcc);
+
+        const uint32_t outputBody = slabIdx * T * 2;
+        refBodyOut[bodyIndex + outputBody] = Float4{ s.lv0.x, s.lv0.y, s.lv0.z, s.av0.x };
+        refBodyOut[bodyIndex + outputBody + T] = Float4{ s.av0.y, s.av0.z, v1.z, v1.w };
+    };
+
+    for (uint32_t slab = 0; slab < nbStaticSlabs; ++slab)
+        for (uint32_t body = 0; body < numDynamicBodies; ++body)
+            solveOneBodySlab(body, slab);
+
+    // propagate reference
+    std::vector<Float4> refVel = velPool;
+    for (uint32_t body = 0; body < numDynamicBodies; ++body)
+    {
+        const uint32_t maxOutputs = std::max(contactCounts[body], jointCounts[body]);
+        Float4 acc0{ 0, 0, 0, 0 }, acc1{ 0, 0, 0, 0 };
+        float scale = 0.f;
+        uint32_t index = body;
+        for (uint32_t i = 0; i < maxOutputs; i += maxStaticPartitions)
+        {
+            const Float4 a = refBodyOut[index], b = refBodyOut[index + T];
+            acc0 = Float4{ acc0.x + a.x, acc0.y + a.y, acc0.z + a.z, acc0.w + a.w };
+            acc1 = Float4{ acc1.x + b.x, acc1.y + b.y, acc1.z + b.z, acc1.w + b.w };
+            index += T * 2;
+            scale += 1.f;
+        }
+        const float inv = 1.f / scale;
+        const uint32_t outputBody = deltaVOffset + body + bodyOffset;
+        refVel[outputBody] = Float4{ acc0.x * inv, acc0.y * inv, acc0.z * inv, acc0.w * inv };
+        refVel[outputBody + T] = Float4{ acc1.x * inv, acc1.y * inv, acc1.z * inv, acc1.w * inv };
+    }
+
+    // ---- compare ----
+    std::vector<Float4> gpuBodyOut(bodyOutCount);
+    shim.memcpyDtoH(gpuBodyOut.data(), dBodyOut, gpuBodyOut.size() * sizeof(Float4));
+    std::vector<Float4> gpuVel(poolSize);
+    shim.memcpyDtoH(gpuVel.data(), dVel, gpuVel.size() * sizeof(Float4));
+    std::vector<TGSContactPoint> gpuCps(cps.size());
+    shim.memcpyDtoH(gpuCps.data(), dCp, gpuCps.size() * sizeof(TGSContactPoint));
+    std::vector<TGSFriction> gpuFrs(frs.size());
+    shim.memcpyDtoH(gpuFrs.data(), dFr, gpuFrs.size() * sizeof(TGSFriction));
+    std::vector<TGSJointRowCon> gpuJrows(jrows.size());
+    shim.memcpyDtoH(gpuJrows.data(), dJr, gpuJrows.size() * sizeof(TGSJointRowCon));
+
+    size_t mismatches = 0;
+    bool anyWritten = false;
+    for (size_t i = 0; i < bodyOutCount; ++i)
+    {
+        // a slab output that was written differs from the 9.f sentinel
+        if (gpuBodyOut[i].x != 9.f || gpuBodyOut[i].y != 9.f || gpuBodyOut[i].z != 9.f)
+            anyWritten = true;
+        const float* g = &gpuBodyOut[i].x;
+        const float* r = &refBodyOut[i].x;
+        for (int c = 0; c < 4; ++c)
+            if (!almostEqual(g[c], r[c], 2e-4f, 2e-4f))
+            {
+                if (mismatches < 5)
+                    PXG_CHECK_MSG(false, "tempStaticBodyOutputs[%zu].%d: gpu=%g ref=%g", i, c, g[c], r[c]);
+                ++mismatches;
+            }
+    }
+    PXG_CHECK_MSG(anyWritten, "solveStaticBlockTGS wrote no outputs (no-op / unbound launch?)");
+    PXG_CHECK_MSG(mismatches == 0, "static solve: %zu tempStaticBodyOutputs mismatches", mismatches);
+
+    mismatches = 0;
+    for (uint32_t body = 0; body < numDynamicBodies; ++body)
+        for (uint32_t half = 0; half < 2; ++half)
+        {
+            const uint32_t i = deltaVOffset + body + bodyOffset + half * T;
+            const float* g = &gpuVel[i].x;
+            const float* r = &refVel[i].x;
+            for (int c = 0; c < 4; ++c)
+                if (!almostEqual(g[c], r[c], 2e-4f, 2e-4f))
+                {
+                    if (mismatches < 5)
+                        PXG_CHECK_MSG(false, "propagate deltaV[%u].%d: gpu=%g ref=%g", i, c, g[c], r[c]);
+                    ++mismatches;
+                }
+        }
+    PXG_CHECK_MSG(mismatches == 0, "propagate: %zu deltaV mismatches", mismatches);
+
+    mismatches = 0;
+    for (size_t i = 0; i < cps.size(); ++i)
+        for (int l = 0; l < 2; ++l)
+            if (!almostEqual(gpuCps[i].appliedForce[l], cps[i].appliedForce[l], 2e-4f, 2e-4f))
+                ++mismatches;
+    for (size_t i = 0; i < frs.size(); ++i)
+        for (int l = 0; l < 2; ++l)
+            if (!almostEqual(gpuFrs[i].appliedForce[l], frs[i].appliedForce[l], 2e-4f, 2e-4f))
+                ++mismatches;
+    for (size_t i = 0; i < jrows.size(); ++i)
+        for (int l = 0; l < 2; ++l)
+        {
+            if (!almostEqual(gpuJrows[i].appliedForce[l], jrows[i].appliedForce[l], 2e-4f, 2e-4f))
+                ++mismatches;
+            if (!almostEqual(gpuJrows[i].residual[l], jrows[i].residual[l], 1e-3f, 1e-3f))
+                ++mismatches;
+        }
+    PXG_CHECK_MSG(mismatches == 0, "static solve: %zu applied-force/residual mismatches", mismatches);
+
+    physx::PxgSolverCoreDesc gpuDesc;
+    shim.memcpyDtoH(&gpuDesc, dDesc, sizeof(gpuDesc));
+    const float expectSum = 0.5f + errAcc.sumSq;
+    const float expectMax = std::fmax(0.0625f, errAcc.maxErr);
+    PXG_CHECK_MSG(gpuDesc.contactErrorAccumulator.mCounter == int32_t(errAcc.counter),
+                  "residual counter: gpu=%d ref=%u", gpuDesc.contactErrorAccumulator.mCounter,
+                  errAcc.counter);
+    PXG_CHECK_MSG(errAcc.counter > 0, "fixture sanity: contact residual path exercised");
+    PXG_CHECK_MSG(almostEqual(gpuDesc.contactErrorAccumulator.mErrorSumOfSquares, expectSum, 2e-4f, 2e-4f),
+                  "residual sum-of-squares: gpu=%g ref=%g",
+                  gpuDesc.contactErrorAccumulator.mErrorSumOfSquares, expectSum);
+    PXG_CHECK_MSG(almostEqual(gpuDesc.contactErrorAccumulator.mMaxError, expectMax, 2e-4f, 2e-4f),
+                  "residual max: gpu=%g ref=%g", gpuDesc.contactErrorAccumulator.mMaxError, expectMax);
+
+    for (PxgDevicePtr pfree : { dVel, dBodyOut, dTx, dIsl, dCC, dJC, dCS, dJS, dBatch, dCh, dFh, dCp, dFr,
+                                dJh, dJr, dDesc, dShared })
+        shim.memFree(pfree);
+}
+
+// ---------------------------------------------------------------------------
+// concludeBlocksTGS (ENGINE ABI)
+// ---------------------------------------------------------------------------
+// Derives the batch range from the island context and runs conclude1DBlockTGS
+// on joint batches (eCONSTRAINT_1D=0) while no-op'ing contact batches
+// (eCONTACT=1), matching solverMultiBlockTGS.cu.  Verifies joint rows are
+// repacked (biasScale/spring .w zeroed per flags) and a canary joint row
+// referenced only by a contact batch is left untouched.
+PXG_TEST(solverTGS_concludeBlocksAbi)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    std::mt19937 rng(4100);
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::uniform_real_distribution<float> sym(-2.f, 2.f);
+
+    const uint32_t rowsPerBatch = 4;
+    const uint32_t batchStartIndex = 1; // island.mBatchStartIndex; batch 0 is a decoy
+    // batches 1..4: joint, contact, joint, contact
+    const uint16_t types[5] = { 0, 0, 1, 0, 1 };
+    const uint32_t numAllBatches = 5;
+    const uint32_t numLiveBatches = 4; // endIndex = mBatchCount + startIndex
+
+    // jrows: joint batches use [0,4) and [4,8); the canary at [8,12) is
+    // referenced only by the contact batches and must stay pristine.
+    std::vector<BatchTGS> batches(numAllBatches);
+    std::vector<TGSJointHeader> jhs(numAllBatches);
+    std::vector<TGSJointRowCon> jrows(numAllBatches * rowsPerBatch);
+    std::memset(batches.data(), 0, batches.size() * sizeof(BatchTGS));
+    std::memset(jhs.data(), 0, jhs.size() * sizeof(TGSJointHeader));
+    std::memset(jrows.data(), 0, jrows.size() * sizeof(TGSJointRowCon));
+
+    for (uint32_t k = 1; k <= numLiveBatches; ++k)
+    {
+        BatchTGS& b = batches[k];
+        b.descStride = uint16_t(1 + rng() % 32);
+        b.constraintType = types[k];
+        b.scalars[1] = k; // mConstraintBatchIndex -> jhs index
+        b.scalars[2] = k * rowsPerBatch; // startConstraintIndex -> jrows
+        for (uint32_t lane = 0; lane < 32; ++lane)
+        {
+            const uint32_t rows = (lane < b.descStride) ? (1 + rng() % rowsPerBatch) : 0;
+            jhs[k].rowCounts_breakable_orthoAxisCount[lane] = rows;
+            for (uint32_t i = 0; i < rowsPerBatch; ++i)
+            {
+                TGSJointRowCon& c = jrows[b.scalars[2] + i];
+                c.lin0XYZ_initBiasOrCoeff0[lane] = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+                c.lin1XYZ_biasScaleOrCoeff1[lane] = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+                c.ang0XYZ_velMultiplierOrCoeff2[lane] = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+                c.ang1XYZ_velTargetOrCoeff3[lane] = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+                c.flags[lane] = (unit(rng) < 0.5f ? DY_SC_FLAG_KEEP_BIAS : 0u) |
+                                (unit(rng) < 0.5f ? DY_SC_FLAG_SPRING : 0u);
+            }
+        }
+    }
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "solverTGS.spv", "concludeBlocksTGS", 24u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &solverTgsAbiLoader);
+
+    PxgDevicePtr dBatch = 0, dJh = 0, dJr = 0, dIsl = 0, dDesc = 0, dShared = 0;
+    shim.memAlloc(&dBatch, batches.size() * sizeof(BatchTGS));
+    shim.memAlloc(&dJh, jhs.size() * sizeof(TGSJointHeader));
+    shim.memAlloc(&dJr, jrows.size() * sizeof(TGSJointRowCon));
+    if (!dBatch || !dJh || !dJr)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+    shim.memcpyHtoD(dBatch, batches.data(), batches.size() * sizeof(BatchTGS));
+    shim.memcpyHtoD(dJh, jhs.data(), jhs.size() * sizeof(TGSJointHeader));
+    shim.memcpyHtoD(dJr, jrows.data(), jrows.size() * sizeof(TGSJointRowCon));
+
+    physx::PxgIslandContext islands[2];
+    std::memset(islands, 0, sizeof(islands));
+    islands[0].mBodyCount = 3u; // decoy
+    islands[1].mBatchStartIndex = batchStartIndex;
+    islands[1].mBatchCount = numLiveBatches; // endIndex = numLiveBatches + startIndex
+    shim.memAlloc(&dIsl, sizeof(islands));
+    shim.memcpyHtoD(dIsl, islands, sizeof(islands));
+
+    physx::PxgSolverCoreDesc desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.islandContextPool = reinterpret_cast<physx::PxgIslandContext*>(dIsl);
+
+    physx::PxgSolverSharedDesc<physx::IterativeSolveDataTGS> shared;
+    std::memset(&shared, 0, sizeof(shared));
+    shared.iterativeData.blockConstraintBatch = reinterpret_cast<physx::PxgBlockConstraintBatch*>(dBatch);
+    shared.iterativeData.blockJointConstraintHeaders =
+        reinterpret_cast<physx::PxgTGSBlockSolverConstraint1DHeader*>(dJh);
+    shared.iterativeData.blockJointConstraintRowsCon =
+        reinterpret_cast<physx::PxgTGSBlockSolverConstraint1DCon*>(dJr);
+
+    shim.memAlloc(&dDesc, sizeof(desc));
+    shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
+    shim.memAlloc(&dShared, sizeof(shared));
+    shim.memcpyHtoD(dShared, &shared, sizeof(shared));
+
+    EngineBlob blob;
+    blob.add<uint64_t>(dDesc);
+    blob.add<uint64_t>(dShared);
+    blob.add<uint32_t>(1u); // islandIndex
+    blob.finish();
+    PXG_CHECK_MSG(blob.bytes.size() == 24, "conclude blob is 24 bytes (got %zu)", blob.bytes.size());
+
+    const uint32_t gridX = (numLiveBatches + 7) / 8; // 8 warps per 256-thread block
+    PXG_CHECK_MSG(shim.launchKernel(0, gridX, 1, 1, blob.bytes.data(), uint32_t(blob.bytes.size())) ==
+                      PxgResult::Success,
+                  "launch concludeBlocksTGS");
+    shim.streamSynchronize();
+
+    // ---- reference (conclude1DBlockTGS on joint batches only) ----
+    auto refRows = jrows;
+    for (uint32_t k = 1; k <= numLiveBatches; ++k)
+    {
+        const BatchTGS& b = batches[k];
+        if (b.constraintType != 0)
+            continue; // contact / articulation-contact: no-op
+        for (uint32_t lane = 0; lane < b.descStride; ++lane)
+        {
+            const uint32_t rows = jhs[k].rowCounts_breakable_orthoAxisCount[lane] & 0xFFu;
+            for (uint32_t i = 0; i < rows; ++i)
+            {
+                TGSJointRowCon& c = refRows[b.scalars[2] + i];
+                if (!(c.flags[lane] & DY_SC_FLAG_KEEP_BIAS))
+                    c.lin1XYZ_biasScaleOrCoeff1[lane].w = 0.f;
+                if (c.flags[lane] & DY_SC_FLAG_SPRING)
+                {
+                    c.lin0XYZ_initBiasOrCoeff0[lane].w = 0.f;
+                    c.lin1XYZ_biasScaleOrCoeff1[lane].w = 0.f;
+                    c.ang0XYZ_velMultiplierOrCoeff2[lane].w = 0.f;
+                    c.ang1XYZ_velTargetOrCoeff3[lane].w = 0.f;
+                }
+            }
+        }
+    }
+
+    std::vector<TGSJointRowCon> gpuRows(jrows.size());
+    shim.memcpyDtoH(gpuRows.data(), dJr, gpuRows.size() * sizeof(TGSJointRowCon));
+
+    size_t mismatches = 0;
+    size_t mutated = 0;
+    for (size_t i = 0; i < jrows.size(); ++i)
+        for (int l = 0; l < 32; ++l)
+        {
+            const Float4* g[] = { &gpuRows[i].lin0XYZ_initBiasOrCoeff0[l],
+                                  &gpuRows[i].lin1XYZ_biasScaleOrCoeff1[l],
+                                  &gpuRows[i].ang0XYZ_velMultiplierOrCoeff2[l],
+                                  &gpuRows[i].ang1XYZ_velTargetOrCoeff3[l] };
+            const Float4* r[] = { &refRows[i].lin0XYZ_initBiasOrCoeff0[l],
+                                  &refRows[i].lin1XYZ_biasScaleOrCoeff1[l],
+                                  &refRows[i].ang0XYZ_velMultiplierOrCoeff2[l],
+                                  &refRows[i].ang1XYZ_velTargetOrCoeff3[l] };
+            const Float4* o[] = { &jrows[i].lin0XYZ_initBiasOrCoeff0[l],
+                                  &jrows[i].lin1XYZ_biasScaleOrCoeff1[l],
+                                  &jrows[i].ang0XYZ_velMultiplierOrCoeff2[l],
+                                  &jrows[i].ang1XYZ_velTargetOrCoeff3[l] };
+            for (int c = 0; c < 4; ++c)
+            {
+                if (std::memcmp(g[c], r[c], sizeof(Float4)) != 0)
+                    ++mismatches;
+                if (std::memcmp(r[c], o[c], sizeof(Float4)) != 0)
+                    ++mutated; // reference actually changed something here
+            }
+        }
+    PXG_CHECK_MSG(mutated > 0, "concludeBlocksTGS reference mutated nothing (fixture too weak / no-op?)");
+    PXG_CHECK_MSG(mismatches == 0, "conclude (engine ABI): %zu joint-row mismatches", mismatches);
+
+    // canary: jrows[16..20) (batch index 4 * rowsPerBatch, referenced only by a
+    // contact batch) must be byte-identical to the upload.
+    for (uint32_t i = 4 * rowsPerBatch; i < 5 * rowsPerBatch; ++i)
+        PXG_CHECK_MSG(std::memcmp(&gpuRows[i], &jrows[i], sizeof(TGSJointRowCon)) == 0,
+                      "conclude touched a contact-only joint row (canary %u)", i);
+
+    for (PxgDevicePtr pfree : { dBatch, dJh, dJr, dIsl, dDesc, dShared })
         shim.memFree(pfree);
 }
 

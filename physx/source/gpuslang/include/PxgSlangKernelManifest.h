@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 139;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 141;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -182,7 +182,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "jointConstraintBlockPrepareParallelLaunchTGS", "constraintPrepTGS.spv", "jointConstraintBlockPrepareParallelLaunchTGS" },  // TGS_JOINT_CONSTRAINT_PREPARE_BLOCK_PARALLEL
     { "contactConstraintBlockPrepareParallelLaunchTGS", "constraintPrepTGS.spv", "contactConstraintBlockPrepareParallelLaunchTGS" },  // TGS_CONTACT_CONSTRAINT_PREPARE_BLOCK_PARALLEL
     { "propagateAverageSolverBodyVelocityTGS", "solverTGS.spv", "propagateAverageSolverBodyVelocityTGS" },  // PROPAGATE_AVERAGE_VELOCITY_TGS
-    { "propagateStaticSolverBodyVelocitiesTGS", nullptr, nullptr },  // PROPAGATE_STATIC_SOLVER_VELOCITIES_TGS (unmapped)
+    { "propagateStaticSolverBodyVelocitiesTGS", "solverTGS.spv", "propagateStaticSolverBodyVelocitiesTGS" },  // PROPAGATE_STATIC_SOLVER_VELOCITIES_TGS
     { "applyTGSSubstepGravity", "solverApplyGravityTGS.spv", "applyTGSSubstepGravity" },  // APPLY_TGS_SUBSTEP_GRAVITY
     { "markActiveSlabPGS", nullptr, nullptr },  // MARK_ACTIVE_SLAB_PGS (unmapped)
     { "markActiveSlabTGS", nullptr, nullptr },  // MARK_ACTIVE_SLAB_TGS (unmapped)
@@ -206,7 +206,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "rigidSumInternalContactAndJointBatches1", "npRigidSumBatches.spv", "rigidSumInternalContactAndJointBatches1" },  // RIGID_SUM_STATIC_CONTACT1 (P5 Step 4 BDA port)
     { "rigidSumInternalContactAndJointBatches2", "npRigidSumBatches.spv", "rigidSumInternalContactAndJointBatches2" },  // RIGID_SUM_STATIC_CONTACT2 (P5 Step 4 BDA port)
     { "solveStaticBlock", nullptr, nullptr },  // RIGID_SOLVE_STATIC_CONSTRAINTS (unmapped)
-    { "solveStaticBlockTGS", nullptr, nullptr },  // RIGID_SOLVE_STATIC_CONSTRAINTS_TGS (unmapped)
+    { "solveStaticBlockTGS", "solverTGS.spv", "solveStaticBlockTGS" },  // RIGID_SOLVE_STATIC_CONSTRAINTS_TGS
     { "solveWholeIslandTGS", "solverTGS.spv", "solveWholeIslandTGS" },  // RIGID_SOLVE_WHOLE_ISLAND_TGS
     { "ps_updateUnsortedArrayLaunch", nullptr, nullptr },  // PS_UPDATE_UNSORTED_ARRAY (unmapped)
     { "ps_updateUserBufferLaunch", nullptr, nullptr },  // PS_UPDATE_BUFFER_DATA (unmapped)
