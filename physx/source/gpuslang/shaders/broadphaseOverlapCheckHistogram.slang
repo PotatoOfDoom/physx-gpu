@@ -26,8 +26,11 @@
 
 // broadphaseOverlapCheckHistogram.slang
 //
-// Slang port of the broad-phase overlap-check region histogram trio
-// (gpubroadphase/src/CUDA/broadphase.cu, L1246-1478):
+// P5 Step 4 (BDA, engine launch path): the broad-phase overlap-check region
+// histogram trio (gpubroadphase/src/CUDA/broadphase.cu, L1246-1478), driven
+// exactly as the engine launches them — ONE PxgBroadPhaseDesc device pointer,
+// walked through the byte-exact PxgBroadPhaseDescGpu mirror (pxgSlangBpDesc,
+// proven by testBpDescLayout):
 //   - writeOutOverlapChecksForInsertedBoundsRegionsHistogram (L1246): for each
 //     region cell a box's full 3D span covers, count the overlap-check
 //     candidates in that region (a difference of two entries of the region's
@@ -37,55 +40,43 @@
 //     prefix over the overlap-check counts with a running block accumulator,
 //     writing the per-block grand total to blockOverlapChecksRegion.
 //   - outputOverlapChecksForRegionHistogram (L1425): exclusive prefix over the
-//     32 per-block totals (grand total -> overlapChecksTotalRegion) added back
+//     32 per-block totals (grand total -> the desc's overlapChecksTotalRegion
+//     u64 VALUE, written through the desc pointer as the .cu does) added back
 //     into each block's range -> a device-wide exclusive prefix sum.
 //
 // The counts sum to the frame's total overlap-check count, which overflows
-// 32 bits (PhysX types these buffers PxU64), so the scan pair carries 64-bit
-// accumulators — mapped to Slang uint64_t (the Vulkan device enables
-// shaderInt64).  This is the 64-bit instance of the broadphaseRegionHistogram
-// two-pass scan.  The CUDA warp-shuffle scans become groupshared 32-lane scans
-// under uniform GroupMemoryBarrierWithGroupSync(); the fixed 32-block grid
-// (gridDim == BLOCK_SIZE == 32) is preserved.
+// 32 bits (PhysX types these buffers PxU64 = regionOverlapType), so the scan
+// pair carries 64-bit accumulators — Slang uint64_t via Ptr<uint64_t> (the
+// Vulkan device enables shaderInt64).  The CUDA warp-shuffle scans become
+// groupshared 32-lane scans under uniform GroupMemoryBarrierWithGroupSync();
+// the .cu's numIterationPerBlock uses the compile-time BLOCK_SIZE (=32 = the
+// launch grid PxgBPKernelGridDim::BP_*_OVERLAPCHECKS_HISTOGRAM), preserved as
+// NUM_BLOCKS.
+
+import pxgSlangBpDesc;
 
 static const uint BLOCK = 256;
-static const uint NUM_BLOCKS = 32; // gridDim.x == BLOCK_SIZE == 32
+static const uint NUM_BLOCKS = 32; // == BLOCK_SIZE in the .cu == the launch grid
 static const uint WARP = 32;
 static const uint WARPS_PER_BLOCK = BLOCK / WARP; // 8
 static const uint REGION_SIZE_PER_AXIS = 4;
 
-struct OverlapCheckParams
+// engine ABI: all three entries take the PxgBroadPhaseDesc device pointer only
+struct BpDescParams
 {
-    uint numHandles;      // nbProjections = numHandles * 2
-    uint totalComparison; // regionAccumTotal
-    uint gridDimX;        // groups launched (32)
+    uint64_t bpDesc;
 }
-
 [[vk::push_constant]]
-ConstantBuffer<OverlapCheckParams> gParams;
+ConstantBuffer<BpDescParams> gBp;
 
-RWStructuredBuffer<uint> gRegionAccum;        // binding 0  regionAccum [nbProj] (exclusive prefix)  (R)
-RWStructuredBuffer<uint> gHandlesX;           // binding 1  boxHandles[0][AXIS_X] [nbProj]           (R)
-RWStructuredBuffer<uint> gSapBoxX;            // binding 2  boxSapBox1D[AXIS_X] flat [numHandles][2]  (R)
-RWStructuredBuffer<uint> gRegionRange;        // binding 3  regionRange[handle] flat [numHandles][8]  (R)
-RWStructuredBuffer<uint> gStartHist;          // binding 4  startRegionsHistogram offset table [64][nbProj] (R)
-RWStructuredBuffer<uint> gActiveHist;         // binding 5  activeRegionsHistogram offset table [64][nbProj] (R)
-RWStructuredBuffer<uint64_t> gOverlapChecks;  // binding 6  overlapChecksRegion [total]  (W / RMW)
-RWStructuredBuffer<uint> gHandleRegiones;     // binding 7  overlapChecksHandleRegiones [total][2] (W)
-RWStructuredBuffer<uint64_t> gBlockOverlap;   // binding 8  blockOverlapChecksRegion [32]  (W/R)
-RWStructuredBuffer<uint64_t> gTotalOverlap;   // binding 9  overlapChecksTotalRegion [1]   (W)
-
-uint getHandle(uint sortedHandle) { return sortedHandle >> 3; }
-uint isNewProjection(uint sortedHandle) { return (sortedHandle >> 1) & 1u; }
-
-uint binarySearch(uint numElements, uint value)
+uint binarySearch(Ptr<uint> data, uint numElements, uint value)
 {
     uint left = 0;
     uint right = numElements;
     while (left < right)
     {
         const uint pos = (left + right) / 2u;
-        if (gRegionAccum[pos] <= value)
+        if (data[pos] <= value)
             left = pos + 1u;
         else
             right = pos;
@@ -100,34 +91,46 @@ uint binarySearch(uint numElements, uint value)
 [numthreads(256, 1, 1)]
 void writeOutOverlapChecksForInsertedBoundsRegionsHistogram(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
     const uint tid = gtid.x;
     const uint blockIdx = gid.x;
-    const uint nbProjections = gParams.numHandles * 2u;
-    const uint totalComparison = gParams.totalComparison;
-    const uint gridDimX = gParams.gridDimX;
+
+    const uint numHandles = desc[0].numPreviousHandles + desc[0].numCreatedHandles - desc[0].numRemovedHandles;
+    const uint nbProjections = numHandles * 2u;
+
+    Ptr<uint> sapBoxX = Ptr<uint>(desc[0].boxSapBox1D[0]);                     // PxgSapBox1D = 2 uints, AXIS_X
+    Ptr<uint64_t> overlapChecks = Ptr<uint64_t>(desc[0].overlapChecksRegion);  // regionOverlapType = PxU64
+    Ptr<uint> handleRegiones = Ptr<uint>(desc[0].overlapChecksHandleRegiones); // PxgHandleRegion = 2 uints
+    Ptr<uint> regionRange = Ptr<uint>(desc[0].regionRange);                    // PxgIntegerRegion = 8 uints
+    Ptr<uint> regionAccum = Ptr<uint>(desc[0].regionAccum);
+    Ptr<uint> handles = Ptr<uint>(desc[0].boxHandles[0]);                      // boxHandles[0][AXIS_X]
+    Ptr<uint> startHist = Ptr<uint>(desc[0].startRegionsHistogram);
+    Ptr<uint> activeHist = Ptr<uint>(desc[0].activeRegionsHistogram);
+
+    const uint totalComparison = desc[0].regionAccumTotal;
 
     const uint nbBlocksRequired = (totalComparison + BLOCK - 1u) / BLOCK;
-    const uint numIterationPerBlock = (nbBlocksRequired + gridDimX - 1u) / gridDimX;
+    const uint numIterationPerBlock = (nbBlocksRequired + NUM_BLOCKS - 1u) / NUM_BLOCKS;
 
     for (uint it = 0; it < numIterationPerBlock; ++it)
     {
         const uint workIndex = it * BLOCK + tid + numIterationPerBlock * blockIdx * BLOCK;
         if (workIndex < totalComparison)
         {
-            const uint boxStartIndexX = binarySearch(nbProjections, workIndex);
-            const uint offset = workIndex - gRegionAccum[boxStartIndexX];
-            const uint sortedHandle = gHandlesX[boxStartIndexX];
-            const uint handle = getHandle(sortedHandle);
-            const uint isNew = isNewProjection(sortedHandle);
+            const uint boxStartIndexX = binarySearch(regionAccum, nbProjections, workIndex);
+            const uint offset = workIndex - regionAccum[boxStartIndexX];
+            const uint sortedHandle = handles[boxStartIndexX];
+            const uint handle = bpGetHandle(sortedHandle);
+            const bool isNew = bpIsNewProjection(sortedHandle);
 
-            const uint boxEndIndexX = gSapBoxX[handle * 2u + 1u];
+            const uint boxEndIndexX = sapBoxX[handle * 2u + 1u];
 
             const uint rr = handle * 8u;
-            const uint sRegionX = gRegionRange[rr + 0u];
-            const uint sRegionY = gRegionRange[rr + 1u];
-            const uint sRegionZ = gRegionRange[rr + 2u];
-            const uint eRegionY = gRegionRange[rr + 5u];
-            const uint eRegionZ = gRegionRange[rr + 6u];
+            const uint sRegionX = regionRange[rr + 0u];
+            const uint sRegionY = regionRange[rr + 1u];
+            const uint sRegionZ = regionRange[rr + 2u];
+            const uint eRegionY = regionRange[rr + 5u];
+            const uint eRegionZ = regionRange[rr + 6u];
 
             const uint nbZRegions = (eRegionZ - sRegionZ) + 1u;
             const uint nbYRegions = (eRegionY - sRegionY) + 1u;
@@ -140,21 +143,13 @@ void writeOutOverlapChecksForInsertedBoundsRegionsHistogram(uint3 gtid : SV_Grou
                                      * nbProjections;
 
             // isNew -> start-region table, else active-region table
-            uint regionStartIndex, regionEndIndex;
-            if (isNew != 0u)
-            {
-                regionStartIndex = gStartHist[regionIndex + boxStartIndexX + 1u];
-                regionEndIndex = gStartHist[regionIndex + boxEndIndexX];
-            }
-            else
-            {
-                regionStartIndex = gActiveHist[regionIndex + boxStartIndexX + 1u];
-                regionEndIndex = gActiveHist[regionIndex + boxEndIndexX];
-            }
+            Ptr<uint> startEndPtHistogram = isNew ? startHist : activeHist;
+            const uint regionStartIndex = startEndPtHistogram[regionIndex + boxStartIndexX + 1u];
+            const uint regionEndIndex = startEndPtHistogram[regionIndex + boxEndIndexX];
 
-            gHandleRegiones[workIndex * 2u + 0u] = handle;
-            gHandleRegiones[workIndex * 2u + 1u] = regionIndex;
-            gOverlapChecks[workIndex] = uint64_t(regionEndIndex - regionStartIndex);
+            handleRegiones[workIndex * 2u + 0u] = handle;      // .handleIndex
+            handleRegiones[workIndex * 2u + 1u] = regionIndex; // .regionIndex
+            overlapChecks[workIndex] = uint64_t(regionEndIndex - regionStartIndex);
         }
     }
 }
@@ -202,15 +197,18 @@ void scanWarpTotals(uint tid)
 [numthreads(256, 1, 1)]
 void computeOverlapChecksForRegionsHistogram(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
     const uint tid = gtid.x;
     const uint blockIdx = gid.x;
     const uint warpIndex = tid / WARP;
     const uint lane = tid & (WARP - 1);
-    const uint totalComparison = gParams.totalComparison;
-    const uint gridDimX = gParams.gridDimX;
+
+    Ptr<uint64_t> blockOverlapChecks = Ptr<uint64_t>(desc[0].blockOverlapChecksRegion);
+    Ptr<uint64_t> overlapChecks = Ptr<uint64_t>(desc[0].overlapChecksRegion);
+    const uint totalComparison = desc[0].regionAccumTotal;
 
     const uint nbBlocksRequired = (totalComparison + BLOCK - 1u) / BLOCK;
-    const uint numIterationPerBlock = (nbBlocksRequired + gridDimX - 1u) / gridDimX;
+    const uint numIterationPerBlock = (nbBlocksRequired + NUM_BLOCKS - 1u) / NUM_BLOCKS;
 
     if (tid == 0)
         gsBlockAccum = uint64_t(0);
@@ -219,7 +217,7 @@ void computeOverlapChecksForRegionsHistogram(uint3 gtid : SV_GroupThreadID, uint
     for (uint it = 0; it < numIterationPerBlock; ++it)
     {
         const uint workIndex = it * BLOCK + tid + numIterationPerBlock * blockIdx * BLOCK;
-        const uint64_t nbComparison = (workIndex < totalComparison) ? gOverlapChecks[workIndex] : uint64_t(0);
+        const uint64_t nbComparison = (workIndex < totalComparison) ? overlapChecks[workIndex] : uint64_t(0);
 
         gsLane[tid] = nbComparison;
         GroupMemoryBarrierWithGroupSync();
@@ -236,13 +234,13 @@ void computeOverlapChecksForRegionsHistogram(uint3 gtid : SV_GroupThreadID, uint
         GroupMemoryBarrierWithGroupSync();
 
         if (workIndex < totalComparison)
-            gOverlapChecks[workIndex] = pairCount + gsWarp[warpIndex] + prevAccum;
+            overlapChecks[workIndex] = pairCount + gsWarp[warpIndex] + prevAccum;
 
         GroupMemoryBarrierWithGroupSync();
     }
 
     if (tid == 0)
-        gBlockOverlap[blockIdx] = gsBlockAccum;
+        blockOverlapChecks[blockIdx] = gsBlockAccum;
 }
 
 // ---------------------------------------------------------------------------
@@ -252,25 +250,30 @@ void computeOverlapChecksForRegionsHistogram(uint3 gtid : SV_GroupThreadID, uint
 [numthreads(256, 1, 1)]
 void outputOverlapChecksForRegionHistogram(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
     const uint tid = gtid.x;
     const uint blockIdx = gid.x;
-    const uint totalComparison = gParams.totalComparison;
-    const uint gridDimX = gParams.gridDimX;
+
+    Ptr<uint64_t> blockOverlapChecks = Ptr<uint64_t>(desc[0].blockOverlapChecksRegion);
+    Ptr<uint64_t> overlapChecks = Ptr<uint64_t>(desc[0].overlapChecksRegion);
+    const uint totalComparison = desc[0].regionAccumTotal;
 
     const uint nbBlocksRequired = (totalComparison + BLOCK - 1u) / BLOCK;
-    const uint numIterationPerBlock = (nbBlocksRequired + gridDimX - 1u) / gridDimX;
+    const uint numIterationPerBlock = (nbBlocksRequired + NUM_BLOCKS - 1u) / NUM_BLOCKS;
 
     if (tid == 0)
     {
         uint64_t acc = uint64_t(0);
         for (uint b = 0; b < NUM_BLOCKS; ++b)
         {
-            const uint64_t v = gBlockOverlap[b];
+            const uint64_t v = blockOverlapChecks[b];
             gsBlockPrefix[b] = acc; // exclusive prefix
             acc += v;
         }
+        // .cu: globalThreadIndex == BLOCK_SIZE-1 exists only in block 0 —
+        // grand total goes to the desc's u64 VALUE field, non-const pointer
         if (blockIdx == 0)
-            gTotalOverlap[0] = acc; // grand total
+            desc[0].overlapChecksTotalRegion = acc;
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -280,6 +283,6 @@ void outputOverlapChecksForRegionHistogram(uint3 gtid : SV_GroupThreadID, uint3 
     {
         const uint workIndex = it * BLOCK + tid + numIterationPerBlock * blockIdx * BLOCK;
         if (workIndex < totalComparison)
-            gOverlapChecks[workIndex] = gOverlapChecks[workIndex] + blockAccum;
+            overlapChecks[workIndex] = overlapChecks[workIndex] + blockAccum;
     }
 }

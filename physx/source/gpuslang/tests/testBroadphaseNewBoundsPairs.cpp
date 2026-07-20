@@ -25,19 +25,30 @@
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
 // Verification of broadphaseNewBoundsPairs.slang (generateFoundPairsForNew
-// BoundsRegion), the final region kernel.  The whole one-shot region pipeline
-// is built on the CPU (the same reference logic verified by tranches 17-20:
+// BoundsRegion), the final region kernel — P5 Step 4: driven through
+// PxgCudaShim on the ENGINE ABI.  The whole one-shot region pipeline is built
+// on the CPU (the same reference logic verified by tranches 17-20:
 // createRegions counts, the region prefix scans, the active-region flag/scan/
 // scatter, and the overlap-check counts + scan) so every input is consistent
-// and in bounds; the kernel then runs on-device and its atomic-compacted
-// found-pair output (nondeterministic order) is compared order-independently
-// against a transcription of the exact kernel logic.
+// and in bounds; a REAL engine PxgBroadPhaseDesc is filled with the live
+// device addresses (including the u64 overlapChecksTotalRegion VALUE and
+// sharedFoundPairIndex = 0) and the kernel launches with the one bpDesc
+// pointer on the engine's 64-block grid.  Its atomic-compacted found-pair
+// output (nondeterministic order) is compared order-independently against a
+// transcription of the exact kernel logic; the atomic pair count is verified
+// by reading the desc back (the kernel InterlockedAdds the desc's
+// sharedFoundPairIndex field).
 
 #include "pxgTestFramework.h"
+#include "PxgCudaShim.h"
+
+#include "foundation/PxBounds3.h"
+#include "PxgBroadPhaseDesc.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -47,17 +58,6 @@ using namespace pxgtest;
 
 const uint32_t TOTAL_REGION_SIZE = 64;
 const uint32_t INVALID = 0xffffffffu;
-
-struct FoundPairParams
-{
-    uint32_t numHandles;
-    uint32_t overlCheckesSize;
-    uint32_t gridDimX;
-    uint32_t maxFoundLostPairs;
-    uint32_t useEnvIds;
-    uint32_t _pad;      // align the uint64 that follows to 8 bytes
-    uint64_t totalPair;
-};
 
 uint32_t getHandle(uint32_t sh) { return sh >> 3; }
 uint32_t isNewP(uint32_t sh) { return (sh >> 1) & 1u; }
@@ -75,13 +75,45 @@ uint32_t bsearch64(const std::vector<uint64_t>& d, uint32_t n, uint64_t v)
     return lo ? lo - 1 : 0;
 }
 
+static std::vector<uint8_t> nbpShimLoader(const char* file) { return loadShaderBlob(file); }
+
+// Fills a REAL engine PxgBroadPhaseDesc with live device addresses (same rig
+// as testBroadphaseSetup.cpp).
+struct BpDescRig
+{
+    physx::gpuslang::PxgCudaShim* shim;
+    physx::PxgBroadPhaseDesc desc;
+
+    explicit BpDescRig(physx::gpuslang::PxgCudaShim* s) : shim(s) { std::memset(&desc, 0, sizeof(desc)); }
+
+    physx::gpuslang::PxgDevicePtr alloc(const void* data, size_t bytes)
+    {
+        physx::gpuslang::PxgDevicePtr p = 0;
+        shim->memAlloc(&p, bytes);
+        if (p && data)
+            shim->memcpyHtoD(p, data, bytes);
+        return p;
+    }
+    physx::gpuslang::PxgDevicePtr upload()
+    {
+        physx::gpuslang::PxgDevicePtr p = alloc(&desc, sizeof(desc));
+        return p;
+    }
+};
+
 PXG_TEST(broadphaseNewBoundsPairs_foundPairs)
 {
+    using namespace physx;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(21010);
     const uint32_t N = 500;             // created boxes
     const uint32_t nbProj = N * 2;
     const uint32_t maxPairs = 500000;
-    const uint32_t useEnvIds = 1;
+    const uint32_t useEnvIds = 1;       // desc.updateData_envIDs non-null (the .cu pointer branch)
 
     // ---- box set: region spans [0,3], X arrangement, bounds, groups, envs ----
     std::vector<uint32_t> regionRange(N * 8, 0), sapBoxX(N * 2), handlesX(nbProj);
@@ -247,40 +279,67 @@ PXG_TEST(broadphaseNewBoundsPairs_foundPairs)
         }
     }
 
-    // ---- device ----
+    // ---- device: fill a REAL PxgBroadPhaseDesc and launch on the engine ABI ----
     PxgSlangComputeDevice* dev = testDevice();
-    std::vector<uint32_t> foundInit(maxPairs * 2, 0xcdcdcdcdu), sharedInit(1, 0);
+    const PxgKernelDef manifest[] = {
+        { "broadphaseNewBoundsPairs.spv", "generateFoundPairsForNewBoundsRegion", 8u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &nbpShimLoader);
 
-    PxgBufferHandle bOv = createBufferFrom(dev, overlapChecks);
-    PxgBufferHandle bHR = createBufferFrom(dev, handleReg);
-    PxgBufferHandle bRange = createBufferFrom(dev, regionRange);
-    PxgBufferHandle bSap = createBufferFrom(dev, sapBoxX);
-    PxgBufferHandle bH = createBufferFrom(dev, handlesX);
-    PxgBufferHandle bSH = createBufferFrom(dev, startHist);
-    PxgBufferHandle bAH = createBufferFrom(dev, activeHist);
-    PxgBufferHandle bOS = createBufferFrom(dev, ordStart);
-    PxgBufferHandle bOA = createBufferFrom(dev, ordActive);
-    PxgBufferHandle bNB = createBufferFrom(dev, newBounds);
-    PxgBufferHandle bG = createBufferFrom(dev, groups);
-    PxgBufferHandle bE = createBufferFrom(dev, envs);
-    PxgBufferHandle bFound = createBufferFrom(dev, foundInit);
-    PxgBufferHandle bShared = createBufferFrom(dev, sharedInit);
+    std::vector<uint32_t> foundInit(maxPairs * 2, 0xcdcdcdcdu);
 
-    FoundPairParams p = {};
-    p.numHandles = N;
-    p.overlCheckesSize = regionAccumTotal;
-    p.gridDimX = 64;
-    p.maxFoundLostPairs = maxPairs;
-    p.useEnvIds = useEnvIds;
-    p.totalPair = overlapChecksTotalRegion;
+    BpDescRig rig(&shim);
+    const PxgDevicePtr dOv = rig.alloc(overlapChecks.data(), overlapChecks.size() * 8);
+    const PxgDevicePtr dHR = rig.alloc(handleReg.data(), handleReg.size() * 4);
+    const PxgDevicePtr dRange = rig.alloc(regionRange.data(), regionRange.size() * 4);
+    const PxgDevicePtr dSap = rig.alloc(sapBoxX.data(), sapBoxX.size() * 4);
+    const PxgDevicePtr dH = rig.alloc(handlesX.data(), handlesX.size() * 4);
+    const PxgDevicePtr dSH = rig.alloc(startHist.data(), startHist.size() * 4);
+    const PxgDevicePtr dAH = rig.alloc(activeHist.data(), activeHist.size() * 4);
+    const PxgDevicePtr dOS = rig.alloc(ordStart.data(), ordStart.size() * 4);
+    const PxgDevicePtr dOA = rig.alloc(ordActive.data(), ordActive.size() * 4);
+    const PxgDevicePtr dNB = rig.alloc(newBounds.data(), newBounds.size() * 4);
+    const PxgDevicePtr dG = rig.alloc(groups.data(), groups.size() * 4);
+    const PxgDevicePtr dE = rig.alloc(envs.data(), envs.size() * 4);
+    const PxgDevicePtr dFound = rig.alloc(foundInit.data(), foundInit.size() * 4);
+    if (!dOv) { std::printf("  NOTE: no BDA -> skip\n"); return; }
 
-    const std::vector<uint32_t> strides = { 8, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4 };
-    Kernel k("broadphaseNewBoundsPairs.spv", "generateFoundPairsForNewBoundsRegion", strides, sizeof(FoundPairParams));
-    k.dispatch(64, { bOv, bHR, bRange, bSap, bH, bSH, bAH, bOS, bOA, bNB, bG, bE, bFound, bShared }, p);
-    dev->flush();
+    // numHandles = numPreviousHandles + numCreatedHandles - numRemovedHandles = N
+    rig.desc.numPreviousHandles = N;
+    rig.desc.overlapChecksRegion = reinterpret_cast<regionOverlapType*>(dOv);
+    rig.desc.overlapChecksHandleRegiones = reinterpret_cast<PxgHandleRegion*>(dHR);
+    rig.desc.regionRange = reinterpret_cast<PxgIntegerRegion*>(dRange);
+    rig.desc.boxSapBox1D[0] = reinterpret_cast<PxgSapBox1D*>(dSap);
+    rig.desc.boxHandles[0][0] = reinterpret_cast<PxU32*>(dH);
+    rig.desc.startRegionsHistogram = reinterpret_cast<PxU32*>(dSH);
+    rig.desc.activeRegionsHistogram = reinterpret_cast<PxU32*>(dAH);
+    rig.desc.orderedStartRegionHandles = reinterpret_cast<PxU32*>(dOS);
+    rig.desc.orderedActiveRegionHandles = reinterpret_cast<PxU32*>(dOA);
+    rig.desc.newIntegerBounds = reinterpret_cast<PxgIntegerAABB*>(dNB);
+    rig.desc.updateData_groups = reinterpret_cast<PxU32*>(dG);
+    rig.desc.updateData_envIDs = useEnvIds ? reinterpret_cast<PxU32*>(dE) : NULL;
+    rig.desc.foundPairReport = reinterpret_cast<PxgBroadPhasePair*>(dFound);
+    rig.desc.sharedFoundPairIndex = 0;
+    rig.desc.max_found_lost_pairs = maxPairs;
+    rig.desc.regionAccumTotal = regionAccumTotal;
+    rig.desc.overlapChecksTotalRegion = overlapChecksTotalRegion; // u64 VALUE in the desc
+    const PxgDevicePtr dDesc = rig.upload();
 
-    const uint32_t gFound = downloadBuffer<uint32_t>(dev, bShared, 1)[0];
-    const auto gPairsFlat = downloadBuffer<uint32_t>(dev, bFound, std::min(gFound, maxPairs) * 2);
+    struct { uint64_t bpDesc; } prm = { dDesc };
+    // engine grid: BP_GENERATE_FOUNDPAIR_NEWBOUNDS = 64 blocks x 256
+    PXG_CHECK_MSG(shim.launchKernel(0, 64, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch generateFoundPairs");
+    shim.streamSynchronize();
+
+    // the atomic pair count lives in the desc itself — read it back
+    PxgBroadPhaseDesc back;
+    std::memset(&back, 0, sizeof(back));
+    PXG_CHECK_MSG(shim.memcpyDtoH(&back, dDesc, sizeof(back)) == PxgResult::Success, "DtoH desc");
+    const uint32_t gFound = back.sharedFoundPairIndex;
+
+    std::vector<uint32_t> gPairsFlat(std::min(gFound, maxPairs) * 2);
+    if (!gPairsFlat.empty())
+        shim.memcpyDtoH(gPairsFlat.data(), dFound, gPairsFlat.size() * 4);
 
     PXG_CHECK_MSG(gFound == refPairs.size(), "found count: gpu=%u ref=%zu", gFound, refPairs.size());
     PXG_CHECK_MSG(gFound > 0, "expected nonzero found pairs");
@@ -292,8 +351,8 @@ PXG_TEST(broadphaseNewBoundsPairs_foundPairs)
     std::sort(refPairs.begin(), refPairs.end());
     PXG_CHECK_MSG(gPairs == refPairs, "found pair set mismatch (gpu %zu vs ref %zu)", gPairs.size(), refPairs.size());
 
-    for (PxgBufferHandle h : { bOv, bHR, bRange, bSap, bH, bSH, bAH, bOS, bOA, bNB, bG, bE, bFound, bShared })
-        dev->destroyBuffer(h);
+    for (PxgDevicePtr pfree : { dOv, dHR, dRange, dSap, dH, dSH, dAH, dOS, dOA, dNB, dG, dE, dFound, dDesc })
+        shim.memFree(pfree);
 }
 
 } // namespace

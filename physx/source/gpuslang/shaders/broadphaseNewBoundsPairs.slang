@@ -26,29 +26,37 @@
 
 // broadphaseNewBoundsPairs.slang
 //
-// Slang port of generateFoundPairsForNewBoundsRegion (BP_GENERATE_FOUNDPAIR_
-// NEWBOUNDS) from gpubroadphase/src/CUDA/broadphase.cu (L1723-1908) — the final
-// kernel of the one-shot region pipeline.  It consumes everything the region
-// stages produced (the overlap-check prefix + handle/region records, the
-// per-region ordered-handle offset tables and compacted handle lists) and emits
-// the found (newly overlapping) pairs among the created bounds.
+// P5 Step 4 (BDA, engine launch path): generateFoundPairsForNewBoundsRegion
+// (BP_GENERATE_FOUNDPAIR_NEWBOUNDS) from gpubroadphase/src/CUDA/broadphase.cu
+// (L1723-1908) — the final kernel of the one-shot region pipeline, driven
+// exactly as the engine launches it: ONE PxgBroadPhaseDesc device pointer,
+// walked through the byte-exact PxgBroadPhaseDescGpu mirror.  It consumes
+// everything the region stages produced (the overlap-check prefix + handle/
+// region records, the per-region ordered-handle offset tables and compacted
+// handle lists) and emits the found (newly overlapping) pairs among the
+// created bounds.
 //
-// Grid 64 x block 256; a 64-bit grid-stride loop over overlapChecksTotalRegion.
-// Each work item:
+// Grid 64 x block 256; a 64-bit grid-stride loop over the desc's
+// overlapChecksTotalRegion (u64 VALUE).  Each work item:
 //   1. binary-searches the overlap-check prefix to find its (handle, region)
 //      entry and the offset within that entry's candidate slice;
 //   2. resolves the candidate otherHandle from the region's compacted ordered
 //      handle list (start or active list, selected by isNewProjection);
 //   3. dedups by keeping the pair only in the region at the max of the two
-//      boxes' min corners, applies the group/environment filter, and does the
+//      boxes' min corners, applies the group/environment filter (the .cu's
+//      USE_ENV_IDS path with its boxEnvIDs NULL-pointer branch), and does the
 //      integer-AABB intersection test on the new bounds;
 //   4. block-compacts the hits (groupshared 32-lane scan) and atomically
-//      reserves a contiguous output range in the found-pair report.
+//      reserves a contiguous output range in the found-pair report — a BDA
+//      atomic (InterlockedAdd) directly on the desc's sharedFoundPairIndex
+//      field, exactly the .cu's atomicAdd(&bpDesc->sharedFoundPairIndex, n).
 //
 // Portability: the CUDA warpScanAdd/__ballot scans become groupshared 32-lane
 // scans under uniform barriers; the 64-bit work indices are carried in
-// uint64_t (the device enables shaderInt64); the atomicAdd to the 32-bit
-// sharedFoundPairIndex counter becomes InterlockedAdd.
+// uint64_t (the device enables shaderInt64); numIterationPerBlock divides by
+// gridDim.x = WorkgroupCount().x as the .cu does.
+
+import pxgSlangBpDesc;
 
 static const uint BLOCK = 256;
 static const uint WARP = 32;
@@ -56,43 +64,21 @@ static const uint WARPS_PER_BLOCK = BLOCK / WARP; // 8
 static const uint REGION_SIZE_PER_AXIS = 4;
 static const uint PX_INVALID_U32 = 0xffffffffu;
 
-struct FoundPairParams
+// engine ABI: the PxgBroadPhaseDesc device pointer only
+struct BpDescParams
 {
-    uint numHandles;        // nbProjections = numHandles * 2
-    uint overlCheckesSize;  // regionAccumTotal (binarySearch length)
-    uint gridDimX;          // 64
-    uint maxFoundLostPairs;
-    uint useEnvIds;         // 0/1
-    uint64_t totalPair;     // overlapChecksTotalRegion (work count)
+    uint64_t bpDesc;
 }
-
 [[vk::push_constant]]
-ConstantBuffer<FoundPairParams> gParams;
-
-RWStructuredBuffer<uint64_t> gOverlapChecks; // binding 0  overlapChecksRegion [overlCheckesSize] (R)
-RWStructuredBuffer<uint> gHandleRegiones;    // binding 1  overlapChecksHandleRegiones [·][2]       (R)
-RWStructuredBuffer<uint> gRegionRange;       // binding 2  regionRange[handle] flat [numHandles][8]  (R)
-RWStructuredBuffer<uint> gSapBoxX;           // binding 3  boxSapBox1D[AXIS_X] flat [numHandles][2]   (R)
-RWStructuredBuffer<uint> gHandlesX;          // binding 4  boxHandles[0][AXIS_X] [nbProj]             (R)
-RWStructuredBuffer<uint> gStartHist;         // binding 5  startRegionsHistogram offset table [64][nbProj] (R)
-RWStructuredBuffer<uint> gActiveHist;        // binding 6  activeRegionsHistogram offset table [64][nbProj] (R)
-RWStructuredBuffer<uint> gOrderedStart;      // binding 7  orderedStartRegionHandles [64][nbProj]     (R)
-RWStructuredBuffer<uint> gOrderedActive;     // binding 8  orderedActiveRegionHandles [64][nbProj]    (R)
-RWStructuredBuffer<uint> gNewBounds;         // binding 9  newIntegerBounds [numHandles][6]           (R)
-RWStructuredBuffer<uint> gGroups;            // binding 10 updateData_groups [numHandles]             (R)
-RWStructuredBuffer<uint> gEnvs;              // binding 11 updateData_envIDs [numHandles]             (R)
-RWStructuredBuffer<uint> gFoundReport;       // binding 12 foundPairReport [maxPairs][2]              (W)
-RWStructuredBuffer<uint> gSharedFound;       // binding 13 sharedFoundPairIndex [1] (atomic)          (W)
-
-uint isNewProjection(uint sortedHandle) { return (sortedHandle >> 1) & 1u; }
+ConstantBuffer<BpDescParams> gBp;
 
 // PxgIntegerAABB.intersects on a flat [6] view {minX,minY,minZ,maxX,maxY,maxZ}
-bool intersects(uint bi, uint bj)
+bool intersects(Ptr<uint> bounds, uint bi, uint bj)
 {
     const uint a = bi * 6u, b = bj * 6u;
-    return !(gNewBounds[b + 0u] > gNewBounds[a + 3u] || gNewBounds[a + 0u] > gNewBounds[b + 3u] ||
-             gNewBounds[b + 1u] > gNewBounds[a + 4u] || gNewBounds[a + 1u] > gNewBounds[b + 4u] ||
-             gNewBounds[b + 2u] > gNewBounds[a + 5u] || gNewBounds[a + 2u] > gNewBounds[b + 5u]);
+    return !(bounds[b + 0u] > bounds[a + 3u] || bounds[a + 0u] > bounds[b + 3u] ||
+             bounds[b + 1u] > bounds[a + 4u] || bounds[a + 1u] > bounds[b + 4u] ||
+             bounds[b + 2u] > bounds[a + 5u] || bounds[a + 2u] > bounds[b + 5u]);
 }
 
 bool filtering(uint groupId, uint otherGroupId, uint envId, uint otherEnvId)
@@ -101,15 +87,15 @@ bool filtering(uint groupId, uint otherGroupId, uint envId, uint otherEnvId)
            ((envId == otherEnvId) || (envId == PX_INVALID_U32) || (otherEnvId == PX_INVALID_U32));
 }
 
-// largest index into gOverlapChecks s.t. value <= workIndex, else 0 (64-bit compares)
-uint binarySearch(uint numElements, uint64_t value)
+// largest index into the 64-bit prefix s.t. value <= workIndex, else 0
+uint binarySearch64(Ptr<uint64_t> data, uint numElements, uint64_t value)
 {
     uint left = 0;
     uint right = numElements;
     while (left < right)
     {
         const uint pos = (left + right) / 2u;
-        if (gOverlapChecks[pos] <= value)
+        if (data[pos] <= value)
             left = pos + 1u;
         else
             right = pos;
@@ -137,19 +123,38 @@ void warpScanAcc(uint tid)
 [numthreads(256, 1, 1)]
 void generateFoundPairsForNewBoundsRegion(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
     const uint tid = gtid.x;
     const uint blockIdx = gid.x;
     const uint warpIndex = tid / WARP;
     const uint lane = tid & (WARP - 1);
 
-    const uint numHandles = gParams.numHandles;
+    const uint numHandles = desc[0].numPreviousHandles + desc[0].numCreatedHandles - desc[0].numRemovedHandles;
     const uint nbProjections = numHandles * 2u;
-    const uint overlCheckesSize = gParams.overlCheckesSize;
-    const uint gridDimX = gParams.gridDimX;
-    const uint maxPairs = gParams.maxFoundLostPairs;
-    const bool useEnvIds = gParams.useEnvIds != 0u;
-    const uint64_t totalPair = gParams.totalPair;
 
+    Ptr<uint> newBounds = Ptr<uint>(desc[0].newIntegerBounds);                 // PxgIntegerAABB = 6 uints
+    Ptr<uint> reports = Ptr<uint>(desc[0].foundPairReport);                    // PxgBroadPhasePair = 2 uints
+
+    Ptr<uint> regionRange = Ptr<uint>(desc[0].regionRange);                    // PxgIntegerRegion = 8 uints
+    Ptr<uint> boxGroups = Ptr<uint>(desc[0].updateData_groups);
+    const uint64_t boxEnvIDsAddr = desc[0].updateData_envIDs;                  // may be NULL (.cu ptr branch)
+    Ptr<uint> boxSapBox1DX = Ptr<uint>(desc[0].boxSapBox1D[0]);                // PxgSapBox1D = 2 uints, AXIS_X
+    Ptr<uint> boxHandles = Ptr<uint>(desc[0].boxHandles[0]);                   // boxHandles[0][AXIS_X]
+
+    // sStartEndPtHistograms[0]=active/[1]=start, sOrderedStartRegionHandles likewise
+    Ptr<uint> activeHist = Ptr<uint>(desc[0].activeRegionsHistogram);
+    Ptr<uint> startHist = Ptr<uint>(desc[0].startRegionsHistogram);
+    Ptr<uint> orderedActive = Ptr<uint>(desc[0].orderedActiveRegionHandles);
+    Ptr<uint> orderedStart = Ptr<uint>(desc[0].orderedStartRegionHandles);
+
+    Ptr<uint64_t> overlapChecks = Ptr<uint64_t>(desc[0].overlapChecksRegion);  // regionOverlapType = PxU64
+    const uint overlCheckesSize = desc[0].regionAccumTotal;
+    Ptr<uint> handleRegions = Ptr<uint>(desc[0].overlapChecksHandleRegiones);  // PxgHandleRegion = 2 uints
+
+    const uint64_t totalPair = desc[0].overlapChecksTotalRegion;               // u64 VALUE in the desc
+    const uint maxPairs = desc[0].max_found_lost_pairs;
+
+    const uint gridDimX = WorkgroupCount().x;
     const uint64_t totalBlockRequired = (totalPair + uint64_t(BLOCK - 1u)) / uint64_t(BLOCK);
     const uint64_t numIterationPerBlock = (totalBlockRequired + uint64_t(gridDimX - 1u)) / uint64_t(gridDimX);
 
@@ -164,50 +169,51 @@ void generateFoundPairsForNewBoundsRegion(uint3 gtid : SV_GroupThreadID, uint3 g
 
         if (workIndex < totalPair)
         {
-            const uint index = binarySearch(overlCheckesSize, workIndex);
-            handle = gHandleRegiones[index * 2u + 0u];
-            const uint regionIndex = gHandleRegiones[index * 2u + 1u]; // = cell * nbProjections
+            const uint index = binarySearch64(overlapChecks, overlCheckesSize, workIndex);
+            handle = handleRegions[index * 2u + 0u];               // .handleIndex
+            const uint regionIndex = handleRegions[index * 2u + 1u]; // .regionIndex (= cell * nbProjections)
 
-            const uint boxStartIndexX = gSapBoxX[handle * 2u + 0u];
-            const uint boxEndIndexX = gSapBoxX[handle * 2u + 1u];
-            const uint isNew = isNewProjection(gHandlesX[boxStartIndexX]);
+            const uint boxStartIndexX = boxSapBox1DX[handle * 2u + 0u];
+            const uint boxEndIndexX = boxSapBox1DX[handle * 2u + 1u];
+            const bool isNew = bpIsNewProjection(boxHandles[boxStartIndexX]);
 
-            const uint64_t offset = workIndex - gOverlapChecks[index];
+            const uint64_t offset = workIndex - overlapChecks[index];
 
-            const uint regionStart = (isNew != 0u) ? gStartHist[regionIndex + boxStartIndexX + 1u]
-                                                   : gActiveHist[regionIndex + boxStartIndexX + 1u];
-            const uint regionEnd = (isNew != 0u) ? gStartHist[regionIndex + boxEndIndexX]
-                                                 : gActiveHist[regionIndex + boxEndIndexX];
+            Ptr<uint> startEndPtHistogram = isNew ? startHist : activeHist;
+            Ptr<uint> orderedStartHandles = isNew ? orderedStart : orderedActive;
 
-            if (regionEnd > regionStart)
+            const uint regionStartIndex = startEndPtHistogram[regionIndex + boxStartIndexX + 1u];
+            const uint regionEndIndex = startEndPtHistogram[regionIndex + boxEndIndexX];
+
+            if (regionEndIndex > regionStartIndex)
             {
-                const uint64_t otherIndex64 = uint64_t(regionStart) + offset;
-                if (otherIndex64 < uint64_t(regionEnd))
+                const uint64_t otherIndex64 = uint64_t(regionStartIndex) + offset;
+                if (otherIndex64 < uint64_t(regionEndIndex))
                 {
                     const uint otherIndex = uint(otherIndex64);
-                    const uint group = gGroups[handle];
-                    const uint envId = useEnvIds ? gEnvs[handle] : PX_INVALID_U32;
+                    const uint group = boxGroups[handle];
+                    const uint envId = boxEnvIDsAddr != 0 ? (Ptr<uint>(boxEnvIDsAddr))[handle] : PX_INVALID_U32;
 
-                    otherHandle = (isNew != 0u) ? gOrderedStart[regionIndex + otherIndex]
-                                                : gOrderedActive[regionIndex + otherIndex];
+                    otherHandle = orderedStartHandles[regionIndex + otherIndex];
 
                     // dedup: report the pair only in the region at the max of the
                     // two boxes' min corners
                     const uint rr = handle * 8u;
                     const uint orr = otherHandle * 8u;
-                    const uint x = max(gRegionRange[rr + 0u], gRegionRange[orr + 0u]);
-                    const uint y = max(gRegionRange[rr + 1u], gRegionRange[orr + 1u]);
-                    const uint z = max(gRegionRange[rr + 2u], gRegionRange[orr + 2u]);
+                    const uint x = max(regionRange[rr + 0u], regionRange[orr + 0u]);
+                    const uint y = max(regionRange[rr + 1u], regionRange[orr + 1u]);
+                    const uint z = max(regionRange[rr + 2u], regionRange[orr + 2u]);
                     const uint otherRegionIndex = (x + y * REGION_SIZE_PER_AXIS
                                                    + z * (REGION_SIZE_PER_AXIS * REGION_SIZE_PER_AXIS))
                                                   * nbProjections;
 
                     if (regionIndex == otherRegionIndex)
                     {
-                        const uint otherGroup = gGroups[otherHandle];
-                        const uint otherEnvId = useEnvIds ? gEnvs[otherHandle] : PX_INVALID_U32;
+                        const uint otherGroup = boxGroups[otherHandle];
+                        const uint otherEnvId = boxEnvIDsAddr != 0 ? (Ptr<uint>(boxEnvIDsAddr))[otherHandle]
+                                                                   : PX_INVALID_U32;
                         if (filtering(group, otherGroup, envId, otherEnvId))
-                            foundCount = intersects(handle, otherHandle) ? 1u : 0u;
+                            foundCount = intersects(newBounds, handle, otherHandle) ? 1u : 0u;
                     }
                 }
             }
@@ -234,7 +240,7 @@ void generateFoundPairsForNewBoundsRegion(uint3 gtid : SV_GroupThreadID, uint3 g
             }
             uint base = 0;
             if (acc > 0u)
-                InterlockedAdd(gSharedFound[0], acc, base);
+                InterlockedAdd(desc[0].sharedFoundPairIndex, acc, base); // BDA atomic on the desc field
             gsBase = base;
         }
         GroupMemoryBarrierWithGroupSync();
@@ -244,9 +250,9 @@ void generateFoundPairsForNewBoundsRegion(uint3 gtid : SV_GroupThreadID, uint3 g
             const uint position = gsBase + res + gsWarp[warpIndex];
             if (position < maxPairs)
             {
-                // PxgBroadPhasePair canonicalizes to (min, max) so mVolA < mVolB
-                gFoundReport[position * 2u + 0u] = min(handle, otherHandle);
-                gFoundReport[position * 2u + 1u] = max(handle, otherHandle);
+                // PxgBroadPhasePair's ctor canonicalizes to (min, max) so mVolA < mVolB
+                reports[position * 2u + 0u] = min(handle, otherHandle);
+                reports[position * 2u + 1u] = max(handle, otherHandle);
             }
         }
         GroupMemoryBarrierWithGroupSync();

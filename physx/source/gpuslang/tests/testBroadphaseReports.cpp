@@ -27,10 +27,22 @@
 // Verification of broadphaseReports.slang against a C++ transcription of the
 // broad-phase found/lost pair report accumulation pipeline: classify each pair
 // as aggregate vs actor, stably compact the four categories, and copy the actor
-// reports to the mapped output.
+// reports to the mapped output.  P5 Step 4: driven through PxgCudaShim on the
+// ENGINE ABI — a REAL engine PxgBroadPhaseDesc is filled with live device
+// addresses (pair counts in sharedFound/LostPairIndex, the per-category block
+// arrays behind aggReportBlock[2]/actorReportBlock[2], the Bp::VolumeData
+// array) and all three kernels launch with the one bpDesc pointer on the
+// engine grids (32x4 for the two accumulate stages, 64 for copyReports).
+// The desc scalar outputs (sharedFoundAggPairIndex / sharedLostAggPairIndex
+// written by stage 2, found_lost_pairs_overflow_flags written by copyReports)
+// are verified by reading the desc back.
 
 #include "pxgTestFramework.h"
 #include "pxgGpuStructs.h"
+#include "PxgCudaShim.h"
+
+#include "foundation/PxBounds3.h"
+#include "PxgBroadPhaseDesc.h"
 
 #include <algorithm>
 #include <cstring>
@@ -48,6 +60,7 @@ struct BpPair
     uint32_t mVolA;
     uint32_t mVolB;
 };
+// mirrors Bp::VolumeData (16 bytes): { void* mUserData; PxU32 mAggregate; pad }
 struct VolumeData
 {
     uint32_t userLo, userHi;
@@ -55,17 +68,40 @@ struct VolumeData
     uint32_t pad;
 };
 
-struct ReportParams
+static std::vector<uint8_t> repShimLoader(const char* file) { return loadShaderBlob(file); }
+
+// Fills a REAL engine PxgBroadPhaseDesc with live device addresses (same rig
+// as testBroadphaseSetup.cpp).
+struct BpDescRig
 {
-    uint32_t numFound;
-    uint32_t numLost;
-    uint32_t maxPairs;
-    uint32_t maxAggPairs;
-    uint32_t hasVolumeData;
+    physx::gpuslang::PxgCudaShim* shim;
+    physx::PxgBroadPhaseDesc desc;
+
+    explicit BpDescRig(physx::gpuslang::PxgCudaShim* s) : shim(s) { std::memset(&desc, 0, sizeof(desc)); }
+
+    physx::gpuslang::PxgDevicePtr alloc(const void* data, size_t bytes)
+    {
+        physx::gpuslang::PxgDevicePtr p = 0;
+        shim->memAlloc(&p, bytes);
+        if (p && data)
+            shim->memcpyHtoD(p, data, bytes);
+        return p;
+    }
+    physx::gpuslang::PxgDevicePtr upload()
+    {
+        physx::gpuslang::PxgDevicePtr p = alloc(&desc, sizeof(desc));
+        return p;
+    }
 };
 
 PXG_TEST(broadphaseReports_accumulateAndCopy)
 {
+    using namespace physx;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(7100);
     const uint32_t numVolumes = 4096;
     const uint32_t numFound = 5300;
@@ -102,57 +138,69 @@ PXG_TEST(broadphaseReports_accumulateAndCopy)
     auto isAgg = [&](const BpPair& p) { return !(isSingle(p.mVolA) && isSingle(p.mVolB)); };
 
     PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "broadphaseReports.spv", "accumulateReportsStage_1", 8u, 0 },
+        { "broadphaseReports.spv", "accumulateReportsStage_2", 8u, 0 },
+        { "broadphaseReports.spv", "copyReports", 8u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 3, &repShimLoader);
 
-    std::vector<uint32_t> aggBlock(2 * 32, 0), actorBlock(2 * 32, 0);
+    std::vector<uint32_t> blockZero(32, 0);
     std::vector<BpPair> foundAgg(numFound), foundActor(numFound), lostAgg(numLost), lostActor(numLost);
     std::memset(foundAgg.data(), 0xcd, foundAgg.size() * sizeof(BpPair));
     std::memset(foundActor.data(), 0xcd, foundActor.size() * sizeof(BpPair));
     std::memset(lostAgg.data(), 0xcd, lostAgg.size() * sizeof(BpPair));
     std::memset(lostActor.data(), 0xcd, lostActor.size() * sizeof(BpPair));
-    std::vector<uint32_t> sharedAgg(2, 0xffffffffu);
     std::vector<uint32_t> foundMap(numFound * 2, 0xabababu), lostMap(numLost * 2, 0xcdcdcdu);
-    std::vector<uint32_t> overflow(1, 0xffffffffu);
-    std::vector<uint32_t> dummy(16, 0);
 
-    PxgBufferHandle fpBuf = createBufferFrom(dev, foundPairs);
-    PxgBufferHandle lpBuf = createBufferFrom(dev, lostPairs);
-    PxgBufferHandle vdBuf = createBufferFrom(dev, volumes);
-    PxgBufferHandle abBuf = createBufferFrom(dev, aggBlock);
-    PxgBufferHandle acBuf = createBufferFrom(dev, actorBlock);
-    PxgBufferHandle faBuf = createBufferFrom(dev, foundAgg);
-    PxgBufferHandle fcBuf = createBufferFrom(dev, foundActor);
-    PxgBufferHandle laBuf = createBufferFrom(dev, lostAgg);
-    PxgBufferHandle lcBuf = createBufferFrom(dev, lostActor);
-    PxgBufferHandle saBuf = createBufferFrom(dev, sharedAgg);
-    PxgBufferHandle fmBuf = createBufferFrom(dev, foundMap);
-    PxgBufferHandle lmBuf = createBufferFrom(dev, lostMap);
-    PxgBufferHandle ofBuf = createBufferFrom(dev, overflow);
-    PxgBufferHandle dummyBuf = createBufferFrom(dev, dummy);
+    BpDescRig rig(&shim);
+    const PxgDevicePtr dFp = rig.alloc(foundPairs.data(), foundPairs.size() * sizeof(BpPair));
+    const PxgDevicePtr dLp = rig.alloc(lostPairs.data(), lostPairs.size() * sizeof(BpPair));
+    const PxgDevicePtr dVd = rig.alloc(volumes.data(), volumes.size() * sizeof(VolumeData));
+    const PxgDevicePtr dAbF = rig.alloc(blockZero.data(), blockZero.size() * 4); // aggReportBlock[0] (found)
+    const PxgDevicePtr dAbL = rig.alloc(blockZero.data(), blockZero.size() * 4); // aggReportBlock[1] (lost)
+    const PxgDevicePtr dCbF = rig.alloc(blockZero.data(), blockZero.size() * 4); // actorReportBlock[0]
+    const PxgDevicePtr dCbL = rig.alloc(blockZero.data(), blockZero.size() * 4); // actorReportBlock[1]
+    const PxgDevicePtr dFa = rig.alloc(foundAgg.data(), foundAgg.size() * sizeof(BpPair));
+    const PxgDevicePtr dFc = rig.alloc(foundActor.data(), foundActor.size() * sizeof(BpPair));
+    const PxgDevicePtr dLa = rig.alloc(lostAgg.data(), lostAgg.size() * sizeof(BpPair));
+    const PxgDevicePtr dLc = rig.alloc(lostActor.data(), lostActor.size() * sizeof(BpPair));
+    const PxgDevicePtr dFm = rig.alloc(foundMap.data(), foundMap.size() * 4);
+    const PxgDevicePtr dLm = rig.alloc(lostMap.data(), lostMap.size() * 4);
+    if (!dFp) { std::printf("  NOTE: no BDA -> skip\n"); return; }
 
-    ReportParams p = {};
-    p.numFound = numFound;
-    p.numLost = numLost;
-    p.maxPairs = maxPairs;
-    p.maxAggPairs = maxAggPairs;
-    p.hasVolumeData = 1;
+    rig.desc.sharedFoundPairIndex = numFound;
+    rig.desc.sharedLostPairIndex = numLost;
+    rig.desc.max_found_lost_pairs = maxPairs;
+    rig.desc.max_found_lost_agg_pairs = maxAggPairs;
+    rig.desc.foundPairReport = reinterpret_cast<PxgBroadPhasePair*>(dFp);
+    rig.desc.lostPairReport = reinterpret_cast<PxgBroadPhasePair*>(dLp);
+    rig.desc.aabbMngr_volumeData = reinterpret_cast<Bp::VolumeData*>(dVd);
+    rig.desc.aggReportBlock[0] = reinterpret_cast<PxU32*>(dAbF);
+    rig.desc.aggReportBlock[1] = reinterpret_cast<PxU32*>(dAbL);
+    rig.desc.actorReportBlock[0] = reinterpret_cast<PxU32*>(dCbF);
+    rig.desc.actorReportBlock[1] = reinterpret_cast<PxU32*>(dCbL);
+    rig.desc.foundAggPairReport = reinterpret_cast<PxgBroadPhasePair*>(dFa);
+    rig.desc.foundActorPairReport = reinterpret_cast<PxgBroadPhasePair*>(dFc);
+    rig.desc.lostAggPairReport = reinterpret_cast<PxgBroadPhasePair*>(dLa);
+    rig.desc.lostActorPairReport = reinterpret_cast<PxgBroadPhasePair*>(dLc);
+    rig.desc.foundPairReportMap = reinterpret_cast<PxgBroadPhasePair*>(dFm);
+    rig.desc.lostPairReportMap = reinterpret_cast<PxgBroadPhasePair*>(dLm);
+    // stage 2 / copyReports must overwrite these desc outputs
+    rig.desc.sharedFoundAggPairIndex = 0xffffffffu;
+    rig.desc.sharedLostAggPairIndex = 0xffffffffu;
+    rig.desc.found_lost_pairs_overflow_flags = true;
+    const PxgDevicePtr dDesc = rig.upload();
 
-    // stage 1: bindings 0..4
-    Kernel k1("broadphaseReports.spv", "accumulateReportsStage_1", { 8, 8, 16, 4, 4 }, sizeof(ReportParams));
-    k1.dispatch(32, { fpBuf, lpBuf, vdBuf, abBuf, acBuf }, p, 4 /*gridY = 4 categories*/);
+    struct { uint64_t bpDesc; } prm = { dDesc };
+    // engine grids: BP_COMPUTE_INCREMENTAL_CMP_COUNTS1/2 = 32 x 4 (blockIdx.y =
+    // the 4 report categories), BP_COPY_REPORTS = 64 x 256
+    PXG_CHECK_MSG(shim.launchKernel(0, 32, 4, 1, &prm, sizeof(prm)) == PxgResult::Success, "launch stage 1");
     dev->barrier();
-
-    // stage 2: bindings 0..9
-    Kernel k2("broadphaseReports.spv", "accumulateReportsStage_2", { 8, 8, 16, 4, 4, 8, 8, 8, 8, 4 },
-              sizeof(ReportParams));
-    k2.dispatch(32, { fpBuf, lpBuf, vdBuf, abBuf, acBuf, faBuf, fcBuf, laBuf, lcBuf, saBuf }, p, 4);
+    PXG_CHECK_MSG(shim.launchKernel(1, 32, 4, 1, &prm, sizeof(prm)) == PxgResult::Success, "launch stage 2");
     dev->barrier();
-
-    // copyReports: bindings 6,8,9,10,11,12
-    Kernel k3("broadphaseReports.spv", "copyReports", { 8, 8, 16, 4, 4, 8, 8, 8, 8, 4, 4, 4, 4 },
-              sizeof(ReportParams));
-    k3.dispatch(32, { dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, fcBuf, dummyBuf, lcBuf, saBuf,
-                      fmBuf, lmBuf, ofBuf }, p);
-    dev->flush();
+    PXG_CHECK_MSG(shim.launchKernel(2, 64, 1, 1, &prm, sizeof(prm)) == PxgResult::Success, "launch copyReports");
+    shim.streamSynchronize();
 
     // ---- reference ----
     std::vector<BpPair> rFoundAgg, rFoundActor, rLostAgg, rLostActor;
@@ -163,14 +211,21 @@ PXG_TEST(broadphaseReports_accumulateAndCopy)
 
     auto eqPair = [](const BpPair& a, const BpPair& b) { return a.mVolA == b.mVolA && a.mVolB == b.mVolB; };
 
-    const auto gFoundAgg = downloadBuffer<BpPair>(dev, faBuf, numFound);
-    const auto gFoundActor = downloadBuffer<BpPair>(dev, fcBuf, numFound);
-    const auto gLostAgg = downloadBuffer<BpPair>(dev, laBuf, numLost);
-    const auto gLostActor = downloadBuffer<BpPair>(dev, lcBuf, numLost);
-    const auto gSharedAgg = downloadBuffer<uint32_t>(dev, saBuf, 2);
+    std::vector<BpPair> gFoundAgg(numFound), gFoundActor(numFound), gLostAgg(numLost), gLostActor(numLost);
+    shim.memcpyDtoH(gFoundAgg.data(), dFa, numFound * sizeof(BpPair));
+    shim.memcpyDtoH(gFoundActor.data(), dFc, numFound * sizeof(BpPair));
+    shim.memcpyDtoH(gLostAgg.data(), dLa, numLost * sizeof(BpPair));
+    shim.memcpyDtoH(gLostActor.data(), dLc, numLost * sizeof(BpPair));
 
-    PXG_CHECK_MSG(gSharedAgg[0] == rFoundAgg.size(), "found agg count: gpu=%u ref=%zu", gSharedAgg[0], rFoundAgg.size());
-    PXG_CHECK_MSG(gSharedAgg[1] == rLostAgg.size(), "lost agg count: gpu=%u ref=%zu", gSharedAgg[1], rLostAgg.size());
+    // desc scalar outputs: agg totals from stage 2, overflow flag from copyReports
+    PxgBroadPhaseDesc back;
+    std::memset(&back, 0, sizeof(back));
+    PXG_CHECK_MSG(shim.memcpyDtoH(&back, dDesc, sizeof(back)) == PxgResult::Success, "DtoH desc");
+
+    PXG_CHECK_MSG(back.sharedFoundAggPairIndex == rFoundAgg.size(), "found agg count: gpu=%u ref=%zu",
+                  back.sharedFoundAggPairIndex, rFoundAgg.size());
+    PXG_CHECK_MSG(back.sharedLostAggPairIndex == rLostAgg.size(), "lost agg count: gpu=%u ref=%zu",
+                  back.sharedLostAggPairIndex, rLostAgg.size());
 
     size_t mism = 0;
     for (size_t i = 0; i < rFoundAgg.size(); ++i)
@@ -186,11 +241,12 @@ PXG_TEST(broadphaseReports_accumulateAndCopy)
     // ---- copyReports verification ----
     const uint32_t nbCreated = numFound - uint32_t(rFoundAgg.size()); // = actorFound count (no overflow)
     const uint32_t nbLostA = numLost - uint32_t(rLostAgg.size());
-    const auto gFoundMap = downloadBuffer<uint32_t>(dev, fmBuf, numFound * 2);
-    const auto gLostMap = downloadBuffer<uint32_t>(dev, lmBuf, numLost * 2);
-    const auto gOverflow = downloadBuffer<uint32_t>(dev, ofBuf, 1)[0];
+    std::vector<uint32_t> gFoundMap(numFound * 2), gLostMap(numLost * 2);
+    shim.memcpyDtoH(gFoundMap.data(), dFm, numFound * 2 * 4);
+    shim.memcpyDtoH(gLostMap.data(), dLm, numLost * 2 * 4);
 
-    PXG_CHECK_MSG(gOverflow == 0, "overflow flag should be 0, got %u", gOverflow);
+    PXG_CHECK_MSG(back.found_lost_pairs_overflow_flags == false, "overflow flag should be false, got %u",
+                  uint32_t(back.found_lost_pairs_overflow_flags));
 
     mism = 0;
     for (uint32_t i = 0; i < nbCreated; ++i)
@@ -205,9 +261,8 @@ PXG_TEST(broadphaseReports_accumulateAndCopy)
     }
     PXG_CHECK_MSG(mism == 0, "%zu copyReports mismatches", mism);
 
-    for (PxgBufferHandle h : { fpBuf, lpBuf, vdBuf, abBuf, acBuf, faBuf, fcBuf, laBuf, lcBuf, saBuf, fmBuf, lmBuf,
-                               ofBuf, dummyBuf })
-        dev->destroyBuffer(h);
+    for (PxgDevicePtr pfree : { dFp, dLp, dVd, dAbF, dAbL, dCbF, dCbL, dFa, dFc, dLa, dLc, dFm, dLm, dDesc })
+        shim.memFree(pfree);
 }
 
 } // namespace

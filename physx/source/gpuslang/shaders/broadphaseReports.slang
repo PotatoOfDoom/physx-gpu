@@ -26,85 +26,68 @@
 
 // broadphaseReports.slang
 //
-// Slang port of the broad-phase found/lost pair report accumulation pipeline
-// (gpubroadphase/src/CUDA/broadphase.cu):
-//   - accumulateReportsStage_1: per-block count of the aggregate (or actor)
-//     pairs in each of the four report categories (found/lost x agg/actor).
-//   - accumulateReportsStage_2: exclusive prefix over the per-block counts,
-//     then a stable compaction of each category's matching pairs into its
-//     output array (foundAgg/foundActor/lostAgg/lostActor).
-//   - copyReports: copy the compacted actor found/lost pairs to the mapped
-//     output buffers and raise the overflow flag.
+// P5 Step 4 (BDA, engine launch path): the broad-phase found/lost pair report
+// accumulation pipeline (gpubroadphase/src/CUDA/broadphase.cu, L2284-2596),
+// driven exactly as the engine launches it — ONE PxgBroadPhaseDesc device
+// pointer, walked through the byte-exact PxgBroadPhaseDescGpu mirror:
+//   - accumulateReportsStage_1 (L2284): per-block count of the aggregate (or
+//     actor) pairs in each of the four report categories (found/lost x
+//     agg/actor), written to the desc's aggReportBlock/actorReportBlock.
+//   - accumulateReportsStage_2 (L2382): exclusive prefix over the per-block
+//     counts (the agg totals land in the desc's sharedFoundAggPairIndex /
+//     sharedLostAggPairIndex, written through the desc pointer), then a stable
+//     compaction of each category's matching pairs into its output array
+//     (foundAgg/foundActor/lostAgg/lostActor).
+//   - copyReports (L2563): copy the compacted actor found/lost pairs to the
+//     mapped output buffers and store the overflow flag into the desc.
 //
 // A pair is an "aggregate" report unless BOTH of its volumes are single actors
-// (VolumeData::isSingleActor()); otherwise it is an "actor" report.  The four
-// categories are selected by the dispatch's Y grid index (blockIdx.y):
-//   0 = found/agg, 1 = found/actor, 2 = lost/agg, 3 = lost/actor.
+// (Bp::VolumeData::isSingleActor(), mAggregate == 0xffffffff at byte offset 8
+// of the 16-byte VolumeData; the .cu's volumeData NULL-pointer branch is the
+// address == 0 check).  The four categories are selected by the dispatch's Y
+// grid index (blockIdx.y): 0 = found/agg, 1 = found/actor, 2 = lost/agg,
+// 3 = lost/actor.
 //
 // Portability: the CUDA warp __ballot_sync+__popc reductions/scans become
-// groupshared 32-lane scans; the fixed 32-block device grid and its
-// between-block accumulation are preserved (BLOCK = 256, 8 warps).
+// groupshared 32-lane scans; the .cu's numIterationPerBlock divides by the
+// compile-time grid constant (=32), preserved as NUM_BLOCKS; copyReports'
+// grid-stride uses gridDim.x = WorkgroupCount().x (engine grid 64).  The
+// overflow bool is byte 0 of overflowFlagsWord — bytes 1-3 are struct tail
+// padding and the .cu stores the bool unconditionally, so a whole-word store
+// of 0/1 is exact.
+
+import pxgSlangBpDesc;
 
 static const uint BLOCK = 256;
-static const uint NUM_BLOCKS = 32;
+static const uint NUM_BLOCKS = 32; // == BP_COMPUTE_INCREMENTAL_CMP_COUNTS1/2 grid
 static const uint WARP = 32;
 static const uint WARPS_PER_BLOCK = BLOCK / WARP; // 8
 static const uint PX_INVALID_U32 = 0xffffffffu;
 
-// mirrors PxgBroadPhasePair (8 bytes)
-struct PxgBroadPhasePair
+// engine ABI: all three entries take the PxgBroadPhaseDesc device pointer only
+struct BpDescParams
 {
-    uint mVolA;
-    uint mVolB;
+    uint64_t bpDesc;
 }
-
-// mirrors Bp::VolumeData (16 bytes): { void* mUserData; PxU32 mAggregate; pad }
-struct VolumeData
-{
-    uint2 mUserData;
-    uint mAggregate;
-    uint pad;
-}
-
-struct ReportParams
-{
-    uint numFound;    // sharedFoundPairIndex
-    uint numLost;     // sharedLostPairIndex
-    uint maxPairs;    // max_found_lost_pairs
-    uint maxAggPairs; // max_found_lost_agg_pairs
-    uint hasVolumeData;
-}
-
 [[vk::push_constant]]
-ConstantBuffer<ReportParams> gParams;
+ConstantBuffer<BpDescParams> gBp;
 
-RWStructuredBuffer<PxgBroadPhasePair> gFoundPairs;          // binding 0
-RWStructuredBuffer<PxgBroadPhasePair> gLostPairs;           // binding 1
-RWStructuredBuffer<VolumeData> gVolumeData;                 // binding 2
-RWStructuredBuffer<uint> gAggReportBlock;                   // binding 3 (flat [2][32])
-RWStructuredBuffer<uint> gActorReportBlock;                 // binding 4 (flat [2][32])
-RWStructuredBuffer<PxgBroadPhasePair> gFoundAggPairReport;  // binding 5
-RWStructuredBuffer<PxgBroadPhasePair> gFoundActorPairReport;// binding 6
-RWStructuredBuffer<PxgBroadPhasePair> gLostAggPairReport;   // binding 7
-RWStructuredBuffer<PxgBroadPhasePair> gLostActorPairReport; // binding 8
-RWStructuredBuffer<uint> gSharedAggIndex;                   // binding 9 ([0]=found,[1]=lost)
-RWStructuredBuffer<uint> gFoundReportMap;                   // binding 10
-RWStructuredBuffer<uint> gLostReportMap;                    // binding 11
-RWStructuredBuffer<uint> gOverflowFlag;                     // binding 12
-
-bool isSingleActor(uint volIndex)
+// Bp::VolumeData is 16 bytes: { void* mUserData; PxU32 mAggregate; pad } —
+// mAggregate is uint 2 of the 4-uint stride.  A null volumeData pointer means
+// "everything is a single actor" (the .cu's ?: on the pointer).
+bool isSingleActor(uint64_t volumeDataAddr, uint volIndex)
 {
-    if (gParams.hasVolumeData == 0)
+    if (volumeDataAddr == 0)
         return true;
-    return gVolumeData[volIndex].mAggregate == PX_INVALID_U32;
+    return (Ptr<uint>(volumeDataAddr))[volIndex * 4u + 2u] == PX_INVALID_U32;
 }
 
 // classify a pair: returns true if it is an aggregate report (not both single
 // actors), false if it is an actor report
-bool isAggregatePair(PxgBroadPhasePair pair)
+bool isAggregatePair(uint64_t volumeDataAddr, uint volA, uint volB)
 {
-    const bool singleA = isSingleActor(pair.mVolA);
-    const bool singleB = isSingleActor(pair.mVolB);
+    const bool singleA = isSingleActor(volumeDataAddr, volA);
+    const bool singleB = isSingleActor(volumeDataAddr, volB);
     return !(singleA && singleB);
 }
 
@@ -155,14 +138,17 @@ void scanWarpTotals(uint tid)
 [numthreads(256, 1, 1)]
 void accumulateReportsStage_1(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
     const uint tid = gtid.x;
     const uint blockIdx = gid.x;
     const uint category = gid.y; // 0=found/agg,1=found/actor,2=lost/agg,3=lost/actor
     const bool found = (category / 2) == 0;
     const bool outputAggReport = (category % 2) == 0;
 
-    const uint nbPairs = found ? gParams.numFound : gParams.numLost;
-    const uint nbPairsSafe = min(nbPairs, gParams.maxPairs);
+    const uint nbPairs = found ? desc[0].sharedFoundPairIndex : desc[0].sharedLostPairIndex;
+    Ptr<uint> pairs = Ptr<uint>(found ? desc[0].foundPairReport : desc[0].lostPairReport); // 2 uints/pair
+    const uint nbPairsSafe = min(nbPairs, desc[0].max_found_lost_pairs);
+    const uint64_t volumeDataAddr = desc[0].aabbMngr_volumeData;
 
     const uint totalBlockRequired = (nbPairs + (BLOCK - 1)) / BLOCK;
     const uint numIterationPerBlock = (totalBlockRequired + (NUM_BLOCKS - 1)) / NUM_BLOCKS;
@@ -174,8 +160,9 @@ void accumulateReportsStage_1(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
         const uint workIndex = it * BLOCK + tid + numIterationPerBlock * blockIdx * BLOCK;
         if (workIndex < nbPairsSafe)
         {
-            const PxgBroadPhasePair pair = found ? gFoundPairs[workIndex] : gLostPairs[workIndex];
-            const bool isAgg = isAggregatePair(pair);
+            const uint volA = pairs[workIndex * 2u + 0u];
+            const uint volB = pairs[workIndex * 2u + 1u];
+            const bool isAgg = isAggregatePair(volumeDataAddr, volA, volB);
             const bool matches = outputAggReport ? isAgg : !isAgg;
             if (matches)
                 ++localCount;
@@ -196,11 +183,11 @@ void accumulateReportsStage_1(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
 
     if (tid == 0)
     {
-        const uint slot = (category / 2) * NUM_BLOCKS + blockIdx;
-        if (outputAggReport)
-            gAggReportBlock[slot] = gsBlockAccum;
-        else
-            gActorReportBlock[slot] = gsBlockAccum;
+        // .cu: bpDesc->aggReportBlock[blockIdx.y/2][blockIdx.x] (or actor)
+        const uint64_t blockArr = outputAggReport
+            ? (found ? desc[0].aggReportBlock[0] : desc[0].aggReportBlock[1])
+            : (found ? desc[0].actorReportBlock[0] : desc[0].actorReportBlock[1]);
+        (Ptr<uint>(blockArr))[blockIdx] = gsBlockAccum;
     }
 }
 
@@ -211,6 +198,7 @@ void accumulateReportsStage_1(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
 [numthreads(256, 1, 1)]
 void accumulateReportsStage_2(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
     const uint tid = gtid.x;
     const uint blockIdx = gid.x;
     const uint category = gid.y;
@@ -218,18 +206,29 @@ void accumulateReportsStage_2(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
     const bool outputAggReport = (category % 2) == 0;
     const uint warpIndex = tid / WARP;
 
-    const uint nbPairs = found ? gParams.numFound : gParams.numLost;
-    const uint nbPairsSafe = min(nbPairs, gParams.maxPairs);
-    const uint maxPairs = outputAggReport ? gParams.maxAggPairs : gParams.maxPairs;
+    // .cu category selection (blockIdx.y 0..3)
+    const uint nbPairs = found ? desc[0].sharedFoundPairIndex : desc[0].sharedLostPairIndex;
+    Ptr<uint> pairs = Ptr<uint>(found ? desc[0].foundPairReport : desc[0].lostPairReport);
+    const uint maxPairs = outputAggReport ? desc[0].max_found_lost_agg_pairs : desc[0].max_found_lost_pairs;
+    const uint64_t outAddr = found
+        ? (outputAggReport ? desc[0].foundAggPairReport : desc[0].foundActorPairReport)
+        : (outputAggReport ? desc[0].lostAggPairReport : desc[0].lostActorPairReport);
+    Ptr<uint> aggOrActorPairs = Ptr<uint>(outAddr);
+
+    // AD: pairs buffer is sized according to this, aggregate count is not considered.
+    const uint nbPairsSafe = min(nbPairs, desc[0].max_found_lost_pairs);
+    const uint64_t volumeDataAddr = desc[0].aabbMngr_volumeData;
 
     if (tid == 0)
         gsBlockAccum = 0;
 
-    // warp 0: exclusive prefix over the 32 per-block counts
+    // warp 0 in the .cu: exclusive prefix over the 32 per-block counts
     if (tid < NUM_BLOCKS)
     {
-        const uint slot = (category / 2) * NUM_BLOCKS + tid;
-        gsLane[tid] = outputAggReport ? gAggReportBlock[slot] : gActorReportBlock[slot];
+        const uint64_t blockArr = outputAggReport
+            ? (found ? desc[0].aggReportBlock[0] : desc[0].aggReportBlock[1])
+            : (found ? desc[0].actorReportBlock[0] : desc[0].actorReportBlock[1]);
+        gsLane[tid] = (Ptr<uint>(blockArr))[tid];
     }
     GroupMemoryBarrierWithGroupSync();
     if (tid == 0)
@@ -241,9 +240,15 @@ void accumulateReportsStage_2(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
             gsBlockHistogram[i] = acc;
             acc += v;
         }
-        // total agg count is recorded for the agg categories (0 = found, 2 = lost)
+        // .cu: the agg totals go to the desc (only blockIdx.y == 0 / 2 write;
+        // all 32 x-blocks store the identical value, as in CUDA)
         if (outputAggReport)
-            gSharedAggIndex[found ? 0u : 1u] = acc;
+        {
+            if (found)
+                desc[0].sharedFoundAggPairIndex = acc;
+            else
+                desc[0].sharedLostAggPairIndex = acc;
+        }
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -256,13 +261,13 @@ void accumulateReportsStage_2(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
         const uint workIndex = it * BLOCK + tid + numIterationPerBlock * blockIdx * BLOCK;
 
         bool matches = false;
-        PxgBroadPhasePair pair;
-        pair.mVolA = 0;
-        pair.mVolB = 0;
+        uint volA = 0;
+        uint volB = 0;
         if (workIndex < nbPairsSafe)
         {
-            pair = found ? gFoundPairs[workIndex] : gLostPairs[workIndex];
-            const bool isAgg = isAggregatePair(pair);
+            volA = pairs[workIndex * 2u + 0u];
+            volB = pairs[workIndex * 2u + 1u];
+            const bool isAgg = isAggregatePair(volumeDataAddr, volA, volB);
             matches = outputAggReport ? isAgg : !isAgg;
         }
 
@@ -286,16 +291,8 @@ void accumulateReportsStage_2(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
             const uint index = offset + prevAccum + gsWarp[warpIndex] + blockStartIndex;
             if (index < maxPairs)
             {
-                if (found)
-                {
-                    if (outputAggReport) gFoundAggPairReport[index] = pair;
-                    else gFoundActorPairReport[index] = pair;
-                }
-                else
-                {
-                    if (outputAggReport) gLostAggPairReport[index] = pair;
-                    else gLostActorPairReport[index] = pair;
-                }
+                aggOrActorPairs[index * 2u + 0u] = volA;
+                aggOrActorPairs[index * 2u + 1u] = volB;
             }
         }
         GroupMemoryBarrierWithGroupSync();
@@ -309,28 +306,35 @@ void accumulateReportsStage_2(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
 [numthreads(256, 1, 1)]
 void copyReports(uint3 dtid : SV_DispatchThreadID)
 {
-    const uint maxPairs = gParams.maxPairs;
-    const uint nbCreatedPairs = min(gParams.numFound, maxPairs) - gSharedAggIndex[0];
-    const uint nbLostPairs = min(gParams.numLost, maxPairs) - gSharedAggIndex[1];
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
+    const uint maxPairs = desc[0].max_found_lost_pairs;
 
-    const bool foundOverflow = gParams.numFound > maxPairs;
-    const bool lostOverflow = gParams.numLost > maxPairs;
+    // sharedFoundPairIndex may exceed the buffer capacity; sharedFound/Lost-
+    // AggPairIndex are the corrected aggregate counts written by stage 2.
+    const uint nbCreatedPairs = min(desc[0].sharedFoundPairIndex, maxPairs) - desc[0].sharedFoundAggPairIndex;
+    const uint nbLostPairs = min(desc[0].sharedLostPairIndex, maxPairs) - desc[0].sharedLostAggPairIndex;
+
+    Ptr<uint> foundReports = Ptr<uint>(desc[0].foundActorPairReport);
+    Ptr<uint> lostReports = Ptr<uint>(desc[0].lostActorPairReport);
+    Ptr<uint> foundReportMap = Ptr<uint>(desc[0].foundPairReportMap);
+    Ptr<uint> lostReportMap = Ptr<uint>(desc[0].lostPairReportMap);
+
+    const bool foundOverflow = desc[0].sharedFoundPairIndex > maxPairs;
+    const bool lostOverflow = desc[0].sharedLostPairIndex > maxPairs;
     if (dtid.x == 0)
-        gOverflowFlag[0] = (foundOverflow || lostOverflow) ? 1u : 0u;
+    {
+        // .cu stores the bool unconditionally; bytes 1-3 of the word are the
+        // struct's tail padding, so the whole-word store is exact.
+        desc[0].overflowFlagsWord = (foundOverflow || lostOverflow) ? 1u : 0u;
+    }
 
-    // PxgBroadPhasePair = 2 uints
+    // PxgBroadPhasePair = 2 PxU32 elements
     const uint nbCreateElements = nbCreatedPairs * 2;
     const uint nbLostElements = nbLostPairs * 2;
-    const uint stride = BLOCK * NUM_BLOCKS;
+    const uint stride = WorkgroupCount().x * 256u; // .cu: blockDim.x * gridDim.x
 
     for (uint i = dtid.x; i < nbCreateElements; i += stride)
-    {
-        const PxgBroadPhasePair p = gFoundActorPairReport[i / 2];
-        gFoundReportMap[i] = (i & 1) == 0 ? p.mVolA : p.mVolB;
-    }
+        foundReportMap[i] = foundReports[i];
     for (uint i = dtid.x; i < nbLostElements; i += stride)
-    {
-        const PxgBroadPhasePair p = gLostActorPairReport[i / 2];
-        gLostReportMap[i] = (i & 1) == 0 ? p.mVolA : p.mVolB;
-    }
+        lostReportMap[i] = lostReports[i];
 }

@@ -24,19 +24,30 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// Verification of broadphaseOverlapCheckHistogram.slang.  Pass 1 (the
+// Verification of broadphaseOverlapCheckHistogram.slang — P5 Step 4: driven
+// through PxgCudaShim on the ENGINE ABI.  Each test fills a REAL engine
+// PxgBroadPhaseDesc with live device addresses and launches with the one
+// bpDesc pointer + the engine's fixed 32-block grid, exactly as
+// PxgCudaBroadPhaseSap::generateNewPairsKernel does.  Pass 1 (the
 // per-comparison overlap-check count + handle/region record) is checked
 // elementwise against a C++ transcription over a consistent synthetic region
 // layout.  Passes 2+3 (the 64-bit device-wide exclusive prefix scan) are
 // checked end-to-end against a uint64 exclusive scan whose total deliberately
 // exceeds 2^32, proving the 64-bit accumulation path (the exact overflow PhysX
-// types these buffers PxU64 for).
+// types these buffers PxU64 for); the grand total is verified by reading the
+// desc back (outputOverlapChecksForRegionHistogram writes the u64
+// overlapChecksTotalRegion VALUE through the desc pointer).
 
 #include "pxgTestFramework.h"
+#include "PxgCudaShim.h"
+
+#include "foundation/PxBounds3.h"
+#include "PxgBroadPhaseDesc.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -46,13 +57,6 @@ namespace
 using namespace pxgtest;
 
 const uint32_t TOTAL_REGION_SIZE = 64;
-
-struct OverlapCheckParams
-{
-    uint32_t numHandles;
-    uint32_t totalComparison;
-    uint32_t gridDimX;
-};
 
 uint32_t getHandle(uint32_t sh) { return sh >> 3; }
 uint32_t isNewP(uint32_t sh) { return (sh >> 1) & 1u; }
@@ -69,9 +73,41 @@ uint32_t binarySearch(const std::vector<uint32_t>& data, uint32_t n, uint32_t va
     return left ? left - 1 : 0;
 }
 
+static std::vector<uint8_t> ochShimLoader(const char* file) { return loadShaderBlob(file); }
+
+// Fills a REAL engine PxgBroadPhaseDesc with live device addresses (same rig
+// as testBroadphaseSetup.cpp).
+struct BpDescRig
+{
+    physx::gpuslang::PxgCudaShim* shim;
+    physx::PxgBroadPhaseDesc desc;
+
+    explicit BpDescRig(physx::gpuslang::PxgCudaShim* s) : shim(s) { std::memset(&desc, 0, sizeof(desc)); }
+
+    physx::gpuslang::PxgDevicePtr alloc(const void* data, size_t bytes)
+    {
+        physx::gpuslang::PxgDevicePtr p = 0;
+        shim->memAlloc(&p, bytes);
+        if (p && data)
+            shim->memcpyHtoD(p, data, bytes);
+        return p;
+    }
+    physx::gpuslang::PxgDevicePtr upload()
+    {
+        physx::gpuslang::PxgDevicePtr p = alloc(&desc, sizeof(desc));
+        return p;
+    }
+};
+
 // ---- pass 1: elementwise overlap-check counts + (handle, region) records ----
 PXG_TEST(broadphaseOverlapCheckHistogram_writeout)
 {
+    using namespace physx;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(20010);
     const uint32_t N = 1500;
     const uint32_t nbProj = N * 2;
@@ -158,31 +194,48 @@ PXG_TEST(broadphaseOverlapCheckHistogram_writeout)
     }
 
     PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "broadphaseOverlapCheckHistogram.spv", "writeOutOverlapChecksForInsertedBoundsRegionsHistogram", 8u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &ochShimLoader);
+
     std::vector<uint64_t> overlapInit(total, 0xdeadbeefdeadbeefull);
     std::vector<uint32_t> hrInit(total * 2, 0xcdcdcdcdu);
-    std::vector<uint64_t> blkInit(TOTAL_REGION_SIZE, 0), totInit(1, 0);
-    std::vector<uint32_t> dummy(16, 0);
 
-    PxgBufferHandle bAcc = createBufferFrom(dev, regionAccum);
-    PxgBufferHandle bH = createBufferFrom(dev, handlesX);
-    PxgBufferHandle bSap = createBufferFrom(dev, sapBoxX);
-    PxgBufferHandle bRange = createBufferFrom(dev, regionRange);
-    PxgBufferHandle bSH = createBufferFrom(dev, startHist);
-    PxgBufferHandle bAH = createBufferFrom(dev, activeHist);
-    PxgBufferHandle bOv = createBufferFrom(dev, overlapInit);
-    PxgBufferHandle bHR = createBufferFrom(dev, hrInit);
-    PxgBufferHandle bBlk = createBufferFrom(dev, blkInit);
-    PxgBufferHandle bTot = createBufferFrom(dev, totInit);
+    BpDescRig rig(&shim);
+    const PxgDevicePtr dAcc = rig.alloc(regionAccum.data(), regionAccum.size() * 4);
+    const PxgDevicePtr dH = rig.alloc(handlesX.data(), handlesX.size() * 4);
+    const PxgDevicePtr dSap = rig.alloc(sapBoxX.data(), sapBoxX.size() * 4);
+    const PxgDevicePtr dRange = rig.alloc(regionRange.data(), regionRange.size() * 4);
+    const PxgDevicePtr dSH = rig.alloc(startHist.data(), startHist.size() * 4);
+    const PxgDevicePtr dAH = rig.alloc(activeHist.data(), activeHist.size() * 4);
+    const PxgDevicePtr dOv = rig.alloc(overlapInit.data(), overlapInit.size() * 8);
+    const PxgDevicePtr dHR = rig.alloc(hrInit.data(), hrInit.size() * 4);
+    if (!dAcc) { std::printf("  NOTE: no BDA -> skip\n"); return; }
 
-    OverlapCheckParams p = { N, total, 32 };
-    const std::vector<uint32_t> strides = { 4, 4, 4, 4, 4, 4, 8, 4, 8, 8 };
-    Kernel k("broadphaseOverlapCheckHistogram.spv", "writeOutOverlapChecksForInsertedBoundsRegionsHistogram", strides,
-             sizeof(OverlapCheckParams));
-    k.dispatch(32, { bAcc, bH, bSap, bRange, bSH, bAH, bOv, bHR, bBlk, bTot }, p);
-    dev->flush();
+    // numHandles = numPreviousHandles + numCreatedHandles - numRemovedHandles = N
+    rig.desc.numPreviousHandles = N;
+    rig.desc.regionAccum = reinterpret_cast<PxU32*>(dAcc);
+    rig.desc.boxHandles[0][0] = reinterpret_cast<PxU32*>(dH);
+    rig.desc.boxSapBox1D[0] = reinterpret_cast<PxgSapBox1D*>(dSap);
+    rig.desc.regionRange = reinterpret_cast<PxgIntegerRegion*>(dRange);
+    rig.desc.startRegionsHistogram = reinterpret_cast<PxU32*>(dSH);
+    rig.desc.activeRegionsHistogram = reinterpret_cast<PxU32*>(dAH);
+    rig.desc.overlapChecksRegion = reinterpret_cast<regionOverlapType*>(dOv);
+    rig.desc.overlapChecksHandleRegiones = reinterpret_cast<PxgHandleRegion*>(dHR);
+    rig.desc.regionAccumTotal = total;
+    const PxgDevicePtr dDesc = rig.upload();
 
-    const auto gOverlap = downloadBuffer<uint64_t>(dev, bOv, total);
-    const auto gHR = downloadBuffer<uint32_t>(dev, bHR, total * 2);
+    struct { uint64_t bpDesc; } prm = { dDesc };
+    // engine grid: BP_WRITEOUT_OVERLAPCHECKS_HISTOGRAM_NEWBOUNDS = 32 blocks x 256
+    PXG_CHECK_MSG(shim.launchKernel(0, 32, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch writeOutOverlapChecks");
+    shim.streamSynchronize();
+
+    std::vector<uint64_t> gOverlap(total);
+    std::vector<uint32_t> gHR(total * 2);
+    shim.memcpyDtoH(gOverlap.data(), dOv, total * 8);
+    shim.memcpyDtoH(gHR.data(), dHR, total * 2 * 4);
 
     size_t ovMism = 0, hrMism = 0;
     for (uint32_t i = 0; i < total; ++i)
@@ -194,13 +247,19 @@ PXG_TEST(broadphaseOverlapCheckHistogram_writeout)
     PXG_CHECK_MSG(hrMism == 0, "%zu handleRegion mismatches", hrMism);
     PXG_CHECK_MSG(total > 0, "expected nonzero comparisons");
 
-    for (PxgBufferHandle h : { bAcc, bH, bSap, bRange, bSH, bAH, bOv, bHR, bBlk, bTot })
-        dev->destroyBuffer(h);
+    for (PxgDevicePtr pfree : { dAcc, dH, dSap, dRange, dSH, dAH, dOv, dHR, dDesc })
+        shim.memFree(pfree);
 }
 
 // ---- passes 2+3: 64-bit device-wide exclusive prefix scan (sum > 2^32) ----
 PXG_TEST(broadphaseOverlapCheckHistogram_scan64)
 {
+    using namespace physx;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(20020);
     const uint32_t n = 100000; // regionAccumTotal
     std::vector<uint64_t> counts(n);
@@ -216,31 +275,42 @@ PXG_TEST(broadphaseOverlapCheckHistogram_scan64)
                   (unsigned long long) refTotal);
 
     PxgSlangComputeDevice* dev = testDevice();
-    std::vector<uint64_t> blkInit(TOTAL_REGION_SIZE, 0), totInit(1, 0);
-    std::vector<uint32_t> dummy(16, 0);
+    const PxgKernelDef manifest[] = {
+        { "broadphaseOverlapCheckHistogram.spv", "computeOverlapChecksForRegionsHistogram", 8u, 0 },
+        { "broadphaseOverlapCheckHistogram.spv", "outputOverlapChecksForRegionHistogram", 8u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 2, &ochShimLoader);
 
-    PxgBufferHandle bOv = createBufferFrom(dev, counts);
-    PxgBufferHandle bBlk = createBufferFrom(dev, blkInit);
-    PxgBufferHandle bTot = createBufferFrom(dev, totInit);
-    PxgBufferHandle bDummy = createBufferFrom(dev, dummy);
+    std::vector<uint64_t> blkInit(TOTAL_REGION_SIZE, 0);
 
-    OverlapCheckParams p = { 0, n, 32 };
-    const std::vector<uint32_t> strides = { 4, 4, 4, 4, 4, 4, 8, 4, 8, 8 };
-    // bindings 0-5,7 unused by passes 2/3 -> bind a dummy; 6=overlap, 8=block, 9=total
-    const std::vector<PxgBufferHandle> buffers = { bDummy, bDummy, bDummy, bDummy, bDummy, bDummy,
-                                                   bOv, bDummy, bBlk, bTot };
+    BpDescRig rig(&shim);
+    const PxgDevicePtr dOv = rig.alloc(counts.data(), counts.size() * 8);
+    const PxgDevicePtr dBlk = rig.alloc(blkInit.data(), blkInit.size() * 8);
+    if (!dOv) { std::printf("  NOTE: no BDA -> skip\n"); return; }
 
-    Kernel k2("broadphaseOverlapCheckHistogram.spv", "computeOverlapChecksForRegionsHistogram", strides,
-              sizeof(OverlapCheckParams));
-    k2.dispatch(32, buffers, p);
+    rig.desc.overlapChecksRegion = reinterpret_cast<regionOverlapType*>(dOv);
+    rig.desc.blockOverlapChecksRegion = reinterpret_cast<regionOverlapType*>(dBlk);
+    rig.desc.regionAccumTotal = n;
+    rig.desc.overlapChecksTotalRegion = 0xeeeeeeeeeeeeeeeeull; // proves the desc write happened
+    const PxgDevicePtr dDesc = rig.upload();
+
+    struct { uint64_t bpDesc; } prm = { dDesc };
+    // engine grids: BP_COMPUTE/OUTPUT_OVERLAPCHECKS_HISTOGRAM = 32 blocks x 256
+    PXG_CHECK_MSG(shim.launchKernel(0, 32, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch computeOverlapChecks");
     dev->barrier();
-    Kernel k3("broadphaseOverlapCheckHistogram.spv", "outputOverlapChecksForRegionHistogram", strides,
-              sizeof(OverlapCheckParams));
-    k3.dispatch(32, buffers, p);
-    dev->flush();
+    PXG_CHECK_MSG(shim.launchKernel(1, 32, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch outputOverlapChecks");
+    shim.streamSynchronize();
 
-    const auto gOverlap = downloadBuffer<uint64_t>(dev, bOv, n);
-    const uint64_t gTotal = downloadBuffer<uint64_t>(dev, bTot, 1)[0];
+    std::vector<uint64_t> gOverlap(n);
+    shim.memcpyDtoH(gOverlap.data(), dOv, n * 8);
+
+    // the grand total lives in the desc itself (u64 VALUE field) — read it back
+    PxgBroadPhaseDesc back;
+    std::memset(&back, 0, sizeof(back));
+    PXG_CHECK_MSG(shim.memcpyDtoH(&back, dDesc, sizeof(back)) == PxgResult::Success, "DtoH desc");
+    const uint64_t gTotal = back.overlapChecksTotalRegion;
 
     size_t mism = 0;
     uint32_t firstBad = 0xffffffffu;
@@ -254,8 +324,8 @@ PXG_TEST(broadphaseOverlapCheckHistogram_scan64)
     PXG_CHECK_MSG(gTotal == refTotal, "total: gpu=%llu ref=%llu", (unsigned long long) gTotal,
                   (unsigned long long) refTotal);
 
-    for (PxgBufferHandle h : { bOv, bBlk, bTot, bDummy })
-        dev->destroyBuffer(h);
+    for (PxgDevicePtr pfree : { dOv, dBlk, dDesc })
+        shim.memFree(pfree);
 }
 
 } // namespace
