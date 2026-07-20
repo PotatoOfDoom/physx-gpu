@@ -90,6 +90,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "computeStartAndActiveRegionHistogram", kOnePtr, 1u },
     { "writeOutStartAndActiveRegionHistogram", kOnePtr, 1u },
     { "outputOrderedActiveRegionHistogram", kOnePtr, 1u },
+    { "computeStartRegionsHistogram", kOnePtr, 1u },
+    { "outputStartRegionsHistogram", kOnePtr, 1u },
 };
 
 inline size_t abiAlign(size_t size)

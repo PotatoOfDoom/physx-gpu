@@ -368,7 +368,8 @@ pxg_compile_shader(broadphaseIncrementalHistogram computeIncrementalComparisonHi
                    computeIncrementalComparisonHistograms_Stage2)
 pxg_compile_shader(broadphaseEndPtHistogram computeEndPtsHistogram outputEndPtsHistogram)
 pxg_compile_shader(broadphaseIncrementalSap performIncrementalSAP)
-pxg_compile_shader(broadphaseRegionHistogram computeRegionsHistogram outputRegionsHistogram)
+pxg_compile_shader(broadphaseRegionHistogram computeRegionsHistogram outputRegionsHistogram
+                   computeStartRegionsHistogram outputStartRegionsHistogram)
 pxg_compile_shader(broadphaseCreateRegions createRegionsKernel)
 pxg_compile_shader(broadphaseActiveRegionHistogram writeOutStartAndActiveRegionHistogram
                    computeStartAndActiveRegionHistogram outputOrderedActiveRegionHistogram)

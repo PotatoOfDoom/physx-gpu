@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 125;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 127;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -43,8 +43,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "computeEndPtsHistogram", "broadphaseEndPtHistogram.spv", "computeEndPtsHistogram" },  // BP_COMPUTE_ENDPT_HISTOGRAM
     { "outputEndPtsHistogram", "broadphaseEndPtHistogram.spv", "outputEndPtsHistogram" },  // BP_OUTPUT_ENDPT_HISTOGRAM
     { "createRegionsKernel", "broadphaseCreateRegions.spv", "createRegionsKernel" },  // BP_CREATE_REGIONS
-    { "computeStartRegionsHistogram", nullptr, nullptr },  // BP_COMPUTE_START_REGION_HISTOGRAM (unmapped)
-    { "outputStartRegionsHistogram", nullptr, nullptr },  // BP_OUTPUT_START_REGION_HISTOGRAM (unmapped)
+    { "computeStartRegionsHistogram", "broadphaseRegionHistogram.spv", "computeStartRegionsHistogram" },  // (P5 Step 4 BDA port)
+    { "outputStartRegionsHistogram", "broadphaseRegionHistogram.spv", "outputStartRegionsHistogram" },  // (P5 Step 4 BDA port)
     { "computeRegionsHistogram", "broadphaseRegionHistogram.spv", "computeRegionsHistogram" },  // BP_COMPUTE_REGION_HISTOGRAM
     { "outputRegionsHistogram", "broadphaseRegionHistogram.spv", "outputRegionsHistogram" },  // BP_OUTPUT_REGION_HISTOGRAM
     { "writeOutStartAndActiveRegionHistogram", "broadphaseActiveRegionHistogram.spv", "writeOutStartAndActiveRegionHistogram" },  // BP_WRITEOUT_ACTIVE_HISTOGRAM
