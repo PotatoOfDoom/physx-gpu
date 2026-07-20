@@ -134,11 +134,12 @@ Landed to close the contact→solve path since the free-fall milestone:
   contact had allocated iter_blockConstraintBatch, defeating the old guard;
   the scalar guard now also requires mNumPartitions!=0.
 
-Remaining non-fatal gap: `mWritebackBlockFunction` (writebackBlocksTGS —
-constraint-force / friction-patch / threshold-stream writeback) still fails
-to launch, but does NOT affect the rest state (it is force reporting +
-friction persistence).  Being converted to the engine ABI as tranche 20
-(same {8,8,4} shape as concludeBlocksTGS).
+As of tranche 20 (commit 852abac) the box-on-ground scene steps with **ZERO
+refused kernel launches**: `writebackBlocksTGS` (constraint-force /
+friction-patch / threshold-stream writeback) was converted to the engine ABI
+({8,8,4}, same shape as concludeBlocksTGS), closing the last harness-form
+solver kernel.  The entire per-frame collision→solve→writeback loop for this
+scene now runs cleanly on the GPU.  Suite 664/664 both modes.
 
 ## P5 Step 4 — earlier MILESTONE: the box falls on the GPU
 
