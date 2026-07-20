@@ -58,6 +58,9 @@ static const uint8_t kOnePtr[] = { 8 };
 // broadphase.cu: initializeSapBox1DLaunch(const PxgBroadPhaseDesc*, PxU32 numHandles, bool isNew)
 static const uint8_t kSapBoxInit[] = { 8, 4, 1 };
 
+// radixSortImpl.cu: (PxgRadixSortDesc* desc, PxU32 numKeys, PxU32 startBit)
+static const uint8_t kRadixDesc[] = { 8, 4, 4 };
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },
@@ -67,6 +70,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "initializeSapBox1DLaunch", kSapBoxInit, uint32_t(sizeof(kSapBoxInit)) },
     { "initializeRadixRanks", kOnePtr, 1u },
     { "updateHandles", kOnePtr, 1u },
+    { "radixSortMultiBlockLaunchWithCount", kRadixDesc, uint32_t(sizeof(kRadixDesc)) },
+    { "radixSortMultiCalculateRanksLaunchWithCount", kRadixDesc, uint32_t(sizeof(kRadixDesc)) },
 };
 
 inline size_t abiAlign(size_t size)

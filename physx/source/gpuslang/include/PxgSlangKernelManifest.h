@@ -188,8 +188,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "markActiveSlabTGS", nullptr, nullptr },  // MARK_ACTIVE_SLAB_TGS (unmapped)
     { "radixSortMultiBlockLaunch", nullptr, nullptr },  // RS_MULTIBLOCK (unmapped)
     { "radixSortMultiCalculateRanksLaunch", nullptr, nullptr },  // RS_CALCULATERANKS_MULTIBLOCK (unmapped)
-    { "radixSortMultiBlockLaunchWithCount", nullptr, nullptr },  // RS_MULTIBLOCK_COUNT (unmapped)
-    { "radixSortMultiCalculateRanksLaunchWithCount", nullptr, nullptr },  // RS_CALCULATERANKS_MULTIBLOCK_COUNT (unmapped)
+    { "radixSortMultiBlockLaunchWithCount", "radixSortDesc.spv", "radixSortMultiBlockLaunchWithCount" },  // RS_MULTIBLOCK_COUNT (P5 Step 4 BDA port)
+    { "radixSortMultiCalculateRanksLaunchWithCount", "radixSortDesc.spv", "radixSortMultiCalculateRanksLaunchWithCount" },  // RS_CALCULATERANKS_MULTIBLOCK_COUNT (P5 Step 4 BDA port)
     { "radixSortMultiBlockLaunchWithoutCount", nullptr, nullptr },  // RS_MULTIBLOCK_NO_COUNT (unmapped)
     { "radixSortMultiCalculateRanksLaunchWithoutCount", nullptr, nullptr },  // RS_CALCULATERANKS_MULTIBLOCK_NO_COUNT (unmapped)
     { "radixSortCopyHigh32Bits", "radixSort64.spv", "radixSortCopyHigh32Bits" },  // RS_COPY_HIGH_32BITS
