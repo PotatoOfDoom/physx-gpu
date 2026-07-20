@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 127;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 128;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -207,7 +207,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "rigidSumInternalContactAndJointBatches2", nullptr, nullptr },  // RIGID_SUM_STATIC_CONTACT2 (unmapped)
     { "solveStaticBlock", nullptr, nullptr },  // RIGID_SOLVE_STATIC_CONSTRAINTS (unmapped)
     { "solveStaticBlockTGS", nullptr, nullptr },  // RIGID_SOLVE_STATIC_CONSTRAINTS_TGS (unmapped)
-    { "solveWholeIslandTGS", nullptr, nullptr },  // RIGID_SOLVE_WHOLE_ISLAND_TGS (unmapped)
+    { "solveWholeIslandTGS", "solverTGS.spv", "solveWholeIslandTGS" },  // RIGID_SOLVE_WHOLE_ISLAND_TGS
     { "ps_updateUnsortedArrayLaunch", nullptr, nullptr },  // PS_UPDATE_UNSORTED_ARRAY (unmapped)
     { "ps_updateUserBufferLaunch", nullptr, nullptr },  // PS_UPDATE_BUFFER_DATA (unmapped)
     { "ps_updateUnsortedDiffuseArrayLaunch", nullptr, nullptr },  // PS_UPDATE_DIFFUSE_UNSORTED_ARRAY (unmapped)

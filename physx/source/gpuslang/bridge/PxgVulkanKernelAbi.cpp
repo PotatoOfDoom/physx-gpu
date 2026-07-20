@@ -80,6 +80,10 @@ static const uint8_t kPropagateAvg[] = { 8, 8, 1, 1, 4 };
 // solverTGS: writeBackBodiesTGS(desc, sharedDesc, PxU32 islandIndex)
 static const uint8_t kWriteBackTGS[] = { 8, 8, 4 };
 
+// solverTGS: solveWholeIslandTGS(desc, sharedDesc, PxU32 islandIndex,
+//   bool doFriction, PxReal elapsedTime, PxReal minPen)
+static const uint8_t kSolveWholeIslandTGS[] = { 8, 8, 4, 1, 4, 4 };
+
 // integration.cu: integrateCoreParallelLaunchTGS(PxU32 offset, desc, sharedDesc,
 //   PxU32* islandIds, PxU32* islandStaticTouchCounts, PxU32* numCountedInteractions)
 static const uint8_t kIntegrateTGS[] = { 4, 8, 8, 8, 8, 8 };
@@ -118,6 +122,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "computeAverageSolverBodyVelocityTGS", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "propagateAverageSolverBodyVelocityTGS", kPropagateAvg, uint32_t(sizeof(kPropagateAvg)) },
     { "writeBackBodiesTGS", kWriteBackTGS, uint32_t(sizeof(kWriteBackTGS)) },
+    { "solveWholeIslandTGS", kSolveWholeIslandTGS, uint32_t(sizeof(kSolveWholeIslandTGS)) },
     { "integrateCoreParallelLaunchTGS", kIntegrateTGS, uint32_t(sizeof(kIntegrateTGS)) },
 };
 

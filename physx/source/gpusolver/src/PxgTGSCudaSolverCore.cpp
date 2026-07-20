@@ -1122,7 +1122,15 @@ void PxgTGSCudaSolverCore::solvePartitions(PxgIslandContext* islandContexts, PxI
 
 	PxU32 bodyCount = (context.mBodyCount + context.mBodyStartIndex) * mSolverCoreDesc->numSlabs;
 
-	const PxU32 maxBodies = 944; 
+#ifdef PXG_NO_CUDA_TOOLKIT
+	// Slang/Vulkan port: solveWholeIslandTGS sizes its shared-memory staging
+	// arrays for 640 body-slabs (CUDA's 944 needs 45312 B of shared memory,
+	// over the portable Vulkan maxComputeSharedMemorySize of 32768).  Larger
+	// islands take the per-partition path below.
+	const PxU32 maxBodies = 640;
+#else
+	const PxU32 maxBodies = 944;
+#endif
 
 	PxU32 startIndex = 0;
 	PxU32 startArtic = 0;

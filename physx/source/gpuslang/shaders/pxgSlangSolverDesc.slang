@@ -34,15 +34,19 @@
 // trailing `bool enableStabilization` -> masked word read (its 3 padding bytes
 // are uninitialized host memory).
 //
-// PxgSolverCoreDescGpu is TRUNCATED after the enableStabilization word
-// (offset 284, mirror size 288 of the full struct): enableStabilization is the
-// LAST field any of the converted kernels reads (integrateCoreParallelLaunchTGS);
-// the remaining engine fields (nbExceededThresholdElements,
-// nbPrevExceededThresholdElements, nbForceChangeElements,
-// maxLinksPerArticulation, contactErrorAccumulator) are only used by the
-// threshold-stream and iterative-solve kernels that are not on the BDA engine
-// path yet.  The desc is only ever dereferenced as desc[0] (never indexed), so
-// the shortened mirror is safe.
+// PxgSolverCoreDescGpu now mirrors the FULL engine struct: the scalar tail
+// past enableStabilization (nbExceededThresholdElements ..
+// maxLinksPerArticulation, then the Dy::ErrorAccumulator
+// contactErrorAccumulator at 304) is required by solveWholeIslandTGS, which
+// tests contactErrorAccumulator.mCounter >= 0 and atomically accumulates the
+// per-launch contact residual statistics into the accumulator.  The two float
+// members of the accumulator are declared as raw uint BITS so the kernel can
+// CAS-emulate CUDA's float atomicAdd / AtomicMax on them
+// (InterlockedCompareExchange has no float overload); mCounter keeps its int
+// type for the plain InterlockedAdd and the signed >= 0 enable test.  The
+// engine struct is 316 bytes rounded up to 320 by its pointer alignment; the
+// desc is only ever dereferenced as desc[0] (never indexed), so the mirror's
+// own 8-byte size rounding is inert.
 //
 // The layout is verified EMPIRICALLY, not by inspection:
 // tests/testSolverDescLayout.cpp fills the REAL engine structs with sentinels
@@ -92,7 +96,16 @@ public struct PxgSolverCoreDescGpu
     public uint accumulatedBodyDeltaVOffset;                    // @276
     public int  sharedThresholdStreamIndex;                     // @280 PxI32
     public uint enableStabilizationWord;                        // @284 bool in byte 0 (mask & 0xff)
-    // TRUNCATED @288 — see file header.
+    public uint nbExceededThresholdElements;                    // @288
+    public uint nbPrevExceededThresholdElements;                // @292
+    public uint nbForceChangeElements;                          // @296
+    public uint maxLinksPerArticulation;                        // @300
+    // ---- Dy::ErrorAccumulator contactErrorAccumulator @304 ----
+    // float members held as raw bits (uint) for the CAS-loop float atomics;
+    // see the file header.
+    public uint contactErrorAccumulator_mErrorSumOfSquares;     // @304 float bits
+    public int  contactErrorAccumulator_mCounter;               // @308 PxI32
+    public uint contactErrorAccumulator_mMaxError;              // @312 float bits
 }
 
 // PxgSolverSharedDesc<IterativeSolveDataTGS> = PxgSolverSharedDescBase (96

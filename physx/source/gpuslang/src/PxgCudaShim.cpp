@@ -26,6 +26,7 @@
 
 #include "PxgCudaShim.h"
 
+#include <cstdlib>
 #include <cstring>
 
 namespace physx
@@ -240,6 +241,14 @@ PxgResult PxgCudaShim::launchKernel(PxgKernelId id, uint32_t gridX, uint32_t gri
                              paramBlob, paramBlobSize);
     else
         mDevice->dispatch(pipe, gridX, gridY, gridZ, nullptr, 0, paramBlob, paramBlobSize);
+
+    // PXG_SYNC_EACH=1: drain the queue after every dispatch so a shader-side
+    // fault (e.g. a stray BDA dereference) is attributed to the exact kernel
+    // that produced it — the launch trace's last line becomes the culprit
+    // instead of a whole flushed batch.  Debug-only; off by default.
+    static const bool syncEach = std::getenv("PXG_SYNC_EACH") != nullptr;
+    if (syncEach)
+        mDevice->flush();
     return PxgResult::Success;
 }
 

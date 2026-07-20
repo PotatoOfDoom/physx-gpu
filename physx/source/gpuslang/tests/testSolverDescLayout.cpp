@@ -28,10 +28,10 @@
 // (pxgSlangSolverDesc.slang).  Fills the REAL engine PxgSolverCoreDesc,
 // PxgSolverSharedDesc<IterativeSolveDataTGS> and a PxgIslandContext[2] array
 // (the exact structs the engine DMAs to the device) with distinct sentinels,
-// uploads the raw bytes, and the solverDescProbe kernel reads 80 fields
+// uploads the raw bytes, and the solverDescProbe kernel reads 87 fields
 // spanning all three structs through the Slang mirrors.  A single wrong
-// offset — missing padding, wrong truncation point, engine struct drift, a
-// wrong PxgIslandContext array stride — mismatches bitwise.  Every solver
+// offset — missing padding, engine struct drift, a wrong PxgIslandContext
+// array stride — mismatches bitwise.  Every solver
 // desc-walking kernel conversion (ZeroBodiesTGS, initializeSolverVelocitiesTGS,
 // computeAverage/propagateAverageSolverBodyVelocityTGS, writeBackBodiesTGS,
 // integrateCoreParallelLaunchTGS) rests on this proof.
@@ -128,6 +128,13 @@ PXG_TEST(solverDescLayout)
     d.accumulatedBodyDeltaVOffset = sent32(u++);
     d.sharedThresholdStreamIndex = -1234567; // PxI32, negative on purpose
     d.enableStabilization = true;
+    d.nbExceededThresholdElements = sent32(u++);
+    d.nbPrevExceededThresholdElements = sent32(u++);
+    d.nbForceChangeElements = sent32(u++);
+    d.maxLinksPerArticulation = sent32(u++);
+    d.contactErrorAccumulator.mErrorSumOfSquares = sentF(f++);
+    d.contactErrorAccumulator.mCounter = -55667788; // PxI32, negative on purpose
+    d.contactErrorAccumulator.mMaxError = sentF(f++);
 
     // ---- the REAL engine PxgSolverSharedDesc<IterativeSolveDataTGS> ----
     PxgSolverSharedDesc<IterativeSolveDataTGS> s;
@@ -220,6 +227,13 @@ PXG_TEST(solverDescLayout)
     expect.push_back(d.accumulatedBodyDeltaVOffset);
     expect.push_back(uint64_t(uint32_t(d.sharedThresholdStreamIndex)));
     expect.push_back(1u); // enableStabilization byte
+    expect.push_back(d.nbExceededThresholdElements);
+    expect.push_back(d.nbPrevExceededThresholdElements);
+    expect.push_back(d.nbForceChangeElements);
+    expect.push_back(d.maxLinksPerArticulation);
+    expect.push_back(bitsOf(d.contactErrorAccumulator.mErrorSumOfSquares));
+    expect.push_back(uint64_t(uint32_t(d.contactErrorAccumulator.mCounter)));
+    expect.push_back(bitsOf(d.contactErrorAccumulator.mMaxError));
 
     expect.push_back(uint64_t(s.blockCurrentFrictionPatches));
     expect.push_back(uint64_t(s.blockPreviousFrictionPatches));

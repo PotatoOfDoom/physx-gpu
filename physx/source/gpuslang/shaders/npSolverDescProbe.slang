@@ -90,7 +90,7 @@ void solverDescProbe(uint3 dtid : SV_DispatchThreadID)
     o[i++] = d.contactManagerOutputBase;
     o[i++] = d.mBodySimBufferDeviceData;
     o[i++] = d.mBodySimPrevVelocitiesBufferDeviceData;
-    // ---- the scalar tail up to the truncation point ----
+    // ---- the scalar tail ----
     o[i++] = uint64_t(d.numIslands);
     o[i++] = uint64_t(d.numBatches);
     o[i++] = uint64_t(d.numArticBatches);
@@ -98,7 +98,16 @@ void solverDescProbe(uint3 dtid : SV_DispatchThreadID)
     o[i++] = uint64_t(d.numSlabs);
     o[i++] = uint64_t(d.accumulatedBodyDeltaVOffset);
     o[i++] = uint64_t(uint(d.sharedThresholdStreamIndex));
-    o[i++] = uint64_t(d.enableStabilizationWord & 0xffu); // the trailing bool byte
+    o[i++] = uint64_t(d.enableStabilizationWord & 0xffu); // the bool byte
+    o[i++] = uint64_t(d.nbExceededThresholdElements);
+    o[i++] = uint64_t(d.nbPrevExceededThresholdElements);
+    o[i++] = uint64_t(d.nbForceChangeElements);
+    o[i++] = uint64_t(d.maxLinksPerArticulation);
+    // Dy::ErrorAccumulator contactErrorAccumulator (float members mirrored as
+    // raw bits for the CAS-loop atomics in solveWholeIslandTGS)
+    o[i++] = uint64_t(d.contactErrorAccumulator_mErrorSumOfSquares);
+    o[i++] = uint64_t(uint(d.contactErrorAccumulator_mCounter));
+    o[i++] = uint64_t(d.contactErrorAccumulator_mMaxError);
 
     // ---- PxgSolverSharedDesc<IterativeSolveDataTGS> ----
     o[i++] = s.blockCurrentFrictionPatches;

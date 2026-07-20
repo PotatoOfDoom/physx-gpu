@@ -51,8 +51,11 @@
 //     the explicit "next*" prefetch chains become direct loads — semantically
 //     identical (the whole solve is gated on numNormalConstr > 0, so the
 //     prefetch always resolves to each row's own data);
-//   - the contact-error accumulator statistics are not ported yet; per-row
-//     joint residual writeback is.
+//   - the contact-error accumulator statistics are not ported on the
+//     bound-buffer path (the per-partition CUDA launch passes error = NULL);
+//     per-row joint residual writeback is.  The BDA solveWholeIslandTGS entry
+//     at the end of this file DOES port them (its CUDA original accumulates
+//     into solverDesc->contactErrorAccumulator itself).
 
 import pxgSlangCommon;
 import pxgSlangSolverDesc;
@@ -1395,5 +1398,793 @@ void propagateAverageSolverBodyVelocityTGS(uint3 groupThreadId : SV_GroupThreadI
         // particles and the final writeBackBodiesTGS)
         bodyVelocities[deltaVOffset + bodyId + totalBodiesIncKinematics] = curVel1;
         bodyVelocities[deltaVOffset + bodyId + 2 * totalBodiesIncKinematics] = curVel2;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// solveWholeIslandTGS (P5 Step 4 BDA engine ABI)
+//
+// Port of solveWholeIslandTGS() in solverMultiBlockTGS.cu: one 256-thread
+// block solves ALL partitions of a small island in a single launch, staging
+// every body-slab velocity/delta in shared memory and writing the results to
+// the averaging slots consumed by computeAverageSolverBodyVelocityTGS.
+// The solve math itself is the *Bda transcription of the bit-verified
+// bound-buffer helpers above (solveContactBlockTGS / solve1DBlockTGS), with
+// the contact-residual statistics (PxgErrorAccumulator) added because this
+// kernel — unlike the per-partition path — accumulates them into
+// solverDesc->contactErrorAccumulator itself.
+//
+// Differences from the .cu:
+//   - maxBodies is 640 instead of 944 (hardware limit): CUDA's four
+//     PxVec3[944] staging arrays are 45312 B of shared memory, over the
+//     portable Vulkan/llvmpipe maxComputeSharedMemorySize of 32768.  With 640
+//     (4 x 640 x 12 B = 30720 B, + 1 KiB of residual-counter scratch = 31744 B)
+//     the kernel fits.  The HOST gate in PxgTGSCudaSolverCore.cpp::
+//     solvePartitions uses the same 640 under PXG_NO_CUDA_TOOLKIT, so islands
+//     with more than 640 body-slabs fall back to the (CUDA-faithful)
+//     per-partition solveBlockPartitionTGS path.  The arrays are flat
+//     float[3n] rather than float3[n] because workgroup float3 arrays may be
+//     given a 16-byte stride, which would overflow the budget again.
+//   - the warp-shuffle loadTxInertia() staging becomes direct loads, gated on
+//     the live lanes (lane < mDescStride) because the tail lanes'
+//     bodyA/BIndex is uninitialized batch memory (same policy as
+//     solveBlockPartitionTGS above);
+//   - accumulateErrorGlobalFullWarp(): the __shfl_xor butterfly reduction
+//     becomes the same butterfly through the (then-dead) staging arrays; the
+//     reduction itself runs unconditionally (uniform control flow around the
+//     barriers) and only the atomic tail is gated on
+//     residualAccumulationEnabled — identical results, since a disabled
+//     launch accumulates nothing;
+//   - CUDA's float atomicAdd / AtomicMax on the accumulator become CAS loops
+//     on the raw float bits (InterlockedCompareExchange has no float
+//     overload), and __fdividef in the residual becomes exact division.
+// ---------------------------------------------------------------------------
+
+// (const PxgSolverCoreDesc*, const PxgSolverSharedDesc<IterativeSolveDataTGS>*,
+//  const PxU32 islandIndex, bool doFriction, const PxReal elapsedTime,
+//  const PxReal minPen): argSizes {8,8,4,1,4,4} -> the bool byte lands at
+// blob offset 20 (bytes 21..23 are zero-filled padding), the floats at 24/28,
+// 32 bytes total.
+struct SolveWholeIslandTGSAbiParams
+{
+    uint64_t solverCoreDesc; // @0
+    uint64_t sharedDesc;     // @8
+    uint islandIndex;        // @16
+    uint doFrictionWord;     // @20: byte 0 = doFriction (unused by the kernel body, exactly like the .cu)
+    float elapsedTime;       // @24
+    float minPen;            // @28
+}                            // = 32
+[[vk::push_constant]]
+ConstantBuffer<SolveWholeIslandTGSAbiParams> gWholeIslandAbi;
+
+// mirrors PxgErrorAccumulator (gpucommon/src/CUDA/solverResidual.cuh): the
+// per-thread contact residual statistics.
+struct PxgErrorAccumulatorSlang
+{
+    float sumOfSquares;
+    int counter;
+    float maxError;
+}
+
+// PxgErrorAccumulator::accumulateErrorLocal().  CUDA computes the residual
+// with __fdividef; exact division here (the CPU references divide exactly
+// too).
+void pxgAccumulateErrorLocal(inout PxgErrorAccumulatorSlang e, float deltaF, float velocityMultiplier)
+{
+    const float r = velocityMultiplier == 0.0f ? 0.0f : deltaF / velocityMultiplier;
+    e.sumOfSquares += r * r;
+    ++e.counter;
+    e.maxError = max(e.maxError, abs(r));
+}
+
+// mirrors solveContactBlockTGS() in solverBlockTGS.cuh — BDA variant of the
+// bound-buffer helper above (identical body, Ptr<> data path), plus the
+// PxgErrorAccumulator statistics the whole-island kernel needs (the CUDA
+// helper takes a PxgErrorAccumulator* that the per-partition launch passes as
+// NULL; errorEnabled mirrors that pointer's nullness).
+void solveContactBlockTGSBda(Ptr<PxgBlockConstraintBatch> batches, uint batchIndex,
+                             inout float3 linVel0, inout float3 angVel0,
+                             inout float3 linVel1, inout float3 angVel1,
+                             float3 b0LinDelta, float3 b0AngDelta, float3 b1LinDelta, float3 b1AngDelta,
+                             uint threadIndex,
+                             Ptr<PxgTGSBlockSolverContactHeader> contactHeaders,
+                             Ptr<PxgTGSBlockSolverFrictionHeader> frictionHeaders,
+                             Ptr<PxgTGSBlockSolverContactPoint> contactPoints,
+                             Ptr<PxgTGSBlockSolverContactFriction> frictionsBuf,
+                             float elapsedTime, float minPen,
+                             bool errorEnabled, inout PxgErrorAccumulatorSlang error,
+                             float ref0, float ref1)
+{
+    const uint constraintBatchIndex = batches[batchIndex].mConstraintBatchIndex;
+    const uint startConstraintIndex = batches[batchIndex].startConstraintIndex;
+    const uint startFrictionIndex = batches[batchIndex].startFrictionIndex;
+
+    float accumulatedNormalImpulse = 0.0f;
+
+    const uint numNormalConstr = contactHeaders[constraintBatchIndex].numNormalConstr[threadIndex];
+    const uint numFrictionConstrTotal = frictionHeaders[constraintBatchIndex].numFrictionConstr[threadIndex];
+    const uint numFrictionConstr = numFrictionConstrTotal & ~1u;
+
+    float accumDeltaF = 0.0f;
+
+    if (numNormalConstr != 0)
+    {
+        const float maxPenBias = contactHeaders[constraintBatchIndex].maxPenBias[threadIndex];
+        const float4 invMass0_1_angDom0_1 = contactHeaders[constraintBatchIndex].invMass0_1_angDom0_1[threadIndex];
+
+        const float invMassA = ref0 * invMass0_1_angDom0_1.x;
+        const float invMassB = ref1 * invMass0_1_angDom0_1.y;
+        const float angDom0 = ref0 * invMass0_1_angDom0_1.z;
+        const float angDom1 = ref1 * invMass0_1_angDom0_1.w;
+        const float sumInvMass = invMassA + invMassB;
+
+        const float4 normal_staticFriction = contactHeaders[constraintBatchIndex].normal_staticFriction[threadIndex];
+        const float3 normal = normal_staticFriction.xyz;
+        const float staticFrictionCof = normal_staticFriction.w;
+
+        const float restitutionXdt = contactHeaders[constraintBatchIndex].restitutionXdt[threadIndex];
+        const float p8 = contactHeaders[constraintBatchIndex].p8[threadIndex];
+        const uint flags = contactHeaders[constraintBatchIndex].flags[threadIndex];
+
+        const float3 delLinVel0 = normal * invMassA;
+        const float3 delLinVel1 = normal * invMassB;
+
+        const float3 relMotion = b0LinDelta - b1LinDelta;
+        const float deltaV = dot(normal, relMotion);
+
+        float relVel1 = dot(linVel0 - linVel1, normal);
+
+        for (uint i = 0; i < numNormalConstr; i++)
+        {
+            const uint c = startConstraintIndex + i;
+
+            const float4 raXn_contactCoeff = contactPoints[c].raXn_extraCoeff[threadIndex];
+            const float4 rbXn_targetVelW = contactPoints[c].rbXn_targetVelW[threadIndex];
+            const float appliedForce = contactPoints[c].appliedForce[threadIndex];
+            const float separation = contactPoints[c].separation[threadIndex];
+            const float maxImpulse = contactPoints[c].maxImpulse[threadIndex];
+
+            const float resp0 = ref0 * contactPoints[c].resp0[threadIndex];
+            const float resp1 = ref1 * contactPoints[c].resp1[threadIndex];
+            const float unitResponse = resp0 + resp1;
+            const float recipResponse = (unitResponse > 0.0f) ? (1.0f / unitResponse) : 0.0f;
+
+            float velMultiplier = recipResponse;
+            float biasCoefficient = contactPoints[c].biasCoefficient[threadIndex];
+
+            if (restitutionXdt < 0.0f)
+                computeCompliantContactCoefficientsTGS(flags, restitutionXdt, unitResponse, recipResponse,
+                                                       raXn_contactCoeff.w, velMultiplier, biasCoefficient);
+
+            const float3 raXn = raXn_contactCoeff.xyz;
+            const float3 rbXn = rbXn_targetVelW.xyz;
+            const float targetVel = rbXn_targetVelW.w;
+
+            // Compute the normal velocity of the constraint.
+            const float v0 = dot(angVel0, raXn);
+            const float v1 = dot(angVel1, rbXn);
+            const float normalVel = relVel1 + (v0 - v1);
+
+            const float sep = max(minPen, separation + deltaV + dot(b0AngDelta, raXn) - dot(b1AngDelta, rbXn));
+
+            // How much the target vel should have changed the position of this constraint...
+            const float tVelErr = targetVel * elapsedTime;
+
+            const float biasedErr = recipResponse * min(-maxPenBias, biasCoefficient * (sep - tVelErr));
+
+            // KS - clamp the maximum force
+            const float tempDeltaF = biasedErr - (normalVel - targetVel) * velMultiplier;
+            const float _deltaF = max(tempDeltaF, -appliedForce);
+            const float _newForce = appliedForce + _deltaF;
+            const float newForce = min(_newForce, maxImpulse);
+            const float deltaF = newForce - appliedForce;
+
+            accumDeltaF += deltaF;
+            relVel1 += sumInvMass * deltaF;
+
+            angVel0 += raXn * (deltaF * angDom0);
+            angVel1 -= rbXn * (deltaF * angDom1);
+
+            if (errorEnabled)
+                pxgAccumulateErrorLocal(error, deltaF, velMultiplier);
+
+            contactPoints[c].appliedForce[threadIndex] = newForce;
+            accumulatedNormalImpulse += newForce;
+        }
+
+        linVel0 += delLinVel0 * accumDeltaF;
+        linVel1 -= delLinVel1 * accumDeltaF;
+
+        if (numFrictionConstrTotal != 0)
+        {
+            const float biasCoefficient = frictionHeaders[constraintBatchIndex].biasCoefficient[threadIndex];
+            const float dynamicFrictionCof = frictionHeaders[constraintBatchIndex].dynamicFriction[threadIndex];
+            const float maxFrictionImpulse = staticFrictionCof * accumulatedNormalImpulse;
+            const float maxDynFrictionImpulse = dynamicFrictionCof * accumulatedNormalImpulse;
+
+            uint broken = 0;
+
+            const float4 frictionNormal0 = frictionHeaders[constraintBatchIndex].frictionNormals0[threadIndex];
+            const float4 frictionNormal1 = frictionHeaders[constraintBatchIndex].frictionNormals1[threadIndex];
+            const float3 normal0 = frictionNormal0.xyz;
+            const float3 normal1 = frictionNormal1.xyz;
+
+            const float3 delLinVel00 = normal0 * invMassA;
+            const float3 delLinVel10 = normal0 * invMassB;
+            const float3 delLinVel01 = normal1 * invMassA;
+            const float3 delLinVel11 = normal1 * invMassB;
+
+            const float relDelta0 = dot(relMotion, normal0);
+            const float relDelta1 = dot(relMotion, normal1);
+
+            for (uint i = 0; i < numFrictionConstr; i += 2)
+            {
+                const uint f0 = startFrictionIndex + i;
+                const uint f1 = startFrictionIndex + i + 1;
+
+                const float4 raXn_extraCoeff0 = frictionsBuf[f0].raXn_error[threadIndex];
+                const float4 rbXn_targetVelW0 = frictionsBuf[f0].rbXn_targetVelW[threadIndex];
+                const float initialError0 = raXn_extraCoeff0.w;
+                const float appliedForce0 = frictionsBuf[f0].appliedForce[threadIndex];
+                const float targetVel0 = rbXn_targetVelW0.w;
+                const float f0_resp = ref0 * frictionsBuf[f0].resp0[threadIndex] + ref1 * frictionsBuf[f0].resp1[threadIndex];
+                const float velMultiplier0 = (f0_resp > 0.0f) ? (p8 / f0_resp) : 0.0f;
+
+                const float4 raXn_extraCoeff1 = frictionsBuf[f1].raXn_error[threadIndex];
+                const float4 rbXn_targetVelW1 = frictionsBuf[f1].rbXn_targetVelW[threadIndex];
+                const float initialError1 = raXn_extraCoeff1.w;
+                const float appliedForce1 = frictionsBuf[f1].appliedForce[threadIndex];
+                const float targetVel1 = rbXn_targetVelW1.w;
+                const float f1_resp = ref0 * frictionsBuf[f1].resp0[threadIndex] + ref1 * frictionsBuf[f1].resp1[threadIndex];
+                const float velMultiplier1 = (f1_resp > 0.0f) ? (p8 / f1_resp) : 0.0f;
+
+                const float3 raXn0 = raXn_extraCoeff0.xyz;
+                const float3 rbXn0 = rbXn_targetVelW0.xyz;
+                const float v00 = dot(angVel0, raXn0) + dot(linVel0, normal0);
+                const float v10 = dot(angVel1, rbXn0) + dot(linVel1, normal0);
+                const float normalVel0 = v00 - v10;
+
+                const float error0 = initialError0 - targetVel0 * elapsedTime +
+                                     dot(raXn0, b0AngDelta) - dot(rbXn0, b1AngDelta) + relDelta0;
+
+                const float bias0 = error0 * biasCoefficient;
+                const float tmp10 = appliedForce0 - (bias0 - targetVel0) * velMultiplier0;
+                const float totalImpulse0 = tmp10 - normalVel0 * velMultiplier0;
+
+                const float3 raXn1 = raXn_extraCoeff1.xyz;
+                const float3 rbXn1 = rbXn_targetVelW1.xyz;
+                const float v01 = dot(angVel0, raXn1) + dot(linVel0, normal1);
+                const float v11 = dot(angVel1, rbXn1) + dot(linVel1, normal1);
+                const float normalVel1 = v01 - v11;
+
+                const float error1 = initialError1 - targetVel1 * elapsedTime +
+                                     dot(raXn1, b0AngDelta) - dot(rbXn1, b1AngDelta) + relDelta1;
+
+                const float bias1 = error1 * biasCoefficient;
+                const float tmp11 = appliedForce1 - (bias1 - targetVel1) * velMultiplier1;
+                const float totalImpulse1 = tmp11 - normalVel1 * velMultiplier1;
+
+                const float totalImpulse = sqrt(totalImpulse0 * totalImpulse0 + totalImpulse1 * totalImpulse1);
+
+                const bool clampImpulse = totalImpulse > maxFrictionImpulse;
+                const float ratio = clampImpulse ? min(maxDynFrictionImpulse, totalImpulse) / totalImpulse : 1.0f;
+
+                const float newAppliedForce0 = totalImpulse0 * ratio;
+                const float newAppliedForce1 = totalImpulse1 * ratio;
+
+                const float deltaF0 = newAppliedForce0 - appliedForce0;
+                const float deltaF1 = newAppliedForce1 - appliedForce1;
+
+                if (errorEnabled)
+                {
+                    pxgAccumulateErrorLocal(error, deltaF0, velMultiplier0);
+                    pxgAccumulateErrorLocal(error, deltaF1, velMultiplier1);
+                }
+
+                linVel0 += delLinVel00 * deltaF0;
+                linVel1 -= delLinVel10 * deltaF0;
+                angVel0 += raXn0 * (deltaF0 * angDom0);
+                angVel1 -= rbXn0 * (deltaF0 * angDom1);
+
+                linVel0 += delLinVel01 * deltaF1;
+                linVel1 -= delLinVel11 * deltaF1;
+                angVel0 += raXn1 * (deltaF1 * angDom0);
+                angVel1 -= rbXn1 * (deltaF1 * angDom1);
+
+                frictionsBuf[f0].appliedForce[threadIndex] = newAppliedForce0;
+                frictionsBuf[f1].appliedForce[threadIndex] = newAppliedForce1;
+                broken = broken | (clampImpulse ? 1u : 0u);
+            }
+
+            if (numFrictionConstr < numFrictionConstrTotal)
+            {
+                // We have a torsional friction anchor, solve this...
+                const float frictionScale = frictionHeaders[constraintBatchIndex].torsionalFrictionScale[threadIndex];
+
+                const uint f0 = startFrictionIndex + numFrictionConstr;
+                const float4 raXn_extraCoeff0 = frictionsBuf[f0].raXn_error[threadIndex];
+                const float4 rbXn_targetVelW0 = frictionsBuf[f0].rbXn_targetVelW[threadIndex];
+                const float appliedForce0 = frictionsBuf[f0].appliedForce[threadIndex];
+                const float targetVel0 = rbXn_targetVelW0.w;
+                const float f0_resp = ref0 * frictionsBuf[f0].resp0[threadIndex] + ref1 * frictionsBuf[f0].resp1[threadIndex];
+                const float velMultiplier0 = (f0_resp > 0.0f) ? (p8 / f0_resp) : 0.0f;
+
+                const float3 raXn0 = raXn_extraCoeff0.xyz;
+                const float3 rbXn0 = rbXn_targetVelW0.xyz;
+
+                const float v00 = dot(angVel0, raXn0);
+                const float v10 = dot(angVel1, rbXn0);
+                const float normalVel0 = v00 - v10;
+
+                const float tmp10 = appliedForce0 - (-targetVel0) * velMultiplier0;
+                const float totalImpulse = tmp10 - normalVel0 * velMultiplier0;
+
+                const bool clampImpulse = abs(totalImpulse) > (maxFrictionImpulse * frictionScale);
+                const float totalClamped = clamp(totalImpulse, -maxDynFrictionImpulse * frictionScale,
+                                                 maxDynFrictionImpulse * frictionScale);
+                const float newAppliedForce = clampImpulse ? totalClamped : totalImpulse;
+
+                const float deltaF = newAppliedForce - appliedForce0;
+                if (errorEnabled)
+                    pxgAccumulateErrorLocal(error, deltaF, velMultiplier0);
+
+                angVel0 += raXn0 * (deltaF * angDom0);
+                angVel1 -= rbXn0 * (deltaF * angDom1);
+
+                frictionsBuf[f0].appliedForce[threadIndex] = newAppliedForce;
+                broken = broken | (clampImpulse ? 1u : 0u);
+            }
+
+            frictionHeaders[constraintBatchIndex].broken[threadIndex] = broken;
+        }
+    }
+}
+
+// mirrors solve1DBlockTGS() in solverBlockTGS.cuh — BDA variant of the
+// bound-buffer helper above (identical body, Ptr<> data path)
+void solve1DBlockTGSBda(Ptr<PxgBlockConstraintBatch> batches, uint batchIndex,
+                        inout float3 linVel0, inout float3 angVel0,
+                        inout float3 linVel1, inout float3 angVel1,
+                        float3 linDelta0, float3 angDelta0, float3 linDelta1, float3 angDelta1,
+                        uint threadIndex,
+                        Ptr<PxgTGSBlockSolverConstraint1DHeader> jointHeaders,
+                        Ptr<PxgTGSBlockSolverConstraint1DCon> jointRowsCon,
+                        PxgSolverTxIData iData0, PxgSolverTxIData iData1,
+                        float elapsedTime, bool residualReportingEnabled, float ref0, float ref1)
+{
+    const uint constraintBatchIndex = batches[batchIndex].mConstraintBatchIndex;
+    const uint startConstraintIndex = batches[batchIndex].startConstraintIndex;
+
+    const float4 raInvMass0 = jointHeaders[constraintBatchIndex].rAWorld_invMass0D0[threadIndex];
+    const float4 rbInvMass1 = jointHeaders[constraintBatchIndex].rBWorld_invMass1D1[threadIndex];
+
+    const float invMass0 = ref0 * raInvMass0.w;
+    const float invMass1 = ref1 * rbInvMass1.w;
+
+    const float3 raPrev = raInvMass0.xyz;
+    const float3 rbPrev = rbInvMass1.xyz;
+
+    const float3 ra = quatRotate(iData0.deltaBody2World.q(), raPrev);
+    const float3 rb = quatRotate(iData1.deltaBody2World.q(), rbPrev);
+
+    const float3 raMotion = (ra + linDelta0) - raPrev;
+    const float3 rbMotion = (rb + linDelta1) - rbPrev;
+
+    const float invInertiaScale0 = ref0 * jointHeaders[constraintBatchIndex].invInertiaScale0[threadIndex];
+    const float invInertiaScale1 = ref1 * jointHeaders[constraintBatchIndex].invInertiaScale1[threadIndex];
+
+    const uint rowCounts_breakable_orthoAxisCount = jointHeaders[constraintBatchIndex].rowCounts_breakable_orthoAxisCount[threadIndex];
+    const uint rowCount = rowCounts_breakable_orthoAxisCount & 0xFFu; // uchar4.x
+
+    const float4 ang0Ortho0_recipResponseW = jointHeaders[constraintBatchIndex].angOrthoAxis0_recipResponseW0[threadIndex];
+    const float4 ang0Ortho1_recipResponseW = jointHeaders[constraintBatchIndex].angOrthoAxis0_recipResponseW1[threadIndex];
+    const float4 ang0Ortho2_recipResponseW = jointHeaders[constraintBatchIndex].angOrthoAxis0_recipResponseW2[threadIndex];
+
+    const float4 ang1OrthoAxis0_ErrorW = jointHeaders[constraintBatchIndex].angOrthoAxis1_ErrorW0[threadIndex];
+    const float4 ang1OrthoAxis1_ErrorW = jointHeaders[constraintBatchIndex].angOrthoAxis1_ErrorW1[threadIndex];
+    const float4 ang1OrthoAxis2_ErrorW = jointHeaders[constraintBatchIndex].angOrthoAxis1_ErrorW2[threadIndex];
+
+    const float recipResponse0 = ang0Ortho0_recipResponseW.w;
+    const float recipResponse1 = ang0Ortho1_recipResponseW.w;
+    const float recipResponse2 = ang0Ortho2_recipResponseW.w;
+
+    const float3 ang0Ortho0 = ang0Ortho0_recipResponseW.xyz;
+    const float3 ang0Ortho1 = ang0Ortho1_recipResponseW.xyz;
+    const float3 ang0Ortho2 = ang0Ortho2_recipResponseW.xyz;
+
+    const float3 ang1Ortho0 = ang1OrthoAxis0_ErrorW.xyz;
+    const float3 ang1Ortho1 = ang1OrthoAxis1_ErrorW.xyz;
+    const float3 ang1Ortho2 = ang1OrthoAxis2_ErrorW.xyz;
+
+    const float error0 = ang1OrthoAxis0_ErrorW.w + (dot(ang0Ortho0, angDelta0) - dot(ang1Ortho0, angDelta1));
+    const float error1 = ang1OrthoAxis1_ErrorW.w + (dot(ang0Ortho1, angDelta0) - dot(ang1Ortho1, angDelta1));
+    const float error2 = ang1OrthoAxis2_ErrorW.w + (dot(ang0Ortho2, angDelta0) - dot(ang1Ortho2, angDelta1));
+
+    const PxgMat33 sqrtInvInertia0 = mat33Load(iData0.sqrtInvInertia);
+    const PxgMat33 sqrtInvInertia1 = mat33Load(iData1.sqrtInvInertia);
+
+    for (uint i = 0; i < rowCount; ++i)
+    {
+        const uint r = startConstraintIndex + i;
+
+        const float4 _clinVel0_coeff0W = jointRowsCon[r].lin0XYZ_initBiasOrCoeff0[threadIndex];
+        const float4 _clinVel1_coeff1W = jointRowsCon[r].lin1XYZ_biasScaleOrCoeff1[threadIndex];
+        const float4 _cangVel0_coeff2W = jointRowsCon[r].ang0XYZ_velMultiplierOrCoeff2[threadIndex];
+        const float4 _cangVel1_coeff3W = jointRowsCon[r].ang1XYZ_velTargetOrCoeff3[threadIndex];
+
+        const float3 clinVel0 = _clinVel0_coeff0W.xyz;
+        const float3 clinVel1 = _clinVel1_coeff1W.xyz;
+        const float3 cangVel0_ = _cangVel0_coeff2W.xyz;
+        const float3 cangVel1_ = _cangVel1_coeff3W.xyz;
+
+        float initBias = _clinVel0_coeff0W.w;
+        const float biasScale = _clinVel1_coeff1W.w;
+        const float velMultiplier = _cangVel0_coeff2W.w;
+        const float targetVel = _cangVel1_coeff3W.w;
+
+        const float3 cangVel0 = cangVel0_ + cross(ra, clinVel0);
+        const float3 cangVel1 = cangVel1_ + cross(rb, clinVel1);
+
+        const uint flags = jointRowsCon[r].flags[threadIndex];
+        const float maxBias = jointRowsCon[r].maxBias[threadIndex];
+        const float minBias = computeMinBiasTGS(flags, maxBias);
+
+        float3 raXnI = mat33Transform(sqrtInvInertia0, cangVel0);
+        float3 rbXnI = mat33Transform(sqrtInvInertia1, cangVel1);
+
+        if ((flags & DY_SC_FLAG_ORTHO_TARGET) != 0)
+        {
+            const float proj0 = (dot(raXnI, ang0Ortho0) + dot(rbXnI, ang1Ortho0)) * recipResponse0;
+            const float proj1 = (dot(raXnI, ang0Ortho1) + dot(rbXnI, ang1Ortho1)) * recipResponse1;
+            const float proj2 = (dot(raXnI, ang0Ortho2) + dot(rbXnI, ang1Ortho2)) * recipResponse2;
+
+            const float3 delta0 = ang0Ortho0 * proj0 + ang0Ortho1 * proj1 + ang0Ortho2 * proj2;
+            const float3 delta1 = ang1Ortho0 * proj0 + ang1Ortho1 * proj1 + ang1Ortho2 * proj2;
+
+            raXnI -= delta0;
+            rbXnI -= delta1;
+
+            const float orthoBasisError = biasScale * (error0 * proj0 + error1 * proj1 + error2 * proj2);
+            initBias -= orthoBasisError;
+        }
+
+        // If biasScale is zero, initBias must also be zero (velocity iterations).
+        initBias = (biasScale == 0.0f) ? 0.0f : initBias;
+
+        const bool isSpringConstraint = (flags & DY_SC_FLAG_SPRING) != 0;
+
+        const float errorDelta = computeResolvedGeometricErrorTGS(raMotion, rbMotion, clinVel0, clinVel1,
+                                                                  angDelta0, angDelta1, raXnI, rbXnI,
+                                                                  jointRowsCon[r].angularErrorScale[threadIndex],
+                                                                  isSpringConstraint, targetVel, elapsedTime);
+
+        const float resp0 = invMass0 * dot(clinVel0, clinVel0) + dot(raXnI, raXnI) * invInertiaScale0;
+        const float resp1 = invMass1 * dot(clinVel1, clinVel1) + dot(rbXnI, rbXnI) * invInertiaScale1;
+
+        const float response = resp0 + resp1;
+        const float recipResponse = response > 0.0f ? 1.0f / response : 0.0f;
+
+        const float vMul = isSpringConstraint ? velMultiplier : recipResponse * velMultiplier;
+
+        const float unclampedBias = initBias + errorDelta * biasScale;
+        const float bias = clamp(unclampedBias, minBias, maxBias);
+
+        const float constant = isSpringConstraint ? bias + targetVel : recipResponse * (bias + targetVel);
+
+        const float appliedForce = jointRowsCon[r].appliedForce[threadIndex];
+        const float maxImpulse = jointRowsCon[r].maxImpulse[threadIndex];
+        const float minImpulse = jointRowsCon[r].minImpulse[threadIndex];
+
+        const float v0 = dot(linVel0, clinVel0) + dot(angVel0, raXnI);
+        const float v1 = dot(linVel1, clinVel1) + dot(angVel1, rbXnI);
+        const float normalVel = v0 - v1;
+
+        const float unclampedForce = appliedForce + (vMul * normalVel + constant);
+        const float clampedForce = min(maxImpulse, max(minImpulse, unclampedForce));
+        const float deltaF = clampedForce - appliedForce;
+
+        jointRowsCon[r].appliedForce[threadIndex] = clampedForce;
+        if (residualReportingEnabled)
+            jointRowsCon[r].residual[threadIndex] = vMul == 0.0f ? 0.0f : deltaF / vMul;
+
+        linVel0 = linVel0 + clinVel0 * (deltaF * invMass0);
+        linVel1 = linVel1 - clinVel1 * (deltaF * invMass1);
+        angVel0 = angVel0 + raXnI * deltaF * invInertiaScale0;
+        angVel1 = angVel1 - rbXnI * deltaF * invInertiaScale1;
+    }
+}
+
+// See the maxBodies deviation note above: 640 body-slabs, flat float[3n]
+// staging arrays (30720 B) + the 1 KiB residual counter scratch = 31744 B.
+static const uint PXG_WHOLE_ISLAND_MAX_BODIES = 640;
+groupshared float shWholeIslandLinVel[PXG_WHOLE_ISLAND_MAX_BODIES * 3];
+groupshared float shWholeIslandAngVel[PXG_WHOLE_ISLAND_MAX_BODIES * 3];
+groupshared float shWholeIslandLinDelta[PXG_WHOLE_ISLAND_MAX_BODIES * 3];
+groupshared float shWholeIslandAngDelta[PXG_WHOLE_ISLAND_MAX_BODIES * 3];
+// residual-reduction integer scratch; the float lanes of the reduction reuse
+// the then-dead LinVel/AngVel staging arrays (shared budget is tight)
+groupshared uint shWholeIslandErrCounter[256];
+
+float3 wiLoadLinVel(uint i)   { return float3(shWholeIslandLinVel[3 * i], shWholeIslandLinVel[3 * i + 1], shWholeIslandLinVel[3 * i + 2]); }
+float3 wiLoadAngVel(uint i)   { return float3(shWholeIslandAngVel[3 * i], shWholeIslandAngVel[3 * i + 1], shWholeIslandAngVel[3 * i + 2]); }
+float3 wiLoadLinDelta(uint i) { return float3(shWholeIslandLinDelta[3 * i], shWholeIslandLinDelta[3 * i + 1], shWholeIslandLinDelta[3 * i + 2]); }
+float3 wiLoadAngDelta(uint i) { return float3(shWholeIslandAngDelta[3 * i], shWholeIslandAngDelta[3 * i + 1], shWholeIslandAngDelta[3 * i + 2]); }
+void wiStoreLinVel(uint i, float3 v)   { shWholeIslandLinVel[3 * i] = v.x; shWholeIslandLinVel[3 * i + 1] = v.y; shWholeIslandLinVel[3 * i + 2] = v.z; }
+void wiStoreAngVel(uint i, float3 v)   { shWholeIslandAngVel[3 * i] = v.x; shWholeIslandAngVel[3 * i + 1] = v.y; shWholeIslandAngVel[3 * i + 2] = v.z; }
+void wiStoreLinDelta(uint i, float3 v) { shWholeIslandLinDelta[3 * i] = v.x; shWholeIslandLinDelta[3 * i + 1] = v.y; shWholeIslandLinDelta[3 * i + 2] = v.z; }
+void wiStoreAngDelta(uint i, float3 v) { shWholeIslandAngDelta[3 * i] = v.x; shWholeIslandAngDelta[3 * i + 1] = v.y; shWholeIslandAngDelta[3 * i + 2] = v.z; }
+
+// mirrors solveWholeIslandTGS() in solverMultiBlockTGS.cu; fixed launch shape
+// grid (1,1,1) x block (256,1,1).
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void solveWholeIslandTGS(uint3 groupThreadId : SV_GroupThreadID)
+{
+    Ptr<PxgSolverCoreDescGpu> descPtr = Ptr<PxgSolverCoreDescGpu>(gWholeIslandAbi.solverCoreDesc);
+    PxgSolverCoreDescGpu desc = descPtr[0];
+    PxgSolverSharedDescTGSGpu sharedDesc = (Ptr<PxgSolverSharedDescTGSGpu>(gWholeIslandAbi.sharedDesc))[0];
+    PxgIslandContextGpu island =
+        (Ptr<PxgIslandContextGpu>(desc.islandContextPool))[gWholeIslandAbi.islandIndex];
+
+
+    const uint startPartitionIndex = island.mStartPartitionIndex;
+
+    const uint numDynamicBodies = island.mBodyCount; // nbBodies minus offset!
+
+    const uint bodyOffset = island.mBodyStartIndex;
+
+    Ptr<float4> bodyVelocities = Ptr<float4>(sharedDesc.iter_solverBodyVelPool);
+    Ptr<PxgBlockConstraintBatch> batches = Ptr<PxgBlockConstraintBatch>(sharedDesc.iter_blockConstraintBatch);
+    Ptr<PxgTGSBlockSolverContactHeader> contactHeaders =
+        Ptr<PxgTGSBlockSolverContactHeader>(sharedDesc.iter_blockContactHeaders);
+    Ptr<PxgTGSBlockSolverFrictionHeader> frictionHeaders =
+        Ptr<PxgTGSBlockSolverFrictionHeader>(sharedDesc.iter_blockFrictionHeaders);
+    Ptr<PxgTGSBlockSolverContactPoint> contactPoints =
+        Ptr<PxgTGSBlockSolverContactPoint>(sharedDesc.iter_blockContactPoints);
+    Ptr<PxgTGSBlockSolverContactFriction> frictionsBuf =
+        Ptr<PxgTGSBlockSolverContactFriction>(sharedDesc.iter_blockFrictions);
+    Ptr<PxgTGSBlockSolverConstraint1DHeader> jointHeaders =
+        Ptr<PxgTGSBlockSolverConstraint1DHeader>(sharedDesc.iter_blockJointConstraintHeaders);
+    Ptr<PxgTGSBlockSolverConstraint1DCon> jointRowsCon =
+        Ptr<PxgTGSBlockSolverConstraint1DCon>(sharedDesc.iter_blockJointConstraintRowsCon);
+    Ptr<uint> encodedReferenceCount = Ptr<uint>(sharedDesc.iter_solverEncodedReferenceCount);
+    Ptr<PxgSolverTxIData> iData = Ptr<PxgSolverTxIData>(desc.solverBodyTxIDataPool);
+    Ptr<uint> constraintsPerPartition = Ptr<uint>(desc.constraintsPerPartition);
+    Ptr<uint> solverBodyReferences = Ptr<uint>(desc.solverBodyReferences); // PxgSolverReferences
+
+    uint startIndex = island.mBatchStartIndex;
+
+    const uint threadIdxX = groupThreadId.x;
+    const uint warpIndex = threadIdxX / 32;
+    const uint threadIndexInWarp = threadIdxX & 31;
+    const uint numWarps = 256 / 32;
+
+    const uint deltaVOffset = desc.accumulatedBodyDeltaVOffset;
+    const uint totalBodiesIncKinematics = numDynamicBodies + bodyOffset;
+
+    const uint numSlabs = desc.numSlabs;
+    const uint numBatches = desc.numBatches;
+    const uint numArticBatches = desc.numArticBatches;
+
+    const uint averageOutputOffsets = (numArticBatches + numBatches) * 32u * 3u * 2u; // PXG_BATCH_SIZE = 32
+
+    for (uint index = threadIdxX; index < (totalBodiesIncKinematics * numSlabs); index += 256)
+    {
+        const uint inputBody = deltaVOffset + (index % totalBodiesIncKinematics);
+        const float4 vel0 = bodyVelocities[inputBody];
+        const float4 vel1 = bodyVelocities[inputBody + totalBodiesIncKinematics];
+        const float4 vel2 = bodyVelocities[inputBody + totalBodiesIncKinematics + totalBodiesIncKinematics];
+
+        const uint writeIndex = index;
+
+        wiStoreLinVel(writeIndex, vel0.xyz);
+        wiStoreAngVel(writeIndex, float3(vel0.w, vel1.x, vel1.y));
+        wiStoreLinDelta(writeIndex, float3(vel1.z, vel1.w, vel2.x));
+        wiStoreAngDelta(writeIndex, float3(vel2.y, vel2.z, vel2.w));
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    const bool residualAccumulationEnabled = desc.contactErrorAccumulator_mCounter >= 0;
+    PxgErrorAccumulatorSlang error = { 0.0f, 0, 0.0f };
+
+    // The constraint-solve loops dereference the block-constraint buffers
+    // (batches[k], contact/joint headers, …).  For a constraint-free island
+    // (mNumPartitions == 0, e.g. a body in free fall) PhysX leaves those
+    // device pointers null/unallocated.  The loops are then zero-trip and the
+    // CUDA kernel never dereferences them — but the SPIR-V/llvmpipe optimizer
+    // speculatively hoists the first batches[] load out of the zero-trip loop,
+    // dereferencing the null pointer and faulting.  Gating the whole section on
+    // a non-null batch pointer makes every such load control-dependent on the
+    // guard (un-hoistable) and is semantically exact: no batch buffer == no
+    // constraint batches to solve.
+    if (sharedDesc.iter_blockConstraintBatch != 0)
+    {
+    for (uint partitionIndex = 0; partitionIndex < island.mNumPartitions; ++partitionIndex)
+    {
+        const uint endIndex = constraintsPerPartition[partitionIndex + startPartitionIndex];
+
+        for (uint k = startIndex + warpIndex; k < endIndex; k += numWarps)
+        {
+            const uint descStride = batches[k].descStride_constraintType & 0xFFFFu;
+            const uint constraintType = batches[k].descStride_constraintType >> 16;
+
+            const uint bodyAIndex = batches[k].bodyAIndex[threadIndexInWarp];
+            const uint bodyBIndex = batches[k].bodyBIndex[threadIndexInWarp];
+
+            const uint slabId = batches[k].slabId[threadIndexInWarp];
+
+            // zero-init: only read on the joint path, where they are loaded below
+            PxgSolverTxIData iData0 = {};
+            PxgSolverTxIData iData1 = {};
+            if (constraintType != PXG_CONSTRAINT_CONTACT && threadIndexInWarp < descStride)
+            {
+                // CUDA stages these through warp shuffles (loadTxInertia)
+                // purely for memory coalescing; direct loads are semantically
+                // identical.  Gated on the live lanes: the tail lanes'
+                // bodyA/BIndex is uninitialized batch memory.
+                iData0 = iData[bodyAIndex];
+                iData1 = iData[bodyBIndex];
+            }
+
+            // Pull out shared memory into registers to solve constraints
+            if (threadIndexInWarp < descStride)
+            {
+                const uint readIndexA = bodyAIndex + slabId * totalBodiesIncKinematics;
+                const uint readIndexB = bodyBIndex + slabId * totalBodiesIncKinematics;
+
+                float3 linVel0 = wiLoadLinVel(readIndexA);
+                float3 angVel0 = wiLoadAngVel(readIndexA);
+                const float3 linDelta0 = wiLoadLinDelta(readIndexA);
+                const float3 angDelta0 = wiLoadAngDelta(readIndexA);
+
+                float3 linVel1 = wiLoadLinVel(readIndexB);
+                float3 angVel1 = wiLoadAngVel(readIndexB);
+                const float3 linDelta1 = wiLoadLinDelta(readIndexB);
+                const float3 angDelta1 = wiLoadAngDelta(readIndexB);
+
+                float curRef0 = 1.0f;
+                float curRef1 = 1.0f;
+
+                const uint numTotalBodies = bodyOffset + numDynamicBodies + island.mArticulationCount;
+
+                if (bodyAIndex >= bodyOffset)
+                {
+                    // Counting the number of active slabs
+                    curRef0 = float(countActiveSlabsBda(bodyAIndex, desc.numSlabs, numTotalBodies,
+                                                        encodedReferenceCount));
+                }
+
+                if (bodyBIndex >= bodyOffset)
+                {
+                    // Counting the number of active slabs
+                    curRef1 = float(countActiveSlabsBda(bodyBIndex, desc.numSlabs, numTotalBodies,
+                                                        encodedReferenceCount));
+                }
+
+                if (constraintType == PXG_CONSTRAINT_CONTACT)
+                    solveContactBlockTGSBda(batches, k, linVel0, angVel0, linVel1, angVel1,
+                                            linDelta0, angDelta0, linDelta1, angDelta1,
+                                            threadIndexInWarp, contactHeaders, frictionHeaders,
+                                            contactPoints, frictionsBuf, gWholeIslandAbi.elapsedTime,
+                                            gWholeIslandAbi.minPen, residualAccumulationEnabled, error,
+                                            curRef0, curRef1);
+                else
+                    solve1DBlockTGSBda(batches, k, linVel0, angVel0, linVel1, angVel1,
+                                       linDelta0, angDelta0, linDelta1, angDelta1,
+                                       threadIndexInWarp, jointHeaders, jointRowsCon, iData0, iData1,
+                                       gWholeIslandAbi.elapsedTime,
+                                       desc.contactErrorAccumulator_mCounter >= 0, curRef0, curRef1);
+
+                wiStoreLinVel(readIndexA, linVel0);
+                wiStoreAngVel(readIndexA, angVel0);
+
+                wiStoreLinVel(readIndexB, linVel1);
+                wiStoreAngVel(readIndexB, angVel1);
+            }
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        startIndex = endIndex;
+    }
+    } // if (iter_blockConstraintBatch != 0)
+
+    // Get here, write out to accumulation buffers...
+
+    for (uint index = threadIdxX; index < (numDynamicBodies * numSlabs); index += 256)
+    {
+        const uint bodyId = index / numSlabs;
+        const uint slabId = index % numSlabs;
+        const uint bodyIndex = index;
+
+        const uint remappedBodyIndex = solverBodyReferences[bodyIndex]; // PxgSolverReferences
+
+        if (remappedBodyIndex != 0xFFFFFFFFu)
+        {
+            const uint velIndex = averageOutputOffsets + computeAverageBodyOutputIndex(bodyIndex);
+
+            const uint readIndex = bodyId + bodyOffset + slabId * totalBodiesIncKinematics;
+
+            const float3 linVel0 = wiLoadLinVel(readIndex);
+            const float3 angVel0 = wiLoadAngVel(readIndex);
+            const float3 linDelta0 = wiLoadLinDelta(readIndex);
+            const float3 angDelta0 = wiLoadAngDelta(readIndex);
+
+            bodyVelocities[velIndex] = float4(linVel0, angVel0.x);
+            bodyVelocities[velIndex + 32] = float4(angVel0.y, angVel0.z, linDelta0.x, linDelta0.y);
+            bodyVelocities[velIndex + 64] = float4(linDelta0.z, angDelta0.x, angDelta0.y, angDelta0.z);
+        }
+    }
+
+    // PxgErrorAccumulator::accumulateErrorGlobalFullWarp(): a per-warp
+    // sum/sum/max butterfly reduction, then lane 0 of each warp accumulates
+    // into solverDesc->contactErrorAccumulator.  The reduction runs
+    // unconditionally so every barrier sits in uniform control flow (a
+    // disabled launch reduces zeros and skips the atomics — identical
+    // observable behavior to the CUDA `if (residualAccumulationEnabled)`
+    // around the whole call).  Scratch: the staging arrays are dead now that
+    // the writeout loop above has completed.
+    GroupMemoryBarrierWithGroupSync();
+    shWholeIslandLinVel[threadIdxX] = error.sumOfSquares;
+    shWholeIslandAngVel[threadIdxX] = error.maxError;
+    shWholeIslandErrCounter[threadIdxX] = uint(error.counter);
+    GroupMemoryBarrierWithGroupSync();
+
+    // the __shfl_xor butterfly of warpReduction<OP, T, 5> (radius 16..1)
+    for (uint radius = 16; radius > 0; radius >>= 1)
+    {
+        const uint partner = threadIdxX ^ radius; // stays inside the warp's 32 lanes
+        const float s = shWholeIslandLinVel[partner];
+        const float m = shWholeIslandAngVel[partner];
+        const uint c = shWholeIslandErrCounter[partner];
+        GroupMemoryBarrierWithGroupSync();
+        shWholeIslandLinVel[threadIdxX] += s;
+        shWholeIslandAngVel[threadIdxX] = max(shWholeIslandAngVel[threadIdxX], m);
+        shWholeIslandErrCounter[threadIdxX] += c;
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (residualAccumulationEnabled && threadIndexInWarp == 0)
+    {
+        const float sumSq = shWholeIslandLinVel[threadIdxX];
+        const uint count = shWholeIslandErrCounter[threadIdxX];
+        const float maxErr = shWholeIslandAngVel[threadIdxX];
+
+        // atomicAdd(&mErrorSumOfSquares, s): float atomic add emulated with a
+        // CAS loop on the raw bits (the mirror holds the field as uint)
+        uint assumed = descPtr[0].contactErrorAccumulator_mErrorSumOfSquares;
+        for (;;)
+        {
+            const uint newBits = asuint(asfloat(assumed) + sumSq);
+            uint old;
+            InterlockedCompareExchange(descPtr[0].contactErrorAccumulator_mErrorSumOfSquares, assumed,
+                                       newBits, old);
+            if (old == assumed)
+                break;
+            assumed = old;
+        }
+
+        // atomicAdd(&mCounter, count)
+        int oldCount;
+        InterlockedAdd(descPtr[0].contactErrorAccumulator_mCounter, int(count), oldCount);
+
+        // if (maxErr > mMaxError) AtomicMax(&mMaxError, maxErr) — the CUDA
+        // AtomicMax(float*) is itself a CAS loop; the pre-test read is
+        // non-atomic exactly like the .cu.
+        if (maxErr > asfloat(descPtr[0].contactErrorAccumulator_mMaxError))
+        {
+            assumed = descPtr[0].contactErrorAccumulator_mMaxError;
+            for (;;)
+            {
+                const uint newBits = asuint(max(maxErr, asfloat(assumed)));
+                uint old;
+                InterlockedCompareExchange(descPtr[0].contactErrorAccumulator_mMaxError, assumed,
+                                           newBits, old);
+                if (old == assumed)
+                    break;
+                assumed = old;
+            }
+        }
     }
 }
