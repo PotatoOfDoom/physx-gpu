@@ -92,6 +92,11 @@ static const uint8_t kIntegrateTGS[] = { 4, 8, 8, 8, 8, 8 };
 //   updateShapesLaunch(const PxgNewShapeSim*, PxgShapeSim*, PxU32 nbNewShapes)
 static const uint8_t kUpdateShapes[] = { 8, 8, 4 };
 
+// gpunarrowphase cudaBox.cu: boxBoxNphase_Kernel(PxU32 numTests, 14 device
+//   pointers, PxU32 patchBytesLimit, contactBytesLimit, forceBytesLimit,
+//   PxReal toleranceLength) — the box-vs-box contact generator.
+static const uint8_t kBoxBoxNphase[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4 };
+
 // gpunarrowphase convex-convex core (cudaGJKEPA.cu):
 //   convexConvexNphase_stage1Kernel(PxU32 numTests, PxReal toleranceLength,
 //     cmInputs*, transformCache*, shapes*, cmManifolds*, tempKeepPairArray*)
@@ -170,6 +175,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "finishContactsKernel", kFinishContacts, uint32_t(sizeof(kFinishContacts)) },
     { "compressContactStage1", kCompress1, uint32_t(sizeof(kCompress1)) },
     { "compressContactStage2", kCompress2, uint32_t(sizeof(kCompress2)) },
+    { "boxBoxNphase_Kernel", kBoxBoxNphase, uint32_t(sizeof(kBoxBoxNphase)) },
 };
 
 inline size_t abiAlign(size_t size)
