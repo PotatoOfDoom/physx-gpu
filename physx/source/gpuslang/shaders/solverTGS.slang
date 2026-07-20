@@ -930,43 +930,48 @@ void concludeBlocksTGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : S
 }
 
 // mirrors writeBackContactBlockFriction() in solverBlockCommon.cuh (TGS
-// header/friction types)
-void writeBackContactBlockFrictionTGS(uint threadIndex, uint numFrictionConstr, uint batchIndex,
-                                      uint startFrictionIndex)
+// header/friction types).  BDA form: the friction/patch pools are reached
+// through Ptr<> off the descriptors instead of the bound-buffer globals.
+void writeBackContactBlockFrictionTGSBda(
+    uint threadIndex, uint numFrictionConstr, uint batchIndex, uint startFrictionIndex,
+    Ptr<PxgTGSBlockSolverFrictionHeader> frictionHeaders,
+    Ptr<PxgTGSBlockSolverContactFriction> frictions,
+    Ptr<PxgBlockFrictionPatch> blockFrictionPatches,
+    Ptr<PxgFrictionPatchGPU> frictionPatches)
 {
-    const uint patchIndex = gBlockFrictionPatches[batchIndex].patchIndex[threadIndex];
+    const uint patchIndex = blockFrictionPatches[batchIndex].patchIndex[threadIndex];
     if (patchIndex != 0xFFFFFFFFu)
     {
-        const float4 axis0 = gFrictionHeaders[batchIndex].frictionNormals0[threadIndex];
-        const float4 axis1 = gFrictionHeaders[batchIndex].frictionNormals1[threadIndex];
+        const float4 axis0 = frictionHeaders[batchIndex].frictionNormals0[threadIndex];
+        const float4 axis1 = frictionHeaders[batchIndex].frictionNormals1[threadIndex];
 
-        gFrictionPatches[patchIndex].anchors = numFrictionConstr / 2;
+        frictionPatches[patchIndex].anchors = numFrictionConstr / 2;
 
         if (numFrictionConstr >= 2)
         {
-            const float4 anchor = gBlockFrictionPatches[batchIndex].anchorPoints0[threadIndex];
-            const float impulse0 = gFrictions[startFrictionIndex + 0].appliedForce[threadIndex];
-            const float impulse1 = gFrictions[startFrictionIndex + 1].appliedForce[threadIndex];
+            const float4 anchor = blockFrictionPatches[batchIndex].anchorPoints0[threadIndex];
+            const float impulse0 = frictions[startFrictionIndex + 0].appliedForce[threadIndex];
+            const float impulse1 = frictions[startFrictionIndex + 1].appliedForce[threadIndex];
             const float3 imp = axis0.xyz * impulse0 + axis1.xyz * impulse1;
-            gFrictionPatches[patchIndex].p0x = anchor.x;
-            gFrictionPatches[patchIndex].p0y = anchor.y;
-            gFrictionPatches[patchIndex].p0z = anchor.z;
-            gFrictionPatches[patchIndex].i0x = imp.x;
-            gFrictionPatches[patchIndex].i0y = imp.y;
-            gFrictionPatches[patchIndex].i0z = imp.z;
+            frictionPatches[patchIndex].p0x = anchor.x;
+            frictionPatches[patchIndex].p0y = anchor.y;
+            frictionPatches[patchIndex].p0z = anchor.z;
+            frictionPatches[patchIndex].i0x = imp.x;
+            frictionPatches[patchIndex].i0y = imp.y;
+            frictionPatches[patchIndex].i0z = imp.z;
         }
         if (numFrictionConstr >= 4)
         {
-            const float4 anchor = gBlockFrictionPatches[batchIndex].anchorPoints1[threadIndex];
-            const float impulse0 = gFrictions[startFrictionIndex + 2].appliedForce[threadIndex];
-            const float impulse1 = gFrictions[startFrictionIndex + 3].appliedForce[threadIndex];
+            const float4 anchor = blockFrictionPatches[batchIndex].anchorPoints1[threadIndex];
+            const float impulse0 = frictions[startFrictionIndex + 2].appliedForce[threadIndex];
+            const float impulse1 = frictions[startFrictionIndex + 3].appliedForce[threadIndex];
             const float3 imp = axis0.xyz * impulse0 + axis1.xyz * impulse1;
-            gFrictionPatches[patchIndex].p1x = anchor.x;
-            gFrictionPatches[patchIndex].p1y = anchor.y;
-            gFrictionPatches[patchIndex].p1z = anchor.z;
-            gFrictionPatches[patchIndex].i1x = imp.x;
-            gFrictionPatches[patchIndex].i1y = imp.y;
-            gFrictionPatches[patchIndex].i1z = imp.z;
+            frictionPatches[patchIndex].p1x = anchor.x;
+            frictionPatches[patchIndex].p1y = anchor.y;
+            frictionPatches[patchIndex].p1z = anchor.z;
+            frictionPatches[patchIndex].i1x = imp.x;
+            frictionPatches[patchIndex].i1y = imp.y;
+            frictionPatches[patchIndex].i1z = imp.z;
         }
     }
 }
@@ -977,61 +982,129 @@ bool nodeIndexLess(uint2 a, uint2 b)
     return a.y < b.y || (a.y == b.y && a.x < b.x);
 }
 
-// mirrors writebackBlocksTGS() in solverMultiBlockTGS.cu (rigid path).  Like
-// the PGS port, threshold elements are appended per-thread instead of through
-// the CUDA warp-aggregated shared-memory staging — the stream contents are
-// identical, ordering within the stream is nondeterministic in both versions.
+// writebackBlocksTGS (P5 Step 4 BDA engine ABI)
+//
+// Port of writebackBlocksTGS() in solverMultiBlockTGS.cu (rigid path).  The
+// engine launches it with (PxgSolverCoreDesc*, const PxgSolverSharedDesc<...>*,
+// PxU32 islandIndex): argSizes {8,8,4} -> 24-byte blob.  Everything the harness
+// form read from gParams / bound buffers is now derived from the descriptors
+// via Ptr<>; the batch start/end range is derived from the island context
+// exactly like the .cu.  One warp per batch, block = WRITEBACK_BLOCKS (256)
+// threads = 8 warps, grid = nbBlocksRequired (WorkgroupCount().x), so the GLOBAL
+// warp index selects the batch, mirroring concludeBlocksTGS.
+//
+// Deviations from the .cu:
+//  - The contact discriminator uses the engine's PxgConstraintType encoding
+//    (contact == eCONTACT(1) / eARTICULATION_CONTACT(3) via pxgIsContactType),
+//    NOT the harness kernels' inverted PXG_CONSTRAINT_CONTACT=0 convention.
+//  - Threshold elements are appended per-thread through an atomic on the desc's
+//    sharedThresholdStreamIndex counter instead of the CUDA warp-aggregated
+//    shared-memory staging (the __shared__ ThresholdStreamElement blob + warp
+//    prefix): the stream CONTENTS are identical, and the intra-stream ordering
+//    is nondeterministic in both versions, so no warp/ballot reduction and no
+//    large groupshared blob are needed (keeps well under the 32 KiB budget).
+struct WritebackBlocksTGSAbiParams
+{
+    uint64_t solverCoreDesc; // @0
+    uint64_t sharedDesc;     // @8
+    uint islandIndex;        // @16
+}                            // = 24 (round to maxAlign 8)
+[[vk::push_constant]]
+ConstantBuffer<WritebackBlocksTGSAbiParams> gWritebackAbi;
+
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(256, 1, 1)]
 void writebackBlocksTGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
-    const uint threadIndex = groupThreadId.x;
-    const uint k = gParams.startIndex + groupId.x;
+    Ptr<PxgSolverCoreDescGpu> descPtr = Ptr<PxgSolverCoreDescGpu>(gWritebackAbi.solverCoreDesc);
+    PxgSolverCoreDescGpu desc = descPtr[0];
+    PxgSolverSharedDescTGSGpu sharedDesc =
+        (Ptr<PxgSolverSharedDescTGSGpu>(gWritebackAbi.sharedDesc))[0];
+    PxgIslandContextGpu island =
+        (Ptr<PxgIslandContextGpu>(desc.islandContextPool))[gWritebackAbi.islandIndex];
 
-    if (k >= gParams.endIndex)
+    const uint startIndex = island.mBatchStartIndex;
+    // endIndex mirrors the .cu: mBatchCount + mArtiBatchCount +
+    // mStaticArtiBatchCount + mSelfArtiBatchCount + mStaticRigidBatchCount +
+    // startIndex.
+    const uint endIndex = island.mBatchCount + island.mArtiBatchCount +
+        island.mStaticArtiBatchCount + island.mSelfArtiBatchCount +
+        island.mStaticRigidBatchCount + startIndex;
+
+    const uint warpSize = 32u;
+    const uint warpIndex = (groupThreadId.x + groupId.x * 256u) / warpSize;
+    const uint threadIndex = groupThreadId.x & (warpSize - 1u);
+
+    const uint k = startIndex + warpIndex;
+    if (k >= endIndex)
         return;
 
-    const uint descStride = gBatches[k].descStride_constraintType & 0xFFFFu;
-    const uint constraintType = gBatches[k].descStride_constraintType >> 16;
+    // Null-guard (llvmpipe): a constraint-free island leaves the block-batch
+    // pointer null/unallocated; the LLVM optimizer would speculatively hoist
+    // the batch load above the range check and fault.  No batch buffer ==
+    // nothing to write back.
+    if (sharedDesc.iter_blockConstraintBatch == 0)
+        return;
+
+    Ptr<PxgBlockConstraintBatch> batchHeaders =
+        Ptr<PxgBlockConstraintBatch>(sharedDesc.iter_blockConstraintBatch);
+
+    const uint descStride = batchHeaders[k].descStride_constraintType & 0xFFFFu;
+    const uint constraintType = batchHeaders[k].descStride_constraintType >> 16;
     if (threadIndex >= descStride)
         return;
 
-    const uint batchIndex = gBatches[k].mConstraintBatchIndex;
-    const uint startConstraintIndex = gBatches[k].startConstraintIndex;
-    const uint startFrictionIndex = gBatches[k].startFrictionIndex;
+    const uint batchIndex = batchHeaders[k].mConstraintBatchIndex;
+    const uint startConstraintIndex = batchHeaders[k].startConstraintIndex;
+    const uint startFrictionIndex = batchHeaders[k].startFrictionIndex;
 
-    if (constraintType == PXG_CONSTRAINT_CONTACT)
+    if (pxgIsContactType(constraintType))
     {
         // writeBackContactBlockTGS()
-        const uint bodyAIndex = gBatches[k].bodyAIndex[threadIndex];
-        const uint bodyBIndex = gBatches[k].bodyBIndex[threadIndex];
+        Ptr<PxgTGSBlockSolverContactHeader> contactHeaders =
+            Ptr<PxgTGSBlockSolverContactHeader>(sharedDesc.iter_blockContactHeaders);
+        Ptr<PxgTGSBlockSolverFrictionHeader> frictionHeaders =
+            Ptr<PxgTGSBlockSolverFrictionHeader>(sharedDesc.iter_blockFrictionHeaders);
+        Ptr<PxgTGSBlockSolverContactPoint> contactPoints =
+            Ptr<PxgTGSBlockSolverContactPoint>(sharedDesc.iter_blockContactPoints);
+        Ptr<PxgTGSBlockSolverContactFriction> frictions =
+            Ptr<PxgTGSBlockSolverContactFriction>(sharedDesc.iter_blockFrictions);
+        Ptr<PxgBlockFrictionPatch> blockFrictionPatches =
+            Ptr<PxgBlockFrictionPatch>(sharedDesc.blockCurrentFrictionPatches);
+        Ptr<float> forceBuffer = Ptr<float>(desc.forceBuffer);
+        Ptr<PxgFrictionPatchGPU> frictionPatches = Ptr<PxgFrictionPatchGPU>(desc.frictionPatches);
+        Ptr<PxgSolverBodyData> solverBodyData = Ptr<PxgSolverBodyData>(desc.solverBodyDataPool);
+
+        const uint bodyAIndex = batchHeaders[k].bodyAIndex[threadIndex];
+        const uint bodyBIndex = batchHeaders[k].bodyBIndex[threadIndex];
 
         float normalForce = 0.0f;
 
-        const uint forceWritebackOffset = gContactHeaders[batchIndex].forceWritebackOffset[threadIndex];
+        const uint forceWritebackOffset = contactHeaders[batchIndex].forceWritebackOffset[threadIndex];
         const bool forceThreshold =
-            (gContactHeaders[batchIndex].flags[threadIndex] & PXG_CONTACT_FLAG_HAS_FORCE_THRESHOLDS) != 0;
+            (contactHeaders[batchIndex].flags[threadIndex] & PXG_CONTACT_FLAG_HAS_FORCE_THRESHOLDS) != 0;
 
-        const uint numFrictionConstr = gFrictionHeaders[batchIndex].numFrictionConstr[threadIndex];
-        const uint numNormalConstr = gContactHeaders[batchIndex].numNormalConstr[threadIndex];
+        const uint numFrictionConstr = frictionHeaders[batchIndex].numFrictionConstr[threadIndex];
+        const uint numNormalConstr = contactHeaders[batchIndex].numNormalConstr[threadIndex];
 
         if (forceWritebackOffset != 0xFFFFFFFFu)
         {
             for (uint i = 0; i < numNormalConstr; i++)
             {
-                const float appliedForce = gContactPoints[startConstraintIndex + i].appliedForce[threadIndex];
-                gForceBuffer[forceWritebackOffset + i] = appliedForce;
+                const float appliedForce = contactPoints[startConstraintIndex + i].appliedForce[threadIndex];
+                forceBuffer[forceWritebackOffset + i] = appliedForce;
                 normalForce += appliedForce;
             }
         }
 
-        writeBackContactBlockFrictionTGS(threadIndex, numFrictionConstr, batchIndex, startFrictionIndex);
+        writeBackContactBlockFrictionTGSBda(threadIndex, numFrictionConstr, batchIndex, startFrictionIndex,
+                                            frictionHeaders, frictions, blockFrictionPatches, frictionPatches);
 
-        if (numFrictionConstr != 0 && gFrictionHeaders[batchIndex].broken[threadIndex] != 0)
-            gBlockFrictionPatches[batchIndex].broken[threadIndex] = 1;
+        if (numFrictionConstr != 0 && frictionHeaders[batchIndex].broken[threadIndex] != 0)
+            blockFrictionPatches[batchIndex].broken[threadIndex] = 1;
 
-        const float reportThreshold0 = gSolverBodyData[bodyAIndex].reportThreshold;
-        const float reportThreshold1 = gSolverBodyData[bodyBIndex].reportThreshold;
+        const float reportThreshold0 = solverBodyData[bodyAIndex].reportThreshold;
+        const float reportThreshold1 = solverBodyData[bodyBIndex].reportThreshold;
 
         if (forceThreshold && normalForce != 0.0f &&
             (reportThreshold0 < PX_MAX_F32 || reportThreshold1 < PX_MAX_F32))
@@ -1039,8 +1112,8 @@ void writebackBlocksTGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : 
             ThresholdStreamElement elt;
             elt.normalForce = normalForce;
             elt.threshold = min(reportThreshold0, reportThreshold1);
-            uint2 nodeA = gSolverBodyData[bodyAIndex].islandNodeIndex;
-            uint2 nodeB = gSolverBodyData[bodyBIndex].islandNodeIndex;
+            uint2 nodeA = solverBodyData[bodyAIndex].islandNodeIndex;
+            uint2 nodeB = solverBodyData[bodyBIndex].islandNodeIndex;
             // PxOrder(): swap so nodeIndexA < nodeIndexB
             if (nodeIndexLess(nodeB, nodeA))
             {
@@ -1050,20 +1123,31 @@ void writebackBlocksTGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : 
             }
             elt.nodeIndexA = nodeA;
             elt.nodeIndexB = nodeB;
-            elt.shapeInteraction = gBatches[k].shapeInteraction[threadIndex];
+            elt.shapeInteraction = batchHeaders[k].shapeInteraction[threadIndex];
             elt.accumulatedForce = 0.0f;
             elt.pad = 0;
 
-            uint index;
-            InterlockedAdd(gThresholdStreamIndex[0], 1, index);
-            gThresholdStream[index] = elt;
+            // atomicAdd(&sharedThresholdStreamIndex, 1): the counter lives in the
+            // desc struct itself (PxI32 field), not a separate buffer.
+            Ptr<ThresholdStreamElement> thresholdStream =
+                Ptr<ThresholdStreamElement>(desc.thresholdStream);
+            int index;
+            InterlockedAdd(descPtr[0].sharedThresholdStreamIndex, 1, index);
+            thresholdStream[uint(index)] = elt;
         }
     }
     else
     {
         // writeBack1DBlockTGS()
-        const uint forceWritebackOffset = gJointHeaders[batchIndex].writeBackOffset[threadIndex];
-        const uint rowCounts_breakable = gJointHeaders[batchIndex].rowCounts_breakable_orthoAxisCount[threadIndex];
+        Ptr<PxgTGSBlockSolverConstraint1DHeader> jointHeaders =
+            Ptr<PxgTGSBlockSolverConstraint1DHeader>(sharedDesc.iter_blockJointConstraintHeaders);
+        Ptr<PxgTGSBlockSolverConstraint1DCon> jointRowsCon =
+            Ptr<PxgTGSBlockSolverConstraint1DCon>(sharedDesc.iter_blockJointConstraintRowsCon);
+        Ptr<PxgConstraintWriteback> constraintWriteBack =
+            Ptr<PxgConstraintWriteback>(desc.constraintWriteBack);
+
+        const uint forceWritebackOffset = jointHeaders[batchIndex].writeBackOffset[threadIndex];
+        const uint rowCounts_breakable = jointHeaders[batchIndex].rowCounts_breakable_orthoAxisCount[threadIndex];
         const uint numRows = rowCounts_breakable & 0xFFu;        // uchar4.x
         const uint breakable = (rowCounts_breakable >> 8) & 0xFFu; // uchar4.y
 
@@ -1076,29 +1160,29 @@ void writebackBlocksTGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : 
             for (uint i = 0; i < numRows; ++i)
             {
                 const uint r = startConstraintIndex + i;
-                if ((gJointRowsCon[r].flags[threadIndex] & DY_SC_FLAG_OUTPUT_FORCE) != 0)
+                if ((jointRowsCon[r].flags[threadIndex] & DY_SC_FLAG_OUTPUT_FORCE) != 0)
                 {
-                    const float4 lin0XYZ = gJointRowsCon[r].lin0XYZ_initBiasOrCoeff0[threadIndex];
-                    const float4 ang0WriteBack = gJointRowsCon[r].ang0XYZ_velMultiplierOrCoeff2[threadIndex];
-                    const float appliedForce = gJointRowsCon[r].appliedForce[threadIndex];
+                    const float4 lin0XYZ = jointRowsCon[r].lin0XYZ_initBiasOrCoeff0[threadIndex];
+                    const float4 ang0WriteBack = jointRowsCon[r].ang0XYZ_velMultiplierOrCoeff2[threadIndex];
+                    const float appliedForce = jointRowsCon[r].appliedForce[threadIndex];
                     linVel += lin0XYZ.xyz * appliedForce;
                     angVel += ang0WriteBack.xyz * appliedForce;
                 }
 
-                const float err = gJointRowsCon[r].residual[threadIndex];
+                const float err = jointRowsCon[r].residual[threadIndex];
                 constraintErrorSq += err * err;
             }
 
-            const float4 body0WorldOffset_invMass0 = gJointHeaders[batchIndex].rAWorld_invMass0D0[threadIndex];
+            const float4 body0WorldOffset_invMass0 = jointHeaders[batchIndex].rAWorld_invMass0D0[threadIndex];
             angVel -= cross(body0WorldOffset_invMass0.xyz, linVel);
 
             const uint broken = breakable != 0
-                ? ((length(linVel) > gJointHeaders[batchIndex].linBreakImpulse[threadIndex] ||
-                    length(angVel) > gJointHeaders[batchIndex].angBreakImpulse[threadIndex]) ? 1u : 0u)
+                ? ((length(linVel) > jointHeaders[batchIndex].linBreakImpulse[threadIndex] ||
+                    length(angVel) > jointHeaders[batchIndex].angBreakImpulse[threadIndex]) ? 1u : 0u)
                 : 0u;
-            gConstraintWriteBack[forceWritebackOffset].angularImpulse_residual =
+            constraintWriteBack[forceWritebackOffset].angularImpulse_residual =
                 float4(angVel, constraintErrorSq);
-            gConstraintWriteBack[forceWritebackOffset].linearImpulse_broken =
+            constraintWriteBack[forceWritebackOffset].linearImpulse_broken =
                 float4(linVel, broken != 0 ? -0.0f : 0.0f);
         }
     }

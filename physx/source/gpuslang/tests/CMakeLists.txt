@@ -953,7 +953,10 @@ set(PXG_HLSL_ENTRIES
     "directApi:getRigidDynamicGlobalPose" "directApi:getRigidDynamicLinearAcceleration"
     "directApi:setRigidDynamicLinearVelocity" "directApi:setRigidDynamicTorque"
     "solverPGS:solveBlockPartition" "solverPGS:concludeBlocks" "solverPGS:writebackBlocks"
-    "solverTGS:solveBlockPartitionTGS" "solverTGS:writebackBlocksTGS"
+    # solverTGS:writebackBlocksTGS retired: converted to the BDA engine ABI
+    # (P5 Step 4), reads its descriptors through Ptr<> and does not lower to
+    # cs_6_0, so it is no longer an HLSL bit-exactness entry.
+    "solverTGS:solveBlockPartitionTGS"
     "solverTGS:writeBackBodiesTGS" "solverTGS:computeAverageSolverBodyVelocityTGS"
     "solverTGS:propagateAverageSolverBodyVelocityTGS"
     "constraintPrepPGS:contactConstraintBlockPrepareParallelLaunch"

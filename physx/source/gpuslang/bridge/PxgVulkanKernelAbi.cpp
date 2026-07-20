@@ -186,6 +186,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "writeBackBodiesTGS", kWriteBackTGS, uint32_t(sizeof(kWriteBackTGS)) },
     { "solveWholeIslandTGS", kSolveWholeIslandTGS, uint32_t(sizeof(kSolveWholeIslandTGS)) },
     { "concludeBlocksTGS", kConcludeBlocksTGS, uint32_t(sizeof(kConcludeBlocksTGS)) },
+    { "writebackBlocksTGS", kConcludeBlocksTGS, uint32_t(sizeof(kConcludeBlocksTGS)) },
     { "solveStaticBlockTGS", kSolveStaticBlockTGS, uint32_t(sizeof(kSolveStaticBlockTGS)) },
     { "propagateStaticSolverBodyVelocitiesTGS", kSolveStaticBlockTGS, uint32_t(sizeof(kSolveStaticBlockTGS)) },
     { "integrateCoreParallelLaunchTGS", kIntegrateTGS, uint32_t(sizeof(kIntegrateTGS)) },

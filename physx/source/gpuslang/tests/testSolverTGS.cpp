@@ -860,11 +860,64 @@ PXG_TEST(solverTGS_contactAndJointBatches)
         dev->destroyBuffer(h);
 }
 
-// ---------------------------------------------------------------------------
-// concludeBlocksTGS + writebackBlocksTGS
-// ---------------------------------------------------------------------------
-PXG_TEST(solverTGS_concludeAndWriteback)
+// Shared engine-ABI test helpers (used by every PxgCudaShim-driven test below).
+static std::vector<uint8_t> solverTgsAbiLoader(const char* file) { return loadShaderBlob(file); }
+
+// Mirrors the bridge's marshalling: place each argument at the natural
+// alignment inferred from its size, then round the blob to the largest
+// alignment seen (a compiled struct's trailing padding).
+struct EngineBlob
 {
+    std::vector<uint8_t> bytes;
+    size_t maxAlign = 1;
+
+    static size_t alignFor(size_t size)
+    {
+        if (size >= 16) return 16;
+        if (size >= 8)  return 8;
+        if (size >= 4)  return 4;
+        if (size >= 2)  return 2;
+        return 1;
+    }
+    template <typename T>
+    void add(const T& v)
+    {
+        const size_t a = alignFor(sizeof(T));
+        if (a > maxAlign) maxAlign = a;
+        bytes.resize((bytes.size() + (a - 1)) & ~(a - 1));
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
+        bytes.insert(bytes.end(), p, p + sizeof(T));
+    }
+    void finish() { bytes.resize((bytes.size() + (maxAlign - 1)) & ~(maxAlign - 1)); }
+};
+
+// ---------------------------------------------------------------------------
+// writebackBlocksTGS (engine ABI, P5 Step 4 BDA)
+// ---------------------------------------------------------------------------
+// ENGINE ABI: the writeback-block kernel takes the engine's
+// (PxgSolverCoreDesc*, PxgSolverSharedDesc<IterativeSolveDataTGS>*, PxU32
+// islandIndex) pack -> {8,8,4} = 24-byte blob.  The test fills the REAL engine
+// descs (+ a 2-element PxgIslandContext array; element [0] is a decoy so
+// islandIndex = 1 pins the island stride) with live device addresses and
+// launches through PxgCudaShim with the engine's grid arithmetic (blockDim
+// WRITEBACK_BLOCKS = 256 = 8 warps; one warp per batch).  constraintType uses
+// the engine encoding (contact == eCONTACT(1) / eARTICULATION_CONTACT(3); 1D
+// joints are 0).  The batchStartIndex-offset arithmetic of the shared island
+// derivation is additionally covered by solverTGS_concludeBlocksAbi.
+//
+// conclude runs before writeback in production but only zeroes repacked .w
+// coefficients that the writeback path never reads, so the writeback outputs
+// are independent of it; no conclude emulation is needed here.
+PXG_TEST(solverTGS_writebackBlocksAbi)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    // engine PxgConstraintType: eCONTACT == 1, eARTICULATION_CONTACT == 3
+    auto isEngineContact = [](uint16_t t) { return t == 1u || t == 3u; };
+
     std::mt19937 rng(3400);
     std::uniform_real_distribution<float> unit(0.f, 1.f);
     std::uniform_real_distribution<float> sym(-2.f, 2.f);
@@ -909,7 +962,8 @@ PXG_TEST(solverTGS_concludeAndWriteback)
     {
         BatchTGS& b = batches[k];
         b.descStride = uint16_t(1 + rng() % 32);
-        b.constraintType = uint16_t(k % 2);
+        // engine encoding: even batches are contacts (eCONTACT=1), odd are 1D joints (0)
+        b.constraintType = uint16_t(k % 2 == 0 ? 1u : 0u);
         b.scalars[1] = k;
         b.scalars[2] = k * rowsPerBatch;
         b.scalars[3] = k * (rowsPerBatch + 1);
@@ -920,7 +974,7 @@ PXG_TEST(solverTGS_concludeAndWriteback)
             b.bodyBIndex[lane] = rng() % numBodies;
             b.shapeInteraction[lane] = (uint64_t(rng()) << 32) | rng();
 
-            if (b.constraintType == 0)
+            if (isEngineContact(b.constraintType))
             {
                 chs[k].numNormalConstr[lane] = rng() % (rowsPerBatch + 1);
                 chs[k].flags[lane] = unit(rng) < 0.6f ? 1u /*eHAS_FORCE_THRESHOLDS*/ : 0u;
@@ -975,92 +1029,122 @@ PXG_TEST(solverTGS_concludeAndWriteback)
 
     PxgSlangComputeDevice* dev = testDevice();
 
-    const std::vector<uint32_t> strides = {
-        sizeof(BatchTGS), sizeof(TGSContactHeader), sizeof(TGSFrictionHeader), sizeof(TGSContactPoint),
-        sizeof(TGSFriction), sizeof(TGSJointHeader), sizeof(TGSJointRowCon), sizeof(SolverTxIData), 16, 4,
-        sizeof(SolverBodyData), sizeof(ConstraintWriteback), 4, 40, 4, sizeof(BlockFrictionPatch),
-        sizeof(FrictionPatchGPU)
-    };
-
-    // concludeBlocksTGS is now an engine-ABI (BDA push-constant) kernel, no
-    // longer a bound-buffer harness entry; a dedicated shim-driven test
-    // (solverTGS_concludeBlocksAbi) exercises it.  Production runs conclude
-    // before writeback, so emulate the conclude pass on the joint rows here (it
-    // only zeroes repacked .w coefficients — inputs the writeback path never
-    // reads — so the observable writeback output is unchanged) to keep the
-    // uploaded joint-row buffer faithful to production.
-    for (uint32_t k = 0; k < numBatches; ++k)
-    {
-        const BatchTGS& b = batches[k];
-        if (b.constraintType == 0)
-            continue; // contact: concludeContactBlockTGS is a no-op ("#if 0")
-        for (uint32_t lane = 0; lane < b.descStride; ++lane)
-        {
-            const uint32_t rows = jhs[k].rowCounts_breakable_orthoAxisCount[lane] & 0xFFu;
-            for (uint32_t i = 0; i < rows; ++i)
-            {
-                TGSJointRowCon& c = jrows[b.scalars[2] + i];
-                if (!(c.flags[lane] & DY_SC_FLAG_KEEP_BIAS))
-                    c.lin1XYZ_biasScaleOrCoeff1[lane].w = 0.f;
-                if (c.flags[lane] & DY_SC_FLAG_SPRING)
-                {
-                    c.lin0XYZ_initBiasOrCoeff0[lane].w = 0.f;
-                    c.lin1XYZ_biasScaleOrCoeff1[lane].w = 0.f;
-                    c.ang0XYZ_velMultiplierOrCoeff2[lane].w = 0.f;
-                    c.ang1XYZ_velTargetOrCoeff3[lane].w = 0.f;
-                }
-            }
-        }
-    }
-
-    Kernel writeback("solverTGS.spv", "writebackBlocksTGS", strides, sizeof(SolverTGSParams));
-
-    PxgBufferHandle batchBuf = createBufferFrom(dev, batches);
-    PxgBufferHandle chBuf = createBufferFrom(dev, chs);
-    PxgBufferHandle fhBuf = createBufferFrom(dev, fhs);
-    PxgBufferHandle cpBuf = createBufferFrom(dev, cps);
-    PxgBufferHandle frBuf = createBufferFrom(dev, frs);
-    PxgBufferHandle jhBuf = createBufferFrom(dev, jhs);
-    PxgBufferHandle jrBuf = createBufferFrom(dev, jrows);
-    PxgBufferHandle bdBuf = createBufferFrom(dev, bodyData);
     std::vector<ConstraintWriteback> wbInit(std::max(writebackCursor, 1u));
     std::memset(wbInit.data(), 0, wbInit.size() * sizeof(ConstraintWriteback));
-    PxgBufferHandle wbBuf = createBufferFrom(dev, wbInit);
     std::vector<float> forceInit(std::max(forceBufCursor, 1u), 0.f);
-    PxgBufferHandle forceBuf = createBufferFrom(dev, forceInit);
-    PxgBufferHandle tsBuf = dev->createBuffer(numBatches * 32 * sizeof(ThresholdElement));
-    std::vector<uint32_t> zero1 = { 0 };
-    PxgBufferHandle tsIdxBuf = createBufferFrom(dev, zero1);
-    PxgBufferHandle fpbBuf = createBufferFrom(dev, patchBlocks);
-    PxgBufferHandle fpBuf = createBufferFrom(dev, patches);
+    const uint32_t tsCapacity = numBatches * 32;
+    std::vector<ThresholdElement> tsInit(tsCapacity);
+    std::memset(tsInit.data(), 0, tsInit.size() * sizeof(ThresholdElement));
 
-    SolverTGSParams params = {};
-    params.startIndex = 0;
-    params.endIndex = numBatches;
+    const PxgKernelDef manifest[] = {
+        { "solverTGS.spv", "writebackBlocksTGS", 24u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &solverTgsAbiLoader);
 
-    writeback.dispatch(numBatches,
-                       { batchBuf, chBuf, fhBuf, cpBuf, frBuf, jhBuf, jrBuf, bdBuf /*dummy at 7*/,
-                         bdBuf /*dummy at 8*/, bdBuf /*dummy at 9*/, bdBuf, wbBuf, forceBuf, tsBuf,
-                         tsIdxBuf, fpbBuf, fpBuf },
-                       params);
-    dev->flush();
+    // ---- upload the block pools + writeback targets ----
+    PxgDevicePtr dBatch = 0, dCh = 0, dFh = 0, dCp = 0, dFr = 0, dJh = 0, dJr = 0, dBody = 0;
+    PxgDevicePtr dPatchBlocks = 0, dPatches = 0, dForce = 0, dWb = 0, dTs = 0, dIsl = 0, dDesc = 0, dShared = 0;
+    shim.memAlloc(&dBatch, batches.size() * sizeof(BatchTGS));
+    shim.memAlloc(&dCh, chs.size() * sizeof(TGSContactHeader));
+    shim.memAlloc(&dFh, fhs.size() * sizeof(TGSFrictionHeader));
+    shim.memAlloc(&dCp, cps.size() * sizeof(TGSContactPoint));
+    shim.memAlloc(&dFr, frs.size() * sizeof(TGSFriction));
+    shim.memAlloc(&dJh, jhs.size() * sizeof(TGSJointHeader));
+    shim.memAlloc(&dJr, jrows.size() * sizeof(TGSJointRowCon));
+    shim.memAlloc(&dBody, bodyData.size() * sizeof(SolverBodyData));
+    shim.memAlloc(&dPatchBlocks, patchBlocks.size() * sizeof(BlockFrictionPatch));
+    shim.memAlloc(&dPatches, patches.size() * sizeof(FrictionPatchGPU));
+    shim.memAlloc(&dForce, forceInit.size() * sizeof(float));
+    shim.memAlloc(&dWb, wbInit.size() * sizeof(ConstraintWriteback));
+    shim.memAlloc(&dTs, tsInit.size() * sizeof(ThresholdElement));
+    if (!dBatch || !dCh || !dJr || !dBody || !dForce || !dWb || !dTs)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+    shim.memcpyHtoD(dBatch, batches.data(), batches.size() * sizeof(BatchTGS));
+    shim.memcpyHtoD(dCh, chs.data(), chs.size() * sizeof(TGSContactHeader));
+    shim.memcpyHtoD(dFh, fhs.data(), fhs.size() * sizeof(TGSFrictionHeader));
+    shim.memcpyHtoD(dCp, cps.data(), cps.size() * sizeof(TGSContactPoint));
+    shim.memcpyHtoD(dFr, frs.data(), frs.size() * sizeof(TGSFriction));
+    shim.memcpyHtoD(dJh, jhs.data(), jhs.size() * sizeof(TGSJointHeader));
+    shim.memcpyHtoD(dJr, jrows.data(), jrows.size() * sizeof(TGSJointRowCon));
+    shim.memcpyHtoD(dBody, bodyData.data(), bodyData.size() * sizeof(SolverBodyData));
+    shim.memcpyHtoD(dPatchBlocks, patchBlocks.data(), patchBlocks.size() * sizeof(BlockFrictionPatch));
+    shim.memcpyHtoD(dPatches, patches.data(), patches.size() * sizeof(FrictionPatchGPU));
+    shim.memcpyHtoD(dForce, forceInit.data(), forceInit.size() * sizeof(float));
+    shim.memcpyHtoD(dWb, wbInit.data(), wbInit.size() * sizeof(ConstraintWriteback));
+    shim.memcpyHtoD(dTs, tsInit.data(), tsInit.size() * sizeof(ThresholdElement));
 
-    // ---- reference ----
-    auto refRows = jrows;
+    // island[0] is a decoy so islandIndex = 1 exercises the PxgIslandContext stride
+    physx::PxgIslandContext islands[2];
+    std::memset(islands, 0, sizeof(islands));
+    islands[0].mBodyCount = 3u; // decoy
+    islands[1].mBatchStartIndex = 0u;
+    islands[1].mBatchCount = numBatches; // endIndex = numBatches + startIndex
+    shim.memAlloc(&dIsl, sizeof(islands));
+    shim.memcpyHtoD(dIsl, islands, sizeof(islands));
+
+    physx::PxgSolverCoreDesc desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.islandContextPool = reinterpret_cast<physx::PxgIslandContext*>(dIsl);
+    desc.solverBodyDataPool = reinterpret_cast<physx::PxgSolverBodyData*>(dBody);
+    desc.forceBuffer = reinterpret_cast<physx::PxF32*>(dForce);
+    desc.constraintWriteBack = reinterpret_cast<physx::PxgConstraintWriteback*>(dWb);
+    desc.frictionPatches = reinterpret_cast<physx::PxFrictionPatch*>(dPatches);
+    desc.thresholdStream = reinterpret_cast<physx::Dy::ThresholdStreamElement*>(dTs);
+    desc.sharedThresholdStreamIndex = 0; // in-struct atomic counter (memset already zeroed it)
+
+    physx::PxgSolverSharedDesc<physx::IterativeSolveDataTGS> shared;
+    std::memset(&shared, 0, sizeof(shared));
+    shared.blockCurrentFrictionPatches = reinterpret_cast<physx::PxgBlockFrictionPatch*>(dPatchBlocks);
+    shared.iterativeData.blockConstraintBatch = reinterpret_cast<physx::PxgBlockConstraintBatch*>(dBatch);
+    shared.iterativeData.blockJointConstraintHeaders =
+        reinterpret_cast<physx::PxgTGSBlockSolverConstraint1DHeader*>(dJh);
+    shared.iterativeData.blockJointConstraintRowsCon =
+        reinterpret_cast<physx::PxgTGSBlockSolverConstraint1DCon*>(dJr);
+    shared.iterativeData.blockContactHeaders =
+        reinterpret_cast<physx::PxgTGSBlockSolverContactHeader*>(dCh);
+    shared.iterativeData.blockFrictionHeaders =
+        reinterpret_cast<physx::PxgTGSBlockSolverFrictionHeader*>(dFh);
+    shared.iterativeData.blockContactPoints =
+        reinterpret_cast<physx::PxgTGSBlockSolverContactPoint*>(dCp);
+    shared.iterativeData.blockFrictions =
+        reinterpret_cast<physx::PxgTGSBlockSolverContactFriction*>(dFr);
+
+    shim.memAlloc(&dDesc, sizeof(desc));
+    shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
+    shim.memAlloc(&dShared, sizeof(shared));
+    shim.memcpyHtoD(dShared, &shared, sizeof(shared));
+
+    EngineBlob blob;
+    blob.add<uint64_t>(dDesc);
+    blob.add<uint64_t>(dShared);
+    blob.add<uint32_t>(1u); // islandIndex
+    blob.finish();
+    PXG_CHECK_MSG(blob.bytes.size() == 24, "writeback blob is 24 bytes (got %zu)", blob.bytes.size());
+
+    const uint32_t gridX = (numBatches + 7) / 8; // 8 warps per 256-thread block
+    PXG_CHECK_MSG(shim.launchKernel(0, gridX, 1, 1, blob.bytes.data(), uint32_t(blob.bytes.size())) ==
+                      PxgResult::Success,
+                  "launch writebackBlocksTGS");
+    shim.streamSynchronize();
+
+    // ---- reference (writebackBlocksTGS; engine constraintType encoding) ----
     auto refPatchBlocks = patchBlocks;
     std::vector<float> refForce = forceInit;
     std::vector<ConstraintWriteback> refWb = wbInit;
     std::vector<FrictionPatchGPU> refPatches = patches;
     std::vector<ThresholdElement> refStream;
+    size_t refMutations = 0; // guard against an all-no-op fixture
 
     for (uint32_t k = 0; k < numBatches; ++k)
     {
         const BatchTGS& b = batches[k];
         for (uint32_t lane = 0; lane < b.descStride; ++lane)
         {
-            if (b.constraintType == 0)
+            if (isEngineContact(b.constraintType))
             {
-                // concludeContactBlockTGS is "#if 0" in CUDA: no contact changes.
                 // writeBackContactBlockTGS
                 const uint32_t nc = chs[k].numNormalConstr[lane];
                 const uint32_t nf = fhs[k].numFrictionConstr[lane];
@@ -1072,6 +1156,7 @@ PXG_TEST(solverTGS_concludeAndWriteback)
                         const float af = cps[b.scalars[2] + i].appliedForce[lane];
                         refForce[fwo + i] = af;
                         normalForce += af;
+                        ++refMutations;
                     }
 
                 const uint32_t patchIndex = refPatchBlocks[k].patchIndex[lane];
@@ -1121,23 +1206,9 @@ PXG_TEST(solverTGS_concludeAndWriteback)
             }
             else
             {
-                // conclude1DBlockTGS
+                // writeBack1DBlockTGS — reads jrows directly (writeback never
+                // mutates the joint rows; conclude, which does, is a separate pass)
                 const uint32_t rows = jhs[k].rowCounts_breakable_orthoAxisCount[lane] & 0xFFu;
-                for (uint32_t i = 0; i < rows; ++i)
-                {
-                    TGSJointRowCon& c = refRows[b.scalars[2] + i];
-                    if (!(c.flags[lane] & DY_SC_FLAG_KEEP_BIAS))
-                        c.lin1XYZ_biasScaleOrCoeff1[lane].w = 0.f;
-                    if (c.flags[lane] & DY_SC_FLAG_SPRING)
-                    {
-                        c.lin0XYZ_initBiasOrCoeff0[lane].w = 0.f;
-                        c.lin1XYZ_biasScaleOrCoeff1[lane].w = 0.f;
-                        c.ang0XYZ_velMultiplierOrCoeff2[lane].w = 0.f;
-                        c.ang1XYZ_velTargetOrCoeff3[lane].w = 0.f;
-                    }
-                }
-
-                // writeBack1DBlockTGS
                 const uint32_t fwo = jhs[k].writeBackOffset[lane];
                 const uint32_t breakable = (jhs[k].rowCounts_breakable_orthoAxisCount[lane] >> 8) & 0xFFu;
                 if (fwo != 0xFFFFFFFFu)
@@ -1146,7 +1217,7 @@ PXG_TEST(solverTGS_concludeAndWriteback)
                     float errSq = 0.f;
                     for (uint32_t i = 0; i < rows; ++i)
                     {
-                        const TGSJointRowCon& c = refRows[b.scalars[2] + i];
+                        const TGSJointRowCon& c = jrows[b.scalars[2] + i];
                         if (c.flags[lane] & DY_SC_FLAG_OUTPUT_FORCE)
                         {
                             const Float4 l0 = c.lin0XYZ_initBiasOrCoeff0[lane];
@@ -1165,44 +1236,44 @@ PXG_TEST(solverTGS_concludeAndWriteback)
                     refWb[fwo].angularImpulse_residual = Float4{ angVel.x, angVel.y, angVel.z, errSq };
                     refWb[fwo].linearImpulse_broken =
                         Float4{ linVel.x, linVel.y, linVel.z, broken ? -0.0f : 0.0f };
+                    ++refMutations;
                 }
             }
         }
     }
+    PXG_CHECK_MSG(refMutations > 0, "writeback fixture mutated nothing (too weak / no-op?)");
 
-    // ---- compare ----
-    const auto gpuRows = downloadBuffer<TGSJointRowCon>(dev, jrBuf, jrows.size());
-    const auto gpuCps = downloadBuffer<TGSContactPoint>(dev, cpBuf, cps.size());
-    const auto gpuForce = downloadBuffer<float>(dev, forceBuf, refForce.size());
-    const auto gpuWb = downloadBuffer<ConstraintWriteback>(dev, wbBuf, refWb.size());
-    const auto gpuPatches = downloadBuffer<FrictionPatchGPU>(dev, fpBuf, patches.size());
-    const auto gpuPatchBlocks = downloadBuffer<BlockFrictionPatch>(dev, fpbBuf, patchBlocks.size());
-    const auto gpuTsCount = downloadBuffer<uint32_t>(dev, tsIdxBuf, 1)[0];
-    auto gpuStream = downloadBuffer<ThresholdElement>(dev, tsBuf, gpuTsCount);
+    // ---- download + compare ----
+    std::vector<TGSJointRowCon> gpuRows(jrows.size());
+    std::vector<TGSContactPoint> gpuCps(cps.size());
+    std::vector<float> gpuForce(refForce.size());
+    std::vector<ConstraintWriteback> gpuWb(refWb.size());
+    std::vector<FrictionPatchGPU> gpuPatches(patches.size());
+    std::vector<BlockFrictionPatch> gpuPatchBlocks(patchBlocks.size());
+    shim.memcpyDtoH(gpuRows.data(), dJr, gpuRows.size() * sizeof(TGSJointRowCon));
+    shim.memcpyDtoH(gpuCps.data(), dCp, gpuCps.size() * sizeof(TGSContactPoint));
+    shim.memcpyDtoH(gpuForce.data(), dForce, gpuForce.size() * sizeof(float));
+    shim.memcpyDtoH(gpuWb.data(), dWb, gpuWb.size() * sizeof(ConstraintWriteback));
+    shim.memcpyDtoH(gpuPatches.data(), dPatches, gpuPatches.size() * sizeof(FrictionPatchGPU));
+    shim.memcpyDtoH(gpuPatchBlocks.data(), dPatchBlocks, gpuPatchBlocks.size() * sizeof(BlockFrictionPatch));
+    // the threshold-stream count lives in the desc's in-struct PxI32 counter
+    physx::PxgSolverCoreDesc descBack;
+    shim.memcpyDtoH(&descBack, dDesc, sizeof(descBack));
+    const uint32_t gpuTsCount = uint32_t(descBack.sharedThresholdStreamIndex);
+    std::vector<ThresholdElement> gpuStream(gpuTsCount);
+    if (gpuTsCount)
+        shim.memcpyDtoH(gpuStream.data(), dTs, gpuTsCount * sizeof(ThresholdElement));
 
+    // writeback never touches the joint rows or contact points: they must be
+    // byte-identical to the upload (canary).
     size_t mismatches = 0;
     for (size_t i = 0; i < jrows.size(); ++i)
-        for (int l = 0; l < 32; ++l)
-        {
-            const Float4* g[] = { &gpuRows[i].lin0XYZ_initBiasOrCoeff0[l],
-                                  &gpuRows[i].lin1XYZ_biasScaleOrCoeff1[l],
-                                  &gpuRows[i].ang0XYZ_velMultiplierOrCoeff2[l],
-                                  &gpuRows[i].ang1XYZ_velTargetOrCoeff3[l] };
-            const Float4* r[] = { &refRows[i].lin0XYZ_initBiasOrCoeff0[l],
-                                  &refRows[i].lin1XYZ_biasScaleOrCoeff1[l],
-                                  &refRows[i].ang0XYZ_velMultiplierOrCoeff2[l],
-                                  &refRows[i].ang1XYZ_velTargetOrCoeff3[l] };
-            for (int c = 0; c < 4; ++c)
-                if (std::memcmp(g[c], r[c], sizeof(Float4)) != 0)
-                    ++mismatches;
-        }
-    // contact conclude is a no-op: the contact coefficients must be untouched
+        if (std::memcmp(&gpuRows[i], &jrows[i], sizeof(TGSJointRowCon)) != 0)
+            ++mismatches;
     for (size_t i = 0; i < cps.size(); ++i)
-        for (int l = 0; l < 32; ++l)
-            if (gpuCps[i].biasCoefficient[l] != cps[i].biasCoefficient[l] ||
-                gpuCps[i].appliedForce[l] != cps[i].appliedForce[l])
-                ++mismatches;
-    PXG_CHECK_MSG(mismatches == 0, "conclude: %zu mismatches", mismatches);
+        if (std::memcmp(&gpuCps[i], &cps[i], sizeof(TGSContactPoint)) != 0)
+            ++mismatches;
+    PXG_CHECK_MSG(mismatches == 0, "writeback touched read-only inputs: %zu", mismatches);
 
     mismatches = 0;
     for (size_t i = 0; i < refForce.size(); ++i)
@@ -1234,9 +1305,9 @@ PXG_TEST(solverTGS_concludeAndWriteback)
             ++mismatches;
     PXG_CHECK_MSG(mismatches == 0, "threshold stream: %zu mismatches", mismatches);
 
-    for (PxgBufferHandle h : { batchBuf, chBuf, fhBuf, cpBuf, frBuf, jhBuf, jrBuf, bdBuf, wbBuf, forceBuf,
-                               tsBuf, tsIdxBuf, fpbBuf, fpBuf })
-        dev->destroyBuffer(h);
+    for (PxgDevicePtr pfree : { dBatch, dCh, dFh, dCp, dFr, dJh, dJr, dBody, dPatchBlocks, dPatches,
+                                dForce, dWb, dTs, dIsl, dDesc, dShared })
+        shim.memFree(pfree);
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,35 +1322,8 @@ PXG_TEST(solverTGS_concludeAndWriteback)
 // WRITE_BACK_BODIES blockDim 256).  writeBackBodiesTGS is launched with
 // islandIndex = 1 against a 2-element island array whose element [0] is a
 // decoy, pinning the PxgIslandContext stride on the real ABI.
-static std::vector<uint8_t> solverTgsAbiLoader(const char* file) { return loadShaderBlob(file); }
-
-// Mirrors the bridge's marshalling: place each argument at the natural
-// alignment inferred from its size, then round the blob to the largest
-// alignment seen (a compiled struct's trailing padding).
-struct EngineBlob
-{
-    std::vector<uint8_t> bytes;
-    size_t maxAlign = 1;
-
-    static size_t alignFor(size_t size)
-    {
-        if (size >= 16) return 16;
-        if (size >= 8)  return 8;
-        if (size >= 4)  return 4;
-        if (size >= 2)  return 2;
-        return 1;
-    }
-    template <typename T>
-    void add(const T& v)
-    {
-        const size_t a = alignFor(sizeof(T));
-        if (a > maxAlign) maxAlign = a;
-        bytes.resize((bytes.size() + (a - 1)) & ~(a - 1));
-        const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
-        bytes.insert(bytes.end(), p, p + sizeof(T));
-    }
-    void finish() { bytes.resize((bytes.size() + (maxAlign - 1)) & ~(maxAlign - 1)); }
-};
+// solverTgsAbiLoader + EngineBlob are defined above (before the first
+// engine-ABI test).
 
 PXG_TEST(solverTGS_velocityAveragingAndPropagate)
 {
