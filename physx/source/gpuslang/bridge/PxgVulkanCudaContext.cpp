@@ -25,6 +25,7 @@
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
 #include "PxgVulkanCudaContext.h"
+#include "PxgVulkanKernelAbi.h"
 
 #if PX_SUPPORT_GPU_PHYSX
 
@@ -108,6 +109,10 @@ public:
 
     void release() override { pxgSetVulkanDriverContext(nullptr); delete this; }
 
+    // The backing shim (bridge-internal): the ccm's getMappedDevicePtr resolves
+    // pinned host pointers through it.
+    PxgCudaShim* shim() const { return mShim; }
+
     // ---- memory ----
     PxCUresult memAlloc(CUdeviceptr* dptr, size_t bytesize) override
     {
@@ -126,32 +131,28 @@ public:
 
     PxCUresult memHostAlloc(void** pp, size_t bytesize, unsigned int /*Flags*/) override
     {
+        // P5 Step 4b: real pinned-mapped memory — a persistently mapped host-
+        // visible buffer with a device address, so the engine's mapped-pointer
+        // model (PxPinnedArray + getMappedDevicePtr, the copy-descriptor queue,
+        // bpDesc mirrors, ...) works as it does on CUDA.
         if (mAbort) return mLastResult;
-        void* p = std::malloc(bytesize ? bytesize : 1);
-        if (pp)
-            *pp = p;
-        return p ? record(PxgResult::Success) : record(PxgResult::OutOfMemory);
+        return record(mShim->memHostAlloc(pp, bytesize));
     }
     PxCUresult memFreeHost(void* p) override
     {
         if (mAbort) return mLastResult;
-        std::free(p);
-        return record(PxgResult::Success);
+        return record(mShim->memFreeHost(p));
     }
     PxCUresult memHostGetDevicePointer(CUdeviceptr* pdptr, void* p, unsigned int /*Flags*/) override
     {
-        // Zero-copy mapped-host device pointers are not part of the P3 single-
-        // device model; callers use explicit staged copies instead.  Write a
-        // null result so a caller that ignores the error code cannot read an
-        // uninitialised device address.  Like CudaCtx this does NOT touch
-        // mLastResult (so an unsupported call — even one made mid-abort — never
-        // clobbers the sticky abort/OOM state); a null host pointer mirrors the
-        // reference's SUCCESS path.  (P4: the engine's pinned-host paths that
-        // assume a mapped device pointer must be routed through explicit staged
-        // copies — see RUNTIME_PLAN.md.)
+        // Interior CPU pointers of pinned allocations resolve to their device
+        // address (CUDA parity).  Unknown host memory yields the null result.
+        // Does NOT touch mLastResult (an unsupported query — even mid-abort —
+        // never clobbers the sticky abort/OOM state).
+        const PxgDevicePtr d = mShim->hostGetDevicePointer(p);
         if (pdptr)
-            *pdptr = 0;
-        return p ? invalidResult() : okResult();
+            *pdptr = CUdeviceptr(d);
+        return d != 0 ? okResult() : (p ? invalidResult() : okResult());
     }
 
     // ---- modules / functions ----
@@ -297,16 +298,38 @@ public:
         return record(mShim->launchKernel(id, gridDimX, gridDimY, gridDimZ, blob.data(),
                                           uint32_t(blob.size())));
     }
-    PxCUresult launchKernel(CUfunction /*f*/, PxU32 /*gridDimX*/, PxU32 /*gridDimY*/, PxU32 /*gridDimZ*/,
+    PxCUresult launchKernel(CUfunction f, PxU32 gridDimX, PxU32 gridDimY, PxU32 gridDimZ,
                             PxU32 /*blockDimX*/, PxU32 /*blockDimY*/, PxU32 /*blockDimZ*/, PxU32 /*sharedMemBytes*/,
-                            CUstream /*hStream*/, void** /*kernelParams*/, void** /*extra*/, const char* /*file*/,
+                            CUstream /*hStream*/, void** kernelParams, void** /*extra*/, const char* /*file*/,
                             int /*line*/) override
     {
-        // The void** form carries no per-argument sizes, so the push-constant
-        // blob cannot be assembled generically; PhysX GPU launches use the
-        // PxCudaKernelParam form above.  (P4 revisits any void** call sites.)
+        // The void** launch form (PX_CUDA_KERNEL_PARAM2; USE_NEW_LAUNCH_FUNCTION
+        // in broadphase/AABB-manager/articulation) carries no per-argument sizes
+        // — CUDA reads them from the compiled kernel's parameter metadata.  The
+        // bridge reads them from the per-kernel launch-ABI table instead
+        // (PxgVulkanKernelAbi.cpp) and assembles the same natural-alignment blob
+        // as the sized form.  A kernel without an ABI row is refused cleanly.
         if (mAbort) return mLastResult;
-        return record(PxgResult::InvalidValue);
+        PxgKernelId id = 0;
+        if (!fromFunc(f, &id))
+            return record(PxgResult::InvalidValue);
+        const PxgKernelAbiRow* abi = id < mManifestCount ? pxgFindKernelAbi(mManifest[id].cudaName) : nullptr;
+        if (!abi || !kernelParams)
+            return record(PxgResult::InvalidValue);
+
+        std::vector<uint8_t> blob;
+        size_t maxAlign = 1;
+        for (uint32_t i = 0; i < abi->argCount; ++i)
+        {
+            const size_t a = paramAlign(abi->argSizes[i]);
+            if (a > maxAlign) maxAlign = a;
+            blob.resize((blob.size() + (a - 1)) & ~(a - 1));
+            const uint8_t* d = static_cast<const uint8_t*>(kernelParams[i]);
+            blob.insert(blob.end(), d, d + abi->argSizes[i]);
+        }
+        blob.resize((blob.size() + (maxAlign - 1)) & ~(maxAlign - 1));
+        return record(mShim->launchKernel(id, gridDimX, gridDimY, gridDimZ, blob.data(),
+                                          uint32_t(blob.size())));
     }
 
     // ---- copies (async == sync: P3 serializes on one queue) ----
@@ -426,7 +449,12 @@ public:
     }
 
     // ---- context access ----
-    CUdeviceptr getMappedDevicePtr(void* /*pinnedHostBuffer*/) override { return 0; }
+    // P5 Step 4b: pinned host memory is a persistently mapped host-visible
+    // buffer with a device address; any interior CPU pointer of one resolves.
+    CUdeviceptr getMappedDevicePtr(void* pinnedHostBuffer) override
+    {
+        return CUdeviceptr(mContext->shim()->hostGetDevicePointer(pinnedHostBuffer));
+    }
     void acquireContext() override { ++mAcquireCount; }
     bool tryAcquireContext() override { ++mAcquireCount; return true; }
     void releaseContext() override { if (mAcquireCount > 0) --mAcquireCount; }

@@ -30,6 +30,7 @@
 
 #include "pxgTestFramework.h"
 #include "pxgGpuStructs.h"
+#include "PxgCudaShim.h"
 
 #include <algorithm>
 #include <cstring>
@@ -81,25 +82,74 @@ uint32_t createHandle(uint32_t h, bool isStart, bool isNew)
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: translateAABBsLaunch
+// Test 1: translateAABBsLaunch — P5 Step 4: driven through PxgCudaShim on the
+// ENGINE ABI.  The param blob is assembled from a CUDA-shaped argument list
+// (4 device pointers, PxU32 capacity, six PxU8 shifts) by the SAME natural-
+// alignment rule PxgVulkanCudaContext::launchKernel uses, so this validates the
+// blob layout (u8 tail at bytes 36..41, rounded to 48) against the compiled
+// push-constant struct, the BDA pointer walk, and the 8-threads-per-box grid
+// arithmetic the engine launches with.
 // ---------------------------------------------------------------------------
+
+// Mirrors the bridge's marshalling: place each argument at the natural alignment
+// inferred from its size, then round the blob to the largest alignment seen
+// (a compiled struct's trailing padding).
+struct EngineBlob
+{
+    std::vector<uint8_t> bytes;
+    size_t maxAlign = 1;
+
+    static size_t alignFor(size_t size)
+    {
+        if (size >= 16) return 16;
+        if (size >= 8)  return 8;
+        if (size >= 4)  return 4;
+        if (size >= 2)  return 2;
+        return 1;
+    }
+    template <typename T>
+    void add(const T& v)
+    {
+        const size_t a = alignFor(sizeof(T));
+        if (a > maxAlign) maxAlign = a;
+        bytes.resize((bytes.size() + (a - 1)) & ~(a - 1));
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
+        bytes.insert(bytes.end(), p, p + sizeof(T));
+    }
+    void finish() { bytes.resize((bytes.size() + (maxAlign - 1)) & ~(maxAlign - 1)); }
+};
+
+static std::vector<uint8_t> bpShimLoader(const char* file) { return loadShaderBlob(file); }
+
 PXG_TEST(broadphaseSetup_translateAABBs)
 {
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(6100);
     std::uniform_real_distribution<float> pos(-500.f, 500.f);
     std::uniform_real_distribution<float> ext(0.01f, 50.f);
     std::uniform_real_distribution<float> cd(0.f, 2.f);
 
+    PxgSlangComputeDevice* dev = testDevice();
+    // Engine ABI blob: 4x u64 + u32 + 6x u8 = 42 -> rounded to 48.
+    const PxgKernelDef manifest[] = {
+        { "broadphaseSetup.spv", "translateAABBsLaunch", 48u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &bpShimLoader);
+
     for (uint32_t variant = 0; variant < 3; ++variant)
     {
         const uint32_t capacity = 300;
         const bool hasEnvIds = variant >= 1;
-        const uint32_t shiftX = variant == 2 ? 1u : 0u;
-        const uint32_t shiftY = variant == 2 ? 2u : 0u;
-        const uint32_t shiftZ = 0u;
-        const uint32_t envShiftX = hasEnvIds ? 3u : 0u;
-        const uint32_t envShiftY = hasEnvIds ? 3u : 0u;
-        const uint32_t envShiftZ = hasEnvIds ? 0u : 0u; // exercise the envShift==0 fallthrough
+        const uint8_t shiftX = variant == 2 ? 1u : 0u;
+        const uint8_t shiftY = variant == 2 ? 2u : 0u;
+        const uint8_t shiftZ = 0u;
+        const uint8_t envShiftX = hasEnvIds ? 3u : 0u;
+        const uint8_t envShiftY = hasEnvIds ? 3u : 0u;
+        const uint8_t envShiftZ = hasEnvIds ? 0u : 0u; // exercise the envShift==0 fallthrough
 
         std::vector<float> inBounds(capacity * 6);
         std::vector<float> contactDist(capacity);
@@ -117,23 +167,46 @@ PXG_TEST(broadphaseSetup_translateAABBs)
             envIds[i] = (rng() % 5 == 0) ? INVALID_U32 : (rng() % 16);
         }
 
-        PxgSlangComputeDevice* dev = testDevice();
-        std::vector<IntegerAABB> outInit(capacity);
-        std::memset(outInit.data(), 0xcc, outInit.size() * sizeof(IntegerAABB));
+        PxgDevicePtr dIn = 0, dOut = 0, dCd = 0, dEnv = 0;
+        PXG_CHECK_MSG(shim.memAlloc(&dIn, inBounds.size() * 4) == PxgResult::Success, "memAlloc in");
+        PXG_CHECK_MSG(shim.memAlloc(&dOut, capacity * sizeof(IntegerAABB)) == PxgResult::Success, "memAlloc out");
+        PXG_CHECK_MSG(shim.memAlloc(&dCd, contactDist.size() * 4) == PxgResult::Success, "memAlloc cd");
+        if (hasEnvIds)
+            PXG_CHECK_MSG(shim.memAlloc(&dEnv, envIds.size() * 4) == PxgResult::Success, "memAlloc env");
+        if (!dIn || !dOut || !dCd)
+        {
+            std::printf("  NOTE: shim has no device-address allocations (no BDA) -> skip\n");
+            return;
+        }
+        shim.memcpyHtoD(dIn, inBounds.data(), inBounds.size() * 4);
+        shim.memcpyHtoD(dCd, contactDist.data(), contactDist.size() * 4);
+        if (hasEnvIds)
+            shim.memcpyHtoD(dEnv, envIds.data(), envIds.size() * 4);
+        shim.memsetD32(dOut, 0xcccccccc, capacity * 6);
 
-        PxgBufferHandle inBuf = createBufferFrom(dev, inBounds);
-        PxgBufferHandle outBuf = createBufferFrom(dev, outInit);
-        PxgBufferHandle cdBuf = createBufferFrom(dev, contactDist);
-        PxgBufferHandle envBuf = createBufferFrom(dev, envIds);
+        // The CUDA argument list, packed by the bridge's rule.  envIds == 0 (null)
+        // when absent — the kernel branches on the pointer, as the .cu does.
+        EngineBlob blob;
+        blob.add<uint64_t>(dIn);
+        blob.add<uint64_t>(dOut);
+        blob.add<uint64_t>(dCd);
+        blob.add<uint64_t>(hasEnvIds ? dEnv : 0);
+        blob.add<uint32_t>(capacity);
+        blob.add<uint8_t>(shiftX);
+        blob.add<uint8_t>(shiftY);
+        blob.add<uint8_t>(shiftZ);
+        blob.add<uint8_t>(envShiftX);
+        blob.add<uint8_t>(envShiftY);
+        blob.add<uint8_t>(envShiftZ);
+        blob.finish();
+        PXG_CHECK_MSG(blob.bytes.size() == 48, "engine blob is 48 bytes (got %zu)", blob.bytes.size());
 
-        Kernel k("broadphaseSetup.spv", "translateAABBsLaunch", { 4, 24, 4, 4 }, sizeof(BpParams));
-        BpParams p = {};
-        p.boxesCapacity = capacity;
-        p.shiftX = shiftX; p.shiftY = shiftY; p.shiftZ = shiftZ;
-        p.envShiftX = envShiftX; p.envShiftY = envShiftY; p.envShiftZ = envShiftZ;
-        p.hasEnvIds = hasEnvIds ? 1u : 0u;
-        k.dispatch((capacity + 255) / 256, { inBuf, outBuf, cdBuf, envBuf }, p);
-        dev->flush();
+        // Engine grid arithmetic: 8 threads/box, blockDim 256 -> 32 boxes/block.
+        const uint32_t aabbsPerBlock = 256 / 8;
+        const uint32_t nbBlocks = (capacity + aabbsPerBlock - 1) / aabbsPerBlock;
+        PXG_CHECK_MSG(shim.launchKernel(0, nbBlocks, 1, 1, blob.bytes.data(), uint32_t(blob.bytes.size())) == PxgResult::Success,
+                      "launchKernel translateAABBs through engine-ABI blob");
+        shim.streamSynchronize();
 
         // ---- reference ----
         const uint32_t shifts[6] = { shiftX, shiftY, shiftZ, shiftX, shiftY, shiftZ };
@@ -161,7 +234,9 @@ PXG_TEST(broadphaseSetup_translateAABBs)
             }
         }
 
-        const auto g = downloadBuffer<IntegerAABB>(dev, outBuf, capacity);
+        std::vector<IntegerAABB> g(capacity);
+        PXG_CHECK_MSG(shim.memcpyDtoH(g.data(), dOut, capacity * sizeof(IntegerAABB)) == PxgResult::Success,
+                      "DtoH out");
         size_t mism = 0;
         for (uint32_t i = 0; i < capacity && mism < 8; ++i)
             for (uint32_t a = 0; a < 6; ++a)
@@ -185,8 +260,11 @@ PXG_TEST(broadphaseSetup_translateAABBs)
             }
         }
 
-        for (PxgBufferHandle h : { inBuf, outBuf, cdBuf, envBuf })
-            dev->destroyBuffer(h);
+        shim.memFree(dIn);
+        shim.memFree(dOut);
+        shim.memFree(dCd);
+        if (dEnv)
+            shim.memFree(dEnv);
     }
 }
 

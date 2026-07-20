@@ -89,6 +89,13 @@ public:
     virtual PxgBufferHandle createBuffer(size_t sizeBytes) = 0;
     virtual void destroyBuffer(PxgBufferHandle buffer) = 0;
 
+    // Pinned-host buffer (CUDA cuMemHostAlloc parity, RUNTIME_PLAN.md P5 Step
+    // 4b): host-visible memory persistently mapped for the buffer's lifetime —
+    // the CPU reads/writes it through `*mappedPtr` while shaders access it by
+    // buffer device address.  Freed with destroyBuffer.  Returns 0 (and leaves
+    // *mappedPtr untouched) on backends without pinned-mapped support.
+    virtual PxgBufferHandle createHostVisibleBuffer(size_t /*sizeBytes*/, void** /*mappedPtr*/) { return 0; }
+
     virtual void upload(PxgBufferHandle buffer, const void* data, size_t sizeBytes, size_t dstOffset = 0) = 0;
     virtual void download(PxgBufferHandle buffer, void* data, size_t sizeBytes, size_t srcOffset = 0) = 0;
 

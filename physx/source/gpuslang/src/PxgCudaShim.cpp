@@ -81,6 +81,62 @@ PxgResult PxgCudaShim::memFree(PxgDevicePtr ptr)
     return PxgResult::Success;
 }
 
+// ---- pinned host memory (P5 Step 4b) ----
+
+PxgResult PxgCudaShim::memHostAlloc(void** out, size_t bytes)
+{
+    if (!out)
+        return PxgResult::InvalidValue;
+    if (bytes == 0)
+        bytes = 1;
+    void* mapped = nullptr;
+    const PxgBufferHandle buf = mDevice->createHostVisibleBuffer(bytes, &mapped);
+    if (buf == 0 || mapped == nullptr)
+        return PxgResult::OutOfMemory;
+    const PxgDevicePtr base = mDevice->getBufferDeviceAddress(buf);
+    if (base == 0)
+    {
+        mDevice->destroyBuffer(buf);
+        return PxgResult::InvalidValue; // no BDA: pinned-mapped model unavailable
+    }
+    mAllocs[base] = Alloc{ buf, base, bytes };
+    mHostAllocs[uintptr_t(mapped)] = HostAlloc{ base, bytes };
+    *out = mapped;
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::memFreeHost(void* p)
+{
+    auto it = mHostAllocs.find(uintptr_t(p));
+    if (it == mHostAllocs.end())
+        return PxgResult::NotFound; // base pointer required, like memFree
+    const PxgDevicePtr devBase = it->second.devBase;
+    mHostAllocs.erase(it);
+    auto ait = mAllocs.find(devBase);
+    if (ait != mAllocs.end())
+    {
+        mDevice->destroyBuffer(ait->second.buffer);
+        mAllocs.erase(ait);
+    }
+    return PxgResult::Success;
+}
+
+PxgDevicePtr PxgCudaShim::hostGetDevicePointer(const void* p) const
+{
+    const uintptr_t addr = uintptr_t(p);
+    if (addr == 0 || mHostAllocs.empty())
+        return 0;
+    auto it = mHostAllocs.upper_bound(addr);
+    if (it == mHostAllocs.begin())
+        return 0;
+    --it;
+    const uintptr_t base = it->first;
+    const HostAlloc& a = it->second;
+    if (addr < base || addr >= base + a.size)
+        return 0;
+    return a.devBase + (addr - base);
+}
+
 bool PxgCudaShim::resolve(PxgDevicePtr ptr, PxgBufferHandle* buffer, size_t* offset) const
 {
     if (ptr == 0 || mAllocs.empty())

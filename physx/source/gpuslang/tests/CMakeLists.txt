@@ -746,6 +746,7 @@ add_executable(gpuslang-tests
     testP4Broadphase.cpp
     testP4Aabb.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp
+    ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelAbi.cpp
     # P4: the REAL gpucommon buddy allocator, reused over the Vulkan memory
     # manager (PxgVulkanMemoryManager) — compiles cuda-free against real headers.
     ${GPUSLANG_ROOT}/../gpucommon/src/PxgHeapMemoryAllocator.cpp
@@ -824,6 +825,7 @@ set_target_properties(pxg-caps PROPERTIES CXX_STANDARD 17)
 add_library(PhysXGpuVulkan SHARED
     ${GPUSLANG_ROOT}/bridge/PhysXGpuVulkan.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp
+    ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelAbi.cpp
     # P4: the real gpucommon buddy allocator, backing createGpuHeapMemoryAllocatorManager.
     ${GPUSLANG_ROOT}/../gpucommon/src/PxgHeapMemoryAllocator.cpp
     # P4 wrangler seam: the real engine KernelWrangler + manager + the live table.

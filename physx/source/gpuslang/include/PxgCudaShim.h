@@ -75,6 +75,10 @@ struct PxgKernelDef
     const char* entry;          // e.g. "spikeBda"
     uint32_t pushConstantSize;  // parameter-blob size in bytes
     uint32_t numTextures;       // sampled 3D images the kernel declares
+    // CUDA __global__ name (registry key), for per-kernel launch-ABI lookups
+    // (the void** launch form carries no argument sizes — P5 Step 4).  Optional:
+    // harness manifests leave it null.
+    const char* cudaName = nullptr;
 };
 
 enum class PxgResult
@@ -103,6 +107,18 @@ public:
     PxgResult memcpyDtoH(void* dst, PxgDevicePtr src, size_t bytes);
     PxgResult memcpyDtoD(PxgDevicePtr dst, PxgDevicePtr src, size_t bytes);
     PxgResult memsetD32(PxgDevicePtr dst, uint32_t value, size_t numWords);
+
+    // ---- pinned host memory (cuMemHostAlloc / cuMemHostGetDevicePointer
+    // parity, RUNTIME_PLAN.md P5 Step 4b) ----
+    // memHostAlloc returns a CPU pointer into a persistently mapped host-
+    // visible buffer that ALSO has a device address, registered in the flat
+    // address space (so memcpys/resolve() see it and kernels dereference it
+    // via BDA).  hostGetDevicePointer maps any interior CPU pointer of such an
+    // allocation to the matching device address (0 when unknown — the CUDA
+    // null result for unregistered host memory).
+    PxgResult memHostAlloc(void** out, size_t bytes);
+    PxgResult memFreeHost(void* p);
+    PxgDevicePtr hostGetDevicePointer(const void* p) const;
 
     // ---- launch (PxCudaContext launchKernel parity) ----
     // gridDim in workgroups; block dims are informational parity (the Slang
@@ -153,6 +169,15 @@ private:
     // base address -> allocation, ordered so an interior address resolves via
     // upper_bound (the CUDA flat-address-space lookup).
     std::map<PxgDevicePtr, Alloc> mAllocs;
+    // Pinned allocations, additionally indexed by CPU base address so a host
+    // pointer (interior included) resolves to its device address.  The Alloc
+    // itself lives in mAllocs (which owns buffer destruction); this is an index.
+    struct HostAlloc
+    {
+        PxgDevicePtr devBase;
+        size_t size;
+    };
+    std::map<uintptr_t, HostAlloc> mHostAllocs;
     std::unordered_map<PxgKernelId, PxgPipelineHandle> mPipelines;
 
     // Stream/event bookkeeping.  Streams are logical handles (all serialize

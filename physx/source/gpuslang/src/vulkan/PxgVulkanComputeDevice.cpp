@@ -412,6 +412,62 @@ public:
         return handle;
     }
 
+    // Pinned-host buffer (RUNTIME_PLAN.md P5 Step 4b): the CUDA cuMemHostAlloc
+    // model — memory the CPU writes/reads through a persistent mapping while
+    // shaders access it by buffer device address.  Forces HOST_VISIBLE|HOST_
+    // COHERENT in BOTH memory modes (v2's device-local policy applies to bulk
+    // simulation buffers, not the pinned mirrors), maps it for the buffer's
+    // lifetime, and hands the mapping back.  Host writes made before a queue
+    // submission are visible to the device (implicit domain acquire at submit);
+    // device writes become host-visible at the flush/wait sync points.
+    PxgBufferHandle createHostVisibleBuffer(size_t sizeBytes, void** mappedPtr) override
+    {
+        if (sizeBytes == 0)
+            sizeBytes = 4;
+
+        VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bufferInfo.size = sizeBytes;
+        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                           VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+        if (mHasBufferDeviceAddress)
+            bufferInfo.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        Buffer buf = {};
+        buf.size = sizeBytes;
+        buf.hostVisible = true;
+        PXG_VK_CHECK(vkCreateBuffer(mDevice, &bufferInfo, nullptr, &buf.buffer));
+
+        VkMemoryRequirements memReq;
+        vkGetBufferMemoryRequirements(mDevice, buf.buffer, &memReq);
+
+        VkMemoryAllocateFlagsInfo allocFlags = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+        allocFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+
+        VkMemoryAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        allocInfo.pNext = mHasBufferDeviceAddress ? &allocFlags : nullptr;
+        allocInfo.allocationSize = memReq.size;
+        allocInfo.memoryTypeIndex = findMemoryType(memReq.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        PXG_VK_CHECK(vkAllocateMemory(mDevice, &allocInfo, nullptr, &buf.memory));
+        PXG_VK_CHECK(vkBindBufferMemory(mDevice, buf.buffer, buf.memory, 0));
+
+        if (mHasBufferDeviceAddress)
+        {
+            VkBufferDeviceAddressInfo addrInfo = { VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+            addrInfo.buffer = buf.buffer;
+            buf.deviceAddress = vkGetBufferDeviceAddress(mDevice, &addrInfo);
+        }
+
+        PXG_VK_CHECK(vkMapMemory(mDevice, buf.memory, 0, VK_WHOLE_SIZE, 0, &buf.mappedPtr));
+        if (mappedPtr)
+            *mappedPtr = buf.mappedPtr;
+
+        const PxgBufferHandle handle = mNextBufferHandle++;
+        mBuffers[handle] = buf;
+        return handle;
+    }
+
     void destroyBuffer(PxgBufferHandle handle) override
     {
         auto it = mBuffers.find(handle);
@@ -421,6 +477,8 @@ public:
         // copies); submit it so the wait below actually covers that work.
         flush();
         vkDeviceWaitIdle(mDevice);
+        if (it->second.mappedPtr)
+            vkUnmapMemory(mDevice, it->second.memory);
         vkDestroyBuffer(mDevice, it->second.buffer, nullptr);
         vkFreeMemory(mDevice, it->second.memory, nullptr);
         mBuffers.erase(it);
@@ -431,6 +489,14 @@ public:
         if (sizeBytes == 0)
             return;
         Buffer& buf = mBuffers[handle];
+        if (buf.mappedPtr)
+        {
+            // Persistently mapped pinned buffer: same stream-ordering drain,
+            // then write through the standing mapping (re-mapping is illegal).
+            flush();
+            memcpy(static_cast<uint8_t*>(buf.mappedPtr) + dstOffset, data, sizeBytes);
+            return;
+        }
         if (buf.hostVisible)
         {
             // cuMemcpyHtoD is stream-ordered: drain prior recorded/in-flight
@@ -487,6 +553,18 @@ public:
         if (sizeBytes == 0)
             return;
         Buffer& buf = mBuffers[handle];
+        if (buf.mappedPtr)
+        {
+            // Persistently mapped pinned buffer: same device->host visibility
+            // barrier + drain, then read through the standing mapping.
+            beginRecording();
+            bufferBarrier(buf.buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                          VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+            flush();
+            memcpy(data, static_cast<const uint8_t*>(buf.mappedPtr) + srcOffset, sizeBytes);
+            return;
+        }
         if (buf.hostVisible)
         {
             // cuMemcpyDtoH is stream-ordered: drain any recorded GPU work
@@ -1100,6 +1178,11 @@ private:
         size_t size;
         uint64_t deviceAddress = 0;
         bool hostVisible = true;
+        // Persistently mapped CPU pointer for pinned-host buffers
+        // (createHostVisibleBuffer); null for ordinary buffers.  A persistently
+        // mapped memory cannot be vkMapMemory'd again, so upload/download go
+        // through this pointer directly when set.
+        void* mappedPtr = nullptr;
     };
 
     struct Texture

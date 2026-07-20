@@ -228,4 +228,101 @@ PXG_TEST(p3Shim)
     shim.memFree(dcopy);
 }
 
+// P5 Step 4b: the pinned-host-memory seam (cuMemHostAlloc + mapped device
+// pointers).  The engine writes pinned memory on the CPU and launches kernels
+// that read it by device address (copy-descriptor queues, pinned mirrors,
+// PxPinnedArray) — and reads kernel output back through the same mapping with
+// no explicit DtoH.  Both directions are verified bitwise through shimAxpy.
+PXG_TEST(p3ShimPinned)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    struct AxpyBuffers { uint64_t x, y, out; };
+    struct AxpyParams { AxpyBuffers bufs; float alpha; uint32_t count; };
+    const PxgKernelDef manifest[] = {
+        { "npShimAxpy.spv", "shimAxpy", uint32_t(sizeof(AxpyParams)), 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &shimLoader);
+
+    const uint32_t N = 4096;
+
+    // Pinned input + output; ordinary device buffer for y.
+    void* hx = nullptr;
+    void* hout = nullptr;
+    if (shim.memHostAlloc(&hx, N * 4) != PxgResult::Success)
+    {
+        std::printf("  NOTE: no pinned-mapped support on this backend -> skip\n");
+        return;
+    }
+    PXG_CHECK_MSG(shim.memHostAlloc(&hout, N * 4) == PxgResult::Success, "memHostAlloc out");
+    PxgDevicePtr dy = 0;
+    PXG_CHECK_MSG(shim.memAlloc(&dy, N * 4) == PxgResult::Success, "memAlloc y");
+
+    // CPU writes the pinned input directly (the engine's model: no HtoD).
+    float* x = static_cast<float*>(hx);
+    std::vector<float> y(N);
+    std::mt19937 rng(0xBEEF);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        x[i] = float(int(rng() % 4001) - 2000) * 0.25f;
+        y[i] = float(int(rng() % 4001) - 2000) * 0.5f;
+    }
+    shim.memcpyHtoD(dy, y.data(), N * 4);
+    std::memset(hout, 0xcd, N * 4);
+
+    // Mapped device pointers: base + interior resolution, unknown rejection.
+    const PxgDevicePtr dxm = shim.hostGetDevicePointer(hx);
+    const PxgDevicePtr doutm = shim.hostGetDevicePointer(hout);
+    PXG_CHECK_MSG(dxm != 0 && doutm != 0, "pinned allocations have device addresses");
+    PXG_CHECK_MSG(shim.hostGetDevicePointer(static_cast<uint8_t*>(hx) + 400) == dxm + 400,
+                  "interior pinned pointer resolves at the right offset");
+    PXG_CHECK_MSG(shim.hostGetDevicePointer(&rng) == 0, "unregistered host memory yields the null device pointer");
+    {
+        // The pinned device address participates in the flat address space
+        // (memcpys/resolve), like any cuMemHostAlloc'd pointer.
+        physx::gpuslang::PxgBufferHandle b;
+        size_t off;
+        PXG_CHECK_MSG(shim.resolve(dxm + 100 * 4, &b, &off) && off == 400,
+                      "pinned device address resolves in the flat address space");
+    }
+
+    const float alpha = 3.0f;
+    AxpyParams prm;
+    prm.bufs.x = dxm;
+    prm.bufs.y = dy;
+    prm.bufs.out = doutm;
+    prm.alpha = alpha;
+    prm.count = N;
+    PXG_CHECK_MSG(shim.launchKernel(0, (N + 63) / 64, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launchKernel reading+writing pinned memory");
+    shim.streamSynchronize();
+
+    // CPU reads the kernel's output THROUGH THE MAPPING (no DtoH).
+    const float* out = static_cast<const float*>(hout);
+    size_t mm = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        uint32_t ru, gu;
+        const float ref = alpha * x[i] + y[i];
+        std::memcpy(&ru, &ref, 4);
+        std::memcpy(&gu, &out[i], 4);
+        if (ru != gu)
+            ++mm;
+    }
+    PXG_CHECK_MSG(mm == 0, "pinned round-trip bitwise-correct (%zu bad)", mm);
+
+    // DtoH from a pinned device address must also work (staged-copy parity).
+    std::vector<float> staged(N, 0.f);
+    PXG_CHECK_MSG(shim.memcpyDtoH(staged.data(), doutm, N * 4) == PxgResult::Success, "DtoH from pinned");
+    PXG_CHECK_MSG(std::memcmp(staged.data(), out, N * 4) == 0, "DtoH from pinned matches the mapping");
+
+    // Free semantics: interior rejected, base accepted, unknown rejected.
+    PXG_CHECK_MSG(shim.memFreeHost(static_cast<uint8_t*>(hx) + 4) == PxgResult::NotFound,
+                  "memFreeHost rejects an interior pointer");
+    PXG_CHECK_MSG(shim.memFreeHost(hx) == PxgResult::Success, "memFreeHost accepts the base pointer");
+    PXG_CHECK_MSG(shim.hostGetDevicePointer(hx) == 0, "freed pinned memory no longer resolves");
+    shim.memFreeHost(hout);
+    shim.memFree(dy);
+}
+
 }  // namespace

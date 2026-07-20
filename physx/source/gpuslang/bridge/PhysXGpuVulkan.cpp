@@ -58,6 +58,7 @@
 #include "PxgVulkanCudaContext.h"     // bridge: PxgCreateVulkanCudaContextManager
 #include "PxgVulkanMemoryManager.h"   // bridge: the Vulkan PxsMemoryManager (P4 memory seam)
 #include "PxgCudaShim.h"              // gpuslang/include: PxgCudaShim, PxgKernelDef, PxgSpirvLoader
+#include "PxgVulkanKernelAbi.h"       // bridge: per-kernel launch-ABI table (P5 Step 4)
 #include "PxgSlangComputeDevice.h"    // gpuslang/include: PxgCreateVulkanComputeDevice
 #include "PxgSlangKernelManifest.h"   // gpuslang/include: generated enum-indexed registry manifest
 #include "PxgHeapMemAllocator.h"      // gpucommon: the REAL buddy heap allocator manager (reused)
@@ -140,23 +141,15 @@ std::mutex& runtimeMutex()
     return m;
 }
 
-// Per-kernel push-constant blob size (the compiled Slang push-constant struct size),
-// keyed by the CUDA __global__ name.  Filled as each kernel's engine-path launch is
-// brought up (RUNTIME_PLAN.md P5 Step 4); the shim validates every launch blob against
+// Per-kernel push-constant blob size, derived from the launch-ABI table
+// (bridge/PxgVulkanKernelAbi.cpp — the single source of truth for a kernel's
+// CUDA argument sizes).  Filled as each kernel's engine-path launch is brought
+// up (RUNTIME_PLAN.md P5 Step 4); the shim validates every launch blob against
 // this, so an unlisted kernel (0) is refused rather than dispatched with a bad blob.
 uint32_t pushConstantSizeFor(const char* cudaName)
 {
-    struct Row { const char* name; uint32_t size; };
-    // { uint64 descs; uint count; } rounds up to 16 (uint64 alignment); the engine's
-    // (CopyDesc* descsGPU, PxU32 numDescs) param pack is padded to match in the bridge.
-    static const Row kRows[] = {
-        { "MemCopyBalanced", 16u },
-    };
-    if (cudaName)
-        for (const Row& row : kRows)
-            if (std::strcmp(row.name, cudaName) == 0)
-                return row.size;
-    return 0u;
+    const PxgKernelAbiRow* row = pxgFindKernelAbi(cudaName);
+    return row ? pxgKernelAbiPushSize(*row) : 0u;
 }
 
 // Returns the runtime, creating it once; null if no Vulkan device is available.
@@ -192,7 +185,8 @@ VulkanGpuRuntime* ensureRuntime()
     for (unsigned i = 0; i < PXG_SLANG_KERNEL_COUNT; ++i)
         r.manifest[i] = PxgKernelDef{ gPxgSlangKernelManifest[i].spirvFile,
                                       gPxgSlangKernelManifest[i].entry,
-                                      pushConstantSizeFor(gPxgSlangKernelManifest[i].cudaName), 0u };
+                                      pushConstantSizeFor(gPxgSlangKernelManifest[i].cudaName), 0u,
+                                      gPxgSlangKernelManifest[i].cudaName };
 
     static PxgSpirvLoader loader = &envSpirvLoader;
     r.shim = new PxgCudaShim(r.device, r.manifest.data(), uint32_t(r.manifest.size()), loader);

@@ -82,6 +82,26 @@ struct BpParams
 [[vk::push_constant]]
 ConstantBuffer<BpParams> gParams;
 
+// RUNTIME_PLAN.md P5 Step 4: translateAABBsLaunch is brought up on the engine launch
+// path (BDA).  Its push constant mirrors the CUDA kernel's parameter list EXACTLY —
+// four device pointers then boxesCapacity (PxU32) then six PxU8 shift bytes — so the
+// engine's param blob drives it unchanged.  The six PxU8 shifts land in bytes 36..41
+// of the blob; rather than require the storagePushConstant8 feature, they are read as
+// two packed uint words and unpacked (little-endian) below.  hasEnvIds is not a CUDA
+// argument: the kernel branches on `envIds != NULL`, reproduced here as `envIds != 0`.
+struct TranslateAabbParams
+{
+    uint64_t inArray;          // @0  const PxBounds3*
+    uint64_t outArray;         // @8  PxgIntegerAABB*
+    uint64_t contactDistances; // @16 const PxReal*
+    uint64_t envIds;           // @24 const PxU32*  (0 => no env ids)
+    uint boxesCapacity;        // @32 PxU32
+    uint packedShift0;         // @36 bytes [shiftX, shiftY, shiftZ, envIDX]
+    uint packedShift1;         // @40 bytes [envIDY, envIDZ, pad, pad]
+}
+[[vk::push_constant]]
+ConstantBuffer<TranslateAabbParams> gTranslate;
+
 RWStructuredBuffer<float> gInBounds;               // binding 0 (PxBounds3: 6 floats/box)
 RWStructuredBuffer<PxgIntegerAABB> gOutBounds;     // binding 1
 RWStructuredBuffer<float> gContactDistances;       // binding 2
@@ -131,25 +151,39 @@ void setEmpty(uint boundIndex)
 }
 
 // mirrors translateAABBsLaunch(): one thread per box computes all 6 components
-// (the CUDA original uses 8 threads/box; the result is identical)
+// P5 Step 4 (BDA, engine launch path): mirrors the CUDA kernel exactly — the engine
+// sizes its grid for 8 threads per box (nbBlocks = capacity / (blockDim/8)), so the
+// thread mapping (boxIndex = tid>>3, a = tid&7, a<6 works / 2 idle) is reproduced
+// verbatim rather than the old 1-thread-6-iteration form.  Buffers arrive as raw
+// device addresses in the push-constant blob (the CUDA param pack), walked via Ptr<T>;
+// the env-id branch reproduces the .cu's `if(envIds && envIdShift)` null-pointer check.
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void translateAABBsLaunch(uint3 dtid : SV_DispatchThreadID)
 {
-    const uint boxIndex = dtid.x;
-    if (boxIndex >= gParams.boxesCapacity)
+    const uint boxIndex = dtid.x >> 3;
+    if (boxIndex >= gTranslate.boxesCapacity)
         return;
 
-    const uint shifts[6] = { gParams.shiftX, gParams.shiftY, gParams.shiftZ,
-                             gParams.shiftX, gParams.shiftY, gParams.shiftZ };
-    const uint envShifts[6] = { gParams.envShiftX, gParams.envShiftY, gParams.envShiftZ,
-                                gParams.envShiftX, gParams.envShiftY, gParams.envShiftZ };
+    const uint shiftX = gTranslate.packedShift0 & 0xffu;
+    const uint shiftY = (gTranslate.packedShift0 >> 8) & 0xffu;
+    const uint shiftZ = (gTranslate.packedShift0 >> 16) & 0xffu;
+    const uint envIDX = (gTranslate.packedShift0 >> 24) & 0xffu;
+    const uint envIDY = gTranslate.packedShift1 & 0xffu;
+    const uint envIDZ = (gTranslate.packedShift1 >> 8) & 0xffu;
 
-    const float contactDistance = gContactDistances[boxIndex];
+    const uint shifts[6] = { shiftX, shiftY, shiftZ, shiftX, shiftY, shiftZ };
+    const uint envShifts[6] = { envIDX, envIDY, envIDZ, envIDX, envIDY, envIDZ };
 
-    for (uint a = 0; a < 6; ++a)
+    Ptr<float> inBounds = Ptr<float>(gTranslate.inArray);            // PxBounds3 = 6 floats/box
+    Ptr<float> contactDistances = Ptr<float>(gTranslate.contactDistances);
+    Ptr<uint> outBounds = Ptr<uint>(gTranslate.outArray);            // PxgIntegerAABB = 6 uints/box
+
+    const float contactDistance = contactDistances[boxIndex];
+    const uint a = dtid.x & 7;
+    if (a < 6)
     {
-        const float inV = gInBounds[boxIndex * 6 + a];
+        const float inV = inBounds[boxIndex * 6 + a];
         const uint mask = a < 3 ? 0u : 1u;
         const float projection = a < 3 ? inV - contactDistance : inV + contactDistance;
 
@@ -159,16 +193,16 @@ void translateAABBsLaunch(uint3 dtid : SV_DispatchThreadID)
         const uint b = (encodeFloat(projection) >> shift) & (~1u);
         uint outV = b | mask;
 
-        if (gParams.hasEnvIds != 0 && envIdShift != 0)
+        if (gTranslate.envIds != 0 && envIdShift != 0)
         {
-            const uint envId = gEnvIds[boxIndex];
+            const uint envId = (Ptr<uint>(gTranslate.envIds))[boxIndex];
             if (envId != PX_INVALID_U32)
                 outV |= envId << (32 - envIdShift);
             else
                 outV = (mask != 0) ? gEncodedMaxExtent : gEncodedMinExtent;
         }
 
-        gOutBounds[boxIndex].mMinMax[a] = outV;
+        outBounds[boxIndex * 6 + a] = outV;
     }
 }
 

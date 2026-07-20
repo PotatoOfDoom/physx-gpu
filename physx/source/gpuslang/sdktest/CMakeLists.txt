@@ -185,6 +185,7 @@ if(Vulkan_FOUND)
         # CUDA CudaContextManager, which are deliberately excluded).
         ${GPUSLANG_ROOT}/bridge/PhysXGpuVulkan.cpp
         ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp
+        ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelAbi.cpp
         ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelTable.cpp
         ${GPUSLANG_ROOT}/bridge/PxgVulkanDriverShim.cpp
         ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelInit.cpp
