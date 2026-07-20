@@ -24,53 +24,80 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// solverPGS.slang
+// solverPGS.slang — the rigid-body PGS constraint-solver kernels on the BDA
+// ENGINE ABI (P5 Step 5).
 //
-// Slang port of the rigid-body PGS constraint-solver iteration
-// (gpusolver/src/CUDA/solverMultiBlock.cu + solverBlock.cuh +
-//  constraintPrepShared.cuh + lowleveldynamics/shared/DyCpuGpu1dConstraint.h):
-//   - solveBlockPartition (rigid path: solveContactBlock + solve1DBlock,
-//     incl. mass-splitting reference counts via countActiveSlabs)
+// Slang port of gpusolver/src/CUDA/solverMultiBlock.cu + solverBlock.cuh +
+// solverBlockCommon.cuh (+ constraintPrepShared.cuh /
+// lowleveldynamics/shared/DyCpuGpu1dConstraint.h for the shared math):
+//   - solveBlockPartition            (contact + 1D joint velocity solve,
+//                                     mass-splitting reference counts)
+//   - concludeBlocks                 (switch to the unbiased constants)
+//   - writebackBlocks                (forces / friction patches / threshold
+//                                     stream / 1D writeback)
+//   - writeBackBodies                (solved velocities -> motion velocities)
+//   - computeAverageSolverBodyVelocity / propagateSolverBodyVelocity
+//                                    (multi-slab mass-splitting averaging)
+//   - markActiveSlabPGS              (active-slab marking that FEEDS the
+//                                     reference counts)
 //
-// One 32-thread workgroup processes one PxgBlockConstraintBatch; lane i
-// solves constraint lane i of the 32-wide SoA block data — the same mapping
-// as the CUDA one-warp-per-batch scheme.  The block data structures
-// (PxgBlockConstraintBatch, PxgBlockSolverContactHeader/Point/Friction,
-// PxgBlockSolverConstraint1DHeader/Con/Mod) are mirrored byte-for-byte
-// including their PX_ALIGN(128/256) padding.
+// Every entry takes the ENGINE's CUDA parameter pack as a push-constant blob
+// (see the per-kernel AbiParams structs; argSizes are transcribed in
+// bridge/PxgVulkanKernelAbi.cpp) and reads every count/offset/pool pointer
+// on-device through the byte-exact pxgSlangSolverDesc mirrors — the PGS shared
+// desc is PxgSolverSharedDesc<IterativeSolveData> (PxgSolverSharedDescPGSGpu).
+// One 32-thread warp processes one PxgBlockConstraintBatch; lane i solves
+// constraint lane i of the 32-wide SoA block data, the same mapping as the
+// CUDA one-warp-per-batch scheme.  The block data structures are mirrored
+// byte-for-byte including their PX_ALIGN(128/256) padding.
 //
-// Differences from CUDA:
-//   - Island bookkeeping (islandContextPool, constraintsPerPartition) is host
-//     work; the dispatch receives the resolved [startIndex, endIndex) batch
-//     range via push constants.
-//   - The staging of IterativeSolveData through shared memory and the
+// PGS body-velocity layouts (BOTH differ from TGS's 3-float4 stripes):
+//   - per-partition solve pool: readIndex = k * 128 + lane, 4 float4 stripes
+//     (lin0 @+0, ang0 @+32, lin1 @+64, ang1 @+96) — TGS uses k * 192 + lane;
+//   - accumulated deltaV pool: TWO float4 stripes per body — linVel @
+//     outputOffset + bodyId, angVel @ +totalBodiesIncKinematics — and the
+//     averaging slots are 2 float4 per slab slot
+//     (ComputeAverageBodyBatchStartIndex float4sPerBody = 2).
+//
+// Differences from CUDA (same policy as solverTGS.slang):
+//   - the staging of IterativeSolveData through shared memory and the
 //     Pxldcg/Pxstcg cache hints are memory optimizations with no semantic
-//     effect; buffers are bound directly.
-//   - The contact-error accumulator (global convergence statistics) is not
-//     ported yet; the per-row 1D residual writeback is.
-//   - The explicit prefetch ("next*") load pattern in solveContactBlock is
+//     effect; data is read through BDA pointers directly;
+//   - the explicit prefetch ("next*") load pattern in solveContactBlock is
 //     flattened to direct loads: each contact/friction row uses exactly its
 //     own data, which is what the prefetch chain resolves to whenever
 //     numNormalConstr > 0 (friction with zero contacts does not occur).
+//     checkActiveContactBlock keeps its unconditional contacts[0] prefetch
+//     (see markActiveSlabPGS below);
+//   - accumulateErrorGlobalFullWarp(): the __shfl_xor butterfly becomes the
+//     same butterfly through groupshared scratch under uniform barriers, and
+//     CUDA's float atomicAdd / AtomicMax on the accumulator become CAS loops
+//     on the raw float bits (same as solveBlockUnified in solverTGS.slang);
+//   - CUDA writebackBlocks stages threshold elements in shared memory and
+//     appends them with one warp-aggregated atomic; the port appends
+//     per-thread — the stream contents are identical, ordering within the
+//     stream is nondeterministic in both versions.
 
 import pxgSlangCommon;
+import pxgSlangSolverDesc;
 
 static const float DY_MIN_RESPONSE = 1e-12f;
 
 // DySolverConstraintTypes.h
+static const uint DY_SC_FLAG_OUTPUT_FORCE = 1u << 1;
 static const uint DY_SC_FLAG_SPRING = 1u << 5;
 static const uint DY_SC_FLAG_ACCELERATION_SPRING = 1u << 7;
 
 // PxgSolverFlags.h
+static const uint PXG_CONTACT_FLAG_HAS_FORCE_THRESHOLDS = 1u << 0;
 static const uint PXG_CONTACT_FLAG_COMPLIANT_ACCELERATION_SPRING = 1u << 3;
+
+static const float PX_MAX_REAL = 3.4028234663852885981170418348452e+38f;
 
 // PxgSolverConstraintDesc.h — PxgConstraintType, the encoding the engine's block
 // prep writes into descStride_constraintType>>16: eCONSTRAINT_1D=0, eCONTACT=1,
-// eARTICULATION_CONSTRAINT_1D=2, eARTICULATION_CONTACT=3.  A batch is a CONTACT iff
-// its type is eCONTACT(1) or eARTICULATION_CONTACT(3); 0/2 are 1D joints.  (The
-// legacy PXG_CONSTRAINT_CONTACT=0 name below is inverted vs the engine and kept
-// only for reference — do NOT branch on it; use pxgIsContactType.)
-static const uint PXG_CONSTRAINT_CONTACT = 0; // PxgSolverConstraintDesc::eCONTACT (legacy/inverted — unused)
+// eARTICULATION_CONSTRAINT_1D=2, eARTICULATION_CONTACT=3.  A batch is a CONTACT
+// iff its type is eCONTACT(1) or eARTICULATION_CONTACT(3); 0/2 are 1D joints.
 static const uint PXG_SOLVER_CONSTRAINT_TYPE_CONTACT = 1u;
 static const uint PXG_SOLVER_CONSTRAINT_TYPE_ARTI_CONTACT = 3u;
 bool pxgIsContactType(uint t)
@@ -190,10 +217,6 @@ struct PxgBlockSolverConstraint1DMod
     float coeff1[32];        // 896
 }                            // = 1024
 
-// ---------------------------------------------------------------------------
-// bindings
-// ---------------------------------------------------------------------------
-
 // mirrors PxgBlockFrictionPatch (2816 bytes, PX_ALIGN(256))
 struct PxgBlockFrictionPatch
 {
@@ -238,60 +261,26 @@ struct PxgFrictionPatchGPU
     uint anchors;
 }                        // = 52
 
-struct SolverParams
-{
-    uint startIndex;  // first batch of this partition
-    uint endIndex;    // one past the last batch
-    uint doFriction;
-    uint residualReportingEnabled;
-    uint numSlabs;
-    uint numTotalBodies;
-    uint bodyOffset;  // islandContextPool->mBodyStartIndex
-    // writeBackBodies / averaging kernels:
-    uint totalBodyCount;        // islandContextPool->mBodyCount (dynamic bodies)
-    uint deltaVOffset;          // accumulatedBodyDeltaVOffset
-    uint outputOffsetIndex;     // sharedDesc->deltaOutOffset
-    uint numSolverBodies;       // solverCoreDesc->numSolverBodies
-    uint averageOutputOffsets;  // (numBatches + numArticBatches) * 32 * 2 * 2
-};
-
-[[vk::push_constant]]
-ConstantBuffer<SolverParams> gParams;
-
-RWStructuredBuffer<PxgBlockConstraintBatch> gBatches;                // binding 0
-RWStructuredBuffer<PxgBlockSolverContactHeader> gContactHeaders;     // binding 1
-RWStructuredBuffer<PxgBlockSolverFrictionHeader> gFrictionHeaders;   // binding 2
-RWStructuredBuffer<PxgBlockSolverContactPoint> gContactPoints;       // binding 3
-RWStructuredBuffer<PxgBlockSolverContactFriction> gFrictions;        // binding 4
-RWStructuredBuffer<PxgBlockSolverConstraint1DHeader> gJointHeaders;  // binding 5
-RWStructuredBuffer<PxgBlockSolverConstraint1DCon> gJointRowsCon;     // binding 6
-RWStructuredBuffer<PxgBlockSolverConstraint1DMod> gJointRowsMod;     // binding 7
-RWStructuredBuffer<float4> gSolverBodyVelPool;                       // binding 8
-RWStructuredBuffer<uint> gEncodedReferenceCount;                     // binding 9
-
-// writeback / averaging bindings
-RWStructuredBuffer<PxgSolverBodyData> gSolverBodyData;               // binding 10
-RWStructuredBuffer<PxgConstraintWriteback> gConstraintWriteBack;     // binding 11
-RWStructuredBuffer<float> gForceBuffer;                              // binding 12
-RWStructuredBuffer<ThresholdStreamElement> gThresholdStream;         // binding 13
-RWStructuredBuffer<uint> gThresholdStreamIndex;                      // binding 14 (single atomic counter)
-RWStructuredBuffer<PxgBlockFrictionPatch> gBlockFrictionPatches;     // binding 15
-RWStructuredBuffer<PxgFrictionPatchGPU> gFrictionPatches;            // binding 16
-RWStructuredBuffer<float4> gMotionVelocities;                        // binding 17
-RWStructuredBuffer<uint> gSolverReferences;                          // binding 18 (PxgSolverReferences)
-
 // ---------------------------------------------------------------------------
 // helpers (transcriptions of the CUDA device functions)
 // ---------------------------------------------------------------------------
 
-// mirrors countActiveSlabs() in solverBlock.cuh
-uint countActiveSlabs(uint index, uint numSlabs, uint numSolverBodies)
+// mirrors countActiveSlabs() in solverBlock.cuh (BDA pointer form)
+uint countActiveSlabsBda(uint index, uint numSlabs, uint numSolverBodies, Ptr<uint> encodedReferenceCount)
 {
     uint referenceCount = 0;
     const uint num32Slabs = (numSlabs + 31) / 32;
     for (uint i = 0; i < num32Slabs; ++i)
-        referenceCount += countbits(gEncodedReferenceCount[index + i * numSolverBodies]);
+        referenceCount += countbits(encodedReferenceCount[index + i * numSolverBodies]);
     return max(1u, referenceCount);
+}
+
+// mirrors resetSlabCount() in solverBlock.cuh
+void resetSlabCountBda(uint index, uint numSlabs, uint numSolverBodies, Ptr<uint> encodedReferenceCount)
+{
+    const uint num32Slabs = (numSlabs + 31) / 32;
+    for (uint i = 0; i < num32Slabs; ++i)
+        encodedReferenceCount[index + i * numSolverBodies] = 0u;
 }
 
 // mirrors Dy::computeRecipUnitResponse()
@@ -381,43 +370,71 @@ float calculateResidual(float deltaF, float velocityMultiplier)
     return velocityMultiplier == 0.0f ? 0.0f : deltaF / velocityMultiplier;
 }
 
+// mirrors PxgErrorAccumulator (gpucommon/src/CUDA/solverResidual.cuh): the
+// per-thread contact residual statistics.
+struct PxgErrorAccumulatorSlang
+{
+    float sumOfSquares;
+    int counter;
+    float maxError;
+}
+
+// PxgErrorAccumulator::accumulateErrorLocal().  CUDA computes the residual
+// with __fdividef; exact division here (the CPU references divide exactly too).
+void pxgAccumulateErrorLocal(inout PxgErrorAccumulatorSlang e, float deltaF, float velocityMultiplier)
+{
+    const float r = velocityMultiplier == 0.0f ? 0.0f : deltaF / velocityMultiplier;
+    e.sumOfSquares += r * r;
+    ++e.counter;
+    e.maxError = max(e.maxError, abs(r));
+}
+
 // ---------------------------------------------------------------------------
-// solve functions
+// solve functions (BDA)
 // ---------------------------------------------------------------------------
 
-// mirrors solveContactBlock() in solverBlock.cuh
-void solveContactBlock(uint batchIndex, inout float3 b0LinVel, inout float3 b0AngVel,
-                       inout float3 b1LinVel, inout float3 b1AngVel, bool doFriction,
-                       uint threadIndex, float ref0, float ref1)
+// mirrors solveContactBlock() in solverBlock.cuh, incl. the PxgErrorAccumulator
+// statistics (the CUDA helper takes a PxgErrorAccumulator* that is null when
+// residual accumulation is off; errorEnabled mirrors that pointer's nullness)
+void solveContactBlockBda(Ptr<PxgBlockConstraintBatch> batches, uint batchIndex,
+                          inout float3 b0LinVel, inout float3 b0AngVel,
+                          inout float3 b1LinVel, inout float3 b1AngVel, bool doFriction,
+                          uint threadIndex,
+                          Ptr<PxgBlockSolverContactHeader> contactHeaders,
+                          Ptr<PxgBlockSolverFrictionHeader> frictionHeaders,
+                          Ptr<PxgBlockSolverContactPoint> contactPointsBuf,
+                          Ptr<PxgBlockSolverContactFriction> frictionsBuf,
+                          bool errorEnabled, inout PxgErrorAccumulatorSlang error,
+                          float ref0, float ref1)
 {
-    const uint constraintBatchIndex = gBatches[batchIndex].mConstraintBatchIndex;
-    const uint startConstraintIndex = gBatches[batchIndex].startConstraintIndex;
-    const uint startFrictionIndex = gBatches[batchIndex].startFrictionIndex;
+    const uint constraintBatchIndex = batches[batchIndex].mConstraintBatchIndex;
+    const uint startConstraintIndex = batches[batchIndex].startConstraintIndex;
+    const uint startFrictionIndex = batches[batchIndex].startFrictionIndex;
 
     float3 linVel0 = b0LinVel;
     float3 linVel1 = b1LinVel;
     float3 angVel0 = b0AngVel;
     float3 angVel1 = b1AngVel;
 
-    const uint numNormalConstr = gContactHeaders[constraintBatchIndex].numNormalConstr[threadIndex];
-    const uint numFrictionConstr = gFrictionHeaders[constraintBatchIndex].numFrictionConstr[threadIndex];
+    const uint numNormalConstr = contactHeaders[constraintBatchIndex].numNormalConstr[threadIndex];
+    const uint numFrictionConstr = frictionHeaders[constraintBatchIndex].numFrictionConstr[threadIndex];
 
     float accumulatedNormalImpulse = 0.0f;
 
-    const float4 invMass0_1_angDom0_1 = gContactHeaders[constraintBatchIndex].invMass0_1_angDom0_1[threadIndex];
+    const float4 invMass0_1_angDom0_1 = contactHeaders[constraintBatchIndex].invMass0_1_angDom0_1[threadIndex];
 
     const float invMassA = ref0 * invMass0_1_angDom0_1.x;
     const float invMassB = ref1 * invMass0_1_angDom0_1.y;
     const float angDom0 = ref0 * invMass0_1_angDom0_1.z;
     const float angDom1 = ref1 * invMass0_1_angDom0_1.w;
 
-    const float4 normal_staticFriction = gContactHeaders[constraintBatchIndex].normal_staticFriction[threadIndex];
+    const float4 normal_staticFriction = contactHeaders[constraintBatchIndex].normal_staticFriction[threadIndex];
     const float3 normal = normal_staticFriction.xyz;
     const float staticFrictionCof = normal_staticFriction.w;
 
-    const float restitution = gContactHeaders[constraintBatchIndex].restitution[threadIndex];
+    const float restitution = contactHeaders[constraintBatchIndex].restitution[threadIndex];
     const float p8 = 0.8f;
-    const uint flags = gContactHeaders[constraintBatchIndex].flags[threadIndex];
+    const uint flags = contactHeaders[constraintBatchIndex].flags[threadIndex];
 
     const float3 delLinVel0 = normal * invMassA;
     const float3 delLinVel1 = normal * invMassB;
@@ -426,13 +443,13 @@ void solveContactBlock(uint batchIndex, inout float3 b0LinVel, inout float3 b0An
     {
         const uint c = startConstraintIndex + i;
 
-        const float4 raXn_targetVelocity = gContactPoints[c].raXn_targetVelocity[threadIndex];
-        const float4 rbXn_maxImpulse = gContactPoints[c].rbXn_maxImpulse[threadIndex];
-        const float appliedForce = gContactPoints[c].appliedForce[threadIndex];
-        const float resp0 = gContactPoints[c].resp0[threadIndex];
-        const float resp1 = gContactPoints[c].resp1[threadIndex];
-        const float coeff0 = gContactPoints[c].coeff0[threadIndex];
-        const float coeff1 = gContactPoints[c].coeff1[threadIndex];
+        const float4 raXn_targetVelocity = contactPointsBuf[c].raXn_targetVelocity[threadIndex];
+        const float4 rbXn_maxImpulse = contactPointsBuf[c].rbXn_maxImpulse[threadIndex];
+        const float appliedForce = contactPointsBuf[c].appliedForce[threadIndex];
+        const float resp0 = contactPointsBuf[c].resp0[threadIndex];
+        const float resp1 = contactPointsBuf[c].resp1[threadIndex];
+        const float coeff0 = contactPointsBuf[c].coeff0[threadIndex];
+        const float coeff1 = contactPointsBuf[c].coeff1[threadIndex];
 
         const float3 raXn = raXn_targetVelocity.xyz;
         const float3 rbXn = rbXn_maxImpulse.xyz;
@@ -467,14 +484,17 @@ void solveContactBlock(uint batchIndex, inout float3 b0LinVel, inout float3 b0An
         angVel0 += raXn * (deltaF * angDom0);
         angVel1 -= rbXn * (deltaF * angDom1);
 
-        gContactPoints[c].appliedForce[threadIndex] = newForce;
+        if (errorEnabled)
+            pxgAccumulateErrorLocal(error, deltaF, velMultiplier);
+
+        contactPointsBuf[c].appliedForce[threadIndex] = newForce;
 
         accumulatedNormalImpulse = accumulatedNormalImpulse + newForce;
     }
 
     if (numFrictionConstr != 0 && doFriction)
     {
-        const float dynamicFrictionCof = gFrictionHeaders[constraintBatchIndex].dynamicFriction[threadIndex];
+        const float dynamicFrictionCof = frictionHeaders[constraintBatchIndex].dynamicFriction[threadIndex];
         const float maxFrictionImpulse = staticFrictionCof * accumulatedNormalImpulse;
         const float maxDynFrictionImpulse = dynamicFrictionCof * accumulatedNormalImpulse;
 
@@ -485,14 +505,14 @@ void solveContactBlock(uint batchIndex, inout float3 b0LinVel, inout float3 b0An
             const uint f = startFrictionIndex + i;
 
             const float4 frictionNormal = (i & 1) != 0
-                ? gFrictionHeaders[constraintBatchIndex].frictionNormals1[threadIndex]
-                : gFrictionHeaders[constraintBatchIndex].frictionNormals0[threadIndex];
+                ? frictionHeaders[constraintBatchIndex].frictionNormals1[threadIndex]
+                : frictionHeaders[constraintBatchIndex].frictionNormals0[threadIndex];
 
-            const float4 raXn_bias = gFrictions[f].raXn_bias[threadIndex];
-            const float4 rbXn_targetVelW = gFrictions[f].rbXn_targetVelW[threadIndex];
-            const float appliedForce = gFrictions[f].appliedForce[threadIndex];
-            const float resp0 = gFrictions[f].resp0[threadIndex];
-            const float resp1 = gFrictions[f].resp1[threadIndex];
+            const float4 raXn_bias = frictionsBuf[f].raXn_bias[threadIndex];
+            const float4 rbXn_targetVelW = frictionsBuf[f].rbXn_targetVelW[threadIndex];
+            const float appliedForce = frictionsBuf[f].appliedForce[threadIndex];
+            const float resp0 = frictionsBuf[f].resp0[threadIndex];
+            const float resp1 = frictionsBuf[f].resp1[threadIndex];
 
             const float3 fnormal = frictionNormal.xyz;
             const float3 raXn = raXn_bias.xyz;
@@ -522,15 +542,18 @@ void solveContactBlock(uint batchIndex, inout float3 b0LinVel, inout float3 b0An
 
             const float deltaF = newAppliedForce - appliedForce;
 
+            if (errorEnabled)
+                pxgAccumulateErrorLocal(error, deltaF, velMultiplier);
+
             linVel0 += fdelLinVel0 * deltaF;
             linVel1 -= fdelLinVel1 * deltaF;
             angVel0 += raXn * (deltaF * angDom0);
             angVel1 -= rbXn * (deltaF * angDom1);
 
-            gFrictions[f].appliedForce[threadIndex] = newAppliedForce;
+            frictionsBuf[f].appliedForce[threadIndex] = newAppliedForce;
             broken = broken | (clampImpulse ? 1u : 0u);
         }
-        gFrictionHeaders[constraintBatchIndex].broken[threadIndex] = broken;
+        frictionHeaders[constraintBatchIndex].broken[threadIndex] = broken;
     }
 
     b0LinVel = linVel0;
@@ -540,35 +563,39 @@ void solveContactBlock(uint batchIndex, inout float3 b0LinVel, inout float3 b0An
 }
 
 // mirrors solve1DBlock() in solverBlock.cuh
-void solve1DBlock(uint batchIndex, inout float3 b0LinVel, inout float3 b0AngVel,
-                  inout float3 b1LinVel, inout float3 b1AngVel, uint threadIndex,
-                  bool residualReportingEnabled, float ref0, float ref1)
+void solve1DBlockBda(Ptr<PxgBlockConstraintBatch> batches, uint batchIndex,
+                     inout float3 b0LinVel, inout float3 b0AngVel,
+                     inout float3 b1LinVel, inout float3 b1AngVel, uint threadIndex,
+                     Ptr<PxgBlockSolverConstraint1DHeader> jointHeaders,
+                     Ptr<PxgBlockSolverConstraint1DCon> jointRowsCon,
+                     Ptr<PxgBlockSolverConstraint1DMod> jointRowsMod,
+                     bool residualReportingEnabled, float ref0, float ref1)
 {
-    const uint constraintBatchIndex = gBatches[batchIndex].mConstraintBatchIndex;
-    const uint startConstraintIndex = gBatches[batchIndex].startConstraintIndex;
+    const uint constraintBatchIndex = batches[batchIndex].mConstraintBatchIndex;
+    const uint startConstraintIndex = batches[batchIndex].startConstraintIndex;
 
     float3 linVel0 = b0LinVel;
     float3 linVel1 = b1LinVel;
     float3 angVel0 = b0AngVel;
     float3 angVel1 = b1AngVel;
 
-    const float invMass0 = ref0 * gJointHeaders[constraintBatchIndex].invMass0D0[threadIndex];
-    const float invMass1 = ref1 * gJointHeaders[constraintBatchIndex].invMass1D1[threadIndex];
-    const float invInertiaScale0 = ref0 * gJointHeaders[constraintBatchIndex].invInertiaScale0[threadIndex];
-    const float invInertiaScale1 = ref1 * gJointHeaders[constraintBatchIndex].invInertiaScale1[threadIndex];
+    const float invMass0 = ref0 * jointHeaders[constraintBatchIndex].invMass0D0[threadIndex];
+    const float invMass1 = ref1 * jointHeaders[constraintBatchIndex].invMass1D1[threadIndex];
+    const float invInertiaScale0 = ref0 * jointHeaders[constraintBatchIndex].invInertiaScale0[threadIndex];
+    const float invInertiaScale1 = ref1 * jointHeaders[constraintBatchIndex].invInertiaScale1[threadIndex];
 
     // PxU16 rowCounts[32]: two lanes per word
-    const uint rowCountWord = gJointHeaders[constraintBatchIndex].rowCounts[threadIndex >> 1];
+    const uint rowCountWord = jointHeaders[constraintBatchIndex].rowCounts[threadIndex >> 1];
     const uint rowCount = (rowCountWord >> ((threadIndex & 1) * 16)) & 0xFFFFu;
 
     for (uint i = 0; i < rowCount; ++i)
     {
         const uint r = startConstraintIndex + i;
 
-        const float4 _clinVel0_minImpulse = gJointRowsCon[r].lin0XYZ_minImpulse[threadIndex];
-        const float4 _clinVel1_maxImpulse = gJointRowsCon[r].lin1XYZ_maxImpulse[threadIndex];
-        const float4 _cangVel0_resp0 = gJointRowsCon[r].ang0XYZ_resp0[threadIndex];
-        const float4 _cangVel1_resp1 = gJointRowsCon[r].ang1XYZ_resp1[threadIndex];
+        const float4 _clinVel0_minImpulse = jointRowsCon[r].lin0XYZ_minImpulse[threadIndex];
+        const float4 _clinVel1_maxImpulse = jointRowsCon[r].lin1XYZ_maxImpulse[threadIndex];
+        const float4 _cangVel0_resp0 = jointRowsCon[r].ang0XYZ_resp0[threadIndex];
+        const float4 _cangVel1_resp1 = jointRowsCon[r].ang1XYZ_resp1[threadIndex];
 
         const float3 clinVel0 = _clinVel0_minImpulse.xyz;
         const float3 clinVel1 = _clinVel1_maxImpulse.xyz;
@@ -577,11 +604,11 @@ void solve1DBlock(uint batchIndex, inout float3 b0LinVel, inout float3 b0AngVel,
 
         const float resp0 = ref0 * _cangVel0_resp0.w;
         const float resp1 = ref1 * _cangVel1_resp1.w;
-        const float initJointSpeed = gJointRowsCon[r].initJointSpeed[threadIndex];
+        const float initJointSpeed = jointRowsCon[r].initJointSpeed[threadIndex];
 
-        const float coeff0 = gJointRowsMod[r].coeff0[threadIndex];
-        const float coeff1 = gJointRowsMod[r].coeff1[threadIndex];
-        const uint flags = gJointRowsMod[r].flags[threadIndex];
+        const float coeff0 = jointRowsMod[r].coeff0[threadIndex];
+        const float coeff1 = jointRowsMod[r].coeff1[threadIndex];
+        const uint flags = jointRowsMod[r].flags[threadIndex];
 
         const float unitResponse = resp0 + resp1;
         const float recipResponse = computeRecipUnitResponse(unitResponse, DY_MIN_RESPONSE);
@@ -595,7 +622,7 @@ void solve1DBlock(uint batchIndex, inout float3 b0LinVel, inout float3 b0AngVel,
                                               initJointSpeed, unitResponse, recipResponse, constant,
                                               unbiasedConstant, vMul, iMul);
 
-        const float appliedForce = gJointRowsMod[r].appliedForce[threadIndex];
+        const float appliedForce = jointRowsMod[r].appliedForce[threadIndex];
 
         const float maxImpulse = _clinVel1_maxImpulse.w;
         const float minImpulse = _clinVel0_minImpulse.w;
@@ -608,9 +635,9 @@ void solve1DBlock(uint batchIndex, inout float3 b0LinVel, inout float3 b0AngVel,
         const float clampedForce = min(maxImpulse, max(minImpulse, unclampedForce));
         const float deltaF = clampedForce - appliedForce;
 
-        gJointRowsMod[r].appliedForce[threadIndex] = clampedForce;
+        jointRowsMod[r].appliedForce[threadIndex] = clampedForce;
         if (residualReportingEnabled)
-            gJointRowsMod[r].residual[threadIndex] = calculateResidual(deltaF, vMul);
+            jointRowsMod[r].residual[threadIndex] = calculateResidual(deltaF, vMul);
 
         linVel0 = linVel0 + clinVel0 * (deltaF * invMass0);
         linVel1 = linVel1 - clinVel1 * (deltaF * invMass1);
@@ -625,175 +652,407 @@ void solve1DBlock(uint batchIndex, inout float3 b0LinVel, inout float3 b0AngVel,
 }
 
 // ---------------------------------------------------------------------------
-// kernel
+// solveBlockPartition (BDA engine ABI) — the per-partition dynamic-vs-dynamic
+// rigid contact/joint velocity solve
 // ---------------------------------------------------------------------------
+//
+// Port of solveBlockPartition() in solverMultiBlock.cu.  The engine launches it
+// ONCE PER PARTITION inside solvePartitions() (PxgCudaSolverCore.cpp), passing
+// the current partition index; each launch solves exactly that one partition's
+// rigid batches.  Signature:
+//   (PxgSolverCoreDesc*, const PxgSolverSharedDesc<IterativeSolveData>*,
+//    PxU32 islandIndex, PxU32 partitionIndex, bool doFriction)
+//   -> argSizes {8,8,4,4,1}: the bool byte lands at blob offset 24 (bytes
+//   25..31 are zero-filled padding), 32 bytes total.
+//
+// Thread layout mirrors the CUDA launch: block = SOLVE_BLOCK_PARTITION = 64
+// threads FLAT (unlike the TGS solveBlockUnified's (32,2,1)); the .cu computes
+// the GLOBAL warp index (threadIdx.x + blockIdx.x * blockDim.x) / 32, so
+// numthreads = (64,1,1) and grid = nbBlocks (WorkgroupCount().x).  The .cu body
+// is a single `if (k < endIndex)` (its strided loop is commented out); we use
+// the equivalent strided loop, stride = WorkgroupCount().x * 2 — a
+// behaviour-preserving superset: within one partition no two batches share a
+// body, so processing several batches per warp is safe, and it makes the batch
+// loads control-dependent on a real loop guard (llvmpipe zero-trip safety,
+// same technique as solveBlockUnified in solverTGS.slang).
+//
+// PGS velocity staging: readIndex = k * 128 + lane, FOUR float4 stripes
+// (lin0/ang0/lin1/ang1 at +0/+32/+64/+96) — VERIFIED against the .cu (TGS uses
+// k * 192).  Writeback goes to remappedBodyA/BIndex (ComputeBodyBatchStartIndex
+// is the identity) at +0/+32.
+//
+// The .cu reads bodyOffset / numDynamicBodies / numArticulations from
+// islandContextPool[0] (islandContextPool->…), NOT islandContextPool[islandIndex]
+// — mirrored exactly; the batch range comes from island[islandIndex].
+struct SolveBlockPartitionAbiParams
+{
+    uint64_t solverCoreDesc; // @0
+    uint64_t sharedDesc;     // @8
+    uint islandIndex;        // @16
+    uint partitionIndex;     // @20
+    uint doFrictionWord;     // @24: byte 0 = doFriction (bytes 25..27 padding)
+    uint abiPad0;            // @28 (blob tail padding to the 8-alignment, never read)
+}                            // = 32
+[[vk::push_constant]]
+ConstantBuffer<SolveBlockPartitionAbiParams> gSolveAbi;
 
-// mirrors solveBlockPartition() in solverMultiBlock.cu (rigid-body path);
-// one workgroup = one warp = one constraint batch
+// per-warp residual-reduction scratch: block = 64 -> 2 warps of 32 lanes
+// (mirrors solveBlockUnified's accumulateErrorGlobalFullWarp scratch).
+groupshared float shSolveErrSum[64];
+groupshared float shSolveErrMax[64];
+groupshared uint  shSolveErrCount[64];
+
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(64, 1, 1)]
 void solveBlockPartition(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
-    const uint threadIndexInWarp = groupThreadId.x;
-    const uint k = gParams.startIndex + groupId.x;
+    Ptr<PxgSolverCoreDescGpu> descPtr = Ptr<PxgSolverCoreDescGpu>(gSolveAbi.solverCoreDesc);
+    PxgSolverCoreDescGpu desc = descPtr[0];
+    PxgSolverSharedDescPGSGpu sharedDesc = (Ptr<PxgSolverSharedDescPGSGpu>(gSolveAbi.sharedDesc))[0];
+    PxgIslandContextGpu island =
+        (Ptr<PxgIslandContextGpu>(desc.islandContextPool))[gSolveAbi.islandIndex];
+    // The .cu reads mBodyStartIndex / mBodyCount / mArticulationCount from
+    // islandContextPool[0] (islandContextPool->…); mirror that exactly.
+    PxgIslandContextGpu island0 = (Ptr<PxgIslandContextGpu>(desc.islandContextPool))[0];
 
-    if (k >= gParams.endIndex)
-        return;
+    const uint partitionIndex = gSolveAbi.partitionIndex;
+    const uint startPartitionIndex = island.mStartPartitionIndex;
 
-    const uint descStride = gBatches[k].descStride_constraintType & 0xFFFFu;
-    const uint constraintType = gBatches[k].descStride_constraintType >> 16;
+    const uint threadIndexInWarp = groupThreadId.x & 31u;
+    const uint warpIndex = (groupThreadId.x + groupId.x * 64u) / 32u; // global warp index
+    const uint numWarpsInGrid = WorkgroupCount().x * 2u;
 
-    const uint readIndex = k * 128 + threadIndexInWarp;
+    Ptr<float4> bodyVelocities = Ptr<float4>(sharedDesc.iter_solverBodyVelPool);
+    Ptr<PxgBlockConstraintBatch> batches = Ptr<PxgBlockConstraintBatch>(sharedDesc.iter_blockConstraintBatch);
+    Ptr<PxgBlockSolverContactHeader> contactHeaders =
+        Ptr<PxgBlockSolverContactHeader>(sharedDesc.iter_blockContactHeaders);
+    Ptr<PxgBlockSolverFrictionHeader> frictionHeaders =
+        Ptr<PxgBlockSolverFrictionHeader>(sharedDesc.iter_blockFrictionHeaders);
+    Ptr<PxgBlockSolverContactPoint> contactPoints =
+        Ptr<PxgBlockSolverContactPoint>(sharedDesc.iter_blockContactPoints);
+    Ptr<PxgBlockSolverContactFriction> frictionsBuf =
+        Ptr<PxgBlockSolverContactFriction>(sharedDesc.iter_blockFrictions);
+    Ptr<PxgBlockSolverConstraint1DHeader> jointHeaders =
+        Ptr<PxgBlockSolverConstraint1DHeader>(sharedDesc.iter_blockJointConstraintHeaders);
+    Ptr<PxgBlockSolverConstraint1DCon> jointRowsCon =
+        Ptr<PxgBlockSolverConstraint1DCon>(sharedDesc.iter_blockJointConstraintRowsCon);
+    Ptr<PxgBlockSolverConstraint1DMod> jointRowsMod =
+        Ptr<PxgBlockSolverConstraint1DMod>(sharedDesc.iter_blockJointConstraintRowsMod);
+    Ptr<uint> constraintsPerPartition = Ptr<uint>(desc.constraintsPerPartition);
+    Ptr<uint> encodedReferenceCount = Ptr<uint>(sharedDesc.iter_solverEncodedReferenceCount);
 
-    if (threadIndexInWarp < descStride)
+    const uint bodyOffset = island0.mBodyStartIndex;
+    const uint numDynamicBodies = island0.mBodyCount; // nbBodies minus offset!
+    const uint numTotalBodies = bodyOffset + numDynamicBodies + island0.mArticulationCount;
+
+    const bool residualAccumulationEnabled = desc.contactErrorAccumulator_mCounter >= 0;
+    PxgErrorAccumulatorSlang error = { 0.0f, 0, 0.0f };
+
+    // Null / empty-partition guard (llvmpipe): a constraint-free island leaves
+    // the block-constraint pointer null/unallocated and mNumPartitions == 0; the
+    // SPIR-V optimizer would speculatively hoist the first batches[] load out of
+    // the (then zero-trip) batch loop and fault.  The uniform scalar guard makes
+    // every dependent load control-dependent on it — semantically exact: no
+    // batch buffer / no partitions == no batches to solve.  The residual
+    // reduction below runs unconditionally (uniform control flow around its
+    // barriers) regardless of this guard.
+    if (sharedDesc.iter_blockConstraintBatch != 0 && island.mNumPartitions != 0 &&
+        partitionIndex < island.mNumPartitions)
     {
-        const float4 linVel0 = gSolverBodyVelPool[readIndex];
-        const float4 angVel0 = gSolverBodyVelPool[readIndex + 32];
-        const float4 linVel1 = gSolverBodyVelPool[readIndex + 64];
-        const float4 angVel1 = gSolverBodyVelPool[readIndex + 96];
+        const uint startIndex = (partitionIndex == 0)
+            ? island.mBatchStartIndex
+            : constraintsPerPartition[partitionIndex + startPartitionIndex - 1u];
+        const uint endIndex = constraintsPerPartition[partitionIndex + startPartitionIndex];
 
-        float3 lv0 = linVel0.xyz;
-        float3 lv1 = linVel1.xyz;
-        float3 av0 = angVel0.xyz;
-        float3 av1 = angVel1.xyz;
+        for (uint k = startIndex + warpIndex; k < endIndex; k += numWarpsInGrid)
+        {
+            const uint descStride = batches[k].descStride_constraintType & 0xFFFFu;
+            const uint constraintType = batches[k].descStride_constraintType >> 16;
 
-        // Reference counts to be used for the current sub-timestep or iteration
-        // (mass splitting across slabs).
-        float curRef0 = 1.0f;
-        float curRef1 = 1.0f;
+            const uint readIndex = k * 128u + threadIndexInWarp;
 
-        if (gBatches[k].bodyAIndex[threadIndexInWarp] >= gParams.bodyOffset)
-            curRef0 = float(countActiveSlabs(gBatches[k].bodyAIndex[threadIndexInWarp], gParams.numSlabs,
-                                             gParams.numTotalBodies));
-        if (gBatches[k].bodyBIndex[threadIndexInWarp] >= gParams.bodyOffset)
-            curRef1 = float(countActiveSlabs(gBatches[k].bodyBIndex[threadIndexInWarp], gParams.numSlabs,
-                                             gParams.numTotalBodies));
+            if (threadIndexInWarp < descStride)
+            {
+                const float4 linVel0 = bodyVelocities[readIndex];
+                const float4 angVel0 = bodyVelocities[readIndex + 32u];
+                const float4 linVel1 = bodyVelocities[readIndex + 64u];
+                const float4 angVel1 = bodyVelocities[readIndex + 96u];
 
-        if (pxgIsContactType(constraintType))
-            solveContactBlock(k, lv0, av0, lv1, av1, gParams.doFriction != 0, threadIndexInWarp, curRef0, curRef1);
-        else
-            solve1DBlock(k, lv0, av0, lv1, av1, threadIndexInWarp, gParams.residualReportingEnabled != 0,
-                         curRef0, curRef1);
+                float3 lv0 = linVel0.xyz;
+                float3 lv1 = linVel1.xyz;
+                float3 av0 = angVel0.xyz;
+                float3 av1 = angVel1.xyz;
 
-        const uint indexA = gBatches[k].remappedBodyAIndex[threadIndexInWarp]; // ComputeBodyBatchStartIndex = identity
-        const uint indexB = gBatches[k].remappedBodyBIndex[threadIndexInWarp];
+                // Reference counts to be used for the current sub-timestep or
+                // iteration (mass splitting across slabs).
+                float curRef0 = 1.0f;
+                float curRef1 = 1.0f;
 
-        gSolverBodyVelPool[indexA] = float4(lv0, 0.0f);
-        gSolverBodyVelPool[indexA + 32] = float4(av0, 0.0f);
-        gSolverBodyVelPool[indexB] = float4(lv1, 0.0f);
-        gSolverBodyVelPool[indexB + 32] = float4(av1, 0.0f);
+                const uint bodyAIndex = batches[k].bodyAIndex[threadIndexInWarp];
+                const uint bodyBIndex = batches[k].bodyBIndex[threadIndexInWarp];
+
+                if (bodyAIndex >= bodyOffset)
+                    curRef0 = float(countActiveSlabsBda(bodyAIndex, desc.numSlabs, numTotalBodies,
+                                                        encodedReferenceCount));
+                if (bodyBIndex >= bodyOffset)
+                    curRef1 = float(countActiveSlabsBda(bodyBIndex, desc.numSlabs, numTotalBodies,
+                                                        encodedReferenceCount));
+
+                if (pxgIsContactType(constraintType))
+                    solveContactBlockBda(batches, k, lv0, av0, lv1, av1,
+                                         (gSolveAbi.doFrictionWord & 0xffu) != 0, threadIndexInWarp,
+                                         contactHeaders, frictionHeaders, contactPoints, frictionsBuf,
+                                         residualAccumulationEnabled, error, curRef0, curRef1);
+                else
+                    solve1DBlockBda(batches, k, lv0, av0, lv1, av1, threadIndexInWarp,
+                                    jointHeaders, jointRowsCon, jointRowsMod,
+                                    residualAccumulationEnabled, curRef0, curRef1);
+
+                const uint indexA = batches[k].remappedBodyAIndex[threadIndexInWarp]; // ComputeBodyBatchStartIndex = identity
+                const uint indexB = batches[k].remappedBodyBIndex[threadIndexInWarp];
+
+                bodyVelocities[indexA] = float4(lv0, 0.0f);
+                bodyVelocities[indexA + 32u] = float4(av0, 0.0f);
+                bodyVelocities[indexB] = float4(lv1, 0.0f);
+                bodyVelocities[indexB + 32u] = float4(av1, 0.0f);
+            }
+        }
+    }
+
+    // PxgErrorAccumulator::accumulateErrorGlobalFullWarp(): per-warp sum/sum/max
+    // butterfly reduction, then lane 0 of each warp accumulates into
+    // solverDesc->contactErrorAccumulator.  Mirrors solveBlockUnified in
+    // solverTGS.slang (same 64-thread / 2-warp block).  The reduction runs
+    // unconditionally (uniform control flow around the barriers); warps that
+    // solved joints only reduce their zero-init accumulators, and a disabled
+    // launch skips only the atomics.
+    GroupMemoryBarrierWithGroupSync();
+    shSolveErrSum[groupThreadId.x] = error.sumOfSquares;
+    shSolveErrMax[groupThreadId.x] = error.maxError;
+    shSolveErrCount[groupThreadId.x] = uint(error.counter);
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint radius = 16u; radius > 0u; radius >>= 1)
+    {
+        const uint partner = groupThreadId.x ^ radius; // stays inside the warp's 32 lanes
+        const float s = shSolveErrSum[partner];
+        const float m = shSolveErrMax[partner];
+        const uint c = shSolveErrCount[partner];
+        GroupMemoryBarrierWithGroupSync();
+        shSolveErrSum[groupThreadId.x] += s;
+        shSolveErrMax[groupThreadId.x] = max(shSolveErrMax[groupThreadId.x], m);
+        shSolveErrCount[groupThreadId.x] += c;
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (residualAccumulationEnabled && threadIndexInWarp == 0u)
+    {
+        const float sumSq = shSolveErrSum[groupThreadId.x];
+        const uint count = shSolveErrCount[groupThreadId.x];
+        const float maxErr = shSolveErrMax[groupThreadId.x];
+
+        // atomicAdd(&mErrorSumOfSquares, s): float atomic add via CAS on raw bits
+        uint assumed = descPtr[0].contactErrorAccumulator_mErrorSumOfSquares;
+        for (;;)
+        {
+            const uint newBits = asuint(asfloat(assumed) + sumSq);
+            uint old;
+            InterlockedCompareExchange(descPtr[0].contactErrorAccumulator_mErrorSumOfSquares, assumed,
+                                       newBits, old);
+            if (old == assumed)
+                break;
+            assumed = old;
+        }
+
+        int oldCount;
+        InterlockedAdd(descPtr[0].contactErrorAccumulator_mCounter, int(count), oldCount);
+
+        if (maxErr > asfloat(descPtr[0].contactErrorAccumulator_mMaxError))
+        {
+            assumed = descPtr[0].contactErrorAccumulator_mMaxError;
+            for (;;)
+            {
+                const uint newBits = asuint(max(maxErr, asfloat(assumed)));
+                uint old;
+                InterlockedCompareExchange(descPtr[0].contactErrorAccumulator_mMaxError, assumed,
+                                           newBits, old);
+                if (old == assumed)
+                    break;
+                assumed = old;
+            }
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
-// conclude / writeback / averaging kernels (solverMultiBlock.cu)
+// concludeBlocks (BDA engine ABI)
 // ---------------------------------------------------------------------------
+//
+// Port of concludeBlocks() in solverMultiBlock.cu (concludeContactBlock +
+// conclude1DBlock in solverBlock.cuh): switches the constraint constants to
+// their unbiased variants for the velocity-iteration phase.  Unlike the TGS
+// twin, the contact branch is REAL work here (coeff0 <- coeff1 for
+// non-compliant contacts, friction bias zeroing).  The engine launches it with
+// (PxgSolverCoreDesc*, PxgSolverSharedDesc<IterativeSolveData>*, PxU32
+// islandIndex): argSizes {8,8,4} -> 24-byte blob.  One warp per batch, block =
+// CONCLUDE_BLOCKS (256) threads = 8 warps, grid = nbBlocksRequired
+// (WorkgroupCount().x), so the GLOBAL warp index selects the batch.
+struct ConcludeBlocksAbiParams
+{
+    uint64_t solverCoreDesc; // @0
+    uint64_t sharedDesc;     // @8
+    uint islandIndex;        // @16
+    uint abiPad0;            // @20 (blob tail padding, never read)
+}                            // = 24
+[[vk::push_constant]]
+ConstantBuffer<ConcludeBlocksAbiParams> gConcludeAbi;
 
-static const uint DY_SC_FLAG_OUTPUT_FORCE = 1u << 1;
-static const uint PXG_CONTACT_FLAG_HAS_FORCE_THRESHOLDS = 1u << 0;
-static const float PX_MAX_REAL = 3.4028234663852885981170418348452e+38f;
-
-// mirrors concludeBlocks() (concludeContactBlock + conclude1DBlock in
-// solverBlock.cuh): switches the constraint constants to their unbiased
-// variants for the velocity-iteration phase
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(256, 1, 1)]
 void concludeBlocks(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
-    const uint threadIndex = groupThreadId.x;
-    const uint k = gParams.startIndex + groupId.x;
+    PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gConcludeAbi.solverCoreDesc))[0];
+    PxgSolverSharedDescPGSGpu sharedDesc =
+        (Ptr<PxgSolverSharedDescPGSGpu>(gConcludeAbi.sharedDesc))[0];
+    PxgIslandContextGpu island =
+        (Ptr<PxgIslandContextGpu>(desc.islandContextPool))[gConcludeAbi.islandIndex];
 
-    if (k >= gParams.endIndex)
+    const uint startIndex = island.mBatchStartIndex;
+    // endIndex mirrors the .cu: mBatchCount + mArtiBatchCount +
+    // mStaticArtiBatchCount + mSelfArtiBatchCount + mStaticRigidBatchCount +
+    // startIndex.
+    const uint endIndex = island.mBatchCount + island.mArtiBatchCount +
+        island.mStaticArtiBatchCount + island.mSelfArtiBatchCount +
+        island.mStaticRigidBatchCount + startIndex;
+
+    const uint warpSize = 32u;
+    const uint warpIndex = (groupThreadId.x + groupId.x * 256u) / warpSize;
+    const uint threadIndex = groupThreadId.x & (warpSize - 1u);
+
+    const uint k = startIndex + warpIndex;
+    if (k >= endIndex)
         return;
 
-    const uint descStride = gBatches[k].descStride_constraintType & 0xFFFFu;
-    const uint constraintType = gBatches[k].descStride_constraintType >> 16;
+    // Null-guard (llvmpipe): a constraint-free island leaves the block-batch
+    // pointer null/unallocated; the LLVM optimizer would speculatively hoist
+    // the batch load above the range check and fault.  No batch buffer ==
+    // nothing to conclude.
+    if (sharedDesc.iter_blockConstraintBatch == 0)
+        return;
+
+    Ptr<PxgBlockConstraintBatch> batchHeaders =
+        Ptr<PxgBlockConstraintBatch>(sharedDesc.iter_blockConstraintBatch);
+
+    const uint descStride = batchHeaders[k].descStride_constraintType & 0xFFFFu;
+    const uint constraintType = batchHeaders[k].descStride_constraintType >> 16;
     if (threadIndex >= descStride)
         return;
 
-    const uint batchIndex = gBatches[k].mConstraintBatchIndex;
-    const uint startConstraintIndex = gBatches[k].startConstraintIndex;
-    const uint startFrictionIndex = gBatches[k].startFrictionIndex;
+    const uint batchIndex = batchHeaders[k].mConstraintBatchIndex;
+    const uint startConstraintIndex = batchHeaders[k].startConstraintIndex;
+    const uint startFrictionIndex = batchHeaders[k].startFrictionIndex;
 
     if (pxgIsContactType(constraintType))
     {
         // concludeContactBlock()
-        const uint numNormalConstr = gContactHeaders[batchIndex].numNormalConstr[threadIndex];
-        const uint numFrictionConstr = gFrictionHeaders[batchIndex].numFrictionConstr[threadIndex];
+        Ptr<PxgBlockSolverContactHeader> contactHeaders =
+            Ptr<PxgBlockSolverContactHeader>(sharedDesc.iter_blockContactHeaders);
+        Ptr<PxgBlockSolverFrictionHeader> frictionHeaders =
+            Ptr<PxgBlockSolverFrictionHeader>(sharedDesc.iter_blockFrictionHeaders);
+        Ptr<PxgBlockSolverContactPoint> contactPoints =
+            Ptr<PxgBlockSolverContactPoint>(sharedDesc.iter_blockContactPoints);
+        Ptr<PxgBlockSolverContactFriction> frictions =
+            Ptr<PxgBlockSolverContactFriction>(sharedDesc.iter_blockFrictions);
+
+        const uint numNormalConstr = contactHeaders[batchIndex].numNormalConstr[threadIndex];
+        const uint numFrictionConstr = frictionHeaders[batchIndex].numFrictionConstr[threadIndex];
 
         if (numNormalConstr != 0)
         {
-            const float restitution = gContactHeaders[batchIndex].restitution[threadIndex];
+            const float restitution = contactHeaders[batchIndex].restitution[threadIndex];
             // Assigning unbiased error to biased error (compliant contacts
             // enforce this automatically).
             if (restitution >= 0.0f)
             {
                 for (uint i = 0; i < numNormalConstr; i++)
-                    gContactPoints[startConstraintIndex + i].coeff0[threadIndex] =
-                        gContactPoints[startConstraintIndex + i].coeff1[threadIndex];
+                    contactPoints[startConstraintIndex + i].coeff0[threadIndex] =
+                        contactPoints[startConstraintIndex + i].coeff1[threadIndex];
             }
         }
 
         for (uint i = 0; i < numFrictionConstr; i++)
         {
-            float4 raXn_bias = gFrictions[startFrictionIndex + i].raXn_bias[threadIndex];
+            float4 raXn_bias = frictions[startFrictionIndex + i].raXn_bias[threadIndex];
             raXn_bias.w = 0.0f;
-            gFrictions[startFrictionIndex + i].raXn_bias[threadIndex] = raXn_bias;
+            frictions[startFrictionIndex + i].raXn_bias[threadIndex] = raXn_bias;
         }
     }
     else
     {
         // conclude1DBlock()
-        const uint rowCountWord = gJointHeaders[batchIndex].rowCounts[threadIndex >> 1];
+        Ptr<PxgBlockSolverConstraint1DHeader> jointHeaders =
+            Ptr<PxgBlockSolverConstraint1DHeader>(sharedDesc.iter_blockJointConstraintHeaders);
+        Ptr<PxgBlockSolverConstraint1DMod> jointRowsMod =
+            Ptr<PxgBlockSolverConstraint1DMod>(sharedDesc.iter_blockJointConstraintRowsMod);
+
+        const uint rowCountWord = jointHeaders[batchIndex].rowCounts[threadIndex >> 1];
         const uint rowCount = (rowCountWord >> ((threadIndex & 1) * 16)) & 0xFFFFu;
 
         for (uint i = 0; i < rowCount; i++)
         {
             const uint r = startConstraintIndex + i;
             // For spring constraints, it is automatically satisfied.
-            if ((gJointRowsMod[r].flags[threadIndex] & DY_SC_FLAG_SPRING) == 0)
-                gJointRowsMod[r].coeff0[threadIndex] = gJointRowsMod[r].coeff1[threadIndex];
+            if ((jointRowsMod[r].flags[threadIndex] & DY_SC_FLAG_SPRING) == 0)
+                jointRowsMod[r].coeff0[threadIndex] = jointRowsMod[r].coeff1[threadIndex];
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// writebackBlocks (BDA engine ABI)
+// ---------------------------------------------------------------------------
+
 // mirrors writeBackContactBlockFriction() in solverBlockCommon.cuh
-void writeBackContactBlockFriction(uint threadIndex, uint numFrictionConstr, uint batchIndex,
-                                   uint startFrictionIndex)
+void writeBackContactBlockFrictionBda(uint threadIndex, uint numFrictionConstr, uint batchIndex,
+                                      uint startFrictionIndex,
+                                      Ptr<PxgBlockSolverFrictionHeader> frictionHeaders,
+                                      Ptr<PxgBlockSolverContactFriction> frictions,
+                                      Ptr<PxgBlockFrictionPatch> blockFrictionPatches,
+                                      Ptr<PxgFrictionPatchGPU> frictionPatches)
 {
-    const uint patchIndex = gBlockFrictionPatches[batchIndex].patchIndex[threadIndex];
+    const uint patchIndex = blockFrictionPatches[batchIndex].patchIndex[threadIndex];
     if (patchIndex != 0xFFFFFFFFu)
     {
-        const float4 axis0 = gFrictionHeaders[batchIndex].frictionNormals0[threadIndex];
-        const float4 axis1 = gFrictionHeaders[batchIndex].frictionNormals1[threadIndex];
+        const float4 axis0 = frictionHeaders[batchIndex].frictionNormals0[threadIndex];
+        const float4 axis1 = frictionHeaders[batchIndex].frictionNormals1[threadIndex];
 
-        gFrictionPatches[patchIndex].anchors = numFrictionConstr / 2;
+        frictionPatches[patchIndex].anchors = numFrictionConstr / 2;
 
         if (numFrictionConstr >= 2)
         {
-            const float4 anchor = gBlockFrictionPatches[batchIndex].anchorPoints0[threadIndex];
-            const float impulse0 = gFrictions[startFrictionIndex + 0].appliedForce[threadIndex];
-            const float impulse1 = gFrictions[startFrictionIndex + 1].appliedForce[threadIndex];
+            const float4 anchor = blockFrictionPatches[batchIndex].anchorPoints0[threadIndex];
+            const float impulse0 = frictions[startFrictionIndex + 0].appliedForce[threadIndex];
+            const float impulse1 = frictions[startFrictionIndex + 1].appliedForce[threadIndex];
             const float3 imp = axis0.xyz * impulse0 + axis1.xyz * impulse1;
-            gFrictionPatches[patchIndex].p0x = anchor.x;
-            gFrictionPatches[patchIndex].p0y = anchor.y;
-            gFrictionPatches[patchIndex].p0z = anchor.z;
-            gFrictionPatches[patchIndex].i0x = imp.x;
-            gFrictionPatches[patchIndex].i0y = imp.y;
-            gFrictionPatches[patchIndex].i0z = imp.z;
+            frictionPatches[patchIndex].p0x = anchor.x;
+            frictionPatches[patchIndex].p0y = anchor.y;
+            frictionPatches[patchIndex].p0z = anchor.z;
+            frictionPatches[patchIndex].i0x = imp.x;
+            frictionPatches[patchIndex].i0y = imp.y;
+            frictionPatches[patchIndex].i0z = imp.z;
         }
         if (numFrictionConstr >= 4)
         {
-            const float4 anchor = gBlockFrictionPatches[batchIndex].anchorPoints1[threadIndex];
-            const float impulse0 = gFrictions[startFrictionIndex + 2].appliedForce[threadIndex];
-            const float impulse1 = gFrictions[startFrictionIndex + 3].appliedForce[threadIndex];
+            const float4 anchor = blockFrictionPatches[batchIndex].anchorPoints1[threadIndex];
+            const float impulse0 = frictions[startFrictionIndex + 2].appliedForce[threadIndex];
+            const float impulse1 = frictions[startFrictionIndex + 3].appliedForce[threadIndex];
             const float3 imp = axis0.xyz * impulse0 + axis1.xyz * impulse1;
-            gFrictionPatches[patchIndex].p1x = anchor.x;
-            gFrictionPatches[patchIndex].p1y = anchor.y;
-            gFrictionPatches[patchIndex].p1z = anchor.z;
-            gFrictionPatches[patchIndex].i1x = imp.x;
-            gFrictionPatches[patchIndex].i1y = imp.y;
-            gFrictionPatches[patchIndex].i1z = imp.z;
+            frictionPatches[patchIndex].p1x = anchor.x;
+            frictionPatches[patchIndex].p1y = anchor.y;
+            frictionPatches[patchIndex].p1z = anchor.z;
+            frictionPatches[patchIndex].i1x = imp.x;
+            frictionPatches[patchIndex].i1y = imp.y;
+            frictionPatches[patchIndex].i1z = imp.z;
         }
     }
 }
@@ -804,62 +1063,112 @@ bool nodeIndexLess(uint2 a, uint2 b)
     return a.y < b.y || (a.y == b.y && a.x < b.x);
 }
 
-// mirrors writebackBlocks() in solverMultiBlock.cu (rigid path).  The CUDA
-// version stages threshold elements in shared memory and appends them with
-// one warp-aggregated atomic; the port appends per-thread — the stream
-// contents are identical, ordering within the stream is nondeterministic in
-// both versions.
+// Port of writebackBlocks() in solverMultiBlock.cu (rigid path:
+// writeBackContactBlock + writeBack1DBlock in solverBlock.cuh).  Engine launch:
+// (PxgSolverCoreDesc*, PxgSolverSharedDesc<IterativeSolveData>*, PxU32
+// islandIndex): argSizes {8,8,4} -> 24-byte blob.  One warp per batch, block =
+// WRITEBACK_BLOCKS (256) = 8 warps, grid = nbBlocksRequired.  Threshold
+// elements are appended per-thread through an atomic on the desc's
+// sharedThresholdStreamIndex counter instead of the CUDA warp-aggregated
+// shared-memory staging: the stream CONTENTS are identical, and the
+// intra-stream ordering is nondeterministic in both versions.
+struct WritebackBlocksAbiParams
+{
+    uint64_t solverCoreDesc; // @0
+    uint64_t sharedDesc;     // @8
+    uint islandIndex;        // @16
+    uint abiPad0;            // @20 (blob tail padding, never read)
+}                            // = 24
+[[vk::push_constant]]
+ConstantBuffer<WritebackBlocksAbiParams> gWritebackAbi;
+
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(256, 1, 1)]
 void writebackBlocks(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
-    const uint threadIndex = groupThreadId.x;
-    const uint k = gParams.startIndex + groupId.x;
+    Ptr<PxgSolverCoreDescGpu> descPtr = Ptr<PxgSolverCoreDescGpu>(gWritebackAbi.solverCoreDesc);
+    PxgSolverCoreDescGpu desc = descPtr[0];
+    PxgSolverSharedDescPGSGpu sharedDesc =
+        (Ptr<PxgSolverSharedDescPGSGpu>(gWritebackAbi.sharedDesc))[0];
+    PxgIslandContextGpu island =
+        (Ptr<PxgIslandContextGpu>(desc.islandContextPool))[gWritebackAbi.islandIndex];
 
-    if (k >= gParams.endIndex)
+    const uint startIndex = island.mBatchStartIndex;
+    const uint endIndex = island.mBatchCount + island.mArtiBatchCount +
+        island.mStaticArtiBatchCount + island.mSelfArtiBatchCount +
+        island.mStaticRigidBatchCount + startIndex;
+
+    const uint warpSize = 32u;
+    const uint warpIndex = (groupThreadId.x + groupId.x * 256u) / warpSize;
+    const uint threadIndex = groupThreadId.x & (warpSize - 1u);
+
+    const uint k = startIndex + warpIndex;
+    if (k >= endIndex)
         return;
 
-    const uint descStride = gBatches[k].descStride_constraintType & 0xFFFFu;
-    const uint constraintType = gBatches[k].descStride_constraintType >> 16;
+    // Null-guard (llvmpipe): see concludeBlocks.
+    if (sharedDesc.iter_blockConstraintBatch == 0)
+        return;
+
+    Ptr<PxgBlockConstraintBatch> batchHeaders =
+        Ptr<PxgBlockConstraintBatch>(sharedDesc.iter_blockConstraintBatch);
+
+    const uint descStride = batchHeaders[k].descStride_constraintType & 0xFFFFu;
+    const uint constraintType = batchHeaders[k].descStride_constraintType >> 16;
     if (threadIndex >= descStride)
         return;
 
-    const uint batchIndex = gBatches[k].mConstraintBatchIndex;
-    const uint startConstraintIndex = gBatches[k].startConstraintIndex;
-    const uint startFrictionIndex = gBatches[k].startFrictionIndex;
+    const uint batchIndex = batchHeaders[k].mConstraintBatchIndex;
+    const uint startConstraintIndex = batchHeaders[k].startConstraintIndex;
+    const uint startFrictionIndex = batchHeaders[k].startFrictionIndex;
 
     if (pxgIsContactType(constraintType))
     {
         // writeBackContactBlock()
-        const uint bodyAIndex = gBatches[k].bodyAIndex[threadIndex];
-        const uint bodyBIndex = gBatches[k].bodyBIndex[threadIndex];
+        Ptr<PxgBlockSolverContactHeader> contactHeaders =
+            Ptr<PxgBlockSolverContactHeader>(sharedDesc.iter_blockContactHeaders);
+        Ptr<PxgBlockSolverFrictionHeader> frictionHeaders =
+            Ptr<PxgBlockSolverFrictionHeader>(sharedDesc.iter_blockFrictionHeaders);
+        Ptr<PxgBlockSolverContactPoint> contactPoints =
+            Ptr<PxgBlockSolverContactPoint>(sharedDesc.iter_blockContactPoints);
+        Ptr<PxgBlockSolverContactFriction> frictions =
+            Ptr<PxgBlockSolverContactFriction>(sharedDesc.iter_blockFrictions);
+        Ptr<PxgBlockFrictionPatch> blockFrictionPatches =
+            Ptr<PxgBlockFrictionPatch>(sharedDesc.blockCurrentFrictionPatches);
+        Ptr<float> forceBuffer = Ptr<float>(desc.forceBuffer);
+        Ptr<PxgFrictionPatchGPU> frictionPatches = Ptr<PxgFrictionPatchGPU>(desc.frictionPatches);
+        Ptr<PxgSolverBodyData> solverBodyData = Ptr<PxgSolverBodyData>(desc.solverBodyDataPool);
 
-        bool forceThreshold = false;
+        const uint bodyAIndex = batchHeaders[k].bodyAIndex[threadIndex];
+        const uint bodyBIndex = batchHeaders[k].bodyBIndex[threadIndex];
+
         float normalForce = 0.0f;
 
-        const uint forceWritebackOffset = gContactHeaders[batchIndex].forceWritebackOffset[threadIndex];
-        forceThreshold = (gContactHeaders[batchIndex].flags[threadIndex] & PXG_CONTACT_FLAG_HAS_FORCE_THRESHOLDS) != 0;
+        const uint forceWritebackOffset = contactHeaders[batchIndex].forceWritebackOffset[threadIndex];
+        const bool forceThreshold =
+            (contactHeaders[batchIndex].flags[threadIndex] & PXG_CONTACT_FLAG_HAS_FORCE_THRESHOLDS) != 0;
 
-        const uint numFrictionConstr = gFrictionHeaders[batchIndex].numFrictionConstr[threadIndex];
-        const uint numNormalConstr = gContactHeaders[batchIndex].numNormalConstr[threadIndex];
+        const uint numFrictionConstr = frictionHeaders[batchIndex].numFrictionConstr[threadIndex];
+        const uint numNormalConstr = contactHeaders[batchIndex].numNormalConstr[threadIndex];
 
         if (forceWritebackOffset != 0xFFFFFFFFu)
         {
             for (uint i = 0; i < numNormalConstr; i++)
             {
-                const float appliedForce = gContactPoints[startConstraintIndex + i].appliedForce[threadIndex];
-                gForceBuffer[forceWritebackOffset + i] = appliedForce;
+                const float appliedForce = contactPoints[startConstraintIndex + i].appliedForce[threadIndex];
+                forceBuffer[forceWritebackOffset + i] = appliedForce;
                 normalForce += appliedForce;
             }
         }
 
-        writeBackContactBlockFriction(threadIndex, numFrictionConstr, batchIndex, startFrictionIndex);
+        writeBackContactBlockFrictionBda(threadIndex, numFrictionConstr, batchIndex, startFrictionIndex,
+                                         frictionHeaders, frictions, blockFrictionPatches, frictionPatches);
 
-        if (numFrictionConstr != 0 && gFrictionHeaders[batchIndex].broken[threadIndex] != 0)
-            gBlockFrictionPatches[batchIndex].broken[threadIndex] = 1;
+        if (numFrictionConstr != 0 && frictionHeaders[batchIndex].broken[threadIndex] != 0)
+            blockFrictionPatches[batchIndex].broken[threadIndex] = 1;
 
-        const float reportThreshold0 = gSolverBodyData[bodyAIndex].reportThreshold;
-        const float reportThreshold1 = gSolverBodyData[bodyBIndex].reportThreshold;
+        const float reportThreshold0 = solverBodyData[bodyAIndex].reportThreshold;
+        const float reportThreshold1 = solverBodyData[bodyBIndex].reportThreshold;
 
         if (forceThreshold && normalForce != 0.0f &&
             (reportThreshold0 < PX_MAX_REAL || reportThreshold1 < PX_MAX_REAL))
@@ -867,8 +1176,8 @@ void writebackBlocks(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_
             ThresholdStreamElement elt;
             elt.normalForce = normalForce;
             elt.threshold = min(reportThreshold0, reportThreshold1);
-            uint2 nodeA = gSolverBodyData[bodyAIndex].islandNodeIndex;
-            uint2 nodeB = gSolverBodyData[bodyBIndex].islandNodeIndex;
+            uint2 nodeA = solverBodyData[bodyAIndex].islandNodeIndex;
+            uint2 nodeB = solverBodyData[bodyBIndex].islandNodeIndex;
             // PxOrder(): swap so nodeIndexA < nodeIndexB
             if (nodeIndexLess(nodeB, nodeA))
             {
@@ -878,22 +1187,35 @@ void writebackBlocks(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_
             }
             elt.nodeIndexA = nodeA;
             elt.nodeIndexB = nodeB;
-            elt.shapeInteraction = gBatches[k].shapeInteraction[threadIndex];
+            elt.shapeInteraction = batchHeaders[k].shapeInteraction[threadIndex];
             elt.accumulatedForce = 0.0f;
             elt.pad = 0;
 
-            uint index;
-            InterlockedAdd(gThresholdStreamIndex[0], 1, index);
-            gThresholdStream[index] = elt;
+            // atomicAdd(&sharedThresholdStreamIndex, 1): the counter lives in the
+            // desc struct itself (PxI32 field), not a separate buffer.
+            Ptr<ThresholdStreamElement> thresholdStream =
+                Ptr<ThresholdStreamElement>(desc.thresholdStream);
+            int index;
+            InterlockedAdd(descPtr[0].sharedThresholdStreamIndex, 1, index);
+            thresholdStream[uint(index)] = elt;
         }
     }
     else
     {
         // writeBack1DBlock()
-        const uint forceWritebackOffset = gJointHeaders[batchIndex].writeBackOffset[threadIndex];
-        const uint breakableWord = gJointHeaders[batchIndex].breakable[threadIndex >> 1];
+        Ptr<PxgBlockSolverConstraint1DHeader> jointHeaders =
+            Ptr<PxgBlockSolverConstraint1DHeader>(sharedDesc.iter_blockJointConstraintHeaders);
+        Ptr<PxgBlockSolverConstraint1DCon> jointRowsCon =
+            Ptr<PxgBlockSolverConstraint1DCon>(sharedDesc.iter_blockJointConstraintRowsCon);
+        Ptr<PxgBlockSolverConstraint1DMod> jointRowsMod =
+            Ptr<PxgBlockSolverConstraint1DMod>(sharedDesc.iter_blockJointConstraintRowsMod);
+        Ptr<PxgConstraintWriteback> constraintWriteBack =
+            Ptr<PxgConstraintWriteback>(desc.constraintWriteBack);
+
+        const uint forceWritebackOffset = jointHeaders[batchIndex].writeBackOffset[threadIndex];
+        const uint breakableWord = jointHeaders[batchIndex].breakable[threadIndex >> 1];
         const uint breakable = (breakableWord >> ((threadIndex & 1) * 16)) & 0xFFFFu;
-        const uint rowCountWord = gJointHeaders[batchIndex].rowCounts[threadIndex >> 1];
+        const uint rowCountWord = jointHeaders[batchIndex].rowCounts[threadIndex >> 1];
         const uint numRows = (rowCountWord >> ((threadIndex & 1) * 16)) & 0xFFFFu;
 
         if (forceWritebackOffset != 0xFFFFFFFFu)
@@ -905,51 +1227,90 @@ void writebackBlocks(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_
             for (uint i = 0; i < numRows; ++i)
             {
                 const uint r = startConstraintIndex + i;
-                if ((gJointRowsMod[r].flags[threadIndex] & DY_SC_FLAG_OUTPUT_FORCE) != 0)
+                if ((jointRowsMod[r].flags[threadIndex] & DY_SC_FLAG_OUTPUT_FORCE) != 0)
                 {
-                    const float4 lin0XYZ_minImpulse = gJointRowsCon[r].lin0XYZ_minImpulse[threadIndex];
+                    const float4 lin0XYZ_minImpulse = jointRowsCon[r].lin0XYZ_minImpulse[threadIndex];
                     const float3 ang0WriteBack = float3(
-                        gJointRowsMod[r].ang0Writeback[threadIndex * 3 + 0],
-                        gJointRowsMod[r].ang0Writeback[threadIndex * 3 + 1],
-                        gJointRowsMod[r].ang0Writeback[threadIndex * 3 + 2]);
-                    const float appliedForce = gJointRowsMod[r].appliedForce[threadIndex];
+                        jointRowsMod[r].ang0Writeback[threadIndex * 3 + 0],
+                        jointRowsMod[r].ang0Writeback[threadIndex * 3 + 1],
+                        jointRowsMod[r].ang0Writeback[threadIndex * 3 + 2]);
+                    const float appliedForce = jointRowsMod[r].appliedForce[threadIndex];
                     linVel += lin0XYZ_minImpulse.xyz * appliedForce;
                     angVel += ang0WriteBack * appliedForce;
                 }
 
-                const float err = gJointRowsMod[r].residual[threadIndex];
+                const float err = jointRowsMod[r].residual[threadIndex];
                 constraintErrorSq += err * err;
             }
 
             const float4 body0WorldOffset_linBreakImpulse =
-                gJointHeaders[batchIndex].body0WorldOffset_linBreakImpulse[threadIndex];
+                jointHeaders[batchIndex].body0WorldOffset_linBreakImpulse[threadIndex];
             angVel -= cross(body0WorldOffset_linBreakImpulse.xyz, linVel);
 
             const uint broken = breakable != 0
                 ? ((length(linVel) > body0WorldOffset_linBreakImpulse.w ||
-                    length(angVel) > gJointHeaders[batchIndex].angBreakImpulse[threadIndex]) ? 1u : 0u)
+                    length(angVel) > jointHeaders[batchIndex].angBreakImpulse[threadIndex]) ? 1u : 0u)
                 : 0u;
-            gConstraintWriteBack[forceWritebackOffset].angularImpulse_residual =
+            constraintWriteBack[forceWritebackOffset].angularImpulse_residual =
                 float4(angVel, constraintErrorSq);
-            gConstraintWriteBack[forceWritebackOffset].linearImpulse_broken =
+            constraintWriteBack[forceWritebackOffset].linearImpulse_broken =
                 float4(linVel, broken != 0 ? -0.0f : 0.0f);
         }
     }
 }
 
-// mirrors writeBackBodies() in solverMultiBlock.cu
+// ---------------------------------------------------------------------------
+// writeBackBodies (BDA engine ABI)
+// ---------------------------------------------------------------------------
+//
+// Port of writeBackBodies() in solverMultiBlock.cu: copies each body's solved
+// velocities (2 float4 stripes at sharedDesc->deltaOutOffset) to the motion
+// velocity array.  Engine launch: (const PxgSolverCoreDesc*, const
+// PxgSolverSharedDesc<IterativeSolveData>*, PxU32 islandIndex): argSizes
+// {8,8,4} -> 24-byte blob; block = WRITE_BACK_BODIES (256), one thread per
+// body, grid = nbBlocksRequired.  NOTE: unlike the TGS twin (which turns
+// accumulated deltas into velocities via invDt), PGS copies the velocities
+// directly, spanning [bodyStartIndex, numSolverBodies).
+struct WriteBackBodiesAbiParams
+{
+    uint64_t solverCoreDesc; // @0
+    uint64_t sharedDesc;     // @8
+    uint islandIndex;        // @16
+    uint abiPad0;            // @20 (blob tail padding, never read)
+}                            // = 24
+[[vk::push_constant]]
+ConstantBuffer<WriteBackBodiesAbiParams> gWriteBackBodiesAbi;
+
 [shader("compute")]
-[numthreads(128, 1, 1)]
+[numthreads(256, 1, 1)]
 void writeBackBodies(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
-    const uint a = dispatchThreadId.x + gParams.bodyOffset;
-    if (a >= gParams.numSolverBodies)
+    PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gWriteBackBodiesAbi.solverCoreDesc))[0];
+    PxgSolverSharedDescPGSGpu sharedDesc =
+        (Ptr<PxgSolverSharedDescPGSGpu>(gWriteBackBodiesAbi.sharedDesc))[0];
+    PxgIslandContextGpu island =
+        (Ptr<PxgIslandContextGpu>(desc.islandContextPool))[gWriteBackBodiesAbi.islandIndex];
+
+    Ptr<float4> bodyVelocities = Ptr<float4>(sharedDesc.iter_solverBodyVelPool);
+    Ptr<float4> motionVelocities = Ptr<float4>(desc.motionVelocityArray);
+
+    const uint bodyStartIndex = island.mBodyStartIndex;
+    const uint totalBodyCount = desc.numSolverBodies;
+    const uint outputOffsetIndex = sharedDesc.deltaOutOffset;
+
+    const uint a = dispatchThreadId.x + bodyStartIndex;
+    if (a >= totalBodyCount)
         return;
 
-    gMotionVelocities[a] = gSolverBodyVelPool[a + gParams.outputOffsetIndex];
-    gMotionVelocities[a + gParams.numSolverBodies] =
-        gSolverBodyVelPool[a + gParams.outputOffsetIndex + gParams.numSolverBodies];
+    motionVelocities[a] = bodyVelocities[a + outputOffsetIndex];                    // linear
+    motionVelocities[a + totalBodyCount] =
+        bodyVelocities[a + outputOffsetIndex + totalBodyCount];                     // angular
 }
+
+// ---------------------------------------------------------------------------
+// computeAverageSolverBodyVelocity / propagateSolverBodyVelocity
+// (BDA engine ABI) — multi-slab mass-splitting velocity averaging
+// ---------------------------------------------------------------------------
 
 uint nextPowerOfTwo(uint x)
 {
@@ -962,41 +1323,72 @@ uint nextPowerOfTwo(uint x)
     return x + 1;
 }
 
-// mirrors ComputeAverageBodyBatchStartIndex() in solverBlock.cuh
+// mirrors ComputeAverageBodyBatchStartIndex() in solverBlock.cuh with the PGS
+// default float4sPerBody = 2 (TGS uses 3)
 uint computeAverageBodyBatchStartIndex(uint bodyIndex)
 {
     return 2 * (bodyIndex & ~31u) + (bodyIndex & 31u);
 }
 
-groupshared float3 gsLinDelta[32];
-groupshared float3 gsAngDelta[32];
-groupshared uint gsHasRef[32];
+// (const PxgSolverCoreDesc*, const PxgSolverSharedDesc<IterativeSolveData>*)
+struct SolverCoreSharedAbiParams
+{
+    uint64_t solverCoreDesc; // @0
+    uint64_t sharedDesc;     // @8
+}                            // = 16
+[[vk::push_constant]]
+ConstantBuffer<SolverCoreSharedAbiParams> gAvgAbi;
+
+// block = (32, COMPUTE_BODIES_AVERAGE_VELOCITY/32, 1) = (32, 8, 1) -> 256
+// threads; the sub-warp reduction scratch is indexed by the flat thread id.
+// The reduced components are the .xyz deltas ONLY — the CUDA __shfl_xor
+// butterfly shuffles just x/y/z, each lane's local .w accumulation is NOT
+// reduced and lane 0's own .w survives into the final store (mirrored by
+// keeping the local float4 in registers and reducing float3s through shared).
+groupshared float3 gsAvgLin[256];
+groupshared float3 gsAvgAng[256];
+groupshared uint gsAvgHasRef[256];
 
 // mirrors computeAverageSolverBodyVelocity() in solverMultiBlock.cu: averages
-// the per-slab velocity deltas of each body (mass splitting) and resets the
-// slab reference counts.  The CUDA sub-warp __shfl_xor reductions become
-// groupshared reductions over the same power-of-two lane groups; one
-// workgroup covers one warp's worth of bodies.
+// the per-slab velocity deltas of each body (mass splitting, PGS 2-float4
+// layout) and resets the slab reference counts.  Engine launch: grid =
+// nbBlocksRequired, block (32, 8, 1); the CUDA warp index is
+// blockIdx.x * blockDim.y + threadIdx.y -> groupId.x * 8 + groupThreadId.y.
+// The CUDA sub-warp __shfl_xor reductions become groupshared reductions over
+// the same power-of-two lane groups (partner = flatId ^ radius stays inside
+// each 32-lane warp because radius < numThreadsPerBody <= 32).
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(32, 8, 1)]
 void computeAverageSolverBodyVelocity(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
-    const uint numSlabs = gParams.numSlabs;
-    const uint totalBodyCount = gParams.totalBodyCount;
-    const uint bodyOffset = gParams.bodyOffset;
-    const uint deltaVOffset = gParams.deltaVOffset;
+    PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gAvgAbi.solverCoreDesc))[0];
+    PxgSolverSharedDescPGSGpu sharedDesc = (Ptr<PxgSolverSharedDescPGSGpu>(gAvgAbi.sharedDesc))[0];
+    PxgIslandContextGpu island0 = (Ptr<PxgIslandContextGpu>(desc.islandContextPool))[0];
+
+    Ptr<uint> solverReferences = Ptr<uint>(desc.solverBodyReferences); // PxgSolverReferences
+    Ptr<float4> bodyVelocities = Ptr<float4>(sharedDesc.iter_solverBodyVelPool);
+    Ptr<uint> encodedReferenceCount = Ptr<uint>(sharedDesc.iter_solverEncodedReferenceCount);
+
+    const uint totalBodyCount = island0.mBodyCount; // nbBodies minus offset!
+    const uint bodyOffset = island0.mBodyStartIndex;
+    const uint numSlabs = desc.numSlabs;
+    const uint deltaVOffset = desc.accumulatedBodyDeltaVOffset;
+
+    const uint averageOutputOffsets = (desc.numBatches + desc.numArticBatches) * 32u * 2u * 2u;
 
     const uint pow2Slabs = (numSlabs & (numSlabs - 1)) == 0 ? numSlabs : nextPowerOfTwo(numSlabs);
     const uint numThreadsPerBody = min(pow2Slabs, 32u);
     const uint numBodiesPerWarp = 32 / numThreadsPerBody;
 
-    const uint warpBodyStartIndex = groupId.x * numBodiesPerWarp;
+    const uint warpIndex = groupId.x * 8u + groupThreadId.y;
+    const uint warpBodyStartIndex = warpIndex * numBodiesPerWarp;
     const uint threadIdInWorkUnit = groupThreadId.x & (numThreadsPerBody - 1);
     const uint bodyInWarp = groupThreadId.x / numThreadsPerBody;
     const uint bodyId = warpBodyStartIndex + bodyInWarp;
+    const uint flatId = groupThreadId.y * 32u + groupThreadId.x;
 
-    float3 linDelta = float3(0.0f);
-    float3 angDelta = float3(0.0f);
+    float4 linDelta = float4(0.0f);
+    float4 angDelta = float4(0.0f);
     bool hasRef = false;
     float4 lastLinearVel = float4(0.0f);
     float4 lastAngularVel = float4(0.0f);
@@ -1006,24 +1398,24 @@ void computeAverageSolverBodyVelocity(uint3 groupThreadId : SV_GroupThreadID, ui
     {
         outputBody = deltaVOffset + bodyId + bodyOffset;
 
-        lastLinearVel = gSolverBodyVelPool[outputBody];
-        lastAngularVel = gSolverBodyVelPool[outputBody + totalBodyCount + bodyOffset];
+        lastLinearVel = bodyVelocities[outputBody];
+        lastAngularVel = bodyVelocities[outputBody + totalBodyCount + bodyOffset];
 
         for (uint b = threadIdInWorkUnit; b < numSlabs; b += numThreadsPerBody)
         {
             const uint bodyIndex = bodyId * numSlabs + b;
-            const uint remappedBodyIndex = gSolverReferences[bodyIndex];
+            const uint remappedBodyIndex = solverReferences[bodyIndex];
 
             if (remappedBodyIndex != 0xFFFFFFFFu)
             {
                 // Outputs are grouped into little clusters of 32...
-                const uint velIndex = gParams.averageOutputOffsets + computeAverageBodyBatchStartIndex(bodyIndex);
+                const uint velIndex = averageOutputOffsets + computeAverageBodyBatchStartIndex(bodyIndex);
 
-                const float4 curLinearDeltaV = gSolverBodyVelPool[velIndex];
-                const float4 curAngularDeltaV = gSolverBodyVelPool[velIndex + 32];
+                const float4 curLinearDeltaV = bodyVelocities[velIndex];
+                const float4 curAngularDeltaV = bodyVelocities[velIndex + 32];
 
-                linDelta += (curLinearDeltaV - lastLinearVel).xyz;
-                angDelta += (curAngularDeltaV - lastAngularVel).xyz;
+                linDelta += curLinearDeltaV - lastLinearVel;
+                angDelta += curAngularDeltaV - lastAngularVel;
                 hasRef = true;
             }
         }
@@ -1031,64 +1423,77 @@ void computeAverageSolverBodyVelocity(uint3 groupThreadId : SV_GroupThreadID, ui
 
     // sub-group reduction over the numThreadsPerBody lanes of each body
     // (replaces the CUDA __shfl_xor_sync / __ballot_sync pattern)
-    gsLinDelta[groupThreadId.x] = linDelta;
-    gsAngDelta[groupThreadId.x] = angDelta;
-    gsHasRef[groupThreadId.x] = hasRef ? 1u : 0u;
+    gsAvgLin[flatId] = linDelta.xyz;
+    gsAvgAng[flatId] = angDelta.xyz;
+    gsAvgHasRef[flatId] = hasRef ? 1u : 0u;
     GroupMemoryBarrierWithGroupSync();
 
     for (uint radius = numThreadsPerBody >> 1; radius > 0; radius >>= 1)
     {
-        const uint partner = groupThreadId.x ^ radius;
-        const float3 lOther = gsLinDelta[partner];
-        const float3 aOther = gsAngDelta[partner];
-        const uint rOther = gsHasRef[partner];
+        const uint partner = flatId ^ radius;
+        const float3 lOther = gsAvgLin[partner];
+        const float3 aOther = gsAvgAng[partner];
+        const uint rOther = gsAvgHasRef[partner];
         GroupMemoryBarrierWithGroupSync();
-        gsLinDelta[groupThreadId.x] += lOther;
-        gsAngDelta[groupThreadId.x] += aOther;
-        gsHasRef[groupThreadId.x] |= rOther;
+        gsAvgLin[flatId] += lOther;
+        gsAvgAng[flatId] += aOther;
+        gsAvgHasRef[flatId] |= rOther;
         GroupMemoryBarrierWithGroupSync();
     }
 
-    if (bodyId < totalBodyCount && gsHasRef[groupThreadId.x] != 0 && threadIdInWorkUnit == 0)
+    if (bodyId < totalBodyCount && gsAvgHasRef[flatId] != 0 && threadIdInWorkUnit == 0)
     {
-        linDelta = gsLinDelta[groupThreadId.x];
-        angDelta = gsAngDelta[groupThreadId.x];
+        linDelta = float4(gsAvgLin[flatId], linDelta.w);
+        angDelta = float4(gsAvgAng[flatId], angDelta.w);
 
         // Counting the number of active slabs
-        const uint referenceCount = countActiveSlabs(bodyOffset + bodyId, numSlabs, gParams.numTotalBodies);
+        const uint numTotalBodies = bodyOffset + island0.mBodyCount + island0.mArticulationCount;
+        const uint referenceCount =
+            countActiveSlabsBda(bodyOffset + bodyId, numSlabs, numTotalBodies, encodedReferenceCount);
         const float recipRefs = 1.0f / float(referenceCount);
 
         linDelta *= recipRefs;
         angDelta *= recipRefs;
 
-        // Resetting rigid body reference count (resetSlabCount)
-        const uint num32Slabs = (numSlabs + 31) / 32;
-        for (uint i = 0; i < num32Slabs; ++i)
-            gEncodedReferenceCount[bodyOffset + bodyId + i * gParams.numTotalBodies] = 0u;
+        // Resetting rigid body reference count
+        resetSlabCountBda(bodyOffset + bodyId, numSlabs, numTotalBodies, encodedReferenceCount);
 
-        gSolverBodyVelPool[outputBody] = lastLinearVel + float4(linDelta, 0.0f);
-        gSolverBodyVelPool[outputBody + totalBodyCount + bodyOffset] = lastAngularVel + float4(angDelta, 0.0f);
+        bodyVelocities[outputBody] = lastLinearVel + linDelta;
+        bodyVelocities[outputBody + totalBodyCount + bodyOffset] = lastAngularVel + angDelta;
     }
 }
 
 // mirrors propagateSolverBodyVelocity() in solverMultiBlock.cu: copies each
-// body's averaged velocity back into every slab slot that references it
+// body's averaged velocity back into every slab slot that references it.
+// Engine launch (solveContactMultiBlockParallel): grid = nbBlocksRequired,
+// block = COMPUTE_BODIES_AVERAGE_VELOCITY (256) FLAT; the CUDA warp index is
+// the global flat thread index / 32.  Same 2-ptr pack as the averaging kernel.
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(256, 1, 1)]
 void propagateSolverBodyVelocity(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
-    const uint numSlabs = gParams.numSlabs;
-    const uint totalBodyCount = gParams.totalBodyCount;
-    const uint bodyOffset = gParams.bodyOffset;
-    const uint deltaVOffset = gParams.deltaVOffset;
+    PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gAvgAbi.solverCoreDesc))[0];
+    PxgSolverSharedDescPGSGpu sharedDesc = (Ptr<PxgSolverSharedDescPGSGpu>(gAvgAbi.sharedDesc))[0];
+    PxgIslandContextGpu island0 = (Ptr<PxgIslandContextGpu>(desc.islandContextPool))[0];
+
+    Ptr<uint> solverReferences = Ptr<uint>(desc.solverBodyReferences); // PxgSolverReferences
+    Ptr<float4> bodyVelocities = Ptr<float4>(sharedDesc.iter_solverBodyVelPool);
+
+    const uint totalBodyCount = island0.mBodyCount; // nbBodies minus offset!
+    const uint bodyOffset = island0.mBodyStartIndex;
+    const uint numSlabs = desc.numSlabs;
+    const uint deltaVOffset = desc.accumulatedBodyDeltaVOffset;
+
+    const uint threadIndex = groupThreadId.x + groupId.x * 256u;
 
     const uint pow2Slabs = (numSlabs & (numSlabs - 1)) == 0 ? numSlabs : nextPowerOfTwo(numSlabs);
     const uint numThreadsPerBody = min(pow2Slabs, 32u);
     const uint numBodiesPerWarp = 32 / numThreadsPerBody;
 
-    const uint warpBodyStartIndex = groupId.x * numBodiesPerWarp;
+    const uint warpIndex = threadIndex / 32u;
+    const uint warpBodyStartIndex = warpIndex * numBodiesPerWarp;
     const uint threadIdInWorkUnit = groupThreadId.x & (numThreadsPerBody - 1);
-    const uint bodyInWarp = groupThreadId.x / numThreadsPerBody;
+    const uint bodyInWarp = (groupThreadId.x & 31u) / numThreadsPerBody;
     const uint bodyId = warpBodyStartIndex + bodyInWarp;
 
     if (bodyId >= totalBodyCount)
@@ -1096,19 +1501,280 @@ void propagateSolverBodyVelocity(uint3 groupThreadId : SV_GroupThreadID, uint3 g
 
     const uint outputBody = deltaVOffset + bodyId + bodyOffset;
 
-    float4 linVel = gSolverBodyVelPool[outputBody];
-    const float4 angVel = gSolverBodyVelPool[outputBody + totalBodyCount + bodyOffset];
+    float4 linVel = bodyVelocities[outputBody];
+    const float4 angVel = bodyVelocities[outputBody + totalBodyCount + bodyOffset];
     linVel.w = 0.0f;
 
     for (uint b = threadIdInWorkUnit; b < numSlabs; b += numThreadsPerBody)
     {
         const uint bodyIndex = bodyId * numSlabs + b;
-        const uint remappedBodyIndex = gSolverReferences[bodyIndex];
+        const uint remappedBodyIndex = solverReferences[bodyIndex];
         if (remappedBodyIndex != 0xFFFFFFFFu)
         {
             const uint velIndex = remappedBodyIndex; // ComputeBodyBatchStartIndex = identity
-            gSolverBodyVelPool[velIndex] = linVel;
-            gSolverBodyVelPool[velIndex + 32] = angVel;
+            bodyVelocities[velIndex] = linVel;
+            bodyVelocities[velIndex + 32] = angVel;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// markActiveSlabPGS (BDA engine ABI) — per-island active-slab marking for the
+// mass-splitting reference counts
+// ---------------------------------------------------------------------------
+
+// mirrors checkActiveContactBlock() in solverBlock.cuh — the read-only "would
+// this contact still push?" predicate markActiveSlabPGS uses to decide whether
+// a body's slab is active.  A stripped variant of solveContactBlockBda: same
+// per-normal-constraint deltaF computation, but it (a) never applies
+// reference-count scaling (this runs BEFORE reference counts are known — it is
+// what computes them), (b) never mutates the velocities between contact points
+// (each point is tested against the SAME input velocities), (c) writes nothing
+// back, and (d) short-circuits to true on the first contact whose |deltaF|
+// exceeds 1e-8.  No friction, exactly like the .cu.
+//
+// The .cu prefetches contacts[0] (raXn/rbXn/appliedForce/resp/coeff) BEFORE the
+// numNormalConstr loop, UNCONDITIONALLY — even for numNormalConstr == 0 lanes.
+// That read is always safe: batch.startConstraintIndex points into the
+// allocated contact-point pool for every batch the block prep emitted (the
+// pool is sized for all batches; an "empty" contact lane still has its rows
+// reserved).  Ported verbatim so the port touches exactly the memory the .cu
+// touches.
+bool checkActiveContactBlockBda(Ptr<PxgBlockConstraintBatch> batches, uint batchIndex,
+                                float3 linVel0, float3 angVel0, float3 linVel1, float3 angVel1,
+                                uint threadIndex,
+                                Ptr<PxgBlockSolverContactHeader> contactHeaders,
+                                Ptr<PxgBlockSolverContactPoint> contactPoints)
+{
+    const uint constraintBatchIndex = batches[batchIndex].mConstraintBatchIndex;
+    const uint startConstraintIndex = batches[batchIndex].startConstraintIndex;
+
+    const uint numNormalConstr = contactHeaders[constraintBatchIndex].numNormalConstr[threadIndex];
+
+    const float4 normal_staticFriction = contactHeaders[constraintBatchIndex].normal_staticFriction[threadIndex];
+    const float3 normal = normal_staticFriction.xyz;
+
+    const float restitution = contactHeaders[constraintBatchIndex].restitution[threadIndex];
+    const uint flags = contactHeaders[constraintBatchIndex].flags[threadIndex];
+
+    // Unconditional contacts[0] prefetch (see the note above).
+    float4 nextRaxn_targetVelocity = contactPoints[startConstraintIndex].raXn_targetVelocity[threadIndex];
+    float4 nextRbxn_maxImpulse = contactPoints[startConstraintIndex].rbXn_maxImpulse[threadIndex];
+    float nextAppliedForce = contactPoints[startConstraintIndex].appliedForce[threadIndex];
+    float nextResp0 = contactPoints[startConstraintIndex].resp0[threadIndex];
+    float nextResp1 = contactPoints[startConstraintIndex].resp1[threadIndex];
+    float nextCoeff0 = contactPoints[startConstraintIndex].coeff0[threadIndex];
+    float nextCoeff1 = contactPoints[startConstraintIndex].coeff1[threadIndex];
+
+    for (uint i = 0; i < numNormalConstr; i++)
+    {
+        const float4 raXn_targetVelocity = nextRaxn_targetVelocity;
+        const float4 rbXn_maxImpulse = nextRbxn_maxImpulse;
+        const float appliedForce = nextAppliedForce;
+        const float resp0 = nextResp0;
+        const float resp1 = nextResp1;
+        const float coeff0 = nextCoeff0;
+        const float coeff1 = nextCoeff1;
+
+        if ((i + 1) < numNormalConstr)
+        {
+            const uint c = startConstraintIndex + i + 1;
+            nextRaxn_targetVelocity = contactPoints[c].raXn_targetVelocity[threadIndex];
+            nextRbxn_maxImpulse = contactPoints[c].rbXn_maxImpulse[threadIndex];
+            nextAppliedForce = contactPoints[c].appliedForce[threadIndex];
+            nextResp0 = contactPoints[c].resp0[threadIndex];
+            nextResp1 = contactPoints[c].resp1[threadIndex];
+            nextCoeff0 = contactPoints[c].coeff0[threadIndex];
+            nextCoeff1 = contactPoints[c].coeff1[threadIndex];
+        }
+
+        const float3 raXn = raXn_targetVelocity.xyz;
+        const float3 rbXn = rbXn_maxImpulse.xyz;
+        const float targetVelocity = raXn_targetVelocity.w;
+        const float maxImpulse = rbXn_maxImpulse.w;
+
+        // NO reference-count scaling (see the (a) note above).
+        const float unitResponse = resp0 + resp1;
+        const float recipResponse = (unitResponse > 0.0f) ? (1.0f / unitResponse) : 0.0f;
+
+        float velMultiplier = recipResponse;
+        float impulseMul = 1.0f;
+        float unbiasedError = 0.0f;
+        float biasedErr = 0.0f;
+
+        computeContactCoefficients(flags, restitution, unitResponse, recipResponse, targetVelocity,
+                                   coeff0, coeff1, velMultiplier, impulseMul, unbiasedError, biasedErr);
+
+        // Compute the normal velocity of the constraint.
+        const float v0 = dot(linVel0, normal) + dot(angVel0, raXn);
+        const float v1 = dot(linVel1, normal) + dot(angVel1, rbXn);
+        const float normalVel = v0 - v1;
+
+        // KS - clamp the maximum force
+        const float tempDeltaF = biasedErr - normalVel * velMultiplier;
+        const float _deltaF = max(tempDeltaF, -appliedForce);
+        const float _newForce = appliedForce * impulseMul + _deltaF;
+        const float newForce = min(_newForce, maxImpulse);
+        const float deltaF = newForce - appliedForce;
+
+        // Check for active contact.
+        if (abs(deltaF) > 1.0e-8f)
+            return true;
+    }
+
+    return false;
+}
+
+// Port of markActiveSlabPGS() (rigid path -> markActiveSlab_rigidBodyPGS()) in
+// solverMultiBlock.cu.  precomputeReferenceCount() (PxgSolverCore.cpp) launches
+// it ONCE per island at partition 0 of every PGS iteration, passing the LAST
+// partition index so a single launch marks every partition's batches (the batch
+// range is [mBatchStartIndex, constraintsPerPartition[lastPartition +
+// mStartPartitionIndex])).  For each batch lane it decides whether that
+// constraint's slab is "active" (a joint is always active; a contact is active
+// iff checkActiveContactBlock says it would still push) and atomicOr's the slab
+// bit into solverEncodedReferenceCount[bodyId], which countActiveSlabsBda()
+// later popcounts to scale invMass/response for mass splitting.
+//
+// Signature (PGS has NO minPen/elapsedTime — velocities alone decide):
+//   (const PxgSolverCoreDesc*, const PxgSolverSharedDesc<IterativeSolveData>*,
+//    PxU32 islandIndex, PxU32 lastPartition, PxgArticulationCoreDesc*)
+//   -> argSizes {8,8,4,4,8} = 32-byte blob (artiDesc @24).
+//
+// Thread layout mirrors the CUDA launch (numThreadsPerWarp = WARP_SIZE = 32,
+// numWarpsPerBlock = COMPUTE_UNCONSTRAINED_VELOCITES(64)/32 = 2):
+//   numthreads = (32, 2, 1); globalWarpIndex = groupId.x * 2 + groupThreadId.y;
+//   lane = groupThreadId.x; batchIndex = mBatchStartIndex + globalWarpIndex.
+// The CUDA body is a single `if (batchIndex < endIndex)` (no strided loop), so
+// the grid.x is sized to cover the whole batch range in one wave — mirrored 1:1.
+//
+// RIGID PATH ONLY (this tranche): groupId.y == 0.  The engine only launches
+// blockY == 2 when the last partition has articulation batches, which a
+// rigid-only scene never produces, so markActiveSlab_articulationPGS is a
+// DEFERRED no-op early-return.
+//
+// PGS body velocities are the TWO-float4-stripe accumulated layout: linVel @
+// outputOffset + bodyId, angVel @ + totalBodiesIncKinematics — NOT the TGS
+// 3-stripe layout, and NOT the per-partition k*128 pool.  numDynamicBodies /
+// numArticulations are read from islandContextPool[0] (the .cu uses
+// islandContextPool->…) while bodyOffset and the batch range come from
+// island[islandIndex] — mirrored exactly.
+struct MarkActiveSlabPGSAbiParams
+{
+    uint64_t solverCoreDesc; // @0
+    uint64_t sharedDesc;     // @8
+    uint islandIndex;        // @16
+    uint lastPartition;      // @20
+    uint64_t artiDesc;       // @24: PxgArticulationCoreDesc* (articulation path deferred; unused here)
+}                            // = 32 (maxAlign 8; @24 already 8-aligned, no padding)
+[[vk::push_constant]]
+ConstantBuffer<MarkActiveSlabPGSAbiParams> gMarkActiveSlabAbi;
+
+[shader("compute")]
+[numthreads(32, 2, 1)]
+void markActiveSlabPGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    // Deferred articulation path: the engine only dispatches groupId.y != 0
+    // (blockY == 2) when the last partition carries articulation batches, which
+    // a rigid-only scene never produces.
+    if (groupId.y != 0)
+        return;
+
+    PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gMarkActiveSlabAbi.solverCoreDesc))[0];
+    PxgSolverSharedDescPGSGpu sharedDesc =
+        (Ptr<PxgSolverSharedDescPGSGpu>(gMarkActiveSlabAbi.sharedDesc))[0];
+    PxgIslandContextGpu island =
+        (Ptr<PxgIslandContextGpu>(desc.islandContextPool))[gMarkActiveSlabAbi.islandIndex];
+    // The .cu reads mBodyCount / mArticulationCount from islandContextPool[0]
+    // (islandContextPool->…), NOT islandContextPool[islandIndex]; mirror that
+    // exactly.  For the single-island scenes islandIndex == 0 so it is moot.
+    PxgIslandContextGpu island0 = (Ptr<PxgIslandContextGpu>(desc.islandContextPool))[0];
+
+    const uint startPartitionIndex = island.mStartPartitionIndex;
+    const uint threadIndexInWarp = groupThreadId.x;              // lane
+    const uint numWarpsPerBlock = 2u;                            // numthreads.y
+    const uint globalWarpIndex = groupId.x * numWarpsPerBlock + groupThreadId.y;
+
+    Ptr<float4> bodyVelocities = Ptr<float4>(sharedDesc.iter_solverBodyVelPool);
+    Ptr<PxgBlockConstraintBatch> batches = Ptr<PxgBlockConstraintBatch>(sharedDesc.iter_blockConstraintBatch);
+    Ptr<PxgBlockSolverContactHeader> contactHeaders =
+        Ptr<PxgBlockSolverContactHeader>(sharedDesc.iter_blockContactHeaders);
+    Ptr<PxgBlockSolverContactPoint> contactPoints =
+        Ptr<PxgBlockSolverContactPoint>(sharedDesc.iter_blockContactPoints);
+    Ptr<uint> encodedReferenceCount = Ptr<uint>(sharedDesc.iter_solverEncodedReferenceCount);
+    Ptr<uint> constraintsPerPartition = Ptr<uint>(desc.constraintsPerPartition);
+
+    const uint bodyOffset = island.mBodyStartIndex;
+    const uint outputOffset = desc.accumulatedBodyDeltaVOffset;
+    const uint numDynamicBodies = island0.mBodyCount; // nbBodies minus offset!
+    const uint totalBodiesIncKinematics = numDynamicBodies + bodyOffset;
+    const uint numArticulations = island0.mArticulationCount;
+    const uint numTotalBodies = bodyOffset + numDynamicBodies + numArticulations;
+
+    // Null / empty-island guard (llvmpipe): precomputeReferenceCount only
+    // launches this when mNumPartitions != 0, but the constraint pointers are
+    // still null for a constraint-free island.  The uniform scalar guard makes
+    // every dependent batch load control-dependent on it, blocking the SPIR-V
+    // optimizer's speculative hoist of the first batches[] load past the
+    // (then dead) `batchIndex < endIndex` test — same technique as
+    // markActiveSlabTGS / solveBlockUnified in solverTGS.slang.
+    if (sharedDesc.iter_blockConstraintBatch != 0 && island.mNumPartitions != 0)
+    {
+        const uint startIndex = island.mBatchStartIndex;
+        const uint endIndex = constraintsPerPartition[gMarkActiveSlabAbi.lastPartition + startPartitionIndex];
+        const uint batchIndex = startIndex + globalWarpIndex;
+
+        if (batchIndex < endIndex)
+        {
+            const uint descStride = batches[batchIndex].descStride_constraintType & 0xFFFFu;
+            const uint constraintType = batches[batchIndex].descStride_constraintType >> 16;
+
+            if (threadIndexInWarp < descStride)
+            {
+                const uint slabId = batches[batchIndex].slabId[threadIndexInWarp];
+                const uint bodyIdA = batches[batchIndex].bodyAIndex[threadIndexInWarp];
+                const uint bodyIdB = batches[batchIndex].bodyBIndex[threadIndexInWarp];
+
+                const uint slabIndexOffset = (slabId / 32u) * numTotalBodies;
+                const uint encodedSlabIndex = (1u << (slabId % 32u));
+
+                bool isActiveSlab = false;
+
+                if (!pxgIsContactType(constraintType))
+                {
+                    // For joint constraints, simply mark slabs as active for
+                    // efficiency (does not significantly change the count).
+                    isActiveSlab = true;
+                }
+                else
+                {
+                    const uint finalIdA = outputOffset + bodyIdA;
+                    const uint finalIdB = outputOffset + bodyIdB;
+
+                    const float4 linVel0 = bodyVelocities[finalIdA];
+                    const float4 angVel0 = bodyVelocities[finalIdA + totalBodiesIncKinematics];
+                    const float4 linVel1 = bodyVelocities[finalIdB];
+                    const float4 angVel1 = bodyVelocities[finalIdB + totalBodiesIncKinematics];
+
+                    // Check if the contact/normal constraint is active.
+                    isActiveSlab = checkActiveContactBlockBda(
+                        batches, batchIndex, linVel0.xyz, angVel0.xyz, linVel1.xyz, angVel1.xyz,
+                        threadIndexInWarp, contactHeaders, contactPoints);
+                }
+
+                // Encode which slab is active in a 32-bit index; countActiveSlabsBda
+                // popcounts these words to recover the reference count.
+                if (isActiveSlab && bodyIdA >= bodyOffset)
+                {
+                    uint prev;
+                    InterlockedOr(encodedReferenceCount[slabIndexOffset + bodyIdA], encodedSlabIndex, prev);
+                }
+                if (isActiveSlab && bodyIdB >= bodyOffset)
+                {
+                    uint prev;
+                    InterlockedOr(encodedReferenceCount[slabIndexOffset + bodyIdB], encodedSlabIndex, prev);
+                }
+            }
         }
     }
 }

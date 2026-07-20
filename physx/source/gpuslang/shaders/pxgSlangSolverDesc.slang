@@ -147,6 +147,52 @@ public struct PxgSolverSharedDescTGSGpu
     public uint64_t iter_artiResponse;                 // @216 PxgArticulationBlockResponse*
 }                                                      // = 224
 
+// PxgSolverSharedDesc<IterativeSolveData> — the PGS variant.  IterativeSolveData
+// (PxgSolverCoreDesc.h:141) has EXACTLY the same shape as IterativeSolveDataTGS:
+// 16 device pointers in the same order (only the pointee block types differ —
+// PxgBlockSolverContactHeader/Point/... instead of the PxgTGSBlock* types — and
+// slot 9 is named tempStaticBodyOutputPool instead of tempStaticBodyOutputs), so
+// the byte layout is identical to PxgSolverSharedDescTGSGpu: base (96) +
+// iterativeData (128) = 224 bytes.  Kept as a separate struct so the PGS kernels
+// document which engine aggregate they walk; testSolver.cpp static_asserts the
+// host-side sizeof/offsetof equality of the two instantiations, and the
+// TGS-variant probe (testSolverDescLayout) pins the shared byte layout.
+public struct PxgSolverSharedDescPGSGpu
+{
+    public uint64_t blockCurrentFrictionPatches;    // @0   PxgBlockFrictionPatch*
+    public uint64_t blockPreviousFrictionPatches;   // @8
+    public uint64_t currentFrictionPatches;         // @16  PxgFrictionPatch*
+    public uint64_t previousFrictionPatches;        // @24
+    public uint64_t mBodySimBufferDeviceData;       // @32  PxgBodySim*
+    public uint64_t articulations;                  // @40  PxgArticulation*
+    public uint64_t articulationDeferredZ;          // @48  Cm::UnAlignedSpatialVector*
+    public uint64_t articulationDirty;              // @56  PxU32*
+    public uint64_t articulationSlabMask;           // @64  uint4*
+    public uint  deltaOutOffset;                    // @72
+    public float dt;                                // @76
+    public float stepDt;                            // @80
+    public float invDtF32;                          // @84
+    public float stepInvDtF32;                      // @88
+    public float lengthScale;                       // @92
+    // ---- iterativeData (IterativeSolveData) @96 ----
+    public uint64_t iter_blockConstraintBatch;         // @96  PxgBlockConstraintBatch*
+    public uint64_t iter_blockJointConstraintHeaders;  // @104 PxgBlockSolverConstraint1DHeader*
+    public uint64_t iter_blockJointConstraintRowsCon;  // @112 PxgBlockSolverConstraint1DCon*
+    public uint64_t iter_blockJointConstraintRowsMod;  // @120 PxgBlockSolverConstraint1DMod*
+    public uint64_t iter_blockContactHeaders;          // @128 PxgBlockSolverContactHeader*
+    public uint64_t iter_blockFrictionHeaders;         // @136 PxgBlockSolverFrictionHeader*
+    public uint64_t iter_blockContactPoints;           // @144 PxgBlockSolverContactPoint*
+    public uint64_t iter_blockFrictions;               // @152 PxgBlockSolverContactFriction*
+    public uint64_t iter_solverBodyVelPool;            // @160 float4*
+    public uint64_t iter_tempStaticBodyOutputPool;     // @168 float4*
+    public uint64_t iter_solverEncodedReferenceCount;  // @176 PxU32*
+    public uint64_t iter_contactHeaders;               // @184 PxgSolverContactHeader*
+    public uint64_t iter_frictionHeaders;              // @192 PxgSolverFrictionHeader*
+    public uint64_t iter_contactPoints;                // @200 PxgSolverContactPointExt*
+    public uint64_t iter_frictions;                    // @208 PxgSolverContactFrictionExt*
+    public uint64_t iter_artiResponse;                 // @216 PxgArticulationBlockResponse*
+}                                                      // = 224
+
 // PxgIslandContext (gpusolver/include/PxgIslandContext.h), 68 bytes.  The
 // kernels index islandContextPool[islandIndex], so this mirror's SIZE (array
 // stride) matters, not only the field offsets — the layout test probes

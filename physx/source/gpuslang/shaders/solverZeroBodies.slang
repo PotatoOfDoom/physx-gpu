@@ -53,50 +53,54 @@
 // The CUDA launches these with a 1D grid; the grid stride blockDim.x*gridDim.x
 // is passed as gridStride so the host's launch geometry is reproduced exactly.
 //
-// ZeroBodiesTGS is on the P5 Step 4 BDA engine-launch ABI: it takes the
-// engine's (PxgSolverCoreDesc*, PxgSolverSharedDesc<IterativeSolveDataTGS>*)
-// pack and reads the counts and pool pointers on-device through the
+// BOTH entries are on the BDA engine-launch ABI: they take the engine's
+// (PxgSolverCoreDesc*, PxgSolverSharedDesc<...>*) pack (ZeroBodies: the PGS
+// IterativeSolveData instantiation, P5 Step 5; ZeroBodiesTGS: the TGS one,
+// P5 Step 4) and read the counts and pool pointers on-device through the
 // byte-exact pxgSlangSolverDesc mirrors (proven by testSolverDescLayout).
-// The PGS ZeroBodies entry still uses the harness push constants + bindings.
 
 import pxgSlangSolverDesc;
-
-struct ZeroBodiesParams
-{
-    uint totalNumBodies;             // numSolverBodies * 2
-    uint totalNumBodiesConstraints;  // see ranges above
-    uint offset;                     // accumulatedBodyDeltaVOffset (PGS only)
-    uint gridStride;                 // blockDim.x * gridDim.x
-}
-
-[[vk::push_constant]]
-ConstantBuffer<ZeroBodiesParams> gParams;
-
-RWStructuredBuffer<float4> gMotionVelocities;  // binding 0  motionVelocityArray
-RWStructuredBuffer<float4> gBodyVelocities;    // binding 1  solverBodyVelPool
 
 static const float4 ZERO = float4(0.0f, 0.0f, 0.0f, 0.0f);
 
 // ---------------------------------------------------------------------------
-// ZeroBodies (PGS)
+// ZeroBodies (PGS) — engine ABI: (const PxgSolverCoreDesc*,
+// const PxgSolverSharedDesc<IterativeSolveData>*)
 // ---------------------------------------------------------------------------
+struct ZeroBodiesAbiParams
+{
+    uint64_t solverCoreDesc; // @0 const PxgSolverCoreDesc*
+    uint64_t sharedDesc;     // @8 const PxgSolverSharedDesc<IterativeSolveData>*
+}
+[[vk::push_constant]]
+ConstantBuffer<ZeroBodiesAbiParams> gZeroPGS;
+
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void ZeroBodies(uint3 dtid : SV_DispatchThreadID)
 {
-    const uint stride = gParams.gridStride;
-    const uint offset = gParams.offset;
+    PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gZeroPGS.solverCoreDesc))[0];
+    PxgSolverSharedDescPGSGpu shared = (Ptr<PxgSolverSharedDescPGSGpu>(gZeroPGS.sharedDesc))[0];
+
+    Ptr<float4> bodyVelocities = Ptr<float4>(shared.iter_solverBodyVelPool);
+    Ptr<float4> motionVelocities = Ptr<float4>(desc.motionVelocityArray);
+    // *2 because of linear and angular components
+    const uint totalNumBodies = desc.numSolverBodies * 2u;
+    const uint totalNumBodiesConstraints = (desc.numBatches + desc.numArticBatches) * 32u * 2u * 2u;
+    const uint offset = desc.accumulatedBodyDeltaVOffset;
+
+    const uint stride = WorkgroupCount().x * 256u;
 
     // (1) motion velocities, and (2) the delta velocities at the accumulation offset
-    for (uint a = dtid.x; a < gParams.totalNumBodies; a += stride)
+    for (uint a = dtid.x; a < totalNumBodies; a += stride)
     {
-        gMotionVelocities[a] = ZERO;
-        gBodyVelocities[offset + a] = ZERO;
+        motionVelocities[a] = ZERO;
+        bodyVelocities[offset + a] = ZERO;
     }
 
     // (3) all solver body velocities
-    for (uint a = dtid.x; a < gParams.totalNumBodiesConstraints; a += stride)
-        gBodyVelocities[a] = ZERO;
+    for (uint a = dtid.x; a < totalNumBodiesConstraints; a += stride)
+        bodyVelocities[a] = ZERO;
 }
 
 // ---------------------------------------------------------------------------

@@ -124,7 +124,7 @@ pxg_compile_shader(scan4x4 scanPerBlockKernel4x4 addBlockSumsKernel4x4)
 pxg_compile_shader(radixFourBit radixFourBitCountPerBlockKernel radixFourBitReorderKernel)
 pxg_compile_shader(reorderData reorderKernel)
 pxg_compile_shader(solverPGS solveBlockPartition concludeBlocks writebackBlocks writeBackBodies
-                   computeAverageSolverBodyVelocity propagateSolverBodyVelocity)
+                   computeAverageSolverBodyVelocity propagateSolverBodyVelocity markActiveSlabPGS)
 pxg_compile_shader(solverTGS solveBlockPartitionTGS concludeBlocksTGS writebackBlocksTGS
                    writeBackBodiesTGS computeAverageSolverBodyVelocityTGS
                    propagateAverageSolverBodyVelocityTGS solveWholeIslandTGS
@@ -965,7 +965,10 @@ set(PXG_HLSL_ENTRIES
     "bodyUpdate:updateBodiesLaunchDirectAPI" "bodyUpdate:updateBodyExternalVelocitiesLaunch"
     "directApi:getRigidDynamicGlobalPose" "directApi:getRigidDynamicLinearAcceleration"
     "directApi:setRigidDynamicLinearVelocity" "directApi:setRigidDynamicTorque"
-    "solverPGS:solveBlockPartition" "solverPGS:concludeBlocks" "solverPGS:writebackBlocks"
+    # solverPGS:solveBlockPartition retired: converted to the BDA engine ABI
+    # (P5 Step 5) and grid-strides via WorkgroupCount(), which has no HLSL
+    # builtin (P0 policy).  The remaining solverPGS entries lower to cs_6_0.
+    "solverPGS:concludeBlocks" "solverPGS:writebackBlocks"
     # solverTGS:writebackBlocksTGS retired: converted to the BDA engine ABI
     # (P5 Step 4), reads its descriptors through Ptr<> and does not lower to
     # cs_6_0, so it is no longer an HLSL bit-exactness entry.
@@ -985,7 +988,9 @@ set(PXG_HLSL_ENTRIES
     "thresholdForceChange:computeThresholdElementMaskIndices"
     "thresholdForceChange:outputThresholdPairsMaskIndices"
     "thresholdForceChange:createForceChangeThresholdElements"
-    "solverZeroBodies:ZeroBodies"
+    # solverZeroBodies:ZeroBodies retired: converted to the BDA engine ABI
+    # (P5 Step 5) and grid-strides via WorkgroupCount(), which has no HLSL
+    # builtin (P0 policy) — same as its TGS twin.
     "solverInitVelocitiesTGS:initializeSolverVelocitiesTGS"
     "solverApplyGravityTGS:applyTGSSubstepGravity"
     "solverDmaBack:dmaBackChangedElems" "solverDmaBack:dmaConstraintResidual"

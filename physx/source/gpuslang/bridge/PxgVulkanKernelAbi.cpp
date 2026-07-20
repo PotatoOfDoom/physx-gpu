@@ -103,6 +103,26 @@ static const uint8_t kSolveBlockUnified[] = { 8, 8, 4, 4, 1, 4, 4, 8 };
 //   precedes elapsedTime, unlike solveBlockUnified)
 static const uint8_t kMarkActiveSlabTGS[] = { 8, 8, 4, 4, 4, 4, 8 };
 
+// gpusolver PGS kernels (solverMultiBlock.cu, P5 Step 5 BDA):
+// solveBlockPartition(PxgSolverCoreDesc*, const PxgSolverSharedDesc<IterativeSolveData>*,
+//   PxU32 islandIndex, PxU32 partitionIndex, bool doFriction) -> 32-byte blob
+//   (bool byte @24, bytes 25..31 padding)
+static const uint8_t kSolveBlockPartitionPGS[] = { 8, 8, 4, 4, 1 };
+
+// concludeBlocks / writebackBlocks / writeBackBodies
+//   (desc, sharedDesc, PxU32 islandIndex) -> 24-byte blob
+static const uint8_t kDescsIslandPGS[] = { 8, 8, 4 };
+
+// computeAverageSolverBodyVelocity / propagateSolverBodyVelocity
+//   (const PxgSolverCoreDesc*, const PxgSolverSharedDesc<IterativeSolveData>*)
+//   -> kTwoPtr (16 bytes)
+
+// markActiveSlabPGS(const PxgSolverCoreDesc*, const
+//   PxgSolverSharedDesc<IterativeSolveData>*, PxU32 islandIndex,
+//   PxU32 lastPartition, PxgArticulationCoreDesc*) -> 32-byte blob (arti ptr
+//   @24; NOTE: unlike markActiveSlabTGS there is no minPen/elapsedTime)
+static const uint8_t kMarkActiveSlabPGS[] = { 8, 8, 4, 4, 8 };
+
 // integration.cu: integrateCoreParallelLaunchTGS(PxU32 offset, desc, sharedDesc,
 //   PxU32* islandIds, PxU32* islandStaticTouchCounts, PxU32* numCountedInteractions)
 static const uint8_t kIntegrateTGS[] = { 4, 8, 8, 8, 8, 8 };
@@ -217,6 +237,15 @@ static const PxgKernelAbiRow kRows[] = {
     { "propagateStaticSolverBodyVelocitiesTGS", kSolveStaticBlockTGS, uint32_t(sizeof(kSolveStaticBlockTGS)) },
     { "solveBlockUnified", kSolveBlockUnified, uint32_t(sizeof(kSolveBlockUnified)) },
     { "markActiveSlabTGS", kMarkActiveSlabTGS, uint32_t(sizeof(kMarkActiveSlabTGS)) },
+    // gpusolver PGS solver kernels (P5 Step 5 BDA)
+    { "ZeroBodies", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "solveBlockPartition", kSolveBlockPartitionPGS, uint32_t(sizeof(kSolveBlockPartitionPGS)) },
+    { "concludeBlocks", kDescsIslandPGS, uint32_t(sizeof(kDescsIslandPGS)) },
+    { "writebackBlocks", kDescsIslandPGS, uint32_t(sizeof(kDescsIslandPGS)) },
+    { "writeBackBodies", kDescsIslandPGS, uint32_t(sizeof(kDescsIslandPGS)) },
+    { "computeAverageSolverBodyVelocity", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "propagateSolverBodyVelocity", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "markActiveSlabPGS", kMarkActiveSlabPGS, uint32_t(sizeof(kMarkActiveSlabPGS)) },
     { "integrateCoreParallelLaunchTGS", kIntegrateTGS, uint32_t(sizeof(kIntegrateTGS)) },
     // gpusimulationcontroller: updateTransformAndBoundArray.cu / updateBodiesAndShapes.cu
     { "updateTransformCacheAndBoundArrayLaunch", kOnePtr, 1u },
