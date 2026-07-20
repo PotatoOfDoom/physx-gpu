@@ -106,6 +106,48 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
+## P5 Step 5 — MILESTONE: four common rigid scenes rest on the GPU, zero refused launches
+
+`gpu-sdk-step` grew a `PXG_SCENE`-dispatched scene table; **all four rigid
+scenes now fall and REST on the Slang/Vulkan (llvmpipe) pipeline with ZERO
+refused kernel launches**, each `exit 0`:
+
+- `box`   — dynamic box on a static ground box (the Step-4 scene).
+- `stack` — three stacked dynamic boxes: `final y = 0.500 / 1.500 / 2.500`,
+  `|v| = 0.000` (exercises dynamic-vs-dynamic box contacts + partitions).
+- `sphere`— dynamic sphere on the ground: rests at `y = 0.500`.
+- `plane` — dynamic box on a `PxPlaneGeometry`: rests at `y = 0.500`.
+
+Suite **666/666** both memory modes; `PXG_SLANG_KERNEL_MAPPED = 145`.
+Deformables / particles / articulations remain explicitly out of scope for this
+milestone.
+
+Landed since the Step-4 box-on-ground milestone (each: bit-exact / geometric
+shim unit test on the real engine ABI + both-mode suite + engine-scene proof):
+- tranche 1: `gpu-sdk-step` scene table (box/stack/sphere/plane builders,
+  per-target fall→rest assertions); stacked-boxes scene rests.
+- tranche 2: fixed the inverted `constraintType` encoding in the **PGS** solver
+  (solveBlockPartition / concludeBlocks / writebackBlocks) — the same
+  eCONTACT=1 vs legacy contact=0 bug fixed for TGS in Step 4, via
+  `pxgIsContactType()`.
+- tranche 3: `solveBlockUnified` on the engine ABI — the per-partition
+  velocity-iteration rigid solve (`solveBlockPartitionTGSInternal`) the engine
+  launches once per partition; stacked boxes solve cleanly.
+- tranche 4: `sphereNphase_Kernel` (sphere narrowphase) on the engine ABI —
+  sphere rests on the ground.
+- tranche 5: `convexPlaneNphase_Kernel` (convex/box-vs-plane narrowphase) on
+  the engine ABI — box rests on a plane.
+- tranche 6: `markActiveSlabTGS` on the engine ABI — the per-partition
+  active-slab marking (`precomputeReferenceCount`) that populates
+  `solverEncodedReferenceCount` for mass-splitting reference counts.  Ported
+  `checkActiveContactBlockTGS` (read-only "would this contact still push?"
+  predicate; no ref-scaling, no velocity mutation) + the slab-bit `atomicOr`.
+  Closes the **last non-fatal refused launch on the stack scene**: all four
+  scenes now step with zero `fail to launch`.  Note the arg order differs from
+  `solveBlockUnified` (minPen precedes elapsedTime) → ABI `{8,8,4,4,4,4,8}` =
+  40 bytes; the `.cu` reads `mBodyCount`/`mArticulationCount` from
+  `islandContextPool[0]` (mirrored exactly).
+
 ## P5 Step 4 — MILESTONE ACHIEVED: the box falls AND RESTS on the GPU
 
 As of tranche 19 (commit 0d547fa) `PXG_GPU_STEP=1 ./gpu-sdk-step` steps the

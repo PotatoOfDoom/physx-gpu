@@ -97,6 +97,12 @@ static const uint8_t kSolveStaticBlockTGS[] = { 8, 8, 4, 4, 4, 4, 4 };
 //   PxgArticulationCoreDesc*) -> 48-byte blob (bool byte @24, arti ptr @40)
 static const uint8_t kSolveBlockUnified[] = { 8, 8, 4, 4, 1, 4, 4, 8 };
 
+// solverTGS: markActiveSlabTGS(desc, sharedDesc, PxU32 islandIndex,
+//   PxU32 lastPartition, PxReal minPen, PxReal elapsedTime,
+//   PxgArticulationCoreDesc*) -> 40-byte blob (arti ptr @32; note minPen
+//   precedes elapsedTime, unlike solveBlockUnified)
+static const uint8_t kMarkActiveSlabTGS[] = { 8, 8, 4, 4, 4, 4, 8 };
+
 // integration.cu: integrateCoreParallelLaunchTGS(PxU32 offset, desc, sharedDesc,
 //   PxU32* islandIds, PxU32* islandStaticTouchCounts, PxU32* numCountedInteractions)
 static const uint8_t kIntegrateTGS[] = { 4, 8, 8, 8, 8, 8 };
@@ -210,6 +216,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "solveStaticBlockTGS", kSolveStaticBlockTGS, uint32_t(sizeof(kSolveStaticBlockTGS)) },
     { "propagateStaticSolverBodyVelocitiesTGS", kSolveStaticBlockTGS, uint32_t(sizeof(kSolveStaticBlockTGS)) },
     { "solveBlockUnified", kSolveBlockUnified, uint32_t(sizeof(kSolveBlockUnified)) },
+    { "markActiveSlabTGS", kMarkActiveSlabTGS, uint32_t(sizeof(kMarkActiveSlabTGS)) },
     { "integrateCoreParallelLaunchTGS", kIntegrateTGS, uint32_t(sizeof(kIntegrateTGS)) },
     // gpusimulationcontroller: updateTransformAndBoundArray.cu / updateBodiesAndShapes.cu
     { "updateTransformCacheAndBoundArrayLaunch", kOnePtr, 1u },

@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 144;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 145;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -185,7 +185,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "propagateStaticSolverBodyVelocitiesTGS", "solverTGS.spv", "propagateStaticSolverBodyVelocitiesTGS" },  // PROPAGATE_STATIC_SOLVER_VELOCITIES_TGS
     { "applyTGSSubstepGravity", "solverApplyGravityTGS.spv", "applyTGSSubstepGravity" },  // APPLY_TGS_SUBSTEP_GRAVITY
     { "markActiveSlabPGS", nullptr, nullptr },  // MARK_ACTIVE_SLAB_PGS (unmapped)
-    { "markActiveSlabTGS", nullptr, nullptr },  // MARK_ACTIVE_SLAB_TGS (unmapped)
+    { "markActiveSlabTGS", "solverTGS.spv", "markActiveSlabTGS" },  // MARK_ACTIVE_SLAB_TGS (P5 Step 5 BDA port)
     { "radixSortMultiBlockLaunch", nullptr, nullptr },  // RS_MULTIBLOCK (unmapped)
     { "radixSortMultiCalculateRanksLaunch", nullptr, nullptr },  // RS_CALCULATERANKS_MULTIBLOCK (unmapped)
     { "radixSortMultiBlockLaunchWithCount", "radixSortDesc.spv", "radixSortMultiBlockLaunchWithCount" },  // RS_MULTIBLOCK_COUNT (P5 Step 4 BDA port)

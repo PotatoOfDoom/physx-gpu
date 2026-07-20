@@ -3444,4 +3444,353 @@ PXG_TEST(solverTGS_concludeBlocksAbi)
         shim.memFree(pfree);
 }
 
+// ---------------------------------------------------------------------------
+// markActiveSlabTGS (ENGINE ABI, P5 Step 5 tranche 6 BDA) — per-partition
+// active-slab marking for the mass-splitting reference counts.
+// ---------------------------------------------------------------------------
+// The read-only predicate that decides whether a contact still pushes.  Mirror
+// of checkActiveContactBlockTGS() in solverBlockTGS.cuh (and of the Slang
+// checkActiveContactBlockTGSBda): a stripped contact solve that (a) applies NO
+// reference-count scaling — this is what COMPUTES the reference counts — (b)
+// never mutates the input velocities between contact points, and (c) returns
+// true on the first |deltaF| > 1e-8.  No friction.
+bool refCheckActiveContactTGS(const BatchTGS& b, const BodyStateTGS& s, uint32_t lane,
+                              std::vector<TGSContactHeader>& chs, std::vector<TGSContactPoint>& cps,
+                              float elapsedTime, float minPen)
+{
+    const uint32_t bi = b.scalars[1]; // constraintBatchIndex
+    const uint32_t sc = b.scalars[2]; // startConstraintIndex
+    TGSContactHeader& ch = chs[bi];
+
+    const uint32_t numNormal = ch.numNormalConstr[lane];
+    if (!numNormal)
+        return false;
+
+    const float maxPenBias = ch.maxPenBias[lane];
+    const Float4 nsf = ch.normal_staticFriction[lane];
+    const Vec3 normal(nsf.x, nsf.y, nsf.z);
+    const float restitutionXdt = ch.restitutionXdt[lane];
+    const uint32_t flags = ch.flags[lane];
+
+    const Vec3 relMotion = s.ld0 - s.ld1;
+    const float deltaV = normal.dot(relMotion);
+    const float relVel1 = (s.lv0 - s.lv1).dot(normal);
+
+    for (uint32_t i = 0; i < numNormal; ++i)
+    {
+        const TGSContactPoint& c = cps[sc + i];
+        const Float4 ra = c.raXn_extraCoeff[lane];
+        const Float4 rb = c.rbXn_targetVelW[lane];
+        const float appliedForce = c.appliedForce[lane];
+        const float separation = c.separation[lane];
+        const float maxImpulse = c.maxImpulse[lane];
+
+        const float resp0 = c.resp0[lane], resp1 = c.resp1[lane]; // NO ref scaling
+        const float unitResponse = resp0 + resp1;
+        const float recipResponse = unitResponse > 0.f ? 1.f / unitResponse : 0.f;
+
+        float velMultiplier = recipResponse;
+        float biasCoefficient = c.biasCoefficient[lane];
+        if (restitutionXdt < 0.f)
+            refCompliantTGS(flags, restitutionXdt, unitResponse, recipResponse, ra.w, velMultiplier,
+                            biasCoefficient);
+
+        const Vec3 raXn(ra.x, ra.y, ra.z), rbXn(rb.x, rb.y, rb.z);
+        const float targetVel = rb.w;
+
+        const float v0 = s.av0.dot(raXn), v1 = s.av1.dot(rbXn);
+        const float normalVel = relVel1 + (v0 - v1);
+
+        const float sep = std::fmax(minPen, separation + deltaV + s.ad0.dot(raXn) - s.ad1.dot(rbXn));
+        const float tVelErr = targetVel * elapsedTime;
+        const float biasedErr = recipResponse * std::fmin(-maxPenBias, biasCoefficient * (sep - tVelErr));
+
+        const float tempDeltaF = biasedErr - (normalVel - targetVel) * velMultiplier;
+        const float _deltaF = std::fmax(tempDeltaF, -appliedForce);
+        const float newForce = std::fmin(appliedForce + _deltaF, maxImpulse);
+        const float deltaF = newForce - appliedForce;
+
+        if (std::fabs(deltaF) > 1.0e-8f)
+            return true;
+    }
+    return false;
+}
+
+// The engine launches markActiveSlabTGS ONCE per island with the LAST partition
+// index; it marks every batch in [mBatchStartIndex, cpp[lastPartition +
+// mStartPartitionIndex]).  For each batch lane < descStride it decides
+// isActiveSlab (joint -> always active; contact -> checkActiveContactBlockTGS)
+// and atomicOr's (1 << (slabId % 32)) into solverEncodedReferenceCount[(slabId /
+// 32) * numTotalBodies + bodyId] for bodyA and bodyB, only when that body index
+// is a real dynamic body (>= bodyOffset).  Body velocities come from the
+// accumulated deltaV staging (3 float4 per body at accumulatedBodyDeltaVOffset +
+// bodyId + k*totalBodiesIncKinematics), NOT the k*192 per-partition pool of
+// solveBlockUnified.  This fixture fills the REAL engine descs (+ a 2-element
+// PxgIslandContext array; islandIndex = 1 pins the stride while element [0]
+// carries decoy partition/batch fields but the SAME body fields — the .cu reads
+// mBodyCount / mArticulationCount from islandContextPool[0]), one partition
+// holding a mix of contact and joint batches (one contact deliberately has
+// numNormalConstr == 0 so the inactive early-return is exercised), pre-zeroes
+// the encoded buffer on device, launches through PxgCudaShim with the 40-byte
+// blob, and compares the final encoded words BIT-EXACT (popcount-of-OR is
+// order-independent) against refCheckActiveContactTGS.
+PXG_TEST(solverTGS_markActiveSlab)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    std::mt19937 rng(5106);
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::uniform_real_distribution<float> sym(-2.f, 2.f);
+
+    const uint32_t bodyOffset = 8;
+    const uint32_t numDynamicBodies = 200;
+    const uint32_t numTotalBodies = bodyOffset + numDynamicBodies; // no articulations
+    const uint32_t totalBodiesIncKinematics = numDynamicBodies + bodyOffset;
+    const uint32_t numSlabs = 40;                   // > 32 -> 2-word slabIndexOffset
+    const uint32_t num32Slabs = (numSlabs + 31) / 32;
+    const uint32_t rowsPerBatch = 4;
+    const float elapsedTime = 0.005f;
+    const float minPen = -0.02f;
+    const uint32_t outputOffset = 0; // accumulatedBodyDeltaVOffset
+
+    // batches: [0] decoy (never marked), then a mix over one partition.
+    // mBatchStartIndex = 1, mStartPartitionIndex = 1, lastPartition = 0 =>
+    // endIndex = cpp[0 + 1] = cpp[1] = 5, so partition spans batches [1, 5).
+    const uint32_t numAllBatches = 5;
+    const uint32_t batchStartIndex = 1;
+    const uint16_t types[5] = { 0, 1, 0, 1, 1 };     // [1]contact [2]joint [3]contact(empty) [4]contact
+    const uint16_t strides[5] = { 0, 32, 27, 32, 20 }; // partial strides gate tail lanes
+    std::vector<uint32_t> cpp = { 777u, 5u };        // index 0 decoy; endIndex = cpp[1] = 5
+
+    std::vector<BatchTGS> batches(numAllBatches);
+    std::vector<TGSContactHeader> chs(numAllBatches);
+    std::vector<TGSContactPoint> cps(numAllBatches * rowsPerBatch);
+    std::memset(batches.data(), 0, batches.size() * sizeof(BatchTGS));
+    std::memset(chs.data(), 0, chs.size() * sizeof(TGSContactHeader));
+    std::memset(cps.data(), 0, cps.size() * sizeof(TGSContactPoint));
+
+    const uint32_t poolSize = 3 * totalBodiesIncKinematics; // 3 float4 stripes per body
+    std::vector<Float4> velPool(poolSize);
+    for (Float4& v : velPool)
+        v = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+
+    for (uint32_t k = batchStartIndex; k < numAllBatches; ++k)
+    {
+        BatchTGS& b = batches[k];
+        b.descStride = strides[k];
+        b.constraintType = types[k];
+        b.scalars[1] = k;                // constraintBatchIndex
+        b.scalars[2] = k * rowsPerBatch; // startConstraintIndex
+
+        // batch [3] is a contact with NO normal constraints -> always inactive.
+        const bool emptyContact = (k == 3);
+
+        for (uint32_t lane = 0; lane < 32; ++lane)
+        {
+            b.slabId[lane] = rng() % numSlabs;
+            b.bodyAIndex[lane] = rng() % numTotalBodies; // some < bodyOffset (kinematic)
+            b.bodyBIndex[lane] = rng() % numTotalBodies;
+
+            if (b.constraintType == 1) // eCONTACT
+            {
+                TGSContactHeader& h = chs[k];
+                h.invMass0_1_angDom0_1[lane] = Float4{ unit(rng), unit(rng), unit(rng), unit(rng) };
+                const Vec3 n = randUnitV(rng);
+                h.normal_staticFriction[lane] = Float4{ n.x, n.y, n.z, unit(rng) };
+                h.maxPenBias[lane] = -unit(rng) * 5.f;
+                h.flags[lane] = unit(rng) < 0.5f ? COMPLIANT_ACCEL_SPRING : 0;
+                h.numNormalConstr[lane] = emptyContact ? 0u : (1u + rng() % rowsPerBatch);
+                h.restitutionXdt[lane] = unit(rng) < 0.5f ? 0.f : -unit(rng);
+                h.p8[lane] = 0.8f;
+
+                for (uint32_t i = 0; i < rowsPerBatch; ++i)
+                {
+                    TGSContactPoint& c = cps[b.scalars[2] + i];
+                    const Vec3 ra = Vec3(sym(rng), sym(rng), sym(rng)) * 0.3f;
+                    const Vec3 rb = Vec3(sym(rng), sym(rng), sym(rng)) * 0.3f;
+                    c.raXn_extraCoeff[lane] = Float4{ ra.x, ra.y, ra.z, unit(rng) * 0.3f };
+                    c.rbXn_targetVelW[lane] = Float4{ rb.x, rb.y, rb.z, sym(rng) * 0.05f };
+                    c.separation[lane] = sym(rng) * 0.05f;
+                    c.maxImpulse[lane] = 10.f + unit(rng) * 100.f;
+                    c.appliedForce[lane] = unit(rng);
+                    c.biasCoefficient[lane] = unit(rng) * 20.f;
+                    c.resp0[lane] = 0.1f + unit(rng);
+                    c.resp1[lane] = 0.1f + unit(rng);
+                }
+            }
+            // joint batches need no header data: markActiveSlab marks joints
+            // active unconditionally.
+        }
+    }
+
+    // ---- reference: OR from a zero-initialised encoded buffer ----
+    auto unpackBody = [&](uint32_t bodyId, Vec3& lv, Vec3& av, Vec3& ld, Vec3& ad) {
+        const uint32_t fi = outputOffset + bodyId;
+        const Float4 v0 = velPool[fi];
+        const Float4 v1 = velPool[fi + totalBodiesIncKinematics];
+        const Float4 v2 = velPool[fi + 2u * totalBodiesIncKinematics];
+        lv = Vec3(v0.x, v0.y, v0.z);
+        av = Vec3(v0.w, v1.x, v1.y);
+        ld = Vec3(v1.z, v1.w, v2.x);
+        ad = Vec3(v2.y, v2.z, v2.w);
+    };
+
+    const uint32_t encSize = num32Slabs * numTotalBodies;
+    std::vector<uint32_t> refEnc(encSize, 0);
+    uint32_t contactActive = 0, contactInactive = 0, jointMarks = 0;
+    for (uint32_t k = batchStartIndex; k < cpp[1]; ++k)
+    {
+        const BatchTGS& b = batches[k];
+        for (uint32_t lane = 0; lane < b.descStride; ++lane)
+        {
+            const uint32_t slabId = b.slabId[lane];
+            const uint32_t bodyIdA = b.bodyAIndex[lane];
+            const uint32_t bodyIdB = b.bodyBIndex[lane];
+            const uint32_t slabIndexOffset = (slabId / 32u) * numTotalBodies;
+            const uint32_t encodedSlabIndex = (1u << (slabId % 32u));
+
+            bool active;
+            if (b.constraintType != 1) // joint (eCONSTRAINT_1D) -> always active
+            {
+                active = true;
+                ++jointMarks;
+            }
+            else
+            {
+                BodyStateTGS s;
+                unpackBody(bodyIdA, s.lv0, s.av0, s.ld0, s.ad0);
+                unpackBody(bodyIdB, s.lv1, s.av1, s.ld1, s.ad1);
+                active = refCheckActiveContactTGS(b, s, lane, chs, cps, elapsedTime, minPen);
+                if (active)
+                    ++contactActive;
+                else
+                    ++contactInactive;
+            }
+
+            if (active && bodyIdA >= bodyOffset)
+                refEnc[slabIndexOffset + bodyIdA] |= encodedSlabIndex;
+            if (active && bodyIdB >= bodyOffset)
+                refEnc[slabIndexOffset + bodyIdB] |= encodedSlabIndex;
+        }
+    }
+
+    // fixture sanity: every code path was genuinely exercised.
+    PXG_CHECK_MSG(contactActive > 0, "fixture: at least one contact marks its slab active");
+    PXG_CHECK_MSG(contactInactive > 0, "fixture: at least one contact leaves its slab inactive");
+    PXG_CHECK_MSG(jointMarks > 0, "fixture: at least one joint batch (unconditionally active)");
+    uint32_t markedWords = 0;
+    for (uint32_t e : refEnc)
+        if (e)
+            ++markedWords;
+    PXG_CHECK_MSG(markedWords > 0 && markedWords < encSize,
+                  "fixture: encoded buffer is a mix of marked/unmarked (%u/%u)", markedWords, encSize);
+
+    // ---- GPU (engine ABI through the shim) ----
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "solverTGS.spv", "markActiveSlabTGS", 40u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &solverTgsAbiLoader);
+
+    PxgDevicePtr dVel = 0, dEnc = 0, dCpp = 0, dIsl = 0, dBatch = 0, dCh = 0, dCp = 0;
+    PxgDevicePtr dDesc = 0, dShared = 0;
+    shim.memAlloc(&dVel, velPool.size() * sizeof(Float4));
+    shim.memAlloc(&dEnc, encSize * 4);
+    shim.memAlloc(&dCpp, cpp.size() * 4);
+    shim.memAlloc(&dBatch, batches.size() * sizeof(BatchTGS));
+    shim.memAlloc(&dCh, chs.size() * sizeof(TGSContactHeader));
+    shim.memAlloc(&dCp, cps.size() * sizeof(TGSContactPoint));
+    if (!dVel || !dEnc || !dCpp || !dBatch || !dCh || !dCp)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+    std::vector<uint32_t> encInit(encSize, 0); // engine memsets this to 0 first
+    shim.memcpyHtoD(dVel, velPool.data(), velPool.size() * sizeof(Float4));
+    shim.memcpyHtoD(dEnc, encInit.data(), encSize * 4);
+    shim.memcpyHtoD(dCpp, cpp.data(), cpp.size() * 4);
+    shim.memcpyHtoD(dBatch, batches.data(), batches.size() * sizeof(BatchTGS));
+    shim.memcpyHtoD(dCh, chs.data(), chs.size() * sizeof(TGSContactHeader));
+    shim.memcpyHtoD(dCp, cps.data(), cps.size() * sizeof(TGSContactPoint));
+
+    physx::PxgIslandContext islands[2];
+    std::memset(islands, 0, sizeof(islands));
+    // element [0]: SAME body fields (the .cu reads mBodyCount / mArticulationCount
+    // from islandContextPool[0]) but DECOY partition/batch fields — a bug that
+    // read them via islandIndex would corrupt the batch range and mismatch.
+    islands[0].mBodyStartIndex = bodyOffset;
+    islands[0].mBodyCount = numDynamicBodies;
+    islands[0].mArticulationCount = 0;
+    islands[0].mStartPartitionIndex = 5u;  // decoy
+    islands[0].mNumPartitions = 9u;        // decoy
+    islands[0].mBatchStartIndex = 42u;     // decoy
+    // element [1] = islandIndex: the real island-indexed fields.
+    islands[1].mBodyStartIndex = bodyOffset;
+    islands[1].mBodyCount = 999u;          // decoy: kernel reads mBodyCount from [0]
+    islands[1].mArticulationCount = 7u;    // decoy: kernel reads it from [0]
+    islands[1].mStartPartitionIndex = 1;
+    islands[1].mNumPartitions = 1;
+    islands[1].mBatchStartIndex = batchStartIndex;
+    shim.memAlloc(&dIsl, sizeof(islands));
+    shim.memcpyHtoD(dIsl, islands, sizeof(islands));
+
+    physx::PxgSolverCoreDesc desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.islandContextPool = reinterpret_cast<physx::PxgIslandContext*>(dIsl);
+    desc.constraintsPerPartition = reinterpret_cast<physx::PxU32*>(dCpp);
+    desc.numSlabs = numSlabs;
+    desc.accumulatedBodyDeltaVOffset = outputOffset;
+
+    physx::PxgSolverSharedDesc<physx::IterativeSolveDataTGS> shared;
+    std::memset(&shared, 0, sizeof(shared));
+    shared.iterativeData.solverBodyVelPool = reinterpret_cast<float4*>(dVel);
+    shared.iterativeData.solverEncodedReferenceCount = reinterpret_cast<physx::PxU32*>(dEnc);
+    shared.iterativeData.blockConstraintBatch = reinterpret_cast<physx::PxgBlockConstraintBatch*>(dBatch);
+    shared.iterativeData.blockContactHeaders = reinterpret_cast<physx::PxgTGSBlockSolverContactHeader*>(dCh);
+    shared.iterativeData.blockContactPoints = reinterpret_cast<physx::PxgTGSBlockSolverContactPoint*>(dCp);
+
+    shim.memAlloc(&dDesc, sizeof(desc));
+    shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
+    shim.memAlloc(&dShared, sizeof(shared));
+    shim.memcpyHtoD(dShared, &shared, sizeof(shared));
+
+    EngineBlob blob;
+    blob.add<uint64_t>(dDesc);     // @0  solverCoreDesc
+    blob.add<uint64_t>(dShared);   // @8  sharedDesc
+    blob.add<uint32_t>(1u);        // @16 islandIndex
+    blob.add<uint32_t>(0u);        // @20 lastPartition
+    blob.add<float>(minPen);       // @24 (note: minPen precedes elapsedTime)
+    blob.add<float>(elapsedTime);  // @28
+    blob.add<uint64_t>(0u);        // @32 artiDesc (deferred; unused on the rigid path)
+    blob.finish();
+    PXG_CHECK_MSG(blob.bytes.size() == 40, "markActiveSlabTGS blob is 40 bytes (got %zu)", blob.bytes.size());
+
+    // grid (maxBlocks, 1, 1); block (32, 2, 1) -> 2 warps/block.  maxBlocks =
+    // ceil(batchesInPartition / numWarpsPerBlock) = ceil(4/2) = 2.
+    PXG_CHECK_MSG(shim.launchKernel(0, 2, 1, 1, blob.bytes.data(), uint32_t(blob.bytes.size())) ==
+                      PxgResult::Success,
+                  "launch markActiveSlabTGS");
+    shim.streamSynchronize();
+
+    // ---- compare ----
+    std::vector<uint32_t> gpuEnc(encSize);
+    shim.memcpyDtoH(gpuEnc.data(), dEnc, encSize * 4);
+
+    size_t mismatches = 0;
+    for (uint32_t i = 0; i < encSize; ++i)
+        if (gpuEnc[i] != refEnc[i])
+        {
+            if (mismatches < 5)
+                PXG_CHECK_MSG(false, "encoded[%u]: gpu=0x%08x ref=0x%08x", i, gpuEnc[i], refEnc[i]);
+            ++mismatches;
+        }
+    PXG_CHECK_MSG(mismatches == 0, "markActiveSlabTGS: %zu encoded-word mismatches", mismatches);
+
+    for (PxgDevicePtr pfree : { dVel, dEnc, dCpp, dBatch, dCh, dCp, dIsl, dDesc, dShared })
+        shim.memFree(pfree);
+}
+
 } // namespace

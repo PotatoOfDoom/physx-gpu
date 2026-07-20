@@ -129,7 +129,7 @@ pxg_compile_shader(solverTGS solveBlockPartitionTGS concludeBlocksTGS writebackB
                    writeBackBodiesTGS computeAverageSolverBodyVelocityTGS
                    propagateAverageSolverBodyVelocityTGS solveWholeIslandTGS
                    solveStaticBlockTGS propagateStaticSolverBodyVelocitiesTGS
-                   solveBlockUnified)
+                   solveBlockUnified markActiveSlabTGS)
 pxg_compile_shader(constraintPrepPGS contactConstraintBlockPrepareParallelLaunch
                    jointConstraintBlockPrepareParallelLaunch)
 pxg_compile_shader(constraintPrepTGS contactConstraintBlockPrepareParallelLaunchTGS
