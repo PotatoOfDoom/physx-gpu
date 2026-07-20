@@ -29,10 +29,21 @@
 // sentinel; after the launch the kernel-defined ranges must be exactly zero and
 // everything outside them must retain the sentinel (catching over- and
 // under-zeroing).  A short grid stride forces the grid-stride loop to iterate.
+//
+// ZeroBodiesTGS runs on the ENGINE ABI (P5 Step 4): a REAL PxgSolverCoreDesc +
+// PxgSolverSharedDesc<IterativeSolveDataTGS> pair is filled with live device
+// addresses and counts, and the kernel is launched through PxgCudaShim with
+// the engine's exact (desc*, sharedDesc*) param pack and fixed
+// ZERO_BODIES = 64x256 grid, deriving both zeroed ranges on-device.
 
 #include "pxgTestFramework.h"
+#include "PxgCudaShim.h"
+
+#include "PxNodeIndex.h" // completes PxNodeIndex for the PxgNarrowphaseCore.h chain
+#include "PxgSolverCoreDesc.h"
 
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace
@@ -95,8 +106,16 @@ PXG_TEST(solverZeroBodies_pgs)
     dev->destroyBuffer(bBody);
 }
 
+static std::vector<uint8_t> zeroBodiesLoader(const char* file) { return loadShaderBlob(file); }
+
 PXG_TEST(solverZeroBodies_tgs)
 {
+    using namespace physx;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     const uint32_t numSolverBodies = 500, numBatches = 20, numArticBatches = 4;
     const uint32_t totalNumBodies = numSolverBodies * 2;                                    // 1000
     const uint32_t totalNumBodiesConstraints =
@@ -105,20 +124,44 @@ PXG_TEST(solverZeroBodies_tgs)
     const uint32_t bodyElems = 8000;     // zero [0,6108), preserve [6108,8000)
 
     PxgSlangComputeDevice* dev = testDevice();
-    const uint32_t GROUPS = 4;
-    const uint32_t gridStride = GROUPS * 256;
+    // engine ABI: (const PxgSolverCoreDesc*, const PxgSolverSharedDesc<IterativeSolveDataTGS>*)
+    const PxgKernelDef manifest[] = { { "solverZeroBodies.spv", "ZeroBodiesTGS", 16u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &zeroBodiesLoader);
 
     std::vector<float> motionInit(4 * motionElems, SENT), bodyInit(4 * bodyElems, SENT);
-    PxgBufferHandle bMotion = createBufferFrom(dev, motionInit);
-    PxgBufferHandle bBody = createBufferFrom(dev, bodyInit);
+    PxgDevicePtr dMotion = 0, dBody = 0, dDesc = 0, dShared = 0;
+    shim.memAlloc(&dMotion, motionInit.size() * 4);
+    shim.memAlloc(&dBody, bodyInit.size() * 4);
+    if (!dMotion || !dBody) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+    shim.memcpyHtoD(dMotion, motionInit.data(), motionInit.size() * 4);
+    shim.memcpyHtoD(dBody, bodyInit.data(), bodyInit.size() * 4);
 
-    Kernel k("solverZeroBodies.spv", "ZeroBodiesTGS", { 16, 16 }, sizeof(ZeroBodiesParams));
-    ZeroBodiesParams p = { totalNumBodies, totalNumBodiesConstraints, 0, gridStride };
-    k.dispatch(GROUPS, { bMotion, bBody }, p);
-    dev->flush();
+    // the REAL engine descs, with live device addresses + counts
+    PxgSolverCoreDesc desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.motionVelocityArray = reinterpret_cast<float4*>(dMotion);
+    desc.numSolverBodies = numSolverBodies;
+    desc.numBatches = numBatches;
+    desc.numArticBatches = numArticBatches;
 
-    const auto gMotion = downloadBuffer<float>(dev, bMotion, 4 * motionElems);
-    const auto gBody = downloadBuffer<float>(dev, bBody, 4 * bodyElems);
+    PxgSolverSharedDesc<IterativeSolveDataTGS> shared;
+    std::memset(&shared, 0, sizeof(shared));
+    shared.iterativeData.solverBodyVelPool = reinterpret_cast<float4*>(dBody);
+
+    shim.memAlloc(&dDesc, sizeof(desc));
+    shim.memAlloc(&dShared, sizeof(shared));
+    shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
+    shim.memcpyHtoD(dShared, &shared, sizeof(shared));
+
+    // PxgSolverCore::resetVelocities: fixed grid ZERO_BODIES = 64 blocks x 256
+    struct { uint64_t desc, shared; } prm = { dDesc, dShared };
+    PXG_CHECK_MSG(shim.launchKernel(0, 64, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch ZeroBodiesTGS");
+    shim.streamSynchronize();
+
+    std::vector<float> gMotion(4 * motionElems), gBody(4 * bodyElems);
+    shim.memcpyDtoH(gMotion.data(), dMotion, gMotion.size() * 4);
+    shim.memcpyDtoH(gBody.data(), dBody, gBody.size() * 4);
 
     const size_t mmMotion = checkFloat4(gMotion, motionElems,
         [&](uint32_t e) { return e < totalNumBodies; });
@@ -128,8 +171,8 @@ PXG_TEST(solverZeroBodies_tgs)
         [&](uint32_t e) { return e < totalNumBodiesConstraints; });
     PXG_CHECK_MSG(mmBody == 0, "ZeroBodiesTGS body: %zu mismatches", mmBody);
 
-    dev->destroyBuffer(bMotion);
-    dev->destroyBuffer(bBody);
+    for (PxgDevicePtr pfree : { dMotion, dBody, dDesc, dShared })
+        shim.memFree(pfree);
 }
 
 } // namespace

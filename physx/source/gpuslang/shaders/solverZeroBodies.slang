@@ -52,6 +52,14 @@
 //
 // The CUDA launches these with a 1D grid; the grid stride blockDim.x*gridDim.x
 // is passed as gridStride so the host's launch geometry is reproduced exactly.
+//
+// ZeroBodiesTGS is on the P5 Step 4 BDA engine-launch ABI: it takes the
+// engine's (PxgSolverCoreDesc*, PxgSolverSharedDesc<IterativeSolveDataTGS>*)
+// pack and reads the counts and pool pointers on-device through the
+// byte-exact pxgSlangSolverDesc mirrors (proven by testSolverDescLayout).
+// The PGS ZeroBodies entry still uses the harness push constants + bindings.
+
+import pxgSlangSolverDesc;
 
 struct ZeroBodiesParams
 {
@@ -92,19 +100,37 @@ void ZeroBodies(uint3 dtid : SV_DispatchThreadID)
 }
 
 // ---------------------------------------------------------------------------
-// ZeroBodiesTGS (TGS)
+// ZeroBodiesTGS (TGS) — engine ABI: (PxgSolverCoreDesc*, PxgSolverSharedDesc*)
 // ---------------------------------------------------------------------------
+struct ZeroBodiesTGSAbiParams
+{
+    uint64_t solverCoreDesc; // @0 const PxgSolverCoreDesc*
+    uint64_t sharedDesc;     // @8 const PxgSolverSharedDesc<IterativeSolveDataTGS>*
+}
+[[vk::push_constant]]
+ConstantBuffer<ZeroBodiesTGSAbiParams> gZeroTGS;
+
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void ZeroBodiesTGS(uint3 dtid : SV_DispatchThreadID)
 {
-    const uint stride = gParams.gridStride;
+    PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gZeroTGS.solverCoreDesc))[0];
+    PxgSolverSharedDescTGSGpu shared = (Ptr<PxgSolverSharedDescTGSGpu>(gZeroTGS.sharedDesc))[0];
+
+    Ptr<float4> bodyVelocities = Ptr<float4>(shared.iter_solverBodyVelPool);
+    Ptr<float4> motionVelocities = Ptr<float4>(desc.motionVelocityArray);
+    // *2 because of linear and angular components
+    const uint totalNumBodies = desc.numSolverBodies * 2u;
+    const uint totalNumBodiesConstraints =
+        (desc.numArticBatches + desc.numBatches) * 32u * 3u * 2u + desc.numSolverBodies * 3u;
+
+    const uint stride = WorkgroupCount().x * 256u;
 
     // (1) motion velocities
-    for (uint a = dtid.x; a < gParams.totalNumBodies; a += stride)
-        gMotionVelocities[a] = ZERO;
+    for (uint a = dtid.x; a < totalNumBodies; a += stride)
+        motionVelocities[a] = ZERO;
 
     // (2) all solver body velocities
-    for (uint a = dtid.x; a < gParams.totalNumBodiesConstraints; a += stride)
-        gBodyVelocities[a] = ZERO;
+    for (uint a = dtid.x; a < totalNumBodiesConstraints; a += stride)
+        bodyVelocities[a] = ZERO;
 }

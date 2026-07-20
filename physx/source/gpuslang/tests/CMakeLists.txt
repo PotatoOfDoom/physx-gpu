@@ -67,7 +67,8 @@ set(SHADER_COMMON_DEPS
     ${SHADER_DIR}/pxgSlangScan.slang
     ${SHADER_DIR}/pxgSlangPrepCommon.slang
     ${SHADER_DIR}/pxgSlangWarpInc.slang
-    ${SHADER_DIR}/pxgSlangBpDesc.slang)
+    ${SHADER_DIR}/pxgSlangBpDesc.slang
+    ${SHADER_DIR}/pxgSlangSolverDesc.slang)
 
 # Shaders whose SPIR-V gets NoContraction decorations stamped onto every
 # float arithmetic op (tools/spv_nocontract.py).  slangc emits none and its
@@ -411,6 +412,9 @@ pxg_compile_shader(npTex3d tex3dSample)
 pxg_compile_shader(npShimAxpy shimAxpy)
 # P5 Step 4: PxgBroadPhaseDesc mirror layout proof (BDA).
 pxg_compile_shader(npBpDescProbe bpDescProbe)
+# P5 Step 4: PxgSolverCoreDesc / PxgSolverSharedDesc<IterativeSolveDataTGS> /
+# PxgIslandContext mirror layout proof (BDA).
+pxg_compile_shader(npSolverDescProbe solverDescProbe)
 # RUNTIME_PLAN.md P3 launch-marshalling proof kernel (multi-arg natural alignment).
 pxg_compile_shader(npShimMisalign shimMisAdd)
 
@@ -752,6 +756,7 @@ add_executable(gpuslang-tests
     testP4Wrangler.cpp
     testP4Broadphase.cpp
     testBpDescLayout.cpp
+    testSolverDescLayout.cpp
     testP4Aabb.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelAbi.cpp
@@ -899,7 +904,7 @@ foreach(suite scan radixSort radixSortDesc radixSortGather preIntegration integr
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -941,7 +946,7 @@ set(PXG_HLSL_ENTRIES
     "thresholdForceChange:computeThresholdElementMaskIndices"
     "thresholdForceChange:outputThresholdPairsMaskIndices"
     "thresholdForceChange:createForceChangeThresholdElements"
-    "solverZeroBodies:ZeroBodies" "solverZeroBodies:ZeroBodiesTGS"
+    "solverZeroBodies:ZeroBodies"
     "solverInitVelocitiesTGS:initializeSolverVelocitiesTGS"
     "solverApplyGravityTGS:applyTGSSubstepGravity"
     "solverDmaBack:dmaBackChangedElems" "solverDmaBack:dmaConstraintResidual"

@@ -32,7 +32,13 @@
 #include "pxgTestFramework.h"
 #include "pxgGpuStructs.h"
 #include "pxgRefMath.h"
+#include "PxgCudaShim.h"
 
+#include "PxNodeIndex.h" // completes PxNodeIndex for the PxgNarrowphaseCore.h chain
+#include "PxgSolverCoreDesc.h"
+#include "PxgIslandContext.h"
+
+#include <cstring>
 #include <numeric>
 #include <random>
 
@@ -1181,8 +1187,51 @@ PXG_TEST(solverTGS_concludeAndWriteback)
 // computeAverageSolverBodyVelocityTGS + propagateAverageSolverBodyVelocityTGS
 // + writeBackBodiesTGS
 // ---------------------------------------------------------------------------
+// ENGINE ABI (P5 Step 4): the averaging/propagate/writeback-bodies kernels
+// take the engine's (PxgSolverCoreDesc*, PxgSolverSharedDesc*) packs; the
+// test fills the REAL engine descs (+ PxgIslandContext) with live device
+// addresses and launches through PxgCudaShim with the engine's grid
+// arithmetic (warp-structured blockDim (32,8,1) -> one-warp workgroups x8;
+// WRITE_BACK_BODIES blockDim 256).  writeBackBodiesTGS is launched with
+// islandIndex = 1 against a 2-element island array whose element [0] is a
+// decoy, pinning the PxgIslandContext stride on the real ABI.
+static std::vector<uint8_t> solverTgsAbiLoader(const char* file) { return loadShaderBlob(file); }
+
+// Mirrors the bridge's marshalling: place each argument at the natural
+// alignment inferred from its size, then round the blob to the largest
+// alignment seen (a compiled struct's trailing padding).
+struct EngineBlob
+{
+    std::vector<uint8_t> bytes;
+    size_t maxAlign = 1;
+
+    static size_t alignFor(size_t size)
+    {
+        if (size >= 16) return 16;
+        if (size >= 8)  return 8;
+        if (size >= 4)  return 4;
+        if (size >= 2)  return 2;
+        return 1;
+    }
+    template <typename T>
+    void add(const T& v)
+    {
+        const size_t a = alignFor(sizeof(T));
+        if (a > maxAlign) maxAlign = a;
+        bytes.resize((bytes.size() + (a - 1)) & ~(a - 1));
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
+        bytes.insert(bytes.end(), p, p + sizeof(T));
+    }
+    void finish() { bytes.resize((bytes.size() + (maxAlign - 1)) & ~(maxAlign - 1)); }
+};
+
 PXG_TEST(solverTGS_velocityAveragingAndPropagate)
 {
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(3500);
     std::uniform_real_distribution<float> unit(0.f, 1.f);
     std::uniform_real_distribution<float> sym(-3.f, 3.f);
@@ -1252,62 +1301,131 @@ PXG_TEST(solverTGS_velocityAveragingAndPropagate)
 
         PxgSlangComputeDevice* dev = testDevice();
 
-        const std::vector<uint32_t> strides = { 1536, 2048, 1664, 1792, 1408, 4992, 3328,
-                                                sizeof(SolverTxIData), 16, 4, sizeof(SolverBodyData), 32,
-                                                4, 40, 4, 2816, 52, 16, 4, sizeof(BodySim) };
+        // engine ABI: {desc, shared} = 16; propagate {desc, shared, bool, bool,
+        // float} = 24; writeBack {desc, shared, u32} = 24
+        const PxgKernelDef manifest[] = {
+            { "solverTGS.spv", "computeAverageSolverBodyVelocityTGS", 16u, 0 },
+            { "solverTGS.spv", "propagateAverageSolverBodyVelocityTGS", 24u, 0 },
+            { "solverTGS.spv", "writeBackBodiesTGS", 24u, 0 },
+        };
+        PxgCudaShim shim(dev, manifest, 3, &solverTgsAbiLoader);
 
-        Kernel average("solverTGS.spv", "computeAverageSolverBodyVelocityTGS",
-                       std::vector<uint32_t>(strides.begin(), strides.begin() + 19),
-                       sizeof(SolverTGSParams));
-        Kernel propagate("solverTGS.spv", "propagateAverageSolverBodyVelocityTGS", strides,
-                         sizeof(SolverTGSParams));
-        Kernel writeBackBodies("solverTGS.spv", "writeBackBodiesTGS",
-                               std::vector<uint32_t>(strides.begin(), strides.begin() + 18),
-                               sizeof(SolverTGSParams));
+        PxgDevicePtr dVel = 0, dEnc = 0, dRef = 0, dTx = 0, dBd = 0, dBs = 0, dMv = 0;
+        shim.memAlloc(&dVel, velPool.size() * sizeof(Float4));
+        shim.memAlloc(&dEnc, encoded.size() * 4);
+        shim.memAlloc(&dRef, references.size() * 4);
+        shim.memAlloc(&dTx, txi.size() * sizeof(SolverTxIData));
+        shim.memAlloc(&dBd, bodyData.size() * sizeof(SolverBodyData));
+        shim.memAlloc(&dBs, bodySims.size() * sizeof(BodySim));
+        shim.memAlloc(&dMv, motionVel.size() * sizeof(Float4));
+        if (!dVel || !dEnc || !dRef || !dTx || !dBd || !dBs || !dMv)
+        {
+            std::printf("  NOTE: no BDA -> skip\n");
+            return;
+        }
+        shim.memcpyHtoD(dVel, velPool.data(), velPool.size() * sizeof(Float4));
+        shim.memcpyHtoD(dEnc, encoded.data(), encoded.size() * 4);
+        shim.memcpyHtoD(dRef, references.data(), references.size() * 4);
+        shim.memcpyHtoD(dTx, txi.data(), txi.size() * sizeof(SolverTxIData));
+        shim.memcpyHtoD(dBd, bodyData.data(), bodyData.size() * sizeof(SolverBodyData));
+        shim.memcpyHtoD(dBs, bodySims.data(), bodySims.size() * sizeof(BodySim));
+        shim.memcpyHtoD(dMv, motionVel.data(), motionVel.size() * sizeof(Float4));
 
-        std::vector<uint32_t> dummy(16, 0);
-        PxgBufferHandle dummyBuf = createBufferFrom(dev, dummy);
-        PxgBufferHandle velBuf = createBufferFrom(dev, velPool);
-        PxgBufferHandle encBuf = createBufferFrom(dev, encoded);
-        PxgBufferHandle refBuf = createBufferFrom(dev, references);
-        PxgBufferHandle txBuf = createBufferFrom(dev, txi);
-        PxgBufferHandle bdBuf = createBufferFrom(dev, bodyData);
-        PxgBufferHandle bsBuf = createBufferFrom(dev, bodySims);
-        PxgBufferHandle mvBuf = createBufferFrom(dev, motionVel);
+        // island array: [0] is a DECOY, [1] is the real island — average/
+        // propagate read island [0] through descA, writeBackBodiesTGS reads
+        // islandIndex = 1 through descB, pinning the PxgIslandContext stride.
+        physx::PxgIslandContext islands[2];
+        std::memset(islands, 0, sizeof(islands));
+        islands[0].mBodyStartIndex = bodyOffset;
+        islands[0].mBodyCount = totalBodyCount;
+        islands[0].mArticulationCount = 0;
+        islands[1] = islands[0];
+        physx::PxgIslandContext islandsB[2];
+        std::memset(islandsB, 0, sizeof(islandsB));
+        islandsB[0].mBodyStartIndex = 999u; // decoy: wrong stride/index fails
+        islandsB[0].mBodyCount = 3u;
+        islandsB[1].mBodyStartIndex = bodyOffset;
+        islandsB[1].mBodyCount = totalBodyCount;
+        PxgDevicePtr dIslA = 0, dIslB = 0;
+        shim.memAlloc(&dIslA, sizeof(islands));
+        shim.memcpyHtoD(dIslA, islands, sizeof(islands));
+        shim.memAlloc(&dIslB, sizeof(islandsB));
+        shim.memcpyHtoD(dIslB, islandsB, sizeof(islandsB));
 
-        SolverTGSParams params = {};
-        params.numSlabs = numSlabs;
-        params.numTotalBodies = numTotalBodies;
-        params.bodyOffset = bodyOffset;
-        params.totalBodyCount = totalBodyCount;
-        params.deltaVOffset = deltaVOffset;
-        params.averageOutputOffsets = averageOutputOffsets;
-        params.isVelocityIteration = isVelocityIteration;
-        params.invDt = invDt;
-        params.stepDt = stepDt;
+        // the REAL engine descs with live device addresses
+        physx::PxgSolverCoreDesc desc;
+        std::memset(&desc, 0, sizeof(desc));
+        desc.islandContextPool = reinterpret_cast<physx::PxgIslandContext*>(dIslA);
+        desc.solverBodyReferences = reinterpret_cast<physx::PxgSolverReferences*>(dRef);
+        desc.solverBodyDataPool = reinterpret_cast<physx::PxgSolverBodyData*>(dBd);
+        desc.solverBodyTxIDataPool = reinterpret_cast<physx::PxgSolverTxIData*>(dTx);
+        desc.mBodySimBufferDeviceData = reinterpret_cast<physx::PxgBodySim*>(dBs);
+        desc.motionVelocityArray = reinterpret_cast<float4*>(dMv);
+        desc.numSlabs = numSlabs;
+        desc.numBatches = numBatches;
+        desc.numArticBatches = 0;
+        desc.numSolverBodies = T;
+        desc.accumulatedBodyDeltaVOffset = deltaVOffset;
+        physx::PxgSolverCoreDesc descB = desc;
+        descB.islandContextPool = reinterpret_cast<physx::PxgIslandContext*>(dIslB);
 
-        const uint32_t pow2 = [&] {
-            uint32_t x = numSlabs;
-            if ((x & (x - 1)) == 0)
-                return x;
-            x--; x |= x >> 1; x |= x >> 2; x |= x >> 4; x |= x >> 8; x |= x >> 16;
-            return x + 1;
-        }();
-        const uint32_t threadsPerBody = std::min(pow2, 32u);
-        const uint32_t bodiesPerWarp = 32 / threadsPerBody;
-        const uint32_t avgGroups = (totalBodyCount + bodiesPerWarp - 1) / bodiesPerWarp;
-        const uint32_t propGroups = (T + bodiesPerWarp - 1) / bodiesPerWarp;
+        physx::PxgSolverSharedDesc<physx::IterativeSolveDataTGS> shared;
+        std::memset(&shared, 0, sizeof(shared));
+        shared.stepDt = stepDt;
+        shared.invDtF32 = invDt;
+        shared.iterativeData.solverBodyVelPool = reinterpret_cast<float4*>(dVel);
+        shared.iterativeData.solverEncodedReferenceCount = reinterpret_cast<physx::PxU32*>(dEnc);
 
-        std::vector<PxgBufferHandle> bufs = { dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf,
-                                              dummyBuf, txBuf, velBuf, encBuf, bdBuf, dummyBuf, dummyBuf,
-                                              dummyBuf, dummyBuf, dummyBuf, dummyBuf, mvBuf, refBuf, bsBuf };
-        average.dispatch(avgGroups, std::vector<PxgBufferHandle>(bufs.begin(), bufs.begin() + 19), params);
-        dev->barrier();
-        propagate.dispatch(propGroups, bufs, params);
-        dev->barrier();
-        writeBackBodies.dispatch((totalBodyCount + 127) / 128,
-                                 std::vector<PxgBufferHandle>(bufs.begin(), bufs.begin() + 18), params);
-        dev->flush();
+        PxgDevicePtr dDescA = 0, dDescB = 0, dShared = 0;
+        shim.memAlloc(&dDescA, sizeof(desc));
+        shim.memcpyHtoD(dDescA, &desc, sizeof(desc));
+        shim.memAlloc(&dDescB, sizeof(descB));
+        shim.memcpyHtoD(dDescB, &descB, sizeof(descB));
+        shim.memAlloc(&dShared, sizeof(shared));
+        shim.memcpyHtoD(dShared, &shared, sizeof(shared));
+
+        // engine grid arithmetic: COMPUTE_BODIES_AVERAGE_VELOCITY = 256,
+        // blockDim (32,8,1) -> dispatch nbBlocks*8 one-warp workgroups.
+        // average (solvePartitions): nbThreads = 32 * mBodyCount;
+        // propagate (pos-iter site): nbThreads = 32 * (mBodyCount + mBodyStartIndex).
+        // (The velocity-iteration engine site under-dispatches via
+        // 32*((mBodyCount+9)/10); the kernel is guard-correct under any grid,
+        // so the test keeps the full-coverage grid for both variants to match
+        // the all-bodies reference.)
+        const uint32_t avgBlocks = (32 * totalBodyCount + 255) / 256;
+        const uint32_t propBlocks = (32 * (totalBodyCount + bodyOffset) + 255) / 256;
+
+        struct { uint64_t desc, shared; } avgPrm = { dDescA, dShared };
+        PXG_CHECK_MSG(shim.launchKernel(0, avgBlocks * 8, 1, 1, &avgPrm, sizeof(avgPrm)) == PxgResult::Success,
+                      "launch computeAverageSolverBodyVelocityTGS");
+
+        // (descs..., bool isVelocityIteration, bool isLastPosIteration, PxReal
+        // biasCoefficient) marshalled by the bridge's natural-alignment rule
+        EngineBlob propBlob;
+        propBlob.add<uint64_t>(dDescA);
+        propBlob.add<uint64_t>(dShared);
+        propBlob.add<uint8_t>(uint8_t(isVelocityIteration));
+        propBlob.add<uint8_t>(0); // isLastPosIteration (unused by the kernel)
+        propBlob.add<float>(0.7f); // biasCoefficient (unused by the kernel)
+        propBlob.finish();
+        PXG_CHECK_MSG(propBlob.bytes.size() == 24, "propagate blob is 24 bytes (got %zu)",
+                      propBlob.bytes.size());
+        PXG_CHECK_MSG(shim.launchKernel(1, propBlocks * 8, 1, 1, propBlob.bytes.data(),
+                                        uint32_t(propBlob.bytes.size())) == PxgResult::Success,
+                      "launch propagateAverageSolverBodyVelocityTGS");
+
+        // WRITE_BACK_BODIES = 256, 1 thread/body; islandIndex = 1 (decoy at [0])
+        EngineBlob wbBlob;
+        wbBlob.add<uint64_t>(dDescB);
+        wbBlob.add<uint64_t>(dShared);
+        wbBlob.add<uint32_t>(1u); // islandIndex
+        wbBlob.finish();
+        PXG_CHECK_MSG(wbBlob.bytes.size() == 24, "writeback blob is 24 bytes (got %zu)",
+                      wbBlob.bytes.size());
+        PXG_CHECK_MSG(shim.launchKernel(2, (totalBodyCount + 255) / 256, 1, 1, wbBlob.bytes.data(),
+                                        uint32_t(wbBlob.bytes.size())) == PxgResult::Success,
+                      "launch writeBackBodiesTGS");
+        shim.streamSynchronize();
 
         // ---- reference ----
         std::vector<Float4> refVel = velPool;
@@ -1441,10 +1559,14 @@ PXG_TEST(solverTGS_velocityAveragingAndPropagate)
         }
 
         // ---- compare ----
-        const auto gpuVel = downloadBuffer<Float4>(dev, velBuf, poolSize);
-        const auto gpuEnc = downloadBuffer<uint32_t>(dev, encBuf, encoded.size());
-        const auto gpuTxi = downloadBuffer<SolverTxIData>(dev, txBuf, txi.size());
-        const auto gpuMotion = downloadBuffer<Float4>(dev, mvBuf, motionVel.size());
+        std::vector<Float4> gpuVel(poolSize);
+        std::vector<uint32_t> gpuEnc(encoded.size());
+        std::vector<SolverTxIData> gpuTxi(txi.size());
+        std::vector<Float4> gpuMotion(motionVel.size());
+        shim.memcpyDtoH(gpuVel.data(), dVel, gpuVel.size() * sizeof(Float4));
+        shim.memcpyDtoH(gpuEnc.data(), dEnc, gpuEnc.size() * 4);
+        shim.memcpyDtoH(gpuTxi.data(), dTx, gpuTxi.size() * sizeof(SolverTxIData));
+        shim.memcpyDtoH(gpuMotion.data(), dMv, gpuMotion.size() * sizeof(Float4));
 
         size_t mismatches = 0;
         for (size_t i = 0; i < poolSize; ++i)
@@ -1498,8 +1620,8 @@ PXG_TEST(solverTGS_velocityAveragingAndPropagate)
         PXG_CHECK_MSG(mismatches == 0, "slabs=%u velIt=%u: %zu motion-velocity mismatches", numSlabs,
                       isVelocityIteration, mismatches);
 
-        for (PxgBufferHandle h : { dummyBuf, velBuf, encBuf, refBuf, txBuf, bdBuf, bsBuf, mvBuf })
-            dev->destroyBuffer(h);
+        for (PxgDevicePtr pfree : { dVel, dEnc, dRef, dTx, dBd, dBs, dMv, dIslA, dIslB, dDescA, dDescB, dShared })
+            shim.memFree(pfree);
     }
 }
 

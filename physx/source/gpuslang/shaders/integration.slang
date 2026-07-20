@@ -45,6 +45,7 @@
 // scalar members arrive as push constants.
 
 import pxgSlangCommon;
+import pxgSlangSolverDesc;
 
 static const uint BLOCK_SIZE = 128;
 
@@ -522,64 +523,99 @@ void integrateCoreParallelLaunch(uint3 dispatchThreadId : SV_DispatchThreadID)
     gBodySim[nodeIndex] = bodySim;
 }
 
-// mirrors integrateCoreParallelLaunchTGS() in integrationTGS.cu
+// mirrors integrateCoreParallelLaunchTGS() in integrationTGS.cu — P5 Step 4
+// BDA engine-launch ABI: the push-constant struct mirrors the CUDA parameter
+// list EXACTLY (PxU32 offset, then five device pointers at natural
+// alignment).  All counts/offsets/pool pointers are read from the descs
+// on-device through the byte-exact pxgSlangSolverDesc mirrors; the CUDA
+// `if (prevVelocities)` null-pointer branch is a device-address check here.
+struct IntegrationTGSAbiParams
+{
+    uint offset;                      // @0  (4 bytes pad follow)
+    uint64_t solverCoreDesc;          // @8  const PxgSolverCoreDesc*
+    uint64_t sharedDesc;              // @16 const PxgSolverSharedDesc<IterativeSolveDataTGS>*
+    uint64_t islandIds;               // @24 const PxU32*
+    uint64_t islandStaticTouchCounts; // @32 const PxU32*
+    uint64_t numCountedInteractions;  // @40 const PxU32*
+}                                     // = 48
+[[vk::push_constant]]
+ConstantBuffer<IntegrationTGSAbiParams> gTgsAbi;
+
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
 void integrateCoreParallelLaunchTGS(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
+    PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gTgsAbi.solverCoreDesc))[0];
+    PxgSolverSharedDescTGSGpu shared = (Ptr<PxgSolverSharedDescTGSGpu>(gTgsAbi.sharedDesc))[0];
+
+    Ptr<float4> motionVelocityArray = Ptr<float4>(desc.motionVelocityArray);
+    const uint numSolverBodies = desc.numSolverBodies;
+    Ptr<float4> solverBodyVelocity = Ptr<float4>(shared.iter_solverBodyVelPool);
+    Ptr<PxgSolverTxIData> txIDatas = Ptr<PxgSolverTxIData>(desc.solverBodyTxIDataPool);
+    Ptr<float4> outSolverVelocity = Ptr<float4>(desc.outSolverVelocity);
+    Ptr<PxgAlignedTransform> outBody2World = Ptr<PxgAlignedTransform>(desc.outBody2World);
+    Ptr<PxgSolverBodyData> solverBodyDataPool = Ptr<PxgSolverBodyData>(desc.solverBodyDataPool);
+    Ptr<PxgBodySim> bodySimPool = Ptr<PxgBodySim>(desc.mBodySimBufferDeviceData);
+    Ptr<PxgSolverBodySleepData> sleepDataPool = Ptr<PxgSolverBodySleepData>(desc.solverBodySleepDataPool);
+    Ptr<uint> islandIds = Ptr<uint>(gTgsAbi.islandIds);
+    Ptr<uint> islandStaticTouchCounts = Ptr<uint>(gTgsAbi.islandStaticTouchCounts);
+    Ptr<uint> numCountedInteractions = Ptr<uint>(gTgsAbi.numCountedInteractions);
+
     const uint idx = dispatchThreadId.x;
-    const uint numSolverBodies = gParams.numSolverBodies;
-    const uint a = idx + gParams.offset;
+    const uint a = idx + gTgsAbi.offset;
 
     if (a >= numSolverBodies)
         return;
 
-    const PxgSolverBodyData data = gSolverBodyData[a];
+    const PxgSolverBodyData data = solverBodyDataPool[a];
 
     const uint nodeIndex = nodeIndexIndex(data.islandNodeIndex);
 
-    PxgBodySim bodySim = gBodySim[nodeIndex];
+    PxgBodySim bodySim = bodySimPool[nodeIndex];
 
-    const PxgMat33 sqrtInvInertia = mat33Load(gTxIData[a].sqrtInvInertia);
-    const PxgTransform28 deltaTransform = gTxIData[a].deltaBody2World;
+    const PxgMat33 sqrtInvInertia = mat33Load(txIDatas[a].sqrtInvInertia);
+    const PxgTransform28 deltaTransform = txIDatas[a].deltaBody2World;
 
     // PT: TODO: PGS version uses bodySim.body2World here, why?
-    PxgAlignedTransform body2World = gOutBody2World[a];
+    PxgAlignedTransform body2World = outBody2World[a];
 
     const float4 inverseInertia = bodySim.inverseInertiaXYZ_contactReportThresholdW;
 
-    const float4 motionLinVel = gMotionVelocityArray[a];
-    const float4 motionAngVel = gMotionVelocityArray[a + numSolverBodies];
+    const float4 motionLinVel = motionVelocityArray[a];
+    const float4 motionAngVel = motionVelocityArray[a + numSolverBodies];
 
-    const uint readIndex = gParams.accumulatedBodyDeltaVOffset + a;
+    const uint readIndex = desc.accumulatedBodyDeltaVOffset + a;
 
     // TGS velocity pool layout: v0 = (lin.xyz, ang.x), v1 = (ang.yz, ...)
-    const float4 v0 = gSolverBodyVelPool[readIndex];
-    const float4 v1 = gSolverBodyVelPool[readIndex + numSolverBodies];
+    const float4 v0 = solverBodyVelocity[readIndex];
+    const float4 v1 = solverBodyVelocity[readIndex + numSolverBodies];
 
     float4 linVel = float4(v0.x, v0.y, v0.z, 0.0f);
     float4 angVel = float4(v0.w, v1.x, v1.y, 0.0f);
 
-    const uint staticTouchCount = gIslandStaticTouchCounts[gIslandIds[nodeIndex]];
+    const uint staticTouchCount = islandStaticTouchCounts[islandIds[nodeIndex]];
 
     PxgSolverBodySleepData sleepData;
 
     integrateCoreTGS(motionLinVel, motionAngVel, inverseInertia, linVel, angVel, body2World,
                      deltaTransform, data, bodySim, sleepData, sqrtInvInertia,
-                     gParams.dt, gParams.invDtF32, gParams.enableStabilization != 0,
-                     staticTouchCount != 0, gNumCountedInteractions[nodeIndex]);
+                     shared.dt, shared.invDtF32, (desc.enableStabilizationWord & 0xffu) != 0,
+                     staticTouchCount != 0, numCountedInteractions[nodeIndex]);
 
-    gSleepData[a] = sleepData;
+    sleepDataPool[a] = sleepData;
 
-    gOutSolverVelocity[a] = linVel;
-    gOutSolverVelocity[a + numSolverBodies] = angVel;
-    gOutBody2World[a] = body2World;
+    outSolverVelocity[a] = linVel;
+    outSolverVelocity[a + numSolverBodies] = angVel;
+    outBody2World[a] = body2World;
 
-    // PT: for acceleration getters (eENABLE_BODY_ACCELERATIONS)
-    if (gParams.hasPrevVelocities != 0)
+    // PT: for acceleration getters (eENABLE_BODY_ACCELERATIONS) — the CUDA
+    // null-pointer branch on mBodySimPrevVelocitiesBufferDeviceData
+    if (desc.mBodySimPrevVelocitiesBufferDeviceData != 0)
     {
-        gPrevVelocities[nodeIndex * 2 + 0] = gBodySim[nodeIndex].linearVelocityXYZ_inverseMassW;
-        gPrevVelocities[nodeIndex * 2 + 1] = gBodySim[nodeIndex].angularVelocityXYZ_maxPenBiasW;
+        // PxgBodySimVelocities: 2 float4 per node
+        Ptr<float4> prevVelocities = Ptr<float4>(desc.mBodySimPrevVelocitiesBufferDeviceData);
+        prevVelocities[nodeIndex * 2 + 0] = bodySimPool[nodeIndex].linearVelocityXYZ_inverseMassW;
+        prevVelocities[nodeIndex * 2 + 1] = bodySimPool[nodeIndex].angularVelocityXYZ_maxPenBiasW;
     }
 
     // write back linear velocity, angular velocity to pxgbodysim
@@ -591,5 +627,5 @@ void integrateCoreParallelLaunchTGS(uint3 dispatchThreadId : SV_DispatchThreadID
     bodySim.angularVelocityXYZ_maxPenBiasW.z = angVel.z;
     bodySim.body2World = body2World;
 
-    gBodySim[nodeIndex] = bodySim;
+    bodySimPool[nodeIndex] = bodySim;
 }

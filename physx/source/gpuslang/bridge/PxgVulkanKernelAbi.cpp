@@ -64,6 +64,26 @@ static const uint8_t kRadixDesc[] = { 8, 4, 4 };
 // broadphase.cu: (const PxgBroadPhaseDesc* bpDesc, bool isIncremental)
 static const uint8_t kBpDescBool[] = { 8, 1 };
 
+// gpusolver/src/CUDA/preIntegration.cu:
+//   initStaticKinematics(PxU32 nbStaticKinematics, PxU32 nbSolverBodies,
+//                        PxgSolverBodyData*, PxgSolverTxIData*, PxAlignedTransform*,
+//                        float4* outVelocityPool, PxU32* activeNodeIndices, PxU32* solverBodyIndices)
+static const uint8_t kInitStaticKin[] = { 4, 4, 8, 8, 8, 8, 8, 8 };
+
+// gpusolver TGS kernels taking (PxgSolverCoreDesc*, PxgSolverSharedDesc<...>*)
+static const uint8_t kTwoPtr[] = { 8, 8 };
+
+// solverTGS: propagateAverageSolverBodyVelocityTGS(desc, sharedDesc,
+//   bool isVelocityIteration, bool isLastPosIteration, PxReal biasCoefficient)
+static const uint8_t kPropagateAvg[] = { 8, 8, 1, 1, 4 };
+
+// solverTGS: writeBackBodiesTGS(desc, sharedDesc, PxU32 islandIndex)
+static const uint8_t kWriteBackTGS[] = { 8, 8, 4 };
+
+// integration.cu: integrateCoreParallelLaunchTGS(PxU32 offset, desc, sharedDesc,
+//   PxU32* islandIds, PxU32* islandStaticTouchCounts, PxU32* numCountedInteractions)
+static const uint8_t kIntegrateTGS[] = { 4, 8, 8, 8, 8, 8 };
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },
@@ -92,6 +112,13 @@ static const PxgKernelAbiRow kRows[] = {
     { "outputOrderedActiveRegionHistogram", kOnePtr, 1u },
     { "computeStartRegionsHistogram", kOnePtr, 1u },
     { "outputStartRegionsHistogram", kOnePtr, 1u },
+    { "initStaticKinematics", kInitStaticKin, uint32_t(sizeof(kInitStaticKin)) },
+    { "ZeroBodiesTGS", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "initializeSolverVelocitiesTGS", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "computeAverageSolverBodyVelocityTGS", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "propagateAverageSolverBodyVelocityTGS", kPropagateAvg, uint32_t(sizeof(kPropagateAvg)) },
+    { "writeBackBodiesTGS", kWriteBackTGS, uint32_t(sizeof(kWriteBackTGS)) },
+    { "integrateCoreParallelLaunchTGS", kIntegrateTGS, uint32_t(sizeof(kIntegrateTGS)) },
 };
 
 inline size_t abiAlign(size_t size)

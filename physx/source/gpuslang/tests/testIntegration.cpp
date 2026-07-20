@@ -32,7 +32,12 @@
 #include "pxgTestFramework.h"
 #include "pxgGpuStructs.h"
 #include "pxgRefMath.h"
+#include "PxgCudaShim.h"
 
+#include "PxNodeIndex.h" // completes PxNodeIndex for the PxgNarrowphaseCore.h chain
+#include "PxgSolverCoreDesc.h"
+
+#include <cstring>
 #include <numeric>
 #include <random>
 
@@ -763,35 +768,101 @@ void checkIntegrationTGS(uint32_t nbBodies, uint32_t seed, bool enableStabilizat
     for (uint32_t i = 0; i < deltaVOffset; ++i)
         velPool[i] = Float4{ 999.f, 999.f, 999.f, 999.f };
 
-    // ---- GPU ----
+    // ---- GPU (P5 Step 4: engine ABI through PxgCudaShim) ----
+    // The kernel takes the engine's exact CUDA param pack (PxU32 offset + five
+    // device pointers); every count/offset/pool pointer is read from REAL
+    // PxgSolverCoreDesc / PxgSolverSharedDesc<IterativeSolveDataTGS> structs
+    // filled with live device addresses.  The CUDA `if (prevVelocities)`
+    // null-pointer branch is exercised: prev-velocities are null for the
+    // sleepy variants and live otherwise.
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "integration.spv", "integrateCoreParallelLaunchTGS", 48u, 0 },
+    };
+    static auto integrationLoader = [](const char* file) { return loadShaderBlob(file); };
+    PxgCudaShim shim(dev, manifest, 1, +integrationLoader);
 
-    Kernel kernel("integration.spv", "integrateCoreParallelLaunchTGS",
-                  { 16, 16, sizeof(SolverTxIData), sizeof(SolverBodyData), sizeof(BodySim), 4, 4, 4,
-                    sizeof(SolverBodySleepData), 16, sizeof(AlignedTransform), 16 },
-                  sizeof(IntegrationParams));
+    const bool hasPrevVelocities = !sleepy;
 
-    PxgBufferHandle motionVelBuf = createBufferFrom(dev, motionVel);
-    PxgBufferHandle velPoolBuf = createBufferFrom(dev, velPool);
-    PxgBufferHandle txIBuf = createBufferFrom(dev, txIData);
-    PxgBufferHandle solverDataBuf = createBufferFrom(dev, solverData);
-    PxgBufferHandle bodySimBuf = createBufferFrom(dev, bodySims);
-    PxgBufferHandle islandIdsBuf = createBufferFrom(dev, islandIds);
-    PxgBufferHandle staticTouchBuf = createBufferFrom(dev, staticTouchCounts);
-    PxgBufferHandle countedBuf = createBufferFrom(dev, numCountedInteractions);
-    PxgBufferHandle sleepDataBuf = dev->createBuffer(nbBodies * sizeof(SolverBodySleepData));
-    PxgBufferHandle outVelBuf = dev->createBuffer(2 * nbBodies * sizeof(Float4));
-    PxgBufferHandle outPoseBuf = createBufferFrom(dev, outPoseInit);
-    PxgBufferHandle prevVelBuf = dev->createBuffer(maxNodes * 2 * sizeof(Float4));
+    PxgDevicePtr dMotion = 0, dVelPool = 0, dTxI = 0, dSolverData = 0, dBodySim = 0;
+    PxgDevicePtr dIslandIds = 0, dStaticTouch = 0, dCounted = 0, dSleep = 0, dOutVel = 0;
+    PxgDevicePtr dOutPose = 0, dPrevVel = 0;
+    shim.memAlloc(&dMotion, motionVel.size() * sizeof(Float4));
+    shim.memAlloc(&dVelPool, velPool.size() * sizeof(Float4));
+    shim.memAlloc(&dTxI, txIData.size() * sizeof(SolverTxIData));
+    shim.memAlloc(&dSolverData, solverData.size() * sizeof(SolverBodyData));
+    shim.memAlloc(&dBodySim, bodySims.size() * sizeof(BodySim));
+    shim.memAlloc(&dIslandIds, islandIds.size() * 4);
+    shim.memAlloc(&dStaticTouch, staticTouchCounts.size() * 4);
+    shim.memAlloc(&dCounted, numCountedInteractions.size() * 4);
+    shim.memAlloc(&dSleep, nbBodies * sizeof(SolverBodySleepData));
+    shim.memAlloc(&dOutVel, 2 * nbBodies * sizeof(Float4));
+    shim.memAlloc(&dOutPose, outPoseInit.size() * sizeof(AlignedTransform));
+    if (hasPrevVelocities)
+        shim.memAlloc(&dPrevVel, maxNodes * 2 * sizeof(Float4));
+    if (!dMotion || !dVelPool || !dTxI || !dSolverData || !dBodySim || !dOutPose)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+    shim.memcpyHtoD(dMotion, motionVel.data(), motionVel.size() * sizeof(Float4));
+    shim.memcpyHtoD(dVelPool, velPool.data(), velPool.size() * sizeof(Float4));
+    shim.memcpyHtoD(dTxI, txIData.data(), txIData.size() * sizeof(SolverTxIData));
+    shim.memcpyHtoD(dSolverData, solverData.data(), solverData.size() * sizeof(SolverBodyData));
+    shim.memcpyHtoD(dBodySim, bodySims.data(), bodySims.size() * sizeof(BodySim));
+    shim.memcpyHtoD(dIslandIds, islandIds.data(), islandIds.size() * 4);
+    shim.memcpyHtoD(dStaticTouch, staticTouchCounts.data(), staticTouchCounts.size() * 4);
+    shim.memcpyHtoD(dCounted, numCountedInteractions.data(), numCountedInteractions.size() * 4);
+    shim.memcpyHtoD(dOutPose, outPoseInit.data(), outPoseInit.size() * sizeof(AlignedTransform));
 
-    const IntegrationParams params = { 0, nbBodies, deltaVOffset, dt, invDt,
-                                       enableStabilization ? 1u : 0u, 1u };
+    // the REAL engine descs
+    physx::PxgSolverCoreDesc desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.outSolverVelocity = reinterpret_cast<float4*>(dOutVel);
+    desc.outBody2World = reinterpret_cast<physx::PxAlignedTransform*>(dOutPose);
+    desc.solverBodyDataPool = reinterpret_cast<physx::PxgSolverBodyData*>(dSolverData);
+    desc.solverBodyTxIDataPool = reinterpret_cast<physx::PxgSolverTxIData*>(dTxI);
+    desc.solverBodySleepDataPool = reinterpret_cast<physx::PxgSolverBodySleepData*>(dSleep);
+    desc.motionVelocityArray = reinterpret_cast<float4*>(dMotion);
+    desc.mBodySimBufferDeviceData = reinterpret_cast<physx::PxgBodySim*>(dBodySim);
+    desc.mBodySimPrevVelocitiesBufferDeviceData =
+        reinterpret_cast<physx::PxgBodySimVelocities*>(dPrevVel); // null when !hasPrevVelocities
+    desc.numSolverBodies = nbBodies;
+    desc.accumulatedBodyDeltaVOffset = deltaVOffset;
+    desc.enableStabilization = enableStabilization;
+
+    physx::PxgSolverSharedDesc<physx::IterativeSolveDataTGS> shared;
+    std::memset(&shared, 0, sizeof(shared));
+    shared.dt = dt;
+    shared.invDtF32 = invDt;
+    shared.iterativeData.solverBodyVelPool = reinterpret_cast<float4*>(dVelPool);
+
+    PxgDevicePtr dDesc = 0, dShared = 0;
+    shim.memAlloc(&dDesc, sizeof(desc));
+    shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
+    shim.memAlloc(&dShared, sizeof(shared));
+    shim.memcpyHtoD(dShared, &shared, sizeof(shared));
+
+    // the engine's exact param pack: (offset, desc*, shared*, islandIds*,
+    // islandStaticTouchCounts*, numCountedInteractions*) = 48-byte blob;
+    // grid = ceil((nbSolverBodies - offset) / INTEGRATE_CORE_PARALLEL = 128)
+    struct
+    {
+        uint32_t offset;
+        uint32_t pad;
+        uint64_t desc, shared, islandIds, staticTouch, counted;
+    } prm = { 0, 0, dDesc, dShared, dIslandIds, dStaticTouch, dCounted };
+    static_assert(sizeof(prm) == 48, "TGS integration blob is 48 bytes");
     const uint32_t blockSize = 128;
-    kernel.dispatch((nbBodies + blockSize - 1) / blockSize,
-                    { motionVelBuf, velPoolBuf, txIBuf, solverDataBuf, bodySimBuf, islandIdsBuf,
-                      staticTouchBuf, countedBuf, sleepDataBuf, outVelBuf, outPoseBuf, prevVelBuf },
-                    params);
-    dev->flush();
+    PXG_CHECK_MSG(shim.launchKernel(0, (nbBodies + blockSize - 1) / blockSize, 1, 1, &prm,
+                                    sizeof(prm)) == PxgResult::Success,
+                  "launch integrateCoreParallelLaunchTGS");
+    shim.streamSynchronize();
 
     // ---- reference ----
     std::vector<BodySim> refBodySims = bodySims;
@@ -837,10 +908,34 @@ void checkIntegrationTGS(uint32_t nbBodies, uint32_t seed, bool enableStabilizat
     }
 
     // ---- compare ----
-    const std::vector<SolverBodySleepData> gpuSleep = downloadBuffer<SolverBodySleepData>(dev, sleepDataBuf, nbBodies);
-    const std::vector<Float4> gpuOutVel = downloadBuffer<Float4>(dev, outVelBuf, 2 * nbBodies);
-    const std::vector<AlignedTransform> gpuOutPose = downloadBuffer<AlignedTransform>(dev, outPoseBuf, nbBodies);
-    const std::vector<BodySim> gpuBodySims = downloadBuffer<BodySim>(dev, bodySimBuf, maxNodes);
+    std::vector<SolverBodySleepData> gpuSleep(nbBodies);
+    std::vector<Float4> gpuOutVel(2 * nbBodies);
+    std::vector<AlignedTransform> gpuOutPose(nbBodies);
+    std::vector<BodySim> gpuBodySims(maxNodes);
+    shim.memcpyDtoH(gpuSleep.data(), dSleep, nbBodies * sizeof(SolverBodySleepData));
+    shim.memcpyDtoH(gpuOutVel.data(), dOutVel, 2 * nbBodies * sizeof(Float4));
+    shim.memcpyDtoH(gpuOutPose.data(), dOutPose, nbBodies * sizeof(AlignedTransform));
+    shim.memcpyDtoH(gpuBodySims.data(), dBodySim, maxNodes * sizeof(BodySim));
+
+    // prev-velocity snapshot: bit-exact copy of the PRE-writeback body sim
+    // velocities for every processed body's node (the CUDA null-pointer
+    // branch: skipped entirely for the sleepy variants)
+    if (hasPrevVelocities)
+    {
+        std::vector<Float4> gpuPrev(maxNodes * 2);
+        shim.memcpyDtoH(gpuPrev.data(), dPrevVel, gpuPrev.size() * sizeof(Float4));
+        for (uint32_t a = 0; a < nbBodies; ++a)
+        {
+            const uint32_t nodeIndex = uint32_t(solverData[a].islandNodeIndex & 0xFFFFFFFFu);
+            const Float4& gl = gpuPrev[nodeIndex * 2 + 0];
+            const Float4& ga = gpuPrev[nodeIndex * 2 + 1];
+            const Float4& rl = bodySims[nodeIndex].linearVelocityXYZ_inverseMassW;
+            const Float4& ra = bodySims[nodeIndex].angularVelocityXYZ_maxPenBiasW;
+            PXG_CHECK_MSG(std::memcmp(&gl, &rl, sizeof(Float4)) == 0 &&
+                              std::memcmp(&ga, &ra, sizeof(Float4)) == 0,
+                          "tgs prevVelocities[node %u]", nodeIndex);
+        }
+    }
 
     auto eq4 = [&](const Float4& g, const Float4& r) {
         return almostEqual(g.x, r.x, 1e-4f, 2e-5f) && almostEqual(g.y, r.y, 1e-4f, 2e-5f) &&
@@ -874,18 +969,11 @@ void checkIntegrationTGS(uint32_t nbBodies, uint32_t seed, bool enableStabilizat
         PXG_CHECK_MSG(eq4(gb.body2World.q, rb.body2World.q), "tgs bodySim.pose.q[node %u]", nodeIndex);
     }
 
-    dev->destroyBuffer(motionVelBuf);
-    dev->destroyBuffer(velPoolBuf);
-    dev->destroyBuffer(txIBuf);
-    dev->destroyBuffer(solverDataBuf);
-    dev->destroyBuffer(bodySimBuf);
-    dev->destroyBuffer(islandIdsBuf);
-    dev->destroyBuffer(staticTouchBuf);
-    dev->destroyBuffer(countedBuf);
-    dev->destroyBuffer(sleepDataBuf);
-    dev->destroyBuffer(outVelBuf);
-    dev->destroyBuffer(outPoseBuf);
-    dev->destroyBuffer(prevVelBuf);
+    for (PxgDevicePtr pfree : { dMotion, dVelPool, dTxI, dSolverData, dBodySim, dIslandIds,
+                                dStaticTouch, dCounted, dSleep, dOutVel, dOutPose, dDesc, dShared })
+        shim.memFree(pfree);
+    if (dPrevVel)
+        shim.memFree(dPrevVel);
 }
 
 PXG_TEST(integration_activeBodies)

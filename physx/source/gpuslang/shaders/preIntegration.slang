@@ -245,29 +245,53 @@ void preIntegrationLaunch(uint3 dispatchThreadId : SV_DispatchThreadID)
     gSolverTxIData[a] = txIData;
 }
 
-// mirrors initStaticKinematics() in preIntegration.cu
+// mirrors initStaticKinematics() in preIntegration.cu — P5 Step 4 BDA
+// engine-launch ABI: the push-constant struct mirrors the CUDA parameter list
+// EXACTLY (two PxU32 counts then six device pointers, natural alignment).
+// The pool structs are the bit-verified pxgSlangCommon mirrors, walked
+// through Ptr<T>.
+struct InitStaticKinematicsParams
+{
+    uint nbStaticKinematics;      // @0
+    uint nbSolverBodies;          // @4
+    uint64_t solverBodyDataPool;  // @8  PxgSolverBodyData*
+    uint64_t solverTxIDataPool;   // @16 PxgSolverTxIData*
+    uint64_t transforms;          // @24 PxAlignedTransform*
+    uint64_t outVelocityPool;     // @32 float4*
+    uint64_t activeNodeIndices;   // @40 PxNodeIndex*
+    uint64_t solverBodyIndices;   // @48 PxU32*
+}                                 // = 56
+[[vk::push_constant]]
+ConstantBuffer<InitStaticKinematicsParams> gStaticKine;
+
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
 void initStaticKinematics(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
     const uint idx = dispatchThreadId.x;
 
-    // gParams.offset carries nbStaticKinematics for this entry point
-    if (idx >= gParams.offset)
+    if (idx >= gStaticKine.nbStaticKinematics)
         return;
 
-    const uint2 index = gIslandNodeIndices[idx];
-    if (!nodeIndexIsStaticBody(index))
-        gSolverBodyIndices[nodeIndexIndex(index)] = idx;
+    Ptr<PxgSolverBodyData> solverBodyDataPool = Ptr<PxgSolverBodyData>(gStaticKine.solverBodyDataPool);
+    Ptr<PxgSolverTxIData> solverTxIDataPool = Ptr<PxgSolverTxIData>(gStaticKine.solverTxIDataPool);
+    Ptr<PxgAlignedTransform> transforms = Ptr<PxgAlignedTransform>(gStaticKine.transforms);
+    Ptr<float4> outVelocityPool = Ptr<float4>(gStaticKine.outVelocityPool);
+    Ptr<uint2> activeNodeIndices = Ptr<uint2>(gStaticKine.activeNodeIndices);
+    Ptr<uint> solverBodyIndices = Ptr<uint>(gStaticKine.solverBodyIndices);
 
-    const PxgSolverBodyData data = gSolverBodyData[idx];
-    gTransforms[idx] = data.body2World;
-    gOutVelocityPool[idx] = data.initialLinVelXYZ_invMassW;
-    gOutVelocityPool[idx + gParams.nbSolverBodies] = data.initialAngVelXYZ_penBiasClamp;
+    const uint2 index = activeNodeIndices[idx];
+    if (!nodeIndexIsStaticBody(index))
+        solverBodyIndices[nodeIndexIndex(index)] = idx;
+
+    const PxgSolverBodyData data = solverBodyDataPool[idx];
+    transforms[idx] = data.body2World;
+    outVelocityPool[idx] = data.initialLinVelXYZ_invMassW;
+    outVelocityPool[idx + gStaticKine.nbSolverBodies] = data.initialAngVelXYZ_penBiasClamp;
 
     PxgSolverTxIData txIData;
     txIData.deltaBody2World = makeTransform28(float4(0, 0, 0, 1), float3(0.0f));
     float zero9[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     txIData.sqrtInvInertia = zero9;
-    gSolverTxIData[idx] = txIData;
+    solverTxIDataPool[idx] = txIData;
 }

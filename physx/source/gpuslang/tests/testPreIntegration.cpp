@@ -30,7 +30,9 @@
 #include "pxgTestFramework.h"
 #include "pxgGpuStructs.h"
 #include "pxgRefMath.h"
+#include "PxgCudaShim.h"
 
+#include <cstring>
 #include <numeric>
 #include <random>
 
@@ -407,6 +409,144 @@ PXG_TEST(preIntegration_partialBlock)
     checkPreIntegration(1, 44, false);
     checkPreIntegration(127, 45, false);
     checkPreIntegration(129, 46, false);
+}
+
+// initStaticKinematics on the ENGINE ABI (P5 Step 4): the kernel takes the
+// CUDA param pack (PxU32 nbStaticKinematics, PxU32 nbSolverBodies, six device
+// pointers) as a 56-byte blob through PxgCudaShim, with the engine's grid
+// arithmetic (nbStaticBlocks = ceil(nbStaticKinematics / PRE_INTEGRATION =
+// 128)).  Pure copies -> bit-exact comparison.
+static std::vector<uint8_t> preIntShimLoader(const char* file) { return loadShaderBlob(file); }
+
+void checkInitStaticKinematics(uint32_t nbStaticKinematics, uint32_t seed)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::uniform_real_distribution<float> sym(-10.f, 10.f);
+
+    // static/kinematic bodies live in the first nbStaticKinematics solver
+    // slots; the velocity pool is strided by the FULL solver body count
+    const uint32_t nbSolverBodies = nbStaticKinematics + 64;
+    const uint32_t maxNodes = nbStaticKinematics + 16;
+
+    std::vector<uint32_t> nodePool(maxNodes);
+    std::iota(nodePool.begin(), nodePool.end(), 0u);
+    std::shuffle(nodePool.begin(), nodePool.end(), rng);
+
+    // ~25% static bodies (PxNodeIndex with index PXG_INVALID_NODE), the rest
+    // kinematic (valid node index -> solverBodyIndices write)
+    std::vector<uint64_t> activeNodeIndices(nbStaticKinematics);
+    for (uint32_t i = 0; i < nbStaticKinematics; ++i)
+        activeNodeIndices[i] = (unit(rng) < 0.25f) ? makeNodeIndex(0xFFFFFFFFu) : makeNodeIndex(nodePool[i]);
+
+    std::vector<SolverBodyData> bodyData(nbStaticKinematics);
+    std::memset(bodyData.data(), 0, bodyData.size() * sizeof(SolverBodyData));
+    for (SolverBodyData& d : bodyData)
+    {
+        const QuatV q = randomQuat(rng);
+        d.body2World.q = q.toFloat4();
+        d.body2World.p = Float4{ sym(rng), sym(rng), sym(rng), 0.f };
+        d.initialLinVelXYZ_invMassW = Float4{ sym(rng), sym(rng), sym(rng), unit(rng) };
+        d.initialAngVelXYZ_penBiasClamp = Float4{ sym(rng), sym(rng), sym(rng), -unit(rng) };
+    }
+
+    const float GARBAGE = 77.5f;
+    std::vector<SolverTxIData> txiInit(nbStaticKinematics);
+    std::memset(txiInit.data(), 0x3B, txiInit.size() * sizeof(SolverTxIData));
+    std::vector<AlignedTransform> xformInit(nbStaticKinematics);
+    std::memset(xformInit.data(), 0x3C, xformInit.size() * sizeof(AlignedTransform));
+    std::vector<Float4> velInit(2 * nbSolverBodies, Float4{ GARBAGE, GARBAGE, GARBAGE, GARBAGE });
+    std::vector<uint32_t> bodyIndicesInit(maxNodes, 0xFFFFFFFFu);
+
+    // ---- GPU (engine ABI blob: {4,4,8,8,8,8,8,8} = 56 bytes) ----
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = { { "preIntegration.spv", "initStaticKinematics", 56u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &preIntShimLoader);
+
+    PxgDevicePtr dData = 0, dTxi = 0, dXform = 0, dVel = 0, dNodes = 0, dIndices = 0;
+    shim.memAlloc(&dData, bodyData.size() * sizeof(SolverBodyData));
+    shim.memAlloc(&dTxi, txiInit.size() * sizeof(SolverTxIData));
+    shim.memAlloc(&dXform, xformInit.size() * sizeof(AlignedTransform));
+    shim.memAlloc(&dVel, velInit.size() * sizeof(Float4));
+    shim.memAlloc(&dNodes, activeNodeIndices.size() * 8);
+    shim.memAlloc(&dIndices, bodyIndicesInit.size() * 4);
+    if (!dData || !dTxi || !dXform || !dVel || !dNodes || !dIndices)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+    shim.memcpyHtoD(dData, bodyData.data(), bodyData.size() * sizeof(SolverBodyData));
+    shim.memcpyHtoD(dTxi, txiInit.data(), txiInit.size() * sizeof(SolverTxIData));
+    shim.memcpyHtoD(dXform, xformInit.data(), xformInit.size() * sizeof(AlignedTransform));
+    shim.memcpyHtoD(dVel, velInit.data(), velInit.size() * sizeof(Float4));
+    shim.memcpyHtoD(dNodes, activeNodeIndices.data(), activeNodeIndices.size() * 8);
+    shim.memcpyHtoD(dIndices, bodyIndicesInit.data(), bodyIndicesInit.size() * 4);
+
+    struct
+    {
+        uint32_t nbStaticKinematics;
+        uint32_t nbSolverBodies;
+        uint64_t solverBodyDataPool, solverTxIDataPool, transforms, outVelocityPool;
+        uint64_t activeNodeIndices, solverBodyIndices;
+    } prm = { nbStaticKinematics, nbSolverBodies, dData, dTxi, dXform, dVel, dNodes, dIndices };
+    static_assert(sizeof(prm) == 56, "initStaticKinematics blob is 56 bytes");
+
+    // engine grid: nbStaticBlocks = ceil(offset / PRE_INTEGRATION = 128)
+    const uint32_t nbStaticBlocks = (nbStaticKinematics + 127) / 128;
+    PXG_CHECK_MSG(shim.launchKernel(0, nbStaticBlocks, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch initStaticKinematics");
+    shim.streamSynchronize();
+
+    // ---- reference (bit-exact: the kernel only copies/zeroes) ----
+    std::vector<uint32_t> refIndices = bodyIndicesInit;
+    std::vector<AlignedTransform> refXform = xformInit;
+    std::vector<Float4> refVel = velInit;
+    std::vector<SolverTxIData> refTxi = txiInit;
+    for (uint32_t i = 0; i < nbStaticKinematics; ++i)
+    {
+        const uint64_t node = activeNodeIndices[i];
+        if (uint32_t(node & 0xFFFFFFFFu) != 0xFFFFFFFFu)
+            refIndices[uint32_t(node & 0xFFFFFFFFu)] = i;
+        refXform[i] = bodyData[i].body2World;
+        refVel[i] = bodyData[i].initialLinVelXYZ_invMassW;
+        refVel[i + nbSolverBodies] = bodyData[i].initialAngVelXYZ_penBiasClamp;
+        refTxi[i].deltaBody2World.q = Quat{ 0, 0, 0, 1 };
+        refTxi[i].deltaBody2World.p = Float3{ 0, 0, 0 };
+        for (int m = 0; m < 9; ++m)
+            refTxi[i].sqrtInvInertia[m] = 0.f;
+    }
+
+    std::vector<uint32_t> gIndices(maxNodes);
+    std::vector<AlignedTransform> gXform(nbStaticKinematics);
+    std::vector<Float4> gVel(2 * nbSolverBodies);
+    std::vector<SolverTxIData> gTxi(nbStaticKinematics);
+    shim.memcpyDtoH(gIndices.data(), dIndices, gIndices.size() * 4);
+    shim.memcpyDtoH(gXform.data(), dXform, gXform.size() * sizeof(AlignedTransform));
+    shim.memcpyDtoH(gVel.data(), dVel, gVel.size() * sizeof(Float4));
+    shim.memcpyDtoH(gTxi.data(), dTxi, gTxi.size() * sizeof(SolverTxIData));
+
+    size_t mm = 0;
+    if (std::memcmp(gIndices.data(), refIndices.data(), gIndices.size() * 4) != 0) ++mm;
+    if (std::memcmp(gXform.data(), refXform.data(), gXform.size() * sizeof(AlignedTransform)) != 0) ++mm;
+    if (std::memcmp(gVel.data(), refVel.data(), gVel.size() * sizeof(Float4)) != 0) ++mm;
+    if (std::memcmp(gTxi.data(), refTxi.data(), gTxi.size() * sizeof(SolverTxIData)) != 0) ++mm;
+    PXG_CHECK_MSG(mm == 0, "initStaticKinematics(n=%u): %zu buffer mismatches (bitwise)",
+                  nbStaticKinematics, mm);
+
+    for (PxgDevicePtr pfree : { dData, dTxi, dXform, dVel, dNodes, dIndices })
+        shim.memFree(pfree);
+}
+
+PXG_TEST(preIntegration_initStaticKinematics)
+{
+    checkInitStaticKinematics(200, 47);
+    checkInitStaticKinematics(1, 48);
+    checkInitStaticKinematics(129, 49);
 }
 
 } // namespace

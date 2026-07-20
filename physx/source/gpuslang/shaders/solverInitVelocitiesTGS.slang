@@ -38,41 +38,62 @@
 // accumulation-offset copy at [outputOffset + bodyId + {0, N, 2N}] (N = body
 // count).
 //
-// Work layout: the CUDA uses a 2D block (32 lanes x blockDim.y warps) with
+// Work layout: the CUDA uses a 2D block (32 lanes x blockDim.y = 8 warps) with
 // numThreadsPerBody = min(nextPow2(numSlabs), 32) cooperating threads per body
 // and numBodiesPerWarp = 32 / numThreadsPerBody bodies per warp.  Here each warp
-// maps to one 32-thread group (group id == warpIndex); numThreadsPerBody is
-// supplied as a push constant (host-computed from numSlabs).  There is no
-// cross-lane communication, so the per-lane scatter is reproduced exactly.
+// maps to one 32-thread group (group id == warpIndex == blockIdx.x*8 +
+// threadIdx.y), so the dispatch multiplies the engine's block count by 8.
+//
+// P5 Step 4 BDA engine-launch ABI: the kernel takes the engine's
+// (PxgSolverCoreDesc*, PxgSolverSharedDesc<IterativeSolveDataTGS>*) pack and
+// reads bodyOffset / numSlabs / numSolverBodies / accumulatedBodyDeltaVOffset
+// and the pool pointers on-device through the byte-exact pxgSlangSolverDesc
+// mirrors (proven by testSolverDescLayout); numThreadsPerBody is computed
+// on-device from numSlabs exactly like the .cu.
 
-struct InitVelParams
+import pxgSlangSolverDesc;
+
+struct InitVelAbiParams
 {
-    uint numSlabs;
-    uint allBodiesCount;    // numSolverBodies
-    uint bodyOffset;        // islandContextPool->mBodyStartIndex
-    uint outputOffset;      // accumulatedBodyDeltaVOffset
-    uint numThreadsPerBody; // min(nextPow2(numSlabs), 32)
+    uint64_t solverCoreDesc; // @0 const PxgSolverCoreDesc*
+    uint64_t sharedDesc;     // @8 const PxgSolverSharedDesc<IterativeSolveDataTGS>*
 }
 
 [[vk::push_constant]]
-ConstantBuffer<InitVelParams> gParams;
-
-RWStructuredBuffer<uint>   gSolverReferences;  // binding 0  mRemappedBodyIndex per (body,slab)
-RWStructuredBuffer<float4> gBodyVelocities;    // binding 1  solverBodyVelPool (output)
-RWStructuredBuffer<float4> gOutSolverVelocity; // binding 2  outSolverVelocity (input)
+ConstantBuffer<InitVelAbiParams> gParams;
 
 static const uint INVALID = 0xffffffffu;
+
+uint nextPowerOfTwo(uint x)
+{
+    x -= 1;
+    x |= x >> 1;
+    x |= x >> 2;
+    x |= x >> 4;
+    x |= x >> 8;
+    x |= x >> 16;
+    return x + 1;
+}
 
 [shader("compute")]
 [numthreads(32, 1, 1)]
 void initializeSolverVelocitiesTGS(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
-    const uint numThreadsPerBody = gParams.numThreadsPerBody;
+    PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gParams.solverCoreDesc))[0];
+    PxgSolverSharedDescTGSGpu shared = (Ptr<PxgSolverSharedDescTGSGpu>(gParams.sharedDesc))[0];
+
+    Ptr<uint> solverReferences = Ptr<uint>(desc.solverBodyReferences); // PxgSolverReferences
+    Ptr<float4> bodyVelocities = Ptr<float4>(shared.iter_solverBodyVelPool);
+    Ptr<PxgIslandContextGpu> islandContextPool = Ptr<PxgIslandContextGpu>(desc.islandContextPool);
+    const uint bodyOffset = islandContextPool[0].mBodyStartIndex;
+    const uint numSlabs = desc.numSlabs;
+    const uint allBodiesCount = desc.numSolverBodies;
+    Ptr<float4> velocities = Ptr<float4>(desc.outSolverVelocity);
+    const uint outputOffset = desc.accumulatedBodyDeltaVOffset;
+
+    const uint pow2Slabs = (numSlabs & (numSlabs - 1u)) == 0 ? numSlabs : nextPowerOfTwo(numSlabs);
+    const uint numThreadsPerBody = min(pow2Slabs, 32u);
     const uint numBodiesPerWarp = 32u / numThreadsPerBody;
-    const uint allBodiesCount = gParams.allBodiesCount;
-    const uint numSlabs = gParams.numSlabs;
-    const uint bodyOffset = gParams.bodyOffset;
-    const uint outputOffset = gParams.outputOffset;
 
     const uint warpIndex = gid.x;                       // one 32-thread group per warp
     const uint lane = gtid.x;
@@ -82,8 +103,8 @@ void initializeSolverVelocitiesTGS(uint3 gtid : SV_GroupThreadID, uint3 gid : SV
 
     if (bodyId < allBodiesCount)
     {
-        const float4 linVel = gOutSolverVelocity[bodyId];
-        const float4 angVel = gOutSolverVelocity[bodyId + allBodiesCount];
+        const float4 linVel = velocities[bodyId];
+        const float4 angVel = velocities[bodyId + allBodiesCount];
 
         const float4 vel0 = float4(linVel.x, linVel.y, linVel.z, angVel.x);
         const float4 vel1 = float4(angVel.y, angVel.z, 0.0f, 0.0f);
@@ -94,22 +115,22 @@ void initializeSolverVelocitiesTGS(uint3 gtid : SV_GroupThreadID, uint3 gid : SV
             for (uint b = threadIdxInWorkUnit; b < numSlabs; b += numThreadsPerBody)
             {
                 const uint bodyIndex = numSlabs * (bodyId - bodyOffset) + b;
-                const uint remappedBodyIndex = gSolverReferences[bodyIndex];
+                const uint remappedBodyIndex = solverReferences[bodyIndex];
 
                 if (remappedBodyIndex != INVALID)
                 {
-                    gBodyVelocities[remappedBodyIndex] = vel0;
-                    gBodyVelocities[remappedBodyIndex + 32u] = vel1;
-                    gBodyVelocities[remappedBodyIndex + 64u] = vel2;
+                    bodyVelocities[remappedBodyIndex] = vel0;
+                    bodyVelocities[remappedBodyIndex + 32u] = vel1;
+                    bodyVelocities[remappedBodyIndex + 64u] = vel2;
                 }
             }
         }
 
         if (threadIdxInWorkUnit == 0u)
         {
-            gBodyVelocities[outputOffset + bodyId] = vel0;
-            gBodyVelocities[outputOffset + bodyId + allBodiesCount] = vel1;
-            gBodyVelocities[outputOffset + bodyId + 2u * allBodiesCount] = vel2;
+            bodyVelocities[outputOffset + bodyId] = vel0;
+            bodyVelocities[outputOffset + bodyId + allBodiesCount] = vel1;
+            bodyVelocities[outputOffset + bodyId + 2u * allBodiesCount] = vel2;
         }
     }
 }
