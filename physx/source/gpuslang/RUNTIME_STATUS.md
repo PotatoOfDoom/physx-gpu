@@ -106,21 +106,33 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
-## P5 Step 5 — MILESTONE: four common rigid scenes rest on the GPU, zero refused launches
+## P5 Step 5 — MILESTONE: five common rigid scenes rest on the GPU, zero refused launches
 
-`gpu-sdk-step` grew a `PXG_SCENE`-dispatched scene table; **all four rigid
+`gpu-sdk-step` grew a `PXG_SCENE`-dispatched scene table; **all five rigid
 scenes now fall and REST on the Slang/Vulkan (llvmpipe) pipeline with ZERO
 refused kernel launches**, each `exit 0`:
 
-- `box`   — dynamic box on a static ground box (the Step-4 scene).
-- `stack` — three stacked dynamic boxes: `final y = 0.500 / 1.500 / 2.500`,
+- `box`    — dynamic box on a static ground box (the Step-4 scene).
+- `stack`  — three stacked dynamic boxes: `final y = 0.500 / 1.500 / 2.500`,
   `|v| = 0.000` (exercises dynamic-vs-dynamic box contacts + partitions).
-- `sphere`— dynamic sphere on the ground: rests at `y = 0.500`.
-- `plane` — dynamic box on a `PxPlaneGeometry`: rests at `y = 0.500`.
+- `sphere` — dynamic sphere on the ground box: rests at `y = 0.500`.
+- `plane`  — dynamic box on a `PxPlaneGeometry`: rests at `y = 0.500`.
+- `capsule`— dynamic capsule on its side on a `PxPlaneGeometry`: rests at
+  `y = 0.500` (routes through the sphere/"primitive" narrowphase `planeCapsule`
+  sub-case — the already-mapped `SPHERE_KERNEL_MAIN`, no new kernel).
 
 Suite **666/666** both memory modes; `PXG_SLANG_KERNEL_MAPPED = 145`.
 Deformables / particles / articulations remain explicitly out of scope for this
 milestone.
+
+**Next frontier — convex-convex GJK contact-gen.**  A `capsule` (or `convex`)
+resting on a BOX ground routes through the convex-convex GJK narrowphase
+(`CONVEX_CONVEX_KERNEL_EARLY_OUT` / `_MAIN` + `FINISH_CONTACTS_KERNEL`), not the
+primitive kernel.  Those three are mapped and LAUNCH with zero refusals, but a
+`capsule`-on-box probe fell straight through the ground (`y = -73.8`, no
+contacts produced) — the convex-convex contact-gen chain is not yet wired
+end-to-end on the engine ABI.  A convex-hull ground scene is deferred until that
+chain is brought up.
 
 Landed since the Step-4 box-on-ground milestone (each: bit-exact / geometric
 shim unit test on the real engine ABI + both-mode suite + engine-scene proof):
@@ -147,6 +159,10 @@ shim unit test on the real engine ABI + both-mode suite + engine-scene proof):
   `solveBlockUnified` (minPen precedes elapsedTime) → ABI `{8,8,4,4,4,4,8}` =
   40 bytes; the `.cu` reads `mBodyCount`/`mArticulationCount` from
   `islandContextPool[0]` (mirrored exactly).
+- tranche 7: `capsule`-on-plane scene — the capsule primitive now rests on the
+  GPU via the already-mapped sphere/"primitive" narrowphase (`planeCapsule`).
+  Also probed the convex-convex path (capsule-on-box) which exposed the
+  next-frontier gap above (kernels launch, no contacts).  No new kernels.
 
 ## P5 Step 4 — MILESTONE ACHIEVED: the box falls AND RESTS on the GPU
 

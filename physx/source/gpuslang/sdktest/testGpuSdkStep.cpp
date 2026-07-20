@@ -172,6 +172,42 @@ void buildSphereScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
                                    PxVec3(sphereI, sphereI, sphereI), 5.0f);
     targets.push_back({ b, 5.0f, 0.5f, "sphere" });
 }
+
+// A rough capsule mass-space inertia (axis along local X, radius r, cylinder
+// half-height h): I_axis ~= 1/2 m r^2, I_transverse ~= m (h^2 + r^2).  At rest
+// (~0 angular velocity) the exact tensor is immaterial; it only needs to be
+// positive-definite so the solver is well-conditioned.
+PxVec3 capsuleInertia(float r, float h, float mass)
+{
+    const float axis = 0.5f * mass * r * r;
+    const float trans = mass * (h * h + r * r);
+    return PxVec3(axis, trans, trans);
+}
+
+// PXG_SCENE=capsule: one dynamic capsule (radius 0.5, half-height 0.5, axis along
+// local X so it lies on its side) resting on the static infinite PxPlaneGeometry.
+// Routes through the sphere/"primitive" narrowphase (planeCapsule sub-case), which
+// is the already-mapped SPHERE_KERNEL_MAIN — no new narrowphase kernel needed.
+void buildCapsuleScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                       std::vector<RestTarget>& targets)
+{
+    PxRigidStatic* ground = physics->createRigidStatic(PxTransformFromPlaneEquation(PxPlane(0.0f, 1.0f, 0.0f, 0.0f)));
+    PxShape* ps = physics->createShape(PxPlaneGeometry(), *material);
+    ground->attachShape(*ps);
+    scene->addActor(*ground);
+    const float r = 0.5f, h = 0.5f;
+    PxRigidDynamic* b = addDynamic(physics, scene, material, PxCapsuleGeometry(r, h),
+                                   capsuleInertia(r, h, 1000.0f), 5.0f);
+    targets.push_back({ b, 5.0f, r, "capsuleOnPlane" }); // rests on its side at centre y = radius
+}
+
+// NOTE (next frontier): a capsule (or convex hull) resting on a BOX ground routes
+// through the convex-convex GJK narrowphase (CONVEX_CONVEX_KERNEL_EARLY_OUT / _MAIN
+// + FINISH_CONTACTS_KERNEL), NOT the sphere/"primitive" kernel.  Those kernels are
+// mapped and LAUNCH with zero refusals, but do not yet produce contacts on the
+// engine ABI (a capsule-on-box probe fell straight through), so a convex-hull
+// ground scene is deferred until the convex-convex contact-gen chain is brought up
+// end-to-end.
 } // namespace
 
 int main()
@@ -238,11 +274,12 @@ int main()
     const char* sceneName = std::getenv("PXG_SCENE");
     if (!sceneName) sceneName = "box";
     std::vector<RestTarget> targets;
-    if      (!std::strcmp(sceneName, "box"))    buildBoxScene(physics, scene, material, targets);
-    else if (!std::strcmp(sceneName, "stack"))  buildStackScene(physics, scene, material, targets);
-    else if (!std::strcmp(sceneName, "plane"))  buildPlaneScene(physics, scene, material, targets);
-    else if (!std::strcmp(sceneName, "sphere")) buildSphereScene(physics, scene, material, targets);
-    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere)\n", sceneName);
+    if      (!std::strcmp(sceneName, "box"))       buildBoxScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "stack"))     buildStackScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "plane"))     buildPlaneScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "sphere"))    buildSphereScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "capsule"))   buildCapsuleScene(physics, scene, material, targets);
+    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule)\n", sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
     std::printf("  [  OK  ] scene '%s' built: %zu dynamic body(ies) + ground on the GPU\n",
                 sceneName, targets.size());
