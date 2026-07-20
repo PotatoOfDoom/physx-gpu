@@ -44,7 +44,10 @@
 // Only the SPHERE and CAPSULE type0 dispatch arms are assembled; the
 // convex-hull arm (generateConvexContacts, cu L1458-1462) is DEFERRED — the
 // stage2 caller gates the collide() call on type0 so convex-type0 pairs keep
-// the elision contract.
+// the elision contract.  LATENT CONTRACT NOTE: as a public function, collide()
+// invoked with a convex-hull type0 returns true WITHOUT generating contacts
+// (the .cu would generate them) — callers MUST keep the type gate until the
+// arm lands.
 //
 // Contact points are written INSIDE collide() straight through Ptr<float4>
 // views of the manifold (localNormalPen @ manifoldBase+0, localContactA @
@@ -1045,6 +1048,15 @@ uint generatedContactsEEContacts(inout CollideScratch s, uint numContactsIn)
                 if (offset < 4u)
                 {
                     const uint idx = blockNC + offset;
+                    // INTENTIONAL DEVIATION (adversarial-review confirmed): the
+                    // .cu (cudaGJKEPA.cu L1255-1260) guards only offset < 4, so
+                    // with numContacts >= 1 entering EE and 4+ edge hits it
+                    // writes contact slot 4..7 — aliasing the ADJACENT manifold
+                    // fields (A[4]==B[0], NormalPen[4]==A[0], B[4..7]==
+                    // mRelativePos..warm-start words): intra-manifold memory
+                    // corruption.  The idx < 4 guard suppresses exactly that
+                    // OOB write; results are byte-identical everywhere the .cu
+                    // write stays in bounds.
                     if (idx < 4u)
                     {
                         mA[idx] = float4(lA, 0.0f);
