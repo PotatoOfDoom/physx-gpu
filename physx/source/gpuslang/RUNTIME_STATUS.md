@@ -106,7 +106,41 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
-## P5 Step 4 — MILESTONE: the box falls on the GPU
+## P5 Step 4 — MILESTONE ACHIEVED: the box falls AND RESTS on the GPU
+
+As of tranche 19 (commit 0d547fa) `PXG_GPU_STEP=1 ./gpu-sdk-step` steps the
+full unmodified PhysX SDK scene end-to-end on the Slang/Vulkan (llvmpipe)
+pipeline: a dynamic box FALLS under gravity and RESTS on a static ground box
+— `box start y=5.000, y after 1 step=4.997, final y=0.500, final |v|=0.000`,
+`[ OK ] box fell + rested`, exit 0, no crash.  The entire per-frame
+collision→solve loop now runs on the GPU: broadphase (incremental SAP) →
+narrowphase (boxBoxNphase) → lost/found contact report → contact prep →
+TGS solve (whole-island + static-contact solve) → integrate.  Suite 665/665
+both memory modes; PXG_SLANG_KERNEL_MAPPED = 141.
+
+Landed to close the contact→solve path since the free-fall milestone:
+- tranche 17: incremental-SAP broadphase (markUpdated/incremental histograms/
+  performIncrementalSAP) on the engine ABI — per-frame moved-shape sweep.
+- tranche 18: updateFrictionPatches + prepareLostFoundPairs_Stage1/2 — the
+  generated contact reaches the solver island.
+- tranche 19: TGS static-contact solve (solveStaticBlockTGS +
+  propagateStaticSolverBodyVelocitiesTGS + concludeBlocksTGS on engine ABI),
+  plus two solver correctness fixes exposed by the first real contact:
+  (a) constraintType encoding — solveWholeIslandTGS used the inverted legacy
+  contact=0 convention; the engine writes eCONTACT=1 (eARTI_CONTACT=3), so a
+  real contact was solved as a 1D joint and crashed; now discriminates with
+  pxgIsContactType(); (b) llvmpipe zero-trip hoist — a static-only island
+  (mNumPartitions==0) left the dynamic constraint loop zero-trip but a static
+  contact had allocated iter_blockConstraintBatch, defeating the old guard;
+  the scalar guard now also requires mNumPartitions!=0.
+
+Remaining non-fatal gap: `mWritebackBlockFunction` (writebackBlocksTGS —
+constraint-force / friction-patch / threshold-stream writeback) still fails
+to launch, but does NOT affect the rest state (it is force reporting +
+friction persistence).  Being converted to the engine ABI as tranche 20
+(same {8,8,4} shape as concludeBlocksTGS).
+
+## P5 Step 4 — earlier MILESTONE: the box falls on the GPU
 
 As of tranche 12 (commit 250bb68) `PXG_GPU_STEP=1 ./gpu-sdk-step` shows the
 box FALLING under gravity on the GPU: `box start y=5.000, y after 1 step
