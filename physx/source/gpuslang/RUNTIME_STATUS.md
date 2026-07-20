@@ -109,7 +109,19 @@ this way / by the wiring, not by the happy path).
 ## P5 Step 4 — live bring-up state (continuation anchor)
 
 Converted to the engine ABI (BDA + ABI row + shim-driven test, all green):
-MemCopyBalanced, translateAABBsLaunch, clearNewFlagLaunch, bpSignalComplete.
+MemCopyBalanced, translateAABBsLaunch, clearNewFlagLaunch, bpSignalComplete,
+markCreatedPairsLaunch, initializeSapBox1DLaunch {8,4,1}, initializeRadixRanks,
+updateHandles (broadphaseSetup.slang fully BDA), radixSortMultiBlockLaunchWithCount
++ radixSortMultiCalculateRanksLaunchWithCount (NEW radixSortDesc.slang, mapped in
+the manifest — PXG_SLANG_KERNEL_MAPPED now 125; 8-pass 3-axis engine test).
+Suite count now 693 (WorkgroupCount entries retired from HLSL checks per P0 policy).
+IN FLIGHT (4 worktree agents, merge + ABI rows + suite + step pending):
+histogram/regions group (endPt+region), createRegions+activeRegion group,
+overlap+newBoundsPairs+reports group, and the SOLVER group (initStaticKinematics
+{4,4,8,8,8,8,8,8} + the TGS every-frame set {8,8}-based with PxgSolverCoreDesc/
+PxgSolverSharedDesc mirrors after the bpDesc mirror+probe pattern).  After merge:
+add each kernel's ABI row from the agents' reported push-struct sizes, retire
+reported hlsl.* failures, full suite both modes, gpu-sdk-step trace, commit.
 Infrastructure DONE: pinned-memory seam (p3ShimPinned), both launch forms
 (sized + void** via PxgVulkanKernelAbi table), PxgBroadPhaseDescGpu mirror
 byte-exact (testBpDescLayout, 57-field probe), PXG_LAUNCH_TRACE.
