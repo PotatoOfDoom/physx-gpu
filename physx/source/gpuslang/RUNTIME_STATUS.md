@@ -105,3 +105,39 @@ mutation battery proving the test has teeth + full-suite regression in both
 modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
+
+## P5 Step 4 — live bring-up state (continuation anchor)
+
+Converted to the engine ABI (BDA + ABI row + shim-driven test, all green):
+MemCopyBalanced, translateAABBsLaunch, clearNewFlagLaunch, bpSignalComplete.
+Infrastructure DONE: pinned-memory seam (p3ShimPinned), both launch forms
+(sized + void** via PxgVulkanKernelAbi table), PxgBroadPhaseDescGpu mirror
+byte-exact (testBpDescLayout, 57-field probe), PXG_LAUNCH_TRACE.
+
+REMAINING for the stepping scene (specs for ALL of these — CUDA signatures,
+argSizes, launch sites, grid arithmetic, slang entries/bindings, notes — are in
+the session scratchpad `kernel-abi-specs.json`, produced by the 6-agent spec
+workflow; regenerate by re-reading .cu/.cpp if lost):
+- solver TGS (sized, 2x ptr {8,8} mostly): ZeroBodiesTGS,
+  initializeSolverVelocitiesTGS, computeAverageSolverBodyVelocityTGS,
+  propagateAverageSolverBodyVelocityTGS (has extra bool/bool/float args),
+  writeBackBodiesTGS, integrateCoreParallelLaunchTGS, solveWholeIslandTGS
+  (unmapped — needs port), solveContactParallelTGS-family, initStaticKinematics.
+  NOTE: warp-structured kernels (32,8,1) blockDim => Slang numthreads(32) with
+  dispatch X = nbBlocks*8; push constants that were harness-precomputed
+  (gridStride, numThreadsPerBody...) must move into desc-reads for the engine ABI.
+- simcontroller: updateTransformCacheAndBoundArrayLaunch, updateBodiesLaunch.
+- BP foundation (void**, bpDesc-walks via the mirror): markCreatedPairsLaunch,
+  initializeSapBox1DLaunch {8,4,1}, initializeRadixRanks, updateHandles.
+- BP histograms/regions/reports (void**, bpDesc): endPts/regions/active/overlap
+  histogram sets, createRegionsKernel, generateFoundPairsForNewBoundsRegion,
+  accumulateReportsStage_1/2, copyReports.
+- radixSortMultiBlockLaunchWithCount + RanksLaunchWithCount (unmapped — port
+  from gpucommon RadixSort.cu, engine launches via runRadixSort desc pairs).
+- AABB manager set (void**): see spec group aabbManager.
+
+Doctrine per kernel: BDA rewrite mirroring the .cu exactly (thread mapping,
+null-branches), ABI row in PxgVulkanKernelAbi.cpp, shim-driven engine-ABI test
+(EngineBlob pattern for multi-arg packs), mutation check, suite 695/695 both
+modes, gpu-sdk-step trace shows the kernel OK, commit.  End state: PXG_GPU_STEP=1
+box falls + rests on GPU.
