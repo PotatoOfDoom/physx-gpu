@@ -40,42 +40,36 @@
 //     handle array (SUPPORT_UPDATE_HANDLES_ARRAY_FOR_GPU).
 //
 // All four are pure per-thread grid-stride scatter kernels — no groupshared,
-// scans, atomics or barriers.  Per-axis arrays are packed into flat buffers.
+// scans, atomics or barriers.
+//
+// P5 Step 4 (BDA, engine launch path): all four take ONE PxgBroadPhaseDesc
+// device pointer (bpDescd) and walk the byte-exact PxgBroadPhaseDescGpu mirror
+// (pxgSlangBpDesc.slang, proven by testBpDescLayout), exactly as the engine
+// launches them (PxgCudaBroadPhaseSap markRemovedPairs*/markUpdatedPairsKernel,
+// single bpDescd param).  In the .cu each per-axis array is a distinct device
+// pointer (boxSapBox1D[axis], boxHandles[1][axis] = the previous frame's, and
+// boxProjections[axis]); the bound-buffer form packed all three axes into one
+// flat buffer with an axis*nbProj / axis*numHandles stride — that stride
+// collapses to per-pointer indexing here (sapBox[handle*2+i] directly, no
+// numHandles multiplier).  Grid is grid-strided; gridDim comes from
+// WorkgroupCount().x, not a push field.
+
+import pxgSlangBpDesc;
 
 static const uint AXIS_COUNT = 3;
 static const uint PXG_INVALID_BP_PROJECTION = 0xffffffffu;
 static const uint PXG_INVALID_BP_SAP_BOX = 0xffffffffu;
 
-struct MarkParams
+// engine ABI: the PxgBroadPhaseDesc device pointer only
+struct BpDescParams
 {
-    uint numHandles;         // nbProjections = numHandles * 2
-    uint numRemovedHandles;
-    uint numUpdatedHandles;
-    uint changedWordCounts;  // aabbMngr_changedHandleBitMapWordCounts
-    uint gridDimX;           // groups launched (grid-stride)
+    uint64_t bpDesc;
 }
 
 [[vk::push_constant]]
-ConstantBuffer<MarkParams> gParams;
-
-RWStructuredBuffer<uint> gRemovedHandles;  // binding 0  updateData_removedHandles
-RWStructuredBuffer<uint> gUpdatedHandles;  // binding 1  updateData_updatedHandles
-RWStructuredBuffer<uint> gSapBox;          // binding 2  boxSapBox1D[axis] flat [3][numHandles][2]
-RWStructuredBuffer<uint> gBoxHandles1;     // binding 3  boxHandles[1][axis] flat [3][nbProj] (previous)
-RWStructuredBuffer<uint> gBoxProjections;  // binding 4  boxProjections[axis] flat [3][nbProj]
-RWStructuredBuffer<uint> gOldBounds;       // binding 5  oldIntegerBounds [numHandles][6]
-RWStructuredBuffer<uint> gNewBounds;       // binding 6  newIntegerBounds [numHandles][6]
-RWStructuredBuffer<uint> gChangedMap;      // binding 7  aabbMngr_changedHandleMap [words]
-RWStructuredBuffer<uint> gAddedMap;        // binding 8  aabbMngr_addedHandleMap [words]
-RWStructuredBuffer<uint> gRemovedMap;      // binding 9  aabbMngr_removedHandleMap [words]
+ConstantBuffer<BpDescParams> gBp;
 
 uint markDeleted(uint handle) { return handle | (1u << 2); }
-
-// sapBox[axis][handle].mMinMax[i]
-uint sapPos(uint axis, uint handle, uint numHandles, uint i)
-{
-    return gSapBox[(axis * numHandles + handle) * 2u + i];
-}
 
 // ---------------------------------------------------------------------------
 // markRemovedPairsLaunch (BP_MARK_DELETEDPAIRS)
@@ -84,31 +78,34 @@ uint sapPos(uint axis, uint handle, uint numHandles, uint i)
 [numthreads(256, 1, 1)]
 void markRemovedPairsLaunch(uint3 dtid : SV_DispatchThreadID)
 {
-    const uint numHandles = gParams.numHandles;
-    const uint nbProj = numHandles * 2u;
-    const uint num = gParams.numRemovedHandles;
-    const uint stride = gParams.gridDimX * 256u;
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
+    const uint num = desc[0].numRemovedHandles;
+    const uint stride = WorkgroupCount().x * 256u;
+
+    Ptr<uint> removedHandles = Ptr<uint>(desc[0].updateData_removedHandles);
+    Ptr<uint> oldBounds = Ptr<uint>(desc[0].oldIntegerBounds);
 
     for (uint i = dtid.x; i < num; i += stride)
     {
-        const uint handle = gRemovedHandles[i];
+        const uint handle = removedHandles[i];
         [unroll]
         for (uint axis = 0; axis < AXIS_COUNT; ++axis)
         {
-            const uint minIndex = sapPos(axis, handle, numHandles, 0u);
-            const uint maxIndex = sapPos(axis, handle, numHandles, 1u);
-            const uint base = axis * nbProj;
-            gBoxHandles1[base + minIndex] = markDeleted(gBoxHandles1[base + minIndex]);
-            gBoxHandles1[base + maxIndex] = markDeleted(gBoxHandles1[base + maxIndex]);
+            Ptr<uint> sapBox = Ptr<uint>(desc[0].boxSapBox1D[axis]);
+            Ptr<uint> boxHandle1 = Ptr<uint>(desc[0].boxHandles[3u + axis]); // boxHandles[1][axis] (previous)
+            const uint minIndex = sapBox[handle * 2u + 0u];
+            const uint maxIndex = sapBox[handle * 2u + 1u];
+            boxHandle1[minIndex] = markDeleted(boxHandle1[minIndex]);
+            boxHandle1[maxIndex] = markDeleted(boxHandle1[maxIndex]);
         }
         // setEmpty on the old integer bounds
         const uint b = handle * 6u;
-        gOldBounds[b + 0u] = 0xff7fffffu;
-        gOldBounds[b + 1u] = 0xff7fffffu;
-        gOldBounds[b + 2u] = 0xff7fffffu;
-        gOldBounds[b + 3u] = 0x00800000u;
-        gOldBounds[b + 4u] = 0x00800000u;
-        gOldBounds[b + 5u] = 0x00800000u;
+        oldBounds[b + 0u] = 0xff7fffffu;
+        oldBounds[b + 1u] = 0xff7fffffu;
+        oldBounds[b + 2u] = 0xff7fffffu;
+        oldBounds[b + 3u] = 0x00800000u;
+        oldBounds[b + 4u] = 0x00800000u;
+        oldBounds[b + 5u] = 0x00800000u;
     }
 }
 
@@ -119,43 +116,46 @@ void markRemovedPairsLaunch(uint3 dtid : SV_DispatchThreadID)
 [numthreads(256, 1, 1)]
 void markRemovedPairsProjectionsLaunch(uint3 dtid : SV_DispatchThreadID)
 {
-    const uint numHandles = gParams.numHandles;
-    const uint nbProj = numHandles * 2u;
-    const uint num = gParams.numRemovedHandles;
-    const uint stride = gParams.gridDimX * 256u;
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
+    const uint num = desc[0].numRemovedHandles;
+    const uint stride = WorkgroupCount().x * 256u;
+
+    Ptr<uint> removedHandles = Ptr<uint>(desc[0].updateData_removedHandles);
 
     for (uint i = dtid.x; i < num; i += stride)
     {
-        const uint handle = gRemovedHandles[i];
+        const uint handle = removedHandles[i];
         [unroll]
         for (uint axis = 0; axis < AXIS_COUNT; ++axis)
         {
-            const uint sb = (axis * numHandles + handle) * 2u;
-            const uint minIndex = gSapBox[sb + 0u];
-            const uint maxIndex = gSapBox[sb + 1u];
-            const uint base = axis * nbProj;
-            gBoxProjections[base + minIndex] = PXG_INVALID_BP_PROJECTION;
-            gBoxProjections[base + maxIndex] = PXG_INVALID_BP_PROJECTION;
-            gSapBox[sb + 0u] = PXG_INVALID_BP_SAP_BOX;
-            gSapBox[sb + 1u] = PXG_INVALID_BP_SAP_BOX;
+            Ptr<uint> sapBox = Ptr<uint>(desc[0].boxSapBox1D[axis]);
+            Ptr<uint> boxProjection = Ptr<uint>(desc[0].boxProjections[axis]);
+            const uint minIndex = sapBox[handle * 2u + 0u];
+            const uint maxIndex = sapBox[handle * 2u + 1u];
+            boxProjection[minIndex] = PXG_INVALID_BP_PROJECTION;
+            boxProjection[maxIndex] = PXG_INVALID_BP_PROJECTION;
+            sapBox[handle * 2u + 0u] = PXG_INVALID_BP_SAP_BOX;
+            sapBox[handle * 2u + 1u] = PXG_INVALID_BP_SAP_BOX;
         }
     }
 }
 
 // write the box's new min/max projections at its per-axis SAP-box positions
-void writeUpdatedProjections(uint handle, uint numHandles, uint nbProj)
+void writeUpdatedProjections(Ptr<PxgBroadPhaseDescGpu> desc, uint handle)
 {
+    Ptr<uint> newBounds = Ptr<uint>(desc[0].newIntegerBounds);
     const uint nb = handle * 6u;
     [unroll]
     for (uint axis = 0; axis < AXIS_COUNT; ++axis)
     {
-        const uint minV = gNewBounds[nb + axis];
-        const uint maxV = gNewBounds[nb + axis + 3u];
-        const uint minIndex = sapPos(axis, handle, numHandles, 0u);
-        const uint maxIndex = sapPos(axis, handle, numHandles, 1u);
-        const uint base = axis * nbProj;
-        gBoxProjections[base + minIndex] = minV;
-        gBoxProjections[base + maxIndex] = maxV;
+        Ptr<uint> sapBox = Ptr<uint>(desc[0].boxSapBox1D[axis]);
+        Ptr<uint> boxProjection = Ptr<uint>(desc[0].boxProjections[axis]);
+        const uint minV = newBounds[nb + axis];
+        const uint maxV = newBounds[nb + axis + 3u];
+        const uint minIndex = sapBox[handle * 2u + 0u];
+        const uint maxIndex = sapBox[handle * 2u + 1u];
+        boxProjection[minIndex] = minV;
+        boxProjection[maxIndex] = maxV;
     }
 }
 
@@ -166,18 +166,23 @@ void writeUpdatedProjections(uint handle, uint numHandles, uint nbProj)
 [numthreads(256, 1, 1)]
 void markUpdatedPairsLaunch(uint3 dtid : SV_DispatchThreadID)
 {
-    const uint numHandles = gParams.numHandles;
-    const uint nbProj = numHandles * 2u;
-    const uint numElements = gParams.changedWordCounts * 32u;
-    const uint stride = gParams.gridDimX * 256u;
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
+    const uint numElements = desc[0].aabbMngr_changedHandleBitMapWordCounts * 32u;
+    const uint stride = WorkgroupCount().x * 256u;
+
+    Ptr<uint> changedMap = Ptr<uint>(desc[0].aabbMngr_changedHandleMap);
+    Ptr<uint> addedMap = Ptr<uint>(desc[0].aabbMngr_addedHandleMap);
+    Ptr<uint> removedMap = Ptr<uint>(desc[0].aabbMngr_removedHandleMap);
 
     for (uint handle = dtid.x; handle < numElements; handle += stride)
     {
         const uint word = handle / 32u;
-        const uint mask = gChangedMap[word];
-        const uint addedOrRemoved = gAddedMap[word] | gRemovedMap[word];
+        const uint mask = changedMap[word];
+        const uint addedOrRemoved = addedMap[word] | removedMap[word];
+        // .cu tests bit (threadIdx.x & 31); blockDim = 256 is a multiple of 32,
+        // so (handle & 31) is identical and grid-agnostic.
         if (((mask & (~addedOrRemoved)) & (1u << (handle & 31u))) != 0u)
-            writeUpdatedProjections(handle, numHandles, nbProj);
+            writeUpdatedProjections(desc, handle);
     }
 }
 
@@ -188,11 +193,12 @@ void markUpdatedPairsLaunch(uint3 dtid : SV_DispatchThreadID)
 [numthreads(256, 1, 1)]
 void markUpdatedPairsLaunch2(uint3 dtid : SV_DispatchThreadID)
 {
-    const uint numHandles = gParams.numHandles;
-    const uint nbProj = numHandles * 2u;
-    const uint num = gParams.numUpdatedHandles;
-    const uint stride = gParams.gridDimX * 256u;
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
+    const uint num = desc[0].numUpdatedHandles;
+    const uint stride = WorkgroupCount().x * 256u;
+
+    Ptr<uint> updatedHandles = Ptr<uint>(desc[0].updateData_updatedHandles);
 
     for (uint i = dtid.x; i < num; i += stride)
-        writeUpdatedProjections(gUpdatedHandles[i], numHandles, nbProj);
+        writeUpdatedProjections(desc, updatedHandles[i]);
 }

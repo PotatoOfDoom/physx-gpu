@@ -1217,18 +1217,16 @@ set(PXG_HLSL_ENTRIES
     "npBoxReduce:boxCompactContacts"
     # markCreatedPairs/initializeRadixRanks/updateHandles: BDA + WorkgroupCount — Vulkan-only (P0 policy).
     "broadphaseSetup:translateAABBsLaunch"
-    "broadphaseSetup:initializeSapBox1DLaunch" 
-    
-     "broadphaseIncrementalHistogram:computeIncrementalComparisonHistograms_Stage1"
-    "broadphaseIncrementalHistogram:computeIncrementalComparisonHistograms_Stage2"
+    "broadphaseSetup:initializeSapBox1DLaunch"
+
+    # broadphaseIncrementalHistogram:computeIncrementalComparisonHistograms_Stage1/_Stage2,
+    # broadphaseIncrementalSap:performIncrementalSAP and broadphaseMarkPairs:markRemovedPairsLaunch/
+    # markRemovedPairsProjectionsLaunch/markUpdatedPairsLaunch/markUpdatedPairsLaunch2 retired:
+    # converted to the BDA engine ABI (P5 Step 4); BDA does not lower to HLSL cs_6_0 (and the
+    # SAP/mark kernels also grid-stride via WorkgroupCount()), so they are Vulkan-only (P0 policy).
     "broadphaseEndPtHistogram:computeEndPtsHistogram"
     "broadphaseEndPtHistogram:outputEndPtsHistogram"
-    "broadphaseIncrementalSap:performIncrementalSAP"
     "broadphaseRegionHistogram:outputRegionsHistogram"
-    "broadphaseMarkPairs:markRemovedPairsLaunch"
-    "broadphaseMarkPairs:markRemovedPairsProjectionsLaunch"
-    "broadphaseMarkPairs:markUpdatedPairsLaunch"
-    "broadphaseMarkPairs:markUpdatedPairsLaunch2"
     # clearNewFlagLaunch: BDA + WorkgroupCount (gl_NumWorkGroups) — Vulkan-only,
     # no cs_6_0 lowering (same policy as the P0 BDA spikes).
     "broadphaseClearNewFlag:bpSignalComplete"

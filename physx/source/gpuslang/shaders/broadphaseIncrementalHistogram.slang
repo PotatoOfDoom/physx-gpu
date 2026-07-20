@@ -53,31 +53,33 @@
 // Portability: the CUDA warpScanAdd/__shfl_sync scans become groupshared
 // 32-lane scans; the fixed 32-block device grid (BLOCK = 256, 8 warps) and its
 // sequential between-tile / between-block accumulation are preserved exactly.
+//
+// P5 Step 4 (BDA, engine launch path): both stages take ONE PxgBroadPhaseDesc
+// device pointer (bpDescd) and walk the byte-exact PxgBroadPhaseDescGpu mirror
+// (pxgSlangBpDesc.slang, proven by testBpDescLayout).  Every per-axis /
+// per-(frame,axis) array that the bound-buffer form packed axis-major into one
+// flat buffer is a distinct device pointer inside the desc here — so the flat
+// axisBase / (frame*3+axis)*nbProj offsets collapse to per-pointer indexing.
+// The engine launches both stages with grid.x = 32 (BP_COMPUTE_INCREMENTAL_
+// CMP_COUNTS1/2), so NUM_BLOCKS = gridDim.x is a fixed device-grid constant
+// exactly as the .cu assumes (the per-block totals array is sized 32 and
+// stage 2 scans those 32 entries).
+
+import pxgSlangBpDesc;
 
 static const uint BLOCK = 256;
 static const uint NUM_BLOCKS = 32;
 static const uint WARP = 32;
 static const uint WARPS_PER_BLOCK = BLOCK / WARP; // 8
 
-struct HistParams
+// engine ABI: the PxgBroadPhaseDesc device pointer only
+struct BpDescParams
 {
-    uint numPreviousHandles; // nbProjections = numPreviousHandles * 2
+    uint64_t bpDesc;
 }
 
 [[vk::push_constant]]
-ConstantBuffer<HistParams> gParams;
-
-// per-axis arrays are packed into single flat buffers, axis-major:
-//   [axis * nbProjections + i]   for the projection arrays
-//   [(frame * 3 + axis) * nbProjections + i]  for the histograms (frame 0 = this
-//   frame, frame 1 = last frame)
-RWStructuredBuffer<uint> gRanks;               // binding 0  boxProjectionRanks[axis][i]
-RWStructuredBuffer<uint> gHandles;             // binding 1  boxHandles[0][axis][i]
-RWStructuredBuffer<uint> gStartHist;           // binding 2  startPtHistogram[frame][axis][i]
-RWStructuredBuffer<uint> gEndHist;             // binding 3  endPtHistogram[frame][axis][i]
-RWStructuredBuffer<uint> gIncComparisons;      // binding 4  incrementalComparisons[axis][i]
-RWStructuredBuffer<uint> gIncBlockComparisons; // binding 5  incrementalBlockComparisons[axis][block]
-RWStructuredBuffer<uint> gTotal;               // binding 6  totalIncrementalComparisons[axis]
+ConstantBuffer<BpDescParams> gBp;
 
 bool isStartProjection(uint sortedHandle)
 {
@@ -140,7 +142,8 @@ void computeIncrementalComparisonHistograms_Stage1(uint3 gtid : SV_GroupThreadID
     const uint warpIndex = tid / WARP;
     const uint lane = tid & (WARP - 1);
 
-    const uint numHandles = gParams.numPreviousHandles;
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
+    const uint numHandles = desc[0].numPreviousHandles;
     const uint nbProjections = numHandles * 2;
 
     const uint nbBlocksRequired = (nbProjections + BLOCK - 1) / BLOCK;
@@ -152,7 +155,12 @@ void computeIncrementalComparisonHistograms_Stage1(uint3 gtid : SV_GroupThreadID
             gsBlockAccum = 0;
         GroupMemoryBarrierWithGroupSync();
 
-        const uint axisBase = axis * nbProjections;
+        // per-axis device pointers (boxProjectionRanks[axis], boxHandles[0][axis],
+        // incrementalComparisons[axis]); the this-frame/last-frame start & end
+        // histograms are boxwise [frame*3+axis].
+        Ptr<uint> ranks = Ptr<uint>(desc[0].boxProjectionRanks[axis]);
+        Ptr<uint> handles = Ptr<uint>(desc[0].boxHandles[axis]);
+        Ptr<uint> incCmp = Ptr<uint>(desc[0].incrementalComparisons[axis]);
 
         for (uint it = 0; it < numIterationPerBlock; ++it)
         {
@@ -162,8 +170,8 @@ void computeIncrementalComparisonHistograms_Stage1(uint3 gtid : SV_GroupThreadID
             uint comparisons = 0;
             if (readIdx < nbProjections)
             {
-                const uint rank = gRanks[axisBase + readIdx];
-                const uint sortedHandle = gHandles[axisBase + readIdx];
+                const uint rank = ranks[readIdx];
+                const uint sortedHandle = handles[readIdx];
                 const bool isDownPass = readIdx <= rank;
                 const bool isStartHandle = isStartProjection(sortedHandle);
 
@@ -178,19 +186,10 @@ void computeIncrementalComparisonHistograms_Stage1(uint3 gtid : SV_GroupThreadID
                     //   isStartHandle -> end-point histogram, else start-point
                     //   isDownPass    -> last frame (1), else this frame (0)
                     const uint frame = isDownPass ? 1u : 0u;
-                    const uint histBase = (frame * 3u + axis) * nbProjections;
-                    uint vEnd, vStart;
-                    if (isStartHandle)
-                    {
-                        vEnd = gEndHist[histBase + end];
-                        vStart = gEndHist[histBase + start];
-                    }
-                    else
-                    {
-                        vEnd = gStartHist[histBase + end];
-                        vStart = gStartHist[histBase + start];
-                    }
-                    comparisons = vEnd - vStart;
+                    const uint fa = frame * 3u + axis;
+                    Ptr<uint> hist = isStartHandle ? Ptr<uint>(desc[0].endPtHistogram[fa])
+                                                   : Ptr<uint>(desc[0].startPtHistogram[fa]);
+                    comparisons = hist[end] - hist[start];
                 }
             }
 
@@ -210,13 +209,13 @@ void computeIncrementalComparisonHistograms_Stage1(uint3 gtid : SV_GroupThreadID
             GroupMemoryBarrierWithGroupSync();
 
             if (readIdx < nbProjections)
-                gIncComparisons[axisBase + readIdx] = accum + res + gsWarp[warpIndex];
+                incCmp[readIdx] = accum + res + gsWarp[warpIndex];
 
             GroupMemoryBarrierWithGroupSync();
         }
 
         if (tid == 0)
-            gIncBlockComparisons[axis * NUM_BLOCKS + blockIdx] = gsBlockAccum;
+            (Ptr<uint>(desc[0].incrementalBlockComparisons[axis]))[blockIdx] = gsBlockAccum;
 
         GroupMemoryBarrierWithGroupSync();
     }
@@ -232,7 +231,8 @@ void computeIncrementalComparisonHistograms_Stage2(uint3 gtid : SV_GroupThreadID
     const uint tid = gtid.x;
     const uint blockIdx = gid.x;
 
-    const uint numHandles = gParams.numPreviousHandles;
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
+    const uint numHandles = desc[0].numPreviousHandles;
     const uint nbProjections = numHandles * 2;
 
     const uint nbBlocksRequired = (nbProjections + BLOCK - 1) / BLOCK;
@@ -240,30 +240,32 @@ void computeIncrementalComparisonHistograms_Stage2(uint3 gtid : SV_GroupThreadID
 
     for (uint axis = 0; axis < 3; ++axis)
     {
+        Ptr<uint> incBlock = Ptr<uint>(desc[0].incrementalBlockComparisons[axis]);
+        Ptr<uint> incCmp = Ptr<uint>(desc[0].incrementalComparisons[axis]);
+
         // exclusive prefix over the 32 per-block comparison totals
         if (tid == 0)
         {
             uint acc = 0;
             for (uint b = 0; b < NUM_BLOCKS; ++b)
             {
-                const uint v = gIncBlockComparisons[axis * NUM_BLOCKS + b];
+                const uint v = incBlock[b];
                 gsLane[b] = acc; // exclusive prefix -> block offset
                 acc += v;
             }
             if (blockIdx == 0)
-                gTotal[axis] = acc; // grand total
+                desc[0].totalIncrementalComparisons[axis] = acc; // grand total (inline desc field)
         }
         GroupMemoryBarrierWithGroupSync();
 
         const uint blockAccumulation = gsLane[blockIdx];
-        const uint axisBase = axis * nbProjections;
 
         for (uint it = 0; it < numIterationPerBlock; ++it)
         {
             const uint blockId = blockIdx * numIterationPerBlock + it;
             const uint readIdx = blockId * BLOCK + tid;
             if (readIdx < nbProjections)
-                gIncComparisons[axisBase + readIdx] = gIncComparisons[axisBase + readIdx] + blockAccumulation;
+                incCmp[readIdx] = incCmp[readIdx] + blockAccumulation;
         }
 
         GroupMemoryBarrierWithGroupSync();

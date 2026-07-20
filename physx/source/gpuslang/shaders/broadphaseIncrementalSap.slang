@@ -53,41 +53,35 @@
 // the two per-thread category counts (found, lost) are packed into one uint
 // (16-bit fields; per-block sum <= 256) so a single scan serves both.  The
 // atomicAdd to the shared pair counters becomes InterlockedAdd.
+//
+// P5 Step 4 (BDA, engine launch path): the kernel takes ONE PxgBroadPhaseDesc
+// device pointer (bpDescd) and walks the byte-exact PxgBroadPhaseDescGpu mirror
+// (pxgSlangBpDesc.slang, proven by testBpDescLayout).  Every axis-major flat
+// input the bound-buffer form bound as a StructuredBuffer is a distinct device
+// pointer inside the desc here (boxProjectionRanks[axis], boxHandles[0][axis],
+// startPtHistogram/endPtHistogram/startPointHandles/endPointHandles[frame*3+
+// axis], incrementalComparisons[axis], ...).  totalIncrementalComparisons is an
+// inline desc field array.  The atomicAdd reservations become BDA InterlockedAdd
+// directly on the desc's sharedFoundPairIndex/sharedLostPairIndex fields.  Grid
+// is (WorkgroupCount().x, 3): gid.y selects the axis, gridDimX = WorkgroupCount()
+// .x drives the grid-stride, and useEnvIds mirrors the .cu's `envIds ?` NULL
+// check on updateData_envIDs.
+
+import pxgSlangBpDesc;
 
 static const uint BLOCK = 256;
 static const uint WARP = 32;
 static const uint WARPS_PER_BLOCK = BLOCK / WARP; // 8
 static const uint PX_INVALID_U32 = 0xffffffffu;
 
-struct SapParams
+// engine ABI: the PxgBroadPhaseDesc device pointer only
+struct BpDescParams
 {
-    uint numPreviousHandles; // nbProjections = numPreviousHandles * 2; #boxes = numPreviousHandles
-    uint gridDimX;           // number of groups launched per axis
-    uint maxFoundLostPairs;
-    uint useEnvIds;          // 0/1
+    uint64_t bpDesc;
 }
 
 [[vk::push_constant]]
-ConstantBuffer<SapParams> gParams;
-
-// inputs (axis-major flat packing; frame 0 = current, frame 1 = last frame)
-RWStructuredBuffer<uint> gTotalIncComparisons; // binding 0  [3]
-RWStructuredBuffer<uint> gIncComparisons;      // binding 1  [3][nbProj]  exclusive prefix
-RWStructuredBuffer<uint> gRanks;               // binding 2  [3][nbProj]  boxProjectionRanks
-RWStructuredBuffer<uint> gBoxHandles;          // binding 3  [3][nbProj]  boxHandles[0][axis]
-RWStructuredBuffer<uint> gStartHist;           // binding 4  [2][3][nbProj]
-RWStructuredBuffer<uint> gEndHist;             // binding 5  [2][3][nbProj]
-RWStructuredBuffer<uint> gStartHandles;        // binding 6  [2][3][nH]
-RWStructuredBuffer<uint> gEndHandles;          // binding 7  [2][3][nH]
-RWStructuredBuffer<uint> gNewBounds;           // binding 8  [nH][6]  newIntegerBounds
-RWStructuredBuffer<uint> gOldBounds;           // binding 9  [nH][6]  oldIntegerBounds
-RWStructuredBuffer<uint> gGroups;              // binding 10 [nH]
-RWStructuredBuffer<uint> gEnvs;                // binding 11 [nH]
-// outputs
-RWStructuredBuffer<uint> gFoundReport;         // binding 12 [maxPairs][2]  (mVolA, mVolB)
-RWStructuredBuffer<uint> gLostReport;          // binding 13 [maxPairs][2]
-RWStructuredBuffer<uint> gSharedFound;         // binding 14 [1]  atomic counter
-RWStructuredBuffer<uint> gSharedLost;          // binding 15 [1]  atomic counter
+ConstantBuffer<BpDescParams> gBp;
 
 bool isStartProjection(uint sortedHandle) { return (sortedHandle & 1u) != 0u; }
 uint getHandle(uint sortedHandle) { return sortedHandle >> 3; }
@@ -98,7 +92,7 @@ struct IAABB
     uint m[6];
 }
 
-IAABB loadAABB(RWStructuredBuffer<uint> buf, uint idx)
+IAABB loadAABB(Ptr<uint> buf, uint idx)
 {
     IAABB r;
     const uint base = idx * 6u;
@@ -143,16 +137,16 @@ bool filtering(uint groupId, uint otherGroupId, uint envId, uint otherEnvId)
            ((envId == otherEnvId) || (envId == PX_INVALID_U32) || (otherEnvId == PX_INVALID_U32));
 }
 
-// largest index into the sorted `data` (base-offset) array s.t. data[index] <= value;
+// largest index into the sorted `data` array s.t. data[index] <= value;
 // 0 if data[0] > value
-uint binarySearch(uint base, uint numElements, uint value)
+uint binarySearch(Ptr<uint> data, uint numElements, uint value)
 {
     uint left = 0;
     uint right = numElements;
     while (left < right)
     {
         const uint pos = (left + right) / 2u;
-        const uint element = gIncComparisons[base + pos];
+        const uint element = data[pos];
         if (element <= value)
             left = pos + 1u;
         else
@@ -189,14 +183,25 @@ void performIncrementalSAP(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
     const uint warpIndex = tid / WARP;
     const uint lane = tid & (WARP - 1);
 
-    const uint numHandles = gParams.numPreviousHandles;
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
+    const uint numHandles = desc[0].numPreviousHandles;
     const uint nbProjections = numHandles * 2u;
-    const uint maxPairs = gParams.maxFoundLostPairs;
-    const uint gridDimX = gParams.gridDimX;
-    const bool useEnvIds = gParams.useEnvIds != 0u;
+    const uint maxPairs = desc[0].max_found_lost_pairs;
+    const uint gridDimX = WorkgroupCount().x;              // groups launched per axis
+    const bool useEnvIds = desc[0].updateData_envIDs != 0; // .cu's `envIds ?` NULL check
 
-    const uint axisProjBase = axis * nbProjections;
-    const uint totalCmpsThisAxis = gTotalIncComparisons[axis];
+    // per-axis device pointers (axis = gid.y)
+    Ptr<uint> incComparisons = Ptr<uint>(desc[0].incrementalComparisons[axis]);
+    Ptr<uint> ranksArr = Ptr<uint>(desc[0].boxProjectionRanks[axis]);
+    Ptr<uint> boxHandlesArr = Ptr<uint>(desc[0].boxHandles[axis]); // boxHandles[0][axis]
+    Ptr<uint> newBounds = Ptr<uint>(desc[0].newIntegerBounds);
+    Ptr<uint> oldBounds = Ptr<uint>(desc[0].oldIntegerBounds);
+    Ptr<uint> groupsArr = Ptr<uint>(desc[0].updateData_groups);
+    Ptr<uint> envsArr = Ptr<uint>(desc[0].updateData_envIDs);
+    Ptr<uint> foundReport = Ptr<uint>(desc[0].foundPairReport); // PxgBroadPhasePair = 2 uints
+    Ptr<uint> lostReport = Ptr<uint>(desc[0].lostPairReport);
+
+    const uint totalCmpsThisAxis = desc[0].totalIncrementalComparisons[axis];
     const uint nbBlocksRequired = (totalCmpsThisAxis + BLOCK - 1u) / BLOCK;
 
     // grid-stride loop over 256-wide logical blocks assigned to this group
@@ -211,16 +216,16 @@ void performIncrementalSAP(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
 
         if (workId < totalCmpsThisAxis)
         {
-            const uint index = binarySearch(axisProjBase, nbProjections, workId);
-            const uint sortedHandle = gBoxHandles[axisProjBase + index];
+            const uint index = binarySearch(incComparisons, nbProjections, workId);
+            const uint sortedHandle = boxHandlesArr[index];
             const uint isStartHandle = isStartProjection(sortedHandle) ? 1u : 0u;
             handle = getHandle(sortedHandle);
 
-            const uint groupId = gGroups[handle];
-            const uint envId = useEnvIds ? gEnvs[handle] : PX_INVALID_U32;
+            const uint groupId = groupsArr[handle];
+            const uint envId = useEnvIds ? envsArr[handle] : PX_INVALID_U32;
 
-            const uint offset = workId - gIncComparisons[axisProjBase + index];
-            const uint prevIndex = gRanks[axisProjBase + index];
+            const uint offset = workId - incComparisons[index];
+            const uint prevIndex = ranksArr[index];
             const uint downPass = prevIndex > index ? 1u : 0u;
             const uint startIndex = (downPass != 0u) ? index : (prevIndex + 1u);
             const uint willFindPair = (1u - isStartHandle) ^ downPass;
@@ -231,25 +236,25 @@ void performIncrementalSAP(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
             const uint frame = downPass;
             const uint fa = (frame * 3u + axis);
             const uint accumVal = (isStartHandle != 0u)
-                ? gEndHist[fa * nbProjections + startIndex]
-                : gStartHist[fa * nbProjections + startIndex];
+                ? (Ptr<uint>(desc[0].endPtHistogram[fa]))[startIndex]
+                : (Ptr<uint>(desc[0].startPtHistogram[fa]))[startIndex];
             const uint handleIndex = accumVal + offset;
             otherHandle = (isStartHandle != 0u)
-                ? gEndHandles[fa * numHandles + handleIndex]
-                : gStartHandles[fa * numHandles + handleIndex];
+                ? (Ptr<uint>(desc[0].endPointHandles[fa]))[handleIndex]
+                : (Ptr<uint>(desc[0].startPointHandles[fa]))[handleIndex];
 
-            const uint otherGroupId = gGroups[otherHandle];
-            const uint otherEnvId = useEnvIds ? gEnvs[otherHandle] : PX_INVALID_U32;
+            const uint otherGroupId = groupsArr[otherHandle];
+            const uint otherEnvId = useEnvIds ? envsArr[otherHandle] : PX_INVALID_U32;
 
             if (filtering(groupId, otherGroupId, envId, otherEnvId))
             {
                 // invert new/old bounds based on up/down sweep so the overlap
                 // logic reports the change on the correct frame
                 const bool wfp = willFindPair != 0u;
-                const IAABB aabb = wfp ? loadAABB(gNewBounds, handle) : loadAABB(gOldBounds, handle);
-                const IAABB oldAABB = wfp ? loadAABB(gOldBounds, handle) : loadAABB(gNewBounds, handle);
-                const IAABB otherAABB = wfp ? loadAABB(gNewBounds, otherHandle) : loadAABB(gOldBounds, otherHandle);
-                const IAABB otherOldAABB = wfp ? loadAABB(gOldBounds, otherHandle) : loadAABB(gNewBounds, otherHandle);
+                const IAABB aabb = wfp ? loadAABB(newBounds, handle) : loadAABB(oldBounds, handle);
+                const IAABB oldAABB = wfp ? loadAABB(oldBounds, handle) : loadAABB(newBounds, handle);
+                const IAABB otherAABB = wfp ? loadAABB(newBounds, otherHandle) : loadAABB(oldBounds, otherHandle);
+                const IAABB otherOldAABB = wfp ? loadAABB(oldBounds, otherHandle) : loadAABB(newBounds, otherHandle);
 
                 if (intersects(aabb, otherAABB) && !intersects1D(oldAABB, otherOldAABB, axis))
                 {
@@ -290,9 +295,9 @@ void performIncrementalSAP(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
             const uint totalLost = acc >> 16;
             uint baseFound = 0, baseLost = 0;
             if (totalFound > 0u)
-                InterlockedAdd(gSharedFound[0], totalFound, baseFound);
+                InterlockedAdd(desc[0].sharedFoundPairIndex, totalFound, baseFound); // BDA atomic on desc field
             if (totalLost > 0u)
-                InterlockedAdd(gSharedLost[0], totalLost, baseLost);
+                InterlockedAdd(desc[0].sharedLostPairIndex, totalLost, baseLost);
             gsBaseFound = baseFound;
             gsBaseLost = baseLost;
         }
@@ -313,13 +318,13 @@ void performIncrementalSAP(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
                 const uint volB = max(handle, otherHandle);
                 if (foundOrLostID == 0u)
                 {
-                    gFoundReport[writeIndex * 2u] = volA;
-                    gFoundReport[writeIndex * 2u + 1u] = volB;
+                    foundReport[writeIndex * 2u] = volA;
+                    foundReport[writeIndex * 2u + 1u] = volB;
                 }
                 else
                 {
-                    gLostReport[writeIndex * 2u] = volA;
-                    gLostReport[writeIndex * 2u + 1u] = volB;
+                    lostReport[writeIndex * 2u] = volA;
+                    lostReport[writeIndex * 2u + 1u] = volB;
                 }
             }
         }

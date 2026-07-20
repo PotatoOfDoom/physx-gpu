@@ -129,6 +129,15 @@ static const PxgKernelAbiRow kRows[] = {
     { "clearNewFlagLaunch", kOnePtr, 1u },
     { "bpSignalComplete", kOnePtr, 1u },
     { "markCreatedPairsLaunch", kOnePtr, 1u },
+    // Incremental-SAP path (moved shapes): all take a single PxgBroadPhaseDesc*
+    // device pointer (BDA), so kOnePtr = {8} matches the void** engine ABI.
+    { "markUpdatedPairsLaunch", kOnePtr, 1u },
+    { "markUpdatedPairsLaunch2", kOnePtr, 1u },
+    { "markRemovedPairsLaunch", kOnePtr, 1u },
+    { "markRemovedPairsProjectionsLaunch", kOnePtr, 1u },
+    { "computeIncrementalComparisonHistograms_Stage1", kOnePtr, 1u },
+    { "computeIncrementalComparisonHistograms_Stage2", kOnePtr, 1u },
+    { "performIncrementalSAP", kOnePtr, 1u },
     { "initializeSapBox1DLaunch", kSapBoxInit, uint32_t(sizeof(kSapBoxInit)) },
     { "initializeRadixRanks", kOnePtr, 1u },
     { "updateHandles", kOnePtr, 1u },
