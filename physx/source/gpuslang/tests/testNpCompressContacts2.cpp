@@ -24,56 +24,95 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// Verification of npCompressContacts2.slang: compressContactStage2 — the
-// cross-block compaction of pairs-with-contacts into the dense PxGpuContactPair
-// list.  The per-block survivor counts (gBlockNumPairs) are built from the exact
-// Stage1 work partition, then the reference reproduces the stable compaction (in
-// work order) and the pointer->offset / remap / actor-table field conversions.
-// Everything is integer, so the comparison is bit-exact (no tolerance).
+// P5 Step 4: compressContactStage2 on the ENGINE ABI, driven through
+// PxgCudaShim exactly as PxgNarrowphaseCore.cpp launches it — 16-argument
+// blob {8,8,4,8,8,8,8,8,8,8,8,8,8,8,8,4} (128 bytes), grid 32 blocks x 256.
+// REAL PxgContactManagerInput / PxsContactManagerOutput / PxGpuContactPair
+// arrays + real CPU/GPU stream base pointers at live device addresses.  The
+// cross-block compaction structure is the verified bound-buffer reference;
+// this test additionally exercises the REAL pointer->offset conversions
+// (cmOutput's stream pointers minus the cpu*Base args, PxReal* force diff /4)
+// and the rebased device pointers written into PxGpuContactPair.
 
 #include "pxgTestFramework.h"
+#include "PxgCudaShim.h"
+
+#include "PxNodeIndex.h"
+#include "PxContact.h"
+#include "PxgContactManager.h"
+#include "PxsContactManagerState.h"
 
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <vector>
 
 namespace
 {
 using namespace pxgtest;
+using physx::gpuslang::PxgCudaShim;
+using physx::gpuslang::PxgKernelDef;
+using physx::gpuslang::PxgDevicePtr;
+using physx::gpuslang::PxgResult;
 
-const uint32_t OUTPUT_WORDS = 12;
 const uint32_t BLOCK = 256, NUM_BLOCKS = 32;
 const uint32_t CONTACT_SIZE = 64, FRIC_SIZE = 52;
 const uint32_t TABLE = 4096;
 
-struct Compress2Params { uint32_t numTotalPairs, maxOutputPatches, contactSize, fricSize; };
-struct GpuPairOut { uint32_t ref0, ref1, node0, node1, forceOff, fricOff, patchOff, pointOff, nbPatches, nbContacts, actor0, actor1; };
+// host-side expected PxGpuContactPair (the fields the kernel writes)
+struct ExpPair
+{
+    uint64_t contactPatches, contactPoints, contactForces, frictionPatches;
+    uint32_t ref0, ref1;
+    uint64_t node0, node1, actor0, actor1;
+    uint32_t nbContactsPatches;
+};
+
+static std::vector<uint8_t> c2Loader(const char* file) { return loadShaderBlob(file); }
 
 PXG_TEST(npCompressContacts2_stage2)
 {
+    using namespace physx;
     std::mt19937 rng(53010);
     const uint32_t N = 40000;
 
-    std::vector<uint32_t> outData(N * OUTPUT_WORDS, 0);
-    std::vector<uint32_t> refs(N * 2);
+    // simulated compressed-stream base offsets (fake device bases the pointers
+    // are relative to); the kernel rebases onto the GPU bases below
+    const uint64_t cpuPatchBase = 0x10000000ull, cpuContactBase = 0x20000000ull, cpuForceBase = 0x30000000ull;
+
+    std::vector<PxgContactManagerInput> cmIn(N);
+    std::vector<PxsContactManagerOutput> outData(N);
+    std::memset(cmIn.data(), 0, N * sizeof(PxgContactManagerInput));
+    std::memset(outData.data(), 0, N * sizeof(PxsContactManagerOutput));
     std::vector<uint32_t> nb(N);
+    std::vector<uint32_t> patchOffs(N), pointOffs(N), forceOffs(N), forcePres(N), nbPatchesArr(N);
     for (uint32_t i = 0; i < N; ++i)
     {
         const uint32_t nbc = (rng() % 100 < 45) ? 0u : (1u + rng() % 8u);
         nb[i] = nbc;
-        outData[i * OUTPUT_WORDS + 0] = (rng() % 20000) * 64u + (rng() % 64); // contactPatches offset
-        outData[i * OUTPUT_WORDS + 2] = rng();                                // contactPoints offset
-        outData[i * OUTPUT_WORDS + 4] = rng();                                // contactForces offset (low)
-        outData[i * OUTPUT_WORDS + 5] = (rng() % 100 < 20) ? 0u : 1u;          // presence (0 == null)
-        outData[i * OUTPUT_WORDS + 8] = (rng() % 0xff) << 8 | (rng() & 0xff) | ((rng() & 0xffff) << 16); // nbPatches in bits 8-15
-        outData[i * OUTPUT_WORDS + 9] = (nbc & 0xffffu) | ((rng() % 0xffff) << 16); // flags noise in high 16
-        refs[i * 2 + 0] = rng() % TABLE;
-        refs[i * 2 + 1] = rng() % TABLE;
+        patchOffs[i] = (rng() % 20000) * CONTACT_SIZE + (rng() % CONTACT_SIZE);
+        pointOffs[i] = rng() % 0x40000;
+        forceOffs[i] = (rng() % 0x40000) & ~3u; // multiple of 4 (PxReal* diff)
+        forcePres[i] = (rng() % 100 < 20) ? 0u : 1u;
+        nbPatchesArr[i] = rng() % 0xff;
+        const uint32_t ref0 = rng() % TABLE, ref1 = rng() % TABLE;
+        cmIn[i].transformCacheRef0 = ref0;
+        cmIn[i].transformCacheRef1 = ref1;
+        outData[i].contactPatches = reinterpret_cast<PxU8*>(cpuPatchBase + patchOffs[i]);
+        outData[i].contactPoints = reinterpret_cast<PxU8*>(cpuContactBase + pointOffs[i]);
+        outData[i].contactForces = forcePres[i] ? reinterpret_cast<PxReal*>(cpuForceBase + forceOffs[i]) : nullptr;
+        outData[i].nbPatches = PxU8(nbPatchesArr[i]);
+        outData[i].nbContacts = PxU16(nbc);
+        outData[i].flags = PxU16(rng() % 0xffff); // high 16 word9 = noise
     }
-    std::vector<uint32_t> remap(TABLE), actorTab(TABLE);
-    for (uint32_t i = 0; i < TABLE; ++i) { remap[i] = rng(); actorTab[i] = rng(); }
+    std::vector<uint64_t> remap(TABLE), actorTab(TABLE);
+    for (uint32_t i = 0; i < TABLE; ++i)
+    {
+        remap[i] = (uint64_t(rng()) << 32) | rng();
+        actorTab[i] = (uint64_t(rng()) << 32) | rng();
+    }
 
-    // gBlockNumPairs: per-block survivor count over the Stage1 partition
+    // gBlockNumPairs
     const uint32_t totalBlockRequired = (N + BLOCK - 1) / BLOCK;
     const uint32_t numIter = (totalBlockRequired + NUM_BLOCKS - 1) / NUM_BLOCKS;
     std::vector<uint32_t> blockNum(NUM_BLOCKS, 0);
@@ -88,14 +127,62 @@ PXG_TEST(npCompressContacts2_stage2)
             }
         blockNum[b] = cnt;
     }
-
-    // reference stable compaction (work order) + field conversions
     std::vector<uint32_t> blockStart(NUM_BLOCKS, 0);
     uint32_t acc = 0;
     for (uint32_t b = 0; b < NUM_BLOCKS; ++b) { blockStart[b] = acc; acc += blockNum[b]; }
     const uint32_t numPairs = acc;
 
-    std::vector<GpuPairOut> refOut(numPairs);
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "npCompressContacts2.spv", "compressContactStage2", 128u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &c2Loader);
+
+    // GPU rebase targets (arbitrary live device buffers big enough not to matter
+    // for pointer arithmetic; we compare full u64 pointers)
+    PxgDevicePtr dCmIn = 0, dOut = 0, dBlock = 0, dRemap = 0, dActor = 0, dPairs = 0, dNum = 0;
+    PxgDevicePtr gPatchBase = 0, gContactBase = 0, gForceBase = 0, gFricBase = 0;
+    if (shim.memAlloc(&dCmIn, N * sizeof(PxgContactManagerInput)) != PxgResult::Success || !dCmIn)
+    { std::printf("  NOTE: no BDA -> skip\n"); return; }
+    shim.memAlloc(&dOut, N * sizeof(PxsContactManagerOutput));
+    shim.memAlloc(&dBlock, NUM_BLOCKS * 4);
+    shim.memAlloc(&dRemap, TABLE * 8);
+    shim.memAlloc(&dActor, TABLE * 8);
+    shim.memAlloc(&dPairs, size_t(numPairs + 16) * sizeof(PxGpuContactPair));
+    shim.memAlloc(&dNum, 4);
+    // small placeholder base allocations (their device addresses are the bases)
+    shim.memAlloc(&gPatchBase, 16);
+    shim.memAlloc(&gContactBase, 16);
+    shim.memAlloc(&gForceBase, 16);
+    shim.memAlloc(&gFricBase, 16);
+
+    shim.memcpyHtoD(dCmIn, cmIn.data(), N * sizeof(PxgContactManagerInput));
+    shim.memcpyHtoD(dOut, outData.data(), N * sizeof(PxsContactManagerOutput));
+    shim.memcpyHtoD(dBlock, blockNum.data(), NUM_BLOCKS * 4);
+    shim.memcpyHtoD(dRemap, remap.data(), TABLE * 8);
+    shim.memcpyHtoD(dActor, actorTab.data(), TABLE * 8);
+    shim.memsetD32(dPairs, 0, size_t(numPairs + 16) * sizeof(PxGpuContactPair) / 4);
+    shim.memsetD32(dNum, 0, 1);
+
+    struct C2Blob
+    {
+        uint64_t inputData, outputData;
+        uint32_t numTotalPairs;
+        uint64_t shapeToRigidRemapTable, transformCacheIdToActorTable, gBlockNumPairs,
+                 cpuCompressedPatchesBase, cpuCompressedContactsBase, cpuForceBufferBase,
+                 gpuCompressedPatchesBase, gpuCompressedContactsBase, gpuForceBufferBase,
+                 gpuFrictionPatchesBase, numPairs, outputPatchs;
+        uint32_t maxOutputPatches;
+    } blob = { dCmIn, dOut, N, dRemap, dActor, dBlock, cpuPatchBase, cpuContactBase, cpuForceBase,
+               gPatchBase, gContactBase, gForceBase, gFricBase, dNum, dPairs, numPairs + 16 };
+    static_assert(sizeof(C2Blob) == 128, "compressStage2 engine blob is 128 bytes");
+
+    PXG_CHECK_MSG(shim.launchKernel(0, NUM_BLOCKS, 1, 1, &blob, sizeof(blob)) == PxgResult::Success,
+                  "launch compressStage2 (engine ABI)");
+    shim.streamSynchronize();
+
+    // reference stable compaction + real pointer arithmetic
+    std::vector<ExpPair> refOut(numPairs);
     for (uint32_t b = 0; b < NUM_BLOCKS; ++b)
     {
         uint32_t rank = 0;
@@ -105,58 +192,46 @@ PXG_TEST(npCompressContacts2_stage2)
                 const uint32_t w = it * BLOCK + tid + numIter * b * BLOCK;
                 if (w >= N || nb[w] == 0) continue;
                 const uint32_t index = blockStart[b] + rank; ++rank;
-                const uint32_t w0 = w * OUTPUT_WORDS;
-                const uint32_t patch = outData[w0 + 0], point = outData[w0 + 2];
-                const uint32_t fOff = outData[w0 + 4], fPres = outData[w0 + 5];
-                GpuPairOut o{};
-                o.ref0 = refs[w * 2 + 0]; o.ref1 = refs[w * 2 + 1];
-                o.node0 = remap[o.ref0]; o.node1 = remap[o.ref1];
-                o.forceOff = fPres ? fOff : 0xFFFFFFFFu;
-                o.fricOff = patch / CONTACT_SIZE * FRIC_SIZE;
-                o.patchOff = patch; o.pointOff = point;
-                o.nbPatches = (outData[w0 + 8] >> 8) & 0xff;
-                o.nbContacts = outData[w0 + 9] & 0xffff;
-                o.actor0 = actorTab[o.ref0]; o.actor1 = actorTab[o.ref1];
-                refOut[index] = o;
+                const uint32_t ref0 = cmIn[w].transformCacheRef0, ref1 = cmIn[w].transformCacheRef1;
+                const uint32_t forceIndex = forcePres[w] ? (forceOffs[w] >> 2) : 0xFFFFFFFFu;
+                ExpPair& o = refOut[index];
+                o.ref0 = ref0; o.ref1 = ref1;
+                o.node0 = remap[ref0]; o.node1 = remap[ref1];
+                o.contactForces = uint64_t(gForceBase) + uint64_t(forceIndex) * 4u;
+                o.frictionPatches = uint64_t(gFricBase) + (uint64_t(patchOffs[w]) / CONTACT_SIZE) * FRIC_SIZE;
+                o.contactPatches = uint64_t(gPatchBase) + uint64_t(patchOffs[w]);
+                o.contactPoints = uint64_t(gContactBase) + uint64_t(pointOffs[w]);
+                o.nbContactsPatches = (nb[w] & 0xffffu) | ((nbPatchesArr[w] & 0xffu) << 16);
+                o.actor0 = actorTab[ref0]; o.actor1 = actorTab[ref1];
             }
     }
 
-    PxgSlangComputeDevice* dev = testDevice();
-    std::vector<GpuPairOut> outInit(numPairs + 16);
-    std::vector<uint32_t> npInit(1, 0);
-    // uint2 refs buffer
-    std::vector<uint32_t> refBuf = refs; // already interleaved (ref0,ref1) per pair
-    PxgBufferHandle bBlock = createBufferFrom(dev, blockNum);
-    PxgBufferHandle bRefs = createBufferFrom(dev, refBuf);
-    PxgBufferHandle bOut = createBufferFrom(dev, outData);
-    PxgBufferHandle bRemap = createBufferFrom(dev, remap);
-    PxgBufferHandle bActor = createBufferFrom(dev, actorTab);
-    PxgBufferHandle bPairs = createBufferFrom(dev, outInit);
-    PxgBufferHandle bNum = createBufferFrom(dev, npInit);
+    std::vector<PxGpuContactPair> gPairs(numPairs);
+    std::vector<uint32_t> gNum(1);
+    shim.memcpyDtoH(gPairs.data(), dPairs, numPairs * sizeof(PxGpuContactPair));
+    shim.memcpyDtoH(gNum.data(), dNum, 4);
 
-    Compress2Params p = { N, numPairs + 16, CONTACT_SIZE, FRIC_SIZE };
-    Kernel k("npCompressContacts2.spv", "compressContactStage2",
-             { 4, 8, 4, 4, 4, (uint32_t)sizeof(GpuPairOut), 4 }, sizeof(Compress2Params));
-    k.dispatch(NUM_BLOCKS, { bBlock, bRefs, bOut, bRemap, bActor, bPairs, bNum }, p);
-    dev->flush();
-
-    const auto gPairs = downloadBuffer<GpuPairOut>(dev, bPairs, numPairs);
-    const auto gNum = downloadBuffer<uint32_t>(dev, bNum, 1);
-
+    auto u64of = [](const void* q) { return uint64_t(reinterpret_cast<uintptr_t>(q)); };
     size_t mm = 0;
     for (uint32_t i = 0; i < numPairs; ++i)
     {
-        const GpuPairOut& r = refOut[i]; const GpuPairOut& v = gPairs[i];
-        if (r.ref0 != v.ref0 || r.ref1 != v.ref1 || r.node0 != v.node0 || r.node1 != v.node1 ||
-            r.forceOff != v.forceOff || r.fricOff != v.fricOff || r.patchOff != v.patchOff ||
-            r.pointOff != v.pointOff || r.nbPatches != v.nbPatches || r.nbContacts != v.nbContacts ||
-            r.actor0 != v.actor0 || r.actor1 != v.actor1) ++mm;
+        const ExpPair& r = refOut[i];
+        const PxGpuContactPair& v = gPairs[i];
+        const uint32_t vNbCp = uint32_t(v.nbContacts) | (uint32_t(v.nbPatches) << 16);
+        if (v.transformCacheRef0 != r.ref0 || v.transformCacheRef1 != r.ref1 ||
+            v.nodeIndex0.getInd() != r.node0 || v.nodeIndex1.getInd() != r.node1 ||
+            u64of(v.actor0) != r.actor0 || u64of(v.actor1) != r.actor1 ||
+            u64of(v.contactForces) != r.contactForces || u64of(v.frictionPatches) != r.frictionPatches ||
+            u64of(v.contactPatches) != r.contactPatches || u64of(v.contactPoints) != r.contactPoints ||
+            vNbCp != r.nbContactsPatches) ++mm;
     }
     PXG_CHECK_MSG(gNum[0] == numPairs, "stage2: numPairs %u != %u", gNum[0], numPairs);
     PXG_CHECK_MSG(mm == 0, "compressContactStage2: %zu compacted-pair mismatches", mm);
     PXG_CHECK_MSG(numPairs > N / 4 && numPairs < N, "stage2: survivor count implausible (%u/%u)", numPairs, N);
 
-    for (PxgBufferHandle h : { bBlock, bRefs, bOut, bRemap, bActor, bPairs, bNum }) dev->destroyBuffer(h);
+    for (PxgDevicePtr h : { dCmIn, dOut, dBlock, dRemap, dActor, dPairs, dNum,
+                            gPatchBase, gContactBase, gForceBase, gFricBase })
+        shim.memFree(h);
 }
 
 } // namespace

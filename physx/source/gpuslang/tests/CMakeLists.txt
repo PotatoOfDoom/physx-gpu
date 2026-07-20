@@ -70,7 +70,9 @@ set(SHADER_COMMON_DEPS
     ${SHADER_DIR}/pxgSlangBpDesc.slang
     ${SHADER_DIR}/pxgSlangSolverDesc.slang
     ${SHADER_DIR}/pxgSlangSimCoreDesc.slang
-    ${SHADER_DIR}/pxgSlangPrepDesc.slang)
+    ${SHADER_DIR}/pxgSlangPrepDesc.slang
+    ${SHADER_DIR}/pxgSlangNpAbi.slang
+    ${SHADER_DIR}/npCvxStage2Core.slang)
 
 # Shaders whose SPIR-V gets NoContraction decorations stamped onto every
 # float arithmetic op (tools/spv_nocontract.py).  slangc emits none and its
@@ -205,9 +207,10 @@ pxg_compile_shader(npCvxCollidePrep cvxCollidePrep)
 pxg_compile_shader(npCvxCollideDecide cvxCollideDecide)
 pxg_compile_shader(npCvxLostFound lostFoundStage1 lostFoundStage2)
 pxg_compile_shader(npCvxWriteStream cvxWriteStream)
-pxg_compile_shader(npCvxFinishContacts cvxFinishContacts)
-pxg_compile_shader(npCvxStage1Refresh cvxStage1Refresh)
-pxg_compile_shader(npCvxStage2Setup cvxStage2Setup)
+pxg_compile_shader(npCvxFinishContacts finishContactsKernel)
+pxg_compile_shader(npCvxStage1Refresh convexConvexNphase_stage1Kernel)
+pxg_compile_shader(npCvxStage2Setup convexConvexNphase_stage2Kernel)
+pxg_compile_shader(npCvxStage2SetupDbg convexConvexNphase_stage2KernelDebug)
 pxg_compile_shader(npCvxPlanePolyIndex cvxPlanePolyIndex)
 pxg_compile_shader(npCvxPlaneRefresh cvxPlaneRefresh)
 pxg_compile_shader(npCvxPlaneGen cvxPlaneGen)
@@ -415,6 +418,8 @@ pxg_compile_shader(npTex3d tex3dSample)
 pxg_compile_shader(npShimAxpy shimAxpy)
 # P5 Step 4: PxgBroadPhaseDesc mirror layout proof (BDA).
 pxg_compile_shader(npBpDescProbe bpDescProbe)
+# P5 Step 4: narrowphase element-struct mirror layout proof (BDA).
+pxg_compile_shader(npNpAbiProbe npAbiProbe)
 # P5 Step 4: PxgSolverCoreDesc / PxgSolverSharedDesc<IterativeSolveDataTGS> /
 # PxgIslandContext mirror layout proof (BDA).
 pxg_compile_shader(npSolverDescProbe solverDescProbe)
@@ -507,6 +512,7 @@ add_executable(gpuslang-tests
     testNpInsertPatch.cpp
     testNpCompressContacts.cpp
     testNpCompressContacts2.cpp
+    testNpAbiLayout.cpp
     testNpTriangle.cpp
     testNpSegTriangle.cpp
     testNpCapTriangle.cpp
@@ -914,7 +920,7 @@ foreach(suite scan radixSort radixSortDesc radixSortGather preIntegration integr
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -973,8 +979,7 @@ set(PXG_HLSL_ENTRIES
     "npMaterialCombine:combineMaterials"
     "npContactPatch:setContactPointAndForcePointers" "npContactPatch:registerContactPatch"
     "npInsertPatch:insertIntoPatchStream"
-    "npCompressContacts:compressContactStage1" "npCompressContacts:updateFrictionPatches"
-    "npCompressContacts2:compressContactStage2"
+    "npCompressContacts:updateFrictionPatches"
     "npTriangle:triPointDistance" "npTriangle:triLineIntersect"
     "npSegTriangle:segTriDistance"
     "npCapTriangle:capTriGenContacts" "npCapTriangle:capTriGenEE"
@@ -1034,9 +1039,6 @@ set(PXG_HLSL_ENTRIES
     "npCvxCollideDecide:cvxCollideDecide"
     "npCvxLostFound:lostFoundStage1"
     "npCvxWriteStream:cvxWriteStream"
-    "npCvxFinishContacts:cvxFinishContacts"
-    "npCvxStage1Refresh:cvxStage1Refresh"
-    "npCvxStage2Setup:cvxStage2Setup"
     "npCvxPlanePolyIndex:cvxPlanePolyIndex"
     "npCvxPlaneRefresh:cvxPlaneRefresh"
     "npCvxPlaneGen:cvxPlaneGen"

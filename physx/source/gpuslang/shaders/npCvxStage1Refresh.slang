@@ -26,184 +26,178 @@
 
 // npCvxStage1Refresh.slang
 //
-// Slang port of convexConvexNphase_stage1Kernel (cudaGJKEPA.cu L2170-2388):
-// the per-pair persistent-manifold refresh + narrowphase-rerun decision that
-// runs before collide().  Per pair (4 CUDA lanes serialized):
-//   - shape/flip setup (flip = type1 < type0 swaps types/scales/blob ptrs/cache
-//     refs); PCM margins: sphere/capsule margin0 = scale0.y with extents0 = 0,
-//     else extents = blobExtents * scale and margin = min(minExtent * 0.25,
-//     toleranceLength * 0.05) (calculatePCMConvexMargin); minMargin =
-//     fminf(margin0, margin1);
-//   - aToB = t1.transformInv(t0) (q = conj(t1.q) * t0.q, p =
-//     t1.q.rotateInv(t0.p - t1.p));
-//   - manifold refresh per slot j < initialNbContacts: localAInB =
-//     aToB.transform(pointA), dist = (localAInB - pointB).dot(localNormal) ->
-//     new pen; keep iff |pointB - (localAInB - localNormal*dist)|^2 <=
-//     (0.8 * minMargin)^2; kept slots compacted in place (unkept trailing slots
-//     keep their previous contents);
-//   - bRunNarrowphase = (newNb != initialNb); when the count is unchanged, the
-//     invalidate_BoxConvex test runs instead: ratio/quat thresholds indexed by
-//     newNb from the sphere (3-entry) or convex (5-entry) tables; deltaP =
-//     max component |curRelPos - preRelPos|; rerun when deltaP > minMargin *
-//     ratio or thresholdQ > quatA.dot(preQuatA) or thresholdQ > quatB.dot(
-//     preQuatB), else when acos(deltaQ)*radius (radiusA = extents0.y for
-//     sphere/capsule -- 0 for a sphere -- else |extents0|, radiusB =
-//     |extents1|) exceeds the position threshold;
-//   - lane-3 counts word: newNbContacts | (bRunNarrowphase ? initialNb << 8 :
-//     0); tempKeepPairArray = bRunNarrowphase; on rerun lanes 0..2 rewrite
-//     moreData with (aToB.p, 0), t0.q, t1.q; lane 3's y/z/w (warm-start data)
-//     pass through unchanged.
+// P5 Step 4 (BDA, engine launch path): convexConvexNphase_stage1Kernel
+// (cudaGJKEPA.cu L2170-2388) on the exact engine ABI —
+//   (PxU32 numTests, PxReal toleranceLength, const PxgContactManagerInput*,
+//    const PxsCachedTransform*, PxgShape*, PxgPersistentContactManifold*,
+//    PxU32* tempKeepPairArray)   argSizes {4,4,8,8,8,8,8} -> 48-byte blob.
+// Engine grid (PxgNarrowphaseCore.cpp ~L616): blockDim (32,4),
+// numBlocks = ceil(numTests*4 / 128) — 4 CUDA lanes per pair,
+// globalElementIndex = flatTid >> 2, tidInGroup = threadIdx.x % 4.
 //
-// Blob extents arrive as direct inputs (the blob byte reads are tranche 142).
+// The per-pair arithmetic is the tranche-153 bound-buffer port VERBATIM
+// (bit-verified there); only the parameter plumbing and data access changed:
+//   - shapes/transforms/manifold/keep-array are read and written through
+//     Ptr<> from the raw device addresses in the push blob;
+//   - the convex blob extents are read from shape.hullOrMeshPtr + 32
+//     (sizeof(float4) + sizeof(uint4)), the real cooked-hull layout, instead
+//     of arriving pre-extracted;
+//   - the CUDA's 4 cooperating lanes are serialized on lane 0 of each group
+//     (the intra-group shuffles/ballot become straight-line code; lanes 1-3
+//     return after the numTests guard).  Memory effects are identical: the
+//     kept slots are compacted in place (reads complete before writes, as
+//     the warp-synchronous CUDA guarantees), unkept trailing slots keep
+//     their previous contents, all four moreData uint4s are stored back
+//     (lane 3's y/z/w warm-start words pass through), and
+//     tempKeepPairArray[pair] = bRunNarrowphase.
+//
+// Per pair: flip = type1 < type0 swaps types/scales/blob ptrs/cache refs;
+// PCM margins (sphere/capsule margin0 = scale0.y, extents0 = 0); aToB =
+// t1.transformInv(t0); refresh keeps slot j iff the reprojected 2D distance
+// <= (0.8 * minMargin)^2; bRunNarrowphase = count changed, else the
+// invalidate_BoxConvex ratio/quat-threshold test; on rerun lanes 0..2
+// rewrite moreData with (aToB.p, 0), t0.q, t1.q; the counts word packs
+// newNb | (bRun ? initialNb << 8 : 0).
 
-static const float FLT_MAXV = 3.4028235e38f;
-static const uint EGT_SPHERE = 0u;
-static const uint EGT_CAPSULE = 2u;
-static const float MESH_MANIFOLD_EPSILON = 0.05f;
-static const float BOX_MARGIN_RATIO = 0.25f;
+import pxgSlangNpAbi;
 
 static const float thresholdsConvex[5] = { 0.5f, 0.125f, 0.25f, 0.375f, 0.375f };
 static const float quatThresholdsConvex[5] = { 0.9998f, 0.9999f, 0.9999f, 0.9999f, 0.9999f };
 static const float thresholdsSphere[3] = { 0.5f, 0.1f, 0.75f };
 static const float quatThresholdsSphere[3] = { 0.9995f, 0.9999f, 0.9997f };
 
-float3 quatRotate(float4 q, float3 v)
-{
-    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
-    const float w2 = q.w * q.w - 0.5f;
-    const float d2 = q.x * vx + q.y * vy + q.z * vz;
-    return float3(vx * w2 + (q.y * vz - q.z * vy) * q.w + q.x * d2,
-                  vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * d2,
-                  vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * d2);
-}
-float3 quatRotateInv(float4 q, float3 v)
-{
-    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
-    const float w2 = q.w * q.w - 0.5f;
-    const float d2 = q.x * vx + q.y * vy + q.z * vz;
-    return float3(vx * w2 - (q.y * vz - q.z * vy) * q.w + q.x * d2,
-                  vy * w2 - (q.z * vx - q.x * vz) * q.w + q.y * d2,
-                  vz * w2 - (q.x * vy - q.y * vx) * q.w + q.z * d2);
-}
-// PxQuat operator* (this = a, arg = b)
-float4 quatMul(float4 a, float4 b)
-{
-    return float4(a.w * b.x + b.w * a.x + a.y * b.z - a.z * b.y,
-                  a.w * b.y + b.w * a.y + a.z * b.x - a.x * b.z,
-                  a.w * b.z + b.w * a.z + a.x * b.y - a.y * b.x,
-                  a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z);
-}
+static const uint EGT_SPHERE = 0u;
+static const uint EGT_CAPSULE = 2u;
+
 float quatDot(float4 a, float4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
 
-float calculatePCMConvexMargin(float3 extents, float toleranceLength)
+// Engine ABI blob: {4,4,8,8,8,8,8} at natural alignment = 48 bytes.
+struct Stage1Params
 {
-    const float mn = min(min(extents.x, extents.y), extents.z);
-    const float toleranceMargin = toleranceLength * MESH_MANIFOLD_EPSILON;
-    return min(mn * BOX_MARGIN_RATIO, toleranceMargin);
+    uint numTests;               // @0
+    float toleranceLength;       // @4
+    uint64_t cmInputs;           // @8   const PxgContactManagerInput*
+    uint64_t transformCache;     // @16  const PxsCachedTransform*
+    uint64_t shapes;             // @24  PxgShape*
+    uint64_t cmManifolds;        // @32  PxgPersistentContactManifold*
+    uint64_t tempKeepPairArray;  // @40  PxU32*
 }
-
-struct Stage1In
-{
-    uint4 meta;        // x=type0 y=type1 z,w pad
-    float4 scale0;     // .xyz; .w = toleranceLength
-    float4 scale1;     // .xyz
-    float4 extents0;   // raw blob extents A (.xyz)
-    float4 extents1;   // raw blob extents B (.xyz)
-    float4 t0q, t0p;   // transformCache[ref0]
-    float4 t1q, t1p;   // transformCache[ref1]
-    float4 mNp[4];     // manifold normal+pen
-    float4 mA[4];      // manifold A points
-    float4 mB[4];      // manifold B points
-    uint4 moreData0;   // mRelativePos bits (x,y,z), w
-    uint4 moreData1;   // mQuatA bits
-    uint4 moreData2;   // mQuatB bits
-    uint4 moreData3;   // x=mNbContacts y=mNbWarmStartPoints z=mWarmStartA w=mWarmStartB
-}
-
-struct Stage1Out
-{
-    float4 mNp[4];     // manifold after refresh/compaction
-    float4 mA[4];
-    float4 mB[4];
-    uint4 moreData0;   // after
-    uint4 moreData1;
-    uint4 moreData2;
-    uint4 moreData3;
-    uint4 result;      // x=tempKeepPair (bRunNarrowphase) y=newNbContacts z,w pad
-}
-
-struct Stage1Params { uint numTests; }
 
 [[vk::push_constant]]
-ConstantBuffer<Stage1Params> gParams;
-
-RWStructuredBuffer<Stage1In> gIn;    // binding 0
-RWStructuredBuffer<Stage1Out> gOut;  // binding 1
+ConstantBuffer<Stage1Params> gS1;
 
 [shader("compute")]
-[numthreads(64, 1, 1)]
-void cvxStage1Refresh(uint3 dtid : SV_DispatchThreadID)
+[numthreads(32, 4, 1)]
+void convexConvexNphase_stage1Kernel(uint3 groupID : SV_GroupID, uint3 tid : SV_GroupThreadID)
 {
-    const uint t = dtid.x;
-    if (t >= gParams.numTests) return;
-    const Stage1In s = gIn[t];
+    // flatTid = blockIdx.x*blockDim.x*blockDim.y + threadIdx.y*blockDim.x + threadIdx.x
+    const uint flatTid = groupID.x * 128u + tid.y * 32u + tid.x;
+    const uint globalElementIndex = flatTid >> 2u;
 
-    uint type0 = s.meta.x;
-    uint type1 = s.meta.y;
-    float3 scale0 = s.scale0.xyz;
-    float3 scale1 = s.scale1.xyz;
-    float3 ext0raw = s.extents0.xyz;
-    float3 ext1raw = s.extents1.xyz;
-    const float toleranceLength = s.scale0.w;
-    float4 t0q = s.t0q; float3 t0p = s.t0p.xyz;
-    float4 t1q = s.t1q; float3 t1p = s.t1p.xyz;
+    if (globalElementIndex >= gS1.numTests)
+        return;
+
+    const uint tidInGroup = tid.x % 4u;
+    if (tidInGroup != 0u)
+        return; // serialized: lane 0 of each group performs all 4 lanes' work
+
+    const float toleranceLength = gS1.toleranceLength;
+
+    const PxgContactManagerInputGpu input =
+        (Ptr<PxgContactManagerInputGpu>(gS1.cmInputs))[globalElementIndex];
+
+    Ptr<PxgShapeGpu> shapes = Ptr<PxgShapeGpu>(gS1.shapes);
+    const PxgShapeGpu shape0 = shapes[input.shapeRef0];
+    const PxgShapeGpu shape1 = shapes[input.shapeRef1];
+
+    uint64_t convexPtrA = shape0.hullOrMeshPtr;
+    uint64_t convexPtrB = shape1.hullOrMeshPtr;
+    float3 scale0 = float3(shape0.scaleX, shape0.scaleY, shape0.scaleZ);
+    float3 scale1 = float3(shape1.scaleX, shape1.scaleY, shape1.scaleZ);
+    uint type0 = shape0.type;
+    uint type1 = shape1.type;
+    uint transformCacheRef0 = input.transformCacheRef0;
+    uint transformCacheRef1 = input.transformCacheRef1;
 
     const bool flip = type1 < type0;
     if (flip)
     {
-        const uint tt = type0; type0 = type1; type1 = tt;
+        uint tu = type0; type0 = type1; type1 = tu;
         const float3 ts = scale0; scale0 = scale1; scale1 = ts;
-        const float3 te = ext0raw; ext0raw = ext1raw; ext1raw = te;
-        const float4 tq = t0q; t0q = t1q; t1q = tq;
-        const float3 tp = t0p; t0p = t1p; t1p = tp;
+        const uint64_t tp = convexPtrA; convexPtrA = convexPtrB; convexPtrB = tp;
+        tu = transformCacheRef0; transformCacheRef0 = transformCacheRef1; transformCacheRef1 = tu;
     }
 
     float convexMargin0;
     float3 extents0;
     if (type0 == EGT_SPHERE || type0 == EGT_CAPSULE)
     {
-        convexMargin0 = scale0.y;
+        convexMargin0 = scale0.y; // sphere radius
         extents0 = float3(0, 0, 0);
     }
     else
     {
-        extents0 = float3(ext0raw.x * scale0.x, ext0raw.y * scale0.y, ext0raw.z * scale0.z);
-        convexMargin0 = calculatePCMConvexMargin(extents0, toleranceLength);
+        // extents float4 at blob + sizeof(float4) + sizeof(uint4)
+        const float4 extents0_f4 = (Ptr<float4>(convexPtrA + 32u))[0];
+        extents0 = float3(extents0_f4.x * scale0.x, extents0_f4.y * scale0.y, extents0_f4.z * scale0.z);
+        convexMargin0 = npAbiPcmConvexMargin(extents0, toleranceLength);
     }
-    const float3 extents1 = float3(ext1raw.x * scale1.x, ext1raw.y * scale1.y, ext1raw.z * scale1.z);
-    const float convexMargin1 = calculatePCMConvexMargin(extents1, toleranceLength);
+    const float4 extents1_f4 = (Ptr<float4>(convexPtrB + 32u))[0];
+    const float3 extents1 = float3(extents1_f4.x * scale1.x, extents1_f4.y * scale1.y, extents1_f4.z * scale1.z);
+    const float convexMargin1 = npAbiPcmConvexMargin(extents1, toleranceLength);
     const float minMargin = min(convexMargin0, convexMargin1);
 
+    Ptr<PxsCachedTransformGpu> cache = Ptr<PxsCachedTransformGpu>(gS1.transformCache);
+    const PxsCachedTransformGpu tc0 = cache[transformCacheRef0];
+    const PxsCachedTransformGpu tc1 = cache[transformCacheRef1];
+    const float4 t0q = float4(tc0.qx, tc0.qy, tc0.qz, tc0.qw);
+    const float3 t0p = float3(tc0.px, tc0.py, tc0.pz);
+    const float4 t1q = float4(tc1.qx, tc1.qy, tc1.qz, tc1.qw);
+    const float3 t1p = float3(tc1.px, tc1.py, tc1.pz);
+
     // aToB = t1.transformInv(t0)
-    const float4 aToBq = quatMul(float4(-t1q.x, -t1q.y, -t1q.z, t1q.w), t0q);
-    const float3 aToBp = quatRotateInv(t1q, t0p - t1p);
+    const float4 aToBq = npAbiQuatMul(float4(-t1q.x, -t1q.y, -t1q.z, t1q.w), t0q);
+    const float3 aToBp = npAbiQuatRotateInv(t1q, t0p - t1p);
 
-    const uint initialNb = s.moreData3.x;
+    Ptr<PxgPersistentContactManifoldGpu> manifold =
+        Ptr<PxgPersistentContactManifoldGpu>(gS1.cmManifolds + uint64_t(globalElementIndex) * 256u);
 
-    // refresh + keep + in-place compaction (unkept trailing slots unchanged)
-    Stage1Out r;
-    for (uint j = 0u; j < 4u; ++j) { r.mNp[j] = s.mNp[j]; r.mA[j] = s.mA[j]; r.mB[j] = s.mB[j]; }
+    // the 4 lanes' moreData uint4 reads (words 0-15 of the manifold tail)
+    const float4 moreRelPos = manifold[0].relativePos;
+    const float4 moreQuatA = manifold[0].quatA;
+    const float4 moreQuatB = manifold[0].quatB;
+    const uint initialNbContacts = manifold[0].nbContacts;
+    const uint moreW13 = manifold[0].nbWarmStartPoints;
+    const uint moreW14 = manifold[0].warmStartA;
+    const uint moreW15 = manifold[0].warmStartB;
 
-    float4 keptNp[4], keptA[4], keptB[4];
-    uint newNb = 0u;
+    // refresh + keep + in-place compaction.  All 4 lanes' reads complete
+    // before any write (the CUDA ballot separates them), so read first.
+    float4 srcNp[4], srcA[4], srcB[4];
     for (uint j = 0u; j < 4u; ++j)
     {
-        if (j >= initialNb) break;
-        const float4 pointA = s.mA[j];
-        const float4 pointB = s.mB[j];
-        float4 pointNormPen = s.mNp[j];
+        if (j < initialNbContacts)
+        {
+            srcNp[j] = manifold[0].localNormalPen[j];
+            srcA[j] = manifold[0].localContactA[j];
+            srcB[j] = manifold[0].localContactB[j];
+        }
+        else
+        {
+            srcNp[j] = float4(0, 0, 0, 0); srcA[j] = float4(0, 0, 0, 0); srcB[j] = float4(0, 0, 0, 0);
+        }
+    }
 
-        const float3 localAInB = quatRotate(aToBq, pointA.xyz) + aToBp;
+    uint newNbContacts = 0u;
+    for (uint j = 0u; j < 4u; ++j)
+    {
+        if (j >= initialNbContacts)
+            break;
+        const float4 pointA = srcA[j];
+        const float4 pointB = srcB[j];
+        float4 pointNormPen = srcNp[j];
+
+        const float3 localAInB = npAbiQuatRotate(aToBq, pointA.xyz) + aToBp;
         const float3 localBInB = pointB.xyz;
         const float3 v = localAInB - localBInB;
         const float3 localNormal = pointNormPen.xyz;
@@ -218,44 +212,42 @@ void cvxStage1Refresh(uint3 dtid : SV_DispatchThreadID)
 
         if (distance2d <= sqThreshold)
         {
-            keptNp[newNb] = pointNormPen; keptA[newNb] = pointA; keptB[newNb] = pointB;
-            ++newNb;
+            manifold[0].localContactB[newNbContacts] = pointB;
+            manifold[0].localContactA[newNbContacts] = pointA;
+            manifold[0].localNormalPen[newNbContacts] = pointNormPen;
+            ++newNbContacts;
         }
     }
-    for (uint j = 0u; j < newNb; ++j)
-    {
-        r.mNp[j] = keptNp[j]; r.mA[j] = keptA[j]; r.mB[j] = keptB[j];
-    }
 
-    bool bRun = newNb != initialNb;
+    bool bRunNarrowphase = newNbContacts != initialNbContacts;
 
-    if (!bRun)
+    if (!bRunNarrowphase)
     {
-        const float3 preRelPos = float3(asfloat(s.moreData0.x), asfloat(s.moreData0.y), asfloat(s.moreData0.z));
-        const float4 preQuatA = float4(asfloat(s.moreData1.x), asfloat(s.moreData1.y), asfloat(s.moreData1.z), asfloat(s.moreData1.w));
-        const float4 preQuatB = float4(asfloat(s.moreData2.x), asfloat(s.moreData2.y), asfloat(s.moreData2.z), asfloat(s.moreData2.w));
+        const float3 relativePos = moreRelPos.xyz;
+        const float4 quatA = moreQuatA;
+        const float4 quatB = moreQuatB;
 
         const float radiusB = sqrt(extents1.x * extents1.x + extents1.y * extents1.y + extents1.z * extents1.z);
 
         float ratio, thresholdQ, radiusA;
         if (type0 == EGT_SPHERE || type0 == EGT_CAPSULE)
         {
-            radiusA = extents0.y; // 0 for a sphere/capsule (extents0 = 0)
-            ratio = thresholdsSphere[newNb];
-            thresholdQ = quatThresholdsSphere[newNb];
+            radiusA = extents0.y; // 0 (extents0 zeroed on the sphere/capsule path)
+            ratio = thresholdsSphere[newNbContacts];
+            thresholdQ = quatThresholdsSphere[newNbContacts];
         }
         else
         {
             radiusA = sqrt(extents0.x * extents0.x + extents0.y * extents0.y + extents0.z * extents0.z);
-            ratio = thresholdsConvex[newNb];
-            thresholdQ = quatThresholdsConvex[newNb];
+            ratio = thresholdsConvex[newNbContacts];
+            thresholdQ = quatThresholdsConvex[newNbContacts];
         }
 
         const float thresholdP = minMargin * ratio;
-        const float3 deltaPv = aToBp - preRelPos;
+        const float3 deltaPv = aToBp - relativePos;
         const float deltaP = max(abs(deltaPv.x), max(abs(deltaPv.y), abs(deltaPv.z)));
-        const float deltaQA = quatDot(t0q, preQuatA);
-        const float deltaQB = quatDot(t1q, preQuatB);
+        const float deltaQA = quatDot(t0q, quatA);
+        const float deltaQB = quatDot(t1q, quatB);
 
         bool generateContacts = (deltaP > thresholdP) || (thresholdQ > deltaQA) || (thresholdQ > deltaQB);
         if (!generateContacts)
@@ -266,21 +258,27 @@ void cvxStage1Refresh(uint3 dtid : SV_DispatchThreadID)
             const float travelDistB = bRadian * radiusB;
             generateContacts = (travelDistA > thresholdP) || (travelDistB > thresholdP);
         }
-        bRun = generateContacts;
+        bRunNarrowphase = generateContacts;
     }
 
-    // moreData writeback
-    r.moreData0 = s.moreData0;
-    r.moreData1 = s.moreData1;
-    r.moreData2 = s.moreData2;
-    r.moreData3 = s.moreData3;
-    r.moreData3.x = newNb | (bRun ? (initialNb << 8u) : 0u);
-    if (bRun)
+    // lane 3: counts word + keep-pair flag; lanes 0..2 on rerun: moreData rewrite.
+    // All four moreData uint4s are stored back (lane 3's y/z/w pass through).
+    (Ptr<uint>(gS1.tempKeepPairArray))[globalElementIndex] = bRunNarrowphase ? 1u : 0u;
+
+    if (bRunNarrowphase)
     {
-        r.moreData0 = uint4(asuint(aToBp.x), asuint(aToBp.y), asuint(aToBp.z), 0u);
-        r.moreData1 = uint4(asuint(t0q.x), asuint(t0q.y), asuint(t0q.z), asuint(t0q.w));
-        r.moreData2 = uint4(asuint(t1q.x), asuint(t1q.y), asuint(t1q.z), asuint(t1q.w));
+        manifold[0].relativePos = float4(aToBp.x, aToBp.y, aToBp.z, asfloat(0u));
+        manifold[0].quatA = t0q;
+        manifold[0].quatB = t1q;
     }
-    r.result = uint4(bRun ? 1u : 0u, newNb, 0u, 0u);
-    gOut[t] = r;
+    else
+    {
+        manifold[0].relativePos = moreRelPos;
+        manifold[0].quatA = moreQuatA;
+        manifold[0].quatB = moreQuatB;
+    }
+    manifold[0].nbContacts = newNbContacts | (bRunNarrowphase ? (initialNbContacts << 8u) : 0u);
+    manifold[0].nbWarmStartPoints = moreW13;
+    manifold[0].warmStartA = moreW14;
+    manifold[0].warmStartB = moreW15;
 }

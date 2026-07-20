@@ -24,14 +24,26 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// Verification of npCvxStage1Refresh.slang: convexConvexNphase_stage1Kernel --
-// PCM margins, aToB, manifold refresh + in-place compaction, the rerun decision
-// (count change or invalidate_BoxConvex), counts word and moreData rewrite.
-// Reference transcribes the CUDA; manifold floats to tolerance, counts/flags
-// exact, keep/invalidate boundary near-ties margin-skipped.  Sphere/capsule
-// fixtures cap contacts at 2 (the sphere threshold tables have 3 entries).
+// P5 Step 4: convexConvexNphase_stage1Kernel on the ENGINE ABI, driven
+// through PxgCudaShim exactly as PxgNarrowphaseCore.cpp launches it —
+// argument blob {4,4,8,8,8,8,8} (48 bytes), grid ceil(numTests*4/128) x
+// (32,4) blocks, REAL PxgContactManagerInput/PxgShape/PxsCachedTransform/
+// PxgPersistentContactManifold arrays and real cooked-hull blobs (extents
+// float4 at hullPtr + 32) at live device addresses.  The CPU reference is
+// the tranche-153 transcription of the CUDA (PCM margins, aToB, manifold
+// refresh + in-place compaction, the rerun decision, counts word + moreData
+// rewrite); manifold floats to tolerance, counts/flags exact, keep/
+// invalidate near-ties margin-skipped.  The last GUARD pairs sit beyond
+// numTests: their manifolds and keep slots must keep their sentinels.
 
 #include "pxgTestFramework.h"
+#include "PxgCudaShim.h"
+
+#include "PxNodeIndex.h"
+#include "PxgContactManager.h"
+#include "PxgConvexConvexShape.h"
+#include "PxgPersistentContactManifold.h"
+#include "PxsTransformCache.h"
 
 #include <cmath>
 #include <cstdint>
@@ -42,6 +54,10 @@
 namespace
 {
 using namespace pxgtest;
+using physx::gpuslang::PxgCudaShim;
+using physx::gpuslang::PxgKernelDef;
+using physx::gpuslang::PxgDevicePtr;
+using physx::gpuslang::PxgResult;
 
 struct F4 { float x, y, z, w; };
 struct U4 { uint32_t x, y, z, w; };
@@ -77,12 +93,12 @@ static const float qthS[3] = { 0.9995f, 0.9999f, 0.9997f };
 
 static float pcmMargin(const V3& e, float tol) { return std::fmin(std::fmin(std::fmin(e.x, e.y), e.z) * 0.25f, tol * 0.05f); }
 
-static void refStage1(const S1In& s, S1Out& o, bool& marg)
+// CUDA transcription (unchanged from the bound-buffer tranche).
+static void refStage1(const S1In& s, float tol, S1Out& o, bool& marg)
 {
     uint32_t type0 = s.meta.x, type1 = s.meta.y;
     V3 sc0 = v3(s.scale0), sc1 = v3(s.scale1);
     V3 e0r = v3(s.extents0), e1r = v3(s.extents1);
-    const float tol = s.scale0.w;
     F4 t0q = s.t0q, t1q = s.t1q;
     V3 t0p = v3(s.t0p), t1p = v3(s.t1p);
     if (type1 < type0)
@@ -169,148 +185,269 @@ static void refStage1(const S1In& s, S1Out& o, bool& marg)
 }
 
 static bool eqF4(const F4& a, const F4& b) { return almostEqual(a.x, b.x, 2e-4f, 2e-5f) && almostEqual(a.y, b.y, 2e-4f, 2e-5f) && almostEqual(a.z, b.z, 2e-4f, 2e-5f) && almostEqual(a.w, b.w, 2e-4f, 2e-4f); }
-static bool eqU4f(const U4& a, const U4& b) // uint4 holding float bits: compare as floats to tolerance
+static bool eqU4f(const U4& a, const U4& b)
 { return almostEqual(u2f(a.x), u2f(b.x), 2e-4f, 2e-5f) && almostEqual(u2f(a.y), u2f(b.y), 2e-4f, 2e-5f) && almostEqual(u2f(a.z), u2f(b.z), 2e-4f, 2e-5f); }
 
-PXG_TEST(npCvxStage1Refresh_refresh)
+static std::vector<uint8_t> s1Loader(const char* file) { return loadShaderBlob(file); }
+
+PXG_TEST(npCvxStage1Refresh_engineAbi)
 {
+    using namespace physx;
+
     std::mt19937 rng(153001);
-    const uint32_t N = 12000;
     auto rf = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng() % 1000000) / 1000000.f); };
     auto randQuat = [&]() { V3 ax = unit(V3{ rf(-1, 1), rf(-1, 1), rf(-1, 1) }); const float a = rf(-3.1f, 3.1f); return F4{ ax.x * std::sin(a * .5f), ax.y * std::sin(a * .5f), ax.z * std::sin(a * .5f), std::cos(a * .5f) }; };
 
-    std::vector<S1In> in(N);
-    std::vector<uint8_t> skip(N, 0);
-    std::vector<S1Out> ref(N);
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "npCvxStage1Refresh.spv", "convexConvexNphase_stage1Kernel", 48u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &s1Loader);
+
+    // toleranceLength is one PUSH scalar per launch (the fixture's only
+    // per-test scalar in the bound-buffer form): three launches sweep it.
+    const float tols[3] = { 0.75f, 1.6f, 3.2f };
+    const uint32_t N = 4000;   // pairs per launch (incl. GUARD tail)
+    const uint32_t GUARD = 5;  // beyond numTests: must stay untouched
+
     size_t nSkip = 0, cRun = 0, cNoRun = 0, cInvalPath = 0, cSphere = 0;
 
-    for (uint32_t i = 0; i < N; ++i)
+    for (uint32_t launch = 0; launch < 3; ++launch)
     {
-        S1In s{};
-        const bool sphereish = (i % 4 == 0);
-        if (sphereish) ++cSphere;
-        const bool flipped = (i % 5 == 1); // type1 < type0 -> flip path
-        const uint32_t tA = sphereish ? (i % 8 == 0 ? 0u : 2u) : 4u;
-        s.meta = flipped ? U4{ 4u, tA == 4u ? 3u : tA, 0, 0 } : U4{ tA, 4u, 0, 0 };
-        s.scale0 = F4{ rf(0.5f, 2), rf(0.5f, 2), rf(0.5f, 2), rf(0.5f, 4) }; // .w = toleranceLength
-        s.scale1 = F4{ rf(0.5f, 2), rf(0.5f, 2), rf(0.5f, 2), 0 };
-        s.extents0 = F4{ rf(0.3f, 2), rf(0.3f, 2), rf(0.3f, 2), 0 };
-        s.extents1 = F4{ rf(0.3f, 2), rf(0.3f, 2), rf(0.3f, 2), 0 };
-        s.t0q = randQuat(); s.t1q = randQuat();
-        s.t0p = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), 0 };
-        s.t1p = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), 0 };
+        const float tol = tols[launch];
+        const uint32_t numTests = N - GUARD;
 
-        const uint32_t nb = sphereish ? (rng() % 3) : (rng() % 5); // sphere tables have 3 entries
-        // post-flip transforms determine aToB; construct pointA consistently so
-        // a controlled fraction of slots survives the refresh keep test
+        std::vector<S1In> in(N);
+        std::vector<uint8_t> skip(N, 0);
+        std::vector<S1Out> ref(N);
+
+        for (uint32_t i = 0; i < N; ++i)
         {
-            F4 ft0q = s.t0q, ft1q = s.t1q; V3 ft0p = v3(s.t0p), ft1p = v3(s.t1p);
-            uint32_t ty0 = s.meta.x, ty1 = s.meta.y;
-            if (ty1 < ty0) { std::swap(ft0q, ft1q); std::swap(ft0p, ft1p); }
-            const F4 fc{ -ft1q.x, -ft1q.y, -ft1q.z, ft1q.w };
-            const F4 aq = qMul(fc, ft0q);
-            const V3 ap = qRotInv(ft1q, sub(ft0p, ft1p));
-            const F4 aqc{ -aq.x, -aq.y, -aq.z, aq.w };
+            S1In s{};
+            const bool sphereish = (i % 4 == 0);
+            if (sphereish) ++cSphere;
+            const bool flipped = (i % 5 == 1); // type1 < type0 -> flip path
+            const uint32_t tA = sphereish ? (i % 8 == 0 ? 0u : 2u) : 4u;
+            s.meta = flipped ? U4{ 4u, tA == 4u ? 3u : tA, 0, 0 } : U4{ tA, 4u, 0, 0 };
+            s.scale0 = F4{ rf(0.5f, 2), rf(0.5f, 2), rf(0.5f, 2), 0 };
+            s.scale1 = F4{ rf(0.5f, 2), rf(0.5f, 2), rf(0.5f, 2), 0 };
+            s.extents0 = F4{ rf(0.3f, 2), rf(0.3f, 2), rf(0.3f, 2), 0 };
+            s.extents1 = F4{ rf(0.3f, 2), rf(0.3f, 2), rf(0.3f, 2), 0 };
+            s.t0q = randQuat(); s.t1q = randQuat();
+            s.t0p = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), 0 };
+            s.t1p = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), 0 };
+
+            const uint32_t nb = sphereish ? (rng() % 3) : (rng() % 5); // sphere tables have 3 entries
+            {
+                F4 ft0q = s.t0q, ft1q = s.t1q; V3 ft0p = v3(s.t0p), ft1p = v3(s.t1p);
+                uint32_t ty0 = s.meta.x, ty1 = s.meta.y;
+                if (ty1 < ty0) { std::swap(ft0q, ft1q); std::swap(ft0p, ft1p); }
+                const F4 fc{ -ft1q.x, -ft1q.y, -ft1q.z, ft1q.w };
+                const F4 aq = qMul(fc, ft0q);
+                const V3 ap = qRotInv(ft1q, sub(ft0p, ft1p));
+                const F4 aqc{ -aq.x, -aq.y, -aq.z, aq.w };
+                for (int j = 0; j < 4; ++j)
+                {
+                    const V3 n = unit(V3{ rf(-1, 1), rf(-1, 1), rf(-1, 1) });
+                    s.mNp[j] = F4{ n.x, n.y, n.z, rf(-0.5f, 0.2f) };
+                    const V3 b{ rf(-1, 1), rf(-1, 1), rf(-1, 1) };
+                    s.mB[j] = F4{ b.x, b.y, b.z, 0 };
+                    if (rng() % 5 == 0)
+                    {
+                        s.mA[j] = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), 0 };
+                    }
+                    else
+                    {
+                        const float d = rf(0.f, 0.05f);
+                        const V3 tgt = add(b, V3{ rf(-d, d), rf(-d, d), rf(-d, d) });
+                        const V3 pa = qRot(aqc, sub(tgt, ap));
+                        s.mA[j] = F4{ pa.x, pa.y, pa.z, 0 };
+                    }
+                }
+            }
+
+            const V3 curRel = qRotInv(s.t1q, sub(v3(s.t0p), v3(s.t1p)));
+            if (i % 2 == 0)
+            {
+                const float eps = rf(0, 0.02f);
+                s.md0 = U4{ f2u(curRel.x + rf(-eps, eps)), f2u(curRel.y + rf(-eps, eps)), f2u(curRel.z + rf(-eps, eps)), 0 };
+                F4 pqa = s.t0q, pqb = s.t1q;
+                if (i % 8 == 4)
+                {
+                    const V3 ax = unit(V3{ rf(-1, 1), rf(-1, 1), rf(-1, 1) });
+                    const float a = rf(0.004f, 0.07f);
+                    const F4 rot{ ax.x * std::sin(a * .5f), ax.y * std::sin(a * .5f), ax.z * std::sin(a * .5f), std::cos(a * .5f) };
+                    if (i % 16 == 4) pqa = qMul(rot, pqa); else pqb = qMul(rot, pqb);
+                }
+                s.md1 = U4{ f2u(pqa.x), f2u(pqa.y), f2u(pqa.z), f2u(pqa.w) };
+                s.md2 = U4{ f2u(pqb.x), f2u(pqb.y), f2u(pqb.z), f2u(pqb.w) };
+            }
+            else
+            {
+                const F4 qa = randQuat(), qb = randQuat();
+                s.md0 = U4{ f2u(rf(-2, 2)), f2u(rf(-2, 2)), f2u(rf(-2, 2)), 0 };
+                s.md1 = U4{ f2u(qa.x), f2u(qa.y), f2u(qa.z), f2u(qa.w) };
+                s.md2 = U4{ f2u(qb.x), f2u(qb.y), f2u(qb.z), f2u(qb.w) };
+            }
+            s.md3 = U4{ nb, rng() % 5, rng(), rng() };
+            in[i] = s;
+
+            if (i < numTests)
+            {
+                bool marg = false;
+                refStage1(s, tol, ref[i], marg);
+                skip[i] = marg ? 1u : 0u;
+                if (marg) { ++nSkip; continue; }
+                if (ref[i].result.x) ++cRun; else ++cNoRun;
+                if (ref[i].result.y == s.md3.x && s.md3.x != 0) ++cInvalPath;
+            }
+        }
+
+        // ---- marshal the fixtures into REAL engine arrays ----
+        std::vector<PxgContactManagerInput> cmIn(N);
+        std::vector<PxgShape> shapes(2 * N);
+        std::vector<PxsCachedTransform> cache(2 * N);
+        std::vector<PxgPersistentContactManifold> mfs(N);
+        std::vector<uint8_t> blobs(size_t(2) * N * 64, 0);
+        std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+        std::memset(cache.data(), 0, cache.size() * sizeof(PxsCachedTransform));
+        std::memset(mfs.data(), 0xCD, mfs.size() * sizeof(PxgPersistentContactManifold));
+
+        PxgDevicePtr dBlobs = 0;
+        PXG_CHECK_MSG(shim.memAlloc(&dBlobs, blobs.size()) == PxgResult::Success, "memAlloc blobs");
+        if (!dBlobs) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            const S1In& s = in[i];
+            cmIn[i].shapeRef0 = 2 * i;
+            cmIn[i].shapeRef1 = 2 * i + 1;
+            cmIn[i].transformCacheRef0 = 2 * i;
+            cmIn[i].transformCacheRef1 = 2 * i + 1;
+
+            PxgShape& sh0 = shapes[2 * i];
+            PxgShape& sh1 = shapes[2 * i + 1];
+            sh0.type = s.meta.x;
+            sh1.type = s.meta.y;
+            sh0.scale.scale = PxVec3(s.scale0.x, s.scale0.y, s.scale0.z);
+            sh1.scale.scale = PxVec3(s.scale1.x, s.scale1.y, s.scale1.z);
+            sh0.scale.rotation = PxQuat(PxIdentity);
+            sh1.scale.rotation = PxQuat(PxIdentity);
+            sh0.materialIndex = 0;
+            sh1.materialIndex = 0;
+            sh0.hullOrMeshPtr = size_t(dBlobs + uint64_t(2 * i) * 64u);
+            sh1.hullOrMeshPtr = size_t(dBlobs + uint64_t(2 * i + 1) * 64u);
+            // blob extents float4 at +32
+            const F4 e0{ s.extents0.x, s.extents0.y, s.extents0.z, 0 };
+            const F4 e1{ s.extents1.x, s.extents1.y, s.extents1.z, 0 };
+            std::memcpy(&blobs[size_t(2 * i) * 64 + 32], &e0, 16);
+            std::memcpy(&blobs[size_t(2 * i + 1) * 64 + 32], &e1, 16);
+
+            cache[2 * i].transform.q = PxQuat(s.t0q.x, s.t0q.y, s.t0q.z, s.t0q.w);
+            cache[2 * i].transform.p = PxVec3(s.t0p.x, s.t0p.y, s.t0p.z);
+            cache[2 * i + 1].transform.q = PxQuat(s.t1q.x, s.t1q.y, s.t1q.z, s.t1q.w);
+            cache[2 * i + 1].transform.p = PxVec3(s.t1p.x, s.t1p.y, s.t1p.z);
+
+            PxgPersistentContactManifold& m = mfs[i];
             for (int j = 0; j < 4; ++j)
             {
-                const V3 n = unit(V3{ rf(-1, 1), rf(-1, 1), rf(-1, 1) });
-                s.mNp[j] = F4{ n.x, n.y, n.z, rf(-0.5f, 0.2f) };
-                const V3 b{ rf(-1, 1), rf(-1, 1), rf(-1, 1) };
-                s.mB[j] = F4{ b.x, b.y, b.z, 0 };
-                if (rng() % 5 == 0)
-                {
-                    // unrelated pointA -> almost surely dropped
-                    s.mA[j] = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), 0 };
-                }
-                else
-                {
-                    // pointA = aToB^-1(pointB + small in-plane delta) -> often kept
-                    const float d = rf(0.f, 0.05f);
-                    const V3 tgt = add(b, V3{ rf(-d, d), rf(-d, d), rf(-d, d) });
-                    const V3 pa = qRot(aqc, sub(tgt, ap));
-                    s.mA[j] = F4{ pa.x, pa.y, pa.z, 0 };
-                }
+                m.mLocalNormal_PenW[j] = make_float4(s.mNp[j].x, s.mNp[j].y, s.mNp[j].z, s.mNp[j].w);
+                m.mLocalContactA[j] = make_float4(s.mA[j].x, s.mA[j].y, s.mA[j].z, s.mA[j].w);
+                m.mLocalContactB[j] = make_float4(s.mB[j].x, s.mB[j].y, s.mB[j].z, s.mB[j].w);
             }
+            m.mRelativePos = make_float4(u2f(s.md0.x), u2f(s.md0.y), u2f(s.md0.z), u2f(s.md0.w));
+            m.mQuatA = PxAlignedQuat(u2f(s.md1.x), u2f(s.md1.y), u2f(s.md1.z), u2f(s.md1.w));
+            m.mQuatB = PxAlignedQuat(u2f(s.md2.x), u2f(s.md2.y), u2f(s.md2.z), u2f(s.md2.w));
+            m.mNbContacts = s.md3.x;
+            m.mNbWarmStartPoints = s.md3.y;
+            m.mWarmStartA = s.md3.z;
+            m.mWarmStartB = s.md3.w;
         }
 
-        // previous-frame data: half the time seeded from the CURRENT transforms
-        // (small delta -> the invalidate path decides), else random (rerun likely)
-        const F4 t1qc{ -s.t1q.x, -s.t1q.y, -s.t1q.z, s.t1q.w };
-        const V3 curRel = qRotInv(s.t1q, sub(v3(s.t0p), v3(s.t1p)));
-        if (i % 2 == 0)
+        PxgDevicePtr dCmIn = 0, dShapes = 0, dCache = 0, dMf = 0, dKeep = 0;
+        shim.memAlloc(&dCmIn, cmIn.size() * sizeof(PxgContactManagerInput));
+        shim.memAlloc(&dShapes, shapes.size() * sizeof(PxgShape));
+        shim.memAlloc(&dCache, cache.size() * sizeof(PxsCachedTransform));
+        shim.memAlloc(&dMf, mfs.size() * sizeof(PxgPersistentContactManifold));
+        shim.memAlloc(&dKeep, N * 4);
+        shim.memcpyHtoD(dBlobs, blobs.data(), blobs.size());
+        shim.memcpyHtoD(dCmIn, cmIn.data(), cmIn.size() * sizeof(PxgContactManagerInput));
+        shim.memcpyHtoD(dShapes, shapes.data(), shapes.size() * sizeof(PxgShape));
+        shim.memcpyHtoD(dCache, cache.data(), cache.size() * sizeof(PxsCachedTransform));
+        shim.memcpyHtoD(dMf, mfs.data(), mfs.size() * sizeof(PxgPersistentContactManifold));
+        shim.memsetD32(dKeep, 0xCCCCCCCC, N);
+
+        // ---- the ENGINE launch: blob {4,4,8,8,8,8,8}, grid ceil(numTests*4/128) x (32,4) ----
+        struct Stage1Blob
         {
-            const float eps = rf(0, 0.02f);
-            s.md0 = U4{ f2u(curRel.x + rf(-eps, eps)), f2u(curRel.y + rf(-eps, eps)), f2u(curRel.z + rf(-eps, eps)), 0 };
-            F4 pqa = s.t0q, pqb = s.t1q;
-            // small-angle perturbation of EXACTLY ONE previous quat: sweeps the
-            // quat-threshold and travel-distance bands (with the sphere path's
-            // radiusA = 0, only one side of each || can fire)
-            if (i % 8 == 4)
+            uint32_t numTests;
+            float toleranceLength;
+            uint64_t cmInputs, transformCache, shapes, cmManifolds, tempKeepPairArray;
+        } blob = { numTests, tol, dCmIn, dCache, dShapes, dMf, dKeep };
+        static_assert(sizeof(Stage1Blob) == 48, "stage1 engine blob is 48 bytes");
+
+        const uint32_t numBlocks = (numTests * 4 + 127) / 128;
+        PXG_CHECK_MSG(shim.launchKernel(0, numBlocks, 1, 1, &blob, sizeof(blob)) == PxgResult::Success,
+                      "launch stage1 (engine ABI)");
+        shim.streamSynchronize();
+
+        // ---- compare ----
+        std::vector<PxgPersistentContactManifold> gMf(N);
+        std::vector<uint32_t> gKeep(N);
+        shim.memcpyDtoH(gMf.data(), dMf, gMf.size() * sizeof(PxgPersistentContactManifold));
+        shim.memcpyDtoH(gKeep.data(), dKeep, N * 4);
+
+        size_t mmM = 0, mmD = 0, mmR = 0, mmG = 0;
+        for (uint32_t i = 0; i < numTests; ++i)
+        {
+            if (skip[i]) continue;
+            const PxgPersistentContactManifold& g = gMf[i];
+            S1Out got;
+            for (int j = 0; j < 4; ++j)
             {
-                const V3 ax = unit(V3{ rf(-1, 1), rf(-1, 1), rf(-1, 1) });
-                const float a = rf(0.004f, 0.07f); // ~0.2..4 degrees
-                const F4 rot{ ax.x * std::sin(a * .5f), ax.y * std::sin(a * .5f), ax.z * std::sin(a * .5f), std::cos(a * .5f) };
-                if (i % 16 == 4) pqa = qMul(rot, pqa); else pqb = qMul(rot, pqb);
+                std::memcpy(&got.mNp[j], &g.mLocalNormal_PenW[j], 16);
+                std::memcpy(&got.mA[j], &g.mLocalContactA[j], 16);
+                std::memcpy(&got.mB[j], &g.mLocalContactB[j], 16);
             }
-            s.md1 = U4{ f2u(pqa.x), f2u(pqa.y), f2u(pqa.z), f2u(pqa.w) };
-            s.md2 = U4{ f2u(pqb.x), f2u(pqb.y), f2u(pqb.z), f2u(pqb.w) };
-        }
-        else
-        {
-            const F4 qa = randQuat(), qb = randQuat();
-            s.md0 = U4{ f2u(rf(-2, 2)), f2u(rf(-2, 2)), f2u(rf(-2, 2)), 0 };
-            s.md1 = U4{ f2u(qa.x), f2u(qa.y), f2u(qa.z), f2u(qa.w) };
-            s.md2 = U4{ f2u(qb.x), f2u(qb.y), f2u(qb.z), f2u(qb.w) };
-        }
-        s.md3 = U4{ nb, rng() % 5, rng(), rng() };
-        in[i] = s;
+            std::memcpy(&got.md0, &g.mRelativePos, 16);
+            std::memcpy(&got.md1, &g.mQuatA, 16);
+            std::memcpy(&got.md2, &g.mQuatB, 16);
+            got.md3 = U4{ g.mNbContacts, g.mNbWarmStartPoints, g.mWarmStartA, g.mWarmStartB };
 
-        bool marg = false;
-        refStage1(s, ref[i], marg);
-        skip[i] = marg ? 1u : 0u;
-        if (marg) { ++nSkip; continue; }
-        if (ref[i].result.x) ++cRun; else ++cNoRun;
-        if (ref[i].result.y == s.md3.x && s.md3.x != 0) ++cInvalPath;
+            if (gKeep[i] != ref[i].result.x) { ++mmR; continue; }
+            for (int j = 0; j < 4; ++j)
+                if (!eqF4(ref[i].mNp[j], got.mNp[j]) || !eqF4(ref[i].mA[j], got.mA[j]) || !eqF4(ref[i].mB[j], got.mB[j])) { ++mmM; break; }
+            if (got.md3.x != ref[i].md3.x || got.md3.y != ref[i].md3.y || got.md3.z != ref[i].md3.z || got.md3.w != ref[i].md3.w) ++mmD;
+            else if (ref[i].result.x)
+            {
+                if (!eqU4f(ref[i].md0, got.md0) || got.md0.w != 0 ||
+                    got.md1.x != ref[i].md1.x || got.md1.y != ref[i].md1.y || got.md1.z != ref[i].md1.z || got.md1.w != ref[i].md1.w ||
+                    got.md2.x != ref[i].md2.x || got.md2.y != ref[i].md2.y || got.md2.z != ref[i].md2.z || got.md2.w != ref[i].md2.w) ++mmD;
+            }
+            else
+            {
+                if (got.md0.x != ref[i].md0.x || got.md1.x != ref[i].md1.x || got.md2.x != ref[i].md2.x) ++mmD;
+            }
+        }
+        // GUARD pairs beyond numTests: manifold + keep sentinels untouched
+        for (uint32_t i = numTests; i < N; ++i)
+        {
+            if (std::memcmp(&gMf[i], &mfs[i], sizeof(PxgPersistentContactManifold)) != 0) ++mmG;
+            if (gKeep[i] != 0xCCCCCCCCu) ++mmG;
+        }
+        PXG_CHECK_MSG(mmR == 0, "stage1 launch %u: %zu keep-flag mismatches", launch, mmR);
+        PXG_CHECK_MSG(mmM == 0, "stage1 launch %u: %zu manifold mismatches", launch, mmM);
+        PXG_CHECK_MSG(mmD == 0, "stage1 launch %u: %zu moreData mismatches", launch, mmD);
+        PXG_CHECK_MSG(mmG == 0, "stage1 launch %u: %zu guard-tail violations", launch, mmG);
+
+        for (PxgDevicePtr pfree : { dBlobs, dCmIn, dShapes, dCache, dMf, dKeep })
+            shim.memFree(pfree);
     }
 
-    PxgSlangComputeDevice* dev = testDevice();
-    const uint32_t GROUPS = (N + 63) / 64;
-    std::vector<S1Out> outInit(N);
-    PxgBufferHandle bIn = createBufferFrom(dev, in);
-    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
-
-    struct S1Params { uint32_t numTests; } prm = { N };
-    Kernel k("npCvxStage1Refresh.spv", "cvxStage1Refresh",
-             { (uint32_t)sizeof(S1In), (uint32_t)sizeof(S1Out) }, sizeof(S1Params));
-    k.dispatch(GROUPS, { bIn, bOut }, prm);
-    dev->flush();
-
-    const auto g = downloadBuffer<S1Out>(dev, bOut, N);
-    size_t mmM = 0, mmD = 0, mmR = 0;
-    for (uint32_t i = 0; i < N; ++i)
-    {
-        if (skip[i]) continue;
-        if (g[i].result.x != ref[i].result.x || g[i].result.y != ref[i].result.y) { ++mmR; continue; }
-        for (int j = 0; j < 4; ++j)
-            if (!eqF4(ref[i].mNp[j], g[i].mNp[j]) || !eqF4(ref[i].mA[j], g[i].mA[j]) || !eqF4(ref[i].mB[j], g[i].mB[j])) { ++mmM; break; }
-        if (g[i].md3.x != ref[i].md3.x || g[i].md3.y != ref[i].md3.y || g[i].md3.z != ref[i].md3.z || g[i].md3.w != ref[i].md3.w) ++mmD;
-        else if (ref[i].result.x)
-        {
-            // rewritten quats are bit-copies of t0q/t1q: compare all 4 components exactly
-            if (!eqU4f(ref[i].md0, g[i].md0) || g[i].md0.w != 0 ||
-                g[i].md1.x != ref[i].md1.x || g[i].md1.y != ref[i].md1.y || g[i].md1.z != ref[i].md1.z || g[i].md1.w != ref[i].md1.w ||
-                g[i].md2.x != ref[i].md2.x || g[i].md2.y != ref[i].md2.y || g[i].md2.z != ref[i].md2.z || g[i].md2.w != ref[i].md2.w) ++mmD;
-        }
-        else { if (g[i].md0.x != ref[i].md0.x || g[i].md1.x != ref[i].md1.x || g[i].md2.x != ref[i].md2.x) ++mmD; }
-    }
-    PXG_CHECK_MSG(mmR == 0, "stage1: %zu result mismatches", mmR);
-    PXG_CHECK_MSG(mmM == 0, "stage1: %zu manifold mismatches", mmM);
-    PXG_CHECK_MSG(mmD == 0, "stage1: %zu moreData mismatches", mmD);
-    PXG_CHECK_MSG(nSkip < N / 3, "stage1: too many marginal (%zu/%u)", nSkip, N);
-    PXG_CHECK_MSG(cRun > N / 10 && cNoRun > N / 10 && cInvalPath > N / 20 && cSphere > N / 8,
+    const size_t total = size_t(3) * (N - GUARD);
+    PXG_CHECK_MSG(nSkip < total / 3, "stage1: too many marginal (%zu/%zu)", nSkip, total);
+    PXG_CHECK_MSG(cRun > total / 10 && cNoRun > total / 10 && cInvalPath > total / 20 && cSphere > total / 8,
                   "stage1: coverage thin (run %zu noRun %zu inval %zu sphere %zu)", cRun, cNoRun, cInvalPath, cSphere);
-
-    for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }
 
 } // namespace

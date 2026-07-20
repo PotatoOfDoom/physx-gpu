@@ -26,54 +26,54 @@
 
 // npCompressContacts.slang
 //
-// Slang port of two of the contact-compression kernels from
+// Two contact-compression kernels from
 // gpunarrowphase/src/CUDA/compressOutputContacts.cu:
-//   - compressContactStage1: per-block count of the pairs that produced at least
-//     one contact (nbContacts != 0), written to gBlockNumPairs — the per-block
-//     histogram the cross-block compaction (Stage2, a later tranche) consumes.
-//   - updateFrictionPatches: rescales each pair's contact-patch byte offset into
-//     the friction-patch stream: frictionPatches = startFriction +
-//     (contactPatches - startContact) * sizeof(PxFrictionPatch) /
-//     sizeof(PxContactPatch).
 //
-// PxsContactManagerOutput is 48 bytes = 12 uint words; its device pointers are
-// modelled as byte offsets: word 0 = contactPatches, word 6 = frictionPatches,
-// word 9 low-16 = nbContacts.  The per-block count is a deterministic function of
-// the (fixed) block/iteration work partition, matching the CUDA's warp-ballot
-// reduction (BLOCK = 256, NUM_BLOCKS = 32).
+// - compressContactStage1 — P5 Step 4 (BDA, engine launch path), the exact
+//   engine ABI: (PxsContactManagerOutput* outputData, PxU32 numTotalPairs,
+//   PxU32* gBlockNumPairs), argSizes {8,4,8} -> 24-byte blob.  Engine grid
+//   (PxgNarrowphaseCore.cpp ~L8984): 32 blocks x 256 threads over the fixed
+//   iteration partition.  Counts, per block, the pairs whose nbContacts != 0
+//   (a real PxsContactManagerOutput field read via Ptr<>: word 9 low 16).
+//   The CUDA's warp-ballot/warp-reduction accumulation is kept as the
+//   verified bound-buffer port's groupshared atomic count — a deterministic,
+//   output-identical reduction over the same work partition (llvmpipe has no
+//   32-wide subgroup).
+//
+// - updateFrictionPatches — still the bound-buffer harness form (its engine
+//   conversion is a separate tranche): rescales each pair's contact-patch
+//   byte offset into the friction-patch stream.
+
+import pxgSlangNpAbi;
 
 static const uint BLOCK = 256;
 static const uint NUM_BLOCKS = 32;
 static const uint OUTPUT_WORDS = 12; // sizeof(PxsContactManagerOutput)/4
 
-struct CompressParams
+// ---------------------------------------------------------------------------
+// compressContactStage1: engine ABI {8,4,8} = 24-byte blob
+// ---------------------------------------------------------------------------
+struct CompressStage1Params
 {
-    uint numTotalPairs;  // stage1
-    uint pairCount;      // updateFrictionPatches
-    uint startContact;   // startContactPatches byte offset
-    uint startFriction;  // startFrictionPatches byte offset
-    uint contactSize;    // sizeof(PxContactPatch)
-    uint fricSize;       // sizeof(PxFrictionPatch)
+    uint64_t outputData;     // @0  PxsContactManagerOutput*
+    uint numTotalPairs;      // @8
+    uint64_t gBlockNumPairs; // @16 PxU32*
 }
 
 [[vk::push_constant]]
-ConstantBuffer<CompressParams> gParams;
-
-RWStructuredBuffer<uint> gOutputData;    // binding 0  PxsContactManagerOutput (word view)
-RWStructuredBuffer<uint> gBlockNumPairs; // binding 1  [NUM_BLOCKS]
+ConstantBuffer<CompressStage1Params> gC1;
 
 groupshared uint gsBlockCount;
 
-// ---------------------------------------------------------------------------
-// compressContactStage1: per-block count of pairs with contacts
-// ---------------------------------------------------------------------------
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void compressContactStage1(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     const uint tid = gtid.x;
     const uint blockIdx = gid.x;
-    const uint n = gParams.numTotalPairs;
+    const uint n = gC1.numTotalPairs;
+
+    Ptr<PxsContactManagerOutputGpu> outputData = Ptr<PxsContactManagerOutputGpu>(gC1.outputData);
 
     const uint totalBlockRequired = (n + (BLOCK - 1)) / BLOCK;
     const uint numIterationPerBlock = (totalBlockRequired + (NUM_BLOCKS - 1)) / NUM_BLOCKS;
@@ -87,7 +87,7 @@ void compressContactStage1(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
         const uint workIndex = it * BLOCK + tid + numIterationPerBlock * blockIdx * BLOCK;
         if (workIndex < n)
         {
-            const uint nbContacts = gOutputData[workIndex * OUTPUT_WORDS + 9u] & 0xffffu;
+            const uint nbContacts = outputData[workIndex].nbContactsFlags & 0xffffu;
             if (nbContacts != 0u)
             {
                 uint orig;
@@ -98,12 +98,28 @@ void compressContactStage1(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
 
     GroupMemoryBarrierWithGroupSync();
     if (tid == 0)
-        gBlockNumPairs[blockIdx] = gsBlockCount;
+        (Ptr<uint>(gC1.gBlockNumPairs))[blockIdx] = gsBlockCount;
 }
 
 // ---------------------------------------------------------------------------
-// updateFrictionPatches: rescale the contact-patch offset into the friction stream
+// updateFrictionPatches (bound-buffer harness form, unchanged)
 // ---------------------------------------------------------------------------
+struct CompressParams
+{
+    uint numTotalPairs;  // unused here
+    uint pairCount;      // updateFrictionPatches
+    uint startContact;   // startContactPatches byte offset
+    uint startFriction;  // startFrictionPatches byte offset
+    uint contactSize;    // sizeof(PxContactPatch)
+    uint fricSize;       // sizeof(PxFrictionPatch)
+}
+
+[[vk::push_constant]]
+ConstantBuffer<CompressParams> gParams;
+
+RWStructuredBuffer<uint> gOutputData;    // binding 0  PxsContactManagerOutput (word view)
+RWStructuredBuffer<uint> gBlockNumPairs; // binding 1  [NUM_BLOCKS] (kept for layout parity)
+
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void updateFrictionPatches(uint3 dtid : SV_DispatchThreadID)

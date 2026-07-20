@@ -24,20 +24,30 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// Verification of npCompressContacts.slang: compressContactStage1 (per-block count
-// of pairs with contacts) and updateFrictionPatches (friction-patch offset
-// rescale).  Both are compared against C++ references — the block count over the
-// exact fixed work partition, and the rescaled offset per pair.
+// Verification of npCompressContacts.slang: compressContactStage1 on the
+// ENGINE ABI (blob {8,4,8} = 24 bytes, real PxsContactManagerOutput array via
+// Ptr<>, 32 blocks x 256 over the fixed partition) and updateFrictionPatches
+// (bound-buffer harness form, unchanged).  Both against C++ references — the
+// block count over the exact work partition, and the rescaled offset per pair.
 
 #include "pxgTestFramework.h"
+#include "PxgCudaShim.h"
+
+#include "PxNodeIndex.h"
+#include "PxsContactManagerState.h"
 
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <vector>
 
 namespace
 {
 using namespace pxgtest;
+using physx::gpuslang::PxgCudaShim;
+using physx::gpuslang::PxgKernelDef;
+using physx::gpuslang::PxgDevicePtr;
+using physx::gpuslang::PxgResult;
 
 struct CompressParams { uint32_t numTotalPairs, pairCount, startContact, startFriction, contactSize, fricSize; };
 
@@ -45,23 +55,27 @@ const uint32_t OUTPUT_WORDS = 12;
 const uint32_t BLOCK = 256, NUM_BLOCKS = 32;
 const uint32_t CONTACT_SIZE = 64, FRIC_SIZE = 52; // sizeof(PxContactPatch)/PxFrictionPatch
 
+static std::vector<uint8_t> cLoader(const char* file) { return loadShaderBlob(file); }
+
 PXG_TEST(npCompressContacts_stage1)
 {
+    using namespace physx;
     std::mt19937 rng(46010);
     const uint32_t N = 9000;
 
-    // PxsContactManagerOutput word view: word9 low16 = nbContacts
-    std::vector<uint32_t> outData(N * OUTPUT_WORDS, 0);
+    // REAL PxsContactManagerOutput array; only nbContacts is read by stage1
+    std::vector<PxsContactManagerOutput> outData(N);
+    std::memset(outData.data(), 0, N * sizeof(PxsContactManagerOutput));
     std::vector<uint32_t> nbRef(N);
     for (uint32_t i = 0; i < N; ++i)
     {
         const uint32_t nb = (rng() % 3 == 0) ? 0u : (1u + rng() % 8u);
         nbRef[i] = nb;
-        outData[i * OUTPUT_WORDS + 9] = (nb & 0xffffu) | ((rng() % 0xffff) << 16); // flags in high 16 = noise
-        outData[i * OUTPUT_WORDS + 0] = rng(); // contactPatches (unused by stage1)
+        outData[i].nbContacts = PxU16(nb);
+        outData[i].flags = PxU16(rng() % 0xffff); // high 16 of word 9 = noise
+        outData[i].contactPatches = reinterpret_cast<PxU8*>(uintptr_t(rng())); // unused by stage1
     }
 
-    // reference: per-block count over the same work partition
     const uint32_t totalBlockRequired = (N + BLOCK - 1) / BLOCK;
     const uint32_t numIterationPerBlock = (totalBlockRequired + NUM_BLOCKS - 1) / NUM_BLOCKS;
     std::vector<uint32_t> refBlock(NUM_BLOCKS, 0);
@@ -78,23 +92,33 @@ PXG_TEST(npCompressContacts_stage1)
     }
 
     PxgSlangComputeDevice* dev = testDevice();
-    std::vector<uint32_t> blockInit(NUM_BLOCKS, 0);
-    PxgBufferHandle bOut = createBufferFrom(dev, outData);
-    PxgBufferHandle bBlock = createBufferFrom(dev, blockInit);
+    const PxgKernelDef manifest[] = {
+        { "npCompressContacts.spv", "compressContactStage1", 24u, 0 }, // {8,4,8}
+    };
+    PxgCudaShim shim(dev, manifest, 1, &cLoader);
 
-    CompressParams p = { N, 0, 0, 0, CONTACT_SIZE, FRIC_SIZE };
-    Kernel k("npCompressContacts.spv", "compressContactStage1", { 4, 4 }, sizeof(CompressParams));
-    k.dispatch(NUM_BLOCKS, { bOut, bBlock }, p);
-    dev->flush();
+    PxgDevicePtr dOut = 0, dBlock = 0;
+    if (shim.memAlloc(&dOut, N * sizeof(PxsContactManagerOutput)) != PxgResult::Success || !dOut)
+    { std::printf("  NOTE: no BDA -> skip\n"); return; }
+    shim.memAlloc(&dBlock, NUM_BLOCKS * 4);
+    shim.memcpyHtoD(dOut, outData.data(), N * sizeof(PxsContactManagerOutput));
+    shim.memsetD32(dBlock, 0, NUM_BLOCKS);
 
-    const auto g = downloadBuffer<uint32_t>(dev, bBlock, NUM_BLOCKS);
+    struct { uint64_t outputData; uint32_t numTotalPairs; uint64_t gBlockNumPairs; } blob = { dOut, N, dBlock };
+    static_assert(sizeof(blob) == 24, "compressStage1 engine blob is 24 bytes");
+    PXG_CHECK_MSG(shim.launchKernel(0, NUM_BLOCKS, 1, 1, &blob, sizeof(blob)) == PxgResult::Success,
+                  "launch compressStage1 (engine ABI)");
+    shim.streamSynchronize();
+
+    std::vector<uint32_t> g(NUM_BLOCKS);
+    shim.memcpyDtoH(g.data(), dBlock, NUM_BLOCKS * 4);
     size_t mm = 0;
     uint32_t total = 0;
     for (uint32_t b = 0; b < NUM_BLOCKS; ++b) { if (g[b] != refBlock[b]) ++mm; total += refBlock[b]; }
     PXG_CHECK_MSG(mm == 0, "compressContactStage1: %zu block mismatches", mm);
     PXG_CHECK_MSG(total > N / 4, "stage1: too few pairs with contacts (%u)", total);
 
-    dev->destroyBuffer(bOut); dev->destroyBuffer(bBlock);
+    shim.memFree(dOut); shim.memFree(dBlock);
 }
 
 PXG_TEST(npCompressContacts_updateFrictionPatches)

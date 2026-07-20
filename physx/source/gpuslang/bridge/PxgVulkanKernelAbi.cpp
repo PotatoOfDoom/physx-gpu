@@ -92,6 +92,19 @@ static const uint8_t kIntegrateTGS[] = { 4, 8, 8, 8, 8, 8 };
 //   updateShapesLaunch(const PxgNewShapeSim*, PxgShapeSim*, PxU32 nbNewShapes)
 static const uint8_t kUpdateShapes[] = { 8, 8, 4 };
 
+// gpunarrowphase convex-convex core (cudaGJKEPA.cu):
+//   convexConvexNphase_stage1Kernel(PxU32 numTests, PxReal toleranceLength,
+//     cmInputs*, transformCache*, shapes*, cmManifolds*, tempKeepPairArray*)
+static const uint8_t kCvxStage1[] = { 4, 4, 8, 8, 8, 8, 8 };
+//   convexConvexNphase_stage2Kernel(PxU32 numTests, PxReal toleranceLength,
+//     tempKeepPairsArray*, cmInputs*, cmManifolds*, shapes*, transformCache*, contactDistance*)
+static const uint8_t kCvxStage2[] = { 4, 4, 8, 8, 8, 8, 8, 8 };
+//   finishContactsKernel(PxU32 numTests, 9 ptrs, bool insertAveragePoint, 6 ptrs, 3 PxU32)
+static const uint8_t kFinishContacts[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 1, 8, 8, 8, 8, 8, 8, 4, 4, 4 };
+//   compressContactStage1(ptr, PxU32, ptr) / compressContactStage2(2 ptr, u32, 12 ptr, u32)
+static const uint8_t kCompress1[] = { 8, 4, 8 };
+static const uint8_t kCompress2[] = { 8, 8, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4 };
+
 // gpusolver: rigidSumInternalContactAndJointBatches1(PxgPrePrepDesc*, PxU32 nbBodies)
 static const uint8_t kPtrU32[] = { 8, 4 };
 // rigidSumInternalContactAndJointBatches2(PxgPrePrepDesc*, PxgSolverCoreDesc*,
@@ -151,6 +164,12 @@ static const PxgKernelAbiRow kRows[] = {
     { "rigidSumInternalContactAndJointBatches2", kThreePtrU32, uint32_t(sizeof(kThreePtrU32)) },
     { "constraintContactBlockPrePrepLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "contactConstraintBlockPrepareParallelLaunchTGS", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    // gpunarrowphase convex-convex core + contact-stream compress (P5 Step 4 BDA)
+    { "convexConvexNphase_stage1Kernel", kCvxStage1, uint32_t(sizeof(kCvxStage1)) },
+    { "convexConvexNphase_stage2Kernel", kCvxStage2, uint32_t(sizeof(kCvxStage2)) },
+    { "finishContactsKernel", kFinishContacts, uint32_t(sizeof(kFinishContacts)) },
+    { "compressContactStage1", kCompress1, uint32_t(sizeof(kCompress1)) },
+    { "compressContactStage2", kCompress2, uint32_t(sizeof(kCompress2)) },
 };
 
 inline size_t abiAlign(size_t size)

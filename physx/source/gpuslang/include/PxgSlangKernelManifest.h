@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 132;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 135;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -63,7 +63,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "accumulateReportsStage_1", "broadphaseReports.spv", "accumulateReportsStage_1" },  // BP_ACCUMULATE_REPORT_STAGE_1
     { "accumulateReportsStage_2", "broadphaseReports.spv", "accumulateReportsStage_2" },  // BP_ACCUMULATE_REPORT_STAGE_2
     { "copyReports", "broadphaseReports.spv", "copyReports" },  // BP_COPY_REPORTS
-    { "finishContactsKernel", nullptr, nullptr },  // FINISH_CONTACTS_KERNEL (unmapped)
+    { "finishContactsKernel", "npCvxFinishContacts.spv", "finishContactsKernel" },  // FINISH_CONTACTS_KERNEL
     { "MemCopyBalanced", "memCopy.spv", "MemCopyBalanced" },  // MEM_COPY_BALANCED_KERNEL
     { "removeContactManagers_Stage1", nullptr, nullptr },  // REMOVE_CONTACT_MANAGERS_1 (unmapped)
     { "removeContactManagers_Stage2", nullptr, nullptr },  // REMOVE_CONTACT_MANAGERS_2 (unmapped)
@@ -80,8 +80,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "convexCoreTrimeshNphase_Kernel32", nullptr, nullptr },  // CONVEXCORE_TRIMESH_KERNEL32_MAIN (unmapped)
     { "convexCoreTetmeshNphase_Kernel32", nullptr, nullptr },  // CONVEXCORE_TETMESH_KERNEL32_MAIN (unmapped)
     { "convexCoreClothmeshNphase_Kernel32", nullptr, nullptr },  // CONVEXCORE_CLOTHMESH_KERNEL32_MAIN (unmapped)
-    { "convexConvexNphase_stage1Kernel", nullptr, nullptr },  // CONVEX_CONVEX_KERNEL_EARLY_OUT (unmapped)
-    { "convexConvexNphase_stage2Kernel", nullptr, nullptr },  // CONVEX_CONVEX_KERNEL_MAIN (unmapped)
+    { "convexConvexNphase_stage1Kernel", "npCvxStage1Refresh.spv", "convexConvexNphase_stage1Kernel" },  // CONVEX_CONVEX_KERNEL_EARLY_OUT
+    { "convexConvexNphase_stage2Kernel", "npCvxStage2Setup.spv", "convexConvexNphase_stage2Kernel" },  // CONVEX_CONVEX_KERNEL_MAIN
     { "removeContactManagers_Stage5_CvxTri", "npPairRemoveSwap.spv", "removeContactManagers_Stage5_CvxTri" },  // REMOVE_CONTACT_MANAGERS_5_CVXTRI
     { "initializeManifolds", "npPairManagement.spv", "initializeManifolds" },  // INITIALIZE_MANIFOLDS
     { "midphaseGeneratePairs", nullptr, nullptr },  // CONVEX_TRIMESH_MIDPHASE (unmapped)
