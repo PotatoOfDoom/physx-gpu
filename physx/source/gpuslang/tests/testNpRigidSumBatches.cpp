@@ -24,15 +24,28 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// Verification of npRigidSumBatches.slang: the
+// Verification of npRigidSumBatches.slang on the ENGINE launch ABI: the
 // rigidSumInternalContactAndJointBatches1/2 pair (constraintBlockPrePrep.cu
-// L1472-1604 / L1607-1956) against an exact serial CPU transcription of the
-// CUDA control flow (warp reductions, exclusive scans, shared accumulators,
-// ballot scatter).  Every quantity is uint add/max, so all collectives are
-// associative reductions over fixed domains -- ALL outputs bitwise, with
-// sentinel-filled output buffers proving the exact write set.
+// L1472-1604 / L1607-1956) driven exactly as
+// PxgSolverCore::constraintPrePrepParallel launches them — REAL engine
+// PxgPrePrepDesc / PxgSolverCoreDesc / PxgConstraintPrepareDesc structs
+// filled with live device addresses, uploaded, and passed by device pointer
+// through PxgCudaShim with the engine grid (32 blocks x 512 threads) and the
+// engine parameter blobs ({desc*, nbBodies} / {preDesc*, coreDesc*,
+// prepDesc*, nbBodies}).  The CPU reference is an exact serial transcription
+// of the CUDA control flow (warp reductions, exclusive scans, shared
+// accumulators, ballot scatter).  Every quantity is uint add/max, so all
+// collectives are associative reductions over fixed domains -- ALL outputs
+// bitwise, with sentinel-filled output buffers proving the exact write set,
+// including the desc-field outputs (prePrepDesc->numStaticBatches,
+// prepDesc->numStatic*Batches, islandContextPool[0].mStaticRigidBatchCount).
 
 #include "pxgTestFramework.h"
+#include "PxgCudaShim.h"
+
+#include "PxNodeIndex.h" // completes PxNodeIndex for the PxgNarrowphaseCore.h chain
+#include "PxgSolverCoreDesc.h"
+#include "PxgIslandContext.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -43,9 +56,40 @@
 namespace
 {
 using namespace pxgtest;
+using physx::gpuslang::PxgCudaShim;
+using physx::gpuslang::PxgKernelDef;
+using physx::gpuslang::PxgDevicePtr;
+using physx::gpuslang::PxgResult;
 
 const uint32_t NB_BLOCKS = 32, BLOCK_DIM = 512, WARPS = 16;
 const uint32_t SENTINEL = 0xAAAAAAAAu;
+
+static std::vector<uint8_t> rsLoader(const char* file) { return loadShaderBlob(file); }
+
+// Mirrors the bridge's marshalling (natural alignment, tail rounded).
+struct EngineBlob
+{
+    std::vector<uint8_t> bytes;
+    size_t maxAlign = 1;
+    static size_t alignFor(size_t size)
+    {
+        if (size >= 16) return 16;
+        if (size >= 8)  return 8;
+        if (size >= 4)  return 4;
+        if (size >= 2)  return 2;
+        return 1;
+    }
+    template <typename T>
+    void add(const T& v)
+    {
+        const size_t a = alignFor(sizeof(T));
+        if (a > maxAlign) maxAlign = a;
+        bytes.resize((bytes.size() + (a - 1)) & ~(a - 1));
+        const uint8_t* pb = reinterpret_cast<const uint8_t*>(&v);
+        bytes.insert(bytes.end(), pb, pb + sizeof(T));
+    }
+    void finish() { bytes.resize((bytes.size() + (maxAlign - 1)) & ~(maxAlign - 1)); }
+};
 
 struct Cfg
 {
@@ -63,10 +107,10 @@ static uint32_t iters(uint32_t nbBodies)
 struct RefOut
 {
     std::vector<uint32_t> temp;            // 128
-    std::vector<uint32_t> startIndices;    // 2 * nbBodies
+    std::vector<uint32_t> startIndices;    // 2 * nbBodies (contact ++ joint)
     std::vector<uint32_t> outContactIds;
     std::vector<uint32_t> outJointIds;
-    std::vector<uint32_t> headers;         // uint4 image flattened
+    std::vector<uint32_t> headers;         // PxgConstraintBatchHeader image flattened (4 words each)
     std::vector<uint32_t> contactBatchIdx;
     std::vector<uint32_t> jointBatchIdx;
     std::vector<uint32_t> totals;          // 5
@@ -232,6 +276,8 @@ static void refRun(uint32_t nbBodies, const std::vector<uint32_t>& cc,
 
 static void runCase(uint32_t nbBodies, uint32_t seed, size_t& mmTotal)
 {
+    using namespace physx;
+
     std::mt19937 rng(seed);
     const uint32_t MAXC = 5, MAXJ = 4;
 
@@ -248,6 +294,8 @@ static void runCase(uint32_t nbBodies, uint32_t seed, size_t& mmTotal)
     for (auto& v : cids) v = rng();
     for (auto& v : jids) v = rng();
 
+    // The kernel derives the seven config values from desc fields; split each
+    // across its contributing engine fields to exercise the summing.
     Cfg cfg;
     cfg.contactUniqueIndexOffset = 64 + rng() % 64;
     cfg.jointUniqueIndexOffset = 32 + rng() % 32;
@@ -273,75 +321,170 @@ static void runCase(uint32_t nbBodies, uint32_t seed, size_t& mmTotal)
     refRun(nbBodies, cc, jc, cids, jids, cfg, ref);
 
     PxgSlangComputeDevice* dev = testDevice();
-    std::vector<uint32_t> tempInit(128, SENTINEL);
-    std::vector<uint32_t> cfgVec = { cfg.contactUniqueIndexOffset, cfg.jointUniqueIndexOffset,
-                                     cfg.batchOffset, cfg.staticContactBatchOffset,
-                                     cfg.staticJointBatchOffset, cfg.numContactBatches,
-                                     cfg.numConstraintBatches };
-    std::vector<uint32_t> startInit(2 * nbBodies, SENTINEL);
-    std::vector<uint32_t> ocInit(cIdCap, SENTINEL), ojInit(jIdCap, SENTINEL);
-    std::vector<uint32_t> hInit(headerCap * 4, SENTINEL);
-    std::vector<uint32_t> cbInit(cbCap, SENTINEL), jbInit(jbCap, SENTINEL);
-    std::vector<uint32_t> totInit(5, SENTINEL);
+    const PxgKernelDef manifest[] = {
+        { "npRigidSumBatches.spv", "rigidSumInternalContactAndJointBatches1", 16u, 0 },
+        { "npRigidSumBatches.spv", "rigidSumInternalContactAndJointBatches2", 32u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 2, &rsLoader);
 
-    PxgBufferHandle bCC = createBufferFrom(dev, cc);
-    PxgBufferHandle bJC = createBufferFrom(dev, jc);
-    PxgBufferHandle bTemp = createBufferFrom(dev, tempInit);
-    PxgBufferHandle bCfg = createBufferFrom(dev, cfgVec);
-    PxgBufferHandle bCids = createBufferFrom(dev, cids);
-    PxgBufferHandle bJids = createBufferFrom(dev, jids);
-    PxgBufferHandle bStart = createBufferFrom(dev, startInit);
-    PxgBufferHandle bOC = createBufferFrom(dev, ocInit);
-    PxgBufferHandle bOJ = createBufferFrom(dev, ojInit);
-    PxgBufferHandle bH = createBufferFrom(dev, hInit);
-    PxgBufferHandle bCB = createBufferFrom(dev, cbInit);
-    PxgBufferHandle bJB = createBufferFrom(dev, jbInit);
-    PxgBufferHandle bTot = createBufferFrom(dev, totInit);
+    auto alloc = [&](const void* data, size_t bytes) -> PxgDevicePtr {
+        PxgDevicePtr pd = 0;
+        shim.memAlloc(&pd, bytes);
+        if (pd && data)
+            shim.memcpyHtoD(pd, data, bytes);
+        return pd;
+    };
 
-    const std::vector<PxgBufferHandle> bufs = { bCC, bJC, bTemp, bCfg, bCids, bJids, bStart,
-                                                bOC, bOJ, bH, bCB, bJB, bTot };
-    const std::vector<uint32_t> strides = { 4, 4, 4, 4, 4, 4, 4, 4, 4, 16, 4, 4, 4 };
+    const std::vector<uint32_t> tempInit(128, SENTINEL);
+    const std::vector<uint32_t> startInit(nbBodies, SENTINEL);
+    const std::vector<uint32_t> ocInit(cIdCap, SENTINEL), ojInit(jIdCap, SENTINEL);
+    const std::vector<uint32_t> hInit(headerCap * 4, SENTINEL);
+    const std::vector<uint32_t> cbInit(cbCap, SENTINEL), jbInit(jbCap, SENTINEL);
 
-    struct P { uint32_t nbBodies; } prm = { nbBodies };
-    Kernel k1("npRigidSumBatches.spv", "rsBatches1", strides, sizeof(P));
-    k1.dispatch(1, bufs, prm);
-    dev->flush();
-    Kernel k2("npRigidSumBatches.spv", "rsBatches2", strides, sizeof(P));
-    k2.dispatch((NB_BLOCKS * BLOCK_DIM + 63) / 64, bufs, prm);
-    dev->flush();
+    const PxgDevicePtr dCC = alloc(cc.data(), cc.size() * 4);
+    const PxgDevicePtr dJC = alloc(jc.data(), jc.size() * 4);
+    const PxgDevicePtr dCids = alloc(cids.data(), cids.size() * 4);
+    const PxgDevicePtr dJids = alloc(jids.data(), jids.size() * 4);
+    const PxgDevicePtr dTempCU = alloc(tempInit.data(), 32 * 4);
+    const PxgDevicePtr dTempJU = alloc(tempInit.data(), 32 * 4);
+    const PxgDevicePtr dTempCH = alloc(tempInit.data(), 32 * 4);
+    const PxgDevicePtr dTempJH = alloc(tempInit.data(), 32 * 4);
+    const PxgDevicePtr dStartC = alloc(startInit.data(), nbBodies * 4);
+    const PxgDevicePtr dStartJ = alloc(startInit.data(), nbBodies * 4);
+    const PxgDevicePtr dOC = alloc(ocInit.data(), cIdCap * 4);
+    const PxgDevicePtr dOJ = alloc(ojInit.data(), jIdCap * 4);
+    const PxgDevicePtr dH = alloc(hInit.data(), headerCap * 16);
+    const PxgDevicePtr dCB = alloc(cbInit.data(), cbCap * 4);
+    const PxgDevicePtr dJB = alloc(jbInit.data(), jbCap * 4);
+    if (!dCC) { std::printf("  NOTE: no BDA -> skip\n"); return; }
 
+    // ---- the REAL engine descriptors, filled as the engine fills them ----
+    PxgPrePrepDesc pre;
+    std::memset(&pre, 0xCD, sizeof(pre)); // background pattern: untouched fields must not matter
+    pre.numTotalContacts = cfg.contactUniqueIndexOffset;
+    pre.numTotalConstraints = cfg.jointUniqueIndexOffset;
+    pre.numBatches = cfg.batchOffset / 2;
+    pre.numArtiBatches = (cfg.batchOffset - cfg.batchOffset / 2) / 2;
+    pre.numArtiSelfBatches = (cfg.batchOffset - cfg.batchOffset / 2) / 3;
+    pre.numArtiStaticBatches = cfg.batchOffset - pre.numBatches - pre.numArtiBatches - pre.numArtiSelfBatches;
+    pre.artiStaticContactBatchOffset = cfg.staticContactBatchOffset / 2;
+    pre.artiStaticConstraintBatchOffset = cfg.staticJointBatchOffset / 2;
+    pre.numStaticBatches = SENTINEL; // output field
+    pre.mRigidStaticContactCounts = reinterpret_cast<PxU32*>(dCC);
+    pre.mRigidStaticConstraintCounts = reinterpret_cast<PxU32*>(dJC);
+    pre.mRigidStaticContactIndices = reinterpret_cast<PxU32*>(dCids);
+    pre.mRigidStaticConstraintIndices = reinterpret_cast<PxU32*>(dJids);
+    pre.mRigidStaticContactStartIndices = reinterpret_cast<PxU32*>(dStartC);
+    pre.mRigidStaticConstraintStartIndices = reinterpret_cast<PxU32*>(dStartJ);
+    pre.mTempContactUniqueIndices = reinterpret_cast<PxU32*>(dTempCU);
+    pre.mTempConstraintUniqueIndices = reinterpret_cast<PxU32*>(dTempJU);
+    pre.mTempContactBlockHeader = reinterpret_cast<PxU32*>(dTempCH);
+    pre.mTempConstraintBlockHeader = reinterpret_cast<PxU32*>(dTempJH);
+    pre.mBatchHeaders = reinterpret_cast<PxgConstraintBatchHeader*>(dH);
+    pre.mContactUniqueIndices = reinterpret_cast<PxU32*>(dOC);
+    pre.mConstraintUniqueIndices = reinterpret_cast<PxU32*>(dOJ);
+
+    PxgConstraintPrepareDesc prep;
+    std::memset(&prep, 0xCD, sizeof(prep));
+    prep.jointConstraintBatchIndices = reinterpret_cast<PxU32*>(dJB);
+    prep.contactConstraintBatchIndices = reinterpret_cast<PxU32*>(dCB);
+    prep.numContactBatches = cfg.numContactBatches;
+    prep.num1dConstraintBatches = cfg.numConstraintBatches;
+    prep.numArtiStaticContactBatches = (cfg.staticContactBatchOffset - pre.artiStaticContactBatchOffset) / 2;
+    prep.numArtiSelfContactBatches = cfg.staticContactBatchOffset - pre.artiStaticContactBatchOffset -
+                                     prep.numArtiStaticContactBatches;
+    prep.numArtiStatic1dConstraintBatches =
+        (cfg.staticJointBatchOffset - pre.artiStaticConstraintBatchOffset) / 2;
+    prep.numArtiSelf1dConstraintBatches = cfg.staticJointBatchOffset - pre.artiStaticConstraintBatchOffset -
+                                          prep.numArtiStatic1dConstraintBatches;
+    prep.numStaticContactBatches = SENTINEL;       // output field
+    prep.numStatic1dConstraintBatches = SENTINEL;  // output field
+    prep.numStaticBatches = SENTINEL;              // output field
+
+    PxgIslandContext isl[1];
+    std::memset(isl, 0xCD, sizeof(isl));
+    isl[0].mStaticRigidBatchCount = SENTINEL;      // output field
+    const PxgDevicePtr dIsl = alloc(isl, sizeof(isl));
+
+    PxgSolverCoreDesc score;
+    std::memset(&score, 0xCD, sizeof(score));
+    score.islandContextPool = reinterpret_cast<PxgIslandContext*>(dIsl);
+
+    const PxgDevicePtr dPre = alloc(&pre, sizeof(pre));
+    const PxgDevicePtr dPrep = alloc(&prep, sizeof(prep));
+    const PxgDevicePtr dScore = alloc(&score, sizeof(score));
+
+    // ---- engine launches: 32 blocks x 512, CUDA-shaped parameter blobs ----
+    EngineBlob b1;
+    b1.add<uint64_t>(dPre);
+    b1.add<uint32_t>(nbBodies);
+    b1.finish();
+    PXG_CHECK_MSG(b1.bytes.size() == 16, "rs1 blob is 16 bytes (got %zu)", b1.bytes.size());
+    PXG_CHECK_MSG(shim.launchKernel(0, NB_BLOCKS, 1, 1, b1.bytes.data(), uint32_t(b1.bytes.size())) ==
+                      PxgResult::Success, "launch rigidSum1");
+
+    EngineBlob b2;
+    b2.add<uint64_t>(dPre);
+    b2.add<uint64_t>(dScore);
+    b2.add<uint64_t>(dPrep);
+    b2.add<uint32_t>(nbBodies);
+    b2.finish();
+    PXG_CHECK_MSG(b2.bytes.size() == 32, "rs2 blob is 32 bytes (got %zu)", b2.bytes.size());
+    PXG_CHECK_MSG(shim.launchKernel(1, NB_BLOCKS, 1, 1, b2.bytes.data(), uint32_t(b2.bytes.size())) ==
+                      PxgResult::Success, "launch rigidSum2");
+    shim.streamSynchronize();
+
+    // ---- bitwise compare (sentinels prove the exact write set) ----
     size_t mm = 0;
-    auto cmp = [&](const char* name, const std::vector<uint32_t>& r, PxgBufferHandle h) {
-        const auto g = downloadBuffer<uint32_t>(dev, h, uint32_t(r.size()));
+    auto cmp = [&](const char* name, const uint32_t* r, size_t n, PxgDevicePtr h) {
+        std::vector<uint32_t> g(n);
+        shim.memcpyDtoH(g.data(), h, n * 4);
         size_t bad = 0, first = ~size_t(0);
-        for (size_t x = 0; x < r.size(); ++x)
+        for (size_t x = 0; x < n; ++x)
             if (r[x] != g[x]) { if (!bad) first = x; ++bad; }
         if (bad)
         {
             std::printf("MM %s: %zu diffs, first at %zu (R %08x G %08x)\n", name, bad, first,
                         r[first], g[first]);
-            size_t shown = 0;
-            for (size_t x = 0; x < r.size() && shown < 8; ++x)
-                if (r[x] != g[x])
-                { std::printf("   [%zu] R %08x G %08x\n", x, r[x], g[x]); ++shown; }
             mm += bad;
         }
     };
-    cmp("temp", ref.temp, bTemp);
-    cmp("start", ref.startIndices, bStart);
-    cmp("outContact", ref.outContactIds, bOC);
-    cmp("outJoint", ref.outJointIds, bOJ);
-    cmp("headers", ref.headers, bH);
-    cmp("cbIdx", ref.contactBatchIdx, bCB);
-    cmp("jbIdx", ref.jointBatchIdx, bJB);
-    cmp("totals", ref.totals, bTot);
+    cmp("tempCU", ref.temp.data() + 0, 32, dTempCU);
+    cmp("tempJU", ref.temp.data() + 32, 32, dTempJU);
+    cmp("tempCH", ref.temp.data() + 64, 32, dTempCH);
+    cmp("tempJH", ref.temp.data() + 96, 32, dTempJH);
+    cmp("startC", ref.startIndices.data(), nbBodies, dStartC);
+    cmp("startJ", ref.startIndices.data() + nbBodies, nbBodies, dStartJ);
+    cmp("outContact", ref.outContactIds.data(), cIdCap, dOC);
+    cmp("outJoint", ref.outJointIds.data(), jIdCap, dOJ);
+    cmp("headers", ref.headers.data(), headerCap * 4, dH);
+    cmp("cbIdx", ref.contactBatchIdx.data(), cbCap, dCB);
+    cmp("jbIdx", ref.jointBatchIdx.data(), jbCap, dJB);
+
+    // ---- desc-field outputs (read the descs back) ----
+    PxgPrePrepDesc preOut;
+    PxgConstraintPrepareDesc prepOut;
+    PxgIslandContext islOut;
+    shim.memcpyDtoH(&preOut, dPre, sizeof(preOut));
+    shim.memcpyDtoH(&prepOut, dPrep, sizeof(prepOut));
+    shim.memcpyDtoH(&islOut, dIsl, sizeof(islOut));
+    if (preOut.numStaticBatches != ref.totals[0]) { std::printf("MM pre.numStaticBatches\n"); ++mm; }
+    if (prepOut.numStaticContactBatches != ref.totals[1]) { std::printf("MM prep.numStaticContactBatches\n"); ++mm; }
+    if (prepOut.numStatic1dConstraintBatches != ref.totals[2]) { std::printf("MM prep.numStatic1dConstraintBatches\n"); ++mm; }
+    if (prepOut.numStaticBatches != ref.totals[3]) { std::printf("MM prep.numStaticBatches\n"); ++mm; }
+    if (islOut.mStaticRigidBatchCount != ref.totals[4]) { std::printf("MM island.mStaticRigidBatchCount\n"); ++mm; }
+    // input desc fields must be untouched (the kernels only WRITE the fields above)
+    if (preOut.numBatches != pre.numBatches || preOut.numTotalContacts != pre.numTotalContacts) { std::printf("MM pre input fields clobbered\n"); ++mm; }
+    if (prepOut.numContactBatches != prep.numContactBatches) { std::printf("MM prep input fields clobbered\n"); ++mm; }
     mmTotal += mm;
 
     std::printf("[ info ] rs nbBodies %u iters %u totC %llu totJ %llu batches %u batchOff %u cfg01 %u %u\n", nbBodies,
                 iters(nbBodies), (unsigned long long)totC, (unsigned long long)totJ,
                 ref.totals[0], cfg.batchOffset, cfg.contactUniqueIndexOffset, cfg.jointUniqueIndexOffset);
 
-    for (PxgBufferHandle h : bufs) dev->destroyBuffer(h);
+    for (PxgDevicePtr h : { dCC, dJC, dCids, dJids, dTempCU, dTempJU, dTempCH, dTempJH, dStartC, dStartJ,
+                            dOC, dOJ, dH, dCB, dJB, dIsl, dPre, dPrep, dScore })
+        shim.memFree(h);
 }
 
 PXG_TEST(npRigidSumBatches_scan)

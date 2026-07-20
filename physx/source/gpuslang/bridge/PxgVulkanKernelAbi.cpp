@@ -92,6 +92,12 @@ static const uint8_t kIntegrateTGS[] = { 4, 8, 8, 8, 8, 8 };
 //   updateShapesLaunch(const PxgNewShapeSim*, PxgShapeSim*, PxU32 nbNewShapes)
 static const uint8_t kUpdateShapes[] = { 8, 8, 4 };
 
+// gpusolver: rigidSumInternalContactAndJointBatches1(PxgPrePrepDesc*, PxU32 nbBodies)
+static const uint8_t kPtrU32[] = { 8, 4 };
+// rigidSumInternalContactAndJointBatches2(PxgPrePrepDesc*, PxgSolverCoreDesc*,
+//   PxgConstraintPrepareDesc*, PxU32 nbBodies)
+static const uint8_t kThreePtrU32[] = { 8, 8, 8, 4 };
+
 // gpusolver preIntegrationTGS.cu: preIntegrationLaunchTGS(PxU32 offset,
 //   PxU32 nbSolverBodies, PxReal dt, PxVec3 gravity, PxgSolverBodyData*,
 //   PxgSolverBodySleepData*, PxgSolverTxIData*, const PxgBodySim*,
@@ -140,6 +146,11 @@ static const PxgKernelAbiRow kRows[] = {
     { "updateBodiesLaunch", kOnePtr, 1u },
     { "updateShapesLaunch", kUpdateShapes, uint32_t(sizeof(kUpdateShapes)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
+    // gpusolver contact/joint constraint prep (P5 Step 4 BDA)
+    { "rigidSumInternalContactAndJointBatches1", kPtrU32, uint32_t(sizeof(kPtrU32)) },
+    { "rigidSumInternalContactAndJointBatches2", kThreePtrU32, uint32_t(sizeof(kThreePtrU32)) },
+    { "constraintContactBlockPrePrepLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "contactConstraintBlockPrepareParallelLaunchTGS", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
 };
 
 inline size_t abiAlign(size_t size)

@@ -381,6 +381,12 @@ PXG_TEST(constraintPrepPGS_contact)
 
 PXG_TEST(constraintPrepTGS_contact)
 {
+    using namespace physx;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(4200);
     ContactSetup cs = buildContactSetup(rng);
 
@@ -405,49 +411,88 @@ PXG_TEST(constraintPrepTGS_contact)
     std::memset(outFR.data(), 0, outFR.size() * sizeof(TGSFriction));
 
     std::vector<uint64_t> currFricIdx(cs.numBatches * 32 + 1, 0);
-    std::vector<uint32_t> dummy(64, 0);
 
-    PxgBufferHandle batchBuf = createBufferFrom(dev, cs.batches);
-    PxgBufferHandle biBuf = createBufferFrom(dev, cs.batchIndices);
-    PxgBufferHandle bdBuf = createBufferFrom(dev, cs.bodyData);
-    PxgBufferHandle txBuf = createBufferFrom(dev, cs.txi);
-    PxgBufferHandle dummyBuf = createBufferFrom(dev, dummy);
-    PxgBufferHandle bfBuf = createBufferFrom(dev, cs.bodyFrames);
-    PxgBufferHandle wuBuf = createBufferFrom(dev, cs.workUnits);
-    PxgBufferHandle cdBuf = createBufferFrom(dev, cs.cdata);
-    PxgBufferHandle cpBuf = createBufferFrom(dev, cs.cpoints);
-    PxgBufferHandle cpatchBuf = createBufferFrom(dev, currPatches);
-    PxgBufferHandle canchBuf = createBufferFrom(dev, currAnchors);
-    PxgBufferHandle cfiBuf = createBufferFrom(dev, currFricIdx);
-    PxgBufferHandle chBuf = createBufferFrom(dev, chs);
-    PxgBufferHandle fhBuf = createBufferFrom(dev, fhs);
-    PxgBufferHandle outCPBuf = createBufferFrom(dev, outCP);
-    PxgBufferHandle outFRBuf = createBufferFrom(dev, outFR);
+    // ---- ENGINE ABI: live device buffers + REAL engine descriptors, launched
+    // through PxgCudaShim exactly as PxgTGSCudaSolverCore::
+    // contactConstraintPrepareParallel does ----
+    static std::vector<uint8_t> (*tgsLoader)(const char*) = [](const char* f) { return loadShaderBlob(f); };
+    const PxgKernelDef manifest[] = {
+        { "constraintPrepTGS.spv", "contactConstraintBlockPrepareParallelLaunchTGS", 16u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, tgsLoader);
 
-    Kernel kern("constraintPrepTGS.spv", "contactConstraintBlockPrepareParallelLaunchTGS",
-                std::vector<uint32_t>(25, 4), sizeof(PrepParams));
+    auto alloc = [&](const void* data, size_t bytes) -> PxgDevicePtr {
+        PxgDevicePtr dp = 0;
+        shim.memAlloc(&dp, bytes);
+        if (dp && data)
+            shim.memcpyHtoD(dp, data, bytes);
+        return dp;
+    };
 
-    PrepParams p = {};
-    p.numBatches = cs.numBatches;
-    p.totalCurrentEdges = cs.numBatches * 32;
-    p.hasPrevFrictionIndices = 0;
-    p.dtOrStepDt = stepDt;
-    p.invDtOrStepInvDt = invStepDt;
-    p.totalDt = totalDt;
-    p.invTotalDt = invTotalDt;
-    p.bounceThreshold = bounceThreshold;
-    p.frictionOffsetThreshold = frictionOffsetThreshold;
-    p.correlationDistance = correlationDistance;
-    p.ccdMaxSeparation = ccdMaxSeparation;
-    p.biasCoefficient = biasCoefficient;
+    const PxgDevicePtr dBatches = alloc(cs.batches.data(), cs.batches.size() * sizeof(Batch));
+    const PxgDevicePtr dBi = alloc(cs.batchIndices.data(), cs.batchIndices.size() * 4);
+    const PxgDevicePtr dBd = alloc(cs.bodyData.data(), cs.bodyData.size() * sizeof(SolverBodyData));
+    const PxgDevicePtr dTx = alloc(cs.txi.data(), cs.txi.size() * sizeof(SolverTxIData));
+    const PxgDevicePtr dBf = alloc(cs.bodyFrames.data(), cs.bodyFrames.size() * sizeof(AlignedTransform));
+    const PxgDevicePtr dWu = alloc(cs.workUnits.data(), cs.workUnits.size() * sizeof(BlockWorkUnit));
+    const PxgDevicePtr dCd = alloc(cs.cdata.data(), cs.cdata.size() * sizeof(BlockContactData));
+    const PxgDevicePtr dCp = alloc(cs.cpoints.data(), cs.cpoints.size() * sizeof(BlockContactPoint));
+    const PxgDevicePtr dPatch = alloc(currPatches.data(), currPatches.size() * sizeof(BlockFrictionPatch));
+    const PxgDevicePtr dAnch = alloc(currAnchors.data(), currAnchors.size() * sizeof(BlockFrictionAnchorPatch));
+    const PxgDevicePtr dCfi = alloc(currFricIdx.data(), currFricIdx.size() * 8);
+    const PxgDevicePtr dCh = alloc(chs.data(), chs.size() * sizeof(TGSContactHeader));
+    const PxgDevicePtr dFh = alloc(fhs.data(), fhs.size() * sizeof(TGSFrictionHeader));
+    const PxgDevicePtr dOutCP = alloc(outCP.data(), outCP.size() * sizeof(TGSContactPoint));
+    const PxgDevicePtr dOutFR = alloc(outFR.data(), outFR.size() * sizeof(TGSFriction));
+    if (!dBatches) { std::printf("  NOTE: no BDA -> skip\n"); return; }
 
-    // TGS contact bindings: 0-3 then 11-24
-    std::vector<PxgBufferHandle> bufs = { batchBuf, biBuf, bdBuf, txBuf, dummyBuf, dummyBuf, dummyBuf,
-                                          dummyBuf, dummyBuf, dummyBuf, dummyBuf, bfBuf, wuBuf, cdBuf,
-                                          cpBuf, cpatchBuf, dummyBuf, canchBuf, dummyBuf, cfiBuf, dummyBuf,
-                                          chBuf, fhBuf, outCPBuf, outFRBuf };
-    kern.dispatch(cs.numBatches, bufs, p);
-    dev->flush();
+    PxgConstraintPrepareDesc prepDesc;
+    std::memset(&prepDesc, 0xCD, sizeof(prepDesc)); // untouched fields must not matter
+    prepDesc.contactConstraintBatchIndices = reinterpret_cast<PxU32*>(dBi);
+    prepDesc.solverBodyDataPool = reinterpret_cast<PxgSolverBodyData*>(dBd);
+    prepDesc.solverBodyTxIDataPool = reinterpret_cast<PxgSolverTxIData*>(dTx);
+    prepDesc.blockWorkUnit = reinterpret_cast<PxgBlockWorkUnit*>(dWu);
+    prepDesc.blockCurrentFrictionIndices = reinterpret_cast<PxgBlockFrictionIndex*>(dCfi);
+    prepDesc.blockPreviousFrictionIndices = NULL; // no previous frame (== hasPrevFrictionIndices false)
+    prepDesc.blockContactCurrentPrepPool = reinterpret_cast<physx::PxgBlockContactData*>(dCd);
+    prepDesc.blockContactPoints = reinterpret_cast<physx::PxgBlockContactPoint*>(dCp);
+    prepDesc.blockCurrentAnchorPatches = reinterpret_cast<physx::PxgBlockFrictionAnchorPatch*>(dAnch);
+    prepDesc.blockPreviousAnchorPatches = NULL;
+    prepDesc.body2WorldPool = reinterpret_cast<PxAlignedTransform*>(dBf);
+    prepDesc.numContactBatches = cs.numBatches;
+    prepDesc.numStaticContactBatches = 0;
+    prepDesc.bounceThresholdF32 = bounceThreshold;
+    prepDesc.frictionOffsetThreshold = frictionOffsetThreshold;
+    prepDesc.correlationDistance = correlationDistance;
+    prepDesc.ccdMaxSeparation = ccdMaxSeparation;
+    prepDesc.totalPreviousEdges = 0;
+    prepDesc.totalCurrentEdges = cs.numBatches * 32;
+    prepDesc.biasCoefficient = biasCoefficient;
+
+    PxgSolverSharedDesc<IterativeSolveDataTGS> sharedDesc;
+    std::memset(&sharedDesc, 0xCD, sizeof(sharedDesc));
+    sharedDesc.blockCurrentFrictionPatches = reinterpret_cast<physx::PxgBlockFrictionPatch*>(dPatch);
+    sharedDesc.blockPreviousFrictionPatches = NULL;
+    sharedDesc.dt = totalDt;
+    sharedDesc.stepDt = stepDt;
+    sharedDesc.invDtF32 = invTotalDt;
+    sharedDesc.stepInvDtF32 = invStepDt;
+    sharedDesc.iterativeData.blockConstraintBatch = reinterpret_cast<PxgBlockConstraintBatch*>(dBatches);
+    sharedDesc.iterativeData.blockContactHeaders = reinterpret_cast<PxgTGSBlockSolverContactHeader*>(dCh);
+    sharedDesc.iterativeData.blockFrictionHeaders = reinterpret_cast<PxgTGSBlockSolverFrictionHeader*>(dFh);
+    sharedDesc.iterativeData.blockContactPoints = reinterpret_cast<PxgTGSBlockSolverContactPoint*>(dOutCP);
+    sharedDesc.iterativeData.blockFrictions = reinterpret_cast<PxgTGSBlockSolverContactFriction*>(dOutFR);
+
+    const PxgDevicePtr dPrepDesc = alloc(&prepDesc, sizeof(prepDesc));
+    const PxgDevicePtr dSharedDesc = alloc(&sharedDesc, sizeof(sharedDesc));
+
+    // engine launch: 2 warps/block (CONSTRAINT_PREPARE_BLOCK_PARALLEL = 64)
+    const uint32_t nbWarpsPerBlock = 64 / 32;
+    const uint32_t nbBlocks = (cs.numBatches + nbWarpsPerBlock - 1) / nbWarpsPerBlock;
+    struct { uint64_t prepDesc, sharedDesc; } prm = { dPrepDesc, dSharedDesc };
+    PXG_CHECK_MSG(shim.launchKernel(0, nbBlocks, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch contactConstraintBlockPrepareParallelLaunchTGS");
+    shim.streamSynchronize();
 
     // ---- reference ----
     std::vector<BlockFrictionPatch> refPatches = currPatches;
@@ -486,7 +531,7 @@ PXG_TEST(constraintPrepTGS_contact)
             if (!(perPointFriction || disableFriction))
                 refGetFrictionPatches(refPatches[k], refAnchors[k], lane, prevIdxDummy, false, cs.workUnits[k].mEdgeIndex[lane],
                                       prevPatchesDummy, prevAnchorsDummy, 0, bf0, bf1, correlationDistance,
-                                      p.totalPreviousEdges, patchExtents, nbContacts);
+                                      /*totalPreviousEdges*/ 0u, patchExtents, nbContacts);
             if (!disableFriction)
                 refGrowPatches(refPatches[k], refAnchors[k], lane, cs.cpoints, contactBase, nbContacts, bf0, bf1,
                                frictionOffsetThreshold + restDistance, patchExtents);
@@ -501,10 +546,14 @@ PXG_TEST(constraintPrepTGS_contact)
     }
 
     // ---- compare ----
-    const auto gCH = downloadBuffer<TGSContactHeader>(dev, chBuf, chs.size());
-    const auto gFH = downloadBuffer<TGSFrictionHeader>(dev, fhBuf, fhs.size());
-    const auto gCP = downloadBuffer<TGSContactPoint>(dev, outCPBuf, outCP.size());
-    const auto gFR = downloadBuffer<TGSFriction>(dev, outFRBuf, outFR.size());
+    std::vector<TGSContactHeader> gCH(chs.size());
+    std::vector<TGSFrictionHeader> gFH(fhs.size());
+    std::vector<TGSContactPoint> gCP(outCP.size());
+    std::vector<TGSFriction> gFR(outFR.size());
+    shim.memcpyDtoH(gCH.data(), dCh, gCH.size() * sizeof(TGSContactHeader));
+    shim.memcpyDtoH(gFH.data(), dFh, gFH.size() * sizeof(TGSFrictionHeader));
+    shim.memcpyDtoH(gCP.data(), dOutCP, gCP.size() * sizeof(TGSContactPoint));
+    shim.memcpyDtoH(gFR.data(), dOutFR, gFR.size() * sizeof(TGSFriction));
 
     size_t mism = 0;
     for (uint32_t k = 0; k < cs.numBatches && mism < 12; ++k)
@@ -558,9 +607,22 @@ PXG_TEST(constraintPrepTGS_contact)
         }
     PXG_CHECK_MSG(mism == 0, "%zu TGS row mismatches", mism);
 
-    for (PxgBufferHandle h : { batchBuf, biBuf, bdBuf, txBuf, dummyBuf, bfBuf, wuBuf, cdBuf, cpBuf, cpatchBuf,
-                               canchBuf, cfiBuf, chBuf, fhBuf, outCPBuf, outFRBuf })
-        dev->destroyBuffer(h);
+    // the current-frame friction patches/anchors are engine-ABI outputs too:
+    // spot-check the write-through-desc path (anchor counts + patch indices)
+    std::vector<BlockFrictionPatch> gPatch(currPatches.size());
+    shim.memcpyDtoH(gPatch.data(), dPatch, gPatch.size() * sizeof(BlockFrictionPatch));
+    mism = 0;
+    for (uint32_t k = 0; k < cs.numBatches; ++k)
+        for (uint32_t l = 0; l < cs.batches[k].descStride; ++l)
+        {
+            if (gPatch[k].anchorCount[l] != refPatches[k].anchorCount[l]) ++mism;
+            if (gPatch[k].patchIndex[l] != cs.workUnits[k].mFrictionPatchIndex[l]) ++mism;
+        }
+    PXG_CHECK_MSG(mism == 0, "%zu TGS patch mismatches", mism);
+
+    for (PxgDevicePtr h : { dBatches, dBi, dBd, dTx, dBf, dWu, dCd, dCp, dPatch, dAnch, dCfi, dCh, dFh,
+                            dOutCP, dOutFR, dPrepDesc, dSharedDesc })
+        shim.memFree(h);
 }
 
 // ---------------------------------------------------------------------------

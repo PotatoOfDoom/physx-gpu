@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 129;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 132;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -102,7 +102,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "evaluatePointDistancesSDFBatch", nullptr, nullptr },  // EVALUATE_POINT_DISTANCES_SDF (unmapped)
     { "updateFrictionPatches", "npCompressContacts.spv", "updateFrictionPatches" },  // UPDATE_FRICTION_PATCHES
     { "preIntegrationLaunch", "preIntegration.spv", "preIntegrationLaunch" },  // PRE_INTEGRATION
-    { "constraintContactBlockPrePrepLaunch", nullptr, nullptr },  // CONTACT_CONSTRAINT_PREPREP_BLOCK (unmapped)
+    { "constraintContactBlockPrePrepLaunch", "npContactPrePrep.spv", "constraintContactBlockPrePrepLaunch" },  // CONTACT_CONSTRAINT_PREPREP_BLOCK (P5 Step 4 BDA port)
     { "constraint1DPrePrepLaunch", nullptr, nullptr },  // JOINT_CONSTRAINT_PREPREP (unmapped)
     { "constraint1DBlockPrePrepLaunch", nullptr, nullptr },  // JOINT_CONSTRAINT_PREPREP_BLOCK (unmapped)
     { "jointConstraintBlockPrepareParallelLaunch", "constraintPrepPGS.spv", "jointConstraintBlockPrepareParallelLaunch" },  // JOINT_CONSTRAINT_PREPARE_BLOCK_PARALLEL
@@ -203,8 +203,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "accumulateDeltaVRigidSecondLaunchMultiStage1", nullptr, nullptr },  // ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND_MULTI1 (unmapped)
     { "accumulateDeltaVRigidSecondLaunchMultiStage2", nullptr, nullptr },  // ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND_MULTI2 (unmapped)
     { "clearDeltaVRigidSecondLaunchMulti", nullptr, nullptr },  // ACCUMULATE_DELTAVEL_RIGIDBODY_MULTI_CLEAR (unmapped)
-    { "rigidSumInternalContactAndJointBatches1", nullptr, nullptr },  // RIGID_SUM_STATIC_CONTACT1 (unmapped)
-    { "rigidSumInternalContactAndJointBatches2", nullptr, nullptr },  // RIGID_SUM_STATIC_CONTACT2 (unmapped)
+    { "rigidSumInternalContactAndJointBatches1", "npRigidSumBatches.spv", "rigidSumInternalContactAndJointBatches1" },  // RIGID_SUM_STATIC_CONTACT1 (P5 Step 4 BDA port)
+    { "rigidSumInternalContactAndJointBatches2", "npRigidSumBatches.spv", "rigidSumInternalContactAndJointBatches2" },  // RIGID_SUM_STATIC_CONTACT2 (P5 Step 4 BDA port)
     { "solveStaticBlock", nullptr, nullptr },  // RIGID_SOLVE_STATIC_CONSTRAINTS (unmapped)
     { "solveStaticBlockTGS", nullptr, nullptr },  // RIGID_SOLVE_STATIC_CONSTRAINTS_TGS (unmapped)
     { "solveWholeIslandTGS", "solverTGS.spv", "solveWholeIslandTGS" },  // RIGID_SOLVE_WHOLE_ISLAND_TGS

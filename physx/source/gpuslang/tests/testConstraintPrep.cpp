@@ -32,6 +32,11 @@
 #include "pxgTestFramework.h"
 #include "pxgGpuStructs.h"
 #include "pxgRefMath.h"
+#include "PxgCudaShim.h"
+
+// engine descriptors for the ENGINE-ABI TGS contact prep test
+#include "PxNodeIndex.h" // completes PxNodeIndex for the PxgNarrowphaseCore.h chain
+#include "PxgSolverCoreDesc.h"
 
 #include <cmath>
 #include <cstring>
@@ -42,6 +47,12 @@ namespace
 {
 using namespace pxgtest;
 
+// PX_MAX_F32 is now a macro from the engine PxSimpleTypes.h (pulled in by the
+// engine descriptor headers for the ENGINE-ABI TGS contact test); use a local
+// alias to avoid the collision.
+#ifdef PX_MAX_F32
+#undef PX_MAX_F32
+#endif
 const float PX_MAX_F32 = 3.4028234663852885981170418348452e+38f;
 
 // flag values (mirror the shader constants)

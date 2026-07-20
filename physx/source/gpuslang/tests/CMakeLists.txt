@@ -69,7 +69,8 @@ set(SHADER_COMMON_DEPS
     ${SHADER_DIR}/pxgSlangWarpInc.slang
     ${SHADER_DIR}/pxgSlangBpDesc.slang
     ${SHADER_DIR}/pxgSlangSolverDesc.slang
-    ${SHADER_DIR}/pxgSlangSimCoreDesc.slang)
+    ${SHADER_DIR}/pxgSlangSimCoreDesc.slang
+    ${SHADER_DIR}/pxgSlangPrepDesc.slang)
 
 # Shaders whose SPIR-V gets NoContraction decorations stamped onto every
 # float arithmetic op (tools/spv_nocontract.py).  slangc emits none and its
@@ -232,8 +233,9 @@ pxg_compile_shader(npCvxBvhGlue cbgGlue)
 pxg_compile_shader(npCvxCoreWarpAcc cwaAddPoints)
 pxg_compile_shader(npD6JointPrep d6jPrep c1dPrePrep)
 pxg_compile_shader(npRemapIndex remapIndex)
-pxg_compile_shader(npContactPrePrep cppPack)
-pxg_compile_shader(npRigidSumBatches rsBatches1 rsBatches2)
+pxg_compile_shader(npContactPrePrep cppPack constraintContactBlockPrePrepLaunch)
+pxg_compile_shader(npRigidSumBatches rigidSumInternalContactAndJointBatches1
+                   rigidSumInternalContactAndJointBatches2)
 pxg_compile_shader(npArtiExtBody aebBody aebFinalizePGS aebFinalizeTGS)
 pxg_compile_shader(npArti1DPrep a1dPGS a1dTGS)
 pxg_compile_shader(npArtiJointHeader ajhPGS ajhTGS)
@@ -418,6 +420,9 @@ pxg_compile_shader(npBpDescProbe bpDescProbe)
 pxg_compile_shader(npSolverDescProbe solverDescProbe)
 # P5 Step 4: empirical layout proof for the simulation-controller desc mirrors.
 pxg_compile_shader(npSimCoreDescProbe simCoreDescProbe)
+# P5 Step 4: PxgPrePrepDesc / PxgConstraintPrepareDesc /
+# PxgSolverSharedDesc<IterativeSolveData> + indexed-element mirror layout proof (BDA).
+pxg_compile_shader(npPrepDescProbe prepDescProbe)
 # RUNTIME_PLAN.md P3 launch-marshalling proof kernel (multi-arg natural alignment).
 pxg_compile_shader(npShimMisalign shimMisAdd)
 
@@ -761,6 +766,7 @@ add_executable(gpuslang-tests
     testBpDescLayout.cpp
     testSolverDescLayout.cpp
     testSimCoreDescLayout.cpp
+    testPrepDescLayout.cpp
     testP4Aabb.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelAbi.cpp
@@ -908,7 +914,7 @@ foreach(suite scan radixSort radixSortDesc radixSortGather preIntegration integr
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -1057,9 +1063,9 @@ set(PXG_HLSL_ENTRIES
     "npD6JointPrep:d6jPrep"
     "npD6JointPrep:c1dPrePrep"
     "npRemapIndex:remapIndex"
+    # npRigidSumBatches + npContactPrePrep:constraintContactBlockPrePrepLaunch:
+    # BDA engine-ABI ports — Vulkan-only (P0 policy), removed from the HLSL set.
     "npContactPrePrep:cppPack"
-    "npRigidSumBatches:rsBatches1"
-    "npRigidSumBatches:rsBatches2"
     "npArtiExtBody:aebBody"
     "npArtiExtBody:aebFinalizePGS"
     "npArtiExtBody:aebFinalizeTGS"
