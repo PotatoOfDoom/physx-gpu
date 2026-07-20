@@ -1,0 +1,460 @@
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+//  * Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+//  * Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in the
+//    documentation and/or other materials provided with the distribution.
+//  * Neither the name of NVIDIA CORPORATION nor the names of its
+//    contributors may be used to endorse or promote products derived
+//    from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
+// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+// Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
+
+// P5 Step 5 tranche 8: the ASSEMBLED collide() (GJK + EPA + sphere/capsule
+// contact gen, npCvxCollide.slang) inside convexConvexNphase_stage2Kernel,
+// driven through PxgCudaShim on the ENGINE ABI (56-byte Stage2Params blob,
+// same launch pattern as testNpCvxStage2Setup.cpp) against a REAL cooked box
+// convex-hull blob (fixture shared with testConvexPlaneNphase.cpp).
+//
+// VERIFICATION LEVEL: geometric integration.  The sub-pieces (gjkWarm /
+// epaCore / face / EE) are bit-verified by their standalone tranches; here
+// the ASSEMBLY is checked against CPU expectations derived from
+// cudaGJKEPA.cu for axis-aligned capsule/sphere-on-box configurations:
+//   1. capsule lying on the box top, surface touching -> 2 face contacts,
+//      manifold normal (0,+1,0) in B-local (np.xyz = -gjkOutput.direction;
+//      the GJK direction is (0,-1,0), i.e. B->closest-feature-of-A points up
+//      so -direction points from B to A), np.w = tEnter = segment-to-surface
+//      distance = radius (+ separation);
+//   2. deep overlap (segment inside the hull) -> EPA path; per the .cu the
+//      face-ray tEnter clamps at 0 (intersectRayPolyhedron starts tFirst=0),
+//      so np.w == 0 and localContactB == the segment endpoints;
+//   3. separated but within contactDistance -> GJK-close face contacts with
+//      np.w = gap;
+//   4. distant -> collide() returns false, word 12 = refreshedNb|0x80000000,
+//      contact slots untouched;
+//   5. capsule overhanging a narrow box -> face rays miss (plane
+//      separation), EE fallback emits the two edge contacts (negated
+//      normalPen);
+//   6. sphere type0 -> exactly 1 contact, contactA = 0 (sphere centre),
+//      normal = -gjkOutput.direction;
+//   7. mutation canary: flipping the hull's top-face plane must break the
+//      touch expectations (proves the kernel reads the blob planes).
+// Also asserted every run: quatB words 9-11 rewritten byte-identically,
+// relativePos/quatA untouched, and warm-start words 13-15 READ but NEVER
+// stored back (sentinel patterns survive).
+
+#include "pxgTestFramework.h"
+#include "PxgCudaShim.h"
+
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+namespace
+{
+using namespace pxgtest;
+using physx::gpuslang::PxgCudaShim;
+using physx::gpuslang::PxgKernelDef;
+using physx::gpuslang::PxgDevicePtr;
+using physx::gpuslang::PxgResult;
+
+// ---------------------------------------------------------------------------
+// Host mirrors of the engine element structs (byte-exact vs the C++ headers).
+// ---------------------------------------------------------------------------
+#pragma pack(push, 1)
+struct HInput { uint32_t shapeRef0, shapeRef1, transformCacheRef0, transformCacheRef1; };  // 16
+struct HCachedTransform { float qx, qy, qz, qw, px, py, pz; uint32_t flags; };              // 32
+struct HShape { float sx, sy, sz, srx, sry, srz, srw; uint32_t materialIndex;
+                uint64_t hullPtr; uint32_t type, particleId; };                             // 48
+struct HManifold                                                                            // 256
+{
+    float lNp[4][4]; float lA[4][4]; float lB[4][4];       // 0 / 64 / 128
+    float relPos[4]; float quatA[4]; float quatB[4];       // 192 / 208 / 224
+    uint32_t nbContacts, nbWarmStart, warmA, warmB;        // 240..252
+};
+#pragma pack(pop)
+
+static_assert(sizeof(HInput) == 16, "HInput");
+static_assert(sizeof(HCachedTransform) == 32, "HCachedTransform");
+static_assert(sizeof(HShape) == 48, "HShape");
+static_assert(sizeof(HManifold) == 256, "HManifold");
+
+struct V3 { float x, y, z; };
+
+// ---------------------------------------------------------------------------
+// The cooked box convex-hull blob (fixture shared with
+// testConvexPlaneNphase.cpp): 8 verts, 6 faces, 12 edges at the GRB byte
+// offsets relative to convexPtrB = hullPtr + 16.  Mesh scale identity so
+// vertex2Shape(v) == v.
+// ---------------------------------------------------------------------------
+static const int kBoxFaceVtx[6][4] = {
+    { 4, 5, 7, 6 }, // +x
+    { 0, 2, 3, 1 }, // -x
+    { 2, 6, 7, 3 }, // +y
+    { 0, 1, 5, 4 }, // -y
+    { 1, 3, 7, 5 }, // +z
+    { 0, 4, 6, 2 }, // -z
+};
+static const float kBoxFaceN[6][3] = {
+    { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 },
+};
+static const int kBoxEdgeFaces[12][2] = {
+    { 0, 2 }, { 0, 3 }, { 0, 4 }, { 0, 5 }, { 1, 2 }, { 1, 3 },
+    { 1, 4 }, { 1, 5 }, { 2, 4 }, { 2, 5 }, { 3, 4 }, { 3, 5 },
+};
+
+static V3 boxCorner(int i, V3 h)
+{
+    return V3{ (i & 4) ? h.x : -h.x, (i & 2) ? h.y : -h.y, (i & 1) ? h.z : -h.z };
+}
+
+static std::vector<uint8_t> buildBoxHull(V3 h)
+{
+    std::vector<uint8_t> blob(512, 0);
+    auto setU32 = [&](size_t off, uint32_t v) { std::memcpy(&blob[off], &v, 4); };
+    auto setF = [&](size_t off, float v) { std::memcpy(&blob[off], &v, 4); };
+
+    const uint32_t V = 8, P = 6, E = 12;
+    const size_t convexPtrB = 16;               // hullPtr + sizeof(float4)
+    // header uint4 (only .x used): nbPolygons | nbVerts<<8 | nbEdges<<16
+    setU32(convexPtrB + 0, P | (V << 8) | (E << 16));
+    // extents float4 (.xyz internal AABB, .w inSphereRadius)
+    setF(convexPtrB + 16, h.x); setF(convexPtrB + 20, h.y); setF(convexPtrB + 24, h.z);
+    setF(convexPtrB + 28, std::fmin(std::fmin(h.x, h.y), h.z));
+
+    const size_t vertsBase = convexPtrB + 32;
+    for (uint32_t i = 0; i < V; ++i)
+    {
+        const V3 c = boxCorner(int(i), h);
+        setF(vertsBase + 16 * i + 0, c.x); setF(vertsBase + 16 * i + 4, c.y); setF(vertsBase + 16 * i + 8, c.z);
+    }
+    const size_t planesBase = vertsBase + 16 * V;
+    for (uint32_t f = 0; f < P; ++f)
+    {
+        setF(planesBase + 16 * f + 0, kBoxFaceN[f][0]);
+        setF(planesBase + 16 * f + 4, kBoxFaceN[f][1]);
+        setF(planesBase + 16 * f + 8, kBoxFaceN[f][2]);
+        const V3 fv = boxCorner(kBoxFaceVtx[f][0], h);
+        setF(planesBase + 16 * f + 12, -(kBoxFaceN[f][0] * fv.x + kBoxFaceN[f][1] * fv.y + kBoxFaceN[f][2] * fv.z));
+    }
+    const size_t polyDescBase = planesBase + 16 * P;
+    for (uint32_t f = 0; f < P; ++f)
+        setU32(polyDescBase + 4 * f, (4u * f) << 16 | (4u << 8) | 0u); // vRef8<<16 | nbVerts<<8 | minIndex
+
+    // verticesByEdges16 [polyDescBase + 4P, +4E) unused by collide() (left 0).
+    const size_t fbeBase = polyDescBase + 4 * P + 4 * E;
+    for (uint32_t e = 0; e < E; ++e)
+    {
+        blob[fbeBase + 2 * e + 0] = uint8_t(kBoxEdgeFaces[e][0]);
+        blob[fbeBase + 2 * e + 1] = uint8_t(kBoxEdgeFaces[e][1]);
+    }
+    // facesByVertices8 [fbeBase + 2E, +3V) unused (left 0).
+    const size_t vtxDataBase = fbeBase + 2 * E + 3 * V;
+    for (uint32_t f = 0; f < P; ++f)
+        for (uint32_t k = 0; k < 4; ++k)
+            blob[vtxDataBase + 4 * f + k] = uint8_t(kBoxFaceVtx[f][k]);
+    return blob;
+}
+
+// The 56-byte engine parameter blob.
+struct Stage2Blob
+{
+    uint32_t numTests;
+    float toleranceLength;
+    uint64_t tempKeepPairsArray, cmInputs, cmManifolds, shapes, transformCache, contactDistance;
+};
+static_assert(sizeof(Stage2Blob) == 56, "stage2 engine blob is 56 bytes");
+
+// One capsule/sphere-on-box scene, both bodies axis-aligned (identity quats).
+struct Scene
+{
+    uint32_t type0;      // 0 = sphere, 2 = capsule
+    V3 scale0;           // capsule: (halfHeight, radius, radius); sphere: (r, r, r)
+    V3 pos0;             // shape 0 world position (box is at the origin)
+    V3 boxHalf;          // hull half-extents
+    float cdPerShape;    // per-shape contact distance (cd0 == cd1)
+    uint32_t countsWord; // stage-1 counts word preloaded in the manifold
+    bool flipTopPlane;   // mutation canary: negate the +y hull plane
+};
+
+struct RunResult
+{
+    HManifold mf;    // manifold after the launch
+    size_t tailBad;  // moreData words 0-11 + 13-15 preservation violations
+};
+
+static std::vector<uint8_t> ccLoader(const char* file) { return loadShaderBlob(file); }
+
+static bool runScene(const Scene& sc, RunResult& out)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    static const PxgKernelDef manifest[] = {
+        { "npCvxStage2Setup.spv", "convexConvexNphase_stage2Kernel", 56u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &ccLoader);
+
+    std::vector<uint8_t> blob = buildBoxHull(sc.boxHalf);
+    if (sc.flipTopPlane)
+    {
+        // negate the +y plane (polygon 2): n = (0,-1,0), d = -d
+        const size_t planesBase = 16 + 32 + 16 * 8 + 16 * 2;
+        float n[4]; std::memcpy(n, &blob[planesBase], 16);
+        n[0] = -n[0]; n[1] = -n[1]; n[2] = -n[2]; n[3] = -n[3];
+        std::memcpy(&blob[planesBase], n, 16);
+    }
+
+    HInput in = { 0, 1, 0, 1 };
+    std::vector<HShape> shapes(2);
+    shapes[0] = { sc.scale0.x, sc.scale0.y, sc.scale0.z, 0, 0, 0, 1, 3u, 0u, sc.type0, 0u };
+    shapes[1] = { 1, 1, 1, 0, 0, 0, 1, 5u, 0u, 3u /*eBOX*/, 0u }; // hullPtr filled below
+    std::vector<HCachedTransform> xf(2);
+    xf[0] = { 0, 0, 0, 1, sc.pos0.x, sc.pos0.y, sc.pos0.z, 0u };
+    xf[1] = { 0, 0, 0, 1, 0, 0, 0, 0u };
+    std::vector<float> cd = { sc.cdPerShape, sc.cdPerShape };
+    uint32_t keep = 1u;
+
+    HManifold mf;
+    std::memset(&mf, 0xCD, sizeof(mf)); // contact slots: 0xCD sentinel
+    mf.relPos[0] = 1; mf.relPos[1] = 2; mf.relPos[2] = 3; mf.relPos[3] = 4;
+    mf.quatA[0] = 5; mf.quatA[1] = 6; mf.quatA[2] = 7; mf.quatA[3] = 8;
+    mf.quatB[0] = 9; mf.quatB[1] = 10; mf.quatB[2] = 11; mf.quatB[3] = 12;
+    mf.nbContacts = sc.countsWord;
+    mf.nbWarmStart = 0u;          // ws13 = 0: seeds nothing, but words 14/15
+    mf.warmA = 0xAABBCCDDu;       // must be READ-only (never stored back)
+    mf.warmB = 0x11223344u;
+
+    PxgDevicePtr dBlob = 0, dIn = 0, dShapes = 0, dXf = 0, dCd = 0, dKeep = 0, dMf = 0;
+    shim.memAlloc(&dBlob, blob.size());
+    if (!dBlob) { std::printf("  NOTE: no BDA -> skip\n"); return false; }
+    shapes[1].hullPtr = uint64_t(dBlob);
+    shim.memAlloc(&dIn, sizeof(HInput));
+    shim.memAlloc(&dShapes, shapes.size() * sizeof(HShape));
+    shim.memAlloc(&dXf, xf.size() * sizeof(HCachedTransform));
+    shim.memAlloc(&dCd, cd.size() * 4);
+    shim.memAlloc(&dKeep, 4);
+    shim.memAlloc(&dMf, sizeof(HManifold));
+
+    shim.memcpyHtoD(dBlob, blob.data(), blob.size());
+    shim.memcpyHtoD(dIn, &in, sizeof(HInput));
+    shim.memcpyHtoD(dShapes, shapes.data(), shapes.size() * sizeof(HShape));
+    shim.memcpyHtoD(dXf, xf.data(), xf.size() * sizeof(HCachedTransform));
+    shim.memcpyHtoD(dCd, cd.data(), cd.size() * 4);
+    shim.memcpyHtoD(dKeep, &keep, 4);
+    shim.memcpyHtoD(dMf, &mf, sizeof(HManifold));
+
+    Stage2Blob params = { 1u, 1.0f, dKeep, dIn, dMf, dShapes, dXf, dCd };
+    PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &params, sizeof(params)) == PxgResult::Success,
+                  "launch stage2 (collide assembled)");
+    shim.streamSynchronize();
+
+    shim.memcpyDtoH(&out.mf, dMf, sizeof(HManifold));
+
+    // moreData tail preservation: relativePos (0-3) / quatA (4-7) untouched,
+    // quatB (8-11) rewritten byte-identically, warm words 13-15 NEVER stored.
+    out.tailBad = 0;
+    if (std::memcmp(out.mf.relPos, mf.relPos, 16) != 0) ++out.tailBad;
+    if (std::memcmp(out.mf.quatA, mf.quatA, 16) != 0) ++out.tailBad;
+    if (std::memcmp(out.mf.quatB, mf.quatB, 16) != 0) ++out.tailBad;
+    if (out.mf.nbWarmStart != mf.nbWarmStart || out.mf.warmA != mf.warmA || out.mf.warmB != mf.warmB)
+        ++out.tailBad;
+
+    for (PxgDevicePtr p : { dBlob, dIn, dShapes, dXf, dCd, dKeep, dMf })
+        shim.memFree(p);
+    return true;
+}
+
+static bool eq4(const float* g, float x, float y, float z, float w)
+{
+    return almostEqual(g[0], x, 2e-4f, 2e-5f) && almostEqual(g[1], y, 2e-4f, 2e-5f) &&
+           almostEqual(g[2], z, 2e-4f, 2e-5f) && almostEqual(g[3], w, 2e-4f, 2e-5f);
+}
+
+static bool slotUntouched(const HManifold& m, uint32_t j)
+{
+    const uint8_t* np = reinterpret_cast<const uint8_t*>(m.lNp[j]);
+    const uint8_t* a = reinterpret_cast<const uint8_t*>(m.lA[j]);
+    const uint8_t* b = reinterpret_cast<const uint8_t*>(m.lB[j]);
+    for (int k = 0; k < 16; ++k)
+        if (np[k] != 0xCD || a[k] != 0xCD || b[k] != 0xCD) return false;
+    return true;
+}
+
+struct ExpContact { V3 a, b, n; float pen; };
+
+// Order-independent slot match of the first `count` manifold slots.
+static size_t matchContacts(const HManifold& m, const std::vector<ExpContact>& exp, bool quiet, const char* label)
+{
+    size_t bad = 0;
+    const uint32_t nb = uint32_t(exp.size());
+    std::vector<bool> used(nb, false);
+    for (uint32_t k = 0; k < nb; ++k)
+    {
+        bool matched = false;
+        for (uint32_t j = 0; j < nb && !matched; ++j)
+        {
+            if (used[j]) continue;
+            if (eq4(m.lA[k], exp[j].a.x, exp[j].a.y, exp[j].a.z, 0.0f) &&
+                eq4(m.lB[k], exp[j].b.x, exp[j].b.y, exp[j].b.z, 0.0f) &&
+                eq4(m.lNp[k], exp[j].n.x, exp[j].n.y, exp[j].n.z, exp[j].pen))
+            { used[j] = true; matched = true; }
+        }
+        if (!matched)
+        {
+            if (!quiet)
+                std::printf("  [%s] slot %u unmatched: A(%g %g %g) B(%g %g %g) np(%g %g %g | %g)\n", label, k,
+                            m.lA[k][0], m.lA[k][1], m.lA[k][2], m.lB[k][0], m.lB[k][1], m.lB[k][2],
+                            m.lNp[k][0], m.lNp[k][1], m.lNp[k][2], m.lNp[k][3]);
+            ++bad;
+        }
+    }
+    return bad;
+}
+
+// Full check of one touching-scene expectation; returns the mismatch count.
+static size_t checkScene(const Scene& sc, uint32_t expWord12, const std::vector<ExpContact>& exp,
+                         bool quiet, const char* label)
+{
+    RunResult r;
+    if (!runScene(sc, r)) return 0; // no BDA -> skip (counts as pass, like siblings)
+    size_t bad = r.tailBad;
+    if (r.tailBad && !quiet) std::printf("  [%s] moreData tail violated (%zu)\n", label, r.tailBad);
+    if (r.mf.nbContacts != expWord12)
+    {
+        if (!quiet) std::printf("  [%s] word12 gpu=%08x ref=%08x\n", label, r.mf.nbContacts, expWord12);
+        ++bad;
+    }
+    bad += matchContacts(r.mf, exp, quiet, label);
+    for (uint32_t j = uint32_t(exp.size()); j < 4; ++j)
+        if (!slotUntouched(r.mf, j))
+        {
+            if (!quiet) std::printf("  [%s] slot %u sentinel violated\n", label, j);
+            ++bad;
+        }
+    return bad;
+}
+
+// ---------------------------------------------------------------------------
+// 1+3. capsule face path: touching and separated-within-contactDistance.
+// capsule (hh=0.5, r=0.5, axis X) over box (2, 0.5, 2); cd = 0.05+0.05;
+// contactDist = 0.1 + r (expandedMargin = radius).  gap g = y0 - 0.5 from
+// segment to box top; contacts iff g <= 0.6; np = ((0,1,0), g),
+// A-local (+-hh, 0, 0), B-local (+-hh, 0.5, 0).
+// ---------------------------------------------------------------------------
+PXG_TEST(cvxCollide_capsuleFaceTouch)
+{
+    const Scene touch = { 2u, V3{ 0.5f, 0.5f, 0.5f }, V3{ 0, 1.0f, 0 }, V3{ 2, 0.5f, 2 }, 0.05f, 0u, false };
+    std::vector<ExpContact> exp = {
+        { V3{ 0.5f, 0, 0 }, V3{ 0.5f, 0.5f, 0 }, V3{ 0, 1, 0 }, 0.5f },
+        { V3{ -0.5f, 0, 0 }, V3{ -0.5f, 0.5f, 0 }, V3{ 0, 1, 0 }, 0.5f },
+    };
+    size_t bad = checkScene(touch, 2u, exp, false, "touch");
+    PXG_CHECK_MSG(bad == 0, "capsule touch: %zu mismatches", bad);
+    std::printf("  [touch] 2 face contacts, np=(0,1,0,0.5) ok\n");
+
+    const Scene near_ = { 2u, V3{ 0.5f, 0.5f, 0.5f }, V3{ 0, 1.05f, 0 }, V3{ 2, 0.5f, 2 }, 0.05f, 0u, false };
+    std::vector<ExpContact> expN = {
+        { V3{ 0.5f, 0, 0 }, V3{ 0.5f, 0.5f, 0 }, V3{ 0, 1, 0 }, 0.55f },
+        { V3{ -0.5f, 0, 0 }, V3{ -0.5f, 0.5f, 0 }, V3{ 0, 1, 0 }, 0.55f },
+    };
+    bad = checkScene(near_, 2u, expN, false, "near");
+    PXG_CHECK_MSG(bad == 0, "capsule near: %zu mismatches", bad);
+    std::printf("  [near] 2 face contacts within contactDistance, np.w=0.55 ok\n");
+}
+
+// ---------------------------------------------------------------------------
+// 2. deep overlap: segment inside the hull -> GJK overlap -> EPA; face rays
+// start inside so tEnter clamps at 0 (the .cu tFirst=0 semantics): np.w = 0
+// and localContactB = the segment endpoints.
+// ---------------------------------------------------------------------------
+PXG_TEST(cvxCollide_capsuleDeepEpa)
+{
+    const Scene deep = { 2u, V3{ 0.5f, 0.5f, 0.5f }, V3{ 0, 0.3f, 0 }, V3{ 2, 0.5f, 2 }, 0.05f, 0u, false };
+    std::vector<ExpContact> exp = {
+        { V3{ 0.5f, 0, 0 }, V3{ 0.5f, 0.3f, 0 }, V3{ 0, 1, 0 }, 0.0f },
+        { V3{ -0.5f, 0, 0 }, V3{ -0.5f, 0.3f, 0 }, V3{ 0, 1, 0 }, 0.0f },
+    };
+    const size_t bad = checkScene(deep, 2u, exp, false, "deep");
+    PXG_CHECK_MSG(bad == 0, "capsule deep/EPA: %zu mismatches", bad);
+    std::printf("  [deep] EPA path, 2 face contacts at the segment (tEnter clamp) ok\n");
+}
+
+// ---------------------------------------------------------------------------
+// 4. distant: gap beyond contactDistance -> collide() returns false; word 12
+// keeps the refreshed count with the no-touch bit; slots untouched.
+// ---------------------------------------------------------------------------
+PXG_TEST(cvxCollide_capsuleDistant)
+{
+    const Scene far_ = { 2u, V3{ 0.5f, 0.5f, 0.5f }, V3{ 0, 2.5f, 0 }, V3{ 2, 0.5f, 2 }, 0.05f,
+                         3u | (2u << 8), false };
+    const size_t bad = checkScene(far_, 3u | 0x80000000u, {}, false, "distant");
+    PXG_CHECK_MSG(bad == 0, "capsule distant: %zu mismatches", bad);
+    std::printf("  [distant] eDISTANT -> word12=refreshedNb|0x80000000, slots untouched ok\n");
+}
+
+// ---------------------------------------------------------------------------
+// 5. EE fallback: capsule (hh=0.5) overhanging a narrow box (hx=0.3) — both
+// face rays hit the +-x plane separation, so generatedContactsEEContacts
+// emits the two top-face edge crossings with the NEGATED normalPen:
+// B-local (+-0.3, 0.5, 0), A-local (+-0.3, 0, 0), np = ((0,1,0), 0.4).
+// ---------------------------------------------------------------------------
+PXG_TEST(cvxCollide_capsuleEdgeEE)
+{
+    const Scene ee = { 2u, V3{ 0.5f, 0.5f, 0.5f }, V3{ 0, 0.9f, 0 }, V3{ 0.3f, 0.5f, 0.5f }, 0.05f, 0u, false };
+    std::vector<ExpContact> exp = {
+        { V3{ 0.3f, 0, 0 }, V3{ 0.3f, 0.5f, 0 }, V3{ 0, 1, 0 }, 0.4f },
+        { V3{ -0.3f, 0, 0 }, V3{ -0.3f, 0.5f, 0 }, V3{ 0, 1, 0 }, 0.4f },
+    };
+    const size_t bad = checkScene(ee, 2u, exp, false, "ee");
+    PXG_CHECK_MSG(bad == 0, "capsule EE: %zu mismatches", bad);
+    std::printf("  [ee] face rays miss, 2 edge-edge contacts ok\n");
+}
+
+// ---------------------------------------------------------------------------
+// 6. sphere type0: 1 contact, contactA = sphere centre (0), contactB = the
+// GJK witness on the box, normal = -gjkOutput.direction = (0,1,0), sep = gap.
+// ---------------------------------------------------------------------------
+PXG_TEST(cvxCollide_sphereWitness)
+{
+    const Scene sph = { 0u, V3{ 0.5f, 0.5f, 0.5f }, V3{ 0, 1.0f, 0 }, V3{ 2, 0.5f, 2 }, 0.05f, 0u, false };
+    std::vector<ExpContact> exp = {
+        { V3{ 0, 0, 0 }, V3{ 0, 0.5f, 0 }, V3{ 0, 1, 0 }, 0.5f },
+    };
+    const size_t bad = checkScene(sph, 1u, exp, false, "sphere");
+    PXG_CHECK_MSG(bad == 0, "sphere witness: %zu mismatches", bad);
+    std::printf("  [sphere] 1 witness contact, A=centre, np=(0,1,0,0.5) ok\n");
+}
+
+// ---------------------------------------------------------------------------
+// 7. mutation canary: flip the hull's +y plane; the touch expectations must
+// FAIL — proves the test discriminates and the kernel reads the blob planes.
+// ---------------------------------------------------------------------------
+PXG_TEST(cvxCollide_mutation)
+{
+    const Scene mut = { 2u, V3{ 0.5f, 0.5f, 0.5f }, V3{ 0, 1.0f, 0 }, V3{ 2, 0.5f, 2 }, 0.05f, 0u, true };
+    std::vector<ExpContact> exp = {
+        { V3{ 0.5f, 0, 0 }, V3{ 0.5f, 0.5f, 0 }, V3{ 0, 1, 0 }, 0.5f },
+        { V3{ -0.5f, 0, 0 }, V3{ -0.5f, 0.5f, 0 }, V3{ 0, 1, 0 }, 0.5f },
+    };
+    RunResult probe;
+    if (!runScene(mut, probe)) return; // no BDA -> skip
+    const size_t bad = checkScene(mut, 2u, exp, true, "mutation");
+    PXG_CHECK_MSG(bad != 0, "mutation must FAIL the touch expectations");
+    std::printf("  [mutation] flipped top plane breaks the expectations (%zu mismatches) ok\n", bad);
+}
+
+} // namespace

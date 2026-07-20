@@ -48,25 +48,30 @@
 // the 16-lane moreData read + one shfl from lane 12, both straight-line when
 // serialized).
 //
-// collide() ITSELF (the GJK/EPA/contact-gen core) IS NOT YET ASSEMBLED in
-// Slang — its verified pieces live in the npGjk*/npEpa*/npManifold*
-// tranches.  This kernel is the .cu with the single `collide(...)` call
-// elided: `bool bIntersection = false` stays false and numManifoldContacts
-// keeps the stage-1 refreshed count, so the epilogue store writes
+// collide() (the GJK/EPA/contact-gen core) IS ASSEMBLED for the SPHERE and
+// CAPSULE type0 arms: stage2Body calls npCvxCollide.collide() (prep + warm
+// seed + gjkWarm + epaCore + sphere witness store / capsule
+// generatedFaceContacts + generatedContactsEEContacts) when transformsValid
+// and type0 is eSPHERE or eCAPSULE.  Contact points are written inside
+// collide() straight into the manifold (localNormalPen/A/B at manifold
+// +0/+64/+128) and the epilogue stores mNbContacts = numManifoldContacts
+// (touch) into word 12.  The CONVEX-HULL type0 arm (generateConvexContacts,
+// cu L1458-1462) remains DEFERRED: convex-type0 pairs keep the original
+// elision contract — bIntersection stays false, numManifoldContacts keeps
+// the stage-1 refreshed count, and the epilogue writes
 //   mNbContacts = refreshedNb | 0x80000000
 // — the manifold-invalidated / no-touch semantic that the downstream
 // finishContactsKernel consumes safely (it clears the bit and treats the
 // count as 0).  The quatB tail words 9..11 are stored back with the values
-// read (the .cu's no-op rewrite).  When the assembled collide() lands it
-// replaces that one call site in stage2Body.
+// read (the .cu's no-op rewrite); the warm-start words 13-15 are READ by
+// collide() but NEVER stored back (the .cu epilogue stores only words 9..12).
 //
 // The setup arithmetic that feeds collide() (post-flip shapes, synthetic
 // vertices, margins, blob-header decode, the shape1-gated minScale quirk,
 // contactDistance + expandedMargin, replaceBreakingThreshold, counts unpack)
-// is not observable in this collide-elided memory effect, so a sibling
-// harness entry `convexConvexNphase_stage2KernelDebug`
-// (npCvxStage2SetupDbg.slang, sharing stage2Body) dumps every scratch value
-// for the bit-exact test to verify against the CPU reference.
+// is additionally dumped by a sibling harness entry
+// `convexConvexNphase_stage2KernelDebug` (npCvxStage2SetupDbg.slang, sharing
+// stage2Body) for the bit-exact test to verify against the CPU reference.
 
 import npCvxStage2Core;
 

@@ -106,7 +106,38 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
-## P5 Step 5 — MILESTONE: five common rigid scenes rest on the GPU, zero refused launches
+## P5 Step 5 — MILESTONE: SIX rigid scenes rest on the GPU; collide() assembled; PGS core on the engine ABI
+
+Tranche 8 (collide() assembly) closed the convex-convex frontier for
+sphere/capsule type0: the new `npCvxCollide.slang` module (1170 lines) wires
+the verified GJK-warm-start (T133) + EPA (T132) + post-GJK decision (T149) +
+capsule face/EE contact gen (T136/T143) + prep/warm-seed/repack (T148)
+transcriptions into a `public bool collide(...)` called from stage2Body,
+gated on `transformsValid && (type0 == EGT_SPHERE || EGT_CAPSULE)` — the
+convex-hull type0 arm keeps the byte-identical elision (its
+`generateConvexContacts` driver is the remaining deferred piece).  Contact
+points are written inside collide() straight into the manifold (localNormalPen
+@0 / A @64 / B @128); the epilogue still stores only moreData words 9-12 and
+warm words 13-15 stay read-never-stored (the .cu quirk, pinned by tests).
+`PXG_SCENE=capsulebox` — capsule dropped onto the ground BOX, routed through
+the real GJK/EPA chain — now **rests at y=0.5000, |v|=0.0000, exit 0, zero
+refused launches**.  New `testCvxCollide` engine-ABI integration test (real
+cooked box hull; touch/near/deep-EPA/distant/EE/sphere fixtures + mutation
+canary; manifold word semantics pinned).
+
+Tranche 9 (PGS core on the engine ABI) fixed the latent PGS gap: all six
+mapped solverPGS kernels were harness-form with no ABI rows.  Converted
+solveBlockPartition {8,8,4,4,1}, concludeBlocks/writebackBlocks/
+writeBackBodies {8,8,4}, computeAverageSolverBodyVelocity/
+propagateSolverBodyVelocity {8,8} (+ ZeroBodies PGS) to BDA, added
+markActiveSlabPGS {8,8,4,4,8} (new map; PXG_SLANG_KERNEL_MAPPED 145→146),
+PxgSolverSharedDescPGSGpu, and shim+desc tests.  PGS structural differences
+honored: k*128 partition staging, 2-stripe deltaV pool, no elapsedTime/minPen,
+real concludeBlocks work, (32,8,1) averaging blockDim.  Remaining for a PGS
+scene: preIntegration, PGS constraint prep, integration, static-block pair,
+dmaBack (tranche 10, in flight).
+
+## P5 Step 5 — earlier milestone: five common rigid scenes rest on the GPU, zero refused launches
 
 `gpu-sdk-step` grew a `PXG_SCENE`-dispatched scene table; **all five rigid
 scenes now fall and REST on the Slang/Vulkan (llvmpipe) pipeline with ZERO

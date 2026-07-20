@@ -29,11 +29,13 @@
 // harness debug 64-byte blob).  Split into a module so each compiled entry
 // declares exactly ONE push-constant block (two push_constant blocks in one
 // module collide at offset 0).  See npCvxStage2Setup.slang for the full
-// derivation and the collide()-elided contract.
+// derivation and the collide() gating contract (sphere/capsule type0 run the
+// assembled npCvxCollide.collide(); convex-hull type0 keeps the elision).
 
 module npCvxStage2Core;
 
 import pxgSlangNpAbi;
+import npCvxCollide;
 
 public static const uint EGT_SPHERE = 0u;
 public static const uint EGT_CAPSULE = 2u;
@@ -103,6 +105,13 @@ public void stage2Body(uint globalWarpIndex, uint numTests, float toleranceLengt
 
     const float3 scale0 = float3(shape0.scaleX, shape0.scaleY, shape0.scaleZ);
     const float3 scale1 = float3(shape1.scaleX, shape1.scaleY, shape1.scaleZ);
+    const float4 rot0 = float4(shape0.scaleRotX, shape0.scaleRotY, shape0.scaleRotZ, shape0.scaleRotW);
+    const float4 rot1 = float4(shape1.scaleRotX, shape1.scaleRotY, shape1.scaleRotZ, shape1.scaleRotW);
+
+    // convexPtrA = hullPtr + sizeof(float4) — hoisted out of the convex branch
+    // so collide() can consume it; never dereferenced for sphere/capsule
+    // before collide (which itself only reads convexPtr1 on those arms).
+    const uint64_t convexPtrA = shape0.hullOrMeshPtr + 16u;
 
     // synthetic vertices + margins (scratch-allocated verts in the .cu)
     float4 verts0_0 = float4(0, 0, 0, 0);
@@ -127,9 +136,7 @@ public void stage2Body(uint globalWarpIndex, uint numTests, float toleranceLengt
     }
     else
     {
-        // convexPtrA = hullPtr + sizeof(float4); header uint4 at convexPtrA,
-        // extents at convexPtrA + sizeof(uint4)
-        const uint64_t convexPtrA = shape0.hullOrMeshPtr + 16u;
+        // header uint4 at convexPtrA, extents at convexPtrA + sizeof(uint4)
         const float4 extents0 = (Ptr<float4>(convexPtrA + 16u))[0];
         const uint hdr0 = (Ptr<uint4>(convexPtrA))[0].x;
         expandedMargin = 0.0f;
@@ -165,16 +172,58 @@ public void stage2Body(uint globalWarpIndex, uint numTests, float toleranceLengt
     const float minMargin = min(convexMargin0, convexMargin1);
     const float replaceBreakingThreshold = minMargin * 0.05f;
 
-    // the 16-lane moreData read; lane 12 holds the stage-1 counts word
+    // the 16-lane moreData read; lane 12 holds the stage-1 counts word,
+    // lanes 13-15 the warm-start words consumed by collide() (cu L2589-2592,
+    // L1300-1302) — READ here, never stored back (cu epilogue stores 9..12).
     const float4 moreQuatB = manifold[0].quatB; // lanes 8..11
     const uint countsWord = manifold[0].nbContacts;
+    const uint ws13 = manifold[0].nbWarmStartPoints;
+    const uint ws14 = manifold[0].warmStartA;
+    const uint ws15 = manifold[0].warmStartB;
     const uint initialNbContacts = countsWord >> 8u;
     uint numManifoldContacts = countsWord & 0xFFu;
 
-    // collide() gate; the call itself is elided (see header) so
+    // collide() gate (cu L2615-2627).  The assembled npCvxCollide.collide()
+    // covers the SPHERE and CAPSULE type0 arms; convex-hull type0
+    // (generateConvexContacts) is deferred and keeps the elision contract:
     // bIntersection stays false and numManifoldContacts is unchanged.
     const bool transformsValid = npAbiTransformIsValid(t0q, t0p) && npAbiTransformIsValid(t1q, t1p);
-    const bool bIntersection = false;
+    bool bIntersection = false;
+    if (transformsValid && (type0 == EGT_SPHERE || type0 == EGT_CAPSULE))
+    {
+        CollideScratch cs;
+        for (uint i = 0u; i < 64u; ++i) { cs.vA[i] = float4(0, 0, 0, 0); cs.vB[i] = float4(0, 0, 0, 0); }
+        // cachedData.Reset (cu L2416); the image is zeroed for determinism
+        // (uninitialized shared memory in the .cu; slots 16-31 are never read
+        // before being written)
+        for (uint i = 0u; i < 32u; ++i) cs.cachedData.v[i] = 0.0f;
+        cs.cachedData.size = 0u;
+        cs.gjkOutput.direction = float3(0, 0, 0);
+        cs.gjkOutput.closestPointA = float3(0, 0, 0);
+        cs.gjkOutput.closestPointB = float3(0, 0, 0);
+        cs.gjkOutput.closestPointDir = float3(0, 0, 0);
+        cs.gjkOutput.lowerBound = 0.0f;
+        cs.gjkOutput.upperBound = 0.0f;
+        cs.gjkOutput.degenerate = false;
+        cs.scale0 = scale0; cs.rot0 = rot0;
+        cs.scale1 = scale1; cs.rot1 = rot1;
+        cs.aToBq = aToBq; cs.aToBp = aToBp;
+        cs.manifoldBase = cmManifoldsPtr + uint64_t(globalWarpIndex) * 256u;
+        cs.convexPtr0 = convexPtrA; cs.convexPtr1 = convexPtrB;
+        cs.nbVertices0 = nbVertices0; cs.nbPolygons0 = nbPolygons0; cs.nbEdges0 = nbEdges0;
+        cs.nbVertices1 = nbVertices1; cs.nbPolygons1 = nbPolygons1; cs.nbEdges1 = nbEdges1;
+        cs.contactDistance = contactDist;
+        cs.toleranceLength = toleranceLength;
+        cs.replaceBreakingThreshold = replaceBreakingThreshold;
+        cs.inSphereRadius0 = inSphereRadius0; cs.inSphereRadius1 = inSphereRadius1;
+        cs.initialNbContacts = initialNbContacts;
+        cs.type0 = type0; cs.type1 = type1;
+
+        float4 verts0Synth[2] = { verts0_0, verts0_1 };
+        // verts0Ptr = 0 selects the synthetic sphere/capsule vertices
+        bIntersection = collide(cs, verts0Synth, 0, convexPtrB + 32u,
+                                ws13, ws14, ws15, numManifoldContacts);
+    }
 
     // epilogue store: lanes 9..12 write moreData words 9..12
     // (quatB.y/z/w rewritten with the values read; word 12 = writeback)
@@ -187,8 +236,8 @@ public void stage2Body(uint globalWarpIndex, uint numTests, float toleranceLengt
         // index-based so Slang computes the physical stride (208 B); a manual
         // byte stride is a latent OOB if it ever drifts from the struct size
         Ptr<Stage2Debug> dbg = Ptr<Stage2Debug>(debugOut);
-        dbg[globalWarpIndex].rotOut0 = float4(shape0.scaleRotX, shape0.scaleRotY, shape0.scaleRotZ, shape0.scaleRotW);
-        dbg[globalWarpIndex].rotOut1 = float4(shape1.scaleRotX, shape1.scaleRotY, shape1.scaleRotZ, shape1.scaleRotW);
+        dbg[globalWarpIndex].rotOut0 = rot0;
+        dbg[globalWarpIndex].rotOut1 = rot1;
         dbg[globalWarpIndex].tBq = t1q;
         dbg[globalWarpIndex].tBp = float4(t1p, 0.0f);
         dbg[globalWarpIndex].aToBq = aToBq;

@@ -201,13 +201,18 @@ void buildCapsuleScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
     targets.push_back({ b, 5.0f, r, "capsuleOnPlane" }); // rests on its side at centre y = radius
 }
 
-// NOTE (next frontier): a capsule (or convex hull) resting on a BOX ground routes
-// through the convex-convex GJK narrowphase (CONVEX_CONVEX_KERNEL_EARLY_OUT / _MAIN
-// + FINISH_CONTACTS_KERNEL), NOT the sphere/"primitive" kernel.  Those kernels are
-// mapped and LAUNCH with zero refusals, but do not yet produce contacts on the
-// engine ABI (a capsule-on-box probe fell straight through), so a convex-hull
-// ground scene is deferred until the convex-convex contact-gen chain is brought up
-// end-to-end.
+// PXG_SCENE=capsulebox: the capsule resting on the static ground BOX — routes
+// through the convex-convex GJK narrowphase (collide(): GJK/EPA + capsule
+// face/EE contact gen), unlike PXG_SCENE=capsule which rides the primitive kernel.
+void buildCapsuleBoxScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                          std::vector<RestTarget>& targets)
+{
+    addGroundBox(physics, scene, material);
+    const float r = 0.5f, h = 0.5f;
+    PxRigidDynamic* b = addDynamic(physics, scene, material, PxCapsuleGeometry(r, h),
+                                   capsuleInertia(r, h, 1000.0f), 5.0f);
+    targets.push_back({ b, 5.0f, r, "capsuleOnBox" });
+}
 } // namespace
 
 int main()
@@ -279,7 +284,8 @@ int main()
     else if (!std::strcmp(sceneName, "plane"))     buildPlaneScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "sphere"))    buildSphereScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "capsule"))   buildCapsuleScene(physics, scene, material, targets);
-    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule)\n", sceneName);
+    else if (!std::strcmp(sceneName, "capsulebox")) buildCapsuleBoxScene(physics, scene, material, targets);
+    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox)\n", sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
     std::printf("  [  OK  ] scene '%s' built: %zu dynamic body(ies) + ground on the GPU\n",
                 sceneName, targets.size());
