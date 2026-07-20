@@ -25,14 +25,28 @@
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
 // Verification of updateBounds.slang against a C++ transcription of
-// updateTransformCacheAndBoundArrayLaunch (rigid-body path) +
+// updateTransformCacheAndBoundArrayLaunch (rigid + articulation paths) +
 // updateCacheAndBound.cuh: world pose composition, transform cache refresh,
 // frozen/unfrozen/updated/activate/deactivate bookkeeping and world-space
 // AABB computation for sphere / capsule / box / convex geometry.
+//
+// updateTransformCacheAndBoundArrayLaunch is verified on the ENGINE launch
+// ABI (P5 Step 4): the test fills the REAL engine PxgSimulationCoreDesc with
+// live device addresses (including a raw PxgArticulation pool whose
+// linkBody2Worlds / linkBody2Actors pointers are planted at the engine's
+// field offsets) and launches through PxgCudaShim with the engine's grid
+// geometry (GridDim/BlockDim::UPDATE_TRANSFORMCACHE_AND_BOUNDARRAY =
+// 256 x 256), plus a 2-block variant that executes the grid-stride wrap.
+// setRigidDynamicGlobalPose stays on the bound-buffer harness.
 
 #include "pxgTestFramework.h"
 #include "pxgGpuStructs.h"
 #include "pxgRefMath.h"
+#include "PxgCudaShim.h"
+
+#include "PxNodeIndex.h" // completes PxNodeIndex for the engine desc header
+#include "PxgSimulationCoreDesc.h"
+#include "PxgArticulation.h"
 
 #include <numeric>
 #include <random>
@@ -44,10 +58,40 @@ using namespace pxgtest;
 
 struct UpdateBoundsParams
 {
-    uint32_t numShapes;      // updateTransformCacheAndBoundArrayLaunch
+    uint32_t numShapes;      // (legacy slot, unused by the engine-ABI entry)
     uint32_t nbElements;     // setRigidDynamicGlobalPose
     uint32_t totalNumShapes; // setRigidDynamicGlobalPose
 };
+
+// Mirrors the bridge's marshalling: place each argument at the natural
+// alignment inferred from its size, then round the blob to the largest
+// alignment seen (a compiled struct's trailing padding).
+struct EngineBlob
+{
+    std::vector<uint8_t> bytes;
+    size_t maxAlign = 1;
+
+    static size_t alignFor(size_t size)
+    {
+        if (size >= 16) return 16;
+        if (size >= 8)  return 8;
+        if (size >= 4)  return 4;
+        if (size >= 2)  return 2;
+        return 1;
+    }
+    template <typename T>
+    void add(const T& v)
+    {
+        const size_t a = alignFor(sizeof(T));
+        if (a > maxAlign) maxAlign = a;
+        bytes.resize((bytes.size() + (a - 1)) & ~(a - 1));
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
+        bytes.insert(bytes.end(), p, p + sizeof(T));
+    }
+    void finish() { bytes.resize((bytes.size() + (maxAlign - 1)) & ~(maxAlign - 1)); }
+};
+
+static std::vector<uint8_t> updateBoundsAbiLoader(const char* file) { return loadShaderBlob(file); }
 
 // ---------------------------------------------------------------------------
 // CPU reference: transcription of updateCacheAndBound.cuh
@@ -88,8 +132,14 @@ Mat33 meshScaleToMat33(const Vec3& scale, const QuatV& rotation)
     return rot.getTranspose() * diagTimesRot;
 }
 
+// blobDeviceBase: under the engine ABI Shape::hullOrMeshOffset carries the
+// RAW DEVICE ADDRESS of the cooked hull (exactly what CUDA stores in
+// PxgShape::hullOrMeshPtr); the reference rebases it onto the host copy of
+// the blob.  The bound-buffer setRigidDynamicGlobalPose path keeps it as a
+// plain byte offset (blobDeviceBase = 0).
 void refUpdateBounds(const ShapeSim& shapeSim, const std::vector<Shape>& shapes,
-                     const std::vector<uint32_t>& geometryBlob, const TransformV& pose, Bounds3& out)
+                     const std::vector<uint32_t>& geometryBlob, const TransformV& pose, Bounds3& out,
+                     uint64_t blobDeviceBase = 0)
 {
     const Vec3 localMin(shapeSim.localBoundsMin);
     const Vec3 localMax(shapeSim.localBoundsMax);
@@ -137,7 +187,7 @@ void refUpdateBounds(const ShapeSim& shapeSim, const std::vector<Shape>& shapes,
             if (!identity)
                 rot = rot * meshScaleToMat33(scale, scaleRot);
 
-            const uint32_t blobBase = uint32_t(shape.hullOrMeshOffset / 4);
+            const uint32_t blobBase = uint32_t((shape.hullOrMeshOffset - blobDeviceBase) / 4);
             const uint32_t tmpX = geometryBlob[blobBase + 4];
             const uint32_t nbHullVertices = (tmpX >> 8) & 0xFFu;
 
@@ -176,10 +226,16 @@ struct RefOutputs
     std::vector<uint32_t> frozen, unfrozen, updated, active, deactivate;
 };
 
+// Transcription of updateTransformCacheAndBoundArrayLaunch (both branches).
+// artLinkB2W / artLinkB2A: per-articulation link transform arrays, indexed
+// [artId * maxLinks + linkId].
 void referenceUpdate(uint32_t numShapes, const std::vector<ShapeSim>& shapeSims,
                      const std::vector<Shape>& shapes, const std::vector<uint32_t>& geometryBlob,
                      const std::vector<BodySim>& bodySims, const std::vector<uint32_t>& bodyDataIndices,
-                     const std::vector<SolverBodySleepData>& sleepData, uint32_t maxNodes, RefOutputs& out)
+                     const std::vector<SolverBodySleepData>& sleepData,
+                     const std::vector<SolverBodySleepData>& artiSleepData,
+                     const std::vector<TransformV>& artLinkB2W, const std::vector<TransformV>& artLinkB2A,
+                     uint32_t maxLinks, uint32_t maxNodes, uint64_t blobDeviceBase, RefOutputs& out)
 {
     out.transformCache.assign(numShapes, CachedTransform{});
     out.bounds.assign(numShapes, Bounds3{});
@@ -203,47 +259,74 @@ void referenceUpdate(uint32_t numShapes, const std::vector<ShapeSim>& shapeSims,
         const bool isBP = (shapeFlags & (eSIMULATION_SHAPE | eTRIGGER_SHAPE)) != 0;
         const bool isBPOrSq = (shapeFlags & (eSIMULATION_SHAPE | eTRIGGER_SHAPE | eSCENE_QUERY_SHAPE)) != 0;
 
-        if (isArticulation)
-            continue; // articulation branch not ported yet
-
-        const uint32_t activeNodeIndex = bodyDataIndices[bodySimIndex];
-        if (activeNodeIndex == 0xFFFFFFFFu)
-            continue;
-
-        const uint32_t internalFlags = sleepData[activeNodeIndex].internalFlags;
-        const TransformV body2World(QuatV(bodySim.body2World.q),
-                                    Vec3(bodySim.body2World.p.x, bodySim.body2World.p.y, bodySim.body2World.p.z));
-
-        if ((internalFlags & eFREEZE_THIS_FRAME) && (internalFlags & eFROZEN))
+        if (!isArticulation)
         {
-            out.frozen[i] = 1;
-            out.transformCache[i].flags = 1; // PxsTransformFlag::eFROZEN
+            const uint32_t activeNodeIndex = bodyDataIndices[bodySimIndex];
+            if (activeNodeIndex == 0xFFFFFFFFu)
+                continue;
+
+            const uint32_t internalFlags = sleepData[activeNodeIndex].internalFlags;
+            const TransformV body2World(QuatV(bodySim.body2World.q),
+                                        Vec3(bodySim.body2World.p.x, bodySim.body2World.p.y, bodySim.body2World.p.z));
+
+            if ((internalFlags & eFREEZE_THIS_FRAME) && (internalFlags & eFROZEN))
+            {
+                out.frozen[i] = 1;
+                out.transformCache[i].flags = 1; // PxsTransformFlag::eFROZEN
+            }
+            else if (internalFlags & eUNFREEZE_THIS_FRAME)
+            {
+                out.unfrozen[i] = 1;
+            }
+
+            if (!(internalFlags & eFROZEN) || (internalFlags & eFREEZE_THIS_FRAME))
+            {
+                if (isBP)
+                    out.updated[i] = 1;
+
+                const TransformV body2Actor(QuatV(bodySim.body2Actor_maxImpulseW.q),
+                                            Vec3(bodySim.body2Actor_maxImpulseW.p.x, bodySim.body2Actor_maxImpulseW.p.y,
+                                                 bodySim.body2Actor_maxImpulseW.p.z));
+                const TransformV absPos = getAbsPose(body2World, TransformV(shapeSim.transform), body2Actor);
+
+                out.transformCache[i].transform = absPos.toTransform28();
+                out.transformCache[i].flags = 0;
+                if (isBPOrSq)
+                    refUpdateBounds(shapeSim, shapes, geometryBlob, absPos, out.bounds[i], blobDeviceBase);
+            }
+
+            if (internalFlags & eACTIVATE_THIS_FRAME)
+                out.active[bodySimIndex] = 1;
+            else if (internalFlags & eDEACTIVATE_THIS_FRAME)
+                out.deactivate[bodySimIndex] = 1;
         }
-        else if (internalFlags & eUNFREEZE_THIS_FRAME)
+        else
         {
-            out.unfrozen[i] = 1;
-        }
+            // articulation branch: no sleep/freeze gating, link poses come
+            // from the articulation's link transform arrays
+            const uint32_t articulationId = bodySim.articulationRemapId;
+            const uint32_t internalFlags = artiSleepData[articulationId].internalFlags;
+            const uint32_t linkId = uint32_t(shapeSim.bodySimIndex >> 32) >> 1;
 
-        if (!(internalFlags & eFROZEN) || (internalFlags & eFREEZE_THIS_FRAME))
-        {
+            const TransformV body2World = artLinkB2W[articulationId * maxLinks + linkId];
+
             if (isBP)
                 out.updated[i] = 1;
 
-            const TransformV body2Actor(QuatV(bodySim.body2Actor_maxImpulseW.q),
-                                        Vec3(bodySim.body2Actor_maxImpulseW.p.x, bodySim.body2Actor_maxImpulseW.p.y,
-                                             bodySim.body2Actor_maxImpulseW.p.z));
+            const TransformV body2Actor = artLinkB2A[articulationId * maxLinks + linkId];
+
             const TransformV absPos = getAbsPose(body2World, TransformV(shapeSim.transform), body2Actor);
 
             out.transformCache[i].transform = absPos.toTransform28();
             out.transformCache[i].flags = 0;
             if (isBPOrSq)
-                refUpdateBounds(shapeSim, shapes, geometryBlob, absPos, out.bounds[i]);
-        }
+                refUpdateBounds(shapeSim, shapes, geometryBlob, absPos, out.bounds[i], blobDeviceBase);
 
-        if (internalFlags & eACTIVATE_THIS_FRAME)
-            out.active[bodySimIndex] = 1;
-        else if (internalFlags & eDEACTIVATE_THIS_FRAME)
-            out.deactivate[bodySimIndex] = 1;
+            if (internalFlags & eACTIVATE_THIS_FRAME)
+                out.active[bodySimIndex] = 1;
+            else if (internalFlags & eDEACTIVATE_THIS_FRAME)
+                out.deactivate[bodySimIndex] = 1;
+        }
     }
 }
 
@@ -258,26 +341,34 @@ QuatV randomQuat(std::mt19937& rng)
     return q.getNormalized();
 }
 
-PXG_TEST(updateBounds_allGeometryTypes)
+PXG_TEST(updateBounds_engineAbi)
 {
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(777);
     std::uniform_real_distribution<float> unit(0.f, 1.f);
     std::uniform_real_distribution<float> sym(-10.f, 10.f);
 
-    const uint32_t numShapes = 600;
-    const uint32_t maxNodes = 256;
+    const uint32_t numShapes = 600;   // last 40 are articulation shapes
+    const uint32_t numRigidShapes = numShapes - 40;
+    const uint32_t maxNodes = 256;    // nodes [firstArtNode, firstArtNode+12) are articulation links
     const uint32_t numHulls = 8;
+    const uint32_t nbArts = 3;
+    const uint32_t maxLinks = 4;
+    const uint32_t firstArtNode = 240;
 
-    // ---- convex geometry blob: numHulls hulls, header (48 bytes) + up to 64 float4 vertices
+    // ---- convex geometry blob: numHulls hulls, header (48 bytes) + up to 64
+    // float4 vertices; every hull base is 16-byte aligned (multiple-of-4 uints)
     std::vector<uint32_t> geometryBlob;
-    std::vector<uint64_t> hullOffsets(numHulls);
-    std::vector<uint32_t> hullVertexCounts(numHulls);
+    std::vector<uint64_t> hullByteOffsets(numHulls);
     for (uint32_t h = 0; h < numHulls; ++h)
     {
         const uint32_t base = uint32_t(geometryBlob.size());
-        hullOffsets[h] = uint64_t(base) * 4; // byte offset
+        hullByteOffsets[h] = uint64_t(base) * 4; // byte offset within the blob
         const uint32_t nbVerts = 4 + rng() % 60;
-        hullVertexCounts[h] = nbVerts;
 
         geometryBlob.resize(base + 12 + nbVerts * 4, 0u);
         // uint4 at byte 16: x packs the vertex count in bits [8,16)
@@ -291,7 +382,8 @@ PXG_TEST(updateBounds_allGeometryTypes)
         }
     }
 
-    // ---- shapes (PxgShape pool: convex hull entries)
+    // ---- shapes (PxgShape pool: convex hull entries; hullOrMeshOffset is
+    // patched to a live device address once the blob is uploaded)
     std::vector<Shape> shapes(numHulls);
     std::memset(shapes.data(), 0, shapes.size() * sizeof(Shape));
     for (uint32_t h = 0; h < numHulls; ++h)
@@ -308,7 +400,6 @@ PXG_TEST(updateBounds_allGeometryTypes)
             const QuatV q = randomQuat(rng);
             s.scaleRotation = q.toQuat();
         }
-        s.hullOrMeshOffset = hullOffsets[h];
         s.type = eCONVEXMESH;
     }
 
@@ -344,22 +435,29 @@ PXG_TEST(updateBounds_allGeometryTypes)
         sleepData[n].wakeCounter = unit(rng);
     }
 
-    // ---- shape sims
-    std::vector<ShapeSim> shapeSims(numShapes);
-    std::memset(shapeSims.data(), 0, shapeSims.size() * sizeof(ShapeSim));
-    for (uint32_t i = 0; i < numShapes; ++i)
+    // articulation link nodes: node firstArtNode + artId*maxLinks + linkId
+    for (uint32_t a = 0; a < nbArts; ++a)
+        for (uint32_t l = 0; l < maxLinks; ++l)
+            bodySims[firstArtNode + a * maxLinks + l].articulationRemapId = a;
+
+    // per-articulation sleep data: activate / deactivate / freeze flags (the
+    // articulation branch must honor only activate/deactivate)
+    std::vector<SolverBodySleepData> artiSleepData(nbArts);
+    artiSleepData[0] = SolverBodySleepData{ 0.5f, eFROZEN | eFREEZE_THIS_FRAME };
+    artiSleepData[1] = SolverBodySleepData{ 0.25f, eACTIVATE_THIS_FRAME };
+    artiSleepData[2] = SolverBodySleepData{ 0.125f, eDEACTIVATE_THIS_FRAME };
+
+    // per-articulation link transforms
+    std::vector<TransformV> artLinkB2W(nbArts * maxLinks);
+    std::vector<TransformV> artLinkB2A(nbArts * maxLinks);
+    for (uint32_t k = 0; k < nbArts * maxLinks; ++k)
     {
-        ShapeSim& s = shapeSims[i];
-        const QuatV q = randomQuat(rng);
-        s.transform.q = q.toQuat();
-        s.transform.p = Float3{ sym(rng) * 0.2f, sym(rng) * 0.2f, sym(rng) * 0.2f };
+        artLinkB2W[k] = TransformV(randomQuat(rng), Vec3(sym(rng), sym(rng), sym(rng)));
+        artLinkB2A[k] = TransformV(randomQuat(rng), Vec3(sym(rng) * 0.1f, sym(rng) * 0.1f, sym(rng) * 0.1f));
+    }
 
-        // 5% static
-        s.bodySimIndex = unit(rng) < 0.05f ? makeNodeIndex(PX_INVALID_NODE) : makeNodeIndex(rng() % maxNodes);
-        s.shapeFlags = uint16_t((unit(rng) < 0.8f ? eSIMULATION_SHAPE : 0) |
-                                (unit(rng) < 0.5f ? eSCENE_QUERY_SHAPE : 0) |
-                                (unit(rng) < 0.1f ? eTRIGGER_SHAPE : 0));
-
+    // ---- shape sims: geometry generator shared by rigid + articulation shapes
+    auto rollGeometry = [&](ShapeSim& s) {
         const float typeRoll = unit(rng);
         if (typeRoll < 0.2f)
         {
@@ -397,102 +495,211 @@ PXG_TEST(updateBounds_allGeometryTypes)
             s.localBoundsMin = Float3{ -1.f - unit(rng), -2.f, -1.f };
             s.localBoundsMax = Float3{ 1.f + unit(rng), 2.f, 1.f };
         }
-    }
+    };
 
-    // ---- GPU ----
-    PxgSlangComputeDevice* dev = testDevice();
-
-    Kernel kernel("updateBounds.spv", "updateTransformCacheAndBoundArrayLaunch",
-                  { sizeof(ShapeSim), sizeof(Shape), sizeof(BodySim), 4, sizeof(SolverBodySleepData),
-                    sizeof(CachedTransform), 4, 4, 4, 4, 4, 4, 4 },
-                  sizeof(UpdateBoundsParams));
-
-    PxgBufferHandle shapeSimBuf = createBufferFrom(dev, shapeSims);
-    PxgBufferHandle shapesBuf = createBufferFrom(dev, shapes);
-    PxgBufferHandle bodySimBuf = createBufferFrom(dev, bodySims);
-    PxgBufferHandle bodyIdxBuf = createBufferFrom(dev, bodyDataIndices);
-    PxgBufferHandle sleepBuf = createBufferFrom(dev, sleepData);
-    std::vector<CachedTransform> cacheInit(numShapes);
-    std::memset(cacheInit.data(), 0, cacheInit.size() * sizeof(CachedTransform));
-    PxgBufferHandle cacheBuf = createBufferFrom(dev, cacheInit);
-    std::vector<float> boundsInit(numShapes * 6, 0.f);
-    PxgBufferHandle boundsBuf = createBufferFrom(dev, boundsInit);
-    std::vector<uint32_t> zerosShapes(numShapes, 0), zerosNodes(maxNodes, 0);
-    PxgBufferHandle frozenBuf = createBufferFrom(dev, zerosShapes);
-    PxgBufferHandle unfrozenBuf = createBufferFrom(dev, zerosShapes);
-    PxgBufferHandle updatedBuf = createBufferFrom(dev, zerosShapes);
-    PxgBufferHandle activeBuf = createBufferFrom(dev, zerosNodes);
-    PxgBufferHandle deactivateBuf = createBufferFrom(dev, zerosNodes);
-    PxgBufferHandle blobBuf = createBufferFrom(dev, geometryBlob);
-
-    const UpdateBoundsParams params = { numShapes, 0, 0 };
-    const uint32_t blockSize = 256;
-    kernel.dispatch((numShapes + blockSize - 1) / blockSize,
-                    { shapeSimBuf, shapesBuf, bodySimBuf, bodyIdxBuf, sleepBuf, cacheBuf, boundsBuf,
-                      frozenBuf, unfrozenBuf, updatedBuf, activeBuf, deactivateBuf, blobBuf },
-                    params);
-    dev->flush();
-
-    // ---- reference ----
-    RefOutputs ref;
-    referenceUpdate(numShapes, shapeSims, shapes, geometryBlob, bodySims, bodyDataIndices, sleepData,
-                    maxNodes, ref);
-
-    // ---- compare ----
-    const std::vector<CachedTransform> gpuCache = downloadBuffer<CachedTransform>(dev, cacheBuf, numShapes);
-    const std::vector<float> gpuBounds = downloadBuffer<float>(dev, boundsBuf, numShapes * 6);
-    const std::vector<uint32_t> gpuFrozen = downloadBuffer<uint32_t>(dev, frozenBuf, numShapes);
-    const std::vector<uint32_t> gpuUnfrozen = downloadBuffer<uint32_t>(dev, unfrozenBuf, numShapes);
-    const std::vector<uint32_t> gpuUpdated = downloadBuffer<uint32_t>(dev, updatedBuf, numShapes);
-    const std::vector<uint32_t> gpuActive = downloadBuffer<uint32_t>(dev, activeBuf, maxNodes);
-    const std::vector<uint32_t> gpuDeactivate = downloadBuffer<uint32_t>(dev, deactivateBuf, maxNodes);
-
+    std::vector<ShapeSim> shapeSims(numShapes);
+    std::memset(shapeSims.data(), 0, shapeSims.size() * sizeof(ShapeSim));
     for (uint32_t i = 0; i < numShapes; ++i)
     {
-        PXG_CHECK_MSG(gpuFrozen[i] == ref.frozen[i], "frozen[%u]: gpu=%u ref=%u", i, gpuFrozen[i], ref.frozen[i]);
-        PXG_CHECK_MSG(gpuUnfrozen[i] == ref.unfrozen[i], "unfrozen[%u]", i);
-        PXG_CHECK_MSG(gpuUpdated[i] == ref.updated[i], "updated[%u]", i);
-        PXG_CHECK_MSG(gpuCache[i].flags == ref.transformCache[i].flags, "cache.flags[%u]: gpu=%u ref=%u",
-                      i, gpuCache[i].flags, ref.transformCache[i].flags);
-
-        const Transform28& gt = gpuCache[i].transform;
-        const Transform28& rt = ref.transformCache[i].transform;
-        PXG_CHECK_MSG(almostEqual(gt.q.x, rt.q.x, 1e-4f, 1e-5f) && almostEqual(gt.q.y, rt.q.y, 1e-4f, 1e-5f) &&
-                          almostEqual(gt.q.z, rt.q.z, 1e-4f, 1e-5f) && almostEqual(gt.q.w, rt.q.w, 1e-4f, 1e-5f),
-                      "cache.q[%u]: gpu=(%g,%g,%g,%g) ref=(%g,%g,%g,%g)", i, gt.q.x, gt.q.y, gt.q.z, gt.q.w,
-                      rt.q.x, rt.q.y, rt.q.z, rt.q.w);
-        PXG_CHECK_MSG(almostEqual(gt.p.x, rt.p.x, 1e-4f, 1e-4f) && almostEqual(gt.p.y, rt.p.y, 1e-4f, 1e-4f) &&
-                          almostEqual(gt.p.z, rt.p.z, 1e-4f, 1e-4f),
-                      "cache.p[%u]: gpu=(%g,%g,%g) ref=(%g,%g,%g)", i, gt.p.x, gt.p.y, gt.p.z, rt.p.x,
-                      rt.p.y, rt.p.z);
-
-        const float* gb = &gpuBounds[i * 6];
-        const float rb[6] = { ref.bounds[i].minimum.x, ref.bounds[i].minimum.y, ref.bounds[i].minimum.z,
-                              ref.bounds[i].maximum.x, ref.bounds[i].maximum.y, ref.bounds[i].maximum.z };
-        for (int c = 0; c < 6; ++c)
-            PXG_CHECK_MSG(almostEqual(gb[c], rb[c], 1e-4f, 1e-3f), "bounds[%u][%d]: gpu=%g ref=%g", i, c,
-                          gb[c], rb[c]);
+        ShapeSim& s = shapeSims[i];
+        const QuatV q = randomQuat(rng);
+        s.transform.q = q.toQuat();
+        s.transform.p = Float3{ sym(rng) * 0.2f, sym(rng) * 0.2f, sym(rng) * 0.2f };
+        s.shapeFlags = uint16_t((unit(rng) < 0.8f ? eSIMULATION_SHAPE : 0) |
+                                (unit(rng) < 0.5f ? eSCENE_QUERY_SHAPE : 0) |
+                                (unit(rng) < 0.1f ? eTRIGGER_SHAPE : 0));
+        if (i < numRigidShapes)
+        {
+            // 5% static (skipped by the kernel)
+            s.bodySimIndex = unit(rng) < 0.05f ? makeNodeIndex(PX_INVALID_NODE)
+                                               : makeNodeIndex(rng() % firstArtNode);
+        }
+        else
+        {
+            // articulation shapes across all arts/links
+            const uint32_t a = rng() % nbArts;
+            const uint32_t l = rng() % maxLinks;
+            s.bodySimIndex = makeNodeIndex(firstArtNode + a * maxLinks + l, l, true);
+        }
+        rollGeometry(s);
     }
 
-    for (uint32_t n = 0; n < maxNodes; ++n)
+    // ---- GPU (ENGINE launch ABI through PxgCudaShim) ----
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "updateBounds.spv", "updateTransformCacheAndBoundArrayLaunch", 8u, 0 }, // { u64 }
+    };
+    PxgCudaShim shim(dev, manifest, 1, &updateBoundsAbiLoader);
+
+    PxgDevicePtr dShapeSims = 0, dShapes = 0, dBodySims = 0, dBodyIdx = 0, dSleep = 0, dArtiSleep = 0;
+    PxgDevicePtr dCache = 0, dBounds = 0, dFrozen = 0, dUnfrozen = 0, dUpdated = 0, dActive = 0, dDeactivate = 0;
+    PxgDevicePtr dBlob = 0, dArtPool = 0, dArtB2W = 0, dArtB2A = 0, dDesc = 0;
+    shim.memAlloc(&dShapeSims, shapeSims.size() * sizeof(ShapeSim));
+    shim.memAlloc(&dShapes, shapes.size() * sizeof(Shape));
+    shim.memAlloc(&dBodySims, bodySims.size() * sizeof(BodySim));
+    shim.memAlloc(&dBodyIdx, bodyDataIndices.size() * 4);
+    shim.memAlloc(&dSleep, sleepData.size() * sizeof(SolverBodySleepData));
+    shim.memAlloc(&dArtiSleep, artiSleepData.size() * sizeof(SolverBodySleepData));
+    shim.memAlloc(&dCache, numShapes * sizeof(CachedTransform));
+    shim.memAlloc(&dBounds, numShapes * sizeof(Bounds3));
+    shim.memAlloc(&dFrozen, numShapes * 4);
+    shim.memAlloc(&dUnfrozen, numShapes * 4);
+    shim.memAlloc(&dUpdated, numShapes * 4);
+    shim.memAlloc(&dActive, maxNodes * 4);
+    shim.memAlloc(&dDeactivate, maxNodes * 4);
+    shim.memAlloc(&dBlob, geometryBlob.size() * 4);
+    shim.memAlloc(&dArtPool, nbArts * sizeof(physx::PxgArticulation));
+    shim.memAlloc(&dArtB2W, nbArts * maxLinks * sizeof(Transform28));
+    shim.memAlloc(&dArtB2A, nbArts * maxLinks * sizeof(Transform28));
+    shim.memAlloc(&dDesc, sizeof(physx::PxgSimulationCoreDesc));
+    if (!dShapeSims || !dShapes || !dBodySims || !dBodyIdx || !dSleep || !dArtiSleep || !dCache ||
+        !dBounds || !dFrozen || !dUnfrozen || !dUpdated || !dActive || !dDeactivate || !dBlob ||
+        !dArtPool || !dArtB2W || !dArtB2A || !dDesc)
     {
-        PXG_CHECK_MSG(gpuActive[n] == ref.active[n], "active[%u]", n);
-        PXG_CHECK_MSG(gpuDeactivate[n] == ref.deactivate[n], "deactivate[%u]", n);
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
     }
 
-    dev->destroyBuffer(shapeSimBuf);
-    dev->destroyBuffer(shapesBuf);
-    dev->destroyBuffer(bodySimBuf);
-    dev->destroyBuffer(bodyIdxBuf);
-    dev->destroyBuffer(sleepBuf);
-    dev->destroyBuffer(cacheBuf);
-    dev->destroyBuffer(boundsBuf);
-    dev->destroyBuffer(frozenBuf);
-    dev->destroyBuffer(unfrozenBuf);
-    dev->destroyBuffer(updatedBuf);
-    dev->destroyBuffer(activeBuf);
-    dev->destroyBuffer(deactivateBuf);
-    dev->destroyBuffer(blobBuf);
+    // hullOrMeshPtr now that the blob has a device address: LIVE device
+    // pointer to the cooked hull (the CUDA meaning of PxgShape::hullOrMeshPtr)
+    for (uint32_t h = 0; h < numHulls; ++h)
+        shapes[h].hullOrMeshOffset = dBlob + hullByteOffsets[h];
+
+    // raw PxgArticulation pool: 0xEE background, per-articulation link
+    // transform array pointers planted at the engine's field offsets
+    std::vector<uint8_t> artPool(nbArts * sizeof(physx::PxgArticulation), 0xEE);
+    for (uint32_t a = 0; a < nbArts; ++a)
+    {
+        const uint64_t b2w = dArtB2W + uint64_t(a) * maxLinks * sizeof(Transform28);
+        const uint64_t b2a = dArtB2A + uint64_t(a) * maxLinks * sizeof(Transform28);
+        uint8_t* base = artPool.data() + a * sizeof(physx::PxgArticulation);
+        std::memcpy(base + offsetof(physx::PxgArticulation, linkBody2Worlds), &b2w, 8);
+        std::memcpy(base + offsetof(physx::PxgArticulation, linkBody2Actors), &b2a, 8);
+    }
+
+    std::vector<Transform28> artB2WUpload(nbArts * maxLinks), artB2AUpload(nbArts * maxLinks);
+    for (uint32_t k = 0; k < nbArts * maxLinks; ++k)
+    {
+        artB2WUpload[k] = artLinkB2W[k].toTransform28();
+        artB2AUpload[k] = artLinkB2A[k].toTransform28();
+    }
+
+    shim.memcpyHtoD(dShapeSims, shapeSims.data(), shapeSims.size() * sizeof(ShapeSim));
+    shim.memcpyHtoD(dShapes, shapes.data(), shapes.size() * sizeof(Shape));
+    shim.memcpyHtoD(dBodySims, bodySims.data(), bodySims.size() * sizeof(BodySim));
+    shim.memcpyHtoD(dBodyIdx, bodyDataIndices.data(), bodyDataIndices.size() * 4);
+    shim.memcpyHtoD(dSleep, sleepData.data(), sleepData.size() * sizeof(SolverBodySleepData));
+    shim.memcpyHtoD(dArtiSleep, artiSleepData.data(), artiSleepData.size() * sizeof(SolverBodySleepData));
+    shim.memcpyHtoD(dBlob, geometryBlob.data(), geometryBlob.size() * 4);
+    shim.memcpyHtoD(dArtPool, artPool.data(), artPool.size());
+    shim.memcpyHtoD(dArtB2W, artB2WUpload.data(), artB2WUpload.size() * sizeof(Transform28));
+    shim.memcpyHtoD(dArtB2A, artB2AUpload.data(), artB2AUpload.size() * sizeof(Transform28));
+
+    // the REAL engine desc with live device addresses
+    physx::PxgSimulationCoreDesc desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.mFrozen = reinterpret_cast<physx::PxU32*>(dFrozen);
+    desc.mUnfrozen = reinterpret_cast<physx::PxU32*>(dUnfrozen);
+    desc.mUpdated = reinterpret_cast<physx::PxU32*>(dUpdated);
+    desc.mActivate = reinterpret_cast<physx::PxU32*>(dActive);
+    desc.mDeactivate = reinterpret_cast<physx::PxU32*>(dDeactivate);
+    desc.mBodySimBufferDeviceData = reinterpret_cast<physx::PxgBodySim*>(dBodySims);
+    desc.mShapeSimsBufferDeviceData = reinterpret_cast<const physx::PxgShapeSim*>(dShapeSims);
+    desc.mArticulationPool = reinterpret_cast<physx::PxgArticulation*>(dArtPool);
+    desc.mArticulationSleepDataPool = reinterpret_cast<physx::PxgSolverBodySleepData*>(dArtiSleep);
+    desc.mTransformCache = reinterpret_cast<physx::PxsCachedTransform*>(dCache);
+    desc.mBounds = reinterpret_cast<physx::PxBounds3*>(dBounds);
+    desc.mBodyDataIndices = reinterpret_cast<physx::PxU32*>(dBodyIdx);
+    desc.mSleepData = reinterpret_cast<physx::PxgSolverBodySleepData*>(dSleep);
+    desc.mShapes = reinterpret_cast<physx::PxgShape*>(dShapes);
+    desc.mNbTotalShapes = numShapes;
+    shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
+
+    // the CUDA argument list, packed by the bridge's rule ({8})
+    EngineBlob blob;
+    blob.add<uint64_t>(dDesc);
+    blob.finish();
+    PXG_CHECK_MSG(blob.bytes.size() == 8, "engine blob is 8 bytes (got %zu)", blob.bytes.size());
+
+    // ---- reference (grid-independent) ----
+    RefOutputs ref;
+    referenceUpdate(numShapes, shapeSims, shapes, geometryBlob, bodySims, bodyDataIndices, sleepData,
+                    artiSleepData, artLinkB2W, artLinkB2A, maxLinks, maxNodes, dBlob, ref);
+
+    // engine grid (256 x 256 = one pass over 600 shapes) and a 2-block grid
+    // (512 threads -> the CUDA grid-stride wrap executes)
+    const std::vector<CachedTransform> cacheInit(numShapes, CachedTransform{});
+    const std::vector<float> boundsInit(numShapes * 6, 0.f);
+    const std::vector<uint32_t> zerosShapes(numShapes, 0), zerosNodes(maxNodes, 0);
+
+    for (uint32_t gridDim : { 256u, 2u })
+    {
+        shim.memcpyHtoD(dCache, cacheInit.data(), cacheInit.size() * sizeof(CachedTransform));
+        shim.memcpyHtoD(dBounds, boundsInit.data(), boundsInit.size() * 4);
+        shim.memcpyHtoD(dFrozen, zerosShapes.data(), zerosShapes.size() * 4);
+        shim.memcpyHtoD(dUnfrozen, zerosShapes.data(), zerosShapes.size() * 4);
+        shim.memcpyHtoD(dUpdated, zerosShapes.data(), zerosShapes.size() * 4);
+        shim.memcpyHtoD(dActive, zerosNodes.data(), zerosNodes.size() * 4);
+        shim.memcpyHtoD(dDeactivate, zerosNodes.data(), zerosNodes.size() * 4);
+
+        PXG_CHECK_MSG(shim.launchKernel(0, gridDim, 1, 1, blob.bytes.data(), uint32_t(blob.bytes.size())) ==
+                          PxgResult::Success,
+                      "launch updateTransformCacheAndBoundArrayLaunch (grid %u)", gridDim);
+        shim.streamSynchronize();
+
+        // ---- compare ----
+        std::vector<CachedTransform> gpuCache(numShapes);
+        std::vector<float> gpuBounds(numShapes * 6);
+        std::vector<uint32_t> gpuFrozen(numShapes), gpuUnfrozen(numShapes), gpuUpdated(numShapes);
+        std::vector<uint32_t> gpuActive(maxNodes), gpuDeactivate(maxNodes);
+        shim.memcpyDtoH(gpuCache.data(), dCache, numShapes * sizeof(CachedTransform));
+        shim.memcpyDtoH(gpuBounds.data(), dBounds, numShapes * 6 * 4);
+        shim.memcpyDtoH(gpuFrozen.data(), dFrozen, numShapes * 4);
+        shim.memcpyDtoH(gpuUnfrozen.data(), dUnfrozen, numShapes * 4);
+        shim.memcpyDtoH(gpuUpdated.data(), dUpdated, numShapes * 4);
+        shim.memcpyDtoH(gpuActive.data(), dActive, maxNodes * 4);
+        shim.memcpyDtoH(gpuDeactivate.data(), dDeactivate, maxNodes * 4);
+
+        for (uint32_t i = 0; i < numShapes; ++i)
+        {
+            PXG_CHECK_MSG(gpuFrozen[i] == ref.frozen[i], "grid %u frozen[%u]: gpu=%u ref=%u", gridDim, i,
+                          gpuFrozen[i], ref.frozen[i]);
+            PXG_CHECK_MSG(gpuUnfrozen[i] == ref.unfrozen[i], "grid %u unfrozen[%u]", gridDim, i);
+            PXG_CHECK_MSG(gpuUpdated[i] == ref.updated[i], "grid %u updated[%u]", gridDim, i);
+            PXG_CHECK_MSG(gpuCache[i].flags == ref.transformCache[i].flags,
+                          "grid %u cache.flags[%u]: gpu=%u ref=%u", gridDim, i, gpuCache[i].flags,
+                          ref.transformCache[i].flags);
+
+            const Transform28& gt = gpuCache[i].transform;
+            const Transform28& rt = ref.transformCache[i].transform;
+            PXG_CHECK_MSG(almostEqual(gt.q.x, rt.q.x, 1e-4f, 1e-5f) && almostEqual(gt.q.y, rt.q.y, 1e-4f, 1e-5f) &&
+                              almostEqual(gt.q.z, rt.q.z, 1e-4f, 1e-5f) && almostEqual(gt.q.w, rt.q.w, 1e-4f, 1e-5f),
+                          "grid %u cache.q[%u]: gpu=(%g,%g,%g,%g) ref=(%g,%g,%g,%g)", gridDim, i, gt.q.x,
+                          gt.q.y, gt.q.z, gt.q.w, rt.q.x, rt.q.y, rt.q.z, rt.q.w);
+            PXG_CHECK_MSG(almostEqual(gt.p.x, rt.p.x, 1e-4f, 1e-4f) && almostEqual(gt.p.y, rt.p.y, 1e-4f, 1e-4f) &&
+                              almostEqual(gt.p.z, rt.p.z, 1e-4f, 1e-4f),
+                          "grid %u cache.p[%u]: gpu=(%g,%g,%g) ref=(%g,%g,%g)", gridDim, i, gt.p.x, gt.p.y,
+                          gt.p.z, rt.p.x, rt.p.y, rt.p.z);
+
+            const float* gb = &gpuBounds[i * 6];
+            const float rb[6] = { ref.bounds[i].minimum.x, ref.bounds[i].minimum.y, ref.bounds[i].minimum.z,
+                                  ref.bounds[i].maximum.x, ref.bounds[i].maximum.y, ref.bounds[i].maximum.z };
+            for (int c = 0; c < 6; ++c)
+                PXG_CHECK_MSG(almostEqual(gb[c], rb[c], 1e-4f, 1e-3f), "grid %u bounds[%u][%d]: gpu=%g ref=%g",
+                              gridDim, i, c, gb[c], rb[c]);
+        }
+
+        for (uint32_t n = 0; n < maxNodes; ++n)
+        {
+            PXG_CHECK_MSG(gpuActive[n] == ref.active[n], "grid %u active[%u]", gridDim, n);
+            PXG_CHECK_MSG(gpuDeactivate[n] == ref.deactivate[n], "grid %u deactivate[%u]", gridDim, n);
+        }
+    }
+
+    for (PxgDevicePtr h : { dShapeSims, dShapes, dBodySims, dBodyIdx, dSleep, dArtiSleep, dCache, dBounds,
+                            dFrozen, dUnfrozen, dUpdated, dActive, dDeactivate, dBlob, dArtPool, dArtB2W,
+                            dArtB2A, dDesc })
+        shim.memFree(h);
 }
 
 // ---------------------------------------------------------------------------

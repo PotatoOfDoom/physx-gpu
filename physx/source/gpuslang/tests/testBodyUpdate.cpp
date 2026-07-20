@@ -27,10 +27,22 @@
 // Verification of bodyUpdate.slang and directApi.slang (+ the
 // setRigidDynamicGlobalPose entry of updateBounds.slang) against C++
 // transcriptions of updateBodiesAndShapes.cu.
+//
+// updateBodiesLaunch and updateShapesLaunch are verified on the ENGINE
+// launch ABI (P5 Step 4): the tests fill the REAL engine PxgNewBodiesDesc /
+// raw CUDA parameter lists with live device addresses, marshal the push blob
+// with the bridge's natural-alignment rule and launch through PxgCudaShim
+// with the engine's grid geometry
+// (PxgSimulationCoreKernelGridDim/BlockDim::UPDATE_BODIES_AND_SHAPES =
+// 64 x 256).  The remaining entries stay on the bound-buffer harness.
 
 #include "pxgTestFramework.h"
 #include "pxgGpuStructs.h"
 #include "pxgRefMath.h"
+#include "PxgCudaShim.h"
+
+#include "PxNodeIndex.h" // completes PxNodeIndex for the engine desc header
+#include "PxgSimulationCoreDesc.h"
 
 #include <numeric>
 #include <random>
@@ -39,6 +51,36 @@ namespace
 {
 
 using namespace pxgtest;
+
+// Mirrors the bridge's marshalling: place each argument at the natural
+// alignment inferred from its size, then round the blob to the largest
+// alignment seen (a compiled struct's trailing padding).
+struct EngineBlob
+{
+    std::vector<uint8_t> bytes;
+    size_t maxAlign = 1;
+
+    static size_t alignFor(size_t size)
+    {
+        if (size >= 16) return 16;
+        if (size >= 8)  return 8;
+        if (size >= 4)  return 4;
+        if (size >= 2)  return 2;
+        return 1;
+    }
+    template <typename T>
+    void add(const T& v)
+    {
+        const size_t a = alignFor(sizeof(T));
+        if (a > maxAlign) maxAlign = a;
+        bytes.resize((bytes.size() + (a - 1)) & ~(a - 1));
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
+        bytes.insert(bytes.end(), p, p + sizeof(T));
+    }
+    void finish() { bytes.resize((bytes.size() + (maxAlign - 1)) & ~(maxAlign - 1)); }
+};
+
+static std::vector<uint8_t> bodyUpdateAbiLoader(const char* file) { return loadShaderBlob(file); }
 
 enum DmaFlags : uint32_t
 {
@@ -97,41 +139,78 @@ BodySim randomBodySim(std::mt19937& rng, uint32_t bodySimIndex)
 }
 
 // ---------------------------------------------------------------------------
-// updateBodiesLaunch / updateShapesLaunch / updateBodyExternalVelocitiesLaunch
+// updateBodiesLaunch — ENGINE launch ABI ({8}: one PxgNewBodiesDesc pointer)
 // ---------------------------------------------------------------------------
+// The REAL engine PxgNewBodiesDesc is filled with live device addresses and
+// the kernel is launched with the engine's 64 x 256 grid.  nbNew = 2501 is
+// odd, spans 157 partially-filled 16-thread groups, and exceeds the
+// 64*256/16 = 1024 bodies one grid pass covers, so the CUDA grid-stride
+// `i += (blockDim.x * gridDim.x) / 16` wrap executes.  Scattered pool is
+// compared bit-exactly (0xCC background pins untouched entries).
 
-PXG_TEST(bodyUpdate_scatterKernels)
+PXG_TEST(bodyUpdate_updateBodiesEngineAbi)
 {
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(2000);
-    std::uniform_real_distribution<float> sym(-5.f, 5.f);
 
-    const uint32_t poolSize = 300;
-    const uint32_t nbNew = 120;
+    const uint32_t poolSize = 3000;
+    const uint32_t nbNew = 2501;
 
-    // shuffled target indices
+    // shuffled target indices (unique, so the scatter is race-free)
     std::vector<uint32_t> targets(poolSize);
     std::iota(targets.begin(), targets.end(), 0u);
     std::shuffle(targets.begin(), targets.end(), rng);
 
     std::vector<BodySim> pool(poolSize);
-    std::memset(pool.data(), 0, pool.size() * sizeof(BodySim));
+    std::memset(pool.data(), 0xCC, pool.size() * sizeof(BodySim));
     std::vector<BodySim> staged(nbNew);
     for (uint32_t i = 0; i < nbNew; ++i)
         staged[i] = randomBodySim(rng, targets[i]);
 
     PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "bodyUpdate.spv", "updateBodiesLaunch", 8u, 0 }, // { u64 }
+    };
+    PxgCudaShim shim(dev, manifest, 1, &bodyUpdateAbiLoader);
 
-    Kernel updateBodies("bodyUpdate.spv", "updateBodiesLaunch", { 4, 4, 4 }, sizeof(BodyUpdateParams));
+    PxgDevicePtr dStaged = 0, dPool = 0, dDesc = 0;
+    shim.memAlloc(&dStaged, staged.size() * sizeof(BodySim));
+    shim.memAlloc(&dPool, pool.size() * sizeof(BodySim));
+    shim.memAlloc(&dDesc, sizeof(physx::PxgNewBodiesDesc));
+    if (!dStaged || !dPool || !dDesc)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+    shim.memcpyHtoD(dStaged, staged.data(), staged.size() * sizeof(BodySim));
+    shim.memcpyHtoD(dPool, pool.data(), pool.size() * sizeof(BodySim));
 
-    PxgBufferHandle stagedBuf = createBufferFrom(dev, staged);
-    PxgBufferHandle poolBuf = createBufferFrom(dev, pool);
-    PxgBufferHandle dummyShapes = dev->createBuffer(16);
+    // the REAL engine desc with live device addresses
+    physx::PxgNewBodiesDesc desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.mNewBodySim = reinterpret_cast<const physx::PxgBodySim*>(dStaged);
+    desc.mBodySimBufferDeviceData = reinterpret_cast<physx::PxgBodySim*>(dPool);
+    desc.mNbNewBodies = nbNew;
+    shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
 
-    updateBodies.dispatch((nbNew + 255) / 256, { stagedBuf, poolBuf, dummyShapes },
-                          BodyUpdateParams{ nbNew });
-    dev->flush();
+    // the CUDA argument list, packed by the bridge's rule ({8})
+    EngineBlob blob;
+    blob.add<uint64_t>(dDesc);
+    blob.finish();
+    PXG_CHECK_MSG(blob.bytes.size() == 8, "engine blob is 8 bytes (got %zu)", blob.bytes.size());
 
-    const std::vector<BodySim> gpuPool = downloadBuffer<BodySim>(dev, poolBuf, poolSize);
+    // engine grid: UPDATE_BODIES_AND_SHAPES = 64 blocks x 256 threads
+    PXG_CHECK_MSG(shim.launchKernel(0, 64, 1, 1, blob.bytes.data(), uint32_t(blob.bytes.size())) ==
+                      PxgResult::Success,
+                  "launch updateBodiesLaunch through engine-ABI blob");
+    shim.streamSynchronize();
+
+    std::vector<BodySim> gpuPool(poolSize);
+    shim.memcpyDtoH(gpuPool.data(), dPool, poolSize * sizeof(BodySim));
 
     std::vector<BodySim> refPool = pool;
     for (uint32_t i = 0; i < nbNew; ++i)
@@ -140,10 +219,31 @@ PXG_TEST(bodyUpdate_scatterKernels)
     PXG_CHECK_MSG(std::memcmp(gpuPool.data(), refPool.data(), poolSize * sizeof(BodySim)) == 0,
                   "updateBodiesLaunch pool mismatch");
 
-    dev->destroyBuffer(stagedBuf);
-    dev->destroyBuffer(poolBuf);
+    shim.memFree(dStaged);
+    shim.memFree(dPool);
+    shim.memFree(dDesc);
+}
 
-    // ---- updateShapesLaunch ----
+// ---------------------------------------------------------------------------
+// updateShapesLaunch — ENGINE launch ABI ({8,8,4}: two element pointers + count)
+// ---------------------------------------------------------------------------
+// Field-by-field scatter semantics from the .cu: everything except the 4
+// padding bytes at offset 52 is copied.  The staged records carry a poison
+// pad word and the destination pool a 0xCD background, so the bit-exact
+// memcmp catches both a pad copy and a missed field.  Launched with the
+// engine's 64 x 256 grid, then again with a 2-block grid on a fresh pool to
+// execute the grid-stride wrap.
+
+PXG_TEST(bodyUpdate_updateShapesEngineAbi)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    std::mt19937 rng(2010);
+    std::uniform_real_distribution<float> sym(-5.f, 5.f);
+
     struct NewShapeSim
     {
         ShapeSim sim;
@@ -152,7 +252,7 @@ PXG_TEST(bodyUpdate_scatterKernels)
     };
     static_assert(sizeof(NewShapeSim) == 80, "PxgNewShapeSim mirror must be 80 bytes");
 
-    const uint32_t shapePool = 200, nbNewShapes = 80;
+    const uint32_t shapePool = 900, nbNewShapes = 701;
     std::vector<uint32_t> shapeTargets(shapePool);
     std::iota(shapeTargets.begin(), shapeTargets.end(), 0u);
     std::shuffle(shapeTargets.begin(), shapeTargets.end(), rng);
@@ -166,40 +266,78 @@ PXG_TEST(bodyUpdate_scatterKernels)
         s.sim.transform.p = Float3{ sym(rng), sym(rng), sym(rng) };
         s.sim.localBoundsMin = Float3{ -1, -1, -1 };
         s.sim.localBoundsMax = Float3{ 1, 1, 1 };
+        s.sim.pad0 = 0xAAAAAAAAu; // poison: the kernel must NOT copy this
         s.sim.bodySimIndex = makeNodeIndex(rng() % 64);
         s.sim.hullDataIndex = rng();
         s.sim.shapeFlags = uint16_t(rng() & 7);
         s.sim.shapeType = uint16_t(rng() % 8);
         s.elementIndex = shapeTargets[i];
+        s.pad = 0xBBBBBBBBu;
     }
 
     std::vector<ShapeSim> shapePoolData(shapePool);
-    std::memset(shapePoolData.data(), 0, shapePoolData.size() * sizeof(ShapeSim));
+    std::memset(shapePoolData.data(), 0xCD, shapePoolData.size() * sizeof(ShapeSim));
 
-    Kernel updateShapes("bodyUpdate.spv", "updateShapesLaunch", { 4, 4, 4 }, sizeof(BodyUpdateParams));
-
-    PxgBufferHandle newShapesBuf = createBufferFrom(dev, newShapes);
-    PxgBufferHandle shapePoolBuf = createBufferFrom(dev, shapePoolData);
-    PxgBufferHandle dummyBody = dev->createBuffer(16);
-
-    updateShapes.dispatch((nbNewShapes + 255) / 256, { newShapesBuf, dummyBody, shapePoolBuf },
-                          BodyUpdateParams{ nbNewShapes });
-    dev->flush();
-
-    const std::vector<ShapeSim> gpuShapes = downloadBuffer<ShapeSim>(dev, shapePoolBuf, shapePool);
+    // reference: the .cu copies mTransform, mLocalBounds, mBodySimIndex,
+    // mHullDataIndex, mShapeFlags, mShapeType — pad0 keeps the pool background
     std::vector<ShapeSim> refShapes = shapePoolData;
     for (uint32_t i = 0; i < nbNewShapes; ++i)
-        refShapes[newShapes[i].elementIndex] = newShapes[i].sim;
+    {
+        ShapeSim& dst = refShapes[newShapes[i].elementIndex];
+        const ShapeSim& src = newShapes[i].sim;
+        dst.transform = src.transform;
+        dst.localBoundsMin = src.localBoundsMin;
+        dst.localBoundsMax = src.localBoundsMax;
+        dst.bodySimIndex = src.bodySimIndex;
+        dst.hullDataIndex = src.hullDataIndex;
+        dst.shapeFlags = src.shapeFlags;
+        dst.shapeType = src.shapeType;
+    }
 
-    // PxgShapeSim has 4 bytes of padding at offset 52 that updateShapesLaunch
-    // copies verbatim (both are zero here) — memcmp is safe
-    PXG_CHECK_MSG(std::memcmp(gpuShapes.data(), refShapes.data(), shapePool * sizeof(ShapeSim)) == 0,
-                  "updateShapesLaunch pool mismatch");
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "bodyUpdate.spv", "updateShapesLaunch", 24u, 0 }, // { u64, u64, u32 } -> 24
+    };
+    PxgCudaShim shim(dev, manifest, 1, &bodyUpdateAbiLoader);
 
-    dev->destroyBuffer(newShapesBuf);
-    dev->destroyBuffer(shapePoolBuf);
-    dev->destroyBuffer(dummyBody);
-    dev->destroyBuffer(dummyShapes);
+    PxgDevicePtr dNew = 0, dPool = 0;
+    shim.memAlloc(&dNew, newShapes.size() * sizeof(NewShapeSim));
+    shim.memAlloc(&dPool, shapePoolData.size() * sizeof(ShapeSim));
+    if (!dNew || !dPool)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+    shim.memcpyHtoD(dNew, newShapes.data(), newShapes.size() * sizeof(NewShapeSim));
+
+    // the CUDA argument list, packed by the bridge's rule ({8,8,4} -> 24)
+    EngineBlob blob;
+    blob.add<uint64_t>(dNew);
+    blob.add<uint64_t>(dPool);
+    blob.add<uint32_t>(nbNewShapes);
+    blob.finish();
+    PXG_CHECK_MSG(blob.bytes.size() == 24, "engine blob is 24 bytes (got %zu)", blob.bytes.size());
+
+    // engine grid (64 x 256, single pass) and a 2-block grid (512 threads ->
+    // the grid-stride wrap covers the remaining shapes)
+    for (uint32_t gridDim : { 64u, 2u })
+    {
+        shim.memcpyHtoD(dPool, shapePoolData.data(), shapePoolData.size() * sizeof(ShapeSim));
+
+        PXG_CHECK_MSG(shim.launchKernel(0, gridDim, 1, 1, blob.bytes.data(), uint32_t(blob.bytes.size())) ==
+                          PxgResult::Success,
+                      "launch updateShapesLaunch through engine-ABI blob (grid %u)", gridDim);
+        shim.streamSynchronize();
+
+        std::vector<ShapeSim> gpuShapes(shapePool);
+        shim.memcpyDtoH(gpuShapes.data(), dPool, shapePool * sizeof(ShapeSim));
+
+        PXG_CHECK_MSG(std::memcmp(gpuShapes.data(), refShapes.data(), shapePool * sizeof(ShapeSim)) == 0,
+                      "updateShapesLaunch pool mismatch (grid %u)", gridDim);
+    }
+
+    shim.memFree(dNew);
+    shim.memFree(dPool);
 }
 
 PXG_TEST(bodyUpdate_externalVelocities)

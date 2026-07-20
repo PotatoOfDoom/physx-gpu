@@ -88,6 +88,10 @@ static const uint8_t kSolveWholeIslandTGS[] = { 8, 8, 4, 1, 4, 4 };
 //   PxU32* islandIds, PxU32* islandStaticTouchCounts, PxU32* numCountedInteractions)
 static const uint8_t kIntegrateTGS[] = { 4, 8, 8, 8, 8, 8 };
 
+// gpusimulationcontroller updateBodiesAndShapes.cu:
+//   updateShapesLaunch(const PxgNewShapeSim*, PxgShapeSim*, PxU32 nbNewShapes)
+static const uint8_t kUpdateShapes[] = { 8, 8, 4 };
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },
@@ -124,6 +128,10 @@ static const PxgKernelAbiRow kRows[] = {
     { "writeBackBodiesTGS", kWriteBackTGS, uint32_t(sizeof(kWriteBackTGS)) },
     { "solveWholeIslandTGS", kSolveWholeIslandTGS, uint32_t(sizeof(kSolveWholeIslandTGS)) },
     { "integrateCoreParallelLaunchTGS", kIntegrateTGS, uint32_t(sizeof(kIntegrateTGS)) },
+    // gpusimulationcontroller: updateTransformAndBoundArray.cu / updateBodiesAndShapes.cu
+    { "updateTransformCacheAndBoundArrayLaunch", kOnePtr, 1u },
+    { "updateBodiesLaunch", kOnePtr, 1u },
+    { "updateShapesLaunch", kUpdateShapes, uint32_t(sizeof(kUpdateShapes)) },
 };
 
 inline size_t abiAlign(size_t size)

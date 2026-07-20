@@ -28,19 +28,29 @@
 //
 // Slang port of the CPU->GPU rigid-body/shape mirror kernels from
 // gpusimulationcontroller/src/CUDA/updateBodiesAndShapes.cu:
-//   - updateBodiesLaunch
-//   - updateBodiesLaunchDirectAPI
-//   - updateShapesLaunch
-//   - updateBodyExternalVelocitiesLaunch
+//   - updateBodiesLaunch          (ENGINE launch ABI, BDA — see below)
+//   - updateBodiesLaunchDirectAPI (bound-buffer form)
+//   - updateShapesLaunch          (ENGINE launch ABI, BDA — see below)
+//   - updateBodyExternalVelocitiesLaunch (bound-buffer form)
 //
-// The CUDA kernels spread each 224-byte PxgBodySim across 16 threads and use
-// warp shuffles to broadcast the embedded body index; the port copies one
-// body per thread (the shuffle scheme is a memory-coalescing optimization
-// with no semantic effect).  Buffers are bound word-addressed so partial
-// float4 updates (the .w-only velocity lane merge of the direct-API path)
-// stay race-free.
+// updateBodiesLaunch and updateShapesLaunch run on the ENGINE launch ABI
+// (P5 Step 4): the push blob is the CUDA parameter list (one PxgNewBodiesDesc
+// device pointer / two raw element pointers + a count) and the data is walked
+// via BDA through the byte-exact pxgSlangSimCoreDesc mirrors, with the CUDA
+// thread mapping preserved: updateBodiesLaunch keeps the 16-threads-per-body
+// uint4 gather and the grid-stride loop `i += (blockDim.x * gridDim.x) / 16`.
+// The only CUDA construct without a direct analogue is the __shfl_sync that
+// broadcasts data.w from lane PXG_BODY_SIM_BODYSIM_INDEX_IND within each
+// 16-lane group; since that lane's value is a uniform re-readable location,
+// each participating thread re-reads the same uint4.w from memory instead
+// (bit-identical result, no cross-lane op).
+//
+// The two direct-API entries below remain in bound-buffer form: buffers are
+// bound word-addressed so partial float4 updates (the .w-only velocity lane
+// merge of the direct-API path) stay race-free.
 
 import pxgSlangCommon;
+import pxgSlangSimCoreDesc;
 
 static const uint BLOCK_SIZE = 256;
 
@@ -67,6 +77,28 @@ struct BodyUpdateParams
 
 [[vk::push_constant]]
 ConstantBuffer<BodyUpdateParams> gParams;
+
+// ENGINE launch ABI of updateBodiesLaunch: exactly the CUDA parameter list —
+// one device pointer ({8} blob).
+struct NewBodiesAbiParams
+{
+    uint64_t scDesc; // const PxgNewBodiesDesc*
+};
+
+[[vk::push_constant]]
+ConstantBuffer<NewBodiesAbiParams> gNewBodiesAbi;
+
+// ENGINE launch ABI of updateShapesLaunch: exactly the CUDA parameter list —
+// two device pointers + a PxU32 count ({8,8,4} blob, padded to 24 bytes).
+struct UpdateShapesAbiParams
+{
+    uint64_t newShapeSimsBufferDeviceData; // @0  const PxgNewShapeSim*
+    uint64_t shapeSimsBufferDeviceData;    // @8  PxgShapeSim*
+    uint nbNewShapes;                      // @16 (+4 bytes pad -> 24)
+};
+
+[[vk::push_constant]]
+ConstantBuffer<UpdateShapesAbiParams> gUpdateShapesAbi;
 
 RWStructuredBuffer<uint> gNewData;      // binding 0: staged source (bodies / shapes / velocity updates)
 RWStructuredBuffer<uint> gBodySimPool;  // binding 1: persistent PxgBodySim pool (word-addressed)
@@ -136,21 +168,44 @@ bool alignedTransformNotEqual(PxgAlignedTransform a, PxgAlignedTransform b)
 }
 
 // mirrors updateBodiesLaunch(): scatter the staged PxgBodySim records into
-// the persistent pool at their embedded body index
+// the persistent pool at their embedded body index — ENGINE launch ABI.
+// Thread mapping is the CUDA's: 16 threads per body (14 of which move one
+// uint4 each), grid-stride `i += (blockDim.x * gridDim.x) / 16`, launched
+// with the engine's 64 x 256 grid.  The CUDA loop condition
+// `(i < totalNbBodies) | (ballot(...) & 0)` evaluates to `i < totalNbBodies`
+// (the ballot only refreshed the shuffle mask); the shuffle broadcast of
+// lane PXG_BODY_SIM_BODYSIM_INDEX_IND's data.w becomes a re-read of that
+// same uniform uint4.w from memory (see file header).
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
 void updateBodiesLaunch(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
-    const uint i = dispatchThreadId.x;
-    if (i >= gParams.count)
-        return;
+    const PxgNewBodiesDescGpu scDesc = (Ptr<PxgNewBodiesDescGpu>(gNewBodiesAbi.scDesc))[0];
 
-    const uint srcBase = i * BODYSIM_WORDS;
-    const uint bodyIndex = gNewData[srcBase + W_BODYSIM_INDEX];
-    const uint dstBase = bodyIndex * BODYSIM_WORDS;
+    Ptr<uint4> gBodySim = Ptr<uint4>(scDesc.mNewBodySim);
+    const uint totalNbBodies = scDesc.mNbNewBodies;
 
-    for (uint w = 0; w < BODYSIM_WORDS; ++w)
-        gBodySimPool[dstBase + w] = gNewData[srcBase + w];
+    // persistent data
+    Ptr<uint4> gBodySimPoolP = Ptr<uint4>(scDesc.mBodySimBufferDeviceData);
+
+    const uint idx = dispatchThreadId.x;
+
+    // each PxgBodySim has 224 bytes, so we need to use 16 threads to read one
+    // body (14 threads move one 16-byte uint4 each; 16 keeps the CUDA's
+    // shuffle-group alignment)
+    for (uint i = idx / 16; i < totalNbBodies; i += (BLOCK_SIZE * WorkgroupCount().x) / 16)
+    {
+        const uint index = idx & 15;
+        if (index < PXG_BODY_SIM_UINT4_SIZE)
+        {
+            const uint4 data = gBodySim[i * PXG_BODY_SIM_UINT4_SIZE + index];
+
+            // __shfl_sync(mask, data.w, PXG_BODY_SIM_BODYSIM_INDEX_IND, 16)
+            const uint bodyIndex = gBodySim[i * PXG_BODY_SIM_UINT4_SIZE + PXG_BODY_SIM_BODYSIM_INDEX_IND].w;
+
+            gBodySimPoolP[bodyIndex * PXG_BODY_SIM_UINT4_SIZE + index] = data;
+        }
+    }
 }
 
 // mirrors updateBodiesLaunchDirectAPI(): first transfer copies everything;
@@ -213,25 +268,38 @@ void updateBodiesLaunchDirectAPI(uint3 dispatchThreadId : SV_DispatchThreadID)
 }
 
 // mirrors updateShapesLaunch(): scatter PxgNewShapeSim records (a PxgShapeSim
-// plus its element index, 80 bytes) into the shape-sim pool
+// plus its element index, 80 bytes) into the shape-sim pool — ENGINE launch
+// ABI (two raw device pointers + count, grid-stride, engine 64 x 256 grid).
+// Field-by-field copy like the CUDA: mTransform, mLocalBounds, mBodySimIndex,
+// mHullDataIndex, mShapeFlags/mShapeType — the 4 padding bytes at offset 52
+// are NOT copied (the CUDA leaves them untouched too).
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
 void updateShapesLaunch(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
-    const uint NEW_SHAPE_WORDS = 20; // sizeof(PxgNewShapeSim) = 80
-    const uint SHAPE_WORDS = 18;     // sizeof(PxgShapeSim) = 72
-    const uint W_ELEMENT_INDEX = 18; // PxgNewShapeSim::mElementIndex
+    Ptr<PxgNewShapeSimGpu> newShapeSimsBufferDeviceData =
+        Ptr<PxgNewShapeSimGpu>(gUpdateShapesAbi.newShapeSimsBufferDeviceData);
+    Ptr<PxgShapeSim> shapeSimsBufferDeviceData = Ptr<PxgShapeSim>(gUpdateShapesAbi.shapeSimsBufferDeviceData);
+    const uint nbNewShapes = gUpdateShapesAbi.nbNewShapes;
 
-    const uint idx = dispatchThreadId.x;
-    if (idx >= gParams.count)
-        return;
+    const uint startIndex = dispatchThreadId.x;
 
-    const uint srcBase = idx * NEW_SHAPE_WORDS;
-    const uint elementIndex = gNewData[srcBase + W_ELEMENT_INDEX];
-    const uint dstBase = elementIndex * SHAPE_WORDS;
+    for (uint idx = startIndex; idx < nbNewShapes; idx += BLOCK_SIZE * WorkgroupCount().x)
+    {
+        const PxgNewShapeSimGpu src = newShapeSimsBufferDeviceData[idx];
+        const uint elementIndex = src.mElementIndex;
 
-    for (uint w = 0; w < SHAPE_WORDS; ++w)
-        gShapeSimPool[dstBase + w] = gNewData[srcBase + w];
+        shapeSimsBufferDeviceData[elementIndex].mTransform = src.base.mTransform;
+        shapeSimsBufferDeviceData[elementIndex].lbMinX = src.base.lbMinX;
+        shapeSimsBufferDeviceData[elementIndex].lbMinY = src.base.lbMinY;
+        shapeSimsBufferDeviceData[elementIndex].lbMinZ = src.base.lbMinZ;
+        shapeSimsBufferDeviceData[elementIndex].lbMaxX = src.base.lbMaxX;
+        shapeSimsBufferDeviceData[elementIndex].lbMaxY = src.base.lbMaxY;
+        shapeSimsBufferDeviceData[elementIndex].lbMaxZ = src.base.lbMaxZ;
+        shapeSimsBufferDeviceData[elementIndex].mBodySimIndex = src.base.mBodySimIndex;
+        shapeSimsBufferDeviceData[elementIndex].mHullDataIndex = src.base.mHullDataIndex;
+        shapeSimsBufferDeviceData[elementIndex].mShapeFlags_mShapeType = src.base.mShapeFlags_mShapeType;
+    }
 }
 
 // mirrors updateBodyExternalVelocitiesLaunch(): applies user velocity /

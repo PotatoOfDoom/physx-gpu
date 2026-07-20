@@ -68,7 +68,8 @@ set(SHADER_COMMON_DEPS
     ${SHADER_DIR}/pxgSlangPrepCommon.slang
     ${SHADER_DIR}/pxgSlangWarpInc.slang
     ${SHADER_DIR}/pxgSlangBpDesc.slang
-    ${SHADER_DIR}/pxgSlangSolverDesc.slang)
+    ${SHADER_DIR}/pxgSlangSolverDesc.slang
+    ${SHADER_DIR}/pxgSlangSimCoreDesc.slang)
 
 # Shaders whose SPIR-V gets NoContraction decorations stamped onto every
 # float arithmetic op (tools/spv_nocontract.py).  slangc emits none and its
@@ -415,6 +416,8 @@ pxg_compile_shader(npBpDescProbe bpDescProbe)
 # P5 Step 4: PxgSolverCoreDesc / PxgSolverSharedDesc<IterativeSolveDataTGS> /
 # PxgIslandContext mirror layout proof (BDA).
 pxg_compile_shader(npSolverDescProbe solverDescProbe)
+# P5 Step 4: empirical layout proof for the simulation-controller desc mirrors.
+pxg_compile_shader(npSimCoreDescProbe simCoreDescProbe)
 # RUNTIME_PLAN.md P3 launch-marshalling proof kernel (multi-arg natural alignment).
 pxg_compile_shader(npShimMisalign shimMisAdd)
 
@@ -757,6 +760,7 @@ add_executable(gpuslang-tests
     testP4Broadphase.cpp
     testBpDescLayout.cpp
     testSolverDescLayout.cpp
+    testSimCoreDescLayout.cpp
     testP4Aabb.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanCudaContext.cpp
     ${GPUSLANG_ROOT}/bridge/PxgVulkanKernelAbi.cpp
@@ -904,7 +908,7 @@ foreach(suite scan radixSort radixSortDesc radixSortGather preIntegration integr
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")
@@ -924,9 +928,11 @@ set(PXG_HLSL_ENTRIES
     "radixSortGather:radixSortDoubleCopy" "radixSortGather:radixSortDoubleCopyHigh32Bits"
     "preIntegration:preIntegrationLaunch" "preIntegration:initStaticKinematics"
     "integration:integrateCoreParallelLaunch" "integration:integrateCoreParallelLaunchTGS"
-    "updateBounds:updateTransformCacheAndBoundArrayLaunch" "updateBounds:setRigidDynamicGlobalPose"
-    "bodyUpdate:updateBodiesLaunch" "bodyUpdate:updateBodiesLaunchDirectAPI"
-    "bodyUpdate:updateShapesLaunch" "bodyUpdate:updateBodyExternalVelocitiesLaunch"
+    # updateBounds:updateTransformCacheAndBoundArrayLaunch, bodyUpdate:updateBodiesLaunch and
+    # bodyUpdate:updateShapesLaunch retired: converted to the BDA engine ABI (P5 Step 4) and
+    # grid-stride via WorkgroupCount(), which has no HLSL builtin (P0 policy).
+    "updateBounds:setRigidDynamicGlobalPose"
+    "bodyUpdate:updateBodiesLaunchDirectAPI" "bodyUpdate:updateBodyExternalVelocitiesLaunch"
     "directApi:getRigidDynamicGlobalPose" "directApi:getRigidDynamicLinearAcceleration"
     "directApi:setRigidDynamicLinearVelocity" "directApi:setRigidDynamicTorque"
     "solverPGS:solveBlockPartition" "solverPGS:concludeBlocks" "solverPGS:writebackBlocks"

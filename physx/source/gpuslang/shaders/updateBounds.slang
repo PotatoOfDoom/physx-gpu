@@ -29,7 +29,7 @@
 // Slang port of the transform-cache / bounds update kernel
 // (gpusimulationcontroller/src/CUDA/updateTransformAndBoundArray.cu +
 //  gpucommon/src/CUDA/updateCacheAndBound.cuh):
-//   - updateTransformCacheAndBoundArrayLaunch (rigid-body path)
+//   - updateTransformCacheAndBoundArrayLaunch (rigid + articulation paths)
 //
 // Per simulation shape this kernel composes the world pose
 // (body2World * body2Actor^-1 * shape2Actor), refreshes the transform cache
@@ -37,29 +37,47 @@
 // mesh geometry (other types use the transformed local-bounds fast path,
 // like the CUDA original).
 //
-// Differences from CUDA:
-//   - PxgShape::hullOrMeshPtr embedded a raw device pointer to the cooked
-//     convex data; the port stores a byte offset into the bound geometry
-//     blob buffer (gGeometryBlob) instead.  The blob layout itself is
-//     unchanged (vertices start at byte 48, vertex count packed in the
-//     uint4 at byte 16 — see convexFormat.h).
-//   - The articulation branch is not yet ported: it walks per-articulation
-//     link arrays through embedded device pointers (PxgArticulation).
-//     Articulated shapes are skipped; see the migration notes.
+// updateTransformCacheAndBoundArrayLaunch runs on the ENGINE launch ABI
+// (P5 Step 4): the push blob is the CUDA parameter list — one device pointer
+// to the engine's PxgSimulationCoreDesc — and every array (shape sims, body
+// sims, shapes, sleep data, transform cache, bounds, frozen/unfrozen/updated/
+// activate/deactivate marks, articulation pool) is walked through the
+// byte-exact pxgSlangSimCoreDesc mirrors via BDA.  PxgShape::hullOrMeshPtr is
+// dereferenced as the raw device pointer it is under CUDA (vertices start at
+// byte 48, vertex count packed in the uint4 at byte 16 — see convexFormat.h).
+// The articulation branch is transcribed faithfully: it indexes
+// mArticulationPool by the 544-byte PxgArticulation stride and reads the
+// linkBody2Worlds / linkBody2Actors PxTransform arrays through the embedded
+// device pointers (stride/offset constants proven by testSimCoreDescLayout).
+//
+// setRigidDynamicGlobalPose below remains in bound-buffer (StructuredBuffer)
+// form; its PxgShape::hullOrMeshPtr is repurposed as a byte offset into the
+// bound geometry blob buffer (gGeometryBlob).
 
 import pxgSlangCommon;
+import pxgSlangSimCoreDesc;
 
 static const uint BLOCK_SIZE = 256;
 
 struct UpdateBoundsParams
 {
-    uint numShapes;      // updateTransformCacheAndBoundArrayLaunch
+    uint numShapes;      // (legacy bound-buffer slot; unused by the BDA entry)
     uint nbElements;     // setRigidDynamicGlobalPose: number of pose updates
     uint totalNumShapes; // setRigidDynamicGlobalPose: size of the node/shape index maps
 };
 
+// ENGINE launch ABI of updateTransformCacheAndBoundArrayLaunch: exactly the
+// CUDA parameter list — one device pointer ({8} blob).
+struct SimCoreAbiParams
+{
+    uint64_t scDesc; // const PxgSimulationCoreDesc*
+};
+
 [[vk::push_constant]]
 ConstantBuffer<UpdateBoundsParams> gParams;
+
+[[vk::push_constant]]
+ConstantBuffer<SimCoreAbiParams> gSimCoreAbi;
 
 RWStructuredBuffer<PxgShapeSim> gShapeSims;             // binding 0
 RWStructuredBuffer<PxgShape> gShapes;                   // binding 1
@@ -230,81 +248,255 @@ void updateBounds(PxgShapeSim shapeSim, PxgTransform28 pose, uint index)
     storeBounds(index, outMin, outMax);
 }
 
+// ---------------------------------------------------------------------------
+// updateTransformCacheAndBoundArrayLaunch — ENGINE launch ABI (BDA)
+// ---------------------------------------------------------------------------
+
+// BDA variant of updateBounds() in updateCacheAndBound.cuh: identical branch
+// structure, with the PxgShape pool and the world-space bounds array reached
+// through device pointers, and hullOrMeshPtr dereferenced as the raw device
+// address of the cooked hull blob (exactly what the CUDA does).
+void updateBoundsBda(PxgShapeSim shapeSim, Ptr<PxgShapeGpu> convexShapes, Ptr<PxBounds3Gpu> boundsArray,
+                     PxgTransform28 pose, uint index)
+{
+    const float3 localMin = shapeSim.localBoundsMin();
+    const float3 localMax = shapeSim.localBoundsMax();
+    const uint shapeType = shapeSim.mShapeFlags_mShapeType >> 16;
+
+    float3 outMin;
+    float3 outMax;
+
+    if (shapeType == PXG_GEOM_SPHERE)
+    {
+        outMin = pose.p() + localMin;
+        outMax = pose.p() + localMax;
+    }
+    else if (shapeType == PXG_GEOM_CAPSULE)
+    {
+        const float radius = localMax.y;
+        const float halfHeight = localMax.x - radius;
+        const float3 d = quatBasisVector0(pose.q());
+        const float3 extents = abs(d) * halfHeight + radius;
+        outMin = pose.p() - extents;
+        outMax = pose.p() + extents;
+    }
+    else if (shapeType == PXG_GEOM_BOX)
+    {
+        const float3 halfExtents = localMax;
+        const float3 extents = basisExtent(mat33FromQuat(pose.q()), halfExtents);
+        outMin = pose.p() - extents;
+        outMax = pose.p() + extents;
+    }
+    else if (shapeType == PXG_GEOM_CONVEXMESH)
+    {
+        const uint hullIndex = shapeSim.mHullDataIndex;
+
+        if (hullIndex != 0xFFFFFFFFu)
+        {
+            const PxgShapeGpu shape = convexShapes[hullIndex];
+            PxgMat33 rot = mat33FromQuat(pose.q());
+            const bool scaleIsIdentity =
+                shape.scaleX == 1.0f && shape.scaleY == 1.0f && shape.scaleZ == 1.0f &&
+                shape.scaleRotX == 0.0f && shape.scaleRotY == 0.0f && shape.scaleRotZ == 0.0f;
+            if (!scaleIsIdentity)
+                rot = mat33MulMat33(rot, meshScaleToMat33(
+                    float3(shape.scaleX, shape.scaleY, shape.scaleZ),
+                    float4(shape.scaleRotX, shape.scaleRotY, shape.scaleRotZ, shape.scaleRotW)));
+
+            // convex blob layout (convexFormat.h): the uint4 at byte 16 packs
+            // the hull vertex count in bits [8, 16) of its first word
+            // (u16High(u32Low(tmp.x))); the float4 vertex array starts at
+            // byte 48 (sizeof(uint4) + 2 * sizeof(float4)).
+            const uint64_t convexPtr = shape.hullOrMeshPtr;
+            const uint4 tmp = (Ptr<uint4>(convexPtr))[1];
+            Ptr<float4> pVertices = Ptr<float4>(convexPtr + 48);
+
+            const uint nbHullVertices = (tmp.x >> 8) & 0xFFu;
+
+            float3 minV = float3(PXG_MAX_F32);
+            float3 maxV = float3(-PXG_MAX_F32);
+
+            for (uint i = 0; i < nbHullVertices; ++i)
+            {
+                const float4 vf = pVertices[i];
+                const float3 vertexV = mat33Transform(rot, vf.xyz);
+                minV = min(minV, vertexV);
+                maxV = max(maxV, vertexV);
+            }
+
+            outMin = minV + pose.p();
+            outMax = maxV + pose.p();
+        }
+        else
+        {
+            // GPU-incompatible hull (more than 64 verts / 31 verts per face)
+            transformFastBounds(pose, localMin, localMax, outMin, outMax);
+        }
+    }
+    else
+    {
+        // Updates any dynamic meshes or HFs that may be attached to simulation shapes
+        transformFastBounds(pose, localMin, localMax, outMin, outMax);
+    }
+
+    PxBounds3Gpu updatedBound;
+    updatedBound.minX = outMin.x;
+    updatedBound.minY = outMin.y;
+    updatedBound.minZ = outMin.z;
+    updatedBound.maxX = outMax.x;
+    updatedBound.maxY = outMax.y;
+    updatedBound.maxZ = outMax.z;
+    boundsArray[index] = updatedBound;
+}
+
+// mirrors updateCacheAndBound() in updateCacheAndBound.cuh (BDA form)
+void updateCacheAndBoundBda(PxgTransform28 absPos, PxgShapeSim shapeSim, uint index,
+                            Ptr<PxsCachedTransform> cacheArray, Ptr<PxBounds3Gpu> boundsArray,
+                            Ptr<PxgShapeGpu> shapes, bool isBP)
+{
+    // setTransformCache(): writes the full 32-byte PxsCachedTransform
+    PxsCachedTransform ct;
+    ct.transform = absPos;
+    ct.flags = 0;
+    cacheArray[index] = ct;
+    if (isBP)
+        updateBoundsBda(shapeSim, shapes, boundsArray, absPos, index);
+}
+
 // mirrors updateTransformCacheAndBoundArrayLaunch() in
-// updateTransformAndBoundArray.cu (rigid-body branch)
+// updateTransformAndBoundArray.cu — ENGINE launch ABI: one push argument
+// (the PxgSimulationCoreDesc device pointer), grid-stride loop over shapes,
+// rigid + articulation branches, launched with the engine's grid geometry
+// (PxgSimulationCoreKernelGridDim/BlockDim::UPDATE_TRANSFORMCACHE_AND_BOUNDARRAY
+// = 256 x 256).
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
 void updateTransformCacheAndBoundArrayLaunch(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
-    // The CUDA kernel uses a grid-stride loop; here the host dispatches
-    // ceil(numShapes / BLOCK_SIZE) groups so a single shot covers the range.
-    const uint i = dispatchThreadId.x;
-    const uint numShapes = gParams.numShapes;
+    const PxgSimulationCoreDescGpu scDesc = (Ptr<PxgSimulationCoreDescGpu>(gSimCoreAbi.scDesc))[0];
 
+    Ptr<PxgSolverBodySleepData> gSleepDataP = Ptr<PxgSolverBodySleepData>(scDesc.mSleepData);
+
+    Ptr<uint> gBodyDataIndicesP = Ptr<uint>(scDesc.mBodyDataIndices);
+    Ptr<PxgShapeGpu> gShapesP = Ptr<PxgShapeGpu>(scDesc.mShapes);
+
+    Ptr<PxgBodySim> gBodySimPool = Ptr<PxgBodySim>(scDesc.mBodySimBufferDeviceData);
+
+    const uint gNumShapes = scDesc.mNbTotalShapes;
+    Ptr<PxgShapeSim> gShapeSimPool = Ptr<PxgShapeSim>(scDesc.mShapeSimsBufferDeviceData);
+
+    const uint64_t gArticulations = scDesc.mArticulationPool;
+    Ptr<PxgSolverBodySleepData> gArticulationSleepData =
+        Ptr<PxgSolverBodySleepData>(scDesc.mArticulationSleepDataPool);
+
+    Ptr<PxsCachedTransform> gTransformCacheP = Ptr<PxsCachedTransform>(scDesc.mTransformCache);
+    Ptr<PxBounds3Gpu> gBoundsP = Ptr<PxBounds3Gpu>(scDesc.mBounds);
+
+    // Each shape has a corresponding unfrozen element
+    Ptr<uint> frozen = Ptr<uint>(scDesc.mFrozen);
+    Ptr<uint> unfrozen = Ptr<uint>(scDesc.mUnfrozen);
+    // Each shape has a updated element corresponding to the elementIndex
+    Ptr<uint> updated = Ptr<uint>(scDesc.mUpdated);
+
+    // Each body has a corresponding active and deactive element
+    Ptr<uint> active = Ptr<uint>(scDesc.mActivate);
+    Ptr<uint> deactivate = Ptr<uint>(scDesc.mDeactivate);
+
+    const uint idx = dispatchThreadId.x;
+
+    for (uint i = idx; i < gNumShapes; i += BLOCK_SIZE * WorkgroupCount().x)
     {
-        if (i >= numShapes)
-            return;
+        const PxgShapeSim shapeSim = gShapeSimPool[i];
 
-        const PxgShapeSim shapeSim = gShapeSims[i];
-
-        const uint2 bodySimNodeIndex = shapeSim.mBodySimIndex;
+        const uint2 bodySimNodeIndex = shapeSim.mBodySimIndex; // bodySimIndex is the same as nodeIndex in the IG
 
         // not static body or deleted shape
-        if (nodeIndexIsStaticBody(bodySimNodeIndex))
-            return;
-
-        const uint elementIndex = i; // transform cache and bound array index
-        const uint bodySimIndex = nodeIndexIndex(bodySimNodeIndex);
-
-        const PxgBodySim bodySim = gBodySims[bodySimIndex];
-
-        const uint shapeFlags = shapeSim.mShapeFlags_mShapeType & 0xFFFFu;
-        const bool isBP = (shapeFlags & (PXG_SHAPE_SIMULATION | PXG_SHAPE_TRIGGER)) != 0;
-        const bool isBPOrSq = (shapeFlags & (PXG_SHAPE_SIMULATION | PXG_SHAPE_TRIGGER | PXG_SHAPE_SCENE_QUERY)) != 0;
-
-        if (!nodeIndexIsArticulation(bodySimNodeIndex))
+        if (!nodeIndexIsStaticBody(bodySimNodeIndex))
         {
-            const uint activeNodeIndex = gBodyDataIndices[bodySimIndex];
+            const uint elementIndex = i; // this is the transform cache and bound array index
+            const uint bodySimIndex = nodeIndexIndex(bodySimNodeIndex);
 
-            // if activeNodeIndex is valid, which means this node is active
-            if (activeNodeIndex != 0xFFFFFFFFu)
+            const PxgBodySim bodySim = gBodySimPool[bodySimIndex];
+
+            const uint shapeFlags = shapeSim.mShapeFlags_mShapeType & 0xFFFFu;
+            const bool isBP = (shapeFlags & (PXG_SHAPE_SIMULATION | PXG_SHAPE_TRIGGER)) != 0;
+
+            const bool isBPOrSq =
+                (shapeFlags & (PXG_SHAPE_SIMULATION | PXG_SHAPE_TRIGGER | PXG_SHAPE_SCENE_QUERY)) != 0;
+
+            if (!nodeIndexIsArticulation(bodySimNodeIndex))
             {
-                const uint internalFlags = gSleepData[activeNodeIndex].internalFlags;
-                const PxgTransform28 body2World = makeTransform28(bodySim.body2World.q, bodySim.body2World.p.xyz);
+                const uint activeNodeIndex = gBodyDataIndicesP[bodySimIndex];
 
-                if ((internalFlags & PXG_BODY_FREEZE_THIS_FRAME) != 0 && (internalFlags & PXG_BODY_FROZEN) != 0)
+                // if activeNodeIndex is valid, which means this node is active
+                if (activeNodeIndex != 0xFFFFFFFFu)
                 {
-                    gFrozen[i] = 1;
-                    gTransformCache[elementIndex].flags = PXG_TRANSFORM_CACHE_FROZEN;
-                }
-                else if ((internalFlags & PXG_BODY_UNFREEZE_THIS_FRAME) != 0)
-                {
-                    gUnfrozen[i] = 1;
-                }
+                    const uint internalFlags = gSleepDataP[activeNodeIndex].internalFlags;
+                    const PxgTransform28 body2World =
+                        makeTransform28(bodySim.body2World.q, bodySim.body2World.p.xyz);
 
-                if ((internalFlags & PXG_BODY_FROZEN) == 0 || (internalFlags & PXG_BODY_FREEZE_THIS_FRAME) != 0)
-                {
-                    if (isBP)
-                        gUpdated[elementIndex] = 1;
+                    if ((internalFlags & PXG_BODY_FREEZE_THIS_FRAME) != 0 && (internalFlags & PXG_BODY_FROZEN) != 0)
+                    {
+                        frozen[i] = 1;
+                        gTransformCacheP[elementIndex].flags = PXG_TRANSFORM_CACHE_FROZEN;
+                    }
+                    else if ((internalFlags & PXG_BODY_UNFREEZE_THIS_FRAME) != 0)
+                    {
+                        unfrozen[i] = 1;
+                    }
 
-                    const PxgTransform28 body2Actor = makeTransform28(
-                        bodySim.body2Actor_maxImpulseW.q, bodySim.body2Actor_maxImpulseW.p.xyz);
-                    const PxgTransform28 absPos = getAbsPose(body2World, shapeSim.mTransform, body2Actor);
+                    if ((internalFlags & PXG_BODY_FROZEN) == 0 || (internalFlags & PXG_BODY_FREEZE_THIS_FRAME) != 0)
+                    {
+                        if (isBP)
+                            updated[elementIndex] = 1;
 
-                    // updateCacheAndBound()
-                    gTransformCache[elementIndex].transform = absPos;
-                    gTransformCache[elementIndex].flags = 0;
-                    if (isBPOrSq)
-                        updateBounds(shapeSim, absPos, elementIndex);
+                        const PxgTransform28 body2Actor = makeTransform28(
+                            bodySim.body2Actor_maxImpulseW.q, bodySim.body2Actor_maxImpulseW.p.xyz);
+                        const PxgTransform28 absPos = getAbsPose(body2World, shapeSim.mTransform, body2Actor);
+
+                        updateCacheAndBoundBda(absPos, shapeSim, elementIndex, gTransformCacheP, gBoundsP,
+                                               gShapesP, isBPOrSq);
+                    }
+
+                    if ((internalFlags & PXG_BODY_ACTIVATE_THIS_FRAME) != 0)
+                        active[bodySimIndex] = 1;
+                    else if ((internalFlags & PXG_BODY_DEACTIVATE_THIS_FRAME) != 0)
+                        deactivate[bodySimIndex] = 1;
                 }
+            }
+            else
+            {
+                // This is articulation
+                const uint articulationId = bodySim.articulationRemapId;
+                const PxgSolverBodySleepData artiSleepData = gArticulationSleepData[articulationId];
+                const uint internalFlags = artiSleepData.internalFlags;
+
+                const uint linkId = nodeIndexArticulationLinkId(bodySimNodeIndex);
+
+                // articulation.linkBody2Worlds[linkId] (PxTransform, 28-byte stride)
+                Ptr<PxgTransform28> linkBody2Worlds = Ptr<PxgTransform28>(
+                    artiLinkTransformArray(gArticulations, articulationId, PXG_ARTI_LINK_BODY2WORLDS_OFFSET));
+                const PxgTransform28 body2World = linkBody2Worlds[linkId];
+
+                if (isBP)
+                    updated[elementIndex] = 1;
+
+                // articulation.linkBody2Actors[linkId]
+                Ptr<PxgTransform28> linkBody2Actors = Ptr<PxgTransform28>(
+                    artiLinkTransformArray(gArticulations, articulationId, PXG_ARTI_LINK_BODY2ACTORS_OFFSET));
+                const PxgTransform28 body2Actor = linkBody2Actors[linkId];
+
+                const PxgTransform28 absPos = getAbsPose(body2World, shapeSim.mTransform, body2Actor);
+
+                updateCacheAndBoundBda(absPos, shapeSim, elementIndex, gTransformCacheP, gBoundsP,
+                                       gShapesP, isBPOrSq);
 
                 if ((internalFlags & PXG_BODY_ACTIVATE_THIS_FRAME) != 0)
-                    gActive[bodySimIndex] = 1;
+                    active[bodySimIndex] = 1;
                 else if ((internalFlags & PXG_BODY_DEACTIVATE_THIS_FRAME) != 0)
-                    gDeactivate[bodySimIndex] = 1;
+                    deactivate[bodySimIndex] = 1;
             }
         }
-        // else: articulation branch not yet ported (see file header)
     }
 }
 
