@@ -106,6 +106,61 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
+## P5 Step 4 — MILESTONE: the box falls on the GPU
+
+As of tranche 12 (commit 250bb68) `PXG_GPU_STEP=1 ./gpu-sdk-step` shows the
+box FALLING under gravity on the GPU: `box start y=5.000, y after 1 step
+=4.997`, free-fall integration end-to-end, ZERO refused launches on the
+rigid free-fall path, suite 679/679 both memory modes.  Landed since the
+last anchor:
+- tranche 10: TGS solver frame set (initStaticKinematics, ZeroBodiesTGS,
+  initializeSolverVelocitiesTGS, computeAverage/propagate/writeBackBodiesTGS,
+  integrateCoreParallelLaunchTGS).
+- solveWholeIslandTGS crash fix: for a constraint-free island PhysX leaves
+  the block-constraint pointers null; the llvmpipe optimizer speculatively
+  hoisted the batches[] load out of the zero-trip loop and faulted.  Gated
+  the solve loops on a non-null batch pointer (commit 707d763).  Debug seam
+  PXG_SYNC_EACH (flush after each dispatch) added to the shim to pin a
+  shader fault to the exact launch.
+- tranche 11: simcontroller updateBodies/Shapes/Transform + PxgSimulationCore
+  /PxgNewBodiesDesc mirrors (commit b0875db).
+- tranche 12: preIntegrationLaunchTGS (the TGS gravity kernel) — shared
+  preIntegrateBodyCompute helper + BDA entry; paramAlign/abiAlign fixed to
+  the largest-power-of-two-divisor rule for the 12-byte by-value PxVec3
+  gravity (commit 250bb68).
+
+REMAINING to make the box REST on the ground (the contact pipeline; the box
+currently falls THROUGH — final y=-73.8, |v|=39.2 — because no contact
+constraint is generated).  The box-vs-box (dynamic box + static ground box)
+contact path, from the engine trace's "Could not find registered CUDA
+function" set (rigid-only; ignore cloth/particle/arti/bvh/sdf):
+- `boxBoxNphase_Kernel` — UNMAPPED, no worktree yet.  Box-box primitives
+  were ported in tranches 47-52 (npBoxBox*.slang helpers exist); needs the
+  BDA entry + ABI row + mapping + engine-ABI test.
+- contact/joint PREP set — staged UNVERIFIED in worktree
+  `.claude/worktrees/agent-ac3f057108a97b50f`: constraintContactBlockPrePrep-
+  Launch, constraint1DPrePrepLaunch, constraint1DBlockPrePrepLaunch,
+  rigidSumInternalContactAndJointBatches1/2, contactConstraintBlockPrepare-
+  ParallelLaunchTGS + pxgSlangPrepDesc.slang (PxgPrePrepDesc/PxgConstraint-
+  PrepareDesc mirrors) + npPrepDescProbe + testPrepDescLayout.  Merge like
+  the simcontroller worktree: git diff -> apply -> ABI rows -> retire HLSL ->
+  reconcile PXG_SLANG_KERNEL_MAPPED -> suite both modes -> engine trace.
+- contact STREAM/compress/finish set — staged UNVERIFIED in worktree
+  `.claude/worktrees/agent-a734706e687bb0590`: npCompressContacts,
+  npCompressContacts2, npCvxFinishContacts, npCvxStage1Refresh,
+  npCvxStage2Setup + pxgSlangNpAbi.slang + npNpAbiProbe + testNpAbiLayout.
+  (convexConvex path — needed for general convex; compress/finish are on the
+  shared contact-stream path.)
+- `clearFrictionPatchCounts` — UNMAPPED, needs port.
+- Already mapped and working: solveWholeIslandTGS (solves the contact once
+  batches exist), contact/jointConstraintBlockPrepareParallelLaunchTGS.
+Merge doctrine (proven 4x this session): worktree agent -> git diff HEAD >
+patch -> git apply in main tree -> add reported ABI rows to bridge/
+PxgVulkanKernelAbi.cpp -> retire reported PXG_HLSL_ENTRIES -> reconcile
+PXG_SLANG_KERNEL_MAPPED -> rebuild both build trees -> suite both modes ->
+gpu-sdk-step trace.  End state: box falls AND rests (finalY in [0.5,1.5],
+|v|~0).
+
 ## P5 Step 4 — live bring-up state (continuation anchor)
 
 Converted to the engine ABI (BDA + ABI row + shim-driven test, all green;
