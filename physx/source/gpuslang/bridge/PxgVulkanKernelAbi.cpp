@@ -52,9 +52,14 @@ static const uint8_t kMemCopyBalanced[] = { 8, 4 };
 //                        PxU32 boxesCapacity, PxU8 x6 shift/envID bits)
 static const uint8_t kTranslateAABBs[] = { 8, 8, 8, 8, 4, 1, 1, 1, 1, 1, 1 };
 
+// broadphase.cu: clearNewFlagLaunch(const PxgBroadPhaseDesc*) / bpSignalComplete(PxU32*)
+static const uint8_t kOnePtr[] = { 8 };
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },
+    { "clearNewFlagLaunch", kOnePtr, 1u },
+    { "bpSignalComplete", kOnePtr, 1u },
 };
 
 inline size_t abiAlign(size_t size)

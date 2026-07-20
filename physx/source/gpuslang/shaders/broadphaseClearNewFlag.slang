@@ -26,83 +26,72 @@
 
 // broadphaseClearNewFlag.slang
 //
-// Slang port of the two remaining broad-phase glue kernels
-// (gpubroadphase/src/CUDA/broadphase.cu):
-//   - clearNewFlagLaunch: after the first frame that inserted a batch of newly
-//     created boxes, rewrite the current frame's start/end sort handles for
-//     those boxes with the "new" flag cleared (isNew = false), so they are no
-//     longer treated as freshly inserted on the next incremental pass.
-//   - bpSignalComplete: a single-thread store of 1 into the completion-signal
-//     word (the CPU polls this to know the broad-phase dispatch chain is done).
-//
-// Both are pure per-thread scatter kernels — no groupshared, scans, atomics or
-// barriers.  The per-axis arrays are packed into flat buffers.
+// P5 Step 4 (BDA, engine launch path): the two broad-phase glue kernels,
+// driven exactly as the engine launches them (void** form, one bpDesc pointer /
+// one raw signal pointer).  clearNewFlagLaunch takes the PxgBroadPhaseDesc
+// aggregate BY DEVICE POINTER and walks its nested pointers through the
+// byte-exact PxgBroadPhaseDescGpu mirror (layout proven by testBpDescLayout);
+// bpSignalComplete stores 1 through the raw signal pointer.  Grid-stride loop,
+// thread mapping and handle encoding mirror the .cu verbatim.
 
-static const uint AXIS_COUNT = 3;
+import pxgSlangBpDesc;
 
-struct ClearParams
+struct ClearNewFlagParams
 {
-    uint numHandles;         // nbProjections = numHandles * 2
-    uint numCreatedHandles;  // grid-stride loop bound
-    uint gridDimX;           // groups launched (grid-stride)
+    uint64_t bpDesc; // device address of the PxgBroadPhaseDesc aggregate
 }
-
 [[vk::push_constant]]
-ConstantBuffer<ClearParams> gParams;
+ConstantBuffer<ClearNewFlagParams> gClear;
 
-RWStructuredBuffer<uint> gCreatedHandles;  // binding 0  updateData_createdHandles
-RWStructuredBuffer<uint> gSapBox;          // binding 1  boxSapBox1D[axis] flat [3][numHandles][2]
-RWStructuredBuffer<uint> gBoxHandles0;     // binding 2  boxHandles[0][axis] flat [3][nbProj] (current)
-RWStructuredBuffer<uint> gSignal;          // binding 3  completion-signal word
-
-// createHandle(handle, isStart, isNew) — PxgBroadPhaseDesc.h
-uint createHandle(uint handle, bool isStart, bool isNew)
-{
-    return (handle << 3) | (isStart ? 1u : 0u) | (isNew ? 2u : 0u);
-}
-
-// sapBox[axis][handle].mMinMax[i]
-uint sapPos(uint axis, uint handle, uint numHandles, uint i)
-{
-    return gSapBox[(axis * numHandles + handle) * 2u + i];
-}
-
-// ---------------------------------------------------------------------------
-// clearNewFlagLaunch (BP_CLEAR_NEWFLAG)
-// ---------------------------------------------------------------------------
+// mirrors clearNewFlagLaunch(const PxgBroadPhaseDesc* bpDesc)  // BP_CLEAR_NEWFLAG
+// engine grid: PxgBPKernelGridDim::BP_CLEAR_NEWFLAG blocks x 256 threads,
+// grid-stride over numCreatedHandles.
 [shader("compute")]
 [numthreads(256, 1, 1)]
-void clearNewFlagLaunch(uint3 dtid : SV_DispatchThreadID)
+void clearNewFlagLaunch(uint3 dtid : SV_DispatchThreadID, uint3 groupId : SV_GroupID,
+                        uint3 gtid : SV_GroupThreadID)
 {
-    const uint numHandles = gParams.numHandles;
-    const uint nbProj = numHandles * 2u;
-    const uint num = gParams.numCreatedHandles;
-    const uint stride = gParams.gridDimX * 256u;
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gClear.bpDesc);
+    const uint numCreatedHandleSize = desc[0].numCreatedHandles;
 
-    for (uint i = dtid.x; i < num; i += stride)
+    Ptr<uint> createdHandles = Ptr<uint>(desc[0].updateData_createdHandles);
+    Ptr<uint> boxSapBox1DX = Ptr<uint>(desc[0].boxSapBox1D[0]); // PxgSapBox1D = 2 uints
+    Ptr<uint> boxSapBox1DY = Ptr<uint>(desc[0].boxSapBox1D[1]);
+    Ptr<uint> boxSapBox1DZ = Ptr<uint>(desc[0].boxSapBox1D[2]);
+    Ptr<uint> boxHandlesX = Ptr<uint>(desc[0].boxHandles[0]); // boxHandles[0][X]
+    Ptr<uint> boxHandlesY = Ptr<uint>(desc[0].boxHandles[1]); // boxHandles[0][Y]
+    Ptr<uint> boxHandlesZ = Ptr<uint>(desc[0].boxHandles[2]); // boxHandles[0][Z]
+
+    // CUDA grid-stride loop: stride = blockDim.x * gridDim.x, with gridDim
+    // available as the NumWorkgroups builtin (WorkgroupCount()).
+    const uint stride = WorkgroupCount().x * 256u;
+    for (uint i = dtid.x; i < numCreatedHandleSize; i += stride)
     {
-        const uint objectHandle = gCreatedHandles[i];
-        const uint startHandle = createHandle(objectHandle, true, false);
-        const uint endHandle = createHandle(objectHandle, false, false);
-        [unroll]
-        for (uint axis = 0; axis < AXIS_COUNT; ++axis)
-        {
-            const uint minIndex = sapPos(axis, objectHandle, numHandles, 0u);
-            const uint maxIndex = sapPos(axis, objectHandle, numHandles, 1u);
-            const uint base = axis * nbProj;
-            gBoxHandles0[base + minIndex] = startHandle;
-            gBoxHandles0[base + maxIndex] = endHandle;
-        }
+        const uint objectHandle = createdHandles[i];
+        const uint startHandle = bpCreateHandle(objectHandle, true, false);
+        const uint endHandle = bpCreateHandle(objectHandle, false, false);
+
+        boxHandlesX[boxSapBox1DX[objectHandle * 2u + 0u]] = startHandle;
+        boxHandlesX[boxSapBox1DX[objectHandle * 2u + 1u]] = endHandle;
+        boxHandlesY[boxSapBox1DY[objectHandle * 2u + 0u]] = startHandle;
+        boxHandlesY[boxSapBox1DY[objectHandle * 2u + 1u]] = endHandle;
+        boxHandlesZ[boxSapBox1DZ[objectHandle * 2u + 0u]] = startHandle;
+        boxHandlesZ[boxSapBox1DZ[objectHandle * 2u + 1u]] = endHandle;
     }
 }
 
-// ---------------------------------------------------------------------------
-// bpSignalComplete (BP_SIGNAL_COMPLETE)
-// ---------------------------------------------------------------------------
+struct SignalParams
+{
+    uint64_t signal; // device address of the completion-signal word
+}
+[[vk::push_constant]]
+ConstantBuffer<SignalParams> gSignalP;
+
+// mirrors bpSignalComplete(PxU32* signal)  // BP_SIGNAL_COMPLETE (grid 1x1)
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void bpSignalComplete(uint3 dtid : SV_DispatchThreadID)
 {
     if (dtid.x == 0u)
-        gSignal[0] = 1u;
+        (Ptr<uint>(gSignalP.signal))[0] = 1u;
 }

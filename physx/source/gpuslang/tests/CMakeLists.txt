@@ -1212,7 +1212,8 @@ set(PXG_HLSL_ENTRIES
     "broadphaseMarkPairs:markRemovedPairsProjectionsLaunch"
     "broadphaseMarkPairs:markUpdatedPairsLaunch"
     "broadphaseMarkPairs:markUpdatedPairsLaunch2"
-    "broadphaseClearNewFlag:clearNewFlagLaunch"
+    # clearNewFlagLaunch: BDA + WorkgroupCount (gl_NumWorkGroups) — Vulkan-only,
+    # no cs_6_0 lowering (same policy as the P0 BDA spikes).
     "broadphaseClearNewFlag:bpSignalComplete"
     "broadphaseAggregateBounds:markAggregateBoundsUpdatedBitmap"
     "broadphaseAggregateBounds:updateAggregateBounds"
