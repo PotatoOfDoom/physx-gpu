@@ -92,6 +92,11 @@ static const uint8_t kConcludeBlocksTGS[] = { 8, 8, 4 };
 //    PxU32 maxStaticPartitions, PxReal elapsedTime, PxReal minPen) -> 40-byte blob
 static const uint8_t kSolveStaticBlockTGS[] = { 8, 8, 4, 4, 4, 4, 4 };
 
+// solverTGS: solveBlockUnified(desc, sharedDesc, PxU32 islandIndex,
+//   PxU32 partitionIndex, bool doFriction, PxReal elapsedTime, PxReal minPen,
+//   PxgArticulationCoreDesc*) -> 48-byte blob (bool byte @24, arti ptr @40)
+static const uint8_t kSolveBlockUnified[] = { 8, 8, 4, 4, 1, 4, 4, 8 };
+
 // integration.cu: integrateCoreParallelLaunchTGS(PxU32 offset, desc, sharedDesc,
 //   PxU32* islandIds, PxU32* islandStaticTouchCounts, PxU32* numCountedInteractions)
 static const uint8_t kIntegrateTGS[] = { 4, 8, 8, 8, 8, 8 };
@@ -189,6 +194,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "writebackBlocksTGS", kConcludeBlocksTGS, uint32_t(sizeof(kConcludeBlocksTGS)) },
     { "solveStaticBlockTGS", kSolveStaticBlockTGS, uint32_t(sizeof(kSolveStaticBlockTGS)) },
     { "propagateStaticSolverBodyVelocitiesTGS", kSolveStaticBlockTGS, uint32_t(sizeof(kSolveStaticBlockTGS)) },
+    { "solveBlockUnified", kSolveBlockUnified, uint32_t(sizeof(kSolveBlockUnified)) },
     { "integrateCoreParallelLaunchTGS", kIntegrateTGS, uint32_t(sizeof(kIntegrateTGS)) },
     // gpusimulationcontroller: updateTransformAndBoundArray.cu / updateBodiesAndShapes.cu
     { "updateTransformCacheAndBoundArrayLaunch", kOnePtr, 1u },

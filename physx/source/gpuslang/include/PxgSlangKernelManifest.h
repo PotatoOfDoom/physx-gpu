@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 141;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 142;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -128,7 +128,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "computeThresholdElementMaskIndices", "thresholdForceChange.spv", "computeThresholdElementMaskIndices" },  // COMPUTE_THRESHOLDELEMENT_MASK_INDICES
     { "outputThresholdPairsMaskIndices", "thresholdForceChange.spv", "outputThresholdPairsMaskIndices" },  // OUTPUT_THRESHOLDELEMENT_MASK_INDICES
     { "createForceChangeThresholdElements", "thresholdForceChange.spv", "createForceChangeThresholdElements" },  // CREATE_FORCECHANGE_THRESHOLDELEMENTS
-    { "solveBlockUnified", nullptr, nullptr },  // SOLVE_UNIFIED (unmapped)
+    { "solveBlockUnified", "solverTGS.spv", "solveBlockUnified" },  // SOLVE_UNIFIED (P5 Step 5 tranche A BDA)
     { "propagateStaticSolverBodyVelocities", nullptr, nullptr },  // PROPAGATE_STATIC_SOLVER_VELOCITIES (unmapped)
     { "integrateCoreParallelLaunch", "integration.spv", "integrateCoreParallelLaunch" },  // INTEGRATE_CORE_PARALLEL
     { "clearFrictionPatchCounts", nullptr, nullptr },  // CLEAR_FRICTION_PATCH_COUNTS (unmapped)
