@@ -109,6 +109,16 @@ static const uint8_t kFinishContacts[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 1, 8, 8
 //   compressContactStage1(ptr, PxU32, ptr) / compressContactStage2(2 ptr, u32, 12 ptr, u32)
 static const uint8_t kCompress1[] = { 8, 4, 8 };
 static const uint8_t kCompress2[] = { 8, 8, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4 };
+//   updateFrictionPatches(PxU32 pairCount, const PxU8* startContactPatches,
+//     PxU8* startFrictionPatches, PxsContactManagerOutput* outputs) -> 32-byte blob
+static const uint8_t kFrictionPatch[] = { 4, 8, 8, 8 };
+//   prepareLostFoundPairs_Stage1(const PxU32* inputFlags, PxU32* tempRunsum,
+//     PxU32* blockAccumulation, PxU32 numPairs) -> 32-byte blob
+static const uint8_t kLostFound1[] = { 8, 8, 8, 4 };
+//   prepareLostFoundPairs_Stage2(inputFlags*, tempRunsum*, allOutputManagers*,
+//     compactedOutputManagers*, outputManagersPtrs*, lostAndTotalReportedPairsCount*,
+//     blockAccumulation*, PxU32 numPairs, contactManagerArray*) -> 72-byte blob
+static const uint8_t kLostFound2[] = { 8, 8, 8, 8, 8, 8, 8, 4, 8 };
 
 // gpusolver: rigidSumInternalContactAndJointBatches1(PxgPrePrepDesc*, PxU32 nbBodies)
 static const uint8_t kPtrU32[] = { 8, 4 };
@@ -185,6 +195,9 @@ static const PxgKernelAbiRow kRows[] = {
     { "finishContactsKernel", kFinishContacts, uint32_t(sizeof(kFinishContacts)) },
     { "compressContactStage1", kCompress1, uint32_t(sizeof(kCompress1)) },
     { "compressContactStage2", kCompress2, uint32_t(sizeof(kCompress2)) },
+    { "updateFrictionPatches", kFrictionPatch, uint32_t(sizeof(kFrictionPatch)) },
+    { "prepareLostFoundPairs_Stage1", kLostFound1, uint32_t(sizeof(kLostFound1)) },
+    { "prepareLostFoundPairs_Stage2", kLostFound2, uint32_t(sizeof(kLostFound2)) },
     { "boxBoxNphase_Kernel", kBoxBoxNphase, uint32_t(sizeof(kBoxBoxNphase)) },
 };
 

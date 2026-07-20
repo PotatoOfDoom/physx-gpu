@@ -40,9 +40,9 @@
 //   output-identical reduction over the same work partition (llvmpipe has no
 //   32-wide subgroup).
 //
-// - updateFrictionPatches — still the bound-buffer harness form (its engine
-//   conversion is a separate tranche): rescales each pair's contact-patch
-//   byte offset into the friction-patch stream.
+// - updateFrictionPatches — P5 Step 4 (BDA, engine launch path), argSizes
+//   {4,8,8,8}: rescales each pair's contact-patch device pointer into the
+//   friction-patch stream (real 64-bit PxsContactManagerOutput fields).
 
 import pxgSlangNpAbi;
 
@@ -102,34 +102,43 @@ void compressContactStage1(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
 }
 
 // ---------------------------------------------------------------------------
-// updateFrictionPatches (bound-buffer harness form, unchanged)
-// ---------------------------------------------------------------------------
-struct CompressParams
+// updateFrictionPatches — P5 Step 4 (BDA, engine launch path), the exact engine
+// ABI (PxgNarrowphaseCore.cpp ~L7222): (PxU32 pairCount, const PxU8*
+// startContactPatches, PxU8* startFrictionPatches, PxsContactManagerOutput*
+// outputs), argSizes {4,8,8,8} -> 32-byte blob.  Engine grid: ceil(count/256)
+// blocks x 256 threads, one contact-manager per thread.  Rescales each pair's
+// contact-patch device pointer into the friction-patch stream, writing the real
+// 64-bit PxsContactManagerOutput.frictionPatches field (byte 24) via Ptr<>:
+//   frictionPatches = startFrictionPatches
+//       + (output.contactPatches - startContactPatches)
+//         * sizeof(PxFrictionPatch) / sizeof(PxContactPatch)
+// exactly the .cu's pointer arithmetic in 64-bit.
+static const uint64_t CONTACT_PATCH_SIZE = 64;  // sizeof(PxContactPatch)
+static const uint64_t FRICTION_PATCH_SIZE = 52; // sizeof(PxFrictionPatch)
+
+struct FrictionPatchParams
 {
-    uint numTotalPairs;  // unused here
-    uint pairCount;      // updateFrictionPatches
-    uint startContact;   // startContactPatches byte offset
-    uint startFriction;  // startFrictionPatches byte offset
-    uint contactSize;    // sizeof(PxContactPatch)
-    uint fricSize;       // sizeof(PxFrictionPatch)
-}
+    uint pairCount;                 // @0
+    // implicit 4-byte pad to the u64 alignment (matches the marshalled blob)
+    uint64_t startContactPatches;   // @8   const PxU8*
+    uint64_t startFrictionPatches;  // @16  PxU8*
+    uint64_t outputs;               // @24  PxsContactManagerOutput*
+}   // size 32
 
 [[vk::push_constant]]
-ConstantBuffer<CompressParams> gParams;
-
-RWStructuredBuffer<uint> gOutputData;    // binding 0  PxsContactManagerOutput (word view)
-RWStructuredBuffer<uint> gBlockNumPairs; // binding 1  [NUM_BLOCKS] (kept for layout parity)
+ConstantBuffer<FrictionPatchParams> gFP;
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void updateFrictionPatches(uint3 dtid : SV_DispatchThreadID)
 {
     const uint threadIndex = dtid.x;
-    if (threadIndex >= gParams.pairCount)
+    if (threadIndex >= gFP.pairCount)
         return;
 
-    const uint contactPatches = gOutputData[threadIndex * OUTPUT_WORDS + 0u];
-    const uint diff = contactPatches - gParams.startContact;
-    const uint frictionPatches = gParams.startFriction + diff * gParams.fricSize / gParams.contactSize;
-    gOutputData[threadIndex * OUTPUT_WORDS + 6u] = frictionPatches;
+    Ptr<PxsContactManagerOutputGpu> outputs = Ptr<PxsContactManagerOutputGpu>(gFP.outputs);
+    const uint64_t contactPatches = outputs[threadIndex].contactPatches;
+    const uint64_t frictionPatches = gFP.startFrictionPatches
+        + (contactPatches - gFP.startContactPatches) * FRICTION_PATCH_SIZE / CONTACT_PATCH_SIZE;
+    outputs[threadIndex].frictionPatches = frictionPatches;
 }

@@ -41,12 +41,13 @@
 //     offset (= number of lost-touch flags) is written to
 //     lostAndTotalReportedPairsCount->x, and the grand total (lost+found) to ->y.
 //
-// Data model: the manager's three copied PxU8 fields arrive packed in one uint
-// (nbPatches | statusFlag<<8 | prevPatches<<16 | nbContacts<<24 — the top byte
-// stands in for the NOT-copied fields); the compacted output uses the real
-// PxsContactManagerOutputCounts little-endian byte layout
-// (nbPatches | prevPatches<<8 | statusFlag<<16, unused byte 0).  Contact-manager
-// pointers are modelled as opaque 32-bit handles (the kernel only copies them).
+// Data model (engine launch path): allOutputManagers is the real 48-byte
+// PxsContactManagerOutput array — its packed flags word (allflagsStart |
+// nbPatches<<8 | statusFlag<<16 | prevPatches<<24) sits at byte 32 = word 8.
+// The compacted output uses the real PxsContactManagerOutputCounts little-endian
+// byte layout (nbPatches | prevPatches<<8 | statusFlag<<16, unused byte 0), one
+// 4-byte word.  Contact-manager pointer arrays are real 64-bit device pointers,
+// copied verbatim (Ptr<uint64_t>).
 
 // launch config: PxgNarrowPhaseBlockDims::COMPACT_LOST_FOUND_PAIRS = 512,
 // PxgNarrowPhaseGridDims::COMPACT_LOST_FOUND_PAIRS = 32 (PxgNpKernelIndices.h)
@@ -55,23 +56,44 @@ static const uint NUM_BLOCKS = 32;
 static const uint WARP = 32;
 static const uint WARPS_PER_BLOCK = BLOCK / WARP; // 16
 
-struct LostFoundParams
+// P5 Step 4 (BDA, engine launch path).  Both stages launch via the engine's
+// sized form (PxgNarrowphaseCore.cpp ~L344), so each argument becomes a field
+// of a single push-constant blob (all pointers -> uint64_t; every array is
+// walked through Ptr<T>).  PxsContactManagerOutput is a 48-byte struct: the
+// packed flags word (allflagsStart | nbPatches<<8 | statusFlag<<16 |
+// prevPatches<<24) lives at byte 32 = uint word 8.  PxsContactManagerOutputCounts
+// is one 4-byte word (nbPatches | prevPatches<<8 | statusFlag<<16).  The
+// contact-manager pointer arrays are real 64-bit device pointers (copied
+// verbatim).  uint2 lostAndTotalReportedPairsCount is {x@0, y@4} = Ptr<uint>.
+static const uint OUTPUT_WORDS = 12; // sizeof(PxsContactManagerOutput)/4
+
+// Stage 1 blob {inputFlags(8), tempRunsum(8), blockAccum(8), numPairs(4)} = 32 B
+struct LostFoundStage1Params
 {
-    uint numPairs; // scan length is 2*numPairs
-    uint pad0, pad1, pad2;
+    uint64_t inputFlags;  // @0  const PxU32*
+    uint64_t tempRunsum;  // @8  PxU32*
+    uint64_t blockAccum;  // @16 PxU32*
+    uint numPairs;        // @24
+}
+// Stage 2 blob {inputFlags,tempRunsum,allOutputManagers,compacted,ptrs,lostTotal,
+//               blockAccum (7x8=56), numPairs(4)@56, cmArray(8)@64} = 72 B
+struct LostFoundStage2Params
+{
+    uint64_t inputFlags;        // @0  const PxU32*
+    uint64_t tempRunsum;        // @8  const PxU32*
+    uint64_t allOutputManagers; // @16 const PxsContactManagerOutput*
+    uint64_t compacted;         // @24 PxsContactManagerOutputCounts*
+    uint64_t ptrs;              // @32 PxsContactManager** (outputManagersPtrs)
+    uint64_t lostTotal;         // @40 uint2*
+    uint64_t blockAccum;        // @48 PxU32*
+    uint numPairs;              // @56
+    uint64_t cmArray;           // @64 PxsContactManager** (contactManagerArray)
 }
 
 [[vk::push_constant]]
-ConstantBuffer<LostFoundParams> gParams;
-
-RWStructuredBuffer<uint> gFlags;       // binding 0: inputFlagsArray [2*numPairs]
-RWStructuredBuffer<uint> gRunSum;      // binding 1: tempRunsumArray [2*numPairs]
-RWStructuredBuffer<uint> gBlockTotals; // binding 2: blockAccumulationArray [NUM_BLOCKS]
-RWStructuredBuffer<uint> gMgrWords;    // binding 3: allOutputManagers (packed) [numPairs]
-RWStructuredBuffer<uint> gMgrHandles;  // binding 4: contactManagerArray (opaque) [numPairs]
-RWStructuredBuffer<uint> gCompacted;   // binding 5: compactedOutputManagers (packed Counts)
-RWStructuredBuffer<uint> gPtrs;        // binding 6: outputManagersPtrs (opaque)
-RWStructuredBuffer<uint> gLostTotal;   // binding 7: lostAndTotalReportedPairsCount {x, y}
+ConstantBuffer<LostFoundStage1Params> gP1;
+[[vk::push_constant]]
+ConstantBuffer<LostFoundStage2Params> gP2;
 
 groupshared uint gsPairs[BLOCK];
 groupshared uint gsWarpPairs[WARPS_PER_BLOCK];
@@ -114,12 +136,16 @@ void scanWarpTotalsPairs(uint tid)
 // ---------------------------------------------------------------------------
 [shader("compute")]
 [numthreads(512, 1, 1)]
-void lostFoundStage1(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+void prepareLostFoundPairs_Stage1(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     const uint tid = gtid.x;
     const uint blockIdx = gid.x;
-    const uint n = 2u * gParams.numPairs;
+    const uint n = 2u * gP1.numPairs;
     const uint warpIndex = tid / WARP;
+
+    Ptr<uint> gFlags = Ptr<uint>(gP1.inputFlags);
+    Ptr<uint> gRunSum = Ptr<uint>(gP1.tempRunsum);
+    Ptr<uint> gBlockTotals = Ptr<uint>(gP1.blockAccum);
 
     const uint totalBlockRequired = (n + (BLOCK - 1)) / BLOCK;
     const uint numIterationPerBlock = (totalBlockRequired + (NUM_BLOCKS - 1)) / NUM_BLOCKS;
@@ -165,12 +191,21 @@ void lostFoundStage1(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 // ---------------------------------------------------------------------------
 [shader("compute")]
 [numthreads(512, 1, 1)]
-void lostFoundStage2(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+void prepareLostFoundPairs_Stage2(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     const uint tid = gtid.x;
     const uint blockIdx = gid.x;
-    const uint numPairs = gParams.numPairs;
+    const uint numPairs = gP2.numPairs;
     const uint n = 2u * numPairs;
+
+    Ptr<uint> gFlags = Ptr<uint>(gP2.inputFlags);
+    Ptr<uint> gRunSum = Ptr<uint>(gP2.tempRunsum);
+    Ptr<uint> gMgr = Ptr<uint>(gP2.allOutputManagers);        // 48-byte struct word view
+    Ptr<uint> gCompacted = Ptr<uint>(gP2.compacted);          // 4-byte Counts view
+    Ptr<uint64_t> gPtrs = Ptr<uint64_t>(gP2.ptrs);            // PxsContactManager*
+    Ptr<uint64_t> gMgrHandles = Ptr<uint64_t>(gP2.cmArray);  // PxsContactManager*
+    Ptr<uint> gLostTotal = Ptr<uint>(gP2.lostTotal);         // uint2 {x,y}
+    Ptr<uint> gBlockTotals = Ptr<uint>(gP2.blockAccum);
 
     if (tid < NUM_BLOCKS)
         gsBlockAccum[tid] = gBlockTotals[tid];
@@ -205,10 +240,12 @@ void lostFoundStage2(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
             if (gFlags[workIndex] != 0u)
             {
                 const uint index = workIndex % numPairs;
-                const uint w = gMgrWords[index];
-                const uint nbPatches = w & 0xFFu;
-                const uint statusFlag = (w >> 8u) & 0xFFu;
-                const uint prevPatches = (w >> 16u) & 0xFFu;
+                // real PxsContactManagerOutput packed flags word (byte 32 = word 8):
+                //   allflagsStart | nbPatches<<8 | statusFlag<<16 | prevPatches<<24
+                const uint w = gMgr[index * OUTPUT_WORDS + 8u];
+                const uint nbPatches = (w >> 8u) & 0xFFu;
+                const uint statusFlag = (w >> 16u) & 0xFFu;
+                const uint prevPatches = (w >> 24u) & 0xFFu;
                 // PxsContactManagerOutputCounts byte layout (nbContacts NOT copied)
                 gCompacted[outOffset] = nbPatches | (prevPatches << 8u) | (statusFlag << 16u);
                 gPtrs[outOffset] = gMgrHandles[index];

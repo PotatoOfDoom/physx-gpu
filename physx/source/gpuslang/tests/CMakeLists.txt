@@ -205,7 +205,7 @@ pxg_compile_shader(npCvxClipEmit cvxClipEmit)
 pxg_compile_shader(npCvxContactDecide cvxContactDecide)
 pxg_compile_shader(npCvxCollidePrep cvxCollidePrep)
 pxg_compile_shader(npCvxCollideDecide cvxCollideDecide)
-pxg_compile_shader(npCvxLostFound lostFoundStage1 lostFoundStage2)
+pxg_compile_shader(npCvxLostFound prepareLostFoundPairs_Stage1 prepareLostFoundPairs_Stage2)
 pxg_compile_shader(npCvxWriteStream cvxWriteStream)
 pxg_compile_shader(npCvxFinishContacts finishContactsKernel)
 pxg_compile_shader(npCvxStage1Refresh convexConvexNphase_stage1Kernel)
@@ -983,7 +983,6 @@ set(PXG_HLSL_ENTRIES
     "npMaterialCombine:combineMaterials"
     "npContactPatch:setContactPointAndForcePointers" "npContactPatch:registerContactPatch"
     "npInsertPatch:insertIntoPatchStream"
-    "npCompressContacts:updateFrictionPatches"
     "npTriangle:triPointDistance" "npTriangle:triLineIntersect"
     "npSegTriangle:segTriDistance"
     "npCapTriangle:capTriGenContacts" "npCapTriangle:capTriGenEE"
@@ -1041,7 +1040,6 @@ set(PXG_HLSL_ENTRIES
     "npCvxContactDecide:cvxContactDecide"
     "npCvxCollidePrep:cvxCollidePrep"
     "npCvxCollideDecide:cvxCollideDecide"
-    "npCvxLostFound:lostFoundStage1"
     "npCvxWriteStream:cvxWriteStream"
     "npCvxPlanePolyIndex:cvxPlanePolyIndex"
     "npCvxPlaneRefresh:cvxPlaneRefresh"

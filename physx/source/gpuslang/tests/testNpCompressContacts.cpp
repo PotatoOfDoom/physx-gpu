@@ -49,9 +49,6 @@ using physx::gpuslang::PxgKernelDef;
 using physx::gpuslang::PxgDevicePtr;
 using physx::gpuslang::PxgResult;
 
-struct CompressParams { uint32_t numTotalPairs, pairCount, startContact, startFriction, contactSize, fricSize; };
-
-const uint32_t OUTPUT_WORDS = 12;
 const uint32_t BLOCK = 256, NUM_BLOCKS = 32;
 const uint32_t CONTACT_SIZE = 64, FRIC_SIZE = 52; // sizeof(PxContactPatch)/PxFrictionPatch
 
@@ -123,46 +120,65 @@ PXG_TEST(npCompressContacts_stage1)
 
 PXG_TEST(npCompressContacts_updateFrictionPatches)
 {
+    using namespace physx;
     std::mt19937 rng(46020);
     const uint32_t N = 7000;
-    const uint32_t startContact = 4096, startFriction = 100000;
+    // Real 64-bit device-pointer bases (the engine passes CUdeviceptr-scale
+    // addresses; the arithmetic is (contactPatches - startContact) in bytes).
+    const uint64_t startContact  = 0x0000000140001000ull;
+    const uint64_t startFriction = 0x0000000180002000ull;
 
-    std::vector<uint32_t> outData(N * OUTPUT_WORDS, 0);
-    std::vector<uint32_t> contactOff(N);
+    // REAL PxsContactManagerOutput array; kernel reads contactPatches (byte 0)
+    // and writes frictionPatches (byte 24) via the byte-exact mirror.
+    std::vector<PxsContactManagerOutput> outData(N);
+    std::memset(outData.data(), 0, N * sizeof(PxsContactManagerOutput));
+    std::vector<uint64_t> contactPtr(N), refFriction(N);
     for (uint32_t i = 0; i < N; ++i)
     {
-        // contactPatches = startContact + patchIndex*64 (a multiple of the patch size).
-        // Every few entries, use a non-multiple-of-64 diff too so the multiply-before-
-        // divide ordering is observable (a divide-first regression would differ here).
-        const uint32_t off = (i % 5 == 0) ? (startContact + i * 32u + 16u) : (startContact + i * CONTACT_SIZE);
-        contactOff[i] = off;
-        outData[i * OUTPUT_WORDS + 0] = off;              // contactPatches
-        outData[i * OUTPUT_WORDS + 6] = 0xdeadbeefu;      // frictionPatches (to be overwritten)
+        // contactPatches = startContact + patchIndex*64 (a multiple of the patch
+        // size).  Every few entries use a non-multiple-of-64 diff too so the
+        // multiply-before-divide ordering is observable (a divide-first
+        // regression would differ here).
+        const uint64_t off = (i % 5 == 0) ? (startContact + i * 32ull + 16ull)
+                                          : (startContact + i * uint64_t(CONTACT_SIZE));
+        contactPtr[i] = off;
+        outData[i].contactPatches  = reinterpret_cast<PxU8*>(uintptr_t(off));
+        outData[i].frictionPatches = reinterpret_cast<PxU8*>(uintptr_t(0xdeadbeefdeadbeefull)); // overwritten
+        refFriction[i] = startFriction + (off - startContact) * FRIC_SIZE / CONTACT_SIZE;
     }
 
-    // reference
-    std::vector<uint32_t> refFriction(N);
-    for (uint32_t i = 0; i < N; ++i)
-        refFriction[i] = startFriction + (contactOff[i] - startContact) * FRIC_SIZE / CONTACT_SIZE;
-
     PxgSlangComputeDevice* dev = testDevice();
-    std::vector<uint32_t> dummy(NUM_BLOCKS, 0);
-    PxgBufferHandle bOut = createBufferFrom(dev, outData);
-    PxgBufferHandle bDummy = createBufferFrom(dev, dummy);
+    const PxgKernelDef manifest[] = {
+        { "npCompressContacts.spv", "updateFrictionPatches", 32u, 0 }, // {4,8,8,8}
+    };
+    PxgCudaShim shim(dev, manifest, 1, &cLoader);
 
-    CompressParams p = { 0, N, startContact, startFriction, CONTACT_SIZE, FRIC_SIZE };
+    PxgDevicePtr dOut = 0;
+    if (shim.memAlloc(&dOut, N * sizeof(PxsContactManagerOutput)) != PxgResult::Success || !dOut)
+    { std::printf("  NOTE: no BDA -> skip\n"); return; }
+    shim.memcpyHtoD(dOut, outData.data(), N * sizeof(PxsContactManagerOutput));
+
+    struct { uint32_t pairCount; uint64_t startContact, startFriction, outputs; } blob =
+        { N, startContact, startFriction, dOut };
+    static_assert(sizeof(blob) == 32, "updateFrictionPatches engine blob is 32 bytes");
     const uint32_t GROUPS = (N + 255) / 256;
-    Kernel k("npCompressContacts.spv", "updateFrictionPatches", { 4, 4 }, sizeof(CompressParams));
-    k.dispatch(GROUPS, { bOut, bDummy }, p);
-    dev->flush();
+    PXG_CHECK_MSG(shim.launchKernel(0, GROUPS, 1, 1, &blob, sizeof(blob)) == PxgResult::Success,
+                  "launch updateFrictionPatches (engine ABI)");
+    shim.streamSynchronize();
 
-    const auto g = downloadBuffer<uint32_t>(dev, bOut, N * OUTPUT_WORDS);
-    size_t mm = 0;
+    std::vector<PxsContactManagerOutput> g(N);
+    shim.memcpyDtoH(g.data(), dOut, N * sizeof(PxsContactManagerOutput));
+    size_t mm = 0, mutated = 0;
     for (uint32_t i = 0; i < N; ++i)
-        if (g[i * OUTPUT_WORDS + 6] != refFriction[i]) ++mm;
+    {
+        const uint64_t got = uint64_t(uintptr_t(g[i].frictionPatches));
+        if (got != refFriction[i]) ++mm;
+        if (got != 0xdeadbeefdeadbeefull) ++mutated;
+    }
     PXG_CHECK_MSG(mm == 0, "updateFrictionPatches: %zu mismatches", mm);
+    PXG_CHECK_MSG(mutated == N, "updateFrictionPatches: kernel did not write (%zu/%u)", mutated, N);
 
-    dev->destroyBuffer(bOut); dev->destroyBuffer(bDummy);
+    shim.memFree(dOut);
 }
 
 } // namespace
