@@ -24,17 +24,27 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// Verification of broadphaseCreateRegions.slang against a C++ transcription of
-// createRegionsKernel.  A consistent synthetic SAP arrangement is built per
-// axis (a permutation of the 2N endpoint positions, each box owning a min/max
-// position pair, start projection at the min position) so the startRegionAccum
-// writes partition the projection space with no collisions.  Every output
-// array (regionRange, startRegionAccum, regionAccum) is compared bit-exactly.
+// Verification of broadphaseCreateRegions.slang (createRegionsKernel) against
+// a C++ transcription of the CUDA kernel — P5 Step 4: driven through
+// PxgCudaShim on the ENGINE ABI.  A REAL PxgBroadPhaseDesc is filled with live
+// device addresses (numHandles split across numPreviousHandles/
+// numCreatedHandles/numRemovedHandles exactly as the .cu recombines them) and
+// launched with the engine's fixed 32x256 grid.  A consistent synthetic SAP
+// arrangement is built per axis (a permutation of the 2N endpoint positions,
+// each box owning a min/max position pair, start projection at the min
+// position) so the startRegionAccum writes partition the projection space with
+// no collisions.  Every output array (regionRange, startRegionAccum,
+// regionAccum) is compared bit-exactly.
 
 #include "pxgTestFramework.h"
+#include "PxgCudaShim.h"
+
+#include "foundation/PxBounds3.h"
+#include "PxgBroadPhaseDesc.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -46,16 +56,43 @@ using namespace pxgtest;
 const uint32_t REGION_SIZE_PER_AXIS = 4;
 const uint32_t SENT = 0xdeadbeefu;
 
-struct CreateRegionsParams
-{
-    uint32_t numHandles;
-};
-
 bool isStart(uint32_t sh) { return (sh & 1u) != 0u; }
 uint32_t getHandle(uint32_t sh) { return sh >> 3; }
 
+static std::vector<uint8_t> bpShimLoader(const char* file) { return loadShaderBlob(file); }
+
+// Fills a REAL engine PxgBroadPhaseDesc with live device addresses and uploads
+// it (same helper as testBroadphaseSetup.cpp).
+struct BpDescRig
+{
+    physx::gpuslang::PxgCudaShim* shim;
+    physx::PxgBroadPhaseDesc desc;
+
+    explicit BpDescRig(physx::gpuslang::PxgCudaShim* s) : shim(s) { std::memset(&desc, 0, sizeof(desc)); }
+
+    physx::gpuslang::PxgDevicePtr alloc(const void* data, size_t bytes)
+    {
+        physx::gpuslang::PxgDevicePtr p = 0;
+        shim->memAlloc(&p, bytes);
+        if (p && data)
+            shim->memcpyHtoD(p, data, bytes);
+        return p;
+    }
+    physx::gpuslang::PxgDevicePtr upload()
+    {
+        physx::gpuslang::PxgDevicePtr p = alloc(&desc, sizeof(desc));
+        return p;
+    }
+};
+
 void runCreateRegionsCase(const char* tag, uint32_t seed, uint32_t N)
 {
+    using namespace physx;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(seed);
     const uint32_t numProj = N * 2;
     const uint32_t eltsPerReg = (N + (REGION_SIZE_PER_AXIS - 1)) / REGION_SIZE_PER_AXIS;
@@ -130,29 +167,50 @@ void runCreateRegionsCase(const char* tag, uint32_t seed, uint32_t N)
         refRegion[workIndex] = regionCount;
     }
 
-    // ---- device ----
+    // ---- device: real PxgBroadPhaseDesc + engine launch ----
     PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = { { "broadphaseCreateRegions.spv", "createRegionsKernel", 8u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &bpShimLoader);
 
     std::vector<uint32_t> rangeInit(N * 8, SENT), startInit(numProj, SENT), regionInit(numProj, SENT);
 
-    PxgBufferHandle bEnd = createBufferFrom(dev, endHist);
-    PxgBufferHandle bHand = createBufferFrom(dev, handlesX);
-    PxgBufferHandle bSap = createBufferFrom(dev, sapBox);
-    PxgBufferHandle bRange = createBufferFrom(dev, rangeInit);
-    PxgBufferHandle bStart = createBufferFrom(dev, startInit);
-    PxgBufferHandle bRegion = createBufferFrom(dev, regionInit);
+    BpDescRig rig(&shim);
+    const PxgDevicePtr dEnd = rig.alloc(endHist.data(), endHist.size() * 4);     // 3 axes, contiguous
+    const PxgDevicePtr dHand = rig.alloc(handlesX.data(), handlesX.size() * 4);
+    const PxgDevicePtr dSap = rig.alloc(sapBox.data(), sapBox.size() * 4);       // 3 axes, contiguous
+    const PxgDevicePtr dRange = rig.alloc(rangeInit.data(), rangeInit.size() * 4);
+    const PxgDevicePtr dStart = rig.alloc(startInit.data(), startInit.size() * 4);
+    const PxgDevicePtr dRegion = rig.alloc(regionInit.data(), regionInit.size() * 4);
+    if (!dEnd) { std::printf("  NOTE: no BDA -> skip\n"); return; }
 
-    CreateRegionsParams p = {};
-    p.numHandles = N;
+    // The kernel recombines numHandles = numPreviousHandles + numCreatedHandles
+    // - numRemovedHandles; split N across the three fields to exercise that.
+    const uint32_t numCreated = std::min(N, 25u);
+    const uint32_t numRemoved = std::min(numCreated, 10u);
+    rig.desc.numPreviousHandles = N - numCreated + numRemoved;
+    rig.desc.numCreatedHandles = numCreated;
+    rig.desc.numRemovedHandles = numRemoved;
+    for (uint32_t ax = 0; ax < 3; ++ax)
+    {
+        rig.desc.totalEndPtHistogram[ax] = reinterpret_cast<PxU32*>(dEnd + ax * numProj * 4);
+        rig.desc.boxSapBox1D[ax] = reinterpret_cast<PxgSapBox1D*>(dSap + ax * N * 2 * 4);
+    }
+    rig.desc.boxHandles[0][0] = reinterpret_cast<PxU32*>(dHand);
+    rig.desc.regionRange = reinterpret_cast<PxgIntegerRegion*>(dRange);
+    rig.desc.startRegionAccum = reinterpret_cast<PxU32*>(dStart);
+    rig.desc.regionAccum = reinterpret_cast<PxU32*>(dRegion);
+    const PxgDevicePtr dDesc = rig.upload();
 
-    const std::vector<uint32_t> strides(6, 4);
-    Kernel k("broadphaseCreateRegions.spv", "createRegionsKernel", strides, sizeof(CreateRegionsParams));
-    k.dispatch(32, { bEnd, bHand, bSap, bRange, bStart, bRegion }, p);
-    dev->flush();
+    struct { uint64_t bpDesc; } prm = { dDesc };
+    // engine grid: BP_CREATE_REGIONS = 32 blocks x 256
+    PXG_CHECK_MSG(shim.launchKernel(0, 32, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "[%s N=%u] launch createRegionsKernel", tag, N);
+    shim.streamSynchronize();
 
-    const auto gRange = downloadBuffer<uint32_t>(dev, bRange, N * 8);
-    const auto gStart = downloadBuffer<uint32_t>(dev, bStart, numProj);
-    const auto gRegion = downloadBuffer<uint32_t>(dev, bRegion, numProj);
+    std::vector<uint32_t> gRange(N * 8), gStart(numProj), gRegion(numProj);
+    shim.memcpyDtoH(gRange.data(), dRange, gRange.size() * 4);
+    shim.memcpyDtoH(gStart.data(), dStart, gStart.size() * 4);
+    shim.memcpyDtoH(gRegion.data(), dRegion, gRegion.size() * 4);
 
     size_t rangeMism = 0, startMism = 0, regionMism = 0;
     uint32_t firstBad = 0xffffffffu, badG = 0, badR = 0;
@@ -176,8 +234,8 @@ void runCreateRegionsCase(const char* tag, uint32_t seed, uint32_t N)
     else
         PXG_CHECK_MSG(regionMism == 0, "[%s N=%u] %zu regionAccum mismatches", tag, N, regionMism);
 
-    for (PxgBufferHandle h : { bEnd, bHand, bSap, bRange, bStart, bRegion })
-        dev->destroyBuffer(h);
+    for (PxgDevicePtr pfree : { dEnd, dHand, dSap, dRange, dStart, dRegion, dDesc })
+        shim.memFree(pfree);
 }
 
 PXG_TEST(broadphaseCreateRegions_regionCounts)

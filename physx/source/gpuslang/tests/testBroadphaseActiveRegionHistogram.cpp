@@ -25,18 +25,28 @@
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
 // Verification of broadphaseActiveRegionHistogram.slang against a C++
-// transcription of the three-kernel active-region pipeline.  A consistent
-// synthetic region layout is built as createRegionsKernel + the region
-// prefix-sum scan would produce it (region spans in [0,3], startRegionAccum =
-// exclusive prefix of per-box yz-cell counts).  All three kernels run on the
-// GPU in sequence; the resulting offset tables (start/active histograms) and
-// the compacted ordered start/active handle arrays are compared bit-exactly
-// against the transcription.
+// transcription of the three-kernel active-region pipeline — P5 Step 4: driven
+// through PxgCudaShim on the ENGINE ABI.  A REAL PxgBroadPhaseDesc is filled
+// with live device addresses (numHandles split across numPreviousHandles/
+// numCreatedHandles/numRemovedHandles, totalComparision in
+// startRegionAccumTotal) and all three kernels are launched with the engine's
+// grids (writeout 32x256, compute 64x512, output 64x256), exactly as
+// computeStartAndActiveHistogramKernel does.  A consistent synthetic region
+// layout is built as createRegionsKernel + the region prefix-sum scan would
+// produce it (region spans in [0,3], startRegionAccum = exclusive prefix of
+// per-box yz-cell counts).  The resulting offset tables (start/active
+// histograms) and the compacted ordered start/active handle arrays are
+// compared bit-exactly against the transcription.
 
 #include "pxgTestFramework.h"
+#include "PxgCudaShim.h"
+
+#include "foundation/PxBounds3.h"
+#include "PxgBroadPhaseDesc.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -47,13 +57,6 @@ using namespace pxgtest;
 
 const uint32_t TOTAL_REGION_SIZE = 64;
 const uint32_t SENT = 0xdeadbeefu;
-
-struct ActiveRegionParams
-{
-    uint32_t numHandles;
-    uint32_t totalComparison;
-    uint32_t gridDimX;
-};
 
 uint32_t getHandle(uint32_t sh) { return sh >> 3; }
 uint32_t isNew(uint32_t sh) { return (sh >> 1) & 1u; }
@@ -70,8 +73,40 @@ uint32_t binarySearch(const std::vector<uint32_t>& data, uint32_t n, uint32_t va
     return left ? left - 1 : 0;
 }
 
+static std::vector<uint8_t> bpShimLoader(const char* file) { return loadShaderBlob(file); }
+
+// Fills a REAL engine PxgBroadPhaseDesc with live device addresses and uploads
+// it (same helper as testBroadphaseSetup.cpp).
+struct BpDescRig
+{
+    physx::gpuslang::PxgCudaShim* shim;
+    physx::PxgBroadPhaseDesc desc;
+
+    explicit BpDescRig(physx::gpuslang::PxgCudaShim* s) : shim(s) { std::memset(&desc, 0, sizeof(desc)); }
+
+    physx::gpuslang::PxgDevicePtr alloc(const void* data, size_t bytes)
+    {
+        physx::gpuslang::PxgDevicePtr p = 0;
+        shim->memAlloc(&p, bytes);
+        if (p && data)
+            shim->memcpyHtoD(p, data, bytes);
+        return p;
+    }
+    physx::gpuslang::PxgDevicePtr upload()
+    {
+        physx::gpuslang::PxgDevicePtr p = alloc(&desc, sizeof(desc));
+        return p;
+    }
+};
+
 void runActiveRegionCase(const char* tag, uint32_t seed, uint32_t N)
 {
+    using namespace physx;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(seed);
     const uint32_t nbProj = N * 2;
 
@@ -184,43 +219,66 @@ void runActiveRegionCase(const char* tag, uint32_t seed, uint32_t N)
         }
     }
 
-    // ---- device ----
+    // ---- device: real PxgBroadPhaseDesc + engine launch sequence ----
     PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "broadphaseActiveRegionHistogram.spv", "writeOutStartAndActiveRegionHistogram", 8u, 0 },
+        { "broadphaseActiveRegionHistogram.spv", "computeStartAndActiveRegionHistogram", 8u, 0 },
+        { "broadphaseActiveRegionHistogram.spv", "outputOrderedActiveRegionHistogram", 8u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 3, &bpShimLoader);
+
+    // the engine memsets both histogram slabs to zero before the writeout pass
     std::vector<uint32_t> histInit(TOTAL_REGION_SIZE * nbProj, 0);
     std::vector<uint32_t> ordInit(TOTAL_REGION_SIZE * nbProj, SENT);
 
-    PxgBufferHandle bAccum = createBufferFrom(dev, startRegionAccum);
-    PxgBufferHandle bHand = createBufferFrom(dev, handlesX);
-    PxgBufferHandle bRange = createBufferFrom(dev, regionRange);
-    PxgBufferHandle bStartH = createBufferFrom(dev, histInit);
-    PxgBufferHandle bActiveH = createBufferFrom(dev, histInit);
-    PxgBufferHandle bSap = createBufferFrom(dev, sapBoxX);
-    PxgBufferHandle bOrdS = createBufferFrom(dev, ordInit);
-    PxgBufferHandle bOrdA = createBufferFrom(dev, ordInit);
+    BpDescRig rig(&shim);
+    const PxgDevicePtr dAccum = rig.alloc(startRegionAccum.data(), startRegionAccum.size() * 4);
+    const PxgDevicePtr dHand = rig.alloc(handlesX.data(), handlesX.size() * 4);
+    const PxgDevicePtr dRange = rig.alloc(regionRange.data(), regionRange.size() * 4);
+    const PxgDevicePtr dStartH = rig.alloc(histInit.data(), histInit.size() * 4);
+    const PxgDevicePtr dActiveH = rig.alloc(histInit.data(), histInit.size() * 4);
+    const PxgDevicePtr dSap = rig.alloc(sapBoxX.data(), sapBoxX.size() * 4);
+    const PxgDevicePtr dOrdS = rig.alloc(ordInit.data(), ordInit.size() * 4);
+    const PxgDevicePtr dOrdA = rig.alloc(ordInit.data(), ordInit.size() * 4);
+    if (!dAccum) { std::printf("  NOTE: no BDA -> skip\n"); return; }
 
-    const std::vector<PxgBufferHandle> buffers = { bAccum, bHand, bRange, bStartH, bActiveH, bSap, bOrdS, bOrdA };
-    const std::vector<uint32_t> strides(8, 4);
+    // numHandles = numPreviousHandles + numCreatedHandles - numRemovedHandles
+    const uint32_t numCreated = std::min(N, 25u);
+    const uint32_t numRemoved = std::min(numCreated, 10u);
+    rig.desc.numPreviousHandles = N - numCreated + numRemoved;
+    rig.desc.numCreatedHandles = numCreated;
+    rig.desc.numRemovedHandles = numRemoved;
+    rig.desc.startRegionAccumTotal = total;
+    rig.desc.startRegionAccum = reinterpret_cast<PxU32*>(dAccum);
+    rig.desc.boxHandles[0][0] = reinterpret_cast<PxU32*>(dHand);
+    rig.desc.regionRange = reinterpret_cast<PxgIntegerRegion*>(dRange);
+    rig.desc.startRegionsHistogram = reinterpret_cast<PxU32*>(dStartH);
+    rig.desc.activeRegionsHistogram = reinterpret_cast<PxU32*>(dActiveH);
+    rig.desc.boxSapBox1D[0] = reinterpret_cast<PxgSapBox1D*>(dSap);
+    rig.desc.orderedStartRegionHandles = reinterpret_cast<PxU32*>(dOrdS);
+    rig.desc.orderedActiveRegionHandles = reinterpret_cast<PxU32*>(dOrdA);
+    const PxgDevicePtr dDesc = rig.upload();
 
-    ActiveRegionParams p32 = { N, total, 32 };
-    ActiveRegionParams p64 = { N, total, 64 };
-
-    Kernel k1("broadphaseActiveRegionHistogram.spv", "writeOutStartAndActiveRegionHistogram", strides,
-              sizeof(ActiveRegionParams));
-    k1.dispatch(32, buffers, p32);
+    struct { uint64_t bpDesc; } prm = { dDesc };
+    // engine grids (computeStartAndActiveHistogramKernel): writeout 32x256,
+    // compute 64x512, output 64x256 — CUDA stream ordering = barrier between.
+    PXG_CHECK_MSG(shim.launchKernel(0, 32, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "[%s N=%u] launch writeOutStartAndActiveRegionHistogram", tag, N);
     dev->barrier();
-    Kernel k2("broadphaseActiveRegionHistogram.spv", "computeStartAndActiveRegionHistogram", strides,
-              sizeof(ActiveRegionParams));
-    k2.dispatch(64, buffers, p64);
+    PXG_CHECK_MSG(shim.launchKernel(1, 64, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "[%s N=%u] launch computeStartAndActiveRegionHistogram", tag, N);
     dev->barrier();
-    Kernel k3("broadphaseActiveRegionHistogram.spv", "outputOrderedActiveRegionHistogram", strides,
-              sizeof(ActiveRegionParams));
-    k3.dispatch(64, buffers, p64);
-    dev->flush();
+    PXG_CHECK_MSG(shim.launchKernel(2, 64, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "[%s N=%u] launch outputOrderedActiveRegionHistogram", tag, N);
+    shim.streamSynchronize();
 
-    const auto gStartH = downloadBuffer<uint32_t>(dev, bStartH, TOTAL_REGION_SIZE * nbProj);
-    const auto gActiveH = downloadBuffer<uint32_t>(dev, bActiveH, TOTAL_REGION_SIZE * nbProj);
-    const auto gOrdS = downloadBuffer<uint32_t>(dev, bOrdS, TOTAL_REGION_SIZE * nbProj);
-    const auto gOrdA = downloadBuffer<uint32_t>(dev, bOrdA, TOTAL_REGION_SIZE * nbProj);
+    std::vector<uint32_t> gStartH(TOTAL_REGION_SIZE * nbProj), gActiveH(TOTAL_REGION_SIZE * nbProj);
+    std::vector<uint32_t> gOrdS(TOTAL_REGION_SIZE * nbProj), gOrdA(TOTAL_REGION_SIZE * nbProj);
+    shim.memcpyDtoH(gStartH.data(), dStartH, gStartH.size() * 4);
+    shim.memcpyDtoH(gActiveH.data(), dActiveH, gActiveH.size() * 4);
+    shim.memcpyDtoH(gOrdS.data(), dOrdS, gOrdS.size() * 4);
+    shim.memcpyDtoH(gOrdA.data(), dOrdA, gOrdA.size() * 4);
 
     size_t shMism = 0, ahMism = 0, osMism = 0, oaMism = 0;
     for (uint32_t i = 0; i < TOTAL_REGION_SIZE * nbProj; ++i)
@@ -237,8 +295,8 @@ void runActiveRegionCase(const char* tag, uint32_t seed, uint32_t N)
     PXG_CHECK_MSG(oaMism == 0, "[%s N=%u] %zu orderedActive mismatches", tag, N, oaMism);
     PXG_CHECK_MSG(total > 0, "[%s N=%u] expected nonzero comparisons", tag, N);
 
-    for (PxgBufferHandle h : { bAccum, bHand, bRange, bStartH, bActiveH, bSap, bOrdS, bOrdA })
-        dev->destroyBuffer(h);
+    for (PxgDevicePtr pfree : { dAccum, dHand, dRange, dStartH, dActiveH, dSap, dOrdS, dOrdA, dDesc })
+        shim.memFree(pfree);
 }
 
 PXG_TEST(broadphaseActiveRegionHistogram_pipeline)

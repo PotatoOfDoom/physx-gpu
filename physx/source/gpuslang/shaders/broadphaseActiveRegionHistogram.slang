@@ -26,66 +26,64 @@
 
 // broadphaseActiveRegionHistogram.slang
 //
-// Slang port of the broad-phase active-region histogram pipeline
-// (gpubroadphase/src/CUDA/broadphase.cu, L1015-1244), the stage that compacts,
-// per coarse region, the handles whose bounds touch that region:
-//   - writeOutStartAndActiveRegionHistogram (L1015): for each region cell a box
-//     covers (the box's fixed min-X region times its [minY,maxY]x[minZ,maxZ]
-//     span), stamp a 1 into that region's slice of startRegionsHistogram at the
-//     box's projection index, and isNewProjection into activeRegionsHistogram.
-//   - computeStartAndActiveRegionHistogram (L1075): turn each region slice's 0/1
-//     flags into in-place exclusive-prefix-sum offset tables (start and active
-//     counts packed 16/16 into one lane and scanned together, one region per
-//     block, block=512).
-//   - outputOrderedActiveRegionHistogram (L1171): scatter each box's handle into
-//     the compacted ordered start/active handle arrays at the slot the prefix
-//     table assigned to the box's min projection (idempotent collisions).
+// P5 Step 4 (BDA, engine launch path): the broad-phase active-region histogram
+// pipeline (gpubroadphase/src/CUDA/broadphase.cu, L1015-1244), the stage that
+// compacts, per coarse region, the handles whose bounds touch that region.
+// All three kernels take ONE PxgBroadPhaseDesc device pointer, walked through
+// the byte-exact PxgBroadPhaseDescGpu mirror (pxgSlangBpDesc.slang, proven by
+// testBpDescLayout), exactly as the engine launches them (computeStartAnd-
+// ActiveHistogramKernel, PxgCudaBroadPhaseSap.cpp:881-894):
+//   - writeOutStartAndActiveRegionHistogram (BP_WRITEOUT_ACTIVE_HISTOGRAM,
+//     grid 32x256): for each region cell a box covers (the box's fixed min-X
+//     region times its [minY,maxY]x[minZ,maxZ] span), stamp a 1 into that
+//     region's slice of startRegionsHistogram at the box's projection index,
+//     and isNewProjection into activeRegionsHistogram.
+//   - computeStartAndActiveRegionHistogram (BP_COMPUTE_ACTIVE_HISTOGRAM, grid
+//     64x512): turn each region slice's 0/1 flags into in-place exclusive-
+//     prefix-sum offset tables (start and active counts packed 16/16 into one
+//     lane and scanned together, one region slice per block iteration).
+//   - outputOrderedActiveRegionHistogram (BP_OUTPUT_ACTIVE_HISTOGRAM, grid
+//     64x256): scatter each box's handle into the compacted ordered start/
+//     active handle arrays at the slot the prefix table assigned to the box's
+//     min projection (idempotent collisions).
 //
-// Portability: the CUDA warpScanAdd / warpScanAddWriteToSharedMem __shfl scans
-// (block=512 = 16 warps) become groupshared 32-lane scans under uniform
-// GroupMemoryBarrierWithGroupSync(), so no subgroup-width assumption is made;
-// the per-region contiguous nbProjections stride and the fixed 32/64-block
-// grids are preserved.  Each region slice's start/active counts stay < 2^16, so
-// the 16/16 packing never carries across the field boundary.
+// numHandles = numPreviousHandles + numCreatedHandles - numRemovedHandles and
+// totalComparision = startRegionAccumTotal are read from the desc, as the .cu
+// does; every gridDim.x read becomes WorkgroupCount().x (the region loop's
+// a += gridDim.x stride included).  Portability: the CUDA warpScanAdd /
+// warpScanAddWriteToSharedMem __shfl scans (block=512 = 16 warps) become
+// groupshared 32-lane scans under uniform GroupMemoryBarrierWithGroupSync(),
+// so no subgroup-width assumption is made.  Each region slice's start/active
+// counts stay < 2^16, so the 16/16 packing never carries across the field
+// boundary.  PxgIntegerRegion = { uint4 minRange; uint4 maxRange } = 8 flat
+// uints; PxgSapBox1D = { PxU32 mMinMax[2] } = 2 flat uints.
+
+import pxgSlangBpDesc;
 
 static const uint REGION_SIZE_PER_AXIS = 4;
 static const uint TOTAL_REGION_SIZE = 64; // 4^3
 static const uint WARP = 32;
-static const uint BLOCK1 = 256;   // writeout / output
-static const uint BLOCK2 = 512;   // compute (16 warps)
+static const uint BLOCK1 = 256;   // writeout / output (BP_WRITEOUT/BP_OUTPUT_ACTIVE_HISTOGRAM)
+static const uint BLOCK2 = 512;   // compute (WARP_SIZE * WARP_PERBLOCK_SIZE_16)
 static const uint WARPS2 = BLOCK2 / WARP; // 16
 
-struct ActiveRegionParams
+struct BpDescParams
 {
-    uint numHandles;       // nbProjections = numHandles * 2
-    uint totalComparison;  // startRegionAccumTotal
-    uint gridDimX;         // groups launched (32 for writeout/output)
+    uint64_t bpDesc;
 }
-
 [[vk::push_constant]]
-ConstantBuffer<ActiveRegionParams> gParams;
+ConstantBuffer<BpDescParams> gBp;
 
-RWStructuredBuffer<uint> gStartRegionAccum; // binding 0  startRegionAccum [nbProj] (exclusive prefix)  (R)
-RWStructuredBuffer<uint> gHandlesX;         // binding 1  boxHandles[0][AXIS_X] [nbProj]                (R)
-RWStructuredBuffer<uint> gRegionRange;      // binding 2  regionRange[handle] flat [numHandles][8]       (R)
-RWStructuredBuffer<uint> gStartHist;        // binding 3  startRegionsHistogram [64][nbProj]  (W/RMW/R)
-RWStructuredBuffer<uint> gActiveHist;       // binding 4  activeRegionsHistogram [64][nbProj] (W/RMW/R)
-RWStructuredBuffer<uint> gSapBoxX;          // binding 5  boxSapBox1D[AXIS_X] flat [numHandles][2]        (R)
-RWStructuredBuffer<uint> gOrderedStart;     // binding 6  orderedStartRegionHandles [64][nbProj]          (W)
-RWStructuredBuffer<uint> gOrderedActive;    // binding 7  orderedActiveRegionHandles [64][nbProj]         (W)
-
-uint getHandle(uint sortedHandle) { return sortedHandle >> 3; }
-uint isNewProjection(uint sortedHandle) { return (sortedHandle >> 1) & 1u; }
-
-// largest index into gStartRegionAccum s.t. value <= workIndex, else 0
-uint binarySearch(uint numElements, uint value)
+// mirrors binarySearch (gpucommon/src/CUDA/reduction.cuh): largest index into
+// data s.t. data[index] <= value, else 0
+uint binarySearch(Ptr<uint> data, uint numElements, uint value)
 {
     uint left = 0;
     uint right = numElements;
     while (left < right)
     {
         const uint pos = (left + right) / 2u;
-        if (gStartRegionAccum[pos] <= value)
+        if (data[pos] <= value)
             left = pos + 1u;
         else
             right = pos;
@@ -104,19 +102,20 @@ struct Decoded
     uint eRegionZ;
 }
 
-Decoded decode(uint workIndex, uint nbProjections)
+Decoded decode(Ptr<uint> startRegionAccum, Ptr<uint> sortedHandles, Ptr<uint> regionRange,
+               uint workIndex, uint nbProjections)
 {
     Decoded d;
-    d.pos = binarySearch(nbProjections, workIndex);
-    d.sortedHandle = gHandlesX[d.pos];
-    d.handle = getHandle(d.sortedHandle);
-    const uint offset = workIndex - gStartRegionAccum[d.pos];
+    d.pos = binarySearch(startRegionAccum, nbProjections, workIndex);
+    d.sortedHandle = sortedHandles[d.pos];
+    d.handle = bpGetHandle(d.sortedHandle);
+    const uint offset = workIndex - startRegionAccum[d.pos];
 
     const uint rr = d.handle * 8u;
-    const uint sRegionX = gRegionRange[rr + 0u];
-    const uint sRegionY = gRegionRange[rr + 1u];
-    d.sRegionZ = gRegionRange[rr + 2u];
-    d.eRegionZ = gRegionRange[rr + 6u]; // maxRange.z
+    const uint sRegionX = regionRange[rr + 0u]; // minRange.x
+    const uint sRegionY = regionRange[rr + 1u]; // minRange.y
+    d.sRegionZ = regionRange[rr + 2u];          // minRange.z
+    d.eRegionZ = regionRange[rr + 6u];          // maxRange.z
 
     const uint nbZRegions = (d.eRegionZ - d.sRegionZ) + 1u;
     const uint zRegion = (offset % nbZRegions) + d.sRegionZ;
@@ -129,37 +128,47 @@ Decoded decode(uint workIndex, uint nbProjections)
 
 // ---------------------------------------------------------------------------
 // pass 1: stamp start/active 0-1 flags into each region slice
+// (BP_WRITEOUT_ACTIVE_HISTOGRAM, grid 32 x 256)
 // ---------------------------------------------------------------------------
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void writeOutStartAndActiveRegionHistogram(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
-    const uint tid = gtid.x;
-    const uint blockIdx = gid.x;
-    const uint nbProjections = gParams.numHandles * 2u;
-    const uint totalComparison = gParams.totalComparison;
-    const uint gridDimX = gParams.gridDimX;
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
 
-    const uint nbBlocksRequired = (totalComparison + BLOCK1 - 1u) / BLOCK1;
-    const uint nbIterationsPerBlock = (nbBlocksRequired + gridDimX - 1u) / gridDimX;
+    Ptr<uint> startRegionAccum = Ptr<uint>(desc[0].startRegionAccum);
+    Ptr<uint> regionRange = Ptr<uint>(desc[0].regionRange);
+    Ptr<uint> sortedHandles = Ptr<uint>(desc[0].boxHandles[0]); // boxHandles[0][AXIS_X], current frame
+    Ptr<uint> activeRegionsHistogram = Ptr<uint>(desc[0].activeRegionsHistogram);
+    Ptr<uint> startRegionsHistogram = Ptr<uint>(desc[0].startRegionsHistogram);
 
-    for (uint it = 0; it < nbIterationsPerBlock; ++it)
+    const uint numHandles = desc[0].numPreviousHandles + desc[0].numCreatedHandles - desc[0].numRemovedHandles;
+    const uint nbProjections = numHandles * 2u;
+
+    const uint totalComparision = desc[0].startRegionAccumTotal;
+
+    const uint nbBlocksRequired = (totalComparision + BLOCK1 - 1u) / BLOCK1;
+    const uint nbIterationsPerBlock = (nbBlocksRequired + WorkgroupCount().x - 1u) / WorkgroupCount().x;
+
+    for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
-        const uint workIndex = it * BLOCK1 + tid + nbIterationsPerBlock * blockIdx * BLOCK1;
-        if (workIndex < totalComparison)
+        const uint workIndex = i * BLOCK1 + gtid.x + nbIterationsPerBlock * gid.x * BLOCK1;
+
+        if (workIndex < totalComparision)
         {
-            const Decoded d = decode(workIndex, nbProjections);
-            gStartHist[d.regionBase + d.pos] = 1u;
-            gActiveHist[d.regionBase + d.pos] = isNewProjection(d.sortedHandle);
+            const Decoded d = decode(startRegionAccum, sortedHandles, regionRange, workIndex, nbProjections);
+            startRegionsHistogram[d.regionBase + d.pos] = 1u;
+            activeRegionsHistogram[d.regionBase + d.pos] = bpIsNewProjection(d.sortedHandle) ? 1u : 0u;
         }
     }
 }
 
 // ---------------------------------------------------------------------------
 // pass 2: per-region packed (start<<16|active) exclusive prefix, in place
+// (BP_COMPUTE_ACTIVE_HISTOGRAM, grid 64 x 512)
 // ---------------------------------------------------------------------------
-groupshared uint gsLane[BLOCK2];   // packed per-lane scan
-groupshared uint gsWarp[WARPS2];   // packed warp totals -> exclusive prefixes
+groupshared uint gsLane[BLOCK2];   // packed per-lane scan (sStartHistogram)
+groupshared uint gsWarp[WARPS2];   // packed warp totals -> exclusive prefixes (sStartWarpAccumulator)
 groupshared uint gsStartBlockAccum;
 groupshared uint gsActiveBlockAccum;
 
@@ -205,32 +214,39 @@ void scanWarpTotals(uint tid)
 [numthreads(512, 1, 1)]
 void computeStartAndActiveRegionHistogram(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
+
     const uint tid = gtid.x;
     const uint warpIndex = tid / WARP;
     const uint lane = tid & (WARP - 1);
-    const uint nbProjections = gParams.numHandles * 2u;
+
+    const uint numHandles = desc[0].numPreviousHandles + desc[0].numCreatedHandles - desc[0].numRemovedHandles;
+    const uint nbProjections = numHandles * 2u;
+
     const uint nbIterationsPerBlock = (nbProjections + BLOCK2 - 1u) / BLOCK2;
 
-    for (uint a = gid.x; a < TOTAL_REGION_SIZE; a += TOTAL_REGION_SIZE)
+    for (uint a = gid.x; a < TOTAL_REGION_SIZE; a += WorkgroupCount().x)
     {
         if (tid == 0)
         {
-            gsStartBlockAccum = 0;
             gsActiveBlockAccum = 0;
+            gsStartBlockAccum = 0;
         }
         GroupMemoryBarrierWithGroupSync();
 
-        const uint regionBase = a * nbProjections;
+        const uint regionStartOffset = a * nbProjections;
+        Ptr<uint> activeRegionsHistogram = Ptr<uint>(desc[0].activeRegionsHistogram);
+        Ptr<uint> startRegionsHistogram = Ptr<uint>(desc[0].startRegionsHistogram);
 
-        for (uint it = 0; it < nbIterationsPerBlock; ++it)
+        for (uint i = 0; i < nbIterationsPerBlock; ++i)
         {
-            const uint workIndex = it * BLOCK2 + tid;
+            const uint workIndex = i * BLOCK2 + tid;
 
             uint activeHistVal = 0, startHistVal = 0;
             if (workIndex < nbProjections)
             {
-                activeHistVal = gActiveHist[regionBase + workIndex];
-                startHistVal = gStartHist[regionBase + workIndex];
+                activeHistVal = activeRegionsHistogram[regionStartOffset + workIndex];
+                startHistVal = startRegionsHistogram[regionStartOffset + workIndex];
             }
             const uint combinedVal = (startHistVal << 16) | activeHistVal;
 
@@ -241,8 +257,8 @@ void computeStartAndActiveRegionHistogram(uint3 gtid : SV_GroupThreadID, uint3 g
             if (lane == WARP - 1)
                 gsWarp[warpIndex] = gsLane[tid]; // inclusive warp total (packed)
 
-            const uint prevActive = gsActiveBlockAccum;
-            const uint prevStart = gsStartBlockAccum;
+            const uint prevActiveBlockAccumulator = gsActiveBlockAccum;
+            const uint prevStartBlockAccumulator = gsStartBlockAccum;
             GroupMemoryBarrierWithGroupSync();
 
             scanWarpTotals(tid); // gsWarp -> exclusive prefixes; block accums += tile total
@@ -252,10 +268,10 @@ void computeStartAndActiveRegionHistogram(uint3 gtid : SV_GroupThreadID, uint3 g
             if (workIndex < nbProjections)
             {
                 const uint warpAccum = startAccumVal + gsWarp[warpIndex];
-                const uint activeIndex = (warpAccum & 0xFFFFu) + prevActive;
-                const uint startIndex = (warpAccum >> 16) + prevStart;
-                gActiveHist[regionBase + workIndex] = activeIndex;
-                gStartHist[regionBase + workIndex] = startIndex;
+                const uint activeIndex = (warpAccum & 0xFFFFu) + prevActiveBlockAccumulator;
+                const uint startIndex = (warpAccum >> 16) + prevStartBlockAccumulator;
+                activeRegionsHistogram[regionStartOffset + workIndex] = activeIndex;
+                startRegionsHistogram[regionStartOffset + workIndex] = startIndex;
             }
 
             GroupMemoryBarrierWithGroupSync();
@@ -265,38 +281,50 @@ void computeStartAndActiveRegionHistogram(uint3 gtid : SV_GroupThreadID, uint3 g
 
 // ---------------------------------------------------------------------------
 // pass 3: scatter handles into the compacted ordered start/active arrays
+// (BP_OUTPUT_ACTIVE_HISTOGRAM, grid 64 x 256)
 // ---------------------------------------------------------------------------
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void outputOrderedActiveRegionHistogram(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
-    const uint tid = gtid.x;
-    const uint blockIdx = gid.x;
-    const uint numHandles = gParams.numHandles;
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gBp.bpDesc);
+
+    Ptr<uint> startRegionAccum = Ptr<uint>(desc[0].startRegionAccum);
+    Ptr<uint> regionRange = Ptr<uint>(desc[0].regionRange);
+    Ptr<uint> sortedHandles = Ptr<uint>(desc[0].boxHandles[0]); // boxHandles[0][AXIS_X], current frame
+    Ptr<uint> sapBoxes = Ptr<uint>(desc[0].boxSapBox1D[0]);     // boxSapBox1D[AXIS_X], 2 uints/box
+    Ptr<uint> startRegionsHistogram = Ptr<uint>(desc[0].startRegionsHistogram);
+    Ptr<uint> activeRegionsHistogram = Ptr<uint>(desc[0].activeRegionsHistogram);
+    Ptr<uint> orderedStartHandles = Ptr<uint>(desc[0].orderedStartRegionHandles);
+    Ptr<uint> orderedActiveHandles = Ptr<uint>(desc[0].orderedActiveRegionHandles);
+
+    const uint numHandles = desc[0].numPreviousHandles + desc[0].numCreatedHandles - desc[0].numRemovedHandles;
     const uint nbProjections = numHandles * 2u;
-    const uint totalComparison = gParams.totalComparison;
-    const uint gridDimX = gParams.gridDimX;
 
-    const uint nbBlocksRequired = (totalComparison + BLOCK1 - 1u) / BLOCK1;
-    const uint nbIterationsPerBlock = (nbBlocksRequired + gridDimX - 1u) / gridDimX;
+    const uint totalComparision = desc[0].startRegionAccumTotal;
 
-    for (uint it = 0; it < nbIterationsPerBlock; ++it)
+    const uint nbBlocksRequired = (totalComparision + BLOCK1 - 1u) / BLOCK1;
+    const uint nbIterationsPerBlock = (nbBlocksRequired + WorkgroupCount().x - 1u) / WorkgroupCount().x;
+
+    for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
-        const uint workIndex = it * BLOCK1 + tid + nbIterationsPerBlock * blockIdx * BLOCK1;
-        if (workIndex < totalComparison)
-        {
-            const Decoded d = decode(workIndex, nbProjections);
+        const uint workIndex = i * BLOCK1 + gtid.x + nbIterationsPerBlock * gid.x * BLOCK1;
 
-            const uint startProjIndex = gSapBoxX[d.handle * 2u + 0u]; // box min projection
-            const uint startIndex = gStartHist[d.regionBase + startProjIndex];
+        if (workIndex < totalComparision)
+        {
+            const Decoded d = decode(startRegionAccum, sortedHandles, regionRange, workIndex, nbProjections);
+
+            const uint startProjIndex = sapBoxes[d.handle * 2u + 0u]; // sapBox.mMinMax[0]
+            const uint startIndex = startRegionsHistogram[d.regionBase + startProjIndex];
 
             if (d.eRegionZ >= d.sRegionZ)
             {
-                gOrderedStart[d.regionBase + startIndex] = d.handle;
-                if (isNewProjection(d.sortedHandle) != 0u)
+                // Output to orderedStartHandles
+                orderedStartHandles[d.regionBase + startIndex] = d.handle;
+                if (bpIsNewProjection(d.sortedHandle))
                 {
-                    const uint activeIndex = gActiveHist[d.regionBase + startProjIndex];
-                    gOrderedActive[d.regionBase + activeIndex] = d.handle;
+                    const uint activeIndex = activeRegionsHistogram[d.regionBase + startProjIndex];
+                    orderedActiveHandles[d.regionBase + activeIndex] = d.handle;
                 }
             }
         }

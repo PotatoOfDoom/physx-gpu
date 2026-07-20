@@ -26,48 +26,50 @@
 
 // broadphaseRegionHistogram.slang
 //
-// Slang port of the broad-phase region prefix-sum scan pair
-// (gpubroadphase/src/CUDA/broadphase.cu, the templated device helpers
-// computeHistogram / outputHistogram, L868-968).  These implement a plain
-// device-wide exclusive prefix sum over a flat PxU32[nbProjections] array plus
-// its grand total; the CUDA exposes them as four kernels —
-// computeStartRegionsHistogram / outputStartRegionsHistogram (over
-// startRegionAccum / blockStartRegionAccum / startRegionAccumTotal) and
-// computeRegionsHistogram / outputRegionsHistogram (over regionAccum /
-// blockRegionAccum / regionAccumTotal) — that are byte-identical modulo which
-// descriptor array they scan, so the two generic entry points below cover all
-// four dispatches (bind the start- or region-arrays).
+// P5 Step 4 (BDA, engine launch path): the broad-phase region prefix-sum scan
+// pair (gpubroadphase/src/CUDA/broadphase.cu, the templated device helpers
+// computeHistogram / outputHistogram instantiated as computeRegionsHistogram /
+// outputRegionsHistogram, launched as BP_COMPUTE_REGION_HISTOGRAM /
+// BP_OUTPUT_REGION_HISTOGRAM), driven exactly as the engine launches them:
+// ONE PxgBroadPhaseDesc device pointer on a (32, 1, 1) grid.  The aggregate is
+// walked through the byte-exact PxgBroadPhaseDescGpu mirror
+// (pxgSlangBpDesc.slang, proven by testBpDescLayout): the scan runs over
+// regionAccum / blockRegionAccum with nbProjections = 2 * (numPreviousHandles
+// + numCreatedHandles - numRemovedHandles), and the grand total lands in the
+// desc's own regionAccumTotal member (the .cu's by-reference write — hence its
+// non-const PxgBroadPhaseDesc* signature).
 //
 //   - computeRegionsHistogram: per-block segmented exclusive prefix (the block
 //     owns a contiguous partition of the array), writing the block-local
-//     prefixes back in place and the per-block grand total to blockHistogram.
+//     prefixes back in place and the per-block grand total to blockRegionAccum.
 //   - outputRegionsHistogram: exclusive prefix over the 32 per-block totals
-//     (grand total -> the scalar total buffer), added back into each block's
+//     (grand total -> bpDesc->regionAccumTotal), added back into each block's
 //     range so the array becomes a device-wide exclusive prefix sum.
 //
-// This is the plain (single-value, no packing, no scatter) instance of the same
-// two-pass scan used by broadphaseIncrementalHistogram.  Portability: the CUDA
-// warpScanAdd / warpScanAddWriteToSharedMem __shfl scans become groupshared
-// 32-lane scans under uniform GroupMemoryBarrierWithGroupSync(); the fixed
-// 32-block device grid (BLOCK = 256, 8 warps, gridDim == BLOCK_SIZE == 32) and
-// its sequential between-tile / between-block accumulation are preserved exactly.
+// The .cu's computeStartRegionsHistogram / outputStartRegionsHistogram are
+// byte-identical modulo scanning startRegionAccum / blockStartRegionAccum /
+// startRegionAccumTotal instead; they remain unmapped manifest rows.
+//
+// Portability: the CUDA warpScanAdd / warpScanAddWriteToSharedMem __shfl scans
+// become groupshared 32-lane scans under uniform
+// GroupMemoryBarrierWithGroupSync(); computeHistogram's iteration count uses
+// gridDim.x (WorkgroupCount().x) exactly like the .cu, while outputHistogram
+// uses the BLOCK_SIZE (= 32) constant, also exactly like the .cu.
+
+import pxgSlangBpDesc;
 
 static const uint BLOCK = 256;
-static const uint NUM_BLOCKS = 32; // gridDim.x == BLOCK_SIZE == 32 (load-bearing)
+static const uint NUM_BLOCKS = 32; // broadphase.cu BLOCK_SIZE == engine grid width (load-bearing)
 static const uint WARP = 32;
 static const uint WARPS_PER_BLOCK = BLOCK / WARP; // 8
 
+// Engine ABI: one device pointer to the PxgBroadPhaseDesc aggregate.
 struct RegionHistParams
 {
-    uint maxWorkIndex; // = nbProjections (scan length)
+    uint64_t bpDesc;
 }
-
 [[vk::push_constant]]
 ConstantBuffer<RegionHistParams> gParams;
-
-RWStructuredBuffer<uint> gHistogram;      // binding 0  startRegionAccum / regionAccum [nbProj] (in/out)
-RWStructuredBuffer<uint> gBlockHistogram; // binding 1  blockStartRegionAccum / blockRegionAccum [32]
-RWStructuredBuffer<uint> gTotal;          // binding 2  {start,region}RegionAccumTotal [1] (output only)
 
 groupshared uint gsLane[BLOCK];          // per-lane scan scratch
 groupshared uint gsWarp[WARPS_PER_BLOCK];
@@ -111,6 +113,7 @@ void scanWarpTotals(uint tid)
 
 // ---------------------------------------------------------------------------
 // pass 1: per-block segmented exclusive scan + block totals
+// (BP_COMPUTE_REGION_HISTOGRAM, engine grid (32, 1, 1))
 // ---------------------------------------------------------------------------
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -121,9 +124,17 @@ void computeRegionsHistogram(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Group
     const uint warpIndex = tid / WARP;
     const uint lane = tid & (WARP - 1);
 
-    const uint maxWorkIndex = gParams.maxWorkIndex;
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gParams.bpDesc);
+    Ptr<uint> histogram = Ptr<uint>(desc[0].regionAccum);
+    Ptr<uint> blockHistogram = Ptr<uint>(desc[0].blockRegionAccum);
+
+    const uint numHandles = desc[0].numPreviousHandles + desc[0].numCreatedHandles - desc[0].numRemovedHandles;
+    const uint maxWorkIndex = numHandles * 2;
+
     const uint nbBlocksRequired = (maxWorkIndex + BLOCK - 1) / BLOCK;
-    const uint nbIterationsPerBlock = (nbBlocksRequired + NUM_BLOCKS - 1) / NUM_BLOCKS;
+    // the .cu derives this from gridDim.x (== 32 in the engine launch)
+    const uint gridDimX = WorkgroupCount().x;
+    const uint nbIterationsPerBlock = (nbBlocksRequired + gridDimX - 1) / gridDimX;
 
     if (tid == 0)
         gsBlockAccum = 0;
@@ -133,7 +144,7 @@ void computeRegionsHistogram(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Group
     {
         const uint workIndex = it * BLOCK + tid + nbIterationsPerBlock * blockIdx * BLOCK;
 
-        const uint histVal = (workIndex < maxWorkIndex) ? gHistogram[workIndex] : 0u;
+        const uint histVal = (workIndex < maxWorkIndex) ? histogram[workIndex] : 0u;
 
         gsLane[tid] = histVal;
         GroupMemoryBarrierWithGroupSync();
@@ -150,17 +161,18 @@ void computeRegionsHistogram(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Group
         GroupMemoryBarrierWithGroupSync();
 
         if (workIndex < maxWorkIndex)
-            gHistogram[workIndex] = accumVal + prevBlockAccum + gsWarp[warpIndex];
+            histogram[workIndex] = accumVal + prevBlockAccum + gsWarp[warpIndex];
 
         GroupMemoryBarrierWithGroupSync();
     }
 
     if (tid == 0)
-        gBlockHistogram[blockIdx] = gsBlockAccum;
+        blockHistogram[blockIdx] = gsBlockAccum;
 }
 
 // ---------------------------------------------------------------------------
 // pass 2: exclusive prefix over the per-block totals + fold into each block
+// (BP_OUTPUT_REGION_HISTOGRAM, engine grid (32, 1, 1))
 // ---------------------------------------------------------------------------
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -169,31 +181,39 @@ void outputRegionsHistogram(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupI
     const uint tid = gtid.x;
     const uint blockIdx = gid.x;
 
-    const uint maxWorkIndex = gParams.maxWorkIndex;
-    const uint nbBlocksRequired = (maxWorkIndex + BLOCK - 1) / BLOCK;
-    const uint numIterationPerBlock = (nbBlocksRequired + NUM_BLOCKS - 1) / NUM_BLOCKS;
+    Ptr<PxgBroadPhaseDescGpu> desc = Ptr<PxgBroadPhaseDescGpu>(gParams.bpDesc);
+    Ptr<uint> histogram = Ptr<uint>(desc[0].regionAccum);
+    Ptr<uint> blockHistogram = Ptr<uint>(desc[0].blockRegionAccum);
 
-    // exclusive prefix over the 32 per-block totals
+    const uint numHandles = desc[0].numPreviousHandles + desc[0].numCreatedHandles - desc[0].numRemovedHandles;
+    const uint maxWorkIndex = numHandles * 2;
+
+    // exclusive prefix over the 32 per-block totals; the grand total goes to
+    // the desc's own regionAccumTotal member (the .cu writes it from
+    // globalThreadIndex == BLOCK_SIZE-1 == 31, i.e. block 0)
     if (tid == 0)
     {
         uint acc = 0;
         for (uint b = 0; b < NUM_BLOCKS; ++b)
         {
-            const uint v = gBlockHistogram[b];
             gsBlockPrefix[b] = acc; // exclusive prefix -> block base
-            acc += v;
+            acc += blockHistogram[b];
         }
         if (blockIdx == 0)
-            gTotal[0] = acc; // grand total
+            desc[0].regionAccumTotal = acc; // grand total
     }
     GroupMemoryBarrierWithGroupSync();
 
     const uint blockAccum = gsBlockPrefix[blockIdx];
 
+    // the .cu uses the BLOCK_SIZE (= 32) constant here, NOT gridDim.x
+    const uint totalBlockRequired = (maxWorkIndex + BLOCK - 1) / BLOCK;
+    const uint numIterationPerBlock = (totalBlockRequired + NUM_BLOCKS - 1) / NUM_BLOCKS;
+
     for (uint it = 0; it < numIterationPerBlock; ++it)
     {
         const uint workIndex = it * BLOCK + tid + numIterationPerBlock * blockIdx * BLOCK;
         if (workIndex < maxWorkIndex)
-            gHistogram[workIndex] = gHistogram[workIndex] + blockAccum;
+            histogram[workIndex] = histogram[workIndex] + blockAccum;
     }
 }

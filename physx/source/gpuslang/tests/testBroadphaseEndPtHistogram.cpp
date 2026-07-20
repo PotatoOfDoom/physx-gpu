@@ -24,32 +24,34 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// Verification of broadphaseEndPtHistogram.slang against a C++ transcription of
-// the broad-phase start/end-point projection histogram builders: per-projection
-// start/end/end2 classification, the device-wide (two-pass) exclusive prefix
-// producing start/end/totalEnd point histograms and their per-block totals, and
-// the compacting scatter of non-deleted handles into the ordered start/end
-// point handle arrays.  Covers incremental (with and without removals) and
-// full-rebuild (non-incremental) modes across the 32-block boundary.
+// Verification of broadphaseEndPtHistogram.slang on the ENGINE ABI (P5 Step 4):
+// a REAL PxgBroadPhaseDesc is filled with live device addresses, uploaded, and
+// both kernels are launched through PxgCudaShim exactly as the engine does —
+// (bpDesc*, bool isIncremental) packed by the bridge's natural-alignment rule
+// into a 16-byte blob, grid (32, 3, 1) with blockIdx.y = axis.  Checked against
+// a C++ transcription of the CUDA passes: per-projection start/end/end2
+// classification, the device-wide (two-pass) exclusive prefix producing
+// start/end/totalEnd point histograms and their per-block totals, and the
+// compacting scatter of non-deleted handles into the ordered start/end point
+// handle arrays.  Covers incremental (with and without removals — the removal
+// path exercises the .cu's NULL total-end second pass) and full-rebuild
+// (non-incremental) modes across the 32-block boundary.
 
 #include "pxgTestFramework.h"
+#include "PxgCudaShim.h"
+
+#include "foundation/PxBounds3.h"
+#include "PxgBroadPhaseDesc.h"
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <vector>
 
 namespace
 {
 using namespace pxgtest;
-
-struct EndPtHistParams
-{
-    uint32_t numPreviousHandles;
-    uint32_t numCreatedHandles;
-    uint32_t numRemovedHandles;
-    uint32_t isIncremental;
-};
 
 const uint32_t NUM_BLOCKS = 32;
 const uint32_t BLOCK = 256;
@@ -59,12 +61,70 @@ bool isStart(uint32_t sh) { return (sh & 1u) != 0u; }
 bool isDeleted(uint32_t sh) { return (sh & (1u << 2)) != 0u; }
 uint32_t getHandle(uint32_t sh) { return sh >> 3; }
 
-// Runs one dispatch configuration end-to-end and asserts every produced array
-// against a CPU reference.  Returns nothing; failures are recorded via
+static std::vector<uint8_t> bpShimLoader(const char* file) { return loadShaderBlob(file); }
+
+// Mirrors the bridge's marshalling: place each argument at the natural alignment
+// inferred from its size, then round the blob to the largest alignment seen
+// (a compiled struct's trailing padding).
+struct EngineBlob
+{
+    std::vector<uint8_t> bytes;
+    size_t maxAlign = 1;
+
+    static size_t alignFor(size_t size)
+    {
+        if (size >= 16) return 16;
+        if (size >= 8)  return 8;
+        if (size >= 4)  return 4;
+        if (size >= 2)  return 2;
+        return 1;
+    }
+    template <typename T>
+    void add(const T& v)
+    {
+        const size_t a = alignFor(sizeof(T));
+        if (a > maxAlign) maxAlign = a;
+        bytes.resize((bytes.size() + (a - 1)) & ~(a - 1));
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(&v);
+        bytes.insert(bytes.end(), p, p + sizeof(T));
+    }
+    void finish() { bytes.resize((bytes.size() + (maxAlign - 1)) & ~(maxAlign - 1)); }
+};
+
+struct BpDescRig
+{
+    physx::gpuslang::PxgCudaShim* shim;
+    physx::PxgBroadPhaseDesc desc;
+
+    explicit BpDescRig(physx::gpuslang::PxgCudaShim* s) : shim(s) { std::memset(&desc, 0, sizeof(desc)); }
+
+    physx::gpuslang::PxgDevicePtr alloc(const void* data, size_t bytes)
+    {
+        physx::gpuslang::PxgDevicePtr p = 0;
+        shim->memAlloc(&p, bytes);
+        if (p && data)
+            shim->memcpyHtoD(p, data, bytes);
+        return p;
+    }
+    physx::gpuslang::PxgDevicePtr upload()
+    {
+        physx::gpuslang::PxgDevicePtr p = alloc(&desc, sizeof(desc));
+        return p;
+    }
+};
+
+// Runs one dispatch configuration end-to-end on the engine ABI and asserts
+// every produced array against a CPU reference.  Failures are recorded via
 // PXG_CHECK_MSG.
 void runEndPtCase(const char* tag, uint32_t seed, uint32_t numPrev, uint32_t numCreated,
                   uint32_t numRemoved, uint32_t isIncremental)
 {
+    using namespace physx;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(seed);
 
     const uint32_t nH = isIncremental ? numPrev : (numPrev + numCreated - numRemoved);
@@ -78,8 +138,8 @@ void runEndPtCase(const char* tag, uint32_t seed, uint32_t numPrev, uint32_t num
     // ---- inputs: boxHandles[2][3][P] flat (fill both frames/all axes) ----
     // Real broad-phase projections come in exact start/end pairs (one of each per
     // box), so every (frame,axis) has exactly nH start and nH end projections;
-    // the ordered-handle scatter stride H = nH depends on that invariant. Build
-    // nH pairs per (frame,axis) and shuffle them into a plausible sorted order,
+    // the ordered-handle scatter stride depends on that invariant. Build nH
+    // pairs per (frame,axis) and shuffle them into a plausible sorted order,
     // with an independent "new" bit (~must not gate the scatter) and ~10% deleted.
     std::vector<uint32_t> boxHandles(2 * 3 * P);
     for (uint32_t f = 0; f < 2; ++f)
@@ -101,49 +161,106 @@ void runEndPtCase(const char* tag, uint32_t seed, uint32_t numPrev, uint32_t num
                 boxHandles[(f * 3 + axis) * P + i] = proj[i];
         }
 
-    // ---- device buffers ----
+    // ---- shim + engine desc with live device addresses ----
     PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "broadphaseEndPtHistogram.spv", "computeEndPtsHistogram", 16u, 0 },
+        { "broadphaseEndPtHistogram.spv", "outputEndPtsHistogram", 16u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 2, &bpShimLoader);
 
-    std::vector<uint32_t> endHistI(2 * 3 * P, SENT), startHistI(2 * 3 * P, SENT), totalEndI(3 * P, SENT);
-    std::vector<uint32_t> blockEndI(2 * 3 * NUM_BLOCKS, SENT), blockStartI(2 * 3 * NUM_BLOCKS, SENT),
-        blockTotalI(3 * NUM_BLOCKS, SENT);
-    std::vector<uint32_t> endHandI(2 * 3 * nH, SENT), startHandI(2 * 3 * nH, SENT);
+    BpDescRig rig(&shim);
 
-    PxgBufferHandle bh = createBufferFrom(dev, boxHandles);
-    PxgBufferHandle eh = createBufferFrom(dev, endHistI);
-    PxgBufferHandle sh = createBufferFrom(dev, startHistI);
-    PxgBufferHandle th = createBufferFrom(dev, totalEndI);
-    PxgBufferHandle beh = createBufferFrom(dev, blockEndI);
-    PxgBufferHandle bsh = createBufferFrom(dev, blockStartI);
-    PxgBufferHandle bth = createBufferFrom(dev, blockTotalI);
-    PxgBufferHandle ehd = createBufferFrom(dev, endHandI);
-    PxgBufferHandle shd = createBufferFrom(dev, startHandI);
+    const std::vector<uint32_t> sentP(P, SENT);
+    const std::vector<uint32_t> sentH(nH, SENT);
+    const std::vector<uint32_t> sentB(NUM_BLOCKS, SENT);
 
-    EndPtHistParams p = {};
-    p.numPreviousHandles = numPrev;
-    p.numCreatedHandles = numCreated;
-    p.numRemovedHandles = numRemoved;
-    p.isIncremental = isIncremental;
+    PxgDevicePtr dBox[2][3], dEnd[2][3], dStart[2][3], dBlockEnd[2][3], dBlockStart[2][3];
+    PxgDevicePtr dEndHand[2][3], dStartHand[2][3];
+    PxgDevicePtr dTotal[3], dBlockTotal[3];
+    for (uint32_t f = 0; f < 2; ++f)
+        for (uint32_t axis = 0; axis < 3; ++axis)
+        {
+            dBox[f][axis] = rig.alloc(&boxHandles[(f * 3 + axis) * P], P * 4);
+            dEnd[f][axis] = rig.alloc(sentP.data(), P * 4);
+            dStart[f][axis] = rig.alloc(sentP.data(), P * 4);
+            dBlockEnd[f][axis] = rig.alloc(sentB.data(), NUM_BLOCKS * 4);
+            dBlockStart[f][axis] = rig.alloc(sentB.data(), NUM_BLOCKS * 4);
+            dEndHand[f][axis] = rig.alloc(sentH.data(), nH * 4);
+            dStartHand[f][axis] = rig.alloc(sentH.data(), nH * 4);
+        }
+    for (uint32_t axis = 0; axis < 3; ++axis)
+    {
+        dTotal[axis] = rig.alloc(sentP.data(), P * 4);
+        dBlockTotal[axis] = rig.alloc(sentB.data(), NUM_BLOCKS * 4);
+    }
+    if (!dBox[0][0])
+    {
+        std::printf("  NOTE: shim has no device-address allocations (no BDA) -> skip\n");
+        return;
+    }
 
-    const std::vector<uint32_t> strides(9, 4);
-    const std::vector<PxgBufferHandle> buffers = { bh, eh, sh, th, beh, bsh, bth, ehd, shd };
+    rig.desc.numPreviousHandles = numPrev;
+    rig.desc.numCreatedHandles = numCreated;
+    rig.desc.numRemovedHandles = numRemoved;
+    for (uint32_t f = 0; f < 2; ++f)
+        for (uint32_t axis = 0; axis < 3; ++axis)
+        {
+            rig.desc.boxHandles[f][axis] = reinterpret_cast<PxU32*>(dBox[f][axis]);
+            rig.desc.endPtHistogram[f][axis] = reinterpret_cast<PxU32*>(dEnd[f][axis]);
+            rig.desc.startPtHistogram[f][axis] = reinterpret_cast<PxU32*>(dStart[f][axis]);
+            rig.desc.blockEndPtHistogram[f][axis] = reinterpret_cast<PxU32*>(dBlockEnd[f][axis]);
+            rig.desc.blockStartPtHistogram[f][axis] = reinterpret_cast<PxU32*>(dBlockStart[f][axis]);
+            rig.desc.endPointHandles[f][axis] = reinterpret_cast<PxU32*>(dEndHand[f][axis]);
+            rig.desc.startPointHandles[f][axis] = reinterpret_cast<PxU32*>(dStartHand[f][axis]);
+        }
+    for (uint32_t axis = 0; axis < 3; ++axis)
+    {
+        rig.desc.totalEndPtHistogram[axis] = reinterpret_cast<PxU32*>(dTotal[axis]);
+        rig.desc.blockTotalEndPtHistogram[axis] = reinterpret_cast<PxU32*>(dBlockTotal[axis]);
+    }
+    const PxgDevicePtr dDesc = rig.upload();
 
-    Kernel k1("broadphaseEndPtHistogram.spv", "computeEndPtsHistogram", strides, sizeof(EndPtHistParams));
-    k1.dispatch(32, buffers, p);
-    dev->barrier();
+    // Engine ABI blob: (bpDesc*, bool) — argSizes {8,1}; the bool lands at
+    // byte 8 and the blob rounds to 16 (bytes 9..15 zero-filled).
+    EngineBlob blob;
+    blob.add<uint64_t>(dDesc);
+    blob.add<uint8_t>(uint8_t(isIncremental ? 1u : 0u));
+    blob.finish();
+    PXG_CHECK_MSG(blob.bytes.size() == 16, "[%s] endpt blob is 16 bytes (got %zu)", tag, blob.bytes.size());
 
-    Kernel k2("broadphaseEndPtHistogram.spv", "outputEndPtsHistogram", strides, sizeof(EndPtHistParams));
-    k2.dispatch(32, buffers, p);
-    dev->flush();
+    // Engine grid: (BP_COMPUTE/OUTPUT_ENDPT_HISTOGRAM = 32, 3, 1), 256 threads;
+    // blockIdx.y selects the axis exactly like the CUDA launch.
+    PXG_CHECK_MSG(shim.launchKernel(0, NUM_BLOCKS, 3, 1, blob.bytes.data(), uint32_t(blob.bytes.size())) ==
+                      PxgResult::Success,
+                  "[%s] launch computeEndPtsHistogram", tag);
+    shim.streamSynchronize();
+    PXG_CHECK_MSG(shim.launchKernel(1, NUM_BLOCKS, 3, 1, blob.bytes.data(), uint32_t(blob.bytes.size())) ==
+                      PxgResult::Success,
+                  "[%s] launch outputEndPtsHistogram", tag);
+    shim.streamSynchronize();
 
-    const auto gEnd = downloadBuffer<uint32_t>(dev, eh, 2 * 3 * P);
-    const auto gStart = downloadBuffer<uint32_t>(dev, sh, 2 * 3 * P);
-    const auto gTotal = downloadBuffer<uint32_t>(dev, th, 3 * P);
-    const auto gBlockEnd = downloadBuffer<uint32_t>(dev, beh, 2 * 3 * NUM_BLOCKS);
-    const auto gBlockStart = downloadBuffer<uint32_t>(dev, bsh, 2 * 3 * NUM_BLOCKS);
-    const auto gBlockTotal = downloadBuffer<uint32_t>(dev, bth, 3 * NUM_BLOCKS);
-    const auto gEndHand = downloadBuffer<uint32_t>(dev, ehd, 2 * 3 * nH);
-    const auto gStartHand = downloadBuffer<uint32_t>(dev, shd, 2 * 3 * nH);
+    // ---- download into flat host mirrors (same indexing as the reference) ----
+    std::vector<uint32_t> gEnd(2 * 3 * P, SENT), gStart(2 * 3 * P, SENT), gTotal(3 * P, SENT);
+    std::vector<uint32_t> gBlockEnd(2 * 3 * NUM_BLOCKS, SENT), gBlockStart(2 * 3 * NUM_BLOCKS, SENT),
+        gBlockTotal(3 * NUM_BLOCKS, SENT);
+    std::vector<uint32_t> gEndHand(2 * 3 * nH, SENT), gStartHand(2 * 3 * nH, SENT);
+    for (uint32_t f = 0; f < 2; ++f)
+        for (uint32_t axis = 0; axis < 3; ++axis)
+        {
+            const uint32_t fa = f * 3 + axis;
+            shim.memcpyDtoH(&gEnd[fa * P], dEnd[f][axis], P * 4);
+            shim.memcpyDtoH(&gStart[fa * P], dStart[f][axis], P * 4);
+            shim.memcpyDtoH(&gBlockEnd[fa * NUM_BLOCKS], dBlockEnd[f][axis], NUM_BLOCKS * 4);
+            shim.memcpyDtoH(&gBlockStart[fa * NUM_BLOCKS], dBlockStart[f][axis], NUM_BLOCKS * 4);
+            shim.memcpyDtoH(&gEndHand[fa * nH], dEndHand[f][axis], nH * 4);
+            shim.memcpyDtoH(&gStartHand[fa * nH], dStartHand[f][axis], nH * 4);
+        }
+    for (uint32_t axis = 0; axis < 3; ++axis)
+    {
+        shim.memcpyDtoH(&gTotal[axis * P], dTotal[axis], P * 4);
+        shim.memcpyDtoH(&gBlockTotal[axis * NUM_BLOCKS], dBlockTotal[axis], NUM_BLOCKS * 4);
+    }
 
     // ---- reference + assertions, per processed frame/axis ----
     size_t histMism = 0, blockMism = 0, handMism = 0;
@@ -232,8 +349,17 @@ void runEndPtCase(const char* tag, uint32_t seed, uint32_t numPrev, uint32_t num
     PXG_CHECK_MSG(blockMism == 0, "[%s] %zu block-total mismatches", tag, blockMism);
     PXG_CHECK_MSG(handMism == 0, "[%s] %zu ordered-handle mismatches", tag, handMism);
 
-    for (PxgBufferHandle h : { bh, eh, sh, th, beh, bsh, bth, ehd, shd })
-        dev->destroyBuffer(h);
+    for (uint32_t f = 0; f < 2; ++f)
+        for (uint32_t axis = 0; axis < 3; ++axis)
+            for (PxgDevicePtr pfree : { dBox[f][axis], dEnd[f][axis], dStart[f][axis], dBlockEnd[f][axis],
+                                        dBlockStart[f][axis], dEndHand[f][axis], dStartHand[f][axis] })
+                shim.memFree(pfree);
+    for (uint32_t axis = 0; axis < 3; ++axis)
+    {
+        shim.memFree(dTotal[axis]);
+        shim.memFree(dBlockTotal[axis]);
+    }
+    shim.memFree(dDesc);
 }
 
 PXG_TEST(broadphaseEndPtHistogram_incrementalNoRemoval)

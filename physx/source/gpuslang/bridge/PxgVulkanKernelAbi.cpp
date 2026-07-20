@@ -61,6 +61,9 @@ static const uint8_t kSapBoxInit[] = { 8, 4, 1 };
 // radixSortImpl.cu: (PxgRadixSortDesc* desc, PxU32 numKeys, PxU32 startBit)
 static const uint8_t kRadixDesc[] = { 8, 4, 4 };
 
+// broadphase.cu: (const PxgBroadPhaseDesc* bpDesc, bool isIncremental)
+static const uint8_t kBpDescBool[] = { 8, 1 };
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },
@@ -72,6 +75,14 @@ static const PxgKernelAbiRow kRows[] = {
     { "updateHandles", kOnePtr, 1u },
     { "radixSortMultiBlockLaunchWithCount", kRadixDesc, uint32_t(sizeof(kRadixDesc)) },
     { "radixSortMultiCalculateRanksLaunchWithCount", kRadixDesc, uint32_t(sizeof(kRadixDesc)) },
+    { "createRegionsKernel", kOnePtr, 1u },
+    { "computeEndPtsHistogram", kBpDescBool, uint32_t(sizeof(kBpDescBool)) },
+    { "outputEndPtsHistogram", kBpDescBool, uint32_t(sizeof(kBpDescBool)) },
+    { "computeRegionsHistogram", kOnePtr, 1u },
+    { "outputRegionsHistogram", kOnePtr, 1u },
+    { "computeStartAndActiveRegionHistogram", kOnePtr, 1u },
+    { "writeOutStartAndActiveRegionHistogram", kOnePtr, 1u },
+    { "outputOrderedActiveRegionHistogram", kOnePtr, 1u },
 };
 
 inline size_t abiAlign(size_t size)
