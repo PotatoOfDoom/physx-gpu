@@ -82,17 +82,18 @@ inline PxCUresult oomResult() { return PxCUresult(PxU32(PXG_CUDA_ERROR_OUT_OF_ME
 // CUDA lays each kernel parameter out in the .param bank at its type's natural
 // alignment, which the driver reads from the compiled function signature
 // (cuLaunchKernel; see CudaContextManager.cpp:1165-1179).  The bridge only has
-// the argument size, from which the alignment is exact for scalars, pointers,
-// and power-of-two vector types — the argument kinds PhysX GPU launch sites
-// use.  (A by-value struct whose size is not a power of two — e.g. a 12-byte
-// float3 — would need its Slang push-constant field authored to match; PhysX
-// passes such aggregates by device pointer, not by value.)
+// the argument size, from which the alignment is the largest power of two that
+// divides the size (capped at 16) — exact for scalars, pointers, power-of-two
+// vector types, AND tightly-packed scalar aggregates such as a 12-byte PxVec3
+// (alignment 4) passed by value (e.g. gravity in preIntegrationLaunchTGS).  The
+// matching Slang push-constant field must be authored to the same layout.
 inline size_t paramAlign(size_t size)
 {
-    if (size >= 16) return 16;
-    if (size >= 8)  return 8;
-    if (size >= 4)  return 4;
-    if (size >= 2)  return 2;
+    if (size == 0) return 1;
+    if (size % 16 == 0) return 16;
+    if (size % 8 == 0)  return 8;
+    if (size % 4 == 0)  return 4;
+    if (size % 2 == 0)  return 2;
     return 1;
 }
 

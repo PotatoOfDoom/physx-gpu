@@ -418,6 +418,15 @@ PXG_TEST(preIntegration_partialBlock)
 // 128)).  Pure copies -> bit-exact comparison.
 static std::vector<uint8_t> preIntShimLoader(const char* file) { return loadShaderBlob(file); }
 
+template <typename T>
+static std::vector<T> downloadShim(physx::gpuslang::PxgCudaShim& shim, physx::gpuslang::PxgDevicePtr p,
+                                   uint32_t count)
+{
+    std::vector<T> out(count);
+    shim.memcpyDtoH(out.data(), p, size_t(count) * sizeof(T));
+    return out;
+}
+
 void checkInitStaticKinematics(uint32_t nbStaticKinematics, uint32_t seed)
 {
     using physx::gpuslang::PxgCudaShim;
@@ -547,6 +556,172 @@ PXG_TEST(preIntegration_initStaticKinematics)
     checkInitStaticKinematics(200, 47);
     checkInitStaticKinematics(1, 48);
     checkInitStaticKinematics(129, 49);
+}
+
+// preIntegrationLaunchTGS on the ENGINE ABI (P5 Step 4): the TGS entry forwards
+// to the SAME preIntegration() as the PGS entry plus a trailing bool
+// skipGravityApplication.  The 13-arg CUDA pack (PxU32 offset, PxU32
+// nbSolverBodies, PxReal dt, PxVec3 gravity, eight device pointers, bool) packs
+// to a 96-byte blob (gravity is a 12-byte, 4-aligned by-value PxVec3, so the
+// pointer bank starts at @24).  Same per-body math as preIntegration_randomBodies
+// -> same CPU reference (referencePreIntegration).
+void checkPreIntegrationTGS(uint32_t nbBodies, uint32_t seed, bool skipGravity, bool mutate)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::uniform_real_distribution<float> sym(-10.f, 10.f);
+
+    const uint32_t maxNodes = nbBodies + 32;
+    std::vector<uint32_t> nodePool(maxNodes);
+    std::iota(nodePool.begin(), nodePool.end(), 0u);
+    std::shuffle(nodePool.begin(), nodePool.end(), rng);
+
+    std::vector<uint64_t> islandNodeIndices(nbBodies);
+    for (uint32_t i = 0; i < nbBodies; ++i)
+        islandNodeIndices[i] = makeNodeIndex(nodePool[i]);
+
+    std::vector<BodySim> bodySims(maxNodes);
+    std::memset(bodySims.data(), 0, bodySims.size() * sizeof(BodySim));
+    for (BodySim& b : bodySims)
+    {
+        b.linearVelocityXYZ_inverseMassW = Float4{ sym(rng), sym(rng), sym(rng), unit(rng) };
+        b.angularVelocityXYZ_maxPenBiasW = Float4{ sym(rng), sym(rng), sym(rng), -unit(rng) };
+        const float maxLin = unit(rng) < 0.5f ? 1.0f : 1e6f;
+        const float maxAng = unit(rng) < 0.5f ? 1.0f : 1e6f;
+        b.maxLinearVelocitySqX_maxAngularVelocitySqY_linearDampingZ_angularDampingW =
+            Float4{ maxLin, maxAng, unit(rng) * 0.5f, unit(rng) * 0.5f };
+        b.inverseInertiaXYZ_contactReportThresholdW =
+            Float4{ unit(rng) < 0.15f ? 0.f : unit(rng) * 4.f, unit(rng) < 0.15f ? 0.f : unit(rng) * 4.f,
+                    unit(rng) < 0.15f ? 0.f : unit(rng) * 4.f, unit(rng) };
+        b.sleepLinVelAccXYZ_freezeCountW = Float4{ 0, 0, 0, unit(rng) };
+        b.sleepAngVelAccXYZ_accelScaleW = Float4{ 0, 0, 0, unit(rng) };
+        b.freezeThresholdX_wakeCounterY_sleepThresholdZ_bodySimIndex = Float4{ unit(rng), unit(rng), unit(rng), 0 };
+        const QuatV q = randomQuat(rng);
+        b.body2World.q = q.toFloat4();
+        b.body2World.p = Float4{ sym(rng), sym(rng), sym(rng), 0.f };
+        b.body2Actor_maxImpulseW.q = Float4{ 0, 0, 0, 1 };
+        b.body2Actor_maxImpulseW.p = Float4{ 0, 0, 0, unit(rng) * 100.f };
+        uint32_t flags = 0;
+        if (unit(rng) < 0.3f) flags |= eENABLE_GYROSCOPIC;
+        if (unit(rng) < 0.2f) flags |= eSPECULATIVE_CCD;
+        b.internalFlags = flags;
+        b.lockFlags = uint16_t(rng() & 0x3Fu & (unit(rng) < 0.3f ? 0x3Fu : 0u));
+        b.disableGravity = uint16_t(unit(rng) < 0.25f ? 1 : 0);
+        b.offsetSlop = unit(rng) * 0.01f;
+        b.externalLinearAcceleration = Float4{ sym(rng), sym(rng), sym(rng), 0 };
+        b.externalAngularAcceleration = Float4{ sym(rng), sym(rng), sym(rng), 0 };
+    }
+
+    const float dt = 1.f / 60.f;
+    const Vec3 gravity(0.f, -9.81f, 0.f);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = { { "preIntegration.spv", "preIntegrationLaunchTGS", 96u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &preIntShimLoader);
+
+    const float GARBAGE = 77.5f;
+    std::vector<SolverBodyData> dataInit(nbBodies);
+    std::memset(dataInit.data(), 0x3A, dataInit.size() * sizeof(SolverBodyData));
+    std::vector<SolverTxIData> txiInit(nbBodies);
+    std::memset(txiInit.data(), 0x3B, txiInit.size() * sizeof(SolverTxIData));
+    std::vector<AlignedTransform> xformInit(nbBodies);
+    std::memset(xformInit.data(), 0x3C, xformInit.size() * sizeof(AlignedTransform));
+    std::vector<Float4> velInit(2 * nbBodies, Float4{ GARBAGE, GARBAGE, GARBAGE, GARBAGE });
+    std::vector<uint32_t> bodyIndicesInit(maxNodes, 0xFFFFFFFFu);
+
+    PxgDevicePtr dData = 0, dSleep = 0, dTxi = 0, dBody = 0, dNodes = 0, dXform = 0, dVel = 0, dIndices = 0;
+    shim.memAlloc(&dData, dataInit.size() * sizeof(SolverBodyData));
+    shim.memAlloc(&dSleep, nbBodies * 32);        // solverBodySleepDataPool, unused by the kernel
+    shim.memAlloc(&dTxi, txiInit.size() * sizeof(SolverTxIData));
+    shim.memAlloc(&dBody, bodySims.size() * sizeof(BodySim));
+    shim.memAlloc(&dNodes, islandNodeIndices.size() * 8);
+    shim.memAlloc(&dXform, xformInit.size() * sizeof(AlignedTransform));
+    shim.memAlloc(&dVel, velInit.size() * sizeof(Float4));
+    shim.memAlloc(&dIndices, bodyIndicesInit.size() * 4);
+    if (!dData || !dTxi || !dBody || !dNodes || !dXform || !dVel || !dIndices)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+    shim.memcpyHtoD(dData, dataInit.data(), dataInit.size() * sizeof(SolverBodyData));
+    shim.memcpyHtoD(dTxi, txiInit.data(), txiInit.size() * sizeof(SolverTxIData));
+    shim.memcpyHtoD(dBody, bodySims.data(), bodySims.size() * sizeof(BodySim));
+    shim.memcpyHtoD(dNodes, islandNodeIndices.data(), islandNodeIndices.size() * 8);
+    shim.memcpyHtoD(dXform, xformInit.data(), xformInit.size() * sizeof(AlignedTransform));
+    shim.memcpyHtoD(dVel, velInit.data(), velInit.size() * sizeof(Float4));
+    shim.memcpyHtoD(dIndices, bodyIndicesInit.data(), bodyIndicesInit.size() * 4);
+
+    struct
+    {
+        uint32_t offset;
+        uint32_t nbSolverBodies;
+        float dt;
+        float gx, gy, gz;
+        uint64_t solverBodyDataPool, solverBodySleepDataPool, solverTxIDataPool, bodySimPool;
+        uint64_t islandNodeIndices, transforms, outVelocityPool, solverBodyIndices;
+        uint32_t skipGravityApplication;
+    } prm = { 0, nbBodies, dt, gravity.x, gravity.y, gravity.z,
+              dData, dSleep, dTxi, dBody, dNodes, dXform, dVel, dIndices, skipGravity ? 1u : 0u };
+    static_assert(sizeof(prm) == 96, "preIntegrationLaunchTGS blob is 96 bytes");
+
+    // mutation: swap the transforms and outVelocityPool device pointers so the
+    // kernel writes the pose where velocities are expected -> the compare fails.
+    if (mutate) { const uint64_t t = prm.transforms; prm.transforms = prm.outVelocityPool; prm.outVelocityPool = t; }
+
+    const uint32_t nbBlocks = (nbBodies + 127) / 128;
+    PXG_CHECK_MSG(shim.launchKernel(0, nbBlocks, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch preIntegrationLaunchTGS");
+    shim.streamSynchronize();
+
+    RefOutputs ref;
+    referencePreIntegration(nbBodies, dt, gravity, skipGravity, bodySims, islandNodeIndices, maxNodes, ref);
+
+    std::vector<SolverBodyData> gData = downloadShim<SolverBodyData>(shim, dData, nbBodies);
+    std::vector<SolverTxIData> gTxi = downloadShim<SolverTxIData>(shim, dTxi, nbBodies);
+    std::vector<AlignedTransform> gXform = downloadShim<AlignedTransform>(shim, dXform, nbBodies);
+    std::vector<Float4> gVel = downloadShim<Float4>(shim, dVel, 2 * nbBodies);
+    std::vector<uint32_t> gIndices = downloadShim<uint32_t>(shim, dIndices, maxNodes);
+
+    size_t bad = 0;
+    auto f4bad = [&](const Float4& g, const Float4& r) {
+        return !(almostEqual(g.x, r.x) && almostEqual(g.y, r.y) && almostEqual(g.z, r.z) && almostEqual(g.w, r.w));
+    };
+    for (uint32_t i = 0; i < nbBodies; ++i)
+    {
+        if (f4bad(gVel[i], ref.velocityPool[i])) ++bad;
+        if (f4bad(gVel[i + nbBodies], ref.velocityPool[i + nbBodies])) ++bad;
+        if (f4bad(gXform[i].q, ref.transforms[i].q)) ++bad;
+        if (f4bad(gXform[i].p, ref.transforms[i].p)) ++bad;
+        if (f4bad(gData[i].initialLinVelXYZ_invMassW, ref.solverBodyData[i].initialLinVelXYZ_invMassW)) ++bad;
+        if (gData[i].islandNodeIndex != ref.solverBodyData[i].islandNodeIndex) ++bad;
+        if (gData[i].flags != ref.solverBodyData[i].flags) ++bad;
+        for (int m = 0; m < 9; ++m)
+            if (!almostEqual(gTxi[i].sqrtInvInertia[m], ref.txIData[i].sqrtInvInertia[m], 1e-4f, 1e-5f)) ++bad;
+    }
+    for (uint32_t n = 0; n < maxNodes; ++n)
+        if (gIndices[n] != ref.solverBodyIndices[n]) ++bad;
+
+    if (mutate)
+        PXG_CHECK_MSG(bad != 0, "preIntegrationLaunchTGS mutation must FAIL (swapped transforms/velocity ptrs)");
+    else
+        PXG_CHECK_MSG(bad == 0, "preIntegrationLaunchTGS(n=%u,skip=%d): %zu mismatches", nbBodies, skipGravity ? 1 : 0, bad);
+
+    for (PxgDevicePtr p : { dData, dSleep, dTxi, dBody, dNodes, dXform, dVel, dIndices })
+        shim.memFree(p);
+}
+
+PXG_TEST(preIntegration_launchTGS)
+{
+    checkPreIntegrationTGS(1000, 42, false, false);
+    checkPreIntegrationTGS(1, 43, false, false);
+    checkPreIntegrationTGS(129, 44, false, false);
+    checkPreIntegrationTGS(500, 45, true, false);   // skipGravityApplication
+    checkPreIntegrationTGS(200, 46, false, true);   // mutation: must FAIL then be caught
 }
 
 } // namespace

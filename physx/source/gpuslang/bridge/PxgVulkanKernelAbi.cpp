@@ -92,6 +92,13 @@ static const uint8_t kIntegrateTGS[] = { 4, 8, 8, 8, 8, 8 };
 //   updateShapesLaunch(const PxgNewShapeSim*, PxgShapeSim*, PxU32 nbNewShapes)
 static const uint8_t kUpdateShapes[] = { 8, 8, 4 };
 
+// gpusolver preIntegrationTGS.cu: preIntegrationLaunchTGS(PxU32 offset,
+//   PxU32 nbSolverBodies, PxReal dt, PxVec3 gravity, PxgSolverBodyData*,
+//   PxgSolverBodySleepData*, PxgSolverTxIData*, const PxgBodySim*,
+//   const PxNodeIndex*, PxAlignedTransform*, float4* outVel, PxU32* solverBodyIndices,
+//   bool skipGravityApplication).  PxVec3 by value = 12 bytes.
+static const uint8_t kPreIntegrateTGS[] = { 4, 4, 4, 12, 8, 8, 8, 8, 8, 8, 8, 8, 1 };
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },
@@ -132,14 +139,19 @@ static const PxgKernelAbiRow kRows[] = {
     { "updateTransformCacheAndBoundArrayLaunch", kOnePtr, 1u },
     { "updateBodiesLaunch", kOnePtr, 1u },
     { "updateShapesLaunch", kUpdateShapes, uint32_t(sizeof(kUpdateShapes)) },
+    { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
 };
 
 inline size_t abiAlign(size_t size)
 {
-    if (size >= 16) return 16;
-    if (size >= 8)  return 8;
-    if (size >= 4)  return 4;
-    if (size >= 2)  return 2;
+    // Largest power of two that divides the size (capped at 16) — the natural
+    // alignment of a tightly-packed scalar aggregate; matches paramAlign() in
+    // PxgVulkanCudaContext.cpp so the void** blob layout equals the sized one.
+    if (size == 0) return 1;
+    if (size % 16 == 0) return 16;
+    if (size % 8 == 0)  return 8;
+    if (size % 4 == 0)  return 4;
+    if (size % 2 == 0)  return 2;
     return 1;
 }
 

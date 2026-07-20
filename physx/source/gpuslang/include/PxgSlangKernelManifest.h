@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 128;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 129;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -177,7 +177,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "computeAverageSolverBodyVelocityTGS", "solverTGS.spv", "computeAverageSolverBodyVelocityTGS" },  // COMPUTE_AVERAGE_VELOCITY_TGS
     { "integrateCoreParallelLaunchTGS", "integration.spv", "integrateCoreParallelLaunchTGS" },  // INTEGRATE_CORE_PARALLEL_TGS
     { "initStaticKinematics", "preIntegration.spv", "initStaticKinematics" },  // INIT_STATIC_KINEMATICS
-    { "preIntegrationLaunchTGS", nullptr, nullptr },  // TGS_PRE_INTEGRATION (unmapped)
+    { "preIntegrationLaunchTGS", "preIntegration.spv", "preIntegrationLaunchTGS" },  // TGS_PRE_INTEGRATION
     { "initializeSolverVelocitiesTGS", "solverInitVelocitiesTGS.spv", "initializeSolverVelocitiesTGS" },  // TGS_INIT_SOLVER_VELS
     { "jointConstraintBlockPrepareParallelLaunchTGS", "constraintPrepTGS.spv", "jointConstraintBlockPrepareParallelLaunchTGS" },  // TGS_JOINT_CONSTRAINT_PREPARE_BLOCK_PARALLEL
     { "contactConstraintBlockPrepareParallelLaunchTGS", "constraintPrepTGS.spv", "contactConstraintBlockPrepareParallelLaunchTGS" },  // TGS_CONTACT_CONSTRAINT_PREPARE_BLOCK_PARALLEL
