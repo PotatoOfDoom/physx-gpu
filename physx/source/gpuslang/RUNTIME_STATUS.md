@@ -108,48 +108,55 @@ this way / by the wiring, not by the happy path).
 
 ## P5 Step 4 — live bring-up state (continuation anchor)
 
-Converted to the engine ABI (BDA + ABI row + shim-driven test, all green):
-MemCopyBalanced, translateAABBsLaunch, clearNewFlagLaunch, bpSignalComplete,
-markCreatedPairsLaunch, initializeSapBox1DLaunch {8,4,1}, initializeRadixRanks,
-updateHandles (broadphaseSetup.slang fully BDA), radixSortMultiBlockLaunchWithCount
-+ radixSortMultiCalculateRanksLaunchWithCount (NEW radixSortDesc.slang, mapped in
-the manifest — PXG_SLANG_KERNEL_MAPPED now 125; 8-pass 3-axis engine test).
-Suite count now 693 (WorkgroupCount entries retired from HLSL checks per P0 policy).
-IN FLIGHT (4 worktree agents, merge + ABI rows + suite + step pending):
-histogram/regions group (endPt+region), createRegions+activeRegion group,
-overlap+newBoundsPairs+reports group, and the SOLVER group (initStaticKinematics
-{4,4,8,8,8,8,8,8} + the TGS every-frame set {8,8}-based with PxgSolverCoreDesc/
-PxgSolverSharedDesc mirrors after the bpDesc mirror+probe pattern).  After merge:
-add each kernel's ABI row from the agents' reported push-struct sizes, retire
-reported hlsl.* failures, full suite both modes, gpu-sdk-step trace, commit.
+Converted to the engine ABI (BDA + ABI row + shim-driven test, all green;
+suite 681/681 both memory modes, PXG_SLANG_KERNEL_MAPPED = 127):
+- the ENTIRE broadphase void** set (0 refused BP kernels in the engine trace):
+  setup/foundation, radix desc pair, endPt/region/start-region/active-region/
+  overlap histograms, createRegions, newBoundsPairs, reports.
+- tranche 10: the TGS solver every-frame set — initStaticKinematics
+  {4,4,8,8,8,8,8,8}, ZeroBodiesTGS/initializeSolverVelocitiesTGS/
+  computeAverageSolverBodyVelocityTGS {8,8}, propagateAverageSolverBodyVelocityTGS
+  {8,8,1,1,4}, writeBackBodiesTGS {8,8,4}, integrateCoreParallelLaunchTGS
+  {4,8,8,8,8,8} — driven by byte-exact PxgSolverCoreDescGpu (truncated @288)/
+  PxgSolverSharedDescTGSGpu/PxgIslandContextGpu mirrors (pxgSlangSolverDesc.slang,
+  80-probe testSolverDescLayout).
+Engine trace after tranche 10: solver launches all OK; y becomes NaN because
+solveWholeIslandTGS is unmapped (solver outputs never written); refused set =
+updateTransformCacheAndBoundArrayLaunch {8}, updateBodiesLaunch {8},
+updateShapesLaunch {8,8,4}.
 Infrastructure DONE: pinned-memory seam (p3ShimPinned), both launch forms
-(sized + void** via PxgVulkanKernelAbi table), PxgBroadPhaseDescGpu mirror
-byte-exact (testBpDescLayout, 57-field probe), PXG_LAUNCH_TRACE.
+(sized + void** via PxgVulkanKernelAbi table), desc-mirror + sentinel-probe
+pattern (bpDesc 57 probes, solverDesc 80 probes), PXG_LAUNCH_TRACE.
 
-REMAINING for the stepping scene (specs for ALL of these — CUDA signatures,
-argSizes, launch sites, grid arithmetic, slang entries/bindings, notes — are in
-the session scratchpad `kernel-abi-specs.json`, produced by the 6-agent spec
-workflow; regenerate by re-reading .cu/.cpp if lost):
-- solver TGS (sized, 2x ptr {8,8} mostly): ZeroBodiesTGS,
-  initializeSolverVelocitiesTGS, computeAverageSolverBodyVelocityTGS,
-  propagateAverageSolverBodyVelocityTGS (has extra bool/bool/float args),
-  writeBackBodiesTGS, integrateCoreParallelLaunchTGS, solveWholeIslandTGS
-  (unmapped — needs port), solveContactParallelTGS-family, initStaticKinematics.
-  NOTE: warp-structured kernels (32,8,1) blockDim => Slang numthreads(32) with
-  dispatch X = nbBlocks*8; push constants that were harness-precomputed
-  (gridStride, numThreadsPerBody...) must move into desc-reads for the engine ABI.
-- simcontroller: updateTransformCacheAndBoundArrayLaunch, updateBodiesLaunch.
-- BP foundation (void**, bpDesc-walks via the mirror): markCreatedPairsLaunch,
-  initializeSapBox1DLaunch {8,4,1}, initializeRadixRanks, updateHandles.
-- BP histograms/regions/reports (void**, bpDesc): endPts/regions/active/overlap
-  histogram sets, createRegionsKernel, generateFoundPairsForNewBoundsRegion,
-  accumulateReportsStage_1/2, copyReports.
-- radixSortMultiBlockLaunchWithCount + RanksLaunchWithCount (unmapped — port
-  from gpucommon RadixSort.cu, engine launches via runRadixSort desc pairs).
-- AABB manager set (void**): see spec group aabbManager.
+IN FLIGHT (5 worktree agents; at merge: apply diff, add reported ABI rows to
+bridge/PxgVulkanKernelAbi.cpp, reconcile PXG_SLANG_KERNEL_MAPPED (127 + sum of
+reported deltas), retire reported PXG_HLSL_ENTRIES rows, rebuild both build
+trees, suite both modes, engine trace, commit):
+1. solveWholeIslandTGS {8,8,4,1,4,4} — 256-thread single-block port; shared
+   staging capped 944->640 (llvmpipe 32KB groupshared limit; host threshold in
+   PxgTGSCudaSolverCore.cpp guarded by PXG_NO_CUDA_TOOLKIT); desc mirror
+   extended past 288 with threshold counts + Dy::ErrorAccumulator tail.
+2. simcontroller trio: updateTransformCacheAndBoundArray/updateBodies/
+   updateShapes + PxgSimulationCoreDesc/PxgNewBodiesDesc mirrors
+   (pxgSlangSimCoreDesc.slang).
+3. NP pair management: prepareLostFoundPairs_Stage1 {8,8,8,4}/Stage2,
+   removeContactManagers_Stage1-4 {8} (+Stage5 pair if not yet BDA),
+   initializeManifolds {8,8,4,4} + PxgPairManagementData mirror.
+4. contact prep: rigidSumInternalContactAndJointBatches1/2,
+   constraintContactBlockPrePrepLaunch, contactConstraintBlockPrepareParallel-
+   LaunchTGS + PxgPrePrepDesc/PxgConstraintPrepareDesc mirrors
+   (pxgSlangPrepDesc.slang).
+5. NP convex-convex core: convexConvexNphase_stage1Kernel {4,4,8,8,8,8,8},
+   stage2Kernel {4,4,8,8,8,8,8,8}, finishContactsKernel (20 args),
+   compressContactStage1/2 — raw-pointer ABIs, element-struct stride probes.
+
+These five cover every kernel the box-falls-and-rests scene is known to need
+(wrangler init warnings + trace analysis); anything still refused after the
+next trace gets the same treatment.  AABB-manager aggregate set (spec group
+aabbManager in scratchpad kernel-abi-specs.json) not needed for this scene.
 
 Doctrine per kernel: BDA rewrite mirroring the .cu exactly (thread mapping,
 null-branches), ABI row in PxgVulkanKernelAbi.cpp, shim-driven engine-ABI test
-(EngineBlob pattern for multi-arg packs), mutation check, suite 695/695 both
-modes, gpu-sdk-step trace shows the kernel OK, commit.  End state: PXG_GPU_STEP=1
-box falls + rests on GPU.
+(EngineBlob pattern for multi-arg packs), mutation check, full suite both
+modes BEFORE committing, gpu-sdk-step trace shows the kernel OK, commit.
+End state: PXG_GPU_STEP=1 box falls + rests on GPU.
