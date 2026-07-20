@@ -125,14 +125,55 @@ Suite **666/666** both memory modes; `PXG_SLANG_KERNEL_MAPPED = 145`.
 Deformables / particles / articulations remain explicitly out of scope for this
 milestone.
 
-**Next frontier — convex-convex GJK contact-gen.**  A `capsule` (or `convex`)
-resting on a BOX ground routes through the convex-convex GJK narrowphase
-(`CONVEX_CONVEX_KERNEL_EARLY_OUT` / `_MAIN` + `FINISH_CONTACTS_KERNEL`), not the
-primitive kernel.  Those three are mapped and LAUNCH with zero refusals, but a
-`capsule`-on-box probe fell straight through the ground (`y = -73.8`, no
-contacts produced) — the convex-convex contact-gen chain is not yet wired
-end-to-end on the engine ABI.  A convex-hull ground scene is deferred until that
-chain is brought up.
+**Next frontier — assemble `collide()` into convex-convex stage2.**  A `capsule`
+(or `convex`) resting on a BOX ground routes through the convex-convex GJK
+narrowphase (`CONVEX_CONVEX_KERNEL_EARLY_OUT` / `_MAIN` + `FINISH_CONTACTS_KERNEL`),
+not the primitive kernel.  A `capsule`-on-box probe fell straight through the
+ground (`y = -73.8`, no contacts) — **but a three-lens investigation
+(wf_1b2513f5) proved the gap is a single intra-kernel elision, not a missing
+kernel.**  Routing (`caseCapsuleBox` → `eConvex` bucket → `testSDKConvexConvexGjkEpaGpu`,
+`PxgNphaseImplementationContext.cpp:1354/1441`), the box hull blob
+(`layOutBoxHull`, host-produced, already live), stage1 refresh
+(`npCvxStage1Refresh.slang`), `finishContactsKernel` (`npCvxFinishContacts.slang`),
+and lost/found (`prepareLostFoundPairs_Stage1/2`) are ALL complete ports; every
+kernel in the path is mapped and launches.  The one gap: the MAIN kernel's
+`collide()` (GJK + EPA + `generateConvexContacts` + `schlock::reduce`) is elided —
+`npCvxStage2Core.slang:177` hard-codes `bIntersection = false` and stores
+`numManifoldContacts | 0x80000000` (the invalidated/no-touch bit), so every
+convex-convex pair emits zero patches (`npCvxStage2Setup.slang:51-61` documents
+this).  The `.cu` original `cudaGJKEPA.cu:2615-2632` calls `bIntersection =
+collide(...)` (driver at `cudaGJKEPA.cu:1275`).
+
+The verified collide() COMPONENTS are all ported (tranches 129/132/133/147/148/149)
+and staged as `npCvxCoreGjk` / `npCvxCoreEpa` / `npCvxCoreCvxGen` /
+`npCvxCollidePrep` / `npCvxCollideDecide` / `npCvxContactDecide` / `npGjk*` /
+`npEpa*` / `npManifold*` / `npCvxCoreSupport`.  Remaining = wire them into a
+`collide()` driver and call it at the `npCvxStage2Core.slang:177` site.  Ordered
+plan:
+
+- **T0** (throwaway smoke test): inject one fabricated manifold contact +
+  `bIntersection=true` + clear the invalidate bit → prove the whole downstream
+  (finishContacts patch atomics → solver → response) turns a manifold into a
+  resting capsule.  Isolates the gap to purely collide() content.
+- **T1** support-mapping + `runGJK` over shape0 (implicit: capsule 2-vertex
+  segment / sphere point / hull) vs shape1 (box hull blob).
+- **T2** EPA (penetration depth + normal) for the overlapping/resting case.
+- **T3** `generateConvexContacts` (face/edge clip → manifold points).
+- **T4** wire `schlock::reduce` (internal to stage2 — no separate kernel).
+- **T5** replace `bIntersection=false` with the collide() result + store
+  `numManifoldContacts | (bIntersection ? 0 : 0x80000000)`; update the stub
+  header.
+- **Wrinkle**: stage2Body runs SERIALIZED ON LANE 0 (llvmpipe has no 32-wide
+  subgroup), whereas the `.cu` collide() is warp-cooperative — the assembly must
+  either serialize the GJK/EPA/contact-gen or route their warp reductions
+  through the groupshared-reduction pattern used elsewhere.
+- **Blocker note**: only capsule/sphere/box primitives are on this critical
+  path (box hull already live; capsule/sphere are implicit, `hullOrMeshPtr==0` is
+  harmless).  Arbitrary user `PxConvexMesh` operands additionally need the
+  host-cooked hull (`addHull`/`layOutHull`) uploaded — CPU cooking, separate work.
+
+Once collide() lands, capsule-on-box / convex-hull-on-box / convex-convex all
+light up together, and a convex-hull ground scene can be added.
 
 Landed since the Step-4 box-on-ground milestone (each: bit-exact / geometric
 shim unit test on the real engine ABI + both-mode suite + engine-scene proof):
