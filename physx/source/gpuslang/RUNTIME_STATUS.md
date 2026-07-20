@@ -151,10 +151,16 @@ and staged as `npCvxCoreGjk` / `npCvxCoreEpa` / `npCvxCoreCvxGen` /
 `collide()` driver and call it at the `npCvxStage2Core.slang:177` site.  Ordered
 plan:
 
-- **T0** (throwaway smoke test): inject one fabricated manifold contact +
-  `bIntersection=true` + clear the invalidate bit → prove the whole downstream
-  (finishContacts patch atomics → solver → response) turns a manifold into a
-  resting capsule.  Isolates the gap to purely collide() content.
+- **T0** (throwaway smoke test — DONE, downstream CONFIRMED): injecting one
+  fabricated upward manifold contact (box-local normal `(0,1,0)`, contactB
+  `(0,0.5,0)`, `penetration.w = 0.5` so finishContacts' `sep = w - radius = 0`)
+  + `bIntersection=true` at `npCvxStage2Core.slang:177` made the capsule-on-box
+  scene **rest at y=0.5000, |v|=0.0000** (was falling through to −73.8).  This
+  proves the ENTIRE convex-convex downstream — finishContacts patch atomics →
+  solver → contact response → lost/found — is live on llvmpipe, and that the
+  ONLY missing piece is stage2's contact CONTENT (the elided collide()).  The
+  probe was reverted; the manifold frame it pinned down (shape1-local normal /
+  contactB, `sep = w - radius`) is the target format for the real collide().
 - **T1** support-mapping + `runGJK` over shape0 (implicit: capsule 2-vertex
   segment / sphere point / hull) vs shape1 (box hull blob).
 - **T2** EPA (penetration depth + normal) for the overlapping/resting case.
