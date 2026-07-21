@@ -40,14 +40,22 @@
 //   generatedContactsEEContacts     capsule edge-edge fallback (T143), blob
 //     (npCvxEEDriver):              readers switched from gBlob to Ptr<> over
 //                                   convexPtr1
+//   generateConvexContacts          the convex-hull arm (cu L823-1022):
+//     (npCvxContactDecide T147,     calculateLocalNormal + addManifoldPoint
+//      npCvxLocalNormal T139,       (replace / append / 5-candidate reduce)
+//      npCvxAddManifold T140,       + fullContactGen decision, reference-
+//      npCvxRefFrame T144,          frame selection on both hulls
+//      npCvxWitnessPoly T138,       (getPolygonIndexFromLocalWitness),
+//      npCvxPolyClip T145,          polygon-vs-polygon clipping, and the
+//      npCvxReduceManifold T137,    reduce<false,false,4> + writeContacts
+//      npCvxClipEmit T146):         manifold emission tail
 //
-// Only the SPHERE and CAPSULE type0 dispatch arms are assembled; the
-// convex-hull arm (generateConvexContacts, cu L1458-1462) is DEFERRED — the
-// stage2 caller gates the collide() call on type0 so convex-type0 pairs keep
-// the elision contract.  LATENT CONTRACT NOTE: as a public function, collide()
-// invoked with a convex-hull type0 returns true WITHOUT generating contacts
-// (the .cu would generate them) — callers MUST keep the type gate until the
-// arm lands.
+// All three type0 dispatch arms (SPHERE / CAPSULE / convex hull) are
+// assembled; the stage2 caller gates collide() only on transform validity,
+// matching the .cu (L2616).  The .cu's EpaAndClipScratch (L775-778) union of
+// EpaScratch and TemporaryContacts is a shared-memory footprint optimization;
+// in this single-thread model TemporaryContacts is plain locals
+// (ctsPos/ctsSep in generateConvexContacts) — no semantic difference.
 //
 // Contact points are written INSIDE collide() straight through Ptr<float4>
 // views of the manifold (localNormalPen @ manifoldBase+0, localContactA @
@@ -218,9 +226,21 @@ uint supportIdxB(float3 dir, uint nb, inout CollideScratch s)
 void cvxPrepareVertices(inout CollideScratch s, float4 verts0Synth[2], uint64_t verts0Ptr, uint64_t verts1Ptr)
 {
     for (uint i = 0u; i < 64u; ++i) { s.vA[i] = float4(0, 0, 0, 0); s.vB[i] = float4(0, 0, 0, 0); }
+    // SPECULATION-SAFE source select (verified empirically on llvmpipe): the
+    // verts0Ptr guard gets if-converted to a select downstream (identical
+    // compiled-shader cache hash for ?: and if/else forms), so the guarded
+    // load executes on BOTH paths and a null verts0Ptr segfaults the host.
+    // Both arms are therefore made dereferenceable: the synthetic path loads
+    // from verts1Ptr (always a valid cooked cloud with >= 4 verts; i < 2
+    // there) and discards the value, and the synth-array index is clamped so
+    // the convex path (i up to nbVertices0-1 > 1) cannot read verts0Synth
+    // out of bounds.
+    const uint64_t srcA = (verts0Ptr != 0) ? verts0Ptr : verts1Ptr;
     for (uint i = 0u; i < s.nbVertices0; ++i)
     {
-        const float3 raw = (verts0Ptr != 0) ? (Ptr<float4>(verts0Ptr))[i].xyz : verts0Synth[i].xyz;
+        float3 raw = verts0Synth[i & 1u].xyz;
+        if (verts0Ptr != 0)
+            raw = (Ptr<float4>(srcA))[i].xyz;
         s.vA[i] = float4(npAbiQuatRotate(s.aToBq, vertex2Shape(raw, s.scale0, s.rot0)) + s.aToBp, 0.0f);
     }
     for (uint i = 0u; i < s.nbVertices1; ++i)
@@ -883,17 +903,13 @@ uint generatedFaceContacts(inout CollideScratch s)
 }
 
 // ---------------------------------------------------------------------------
-// getPolygonIndexFromLocalWitness (npCvxEEDriver.slang L136-201, T138),
-// planes from the blob over convexPtr1.
+// getPolygonIndexFromLocalWitness (npCvxEEDriver.slang L136-201, T138 /
+// cu L611-698), planes read from either cooked-hull blob — the convex arm
+// calls it on BOTH hulls (cu L892-909), the EE fallback on hull 1 only.
 // ---------------------------------------------------------------------------
-uint getPolygonIndexBlob(inout CollideScratch s, uint pOff,
-                         float3 witnessPt, float3 n, float radius, float toleranceLength)
+uint getPolygonIndexBlob(uint64_t baseBlob, uint nbPolygons, float3 scale, float4 rot,
+                         uint pOff, float3 witnessPt, float3 n, float radius, float toleranceLength)
 {
-    const uint64_t baseBlob = s.convexPtr1;
-    const uint nbPolygons = s.nbPolygons1;
-    const float3 scale = s.scale1;
-    const float4 rot = s.rot1;
-
     const float margin = radius * 0.01f;
     const float lowerEps = toleranceLength * PCM_LOWER_EPS;
     const float upperEps = toleranceLength * PCM_UPPER_EPS;
@@ -1014,7 +1030,8 @@ uint generatedContactsEEContacts(inout CollideScratch s, uint numContactsIn)
     const uint dOff = polyDescByteOff(s.nbVertices1, s.nbPolygons1);
     const uint vdOff = vertexDataByteOff(s.nbVertices1, s.nbPolygons1, s.nbEdges1);
 
-    const uint bestPlaneBIdx = getPolygonIndexBlob(s, pOff, s.gjkOutput.closestPointB, normal,
+    const uint bestPlaneBIdx = getPolygonIndexBlob(s.convexPtr1, s.nbPolygons1, s.scale1, s.rot1,
+                                                   pOff, s.gjkOutput.closestPointB, normal,
                                                    s.inSphereRadius1, s.toleranceLength);
     const uint polyDesc = blobLoadU32(s.convexPtr1, dOff + 4u * bestPlaneBIdx);
     const uint nbVerts = getNbVertsW(polyDesc);
@@ -1074,10 +1091,513 @@ uint generatedContactsEEContacts(inout CollideScratch s, uint numContactsIn)
 }
 
 // ---------------------------------------------------------------------------
-// collide (cu L1275-1465), SPHERE + CAPSULE type0 arms only (the convex-hull
-// arm is deferred; the stage2 caller gates on type0).  verts0Ptr == 0 selects
-// the synthetic verts0Synth vertices; ws13/14/15 are manifold moreData words
-// 13-15 (nbWarmStartPoints / warmStartA / warmStartB) read by the caller.
+// The convex-hull arm: generateConvexContacts (cu L823-1022) and its callees,
+// transcribed from the verified standalone tranches (see the header list).
+// ---------------------------------------------------------------------------
+
+// argmin/argmax over masked lanes, lowest-lane tie-break — the serialized
+// minIndex/maxIndex warp butterflies (npCvxAddManifold.slang L49-62 for the
+// 5-entry form, npCvxReduceManifold.slang L73-99 for the 32-entry form).
+uint minIndex5(float v[5], uint mask)
+{
+    float mn = PXG_MAX_F32;
+    for (uint L = 0u; L < 5u; ++L) if ((mask & (1u << L)) != 0u) mn = min(mn, v[L]);
+    for (uint L = 0u; L < 5u; ++L) if (((mask & (1u << L)) != 0u) && v[L] == mn) return L;
+    return 0u;
+}
+uint maxIndex5(float v[5], uint mask)
+{
+    float mx = -PXG_MAX_F32;
+    for (uint L = 0u; L < 5u; ++L) if ((mask & (1u << L)) != 0u) mx = max(mx, v[L]);
+    for (uint L = 0u; L < 5u; ++L) if (((mask & (1u << L)) != 0u) && v[L] == mx) return L;
+    return 0u;
+}
+uint minIndexW(float v[32], uint mask)
+{
+    float mn = PXG_MAX_F32;
+    for (uint L = 0u; L < 32u; ++L) if ((mask & (1u << L)) != 0u) mn = min(mn, v[L]);
+    for (uint L = 0u; L < 32u; ++L) if (((mask & (1u << L)) != 0u) && v[L] == mn) return L;
+    return 0u;
+}
+uint maxIndexW(float v[32], uint mask)
+{
+    float mx = -PXG_MAX_F32;
+    for (uint L = 0u; L < 32u; ++L) if ((mask & (1u << L)) != 0u) mx = max(mx, v[L]);
+    for (uint L = 0u; L < 32u; ++L) if (((mask & (1u << L)) != 0u) && v[L] == mx) return L;
+    return 0u;
+}
+
+// calculateLocalNormal (cu L510-545 / npCvxLocalNormal.slang T139): the
+// width-4 shuffle tree fixes the summation association to (n0+n1)+(n2+n3);
+// out-of-range slots contribute zero.  Only called with numContacts in 1..4.
+float3 calculateLocalNormalM(inout CollideScratch s, uint numContacts)
+{
+    Ptr<float4> mNp = Ptr<float4>(s.manifoldBase);
+    const float3 n0 = (0u < numContacts) ? mNp[0].xyz : float3(0.0f, 0.0f, 0.0f);
+    const float3 n1 = (1u < numContacts) ? mNp[1].xyz : float3(0.0f, 0.0f, 0.0f);
+    const float3 n2 = (2u < numContacts) ? mNp[2].xyz : float3(0.0f, 0.0f, 0.0f);
+    const float3 n3 = (3u < numContacts) ? mNp[3].xyz : float3(0.0f, 0.0f, 0.0f);
+    return getNormalized((n0 + n1) + (n2 + n3));
+}
+
+// addManifoldPoint (cu L552-602 / npCvxAddManifold.slang T140), operating
+// straight on the manifold Ptr<float4> views:
+//   - existing points within replaceBreakingThreshold (A or B endpoint) flag
+//     a match; any match, or a non-full manifold, replaces the lowest
+//     matching slot (or appends);
+//   - full + matchless: schlock::reduce<false,false,4> over the 5 candidates
+//     (existing points in lanes 0..3, the new one in lane 4, reduced over the
+//     B endpoints with PER-LANE normals) + writeContacts compaction.
+void addManifoldPointM(inout CollideScratch s, float3 localPointA, float3 localPointB,
+                       float3 normal, float sep, inout uint numContacts)
+{
+    Ptr<float4> mNp = Ptr<float4>(s.manifoldBase);
+    Ptr<float4> mA = Ptr<float4>(s.manifoldBase + 64u);
+    Ptr<float4> mB = Ptr<float4>(s.manifoldBase + 128u);
+
+    const float sqRbt = s.replaceBreakingThreshold * s.replaceBreakingThreshold;
+    uint matches = 0u;
+    for (uint j = 0u; j < numContacts; ++j)
+    {
+        const float3 db = mB[j].xyz - localPointB;
+        const float3 da = mA[j].xyz - localPointA;
+        const bool bMatch = dot3(db, db) < sqRbt;
+        const bool aMatch = dot3(da, da) < sqRbt;
+        if (aMatch || bMatch) matches |= (1u << j);
+    }
+
+    if (matches != 0u || numContacts < 4u)
+    {
+        uint index;
+        if (matches != 0u) { index = firstbitlow(matches); }
+        else { index = numContacts; numContacts = numContacts + 1u; }
+        mNp[index] = float4(normal, sep);
+        mA[index] = float4(localPointA, 0.0f);
+        mB[index] = float4(localPointB, 0.0f);
+        return;
+    }
+
+    // full + matchless: reduce the 5 candidates, keep the best 4 (cu L588-601)
+    float3 cA[5], cB[5], cN[5];
+    float cS[5];
+    for (uint j = 0u; j < 4u; ++j)
+    {
+        cA[j] = mA[j].xyz; cB[j] = mB[j].xyz;
+        const float4 np = mNp[j];
+        cN[j] = np.xyz; cS[j] = np.w;
+    }
+    cA[4] = localPointA; cB[4] = localPointB; cN[4] = normal; cS[4] = sep;
+
+    const uint allMask = 0x1fu; // (1 << 5) - 1
+
+    const uint i0 = minIndex5(cS, allMask);          // deepest
+    uint mask = (1u << i0);
+
+    float d1[5];
+    for (uint L = 0u; L < 5u; ++L) { const float3 df = cB[i0] - cB[L]; d1[L] = dot3(df, df); }
+    const uint i1 = maxIndex5(d1, allMask & ~mask);  // furthest from i0
+    mask |= (1u << i1);
+
+    float d[5];
+    for (uint L = 0u; L < 5u; ++L)
+    {
+        const float3 dir = crossX(cN[L], cB[i1] - cB[i0]); // per-lane normal
+        d[L] = dot3(dir, cB[L] - cB[i0]);
+    }
+    const uint f = maxIndex5(d, allMask & ~mask);
+    mask |= (1u << f);
+    uint g = minIndex5(d, allMask & ~mask);
+    if (d[f] * d[g] > 0.0f)
+        g = maxIndex5(d, allMask & ~mask);
+    mask |= (1u << g);
+
+    // writeContacts (cu L71-84): warpScanExclusive compaction into slots 0..3
+    for (uint L = 0u; L < 5u; ++L)
+    {
+        if ((mask & (1u << L)) != 0u)
+        {
+            const uint idx = countbits(mask & ((1u << L) - 1u));
+            mNp[idx] = float4(cN[L], cS[L]);
+            mA[idx] = float4(cA[L], 0.0f);
+            mB[idx] = float4(cB[L], 0.0f);
+        }
+    }
+    numContacts = countbits(mask); // 4
+}
+
+// convex-convex polyClip (cu L113-214 / npCvxPolyClip.slang T145): warp-SIMD
+// one-lane-per-vertex clipper, serialized over per-lane arrays with every
+// ballot / shfl_xor / shuffle reduction replicated bit-for-bit.  Contacts
+// accumulate into ctsPos/ctsSep (the TemporaryContacts locals, NUM_TMP = 32);
+// addContacts (cu L93-109) is the fmask/scan pattern at the three emit sites.
+uint polyClipCvx(float4 plane0, float3 v0[32], uint nbV0,
+                 float4 plane1, float3 v1[32], uint nbV1,
+                 float3 axis, float contactDist,
+                 inout float3 ctsPos[32], inout float ctsSep[32])
+{
+    const float3 p0n = plane0.xyz; const float p0d = plane0.w;
+    const float3 p1n = plane1.xyz; const float p1d = plane1.w;
+
+    for (uint i = 0u; i < 32u; ++i) { ctsPos[i] = float3(0.0f, 0.0f, 0.0f); ctsSep[i] = 0.0f; }
+    uint nbContacts = 0u;
+
+    // s0, s1 (per lane): the plane projections onto the axis
+    const float p1DotAxis = dot3(p1n, axis);
+    float s0[32], s1[32];
+    for (uint L = 0u; L < 32u; ++L)
+    {
+        s0[L] = -(dot3(p1n, v0[L]) + p1d) / p1DotAxis;
+        s1[L] = dot3(p0n, v1[L]) + p0d;
+    }
+
+    // e0, e0planeN, e0planeD (per lane = poly0 edge L)
+    float3 e0[32], e0planeN[32]; float e0planeD[32];
+    for (uint L = 0u; L < 32u; ++L)
+    {
+        const uint nxt = (L + 1u == nbV0) ? 0u : ((L + 1u) & 31u);
+        e0[L] = v0[nxt] - v0[L];
+        e0planeN[L] = crossX(e0[L], axis);
+        e0planeD[L] = dot3(e0planeN[L], v0[L]);
+    }
+
+    // poly1 points vs poly0 edge-planes -> in1/out1
+    uint in1[32], out1[32];
+    for (uint L = 0u; L < 32u; ++L)
+    {
+        uint i1m = 0u, o1m = 0u;
+        for (uint j = 0u; j < nbV1; ++j)
+        {
+            const float dd = dot3(v1[j], e0planeN[L]);
+            const float tt = dd - e0planeD[L];
+            const uint bj = (1u << j);
+            if (tt < 0.0f) i1m |= bj;
+            if (tt > 0.0f) o1m |= bj;
+        }
+        in1[L] = i1m; out1[L] = o1m;
+    }
+    for (uint L = 0u; L < 32u; ++L) if (L >= nbV0) { in1[L] = 0u; out1[L] = 0u; }
+
+    // b = AND over all lanes of (~out1) (the shfl_xor butterfly)
+    uint b = 0xffffffffu;
+    for (uint L = 0u; L < 32u; ++L) b &= ~out1[L];
+
+    // emit poly1 points inside poly0
+    {
+        const uint mask = b & ((nbV1 >= 32u) ? 0xffffffffu : ((1u << nbV1) - 1u));
+        uint fmask = 0u;
+        for (uint L = 0u; L < 32u; ++L) if ((mask & (1u << L)) != 0u && s1[L] < contactDist) fmask |= (1u << L);
+        for (uint L = 0u; L < 32u; ++L)
+            if ((fmask & (1u << L)) != 0u)
+            {
+                const uint idx = countbits(fmask & ((1u << L) - 1u)) + nbContacts;
+                if (idx < 32u) { ctsPos[idx] = v1[L] - s1[L] * axis; ctsSep[idx] = s1[L]; }
+            }
+        nbContacts += countbits(fmask);
+    }
+
+    // all poly1 points inside poly0, so done
+    uint anyOut1 = 0u;
+    for (uint L = 0u; L < 32u; ++L) anyOut1 |= out1[L];
+    if (anyOut1 == 0u)
+        return nbContacts;
+
+    // save poly1's edge crosses
+    uint e1cross[32];
+    for (uint L = 0u; L < 32u; ++L)
+    {
+        const uint i1m = in1[L] | (in1[L] << nbV1);
+        const uint o1m = out1[L] | (out1[L] << nbV1);
+        e1cross[L] = (i1m & (o1m >> 1)) | ((i1m >> 1) & o1m);
+    }
+
+    // e1, e1planeN, e1planeD (poly1 edge L)
+    float3 e1[32], e1planeN[32]; float e1planeD[32];
+    for (uint L = 0u; L < 32u; ++L)
+    {
+        const uint nxt = (L + 1u == nbV1) ? 0u : ((L + 1u) & 31u);
+        e1[L] = v1[nxt] - v1[L];
+        e1planeN[L] = crossX(axis, e1[L]);
+        e1planeD[L] = dot3(e1planeN[L], v1[L]);
+    }
+
+    // poly0 points vs poly1 edge-planes -> in0/out0 (ballot per j)
+    uint in0[32], out0[32];
+    for (uint L = 0u; L < 32u; ++L) { in0[L] = 0u; out0[L] = 0u; }
+    for (uint j = 0u; j < nbV0; ++j)
+    {
+        uint inMask = 0u, outMask = 0u;
+        for (uint L = 0u; L < 32u; ++L)
+        {
+            const float tt = dot3(v0[j], e1planeN[L]) - e1planeD[L];
+            if (tt < 0.0f) inMask |= (1u << L);
+            if (tt > 0.0f) outMask |= (1u << L);
+        }
+        in0[j] = inMask; out0[j] = outMask;
+    }
+
+    const uint mask1 = (nbV1 >= 32u) ? 0xffffffffu : ((1u << nbV1) - 1u);
+    for (uint L = 0u; L < 32u; ++L) { in0[L] &= mask1; out0[L] &= mask1; }
+
+    // emit poly0 points inside poly1
+    {
+        uint ballotNotOut0 = 0u;
+        for (uint L = 0u; L < 32u; ++L) if (out0[L] == 0u) ballotNotOut0 |= (1u << L);
+        const uint mask = ballotNotOut0 & ((nbV0 >= 32u) ? 0xffffffffu : ((1u << nbV0) - 1u));
+        uint fmask = 0u;
+        for (uint L = 0u; L < 32u; ++L) if ((mask & (1u << L)) != 0u && s0[L] < contactDist) fmask |= (1u << L);
+        for (uint L = 0u; L < 32u; ++L)
+            if ((fmask & (1u << L)) != 0u)
+            {
+                const uint idx = countbits(fmask & ((1u << L) - 1u)) + nbContacts;
+                if (idx < 32u) { ctsPos[idx] = v0[L]; ctsSep[idx] = s0[L]; }
+            }
+        nbContacts += countbits(fmask);
+    }
+
+    // all poly0 points inside poly1, so done
+    uint anyOut0 = 0u;
+    for (uint L = 0u; L < 32u; ++L) anyOut0 |= out0[L];
+    if (anyOut0 == 0u)
+        return nbContacts;
+
+    // poly0's edge crosses
+    uint e0cross[32]; float s0d[32];
+    for (uint L = 0u; L < 32u; ++L)
+    {
+        const uint nxt = (L + 1u == nbV0) ? 0u : ((L + 1u) & 31u);
+        const uint in0p = in0[nxt], out0p = out0[nxt];
+        e0cross[L] = (in0[L] & out0p) | (in0p & out0[L]);
+        s0d[L] = s0[nxt] - s0[L];
+    }
+
+    // c = e0cross & e1cross ; a = OR over lanes of c
+    uint c[32]; uint a = 0u;
+    for (uint L = 0u; L < 32u; ++L) { c[L] = e0cross[L] & e1cross[L]; a |= c[L]; }
+
+    // edge-edge crossing loop; mDote0 == 0 -> sep = PX_MAX_F32 (discarded by
+    // the addContacts sep < contactDist filter)
+    for (; a != 0u; a &= (a - 1u))
+    {
+        const uint index = firstbitlow(a);
+        const float3 m = e1planeN[index];
+        const uint lsb = a & (uint)(-(int)a); // lowest set bit value
+        float3 pt[32]; float sepA[32];
+        for (uint L = 0u; L < 32u; ++L)
+        {
+            const float mDote0 = dot3(m, e0[L]);
+            const float lambda = -(dot3(m, v0[L]) - e1planeD[index]) / mDote0;
+            pt[L] = v0[L] + lambda * e0[L];
+            sepA[L] = (mDote0 != 0.0f) ? (s0[L] + lambda * s0d[L]) : PXG_MAX_F32;
+        }
+        uint flags = 0u;
+        for (uint L = 0u; L < 32u; ++L) if ((c[L] & lsb) != 0u) flags |= (1u << L);
+        uint fmask = 0u;
+        for (uint L = 0u; L < 32u; ++L) if ((flags & (1u << L)) != 0u && sepA[L] < contactDist) fmask |= (1u << L);
+        for (uint L = 0u; L < 32u; ++L)
+            if ((fmask & (1u << L)) != 0u)
+            {
+                const uint idx = countbits(fmask & ((1u << L) - 1u)) + nbContacts;
+                if (idx < 32u) { ctsPos[idx] = pt[L]; ctsSep[idx] = sepA[L]; }
+            }
+        nbContacts += countbits(fmask);
+    }
+
+    return nbContacts;
+}
+
+// The polyClip contact-emission tail (cu L960-1015, both branches unified /
+// npCvxClipEmit.slang T146): reduce to <=4 when nbContacts > 4
+// (schlock::reduce<false,false,4> with the UNIFORM clip normal), derive the
+// paired point otherPt = clipPt + clipN*sep, and compact into the manifold
+// via writeContacts:
+//   refIsReference:  A = aToB.transformInv(otherPt), B = clipPt, n =  clipN
+//   else:            A = aToB.transformInv(clipPt), B = otherPt, n = -clipN
+// Returns popcount(mask) (<= 4), the new numManifoldContacts.
+// nbContacts >= 32 clamps allMask to full rather than replicating CUDA's
+// (1<<32)-1 shift-by-width UB (npCvxClipEmit.slang L109-113 note; the
+// boundary is unreachable — NUM_TMP caps slot writes and the manifold write
+// below is idx-guarded like the .cu's popc(mask) <= 4 assert).
+uint emitClipContacts(inout CollideScratch s, uint nbContacts,
+                      float3 pt[32], float sep[32], float3 clipN, bool refIsReference)
+{
+    Ptr<float4> mNp = Ptr<float4>(s.manifoldBase);
+    Ptr<float4> mA = Ptr<float4>(s.manifoldBase + 64u);
+    Ptr<float4> mB = Ptr<float4>(s.manifoldBase + 128u);
+
+    const uint allMask = (nbContacts >= 32u) ? 0xffffffffu : ((1u << nbContacts) - 1u);
+
+    uint mask;
+    if (nbContacts > 4u)
+    {
+        const uint i0 = minIndexW(sep, allMask);
+        mask = (1u << i0);
+        float d1[32];
+        for (uint L = 0u; L < 32u; ++L) { const float3 df = pt[i0] - pt[L]; d1[L] = dot3(df, df); }
+        const uint i1 = maxIndexW(d1, allMask & ~mask);
+        mask |= (1u << i1);
+        const float3 dir = crossX(clipN, pt[i1] - pt[i0]); // per-lane normal is uniform (clipN)
+        float d[32];
+        for (uint L = 0u; L < 32u; ++L) d[L] = dot3(dir, pt[L] - pt[i0]);
+        const uint f = maxIndexW(d, allMask & ~mask);
+        mask |= (1u << f);
+        uint g = minIndexW(d, allMask & ~mask);
+        if (d[f] * d[g] > 0.0f) g = maxIndexW(d, allMask & ~mask);
+        mask |= (1u << g);
+    }
+    else
+    {
+        mask = allMask;
+    }
+
+    // writeContacts (cu L71-84)
+    for (uint L = 0u; L < 32u; ++L)
+    {
+        if ((mask & (1u << L)) != 0u)
+        {
+            const uint idx = countbits(mask & ((1u << L) - 1u));
+            if (idx < 4u)
+            {
+                const float3 clipPt = pt[L];
+                const float sepL = sep[L];
+                const float3 otherPt = clipPt + clipN * sepL;
+                float3 pa, pb, nrm;
+                if (refIsReference) { pa = otherPt; pb = clipPt; nrm = clipN; }
+                else                { pa = clipPt; pb = otherPt; nrm = -clipN; }
+                mNp[idx] = float4(nrm, sepL);
+                mA[idx] = float4(transformInvPoint(s.aToBq, s.aToBp, pa), 0.0f);
+                mB[idx] = float4(pb, 0.0f);
+            }
+        }
+    }
+    return countbits(mask);
+}
+
+// generateConvexContacts (cu L823-1022): the PCM convex-convex contact path.
+// The .cu takes persistentContactManifoldMoreDataW by reference but never
+// reads or writes it in the body — no re-pack mirroring is needed here.
+// The .cu's bool return is unconditionally true and its caller (cu L1460)
+// discards it, so this is void; numManifoldContacts is the inout dataflow.
+void generateConvexContacts(inout CollideScratch s, inout uint numManifoldContacts)
+{
+    const float3 normal = s.gjkOutput.direction;
+
+    // the four blob section offsets per hull (cu L829-854)
+    const uint pOff0 = planesByteOff(s.nbVertices0);
+    const uint dOff0 = polyDescByteOff(s.nbVertices0, s.nbPolygons0);
+    const uint vdOff0 = vertexDataByteOff(s.nbVertices0, s.nbPolygons0, s.nbEdges0);
+    const uint pOff1 = planesByteOff(s.nbVertices1);
+    const uint dOff1 = polyDescByteOff(s.nbVertices1, s.nbPolygons1);
+    const uint vdOff1 = vertexDataByteOff(s.nbVertices1, s.nbPolygons1, s.nbEdges1);
+
+    const float3 witnessA = s.gjkOutput.closestPointA;
+    const float3 witnessB = s.gjkOutput.closestPointB;
+
+    // calculateLocalNormal BEFORE the witness add, on the refreshed count
+    // (cu L863-866); stays (0,0,0) when the manifold is empty.
+    float3 localNor = float3(0.0f, 0.0f, 0.0f);
+    if (numManifoldContacts != 0u)
+        localNor = calculateLocalNormalM(s, numManifoldContacts);
+
+    // add the GJK/EPA witness to the manifold first (cu L872-880)
+    addManifoldPointM(s,
+                      transformInvPoint(s.aToBq, s.aToBp, witnessA), witnessB,
+                      -normal, dot3(witnessB - witnessA, normal),
+                      numManifoldContacts);
+
+    // full contact-gen decision (cu L887, the ACTIVE line: post-add count < 4;
+    // the initialNbContacts variant is the commented-out cu L886)
+    const bool fullContactGen = (0.707106781f > dot3(localNor, -normal)) || (numManifoldContacts < 4u);
+    if (!fullContactGen)
+        return;
+
+    // reference-face selection on both hulls (cu L891-909; npCvxRefFrame T144)
+    const float3 normalIn0 = npAbiQuatRotateInv(s.aToBq, -normal);
+    const uint bestPlaneAIdx = getPolygonIndexBlob(s.convexPtr0, s.nbPolygons0, s.scale0, s.rot0,
+                                                   pOff0,
+                                                   transformInvPoint(s.aToBq, s.aToBp, s.gjkOutput.closestPointA),
+                                                   normalIn0, s.inSphereRadius0, s.toleranceLength);
+    const uint bestPlaneBIdx = getPolygonIndexBlob(s.convexPtr1, s.nbPolygons1, s.scale1, s.rot1,
+                                                   pOff1, s.gjkOutput.closestPointB,
+                                                   normal, s.inSphereRadius1, s.toleranceLength);
+
+    // reference plane (hull B shape space) + PxPlane::normalize (cu L911-915)
+    const float4 refPl = blobLoadFloat4(s.convexPtr1, pOff1 + 16u * bestPlaneBIdx);
+    float3 refN = shape2Vertex(float3(refPl.x, refPl.y, refPl.z), s.scale1, s.rot1);
+    float refD = refPl.w;
+    { const float denom = 1.0f / mag3(refN); refN = refN * denom; refD = refD * denom; }
+
+    // incident plane (hull A shape space) + normalize (cu L917-922)
+    const float4 incPl = blobLoadFloat4(s.convexPtr0, pOff0 + 16u * bestPlaneAIdx);
+    float3 incN = shape2Vertex(float3(incPl.x, incPl.y, incPl.z), s.scale0, s.rot0);
+    float incD = incPl.w;
+    { const float denom = 1.0f / mag3(incN); incN = incN * denom; incD = incD * denom; }
+
+    // projections onto the GJK normal — incident BEFORE the transform (cu L924-925)
+    const float referenceProject = abs(dot3(refN, normal));
+    const float incidentProject = abs(dot3(incN, normalIn0));
+
+    const uint polyDesc0 = blobLoadU32(s.convexPtr0, dOff0 + 4u * bestPlaneAIdx);
+    const uint polyDesc1 = blobLoadU32(s.convexPtr1, dOff1 + 4u * bestPlaneBIdx);
+
+    // incident plane -> B space: PxPlane::transform(aToB) + normalize (cu L931-933)
+    float3 incNt = npAbiQuatRotate(s.aToBq, incN);
+    float incDt = incD - dot3(s.aToBp, incNt);
+    { const float denom = 1.0f / mag3(incNt); incNt = incNt * denom; incDt = incDt * denom; }
+
+    const float orthoEps = 1e-6f;
+    if (!(abs(dot3(normal, refN)) >= orthoEps && abs(dot3(normal, incNt)) >= orthoEps))
+        return;
+
+    // per-lane polygon vertices from the prepared clouds (cu L940-946);
+    // lanes >= nbVerts are zero-filled for determinism (uninitialized
+    // registers in the .cu; never selected by the masked reductions)
+    const uint nbVerts0p = getNbVertsW(polyDesc0);
+    const uint nbVerts1p = getNbVertsW(polyDesc1);
+    const uint vref0 = getVRef8W(polyDesc0);
+    const uint vref1 = getVRef8W(polyDesc1);
+    float3 verts0[32], verts1[32];
+    for (uint lane = 0u; lane < 32u; ++lane)
+    {
+        // the guards may be if-converted to selects downstream (see the
+        // cvxPrepareVertices note), so the vertexData8 byte reads are
+        // CLAMPED to the polygon's last vertex slot — the speculated value
+        // for lanes >= nbVerts is discarded by the select, and the address
+        // never runs past the blob tail (nbVerts >= 3 for any polygon).
+        verts0[lane] = float3(0.0f, 0.0f, 0.0f);
+        verts1[lane] = float3(0.0f, 0.0f, 0.0f);
+        if (lane < nbVerts0p)
+            verts0[lane] = s.vA[blobLoadU8(s.convexPtr0, vdOff0 + vref0 + min(lane, nbVerts0p - 1u))].xyz;
+        if (lane < nbVerts1p)
+            verts1[lane] = s.vB[blobLoadU8(s.convexPtr1, vdOff1 + vref1 + min(lane, nbVerts1p - 1u))].xyz;
+    }
+
+    float3 ctsPos[32]; float ctsSep[32];
+    if (referenceProject > incidentProject)
+    {
+        // hull B's polygon is the reference face (cu L951-982)
+        const uint nbContacts = polyClipCvx(float4(refN, refD), verts1, nbVerts1p,
+                                            float4(incNt, incDt), verts0, nbVerts0p,
+                                            refN, s.contactDistance, ctsPos, ctsSep);
+        if (nbContacts != 0u)
+            numManifoldContacts = emitClipContacts(s, nbContacts, ctsPos, ctsSep, refN, true);
+    }
+    else
+    {
+        // hull A's transformed polygon is the reference face (cu L984-1016);
+        // both planes are in B space
+        const uint nbContacts = polyClipCvx(float4(incNt, incDt), verts0, nbVerts0p,
+                                            float4(refN, refD), verts1, nbVerts1p,
+                                            incNt, s.contactDistance, ctsPos, ctsSep);
+        if (nbContacts != 0u)
+            numManifoldContacts = emitClipContacts(s, nbContacts, ctsPos, ctsSep, incNt, false);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// collide (cu L1275-1465), all three type0 arms (SPHERE / CAPSULE / convex
+// hull).  verts0Ptr == 0 selects the synthetic verts0Synth vertices;
+// ws13/14/15 are manifold moreData words 13-15 (nbWarmStartPoints /
+// warmStartA / warmStartB) read by the caller.
 // ---------------------------------------------------------------------------
 public bool collide(inout CollideScratch s,
                     float4 verts0Synth[2], uint64_t verts0Ptr, uint64_t verts1Ptr,
@@ -1143,7 +1663,7 @@ public bool collide(inout CollideScratch s,
             separated = (epaResult2 == GJK_CLOSE);
         }
     }
-    // (separated is not consumed by the sphere/capsule arms — same as the .cu)
+    // (separated is not consumed by any dispatch arm — same as the .cu)
 
     // 10. type0 dispatch
     if (s.type0 == EGT_SPHERE)
@@ -1175,8 +1695,13 @@ public bool collide(inout CollideScratch s,
             numContacts = generatedContactsEEContacts(s, numContacts);
         numManifoldContacts = numContacts;
     }
-    // else: convex-hull generateConvexContacts (cu L1458-1462) — DEFERRED;
-    // unreachable behind the stage2 type gate.
+    else
+    {
+        // convex-hull arm (cu L1458-1462): generateConvexContacts; the .cu
+        // passes persistentContactManifoldMoreDataW but the callee never
+        // touches it, and its bool return is discarded.
+        generateConvexContacts(s, numManifoldContacts);
+    }
 
     return true;
 }

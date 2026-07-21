@@ -24,14 +24,16 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// P5 Step 5 tranche 8: the ASSEMBLED collide() (GJK + EPA + sphere/capsule
-// contact gen, npCvxCollide.slang) inside convexConvexNphase_stage2Kernel,
-// driven through PxgCudaShim on the ENGINE ABI (56-byte Stage2Params blob,
-// same launch pattern as testNpCvxStage2Setup.cpp) against a REAL cooked box
-// convex-hull blob (fixture shared with testConvexPlaneNphase.cpp).
+// P5 Step 5 tranches 8+11: the ASSEMBLED collide() (GJK + EPA + all three
+// type0 contact-gen arms, npCvxCollide.slang) inside
+// convexConvexNphase_stage2Kernel, driven through PxgCudaShim on the ENGINE
+// ABI (56-byte Stage2Params blob, same launch pattern as
+// testNpCvxStage2Setup.cpp) against REAL cooked box convex-hull blobs
+// (fixture shared with testConvexPlaneNphase.cpp).
 //
 // VERIFICATION LEVEL: geometric integration.  The sub-pieces (gjkWarm /
-// epaCore / face / EE) are bit-verified by their standalone tranches; here
+// epaCore / face / EE / localNormal / addManifold / refFrame / polyClip /
+// reduce / clipEmit) are bit-verified by their standalone tranches; here
 // the ASSEMBLY is checked against CPU expectations derived from
 // cudaGJKEPA.cu for axis-aligned capsule/sphere-on-box configurations:
 //   1. capsule lying on the box top, surface touching -> 2 face contacts,
@@ -52,7 +54,27 @@
 //   6. sphere type0 -> exactly 1 contact, contactA = 0 (sphere centre),
 //      normal = -gjkOutput.direction;
 //   7. mutation canary: flipping the hull's top-face plane must break the
-//      touch expectations (proves the kernel reads the blob planes).
+//      touch expectations (proves the kernel reads the blob planes);
+// and (tranche 11) for convex-hull-vs-box pairs through the
+// generateConvexContacts arm (cu L823-1022) — shape0 = a cooked cube hull
+// with type eCONVEXMESH (5, PxGeometry.h L55), shape1 = the big box hull
+// with type eBOX (3); type1 < type0 flips the pair (stage2Body), so
+// post-flip hull A = the box at the origin, hull B = the cube at pos0,
+// aToBp = -pos0, and the manifold normal is -Y in B-local:
+//   8. near/touching face-face (gap +0.05 < contactDist, GJK eCLOSE) and
+//      barely/deep overlap (EPA) -> polyClip clips B's bottom face against
+//      A's top face; B's 4 verts land inside A's face -> the first
+//      addContacts emits exactly 4 (cu L153), no reduce; contacts at the
+//      cube's bottom corners, np = (0,-1,0, gap);
+//   9. distant -> eDISTANT invalidate writeback, slots untouched;
+//  10. cube rotated 45 deg about Y over an equal box -> both faces clip to
+//      8 edge-edge crossings (cu L197-211) -> reduce<false,false,4>
+//      (cu L971/L1005) down to 4 octagon vertices;
+//  11. preloaded 4-contact manifold + aligned localNor -> fullContactGen
+//      false (cu L887): witness REPLACE (within replaceBreakingThreshold,
+//      cu L574-586) and full+matchless 5-candidate reduce-drop (cu L588-601)
+//      leave the preloaded manifold intact — no clip regen;
+//  12. mutation canary on hull A's top plane.
 // Also asserted every run: quatB words 9-11 rewritten byte-identically,
 // relativePos/quatA untouched, and warm-start words 13-15 READ but NEVER
 // stored back (sentinel patterns survive).
@@ -102,13 +124,22 @@ struct V3 { float x, y, z; };
 // offsets relative to convexPtrB = hullPtr + 16.  Mesh scale identity so
 // vertex2Shape(v) == v.
 // ---------------------------------------------------------------------------
+// Face windings are COUNTER-clockwise seen from outside (Newell normal ==
+// the outward plane normal), matching real cooked hulls (the cooking
+// unify-normals pass, GuCookingConvexPolygonsBuilder.cpp L1109-1160, flips
+// polygon windings until computeNewellPlane agrees with the outward
+// triangle normals).  polyClip's edge planes (e0planeN = e0 x axis,
+// cudaGJKEPA.cu L133) assume this orientation, so the winding is
+// load-bearing for the tranche-11 convex-hull fixtures.  (Tranche 8's
+// windings were reversed; only the winding-insensitive EE path consumed
+// them.)
 static const int kBoxFaceVtx[6][4] = {
-    { 4, 5, 7, 6 }, // +x
-    { 0, 2, 3, 1 }, // -x
-    { 2, 6, 7, 3 }, // +y
-    { 0, 1, 5, 4 }, // -y
-    { 1, 3, 7, 5 }, // +z
-    { 0, 4, 6, 2 }, // -z
+    { 6, 7, 5, 4 }, // +x
+    { 1, 3, 2, 0 }, // -x
+    { 3, 7, 6, 2 }, // +y
+    { 4, 5, 1, 0 }, // -y
+    { 5, 7, 3, 1 }, // +z
+    { 2, 6, 4, 0 }, // -z
 };
 static const float kBoxFaceN[6][3] = {
     { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 },
@@ -180,16 +211,26 @@ struct Stage2Blob
 };
 static_assert(sizeof(Stage2Blob) == 56, "stage2 engine blob is 56 bytes");
 
-// One capsule/sphere-on-box scene, both bodies axis-aligned (identity quats).
+struct ExpContact { V3 a, b, n; float pen; };
+
+// One shape0-on-box scene.  Shape 1 is always the cooked box hull (type
+// eBOX = 3) at the origin; shape 0 is a sphere/capsule (tranche 8) or a
+// second cooked hull with type eCONVEXMESH = 5 (tranche 11; the flip in
+// stage2Body then makes the BOX hull A and the cube hull B).
 struct Scene
 {
-    uint32_t type0;      // 0 = sphere, 2 = capsule
-    V3 scale0;           // capsule: (halfHeight, radius, radius); sphere: (r, r, r)
+    uint32_t type0;      // 0 = sphere, 2 = capsule, 5 = convex-mesh hull
+    V3 scale0;           // capsule: (halfHeight, radius, radius); sphere: (r, r, r); hull: mesh scale
     V3 pos0;             // shape 0 world position (box is at the origin)
-    V3 boxHalf;          // hull half-extents
+    V3 boxHalf;          // shape1 hull half-extents
     float cdPerShape;    // per-shape contact distance (cd0 == cd1)
     uint32_t countsWord; // stage-1 counts word preloaded in the manifold
-    bool flipTopPlane;   // mutation canary: negate the +y hull plane
+    bool flipTopPlane;   // mutation canary: negate the +y plane of shape1's hull
+    // tranche-11 extensions (defaulted so tranche-8 braced inits stand)
+    V3 h0 = {};                              // type0 == 5: shape0 hull half-extents
+    float q0x = 0, q0y = 0, q0z = 0, q0w = 1; // shape0 world orientation
+    uint32_t preloadCount = 0;               // manifold slots preloaded before launch
+    ExpContact pre[4] = {};                  // (countsWord low byte must match)
 };
 
 struct RunResult
@@ -217,13 +258,17 @@ static bool runScene(const Scene& sc, RunResult& out)
         n[0] = -n[0]; n[1] = -n[1]; n[2] = -n[2]; n[3] = -n[3];
         std::memcpy(&blob[planesBase], n, 16);
     }
+    const bool cvx0 = (sc.type0 == 5u); // shape0 is a second cooked hull
+    std::vector<uint8_t> blob0;
+    if (cvx0)
+        blob0 = buildBoxHull(sc.h0);
 
     HInput in = { 0, 1, 0, 1 };
     std::vector<HShape> shapes(2);
     shapes[0] = { sc.scale0.x, sc.scale0.y, sc.scale0.z, 0, 0, 0, 1, 3u, 0u, sc.type0, 0u };
     shapes[1] = { 1, 1, 1, 0, 0, 0, 1, 5u, 0u, 3u /*eBOX*/, 0u }; // hullPtr filled below
     std::vector<HCachedTransform> xf(2);
-    xf[0] = { 0, 0, 0, 1, sc.pos0.x, sc.pos0.y, sc.pos0.z, 0u };
+    xf[0] = { sc.q0x, sc.q0y, sc.q0z, sc.q0w, sc.pos0.x, sc.pos0.y, sc.pos0.z, 0u };
     xf[1] = { 0, 0, 0, 1, 0, 0, 0, 0u };
     std::vector<float> cd = { sc.cdPerShape, sc.cdPerShape };
     uint32_t keep = 1u;
@@ -237,11 +282,27 @@ static bool runScene(const Scene& sc, RunResult& out)
     mf.nbWarmStart = 0u;          // ws13 = 0: seeds nothing, but words 14/15
     mf.warmA = 0xAABBCCDDu;       // must be READ-only (never stored back)
     mf.warmB = 0x11223344u;
+    for (uint32_t j = 0; j < sc.preloadCount && j < 4; ++j)
+    {
+        // preloaded persistent-manifold points (the stage-1 refreshed state)
+        mf.lNp[j][0] = sc.pre[j].n.x; mf.lNp[j][1] = sc.pre[j].n.y;
+        mf.lNp[j][2] = sc.pre[j].n.z; mf.lNp[j][3] = sc.pre[j].pen;
+        mf.lA[j][0] = sc.pre[j].a.x; mf.lA[j][1] = sc.pre[j].a.y;
+        mf.lA[j][2] = sc.pre[j].a.z; mf.lA[j][3] = 0.0f;
+        mf.lB[j][0] = sc.pre[j].b.x; mf.lB[j][1] = sc.pre[j].b.y;
+        mf.lB[j][2] = sc.pre[j].b.z; mf.lB[j][3] = 0.0f;
+    }
 
-    PxgDevicePtr dBlob = 0, dIn = 0, dShapes = 0, dXf = 0, dCd = 0, dKeep = 0, dMf = 0;
+    PxgDevicePtr dBlob = 0, dBlob0 = 0, dIn = 0, dShapes = 0, dXf = 0, dCd = 0, dKeep = 0, dMf = 0;
     shim.memAlloc(&dBlob, blob.size());
     if (!dBlob) { std::printf("  NOTE: no BDA -> skip\n"); return false; }
     shapes[1].hullPtr = uint64_t(dBlob);
+    if (cvx0)
+    {
+        shim.memAlloc(&dBlob0, blob0.size());
+        shapes[0].hullPtr = uint64_t(dBlob0);
+        shim.memcpyHtoD(dBlob0, blob0.data(), blob0.size());
+    }
     shim.memAlloc(&dIn, sizeof(HInput));
     shim.memAlloc(&dShapes, shapes.size() * sizeof(HShape));
     shim.memAlloc(&dXf, xf.size() * sizeof(HCachedTransform));
@@ -275,6 +336,8 @@ static bool runScene(const Scene& sc, RunResult& out)
 
     for (PxgDevicePtr p : { dBlob, dIn, dShapes, dXf, dCd, dKeep, dMf })
         shim.memFree(p);
+    if (dBlob0)
+        shim.memFree(dBlob0);
     return true;
 }
 
@@ -293,8 +356,6 @@ static bool slotUntouched(const HManifold& m, uint32_t j)
         if (np[k] != 0xCD || a[k] != 0xCD || b[k] != 0xCD) return false;
     return true;
 }
-
-struct ExpContact { V3 a, b, n; float pen; };
 
 // Order-independent slot match of the first `count` manifold slots.
 static size_t matchContacts(const HManifold& m, const std::vector<ExpContact>& exp, bool quiet, const char* label)
@@ -455,6 +516,246 @@ PXG_TEST(cvxCollide_mutation)
     const size_t bad = checkScene(mut, 2u, exp, true, "mutation");
     PXG_CHECK_MSG(bad != 0, "mutation must FAIL the touch expectations");
     std::printf("  [mutation] flipped top plane breaks the expectations (%zu mismatches) ok\n", bad);
+}
+
+// ===========================================================================
+// Tranche 11: the convex-hull arm (generateConvexContacts, cu L823-1022).
+//
+// Geometry shared by fixtures 8-12: shape0 = cube hull (half h0 = 0.5,
+// type eCONVEXMESH = 5) at (0, y0, 0); shape1 = box hull (half (2, .5, 2)
+// unless noted, type eBOX = 3) at the origin.  type1 (3) < type0 (5) flips
+// the pair, so post-flip hull A = the BOX at the origin, hull B = the cube,
+// aToBp = (0, -y0, 0).  gap = (y0 - 0.5) - boxHalf.y.  contactDistance =
+// 0.05 + 0.05 + expandedMargin(0 for convex type0) = 0.1.
+//
+// Derivation of the face-face expectations (all axis-aligned fixtures):
+// GJK/EPA return direction = (0,1,0) (the min-separation/penetration axis;
+// side faces are >= 2 away).  bestPlaneAIdx = A's +y face and bestPlaneBIdx
+// = B's -y face (getPolygonIndexFromLocalWitness: min plane distance 0 at
+// the witness, projection tie-break onto -normal/normal picks the
+// anti-parallel face, cu L677-689).  referenceProject == incidentProject ==
+// |normal.y| exactly (rotation preserves y), so the strict > (cu L951) takes
+// the ELSE branch: referencePlane = A's +y face transformed to B space
+// (y = 0.5 - y0), axis = (0,1,0).  polyClip: B's 4 bottom verts all inside
+// A's face -> the FIRST addContacts (cu L153) emits pos = v1 - s1*axis with
+// s1 = plane0.distance(v1) = gap, then the !any(out1) early-out (cu L155).
+// 4 contacts -> no reduce; the emit tail (cu L994-1015) writes
+//   pa = clip pt (y_B = 0.5 - y0),  pb = pa + n*sep (y_B = -0.5),
+//   mA = aToB.transformInv(pa) = pa + (0, y0, 0) (y_A = +0.5),
+//   np = (-referencePlane.n, sep) = (0,-1,0, gap):
+// the cube's bottom corners, A-local on the box top, B-local on the cube
+// bottom.  word12 = 4 (touch).
+// ===========================================================================
+
+static Scene makeCvxScene(float y0, V3 boxHalf)
+{
+    Scene sc = { 5u, V3{ 1, 1, 1 }, V3{ 0, y0, 0 }, boxHalf, 0.05f, 0u, false };
+    sc.h0 = V3{ 0.5f, 0.5f, 0.5f };
+    return sc;
+}
+
+static std::vector<ExpContact> cvxCornerContacts(float sep)
+{
+    std::vector<ExpContact> v;
+    const float xs[4] = { -0.5f, -0.5f, 0.5f, 0.5f };
+    const float zs[4] = { -0.5f, 0.5f, -0.5f, 0.5f };
+    for (int k = 0; k < 4; ++k)
+        v.push_back({ V3{ xs[k], 0.5f, zs[k] }, V3{ xs[k], -0.5f, zs[k] }, V3{ 0, -1, 0 }, sep });
+    return v;
+}
+
+// ---------------------------------------------------------------------------
+// 8. face-face: barely-overlapping (y0 = 0.98, pen -0.02 -> GJK eOVERLAP ->
+// EPA finds the +y face at depth 0.02) and separated-within-contactDistance
+// (y0 = 1.05, gap +0.05 < 0.1 -> GJK eCLOSE, EPA skipped).  Both regenerate
+// through polyClip (numManifoldContacts 1 < 4 after the witness add,
+// cu L887) -> 4 corner contacts.
+// ---------------------------------------------------------------------------
+PXG_TEST(cvxCollide_hullFaceTouch)
+{
+    const Scene touch = makeCvxScene(0.98f, V3{ 2, 0.5f, 2 });
+    size_t bad = checkScene(touch, 4u, cvxCornerContacts(-0.02f), false, "hullTouch");
+    PXG_CHECK_MSG(bad == 0, "hull face touch (EPA): %zu mismatches", bad);
+    std::printf("  [hullTouch] EPA, 4 corner contacts, np=(0,-1,0,-0.02) ok\n");
+
+    const Scene near_ = makeCvxScene(1.05f, V3{ 2, 0.5f, 2 });
+    bad = checkScene(near_, 4u, cvxCornerContacts(0.05f), false, "hullNear");
+    PXG_CHECK_MSG(bad == 0, "hull near (GJK close): %zu mismatches", bad);
+    std::printf("  [hullNear] GJK close, 4 corner contacts, np.w=+0.05 ok\n");
+}
+
+// ---------------------------------------------------------------------------
+// 9. deep overlap (y0 = 0.7, pen -0.3): EPA path (top face at 0.3 vs sides
+// at ~2.5), same clip -> 4 corner contacts with np.w = -0.3.
+// ---------------------------------------------------------------------------
+PXG_TEST(cvxCollide_hullDeepEpa)
+{
+    const Scene deep = makeCvxScene(0.7f, V3{ 2, 0.5f, 2 });
+    const size_t bad = checkScene(deep, 4u, cvxCornerContacts(-0.3f), false, "hullDeep");
+    PXG_CHECK_MSG(bad == 0, "hull deep/EPA: %zu mismatches", bad);
+    std::printf("  [hullDeep] EPA path, 4 corner contacts, np.w=-0.3 ok\n");
+}
+
+// ---------------------------------------------------------------------------
+// 10. distant (y0 = 1.5, gap 0.5 > 0.1): GJK eDISTANT -> collide() returns
+// false (cu L1354-1357); word 12 = refreshedNb | 0x80000000, slots untouched.
+// ---------------------------------------------------------------------------
+PXG_TEST(cvxCollide_hullDistant)
+{
+    Scene far_ = makeCvxScene(1.5f, V3{ 2, 0.5f, 2 });
+    far_.countsWord = 3u | (2u << 8);
+    const size_t bad = checkScene(far_, 3u | 0x80000000u, {}, false, "hullDistant");
+    PXG_CHECK_MSG(bad == 0, "hull distant: %zu mismatches", bad);
+    std::printf("  [hullDistant] eDISTANT -> word12=refreshedNb|0x80000000, slots untouched ok\n");
+}
+
+// ---------------------------------------------------------------------------
+// 11. rotated-45-degree edge-dominant clip: the cube rotated 45 deg about Y
+// (q = (0, sin22.5, 0, cos22.5)) over an EQUAL box (half 0.5), gap +0.05.
+// In B space, A's top face is B's bottom face rotated -45 deg: neither
+// polygon's vertices are inside the other (corner radius 0.7071 > 0.5), so
+// polyClip's two containment passes emit nothing and the edge-edge loop
+// (cu L197-211) emits the 8 octagon crossings, all with sep = gap (s0d = 0
+// on flat parallel faces) -> nbContacts 8 > 4 -> reduce<false,false,4>
+// (cu L1005) keeps 4.  Every kept contact must be one of the 8 octagon
+// vertices: B-local (+-1/2, +-t) / (+-t, +-1/2) with t = sqrt(2)/2 - 1/2, at
+// y_B = -0.5; A-local = the +45-deg Y-rotation of the B point at y_A = +0.5;
+// np = (0,-1,0, 0.05) exactly (pure-Y rotation preserves the y axis).
+// The 4-subset reduce chooses is tie-break-dependent (all seps equal), so
+// the assertion is set-membership + distinctness + count == 4.
+// ---------------------------------------------------------------------------
+PXG_TEST(cvxCollide_hullRot45)
+{
+    Scene rot = makeCvxScene(1.05f, V3{ 0.5f, 0.5f, 0.5f });
+    const float s8 = std::sin(3.14159265358979323846 / 8.0);
+    const float c8 = std::cos(3.14159265358979323846 / 8.0);
+    rot.q0y = s8; rot.q0w = c8;
+
+    RunResult r;
+    if (!runScene(rot, r)) return; // no BDA -> skip
+    size_t bad = r.tailBad;
+    if (r.mf.nbContacts != 4u)
+    {
+        std::printf("  [rot45] word12 gpu=%08x ref=4\n", r.mf.nbContacts);
+        ++bad;
+    }
+
+    // the 8 octagon candidates (B-local xz), A = rotY(+45)(B)
+    const double t = std::sqrt(2.0) / 2.0 - 0.5;
+    const double bx[8] = { 0.5, 0.5, -0.5, -0.5, t, -t, t, -t };
+    const double bz[8] = { t, -t, t, -t, 0.5, 0.5, -0.5, -0.5 };
+    const double ch = std::sqrt(2.0) / 2.0; // cos45 == sin45
+    std::vector<ExpContact> cand;
+    for (int k = 0; k < 8; ++k)
+    {
+        const double ax = bx[k] * ch + bz[k] * ch;   // x' = x c + z s
+        const double az = bz[k] * ch - bx[k] * ch;   // z' = z c - x s
+        cand.push_back({ V3{ float(ax), 0.5f, float(az) },
+                         V3{ float(bx[k]), -0.5f, float(bz[k]) },
+                         V3{ 0, -1, 0 }, 0.05f });
+    }
+    std::vector<bool> used(8, false);
+    const uint32_t nb = r.mf.nbContacts & 0xFFu;
+    for (uint32_t k = 0; k < nb && k < 4; ++k)
+    {
+        bool matched = false;
+        for (int j = 0; j < 8 && !matched; ++j)
+        {
+            if (used[j]) continue;
+            if (eq4(r.mf.lA[k], cand[j].a.x, cand[j].a.y, cand[j].a.z, 0.0f) &&
+                eq4(r.mf.lB[k], cand[j].b.x, cand[j].b.y, cand[j].b.z, 0.0f) &&
+                eq4(r.mf.lNp[k], cand[j].n.x, cand[j].n.y, cand[j].n.z, cand[j].pen))
+            { used[j] = true; matched = true; }
+        }
+        if (!matched)
+        {
+            std::printf("  [rot45] slot %u not an octagon vertex: A(%g %g %g) B(%g %g %g) np(%g %g %g | %g)\n",
+                        k, r.mf.lA[k][0], r.mf.lA[k][1], r.mf.lA[k][2],
+                        r.mf.lB[k][0], r.mf.lB[k][1], r.mf.lB[k][2],
+                        r.mf.lNp[k][0], r.mf.lNp[k][1], r.mf.lNp[k][2], r.mf.lNp[k][3]);
+            ++bad;
+        }
+    }
+    PXG_CHECK_MSG(bad == 0, "hull rot45: %zu mismatches", bad);
+    std::printf("  [rot45] 8 EE crossings reduced to 4 distinct octagon vertices ok\n");
+}
+
+// ---------------------------------------------------------------------------
+// 12. preloaded steady-state manifold (y0 = 1.05): countsWord = 4 | 4<<8, 4
+// preloaded contacts with normal (0,-1,0) -> localNor = (0,-1,0),
+// dot(localNor, -normal) = 1 >= 0.707 and post-add count = 4, so
+// fullContactGen is FALSE (cu L887) -> NO polyClip regen; the manifold is
+// exactly the addManifoldPoint result.
+//   (a) REPLACE: slot 0 preloaded at the GJK witness (A (-0.5, .5, -.5) /
+//       B (-0.5,-.5,-.5); the witness is the corner-most segment point —
+//       GJK's tie-breaks pick support verts vA[2]/vA[7]/vB[0], the segment
+//       simplex gives q = 12/32, cpA = (-0.5,-0.55,-0.5)) with a STALE
+//       sep = 0.2; the new point is within replaceBreakingThreshold
+//       (identical A/B) -> replaces slot 0, refreshing sep to +0.05
+//       (cu L574-586).  A clip regen would instead move slots 1-3 to the
+//       +-0.5 corners — discriminated.
+//   (b) REDUCE-DROP: all 4 slots at +-0.45 corners with sep 0.04 (DEEPER
+//       than the witness sep ~0.04999995 — fp: 0.5 - 1.05f + 0.5 rounds
+//       BELOW 0.05f, so equal-sep preloads would make the witness the
+//       deepest candidate i0 and the reduce would keep it, dropping slot 0
+//       — verified on-device).  No match (nearest B-distance^2 = 0.005 >>
+//       rbt^2 = 6.25e-6, rbt = min(pcmMargin) * 0.05 = 0.0025) -> full +
+//       matchless -> the 5-candidate reduce (cu L588-601): i0 = slot0
+//       (lowest-lane min sep 0.04), i1 = slot2 (farthest, 1.62), f = slot3
+//       (max d = +0.81), g = slot1 (min d = -0.81, opposite sign kept) ->
+//       the new witness (lane 4, d = 0 by symmetric cancellation) is
+//       DROPPED and the compaction preserves slots 0-3 verbatim.
+// ---------------------------------------------------------------------------
+PXG_TEST(cvxCollide_hullManifoldSteady)
+{
+    // (a) replace
+    Scene rep = makeCvxScene(1.05f, V3{ 2, 0.5f, 2 });
+    rep.countsWord = 4u | (4u << 8);
+    rep.preloadCount = 4;
+    rep.pre[0] = { V3{ -0.5f, 0.5f, -0.5f }, V3{ -0.5f, -0.5f, -0.5f }, V3{ 0, -1, 0 }, 0.2f };
+    rep.pre[1] = { V3{ 0.45f, 0.5f, -0.45f }, V3{ 0.45f, -0.5f, -0.45f }, V3{ 0, -1, 0 }, 0.05f };
+    rep.pre[2] = { V3{ 0.45f, 0.5f, 0.45f }, V3{ 0.45f, -0.5f, 0.45f }, V3{ 0, -1, 0 }, 0.05f };
+    rep.pre[3] = { V3{ -0.45f, 0.5f, 0.45f }, V3{ -0.45f, -0.5f, 0.45f }, V3{ 0, -1, 0 }, 0.05f };
+    std::vector<ExpContact> expR;
+    expR.push_back({ rep.pre[0].a, rep.pre[0].b, V3{ 0, -1, 0 }, 0.05f }); // sep refreshed
+    expR.push_back(rep.pre[1]);
+    expR.push_back(rep.pre[2]);
+    expR.push_back(rep.pre[3]);
+    size_t bad = checkScene(rep, 4u, expR, false, "steadyReplace");
+    PXG_CHECK_MSG(bad == 0, "hull steady replace: %zu mismatches", bad);
+    std::printf("  [steadyReplace] witness replaced slot 0 (sep 0.2 -> 0.05), no regen ok\n");
+
+    // (b) reduce-drop
+    Scene drop = makeCvxScene(1.05f, V3{ 2, 0.5f, 2 });
+    drop.countsWord = 4u | (4u << 8);
+    drop.preloadCount = 4;
+    drop.pre[0] = { V3{ -0.45f, 0.5f, -0.45f }, V3{ -0.45f, -0.5f, -0.45f }, V3{ 0, -1, 0 }, 0.04f };
+    drop.pre[1] = { V3{ 0.45f, 0.5f, -0.45f }, V3{ 0.45f, -0.5f, -0.45f }, V3{ 0, -1, 0 }, 0.04f };
+    drop.pre[2] = { V3{ 0.45f, 0.5f, 0.45f }, V3{ 0.45f, -0.5f, 0.45f }, V3{ 0, -1, 0 }, 0.04f };
+    drop.pre[3] = { V3{ -0.45f, 0.5f, 0.45f }, V3{ -0.45f, -0.5f, 0.45f }, V3{ 0, -1, 0 }, 0.04f };
+    std::vector<ExpContact> expD(drop.pre, drop.pre + 4);
+    bad = checkScene(drop, 4u, expD, false, "steadyDrop");
+    PXG_CHECK_MSG(bad == 0, "hull steady reduce-drop: %zu mismatches", bad);
+    std::printf("  [steadyDrop] 5-candidate reduce dropped the witness, manifold intact ok\n");
+}
+
+// ---------------------------------------------------------------------------
+// 13. mutation canary: negate hull A's +y plane (shape1's blob).  The
+// incident plane flips orientation, so the else-branch clip axis becomes
+// (0,-1,0), inverting polyClip's edge-plane in/out tests — no clip contacts
+// are emitted and the manifold keeps only the addManifoldPoint witness
+// (word12 = 1): the hullNear expectations must FAIL (proves the kernel
+// reads hull A's blob planes).
+// ---------------------------------------------------------------------------
+PXG_TEST(cvxCollide_hullMutation)
+{
+    Scene mut = makeCvxScene(1.05f, V3{ 2, 0.5f, 2 });
+    mut.flipTopPlane = true;
+    RunResult probe;
+    if (!runScene(mut, probe)) return; // no BDA -> skip
+    const size_t bad = checkScene(mut, 4u, cvxCornerContacts(0.05f), true, "hullMutation");
+    PXG_CHECK_MSG(bad != 0, "hull mutation must FAIL the near expectations");
+    std::printf("  [hullMutation] flipped A top plane breaks the expectations (%zu mismatches) ok\n", bad);
 }
 
 } // namespace

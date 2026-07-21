@@ -29,8 +29,9 @@
 // harness debug 64-byte blob).  Split into a module so each compiled entry
 // declares exactly ONE push-constant block (two push_constant blocks in one
 // module collide at offset 0).  See npCvxStage2Setup.slang for the full
-// derivation and the collide() gating contract (sphere/capsule type0 run the
-// assembled npCvxCollide.collide(); convex-hull type0 keeps the elision).
+// derivation.  ALL convex-convex type0 arms (sphere / capsule / convex hull)
+// run the assembled npCvxCollide.collide(), gated only on transform validity
+// exactly like the .cu (L2616).
 
 module npCvxStage2Core;
 
@@ -183,13 +184,14 @@ public void stage2Body(uint globalWarpIndex, uint numTests, float toleranceLengt
     const uint initialNbContacts = countsWord >> 8u;
     uint numManifoldContacts = countsWord & 0xFFu;
 
-    // collide() gate (cu L2615-2627).  The assembled npCvxCollide.collide()
-    // covers the SPHERE and CAPSULE type0 arms; convex-hull type0
-    // (generateConvexContacts) is deferred and keeps the elision contract:
-    // bIntersection stays false and numManifoldContacts is unchanged.
+    // collide() gate (cu L2615-2627): transform validity ONLY, matching the
+    // .cu's `transf0.isValid() && transf1.isValid()`.  All three type0 arms
+    // (SPHERE / CAPSULE / convex-hull generateConvexContacts) are assembled
+    // in npCvxCollide.collide(); invalid-transform pairs keep the writeback
+    // refreshedNb | 0x80000000 (bIntersection false, count unchanged).
     const bool transformsValid = npAbiTransformIsValid(t0q, t0p) && npAbiTransformIsValid(t1q, t1p);
     bool bIntersection = false;
-    if (transformsValid && (type0 == EGT_SPHERE || type0 == EGT_CAPSULE))
+    if (transformsValid)
     {
         CollideScratch cs;
         for (uint i = 0u; i < 64u; ++i) { cs.vA[i] = float4(0, 0, 0, 0); cs.vB[i] = float4(0, 0, 0, 0); }
@@ -220,8 +222,12 @@ public void stage2Body(uint globalWarpIndex, uint numTests, float toleranceLengt
         cs.type0 = type0; cs.type1 = type1;
 
         float4 verts0Synth[2] = { verts0_0, verts0_1 };
-        // verts0Ptr = 0 selects the synthetic sphere/capsule vertices
-        bIntersection = collide(cs, verts0Synth, 0, convexPtrB + 32u,
+        // verts0Ptr = 0 selects the synthetic sphere/capsule vertices; the
+        // convex-hull type0 reads the blob cloud at convexPtrA + sizeof(uint4)
+        // + sizeof(float4) (cu L2485-2487), like hull B (cu L2498)
+        const uint64_t verts0Ptr =
+            (type0 == EGT_SPHERE || type0 == EGT_CAPSULE) ? 0 : convexPtrA + 32u;
+        bIntersection = collide(cs, verts0Synth, verts0Ptr, convexPtrB + 32u,
                                 ws13, ws14, ws15, numManifoldContacts);
     }
 

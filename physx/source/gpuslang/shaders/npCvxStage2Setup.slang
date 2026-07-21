@@ -48,17 +48,17 @@
 // the 16-lane moreData read + one shfl from lane 12, both straight-line when
 // serialized).
 //
-// collide() (the GJK/EPA/contact-gen core) IS ASSEMBLED for the SPHERE and
-// CAPSULE type0 arms: stage2Body calls npCvxCollide.collide() (prep + warm
-// seed + gjkWarm + epaCore + sphere witness store / capsule
-// generatedFaceContacts + generatedContactsEEContacts) when transformsValid
-// and type0 is eSPHERE or eCAPSULE.  Contact points are written inside
-// collide() straight into the manifold (localNormalPen/A/B at manifold
-// +0/+64/+128) and the epilogue stores mNbContacts = numManifoldContacts
-// (touch) into word 12.  The CONVEX-HULL type0 arm (generateConvexContacts,
-// cu L1458-1462) remains DEFERRED: convex-type0 pairs keep the original
-// elision contract — bIntersection stays false, numManifoldContacts keeps
-// the stage-1 refreshed count, and the epilogue writes
+// collide() (the GJK/EPA/contact-gen core) IS FULLY ASSEMBLED — all three
+// type0 arms: stage2Body calls npCvxCollide.collide() (prep + warm seed +
+// gjkWarm + epaCore + sphere witness store / capsule generatedFaceContacts +
+// generatedContactsEEContacts / convex-hull generateConvexContacts:
+// calculateLocalNormal + addManifoldPoint + reference-face selection +
+// polyClip + reduce + writeContacts) whenever transformsValid — the exact
+// .cu gate (transf0.isValid() && transf1.isValid(), cu L2616).  Contact
+// points are written inside collide() straight into the manifold
+// (localNormalPen/A/B at manifold +0/+64/+128) and the epilogue stores
+// mNbContacts = numManifoldContacts (touch) into word 12.  Invalid-transform
+// pairs (and eDISTANT results) write
 //   mNbContacts = refreshedNb | 0x80000000
 // — the manifold-invalidated / no-touch semantic that the downstream
 // finishContactsKernel consumes safely (it clears the bit and treats the

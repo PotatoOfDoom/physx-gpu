@@ -12,6 +12,16 @@
 
 #include "PxPhysicsAPI.h"       // PxCreateCudaContextManager (public C-ABI, resolves to the bridge)
 
+// Runtime convex cooking: the immediate-mode entry points live in
+// geomutils/src/cooking (GuCookingConvexMesh.cpp:181 createConvexMesh,
+// GuMeshFactory.cpp:1259 getInsertionCallback) and are compiled into the
+// physx-sdk static lib by the GLOB_RECURSE over geomutils/src/*.cpp — the
+// physxcooking/src/Cooking.cpp C-ABI wrappers are NOT in the build, so we
+// call physx::immediateCooking:: directly via GuCooking.h (on the include
+// path through physx-sdk's PUBLIC ${SRC}/geomutils/include).
+#include "GuCooking.h"
+#include "cooking/PxCooking.h"
+
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
@@ -213,6 +223,52 @@ void buildCapsuleBoxScene(PxPhysics* physics, PxScene* scene, PxMaterial* materi
                                    capsuleInertia(r, h, 1000.0f), 5.0f);
     targets.push_back({ b, 5.0f, r, "capsuleOnBox" });
 }
+
+// PXG_SCENE=convex: a dynamic CONVEX MESH (a runtime-cooked cube hull, half
+// 0.5) resting on the static ground BOX.  Box (eBOX=3) vs convex mesh
+// (eCONVEXMESH=5) lands in the GPU_BUCKET_ID::eConvex bucket
+// (PxgNphaseImplementationContext.cpp cndCasePrimitiveConvex) — the same
+// convexConvexNphase stage1/stage2/finish kernel chain as capsulebox, but
+// stage2's collide() now dispatches the convex-hull generateConvexContacts
+// arm (cudaGJKEPA.cu L1458-1462): polygon-vs-polygon clipping instead of the
+// capsule face/EE path.  cooking: buildGPUData = true sets the GRB edge bit
+// so ConvexMesh::isGpuCompatible() (GuConvexMesh.cpp:104) holds and the pair
+// is NOT demoted to the CPU fallback bucket; insertion goes through THIS
+// PxPhysics' insertion callback so the mesh registers with its factory.
+void buildConvexScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                      std::vector<RestTarget>& targets)
+{
+    addGroundBox(physics, scene, material);
+
+    static const PxVec3 cubeVerts[8] = {
+        PxVec3(-0.5f, -0.5f, -0.5f), PxVec3(-0.5f, -0.5f, 0.5f),
+        PxVec3(-0.5f, 0.5f, -0.5f),  PxVec3(-0.5f, 0.5f, 0.5f),
+        PxVec3(0.5f, -0.5f, -0.5f),  PxVec3(0.5f, -0.5f, 0.5f),
+        PxVec3(0.5f, 0.5f, -0.5f),   PxVec3(0.5f, 0.5f, 0.5f),
+    };
+    PxCookingParams cp(physics->getTolerancesScale());
+    cp.buildGPUData = true;
+    PxConvexMeshDesc desc;
+    desc.points.count = 8;
+    desc.points.stride = sizeof(PxVec3);
+    desc.points.data = cubeVerts;
+    desc.flags = PxConvexFlag::eCOMPUTE_CONVEX;
+    PxConvexMeshCookingResult::Enum cond = PxConvexMeshCookingResult::eSUCCESS;
+    PxConvexMesh* mesh = immediateCooking::createConvexMesh(
+        cp, desc, physics->getPhysicsInsertionCallback(), &cond);
+    if (!mesh)
+    {
+        std::printf("FAIL: runtime convex cooking failed (result %d)\n", int(cond));
+        return; // targets stays empty; main() hard-fails on that
+    }
+    std::printf("  cooked convex hull: %u verts, %u polygons (GPU-compatible: %s)\n",
+                mesh->getNbVertices(), mesh->getNbPolygons(),
+                mesh->isGpuCompatible() ? "yes" : "NO");
+
+    PxRigidDynamic* b = addDynamic(physics, scene, material, PxConvexMeshGeometry(mesh),
+                                   boxInertia(PxVec3(0.5f), 1000.0f), 5.0f);
+    targets.push_back({ b, 5.0f, 0.5f, "convexOnBox" });
+}
 } // namespace
 
 int main()
@@ -291,8 +347,14 @@ int main()
     else if (!std::strcmp(sceneName, "sphere"))    buildSphereScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "capsule"))   buildCapsuleScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "capsulebox")) buildCapsuleBoxScene(physics, scene, material, targets);
-    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox)\n", sceneName);
+    else if (!std::strcmp(sceneName, "convex"))    buildConvexScene(physics, scene, material, targets);
+    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex)\n", sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
+    if (targets.empty())
+    {
+        std::printf("[ FAIL ] gpu-sdk-step: scene '%s' built no dynamic bodies\n", sceneName);
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+    }
     std::printf("  [  OK  ] scene '%s' built: %zu dynamic body(ies) + ground on the GPU\n",
                 sceneName, targets.size());
 

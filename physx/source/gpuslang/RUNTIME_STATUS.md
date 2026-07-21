@@ -106,7 +106,40 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
-## P5 Step 5 — MILESTONE: six rigid scenes rest on BOTH solvers (TGS + PGS), zero refused launches
+## P5 Step 5 — MILESTONE: the four rigid primitives + convex meshes rest on BOTH solvers
+
+Tranche 11 assembled the CONVEX-HULL arm of collide() (`generateConvexContacts`,
+cudaGJKEPA.cu L1458-1462) into `npCvxCollide.slang` (now 1707 lines): the T144
+reference-frame setup, T139 calculateLocalNormal, T138 getPolygonIndexFromLocal-
+Witness (generalised to both hulls), T145 polyClip + addContacts, T146 emit
+tails, T137 schlock::reduce, and T140 addManifoldPoint (match→replace /
+append<4 / full+matchless→5-candidate reduce) — transcribed from their verified
+oracles, single-thread, into collide()'s else arm.  The stage2 gate is now the
+exact `.cu` `if (transformsValid)` (L2616) — sphere, capsule AND convex-hull
+type0 all run the assembled collide().  New intentional deviations
+(if-conversion speculation hazards on llvmpipe — the null-vertex-source and
+past-nbVerts blob reads are made dereferenceable and select-discarded) are
+documented in-source with `.cu` line evidence.
+
+`PXG_SCENE=convex` cooks an 8-vertex cube at runtime (immediate-mode
+`physx::immediateCooking::createConvexMesh`, `buildGPUData=true`) and drops it
+on the ground box → it **rests at y=0.5000, |v|=0.0000** through the real
+GJK/EPA + polygon-clip contact path.
+
+**The rigid milestone is met: all four PhysX rigid primitives (box, sphere,
+capsule, plane) PLUS convex meshes, singly and stacked, fall and REST on the
+Slang/Vulkan (llvmpipe) GPU pipeline under BOTH solvers (TGS and PGS) — 14/14
+scene×solver combinations, each `exit 0` with ZERO refused kernel launches.**
+Suite 664/664 both memory modes.  New `testCvxCollide` convex-hull fixtures
+(face-touch / deep-EPA / rot-45 edge / replace-vs-reduce manifold / mutation
+canary) on the engine ABI with a real cooked box hull.
+
+Remaining (out of the common-rigid-scene milestone; documented deferrals):
+jointed scenes (`constraint1DPrePrepLaunch` D6 data-prep — scoped, next),
+force-threshold reporting, convex-vs-trimesh / heightfield contact pipelines,
+and all articulation / deformable / particle paths.
+
+## P5 Step 5 — earlier milestone: six scenes rest on BOTH solvers (TGS + PGS)
 
 Tranche 10 completed the PGS path to scene-readiness: preIntegrationLaunch
 (88-B pack, no skip-gravity bool), integrateCoreParallelLaunch, both PGS

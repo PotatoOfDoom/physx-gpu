@@ -33,10 +33,11 @@
 //   - the production entry's memory effects: the tempKeepPairsArray /
 //     numTests early-outs and the moreData words 9..12 store — every pair
 //     here keeps the elision-contract writeback refreshedNb | 0x80000000
-//     (convex type0 pairs are gated off collide(); sphere/capsule type0
-//     pairs are pinned behind the transform-validity gate below because the
-//     stub blobs are not real hulls — assembled-collide output is covered by
-//     testCvxCollide.cpp) and the quatB tail is a bit-identical rewrite;
+//     (ALL pairs are pinned behind the transform-validity gate below: the
+//     assembled collide() now runs for every convex-convex type0 including
+//     the tranche-11 convex-hull arm, and the stub blobs are not real
+//     hulls — assembled-collide output is covered by testCvxCollide.cpp)
+//     and the quatB tail is a bit-identical rewrite;
 //   - the Debug entry (engine blob + trailing debug pointer) dumps every
 //     scratch value the .cu computes; compared against the tranche-154
 //     CPU transcription (shape flip, synthetic vertices, margins, blob
@@ -224,18 +225,21 @@ PXG_TEST(npCvxStage2Setup_engineAbi)
                 s.t0q = F4{ s.t0q.x * 1.2f, s.t0q.y * 1.2f, s.t0q.z * 1.2f, s.t0q.w * 1.2f };
                 ++cBadQuat;
             }
-            // The assembled collide() (npCvxCollide) now runs for post-flip
-            // sphere/capsule type0 — but this fixture's 64-byte stub blobs are
-            // NOT valid hulls (the collide vertex/plane reads would run off the
-            // stub).  Pin those pairs behind the transform-validity gate with a
-            // non-unit t0q: bIntersection stays false, the elision-contract
-            // writeback expectations hold, and the debug entry still verifies
-            // the full sphere/capsule SETUP arithmetic (which runs regardless
-            // of the gate).  Assembled-collide contact output is covered by
-            // testCvxCollide.cpp on a REAL cooked hull.
-            const uint32_t minType = ty0 < ty1 ? ty0 : ty1;
-            if (minType == 0u || minType == 2u)
-                s.t0q = F4{ s.t0q.x * 1.2f, s.t0q.y * 1.2f, s.t0q.z * 1.2f, s.t0q.w * 1.2f };
+            // The assembled collide() (npCvxCollide) now runs for EVERY
+            // convex-convex type0 (tranche 11 added the convex-hull
+            // generateConvexContacts arm; the stage2 gate is transform
+            // validity only, matching cudaGJKEPA.cu L2616) — but this
+            // fixture's 64-byte stub blobs are NOT valid hulls (the collide
+            // vertex/plane/polyDesc reads would run off the stub; the random
+            // nbEdges alone pushes vertexData offsets hundreds of KB out).
+            // Pin ALL pairs behind the transform-validity gate with a
+            // non-unit t0q — exactly how tranche 8 pinned the sphere/capsule
+            // fixtures: bIntersection stays false, the elision-contract
+            // writeback expectations hold, and the debug entry still
+            // verifies the full SETUP arithmetic (which runs regardless of
+            // the gate).  Assembled-collide contact output is covered by
+            // testCvxCollide.cpp on REAL cooked hulls.
+            s.t0q = F4{ s.t0q.x * 1.2f, s.t0q.y * 1.2f, s.t0q.z * 1.2f, s.t0q.w * 1.2f };
             s.t0p = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), rf(0.02f, 0.3f) };
             s.t1p = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), rf(0.02f, 0.3f) };
             const uint32_t refreshed = rng() % 5, initial = rng() % 5;
