@@ -106,6 +106,45 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
+## P6.1 — particle contact-sort kernels on the engine ABI (stage-7 sort BDA-rewritten)
+
+Brought the three particle contact-sort kernels onto the BDA engine ABI. They were
+manifest-mapped but only to Phase-1 HARNESS shaders (resource-binding + scalar
+push-constants: `radixSortGather.slang`'s `GatherParams{numKeys,lowBit,gridDimX}`
+over `RWStructuredBuffer` bindings, `clampValues.slang`'s index scheme) which the
+engine-ABI dispatcher cannot drive — so they refused. A *bloße* ABI row would not
+have worked; each needed a real BDA rewrite whose push-constant IS the CUDA
+argument pack of device pointers, exactly like the already-live
+`radixSortMultiBlockLaunchWithCount` (`radixSortDesc.slang`). New shader
+`particleContactSortBda.slang` (ported line-for-line from the .cu):
+- `radixSortDoubleCopy` (`radixSortImpl.cu:187`, ABI `{8,8,8,8,8,8,8}` = 56B) —
+  two rank-indexed 64-bit gathers; launched at `PxgParticleSystemCore.cpp:1268`.
+- `radixSortDoubleCopyHigh32Bits` (`radixSortImpl.cu:139`, `{8,8,8,8,8,8,8}`) —
+  the twin gather writing only the high word (`key.y`); launched at `:1207`.
+- `clampMaxValue` (`MemCopyBalanced.cu:88`, ABI `{8,4}`) — in-place clamp of the
+  contact counter to `mMaxContacts`; launched at `:1105`.
+`numKeys` is a `const PxU32*` device pointer (read `*numKeys` via `Ptr<>`), not a
+host scalar. Grid-stride uses `WorkgroupCount().x * 1024` (= `BlockDim::RADIX_SORT`,
+matching `numthreads(1024)`), so the kernels are Vulkan-only and excluded from
+`PXG_HLSL_ENTRIES`. The manifest rows were *re-pointed* to `particleContactSortBda.spv`
+(the harness `radixSortGather.slang`/`clampValues.slang` stay for their existing
+unit tests), so `PXG_SLANG_KERNEL_MAPPED` stays **156** (no new mapping, only a
+re-point + new ABI rows).
+
+**`PXG_SCENE=particle` trace: all three flip REFUSED→OK ×120/frame; the only
+remaining refused particle launch is `removeContactManagers_Stage5` (×2, narrowphase
+pair-mgmt off the bag path — deferred).** Free-fall byte-unchanged (PGS 19.78 m,
+exit 0). New unit test `gpuslang.particleContactSort` bit-exact in both modes; suite
+**666/666** both memory modes. Rigid regression: all 8 scenes × 2 solvers = 16/16
+`exit 0` — the rigid-shared radix gather is byte-unaffected (those scenes don't
+dispatch it, but re-verified, not assumed).
+
+Scoping note: a 6-agent workflow mapped the full PBD settling pipeline. The grid-sort
+machinery (`radixSortMultiBlock…WithCount`, `CalculateRanks`, `initializeRadixRanks`)
+is already live; the roadmap to a settling bag is P6.2 grid build + reorder (incl.
+authoring the un-ported `radixSort…WithoutCount` pair) → P6.3 self-collision → P6.4
+plane/primitive contact → P6.5 settling-bag scene + fall-then-rest harness.
+
 ## P6.0 — MILESTONE: the first live particle frame — a PBD particle cloud free-falls on Vulkan
 
 The first-ever deformable/particle frame on the Slang/Vulkan (llvmpipe) engine

@@ -193,9 +193,9 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "radixSortMultiBlockLaunchWithoutCount", nullptr, nullptr },  // RS_MULTIBLOCK_NO_COUNT (unmapped)
     { "radixSortMultiCalculateRanksLaunchWithoutCount", nullptr, nullptr },  // RS_CALCULATERANKS_MULTIBLOCK_NO_COUNT (unmapped)
     { "radixSortCopyHigh32Bits", "radixSort64.spv", "radixSortCopyHigh32Bits" },  // RS_COPY_HIGH_32BITS
-    { "radixSortDoubleCopyHigh32Bits", "radixSortGather.spv", "radixSortDoubleCopyHigh32Bits" },  // RS_DOUBLE_COPY_HIGH_32BITS2
+    { "radixSortDoubleCopyHigh32Bits", "particleContactSortBda.spv", "radixSortDoubleCopyHigh32Bits" },  // RS_DOUBLE_COPY_HIGH_32BITS2 (P6.1 BDA re-point)
     { "radixSortCopy", "radixSortGather.spv", "radixSortCopy" },  // RS_COPY_VALUE
-    { "radixSortDoubleCopy", "radixSortGather.spv", "radixSortDoubleCopy" },  // RS_DOUBLE_COPY_VALUE
+    { "radixSortDoubleCopy", "particleContactSortBda.spv", "radixSortDoubleCopy" },  // RS_DOUBLE_COPY_VALUE (P6.1 BDA re-point)
     { "radixSortCopyBits2", "radixSortGather.spv", "radixSortCopyBits2" },  // RS_COPY_BITS2
     { "radixSortCopy2", "radixSortGather.spv", "radixSortCopy2" },  // RS_COPY_VALUE2
     { "accumulateDeltaVRigidFirstLaunch", nullptr, nullptr },  // ACCUMULATE_DELTAVEL_RIGIDBODY_FIRST (unmapped)
@@ -439,7 +439,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_accumulateBendingDampingDeltaVelocity", nullptr, nullptr },  // CLOTH_BENDING_DAMPING (unmapped)
     { "cloth_applyAccumulatedDeltaVelocity", nullptr, nullptr },  // CLOTH_APPLY_ACCUMULATED_DAMPING (unmapped)
     { "fem_reorderRigidContactsLaunch", nullptr, nullptr },  // FEM_REORDER_RS_CONTACTS (unmapped)
-    { "clampMaxValue", "clampValues.spv", "clampMaxValue" },  // CLAMP_MAX_VALUE
+    { "clampMaxValue", "particleContactSortBda.spv", "clampMaxValue" },  // CLAMP_MAX_VALUE (P6.1 BDA re-point)
     { "clampMaxValues", "clampValues.spv", "clampMaxValues" },  // CLAMP_MAX_VALUES
     { "scanPerBlockKernel", "scan.spv", "scanPerBlockKernel" },  // scanPerBlockKernel
     { "scanPerBlockKernel4x4", "scan4x4.spv", "scanPerBlockKernel4x4" },  // scanPerBlockKernel4x4

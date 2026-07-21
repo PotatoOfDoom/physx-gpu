@@ -240,6 +240,17 @@ static const uint8_t kPsUpdateUserBuffer[] = { 8, 8, 4 };
 //     Two device pointers -> 16-byte blob (same shape as kTwoPtr).
 static const uint8_t kPsUpdateUnsorted[] = { 8, 8 };
 
+// gpucommon/src/CUDA/radixSortImpl.cu (P6.1 particle contact-sort BDA):
+//   radixSortDoubleCopy(const PxU64* inValue0, PxU64* outValue0, PxU32* rank0,
+//     const PxU64* inValue1, PxU64* outValue1, PxU32* rank1, const PxU32* numKeys)
+//     (radixSortImpl.cu:187) and radixSortDoubleCopyHigh32Bits (radixSortImpl.cu:139),
+//   which has the IDENTICAL 7-device-pointer pack (only the output width differs,
+//   in the kernel body), so both share this row.  numKeys is a const PxU32*
+//   DEVICE POINTER (deref'd on-device), not a host scalar -> 56-byte blob.
+static const uint8_t kRadixDoubleCopy[] = { 8, 8, 8, 8, 8, 8, 8 };
+//   clampMaxValue(PxU32* value, const PxU32 maxValue) (MemCopyBalanced.cu:88):
+//   pointer@0 + PxU32 by value@8 -> 16-byte blob.  Reuses kPtrU32 = {8,4}.
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },
@@ -351,6 +362,12 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_preIntegrateLaunch", kPsPreIntegrate, uint32_t(sizeof(kPsPreIntegrate)) },
     { "ps_integrateLaunch", kPsIntegrate, uint32_t(sizeof(kPsIntegrate)) },
     { "ps_updateUserBufferLaunch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
+    // gpucommon particle contact-sort kernels (P6.1 BDA)
+    // radixSortImpl.cu:187 / :139 — the twin rank-indexed gathers share the pack.
+    { "radixSortDoubleCopy", kRadixDoubleCopy, uint32_t(sizeof(kRadixDoubleCopy)) },
+    { "radixSortDoubleCopyHigh32Bits", kRadixDoubleCopy, uint32_t(sizeof(kRadixDoubleCopy)) },
+    // MemCopyBalanced.cu:88 — clampMaxValue(PxU32* value, const PxU32 maxValue) -> {8,4}
+    { "clampMaxValue", kPtrU32, uint32_t(sizeof(kPtrU32)) },
 };
 
 inline size_t abiAlign(size_t size)
