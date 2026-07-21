@@ -252,6 +252,28 @@ static const uint8_t kPsCalcHash[] = { 8, 8 };
 //   PxU32 by value) -> {8,4} = 12, rounded to the 8-alignment -> 16-byte blob.
 static const uint8_t kPsReorder[] = { 8, 4 };
 
+// gpusimulationcontroller particlesystem.cu (P6.3 PBD self-collision + solve):
+//   ps_selfCollisionLaunch(const PxgParticleSystem* particleSystems,
+//     const PxU32 id) — 3x3x3 grid neighbour search.  Launch site
+//   PxgParticleSystemCore.cpp:1043 packs { particleSystemsd, id } (pointer +
+//   PxU32 by value) -> {8,4}; reuses kPsReorder (identical shape).
+//   ps_solveOneWayContactDeltaVLaunch(PxgParticleSystem* particleSystems,
+//     const PxU32* activeParticleSystems, PxReal invDt, PxReal dt,
+//     PxReal biasCoefficient, bool isVelocityIteration) — one-way contact solve.
+//   Launch site PxgParticleSystemCore.cpp:1359 -> {8,8,4,4,4,1} = 32-byte blob
+//   (bool at @28).
+static const uint8_t kPsSolveOneWay[] = { 8, 8, 4, 4, 4, 1 };
+//   ps_applyDeltaLaunch(PxgParticleSystem* particleSystems,
+//     const PxU32* activeParticleSystems, PxReal dt) — SOR-average mDelta into
+//   mAccumDeltaP.  Launch site PxgParticleSystemCore.cpp:1526 -> {8,8,4};
+//   reuses kPsUpdateUserBuffer (identical shape).
+//   ps_updateParticleLaunch(const PxgParticleSystem* particleSystems,
+//     const PxU32* activeParticleSystems, PxReal invDt,
+//     bool skipNewPositionAdjustment) — apply accumDeltaP + recompute velocity.
+//   Launch site PxgParticleSystemCore.cpp:1568 -> {8,8,4,1} = 24-byte blob
+//   (bool at @20).
+static const uint8_t kPsUpdateParticle[] = { 8, 8, 4, 1 };
+
 // gpucommon/src/CUDA/radixSortImpl.cu (P6.2 grid radix sort):
 //   radixSortMultiBlockLaunchWithoutCount(PxgRadixSortDesc* desc, PxU32 startBit)
 //   / radixSortMultiCalculateRanksLaunchWithoutCount(same ABI) — the numKeys
@@ -384,6 +406,17 @@ static const PxgKernelAbiRow kRows[] = {
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },
+    // gpusimulationcontroller PBD particle self-collision + solve (P6.3 BDA)
+    // ps_selfCollisionLaunch(const PxgParticleSystem*, PxU32 id) -> {8,4}
+    { "ps_selfCollisionLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },
+    // ps_solveOneWayContactDeltaVLaunch(PxgParticleSystem*, const PxU32*, PxReal invDt,
+    //   PxReal dt, PxReal biasCoefficient, bool isVelocityIteration) -> {8,8,4,4,4,1}
+    { "ps_solveOneWayContactDeltaVLaunch", kPsSolveOneWay, uint32_t(sizeof(kPsSolveOneWay)) },
+    // ps_applyDeltaLaunch(PxgParticleSystem*, const PxU32*, PxReal dt) -> {8,8,4}
+    { "ps_applyDeltaLaunch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
+    // ps_updateParticleLaunch(const PxgParticleSystem*, const PxU32*, PxReal invDt,
+    //   bool skipNewPositionAdjustment) -> {8,8,4,1}
+    { "ps_updateParticleLaunch", kPsUpdateParticle, uint32_t(sizeof(kPsUpdateParticle)) },
     // gpucommon radixSortImpl.cu:69 / :81 — the WithoutCount radix twins (P6.2 BDA)
     { "radixSortMultiBlockLaunchWithoutCount", kRadixDescNoCount, uint32_t(sizeof(kRadixDescNoCount)) },
     { "radixSortMultiCalculateRanksLaunchWithoutCount", kRadixDescNoCount, uint32_t(sizeof(kRadixDescNoCount)) },

@@ -83,7 +83,7 @@ set(SHADER_COMMON_DEPS
 # to contract undecorated expressions: llvmpipe fuses npCvxCoreEpa's
 # makePlane triple-cross sums into fma chains (1-ulp vs strict IEEE), which
 # breaks the bitwise CPU-vs-GPU doctrine.  The decoration forbids that.
-set(PXG_NOCONTRACT_SHADERS npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npD6JointPrep npArtiExtBody npArti1DPrep npArtiJointHeader npArtiSolve1D npArtiSolveContact npArtiSolve1DTGS npArtiSolveContactTGS npArtiCheckActive npArtiPropagate npArtiPropagateAccel npArtiPropagateAccelJV npArtiSpatialMatVec npArtiSpatialMatMat npArtiTranslateInertia npArtiTranslateSInertia npArtiPropagateZA npArtiPropagateZASph npArtiTranslateInertiaMass npArtiInvertInertia npArtiPropagateImpDof npArtiAccumLinkImp npArtiDriveParams npArtiClampDriveImp npClothDefGrad2D npSbDefGrad npDefMaterial npJacobiRotate npClothAtan npAnisoHelpers npClothDeltaLambda npClothExtractRot2D npClothVelClamp npClothArap2D npClothArea2D npClothWind npSbBaryInvMass npSbVolumeSolve npIsoConcaveCorner npSphSpikyKernel npIsoAcosDecode npSparseGridDomain npDenseGridCell npSbBaryProject npIsoVecNormalize npSbCompliance npSbDeltaLambdaGradC npSbTetConstraint npPsSpecVolume npSbComputeLambda npGridLocation npAnisoOutput npSmoothPos npIsoAvgVerts npPsSolvePC npPsSolvePCTGS npPsWeightKernels npPsDiffuseUpdate npPsDiffuseSpawn npPsDiffuseAvg npPsDiffuseOneWay npSdfBoxDist npSparseGridCellFromPos npIsoGridFilter npSbExtractRotAPD npSbSolveNeoHookean npSbSolveCorot npSbSolveGM npClothMembrane npClothBending npClothSharedEnergy npSbCollisionConstraint npClothCollisionConstraint npSdfBvhMorton npSbStress npSdfHoles npClothTriContact particleSim)
+set(PXG_NOCONTRACT_SHADERS npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npD6JointPrep npArtiExtBody npArti1DPrep npArtiJointHeader npArtiSolve1D npArtiSolveContact npArtiSolve1DTGS npArtiSolveContactTGS npArtiCheckActive npArtiPropagate npArtiPropagateAccel npArtiPropagateAccelJV npArtiSpatialMatVec npArtiSpatialMatMat npArtiTranslateInertia npArtiTranslateSInertia npArtiPropagateZA npArtiPropagateZASph npArtiTranslateInertiaMass npArtiInvertInertia npArtiPropagateImpDof npArtiAccumLinkImp npArtiDriveParams npArtiClampDriveImp npClothDefGrad2D npSbDefGrad npDefMaterial npJacobiRotate npClothAtan npAnisoHelpers npClothDeltaLambda npClothExtractRot2D npClothVelClamp npClothArap2D npClothArea2D npClothWind npSbBaryInvMass npSbVolumeSolve npIsoConcaveCorner npSphSpikyKernel npIsoAcosDecode npSparseGridDomain npDenseGridCell npSbBaryProject npIsoVecNormalize npSbCompliance npSbDeltaLambdaGradC npSbTetConstraint npPsSpecVolume npSbComputeLambda npGridLocation npAnisoOutput npSmoothPos npIsoAvgVerts npPsSolvePC npPsSolvePCTGS npPsWeightKernels npPsDiffuseUpdate npPsDiffuseSpawn npPsDiffuseAvg npPsDiffuseOneWay npSdfBoxDist npSparseGridCellFromPos npIsoGridFilter npSbExtractRotAPD npSbSolveNeoHookean npSbSolveCorot npSbSolveGM npClothMembrane npClothBending npClothSharedEnergy npSbCollisionConstraint npClothCollisionConstraint npSdfBvhMorton npSbStress npSdfHoles npClothTriContact particleSim particleSelfCollisionBda)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
@@ -366,6 +366,12 @@ pxg_compile_shader(particleContactSortBda radixSortDoubleCopy radixSortDoubleCop
 # absent from PXG_HLSL_ENTRIES (same precedent as particleSim /
 # particleContactSortBda / solveBlockUnified).
 pxg_compile_shader(particleGridBda ps_calculateHashLaunch ps_reorderDataAndFindCellStartLaunch)
+# P6.3: PBD particle self-collision neighbour search + one-way contact solve +
+# delta-apply + velocity recompute on the engine ABI (BDA).  All four kernels read
+# the PxgParticleSystem descriptor array through Ptr<>, which has no HLSL cs_6_0
+# lowering, so this shader is deliberately absent from PXG_HLSL_ENTRIES (same
+# precedent as particleSim / particleGridBda / particleContactSortBda).
+pxg_compile_shader(particleSelfCollisionBda ps_selfCollisionLaunch ps_solveOneWayContactDeltaVLaunch ps_applyDeltaLaunch ps_updateParticleLaunch)
 pxg_compile_shader(contactReduce ctContactReduce)
 pxg_compile_shader(npSbTet ctSbTet)
 pxg_compile_shader(npSbSelf ctSbSelfQuery)
@@ -742,6 +748,7 @@ add_executable(gpuslang-tests
     testParticleSim.cpp
     testParticleContactSort.cpp
     testParticleGrid.cpp
+    testParticleSelfCollision.cpp
     testContactReduce.cpp
     testNpSbTet.cpp
     testNpSbSelf.cpp
@@ -969,7 +976,7 @@ foreach(suite scan radixSort radixSortDesc radixSortGather preIntegration integr
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout particleSelfCollision)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")

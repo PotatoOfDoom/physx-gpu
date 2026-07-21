@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 160;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 164;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -218,7 +218,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_calculateHashLaunch", "particleGridBda.spv", "ps_calculateHashLaunch" },  // PS_CALCULATE_HASH (P6.2 BDA port: grid-cell hash + identity seed)
     { "ps_calculateHashForDiffuseParticlesLaunch", nullptr, nullptr },  // PS_CALCULATE_HASH_FOR_DIFFUSE_PARTICLES (unmapped)
     { "ps_reorderDataAndFindCellStartLaunch", "particleGridBda.spv", "ps_reorderDataAndFindCellStartLaunch" },  // PS_REORDER_PARTICLE_FIND_CELLSTARTEND (P6.2 BDA port: gather + cell start/end)
-    { "ps_selfCollisionLaunch", nullptr, nullptr },  // PS_PARTICLE_SELF_COLLISION (unmapped)
+    { "ps_selfCollisionLaunch", "particleSelfCollisionBda.spv", "ps_selfCollisionLaunch" },  // PS_PARTICLE_SELF_COLLISION (P6.3 BDA port: 3x3x3 grid neighbour search)
     { "ps_primitivesBoundFirstPassLaunch", nullptr, nullptr },  // PS_PRIMITIVES_BOUND_FIRST (unmapped)
     { "ps_primitivesBoundSecondPassLaunch", nullptr, nullptr },  // PS_PRIMITIVES_BOUND_SECOND (unmapped)
     { "ps_primitivesCollisionLaunch", nullptr, nullptr },  // PS_PRIMITIVES_COLLISION (unmapped)
@@ -232,15 +232,15 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_contactPrepareLaunch", nullptr, nullptr },  // PS_CONTACT_PREPARE (unmapped)
     { "ps_solvePCOutputParticleDeltaVLaunch", nullptr, nullptr },  // PS_SOLVE_PC_PARTICLE (unmapped)
     { "ps_solvePCOutputRigidDeltaVLaunch", nullptr, nullptr },  // PS_SOLVE_PC_RIGID (unmapped)
-    { "ps_solveOneWayContactDeltaVLaunch", nullptr, nullptr },  // PS_SOLVE_ONEWAY_CONTACTS (unmapped)
+    { "ps_solveOneWayContactDeltaVLaunch", "particleSelfCollisionBda.spv", "ps_solveOneWayContactDeltaVLaunch" },  // PS_SOLVE_ONEWAY_CONTACTS (P6.3 BDA port: one-way contact solve -> accumDeltaP)
     { "ps_findStartEndParticleFirstLaunch", nullptr, nullptr },  // PS_FIND_RANGESTARTEND_PARTICLE_FIRST (unmapped)
     { "ps_findStartEndParticleSecondLaunch", nullptr, nullptr },  // PS_FIND_RANGESTARTEND_PARTICLE_SECONE (unmapped)
     { "ps_accumulateDeltaVParticleLaunch", nullptr, nullptr },  // PS_ACCUMULATE_DELTAVEL_PARTICLE (unmapped)
-    { "ps_updateParticleLaunch", nullptr, nullptr },  // PS_UPDATE_PARTICLE (unmapped)
+    { "ps_updateParticleLaunch", "particleSelfCollisionBda.spv", "ps_updateParticleLaunch" },  // PS_UPDATE_PARTICLE (P6.3 BDA port: apply accumDeltaP + recompute sorted velocity)
     { "ps_integrateLaunch", "particleSim.spv", "ps_integrateLaunch" },  // PS_INTEGRATION (P6.0 BDA port)
     { "ps_calculateDensityAndPotentialLaunch", nullptr, nullptr },  // PS_CALCULATE_DENSITIES_AND_POTENTIALS (unmapped)
     { "ps_solveDensityLaunch", nullptr, nullptr },  // PS_SOLVE_DENSITIES (unmapped)
-    { "ps_applyDeltaLaunch", nullptr, nullptr },  // PS_APPLY_DELTAS (unmapped)
+    { "ps_applyDeltaLaunch", "particleSelfCollisionBda.spv", "ps_applyDeltaLaunch" },  // PS_APPLY_DELTAS (P6.3 BDA port: SOR-average mDelta -> accumDeltaP)
     { "ps_vorticityConfinementLaunch", nullptr, nullptr },  // PS_VORTICITY_CONFINEMENT (unmapped)
     { "ps_solveVelocityLaunch", nullptr, nullptr },  // PS_SOLVE_VELOCITIES (unmapped)
     { "ps_updateRemapVertsLaunch", nullptr, nullptr },  // PS_UPDATE_REMAP_VERTS (unmapped)

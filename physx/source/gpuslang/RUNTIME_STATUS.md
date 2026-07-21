@@ -106,6 +106,48 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
+## P6.3 — particle self-collision + one-way solve on the engine ABI
+
+Brought the particle-particle self-collision path onto the BDA engine ABI — the
+3×3×3 grid neighbour search (over the P6.2 grid) + the one-way contact solve loop.
+Four kernels, all previously `nullptr`:
+- `ps_selfCollisionLaunch` (`particlesystem.cu:1145`, ABI `{8,4}`) — neighbour-search
+  the grid cells via `mCellStart`/`mCellEnd`/`mSortedToUnsortedMapping`, emit one-way
+  self-collision contacts + accumulate deltas.
+- `ps_solveOneWayContactDeltaVLaunch` (`:1823`, ABI `{8,8,4,4,4,1}`) — solve the
+  one-way contacts → `accumDeltaP`.
+- `ps_applyDeltaLaunch` (`:3689`, ABI `{8,8,4}`) — SOR-average `mDelta` → `accumDeltaP`.
+- `ps_updateParticleLaunch` (`:3010`, ABI `{8,8,4,1}`) — apply `accumDeltaP` + recompute
+  the sorted velocity.
+All reuse the P6.0 `PxgParticleSystemGpu` mirror unchanged (P6.3-touched offsets pinned
+via `offsetof`: `mAccumDeltaP@152`, `mOneWayContactInfos@200`, `mOneWayForces@208`,
+`mOneWayContactCount@232`, `mDelta@368`, `mData.mRestOffset@268`/`mSolidRestOffset@272`/
+`mRelaxationFactor@300`, `mCommonData.mMaxNeighborhood@124`).
+
+**Key llvmpipe deviation (verified equivalent):** the CUDA `SelfCollideCache`
+`__shared__ uint[32][64]` is accessed ONLY as `[*][threadIdx.x]` (write @1130, read @1231)
+— each thread exclusively owns its column, no cross-thread sharing — so it lowers to a
+per-thread local `uint[32]` and the `__syncwarp()` drops out. This **removes the sole
+32-lane-warp assumption**, making the kernel llvmpipe-safe, and is provably identical.
+
+**Correctness is proven by the unit test, not the scene:** on the uniform free-fall cloud
+all particles stay at rest spacing, so self-collision is a genuine no-op. The
+`particleSelfCollisionSeparates` test constructs two particles overlapping at Δx=0.15
+(< 2·solidRestOffset=0.2) with a filled grid, runs selfCollision → solveOneWay →
+applyDelta → updateParticle, and confirms they are pushed apart to Δ=0.25 ≥ 0.2,
+bit-exact vs a CPU transcription. The three solve kernels are also each unit-tested
+bit-exact in isolation. **`PXG_SCENE=particle` trace: all 4 dispatch OK every frame**
+(selfCollision ×120, the solve trio ×600 = 5 iters × 120 frames); **free-fall
+byte-identical (PGS 80.9665, TGS 9.89m)**. Suite **668/668** both memory modes;
+`PXG_SLANG_KERNEL_MAPPED` 160 → **164**. Rigid regression 8×2 = **16/16** (particle-only
+kernels, rigid path byte-unaffected).
+
+P6.4 frontier: the primitive/plane-contact chain (plain WithCount `radixSortMultiBlockLaunch`/
+`CalculateRanks`, `ps_reorderPrimitiveContactsLaunch`, `ps_primitivesBound*`,
+`ps_primitivesCollisionLaunch`, `ps_contactPrepareLaunch`, `ps_findStartEndParticle*`,
+`ps_solvePCOutputParticleDeltaV*`, `ps_accumulateDeltaVParticleLaunch`) — the "catch" that
+lets the cloud rest on a floor.
+
 ## P6.2 — particle grid build + reorder on the engine ABI (spatial hash → sort → cell start/end)
 
 Brought the particle grid-build stage onto the BDA engine ABI — the spatial-hash /
