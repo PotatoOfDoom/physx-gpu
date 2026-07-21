@@ -40,8 +40,23 @@
 
 #include "pxgTestFramework.h"
 
+// P6.4a-1 additions verify the psBoundsBda.slang BDA wrappers against the REAL
+// engine descriptors: ps_updateBound{First,Second}PassLaunch (2-pass world AABB
+// reduce, driven by a genuine PxgParticleSystem) and
+// ps_primitivesBound{First,Second}PassLaunch (per-pair grid cell-range count +
+// segmented scan, driven by real PxgContactManagerInput / PxgShape / PxBounds3).
+// host_defines.h expands the __device__/__align__ qualifiers before the engine
+// headers (nocuda/ is on the include path), matching testParticleSim.cpp.
+#include "host_defines.h"
+#include "PxgParticleSystem.h"     // real per-system descriptor
+#include "PxgContactManager.h"     // PxgContactManagerInput
+#include "PxgConvexConvexShape.h"  // PxgShape
+#include "PxsTransformCache.h"     // PxsCachedTransform (ABI-parity arg)
+#include "geometry/PxGeometry.h"   // PxGeometryType
+
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <numeric>
@@ -329,6 +344,330 @@ PXG_TEST(psBounds_scanAndReorder)
         dev->destroyBuffer(hCin); dev->destroyBuffer(hRA); dev->destroyBuffer(hRB);
         dev->destroyBuffer(hSA); dev->destroyBuffer(hSB);
     }
+}
+
+// ===========================================================================
+// P6.4a-1 BDA wrappers (psBoundsBda.slang) driven by REAL engine descriptors.
+// ===========================================================================
+using namespace physx;
+
+static uint32_t fbits(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+
+struct DevBuf { PxgBufferHandle h = 0; uint64_t addr = 0; };
+
+template <typename T>
+static DevBuf makeDev(PxgSlangComputeDevice* dev, const std::vector<T>& data)
+{
+    DevBuf b;
+    b.h = createBufferFrom(dev, data);
+    b.addr = dev->getBufferDeviceAddress(b.h);
+    return b;
+}
+
+static PxgParticleSystem makeZeroPs()
+{
+    PxgParticleSystem ps;
+    std::memset(&ps, 0, sizeof(ps));
+    return ps;
+}
+
+// ---------------------------------------------------------------------------
+// ps_updateBound{First,Second}PassLaunch — two-pass world AABB reduce.
+// Fills N particles into a genuine PxgParticleSystem, runs the per-block reduce
+// then the global reduce+fatten, and asserts the broadphase bound array AND the
+// mData.mBoundCenter writeback are BIT-EXACT vs a CPU min/max transcription.
+// ---------------------------------------------------------------------------
+PXG_TEST(psBounds_updateBoundReduce)
+{
+    // mirror strides / offsets the BDA kernel bakes in
+    static_assert(sizeof(PxgParticleSystem) == 656, "PxgParticleSystem stride");
+    static_assert(offsetof(PxgParticleSystem, mData) == 248, "mData offset");
+    static_assert(offsetof(PxgParticleSystemData, mBoundCenter) == 0, "mBoundCenter first in mData");
+
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // 2500 -> 3 pass-1 blocks of 1024 (partial last block) -> a 3-bound pass-2 reduce
+    const uint32_t N = 2500;
+    const uint32_t numBlocks = (N + 1024u - 1u) / 1024u;
+    const uint32_t elemIndex = 1u; // exercise non-zero broadphase element index
+    const float cd = 0.375f;
+
+    std::mt19937 rng(64041);
+    std::uniform_real_distribution<float> uv(-50.f, 50.f);
+    std::vector<F4> predicted(N);
+    for (uint32_t i = 0; i < N; ++i)
+        predicted[i] = { uv(rng), uv(rng), uv(rng), 1.0f };
+
+    // CPU reference: global min/max over xyz, then fatten by cd, then centre.
+    float gmin[3] = { 3.4028235e38f, 3.4028235e38f, 3.4028235e38f };
+    float gmax[3] = { -3.4028235e38f, -3.4028235e38f, -3.4028235e38f };
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const float* p = &predicted[i].x;
+        for (int k = 0; k < 3; ++k) { gmin[k] = std::min(gmin[k], p[k]); gmax[k] = std::max(gmax[k], p[k]); }
+    }
+    float refMin[3], refMax[3], refCenter[3];
+    for (int k = 0; k < 3; ++k)
+    {
+        refMin[k] = gmin[k] - cd;
+        refMax[k] = gmax[k] + cd;
+        refCenter[k] = (refMax[k] + refMin[k]) * 0.5f;
+    }
+
+    DevBuf bPred = makeDev(dev, predicted);
+    std::vector<int32_t> dummyDiffuseCount = { 0 };
+    DevBuf bDiffCount = makeDev(dev, dummyDiffuseCount);
+
+    PxgParticleSystem ps = makeZeroPs();
+    ps.mUnsortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bPred.addr));
+    ps.mOriginPos_InvMass = reinterpret_cast<float4*>(size_t(bPred.addr));       // unused (no CCD)
+    ps.mDiffuseOriginPos_LifeTime = reinterpret_cast<float4*>(size_t(bPred.addr));
+    ps.mDiffusePosition_LifeTime = reinterpret_cast<float4*>(size_t(bPred.addr));
+    ps.mNumDiffuseParticles = reinterpret_cast<int*>(size_t(bDiffCount.addr));   // unused (maxDiffuse 0)
+    ps.mCommonData.mNumParticles = N;
+    ps.mCommonData.mMaxDiffuseParticles = 0;
+    ps.mData.mFlags = 0;  // no eENABLE_SPECULATIVE_CCD
+
+    std::vector<PxgParticleSystem> descArr = { ps };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<float> tempBounds(numBlocks * 6u, 0.f);
+    DevBuf bTemp = makeDev(dev, tempBounds);
+    std::vector<float> boundArray((elemIndex + 1u) * 6u, -123.f);
+    DevBuf bBoundArr = makeDev(dev, boundArray);
+    std::vector<float> contactDists(elemIndex + 1u, 0.f);
+    contactDists[elemIndex] = cd;
+    DevBuf bCd = makeDev(dev, contactDists);
+
+    struct Push1 { uint64_t particleSystems; uint32_t id; uint32_t isTGS; uint64_t bounds; };
+    Push1 p1 = { bDesc.addr, 0u, 0u, bTemp.addr };
+    Kernel k1("psBoundsBda.spv", "ps_updateBoundFirstPassLaunch", {}, sizeof(Push1));
+    k1.dispatch(numBlocks, {}, p1, 1u, 1u);
+    dev->flush();
+
+    struct Push2
+    {
+        uint64_t particleSystems; uint32_t id; uint32_t pad12; uint64_t bounds;
+        uint32_t numBounds; uint32_t pad28; uint64_t boundArray; uint64_t contactDists;
+        uint32_t elemIndex; uint32_t pad52;
+    };
+    Push2 p2 = { bDesc.addr, 0u, 0u, bTemp.addr, numBlocks, 0u, bBoundArr.addr, bCd.addr, elemIndex, 0u };
+    Kernel k2("psBoundsBda.spv", "ps_updateBoundSecondPassLaunch", {}, sizeof(Push2));
+    k2.dispatch(1u, {}, p2, 1u, 1u);
+    dev->flush();
+
+    const auto gBound = downloadBuffer<float>(dev, bBoundArr.h, (elemIndex + 1u) * 6u);
+    const auto gDesc = downloadBuffer<PxgParticleSystem>(dev, bDesc.h, 1);
+
+    size_t mm = 0;
+    for (int k = 0; k < 3; ++k)
+    {
+        if (fbits(gBound[elemIndex * 6u + k]) != fbits(refMin[k])) { ++mm;
+            std::printf("  boundMin[%d] gpu=%g ref=%g\n", k, gBound[elemIndex * 6u + k], refMin[k]); }
+        if (fbits(gBound[elemIndex * 6u + 3u + k]) != fbits(refMax[k])) { ++mm;
+            std::printf("  boundMax[%d] gpu=%g ref=%g\n", k, gBound[elemIndex * 6u + 3u + k], refMax[k]); }
+    }
+    const float gc[3] = { gDesc[0].mData.mBoundCenter.x, gDesc[0].mData.mBoundCenter.y, gDesc[0].mData.mBoundCenter.z };
+    for (int k = 0; k < 3; ++k)
+        if (fbits(gc[k]) != fbits(refCenter[k])) { ++mm;
+            std::printf("  boundCenter[%d] gpu=%g ref=%g\n", k, gc[k], refCenter[k]); }
+
+    PXG_CHECK_MSG(mm == 0, "ps_updateBound bit-exact AABB reduce vs CPU (%zu mismatches)", mm);
+
+    dev->destroyBuffer(bPred.h); dev->destroyBuffer(bDiffCount.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bTemp.h); dev->destroyBuffer(bBoundArr.h); dev->destroyBuffer(bCd.h);
+}
+
+// ---------------------------------------------------------------------------
+// ps_primitivesBound{First,Second}PassLaunch — per-pair grid cell-range count +
+// segmented scan through real PxgContactManagerInput / PxgShape / PxBounds3.
+// Verifies the exclusive scan (offsets), the 32 per-block totals and the grand
+// total BIT-EXACT vs a CPU transcription for particle-vs-plane pairs (with the
+// LoadShapePair swap exercised by alternating which shapeRef is the particle).
+// ---------------------------------------------------------------------------
+PXG_TEST(psBounds_primitivesBoundCellRange)
+{
+    static_assert(sizeof(PxgContactManagerInput) == 16, "PxgContactManagerInput stride");
+    static_assert(sizeof(PxgShape) == 48, "PxgShape stride");
+    static_assert(offsetof(PxgShape, type) == 40, "PxgShape::type offset");
+    static_assert(offsetof(PxgShape, particleOrSoftbodyId) == 44, "PxgShape::particleOrSoftbodyId offset");
+
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t BLOCK = 512u, NUM_BLOCKS = 32u;
+    const uint32_t NT = 6000u;         // > 512*32/... spans multiple tiles per device block
+    const float cw = 0.5f;
+    const uint32_t grid[3] = { 16u, 16u, 16u };
+
+    std::mt19937 rng(64042);
+    std::uniform_real_distribution<float> u01(0, 1);
+    std::uniform_real_distribution<float> uv(-1, 1);
+
+    auto safeCoordL = [&](float v) { const float q = v / cw; return std::fabs(q - std::round(q)) > 1e-3f; };
+    auto floorDivL = [&](float v) { return (int32_t)std::floor(v / cw); };
+
+    // per-pair boxes + per-cache-ref contact distances
+    std::vector<F4> pMin(NT), pMax(NT), rMin(NT), rMax(NT);  // particle / rigid boxes
+    std::vector<float> cdP(NT), cdR(NT);
+    for (uint32_t i = 0; i < NT; ++i)
+    {
+        cdP[i] = 0.05f + 0.15f * u01(rng);
+        cdR[i] = 0.05f + 0.15f * u01(rng);
+        const float cd = cdP[i] + cdR[i];
+        for (uint32_t attempt = 0;; ++attempt)
+        {
+            const bool disjoint = (i % 7 == 5);
+            const float c0[3] = { 4.0f * uv(rng), 4.0f * uv(rng), 4.0f * uv(rng) };
+            const float h0[3] = { 0.3f + 1.6f * u01(rng), 0.3f + 1.6f * u01(rng), 0.3f + 1.6f * u01(rng) };
+            float c1[3] = { c0[0] + 1.3f * uv(rng), c0[1] + 1.3f * uv(rng), c0[2] + 1.3f * uv(rng) };
+            if (disjoint) c1[0] = c0[0] + h0[0] + 4.0f + 2.0f * u01(rng);
+            const float h1[3] = { 0.3f + 1.6f * u01(rng), 0.3f + 1.6f * u01(rng), 0.3f + 1.6f * u01(rng) };
+            float pmn[3], pmx[3], rmn[3], rmx[3];
+            bool ok = true;
+            for (int k = 0; k < 3; ++k)
+            {
+                pmn[k] = c0[k] - h0[k]; pmx[k] = c0[k] + h0[k];
+                rmn[k] = c1[k] - h1[k]; rmx[k] = c1[k] + h1[k];
+                const float mn = std::max(pmn[k], rmn[k]) - cd;
+                const float mx = std::min(pmx[k], rmx[k]) + cd;
+                ok = ok && safeCoordL(mn) && safeCoordL(mx);
+            }
+            if (ok)
+            {
+                pMin[i] = { pmn[0], pmn[1], pmn[2], 0 }; pMax[i] = { pmx[0], pmx[1], pmx[2], 0 };
+                rMin[i] = { rmn[0], rmn[1], rmn[2], 0 }; rMax[i] = { rmx[0], rmx[1], rmx[2], 0 };
+                break;
+            }
+            PXG_CHECK(attempt < 200);
+        }
+    }
+
+    // CPU reference: cell counts, straight exclusive scan, per-block chunk totals
+    std::vector<uint32_t> counts(NT), refOffsets(NT);
+    uint32_t total = 0;
+    size_t zeroRows = 0, multiRows = 0;
+    for (uint32_t i = 0; i < NT; ++i)
+    {
+        const float cd = cdP[i] + cdR[i];
+        uint32_t count = 1;
+        for (int k = 0; k < 3; ++k)
+        {
+            const float mn = std::max((&pMin[i].x)[k], (&rMin[i].x)[k]) - cd;
+            const float mx = std::min((&pMax[i].x)[k], (&rMax[i].x)[k]) + cd;
+            const int32_t r = std::min(std::max(floorDivL(mx) - floorDivL(mn) + 1, 0), (int32_t)grid[k]);
+            count *= (uint32_t)r;
+        }
+        counts[i] = count;
+        refOffsets[i] = total;
+        total += count;
+        if (count == 0) ++zeroRows;
+        if (count > 4) ++multiRows;
+    }
+    const uint32_t nbBlocksRequired = (NT + BLOCK - 1) / BLOCK;
+    const uint32_t iters = (nbBlocksRequired + NUM_BLOCKS - 1) / NUM_BLOCKS;
+    std::vector<uint32_t> refBlock(NUM_BLOCKS, 0);
+    for (uint32_t b = 0; b < NUM_BLOCKS; ++b)
+        for (uint32_t j = b * iters * BLOCK; j < std::min((b + 1) * iters * BLOCK, NT); ++j)
+            refBlock[b] += counts[j];
+
+    // ---- build the real engine descriptors ----
+    // pair i: cache refs (2i, 2i+1), shape refs (2i, 2i+1); the particle shape
+    // is placed in slot 0 for even i and slot 1 for odd i (exercises the swap).
+    std::vector<PxgContactManagerInput> cmInputs(NT);
+    std::vector<PxgShape> shapes(2 * NT);
+    std::vector<float> boundsF(2 * NT * 6, 0.f); // PxBounds3[2*NT] as raw floats
+    std::vector<float> contactDistance(2 * NT, 0.f);
+
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    for (uint32_t i = 0; i < NT; ++i)
+    {
+        const uint32_t particleCache = 2u * i, rigidCache = 2u * i + 1u;
+        PxgShape particleShape; std::memset(&particleShape, 0, sizeof(particleShape));
+        particleShape.type = PxU32(PxGeometryType::ePARTICLESYSTEM);
+        particleShape.particleOrSoftbodyId = 0u;
+        PxgShape rigidShape; std::memset(&rigidShape, 0, sizeof(rigidShape));
+        rigidShape.type = PxU32(PxGeometryType::ePLANE);
+
+        const bool particleInSlot0 = (i % 2u) == 0u;
+        const uint32_t sPart = 2u * i, sRig = 2u * i + 1u;
+        if (particleInSlot0)
+        {
+            shapes[sPart] = particleShape; shapes[sRig] = rigidShape;
+            cmInputs[i].shapeRef0 = sPart; cmInputs[i].shapeRef1 = sRig;
+            cmInputs[i].transformCacheRef0 = particleCache; cmInputs[i].transformCacheRef1 = rigidCache;
+        }
+        else
+        {
+            shapes[sPart] = rigidShape; shapes[sRig] = particleShape;
+            cmInputs[i].shapeRef0 = sPart; cmInputs[i].shapeRef1 = sRig;
+            cmInputs[i].transformCacheRef0 = rigidCache; cmInputs[i].transformCacheRef1 = particleCache;
+        }
+
+        // bounds[particleCache] = particle box, bounds[rigidCache] = rigid box
+        for (int k = 0; k < 3; ++k)
+        {
+            boundsF[particleCache * 6 + k] = (&pMin[i].x)[k];
+            boundsF[particleCache * 6 + 3 + k] = (&pMax[i].x)[k];
+            boundsF[rigidCache * 6 + k] = (&rMin[i].x)[k];
+            boundsF[rigidCache * 6 + 3 + k] = (&rMax[i].x)[k];
+        }
+        contactDistance[particleCache] = cdP[i];
+        contactDistance[rigidCache] = cdR[i];
+    }
+
+    PxgParticleSystem ps = makeZeroPs();
+    ps.mCommonData.mGridCellWidth = cw;
+    ps.mCommonData.mGridSizeX = grid[0];
+    ps.mCommonData.mGridSizeY = grid[1];
+    ps.mCommonData.mGridSizeZ = grid[2];
+    std::vector<PxgParticleSystem> descArr = { ps };
+
+    DevBuf bCin = makeDev(dev, cmInputs);
+    DevBuf bShapes = makeDev(dev, shapes);
+    DevBuf bBounds = makeDev(dev, boundsF);
+    DevBuf bCdist = makeDev(dev, contactDistance);
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> blockOffsets(NUM_BLOCKS, 0), offsets(NT, 0), totalBuf(1, 0);
+    DevBuf bBlockOff = makeDev(dev, blockOffsets);
+    DevBuf bOffsets = makeDev(dev, offsets);
+    DevBuf bTotal = makeDev(dev, totalBuf);
+
+    struct PB1
+    {
+        uint32_t numTests, pad4; uint64_t cmInputs, shapes, transformCache, bounds,
+            contactDistance, particleSystems, blockOffsets, offsets;
+    };
+    PB1 pb1 = { NT, 0u, bCin.addr, bShapes.addr, /*transformCache (unused)*/ bBounds.addr,
+                bBounds.addr, bCdist.addr, bDesc.addr, bBlockOff.addr, bOffsets.addr };
+    Kernel kp1("psBoundsBda.spv", "ps_primitivesBoundFirstPassLaunch", {}, sizeof(PB1));
+    kp1.dispatch(NUM_BLOCKS, {}, pb1, 1u, 1u);
+    dev->flush();
+
+    const auto gBlocks = downloadBuffer<uint32_t>(dev, bBlockOff.h, NUM_BLOCKS);
+    size_t mmB = 0;
+    for (uint32_t b = 0; b < NUM_BLOCKS; ++b)
+        if (gBlocks[b] != refBlock[b]) ++mmB;
+    PXG_CHECK_MSG(mmB == 0, "psPrimBound: %zu block-total mismatches", mmB);
+
+    struct PB2 { uint32_t numTests, pad4; uint64_t blockOffsets, offsets, totalNumPairs; };
+    PB2 pb2 = { NT, 0u, bBlockOff.addr, bOffsets.addr, bTotal.addr };
+    Kernel kp2("psBoundsBda.spv", "ps_primitivesBoundSecondPassLaunch", {}, sizeof(PB2));
+    kp2.dispatch(NUM_BLOCKS, {}, pb2, 1u, 1u);
+    dev->flush();
+
+    const auto gOff = downloadBuffer<uint32_t>(dev, bOffsets.h, NT);
+    const uint32_t gTotal = downloadBuffer<uint32_t>(dev, bTotal.h, 1)[0];
+    size_t mm = 0;
+    for (uint32_t i = 0; i < NT; ++i)
+        if (gOff[i] != refOffsets[i]) ++mm;
+    PXG_CHECK_MSG(mm == 0, "psPrimBound: %zu offset mismatches", mm);
+    PXG_CHECK_MSG(gTotal == total, "psPrimBound: total %u != %u", gTotal, total);
+    PXG_CHECK_MSG(zeroRows > 400 && multiRows > 200 && total > 20000,
+                  "psPrimBound: coverage thin (zero=%zu multi=%zu total=%u)", zeroRows, multiRows, total);
+
+    dev->destroyBuffer(bCin.h); dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bBounds.h);
+    dev->destroyBuffer(bCdist.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bBlockOff.h); dev->destroyBuffer(bOffsets.h); dev->destroyBuffer(bTotal.h);
 }
 
 } // namespace

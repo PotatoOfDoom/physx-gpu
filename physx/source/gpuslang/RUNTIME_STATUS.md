@@ -106,6 +106,35 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
+## P6.4a-1 — particle bound / cell-range kernels on the engine ABI
+
+Toward a particle-vs-floor "catch", brought the 4 particle bound/cell-range
+kernels onto the BDA engine ABI (the AABB bookkeeping that precedes contact gen;
+the heavy `ps_primitivesCollisionLaunch` is the separate next tranche P6.4a-2):
+- `ps_updateBoundFirstPassLaunch` (`{8,4,1,8}`) + `ps_updateBoundSecondPassLaunch`
+  (`{8,4,8,4,8,8,4}`) — 2-pass particle-system world-AABB reduce feeding the
+  broadphase (`PxgParticleSystemCore.cpp:856`/`:907`).
+- `ps_primitivesBoundFirstPassLaunch` (`{4,8,8,8,8,8,8,8,8}`) +
+  `ps_primitivesBoundSecondPassLaunch` (`{4,8,8,8}`) — per BP-found particle-shape
+  pair, the grid-cell range to test (`PxgNarrowphaseCore.cpp:3151`/`:3190`).
+New file `psBoundsBda.slang`. Reused mirrors: `PxgParticleSystemGpu` (P6.0, no
+extension needed), `PxgContactManagerInput` (16B, from boxBoxNphase.slang) and
+`PxgShape` (48B, type@40/particleOrSoftbodyId@44, from pxgSlangCommon.slang), both
+pinned by `offsetof`/`static_assert` against the real engine structs. The 32-lane
+`warpReduction` in updateBound lowered to a **portable full-block groupshared
+min/max tree** (min/max of a finite float set is associative + rounding-free ⇒
+bit-identical for any subgroup width — the llvmpipe guard).
+
+**Trace: `ps_updateBound{First,Second}` dispatch OK ×120/frame**; free-fall
+byte-unchanged (PGS 80.9665, TGS 9.89m). The `ps_primitivesBound` kernels are
+mapped + unit-tested bit-exact but do NOT dispatch in the 2s free-fall window (the
+cloud at y 81–100 never overlaps the ground box's AABB → `eParticlesystems` BP
+bucket empty, numTests=0); they activate once P6.4a-2 contact-gen brings the
+particle-vs-floor pairs online. Suite **668/668** both memory modes (new test
+`gpuslang.psBounds`: AABB reduce + cell-range both bit-exact vs CPU).
+`PXG_SLANG_KERNEL_MAPPED` 164 → **168**. Rigid regression 8×2 = **16/16** (reused
+rigid-shared narrowphase mirrors byte-unaffected).
+
 ## P6.3 — particle self-collision + one-way solve on the engine ABI
 
 Brought the particle-particle self-collision path onto the BDA engine ABI — the

@@ -274,6 +274,36 @@ static const uint8_t kPsSolveOneWay[] = { 8, 8, 4, 4, 4, 1 };
 //   (bool at @20).
 static const uint8_t kPsUpdateParticle[] = { 8, 8, 4, 1 };
 
+// gpusimulationcontroller particlesystem.cu (P6.4a-1 PBD bound bookkeeping):
+//   ps_updateBoundFirstPassLaunch(const PxgParticleSystem* particleSystems,
+//     const PxU32 id, const bool isTGS, PxBounds3* bounds) — per-block world AABB
+//   reduce.  Launch site PxgParticleSystemCore.cpp:856 packs
+//   { particleSystems, particleSystemId, isTGS, tempBuf } (ptr + PxU32 + bool +
+//   ptr) -> {8,4,1,8} = 24-byte blob (bool @12, bounds @16).
+static const uint8_t kPsUpdateBound1[] = { 8, 4, 1, 8 };
+//   ps_updateBoundSecondPassLaunch(PxgParticleSystem* particleSystems,
+//     const PxU32 id, const PxBounds3* bounds, const PxU32 numBounds,
+//     PxBounds3* boundArray, const PxReal* contactDists, const PxU32 elemIndex)
+//   — global AABB + fatten + centre.  Launch site
+//   PxgParticleSystemCore.cpp:907 packs { particleSystems, particleSystemId,
+//   tempBuf, numBlocks, boundArray, contactDists, elemId }
+//   -> {8,4,8,4,8,8,4} = 56-byte blob.
+static const uint8_t kPsUpdateBound2[] = { 8, 4, 8, 4, 8, 8, 4 };
+
+// gpunarrowphase cudaParticleSystem.cu (P6.4a-1 PBD primitive cell-range):
+//   ps_primitivesBoundFirstPassLaunch(const PxU32 numTests,
+//     const PxgContactManagerInput* cmInputs, const PxgShape* shapes,
+//     const PxsCachedTransform* transformCache, const PxBounds3* bounds,
+//     const PxReal* contactDistance, const PxgParticleSystem* particleSystems,
+//     PxU32* blockOffsets, PxU32* offsets) — per-pair cell-range count + scan.
+//   Launch site PxgNarrowphaseCore.cpp:3151 -> {4,8,8,8,8,8,8,8,8} = 72-byte blob.
+static const uint8_t kPsPrimBound1[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8 };
+//   ps_primitivesBoundSecondPassLaunch(const PxU32 numTests,
+//     const PxU32* blockOffsets, PxU32* offsets, PxU32* totalNumPairs) —
+//   block-total scan + fold.  Launch site PxgNarrowphaseCore.cpp:3190
+//   -> {4,8,8,8} = 32-byte blob.
+static const uint8_t kPsPrimBound2[] = { 4, 8, 8, 8 };
+
 // gpucommon/src/CUDA/radixSortImpl.cu (P6.2 grid radix sort):
 //   radixSortMultiBlockLaunchWithoutCount(PxgRadixSortDesc* desc, PxU32 startBit)
 //   / radixSortMultiCalculateRanksLaunchWithoutCount(same ABI) — the numKeys
@@ -417,6 +447,11 @@ static const PxgKernelAbiRow kRows[] = {
     // ps_updateParticleLaunch(const PxgParticleSystem*, const PxU32*, PxReal invDt,
     //   bool skipNewPositionAdjustment) -> {8,8,4,1}
     { "ps_updateParticleLaunch", kPsUpdateParticle, uint32_t(sizeof(kPsUpdateParticle)) },
+    // gpusimulationcontroller/gpunarrowphase (P6.4a-1 PBD bound / cell-range)
+    { "ps_updateBoundFirstPassLaunch", kPsUpdateBound1, uint32_t(sizeof(kPsUpdateBound1)) },
+    { "ps_updateBoundSecondPassLaunch", kPsUpdateBound2, uint32_t(sizeof(kPsUpdateBound2)) },
+    { "ps_primitivesBoundFirstPassLaunch", kPsPrimBound1, uint32_t(sizeof(kPsPrimBound1)) },
+    { "ps_primitivesBoundSecondPassLaunch", kPsPrimBound2, uint32_t(sizeof(kPsPrimBound2)) },
     // gpucommon radixSortImpl.cu:69 / :81 — the WithoutCount radix twins (P6.2 BDA)
     { "radixSortMultiBlockLaunchWithoutCount", kRadixDescNoCount, uint32_t(sizeof(kRadixDescNoCount)) },
     { "radixSortMultiCalculateRanksLaunchWithoutCount", kRadixDescNoCount, uint32_t(sizeof(kRadixDescNoCount)) },

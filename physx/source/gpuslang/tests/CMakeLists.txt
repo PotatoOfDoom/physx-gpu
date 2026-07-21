@@ -379,6 +379,13 @@ pxg_compile_shader(npSbSb ctSbSbQuery)
 pxg_compile_shader(npTetTriMid ctTetTriMid)
 pxg_compile_shader(psPrimContact ctPsPrimContact)
 pxg_compile_shader(psBounds ctPsBoundFirstPass ctPsBoundSecondPass ctPsReorderContacts ctPsGridHash)
+# P6.4a-1: PBD particle bound / cell-range bookkeeping on the engine ABI (BDA).
+# All four kernels read the PxgParticleSystem descriptor array (and the rigid
+# narrowphase cmInputs/shapes/bounds mirrors) through Ptr<>, which has no HLSL
+# cs_6_0 lowering, so this shader is deliberately absent from PXG_HLSL_ENTRIES
+# (same precedent as particleSim / particleGridBda / particleSelfCollisionBda).
+pxg_compile_shader(psBoundsBda ps_updateBoundFirstPassLaunch ps_updateBoundSecondPassLaunch
+                   ps_primitivesBoundFirstPassLaunch ps_primitivesBoundSecondPassLaunch)
 pxg_compile_shader(psPrimCollide ctPsPrimCollide)
 pxg_compile_shader(psDiffuseCollide ctPsDiffuseCollide)
 pxg_compile_shader(fcPrim ctFcPrim)
