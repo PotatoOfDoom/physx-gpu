@@ -697,3 +697,354 @@ void constraintContactBlockPrePrepLaunch(uint3 groupId : SV_GroupID,
     // allowed: forceIndex defaults to 0xFFFFFFFF when no force buffer exists)
     blockWorkUnit[batchIndex].mWriteback[threadIndexInWarp] = forceIndex + contactStartIndex;
 }
+
+// ---------------------------------------------------------------------------
+// clearFrictionPatchCounts (P5 Step 5 BDA engine ABI)
+// ---------------------------------------------------------------------------
+// Port of clearFrictionPatchCounts() in constraintBlockPrePrep.cu: one thread
+// per destroyed edge, zeroing that edge's previous-frame friction patch count
+// so stale friction correlation data cannot carry over to a recycled edge.
+// Launched from PxgCudaSolverCore/PxgTGSCudaSolverCore::gpuMemDMAUpContactData
+// whenever nbDestroyedEdges > 0.  block = CLEAR_FRICTION_PATCH_COUNTS (256),
+// grid = ceil(nbToClear / 256).
+//
+// Engine launch pack: (PxU32* frictionPatchCount, PxU32* edgeIndicesToClear,
+// PxU32 nbToClear) -> argSizes {8,8,4} = 24-byte blob (count @16, tail padded
+// to 8).
+struct ClearFrictionPatchCountsAbiParams
+{
+    uint64_t frictionPatchCount;  // @0  PxU32*
+    uint64_t edgeIndicesToClear;  // @8  PxU32*
+    uint nbToClear;               // @16 (bytes 20..23 blob tail padding)
+    uint abiPad0;                 // @20 (never read)
+}                                 // = 24
+[[vk::push_constant]]
+ConstantBuffer<ClearFrictionPatchCountsAbiParams> gClearFpc;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void clearFrictionPatchCounts(uint3 dtid : SV_DispatchThreadID)
+{
+    if (dtid.x >= gClearFpc.nbToClear)
+        return;
+
+    Ptr<uint> frictionPatchCount = Ptr<uint>(gClearFpc.frictionPatchCount);
+    Ptr<uint> edgeIndicesToClear = Ptr<uint>(gClearFpc.edgeIndicesToClear);
+
+    const uint indexToClear = edgeIndicesToClear[dtid.x];
+    frictionPatchCount[indexToClear] = 0u;
+}
+
+// ---------------------------------------------------------------------------
+// constraint1DBlockPrePrepLaunch (P5 Step 5 BDA engine ABI)
+// ---------------------------------------------------------------------------
+// Port of constraint1DBlockPrePrepLaunch() in constraintBlockPrePrep.cu — the
+// JOINT (1D-constraint) half of the block pre-prep.  The engine launches it
+// with the TOTAL batch count (contacts INCLUDED:
+// PxgGpuContext::doConstraintPrePrepCommon passes mNumConstraintBatches which
+// sums joint AND contact batches), so it runs for EVERY scene with any
+// constraint batches; warps whose batch is a contact type (eCONTACT /
+// eARTICULATION_CONTACT) do nothing, exactly like the .cu's
+// `if (conType == eCONSTRAINT_1D || eARTICULATION_CONSTRAINT_1D)` guard.
+// For 1D batches it stages the per-batch header + per-lane body/remap data
+// into the PxgBlockConstraintBatch and copies the joint prep rows
+// (PxgConstraintData + Px1DConstraint) into the block-SoA prep pools, then
+// allocates the batch's row range from desc->sharedJointRowIndex.
+//
+// Same 16-byte pack as constraintContactBlockPrePrepLaunch:
+//   (PxgPrePrepDesc*, PxgSolverSharedDesc<IterativeSolveData>*) -> {8,8}.
+// block = CONSTRAINT_PREPREP_BLOCK (128) = 4 warps; warpIndex selects the
+// batch.
+//
+// llvmpipe deviations (behaviour-preserving):
+//   - the warpCopy of the desc through shared memory becomes direct BDA reads;
+//   - warpScan<MaxOpPxU32>(numRows) becomes a groupshared 32-lane butterfly
+//     max per warp under BLOCK-uniform barriers (hoisted out of the per-warp
+//     type guard; inactive/contact warps reduce zeros);
+//   - the lane-31 atomicAdd on sharedJointRowIndex/sharedArticulationResponseIndex
+//     is an InterlockedAdd on the desc field (as in the contact twin).
+
+// mirrors PxgConstraintData (PxgConstraintPrep.h), 64 bytes
+struct PxgConstraintDataGpu
+{
+    float4 mInvMassScale;              // @0
+    float4 mRaWorld_linBreakForceW;    // @16
+    float4 mRbWorld_angBreakForceW;    // @32
+    uint4 mNumRows_Flags_StartIndex;   // @48
+}                                      // = 64 (array stride)
+
+// mirrors Px1DConstraint (PxConstraintDesc.h), 80 bytes PX_ALIGN(16)
+struct Px1DConstraintGpu
+{
+    float4 linear0XYZ_geometricErrorW; // @0
+    float4 angular0XYZ_velocityTargetW;// @16
+    float4 linear1XYZ_minImpulseW;     // @32
+    float4 angular1XYZ_maxImpulseW;    // @48
+    float mods_restitution;            // @64 (mods.bounce.restitution / spring.stiffness)
+    float mods_velocityThreshold;      // @68 (mods.bounce.velocityThreshold / spring.damping)
+    uint flags_solveHint;              // @72 PxU16 flags | PxU16 solveHint << 16
+    uint pad;                          // @76
+}                                      // = 80 (array stride)
+
+// per-warp numRows max scratch: 128 threads = 4 warps
+groupshared uint gsJointNumRows[128];
+
+[shader("compute")]
+[numthreads(128, 1, 1)]
+void constraint1DBlockPrePrepLaunch(uint3 groupId : SV_GroupID,
+                                    uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint tid = groupThreadId.x;
+    const uint blockStride = 128u / 32u;
+    const uint warpIndexInBlock = tid / 32u;
+    const uint threadIndexInWarp = tid & 31u;
+    const uint warpIndex = groupId.x * blockStride + warpIndexInBlock; // the batch index a
+
+    Ptr<PxgPrePrepDescGpu> desc = Ptr<PxgPrePrepDescGpu>(gCppLaunch.prePrepDesc);
+    Ptr<PxgSolverSharedDescIterGpu> sharedDesc = Ptr<PxgSolverSharedDescIterGpu>(gCppLaunch.sharedDesc);
+
+    const uint numBatches = desc[0].numBatches;
+    const uint numArtiBatches = desc[0].numArtiBatches;
+    const uint numArtiStaticBatches = desc[0].numArtiStaticBatches;
+    const uint numArtiSelfBatches = desc[0].numArtiSelfBatches;
+    const uint totalDynamicBatches = numBatches + numArtiBatches;
+    const uint totalBatches =
+        totalDynamicBatches + numArtiStaticBatches + numArtiSelfBatches + desc[0].numStaticBatches;
+
+    const uint nbElemsPerBody = desc[0].nbElementsPerBody;
+    const uint nbArticulations = desc[0].mTotalActiveArticulations;
+    const uint nbSlabs = desc[0].mTotalSlabs;
+
+    Ptr<PxgBodySim> bodySims = Ptr<PxgBodySim>(sharedDesc[0].mBodySimBufferDeviceData);
+
+    const uint a = warpIndex;
+    const bool warpActive = a < totalBatches;
+
+    uint conType = 0xFFFFFFFFu;
+    uint descStride = 0u;
+    uint batchIndex = 0u;
+    uint headerWord0 = 0u;
+    uint headerMask = 0u;
+    uint startPartitionIndex = 0u;
+    bool is1D = false;
+
+    Ptr<PxgBlockConstraintBatchGpu> blockBatches = Ptr<PxgBlockConstraintBatchGpu>(desc[0].blockBatches);
+
+    if (warpActive)
+    {
+        Ptr<PxgConstraintBatchHeaderGpu> headers = Ptr<PxgConstraintBatchHeaderGpu>(desc[0].mBatchHeaders);
+        headerWord0 = headers[a].mDescStride_constraintType;
+        batchIndex = headers[a].mConstraintBatchIndex;
+        startPartitionIndex = headers[a].mStartPartitionIndex;
+        headerMask = headers[a].mask;
+        conType = headerWord0 >> 16;       // PxgConstraintBatchHeader::constraintType
+        descStride = headerWord0 & 0xFFFFu;
+        // eCONSTRAINT_1D = 0, eARTICULATION_CONSTRAINT_1D = 2
+        is1D = (conType == 0u) || (conType == 2u);
+    }
+
+    uint numRows = 0u;
+
+    if (warpActive && is1D)
+    {
+        // Copy across data from batchHeader (CUDA: all lanes store the same
+        // values; the port stores from lane 0)
+        if (threadIndexInWarp == 0u)
+        {
+            blockBatches[a].descStride_constraintType = headerWord0;
+            blockBatches[a].mConstraintBatchIndex = batchIndex;
+            blockBatches[a].mStartPartitionIndex = startPartitionIndex;
+            blockBatches[a].mask = headerMask;
+        }
+
+        const uint outputRowStartIndex = batchIndex * MAX_CONSTRAINT_ROWS;
+
+        if (threadIndexInWarp < descStride)
+        {
+            const uint uniqueId = conType == 0u
+                ? (Ptr<uint>(desc[0].mConstraintUniqueIndices))[startPartitionIndex + threadIndexInWarp]
+                : (Ptr<uint>(desc[0].mArtiConstraintUniqueIndices))[startPartitionIndex + threadIndexInWarp];
+
+            Ptr<PartitionNodeDataGpu> partitionNodeData =
+                Ptr<PartitionNodeDataGpu>(desc[0].mPartitionNodeData);
+            Ptr<PartitionIndexDataGpu> partitionIndexData =
+                Ptr<PartitionIndexDataGpu>(desc[0].mPartitionIndices);
+            Ptr<uint> solverBodyIndices = Ptr<uint>(desc[0].solverBodyIndices);
+
+            const PartitionNodeDataGpu nodeData = partitionNodeData[uniqueId];
+            const uint2 igNodeIndexA = nodeData.mNodeIndex0;
+            const uint2 igNodeIndexB = nodeData.mNodeIndex1;
+
+            const bool isArticulationA = (igNodeIndexA.y & 1u) != 0u; // isArticulation()
+            const bool isArticulationB = (igNodeIndexB.y & 1u) != 0u;
+
+            const uint nodeIndexA = igNodeIndexA.x; // PxNodeIndex::index()
+            const uint nodeIndexB = igNodeIndexB.x;
+
+            const uint nextIndexA = nodeData.mNextIndex0;
+            const uint nextIndexB = nodeData.mNextIndex1;
+
+            const uint solverBodyIndexA =
+                nodeIndexA == PX_INVALID_NODE ? 0u : solverBodyIndices[nodeIndexA];
+            const uint solverBodyIndexB =
+                nodeIndexB == PX_INVALID_NODE ? 0u : solverBodyIndices[nodeIndexB];
+
+            blockBatches[a].bodyAIndex[threadIndexInWarp] = solverBodyIndexA;
+            blockBatches[a].bodyBIndex[threadIndexInWarp] = solverBodyIndexB;
+            blockBatches[a].bodyANodeIndex[threadIndexInWarp] = igNodeIndexA;
+            blockBatches[a].bodyBNodeIndex[threadIndexInWarp] = igNodeIndexB;
+
+            const uint currentPartition = partitionIndexData[uniqueId].partition_patch_ctype & 0xFFFFu;
+            const uint maxConstraintPartitions = desc[0].mMaxConstraintPartitions;
+            const uint slabId = currentPartition / maxConstraintPartitions;
+            blockBatches[a].slabId[threadIndexInWarp] = slabId;
+
+            Ptr<uint> partitionStartBatch = Ptr<uint>(desc[0].mPartitionstartBatchIndices);
+            Ptr<uint> partitionArtiStartBatch = Ptr<uint>(desc[0].mPartitionArtiStartBatchIndices);
+            Ptr<uint> partitionJointCounts = Ptr<uint>(desc[0].mPartitionJointCounts);
+            Ptr<uint> partitionArtiJointCounts = Ptr<uint>(desc[0].mPartitionArtiJointCounts);
+            Ptr<uint> solverBodyReferences = Ptr<uint>(desc[0].mSolverBodyReferences);
+            Ptr<uint> slabMaskWords = Ptr<uint>(sharedDesc[0].articulationSlabMask); // uint4 elements
+
+            // Static articulation constraints don't have all the data in the
+            // partitioning assigned to be able to compute the data below
+            if (a < totalDynamicBatches)
+            {
+                if (!isArticulationA)
+                {
+                    blockBatches[a].remappedBodyAIndex[threadIndexInWarp] = computeRemapIndexRigidBody(
+                        (nextIndexA & 1u) != 0u, partitionStartBatch, partitionArtiStartBatch,
+                        partitionJointCounts, partitionArtiJointCounts, partitionIndexData[nextIndexA >> 1],
+                        solverBodyReferences, currentPartition, maxConstraintPartitions,
+                        solverBodyIndexA, desc[0].mActiveBodyStartOffset, numBatches, numArtiBatches,
+                        nbElemsPerBody, nbSlabs);
+                }
+                else
+                {
+                    blockBatches[a].remappedBodyAIndex[threadIndexInWarp] =
+                        bodySims[nodeIndexA].articulationRemapId;
+
+                    const uint partitionId = currentPartition & (maxConstraintPartitions - 1u);
+                    const uint ind = solverBodyIndexA + (slabId + partitionId * nbSlabs) * nbArticulations;
+
+                    slabMaskWords[ind * 4u + 0u] = igNodeIndexA.y >> 1; // articulationLinkId()
+                    slabMaskWords[ind * 4u + 1u] = a * 32u * 2u * nbElemsPerBody + threadIndexInWarp;
+                }
+
+                if (!isArticulationB)
+                {
+                    blockBatches[a].remappedBodyBIndex[threadIndexInWarp] = computeRemapIndexRigidBody(
+                        (nextIndexB & 1u) != 0u, partitionStartBatch, partitionArtiStartBatch,
+                        partitionJointCounts, partitionArtiJointCounts, partitionIndexData[nextIndexB >> 1],
+                        solverBodyReferences, currentPartition, maxConstraintPartitions,
+                        solverBodyIndexB, desc[0].mActiveBodyStartOffset, numBatches, numArtiBatches,
+                        nbElemsPerBody, nbSlabs);
+                }
+                else
+                {
+                    blockBatches[a].remappedBodyBIndex[threadIndexInWarp] =
+                        bodySims[nodeIndexB].articulationRemapId;
+
+                    const uint partitionId = currentPartition & (maxConstraintPartitions - 1u);
+                    const uint ind = solverBodyIndexB + (slabId + partitionId * nbSlabs) * nbArticulations;
+
+                    slabMaskWords[ind * 4u + 2u] = igNodeIndexB.y >> 1;
+                    slabMaskWords[ind * 4u + 3u] = (a * 32u * 2u + 32u) * nbElemsPerBody + threadIndexInWarp;
+                }
+            }
+            else
+            {
+                if (isArticulationA)
+                    blockBatches[a].remappedBodyAIndex[threadIndexInWarp] =
+                        bodySims[nodeIndexA].articulationRemapId;
+                if (isArticulationB)
+                    blockBatches[a].remappedBodyBIndex[threadIndexInWarp] =
+                        bodySims[nodeIndexB].articulationRemapId;
+            }
+
+            // KS - doubles up as joint indices for joints!
+            const uint index = (Ptr<uint>(desc[0].mNpOutputIndices))[uniqueId];
+
+            const bool hasArticulations = isArticulationA || isArticulationB;
+            Ptr<PxgConstraintDataGpu> cdata = hasArticulations
+                ? Ptr<PxgConstraintDataGpu>(desc[0].artiConstraintData)
+                : Ptr<PxgConstraintDataGpu>(desc[0].constraintData);
+            Ptr<Px1DConstraintGpu> tRows = hasArticulations
+                ? Ptr<Px1DConstraintGpu>(desc[0].artiConstraintRows)
+                : Ptr<Px1DConstraintGpu>(desc[0].constraintRows);
+
+            Ptr<PxgBlockConstraint1DData> gBlockPrepData =
+                Ptr<PxgBlockConstraint1DData>(desc[0].blockPrepData);
+            Ptr<PxgBlockConstraint1DVelocities> gBlockPrepVelocityData =
+                Ptr<PxgBlockConstraint1DVelocities>(desc[0].blockPrepVelocityData);
+            Ptr<PxgBlockConstraint1DParameters> gBlockPrepParameterData =
+                Ptr<PxgBlockConstraint1DParameters>(desc[0].blockPrepParameterData);
+
+            const float4 raWorld_linBreakForceW = cdata[index].mRaWorld_linBreakForceW;
+            const float4 rbWorld_angBreakForceW = cdata[index].mRbWorld_angBreakForceW;
+            const uint4 mNumRows_Flags_StartIndex = cdata[index].mNumRows_Flags_StartIndex;
+            numRows = mNumRows_Flags_StartIndex.x;
+            const uint rowStartIndex = mNumRows_Flags_StartIndex.z;
+
+            gBlockPrepData[batchIndex].mInvMassScale[threadIndexInWarp] = cdata[index].mInvMassScale;
+            gBlockPrepData[batchIndex].mRAWorld_linBreakForce[threadIndexInWarp] = raWorld_linBreakForceW;
+            gBlockPrepData[batchIndex].mRBWorld_AngBreakForce[threadIndexInWarp] = rbWorld_angBreakForceW;
+            gBlockPrepData[batchIndex].mFlags[threadIndexInWarp] = mNumRows_Flags_StartIndex.y;
+            gBlockPrepData[batchIndex].mNumRows[threadIndexInWarp] = numRows;
+
+            for (uint i = 0; i < numRows; ++i)
+            {
+                const Px1DConstraintGpu constraint1D = tRows[rowStartIndex + i];
+
+                gBlockPrepVelocityData[outputRowStartIndex + i].linear0XYZ_geometricErrorW[threadIndexInWarp] =
+                    constraint1D.linear0XYZ_geometricErrorW;
+                gBlockPrepVelocityData[outputRowStartIndex + i].angular0XYZ_velocityTargetW[threadIndexInWarp] =
+                    constraint1D.angular0XYZ_velocityTargetW;
+                gBlockPrepVelocityData[outputRowStartIndex + i].linear1XYZ_minImpulseW[threadIndexInWarp] =
+                    constraint1D.linear1XYZ_minImpulseW;
+                gBlockPrepVelocityData[outputRowStartIndex + i].angular1XYZ_maxImpulseW[threadIndexInWarp] =
+                    constraint1D.angular1XYZ_maxImpulseW;
+
+                gBlockPrepParameterData[outputRowStartIndex + i].flags[threadIndexInWarp] =
+                    constraint1D.flags_solveHint & 0xFFFFu;
+                gBlockPrepParameterData[outputRowStartIndex + i].springStiffness_restitution[threadIndexInWarp] =
+                    constraint1D.mods_restitution;
+                gBlockPrepParameterData[outputRowStartIndex + i].springDamping_velocityThreshold[threadIndexInWarp] =
+                    constraint1D.mods_velocityThreshold;
+                gBlockPrepParameterData[outputRowStartIndex + i].solveHint[threadIndexInWarp] =
+                    constraint1D.flags_solveHint >> 16;
+            }
+        }
+    }
+
+    // warpScan<MaxOpPxU32>(numRows): per-warp max through groupshared under
+    // BLOCK-uniform barriers (hoisted out of the per-warp type guard; contact
+    // and inactive warps reduce zeros and skip the atomic below).
+    GroupMemoryBarrierWithGroupSync();
+    gsJointNumRows[tid] = numRows;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint radius = 16u; radius > 0u; radius >>= 1)
+    {
+        const uint partner = tid ^ radius; // stays inside the warp's 32 lanes
+        const uint other = gsJointNumRows[partner];
+        GroupMemoryBarrierWithGroupSync();
+        gsJointNumRows[tid] = max(gsJointNumRows[tid], other);
+        GroupMemoryBarrierWithGroupSync();
+    }
+    const uint warpMaxRows = gsJointNumRows[tid];
+
+    // we need to update the sharedJointRowIndex
+    if (warpActive && is1D && threadIndexInWarp == (32u - 1u))
+    {
+        uint startRow;
+        InterlockedAdd(desc[0].sharedJointRowIndex, warpMaxRows, startRow);
+        blockBatches[a].startConstraintIndex = startRow;
+
+        if (conType == 2u) // eARTICULATION_CONSTRAINT_1D
+        {
+            uint startResponse;
+            InterlockedAdd(desc[0].sharedArticulationResponseIndex, warpMaxRows, startResponse);
+            blockBatches[a].mArticulationResponseIndex = startResponse;
+        }
+    }
+}

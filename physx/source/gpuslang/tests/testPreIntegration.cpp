@@ -41,15 +41,6 @@ namespace
 
 using namespace pxgtest;
 
-struct PreIntegrationParams
-{
-    uint32_t offset;
-    uint32_t nbSolverBodies;
-    float dt;
-    float gravityX, gravityY, gravityZ;
-    uint32_t skipGravityApplication;
-};
-
 // ---------------------------------------------------------------------------
 // CPU reference: direct transcription of preIntegration.cuh
 // ---------------------------------------------------------------------------
@@ -253,8 +244,36 @@ QuatV randomQuat(std::mt19937& rng)
     return q.getNormalized();
 }
 
-void checkPreIntegration(uint32_t nbBodies, uint32_t seed, bool skipGravity)
+// initStaticKinematics on the ENGINE ABI (P5 Step 4): the kernel takes the
+// CUDA param pack (PxU32 nbStaticKinematics, PxU32 nbSolverBodies, six device
+// pointers) as a 56-byte blob through PxgCudaShim, with the engine's grid
+// arithmetic (nbStaticBlocks = ceil(nbStaticKinematics / PRE_INTEGRATION =
+// 128)).  Pure copies -> bit-exact comparison.
+static std::vector<uint8_t> preIntShimLoader(const char* file) { return loadShaderBlob(file); }
+
+template <typename T>
+static std::vector<T> downloadShim(physx::gpuslang::PxgCudaShim& shim, physx::gpuslang::PxgDevicePtr p,
+                                   uint32_t count)
 {
+    std::vector<T> out(count);
+    shim.memcpyDtoH(out.data(), p, size_t(count) * sizeof(T));
+    return out;
+}
+
+// preIntegrationLaunch (PGS) on the ENGINE ABI (P5 Step 5): the CUDA entry
+// forwards to the SAME preIntegration() as the TGS twin WITHOUT the trailing
+// bool (skipGravityApplication defaults to false), so the pack is the TGS one
+// minus the bool: (PxU32 offset, PxU32 nbSolverBodies, PxReal dt, PxVec3
+// gravity, eight device pointers) = 88-byte blob.  Same per-body math ->
+// same CPU reference (referencePreIntegration with skipGravity = false).
+// The skip-gravity path is TGS-only and covered by preIntegration_launchTGS.
+void checkPreIntegration(uint32_t nbBodies, uint32_t seed, bool mutate)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> unit(0.f, 1.f);
     std::uniform_real_distribution<float> sym(-10.f, 10.f);
@@ -311,87 +330,104 @@ void checkPreIntegration(uint32_t nbBodies, uint32_t seed, bool skipGravity)
     const float dt = 1.f / 60.f;
     const Vec3 gravity(0.f, -9.81f, 0.f);
 
-    // ---- GPU ----
+    // ---- GPU (engine ABI through PxgCudaShim) ----
     PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = { { "preIntegration.spv", "preIntegrationLaunch", 88u, 0 } };
+    PxgCudaShim shim(dev, manifest, 1, &preIntShimLoader);
 
-    Kernel kernel("preIntegration.spv", "preIntegrationLaunch",
-                  { sizeof(SolverBodyData), sizeof(SolverTxIData), sizeof(BodySim), 8,
-                    sizeof(AlignedTransform), 16, 4 },
-                  sizeof(PreIntegrationParams));
-
-    PxgBufferHandle solverBodyData = dev->createBuffer(nbBodies * sizeof(SolverBodyData));
-    PxgBufferHandle txIData = dev->createBuffer(nbBodies * sizeof(SolverTxIData));
-    PxgBufferHandle bodySimBuf = createBufferFrom(dev, bodySims);
-    PxgBufferHandle nodeIndices = createBufferFrom(dev, islandNodeIndices);
-    PxgBufferHandle transforms = dev->createBuffer(nbBodies * sizeof(AlignedTransform));
-    PxgBufferHandle velocityPool = dev->createBuffer(2 * nbBodies * sizeof(Float4));
+    std::vector<SolverBodyData> dataInit(nbBodies);
+    std::memset(dataInit.data(), 0x3A, dataInit.size() * sizeof(SolverBodyData));
+    std::vector<SolverTxIData> txiInit(nbBodies);
+    std::memset(txiInit.data(), 0x3B, txiInit.size() * sizeof(SolverTxIData));
+    std::vector<AlignedTransform> xformInit(nbBodies);
+    std::memset(xformInit.data(), 0x3C, xformInit.size() * sizeof(AlignedTransform));
+    std::vector<Float4> velInit(2 * nbBodies, Float4{ 77.5f, 77.5f, 77.5f, 77.5f });
     std::vector<uint32_t> bodyIndicesInit(maxNodes, 0xFFFFFFFFu);
-    PxgBufferHandle solverBodyIndices = createBufferFrom(dev, bodyIndicesInit);
 
-    const PreIntegrationParams params = { 0, nbBodies, dt, gravity.x, gravity.y, gravity.z,
-                                          skipGravity ? 1u : 0u };
-    const uint32_t blockSize = 128;
-    kernel.dispatch((nbBodies + blockSize - 1) / blockSize,
-                    { solverBodyData, txIData, bodySimBuf, nodeIndices, transforms, velocityPool,
-                      solverBodyIndices },
-                    params);
-    dev->flush();
+    PxgDevicePtr dData = 0, dSleep = 0, dTxi = 0, dBody = 0, dNodes = 0, dXform = 0, dVel = 0, dIndices = 0;
+    shim.memAlloc(&dData, dataInit.size() * sizeof(SolverBodyData));
+    shim.memAlloc(&dSleep, nbBodies * 32);        // solverBodySleepDataPool, unused by the kernel
+    shim.memAlloc(&dTxi, txiInit.size() * sizeof(SolverTxIData));
+    shim.memAlloc(&dBody, bodySims.size() * sizeof(BodySim));
+    shim.memAlloc(&dNodes, islandNodeIndices.size() * 8);
+    shim.memAlloc(&dXform, xformInit.size() * sizeof(AlignedTransform));
+    shim.memAlloc(&dVel, velInit.size() * sizeof(Float4));
+    shim.memAlloc(&dIndices, bodyIndicesInit.size() * 4);
+    if (!dData || !dTxi || !dBody || !dNodes || !dXform || !dVel || !dIndices)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+    shim.memcpyHtoD(dData, dataInit.data(), dataInit.size() * sizeof(SolverBodyData));
+    shim.memcpyHtoD(dTxi, txiInit.data(), txiInit.size() * sizeof(SolverTxIData));
+    shim.memcpyHtoD(dBody, bodySims.data(), bodySims.size() * sizeof(BodySim));
+    shim.memcpyHtoD(dNodes, islandNodeIndices.data(), islandNodeIndices.size() * 8);
+    shim.memcpyHtoD(dXform, xformInit.data(), xformInit.size() * sizeof(AlignedTransform));
+    shim.memcpyHtoD(dVel, velInit.data(), velInit.size() * sizeof(Float4));
+    shim.memcpyHtoD(dIndices, bodyIndicesInit.data(), bodyIndicesInit.size() * 4);
 
-    // ---- reference ----
+    struct
+    {
+        uint32_t offset;
+        uint32_t nbSolverBodies;
+        float dt;
+        float gx, gy, gz;
+        uint64_t solverBodyDataPool, solverBodySleepDataPool, solverTxIDataPool, bodySimPool;
+        uint64_t islandNodeIndices, transforms, outVelocityPool, solverBodyIndices;
+    } prm = { 0, nbBodies, dt, gravity.x, gravity.y, gravity.z,
+              dData, dSleep, dTxi, dBody, dNodes, dXform, dVel, dIndices };
+    static_assert(sizeof(prm) == 88, "preIntegrationLaunch blob is 88 bytes");
+
+    // mutation: swap the transforms and outVelocityPool device pointers so the
+    // kernel writes the pose where velocities are expected -> the compare fails.
+    if (mutate) { const uint64_t t = prm.transforms; prm.transforms = prm.outVelocityPool; prm.outVelocityPool = t; }
+
+    const uint32_t nbBlocks = (nbBodies + 127) / 128;
+    PXG_CHECK_MSG(shim.launchKernel(0, nbBlocks, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch preIntegrationLaunch");
+    shim.streamSynchronize();
+
+    // ---- reference (skipGravity is TGS-only; the PGS entry never skips) ----
     RefOutputs ref;
-    referencePreIntegration(nbBodies, dt, gravity, skipGravity, bodySims, islandNodeIndices, maxNodes, ref);
+    referencePreIntegration(nbBodies, dt, gravity, /*skipGravity*/ false, bodySims, islandNodeIndices,
+                            maxNodes, ref);
 
-    // ---- compare ----
-    const std::vector<SolverBodyData> gpuData = downloadBuffer<SolverBodyData>(dev, solverBodyData, nbBodies);
-    const std::vector<SolverTxIData> gpuTxI = downloadBuffer<SolverTxIData>(dev, txIData, nbBodies);
-    const std::vector<AlignedTransform> gpuTransforms = downloadBuffer<AlignedTransform>(dev, transforms, nbBodies);
-    const std::vector<Float4> gpuVel = downloadBuffer<Float4>(dev, velocityPool, 2 * nbBodies);
-    const std::vector<uint32_t> gpuIndices = downloadBuffer<uint32_t>(dev, solverBodyIndices, maxNodes);
+    std::vector<SolverBodyData> gData = downloadShim<SolverBodyData>(shim, dData, nbBodies);
+    std::vector<SolverTxIData> gTxi = downloadShim<SolverTxIData>(shim, dTxi, nbBodies);
+    std::vector<AlignedTransform> gXform = downloadShim<AlignedTransform>(shim, dXform, nbBodies);
+    std::vector<Float4> gVel = downloadShim<Float4>(shim, dVel, 2 * nbBodies);
+    std::vector<uint32_t> gIndices = downloadShim<uint32_t>(shim, dIndices, maxNodes);
 
-    auto checkFloat4 = [&](const char* what, uint32_t i, const Float4& g, const Float4& r) {
-        PXG_CHECK_MSG(almostEqual(g.x, r.x) && almostEqual(g.y, r.y) && almostEqual(g.z, r.z) &&
-                          almostEqual(g.w, r.w),
-                      "%s[%u]: gpu=(%g,%g,%g,%g) ref=(%g,%g,%g,%g)", what, i, g.x, g.y, g.z, g.w, r.x,
-                      r.y, r.z, r.w);
+    size_t bad = 0;
+    auto f4bad = [&](const Float4& g, const Float4& r) {
+        return !(almostEqual(g.x, r.x) && almostEqual(g.y, r.y) && almostEqual(g.z, r.z) && almostEqual(g.w, r.w));
     };
-
     for (uint32_t i = 0; i < nbBodies; ++i)
     {
-        checkFloat4("velLin", i, gpuVel[i], ref.velocityPool[i]);
-        checkFloat4("velAng", i, gpuVel[i + nbBodies], ref.velocityPool[i + nbBodies]);
-        checkFloat4("transform.q", i, gpuTransforms[i].q, ref.transforms[i].q);
-        checkFloat4("transform.p", i, gpuTransforms[i].p, ref.transforms[i].p);
-
-        const SolverBodyData& g = gpuData[i];
-        const SolverBodyData& r = ref.solverBodyData[i];
-        checkFloat4("data.initialAngVel", i, g.initialAngVelXYZ_penBiasClamp, r.initialAngVelXYZ_penBiasClamp);
-        checkFloat4("data.initialLinVel", i, g.initialLinVelXYZ_invMassW, r.initialLinVelXYZ_invMassW);
-        checkFloat4("data.body2World.q", i, g.body2World.q, r.body2World.q);
-        PXG_CHECK_MSG(g.islandNodeIndex == r.islandNodeIndex, "data.islandNodeIndex[%u]", i);
-        PXG_CHECK_MSG(g.flags == r.flags, "data.flags[%u]: gpu=%u ref=%u", i, g.flags, r.flags);
-        PXG_CHECK_MSG(almostEqual(g.reportThreshold, r.reportThreshold), "data.reportThreshold[%u]", i);
-        PXG_CHECK_MSG(almostEqual(g.maxImpulse, r.maxImpulse), "data.maxImpulse[%u]", i);
-        PXG_CHECK_MSG(almostEqual(g.offsetSlop, r.offsetSlop), "data.offsetSlop[%u]", i);
-
+        if (f4bad(gVel[i], ref.velocityPool[i])) ++bad;
+        if (f4bad(gVel[i + nbBodies], ref.velocityPool[i + nbBodies])) ++bad;
+        if (f4bad(gXform[i].q, ref.transforms[i].q)) ++bad;
+        if (f4bad(gXform[i].p, ref.transforms[i].p)) ++bad;
+        if (f4bad(gData[i].initialLinVelXYZ_invMassW, ref.solverBodyData[i].initialLinVelXYZ_invMassW)) ++bad;
+        if (f4bad(gData[i].initialAngVelXYZ_penBiasClamp, ref.solverBodyData[i].initialAngVelXYZ_penBiasClamp)) ++bad;
+        if (gData[i].islandNodeIndex != ref.solverBodyData[i].islandNodeIndex) ++bad;
+        if (gData[i].flags != ref.solverBodyData[i].flags) ++bad;
+        if (!almostEqual(gData[i].reportThreshold, ref.solverBodyData[i].reportThreshold)) ++bad;
+        if (!almostEqual(gData[i].maxImpulse, ref.solverBodyData[i].maxImpulse)) ++bad;
+        if (!almostEqual(gData[i].offsetSlop, ref.solverBodyData[i].offsetSlop)) ++bad;
         for (int m = 0; m < 9; ++m)
-        {
-            PXG_CHECK_MSG(almostEqual(gpuTxI[i].sqrtInvInertia[m], ref.txIData[i].sqrtInvInertia[m], 1e-4f, 1e-5f),
-                          "txI[%u].m[%d]: gpu=%g ref=%g", i, m, gpuTxI[i].sqrtInvInertia[m],
-                          ref.txIData[i].sqrtInvInertia[m]);
-        }
+            if (!almostEqual(gTxi[i].sqrtInvInertia[m], ref.txIData[i].sqrtInvInertia[m], 1e-4f, 1e-5f)) ++bad;
     }
-
     for (uint32_t n = 0; n < maxNodes; ++n)
-        PXG_CHECK_MSG(gpuIndices[n] == ref.solverBodyIndices[n], "solverBodyIndices[%u]: gpu=%u ref=%u",
-                      n, gpuIndices[n], ref.solverBodyIndices[n]);
+        if (gIndices[n] != ref.solverBodyIndices[n]) ++bad;
 
-    dev->destroyBuffer(solverBodyData);
-    dev->destroyBuffer(txIData);
-    dev->destroyBuffer(bodySimBuf);
-    dev->destroyBuffer(nodeIndices);
-    dev->destroyBuffer(transforms);
-    dev->destroyBuffer(velocityPool);
-    dev->destroyBuffer(solverBodyIndices);
+    if (mutate)
+        PXG_CHECK_MSG(bad != 0, "preIntegrationLaunch mutation must FAIL (swapped transforms/velocity ptrs)");
+    else
+        PXG_CHECK_MSG(bad == 0, "preIntegrationLaunch(n=%u): %zu mismatches", nbBodies, bad);
+
+    for (PxgDevicePtr p : { dData, dSleep, dTxi, dBody, dNodes, dXform, dVel, dIndices })
+        shim.memFree(p);
 }
 
 PXG_TEST(preIntegration_randomBodies)
@@ -399,8 +435,9 @@ PXG_TEST(preIntegration_randomBodies)
     checkPreIntegration(1000, 42, false);
 }
 
-PXG_TEST(preIntegration_skipGravity)
+PXG_TEST(preIntegration_mutation)
 {
+    // sanity: a swapped output pointer must be caught by the comparison
     checkPreIntegration(300, 43, true);
 }
 
@@ -409,22 +446,6 @@ PXG_TEST(preIntegration_partialBlock)
     checkPreIntegration(1, 44, false);
     checkPreIntegration(127, 45, false);
     checkPreIntegration(129, 46, false);
-}
-
-// initStaticKinematics on the ENGINE ABI (P5 Step 4): the kernel takes the
-// CUDA param pack (PxU32 nbStaticKinematics, PxU32 nbSolverBodies, six device
-// pointers) as a 56-byte blob through PxgCudaShim, with the engine's grid
-// arithmetic (nbStaticBlocks = ceil(nbStaticKinematics / PRE_INTEGRATION =
-// 128)).  Pure copies -> bit-exact comparison.
-static std::vector<uint8_t> preIntShimLoader(const char* file) { return loadShaderBlob(file); }
-
-template <typename T>
-static std::vector<T> downloadShim(physx::gpuslang::PxgCudaShim& shim, physx::gpuslang::PxgDevicePtr p,
-                                   uint32_t count)
-{
-    std::vector<T> out(count);
-    shim.memcpyDtoH(out.data(), p, size_t(count) * sizeof(T));
-    return out;
 }
 
 void checkInitStaticKinematics(uint32_t nbStaticKinematics, uint32_t seed)

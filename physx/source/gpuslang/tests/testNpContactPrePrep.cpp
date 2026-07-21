@@ -917,4 +917,454 @@ PXG_TEST(npContactPrePrep_engineKernel)
         shim.memFree(h);
 }
 
+// ---------------------------------------------------------------------------
+// clearFrictionPatchCounts (ENGINE ABI, P5 Step 5)
+// ---------------------------------------------------------------------------
+// One thread per destroyed edge: frictionPatchCount[edgeIndicesToClear[i]] = 0.
+// Launched by gpuMemDMAUpContactData when nbDestroyedEdges > 0 with the 3-arg
+// CUDA pack (PxU32* frictionPatchCount, PxU32* edgeIndicesToClear, PxU32
+// nbToClear) -> 24-byte blob; grid = ceil(nbToClear / 256).  Bit-exact
+// compare; untouched slots keep their sentinel (over-clear check).
+PXG_TEST(npContactPrePrep_clearFrictionPatchCounts)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    std::mt19937 rng(52100);
+    const uint32_t nbEdges = 700;
+    const uint32_t nbToClear = 301; // partial block: 301 threads of ceil = 2 * 256
+
+    // shuffled distinct indices so no edge is cleared twice
+    std::vector<uint32_t> indexPool(nbEdges);
+    for (uint32_t i = 0; i < nbEdges; ++i) indexPool[i] = i;
+    std::shuffle(indexPool.begin(), indexPool.end(), rng);
+    std::vector<uint32_t> toClear(indexPool.begin(), indexPool.begin() + nbToClear);
+
+    std::vector<uint32_t> countsInit(nbEdges);
+    for (auto& c : countsInit) c = 1 + rng() % 7; // non-zero sentinels
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "npContactPrePrep.spv", "clearFrictionPatchCounts", 24u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &cppShimLoader);
+
+    PxgDevicePtr dCounts = 0, dIdx = 0;
+    shim.memAlloc(&dCounts, countsInit.size() * 4);
+    shim.memAlloc(&dIdx, toClear.size() * 4);
+    if (!dCounts || !dIdx)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+    shim.memcpyHtoD(dCounts, countsInit.data(), countsInit.size() * 4);
+    shim.memcpyHtoD(dIdx, toClear.data(), toClear.size() * 4);
+
+    struct { uint64_t counts, idx; uint32_t nbToClear, pad; } prm = { dCounts, dIdx, nbToClear, 0 };
+    static_assert(sizeof(prm) == 24, "clearFrictionPatchCounts blob is 24 bytes");
+    const uint32_t nbBlocks = (nbToClear + 255) / 256; // CLEAR_FRICTION_PATCH_COUNTS = 256
+    PXG_CHECK_MSG(shim.launchKernel(0, nbBlocks, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch clearFrictionPatchCounts");
+    shim.streamSynchronize();
+
+    std::vector<uint32_t> refCounts = countsInit;
+    for (uint32_t i = 0; i < nbToClear; ++i)
+        refCounts[toClear[i]] = 0;
+
+    std::vector<uint32_t> g(nbEdges);
+    shim.memcpyDtoH(g.data(), dCounts, g.size() * 4);
+    size_t mm = 0;
+    for (uint32_t i = 0; i < nbEdges; ++i)
+        if (g[i] != refCounts[i]) ++mm;
+    PXG_CHECK_MSG(mm == 0, "clearFrictionPatchCounts: %zu mismatches", mm);
+
+    for (PxgDevicePtr h : { dCounts, dIdx })
+        shim.memFree(h);
+}
+
+// ---------------------------------------------------------------------------
+// constraint1DBlockPrePrepLaunch (ENGINE ABI, P5 Step 5)
+// ---------------------------------------------------------------------------
+// The JOINT half of the block pre-prep, launched with the TOTAL batch count
+// (contacts included).  Rigid-only scenario: 3 dynamic 1D batches interleaved
+// with 2 contact batches (which the kernel must SKIP — their block rows stay
+// sentinel) plus 1 static-region 1D batch (a >= totalDynamicBatches: header +
+// prep rows written, remap indices untouched for rigid bodies).  Row-range
+// allocation from the shared atomic is order-independent: the per-batch
+// (start, warpMaxRows) ranges must partition [init, final).  Everything else
+// is compared bitwise against the transcription (articulation branches are
+// exercised by real jointed-articulation scenes, not this fixture).
+PXG_TEST(npContactPrePrep_jointPrePrep)
+{
+    using namespace physx;
+
+    std::mt19937 rng(52200);
+    std::uniform_real_distribution<float> sf(-1.f, 1.f);
+
+    // k: 0=1D 1=contact 2=1D 3=contact 4=1D | 5=static 1D
+    const uint32_t numBatches = 5, numArtiBatches = 0, numStaticBatches = 1;
+    const uint32_t totalBatches = numBatches + numArtiBatches + numStaticBatches; // 6
+    const uint32_t dynamicBatchEnd = numBatches + numArtiBatches;                 // 5
+    const bool is1DBatch[6] = { true, false, true, false, true, true };
+
+    const uint32_t numNodes = 96;
+    const uint32_t totalActiveBodies = 24, activeBodyOffset = 6;
+    const uint32_t maxConstraintPartitions = 8, nbSlabs = 2, nbElemsPerBody = 2;
+    const uint32_t numPartitions = 64;
+    const uint32_t nUnique = totalBatches * 32 * 2; // rigid slots then arti slots
+    const uint32_t nBlockData = 8;                  // blockPrepData elements
+    const uint32_t MAXROWS = 20;                    // Dy::MAX_CONSTRAINT_ROWS
+    const uint32_t maxRowsPerJoint = 6;
+    const uint32_t nCData = 256;
+    const uint32_t refCap = 64;
+    const uint32_t initJointRow = 5;
+
+    std::vector<PxgConstraintBatchHeader> headers(totalBatches);
+    std::memset(headers.data(), 0, headers.size() * sizeof(PxgConstraintBatchHeader));
+    uint32_t cbiCursor = 0;
+    for (uint32_t k = 0; k < totalBatches; ++k)
+    {
+        headers[k].mDescStride = PxU16(is1DBatch[k] ? (1 + rng() % 32) : (4 + rng() % 29));
+        headers[k].constraintType = PxU16(is1DBatch[k] ? 0 : 1); // eCONSTRAINT_1D / eCONTACT
+        headers[k].mConstraintBatchIndex = is1DBatch[k] ? cbiCursor++ : (rng() % nBlockData);
+        headers[k].mStartPartitionIndex = k * 32;
+        headers[k].mask = rng();
+    }
+
+    std::vector<uint32_t> constraintUnique((totalBatches + 1) * 32);
+    for (uint32_t i = 0; i < constraintUnique.size(); ++i)
+        constraintUnique[i] = i % (totalBatches * 32);
+
+    std::vector<uint32_t> solverBodyIndices(numNodes);
+    for (uint32_t n = 0; n < numNodes; ++n)
+        solverBodyIndices[n] = rng() % totalActiveBodies;
+
+    std::vector<PartitionNodeData> nodeData(nUnique);
+    std::memset(nodeData.data(), 0, nodeData.size() * sizeof(PartitionNodeData));
+    std::vector<PartitionIndexData> indexData(nUnique);
+    std::memset(indexData.data(), 0, indexData.size() * sizeof(PartitionIndexData));
+    std::vector<uint32_t> npOutputIndices(nUnique);
+    for (uint32_t q = 0; q < nUnique; ++q)
+    {
+        const bool staticA = (rng() % 6 == 0);
+        const bool staticB = (rng() % 4 == 0);
+        nodeData[q].mNodeIndex0 = staticA ? PxNodeIndex() : PxNodeIndex(rng() % numNodes);
+        nodeData[q].mNodeIndex1 = staticB ? PxNodeIndex() : PxNodeIndex(rng() % numNodes);
+        nodeData[q].mNextIndex[0] = ((rng() % nUnique) << 1) | (rng() & 1);
+        nodeData[q].mNextIndex[1] = ((rng() % nUnique) << 1) | (rng() & 1);
+
+        indexData[q].mPartitionIndex = PxU16(rng() % numPartitions);
+        indexData[q].mPatchIndex = PxU8(rng() % 3);
+        indexData[q].mCType = PxU8(rng() % 4);
+        indexData[q].mPartitionEntryIndex = rng() % 4096;
+
+        npOutputIndices[q] = q % nCData; // joints: direct PxgConstraintData index
+    }
+
+    std::vector<uint32_t> partStart(numPartitions), partArtiStart(numPartitions),
+        partJointCounts(numPartitions), partArtiJointCounts(numPartitions);
+    for (uint32_t pi = 0; pi < numPartitions; ++pi)
+    {
+        partStart[pi] = rng() % 100;
+        partArtiStart[pi] = rng() % 100;
+        partJointCounts[pi] = rng() % 10;
+        partArtiJointCounts[pi] = rng() % 10;
+    }
+
+    // joint prep inputs: PxgConstraintData + Px1DConstraint row pools
+    std::vector<PxgConstraintData> cdata(nCData);
+    std::memset(cdata.data(), 0, cdata.size() * sizeof(PxgConstraintData));
+    const uint32_t nRows = nCData * maxRowsPerJoint;
+    std::vector<Px1DConstraint> rows(nRows);
+    std::memset(rows.data(), 0, rows.size() * sizeof(Px1DConstraint));
+    for (uint32_t c = 0; c < nCData; ++c)
+    {
+        PxgConstraintData& d = cdata[c];
+        d.mInvMassScale.linear0 = sf(rng); d.mInvMassScale.angular0 = sf(rng);
+        d.mInvMassScale.linear1 = sf(rng); d.mInvMassScale.angular1 = sf(rng);
+        d.mRaWorld_linBreakForceW = make_float4(sf(rng), sf(rng), sf(rng), sf(rng));
+        d.mRbWorld_angBreakForceW = make_float4(sf(rng), sf(rng), sf(rng), sf(rng));
+        const uint32_t nr = rng() % (maxRowsPerJoint + 1); // 0..6 rows
+        d.mNumRows_Flags_StartIndex.x = nr;
+        d.mNumRows_Flags_StartIndex.y = rng();
+        d.mNumRows_Flags_StartIndex.z = c * maxRowsPerJoint;
+        d.mNumRows_Flags_StartIndex.w = 0;
+    }
+    for (uint32_t r = 0; r < nRows; ++r)
+    {
+        Px1DConstraint& c1 = rows[r];
+        c1.linear0 = PxVec3(sf(rng), sf(rng), sf(rng)); c1.geometricError = sf(rng);
+        c1.angular0 = PxVec3(sf(rng), sf(rng), sf(rng)); c1.velocityTarget = sf(rng);
+        c1.linear1 = PxVec3(sf(rng), sf(rng), sf(rng)); c1.minImpulse = -1.f - sf(rng);
+        c1.angular1 = PxVec3(sf(rng), sf(rng), sf(rng)); c1.maxImpulse = 1.f + sf(rng);
+        c1.mods.bounce.restitution = sf(rng);
+        c1.mods.bounce.velocityThreshold = sf(rng);
+        c1.flags = PxU16(rng() & 0xFFFF);
+        c1.solveHint = PxU16(rng() & 0xFFFF);
+        c1.pad = 0;
+    }
+
+    // ---- sentinel-filled outputs ----
+    const uint32_t SENT = 0xABABABABu;
+    std::vector<uint32_t> blockBatchesInit(totalBatches * sizeof(PxgBlockConstraintBatch) / 4, SENT);
+    std::vector<uint32_t> prepDataInit(nBlockData * sizeof(PxgBlockConstraint1DData) / 4, SENT);
+    std::vector<uint32_t> prepVelInit(nBlockData * MAXROWS * sizeof(PxgBlockConstraint1DVelocities) / 4, SENT);
+    std::vector<uint32_t> prepParInit(nBlockData * MAXROWS * sizeof(PxgBlockConstraint1DParameters) / 4, SENT);
+    std::vector<uint32_t> bodyRefInit(refCap, SENT);
+
+    std::vector<PxgBodySim> bodySims(numNodes);
+    std::memset(bodySims.data(), 0, bodySims.size() * sizeof(PxgBodySim));
+
+    // ---- device buffers ----
+    PxgSlangComputeDevice* dev = testDevice();
+    const physx::gpuslang::PxgKernelDef manifest[] = {
+        { "npContactPrePrep.spv", "constraint1DBlockPrePrepLaunch", 16u, 0 },
+    };
+    physx::gpuslang::PxgCudaShim shim(dev, manifest, 1, &cppShimLoader);
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    auto alloc = [&](const void* data, size_t bytes) -> PxgDevicePtr {
+        PxgDevicePtr dp = 0;
+        shim.memAlloc(&dp, bytes);
+        if (dp && data)
+            shim.memcpyHtoD(dp, data, bytes);
+        return dp;
+    };
+
+    const PxgDevicePtr dHeaders = alloc(headers.data(), headers.size() * sizeof(PxgConstraintBatchHeader));
+    const PxgDevicePtr dCU = alloc(constraintUnique.data(), constraintUnique.size() * 4);
+    const PxgDevicePtr dSBI = alloc(solverBodyIndices.data(), solverBodyIndices.size() * 4);
+    const PxgDevicePtr dND = alloc(nodeData.data(), nodeData.size() * sizeof(PartitionNodeData));
+    const PxgDevicePtr dID = alloc(indexData.data(), indexData.size() * sizeof(PartitionIndexData));
+    const PxgDevicePtr dNpIdx = alloc(npOutputIndices.data(), npOutputIndices.size() * 4);
+    const PxgDevicePtr dPS = alloc(partStart.data(), partStart.size() * 4);
+    const PxgDevicePtr dPAS = alloc(partArtiStart.data(), partArtiStart.size() * 4);
+    const PxgDevicePtr dPJC = alloc(partJointCounts.data(), partJointCounts.size() * 4);
+    const PxgDevicePtr dPAJC = alloc(partArtiJointCounts.data(), partArtiJointCounts.size() * 4);
+    const PxgDevicePtr dCData = alloc(cdata.data(), cdata.size() * sizeof(PxgConstraintData));
+    const PxgDevicePtr dRows = alloc(rows.data(), rows.size() * sizeof(Px1DConstraint));
+    const PxgDevicePtr dBodySims = alloc(bodySims.data(), bodySims.size() * sizeof(PxgBodySim));
+    const PxgDevicePtr dBB = alloc(blockBatchesInit.data(), blockBatchesInit.size() * 4);
+    const PxgDevicePtr dPD = alloc(prepDataInit.data(), prepDataInit.size() * 4);
+    const PxgDevicePtr dPV = alloc(prepVelInit.data(), prepVelInit.size() * 4);
+    const PxgDevicePtr dPP = alloc(prepParInit.data(), prepParInit.size() * 4);
+    const PxgDevicePtr dBodyRef = alloc(bodyRefInit.data(), bodyRefInit.size() * 4);
+    if (!dHeaders) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgPrePrepDesc pre;
+    std::memset(&pre, 0xCD, sizeof(pre));
+    pre.blockBatches = reinterpret_cast<PxgBlockConstraintBatch*>(dBB);
+    pre.numBatches = numBatches;
+    pre.numStaticBatches = numStaticBatches;
+    pre.numArtiBatches = 0;
+    pre.numArtiStaticBatches = 0;
+    pre.numArtiSelfBatches = 0;
+    pre.blockPrepData = reinterpret_cast<PxgBlockConstraint1DData*>(dPD);
+    pre.blockPrepVelocityData = reinterpret_cast<PxgBlockConstraint1DVelocities*>(dPV);
+    pre.blockPrepParameterData = reinterpret_cast<PxgBlockConstraint1DParameters*>(dPP);
+    pre.constraintData = reinterpret_cast<PxgConstraintData*>(dCData);
+    pre.constraintRows = reinterpret_cast<Px1DConstraint*>(dRows);
+    pre.artiConstraintData = NULL;
+    pre.artiConstraintRows = NULL;
+    pre.sharedJointRowIndex = initJointRow;
+    pre.sharedArticulationResponseIndex = 0;
+    pre.solverBodyIndices = reinterpret_cast<PxU32*>(dSBI);
+    pre.mPartitionIndices = reinterpret_cast<PartitionIndexData*>(dID);
+    pre.mPartitionstartBatchIndices = reinterpret_cast<PxU32*>(dPS);
+    pre.mPartitionArtiStartBatchIndices = reinterpret_cast<PxU32*>(dPAS);
+    pre.mPartitionJointCounts = reinterpret_cast<PxU32*>(dPJC);
+    pre.mPartitionArtiJointCounts = reinterpret_cast<PxU32*>(dPAJC);
+    pre.mNpOutputIndices = reinterpret_cast<PxU32*>(dNpIdx);
+    pre.mPartitionNodeData = reinterpret_cast<PartitionNodeData*>(dND);
+    pre.mBatchHeaders = reinterpret_cast<PxgConstraintBatchHeader*>(dHeaders);
+    pre.mConstraintUniqueIndices = reinterpret_cast<PxU32*>(dCU);
+    pre.mArtiConstraintUniqueIndices = NULL;
+    pre.mSolverBodyReferences = reinterpret_cast<PxgSolverReferences*>(dBodyRef);
+    pre.mMaxConstraintPartitions = maxConstraintPartitions;
+    pre.mTotalSlabs = nbSlabs;
+    pre.mTotalActiveBodies = totalActiveBodies;
+    pre.mTotalActiveArticulations = 0;
+    pre.mActiveBodyStartOffset = activeBodyOffset;
+    pre.nbElementsPerBody = nbElemsPerBody;
+
+    PxgSolverSharedDesc<IterativeSolveData> sh;
+    std::memset(&sh, 0xCD, sizeof(sh));
+    sh.mBodySimBufferDeviceData = reinterpret_cast<PxgBodySim*>(dBodySims);
+    sh.articulationSlabMask = NULL; // rigid-only fixture: the arti branch is never taken
+    sh.deltaOutOffset = 0x7FFFFFFF;
+
+    const PxgDevicePtr dPre = alloc(&pre, sizeof(pre));
+    const PxgDevicePtr dSh = alloc(&sh, sizeof(sh));
+
+    // engine launch: grid = ceil(totalBatches*32 / CONSTRAINT_PREPREP_BLOCK=128)
+    const uint32_t nbBlocks = (totalBatches * 32 + 127) / 128;
+    struct { uint64_t pre, sh; } prm = { dPre, dSh };
+    PXG_CHECK_MSG(shim.launchKernel(0, nbBlocks, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch constraint1DBlockPrePrepLaunch");
+    shim.streamSynchronize();
+
+    // ---- download ----
+    std::vector<PxgBlockConstraintBatch> gBB(totalBatches);
+    std::vector<uint32_t> gPD(prepDataInit.size()), gPV(prepVelInit.size()), gPP(prepParInit.size());
+    std::vector<uint32_t> gBodyRef(refCap);
+    PxgPrePrepDesc preOut;
+    shim.memcpyDtoH(gBB.data(), dBB, gBB.size() * sizeof(PxgBlockConstraintBatch));
+    shim.memcpyDtoH(gPD.data(), dPD, gPD.size() * 4);
+    shim.memcpyDtoH(gPV.data(), dPV, gPV.size() * 4);
+    shim.memcpyDtoH(gPP.data(), dPP, gPP.size() * 4);
+    shim.memcpyDtoH(gBodyRef.data(), dBodyRef, refCap * 4);
+    shim.memcpyDtoH(&preOut, dPre, sizeof(preOut));
+
+    size_t mm = 0;
+
+    // ---- step 1: the atomic allocations partition [initJointRow, final) ----
+    struct Range { uint32_t start, count; };
+    std::vector<Range> jointRanges;
+    uint32_t warpMax[6] = { 0 };
+    for (uint32_t k = 0; k < totalBatches; ++k)
+    {
+        if (!is1DBatch[k]) continue;
+        for (uint32_t l = 0; l < headers[k].mDescStride; ++l)
+        {
+            const uint32_t uq = constraintUnique[headers[k].mStartPartitionIndex + l];
+            warpMax[k] = std::max(warpMax[k], cdata[npOutputIndices[uq]].mNumRows_Flags_StartIndex.x);
+        }
+        jointRanges.push_back({ gBB[k].startConstraintIndex, warpMax[k] });
+    }
+    {
+        std::sort(jointRanges.begin(), jointRanges.end(),
+                  [](const Range& a, const Range& b) { return a.start < b.start; });
+        uint32_t cur = initJointRow;
+        for (const Range& r : jointRanges)
+        {
+            if (r.start != cur) { std::printf("MM jointAlloc: range start %u != %u\n", r.start, cur); ++mm; }
+            cur += r.count;
+        }
+        if (cur != preOut.sharedJointRowIndex)
+        { std::printf("MM jointAlloc: end %u != %u\n", cur, preOut.sharedJointRowIndex); ++mm; }
+    }
+
+    // ---- step 2: full CPU reference AT the GPU-allocated bases ----
+    std::vector<uint32_t> refBB = blockBatchesInit;
+    std::vector<uint32_t> refPD = prepDataInit;
+    std::vector<uint32_t> refPV = prepVelInit;
+    std::vector<uint32_t> refPP = prepParInit;
+    std::vector<uint32_t> refBodyRef = bodyRefInit;
+    std::vector<uint32_t> refBodyRefCount(refCap, 0);
+
+    PxgBlockConstraintBatch* rBB = reinterpret_cast<PxgBlockConstraintBatch*>(refBB.data());
+    PxgBlockConstraint1DData* rPD = reinterpret_cast<PxgBlockConstraint1DData*>(refPD.data());
+    PxgBlockConstraint1DVelocities* rPV = reinterpret_cast<PxgBlockConstraint1DVelocities*>(refPV.data());
+    PxgBlockConstraint1DParameters* rPP = reinterpret_cast<PxgBlockConstraint1DParameters*>(refPP.data());
+
+    for (uint32_t k = 0; k < totalBatches; ++k)
+    {
+        if (!is1DBatch[k]) continue;
+        const uint32_t descStride = headers[k].mDescStride;
+        const uint32_t batchIndex = headers[k].mConstraintBatchIndex;
+        PxgBlockConstraintBatch& b = rBB[k];
+        b.mDescStride = headers[k].mDescStride;
+        b.constraintType = headers[k].constraintType;
+        b.mConstraintBatchIndex = batchIndex;
+        b.mStartPartitionIndex = headers[k].mStartPartitionIndex;
+        b.mask = headers[k].mask;
+        b.startConstraintIndex = gBB[k].startConstraintIndex; // GPU-allocated
+
+        for (uint32_t l = 0; l < descStride; ++l)
+        {
+            const uint32_t uq = constraintUnique[headers[k].mStartPartitionIndex + l];
+            const PartitionNodeData& nd = nodeData[uq];
+            const uint32_t nodeA = nd.mNodeIndex0.index(), nodeB = nd.mNodeIndex1.index();
+            const uint32_t sbA = nodeA == 0xFFFFFFFFu ? 0 : solverBodyIndices[nodeA];
+            const uint32_t sbB = nodeB == 0xFFFFFFFFu ? 0 : solverBodyIndices[nodeB];
+            b.bodyAIndex[l] = sbA;
+            b.bodyBIndex[l] = sbB;
+            b.bodyANodeIndex[l] = nd.mNodeIndex0;
+            b.bodyBNodeIndex[l] = nd.mNodeIndex1;
+            const uint32_t currentPartition = indexData[uq].mPartitionIndex;
+            const uint32_t slabId = currentPartition / maxConstraintPartitions;
+            b.slabId[l] = slabId;
+            if (k < dynamicBatchEnd)
+            {
+                b.remappedBodyAIndex[l] = refRemapIndexRigidBody(
+                    (nd.mNextIndex[0] & 1) != 0, partStart, partArtiStart, partJointCounts,
+                    partArtiJointCounts, indexData[nd.mNextIndex[0] >> 1], refBodyRef, refBodyRefCount,
+                    currentPartition, maxConstraintPartitions, sbA, activeBodyOffset, numBatches,
+                    numArtiBatches, nbElemsPerBody, nbSlabs);
+                b.remappedBodyBIndex[l] = refRemapIndexRigidBody(
+                    (nd.mNextIndex[1] & 1) != 0, partStart, partArtiStart, partJointCounts,
+                    partArtiJointCounts, indexData[nd.mNextIndex[1] >> 1], refBodyRef, refBodyRefCount,
+                    currentPartition, maxConstraintPartitions, sbB, activeBodyOffset, numBatches,
+                    numArtiBatches, nbElemsPerBody, nbSlabs);
+            }
+            // else: static-region rigid 1D batch — no remap writes at all
+
+            const uint32_t index = npOutputIndices[uq];
+            const PxgConstraintData& d = cdata[index];
+            const uint32_t nr = d.mNumRows_Flags_StartIndex.x;
+            const uint32_t rowStart = d.mNumRows_Flags_StartIndex.z;
+            const uint32_t outBase = batchIndex * MAXROWS;
+            rPD[batchIndex].mInvMassScale[l] = d.mInvMassScale;
+            rPD[batchIndex].mRAWorld_linBreakForce[l] = d.mRaWorld_linBreakForceW;
+            rPD[batchIndex].mRBWorld_AngBreakForce[l] = d.mRbWorld_angBreakForceW;
+            rPD[batchIndex].mFlags[l] = d.mNumRows_Flags_StartIndex.y;
+            rPD[batchIndex].mNumRows[l] = nr;
+            for (uint32_t i = 0; i < nr; ++i)
+            {
+                const Px1DConstraint& c1 = rows[rowStart + i];
+                std::memcpy(&rPV[outBase + i].linear0XYZ_geometricErrorW[l], &c1.linear0, 16);
+                std::memcpy(&rPV[outBase + i].angular0XYZ_velocityTargetW[l], &c1.angular0, 16);
+                std::memcpy(&rPV[outBase + i].linear1XYZ_minImpulseW[l], &c1.linear1, 16);
+                std::memcpy(&rPV[outBase + i].angular1XYZ_maxImpulseW[l], &c1.angular1, 16);
+                rPP[outBase + i].flags[l] = c1.flags;
+                rPP[outBase + i].mods.bounce.restitution[l] = c1.mods.bounce.restitution;
+                rPP[outBase + i].mods.bounce.velocityThreshold[l] = c1.mods.bounce.velocityThreshold;
+                rPP[outBase + i].solveHint[l] = c1.solveHint;
+            }
+        }
+    }
+
+    // ---- step 3: bitwise compares (contact batches / untouched lanes must
+    // still hold the sentinel) ----
+    auto cmpWords = [&](const char* name, const std::vector<uint32_t>& r, const uint32_t* g, size_t n) {
+        size_t bad = 0, first = ~size_t(0);
+        for (size_t x = 0; x < n; ++x)
+            if (r[x] != g[x]) { if (!bad) first = x; ++bad; }
+        if (bad)
+        {
+            std::printf("MM %s: %zu diffs, first at word %zu (R %08x G %08x)\n", name, bad, first,
+                        r[first], g[first]);
+            mm += bad;
+        }
+    };
+    cmpWords("blockBatches", refBB, reinterpret_cast<const uint32_t*>(gBB.data()), refBB.size());
+    cmpWords("blockPrepData", refPD, gPD.data(), refPD.size());
+    cmpWords("blockPrepVelocityData", refPV, gPV.data(), refPV.size());
+    cmpWords("blockPrepParameterData", refPP, gPP.data(), refPP.size());
+    // solverBodyReferences: same benign scratch race as the contact twin test —
+    // compare only slots written at most once
+    {
+        size_t bad = 0;
+        for (uint32_t x = 0; x < refCap; ++x)
+            if (refBodyRefCount[x] <= 1 && refBodyRef[x] != gBodyRef[x]) ++bad;
+        if (bad) { std::printf("MM solverBodyReferences (once-written): %zu diffs\n", bad); mm += bad; }
+    }
+
+    // untouched desc counters must be untouched
+    if (preOut.sharedArticulationResponseIndex != 0)
+    { std::printf("MM sharedArticulationResponseIndex clobbered\n"); ++mm; }
+
+    PXG_CHECK_MSG(mm == 0, "constraint1DBlockPrePrepLaunch: %zu mismatches", mm);
+
+    std::printf("[ info ] joint pre-prep: %u batches (4x 1D incl. 1 static, 2 contact skipped), "
+                "rows %u..%u\n", totalBatches, initJointRow, preOut.sharedJointRowIndex);
+
+    for (PxgDevicePtr h : { dHeaders, dCU, dSBI, dND, dID, dNpIdx, dPS, dPAS, dPJC, dPAJC, dCData,
+                            dRows, dBodySims, dBB, dPD, dPV, dPP, dBodyRef, dPre, dSh })
+        shim.memFree(h);
+}
+
 } // namespace

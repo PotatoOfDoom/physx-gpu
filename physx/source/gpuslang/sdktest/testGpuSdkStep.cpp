@@ -255,12 +255,18 @@ int main()
     sceneDesc.cudaContextManager = cudaCtx;
     sceneDesc.flags |= PxSceneFlag::eENABLE_GPU_DYNAMICS;
     sceneDesc.broadPhaseType = PxBroadPhaseType::eGPU;
-    sceneDesc.solverType = PxSolverType::eTGS;
+    // PXG_SOLVER=pgs switches the scene to the PGS solver (default TGS): the two
+    // GPU solver paths launch DIFFERENT kernel sets (PxgCudaSolverCore vs
+    // PxgTGSCudaSolverCore), so each scene can be proven on either.
+    const char* solverEnv = std::getenv("PXG_SOLVER");
+    const bool usePgs = solverEnv && !std::strcmp(solverEnv, "pgs");
+    sceneDesc.solverType = usePgs ? PxSolverType::ePGS : PxSolverType::eTGS;
     // Keep the GPU memory footprint modest for a two-body scene.
     sceneDesc.gpuDynamicsConfig.maxRigidContactCount = 1024 * 4;
     sceneDesc.gpuDynamicsConfig.maxRigidPatchCount = 1024;
 
-    std::printf("  creating GPU scene (eENABLE_GPU_DYNAMICS + eGPU broadphase, TGS)...\n");
+    std::printf("  creating GPU scene (eENABLE_GPU_DYNAMICS + eGPU broadphase, %s)...\n",
+                usePgs ? "PGS" : "TGS");
     PxScene* scene = physics->createScene(sceneDesc);
     if (!scene)
     {

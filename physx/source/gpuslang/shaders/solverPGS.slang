@@ -1778,3 +1778,325 @@ void markActiveSlabPGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : S
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// solveStaticBlock + propagateStaticSolverBodyVelocities
+// (P5 Step 5 BDA engine ABI) — the dynamic-vs-static rigid contact/joint solve
+// ---------------------------------------------------------------------------
+
+// solveStaticBlock: port of solveStaticBlock() in solverMultiBlock.cu,
+// mirroring the engine-proven TGS twin solveStaticBlockTGS (solverTGS.slang).
+// One thread per (dynamic body, static slab); each thread walks that body's
+// static contact and joint batches (packed into the same block-constraint
+// buffers, addressed through the per-body mRigidStatic*StartIndices) and
+// writes the resulting body velocity to the per-slab tempStaticBodyOutputPool
+// scratch that propagateStaticSolverBodyVelocities later averages back into
+// the deltaV pool.  block = SOLVE_BLOCK_PARTITION (64) threads, grid =
+// nbBlocksRequired (WorkgroupCount().x is unused — the guard is the
+// per-thread nbDynamicBodiesToSolve bound).
+//
+// Engine launch pack (PxgCudaSolverCore.cpp solveContactMultiBlockParallel):
+//   (PxgSolverCoreDesc*, const PxgSolverSharedDesc<IterativeSolveData>*,
+//    PxU32 islandIndex, PxU32 nbStaticSlabs, PxU32 maxStaticPartitions,
+//    bool doFriction)
+//   -> argSizes {8,8,4,4,4,1}: the bool byte lands at blob offset 28 (bytes
+//   29..31 zero-filled padding), 32 bytes total.
+//
+// PGS differences from the TGS twin (all from the .cu):
+//   - the velocity pool holds TWO full float4 stripes per body (linVel @
+//     inputBody, angVel @ + totalBodiesIncKinematics) — no delta stripes and
+//     no packed lin/ang split;
+//   - solve1DBlock takes no per-body TxI inertia data (the PGS 1D rows carry
+//     everything) and no elapsedTime/minPen anywhere;
+//   - the block-packed lane index is warpScanExclusive(batch.mask,
+//     threadIndexInWarp) = popcount(mask & ((1<<lane)-1)); it is a pure
+//     function of the STORED mask and the lane (no cross-lane ballot), so it
+//     is llvmpipe-safe — same as the TGS twin;
+//   - ref0/ref1 are 1 (mass-splitting is not used for static interactions);
+//   - accumulateErrorGlobalFullWarp(): same 64-entry groupshared butterfly +
+//     CAS-loop float atomics as solveBlockPartition above.
+struct SolveStaticBlockAbiParams
+{
+    uint64_t solverCoreDesc;   // @0
+    uint64_t sharedDesc;       // @8
+    uint islandIndex;          // @16
+    uint nbStaticSlabs;        // @20
+    uint maxStaticPartitions;  // @24
+    uint doFrictionWord;       // @28: byte 0 = doFriction (bytes 29..31 padding)
+}                              // = 32
+[[vk::push_constant]]
+ConstantBuffer<SolveStaticBlockAbiParams> gStaticSolveAbi;
+
+// per-warp residual-reduction scratch: block = 64 -> 2 warps of 32 lanes.
+groupshared float shStaticErrSum[64];
+groupshared float shStaticErrMax[64];
+groupshared uint  shStaticErrCount[64];
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void solveStaticBlock(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    Ptr<PxgSolverCoreDescGpu> descPtr = Ptr<PxgSolverCoreDescGpu>(gStaticSolveAbi.solverCoreDesc);
+    PxgSolverCoreDescGpu desc = descPtr[0];
+    PxgSolverSharedDescPGSGpu sharedDesc =
+        (Ptr<PxgSolverSharedDescPGSGpu>(gStaticSolveAbi.sharedDesc))[0];
+    PxgIslandContextGpu island =
+        (Ptr<PxgIslandContextGpu>(desc.islandContextPool))[gStaticSolveAbi.islandIndex];
+
+    Ptr<float4> bodyVelocities = Ptr<float4>(sharedDesc.iter_solverBodyVelPool);
+    Ptr<float4> bodyOutVelocities = Ptr<float4>(sharedDesc.iter_tempStaticBodyOutputPool);
+
+    const uint numDynamicBodies = island.mBodyCount; // nbBodies minus offset!
+    const uint numDynamicBodiesRounded = (island.mBodyCount + 31u) & ~31u; // multiple of 32
+    const uint bodyOffset = island.mBodyStartIndex;
+    const uint deltaVOffset = desc.accumulatedBodyDeltaVOffset;
+    const uint totalBodiesIncKinematics = numDynamicBodies + bodyOffset;
+
+    const uint nbStaticSlabs = gStaticSolveAbi.nbStaticSlabs;
+    const uint maxStaticPartitions = gStaticSolveAbi.maxStaticPartitions;
+    const bool doFriction = (gStaticSolveAbi.doFrictionWord & 0xffu) != 0;
+
+    const uint nbDynamicBodiesToSolve = numDynamicBodiesRounded * nbStaticSlabs;
+
+    const uint globalThreadIdx = groupThreadId.x + groupId.x * 64u;
+    const uint warpSize = 32u;
+    const uint threadIndexInWarp = groupThreadId.x & (warpSize - 1u);
+
+    const bool residualAccumulationEnabled = desc.contactErrorAccumulator_mCounter >= 0;
+    PxgErrorAccumulatorSlang error = { 0.0f, 0, 0.0f };
+
+    Ptr<uint> rigidStaticContactCounts = Ptr<uint>(desc.mRigidStaticContactCounts);
+    Ptr<uint> rigidStaticJointCounts = Ptr<uint>(desc.mRigidStaticJointCounts);
+    Ptr<uint> rigidStaticContactStartIndices = Ptr<uint>(desc.mRigidStaticContactStartIndices);
+    Ptr<uint> rigidStaticJointStartIndices = Ptr<uint>(desc.mRigidStaticJointStartIndices);
+
+    Ptr<PxgBlockConstraintBatch> batches = Ptr<PxgBlockConstraintBatch>(sharedDesc.iter_blockConstraintBatch);
+    Ptr<PxgBlockSolverContactHeader> contactHeaders =
+        Ptr<PxgBlockSolverContactHeader>(sharedDesc.iter_blockContactHeaders);
+    Ptr<PxgBlockSolverFrictionHeader> frictionHeaders =
+        Ptr<PxgBlockSolverFrictionHeader>(sharedDesc.iter_blockFrictionHeaders);
+    Ptr<PxgBlockSolverContactPoint> contactPoints =
+        Ptr<PxgBlockSolverContactPoint>(sharedDesc.iter_blockContactPoints);
+    Ptr<PxgBlockSolverContactFriction> frictionsBuf =
+        Ptr<PxgBlockSolverContactFriction>(sharedDesc.iter_blockFrictions);
+    Ptr<PxgBlockSolverConstraint1DHeader> jointHeaders =
+        Ptr<PxgBlockSolverConstraint1DHeader>(sharedDesc.iter_blockJointConstraintHeaders);
+    Ptr<PxgBlockSolverConstraint1DCon> jointRowsCon =
+        Ptr<PxgBlockSolverConstraint1DCon>(sharedDesc.iter_blockJointConstraintRowsCon);
+    Ptr<PxgBlockSolverConstraint1DMod> jointRowsMod =
+        Ptr<PxgBlockSolverConstraint1DMod>(sharedDesc.iter_blockJointConstraintRowsMod);
+
+    // Null-guard (llvmpipe): islands with no static rigid batches leave the
+    // block-batch / count pointers null; gate every dependent load behind the
+    // non-null check so the optimizer cannot hoist a BDA load out of a
+    // zero-trip loop.  A body with zero static contacts/joints does no work.
+    if (globalThreadIdx < nbDynamicBodiesToSolve && sharedDesc.iter_blockConstraintBatch != 0 &&
+        desc.mRigidStaticContactCounts != 0 && desc.mRigidStaticJointCounts != 0)
+    {
+        const uint bodyIndex = globalThreadIdx % numDynamicBodiesRounded;
+        const uint slabIdx = globalThreadIdx / numDynamicBodiesRounded;
+        const uint startIndex = slabIdx * maxStaticPartitions;
+
+        if (bodyIndex < numDynamicBodies)
+        {
+            const uint rawContact = rigidStaticContactCounts[bodyIndex];
+            const uint rawJoint = rigidStaticJointCounts[bodyIndex];
+            const uint contactCount = min(maxStaticPartitions, max(startIndex, rawContact) - startIndex);
+            const uint jointCount = min(maxStaticPartitions, max(startIndex, rawJoint) - startIndex);
+
+            const uint outputBody = slabIdx * totalBodiesIncKinematics * 2u;
+
+            if (contactCount != 0u || jointCount != 0u)
+            {
+                const uint startContactIndex = rigidStaticContactStartIndices[bodyIndex] + startIndex;
+                const uint startJointIndex = rigidStaticJointStartIndices[bodyIndex] + startIndex;
+
+                const uint inputBody = deltaVOffset + bodyIndex + bodyOffset;
+
+                // PGS 2-stripe accumulated layout: linVel @ inputBody, angVel
+                // @ + totalBodiesIncKinematics.
+                float4 linVel = bodyVelocities[inputBody];
+                float4 angVel = bodyVelocities[inputBody + totalBodiesIncKinematics];
+
+                float3 lv0 = linVel.xyz;
+                float3 lv1 = float3(0.0f);
+                float3 av0 = angVel.xyz;
+                float3 av1 = float3(0.0f);
+
+                for (uint i = 0; i < jointCount; ++i)
+                {
+                    const uint bk = startJointIndex + i;
+                    // warpScanExclusive(batch.mask, threadIndexInWarp)
+                    const uint idx = countbits(batches[bk].mask & ((1u << threadIndexInWarp) - 1u));
+                    // For interaction with static objects, mass-splitting is
+                    // not used; thus, reference counts are 1.
+                    solve1DBlockBda(batches, bk, lv0, av0, lv1, av1, idx, jointHeaders, jointRowsCon,
+                                    jointRowsMod, residualAccumulationEnabled, 1.0f, 1.0f);
+                }
+
+                for (uint i = 0; i < contactCount; ++i)
+                {
+                    const uint bk = startContactIndex + i;
+                    const uint idx = countbits(batches[bk].mask & ((1u << threadIndexInWarp) - 1u));
+                    solveContactBlockBda(batches, bk, lv0, av0, lv1, av1, doFriction, idx,
+                                         contactHeaders, frictionHeaders, contactPoints, frictionsBuf,
+                                         residualAccumulationEnabled, error, 1.0f, 1.0f);
+                }
+
+                linVel.x = lv0.x; linVel.y = lv0.y; linVel.z = lv0.z;
+                angVel.x = av0.x; angVel.y = av0.y; angVel.z = av0.z;
+
+                bodyOutVelocities[bodyIndex + outputBody] = linVel;
+                bodyOutVelocities[bodyIndex + outputBody + totalBodiesIncKinematics] = angVel;
+            }
+        }
+    }
+
+    // PxgErrorAccumulator::accumulateErrorGlobalFullWarp(): per-warp sum/sum/max
+    // butterfly reduction, then lane 0 of each warp accumulates into
+    // solverDesc->contactErrorAccumulator.  The reduction runs unconditionally
+    // (uniform control flow around the barriers); idle threads reduce their
+    // zero-init accumulators, and a disabled launch skips only the atomics.
+    GroupMemoryBarrierWithGroupSync();
+    shStaticErrSum[groupThreadId.x] = error.sumOfSquares;
+    shStaticErrMax[groupThreadId.x] = error.maxError;
+    shStaticErrCount[groupThreadId.x] = uint(error.counter);
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint radius = 16u; radius > 0u; radius >>= 1)
+    {
+        const uint partner = groupThreadId.x ^ radius; // stays inside the warp's 32 lanes
+        const float s = shStaticErrSum[partner];
+        const float m = shStaticErrMax[partner];
+        const uint c = shStaticErrCount[partner];
+        GroupMemoryBarrierWithGroupSync();
+        shStaticErrSum[groupThreadId.x] += s;
+        shStaticErrMax[groupThreadId.x] = max(shStaticErrMax[groupThreadId.x], m);
+        shStaticErrCount[groupThreadId.x] += c;
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (residualAccumulationEnabled && threadIndexInWarp == 0u)
+    {
+        const float sumSq = shStaticErrSum[groupThreadId.x];
+        const uint count = shStaticErrCount[groupThreadId.x];
+        const float maxErr = shStaticErrMax[groupThreadId.x];
+
+        // atomicAdd(&mErrorSumOfSquares, s): float atomic add via CAS on raw bits
+        uint assumed = descPtr[0].contactErrorAccumulator_mErrorSumOfSquares;
+        for (;;)
+        {
+            const uint newBits = asuint(asfloat(assumed) + sumSq);
+            uint old;
+            InterlockedCompareExchange(descPtr[0].contactErrorAccumulator_mErrorSumOfSquares, assumed,
+                                       newBits, old);
+            if (old == assumed)
+                break;
+            assumed = old;
+        }
+
+        int oldCount;
+        InterlockedAdd(descPtr[0].contactErrorAccumulator_mCounter, int(count), oldCount);
+
+        if (maxErr > asfloat(descPtr[0].contactErrorAccumulator_mMaxError))
+        {
+            assumed = descPtr[0].contactErrorAccumulator_mMaxError;
+            for (;;)
+            {
+                const uint newBits = asuint(max(maxErr, asfloat(assumed)));
+                uint old;
+                InterlockedCompareExchange(descPtr[0].contactErrorAccumulator_mMaxError, assumed,
+                                           newBits, old);
+                if (old == assumed)
+                    break;
+                assumed = old;
+            }
+        }
+    }
+}
+
+// propagateStaticSolverBodyVelocities: port of
+// propagateStaticSolverBodyVelocities() in solverMultiBlock.cu.  Averages the
+// per-slab static-solve outputs (tempStaticBodyOutputPool, written by
+// solveStaticBlock) back into the body's deltaV velocity slot.  One thread per
+// dynamic body; block = SOLVE_BLOCK_PARTITION (64), grid = nbBlocksRequired.
+//
+// The .cu SIGNATURE has FIVE parameters (desc, sharedDesc, islandIndex,
+// nbStaticSlabs, maxStaticPartitions — no doFriction), but the engine launches
+// it with the SAME six-entry staticKernelParams array as solveStaticBlock; the
+// sized launch path then appends the stray doFriction byte at blob offset 28,
+// which is exactly this struct's tail padding, so both packs produce the same
+// 32-byte blob.  The ABI row (PxgVulkanKernelAbi.cpp) declares the 5-arg .cu
+// signature {8,8,4,4,4}; nbStaticSlabs is unused by the kernel body, exactly
+// as the .cu ignores it.
+struct PropagateStaticSolverBodyVelocitiesAbiParams
+{
+    uint64_t solverCoreDesc;   // @0
+    uint64_t sharedDesc;       // @8
+    uint islandIndex;          // @16
+    uint nbStaticSlabs;        // @20 (unused)
+    uint maxStaticPartitions;  // @24
+    uint abiPad0;              // @28 (blob tail padding / the engine's stray doFriction byte, never read)
+}                              // = 32
+[[vk::push_constant]]
+ConstantBuffer<PropagateStaticSolverBodyVelocitiesAbiParams> gStaticPropagateAbi;
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void propagateStaticSolverBodyVelocities(uint3 groupThreadId : SV_GroupThreadID,
+                                         uint3 groupId : SV_GroupID)
+{
+    PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gStaticPropagateAbi.solverCoreDesc))[0];
+    PxgSolverSharedDescPGSGpu sharedDesc =
+        (Ptr<PxgSolverSharedDescPGSGpu>(gStaticPropagateAbi.sharedDesc))[0];
+    PxgIslandContextGpu island =
+        (Ptr<PxgIslandContextGpu>(desc.islandContextPool))[gStaticPropagateAbi.islandIndex];
+
+    Ptr<float4> bodyVelocities = Ptr<float4>(sharedDesc.iter_solverBodyVelPool);
+    Ptr<float4> bodyOutVelocities = Ptr<float4>(sharedDesc.iter_tempStaticBodyOutputPool);
+    const uint numDynamicBodies = island.mBodyCount;
+    const uint bodyOffset = island.mBodyStartIndex;
+    const uint deltaVOffset = desc.accumulatedBodyDeltaVOffset;
+    const uint totalBodiesIncKinematics = numDynamicBodies + bodyOffset;
+    const uint maxStaticPartitions = gStaticPropagateAbi.maxStaticPartitions;
+
+    const uint globalThreadIdx = groupThreadId.x + groupId.x * 64u;
+
+    Ptr<uint> rigidStaticContactCounts = Ptr<uint>(desc.mRigidStaticContactCounts);
+    Ptr<uint> rigidStaticJointCounts = Ptr<uint>(desc.mRigidStaticJointCounts);
+
+    // Null-guard (llvmpipe): skip when the per-body static count arrays are
+    // absent (no static rigid work); the tempStaticBodyOutputPool reads below
+    // are then unreachable and cannot be hoisted.
+    if (globalThreadIdx < numDynamicBodies && desc.mRigidStaticContactCounts != 0 &&
+        desc.mRigidStaticJointCounts != 0)
+    {
+        const uint contactCount = rigidStaticContactCounts[globalThreadIdx];
+        const uint jointCount = rigidStaticJointCounts[globalThreadIdx];
+
+        if (contactCount != 0u || jointCount != 0u)
+        {
+            const uint maxOutputs = max(contactCount, jointCount);
+
+            // We have velocity changes we need to propagate!
+            const uint outputBody = deltaVOffset + globalThreadIdx + bodyOffset;
+
+            float scale = 0.0f;
+            float4 vel0 = float4(0.0f);
+            float4 vel1 = float4(0.0f);
+            uint index = globalThreadIdx;
+            for (uint i = 0; i < maxOutputs; i += maxStaticPartitions)
+            {
+                vel0 += bodyOutVelocities[index];
+                vel1 += bodyOutVelocities[index + totalBodiesIncKinematics];
+                index += totalBodiesIncKinematics * 2u;
+                scale += 1.0f;
+            }
+
+            scale = 1.0f / scale;
+
+            bodyVelocities[outputBody] = vel0 * scale;
+            bodyVelocities[outputBody + totalBodiesIncKinematics] = vel1 * scale;
+        }
+    }
+}

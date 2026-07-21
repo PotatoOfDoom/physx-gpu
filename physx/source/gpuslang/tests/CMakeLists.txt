@@ -125,7 +125,8 @@ pxg_compile_shader(scan4x4 scanPerBlockKernel4x4 addBlockSumsKernel4x4)
 pxg_compile_shader(radixFourBit radixFourBitCountPerBlockKernel radixFourBitReorderKernel)
 pxg_compile_shader(reorderData reorderKernel)
 pxg_compile_shader(solverPGS solveBlockPartition concludeBlocks writebackBlocks writeBackBodies
-                   computeAverageSolverBodyVelocity propagateSolverBodyVelocity markActiveSlabPGS)
+                   computeAverageSolverBodyVelocity propagateSolverBodyVelocity markActiveSlabPGS
+                   solveStaticBlock propagateStaticSolverBodyVelocities)
 pxg_compile_shader(solverTGS solveBlockPartitionTGS concludeBlocksTGS writebackBlocksTGS
                    writeBackBodiesTGS computeAverageSolverBodyVelocityTGS
                    propagateAverageSolverBodyVelocityTGS solveWholeIslandTGS
@@ -240,7 +241,8 @@ pxg_compile_shader(npCvxBvhGlue cbgGlue)
 pxg_compile_shader(npCvxCoreWarpAcc cwaAddPoints)
 pxg_compile_shader(npD6JointPrep d6jPrep c1dPrePrep)
 pxg_compile_shader(npRemapIndex remapIndex)
-pxg_compile_shader(npContactPrePrep cppPack constraintContactBlockPrePrepLaunch)
+pxg_compile_shader(npContactPrePrep cppPack constraintContactBlockPrePrepLaunch
+                   constraint1DBlockPrePrepLaunch clearFrictionPatchCounts)
 pxg_compile_shader(npRigidSumBatches rigidSumInternalContactAndJointBatches1
                    rigidSumInternalContactAndJointBatches2)
 pxg_compile_shader(npArtiExtBody aebBody aebFinalizePGS aebFinalizeTGS)
@@ -995,7 +997,10 @@ set(PXG_HLSL_ENTRIES
     # builtin (P0 policy) — same as its TGS twin.
     "solverInitVelocitiesTGS:initializeSolverVelocitiesTGS"
     "solverApplyGravityTGS:applyTGSSubstepGravity"
-    "solverDmaBack:dmaBackChangedElems" "solverDmaBack:dmaConstraintResidual"
+    # solverDmaBack:dmaBackChangedElems retired: converted to the BDA engine ABI
+    # (P5 Step 5) and grid-strides via WorkgroupCount(), which has no HLSL
+    # builtin (P0 policy).  dmaConstraintResidual still lowers to cs_6_0.
+    "solverDmaBack:dmaConstraintResidual"
     "npPairManagement:initializeKeepDropBuffer" "npPairManagement:markKeepDropBuff"
     "npPairManagement:processKeepDropBuff" "npPairManagement:accumulateKeepDrop"
     "npPairManagement:initializeManifolds"

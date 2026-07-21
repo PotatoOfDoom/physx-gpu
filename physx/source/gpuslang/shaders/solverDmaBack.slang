@@ -24,63 +24,99 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// solverDmaBack.slang
-//
-// Slang port of the two solver DMA-back glue kernels from
-// gpusolver/src/CUDA/solverMultiBlock.cu:
+// solverDmaBack.slang — the two solver DMA-back glue kernels from
+// gpusolver/src/CUDA/solverMultiBlock.cu on the BDA ENGINE ABI (P5 Step 5):
 //   - dmaBackChangedElems: word-wise grid-stride copy of the force-change
 //     threshold-element array (produced by createForceChangeThresholdElements)
 //     into the host-mapped output.  The CUDA copies
 //     sizeof(Dy::ThresholdStreamElement)*nbElems / sizeof(PxU32) = 10*nbElems
-//     32-bit words (the element is 40 bytes).
+//     32-bit words (the element is 40 bytes).  The source pointer and the
+//     element count are read from the PxgSolverCoreDesc on-device
+//     (forceChangeThresholdElements / nbForceChangeElements), exactly like
+//     the .cu; the destination is the host-mapped pointer the engine passes.
 //   - dmaConstraintResidual: gather each constraint's residual — the .w of
-//     PxgConstraintWriteback::angularImpulse_residual (the second float4) — into
-//     a flat residuals array, one thread per constraint.
+//     PxgConstraintWriteback::angularImpulse_residual (the second float4) —
+//     into a flat residuals array, one thread per constraint.
+//
+// Engine launch packs (PxgCudaSolverCore.cpp, sized PxCudaKernelParam form;
+// argSizes transcribed in bridge/PxgVulkanKernelAbi.cpp):
+//   dmaBackChangedElems(const PxgSolverCoreDesc*, Dy::ThresholdStreamElement*)
+//     -> {8,8} = 16-byte blob; grid = PxgKernelGridDim::DMA_CHANGED_ELEMS,
+//     block = PxgKernelBlockDim::DMA_CHANGED_ELEMS = 512; the CUDA
+//     blockDim.x * gridDim.x stride becomes 512 * WorkgroupCount().x.
+//   dmaConstraintResidual(const PxgConstraintWriteback*, PxReal*, PxU32 count)
+//     -> {8,8,4} = 24-byte blob (count @16, tail padded to 8); block = 256.
 
-struct DmaParams
-{
-    uint nbElems;     // dmaBackChangedElems: number of ThresholdStreamElements
-    uint count;       // dmaConstraintResidual: number of writebacks
-    uint gridStride;  // blockDim.x * gridDim.x
-}
+import pxgSlangCommon;
+import pxgSlangSolverDesc;
 
-// Dy::ThresholdStreamElement is 40 bytes = 10 uint words
-static const uint ELEMENT_WORDS = 10u;
-
-struct ConstraintWriteback
+// mirrors PxgConstraintWriteback (32 bytes)
+struct PxgConstraintWriteback
 {
     float4 linearImpulse_broken;
     float4 angularImpulse_residual;
 }
 
-[[vk::push_constant]]
-ConstantBuffer<DmaParams> gParams;
-
-RWStructuredBuffer<uint> gChangedSrc;              // binding 0  forceChangeThresholdElements (word view)
-RWStructuredBuffer<uint> gChangedDst;             // binding 1  host-mapped output (word view)
-RWStructuredBuffer<ConstraintWriteback> gWritebacks; // binding 2
-RWStructuredBuffer<float> gResiduals;             // binding 3
+// Dy::ThresholdStreamElement is 40 bytes = 10 uint words
+static const uint ELEMENT_WORDS = 10u;
 
 // ---------------------------------------------------------------------------
-// dmaBackChangedElems
+// dmaBackChangedElems (BDA engine ABI)
 // ---------------------------------------------------------------------------
-[shader("compute")]
-[numthreads(256, 1, 1)]
-void dmaBackChangedElems(uint3 dtid : SV_DispatchThreadID)
+struct DmaChangedElemsAbiParams
 {
-    const uint nbWords = ELEMENT_WORDS * gParams.nbElems;
-    const uint stride = gParams.gridStride;
-    for (uint i = dtid.x; i < nbWords; i += stride)
-        gChangedDst[i] = gChangedSrc[i];
+    uint64_t solverCoreDesc;   // @0  const PxgSolverCoreDesc*
+    uint64_t hostChangedElems; // @8  Dy::ThresholdStreamElement* (host-mapped)
+}                              // = 16
+[[vk::push_constant]]
+ConstantBuffer<DmaChangedElemsAbiParams> gDmaChangedAbi;
+
+[shader("compute")]
+[numthreads(512, 1, 1)]
+void dmaBackChangedElems(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gDmaChangedAbi.solverCoreDesc))[0];
+
+    // Null-guard (llvmpipe): a scene without force thresholds leaves
+    // forceChangeThresholdElements unallocated (the engine then never launches
+    // this kernel, but the guard keeps the zero-trip loop hoist-safe).
+    if (desc.forceChangeThresholdElements == 0 || gDmaChangedAbi.hostChangedElems == 0)
+        return;
+
+    Ptr<uint> src = Ptr<uint>(desc.forceChangeThresholdElements);
+    Ptr<uint> dst = Ptr<uint>(gDmaChangedAbi.hostChangedElems);
+
+    const uint nbWords = ELEMENT_WORDS * desc.nbForceChangeElements;
+    const uint stride = 512u * WorkgroupCount().x; // blockDim.x * gridDim.x
+    const uint globalThreadIdx = groupThreadId.x + groupId.x * 512u;
+
+    for (uint i = globalThreadIdx; i < nbWords; i += stride)
+        dst[i] = src[i];
 }
 
 // ---------------------------------------------------------------------------
-// dmaConstraintResidual
+// dmaConstraintResidual (BDA engine ABI)
 // ---------------------------------------------------------------------------
+struct DmaConstraintResidualAbiParams
+{
+    uint64_t writebacks; // @0  const PxgConstraintWriteback*
+    uint64_t residuals;  // @8  PxReal* (host-mapped)
+    uint count;          // @16 (bytes 20..23 blob tail padding)
+    uint abiPad0;        // @20 (never read)
+}                        // = 24
+[[vk::push_constant]]
+ConstantBuffer<DmaConstraintResidualAbiParams> gDmaResidualAbi;
+
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void dmaConstraintResidual(uint3 dtid : SV_DispatchThreadID)
 {
-    if (dtid.x < gParams.count)
-        gResiduals[dtid.x] = gWritebacks[dtid.x].angularImpulse_residual.w;
+    if (dtid.x >= gDmaResidualAbi.count)
+        return;
+    if (gDmaResidualAbi.writebacks == 0 || gDmaResidualAbi.residuals == 0)
+        return;
+
+    Ptr<PxgConstraintWriteback> writebacks = Ptr<PxgConstraintWriteback>(gDmaResidualAbi.writebacks);
+    Ptr<float> residuals = Ptr<float>(gDmaResidualAbi.residuals);
+    residuals[dtid.x] = writebacks[dtid.x].angularImpulse_residual.w;
 }

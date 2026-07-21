@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 146;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 150;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -104,7 +104,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "preIntegrationLaunch", "preIntegration.spv", "preIntegrationLaunch" },  // PRE_INTEGRATION
     { "constraintContactBlockPrePrepLaunch", "npContactPrePrep.spv", "constraintContactBlockPrePrepLaunch" },  // CONTACT_CONSTRAINT_PREPREP_BLOCK (P5 Step 4 BDA port)
     { "constraint1DPrePrepLaunch", nullptr, nullptr },  // JOINT_CONSTRAINT_PREPREP (unmapped)
-    { "constraint1DBlockPrePrepLaunch", nullptr, nullptr },  // JOINT_CONSTRAINT_PREPREP_BLOCK (unmapped)
+    { "constraint1DBlockPrePrepLaunch", "npContactPrePrep.spv", "constraint1DBlockPrePrepLaunch" },  // JOINT_CONSTRAINT_PREPREP_BLOCK (P5 Step 5 BDA port)
     { "jointConstraintBlockPrepareParallelLaunch", "constraintPrepPGS.spv", "jointConstraintBlockPrepareParallelLaunch" },  // JOINT_CONSTRAINT_PREPARE_BLOCK_PARALLEL
     { "contactConstraintBlockPrepareParallelLaunch", "constraintPrepPGS.spv", "contactConstraintBlockPrepareParallelLaunch" },  // CONTACT_CONSTRAINT_PREPARE_BLOCK_PARALLEL
     { "ZeroBodies", "solverZeroBodies.spv", "ZeroBodies" },  // ZERO_BODIES
@@ -129,9 +129,9 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "outputThresholdPairsMaskIndices", "thresholdForceChange.spv", "outputThresholdPairsMaskIndices" },  // OUTPUT_THRESHOLDELEMENT_MASK_INDICES
     { "createForceChangeThresholdElements", "thresholdForceChange.spv", "createForceChangeThresholdElements" },  // CREATE_FORCECHANGE_THRESHOLDELEMENTS
     { "solveBlockUnified", "solverTGS.spv", "solveBlockUnified" },  // SOLVE_UNIFIED (P5 Step 5 tranche A BDA)
-    { "propagateStaticSolverBodyVelocities", nullptr, nullptr },  // PROPAGATE_STATIC_SOLVER_VELOCITIES (unmapped)
+    { "propagateStaticSolverBodyVelocities", "solverPGS.spv", "propagateStaticSolverBodyVelocities" },  // PROPAGATE_STATIC_SOLVER_VELOCITIES (P5 Step 5 BDA port)
     { "integrateCoreParallelLaunch", "integration.spv", "integrateCoreParallelLaunch" },  // INTEGRATE_CORE_PARALLEL
-    { "clearFrictionPatchCounts", nullptr, nullptr },  // CLEAR_FRICTION_PATCH_COUNTS (unmapped)
+    { "clearFrictionPatchCounts", "npContactPrePrep.spv", "clearFrictionPatchCounts" },  // CLEAR_FRICTION_PATCH_COUNTS (P5 Step 5 BDA port)
     { "dmaBackChangedElems", "solverDmaBack.spv", "dmaBackChangedElems" },  // DMA_CHANGED_ELEMS
     { "bpSignalComplete", "broadphaseClearNewFlag.spv", "bpSignalComplete" },  // BP_SIGNAL_COMPLETE
     { "dmaConstraintResidual", "solverDmaBack.spv", "dmaConstraintResidual" },  // DMA_CONSTRAINT_RESIDUAL
@@ -205,7 +205,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "clearDeltaVRigidSecondLaunchMulti", nullptr, nullptr },  // ACCUMULATE_DELTAVEL_RIGIDBODY_MULTI_CLEAR (unmapped)
     { "rigidSumInternalContactAndJointBatches1", "npRigidSumBatches.spv", "rigidSumInternalContactAndJointBatches1" },  // RIGID_SUM_STATIC_CONTACT1 (P5 Step 4 BDA port)
     { "rigidSumInternalContactAndJointBatches2", "npRigidSumBatches.spv", "rigidSumInternalContactAndJointBatches2" },  // RIGID_SUM_STATIC_CONTACT2 (P5 Step 4 BDA port)
-    { "solveStaticBlock", nullptr, nullptr },  // RIGID_SOLVE_STATIC_CONSTRAINTS (unmapped)
+    { "solveStaticBlock", "solverPGS.spv", "solveStaticBlock" },  // RIGID_SOLVE_STATIC_CONSTRAINTS (P5 Step 5 BDA port)
     { "solveStaticBlockTGS", "solverTGS.spv", "solveStaticBlockTGS" },  // RIGID_SOLVE_STATIC_CONSTRAINTS_TGS
     { "solveWholeIslandTGS", "solverTGS.spv", "solveWholeIslandTGS" },  // RIGID_SOLVE_WHOLE_ISLAND_TGS
     { "ps_updateUnsortedArrayLaunch", nullptr, nullptr },  // PS_UPDATE_UNSORTED_ARRAY (unmapped)

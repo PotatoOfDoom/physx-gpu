@@ -48,26 +48,6 @@ import pxgSlangCommon;
 
 static const uint BLOCK_SIZE = 128; // PxgKernelBlockDim::PRE_INTEGRATION
 
-struct PreIntegrationParams
-{
-    uint offset;
-    uint nbSolverBodies;
-    float dt;
-    float gravityX, gravityY, gravityZ;
-    uint skipGravityApplication;
-};
-
-[[vk::push_constant]]
-ConstantBuffer<PreIntegrationParams> gParams;
-
-RWStructuredBuffer<PxgSolverBodyData> gSolverBodyData; // binding 0
-RWStructuredBuffer<PxgSolverTxIData> gSolverTxIData;   // binding 1
-RWStructuredBuffer<PxgBodySim> gBodySim;               // binding 2
-RWStructuredBuffer<uint2> gIslandNodeIndices;          // binding 3 (PxNodeIndex)
-RWStructuredBuffer<PxgAlignedTransform> gTransforms;   // binding 4
-RWStructuredBuffer<float4> gOutVelocityPool;           // binding 5
-RWStructuredBuffer<uint> gSolverBodyIndices;           // binding 6
-
 // mirrors computeSafeSqrtInertia() in preIntegration.cuh
 float3 computeSafeSqrtInertia(float3 v)
 {
@@ -232,37 +212,69 @@ void preIntegrateBodyCompute(PxgBodySim bodySim, uint a, uint nbSolverBodies, fl
     outTxIData = txIData;
 }
 
-// bound-buffer PGS entry: unchanged behavior, now via the shared helper.
+// mirrors preIntegrationLaunch() in preIntegration.cu — the PGS entry point,
+// P5 Step 5 BDA engine-ABI form.  The CUDA entry just forwards to the same
+// preIntegration() as the TGS twin WITHOUT the trailing bool (preIntegration's
+// skipGravityApplication parameter defaults to false).  The push-constant
+// struct mirrors the CUDA parameter list EXACTLY (offset, nbSolverBodies, dt,
+// PxVec3 gravity by value, then eight device pointers), natural alignment,
+// 88-byte blob.  solverBodySleepDataPool is passed to match the ABI but unused
+// (the CUDA preIntegration's sleep-data write is #if 0'd out).
+struct PreIntegrationPgsParams
+{
+    uint offset;                       // @0
+    uint nbSolverBodies;               // @4
+    float dt;                          // @8
+    float gravityX, gravityY, gravityZ;// @12,16,20
+    uint64_t solverBodyDataPool;       // @24 PxgSolverBodyData*
+    uint64_t solverBodySleepDataPool;  // @32 (unused)
+    uint64_t solverTxIDataPool;        // @40 PxgSolverTxIData*
+    uint64_t bodySimPool;              // @48 PxgBodySim*
+    uint64_t islandNodeIndices;        // @56 PxNodeIndex* (uint2)
+    uint64_t transforms;               // @64 PxAlignedTransform*
+    uint64_t outVelocityPool;          // @72 float4*
+    uint64_t solverBodyIndices;        // @80 PxU32*
+}                                      // = 88 (maxAlign 8)
+[[vk::push_constant]]
+ConstantBuffer<PreIntegrationPgsParams> gPrePgs;
+
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
 void preIntegrationLaunch(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
     const uint idx = dispatchThreadId.x;
-    const uint a = idx + gParams.offset;
+    const uint a = idx + gPrePgs.offset;
 
-    if (a >= gParams.nbSolverBodies)
+    if (a >= gPrePgs.nbSolverBodies)
         return;
 
-    const float3 gravity = float3(gParams.gravityX, gParams.gravityY, gParams.gravityZ);
-    const bool skipGravityApplication = gParams.skipGravityApplication != 0;
+    const float3 gravity = float3(gPrePgs.gravityX, gPrePgs.gravityY, gPrePgs.gravityZ);
 
-    const uint2 islandNodeIndex = gIslandNodeIndices[a];
+    Ptr<PxgBodySim> bodySimPool = Ptr<PxgBodySim>(gPrePgs.bodySimPool);
+    Ptr<uint2> islandNodeIndices = Ptr<uint2>(gPrePgs.islandNodeIndices);
+    Ptr<uint> solverBodyIndices = Ptr<uint>(gPrePgs.solverBodyIndices);
+    Ptr<float4> outVelocityPool = Ptr<float4>(gPrePgs.outVelocityPool);
+    Ptr<PxgAlignedTransform> transforms = Ptr<PxgAlignedTransform>(gPrePgs.transforms);
+    Ptr<PxgSolverBodyData> solverBodyDataPool = Ptr<PxgSolverBodyData>(gPrePgs.solverBodyDataPool);
+    Ptr<PxgSolverTxIData> solverTxIDataPool = Ptr<PxgSolverTxIData>(gPrePgs.solverTxIDataPool);
+
+    const uint2 islandNodeIndex = islandNodeIndices[a];
     const uint nodeIndex = nodeIndexIndex(islandNodeIndex);
-    gSolverBodyIndices[nodeIndex] = a;
+    solverBodyIndices[nodeIndex] = a;
 
     float4 outLinVel, outAngVel;
     PxgAlignedTransform outBody2World;
     PxgSolverBodyData outData;
     PxgSolverTxIData outTxIData;
-    preIntegrateBodyCompute(gBodySim[nodeIndex], a, gParams.nbSolverBodies, gParams.dt, gravity,
-                            skipGravityApplication, islandNodeIndex, outLinVel, outAngVel,
+    preIntegrateBodyCompute(bodySimPool[nodeIndex], a, gPrePgs.nbSolverBodies, gPrePgs.dt, gravity,
+                            /*skipGravityApplication=*/false, islandNodeIndex, outLinVel, outAngVel,
                             outBody2World, outData, outTxIData);
 
-    gOutVelocityPool[a] = outLinVel;
-    gOutVelocityPool[a + gParams.nbSolverBodies] = outAngVel;
-    gTransforms[a] = outBody2World;
-    gSolverBodyData[a] = outData;
-    gSolverTxIData[a] = outTxIData;
+    outVelocityPool[a] = outLinVel;
+    outVelocityPool[a + gPrePgs.nbSolverBodies] = outAngVel;
+    transforms[a] = outBody2World;
+    solverBodyDataPool[a] = outData;
+    solverTxIDataPool[a] = outTxIData;
 }
 
 // mirrors initStaticKinematics() in preIntegration.cu — P5 Step 4 BDA

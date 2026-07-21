@@ -24,11 +24,11 @@
 //
 // Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
 
-// constraintPrepPGS.slang
+// constraintPrepPGS.slang — the PGS constraint prep kernels on the BDA ENGINE
+// ABI (P5 Step 5), mirroring the constraintPrepTGS.slang conversion.
 //
-// Slang port of the PGS constraint prep kernels
-// (gpusolver/src/CUDA/constraintBlockPrep.cu + contactConstraintBlockPrep.cuh
-//  + jointConstraintBlockPrep.cuh):
+// Slang port of gpusolver/src/CUDA/constraintBlockPrep.cu
+// (+ contactConstraintBlockPrep.cuh + jointConstraintBlockPrep.cuh):
 //   - contactConstraintBlockPrepareParallelLaunch
 //     (createFinalizeSolverContactsBlockGPU: friction correlation +
 //      setupFinalizeSolverConstraintsBlock)
@@ -36,19 +36,36 @@
 //     (setupSolverConstraintBlockGPU: preprocessRows/orthogonalize +
 //      setUp1DConstraintBlock)
 //
+// Both entries take the ENGINE's CUDA parameter pack
+//   (PxgConstraintPrepareDesc*, PxgSolverSharedDesc<IterativeSolveData>*)
+// as a 16-byte push-constant blob (argSizes {8,8} in
+// bridge/PxgVulkanKernelAbi.cpp) and read every count / scalar / pool pointer
+// on-device through the byte-exact pxgSlangPrepDesc / pxgSlangSolverDesc
+// mirrors.  The batch count is derived on-device exactly like the .cu:
+//   contacts: numContactBatches + numStaticContactBatches
+//   joints:   num1dConstraintBatches + numStatic1dConstraintBatches
+// dt / invDt come from sharedDesc->dt / sharedDesc->invDtF32; the prep
+// thresholds come from the prepare desc.
+//
+// Thread layout mirrors the CUDA launch: block =
+// CONSTRAINT_PREPARE_BLOCK_PARALLEL (64) = 2 warps; warpIndex = blockIdx.x *
+// (blockDim/32) + threadIdx.x/32 selects the batch.
+//
 // Differences from CUDA (same policy as the solver ports):
-//   - one 32-thread workgroup per batch; the batch range and descriptor
-//     scalars arrive as push constants;
 //   - the warp-staged sqrtInvInertia loads and the __syncwarp()s around the
 //     per-lane friction-patch writes become direct loads (all accesses are
 //     same-lane);
 //   - the PxU16 rowCounts/breakable header fields are written with
 //     InterlockedAnd/Or word updates (CUDA issues native 16-bit stores);
 //   - the per-warp __shared__ scratch (sortedRowIndices, angSqrtInvInertia)
-//     becomes per-thread local arrays.
+//     becomes per-thread local arrays;
+//   - the CUDA null blockPreviousFrictionIndices pointer check becomes a
+//     device-address != 0 test (hasPrevFrictionIndices).
 
 import pxgSlangCommon;
 import pxgSlangPrepCommon;
+import pxgSlangPrepDesc;
+import pxgSlangSolverDesc;
 
 // ---------------------------------------------------------------------------
 // output block structures (byte-identical mirrors, same as solverPGS.slang)
@@ -163,66 +180,247 @@ struct PxgBlockSolverConstraint1DMod
 }                            // = 1024
 
 // ---------------------------------------------------------------------------
-// push constants + bindings
+// engine-ABI push constants (shared by both entries: the CUDA parameter pack
+// is identical — PxgConstraintPrepareDesc*, PxgSolverSharedDesc<...>*)
 // ---------------------------------------------------------------------------
 
-struct PrepParams
+struct PgsPrepLaunch
 {
-    uint numBatches;              // resolved batch count for this dispatch
-    uint totalPreviousEdges;
-    uint totalCurrentEdges;
-    uint hasPrevFrictionIndices;
-    float dt;                     // sharedDesc->dt (PGS) / stepDt (TGS)
-    float invDt;                  // sharedDesc->invDtF32 (PGS) / stepInvDtF32 (TGS)
-    float totalDt;                // TGS only: sharedDesc->dt
-    float invTotalDt;             // TGS only: sharedDesc->invDtF32
-    float bounceThreshold;
-    float frictionOffsetThreshold;
-    float correlationDistance;
-    float ccdMaxSeparation;
-    float lengthScale;            // TGS only
-    float biasCoefficient;        // TGS only
-};
+    uint64_t prepDesc;   // @0 PxgConstraintPrepareDesc*
+    uint64_t sharedDesc; // @8 PxgSolverSharedDesc<IterativeSolveData>*
+}
 
 [[vk::push_constant]]
-ConstantBuffer<PrepParams> gParams;
+ConstantBuffer<PgsPrepLaunch> gPgsPrepLaunch;
 
-RWStructuredBuffer<PxgBlockConstraintBatch> gBatches;                    // binding 0
-RWStructuredBuffer<uint> gBatchIndices;                                  // binding 1 (contact OR joint indices)
-RWStructuredBuffer<PxgSolverBodyData> gSolverBodyData;                   // binding 2
-RWStructuredBuffer<PxgSolverTxIData> gTxIData;                           // binding 3
+// ---------------------------------------------------------------------------
+// Ptr-typed twins of the pxgSlangPrepCommon correlation helpers (same bodies,
+// BDA access — copied from the constraintPrepTGS.slang conversion).
+// ---------------------------------------------------------------------------
 
-// joint prep inputs/outputs
-RWStructuredBuffer<PxgBlockConstraint1DData> gJointData;                 // binding 4
-RWStructuredBuffer<PxgBlockConstraint1DVelocities> gJointVel;            // binding 5 (RW: orthogonalize)
-RWStructuredBuffer<PxgBlockConstraint1DParameters> gJointPar;            // binding 6
-RWStructuredBuffer<uint> gConstraintUniqueIndices;                       // binding 7
-RWStructuredBuffer<uint2> gSolverConstantData;                           // binding 8 (PxgSolverConstraintManagerConstants)
-RWStructuredBuffer<PxgBlockSolverConstraint1DHeader> gJointHeaders;      // binding 9
-RWStructuredBuffer<PxgBlockSolverConstraint1DCon> gJointRowsCon;         // binding 10
-RWStructuredBuffer<PxgBlockSolverConstraint1DMod> gJointRowsMod;         // binding 11
+// mirrors initFrictionPatch() + correlatePatches()
+void correlatePatchesPtr(Ptr<PxgBlockFrictionPatch> patches, uint pi, uint nbContacts, float3 normal,
+                         PxgAlignedTransform bodyFrame0, PxgAlignedTransform bodyFrame1, uint threadIndex)
+{
+    if (nbContacts > 0)
+    {
+        const float3 body0Normal = quatRotateInv(bodyFrame0.q, normal);
+        const float3 body1Normal = quatRotateInv(bodyFrame1.q, normal);
 
-// contact prep inputs/outputs
-RWStructuredBuffer<PxgAlignedTransform> gBodyFrames;                     // binding 12
-RWStructuredBuffer<PxgBlockWorkUnit> gWorkUnits;                         // binding 13
-RWStructuredBuffer<PxgBlockContactData> gContactPrepData;                // binding 14
-RWStructuredBuffer<PxgBlockContactPoint> gContactPrepPoints;             // binding 15
-RWStructuredBuffer<PxgBlockFrictionPatch> gCurrFrictionPatches;          // binding 16
-RWStructuredBuffer<PxgBlockFrictionPatch> gPrevFrictionPatches;          // binding 17
-RWStructuredBuffer<PxgBlockFrictionAnchorPatch> gCurrAnchors;            // binding 18
-RWStructuredBuffer<PxgBlockFrictionAnchorPatch> gPrevAnchors;            // binding 19
-RWStructuredBuffer<uint2> gCurrFrictionIndices;                          // binding 20
-RWStructuredBuffer<uint2> gPrevFrictionIndices;                          // binding 21
-RWStructuredBuffer<PxgBlockSolverContactHeader> gContactHeaders;         // binding 22
-RWStructuredBuffer<PxgBlockSolverFrictionHeader> gFrictionHeaders;       // binding 23
-RWStructuredBuffer<PxgBlockSolverContactPoint> gContactPoints;           // binding 24
-RWStructuredBuffer<PxgBlockSolverContactFriction> gFrictions;            // binding 25
+        patches[pi].contactID0[threadIndex] = 0xff;
+        patches[pi].contactID1[threadIndex] = 0xff;
+
+        // initFrictionPatch()
+        patches[pi].body0Normal[threadIndex] = float4(body0Normal, 0.0f);
+        patches[pi].body1Normal[threadIndex] = float4(body1Normal, 0.0f);
+        patches[pi].anchorCount[threadIndex] = 0;
+        patches[pi].broken[threadIndex] = 0;
+    }
+}
+
+// mirrors getFrictionPatches(); hasPrevFrictionIndices is the engine's
+// blockPreviousFrictionIndices != NULL
+void getFrictionPatchesPtr(Ptr<PxgBlockFrictionPatch> currPatches, uint pi,
+                           Ptr<PxgBlockFrictionAnchorPatch> currAnchors, uint ai,
+                           Ptr<uint2> prevFrictionIndices, bool hasPrevFrictionIndices,
+                           uint prevFrictionStartIndex, Ptr<PxgBlockFrictionPatch> prevPatches,
+                           Ptr<PxgBlockFrictionAnchorPatch> prevAnchors, uint frictionPatchCount,
+                           PxgAlignedTransform bodyFrame0, PxgAlignedTransform bodyFrame1,
+                           float correlationDistance, uint threadIndex, uint totalNbEdges,
+                           inout float patchExtents, uint nbContacts)
+{
+    if (prevFrictionStartIndex == 0xFFFFFFFFu || frictionPatchCount == 0 || !hasPrevFrictionIndices)
+        return;
+
+    for (uint a = 0; a < frictionPatchCount; ++a)
+    {
+        const uint2 index = prevFrictionIndices[prevFrictionStartIndex + a * totalNbEdges];
+        // PxgBlockFrictionIndex: PxU64 = patchIndex << 5 | threadIdx
+        const uint oldThreadId = index.x & 31u;
+        const uint patchIndex = (index.x >> 5) | (index.y << 27);
+
+        if (prevPatches[patchIndex].broken[oldThreadId] == 0)
+        {
+            const float4 oldBody0Normal = prevPatches[patchIndex].body0Normal[oldThreadId];
+            if (dot(oldBody0Normal.xyz, currPatches[pi].body0Normal[threadIndex].xyz) > PXC_SAME_NORMAL)
+            {
+                const uint anchorCount = prevPatches[patchIndex].anchorCount[oldThreadId];
+                if (anchorCount != 0)
+                {
+                    // KS - if we have more anchors than contacts, we need to throw away the patch and rebuild
+                    if (anchorCount <= nbContacts)
+                    {
+                        const PxgAlignedTransform body1ToBody0 = alignedTransformInvTransform(bodyFrame0, bodyFrame1);
+                        const float4 oldBody1Normal = prevPatches[patchIndex].body1Normal[oldThreadId];
+                        if (dot(oldBody0Normal.xyz, alignedRotate(body1ToBody0.q, oldBody1Normal).xyz) > PXC_SAME_NORMAL)
+                        {
+                            const float4 body0Anchor0 = prevAnchors[patchIndex].body0Anchors0[oldThreadId];
+                            const float4 body1Anchor0 = prevAnchors[patchIndex].body1Anchors0[oldThreadId];
+                            if (anchorCount == 0 ||
+                                pointsAreClose(body1ToBody0, body0Anchor0, body1Anchor0, oldBody0Normal, correlationDistance))
+                            {
+                                const float4 body0Anchor1 = prevAnchors[patchIndex].body0Anchors1[oldThreadId];
+                                const float4 body1Anchor1 = prevAnchors[patchIndex].body1Anchors1[oldThreadId];
+                                if (anchorCount < 2 ||
+                                    pointsAreClose(body1ToBody0, body0Anchor1, body1Anchor1, oldBody0Normal, correlationDistance))
+                                {
+                                    currPatches[pi].contactID0[threadIndex] = 0xff;
+                                    currPatches[pi].contactID1[threadIndex] = 0xff;
+                                    currPatches[pi].anchorCount[threadIndex] = anchorCount;
+                                    currPatches[pi].body0Normal[threadIndex] = oldBody0Normal;
+                                    currPatches[pi].body1Normal[threadIndex] = oldBody1Normal;
+                                    currAnchors[ai].body0Anchors0[threadIndex] = body0Anchor0;
+                                    currAnchors[ai].body0Anchors1[threadIndex] = body0Anchor1;
+                                    currAnchors[ai].body1Anchors0[threadIndex] = body1Anchor0;
+                                    currAnchors[ai].body1Anchors1[threadIndex] = body1Anchor1;
+                                    const float4 ext = body0Anchor0 - body0Anchor1;
+                                    patchExtents = ext.x * ext.x + ext.y * ext.y + ext.z * ext.z;
+                                    return; // Found a match = terminate!
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// mirrors growPatches()
+void growPatchesPtr(Ptr<PxgBlockFrictionPatch> patches, uint pi,
+                    Ptr<PxgBlockFrictionAnchorPatch> anchors, uint ai,
+                    Ptr<PxgBlockContactPoint> contacts, uint contactBase, uint numContacts,
+                    PxgAlignedTransform bodyFrame0, PxgAlignedTransform bodyFrame1,
+                    float frictionOffsetThreshold, uint threadIndex, float anchorSqDistance)
+{
+    float3 boundsMin = float3(PREP_PX_MAX_F32);
+    float3 boundsMax = float3(-PREP_PX_MAX_F32);
+    for (uint i = 0; i < numContacts; ++i)
+    {
+        const float4 cp = contacts[contactBase + i].point_separationW[threadIndex];
+        boundsMin = min(boundsMin, cp.xyz);
+        boundsMax = max(boundsMax, cp.xyz);
+    }
+
+    uint oldAnchorCount = patches[pi].anchorCount[threadIndex];
+
+    if (oldAnchorCount == 2)
+    {
+        const float3 dims = boundsMax - boundsMin;
+        const float frictionPatchDiagonalSq = dot(dims, dims);
+
+        // If the squared distance between the anchors is more than a quarter
+        // of the patch diagonal, we can keep, otherwise the anchors are
+        // potentially clustered around a corner so force a rebuild of the patch
+        if ((anchorSqDistance * 4.0f) >= frictionPatchDiagonalSq)
+            return;
+
+        oldAnchorCount = 0;
+    }
+
+    float3 worldAnchor0 = float3(0.0f);
+    float3 worldAnchor1 = float3(0.0f);
+    uint contactID0 = 0;
+    uint contactID1 = 0;
+
+    uint anchorCount = 0;
+    float pointDistSq = 0.0f;
+
+    // if we have an anchor already, keep it
+    if (oldAnchorCount == 1)
+    {
+        const float4 a0 = anchors[ai].body0Anchors0[threadIndex];
+        worldAnchor0 = alignedTransformVec(bodyFrame0, a0.xyz);
+        contactID0 = 0xFF;
+        anchorCount++;
+    }
+
+    const float eps = 1e-8f;
+
+    for (uint j = 0; j < numContacts; j++)
+    {
+        const float4 worldPoint4_separationW = contacts[contactBase + j].point_separationW[threadIndex];
+
+        if (worldPoint4_separationW.w < frictionOffsetThreshold)
+        {
+            const float3 worldPoint = worldPoint4_separationW.xyz;
+            if (anchorCount == 0)
+            {
+                contactID0 = j & 0xFFFFu; // PxU16(j)
+                worldAnchor0 = worldPoint;
+                anchorCount++;
+            }
+            else if (anchorCount == 1)
+            {
+                const float3 d = worldPoint - worldAnchor0;
+                pointDistSq = dot(d, d);
+                if (pointDistSq > eps)
+                {
+                    contactID1 = j;
+                    worldAnchor1 = worldPoint;
+                    anchorCount++;
+                }
+            }
+            else // case 2
+            {
+                const float3 d0v = worldPoint - worldAnchor0;
+                const float3 d1v = worldPoint - worldAnchor1;
+                const float dist0 = dot(d0v, d0v);
+                const float dist1 = dot(d1v, d1v);
+                if (dist0 > dist1)
+                {
+                    if (dist0 > pointDistSq)
+                    {
+                        contactID1 = j & 0xFFFFu;
+                        worldAnchor1 = worldPoint;
+                        pointDistSq = dist0;
+                    }
+                }
+                else if (dist1 > pointDistSq)
+                {
+                    contactID0 = j & 0xFFFFu;
+                    worldAnchor0 = worldPoint;
+                    pointDistSq = dist1;
+                }
+            }
+        }
+    }
+
+    // add the new anchor(s) to the patch (the CUDA switch falls through from
+    // case 2 into case 1)
+    if (anchorCount == 2)
+    {
+        const float3 localPoint0 = alignedTransformInvVec(bodyFrame0, worldAnchor1);
+        const float3 localPoint1 = alignedTransformInvVec(bodyFrame1, worldAnchor1);
+        anchors[ai].body0Anchors1[threadIndex] = float4(localPoint0, 0.0f);
+        anchors[ai].body1Anchors1[threadIndex] = float4(localPoint1, 0.0f);
+        patches[pi].contactID1[threadIndex] = contactID1;
+    }
+    if (anchorCount >= 1 && oldAnchorCount == 0)
+    {
+        const float3 localPoint0 = alignedTransformInvVec(bodyFrame0, worldAnchor0);
+        const float3 localPoint1 = alignedTransformInvVec(bodyFrame1, worldAnchor0);
+        anchors[ai].body0Anchors0[threadIndex] = float4(localPoint0, 0.0f);
+        anchors[ai].body1Anchors0[threadIndex] = float4(localPoint1, 0.0f);
+        patches[pi].contactID0[threadIndex] = contactID0;
+    }
+
+    patches[pi].anchorCount[threadIndex] = anchorCount;
+}
 
 // ---------------------------------------------------------------------------
 // contact prep (setupFinalizeSolverConstraintsBlock in contactConstraintBlockPrep.cuh)
 // ---------------------------------------------------------------------------
 
-void setupFinalizeSolverConstraintsBlock(uint prepIndex, uint contactBase, uint contactCount,
+void setupFinalizeSolverConstraintsBlock(Ptr<PxgBlockContactData> gContactPrepData,
+                                         Ptr<PxgBlockContactPoint> gContactPrepPoints,
+                                         Ptr<PxgBlockFrictionPatch> gCurrFrictionPatches,
+                                         Ptr<PxgBlockFrictionAnchorPatch> gCurrAnchors,
+                                         Ptr<PxgBlockSolverContactHeader> gContactHeaders,
+                                         Ptr<PxgBlockSolverFrictionHeader> gFrictionHeaders,
+                                         Ptr<PxgBlockSolverContactPoint> gContactPoints,
+                                         Ptr<PxgBlockSolverContactFriction> gFrictions,
+                                         uint prepIndex, uint contactBase, uint contactCount,
                                          PxgAlignedTransform bodyFrame0, PxgAlignedTransform bodyFrame1,
                                          PxgSolverBodyData data0, PxgSolverBodyData data1,
                                          float4 initialLinVel0_invMassW, float4 initialAngVel0_penBiasClamp,
@@ -510,45 +708,88 @@ void setupFinalizeSolverConstraintsBlock(uint prepIndex, uint contactBase, uint 
 }
 
 // mirrors contactConstraintBlockPrepareParallelLaunch() +
-// createFinalizeSolverContactsBlockGPU(); one workgroup per contact batch
+// createFinalizeSolverContactsBlockGPU() on the ENGINE ABI: warpIndex =
+// blockIdx.x * (blockDim/32) + threadIdx.x/32 selects the batch,
+// nbContactBatches = numContactBatches + numStaticContactBatches from the desc.
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(64, 1, 1)]
 void contactConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_GroupThreadID,
                                                  uint3 groupId : SV_GroupID)
 {
-    const uint threadIndexInWarp = groupThreadId.x;
-    const uint i = groupId.x;
+    const uint blockStride = 64u / 32u;
+    const uint warpIndex = groupId.x * blockStride + groupThreadId.x / 32u;
+    const uint threadIndexInWarp = groupThreadId.x & 31u;
 
-    if (i >= gParams.numBatches)
+    Ptr<PxgConstraintPrepareDescGpu> prepDesc =
+        Ptr<PxgConstraintPrepareDescGpu>(gPgsPrepLaunch.prepDesc);
+    Ptr<PxgSolverSharedDescPGSGpu> sharedDesc =
+        Ptr<PxgSolverSharedDescPGSGpu>(gPgsPrepLaunch.sharedDesc);
+
+    const uint totalPreviousEdges = prepDesc[0].totalPreviousEdges;
+    const uint totalCurrentEdges = prepDesc[0].totalCurrentEdges;
+    const uint nbContactBatches = prepDesc[0].numContactBatches + prepDesc[0].numStaticContactBatches;
+
+    const uint i = warpIndex;
+    if (i >= nbContactBatches)
         return;
 
-    const uint batchIndex = gBatchIndices[i];
+    Ptr<PxgBlockWorkUnit> gWorkUnitsP = Ptr<PxgBlockWorkUnit>(prepDesc[0].blockWorkUnit);
+    Ptr<uint> batchIndices = Ptr<uint>(prepDesc[0].contactConstraintBatchIndices);
+    Ptr<PxgBlockConstraintBatch> batches =
+        Ptr<PxgBlockConstraintBatch>(sharedDesc[0].iter_blockConstraintBatch);
+    Ptr<PxgSolverBodyData> solverBodyDatas = Ptr<PxgSolverBodyData>(prepDesc[0].solverBodyDataPool);
+    Ptr<PxgSolverTxIData> solverTxIDatas = Ptr<PxgSolverTxIData>(prepDesc[0].solverBodyTxIDataPool);
+    Ptr<PxgAlignedTransform> bodyFrames = Ptr<PxgAlignedTransform>(prepDesc[0].body2WorldPool);
+    Ptr<PxgBlockContactData> contactPrepPool =
+        Ptr<PxgBlockContactData>(prepDesc[0].blockContactCurrentPrepPool);
+    Ptr<PxgBlockContactPoint> contactPrepPoints = Ptr<PxgBlockContactPoint>(prepDesc[0].blockContactPoints);
+    Ptr<PxgBlockFrictionPatch> currFrictionPatches =
+        Ptr<PxgBlockFrictionPatch>(sharedDesc[0].blockCurrentFrictionPatches);
+    Ptr<PxgBlockFrictionPatch> prevFrictionPatches =
+        Ptr<PxgBlockFrictionPatch>(sharedDesc[0].blockPreviousFrictionPatches);
+    Ptr<PxgBlockFrictionAnchorPatch> currAnchors =
+        Ptr<PxgBlockFrictionAnchorPatch>(prepDesc[0].blockCurrentAnchorPatches);
+    Ptr<PxgBlockFrictionAnchorPatch> prevAnchors =
+        Ptr<PxgBlockFrictionAnchorPatch>(prepDesc[0].blockPreviousAnchorPatches);
+    Ptr<uint2> currFrictionIndices = Ptr<uint2>(prepDesc[0].blockCurrentFrictionIndices);
+    Ptr<uint2> prevFrictionIndices = Ptr<uint2>(prepDesc[0].blockPreviousFrictionIndices);
+    Ptr<PxgBlockSolverContactHeader> contactHeaders =
+        Ptr<PxgBlockSolverContactHeader>(sharedDesc[0].iter_blockContactHeaders);
+    Ptr<PxgBlockSolverFrictionHeader> frictionHeaders =
+        Ptr<PxgBlockSolverFrictionHeader>(sharedDesc[0].iter_blockFrictionHeaders);
+    Ptr<PxgBlockSolverContactPoint> contactPoints =
+        Ptr<PxgBlockSolverContactPoint>(sharedDesc[0].iter_blockContactPoints);
+    Ptr<PxgBlockSolverContactFriction> frictions =
+        Ptr<PxgBlockSolverContactFriction>(sharedDesc[0].iter_blockFrictions);
 
-    const uint descStride = gBatches[batchIndex].descStride_constraintType & 0xFFFFu;
+    const uint batchIndex = batchIndices[i];
+
+    const uint descStride = batches[batchIndex].descStride_constraintType & 0xFFFFu;
     if (threadIndexInWarp >= descStride)
         return;
 
-    const uint bodyAIndex = gBatches[batchIndex].bodyAIndex[threadIndexInWarp];
-    const uint bodyBIndex = gBatches[batchIndex].bodyBIndex[threadIndexInWarp];
-    const uint descIndexBatch = gBatches[batchIndex].mConstraintBatchIndex;
+    const uint bodyAIndex = batches[batchIndex].bodyAIndex[threadIndexInWarp];
+    const uint bodyBIndex = batches[batchIndex].bodyBIndex[threadIndexInWarp];
+    const uint descIndexBatch = batches[batchIndex].mConstraintBatchIndex;
 
     // CUDA stages the sqrtInvInertia tensors through shared memory for
     // coalescing; direct loads are semantically identical.
-    const PxgMat33 invInertia0 = mat33Load(gTxIData[bodyAIndex].sqrtInvInertia);
-    const PxgMat33 invInertia1 = mat33Load(gTxIData[bodyBIndex].sqrtInvInertia);
+    const PxgMat33 invInertia0 = mat33Load(solverTxIDatas[bodyAIndex].sqrtInvInertia);
+    const PxgMat33 invInertia1 = mat33Load(solverTxIDatas[bodyBIndex].sqrtInvInertia);
 
     // Fill in correlation information for next frame...
-    const uint edgeIndex = gWorkUnits[descIndexBatch].mEdgeIndex[threadIndexInWarp];
-    const uint frictionIndex = edgeIndex + gParams.totalCurrentEdges * gWorkUnits[descIndexBatch].mPatchIndex[threadIndexInWarp];
+    const uint edgeIndex = gWorkUnitsP[descIndexBatch].mEdgeIndex[threadIndexInWarp];
+    const uint frictionIndex =
+        edgeIndex + totalCurrentEdges * gWorkUnitsP[descIndexBatch].mPatchIndex[threadIndexInWarp];
     // PxgBlockFrictionIndex::createPatchIndex(): PxU64 = patchIndex << 5 | lane
-    gCurrFrictionIndices[frictionIndex] =
+    currFrictionIndices[frictionIndex] =
         uint2((descIndexBatch << 5) | threadIndexInWarp, descIndexBatch >> 27);
 
-    const PxgSolverBodyData bodyData0 = gSolverBodyData[bodyAIndex];
-    const PxgSolverBodyData bodyData1 = gSolverBodyData[bodyBIndex];
+    const PxgSolverBodyData bodyData0 = solverBodyDatas[bodyAIndex];
+    const PxgSolverBodyData bodyData1 = solverBodyDatas[bodyBIndex];
 
-    const PxgAlignedTransform bodyFrame0 = gBodyFrames[bodyAIndex];
-    const PxgAlignedTransform bodyFrame1 = gBodyFrames[bodyBIndex];
+    const PxgAlignedTransform bodyFrame0 = bodyFrames[bodyAIndex];
+    const PxgAlignedTransform bodyFrame1 = bodyFrames[bodyBIndex];
 
     const float4 linVel_invMass0 = bodyData0.initialLinVelXYZ_invMassW;
     const float4 angVelXYZ_penBiasClamp0 = bodyData0.initialAngVelXYZ_penBiasClamp;
@@ -557,11 +798,11 @@ void contactConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_GroupT
 
     const float solverOffsetSlop = max(bodyData0.offsetSlop, bodyData1.offsetSlop);
 
-    const uint forceWritebackOffset = gWorkUnits[descIndexBatch].mWriteback[threadIndexInWarp];
+    const uint forceWritebackOffset = gWorkUnitsP[descIndexBatch].mWriteback[threadIndexInWarp];
 
     // ---- createFinalizeSolverContactsBlockGPU ----
 
-    const float4 data_ = gContactPrepData[descIndexBatch].contactData[threadIndexInWarp];
+    const float4 data_ = contactPrepPool[descIndexBatch].contactData[threadIndexInWarp];
     // PxgMaterialContactData: x=restDistance, y=staticFriction, z=dynamicFriction,
     // w packs mNumContacts | mSolverFlags << 8 | prevFrictionPatchCount << 16
     const uint materialWord = asuint(data_.w);
@@ -572,19 +813,19 @@ void contactConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_GroupT
     const float staticFrictionCof = data_.y;
     const float dynamicFrictionCof = data_.z;
 
-    const float4 normal4 = gContactPrepData[descIndexBatch].normal_restitutionW[threadIndexInWarp];
+    const float4 normal4 = contactPrepPool[descIndexBatch].normal_restitutionW[threadIndexInWarp];
     const float3 normal = normal4.xyz;
 
-    const uint contactBase = gBatches[batchIndex].blockContactIndex;
+    const uint contactBase = batches[batchIndex].blockContactIndex;
 
-    correlatePatches(gCurrFrictionPatches, descIndexBatch, nbContacts, normal, bodyFrame0, bodyFrame1,
-                     threadIndexInWarp);
+    correlatePatchesPtr(currFrictionPatches, descIndexBatch, nbContacts, normal, bodyFrame0, bodyFrame1,
+                        threadIndexInWarp);
 
     const bool perPointFriction = (flags & PXG_SC_FLAG_PER_POINT_FRICTION) != 0;
     const bool disableFriction = (flags & PXG_SC_FLAG_DISABLE_FRICTION) != 0;
 
     // KS - ensure that the friction patch broken bit is set to 0
-    gCurrFrictionPatches[descIndexBatch].broken[threadIndexInWarp] = 0;
+    currFrictionPatches[descIndexBatch].broken[threadIndexInWarp] = 0;
 
     float patchExtents = 0.0f;
 
@@ -593,40 +834,43 @@ void contactConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_GroupT
 
     if (!(perPointFriction || disableFriction))
     {
-        getFrictionPatches(gCurrFrictionPatches, descIndexBatch, gCurrAnchors, descIndexBatch,
-                           gPrevFrictionIndices, gParams.hasPrevFrictionIndices != 0, edgeIndex,
-                           gPrevFrictionPatches, gPrevAnchors, prevFrictionPatchCount, bodyFrame0,
-                           bodyFrame1, gParams.correlationDistance, threadIndexInWarp,
-                           gParams.totalPreviousEdges, patchExtents, nbContacts);
+        getFrictionPatchesPtr(currFrictionPatches, descIndexBatch, currAnchors, descIndexBatch,
+                              prevFrictionIndices, prepDesc[0].blockPreviousFrictionIndices != 0, edgeIndex,
+                              prevFrictionPatches, prevAnchors, prevFrictionPatchCount, bodyFrame0,
+                              bodyFrame1, prepDesc[0].correlationDistance, threadIndexInWarp,
+                              totalPreviousEdges, patchExtents, nbContacts);
     }
 
     if (!disableFriction)
-        growPatches(gCurrFrictionPatches, descIndexBatch, gCurrAnchors, descIndexBatch, gContactPrepPoints,
-                    contactBase, nbContacts, bodyFrame0, bodyFrame1,
-                    gParams.frictionOffsetThreshold + restDistance, threadIndexInWarp, patchExtents);
+        growPatchesPtr(currFrictionPatches, descIndexBatch, currAnchors, descIndexBatch, contactPrepPoints,
+                       contactBase, nbContacts, bodyFrame0, bodyFrame1,
+                       prepDesc[0].frictionOffsetThreshold + restDistance, threadIndexInWarp, patchExtents);
 
-    setupFinalizeSolverConstraintsBlock(descIndexBatch, contactBase, nbContacts, bodyFrame0, bodyFrame1,
+    setupFinalizeSolverConstraintsBlock(contactPrepPool, contactPrepPoints, currFrictionPatches, currAnchors,
+                                        contactHeaders, frictionHeaders, contactPoints, frictions,
+                                        descIndexBatch, contactBase, nbContacts, bodyFrame0, bodyFrame1,
                                         bodyData0, bodyData1, linVel_invMass0, angVelXYZ_penBiasClamp0,
                                         linVel_invMass1, angVelXYZ_penBiasClamp1, invInertia0, invInertia1,
-                                        gParams.invDt, gParams.dt, gParams.bounceThreshold, threadIndexInWarp,
+                                        sharedDesc[0].invDtF32, sharedDesc[0].dt,
+                                        prepDesc[0].bounceThresholdF32, threadIndexInWarp,
                                         forceWritebackOffset, perPointFriction, descIndexBatch,
-                                        gBatches[batchIndex].startConstraintIndex,
-                                        gBatches[batchIndex].startFrictionIndex, restDistance,
+                                        batches[batchIndex].startConstraintIndex,
+                                        batches[batchIndex].startFrictionIndex, restDistance,
                                         staticFrictionCof, dynamicFrictionCof, flags,
-                                        gParams.ccdMaxSeparation, solverOffsetSlop);
+                                        prepDesc[0].ccdMaxSeparation, solverOffsetSlop);
 
     // ---- back in the kernel wrapper ----
 
-    gCurrFrictionPatches[descIndexBatch].patchIndex[threadIndexInWarp] =
-        gWorkUnits[descIndexBatch].mFrictionPatchIndex[threadIndexInWarp];
+    currFrictionPatches[descIndexBatch].patchIndex[threadIndexInWarp] =
+        gWorkUnitsP[descIndexBatch].mFrictionPatchIndex[threadIndexInWarp];
 
     // PxSave3(bodyFrame0.transform(PxLoad3(anchor))): PxVec3 path, w = 0
-    if (gCurrFrictionPatches[descIndexBatch].anchorCount[threadIndexInWarp] >= 1)
-        gCurrFrictionPatches[descIndexBatch].anchorPoints0[threadIndexInWarp] = float4(
-            alignedTransformVec(bodyFrame0, gCurrAnchors[descIndexBatch].body0Anchors0[threadIndexInWarp].xyz), 0.0f);
-    if (gCurrFrictionPatches[descIndexBatch].anchorCount[threadIndexInWarp] == 2)
-        gCurrFrictionPatches[descIndexBatch].anchorPoints1[threadIndexInWarp] = float4(
-            alignedTransformVec(bodyFrame0, gCurrAnchors[descIndexBatch].body0Anchors1[threadIndexInWarp].xyz), 0.0f);
+    if (currFrictionPatches[descIndexBatch].anchorCount[threadIndexInWarp] >= 1)
+        currFrictionPatches[descIndexBatch].anchorPoints0[threadIndexInWarp] = float4(
+            alignedTransformVec(bodyFrame0, currAnchors[descIndexBatch].body0Anchors0[threadIndexInWarp].xyz), 0.0f);
+    if (currFrictionPatches[descIndexBatch].anchorCount[threadIndexInWarp] == 2)
+        currFrictionPatches[descIndexBatch].anchorPoints1[threadIndexInWarp] = float4(
+            alignedTransformVec(bodyFrame0, currAnchors[descIndexBatch].body0Anchors1[threadIndexInWarp].xyz), 0.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -636,7 +880,8 @@ void contactConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_GroupT
 // mirrors orthogonalize() in jointConstraintBlockPrep.cuh; operates on the
 // rows gJointVel[rowBase + sortedRowIndices[startOffset + i]] and the local
 // angSqrtInvInertia arrays (sub-range [startOffset, startOffset + rowCount))
-void orthogonalize(uint sortedRowIndices[MAX_CONSTRAINT_ROWS], uint startOffset, uint rowBase,
+void orthogonalize(Ptr<PxgBlockConstraint1DVelocities> gJointVel,
+                   uint sortedRowIndices[MAX_CONSTRAINT_ROWS], uint startOffset, uint rowBase,
                    inout float3 angSqrtInvInertia0[MAX_CONSTRAINT_ROWS],
                    inout float3 angSqrtInvInertia1[MAX_CONSTRAINT_ROWS], uint rowCount, uint eqRowCount,
                    float invMass0, float invMass1, float invInertiaScale0, float invInertiaScale1,
@@ -720,7 +965,10 @@ void orthogonalize(uint sortedRowIndices[MAX_CONSTRAINT_ROWS], uint startOffset,
 }
 
 // mirrors preprocessRows() in jointConstraintBlockPrep.cuh
-void preprocessRows(inout uint sortedRowIndices[MAX_CONSTRAINT_ROWS], uint jointDataIndex, uint rowBase,
+void preprocessRows(Ptr<PxgBlockConstraint1DData> gJointData,
+                    Ptr<PxgBlockConstraint1DVelocities> gJointVel,
+                    Ptr<PxgBlockConstraint1DParameters> gJointPar,
+                    inout uint sortedRowIndices[MAX_CONSTRAINT_ROWS], uint jointDataIndex, uint rowBase,
                     out float3 angSqrtInvInertia0[MAX_CONSTRAINT_ROWS],
                     out float3 angSqrtInvInertia1[MAX_CONSTRAINT_ROWS], float4 invMassScale, float iMass0,
                     float iMass1, PxgMat33 i0, PxgMat33 i1, uint threadIndex, bool disablePreprocessing)
@@ -769,9 +1017,9 @@ void preprocessRows(inout uint sortedRowIndices[MAX_CONSTRAINT_ROWS], uint joint
                      bCount++)
                     ;
 
-                orthogonalize(sortedRowIndices, start, rowBase, angSqrtInvInertia0, angSqrtInvInertia1,
-                              i - start, bCount - start, invMass0, invMass1, invInertiaScale0,
-                              invInertiaScale1, threadIndex);
+                orthogonalize(gJointVel, sortedRowIndices, start, rowBase, angSqrtInvInertia0,
+                              angSqrtInvInertia1, i - start, bCount - start, invMass0, invMass1,
+                              invInertiaScale0, invInertiaScale1, threadIndex);
             }
         }
     }
@@ -779,64 +1027,98 @@ void preprocessRows(inout uint sortedRowIndices[MAX_CONSTRAINT_ROWS], uint joint
 
 // packed-PxU16 store into a uint[16] header field (CUDA issues native 16-bit
 // stores; adjacent lanes share a word, so the halves are updated atomically)
-void storeHeaderU16(uint headerIndex, bool isBreakable, uint threadIndex, uint value)
+void storeHeaderU16(Ptr<PxgBlockSolverConstraint1DHeader> gJointHeaders, uint headerIndex,
+                    bool isBreakable, uint threadIndex, uint value)
 {
     const uint word = threadIndex >> 1;
     const uint shift = (threadIndex & 1) * 16;
     if (isBreakable)
     {
-        InterlockedAnd(gJointHeaders[headerIndex].breakable[word], ~(0xFFFFu << shift));
-        InterlockedOr(gJointHeaders[headerIndex].breakable[word], (value & 0xFFFFu) << shift);
+        uint prev;
+        InterlockedAnd(gJointHeaders[headerIndex].breakable[word], ~(0xFFFFu << shift), prev);
+        InterlockedOr(gJointHeaders[headerIndex].breakable[word], (value & 0xFFFFu) << shift, prev);
     }
     else
     {
-        InterlockedAnd(gJointHeaders[headerIndex].rowCounts[word], ~(0xFFFFu << shift));
-        InterlockedOr(gJointHeaders[headerIndex].rowCounts[word], (value & 0xFFFFu) << shift);
+        uint prev;
+        InterlockedAnd(gJointHeaders[headerIndex].rowCounts[word], ~(0xFFFFu << shift), prev);
+        InterlockedOr(gJointHeaders[headerIndex].rowCounts[word], (value & 0xFFFFu) << shift, prev);
     }
 }
 
 // mirrors jointConstraintBlockPrepareParallelLaunch() +
-// setupSolverConstraintBlockGPU() + setUp1DConstraintBlock();
-// one workgroup per joint batch
+// setupSolverConstraintBlockGPU() + setUp1DConstraintBlock() on the ENGINE
+// ABI: warpIndex = blockIdx.x * (blockDim/32) + threadIdx.x/32 selects the
+// batch, num1dConstraintBatches = num1dConstraintBatches +
+// numStatic1dConstraintBatches from the desc.
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(64, 1, 1)]
 void jointConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_GroupThreadID,
                                                uint3 groupId : SV_GroupID)
 {
-    const uint threadIndexInWarp = groupThreadId.x;
-    const uint i = groupId.x;
+    const uint blockStride = 64u / 32u;
+    const uint warpIndex = groupId.x * blockStride + groupThreadId.x / 32u;
+    const uint threadIndexInWarp = groupThreadId.x & 31u;
 
-    if (i >= gParams.numBatches)
+    Ptr<PxgConstraintPrepareDescGpu> prepDesc =
+        Ptr<PxgConstraintPrepareDescGpu>(gPgsPrepLaunch.prepDesc);
+    Ptr<PxgSolverSharedDescPGSGpu> sharedDesc =
+        Ptr<PxgSolverSharedDescPGSGpu>(gPgsPrepLaunch.sharedDesc);
+
+    const uint num1dConstraintBatches =
+        prepDesc[0].num1dConstraintBatches + prepDesc[0].numStatic1dConstraintBatches;
+
+    const uint i = warpIndex;
+    if (i >= num1dConstraintBatches)
         return;
 
-    const uint batchIndex = gBatchIndices[i];
+    Ptr<uint> batchIndices = Ptr<uint>(prepDesc[0].jointConstraintBatchIndices);
+    Ptr<PxgBlockConstraintBatch> batches =
+        Ptr<PxgBlockConstraintBatch>(sharedDesc[0].iter_blockConstraintBatch);
+    Ptr<PxgSolverBodyData> solverBodyDatas = Ptr<PxgSolverBodyData>(prepDesc[0].solverBodyDataPool);
+    Ptr<PxgSolverTxIData> solverTxIDatas = Ptr<PxgSolverTxIData>(prepDesc[0].solverBodyTxIDataPool);
+    Ptr<PxgBlockConstraint1DData> gJointData = Ptr<PxgBlockConstraint1DData>(prepDesc[0].blockJointPrepPool);
+    Ptr<PxgBlockConstraint1DVelocities> gJointVel =
+        Ptr<PxgBlockConstraint1DVelocities>(prepDesc[0].blockJointPrepPool0);
+    Ptr<PxgBlockConstraint1DParameters> gJointPar =
+        Ptr<PxgBlockConstraint1DParameters>(prepDesc[0].blockJointPrepPool1);
+    Ptr<uint> constraintUniqueIndices = Ptr<uint>(prepDesc[0].constraintUniqueIndices);
+    Ptr<uint2> solverConstantData = Ptr<uint2>(prepDesc[0].solverConstantData); // PxgSolverConstraintManagerConstants
+    Ptr<PxgBlockSolverConstraint1DHeader> gJointHeaders =
+        Ptr<PxgBlockSolverConstraint1DHeader>(sharedDesc[0].iter_blockJointConstraintHeaders);
+    Ptr<PxgBlockSolverConstraint1DCon> gJointRowsCon =
+        Ptr<PxgBlockSolverConstraint1DCon>(sharedDesc[0].iter_blockJointConstraintRowsCon);
+    Ptr<PxgBlockSolverConstraint1DMod> gJointRowsMod =
+        Ptr<PxgBlockSolverConstraint1DMod>(sharedDesc[0].iter_blockJointConstraintRowsMod);
 
-    const uint descStride = gBatches[batchIndex].descStride_constraintType & 0xFFFFu;
+    const uint batchIndex = batchIndices[i];
+
+    const uint descStride = batches[batchIndex].descStride_constraintType & 0xFFFFu;
     if (threadIndexInWarp >= descStride)
         return;
 
-    const uint bodyAIndex = gBatches[batchIndex].bodyAIndex[threadIndexInWarp];
-    const uint bodyBIndex = gBatches[batchIndex].bodyBIndex[threadIndexInWarp];
-    const uint descIndexBatch = gBatches[batchIndex].mConstraintBatchIndex;
+    const uint bodyAIndex = batches[batchIndex].bodyAIndex[threadIndexInWarp];
+    const uint bodyBIndex = batches[batchIndex].bodyBIndex[threadIndexInWarp];
+    const uint descIndexBatch = batches[batchIndex].mConstraintBatchIndex;
     const uint rowBase = descIndexBatch * MAX_CONSTRAINT_ROWS;
-    const uint outRowBase = gBatches[batchIndex].startConstraintIndex;
+    const uint outRowBase = batches[batchIndex].startConstraintIndex;
 
     const uint uniqueIndex =
-        gConstraintUniqueIndices[gBatches[batchIndex].mStartPartitionIndex + threadIndexInWarp];
+        constraintUniqueIndices[batches[batchIndex].mStartPartitionIndex + threadIndexInWarp];
 
-    const PxgSolverBodyData bodyData0 = gSolverBodyData[bodyAIndex];
-    const PxgSolverBodyData bodyData1 = gSolverBodyData[bodyBIndex];
+    const PxgSolverBodyData bodyData0 = solverBodyDatas[bodyAIndex];
+    const PxgSolverBodyData bodyData1 = solverBodyDatas[bodyBIndex];
 
-    const float dt = gParams.dt;
-    const float recipdt = gParams.invDt;
+    const float dt = sharedDesc[0].dt;
+    const float recipdt = sharedDesc[0].invDtF32;
 
     // ---- setupSolverConstraintBlockGPU ----
 
     const uint numRows = gJointData[descIndexBatch].mNumRows[threadIndexInWarp];
 
-    storeHeaderU16(descIndexBatch, false, threadIndexInWarp, numRows & 0xFFu); // PxU8(mNumRows)
+    storeHeaderU16(gJointHeaders, descIndexBatch, false, threadIndexInWarp, numRows & 0xFFu); // PxU8(mNumRows)
 
-    gJointHeaders[descIndexBatch].writeBackOffset[threadIndexInWarp] = gSolverConstantData[uniqueIndex].y;
+    gJointHeaders[descIndexBatch].writeBackOffset[threadIndexInWarp] = solverConstantData[uniqueIndex].y;
 
     const float4 lin0_ang0_lin1_ang1 = gJointData[descIndexBatch].mInvMassScale[threadIndexInWarp];
 
@@ -859,7 +1141,7 @@ void jointConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_GroupThr
     gJointHeaders[descIndexBatch].invInertiaScale0[threadIndexInWarp] = lin0_ang0_lin1_ang1.y;
     gJointHeaders[descIndexBatch].invInertiaScale1[threadIndexInWarp] = lin0_ang0_lin1_ang1.w;
 
-    storeHeaderU16(descIndexBatch, true, threadIndexInWarp,
+    storeHeaderU16(gJointHeaders, descIndexBatch, true, threadIndexInWarp,
                    ((raWorld_linBreakForce.w != PREP_PX_MAX_F32) || (angBreakForce != PREP_PX_MAX_F32)) ? 1u : 0u);
 
     const bool disablePreprocessing =
@@ -869,11 +1151,12 @@ void jointConstraintBlockPrepareParallelLaunch(uint3 groupThreadId : SV_GroupThr
     float3 angSqrtInvInertia0[MAX_CONSTRAINT_ROWS];
     float3 angSqrtInvInertia1[MAX_CONSTRAINT_ROWS];
 
-    const PxgMat33 i0 = mat33Load(gTxIData[bodyAIndex].sqrtInvInertia);
-    const PxgMat33 i1 = mat33Load(gTxIData[bodyBIndex].sqrtInvInertia);
+    const PxgMat33 i0 = mat33Load(solverTxIDatas[bodyAIndex].sqrtInvInertia);
+    const PxgMat33 i1 = mat33Load(solverTxIDatas[bodyBIndex].sqrtInvInertia);
 
-    preprocessRows(sortedRowIndices, descIndexBatch, rowBase, angSqrtInvInertia0, angSqrtInvInertia1,
-                   lin0_ang0_lin1_ang1, initialLinVelXYZ_invMassW0.w, initialLinVelXYZ_invMassW1.w, i0, i1,
+    preprocessRows(gJointData, gJointVel, gJointPar, sortedRowIndices, descIndexBatch, rowBase,
+                   angSqrtInvInertia0, angSqrtInvInertia1, lin0_ang0_lin1_ang1,
+                   initialLinVelXYZ_invMassW0.w, initialLinVelXYZ_invMassW1.w, i0, i1,
                    threadIndexInWarp, disablePreprocessing);
 
     // ---- setUp1DConstraintBlock ----

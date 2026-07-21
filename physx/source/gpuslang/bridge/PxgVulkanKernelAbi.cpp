@@ -124,8 +124,41 @@ static const uint8_t kDescsIslandPGS[] = { 8, 8, 4 };
 static const uint8_t kMarkActiveSlabPGS[] = { 8, 8, 4, 4, 8 };
 
 // integration.cu: integrateCoreParallelLaunchTGS(PxU32 offset, desc, sharedDesc,
-//   PxU32* islandIds, PxU32* islandStaticTouchCounts, PxU32* numCountedInteractions)
+//   PxU32* islandIds, PxU32* islandStaticTouchCounts, PxU32* numCountedInteractions).
+//   The PGS twin integrateCoreParallelLaunch (integration.cu) has the IDENTICAL
+//   6-arg pack (only the shared-desc instantiation differs), so it shares this
+//   row's argSizes.
 static const uint8_t kIntegrateTGS[] = { 4, 8, 8, 8, 8, 8 };
+
+// preIntegration.cu: preIntegrationLaunch(PxU32 offset, PxU32 nbSolverBodies,
+//   PxReal dt, PxVec3 gravity, PxgSolverBodyData*, PxgSolverBodySleepData*,
+//   PxgSolverTxIData*, const PxgBodySim*, const PxNodeIndex*,
+//   PxAlignedTransform*, float4* outVel, PxU32* solverBodyIndices).  Same as
+//   the TGS twin (kPreIntegrateTGS below) WITHOUT the trailing bool.
+//   PxVec3 by value = 12 bytes -> 88-byte blob.
+static const uint8_t kPreIntegratePGS[] = { 4, 4, 4, 12, 8, 8, 8, 8, 8, 8, 8, 8 };
+
+// solverMultiBlock.cu: solveStaticBlock(PxgSolverCoreDesc*,
+//   const PxgSolverSharedDesc<IterativeSolveData>*, PxU32 islandIndex,
+//   PxU32 nbStaticSlabs, PxU32 maxStaticPartitions, bool doFriction)
+//   -> 32-byte blob (bool byte @28, bytes 29..31 padding).  NOTE: unlike the
+//   TGS twin there is no elapsedTime/minPen.
+static const uint8_t kSolveStaticBlockPGS[] = { 8, 8, 4, 4, 4, 1 };
+
+// solverMultiBlock.cu: propagateStaticSolverBodyVelocities(const
+//   PxgSolverCoreDesc*, const PxgSolverSharedDesc<IterativeSolveData>*,
+//   PxU32 islandIndex, PxU32 nbStaticSlabs, PxU32 maxStaticPartitions)
+//   -> 32-byte blob (28 rounded to the 8-alignment).  The engine's launch
+//   site reuses solveStaticBlock's 6-entry param array; the stray doFriction
+//   byte lands in this blob's tail padding, so both packs produce the same
+//   32 bytes (see the .slang push struct).
+static const uint8_t kPropagateStaticPGS[] = { 8, 8, 4, 4, 4 };
+
+// solverMultiBlock.cu: dmaConstraintResidual(const PxgConstraintWriteback*,
+//   PxReal* residuals, PxU32 count) — also the shape of
+//   clearFrictionPatchCounts(PxU32* frictionPatchCount,
+//   PxU32* edgeIndicesToClear, PxU32 nbToClear) in constraintBlockPrePrep.cu.
+static const uint8_t kTwoPtrU32[] = { 8, 8, 4 };
 
 // gpusimulationcontroller updateBodiesAndShapes.cu:
 //   updateShapesLaunch(const PxgNewShapeSim*, PxgShapeSim*, PxU32 nbNewShapes)
@@ -246,18 +279,30 @@ static const PxgKernelAbiRow kRows[] = {
     { "computeAverageSolverBodyVelocity", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "propagateSolverBodyVelocity", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "markActiveSlabPGS", kMarkActiveSlabPGS, uint32_t(sizeof(kMarkActiveSlabPGS)) },
+    { "solveStaticBlock", kSolveStaticBlockPGS, uint32_t(sizeof(kSolveStaticBlockPGS)) },
+    { "propagateStaticSolverBodyVelocities", kPropagateStaticPGS, uint32_t(sizeof(kPropagateStaticPGS)) },
     { "integrateCoreParallelLaunchTGS", kIntegrateTGS, uint32_t(sizeof(kIntegrateTGS)) },
+    { "integrateCoreParallelLaunch", kIntegrateTGS, uint32_t(sizeof(kIntegrateTGS)) },
+    // solverMultiBlock.cu DMA-back glue (P5 Step 5 BDA)
+    { "dmaBackChangedElems", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "dmaConstraintResidual", kTwoPtrU32, uint32_t(sizeof(kTwoPtrU32)) },
+    // constraintBlockPrePrep.cu: clearFrictionPatchCounts (P5 Step 5 BDA)
+    { "clearFrictionPatchCounts", kTwoPtrU32, uint32_t(sizeof(kTwoPtrU32)) },
     // gpusimulationcontroller: updateTransformAndBoundArray.cu / updateBodiesAndShapes.cu
     { "updateTransformCacheAndBoundArrayLaunch", kOnePtr, 1u },
     { "updateBodiesLaunch", kOnePtr, 1u },
     { "updateChangedAABBMgrHandlesLaunch", kOnePtr, 1u },
     { "updateShapesLaunch", kUpdateShapes, uint32_t(sizeof(kUpdateShapes)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
-    // gpusolver contact/joint constraint prep (P5 Step 4 BDA)
+    { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
+    // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)
     { "rigidSumInternalContactAndJointBatches1", kPtrU32, uint32_t(sizeof(kPtrU32)) },
     { "rigidSumInternalContactAndJointBatches2", kThreePtrU32, uint32_t(sizeof(kThreePtrU32)) },
     { "constraintContactBlockPrePrepLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "constraint1DBlockPrePrepLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "contactConstraintBlockPrepareParallelLaunchTGS", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "contactConstraintBlockPrepareParallelLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "jointConstraintBlockPrepareParallelLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     // gpunarrowphase convex-convex core + contact-stream compress (P5 Step 4 BDA)
     { "convexConvexNphase_stage1Kernel", kCvxStage1, uint32_t(sizeof(kCvxStage1)) },
     { "convexConvexNphase_stage2Kernel", kCvxStage2, uint32_t(sizeof(kCvxStage2)) },

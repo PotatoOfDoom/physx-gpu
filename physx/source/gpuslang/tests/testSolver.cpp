@@ -1980,4 +1980,438 @@ PXG_TEST(solverPGS_markActiveSlab)
         shim.memFree(pfree);
 }
 
+// ---------------------------------------------------------------------------
+// solveStaticBlock + propagateStaticSolverBodyVelocities (ENGINE ABI)
+// ---------------------------------------------------------------------------
+// The dynamic-vs-static rigid contact/joint solve, mirroring the proven TGS
+// twin test (solverTGS_staticContactSolve) on the PGS layouts.  Two dynamic
+// bodies (lanes 0 and 1 of shared static batches, exercising
+// warpScanExclusive), each with 3 static contact batches split across 2 slabs
+// (maxStaticPartitions = 2) plus a shared static 1D joint batch.
+// solveStaticBlock walks the batches with ref0 = ref1 = 1 (no mass splitting
+// against statics) and writes per-slab body velocities (PGS TWO-float4-stripe
+// layout, .w preserved from the loaded value) to tempStaticBodyOutputPool;
+// propagateStaticSolverBodyVelocities averages them back into the deltaV
+// pool.  Both are checked against the proven refSolveContact / refSolve1D
+// transcriptions, and the contact-residual accumulator is checked.
+PXG_TEST(solverPGS_staticContactSolve)
+{
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+
+    std::mt19937 rng(3950);
+    std::uniform_real_distribution<float> unit(0.f, 1.f);
+    std::uniform_real_distribution<float> sym(-2.f, 2.f);
+
+    const uint32_t numDynamicBodies = 2;
+    const uint32_t bodyOffset = 1;
+    const uint32_t T = numDynamicBodies + bodyOffset; // totalBodiesIncKinematics = 3
+    const uint32_t nbStaticSlabs = 2;
+    const uint32_t maxStaticPartitions = 2;
+    const uint32_t rowsPerBatch = 4;
+    const uint32_t deltaVOffset = 100;
+    const uint32_t poolSize = 200;
+
+    // batch 0 = decoy; 1,2,3 = contacts (eCONTACT=1); 4 = joint (eCONSTRAINT_1D=0)
+    const uint32_t numAllBatches = 5;
+    const uint32_t contactStart = 1; // shared by both bodies
+    const uint32_t jointStart = 4;
+
+    std::vector<BlockConstraintBatch> batches(numAllBatches);
+    std::vector<BlockContactHeader> chs(3);
+    std::vector<BlockFrictionHeader> fhs(3);
+    std::vector<BlockContactPoint> cps(3 * rowsPerBatch);
+    std::vector<BlockContactFriction> frs(3 * 2);
+    std::vector<BlockJointHeader> jhs(1);
+    std::vector<BlockJointRowCon> jcons(rowsPerBatch);
+    std::vector<BlockJointRowMod> jmods(rowsPerBatch);
+    std::memset(batches.data(), 0, batches.size() * sizeof(BlockConstraintBatch));
+    std::memset(chs.data(), 0, chs.size() * sizeof(BlockContactHeader));
+    std::memset(fhs.data(), 0, fhs.size() * sizeof(BlockFrictionHeader));
+    std::memset(cps.data(), 0, cps.size() * sizeof(BlockContactPoint));
+    std::memset(frs.data(), 0, frs.size() * sizeof(BlockContactFriction));
+    std::memset(jhs.data(), 0, jhs.size() * sizeof(BlockJointHeader));
+    std::memset(jcons.data(), 0, jcons.size() * sizeof(BlockJointRowCon));
+    std::memset(jmods.data(), 0, jmods.size() * sizeof(BlockJointRowMod));
+
+    std::vector<Float4> velPool(poolSize);
+    for (Float4& v : velPool)
+        v = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+
+    // ---- contact / joint batch data (lanes 0 and 1 = bodies 0 and 1;
+    // body B is the static: invMassB = angDom1 = resp1 = 0) ----
+    auto fillContactLane = [&](uint32_t header, uint32_t lane) {
+        BlockContactHeader& h = chs[header];
+        h.invMass0_1_angDom0_1[lane] = Float4{ unit(rng), 0.f, unit(rng), 0.f };
+        const Vec3 n = randUnit(rng);
+        h.normal_staticFriction[lane] = Float4{ n.x, n.y, n.z, unit(rng) };
+        h.flags[lane] = unit(rng) < 0.5f ? COMPLIANT_ACCEL_SPRING : 0;
+        h.numNormalConstr[lane] = 1 + rng() % rowsPerBatch; // >=1 so the solve does work
+        // mix rigid (>= 0) and compliant (< 0) restitution
+        h.restitution[lane] = unit(rng) < 0.5f ? unit(rng) * 0.8f : -unit(rng) * 100.f;
+
+        BlockFrictionHeader& fh = fhs[header];
+        fh.numFrictionConstr[lane] = rng() % 3; // 0..2
+        fh.dynamicFriction[lane] = unit(rng);
+        const Vec3 f0 = randUnit(rng), f1 = randUnit(rng);
+        fh.frictionNormals0[lane] = Float4{ f0.x, f0.y, f0.z, 0 };
+        fh.frictionNormals1[lane] = Float4{ f1.x, f1.y, f1.z, 0 };
+
+        for (uint32_t i = 0; i < rowsPerBatch; ++i)
+        {
+            BlockContactPoint& c = cps[header * rowsPerBatch + i];
+            const Vec3 ra = Vec3(sym(rng), sym(rng), sym(rng)) * 0.3f;
+            const Vec3 rb = Vec3(sym(rng), sym(rng), sym(rng)) * 0.3f;
+            c.raXn_targetVelocity[lane] = Float4{ ra.x, ra.y, ra.z, sym(rng) * 0.1f };
+            c.rbXn_maxImpulse[lane] = Float4{ rb.x, rb.y, rb.z, 10.f + unit(rng) * 100.f };
+            c.appliedForce[lane] = unit(rng);
+            c.resp0[lane] = 0.1f + unit(rng);
+            c.resp1[lane] = 0.f; // static B
+            c.coeff0[lane] = unit(rng) * 0.2f;
+            c.coeff1[lane] = unit(rng) * 0.2f;
+        }
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            BlockContactFriction& f = frs[header * 2 + i];
+            const Vec3 ra = Vec3(sym(rng), sym(rng), sym(rng)) * 0.3f;
+            const Vec3 rb = Vec3(sym(rng), sym(rng), sym(rng)) * 0.3f;
+            f.raXn_bias[lane] = Float4{ ra.x, ra.y, ra.z, sym(rng) * 0.05f };
+            f.rbXn_targetVelW[lane] = Float4{ rb.x, rb.y, rb.z, sym(rng) * 0.05f };
+            f.appliedForce[lane] = sym(rng) * 0.2f;
+            f.resp0[lane] = 0.1f + unit(rng);
+            f.resp1[lane] = 0.f; // static B
+        }
+    };
+    auto fillJointLane = [&](uint32_t lane) {
+        BlockJointHeader& h = jhs[0];
+        h.rowCounts[lane] = uint16_t(1 + rng() % rowsPerBatch);
+        h.invMass0D0[lane] = unit(rng);
+        h.invMass1D1[lane] = 0.f; // static B
+        h.invInertiaScale0[lane] = unit(rng);
+        h.invInertiaScale1[lane] = 0.f; // static B
+        for (uint32_t i = 0; i < rowsPerBatch; ++i)
+        {
+            BlockJointRowCon& c = jcons[i];
+            BlockJointRowMod& m = jmods[i];
+            const Vec3 l0 = randUnit(rng), l1 = randUnit(rng);
+            const Vec3 a0 = Vec3(sym(rng), sym(rng), sym(rng)) * 0.4f;
+            const Vec3 a1 = Vec3(sym(rng), sym(rng), sym(rng)) * 0.4f;
+            c.lin0XYZ_minImpulse[lane] = Float4{ l0.x, l0.y, l0.z, -50.f - unit(rng) * 50.f };
+            c.lin1XYZ_maxImpulse[lane] = Float4{ l1.x, l1.y, l1.z, 50.f + unit(rng) * 50.f };
+            c.ang0XYZ_resp0[lane] = Float4{ a0.x, a0.y, a0.z, 0.1f + unit(rng) };
+            c.ang1XYZ_resp1[lane] = Float4{ a1.x, a1.y, a1.z, 0.f }; // static B resp1 = 0
+            c.initJointSpeed[lane] = sym(rng) * 0.1f;
+            m.appliedForce[lane] = sym(rng) * 0.2f;
+            uint32_t fl = 0;
+            const float r = unit(rng);
+            if (r < 0.4f)
+                fl |= DY_SC_FLAG_SPRING;
+            if (r < 0.2f)
+                fl |= DY_SC_FLAG_ACCELERATION_SPRING;
+            m.flags[lane] = fl;
+            m.coeff0[lane] = unit(rng) * 0.3f;
+            m.coeff1[lane] = unit(rng) * 0.3f;
+        }
+    };
+
+    for (uint32_t k = 1; k <= 3; ++k) // contact batches
+    {
+        BlockConstraintBatch& b = batches[k];
+        b.descStride = 2;
+        b.constraintType = 1; // eCONTACT
+        b.constraintBatchIndex = k - 1;         // -> chs/fhs index
+        b.startConstraintIndex = (k - 1) * rowsPerBatch; // -> cps
+        b.startFrictionIndex = (k - 1) * 2;              // -> frs
+        b.mask = 0x3u; // lanes 0,1 active
+        fillContactLane(k - 1, 0);
+        fillContactLane(k - 1, 1);
+    }
+    {
+        BlockConstraintBatch& b = batches[4]; // joint batch
+        b.descStride = 2;
+        b.constraintType = 0; // eCONSTRAINT_1D
+        b.constraintBatchIndex = 0; // jhs index
+        b.startConstraintIndex = 0; // jcons/jmods start
+        b.mask = 0x3u;
+        fillJointLane(0);
+        fillJointLane(1);
+    }
+
+    std::vector<uint32_t> contactCounts = { 3, 3 };
+    std::vector<uint32_t> jointCounts = { 1, 1 };
+    std::vector<uint32_t> contactStarts = { contactStart, contactStart };
+    std::vector<uint32_t> jointStarts = { jointStart, jointStart };
+
+    // ---- GPU (engine ABI through the shim) ----
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "solverPGS.spv", "solveStaticBlock", 32u, 0 },
+        { "solverPGS.spv", "propagateStaticSolverBodyVelocities", 32u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 2, &solverPgsAbiLoader);
+
+    const uint32_t bodyOutCount = nbStaticSlabs * T * 2 + T; // slabIdx*T*2 + bodyIndex + T max
+    std::vector<Float4> bodyOutInit(bodyOutCount, Float4{ 9.f, 9.f, 9.f, 9.f }); // sentinel
+
+    PxgDevicePtr dVel = 0, dBodyOut = 0, dIsl = 0, dCC = 0, dJC = 0, dCS = 0, dJS = 0;
+    PxgDevicePtr dBatch = 0, dCh = 0, dFh = 0, dCp = 0, dFr = 0, dJh = 0, dJc = 0, dJm = 0;
+    PxgDevicePtr dDesc = 0, dShared = 0;
+    shim.memAlloc(&dVel, velPool.size() * sizeof(Float4));
+    shim.memAlloc(&dBodyOut, bodyOutInit.size() * sizeof(Float4));
+    shim.memAlloc(&dCC, contactCounts.size() * 4);
+    shim.memAlloc(&dJC, jointCounts.size() * 4);
+    shim.memAlloc(&dCS, contactStarts.size() * 4);
+    shim.memAlloc(&dJS, jointStarts.size() * 4);
+    shim.memAlloc(&dBatch, batches.size() * sizeof(BlockConstraintBatch));
+    shim.memAlloc(&dCh, chs.size() * sizeof(BlockContactHeader));
+    shim.memAlloc(&dFh, fhs.size() * sizeof(BlockFrictionHeader));
+    shim.memAlloc(&dCp, cps.size() * sizeof(BlockContactPoint));
+    shim.memAlloc(&dFr, frs.size() * sizeof(BlockContactFriction));
+    shim.memAlloc(&dJh, jhs.size() * sizeof(BlockJointHeader));
+    shim.memAlloc(&dJc, jcons.size() * sizeof(BlockJointRowCon));
+    shim.memAlloc(&dJm, jmods.size() * sizeof(BlockJointRowMod));
+    if (!dVel || !dBodyOut || !dCC || !dJC || !dCS || !dJS || !dBatch || !dCh || !dFh || !dCp || !dFr ||
+        !dJh || !dJc || !dJm)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+    shim.memcpyHtoD(dVel, velPool.data(), velPool.size() * sizeof(Float4));
+    shim.memcpyHtoD(dBodyOut, bodyOutInit.data(), bodyOutInit.size() * sizeof(Float4));
+    shim.memcpyHtoD(dCC, contactCounts.data(), contactCounts.size() * 4);
+    shim.memcpyHtoD(dJC, jointCounts.data(), jointCounts.size() * 4);
+    shim.memcpyHtoD(dCS, contactStarts.data(), contactStarts.size() * 4);
+    shim.memcpyHtoD(dJS, jointStarts.data(), jointStarts.size() * 4);
+    shim.memcpyHtoD(dBatch, batches.data(), batches.size() * sizeof(BlockConstraintBatch));
+    shim.memcpyHtoD(dCh, chs.data(), chs.size() * sizeof(BlockContactHeader));
+    shim.memcpyHtoD(dFh, fhs.data(), fhs.size() * sizeof(BlockFrictionHeader));
+    shim.memcpyHtoD(dCp, cps.data(), cps.size() * sizeof(BlockContactPoint));
+    shim.memcpyHtoD(dFr, frs.data(), frs.size() * sizeof(BlockContactFriction));
+    shim.memcpyHtoD(dJh, jhs.data(), jhs.size() * sizeof(BlockJointHeader));
+    shim.memcpyHtoD(dJc, jcons.data(), jcons.size() * sizeof(BlockJointRowCon));
+    shim.memcpyHtoD(dJm, jmods.data(), jmods.size() * sizeof(BlockJointRowMod));
+
+    physx::PxgIslandContext islands[2];
+    std::memset(islands, 0, sizeof(islands));
+    islands[0].mBodyStartIndex = 77u; // decoy
+    islands[0].mBodyCount = 5u;
+    islands[1].mBodyStartIndex = bodyOffset;
+    islands[1].mBodyCount = numDynamicBodies;
+    shim.memAlloc(&dIsl, sizeof(islands));
+    shim.memcpyHtoD(dIsl, islands, sizeof(islands));
+
+    physx::PxgSolverCoreDesc desc;
+    std::memset(&desc, 0, sizeof(desc));
+    desc.islandContextPool = reinterpret_cast<physx::PxgIslandContext*>(dIsl);
+    desc.accumulatedBodyDeltaVOffset = deltaVOffset;
+    desc.mRigidStaticContactCounts = reinterpret_cast<physx::PxU32*>(dCC);
+    desc.mRigidStaticJointCounts = reinterpret_cast<physx::PxU32*>(dJC);
+    desc.mRigidStaticContactStartIndices = reinterpret_cast<physx::PxU32*>(dCS);
+    desc.mRigidStaticJointStartIndices = reinterpret_cast<physx::PxU32*>(dJS);
+    desc.contactErrorAccumulator.mErrorSumOfSquares = 0.5f;
+    desc.contactErrorAccumulator.mCounter = 0; // >= 0: residual accumulation ON
+    desc.contactErrorAccumulator.mMaxError = 0.0625f;
+
+    physx::PxgSolverSharedDesc<physx::IterativeSolveData> shared;
+    std::memset(&shared, 0, sizeof(shared));
+    shared.iterativeData.solverBodyVelPool = reinterpret_cast<float4*>(dVel);
+    shared.iterativeData.tempStaticBodyOutputPool = reinterpret_cast<float4*>(dBodyOut);
+    shared.iterativeData.blockConstraintBatch = reinterpret_cast<physx::PxgBlockConstraintBatch*>(dBatch);
+    shared.iterativeData.blockContactHeaders = reinterpret_cast<physx::PxgBlockSolverContactHeader*>(dCh);
+    shared.iterativeData.blockFrictionHeaders = reinterpret_cast<physx::PxgBlockSolverFrictionHeader*>(dFh);
+    shared.iterativeData.blockContactPoints = reinterpret_cast<physx::PxgBlockSolverContactPoint*>(dCp);
+    shared.iterativeData.blockFrictions = reinterpret_cast<physx::PxgBlockSolverContactFriction*>(dFr);
+    shared.iterativeData.blockJointConstraintHeaders =
+        reinterpret_cast<physx::PxgBlockSolverConstraint1DHeader*>(dJh);
+    shared.iterativeData.blockJointConstraintRowsCon =
+        reinterpret_cast<physx::PxgBlockSolverConstraint1DCon*>(dJc);
+    shared.iterativeData.blockJointConstraintRowsMod =
+        reinterpret_cast<physx::PxgBlockSolverConstraint1DMod*>(dJm);
+
+    shim.memAlloc(&dDesc, sizeof(desc));
+    shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
+    shim.memAlloc(&dShared, sizeof(shared));
+    shim.memcpyHtoD(dShared, &shared, sizeof(shared));
+
+    // the engine's exact 6-entry staticKernelParams pack, used verbatim for
+    // BOTH kernels (the propagate kernel's 5-arg signature treats the trailing
+    // doFriction byte as tail padding): 32-byte blob.
+    auto makeBlob = [&]() {
+        EngineBlob blob;
+        blob.add<uint64_t>(dDesc);
+        blob.add<uint64_t>(dShared);
+        blob.add<uint32_t>(1u);                   // islandIndex
+        blob.add<uint32_t>(nbStaticSlabs);
+        blob.add<uint32_t>(maxStaticPartitions);
+        blob.add<uint8_t>(1u);                    // doFriction
+        blob.finish();
+        return blob;
+    };
+    EngineBlob solveBlob = makeBlob();
+    PXG_CHECK_MSG(solveBlob.bytes.size() == 32, "static-solve blob is 32 bytes (got %zu)",
+                  solveBlob.bytes.size());
+
+    // nbBlocksRequired = ceil(bodyCount / SOLVE_BLOCK_PARTITION = 64) * nbStaticSlabs
+    const uint32_t nbBlocksRequired = ((numDynamicBodies + 63) / 64) * nbStaticSlabs;
+    PXG_CHECK_MSG(shim.launchKernel(0, nbBlocksRequired, 1, 1, solveBlob.bytes.data(),
+                                    uint32_t(solveBlob.bytes.size())) == PxgResult::Success,
+                  "launch solveStaticBlock");
+    shim.streamSynchronize();
+
+    EngineBlob propBlob = makeBlob();
+    PXG_CHECK_MSG(shim.launchKernel(1, nbBlocksRequired, 1, 1, propBlob.bytes.data(),
+                                    uint32_t(propBlob.bytes.size())) == PxgResult::Success,
+                  "launch propagateStaticSolverBodyVelocities");
+    shim.streamSynchronize();
+
+    // ---- reference ----
+    RefErrAcc errAcc; // single accumulator: final = sum over all threads (order-independent under tol)
+    std::vector<Float4> refBodyOut = bodyOutInit;
+
+    auto solveOneBodySlab = [&](uint32_t bodyIndex, uint32_t slabIdx) {
+        const uint32_t idx = bodyIndex; // lane 0 or 1 via warpScanExclusive(0b11, tIW=bodyIndex)
+        const uint32_t startIndex = slabIdx * maxStaticPartitions;
+        const uint32_t rawC = contactCounts[bodyIndex], rawJ = jointCounts[bodyIndex];
+        const uint32_t contactCount = std::min(maxStaticPartitions, std::max(startIndex, rawC) - startIndex);
+        const uint32_t jointCount = std::min(maxStaticPartitions, std::max(startIndex, rawJ) - startIndex);
+        if (contactCount == 0 && jointCount == 0)
+            return;
+
+        const uint32_t inputBody = deltaVOffset + bodyIndex + bodyOffset;
+        // PGS 2-stripe layout: linVel @ inputBody, angVel @ + T
+        const Float4 vLin = velPool[inputBody], vAng = velPool[inputBody + T];
+        Vec3 lv0(vLin.x, vLin.y, vLin.z), av0(vAng.x, vAng.y, vAng.z);
+        Vec3 lv1(0.f), av1(0.f);
+
+        const uint32_t startContactIndex = contactStarts[bodyIndex] + startIndex;
+        const uint32_t startJointIndex = jointStarts[bodyIndex] + startIndex;
+
+        for (uint32_t i = 0; i < jointCount; ++i)
+            refSolve1D(batches[startJointIndex + i], lv0, av0, lv1, av1, idx, true, jhs, jcons, jmods,
+                       1.f, 1.f);
+        for (uint32_t i = 0; i < contactCount; ++i)
+            refSolveContact(batches[startContactIndex + i], lv0, av0, lv1, av1, true, idx, chs, fhs, cps,
+                            frs, 1.f, 1.f, &errAcc);
+
+        const uint32_t outputBody = slabIdx * T * 2;
+        // xyz overwritten, .w preserved from the loaded value (mirrors the .cu)
+        refBodyOut[bodyIndex + outputBody] = Float4{ lv0.x, lv0.y, lv0.z, vLin.w };
+        refBodyOut[bodyIndex + outputBody + T] = Float4{ av0.x, av0.y, av0.z, vAng.w };
+    };
+
+    for (uint32_t slab = 0; slab < nbStaticSlabs; ++slab)
+        for (uint32_t body = 0; body < numDynamicBodies; ++body)
+            solveOneBodySlab(body, slab);
+
+    // propagate reference
+    std::vector<Float4> refVel = velPool;
+    for (uint32_t body = 0; body < numDynamicBodies; ++body)
+    {
+        const uint32_t maxOutputs = std::max(contactCounts[body], jointCounts[body]);
+        Float4 acc0{ 0, 0, 0, 0 }, acc1{ 0, 0, 0, 0 };
+        float scale = 0.f;
+        uint32_t index = body;
+        for (uint32_t i = 0; i < maxOutputs; i += maxStaticPartitions)
+        {
+            const Float4 a = refBodyOut[index], b = refBodyOut[index + T];
+            acc0 = Float4{ acc0.x + a.x, acc0.y + a.y, acc0.z + a.z, acc0.w + a.w };
+            acc1 = Float4{ acc1.x + b.x, acc1.y + b.y, acc1.z + b.z, acc1.w + b.w };
+            index += T * 2;
+            scale += 1.f;
+        }
+        const float inv = 1.f / scale;
+        const uint32_t outputBody = deltaVOffset + body + bodyOffset;
+        refVel[outputBody] = Float4{ acc0.x * inv, acc0.y * inv, acc0.z * inv, acc0.w * inv };
+        refVel[outputBody + T] = Float4{ acc1.x * inv, acc1.y * inv, acc1.z * inv, acc1.w * inv };
+    }
+
+    // ---- compare ----
+    std::vector<Float4> gpuBodyOut(bodyOutCount);
+    shim.memcpyDtoH(gpuBodyOut.data(), dBodyOut, gpuBodyOut.size() * sizeof(Float4));
+    std::vector<Float4> gpuVel(poolSize);
+    shim.memcpyDtoH(gpuVel.data(), dVel, gpuVel.size() * sizeof(Float4));
+    std::vector<BlockContactPoint> gpuCps(cps.size());
+    shim.memcpyDtoH(gpuCps.data(), dCp, gpuCps.size() * sizeof(BlockContactPoint));
+    std::vector<BlockContactFriction> gpuFrs(frs.size());
+    shim.memcpyDtoH(gpuFrs.data(), dFr, gpuFrs.size() * sizeof(BlockContactFriction));
+    std::vector<BlockJointRowMod> gpuJmods(jmods.size());
+    shim.memcpyDtoH(gpuJmods.data(), dJm, gpuJmods.size() * sizeof(BlockJointRowMod));
+
+    size_t mismatches = 0;
+    bool anyWritten = false;
+    for (size_t i = 0; i < bodyOutCount; ++i)
+    {
+        // a slab output that was written differs from the 9.f sentinel
+        if (gpuBodyOut[i].x != 9.f || gpuBodyOut[i].y != 9.f || gpuBodyOut[i].z != 9.f)
+            anyWritten = true;
+        const float* g = &gpuBodyOut[i].x;
+        const float* r = &refBodyOut[i].x;
+        for (int c = 0; c < 4; ++c)
+            if (!almostEqual(g[c], r[c], 2e-4f, 2e-4f))
+            {
+                if (mismatches < 5)
+                    PXG_CHECK_MSG(false, "tempStaticBodyOutputPool[%zu].%d: gpu=%g ref=%g", i, c, g[c], r[c]);
+                ++mismatches;
+            }
+    }
+    PXG_CHECK_MSG(anyWritten, "solveStaticBlock wrote no outputs (no-op / unbound launch?)");
+    PXG_CHECK_MSG(mismatches == 0, "static solve: %zu tempStaticBodyOutputPool mismatches", mismatches);
+
+    mismatches = 0;
+    for (uint32_t body = 0; body < numDynamicBodies; ++body)
+        for (uint32_t half = 0; half < 2; ++half)
+        {
+            const uint32_t i = deltaVOffset + body + bodyOffset + half * T;
+            const float* g = &gpuVel[i].x;
+            const float* r = &refVel[i].x;
+            for (int c = 0; c < 4; ++c)
+                if (!almostEqual(g[c], r[c], 2e-4f, 2e-4f))
+                {
+                    if (mismatches < 5)
+                        PXG_CHECK_MSG(false, "propagate deltaV[%u].%d: gpu=%g ref=%g", i, c, g[c], r[c]);
+                    ++mismatches;
+                }
+        }
+    PXG_CHECK_MSG(mismatches == 0, "propagate: %zu deltaV mismatches", mismatches);
+
+    mismatches = 0;
+    for (size_t i = 0; i < cps.size(); ++i)
+        for (int l = 0; l < 2; ++l)
+            if (!almostEqual(gpuCps[i].appliedForce[l], cps[i].appliedForce[l], 2e-4f, 2e-4f))
+                ++mismatches;
+    for (size_t i = 0; i < frs.size(); ++i)
+        for (int l = 0; l < 2; ++l)
+            if (!almostEqual(gpuFrs[i].appliedForce[l], frs[i].appliedForce[l], 2e-4f, 2e-4f))
+                ++mismatches;
+    for (size_t i = 0; i < jmods.size(); ++i)
+        for (int l = 0; l < 2; ++l)
+        {
+            if (!almostEqual(gpuJmods[i].appliedForce[l], jmods[i].appliedForce[l], 2e-4f, 2e-4f))
+                ++mismatches;
+            if (!almostEqual(gpuJmods[i].residual[l], jmods[i].residual[l], 1e-3f, 1e-3f))
+                ++mismatches;
+        }
+    PXG_CHECK_MSG(mismatches == 0, "static solve: %zu applied-force/residual mismatches", mismatches);
+
+    physx::PxgSolverCoreDesc gpuDesc;
+    shim.memcpyDtoH(&gpuDesc, dDesc, sizeof(gpuDesc));
+    const float expectSum = 0.5f + errAcc.sumSq;
+    const float expectMax = std::fmax(0.0625f, errAcc.maxErr);
+    PXG_CHECK_MSG(gpuDesc.contactErrorAccumulator.mCounter == int32_t(errAcc.counter),
+                  "residual counter: gpu=%d ref=%u", gpuDesc.contactErrorAccumulator.mCounter,
+                  errAcc.counter);
+    PXG_CHECK_MSG(errAcc.counter > 0, "fixture sanity: contact residual path exercised");
+    PXG_CHECK_MSG(almostEqual(gpuDesc.contactErrorAccumulator.mErrorSumOfSquares, expectSum, 2e-4f, 2e-4f),
+                  "residual sum-of-squares: gpu=%g ref=%g",
+                  gpuDesc.contactErrorAccumulator.mErrorSumOfSquares, expectSum);
+    PXG_CHECK_MSG(almostEqual(gpuDesc.contactErrorAccumulator.mMaxError, expectMax, 2e-4f, 2e-4f),
+                  "residual max: gpu=%g ref=%g", gpuDesc.contactErrorAccumulator.mMaxError, expectMax);
+
+    for (PxgDevicePtr pfree : { dVel, dBodyOut, dIsl, dCC, dJC, dCS, dJS, dBatch, dCh, dFh, dCp, dFr,
+                                dJh, dJc, dJm, dDesc, dShared })
+        shim.memFree(pfree);
+}
+
 } // namespace

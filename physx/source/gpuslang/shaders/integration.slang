@@ -49,33 +49,6 @@ import pxgSlangSolverDesc;
 
 static const uint BLOCK_SIZE = 128;
 
-struct IntegrationParams
-{
-    uint offset;
-    uint numSolverBodies;
-    uint accumulatedBodyDeltaVOffset;
-    float dt;
-    float invDtF32;
-    uint enableStabilization;
-    uint hasPrevVelocities; // mBodySimPrevVelocitiesBufferDeviceData != NULL
-};
-
-[[vk::push_constant]]
-ConstantBuffer<IntegrationParams> gParams;
-
-RWStructuredBuffer<float4> gMotionVelocityArray;            // binding 0
-RWStructuredBuffer<float4> gSolverBodyVelPool;              // binding 1
-RWStructuredBuffer<PxgSolverTxIData> gTxIData;              // binding 2
-RWStructuredBuffer<PxgSolverBodyData> gSolverBodyData;      // binding 3
-RWStructuredBuffer<PxgBodySim> gBodySim;                    // binding 4
-RWStructuredBuffer<uint> gIslandIds;                        // binding 5
-RWStructuredBuffer<uint> gIslandStaticTouchCounts;          // binding 6
-RWStructuredBuffer<uint> gNumCountedInteractions;           // binding 7
-RWStructuredBuffer<PxgSolverBodySleepData> gSleepData;      // binding 8
-RWStructuredBuffer<float4> gOutSolverVelocity;              // binding 9
-RWStructuredBuffer<PxgAlignedTransform> gOutBody2World;     // binding 10
-RWStructuredBuffer<float4> gPrevVelocities;                 // binding 11 (PxgBodySimVelocities: 2 float4 per body)
-
 // mirrors updateWakeCounter() in integration.cuh
 void updateWakeCounter(inout bool freeze, inout float4 solverBodyLinVel, inout float4 solverBodyAngVel,
                        PxgAlignedTransform body2World, inout PxgBodySim bodySim, out PxgSolverBodySleepData sleepData,
@@ -461,54 +434,96 @@ void integrateCoreTGS(float4 motionLinVelXYZW, float4 motionAngVelXYZW, float4 i
     }
 }
 
-// mirrors integrateCoreParallelLaunch() in integration.cu
+// mirrors integrateCoreParallelLaunch() in integration.cu — P5 Step 5 BDA
+// engine-launch ABI, the same 48-byte pack shape as the TGS twin below:
+// (PxU32 offset, const PxgSolverCoreDesc*, const
+// PxgSolverSharedDesc<IterativeSolveData>*, const PxU32* islandIds, const
+// PxU32* islandStaticTouchCounts, const PxU32* numCountedInteractions).
+// All counts/offsets/pool pointers are read from the descs on-device through
+// the byte-exact pxgSlangSolverDesc mirrors.  PGS differences from the TGS
+// twin, mirrored from the .cu: the pose is read from bodySim.body2World (not
+// outBody2World[a]); the velocity pool holds TWO full float4 stripes (linVel @
+// index, angVel @ index + numSolverBodies) instead of the packed TGS layout;
+// and integrateCore() adds the initial velocities (PGS solves deltas).
+struct IntegrationPgsAbiParams
+{
+    uint offset;                      // @0  (4 bytes pad follow)
+    uint64_t solverCoreDesc;          // @8  const PxgSolverCoreDesc*
+    uint64_t sharedDesc;              // @16 const PxgSolverSharedDesc<IterativeSolveData>*
+    uint64_t islandIds;               // @24 const PxU32*
+    uint64_t islandStaticTouchCounts; // @32 const PxU32*
+    uint64_t numCountedInteractions;  // @40 const PxU32*
+}                                     // = 48
+[[vk::push_constant]]
+ConstantBuffer<IntegrationPgsAbiParams> gPgsAbi;
+
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
 void integrateCoreParallelLaunch(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
+    PxgSolverCoreDescGpu desc = (Ptr<PxgSolverCoreDescGpu>(gPgsAbi.solverCoreDesc))[0];
+    PxgSolverSharedDescPGSGpu shared = (Ptr<PxgSolverSharedDescPGSGpu>(gPgsAbi.sharedDesc))[0];
+
+    Ptr<float4> motionVelocityArray = Ptr<float4>(desc.motionVelocityArray);
+    const uint numSolverBodies = desc.numSolverBodies;
+    Ptr<float4> solverBodyVelocity = Ptr<float4>(shared.iter_solverBodyVelPool);
+    Ptr<PxgSolverTxIData> txIData = Ptr<PxgSolverTxIData>(desc.solverBodyTxIDataPool);
+    Ptr<float4> outSolverVelocity = Ptr<float4>(desc.outSolverVelocity);
+    Ptr<PxgAlignedTransform> outBody2World = Ptr<PxgAlignedTransform>(desc.outBody2World);
+    Ptr<PxgSolverBodyData> solverBodyDataPool = Ptr<PxgSolverBodyData>(desc.solverBodyDataPool);
+    Ptr<PxgBodySim> bodySimPool = Ptr<PxgBodySim>(desc.mBodySimBufferDeviceData);
+    Ptr<PxgSolverBodySleepData> sleepDataPool = Ptr<PxgSolverBodySleepData>(desc.solverBodySleepDataPool);
+    Ptr<uint> islandIds = Ptr<uint>(gPgsAbi.islandIds);
+    Ptr<uint> islandStaticTouchCounts = Ptr<uint>(gPgsAbi.islandStaticTouchCounts);
+    Ptr<uint> numCountedInteractions = Ptr<uint>(gPgsAbi.numCountedInteractions);
+
     const uint idx = dispatchThreadId.x;
-    const uint numSolverBodies = gParams.numSolverBodies;
-    const uint a = idx + gParams.offset;
+    const uint a = idx + gPgsAbi.offset;
 
     if (a >= numSolverBodies)
         return;
 
-    const PxgSolverBodyData data = gSolverBodyData[a];
+    const PxgSolverBodyData data = solverBodyDataPool[a];
 
     const uint nodeIndex = nodeIndexIndex(data.islandNodeIndex);
 
-    PxgBodySim bodySim = gBodySim[nodeIndex];
+    PxgBodySim bodySim = bodySimPool[nodeIndex];
 
-    const PxgMat33 sqrtInvInertia = mat33Load(gTxIData[a].sqrtInvInertia);
+    const PxgMat33 sqrtInvInertia = mat33Load(txIData[a].sqrtInvInertia);
 
+    // PT: TODO: TGS version uses outBody2World[a] here, why? (mirrored: PGS
+    // reads the pose from the body sim)
     PxgAlignedTransform body2World = bodySim.body2World;
     const float4 inverseInertia = bodySim.inverseInertiaXYZ_contactReportThresholdW;
 
-    const uint index = gParams.accumulatedBodyDeltaVOffset + a;
+    const uint index = desc.accumulatedBodyDeltaVOffset + a;
 
-    float4 linVel = gSolverBodyVelPool[index];
-    float4 angVel = gSolverBodyVelPool[index + numSolverBodies];
+    float4 linVel = solverBodyVelocity[index];
+    float4 angVel = solverBodyVelocity[index + numSolverBodies];
 
-    const uint staticTouchCount = gIslandStaticTouchCounts[gIslandIds[nodeIndex]];
+    const uint staticTouchCount = islandStaticTouchCounts[islandIds[nodeIndex]];
 
     PxgSolverBodySleepData sleepData;
 
-    integrateCore(gMotionVelocityArray[a], gMotionVelocityArray[a + numSolverBodies], inverseInertia,
+    integrateCore(motionVelocityArray[a], motionVelocityArray[a + numSolverBodies], inverseInertia,
                   linVel, angVel, body2World, data, bodySim, sleepData, sqrtInvInertia,
-                  gParams.dt, gParams.invDtF32, gParams.enableStabilization != 0, staticTouchCount != 0,
-                  gNumCountedInteractions[nodeIndex]);
+                  shared.dt, shared.invDtF32, (desc.enableStabilizationWord & 0xffu) != 0,
+                  staticTouchCount != 0, numCountedInteractions[nodeIndex]);
 
-    gSleepData[a] = sleepData;
+    sleepDataPool[a] = sleepData;
 
-    gOutSolverVelocity[a] = linVel;
-    gOutSolverVelocity[a + numSolverBodies] = angVel;
-    gOutBody2World[a] = body2World;
+    outSolverVelocity[a] = linVel;
+    outSolverVelocity[a + numSolverBodies] = angVel;
+    outBody2World[a] = body2World;
 
-    // PT: for acceleration getters (eENABLE_BODY_ACCELERATIONS)
-    if (gParams.hasPrevVelocities != 0)
+    // PT: for acceleration getters (eENABLE_BODY_ACCELERATIONS) — the CUDA
+    // null-pointer branch on mBodySimPrevVelocitiesBufferDeviceData
+    if (desc.mBodySimPrevVelocitiesBufferDeviceData != 0)
     {
-        gPrevVelocities[nodeIndex * 2 + 0] = gBodySim[nodeIndex].linearVelocityXYZ_inverseMassW;
-        gPrevVelocities[nodeIndex * 2 + 1] = gBodySim[nodeIndex].angularVelocityXYZ_maxPenBiasW;
+        // PxgBodySimVelocities: 2 float4 per node
+        Ptr<float4> prevVelocities = Ptr<float4>(desc.mBodySimPrevVelocitiesBufferDeviceData);
+        prevVelocities[nodeIndex * 2 + 0] = bodySimPool[nodeIndex].linearVelocityXYZ_inverseMassW;
+        prevVelocities[nodeIndex * 2 + 1] = bodySimPool[nodeIndex].angularVelocityXYZ_maxPenBiasW;
     }
 
     // write back linear velocity, angular velocity to pxgbodysim
@@ -520,7 +535,7 @@ void integrateCoreParallelLaunch(uint3 dispatchThreadId : SV_DispatchThreadID)
     bodySim.angularVelocityXYZ_maxPenBiasW.z = angVel.z;
     bodySim.body2World = body2World;
 
-    gBodySim[nodeIndex] = bodySim;
+    bodySimPool[nodeIndex] = bodySim;
 }
 
 // mirrors integrateCoreParallelLaunchTGS() in integrationTGS.cu — P5 Step 4

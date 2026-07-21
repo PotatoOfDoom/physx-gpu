@@ -106,7 +106,29 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
-## P5 Step 5 — MILESTONE: SIX rigid scenes rest on the GPU; collide() assembled; PGS core on the engine ABI
+## P5 Step 5 — MILESTONE: six rigid scenes rest on BOTH solvers (TGS + PGS), zero refused launches
+
+Tranche 10 completed the PGS path to scene-readiness: preIntegrationLaunch
+(88-B pack, no skip-gravity bool), integrateCoreParallelLaunch, both PGS
+constraint-prep entries ({8,8} desc packs), NEW solveStaticBlock +
+propagateStaticSolverBodyVelocities (the static-ground path; {8,8,4,4,4,1} /
+{8,8,4,4,4}), dmaBack pair, NEW constraint1DBlockPrePrepLaunch (launched with
+the TOTAL batch count even in contact-only scenes — contact warps no-op like
+the .cu) and clearFrictionPatchCounts.  10 new ABI rows;
+`PXG_SLANG_KERNEL_MAPPED` 146 → 150; harness tests converted to shim+desc
+form.  gpu-sdk-step gained `PXG_SOLVER=pgs`.
+
+**All SIX scenes (box, stack, sphere, plane, capsule, capsulebox) now fall
+and REST under BOTH solvers — 12/12 combinations, each `exit 0`, zero
+refused launches.**  Suite 664/664 both memory modes.
+
+Known PGS/TGS deferrals (documented, latent for the proven scenes): the
+force-threshold reporting group (+ RADIXSORT_SINGLEBLOCK/CALCULATERANKS) only
+launches with force-threshold pairs; `constraint1DPrePrepLaunch` (D6 joint
+data prep) only with joints — a jointed scene is the next bring-up; all
+articulation launches remain deferred.
+
+## P5 Step 5 — earlier milestone: six scenes on TGS; collide() assembled; PGS core on the engine ABI
 
 Tranche 8 (collide() assembly) closed the convex-convex frontier for
 sphere/capsule type0: the new `npCvxCollide.slang` module (1170 lines) wires
