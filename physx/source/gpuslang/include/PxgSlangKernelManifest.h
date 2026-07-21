@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 152;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 156;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -208,10 +208,10 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "solveStaticBlock", "solverPGS.spv", "solveStaticBlock" },  // RIGID_SOLVE_STATIC_CONSTRAINTS (P5 Step 5 BDA port)
     { "solveStaticBlockTGS", "solverTGS.spv", "solveStaticBlockTGS" },  // RIGID_SOLVE_STATIC_CONSTRAINTS_TGS
     { "solveWholeIslandTGS", "solverTGS.spv", "solveWholeIslandTGS" },  // RIGID_SOLVE_WHOLE_ISLAND_TGS
-    { "ps_updateUnsortedArrayLaunch", nullptr, nullptr },  // PS_UPDATE_UNSORTED_ARRAY (unmapped)
-    { "ps_updateUserBufferLaunch", nullptr, nullptr },  // PS_UPDATE_BUFFER_DATA (unmapped)
+    { "ps_updateUnsortedArrayLaunch", "particleSim.spv", "ps_updateUnsortedArrayLaunch" },  // PS_UPDATE_UNSORTED_ARRAY (P6.0 BDA port: user-buffer ingest)
+    { "ps_updateUserBufferLaunch", "particleSim.spv", "ps_updateUserBufferLaunch" },  // PS_UPDATE_BUFFER_DATA (P6.0 BDA port)
     { "ps_updateUnsortedDiffuseArrayLaunch", nullptr, nullptr },  // PS_UPDATE_DIFFUSE_UNSORTED_ARRAY (unmapped)
-    { "ps_preIntegrateLaunch", nullptr, nullptr },  // PS_PREINTEGRATION (unmapped)
+    { "ps_preIntegrateLaunch", "particleSim.spv", "ps_preIntegrateLaunch" },  // PS_PREINTEGRATION (P6.0 BDA port)
     { "ps_preDiffuseIntegrateLaunch", nullptr, nullptr },  // PS_PRE_DIFFUSE_INTEGRATION (unmapped)
     { "ps_updateBoundFirstPassLaunch", nullptr, nullptr },  // PS_UPDATE_BOUND_FRIST (unmapped)
     { "ps_updateBoundSecondPassLaunch", nullptr, nullptr },  // PS_UPDATE_BOUND_SECOND (unmapped)
@@ -237,7 +237,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_findStartEndParticleSecondLaunch", nullptr, nullptr },  // PS_FIND_RANGESTARTEND_PARTICLE_SECONE (unmapped)
     { "ps_accumulateDeltaVParticleLaunch", nullptr, nullptr },  // PS_ACCUMULATE_DELTAVEL_PARTICLE (unmapped)
     { "ps_updateParticleLaunch", nullptr, nullptr },  // PS_UPDATE_PARTICLE (unmapped)
-    { "ps_integrateLaunch", nullptr, nullptr },  // PS_INTEGRATION (unmapped)
+    { "ps_integrateLaunch", "particleSim.spv", "ps_integrateLaunch" },  // PS_INTEGRATION (P6.0 BDA port)
     { "ps_calculateDensityAndPotentialLaunch", nullptr, nullptr },  // PS_CALCULATE_DENSITIES_AND_POTENTIALS (unmapped)
     { "ps_solveDensityLaunch", nullptr, nullptr },  // PS_SOLVE_DENSITIES (unmapped)
     { "ps_applyDeltaLaunch", nullptr, nullptr },  // PS_APPLY_DELTAS (unmapped)

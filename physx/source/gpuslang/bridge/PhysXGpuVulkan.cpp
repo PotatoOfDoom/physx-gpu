@@ -69,6 +69,7 @@
 #include "PxgAABBManager.h"                 // gpubroadphase (PxgAABBManager + PxgBoundsArray)
 #include "PxgNphaseImplementationContext.h" // gpunarrowphase
 #include "PxgSimulationController.h"        // gpusimulationcontroller
+#include "PxgParticleSystem.h"              // gpusimulationcontroller: PxgParticleBuffer (P6.0)
 #include "PxgDynamicsContext.h"             // gpusolver (PGS)
 #include "PxgTGSDynamicsContext.h"          // gpusolver (TGS)
 
@@ -221,7 +222,16 @@ public:
 
     void release() PX_OVERRIDE {}
 
-    PxsParticleBuffer* createParticleBuffer(PxU32, PxU32, PxCudaContextManager&) PX_OVERRIDE { warnNotImplemented("createParticleBuffer"); return NULL; }
+    // P6.0 PBD particle bring-up: mirror physxgpu/src/PxgPhysXGpu.cpp:98-102 —
+    // the concrete PxgParticleBuffer allocates its device buffers through the
+    // Vulkan shim (PxgVulkanMemoryManager) and launches no kernels, so it
+    // constructs the moment this stub is replaced.  A plain PxPBDParticleSystem +
+    // one PxParticleBuffer only ever calls createParticleBuffer (NpParticleBuffer.cpp:610);
+    // the diffuse/cloth/rigid variants stay stubbed (P6.1+).
+    PxsParticleBuffer* createParticleBuffer(PxU32 maxNumParticles, PxU32 maxVolumes, PxCudaContextManager& cudaContextManager) PX_OVERRIDE
+    {
+        return static_cast<PxsParticleBuffer*>(PX_NEW(PxgParticleBuffer)(maxNumParticles, maxVolumes, cudaContextManager));
+    }
     PxsParticleAndDiffuseBuffer* createParticleAndDiffuseBuffer(PxU32, PxU32, PxU32, PxCudaContextManager&) PX_OVERRIDE { warnNotImplemented("createParticleAndDiffuseBuffer"); return NULL; }
     PxsParticleClothBuffer* createParticleClothBuffer(PxU32, PxU32, PxU32, PxU32, PxU32, PxCudaContextManager&) PX_OVERRIDE { warnNotImplemented("createParticleClothBuffer"); return NULL; }
     PxsParticleRigidBuffer* createParticleRigidBuffer(PxU32, PxU32, PxU32, PxCudaContextManager&) PX_OVERRIDE { warnNotImplemented("createParticleRigidBuffer"); return NULL; }

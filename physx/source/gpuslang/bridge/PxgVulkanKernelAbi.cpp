@@ -220,6 +220,26 @@ static const uint8_t kThreePtrU32[] = { 8, 8, 8, 4 };
 //   bool skipGravityApplication).  PxVec3 by value = 12 bytes.
 static const uint8_t kPreIntegrateTGS[] = { 4, 4, 4, 12, 8, 8, 8, 8, 8, 8, 8, 8, 1 };
 
+// gpusimulationcontroller particlesystem.cu (P6.0 PBD particle BDA):
+//   ps_preIntegrateLaunch(const PxgParticleSystem* particleSystems,
+//     const PxU32* activeParticleSystems, PxVec3 gravity, PxReal dt,
+//     bool isTGS, bool externalForcesEveryTgsIterationEnabled)
+//   PxVec3 by value = 12 bytes -> 40-byte blob (two 1-byte bools at 32/33).
+static const uint8_t kPsPreIntegrate[] = { 8, 8, 12, 4, 1, 1 };
+//   ps_integrateLaunch(PxgParticleSystem* particleSystems,
+//     const PxU32* activeParticleSystems, PxReal dt, PxReal epsilonSq)
+//     -> 24-byte blob.
+static const uint8_t kPsIntegrate[] = { 8, 8, 4, 4 };
+//   ps_updateUserBufferLaunch(const PxgParticleSystem* particleSystems,
+//     const PxU32* activeParticleSystems) — the __global__ takes 2 pointers, but
+//     the launch site (copyUnsortedArrayToUserBuffer) passes a 3rd PxU32 `count`
+//     (unused by the kernel), so the marshalled pack is {8,8,4} -> 24-byte blob.
+static const uint8_t kPsUpdateUserBuffer[] = { 8, 8, 4 };
+//   ps_updateUnsortedArrayLaunch(const PxgParticleSystem* particleSystems,
+//     const PxU32* activeParticleSystems) — user-buffer -> unsorted ingest.
+//     Two device pointers -> 16-byte blob (same shape as kTwoPtr).
+static const uint8_t kPsUpdateUnsorted[] = { 8, 8 };
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },
@@ -326,6 +346,11 @@ static const PxgKernelAbiRow kRows[] = {
     { "boxBoxNphase_Kernel", kBoxBoxNphase, uint32_t(sizeof(kBoxBoxNphase)) },
     { "sphereNphase_Kernel", kSphereNphase, uint32_t(sizeof(kSphereNphase)) },
     { "convexPlaneNphase_Kernel", kConvexPlaneNphase, uint32_t(sizeof(kConvexPlaneNphase)) },
+    // gpusimulationcontroller PBD particle kernels (P6.0 BDA)
+    { "ps_updateUnsortedArrayLaunch", kPsUpdateUnsorted, uint32_t(sizeof(kPsUpdateUnsorted)) },
+    { "ps_preIntegrateLaunch", kPsPreIntegrate, uint32_t(sizeof(kPsPreIntegrate)) },
+    { "ps_integrateLaunch", kPsIntegrate, uint32_t(sizeof(kPsIntegrate)) },
+    { "ps_updateUserBufferLaunch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
 };
 
 inline size_t abiAlign(size_t size)

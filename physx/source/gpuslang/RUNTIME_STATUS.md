@@ -106,6 +106,54 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
+## P6.0 — MILESTONE: the first live particle frame — a PBD particle cloud free-falls on Vulkan
+
+The first-ever deformable/particle frame on the Slang/Vulkan (llvmpipe) engine
+path: a PBD particle cloud now free-falls under gravity and steps live, on both
+solvers, `exit 0`, with the full suite and the entire rigid regression staying
+green. This opens the Phase-2 runtime for the deformable/particle subsystems
+(previously 0 kernels mapped; Phase-1 math was already ported + unit-tested).
+
+Four `ps_*` kernels were brought up on the BDA engine ABI, ported line-for-line
+from `gpusimulationcontroller/src/CUDA/particlesystem.cu`:
+- `ps_updateUnsortedArrayLaunch` (ABI `{8,8}`) — the INGEST. Copies the user
+  `PxParticleBuffer` into the internal `mUnsortedPositions_InvMass`. **Load-bearing
+  discovery:** without it that array stays zero → `invMass==0` → `preIntegrate`'s
+  `tPos.w!=0` guard skips every particle → no fall at all. The scoped "3 kernels"
+  cannot produce an observable; this ingest kernel is the required 4th. Fires once
+  (frame 1, buffer flags dirty); thereafter preIntegrate drives the fall.
+- `ps_preIntegrateLaunch` (ABI `{8,8,12,4,1,1}`) — the gravity predict on the
+  UNSORTED arrays: `vel = (vel + gravity*gravityScale*dt)*damping`,
+  `pos += vel*dt*fwdScale` (fwdScale 0.5 TGS / 1.0 PGS). The free-fall driver.
+- `ps_integrateLaunch` (ABI `{8,8,4,4}`) — post-solve writeback from the SORTED
+  state. On the contact-free free-fall path the un-ported reorder never fills the
+  sorted buffers (zero on fresh `vkAllocateMemory`) → `mSortedDeltaP==0` → locked →
+  `pos4.w==0` guard → inert no-op that neither corrupts nor faults. A
+  behaviour-preserving `sortedIndex < numParticles` bound guard hardens the one
+  scatter write against the un-ported-reorder garbage case.
+- `ps_updateUserBufferLaunch` (ABI `{8,8,4}`) — egress back to the user buffer so
+  the host DtoH read observes the fall.
+
+First-ever `PxgParticleSystem` BDA round-trip: `pxgSlangParticleDesc.slang` mirrors
+`PxgParticleSystemGpu` (656 B, `mSortedDeltaP@160`/`mData@248`) +
+`PxgParticleSimBufferGpu` (88 B, `mFlags@72`), validated three ways — SPIR-V
+`ArrayStride 656`/`88`, `offsetof`/`static_assert` against the real engine
+`PxgParticleSystem` compiled in the test TU, and a sentinel-filled device
+round-trip per kernel (bit-exact).
+
+**`PXG_SCENE=particle` free-fall (cloud from y≈100.75 over 2.0s, both solvers,
+`exit 0`):** TGS drops 9.89 m (fwdScale 0.5), PGS drops 19.78 m ≈ true free fall
+½·9.81·2² = 19.62 m — the drop ratio validates the `isTGS` bool marshalling.
+`ps_updateUnsortedArrayLaunch` OK ×1, the other three OK ×120 each; the remaining
+grid/sort/collision/solve launches refuse cleanly (non-fatal). A particle-only
+scene SIGSEGVs the rigid solver (`rigidSumInternalContactAndJointBatches2`
+null-derefs with zero dynamic rigids), so the scene keeps a proven box-on-ground
+rigid config at y≈0.5 far below the cloud.
+
+Suite 665/665 both memory modes (`gpuslang.particleSim` 5/5 bit-exact both modes);
+`PXG_SLANG_KERNEL_MAPPED = 156`. Rigid regression unaffected: all 8 scenes ×
+2 solvers = 16/16 `exit 0`, byte-for-byte identical.
+
 ## P5 Step 5 — MILESTONE COMPLETE: all eight common rigid scenes hold on BOTH solvers
 
 Tranche 13 converted the last bound-buffer kernel in the joint path —

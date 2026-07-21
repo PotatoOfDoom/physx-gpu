@@ -22,6 +22,7 @@
 #include "GuCooking.h"
 #include "cooking/PxCooking.h"
 #include "extensions/PxD6Joint.h"   // PxD6JointCreate + PxD6Axis/PxD6Motion (jointed scene)
+#include "cudamanager/PxCudaContext.h" // PxCudaContext::memcpyHtoD/DtoH (particle buffer fill/read)
 
 #include <cstdio>
 #include <cmath>
@@ -306,6 +307,114 @@ void buildJointScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
 
     targets.push_back({ box, spawnY, restY, "boxOnD6Joint" });
 }
+
+// PXG_SCENE=particle (P6.0): the first deformable/particle scene.  A PBD particle
+// cloud (4x4x4 = 64 particles, invMass = 1) is spawned HIGH above everything with
+// zero initial velocity and no ground, so it is a pure free fall with NO contacts.
+// The engine launches the whole per-frame ps_* sequence, but only the four P6.0
+// kernels are mapped (ps_updateUnsortedArrayLaunch ingest, ps_preIntegrateLaunch
+// predict, ps_integrateLaunch writeback, ps_updateUserBufferLaunch egress); every
+// grid / sort / collision / solve kernel refuses (non-fatal).  Because there is no
+// contact, the sorted buffers stay zero, ps_integrateLaunch is an inert no-op
+// (pos4.w == 0 guard), and the observable fall is produced entirely by the ingest
+// -> predict -> egress chain on the UNSORTED arrays.
+struct ParticleScene
+{
+    PxPBDParticleSystem* system = nullptr;
+    PxParticleBuffer* buffer = nullptr;
+    PxU32 numParticles = 0;
+    PxCudaContextManager* cudaCtx = nullptr;
+};
+
+ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
+                                 PxCudaContextManager* cudaCtx)
+{
+    ParticleScene out;
+    out.cudaCtx = cudaCtx;
+
+    // A minimal rigid body (box on ground) FAR BELOW the cloud.  The engine drives
+    // the rigid solver core for the particle island's iteration loop; with zero
+    // dynamic rigid bodies the rigid batch-sum kernel (rigidSumInternalContactAndJoint
+    // Batches2) dereferences null solver descriptors and faults, so the scene needs
+    // one live rigid body to keep that proven path valid.  It rests at y=0.5, ~100
+    // below the particle cloud, so there is never any particle/rigid interaction.
+    addGroundBox(physics, scene, rigidMat);
+    addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+               boxInertia(PxVec3(0.5f), 1000.0f), 5.0f);
+
+    // PBD material + particle system + one phase mapping to that material.
+    PxPBDMaterial* pbdMat = physics->createPBDMaterial(/*friction*/ 0.05f, /*damping*/ 0.0f,
+        /*adhesion*/ 0.0f, /*viscosity*/ 0.0f, /*vorticityConfinement*/ 0.0f, /*surfaceTension*/ 0.0f,
+        /*cohesion*/ 0.0f, /*lift*/ 0.0f, /*drag*/ 0.0f);
+
+    PxPBDParticleSystem* ps = physics->createPBDParticleSystem(*cudaCtx);
+    const float particleSpacing = 0.5f;
+    const float restOffset = 0.5f * particleSpacing;
+    ps->setRestOffset(restOffset);
+    ps->setContactOffset(restOffset + 0.05f);
+    ps->setParticleContactOffset(restOffset + 0.05f);
+    ps->setSolidRestOffset(restOffset);
+    ps->setMaxVelocity(1e6f); // do not clamp the free fall
+
+    const PxU32 phase = ps->createPhase(pbdMat,
+        PxParticlePhaseFlags(PxParticlePhaseFlag::eParticlePhaseSelfCollide));
+
+    // 4x4x4 grid, invMass 1, zero velocity, spawned centred high above y=0.
+    const int G = 4;
+    const PxU32 N = PxU32(G * G * G);
+    const float startY = 100.0f;
+    std::vector<PxVec4> hostPos(N), hostVel(N, PxVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    std::vector<PxU32> hostPhase(N, phase);
+    PxU32 idx = 0;
+    for (int x = 0; x < G; ++x)
+        for (int y = 0; y < G; ++y)
+            for (int z = 0; z < G; ++z)
+            {
+                hostPos[idx++] = PxVec4(float(x) * particleSpacing - 0.75f,
+                                        startY + float(y) * particleSpacing,
+                                        float(z) * particleSpacing - 0.75f, 1.0f);
+            }
+
+    PxParticleBuffer* buffer = physics->createParticleBuffer(N, /*maxVolumes*/ 0, cudaCtx);
+    if (!buffer)
+    {
+        std::printf("FAIL: createParticleBuffer returned null (bridge stub not replaced?)\n");
+        return out;
+    }
+
+    // Fill the buffer's DEVICE arrays (getPositionInvMasses() et al. are device
+    // pointers on the GPU path) via host->device copies through the bridge.
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPositionInvMasses()), hostPos.data(),
+                    N * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getVelocities()), hostVel.data(),
+                    N * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPhases()), hostPhase.data(),
+                    N * sizeof(PxU32));
+    buffer->setNbActiveParticles(N);
+    buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_POSITION);
+    buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_VELOCITY);
+    buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_PHASE);
+    ps->addParticleBuffer(buffer);
+    scene->addActor(*ps);
+
+    out.system = ps;
+    out.buffer = buffer;
+    out.numParticles = N;
+    return out;
+}
+
+// DtoH-read the particle buffer and return the mean y of the cloud.
+float particleMeanY(const ParticleScene& psc)
+{
+    std::vector<PxVec4> host(psc.numParticles);
+    PxCudaContext* ctx = psc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(psc.buffer->getPositionInvMasses()),
+                    psc.numParticles * sizeof(PxVec4));
+    double sum = 0.0;
+    for (PxU32 i = 0; i < psc.numParticles; ++i) sum += double(host[i].y);
+    return float(sum / double(psc.numParticles));
+}
 } // namespace
 
 int main()
@@ -377,6 +486,67 @@ int main()
     // Each builder adds its actors and pushes the dynamic bodies it wants rest-checked.
     const char* sceneName = std::getenv("PXG_SCENE");
     if (!sceneName) sceneName = "box";
+
+    // PXG_SCENE=particle (P6.0): the deformable/particle free-fall path.  Wholly
+    // separate observable from the rigid RestTarget path — a PBD cloud that falls
+    // under gravity, verified by DtoH-reading its mean y across steps.
+    if (!std::strcmp(sceneName, "particle"))
+    {
+        ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx);
+        if (!psc.system || !psc.buffer)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: particle scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'particle' built: %u PBD particles free-falling from y~100 on the GPU\n",
+                    psc.numParticles);
+
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: particle GPU pipeline CONSTRUCTED + live over Vulkan "
+                        "(set PXG_GPU_STEP=1 to step the free fall)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const int steps = 120;
+        const float y0 = particleMeanY(psc);
+        std::printf("  stepping the particle cloud (%d x %.4fs), initial mean y=%.4f...\n", steps, dt, y0);
+
+        float prevY = y0;
+        int nonMonotonic = 0;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            const float y = particleMeanY(psc);
+            if (i < 5 || i == steps - 1)
+                std::printf("    step %3d: mean y = %.5f (dy = %+.5f)\n", i, y, y - prevY);
+            // Free fall: mean y must not increase (allow a tiny float slack).
+            if (y > prevY + 1e-3f) ++nonMonotonic;
+            prevY = y;
+        }
+        const float yEnd = particleMeanY(psc);
+        const float drop = y0 - yEnd;
+        std::printf("  particle free fall: mean y %.4f -> %.4f (dropped %.4f over %.2fs)\n",
+                    y0, yEnd, drop, steps * dt);
+
+        int failures = 0;
+        if (!(yEnd < y0 - 0.05f)) { std::printf("FAIL: cloud did not fall (drop=%.4f)\n", drop); ++failures; }
+        if (nonMonotonic != 0)    { std::printf("FAIL: mean y increased on %d step(s)\n", nonMonotonic); ++failures; }
+        if (!std::isfinite(yEnd)) { std::printf("FAIL: mean y is not finite (%.4f)\n", yEnd); ++failures; }
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: particle cloud fell monotonically under gravity on Vulkan "
+                        "(the first live particle frame)\n");
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: particle free-fall checks failed (%d)\n", failures);
+        return 2;
+    }
+
     std::vector<RestTarget> targets;
     if      (!std::strcmp(sceneName, "box"))       buildBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "stack"))     buildStackScene(physics, scene, material, targets);
