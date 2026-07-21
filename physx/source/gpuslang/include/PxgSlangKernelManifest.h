@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 168;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 169;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -221,7 +221,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_selfCollisionLaunch", "particleSelfCollisionBda.spv", "ps_selfCollisionLaunch" },  // PS_PARTICLE_SELF_COLLISION (P6.3 BDA port: 3x3x3 grid neighbour search)
     { "ps_primitivesBoundFirstPassLaunch", "psBoundsBda.spv", "ps_primitivesBoundFirstPassLaunch" },  // PS_PRIMITIVES_BOUND_FIRST (P6.4a-1 BDA port: per-pair cell-range count + scan)
     { "ps_primitivesBoundSecondPassLaunch", "psBoundsBda.spv", "ps_primitivesBoundSecondPassLaunch" },  // PS_PRIMITIVES_BOUND_SECOND (P6.4a-1 BDA port: block-total scan + fold + total)
-    { "ps_primitivesCollisionLaunch", nullptr, nullptr },  // PS_PRIMITIVES_COLLISION (unmapped)
+    { "ps_primitivesCollisionLaunch", "psContactGenBda.spv", "ps_primitivesCollisionLaunch" },  // PS_PRIMITIVES_COLLISION (P6.4a-2 BDA port: particle-vs-primitive contact generator)
     { "ps_convexCollisionLaunch", nullptr, nullptr },  // PS_CONVEX_COLLISION (unmapped)
     { "ps_primitivesDiffuseCollisionLaunch", nullptr, nullptr },  // PS_PRIMITIVES_DIFFUSE_COLLISION (unmapped)
     { "ps_convexDiffuseCollisionLaunch", nullptr, nullptr },  // PS_CONVEX_DIFFUSE_COLLISION (unmapped)

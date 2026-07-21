@@ -304,6 +304,21 @@ static const uint8_t kPsPrimBound1[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8 };
 //   -> {4,8,8,8} = 32-byte blob.
 static const uint8_t kPsPrimBound2[] = { 4, 8, 8, 8 };
 
+// gpunarrowphase cudaParticleSystem.cu:1189 (P6.4a-2 particle contact generator):
+//   ps_primitivesCollisionLaunch(const bool isTGS, const PxU32 numTests,
+//     const PxReal toleranceLength, const PxgContactManagerInput* cmInputs,
+//     PxgShape* shapes, const PxsCachedTransform* transformCache,
+//     const PxBounds3* bounds, const PxReal* contactDistance,
+//     const PxReal* restDistances, const PxsMaterialData* materials,
+//     const PxU32* startIndices, const PxU32* totalNumPairs,
+//     PxgParticleSystem* particleSystems, const PxNodeIndex* shapeToRigidRemapTable,
+//     PxgParticleContactWriter writer) — the writer is passed BY VALUE (8 device
+//   pointers + PxU32 maxContacts + 4B tail pad = 72 bytes, sizeof =
+//   sizeof(PxgParticleContactWriter)).  Launch site PxgNarrowphaseCore.cpp:3225.
+//   Natural-alignment blob (bool @0, u32 @4, f32 @8, first ptr @16, writer @104)
+//   -> {1,4,4,8x11,72} = 176-byte blob.
+static const uint8_t kPsPrimCollide[] = { 1, 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 72 };
+
 // gpucommon/src/CUDA/radixSortImpl.cu (P6.2 grid radix sort):
 //   radixSortMultiBlockLaunchWithoutCount(PxgRadixSortDesc* desc, PxU32 startBit)
 //   / radixSortMultiCalculateRanksLaunchWithoutCount(same ABI) — the numKeys
@@ -452,6 +467,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_updateBoundSecondPassLaunch", kPsUpdateBound2, uint32_t(sizeof(kPsUpdateBound2)) },
     { "ps_primitivesBoundFirstPassLaunch", kPsPrimBound1, uint32_t(sizeof(kPsPrimBound1)) },
     { "ps_primitivesBoundSecondPassLaunch", kPsPrimBound2, uint32_t(sizeof(kPsPrimBound2)) },
+    // gpunarrowphase (P6.4a-2 PBD particle-vs-primitive contact generator)
+    { "ps_primitivesCollisionLaunch", kPsPrimCollide, uint32_t(sizeof(kPsPrimCollide)) },
     // gpucommon radixSortImpl.cu:69 / :81 — the WithoutCount radix twins (P6.2 BDA)
     { "radixSortMultiBlockLaunchWithoutCount", kRadixDescNoCount, uint32_t(sizeof(kRadixDescNoCount)) },
     { "radixSortMultiCalculateRanksLaunchWithoutCount", kRadixDescNoCount, uint32_t(sizeof(kRadixDescNoCount)) },

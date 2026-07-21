@@ -106,6 +106,42 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
+## P6.4a-2 — particle-vs-primitive contact generator on the engine ABI
+
+Brought the heavy `ps_primitivesCollisionLaunch` (`cudaParticleSystem.cu`, device core
+`particlePrimitiveCollision`) onto the BDA engine ABI — the kernel that detects a particle
+touching a static shape (plane/box/sphere/capsule) and writes the contacts. It's the
+"catch" contact generator. New file `psContactGenBda.slang`; manifest count 168 → **169**.
+
+The 15-arg launch pack (`PxgNarrowphaseCore.cpp:3225`) includes the `PxgParticleContactWriter`
+**by value** — marshalled inline as the 72-byte tail of a 176-byte push blob (writer@104,
+static_assert-pinned member offsets: particleContacts@104 … maxContacts@168). ABI row
+`{1,4,4, 8×11, 72}`. Reused mirrors (all offset-validated in the test TU): `PxgParticleSystemGpu`/
+`PxgParticleSimBufferGpu` (P6.0), `PxgContactManagerInput`(16)/`PxgShape`(48)/`PxsCachedTransform`(32)/
+`PxgRigidFilterPair`(32) (transcribed, static_asserted), + the plane/sphere/capsule/box contact
+core + `writeContact` staging fan-out reused from harness `psPrimCollide.slang`.
+
+llvmpipe deviations (flagged): geometry switch keys the **real** `PxGeometryType` from
+`PxgShape.type`; the caller's grid-stride ballot/warpScan compaction dropped (scheduling only —
+contact set + total identical); per-warp `warpReduction<Max>` → full-**block** groupshared max
+(block-uniform inner bound so ballot barriers are safe without a 32-lane subgroup); per-warp
+`__ballot_sync`+lane-atomic kept as a 32-lane **logical** groupshared tile; every BDA `Ptr<>` load
+behind a uniform-scalar guard (no hoist out of zero-trip cell loops).
+
+**KEY EVIDENCE (no scene observable this tranche — the high cloud never reaches the floor so
+`numTests=0` and the kernel doesn't dispatch):** unit test `gpuslang.psContactGen` builds ONE
+particle at y=−0.1 penetrating a static plane y=0 with a filled grid, runs the kernel, and
+asserts exactly **ONE** contact with normal **(0,1,0)** and penetration **−0.1**, bit-exact vs a
+CPU transcription of the ePLANE branch (all six radix staging arrays + the counter correct). Both
+memory modes. Suite **669/669** both modes. Free-fall byte-identical (PGS 80.9665, TGS 9.89m), no
+new refused/error lines vs the P6.4a-1 baseline, no crash. Rigid regression 8×2 = **16/16**.
+
+P6.4b frontier: the generated contacts feed the not-yet-mapped contact **sort → prep → one-way
+solve** chain (`sortParticleContacts` radix staging → `ps_reorderPrimitiveContactsLaunch` →
+`ps_contactPrepareLaunch` → `ps_findStartEndParticle*` → `ps_solvePCOutputParticleDeltaV*` →
+`ps_accumulateDeltaVParticleLaunch`); **P6.5** lowers the cloud so the whole path dispatches and
+the bag settles.
+
 ## P6.4a-1 — particle bound / cell-range kernels on the engine ABI
 
 Toward a particle-vs-floor "catch", brought the 4 particle bound/cell-range
