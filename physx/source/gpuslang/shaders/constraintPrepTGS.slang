@@ -39,19 +39,21 @@
 // Same portability policy as constraintPrepPGS.slang: direct (non-warp-staged)
 // loads, per-thread local scratch for the row preprocessing.
 //
-// P5 Step 4: contactConstraintBlockPrepareParallelLaunchTGS is on the ENGINE
-// launch ABI — params { PxgConstraintPrepareDesc*,
-// PxgSolverSharedDesc<IterativeSolveDataTGS>* } (PxgTGSCudaSolverCore.cpp
-// L964), block = CONSTRAINT_PREPARE_BLOCK_PARALLEL = 64 (2 warps/block),
-// grid = ceil(nbContactBatches / 2), all data walked through the byte-exact
-// BDA desc mirrors (pxgSlangPrepDesc.slang / pxgSlangSolverDesc.slang).  The
-// .cu's shared-memory inertia staging (3-lane uint4 loads) is replaced by
-// direct per-lane loads from solverBodyTxIDataPool — bit-identical data
+// P5 Step 5: BOTH TGS prep entries are now on the ENGINE launch ABI — params
+// { PxgConstraintPrepareDesc*, PxgSolverSharedDesc<IterativeSolveDataTGS>* }
+// (contact: PxgTGSCudaSolverCore.cpp L964; joint: L933), block =
+// CONSTRAINT_PREPARE_BLOCK_PARALLEL = 64 (2 warps/block), grid =
+// ceil(nbBatches / 2), all data walked through the byte-exact BDA desc mirrors
+// (pxgSlangPrepDesc.slang / pxgSlangSolverDesc.slang).  The .cu's shared-memory
+// inertia staging (3-lane uint4 loads for contacts, __shared__ sortedRowIndices
+// /angSqrtInvInertia scratch for joints) is replaced by direct per-lane loads
+// from solverBodyTxIDataPool + per-thread local arrays — bit-identical data
 // movement, the same equivalence the bound-buffer port established.  The
-// bound-buffer port's `hasPrevFrictionIndices` push flag becomes the
-// blockPreviousFrictionIndices != NULL pointer check.
-// jointConstraintBlockPrepareParallelLaunchTGS remains in bound-buffer form
-// (bindings 0-10 + PrepParams push constants) pending its own conversion.
+// contact port's `hasPrevFrictionIndices` push flag becomes the
+// blockPreviousFrictionIndices != NULL pointer check.  The joint port reads
+// stepDt/stepInvDtF32/dt/invDtF32/lengthScale from the shared desc and
+// biasCoefficient (erp = 0.5 * biasCoefficient) from the prepare desc, exactly
+// as setupSolverConstraintBlockGPUTGS's argument list does.
 
 import pxgSlangCommon;
 import pxgSlangPrepCommon;
@@ -174,73 +176,22 @@ struct PxgTGSBlockSolverConstraint1DCon
 }                                             // = 3328
 
 // ---------------------------------------------------------------------------
-// push constants + bindings
+// engine-ABI push constant (shared by both entries: the CUDA parameter pack is
+// identical — PxgConstraintPrepareDesc*, PxgSolverSharedDesc<IterativeSolveDataTGS>*)
 // ---------------------------------------------------------------------------
 
-struct PrepParams
-{
-    uint numBatches;
-    uint totalPreviousEdges;
-    uint totalCurrentEdges;
-    uint hasPrevFrictionIndices;
-    float stepDt;      // sharedDesc->stepDt
-    float invStepDt;   // sharedDesc->stepInvDtF32
-    float totalDt;     // sharedDesc->dt
-    float invTotalDt;  // sharedDesc->invDtF32
-    float bounceThreshold;
-    float frictionOffsetThreshold;
-    float correlationDistance;
-    float ccdMaxSeparation;
-    float lengthScale;
-    float biasCoefficient;
-};
-
-[[vk::push_constant]]
-ConstantBuffer<PrepParams> gParams;
-
-RWStructuredBuffer<PxgBlockConstraintBatch> gBatches;                    // binding 0
-RWStructuredBuffer<uint> gBatchIndices;                                  // binding 1
-RWStructuredBuffer<PxgSolverBodyData> gSolverBodyData;                   // binding 2
-RWStructuredBuffer<PxgSolverTxIData> gTxIData;                           // binding 3
-
-// joint prep inputs/outputs
-RWStructuredBuffer<PxgBlockConstraint1DData> gJointData;                 // binding 4
-RWStructuredBuffer<PxgBlockConstraint1DVelocities> gJointVel;            // binding 5
-RWStructuredBuffer<PxgBlockConstraint1DParameters> gJointPar;            // binding 6 (RW: solveHint promotion)
-RWStructuredBuffer<uint> gConstraintUniqueIndices;                       // binding 7
-RWStructuredBuffer<uint2> gSolverConstantData;                           // binding 8
-RWStructuredBuffer<PxgTGSBlockSolverConstraint1DHeader> gJointHeaders;   // binding 9
-RWStructuredBuffer<PxgTGSBlockSolverConstraint1DCon> gJointRowsCon;      // binding 10
-
-// contact prep inputs/outputs
-RWStructuredBuffer<PxgAlignedTransform> gBodyFrames;                     // binding 11
-RWStructuredBuffer<PxgBlockWorkUnit> gWorkUnits;                         // binding 12
-RWStructuredBuffer<PxgBlockContactData> gContactPrepData;               // binding 13
-RWStructuredBuffer<PxgBlockContactPoint> gContactPrepPoints;            // binding 14
-RWStructuredBuffer<PxgBlockFrictionPatch> gCurrFrictionPatches;         // binding 15
-RWStructuredBuffer<PxgBlockFrictionPatch> gPrevFrictionPatches;         // binding 16
-RWStructuredBuffer<PxgBlockFrictionAnchorPatch> gCurrAnchors;           // binding 17
-RWStructuredBuffer<PxgBlockFrictionAnchorPatch> gPrevAnchors;           // binding 18
-RWStructuredBuffer<uint2> gCurrFrictionIndices;                        // binding 19
-RWStructuredBuffer<uint2> gPrevFrictionIndices;                        // binding 20
-RWStructuredBuffer<PxgTGSBlockSolverContactHeader> gContactHeaders;     // binding 21
-RWStructuredBuffer<PxgTGSBlockSolverFrictionHeader> gFrictionHeaders;   // binding 22
-RWStructuredBuffer<PxgTGSBlockSolverContactPoint> gContactPoints;       // binding 23
-RWStructuredBuffer<PxgTGSBlockSolverContactFriction> gFrictions;        // binding 24
-
-// ---------------------------------------------------------------------------
-// contact prep (setupFinalizeSolverConstraintsBlockTGS) — ENGINE ABI (BDA)
-// ---------------------------------------------------------------------------
-
-// The CUDA parameter list (PxgTGSCudaSolverCore::contactConstraintPrepareParallel)
-struct TgsContactPrepLaunch
+struct TgsPrepLaunch
 {
     uint64_t prepDesc;   // @0 PxgConstraintPrepareDesc*
     uint64_t sharedDesc; // @8 PxgSolverSharedDesc<IterativeSolveDataTGS>*
 }
 
 [[vk::push_constant]]
-ConstantBuffer<TgsContactPrepLaunch> gTgsContactLaunch;
+ConstantBuffer<TgsPrepLaunch> gTgsPrepLaunch;
+
+// ---------------------------------------------------------------------------
+// contact prep (setupFinalizeSolverConstraintsBlockTGS) — ENGINE ABI (BDA)
+// ---------------------------------------------------------------------------
 
 // Ptr-typed twins of the pxgSlangPrepCommon correlation helpers (same bodies,
 // BDA access; the RWStructuredBuffer originals stay for the PGS module).
@@ -813,9 +764,9 @@ void contactConstraintBlockPrepareParallelLaunchTGS(uint3 groupThreadId : SV_Gro
     const uint threadIndexInWarp = groupThreadId.x & 31u;
 
     Ptr<PxgConstraintPrepareDescGpu> prepDesc =
-        Ptr<PxgConstraintPrepareDescGpu>(gTgsContactLaunch.prepDesc);
+        Ptr<PxgConstraintPrepareDescGpu>(gTgsPrepLaunch.prepDesc);
     Ptr<PxgSolverSharedDescTGSGpu> sharedDesc =
-        Ptr<PxgSolverSharedDescTGSGpu>(gTgsContactLaunch.sharedDesc);
+        Ptr<PxgSolverSharedDescTGSGpu>(gTgsPrepLaunch.sharedDesc);
 
     const uint totalPreviousEdges = prepDesc[0].totalPreviousEdges;
     const uint totalCurrentEdges = prepDesc[0].totalCurrentEdges;
@@ -958,11 +909,13 @@ void contactConstraintBlockPrepareParallelLaunchTGS(uint3 groupThreadId : SV_Gro
 }
 
 // ---------------------------------------------------------------------------
-// joint prep (jointConstraintBlockPrepTGS.cuh)
+// joint prep (jointConstraintBlockPrepTGS.cuh) — ENGINE ABI (BDA)
 // ---------------------------------------------------------------------------
 
 // orthogonalize() is identical to the PGS variant (shared source); copied here
-void orthogonalize(uint sortedRowIndices[MAX_CONSTRAINT_ROWS], uint startOffset, uint rowBase,
+// with BDA (Ptr<>) access to the joint velocities pool.
+void orthogonalize(Ptr<PxgBlockConstraint1DVelocities> gJointVel,
+                   uint sortedRowIndices[MAX_CONSTRAINT_ROWS], uint startOffset, uint rowBase,
                    inout float3 angSqrtInvInertia0[MAX_CONSTRAINT_ROWS],
                    inout float3 angSqrtInvInertia1[MAX_CONSTRAINT_ROWS], uint rowCount, uint eqRowCount,
                    float invMass0, float invMass1, float invInertiaScale0, float invInertiaScale1,
@@ -1046,7 +999,10 @@ void orthogonalize(uint sortedRowIndices[MAX_CONSTRAINT_ROWS], uint startOffset,
 }
 
 // mirrors preprocessRows() (identical to PGS)
-void preprocessRows(inout uint sortedRowIndices[MAX_CONSTRAINT_ROWS], uint jointDataIndex, uint rowBase,
+void preprocessRows(Ptr<PxgBlockConstraint1DData> gJointData,
+                    Ptr<PxgBlockConstraint1DVelocities> gJointVel,
+                    Ptr<PxgBlockConstraint1DParameters> gJointPar,
+                    inout uint sortedRowIndices[MAX_CONSTRAINT_ROWS], uint jointDataIndex, uint rowBase,
                     out float3 angSqrtInvInertia0[MAX_CONSTRAINT_ROWS],
                     out float3 angSqrtInvInertia1[MAX_CONSTRAINT_ROWS], float4 invMassScale, float iMass0,
                     float iMass1, PxgMat33 i0, PxgMat33 i1, uint threadIndex, bool disablePreprocessing)
@@ -1094,9 +1050,9 @@ void preprocessRows(inout uint sortedRowIndices[MAX_CONSTRAINT_ROWS], uint joint
                      bCount++)
                     ;
 
-                orthogonalize(sortedRowIndices, start, rowBase, angSqrtInvInertia0, angSqrtInvInertia1,
-                              i - start, bCount - start, invMass0, invMass1, invInertiaScale0,
-                              invInertiaScale1, threadIndex);
+                orthogonalize(gJointVel, sortedRowIndices, start, rowBase, angSqrtInvInertia0,
+                              angSqrtInvInertia1, i - start, bCount - start, invMass0, invMass1,
+                              invInertiaScale0, invInertiaScale1, threadIndex);
             }
         }
     }
@@ -1104,7 +1060,12 @@ void preprocessRows(inout uint sortedRowIndices[MAX_CONSTRAINT_ROWS], uint joint
 
 // mirrors intializeBlock1DTGS(); returns 1 for a rotational-equality row (which
 // contributes an ortho axis into slot eqCount), 0 otherwise
-uint intializeBlock1DTGS(uint index, uint jointDataIndex, uint headerIndex, uint outRow,
+uint intializeBlock1DTGS(Ptr<PxgBlockConstraint1DVelocities> gJointVel,
+                         Ptr<PxgBlockConstraint1DParameters> gJointPar,
+                         Ptr<PxgBlockConstraint1DData> gJointData,
+                         Ptr<PxgTGSBlockSolverConstraint1DHeader> gJointHeaders,
+                         Ptr<PxgTGSBlockSolverConstraint1DCon> gJointRowsCon,
+                         uint index, uint jointDataIndex, uint headerIndex, uint outRow,
                          float jointSpeedForRestitutionBounce, float initJointSpeed, float unitResponse,
                          float minRowResponse, float erp, float lengthScale, float stepDt, float simDt,
                          float recipStepDt, float recipSimDt, float3 angSqrtInvInertia0,
@@ -1213,7 +1174,8 @@ uint intializeBlock1DTGS(uint index, uint jointDataIndex, uint headerIndex, uint
     return ret;
 }
 
-void setOrthoAxisZero(uint headerIndex, uint slot, uint threadIndex)
+void setOrthoAxisZero(Ptr<PxgTGSBlockSolverConstraint1DHeader> gJointHeaders, uint headerIndex, uint slot,
+                      uint threadIndex)
 {
     if (slot == 0)
     {
@@ -1233,42 +1195,74 @@ void setOrthoAxisZero(uint headerIndex, uint slot, uint threadIndex)
 }
 
 // mirrors jointConstraintBlockPrepareParallelLaunchTGS() +
-// setupSolverConstraintBlockGPUTGS() + setUp1DConstraintBlockTGS()
+// setupSolverConstraintBlockGPUTGS() + setUp1DConstraintBlockTGS() on the
+// ENGINE ABI: warpIndex = blockIdx.x * (blockDim/32) + threadIdx.x/32 selects
+// the batch, total1dConstraintBatches = num1dConstraintBatches +
+// numStatic1dConstraintBatches from the desc.
 [shader("compute")]
-[numthreads(32, 1, 1)]
+[numthreads(64, 1, 1)]
 void jointConstraintBlockPrepareParallelLaunchTGS(uint3 groupThreadId : SV_GroupThreadID,
                                                   uint3 groupId : SV_GroupID)
 {
-    const uint threadIndexInWarp = groupThreadId.x;
-    const uint i = groupId.x;
+    const uint blockStride = 64u / 32u;
+    const uint warpIndex = groupId.x * blockStride + groupThreadId.x / 32u;
+    const uint threadIndexInWarp = groupThreadId.x & 31u;
 
-    if (i >= gParams.numBatches)
+    Ptr<PxgConstraintPrepareDescGpu> prepDesc =
+        Ptr<PxgConstraintPrepareDescGpu>(gTgsPrepLaunch.prepDesc);
+    Ptr<PxgSolverSharedDescTGSGpu> sharedDesc =
+        Ptr<PxgSolverSharedDescTGSGpu>(gTgsPrepLaunch.sharedDesc);
+
+    const uint num1dConstraintBatches =
+        prepDesc[0].num1dConstraintBatches + prepDesc[0].numStatic1dConstraintBatches;
+
+    const uint i = warpIndex;
+    if (i >= num1dConstraintBatches)
         return;
 
-    const uint batchIndex = gBatchIndices[i];
+    Ptr<uint> batchIndices = Ptr<uint>(prepDesc[0].jointConstraintBatchIndices);
+    Ptr<PxgBlockConstraintBatch> batches =
+        Ptr<PxgBlockConstraintBatch>(sharedDesc[0].iter_blockConstraintBatch);
+    Ptr<PxgSolverBodyData> solverBodyDatas = Ptr<PxgSolverBodyData>(prepDesc[0].solverBodyDataPool);
+    Ptr<PxgSolverTxIData> solverTxIDatas = Ptr<PxgSolverTxIData>(prepDesc[0].solverBodyTxIDataPool);
+    Ptr<PxgBlockConstraint1DData> gJointData = Ptr<PxgBlockConstraint1DData>(prepDesc[0].blockJointPrepPool);
+    Ptr<PxgBlockConstraint1DVelocities> gJointVel =
+        Ptr<PxgBlockConstraint1DVelocities>(prepDesc[0].blockJointPrepPool0);
+    Ptr<PxgBlockConstraint1DParameters> gJointPar =
+        Ptr<PxgBlockConstraint1DParameters>(prepDesc[0].blockJointPrepPool1);
+    Ptr<uint> constraintUniqueIndices = Ptr<uint>(prepDesc[0].constraintUniqueIndices);
+    Ptr<uint2> solverConstantData = Ptr<uint2>(prepDesc[0].solverConstantData); // PxgSolverConstraintManagerConstants
+    Ptr<PxgTGSBlockSolverConstraint1DHeader> gJointHeaders =
+        Ptr<PxgTGSBlockSolverConstraint1DHeader>(sharedDesc[0].iter_blockJointConstraintHeaders);
+    Ptr<PxgTGSBlockSolverConstraint1DCon> gJointRowsCon =
+        Ptr<PxgTGSBlockSolverConstraint1DCon>(sharedDesc[0].iter_blockJointConstraintRowsCon);
 
-    const uint descStride = gBatches[batchIndex].descStride_constraintType & 0xFFFFu;
+    const uint batchIndex = batchIndices[i];
+
+    const uint descStride = batches[batchIndex].descStride_constraintType & 0xFFFFu;
     if (threadIndexInWarp >= descStride)
         return;
 
-    const uint bodyAIndex = gBatches[batchIndex].bodyAIndex[threadIndexInWarp];
-    const uint bodyBIndex = gBatches[batchIndex].bodyBIndex[threadIndexInWarp];
-    const uint descIndexBatch = gBatches[batchIndex].mConstraintBatchIndex;
+    const uint bodyAIndex = batches[batchIndex].bodyAIndex[threadIndexInWarp];
+    const uint bodyBIndex = batches[batchIndex].bodyBIndex[threadIndexInWarp];
+    const uint descIndexBatch = batches[batchIndex].mConstraintBatchIndex;
     const uint rowBase = descIndexBatch * MAX_CONSTRAINT_ROWS;
-    const uint outRowBase = gBatches[batchIndex].startConstraintIndex;
+    const uint outRowBase = batches[batchIndex].startConstraintIndex;
 
     const uint uniqueIndex =
-        gConstraintUniqueIndices[gBatches[batchIndex].mStartPartitionIndex + threadIndexInWarp];
+        constraintUniqueIndices[batches[batchIndex].mStartPartitionIndex + threadIndexInWarp];
 
-    const PxgSolverBodyData bodyData0 = gSolverBodyData[bodyAIndex];
-    const PxgSolverBodyData bodyData1 = gSolverBodyData[bodyBIndex];
+    const PxgSolverBodyData bodyData0 = solverBodyDatas[bodyAIndex];
+    const PxgSolverBodyData bodyData1 = solverBodyDatas[bodyBIndex];
 
-    const float stepDt = gParams.stepDt;
-    const float recipStepDt = gParams.invStepDt;
-    const float simDt = gParams.totalDt;
-    const float recipSimDt = gParams.invTotalDt;
-    const float lengthScale = gParams.lengthScale;
-    const float biasCoefficient = gParams.biasCoefficient;
+    // stepDt/stepInvDtF32/dt/invDtF32/lengthScale from the shared desc;
+    // biasCoefficient from the prepare desc (setupSolverConstraintBlockGPUTGS args)
+    const float stepDt = sharedDesc[0].stepDt;
+    const float recipStepDt = sharedDesc[0].stepInvDtF32;
+    const float simDt = sharedDesc[0].dt;
+    const float recipSimDt = sharedDesc[0].invDtF32;
+    const float lengthScale = sharedDesc[0].lengthScale;
+    const float biasCoefficient = prepDesc[0].biasCoefficient;
     const float erp = 0.5f * biasCoefficient;
 
     // ---- setupSolverConstraintBlockGPUTGS ----
@@ -1279,7 +1273,7 @@ void jointConstraintBlockPrepareParallelLaunchTGS(uint3 groupThreadId : SV_Group
     // register and store once at the end.
     uint rc_x = numRows & 0xFFu;
 
-    gJointHeaders[descIndexBatch].writeBackOffset[threadIndexInWarp] = gSolverConstantData[uniqueIndex].y;
+    gJointHeaders[descIndexBatch].writeBackOffset[threadIndexInWarp] = solverConstantData[uniqueIndex].y;
 
     const float4 lin0_ang0_lin1_ang1 = gJointData[descIndexBatch].mInvMassScale[threadIndexInWarp];
 
@@ -1326,11 +1320,12 @@ void jointConstraintBlockPrepareParallelLaunchTGS(uint3 groupThreadId : SV_Group
     float3 angSqrtInvInertia0[MAX_CONSTRAINT_ROWS];
     float3 angSqrtInvInertia1[MAX_CONSTRAINT_ROWS];
 
-    const PxgMat33 i0 = mat33Load(gTxIData[bodyAIndex].sqrtInvInertia);
-    const PxgMat33 i1 = mat33Load(gTxIData[bodyBIndex].sqrtInvInertia);
+    const PxgMat33 i0 = mat33Load(solverTxIDatas[bodyAIndex].sqrtInvInertia);
+    const PxgMat33 i1 = mat33Load(solverTxIDatas[bodyBIndex].sqrtInvInertia);
 
-    preprocessRows(sortedRowIndices, descIndexBatch, rowBase, angSqrtInvInertia0, angSqrtInvInertia1,
-                   lin0_ang0_lin1_ang1, initialLinVelXYZ_invMassW0.w, initialLinVelXYZ_invMassW1.w, i0, i1,
+    preprocessRows(gJointData, gJointVel, gJointPar, sortedRowIndices, descIndexBatch, rowBase,
+                   angSqrtInvInertia0, angSqrtInvInertia1, lin0_ang0_lin1_ang1,
+                   initialLinVelXYZ_invMassW0.w, initialLinVelXYZ_invMassW1.w, i0, i1,
                    threadIndexInWarp, disablePreprocessing);
 
     // ---- setUp1DConstraintBlockTGS ----
@@ -1375,7 +1370,8 @@ void jointConstraintBlockPrepareParallelLaunchTGS(uint3 groupThreadId : SV_Group
 
         const float minRowResponse = DY_MIN_RESPONSE;
 
-        eqCount += intializeBlock1DTGS(index, descIndexBatch, descIndexBatch, outRow,
+        eqCount += intializeBlock1DTGS(gJointVel, gJointPar, gJointData, gJointHeaders, gJointRowsCon, index,
+                                       descIndexBatch, descIndexBatch, outRow,
                                        jointSpeedForRestitutionBounce, initJointSpeed, unitResponse,
                                        minRowResponse, erp, lengthScale, stepDt, simDt, recipStepDt, recipSimDt,
                                        angSqrt0, angSqrt1, lin0_ang0_lin1_ang1.y, lin0_ang0_lin1_ang1.w, eqCount,
@@ -1383,7 +1379,7 @@ void jointConstraintBlockPrepareParallelLaunchTGS(uint3 groupThreadId : SV_Group
     }
 
     for (uint s = eqCount; s < 3; ++s)
-        setOrthoAxisZero(descIndexBatch, s, threadIndexInWarp);
+        setOrthoAxisZero(gJointHeaders, descIndexBatch, s, threadIndexInWarp);
 
     // store the assembled uchar4 rowCounts_breakable_orthoAxisCount
     const uint packed = (rc_x & 0xFFu) | ((rc_y & 0xFFu) << 8) | ((eqCount & 0xFFu) << 16);

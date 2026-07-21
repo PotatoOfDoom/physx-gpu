@@ -989,31 +989,82 @@ PXG_TEST(constraintPrepTGS_joint)
     std::memset(hdrs.data(), 0, hdrs.size() * sizeof(TGSJointHeader));
     std::memset(cons.data(), 0, cons.size() * sizeof(TGSJointRowCon));
 
-    PxgBufferHandle batchBuf = createBufferFrom(dev, js.batches);
-    PxgBufferHandle biBuf = createBufferFrom(dev, js.batchIndices);
-    PxgBufferHandle bdBuf = createBufferFrom(dev, js.bodyData);
-    PxgBufferHandle txBuf = createBufferFrom(dev, js.txi);
-    PxgBufferHandle jdBuf = createBufferFrom(dev, js.jdata);
-    PxgBufferHandle jvBuf = createBufferFrom(dev, js.jvel);
-    PxgBufferHandle jpBuf = createBufferFrom(dev, js.jpar);
-    PxgBufferHandle uiBuf = createBufferFrom(dev, js.uniqueIndices);
-    PxgBufferHandle scBuf = createBufferFrom(dev, js.constantData);
-    PxgBufferHandle hdrBuf = createBufferFrom(dev, hdrs);
-    PxgBufferHandle conBuf = createBufferFrom(dev, cons);
+    // ---- ENGINE ABI (P5 Step 5 tranche 13): live device buffers + REAL engine
+    // descriptors, launched through PxgCudaShim exactly as
+    // PxgTGSCudaSolverCore::jointConstraintPrepareParallel does ----
+    using namespace physx;
+    using physx::gpuslang::PxgCudaShim;
+    using physx::gpuslang::PxgKernelDef;
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
 
-    Kernel kern("constraintPrepTGS.spv", "jointConstraintBlockPrepareParallelLaunchTGS",
-                std::vector<uint32_t>(11, 4), sizeof(PrepParams));
+    static std::vector<uint8_t> (*tgsJointLoader)(const char*) = [](const char* f) { return loadShaderBlob(f); };
+    const PxgKernelDef manifest[] = {
+        { "constraintPrepTGS.spv", "jointConstraintBlockPrepareParallelLaunchTGS", 16u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, tgsJointLoader);
 
-    PrepParams p = {};
-    p.numBatches = js.numBatches;
-    p.dtOrStepDt = stepDt;
-    p.invDtOrStepInvDt = recipStepDt;
-    p.totalDt = simDt;
-    p.invTotalDt = recipSimDt;
-    p.lengthScale = lengthScale;
-    p.biasCoefficient = biasCoefficient;
-    kern.dispatch(js.numBatches, { batchBuf, biBuf, bdBuf, txBuf, jdBuf, jvBuf, jpBuf, uiBuf, scBuf, hdrBuf, conBuf }, p);
-    dev->flush();
+    auto alloc = [&](const void* data, size_t bytes) -> PxgDevicePtr {
+        PxgDevicePtr dp = 0;
+        shim.memAlloc(&dp, bytes);
+        if (dp && data)
+            shim.memcpyHtoD(dp, data, bytes);
+        return dp;
+    };
+
+    const PxgDevicePtr dBatches = alloc(js.batches.data(), js.batches.size() * sizeof(Batch));
+    const PxgDevicePtr dBi = alloc(js.batchIndices.data(), js.batchIndices.size() * 4);
+    const PxgDevicePtr dBd = alloc(js.bodyData.data(), js.bodyData.size() * sizeof(SolverBodyData));
+    const PxgDevicePtr dTx = alloc(js.txi.data(), js.txi.size() * sizeof(SolverTxIData));
+    const PxgDevicePtr dJd = alloc(js.jdata.data(), js.jdata.size() * sizeof(BlockConstraint1DData));
+    const PxgDevicePtr dJv = alloc(js.jvel.data(), js.jvel.size() * sizeof(BlockConstraint1DVelocities));
+    const PxgDevicePtr dJp = alloc(js.jpar.data(), js.jpar.size() * sizeof(BlockConstraint1DParameters));
+    const PxgDevicePtr dUi = alloc(js.uniqueIndices.data(), js.uniqueIndices.size() * 4);
+    const PxgDevicePtr dSc = alloc(js.constantData.data(), js.constantData.size() * 8);
+    const PxgDevicePtr dHdr = alloc(hdrs.data(), hdrs.size() * sizeof(TGSJointHeader));
+    const PxgDevicePtr dCon = alloc(cons.data(), cons.size() * sizeof(TGSJointRowCon));
+    if (!dBatches) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgConstraintPrepareDesc prepDesc;
+    std::memset(&prepDesc, 0xCD, sizeof(prepDesc)); // untouched fields must not matter
+    prepDesc.jointConstraintBatchIndices = reinterpret_cast<PxU32*>(dBi);
+    prepDesc.solverBodyDataPool = reinterpret_cast<PxgSolverBodyData*>(dBd);
+    prepDesc.solverBodyTxIDataPool = reinterpret_cast<PxgSolverTxIData*>(dTx);
+    prepDesc.blockJointPrepPool = reinterpret_cast<PxgBlockConstraint1DData*>(dJd);
+    prepDesc.blockJointPrepPool0 = reinterpret_cast<PxgBlockConstraint1DVelocities*>(dJv);
+    prepDesc.blockJointPrepPool1 = reinterpret_cast<PxgBlockConstraint1DParameters*>(dJp);
+    prepDesc.constraintUniqueIndices = reinterpret_cast<PxU32*>(dUi);
+    prepDesc.solverConstantData = reinterpret_cast<PxgSolverConstraintManagerConstants*>(dSc);
+    // split the on-device batch-count sum (num1dConstraintBatches +
+    // numStatic1dConstraintBatches) to pin the full expression
+    prepDesc.num1dConstraintBatches = js.numBatches - 1;
+    prepDesc.numStatic1dConstraintBatches = 1;
+    // TGS reads erp = 0.5 * biasCoefficient from the prepare desc
+    prepDesc.biasCoefficient = biasCoefficient;
+
+    PxgSolverSharedDesc<IterativeSolveDataTGS> sharedDesc;
+    std::memset(&sharedDesc, 0xCD, sizeof(sharedDesc));
+    sharedDesc.stepDt = stepDt;
+    sharedDesc.stepInvDtF32 = recipStepDt;
+    sharedDesc.dt = simDt;
+    sharedDesc.invDtF32 = recipSimDt;
+    sharedDesc.lengthScale = lengthScale;
+    sharedDesc.iterativeData.blockConstraintBatch = reinterpret_cast<PxgBlockConstraintBatch*>(dBatches);
+    sharedDesc.iterativeData.blockJointConstraintHeaders =
+        reinterpret_cast<PxgTGSBlockSolverConstraint1DHeader*>(dHdr);
+    sharedDesc.iterativeData.blockJointConstraintRowsCon =
+        reinterpret_cast<PxgTGSBlockSolverConstraint1DCon*>(dCon);
+
+    const PxgDevicePtr dPrepDesc = alloc(&prepDesc, sizeof(prepDesc));
+    const PxgDevicePtr dSharedDesc = alloc(&sharedDesc, sizeof(sharedDesc));
+
+    // engine launch: nbBlocks = ceil(nbJointBatches * 32 /
+    // CONSTRAINT_PREPARE_BLOCK_PARALLEL = 64) = 2 warps/block
+    const uint32_t nbBlocks = (js.numBatches * 32 + 63) / 64;
+    struct { uint64_t prepDesc, sharedDesc; } prm = { dPrepDesc, dSharedDesc };
+    PXG_CHECK_MSG(shim.launchKernel(0, nbBlocks, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch jointConstraintBlockPrepareParallelLaunchTGS");
+    shim.streamSynchronize();
 
     // ---- reference ----
     std::vector<BlockConstraint1DVelocities> refVel = js.jvel;
@@ -1036,10 +1087,14 @@ PXG_TEST(constraintPrepTGS_joint)
     }
 
     // ---- compare ----
-    const auto gHdr = downloadBuffer<TGSJointHeader>(dev, hdrBuf, hdrs.size());
-    const auto gCon = downloadBuffer<TGSJointRowCon>(dev, conBuf, cons.size());
-    const auto gVel = downloadBuffer<BlockConstraint1DVelocities>(dev, jvBuf, js.jvel.size());
-    const auto gPar = downloadBuffer<BlockConstraint1DParameters>(dev, jpBuf, js.jpar.size());
+    std::vector<TGSJointHeader> gHdr(hdrs.size());
+    std::vector<TGSJointRowCon> gCon(cons.size());
+    std::vector<BlockConstraint1DVelocities> gVel(js.jvel.size());
+    std::vector<BlockConstraint1DParameters> gPar(js.jpar.size());
+    shim.memcpyDtoH(gHdr.data(), dHdr, gHdr.size() * sizeof(TGSJointHeader));
+    shim.memcpyDtoH(gCon.data(), dCon, gCon.size() * sizeof(TGSJointRowCon));
+    shim.memcpyDtoH(gVel.data(), dJv, gVel.size() * sizeof(BlockConstraint1DVelocities));
+    shim.memcpyDtoH(gPar.data(), dJp, gPar.size() * sizeof(BlockConstraint1DParameters));
 
     size_t mism = 0;
     for (uint32_t k = 0; k < js.numBatches && mism < 12; ++k)
@@ -1100,8 +1155,9 @@ PXG_TEST(constraintPrepTGS_joint)
         }
     PXG_CHECK_MSG(mism == 0, "%zu TGS orthogonalize/hint mismatches", mism);
 
-    for (PxgBufferHandle h : { batchBuf, biBuf, bdBuf, txBuf, jdBuf, jvBuf, jpBuf, uiBuf, scBuf, hdrBuf, conBuf })
-        dev->destroyBuffer(h);
+    for (PxgDevicePtr pfree : { dBatches, dBi, dBd, dTx, dJd, dJv, dJp, dUi, dSc, dHdr, dCon,
+                                dPrepDesc, dSharedDesc })
+        shim.memFree(pfree);
 }
 
 // Exercises the getFrictionPatches() previous-frame anchor carry-over path,

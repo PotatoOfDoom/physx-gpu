@@ -106,7 +106,40 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
-## P5 Step 5 — a jointed scene holds on the GPU (PGS); TGS joint-prep is the one remaining gap
+## P5 Step 5 — MILESTONE COMPLETE: all eight common rigid scenes hold on BOTH solvers
+
+Tranche 13 converted the last bound-buffer kernel in the joint path —
+`jointConstraintBlockPrepareParallelLaunchTGS` — to the BDA engine ABI
+(ABI `{8,8}` = `kTwoPtr`, mirroring the same-file contact-TGS twin and the
+tranche-9 PGS joint twin; the joint port reads stepDt/stepInvDt/dt/invDt/
+lengthScale from the shared desc and `erp = 0.5 * biasCoefficient` from the
+prepare desc; `orthogonalize`/`preprocessRows` inertia reads plumbed through
+`solverBodyTxIDataPool`).  The kernel was already mapped; only the ABI row was
+missing (tranche 12 had deliberately left it out so the un-converted kernel
+refused cleanly instead of crashing).
+
+**`PXG_SCENE=joint PXG_SOLVER=tgs` now HOLDS at y=3.000, |v|=0.000, exit 0,
+ZERO refused launches** (was 240 refusals/step + fall-through to y=-75).
+
+**The common-rigid-scene milestone is COMPLETE: all eight scenes — box, stack
+(3 dynamic boxes), sphere, plane, capsule, capsule-on-box, convex-mesh, and a
+D6-jointed box — fall/hold and REST on the Slang/Vulkan (llvmpipe) GPU pipeline
+under BOTH solvers (TGS + PGS): 16/16 scene×solver combinations, each `exit 0`
+with ZERO refused kernel launches.**  Suite 664/664 both memory modes;
+`PXG_SLANG_KERNEL_MAPPED = 152`.
+
+Coverage now spans all four PhysX rigid primitives (box/sphere/capsule/plane),
+convex meshes, primitive-vs-primitive + convex-convex GJK/EPA narrowphase,
+box-plane, both TGS and PGS solver cores incl. static-block + mass-splitting
+reference counts, and D6 joints — the full common-rigid-body pipeline.
+
+Explicitly out of this milestone (documented deferrals): force-threshold
+reporting (RADIXSORT_SINGLEBLOCK/CALCULATERANKS + the threshold group),
+convex-vs-trimesh / heightfield contact pipelines, and all articulation /
+deformable / particle paths (Phase-1 math ported + unit-tested, Phase-2 runtime
+not started — 0/56 softbody, 0/65 particle, 0/57 cloth kernels mapped).
+
+## P5 Step 5 — earlier: a jointed scene holds on the GPU (PGS); TGS joint-prep was the one remaining gap
 
 Tranche 12 brought up the D6-joint data-prep on the engine ABI:
 `constraint1DPrePrepLaunch` (the last unmapped joint kernel; ABI `{8,8}`,

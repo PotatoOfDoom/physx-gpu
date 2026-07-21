@@ -307,14 +307,13 @@ static const PxgKernelAbiRow kRows[] = {
     { "contactConstraintBlockPrepareParallelLaunchTGS", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "contactConstraintBlockPrepareParallelLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "jointConstraintBlockPrepareParallelLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
-    // NOTE: jointConstraintBlockPrepareParallelLaunchTGS is deliberately WITHOUT an
-    // ABI row.  Unlike its PGS twin (BDA-converted) it is still in BOUND-BUFFER form
-    // (bindings 0-10 + a PrepParams push constant) pending its own BDA conversion —
-    // see constraintPrepTGS.slang:53-54.  Giving it a {8,8} row would make the engine
-    // launch it via the pointer-pack ABI against unbound buffers + a truncated push
-    // constant, which GPU-faults.  Leaving it un-rowed keeps the clean InvalidValue
-    // refusal until the kernel is converted; the TGS jointed scene is blocked on that
-    // (P5 Step 5 tranche 12 — the PGS jointed scene fully steps).
+    // jointConstraintBlockPrepareParallelLaunchTGS (P5 Step 5 tranche 13 BDA):
+    // now converted to the engine ABI, taking the same
+    // (PxgConstraintPrepareDesc*, PxgSolverSharedDesc<IterativeSolveDataTGS>*)
+    // pointer pack as its PGS twin and the TGS contact prep
+    // (PxgTGSCudaSolverCore::jointConstraintPrepareParallel L933-949), so it
+    // gets the {8,8} kTwoPtr row.  This unblocks the TGS jointed scene.
+    { "jointConstraintBlockPrepareParallelLaunchTGS", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     // gpunarrowphase convex-convex core + contact-stream compress (P5 Step 4 BDA)
     { "convexConvexNphase_stage1Kernel", kCvxStage1, uint32_t(sizeof(kCvxStage1)) },
     { "convexConvexNphase_stage2Kernel", kCvxStage2, uint32_t(sizeof(kCvxStage2)) },
