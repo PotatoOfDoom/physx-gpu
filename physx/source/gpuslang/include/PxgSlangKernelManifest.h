@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 156;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 160;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -190,8 +190,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "radixSortMultiCalculateRanksLaunch", nullptr, nullptr },  // RS_CALCULATERANKS_MULTIBLOCK (unmapped)
     { "radixSortMultiBlockLaunchWithCount", "radixSortDesc.spv", "radixSortMultiBlockLaunchWithCount" },  // RS_MULTIBLOCK_COUNT (P5 Step 4 BDA port)
     { "radixSortMultiCalculateRanksLaunchWithCount", "radixSortDesc.spv", "radixSortMultiCalculateRanksLaunchWithCount" },  // RS_CALCULATERANKS_MULTIBLOCK_COUNT (P5 Step 4 BDA port)
-    { "radixSortMultiBlockLaunchWithoutCount", nullptr, nullptr },  // RS_MULTIBLOCK_NO_COUNT (unmapped)
-    { "radixSortMultiCalculateRanksLaunchWithoutCount", nullptr, nullptr },  // RS_CALCULATERANKS_MULTIBLOCK_NO_COUNT (unmapped)
+    { "radixSortMultiBlockLaunchWithoutCount", "radixSortDesc.spv", "radixSortMultiBlockLaunchWithoutCount" },  // RS_MULTIBLOCK_NO_COUNT (P6.2 BDA port)
+    { "radixSortMultiCalculateRanksLaunchWithoutCount", "radixSortDesc.spv", "radixSortMultiCalculateRanksLaunchWithoutCount" },  // RS_CALCULATERANKS_MULTIBLOCK_NO_COUNT (P6.2 BDA port)
     { "radixSortCopyHigh32Bits", "radixSort64.spv", "radixSortCopyHigh32Bits" },  // RS_COPY_HIGH_32BITS
     { "radixSortDoubleCopyHigh32Bits", "particleContactSortBda.spv", "radixSortDoubleCopyHigh32Bits" },  // RS_DOUBLE_COPY_HIGH_32BITS2 (P6.1 BDA re-point)
     { "radixSortCopy", "radixSortGather.spv", "radixSortCopy" },  // RS_COPY_VALUE
@@ -215,9 +215,9 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_preDiffuseIntegrateLaunch", nullptr, nullptr },  // PS_PRE_DIFFUSE_INTEGRATION (unmapped)
     { "ps_updateBoundFirstPassLaunch", nullptr, nullptr },  // PS_UPDATE_BOUND_FRIST (unmapped)
     { "ps_updateBoundSecondPassLaunch", nullptr, nullptr },  // PS_UPDATE_BOUND_SECOND (unmapped)
-    { "ps_calculateHashLaunch", nullptr, nullptr },  // PS_CALCULATE_HASH (unmapped)
+    { "ps_calculateHashLaunch", "particleGridBda.spv", "ps_calculateHashLaunch" },  // PS_CALCULATE_HASH (P6.2 BDA port: grid-cell hash + identity seed)
     { "ps_calculateHashForDiffuseParticlesLaunch", nullptr, nullptr },  // PS_CALCULATE_HASH_FOR_DIFFUSE_PARTICLES (unmapped)
-    { "ps_reorderDataAndFindCellStartLaunch", nullptr, nullptr },  // PS_REORDER_PARTICLE_FIND_CELLSTARTEND (unmapped)
+    { "ps_reorderDataAndFindCellStartLaunch", "particleGridBda.spv", "ps_reorderDataAndFindCellStartLaunch" },  // PS_REORDER_PARTICLE_FIND_CELLSTARTEND (P6.2 BDA port: gather + cell start/end)
     { "ps_selfCollisionLaunch", nullptr, nullptr },  // PS_PARTICLE_SELF_COLLISION (unmapped)
     { "ps_primitivesBoundFirstPassLaunch", nullptr, nullptr },  // PS_PRIMITIVES_BOUND_FIRST (unmapped)
     { "ps_primitivesBoundSecondPassLaunch", nullptr, nullptr },  // PS_PRIMITIVES_BOUND_SECOND (unmapped)

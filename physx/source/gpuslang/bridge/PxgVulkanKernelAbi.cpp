@@ -240,6 +240,25 @@ static const uint8_t kPsUpdateUserBuffer[] = { 8, 8, 4 };
 //     Two device pointers -> 16-byte blob (same shape as kTwoPtr).
 static const uint8_t kPsUpdateUnsorted[] = { 8, 8 };
 
+// gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
+//   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
+//     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
+//   Launch site PxgParticleSystemCore.cpp:636 packs two device pointers
+//   { particleSystemsd, activeParticleSystemsd } -> 16-byte blob.
+static const uint8_t kPsCalcHash[] = { 8, 8 };
+//   ps_reorderDataAndFindCellStartLaunch(const PxgParticleSystem* particleSystems,
+//     const PxU32 id) — gather + cell start/end.  Launch site
+//   PxgParticleSystemCore.cpp:681 packs { particleSystemsd, id } (pointer +
+//   PxU32 by value) -> {8,4} = 12, rounded to the 8-alignment -> 16-byte blob.
+static const uint8_t kPsReorder[] = { 8, 4 };
+
+// gpucommon/src/CUDA/radixSortImpl.cu (P6.2 grid radix sort):
+//   radixSortMultiBlockLaunchWithoutCount(PxgRadixSortDesc* desc, PxU32 startBit)
+//   / radixSortMultiCalculateRanksLaunchWithoutCount(same ABI) — the numKeys
+//   push param the WithCount twins carry is dropped (sourced from desc.count),
+//   leaving a device pointer + PxU32 -> {8,4} = 16-byte blob.
+static const uint8_t kRadixDescNoCount[] = { 8, 4 };
+
 // gpucommon/src/CUDA/radixSortImpl.cu (P6.1 particle contact-sort BDA):
 //   radixSortDoubleCopy(const PxU64* inValue0, PxU64* outValue0, PxU32* rank0,
 //     const PxU64* inValue1, PxU64* outValue1, PxU32* rank1, const PxU32* numKeys)
@@ -362,6 +381,12 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_preIntegrateLaunch", kPsPreIntegrate, uint32_t(sizeof(kPsPreIntegrate)) },
     { "ps_integrateLaunch", kPsIntegrate, uint32_t(sizeof(kPsIntegrate)) },
     { "ps_updateUserBufferLaunch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
+    // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
+    { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
+    { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },
+    // gpucommon radixSortImpl.cu:69 / :81 — the WithoutCount radix twins (P6.2 BDA)
+    { "radixSortMultiBlockLaunchWithoutCount", kRadixDescNoCount, uint32_t(sizeof(kRadixDescNoCount)) },
+    { "radixSortMultiCalculateRanksLaunchWithoutCount", kRadixDescNoCount, uint32_t(sizeof(kRadixDescNoCount)) },
     // gpucommon particle contact-sort kernels (P6.1 BDA)
     // radixSortImpl.cu:187 / :139 — the twin rank-indexed gathers share the pack.
     { "radixSortDoubleCopy", kRadixDoubleCopy, uint32_t(sizeof(kRadixDoubleCopy)) },

@@ -106,6 +106,50 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
+## P6.2 — particle grid build + reorder on the engine ABI (spatial hash → sort → cell start/end)
+
+Brought the particle grid-build stage onto the BDA engine ABI — the spatial-hash /
+radix-sort / reorder trio that is the hard prerequisite for particle self-collision.
+Four kernels, all previously UNMAPPED (`nullptr` in the manifest → "Could not find
+registered CUDA function" at runtime, so the engine's `updateGrid()` silently no-op'd):
+- `radixSortMultiBlockLaunchWithoutCount` / `radixSortMultiCalculateRanksLaunchWithoutCount`
+  (`radixSortImpl.cu:69`/`:81`, ABI `{8,4}`) — the previously un-authored WithoutCount
+  radix twins. They turned out to be the already-proven WithCount BDA entrypoints
+  (`radixSortDesc.slang`) with `numKeys` sourced from `desc.count` (offset-40 field of
+  `PxgRadixSortDescGpu`) instead of a push param; bodies copied verbatim, WithCount
+  entrypoints left byte-untouched.
+- `ps_calculateHashLaunch` (`particlesystem.cu:803`, ABI `{8,8}`) — grid-cell hash per
+  particle + identity sorted↔unsorted seed.
+- `ps_reorderDataAndFindCellStartLaunch` (`particlesystem.cu:898`, ABI `{8,4}`,
+  `__launch_bounds__(1024)`) — gather sorted arrays via the permutation + groupshared
+  cell-boundary scan producing `mCellStart`/`mCellEnd`.
+Both grid kernels REUSE the P6.0 `PxgParticleSystemGpu` mirror unchanged (every field
+they touch was already present — pinned via `offsetof` static checks:
+`mGridParticleHash@144`, `mCellStart@168`/`mCellEnd@176`, `mGridCellWidth@88`,
+`mUnsortedToSortedMapping@48`/`mSortedToUnsortedMapping@56`). `calcGridHash`'s
+`int & uint` wrap reproduced with `asuint(int) & (uint)`; the CUDA descriptor blockCopy
+replaced by direct `Ptr<>` field loads (semantically identical).
+
+**`PXG_SCENE=particle` trace: all 4 dispatch OK every frame** (`ps_calculateHashLaunch`
+×120, `ps_reorderDataAndFindCellStartLaunch` ×120, the two WithoutCount radix ×960 each,
+zero REFUSED). The grid is now correctly built on-device; **the free-fall is byte-identical
+to the P6.1 baseline (PGS 80.9665, TGS drops 9.89m)** — the reorder→integrate round-trip
+is an identity on the contact-free path, so the port is provably trajectory-neutral (grid
+feeds self-collision, still unmapped). New unit test `gpuslang.particleGrid` (radix
+WithoutCount 8-pass bit-exact; calculateHash vs CPU incl. negative-coord wrap; reorder +
+cellStart/cellEnd) passes both modes. Suite **667/667** both memory modes (the lone -j4
+`scan`/`npRigidSumBatches` SEGFAULTs are the known flakes; pass isolated).
+`PXG_SLANG_KERNEL_MAPPED` 156 → **160**. Rigid regression 8×2 = **16/16** — the shared
+`radixSortDesc` module change (WithCount untouched) leaves the rigid broadphase
+byte-unaffected.
+
+P6.3 frontier (now the blocking failures, reached on valid grid data): the plain
+count-via-pointer `radixSortMultiBlockLaunch`/`radixSortMultiCalculateRanksLaunch`
+(contact sort) + `ps_reorderPrimitiveContactsLaunch`, and upstream the self-collision
+contact-gen/solve chain (`ps_selfCollisionLaunch`, `ps_primitivesBound*`,
+`ps_primitivesCollisionLaunch`, `ps_contactPrepareLaunch`, `ps_solvePCOutputParticleDeltaVLaunch`,
+`ps_findStartEndParticle*`, `ps_accumulateDeltaVParticleLaunch`, `ps_updateParticleLaunch`).
+
 ## P6.1 — particle contact-sort kernels on the engine ABI (stage-7 sort BDA-rewritten)
 
 Brought the three particle contact-sort kernels onto the BDA engine ABI. They were
