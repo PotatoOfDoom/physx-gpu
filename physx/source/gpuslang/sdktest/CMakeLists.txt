@@ -38,6 +38,18 @@ list(FILTER SDK_SRC EXCLUDE REGEX "windows")
 # / the g_* pointers), so the CPU-only sdk-step is unaffected by the exclusion.
 list(FILTER SDK_SRC EXCLUDE REGEX "/gpu/PxGpu.cpp")
 
+# physxextensions is otherwise omitted (the SDK_SRC GLOB above skips it), but the
+# jointed GPU scene (PXG_SCENE=joint in testGpuSdkStep.cpp) needs PxD6JointCreate
+# and the D6 joint runtime.  Add the MINIMAL joint translation units only —
+# ExtJoint.cpp (the base joint + createJointT template home) and ExtD6Joint.cpp
+# (PxD6JointCreate + the D6 joint shader table) — NOT the whole extensions tree,
+# which drags in serialization / omnipvd / metadata / cooking-heavy TUs that do
+# not build no-toolkit.  These two only include ExtJoint.h + the omnipvd shim
+# (PX_SUPPORT_OMNI_PVD-guarded, a no-op here), so they self-contain.
+list(APPEND SDK_SRC
+    ${SRC}/physxextensions/src/ExtJoint.cpp
+    ${SRC}/physxextensions/src/ExtD6Joint.cpp)
+
 add_library(physx-sdk STATIC ${SDK_SRC})
 target_compile_definitions(physx-sdk PUBLIC PX_PHYSX_STATIC_LIB PXG_NO_CUDA_TOOLKIT PX_PUBLIC_RELEASE=1)
 target_compile_options(physx-sdk PRIVATE -w -fno-strict-aliasing)

@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 150;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 152;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -26,7 +26,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "updateBodiesLaunchDirectAPI", "bodyUpdate.spv", "updateBodiesLaunchDirectAPI" },  // UPDATE_BODIES_DIRECT_API
     { "newArticulationsLaunch", nullptr, nullptr },  // NEW_ARTICULATIONS (unmapped)
     { "updateArticulationsLaunch", nullptr, nullptr },  // UPDATE_ARTICULATIONS (unmapped)
-    { "updateJointsLaunch", nullptr, nullptr },  // UPDATE_JOINTS (unmapped)
+    { "updateJointsLaunch", "bodyUpdate.spv", "updateJointsLaunch" },  // UPDATE_JOINTS (P5 Step 5 BDA port)
     { "updateTransformCacheAndBoundArrayLaunch", "updateBounds.spv", "updateTransformCacheAndBoundArrayLaunch" },  // UPDATE_TRANSFORMCACHE_AND_BOUNDARRAY
     { "mergeTransformCacheAndBoundArrayChanges", nullptr, nullptr },  // MERGE_TRANSFORMCACHE_AND_BOUNDARRAY_CHANGES (unmapped)
     { "updateChangedAABBMgrHandlesLaunch", "updateBounds.spv", "updateChangedAABBMgrHandlesLaunch" },  // UPDATE_AABBMGR_HANDLES (P5 Step 4 BDA)
@@ -103,7 +103,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "updateFrictionPatches", "npCompressContacts.spv", "updateFrictionPatches" },  // UPDATE_FRICTION_PATCHES
     { "preIntegrationLaunch", "preIntegration.spv", "preIntegrationLaunch" },  // PRE_INTEGRATION
     { "constraintContactBlockPrePrepLaunch", "npContactPrePrep.spv", "constraintContactBlockPrePrepLaunch" },  // CONTACT_CONSTRAINT_PREPREP_BLOCK (P5 Step 4 BDA port)
-    { "constraint1DPrePrepLaunch", nullptr, nullptr },  // JOINT_CONSTRAINT_PREPREP (unmapped)
+    { "constraint1DPrePrepLaunch", "npD6JointPrep.spv", "constraint1DPrePrepLaunch" },  // JOINT_CONSTRAINT_PREPREP (P5 Step 5 BDA port)
     { "constraint1DBlockPrePrepLaunch", "npContactPrePrep.spv", "constraint1DBlockPrePrepLaunch" },  // JOINT_CONSTRAINT_PREPREP_BLOCK (P5 Step 5 BDA port)
     { "jointConstraintBlockPrepareParallelLaunch", "constraintPrepPGS.spv", "jointConstraintBlockPrepareParallelLaunch" },  // JOINT_CONSTRAINT_PREPARE_BLOCK_PARALLEL
     { "contactConstraintBlockPrepareParallelLaunch", "constraintPrepPGS.spv", "contactConstraintBlockPrepareParallelLaunch" },  // CONTACT_CONSTRAINT_PREPARE_BLOCK_PARALLEL

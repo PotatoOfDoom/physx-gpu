@@ -329,3 +329,86 @@ void updateBodyExternalVelocitiesLaunch(uint3 dispatchThreadId : SV_DispatchThre
     storeFloat4(gBodySimPool, dstBase + W_EXTERNAL_ACCEL, loadFloat4(gNewData, srcBase + 8));
     storeFloat4(gBodySimPool, dstBase + W_EXTERNAL_ACCEL + 4, loadFloat4(gNewData, srcBase + 12));
 }
+
+// ---------------------------------------------------------------------------
+// updateJointsLaunch (P5 Step 5 BDA engine ABI)
+// ---------------------------------------------------------------------------
+// Port of updateJointsLaunch() in updateBodiesAndShapes.cu L931 — the per-joint
+// scatter that copies newly added / changed D6 joints from the CPU-mapped
+// (PxPinnedArray) joint pools to the GPU device pools.  Without it the GPU joint
+// buffers stay unpopulated (0xFFFFFFFF), so the D6 data-prep + block-prepare read
+// garbage; it is the upstream producer that makes a JOINTED scene step (P5 Step 5
+// tranche 12).  Launched from PxgSimulationCore::updateJoints whenever there are
+// dirty rigid/arti joints: grid = (ceil(maxUpdatedJoints/8), 2, 1), block =
+// (32, 8, 1) — blockIdx.y selects rigid (0) vs articulation (1).  One warp copies
+// one joint; the copy is a pure byte scatter (no arithmetic), so the strided
+// per-lane loop below is byte-identical to the CUDA warpCopy.
+//
+// Engine launch pack: a single (const PxgUpdatedJointsDesc*) -> {8}.  The arti
+// branch (blockIdx.y == 1) is a documented DEFERRED no-op, mirroring every other
+// articulation path in the port.
+static const uint PXG_D6_JOINT_DATA_WORDS = 112u;      // sizeof(PxgD6JointData) / 4 = 448/4
+static const uint PXG_CONSTRAINT_PREPREP_WORDS = 8u;   // sizeof(PxgConstraintPrePrep) / 4 = 32/4
+
+// mirrors PxgUpdatedJointsDesc (PxgSimulationCoreDesc.h L323), 96 bytes
+struct PxgUpdatedJointsDescGpu
+{
+    uint64_t mD6RigidJointCPUPool;         // @0   const PxgD6JointData*  (pinned/mapped)
+    uint64_t mD6RigidJointGPUPool;         // @8   PxgD6JointData*        (device)
+    uint64_t mD6RigidJointPrePrepCPUPool;  // @16  const PxgConstraintPrePrep*
+    uint64_t mD6RigidJointPrePrepGPUPool;  // @24  PxgConstraintPrePrep*
+    uint64_t mD6ArtiJointCPUPool;          // @32
+    uint64_t mD6ArtiJointGPUPool;          // @40
+    uint64_t mD6ArtiJointPrePrepCPUPool;   // @48
+    uint64_t mD6ArtiJointPrePrepGPUPool;   // @56
+    uint64_t mUpdatedRigidJointIndices;    // @64  const PxU32*           (pinned/mapped)
+    uint mNbUpdatedRigidJoints;            // @72
+    uint pad0;                             // @76  (8-align)
+    uint64_t mUpdatedArtiJointIndices;     // @80
+    uint mNbUpdatedArtiJoints;             // @88
+    uint pad1;                             // @92 -> size 96
+}
+
+struct UpdateJointsAbiParams
+{
+    uint64_t jointDesc; // @0 const PxgUpdatedJointsDesc*
+}
+
+[[vk::push_constant]]
+ConstantBuffer<UpdateJointsAbiParams> gUpdateJointsAbi;
+
+[shader("compute")]
+[numthreads(32, 8, 1)]
+void updateJointsLaunch(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    if (gUpdateJointsAbi.jointDesc == 0)
+        return;
+
+    // articulation branch (blockIdx.y == 1): DEFERRED no-op.
+    if (groupId.y != 0u)
+        return;
+
+    Ptr<PxgUpdatedJointsDescGpu> desc = Ptr<PxgUpdatedJointsDescGpu>(gUpdateJointsAbi.jointDesc);
+
+    const uint nbUpdatedJoints = desc[0].mNbUpdatedRigidJoints;
+    const uint lane = groupThreadId.x;                                  // threadIdx.x (0..31)
+    const uint globalWarpIndex = groupId.x * 8u + groupThreadId.y;      // blockIdx.x*blockDim.y + threadIdx.y
+
+    if (globalWarpIndex >= nbUpdatedJoints)
+        return;
+
+    Ptr<uint> updateJointIndices = Ptr<uint>(desc[0].mUpdatedRigidJointIndices);
+    const uint jointIndex = updateJointIndices[globalWarpIndex];
+
+    // PxgD6JointData scatter: 448 bytes = 112 uints, strided across the 32 lanes.
+    Ptr<uint> srcJoint = Ptr<uint>(desc[0].mD6RigidJointCPUPool + uint64_t(jointIndex) * 448);
+    Ptr<uint> dstJoint = Ptr<uint>(desc[0].mD6RigidJointGPUPool + uint64_t(jointIndex) * 448);
+    for (uint u = lane; u < PXG_D6_JOINT_DATA_WORDS; u += 32u)
+        dstJoint[u] = srcJoint[u];
+
+    // PxgConstraintPrePrep scatter: 32 bytes = 8 uints.
+    Ptr<uint> srcPP = Ptr<uint>(desc[0].mD6RigidJointPrePrepCPUPool + uint64_t(jointIndex) * 32);
+    Ptr<uint> dstPP = Ptr<uint>(desc[0].mD6RigidJointPrePrepGPUPool + uint64_t(jointIndex) * 32);
+    for (uint u = lane; u < PXG_CONSTRAINT_PREPREP_WORDS; u += 32u)
+        dstPP[u] = srcPP[u];
+}

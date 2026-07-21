@@ -38,6 +38,14 @@
 // trig-unstable class).
 
 #include "pxgTestFramework.h"
+#include "PxgCudaShim.h"
+
+#include "PxNodeIndex.h"
+#include "PxgSolverCoreDesc.h"      // PxgPrePrepDesc, PxgSolverSharedDesc, IterativeSolveData
+#include "PxgSolverConstraintDesc.h"
+#include "PxgConstraintPrep.h"      // PxgConstraintData, PxgConstraintPrePrep, PxgD6JointData
+#include "PxgSolverBody.h"          // PxgSolverBodyData
+#include "PxConstraintDesc.h"       // Px1DConstraint
 
 #include <cfloat>
 #include <cmath>
@@ -1189,6 +1197,358 @@ PXG_TEST(npD6JointPrep_c1dPrePrep)
                   cRun, cDis, cRem, cExtF, cTrig);
 
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
+}
+
+// ---------------------------------------------------------------------------
+// constraint1DPrePrepLaunch on the ENGINE ABI (constraintBlockPrePrep.cu L1168)
+// ---------------------------------------------------------------------------
+// The full per-joint kernel driven exactly as PxgSolverCore::constraintPrePrep-
+// Parallel launches it: REAL PxgD6JointData / PxgConstraintPrePrep /
+// PxgSolverBodyData device arrays reached through a live PxgPrePrepDesc, params
+// { PxgPrePrepDesc*, PxgSolverSharedDesc<IterativeSolveData>* } -> {8,8}, grid =
+// ceil(nbD6Joints / 128), block 128, thread-per-joint.  The GPU builds its D6In
+// from the real PxgD6JointData mirror (pinning every field offset end-to-end);
+// the reference reuses the proven d6ref::solverPrep on the same fixture.  Rigid
+// joints only (the arti branch is a documented deferred no-op).
+
+using namespace physx;
+
+// materialise a random D6In fixture into the REAL PxgD6JointData struct.  The
+// two body poses (bA2w/bB2w) do NOT live here — they come from the solver-body
+// data — so this stores only the joint-frame / limit / drive / bitmap fields.
+static void materializeJointData(const D6In& s, PxgD6JointData& d)
+{
+    std::memset(&d, 0, sizeof(d));
+    d.invMassScale.linear0 = 1.0f + 0.1f * s.linXP.x;   // arbitrary known values;
+    d.invMassScale.angular0 = 1.0f + 0.1f * s.linXP.y;  // passed through verbatim
+    d.invMassScale.linear1 = 1.0f + 0.1f * s.linYP.x;
+    d.invMassScale.angular1 = 1.0f + 0.1f * s.linYP.y;
+
+    d.c2b[0].q = PxQuat(s.c2bAq.x, s.c2bAq.y, s.c2bAq.z, s.c2bAq.w);
+    d.c2b[0].p = PxVec3(s.c2bAp.x, s.c2bAp.y, s.c2bAp.z);
+    d.c2b[1].q = PxQuat(s.c2bBq.x, s.c2bBq.y, s.c2bBq.z, s.c2bBq.w);
+    d.c2b[1].p = PxVec3(s.c2bBp.x, s.c2bBp.y, s.c2bBp.z);
+
+    auto setParams = [](PxgJointLimitParameters& p, const F4& lp) {
+        p.restitution = lp.x; p.bounceThreshold = lp.y; p.stiffness = lp.z; p.damping = lp.w;
+    };
+    setParams(d.distanceLimit, s.distP);   d.distanceLimit.value = s.distV.x;
+    setParams(d.linearLimitX, s.linXP);    d.linearLimitX.upper = s.linXV.x; d.linearLimitX.lower = s.linXV.y;
+    setParams(d.linearLimitY, s.linYP);    d.linearLimitY.upper = s.linYV.x; d.linearLimitY.lower = s.linYV.y;
+    setParams(d.linearLimitZ, s.linZP);    d.linearLimitZ.upper = s.linZV.x; d.linearLimitZ.lower = s.linZV.y;
+    setParams(d.twistLimit, s.twistP);     d.twistLimit.upper = s.twistV.x; d.twistLimit.lower = s.twistV.y;
+    setParams(d.swingLimit, s.swingP);     d.swingLimit.yAngle = s.swingV.x; d.swingLimit.zAngle = s.swingV.y;
+    setParams(d.pyramidSwingLimit, s.pyrP);
+    d.pyramidSwingLimit.yAngleMin = s.pyrV.x; d.pyramidSwingLimit.yAngleMax = s.pyrV.y;
+    d.pyramidSwingLimit.zAngleMin = s.pyrV.z; d.pyramidSwingLimit.zAngleMax = s.pyrV.w;
+
+    for (int k = 0; k < 6; ++k)
+    {
+        d.drive[k].stiffness = s.drives[k].x;
+        d.drive[k].damping = s.drives[k].y;
+        d.drive[k].forceLimit = s.drives[k].z;
+        d.drive[k].flags = PxgD6JointDriveFlags(PxgD6JointDriveFlag::Enum(f2u(s.drives[k].w)));
+    }
+
+    d.drivePosition.q = PxQuat(s.drvPq.x, s.drvPq.y, s.drvPq.z, s.drvPq.w);
+    d.drivePosition.p = PxVec3(s.drvPp.x, s.drvPp.y, s.drvPp.z);
+    d.driveLinearVelocity = PxVec3(s.linVel.x, s.linVel.y, s.linVel.z);
+    d.driveAngularVelocity = PxVec3(s.angVel.x, s.angVel.y, s.angVel.z);
+
+    d.locked = f2u(s.bA2wp.w);
+    d.limited = f2u(s.bB2wp.w);
+    d.driving = f2u(s.drvPp.w);
+    d.distanceMinDist = s.linVel.w;
+
+    const uint32_t useBits = f2u(s.c2bBp.w);
+    d.mUseDistanceLimit = (useBits & 1u) != 0;
+    d.mUseNewLinearLimits = (useBits & 2u) != 0;
+    d.mUseConeLimit = (useBits & 4u) != 0;
+    d.mUsePyramidLimits = (useBits & 8u) != 0;
+    d.angularDriveConfig = 0;
+    for (int a = 0; a < 6; ++a) d.motion[a] = PxgD6Motion::eLOCKED;   // unread by the kernel
+}
+
+static std::vector<uint8_t> d6ShimLoader(const char* file) { return pxgtest::loadShaderBlob(file); }
+
+PXG_TEST(npD6JointPrep_engineKernel)
+{
+    std::mt19937 rng(175701);
+    const uint32_t N = 1500;                              // rigid joints
+    const uint32_t F_EXT = 1u << 9, F_DISABLE = 1u << 12; // PxConstraintFlag
+    const uint32_t PX_INVALID = 0xFFFFFFFFu;
+    const uint32_t MAX_ROWS_PER_JOINT = 20;               // Dy::MAX_CONSTRAINT_ROWS
+
+    // static anchor (solver body 0, referenced by every PX_INVALID node)
+    const PxTransform anchor(PxVec3(0.3f, -0.7f, 1.1f), PxQuat(0.1f, 0.2f, 0.3f, 0.927f).getNormalized());
+
+    const uint32_t numNodes = 2 * N + 2;    // node 0 unused; joints use 1..2N
+    const uint32_t numBodies = numNodes;    // identity solverBodyIndices
+
+    std::vector<PxgD6JointData> jointData(N);
+    std::vector<PxgConstraintPrePrep> prePrep(N);
+    std::vector<PxgSolverBodyData> bodyData(numBodies);
+    std::memset(bodyData.data(), 0, bodyData.size() * sizeof(PxgSolverBodyData));
+    bodyData[0].body2World = PxAlignedTransform(anchor);
+    std::vector<uint32_t> solverBodyIndices(numNodes);
+    for (uint32_t k = 0; k < numNodes; ++k) solverBodyIndices[k] = k;
+
+    // references
+    std::vector<D6Out> ref(N);
+    std::vector<PxgConstraintData> refCData(N);
+    std::vector<uint8_t> removed(N);
+    std::vector<float> refUseExt(N);
+    size_t cRem = 0, cDis = 0, cExtF = 0, cRun = 0, cTrig = 0, cRows = 0, cStatA = 0, cStatB = 0;
+
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        D6In s{};
+        genFixture(rng, i, s);
+
+        // node topology: mostly dynamic-dynamic; a few static / removed
+        const bool rem = (i % 41 == 7);
+        const bool staticA = !rem && (i % 13 == 3);
+        const bool staticB = !rem && !staticA && (i % 17 == 5);
+
+        const uint32_t nodeA = (rem || staticA) ? PX_INVALID : (2 * i + 1);
+        const uint32_t nodeB = (rem || staticB) ? PX_INVALID : (2 * i + 2);
+
+        // place body poses: PX_INVALID -> solver body 0 (anchor); the fixture's
+        // bA2w/bB2w must then equal the anchor so the reference sees the same pose.
+        if (nodeA == PX_INVALID)
+        {
+            s.bA2wq = F4{ anchor.q.x, anchor.q.y, anchor.q.z, anchor.q.w };
+            s.bA2wp = F4{ anchor.p.x, anchor.p.y, anchor.p.z, s.bA2wp.w };
+            if (staticA) ++cStatA;
+        }
+        else
+            bodyData[solverBodyIndices[nodeA]].body2World =
+                PxAlignedTransform(PxTransform(PxVec3(s.bA2wp.x, s.bA2wp.y, s.bA2wp.z),
+                                               PxQuat(s.bA2wq.x, s.bA2wq.y, s.bA2wq.z, s.bA2wq.w)));
+        if (nodeB == PX_INVALID)
+        {
+            s.bB2wq = F4{ anchor.q.x, anchor.q.y, anchor.q.z, anchor.q.w };
+            s.bB2wp = F4{ anchor.p.x, anchor.p.y, anchor.p.z, s.bB2wp.w };
+            if (staticB) ++cStatB;
+        }
+        else
+            bodyData[solverBodyIndices[nodeB]].body2World =
+                PxAlignedTransform(PxTransform(PxVec3(s.bB2wp.x, s.bB2wp.y, s.bB2wp.z),
+                                               PxQuat(s.bB2wq.x, s.bB2wq.y, s.bB2wq.z, s.bB2wq.w)));
+
+        materializeJointData(s, jointData[i]);
+
+        uint32_t ppFlags = ((rng() % 2) ? (1u << 3) : 0u) | ((rng() % 2) ? (1u << 5) : 0u);
+        if (rng() % 3 == 0) ppFlags |= F_EXT;
+        if (i % 5 == 1) ppFlags |= F_DISABLE;
+
+        prePrep[i].mNodeIndexA = PxNodeIndex(nodeA);
+        prePrep[i].mNodeIndexB = PxNodeIndex(nodeB);
+        prePrep[i].mFlags = ppFlags;
+        prePrep[i].mLinBreakForce = rfS(rng, 0.f, 1e5f);
+        prePrep[i].mAngBreakForce = rfS(rng, 0.f, 1e5f);
+
+        removed[i] = rem ? 1 : 0;
+        refUseExt[i] = (ppFlags & F_EXT) ? 1.f : 0.f;
+
+        // reference
+        D6Out& o = ref[i];
+        std::memset(&o, 0, sizeof(o));
+        PxgConstraintData& cd = refCData[i];
+        std::memset(&cd, 0, sizeof(cd));
+        if (rem) { ++cRem; continue; }
+
+        uint32_t numRows = 0;
+        V3 ra{ 0, 0, 0 }, rb{ 0, 0, 0 };
+        if (!(ppFlags & F_DISABLE))
+        {
+            D6In t = s;
+            t.c2bAp.w = asF((ppFlags & F_EXT) ? 1u : 0u);   // engine derives useExt from prePrep
+            d6ref::solverPrep(t, o);
+            numRows = o.counts.x;
+            ra = V3{ o.cAoutW.x - s.bA2wp.x, o.cAoutW.y - s.bA2wp.y, o.cAoutW.z - s.bA2wp.z };
+            rb = V3{ o.cBoutW.x - s.bB2wp.x, o.cBoutW.y - s.bB2wp.y, o.cBoutW.z - s.bB2wp.z };
+            ++cRun;
+            if (o.counts.y) ++cTrig;
+            cRows += numRows;
+        }
+        else
+            ++cDis;
+
+        cd.mInvMassScale = jointData[i].invMassScale;
+        cd.mRaWorld_linBreakForceW = make_float4(ra.x, ra.y, ra.z, prePrep[i].mLinBreakForce);
+        cd.mRbWorld_angBreakForceW = make_float4(rb.x, rb.y, rb.z, prePrep[i].mAngBreakForce);
+        cd.mNumRows_Flags_StartIndex = make_uint4(numRows, ppFlags, i * MAX_ROWS_PER_JOINT, 0);
+        if (ppFlags & F_EXT) ++cExtF;
+    }
+
+    std::printf("[ info ] eng cov: run %zu dis %zu rem %zu extF %zu trig %zu rows %zu statA %zu statB %zu\n",
+                cRun, cDis, cRem, cExtF, cTrig, cRows, cStatA, cStatB);
+
+    PxgSlangComputeDevice* dev = testDevice();
+    using physx::gpuslang::PxgDevicePtr;
+    using physx::gpuslang::PxgResult;
+    const physx::gpuslang::PxgKernelDef manifest[] = {
+        { "npD6JointPrep.spv", "constraint1DPrePrepLaunch", 16u, 0 },
+    };
+    physx::gpuslang::PxgCudaShim shim(dev, manifest, 1, &d6ShimLoader);
+
+    auto alloc = [&](const void* data, size_t bytes) -> PxgDevicePtr {
+        PxgDevicePtr dp = 0;
+        shim.memAlloc(&dp, bytes);
+        if (dp && data) shim.memcpyHtoD(dp, data, bytes);
+        return dp;
+    };
+
+    // outputs: sentinel-filled so removed joints prove "no write"
+    std::vector<PxgConstraintData> cDataInit(N);
+    std::memset(cDataInit.data(), 0xCD, cDataInit.size() * sizeof(PxgConstraintData));
+    std::vector<Px1DConstraint> rowInit(N * MAX_ROWS_PER_JOINT);
+    std::memset(rowInit.data(), 0xCD, rowInit.size() * sizeof(Px1DConstraint));
+
+    const PxgDevicePtr dJoint = alloc(jointData.data(), jointData.size() * sizeof(PxgD6JointData));
+    const PxgDevicePtr dPre = alloc(prePrep.data(), prePrep.size() * sizeof(PxgConstraintPrePrep));
+    const PxgDevicePtr dBody = alloc(bodyData.data(), bodyData.size() * sizeof(PxgSolverBodyData));
+    const PxgDevicePtr dSBI = alloc(solverBodyIndices.data(), solverBodyIndices.size() * 4);
+    const PxgDevicePtr dCData = alloc(cDataInit.data(), cDataInit.size() * sizeof(PxgConstraintData));
+    const PxgDevicePtr dRows = alloc(rowInit.data(), rowInit.size() * sizeof(Px1DConstraint));
+    if (!dJoint) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgPrePrepDesc desc;
+    std::memset(&desc, 0xCD, sizeof(desc));
+    desc.rigidJointData = reinterpret_cast<PxgD6JointData*>(dJoint);
+    desc.rigidConstraintPrePrep = reinterpret_cast<PxgConstraintPrePrep*>(dPre);
+    desc.constraintData = reinterpret_cast<PxgConstraintData*>(dCData);
+    desc.constraintRows = reinterpret_cast<Px1DConstraint*>(dRows);
+    desc.artiJointData = NULL;
+    desc.artiConstraintPrePrep = NULL;
+    desc.artiConstraintData = NULL;
+    desc.artiConstraintRows = NULL;
+    desc.mSolverBodyData = reinterpret_cast<PxgSolverBodyData*>(dBody);
+    desc.solverBodyIndices = reinterpret_cast<PxU32*>(dSBI);
+    desc.nbD6RigidJoints = N;
+    desc.nbD6ArtiJoints = 0;
+    desc.nbTotalArtiJoints = 0;
+
+    PxgSolverSharedDesc<IterativeSolveData> sh;
+    std::memset(&sh, 0xCD, sizeof(sh));
+    sh.mBodySimBufferDeviceData = NULL;
+
+    const PxgDevicePtr dDesc = alloc(&desc, sizeof(desc));
+    const PxgDevicePtr dSh = alloc(&sh, sizeof(sh));
+
+    const uint32_t nbBlocks = (N + 127) / 128;   // CONSTRAINT_PREPREP_BLOCK = 128
+    struct { uint64_t pre, sh; } prm = { dDesc, dSh };
+    PXG_CHECK_MSG(shim.launchKernel(0, nbBlocks, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch constraint1DPrePrepLaunch");
+    shim.streamSynchronize();
+
+    std::vector<PxgConstraintData> gCData(N);
+    std::vector<Px1DConstraint> gRows(N * MAX_ROWS_PER_JOINT);
+    shim.memcpyDtoH(gCData.data(), dCData, gCData.size() * sizeof(PxgConstraintData));
+    shim.memcpyDtoH(gRows.data(), dRows, gRows.size() * sizeof(Px1DConstraint));
+
+    PxgConstraintData sentinel;
+    std::memset(&sentinel, 0xCD, sizeof(sentinel));
+
+    // Px1DConstraint field views for the row comparison
+    auto rowLin0 = [](const Px1DConstraint& c) { return F4{ c.linear0.x, c.linear0.y, c.linear0.z, c.geometricError }; };
+    auto rowAng0 = [](const Px1DConstraint& c) { return F4{ c.angular0.x, c.angular0.y, c.angular0.z, c.velocityTarget }; };
+    auto rowLin1 = [](const Px1DConstraint& c) { return F4{ c.linear1.x, c.linear1.y, c.linear1.z, c.minImpulse }; };
+    auto rowAng1 = [](const Px1DConstraint& c) { return F4{ c.angular1.x, c.angular1.y, c.angular1.z, c.maxImpulse }; };
+
+    size_t mm = 0, unstable = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        if (removed[i])
+        {
+            if (std::memcmp(&gCData[i], &sentinel, sizeof(PxgConstraintData)) != 0)
+            {
+                if (mm < 5) std::printf("MM %u removed case was written\n", i);
+                ++mm;
+            }
+            continue;
+        }
+
+        const PxgConstraintData& r = refCData[i];
+        const PxgConstraintData& q = gCData[i];
+
+        // trig-free meta: invMassScale, ra/rb, flags/startIndex (never excludable)
+        const F4* rInv = reinterpret_cast<const F4*>(&r.mInvMassScale);
+        const F4* qInv = reinterpret_cast<const F4*>(&q.mInvMassScale);
+        const F4 rRa{ r.mRaWorld_linBreakForceW.x, r.mRaWorld_linBreakForceW.y, r.mRaWorld_linBreakForceW.z, r.mRaWorld_linBreakForceW.w };
+        const F4 qRa{ q.mRaWorld_linBreakForceW.x, q.mRaWorld_linBreakForceW.y, q.mRaWorld_linBreakForceW.z, q.mRaWorld_linBreakForceW.w };
+        const bool metaHard = eqF4FZ(*rInv, *qInv) && eqF4FZ(rRa, qRa) &&
+                              eqFZ(r.mRbWorld_angBreakForceW.x, q.mRbWorld_angBreakForceW.x) &&
+                              eqFZ(r.mRbWorld_angBreakForceW.y, q.mRbWorld_angBreakForceW.y) &&
+                              eqFZ(r.mRbWorld_angBreakForceW.z, q.mRbWorld_angBreakForceW.z) &&
+                              eqFZ(r.mRbWorld_angBreakForceW.w, q.mRbWorld_angBreakForceW.w) &&
+                              r.mNumRows_Flags_StartIndex.y == q.mNumRows_Flags_StartIndex.y &&
+                              r.mNumRows_Flags_StartIndex.z == q.mNumRows_Flags_StartIndex.z &&
+                              r.mNumRows_Flags_StartIndex.w == q.mNumRows_Flags_StartIndex.w;
+        if (!metaHard)
+        {
+            if (mm < 5)
+                std::printf("MM %u eng meta: raR (%g %g %g) raG (%g %g %g) flagsR %u flagsG %u\n", i,
+                            r.mRaWorld_linBreakForceW.x, r.mRaWorld_linBreakForceW.y,
+                            r.mRaWorld_linBreakForceW.z, q.mRaWorld_linBreakForceW.x,
+                            q.mRaWorld_linBreakForceW.y, q.mRaWorld_linBreakForceW.z,
+                            r.mNumRows_Flags_StartIndex.y, q.mNumRows_Flags_StartIndex.y);
+            ++mm;
+            continue;
+        }
+
+        const uint32_t rN = r.mNumRows_Flags_StartIndex.x, qN = q.mNumRows_Flags_StartIndex.x;
+        const bool trig = ref[i].counts.y != 0;
+        if (rN != qN)
+        {
+            if (trig) { ++unstable; continue; }   // trig-flipped hard anglePair gate (capped)
+            if (mm < 5) std::printf("MM %u eng numRows: R %u G %u\n", i, rN, qN);
+            ++mm;
+            continue;
+        }
+
+        bool ok = true;
+        for (uint32_t j = 0; j < rN && ok; ++j)
+        {
+            // reference row j comes from the flat D6Out image (5 float4s / row)
+            const F4 rl0 = ref[i].rows[j * 5 + 0], ra0 = ref[i].rows[j * 5 + 1],
+                     rl1 = ref[i].rows[j * 5 + 2], ra1 = ref[i].rows[j * 5 + 3],
+                     rmod = ref[i].rows[j * 5 + 4];
+            const Px1DConstraint& g = gRows[i * MAX_ROWS_PER_JOINT + j];
+            const F4 gl0 = rowLin0(g), ga0 = rowAng0(g), gl1 = rowLin1(g), ga1 = rowAng1(g);
+            uint32_t gpackFlags; std::memcpy(&gpackFlags, &g.flags, 4);
+            const uint32_t rpackFlags = f2u(rmod.z);
+
+            auto cmp4 = [&](const F4& A, const F4& B) {
+                return trig ? (eqTol(A.x, B.x) && eqTol(A.y, B.y) && eqTol(A.z, B.z) && eqTol(A.w, B.w))
+                            : eqF4FZ(A, B);
+            };
+            ok = cmp4(rl0, gl0) && cmp4(ra0, ga0) && cmp4(rl1, gl1) && cmp4(ra1, ga1);
+            const bool modOk = trig ? (eqTol(rmod.x, g.mods.spring.stiffness) && eqTol(rmod.y, g.mods.spring.damping))
+                                    : (eqFZ(rmod.x, g.mods.spring.stiffness) && eqFZ(rmod.y, g.mods.spring.damping));
+            ok = ok && modOk && (gpackFlags == rpackFlags);
+        }
+        if (!ok)
+        {
+            if (mm < 5) std::printf("MM %u eng rows: n %u trig %u\n", i, rN, ref[i].counts.y);
+            ++mm;
+        }
+    }
+
+    PXG_CHECK_MSG(mm == 0, "constraint1DPrePrepLaunch: %zu mismatches", mm);
+    PXG_CHECK_MSG(unstable <= 8, "constraint1DPrePrepLaunch: %zu trig-unstable cases (cap 8)", unstable);
+    if (unstable)
+        std::printf("[ info ] eng trig-unstable excluded: %zu of %u\n", unstable, N);
+
+    const bool cov = cRun > N / 2 && cDis > 100 && cRem > 20 && cExtF > N / 6 && cTrig > 100 &&
+                     cRows > 1500 && cStatA > 20 && cStatB > 20;
+    PXG_CHECK_MSG(cov, "constraint1DPrePrepLaunch: coverage thin (run %zu dis %zu rem %zu extF %zu "
+                       "trig %zu statA %zu statB %zu)",
+                  cRun, cDis, cRem, cExtF, cTrig, cStatA, cStatB);
+
+    for (PxgDevicePtr p : { dJoint, dPre, dBody, dSBI, dCData, dRows, dDesc, dSh })
+        shim.memFree(p);
 }
 
 } // namespace

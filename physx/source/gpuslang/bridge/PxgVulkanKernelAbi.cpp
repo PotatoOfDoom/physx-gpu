@@ -293,6 +293,9 @@ static const PxgKernelAbiRow kRows[] = {
     { "updateBodiesLaunch", kOnePtr, 1u },
     { "updateChangedAABBMgrHandlesLaunch", kOnePtr, 1u },
     { "updateShapesLaunch", kUpdateShapes, uint32_t(sizeof(kUpdateShapes)) },
+    // updateBodiesAndShapes.cu: updateJointsLaunch(const PxgUpdatedJointsDesc*)
+    // -> single device pointer {8} (P5 Step 5 tranche 12: the joint CPU->GPU scatter)
+    { "updateJointsLaunch", kOnePtr, 1u },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)
@@ -300,9 +303,18 @@ static const PxgKernelAbiRow kRows[] = {
     { "rigidSumInternalContactAndJointBatches2", kThreePtrU32, uint32_t(sizeof(kThreePtrU32)) },
     { "constraintContactBlockPrePrepLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "constraint1DBlockPrePrepLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "constraint1DPrePrepLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "contactConstraintBlockPrepareParallelLaunchTGS", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "contactConstraintBlockPrepareParallelLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "jointConstraintBlockPrepareParallelLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    // NOTE: jointConstraintBlockPrepareParallelLaunchTGS is deliberately WITHOUT an
+    // ABI row.  Unlike its PGS twin (BDA-converted) it is still in BOUND-BUFFER form
+    // (bindings 0-10 + a PrepParams push constant) pending its own BDA conversion —
+    // see constraintPrepTGS.slang:53-54.  Giving it a {8,8} row would make the engine
+    // launch it via the pointer-pack ABI against unbound buffers + a truncated push
+    // constant, which GPU-faults.  Leaving it un-rowed keeps the clean InvalidValue
+    // refusal until the kernel is converted; the TGS jointed scene is blocked on that
+    // (P5 Step 5 tranche 12 — the PGS jointed scene fully steps).
     // gpunarrowphase convex-convex core + contact-stream compress (P5 Step 4 BDA)
     { "convexConvexNphase_stage1Kernel", kCvxStage1, uint32_t(sizeof(kCvxStage1)) },
     { "convexConvexNphase_stage2Kernel", kCvxStage2, uint32_t(sizeof(kCvxStage2)) },

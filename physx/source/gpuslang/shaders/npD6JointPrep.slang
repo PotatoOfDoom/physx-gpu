@@ -48,6 +48,16 @@
 // verifies bitwise (modulo the documented +-0 class); this shader is in
 // PXG_NOCONTRACT_SHADERS, so all float arithmetic carries NoContraction.
 
+// P5 Step 5 (BDA, ENGINE launch ABI): the engine entry
+// constraint1DPrePrepLaunch (constraintBlockPrePrep.cu L1168) is appended at
+// the end of this file.  It reuses the proven d6SolveQ core verbatim, feeding
+// it a D6In assembled from the REAL PxgD6JointData mirror + the two solver-body
+// poses reached through the BDA desc.  These imports supply the PxgPrePrepDesc /
+// PxgSolverBodyData / PxNodeIndex mirrors (proven by testPrepDescLayout /
+// pxgSlangCommon).
+import pxgSlangPrepDesc;
+import pxgSlangCommon;
+
 static const float FLT_MAXQ = 3.402823466e+38f;
 static const uint MAX_ROWS = 24u;
 
@@ -908,4 +918,279 @@ void c1dPrePrep(uint3 dtid : SV_DispatchThreadID)
     o.rbW = float4(rb, s.distV.z);   // mAngBreakForce
     packRows(buf, o);
     gOut[tid] = o;
+}
+
+// ---------------------------------------------------------------------------
+// constraint1DPrePrepLaunch (P5 Step 5 BDA engine ABI)
+// ---------------------------------------------------------------------------
+// Port of constraint1DPrePrepLaunch() in constraintBlockPrePrep.cu L1168 — the
+// per-joint D6 data-prep kernel.  The engine launches it from
+// PxgSolverCore::constraintPrePrepParallel (PxgSolverCore.cpp L600) with the
+// SAME two-pointer pack as the block twin:
+//   params { PxgPrePrepDesc*, PxgSolverSharedDesc<IterativeSolveData>* } -> {8,8},
+//   grid = ceil(nbD6Joints / CONSTRAINT_PREPREP_BLOCK=128), block = 128,
+//   thread-per-joint (threadIndex = threadIdx.x + blockIdx.x*blockDim.x).  It is
+//   launched once per step regardless of solver (PxgPrePrepDesc is
+//   solver-agnostic and constraintPrePrepParallel is shared by the PGS and TGS
+//   cores), so BOTH solver paths hit this kernel.  nbD6Joints spans rigid AND
+//   arti joints; threads with threadIndex >= nbRigidJoints take the articulation
+//   branch, which is a DEFERRED no-op here (mirrors every other arti path in the
+//   port — markActiveSlab / solveBlockUnified).
+//
+// The rigid arm is constraint1DPrePrep<false> transcribed line-for-line:
+//   - the removed-joint gate (both node indices PX_INVALID_NODE -> NO write);
+//   - poses from solverBodyData[solverBodyIndices[node]].body2World.getTransform()
+//     (PX_INVALID_NODE -> solver body 0), an arithmetic-free repack;
+//   - the eDISABLE_CONSTRAINT branch (numRows = 0, ra = rb = 0);
+//   - useExtendedLimits from the prePrep mFlags;
+//   - the D6JointSolverPrep call (d6SolveQ) with ra = ca2w - pose0.p (= raInner)
+//     and rb = cb2w - pose1.p;
+//   - the PxgConstraintData image (invMassScale passthrough from the joint data,
+//     mRaWorld_linBreakForceW / mRbWorld_angBreakForceW,
+//     mNumRows_Flags_StartIndex with startIndex = jointDataIndex * 20).
+// All D6 row arithmetic is the proven d6SolveQ; only the desc-driven data plumbing
+// and the real PxgD6JointData -> D6In assembly are new here.
+
+static const uint PX_INVALID_NODE_J = 0xFFFFFFFFu;
+
+struct C1dLaunchParams
+{
+    uint64_t prePrepDesc; // @0 PxgPrePrepDesc*
+    uint64_t sharedDesc;  // @8 PxgSolverSharedDesc<IterativeSolveData>*
+}
+
+[[vk::push_constant]]
+ConstantBuffer<C1dLaunchParams> gC1dLaunch;
+
+// mirrors PxgD6JointData (PxgD6JointData.h + PxgD6JointLimit.h + PxgD6Joint.h),
+// 448 bytes.  Offsets verified against the C++ layout (PxgJointData base:
+// PxgConstraintInvMassScale @0 [PX_ALIGN 16], PxTransform32 c2b[2] @16..80;
+// then PxgD6Motion motion[6] @80, the PxgJointLimitParameters-derived limits
+// [restitution,bounceThreshold,stiffness,damping first], the 16-byte
+// PxgD6JointDrive drive[6], PxTransform drivePosition, the two PxVec3 drive
+// velocities, the locked/limited/driving bitmaps, distanceMinDist, the four
+// mUse* bools packed as bytes, and angularDriveConfig).  The end-to-end row
+// comparison in testNpD6JointPrep pins every offset empirically.
+struct PxgD6JointDataGpu
+{
+    float4 invMassScale;   // @0   lin0,ang0,lin1,ang1
+    float4 c2bAq;          // @16  c2b[0].q
+    float4 c2bAp;          // @32  c2b[0].p.xyz + pad
+    float4 c2bBq;          // @48  c2b[1].q
+    float4 c2bBp;          // @64  c2b[1].p.xyz + pad
+    uint motion0; uint motion1; uint motion2; uint motion3; uint motion4; uint motion5; // @80..104
+    float dist_rest; float dist_bounce; float dist_stiff; float dist_damp; float dist_value; // @104..124
+    float linX_rest; float linX_bounce; float linX_stiff; float linX_damp; float linX_upper; float linX_lower; // @124..148
+    float linY_rest; float linY_bounce; float linY_stiff; float linY_damp; float linY_upper; float linY_lower; // @148..172
+    float linZ_rest; float linZ_bounce; float linZ_stiff; float linZ_damp; float linZ_upper; float linZ_lower; // @172..196
+    float twist_rest; float twist_bounce; float twist_stiff; float twist_damp; float twist_upper; float twist_lower; // @196..220
+    float swing_rest; float swing_bounce; float swing_stiff; float swing_damp; float swing_yAngle; float swing_zAngle; // @220..244
+    float pyr_rest; float pyr_bounce; float pyr_stiff; float pyr_damp; float pyr_yMin; float pyr_yMax; float pyr_zMin; float pyr_zMax; // @244..276
+    float d0_s; float d0_d; float d0_f; uint d0_flags; // @276..292
+    float d1_s; float d1_d; float d1_f; uint d1_flags; // @292..308
+    float d2_s; float d2_d; float d2_f; uint d2_flags; // @308..324
+    float d3_s; float d3_d; float d3_f; uint d3_flags; // @324..340
+    float d4_s; float d4_d; float d4_f; uint d4_flags; // @340..356
+    float d5_s; float d5_d; float d5_f; uint d5_flags; // @356..372
+    float drvQ_x; float drvQ_y; float drvQ_z; float drvQ_w; // @372..388  drivePosition.q
+    float drvP_x; float drvP_y; float drvP_z;              // @388..400  drivePosition.p
+    float dlv_x; float dlv_y; float dlv_z;                 // @400..412  driveLinearVelocity
+    float dav_x; float dav_y; float dav_z;                 // @412..424  driveAngularVelocity
+    uint locked;             // @424
+    uint limited;            // @428
+    uint driving;            // @432
+    float distanceMinDist;   // @436
+    uint useBools;           // @440  byte0=useDistance,1=useNewLinear,2=useCone,3=usePyramid
+    uint angularDriveConfig; // @444  (byte0 only; rest pad) -> size 448
+}
+
+// mirrors PxgConstraintPrePrep (PxgConstraintPrep.h), 32 bytes (PxNodeIndex is
+// PX_ALIGN 8; mNodeIndexA/B = PxU64 {index, linkID})
+struct PxgConstraintPrePrepGpu
+{
+    uint2 mNodeIndexA;       // @0  (x = index)
+    uint2 mNodeIndexB;       // @8
+    uint mFlags;             // @16 PxConstraintFlag
+    float mLinBreakForce;    // @20
+    float mAngBreakForce;    // @24
+    uint pad;                // @28 -> size 32
+}
+
+// mirrors PxgConstraintData (PxgConstraintPrep.h), 64 bytes (output)
+struct PxgConstraintDataGpu
+{
+    float4 mInvMassScale;              // @0
+    float4 mRaWorld_linBreakForceW;    // @16
+    float4 mRbWorld_angBreakForceW;    // @32
+    uint4 mNumRows_Flags_StartIndex;   // @48
+}
+
+// mirrors Px1DConstraint (PxConstraintDesc.h), 80 bytes PX_ALIGN(16) (output row)
+struct Px1DConstraintGpu
+{
+    float4 linear0XYZ_geometricErrorW; // @0
+    float4 angular0XYZ_velocityTargetW;// @16
+    float4 linear1XYZ_minImpulseW;     // @32
+    float4 angular1XYZ_maxImpulseW;    // @48
+    float mods_restitution;            // @64 (mods.spring.stiffness / bounce.restitution)
+    float mods_velocityThreshold;      // @68 (mods.spring.damping / bounce.velocityThreshold)
+    uint flags_solveHint;              // @72 PxU16 flags | PxU16 solveHint << 16
+    uint pad;                          // @76 -> size 80
+}
+
+// Assemble the flat D6In (the proven d6SolveQ input) from the REAL joint data +
+// the two body poses.  The mapping mirrors the D6In field comments and the
+// PxgConstraintHelper / D6JointSolverPrep field reads (constraintBlockPrePrep.cu
+// L516-737).  useBits is packed into c2bBp.w exactly as d6SolveQ expects; the
+// locked/limited/driving bitmaps into bA2wp.w / bB2wp.w / drvPp.w.
+D6In d6InFromReal(const PxgD6JointDataGpu d, float4 pose0q, float3 pose0p, float4 pose1q,
+                  float3 pose1p)
+{
+    const bool useDistance = (d.useBools & 0xFFu) != 0u;
+    const bool useNewLinear = ((d.useBools >> 8u) & 0xFFu) != 0u;
+    const bool useCone = ((d.useBools >> 16u) & 0xFFu) != 0u;
+    const bool usePyramid = ((d.useBools >> 24u) & 0xFFu) != 0u;
+    const uint useBits = (useDistance ? 1u : 0u) | (useNewLinear ? 2u : 0u) |
+                         (useCone ? 4u : 0u) | (usePyramid ? 8u : 0u);
+
+    D6In s;
+    s.c2bAq = d.c2bAq;
+    s.c2bAp = float4(d.c2bAp.xyz, 0.0f);            // .w unused by d6SolveQ
+    s.c2bBq = d.c2bBq;
+    s.c2bBp = float4(d.c2bBp.xyz, asfloat(useBits));
+    s.bA2wq = pose0q;
+    s.bA2wp = float4(pose0p, asfloat(d.locked));
+    s.bB2wq = pose1q;
+    s.bB2wp = float4(pose1p, asfloat(d.limited));
+    s.drvPq = float4(d.drvQ_x, d.drvQ_y, d.drvQ_z, d.drvQ_w);
+    s.drvPp = float4(d.drvP_x, d.drvP_y, d.drvP_z, asfloat(d.driving));
+    s.linVel = float4(d.dlv_x, d.dlv_y, d.dlv_z, d.distanceMinDist);
+    s.angVel = float4(d.dav_x, d.dav_y, d.dav_z, 0.0f);
+    s.drives[0] = float4(d.d0_s, d.d0_d, d.d0_f, asfloat(d.d0_flags));
+    s.drives[1] = float4(d.d1_s, d.d1_d, d.d1_f, asfloat(d.d1_flags));
+    s.drives[2] = float4(d.d2_s, d.d2_d, d.d2_f, asfloat(d.d2_flags));
+    s.drives[3] = float4(d.d3_s, d.d3_d, d.d3_f, asfloat(d.d3_flags));
+    s.drives[4] = float4(d.d4_s, d.d4_d, d.d4_f, asfloat(d.d4_flags));
+    s.drives[5] = float4(d.d5_s, d.d5_d, d.d5_f, asfloat(d.d5_flags));
+    s.distP = float4(d.dist_rest, d.dist_bounce, d.dist_stiff, d.dist_damp);
+    s.distV = float4(d.dist_value, 0.0f, 0.0f, 0.0f);
+    s.linXP = float4(d.linX_rest, d.linX_bounce, d.linX_stiff, d.linX_damp);
+    s.linXV = float4(d.linX_upper, d.linX_lower, 0.0f, 0.0f);
+    s.linYP = float4(d.linY_rest, d.linY_bounce, d.linY_stiff, d.linY_damp);
+    s.linYV = float4(d.linY_upper, d.linY_lower, 0.0f, 0.0f);
+    s.linZP = float4(d.linZ_rest, d.linZ_bounce, d.linZ_stiff, d.linZ_damp);
+    s.linZV = float4(d.linZ_upper, d.linZ_lower, 0.0f, 0.0f);
+    s.twistP = float4(d.twist_rest, d.twist_bounce, d.twist_stiff, d.twist_damp);
+    s.twistV = float4(d.twist_upper, d.twist_lower, 0.0f, 0.0f);
+    s.swingP = float4(d.swing_rest, d.swing_bounce, d.swing_stiff, d.swing_damp);
+    s.swingV = float4(d.swing_yAngle, d.swing_zAngle, 0.0f, 0.0f);
+    s.pyrP = float4(d.pyr_rest, d.pyr_bounce, d.pyr_stiff, d.pyr_damp);
+    s.pyrV = float4(d.pyr_yMin, d.pyr_yMax, d.pyr_zMin, d.pyr_zMax);
+    return s;
+}
+
+[shader("compute")]
+[numthreads(128, 1, 1)]
+void constraint1DPrePrepLaunch(uint3 dtid : SV_DispatchThreadID)
+{
+    // llvmpipe zero-trip guard on a null descriptor pointer
+    if (gC1dLaunch.prePrepDesc == 0)
+        return;
+
+    Ptr<PxgPrePrepDescGpu> desc = Ptr<PxgPrePrepDescGpu>(gC1dLaunch.prePrepDesc);
+
+    const uint nbRigidJoints = desc[0].nbD6RigidJoints;
+    const uint nbArtiJoints = desc[0].nbD6ArtiJoints;
+    const uint nbTotalJoints = nbRigidJoints + nbArtiJoints;
+    const uint threadIndex = dtid.x;
+
+    if (threadIndex >= nbTotalJoints)
+        return;
+
+    // articulation joints (else branch of the .cu): DEFERRED no-op, exactly like
+    // every other articulation path in the port.
+    if (threadIndex >= nbRigidJoints)
+        return;
+
+    const uint jointDataIndex = threadIndex;
+
+    Ptr<PxgConstraintPrePrepGpu> prePrep =
+        Ptr<PxgConstraintPrePrepGpu>(desc[0].rigidConstraintPrePrep);
+    const PxgConstraintPrePrepGpu pp = prePrep[jointDataIndex];
+
+    const uint nodeIndexA = pp.mNodeIndexA.x;   // PxNodeIndex::index()
+    const uint nodeIndexB = pp.mNodeIndexB.x;
+
+    // removed joint: both node indices PX_INVALID_NODE -> nothing written
+    if (nodeIndexA == PX_INVALID_NODE_J && nodeIndexB == PX_INVALID_NODE_J)
+        return;
+
+    const uint prePrepFlags = pp.mFlags;
+    const bool disableConstraints = (prePrepFlags & E_DISABLE_CONSTRAINT) != 0u;
+    const uint useExtendedLimits = (prePrepFlags & E_EXTENDED_LIMITS) != 0u ? 1u : 0u;
+
+    Ptr<uint> solverBodyIndices = Ptr<uint>(desc[0].solverBodyIndices);
+    Ptr<PxgSolverBodyData> solverBodyData = Ptr<PxgSolverBodyData>(desc[0].mSolverBodyData);
+
+    const uint sbIndexA = nodeIndexA == PX_INVALID_NODE_J ? 0u : solverBodyIndices[nodeIndexA];
+    const uint sbIndexB = nodeIndexB == PX_INVALID_NODE_J ? 0u : solverBodyIndices[nodeIndexB];
+
+    const PxgSolverBodyData bodyA = solverBodyData[sbIndexA];
+    const PxgSolverBodyData bodyB = solverBodyData[sbIndexB];
+    const float4 pose0q = bodyA.body2World.q;       // PxAlignedTransform::getTransform()
+    const float3 pose0p = bodyA.body2World.p.xyz;
+    const float4 pose1q = bodyB.body2World.q;
+    const float3 pose1p = bodyB.body2World.p.xyz;
+
+    Ptr<PxgD6JointDataGpu> jointData = Ptr<PxgD6JointDataGpu>(desc[0].rigidJointData);
+    const PxgD6JointDataGpu d = jointData[jointDataIndex];
+
+    uint trig = 0u;
+    RowBuf buf;
+    buf.n = 0u;
+    float3 ra, rb;
+    if (!disableConstraints)
+    {
+        const D6In s = d6InFromReal(d, pose0q, pose0p, pose1q, pose1p);
+        float3 raInner, cB2wp;
+        d6SolveQ(s, useExtendedLimits, buf, trig, raInner, cB2wp);
+        // exact CUDA roundtrip: D6JointSolverPrep returns cA2wOut = raInner +
+        // bA2w.p, then ra = cA2wOut - pose0.p — NOT algebraically raInner under
+        // NoContraction float rounding, so the add-then-subtract must be kept.
+        const float3 ca2w = raInner + pose0p; // cA2wOut
+        ra = ca2w - pose0p;                   // cA2wOut - pose0.p
+        rb = cB2wp - pose1p;                  // cB2wOut - pose1.p
+    }
+    else
+    {
+        ra = float3(0, 0, 0);
+        rb = float3(0, 0, 0);
+    }
+
+    const uint numRows = buf.n;
+    const uint constraintsStartIndex = jointDataIndex * DY_MAX_CONSTRAINT_ROWS;
+
+    Ptr<Px1DConstraintGpu> constraintRows = Ptr<Px1DConstraintGpu>(desc[0].constraintRows);
+    for (uint i = 0u; i < numRows; ++i)
+    {
+        const C1D c = buf.r[i];
+        Px1DConstraintGpu row;
+        row.linear0XYZ_geometricErrorW = float4(c.lin0, c.geo);
+        row.angular0XYZ_velocityTargetW = float4(c.ang0, c.vt);
+        row.linear1XYZ_minImpulseW = float4(c.lin1, c.minI);
+        row.angular1XYZ_maxImpulseW = float4(c.ang1, c.maxI);
+        row.mods_restitution = c.m0;
+        row.mods_velocityThreshold = c.m1;
+        row.flags_solveHint = c.flags | (c.hint << 16u);
+        row.pad = 0u;
+        constraintRows[constraintsStartIndex + i] = row;
+    }
+
+    Ptr<PxgConstraintDataGpu> constraintData = Ptr<PxgConstraintDataGpu>(desc[0].constraintData);
+    PxgConstraintDataGpu cd;
+    cd.mInvMassScale = d.invMassScale;             // passthrough from jointData
+    cd.mRaWorld_linBreakForceW = float4(ra, pp.mLinBreakForce);
+    cd.mRbWorld_angBreakForceW = float4(rb, pp.mAngBreakForce);
+    cd.mNumRows_Flags_StartIndex = uint4(numRows, prePrepFlags, constraintsStartIndex, 0u);
+    constraintData[jointDataIndex] = cd;
 }

@@ -106,7 +106,35 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
-## P5 Step 5 — MILESTONE: the four rigid primitives + convex meshes rest on BOTH solvers
+## P5 Step 5 — a jointed scene holds on the GPU (PGS); TGS joint-prep is the one remaining gap
+
+Tranche 12 brought up the D6-joint data-prep on the engine ABI:
+`constraint1DPrePrepLaunch` (the last unmapped joint kernel; ABI `{8,8}`,
+thread-per-joint; rigid arm = `constraint1DPrePrep<false>` row construction
+transcribed bit-exact, arti arm deferred) plus a discovered unmapped upstream
+producer `updateJointsLaunch` (`{8}`, the CPU-pinned→GPU joint-pool scatter
+without which the joint pools stay `0xFFFFFFFF`).  `PXG_SLANG_KERNEL_MAPPED`
+150 → 152.  The harness now compiles two extension TUs (`ExtJoint.cpp` +
+`ExtD6Joint.cpp` → `PxD6JointCreate`; clean, no serialization/PVD/metadata
+drag).  New engine-ABI unit test `npD6JointPrep_engineKernel` (real
+`PxgPrePrepDesc`/D6 joint data → bit-exact `Px1DConstraint` rows, incl. the
+`ra = (raInner + pose0.p) − pose0.p` round-trip that is NOT algebraically
+`raInner` under the CUDA `NoContraction` rounding).
+
+`PXG_SCENE=joint`: a dynamic box suspended from a static world anchor by a
+`PxD6Joint` (linear DOFs locked, spawned at y=3.5, pinned to y=3.0):
+- **PGS: holds at y=3.000, |v|=0.0000, exit 0, ZERO refused launches.**
+- TGS: PARTIAL — `jointConstraintBlockPrepareParallelLaunchTGS` is still in
+  bound-buffer form (never converted to the BDA engine ABI, unlike its
+  now-converted PGS twin; `constraintPrepTGS.slang:53-54` flags it "pending
+  its own conversion").  It cleanly REFUSES (no crash) and the box falls
+  through.  Converting it (mirror the contact-TGS twin: 11 bound buffers →
+  `Ptr<>` desc reads + `orthogonalize`/`preprocessRows` + its unit test) is
+  the next tranche.
+
+Suite 664/664 both memory modes.
+
+## P5 Step 5 — earlier milestone: the four rigid primitives + convex meshes rest on BOTH solvers
 
 Tranche 11 assembled the CONVEX-HULL arm of collide() (`generateConvexContacts`,
 cudaGJKEPA.cu L1458-1462) into `npCvxCollide.slang` (now 1707 lines): the T144

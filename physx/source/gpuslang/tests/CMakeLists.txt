@@ -116,7 +116,7 @@ pxg_compile_shader(preIntegration preIntegrationLaunch initStaticKinematics preI
 pxg_compile_shader(integration integrateCoreParallelLaunch integrateCoreParallelLaunchTGS)
 pxg_compile_shader(updateBounds updateTransformCacheAndBoundArrayLaunch setRigidDynamicGlobalPose updateChangedAABBMgrHandlesLaunch)
 pxg_compile_shader(bodyUpdate updateBodiesLaunch updateBodiesLaunchDirectAPI updateShapesLaunch
-                   updateBodyExternalVelocitiesLaunch)
+                   updateBodyExternalVelocitiesLaunch updateJointsLaunch)
 pxg_compile_shader(directApi getRigidDynamicGlobalPose getRigidDynamicLinearVelocity
                    getRigidDynamicAngularVelocity getRigidDynamicLinearAcceleration
                    getRigidDynamicAngularAcceleration setRigidDynamicLinearVelocity
@@ -239,7 +239,7 @@ pxg_compile_shader(npCvxCorePlaneGen cpgContacts)
 pxg_compile_shader(npCvxCoreCvxGen cvgContacts)
 pxg_compile_shader(npCvxBvhGlue cbgGlue)
 pxg_compile_shader(npCvxCoreWarpAcc cwaAddPoints)
-pxg_compile_shader(npD6JointPrep d6jPrep c1dPrePrep)
+pxg_compile_shader(npD6JointPrep d6jPrep c1dPrePrep constraint1DPrePrepLaunch)
 pxg_compile_shader(npRemapIndex remapIndex)
 pxg_compile_shader(npContactPrePrep cppPack constraintContactBlockPrePrepLaunch
                    constraint1DBlockPrePrepLaunch clearFrictionPatchCounts)

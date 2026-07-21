@@ -21,6 +21,7 @@
 // path through physx-sdk's PUBLIC ${SRC}/geomutils/include).
 #include "GuCooking.h"
 #include "cooking/PxCooking.h"
+#include "extensions/PxD6Joint.h"   // PxD6JointCreate + PxD6Axis/PxD6Motion (jointed scene)
 
 #include <cstdio>
 #include <cmath>
@@ -269,6 +270,42 @@ void buildConvexScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
                                    boxInertia(PxVec3(0.5f), 1000.0f), 5.0f);
     targets.push_back({ b, 5.0f, 0.5f, "convexOnBox" });
 }
+
+// PXG_SCENE=joint: a dynamic box suspended from a static WORLD anchor by a
+// PxD6Joint with the three LINEAR DOFs locked (angular free).  The joint pins
+// the box centre to the anchor point and holds it against gravity, so the box
+// hangs at a fixed rest height instead of falling.  This is the FIRST scene that
+// launches constraint1DPrePrepLaunch (the D6-joint data-prep kernel): a D6 joint
+// is the only joint whose rows are prepped on the GPU (all other joint types are
+// prepped on the CPU), so the JOINTED path must NOT refuse.  The joint path is
+// solver-shared, so this holds under BOTH the TGS and PGS cores.
+void buildJointScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                     std::vector<RestTarget>& targets)
+{
+    const float restY = 3.0f;          // world anchor / pinned box-centre height
+    const float spawnY = restY + 0.5f; // spawn slightly above so it falls onto the pin
+
+    // A free dynamic box (no ground); its resting pose is the joint, not a contact.
+    PxRigidDynamic* box = physics->createRigidDynamic(PxTransform(PxVec3(0.0f, spawnY, 0.0f)));
+    PxShape* s = physics->createShape(PxBoxGeometry(0.5f, 0.5f, 0.5f), *material);
+    box->attachShape(*s);
+    box->setMass(1000.0f);
+    box->setMassSpaceInertiaTensor(boxInertia(PxVec3(0.5f), 1000.0f));
+    scene->addActor(*box);
+
+    // actor0 = NULL -> world-attached at localFrame0; the box centre (identity
+    // localFrame1) is constrained to the world point (0, restY, 0).
+    PxD6Joint* joint = PxD6JointCreate(*physics, NULL, PxTransform(PxVec3(0.0f, restY, 0.0f)),
+                                       box, PxTransform(PxIdentity));
+    joint->setMotion(PxD6Axis::eX, PxD6Motion::eLOCKED);
+    joint->setMotion(PxD6Axis::eY, PxD6Motion::eLOCKED);
+    joint->setMotion(PxD6Axis::eZ, PxD6Motion::eLOCKED);
+    joint->setMotion(PxD6Axis::eTWIST, PxD6Motion::eFREE);
+    joint->setMotion(PxD6Axis::eSWING1, PxD6Motion::eFREE);
+    joint->setMotion(PxD6Axis::eSWING2, PxD6Motion::eFREE);
+
+    targets.push_back({ box, spawnY, restY, "boxOnD6Joint" });
+}
 } // namespace
 
 int main()
@@ -348,7 +385,8 @@ int main()
     else if (!std::strcmp(sceneName, "capsule"))   buildCapsuleScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "capsulebox")) buildCapsuleBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "convex"))    buildConvexScene(physics, scene, material, targets);
-    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex)\n", sceneName);
+    else if (!std::strcmp(sceneName, "joint"))     buildJointScene(physics, scene, material, targets);
+    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint)\n", sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
     if (targets.empty())
     {
