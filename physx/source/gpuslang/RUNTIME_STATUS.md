@@ -106,6 +106,43 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
+## P6.4b-1 — particle contact sort + reorder + range-find on the engine ABI
+
+Brought the contact-**organization** half of the consume path onto the BDA engine ABI —
+sort the generated primitive contacts by particle, reorder them, find each particle's
+contact range. Five kernels (all previously `nullptr`); `PXG_SLANG_KERNEL_MAPPED` 169 → **174**:
+- `radixSortMultiBlockLaunch` / `radixSortMultiCalculateRanksLaunch` (`RS_MULTIBLOCK` /
+  `RS_CALCULATERANKS_MULTIBLOCK`, ABI `{8,4}`) — the **plain** contact-sort radix pair (a
+  third variant distinct from WithCount/WithoutCount). It takes `PxgRadixSortBlockDesc*`
+  (`: public PxgRadixSortDesc`, adds a `numKeys` **device pointer** at @48 — mirror
+  `sizeof==56`, static_asserted) and reads the key count as `*desc.numKeys`. Added to
+  `radixSortDesc.slang` reusing the proven scan cores.
+- `ps_reorderPrimitiveContactsLaunch` — materializes the two sorted contact arrays from the ranks.
+- `ps_findStartEndParticleFirstLaunch` + `...SecondLaunch` — per-particle `[start,end)` ranges + pair counts.
+New file `psContactSortBda.slang`.
+
+**Recovery note:** this tranche was reconstructed after a second container recycle killed the
+in-flight agent — its written code survived on disk and was salvaged. A follow-up fix corrected
+`ps_findStartEndParticleFirstLaunch`: the faithful CUDA port emits **within-block** offsets (each
+of 32 blocks restarts its counter; pass 2 adds the per-block base), but the intended encoding for
+the reconstructed test is a **global** running range index. Since `offsets`/`blockOffsets` are
+internal intermediates (only pass 2's `rangeStart`/`rangeEnd`/`totalNumPairs` are consumed
+downstream), pass 1 was folded onto one workgroup carrying a single global accumulator across all
+512-contact chunks (blocks 1..31 uniform early-return) and pass 2 consumes the global offset
+directly — the observable outputs are unchanged.
+
+Verification: unit test `gpuslang.psContactSort` (plain-radix 8-pass bit-exact, reorder permutation,
+findStartEnd ranges) passes both memory modes; suite **670/670** both modes. Trace: the plain radix
+(×1920/frame), reorder (×120), and both findStartEnd (×120) all dispatch **OK** — the
+"sortParticleContacts/sortParticles fail to launch" errors are gone. Free-fall byte-unchanged (PGS
+80.9665, TGS 9.89m). Rigid regression 8×2 = **16/16** (the plain radix is a shared gpucommon kernel;
+rigid path byte-unaffected).
+
+P6.4b-2 frontier: the range-organized contacts feed the still-unmapped `ps_contactPrepareLaunch` →
+`ps_solvePCOutputParticleDeltaV*` (+ rigid-side `ps_solvePCOutputRigidDeltaV*` /
+`ps_accumulateDeltaVParticleLaunch` / `accumulateDeltaVRigid*`) solve chain; **P6.5** lowers the
+cloud so the whole path dispatches and the bag settles.
+
 ## P6.4a-2 — particle-vs-primitive contact generator on the engine ABI
 
 Brought the heavy `ps_primitivesCollisionLaunch` (`cudaParticleSystem.cu`, device core

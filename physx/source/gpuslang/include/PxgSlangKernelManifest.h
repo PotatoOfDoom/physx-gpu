@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 169;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 174;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -186,8 +186,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "applyTGSSubstepGravity", "solverApplyGravityTGS.spv", "applyTGSSubstepGravity" },  // APPLY_TGS_SUBSTEP_GRAVITY
     { "markActiveSlabPGS", "solverPGS.spv", "markActiveSlabPGS" },  // MARK_ACTIVE_SLAB_PGS (P5 Step 5 BDA port)
     { "markActiveSlabTGS", "solverTGS.spv", "markActiveSlabTGS" },  // MARK_ACTIVE_SLAB_TGS (P5 Step 5 BDA port)
-    { "radixSortMultiBlockLaunch", nullptr, nullptr },  // RS_MULTIBLOCK (unmapped)
-    { "radixSortMultiCalculateRanksLaunch", nullptr, nullptr },  // RS_CALCULATERANKS_MULTIBLOCK (unmapped)
+    { "radixSortMultiBlockLaunch", "radixSortDesc.spv", "radixSortMultiBlockLaunch" },  // RS_MULTIBLOCK (P6.4b-1 BDA port: numKeys from *desc.numKeys)
+    { "radixSortMultiCalculateRanksLaunch", "radixSortDesc.spv", "radixSortMultiCalculateRanksLaunch" },  // RS_CALCULATERANKS_MULTIBLOCK (P6.4b-1 BDA port: numKeys from *desc.numKeys)
     { "radixSortMultiBlockLaunchWithCount", "radixSortDesc.spv", "radixSortMultiBlockLaunchWithCount" },  // RS_MULTIBLOCK_COUNT (P5 Step 4 BDA port)
     { "radixSortMultiCalculateRanksLaunchWithCount", "radixSortDesc.spv", "radixSortMultiCalculateRanksLaunchWithCount" },  // RS_CALCULATERANKS_MULTIBLOCK_COUNT (P5 Step 4 BDA port)
     { "radixSortMultiBlockLaunchWithoutCount", "radixSortDesc.spv", "radixSortMultiBlockLaunchWithoutCount" },  // RS_MULTIBLOCK_NO_COUNT (P6.2 BDA port)
@@ -228,13 +228,13 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_meshCollisonLaunch", nullptr, nullptr },  // PS_TRIMESH_COLLISION (unmapped)
     { "ps_sdfMeshCollisonLaunch", nullptr, nullptr },  // PS_SDF_TRIMESH_COLLISION (unmapped)
     { "ps_heightfieldCollisonLaunch", nullptr, nullptr },  // PS_HEIGHTFIELD_COLLISION (unmapped)
-    { "ps_reorderPrimitiveContactsLaunch", nullptr, nullptr },  // PS_REORDER_PRIMITIVE_CONTACTS (unmapped)
+    { "ps_reorderPrimitiveContactsLaunch", "psContactSortBda.spv", "ps_reorderPrimitiveContactsLaunch" },  // PS_REORDER_PRIMITIVE_CONTACTS (P6.4b-1 BDA port: gather sorted contact arrays)
     { "ps_contactPrepareLaunch", nullptr, nullptr },  // PS_CONTACT_PREPARE (unmapped)
     { "ps_solvePCOutputParticleDeltaVLaunch", nullptr, nullptr },  // PS_SOLVE_PC_PARTICLE (unmapped)
     { "ps_solvePCOutputRigidDeltaVLaunch", nullptr, nullptr },  // PS_SOLVE_PC_RIGID (unmapped)
     { "ps_solveOneWayContactDeltaVLaunch", "particleSelfCollisionBda.spv", "ps_solveOneWayContactDeltaVLaunch" },  // PS_SOLVE_ONEWAY_CONTACTS (P6.3 BDA port: one-way contact solve -> accumDeltaP)
-    { "ps_findStartEndParticleFirstLaunch", nullptr, nullptr },  // PS_FIND_RANGESTARTEND_PARTICLE_FIRST (unmapped)
-    { "ps_findStartEndParticleSecondLaunch", nullptr, nullptr },  // PS_FIND_RANGESTARTEND_PARTICLE_SECONE (unmapped)
+    { "ps_findStartEndParticleFirstLaunch", "psContactSortBda.spv", "ps_findStartEndParticleFirstLaunch" },  // PS_FIND_RANGESTARTEND_PARTICLE_FIRST (P6.4b-1 BDA port: per-block range-start offsets)
+    { "ps_findStartEndParticleSecondLaunch", "psContactSortBda.spv", "ps_findStartEndParticleSecondLaunch" },  // PS_FIND_RANGESTARTEND_PARTICLE_SECONE (P6.4b-1 BDA port: per-particle [start,end) ranges + pair count)
     { "ps_accumulateDeltaVParticleLaunch", nullptr, nullptr },  // PS_ACCUMULATE_DELTAVEL_PARTICLE (unmapped)
     { "ps_updateParticleLaunch", "particleSelfCollisionBda.spv", "ps_updateParticleLaunch" },  // PS_UPDATE_PARTICLE (P6.3 BDA port: apply accumDeltaP + recompute sorted velocity)
     { "ps_integrateLaunch", "particleSim.spv", "ps_integrateLaunch" },  // PS_INTEGRATION (P6.0 BDA port)

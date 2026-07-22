@@ -326,6 +326,38 @@ static const uint8_t kPsPrimCollide[] = { 1, 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
 //   leaving a device pointer + PxU32 -> {8,4} = 16-byte blob.
 static const uint8_t kRadixDescNoCount[] = { 8, 4 };
 
+// gpucommon/src/CUDA/radixSortImpl.cu:39 / :53 (P6.4b-1 plain radix twins the PBD
+// particle contact-sort loop drives, PxgParticleSystemCore.cpp:1141):
+//   radixSortMultiBlockLaunch(PxgRadixSortBlockDesc* desc, const PxU32 gStartBit)
+//   / radixSortMultiCalculateRanksLaunch(same ABI) — SAME {desc, startBit} = {8,4}
+//   push pack as the WithoutCount twins; the numKeys difference (deref'd from the
+//   PxgRadixSortBlockDesc::numKeys DEVICE POINTER @48, not the inline count) is
+//   entirely on-device, so this row is shared.  Launched grid (RADIX_SORT, 2, 1).
+static const uint8_t kRadixDescPlain[] = { 8, 4 };
+
+// gpunarrowphase cudaParticleSystem.cu:1687 (P6.4b-1 contact reorder):
+//   ps_reorderPrimitiveContactsLaunch(const PxgParticlePrimitiveContact* particleContacts,
+//     const PxI32* numParticleContacts, const PxU32* remapByRigid, const PxU32* remapByParticle,
+//     PxgParticlePrimitiveContact* sortedContactsByRigid,
+//     PxgParticlePrimitiveContact* sortedContactsByParticle)
+//   -> 6 device pointers = {8,8,8,8,8,8} = 48-byte blob.  Launch PxgParticleSystemCore.cpp:1302.
+static const uint8_t kPsReorderContacts[] = { 8, 8, 8, 8, 8, 8 };
+
+// gpusimulationcontroller particlesystem.cu:2277 (P6.4b-1 range-find pass 1):
+//   ps_findStartEndParticleFirstLaunch(PxgParticleSystem* particleSystems,
+//     PxgParticlePrimitiveContact* sortedContacts, PxU32* numContacts,
+//     PxU32* blockOffsets, PxU32* offsets)
+//   -> 5 device pointers = {8,8,8,8,8} = 40-byte blob (particleSystems ABI-only,
+//   never dereferenced).  Launch PxgParticleSystemCore.cpp:1648.
+static const uint8_t kPsFindStartEnd1[] = { 8, 8, 8, 8, 8 };
+
+// gpusimulationcontroller particlesystem.cu:2402 (P6.4b-1 range-find pass 2):
+//   ps_findStartEndParticleSecondLaunch(PxgParticlePrimitiveContact* sortedContacts,
+//     PxU32* numContacts, PxU32* blockOffsets, PxU32* offsets, PxU32* totalNumPairs,
+//     PxU32* rangeStart, PxU32* rangeEnd)
+//   -> 7 device pointers = {8,8,8,8,8,8,8} = 56-byte blob.  Launch PxgParticleSystemCore.cpp:1690.
+static const uint8_t kPsFindStartEnd2[] = { 8, 8, 8, 8, 8, 8, 8 };
+
 // gpucommon/src/CUDA/radixSortImpl.cu (P6.1 particle contact-sort BDA):
 //   radixSortDoubleCopy(const PxU64* inValue0, PxU64* outValue0, PxU32* rank0,
 //     const PxU64* inValue1, PxU64* outValue1, PxU32* rank1, const PxU32* numKeys)
@@ -469,6 +501,14 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_primitivesBoundSecondPassLaunch", kPsPrimBound2, uint32_t(sizeof(kPsPrimBound2)) },
     // gpunarrowphase (P6.4a-2 PBD particle-vs-primitive contact generator)
     { "ps_primitivesCollisionLaunch", kPsPrimCollide, uint32_t(sizeof(kPsPrimCollide)) },
+    // gpucommon radixSortImpl.cu:39 / :53 — the PLAIN radix twins (P6.4b-1 BDA);
+    // same {8,4} pack as the WithoutCount twins (numKeys deref'd on-device).
+    { "radixSortMultiBlockLaunch", kRadixDescPlain, uint32_t(sizeof(kRadixDescPlain)) },
+    { "radixSortMultiCalculateRanksLaunch", kRadixDescPlain, uint32_t(sizeof(kRadixDescPlain)) },
+    // gpusimulationcontroller/gpunarrowphase (P6.4b-1 PBD contact sort/organize)
+    { "ps_reorderPrimitiveContactsLaunch", kPsReorderContacts, uint32_t(sizeof(kPsReorderContacts)) },
+    { "ps_findStartEndParticleFirstLaunch", kPsFindStartEnd1, uint32_t(sizeof(kPsFindStartEnd1)) },
+    { "ps_findStartEndParticleSecondLaunch", kPsFindStartEnd2, uint32_t(sizeof(kPsFindStartEnd2)) },
     // gpucommon radixSortImpl.cu:69 / :81 — the WithoutCount radix twins (P6.2 BDA)
     { "radixSortMultiBlockLaunchWithoutCount", kRadixDescNoCount, uint32_t(sizeof(kRadixDescNoCount)) },
     { "radixSortMultiCalculateRanksLaunchWithoutCount", kRadixDescNoCount, uint32_t(sizeof(kRadixDescNoCount)) },

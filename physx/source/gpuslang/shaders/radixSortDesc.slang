@@ -49,6 +49,16 @@
 // count field, mirrored at offset 40 in PxgRadixSortDescGpu) instead.  Their
 // ranking cores are copied verbatim from the WithCount entrypoints (only
 // numKeys is re-sourced), so the proven WithCount SPIR-V is byte-untouched.
+//
+// P6.4b-1 adds the PLAIN twins radixSortMultiBlockLaunch / ...CalculateRanks
+// (radixSortImpl.cu:39 / :53) — the variant the PBD particle contact-sort loop
+// drives (PxgParticleSystemCore.cpp:1141, grid (RADIX_SORT, 2, 1)).  These take
+// the SAME {desc, startBit} push ABI as the WithoutCount twins ({8,4}) but the
+// descriptor is a PxgRadixSortBlockDesc (PxgRadixSortDesc.h:49) — PxgRadixSortDesc
+// plus a trailing PxU32* numKeys DEVICE POINTER at offset 48 — and numKeys is read
+// as *desc[blockIdx.y].numKeys (a device dereference), NOT the inline PxU32 count.
+// Bodies copied verbatim from the WithoutCount twins (only numKeys re-sourced),
+// so all previously proven SPIR-V is byte-untouched.
 
 import pxgSlangScan;
 
@@ -377,6 +387,220 @@ void radixSortMultiCalculateRanksLaunchWithoutCount(uint3 groupThreadId : SV_Gro
 
     PxgRadixSortDescGpu desc = (Ptr<PxgRadixSortDescGpu>(gRsdNc.desc))[groupId.y];
     const uint numKeys = desc.count;
+    Ptr<uint> inputKeys = Ptr<uint>(desc.inputKeys);
+    Ptr<uint> inputRanks = Ptr<uint>(desc.inputRanks);
+    Ptr<uint> outputKeys = Ptr<uint>(desc.outputKeys);
+    Ptr<uint> outputRanks = Ptr<uint>(desc.outputRanks);
+    Ptr<uint> radixCounts = Ptr<uint>(desc.radixBlockCounts);
+
+    // ---- Step 1: global write cursor per digit for this block ----
+    if (tid < RADIX_SIZE)
+    {
+        const uint d = tid;
+        uint blockPrefix = 0;
+        uint digitTotal = 0;
+        for (uint b = 0; b < NUM_BLOCKS; ++b)
+        {
+            const uint cnt = radixCounts[d * NUM_BLOCKS + b];
+            if (b < blockId)
+                blockPrefix += cnt;
+            digitTotal += cnt;
+        }
+        gsIterTotals[d] = digitTotal;
+        gsDigitStart[d] = blockPrefix;
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (tid == 0)
+    {
+        uint running = 0;
+        for (uint d = 0; d < RADIX_SIZE; ++d)
+        {
+            gsDigitStart[d] += running;
+            running += gsIterTotals[d];
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    // ---- Step 2: iterate the chunk, ranking 4096 keys per iteration ----
+    const BlockChunk chunk = computeBlockChunk(blockId, numKeys);
+
+    for (uint iter = 0; iter < chunk.iterations; ++iter)
+    {
+        const uint u4 = chunk.startU4 + iter * BLOCK_SIZE + tid;
+        const bool rowValid = u4 < chunk.endU4;
+
+        uint keys[4];
+        uint ranks[4];
+        uint digits[4];
+        bool valid[4];
+        uint withinWarpRank[4];
+
+        [ForceUnroll]
+        for (uint c = 0; c < 4; ++c)
+        {
+            const uint keyIndex = u4 * 4 + c;
+            valid[c] = rowValid && keyIndex < numKeys;
+            keys[c] = valid[c] ? inputKeys[keyIndex] : 0u;
+            ranks[c] = valid[c] ? inputRanks[keyIndex] : 0u;
+            digits[c] = getRadix(keys[c], startBit);
+            withinWarpRank[c] = 0u;
+        }
+
+        for (uint group = 0; group < RADIX_SIZE; group += 4)
+        {
+            uint accum = 0;
+            [ForceUnroll]
+            for (uint c = 0; c < 4; ++c)
+            {
+                const uint rel = digits[c] - group;
+                if (valid[c] && rel < 4)
+                    accum += 1u << (rel << 3);
+            }
+
+            const uint inclusive = warp32InclusiveScan(tid, accum);
+
+            if ((tid & 31u) == 31u)
+            {
+                [ForceUnroll]
+                for (uint dd = 0; dd < 4; ++dd)
+                    gsWarpCounts[(group + dd) * WARPS_PER_BLOCK + warpIndex] = (inclusive >> (dd << 3)) & 0xFFu;
+            }
+
+            uint exclusive = inclusive - accum;
+
+            [ForceUnroll]
+            for (uint c = 0; c < 4; ++c)
+            {
+                const uint rel = digits[c] - group;
+                if (valid[c] && rel < 4)
+                {
+                    withinWarpRank[c] = (exclusive >> (rel << 3)) & 0xFFu;
+                    exclusive += 1u << (rel << 3);
+                }
+            }
+
+            GroupMemoryBarrierWithGroupSync();
+        }
+
+        if (tid < RADIX_SIZE)
+        {
+            uint running = 0;
+            for (uint w = 0; w < WARPS_PER_BLOCK; ++w)
+            {
+                const uint t = gsWarpCounts[tid * WARPS_PER_BLOCK + w];
+                gsWarpCounts[tid * WARPS_PER_BLOCK + w] = running;
+                running += t;
+            }
+            gsIterTotals[tid] = running;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        [ForceUnroll]
+        for (uint c = 0; c < 4; ++c)
+        {
+            if (valid[c])
+            {
+                const uint d = digits[c];
+                const uint outIndex = gsDigitStart[d]
+                    + gsWarpCounts[d * WARPS_PER_BLOCK + warpIndex]
+                    + withinWarpRank[c];
+                outputKeys[outIndex] = keys[c];
+                outputRanks[outIndex] = ranks[c];
+            }
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        if (tid < RADIX_SIZE)
+            gsDigitStart[tid] += gsIterTotals[tid];
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plain twins (radixSortImpl.cu:39 / :53) — numKeys DEREFERENCED from the device
+// pointer PxgRadixSortBlockDesc::numKeys (@48), NOT the inline PxU32 count.  Push
+// ABI {desc, startBit} = {8,4} reuses RadixSortDescNoCountParams.  The PBD
+// particle contact-sort loop (PxgParticleSystemCore.cpp:1141) drives these.
+// ---------------------------------------------------------------------------
+// mirrors PxgRadixSortBlockDesc (PxgRadixSortDesc.h:49) — PxgRadixSortDesc's 5
+// pointers + PxU32 count (@40) + a trailing PxU32* numKeys (@48); C sizeof = 56.
+struct PxgRadixSortBlockDescGpu
+{
+    uint64_t inputKeys;         // @0
+    uint64_t inputRanks;        // @8
+    uint64_t outputKeys;        // @16
+    uint64_t outputRanks;       // @24
+    uint64_t radixBlockCounts;  // @32
+    uint count;                 // @40 (unused by the plain twins)
+    uint pad0;                  // @44
+    uint64_t numKeys;           // @48 PxU32* device pointer -> *numKeys is the key count
+}
+
+// mirrors radixSortMultiBlockLaunch -> radixSortSingleBlock: per-block digit
+// histogram of desc[blockIdx.y]'s input keys, numKeys = *desc.numKeys (identical
+// body to radixSortMultiBlockLaunchWithoutCount bar the numKeys source).
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void radixSortMultiBlockLaunch(uint3 groupThreadId : SV_GroupThreadID,
+                               uint3 groupId : SV_GroupID)
+{
+    const uint tid = groupThreadId.x;
+    const uint blockId = groupId.x;
+    const uint startBit = gRsdNc.startBit;
+
+    PxgRadixSortBlockDescGpu desc = (Ptr<PxgRadixSortBlockDescGpu>(gRsdNc.desc))[groupId.y];
+    const uint numKeys = Ptr<uint>(desc.numKeys)[0];
+    Ptr<uint> inputKeys = Ptr<uint>(desc.inputKeys);
+    Ptr<uint> radixCounts = Ptr<uint>(desc.radixBlockCounts);
+
+    if (tid < RADIX_SIZE)
+        gsHistogram[tid] = 0u;
+
+    GroupMemoryBarrierWithGroupSync();
+
+    const BlockChunk chunk = computeBlockChunk(blockId, numKeys);
+
+    for (uint u4 = chunk.startU4 + tid; u4 < chunk.endU4; u4 += BLOCK_SIZE)
+    {
+        [ForceUnroll]
+        for (uint c = 0; c < 4; ++c)
+        {
+            const uint keyIndex = u4 * 4 + c;
+            if (keyIndex < numKeys)
+            {
+                const uint digit = getRadix(inputKeys[keyIndex], startBit);
+                InterlockedAdd(gsHistogram[digit], 1u);
+            }
+        }
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (tid < RADIX_SIZE)
+        radixCounts[tid * NUM_BLOCKS + blockId] = gsHistogram[tid];
+}
+
+// mirrors radixSortMultiCalculateRanksLaunch -> radixSortCalculateRanks: stable
+// reorder of desc[blockIdx.y]'s keys+ranks by the current 4-bit digit, numKeys =
+// *desc.numKeys (identical body to the WithoutCount twin bar the numKeys source).
+[shader("compute")]
+[numthreads(BLOCK_SIZE, 1, 1)]
+void radixSortMultiCalculateRanksLaunch(uint3 groupThreadId : SV_GroupThreadID,
+                                        uint3 groupId : SV_GroupID)
+{
+    const uint tid = groupThreadId.x;
+    const uint blockId = groupId.x;
+    const uint warpIndex = tid >> 5;
+    const uint startBit = gRsdNc.startBit;
+
+    PxgRadixSortBlockDescGpu desc = (Ptr<PxgRadixSortBlockDescGpu>(gRsdNc.desc))[groupId.y];
+    const uint numKeys = Ptr<uint>(desc.numKeys)[0];
     Ptr<uint> inputKeys = Ptr<uint>(desc.inputKeys);
     Ptr<uint> inputRanks = Ptr<uint>(desc.inputRanks);
     Ptr<uint> outputKeys = Ptr<uint>(desc.outputKeys);
