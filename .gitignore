@@ -2,3 +2,5 @@
 /build-gpuslang/
 # full-SDK integration test build output (P5)
 /build-sdk/
+# Claude Code local session state (agent worktrees, task tracking) — never project content
+/.claude/
