@@ -358,6 +358,38 @@ static const uint8_t kPsFindStartEnd1[] = { 8, 8, 8, 8, 8 };
 //   -> 7 device pointers = {8,8,8,8,8,8,8} = 56-byte blob.  Launch PxgParticleSystemCore.cpp:1690.
 static const uint8_t kPsFindStartEnd2[] = { 8, 8, 8, 8, 8, 8, 8 };
 
+// gpusimulationcontroller particlesystem.cu:1238 (P6.4b-2 contact constraint prep):
+//   ps_contactPrepareLaunch(PxgParticleSystem* particleSystems,
+//     PxgParticlePrimitiveContact* sortedContacts, PxU32* numContacts,
+//     PxgParticlePrimitiveConstraintBlock* primitiveConstraints,
+//     PxgPrePrepDesc* preDesc, PxgConstraintPrepareDesc* prepareDesc,
+//     float2* appliedForces, PxReal dt, bool isTGS, float4* deltaVel,
+//     PxgSolverSharedDescBase* sharedDesc)
+//   -> {8,8,8,8,8,8,8,4,1,8,8} = 80-byte blob (dt@56, isTGS byte@60, deltaVel@64
+//   after the 8-align).  Launch PxgParticleSystemCore.cpp:1609.
+static const uint8_t kPsContactPrepare[] = { 8, 8, 8, 8, 8, 8, 8, 4, 1, 8, 8 };
+
+// gpusimulationcontroller particlesystem.cu:1531 (P6.4b-2 particle-side PC solve,
+// the NON-TGS variant):
+//   ps_solvePCOutputParticleDeltaVLaunch(PxgParticleSystem* particleSystems,
+//     PxgParticlePrimitiveContact* sortedContacts,
+//     PxgParticlePrimitiveConstraintBlock* primitiveConstraints, PxU32* numContacts,
+//     PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
+//     PxgSolverSharedDesc<IterativeSolveData>* sharedDesc, float4* deltaPos,
+//     float2* appliedForces, PxReal dt, PxReal relaxationCoefficient,
+//     bool isVelocityIteration, PxgArticulationCoreDesc* artiCoreDesc)
+//   -> {8,8,8,8,8,8,8,8,8,4,4,1,8} = 96-byte blob (dt@72, coeff@76, bool byte@80,
+//   artiCoreDesc@88).  Launch PxgParticleSystemCore.cpp:1948.
+static const uint8_t kPsSolvePCParticle[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 1, 8 };
+
+// gpusimulationcontroller particlesystem.cu:2828 (P6.4b-2 per-particle deltaV accum):
+//   ps_accumulateDeltaVParticleLaunch(PxgParticleSystem* particleSystems,
+//     PxgParticlePrimitiveContact* sortedContacts, PxU32* totalNumPairs,
+//     PxU32* rangeStart, PxU32* rangeEnd, float4* deltaPos)
+//   -> 6 device pointers = {8,8,8,8,8,8} = 48-byte blob.  Launch
+//   PxgParticleSystemCore.cpp:2005.
+static const uint8_t kPsAccumulateDeltaVParticle[] = { 8, 8, 8, 8, 8, 8 };
+
 // gpucommon/src/CUDA/radixSortImpl.cu (P6.1 particle contact-sort BDA):
 //   radixSortDoubleCopy(const PxU64* inValue0, PxU64* outValue0, PxU32* rank0,
 //     const PxU64* inValue1, PxU64* outValue1, PxU32* rank1, const PxU32* numKeys)
@@ -509,6 +541,10 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_reorderPrimitiveContactsLaunch", kPsReorderContacts, uint32_t(sizeof(kPsReorderContacts)) },
     { "ps_findStartEndParticleFirstLaunch", kPsFindStartEnd1, uint32_t(sizeof(kPsFindStartEnd1)) },
     { "ps_findStartEndParticleSecondLaunch", kPsFindStartEnd2, uint32_t(sizeof(kPsFindStartEnd2)) },
+    // gpusimulationcontroller (P6.4b-2 PBD particle-side contact solve)
+    { "ps_contactPrepareLaunch", kPsContactPrepare, uint32_t(sizeof(kPsContactPrepare)) },
+    { "ps_solvePCOutputParticleDeltaVLaunch", kPsSolvePCParticle, uint32_t(sizeof(kPsSolvePCParticle)) },
+    { "ps_accumulateDeltaVParticleLaunch", kPsAccumulateDeltaVParticle, uint32_t(sizeof(kPsAccumulateDeltaVParticle)) },
     // gpucommon radixSortImpl.cu:69 / :81 — the WithoutCount radix twins (P6.2 BDA)
     { "radixSortMultiBlockLaunchWithoutCount", kRadixDescNoCount, uint32_t(sizeof(kRadixDescNoCount)) },
     { "radixSortMultiCalculateRanksLaunchWithoutCount", kRadixDescNoCount, uint32_t(sizeof(kRadixDescNoCount)) },

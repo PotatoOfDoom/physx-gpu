@@ -106,6 +106,40 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
+## P6.4b-2 — particle-side contact SOLVE on the engine ABI (the "catch" application)
+
+Brought the particle-side primitive-contact SOLVE onto the BDA engine ABI — the kernels that
+turn a particle-vs-shape contact into a corrective particle delta. Three kernels;
+`PXG_SLANG_KERNEL_MAPPED` 174 → **177**:
+- `ps_contactPrepareLaunch` (`particlesystem.cu:1238`, ABI `{8,8,8,8,8,8,8,4,1,8,8}`=80B) — prep the
+  primitive contact constraint (effective mass / normal / bias) into the 3072-byte
+  `PxgParticlePrimitiveConstraintBlock` SoA.
+- `ps_solvePCOutputParticleDeltaVLaunch` (`:1531`, non-TGS, `{8,8,8,8,8,8,8,8,8,4,4,1,8}`=96B) —
+  solve the constraint, particle side → per-contact deltaV.
+- `ps_accumulateDeltaVParticleLaunch` (`:2828`, `{8,8,8,8,8,8}`=48B) — reduce per-contact deltaV
+  over each particle's `[start,end)` range (P6.4b-1) into the particle's accumulated delta.
+New file `psContactSolveBda.slang`; all descriptor fields reused from existing mirrors
+(`PxgParticleSystemGpu`, the SoA constraint block walked by byte-offset `Ptr` views, plus the
+solver-desc mirrors), none added.
+
+**KEY EVIDENCE — a penetrating particle is pushed OUT:** unit test `gpuslang.psContactSolve` builds
+one particle penetrating a static plane (normal (0,1,0), pen −0.1, range [0,1)), runs
+prepare→solve→accumulate, and asserts `accumDeltaP = (0, +0.1, 0)` — UPWARD, fully resolving the
+penetration — bit-exact vs a CPU transcription (plus relaxation-scaled and infinite-mass cases).
+In the live scene the 3 kernels now **DISPATCH OK** (contactPrepare ×240, solve ×600, accumulate
+×600 per run) and safely no-op on the zero-contact high cloud (uniform `workIndex<tNumContacts`
+zero-trip guard) — this additionally proves the BDA/ABI wiring end-to-end. Free-fall byte-unchanged
+(PGS 80.9665, TGS 9.89m). Suite **671/671** both memory modes. Rigid regression 8×2 = **16/16**.
+
+Deviations (flagged): the `isArticulation()` reaction branch is structurally preserved but dead
+(no write; the artiCoreDesc/outArtiVelocity reads sunk into the dead branch so a rigid/static
+contact never dereferences them) — a byte-exact articulation mirror is a separate reaction tranche;
+descriptor block-copy→direct `Ptr<>` reads; no 32-lane-warp ops in these kernels.
+
+Remaining to the money shot: the rigid-side reaction (`ps_solvePCOutputRigidDeltaVLaunch`,
+`accumulateDeltaVRigid*` — inert for a static floor) + the TGS solve twin + articulation path, and
+**P6.5** (lower the cloud + rewrite the harness fall→rest so the settling bag becomes observable).
+
 ## P6.4b-1 — particle contact sort + reorder + range-find on the engine ABI
 
 Brought the contact-**organization** half of the consume path onto the BDA engine ABI —

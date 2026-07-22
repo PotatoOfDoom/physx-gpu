@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 174;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 177;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -229,13 +229,13 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_sdfMeshCollisonLaunch", nullptr, nullptr },  // PS_SDF_TRIMESH_COLLISION (unmapped)
     { "ps_heightfieldCollisonLaunch", nullptr, nullptr },  // PS_HEIGHTFIELD_COLLISION (unmapped)
     { "ps_reorderPrimitiveContactsLaunch", "psContactSortBda.spv", "ps_reorderPrimitiveContactsLaunch" },  // PS_REORDER_PRIMITIVE_CONTACTS (P6.4b-1 BDA port: gather sorted contact arrays)
-    { "ps_contactPrepareLaunch", nullptr, nullptr },  // PS_CONTACT_PREPARE (unmapped)
-    { "ps_solvePCOutputParticleDeltaVLaunch", nullptr, nullptr },  // PS_SOLVE_PC_PARTICLE (unmapped)
+    { "ps_contactPrepareLaunch", "psContactSolveBda.spv", "ps_contactPrepareLaunch" },  // PS_CONTACT_PREPARE (P6.4b-2 BDA port: particle-vs-primitive contact constraint prep)
+    { "ps_solvePCOutputParticleDeltaVLaunch", "psContactSolveBda.spv", "ps_solvePCOutputParticleDeltaVLaunch" },  // PS_SOLVE_PC_PARTICLE (P6.4b-2 BDA port: particle-side PC solve -> per-contact deltaV)
     { "ps_solvePCOutputRigidDeltaVLaunch", nullptr, nullptr },  // PS_SOLVE_PC_RIGID (unmapped)
     { "ps_solveOneWayContactDeltaVLaunch", "particleSelfCollisionBda.spv", "ps_solveOneWayContactDeltaVLaunch" },  // PS_SOLVE_ONEWAY_CONTACTS (P6.3 BDA port: one-way contact solve -> accumDeltaP)
     { "ps_findStartEndParticleFirstLaunch", "psContactSortBda.spv", "ps_findStartEndParticleFirstLaunch" },  // PS_FIND_RANGESTARTEND_PARTICLE_FIRST (P6.4b-1 BDA port: per-block range-start offsets)
     { "ps_findStartEndParticleSecondLaunch", "psContactSortBda.spv", "ps_findStartEndParticleSecondLaunch" },  // PS_FIND_RANGESTARTEND_PARTICLE_SECONE (P6.4b-1 BDA port: per-particle [start,end) ranges + pair count)
-    { "ps_accumulateDeltaVParticleLaunch", nullptr, nullptr },  // PS_ACCUMULATE_DELTAVEL_PARTICLE (unmapped)
+    { "ps_accumulateDeltaVParticleLaunch", "psContactSolveBda.spv", "ps_accumulateDeltaVParticleLaunch" },  // PS_ACCUMULATE_DELTAVEL_PARTICLE (P6.4b-2 BDA port: reduce per-contact deltaV over each particle's [start,end) range)
     { "ps_updateParticleLaunch", "particleSelfCollisionBda.spv", "ps_updateParticleLaunch" },  // PS_UPDATE_PARTICLE (P6.3 BDA port: apply accumDeltaP + recompute sorted velocity)
     { "ps_integrateLaunch", "particleSim.spv", "ps_integrateLaunch" },  // PS_INTEGRATION (P6.0 BDA port)
     { "ps_calculateDensityAndPotentialLaunch", nullptr, nullptr },  // PS_CALCULATE_DENSITIES_AND_POTENTIALS (unmapped)
