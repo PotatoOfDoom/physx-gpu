@@ -240,6 +240,21 @@ static const uint8_t kPsUpdateUserBuffer[] = { 8, 8, 4 };
 //     Two device pointers -> 16-byte blob (same shape as kTwoPtr).
 static const uint8_t kPsUpdateUnsorted[] = { 8, 8 };
 
+// gpusimulationcontroller FEMCloth.cu (P7.0 FEMCloth free-fall BDA):
+//   cloth_preIntegrateLaunch(PxgFEMCloth* femCloths, const PxU32* activeIds,
+//     PxVec3 gravity, PxReal dt, bool isTGS, PxReal* speculativeCCDContactOffset,
+//     bool externalForcesEveryTgsIterationEnabled, bool adaptiveCollisionPairUpdate,
+//     PxU8* updateContactPairs, PxU32* VTContactCounts, PxU32* EEContactCounts)
+//     PxVec3 by value = 12 -> natural-alignment blob = 80 bytes.
+static const uint8_t kClothPreIntegrate[] = { 8, 8, 12, 4, 1, 8, 1, 1, 8, 8, 8 };
+//   cloth_finalizeVelocitiesLaunch(PxgFEMCloth* femCloths, const PxU32* activeId,
+//     PxReal invTotalDt, PxReal dt, bool alwaysRunVelocityAveraging) -> 32-byte blob.
+static const uint8_t kClothFinalizeVel[] = { 8, 8, 4, 4, 1 };
+//   cloth_sleeping(PxgFEMCloth* femCloths, PxU32 numActiveCloths, const PxU32*
+//     activeId, PxReal dt, PxReal resetCounter, PxReal* wakeCounters,
+//     PxU32* stateChangedMask) -> 48-byte blob (activeId 8-aligned after the PxU32).
+static const uint8_t kClothSleeping[] = { 8, 4, 8, 4, 4, 8, 8 };
+
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
@@ -542,6 +557,10 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_preIntegrateLaunch", kPsPreIntegrate, uint32_t(sizeof(kPsPreIntegrate)) },
     { "ps_integrateLaunch", kPsIntegrate, uint32_t(sizeof(kPsIntegrate)) },
     { "ps_updateUserBufferLaunch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
+    // gpusimulationcontroller FEMCloth kernels (P7.0 FEMCloth free-fall BDA)
+    { "cloth_preIntegrateLaunch", kClothPreIntegrate, uint32_t(sizeof(kClothPreIntegrate)) },
+    { "cloth_finalizeVelocitiesLaunch", kClothFinalizeVel, uint32_t(sizeof(kClothFinalizeVel)) },
+    { "cloth_sleeping", kClothSleeping, uint32_t(sizeof(kClothSleeping)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },

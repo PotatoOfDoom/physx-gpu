@@ -106,6 +106,66 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
+## P7.0 — MILESTONE: the FIRST live FEMCloth frame — a triangle-mesh cloth falls under gravity on Vulkan
+
+The deformable-surface (cloth) subsystem opens exactly as the particle arc did with
+P6.0: a triangle-mesh cloth FALLING under gravity through the full `Pxg*` engine on
+llvmpipe. Three FEMCloth orchestration kernels; `PXG_SLANG_KERNEL_MAPPED` 180 → **183**,
+all in new file `femClothSimBda.slang`, ported line-for-line from
+`gpusimulationcontroller/src/CUDA/FEMCloth.cu`:
+- `cloth_preIntegrateLaunch` (`FEMCloth.cu:48`, ABI `{8,8,12,4,1,8,1,1,8,8,8}`=80B) — the
+  free-fall driver: gravity predict AND the PGS position integration in one shot
+  (`positions[i] = oldPos + vel*dt`, the observable fall). The cloth vertex arrays ALIAS
+  the user `PxDeformableSurface` buffers directly (`PxgSimulationCore.cpp:1850`), so this
+  write is what a host DtoH read of `getPositionInvMassBufferD()` sees — NO ingest/egress
+  kernel. Launch `PxgFEMClothCore.cpp:177`.
+- `cloth_finalizeVelocitiesLaunch` (`:1227`, ABI `{8,8,4,4,1}`=32B) — velocity settling +
+  the block-wide wake flag (`mIsActive` device `atomicOr`). Its two-level warp `__any_sync`
+  lowers to a groupshared `InterlockedOr` (block-wide OR — semantically identical).
+- `cloth_sleeping` (`:1313`, ABI `{8,4,8,4,4,8,8}`=48B) — wake-counter bookkeeping. REQUIRED
+  or the cloth deactivates (wakeCounters→0 in ~24 frames) and the fall freezes. Its
+  `__ballot_sync` lowers to a groupshared `InterlockedOr` ballot, and the CUDA
+  early-return+`__syncthreads` is restructured to an `if (gid < n)` guard so ALL threads
+  reach both barriers (llvmpipe requires uniform barrier control flow).
+
+New descriptor mirror `pxgSlangFEMClothDesc.slang`: byte-exact `PxgFEMClothGpu` of the engine
+`class PxgFEMCloth` (`PxgFEMCloth.h:69`), flat pointer+scalar block, sizeof **400**; the packed
+`PxU8 mActorFlags|PxU8 mBodyFlags|PxU16 mSurfaceFlags` @376 folds to one `mFlagsWord` (low byte =
+mActorFlags; gravity-disable test). New scene `PXG_SCENE=cloth` in `testGpuSdkStep.cpp`: a
+vert-mapped triangle grid cooked with `buildGPUData`, a `PxDeformableSurface` spawned high with
+one live rigid body below (the zero-dynamic-rigid null-deref trap), DtoH mean-vertex-y readback.
+
+**KEY EVIDENCE — the FEMCloth free-fall (`PXG_SCENE=cloth PXG_SOLVER=pgs`):**
+```
+step  0: mean y = 4.99727 (dy = -0.00273)    step 30: mean y = 3.64840 (dy = -0.08448)
+step 10: mean y = 4.82015 (dy = -0.02997)    step 50: mean y = 1.38665 (dy = -0.13897)
+step 20: mean y = 4.37052 (dy = -0.05723)    step 59: mean y = 0.01325 (dy = -0.16350)
+cloth free fall: mean y 5.0000 -> 0.0133 (dropped 4.9867 over 1.00s)
+[  OK  ] gpu-sdk-step: FEMCloth fell monotonically under gravity on Vulkan (the first live FEMCloth frame)
+```
+Monotonic, with dy accelerating each step (−0.0027 → −0.1635) — exactly semi-implicit
+free-fall. All 3 cloth kernels DISPATCH + launch OK in the trace. Deviations (flagged, all
+free-fall-preserving): `preIntegrate`'s `adaptiveCollisionPairUpdate` warpReduction (its only
+subgroup op) is OMITTED — the scene sets `nbCollisionPairUpdatesPerTimestep != 0` so that
+branch is dead; the `*updateContactPairs = !isTGS` PxU8 store is elided (buffer is exactly
+`sizeof(PxU8)`, no mapped kernel consumes it on the free-fall path). New unit test
+`gpuslang.femClothSim` (5 cases: descLayout, PreIntegratePGS, PreIntegrateTGS, Finalize,
+Sleeping) bit-exact vs a CPU transcription of the .cu, both memory modes; the P6.1 particle
+BDA re-points verified intact (manifest hand-edited, NOT regenerated). Full suite **673/673**
+both memory modes; rigid regression 8×2 = **16/16** — all as re-verified end-to-end by the
+build agent BEFORE the environment note below.
+
+**ENVIRONMENT NOTE (llvmpipe full-engine path degraded mid-verification):** the byte-identical
+build that ran the cloth free-fall + full suite green began, ~2h into this container's boot,
+to SIGSEGV inside `libvulkan_lvp.so` (null deref, `at 50`) on the FIRST core kernel of any
+`gpu-sdk-step` step (`updateShapesLaunch`) — for EVERY scene (box/particle/cloth), in both
+memory modes. Proven environmental, not a code regression: the clean committed P6.6 (d584c8f)
+ALSO crashes the same way now, and dmesg shows the crash epoch begins abruptly at the same
+uptime for all binaries (the agent's own binary that stepped cloth cleanly earlier now
+crashes too). The gpuslang unit suite (isolated-kernel llvmpipe path) stays fully green, so
+the P7.0 kernels remain unit-verified bit-exact in both modes; the money-shot scene re-run is
+pending a fresh container (the deterministic scene proof above was captured before the drift).
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

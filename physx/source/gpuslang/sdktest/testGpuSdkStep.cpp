@@ -439,6 +439,148 @@ float particleMeanY(const ParticleScene& psc)
     for (PxU32 i = 0; i < psc.numParticles; ++i) sum += double(host[i].y);
     return float(sum / double(psc.numParticles));
 }
+
+// PXG_SCENE=cloth (P7.0): the first FEMCloth/deformable-surface scene — the exact
+// analog of the PBD particle free fall (buildParticleScene above).  A small
+// triangle GRID mesh (a PxDeformableSurface) is spawned HIGH with invMass = 1 and
+// zero velocity, so it is a pure free fall with NO contacts.  The engine launches
+// the whole per-frame cloth sequence, but only the three P7.0 orchestration
+// kernels are mapped (cloth_preIntegrateLaunch gravity-predict + integrate,
+// cloth_finalizeVelocitiesLaunch, cloth_sleeping wake bookkeeping); every
+// membrane / bending / collision / solve kernel refuses (non-fatal).
+//
+// Two structural wins over particles: (1) the engine's internal cloth vertex
+// arrays ALIAS the user buffer (PxgSimulationCore.cpp:1850 femCloth.mPosition_
+// InvMass = ...positionInvMass), so there is NO ingest/egress kernel — the
+// predictor writes the fall straight into the buffer getPositionInvMassBufferD()
+// reads back; (2) the cloth device buffers allocate via the already-real GPU
+// memory manager in attachShape (NpDeformableSurface.cpp:387), so NO bridge
+// factory code is needed (unlike particles' createParticleBuffer).
+struct ClothScene
+{
+    PxDeformableSurface* surface = nullptr;
+    PxU32 numVerts = 0;
+    PxCudaContextManager* cudaCtx = nullptr;
+};
+
+ClothScene buildClothScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
+                           PxCudaContextManager* cudaCtx)
+{
+    ClothScene out;
+    out.cudaCtx = cudaCtx;
+
+    // A minimal rigid body (box on ground) FAR BELOW the cloth.  As with the
+    // particle scene, the cloth solve runs inside the rigid PGS island loop and
+    // rigidSumInternalContactAndJointBatches2 null-derefs the solver descriptors
+    // with zero dynamic rigids, so one live dynamic body is required to keep that
+    // proven path valid.  It rests at y=0.5, well below the cloth (spawned y~5).
+    addGroundBox(physics, scene, rigidMat);
+    addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+               boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+
+    // Cook a small triangle GRID mesh.  buildGPUData + eENABLE_VERT_MAPPING are
+    // MANDATORY: attachShape rejects a mesh whose getNbTriangleReferences()==0
+    // (NpDeformableSurface.cpp:363), and the GPU solve needs the GPU accel data.
+    const PxU32 numX = 5, numZ = 5;              // 25 verts, 32 triangles
+    const float sizeX = 2.0f, sizeZ = 2.0f;
+    const float spawnY = 5.0f;                   // spawn HIGH — a pure free fall
+    const float sx = sizeX / float(numX - 1);
+    const float sz = sizeZ / float(numZ - 1);
+
+    std::vector<PxVec3> verts;
+    verts.reserve(numX * numZ);
+    for (PxU32 i = 0; i < numX; ++i)
+        for (PxU32 j = 0; j < numZ; ++j)
+            verts.push_back(PxVec3(float(i) * sx - 0.5f * sizeX, 0.0f, float(j) * sz - 0.5f * sizeZ));
+
+    std::vector<PxU32> tris;
+    tris.reserve(3 * 2 * (numX - 1) * (numZ - 1));
+    auto vid = [numZ](PxU32 x, PxU32 y) { return x * numZ + y; };
+    for (PxU32 i = 1; i < numX; ++i)
+        for (PxU32 j = 1; j < numZ; ++j)
+        {
+            tris.push_back(vid(i - 1, j - 1)); tris.push_back(vid(i, j - 1)); tris.push_back(vid(i - 1, j));
+            tris.push_back(vid(i - 1, j));     tris.push_back(vid(i, j - 1)); tris.push_back(vid(i, j));
+        }
+
+    PxTriangleMeshDesc meshDesc;
+    meshDesc.points.count = PxU32(verts.size());
+    meshDesc.points.stride = sizeof(PxVec3);
+    meshDesc.points.data = verts.data();
+    meshDesc.triangles.count = PxU32(tris.size() / 3);
+    meshDesc.triangles.stride = 3 * sizeof(PxU32);
+    meshDesc.triangles.data = tris.data();
+
+    PxCookingParams ckParams(physics->getTolerancesScale());
+    ckParams.buildGPUData = true;
+    ckParams.meshPreprocessParams |= PxMeshPreprocessingFlag::eENABLE_VERT_MAPPING;
+
+    PxTriangleMesh* triMesh =
+        immediateCooking::createTriangleMesh(ckParams, meshDesc, physics->getPhysicsInsertionCallback());
+    if (!triMesh) { std::printf("FAIL: immediateCooking::createTriangleMesh returned null\n"); return out; }
+
+    // Deformable-surface material + a SIMULATION_SHAPE built from the tri-mesh.
+    PxDeformableSurfaceMaterial* clothMat =
+        physics->createDeformableSurfaceMaterial(/*youngs*/ 1.e6f, /*poissons*/ 0.3f,
+            /*dynamicFriction*/ 0.5f, /*thickness*/ 0.01f, /*bendingStiffness*/ 1.e-4f);
+    PxDeformableSurfaceMaterial* mats[1] = { clothMat };
+
+    PxShapeFlags shapeFlags = PxShapeFlag::eSIMULATION_SHAPE | PxShapeFlag::eSCENE_QUERY_SHAPE;
+    PxShape* shape = physics->createShape(PxTriangleMeshGeometry(triMesh),
+                                          mats, PxU16(1), true, shapeFlags);
+    if (!shape) { std::printf("FAIL: createShape (deformable surface) returned null\n"); return out; }
+
+    PxDeformableSurface* surface = physics->createDeformableSurface(*cudaCtx);
+    if (!surface) { std::printf("FAIL: createDeformableSurface returned null\n"); return out; }
+
+    // NON-ADAPTIVE collision-pair updates (frequency != 0): this makes the engine
+    // pass adaptiveCollisionPairUpdate = false to cloth_preIntegrateLaunch, so the
+    // predictor's ONLY warp op (warpReduction in the adaptive branch) is dead code
+    // — no subgroup op runs on llvmpipe from the fall driver.
+    surface->setNbCollisionPairUpdatesPerTimestep(4);
+    surface->setNbCollisionSubsteps(1);
+    surface->setLinearDamping(0.0f);             // cleanest free fall (damping factor 1)
+    surface->setMaxLinearVelocity(1.0e6f);       // do not clamp the free fall
+    surface->attachShape(*shape);
+    shape->release();
+
+    scene->addActor(*surface);
+
+    // Fill the DEVICE buffers directly (getPositionInvMassBufferD() aliases the
+    // engine's internal cloth arrays).  Spawn the whole grid at y=spawnY, invMass=1
+    // so every vertex free-falls; rest position = spawn shape; velocity = 0.
+    const PxU32 nv = PxU32(verts.size());
+    std::vector<PxVec4> posInvMass(nv), vel(nv, PxVec4(0.0f)), rest(nv);
+    for (PxU32 v = 0; v < nv; ++v)
+    {
+        posInvMass[v] = PxVec4(verts[v].x, spawnY + verts[v].y, verts[v].z, 1.0f);
+        rest[v]       = PxVec4(verts[v].x, spawnY + verts[v].y, verts[v].z, 1.0f);
+    }
+
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getPositionInvMassBufferD()),
+                    posInvMass.data(), nv * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getVelocityBufferD()),
+                    vel.data(), nv * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getRestPositionBufferD()),
+                    rest.data(), nv * sizeof(PxVec4));
+
+    out.surface = surface;
+    out.numVerts = nv;
+    return out;
+}
+
+// DtoH-read the cloth vertex buffer and return the mean y across vertices.
+float clothMeanY(const ClothScene& csc)
+{
+    std::vector<PxVec4> host(csc.numVerts);
+    PxCudaContext* ctx = csc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(csc.surface->getPositionInvMassBufferD()),
+                    csc.numVerts * sizeof(PxVec4));
+    double sum = 0.0;
+    for (PxU32 i = 0; i < csc.numVerts; ++i) sum += double(host[i].y);
+    return float(sum / double(csc.numVerts));
+}
 } // namespace
 
 int main()
@@ -599,6 +741,66 @@ int main()
         return 2;
     }
 
+    // PXG_SCENE=cloth (P7.0): the FEMCloth free-fall path — the exact analog of the
+    // particle scene above.  A triangle-mesh cloth falls under gravity, verified by
+    // DtoH-reading its mean vertex y across steps.
+    if (!std::strcmp(sceneName, "cloth"))
+    {
+        ClothScene csc = buildClothScene(physics, scene, material, cudaCtx);
+        if (!csc.surface || csc.numVerts == 0)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: cloth scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'cloth' built: %u-vertex FEMCloth free-falling from y~5 on the GPU\n",
+                    csc.numVerts);
+
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: cloth GPU pipeline CONSTRUCTED + live over Vulkan "
+                        "(set PXG_GPU_STEP=1 to step the free fall)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_CLOTH_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 60;
+        const float y0 = clothMeanY(csc);
+        std::printf("  stepping the cloth (%d x %.4fs), initial mean y=%.4f...\n", steps, dt, y0);
+
+        float prevY = y0;
+        int nonMonotonic = 0;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            const float y = clothMeanY(csc);
+            if (i < 5 || i == steps - 1 || (i % 10 == 0))
+                std::printf("    step %3d: mean y = %.5f (dy = %+.5f)\n", i, y, y - prevY);
+            if (y > prevY + 1e-3f) ++nonMonotonic;   // free fall: must not rise
+            prevY = y;
+        }
+        const float yEnd = clothMeanY(csc);
+        const float drop = y0 - yEnd;
+
+        int failures = 0;
+        std::printf("  cloth free fall: mean y %.4f -> %.4f (dropped %.4f over %.2fs)\n",
+                    y0, yEnd, drop, steps * dt);
+        if (!(yEnd < y0 - 0.05f)) { std::printf("FAIL: cloth did not fall (drop=%.4f)\n", drop); ++failures; }
+        if (nonMonotonic != 0)    { std::printf("FAIL: mean y increased on %d step(s)\n", nonMonotonic); ++failures; }
+        if (!std::isfinite(yEnd)) { std::printf("FAIL: mean y is not finite (%.4f)\n", yEnd); ++failures; }
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: FEMCloth fell monotonically under gravity on Vulkan "
+                        "(the first live FEMCloth frame)\n");
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: cloth free-fall checks failed (%d)\n", failures);
+        return 2;
+    }
+
     std::vector<RestTarget> targets;
     if      (!std::strcmp(sceneName, "box"))       buildBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "stack"))     buildStackScene(physics, scene, material, targets);
@@ -608,7 +810,7 @@ int main()
     else if (!std::strcmp(sceneName, "capsulebox")) buildCapsuleBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "convex"))    buildConvexScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "joint"))     buildJointScene(physics, scene, material, targets);
-    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint)\n", sceneName);
+    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint|particle|cloth)\n", sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
     if (targets.empty())
     {
