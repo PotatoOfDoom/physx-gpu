@@ -155,16 +155,38 @@ BDA re-points verified intact (manifest hand-edited, NOT regenerated). Full suit
 both memory modes; rigid regression 8×2 = **16/16** — all as re-verified end-to-end by the
 build agent BEFORE the environment note below.
 
-**ENVIRONMENT NOTE (llvmpipe full-engine path degraded mid-verification):** the byte-identical
-build that ran the cloth free-fall + full suite green began, ~2h into this container's boot,
-to SIGSEGV inside `libvulkan_lvp.so` (null deref, `at 50`) on the FIRST core kernel of any
-`gpu-sdk-step` step (`updateShapesLaunch`) — for EVERY scene (box/particle/cloth), in both
-memory modes. Proven environmental, not a code regression: the clean committed P6.6 (d584c8f)
-ALSO crashes the same way now, and dmesg shows the crash epoch begins abruptly at the same
-uptime for all binaries (the agent's own binary that stepped cloth cleanly earlier now
-crashes too). The gpuslang unit suite (isolated-kernel llvmpipe path) stays fully green, so
-the P7.0 kernels remain unit-verified bit-exact in both modes; the money-shot scene re-run is
-pending a fresh container (the deterministic scene proof above was captured before the drift).
+**P7.0 RE-VERIFIED on a fresh container — the `libvulkan_lvp.so` SIGSEGV was NOT an
+environmental degradation; it was a MISSING `PXG_SHADER_DIR` (root-caused + fixed).** The
+earlier "environment degraded mid-verification" note (the SIGSEGV inside `libvulkan_lvp.so`,
+null deref `at 50`, on the first core kernel `updateShapesLaunch` of every `gpu-sdk-step`
+scene, both memory modes) was a MISDIAGNOSIS. The real, fully-reproduced mechanism:
+1. `gpu-sdk-step` loads each kernel's SPIR-V blob at first launch via `envSpirvLoader`
+   (`bridge/PhysXGpuVulkan.cpp`), resolving the manifest `spirvFile` against `$PXG_SHADER_DIR`.
+2. With `PXG_SHADER_DIR` UNSET, `bodyUpdate.spv` (the first engine kernel, `updateShapesLaunch`)
+   is not found → **empty blob** → empty `VkShaderModule`.
+3. `vkCreateComputePipelines` returns **VK_ERROR_UNKNOWN (-13)**; `PXG_VK_CHECK` is `fprintf` +
+   `assert(false)`, and `assert` is a no-op under `NDEBUG` (Release), so the failure is
+   **non-fatal** → the shim binds the **NULL `VkPipeline`**.
+4. lavapipe null-derefs that pipeline in `handle_pipeline` (`lvp_execute.c:1034`) at command-
+   buffer replay on the `vk_queue` submit thread → the `at 50` SIGSEGV.
+Ruled out as causes (each tested): Mesa point-release (`25.2.8-0ubuntu0.24.04.1` and `.2` crash
+identically), the `MESA_VK_ENABLE_SUBMIT_THREAD` submit thread, `LP_NUM_THREADS` raster
+threads, the Mesa shader disk cache, and the app pipeline cache. The unit test
+`gpuslang.bodyUpdate` builds the SAME `updateShapesLaunch` pipeline and PASSES (it resolves
+its own shader dir) — proving the SPIR-V is fine and the fault is purely the missing runtime
+shader path. **Fix: run `gpu-sdk-step` with `PXG_SHADER_DIR=<build-gpuslang>/shaders`** (the
+harness shader-output dir); `envSpirvLoader` now also logs a loud one-time warning naming the
+missing file + the `PXG_SHADER_DIR` hint, so the silent-empty-blob → NULL-pipeline trap can
+never masquerade as a driver crash again.
+
+**Re-verification (fresh container, Mesa `25.2.8` / llvmpipe LLVM `20.1.2` — the exact CI
+profile — + slangc `2026.12.2`, both provisioned from scratch):** with `PXG_SHADER_DIR` set,
+`PXG_SCENE=cloth` reproduces the money shot **BIT-EXACT** to the trajectory above (mean y
+`5.0000 → 4.99727 → 4.82015 → 4.37052 → 3.64840 → 1.38665 → 0.01325`, dy monotone
+`−0.00273 → −0.16350`, prints the `[  OK  ]` line); `box` falls `5.000 → 0.500` and rests;
+`particle` free-falls `100.75 → 80.9665`. Full gpuslang suite **673/673 in BOTH memory modes**;
+rigid regression 8×2 = **16/16**. P7.0's code was always good; only the invocation was missing
+the shader path.
 
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 

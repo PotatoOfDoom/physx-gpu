@@ -96,6 +96,25 @@ namespace
 // SPIR-V blob loader: resolves a manifest spirvFile name against $PXG_SHADER_DIR
 // (the same convention the harness uses), falling back to the bare name.  Used
 // lazily by the shim when a pipeline is first launched.
+// Warn (loudly, once) when a MAPPED kernel's SPIR-V blob cannot be loaded.  An
+// empty blob silently produces an empty VkShaderModule, whose vkCreateComputePipelines
+// fails VK_ERROR_UNKNOWN; because PXG_VK_CHECK's assert compiles out under NDEBUG the
+// shim then binds a NULL VkPipeline, which crashes the driver at submit time
+// (lavapipe: null deref in handle_pipeline) — a failure mode that reads like an
+// environment/driver fault but is really just a missing $PXG_SHADER_DIR.  This diagnostic
+// makes the real cause unmissable.  (See RUNTIME_STATUS.md P7.0 environment note.)
+inline void warnMissingSpirv(const std::string& path)
+{
+    const char* dir = std::getenv("PXG_SHADER_DIR");
+    fprintf(stderr,
+            "[gpuslang/bridge] FATAL-ish: SPIR-V blob '%s' is missing or empty. "
+            "The engine will bind a NULL compute pipeline and the GPU driver will crash. "
+            "Set PXG_SHADER_DIR to the compiled-shader directory "
+            "(e.g. <build-gpuslang>/shaders). PXG_SHADER_DIR is currently %s%s%s.\n",
+            path.c_str(),
+            dir ? "'" : "UNSET", dir ? dir : "", dir ? "'" : "");
+}
+
 std::vector<uint8_t> envSpirvLoader(const char* file)
 {
     std::vector<uint8_t> blob;
@@ -105,15 +124,24 @@ std::vector<uint8_t> envSpirvLoader(const char* file)
     const std::string path = dir ? (std::string(dir) + "/" + file) : std::string(file);
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f)
+    {
+        warnMissingSpirv(path);
         return blob;
+    }
     const std::streamsize n = f.tellg();
     if (n <= 0)
+    {
+        warnMissingSpirv(path);
         return blob;
+    }
     f.seekg(0);
     blob.resize(size_t(n));
     f.read(reinterpret_cast<char*>(blob.data()), n);
     if (!f)
+    {
         blob.clear();
+        warnMissingSpirv(path);
+    }
     return blob;
 }
 
