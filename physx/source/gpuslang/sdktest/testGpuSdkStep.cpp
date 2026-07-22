@@ -339,8 +339,26 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     // one live rigid body to keep that proven path valid.  It rests at y=0.5, ~100
     // below the particle cloud, so there is never any particle/rigid interaction.
     addGroundBox(physics, scene, rigidMat);
-    addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
-               boxInertia(PxVec3(0.5f), 1000.0f), 5.0f);
+    // The engine drives the rigid solver core for the particle island, so one live
+    // dynamic rigid body is required (else rigidSumInternalContactAndJointBatches2
+    // null-derefs).  Free-fall: box at x=0,y=5 (never meets the y~100 cloud).  Bag
+    // mode (PXG_PARTICLE_STARTY set): place it FAR ASIDE at x=20 so the settling
+    // pile on the floor never touches it.
+    if (std::getenv("PXG_PARTICLE_STARTY"))
+    {
+        PxRigidDynamic* aside = physics->createRigidDynamic(PxTransform(PxVec3(20.0f, 0.5f, 0.0f)));
+        PxShape* s = physics->createShape(PxBoxGeometry(0.5f, 0.5f, 0.5f), *rigidMat);
+        aside->attachShape(*s);
+        aside->setMass(1000.0f);
+        aside->setMassSpaceInertiaTensor(boxInertia(PxVec3(0.5f), 1000.0f));
+        s->release();
+        scene->addActor(*aside);
+    }
+    else
+    {
+        addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                   boxInertia(PxVec3(0.5f), 1000.0f), 5.0f);
+    }
 
     // PBD material + particle system + one phase mapping to that material.
     PxPBDMaterial* pbdMat = physics->createPBDMaterial(/*friction*/ 0.05f, /*damping*/ 0.0f,
@@ -362,7 +380,13 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     // 4x4x4 grid, invMass 1, zero velocity, spawned centred high above y=0.
     const int G = 4;
     const PxU32 N = PxU32(G * G * G);
-    const float startY = 100.0f;
+    // startY defaults to 100 (the P6.0 free-fall baseline all tranches regress
+    // against); PXG_PARTICLE_STARTY lowers the cloud so it can reach the floor
+    // (P6.5 settling bag).  When lowered, raise solver iterations for a stable pile.
+    const char* startYEnv = std::getenv("PXG_PARTICLE_STARTY");
+    const float startY = startYEnv ? float(atof(startYEnv)) : 100.0f;
+    if (startYEnv)
+        ps->setSolverIterationCounts(/*pos*/ 8, /*vel*/ 1);
     std::vector<PxVec4> hostPos(N), hostVel(N, PxVec4(0.0f, 0.0f, 0.0f, 0.0f));
     std::vector<PxU32> hostPhase(N, phase);
     PxU32 idx = 0;
@@ -509,29 +533,57 @@ int main()
         }
 
         const float dt = 1.0f / 60.0f;
-        const int steps = 120;
+        const char* stepsEnv = std::getenv("PXG_PARTICLE_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 120;
+        const bool bagMode = std::getenv("PXG_PARTICLE_STARTY") != nullptr;
         const float y0 = particleMeanY(psc);
         std::printf("  stepping the particle cloud (%d x %.4fs), initial mean y=%.4f...\n", steps, dt, y0);
 
         float prevY = y0;
         int nonMonotonic = 0;
+        float restMaxDy = 0.0f;   // max |dy| over the final quarter (rest convergence)
+        const int restWindow = steps / 4;
         for (int i = 0; i < steps; ++i)
         {
             scene->simulate(dt);
             scene->fetchResults(true);
             const float y = particleMeanY(psc);
-            if (i < 5 || i == steps - 1)
+            if (i < 5 || i == steps - 1 || (bagMode && (i % 15 == 0)))
                 std::printf("    step %3d: mean y = %.5f (dy = %+.5f)\n", i, y, y - prevY);
             // Free fall: mean y must not increase (allow a tiny float slack).
             if (y > prevY + 1e-3f) ++nonMonotonic;
+            if (i >= steps - restWindow) restMaxDy = PxMax(restMaxDy, PxAbs(y - prevY));
             prevY = y;
         }
         const float yEnd = particleMeanY(psc);
         const float drop = y0 - yEnd;
-        std::printf("  particle free fall: mean y %.4f -> %.4f (dropped %.4f over %.2fs)\n",
-                    y0, yEnd, drop, steps * dt);
 
         int failures = 0;
+        if (bagMode)
+        {
+            // Settling bag (P6.5): the cloud must FALL, be CAUGHT on the floor, and
+            // come to REST.  restMaxDy over the final quarter must decay to ~0, yEnd
+            // must sit just above the floor (top y=0, particles rest near solidRest
+            // offset), and everything must stay finite.
+            std::printf("  particle SETTLING BAG: mean y %.4f -> %.4f (dropped %.4f over %.2fs); "
+                        "rest |dy| over last %d steps = %.6f\n", y0, yEnd, drop, steps * dt, restWindow, restMaxDy);
+            if (!(drop > 0.5f))          { std::printf("FAIL: cloud did not fall (drop=%.4f)\n", drop); ++failures; }
+            if (!(restMaxDy < 0.01f))    { std::printf("FAIL: cloud did not come to rest (rest |dy|=%.6f)\n", restMaxDy); ++failures; }
+            if (!(yEnd > -0.5f && yEnd < 1.5f)) { std::printf("FAIL: cloud did not settle near the floor (yEnd=%.4f)\n", yEnd); ++failures; }
+            if (!std::isfinite(yEnd))    { std::printf("FAIL: mean y is not finite (%.4f)\n", yEnd); ++failures; }
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            if (failures == 0)
+            {
+                std::printf("[  OK  ] gpu-sdk-step: PBD particle bag fell, was caught by the floor, and "
+                            "SETTLED TO REST on Vulkan (the money shot)\n");
+                return 0;
+            }
+            std::printf("[ FAIL ] gpu-sdk-step: particle settling-bag checks failed (%d)\n", failures);
+            return 2;
+        }
+
+        std::printf("  particle free fall: mean y %.4f -> %.4f (dropped %.4f over %.2fs)\n",
+                    y0, yEnd, drop, steps * dt);
         if (!(yEnd < y0 - 0.05f)) { std::printf("FAIL: cloud did not fall (drop=%.4f)\n", drop); ++failures; }
         if (nonMonotonic != 0)    { std::printf("FAIL: mean y increased on %d step(s)\n", nonMonotonic); ++failures; }
         if (!std::isfinite(yEnd)) { std::printf("FAIL: mean y is not finite (%.4f)\n", yEnd); ++failures; }

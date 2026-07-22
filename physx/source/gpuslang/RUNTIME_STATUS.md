@@ -106,6 +106,44 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
+## P6.5 — MILESTONE: a PBD particle bag falls, is caught by the floor, and SETTLES TO REST on Vulkan (the money shot)
+
+The full PBD particle pipeline now produces a **settling granular bag** on the Slang/Vulkan
+(llvmpipe) engine path — the culmination of the P6 marathon. A 4×4×4 particle cloud dropped
+onto a static floor falls under gravity, is **caught by the particle-side primitive-contact
+solve** (P6.4a generation → P6.4b-1 sort/organize → P6.4b-2 solve), and **comes to rest at
+exactly `solidRestOffset` above the floor** — no tunnelling, no explosion, no crash.
+
+Observed (PGS, cloud spawned at y≈3.75 onto the floor top at y=0):
+```
+mean y: 3.75 → 3.38 → 2.40 → 0.85 (falls, accelerating) → 0.25000 (caught) →
+        0.25000 … 0.25000 (rest);  rest |dy| over the last 35 steps = 0.000000
+[ OK ] PBD particle bag fell, was caught by the floor, and SETTLED TO REST (the money shot)
+```
+It settles at **exactly y=0.25000** = the rest offset (0.5·spacing) above the floor — the
+particle-side solve alone suffices (the rigid-side reaction is inert for a static floor).
+
+**Solver scope: this is a PGS result.** PGS routes the catch through the non-TGS
+`ps_solvePCOutputParticleDeltaVLaunch` mapped in P6.4b-2. Under TGS the cloud still tunnels
+(yEnd≈−9.7) because TGS routes through the `...TGSLaunch` twin (+ `ps_stepParticlesLaunch` /
+`ps_finalizeParticlesLaunch`), which are the deferred next tranche — so the settling bag is
+demonstrated on **`PXG_SOLVER=pgs`**.
+
+This is a **pure scene/harness tranche** (no new kernels — the pipeline was completed by
+P6.0–P6.4b-2). `testGpuSdkStep.cpp`: `PXG_PARTICLE_STARTY` lowers the cloud so it reaches the
+floor within the run and switches the pass criterion from "monotonic free fall" to
+**fall-then-rest** (drop > 0.5, rest |dy| over the final quarter < 0.01, settled near the floor,
+finite); in bag mode the required rigid body is relocated far aside (x=20) so the pile never
+touches it, and solver iterations are raised to 8/1. `PXG_SLANG_KERNEL_MAPPED` stays **177**
+(no kernel change). The DEFAULT `PXG_SCENE=particle` free-fall is byte-unchanged (100.75 →
+80.9665, monotonic) — the full gpuslang suite (671/671 both modes) and the 8-scene × 2-solver
+rigid regression (16/16) are unaffected.
+
+Deferred (out of this milestone): the rigid-side particle reaction (`ps_solvePCOutputRigidDeltaV*`,
+`accumulateDeltaVRigid*` — needed only for a DYNAMIC floor), the TGS particle-solve twin, the
+articulation reaction path, diffuse/cloth/fluid/inflatable particle features, and the
+narrowphase-hygiene `removeContactManagers_Stage5`.
+
 ## P6.4b-2 — particle-side contact SOLVE on the engine ABI (the "catch" application)
 
 Brought the particle-side primitive-contact SOLVE onto the BDA engine ABI — the kernels that
