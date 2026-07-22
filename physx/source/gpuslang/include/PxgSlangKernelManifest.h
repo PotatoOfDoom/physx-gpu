@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 177;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 180;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -267,11 +267,11 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_findStartEndFEMFirstLaunch", nullptr, nullptr },  // PS_FIND_RANGESTARTEND_FEM_FIRST (unmapped)
     { "ps_findStartEndFEMSecondLaunch", nullptr, nullptr },  // PS_RANGESTARTEND_FEM_SECONE (unmapped)
     { "ps_accumulateFEMParticleDeltaVLaunch", nullptr, nullptr },  // PS_ACCUMULATE_FEM_PARTICLE_DELTA (unmapped)
-    { "ps_stepParticlesLaunch", nullptr, nullptr },  // PS_STEP_PARTICLES (unmapped)
-    { "ps_solvePCOutputParticleDeltaVTGSLaunch", nullptr, nullptr },  // PS_SOLVE_PC_PARTICLE_TGS (unmapped)
+    { "ps_stepParticlesLaunch", "psContactSolveTgsBda.spv", "ps_stepParticlesLaunch" },  // PS_STEP_PARTICLES (P6.6 BDA port: TGS substep predictor)
+    { "ps_solvePCOutputParticleDeltaVTGSLaunch", "psContactSolveTgsBda.spv", "ps_solvePCOutputParticleDeltaVTGSLaunch" },  // PS_SOLVE_PC_PARTICLE_TGS (P6.6 BDA port: TGS twin of the particle-side PC solve)
     { "ps_solvePCOutputRigidDeltaVTGSLaunch", nullptr, nullptr },  // PS_SOLVE_PC_RIGID_TGS (unmapped)
     { "ps_solveRigidAttachmentsTGSLaunch", nullptr, nullptr },  // PS_SOLVE_RIGID_ATTACHMENTS_TGS (unmapped)
-    { "ps_finalizeParticlesLaunch", nullptr, nullptr },  // PS_FINALIZE_PARTICLES (unmapped)
+    { "ps_finalizeParticlesLaunch", "psContactSolveTgsBda.spv", "ps_finalizeParticlesLaunch" },  // PS_FINALIZE_PARTICLES (P6.6 BDA port: TGS velocity-iteration finalize)
     { "ps_updateMaterials", nullptr, nullptr },  // PS_UPDATE_MATERIALS (unmapped)
     { "femAttachmentPrepareLaunch", nullptr, nullptr },  // FEM_ATTACHMENT_CONSTRAINT_PREP (unmapped)
     { "sb_gm_preIntegrateLaunch", nullptr, nullptr },  // SB_SIM_PREINTEGRATION (unmapped)

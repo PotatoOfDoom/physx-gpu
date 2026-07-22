@@ -390,6 +390,36 @@ static const uint8_t kPsSolvePCParticle[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 1
 //   PxgParticleSystemCore.cpp:2005.
 static const uint8_t kPsAccumulateDeltaVParticle[] = { 8, 8, 8, 8, 8, 8 };
 
+// gpusimulationcontroller particlesystem.cu:120 (P6.6 TGS substep predictor):
+//   ps_stepParticlesLaunch(const PxgParticleSystem* particleSystems,
+//     const PxU32* activeParticleSystems, const PxReal dt, const PxReal invTotalDt,
+//     bool isFirstIteration, const bool isTGS,
+//     const bool externalForcesEveryTgsIterationEnabled, const PxVec3 gravity)
+//   PxVec3 gravity by value = 12 bytes -> {8,8,4,4,1,1,1,12} = 40-byte blob (three
+//   bool bytes @24/25/26, gravity @28 after the 4-align).  Launch
+//   PxgParticleSystemCore.cpp:2460.
+static const uint8_t kPsStepParticles[] = { 8, 8, 4, 4, 1, 1, 1, 12 };
+
+// gpusimulationcontroller particlesystem.cu:1690 (P6.6 TGS twin of the particle-
+// side PC solve).  The launch site packs the IDENTICAL array as the non-TGS solve
+// (PxgParticleSystemCore.cpp:1947, the isTGS ? PS_SOLVE_PC_PARTICLE_TGS branch;
+// only the CUfunction differs), so it reuses kPsSolvePCParticle:
+//   ps_solvePCOutputParticleDeltaVTGSLaunch(PxgParticleSystem* particleSystems,
+//     PxgParticlePrimitiveContact* sortedContacts,
+//     PxgParticlePrimitiveConstraintBlock* primitiveConstraints, PxU32* numContacts,
+//     PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
+//     PxgSolverSharedDesc<IterativeSolveData>* sharedDesc, float4* deltaPos,
+//     float2* appliedForces, PxReal dt, PxReal relaxationCoefficient,
+//     bool isVelocityIteration, PxgArticulationCoreDesc* artiCoreDesc)
+//   -> {8,8,8,8,8,8,8,8,8,4,4,1,8} = 96-byte blob (kPsSolvePCParticle).
+
+// gpusimulationcontroller particlesystem.cu:5731 (P6.6 TGS velocity-iter finalize):
+//   ps_finalizeParticlesLaunch(const PxgParticleSystem* particleSystems,
+//     const PxU32 id, const PxReal invTotalDt, PxReal velocityScale)
+//   -> {8,4,4,4} = 20 data bytes, rounded to the 8-alignment (maxAlign 8) -> 24-byte
+//   blob.  Launch PxgPBDParticleSystemCore.cpp:498.
+static const uint8_t kPsFinalizeParticles[] = { 8, 4, 4, 4 };
+
 // gpucommon/src/CUDA/radixSortImpl.cu (P6.1 particle contact-sort BDA):
 //   radixSortDoubleCopy(const PxU64* inValue0, PxU64* outValue0, PxU32* rank0,
 //     const PxU64* inValue1, PxU64* outValue1, PxU32* rank1, const PxU32* numKeys)
@@ -545,6 +575,11 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_contactPrepareLaunch", kPsContactPrepare, uint32_t(sizeof(kPsContactPrepare)) },
     { "ps_solvePCOutputParticleDeltaVLaunch", kPsSolvePCParticle, uint32_t(sizeof(kPsSolvePCParticle)) },
     { "ps_accumulateDeltaVParticleLaunch", kPsAccumulateDeltaVParticle, uint32_t(sizeof(kPsAccumulateDeltaVParticle)) },
+    // gpusimulationcontroller (P6.6 PBD particle-side TGS contact-solve loop)
+    { "ps_stepParticlesLaunch", kPsStepParticles, uint32_t(sizeof(kPsStepParticles)) },
+    // ps_solvePCOutputParticleDeltaVTGSLaunch shares the non-TGS solve's 96-byte pack.
+    { "ps_solvePCOutputParticleDeltaVTGSLaunch", kPsSolvePCParticle, uint32_t(sizeof(kPsSolvePCParticle)) },
+    { "ps_finalizeParticlesLaunch", kPsFinalizeParticles, uint32_t(sizeof(kPsFinalizeParticles)) },
     // gpucommon radixSortImpl.cu:69 / :81 — the WithoutCount radix twins (P6.2 BDA)
     { "radixSortMultiBlockLaunchWithoutCount", kRadixDescNoCount, uint32_t(sizeof(kRadixDescNoCount)) },
     { "radixSortMultiCalculateRanksLaunchWithoutCount", kRadixDescNoCount, uint32_t(sizeof(kRadixDescNoCount)) },

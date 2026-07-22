@@ -40,6 +40,17 @@
 # registry is caught by the manifest test.
 #
 #   python3 gen_kernel_manifest.py <PxgKernelNames.h> <tests/CMakeLists.txt> <out.h>
+#
+# WARNING — the checked-in manifest carries MANUAL overrides this generator does NOT
+# reproduce.  When the same entry name is compiled into two modules (a Phase-1
+# RWStructuredBuffer harness shader AND a later BDA re-point), parse_entries picks the
+# FIRST `pxg_compile_shader` definition, but the engine needs the BDA module — e.g. the
+# P6.1 re-points `radixSortDoubleCopy` / `radixSortDoubleCopyHigh32Bits` must map to
+# particleContactSortBda.spv, not radixSortGather.spv.  Blindly regenerating SILENTLY
+# reverts those rows and dispatches a descriptor-bound shader with an unbound layout
+# (GPU fault in the particle sort).  To ADD a kernel, prefer hand-editing the 3-tuple
+# row(s) + the PXG_SLANG_KERNEL_MAPPED count; if you regenerate, DIFF against HEAD and
+# restore every manual BDA re-point before committing.
 
 import re
 import sys

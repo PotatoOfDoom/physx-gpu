@@ -106,6 +106,67 @@ modes before commit. Adversarial review for non-trivial synchronization code
 (the P1.1 ordering gap and the P1.6 host-visible ordering gap were both found
 this way / by the wiring, not by the happy path).
 
+## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
+
+The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED
+(yEnd≈−9.7) because the TGS particle-solve path routes through three kernels that
+were still unmapped. This tranche maps them, so the bag settles under BOTH solvers.
+Three kernels; `PXG_SLANG_KERNEL_MAPPED` 177 → **180**, all in new file
+`psContactSolveTgsBda.slang`, ported line-for-line from `particlesystem.cu`:
+- `ps_stepParticlesLaunch` (`particlesystem.cu:120`, ABI `{8,8,4,4,1,1,1,12}`=40B) — the
+  TGS substep PREDICTOR run at the top of each non-velocity iteration: advances the
+  sorted position by `vel*dt` (from sorted-origin on the first iter, else sorted-pos +
+  running deltaP) and accumulates the running deltaP. Launch `PxgParticleSystemCore.cpp:2460`.
+- `ps_solvePCOutputParticleDeltaVTGSLaunch` (`:1690`, same 96B pack as the non-TGS twin) —
+  the TGS twin of `ps_solvePCOutputParticleDeltaVLaunch`. DIFF vs non-TGS: the velocity read
+  (`PxgVelocityReader::readVelocitiesTGS` unpacks lin/ang VELOCITY **and** lin/ang DELTA from
+  the 3-float4-per-body TGS iter pool) and the solve core (`solvePCOutputDeltaVTGS`: folds
+  `normalDelta + normalVel*projectionDt` / `tanDelta` into the separation, `projectionDt =
+  velIter?0:dt`). For a static floor with zero body velocity/delta the folding collapses to
+  the non-TGS result, so TGS and PGS agree on the money-shot contact. Launch `:1947`.
+- `ps_finalizeParticlesLaunch` (`:5731`, ABI `{8,4,4,4}`=24B) — the TGS velocity-iteration
+  FINALIZE: blends `deltaP*invTotalDt` into the sorted velocity when the stored velocity is
+  larger (momentum conservation). Launch `PxgPBDParticleSystemCore.cpp:498`.
+The contact PREPARE + deltaV ACCUMULATE stay shared with the non-TGS path (psContactSolveBda,
+byte-untouched). All descriptor fields reused from existing mirrors; none added.
+
+**KEY EVIDENCE — the TGS settling bag (`PXG_SOLVER=tgs`, cloud at y≈3.75):**
+```
+mean y: 3.75 → 3.38 (s15) → 2.40 (s30) → 0.85 (s45, accelerating) → 0.25000 (s60, caught) →
+        0.25000 … 0.25000 (rest);  rest |dy| over the last 35 steps = 0.000000
+[  OK  ] PBD particle bag fell, was caught by the floor, and SETTLED TO REST (the money shot)
+```
+Settles at **exactly y=0.25000** = the rest offset above the floor, byte-identical to the
+PGS bag — NOT tunnelling to −9.7. The 3 kernels DISPATCH OK in the trace (step ×24, TGS-solve
+×27, finalize ×3 over 3 steps). PGS bag STILL settles (unchanged, 3.75→0.25), and the DEFAULT
+free-fall is byte-unchanged (100.75 → 80.9665) under BOTH solvers. New unit test
+`gpuslang.psContactSolveTgs` (4 cases): a penetrating particle pushed OUT upward by the TGS
+solve (bit-exact vs a CPU transcription of `solvePCOutputDeltaVTGS`), a moving NON-static body
+that exercises the `readVelocitiesTGS` unpacking + the `normalDelta`/`normalVel*projectionDt`
+folding (velIter true/false, bit-exact), and step + finalize in isolation. Full suite
+**672/672** both memory modes; rigid regression 8×2 = **16/16**.
+
+Deviations (flagged): the `isArticulation()` reaction branch is DEFERRED (dead; the
+`artiCoreDesc`/`outArtiVelocity` reads the `PxgVelocityReader` ctor hoists are sunk INTO the
+dead branch so a rigid/static contact never dereferences them — identical result for the
+particle-vs-static-floor scenes); `ps_stepParticlesLaunch` indexes `particleSystems[blockIdx.y]`
+directly (the `activeParticleSystems*` arg is ABI parity only); descriptor block-copy→direct
+`Ptr<>` reads; PxU16 phase→material as 32-bit word+shift; no 32-lane-warp ops in any of the
+three kernels. `psContactSolveTgsBda` is in `PXG_NOCONTRACT_SHADERS` (NoContraction stamped)
+so the dot-product/sqrt-heavy TGS solve is bitwise vs the `-ffp-contract=off` CPU reference,
+matching the `npPsSolvePCTGS` precedent.
+
+**MANIFEST GOTCHA (found + fixed):** `PxgSlangKernelManifest.h` carries MANUAL overrides the
+generator (`gen_kernel_manifest.py`) does NOT reproduce — notably the P6.1 BDA re-points
+`radixSortDoubleCopy` / `radixSortDoubleCopyHigh32Bits` → `particleContactSortBda.spv` (the
+generator's "first-definition-wins" instead picks the RWStructuredBuffer harness
+`radixSortGather.spv`). Re-running the generator SILENTLY reverted those two rows, so the
+engine dispatched a descriptor-bound shader with an unbound layout → GPU fault in the particle
+sort (crashed every particle scene, both solvers, even free-fall). Fix: DO NOT regenerate — the
+3 new rows + the count were hand-edited, leaving every other row (and its annotation) intact.
+The rigid-side TGS twin `ps_solvePCOutputRigidDeltaVTGSLaunch` stays DEFERRED (inert for a
+static floor, refuses harmlessly like the non-TGS rigid side under PGS).
+
 ## P6.5 — MILESTONE: a PBD particle bag falls, is caught by the floor, and SETTLES TO REST on Vulkan (the money shot)
 
 The full PBD particle pipeline now produces a **settling granular bag** on the Slang/Vulkan
