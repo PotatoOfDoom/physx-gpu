@@ -469,6 +469,44 @@ forced-fresh mutation check, regression) before commit. Remaining: 4b-2 PREPARE
 (`cloth_rigidContactPrepareLaunch`) → 4b-3 SOLVE (`cloth_queryRigidClothContactReferenceCount{,TGS}` +
 `cloth_solveRigidClothCollision{,TGS}`) → 4c the `clothdrape` floor scene.
 
+## P7.1 tranche 4b-2/3 — cloth rigid-contact PREPARE + SOLVE on the BDA engine ABI
+
+The third tranche of the cloth-drape arc (the analog of particle P6.4b-2): turn the generated + sorted
+cloth-vs-rigid contacts into a corrective cloth-vertex push. Five kernels; `PXG_SLANG_KERNEL_MAPPED`
+196 → **201**, ported line-for-line from `FEMClothConstraintPrep.cu` + `FEMClothExternalSolve.cu`:
+- `cloth_rigidContactPrepareLaunch` (`CLOTH_RIGID_CONTACTPREPARE`, launch `PxgFEMClothCore.cpp:328`,
+  ABI `{8×10,4,8,1}`=104B) — builds a `PxgFemRigidConstraintBlock` (effective mass / normal / raXn
+  response rows / bias) from each sorted contact.
+- `cloth_queryRigidClothContactReferenceCount{,TGS}Launch` (`CLOTH_QUERY_RIGID_CLOTH_REFERENCE_COUNT[_TGS]`,
+  `:1741`, ABI `{8×8,4,8,8}`=88B) — accumulates each cloth vertex's contact reference count into
+  `mDeltaPos.w` (so the already-mapped `cloth_applyExternalDeltasLaunch` averages correctly).
+- `cloth_solveRigidClothCollision{,TGS}Launch` (`CLOTH_SOLVE_RIGID_CLOTH_COLLISION[_TGS]`, `:1797`,
+  ABI `{8×11,4,8,8}`=112B) — solve the constraint, scatter the cloth-side correction
+  `deltaPos = −(δλN·normal + δλT·tangent)·dt` into `mDeltaPos`.
+
+New shader `femClothRigidContactBda.slang` (NoContraction-stamped — the dot/normalize bias math is
+bitwise vs the `-ffp-contract=off` CPU ref, the psContactSolveTgsBda precedent). New mirror
+`PxgFemRigidConstraintBlock` (PxgFEMCore.h:167, the 32-slab SoA; host-replicated + self-asserted since
+the header pulls the CUDA stack, the P7.1.3a precedent). **Fully BIT-EXACT** (linear algebra + sqrt, no
+transcendental seam) in PGS AND TGS, BOTH memory modes. New unit tests `gpuslang.femClothSim` +2 cases
+(`RigidContactPGS`/`TGS`): one cloth vertex penetrating a static floor → a sorted contact → prepare →
+queryRefCount → solve → the prepared constraint block (7 fields incl. non-zero response rows) AND the
+solved `mDeltaPos` push the vertex OUT, bit-exact vs a CPU transcription; independently mutation-checked
+in the main tree (dropping the `deltaPos.y` negation + forced-fresh `.spv` recompile fails both cases:
+ref y=+0.0038 vs got −0.0038). Full suite **673/673 both memory modes**; rigid regression 8×2 = **16/16**.
+
+**This closes the cloth-vs-rigid contact SOLVE chain end-to-end** (generate → sort → prepare → solve →
+`applyExternalDeltas`); only the scene (4c) remains to make a cloth actually settle on a floor.
+Deferrals (each behavior-preserving for a static floor, documented in-shader): the articulation branch
+(a static floor is never an articulation); the dynamic-rigid reaction (`computeRigidChange` behind
+`!isStaticBody()`, never taken — the prepare still writes the count-0 the CUDA writes); friction
+(`getCombinedFriction()==0` for the NULL-material query path → `δλT ≡ −0`, cloth push bit-exact with a
+frictionless material; material-strided friction is a follow-on); `atomicAdd(mDeltaPos)` → plain
+read-modify-write (single-contact test). Drafted by a background worktree agent, salvaged +
+INDEPENDENTLY re-verified in the main tree (build, both-mode suite, my own forced-fresh mutation check,
+regression) before commit. Remaining: **4c** — the `PXG_SCENE=clothdrape` floor scene (cloth falls,
+the contact pipeline catches it, it settles).
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

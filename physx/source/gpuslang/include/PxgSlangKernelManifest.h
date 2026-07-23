@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 196;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 201;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -409,7 +409,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_midphaseVertexHeightfieldLaunch", nullptr, nullptr },  // CLOTH_MIDPHASE_VERTEX_HF (unmapped)
     { "cloth_heightfieldVertexContactGenLaunch", nullptr, nullptr },  // CLOTH_HF_VERTEX_CG (unmapped)
     { "cloth_rigidAttachmentPrepareLaunch", "femClothRigidAttachBda.spv", "cloth_rigidAttachmentPrepareLaunch" },  // CLOTH_RIGID_ATTACHMENT_CONSTRAINT_PREP (P7.1 tranche 3a BDA port: cloth rigid/world attachment constraint prep)
-    { "cloth_rigidContactPrepareLaunch", nullptr, nullptr },  // CLOTH_RIGID_CONTACTPREPARE (unmapped)
+    { "cloth_rigidContactPrepareLaunch", "femClothRigidContactBda.spv", "cloth_rigidContactPrepareLaunch" },  // CLOTH_RIGID_CONTACTPREPARE (P7.1 tranche 4b-2 BDA port: cloth-vs-rigid contact constraint prep)
     { "cloth_clothContactPrepareLaunch", nullptr, nullptr },  // CLOTH_CLOTH_CONTACTPREPARE (unmapped)
     { "cloth_particleContactPrepareLaunch", nullptr, nullptr },  // CLOTH_PARTICLE_CONTACTPREPARE (unmapped)
     { "cloth_solveNonSharedTriangleEnergyLaunch", "femClothSolveBda.spv", "cloth_solveNonSharedTriangleEnergyLaunch" },  // CLOTH_SIM_NONSHARED_TRIANGLE_ENERGY_SOLVE (P7.1 BDA port: cloth in-plane membrane energy solve)
@@ -418,8 +418,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_solveTrianglePairEnergyClusterLaunch", "femClothSolvePairBda.spv", "cloth_solveTrianglePairEnergyClusterLaunch" },  // CLOTH_SIM_TRIANGLEPAIR_ENERGY_SOLVE_CLUSTER (P7.1 tranche 2 BDA port: cluster twin)
     { "cloth_averageTrianglePairVertsLaunch", "femClothSolvePairBda.spv", "cloth_averageTrianglePairVertsLaunch" },  // CLOTH_SIM_TRIANGLEPAIR_AVERAGE_VERTS (P7.1 tranche 2 BDA port: Jacobi tri-pair vertex average)
     { "cloth_stepLaunch", nullptr, nullptr },  // CLOTH_SIM_STEP (unmapped)
-    { "cloth_queryRigidClothContactReferenceCountLaunch", nullptr, nullptr },  // CLOTH_QUERY_RIGID_CLOTH_REFERENCE_COUNT (unmapped)
-    { "cloth_solveRigidClothCollisionLaunch", nullptr, nullptr },  // CLOTH_SOLVE_RIGID_CLOTH_COLLISION (unmapped)
+    { "cloth_queryRigidClothContactReferenceCountLaunch", "femClothRigidContactBda.spv", "cloth_queryRigidClothContactReferenceCountLaunch" },  // CLOTH_QUERY_RIGID_CLOTH_REFERENCE_COUNT (P7.1 tranche 4b-3 BDA port: PGS cloth-vs-rigid contact reference-count query)
+    { "cloth_solveRigidClothCollisionLaunch", "femClothRigidContactBda.spv", "cloth_solveRigidClothCollisionLaunch" },  // CLOTH_SOLVE_RIGID_CLOTH_COLLISION (P7.1 tranche 4b-3 BDA port: PGS cloth-vs-rigid contact solve)
     { "cloth_solveClothClothDeltaVTLaunch", nullptr, nullptr },  // CLOTH_SOLVE_CLOTH_VT_COLLISION (unmapped)
     { "cloth_solveClothClothDeltaEELaunch", nullptr, nullptr },  // CLOTH_SOLVE_CLOTH_EE_COLLISION (unmapped)
     { "cloth_queryClothClothContactVTCountLaunch", nullptr, nullptr },  // CLOTH_QUERY_CLOTH_CONTACT_VT_COUNT (unmapped)
@@ -431,8 +431,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_solveRigidClothAttachmentLaunch", "femClothRigidAttachBda.spv", "cloth_solveRigidClothAttachmentLaunch" },  // CLOTH_SOLVE_RIGID_CLOTH_ATTACHMENT (P7.1 tranche 3a BDA port: PGS rigid/world attachment solve)
     { "cloth_solveOutputAttachmentClothClothDeltaVLaunch", nullptr, nullptr },  // CLOTH_SOLVE_ATTACHMENT_CLOTH_CLOTH_DELTA (unmapped)
     { "cloth_finalizeVelocitiesLaunch", "femClothSimBda.spv", "cloth_finalizeVelocitiesLaunch" },  // CLOTH_FINALIZE_VELOCITIES (P7.0 BDA port)
-    { "cloth_solveRigidClothCollisionTGSLaunch", nullptr, nullptr },  // CLOTH_SOLVE_RIGID_CLOTH_COLLISION_TGS (unmapped)
-    { "cloth_queryRigidClothContactReferenceCountTGSLaunch", nullptr, nullptr },  // CLOTH_QUERY_RIGID_CLOTH_REFERENCE_COUNT_TGS (unmapped)
+    { "cloth_solveRigidClothCollisionTGSLaunch", "femClothRigidContactBda.spv", "cloth_solveRigidClothCollisionTGSLaunch" },  // CLOTH_SOLVE_RIGID_CLOTH_COLLISION_TGS (P7.1 tranche 4b-3 BDA port: TGS cloth-vs-rigid contact solve)
+    { "cloth_queryRigidClothContactReferenceCountTGSLaunch", "femClothRigidContactBda.spv", "cloth_queryRigidClothContactReferenceCountTGSLaunch" },  // CLOTH_QUERY_RIGID_CLOTH_REFERENCE_COUNT_TGS (P7.1 tranche 4b-3 BDA port: TGS cloth-vs-rigid contact reference-count query)
     { "cloth_solveRigidClothAttachmentTGSLaunch", "femClothRigidAttachBda.spv", "cloth_solveRigidClothAttachmentTGSLaunch" },  // CLOTH_SOLVE_RIGID_CLOTH_ATTACHMENT_TGS (P7.1 tranche 3a BDA port: TGS rigid/world attachment solve)
     { "cloth_sleeping", "femClothSimBda.spv", "cloth_sleeping" },  // CLOTH_SLEEPING (P7.0 BDA port: wake-counter bookkeeping)
     { "cloth_accumulateInPlaneDampingDeltaVelocity", nullptr, nullptr },  // CLOTH_IN_PLANE_DAMPING (unmapped)

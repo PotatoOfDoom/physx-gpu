@@ -2665,4 +2665,524 @@ PXG_TEST(femClothSimReorderRigidContacts) { runReorderRigidContacts(5000u, 0x5EE
 // exercising the numIternations / index += blockDim*gridDim stride verbatim.
 PXG_TEST(femClothSimReorderRigidContactsMultiIter) { runReorderRigidContacts(262144u + 777u, 0x4B02F00Du); }
 
+// ===========================================================================
+// P7.1 tranche 4b-2/3: cloth-vs-rigid contact PREPARE + query/SOLVE.
+//   femClothRigidContactBda.spv:
+//     cloth_rigidContactPrepareLaunch                       (FEMClothConstraintPrep.cu:70)
+//     cloth_queryRigidClothContactReferenceCount{,TGS}Launch(FEMClothExternalSolve.cu:414/:558)
+//     cloth_solveRigidClothCollision{,TGS}Launch            (FEMClothExternalSolve.cu:535/:578)
+// ONE cloth vertex penetrating a STATIC floor -> a sorted contact -> prepare (build the
+// PxgFemRigidConstraintBlock) -> queryRefCount (bump mDeltaPos.w) -> solve (push the
+// vertex OUT along the plane normal into mDeltaPos).  Bit-exact vs a CPU transcription of
+// the .cu math (PGS and TGS), both memory modes.
+// ===========================================================================
+
+// Host replica of the block-of-32 PxgFemRigidConstraintBlock (PxgFEMCore.h:167, verbatim
+// hand-copy — PxgFEMCore.h is not includable in this CUDA-toolkit-free TU).  A trivial
+// fixed-array SoA (float4[32] blocks + float[32]); the byte image the prepare WRITES and
+// the solve READS, matching the shader's FRC_* byte offsets (femClothRigidContactBda.slang).
+struct RigidContactConstraintHost
+{
+    F4 raXn_resp[32];          // @0
+    F4 raXnF0_resp[32];        // @512
+    F4 raXnF1_resp[32];        // @1024
+    F4 normal_errorW[32];      // @1536
+    F4 fricTan0_invMass0[32];  // @2048
+    F4 barycentric[32];        // @2560
+    float maxPenBias[32];      // @3072 -> 3200
+};
+static_assert(sizeof(RigidContactConstraintHost) == 3200, "PxgFemRigidConstraintBlock sizeof == 3200");
+static_assert(offsetof(RigidContactConstraintHost, raXnF0_resp) == 512, "raXnF0_resp @512");
+static_assert(offsetof(RigidContactConstraintHost, raXnF1_resp) == 1024, "raXnF1_resp @1024");
+static_assert(offsetof(RigidContactConstraintHost, normal_errorW) == 1536, "normal_errorW @1536");
+static_assert(offsetof(RigidContactConstraintHost, fricTan0_invMass0) == 2048, "fricTan0_invMass0 @2048");
+static_assert(offsetof(RigidContactConstraintHost, barycentric) == 2560, "barycentric @2560");
+static_assert(offsetof(RigidContactConstraintHost, maxPenBias) == 3072, "maxPenBias @3072");
+
+// ---------------------------------------------------------------------------
+// bit-exact CPU reference for the prepare + query/solve.  prepareFEMContacts
+// (deformableUtils.cuh:132) and FEMCollision::initialize / readCloth / computeFEMChange /
+// writeCloth (deformableUtils.cuh:280 / :488) are transcribed verbatim for the STATIC /
+// null-material (frictionless) path.
+// ---------------------------------------------------------------------------
+namespace p714ref
+{
+struct V3 { float x, y, z; };
+static V3 cross3(V3 a, V3 b) { return V3{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+static float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static float rmax(float a, float b) { return a > b ? a : b; }
+static float rmin(float a, float b) { return a < b ? a : b; }
+static float rabs(float a) { return a < 0.f ? -a : a; }
+
+// PxMat33 (column-major [9]) * PxVec3.
+static V3 mat33Mul(const float m[9], V3 v)
+{
+    return V3{ m[0] * v.x + m[3] * v.y + m[6] * v.z,
+               m[1] * v.x + m[4] * v.y + m[7] * v.z,
+               m[2] * v.x + m[5] * v.y + m[8] * v.z };
+}
+
+// PxComputeBasisVectors (PxMathUtils.h:297); right/up .normalize() is v / sqrt(magSq).
+static void computeBasis(V3 dir, V3& right, V3& up)
+{
+    if (rabs(dir.y) <= 0.9999f)
+    {
+        right = V3{ dir.z, 0.0f, -dir.x };
+        const float m = std::sqrt(right.x * right.x + right.y * right.y + right.z * right.z);
+        if (m > 0.0f) right = V3{ right.x / m, right.y / m, right.z / m };
+        up = V3{ dir.y * right.z, dir.z * right.x - dir.x * right.z, -dir.y * right.x };
+    }
+    else
+    {
+        right = V3{ 1.0f, 0.0f, 0.0f };
+        up = V3{ 0.0f, dir.z, -dir.y };
+        const float m = std::sqrt(up.x * up.x + up.y * up.y + up.z * up.z);
+        if (m > 0.0f) up = V3{ up.x / m, up.y / m, up.z / m };
+    }
+}
+
+// prepareFEMContacts (deformableUtils.cuh:132) — rigid / static (non-articulation) path.
+static void refPrepare(RigidContactConstraintHost& c, int slot,
+                       V3 normal, V3 p, float pen, V3 delta, F4 barycentric,
+                       V3 bodyFrameP, float invMass0, float penBiasClampRigid,
+                       const float sqrtInvInertia[9], float penBiasClampFEM, bool isStatic)
+{
+    V3 t0, t1;
+    computeBasis(normal, t0, t1);
+
+    const bool isKinematic = (invMass0 == 0.0f) && (!isStatic);
+
+    const V3 ra = V3{ p.x - bodyFrameP.x, p.y - bodyFrameP.y, p.z - bodyFrameP.z };
+    const V3 raXn = cross3(ra, normal);
+    const V3 raXF0 = cross3(ra, t0);
+    const V3 raXF1 = cross3(ra, t1);
+
+    const V3 raXnSI = mat33Mul(sqrtInvInertia, raXn);
+    const float resp0 = dot3(raXnSI, raXnSI) + invMass0;
+    const V3 raXF0SI = mat33Mul(sqrtInvInertia, raXF0);
+    const V3 raXF1SI = mat33Mul(sqrtInvInertia, raXF1);
+    const float respF0 = dot3(raXF0SI, raXF0SI) + invMass0;
+    const float respF1 = dot3(raXF1SI, raXF1SI) + invMass0;
+
+    F4 raXn_resp, raXnF0_resp, raXnF1_resp;
+    if (isKinematic)
+    {
+        raXn_resp = F4{ raXn.x, raXn.y, raXn.z, resp0 };
+        raXnF0_resp = F4{ raXF0.x, raXF0.y, raXF0.z, respF0 };
+        raXnF1_resp = F4{ raXF1.x, raXF1.y, raXF1.z, respF1 };
+    }
+    else
+    {
+        raXn_resp = F4{ raXnSI.x, raXnSI.y, raXnSI.z, resp0 };
+        raXnF0_resp = F4{ raXF0SI.x, raXF0SI.y, raXF0SI.z, respF0 };
+        raXnF1_resp = F4{ raXF1SI.x, raXF1SI.y, raXF1SI.z, respF1 };
+    }
+
+    const float maxPenBias = rmax(penBiasClampRigid, penBiasClampFEM);
+    const float error = pen + dot3(delta, normal);
+
+    c.normal_errorW[slot] = F4{ normal.x, normal.y, normal.z, error };
+    c.raXn_resp[slot] = raXn_resp;
+    c.raXnF0_resp[slot] = raXnF0_resp;
+    c.raXnF1_resp[slot] = raXnF1_resp;
+    c.fricTan0_invMass0[slot] = F4{ t0.x, t0.y, t0.z, invMass0 };
+    c.maxPenBias[slot] = maxPenBias;
+    c.barycentric[slot] = barycentric;
+}
+
+// FEMCollision::initialize (deformableUtils.cuh:280) — static / null-material (frictionless)
+// path.  Rigid velocities are all zero for a static body at rest.
+struct InitResult { bool isActive; float deltaLambdaN; float deltaLambdaT; V3 normal; V3 tangent; float accum; };
+static InitResult refInitialize(const RigidContactConstraintHost& c, int slot, bool isTGS,
+                                float appliedForceRef, float dt, V3 bcVec, V3 deformableLinDelta,
+                                V3 deformableInvMasses, float rigidRefCount, bool wasActive, bool checkOnly)
+{
+    InitResult r;
+    r.isActive = false; r.deltaLambdaN = 0.0f; r.deltaLambdaT = 0.0f;
+    r.tangent = V3{ 0, 0, 0 }; r.accum = appliedForceRef;
+
+    const float invDt = 1.0f / dt;
+    const F4 raXn_resp = c.raXn_resp[slot];
+    const F4 normal_biasW = c.normal_errorW[slot];
+    const F4 raXnF0_resp = c.raXnF0_resp[slot];
+    const F4 raXnF1_resp = c.raXnF1_resp[slot];
+    const float maxPenBias = c.maxPenBias[slot];
+    const F4 fricTan0 = c.fricTan0_invMass0[slot];
+
+    const V3 normal = V3{ normal_biasW.x, normal_biasW.y, normal_biasW.z };
+    r.normal = normal;
+    const V3 fric0 = V3{ fricTan0.x, fricTan0.y, fricTan0.z };
+    const V3 fric1 = cross3(normal, fric0);
+    const float initPen = normal_biasW.w;
+    const V3 raXn = V3{ raXn_resp.x, raXn_resp.y, raXn_resp.z };
+
+    // static body at rest -> zero velocities / deltas.
+    const V3 linVel = V3{ 0, 0, 0 }, angVel = V3{ 0, 0, 0 };
+    const V3 rigidLinDelta = V3{ 0, 0, 0 }, rigidAngDelta = V3{ 0, 0, 0 };
+
+    float CN; V3 relLinDelta; V3 angDelta;
+    if (isTGS)
+    {
+        const float normalVel = dot3(linVel, normal) + dot3(angVel, raXn);
+        relLinDelta = V3{ rigidLinDelta.x - deformableLinDelta.x, rigidLinDelta.y - deformableLinDelta.y,
+                          rigidLinDelta.z - deformableLinDelta.z };
+        angDelta = rigidAngDelta;
+        const float error = (initPen + dot3(relLinDelta, normal) + dot3(angDelta, raXn)) * invDt;
+        const float errorBiased = rmax(maxPenBias, error);
+        CN = errorBiased + normalVel;
+    }
+    else
+    {
+        const float normalVel = dot3(linVel, normal) + dot3(angVel, raXn);
+        relLinDelta = V3{ -deformableLinDelta.x, -deformableLinDelta.y, -deformableLinDelta.z };
+        angDelta = V3{ 0, 0, 0 };
+        const float error = (initPen + dot3(relLinDelta, normal)) * invDt;
+        const float errorBiased = rmax(maxPenBias, error);
+        CN = errorBiased + normalVel;
+    }
+
+    r.isActive = wasActive || (CN < 0.0f);
+    if (checkOnly) return r;
+    if (!r.isActive) return r;
+
+    const V3 bcSq = V3{ bcVec.x * bcVec.x, bcVec.y * bcVec.y, bcVec.z * bcVec.z };
+    const float deformableInvMass = dot3(bcSq, deformableInvMasses);
+    const float unitResponse = rigidRefCount * raXn_resp.w + deformableInvMass;
+    const float invDenom = (unitResponse > 0.0f) ? (1.0f / unitResponse) : 0.0f;
+
+    r.deltaLambdaN = rmax(-CN * invDenom, -r.accum);
+    r.accum += r.deltaLambdaN;
+
+    const V3 raXnF0 = V3{ raXnF0_resp.x, raXnF0_resp.y, raXnF0_resp.z };
+    const V3 raXnF1 = V3{ raXnF1_resp.x, raXnF1_resp.y, raXnF1_resp.z };
+    const float tanVel0 = dot3(linVel, fric0) + dot3(angVel, raXnF0);
+    const float tanVel1 = dot3(linVel, fric1) + dot3(angVel, raXnF1);
+    const float CT0 = (dot3(fric0, relLinDelta) + dot3(angDelta, raXnF0)) * invDt + tanVel0;
+    const float CT1 = (dot3(fric1, relLinDelta) + dot3(angDelta, raXnF1)) * invDt + tanVel1;
+    const V3 relTanDelta = V3{ CT0 * fric0.x + CT1 * fric1.x, CT0 * fric0.y + CT1 * fric1.y,
+                               CT0 * fric0.z + CT1 * fric1.z };
+    const float tanMagSq = dot3(relTanDelta, relTanDelta);
+    if (tanMagSq > 1.0e-14f)
+    {
+        const float CT = std::sqrt(tanMagSq);
+        const float invTanMag = 1.0f / CT;
+        r.tangent = V3{ relTanDelta.x * invTanMag, relTanDelta.y * invTanMag, relTanDelta.z * invTanMag };
+        const float uT0 = rigidRefCount * raXnF0_resp.w + deformableInvMass;
+        const float invT0 = (uT0 > 0.0f) ? (1.0f / uT0) : 0.0f;
+        const float uT1 = rigidRefCount * raXnF1_resp.w + deformableInvMass;
+        const float invT1 = (uT1 > 0.0f) ? (1.0f / uT1) : 0.0f;
+        const float dLT0 = CT0 * invT0;
+        const float dLT1 = CT1 * invT1;
+        const float dLT = std::sqrt(dLT0 * dLT0 + dLT1 * dLT1);
+        const float combinedFriction = 0.0f;   // null-material path (DEFERRED)
+        r.deltaLambdaT = -rmin(dLT, combinedFriction * rabs(r.deltaLambdaN));
+    }
+    return r;
+}
+} // namespace p714ref
+
+// ---------------------------------------------------------------------------
+// cloth_rigidContactPrepareLaunch -> query -> solve: push one cloth vertex OUT of a
+// static floor.  isTGS selects the PGS / TGS solve twin.
+// ---------------------------------------------------------------------------
+static void runRigidContact(bool isTGS)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+
+    // --- cloth vertex (id 0, elemIdx 0), invMass = 0.5 (movable) ----------
+    const float invMass = 0.5f;
+    // accumulated delta (xyz) nonzero -> exercises the initialize relLinDelta term; .w = invMass.
+    const F4 accum0 = { 0.0010f, -0.0020f, 0.0015f, invMass };
+    std::vector<F4> positions = { { 0.5f, -0.02f, 0.7f, invMass } };
+    std::vector<F4> velocities = { { 0.0f, 0.0f, 0.0f, invMass } };
+    std::vector<F4> accumDelta = { accum0 };
+    std::vector<F4> deltaPos = { { 0.0f, 0.0f, 0.0f, 0.0f } };   // query/solve output
+    std::vector<uint32_t> triVtx = { 0u, 0u, 0u, 0u };           // unused (vertex contact)
+
+    DevBuf bPos = makeDev(dev, positions);
+    DevBuf bVel = makeDev(dev, velocities);
+    DevBuf bAcc = makeDev(dev, accumDelta);
+    DevBuf bDelta = makeDev(dev, deltaPos);
+    DevBuf bTri = makeDev(dev, triVtx);
+
+    const float penBiasClampFEM = -1.0e10f;
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
+    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
+    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mPenBiasClamp = penBiasClampFEM;
+    c.mNbVerts = 1u;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // --- the STATIC floor contact -----------------------------------------
+    // plane normal (unit, tilted, dominant +Y so "out of floor" ~ +Y).  Stored in
+    // normalPens.xyz; the solver normal is -planeNormal.
+    float rawN[3] = { 0.2f, 0.9f, 0.3f };
+    const float nmag = std::sqrt(rawN[0] * rawN[0] + rawN[1] * rawN[1] + rawN[2] * rawN[2]);
+    const p714ref::V3 planeNormal = { rawN[0] / nmag, rawN[1] / nmag, rawN[2] / nmag };
+    const float penW = -0.02f;   // pInPlaneSpace.x < 0 -> penetrating (pen = penW - restW).
+
+    std::vector<F4> contacts = { { positions[0].x, positions[0].y, positions[0].z, 0.0f } }; // restW = 0
+    std::vector<F4> normalPens = { { planeNormal.x, planeNormal.y, planeNormal.z, penW } };
+    std::vector<F4> barycentrics = { { 0.0f, 0.0f, 0.0f, 1.0f } };   // vertex (bc.w != 0)
+    const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
+    std::vector<FemOtherContactInfoHost> infos(1);
+    infos[0].pairInd0 = staticNodeInd;         // rigid node (static)
+    infos[0].pairInd1 = 0u;                     // (clothId 0 << 20) | elemIdx 0
+    infos[0].rigidMatInd_isInCollision = 0u;    // not-yet-in-collision, rigidMatIndex 0
+
+    DevBuf bContacts = makeDev(dev, contacts);
+    DevBuf bNormalPens = makeDev(dev, normalPens);
+    DevBuf bBary = makeDev(dev, barycentrics);
+    DevBuf bInfos = makeDev(dev, infos);
+    std::vector<uint32_t> numContacts = { 1u };
+    DevBuf bNum = makeDev(dev, numContacts);
+
+    // constraint block (3200 bytes) seeded with a sentinel pattern.
+    std::vector<uint8_t> constraintBytes(sizeof(RigidContactConstraintHost), 0xCD);
+    DevBuf bConstraint = makeDev(dev, constraintBytes);
+
+    std::vector<float> rigidLambdaNs = { 123.0f };   // prepare zeroes it (appliedForces)
+    DevBuf bLambda = makeDev(dev, rigidLambdaNs);
+    std::vector<F4> rigidDeltaVel = { { 9.f, 9.f, 9.f, 9.f }, { 9.f, 9.f, 9.f, 9.f } };
+    DevBuf bRigidDeltaVel = makeDev(dev, rigidDeltaVel);
+    std::vector<uint32_t> refCounts = { 0u, 0u };    // femRigidContactCount (unused for static)
+    DevBuf bRefCounts = makeDev(dev, refCounts);
+
+    // --- static-body frame / mass / inertia (solver body 0) ---------------
+    // body2WorldPool[0] = identity quat, p = origin -> ra == contact point.
+    std::vector<F4> body2World = { { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
+    DevBuf bBody2World = makeDev(dev, body2World);
+    // solverBodyData[0]: initialLinVelXYZ_invMassW @16 = 0 (invMass0 = 0),
+    //   initialAngVelXYZ_penBiasClamp.w @12 = penBiasClampRigid.
+    const float penBiasClampRigid = -1.0e10f;
+    std::vector<uint8_t> solverBodyData(96, 0);
+    std::memcpy(solverBodyData.data() + 12, &penBiasClampRigid, 4);
+    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
+    // solverTxIData[0].sqrtInvInertia @28: a NON-zero symmetric matrix so the rigid
+    // response rows (raXn x sqrtInvInertia) have teeth (a static body reads slot 0's
+    // matrix verbatim; velocities stay zero, so only the response denominator is affected).
+    const float sqrtInvInertia[9] = { 2.0f, 0.1f, 0.0f, 0.1f, 1.5f, 0.2f, 0.0f, 0.2f, 1.0f };
+    std::vector<uint8_t> solverTxIData(64, 0);
+    std::memcpy(solverTxIData.data() + 28, sqrtInvInertia, 9 * 4);
+    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
+
+    // --- solver-body velocity buffers (static floor at rest) --------------
+    const uint32_t numSolverBodies = 1u;
+    const uint32_t accOffset = 0u;
+    std::vector<F4> outSolverVelocity = { { 0.f, 0.f, 0.f, 0.f }, { 0.f, 0.f, 0.f, 0.f },
+                                          { 77.f, 78.f, 79.f, 80.f }, { 81.f, 82.f, 83.f, 84.f } };
+    DevBuf bOutSolverVel = makeDev(dev, outSolverVelocity);
+    std::vector<F4> solverBodyVelPool = { { 0.f, 0.f, 0.f, 0.f }, { 0.f, 0.f, 0.f, 0.f },
+                                          { 0.f, 0.f, 0.f, 0.f }, { 61.f, 62.f, 63.f, 64.f } };
+    DevBuf bSolverBodyVelPool = makeDev(dev, solverBodyVelPool);
+    std::vector<uint32_t> solverBodyIndices = { 0u };   // never dereferenced for a static body
+    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
+
+    // --- raw descriptor buffers, pointers poked at the mirror offsets -----
+    std::vector<uint8_t> prepDesc(304, 0);          // PxgConstraintPrepareDescGpu
+    pokePtr(prepDesc, 64, bSolverBodyData.addr);    // solverBodyDataPool @64
+    pokePtr(prepDesc, 72, bSolverTxIData.addr);     // solverBodyTxIDataPool @72
+    pokePtr(prepDesc, 168, bBody2World.addr);       // body2WorldPool @168
+    DevBuf bPrepDesc = makeDev(dev, prepDesc);
+
+    std::vector<uint8_t> prePrepDesc(760, 0);       // PxgPrePrepDescGpu
+    pokePtr(prePrepDesc, 272, bSolverBodyIndices.addr); // solverBodyIndices @272 (static -> unused)
+    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
+
+    std::vector<uint8_t> solverCoreDesc(320, 0);    // PxgSolverCoreDescGpu
+    pokePtr(solverCoreDesc, 0, bOutSolverVel.addr);        // outSolverVelocity @0
+    pokeU32(solverCoreDesc, 268, numSolverBodies);         // numSolverBodies @268
+    pokeU32(solverCoreDesc, 276, accOffset);               // accumulatedBodyDeltaVOffset @276
+    DevBuf bSolverCoreDesc = makeDev(dev, solverCoreDesc);
+
+    std::vector<uint8_t> sharedDesc(224, 0);        // PxgSolverSharedDesc<IterativeSolveData(TGS)>
+    pokePtr(sharedDesc, 160, bSolverBodyVelPool.addr);     // iter_solverBodyVelPool @160
+    DevBuf bSharedDesc = makeDev(dev, sharedDesc);
+
+    // ======================= dispatch PREPARE ==========================
+    struct PrepPush
+    {
+        uint64_t femClothes, contacts, normalPens, barycentrics, contactInfos, numContacts;
+        uint64_t constraints, prePrepDesc, prepDesc, rigidLambdaNs;
+        float invDt; uint32_t pad84;
+        uint64_t sharedDesc;
+        uint32_t isTGS, pad100;
+    };
+    static_assert(sizeof(PrepPush) == 104, "prepare push-constant blob must be 104 bytes");
+    PrepPush pp = {};
+    pp.femClothes = bDesc.addr; pp.contacts = bContacts.addr; pp.normalPens = bNormalPens.addr;
+    pp.barycentrics = bBary.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
+    pp.constraints = bConstraint.addr; pp.prePrepDesc = bPrePrepDesc.addr; pp.prepDesc = bPrepDesc.addr;
+    pp.rigidLambdaNs = bLambda.addr; pp.invDt = 1.0f / dt; pp.sharedDesc = bSharedDesc.addr;
+    pp.isTGS = isTGS ? 1u : 0u;
+
+    Kernel kPrep("femClothRigidContactBda.spv", "cloth_rigidContactPrepareLaunch", {}, sizeof(PrepPush));
+    kPrep.dispatch(1u, {}, pp, 1u, 1u);
+    dev->flush();
+
+    // ---- CPU reference for the prepared constraint ----
+    RigidContactConstraintHost refC;
+    std::memset(&refC, 0xCD, sizeof(refC));
+    const p714ref::V3 solverNormal = { -planeNormal.x, -planeNormal.y, -planeNormal.z };
+    const float pen = penW - contacts[0].w;
+    p714ref::refPrepare(refC, 0, solverNormal, p714ref::V3{ positions[0].x, positions[0].y, positions[0].z },
+                        pen, p714ref::V3{ accum0.x, accum0.y, accum0.z }, barycentrics[0],
+                        p714ref::V3{ 0, 0, 0 }, /*invMass0*/ 0.0f, penBiasClampRigid,
+                        sqrtInvInertia, penBiasClampFEM, /*isStatic*/ true);
+
+    const auto gConstraintBytes = downloadBuffer<uint8_t>(dev, bConstraint.h, sizeof(RigidContactConstraintHost));
+    RigidContactConstraintHost gotC;
+    std::memcpy(&gotC, gConstraintBytes.data(), sizeof(gotC));
+    const auto gLambda = downloadBuffer<float>(dev, bLambda.h, 1);
+
+    size_t mm = 0;
+    auto cmp4 = [&](const char* nm, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm; std::printf("  prep %s MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm,
+                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
+    };
+    cmp4("raXn_resp", refC.raXn_resp[0], gotC.raXn_resp[0]);
+    cmp4("raXnF0_resp", refC.raXnF0_resp[0], gotC.raXnF0_resp[0]);
+    cmp4("raXnF1_resp", refC.raXnF1_resp[0], gotC.raXnF1_resp[0]);
+    cmp4("normal_errorW", refC.normal_errorW[0], gotC.normal_errorW[0]);
+    cmp4("fricTan0_invMass0", refC.fricTan0_invMass0[0], gotC.fricTan0_invMass0[0]);
+    cmp4("barycentric", refC.barycentric[0], gotC.barycentric[0]);
+    if (f2u(refC.maxPenBias[0]) != f2u(gotC.maxPenBias[0]))
+    { ++mm; std::printf("  prep maxPenBias MM: ref %g got %g\n", refC.maxPenBias[0], gotC.maxPenBias[0]); }
+    // appliedForces zeroed by the prepare.
+    if (f2u(gLambda[0]) != 0u)
+    { ++mm; std::printf("  rigidLambdaNs not zeroed: %g\n", gLambda[0]); }
+
+    // teeth: the response rows must be non-zero (the sqrtInvInertia matrix is exercised).
+    PXG_CHECK_MSG(f2u(gotC.raXn_resp[0].x) != 0u || f2u(gotC.raXn_resp[0].y) != 0u ||
+                  f2u(gotC.raXn_resp[0].z) != 0u,
+                  "prepared raXn response must be non-zero (sqrtInvInertia teeth)");
+    PXG_CHECK_MSG(mm == 0, "cloth_rigidContactPrepareLaunch bit-exact vs CPU (%zu mismatches)", mm);
+
+    // ======================= dispatch QUERY (refcount) =================
+    struct QueryPush
+    {
+        uint64_t femClothes, contactInfos, constraints, numContacts, prePrepDesc, solverCoreDesc;
+        uint64_t artiCoreDesc, sharedDesc;
+        float dt; uint32_t pad68;
+        uint64_t appliedForces, rigidBodyReferenceCounts;
+    };
+    static_assert(sizeof(QueryPush) == 88, "query push-constant blob must be 88 bytes");
+    QueryPush qp = {};
+    qp.femClothes = bDesc.addr; qp.contactInfos = bInfos.addr; qp.constraints = bConstraint.addr;
+    qp.numContacts = bNum.addr; qp.prePrepDesc = bPrePrepDesc.addr; qp.solverCoreDesc = bSolverCoreDesc.addr;
+    qp.artiCoreDesc = 0ull; qp.sharedDesc = bSharedDesc.addr; qp.dt = dt;
+    qp.appliedForces = bLambda.addr; qp.rigidBodyReferenceCounts = bRefCounts.addr;
+
+    const char* queryEntry = isTGS ? "cloth_queryRigidClothContactReferenceCountTGSLaunch"
+                                   : "cloth_queryRigidClothContactReferenceCountLaunch";
+    Kernel kQuery("femClothRigidContactBda.spv", queryEntry, {}, sizeof(QueryPush));
+    kQuery.dispatch(1u, {}, qp, 1u, 1u);
+    dev->flush();
+
+    // ---- CPU reference for the query (mark in-collision + bump mDeltaPos.w) ----
+    const p714ref::V3 bcVec = { 1.0f, 0.0f, 0.0f };   // vertex
+    const p714ref::V3 accumV = { accum0.x, accum0.y, accum0.z };
+    const p714ref::InitResult qir = p714ref::refInitialize(refC, 0, isTGS, /*appliedForceRef*/ 0.0f, dt,
+                                                           bcVec, accumV, p714ref::V3{ invMass, 0, 0 },
+                                                           /*rigidRefCount*/ 1.0f, /*wasActive*/ false,
+                                                           /*checkOnly*/ true);
+    PXG_CHECK_MSG(qir.isActive, "query CPU ref: the penetrating contact must be active");
+    F4 refDeltaAfterQuery = { 0.0f, 0.0f, 0.0f, (qir.isActive && invMass != 0.0f) ? 1.0f : 0.0f };
+
+    const auto gDeltaQ = downloadBuffer<F4>(dev, bDelta.h, 1);
+    const auto gInfoQ = downloadBuffer<FemOtherContactInfoHost>(dev, bInfos.h, 1);
+    if (f2u(gDeltaQ[0].w) != f2u(refDeltaAfterQuery.w))
+    { ++mm; std::printf("  query mDeltaPos.w MM: ref %g got %g\n", refDeltaAfterQuery.w, gDeltaQ[0].w); }
+    PXG_CHECK_MSG(f2u(gDeltaQ[0].w) == f2u(1.0f), "query must bump mDeltaPos.w to 1 (reference count)");
+    PXG_CHECK_MSG((gInfoQ[0].rigidMatInd_isInCollision & 0x80000000u) != 0u,
+                  "query must mark the contact in-collision (bit31)");
+    PXG_CHECK_MSG(mm == 0, "cloth_queryRigidClothContactReferenceCount%s bit-exact vs CPU (%zu mismatches)",
+                  isTGS ? "TGS" : "PGS", mm);
+
+    // ======================= dispatch SOLVE ============================
+    struct SolvePush
+    {
+        uint64_t femClothes, contactInfos, constraints, numContacts, prePrepDesc, solverCoreDesc;
+        uint64_t artiCoreDesc, sharedDesc, rigidDeltaVel, appliedForces, rigidBodyReferenceCounts;
+        float dt; uint32_t pad92;
+        uint64_t materials, rigidBodyMaterials;
+    };
+    static_assert(sizeof(SolvePush) == 112, "solve push-constant blob must be 112 bytes");
+    SolvePush sp = {};
+    sp.femClothes = bDesc.addr; sp.contactInfos = bInfos.addr; sp.constraints = bConstraint.addr;
+    sp.numContacts = bNum.addr; sp.prePrepDesc = bPrePrepDesc.addr; sp.solverCoreDesc = bSolverCoreDesc.addr;
+    sp.artiCoreDesc = 0ull; sp.sharedDesc = bSharedDesc.addr; sp.rigidDeltaVel = bRigidDeltaVel.addr;
+    sp.appliedForces = bLambda.addr; sp.rigidBodyReferenceCounts = bRefCounts.addr; sp.dt = dt;
+    sp.materials = 0ull; sp.rigidBodyMaterials = 0ull;   // DEFERRED null-material path
+
+    const char* solveEntry = isTGS ? "cloth_solveRigidClothCollisionTGSLaunch"
+                                   : "cloth_solveRigidClothCollisionLaunch";
+    Kernel kSolve("femClothRigidContactBda.spv", solveEntry, {}, sizeof(SolvePush));
+    kSolve.dispatch(1u, {}, sp, 1u, 1u);
+    dev->flush();
+
+    // ---- CPU reference for the solved mDeltaPos ----
+    // readCloth (checkOnly=false): mass-splitting by the query's refCount (mDeltaPos.w == 1).
+    const float refCount = refDeltaAfterQuery.w;   // 1
+    const p714ref::V3 deformableInvMasses = { invMass * refCount, 0.0f, 0.0f };
+    const p714ref::InitResult sir = p714ref::refInitialize(refC, 0, isTGS, /*appliedForceRef*/ 0.0f, dt,
+                                                           bcVec, accumV, deformableInvMasses,
+                                                           /*rigidRefCount*/ 1.0f, /*wasActive*/ true,
+                                                           /*checkOnly*/ false);
+    // computeFEMChange + writeCloth (vertex).
+    const p714ref::V3 deltaPosR = {
+        -(sir.deltaLambdaN * sir.normal.x + sir.deltaLambdaT * sir.tangent.x) * dt,
+        -(sir.deltaLambdaN * sir.normal.y + sir.deltaLambdaT * sir.tangent.y) * dt,
+        -(sir.deltaLambdaN * sir.normal.z + sir.deltaLambdaT * sir.tangent.z) * dt };
+    const float sScale = deformableInvMasses.x;   // > 0
+    F4 refDeltaAfterSolve = { refDeltaAfterQuery.x + deltaPosR.x * sScale,
+                              refDeltaAfterQuery.y + deltaPosR.y * sScale,
+                              refDeltaAfterQuery.z + deltaPosR.z * sScale,
+                              refDeltaAfterQuery.w };   // .w unchanged (writeCloth touches xyz only)
+
+    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, 1);
+    const auto gLambda2 = downloadBuffer<float>(dev, bLambda.h, 1);
+    const auto gRigidDeltaVel = downloadBuffer<F4>(dev, bRigidDeltaVel.h, 2);
+
+    // teeth: the solve must push the vertex OUT along the plane normal (dot > 0).
+    const float pushDot = gDelta[0].x * planeNormal.x + gDelta[0].y * planeNormal.y + gDelta[0].z * planeNormal.z;
+    PXG_CHECK_MSG(pushDot > 0.0f, "solve must push the cloth vertex OUT of the floor (dot(mDeltaPos, planeNormal) > 0, got %g, isTGS=%d)",
+                  pushDot, int(isTGS));
+
+    size_t mm2 = 0;
+    if (f2u(refDeltaAfterSolve.x) != f2u(gDelta[0].x) || f2u(refDeltaAfterSolve.y) != f2u(gDelta[0].y) ||
+        f2u(refDeltaAfterSolve.z) != f2u(gDelta[0].z) || f2u(refDeltaAfterSolve.w) != f2u(gDelta[0].w))
+    { ++mm2; std::printf("  solve mDeltaPos MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n",
+                         refDeltaAfterSolve.x, refDeltaAfterSolve.y, refDeltaAfterSolve.z, refDeltaAfterSolve.w,
+                         gDelta[0].x, gDelta[0].y, gDelta[0].z, gDelta[0].w); }
+    if (f2u(gLambda2[0]) != f2u(sir.accum))
+    { ++mm2; std::printf("  solve appliedForces MM: ref %g got %g\n", sir.accum, gLambda2[0]); }
+    // dynamic-rigid reaction DEFERRED: static contact writes zeros with count 0.
+    for (uint32_t j = 0; j < 2; ++j)
+        if (f2u(gRigidDeltaVel[j].x) != 0u || f2u(gRigidDeltaVel[j].y) != 0u ||
+            f2u(gRigidDeltaVel[j].z) != 0u || f2u(gRigidDeltaVel[j].w) != 0u)
+        { ++mm2; std::printf("  rigidDeltaVel[%u] not zeroed (static reaction)\n", j); }
+    PXG_CHECK_MSG(mm2 == 0, "cloth_solveRigidClothCollision%s bit-exact vs CPU (%zu mismatches)",
+                  isTGS ? "TGS" : "PGS", mm2);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h);
+    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bTri.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bContacts.h); dev->destroyBuffer(bNormalPens.h); dev->destroyBuffer(bBary.h);
+    dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bConstraint.h);
+    dev->destroyBuffer(bLambda.h); dev->destroyBuffer(bRigidDeltaVel.h); dev->destroyBuffer(bRefCounts.h);
+    dev->destroyBuffer(bBody2World.h); dev->destroyBuffer(bSolverBodyData.h); dev->destroyBuffer(bSolverTxIData.h);
+    dev->destroyBuffer(bOutSolverVel.h); dev->destroyBuffer(bSolverBodyVelPool.h); dev->destroyBuffer(bSolverBodyIndices.h);
+    dev->destroyBuffer(bPrepDesc.h); dev->destroyBuffer(bPrePrepDesc.h);
+    dev->destroyBuffer(bSolverCoreDesc.h); dev->destroyBuffer(bSharedDesc.h);
+}
+
+PXG_TEST(femClothSimRigidContactPGS) { runRigidContact(/*isTGS*/ false); }
+PXG_TEST(femClothSimRigidContactTGS) { runRigidContact(/*isTGS*/ true); }
+
 } // namespace

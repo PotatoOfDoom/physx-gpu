@@ -340,6 +340,34 @@ static const uint8_t kClothVertContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80
 //   PxgFEMCore::reorderRigidContacts() PxgFEMCore.cpp:232.
 static const uint8_t kFemReorderRSContacts[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
 
+// gpusimulationcontroller FEMCloth-vs-rigid contact PREPARE + SOLVE (P7.1 tranche 4b-2/3):
+//   cloth_rigidContactPrepareLaunch(PxgFEMCloth* femClothes, float4* contacts_restW,
+//     float4* normalPens, float4* barycentrics, const PxgFemOtherContactInfo* contactInfos,
+//     PxU32* numContacts, PxgFemRigidConstraintBlock* primitiveConstraints,
+//     PxgPrePrepDesc* preDesc, PxgConstraintPrepareDesc* prepareDesc, PxReal* rigidLambdaNs,
+//     PxReal invDt, PxgSolverSharedDescBase* sharedDesc, bool isTGS)  -- launch site
+//   PxgFEMClothCore.cpp:328.  Ten device pointers + PxReal (@80) + device pointer (@88) +
+//   bool (@96) -> natural-alignment blob = 104 bytes.
+static const uint8_t kClothRigidContactPrep[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 1 };
+//   cloth_queryRigidClothContactReferenceCount{,TGS}Launch(PxgFEMCloth* femClothes,
+//     PxgFemOtherContactInfo* contactInfos, PxgFemRigidConstraintBlock* constraints,
+//     PxU32* numContacts, PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
+//     PxgArticulationCoreDesc* artiCoreDesc, PxgSolverSharedDesc* sharedDesc, PxReal dt,
+//     PxReal* appliedForces, PxU32* rigidBodyReferenceCounts)  -- launch site
+//   PxgFEMClothCore.cpp:1741 (both PGS and TGS share the pack).  Eight device pointers +
+//   PxReal (@64) + two device pointers (@72/@80) -> natural-alignment blob = 88 bytes.
+static const uint8_t kClothRigidContactQuery[] = { 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
+//   cloth_solveRigidClothCollision{,TGS}Launch(PxgFEMCloth* femClothes,
+//     PxgFemOtherContactInfo* contactInfos, PxgFemRigidConstraintBlock* constraints,
+//     PxU32* numContacts, PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
+//     PxgArticulationCoreDesc* artiCoreDesc, PxgSolverSharedDesc* sharedDesc,
+//     float4* rigidDeltaVel, PxReal* appliedForces, PxU32* rigidBodyReferenceCounts,
+//     PxReal dt, PxsDeformableSurfaceMaterialData* materials,
+//     const PxsMaterialData* rigidBodyMaterials)  -- launch site PxgFEMClothCore.cpp:1797
+//   (both PGS and TGS share the pack).  Eleven device pointers + PxReal (@88) + two device
+//   pointers (@96/@104) -> natural-alignment blob = 112 bytes.
+static const uint8_t kClothRigidContactSolve[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
+
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
@@ -664,6 +692,12 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_SphereVertexContactGenLaunch", kClothVertContactGen, uint32_t(sizeof(kClothVertContactGen)) },
     // gpunarrowphase FEMCloth-vs-rigid contact SORT / reorder (P7.1 tranche 4b-1 BDA)
     { "fem_reorderRigidContactsLaunch", kFemReorderRSContacts, uint32_t(sizeof(kFemReorderRSContacts)) },
+    // gpusimulationcontroller FEMCloth-vs-rigid contact PREPARE + query/solve (P7.1 tranche 4b-2/3 BDA)
+    { "cloth_rigidContactPrepareLaunch", kClothRigidContactPrep, uint32_t(sizeof(kClothRigidContactPrep)) },
+    { "cloth_queryRigidClothContactReferenceCountLaunch", kClothRigidContactQuery, uint32_t(sizeof(kClothRigidContactQuery)) },
+    { "cloth_queryRigidClothContactReferenceCountTGSLaunch", kClothRigidContactQuery, uint32_t(sizeof(kClothRigidContactQuery)) },
+    { "cloth_solveRigidClothCollisionLaunch", kClothRigidContactSolve, uint32_t(sizeof(kClothRigidContactSolve)) },
+    { "cloth_solveRigidClothCollisionTGSLaunch", kClothRigidContactSolve, uint32_t(sizeof(kClothRigidContactSolve)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },
