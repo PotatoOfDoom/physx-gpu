@@ -3606,4 +3606,539 @@ PXG_TEST(femClothSimSelfCollisionEE)
     dev->destroyBuffer(bPosOut.h); dev->destroyBuffer(bDesc2.h); dev->destroyBuffer(bCount2.h);
 }
 
+// ===========================================================================
+// P7.2 tranche 2: cloth-vs-CLOTH self-contact SOLVE.
+//   femClothClothContactBda.spv:
+//     cloth_clothContactPrepareLaunch            (FEMClothConstraintPrep.cu:155)
+//     cloth_queryClothClothContact{VT,EE}CountLaunch (FEMClothExternalSolve.cu:902/:964)
+//     cloth_solveClothClothDelta{VT,EE}Launch    (FEMClothExternalSolve.cu:651/:760)
+//     cloth_updateClothContactValidityLaunch     (FEMClothExternalSolve.cu:1114)
+// The prepare marks a not-yet-valid self-contact valid (rest-pose distance filter); the
+// query counts each referenced cloth vertex into mDeltaPos.w and marks the pair
+// in-collision; the VT/EE solve scatters BOTH endpoints' corrections into mDeltaPos so the
+// penetrating vertex + its triangle (VT) / the two crossing edges (EE) get pushed APART.
+// Checked bit-exact vs a CPU transcription of the .cu math (PGS; the cloth self-contact
+// solve has no TGS variant) in BOTH memory modes.  FULLY bit-exact: the closest-point +
+// constraint math is pure mul/add/sub/div/sqrt/abs — the only transcendental (PxRecipSqrt)
+// is on the friction branch, DEAD for the zero-friction self-fold target.
+// ===========================================================================
+
+// auxInd flag bits beyond the tranche-1 masks (@3235): isInCollision (bit29), Valid (bit31).
+static const uint32_t CONTACT_FLAG_MASK_H  = 1u << 29;
+static const uint32_t VALIDITY_FLAG_MASK_H = 1u << 31;
+
+// Push blobs, byte-identical to femClothClothContactBda.slang's [[vk::push_constant]]
+// structs (ABI rows {8,8,8,4,8,8} / {8,8,8} / {8,8,8,4} / {8,8,1,1,8,8,8,4}).
+struct PrepClothClothPush
+{
+    uint64_t clothes, contactInfos, numContacts;
+    uint32_t maxContacts, pad28;
+    uint64_t clothMaterials, updateContactPairs;
+};
+static_assert(sizeof(PrepClothClothPush) == 48, "clothContactPrepare push blob must be 48 bytes");
+static_assert(offsetof(PrepClothClothPush, clothMaterials) == 32, "clothMaterials @32");
+
+struct QueryClothClothPush
+{
+    uint64_t cloths, contactInfos, numContacts;
+};
+static_assert(sizeof(QueryClothClothPush) == 24, "queryClothCloth push blob must be 24 bytes");
+
+struct SolveClothClothPush
+{
+    uint64_t cloths, contactInfos, numContacts;
+    float dt;
+    uint32_t pad28;
+};
+static_assert(sizeof(SolveClothClothPush) == 32, "solveClothCloth push blob must be 32 bytes");
+
+struct UpdateValidityPush
+{
+    uint64_t femCloths, activeIds;
+    uint32_t adaptiveWord, forceWord;
+    uint64_t updateContactPairs, VTContactCount, EEContactCount;
+    float dt;
+    uint32_t pad52;
+};
+static_assert(sizeof(UpdateValidityPush) == 56, "updateContactValidity push blob must be 56 bytes");
+static_assert(offsetof(UpdateValidityPush, updateContactPairs) == 24, "updateContactPairs @24");
+static_assert(offsetof(UpdateValidityPush, dt) == 48, "dt @48");
+
+// ---------------------------------------------------------------------------
+// Bit-exact CPU transcription of the count + solve arithmetic
+// (FEMClothExternalSolve.cu countContact + triangleCollisionConstraint +
+// applyContactDelta).  Reuses the p72ref vector helpers; built -ffp-contract=off.
+// ---------------------------------------------------------------------------
+namespace p72solve
+{
+using p72ref::V3;
+using p72ref::sub;
+using p72ref::add;
+using p72ref::mul;    // mul(v, s) = { v.x*s, v.y*s, v.z*s }
+using p72ref::dot;
+using p72ref::divv;   // divv(v, s) = { v.x/s, v.y/s, v.z/s } (per-component)
+static const float THR = 1.0e-14f;
+
+// weights-weighted displacement (cloth0 - cloth1), left-associative like the shader.
+static V3 dispFromWeights(const float w[4], V3 xx0, V3 xx1, V3 xx2, V3 xx3)
+{
+    return add(add(add(mul(xx0, w[0]), mul(xx1, w[1])), mul(xx2, w[2])), mul(xx3, w[3]));
+}
+
+// triangleCollisionConstraint (frictionless path): out dx[4].  invM = count-split masses.
+static void constraint(V3& dx0, V3& dx1, V3& dx2, V3& dx3, V3 disp, V3 normal, const float invM[4],
+                       float restDist, const float w[4])
+{
+    dx0 = dx1 = dx2 = dx3 = V3{ 0.0f, 0.0f, 0.0f };
+    const float CN = dot(disp, normal) - restDist;
+    float denom = invM[0] * w[0] * w[0];
+    denom += invM[1] * w[1] * w[1];
+    denom += invM[2] * w[2] * w[2];
+    denom += invM[3] * w[3] * w[3];
+    if (denom < THR)
+        return;
+    const float invDenom = 1.0f / denom;
+    const float deltaLambdaN = -CN * invDenom;
+    const V3 commonVec = mul(normal, deltaLambdaN);
+    dx0 = mul(commonVec, invM[0] * w[0]);
+    dx1 = mul(commonVec, invM[1] * w[1]);
+    dx2 = mul(commonVec, invM[2] * w[2]);
+    dx3 = mul(commonVec, invM[3] * w[3]);
+}
+} // namespace p72solve
+
+// A self-contact reference outcome: the four endpoints' (vertexSlot, mDeltaPos.w count,
+// mDeltaPos.xyz correction).
+struct SelfContactRef
+{
+    uint32_t slot[4];
+    float countW[4];
+    p72ref::V3 dx[4];
+    bool inCollision;
+};
+
+// Transcribe the query (countContact) + solve (constraint + applyContactDelta) for one
+// self-contact given the four endpoint positions / inverse masses / weights, the normal
+// and the total rest distance.  `vertInvMass[i]` == the endpoint's mPosition_InvMass.w.
+static SelfContactRef refSelfContact(const uint32_t slot[4], const p72ref::V3 xx[4],
+                                     const float vertInvMass[4], const float weights[4],
+                                     p72ref::V3 normal, float restDistTotal)
+{
+    using p72ref::V3;
+    SelfContactRef r;
+    for (int i = 0; i < 4; ++i) { r.slot[i] = slot[i]; r.countW[i] = 0.0f; r.dx[i] = V3{ 0, 0, 0 }; }
+
+    // countContact: mark in-collision iff distSq <= restDist^2, then bump |coeff|.
+    const V3 disp = p72solve::dispFromWeights(weights, xx[0], xx[1], xx[2], xx[3]);
+    const float distSq = p72solve::dot(disp, disp);
+    r.inCollision = !(distSq > restDistTotal * restDistTotal);
+    if (!r.inCollision)
+        return r;
+    for (int i = 0; i < 4; ++i)
+    {
+        const float coeff = std::fabs(weights[i]);
+        if (coeff > 1e-3f)
+            r.countW[i] = coeff;   // one contact -> distinct slots, so no accumulation
+    }
+
+    // solve: split masses by the query counts, run the constraint, scatter if count > 0.
+    float splitted[4];
+    for (int i = 0; i < 4; ++i)
+        splitted[i] = r.countW[i] * vertInvMass[i];
+    V3 dx0, dx1, dx2, dx3;
+    p72solve::constraint(dx0, dx1, dx2, dx3, disp, normal, splitted, restDistTotal, weights);
+    const V3 dxs[4] = { dx0, dx1, dx2, dx3 };
+    for (int i = 0; i < 4; ++i)
+        if (r.countW[i] > 0.0f)
+            r.dx[i] = dxs[i];
+    return r;
+}
+
+// cloth_clothContactPrepare -> query -> solve: push a penetrating VT self-contact apart.
+static void runClothSelfContactVT()
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+    const float invMass = 0.5f;
+    const float restDistScalar = 0.05f;   // total rest distance = 0.1
+
+    // Triangle T0 = {0,1,2} in a TILTED plane (so the contact normal is off-axis and no
+    // delta component lands on an exact signed zero — the femClothSimRigidContact
+    // precedent); vertex 3 hovers 0.05 above the centroid along the triangle normal,
+    // projecting to the interior (barycentric ~1/3,1/3,1/3).
+    std::vector<F4> pos = {
+        { 0.00f, 0.00f, 0.00f, invMass },              // v0 (T0)
+        { 1.00f, 0.00f, 0.20f, invMass },              // v1 (T0) tilted
+        { 0.00f, 1.00f, 0.10f, invMass },              // v2 (T0) tilted
+        { 0.3235743f, 0.3284538f, 0.1487950f, invMass },  // v3 penetrating vertex
+    };
+    std::vector<F4> rest = pos;   // distinct rest -> rest-pose filter passes
+    std::vector<F4> prev = pos;   // prevPositionInContactOffset == pos -> relDelta 0
+    std::vector<F4> deltaPos(4, F4{ 0, 0, 0, 0 });
+    std::vector<float> friction(4, 0.0f);   // frictionless -> the tangent branch is dead
+    std::vector<TriIdx4> tris = { { 0u, 1u, 2u, 0u } };
+
+    DevBuf bPos = makeDev(dev, pos);
+    DevBuf bRest = makeDev(dev, rest);
+    DevBuf bPrev = makeDev(dev, prev);
+    DevBuf bDelta = makeDev(dev, deltaPos);
+    DevBuf bFric = makeDev(dev, friction);
+    DevBuf bTri = makeDev(dev, tris);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mRestPosition = reinterpret_cast<decltype(c.mRestPosition)>(size_t(bRest.addr));
+    c.mPrevPositionInContactOffset = reinterpret_cast<decltype(c.mPrevPositionInContactOffset)>(size_t(bPrev.addr));
+    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
+    c.mDynamicFrictions = reinterpret_cast<decltype(c.mDynamicFrictions)>(size_t(bFric.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mNbVerts = 4u;
+    c.mSelfCollisionFilterDistance = 0.0f;
+    c.mRestDistance = restDistScalar;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // contactInfo: pairInd0 = encode(0,3) (vertex), pairInd1 = encode(0,0) (triangle),
+    // auxInd = VT (bit30=0), NOT-yet-valid (bit31=0).
+    std::vector<FemFemContactInfoHost> infos(1);
+    infos[0].pairInd0 = (0ull << 20) | 3ull;
+    infos[0].pairInd1 = (0u << 20) | 0u;
+    infos[0].auxInd = 0u;
+    DevBuf bInfos = makeDev(dev, infos);
+    std::vector<uint32_t> numContacts = { 1u };
+    DevBuf bNum = makeDev(dev, numContacts);
+    std::vector<uint32_t> upd = { 1u };
+    DevBuf bUpd = makeDev(dev, upd);
+
+    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    const uint32_t MAXC = 64u;
+
+    // ---- prepare ----
+    PrepClothClothPush pp = {};
+    pp.clothes = bDesc.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
+    pp.maxContacts = MAXC; pp.clothMaterials = 0ull; pp.updateContactPairs = bUpd.addr;
+    Kernel kPrep("femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch", {}, sizeof(PrepClothClothPush));
+    kPrep.dispatch(1u, {}, pp, 1u, 1u);
+    dev->flush();
+    const FemFemContactInfoHost giPrep = downloadBuffer<FemFemContactInfoHost>(dev, bInfos.h, 1)[0];
+    PXG_CHECK_MSG((giPrep.auxInd & VALIDITY_FLAG_MASK_H) != 0u,
+                  "prepare must mark the VT self-contact valid (auxInd=0x%08x)", giPrep.auxInd);
+
+    // ---- query VT (count) ----
+    QueryClothClothPush qp = {};
+    qp.cloths = bDesc.addr; qp.contactInfos = bInfos.addr; qp.numContacts = bNum.addr;
+    Kernel kQuery("femClothClothContactBda.spv", "cloth_queryClothClothContactVTCountLaunch", {}, sizeof(QueryClothClothPush));
+    kQuery.dispatch(1u, {}, qp, 1u, 1u);
+    dev->flush();
+
+    // ---- CPU reference: closestPtPointTriangle(p=v3, a=v0, b=v1, c=v2) -> weights ----
+    using p72ref::V3;
+    auto v3f = [&](const F4& f) { return V3{ f.x, f.y, f.z }; };
+    float s, t;
+    p72ref::closestPtPointTriangle(v3f(pos[3]), v3f(pos[0]), v3f(pos[1]), v3f(pos[2]), s, t);
+    const float rBary = 1.0f - s - t;
+    const float weightsVT[4] = { 1.0f, -rBary, -s, -t };
+    const V3 xxVT[4] = { v3f(pos[3]), v3f(pos[0]), v3f(pos[1]), v3f(pos[2]) };
+    // normal = disp / dist (per-component division; VT path).
+    const V3 dispVT = p72solve::dispFromWeights(weightsVT, xxVT[0], xxVT[1], xxVT[2], xxVT[3]);
+    const float distVT = std::sqrt(p72solve::dot(dispVT, dispVT));
+    const V3 normalVT = p72ref::divv(dispVT, distVT);
+    const float restTotal = restDistScalar + restDistScalar;
+    const uint32_t slotVT[4] = { 3u, 0u, 1u, 2u };   // vertex, tri.x, tri.y, tri.z
+    const float vimVT[4] = { invMass, invMass, invMass, invMass };
+    const SelfContactRef ref = refSelfContact(slotVT, xxVT, vimVT, weightsVT, normalVT, restTotal);
+    PXG_CHECK_MSG(ref.inCollision, "reference: the VT self-contact must be in-collision");
+
+    // per-slot reference mDeltaPos after query (.w) — check the count pass.
+    F4 refDelta[4] = { F4{ 0, 0, 0, 0 }, F4{ 0, 0, 0, 0 }, F4{ 0, 0, 0, 0 }, F4{ 0, 0, 0, 0 } };
+    for (int i = 0; i < 4; ++i) refDelta[ref.slot[i]].w = ref.countW[i];
+
+    const auto gDeltaQ = downloadBuffer<F4>(dev, bDelta.h, 4);
+    const FemFemContactInfoHost giQ = downloadBuffer<FemFemContactInfoHost>(dev, bInfos.h, 1)[0];
+    size_t mmQ = 0;
+    for (uint32_t v = 0; v < 4; ++v)
+        if (f2u(gDeltaQ[v].w) != f2u(refDelta[v].w))
+        { ++mmQ; std::printf("  VT query mDeltaPos[%u].w MM: ref %g got %g\n", v, refDelta[v].w, gDeltaQ[v].w); }
+    PXG_CHECK_MSG((giQ.auxInd & CONTACT_FLAG_MASK_H) != 0u, "query must mark the VT contact in-collision");
+    PXG_CHECK_MSG(mmQ == 0, "cloth_queryClothClothContactVTCount bit-exact vs CPU (%zu mismatches)", mmQ);
+
+    // ---- solve VT ----
+    SolveClothClothPush sp = {};
+    sp.cloths = bDesc.addr; sp.contactInfos = bInfos.addr; sp.numContacts = bNum.addr; sp.dt = dt;
+    Kernel kSolve("femClothClothContactBda.spv", "cloth_solveClothClothDeltaVTLaunch", {}, sizeof(SolveClothClothPush));
+    kSolve.dispatch(1u, {}, sp, 1u, 1u);
+    dev->flush();
+
+    for (int i = 0; i < 4; ++i)
+    {
+        refDelta[ref.slot[i]].x = ref.dx[i].x;
+        refDelta[ref.slot[i]].y = ref.dx[i].y;
+        refDelta[ref.slot[i]].z = ref.dx[i].z;
+    }
+
+    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, 4);
+    size_t mm = 0;
+    for (uint32_t v = 0; v < 4; ++v)
+        if (f2u(gDelta[v].x) != f2u(refDelta[v].x) || f2u(gDelta[v].y) != f2u(refDelta[v].y) ||
+            f2u(gDelta[v].z) != f2u(refDelta[v].z) || f2u(gDelta[v].w) != f2u(refDelta[v].w))
+        { ++mm; std::printf("  VT solve mDeltaPos[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", v,
+                            refDelta[v].x, refDelta[v].y, refDelta[v].z, refDelta[v].w,
+                            gDelta[v].x, gDelta[v].y, gDelta[v].z, gDelta[v].w); }
+
+    // teeth: the vertex is pushed OUT along +normal and the triangle vertices are pushed
+    // along -normal -> the vertex-triangle penetration is resolved (both endpoints move apart).
+    auto dotN = [](const F4& d, const V3& nn) { return d.x * nn.x + d.y * nn.y + d.z * nn.z; };
+    PXG_CHECK_MSG(dotN(gDelta[3], normalVT) > 0.0f,
+                  "solve must push the penetrating VERTEX out along +normal (dot %g)", dotN(gDelta[3], normalVT));
+    PXG_CHECK_MSG(dotN(gDelta[0], normalVT) < 0.0f && dotN(gDelta[1], normalVT) < 0.0f && dotN(gDelta[2], normalVT) < 0.0f,
+                  "solve must push the TRIANGLE along -normal (dots %g,%g,%g)",
+                  dotN(gDelta[0], normalVT), dotN(gDelta[1], normalVT), dotN(gDelta[2], normalVT));
+    PXG_CHECK_MSG(mm == 0, "cloth_solveClothClothDeltaVT bit-exact vs CPU (%zu mismatches)", mm);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bRest.h); dev->destroyBuffer(bPrev.h);
+    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bFric.h); dev->destroyBuffer(bTri.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bUpd.h);
+}
+
+// cloth_clothContactPrepare -> query -> solve: push a penetrating EE self-contact apart.
+static void runClothSelfContactEE()
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+    const float invMass = 0.5f;
+    const float restDistScalar = 0.05f;   // total rest distance = 0.1
+
+    // Two perpendicular crossing edges with a 0.03 gap, ROTATED off-axis (Rz30.Ry25.Rx20)
+    // so the contact normal has no zero component (the femClothSimRigidContact precedent —
+    // an axis-aligned separation would land the transverse delta components on signed zero).
+    // T_a = {0,1,2} (index 0): edge0 = v0->v1.  T_b = {3,4,5} (index 1): edge0 = v3->v4.
+    std::vector<F4> pos = {
+        { -0.3924428f, -0.2265770f,  0.2113091f, invMass },  // v0 (T_a, edge1 v0)
+        {  0.3924428f,  0.2265770f, -0.2113091f, invMass },  // v1 (T_a, edge1 v1)
+        { -0.5149359f,  0.0976325f, -0.8516507f, invMass },  // v2 (T_a, far)
+        { -0.0879522f,  0.2628919f,  0.1185422f, invMass },  // v3 (T_b, edge0 v0)
+        {  0.1188483f, -0.2687499f, -0.0674431f, invMass },  // v4 (T_b, edge0 v1)
+        {  0.5149359f, -0.0976325f,  0.8516507f, invMass },  // v5 (T_b, far)
+    };
+    std::vector<F4> rest = pos;
+    std::vector<F4> prev = pos;
+    std::vector<F4> deltaPos(6, F4{ 0, 0, 0, 0 });
+    std::vector<float> friction(6, 0.0f);
+    std::vector<TriIdx4> tris = { { 0u, 1u, 2u, 0x7u }, { 3u, 4u, 5u, 0x7u } };
+
+    DevBuf bPos = makeDev(dev, pos);
+    DevBuf bRest = makeDev(dev, rest);
+    DevBuf bPrev = makeDev(dev, prev);
+    DevBuf bDelta = makeDev(dev, deltaPos);
+    DevBuf bFric = makeDev(dev, friction);
+    DevBuf bTri = makeDev(dev, tris);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mRestPosition = reinterpret_cast<decltype(c.mRestPosition)>(size_t(bRest.addr));
+    c.mPrevPositionInContactOffset = reinterpret_cast<decltype(c.mPrevPositionInContactOffset)>(size_t(bPrev.addr));
+    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
+    c.mDynamicFrictions = reinterpret_cast<decltype(c.mDynamicFrictions)>(size_t(bFric.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mNbVerts = 6u;
+    c.mSelfCollisionFilterDistance = 0.0f;
+    c.mRestDistance = restDistScalar;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // contactInfo: pairInd0 = encode(0,1) (triangle0 = T_b, edge0 index 0),
+    // pairInd1 = encode(0,0) (triangle1 = T_a, edge index 0), auxInd = EE (bit30), aux0=aux1=0,
+    // NOT-yet-valid.
+    std::vector<FemFemContactInfoHost> infos(1);
+    infos[0].pairInd0 = (0ull << 20) | 1ull;
+    infos[0].pairInd1 = (0u << 20) | 0u;
+    infos[0].auxInd = PAIR_TYPE_FLAG_MASK_H;   // bit30 = EE, aux0=aux1=0
+    DevBuf bInfos = makeDev(dev, infos);
+    std::vector<uint32_t> numContacts = { 1u };
+    DevBuf bNum = makeDev(dev, numContacts);
+    std::vector<uint32_t> upd = { 1u };
+    DevBuf bUpd = makeDev(dev, upd);
+
+    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    const uint32_t MAXC = 64u;
+
+    // ---- prepare ----
+    PrepClothClothPush pp = {};
+    pp.clothes = bDesc.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
+    pp.maxContacts = MAXC; pp.clothMaterials = 0ull; pp.updateContactPairs = bUpd.addr;
+    Kernel kPrep("femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch", {}, sizeof(PrepClothClothPush));
+    kPrep.dispatch(1u, {}, pp, 1u, 1u);
+    dev->flush();
+    const FemFemContactInfoHost giPrep = downloadBuffer<FemFemContactInfoHost>(dev, bInfos.h, 1)[0];
+    PXG_CHECK_MSG((giPrep.auxInd & VALIDITY_FLAG_MASK_H) != 0u,
+                  "prepare must mark the EE self-contact valid (auxInd=0x%08x)", giPrep.auxInd);
+
+    // ---- query EE (count) ----
+    QueryClothClothPush qp = {};
+    qp.cloths = bDesc.addr; qp.contactInfos = bInfos.addr; qp.numContacts = bNum.addr;
+    Kernel kQuery("femClothClothContactBda.spv", "cloth_queryClothClothContactEECountLaunch", {}, sizeof(QueryClothClothPush));
+    kQuery.dispatch(1u, {}, qp, 1u, 1u);
+    dev->flush();
+
+    // ---- CPU reference: closestPtLineLine(edge0 = v3->v4, edge1 = v0->v1) -> weights ----
+    using p72ref::V3;
+    auto v3f = [&](const F4& f) { return V3{ f.x, f.y, f.z }; };
+    // vertIndices = (T_b[0]=3, T_b[1]=4, T_a[0]=0, T_a[1]=1).
+    const uint32_t slotEE[4] = { 3u, 4u, 0u, 1u };
+    const V3 xxEE[4] = { v3f(pos[3]), v3f(pos[4]), v3f(pos[0]), v3f(pos[1]) };
+    float s, t, distSq;
+    p72ref::closestPtLineLine(xxEE[0], xxEE[1], xxEE[2], xxEE[3], s, t, distSq);
+    const float weightsEE[4] = { 1.0f - s, s, -(1.0f - t), -t };
+    // normal = disp * (1/dist) (reciprocal-multiply; EE path).
+    const V3 dispEE = p72solve::dispFromWeights(weightsEE, xxEE[0], xxEE[1], xxEE[2], xxEE[3]);
+    const float distEE = std::sqrt(distSq);
+    const V3 normalEE = p72ref::mul(dispEE, 1.0f / distEE);
+    const float restTotal = restDistScalar + restDistScalar;
+    const float vimEE[4] = { invMass, invMass, invMass, invMass };
+    const SelfContactRef ref = refSelfContact(slotEE, xxEE, vimEE, weightsEE, normalEE, restTotal);
+    PXG_CHECK_MSG(ref.inCollision, "reference: the EE self-contact must be in-collision");
+
+    F4 refDelta[6];
+    for (int v = 0; v < 6; ++v) refDelta[v] = F4{ 0, 0, 0, 0 };
+    for (int i = 0; i < 4; ++i) refDelta[ref.slot[i]].w = ref.countW[i];
+
+    const auto gDeltaQ = downloadBuffer<F4>(dev, bDelta.h, 6);
+    const FemFemContactInfoHost giQ = downloadBuffer<FemFemContactInfoHost>(dev, bInfos.h, 1)[0];
+    size_t mmQ = 0;
+    for (uint32_t v = 0; v < 6; ++v)
+        if (f2u(gDeltaQ[v].w) != f2u(refDelta[v].w))
+        { ++mmQ; std::printf("  EE query mDeltaPos[%u].w MM: ref %g got %g\n", v, refDelta[v].w, gDeltaQ[v].w); }
+    PXG_CHECK_MSG((giQ.auxInd & CONTACT_FLAG_MASK_H) != 0u, "query must mark the EE contact in-collision");
+    PXG_CHECK_MSG(mmQ == 0, "cloth_queryClothClothContactEECount bit-exact vs CPU (%zu mismatches)", mmQ);
+
+    // ---- solve EE ----
+    SolveClothClothPush sp = {};
+    sp.cloths = bDesc.addr; sp.contactInfos = bInfos.addr; sp.numContacts = bNum.addr; sp.dt = dt;
+    Kernel kSolve("femClothClothContactBda.spv", "cloth_solveClothClothDeltaEELaunch", {}, sizeof(SolveClothClothPush));
+    kSolve.dispatch(1u, {}, sp, 1u, 1u);
+    dev->flush();
+
+    for (int i = 0; i < 4; ++i)
+    {
+        refDelta[ref.slot[i]].x = ref.dx[i].x;
+        refDelta[ref.slot[i]].y = ref.dx[i].y;
+        refDelta[ref.slot[i]].z = ref.dx[i].z;
+    }
+
+    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, 6);
+    size_t mm = 0;
+    for (uint32_t v = 0; v < 6; ++v)
+        if (f2u(gDelta[v].x) != f2u(refDelta[v].x) || f2u(gDelta[v].y) != f2u(refDelta[v].y) ||
+            f2u(gDelta[v].z) != f2u(refDelta[v].z) || f2u(gDelta[v].w) != f2u(refDelta[v].w))
+        { ++mm; std::printf("  EE solve mDeltaPos[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", v,
+                            refDelta[v].x, refDelta[v].y, refDelta[v].z, refDelta[v].w,
+                            gDelta[v].x, gDelta[v].y, gDelta[v].z, gDelta[v].w); }
+
+    // teeth: edge0 (v3,v4) is pushed along +normal and edge1 (v0,v1) along -normal -> the
+    // crossing edges separate (both endpoints move apart).
+    auto dotN = [](const F4& d, const V3& nn) { return d.x * nn.x + d.y * nn.y + d.z * nn.z; };
+    PXG_CHECK_MSG(dotN(gDelta[3], normalEE) > 0.0f && dotN(gDelta[4], normalEE) > 0.0f,
+                  "solve must push edge0 out along +normal (dots %g,%g)", dotN(gDelta[3], normalEE), dotN(gDelta[4], normalEE));
+    PXG_CHECK_MSG(dotN(gDelta[0], normalEE) < 0.0f && dotN(gDelta[1], normalEE) < 0.0f,
+                  "solve must push edge1 along -normal (dots %g,%g)", dotN(gDelta[0], normalEE), dotN(gDelta[1], normalEE));
+    PXG_CHECK_MSG(mm == 0, "cloth_solveClothClothDeltaEE bit-exact vs CPU (%zu mismatches)", mm);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bRest.h); dev->destroyBuffer(bPrev.h);
+    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bFric.h); dev->destroyBuffer(bTri.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bUpd.h);
+}
+
+PXG_TEST(femClothSimSelfContactSolveVT) { runClothSelfContactVT(); }
+PXG_TEST(femClothSimSelfContactSolveEE) { runClothSelfContactEE(); }
+
+// cloth_updateClothContactValidityLaunch — snapshot each vertex into
+// mPrevPositionInContactOffset (w = 1) and reset the VT/EE contact counts on an adaptive
+// update.  Pure copy + set-w — trivially bit-exact; the forced-fresh mutation check flips
+// `adaptive` off to prove the write is guarded (a stub that always wrote would fail).
+PXG_TEST(femClothSimUpdateClothContactValidity)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    std::vector<F4> pos = {
+        { 1.5f, -2.5f, 3.5f, 0.25f },
+        { -4.0f, 5.0f, -6.0f, 0.5f },
+        { 7.0f, 8.0f, 9.0f, 1.0f },
+    };
+    const uint32_t N = uint32_t(pos.size());
+    std::vector<F4> prev(N, F4{ -111.0f, -222.0f, -333.0f, -444.0f });   // poison
+    std::vector<float> fric(N, 0.0f);
+
+    DevBuf bPos = makeDev(dev, pos);
+    DevBuf bPrev = makeDev(dev, prev);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mPrevPositionInContactOffset = reinterpret_cast<decltype(c.mPrevPositionInContactOffset)>(size_t(bPrev.addr));
+    c.mNbVerts = N;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+    std::vector<uint32_t> upd = { 1u };   // updateContactPairs == 1
+    DevBuf bUpd = makeDev(dev, upd);
+    std::vector<uint32_t> vtCount = { 77u };
+    DevBuf bVt = makeDev(dev, vtCount);
+    std::vector<uint32_t> eeCount = { 88u };
+    DevBuf bEe = makeDev(dev, eeCount);
+
+    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    UpdateValidityPush up = {};
+    up.femCloths = bDesc.addr; up.activeIds = bActive.addr;
+    up.adaptiveWord = 1u;   // adaptiveCollisionPairUpdate = true
+    up.forceWord = 0u;      // forceUpdateClothContactPairs (unused)
+    up.updateContactPairs = bUpd.addr; up.VTContactCount = bVt.addr; up.EEContactCount = bEe.addr;
+    up.dt = 1.0f / 60.0f;   // unused
+    Kernel k("femClothClothContactBda.spv", "cloth_updateClothContactValidityLaunch", {}, sizeof(UpdateValidityPush));
+    k.dispatch(1u, {}, up, 1u, 1u);
+    dev->flush();
+
+    const auto gPrev = downloadBuffer<F4>(dev, bPrev.h, N);
+    const uint32_t gVt = downloadBuffer<uint32_t>(dev, bVt.h, 1)[0];
+    const uint32_t gEe = downloadBuffer<uint32_t>(dev, bEe.h, 1)[0];
+    size_t mm = 0;
+    for (uint32_t v = 0; v < N; ++v)
+        if (f2u(gPrev[v].x) != f2u(pos[v].x) || f2u(gPrev[v].y) != f2u(pos[v].y) ||
+            f2u(gPrev[v].z) != f2u(pos[v].z) || f2u(gPrev[v].w) != f2u(1.0f))
+        { ++mm; std::printf("  update prev[%u] MM: ref(%g,%g,%g,1) got(%g,%g,%g,%g)\n", v,
+                            pos[v].x, pos[v].y, pos[v].z, gPrev[v].x, gPrev[v].y, gPrev[v].z, gPrev[v].w); }
+    PXG_CHECK_MSG(gVt == 0u && gEe == 0u, "adaptive update must reset VT/EE counts (got %u,%u)", gVt, gEe);
+    PXG_CHECK_MSG(mm == 0, "cloth_updateClothContactValidity bit-exact vs CPU (%zu mismatches)", mm);
+
+    // forced-fresh mutation check: adaptive OFF -> the snapshot MUST NOT happen and the
+    // counts MUST survive (proves the write is genuinely gated, not an unconditional stub).
+    std::vector<F4> prev2(N, F4{ -111.0f, -222.0f, -333.0f, -444.0f });
+    DevBuf bPrev2 = makeDev(dev, prev2);
+    std::vector<uint32_t> vt2 = { 77u };
+    DevBuf bVt2 = makeDev(dev, vt2);
+    std::vector<uint32_t> ee2 = { 88u };
+    DevBuf bEe2 = makeDev(dev, ee2);
+    PxgFEMCloth c2 = c;
+    c2.mPrevPositionInContactOffset = reinterpret_cast<decltype(c2.mPrevPositionInContactOffset)>(size_t(bPrev2.addr));
+    std::vector<PxgFEMCloth> descArr2 = { c2 };
+    DevBuf bDesc2 = makeDev(dev, descArr2);
+    UpdateValidityPush up2 = up;
+    up2.femCloths = bDesc2.addr; up2.adaptiveWord = 0u;   // adaptive OFF
+    up2.VTContactCount = bVt2.addr; up2.EEContactCount = bEe2.addr;
+    k.dispatch(1u, {}, up2, 1u, 1u);
+    dev->flush();
+    const auto gPrev2 = downloadBuffer<F4>(dev, bPrev2.h, N);
+    const uint32_t gVt2 = downloadBuffer<uint32_t>(dev, bVt2.h, 1)[0];
+    const uint32_t gEe2 = downloadBuffer<uint32_t>(dev, bEe2.h, 1)[0];
+    PXG_CHECK_MSG(f2u(gPrev2[0].w) == f2u(-444.0f), "non-adaptive update must leave prev untouched (got w=%g)", gPrev2[0].w);
+    PXG_CHECK_MSG(gVt2 == 77u && gEe2 == 88u, "non-adaptive update must not reset counts (got %u,%u)", gVt2, gEe2);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bPrev.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bActive.h); dev->destroyBuffer(bUpd.h); dev->destroyBuffer(bVt.h); dev->destroyBuffer(bEe.h);
+    dev->destroyBuffer(bPrev2.h); dev->destroyBuffer(bVt2.h); dev->destroyBuffer(bEe2.h); dev->destroyBuffer(bDesc2.h);
+}
+
 } // namespace

@@ -602,6 +602,56 @@ in place, unlike the rigid 4b-1 radix reorder): P7.2 tranche 2 = PREPARE `cloth_
 scene. Drafted by a background worktree agent, salvaged + INDEPENDENTLY re-verified in the main tree
 (build, both-mode suite, my own forced-fresh mutation check, regression) before commit.
 
+## P7.2 tranche 2 — cloth SELF-collision SOLVE (prepare + count + solve VT/EE + validity) on the BDA engine ABI
+
+Closes the cloth-fold-on-itself pipeline the tranche-1 midphase opened: turn the detected VT/EE
+self-contacts into position corrections. Six kernels; `PXG_SLANG_KERNEL_MAPPED` 203 → **209**, ported
+line-for-line from `gpusimulationcontroller/src/CUDA/FEMClothConstraintPrep.cu` + `FEMClothExternalSolve.cu`:
+- `cloth_clothContactPrepareLaunch` (`CLOTH_CLOTH_CONTACTPREPARE`, `PxgFEMClothCore.cpp:505`) — recomputes
+  the exact rest-pose distance filter and stamps each surviving `PxgFemFemContactInfo`; ABI `{8,8,8,4,8,8}`=48B
+  (the `maxContacts` PxU32 @24 tail-pads to realign the following pointer).
+- `cloth_queryClothClothContact{VT,EE}CountLaunch` (`CLOTH_QUERY_CLOTH_CONTACT_{VT,EE}_COUNT`,
+  `:1983`) — per-substep reference-count of each vertex's self-contacts into `mDeltaPos.w`; shared ABI
+  `{8,8,8}`=24B.
+- `cloth_solveClothClothDelta{VT,EE}Launch` (`CLOTH_SOLVE_CLOTH_{VT,EE}_COLLISION`, `:2005`) — scatters
+  BOTH endpoints' corrections into `mDeltaPos` (folded into position by the already-live
+  `cloth_applyExternalDeltasLaunch`); shared ABI `{8,8,8,4}`=32B (`dt` PxReal @24).
+- `cloth_updateClothContactValidityLaunch` (`CLOTH_UPDATE_CLOTH_CONTACT_VALIDITY`, `:652`) — per-vertex
+  contact-pair validity refresh + `prevPositionInContactOffset` snapshot; ABI `{8,8,1,1,8,8,8,4}`=56B (two
+  `bool` flags @16/@17).
+
+New shader `femClothClothContactBda.slang` — the closest-point constraint math (`closestPtPointTriangle`,
+`closestPtLineLine`, barycentric weight scatter) + the `mDeltaPos` RMW accumulation rebuilt as the BDA
+sibling of the proven Phase-1 cloth-cloth solve, reading every descriptor / `PxgFemFemContactInfo` record
+through `Ptr<>` + push constants. NoContraction-stamped; deliberately absent from `PXG_HLSL_ENTRIES` (pure
+BDA, no `cs_6_0` lowering — same precedent as `femClothRigidContactBda` / `femClothSelfCollisionBda`); its
+five imported modules already ride in `SHADER_COMMON_DEPS`. No new device mirror — the existing
+`PxgFEMCloth`/`PxgFemFemContactInfo` carry every field. **Fully BIT-EXACT — both memory modes**: the
+friction branch's `PxRecipSqrt` transcendental seam is DEAD behind `frictionCoefficient != 0`, and the
+solve runs the deferred null-material (frictionless) target the launch site uses, so every executed op is
+mul/add/sqrt/1÷x/dot/cross. New unit tests `gpuslang.femClothSim` +2 cases (`runClothSelfContactVT`:
+prepare → query → VT-solve on a penetrating vertex-triangle self-pair → both endpoints pushed apart, the
+query count landing in `mDeltaPos.w`, validity snapshot; `runClothSelfContactEE`: the same chain on a
+crossing edge-edge self-pair), each bit-exact vs a `p72ref` CPU transcription of the closest-point +
+constraint math. Independently mutation-checked in the main tree (`deltaLambdaN * normal` → `* 1.01f` +
+forced-fresh `.spv` recompile fails every `mDeltaPos[0..3]` VT + EE `MM` compare). Full suite **673/673
+both memory modes**; rigid regression 8×2 = **16/16**; the `cloth` + `clothdrape` scenes still settle.
+
+Deviations (behavior-preserving, documented in-shader): the CUDA `atomicAdd` into `mDeltaPos` → a
+groupshared/`Ptr<>` read-modify-write (single-thread-per-contact scatter, no cross-lane contention on the
+test geometry — the proven external-solve lowering); the friction-material fetch + `PxRecipSqrt` tangent
+solve carried for ABI parity but frictionless-dead as above; the `bool` flags marshalled as the CUDA's
+1-byte `PxU8` payload; ABI-parity args (`updateContactPairs`, the adaptive/force flags) present in the
+push blob but unread on the frictionless self path. Drafted by a background worktree agent, salvaged +
+INDEPENDENTLY re-verified in the main tree (build, both-mode 673/673 suite, my own forced-fresh mutation
+check with teeth, regression, `cloth`/`clothdrape` scenes) before commit.
+
+**Scouting for the rest of the self-collision arc**: P7.2 tranche 3 = a `clothselfcollide` fold-on-itself
+scene (drop a cloth so it lands on itself and the self-contacts stop it from interpenetrating — the
+self-collision money shot), wiring the tranche-1 midphase + this solve into the per-substep loop. Then the
+flagged multi-rigid sort-helper ABI (single-copy radix BDA rewrite) + cloth TGS integration close out P7,
+after which **SOFTBODY** (0/56 kernels — the next big subsystem) opens.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

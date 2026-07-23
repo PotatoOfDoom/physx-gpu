@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 203;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 209;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -410,7 +410,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_heightfieldVertexContactGenLaunch", nullptr, nullptr },  // CLOTH_HF_VERTEX_CG (unmapped)
     { "cloth_rigidAttachmentPrepareLaunch", "femClothRigidAttachBda.spv", "cloth_rigidAttachmentPrepareLaunch" },  // CLOTH_RIGID_ATTACHMENT_CONSTRAINT_PREP (P7.1 tranche 3a BDA port: cloth rigid/world attachment constraint prep)
     { "cloth_rigidContactPrepareLaunch", "femClothRigidContactBda.spv", "cloth_rigidContactPrepareLaunch" },  // CLOTH_RIGID_CONTACTPREPARE (P7.1 tranche 4b-2 BDA port: cloth-vs-rigid contact constraint prep)
-    { "cloth_clothContactPrepareLaunch", nullptr, nullptr },  // CLOTH_CLOTH_CONTACTPREPARE (unmapped)
+    { "cloth_clothContactPrepareLaunch", "femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch" },  // CLOTH_CLOTH_CONTACTPREPARE (P7.2 tranche 2 BDA port: cloth-vs-cloth self-contact prepare + rest-pose filter)
     { "cloth_particleContactPrepareLaunch", nullptr, nullptr },  // CLOTH_PARTICLE_CONTACTPREPARE (unmapped)
     { "cloth_solveNonSharedTriangleEnergyLaunch", "femClothSolveBda.spv", "cloth_solveNonSharedTriangleEnergyLaunch" },  // CLOTH_SIM_NONSHARED_TRIANGLE_ENERGY_SOLVE (P7.1 BDA port: cloth in-plane membrane energy solve)
     { "cloth_solveNonSharedTriangleEnergyClusterLaunch", "femClothSolveBda.spv", "cloth_solveNonSharedTriangleEnergyClusterLaunch" },  // CLOTH_SIM_NONSHARED_TRIANGLE_ENERGY_SOLVE_CLUSTER (P7.1 BDA port: cluster twin)
@@ -420,12 +420,12 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_stepLaunch", nullptr, nullptr },  // CLOTH_SIM_STEP (unmapped)
     { "cloth_queryRigidClothContactReferenceCountLaunch", "femClothRigidContactBda.spv", "cloth_queryRigidClothContactReferenceCountLaunch" },  // CLOTH_QUERY_RIGID_CLOTH_REFERENCE_COUNT (P7.1 tranche 4b-3 BDA port: PGS cloth-vs-rigid contact reference-count query)
     { "cloth_solveRigidClothCollisionLaunch", "femClothRigidContactBda.spv", "cloth_solveRigidClothCollisionLaunch" },  // CLOTH_SOLVE_RIGID_CLOTH_COLLISION (P7.1 tranche 4b-3 BDA port: PGS cloth-vs-rigid contact solve)
-    { "cloth_solveClothClothDeltaVTLaunch", nullptr, nullptr },  // CLOTH_SOLVE_CLOTH_VT_COLLISION (unmapped)
-    { "cloth_solveClothClothDeltaEELaunch", nullptr, nullptr },  // CLOTH_SOLVE_CLOTH_EE_COLLISION (unmapped)
-    { "cloth_queryClothClothContactVTCountLaunch", nullptr, nullptr },  // CLOTH_QUERY_CLOTH_CONTACT_VT_COUNT (unmapped)
-    { "cloth_queryClothClothContactEECountLaunch", nullptr, nullptr },  // CLOTH_QUERY_CLOTH_CONTACT_EE_COUNT (unmapped)
+    { "cloth_solveClothClothDeltaVTLaunch", "femClothClothContactBda.spv", "cloth_solveClothClothDeltaVTLaunch" },  // CLOTH_SOLVE_CLOTH_VT_COLLISION (P7.2 tranche 2 BDA port: vertex-triangle self-contact solve)
+    { "cloth_solveClothClothDeltaEELaunch", "femClothClothContactBda.spv", "cloth_solveClothClothDeltaEELaunch" },  // CLOTH_SOLVE_CLOTH_EE_COLLISION (P7.2 tranche 2 BDA port: edge-edge self-contact solve)
+    { "cloth_queryClothClothContactVTCountLaunch", "femClothClothContactBda.spv", "cloth_queryClothClothContactVTCountLaunch" },  // CLOTH_QUERY_CLOTH_CONTACT_VT_COUNT (P7.2 tranche 2 BDA port: VT self-contact reference-count)
+    { "cloth_queryClothClothContactEECountLaunch", "femClothClothContactBda.spv", "cloth_queryClothClothContactEECountLaunch" },  // CLOTH_QUERY_CLOTH_CONTACT_EE_COUNT (P7.2 tranche 2 BDA port: EE self-contact reference-count)
     { "cloth_applyExternalDeltasLaunch", "femClothRigidAttachBda.spv", "cloth_applyExternalDeltasLaunch" },  // CLOTH_APPLY_EXTERNAL_DELTAS (P7.1 tranche 3c BDA port: fold mDeltaPos into position/velocity)
-    { "cloth_updateClothContactValidityLaunch", nullptr, nullptr },  // CLOTH_UPDATE_CLOTH_CONTACT_VALIDITY (unmapped)
+    { "cloth_updateClothContactValidityLaunch", "femClothClothContactBda.spv", "cloth_updateClothContactValidityLaunch" },  // CLOTH_UPDATE_CLOTH_CONTACT_VALIDITY (P7.2 tranche 2 BDA port: per-vertex contact-pair validity refresh)
     { "cloth_solveCPOutputClothDeltaVLaunch", nullptr, nullptr },  // CLOTH_PARTICLE_CLOTH_DELTA (unmapped)
     { "cloth_solveCPOutputParticleDeltaVLaunch", nullptr, nullptr },  // CLOTH_PARTICLE_PARTICLE_DELTA (unmapped)
     { "cloth_solveRigidClothAttachmentLaunch", "femClothRigidAttachBda.spv", "cloth_solveRigidClothAttachmentLaunch" },  // CLOTH_SOLVE_RIGID_CLOTH_ATTACHMENT (P7.1 tranche 3a BDA port: PGS rigid/world attachment solve)

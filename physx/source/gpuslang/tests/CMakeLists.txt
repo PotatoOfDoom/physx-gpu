@@ -86,7 +86,7 @@ set(SHADER_COMMON_DEPS
 # to contract undecorated expressions: llvmpipe fuses npCvxCoreEpa's
 # makePlane triple-cross sums into fma chains (1-ulp vs strict IEEE), which
 # breaks the bitwise CPU-vs-GPU doctrine.  The decoration forbids that.
-set(PXG_NOCONTRACT_SHADERS npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npD6JointPrep npArtiExtBody npArti1DPrep npArtiJointHeader npArtiSolve1D npArtiSolveContact npArtiSolve1DTGS npArtiSolveContactTGS npArtiCheckActive npArtiPropagate npArtiPropagateAccel npArtiPropagateAccelJV npArtiSpatialMatVec npArtiSpatialMatMat npArtiTranslateInertia npArtiTranslateSInertia npArtiPropagateZA npArtiPropagateZASph npArtiTranslateInertiaMass npArtiInvertInertia npArtiPropagateImpDof npArtiAccumLinkImp npArtiDriveParams npArtiClampDriveImp npClothDefGrad2D npSbDefGrad npDefMaterial npJacobiRotate npClothAtan npAnisoHelpers npClothDeltaLambda npClothExtractRot2D npClothVelClamp npClothArap2D npClothArea2D npClothWind npSbBaryInvMass npSbVolumeSolve npIsoConcaveCorner npSphSpikyKernel npIsoAcosDecode npSparseGridDomain npDenseGridCell npSbBaryProject npIsoVecNormalize npSbCompliance npSbDeltaLambdaGradC npSbTetConstraint npPsSpecVolume npSbComputeLambda npGridLocation npAnisoOutput npSmoothPos npIsoAvgVerts npPsSolvePC npPsSolvePCTGS npPsWeightKernels npPsDiffuseUpdate npPsDiffuseSpawn npPsDiffuseAvg npPsDiffuseOneWay npSdfBoxDist npSparseGridCellFromPos npIsoGridFilter npSbExtractRotAPD npSbSolveNeoHookean npSbSolveCorot npSbSolveGM npClothMembrane npClothBending npClothSharedEnergy npSbCollisionConstraint npClothCollisionConstraint npSdfBvhMorton npSbStress npSdfHoles npClothTriContact particleSim particleSelfCollisionBda psContactSolveTgsBda femClothSimBda femClothSolveBda femClothSolvePairBda femClothRigidAttachBda femClothContactGenBda femClothRigidContactBda femClothSelfCollisionBda)
+set(PXG_NOCONTRACT_SHADERS npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npD6JointPrep npArtiExtBody npArti1DPrep npArtiJointHeader npArtiSolve1D npArtiSolveContact npArtiSolve1DTGS npArtiSolveContactTGS npArtiCheckActive npArtiPropagate npArtiPropagateAccel npArtiPropagateAccelJV npArtiSpatialMatVec npArtiSpatialMatMat npArtiTranslateInertia npArtiTranslateSInertia npArtiPropagateZA npArtiPropagateZASph npArtiTranslateInertiaMass npArtiInvertInertia npArtiPropagateImpDof npArtiAccumLinkImp npArtiDriveParams npArtiClampDriveImp npClothDefGrad2D npSbDefGrad npDefMaterial npJacobiRotate npClothAtan npAnisoHelpers npClothDeltaLambda npClothExtractRot2D npClothVelClamp npClothArap2D npClothArea2D npClothWind npSbBaryInvMass npSbVolumeSolve npIsoConcaveCorner npSphSpikyKernel npIsoAcosDecode npSparseGridDomain npDenseGridCell npSbBaryProject npIsoVecNormalize npSbCompliance npSbDeltaLambdaGradC npSbTetConstraint npPsSpecVolume npSbComputeLambda npGridLocation npAnisoOutput npSmoothPos npIsoAvgVerts npPsSolvePC npPsSolvePCTGS npPsWeightKernels npPsDiffuseUpdate npPsDiffuseSpawn npPsDiffuseAvg npPsDiffuseOneWay npSdfBoxDist npSparseGridCellFromPos npIsoGridFilter npSbExtractRotAPD npSbSolveNeoHookean npSbSolveCorot npSbSolveGM npClothMembrane npClothBending npClothSharedEnergy npSbCollisionConstraint npClothCollisionConstraint npSdfBvhMorton npSbStress npSdfHoles npClothTriContact particleSim particleSelfCollisionBda psContactSolveTgsBda femClothSimBda femClothSolveBda femClothSolvePairBda femClothRigidAttachBda femClothContactGenBda femClothRigidContactBda femClothSelfCollisionBda femClothClothContactBda)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
@@ -462,6 +462,24 @@ pxg_compile_shader(femClothRigidContactBda cloth_rigidContactPrepareLaunch
 # next scope.
 pxg_compile_shader(femClothSelfCollisionBda cloth_selfCollisionMidphaseVTLaunch
                    cloth_selfCollisionMidphaseEELaunch)
+# P7.2 tranche 2: cloth-vs-CLOTH self-contact SOLVE on the engine ABI (BDA) — completes the
+# cloth-fold-on-itself pipeline the tranche-1 midphase started.  The prepare recomputes the
+# exact rest-pose distance filter, the query counts each cloth vertex's self-contact
+# references into mDeltaPos.w, the VT/EE solves scatter BOTH endpoints' corrections into
+# mDeltaPos (folded by the already-live cloth_applyExternalDeltasLaunch), and the validity
+# pass snapshots prevPositionInContactOffset.  Reads every descriptor / contact record
+# through Ptr<> (BDA, no HLSL cs_6_0 lowering) so it is deliberately absent from
+# PXG_HLSL_ENTRIES (same precedent as femClothRigidContactBda / femClothSelfCollisionBda),
+# and IS in PXG_NOCONTRACT_SHADERS (the dot/cross/normalize-heavy closest-point + constraint
+# math needs -ffp-contract=off parity).  Material friction is the deferred null-material
+# (frictionless) path; the different-cloth pairs flow through the identical generic
+# arithmetic.
+pxg_compile_shader(femClothClothContactBda cloth_clothContactPrepareLaunch
+                   cloth_queryClothClothContactVTCountLaunch
+                   cloth_queryClothClothContactEECountLaunch
+                   cloth_solveClothClothDeltaVTLaunch
+                   cloth_solveClothClothDeltaEELaunch
+                   cloth_updateClothContactValidityLaunch)
 pxg_compile_shader(contactReduce ctContactReduce)
 pxg_compile_shader(npSbTet ctSbTet)
 pxg_compile_shader(npSbSelf ctSbSelfQuery)

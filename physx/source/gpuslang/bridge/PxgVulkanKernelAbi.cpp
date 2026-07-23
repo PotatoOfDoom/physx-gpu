@@ -380,6 +380,31 @@ static const uint8_t kClothRigidContactSolve[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
 //   realign the following pointers).
 static const uint8_t kClothSelfCollisionMidphase[] = { 4, 8, 8, 8, 8, 4, 8, 8, 8 };
 
+// gpusimulationcontroller FEMCloth self-contact SOLVE (P7.2 tranche 2 cloth-vs-cloth
+// self-contact prepare + count + solve + validity):
+//   cloth_clothContactPrepareLaunch(PxgFEMCloth* clothes,
+//     PxgFemFemContactInfo* contactInfos, PxU32* numContacts, PxU32 maxContacts,
+//     PxsDeformableSurfaceMaterialData* clothMaterials, const PxU8* updateContactPairs)
+//   -- launch site PxgFEMClothCore.cpp:505.  Three device pointers + PxU32 (@24) + two
+//   device pointers -> natural-alignment blob = 48 bytes (the PxU32 4-byte tail-pad
+//   realigns the following pointer).
+static const uint8_t kClothClothContactPrep[] = { 8, 8, 8, 4, 8, 8 };
+//   cloth_queryClothClothContact{VT,EE}CountLaunch(PxgFEMCloth* cloths,
+//     PxgFemFemContactInfo* contactInfos, PxU32* numContacts)  -- launch site
+//   PxgFEMClothCore.cpp:1983 (VT and EE share the pack).  Three device pointers = 24-byte blob.
+static const uint8_t kClothClothContactQuery[] = { 8, 8, 8 };
+//   cloth_solveClothClothDelta{VT,EE}Launch(PxgFEMCloth* cloths,
+//     PxgFemFemContactInfo* contactInfos, PxU32* numContacts, PxReal dt)  -- launch site
+//   PxgFEMClothCore.cpp:2005 (VT and EE share the pack).  Three device pointers + PxReal
+//   (@24) -> 32-byte blob.
+static const uint8_t kClothClothContactSolve[] = { 8, 8, 8, 4 };
+//   cloth_updateClothContactValidityLaunch(PxgFEMCloth* femCloths, const PxU32* activeIds,
+//     bool adaptiveCollisionPairUpdate, bool forceUpdateClothContactPairs,
+//     const PxU8* updateContactPairs, PxU32* VTContactCount, PxU32* EEContactCount,
+//     PxReal dt)  -- launch site PxgFEMClothCore.cpp:652.  Two device pointers + two bools
+//   (@16/@17) + three device pointers + PxReal (@48) -> natural-alignment blob = 56 bytes.
+static const uint8_t kClothUpdateContactValidity[] = { 8, 8, 1, 1, 8, 8, 8, 4 };
+
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
@@ -713,6 +738,13 @@ static const PxgKernelAbiRow kRows[] = {
     // gpunarrowphase FEMCloth SELF-collision midphase + contact GENERATION (P7.2 tranche 1 BDA)
     { "cloth_selfCollisionMidphaseVTLaunch", kClothSelfCollisionMidphase, uint32_t(sizeof(kClothSelfCollisionMidphase)) },
     { "cloth_selfCollisionMidphaseEELaunch", kClothSelfCollisionMidphase, uint32_t(sizeof(kClothSelfCollisionMidphase)) },
+    // gpusimulationcontroller FEMCloth self-contact prepare + count + solve + validity (P7.2 tranche 2 BDA)
+    { "cloth_clothContactPrepareLaunch", kClothClothContactPrep, uint32_t(sizeof(kClothClothContactPrep)) },
+    { "cloth_queryClothClothContactVTCountLaunch", kClothClothContactQuery, uint32_t(sizeof(kClothClothContactQuery)) },
+    { "cloth_queryClothClothContactEECountLaunch", kClothClothContactQuery, uint32_t(sizeof(kClothClothContactQuery)) },
+    { "cloth_solveClothClothDeltaVTLaunch", kClothClothContactSolve, uint32_t(sizeof(kClothClothContactSolve)) },
+    { "cloth_solveClothClothDeltaEELaunch", kClothClothContactSolve, uint32_t(sizeof(kClothClothContactSolve)) },
+    { "cloth_updateClothContactValidityLaunch", kClothUpdateContactValidity, uint32_t(sizeof(kClothUpdateContactValidity)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },
