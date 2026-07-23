@@ -1,0 +1,613 @@
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+//  * Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+//  * Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in the
+//    documentation and/or other materials provided with the distribution.
+//  * Neither the name of NVIDIA CORPORATION nor the names of its
+//    contributors may be used to endorse or promote products derived
+//    from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
+// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+// Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
+
+// femClothContactGenBda.slang
+//
+// P7.1 tranche 4a — cloth-vertex-vs-PRIMITIVE contact GENERATION (the first
+// tranche of the cloth-drape-on-a-floor arc) on the Vulkan engine ABI (BDA).
+// Ported line-for-line from gpunarrowphase/src/CUDA:
+//   - cloth_midphaseGenerateVertexPairsLaunch (femClothMidPhase.cu, launch
+//     PxgNarrowphaseCore.cpp:6317, CLOTH_MIDPHASE_VERTEX_PRIMS): the broadphase->
+//     midphase pass that emits cloth-vertex <-> primitive-shape candidate pairs.
+//     Each cloth vertex is tested against the rigid shape's world AABB
+//     (bounds[rigidCacheRef]); a hit appends uint4(cmIdx, vertId, 0, 0) to the
+//     intermediate stack and bumps midphasePairsNum.
+//   - cloth_planeVertContactGenLaunch (femClothPrimitives.cu:853, launch :5853,
+//     CLOTH_PLANE_VERTEX_CG): cloth-vertex-vs-PLANE contact generation (a cloth
+//     falling onto a floor) — vertPlaneCollide + the PxgFEMContactWriter append.
+//   - cloth_SphereVertexContactGenLaunch (femClothPrimitives.cu:700, launch :5776,
+//     CLOTH_VERT_SPHERE_CG): cloth-vertex-vs-SPHERE contact generation (a drape
+//     over a sphere) — spheresphere + the same writer append.  (The kernel's
+//     eCAPSULE branch is DEFERRED — see DEVIATIONS.)
+//
+// Doctrine (identical to the prior cloth BDA tranches femClothSolveBda /
+// femClothRigidAttachBda and the particle contact-gen precedent psContactGenBda):
+//   - the PxgFEMCloth descriptor arrives as a device pointer read through Ptr<>
+//     (the byte-exact pxgSlangFEMClothDesc mirror); mPosition_InvMass @16 and
+//     mNbVerts @316 are the only fields the vertex kernels touch;
+//   - the per-pair narrowphase inputs (PxgContactManagerInput / PxgShape /
+//     PxsCachedTransform / PxgRigidFilterPair / PxNodeIndex remap) are transcribed
+//     locally as byte-exact mirrors (pinned by static_asserts against the real
+//     engine structs in testFemClothSim.cpp), matching the psContactGenBda
+//     precedent (keeps the rigid-common module out of the cloth-descriptor TU);
+//   - the PxBounds3 world AABB (24B: min @0, max @12) is read straight from the
+//     bounds array by float offset (rigidCacheRef*6);
+//   - the by-value PxgFEMContactWriter (PxgFEMCore.h:361) is inlined field-by-field
+//     into the contact-gen push blob and its device pointers are written directly
+//     (writeRigidVsDeformableContact -> writeContactCore + the FEM-rigid contact
+//     info tail), exactly as psContactGenBda inlined PxgParticleContactWriter.
+//
+// DEVIATIONS from CUDA (recipe policy; each preserves the emitted contact SET and
+// the running contact/pair total, and is exercised by testFemClothSim.cpp):
+//   - NO 32-lane warp intrinsics.  The CUDA __ballot_sync / __shfl_sync / lane-0
+//     atomicAdd contact-compaction is a pure SCHEDULING optimisation — the SET of
+//     emitted contacts and the running total are identical whether or not work is
+//     compacted, and the six contact-buffer arrays are radix-sorted downstream, so
+//     the atomicAdd-order-dependent buffer INDEX carries no observable meaning.
+//     It is lowered to a per-32-lane-LOGICAL-tile groupshared aggregation
+//     (InterlockedOr ballot + countbits prefix + ONE lane-0 InterlockedAdd) with
+//     full-block barriers at block-UNIFORM points (the loop bound numRequiredThreads
+//     / nbVerts is block-uniform, so every barrier is reached uniformly) — the
+//     exact llvmpipe-safe pattern of psContactGenBda;
+//   - LoadShapePair(Warp)'s warp-cooperative shape/transform/cmInput reads are done
+//     as direct per-thread Ptr<> loads (semantically identical read-fanout; same as
+//     psContactGenBda);
+//   - the midphase grid.x extent (numBlocks = 32, PxgNarrowphaseCore.cpp:6335) is a
+//     compile-time constant MIDPHASE_GRID_X so the grid-stride matches the launch
+//     (psContactGenBda hardcodes PS_GRID the same way — there is no gridDim built-in
+//     in a compute shader); the dispatch MUST use grid (32, numTests, 1);
+//   - cloth_SphereVertexContactGenLaunch's eCAPSULE branch (vertCapsuleCollide,
+//     femClothPrimitives.cu:462) is DEFERRED — this tranche's scope is the sphere
+//     drape.  For a non-sphere rigid the else-path produces no contact (the CUDA
+//     asserts eCAPSULE there; a capsule input is out of scope and never launched in
+//     the sphere test).  Same deferral shape as psContactGenBda's eCONVEXCORE;
+//   - PxgFemOtherContactInfo::setRigidMaterialIndex(mat) followed by
+//     markInCollision(false) (PxgFEMCore.h:148/:152) is emitted as a single store of
+//     (mat & 0x7fffffff): setRigidMaterialIndex writes (old & 0x80000000) | (mat &
+//     0x7fffffff) and the subsequent markInCollision(false) clears bit 31, so the
+//     net 32-bit word is provably (mat & 0x7fffffff) regardless of the prior buffer
+//     content — bit-identical, no read-modify-write needed;
+//   - the mesh-vertex-vs-mesh / capsule / box sibling kernels in the same .cu files
+//     are out of scope (this tranche is plane + sphere, the floor/sphere drape).
+//
+// All float arithmetic is NoContraction-stamped (PXG_NOCONTRACT_SHADERS): the
+// midphase (closest-v).magnitudeSquared() feeds the compared `<= tolerance`, the
+// plane transformInv feeds the compared `contactDist >= x` AND the stored
+// separation, and spheresphere's delta.dot feeds the compared `inflatedSum^2 >
+// distanceSq` AND the stored penetration — any of which would fuse to an FMA
+// otherwise, breaking bitwise parity with the -ffp-contract=off CPU reference.
+
+import pxgSlangFEMClothDesc;   // PxgFEMClothGpu (mPosition_InvMass @16, mNbVerts @316)
+
+// PxGeometryType (PxGeometry.h): eSPHERE 0, ePLANE 1, eCAPSULE 2, ... eTRIANGLEMESH 8.
+static const uint GEOM_SPHERE = 0u;
+static const uint GEOM_PLANE = 1u;
+static const uint GEOM_CAPSULE = 2u;
+static const uint GEOM_TRIANGLEMESH = 8u;
+
+// PXG_BITSHIFT_ELEMENT_ID (PxgSimulationCoreDesc.h:41) — the cloth-id / element
+// packing used by PxEncodeClothIndex(clothId, elem) = (clothId << 20) | elem.
+static const uint PXG_CLOTH_ID_SHIFT = 20u;
+
+// Launch geometry.
+//   midphase: grid (32, numTests, 1), block (WARP_SIZE=32, MIDPHASE_WARPS=2, 1).
+//   plane:    grid (numTests, 1, 1),  block (32, 16, 1) = 512.
+//   sphere:   grid (numTests, 1, 1),  block (32,  1, 1) = 32.
+static const uint WARP = 32u;
+static const uint MIDPHASE_WARPS = 2u;
+static const uint MIDPHASE_BLOCK = WARP * MIDPHASE_WARPS;      // 64
+static const uint MIDPHASE_GRID_X = 32u;
+static const uint PLANE_WARPS = 16u;
+static const uint PLANE_BLOCK = WARP * PLANE_WARPS;            // 512
+static const uint SPHERE_WARPS = 1u;
+static const uint SPHERE_BLOCK = WARP * SPHERE_WARPS;          // 32
+
+// ---------------------------------------------------------------------------
+// Local element-struct mirrors (byte-exact vs the engine C++ layouts; pinned by
+// static_asserts in testFemClothSim.cpp).  Same transcription as psContactGenBda.
+// ---------------------------------------------------------------------------
+// PxgContactManagerInput (PxgContactManager.h, 16 bytes)
+struct PxgContactManagerInput
+{
+    uint shapeRef0;          // @0
+    uint shapeRef1;          // @4
+    uint transformCacheRef0; // @8
+    uint transformCacheRef1; // @12
+}
+
+// PxgShape (PxgConvexConvexShape.h, 48 bytes)
+struct PxgShape
+{
+    float scaleX, scaleY, scaleZ;                     // @0
+    float scaleRotX, scaleRotY, scaleRotZ, scaleRotW; // @12
+    uint materialIndex;                               // @28
+    uint2 hullOrMeshOffset;                           // @32
+    uint type;                                        // @40
+    uint particleOrSoftbodyId;                        // @44
+}                                                     // = 48
+
+// PxsCachedTransform (PxsTransformCache.h, 32 bytes): PxTransform (q@0, p@16) + flags.
+struct PxsCachedTransform
+{
+    float qx, qy, qz, qw; // @0  PxQuat
+    float px, py, pz;     // @16 PxVec3
+    uint flags;           // @28 -> 32
+}
+
+// PxgRigidFilterPair (PxgSimulationCoreDesc.h, 32 bytes): index0 u64, index1 u64,
+// index2 u32, padding.
+struct PairR { uint2 index0; uint2 index1; uint index2; uint pad0, pad1, pad2; }
+
+// ---------------------------------------------------------------------------
+// Push-constant blobs — BYTE-IDENTICAL to each CUDA PxCudaKernelParam pack.
+// ---------------------------------------------------------------------------
+// cloth_midphaseGenerateVertexPairsLaunch (femClothMidPhase.cu; launch pack
+// PxgNarrowphaseCore.cpp:6318): { PxU32 numTests, PxReal toleranceLength,
+// cmInputs*, transformCache*, bounds*, contactDistance*, gpuShapes*, femClothes*,
+// stackPtr(uint4*), midphasePairsNum(PxU32*) } -> 72-byte blob.
+// (ABI row {4,4,8,8,8,8,8,8,8,8}.)
+struct MidphaseParams
+{
+    uint numTests;              // @0
+    float toleranceLength;      // @4  (unused; ABI parity)
+    uint64_t cmInputs;          // @8
+    uint64_t transformCache;    // @16 (unused; ABI parity — the vertex midphase
+                                //      reads the rigid AABB straight from bounds)
+    uint64_t bounds;            // @24
+    uint64_t contactDistance;   // @32
+    uint64_t gpuShapes;         // @40
+    uint64_t femClothes;        // @48
+    uint64_t stackPtr;          // @56 output (uint4*)
+    uint64_t midphasePairsNum;  // @64 output (PxU32*) -> 72
+}
+
+// cloth_planeVertContactGenLaunch / cloth_SphereVertexContactGenLaunch share the
+// arg pack (femClothPrimitives.cu; launch PxgNarrowphaseCore.cpp:5853 / :5776):
+// { PxU32 numTests, cmInputs*, transformCache*, contactDistance*, restDistance*,
+// gpuShapes*, femClothes*, shapeToRigidRemapTable*, filterPairs*, PxU32 nbFilterPairs,
+// PxgFEMContactWriter writer(BY VALUE, 80B) } -> 160-byte blob.
+// (ABI row {4,8,8,8,8,8,8,8,8,4,80}.)
+struct ContactGenParams
+{
+    uint numTests;                 // @0
+    uint _pad4;                    // @4
+    uint64_t cmInputs;             // @8
+    uint64_t transformCache;       // @16
+    uint64_t contactDistance;      // @24
+    uint64_t restDistance;         // @32
+    uint64_t gpuShapes;            // @40
+    uint64_t femClothes;           // @48
+    uint64_t shapeToRigidRemap;    // @56  PxNodeIndex* (PxU64 per shape cache ref)
+    uint64_t filterPairs;          // @64  PxgRigidFilterPair*
+    uint nbFilterPairs;            // @72
+    uint _pad76;                   // @76
+    // ---- PxgFEMContactWriter (by value, 80B) @80 ----
+    uint64_t w_outPoint;            // @80  float4*
+    uint64_t w_outNormalPen;        // @88  float4*
+    uint64_t w_outBarycentric;      // @96  float4*
+    uint64_t w_outContactInfo;      // @104 PxgFemOtherContactInfo* (16B stride)
+    uint64_t w_totalContactCount;   // @112 PxU32*
+    uint64_t w_contactByX;          // @120 PxU64* (contactByRigid)
+    uint64_t w_tempContactByX;      // @128 PxU32*
+    uint64_t w_contactIndexSortedByX; // @136 PxU32*
+    uint64_t w_contactSortedByX;    // @144 PxU32* (unused by the vertex writer; ABI parity)
+    uint w_maxNumContacts;          // @152 PxU32
+    uint _pad156;                   // @156 -> 160
+}
+
+[[vk::push_constant]] ConstantBuffer<MidphaseParams> gMid;
+[[vk::push_constant]] ConstantBuffer<ContactGenParams> gCG;
+
+// ---------------------------------------------------------------------------
+// PxQuat helpers (PxQuat.h, transcribed to keep the rigid-common module out of
+// this TU; identical to psContactGenBda / femClothRigidAttachBda).
+// ---------------------------------------------------------------------------
+float3 quatRotateInv(float4 q, float3 v)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q.w * q.w - 0.5f;
+    const float dot2 = (q.x * vx + q.y * vy + q.z * vz);
+    return float3((vx * w2 - (q.y * vz - q.z * vy) * q.w + q.x * dot2),
+                  (vy * w2 - (q.z * vx - q.x * vz) * q.w + q.y * dot2),
+                  (vz * w2 - (q.x * vy - q.y * vx) * q.w + q.z * dot2));
+}
+float3 getBasisVector0(float4 q)
+{
+    const float x2 = q.x * 2.0f;
+    const float w2 = q.w * 2.0f;
+    return float3((q.w * w2) - 1.0f + q.x * x2,
+                  (q.z * w2) + q.y * x2,
+                  (-q.y * w2) + q.z * x2);
+}
+
+float dot3(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+// ---------------------------------------------------------------------------
+// PxgRigidFilterPair binary-search find (deformableElementFilter.cuh:67/:89) with
+// the ignoreIndex2 early accept — transcribed from psContactGenBda::findRigid.  A
+// cloth vertex's compressed id folds into q1 = uint2(clothMask, 0).
+// ---------------------------------------------------------------------------
+bool u64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
+bool u64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
+
+bool findRigid(uint64_t pairsAddr, uint nbPairs, uint2 q0, uint2 q1)
+{
+    Ptr<PairR> pairs = Ptr<PairR>(pairsAddr);
+    uint l = 0u, r = nbPairs;
+    while (l < r)
+    {
+        const uint mid = (l + r) / 2u;
+        const PairR p = pairs[mid];
+        int cmp = 0;
+        if (u64Lt(q0, p.index0)) cmp = -1;
+        else if (u64Lt(p.index0, q0)) cmp = 1;
+        else if (u64Lt(q1, p.index1)) cmp = -1;
+        else if (u64Lt(p.index1, q1)) cmp = 1;
+        else if (0u < p.index2) cmp = -1;   // q.index2 == 0
+        if (cmp == 0 || (u64Eq(q0, p.index0) && u64Eq(q1, p.index1)))
+            return true;
+        if (cmp < 0) r = mid; else l = mid + 1u;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// LoadShapePair<eTRIANGLEMESH> (dataReadWriteHelper.cuh:292): the cloth is the
+// eTRIANGLEMESH shape; the other shape is the rigid.  Returns via out-params.
+// ---------------------------------------------------------------------------
+void loadClothRigidPair(uint64_t cmInputsAddr, uint64_t shapesAddr, uint cmIdx,
+                        out PxgShape clothShape, out uint clothCacheRef,
+                        out PxgShape rigidShape, out uint rigidCacheRef)
+{
+    const PxgContactManagerInput cin = Ptr<PxgContactManagerInput>(cmInputsAddr)[cmIdx];
+    Ptr<PxgShape> shapes = Ptr<PxgShape>(shapesAddr);
+    uint sRefCloth = cin.shapeRef0, cRefCloth = cin.transformCacheRef0;
+    uint sRefRigid = cin.shapeRef1, cRefRigid = cin.transformCacheRef1;
+    if (shapes[cin.shapeRef0].type != GEOM_TRIANGLEMESH)
+    {
+        sRefCloth = cin.shapeRef1; cRefCloth = cin.transformCacheRef1;
+        sRefRigid = cin.shapeRef0; cRefRigid = cin.transformCacheRef0;
+    }
+    clothShape = shapes[sRefCloth]; clothCacheRef = cRefCloth;
+    rigidShape = shapes[sRefRigid]; rigidCacheRef = cRefRigid;
+}
+
+// ===========================================================================
+// cloth_midphaseGenerateVertexPairsLaunch (femClothMidPhase.cu)
+// ===========================================================================
+groupshared uint sMidMask[MIDPHASE_WARPS];
+groupshared uint sMidStart[MIDPHASE_WARPS];
+
+[shader("compute")]
+[numthreads(64, 1, 1)] // (WARP_SIZE, MIDPHASE_WARPS, 1) flattened
+void cloth_midphaseGenerateVertexPairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    const uint tid = gtid.x;
+    const uint warpId = tid >> 5;       // threadIdx.y
+    const uint lane = tid & (WARP - 1u); // threadIdx.x
+    const uint cmIdx = gid.y;           // blockIdx.y
+
+    if (cmIdx >= gMid.numTests)
+        return;
+
+    PxgShape clothShape, rigidShape;
+    uint clothCacheRef, rigidCacheRef;
+    loadClothRigidPair(gMid.cmInputs, gMid.gpuShapes, cmIdx,
+                       clothShape, clothCacheRef, rigidShape, rigidCacheRef);
+
+    const uint femClothId = clothShape.particleOrSoftbodyId;
+    Ptr<PxgFEMClothGpu> femClothes = Ptr<PxgFEMClothGpu>(gMid.femClothes);
+    const uint64_t meshVertsAddr = femClothes[femClothId].mPosition_InvMass;
+    const uint nbVerts = femClothes[femClothId].mNbVerts;
+
+    // rigid world AABB = bounds[rigidCacheRef] (24B: min @0, max @12); NOT fattened
+    // (the vertex midphase leaves aabb.fattenFast commented out).
+    Ptr<float> bounds = Ptr<float>(gMid.bounds);
+    const uint rb = rigidCacheRef * 6u;
+    const float3 aabbMin = float3(bounds[rb + 0u], bounds[rb + 1u], bounds[rb + 2u]);
+    const float3 aabbMax = float3(bounds[rb + 3u], bounds[rb + 4u], bounds[rb + 5u]);
+
+    Ptr<float> contactDistance = Ptr<float>(gMid.contactDistance);
+    const float contactDist = contactDistance[clothCacheRef] + contactDistance[rigidCacheRef];
+    const float tolerance = contactDist * contactDist;
+
+    Ptr<float4> meshVerts = Ptr<float4>(meshVertsAddr);
+
+    const uint idx = tid + gid.x * MIDPHASE_BLOCK;                 // threadIdx.* + blockIdx.x*blockDim
+    const uint stride = MIDPHASE_BLOCK * MIDPHASE_GRID_X;          // blockDim.x*blockDim.y*gridDim.x
+
+    for (uint i = 0u; i < nbVerts; i += stride)
+    {
+        const uint id = idx + i;
+        bool hasHit = false;
+        if (id < nbVerts)
+        {
+            const float4 vf = meshVerts[id];
+            const float3 v = float3(vf.x, vf.y, vf.z);
+            // aabb.closestPoint(v) = clamp(v, min, max) = min.maximum(max.minimum(v))
+            const float3 closest = max(aabbMin, min(aabbMax, v));
+            const float3 d = closest - v;
+            hasHit = (d.x * d.x + d.y * d.y + d.z * d.z) <= tolerance;
+        }
+
+        // per-32-lane-tile ballot -> lane-0 atomicAdd -> exclusive-prefix scatter.
+        if (lane == 0u) sMidMask[warpId] = 0u;
+        GroupMemoryBarrierWithGroupSync();
+        if (hasHit) InterlockedOr(sMidMask[warpId], 1u << lane);
+        GroupMemoryBarrierWithGroupSync();
+        const uint hitMask = sMidMask[warpId];
+        const uint validCount = countbits(hitMask);
+        if (lane == 0u)
+        {
+            uint s = 0u;
+            if (validCount != 0u)
+                InterlockedAdd(Ptr<uint>(gMid.midphasePairsNum)[0], validCount, s);
+            sMidStart[warpId] = s;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        const uint prevStackShift = sMidStart[warpId];
+        if (hasHit)
+        {
+            const uint offset = countbits(hitMask & ((1u << lane) - 1u));
+            Ptr<uint4>(gMid.stackPtr)[prevStackShift + offset] = uint4(cmIdx, id, 0u, 0u);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PxgFEMContactWriter::writeRigidVsDeformableContact (PxgFEMCore.h:485) -> the
+// capacity-gated writeContactCore staging + the FEM-rigid contact-info tail.
+// pairInd0 == rigidId.getInd() (the plane/sphere callers pass them equal).
+// ---------------------------------------------------------------------------
+void writeRigidVsDeformableContact(uint index, float4 contact, float4 normalPen, float4 barycentric,
+                                   uint2 rigidId, uint pairInd1, uint rigidMaterialIndex)
+{
+    if (index >= gCG.w_maxNumContacts)
+        return;
+
+    // writeContactCore
+    Ptr<uint2>(gCG.w_contactByX)[index] = rigidId;                 // contactByX[index] = rigidId (PxU64)
+    Ptr<uint>(gCG.w_tempContactByX)[index] = rigidId.x;            // PxU32(rigidId & 0xffffffff)
+    Ptr<uint>(gCG.w_contactIndexSortedByX)[index] = index;
+    Ptr<float4>(gCG.w_outPoint)[index] = contact;
+    Ptr<float4>(gCG.w_outNormalPen)[index] = normalPen;
+
+    // result == true branch
+    Ptr<float4>(gCG.w_outBarycentric)[index] = barycentric;
+    // PxgFemOtherContactInfo (16B): pairInd0 u64 @0, pairInd1 u32 @8, rigidMatInd @12
+    const uint64_t infoBase = gCG.w_outContactInfo + uint64_t(index) * 16UL;
+    Ptr<uint2>(infoBase + 0UL)[0] = rigidId;                      // pairInd0 == rigidId.getInd()
+    Ptr<uint>(infoBase + 8UL)[0] = pairInd1;
+    // setRigidMaterialIndex(mat) + markInCollision(false) == (mat & 0x7fffffff)
+    Ptr<uint>(infoBase + 12UL)[0] = rigidMaterialIndex & 0x7fffffffu;
+}
+
+// ===========================================================================
+// cloth_planeVertContactGenLaunch (femClothPrimitives.cu:853)
+// ===========================================================================
+groupshared uint sPlaneMask[PLANE_WARPS];
+groupshared uint sPlaneStart[PLANE_WARPS];
+
+[shader("compute")]
+[numthreads(512, 1, 1)] // (32, 16, 1) flattened
+void cloth_planeVertContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    const uint tid = gtid.x;
+    const uint warpId = tid >> 5;
+    const uint lane = tid & (WARP - 1u);
+    const uint cmIdx = gid.x;
+
+    if (cmIdx >= gCG.numTests)
+        return;
+
+    PxgShape clothShape, rigidShape;
+    uint clothCacheRef, rigidCacheRef;
+    loadClothRigidPair(gCG.cmInputs, gCG.gpuShapes, cmIdx,
+                       clothShape, clothCacheRef, rigidShape, rigidCacheRef);
+
+    const uint2 rigidId = Ptr<uint2>(gCG.shapeToRigidRemap)[rigidCacheRef];
+    const uint femClothId = clothShape.particleOrSoftbodyId;
+    Ptr<PxgFEMClothGpu> femClothes = Ptr<PxgFEMClothGpu>(gCG.femClothes);
+    Ptr<float4> verts = Ptr<float4>(femClothes[femClothId].mPosition_InvMass);
+    const uint numVerts = femClothes[femClothId].mNbVerts;
+
+    const PxsCachedTransform rtc = Ptr<PxsCachedTransform>(gCG.transformCache)[rigidCacheRef];
+    const float4 rigidQ = float4(rtc.qx, rtc.qy, rtc.qz, rtc.qw);
+    const float3 rigidP = float3(rtc.px, rtc.py, rtc.pz);
+
+    Ptr<float> contactDistance = Ptr<float>(gCG.contactDistance);
+    const float contactDist = contactDistance[clothCacheRef] + contactDistance[rigidCacheRef];
+    const uint rigidMaterialIndex = rigidShape.materialIndex;
+    const float restDistance = Ptr<float>(gCG.restDistance)[cmIdx];
+
+    const uint numRequiredThreads = (numVerts + 31u) & (~31u);
+
+    for (uint i = tid; i < numRequiredThreads; i += PLANE_BLOCK)
+    {
+        bool hasContact = false;
+        float4 contact = float4(0, 0, 0, 0);
+        float4 normalPen = float4(0, 0, 0, 0);
+        uint pairInd1 = 0u;
+
+        if (i < numVerts)
+        {
+            const float4 pf = verts[i];
+            const float3 clothP = float3(pf.x, pf.y, pf.z);
+
+            // vertPlaneCollide (femClothPrimitives.cu:141): p in plane space, plane
+            // normal = q.getBasisVector0(); contact if contactDist >= pInPlane.x.
+            const float3 pInPlaneSpace = quatRotateInv(rigidQ, clothP - rigidP);
+            const float3 normal = getBasisVector0(rigidQ);
+            if (contactDist >= pInPlaneSpace.x)
+            {
+                normalPen = float4(normal.x, normal.y, normal.z, pInPlaneSpace.x);
+
+                const uint clothMask = (femClothId << PXG_CLOTH_ID_SHIFT) | i;
+                // filter: drop the contact if (rigidId, clothMask) is filtered.
+                const bool filtered = findRigid(gCG.filterPairs, gCG.nbFilterPairs, rigidId, uint2(clothMask, 0u));
+                if (!filtered)
+                {
+                    hasContact = true;
+                    pairInd1 = clothMask;
+                    const float3 rP = clothP - normalPen.w * normal;
+                    contact = float4(rP.x, rP.y, rP.z, restDistance);
+                }
+            }
+        }
+
+        // per-tile ballot -> lane-0 atomicAdd -> exclusive-prefix write.
+        if (lane == 0u) sPlaneMask[warpId] = 0u;
+        GroupMemoryBarrierWithGroupSync();
+        if (hasContact) InterlockedOr(sPlaneMask[warpId], 1u << lane);
+        GroupMemoryBarrierWithGroupSync();
+        const uint mask = sPlaneMask[warpId];
+        const uint totalCount = countbits(mask);
+        const uint threadOffset = countbits(mask & ((1u << lane) - 1u));
+        if (lane == 0u)
+        {
+            uint s = 0u;
+            if (totalCount != 0u)
+                InterlockedAdd(Ptr<uint>(gCG.w_totalContactCount)[0], totalCount, s);
+            sPlaneStart[warpId] = s;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        const uint startIndex = sPlaneStart[warpId];
+        if (hasContact)
+            writeRigidVsDeformableContact(startIndex + threadOffset, contact, normalPen,
+                                          float4(0, 0, 0, 1), rigidId, pairInd1, rigidMaterialIndex);
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+// ===========================================================================
+// cloth_SphereVertexContactGenLaunch (femClothPrimitives.cu:700).  eCAPSULE
+// branch DEFERRED (see header).
+// ===========================================================================
+groupshared uint sSphMask[SPHERE_WARPS];
+groupshared uint sSphStart[SPHERE_WARPS];
+
+[shader("compute")]
+[numthreads(32, 1, 1)] // (32, 1, 1)
+void cloth_SphereVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    const uint tid = gtid.x;
+    const uint warpId = tid >> 5;      // == 0 (single warp)
+    const uint lane = tid & (WARP - 1u);
+    const uint cmIdx = gid.x;
+
+    if (cmIdx >= gCG.numTests)
+        return;
+
+    PxgShape clothShape, rigidShape;
+    uint clothCacheRef, rigidCacheRef;
+    loadClothRigidPair(gCG.cmInputs, gCG.gpuShapes, cmIdx,
+                       clothShape, clothCacheRef, rigidShape, rigidCacheRef);
+
+    const uint rigidType = rigidShape.type;
+    const uint2 rigidId = Ptr<uint2>(gCG.shapeToRigidRemap)[rigidCacheRef];
+    const uint femClothId = clothShape.particleOrSoftbodyId;
+    Ptr<PxgFEMClothGpu> femClothes = Ptr<PxgFEMClothGpu>(gCG.femClothes);
+    Ptr<float4> verts = Ptr<float4>(femClothes[femClothId].mPosition_InvMass);
+    const uint numVerts = femClothes[femClothId].mNbVerts;
+
+    const PxsCachedTransform rtc = Ptr<PxsCachedTransform>(gCG.transformCache)[rigidCacheRef];
+    const float3 rigidCenter = float3(rtc.px, rtc.py, rtc.pz);
+
+    Ptr<float> contactDistance = Ptr<float>(gCG.contactDistance);
+    const float contactDist = contactDistance[clothCacheRef] + contactDistance[rigidCacheRef];
+    const uint rigidMaterialIndex = rigidShape.materialIndex;
+    const float restDistance = Ptr<float>(gCG.restDistance)[cmIdx];
+    const float sphereRadius = rigidShape.scaleY;   // scale.scale.y
+
+    const uint numRequiredThreads = (numVerts + 31u) & (~31u);
+
+    for (uint i = tid; i < numRequiredThreads; i += SPHERE_BLOCK)
+    {
+        bool hasContact = false;
+        float4 contact = float4(0, 0, 0, 0);
+        float4 normalPen = float4(0, 0, 0, 0);
+        uint pairInd1 = 0u;
+
+        if (i < numVerts)
+        {
+            const uint clothMask = (femClothId << PXG_CLOTH_ID_SHIFT) | i;
+            const bool skipVertex = findRigid(gCG.filterPairs, gCG.nbFilterPairs, rigidId, uint2(clothMask, 0u));
+            if (!skipVertex)
+            {
+                const float4 cf = verts[i];
+                const float3 p = float3(cf.x, cf.y, cf.z);
+
+                if (rigidType == GEOM_SPHERE)
+                {
+                    // spheresphere(p, center, r0=0, r1=radius, contactDist, normalPen)
+                    // (sphereCollision.cuh:67).
+                    const float3 delta = p - rigidCenter;
+                    const float distanceSq = dot3(delta, delta);
+                    const float radiusSum = sphereRadius;         // 0 + radius
+                    const float inflatedSum = radiusSum + contactDist;
+                    if ((inflatedSum * inflatedSum) > distanceSq)
+                    {
+                        const float eps = 1e-4f;
+                        const float dist = sqrt(distanceSq);
+                        const float3 n = (eps >= dist) ? float3(1.0f, 0.0f, 0.0f) : (delta * (1.0f / dist));
+                        const float pen = dist - radiusSum;
+                        normalPen = float4(n.x, n.y, n.z, pen);
+                        hasContact = true;
+                    }
+                    // else: eCAPSULE branch DEFERRED (see header).
+                }
+
+                if (hasContact)
+                {
+                    pairInd1 = clothMask;
+                    contact = float4(cf.x, cf.y, cf.z, restDistance); // verts[i], w=restDistance
+                }
+            }
+        }
+
+        if (lane == 0u) sSphMask[warpId] = 0u;
+        GroupMemoryBarrierWithGroupSync();
+        if (hasContact) InterlockedOr(sSphMask[warpId], 1u << lane);
+        GroupMemoryBarrierWithGroupSync();
+        const uint mask = sSphMask[warpId];
+        const uint totalCount = countbits(mask);
+        const uint threadOffset = countbits(mask & ((1u << lane) - 1u));
+        if (lane == 0u)
+        {
+            uint s = 0u;
+            if (totalCount != 0u)
+                InterlockedAdd(Ptr<uint>(gCG.w_totalContactCount)[0], totalCount, s);
+            sSphStart[warpId] = s;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        const uint startIndex = sSphStart[warpId];
+        if (hasContact)
+            writeRigidVsDeformableContact(startIndex + threadOffset, contact, normalPen,
+                                          float4(0, 0, 0, 1), rigidId, pairInd1, rigidMaterialIndex);
+        GroupMemoryBarrierWithGroupSync();
+    }
+}

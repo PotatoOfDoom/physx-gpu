@@ -386,6 +386,57 @@ fully mapped), so the hang is a **PGS** result, exactly as the particle settling
 result. This closes the cloth attachment loop end-to-end; 3c was ported + verified in the main tree,
 3b salvaged from the (honest-reporting) scene agent, and the money shot re-run green here.
 
+## P7.1 tranche 4a — cloth-vertex-vs-PRIMITIVE contact GENERATION on the BDA engine ABI
+
+The first tranche of the cloth-drape-on-a-floor arc (the analog of the particle P6.4a contact
+generator). Three kernels; `PXG_SLANG_KERNEL_MAPPED` 192 → **195**, ported line-for-line from
+`gpunarrowphase/src/CUDA/femClothMidPhase.cu` + `femClothPrimitives.cu`:
+- `cloth_midphaseGenerateVertexPairsLaunch` (`CLOTH_MIDPHASE_VERTEX_PRIMS`, launch
+  `PxgNarrowphaseCore.cpp:6317`, ABI `{4,4,8×8}`=72B, grid (32, numTests, 1)) — broadphase→midphase
+  cloth-vertex ↔ rigid-AABB candidate-pair emit.
+- `cloth_planeVertContactGenLaunch` (`CLOTH_PLANE_VERTEX_CG`, `:5853`) — vertex-vs-PLANE contact
+  generation (the floor drape).
+- `cloth_SphereVertexContactGenLaunch` (`CLOTH_VERT_SPHERE_CG`, `:5776`) — vertex-vs-SPHERE (the
+  drape-over-a-sphere). Both share ABI `{4,8×8,4,80}`=160B (a `PxgFEMContactWriter` marshalled by
+  value @80, the psContactGen precedent).
+
+New shader `femClothContactGenBda.slang`. Reuses the REAL narrowphase mirrors (`PxgContactManagerInput`
+/ `PxgShape` / `PxsCachedTransform` / `PxgRigidFilterPair` / `PxBounds3`, offset-pinned); the
+`PxgFEMContactWriter` info tail (`PxgFemOtherContactInfo`, sizeof 16) mirrored locally + self-asserted
+(`PxgFEMCore.h` pulls the CUDA buffer stack, not test-includable). **Fully BIT-EXACT — no
+transcendental/tolerance seam** (plane/sphere/midphase use only mul/add/sqrt/1÷x, IEEE-correctly-
+rounded). New unit tests `gpuslang.femClothSim` +5 cases (ContactGenDescLayout / MidphaseVertexPairs
+incl. a no-penetration→0-pairs case / PlaneVertContactGen{,NoContact} / SphereVertContactGen): one
+cloth vertex penetrating a plane/sphere → midphase + contact-gen → the contact (normal, penetration,
+indices) compared bit-exact vs a CPU transcription of the `.cu`; independently mutation-checked in the
+main tree (a +0.01 perturbation of the stored plane normal + forced-fresh `.spv` recompile fails the
+plane case: ref n.x −5.96e-08 vs got 0.0099). Full suite **673/673 both memory modes**; rigid
+regression 8×2 = **16/16** (three previously-`nullptr` cloth rows hand-edited, NOT regenerated — no
+scene uses these yet, so every existing dispatch is byte-unaffected).
+
+Deviations (flagged, behavior-preserving, documented in the shader header): the CUDA
+`__ballot_sync`/`__shfl_sync`/lane-0-atomicAdd contact compaction → per-32-lane-tile groupshared
+`InterlockedOr`-ballot + `countbits` prefix + one `InterlockedAdd` (identical contact SET + totals;
+the atomicAdd-order buffer index is meaningless — radix-sorted downstream); warp-cooperative
+`LoadShapePair` → per-thread `Ptr<>` loads; the midphase `gridDim.x` hardcoded to `MIDPHASE_GRID_X=32`
+(compute has no gridDim built-in; matches `numBlocks=32` — psContactGen `PS_GRID` precedent, dispatch
+grid must be (32,·,·)); the sphere kernel's eCAPSULE branch deferred (a capsule is never launched into
+the sphere path); `setRigidMaterialIndex(mat)+markInCollision(false)` folded to one store of
+`mat & 0x7fffffff` (the two RMWs provably net to that word).
+
+**Scouting map for the rest of the cloth-drape arc** (recommended next tranches, mirroring particle
+P6.4b): **4b-1 SORT** — `fem_reorderRigidContactsLaunch` (`FEM_REORDER_RS_CONTACTS`, launch
+`PxgFEMCore.cpp:231`) + wire the already-mapped radix path (`RS_MULTIBLOCK`/`CALCULATERANKS`/
+`COPY_HIGH_32BITS`/`COPY_VALUE`). **4b-2 PREPARE** — `cloth_rigidContactPrepareLaunch`
+(`CLOTH_RIGID_CONTACTPREPARE`, `PxgFEMClothCore.cpp:326`, builds `PxgFemRigidConstraintBlock`).
+**4b-3 SOLVE** — `cloth_queryRigidClothContactReferenceCount{,TGS}Launch` +
+`cloth_solveRigidClothCollision{,TGS}Launch` (`:1733`/`:1778`; scatters into `mDeltaPos`, folded by
+the already-mapped `cloth_applyExternalDeltasLaunch`; the rigid-side reaction `accumulateRigidDeltas`
+is deferrable for a static floor, the P7.1.3a static-anchor precedent). **4c** — the
+`PXG_SCENE=clothdrape` floor scene. This tranche was drafted by a background worktree agent then
+salvaged + INDEPENDENTLY re-verified in the main tree (build, both-mode suite, my own forced-fresh
+mutation check, regression) before commit.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

@@ -49,8 +49,13 @@
 #include "PxgFEMCloth.h"                     // real engine per-cloth descriptor
 #include "PxsDeformableSurfaceMaterialCore.h" // real engine surface material data
 #include "PxNodeIndex.h"                     // PxNodeIndex (rigid/world anchor node index)
-#include "PxgSimulationCoreDesc.h"           // PxgFEMRigidAttachment (P7.1 tranche 3a)
+#include "PxgSimulationCoreDesc.h"           // PxgFEMRigidAttachment (P7.1 tranche 3a) / PxgRigidFilterPair (4a)
 #include "PxgSolverBody.h"                   // PxgSolverBodyData / PxgSolverTxIData / PxAlignedTransform
+#include "PxgContactManager.h"               // PxgContactManagerInput (P7.1 tranche 4a contact gen)
+#include "PxgConvexConvexShape.h"            // PxgShape (P7.1 tranche 4a contact gen)
+#include "PxsTransformCache.h"               // PxsCachedTransform (P7.1 tranche 4a contact gen)
+#include "geometry/PxGeometry.h"             // PxGeometryType (P7.1 tranche 4a contact gen)
+#include "foundation/PxBounds3.h"            // PxBounds3 (P7.1 tranche 4a midphase AABB)
 
 #include <cstdint>
 #include <cstddef>
@@ -2010,6 +2015,543 @@ PXG_TEST(femClothSimApplyExternalDeltas)
 
     dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h);
     dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+// ===========================================================================
+// P7.1 tranche 4a: cloth-vertex-vs-PRIMITIVE contact GENERATION.
+//   femClothContactGenBda.spv:
+//     cloth_midphaseGenerateVertexPairsLaunch  (femClothMidPhase.cu)
+//     cloth_planeVertContactGenLaunch          (femClothPrimitives.cu:853)
+//     cloth_SphereVertexContactGenLaunch       (femClothPrimitives.cu:700)
+// Bit-exact vs a CPU transcription of the .cu math (both memory modes).
+// ===========================================================================
+
+// PxgFemOtherContactInfo host mirror (PxgFEMCore.h:128, PX_ALIGN(16), 16 bytes).
+// PxgFEMCore.h is not test-includable (it pulls the CUDA buffer stack), so the
+// contact-writer's info tail is mirrored locally and pinned self-consistently
+// here (the layout the shader writes at index*16 must equal what we read back).
+struct FemOtherContactInfoHost
+{
+    uint64_t pairInd0;                 // @0
+    uint32_t pairInd1;                 // @8
+    uint32_t rigidMatInd_isInCollision; // @12 -> 16
+};
+static_assert(sizeof(FemOtherContactInfoHost) == 16, "PxgFemOtherContactInfo mirror == 16B");
+static_assert(offsetof(FemOtherContactInfoHost, pairInd0) == 0, "pairInd0 @0");
+static_assert(offsetof(FemOtherContactInfoHost, pairInd1) == 8, "pairInd1 @8");
+static_assert(offsetof(FemOtherContactInfoHost, rigidMatInd_isInCollision) == 12, "rigidMatInd @12");
+
+// midphase push blob — byte-identical to MidphaseParams (ABI row {4,4,8,8,8,8,8,8,8,8}).
+struct MidphasePush
+{
+    uint32_t numTests;
+    float toleranceLength;
+    uint64_t cmInputs, transformCache, bounds, contactDistance, gpuShapes, femClothes;
+    uint64_t stackPtr, midphasePairsNum;
+};
+static_assert(sizeof(MidphasePush) == 72, "midphase push blob must be 72 bytes");
+
+// plane / sphere contact-gen push blob — byte-identical to ContactGenParams
+// (ABI row {4,8,8,8,8,8,8,8,8,4,80}).  The PxgFEMContactWriter (80B) inlined @80.
+struct ContactGenPush
+{
+    uint32_t numTests, pad4;
+    uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes, femClothes;
+    uint64_t shapeToRigidRemap, filterPairs;
+    uint32_t nbFilterPairs, pad76;
+    uint64_t w_outPoint, w_outNormalPen, w_outBarycentric, w_outContactInfo, w_totalContactCount;
+    uint64_t w_contactByX, w_tempContactByX, w_contactIndexSortedByX, w_contactSortedByX;
+    uint32_t w_maxNumContacts, pad156;
+};
+static_assert(sizeof(ContactGenPush) == 160, "contact-gen push blob must be 160 bytes");
+static_assert(offsetof(ContactGenPush, w_outPoint) == 80, "writer @80");
+static_assert(offsetof(ContactGenPush, w_maxNumContacts) == 152, "maxNumContacts @152");
+
+// PxQuat::rotateInv / getBasisVector0 CPU transcriptions (bit-exact; the test TU
+// is built -ffp-contract=off, matching the NoContraction shader stamp).
+struct V3c { float x, y, z; };
+static V3c cpuQuatRotateInv(const float q[4], V3c v)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q[3] * q[3] - 0.5f;
+    const float dot2 = (q[0] * vx + q[1] * vy + q[2] * vz);
+    return V3c{ vx * w2 - (q[1] * vz - q[2] * vy) * q[3] + q[0] * dot2,
+                vy * w2 - (q[2] * vx - q[0] * vz) * q[3] + q[1] * dot2,
+                vz * w2 - (q[0] * vy - q[1] * vx) * q[3] + q[2] * dot2 };
+}
+static V3c cpuGetBasisVector0(const float q[4])
+{
+    const float x2 = q[0] * 2.0f, w2 = q[3] * 2.0f;
+    return V3c{ (q[3] * w2) - 1.0f + q[0] * x2, (q[2] * w2) + q[1] * x2, (-q[1] * w2) + q[2] * x2 };
+}
+
+// ---------------------------------------------------------------------------
+// Descriptor / layout proof for the narrowphase mirrors the contact-gen kernels
+// dereference (byte-exact vs the real engine structs).
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimContactGenDescLayout)
+{
+    static_assert(sizeof(PxgContactManagerInput) == 16, "PxgContactManagerInput stride");
+    static_assert(sizeof(PxgShape) == 48, "PxgShape stride");
+    static_assert(offsetof(PxgShape, type) == 40, "PxgShape::type @40");
+    static_assert(offsetof(PxgShape, particleOrSoftbodyId) == 44, "PxgShape::particleOrSoftbodyId @44");
+    static_assert(offsetof(PxgShape, materialIndex) == 28, "PxgShape::materialIndex @28");
+    static_assert(sizeof(PxsCachedTransform) == 32, "PxsCachedTransform stride");
+    static_assert(sizeof(PxgRigidFilterPair) == 32, "PxgRigidFilterPair stride");
+
+    PXG_CHECK_MSG(sizeof(PxBounds3) == 24, "PxBounds3 sizeof == 24 (got %zu)", sizeof(PxBounds3));
+    PXG_CHECK(offsetof(PxBounds3, minimum) == 0);
+    PXG_CHECK(offsetof(PxBounds3, maximum) == 12);
+
+    // PxGeometryType values the kernels key on.
+    PXG_CHECK(uint32_t(PxGeometryType::eSPHERE) == 0u);
+    PXG_CHECK(uint32_t(PxGeometryType::ePLANE) == 1u);
+    PXG_CHECK(uint32_t(PxGeometryType::eTRIANGLEMESH) == 8u);
+    // PxNodeIndex round-trip: contactByRigid low-32 == getInd() & 0xffffffff.
+    PXG_CHECK(sizeof(PxNodeIndex) == 8);
+}
+
+// Build a single-cloth descriptor referencing a position buffer + nbVerts.
+static PxgFEMCloth makeClothDesc(uint64_t posAddr, uint32_t nbVerts)
+{
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(posAddr));
+    c.mNbVerts = nbVerts;
+    return c;
+}
+
+// ---------------------------------------------------------------------------
+// cloth_midphaseGenerateVertexPairsLaunch — vertices vs the rigid world AABB.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimMidphaseVertexPairs)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // rigid AABB [-1,1]^3 at cache ref 1; total contactDist 0.1 -> tolerance 0.01.
+    // vert0 inside (hit), vert1 far (miss), vert2 0.05 outside (hit), vert3 far (miss).
+    std::vector<F4> verts = {
+        { 0.00f,  0.00f, 0.00f, 1.0f },   // id0 HIT (magSq 0)
+        { 5.00f,  0.00f, 0.00f, 1.0f },   // id1 MISS (magSq 16)
+        { 1.05f,  0.00f, 0.00f, 1.0f },   // id2 HIT (magSq 0.0025 <= 0.01)
+        { 0.00f, -5.00f, 0.00f, 1.0f },   // id3 MISS (magSq 16)
+    };
+    const uint32_t nbVerts = uint32_t(verts.size());
+    DevBuf bVerts = makeDev(dev, verts);
+
+    PxgFEMCloth c = makeClothDesc(bVerts.addr, nbVerts);
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<PxgContactManagerInput> cmInputs(1);
+    std::memset(cmInputs.data(), 0, sizeof(PxgContactManagerInput));
+    cmInputs[0].shapeRef0 = 0u; cmInputs[0].shapeRef1 = 1u;
+    cmInputs[0].transformCacheRef0 = 0u; cmInputs[0].transformCacheRef1 = 1u;
+    DevBuf bCin = makeDev(dev, cmInputs);
+
+    std::vector<PxgShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    shapes[0].type = PxU32(PxGeometryType::eTRIANGLEMESH); // cloth
+    shapes[0].particleOrSoftbodyId = 0u;
+    shapes[1].type = PxU32(PxGeometryType::ePLANE);        // rigid (any non-mesh)
+    DevBuf bShapes = makeDev(dev, shapes);
+
+    // bounds: [1] = the rigid AABB [-1,1]^3 (min @0, max @12).
+    std::vector<float> boundsF(2 * 6, 0.0f);
+    boundsF[6 + 0] = -1.0f; boundsF[6 + 1] = -1.0f; boundsF[6 + 2] = -1.0f;
+    boundsF[6 + 3] =  1.0f; boundsF[6 + 4] =  1.0f; boundsF[6 + 5] =  1.0f;
+    DevBuf bBounds = makeDev(dev, boundsF);
+
+    std::vector<float> contactDist = { 0.05f, 0.05f }; // total 0.1 -> tolerance 0.01
+    DevBuf bCd = makeDev(dev, contactDist);
+    std::vector<PxsCachedTransform> tcache(2);
+    std::memset(tcache.data(), 0, tcache.size() * sizeof(PxsCachedTransform));
+    DevBuf bTc = makeDev(dev, tcache); // unused by the vertex midphase (ABI parity)
+
+    const uint32_t STACK_MAX = 64u;
+    std::vector<uint32_t> stack(STACK_MAX * 4, 0xffffffffu); // uint4[]
+    std::vector<uint32_t> pairsNum = { 0u };
+    DevBuf bStack = makeDev(dev, stack);
+    DevBuf bPairsNum = makeDev(dev, pairsNum);
+
+    MidphasePush push = {};
+    push.numTests = 1u;
+    push.toleranceLength = 1.0f;
+    push.cmInputs = bCin.addr;
+    push.transformCache = bTc.addr;
+    push.bounds = bBounds.addr;
+    push.contactDistance = bCd.addr;
+    push.gpuShapes = bShapes.addr;
+    push.femClothes = bDesc.addr;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairsNum.addr;
+
+    // engine launch geometry: grid (32, numTests, 1), block (32, 2, 1).
+    Kernel k("femClothContactGenBda.spv", "cloth_midphaseGenerateVertexPairsLaunch", {}, sizeof(MidphasePush));
+    k.dispatch(/*gridX*/ 32u, {}, push, /*gridY numTests*/ 1u, 1u);
+    dev->flush();
+
+    const uint32_t gNum = downloadBuffer<uint32_t>(dev, bPairsNum.h, 1)[0];
+    PXG_CHECK_MSG(gNum == 2u, "midphase emitted %u pairs (expected 2)", gNum);
+
+    const auto gStack = downloadBuffer<uint32_t>(dev, bStack.h, STACK_MAX * 4);
+    // Single warp -> deterministic order: pairs written in vertex-id order.
+    // pair0 = (cmIdx 0, id 0), pair1 = (cmIdx 0, id 2).
+    size_t mm = 0;
+    auto chkPair = [&](uint32_t slot, uint32_t cm, uint32_t id) {
+        const uint32_t gx = gStack[slot * 4 + 0], gy = gStack[slot * 4 + 1];
+        const uint32_t gz = gStack[slot * 4 + 2], gw = gStack[slot * 4 + 3];
+        if (gx != cm || gy != id || gz != 0u || gw != 0u)
+        { ++mm; std::printf("  midphase pair[%u] MM: got(%u,%u,%u,%u) ref(%u,%u,0,0)\n", slot, gx, gy, gz, gw, cm, id); }
+    };
+    chkPair(0u, 0u, 0u);
+    chkPair(1u, 0u, 2u);
+    PXG_CHECK_MSG(mm == 0, "cloth_midphaseGenerateVertexPairs bit-exact vs CPU (%zu mismatches)", mm);
+
+    // ---- non-penetrating case: all verts far outside -> zero pairs ----
+    std::vector<F4> vertsOut = {
+        { 10.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 10.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 10.0f, 1.0f },
+    };
+    DevBuf bVertsOut = makeDev(dev, vertsOut);
+    PxgFEMCloth c2 = makeClothDesc(bVertsOut.addr, uint32_t(vertsOut.size()));
+    std::vector<PxgFEMCloth> descArr2 = { c2 };
+    DevBuf bDesc2 = makeDev(dev, descArr2);
+    std::vector<uint32_t> pairsNum2 = { 0u };
+    DevBuf bPairsNum2 = makeDev(dev, pairsNum2);
+    MidphasePush push2 = push;
+    push2.femClothes = bDesc2.addr;
+    push2.midphasePairsNum = bPairsNum2.addr;
+    k.dispatch(32u, {}, push2, 1u, 1u);
+    dev->flush();
+    const uint32_t gNum2 = downloadBuffer<uint32_t>(dev, bPairsNum2.h, 1)[0];
+    PXG_CHECK_MSG(gNum2 == 0u, "midphase (no penetration) emitted %u pairs (expected 0)", gNum2);
+
+    dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h);
+    dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bCd.h);
+    dev->destroyBuffer(bTc.h); dev->destroyBuffer(bStack.h); dev->destroyBuffer(bPairsNum.h);
+    dev->destroyBuffer(bVertsOut.h); dev->destroyBuffer(bDesc2.h); dev->destroyBuffer(bPairsNum2.h);
+}
+
+// Shared writer-buffer set for the plane / sphere contact-gen tests.
+struct WriterBufs
+{
+    DevBuf point, normalPen, barycentric, info, count, byRigid, tempByRigid, idxByRigid, sortedByRigid;
+    uint32_t maxContacts;
+};
+static WriterBufs makeWriter(PxgSlangComputeDevice* dev, uint32_t maxContacts)
+{
+    WriterBufs w; w.maxContacts = maxContacts;
+    std::vector<F4> zf4(maxContacts, F4{ 0, 0, 0, 0 });
+    std::vector<FemOtherContactInfoHost> zinfo(maxContacts);
+    std::memset(zinfo.data(), 0, zinfo.size() * sizeof(FemOtherContactInfoHost));
+    std::vector<uint32_t> zc = { 0u };
+    std::vector<uint64_t> zu64(maxContacts, 0xffffffffffffffffull);
+    std::vector<uint32_t> zu32(maxContacts, 0xffffffffu);
+    w.point = makeDev(dev, zf4); w.normalPen = makeDev(dev, zf4); w.barycentric = makeDev(dev, zf4);
+    w.info = makeDev(dev, zinfo); w.count = makeDev(dev, zc);
+    w.byRigid = makeDev(dev, zu64); w.tempByRigid = makeDev(dev, zu32);
+    w.idxByRigid = makeDev(dev, zu32); w.sortedByRigid = makeDev(dev, zu32);
+    return w;
+}
+static void fillWriter(ContactGenPush& p, const WriterBufs& w)
+{
+    p.w_outPoint = w.point.addr; p.w_outNormalPen = w.normalPen.addr; p.w_outBarycentric = w.barycentric.addr;
+    p.w_outContactInfo = w.info.addr; p.w_totalContactCount = w.count.addr;
+    p.w_contactByX = w.byRigid.addr; p.w_tempContactByX = w.tempByRigid.addr;
+    p.w_contactIndexSortedByX = w.idxByRigid.addr; p.w_contactSortedByX = w.sortedByRigid.addr;
+    p.w_maxNumContacts = w.maxContacts;
+}
+static void destroyWriter(PxgSlangComputeDevice* dev, const WriterBufs& w)
+{
+    dev->destroyBuffer(w.point.h); dev->destroyBuffer(w.normalPen.h); dev->destroyBuffer(w.barycentric.h);
+    dev->destroyBuffer(w.info.h); dev->destroyBuffer(w.count.h); dev->destroyBuffer(w.byRigid.h);
+    dev->destroyBuffer(w.tempByRigid.h); dev->destroyBuffer(w.idxByRigid.h); dev->destroyBuffer(w.sortedByRigid.h);
+}
+
+// ---------------------------------------------------------------------------
+// cloth_planeVertContactGenLaunch — one cloth vertex penetrating a plane.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimPlaneVertContactGen)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // plane: rotate the canonical +X normal onto +Y (q = +90deg about z), at origin.
+    const float sq = std::sin(0.78539816339744830961f);
+    const float cq = std::cos(0.78539816339744830961f);
+    const float planeQ[4] = { 0.0f, 0.0f, sq, cq };
+    const float planeP[3] = { 0.0f, 0.0f, 0.0f };
+    const float contactOffsetCloth = 0.2f, contactOffsetRigid = 0.1f; // total 0.3
+    const float contactDist = contactOffsetCloth + contactOffsetRigid;
+    const float restDistance = 0.05f;
+    const uint32_t materialIndex = 5u;
+    const uint64_t rigidNodeInd = 0x0000000200000007ull; // low32 = 7
+
+    // vert0 penetrating (below plane), vert1/vert2 above (no contact).
+    std::vector<F4> verts = {
+        { 0.5f, -0.1f, 0.3f, 1.0f },   // HIT (pInPlane.x ~ -0.1 <= 0.3)
+        { 0.0f,  1.0f, 0.0f, 1.0f },   // MISS
+        { -0.3f, 2.0f, 0.1f, 1.0f },   // MISS
+    };
+    const uint32_t nbVerts = uint32_t(verts.size());
+    DevBuf bVerts = makeDev(dev, verts);
+    PxgFEMCloth c = makeClothDesc(bVerts.addr, nbVerts);
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<PxgContactManagerInput> cmInputs(1);
+    std::memset(cmInputs.data(), 0, sizeof(PxgContactManagerInput));
+    cmInputs[0].shapeRef0 = 0u; cmInputs[0].shapeRef1 = 1u;
+    cmInputs[0].transformCacheRef0 = 0u; cmInputs[0].transformCacheRef1 = 1u;
+    DevBuf bCin = makeDev(dev, cmInputs);
+
+    std::vector<PxgShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    shapes[0].type = PxU32(PxGeometryType::eTRIANGLEMESH);
+    shapes[0].particleOrSoftbodyId = 0u;
+    shapes[1].type = PxU32(PxGeometryType::ePLANE);
+    shapes[1].materialIndex = materialIndex;
+    DevBuf bShapes = makeDev(dev, shapes);
+
+    std::vector<PxsCachedTransform> tcache(2);
+    std::memset(tcache.data(), 0, tcache.size() * sizeof(PxsCachedTransform));
+    tcache[1].transform = PxTransform(PxVec3(planeP[0], planeP[1], planeP[2]),
+                                      PxQuat(planeQ[0], planeQ[1], planeQ[2], planeQ[3]));
+    DevBuf bTc = makeDev(dev, tcache);
+
+    std::vector<float> contactDistArr = { contactOffsetCloth, contactOffsetRigid };
+    DevBuf bCd = makeDev(dev, contactDistArr);
+    std::vector<float> restArr = { restDistance };
+    DevBuf bRd = makeDev(dev, restArr);
+    std::vector<uint64_t> remap = { 0ull, rigidNodeInd };
+    DevBuf bRemap = makeDev(dev, remap);
+    DevBuf bFilters = makeDev(dev, std::vector<uint32_t>{ 0u }); // dummy buffer (nbFilterPairs=0 -> find() false)
+
+    WriterBufs w = makeWriter(dev, 64u);
+
+    ContactGenPush push = {};
+    push.numTests = 1u;
+    push.cmInputs = bCin.addr; push.transformCache = bTc.addr; push.contactDistance = bCd.addr;
+    push.restDistance = bRd.addr; push.gpuShapes = bShapes.addr; push.femClothes = bDesc.addr;
+    push.shapeToRigidRemap = bRemap.addr; push.filterPairs = bFilters.addr; push.nbFilterPairs = 0u;
+    fillWriter(push, w);
+
+    Kernel k("femClothContactGenBda.spv", "cloth_planeVertContactGenLaunch", {}, sizeof(ContactGenPush));
+    k.dispatch(/*gridX numTests*/ 1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // ---- CPU reference for vert0 ----
+    const V3c n = cpuGetBasisVector0(planeQ);
+    const V3c pin = cpuQuatRotateInv(planeQ, V3c{ verts[0].x - planeP[0], verts[0].y - planeP[1], verts[0].z - planeP[2] });
+    PXG_CHECK_MSG(contactDist >= pin.x, "reference: vert0 must be within the plane contact offset");
+    const F4 refNormalPen = { n.x, n.y, n.z, pin.x };
+    const float rpx = verts[0].x - pin.x * n.x, rpy = verts[0].y - pin.x * n.y, rpz = verts[0].z - pin.x * n.z;
+    const F4 refPoint = { rpx, rpy, rpz, restDistance };
+    const uint32_t clothMask0 = (0u << 20) | 0u;
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, w.count.h, 1)[0];
+    PXG_CHECK_MSG(gCount == 1u, "plane contact-gen emitted %u contacts (expected 1)", gCount);
+
+    const F4 gPoint = downloadBuffer<F4>(dev, w.point.h, 1)[0];
+    const F4 gNP = downloadBuffer<F4>(dev, w.normalPen.h, 1)[0];
+    const F4 gBary = downloadBuffer<F4>(dev, w.barycentric.h, 1)[0];
+    const FemOtherContactInfoHost gInfo = downloadBuffer<FemOtherContactInfoHost>(dev, w.info.h, 1)[0];
+    const uint64_t gByRigid = downloadBuffer<uint64_t>(dev, w.byRigid.h, 1)[0];
+    const uint32_t gTempByRigid = downloadBuffer<uint32_t>(dev, w.tempByRigid.h, 1)[0];
+    const uint32_t gIdxByRigid = downloadBuffer<uint32_t>(dev, w.idxByRigid.h, 1)[0];
+
+    size_t mm = 0;
+    auto cmpF4 = [&](const char* nm, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm; std::printf("  plane %s MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm, r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
+    };
+    cmpF4("outPoint", refPoint, gPoint);
+    cmpF4("outNormalPen", refNormalPen, gNP);
+    cmpF4("outBarycentric", F4{ 0, 0, 0, 1 }, gBary);
+    if (gByRigid != rigidNodeInd) { ++mm; std::printf("  plane contactByRigid MM got %llu ref %llu\n", (unsigned long long)gByRigid, (unsigned long long)rigidNodeInd); }
+    if (gTempByRigid != uint32_t(rigidNodeInd & 0xffffffffu)) { ++mm; std::printf("  plane tempByRigid MM got %u\n", gTempByRigid); }
+    if (gIdxByRigid != 0u) { ++mm; std::printf("  plane contactIndexSortedByRigid MM got %u\n", gIdxByRigid); }
+    if (gInfo.pairInd0 != rigidNodeInd) { ++mm; std::printf("  plane info.pairInd0 MM got %llu\n", (unsigned long long)gInfo.pairInd0); }
+    if (gInfo.pairInd1 != clothMask0) { ++mm; std::printf("  plane info.pairInd1 MM got %u ref %u\n", gInfo.pairInd1, clothMask0); }
+    if (gInfo.rigidMatInd_isInCollision != (materialIndex & 0x7fffffffu)) { ++mm; std::printf("  plane info.rigidMatInd MM got %u\n", gInfo.rigidMatInd_isInCollision); }
+    PXG_CHECK_MSG(mm == 0, "cloth_planeVertContactGen bit-exact vs CPU (%zu mismatches)", mm);
+
+    // teeth: a wrong normal would not satisfy this human-readable sanity.
+    PXG_CHECK_MSG(almostEqual(gNP.x, 0.0f, 1e-5f, 1e-6f) && almostEqual(gNP.y, 1.0f, 1e-5f, 1e-6f) &&
+                  almostEqual(gNP.z, 0.0f, 1e-5f, 1e-6f) && almostEqual(gNP.w, -0.1f, 1e-5f, 1e-6f),
+                  "plane contact normal ~ (0,1,0), separation ~ -0.1");
+
+    destroyWriter(dev, w);
+    dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h);
+    dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bTc.h); dev->destroyBuffer(bCd.h);
+    dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h);
+}
+
+// non-penetrating plane case: all verts above the plane -> zero contacts.
+PXG_TEST(femClothSimPlaneVertContactGenNoContact)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float sq = std::sin(0.78539816339744830961f), cq = std::cos(0.78539816339744830961f);
+    const float planeQ[4] = { 0.0f, 0.0f, sq, cq };
+
+    std::vector<F4> verts = { { 0.0f, 1.0f, 0.0f, 1.0f }, { 0.0f, 2.0f, 0.0f, 1.0f } }; // all above
+    DevBuf bVerts = makeDev(dev, verts);
+    PxgFEMCloth c = makeClothDesc(bVerts.addr, uint32_t(verts.size()));
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<PxgContactManagerInput> cmInputs(1);
+    std::memset(cmInputs.data(), 0, sizeof(PxgContactManagerInput));
+    cmInputs[0].shapeRef1 = 1u; cmInputs[0].transformCacheRef1 = 1u;
+    DevBuf bCin = makeDev(dev, cmInputs);
+    std::vector<PxgShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    shapes[0].type = PxU32(PxGeometryType::eTRIANGLEMESH);
+    shapes[1].type = PxU32(PxGeometryType::ePLANE);
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<PxsCachedTransform> tcache(2);
+    std::memset(tcache.data(), 0, tcache.size() * sizeof(PxsCachedTransform));
+    tcache[1].transform = PxTransform(PxVec3(0, 0, 0), PxQuat(planeQ[0], planeQ[1], planeQ[2], planeQ[3]));
+    DevBuf bTc = makeDev(dev, tcache);
+    std::vector<float> contactDistArr = { 0.2f, 0.1f };
+    DevBuf bCd = makeDev(dev, contactDistArr);
+    std::vector<float> restArr = { 0.0f };
+    DevBuf bRd = makeDev(dev, restArr);
+    std::vector<uint64_t> remap = { 0ull, 7ull };
+    DevBuf bRemap = makeDev(dev, remap);
+    DevBuf bFilters = makeDev(dev, std::vector<uint32_t>{ 0u });
+    WriterBufs w = makeWriter(dev, 64u);
+
+    ContactGenPush push = {};
+    push.numTests = 1u;
+    push.cmInputs = bCin.addr; push.transformCache = bTc.addr; push.contactDistance = bCd.addr;
+    push.restDistance = bRd.addr; push.gpuShapes = bShapes.addr; push.femClothes = bDesc.addr;
+    push.shapeToRigidRemap = bRemap.addr; push.filterPairs = bFilters.addr; push.nbFilterPairs = 0u;
+    fillWriter(push, w);
+
+    Kernel k("femClothContactGenBda.spv", "cloth_planeVertContactGenLaunch", {}, sizeof(ContactGenPush));
+    k.dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, w.count.h, 1)[0];
+    PXG_CHECK_MSG(gCount == 0u, "plane contact-gen (no penetration) emitted %u contacts (expected 0)", gCount);
+
+    destroyWriter(dev, w);
+    dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h);
+    dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bTc.h); dev->destroyBuffer(bCd.h);
+    dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h);
+}
+
+// ---------------------------------------------------------------------------
+// cloth_SphereVertexContactGenLaunch — one cloth vertex penetrating a sphere.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimSphereVertContactGen)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const float sphereRadius = 1.0f;
+    const float contactOffsetCloth = 0.05f, contactOffsetRigid = 0.05f; // total 0.1
+    const float contactDist = contactOffsetCloth + contactOffsetRigid;
+    const float restDistance = 0.03f;
+    const uint32_t materialIndex = 9u;
+    const uint64_t rigidNodeInd = 0x0000000300000011ull; // low32 = 0x11
+    const float sphereCenter[3] = { 0.0f, 0.0f, 0.0f };
+
+    // vert0 inside the sphere (hit), vert1/vert2 outside (miss).
+    std::vector<F4> verts = {
+        { 0.5f, 0.0f, 0.0f, 1.0f },   // HIT (dist 0.5 < 1.1)
+        { 3.0f, 0.0f, 0.0f, 1.0f },   // MISS
+        { 0.0f, 2.0f, 0.0f, 1.0f },   // MISS
+    };
+    const uint32_t nbVerts = uint32_t(verts.size());
+    DevBuf bVerts = makeDev(dev, verts);
+    PxgFEMCloth c = makeClothDesc(bVerts.addr, nbVerts);
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<PxgContactManagerInput> cmInputs(1);
+    std::memset(cmInputs.data(), 0, sizeof(PxgContactManagerInput));
+    cmInputs[0].shapeRef0 = 0u; cmInputs[0].shapeRef1 = 1u;
+    cmInputs[0].transformCacheRef0 = 0u; cmInputs[0].transformCacheRef1 = 1u;
+    DevBuf bCin = makeDev(dev, cmInputs);
+
+    std::vector<PxgShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    shapes[0].type = PxU32(PxGeometryType::eTRIANGLEMESH);
+    shapes[0].particleOrSoftbodyId = 0u;
+    shapes[1].type = PxU32(PxGeometryType::eSPHERE);
+    shapes[1].materialIndex = materialIndex;
+    shapes[1].scale.scale = PxVec3(sphereRadius, sphereRadius, sphereRadius); // radius = scale.y
+    DevBuf bShapes = makeDev(dev, shapes);
+
+    std::vector<PxsCachedTransform> tcache(2);
+    std::memset(tcache.data(), 0, tcache.size() * sizeof(PxsCachedTransform));
+    tcache[1].transform = PxTransform(PxVec3(sphereCenter[0], sphereCenter[1], sphereCenter[2]), PxQuat(PxIdentity));
+    DevBuf bTc = makeDev(dev, tcache);
+
+    std::vector<float> contactDistArr = { contactOffsetCloth, contactOffsetRigid };
+    DevBuf bCd = makeDev(dev, contactDistArr);
+    std::vector<float> restArr = { restDistance };
+    DevBuf bRd = makeDev(dev, restArr);
+    std::vector<uint64_t> remap = { 0ull, rigidNodeInd };
+    DevBuf bRemap = makeDev(dev, remap);
+    DevBuf bFilters = makeDev(dev, std::vector<uint32_t>{ 0u });
+    WriterBufs w = makeWriter(dev, 64u);
+
+    ContactGenPush push = {};
+    push.numTests = 1u;
+    push.cmInputs = bCin.addr; push.transformCache = bTc.addr; push.contactDistance = bCd.addr;
+    push.restDistance = bRd.addr; push.gpuShapes = bShapes.addr; push.femClothes = bDesc.addr;
+    push.shapeToRigidRemap = bRemap.addr; push.filterPairs = bFilters.addr; push.nbFilterPairs = 0u;
+    fillWriter(push, w);
+
+    Kernel k("femClothContactGenBda.spv", "cloth_SphereVertexContactGenLaunch", {}, sizeof(ContactGenPush));
+    k.dispatch(/*gridX numTests*/ 1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // ---- CPU reference (spheresphere) for vert0 ----
+    const float dx = verts[0].x - sphereCenter[0], dy = verts[0].y - sphereCenter[1], dz = verts[0].z - sphereCenter[2];
+    const float distanceSq = dx * dx + dy * dy + dz * dz;
+    const float radiusSum = sphereRadius; // 0 + radius
+    const float inflatedSum = radiusSum + contactDist;
+    PXG_CHECK_MSG((inflatedSum * inflatedSum) > distanceSq, "reference: vert0 must penetrate the inflated sphere");
+    const float dist = std::sqrt(distanceSq);
+    V3c refN = (1e-4f >= dist) ? V3c{ 1.0f, 0.0f, 0.0f } : V3c{ dx * (1.0f / dist), dy * (1.0f / dist), dz * (1.0f / dist) };
+    const float refPen = dist - radiusSum;
+    const F4 refNormalPen = { refN.x, refN.y, refN.z, refPen };
+    const F4 refPoint = { verts[0].x, verts[0].y, verts[0].z, restDistance };
+    const uint32_t clothMask0 = (0u << 20) | 0u;
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, w.count.h, 1)[0];
+    PXG_CHECK_MSG(gCount == 1u, "sphere contact-gen emitted %u contacts (expected 1)", gCount);
+
+    const F4 gPoint = downloadBuffer<F4>(dev, w.point.h, 1)[0];
+    const F4 gNP = downloadBuffer<F4>(dev, w.normalPen.h, 1)[0];
+    const F4 gBary = downloadBuffer<F4>(dev, w.barycentric.h, 1)[0];
+    const FemOtherContactInfoHost gInfo = downloadBuffer<FemOtherContactInfoHost>(dev, w.info.h, 1)[0];
+    const uint64_t gByRigid = downloadBuffer<uint64_t>(dev, w.byRigid.h, 1)[0];
+    const uint32_t gTempByRigid = downloadBuffer<uint32_t>(dev, w.tempByRigid.h, 1)[0];
+
+    size_t mm = 0;
+    auto cmpF4 = [&](const char* nm, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm; std::printf("  sphere %s MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm, r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
+    };
+    cmpF4("outPoint", refPoint, gPoint);
+    cmpF4("outNormalPen", refNormalPen, gNP);
+    cmpF4("outBarycentric", F4{ 0, 0, 0, 1 }, gBary);
+    if (gByRigid != rigidNodeInd) { ++mm; std::printf("  sphere contactByRigid MM got %llu\n", (unsigned long long)gByRigid); }
+    if (gTempByRigid != uint32_t(rigidNodeInd & 0xffffffffu)) { ++mm; std::printf("  sphere tempByRigid MM got %u\n", gTempByRigid); }
+    if (gInfo.pairInd0 != rigidNodeInd) { ++mm; std::printf("  sphere info.pairInd0 MM got %llu\n", (unsigned long long)gInfo.pairInd0); }
+    if (gInfo.pairInd1 != clothMask0) { ++mm; std::printf("  sphere info.pairInd1 MM got %u\n", gInfo.pairInd1); }
+    if (gInfo.rigidMatInd_isInCollision != (materialIndex & 0x7fffffffu)) { ++mm; std::printf("  sphere info.rigidMatInd MM got %u\n", gInfo.rigidMatInd_isInCollision); }
+    PXG_CHECK_MSG(mm == 0, "cloth_SphereVertexContactGen bit-exact vs CPU (%zu mismatches)", mm);
+
+    PXG_CHECK_MSG(almostEqual(gNP.x, 1.0f, 1e-5f, 1e-6f) && almostEqual(gNP.w, -0.5f, 1e-5f, 1e-6f),
+                  "sphere contact normal ~ (1,0,0), separation ~ -0.5");
+
+    destroyWriter(dev, w);
+    dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h);
+    dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bTc.h); dev->destroyBuffer(bCd.h);
+    dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h);
 }
 
 } // namespace

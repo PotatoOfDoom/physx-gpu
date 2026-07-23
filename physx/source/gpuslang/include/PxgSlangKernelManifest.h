@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 192;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 195;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -387,9 +387,9 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_SphereContactGenLaunch", nullptr, nullptr },  // CLOTH_SPHERE_CG (unmapped)
     { "cloth_boxTriangleContactGenLaunch", nullptr, nullptr },  // CLOTH_BOX_TRIANGLE_CG (unmapped)
     { "cloth_convexContactGenLaunch", nullptr, nullptr },  // CLOTH_CONVEX_CG (unmapped)
-    { "cloth_SphereVertexContactGenLaunch", nullptr, nullptr },  // CLOTH_VERT_SPHERE_CG (unmapped)
-    { "cloth_planeVertContactGenLaunch", nullptr, nullptr },  // CLOTH_PLANE_VERTEX_CG (unmapped)
-    { "cloth_midphaseGenerateVertexPairsLaunch", nullptr, nullptr },  // CLOTH_MIDPHASE_VERTEX_PRIMS (unmapped)
+    { "cloth_SphereVertexContactGenLaunch", "femClothContactGenBda.spv", "cloth_SphereVertexContactGenLaunch" },  // CLOTH_VERT_SPHERE_CG (P7.1 tranche 4a BDA port: cloth-vertex-vs-sphere contact gen)
+    { "cloth_planeVertContactGenLaunch", "femClothContactGenBda.spv", "cloth_planeVertContactGenLaunch" },  // CLOTH_PLANE_VERTEX_CG (P7.1 tranche 4a BDA port: cloth-vertex-vs-plane contact gen)
+    { "cloth_midphaseGenerateVertexPairsLaunch", "femClothContactGenBda.spv", "cloth_midphaseGenerateVertexPairsLaunch" },  // CLOTH_MIDPHASE_VERTEX_PRIMS (P7.1 tranche 4a BDA port: cloth-vertex-vs-primitive midphase pair gen)
     { "cloth_boxVertexContactGenLaunch", nullptr, nullptr },  // CLOTH_BOX_VERTEX_COLLISION (unmapped)
     { "cloth_convexVertexContactGenLaunch", nullptr, nullptr },  // CLOTH_CONVEX_VERTEX_COLLISION (unmapped)
     { "cloth_selfCollisionMidphaseVTLaunch", nullptr, nullptr },  // CLOTH_SELFCOLLISION_MIDPHASE_VT (unmapped)

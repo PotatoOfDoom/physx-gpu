@@ -307,6 +307,28 @@ static const uint8_t kClothRigidAttachSolve[] = { 8, 8, 4, 8, 8, 8, 8, 4, 8 };
 //   pointers + PxReal -> natural-alignment blob = 24 bytes (20 rounded to 8).
 static const uint8_t kClothApplyExtDeltas[] = { 8, 8, 4 };
 
+// gpunarrowphase femClothMidPhase.cu (P7.1 tranche 4a cloth-vs-primitive contact
+// GENERATION — the broadphase->midphase pass):
+//   cloth_midphaseGenerateVertexPairsLaunch(PxU32 numWorkItems,
+//     PxReal tolerenceLength, const PxgContactManagerInput* cmInputs,
+//     const PxsCachedTransform* transformCache, const PxBounds3* bounds,
+//     const PxReal* contactDistance, const PxgShape* gpuShapes,
+//     const PxgFEMCloth* femClothes, uint4* stackPtr, PxU32* midphasePairsNum)
+//   -- launch site PxgNarrowphaseCore.cpp:6317.  PxU32 + PxReal (@0/@4) + eight
+//   device pointers -> natural-alignment blob = 72 bytes.
+static const uint8_t kClothMidphaseVertPairs[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 8 };
+//   cloth_planeVertContactGenLaunch / cloth_SphereVertexContactGenLaunch share the
+//   arg pack (femClothPrimitives.cu:853 / :700, launch PxgNarrowphaseCore.cpp:5853 /
+//   :5776): (PxU32 numWorkItems, const PxgContactManagerInput* cmInputs,
+//   const PxsCachedTransform* transformCache, const PxReal* contactDistance,
+//   const PxReal* restDistance, const PxgShape* gpuShapes,
+//   const PxgFEMCloth* femClothes, const PxNodeIndex* shapeToRigidRemapTable,
+//   PxgRigidFilterPair* filterPairs, PxU32 nbFilterPairs, PxgFEMContactWriter writer).
+//   The writer is passed BY VALUE (nine device pointers + PxU32 maxNumContacts +
+//   4B tail pad = 80 bytes, sizeof(PxgFEMContactWriter)).  Eight device pointers +
+//   PxU32 nbFilterPairs (@72) + the 80-byte writer (@80) -> 160-byte blob.
+static const uint8_t kClothVertContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80 };
+
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
@@ -625,6 +647,10 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_solveRigidClothAttachmentLaunch", kClothRigidAttachSolve, uint32_t(sizeof(kClothRigidAttachSolve)) },
     { "cloth_solveRigidClothAttachmentTGSLaunch", kClothRigidAttachSolve, uint32_t(sizeof(kClothRigidAttachSolve)) },
     { "cloth_applyExternalDeltasLaunch", kClothApplyExtDeltas, uint32_t(sizeof(kClothApplyExtDeltas)) },
+    // gpunarrowphase FEMCloth-vs-primitive contact GENERATION (P7.1 tranche 4a BDA)
+    { "cloth_midphaseGenerateVertexPairsLaunch", kClothMidphaseVertPairs, uint32_t(sizeof(kClothMidphaseVertPairs)) },
+    { "cloth_planeVertContactGenLaunch", kClothVertContactGen, uint32_t(sizeof(kClothVertContactGen)) },
+    { "cloth_SphereVertexContactGenLaunch", kClothVertContactGen, uint32_t(sizeof(kClothVertContactGen)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },
