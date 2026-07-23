@@ -46,7 +46,8 @@
 // no-CUDA-toolkit stand-in for the __device__/__align__ qualifiers the engine
 // descriptor header decorates its inline members with; must precede PxgFEMCloth.h.
 #include "host_defines.h"
-#include "PxgFEMCloth.h"   // real engine per-cloth descriptor
+#include "PxgFEMCloth.h"                     // real engine per-cloth descriptor
+#include "PxsDeformableSurfaceMaterialCore.h" // real engine surface material data
 
 #include <cstdint>
 #include <cstddef>
@@ -121,6 +122,217 @@ static PxgFEMCloth makeZeroDesc()
     return c;
 }
 
+// P7.1: the in-plane membrane energy-solve push-constant blob, byte-identical to
+// femClothSolveBda.slang's SolveNonSharedTriParams (ABI row {8,8,8,4,4,1}).
+struct SolvePush
+{
+    uint64_t femCloths, activeFEMCloths, materials;
+    float dt;
+    uint32_t partitionId, isTGSWord, pad36;
+};
+static_assert(sizeof(SolvePush) == 40, "SolveNonSharedTri push-constant blob must be 40 bytes");
+
+// ---------------------------------------------------------------------------
+// P7.1: bit-exact CPU reference for the in-plane membrane energy solve.  The
+// membrane leaf (refMembrane) + its 2x2 constraints (extractRotation2D /
+// arapConstraint2D / areaConstraint2D) are lifted VERBATIM from the Phase-1-
+// verified testNpClothSharedEnergy.cpp — which already pins them bit-exact vs the
+// SAME Slang membraneSolve this tranche imports (pxgSlangClothMembrane, a byte-
+// for-byte copy of npClothSharedEnergy's).  Kept in a private namespace so it
+// cannot collide with the file-scope helpers / F4.
+// ---------------------------------------------------------------------------
+namespace p71ref
+{
+struct F4 { float x, y, z, w; };
+struct V2 { float x, y; };
+struct V3 { float x, y, z; };
+const float FEMCLOTH_THRESHOLD = 1.0e-14f;
+
+static V2 add2(V2 a, V2 b) { return V2{ a.x + b.x, a.y + b.y }; }
+static V2 sub2(V2 a, V2 b) { return V2{ a.x - b.x, a.y - b.y }; }
+static V2 muls2(V2 a, float s) { return V2{ a.x * s, a.y * s }; }
+static V2 neg2(V2 a) { return V2{ -a.x, -a.y }; }
+static float dot2(V2 a, V2 b) { return a.x * b.x + a.y * b.y; }
+static float magSq2(V2 v) { return v.x * v.x + v.y * v.y; }
+static V3 add3(V3 a, V3 b) { return V3{ a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V3 sub3(V3 a, V3 b) { return V3{ a.x - b.x, a.y - b.y, a.z - b.z }; }
+static V3 muls3(V3 a, float s) { return V3{ a.x * s, a.y * s, a.z * s }; }
+static float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static V3 cross3(V3 a, V3 b)
+{
+    return V3{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+}
+static float magSq3(V3 v) { return v.x * v.x + v.y * v.y + v.z * v.z; }
+
+static V3 getNormalized3(V3 v)
+{
+    const float m = magSq3(v);
+    return m > 0.f ? muls3(v, 1.0f / std::sqrt(m)) : V3{ 0.f, 0.f, 0.f };
+}
+
+static void extractRotation2D(V2& r0, V2& r1, V2 f0, V2 f1)
+{
+    const float s2x = dot2(f0, f0), s2y = dot2(f1, f1), s2z = dot2(f0, f1);
+    const float det = s2x * s2y - s2z * s2z;
+    if (det < FEMCLOTH_THRESHOLD) { r0 = V2{ 1.f, 0.f }; r1 = V2{ 0.f, 1.f }; return; }
+
+    const float s0 = std::sqrt(det);
+    const float t = std::sqrt(s2x + s2y + 2.0f * s0);
+    if (t < FEMCLOTH_THRESHOLD) { r0 = V2{ 1.f, 0.f }; r1 = V2{ 0.f, 1.f }; return; }
+    const float tInv = 1.0f / t;
+
+    const float Sx = (s2x + s0) * tInv, Sy = (s2y + s0) * tInv, Sz = s2z * tInv;
+
+    const float sDet = Sx * Sy - Sz * Sz;
+    if (sDet < FEMCLOTH_THRESHOLD) { r0 = V2{ 1.f, 0.f }; r1 = V2{ 0.f, 1.f }; return; }
+    const float sDetInv = 1.0f / sDet;
+
+    const float ix = Sy * sDetInv, iy = Sx * sDetInv, iz = (-Sz) * sDetInv;
+
+    r0 = add2(muls2(f0, ix), muls2(f1, iz));
+    r1 = add2(muls2(f0, iz), muls2(f1, iy));
+}
+
+static float queryDeltaLambda3(float C, V2 g0, V2 g1, V2 g2, float alphaTilde, float lambda,
+                               float m0, float m1, float m2)
+{
+    const float denom = (m0 * magSq2(g0) + m1 * magSq2(g1) + m2 * magSq2(g2)) + alphaTilde;
+    if (denom < FEMCLOTH_THRESHOLD)
+        return 0.0f;
+    return (-C - alphaTilde * lambda) / denom;
+}
+
+static void arapConstraint2D(float& lambda, V2& dx0, V2& dx1, V2& dx2, float alphaTilde,
+                             const F4& QInv, V2 x01, V2 x02, float m0, float m1, float m2)
+{
+    const V2 f0 = add2(muls2(x01, QInv.x), muls2(x02, QInv.y));
+    const V2 f1 = add2(muls2(x01, QInv.z), muls2(x02, QInv.w));
+
+    V2 r0, r1;
+    extractRotation2D(r0, r1, f0, f1);
+
+    const V2 FMinusR0 = sub2(f0, r0);
+    const V2 FMinusR1 = sub2(f1, r1);
+
+    const float C = std::sqrt(dot2(FMinusR0, FMinusR0) + dot2(FMinusR1, FMinusR1));
+
+    if (C > FEMCLOTH_THRESHOLD)
+    {
+        const float CInv = 1.0f / C;
+
+        const V2 pC_pF0 = muls2(FMinusR0, CInv);
+        const V2 pC_pF1 = muls2(FMinusR1, CInv);
+
+        const V2 grad1 = add2(muls2(pC_pF0, QInv.x), muls2(pC_pF1, QInv.z));
+        const V2 grad2 = add2(muls2(pC_pF0, QInv.y), muls2(pC_pF1, QInv.w));
+        const V2 grad0 = sub2(neg2(grad1), grad2);
+
+        const float deltaLambda = queryDeltaLambda3(C, grad0, grad1, grad2, alphaTilde, lambda, m0, m1, m2);
+        lambda = lambda + deltaLambda;
+
+        dx0 = add2(dx0, muls2(grad0, m0 * deltaLambda));
+        dx1 = add2(dx1, muls2(grad1, m1 * deltaLambda));
+        dx2 = add2(dx2, muls2(grad2, m2 * deltaLambda));
+    }
+}
+
+static void areaConstraint2D(float& lambda, V2& dx0, V2& dx1, V2& dx2, float alphaTilde,
+                             V2 x01, V2 x02, float m0, float m1, float m2, float area)
+{
+    const float x01CrossX02 = x01.x * x02.y - x01.y * x02.x;
+    const float undeformedAreaInv = 1.0f / area;
+
+    const float C = 0.5f * x01CrossX02 * undeformedAreaInv - 1.0f;
+
+    const V2 grad1 = V2{ 0.5f * undeformedAreaInv * x02.y, -(0.5f * undeformedAreaInv * x02.x) };
+    const V2 grad2 = V2{ -(0.5f * undeformedAreaInv * x01.y), 0.5f * undeformedAreaInv * x01.x };
+    const V2 grad0 = sub2(neg2(grad1), grad2);
+
+    const float deltaLambda = queryDeltaLambda3(C, grad0, grad1, grad2, alphaTilde, lambda, m0, m1, m2);
+    lambda = lambda + deltaLambda;
+
+    dx0 = add2(dx0, muls2(grad0, m0 * deltaLambda));
+    dx1 = add2(dx1, muls2(grad1, m1 * deltaLambda));
+    dx2 = add2(dx2, muls2(grad2, m2 * deltaLambda));
+}
+
+// membraneEnergySolvePerTriangle (FEMClothUtil.cuh L436-527).
+static void refMembrane(F4& xx0, F4& xx1, F4& xx2, float dt, float youngs, float poissons,
+                        float thickness, const F4& QInv, float vs0, float vs1, float vs2,
+                        float& slotX, float& slotY, bool isTGS)
+{
+    if (youngs < FEMCLOTH_THRESHOLD)
+        return;
+
+    V3 x0 = V3{ xx0.x, xx0.y, xx0.z };
+    V3 x1 = V3{ xx1.x, xx1.y, xx1.z };
+    V3 x2 = V3{ xx2.x, xx2.y, xx2.z };
+
+    const V3 x01 = sub3(x1, x0);
+    const V3 x02 = sub3(x2, x0);
+
+    const V3 axis0 = getNormalized3(x01);
+    const V3 normal = cross3(x01, x02);
+    const V3 axis1 = getNormalized3(cross3(normal, axis0));
+
+    const float dt2 = dt * dt;
+
+    const float det = QInv.x * QInv.w - QInv.y * QInv.z;
+    const float area = 1.0f / (2.0f * det);
+    const float volume = area * thickness;
+
+    V2 dx0 = V2{ 0.f, 0.f }, dx1 = V2{ 0.f, 0.f }, dx2 = V2{ 0.f, 0.f };
+    float lambda0 = 0.f, lambda1 = 0.f;
+
+    if (!isTGS)
+    {
+        lambda0 = slotX;
+        lambda1 = slotY;
+    }
+
+    const float lamL = youngs * poissons / ((1.0f + poissons) * (1.0f - 2.0f * poissons));
+    const float mu = youngs / (2.0f * (1.0f + poissons));
+
+    V2 xp01 = V2{ dot3(axis0, x01), dot3(axis1, x01) };
+    V2 xp02 = V2{ dot3(axis0, x02), dot3(axis1, x02) };
+
+    const float alphaTilde0 = 1.0f / (2.0f * mu * volume * dt2);
+
+    arapConstraint2D(lambda0, dx0, dx1, dx2, alphaTilde0, QInv, xp01, xp02,
+                     vs0 * xx0.w, vs1 * xx1.w, vs2 * xx2.w);
+
+    if (poissons > FEMCLOTH_THRESHOLD)
+    {
+        float alphaTilde1 = 0.0f;
+
+        if (poissons < 0.5f - FEMCLOTH_THRESHOLD)
+        {
+            alphaTilde1 = 1.0f / (lamL * volume * dt2);
+        }
+
+        xp01 = add2(xp01, sub2(dx1, dx0));
+        xp02 = add2(xp02, sub2(dx2, dx0));
+
+        areaConstraint2D(lambda1, dx0, dx1, dx2, alphaTilde1, xp01, xp02,
+                         vs0 * xx0.w, vs1 * xx1.w, vs2 * xx2.w, area);
+    }
+
+    x0 = add3(x0, add3(muls3(axis0, dx0.x), muls3(axis1, dx0.y)));
+    x1 = add3(x1, add3(muls3(axis0, dx1.x), muls3(axis1, dx1.y)));
+    x2 = add3(x2, add3(muls3(axis0, dx2.x), muls3(axis1, dx2.y)));
+
+    if (!isTGS)
+    {
+        slotX = lambda0;
+        slotY = lambda1;
+    }
+
+    xx0.x = x0.x; xx0.y = x0.y; xx0.z = x0.z;
+    xx1.x = x1.x; xx1.y = x1.y; xx1.z = x1.z;
+    xx2.x = x2.x; xx2.y = x2.y; xx2.z = x2.z;
+}
+} // namespace p71ref
+
 // ---------------------------------------------------------------------------
 // Descriptor mirror layout proof — pins pxgSlangFEMClothDesc against the real
 // engine PxgFEMCloth (offsets the three kernels dereference).  sizeof == 400.
@@ -153,8 +365,30 @@ PXG_TEST(femClothSimDescLayout)
     PXG_CHECK(offsetof(PxgFEMCloth, mIsActive) == 380);
     PXG_CHECK(offsetof(PxgFEMCloth, mRestDistance) == 384);
 
+    // P7.1: the in-plane membrane solve (cloth_solveNonSharedTriangleEnergy*) reads
+    // these fields through the pxgSlangFEMClothDesc mirror — pin their offsets.
+    PXG_CHECK(offsetof(PxgFEMCloth, mMaterialIndices) == 56);                                // PxU16*
+    PXG_CHECK(offsetof(PxgFEMCloth, mOrderedNonSharedTriangleVertexIndices_triIndex) == 80); // uint4*
+    PXG_CHECK(offsetof(PxgFEMCloth, mOrderedNonSharedTriangleLambdas) == 96);                // float2*
+    PXG_CHECK(offsetof(PxgFEMCloth, mOrderedNonSharedTriangleRestPoseInv) == 104);           // float4* (QInv)
+    PXG_CHECK(offsetof(PxgFEMCloth, mNonSharedTriAccumulatedPartitionsCP) == 192);           // PxU32*
+    PXG_CHECK(offsetof(PxgFEMCloth, mNbNonSharedTriPartitions) == 344);                      // PxU32
+
     // the byte-packed flag word (@376): low byte == mActorFlags (eDISABLE_GRAVITY test)
     PXG_CHECK(PxActorFlag::eDISABLE_GRAVITY == (1 << 1));
+
+    // P7.1: PxsDeformableSurfaceMaterialGpu mirror (Slang) vs the real engine
+    // PxsDeformableSurfaceMaterialData (32-byte array element read per triangle).
+    PXG_CHECK_MSG(sizeof(PxsDeformableSurfaceMaterialData) == 32,
+                  "PxsDeformableSurfaceMaterialData sizeof == 32 (got %zu)",
+                  sizeof(PxsDeformableSurfaceMaterialData));
+    PXG_CHECK(offsetof(PxsDeformableSurfaceMaterialData, youngs) == 0);
+    PXG_CHECK(offsetof(PxsDeformableSurfaceMaterialData, poissons) == 4);
+    PXG_CHECK(offsetof(PxsDeformableSurfaceMaterialData, dynamicFriction) == 8);
+    PXG_CHECK(offsetof(PxsDeformableSurfaceMaterialData, thickness) == 12);
+    PXG_CHECK(offsetof(PxsDeformableSurfaceMaterialData, bendingStiffness) == 16);
+    PXG_CHECK(offsetof(PxsDeformableSurfaceMaterialData, elasticityDamping) == 20);
+    PXG_CHECK(offsetof(PxsDeformableSurfaceMaterialData, bendingDamping) == 24);
 }
 
 // ---------------------------------------------------------------------------
@@ -510,5 +744,155 @@ PXG_TEST(femClothSimSleeping)
     dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
     dev->destroyBuffer(bWake.h); dev->destroyBuffer(bMask.h);
 }
+
+// ---------------------------------------------------------------------------
+// P7.1: cloth_solveNonSharedTriangleEnergyLaunch — the in-plane membrane energy
+// solve.  One STRETCHED triangle (edge x01 pulled to 1.5x rest) in a single
+// non-shared partition [0,1); dispatch, then bit-exact compare positions /
+// velocities / accumulated-delta / lambdas vs a CPU transcription of
+// updateNonSharedTriangle (FEMCloth.cu:610) driving the verified refMembrane.
+// ---------------------------------------------------------------------------
+static void runSolveNonShared(bool isTGS)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t N = 3;                 // one triangle
+    const float dt = 1.0f / 60.0f;
+    const float invDt = 1.0f / dt;
+
+    struct F2 { float x, y; };
+    struct U4 { uint32_t x, y, z, w; };
+
+    // Stretched current positions (rest edges are unit; x01 pulled to 1.5).
+    std::vector<F4> positions = {
+        { 0.0f, 0.0f, 0.0f, 1.0f },
+        { 1.5f, 0.0f, 0.0f, 1.0f },
+        { 0.0f, 1.0f, 0.0f, 1.0f },
+    };
+    std::vector<F4> vels = {
+        { 0.10f, -0.20f, 0.05f, 0.0f },
+        { -0.03f, 0.07f, -0.11f, 0.0f },
+        { 0.02f, -0.09f, 0.13f, 0.0f },
+    };
+    std::vector<F4> accum = {
+        { 0.30f, -0.10f, 0.20f, 0.0f },
+        { -0.40f, 0.50f, -0.60f, 0.0f },
+        { 0.70f, -0.80f, 0.90f, 0.0f },
+    };
+    // Rest-pose inverse: Q = [[1,0],[0,1]] -> QInv = (1,0,0,1); det=1, area=0.5.
+    std::vector<F4> qinv = { { 1.0f, 0.0f, 0.0f, 1.0f } };
+    std::vector<F2> lambdas = { { 0.0f, 0.0f } };
+    std::vector<U4> triVtx = { { 0u, 1u, 2u, 0u } };   // verts (0,1,2), triIndex 0
+    std::vector<uint32_t> matIdx = { 0u };              // mMaterialIndices[0] = 0
+    std::vector<uint32_t> partCP = { 1u };              // partition 0 -> [0,1)
+
+    PxsDeformableSurfaceMaterialData mat;
+    std::memset(&mat, 0, sizeof(mat));
+    mat.youngs = 1.0e5f;
+    mat.poissons = 0.3f;
+    mat.thickness = 0.01f;
+    std::vector<PxsDeformableSurfaceMaterialData> mats = { mat };
+
+    DevBuf bPos = makeDev(dev, positions);
+    DevBuf bVel = makeDev(dev, vels);
+    DevBuf bAcc = makeDev(dev, accum);
+    DevBuf bQ = makeDev(dev, qinv);
+    DevBuf bLam = makeDev(dev, lambdas);
+    DevBuf bTri = makeDev(dev, triVtx);
+    DevBuf bMatIdx = makeDev(dev, matIdx);
+    DevBuf bPart = makeDev(dev, partCP);
+    DevBuf bMat = makeDev(dev, mats);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
+    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
+    c.mMaterialIndices = reinterpret_cast<decltype(c.mMaterialIndices)>(size_t(bMatIdx.addr));
+    c.mOrderedNonSharedTriangleVertexIndices_triIndex =
+        reinterpret_cast<decltype(c.mOrderedNonSharedTriangleVertexIndices_triIndex)>(size_t(bTri.addr));
+    c.mOrderedNonSharedTriangleLambdas =
+        reinterpret_cast<decltype(c.mOrderedNonSharedTriangleLambdas)>(size_t(bLam.addr));
+    c.mOrderedNonSharedTriangleRestPoseInv =
+        reinterpret_cast<decltype(c.mOrderedNonSharedTriangleRestPoseInv)>(size_t(bQ.addr));
+    c.mNonSharedTriAccumulatedPartitionsCP =
+        reinterpret_cast<decltype(c.mNonSharedTriAccumulatedPartitionsCP)>(size_t(bPart.addr));
+    c.mNbNonSharedTriPartitions = 1u;
+    c.mNbVerts = N;
+
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    SolvePush push = {};
+    push.femCloths = bDesc.addr;
+    push.activeFEMCloths = bActive.addr;
+    push.materials = bMat.addr;
+    push.dt = dt;
+    push.partitionId = 0u;
+    push.isTGSWord = isTGS ? 1u : 0u;
+
+    Kernel k("femClothSolveBda.spv", "cloth_solveNonSharedTriangleEnergyLaunch", {}, sizeof(SolvePush));
+    k.dispatch(/*gridX numBlocks*/ 1u, {}, push, /*gridY nbActive*/ 1u, /*gridZ*/ 1u);
+    dev->flush();
+
+    // CPU reference: updateNonSharedTriangle (FEMCloth.cu:610) wiring + refMembrane.
+    p71ref::F4 rx0 = { positions[0].x, positions[0].y, positions[0].z, positions[0].w };
+    p71ref::F4 rx1 = { positions[1].x, positions[1].y, positions[1].z, positions[1].w };
+    p71ref::F4 rx2 = { positions[2].x, positions[2].y, positions[2].z, positions[2].w };
+    const p71ref::F4 rQ = { qinv[0].x, qinv[0].y, qinv[0].z, qinv[0].w };
+    float slotX = isTGS ? 0.0f : lambdas[0].x;
+    float slotY = isTGS ? 0.0f : lambdas[0].y;
+
+    p71ref::refMembrane(rx0, rx1, rx2, dt, mat.youngs, mat.poissons, mat.thickness, rQ,
+                        1.0f, 1.0f, 1.0f, slotX, slotY, isTGS);
+
+    std::vector<F4> refPos = positions, refVel = vels, refAcc = accum;
+    const p71ref::F4 nx[3] = { rx0, rx1, rx2 };
+    const F4 xcp[3] = { positions[0], positions[1], positions[2] };
+    for (uint32_t v = 0; v < 3; ++v)
+    {
+        const F4 newPos = { nx[v].x, nx[v].y, nx[v].z, xcp[v].w }; // membrane preserves .w
+        const F4 d = { newPos.x - xcp[v].x, newPos.y - xcp[v].y, newPos.z - xcp[v].z, newPos.w - xcp[v].w };
+        refVel[v] = { vels[v].x + d.x * invDt, vels[v].y + d.y * invDt, vels[v].z + d.z * invDt, vels[v].w + d.w * invDt };
+        refAcc[v] = { accum[v].x + d.x, accum[v].y + d.y, accum[v].z + d.z, accum[v].w + d.w };
+        refPos[v] = newPos;
+    }
+    const F2 refLam = { slotX, slotY };
+
+    const auto gPos = downloadBuffer<F4>(dev, bPos.h, N);
+    const auto gVel = downloadBuffer<F4>(dev, bVel.h, N);
+    const auto gAcc = downloadBuffer<F4>(dev, bAcc.h, N);
+    const auto gLam = downloadBuffer<F2>(dev, bLam.h, 1);
+
+    // The solve must actually move the stretched vertex (teeth: not a no-op).
+    PXG_CHECK_MSG(f2u(gPos[1].x) != f2u(positions[1].x),
+                  "energy solve should correct the stretched triangle (x1.x moved)");
+
+    size_t mm = 0;
+    auto cmp4 = [&](const char* nm, uint32_t i, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm; std::printf("  %s[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm, i,
+                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
+    };
+    for (uint32_t v = 0; v < N; ++v)
+    {
+        cmp4("pos", v, refPos[v], gPos[v]);
+        cmp4("vel", v, refVel[v], gVel[v]);
+        cmp4("acc", v, refAcc[v], gAcc[v]);
+    }
+    if (!isTGS && (f2u(refLam.x) != f2u(gLam[0].x) || f2u(refLam.y) != f2u(gLam[0].y)))
+    { ++mm; std::printf("  lambda MM: ref(%g,%g) got(%g,%g)\n", refLam.x, refLam.y, gLam[0].x, gLam[0].y); }
+
+    PXG_CHECK_MSG(mm == 0, "cloth_solveNonSharedTriangleEnergy bit-exact vs CPU (%zu mismatches, isTGS=%d)",
+                  mm, int(isTGS));
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h);
+    dev->destroyBuffer(bQ.h); dev->destroyBuffer(bLam.h); dev->destroyBuffer(bTri.h);
+    dev->destroyBuffer(bMatIdx.h); dev->destroyBuffer(bPart.h); dev->destroyBuffer(bMat.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+PXG_TEST(femClothSimSolveNonSharedPGS) { runSolveNonShared(/*isTGS*/ false); }
+PXG_TEST(femClothSimSolveNonSharedTGS) { runSolveNonShared(/*isTGS*/ true); }
 
 } // namespace

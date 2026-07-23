@@ -188,6 +188,55 @@ profile — + slangc `2026.12.2`, both provisioned from scratch):** with `PXG_SH
 rigid regression 8×2 = **16/16**. P7.0's code was always good; only the invocation was missing
 the shader path.
 
+## P7.1 tranche 1 — the cloth IN-PLANE MEMBRANE energy solve on the BDA engine ABI
+
+The first step of the P7.0→draping arc (the analog of the particle P6.2/P6.3 tranches): the
+per-triangle in-plane (membrane / ARAP + area) energy solve — the internal force that makes the
+cloth resist stretching — is brought onto the BDA engine ABI. Two kernels;
+`PXG_SLANG_KERNEL_MAPPED` 183 → **185**, ported line-for-line from `FEMCloth.cu`:
+- `cloth_solveNonSharedTriangleEnergyLaunch` (`FEMCloth.cu:669`, ABI `{8,8,8,4,4,1}`=40B, launch
+  `PxgFEMClothCore.cpp:1556`) — one large partition per launch: over the graph-colored non-shared
+  triangle partition `[accumCP[p-1], accumCP[p])`, solve each triangle's in-plane energy and fold
+  the position change back into velocity + accumulated delta (`updateNonSharedTriangle`, `:610`).
+- `cloth_solveNonSharedTriangleEnergyClusterLaunch` (`:719`) — the small-partition twin: loops the
+  remaining partitions in one launch with a groupshared barrier between them (barrier in UNIFORM
+  control flow — `nbPartitions` is uniform — so llvmpipe-safe).
+
+New shader `femClothSolveBda.slang`; the in-plane math lives in new module
+`pxgSlangClothMembrane.slang` — a VERBATIM lift (code byte-for-byte identical, verified by diff) of
+the Phase-1 `npClothSharedEnergy` membrane leaf (`membraneSolve` = `membraneEnergySolvePerTriangle`
+FEMClothUtil.cuh:436-527, composing extractRotation2D / arapConstraint2D / areaConstraint2D + inline
+Lamé params), so the engine BDA solve and the Phase-1 verification shaders share ONE bit-exact copy;
+NoContraction-stamped (`PXG_NOCONTRACT_SHADERS`) like its Phase-1 twin. New descriptor: byte-exact
+`PxsDeformableSurfaceMaterialGpu` mirror of `PxsDeformableSurfaceMaterialData` (sizeof 32); the
+PxgFEMCloth fields the solve reads (`mMaterialIndices`@56,
+`mOrderedNonSharedTriangleVertexIndices_triIndex`@80, `mOrderedNonSharedTriangleLambdas`@96,
+`...RestPoseInv`@104 = QInv, `mNonSharedTriAccumulatedPartitionsCP`@192,
+`mNbNonSharedTriPartitions`@344) pinned with offsetof static_asserts in the test TU.
+
+**Correctness is proven by the unit test, not the scene** (the P6.2/6.3 precedent): the P7.0
+5×5-grid cloth has **0 non-shared-triangle partitions** — its triangles route through the
+*shared/pair* energy path (`cloth_solveTrianglePairEnergyLaunch`, still unmapped — the next
+tranche), so `solveNonSharedTriangles` launches nothing and the free-fall is **byte-unchanged**
+(mean y 5.0000 → 0.01325, monotone, exit 0). New unit test `gpuslang.femClothSim` +2 cases
+(`SolveNonSharedPGS`/`TGS`): one triangle STRETCHED to 1.5× rest edge in a single partition,
+dispatched, then `positions`/`velocities`/`accumulatedDelta`/`lambdas` compared **bit-exact** vs a
+CPU transcription of `updateNonSharedTriangle` driving the Phase-1-verified `refMembrane` —
+mutation-checked (a 1-line invDt perturbation in the shader makes it fail on the velocity
+writeback, ref 4.07 vs got 6.05). Full suite **673/673 both memory modes** (the femClothSim entry
+now runs 7 cases); rigid regression 8×2 = **16/16** (the manifest gains only two previously-`nullptr`
+cloth rows — hand-edited, NOT regenerated — so every rigid/particle dispatch is byte-unaffected).
+
+Deviations (flagged, all behavior-preserving): the CUDA `USE_BLOCK_COPY` groupshared descriptor copy
+→ direct `Ptr<>` reads (P7.0 precedent); `mMaterialIndices[triIdx]` PxU16 load → 32-bit word read +
+half extraction (llvmpipe has no 16-bit storage); the per-triangle lambda array I/O is hoisted OUT of
+`membraneSolve` into `updateNonSharedTriangle` (the verified npClothSharedEnergy float2-slot pattern —
+same read-at-start / write-at-end, PGS only). **Recovery note:** this tranche's shader + scaffolding
+were drafted by a background worktree agent that a container suspend interrupted before it built or
+tested; the code survived on disk and was salvaged — the math verified byte-identical to the Phase-1
+module by diff, the wiring audited against the `.cu`, and the functional bit-exact unit test authored
+to close it.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

@@ -51,6 +51,25 @@ module pxgSlangFEMClothDesc;
 // byte of mFlagsWord (mActorFlags) in the pre-integrate gravity predict.
 public static const uint PXG_FEMCLOTH_ACTORFLAG_DISABLE_GRAVITY = 2u;
 
+// P7.1: byte-exact mirror of PxsDeformableSurfaceMaterialData
+// (PxsDeformableSurfaceMaterialCore.h:38, PX_ALIGN(16), sizeof == 32).  The
+// per-triangle in-plane energy solve reads this array through a device pointer
+// (mMaterialIndices[triIndex] -> clothMaterials[globalMaterialIndex]); the eight
+// PxReal fields lay out at their natural f32 offsets and 32 is already a multiple
+// of 16, so the Slang array stride (32) equals the C++ one.  Offsets are pinned
+// with g++ offsetof static_asserts in testFemClothSim.cpp.
+public struct PxsDeformableSurfaceMaterialGpu
+{
+    public float youngs;             // @0
+    public float poissons;           // @4
+    public float dynamicFriction;    // @8
+    public float thickness;          // @12
+    public float bendingStiffness;   // @16
+    public float elasticityDamping;  // @20
+    public float bendingDamping;     // @24
+    public float padding0;           // @28  -> 32
+}
+
 // Byte-exact mirror of class PxgFEMCloth (PxgFEMCloth.h:69).  Every pointer is
 // 8 bytes; the block is a run of device pointers (0..287), then the PxReal/PxU32
 // scalar tail (288..399).  sizeof = 400.

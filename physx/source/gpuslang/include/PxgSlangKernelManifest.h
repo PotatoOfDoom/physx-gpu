@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 183;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 185;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -412,8 +412,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_rigidContactPrepareLaunch", nullptr, nullptr },  // CLOTH_RIGID_CONTACTPREPARE (unmapped)
     { "cloth_clothContactPrepareLaunch", nullptr, nullptr },  // CLOTH_CLOTH_CONTACTPREPARE (unmapped)
     { "cloth_particleContactPrepareLaunch", nullptr, nullptr },  // CLOTH_PARTICLE_CONTACTPREPARE (unmapped)
-    { "cloth_solveNonSharedTriangleEnergyLaunch", nullptr, nullptr },  // CLOTH_SIM_NONSHARED_TRIANGLE_ENERGY_SOLVE (unmapped)
-    { "cloth_solveNonSharedTriangleEnergyClusterLaunch", nullptr, nullptr },  // CLOTH_SIM_NONSHARED_TRIANGLE_ENERGY_SOLVE_CLUSTER (unmapped)
+    { "cloth_solveNonSharedTriangleEnergyLaunch", "femClothSolveBda.spv", "cloth_solveNonSharedTriangleEnergyLaunch" },  // CLOTH_SIM_NONSHARED_TRIANGLE_ENERGY_SOLVE (P7.1 BDA port: cloth in-plane membrane energy solve)
+    { "cloth_solveNonSharedTriangleEnergyClusterLaunch", "femClothSolveBda.spv", "cloth_solveNonSharedTriangleEnergyClusterLaunch" },  // CLOTH_SIM_NONSHARED_TRIANGLE_ENERGY_SOLVE_CLUSTER (P7.1 BDA port: cluster twin)
     { "cloth_solveTrianglePairEnergyLaunch", nullptr, nullptr },  // CLOTH_SIM_TRIANGLEPAIR_ENERGY_SOLVE (unmapped)
     { "cloth_solveTrianglePairEnergyClusterLaunch", nullptr, nullptr },  // CLOTH_SIM_TRIANGLEPAIR_ENERGY_SOLVE_CLUSTER (unmapped)
     { "cloth_averageTrianglePairVertsLaunch", nullptr, nullptr },  // CLOTH_SIM_TRIANGLEPAIR_AVERAGE_VERTS (unmapped)

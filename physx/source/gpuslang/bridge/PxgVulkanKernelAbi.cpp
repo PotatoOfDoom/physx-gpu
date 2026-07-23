@@ -255,6 +255,16 @@ static const uint8_t kClothFinalizeVel[] = { 8, 8, 4, 4, 1 };
 //     PxU32* stateChangedMask) -> 48-byte blob (activeId 8-aligned after the PxU32).
 static const uint8_t kClothSleeping[] = { 8, 4, 8, 4, 4, 8, 8 };
 
+// gpusimulationcontroller FEMCloth.cu (P7.1 FEMCloth in-plane membrane energy solve):
+//   cloth_solveNonSharedTriangleEnergyLaunch(PxgFEMCloth* femCloths, const PxU32*
+//     activeFEMCloths, const PxsDeformableSurfaceMaterialData* clothMaterials,
+//     PxReal dt, PxU32 partitionId, bool isTGS)  -- launch site
+//     PxgFEMClothCore.cpp:1556; the cluster twin
+//     cloth_solveNonSharedTriangleEnergyClusterLaunch (:1573) shares the pack
+//     (clusterStartId in place of partitionId).  Three device pointers + PxReal +
+//     PxU32 + bool -> natural-alignment blob = 40 bytes.
+static const uint8_t kClothSolveTriEnergy[] = { 8, 8, 8, 4, 4, 1 };
+
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
@@ -561,6 +571,9 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_preIntegrateLaunch", kClothPreIntegrate, uint32_t(sizeof(kClothPreIntegrate)) },
     { "cloth_finalizeVelocitiesLaunch", kClothFinalizeVel, uint32_t(sizeof(kClothFinalizeVel)) },
     { "cloth_sleeping", kClothSleeping, uint32_t(sizeof(kClothSleeping)) },
+    // gpusimulationcontroller FEMCloth in-plane membrane energy solve (P7.1 BDA)
+    { "cloth_solveNonSharedTriangleEnergyLaunch", kClothSolveTriEnergy, uint32_t(sizeof(kClothSolveTriEnergy)) },
+    { "cloth_solveNonSharedTriangleEnergyClusterLaunch", kClothSolveTriEnergy, uint32_t(sizeof(kClothSolveTriEnergy)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },
