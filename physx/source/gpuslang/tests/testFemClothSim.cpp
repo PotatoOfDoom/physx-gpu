@@ -3185,4 +3185,425 @@ static void runRigidContact(bool isTGS)
 PXG_TEST(femClothSimRigidContactPGS) { runRigidContact(/*isTGS*/ false); }
 PXG_TEST(femClothSimRigidContactTGS) { runRigidContact(/*isTGS*/ true); }
 
+// ===========================================================================
+// P7.2 tranche 1: cloth SELF-collision midphase + contact GENERATION.
+//   femClothSelfCollisionBda.spv:
+//     cloth_selfCollisionMidphaseVTLaunch  (femClothClothMidPhase.cu:1163)
+//     cloth_selfCollisionMidphaseEELaunch  (femClothClothMidPhase.cu:1196)
+// Both kernels walk the cloth's own BV32 triangle BVH (one 32-thread group per
+// query) and append a PxgFemFemContactInfo for every penetrating vertex-triangle
+// (VT) / crossing edge-edge (EE) pair.  The midphase emits ONLY the integer contact
+// record (pairInd0 / pairInd1 / auxInd — the pair-type + validity bits and, for EE,
+// the local edge indices); the normal / distance / barycentric are computed later in
+// the (out-of-scope) self-contact prepare.  FULLY bit-exact: the VT/EE closest-point
+// tests are pure mul/add/sub/div/sqrt/min/max — no transcendental, no tolerance seam.
+// Checked bit-exact vs a CPU transcription of the .cu math in BOTH memory modes.
+// ===========================================================================
+
+// PxgFemFemContactInfo host mirror (PxgFEMCore.h:51, PX_ALIGN(16), 16 bytes).
+// PxgFEMCore.h is not test-includable (pulls the CUDA buffer stack), so the layout
+// the shader writes at index*16 is mirrored locally and pinned self-consistently.
+struct FemFemContactInfoHost
+{
+    uint64_t pairInd0;   // @0
+    uint32_t pairInd1;   // @8
+    uint32_t auxInd;     // @12 -> 16
+};
+static_assert(sizeof(FemFemContactInfoHost) == 16, "PxgFemFemContactInfo mirror == 16B");
+static_assert(offsetof(FemFemContactInfoHost, pairInd0) == 0, "pairInd0 @0");
+static_assert(offsetof(FemFemContactInfoHost, pairInd1) == 8, "pairInd1 @8");
+static_assert(offsetof(FemFemContactInfoHost, auxInd) == 12, "auxInd @12");
+
+// self-collision push blob — byte-identical to SelfCollisionParams
+// (ABI row {4,8,8,8,8,4,8,8,8} -> 72 bytes).
+struct SelfCollisionPush
+{
+    uint32_t maxContacts, pad4;
+    uint64_t activeClothes, contactDistance, clothes, clothClothPairs;
+    uint32_t numClothClothPairs, pad44;
+    uint64_t updateContactPairs, outContactInfo, totalContactCount;
+};
+static_assert(sizeof(SelfCollisionPush) == 72, "self-collision push blob must be 72 bytes");
+static_assert(offsetof(SelfCollisionPush, updateContactPairs) == 48, "updateContactPairs @48");
+static_assert(offsetof(SelfCollisionPush, totalContactCount) == 64, "totalContactCount @64");
+
+// A four-uint triangle-index record (uint4: x/y/z vertex ids, w = edge authorship).
+struct TriIdx4 { uint32_t x, y, z, w; };
+
+// PxgFemFemContactInfo::auxInd bit packing (PxgFEMCore.h:69-82) — the exact constants
+// the shader uses, pinned here so the CPU reference builds the same word.
+static const uint32_t AUX_IND0_BITS_H = 14u;
+static const uint32_t AUX_IND1_BITS_H = 15u;
+static const uint32_t AUX_IND0_MASK_H = (1u << AUX_IND0_BITS_H) - 1u;
+static const uint32_t AUX_IND1_MASK_H = ((1u << AUX_IND1_BITS_H) - 1u) << AUX_IND0_BITS_H;
+static const uint32_t PAIR_TYPE_FLAG_MASK_H = 1u << 30;
+
+// Gu::BV32DataPacked (1168 bytes) with a SINGLE leaf child covering all nbTriangles
+// triangles (primStart 0), boxed by [boxLo, boxHi]^3.  The buffer is prefixed with a
+// 16-byte header (sizeof(uint4)) the kernel skips (bv32PackedNodes = mTriMeshData+16).
+static std::vector<uint32_t> makeBv32TreeWords(uint32_t nbTriangles, float boxLo, float boxHi)
+{
+    std::vector<uint32_t> w(296, 0u); // 4 header words + 292 node words = 1184 bytes
+    const uint32_t node = 4u;         // node begins at byte 16
+    // mMin[0].xyz @node ; mMax[0].xyz @node+128 (byte +512) ; mData[0] @node+256 (byte +1024)
+    w[node + 0] = f2u(boxLo); w[node + 1] = f2u(boxLo); w[node + 2] = f2u(boxLo);
+    w[node + 128 + 0] = f2u(boxHi); w[node + 128 + 1] = f2u(boxHi); w[node + 128 + 2] = f2u(boxHi);
+    w[node + 256] = (0u << 7) | (nbTriangles << 1) | 1u;  // leaf: primStart 0, nbPrims, isLeaf
+    w[node + 288] = 1u;                                    // mNbNodes @byte 1152
+    w[node + 289] = 1u;                                    // mDepth  @byte 1156
+    return w;
+}
+
+// ---------------------------------------------------------------------------
+// Bit-exact CPU transcription of the VT / EE self-collision predicates
+// (femClothClothMidPhase.cu ClothTree{Vertex,Edge}Traverser + deformableCollision.cuh
+// closestPtPointTriangle / closestPtLineLine).  Built -ffp-contract=off (matching the
+// NoContraction shader stamp).
+// ---------------------------------------------------------------------------
+namespace p72ref
+{
+struct V3 { float x, y, z; };
+static V3 sub(V3 a, V3 b) { return V3{ a.x - b.x, a.y - b.y, a.z - b.z }; }
+static V3 add(V3 a, V3 b) { return V3{ a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V3 mul(V3 a, float s) { return V3{ a.x * s, a.y * s, a.z * s }; }
+static float dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static float fmin3(float a, float b) { return a < b ? a : b; }
+static float fmax3(float a, float b) { return a > b ? a : b; }
+static V3 vmin(V3 a, V3 b) { return V3{ fmin3(a.x, b.x), fmin3(a.y, b.y), fmin3(a.z, b.z) }; }
+static V3 vmax(V3 a, V3 b) { return V3{ fmax3(a.x, b.x), fmax3(a.y, b.y), fmax3(a.z, b.z) }; }
+
+static const float BARY_THR = 1.0e-6f;
+static const float ONE_MINUS_BARY_THR = 1.0f - 1.0e-6f;
+
+static V3 closestPtPointTriangle(V3 p, V3 a, V3 b, V3 c, float& s, float& t)
+{
+    const V3 ab = sub(b, a), ac = sub(c, a), ap = sub(p, a);
+    const float d1 = dot(ab, ap), d2 = dot(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) { s = 0.0f; t = 0.0f; return a; }
+    const V3 bp = sub(p, b);
+    const float d3 = dot(ab, bp), d4 = dot(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3) { s = 1.0f; t = 0.0f; return b; }
+    const float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) { const float v = d1 / (d1 - d3); s = v; t = 0.0f; return add(a, mul(ab, v)); }
+    const V3 cp = sub(p, c);
+    const float d5 = dot(ab, cp), d6 = dot(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6) { s = 0.0f; t = 1.0f; return c; }
+    const float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) { const float wv = d2 / (d2 - d6); s = 0.0f; t = wv; return add(a, mul(ac, wv)); }
+    const float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f)
+    { const float wv = (d4 - d3) / ((d4 - d3) + (d5 - d6)); s = 1.0f - wv; t = wv; return add(b, mul(sub(c, b), wv)); }
+    const float denom = 1.0f / (va + vb + vc);
+    const float v = vb * denom, wv = vc * denom;
+    s = v; t = wv;
+    return add(a, add(mul(ab, v), mul(ac, wv)));
+}
+
+// closestPtLineLine (deformableCollision.cuh:244) — matches npEdgeEdge.slang:57.  The
+// vector/scalar `r0 / r0Len` is transcribed as PER-COMPONENT division (divv), matching
+// the shader's `float3 / float` (3x OpFDiv at -O0), NOT a reciprocal-multiply.
+static V3 divv(V3 a, float s) { return V3{ a.x / s, a.y / s, a.z / s }; }
+static void closestPtLineLine(V3 e0v0, V3 e0v1, V3 e1v0, V3 e1v1, float& s, float& t, float& distSq)
+{
+    const V3 r0 = sub(e0v1, e0v0), r1 = sub(e1v1, e1v0), d = sub(e1v0, e0v0);
+    const float r0Len2 = dot(r0, r0), r1Len2 = dot(r1, r1);
+    if (r0Len2 < 1.0e-18f || r1Len2 < 1.0e-18f) { s = 0.0f; t = 0.0f; distSq = dot(d, d); return; }
+    const float r0Len = std::sqrt(r0Len2), r1Len = std::sqrt(r1Len2);
+    const V3 u0 = divv(r0, r0Len), u1 = divv(r1, r1Len);
+    const float cosTheta = std::fabs(dot(u0, u1));
+    if (cosTheta > 0.9999f)
+    {
+        const float tProj = dot(sub(e0v0, e1v0), r1) / r1Len2;
+        t = tProj; s = 0.0f;
+        const V3 pt1 = add(e1v0, mul(r1, tProj));
+        distSq = dot(sub(pt1, e0v0), sub(pt1, e0v0));
+        return;
+    }
+    const float a01 = -dot(u0, u1);
+    const float b0 = dot(u0, d) / r0Len, b1 = -dot(u1, d) / r1Len;
+    const float det = 1.0f - a01 * a01;
+    if (det < 1.0e-9f) { s = 0.0f; t = 0.0f; distSq = dot(d, d); return; }
+    const float invDet = 1.0f / det;
+    s = (b0 - b1 * a01) * invDet;
+    t = (b1 - a01 * b0) * invDet;
+    const V3 pt0 = add(e0v0, mul(r0, s)), pt1 = add(e1v0, mul(r1, t));
+    distSq = dot(sub(pt1, pt0), sub(pt1, pt0));
+}
+} // namespace p72ref
+
+// Build a single-active-cloth self-collision descriptor over the given buffers.
+static SelfCollisionPush makeSelfCollisionPush(uint32_t maxContacts, uint64_t activeClothes,
+                                               uint64_t contactDistance, uint64_t clothes,
+                                               uint64_t updateContactPairs, uint64_t outContactInfo,
+                                               uint64_t totalContactCount)
+{
+    SelfCollisionPush p = {};
+    p.maxContacts = maxContacts;
+    p.activeClothes = activeClothes;
+    p.contactDistance = contactDistance;
+    p.clothes = clothes;
+    p.clothClothPairs = 0ull;      // unused by the traversers (ABI parity)
+    p.numClothClothPairs = 0u;
+    p.updateContactPairs = updateContactPairs;
+    p.outContactInfo = outContactInfo;
+    p.totalContactCount = totalContactCount;
+    return p;
+}
+
+// ---------------------------------------------------------------------------
+// cloth_selfCollisionMidphaseVTLaunch — one cloth vertex penetrating a triangle.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimSelfCollisionVT)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // Triangle T0 = {0,1,2} in the z=0 plane; vertex 3 hovers 0.05 above, projecting
+    // inside T0 (a VT self-contact); vertex 3 is NOT a member of T0.
+    std::vector<F4> pos = {
+        { 0.00f, 0.00f, 0.00f, 1.0f },   // v0 (T0)
+        { 1.00f, 0.00f, 0.00f, 1.0f },   // v1 (T0)
+        { 0.00f, 1.00f, 0.00f, 1.0f },   // v2 (T0)
+        { 0.25f, 0.25f, 0.05f, 1.0f },   // v3 penetrating
+    };
+    std::vector<F4> rest = pos; // distinct rest positions -> rest-pose filter (dist>0) passes
+    std::vector<TriIdx4> tris = { { 0u, 1u, 2u, 0x7u } }; // edge authorship 0x7 (VT ignores .w)
+    std::vector<uint32_t> tree = makeBv32TreeWords(/*nbTriangles*/ 1u, -1000.0f, 1000.0f);
+
+    DevBuf bPos = makeDev(dev, pos);
+    DevBuf bRest = makeDev(dev, rest);
+    DevBuf bTri = makeDev(dev, tris);
+    DevBuf bTree = makeDev(dev, tree);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mTriMeshData = reinterpret_cast<void*>(size_t(bTree.addr));
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mRestPosition = reinterpret_cast<decltype(c.mRestPosition)>(size_t(bRest.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mNbVerts = 4u;
+    c.mElementIndex = 0u;
+    c.mSelfCollisionFilterDistance = 0.0f; // filterDistSq 0 -> any positive rest distance passes
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+    std::vector<float> cd = { 0.05f };            // contactDist = 2*0.05 = 0.1 -> contactDistSq 0.01
+    DevBuf bCd = makeDev(dev, cd);
+    std::vector<uint32_t> upd = { 1u };
+    DevBuf bUpd = makeDev(dev, upd);
+
+    const uint32_t MAXC = 64u;
+    std::vector<FemFemContactInfoHost> outInfo(MAXC);
+    std::memset(outInfo.data(), 0xAB, outInfo.size() * sizeof(FemFemContactInfoHost)); // poison
+    DevBuf bOut = makeDev(dev, outInfo);
+    std::vector<uint32_t> count = { 0u };
+    DevBuf bCount = makeDev(dev, count);
+
+    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    SelfCollisionPush push = makeSelfCollisionPush(MAXC, bActive.addr, bCd.addr, bDesc.addr,
+                                                   bUpd.addr, bOut.addr, bCount.addr);
+    Kernel k("femClothSelfCollisionBda.spv", "cloth_selfCollisionMidphaseVTLaunch", {}, sizeof(SelfCollisionPush));
+    k.dispatch(/*gridX numVerts*/ 4u, {}, push, /*gridY nbActive*/ 1u, 1u);
+    dev->flush();
+
+    // ---- CPU predicate: exactly vertex 3 penetrates T0 ----
+    using p72ref::V3;
+    auto v3f = [&](const F4& f) { return V3{ f.x, f.y, f.z }; };
+    const float contactDist = 2.0f * cd[0];
+    const float contactDistSq = contactDist * contactDist;
+    const V3 x1 = v3f(pos[0]), x2 = v3f(pos[1]), x3 = v3f(pos[2]), vtx = v3f(pos[3]);
+    const V3 bMin = p72ref::sub(p72ref::vmin(p72ref::vmin(x1, x2), x3), V3{ contactDist, contactDist, contactDist });
+    const V3 bMax = p72ref::add(p72ref::vmax(p72ref::vmax(x1, x2), x3), V3{ contactDist, contactDist, contactDist });
+    const bool contains = !(vtx.x < bMin.x || vtx.x > bMax.x || vtx.y < bMin.y || vtx.y > bMax.y || vtx.z < bMin.z || vtx.z > bMax.z);
+    float s, t; const V3 cp = p72ref::closestPtPointTriangle(vtx, x1, x2, x3, s, t);
+    const V3 dir = p72ref::sub(vtx, cp);
+    const float distSq = p72ref::dot(dir, dir);
+    const bool penetrates = contains && (distSq < contactDistSq) && (distSq > 1.0e-14f);
+    PXG_CHECK_MSG(penetrates, "reference: vertex 3 must penetrate T0 (distSq=%g < %g)", distSq, contactDistSq);
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+    PXG_CHECK_MSG(gCount == 1u, "VT self-collision emitted %u contacts (expected 1)", gCount);
+
+    const FemFemContactInfoHost gi = downloadBuffer<FemFemContactInfoHost>(dev, bOut.h, 1)[0];
+    size_t mm = 0;
+    const uint64_t refPair0 = (0ull << 20) | 3ull;   // encode(cloth 0, vertex 3)
+    const uint32_t refPair1 = (0u << 20) | 0u;        // encode(cloth 0, triangle 0)
+    const uint32_t refAux = 0u;                       // VT pair (bit30=0), invalid (self, bit31=0), zero-init
+    if (gi.pairInd0 != refPair0) { ++mm; std::printf("  VT pairInd0 MM got %llu ref %llu\n", (unsigned long long)gi.pairInd0, (unsigned long long)refPair0); }
+    if (gi.pairInd1 != refPair1) { ++mm; std::printf("  VT pairInd1 MM got %u ref %u\n", gi.pairInd1, refPair1); }
+    if (gi.auxInd != refAux) { ++mm; std::printf("  VT auxInd MM got 0x%08x ref 0x%08x\n", gi.auxInd, refAux); }
+    PXG_CHECK_MSG(mm == 0, "cloth_selfCollisionMidphaseVT bit-exact vs CPU (%zu mismatches)", mm);
+
+    // ---- non-penetrating case: lift vertex 3 above the fattened bound -> zero contacts ----
+    std::vector<F4> posOut = pos;
+    posOut[3] = F4{ 0.25f, 0.25f, 0.5f, 1.0f }; // z=0.5 > 0.2 fattened bound -> not contained
+    DevBuf bPosOut = makeDev(dev, posOut);
+    PxgFEMCloth c2 = c;
+    c2.mPosition_InvMass = reinterpret_cast<decltype(c2.mPosition_InvMass)>(size_t(bPosOut.addr));
+    std::vector<PxgFEMCloth> descArr2 = { c2 };
+    DevBuf bDesc2 = makeDev(dev, descArr2);
+    std::vector<uint32_t> count2 = { 0u };
+    DevBuf bCount2 = makeDev(dev, count2);
+    SelfCollisionPush push2 = push;
+    push2.clothes = bDesc2.addr;
+    push2.totalContactCount = bCount2.addr;
+    k.dispatch(4u, {}, push2, 1u, 1u);
+    dev->flush();
+    const uint32_t gCount2 = downloadBuffer<uint32_t>(dev, bCount2.h, 1)[0];
+    PXG_CHECK_MSG(gCount2 == 0u, "VT self-collision (no penetration) emitted %u contacts (expected 0)", gCount2);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bRest.h); dev->destroyBuffer(bTri.h);
+    dev->destroyBuffer(bTree.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+    dev->destroyBuffer(bCd.h); dev->destroyBuffer(bUpd.h); dev->destroyBuffer(bOut.h); dev->destroyBuffer(bCount.h);
+    dev->destroyBuffer(bPosOut.h); dev->destroyBuffer(bDesc2.h); dev->destroyBuffer(bCount2.h);
+}
+
+// ---------------------------------------------------------------------------
+// cloth_selfCollisionMidphaseEELaunch — two triangles whose edges cross.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimSelfCollisionEE)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // T0 = {0,1,2}: edge0 (v0->v1) is the x-axis segment at (y=0,z=0); its other two
+    //   edges dive to v2=(0,0,-1) (far from T1).
+    // T1 = {3,4,5} at z=0.03: edge0 (v3->v4) and edge2 (v5->v3) BOTH cross the x-axis
+    //   within contactDist (two EE crossings); edge1 (v4->v5) stays at y=-0.3 (far).
+    std::vector<F4> pos = {
+        { -0.5f, 0.0f,  0.0f, 1.0f },   // v0 (T0)
+        {  0.5f, 0.0f,  0.0f, 1.0f },   // v1 (T0)
+        {  0.0f, 0.0f, -1.0f, 1.0f },   // v2 (T0)
+        {  0.0f,  0.3f, 0.03f, 1.0f },  // v3 (T1)
+        {  0.2f, -0.3f, 0.03f, 1.0f },  // v4 (T1)
+        { -0.2f, -0.3f, 0.03f, 1.0f },  // v5 (T1)
+    };
+    std::vector<F4> rest = pos;
+    std::vector<TriIdx4> tris = { { 0u, 1u, 2u, 0x7u }, { 3u, 4u, 5u, 0x7u } }; // all edges active
+    std::vector<uint32_t> twae = { 0u, 1u }; // both triangles have active edges
+    std::vector<uint32_t> tree = makeBv32TreeWords(/*nbTriangles*/ 2u, -1000.0f, 1000.0f);
+
+    DevBuf bPos = makeDev(dev, pos);
+    DevBuf bRest = makeDev(dev, rest);
+    DevBuf bTri = makeDev(dev, tris);
+    DevBuf bTwae = makeDev(dev, twae);
+    DevBuf bTree = makeDev(dev, tree);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mTriMeshData = reinterpret_cast<void*>(size_t(bTree.addr));
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mRestPosition = reinterpret_cast<decltype(c.mRestPosition)>(size_t(bRest.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mTrianglesWithActiveEdges = reinterpret_cast<decltype(c.mTrianglesWithActiveEdges)>(size_t(bTwae.addr));
+    c.mNbTrianglesWithActiveEdges = 2u;
+    c.mElementIndex = 0u;
+    c.mSelfCollisionFilterDistance = 0.0f;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+    std::vector<float> cd = { 0.05f };            // contactDist 0.1 -> contactDistSq 0.01
+    DevBuf bCd = makeDev(dev, cd);
+    std::vector<uint32_t> upd = { 1u };
+    DevBuf bUpd = makeDev(dev, upd);
+
+    const uint32_t MAXC = 64u;
+    std::vector<FemFemContactInfoHost> outInfo(MAXC);
+    std::memset(outInfo.data(), 0xAB, outInfo.size() * sizeof(FemFemContactInfoHost));
+    DevBuf bOut = makeDev(dev, outInfo);
+    std::vector<uint32_t> count = { 0u };
+    DevBuf bCount = makeDev(dev, count);
+
+    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    SelfCollisionPush push = makeSelfCollisionPush(MAXC, bActive.addr, bCd.addr, bDesc.addr,
+                                                   bUpd.addr, bOut.addr, bCount.addr);
+    Kernel k("femClothSelfCollisionBda.spv", "cloth_selfCollisionMidphaseEELaunch", {}, sizeof(SelfCollisionPush));
+    k.dispatch(/*gridX numTrisWithActiveEdges*/ 2u, {}, push, /*gridY nbActive*/ 1u, 1u);
+    dev->flush();
+
+    // ---- CPU transcription: the T1(query)-vs-T0(found) 3x3 edge loop ----
+    // (only the higher-indexed triangle's warp processes the pair: t0_index 1 > primIdx 0.)
+    using p72ref::V3;
+    auto v3f = [&](const F4& f) { return V3{ f.x, f.y, f.z }; };
+    const float contactDist = 2.0f * cd[0];
+    const float contactDistSq = contactDist * contactDist;
+    const uint32_t nextE[3] = { 1u, 2u, 0u };
+    const uint32_t vIndices0[3] = { tris[1].x, tris[1].y, tris[1].z }; // query = T1
+    const uint32_t vIndices1[3] = { tris[0].x, tris[0].y, tris[0].z }; // found = T0
+    V3 t0pts[3] = { v3f(pos[vIndices0[0]]), v3f(pos[vIndices0[1]]), v3f(pos[vIndices0[2]]) };
+    V3 t1pts[3] = { v3f(pos[vIndices1[0]]), v3f(pos[vIndices1[1]]), v3f(pos[vIndices1[2]]) };
+    std::vector<FemFemContactInfoHost> refContacts;
+    const uint64_t refPair0 = (0ull << 20) | 1ull;   // encode(cloth 0, t0_index 1)
+    const uint32_t refPair1 = (0u << 20) | 0u;        // encode(cloth 0, primitive 0)
+    for (uint32_t e1 = 0; e1 < 3; ++e1)           // edges of found T0
+    {
+        const uint32_t e1v0 = vIndices1[e1], e1v1 = vIndices1[nextE[e1]];
+        const V3 e1x0 = t1pts[e1], e1x1 = t1pts[nextE[e1]];
+        for (uint32_t e0 = 0; e0 < 3; ++e0)       // edges of query T1
+        {
+            const uint32_t e0v0 = vIndices0[e0], e0v1 = vIndices0[nextE[e0]];
+            if (e0v0 == e1v0 || e0v0 == e1v1 || e0v1 == e1v0 || e0v1 == e1v1) continue;
+            const V3 e0x0 = t0pts[e0], e0x1 = t0pts[nextE[e0]];
+            float s, t, dq;
+            p72ref::closestPtLineLine(e0x0, e0x1, e1x0, e1x1, s, t, dq);
+            const bool isOutside = (s < p72ref::BARY_THR) || (s > p72ref::ONE_MINUS_BARY_THR) ||
+                                   (t < p72ref::BARY_THR) || (t > p72ref::ONE_MINUS_BARY_THR);
+            if (isOutside) continue;
+            if (dq < contactDistSq && dq > 1.0e-14f)
+            {
+                // filterDistSq 0, distinct rest positions -> passes; build the auxInd.
+                uint32_t aux = PAIR_TYPE_FLAG_MASK_H;
+                aux = (aux & ~AUX_IND0_MASK_H) | (e0 & AUX_IND0_MASK_H);
+                aux = (aux & ~AUX_IND1_MASK_H) | ((e1 & ((1u << AUX_IND1_BITS_H) - 1u)) << AUX_IND0_BITS_H);
+                refContacts.push_back(FemFemContactInfoHost{ refPair0, refPair1, aux });
+            }
+        }
+    }
+    PXG_CHECK_MSG(refContacts.size() == 2u, "reference: expected 2 EE crossings, got %zu", refContacts.size());
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+    PXG_CHECK_MSG(gCount == uint32_t(refContacts.size()), "EE self-collision emitted %u contacts (expected %zu)",
+                  gCount, refContacts.size());
+
+    const auto gi = downloadBuffer<FemFemContactInfoHost>(dev, bOut.h, gCount ? gCount : 1u);
+    size_t mm = 0;
+    for (uint32_t i = 0; i < gCount && i < refContacts.size(); ++i)
+    {
+        if (std::memcmp(&gi[i], &refContacts[i], sizeof(FemFemContactInfoHost)) != 0)
+        {
+            ++mm;
+            std::printf("  EE contact[%u] MM: got(p0=%llu,p1=%u,aux=0x%08x) ref(p0=%llu,p1=%u,aux=0x%08x)\n", i,
+                        (unsigned long long)gi[i].pairInd0, gi[i].pairInd1, gi[i].auxInd,
+                        (unsigned long long)refContacts[i].pairInd0, refContacts[i].pairInd1, refContacts[i].auxInd);
+        }
+    }
+    PXG_CHECK_MSG(mm == 0, "cloth_selfCollisionMidphaseEE bit-exact vs CPU (%zu mismatches)", mm);
+
+    // ---- non-crossing case: lift T1 to z=1.0 -> no edge crossing -> zero contacts ----
+    std::vector<F4> posOut = pos;
+    posOut[3].z = 1.0f; posOut[4].z = 1.0f; posOut[5].z = 1.0f;
+    DevBuf bPosOut = makeDev(dev, posOut);
+    PxgFEMCloth c2 = c;
+    c2.mPosition_InvMass = reinterpret_cast<decltype(c2.mPosition_InvMass)>(size_t(bPosOut.addr));
+    std::vector<PxgFEMCloth> descArr2 = { c2 };
+    DevBuf bDesc2 = makeDev(dev, descArr2);
+    std::vector<uint32_t> count2 = { 0u };
+    DevBuf bCount2 = makeDev(dev, count2);
+    SelfCollisionPush push2 = push;
+    push2.clothes = bDesc2.addr;
+    push2.totalContactCount = bCount2.addr;
+    k.dispatch(2u, {}, push2, 1u, 1u);
+    dev->flush();
+    const uint32_t gCount2 = downloadBuffer<uint32_t>(dev, bCount2.h, 1)[0];
+    PXG_CHECK_MSG(gCount2 == 0u, "EE self-collision (no crossing) emitted %u contacts (expected 0)", gCount2);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bRest.h); dev->destroyBuffer(bTri.h);
+    dev->destroyBuffer(bTwae.h); dev->destroyBuffer(bTree.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bActive.h); dev->destroyBuffer(bCd.h); dev->destroyBuffer(bUpd.h);
+    dev->destroyBuffer(bOut.h); dev->destroyBuffer(bCount.h);
+    dev->destroyBuffer(bPosOut.h); dev->destroyBuffer(bDesc2.h); dev->destroyBuffer(bCount2.h);
+}
+
 } // namespace

@@ -368,6 +368,18 @@ static const uint8_t kClothRigidContactQuery[] = { 8, 8, 8, 8, 8, 8, 8, 8, 4, 8,
 //   pointers (@96/@104) -> natural-alignment blob = 112 bytes.
 static const uint8_t kClothRigidContactSolve[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
 
+// gpunarrowphase femClothClothMidPhase.cu (P7.2 tranche 1 cloth SELF-collision midphase
+// + contact GENERATION):
+//   cloth_selfCollisionMidphase{VT,EE}Launch(PxU32 maxContacts, const PxU32*
+//     activeClothes, const PxReal* contactDistance, const PxgFEMCloth* clothes,
+//     PxgNonRigidFilterPair* clothClothPairs, PxU32 numClothClothPairs,
+//     const PxU8* updateContactPairs, PxgFemFemContactInfo* outContactInfo,
+//     PxU32* totalContactCount)  -- launch site PxgFEMClothCore.cpp:698 (VT and EE
+//   share the pack).  PxU32 (@0) + four device pointers + PxU32 (@40) + three device
+//   pointers -> natural-alignment blob = 72 bytes (the two PxU32 4-byte tail-pads
+//   realign the following pointers).
+static const uint8_t kClothSelfCollisionMidphase[] = { 4, 8, 8, 8, 8, 4, 8, 8, 8 };
+
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
@@ -698,6 +710,9 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_queryRigidClothContactReferenceCountTGSLaunch", kClothRigidContactQuery, uint32_t(sizeof(kClothRigidContactQuery)) },
     { "cloth_solveRigidClothCollisionLaunch", kClothRigidContactSolve, uint32_t(sizeof(kClothRigidContactSolve)) },
     { "cloth_solveRigidClothCollisionTGSLaunch", kClothRigidContactSolve, uint32_t(sizeof(kClothRigidContactSolve)) },
+    // gpunarrowphase FEMCloth SELF-collision midphase + contact GENERATION (P7.2 tranche 1 BDA)
+    { "cloth_selfCollisionMidphaseVTLaunch", kClothSelfCollisionMidphase, uint32_t(sizeof(kClothSelfCollisionMidphase)) },
+    { "cloth_selfCollisionMidphaseEELaunch", kClothSelfCollisionMidphase, uint32_t(sizeof(kClothSelfCollisionMidphase)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },
