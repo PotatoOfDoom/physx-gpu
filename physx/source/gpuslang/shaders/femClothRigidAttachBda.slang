@@ -232,8 +232,21 @@ struct SolveAttachParams
     uint64_t rigidDeltaVel;           // @64  -> 72
 }
 
+// cloth_applyExternalDeltasLaunch push-constant blob (FEMClothExternalSolve.cu:1053).
+// CUDA arg pack (PxgFEMClothCore.cpp:2113): { PxgFEMCloth* femClothes,
+// const PxU32* activeClothes, PxReal dt } -> natural-alignment blob = 24 bytes
+// (8+8+4 rounded to 8-alignment).  (ABI row {8,8,4}.)
+struct ApplyExtDeltasParams
+{
+    uint64_t clothes;                 // @0
+    uint64_t activeClothes;           // @8
+    float dt;                         // @16
+    uint _pad20;                      // @20  -> 24
+}
+
 [[vk::push_constant]] ConstantBuffer<PrepAttachParams> gPrep;
 [[vk::push_constant]] ConstantBuffer<SolveAttachParams> gSolve;
+[[vk::push_constant]] ConstantBuffer<ApplyExtDeltasParams> gApply;
 
 // ===========================================================================
 // cloth_rigidAttachmentPrepareLaunch (FEMClothConstraintPrep.cu:387)
@@ -608,6 +621,61 @@ void cloth_solveRigidClothAttachmentTGSLaunch(uint3 groupThreadId : SV_GroupThre
         {
             const float3 deltaPos = float3(-deltaImpulse.x, -deltaImpulse.y, -deltaImpulse.z);
             applyClothDelta(clothes[clothId].mDeltaPos, elemIdx, deltaPos, clothAccumDelta.w);
+        }
+    }
+}
+
+// ===========================================================================
+// cloth_applyExternalDeltasLaunch (FEMClothExternalSolve.cu:1053) — the per-vertex
+// pass that folds the accumulated external correction (mDeltaPos, written by the
+// attachment / contact solves; .w = the running per-vertex count) into the live
+// position/velocity/accumulated-delta state, then clears it.  Without this the
+// attachment (and cloth-cloth / contact) corrections are dead-ended, so nothing
+// pinned actually moves.  Per-vertex, block dim SB_SOLVETETRA (64), grid
+// (numBlocks, nbActiveClothes, 1) — vertIdx = tid + blockIdx.x*64, guard < nbVerts.
+// ===========================================================================
+[shader("compute")]
+[numthreads(64, 1, 1)] // SB_SOLVETETRA
+void cloth_applyExternalDeltasLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    Ptr<PxgFEMClothGpu> femClothes = Ptr<PxgFEMClothGpu>(gApply.clothes);
+    const uint id = Ptr<uint>(gApply.activeClothes)[groupId.y];
+    const float dt = gApply.dt;
+
+    const uint nbVerts = femClothes[id].mNbVerts;
+    const uint vertIdx = groupThreadId.x + groupId.x * 64u;
+
+    if (vertIdx < nbVerts)
+    {
+        Ptr<float4> mDeltaPos = Ptr<float4>(femClothes[id].mDeltaPos);
+        float4 delta = mDeltaPos[vertIdx];
+
+        if (delta.w != 0.0f)
+        {
+            Ptr<float4> positions = Ptr<float4>(femClothes[id].mPosition_InvMass);
+            Ptr<float4> velocities = Ptr<float4>(femClothes[id].mVelocity_InvMass);
+            Ptr<float4> accumulatedDeltaPos = Ptr<float4>(femClothes[id].mAccumulatedDeltaPos);
+
+            float4 accumDelta = accumulatedDeltaPos[vertIdx];
+            const float invDt = 1.0f / dt;
+            float4 pos = positions[vertIdx];
+            float4 vel = velocities[vertIdx];
+            const float scale = 1.0f / delta.w;
+
+            delta.x *= scale;
+            delta.y *= scale;
+            delta.z *= scale;
+            delta.w = 0.0f;
+
+            vel += delta * invDt;
+            pos += delta;
+            accumDelta += delta;
+
+            positions[vertIdx] = pos;
+            velocities[vertIdx] = vel;
+            accumulatedDeltaPos[vertIdx] = accumDelta;
+
+            mDeltaPos[vertIdx] = float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
     }
 }

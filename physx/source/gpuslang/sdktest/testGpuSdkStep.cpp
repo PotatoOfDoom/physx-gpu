@@ -581,6 +581,182 @@ float clothMeanY(const ClothScene& csc)
     for (PxU32 i = 0; i < csc.numVerts; ++i) sum += double(host[i].y);
     return float(sum / double(csc.numVerts));
 }
+
+// PXG_SCENE=clothhang (P7.1 tranche 3b): a HANGING / draping cloth — the visible
+// "cloth is usable" money shot.  Same triangle-mesh PxDeformableSurface cook + GPU
+// spawn as the free-fall 'cloth' scene, but the cloth is oriented as a VERTICAL
+// curtain (XY plane) and its TOP ROW of vertices is PINNED to fixed world anchors at
+// their spawn positions via the deformable-surface rigid-attachment API
+// (PxPhysics::createDeformableAttachment with actor0 = the surface / eVERTEX,
+// actor1 = NULL / eWORLD).  That path threads down through
+// NpDeformableAttachment::addAttachment -> Sc::DeformableSurfaceCore::addRigidAttachment
+// -> Sc::Scene::addRigidAttachment -> PxgSimulationController::addRigidAttachment ->
+// PxgFEMRigidAttachment, so the engine's rigid-cloth-attachment buffers get populated
+// and the P7.1.3a constraint kernels (cloth_rigidAttachmentPrepareLaunch +
+// cloth_solveRigidClothAttachment{,TGS}Launch) dispatch each solver iteration.
+//
+// EXPECTED PHYSICS: the pinned top row stays at its anchor y; the free rows below
+// stretch a bounded amount under gravity, then the membrane/bending energy solve
+// balances the load and the drape STABILIZES (fall-then-settle, not free-fall).
+//
+// Each pinned vertex gets its OWN attachment (all distinct vertices — one attachment
+// per vertex, no per-vertex contention), so the exact single-attachment 3a solve path
+// is exercised and the deferred multi-attachment averaging kernel is NOT needed.
+struct ClothHangScene
+{
+    PxDeformableSurface* surface = nullptr;
+    PxU32 numVerts = 0;
+    PxCudaContextManager* cudaCtx = nullptr;
+    PxDeformableAttachment* attachment = nullptr;
+    std::vector<PxU32> topRow;      // PINNED vertices (top edge of the curtain)
+    std::vector<PxU32> bottomRow;   // FREE vertices tracked for the drape/settle
+};
+
+ClothHangScene buildClothHangScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
+                                   PxCudaContextManager* cudaCtx)
+{
+    ClothHangScene out;
+    out.cudaCtx = cudaCtx;
+
+    // A live dynamic rigid FAR BELOW the cloth (same rationale as the free-fall scene:
+    // the cloth solve runs inside the rigid PGS island loop, whose descriptors must be
+    // non-null).  It rests at y=0.5, well below the curtain (top row at y~5).
+    addGroundBox(physics, scene, rigidMat);
+    addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+               boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+
+    // Cook a triangle GRID mesh (buildGPUData + eENABLE_VERT_MAPPING mandatory, as in
+    // buildClothScene).  Grid indexed [col][row]; the curtain hangs in the XY plane.
+    const PxU32 numCol = 5, numRow = 5;             // 25 verts, 32 triangles
+    const float sizeX = 2.0f, sizeY = 2.0f;
+    const float topY = 5.0f;                        // the pinned top edge height
+    const float sx = sizeX / float(numCol - 1);
+    const float sy = sizeY / float(numRow - 1);
+    auto vid = [numRow](PxU32 c, PxU32 r) { return c * numRow + r; };
+
+    std::vector<PxVec3> verts;
+    verts.reserve(numCol * numRow);
+    for (PxU32 c = 0; c < numCol; ++c)
+        for (PxU32 r = 0; r < numRow; ++r)
+            // row 0 = top edge (y = topY); increasing r hangs DOWNWARD; planar z = 0.
+            verts.push_back(PxVec3(float(c) * sx - 0.5f * sizeX, topY - float(r) * sy, 0.0f));
+
+    std::vector<PxU32> tris;
+    tris.reserve(3 * 2 * (numCol - 1) * (numRow - 1));
+    for (PxU32 c = 1; c < numCol; ++c)
+        for (PxU32 r = 1; r < numRow; ++r)
+        {
+            tris.push_back(vid(c - 1, r - 1)); tris.push_back(vid(c, r - 1)); tris.push_back(vid(c - 1, r));
+            tris.push_back(vid(c - 1, r));     tris.push_back(vid(c, r - 1)); tris.push_back(vid(c, r));
+        }
+
+    // Track the top row (pinned) and bottom row (free) for the per-row settle check.
+    for (PxU32 c = 0; c < numCol; ++c) out.topRow.push_back(vid(c, 0));
+    for (PxU32 c = 0; c < numCol; ++c) out.bottomRow.push_back(vid(c, numRow - 1));
+
+    PxTriangleMeshDesc meshDesc;
+    meshDesc.points.count = PxU32(verts.size());
+    meshDesc.points.stride = sizeof(PxVec3);
+    meshDesc.points.data = verts.data();
+    meshDesc.triangles.count = PxU32(tris.size() / 3);
+    meshDesc.triangles.stride = 3 * sizeof(PxU32);
+    meshDesc.triangles.data = tris.data();
+
+    PxCookingParams ckParams(physics->getTolerancesScale());
+    ckParams.buildGPUData = true;
+    ckParams.meshPreprocessParams |= PxMeshPreprocessingFlag::eENABLE_VERT_MAPPING;
+
+    PxTriangleMesh* triMesh =
+        immediateCooking::createTriangleMesh(ckParams, meshDesc, physics->getPhysicsInsertionCallback());
+    if (!triMesh) { std::printf("FAIL: immediateCooking::createTriangleMesh returned null\n"); return out; }
+
+    PxDeformableSurfaceMaterial* clothMat =
+        physics->createDeformableSurfaceMaterial(/*youngs*/ 1.e6f, /*poissons*/ 0.3f,
+            /*dynamicFriction*/ 0.5f, /*thickness*/ 0.01f, /*bendingStiffness*/ 1.e-4f);
+    PxDeformableSurfaceMaterial* mats[1] = { clothMat };
+
+    PxShapeFlags shapeFlags = PxShapeFlag::eSIMULATION_SHAPE | PxShapeFlag::eSCENE_QUERY_SHAPE;
+    PxShape* shape = physics->createShape(PxTriangleMeshGeometry(triMesh), mats, PxU16(1), true, shapeFlags);
+    if (!shape) { std::printf("FAIL: createShape (deformable surface) returned null\n"); return out; }
+
+    PxDeformableSurface* surface = physics->createDeformableSurface(*cudaCtx);
+    if (!surface) { std::printf("FAIL: createDeformableSurface returned null\n"); return out; }
+
+    surface->setNbCollisionPairUpdatesPerTimestep(4);
+    surface->setNbCollisionSubsteps(1);
+    surface->setLinearDamping(0.0f);
+    surface->setMaxLinearVelocity(1.0e6f);
+    surface->attachShape(*shape);
+    shape->release();
+
+    scene->addActor(*surface);
+
+    // Fill the DEVICE buffers directly (getPositionInvMassBufferD() aliases the engine's
+    // internal cloth arrays).  invMass=1 for every vertex (the pin is a CONSTRAINT, not a
+    // fixed/zero-mass vertex — the attachment solve does the holding); velocity=0; rest =
+    // spawn shape (so the membrane is at rest at spawn).
+    const PxU32 nv = PxU32(verts.size());
+    std::vector<PxVec4> posInvMass(nv), vel(nv, PxVec4(0.0f)), rest(nv);
+    for (PxU32 v = 0; v < nv; ++v)
+    {
+        posInvMass[v] = PxVec4(verts[v].x, verts[v].y, verts[v].z, 1.0f);
+        rest[v]       = PxVec4(verts[v].x, verts[v].y, verts[v].z, 1.0f);
+    }
+
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getPositionInvMassBufferD()),
+                    posInvMass.data(), nv * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getVelocityBufferD()),
+                    vel.data(), nv * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getRestPositionBufferD()),
+                    rest.data(), nv * sizeof(PxVec4));
+
+    // PIN the top row: one VERTEX->WORLD attachment per top-row vertex, anchored at the
+    // vertex's own spawn position (pose = identity, so anchor = coords[i]).  Distinct
+    // vertices => one attachment each => the exact single-attachment 3a path.
+    static std::vector<PxU32> pinIdx;    // must outlive createDeformableAttachment's copy
+    static std::vector<PxVec4> pinPos;
+    pinIdx = out.topRow;
+    pinPos.clear();
+    for (PxU32 id : out.topRow)
+        pinPos.push_back(PxVec4(verts[id].x, verts[id].y, verts[id].z, 0.0f));
+
+    PxDeformableAttachmentData attData;
+    attData.actor[0] = surface;
+    attData.type[0]  = PxDeformableAttachmentTargetType::eVERTEX;
+    attData.indices[0].data = pinIdx.data();
+    attData.indices[0].count = PxU32(pinIdx.size());
+    attData.actor[1] = NULL;                                          // world anchor
+    attData.type[1]  = PxDeformableAttachmentTargetType::eWORLD;
+    attData.coords[1].data = pinPos.data();
+    attData.coords[1].count = PxU32(pinPos.size());
+    attData.pose[1] = PxTransform(PxIdentity);
+
+    out.attachment = physics->createDeformableAttachment(attData);
+    if (!out.attachment)
+        std::printf("FAIL: createDeformableAttachment (cloth vertex -> world) returned null\n");
+
+    out.surface = surface;
+    out.numVerts = nv;
+    return out;
+}
+
+// DtoH-read the cloth vertex buffer once; fill the mean y of the pinned top row and the
+// free bottom row (the two observables of the drape).  Returns false on non-finite y.
+bool clothHangRowMeans(const ClothHangScene& csc, float& topMeanY, float& bottomMeanY)
+{
+    std::vector<PxVec4> host(csc.numVerts);
+    PxCudaContext* ctx = csc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(csc.surface->getPositionInvMassBufferD()),
+                    csc.numVerts * sizeof(PxVec4));
+    double topSum = 0.0, botSum = 0.0;
+    bool finite = true;
+    for (PxU32 id : csc.topRow)    { topSum += double(host[id].y); if (!std::isfinite(host[id].y)) finite = false; }
+    for (PxU32 id : csc.bottomRow) { botSum += double(host[id].y); if (!std::isfinite(host[id].y)) finite = false; }
+    topMeanY = float(topSum / double(csc.topRow.size()));
+    bottomMeanY = float(botSum / double(csc.bottomRow.size()));
+    return finite;
+}
 } // namespace
 
 int main()
@@ -801,6 +977,87 @@ int main()
         return 2;
     }
 
+    // PXG_SCENE=clothhang (P7.1 tranche 3b): the HANGING / draping cloth money shot.
+    // A vertical FEMCloth curtain pinned along its top edge to fixed world anchors; it
+    // must DRAPE below the pins and SETTLE (fall-then-stabilize), mirroring the P6.5
+    // particle settling-bag pass criterion but per-row: pinned top row ~constant y, free
+    // bottom row drops a bounded amount then converges.
+    if (!std::strcmp(sceneName, "clothhang"))
+    {
+        ClothHangScene csc = buildClothHangScene(physics, scene, material, cudaCtx);
+        if (!csc.surface || csc.numVerts == 0 || !csc.attachment)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: clothhang scene build failed "
+                        "(surface=%p verts=%u attachment=%p)\n",
+                        (void*)csc.surface, csc.numVerts, (void*)csc.attachment);
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'clothhang' built: %u-vertex FEMCloth curtain, top row (%zu verts) "
+                    "PINNED to world anchors\n", csc.numVerts, csc.topRow.size());
+
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: clothhang GPU pipeline CONSTRUCTED + live over Vulkan "
+                        "(set PXG_GPU_STEP=1 to step the drape)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_CLOTH_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 120;
+        float top0 = 0.0f, bot0 = 0.0f;
+        bool finite0 = clothHangRowMeans(csc, top0, bot0);
+        std::printf("  stepping the curtain (%d x %.4fs): top row y0=%.4f, bottom row y0=%.4f\n",
+                    steps, dt, top0, bot0);
+
+        float prevBot = bot0;
+        float topMaxDev = 0.0f;         // max |top mean y - top0| over the whole run
+        float botRestMaxDy = 0.0f;      // max |d(bottom mean y)| over the final quarter (convergence)
+        bool allFinite = finite0;
+        const int restWindow = steps / 4;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            float top = 0.0f, bot = 0.0f;
+            allFinite = clothHangRowMeans(csc, top, bot) && allFinite;
+            topMaxDev = PxMax(topMaxDev, PxAbs(top - top0));
+            if (i >= steps - restWindow) botRestMaxDy = PxMax(botRestMaxDy, PxAbs(bot - prevBot));
+            if (i < 6 || i == steps - 1 || (i % 10 == 0))
+                std::printf("    step %3d: top y = %.5f (dev %+.5f) | bottom y = %.5f (dy %+.5f)\n",
+                            i, top, top - top0, bot, bot - prevBot);
+            prevBot = bot;
+        }
+        float topEnd = 0.0f, botEnd = 0.0f;
+        clothHangRowMeans(csc, topEnd, botEnd);
+        const float botDrop = bot0 - botEnd;
+
+        std::printf("  clothhang: top row y %.4f -> %.4f (max |dev|=%.5f) | bottom row y %.4f -> %.4f "
+                    "(dropped %.4f); bottom rest |dy| over last %d steps = %.6f\n",
+                    top0, topEnd, topMaxDev, bot0, botEnd, botDrop, restWindow, botRestMaxDy);
+
+        int failures = 0;
+        // (1) the PINNED top row must stay put (near its anchor y).
+        if (!(topMaxDev < 0.05f)) { std::printf("FAIL: pinned top row moved (max |dev|=%.5f)\n", topMaxDev); ++failures; }
+        // (2) the free bottom row must DRAPE below by a BOUNDED amount (not free-fall).
+        if (!(botDrop > 0.0f))    { std::printf("FAIL: bottom row did not drape down (drop=%.5f)\n", botDrop); ++failures; }
+        if (!(botDrop < 2.0f))    { std::printf("FAIL: bottom row fell unbounded (drop=%.5f) — not hanging\n", botDrop); ++failures; }
+        // (3) the drape must CONVERGE (bottom row stops moving over the final quarter).
+        if (!(botRestMaxDy < 0.01f)) { std::printf("FAIL: drape did not settle (rest |dy|=%.6f)\n", botRestMaxDy); ++failures; }
+        // (4) nothing NaN/inf.
+        if (!allFinite || !std::isfinite(topEnd) || !std::isfinite(botEnd))
+        { std::printf("FAIL: cloth y went non-finite\n"); ++failures; }
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: FEMCloth HANGS from its pinned edge and drapes under gravity\n");
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: clothhang drape checks failed (%d)\n", failures);
+        return 2;
+    }
+
     std::vector<RestTarget> targets;
     if      (!std::strcmp(sceneName, "box"))       buildBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "stack"))     buildStackScene(physics, scene, material, targets);
@@ -810,7 +1067,7 @@ int main()
     else if (!std::strcmp(sceneName, "capsulebox")) buildCapsuleBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "convex"))    buildConvexScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "joint"))     buildJointScene(physics, scene, material, targets);
-    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint|particle|cloth)\n", sceneName);
+    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint|particle|cloth|clothhang)\n", sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
     if (targets.empty())
     {

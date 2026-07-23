@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 191;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 192;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -424,7 +424,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_solveClothClothDeltaEELaunch", nullptr, nullptr },  // CLOTH_SOLVE_CLOTH_EE_COLLISION (unmapped)
     { "cloth_queryClothClothContactVTCountLaunch", nullptr, nullptr },  // CLOTH_QUERY_CLOTH_CONTACT_VT_COUNT (unmapped)
     { "cloth_queryClothClothContactEECountLaunch", nullptr, nullptr },  // CLOTH_QUERY_CLOTH_CONTACT_EE_COUNT (unmapped)
-    { "cloth_applyExternalDeltasLaunch", nullptr, nullptr },  // CLOTH_APPLY_EXTERNAL_DELTAS (unmapped)
+    { "cloth_applyExternalDeltasLaunch", "femClothRigidAttachBda.spv", "cloth_applyExternalDeltasLaunch" },  // CLOTH_APPLY_EXTERNAL_DELTAS (P7.1 tranche 3c BDA port: fold mDeltaPos into position/velocity)
     { "cloth_updateClothContactValidityLaunch", nullptr, nullptr },  // CLOTH_UPDATE_CLOTH_CONTACT_VALIDITY (unmapped)
     { "cloth_solveCPOutputClothDeltaVLaunch", nullptr, nullptr },  // CLOTH_PARTICLE_CLOTH_DELTA (unmapped)
     { "cloth_solveCPOutputParticleDeltaVLaunch", nullptr, nullptr },  // CLOTH_PARTICLE_PARTICLE_DELTA (unmapped)

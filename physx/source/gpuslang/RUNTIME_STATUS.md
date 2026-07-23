@@ -337,6 +337,55 @@ scene tranche's concern). This tranche was drafted by a background worktree agen
 INDEPENDENTLY re-verified in the main tree (build, both-mode suite, my own mutation check with a
 forced-fresh recompile, regression) before commit.
 
+## P7.1 tranche 3bc — MILESTONE: a FEMCloth HANGS from a pinned edge and drapes under gravity (the cloth money shot)
+
+The culmination of the P7.1 cloth arc: a triangle-mesh `PxDeformableSurface` pinned along its top
+edge now **HANGS and drapes to rest** on the Slang/Vulkan (llvmpipe) engine path — the cloth analog
+of the P6.5 settling-bag particle money shot. Two parts:
+
+**3c — the missing link `cloth_applyExternalDeltasLaunch`** (`FEMClothExternalSolve.cu:1053`, ABI
+`{8,8,4}`, launch `PxgFEMClothCore.cpp:2113`, block dim SB_SOLVETETRA=64). `PXG_SLANG_KERNEL_MAPPED`
+191 → **192** (manifest hand-edited). This per-vertex kernel folds the accumulated external
+correction — `mDeltaPos` (`.w` = the running per-vertex count) written by the attachment/contact
+solves — into `mPosition_InvMass` / `mVelocity_InvMass` / `mAccumulatedDeltaPos` (`scale = 1/.w`,
+`vel += delta/scale·invDt`, `pos += delta`), then clears it. **It is the ONLY consumer of
+`mDeltaPos`; without it every cloth attachment (and cloth-cloth / contact) correction was
+dead-ended — surfaced by the tranche-3b scene agent's honest report** (the pin dispatched but moved
+nothing). Added to `femClothRigidAttachBda.slang` (NoContraction-stamped). New unit test
+`gpuslang.femClothSim` `ApplyExternalDeltas`: three vertices (counts 2 / 0 / 3), bit-exact vs the
+`.cu` (the count-0 vertex must stay untouched, the others fold + clear) — mutation-checked
+(`pos += delta·1.0001` fails the two applied vertices under a forced-fresh recompile).
+
+**3b — the `PXG_SCENE=clothhang` scene.** A vertical triangle-mesh curtain (top row at y=5, hanging
+to y=3) is pinned along its **top row (5 distinct vertices → one rigid attachment each**, so the
+exact single-attachment 3a path, no averaging kernel) to a static world anchor via the REAL
+deformable-surface attachment API (`PxPhysics::createDeformableAttachment`, type eVERTEX↔eWORLD →
+`Sc::Scene::addRigidAttachment(body=NULL)` → `PxgSimulationController::addRigidAttachment`). It steps
+under gravity with the live P7.1.1/.2 energy solve + the P7.1.3a attachment prepare/solve + this 3c
+apply.
+
+**KEY EVIDENCE (`PXG_SCENE=clothhang PXG_SOLVER=pgs`, 120 steps):**
+```
+top row    y 5.0000 -> 5.0000  (max |dev| = 0.00000)   -- pinned edge holds exactly
+bottom row y 3.0000 -> 2.9869  (dropped 0.0131)        -- drapes + stabilizes
+bottom rest |dy| over the last 30 steps = 0.000000     -- converged to rest
+cloth_applyExternalDeltasLaunch OK x1120 (+ attachment prepare/solve OK every iteration)
+[  OK  ] gpu-sdk-step: FEMCloth HANGS from its pinned edge and drapes under gravity
+```
+The pinned top row stays at y=5 to the ULP; the free cloth hangs as a coherent draped sheet (the
+energy solve holds its shape against gravity) and comes to REST — NOT free-fall (the P7.0 free-fall
+dropped 4.99 m; this drops 0.013 m of stretch and stops). Full suite **673/673 both memory modes**
+(femClothSim now 20 cases); rigid regression 8×2 = **16/16**; the `cloth` free-fall + `box` +
+`particle` scenes are byte-unchanged.
+
+Deferred (the next frontier, all currently refuse cleanly + are no-ops for a non-self-intersecting
+hanging curtain): cloth **self-collision** (`cloth_selfCollisionMidphaseLaunch` + its sort/reorder
+chain) and cloth-vs-primitive **contact** — needed for a cloth that drapes OVER an object or folds
+onto itself. The TGS attachment path also freezes the curtain (TGS cloth position-integration not
+fully mapped), so the hang is a **PGS** result, exactly as the particle settling bag was first a PGS
+result. This closes the cloth attachment loop end-to-end; 3c was ported + verified in the main tree,
+3b salvaged from the (honest-reporting) scene agent, and the money shot re-run green here.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

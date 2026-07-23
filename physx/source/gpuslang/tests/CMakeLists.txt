@@ -414,7 +414,8 @@ pxg_compile_shader(femClothSolvePairBda cloth_solveTrianglePairEnergyLaunch
 # cone-limited attachment path are deferred (rigid / world anchor scope).
 pxg_compile_shader(femClothRigidAttachBda cloth_rigidAttachmentPrepareLaunch
                    cloth_solveRigidClothAttachmentLaunch
-                   cloth_solveRigidClothAttachmentTGSLaunch)
+                   cloth_solveRigidClothAttachmentTGSLaunch
+                   cloth_applyExternalDeltasLaunch)
 pxg_compile_shader(contactReduce ctContactReduce)
 pxg_compile_shader(npSbTet ctSbTet)
 pxg_compile_shader(npSbSelf ctSbSelfQuery)

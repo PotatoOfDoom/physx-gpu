@@ -1922,4 +1922,94 @@ static void runRigidAttach(bool isTGS)
 PXG_TEST(femClothSimRigidAttachPGS) { runRigidAttach(/*isTGS*/ false); }
 PXG_TEST(femClothSimRigidAttachTGS) { runRigidAttach(/*isTGS*/ true); }
 
+// ---------------------------------------------------------------------------
+// P7.1 tranche 3c: cloth_applyExternalDeltasLaunch — folds the accumulated
+// external correction (mDeltaPos, .w = per-vertex count) into position / velocity
+// / accumulated-delta, then clears it.  The missing link that lets an attachment
+// (or contact) actually move a cloth vertex.  Bit-exact vs FEMClothExternalSolve.cu:1053.
+// ---------------------------------------------------------------------------
+struct ApplyExtPush { uint64_t clothes, activeClothes; float dt; uint32_t pad20; };
+static_assert(sizeof(ApplyExtPush) == 24, "applyExternalDeltas push blob must be 24 bytes");
+
+PXG_TEST(femClothSimApplyExternalDeltas)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t N = 3;
+    const float dt = 1.0f / 60.0f;
+    const float invDt = 1.0f / dt;
+
+    std::vector<F4> positions = { {1.f,2.f,3.f,1.f}, {4.f,5.f,6.f,1.f}, {7.f,8.f,9.f,1.f} };
+    std::vector<F4> vels = { {0.1f,0.2f,0.3f,0.f}, {-0.1f,-0.2f,-0.3f,0.f}, {0.05f,-0.05f,0.15f,0.f} };
+    std::vector<F4> accum = { {0.5f,0.5f,0.5f,0.f}, {1.f,1.f,1.f,0.f}, {-1.f,-1.f,-1.f,0.f} };
+    // vert0 count=2 (apply), vert1 count=0 (skip, must stay untouched), vert2 count=3 (apply)
+    std::vector<F4> deltaPos = { {0.3f,-0.6f,0.9f,2.0f}, {9.f,9.f,9.f,0.0f}, {1.5f,0.3f,-0.9f,3.0f} };
+
+    DevBuf bPos = makeDev(dev, positions);
+    DevBuf bVel = makeDev(dev, vels);
+    DevBuf bAcc = makeDev(dev, accum);
+    DevBuf bDelta = makeDev(dev, deltaPos);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
+    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
+    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
+    c.mNbVerts = N;
+
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    ApplyExtPush push = {};
+    push.clothes = bDesc.addr;
+    push.activeClothes = bActive.addr;
+    push.dt = dt;
+
+    Kernel k("femClothRigidAttachBda.spv", "cloth_applyExternalDeltasLaunch", {}, sizeof(ApplyExtPush));
+    k.dispatch(/*numBlocks*/ 1u, {}, push, /*nbActive*/ 1u, 1u);
+    dev->flush();
+
+    // CPU reference (FEMClothExternalSolve.cu:1053).
+    std::vector<F4> refPos = positions, refVel = vels, refAcc = accum, refDelta = deltaPos;
+    for (uint32_t v = 0; v < N; ++v)
+    {
+        const F4 d = deltaPos[v];
+        if (d.w != 0.0f)
+        {
+            const float scale = 1.0f / d.w;
+            const F4 sd = { d.x * scale, d.y * scale, d.z * scale, 0.0f };
+            refVel[v] = { vels[v].x + sd.x * invDt, vels[v].y + sd.y * invDt, vels[v].z + sd.z * invDt, vels[v].w + sd.w * invDt };
+            refPos[v] = { positions[v].x + sd.x, positions[v].y + sd.y, positions[v].z + sd.z, positions[v].w + sd.w };
+            refAcc[v] = { accum[v].x + sd.x, accum[v].y + sd.y, accum[v].z + sd.z, accum[v].w + sd.w };
+            refDelta[v] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        }
+    }
+
+    const auto gPos = downloadBuffer<F4>(dev, bPos.h, N);
+    const auto gVel = downloadBuffer<F4>(dev, bVel.h, N);
+    const auto gAcc = downloadBuffer<F4>(dev, bAcc.h, N);
+    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, N);
+
+    PXG_CHECK_MSG(f2u(gPos[0].x) != f2u(positions[0].x), "applyExternalDeltas should move vert0 (teeth)");
+    PXG_CHECK_MSG(f2u(gPos[1].x) == f2u(positions[1].x), "vert1 (count 0) must stay untouched");
+
+    size_t mm = 0;
+    auto cmp4 = [&](const char* nm, uint32_t i, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm; std::printf("  %s[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm, i, r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
+    };
+    for (uint32_t v = 0; v < N; ++v)
+    {
+        cmp4("pos", v, refPos[v], gPos[v]);
+        cmp4("vel", v, refVel[v], gVel[v]);
+        cmp4("acc", v, refAcc[v], gAcc[v]);
+        cmp4("delta", v, refDelta[v], gDelta[v]);
+    }
+    PXG_CHECK_MSG(mm == 0, "cloth_applyExternalDeltas bit-exact vs CPU (%zu mismatches)", mm);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h);
+    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
 } // namespace

@@ -301,6 +301,12 @@ static const uint8_t kClothRigidAttachPrep[] = { 8, 8, 8, 8, 4, 8, 8, 8, 8, 8 };
 //   bytes.
 static const uint8_t kClothRigidAttachSolve[] = { 8, 8, 4, 8, 8, 8, 8, 4, 8 };
 
+// gpusimulationcontroller FEMCloth.cu apply-external-deltas (P7.1 tranche 3c):
+//   cloth_applyExternalDeltasLaunch(PxgFEMCloth* femClothes, const PxU32*
+//     activeClothes, PxReal dt)  -- launch PxgFEMClothCore.cpp:2113.  Two device
+//   pointers + PxReal -> natural-alignment blob = 24 bytes (20 rounded to 8).
+static const uint8_t kClothApplyExtDeltas[] = { 8, 8, 4 };
+
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
@@ -618,6 +624,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_rigidAttachmentPrepareLaunch", kClothRigidAttachPrep, uint32_t(sizeof(kClothRigidAttachPrep)) },
     { "cloth_solveRigidClothAttachmentLaunch", kClothRigidAttachSolve, uint32_t(sizeof(kClothRigidAttachSolve)) },
     { "cloth_solveRigidClothAttachmentTGSLaunch", kClothRigidAttachSolve, uint32_t(sizeof(kClothRigidAttachSolve)) },
+    { "cloth_applyExternalDeltasLaunch", kClothApplyExtDeltas, uint32_t(sizeof(kClothApplyExtDeltas)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },
