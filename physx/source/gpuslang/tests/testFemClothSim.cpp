@@ -63,6 +63,9 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <algorithm>
+#include <numeric>
+#include <random>
 
 namespace
 {
@@ -2553,5 +2556,113 @@ PXG_TEST(femClothSimSphereVertContactGen)
     dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bTc.h); dev->destroyBuffer(bCd.h);
     dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h);
 }
+
+// ===========================================================================
+// P7.1 tranche 4b-1: cloth-vs-rigid contact SORT / REORDER.
+//   femClothContactSortBda.spv:
+//     fem_reorderRigidContactsLaunch  (softbodyPrimitives.cu:1655)
+// The reorder gathers the 4a-generated unsorted cloth-vs-rigid contact arrays
+// (point / normalPen / barycentric / info) into the `…Sorted…` buffers through
+// the by-rigid radix ranks (remapByRigid) produced upstream by the already-mapped
+// plain radix sort, and splits the sorted contact-info's pairInd0 (PxU64 rigid id)
+// into a separate sortedRigidIds array.  A PURE permutation: no float arithmetic,
+// so every moved float4 / info byte must survive verbatim.  Checked bit-exact vs a
+// CPU gather in BOTH memory modes (the FemOtherContactInfoHost mirror @2033 pins
+// the 16-byte contact-info layout the shader gathers).
+// ===========================================================================
+
+// fem_reorderRigidContactsLaunch push blob — byte-identical to
+// femClothContactSortBda.slang's FemReorderParams (ABI row {8}x11 = 88 bytes).
+struct FemReorderPush
+{
+    uint64_t contacts, normalpens, barycentrics, contactInfos, numContacts, remapByRigid;
+    uint64_t sortedContacts, sortedNormalPens, sortedBarycentrics, sortedContactInfos, sortedRigidIds;
+};
+static_assert(sizeof(FemReorderPush) == 88, "fem reorder push blob must be 88 bytes");
+
+// Bit-exact reorder-gather proof for a given contact count.  NC is chosen by the
+// callers to cover both the single-iteration common case and the grid-stride loop
+// (NC > SB_REORDERCONTACTS grid*block = 262144 forces a second loop iteration,
+// exercising the CUDA-precedence-preserved numIternations term).
+static void runReorderRigidContacts(uint32_t NC, uint32_t seed)
+{
+    std::mt19937 rng(seed);
+    PxgSlangComputeDevice* dev = testDevice();
+
+    std::vector<F4> contacts(NC), normalpens(NC), barycentrics(NC);
+    std::vector<FemOtherContactInfoHost> infos(NC);
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        // Distinct finite floats per lane (rng() value-cast, the psContactSort
+        // precedent) — a wrong permutation is caught, no NaN-canonicalization risk.
+        contacts[i]     = { float(rng()), float(rng()), float(rng()), float(rng()) };
+        normalpens[i]   = { float(rng()), float(rng()), float(rng()), float(rng()) };
+        barycentrics[i] = { float(rng()), float(rng()), float(rng()), float(rng()) };
+        // The 16-byte contact info carries raw integer bit patterns (a true bit
+        // test); pairInd0 is the PxU64 rigid id the kernel also splits out.
+        infos[i].pairInd0 = (uint64_t(rng()) << 32) | uint64_t(rng());
+        infos[i].pairInd1 = rng();
+        infos[i].rigidMatInd_isInCollision = rng();
+    }
+
+    // by-rigid sort ranks: an arbitrary permutation of [0, NC) (what the upstream
+    // radix sort emits into mContactRemapSortedByRigidBuf).
+    std::vector<uint32_t> remapByRigid(NC);
+    std::iota(remapByRigid.begin(), remapByRigid.end(), 0u);
+    std::shuffle(remapByRigid.begin(), remapByRigid.end(), rng);
+
+    DevBuf bContacts = makeDev(dev, contacts);
+    DevBuf bNormalPens = makeDev(dev, normalpens);
+    DevBuf bBarycentrics = makeDev(dev, barycentrics);
+    DevBuf bInfos = makeDev(dev, infos);
+    DevBuf bNum = makeDev(dev, std::vector<uint32_t>(1, NC));
+    DevBuf bRemap = makeDev(dev, remapByRigid);
+    DevBuf bSortedContacts = makeDev(dev, std::vector<F4>(NC));
+    DevBuf bSortedNormalPens = makeDev(dev, std::vector<F4>(NC));
+    DevBuf bSortedBarycentrics = makeDev(dev, std::vector<F4>(NC));
+    DevBuf bSortedInfos = makeDev(dev, std::vector<FemOtherContactInfoHost>(NC));
+    DevBuf bSortedRigidIds = makeDev(dev, std::vector<uint64_t>(NC));
+    if (!bContacts.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    FemReorderPush push = {
+        bContacts.addr, bNormalPens.addr, bBarycentrics.addr, bInfos.addr, bNum.addr, bRemap.addr,
+        bSortedContacts.addr, bSortedNormalPens.addr, bSortedBarycentrics.addr,
+        bSortedInfos.addr, bSortedRigidIds.addr };
+    Kernel k("femClothContactSortBda.spv", "fem_reorderRigidContactsLaunch", {}, sizeof(FemReorderPush));
+    k.dispatch(/*gridX SB_REORDERCONTACTS*/ 1024u, {}, push);
+    dev->flush();
+
+    const auto gC = downloadBuffer<F4>(dev, bSortedContacts.h, NC);
+    const auto gN = downloadBuffer<F4>(dev, bSortedNormalPens.h, NC);
+    const auto gB = downloadBuffer<F4>(dev, bSortedBarycentrics.h, NC);
+    const auto gI = downloadBuffer<FemOtherContactInfoHost>(dev, bSortedInfos.h, NC);
+    const auto gR = downloadBuffer<uint64_t>(dev, bSortedRigidIds.h, NC);
+
+    size_t bad = 0;
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        const uint32_t r = remapByRigid[i];
+        if (std::memcmp(&gC[i], &contacts[r], sizeof(F4)) != 0) ++bad;
+        if (std::memcmp(&gN[i], &normalpens[r], sizeof(F4)) != 0) ++bad;
+        if (std::memcmp(&gB[i], &barycentrics[r], sizeof(F4)) != 0) ++bad;
+        if (std::memcmp(&gI[i], &infos[r], sizeof(FemOtherContactInfoHost)) != 0) ++bad;
+        if (gR[i] != infos[r].pairInd0) ++bad; // sortedRigidIds[i] == sortedInfo.pairInd0
+    }
+    PXG_CHECK_MSG(bad == 0, "cloth reorder gather bit-exact NC=%u (%zu mismatches)", NC, bad);
+
+    dev->destroyBuffer(bContacts.h); dev->destroyBuffer(bNormalPens.h); dev->destroyBuffer(bBarycentrics.h);
+    dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bRemap.h);
+    dev->destroyBuffer(bSortedContacts.h); dev->destroyBuffer(bSortedNormalPens.h);
+    dev->destroyBuffer(bSortedBarycentrics.h); dev->destroyBuffer(bSortedInfos.h);
+    dev->destroyBuffer(bSortedRigidIds.h);
+}
+
+// Common case: ~20 active device blocks, single grid-stride iteration.
+PXG_TEST(femClothSimReorderRigidContacts) { runReorderRigidContacts(5000u, 0x5EED4B01u); }
+
+// Grid-stride coverage: NC just past SB_REORDERCONTACTS grid*block (256*1024 =
+// 262144) so the last 777 contacts are gathered on the SECOND loop iteration,
+// exercising the numIternations / index += blockDim*gridDim stride verbatim.
+PXG_TEST(femClothSimReorderRigidContactsMultiIter) { runReorderRigidContacts(262144u + 777u, 0x4B02F00Du); }
 
 } // namespace

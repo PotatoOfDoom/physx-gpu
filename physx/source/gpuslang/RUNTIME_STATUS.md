@@ -437,6 +437,38 @@ is deferrable for a static floor, the P7.1.3a static-anchor precedent). **4c** �
 salvaged + INDEPENDENTLY re-verified in the main tree (build, both-mode suite, my own forced-fresh
 mutation check, regression) before commit.
 
+## P7.1 tranche 4b-1 — cloth rigid-contact SORT / reorder on the BDA engine ABI
+
+The second tranche of the cloth-drape arc (the analog of particle P6.4b-1): reorder the P7.1.4a-generated
+cloth-vs-rigid contacts into the by-rigid `…Sorted…` buffers the prepare/solve read. One kernel;
+`PXG_SLANG_KERNEL_MAPPED` 195 → **196**:
+- `fem_reorderRigidContactsLaunch` (`FEM_REORDER_RS_CONTACTS`, launch `PxgFEMCore.cpp:231`, ABI
+  `{8}×11`=88B, block/grid SB_REORDERCONTACTS 256/1024) — a pure gather: `remapIndex =
+  remapByRigid[index]`, then copy `contacts / normalpens / barycentrics / contactInfos[remapIndex]`
+  into the four sorted arrays and split the sorted info's `pairInd0` (PxU64 rigid id) into
+  `sortedRigidIds[index]`. New shader `femClothContactSortBda.slang` (mirrors the particle
+  `psContactSortBda` precedent — a distinct pipeline stage, no imports).
+
+The radix sort that produces `remapByRigid` is **already mapped** — `PxgFEMClothCore::sortContacts()`
+drives the plain `RS_MULTIBLOCK`/`RS_CALCULATERANKS_MULTIBLOCK` (P6.4b-1) + `RS_COPY_HIGH_32BITS`/
+`RS_COPY_VALUE`, and `updateGPURadixSortBlockDesc` is a host function (no kernel). No sort-setup kernel
+is missing. **Fully BIT-EXACT** (a pure index-remapped load/store — zero float arithmetic, so NOT in
+`PXG_NOCONTRACT_SHADERS`; the float4 lanes move as opaque bit patterns). New unit tests
+`gpuslang.femClothSim` +2 cases (`ReorderRigidContacts` NC=5000; `…MultiIter` NC=262921 > grid·block,
+forcing the second grid-stride iteration): a shuffled `[0,NC)` rank permutation → reorder → every
+sorted point/normalPen/barycentric/info is the exact permutation + `sortedRigidIds[i]==info.pairInd0`,
+bit-exact; independently mutation-checked in the main tree (`barycentrics[remapIndex]→[index]` +
+forced-fresh `.spv` recompile fails both cases). Full suite **673/673 both memory modes**; rigid
+regression 8×2 = **16/16** (one previously-`nullptr` row hand-edited; no scene uses it yet).
+
+Deviations (behavior-preserving): NO NoContraction (pure gather); the CUDA grid-stride early-`return`
+kept verbatim (no groupshared/barrier); operator precedence `(n+B·G-1)/B*G` preserved verbatim
+(exercised by the multi-iter case); PxU64 rigid id carried as `uint2` halves. Drafted by a background
+worktree agent, salvaged + INDEPENDENTLY re-verified in the main tree (build, both-mode suite, my own
+forced-fresh mutation check, regression) before commit. Remaining: 4b-2 PREPARE
+(`cloth_rigidContactPrepareLaunch`) → 4b-3 SOLVE (`cloth_queryRigidClothContactReferenceCount{,TGS}` +
+`cloth_solveRigidClothCollision{,TGS}`) → 4c the `clothdrape` floor scene.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

@@ -329,6 +329,17 @@ static const uint8_t kClothMidphaseVertPairs[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 8 
 //   PxU32 nbFilterPairs (@72) + the 80-byte writer (@80) -> 160-byte blob.
 static const uint8_t kClothVertContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80 };
 
+// gpunarrowphase softbodyPrimitives.cu:1655 (P7.1 tranche 4b-1 cloth-vs-rigid
+// contact SORT / reorder):
+//   fem_reorderRigidContactsLaunch(const float4* contacts, const float4* normalpens,
+//     const float4* barycentrics, const PxgFemOtherContactInfo* contactInfos,
+//     const PxU32* numContacts, const PxU32* remapByRigid, float4* sortedContacts,
+//     float4* sortedNormalPens, float4* sortedBarycentrics,
+//     PxgFemOtherContactInfo* sortedContactInfos, PxU64* sortedRigidIds)
+//   -> 11 device pointers = {8,8,8,8,8,8,8,8,8,8,8} = 88-byte blob.  Launch site
+//   PxgFEMCore::reorderRigidContacts() PxgFEMCore.cpp:232.
+static const uint8_t kFemReorderRSContacts[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
+
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
@@ -651,6 +662,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_midphaseGenerateVertexPairsLaunch", kClothMidphaseVertPairs, uint32_t(sizeof(kClothMidphaseVertPairs)) },
     { "cloth_planeVertContactGenLaunch", kClothVertContactGen, uint32_t(sizeof(kClothVertContactGen)) },
     { "cloth_SphereVertexContactGenLaunch", kClothVertContactGen, uint32_t(sizeof(kClothVertContactGen)) },
+    // gpunarrowphase FEMCloth-vs-rigid contact SORT / reorder (P7.1 tranche 4b-1 BDA)
+    { "fem_reorderRigidContactsLaunch", kFemReorderRSContacts, uint32_t(sizeof(kFemReorderRSContacts)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },

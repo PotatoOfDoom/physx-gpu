@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 195;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 196;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -438,7 +438,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_accumulateInPlaneDampingDeltaVelocity", nullptr, nullptr },  // CLOTH_IN_PLANE_DAMPING (unmapped)
     { "cloth_accumulateBendingDampingDeltaVelocity", nullptr, nullptr },  // CLOTH_BENDING_DAMPING (unmapped)
     { "cloth_applyAccumulatedDeltaVelocity", nullptr, nullptr },  // CLOTH_APPLY_ACCUMULATED_DAMPING (unmapped)
-    { "fem_reorderRigidContactsLaunch", nullptr, nullptr },  // FEM_REORDER_RS_CONTACTS (unmapped)
+    { "fem_reorderRigidContactsLaunch", "femClothContactSortBda.spv", "fem_reorderRigidContactsLaunch" },  // FEM_REORDER_RS_CONTACTS (P7.1 tranche 4b-1 BDA port)
     { "clampMaxValue", "particleContactSortBda.spv", "clampMaxValue" },  // CLAMP_MAX_VALUE (P6.1 BDA re-point)
     { "clampMaxValues", "clampValues.spv", "clampMaxValues" },  // CLAMP_MAX_VALUES
     { "scanPerBlockKernel", "scan.spv", "scanPerBlockKernel" },  // scanPerBlockKernel
