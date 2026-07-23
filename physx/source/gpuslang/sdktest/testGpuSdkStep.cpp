@@ -582,6 +582,164 @@ float clothMeanY(const ClothScene& csc)
     return float(sum / double(csc.numVerts));
 }
 
+// DtoH-read the cloth vertex buffer once and fill the mean AND the min y across all
+// verts (the drape needs the min to prove no corner tunnelled below the floor).
+// Returns false on any non-finite y.
+bool clothMeanMinY(const ClothScene& csc, float& meanY, float& minY)
+{
+    std::vector<PxVec4> host(csc.numVerts);
+    PxCudaContext* ctx = csc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(csc.surface->getPositionInvMassBufferD()),
+                    csc.numVerts * sizeof(PxVec4));
+    double sum = 0.0;
+    float lo = 1.0e30f;
+    bool finite = true;
+    for (PxU32 i = 0; i < csc.numVerts; ++i)
+    {
+        const float y = host[i].y;
+        sum += double(y);
+        lo = PxMin(lo, y);
+        if (!std::isfinite(y) || !std::isfinite(host[i].x) || !std::isfinite(host[i].z)) finite = false;
+    }
+    meanY = float(sum / double(csc.numVerts));
+    minY = lo;
+    return finite;
+}
+
+// PXG_SCENE=clothdrape (P7.1 tranche 4c): the cloth-vs-rigid CONTACT money shot — a
+// HORIZONTAL FEMCloth sheet dropped a short distance ABOVE a STATIC floor, with NO pins.
+// The whole cloth-vs-primitive contact chain must CATCH it: broadphase pairs the cloth
+// mesh with the static PLANE (cndCasePlaneMesh -> GPU_BUCKET_ID::eFemClothPlane), the
+// narrowphase dispatches testSDKFemClothPlane (cloth_planeVertContactGenLaunch), the
+// contacts sort (fem_reorderRigidContactsLaunch + the shared radix sort), prepare
+// (cloth_rigidContactPrepareLaunch), query ref-count + solve
+// (cloth_queryRigidClothContactReferenceCount{,TGS} + cloth_solveRigidClothCollision{,TGS}),
+// and the accumulated mDeltaPos folds back into the vertices via
+// cloth_applyExternalDeltasLaunch.  A static PLANE is the natural target because
+// cloth_planeVertContactGenLaunch is the mapped direct plane path (no midphase needed).
+//
+// EXPECTED PHYSICS: the sheet free-falls, the floor contact generates+solves, and the
+// cloth SETTLES resting ON the floor (mean y drops then converges to ~floorY + the cloth
+// contact/rest offset), NOT tunnelling to -inf and NOT free-falling through.
+//
+// A live dynamic rigid (a box resting on the same plane, spawned FAR from the cloth in x)
+// is kept for the same reason as the free-fall/hang scenes: the cloth solve runs inside
+// the rigid PGS island loop, whose descriptors must be non-null.  It is placed well away
+// from the cloth footprint so it never touches the sheet.
+struct ClothDrapeConfig { float floorY = 0.0f; float spawnY = 1.5f; };
+
+ClothScene buildClothDrapeScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
+                                PxCudaContextManager* cudaCtx, const ClothDrapeConfig& cfg)
+{
+    ClothScene out;
+    out.cudaCtx = cudaCtx;
+
+    // The STATIC FLOOR: an infinite plane at y = floorY, normal +Y.  This is the surface
+    // the cloth contact path must catch (cloth-vertex-vs-plane, the mapped direct path).
+    PxRigidStatic* floor = physics->createRigidStatic(
+        PxTransformFromPlaneEquation(PxPlane(0.0f, 1.0f, 0.0f, -cfg.floorY)));
+    PxShape* floorShape = physics->createShape(PxPlaneGeometry(), *rigidMat);
+    floor->attachShape(*floorShape);
+    scene->addActor(*floor);
+    floorShape->release();
+
+    // A live dynamic rigid resting on the SAME plane, spawned FAR from the cloth (x=8) so
+    // it never interacts with the sheet.  Keeps the rigid PGS island non-empty (see the
+    // free-fall/hang scenes' rationale) and rides the proven box-on-plane contact path.
+    {
+        PxRigidDynamic* b = physics->createRigidDynamic(PxTransform(PxVec3(8.0f, cfg.floorY + 3.0f, 0.0f)));
+        PxShape* s = physics->createShape(PxBoxGeometry(0.5f, 0.5f, 0.5f), *rigidMat);
+        b->attachShape(*s);
+        b->setMass(1000.0f);
+        b->setMassSpaceInertiaTensor(boxInertia(PxVec3(0.5f), 1000.0f));
+        scene->addActor(*b);
+        s->release();
+    }
+
+    // Cook the same small horizontal triangle GRID mesh as buildClothScene (buildGPUData +
+    // eENABLE_VERT_MAPPING mandatory).  Sheet is planar in XZ, spawned at y = spawnY.
+    const PxU32 numX = 5, numZ = 5;              // 25 verts, 32 triangles
+    const float sizeX = 2.0f, sizeZ = 2.0f;
+    const float sx = sizeX / float(numX - 1);
+    const float sz = sizeZ / float(numZ - 1);
+
+    std::vector<PxVec3> verts;
+    verts.reserve(numX * numZ);
+    for (PxU32 i = 0; i < numX; ++i)
+        for (PxU32 j = 0; j < numZ; ++j)
+            verts.push_back(PxVec3(float(i) * sx - 0.5f * sizeX, 0.0f, float(j) * sz - 0.5f * sizeZ));
+
+    std::vector<PxU32> tris;
+    tris.reserve(3 * 2 * (numX - 1) * (numZ - 1));
+    auto vid = [numZ](PxU32 x, PxU32 y) { return x * numZ + y; };
+    for (PxU32 i = 1; i < numX; ++i)
+        for (PxU32 j = 1; j < numZ; ++j)
+        {
+            tris.push_back(vid(i - 1, j - 1)); tris.push_back(vid(i, j - 1)); tris.push_back(vid(i - 1, j));
+            tris.push_back(vid(i - 1, j));     tris.push_back(vid(i, j - 1)); tris.push_back(vid(i, j));
+        }
+
+    PxTriangleMeshDesc meshDesc;
+    meshDesc.points.count = PxU32(verts.size());
+    meshDesc.points.stride = sizeof(PxVec3);
+    meshDesc.points.data = verts.data();
+    meshDesc.triangles.count = PxU32(tris.size() / 3);
+    meshDesc.triangles.stride = 3 * sizeof(PxU32);
+    meshDesc.triangles.data = tris.data();
+
+    PxCookingParams ckParams(physics->getTolerancesScale());
+    ckParams.buildGPUData = true;
+    ckParams.meshPreprocessParams |= PxMeshPreprocessingFlag::eENABLE_VERT_MAPPING;
+
+    PxTriangleMesh* triMesh =
+        immediateCooking::createTriangleMesh(ckParams, meshDesc, physics->getPhysicsInsertionCallback());
+    if (!triMesh) { std::printf("FAIL: immediateCooking::createTriangleMesh returned null\n"); return out; }
+
+    PxDeformableSurfaceMaterial* clothMat =
+        physics->createDeformableSurfaceMaterial(/*youngs*/ 1.e6f, /*poissons*/ 0.3f,
+            /*dynamicFriction*/ 0.5f, /*thickness*/ 0.01f, /*bendingStiffness*/ 1.e-4f);
+    PxDeformableSurfaceMaterial* mats[1] = { clothMat };
+
+    PxShapeFlags shapeFlags = PxShapeFlag::eSIMULATION_SHAPE | PxShapeFlag::eSCENE_QUERY_SHAPE;
+    PxShape* shape = physics->createShape(PxTriangleMeshGeometry(triMesh), mats, PxU16(1), true, shapeFlags);
+    if (!shape) { std::printf("FAIL: createShape (deformable surface) returned null\n"); return out; }
+
+    PxDeformableSurface* surface = physics->createDeformableSurface(*cudaCtx);
+    if (!surface) { std::printf("FAIL: createDeformableSurface returned null\n"); return out; }
+
+    surface->setNbCollisionPairUpdatesPerTimestep(4);
+    surface->setNbCollisionSubsteps(1);
+    surface->setLinearDamping(0.0f);
+    surface->setMaxLinearVelocity(1.0e6f);
+    surface->attachShape(*shape);
+    shape->release();
+
+    scene->addActor(*surface);
+
+    // Fill the DEVICE buffers directly.  invMass=1 for every vertex (a genuine free fall
+    // caught only by the floor contact — no pin, no zero-mass bypass); velocity=0; rest =
+    // the flat spawn shape (membrane at rest at spawn).
+    const PxU32 nv = PxU32(verts.size());
+    std::vector<PxVec4> posInvMass(nv), vel(nv, PxVec4(0.0f)), rest(nv);
+    for (PxU32 v = 0; v < nv; ++v)
+    {
+        posInvMass[v] = PxVec4(verts[v].x, cfg.spawnY + verts[v].y, verts[v].z, 1.0f);
+        rest[v]       = PxVec4(verts[v].x, cfg.spawnY + verts[v].y, verts[v].z, 1.0f);
+    }
+
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getPositionInvMassBufferD()),
+                    posInvMass.data(), nv * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getVelocityBufferD()),
+                    vel.data(), nv * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getRestPositionBufferD()),
+                    rest.data(), nv * sizeof(PxVec4));
+
+    out.surface = surface;
+    out.numVerts = nv;
+    return out;
+}
+
 // PXG_SCENE=clothhang (P7.1 tranche 3b): a HANGING / draping cloth — the visible
 // "cloth is usable" money shot.  Same triangle-mesh PxDeformableSurface cook + GPU
 // spawn as the free-fall 'cloth' scene, but the cloth is oriented as a VERTICAL
@@ -1058,6 +1216,82 @@ int main()
         return 2;
     }
 
+    // PXG_SCENE=clothdrape (P7.1 tranche 4c): the cloth-vs-rigid CONTACT money shot.
+    // A horizontal FEMCloth sheet dropped above a STATIC plane floor with NO pins; the
+    // floor contact chain must catch it and it must SETTLE resting on the floor (mean y
+    // drops then converges to ~floorY), NOT tunnel to -inf and NOT free-fall through.
+    if (!std::strcmp(sceneName, "clothdrape"))
+    {
+        const ClothDrapeConfig cfg;   // floorY = 0.0, spawnY = 1.5
+        ClothScene csc = buildClothDrapeScene(physics, scene, material, cudaCtx, cfg);
+        if (!csc.surface || csc.numVerts == 0)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: clothdrape scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'clothdrape' built: %u-vertex FEMCloth sheet spawned at y~%.2f above a "
+                    "STATIC plane floor at y=%.2f (no pins)\n", csc.numVerts, cfg.spawnY, cfg.floorY);
+
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: clothdrape GPU pipeline CONSTRUCTED + live over Vulkan "
+                        "(set PXG_GPU_STEP=1 to step the drop)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_CLOTH_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 180;
+        float mean0 = 0.0f, min0 = 0.0f;
+        bool finite0 = clothMeanMinY(csc, mean0, min0);
+        std::printf("  stepping the drop (%d x %.4fs): initial mean y=%.4f (min %.4f), floor y=%.2f...\n",
+                    steps, dt, mean0, min0, cfg.floorY);
+
+        float prevMean = mean0;
+        float restMaxDy = 0.0f;         // max |d(mean y)| over the final quarter (convergence)
+        bool allFinite = finite0;
+        const int restWindow = steps / 4;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            float mean = 0.0f, mn = 0.0f;
+            allFinite = clothMeanMinY(csc, mean, mn) && allFinite;
+            if (i >= steps - restWindow) restMaxDy = PxMax(restMaxDy, PxAbs(mean - prevMean));
+            if (i < 6 || i == steps - 1 || (i % 10 == 0))
+                std::printf("    step %3d: mean y = %.5f (dy %+.5f) | min y = %.5f\n",
+                            i, mean, mean - prevMean, mn);
+            prevMean = mean;
+        }
+        float meanEnd = 0.0f, minEnd = 0.0f;
+        clothMeanMinY(csc, meanEnd, minEnd);
+        const float drop = mean0 - meanEnd;
+
+        std::printf("  clothdrape: mean y %.4f -> %.4f (dropped %.4f over %.2fs) | final min y = %.4f; "
+                    "rest |dy| over last %d steps = %.6f\n",
+                    mean0, meanEnd, drop, steps * dt, minEnd, restWindow, restMaxDy);
+
+        int failures = 0;
+        // (1) the cloth must FALL a real distance under gravity (not stuck at spawn).
+        if (!(drop > 0.5f))          { std::printf("FAIL: cloth did not fall (drop=%.4f)\n", drop); ++failures; }
+        // (2) the drop must CONVERGE — the sheet stops moving over the final quarter.
+        if (!(restMaxDy < 0.01f))    { std::printf("FAIL: cloth did not settle (rest |dy|=%.6f)\n", restMaxDy); ++failures; }
+        // (3) it must settle ON the floor: mean near floorY and NOT tunnelled below it.
+        if (!(meanEnd < cfg.floorY + 0.5f)) { std::printf("FAIL: cloth did not reach the floor (meanY=%.4f)\n", meanEnd); ++failures; }
+        if (!(minEnd > cfg.floorY - 0.1f))  { std::printf("FAIL: cloth tunnelled below the floor (minY=%.4f)\n", minEnd); ++failures; }
+        // (4) nothing NaN/inf.
+        if (!allFinite || !std::isfinite(meanEnd)) { std::printf("FAIL: cloth y went non-finite\n"); ++failures; }
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: FEMCloth fell onto the floor and SETTLED under contact\n");
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: clothdrape settle checks failed (%d)\n", failures);
+        return 2;
+    }
+
     std::vector<RestTarget> targets;
     if      (!std::strcmp(sceneName, "box"))       buildBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "stack"))     buildStackScene(physics, scene, material, targets);
@@ -1067,7 +1301,7 @@ int main()
     else if (!std::strcmp(sceneName, "capsulebox")) buildCapsuleBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "convex"))    buildConvexScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "joint"))     buildJointScene(physics, scene, material, targets);
-    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint|particle|cloth|clothhang)\n", sceneName);
+    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint|particle|cloth|clothhang|clothdrape)\n", sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
     if (targets.empty())
     {

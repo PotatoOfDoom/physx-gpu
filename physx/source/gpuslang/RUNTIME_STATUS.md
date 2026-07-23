@@ -507,6 +507,52 @@ INDEPENDENTLY re-verified in the main tree (build, both-mode suite, my own force
 regression) before commit. Remaining: **4c** — the `PXG_SCENE=clothdrape` floor scene (cloth falls,
 the contact pipeline catches it, it settles).
 
+## P7.1 tranche 4c — MILESTONE: a FEMCloth falls onto a floor and SETTLES under contact (the cloth-contact money shot)
+
+The payoff of the cloth-vs-rigid contact arc: a triangle-mesh `PxDeformableSurface` dropped above a
+STATIC floor now **falls, is caught by the contact pipeline, and settles resting ON the floor** — the
+second cloth money shot (after the P7.1.3 hanging cloth), the direct analog of the P6.5 particle
+settling bag. A PURE SCENE tranche (no new kernels — the whole gen→sort→prepare→solve→apply chain is
+mapped by P7.1.4a/4b). New `PXG_SCENE=clothdrape` in `testGpuSdkStep.cpp`: a horizontal 5×5 tri-mesh
+cloth spawned flat at y=1.5 with **invMass=1 everywhere, NO pins/attachments, no zero-mass bypass** —
+only the floor CONTACT can catch it. The floor is a static infinite `PxPlane` at y=0 (the direct
+cloth-vs-plane path `cloth_planeVertContactGenLaunch`, no midphase); one live dynamic box far aside
+keeps the rigid PGS island non-empty.
+
+**KEY EVIDENCE (`PXG_SCENE=clothdrape PXG_SOLVER=pgs`, 180 steps):**
+```
+mean y 1.5000 -> 1.320 (s10) -> 0.148 (s30, free-fall at g) -> 0.00000 (s40, caught) ->
+        0.00000 ... 0.00000 (rest); final min y = -0.0000 (no vertex tunnels below 0);
+        rest |dy| over the last 45 steps = 0.000000
+[  OK  ] gpu-sdk-step: FEMCloth fell onto the floor and SETTLED under contact
+```
+It free-falls at the gravity rate until ~y=0.15, then the plane contact decelerates it to rest exactly
+at the surface (min y never < 0 → no tunnelling). The contact kernels DISPATCH OK in the trace:
+`cloth_planeVertContactGenLaunch` / `fem_reorderRigidContactsLaunch` / `cloth_rigidContactPrepareLaunch`
+×59, `cloth_queryRigidClothContactReferenceCountLaunch` / `cloth_solveRigidClothCollisionLaunch` ×236,
+`cloth_applyExternalDeltasLaunch` ×1180, **zero refusals among them** (contact-gen stops at step 59
+because the settled cloth then sleeps — physically correct). Full unit suite **673/673 both memory
+modes** (unchanged — SDK-scene-only edit); rigid regression 8×2 = **16/16**; `cloth`/`clothhang`/
+`particle` scenes unchanged.
+
+**Solver scope: this is a PGS result** (as the P7.0/3b/4b cloth milestones were). Under TGS all three
+cloth scenes (`cloth`, `clothhang`, `clothdrape`) leave the sheet frozen — cloth gravity integration on
+this Vulkan/llvmpipe path is PGS-only (a TGS cloth-position-integration gap, pre-existing, NOT caused by
+contacts) — so `clothdrape` honestly prints `[FAIL]` under TGS exactly as `cloth`/`clothhang` do; it was
+NOT special-cased to fake a TGS pass.
+
+**Honest gap flagged (a real follow-on):** three single-copy radix-sort helpers used by
+`PxgFEMClothCore::sortContacts` — `clampMaxValues`, `radixSortCopy`, `radixSortCopyHigh32Bits` — REFUSE
+with a push-constant-size ABI mismatch (`paramBlobSize != manifest.pushConstantSize`). Harmless for
+THIS scene (every cloth-vs-plane contact references the SAME single static rigid, so the sort-by-rigid
+key is trivially uniform and the reorder/prepare/solve see the correct order regardless), and the cloth
+settles exactly — but it is a genuine gap the cloth contact sort would hit with MULTIPLE distinct rigid
+contact targets. It is outside this tranche's scope; the fix (align those single-copy radix kernels'
+push-constant ABI, the double-copy variants used by the particle path are already fine) is a scoped
+follow-on. This tranche was drafted by a background worktree agent (honest-reporting) then salvaged +
+INDEPENDENTLY re-verified in the main tree (rebuild, the clothdrape money shot, rigid regression 16/16,
+all cloth/box/particle scenes) before commit.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED
