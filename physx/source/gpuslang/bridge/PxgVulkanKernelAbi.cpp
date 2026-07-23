@@ -281,6 +281,26 @@ static const uint8_t kClothSolveTriPairEnergy[] = { 8, 8, 8, 4, 4, 1, 1 };
 //     blob (bool @20, rounded to the 8-alignment).
 static const uint8_t kClothAvgPairVerts[] = { 8, 8, 4, 1 };
 
+// gpusimulationcontroller FEMCloth rigid-attachment kernels (P7.1 tranche 3a BDA):
+//   cloth_rigidAttachmentPrepareLaunch(PxgFEMCloth* clothes,
+//     PxgFEMRigidAttachment* rigidAttachments, PxU32* activeRigidAttachments,
+//     PxNodeIndex* rigidAttachmentIds, PxU32 numRigidAttachments,
+//     PxgFEMRigidAttachmentConstraint* attachmentConstraints, PxgPrePrepDesc* preDesc,
+//     PxgConstraintPrepareDesc* prepareDesc, PxgSolverSharedDescBase* sharedDesc,
+//     float4* rigidDeltaVel)  -- launch site PxgFEMClothCore.cpp:226.  Four device
+//   pointers + PxU32 (@32) + five device pointers -> natural-alignment blob = 80
+//   bytes (numRigidAttachments's 4-byte tail-pad realigns the @40 pointer).
+static const uint8_t kClothRigidAttachPrep[] = { 8, 8, 8, 8, 4, 8, 8, 8, 8, 8 };
+//   cloth_solveRigidClothAttachmentLaunch / ...TGSLaunch(PxgFEMCloth* clothes,
+//     PxgFEMRigidAttachmentConstraint* attachments, PxU32 numAttachments,
+//     PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
+//     PxgArticulationCoreDesc* artiCoreDesc, PxgSolverSharedDesc* sharedDesc,
+//     PxReal dt, float4* rigidDeltaVel)  -- launch site PxgFEMClothCore.cpp:1858
+//   (both PGS and TGS share the pack).  Two device pointers + PxU32 (@16) + four
+//   device pointers + PxReal (@56) + device pointer -> natural-alignment blob = 72
+//   bytes.
+static const uint8_t kClothRigidAttachSolve[] = { 8, 8, 4, 8, 8, 8, 8, 4, 8 };
+
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
@@ -594,6 +614,10 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_solveTrianglePairEnergyLaunch", kClothSolveTriPairEnergy, uint32_t(sizeof(kClothSolveTriPairEnergy)) },
     { "cloth_solveTrianglePairEnergyClusterLaunch", kClothSolveTriPairEnergy, uint32_t(sizeof(kClothSolveTriPairEnergy)) },
     { "cloth_averageTrianglePairVertsLaunch", kClothAvgPairVerts, uint32_t(sizeof(kClothAvgPairVerts)) },
+    // gpusimulationcontroller FEMCloth rigid-attachment prep + PGS/TGS solve (P7.1 tranche 3a BDA)
+    { "cloth_rigidAttachmentPrepareLaunch", kClothRigidAttachPrep, uint32_t(sizeof(kClothRigidAttachPrep)) },
+    { "cloth_solveRigidClothAttachmentLaunch", kClothRigidAttachSolve, uint32_t(sizeof(kClothRigidAttachSolve)) },
+    { "cloth_solveRigidClothAttachmentTGSLaunch", kClothRigidAttachSolve, uint32_t(sizeof(kClothRigidAttachSolve)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },

@@ -86,7 +86,7 @@ set(SHADER_COMMON_DEPS
 # to contract undecorated expressions: llvmpipe fuses npCvxCoreEpa's
 # makePlane triple-cross sums into fma chains (1-ulp vs strict IEEE), which
 # breaks the bitwise CPU-vs-GPU doctrine.  The decoration forbids that.
-set(PXG_NOCONTRACT_SHADERS npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npD6JointPrep npArtiExtBody npArti1DPrep npArtiJointHeader npArtiSolve1D npArtiSolveContact npArtiSolve1DTGS npArtiSolveContactTGS npArtiCheckActive npArtiPropagate npArtiPropagateAccel npArtiPropagateAccelJV npArtiSpatialMatVec npArtiSpatialMatMat npArtiTranslateInertia npArtiTranslateSInertia npArtiPropagateZA npArtiPropagateZASph npArtiTranslateInertiaMass npArtiInvertInertia npArtiPropagateImpDof npArtiAccumLinkImp npArtiDriveParams npArtiClampDriveImp npClothDefGrad2D npSbDefGrad npDefMaterial npJacobiRotate npClothAtan npAnisoHelpers npClothDeltaLambda npClothExtractRot2D npClothVelClamp npClothArap2D npClothArea2D npClothWind npSbBaryInvMass npSbVolumeSolve npIsoConcaveCorner npSphSpikyKernel npIsoAcosDecode npSparseGridDomain npDenseGridCell npSbBaryProject npIsoVecNormalize npSbCompliance npSbDeltaLambdaGradC npSbTetConstraint npPsSpecVolume npSbComputeLambda npGridLocation npAnisoOutput npSmoothPos npIsoAvgVerts npPsSolvePC npPsSolvePCTGS npPsWeightKernels npPsDiffuseUpdate npPsDiffuseSpawn npPsDiffuseAvg npPsDiffuseOneWay npSdfBoxDist npSparseGridCellFromPos npIsoGridFilter npSbExtractRotAPD npSbSolveNeoHookean npSbSolveCorot npSbSolveGM npClothMembrane npClothBending npClothSharedEnergy npSbCollisionConstraint npClothCollisionConstraint npSdfBvhMorton npSbStress npSdfHoles npClothTriContact particleSim particleSelfCollisionBda psContactSolveTgsBda femClothSimBda femClothSolveBda femClothSolvePairBda)
+set(PXG_NOCONTRACT_SHADERS npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npD6JointPrep npArtiExtBody npArti1DPrep npArtiJointHeader npArtiSolve1D npArtiSolveContact npArtiSolve1DTGS npArtiSolveContactTGS npArtiCheckActive npArtiPropagate npArtiPropagateAccel npArtiPropagateAccelJV npArtiSpatialMatVec npArtiSpatialMatMat npArtiTranslateInertia npArtiTranslateSInertia npArtiPropagateZA npArtiPropagateZASph npArtiTranslateInertiaMass npArtiInvertInertia npArtiPropagateImpDof npArtiAccumLinkImp npArtiDriveParams npArtiClampDriveImp npClothDefGrad2D npSbDefGrad npDefMaterial npJacobiRotate npClothAtan npAnisoHelpers npClothDeltaLambda npClothExtractRot2D npClothVelClamp npClothArap2D npClothArea2D npClothWind npSbBaryInvMass npSbVolumeSolve npIsoConcaveCorner npSphSpikyKernel npIsoAcosDecode npSparseGridDomain npDenseGridCell npSbBaryProject npIsoVecNormalize npSbCompliance npSbDeltaLambdaGradC npSbTetConstraint npPsSpecVolume npSbComputeLambda npGridLocation npAnisoOutput npSmoothPos npIsoAvgVerts npPsSolvePC npPsSolvePCTGS npPsWeightKernels npPsDiffuseUpdate npPsDiffuseSpawn npPsDiffuseAvg npPsDiffuseOneWay npSdfBoxDist npSparseGridCellFromPos npIsoGridFilter npSbExtractRotAPD npSbSolveNeoHookean npSbSolveCorot npSbSolveGM npClothMembrane npClothBending npClothSharedEnergy npSbCollisionConstraint npClothCollisionConstraint npSdfBvhMorton npSbStress npSdfHoles npClothTriContact particleSim particleSelfCollisionBda psContactSolveTgsBda femClothSimBda femClothSolveBda femClothSolvePairBda femClothRigidAttachBda)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
@@ -403,6 +403,18 @@ pxg_compile_shader(femClothSolveBda cloth_solveNonSharedTriangleEnergyLaunch
 pxg_compile_shader(femClothSolvePairBda cloth_solveTrianglePairEnergyLaunch
                    cloth_solveTrianglePairEnergyClusterLaunch
                    cloth_averageTrianglePairVertsLaunch)
+# P7.1 tranche 3a: FEMCloth RIGID-ATTACHMENT constraint prep + PGS/TGS solve on the
+# engine ABI (BDA) — the machinery to PIN a cloth vertex to a rigid / world anchor
+# (toward a hanging cloth).  All three kernels read the PxgFEMCloth descriptor array,
+# the block-of-32 PxgFEMRigidAttachmentConstraint, the PxgFEMRigidAttachment array
+# and the prep / solver-core / solver-shared desc mirrors through Ptr<> (no HLSL
+# cs_6_0 lowering) and grid-stride via nbIterationsPerBlock, so this shader is
+# deliberately absent from PXG_HLSL_ENTRIES (same precedent as femClothSolveBda /
+# psContactSolveTgsBda).  The articulation anchor branch + dynamic-rigid reaction +
+# cone-limited attachment path are deferred (rigid / world anchor scope).
+pxg_compile_shader(femClothRigidAttachBda cloth_rigidAttachmentPrepareLaunch
+                   cloth_solveRigidClothAttachmentLaunch
+                   cloth_solveRigidClothAttachmentTGSLaunch)
 pxg_compile_shader(contactReduce ctContactReduce)
 pxg_compile_shader(npSbTet ctSbTet)
 pxg_compile_shader(npSbSelf ctSbSelfQuery)

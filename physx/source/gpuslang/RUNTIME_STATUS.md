@@ -294,6 +294,49 @@ completion), then salvaged and INDEPENDENTLY re-verified in the main tree — ma
 Phase-1 modules, the atan2 tolerance re-derived and mutation-checked for teeth, and the full
 suite/regression/scene re-run before commit.
 
+## P7.1 tranche 3a — the cloth RIGID-ATTACHMENT constraint kernels on the BDA engine ABI
+
+The machinery to PIN a cloth vertex to a rigid/world anchor (the first half of a hanging/draping
+cloth; the scene that uses it is tranche 3b). Three kernels; `PXG_SLANG_KERNEL_MAPPED` 188 → **191**,
+ported line-for-line from `FEMClothConstraintPrep.cu` + `FEMClothExternalSolve.cu`:
+- `cloth_rigidAttachmentPrepareLaunch` (launch `PxgFEMClothCore.cpp:226`, ABI
+  `{8,8,8,8,4,8,8,8,8,8}`=80B) — builds a `PxgFEMRigidAttachmentConstraint` from each
+  `PxgFEMRigidAttachment` (the anchor world pose, the cloth element + barycentric, the effective
+  mass / raXn rows), zeroing the rigid-side `rigidDeltaVel` slots.
+- `cloth_solveRigidClothAttachmentLaunch` (PGS) + `...TGSLaunch` (launch `:1858`, ABI
+  `{8,8,4,8,8,8,8,4,8}`=72B) — applies the constraint: pull the cloth vertex toward the anchor
+  (scatter the position correction into `mDeltaPos`), accumulate the rigid-side reaction.
+
+New shader `femClothRigidAttachBda.slang`. New byte-exact mirrors (offset-probed vs the real headers,
+static_assert-pinned in the test TU): `PxNodeIndex` (8B, static/articulation bit-ops on the u64),
+`PxgFEMRigidAttachment` (96B, pinned vs `PxgSimulationCoreDesc.h`), `PxgFEMRigidAttachmentConstraint`
+(the RAC_* 32-slab SoA block, replicated host-side because `PxgFEMCore.h` pulls `<cuda.h>` and can't
+be included in the toolkit-free test TU — cited to `PxgFEMCore.h:191`). Reuses the P5 prep/solver-desc
+mirrors (`PxgPrePrepDescGpu` / `PxgConstraintPrepareDescGpu` / `PxgSolverCoreDescGpu` /
+`PxgSolverSharedDesc{PGS,TGS}Gpu` / `PxgSolverBodyData` / `PxgSolverTxIData` / `PxgAlignedTransform`).
+
+**Fully BIT-EXACT — no transcendental/tolerance seam** (the attachment solve is plain linear algebra;
+`getNormalized`'s `PxRecipSqrt` is `1/sqrtf`, IEEE-correctly-rounded). New unit tests
+`gpuslang.femClothSim` +3 cases (`RigidAttachDescLayout`/`PGS`/`TGS`): one cloth vertex + one static
+world anchor, `prepare → solve`, comparing the prepared constraint block AND the solved `mDeltaPos`
+bit-exact vs a CPU transcription (private `p73ref` namespace, verbatim `PxQuat::rotate`/`getNormalized`/
+`PxMat33` leaves). The pull is toward the anchor (error = anchor − clothPos); independently
+mutation-checked in the main tree (a `dp.x += 0.0002` scatter perturbation + forced-fresh `.spv`
+recompile fails both attach cases). Full suite **673/673 both memory modes**; rigid regression
+8×2 = **16/16** (three previously-`nullptr` cloth rows hand-edited, NOT regenerated).
+
+Deviations (flagged, behavior-preserving, all documented in the shader header): the **articulation
+anchor branch** is deferred (a rigid/world anchor is never an articulation — the `psContactSolveTgsBda`
+precedent of sinking `outArtiVelocity` behind the `isArticulation()` guard); the **dynamic-rigid
+reaction** writeback is deferred (CUDA guards it behind `!isStaticBody()`, never taken for a static
+anchor — the prepare still zeroes `rigidDeltaVel` as the CUDA does, verified in the test); the
+**cone-limit** path is deferred (a `PxSinCos` seam; `isConeLimitedEnabled()` is false for a plain pin,
+so the plain velError/tgsError IS the exact CUDA false-path); `atomicAdd(mDeltaPos)` → plain
+read-modify-write (bit-identical for the single-attachment test; multi-attachment averaging is the
+scene tranche's concern). This tranche was drafted by a background worktree agent, then salvaged and
+INDEPENDENTLY re-verified in the main tree (build, both-mode suite, my own mutation check with a
+forced-fresh recompile, regression) before commit.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

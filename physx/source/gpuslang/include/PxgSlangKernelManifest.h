@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 188;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 191;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -408,7 +408,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_heightfieldContactGenLaunch", nullptr, nullptr },  // CLOTH_HF_CG (unmapped)
     { "cloth_midphaseVertexHeightfieldLaunch", nullptr, nullptr },  // CLOTH_MIDPHASE_VERTEX_HF (unmapped)
     { "cloth_heightfieldVertexContactGenLaunch", nullptr, nullptr },  // CLOTH_HF_VERTEX_CG (unmapped)
-    { "cloth_rigidAttachmentPrepareLaunch", nullptr, nullptr },  // CLOTH_RIGID_ATTACHMENT_CONSTRAINT_PREP (unmapped)
+    { "cloth_rigidAttachmentPrepareLaunch", "femClothRigidAttachBda.spv", "cloth_rigidAttachmentPrepareLaunch" },  // CLOTH_RIGID_ATTACHMENT_CONSTRAINT_PREP (P7.1 tranche 3a BDA port: cloth rigid/world attachment constraint prep)
     { "cloth_rigidContactPrepareLaunch", nullptr, nullptr },  // CLOTH_RIGID_CONTACTPREPARE (unmapped)
     { "cloth_clothContactPrepareLaunch", nullptr, nullptr },  // CLOTH_CLOTH_CONTACTPREPARE (unmapped)
     { "cloth_particleContactPrepareLaunch", nullptr, nullptr },  // CLOTH_PARTICLE_CONTACTPREPARE (unmapped)
@@ -428,12 +428,12 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_updateClothContactValidityLaunch", nullptr, nullptr },  // CLOTH_UPDATE_CLOTH_CONTACT_VALIDITY (unmapped)
     { "cloth_solveCPOutputClothDeltaVLaunch", nullptr, nullptr },  // CLOTH_PARTICLE_CLOTH_DELTA (unmapped)
     { "cloth_solveCPOutputParticleDeltaVLaunch", nullptr, nullptr },  // CLOTH_PARTICLE_PARTICLE_DELTA (unmapped)
-    { "cloth_solveRigidClothAttachmentLaunch", nullptr, nullptr },  // CLOTH_SOLVE_RIGID_CLOTH_ATTACHMENT (unmapped)
+    { "cloth_solveRigidClothAttachmentLaunch", "femClothRigidAttachBda.spv", "cloth_solveRigidClothAttachmentLaunch" },  // CLOTH_SOLVE_RIGID_CLOTH_ATTACHMENT (P7.1 tranche 3a BDA port: PGS rigid/world attachment solve)
     { "cloth_solveOutputAttachmentClothClothDeltaVLaunch", nullptr, nullptr },  // CLOTH_SOLVE_ATTACHMENT_CLOTH_CLOTH_DELTA (unmapped)
     { "cloth_finalizeVelocitiesLaunch", "femClothSimBda.spv", "cloth_finalizeVelocitiesLaunch" },  // CLOTH_FINALIZE_VELOCITIES (P7.0 BDA port)
     { "cloth_solveRigidClothCollisionTGSLaunch", nullptr, nullptr },  // CLOTH_SOLVE_RIGID_CLOTH_COLLISION_TGS (unmapped)
     { "cloth_queryRigidClothContactReferenceCountTGSLaunch", nullptr, nullptr },  // CLOTH_QUERY_RIGID_CLOTH_REFERENCE_COUNT_TGS (unmapped)
-    { "cloth_solveRigidClothAttachmentTGSLaunch", nullptr, nullptr },  // CLOTH_SOLVE_RIGID_CLOTH_ATTACHMENT_TGS (unmapped)
+    { "cloth_solveRigidClothAttachmentTGSLaunch", "femClothRigidAttachBda.spv", "cloth_solveRigidClothAttachmentTGSLaunch" },  // CLOTH_SOLVE_RIGID_CLOTH_ATTACHMENT_TGS (P7.1 tranche 3a BDA port: TGS rigid/world attachment solve)
     { "cloth_sleeping", "femClothSimBda.spv", "cloth_sleeping" },  // CLOTH_SLEEPING (P7.0 BDA port: wake-counter bookkeeping)
     { "cloth_accumulateInPlaneDampingDeltaVelocity", nullptr, nullptr },  // CLOTH_IN_PLANE_DAMPING (unmapped)
     { "cloth_accumulateBendingDampingDeltaVelocity", nullptr, nullptr },  // CLOTH_BENDING_DAMPING (unmapped)

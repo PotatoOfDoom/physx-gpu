@@ -48,6 +48,9 @@
 #include "host_defines.h"
 #include "PxgFEMCloth.h"                     // real engine per-cloth descriptor
 #include "PxsDeformableSurfaceMaterialCore.h" // real engine surface material data
+#include "PxNodeIndex.h"                     // PxNodeIndex (rigid/world anchor node index)
+#include "PxgSimulationCoreDesc.h"           // PxgFEMRigidAttachment (P7.1 tranche 3a)
+#include "PxgSolverBody.h"                   // PxgSolverBodyData / PxgSolverTxIData / PxAlignedTransform
 
 #include <cstdint>
 #include <cstddef>
@@ -1427,5 +1430,496 @@ PXG_TEST(femClothSimSolveTriPairClusterPGS)
     runSolveTriPair({ /*isShared*/ true, /*bendingOn*/ false, /*flat*/ false, /*isTGS*/ false, /*useCluster*/ true });
     runSolveTriPair({ /*isShared*/ false, /*bendingOn*/ true, /*flat*/ true, /*isTGS*/ false, /*useCluster*/ true });
 }
+
+// ===========================================================================
+// P7.1 tranche 3a: the cloth RIGID-ATTACHMENT constraint kernels — the machinery
+// to PIN a cloth vertex to a rigid / world anchor (toward a hanging cloth).  ONE
+// cloth vertex + ONE static/world attachment: run prepare -> solve, and compare the
+// prepared constraint block AND the solved mDeltaPos (the cloth-side pull toward the
+// anchor) BIT-EXACT against a CPU transcription of FEMClothConstraintPrep.cu:387 +
+// FEMClothExternalSolve.cu:1371/:1571 + attachments.cuh.  The attachment solve is
+// plain linear algebra, so every field is fully bit-exact (no transcendental seam).
+// ===========================================================================
+
+// Host replica of the block-of-32 PxgFEMRigidAttachmentConstraint (PxgFEMCore.h:191,
+// verbatim hand-copy — PxgFEMCore.h is not includable in this CUDA-toolkit-free test
+// TU: it pulls PxgCudaBuffer.h -> cuda.h).  The layout is a trivial fixed-array SoA
+// (float4[32] blocks + PxU32[32] + PxU64[32], each 16-byte-aligned), pinned by the
+// self static_asserts below.  This is the byte image the prepare WRITES and the
+// solve READS, matching the shader's RAC_* byte offsets (femClothRigidAttachBda.slang).
+struct RigidAttachConstraintHost
+{
+    F4 baryOrType[32];                  // @0
+    F4 raXn0_biasW[32];                 // @512
+    F4 raXn1_biasW[32];                 // @1024
+    F4 raXn2_biasW[32];                 // @1536
+    F4 velMultiplierXYZ_invMassW[32];   // @2048
+    F4 low_high_limits[32];             // @2560
+    F4 axis_angle[32];                  // @3072
+    uint32_t elemId[32];                // @3584
+    uint64_t rigidId[32];               // @3712
+};
+static_assert(sizeof(RigidAttachConstraintHost) == 3968, "PxgFEMRigidAttachmentConstraint sizeof == 3968");
+static_assert(offsetof(RigidAttachConstraintHost, raXn0_biasW) == 512, "raXn0_biasW @512");
+static_assert(offsetof(RigidAttachConstraintHost, raXn1_biasW) == 1024, "raXn1_biasW @1024");
+static_assert(offsetof(RigidAttachConstraintHost, raXn2_biasW) == 1536, "raXn2_biasW @1536");
+static_assert(offsetof(RigidAttachConstraintHost, velMultiplierXYZ_invMassW) == 2048, "velMult @2048");
+static_assert(offsetof(RigidAttachConstraintHost, low_high_limits) == 2560, "low_high_limits @2560");
+static_assert(offsetof(RigidAttachConstraintHost, axis_angle) == 3072, "axis_angle @3072");
+static_assert(offsetof(RigidAttachConstraintHost, elemId) == 3584, "elemId @3584");
+static_assert(offsetof(RigidAttachConstraintHost, rigidId) == 3712, "rigidId @3712");
+
+// ---------------------------------------------------------------------------
+// bit-exact CPU reference for the prepare + PGS/TGS attachment solves.  The rigid /
+// world-anchor math (PxQuat::rotate, getNormalized via 1/sqrt, PxMat33*PxVec3) and
+// the calculateAttachmentDeltaImpulsePGS/TGS leaves (attachments.cuh) are transcribed
+// verbatim into a private namespace.
+// ---------------------------------------------------------------------------
+namespace p73ref
+{
+struct V3 { float x, y, z; };
+static V3 cross3(V3 a, V3 b) { return V3{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+static float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+// PxQuat::rotate (PxQuat.h:286).
+static V3 quatRotate(float qx, float qy, float qz, float qw, V3 v)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = qw * qw - 0.5f;
+    const float d2 = qx * vx + qy * vy + qz * vz;
+    return V3{ vx * w2 + (qy * vz - qz * vy) * qw + qx * d2,
+               vy * w2 + (qz * vx - qx * vz) * qw + qy * d2,
+               vz * w2 + (qx * vy - qy * vx) * qw + qz * d2 };
+}
+// PxVec3::getNormalized (PxVec3.h:286); PxRecipSqrt == 1.0/sqrt (unix intrinsic).
+static V3 getNormalized(V3 v)
+{
+    const float m = v.x * v.x + v.y * v.y + v.z * v.z;
+    if (m > 0.0f) { const float rs = 1.0f / std::sqrt(m); return V3{ v.x * rs, v.y * rs, v.z * rs }; }
+    return V3{ 0.0f, 0.0f, 0.0f };
+}
+// PxMat33 (column-major [9]) * PxVec3.
+static V3 mat33Mul(const float m[9], V3 v)
+{
+    return V3{ m[0] * v.x + m[3] * v.y + m[6] * v.z,
+               m[1] * v.x + m[4] * v.y + m[7] * v.z,
+               m[2] * v.x + m[5] * v.y + m[8] * v.z };
+}
+
+// cloth_rigidAttachmentPrepareLaunch (FEMClothConstraintPrep.cu:387) — the rigid /
+// static (non-articulation) path.  Fills constraint slot [0].
+static void refPrepare(RigidAttachConstraintHost& c,
+                       F4 attachmentPose,  // cloth vertex pos_invMass (invMass1 in .w)
+                       V3 ra4, V3 axisIn, float axisAngleW, F4 lowHigh, F4 baryOrType1,
+                       uint32_t elemId, uint64_t rigidId,
+                       float qx, float qy, float qz, float qw, V3 bodyFrameP,
+                       float invMass0, const float sqrtInvInertia[9], bool isStatic)
+{
+    const float invMass1 = attachmentPose.w;
+    const V3 point = V3{ attachmentPose.x, attachmentPose.y, attachmentPose.z };
+    const V3 normal0 = V3{ 1.0f, 0.0f, 0.0f };
+    const V3 normal1 = V3{ 0.0f, 1.0f, 0.0f };
+    const V3 normal2 = V3{ 0.0f, 0.0f, 1.0f };
+
+    float invSqrt[9];
+    float inertiaScale = 1.0f;
+    if (invMass0 == 0.0f && !isStatic)
+    {
+        invSqrt[0] = 1.0f; invSqrt[1] = 0.0f; invSqrt[2] = 0.0f;
+        invSqrt[3] = 0.0f; invSqrt[4] = 1.0f; invSqrt[5] = 0.0f;
+        invSqrt[6] = 0.0f; invSqrt[7] = 0.0f; invSqrt[8] = 1.0f;
+        inertiaScale = 0.0f;
+    }
+    else
+    {
+        for (int k = 0; k < 9; ++k) invSqrt[k] = sqrtInvInertia[k];
+    }
+
+    const V3 ra = quatRotate(qx, qy, qz, qw, ra4);
+    const V3 error = V3{ ra.x + bodyFrameP.x - point.x, ra.y + bodyFrameP.y - point.y, ra.z + bodyFrameP.z - point.z };
+    const V3 worldAxis = getNormalized(quatRotate(qx, qy, qz, qw, axisIn));
+
+    const V3 raXn0 = cross3(ra, normal0);
+    const V3 raXn1 = cross3(ra, normal1);
+    const V3 raXn2 = cross3(ra, normal2);
+
+    const V3 rs0 = mat33Mul(invSqrt, raXn0);
+    const V3 rs1 = mat33Mul(invSqrt, raXn1);
+    const V3 rs2 = mat33Mul(invSqrt, raXn2);
+
+    const float resp0 = dot3(rs0, rs0) * inertiaScale + invMass0 + invMass1;
+    const float resp1 = dot3(rs1, rs1) * inertiaScale + invMass0 + invMass1;
+    const float resp2 = dot3(rs2, rs2) * inertiaScale + invMass0 + invMass1;
+
+    const float vm0 = (resp0 > 0.0f) ? (1.0f / resp0) : 0.0f;
+    const float vm1 = (resp1 > 0.0f) ? (1.0f / resp1) : 0.0f;
+    const float vm2 = (resp2 > 0.0f) ? (1.0f / resp2) : 0.0f;
+
+    const float be0 = dot3(error, normal0);
+    const float be1 = dot3(error, normal1);
+    const float be2 = dot3(error, normal2);
+
+    c.raXn0_biasW[0] = F4{ rs0.x, rs0.y, rs0.z, be0 };
+    c.raXn1_biasW[0] = F4{ rs1.x, rs1.y, rs1.z, be1 };
+    c.raXn2_biasW[0] = F4{ rs2.x, rs2.y, rs2.z, be2 };
+    c.velMultiplierXYZ_invMassW[0] = F4{ vm0, vm1, vm2, invMass0 };
+    c.elemId[0] = elemId;
+    c.rigidId[0] = rigidId;
+    c.baryOrType[0] = baryOrType1;
+    c.low_high_limits[0] = lowHigh;
+    c.axis_angle[0] = F4{ worldAxis.x, worldAxis.y, worldAxis.z, axisAngleW };
+}
+
+// calculateAttachmentDeltaImpulsePGS (attachments.cuh:83) + cloth-side scatter
+// (FEMClothExternalSolve.cu:1470) — NOTE the CUDA passes raXn0_biasW THREE TIMES
+// (:1451), so raXn0/1/2 and all three position-error components come from raXn0_biasW.
+static F4 refSolvePGS(const RigidAttachConstraintHost& c, F4 clothVel, V3 rigidLinVel, V3 rigidAngVel, float dt)
+{
+    const float invDt = 1.0f / dt;
+    const V3 linVel1 = V3{ clothVel.x, clothVel.y, clothVel.z };
+    const F4 r0 = c.raXn0_biasW[0];
+    const F4 vm = c.velMultiplierXYZ_invMassW[0];
+    const V3 raXn0 = V3{ r0.x, r0.y, r0.z };
+
+    const float velOfRigidX = rigidLinVel.x + dot3(rigidAngVel, raXn0);
+    const float velOfRigidY = rigidLinVel.y + dot3(rigidAngVel, raXn0);
+    const float velOfRigidZ = rigidLinVel.z + dot3(rigidAngVel, raXn0);
+
+    const float positionError = r0.w;
+    const float biasFactor = 0.5f;
+    const V3 velError = V3{ linVel1.x - positionError * biasFactor * invDt,
+                           linVel1.y - positionError * biasFactor * invDt,
+                           linVel1.z - positionError * biasFactor * invDt };
+
+    const float dF0 = (velError.x - velOfRigidX) * vm.x;
+    const float dF1 = (velError.y - velOfRigidY) * vm.y;
+    const float dF2 = (velError.z - velOfRigidZ) * vm.z;
+
+    F4 out = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
+    if (dF0 != 0.0f || dF1 != 0.0f || dF2 != 0.0f)
+    {
+        const V3 deltaPos = V3{ (-dF0) * dt, (-dF1) * dt, (-dF2) * dt };
+        out = F4{ deltaPos.x * clothVel.w, deltaPos.y * clothVel.w, deltaPos.z * clothVel.w, 1.0f };
+    }
+    return out;
+}
+
+// calculateAttachmentDeltaImpulseTGS (attachments.cuh:147, offset overload — distinct
+// raXn rows) + cloth-side scatter (FEMClothExternalSolve.cu:1667).
+static F4 refSolveTGS(const RigidAttachConstraintHost& c, F4 clothAccumDelta,
+                      V3 rigidLinVel, V3 rigidAngVel, V3 rigidLinDelta, V3 rigidAngDelta, float dt)
+{
+    const V3 linDelta1 = V3{ clothAccumDelta.x, clothAccumDelta.y, clothAccumDelta.z };
+    const F4 r0 = c.raXn0_biasW[0], r1 = c.raXn1_biasW[0], r2 = c.raXn2_biasW[0];
+    const F4 vm = c.velMultiplierXYZ_invMassW[0];
+    const V3 raXn0 = V3{ r0.x, r0.y, r0.z }, raXn1 = V3{ r1.x, r1.y, r1.z }, raXn2 = V3{ r2.x, r2.y, r2.z };
+
+    const float vo0 = rigidLinVel.x + dot3(rigidAngVel, raXn0);
+    const float vo1 = rigidLinVel.y + dot3(rigidAngVel, raXn1);
+    const float vo2 = rigidLinVel.z + dot3(rigidAngVel, raXn2);
+
+    const V3 linDelta = V3{ linDelta1.x - rigidLinDelta.x, linDelta1.y - rigidLinDelta.y, linDelta1.z - rigidLinDelta.z };
+    const float peX = r0.w, peY = r1.w, peZ = r2.w;
+    const V3 tgsError = V3{ linDelta.x - peX - dot3(rigidAngDelta, raXn0),
+                           linDelta.y - peY - dot3(rigidAngDelta, raXn1),
+                           linDelta.z - peZ - dot3(rigidAngDelta, raXn2) };
+
+    const float velDt = dt; // isVelocityIteration == false
+    const float BIAS = 0.7f; // FEMCLOTH_BIAS_COEFFICIENT
+    const float dF0 = (tgsError.x - vo0 * velDt) * vm.x * BIAS;
+    const float dF1 = (tgsError.y - vo1 * velDt) * vm.y * BIAS;
+    const float dF2 = (tgsError.z - vo2 * velDt) * vm.z * BIAS;
+
+    F4 out = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
+    if (dF0 != 0.0f || dF1 != 0.0f || dF2 != 0.0f)
+    {
+        const V3 deltaPos = V3{ -dF0, -dF1, -dF2 };
+        out = F4{ deltaPos.x * clothAccumDelta.w, deltaPos.y * clothAccumDelta.w, deltaPos.z * clothAccumDelta.w, 1.0f };
+    }
+    return out;
+}
+} // namespace p73ref
+
+static void pokePtr(std::vector<uint8_t>& buf, size_t off, uint64_t v) { std::memcpy(buf.data() + off, &v, 8); }
+static void pokeU32(std::vector<uint8_t>& buf, size_t off, uint32_t v) { std::memcpy(buf.data() + off, &v, 4); }
+
+// ---------------------------------------------------------------------------
+// Descriptor-mirror layout proof for the NEW tranche-3a mirrors.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimRigidAttachDescLayout)
+{
+    // PxNodeIndex: static/world anchor is mID == PX_INVALID_NODE (low 32 bits).
+    PXG_CHECK_MSG(sizeof(PxNodeIndex) == 8, "PxNodeIndex sizeof == 8 (got %zu)", sizeof(PxNodeIndex));
+    PxNodeIndex staticNode; // default ctor -> PX_INVALID_NODE
+    PXG_CHECK(staticNode.isStaticBody());
+    PXG_CHECK(staticNode.getInd() == 0x00000000FFFFFFFFull);
+
+    // PxgFEMRigidAttachment (PxgSimulationCoreDesc.h:208) — the shader's RA_* offsets.
+    PXG_CHECK_MSG(sizeof(PxgFEMRigidAttachment) == 96, "PxgFEMRigidAttachment sizeof == 96 (got %zu)", sizeof(PxgFEMRigidAttachment));
+    PXG_CHECK(offsetof(PxgFEMRigidAttachment, index0) == 0);
+    PXG_CHECK(offsetof(PxgFEMRigidAttachment, index1) == 8);
+    PXG_CHECK(offsetof(PxgFEMRigidAttachment, localPose0) == 32);
+    PXG_CHECK(offsetof(PxgFEMRigidAttachment, coneLimitParams) + offsetof(PxgConeLimitParams, low_high_limits) == 48);
+    PXG_CHECK(offsetof(PxgFEMRigidAttachment, coneLimitParams) + offsetof(PxgConeLimitParams, axis_angle) == 64);
+    PXG_CHECK(offsetof(PxgFEMRigidAttachment, baryOrType1) == 80);
+
+    // PxgSolverBodyData / PxgSolverTxIData (PxgSolverBody.h) — the prepare's anchor
+    // frame reads.  The device float4 initialLinVelXYZ_invMassW @16 == { initialLinVel
+    // (@16, 12B), invMass (@28, 4B) } on the host (non-CUDA union branch).
+    PXG_CHECK_MSG(sizeof(PxgSolverBodyData) == 96, "PxgSolverBodyData sizeof == 96 (got %zu)", sizeof(PxgSolverBodyData));
+    PXG_CHECK(offsetof(PxgSolverBodyData, initialLinVel) == 16);
+    PXG_CHECK(offsetof(PxgSolverBodyData, invMass) == 28);
+    PXG_CHECK_MSG(sizeof(PxgSolverTxIData) == 64, "PxgSolverTxIData sizeof == 64 (got %zu)", sizeof(PxgSolverTxIData));
+    PXG_CHECK(offsetof(PxgSolverTxIData, sqrtInvInertia) == 28);
+    PXG_CHECK_MSG(sizeof(PxAlignedTransform) == 32, "PxAlignedTransform sizeof == 32 (got %zu)", sizeof(PxAlignedTransform));
+
+    // block-of-32 constraint replica pinned above by static_asserts; re-affirm the stride.
+    PXG_CHECK(sizeof(RigidAttachConstraintHost) == 3968);
+}
+
+// ---------------------------------------------------------------------------
+// cloth_rigidAttachmentPrepareLaunch -> cloth_solveRigidClothAttachment{,TGS}Launch:
+// pin ONE cloth vertex to a fixed world anchor.
+// ---------------------------------------------------------------------------
+static void runRigidAttach(bool isTGS)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+
+    // --- cloth vertex (id 0, elemIdx 0), invMass = 0.5 (movable) ----------
+    const float invMass = 0.5f;
+    std::vector<F4> positions = { { 1.0f, 2.0f, 3.0f, invMass } };
+    std::vector<F4> velocities = { { 0.10f, -0.20f, 0.05f, invMass } };
+    std::vector<F4> accumDelta = { { 0.02f, -0.03f, 0.04f, invMass } };
+    std::vector<F4> deltaPos = { { 0.0f, 0.0f, 0.0f, 0.0f } };   // solve output
+    std::vector<uint32_t> triVtx = { 0u, 0u, 0u, 0u };           // unused (vertex attach)
+
+    DevBuf bPos = makeDev(dev, positions);
+    DevBuf bVel = makeDev(dev, velocities);
+    DevBuf bAcc = makeDev(dev, accumDelta);
+    DevBuf bDelta = makeDev(dev, deltaPos);
+    DevBuf bTri = makeDev(dev, triVtx);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
+    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
+    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mNbVerts = 1u;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // --- the world anchor: static node, identity body frame at the origin -
+    const F4 anchor = { 2.0f, 0.5f, 3.5f, 0.0f };   // localPose0 (world = local, identity frame)
+    const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
+
+    // PxgFEMRigidAttachment (96 bytes) via the real engine struct.
+    PxgFEMRigidAttachment att;
+    std::memset(&att, 0, sizeof(att));
+    att.index0 = staticNodeInd;                          // rigid node index (static)
+    att.index1 = 0ull;                                   // elemId = (clothId 0 << 20) | elemIdx 0
+    att.localPose0 = make_float4(anchor.x, anchor.y, anchor.z, anchor.w);
+    att.coneLimitParams.low_high_limits = make_float4(-1.0f, -1.0f, -1.0f, -1.0f); // cone disabled
+    att.coneLimitParams.axis_angle = make_float4(1.0f, 0.0f, 0.0f, -1.0f);         // axis (1,0,0), angle -1
+    att.baryOrType1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);                         // vertex type
+    std::vector<PxgFEMRigidAttachment> atts = { att };
+    DevBuf bAtt = makeDev(dev, atts);
+
+    std::vector<uint32_t> activeAtt = { 0u };
+    DevBuf bActiveAtt = makeDev(dev, activeAtt);
+    std::vector<uint64_t> attachIds = { 0xBADBADBADull };   // output (PxNodeIndex)
+    DevBuf bAttachIds = makeDev(dev, attachIds);
+
+    // constraint block (3968 bytes) seeded with a sentinel pattern.
+    std::vector<uint8_t> constraintBytes(sizeof(RigidAttachConstraintHost), 0xCD);
+    DevBuf bConstraint = makeDev(dev, constraintBytes);
+
+    // rigidDeltaVel: prepare zeroes [0] and [0+numAttachments]; deferred otherwise.
+    std::vector<F4> rigidDeltaVel = { { 9.f, 9.f, 9.f, 9.f }, { 9.f, 9.f, 9.f, 9.f } };
+    DevBuf bRigidDeltaVel = makeDev(dev, rigidDeltaVel);
+
+    // --- anchor rigid frame / mass / inertia (solver body 0 = world/zero) --
+    // body2WorldPool[0] = identity quat (0,0,0,1), p = (0,0,0,0).
+    std::vector<F4> body2World = { { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
+    DevBuf bBody2World = makeDev(dev, body2World);
+    std::vector<uint8_t> solverBodyData(96, 0);   // initialLinVelXYZ_invMassW @16 = 0 -> invMass0 = 0
+    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
+    std::vector<uint8_t> solverTxIData(64, 0);    // sqrtInvInertia @28 = 0 matrix
+    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
+
+    // --- solver-body velocity buffers (world anchor at rest) --------------
+    // numSolverBodies = 1, accumulatedBodyDeltaVOffset = 0.  Read slots (0,1 for
+    // outSolverVelocity; 0,1,2 for solverBodyVelPool) are ZERO; the trailing slots
+    // carry sentinels so a wrong reader offset would read nonzero and mismatch.
+    const uint32_t numSolverBodies = 1u;
+    const uint32_t accOffset = 0u;
+    std::vector<F4> outSolverVelocity = { { 0.f, 0.f, 0.f, 0.f }, { 0.f, 0.f, 0.f, 0.f },
+                                          { 77.f, 78.f, 79.f, 80.f }, { 81.f, 82.f, 83.f, 84.f } };
+    DevBuf bOutSolverVel = makeDev(dev, outSolverVelocity);
+    std::vector<F4> solverBodyVelPool = { { 0.f, 0.f, 0.f, 0.f }, { 0.f, 0.f, 0.f, 0.f },
+                                          { 0.f, 0.f, 0.f, 0.f }, { 61.f, 62.f, 63.f, 64.f } };
+    DevBuf bSolverBodyVelPool = makeDev(dev, solverBodyVelPool);
+    std::vector<uint32_t> solverBodyIndices = { 0u };   // never dereferenced for a static anchor
+    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
+
+    // --- raw descriptor buffers, pointers poked at the mirror offsets -----
+    std::vector<uint8_t> prepDesc(304, 0);          // PxgConstraintPrepareDescGpu
+    pokePtr(prepDesc, 64, bSolverBodyData.addr);    // solverBodyDataPool @64
+    pokePtr(prepDesc, 72, bSolverTxIData.addr);     // solverBodyTxIDataPool @72
+    pokePtr(prepDesc, 168, bBody2World.addr);       // body2WorldPool @168
+    DevBuf bPrepDesc = makeDev(dev, prepDesc);
+
+    std::vector<uint8_t> prePrepDesc(760, 0);       // PxgPrePrepDescGpu
+    pokePtr(prePrepDesc, 272, bSolverBodyIndices.addr); // solverBodyIndices @272 (static -> unused)
+    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
+
+    std::vector<uint8_t> solverCoreDesc(320, 0);    // PxgSolverCoreDescGpu
+    pokePtr(solverCoreDesc, 0, bOutSolverVel.addr);        // outSolverVelocity @0
+    pokeU32(solverCoreDesc, 268, numSolverBodies);         // numSolverBodies @268
+    pokeU32(solverCoreDesc, 276, accOffset);               // accumulatedBodyDeltaVOffset @276
+    DevBuf bSolverCoreDesc = makeDev(dev, solverCoreDesc);
+
+    std::vector<uint8_t> sharedDesc(224, 0);        // PxgSolverSharedDesc<IterativeSolveData(TGS)>
+    pokePtr(sharedDesc, 160, bSolverBodyVelPool.addr);     // iter_solverBodyVelPool @160
+    DevBuf bSharedDesc = makeDev(dev, sharedDesc);
+
+    // ======================= dispatch PREPARE ==========================
+    struct PrepPush
+    {
+        uint64_t clothes, rigidAttachments, activeRigidAttachments, rigidAttachmentIds;
+        uint32_t numRigidAttachments, pad36;
+        uint64_t constraints, prePrepDesc, prepDesc, sharedDesc, rigidDeltaVel;
+    };
+    static_assert(sizeof(PrepPush) == 80, "prepare push-constant blob must be 80 bytes");
+    PrepPush pp = {};
+    pp.clothes = bDesc.addr;
+    pp.rigidAttachments = bAtt.addr;
+    pp.activeRigidAttachments = bActiveAtt.addr;
+    pp.rigidAttachmentIds = bAttachIds.addr;
+    pp.numRigidAttachments = 1u;
+    pp.constraints = bConstraint.addr;
+    pp.prePrepDesc = bPrePrepDesc.addr;
+    pp.prepDesc = bPrepDesc.addr;
+    pp.sharedDesc = bSharedDesc.addr;
+    pp.rigidDeltaVel = bRigidDeltaVel.addr;
+
+    Kernel kPrep("femClothRigidAttachBda.spv", "cloth_rigidAttachmentPrepareLaunch", {}, sizeof(PrepPush));
+    kPrep.dispatch(1u, {}, pp, 1u, 1u);
+    dev->flush();
+
+    // ---- CPU reference for the prepared constraint ----
+    RigidAttachConstraintHost refC;
+    std::memset(&refC, 0xCD, sizeof(refC));   // same sentinel seed
+    float zeroInertia[9] = { 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    p73ref::refPrepare(refC, positions[0], p73ref::V3{ anchor.x, anchor.y, anchor.z },
+                       p73ref::V3{ 1.0f, 0.0f, 0.0f }, -1.0f,
+                       F4{ -1.0f, -1.0f, -1.0f, -1.0f }, F4{ 0.0f, 0.0f, 0.0f, 0.0f },
+                       /*elemId*/ 0u, /*rigidId*/ staticNodeInd,
+                       /*q*/ 0.0f, 0.0f, 0.0f, 1.0f, p73ref::V3{ 0.0f, 0.0f, 0.0f },
+                       /*invMass0*/ 0.0f, zeroInertia, /*isStatic*/ true);
+
+    const auto gConstraintBytes = downloadBuffer<uint8_t>(dev, bConstraint.h, sizeof(RigidAttachConstraintHost));
+    RigidAttachConstraintHost gotC;
+    std::memcpy(&gotC, gConstraintBytes.data(), sizeof(gotC));
+    const auto gAttachIds = downloadBuffer<uint64_t>(dev, bAttachIds.h, 1);
+    const auto gRigidDeltaVel = downloadBuffer<F4>(dev, bRigidDeltaVel.h, 2);
+
+    size_t mm = 0;
+    auto cmp4 = [&](const char* nm, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm; std::printf("  prep %s MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm,
+                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
+    };
+    cmp4("raXn0_biasW", refC.raXn0_biasW[0], gotC.raXn0_biasW[0]);
+    cmp4("raXn1_biasW", refC.raXn1_biasW[0], gotC.raXn1_biasW[0]);
+    cmp4("raXn2_biasW", refC.raXn2_biasW[0], gotC.raXn2_biasW[0]);
+    cmp4("velMult_invMass", refC.velMultiplierXYZ_invMassW[0], gotC.velMultiplierXYZ_invMassW[0]);
+    cmp4("baryOrType", refC.baryOrType[0], gotC.baryOrType[0]);
+    cmp4("low_high_limits", refC.low_high_limits[0], gotC.low_high_limits[0]);
+    cmp4("axis_angle", refC.axis_angle[0], gotC.axis_angle[0]);
+    if (gotC.elemId[0] != refC.elemId[0])
+    { ++mm; std::printf("  prep elemId MM: got %u ref %u\n", gotC.elemId[0], refC.elemId[0]); }
+    if (gotC.rigidId[0] != refC.rigidId[0])
+    { ++mm; std::printf("  prep rigidId MM: got %llu ref %llu\n",
+                        (unsigned long long)gotC.rigidId[0], (unsigned long long)refC.rigidId[0]); }
+    if (gAttachIds[0] != staticNodeInd)
+    { ++mm; std::printf("  rigidAttachmentIds MM: got %llu ref %llu\n",
+                        (unsigned long long)gAttachIds[0], (unsigned long long)staticNodeInd); }
+    // rigidDeltaVel zeroed by the prepare (deferred-but-zeroed).
+    for (uint32_t j = 0; j < 2; ++j)
+        if (f2u(gRigidDeltaVel[j].x) != 0u || f2u(gRigidDeltaVel[j].y) != 0u ||
+            f2u(gRigidDeltaVel[j].z) != 0u || f2u(gRigidDeltaVel[j].w) != 0u)
+        { ++mm; std::printf("  rigidDeltaVel[%u] not zeroed\n", j); }
+
+    // teeth: the prepared position error must equal (anchor - clothPos) componentwise
+    // (the pull direction), and be non-zero.
+    PXG_CHECK_MSG(f2u(gotC.raXn0_biasW[0].w) == f2u(anchor.x - positions[0].x) &&
+                  f2u(gotC.raXn1_biasW[0].w) == f2u(anchor.y - positions[0].y) &&
+                  f2u(gotC.raXn2_biasW[0].w) == f2u(anchor.z - positions[0].z),
+                  "prepared position error must be (anchor - clothPos)");
+
+    PXG_CHECK_MSG(mm == 0, "cloth_rigidAttachmentPrepareLaunch bit-exact vs CPU (%zu mismatches)", mm);
+
+    // ======================= dispatch SOLVE ============================
+    struct SolvePush
+    {
+        uint64_t clothes, attachments;
+        uint32_t numAttachments, pad20;
+        uint64_t prePrepDesc, solverCoreDesc, artiCoreDesc, sharedDesc;
+        float dt;
+        uint32_t pad60;
+        uint64_t rigidDeltaVel;
+    };
+    static_assert(sizeof(SolvePush) == 72, "solve push-constant blob must be 72 bytes");
+    SolvePush sp = {};
+    sp.clothes = bDesc.addr;
+    sp.attachments = bConstraint.addr;
+    sp.numAttachments = 1u;
+    sp.prePrepDesc = bPrePrepDesc.addr;
+    sp.solverCoreDesc = bSolverCoreDesc.addr;
+    sp.artiCoreDesc = 0ull;   // never dereferenced (articulation deferred)
+    sp.sharedDesc = bSharedDesc.addr;
+    sp.dt = dt;
+    sp.rigidDeltaVel = bRigidDeltaVel.addr;
+
+    const char* solveEntry = isTGS ? "cloth_solveRigidClothAttachmentTGSLaunch"
+                                   : "cloth_solveRigidClothAttachmentLaunch";
+    Kernel kSolve("femClothRigidAttachBda.spv", solveEntry, {}, sizeof(SolvePush));
+    kSolve.dispatch(1u, {}, sp, 1u, 1u);
+    dev->flush();
+
+    // ---- CPU reference for the solved mDeltaPos (rigid at rest -> vel0 = 0) ----
+    const p73ref::V3 z3 = { 0.0f, 0.0f, 0.0f };
+    F4 refDelta = isTGS ? p73ref::refSolveTGS(gotC, accumDelta[0], z3, z3, z3, z3, dt)
+                        : p73ref::refSolvePGS(gotC, velocities[0], z3, z3, dt);
+
+    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, 1);
+
+    // teeth: the solve must actually pull the vertex (mDeltaPos != 0, w == 1).
+    PXG_CHECK_MSG(f2u(gDelta[0].x) != 0u || f2u(gDelta[0].y) != 0u || f2u(gDelta[0].z) != 0u,
+                  "attachment solve should pull the cloth vertex (mDeltaPos != 0, isTGS=%d)", int(isTGS));
+
+    size_t mm2 = 0;
+    if (f2u(refDelta.x) != f2u(gDelta[0].x) || f2u(refDelta.y) != f2u(gDelta[0].y) ||
+        f2u(refDelta.z) != f2u(gDelta[0].z) || f2u(refDelta.w) != f2u(gDelta[0].w))
+    { ++mm2; std::printf("  solve mDeltaPos MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n",
+                         refDelta.x, refDelta.y, refDelta.z, refDelta.w,
+                         gDelta[0].x, gDelta[0].y, gDelta[0].z, gDelta[0].w); }
+    PXG_CHECK_MSG(mm2 == 0, "cloth_solveRigidClothAttachment%s bit-exact vs CPU (%zu mismatches)",
+                  isTGS ? "TGS" : "PGS", mm2);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h);
+    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bTri.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bAtt.h); dev->destroyBuffer(bActiveAtt.h); dev->destroyBuffer(bAttachIds.h);
+    dev->destroyBuffer(bConstraint.h); dev->destroyBuffer(bRigidDeltaVel.h);
+    dev->destroyBuffer(bBody2World.h); dev->destroyBuffer(bSolverBodyData.h); dev->destroyBuffer(bSolverTxIData.h);
+    dev->destroyBuffer(bOutSolverVel.h); dev->destroyBuffer(bSolverBodyVelPool.h); dev->destroyBuffer(bSolverBodyIndices.h);
+    dev->destroyBuffer(bPrepDesc.h); dev->destroyBuffer(bPrePrepDesc.h);
+    dev->destroyBuffer(bSolverCoreDesc.h); dev->destroyBuffer(bSharedDesc.h);
+}
+
+PXG_TEST(femClothSimRigidAttachPGS) { runRigidAttach(/*isTGS*/ false); }
+PXG_TEST(femClothSimRigidAttachTGS) { runRigidAttach(/*isTGS*/ true); }
 
 } // namespace
