@@ -915,6 +915,193 @@ bool clothHangRowMeans(const ClothHangScene& csc, float& topMeanY, float& bottom
     bottomMeanY = float(botSum / double(csc.bottomRow.size()));
     return finite;
 }
+
+// PXG_SCENE=clothselfcollide (P7.2 tranche 3): the cloth SELF-collision money shot.
+//
+// A single FEMCloth mesh HAIRPIN-FOLDED into two stacked layers of the SAME cloth.  The
+// LOWER layer is a FIXED shelf (invMass 0, pinned at y=baseY); the UPPER layer (invMass 1)
+// hangs from the crease edge and, under gravity, DRAPES DOWN onto the shelf.  The two
+// layers share the same (x,z) footprint but are FAR apart in mesh topology (joined only at
+// the crease), so the vertex-triangle self-collision filter does not exclude them.  The ONLY
+// thing that can stop the upper layer from drooping straight THROUGH the shelf is self-
+// collision — there is NO rigid body here, so this isolates the tranche-1 midphase
+// (cloth_selfCollisionMidphase{VT,EE}) + tranche-2 solve (cloth_clothContactPrepare ->
+// query -> cloth_solveClothClothDelta{VT,EE}, folded back by cloth_applyExternalDeltas)
+// with nothing else in the loop that could catch the cloth.  (Cloth runs on the PGS solver;
+// pass PXG_SOLVER=pgs — the TGS cloth path is a separate, not-yet-ported frontier.)
+//
+// The self-collision SWITCH is the rest-pose filter distance, whose exact semantics the
+// midphase documents (femClothClothMidPhase.cu:789): a vertex-triangle pair self-collides
+// only when its REST-pose distance EXCEEDS the filter distance.  The two layers sit dropH
+// apart in the rest pose, so filterDistance < dropH LETS them collide (self-collision ON)
+// while filterDistance > dropH FILTERS the pair out (self-collision OFF, the control).
+// PXG_SELFCOLL (default "1") picks the mode; everything else is identical, so a two-run A/B
+// comparison isolates self-collision as the ONLY cause of the upper layer staying up.
+struct ClothSelfScene
+{
+    PxDeformableSurface* surface = nullptr;
+    PxU32 numVerts = 0;
+    PxCudaContextManager* cudaCtx = nullptr;
+    std::vector<PxU32> topIdx;      // the FREE upper layer (drapes onto the shelf) — observable
+    float baseY = 0.0f;            // the fixed shelf height
+    bool selfCollOn = true;
+};
+
+ClothSelfScene buildClothSelfCollideScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
+                                          PxCudaContextManager* cudaCtx, bool enableSelfCollision)
+{
+    ClothSelfScene out;
+    out.cudaCtx = cudaCtx;
+    out.selfCollOn = enableSelfCollision;
+
+    // A live dynamic rigid FAR from the cloth keeps the rigid PGS island non-empty (every
+    // cloth scene needs this — the cloth solve runs inside it).  No floor: the "shelf" the
+    // upper layer lands on is made of the cloth's OWN fixed verts, so self-collision is the
+    // only thing in the loop that can stop the drape.
+    addGroundBox(physics, scene, rigidMat);
+    addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+               boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+
+    const PxU32 half = 4;                 // columns per layer
+    const PxU32 numX = 2 * half;          // 8 columns after the fold
+    const PxU32 numZ = 5;                 // 5 rows -> 40 verts, 56 triangles
+    const float baseY = 5.0f;             // the fixed shelf height
+    const float dropH = 0.05f;            // upper layer starts JUST above the shelf (in
+                                          // contact range from the start — a gentle press,
+                                          // not a swing, so self-collision engages cleanly)
+    const float lenX  = 2.0f, lenZ = 2.0f;
+    const float dx = lenX / float(half - 1);
+    const float dz = lenZ / float(numZ - 1);
+    out.baseY = baseY;
+
+    auto vid = [numZ](PxU32 c, PxU32 r) { return c * numZ + r; };
+
+    // Hairpin fold: columns [0,half) run x = -lenX/2 -> +lenX/2 at y=baseY (the shelf);
+    // columns [half,2*half) fold BACK, x = +lenX/2 -> -lenX/2 at y=baseY+dropH (the top).
+    // Columns half-1 and half both sit at x=+lenX/2 (the physical crease).
+    std::vector<PxVec3> verts;
+    verts.reserve(numX * numZ);
+    for (PxU32 c = 0; c < numX; ++c)
+    {
+        const bool lower = (c < half);
+        const float x = (lower ? float(c) : float(2 * half - 1 - c)) * dx - 0.5f * lenX;
+        const float y = lower ? baseY : baseY + dropH;
+        for (PxU32 r = 0; r < numZ; ++r)
+            verts.push_back(PxVec3(x, y, float(r) * dz - 0.5f * lenZ));
+    }
+
+    std::vector<PxU32> tris;
+    tris.reserve(3 * 2 * (numX - 1) * (numZ - 1));
+    for (PxU32 c = 1; c < numX; ++c)
+        for (PxU32 r = 1; r < numZ; ++r)
+        {
+            tris.push_back(vid(c - 1, r - 1)); tris.push_back(vid(c, r - 1)); tris.push_back(vid(c - 1, r));
+            tris.push_back(vid(c - 1, r));     tris.push_back(vid(c, r - 1)); tris.push_back(vid(c, r));
+        }
+
+    // The FREE upper layer (columns [half,2*half)) is the observable — does it stay on the shelf?
+    for (PxU32 c = half; c < numX; ++c)
+        for (PxU32 r = 0; r < numZ; ++r)
+            out.topIdx.push_back(vid(c, r));
+
+    PxTriangleMeshDesc meshDesc;
+    meshDesc.points.count = PxU32(verts.size());
+    meshDesc.points.stride = sizeof(PxVec3);
+    meshDesc.points.data = verts.data();
+    meshDesc.triangles.count = PxU32(tris.size() / 3);
+    meshDesc.triangles.stride = 3 * sizeof(PxU32);
+    meshDesc.triangles.data = tris.data();
+
+    PxCookingParams ckParams(physics->getTolerancesScale());
+    ckParams.buildGPUData = true;
+    ckParams.meshPreprocessParams |= PxMeshPreprocessingFlag::eENABLE_VERT_MAPPING;
+
+    PxTriangleMesh* triMesh =
+        immediateCooking::createTriangleMesh(ckParams, meshDesc, physics->getPhysicsInsertionCallback());
+    if (!triMesh) { std::printf("FAIL: immediateCooking::createTriangleMesh returned null\n"); return out; }
+
+    // A THICK cloth (0.1) gives self-collision a wide contact band so a vertex cannot skip
+    // through a triangle between substeps; low bending lets the free layer settle.
+    PxDeformableSurfaceMaterial* clothMat =
+        physics->createDeformableSurfaceMaterial(/*youngs*/ 1.e6f, /*poissons*/ 0.3f,
+            /*dynamicFriction*/ 0.5f, /*thickness*/ 0.1f, /*bendingStiffness*/ 1.e-4f);
+    PxDeformableSurfaceMaterial* mats[1] = { clothMat };
+
+    PxShapeFlags shapeFlags = PxShapeFlag::eSIMULATION_SHAPE | PxShapeFlag::eSCENE_QUERY_SHAPE;
+    PxShape* shape = physics->createShape(PxTriangleMeshGeometry(triMesh), mats, PxU16(1), true, shapeFlags);
+    if (!shape) { std::printf("FAIL: createShape (deformable surface) returned null\n"); return out; }
+    shape->setContactOffset(0.1f);   // widen the contact band to match the thick cloth
+
+    PxDeformableSurface* surface = physics->createDeformableSurface(*cudaCtx);
+    if (!surface) { std::printf("FAIL: createDeformableSurface returned null\n"); return out; }
+
+    surface->setNbCollisionPairUpdatesPerTimestep(4);
+    surface->setNbCollisionSubsteps(8);   // more self-collision solve iterations -> stiffer hold
+    surface->setLinearDamping(0.2f);      // bleed off the drape momentum so the hold is clean
+    surface->setMaxLinearVelocity(1.0e6f);
+    // The rest-pose filter is the self-collision switch (see the scene comment): ON lets the
+    // dropH-separated layers collide, OFF filters them out AND flags the body disabled.
+    if (enableSelfCollision)
+        surface->setSelfCollisionFilterDistance(0.02f);         // < dropH -> layers self-collide
+    else
+    {
+        surface->setSelfCollisionFilterDistance(dropH + 0.3f);  // > dropH -> pair filtered out
+        surface->setDeformableBodyFlag(PxDeformableBodyFlag::eDISABLE_SELF_COLLISION, true);
+    }
+    surface->attachShape(*shape);
+    shape->release();
+
+    scene->addActor(*surface);
+
+    // invMass: lower layer (c<half) FIXED (0) = the shelf; upper layer (c>=half) FREE (1).
+    // rest = spawn shape (membrane at rest at spawn, so the ONLY driver is gravity).
+    const PxU32 nv = PxU32(verts.size());
+    std::vector<PxVec4> posInvMass(nv), vel(nv, PxVec4(0.0f)), rest(nv);
+    for (PxU32 c = 0; c < numX; ++c)
+        for (PxU32 r = 0; r < numZ; ++r)
+        {
+            const PxU32 v = vid(c, r);
+            const float invMass = (c < half) ? 0.0f : 1.0f;
+            posInvMass[v] = PxVec4(verts[v].x, verts[v].y, verts[v].z, invMass);
+            rest[v]       = PxVec4(verts[v].x, verts[v].y, verts[v].z, invMass);
+        }
+
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getPositionInvMassBufferD()),
+                    posInvMass.data(), nv * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getVelocityBufferD()),
+                    vel.data(), nv * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getRestPositionBufferD()),
+                    rest.data(), nv * sizeof(PxVec4));
+
+    out.surface = surface;
+    out.numVerts = nv;
+    return out;
+}
+
+// DtoH-read the cloth vertex buffer once; fill the min AND mean y across the FREE upper
+// layer (the observable — does self-collision keep it on the shelf?).  Returns false on
+// any non-finite coordinate.
+bool clothTopMinMeanY(const ClothSelfScene& csc, float& minY, float& meanY)
+{
+    std::vector<PxVec4> host(csc.numVerts);
+    PxCudaContext* ctx = csc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(csc.surface->getPositionInvMassBufferD()),
+                    csc.numVerts * sizeof(PxVec4));
+    double sum = 0.0;
+    float lo = 1.0e30f;
+    bool finite = true;
+    for (PxU32 id : csc.topIdx)
+    {
+        const float y = host[id].y;
+        sum += double(y);
+        lo = PxMin(lo, y);
+        if (!std::isfinite(y) || !std::isfinite(host[id].x) || !std::isfinite(host[id].z)) finite = false;
+    }
+    minY = lo;
+    meanY = float(sum / double(csc.topIdx.size()));
+    return finite;
+}
 } // namespace
 
 int main()
@@ -1292,6 +1479,96 @@ int main()
         return 2;
     }
 
+    // PXG_SCENE=clothselfcollide (P7.2 tranche 3): the cloth SELF-collision money shot.
+    // A hairpin-folded cloth whose LOWER layer is a fixed shelf (invMass 0) and whose UPPER
+    // layer (invMass 1) drapes down onto it under gravity.  With self-collision ON
+    // (PXG_SELFCOLL=1, default) the upper layer must be CAUGHT on the shelf (min y ~ baseY);
+    // with it OFF (PXG_SELFCOLL=0, the control) it droops straight THROUGH (min y well below
+    // baseY).  There is no rigid body in the loop, so self-collision is the ONLY thing that
+    // can catch it.  Cloth runs on PGS — pass PXG_SOLVER=pgs.  Run the binary twice to see
+    // the A/B difference (the verification does exactly that).
+    if (!std::strcmp(sceneName, "clothselfcollide"))
+    {
+        const char* scEnv = std::getenv("PXG_SELFCOLL");
+        const bool selfOn = !scEnv || scEnv[0] != '0';
+
+        ClothSelfScene csc = buildClothSelfCollideScene(physics, scene, material, cudaCtx, selfOn);
+        if (!csc.surface || csc.numVerts == 0)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: clothselfcollide scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'clothselfcollide' built: %u-vertex hairpin-folded FEMCloth (upper layer "
+                    "drapes onto a fixed shelf at y=%.2f), self-collision %s\n",
+                    csc.numVerts, csc.baseY, selfOn ? "ON" : "OFF (control)");
+
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: clothselfcollide GPU pipeline CONSTRUCTED + live over Vulkan "
+                        "(set PXG_GPU_STEP=1 to step the drape)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_CLOTH_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 200;
+        float min0 = 0.0f, mean0 = 0.0f;
+        bool finite = clothTopMinMeanY(csc, min0, mean0);
+        std::printf("  stepping the drape (%d x %.4fs, self-collision %s): upper layer starts at mean y=%.4f "
+                    "(min %.4f); shelf y=%.2f...\n", steps, dt, selfOn ? "ON" : "OFF", mean0, min0, csc.baseY);
+
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            float mn = 0.0f, mean = 0.0f;
+            finite = clothTopMinMeanY(csc, mn, mean) & finite;
+            if (i < 6 || i == steps - 1 || (i % 20 == 0))
+                std::printf("    step %3d: upper layer min y=%.5f mean=%.5f (shelf y=%.2f)\n",
+                            i, mn, mean, csc.baseY);
+        }
+        float minE = 0.0f, meanE = 0.0f;
+        clothTopMinMeanY(csc, minE, meanE);
+
+        std::printf("  clothselfcollide (self-collision %s): final upper layer min y=%.4f (mean %.4f); shelf y=%.2f\n",
+                    selfOn ? "ON" : "OFF", minE, meanE, csc.baseY);
+
+        int failures = 0;
+        // The upper layer must MOVE (not frozen exactly at spawn) — proves the PGS sim ran.
+        if (!(PxAbs(meanE - mean0) > 0.003f))
+        { std::printf("FAIL: upper layer never moved (mean %.4f -> %.4f) — sim frozen?\n", mean0, meanE); ++failures; }
+        if (!finite) { std::printf("FAIL: cloth y went non-finite\n"); ++failures; }
+        if (selfOn)
+        {
+            // Self-collision ON: the upper layer is CAUGHT on the shelf — it does not tunnel
+            // meaningfully below it.
+            if (!(minE > csc.baseY - 0.10f))
+            { std::printf("FAIL: self-collision ON but the upper layer tunnelled through the shelf "
+                          "(min y=%.4f, shelf=%.2f)\n", minE, csc.baseY); ++failures; }
+        }
+        else
+        {
+            // Control: with self-collision OFF the upper layer droops straight through the shelf.
+            if (!(minE < csc.baseY - 0.20f))
+            { std::printf("FAIL: self-collision OFF but the upper layer stayed on the shelf "
+                          "(min y=%.4f, shelf=%.2f) — control invalid\n", minE, csc.baseY); ++failures; }
+        }
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        if (failures == 0)
+        {
+            if (selfOn)
+                std::printf("[  OK  ] gpu-sdk-step: FEMCloth self-collision CAUGHT the draping layer on the shelf "
+                            "(min y=%.4f, shelf=%.2f)\n", minE, csc.baseY);
+            else
+                std::printf("[  OK  ] gpu-sdk-step: control run — WITHOUT self-collision the upper layer drooped "
+                            "through the shelf (min y=%.4f, shelf=%.2f)\n", minE, csc.baseY);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: clothselfcollide checks failed (%d)\n", failures);
+        return 2;
+    }
+
     std::vector<RestTarget> targets;
     if      (!std::strcmp(sceneName, "box"))       buildBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "stack"))     buildStackScene(physics, scene, material, targets);
@@ -1301,7 +1578,7 @@ int main()
     else if (!std::strcmp(sceneName, "capsulebox")) buildCapsuleBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "convex"))    buildConvexScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "joint"))     buildJointScene(physics, scene, material, targets);
-    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint|particle|cloth|clothhang|clothdrape)\n", sceneName);
+    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint|particle|cloth|clothhang|clothdrape|clothselfcollide)\n", sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
     if (targets.empty())
     {
