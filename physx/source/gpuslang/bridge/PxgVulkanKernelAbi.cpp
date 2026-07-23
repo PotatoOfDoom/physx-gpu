@@ -265,6 +265,22 @@ static const uint8_t kClothSleeping[] = { 8, 4, 8, 4, 4, 8, 8 };
 //     PxU32 + bool -> natural-alignment blob = 40 bytes.
 static const uint8_t kClothSolveTriEnergy[] = { 8, 8, 8, 4, 4, 1 };
 
+// gpusimulationcontroller FEMCloth.cu (P7.1 tranche 2 FEMCloth triangle-pair
+// shared-energy + bending solve):
+//   cloth_solveTrianglePairEnergyLaunch(PxgFEMCloth* gFEMCloths, const PxU32*
+//     activeFEMCloths, const PxsDeformableSurfaceMaterialData* clothMaterials,
+//     PxReal dt, PxU32 partitionId, bool isSharedTrianglePair, bool isTGS)  --
+//     launch site PxgFEMClothCore.cpp:1617; the cluster twin
+//     cloth_solveTrianglePairEnergyClusterLaunch (:1637) shares the pack
+//     (firstClusterId in place of partitionId).  Three device pointers + PxReal +
+//     PxU32 + two bools (@32/@33) -> natural-alignment blob = 40 bytes.
+static const uint8_t kClothSolveTriPairEnergy[] = { 8, 8, 8, 4, 4, 1, 1 };
+//   cloth_averageTrianglePairVertsLaunch(PxgFEMCloth* gFEMCloths, const PxU32*
+//     activeFEMCloths, PxReal invDt, bool isSharedPartition)  -- launch site
+//     PxgFEMClothCore.cpp:1668.  Two device pointers + PxReal + bool -> 24-byte
+//     blob (bool @20, rounded to the 8-alignment).
+static const uint8_t kClothAvgPairVerts[] = { 8, 8, 4, 1 };
+
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
@@ -574,6 +590,10 @@ static const PxgKernelAbiRow kRows[] = {
     // gpusimulationcontroller FEMCloth in-plane membrane energy solve (P7.1 BDA)
     { "cloth_solveNonSharedTriangleEnergyLaunch", kClothSolveTriEnergy, uint32_t(sizeof(kClothSolveTriEnergy)) },
     { "cloth_solveNonSharedTriangleEnergyClusterLaunch", kClothSolveTriEnergy, uint32_t(sizeof(kClothSolveTriEnergy)) },
+    // gpusimulationcontroller FEMCloth triangle-pair shared-energy + bending solve (P7.1 tranche 2 BDA)
+    { "cloth_solveTrianglePairEnergyLaunch", kClothSolveTriPairEnergy, uint32_t(sizeof(kClothSolveTriPairEnergy)) },
+    { "cloth_solveTrianglePairEnergyClusterLaunch", kClothSolveTriPairEnergy, uint32_t(sizeof(kClothSolveTriPairEnergy)) },
+    { "cloth_averageTrianglePairVertsLaunch", kClothAvgPairVerts, uint32_t(sizeof(kClothAvgPairVerts)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },

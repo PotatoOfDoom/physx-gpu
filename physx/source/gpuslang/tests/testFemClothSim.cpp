@@ -132,6 +132,28 @@ struct SolvePush
 };
 static_assert(sizeof(SolvePush) == 40, "SolveNonSharedTri push-constant blob must be 40 bytes");
 
+// P7.1 tranche 2: the triangle-pair energy solve push-constant blob, byte-identical
+// to femClothSolvePairBda.slang's SolveTriPairParams (ABI row {8,8,8,4,4,1,1}).
+struct SolveTriPairPush
+{
+    uint64_t femCloths, activeFEMCloths, materials;
+    float dt;
+    uint32_t partitionId;
+    uint32_t flagsWord;   // byte0 = isSharedTrianglePair, byte1 = isTGS
+    uint32_t pad36;
+};
+static_assert(sizeof(SolveTriPairPush) == 40, "SolveTriPair push-constant blob must be 40 bytes");
+
+// P7.1 tranche 2: the Jacobi average push-constant blob, byte-identical to
+// femClothSolvePairBda.slang's AvgPairVertsParams (ABI row {8,8,4,1}).
+struct AvgPairVertsPush
+{
+    uint64_t femCloths, activeFEMCloths;
+    float dtInv;
+    uint32_t isSharedWord;   // byte0 = isSharedPartition
+};
+static_assert(sizeof(AvgPairVertsPush) == 24, "AvgPairVerts push-constant blob must be 24 bytes");
+
 // ---------------------------------------------------------------------------
 // P7.1: bit-exact CPU reference for the in-plane membrane energy solve.  The
 // membrane leaf (refMembrane) + its 2x2 constraints (extractRotation2D /
@@ -147,6 +169,11 @@ struct F4 { float x, y, z, w; };
 struct V2 { float x, y; };
 struct V3 { float x, y, z; };
 const float FEMCLOTH_THRESHOLD = 1.0e-14f;
+const float FEMCLOTH_HALF_PI = 1.57079632679489661923f;
+const float FEMCLOTH_2PI = 6.28318530717958647692f;
+static float pabs(float a) { return a < 0.f ? -a : a; }
+static float selMin(float a, float b) { return a < b ? a : b; }
+static float selMax(float a, float b) { return a > b ? a : b; }
 
 static V2 add2(V2 a, V2 b) { return V2{ a.x + b.x, a.y + b.y }; }
 static V2 sub2(V2 a, V2 b) { return V2{ a.x - b.x, a.y - b.y }; }
@@ -331,6 +358,120 @@ static void refMembrane(F4& xx0, F4& xx1, F4& xx2, float dt, float youngs, float
     xx1.x = x1.x; xx1.y = x1.y; xx1.z = x1.z;
     xx2.x = x2.x; xx2.y = x2.y; xx2.z = x2.z;
 }
+
+// bendingEnergySolvePerTrianglePair (FEMClothUtil.cuh L543-655).  The angle is
+// computed with the HOST std::atan2 (the documented seam — the engine kernel calls
+// atan2 ON-DEVICE, which is not cross-backend bit-exact).  Everything else is a
+// verbatim transcription (lifted from the Phase-1-verified testNpClothBending.cpp).
+// vrc = the four vertex reference counts; lambdaSlot is the per-pair bending lambda.
+static void refBendingPair(F4& x0, F4& x1, F4& x2, F4& x3, F4 vrc,
+                           float restBendingAngle, float kInv, float dt,
+                           float& lambdaSlot, bool isTGS)
+{
+    const V3 p0 = { x0.x, x0.y, x0.z }, p1 = { x1.x, x1.y, x1.z };
+    const V3 p2 = { x2.x, x2.y, x2.z }, p3 = { x3.x, x3.y, x3.z };
+    const V3 x02 = sub3(p2, p0), x03 = sub3(p3, p0), x13 = sub3(p3, p1), x12 = sub3(p2, p1), x23 = sub3(p3, p2);
+    const float x23Len = std::sqrt(magSq3(x23));
+
+    if (x23Len < FEMCLOTH_THRESHOLD)
+        return;
+    if (kInv <= 0.f)
+        return;
+
+    const float x23LenInv = 1.f / x23Len;
+    const V3 x23n = muls3(x23, x23LenInv);
+    const V3 scaledN0 = cross3(x02, x03);
+    const V3 scaledN1 = cross3(x13, x12);
+    const float n0LenInv = 1.f / std::sqrt(magSq3(scaledN0));
+    const float n1LenInv = 1.f / std::sqrt(magSq3(scaledN1));
+    const V3 n0 = muls3(scaledN0, n0LenInv);
+    const V3 n1 = muls3(scaledN1, n1LenInv);
+
+    const float cosAngle = dot3(n0, n1);
+    const float sinAngle = dot3(cross3(n0, n1), x23n);
+    const float angle = std::atan2(sinAngle, cosAngle);   // THE SEAM
+
+    const float dtInv = 1.f / dt;
+    const float alphaTilde = kInv * dtInv * dtInv;
+    float C = angle - restBendingAngle;
+
+    if (pabs(C + FEMCLOTH_2PI) < pabs(C))
+        C += FEMCLOTH_2PI;
+    else if (pabs(C - FEMCLOTH_2PI) < pabs(C))
+        C -= FEMCLOTH_2PI;
+
+    C = selMin(FEMCLOTH_HALF_PI, selMax(-FEMCLOTH_HALF_PI, C));
+
+    const V3 temp0 = muls3(n0, n0LenInv);
+    const V3 temp1 = muls3(n1, n1LenInv);
+    const V3 dCdx0 = muls3(temp0, -x23Len);
+    const V3 dCdx1 = muls3(temp1, -x23Len);
+    const V3 dCdx2 = V3{ dot3(x03, x23n) * temp0.x + dot3(x13, x23n) * temp1.x,
+                         dot3(x03, x23n) * temp0.y + dot3(x13, x23n) * temp1.y,
+                         dot3(x03, x23n) * temp0.z + dot3(x13, x23n) * temp1.z };
+    const V3 s3 = V3{ dot3(x02, x23n) * temp0.x + dot3(x12, x23n) * temp1.x,
+                      dot3(x02, x23n) * temp0.y + dot3(x12, x23n) * temp1.y,
+                      dot3(x02, x23n) * temp0.z + dot3(x12, x23n) * temp1.z };
+    const V3 dCdx3 = V3{ -s3.x, -s3.y, -s3.z };
+
+    float lambda = 0.f;
+    if (!isTGS)
+        lambda = lambdaSlot;
+
+    const float m0 = vrc.x * x0.w;
+    const float m1 = vrc.y * x1.w;
+    const float m2 = vrc.z * x2.w;
+    const float m3 = vrc.w * x3.w;
+    const float denom = (m0 * magSq3(dCdx0) + m1 * magSq3(dCdx1) + m2 * magSq3(dCdx2) + m3 * magSq3(dCdx3)) + alphaTilde;
+    float deltaLambda;
+    if (denom < FEMCLOTH_THRESHOLD)
+        deltaLambda = 0.f;
+    else
+        deltaLambda = (-C - alphaTilde * lambda) / denom;
+
+    if (!isTGS)
+        lambdaSlot = lambda + deltaLambda;
+
+    const float scale0 = vrc.x * x0.w * deltaLambda;
+    const float scale1 = vrc.y * x1.w * deltaLambda;
+    const float scale2 = vrc.z * x2.w * deltaLambda;
+    const float scale3 = vrc.w * x3.w * deltaLambda;
+
+    x0.x += scale0 * dCdx0.x; x0.y += scale0 * dCdx0.y; x0.z += scale0 * dCdx0.z;
+    x1.x += scale1 * dCdx1.x; x1.y += scale1 * dCdx1.y; x1.z += scale1 * dCdx1.z;
+    x2.x += scale2 * dCdx2.x; x2.y += scale2 * dCdx2.y; x2.z += scale2 * dCdx2.z;
+    x3.x += scale3 * dCdx3.x; x3.y += scale3 * dCdx3.y; x3.z += scale3 * dCdx3.z;
+}
+
+// clothSharedEnergySolvePerTrianglePair (FEMClothUtil.cuh:661): membrane on both
+// triangles (x2,x3,x0)/(x2,x3,x1) threaded in place, then bending.  restEdge holds
+// (restEdge0.x, restEdge0.y, restEdge1.x, restEdge1.y).
+static void refSharedPair(F4& x0, F4& x1, F4& x2, F4& x3, F4 vrc,
+                          F4 restEdge, float restSharedEdgeLength,
+                          float youngs0, float poissons0, float thickness0,
+                          float youngs1, float poissons1, float thickness1,
+                          float& m0x, float& m0y, float& m1x, float& m1y,
+                          float restBendingAngle, float kInv, float dt,
+                          float& bendLambda, bool isTGS)
+{
+    const float det0 = restSharedEdgeLength * restEdge.y;
+    const float det1 = restSharedEdgeLength * restEdge.w;
+
+    if (pabs(det0) > FEMCLOTH_THRESHOLD)
+    {
+        const float inv0 = 1.f / det0;
+        const F4 QInv0 = F4{ restEdge.y * inv0, 0.f * inv0, -restEdge.x * inv0, restSharedEdgeLength * inv0 };
+        refMembrane(x2, x3, x0, dt, youngs0, poissons0, thickness0, QInv0, vrc.z, vrc.w, vrc.x, m0x, m0y, isTGS);
+    }
+    if (pabs(det1) > FEMCLOTH_THRESHOLD)
+    {
+        const float inv1 = 1.f / det1;
+        const F4 QInv1 = F4{ restEdge.w * inv1, 0.f * inv1, -restEdge.z * inv1, restSharedEdgeLength * inv1 };
+        refMembrane(x2, x3, x1, dt, youngs1, poissons1, thickness1, QInv1, vrc.z, vrc.w, vrc.y, m1x, m1y, isTGS);
+    }
+
+    refBendingPair(x0, x1, x2, x3, vrc, restBendingAngle, kInv, dt, bendLambda, isTGS);
+}
 } // namespace p71ref
 
 // ---------------------------------------------------------------------------
@@ -389,6 +530,33 @@ PXG_TEST(femClothSimDescLayout)
     PXG_CHECK(offsetof(PxsDeformableSurfaceMaterialData, bendingStiffness) == 16);
     PXG_CHECK(offsetof(PxsDeformableSurfaceMaterialData, elasticityDamping) == 20);
     PXG_CHECK(offsetof(PxsDeformableSurfaceMaterialData, bendingDamping) == 24);
+
+    // P7.1 tranche 2: the triangle-pair (shared shell-energy + bending) solve
+    // (cloth_solveTrianglePairEnergy* / cloth_averageTrianglePairVertsLaunch) reads
+    // these pair-scheme fields through the pxgSlangFEMClothDesc mirror — pin their
+    // offsets against the real engine PxgFEMCloth (all already present in the mirror
+    // from tranche 1's byte-exact round-trip; this locks the ones now dereferenced).
+    PXG_CHECK(offsetof(PxgFEMCloth, mOrderedSharedTriangleLambdas) == 88);                          // float2* (membrane lambdas)
+    PXG_CHECK(offsetof(PxgFEMCloth, mOrderedSharedTrianglePairVertexIndices) == 112);               // uint4*
+    PXG_CHECK(offsetof(PxgFEMCloth, mOrderedNonSharedTrianglePairVertexIndices) == 120);            // uint4*
+    PXG_CHECK(offsetof(PxgFEMCloth, mOrderedSharedRestBendingAngle_flexuralStiffness_damping) == 128);    // float4*
+    PXG_CHECK(offsetof(PxgFEMCloth, mOrderedNonSharedRestBendingAngle_flexuralStiffness_damping) == 136); // float4*
+    PXG_CHECK(offsetof(PxgFEMCloth, mSharedBendingLambdas) == 144);                                 // float*
+    PXG_CHECK(offsetof(PxgFEMCloth, mNonSharedBendingLambdas) == 152);                              // float*
+    PXG_CHECK(offsetof(PxgFEMCloth, mNonSharedTriPair_hasActiveBending) == 160);                    // bool (low byte of the @160 word)
+    PXG_CHECK(offsetof(PxgFEMCloth, mOrderedSharedRestEdge0_edge1) == 168);                         // float4*
+    PXG_CHECK(offsetof(PxgFEMCloth, mOrderedSharedRestEdgeLength_material0_material1) == 176);      // float4*
+    PXG_CHECK(offsetof(PxgFEMCloth, mPosition_InvMassCP) == 184);                                   // float4* (copies buffer)
+    PXG_CHECK(offsetof(PxgFEMCloth, mSharedTriPairRemapOutputCP) == 200);                           // PxU32* (writeIndices)
+    PXG_CHECK(offsetof(PxgFEMCloth, mNonSharedTriPairRemapOutputCP) == 208);                        // PxU32*
+    PXG_CHECK(offsetof(PxgFEMCloth, mSharedTriPairAccumulatedCopiesCP) == 216);                     // PxU32*
+    PXG_CHECK(offsetof(PxgFEMCloth, mNonSharedTriPairAccumulatedCopiesCP) == 224);                  // PxU32*
+    PXG_CHECK(offsetof(PxgFEMCloth, mSharedTriPairAccumulatedPartitionsCP) == 232);                 // PxU32*
+    PXG_CHECK(offsetof(PxgFEMCloth, mNonSharedTriPairAccumulatedPartitionsCP) == 240);              // PxU32*
+    PXG_CHECK(offsetof(PxgFEMCloth, mNbSharedTrianglePairs) == 336);                                // PxU32
+    PXG_CHECK(offsetof(PxgFEMCloth, mNbNonSharedTrianglePairs) == 340);                             // PxU32
+    PXG_CHECK(offsetof(PxgFEMCloth, mNbSharedTriPairPartitions) == 348);                            // PxU32
+    PXG_CHECK(offsetof(PxgFEMCloth, mNbNonSharedTriPairPartitions) == 352);                         // PxU32
 }
 
 // ---------------------------------------------------------------------------
@@ -894,5 +1062,370 @@ static void runSolveNonShared(bool isTGS)
 
 PXG_TEST(femClothSimSolveNonSharedPGS) { runSolveNonShared(/*isTGS*/ false); }
 PXG_TEST(femClothSimSolveNonSharedTGS) { runSolveNonShared(/*isTGS*/ true); }
+
+// ---------------------------------------------------------------------------
+// P7.1 tranche 2: cloth_solveTrianglePairEnergyLaunch (+ cluster twin) +
+// cloth_averageTrianglePairVertsLaunch — the triangle-PAIR shared-energy + bending
+// solve.  A SINGLE triangle pair (4 verts, one dihedral) with the copies/remap
+// arrays set up for one pair in one partition; dispatch the pair solve then the
+// Jacobi average, and compare positions / velocities / accumulated-delta / lambdas
+// against a CPU transcription of updateTrianglePairs (FEMCloth.cu:768) driving the
+// verified refMembrane + refBendingPair.
+//
+// atan2 seam (see femClothSolvePairBda.slang header): the MEMBRANE half + the
+// copies/remap/average machinery are BIT-EXACT; the on-device atan2 BENDING half is
+// a TOLERANCE path.  The configs below cover both:
+//   - bending OFF (kInv<=0): everything bit-exact  -> pins membrane + copies/average.
+//   - non-shared FLAT pair (symmetric coplanar): atan2(0,+x)==+0 is exact, so the
+//     whole bending downstream (dCdx / deltaLambda / scale) is bit-exact too.
+//   - genuinely-BENT pair with bending on: positions within a tight relative
+//     tolerance (the atan2-only divergence); membrane lambdas stay bit-exact.
+// ---------------------------------------------------------------------------
+
+// One triangle pair, 4 vertices (indices 0..3), pair vertexIndex = (0,1,2,3).
+struct TriPairConfig
+{
+    bool isShared;      // shared partition (membrane+bending) vs non-shared (bending only)
+    bool bendingOn;     // kInv > 0 (else the bending term early-outs)
+    bool flat;          // symmetric coplanar pair (atan2==+0 exact -> bending bit-exact)
+    bool isTGS;
+    bool useCluster;    // dispatch the cluster twin instead of the per-partition launch
+};
+
+static void runSolveTriPair(const TriPairConfig& cfg)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t N = 4;                 // one pair, 4 verts
+    const float dt = 1.0f / 60.0f;
+    const float invDt = 1.0f / dt;
+
+    struct F2 { float x, y; };
+    struct U4 { uint32_t x, y, z, w; };
+
+    // --- geometry ---------------------------------------------------------
+    std::vector<F4> positions(N);
+    if (cfg.flat)
+    {
+        // symmetric coplanar pair: sinAngle==0, cosAngle==1 exactly -> atan2==+0.
+        positions[0] = { -1.0f, 0.0f, 0.0f, 1.0f };
+        positions[1] = { 1.0f, 0.0f, 0.0f, 1.0f };
+        positions[2] = { 0.0f, -1.0f, 0.0f, 1.0f };
+        positions[3] = { 0.0f, 1.0f, 0.0f, 1.0f };
+    }
+    else
+    {
+        // a stretched, out-of-plane (bent) pair; verts 2,3 are the shared edge.
+        positions[0] = { -0.5f, 0.5f, 0.30f, 1.0f };
+        positions[1] = { 0.5f, 0.5f, -0.20f, 1.0f };
+        positions[2] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        positions[3] = { 0.0f, 1.2f, 0.0f, 1.0f };
+    }
+    std::vector<F4> vels(N), accum(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        vels[i] = { 0.10f * float(i) + 0.03f, -0.20f * float(i) - 0.01f, 0.05f * float(i), 1.0f };
+        accum[i] = { 0.30f - 0.10f * float(i), -0.20f + 0.05f * float(i), 0.15f * float(i), 1.0f };
+    }
+
+    // --- material + rest data --------------------------------------------
+    PxsDeformableSurfaceMaterialData mat;
+    std::memset(&mat, 0, sizeof(mat));
+    mat.youngs = 1.0e5f;
+    mat.poissons = 0.3f;
+    mat.thickness = 0.01f;
+    std::vector<PxsDeformableSurfaceMaterialData> mats = { mat };
+
+    const float restSharedEdgeLength = 1.0f;
+    // restEdge0 = (0,1), restEdge1 = (0,1) -> det0=det1=1 (both membranes run).
+    const F4 restEdge = { 0.0f, 1.0f, 0.0f, 1.0f };
+    // restData1 = (restLen, material0, material1, _) -> both index material 0.
+    const F4 restEdgeLen_mat = { restSharedEdgeLength, 0.0f, 0.0f, 0.0f };
+
+    const float restBendingAngle = cfg.flat ? 0.5f : 0.4f;
+    const float kInv = cfg.bendingOn ? 2.0e-3f : -1.0f;   // <=0 disables bending
+    const F4 restBend = { restBendingAngle, kInv, 0.0f, 0.0f };
+
+    // per-pair lambda seeds (PGS reads/updates them; TGS ignores them).
+    std::vector<F2> membraneLambdas = { { 0.011f, -0.022f }, { -0.033f, 0.044f } }; // 2 float2
+    std::vector<float> bendingLambda = { 0.055f };
+
+    // --- copies/remap scheme for a single pair ---------------------------
+    // CP buffer: [0..3] current per-pair positions (w=0 -> read from positions[]),
+    // [4..7] accumulated poses (written by solve, read+zeroed by average).
+    std::vector<F4> cp(8, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
+    std::vector<U4> pairVtx = { { 0u, 1u, 2u, 3u } };
+    std::vector<uint32_t> writeIndices = { 4u, 5u, 6u, 7u };   // pair-slot k -> CP[4+k]
+    std::vector<uint32_t> accumCopies = { 1u, 2u, 3u, 4u };    // per-vertex prefix sum (1 copy each)
+    std::vector<uint32_t> accumPartitions = { 1u };            // partition 0 -> [0,1)
+
+    // --- upload ----------------------------------------------------------
+    DevBuf bPos = makeDev(dev, positions);
+    DevBuf bVel = makeDev(dev, vels);
+    DevBuf bAcc = makeDev(dev, accum);
+    DevBuf bCP = makeDev(dev, cp);
+    DevBuf bPairVtx = makeDev(dev, pairVtx);
+    DevBuf bWrite = makeDev(dev, writeIndices);
+    DevBuf bCopies = makeDev(dev, accumCopies);
+    DevBuf bParts = makeDev(dev, accumPartitions);
+    DevBuf bRestEdge = makeDev(dev, std::vector<F4>{ restEdge });
+    DevBuf bRestEdgeLenMat = makeDev(dev, std::vector<F4>{ restEdgeLen_mat });
+    DevBuf bRestBend = makeDev(dev, std::vector<F4>{ restBend });
+    DevBuf bMemLam = makeDev(dev, membraneLambdas);
+    DevBuf bBendLam = makeDev(dev, bendingLambda);
+    DevBuf bMat = makeDev(dev, mats);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
+    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
+    c.mPosition_InvMassCP = reinterpret_cast<decltype(c.mPosition_InvMassCP)>(size_t(bCP.addr));
+    c.mNbVerts = N;
+
+    if (cfg.isShared)
+    {
+        c.mOrderedSharedTrianglePairVertexIndices =
+            reinterpret_cast<decltype(c.mOrderedSharedTrianglePairVertexIndices)>(size_t(bPairVtx.addr));
+        c.mSharedTriPairRemapOutputCP =
+            reinterpret_cast<decltype(c.mSharedTriPairRemapOutputCP)>(size_t(bWrite.addr));
+        c.mSharedTriPairAccumulatedCopiesCP =
+            reinterpret_cast<decltype(c.mSharedTriPairAccumulatedCopiesCP)>(size_t(bCopies.addr));
+        c.mSharedTriPairAccumulatedPartitionsCP =
+            reinterpret_cast<decltype(c.mSharedTriPairAccumulatedPartitionsCP)>(size_t(bParts.addr));
+        c.mOrderedSharedRestEdge0_edge1 =
+            reinterpret_cast<decltype(c.mOrderedSharedRestEdge0_edge1)>(size_t(bRestEdge.addr));
+        c.mOrderedSharedRestEdgeLength_material0_material1 =
+            reinterpret_cast<decltype(c.mOrderedSharedRestEdgeLength_material0_material1)>(size_t(bRestEdgeLenMat.addr));
+        c.mOrderedSharedRestBendingAngle_flexuralStiffness_damping =
+            reinterpret_cast<decltype(c.mOrderedSharedRestBendingAngle_flexuralStiffness_damping)>(size_t(bRestBend.addr));
+        c.mOrderedSharedTriangleLambdas =
+            reinterpret_cast<decltype(c.mOrderedSharedTriangleLambdas)>(size_t(bMemLam.addr));
+        c.mSharedBendingLambdas =
+            reinterpret_cast<decltype(c.mSharedBendingLambdas)>(size_t(bBendLam.addr));
+        c.mNbSharedTrianglePairs = 1u;
+        c.mNbSharedTriPairPartitions = 1u;
+    }
+    else
+    {
+        c.mOrderedNonSharedTrianglePairVertexIndices =
+            reinterpret_cast<decltype(c.mOrderedNonSharedTrianglePairVertexIndices)>(size_t(bPairVtx.addr));
+        c.mNonSharedTriPairRemapOutputCP =
+            reinterpret_cast<decltype(c.mNonSharedTriPairRemapOutputCP)>(size_t(bWrite.addr));
+        c.mNonSharedTriPairAccumulatedCopiesCP =
+            reinterpret_cast<decltype(c.mNonSharedTriPairAccumulatedCopiesCP)>(size_t(bCopies.addr));
+        c.mNonSharedTriPairAccumulatedPartitionsCP =
+            reinterpret_cast<decltype(c.mNonSharedTriPairAccumulatedPartitionsCP)>(size_t(bParts.addr));
+        c.mOrderedNonSharedRestBendingAngle_flexuralStiffness_damping =
+            reinterpret_cast<decltype(c.mOrderedNonSharedRestBendingAngle_flexuralStiffness_damping)>(size_t(bRestBend.addr));
+        c.mNonSharedBendingLambdas =
+            reinterpret_cast<decltype(c.mNonSharedBendingLambdas)>(size_t(bBendLam.addr));
+        c.mNbNonSharedTrianglePairs = 1u;
+        c.mNbNonSharedTriPairPartitions = 1u;
+        c.mNonSharedTriPair_hasActiveBending = true;   // else the kernel early-returns
+    }
+
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    // --- dispatch solve ---------------------------------------------------
+    SolveTriPairPush push = {};
+    push.femCloths = bDesc.addr;
+    push.activeFEMCloths = bActive.addr;
+    push.materials = bMat.addr;
+    push.dt = dt;
+    push.partitionId = 0u;   // partitionId (launch) / firstClusterId (cluster)
+    push.flagsWord = (cfg.isShared ? 1u : 0u) | ((cfg.isTGS ? 1u : 0u) << 8u);
+
+    const char* solveEntry = cfg.useCluster ? "cloth_solveTrianglePairEnergyClusterLaunch"
+                                            : "cloth_solveTrianglePairEnergyLaunch";
+    Kernel kSolve("femClothSolvePairBda.spv", solveEntry, {}, sizeof(SolveTriPairPush));
+    kSolve.dispatch(/*gridX numBlocks*/ 1u, {}, push, /*gridY nbActive*/ 1u, /*gridZ*/ 1u);
+    dev->flush();
+
+    // --- dispatch average -------------------------------------------------
+    AvgPairVertsPush apush = {};
+    apush.femCloths = bDesc.addr;
+    apush.activeFEMCloths = bActive.addr;
+    apush.dtInv = invDt;
+    apush.isSharedWord = cfg.isShared ? 1u : 0u;
+    Kernel kAvg("femClothSolvePairBda.spv", "cloth_averageTrianglePairVertsLaunch", {}, sizeof(AvgPairVertsPush));
+    kAvg.dispatch(/*gridX numBlocks*/ 1u, {}, apush, /*gridY nbActive*/ 1u, /*gridZ*/ 1u);
+    dev->flush();
+
+    // --- CPU reference ----------------------------------------------------
+    p71ref::F4 rx0 = { positions[0].x, positions[0].y, positions[0].z, positions[0].w };
+    p71ref::F4 rx1 = { positions[1].x, positions[1].y, positions[1].z, positions[1].w };
+    p71ref::F4 rx2 = { positions[2].x, positions[2].y, positions[2].z, positions[2].w };
+    p71ref::F4 rx3 = { positions[3].x, positions[3].y, positions[3].z, positions[3].w };
+    const p71ref::F4 vrc = { 1.0f, 1.0f, 1.0f, 1.0f };   // 1 copy per vertex
+
+    float m0x = membraneLambdas[0].x, m0y = membraneLambdas[0].y;
+    float m1x = membraneLambdas[1].x, m1y = membraneLambdas[1].y;
+    float bendLam = bendingLambda[0];
+
+    if (cfg.isShared)
+    {
+        const p71ref::F4 re = { restEdge.x, restEdge.y, restEdge.z, restEdge.w };
+        p71ref::refSharedPair(rx0, rx1, rx2, rx3, vrc, re, restSharedEdgeLength,
+                              mat.youngs, mat.poissons, mat.thickness,
+                              mat.youngs, mat.poissons, mat.thickness,
+                              m0x, m0y, m1x, m1y, restBendingAngle, kInv, dt, bendLam, cfg.isTGS);
+    }
+    else
+    {
+        p71ref::refBendingPair(rx0, rx1, rx2, rx3, vrc, restBendingAngle, kInv, dt, bendLam, cfg.isTGS);
+    }
+
+    const p71ref::F4 solved[4] = { rx0, rx1, rx2, rx3 };
+    std::vector<F4> refPos(N), refVel(N), refAcc(N);
+    for (uint32_t v = 0; v < N; ++v)
+    {
+        const F4 orig = positions[v];
+        const F4 d = { solved[v].x - orig.x, solved[v].y - orig.y, solved[v].z - orig.z, 0.0f };
+        refPos[v] = { orig.x + d.x, orig.y + d.y, orig.z + d.z, orig.w };
+        refVel[v] = { vels[v].x + d.x * invDt, vels[v].y + d.y * invDt, vels[v].z + d.z * invDt, vels[v].w };
+        refAcc[v] = { accum[v].x + d.x, accum[v].y + d.y, accum[v].z + d.z, accum[v].w };
+    }
+
+    // --- download + compare ----------------------------------------------
+    const auto gPos = downloadBuffer<F4>(dev, bPos.h, N);
+    const auto gVel = downloadBuffer<F4>(dev, bVel.h, N);
+    const auto gAcc = downloadBuffer<F4>(dev, bAcc.h, N);
+    const auto gMemLam = downloadBuffer<F2>(dev, bMemLam.h, 2);
+    const auto gBendLam = downloadBuffer<float>(dev, bBendLam.h, 1);
+
+    const char* tag = cfg.isShared ? "shared" : "nonShared";
+    // Bit-exact whenever bending is disabled OR the atan2 hits its exact +0 special
+    // value (flat pair); otherwise the atan2 downstream is a tolerance path.
+    const bool bitExact = !cfg.bendingOn || cfg.flat;
+
+    // Teeth: the solve must actually move at least one vertex.
+    bool moved = false;
+    for (uint32_t v = 0; v < N; ++v)
+        moved = moved || f2u(gPos[v].x) != f2u(positions[v].x) || f2u(gPos[v].y) != f2u(positions[v].y)
+                      || f2u(gPos[v].z) != f2u(positions[v].z);
+    PXG_CHECK_MSG(moved, "%s tri-pair solve should move a vertex (teeth, isTGS=%d, bendOn=%d, flat=%d)",
+                  tag, int(cfg.isTGS), int(cfg.bendingOn), int(cfg.flat));
+
+    // Tight documented tolerance for the atan2 seam.  atan2 diverges by at most a
+    // few ulp (~1e-7 rel) between llvmpipe's GLSL.std.450 Atan2 and glibc; that
+    // propagates LINEARLY through C -> deltaLambda -> the per-vertex bending
+    // displacement `d`, whose absolute error is bounded by ~5e-7 here.  Position and
+    // accumulated-delta inherit `d` directly, so a 1e-6 absolute floor (+ 1e-5
+    // relative) covers them.  Velocity inherits `d * invDt` (invDt == 60), so its
+    // absolute floor is scaled by invDt (1e-6 * 60 == 6e-5) — the SAME underlying
+    // seam bound, just amplified by the fixed invDt, not a looser tolerance.
+    const float relTol = 1.0e-5f;
+    const float posAbs = 1.0e-6f;
+    const float velAbs = posAbs * invDt;   // velocity = position-change * invDt
+    auto close = [&](float a, float b, float absTol) { return std::fabs(a - b) <= absTol + relTol * std::fabs(a); };
+
+    size_t mm = 0;
+    float maxErr = 0.0f;
+    auto cmp4 = [&](const char* nm, uint32_t i, const F4& r, const F4& g, float absTol) {
+        bool ok;
+        if (bitExact)
+            ok = f2u(r.x) == f2u(g.x) && f2u(r.y) == f2u(g.y) && f2u(r.z) == f2u(g.z) && f2u(r.w) == f2u(g.w);
+        else
+            ok = close(r.x, g.x, absTol) && close(r.y, g.y, absTol) && close(r.z, g.z, absTol) && close(r.w, g.w, absTol);
+        maxErr = std::fmax(maxErr, std::fmax(std::fabs(r.x - g.x), std::fmax(std::fabs(r.y - g.y), std::fabs(r.z - g.z))));
+        if (!ok)
+        {
+            ++mm;
+            if (mm <= 8)
+                std::printf("  %s %s[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", tag, nm, i,
+                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w);
+        }
+    };
+    for (uint32_t v = 0; v < N; ++v)
+    {
+        cmp4("pos", v, refPos[v], gPos[v], posAbs);
+        cmp4("vel", v, refVel[v], gVel[v], velAbs);
+        cmp4("acc", v, refAcc[v], gAcc[v], posAbs);
+    }
+
+    // Lambdas (PGS only — TGS never reads/writes them).  The MEMBRANE lambdas are
+    // always bit-exact (the membrane half is bit-exact); the BENDING lambda is
+    // bit-exact when the bending is bit-exact, else within tolerance.
+    if (!cfg.isTGS)
+    {
+        if (cfg.isShared)
+        {
+            if (f2u(gMemLam[0].x) != f2u(m0x) || f2u(gMemLam[0].y) != f2u(m0y)
+                || f2u(gMemLam[1].x) != f2u(m1x) || f2u(gMemLam[1].y) != f2u(m1y))
+            {
+                ++mm;
+                std::printf("  %s membrane lambda MM: ref(%g,%g / %g,%g) got(%g,%g / %g,%g)\n", tag,
+                            m0x, m0y, m1x, m1y, gMemLam[0].x, gMemLam[0].y, gMemLam[1].x, gMemLam[1].y);
+            }
+        }
+        bool bendOk = bitExact ? (f2u(gBendLam[0]) == f2u(bendLam)) : close(bendLam, gBendLam[0], posAbs);
+        if (!bendOk)
+        {
+            ++mm;
+            std::printf("  %s bending lambda MM: ref %g got %g\n", tag, bendLam, gBendLam[0]);
+        }
+    }
+
+    PXG_CHECK_MSG(mm == 0, "%s tri-pair solve %s vs CPU (%zu mismatches, isTGS=%d, bendOn=%d, flat=%d, cluster=%d, maxErr=%g)",
+                  tag, bitExact ? "bit-exact" : "within-tol", mm, int(cfg.isTGS), int(cfg.bendingOn),
+                  int(cfg.flat), int(cfg.useCluster), maxErr);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h);
+    dev->destroyBuffer(bCP.h); dev->destroyBuffer(bPairVtx.h); dev->destroyBuffer(bWrite.h);
+    dev->destroyBuffer(bCopies.h); dev->destroyBuffer(bParts.h); dev->destroyBuffer(bRestEdge.h);
+    dev->destroyBuffer(bRestEdgeLenMat.h); dev->destroyBuffer(bRestBend.h); dev->destroyBuffer(bMemLam.h);
+    dev->destroyBuffer(bBendLam.h); dev->destroyBuffer(bMat.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bActive.h);
+}
+
+// Shared pair, bending OFF: membrane + copies/remap/average are BIT-EXACT.
+PXG_TEST(femClothSimSolveTriPairSharedMembranePGS)
+{
+    runSolveTriPair({ /*isShared*/ true, /*bendingOn*/ false, /*flat*/ false, /*isTGS*/ false, /*useCluster*/ false });
+}
+PXG_TEST(femClothSimSolveTriPairSharedMembraneTGS)
+{
+    runSolveTriPair({ /*isShared*/ true, /*bendingOn*/ false, /*flat*/ false, /*isTGS*/ true, /*useCluster*/ false });
+}
+
+// Shared pair, bending ON (bent): membrane bit-exact, bending within tolerance.
+PXG_TEST(femClothSimSolveTriPairSharedBendPGS)
+{
+    runSolveTriPair({ /*isShared*/ true, /*bendingOn*/ true, /*flat*/ false, /*isTGS*/ false, /*useCluster*/ false });
+}
+PXG_TEST(femClothSimSolveTriPairSharedBendTGS)
+{
+    runSolveTriPair({ /*isShared*/ true, /*bendingOn*/ true, /*flat*/ false, /*isTGS*/ true, /*useCluster*/ false });
+}
+
+// Non-shared FLAT pair, bending ON: atan2(0,+x)==+0 exact -> bending BIT-EXACT.
+PXG_TEST(femClothSimSolveTriPairNonSharedFlatPGS)
+{
+    runSolveTriPair({ /*isShared*/ false, /*bendingOn*/ true, /*flat*/ true, /*isTGS*/ false, /*useCluster*/ false });
+}
+PXG_TEST(femClothSimSolveTriPairNonSharedFlatTGS)
+{
+    runSolveTriPair({ /*isShared*/ false, /*bendingOn*/ true, /*flat*/ true, /*isTGS*/ true, /*useCluster*/ false });
+}
+
+// Non-shared BENT pair, bending ON: the general on-device atan2 path, within tolerance.
+PXG_TEST(femClothSimSolveTriPairNonSharedBentPGS)
+{
+    runSolveTriPair({ /*isShared*/ false, /*bendingOn*/ true, /*flat*/ false, /*isTGS*/ false, /*useCluster*/ false });
+}
+PXG_TEST(femClothSimSolveTriPairNonSharedBentTGS)
+{
+    runSolveTriPair({ /*isShared*/ false, /*bendingOn*/ true, /*flat*/ false, /*isTGS*/ true, /*useCluster*/ false });
+}
+
+// Cluster twin (the barrier-looped partition path): shared membrane bit-exact +
+// non-shared flat bending bit-exact, dispatched through the *ClusterLaunch entry.
+PXG_TEST(femClothSimSolveTriPairClusterPGS)
+{
+    runSolveTriPair({ /*isShared*/ true, /*bendingOn*/ false, /*flat*/ false, /*isTGS*/ false, /*useCluster*/ true });
+    runSolveTriPair({ /*isShared*/ false, /*bendingOn*/ true, /*flat*/ true, /*isTGS*/ false, /*useCluster*/ true });
+}
 
 } // namespace

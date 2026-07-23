@@ -72,6 +72,9 @@ set(SHADER_COMMON_DEPS
     ${SHADER_DIR}/pxgSlangSimCoreDesc.slang
     ${SHADER_DIR}/pxgSlangPrepDesc.slang
     ${SHADER_DIR}/pxgSlangParticleDesc.slang
+    ${SHADER_DIR}/pxgSlangFEMClothDesc.slang
+    ${SHADER_DIR}/pxgSlangClothMembrane.slang
+    ${SHADER_DIR}/pxgSlangClothBending.slang
     ${SHADER_DIR}/pxgSlangNpAbi.slang
     ${SHADER_DIR}/npCvxCollide.slang
     ${SHADER_DIR}/npCvxStage2Core.slang
@@ -83,7 +86,7 @@ set(SHADER_COMMON_DEPS
 # to contract undecorated expressions: llvmpipe fuses npCvxCoreEpa's
 # makePlane triple-cross sums into fma chains (1-ulp vs strict IEEE), which
 # breaks the bitwise CPU-vs-GPU doctrine.  The decoration forbids that.
-set(PXG_NOCONTRACT_SHADERS npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npD6JointPrep npArtiExtBody npArti1DPrep npArtiJointHeader npArtiSolve1D npArtiSolveContact npArtiSolve1DTGS npArtiSolveContactTGS npArtiCheckActive npArtiPropagate npArtiPropagateAccel npArtiPropagateAccelJV npArtiSpatialMatVec npArtiSpatialMatMat npArtiTranslateInertia npArtiTranslateSInertia npArtiPropagateZA npArtiPropagateZASph npArtiTranslateInertiaMass npArtiInvertInertia npArtiPropagateImpDof npArtiAccumLinkImp npArtiDriveParams npArtiClampDriveImp npClothDefGrad2D npSbDefGrad npDefMaterial npJacobiRotate npClothAtan npAnisoHelpers npClothDeltaLambda npClothExtractRot2D npClothVelClamp npClothArap2D npClothArea2D npClothWind npSbBaryInvMass npSbVolumeSolve npIsoConcaveCorner npSphSpikyKernel npIsoAcosDecode npSparseGridDomain npDenseGridCell npSbBaryProject npIsoVecNormalize npSbCompliance npSbDeltaLambdaGradC npSbTetConstraint npPsSpecVolume npSbComputeLambda npGridLocation npAnisoOutput npSmoothPos npIsoAvgVerts npPsSolvePC npPsSolvePCTGS npPsWeightKernels npPsDiffuseUpdate npPsDiffuseSpawn npPsDiffuseAvg npPsDiffuseOneWay npSdfBoxDist npSparseGridCellFromPos npIsoGridFilter npSbExtractRotAPD npSbSolveNeoHookean npSbSolveCorot npSbSolveGM npClothMembrane npClothBending npClothSharedEnergy npSbCollisionConstraint npClothCollisionConstraint npSdfBvhMorton npSbStress npSdfHoles npClothTriContact particleSim particleSelfCollisionBda psContactSolveTgsBda femClothSimBda femClothSolveBda)
+set(PXG_NOCONTRACT_SHADERS npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npD6JointPrep npArtiExtBody npArti1DPrep npArtiJointHeader npArtiSolve1D npArtiSolveContact npArtiSolve1DTGS npArtiSolveContactTGS npArtiCheckActive npArtiPropagate npArtiPropagateAccel npArtiPropagateAccelJV npArtiSpatialMatVec npArtiSpatialMatMat npArtiTranslateInertia npArtiTranslateSInertia npArtiPropagateZA npArtiPropagateZASph npArtiTranslateInertiaMass npArtiInvertInertia npArtiPropagateImpDof npArtiAccumLinkImp npArtiDriveParams npArtiClampDriveImp npClothDefGrad2D npSbDefGrad npDefMaterial npJacobiRotate npClothAtan npAnisoHelpers npClothDeltaLambda npClothExtractRot2D npClothVelClamp npClothArap2D npClothArea2D npClothWind npSbBaryInvMass npSbVolumeSolve npIsoConcaveCorner npSphSpikyKernel npIsoAcosDecode npSparseGridDomain npDenseGridCell npSbBaryProject npIsoVecNormalize npSbCompliance npSbDeltaLambdaGradC npSbTetConstraint npPsSpecVolume npSbComputeLambda npGridLocation npAnisoOutput npSmoothPos npIsoAvgVerts npPsSolvePC npPsSolvePCTGS npPsWeightKernels npPsDiffuseUpdate npPsDiffuseSpawn npPsDiffuseAvg npPsDiffuseOneWay npSdfBoxDist npSparseGridCellFromPos npIsoGridFilter npSbExtractRotAPD npSbSolveNeoHookean npSbSolveCorot npSbSolveGM npClothMembrane npClothBending npClothSharedEnergy npSbCollisionConstraint npClothCollisionConstraint npSdfBvhMorton npSbStress npSdfHoles npClothTriContact particleSim particleSelfCollisionBda psContactSolveTgsBda femClothSimBda femClothSolveBda femClothSolvePairBda)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
@@ -389,6 +392,17 @@ pxg_compile_shader(femClothSimBda cloth_preIntegrateLaunch cloth_finalizeVelocit
 # verbatim from the Phase-1-verified pxgSlangClothMembrane module.
 pxg_compile_shader(femClothSolveBda cloth_solveNonSharedTriangleEnergyLaunch
                    cloth_solveNonSharedTriangleEnergyClusterLaunch)
+# P7.1 tranche 2: FEMCloth triangle-pair (shared shell-energy + Discrete-Shells
+# bending) solve on the engine ABI (BDA).  All three kernels read the PxgFEMCloth
+# descriptor array + the PxsDeformableSurfaceMaterialData array through Ptr<> (no
+# HLSL cs_6_0 lowering) and the cluster kernel loops partitions with a groupshared
+# barrier, so this shader is deliberately absent from PXG_HLSL_ENTRIES (same
+# precedent as femClothSolveBda / femClothSimBda).  The in-plane math is imported
+# verbatim from pxgSlangClothMembrane; the bending math from pxgSlangClothBending
+# (a DOCUMENTED-REPLACEMENT / tolerance leaf — it evaluates atan2 on-device).
+pxg_compile_shader(femClothSolvePairBda cloth_solveTrianglePairEnergyLaunch
+                   cloth_solveTrianglePairEnergyClusterLaunch
+                   cloth_averageTrianglePairVertsLaunch)
 pxg_compile_shader(contactReduce ctContactReduce)
 pxg_compile_shader(npSbTet ctSbTet)
 pxg_compile_shader(npSbSelf ctSbSelfQuery)

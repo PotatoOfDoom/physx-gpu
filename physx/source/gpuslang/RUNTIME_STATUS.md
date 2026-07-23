@@ -237,6 +237,63 @@ tested; the code survived on disk and was salvaged — the math verified byte-id
 module by diff, the wiring audited against the `.cu`, and the functional bit-exact unit test authored
 to close it.
 
+## P7.1 tranche 2 — the cloth triangle-PAIR (shared-energy + bending) solve on the BDA engine ABI
+
+The energy solve the P7.0 5×5-grid cloth ACTUALLY routes through (its triangles have 0 non-shared
+partitions — all edges are shared triangle *pairs*). Three kernels; `PXG_SLANG_KERNEL_MAPPED`
+185 → **188**, ported line-for-line from `FEMCloth.cu`:
+- `cloth_solveTrianglePairEnergyLaunch` (`:861`, ABI `{8,8,8,4,4,1,1}` — adds an `isSharedTrianglePair`
+  bool vs the non-shared solve) + its cluster twin `...ClusterLaunch` — the 4-vertex (x0,x1,x2,x3)
+  pair solve (`updateTrianglePairs`, `:768`): for a SHARED pair, `clothSharedEnergySolvePerTrianglePair`
+  (membrane on both triangles + bending); for a NON-shared pair, `bendingEnergySolvePerTrianglePair`
+  (bending only). Uses the COPIES/REMAP scheme — each vertex belongs to several pairs, so each pair
+  writes its correction to its own copy slot (`mPosition_InvMassCP` via the remap-output CP).
+- `cloth_averageTrianglePairVertsLaunch` (`:522`, ABI `{8,8,4,1}`) — the Jacobi pass that averages
+  each vertex's per-pair copies back by its reference count.
+
+New shader `femClothSolvePairBda.slang`; the bending math is new module `pxgSlangClothBending.slang`
+(`bendingSolve` = `bendingEnergySolvePerTrianglePair`, FEMClothUtil.cuh:543-655 — the Discrete-Shells
+XPBD dihedral constraint, structurally identical to the Phase-1 `npClothBending`). The shared-energy
+driver reuses `pxgSlangClothMembrane` (tranche 1) for the two membrane calls.
+
+**THE atan2 SEAM (documented tolerance, the tex3D precedent).** The bending dihedral uses
+`atan2(sinAngle, cosAngle)`; `atan2f` is a libm transcendental with NO cross-backend bit-exact
+guarantee (same class as sinf/cosf/tex3D filtering). The Phase-1 `npClothBending` harness dodges it by
+taking the angle as a host-precomputed INPUT; the ENGINE kernel has no host, so it evaluates `atan2`
+**on-device**. Therefore: the membrane half, the copies/remap/average machinery, and everything up to
+and INCLUDING `sinAngle`/`cosAngle` are **bit-exact**; the on-device `atan2` and everything downstream
+(C, the 2π wrap, clamp, deltaLambda, position update) is a **tight-tolerance** path — `relTol 1e-5` +
+abs floor `1e-6` (velocity `6e-5 = 1e-6·invDt`), justified by the *measured* ~1e-7-relative divergence
+between llvmpipe's `GLSL.std.450 Atan2` and glibc, which propagates to ~5e-7 in the displacement. A
+symmetric-coplanar (FLAT) pair hits `atan2(0,+1) == +0` (an IEEE-exact special value), so its bending
+is **bit-exact** too.
+
+**Scene — the 5×5 mesh now runs its energy solve LIVE:** `PXG_SCENE=cloth` dispatches
+`cloth_solveTrianglePairEnergyClusterLaunch` ×960 + `cloth_averageTrianglePairVertsLaunch` ×960 over
+the run, **zero refused launches** (was `Could not find cloth_solveTrianglePairEnergyLaunch`), exit 0;
+the free-fall is **byte-unchanged** (mean y 5.0000 → 0.01325 — a true no-op on the coherent flat cloth,
+no spurious deformation, no crash). New unit tests `gpuslang.femClothSim` +9 cases (SharedMembrane /
+SharedBend / NonSharedFlat / NonSharedBent / Cluster × PGS/TGS): a triangle pair (bent out of plane
+for the bend cases, coplanar for the flat) with the copies/remap arrays set for a single pair,
+dispatched through solve + average, compared vs a CPU transcription — **bit-exact** for the membrane +
+flat-bending + machinery, **within-tolerance** for the on-device-atan2 bent bending — mutation-checked
+(a +0.01 rad angle perturbation fails 7 cases; the tight tolerance has teeth). Full suite **673/673
+both memory modes**; rigid regression 8×2 = **16/16** (three previously-`nullptr` cloth rows hand-edited,
+NOT regenerated — rigid/particle dispatch byte-unaffected).
+
+Also fixed a latent build-dep gap surfaced by the mutation check: the cloth Slang modules
+(`pxgSlangFEMClothDesc` / `...ClothMembrane` / `...ClothBending`) were absent from
+`SHADER_COMMON_DEPS`, so editing an imported module did not re-trigger dependent-shader recompiles
+(stale `.spv` on incremental builds — clean builds were always correct). All three are now tracked.
+
+Deviations (flagged, behavior-preserving): descriptor block-copy → direct `Ptr<>` reads; PxU16 loads →
+32-bit word + half extraction; the copies-`w`-flag reset and the remap writeback transcribed verbatim;
+material lookup by `u32(restData.y/z)`; the atan2 tolerance seam above (the ONLY non-bitwise part).
+**Recovery/verification note:** the tranche was drafted by a background worktree agent (this one ran to
+completion), then salvaged and INDEPENDENTLY re-verified in the main tree — math diffed against the
+Phase-1 modules, the atan2 tolerance re-derived and mutation-checked for teeth, and the full
+suite/regression/scene re-run before commit.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED
