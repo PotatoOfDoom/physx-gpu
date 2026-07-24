@@ -405,6 +405,15 @@ static const uint8_t kClothClothContactSolve[] = { 8, 8, 8, 4 };
 //   (@16/@17) + three device pointers + PxReal (@48) -> natural-alignment blob = 56 bytes.
 static const uint8_t kClothUpdateContactValidity[] = { 8, 8, 1, 1, 8, 8, 8, 4 };
 
+// gpusimulationcontroller softBodyGM.cu:72 (P8.0 SOFTBODY / FEM-volume free-fall BDA):
+//   sb_gm_preIntegrateLaunch(PxgSoftBody* softbodies, const PxU32* activeId,
+//     PxVec3 gravity, PxReal dt, bool isTGS, PxReal* speculativeCCDContactOffset,
+//     bool externalForcesEveryTgsIterationEnabled)  -- launch site
+//   PxgSoftBodyCore.cpp:165.  Two device pointers + PxVec3 by value (12) + PxReal
+//   (@28) + bool isTGS (@32) + device pointer (@40, after the isTGS 4-byte tail-pad
+//   realigns to 8) + bool externalForces (@48) -> natural-alignment blob = 56 bytes.
+static const uint8_t kSbPreIntegrate[] = { 8, 8, 12, 4, 1, 8, 1 };
+
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
@@ -745,6 +754,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_solveClothClothDeltaVTLaunch", kClothClothContactSolve, uint32_t(sizeof(kClothClothContactSolve)) },
     { "cloth_solveClothClothDeltaEELaunch", kClothClothContactSolve, uint32_t(sizeof(kClothClothContactSolve)) },
     { "cloth_updateClothContactValidityLaunch", kClothUpdateContactValidity, uint32_t(sizeof(kClothUpdateContactValidity)) },
+    // gpusimulationcontroller softbody (FEM-volume) free-fall predict/integrate (P8.0 BDA)
+    { "sb_gm_preIntegrateLaunch", kSbPreIntegrate, uint32_t(sizeof(kSbPreIntegrate)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },

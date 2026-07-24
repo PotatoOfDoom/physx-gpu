@@ -652,6 +652,64 @@ self-collision money shot), wiring the tranche-1 midphase + this solve into the 
 flagged multi-rigid sort-helper ABI (single-copy radix BDA rewrite) + cloth TGS integration close out P7,
 after which **SOFTBODY** (0/56 kernels — the next big subsystem) opens.
 
+## P8.0 tranche 1 — OPENS THE SOFTBODY (FEM-volume) SUBSYSTEM: the first live softbody frame on the BDA engine ABI
+
+The softbody analog of the P7.0 FEMCloth free-fall: the first of the ~56 softbody simulation
+kernels, ported line-for-line from `gpusimulationcontroller/src/CUDA/softBodyGM.cu`.
+`PXG_SLANG_KERNEL_MAPPED` 209 → **210**:
+- `sb_gm_preIntegrateLaunch` (`SB_SIM_PREINTEGRATION`, `softBodyGM.cu:72`, launch
+  `PxgSoftBodyCore.cpp:165`) — the softbody free-fall predict/integrate driver: gravity predict
+  AND (on the PGS path) the position integration `mSimPosition_InvMass[i] = oldPos + vel*dt`
+  (the observable fall), plus the full-kinematic (`mBodyFlags & eKINEMATIC`) and
+  partially-kinematic (`mVolumeFlags & ePARTIALLY_KINEMATIC`) branches, the damping predict,
+  the max-velocity clamp and both the TGS and PGS position paths — every null/flag branch and
+  the thread mapping preserved. Grid `(numBlocks, nbActiveSoftBodies, 1)`, block
+  `(32, SB_PREINTEGRATION/32, 1)`, `blockIdx.y` selects the softbody via `activeId[blockIdx.y]`.
+  ABI `{8,8,12,4,1,8,1}` = **56 bytes** (two device ptrs, `PxVec3 gravity`(12)@16, `PxReal dt`@28,
+  `bool isTGS`@32, `PxReal* speculativeCCDContactOffset`@40 after the 4-byte tail-pad realigns,
+  `bool externalForcesEveryTgsIterationEnabled`@48).
+
+New shaders `softBodySimBda.slang` + `pxgSlangSoftBodyDesc.slang` — the first softbody device
+mirror: `PxgSoftBodyGpu`, a BYTE-EXACT transcription of the engine `PxgSoftBody` struct (every
+field offset AND the array stride, self-asserted with `offsetof` against the real engine header
+in the test TU — the byte-packed `mActorFlags`@392 / `mBodyFlags`@393 / `mVolumeFlags`@394 flag
+triple + explicit `_pad396` so the following pointer lands at @400). The kernel reads the
+descriptor array through `Ptr<>` + push constants (pure BDA, excluded from `PXG_HLSL_ENTRIES`),
+NoContraction-stamped. **Fully BIT-EXACT — both memory modes, NO transcendental seam**: the
+predict/integrate path is pure mul/add; the max-velocity clamp's `1/PxSqrt(velMagSq)` is DEAD on
+the default scene (`mMaxLinearVelocity == PX_MAX_REAL` short-circuits the clamp false). New unit
+test `gpuslang.softBodySim` (`runPreIntegrate` for both the PGS and TGS paths): a small softbody
+with free + fixed verts, gravity `(0,-9.81,0)`, dispatched and compared f2u-bit-exact to a CPU
+transcription of the same gravity/damping predict + PGS position integrate (and the TGS path where
+`delta` stays 0 but velocity still receives gravity). Independently mutation-checked in the main
+tree (`vel += gravity*dt` → `*1.01f` + forced-fresh `.spv` recompile fails 21 f2u compares:
+`vel MM 0 ref(0,-0.163228,0) got(0,-0.16486,0)`). `softBodySim` passes bit-exact in BOTH memory
+modes; the rest of the suite passes too (673 prior + this new case), with the lone exception of
+`gpuslang.npBv32`, which fails `vkCreateComputePipelines … VK_ERROR_UNKNOWN (-13)` even in isolation
+— an ENVIRONMENTAL llvmpipe pipeline-creation degradation (the container's long suspend/resume, the
+same class as the documented `gpuslang.scan` flake), NOT a logic regression from this change (every
+BV32-using test that DOES build its pipeline, e.g. `femClothSim`, still passes bit-exact).
+
+Deviations (behavior-preserving, documented in-shader): the kernel's ONLY warp op — the
+speculative-CCD reduction (`warpReduction<MaxOpFloat>` + `__syncthreads` + `AtomicMax` on
+`speculativeCCDContactOffset[id]`) — is OMITTED because it is gated by the OPT-IN
+`eENABLE_SPECULATIVE_CCD` body flag (unset on the default free-fall scene), so the whole block +
+its `__shared__ maxMagnitudeVelSq[32]` are dead; keeping it out means the shader has NO groupshared
+and NO barriers, so there is no 8-vs-32-lane subgroup hazard on llvmpipe (the exact position the
+cloth precedent took for its dead `adaptiveCollisionPairUpdate` reduction; `speculativeCCDContactOffset`
+stays in the push blob for ABI parity but is unread). The two per-vertex `bool*` byte stores
+(`mVertsAreDeformed`/`mVertsCanNotDeform` = false) are elided (8-bit storage on llvmpipe; the cloth
+`updateContactPairs` precedent) — no MAPPED kernel consumes them on the free-fall path; the
+`mAwake = false` reset IS kept (PxU32, 4-byte, faithful).
+
+**Scouting for the softbody arc** (the minimal "a softbody falls and settles" pipeline, analogous to
+how cloth needed only 3 kernels for its first frame): next tranches = `sb_refitBoundLaunch` (BV32
+refit) → the FEM-volume solve chain (`sb_gm_cp_solveTetrahedronsPartitionLaunch` +
+`sb_updateTetrahedraRotationsLaunch` + `sb_gm_applyExternalDeltasLaunch`) → `sb_gm_stepSoftbodyLaunch`
++ `sb_gm_finalizeVelocitiesLaunch` + `sb_sleeping`, then softbody-vs-rigid contact
+(`sb_rigidContactPrepareLaunch` + `sb_solveRigidSoftCollisionLaunch`) for a softbody-on-floor scene.
+56 softbody kernels total; this is 1.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED
