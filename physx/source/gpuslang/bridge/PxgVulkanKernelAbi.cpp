@@ -425,6 +425,15 @@ static const uint8_t kClothRefitBound[] = { 8, 8, 4, 8, 8, 8, 8, 4, 8 };
 //   realigns to 8) + bool externalForces (@48) -> natural-alignment blob = 56 bytes.
 static const uint8_t kSbPreIntegrate[] = { 8, 8, 12, 4, 1, 8, 1 };
 
+// gpusimulationcontroller softBody.cu:99 (P8.0 tranche 2 softbody BVH bottom-up refit):
+//   sb_refitBoundLaunch(PxgSoftBody* gSoftbodies, const PxU32* activeSoftbodies,
+//     const PxU32 nbActiveSoftBodies, PxReal* bpContactDistance, PxReal* npContactDistance,
+//     PxReal* speculativeCCDContactOffset, PxBounds3* boundArray, const PxU32* elemIndex)
+//   -- launch site PxgSoftBodyCore.cpp:284.  Two device pointers + PxU32 (@16, its 4-byte
+//   tail-pad realigning the next pointer to @24) + five device pointers -> natural-alignment
+//   blob = 64 bytes.
+static const uint8_t kSbRefitBound[] = { 8, 8, 4, 8, 8, 8, 8, 8 };
+
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
@@ -769,6 +778,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_refitBoundLaunch", kClothRefitBound, uint32_t(sizeof(kClothRefitBound)) },
     // gpusimulationcontroller softbody (FEM-volume) free-fall predict/integrate (P8.0 BDA)
     { "sb_gm_preIntegrateLaunch", kSbPreIntegrate, uint32_t(sizeof(kSbPreIntegrate)) },
+    { "sb_refitBoundLaunch", kSbRefitBound, uint32_t(sizeof(kSbRefitBound)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },

@@ -815,6 +815,49 @@ comparison read as a frozen sim.
 
 Suite 674/674 in both memory modes, rigid regression 16/16, cloth/clothhang/clothdrape/particle green.
 
+## P8.0 tranche 2 — the SOFTBODY BVH bounds refit (`sb_refitBoundLaunch`)
+
+Second kernel of the softbody free-fall chain.  `sb_gm_preIntegrateLaunch` (tranche 1) moves the
+vertices; from that moment the softbody's cooked BV32 TETRAHEDRON tree and its broad-phase bound are
+stale, so the broad phase, the midphase and contact generation all still see the body where it was
+cooked.  `shaders/softBodyRefitBda.slang` ports softBody.cu:99 (launch PxgSoftBodyCore.cpp:284) as the
+direct sibling of the cloth refit — same algorithm over tetrahedra instead of triangles — reusing that
+port's BV32 decode and warp lowering verbatim.  ABI row `{8,8,4,8,8,8,8,8}` (64-byte blob); manifest
+hand-edited, **MAPPED 211 → 212**.
+
+Differences from the cloth sibling, all straight from the .cu: the primitive is a TETRAHEDRON (4
+vertices, min/max folded pairwise v0v1 / v2v3 / the two); the tree hangs off `mTetMeshData` with
+`mTetIndices` and the COLLISION-mesh `mPosition_InvMass` (not the `mSim*` fields); there is no
+`updateContactPairs` gate (a cloth-only mechanism); and the broad-phase tail copies the root bound
+VERBATIM with no expansion ("the broad phase will add contact dist automatically"), additionally
+republishing the bp/np contact distance as `speculativeCCDContactOffset + mOriginalContactOffset` when
+`PxDeformableBodyFlag::eENABLE_SPECULATIVE_CCD` is set.  The llvmpipe `k &= k-1` miscompile and the
+buffer-trailer load-width artifact — both bisected on the cloth sibling — are pre-empted here.
+
+**The test geometry is built for mutation teeth, and getting there took three rebuilds.**  The
+first attempt (a plain shared-vertex mesh) let a mutant that folds `worldV3` out of the min/max PASS:
+every dropped vertex also appeared in another slot of another tet in the same leaf, which re-supplied
+the extreme.  Adding one dedicated extremal vertex per slot fixed two of four slots.  The real cause is
+structural: the kernel's leaf walk aggregates across ALL of a node's leaf children and then writes that
+one aggregate into EVERY child slot, so several extremal vertices under one node mask each other — one
+tet per leaf child is not enough, it has to be one tet per NODE.  The final tree is a root with 8
+internal children, each a node holding a single tet, and each tet carries in one chosen slot a vertex
+uniquely extremal in all three axes (v8/v9 for x, v10/v11 for y, v12/v13 for z, v14/v15 for w, min and
+max).  All **8 slot mutants** (4 slots x min/max) are now caught, plus bottom-up→top-down, a
+broad-phase bound expansion, a childOffset shift, and ignoring the speculative-CCD gate.
+
+Everything is compared **bit-exact** (raw float bits) against a CPU reference transcribing the 32-lane
+semantics: every node AABB slot, every `mPackedNodeBounds` entry, the broad-phase slot (with the
+neighbours checked untouched — elemIndex indirection proof) and both contact-distance arrays, with the
+speculative-CCD branch covered BOTH ways.  Pure min/max plus one addition, no transcendental —
+**fully bit-exact, no tolerance seam**.  Suite 674/674 in both memory modes (one `gpuslang.scan`
+SegFault on the first V2 run, the known llvmpipe flake — clean on re-run), rigid regression 16/16,
+cloth / clothdrape / clothselfcollide / particle green.
+
+**Remaining softbody free-fall chain**: `sb_gm_stepSoftbodyLaunch` → `sb_gm_finalizeVelocitiesLaunch`
+→ `sb_sleeping` completes the minimal "a softbody falls and settles" path (2 of 56 softbody kernels
+mapped so far), then the FEM-volume solve chain, then softbody-vs-rigid contact for a scene.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED
