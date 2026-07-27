@@ -367,7 +367,14 @@ void cloth_sleeping(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_G
     }
     GroupMemoryBarrierWithGroupSync();
 
+    // CUDA gates this store on `(startIdx + threadIdx.x) < ((numActive + 31) / 32)` — only
+    // the words a warp with at least one live cloth actually filled.  The P7.0 port dropped
+    // that guard, which writes zeros PAST THE END of stateChangedMask: it is a PxgBitMap
+    // sized to the body count, so a single active cloth means one live word while all 32
+    // lanes were storing.  Restored while porting the softbody twin (sb_sleeping), whose
+    // unit test asserts the neighbouring words stay untouched.
     const uint startIdx = (groupId.x * CLOTH_STEP) / 32u; // = 32 * groupId.x
-    if (groupThreadId.x < CLOTH_STEP_NUM_WARPS)
+    const uint nbWords = (gSleep.numActiveCloths + 31u) / 32u;
+    if (groupThreadId.x < CLOTH_STEP_NUM_WARPS && (startIdx + groupThreadId.x) < nbWords)
         stateChangedMask[startIdx + groupThreadId.x] = gSleepMasks[groupThreadId.x];
 }

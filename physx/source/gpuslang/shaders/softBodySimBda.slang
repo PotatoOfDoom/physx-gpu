@@ -236,3 +236,308 @@ void sb_gm_preIntegrateLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 grou
     // is intentionally omitted — dead on the default free-fall scene (the
     // eENABLE_SPECULATIVE_CCD body flag is opt-in and unset).  See the header.
 }
+
+
+// ===========================================================================
+// P8.0 tranche 3 — the rest of the softbody FREE-FALL chain.
+//
+// sb_gm_preIntegrateLaunch (above) predicts the velocity and moves the vertices once
+// per step; sb_refitBoundLaunch (softBodyRefitBda.slang) republishes the bounds.  These
+// three close the loop so a softbody can fall, settle and go to sleep:
+//
+//   sb_gm_stepSoftbodyLaunch      (softBodyGM.cu:232, launch PxgSoftBodyCore.cpp:2632)
+//       the SUBSTEP integrator — advances position by vel*dt and accumulates the
+//       per-substep delta into mSimDeltaPos, optionally re-applying gravity/damping
+//       first when external forces run every TGS iteration.
+//   sb_gm_finalizeVelocitiesLaunch (softBodyGM.cu:3136, launch PxgSoftBodyCore.cpp:920)
+//       turns the accumulated position delta back into a velocity, applies the settling
+//       damping / velocity averaging, and ORs the body's awake flag.
+//   sb_sleeping                    (softBodyGM.cu:3219, launch PxgSoftBodyCore.cpp:948)
+//       the per-body wake-counter bookkeeping + the state-changed bitmap.
+//
+// These are the softbody twins of the cloth trio already living in femClothSimBda.slang
+// (cloth_preIntegrate / cloth_finalizeVelocities / cloth_sleeping) and reuse its warp
+// lowerings verbatim.  Softbody-specific differences, all straight from the .cu:
+//   - every buffer is the SIMULATION mesh (mSimPosition_InvMass @96, mSimVelocity_InvMass
+//     @88, mSimDeltaPos @128, mNumVertsGM @372) — not the collision mesh the refit walks;
+//   - the awake flag is mAwake @408 (PxU32), not the cloth's mIsActive;
+//   - finalize takes an explicit `velocityScale` and blends
+//     `tVel*velocityScale + deltaVel*(1-velocityScale)`, where the cloth kernel rescales
+//     by a sqrt ratio instead.  Different formulas — do NOT copy the cloth line here.
+//
+// DEVIATIONS from CUDA:
+//   - __any_sync / __ballot_sync + the two-level shared-memory reduction become
+//     groupshared InterlockedOr (order-independent, so bit-identical): a block-wide OR
+//     for finalize's awake flag, and one 32-bit word per warp for sleeping's ballot;
+//   - sb_sleeping's CUDA `if (globalThreadIdx >= numActiveSoftBodies) return;` sits
+//     BEFORE a __syncthreads (UB in a partly filled block).  Restructured into an
+//     `if (gid < n)` guard so every thread reaches both barriers.  Same stores;
+//   - sb_gm_stepSoftbodyLaunch's commented-out `if (tPos.w != 0.f)` guard around the
+//     velocity load is reproduced as CUDA leaves it — INACTIVE (the .cu comment says it
+//     "doesn't look right and break[s] the collision of kinematic softbodies").
+//
+// PxSqrt in the max-velocity clamp is IEEE-754 correctly-rounded (unlike rsqrt / the
+// trig family), so it stays bit-exact and needs no tolerance seam.  Every mul feeding an
+// add/sub (gravity*dt into vel, vel*dt into pos and posDelta, the settle tolerances, the
+// velocity blend) is NoContraction-stamped via PXG_NOCONTRACT_SHADERS.
+// ===========================================================================
+
+static const uint SB_STEP_NUM_WARPS = SB_PREINTEGRATION / WARP_SIZE;  // 32
+
+// ---------------------------------------------------------------------------
+// sb_gm_stepSoftbodyLaunch (softBodyGM.cu:232)
+// ---------------------------------------------------------------------------
+// CUDA arg pack (PxgSoftBodyCore.cpp:2637): { const PxgSoftBody* softbodies,
+// const PxU32* activeId, const PxReal dt, const PxVec3 gravity(12),
+// const bool externalForcesEveryTgsIterationEnabled(1) } -> PxVec3 has 4-byte
+// alignment, so dt @16, gravity @20..32, the bool @32 -> 33, rounded up to the
+// pointer alignment -> 40-byte blob.  (ABI row {8,8,4,12,1}.)
+struct StepParams
+{
+    uint64_t softbodies;     // @0
+    uint64_t activeId;       // @8
+    float dt;                // @16
+    float gravityX;          // @20
+    float gravityY;          // @24
+    float gravityZ;          // @28
+    uint extForcesWord;      // @32  byte0 = externalForcesEveryTgsIterationEnabled
+    uint _pad36;             // @36  -> 40
+}
+[[vk::push_constant]]
+ConstantBuffer<StepParams> gStep;
+
+[shader("compute")]
+[numthreads(1024, 1, 1)] // SB_PREINTEGRATION; grid (nbBlocks, nbActiveSoftbodies, 1)
+void sb_gm_stepSoftbodyLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    Ptr<PxgSoftBodyGpu> softbodies = Ptr<PxgSoftBodyGpu>(gStep.softbodies);
+    const uint id = (Ptr<uint>(gStep.activeId))[groupId.y];
+
+    const uint nbVerts = softbodies[id].mNumVertsGM;
+    Ptr<float4> velocities = Ptr<float4>(softbodies[id].mSimVelocity_InvMass);
+    Ptr<float4> positions = Ptr<float4>(softbodies[id].mSimPosition_InvMass);
+    Ptr<float4> posDelta = Ptr<float4>(softbodies[id].mSimDeltaPos);
+
+    const uint globalThreadIndex = groupThreadId.x + SB_PREINTEGRATION * groupId.x;
+
+    const bool externalForcesEveryTgsIterationEnabled = (gStep.extForcesWord & 0xffu) != 0u;
+    const float3 gravity = float3(gStep.gravityX, gStep.gravityY, gStep.gravityZ);
+    const float dt = gStep.dt;
+
+    if (globalThreadIndex < nbVerts)
+    {
+        const float4 tPos = positions[globalThreadIndex];
+        const float4 pDelta = posDelta[globalThreadIndex];
+        const float4 v = velocities[globalThreadIndex];
+        const float3 oldPos = float3(tPos.x, tPos.y, tPos.z);
+        // CUDA guards this load with a COMMENTED-OUT `if (tPos.w != 0.f)`; reproduced
+        // as-is (inactive), so every vertex — kinematic included — picks up its velocity.
+        float3 vel = float3(v.x, v.y, v.z);
+
+        if (externalForcesEveryTgsIterationEnabled)
+        {
+            if (tPos.w != 0.0f)
+            {
+                // The @392 fold: byte0 = mActorFlags.
+                const uint actorFlags = softbodies[id].mFlagsWord & 0xffu;
+                if ((actorFlags & PXG_SOFTBODY_ACTORFLAG_DISABLE_GRAVITY) == 0u)
+                {
+                    vel += gravity * dt;
+                }
+                const float damping = 1.0f - min(dt * softbodies[id].mLinearDamping, 1.0f);
+                vel *= damping;
+            }
+
+            // Max velocity clamping
+            const float maxVel = softbodies[id].mMaxLinearVelocity;
+            const float velMagSq = vel.x * vel.x + vel.y * vel.y + vel.z * vel.z;
+            vel = (maxVel != PX_MAX_REAL && maxVel * maxVel < velMagSq)
+                      ? (maxVel / sqrt(velMagSq)) * vel
+                      : vel;
+
+            // NOTE: w comes from the OLD VELOCITY here, not from tPos (CUDA writes v.w).
+            velocities[globalThreadIndex] = float4(vel.x, vel.y, vel.z, v.w);
+        }
+
+        const float3 delta = vel * dt;
+
+        const float3 pos = oldPos + delta;
+        positions[globalThreadIndex] = float4(pos.x, pos.y, pos.z, tPos.w);
+        posDelta[globalThreadIndex] =
+            float4(pDelta.x + delta.x, pDelta.y + delta.y, pDelta.z + delta.z, tPos.w);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sb_gm_finalizeVelocitiesLaunch (softBodyGM.cu:3136)
+// ---------------------------------------------------------------------------
+// CUDA arg pack (PxgSoftBodyCore.cpp:922): { PxgSoftBody* gSoftbodies,
+// const PxU32* activeSoftbodies, const PxReal invDt, const PxReal velocityScale,
+// const PxReal dt, const bool alwaysRunVelocityAveraging(1) } -> 29, rounded up to the
+// pointer alignment -> 32-byte blob.  (ABI row {8,8,4,4,4,1}.)
+struct FinalizeParams
+{
+    uint64_t gSoftbodies;      // @0
+    uint64_t activeSoftbodies; // @8
+    float invDt;               // @16
+    float velocityScale;       // @20
+    float dt;                  // @24
+    uint alwaysAvgWord;        // @28  byte0 = alwaysRunVelocityAveraging  -> 32
+}
+[[vk::push_constant]]
+ConstantBuffer<FinalizeParams> gFin;
+
+groupshared uint gSbAnyAwake;
+
+[shader("compute")]
+[numthreads(1024, 1, 1)] // SB_PREINTEGRATION; grid (nbBlocks, nbActiveSoftbodies, 1)
+void sb_gm_finalizeVelocitiesLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    Ptr<PxgSoftBodyGpu> softbodies = Ptr<PxgSoftBodyGpu>(gFin.gSoftbodies);
+    const uint softbodyId = (Ptr<uint>(gFin.activeSoftbodies))[groupId.y];
+
+    Ptr<float4> deltaPos = Ptr<float4>(softbodies[softbodyId].mSimDeltaPos);
+    Ptr<float4> vels = Ptr<float4>(softbodies[softbodyId].mSimVelocity_InvMass);
+    Ptr<float4> positions = Ptr<float4>(softbodies[softbodyId].mSimPosition_InvMass);
+
+    const uint vertIdx = groupThreadId.x + groupId.x * SB_PREINTEGRATION;
+    const uint nbVerts = softbodies[softbodyId].mNumVertsGM;
+
+    const float dt = gFin.dt;
+    const float invDt = gFin.invDt;
+    const float velocityScale = gFin.velocityScale;
+    const bool alwaysRunVelocityAveraging = (gFin.alwaysAvgWord & 0xffu) != 0u;
+
+    if (groupThreadId.x == 0u)
+        gSbAnyAwake = 0u;
+    GroupMemoryBarrierWithGroupSync();
+
+    bool awake = false;
+
+    if (vertIdx < nbVerts)
+    {
+        const float settleTolerance = softbodies[softbodyId].mSettlingThreshold * dt;
+        const float tolerance = softbodies[softbodyId].mSleepThreshold * dt;
+        const float sleepDamping = 1.0f - min(1.0f, softbodies[softbodyId].mSettlingDamping * dt);
+
+        const float4 delta = deltaPos[vertIdx];
+        const float3 tDelta = float3(delta.x, delta.y, delta.z);
+        const float3 deltaVel = tDelta * invDt;
+        const float4 pos = positions[vertIdx];
+
+        if (pos.w != 0.0f) // skip kinematic and infinite mass particles
+        {
+            float velocityScaling = 1.0f;
+
+            const float magSq = tDelta.x * tDelta.x + tDelta.y * tDelta.y + tDelta.z * tDelta.z;
+            if (magSq < settleTolerance * settleTolerance)
+            {
+                awake = magSq >= tolerance * tolerance;
+                velocityScaling = sleepDamping;
+            }
+            else
+            {
+                awake = true;
+            }
+
+            if (alwaysRunVelocityAveraging || velocityScaling != 1.0f)
+            {
+                const float4 vel = vels[vertIdx];
+                float3 tVel = float3(vel.x, vel.y, vel.z);
+
+                const float deltaVelMagSq =
+                    deltaVel.x * deltaVel.x + deltaVel.y * deltaVel.y + deltaVel.z * deltaVel.z;
+                const float velMagSq = tVel.x * tVel.x + tVel.y * tVel.y + tVel.z * tVel.z;
+                if (alwaysRunVelocityAveraging && deltaVelMagSq < velMagSq)
+                    tVel = tVel * velocityScale + deltaVel * (1.0f - velocityScale);
+
+                vels[vertIdx] = float4(velocityScaling * tVel.x, velocityScaling * tVel.y,
+                                       velocityScaling * tVel.z, vel.w);
+            }
+        }
+    }
+
+    // Block-wide OR of `awake` (replaces the CUDA two-level __any_sync + shared isAwake[]).
+    if (awake)
+        InterlockedOr(gSbAnyAwake, 1u);
+    GroupMemoryBarrierWithGroupSync();
+
+    if (groupThreadId.x == 0u && gSbAnyAwake != 0u)
+        InterlockedOr(softbodies[softbodyId].mAwake, 1u); // BDA device atomicOr
+}
+
+// ---------------------------------------------------------------------------
+// sb_sleeping (softBodyGM.cu:3219)
+// ---------------------------------------------------------------------------
+// CUDA arg pack (PxgSoftBodyCore.cpp:955): { PxgSoftBody* softBodies,
+// const PxU32 numActiveSoftBodies, const PxU32* activeId, const PxReal dt,
+// const PxReal resetCounter, PxReal* wakeCounters, PxU32* stateChangedMask }
+// -> 48-byte blob.  (ABI row {8,4,8,4,4,8,8}.)
+struct SleepParams
+{
+    uint64_t softBodies;         // @0
+    uint numActiveSoftBodies;    // @8
+    uint _pad12;                 // @12
+    uint64_t activeId;           // @16
+    float dt;                    // @24
+    float resetCounter;          // @28
+    uint64_t wakeCounters;       // @32
+    uint64_t stateChangedMask;   // @40  -> 48
+}
+[[vk::push_constant]]
+ConstantBuffer<SleepParams> gSleep;
+
+groupshared uint gSbSleepMasks[SB_STEP_NUM_WARPS]; // 32
+
+[shader("compute")]
+[numthreads(1024, 1, 1)] // SB_PREINTEGRATION; grid (nbBlocks, 1, 1)
+void sb_sleeping(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    Ptr<PxgSoftBodyGpu> softBodies = Ptr<PxgSoftBodyGpu>(gSleep.softBodies);
+    Ptr<uint> activeId = Ptr<uint>(gSleep.activeId);
+    Ptr<float> wakeCounters = Ptr<float>(gSleep.wakeCounters);
+    Ptr<uint> stateChangedMask = Ptr<uint>(gSleep.stateChangedMask);
+
+    const uint globalThreadIdx = groupThreadId.x + groupId.x * SB_PREINTEGRATION;
+    const uint laneId = groupThreadId.x & 31u;
+    const uint warpId = groupThreadId.x >> 5;
+
+    // Restructured from the CUDA early-return + __syncthreads (UB in a partly filled
+    // block) into an `if (gid < n)` guard so all threads reach both barriers.
+    if (groupThreadId.x < SB_STEP_NUM_WARPS)
+        gSbSleepMasks[groupThreadId.x] = 0u;
+    GroupMemoryBarrierWithGroupSync();
+
+    if (globalThreadIdx < gSleep.numActiveSoftBodies)
+    {
+        const uint id = activeId[globalThreadIdx];
+
+        const bool reset = softBodies[id].mAwake != 0u;
+        float counter = wakeCounters[id];
+        const bool wasActive = counter > 0.0f;
+
+        if (reset)
+            counter = gSleep.resetCounter;
+        else
+            counter = max(0.0f, counter - gSleep.dt);
+
+        const bool isActive = counter > 0.0f;
+
+        wakeCounters[id] = counter;
+
+        // groupshared ballot (replaces __ballot_sync): bit laneId of this warp's word
+        // = (isActive XOR wasActive).
+        if (isActive != wasActive)
+            InterlockedOr(gSbSleepMasks[warpId], 1u << laneId);
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // CUDA gates the write on `(startIdx + threadIdx.x) < ((numActive + 31) / 32)` —
+    // i.e. only the words that a warp with at least one live body actually filled.
+    // The guard is load-bearing: stateChangedMask is a PxgBitMap sized for the body
+    // count, so dropping it writes zeros past the end of the map.
+    const uint startIdx = (groupId.x * SB_PREINTEGRATION) / 32u;
+    const uint nbWords = (gSleep.numActiveSoftBodies + 31u) / 32u;
+    if (groupThreadId.x < SB_STEP_NUM_WARPS && (startIdx + groupThreadId.x) < nbWords)
+        stateChangedMask[startIdx + groupThreadId.x] = gSbSleepMasks[groupThreadId.x];
+}

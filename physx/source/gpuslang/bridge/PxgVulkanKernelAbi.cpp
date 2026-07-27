@@ -434,6 +434,28 @@ static const uint8_t kSbPreIntegrate[] = { 8, 8, 12, 4, 1, 8, 1 };
 //   blob = 64 bytes.
 static const uint8_t kSbRefitBound[] = { 8, 8, 4, 8, 8, 8, 8, 8 };
 
+// gpusimulationcontroller softBodyGM.cu (P8.0 tranche 3 — the rest of the softbody
+// free-fall chain):
+//   sb_gm_stepSoftbodyLaunch(const PxgSoftBody* softbodies, const PxU32* activeId,
+//     const PxReal dt, const PxVec3 gravity, const bool
+//     externalForcesEveryTgsIterationEnabled)  -- launch site PxgSoftBodyCore.cpp:2637.
+//   Two device pointers + PxReal (@16) + PxVec3 by value (12, 4-byte aligned -> @20..32)
+//   + bool (@32) -> 33, rounded up to the pointer alignment -> 40-byte blob.
+static const uint8_t kSbStepSoftbody[] = { 8, 8, 4, 12, 1 };
+//   sb_gm_finalizeVelocitiesLaunch(PxgSoftBody* gSoftbodies, const PxU32* activeSoftbodies,
+//     const PxReal invDt, const PxReal velocityScale, const PxReal dt,
+//     const bool alwaysRunVelocityAveraging)  -- launch site PxgSoftBodyCore.cpp:922.
+//   Two device pointers + three PxReal (@16/@20/@24) + bool (@28) -> 29, rounded up to
+//   the pointer alignment -> 32-byte blob.
+static const uint8_t kSbFinalizeVelocities[] = { 8, 8, 4, 4, 4, 1 };
+//   sb_sleeping(PxgSoftBody* softBodies, const PxU32 numActiveSoftBodies,
+//     const PxU32* activeId, const PxReal dt, const PxReal resetCounter,
+//     PxReal* wakeCounters, PxU32* stateChangedMask)  -- launch site
+//   PxgSoftBodyCore.cpp:955.  Device pointer + PxU32 (@8, its 4-byte tail-pad realigning
+//   the next pointer to @16) + device pointer + two PxReal (@24/@28) + two device
+//   pointers (@32/@40) -> 48-byte blob.  Same shape as the cloth kClothSleeping row.
+static const uint8_t kSbSleeping[] = { 8, 4, 8, 4, 4, 8, 8 };
+
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
@@ -779,6 +801,10 @@ static const PxgKernelAbiRow kRows[] = {
     // gpusimulationcontroller softbody (FEM-volume) free-fall predict/integrate (P8.0 BDA)
     { "sb_gm_preIntegrateLaunch", kSbPreIntegrate, uint32_t(sizeof(kSbPreIntegrate)) },
     { "sb_refitBoundLaunch", kSbRefitBound, uint32_t(sizeof(kSbRefitBound)) },
+    // gpusimulationcontroller softbody free-fall chain: substep integrate + finalize + sleep (P8.0 tranche 3)
+    { "sb_gm_stepSoftbodyLaunch", kSbStepSoftbody, uint32_t(sizeof(kSbStepSoftbody)) },
+    { "sb_gm_finalizeVelocitiesLaunch", kSbFinalizeVelocities, uint32_t(sizeof(kSbFinalizeVelocities)) },
+    { "sb_sleeping", kSbSleeping, uint32_t(sizeof(kSbSleeping)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },

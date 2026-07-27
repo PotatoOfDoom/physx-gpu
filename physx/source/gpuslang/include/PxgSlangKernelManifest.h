@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 212;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 215;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -318,7 +318,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_gm_applyDeformationDeltasLaunch", nullptr, nullptr },  // SB_GM_APPLY_DEFORMATION_DELTAS (unmapped)
     { "sb_other_contact_remap_to_simLaunch", nullptr, nullptr },  // SB_OTHER_CONTACT_REMAP_TO_SIM (unmapped)
     { "sb_fem_contact_remap_to_simLaunch", nullptr, nullptr },  // SB_FEM_CONTACT_REMAP_TO_SIM (unmapped)
-    { "sb_gm_stepSoftbodyLaunch", nullptr, nullptr },  // SB_GM_STEPSOFTBODY (unmapped)
+    { "sb_gm_stepSoftbodyLaunch", "softBodySimBda.spv", "sb_gm_stepSoftbodyLaunch" },  // SB_GM_STEPSOFTBODY (P8.0 tranche 3 BDA port)
     { "sb_solveRigidSoftAttachmentLaunchTGS", nullptr, nullptr },  // SB_SOLVE_RIGID_SOFT_ATTACHMENT_TGS (unmapped)
     { "sb_queryRigidSoftContactReferenceCountLaunchTGS", nullptr, nullptr },  // SB_QUERY_RIGID_SOFT_REFERENCE_COUNT_TGS (unmapped)
     { "sb_solveRigidSoftCollisionLaunchTGS", nullptr, nullptr },  // SB_SOLVE_RIGID_SOFT_COLLISION_TGS (unmapped)
@@ -328,8 +328,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_initPlasticDeformLaunch", nullptr, nullptr },  // SB_INIT_PLASTIC_DEFORM (unmapped)
     { "sb_plasticDeformLaunch2", nullptr, nullptr },  // SB_PLASTIC_DEFORM2 (unmapped)
     { "sb_copyOrApplySoftBodyDataDEPRECATED", nullptr, nullptr },  // SB_COPY_OR_APPLY_SOFTBODY_DATA_DEPRECATED (unmapped)
-    { "sb_gm_finalizeVelocitiesLaunch", nullptr, nullptr },  // SB_GM_FINALIZE_VELOCITIES (unmapped)
-    { "sb_sleeping", nullptr, nullptr },  // SB_SLEEPING (unmapped)
+    { "sb_gm_finalizeVelocitiesLaunch", "softBodySimBda.spv", "sb_gm_finalizeVelocitiesLaunch" },  // SB_GM_FINALIZE_VELOCITIES (P8.0 tranche 3 BDA port)
+    { "sb_sleeping", "softBodySimBda.spv", "sb_sleeping" },  // SB_SLEEPING (P8.0 tranche 3 BDA port)
     { "compressContactStage1", "npCompressContacts.spv", "compressContactStage1" },  // COMPRESS_CONTACT_STAGE_1
     { "compressContactStage2", "npCompressContacts2.spv", "compressContactStage2" },  // COMPRESS_CONTACT_STAGE_2
     { "computeArtiDenseJacobians", nullptr, nullptr },  // COMPUTE_ARTI_DENSE_JACOBIANS (unmapped)

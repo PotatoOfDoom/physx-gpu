@@ -873,8 +873,10 @@ PXG_TEST(femClothSimSleeping)
     std::vector<uint32_t> active = { 0u, 1u, 2u };
     DevBuf bActive = makeDev(dev, active);
     DevBuf bWake = makeDev(dev, wake);
-    // stateChangedMask: cloth_sleeping writes CLOTH_STEP/32 == 32 words per block.
-    std::vector<uint32_t> stateMask(32, 0xDEADBEEFu);
+    // stateChangedMask: cloth_sleeping fills one word per warp, but only for the warps that
+    // hold a live cloth — the rest of the map must keep this sentinel.
+    static const uint32_t MASK_SENTINEL = 0xDEADBEEFu;
+    std::vector<uint32_t> stateMask(32, MASK_SENTINEL);
     DevBuf bMask = makeDev(dev, stateMask);
 
     SleepPush push = {};
@@ -915,8 +917,16 @@ PXG_TEST(femClothSimSleeping)
 
     if (gMask[0] != refMask0)
     { ++mm; std::printf("  stateMask[0] MM: got 0x%x expected 0x%x\n", gMask[0], refMask0); }
-    for (uint32_t w = 1; w < 32; ++w) // warps with no active thread -> 0
-        if (gMask[w] != 0u) { ++mm; std::printf("  stateMask[%u] MM: got 0x%x expected 0\n", w, gMask[w]); }
+    // CUDA gates the store on `(startIdx + threadIdx.x) < ((numActive + 31) / 32)`, so with
+    // one live word only word 0 is written and the rest of the PxgBitMap must be LEFT ALONE
+    // — writing them is an out-of-bounds store past the end of the map.  This assertion used
+    // to expect zeros here, which encoded the missing guard; it was corrected together with
+    // the shader while porting the softbody twin (sb_sleeping).
+    const uint32_t nbWords = (numActive + 31u) / 32u;
+    for (uint32_t w = nbWords; w < 32; ++w)
+        if (gMask[w] != MASK_SENTINEL)
+        { ++mm; std::printf("  stateMask[%u] clobbered: got 0x%x expected the untouched sentinel 0x%x "
+                            "(the (numActive+31)/32 word guard is missing)\n", w, gMask[w], MASK_SENTINEL); }
 
     PXG_CHECK_MSG(mm == 0, "cloth_sleeping bit-exact vs CPU (%zu mismatches)", mm);
 

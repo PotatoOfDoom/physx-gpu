@@ -858,6 +858,60 @@ cloth / clothdrape / clothselfcollide / particle green.
 → `sb_sleeping` completes the minimal "a softbody falls and settles" path (2 of 56 softbody kernels
 mapped so far), then the FEM-volume solve chain, then softbody-vs-rigid contact for a scene.
 
+## P8.0 tranche 3 — the softbody free-fall chain CLOSES (step + finalize + sleeping)
+
+Three kernels, all in `shaders/softBodySimBda.slang` alongside the tranche-1 preIntegrate, complete
+the minimal "a softbody falls, settles and goes to sleep" path:
+
+| kernel | source | what it does |
+|---|---|---|
+| `sb_gm_stepSoftbodyLaunch` | softBodyGM.cu:232 | the substep integrator — advances position by `vel*dt` and accumulates the delta into `mSimDeltaPos`, optionally re-applying gravity/damping/max-velocity-clamp first |
+| `sb_gm_finalizeVelocitiesLaunch` | softBodyGM.cu:3136 | turns the accumulated delta back into a velocity, applies settling damping / velocity averaging, ORs the awake flag |
+| `sb_sleeping` | softBodyGM.cu:3219 | per-body wake-counter bookkeeping + the state-changed bitmap |
+
+ABI rows `{8,8,4,12,1}` (40 B), `{8,8,4,4,4,1}` (32 B) and `{8,4,8,4,4,8,8}` (48 B); manifest
+hand-edited, **MAPPED 212 → 215**.  These are the softbody twins of the cloth trio in
+`femClothSimBda.slang` and reuse its warp lowerings; the softbody-specific differences are that every
+buffer is the SIMULATION mesh (`mSimPosition_InvMass` @96 / `mSimVelocity_InvMass` @88 / `mSimDeltaPos`
+@128 / `mNumVertsGM` @372), the awake flag is `mAwake` @408, and finalize takes an explicit
+`velocityScale` and blends `tVel*velocityScale + deltaVel*(1-velocityScale)` where the cloth kernel
+rescales by a sqrt ratio — **different formulas, the cloth line must not be copied**.
+
+One trap worth naming: `sb_gm_stepSoftbodyLaunch` launches **(1024,1,1)** with a plain 1-D index,
+while its own file-mate `sb_gm_preIntegrateLaunch` launches (32,32,1) and builds the index from
+`threadIdx.x + WARP_SIZE*threadIdx.y + ...`.  Copying the neighbouring kernel's thread mapping would
+be silently wrong.  Its arg pack also orders `dt` BEFORE `gravity`, the opposite of preIntegrate's.
+
+**A REGRESSION FOUND AND FIXED IN THE CLOTH PORT.**  While transcribing `sb_sleeping`'s
+`(startIdx + threadIdx.x) < ((numActive + 31) / 32)` store guard it became clear the P7.0
+`cloth_sleeping` port had dropped it: `stateChangedMask` is a `PxgBitMap` sized to the body count, so
+with one live cloth exactly one word is live while all 32 lanes were storing — zeros written past the
+end of the map.  The guard is restored in `femClothSimBda.slang`, and `femClothSimSleeping`'s
+assertion — which had encoded the buggy behaviour by expecting zeros in the out-of-range words — now
+requires the sentinel to survive instead.  The corrected test fails against the unguarded shader,
+which is how the fix was confirmed.
+
+**Verification.**  9 new bit-exact cases (raw float bits vs an `-ffp-contract=off` CPU transcription):
+step x4 (plain / external-forces / velocity-clamp / gravity-disabled), finalize x4 (awake / asleep /
+averaging / exactly-on-the-sleep-threshold), sleeping x1.  **19 mutants, all caught** — and two of
+them only after the cases were sharpened:
+  - the `eDISABLE_GRAVITY` gate had NO teeth until a case actually set the flag (every other case left
+    it clear, so a mutant that always applies gravity passed);
+  - the `awake = magSq >= tolerance*tolerance` comparison had no teeth until a case put every vertex
+    EXACTLY on the threshold (`delta = (tolerance,0,0)` makes `magSq == tolerance*tolerance` to the
+    bit).  The mixed case always contained a vertex above the settle tolerance, which set awake through
+    the else-branch regardless — so both a `>=`→`>` flip and a 4x threshold loosening passed.
+
+`PxSqrt` in the max-velocity clamp is IEEE-754 correctly rounded (unlike rsqrt / the trig family), so
+it stays bit-exact — **no tolerance seam anywhere in this tranche**.  Suite 674/674 in both memory
+modes (one `gpuslang.npRigidSumBatches` SegFault on one run — the known llvmpipe flake; the test
+passes 3/3 in isolation and the suite re-run is clean), rigid regression 16/16,
+cloth / clothhang / clothdrape / clothselfcollide / particle green.
+
+**Softbody status: 5 of 56 kernels mapped.**  Next is the FEM-volume solve chain
+(`sb_gm_cp_solveTetrahedronsPartitionLaunch` + `sb_updateTetrahedraRotationsLaunch` +
+`sb_gm_applyExternalDeltasLaunch`), then softbody-vs-rigid contact, then a softbody scene.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

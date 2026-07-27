@@ -501,7 +501,10 @@ pxg_compile_shader(femClothRefitBda cloth_refitBoundLaunch)
 # (the speculative-CCD AtomicMax reduction) is omitted as dead on the free-fall
 # scene, so there is no groupshared / barrier and no subgroup lowering (see the
 # shader header).
-pxg_compile_shader(softBodySimBda sb_gm_preIntegrateLaunch)
+pxg_compile_shader(softBodySimBda sb_gm_preIntegrateLaunch
+                   sb_gm_stepSoftbodyLaunch
+                   sb_gm_finalizeVelocitiesLaunch
+                   sb_sleeping)
 # P8.0 tranche 2: the SOFTBODY BVH bounds refit (sb_refitBoundLaunch) — second kernel of
 # the free-fall chain.  Direct sibling of femClothRefitBda (same algorithm over
 # tetrahedra instead of triangles), same BDA Ptr<> reads and same groupshared warp

@@ -654,4 +654,418 @@ static void runSbRefitBound(bool speculativeCCD)
 PXG_TEST(softBodySimRefitBound) { runSbRefitBound(/*speculativeCCD*/ false); }
 PXG_TEST(softBodySimRefitBoundCCD) { runSbRefitBound(/*speculativeCCD*/ true); }
 
+
+// ===========================================================================
+// P8.0 tranche 3 — the rest of the softbody free-fall chain:
+//   sb_gm_stepSoftbodyLaunch       (softBodyGM.cu:232)  — the substep integrator
+//   sb_gm_finalizeVelocitiesLaunch (softBodyGM.cu:3136) — delta -> velocity + settle
+//   sb_sleeping                    (softBodyGM.cu:3219) — wake counters + changed bitmap
+// Every case is bit-exact (raw float bits) against a CPU transcription built with
+// -ffp-contract=off, and the descriptor offsets are the ones softBodySimDescLayout pins.
+// ===========================================================================
+
+struct StepPush
+{
+    uint64_t softbodies, activeId;
+    float dt, gx, gy, gz;
+    uint32_t extForcesWord, pad36;
+};
+static_assert(sizeof(StepPush) == 40, "step push blob must be 40 bytes");
+static_assert(offsetof(StepPush, dt) == 16, "dt @16");
+static_assert(offsetof(StepPush, gx) == 20, "gravity @20");
+static_assert(offsetof(StepPush, extForcesWord) == 32, "extForces @32");
+
+struct SbFinPush
+{
+    uint64_t gSoftbodies, activeSoftbodies;
+    float invDt, velocityScale, dt;
+    uint32_t alwaysAvgWord;
+};
+static_assert(sizeof(SbFinPush) == 32, "finalize push blob must be 32 bytes");
+static_assert(offsetof(SbFinPush, invDt) == 16, "invDt @16");
+static_assert(offsetof(SbFinPush, alwaysAvgWord) == 28, "alwaysAvg @28");
+
+struct SbSleepPush
+{
+    uint64_t softBodies;
+    uint32_t numActiveSoftBodies, pad12;
+    uint64_t activeId;
+    float dt, resetCounter;
+    uint64_t wakeCounters, stateChangedMask;
+};
+static_assert(sizeof(SbSleepPush) == 48, "sleeping push blob must be 48 bytes");
+static_assert(offsetof(SbSleepPush, activeId) == 16, "activeId @16");
+static_assert(offsetof(SbSleepPush, dt) == 24, "dt @24");
+static_assert(offsetof(SbSleepPush, wakeCounters) == 32, "wakeCounters @32");
+
+namespace p80ref
+{
+struct V3 { float x, y, z; };
+static V3 add(V3 a, V3 b) { return V3{ a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V3 mul(V3 a, float s) { return V3{ a.x * s, a.y * s, a.z * s }; }
+static float magSq(V3 a) { return a.x * a.x + a.y * a.y + a.z * a.z; }
+} // namespace p80ref
+
+// ---------------------------------------------------------------------------
+// sb_gm_stepSoftbodyLaunch.  Driven twice: externalForces OFF (the plain substep
+// advance — vel is NOT rewritten, gravity is NOT re-applied) and ON (gravity +
+// damping + max-velocity clamp run first and the velocity IS written back).
+// ---------------------------------------------------------------------------
+static void runStepSoftbody(bool externalForces, bool clampVelocity, bool disableGravity = false)
+{
+    using namespace p80ref;
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t N = 8;
+    const float dt = 1.0f / 60.0f;
+    const V3 g = { 0.0f, -9.81f, 0.0f };
+    const float linearDamping = 0.1f;
+    // clampVelocity picks whether the max-velocity branch is live.  The clamp is the
+    // kernel's ONLY sqrt; sqrt is IEEE-754 correctly rounded, so it stays bit-exact.
+    const float maxLinVel = clampVelocity ? 0.35f : PX_MAX_REAL_F;
+
+    std::vector<F4> positions(N), vels(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const float w = (i == 3) ? 0.0f : 1.0f;   // vertex 3 fixed (invMass 0)
+        positions[i] = { float(i) * 1.0f, 5.0f + float(i) * 0.25f, -float(i) * 0.5f, w };
+        vels[i] = { 0.13f * float(i) + 0.07f, -0.21f * float(i) - 0.11f, 0.05f * float(i) + 0.03f,
+                    0.5f + 0.25f * float(i) };   // distinctive .w — the kernel must carry it
+    }
+    std::vector<F4> posDelta(N);
+    for (uint32_t i = 0; i < N; ++i)
+        posDelta[i] = { 0.011f * float(i), -0.023f * float(i), 0.017f * float(i), 99.0f };
+
+    DevBuf bPos = makeDev(dev, positions);
+    DevBuf bVel = makeDev(dev, vels);
+    DevBuf bDelta = makeDev(dev, posDelta);
+
+    PxgSoftBody c = makeZeroDesc();
+    c.mSimVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVel.addr));
+    c.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    c.mSimDeltaPos = reinterpret_cast<float4*>(size_t(bDelta.addr));
+    c.mLinearDamping = linearDamping;
+    c.mMaxLinearVelocity = maxLinVel;
+    c.mNumVertsGM = N;
+    // PxActorFlag::eDISABLE_GRAVITY == (1<<1); byte0 of the @392 flags fold.
+    c.mActorFlags = PxActorFlags(disableGravity ? PxActorFlag::eDISABLE_GRAVITY : PxActorFlag::Enum(0));
+    std::vector<PxgSoftBody> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    StepPush push = {};
+    push.softbodies = bDesc.addr;
+    push.activeId = bActive.addr;
+    push.dt = dt; push.gx = g.x; push.gy = g.y; push.gz = g.z;
+    push.extForcesWord = externalForces ? 1u : 0u;
+
+    Kernel k("softBodySimBda.spv", "sb_gm_stepSoftbodyLaunch", {}, sizeof(StepPush));
+    k.dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // CPU reference — expression order transcribed from softBodyGM.cu:232.
+    std::vector<F4> refPos = positions, refVel = vels, refDelta = posDelta;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const F4 tPos = positions[i];
+        const F4 pDelta = posDelta[i];
+        const F4 v = vels[i];
+        const V3 oldPos = { tPos.x, tPos.y, tPos.z };
+        V3 vel = { v.x, v.y, v.z };   // the `if (tPos.w != 0)` guard is commented out in CUDA
+
+        if (externalForces)
+        {
+            if (tPos.w != 0.0f)
+            {
+                if (!disableGravity)
+                    vel = add(vel, mul(g, dt));
+                const float damping = 1.0f - std::fmin(dt * linearDamping, 1.0f);
+                vel = mul(vel, damping);
+            }
+            const float velMagSq = magSq(vel);
+            if (maxLinVel != PX_MAX_REAL_F && maxLinVel * maxLinVel < velMagSq)
+                vel = mul(vel, maxLinVel / std::sqrt(velMagSq));
+            refVel[i] = { vel.x, vel.y, vel.z, v.w };             // .w from the OLD VELOCITY
+        }
+
+        const V3 delta = mul(vel, dt);
+        const V3 pos = add(oldPos, delta);
+        refPos[i] = { pos.x, pos.y, pos.z, tPos.w };
+        refDelta[i] = { pDelta.x + delta.x, pDelta.y + delta.y, pDelta.z + delta.z, tPos.w };
+    }
+
+    const auto gPos = downloadBuffer<F4>(dev, bPos.h, N);
+    const auto gVel = downloadBuffer<F4>(dev, bVel.h, N);
+    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, N);
+
+    size_t mm = 0;
+    auto cmp = [&](const char* what, uint32_t i, const F4& r, const F4& got) {
+        if (f2u(r.x) != f2u(got.x) || f2u(r.y) != f2u(got.y) ||
+            f2u(r.z) != f2u(got.z) || f2u(r.w) != f2u(got.w))
+        { ++mm; std::printf("  %s[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", what, i,
+                            r.x, r.y, r.z, r.w, got.x, got.y, got.z, got.w); } };
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        cmp("pos", i, refPos[i], gPos[i]);
+        cmp("vel", i, refVel[i], gVel[i]);
+        cmp("posDelta", i, refDelta[i], gDelta[i]);
+    }
+    // Teeth on the branch itself: with externalForces OFF the velocity buffer must be
+    // UNTOUCHED (a port that always writes it back would pass the value compare only by
+    // accident), and posDelta.w must become tPos.w, not stay at its 99 sentinel.
+    if (!externalForces)
+        for (uint32_t i = 0; i < N; ++i)
+            if (f2u(gVel[i].x) != f2u(vels[i].x) || f2u(gVel[i].w) != f2u(vels[i].w))
+            { ++mm; std::printf("  vel[%u] must be untouched when externalForces is off\n", i); }
+    for (uint32_t i = 0; i < N; ++i)
+        if (f2u(gDelta[i].w) != f2u(positions[i].w))
+        { ++mm; std::printf("  posDelta[%u].w must be tPos.w (%g), got %g\n", i, positions[i].w, gDelta[i].w); }
+    PXG_CHECK_MSG(mm == 0, "sb_gm_stepSoftbodyLaunch bit-exact vs CPU (%zu mismatches)", mm);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bDelta.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+PXG_TEST(softBodySimStepPlain) { runStepSoftbody(/*externalForces*/ false, /*clamp*/ false); }
+PXG_TEST(softBodySimStepExternalForces) { runStepSoftbody(/*externalForces*/ true, /*clamp*/ false); }
+PXG_TEST(softBodySimStepVelocityClamp) { runStepSoftbody(/*externalForces*/ true, /*clamp*/ true); }
+// Gives the eDISABLE_GRAVITY gate teeth: without this case a mutant that drops the flag
+// test and always applies gravity passes, because every other case leaves the flag clear.
+PXG_TEST(softBodySimStepNoGravity) { runStepSoftbody(/*externalForces*/ true, /*clamp*/ false, /*disableGravity*/ true); }
+
+// ---------------------------------------------------------------------------
+// sb_gm_finalizeVelocitiesLaunch.  Three regimes are exercised in ONE dispatch by
+// giving different vertices different delta magnitudes: above the settle tolerance
+// (awake, no scaling), between the sleep and settle tolerances (settling -> damped,
+// still awake), and below the sleep tolerance (asleep -> damped, not awake).
+// ---------------------------------------------------------------------------
+static void runSbFinalize(bool alwaysRunVelocityAveraging, bool expectAwake, bool onSleepThreshold = false)
+{
+    using namespace p80ref;
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t N = 8;
+    const float dt = 1.0f / 60.0f;
+    const float invDt = 1.0f / dt;
+    const float velocityScale = 0.35f;
+    const float settlingThreshold = 6.0f;
+    const float sleepThreshold = 1.5f;
+    const float settlingDamping = 3.0f;
+
+    const float settleTol = settlingThreshold * dt;   // 0.1
+    const float sleepTol = sleepThreshold * dt;       // 0.025
+
+    std::vector<F4> deltas(N), positions(N), vels(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        // i%3 == 0: big delta (awake, unscaled); 1: middling (settling); 2: tiny (asleep)
+        const float scale = (i % 3 == 0) ? (settleTol * 4.0f)
+                          : (i % 3 == 1) ? (sleepTol * 2.0f)
+                                         : (sleepTol * 0.25f);
+        deltas[i] = { scale * 0.577f, -scale * 0.577f, scale * 0.577f, 42.0f };
+        // vertex 3 is kinematic (w == 0) -> the whole body of the branch is skipped
+        positions[i] = { float(i), 5.0f - float(i) * 0.1f, 0.25f * float(i), (i == 3) ? 0.0f : 1.0f };
+        vels[i] = { 0.31f * float(i) + 0.09f, -0.17f * float(i) - 0.13f, 0.23f * float(i) + 0.05f,
+                    0.75f + 0.125f * float(i) };
+    }
+    // When expectAwake is false, every vertex must fall below the sleep tolerance.
+    if (!expectAwake)
+        for (uint32_t i = 0; i < N; ++i)
+            deltas[i] = { sleepTol * 0.25f * 0.577f, -sleepTol * 0.25f * 0.577f,
+                          sleepTol * 0.25f * 0.577f, 42.0f };
+    // onSleepThreshold puts EVERY vertex exactly ON the sleep threshold: delta =
+    // (tolerance, 0, 0) makes magSq == tolerance*tolerance to the bit (it is literally the
+    // same product), and every vertex is inside the settling band, so the awake decision
+    // rests solely on `magSq >= tolerance*tolerance`.  Without this case that comparison
+    // has NO teeth — the mixed case always contains a vertex above the settle tolerance,
+    // which sets awake through the else-branch regardless (verified: a mutant loosening
+    // the threshold passes without it).
+
+    DevBuf bDelta = makeDev(dev, deltas);
+    DevBuf bPos = makeDev(dev, positions);
+    DevBuf bVel = makeDev(dev, vels);
+
+    PxgSoftBody c = makeZeroDesc();
+    c.mSimDeltaPos = reinterpret_cast<float4*>(size_t(bDelta.addr));
+    c.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    c.mSimVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVel.addr));
+    c.mNumVertsGM = N;
+    c.mSettlingThreshold = settlingThreshold;
+    c.mSleepThreshold = sleepThreshold;
+    c.mSettlingDamping = settlingDamping;
+    c.mAwake = 0u;
+    std::vector<PxgSoftBody> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    SbFinPush push = {};
+    push.gSoftbodies = bDesc.addr;
+    push.activeSoftbodies = bActive.addr;
+    push.invDt = invDt; push.velocityScale = velocityScale; push.dt = dt;
+    push.alwaysAvgWord = alwaysRunVelocityAveraging ? 1u : 0u;
+
+    if (onSleepThreshold)
+        for (uint32_t i = 0; i < N; ++i)
+            deltas[i] = { sleepTol, 0.0f, 0.0f, 42.0f };
+
+    dev->upload(bDelta.h, deltas.data(), deltas.size() * sizeof(F4));
+
+    Kernel k("softBodySimBda.spv", "sb_gm_finalizeVelocitiesLaunch", {}, sizeof(SbFinPush));
+    k.dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // CPU reference — expression order transcribed from softBodyGM.cu:3136.
+    std::vector<F4> refVel = vels;
+    bool refAwake = false;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const float settleTolerance = settlingThreshold * dt;
+        const float tolerance = sleepThreshold * dt;
+        const float sleepDamping = 1.0f - std::fmin(1.0f, settlingDamping * dt);
+
+        const F4 delta = deltas[i];
+        const V3 tDelta = { delta.x, delta.y, delta.z };
+        const V3 deltaVel = mul(tDelta, invDt);
+        const F4 pos = positions[i];
+
+        if (pos.w != 0.0f)
+        {
+            float velocityScaling = 1.0f;
+            const float mSq = magSq(tDelta);
+            if (mSq < settleTolerance * settleTolerance)
+            {
+                if (mSq >= tolerance * tolerance) refAwake = true;
+                velocityScaling = sleepDamping;
+            }
+            else
+            {
+                refAwake = true;
+            }
+
+            if (alwaysRunVelocityAveraging || velocityScaling != 1.0f)
+            {
+                const F4 vel = vels[i];
+                V3 tVel = { vel.x, vel.y, vel.z };
+                if (alwaysRunVelocityAveraging && magSq(deltaVel) < magSq(tVel))
+                    tVel = add(mul(tVel, velocityScale), mul(deltaVel, 1.0f - velocityScale));
+                refVel[i] = { velocityScaling * tVel.x, velocityScaling * tVel.y,
+                              velocityScaling * tVel.z, vel.w };
+            }
+        }
+    }
+
+    const auto gVel = downloadBuffer<F4>(dev, bVel.h, N);
+    const auto gDesc = downloadBuffer<PxgSoftBody>(dev, bDesc.h, 1);
+
+    size_t mm = 0;
+    for (uint32_t i = 0; i < N; ++i)
+        if (f2u(refVel[i].x) != f2u(gVel[i].x) || f2u(refVel[i].y) != f2u(gVel[i].y) ||
+            f2u(refVel[i].z) != f2u(gVel[i].z) || f2u(refVel[i].w) != f2u(gVel[i].w))
+        { ++mm; std::printf("  vel[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", i,
+                            refVel[i].x, refVel[i].y, refVel[i].z, refVel[i].w,
+                            gVel[i].x, gVel[i].y, gVel[i].z, gVel[i].w); }
+    // The kinematic vertex must be left completely alone.
+    if (f2u(gVel[3].x) != f2u(vels[3].x) || f2u(gVel[3].w) != f2u(vels[3].w))
+    { ++mm; std::printf("  vel[3] (kinematic, pos.w==0) must be untouched\n"); }
+    PXG_CHECK_MSG(mm == 0, "sb_gm_finalizeVelocitiesLaunch bit-exact vs CPU (%zu mismatches)", mm);
+    PXG_CHECK_MSG(refAwake == expectAwake, "test setup: expected awake=%d, reference says %d",
+                  int(expectAwake), int(refAwake));
+    PXG_CHECK_MSG((gDesc[0].mAwake != 0u) == expectAwake,
+                  "mAwake must be %u (block-wide OR of the per-vertex awake flags), got %u",
+                  unsigned(expectAwake), gDesc[0].mAwake);
+
+    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+PXG_TEST(softBodySimFinalizeAwake) { runSbFinalize(/*alwaysAvg*/ false, /*expectAwake*/ true); }
+PXG_TEST(softBodySimFinalizeAsleep) { runSbFinalize(/*alwaysAvg*/ false, /*expectAwake*/ false); }
+PXG_TEST(softBodySimFinalizeAveraging) { runSbFinalize(/*alwaysAvg*/ true, /*expectAwake*/ true); }
+PXG_TEST(softBodySimFinalizeOnSleepThreshold)
+{ runSbFinalize(/*alwaysAvg*/ false, /*expectAwake*/ true, /*onSleepThreshold*/ true); }
+
+// ---------------------------------------------------------------------------
+// sb_sleeping.  Four bodies cover the whole truth table of (mAwake, wasActive):
+//   0: awake + was active   -> counter reset, stays active     -> no state change
+//   1: awake + was inactive -> counter reset, becomes active   -> STATE CHANGE
+//   2: asleep + was active, counter survives dt -> stays active-> no state change
+//   3: asleep + was active, counter runs out    -> goes asleep -> STATE CHANGE
+// The changed-mask word must therefore be exactly (1<<1) | (1<<3) == 0xA, and the
+// neighbouring bitmap words must be untouched — the guard the CUDA kernel applies and
+// which a port that drops it would violate.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimSleeping)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 0.05f;
+    const float resetCounter = 0.4f;
+    const uint32_t NB = 4;
+
+    std::vector<PxgSoftBody> bodies(NB, makeZeroDesc());
+    bodies[0].mAwake = 1u;
+    bodies[1].mAwake = 1u;
+    bodies[2].mAwake = 0u;
+    bodies[3].mAwake = 0u;
+    DevBuf bDesc = makeDev(dev, bodies);
+
+    std::vector<uint32_t> active = { 0u, 1u, 2u, 3u };
+    DevBuf bActive = makeDev(dev, active);
+
+    std::vector<float> wake = { 0.2f, 0.0f, 0.2f, 0.03f };   // body 3: 0.03 - 0.05 -> 0
+    DevBuf bWake = makeDev(dev, wake);
+
+    const uint32_t SENTINEL = 0xDEADBEEFu;
+    std::vector<uint32_t> changed(4, SENTINEL);
+    DevBuf bChanged = makeDev(dev, changed);
+
+    SbSleepPush push = {};
+    push.softBodies = bDesc.addr;
+    push.numActiveSoftBodies = NB;
+    push.activeId = bActive.addr;
+    push.dt = dt;
+    push.resetCounter = resetCounter;
+    push.wakeCounters = bWake.addr;
+    push.stateChangedMask = bChanged.addr;
+
+    Kernel k("softBodySimBda.spv", "sb_sleeping", {}, sizeof(SbSleepPush));
+    k.dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // CPU reference
+    std::vector<float> refWake(NB);
+    uint32_t refMask = 0u;
+    for (uint32_t i = 0; i < NB; ++i)
+    {
+        const bool reset = bodies[i].mAwake != 0u;
+        float counter = wake[i];
+        const bool wasActive = counter > 0.0f;
+        counter = reset ? resetCounter : std::fmax(0.0f, counter - dt);
+        const bool isActive = counter > 0.0f;
+        refWake[i] = counter;
+        if (isActive != wasActive) refMask |= (1u << i);
+    }
+    PXG_CHECK_MSG(refMask == 0xAu, "test setup: expected the changed mask to be 0xA, reference says 0x%X", refMask);
+
+    const auto gWake = downloadBuffer<float>(dev, bWake.h, NB);
+    const auto gChanged = downloadBuffer<uint32_t>(dev, bChanged.h, changed.size());
+
+    size_t mm = 0;
+    for (uint32_t i = 0; i < NB; ++i)
+        if (f2u(gWake[i]) != f2u(refWake[i]))
+        { ++mm; std::printf("  wakeCounter[%u] MM: ref %g got %g\n", i, refWake[i], gWake[i]); }
+    if (gChanged[0] != refMask)
+    { ++mm; std::printf("  stateChangedMask[0] MM: ref 0x%X got 0x%X\n", refMask, gChanged[0]); }
+    // Words past ceil(numActive/32) == 1 must be untouched: CUDA gates the store on
+    // (startIdx + threadIdx.x) < ((numActive + 31) / 32), and stateChangedMask is a
+    // PxgBitMap sized to the body count — dropping that guard writes past its end.
+    for (uint32_t w = 1; w < uint32_t(changed.size()); ++w)
+        if (gChanged[w] != SENTINEL)
+        { ++mm; std::printf("  stateChangedMask[%u] clobbered: expected 0x%X got 0x%X "
+                            "(the (numActive+31)/32 word guard is missing)\n", w, SENTINEL, gChanged[w]); }
+    PXG_CHECK_MSG(mm == 0, "sb_sleeping bit-exact vs CPU (%zu mismatches)", mm);
+
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+    dev->destroyBuffer(bWake.h); dev->destroyBuffer(bChanged.h);
+}
+
 } // namespace
