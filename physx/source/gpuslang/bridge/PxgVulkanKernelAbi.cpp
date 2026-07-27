@@ -456,6 +456,17 @@ static const uint8_t kSbFinalizeVelocities[] = { 8, 8, 4, 4, 4, 1 };
 //   pointers (@32/@40) -> 48-byte blob.  Same shape as the cloth kClothSleeping row.
 static const uint8_t kSbSleeping[] = { 8, 4, 8, 4, 4, 8, 8 };
 
+// gpusimulationcontroller softBodyGM.cu (P8.0 tranche 4 — the softbody FEM-volume solve
+// bracket):
+//   sb_gm_zeroTetMultipliers(PxgSoftBody* gSoftbodies, const PxU32* activeSoftbodies)
+//   -- launch site PxgSoftBodyCore.cpp:198.  Two device pointers -> 16-byte blob.
+static const uint8_t kSbZeroTetMultipliers[] = { 8, 8 };
+//   sb_gm_applyExternalDeltasLaunch(PxgSoftBody* gSoftbodies,
+//     const PxU32* activeSoftbodies, const PxReal invDt)  -- launch site
+//   PxgSoftBodyCore.cpp:874.  Two device pointers + PxReal (@16) -> 20, rounded up to the
+//   pointer alignment -> 24-byte blob.
+static const uint8_t kSbApplyExternalDeltas[] = { 8, 8, 4 };
+
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
@@ -805,6 +816,9 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_gm_stepSoftbodyLaunch", kSbStepSoftbody, uint32_t(sizeof(kSbStepSoftbody)) },
     { "sb_gm_finalizeVelocitiesLaunch", kSbFinalizeVelocities, uint32_t(sizeof(kSbFinalizeVelocities)) },
     { "sb_sleeping", kSbSleeping, uint32_t(sizeof(kSbSleeping)) },
+    // gpusimulationcontroller softbody FEM-volume solve bracket (P8.0 tranche 4)
+    { "sb_gm_zeroTetMultipliers", kSbZeroTetMultipliers, uint32_t(sizeof(kSbZeroTetMultipliers)) },
+    { "sb_gm_applyExternalDeltasLaunch", kSbApplyExternalDeltas, uint32_t(sizeof(kSbApplyExternalDeltas)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },

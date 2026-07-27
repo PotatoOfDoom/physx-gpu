@@ -912,6 +912,41 @@ cloth / clothhang / clothdrape / clothselfcollide / particle green.
 (`sb_gm_cp_solveTetrahedronsPartitionLaunch` + `sb_updateTetrahedraRotationsLaunch` +
 `sb_gm_applyExternalDeltasLaunch`), then softbody-vs-rigid contact, then a softbody scene.
 
+## P8.0 tranche 4 — the softbody FEM-volume solve BRACKET (zeroTetMultipliers + applyExternalDeltas)
+
+The two kernels that open and close each softbody solve iteration, in the new
+`shaders/softBodySolveBda.slang`:
+
+| kernel | source | what it does |
+|---|---|---|
+| `sb_gm_zeroTetMultipliers` | softBodyGM.cu:1801 | clears every tetrahedron's Lagrange-multiplier spatial vector at the top of the solve — without it the solver accumulates into last frame's multipliers and the material response drifts frame over frame |
+| `sb_gm_applyExternalDeltasLaunch` | softBodyGM.cu:2609 | folds the accumulated per-vertex correction (`mSimDelta`, written by the contact/attachment solves) back into position, velocity and `mSimDeltaPos`, then clears the delta buffer — the softbody twin of the `cloth_applyExternalDeltasLaunch` the cloth arc has used since P7.1 |
+
+ABI rows `{8,8}` (16 B) and `{8,8,4}` (24 B); manifest hand-edited, **MAPPED 215 → 217**.  Both are
+pure load/scale/store: no transcendental, no warp op, no cross-lane communication — **fully bit-exact,
+no tolerance seam**.
+
+The multipliers live in a `PxgSpatialVectorBlock` (PxgArticulation.h:77), the 32-lane SoA block
+`float4 mTopxyz_bx[32]` @0 then `float2 mbyz[32]` @512 → 768-byte stride, so zeroing tet `t` means two
+stores at block `t/32`, lane `t&31`.  `sb_gm_applyExternalDeltasLaunch`'s opening `blockCopy` of the
+whole 432-byte descriptor into `__shared__` + `__syncthreads` is a read-caching optimisation only and
+is dropped (every lane reads through `Ptr<>` instead), which also removes the kernel's only barrier.
+
+**Verification.** 2 new bit-exact cases, **10 mutants all caught**.  The zeroTetMultipliers case uses
+`numTets = 37` — deliberately not a multiple of 32 — and over-dispatches by a block, so one case pins
+the block/lane split, the `groupThreadIdx < numTets` guard, and the fact that ONLY the two words
+`storeSpatialVector` writes are touched (every other word of every block keeps its poison).  The
+applyExternalDeltas case spans the `delta.w` reference count — 0, 1, 3, 7, 2.5, 0.5, 4, 12 — with
+explicit assertions that vertex 3 (`w == 7`) is averaged by exactly 1/7 and vertex 5 (`w == 0.5`) is
+NOT scaled up, which is what gives the `1.0f / max(delta.w, 1.0f)` line teeth: a port that dropped
+either the divide or the clamp matches the `w == 0` / `w == 1` vertices and only differs there.
+
+Suite 674/674 in both memory modes, rigid regression 16/16, cloth / clothdrape / clothselfcollide /
+particle green.  **Softbody now 7 of 56 kernels mapped.**  Remaining in the solve chain:
+`sb_gm_cp_solveTetrahedronsPartitionLaunch` (the constraint solve itself) and
+`sb_updateTetrahedraRotationsLaunch` (the APD / `extractRotation` polar decomposition — the first
+softbody kernel with a genuine transcendental seam), then softbody-vs-rigid contact, then a scene.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

@@ -1068,4 +1068,187 @@ PXG_TEST(softBodySimSleeping)
     dev->destroyBuffer(bWake.h); dev->destroyBuffer(bChanged.h);
 }
 
+
+// ===========================================================================
+// P8.0 tranche 4 — the softbody FEM-volume solve bracket:
+//   sb_gm_zeroTetMultipliers        (softBodyGM.cu:1801) — clears the per-tet multipliers
+//   sb_gm_applyExternalDeltasLaunch (softBodyGM.cu:2609) — folds the accumulated
+//                                     per-vertex correction back and clears the delta
+// ===========================================================================
+
+struct ZeroTetPush { uint64_t gSoftbodies, activeSoftbodies; };
+static_assert(sizeof(ZeroTetPush) == 16, "zeroTetMultipliers push blob must be 16 bytes");
+
+struct ApplyDeltasPush
+{
+    uint64_t gSoftbodies, activeSoftbodies;
+    float invDt;
+    uint32_t pad20;
+};
+static_assert(sizeof(ApplyDeltasPush) == 24, "applyExternalDeltas push blob must be 24 bytes");
+static_assert(offsetof(ApplyDeltasPush, invDt) == 16, "invDt @16");
+
+// PxgSpatialVectorBlock (PxgArticulation.h:77): float4 mTopxyz_bx[32] @0, float2 mbyz[32]
+// @512 -> 768 bytes = 192 uint32 words.
+static const uint32_t SPATIAL_BLOCK_WORDS = 192u;
+static const uint32_t SPATIAL_BLOCK_MBYZ_WORD = 128u;
+
+// ---------------------------------------------------------------------------
+// sb_gm_zeroTetMultipliers.  numTets is deliberately NOT a multiple of 32 (37), so the
+// case pins three things at once: the block/lane split (tet 32..36 land in block 1), the
+// `groupThreadIdx < numTets` guard, and the fact that only the two words
+// storeSpatialVector actually writes are touched — every other word of the block, and
+// every word of the block past numTets, must keep its poison.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimZeroTetMultipliers)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t numTets = 37u;
+    const uint32_t nbBlocks = 3u;   // one more block than numTets needs -> guard is exercised
+
+    const uint32_t POISON = 0x7F7F7F7Fu;
+    std::vector<uint32_t> mult(nbBlocks * SPATIAL_BLOCK_WORDS, POISON);
+    DevBuf bMult = makeDev(dev, mult);
+
+    PxgSoftBody c = makeZeroDesc();
+    c.mSimTetraMultipliers = reinterpret_cast<decltype(c.mSimTetraMultipliers)>(size_t(bMult.addr));
+    c.mNumTetsGM = numTets;
+    std::vector<PxgSoftBody> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    ZeroTetPush push = {};
+    push.gSoftbodies = bDesc.addr;
+    push.activeSoftbodies = bActive.addr;
+
+    Kernel k("softBodySolveBda.spv", "sb_gm_zeroTetMultipliers", {}, sizeof(ZeroTetPush));
+    // grid.x must cover numTets: ceil(37/64) == 1, but dispatch 2 to prove the guard.
+    k.dispatch(2u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // CPU reference: for tet t < numTets, block t/32 lane t&31 gets
+    // mTopxyz_bx[lane] = (0,0,0,0) and mbyz[lane] = (0,0); nothing else changes.
+    std::vector<uint32_t> ref = mult;
+    for (uint32_t t = 0; t < numTets; ++t)
+    {
+        const uint32_t base = (t / 32u) * SPATIAL_BLOCK_WORDS;
+        const uint32_t lane = t & 31u;
+        for (uint32_t e = 0; e < 4u; ++e) ref[base + lane * 4u + e] = f2u(0.0f);
+        for (uint32_t e = 0; e < 2u; ++e) ref[base + SPATIAL_BLOCK_MBYZ_WORD + lane * 2u + e] = f2u(0.0f);
+    }
+
+    const auto got = downloadBuffer<uint32_t>(dev, bMult.h, mult.size());
+    size_t mm = 0;
+    for (uint32_t w = 0; w < uint32_t(mult.size()); ++w)
+        if (got[w] != ref[w])
+        { ++mm; if (mm <= 8) std::printf("  multiplier word %u MM: ref 0x%08x got 0x%08x\n", w, ref[w], got[w]); }
+    PXG_CHECK_MSG(mm == 0, "sb_gm_zeroTetMultipliers bit-exact vs CPU (%zu mismatches)", mm);
+    // Sanity: the refit must actually have run, and block 2 (all tets >= numTets) untouched.
+    PXG_CHECK_MSG(got[0] == f2u(0.0f), "tet 0's multiplier must be zeroed");
+    for (uint32_t w = 2u * SPATIAL_BLOCK_WORDS; w < 3u * SPATIAL_BLOCK_WORDS; ++w)
+        PXG_CHECK_MSG(got[w] == POISON, "block 2 holds no live tet and must be untouched (word %u)", w);
+
+    dev->destroyBuffer(bMult.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+// ---------------------------------------------------------------------------
+// sb_gm_applyExternalDeltasLaunch.  The delta.w reference count drives the averaging
+// scale, so the vertices span it: w == 0 (untouched -> scale 1), w == 1 (one constraint
+// -> scale 1), w == 3 and w == 7 (averaged), plus a fractional w to prove the divide is
+// not an integer one.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimApplyExternalDeltas)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t N = 8;
+    const float invDt = 60.0f;
+
+    std::vector<F4> pos(N), vel(N), delta(N), deltaPos(N);
+    const float ws[8] = { 0.0f, 1.0f, 3.0f, 7.0f, 2.5f, 0.5f, 4.0f, 12.0f };
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        pos[i] = { float(i) * 0.75f, 5.0f - float(i) * 0.1f, -0.3f * float(i), 1.0f + 0.25f * float(i) };
+        vel[i] = { 0.11f * float(i) + 0.03f, -0.19f * float(i) - 0.07f, 0.13f * float(i) + 0.05f,
+                   0.5f + 0.125f * float(i) };
+        delta[i] = { 0.031f * float(i) + 0.007f, -0.017f * float(i) - 0.011f,
+                     0.023f * float(i) + 0.013f, ws[i] };
+        deltaPos[i] = { 0.101f * float(i), -0.203f * float(i), 0.307f * float(i), 77.0f };
+    }
+
+    DevBuf bPos = makeDev(dev, pos);
+    DevBuf bVel = makeDev(dev, vel);
+    DevBuf bDelta = makeDev(dev, delta);
+    DevBuf bDeltaPos = makeDev(dev, deltaPos);
+
+    PxgSoftBody c = makeZeroDesc();
+    c.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    c.mSimVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVel.addr));
+    c.mSimDelta = reinterpret_cast<float4*>(size_t(bDelta.addr));
+    c.mSimDeltaPos = reinterpret_cast<float4*>(size_t(bDeltaPos.addr));
+    c.mNumVertsGM = N;
+    std::vector<PxgSoftBody> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    ApplyDeltasPush push = {};
+    push.gSoftbodies = bDesc.addr;
+    push.activeSoftbodies = bActive.addr;
+    push.invDt = invDt;
+
+    Kernel k("softBodySolveBda.spv", "sb_gm_applyExternalDeltasLaunch", {}, sizeof(ApplyDeltasPush));
+    k.dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // CPU reference — expression order transcribed from softBodyGM.cu:2609.
+    std::vector<F4> refPos(N), refVel(N), refDeltaPos(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        F4 d = delta[i];
+        const float scale = 1.0f / std::fmax(d.w, 1.0f);
+        d.x *= scale; d.y *= scale; d.z *= scale;
+        d.w = 0.0f;
+        refVel[i] = { vel[i].x + d.x * invDt, vel[i].y + d.y * invDt,
+                      vel[i].z + d.z * invDt, vel[i].w + d.w * invDt };
+        refPos[i] = { pos[i].x + d.x, pos[i].y + d.y, pos[i].z + d.z, pos[i].w + d.w };
+        refDeltaPos[i] = { deltaPos[i].x + d.x, deltaPos[i].y + d.y,
+                           deltaPos[i].z + d.z, deltaPos[i].w + d.w };
+    }
+
+    const auto gPos = downloadBuffer<F4>(dev, bPos.h, N);
+    const auto gVel = downloadBuffer<F4>(dev, bVel.h, N);
+    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, N);
+    const auto gDeltaPos = downloadBuffer<F4>(dev, bDeltaPos.h, N);
+
+    size_t mm = 0;
+    auto cmp = [&](const char* what, uint32_t i, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) ||
+            f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm; std::printf("  %s[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", what, i,
+                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); } };
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        cmp("pos", i, refPos[i], gPos[i]);
+        cmp("vel", i, refVel[i], gVel[i]);
+        cmp("deltaPos", i, refDeltaPos[i], gDeltaPos[i]);
+        // the delta buffer must be fully cleared for the next iteration
+        cmp("delta(cleared)", i, F4{ 0.0f, 0.0f, 0.0f, 0.0f }, gDelta[i]);
+    }
+    // Teeth on the averaging divide: vertex 3 has w == 7, so its applied delta must be
+    // exactly one seventh of the raw one — a port that skipped the scale would match the
+    // w == 0 / w == 1 vertices and only differ here.
+    const float expectX3 = pos[3].x + delta[3].x / 7.0f;
+    PXG_CHECK_MSG(f2u(gPos[3].x) == f2u(expectX3),
+                  "vertex 3 (delta.w == 7) must be averaged by 1/7: ref %g got %g", expectX3, gPos[3].x);
+    // ...and on the never-below-one clamp: vertex 5 has w == 0.5, which must NOT scale up.
+    const float expectX5 = pos[5].x + delta[5].x;
+    PXG_CHECK_MSG(f2u(gPos[5].x) == f2u(expectX5),
+                  "vertex 5 (delta.w == 0.5) must clamp the divisor to 1: ref %g got %g", expectX5, gPos[5].x);
+    PXG_CHECK_MSG(mm == 0, "sb_gm_applyExternalDeltasLaunch bit-exact vs CPU (%zu mismatches)", mm);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bDelta.h);
+    dev->destroyBuffer(bDeltaPos.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
 } // namespace
