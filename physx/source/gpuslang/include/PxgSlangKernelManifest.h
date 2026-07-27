@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 210;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 211;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -382,7 +382,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "copyUserData", nullptr, nullptr },  // COPY_USER_DATA (unmapped)
     { "markAddedAndDeletedAggregatedBounds", "broadphaseAggregateFinalize.spv", "markAddedAndDeletedAggregatedBounds" },  // AGG_MARK_ADDED_DELETED_AGGREGATED_BOUNDS
     { "cloth_preIntegrateLaunch", "femClothSimBda.spv", "cloth_preIntegrateLaunch" },  // CLOTH_SIM_PREINTEGRATION (P7.0 BDA port: FEMCloth free-fall predict + integrate)
-    { "cloth_refitBoundLaunch", nullptr, nullptr },  // CLOTH_REFIT_BOUND (unmapped)
+    { "cloth_refitBoundLaunch", "femClothRefitBda.spv", "cloth_refitBoundLaunch" },  // CLOTH_REFIT_BOUND (P7.2 tranche 3a BDA port)
     { "cloth_midphaseGeneratePairsLaunch", nullptr, nullptr },  // CLOTH_MIDPHASE_PRIMITIVES (unmapped)
     { "cloth_SphereContactGenLaunch", nullptr, nullptr },  // CLOTH_SPHERE_CG (unmapped)
     { "cloth_boxTriangleContactGenLaunch", nullptr, nullptr },  // CLOTH_BOX_TRIANGLE_CG (unmapped)

@@ -710,6 +710,60 @@ refit) → the FEM-volume solve chain (`sb_gm_cp_solveTetrahedronsPartitionLaunc
 (`sb_rigidContactPrepareLaunch` + `sb_solveRigidSoftCollisionLaunch`) for a softbody-on-floor scene.
 56 softbody kernels total; this is 1.
 
+## P7.2 tranche 3a — the cloth BVH BOUNDS REFIT: the self-collision midphase now queries a LIVE tree
+
+Tranches 1 + 2 gave the cloth a self-collision midphase and solve, but the midphase walked the
+cloth's own BV32 triangle BVH **as cooked** — in rest pose.  `cloth_refitBoundLaunch`
+(`CLOTH_REFIT_BOUND`, FEMCloth.cu:338, launch PxgFEMClothCore.cpp:563) is the per-step rebuild that
+was missing, and without it a folded cloth generates **zero** self-contacts no matter how deeply it
+penetrates itself: every midphase box test is against last-cook geometry.
+
+`shaders/femClothRefitBda.slang` ports it line-for-line as the BDA sibling of
+`femClothSelfCollisionBda.slang` (same `Gu::BV32DataPacked` 1168-byte decode, same
+`pxgSlangFEMClothDesc` mirror).  It walks the `BV32DataDepthInfo` levels bottom-up, recomputes every
+node's 32 per-child AABBs from the CURRENT `mPosition_InvMass`, aggregates each node's own bound into
+`mPackedNodeBounds`, and expands the root into the broad-phase `boundArray` slot.  ABI row
+`{8,8,4,8,8,8,8,4,8}` (72-byte blob); manifest hand-edited, **MAPPED 210 → 211**.
+
+**Warp lowering.** One 32-thread group per cloth replaces the CUDA (32, `SB_REFIT_WAPRS_PER_BLOCK`=32)
+block, so the per-level node loop runs serially in the single warp.  This is forced, not cosmetic:
+CUDA `__syncthreads()`-couples 32 warps that each run a data-dependent inner loop, and the groupshared
+lowering of `__ballot_sync` / `warpShuffleMin`/`Max` needs a barrier every lane reaches uniformly —
+impossible with 32 divergent warps in one group.  Output-identical: same-level nodes have no data
+dependency on each other (each reads only children written in a PREVIOUS level, and writes only its
+own slots), and min/max is exact + associative + commutative, so both the serialization and the
+reduction-order change are bit-preserving, not merely equivalent.
+
+**Two llvmpipe landmines, both bisected rather than guessed:**
+
+1. **`k &= k-1` miscompiles.** CUDA's leaf walk is
+   `for (k = resultWarp; k; k = clearLowestSetBit(k))` — the canonical popcount loop idiom.  Under
+   llvmpipe's LLVM 20.1 backend this **SIGSEGVs in the driver worker thread** as soon as the loop body
+   is non-trivial; bisection pinned it to that loop, with the primitive gather and the groupshared
+   reduction EACH reproducing it alone, while an empty-body bit walk runs clean (so: codegen bug, not
+   a Slang/SPIR-V semantics issue).  Replaced with a fixed 32-iteration scan over the same ballot
+   mask — identical set bits, identical ascending order, identical bits out.
+2. **A buffer ending exactly on its last element faults.** llvmpipe widens the final
+   `remapPackedNodeIndex` load past the last word, so a test blob that ends on it faults when it lands
+   at the end of a mapped region — which is why this only reproduced when the case ran AFTER the rest
+   of the suite, never in isolation.  A 16-byte trailer on the test blob fixes it; the refit stays
+   bit-exact with the trailer, which it could not be if the kernel were really consuming a 4th remap
+   entry.  The engine blob is a cooked mesh-data block with its own trailing sections, so it never
+   ends on that boundary.
+
+**Verification.** `femClothSimRefitBound` builds a deliberately TWO-level tree (root with 2 internal
+children → two leaf nodes over 6 triangles) so both aggregation paths run — the leaf triangle-vertex
+ballot walk AND the `!isLeaf → read mPackedNodeBounds[childOffset]` path, which is only correct if the
+deeper level really ran first.  Every node AABB slot, every `mPackedNodeBounds` entry and the
+broad-phase slot are compared **bit-exact** (raw float bits) against a CPU reference that transcribes
+the 32-lane semantics exactly; neighbouring broad-phase slots are checked untouched (elemIndex
+indirection proof) and `updateContactPairs == 0` must skip the refit entirely.  Pure min/max/mul/add,
+no transcendental — **fully bit-exact, no tolerance seam**.  Forced-fresh mutation checks (3, each
+`rm`-ing the .spv first): perturbing the leaf min, flipping the walk top-down (the reference then
+still holds the poison sentinel — proof the bottom-up order is load-bearing), and flipping the
+broad-phase expansion sign are all caught with concrete f2u mismatches.  Full suite **674/674 in both
+memory modes** (default + `PXG_DEVICE_V2=1`), rigid regression 16/16.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

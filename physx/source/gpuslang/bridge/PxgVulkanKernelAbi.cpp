@@ -405,6 +405,17 @@ static const uint8_t kClothClothContactSolve[] = { 8, 8, 8, 4 };
 //   (@16/@17) + three device pointers + PxReal (@48) -> natural-alignment blob = 56 bytes.
 static const uint8_t kClothUpdateContactValidity[] = { 8, 8, 1, 1, 8, 8, 8, 4 };
 
+// gpusimulationcontroller FEMCloth.cu:338 (P7.2 tranche 3a cloth BVH bottom-up refit):
+//   cloth_refitBoundLaunch(PxgFEMCloth* gFemClothes, const PxU32* activeFemClothes,
+//     const PxU32 nbActiveFemClothes, PxReal* contactDists,
+//     PxReal* speculativeCCDContactOffset, PxBounds3* boundArray, const PxU32* elemIndex,
+//     const PxReal nbCollisionPairUpdatesPerTimestep, const PxU8* updateContactPairs)
+//   -- launch site PxgFEMClothCore.cpp:563.  Two device pointers + PxU32 (@16, its
+//   4-byte tail-pad realigning the next pointer to @24) + four device pointers +
+//   PxReal (@56, likewise tail-padded) + device pointer (@64) -> natural-alignment
+//   blob = 72 bytes.
+static const uint8_t kClothRefitBound[] = { 8, 8, 4, 8, 8, 8, 8, 4, 8 };
+
 // gpusimulationcontroller softBodyGM.cu:72 (P8.0 SOFTBODY / FEM-volume free-fall BDA):
 //   sb_gm_preIntegrateLaunch(PxgSoftBody* softbodies, const PxU32* activeId,
 //     PxVec3 gravity, PxReal dt, bool isTGS, PxReal* speculativeCCDContactOffset,
@@ -754,6 +765,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_solveClothClothDeltaVTLaunch", kClothClothContactSolve, uint32_t(sizeof(kClothClothContactSolve)) },
     { "cloth_solveClothClothDeltaEELaunch", kClothClothContactSolve, uint32_t(sizeof(kClothClothContactSolve)) },
     { "cloth_updateClothContactValidityLaunch", kClothUpdateContactValidity, uint32_t(sizeof(kClothUpdateContactValidity)) },
+    // gpusimulationcontroller FEMCloth BVH bottom-up bounds refit (P7.2 tranche 3a BDA)
+    { "cloth_refitBoundLaunch", kClothRefitBound, uint32_t(sizeof(kClothRefitBound)) },
     // gpusimulationcontroller softbody (FEM-volume) free-fall predict/integrate (P8.0 BDA)
     { "sb_gm_preIntegrateLaunch", kSbPreIntegrate, uint32_t(sizeof(kSbPreIntegrate)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)

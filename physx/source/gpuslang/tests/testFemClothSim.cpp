@@ -4141,4 +4141,366 @@ PXG_TEST(femClothSimUpdateClothContactValidity)
     dev->destroyBuffer(bPrev2.h); dev->destroyBuffer(bVt2.h); dev->destroyBuffer(bEe2.h); dev->destroyBuffer(bDesc2.h);
 }
 
+
+// ---------------------------------------------------------------------------
+// P7.2 tranche 3a — cloth_refitBoundLaunch (FEMCloth.cu:338, femClothRefitBda.spv).
+//
+// The BVH bounds refit: walk the cloth's Gu::BV32DataPacked tree bottom-up (deepest
+// BV32DataDepthInfo level first), rewrite every node's 32 per-child AABBs from the
+// CURRENT vertex positions, aggregate each node's own bound into mPackedNodeBounds,
+// and finally expand the root bound into the broad-phase boundArray slot.  Without
+// this the tranche-1 self-collision midphase queries the rest-pose tree it was cooked
+// with and returns zero contacts.
+//
+// The test tree is deliberately TWO levels deep so BOTH aggregation paths run:
+//   node 0 (root, level 0): 2 INTERNAL children -> nodes 1 and 2
+//   node 1 (level 1): 2 LEAF children (prims 0-1 and prim 2)
+//   node 2 (level 1): 1 LEAF child  (prims 3-5)
+// Level 1 exercises the leaf triangle-vertex min/max ballot walk; level 0 exercises
+// the `!isLeaf -> read mPackedNodeBounds[childOffset]` path, which is only correct if
+// level 1 really ran first (a top-down or single-level port fails here).
+// ---------------------------------------------------------------------------
+struct RefitPush
+{
+    uint64_t femClothes, activeFemClothes;
+    uint32_t nbActive, pad20;
+    uint64_t contactDists, speculativeCCD, boundArray, elemIndex;
+    float nbCollisionPairUpdatesPerTimestep;
+    uint32_t pad60;
+    uint64_t updateContactPairs;
+};
+static_assert(sizeof(RefitPush) == 72, "refitBound push blob must be 72 bytes");
+static_assert(offsetof(RefitPush, contactDists) == 24, "contactDists @24");
+static_assert(offsetof(RefitPush, boundArray) == 40, "boundArray @40");
+static_assert(offsetof(RefitPush, nbCollisionPairUpdatesPerTimestep) == 56, "nbUpdates @56");
+static_assert(offsetof(RefitPush, updateContactPairs) == 64, "updateContactPairs @64");
+
+namespace p72refit
+{
+// Gu::BV32DataPacked = 1168 B = 292 uint32 words.
+static const uint32_t BV32_WORDS = 292u;
+static const uint32_t W_MMIN  = 0u;    // mMin[32] float4 @byte 0
+static const uint32_t W_MMAX  = 128u;  // mMax[32] float4 @byte 512
+static const uint32_t W_MDATA = 256u;  // mData[32] @byte 1024
+static const uint32_t W_NBNODES = 288u;// mNbNodes @byte 1152
+static const uint32_t W_DEPTH = 289u;  // mDepth  @byte 1156
+
+static uint32_t leafWord(uint32_t startIndex, uint32_t nbPrims)
+{
+    return (startIndex << 7) | (nbPrims << 1) | 1u;   // isLeaf bit 0
+}
+static uint32_t internalWord(uint32_t childOffset)
+{
+    return childOffset << 11;                          // GU_BV4_CHILD_OFFSET_SHIFT_COUNT, isLeaf 0
+}
+
+struct Bounds { p72ref::V3 mn, mx; };
+
+// The whole tree blob: uint4 header + nbNodes x BV32DataPacked + maxDepth x
+// BV32DataDepthInfo + nbNodes x remapPackedNodeIndex.
+struct TreeBlob
+{
+    std::vector<uint32_t> w;
+    uint32_t nodeWord(uint32_t node) const { return 4u + node * BV32_WORDS; }
+};
+
+// The 32-lane semantics of the CUDA kernel, transcribed exactly (-ffp-contract=off):
+// per node, the leaf ballot walk broadcasts a warp-wide min/max into EVERY lane, the
+// non-leaf lanes then OVERWRITE their own lane value with the child's stored bound,
+// and the node's aggregate reduces over all 32 lanes (lanes >= nbChildren still carry
+// the leaf aggregate / the +-MAX identity, which is exactly what CUDA reduces too).
+static void refitNodeRef(uint32_t nodeIndex, TreeBlob& tree, std::vector<Bounds>& packed,
+                         const std::vector<F4>& pos, const std::vector<TriIdx4>& tris)
+{
+    const uint32_t nw = tree.nodeWord(nodeIndex);
+    const uint32_t nbChildren = tree.w[nw + W_NBNODES];
+    const float MAXF = PX_MAX_REAL_F;
+
+    std::vector<p72ref::V3> laneMin(32, p72ref::V3{ MAXF, MAXF, MAXF });
+    std::vector<p72ref::V3> laneMax(32, p72ref::V3{ -MAXF, -MAXF, -MAXF });
+
+    uint32_t resultWarp = 0u;
+    for (uint32_t k = 0; k < 32u; ++k)
+        if (k < nbChildren && (tree.w[nw + W_MDATA + k] & 1u))
+            resultWarp |= (1u << k);
+
+    for (uint32_t k = resultWarp; k != 0u; k &= (k - 1u))
+    {
+        uint32_t indexInWarp = 0;
+        while (((k >> indexInWarp) & 1u) == 0u) ++indexInWarp;
+        const uint32_t d = tree.w[nw + W_MDATA + indexInWarp];
+        const uint32_t nbPrimitives = (d >> 1) & 63u;
+        const uint32_t startIndex = d >> 7;
+
+        std::vector<p72ref::V3> tMin = laneMin, tMax = laneMax;
+        for (uint32_t lane = 0; lane < 32u; ++lane)
+        {
+            if (lane >= nbPrimitives) continue;
+            const TriIdx4& t = tris[startIndex + lane];
+            const F4& a = pos[t.x]; const F4& b = pos[t.y]; const F4& c = pos[t.z];
+            float tx = p72ref::fmin3(a.x, b.x), ty = p72ref::fmin3(a.y, b.y), tz = p72ref::fmin3(a.z, b.z);
+            tx = p72ref::fmin3(tx, c.x); ty = p72ref::fmin3(ty, c.y); tz = p72ref::fmin3(tz, c.z);
+            tMin[lane] = p72ref::vmin(tMin[lane], p72ref::V3{ tx, ty, tz });
+            tx = p72ref::fmax3(a.x, b.x); ty = p72ref::fmax3(a.y, b.y); tz = p72ref::fmax3(a.z, b.z);
+            tx = p72ref::fmax3(tx, c.x); ty = p72ref::fmax3(ty, c.y); tz = p72ref::fmax3(tz, c.z);
+            tMax[lane] = p72ref::vmax(tMax[lane], p72ref::V3{ tx, ty, tz });
+        }
+        p72ref::V3 rn = tMin[0], rx = tMax[0];
+        for (uint32_t lane = 1; lane < 32u; ++lane)
+        { rn = p72ref::vmin(rn, tMin[lane]); rx = p72ref::vmax(rx, tMax[lane]); }
+        for (uint32_t lane = 0; lane < 32u; ++lane) { laneMin[lane] = rn; laneMax[lane] = rx; }
+    }
+
+    for (uint32_t lane = 0; lane < 32u; ++lane)
+    {
+        if (lane < nbChildren && !(tree.w[nw + W_MDATA + lane] & 1u))
+        {
+            const uint32_t childOffset = tree.w[nw + W_MDATA + lane] >> 11;
+            laneMin[lane] = packed[childOffset].mn;
+            laneMax[lane] = packed[childOffset].mx;
+        }
+    }
+
+    for (uint32_t lane = 0; lane < nbChildren; ++lane)
+    {
+        std::memcpy(&tree.w[nw + W_MMIN + lane * 4 + 0], &laneMin[lane].x, 4);
+        std::memcpy(&tree.w[nw + W_MMIN + lane * 4 + 1], &laneMin[lane].y, 4);
+        std::memcpy(&tree.w[nw + W_MMIN + lane * 4 + 2], &laneMin[lane].z, 4);
+        tree.w[nw + W_MMIN + lane * 4 + 3] = f2u(0.0f);
+        std::memcpy(&tree.w[nw + W_MMAX + lane * 4 + 0], &laneMax[lane].x, 4);
+        std::memcpy(&tree.w[nw + W_MMAX + lane * 4 + 1], &laneMax[lane].y, 4);
+        std::memcpy(&tree.w[nw + W_MMAX + lane * 4 + 2], &laneMax[lane].z, 4);
+        tree.w[nw + W_MMAX + lane * 4 + 3] = f2u(0.0f);
+    }
+
+    p72ref::V3 an = laneMin[0], ax = laneMax[0];
+    for (uint32_t lane = 1; lane < 32u; ++lane)
+    { an = p72ref::vmin(an, laneMin[lane]); ax = p72ref::vmax(ax, laneMax[lane]); }
+    packed[nodeIndex].mn = an;
+    packed[nodeIndex].mx = ax;
+}
+} // namespace p72refit
+
+PXG_TEST(femClothSimRefitBound)
+{
+    using namespace p72refit;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // 8 vertices with deliberately irregular coordinates (no exact-representable grid,
+    // so a min/max mix-up cannot accidentally agree), 6 triangles.
+    std::vector<F4> pos = {
+        { -0.31718f,  0.90211f, -0.14477f, 0.5f },
+        {  1.17093f, -0.42388f,  0.63512f, 0.5f },
+        {  0.55401f,  1.30877f,  0.21939f, 0.5f },
+        { -1.02664f,  0.13205f,  1.44170f, 0.5f },
+        {  2.31882f,  0.77519f, -0.90613f, 0.5f },
+        {  0.04471f, -1.15938f,  0.38204f, 0.5f },
+        { -0.68350f,  2.02117f,  1.09926f, 0.5f },
+        {  1.83007f,  0.29644f, -1.27735f, 0.5f },
+    };
+    std::vector<TriIdx4> tris = {
+        { 0u, 1u, 2u, 0u }, { 1u, 3u, 4u, 0u }, { 2u, 5u, 6u, 0u },
+        { 3u, 6u, 7u, 0u }, { 4u, 0u, 5u, 0u }, { 5u, 7u, 1u, 0u },
+    };
+
+    const uint32_t nbNodes = 3u, maxDepth = 2u;
+
+    // --- assemble the tree blob -------------------------------------------------
+    TreeBlob tree;
+    tree.w.assign(4u + nbNodes * BV32_WORDS + maxDepth * 2u + nbNodes, 0u);
+    tree.w[0] = uint32_t(pos.size());   // nbVerts
+    tree.w[1] = uint32_t(tris.size());  // nbTriangles
+    tree.w[2] = maxDepth;
+    tree.w[3] = nbNodes;
+
+    // Poison every node AABB slot with a recognisable rest-pose stale value: a correct
+    // refit must overwrite slots 0..nbChildren-1 and leave the rest untouched.
+    const float POISON = -7777.0f;
+    for (uint32_t n = 0; n < nbNodes; ++n)
+        for (uint32_t k = 0; k < 32u * 4u; ++k)
+        {
+            tree.w[tree.nodeWord(n) + W_MMIN + k] = f2u(POISON);
+            tree.w[tree.nodeWord(n) + W_MMAX + k] = f2u(POISON);
+        }
+
+    // node 0: two internal children -> nodes 1, 2
+    tree.w[tree.nodeWord(0) + W_MDATA + 0] = internalWord(1u);
+    tree.w[tree.nodeWord(0) + W_MDATA + 1] = internalWord(2u);
+    tree.w[tree.nodeWord(0) + W_NBNODES] = 2u;
+    tree.w[tree.nodeWord(0) + W_DEPTH] = 0u;
+    // node 1: two leaf children (tris 0-1, tri 2)
+    tree.w[tree.nodeWord(1) + W_MDATA + 0] = leafWord(0u, 2u);
+    tree.w[tree.nodeWord(1) + W_MDATA + 1] = leafWord(2u, 1u);
+    tree.w[tree.nodeWord(1) + W_NBNODES] = 2u;
+    tree.w[tree.nodeWord(1) + W_DEPTH] = 1u;
+    // node 2: one leaf child (tris 3-5)
+    tree.w[tree.nodeWord(2) + W_MDATA + 0] = leafWord(3u, 3u);
+    tree.w[tree.nodeWord(2) + W_NBNODES] = 1u;
+    tree.w[tree.nodeWord(2) + W_DEPTH] = 1u;
+
+    // BV32DataDepthInfo[maxDepth]: level 0 -> {offset 0, count 1}; level 1 -> {1, 2}
+    const uint32_t wDepthInfo = 4u + nbNodes * BV32_WORDS;
+    tree.w[wDepthInfo + 0] = 0u; tree.w[wDepthInfo + 1] = 1u;
+    tree.w[wDepthInfo + 2] = 1u; tree.w[wDepthInfo + 3] = 2u;
+    // remapPackedNodeIndex[nbNodes]: identity (level 0 = node 0, level 1 = nodes 1,2)
+    const uint32_t wRemap = wDepthInfo + maxDepth * 2u;
+    tree.w[wRemap + 0] = 0u; tree.w[wRemap + 1] = 1u; tree.w[wRemap + 2] = 2u;
+
+    // --- device state -----------------------------------------------------------
+    const uint32_t clothId = 0u, elemIdx = 2u;
+    const float origContactOffset = 0.037f, specCCD = 0.011f, nbUpdatesPerStep = 3.0f;
+
+    std::vector<float> packedBoundsInit(nbNodes * 6u, POISON);
+    std::vector<float> boundArrayInit((elemIdx + 2u) * 6u, POISON);
+
+    // The tree blob gets a 16-byte trailer.  llvmpipe widens the final
+    // remapPackedNodeIndex load past the last element, so a device buffer that ends
+    // EXACTLY on that word faults when it happens to sit at the end of a mapped region
+    // (reproduces only when this case runs after the rest of the suite, never in
+    // isolation).  It is a load-width artifact, not a kernel off-by-one: with the
+    // trailer present the refit is still bit-exact, which it could not be if the kernel
+    // were really consuming a 4th remap entry (it would refit an extra node).  The real
+    // engine blob is a cooked mesh-data block with its own trailing sections, so it
+    // never ends on that boundary.
+    std::vector<uint32_t> treePad = tree.w; treePad.resize(tree.w.size() + 4u, 0u);
+    DevBuf bPos = makeDev(dev, pos);
+    DevBuf bTri = makeDev(dev, tris);
+    DevBuf bTree = makeDev(dev, treePad);
+    DevBuf bPacked = makeDev(dev, packedBoundsInit);
+    DevBuf bBounds = makeDev(dev, boundArrayInit);
+    std::vector<uint32_t> active = { clothId };
+    DevBuf bActive = makeDev(dev, active);
+    std::vector<uint32_t> elemIndices = { elemIdx };
+    DevBuf bElem = makeDev(dev, elemIndices);
+    std::vector<float> spec = { specCCD };
+    DevBuf bSpec = makeDev(dev, spec);
+    std::vector<float> contactDists = { 0.0f };
+    DevBuf bCd = makeDev(dev, contactDists);
+    std::vector<uint32_t> upd = { 1u };
+    DevBuf bUpd = makeDev(dev, upd);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mTriMeshData = reinterpret_cast<decltype(c.mTriMeshData)>(size_t(bTree.addr));
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mPackedNodeBounds = reinterpret_cast<decltype(c.mPackedNodeBounds)>(size_t(bPacked.addr));
+    c.mNbVerts = uint32_t(pos.size());
+    c.mNbTriangles = uint32_t(tris.size());
+    c.mOriginalContactOffset = origContactOffset;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    RefitPush rp{};
+    rp.femClothes = bDesc.addr;
+    rp.activeFemClothes = bActive.addr;
+    rp.nbActive = 1u;
+    rp.contactDists = bCd.addr;
+    rp.speculativeCCD = bSpec.addr;
+    rp.boundArray = bBounds.addr;
+    rp.elemIndex = bElem.addr;
+    rp.nbCollisionPairUpdatesPerTimestep = nbUpdatesPerStep;
+    rp.updateContactPairs = bUpd.addr;
+
+    Kernel k("femClothRefitBda.spv", "cloth_refitBoundLaunch", {}, sizeof(RefitPush));
+    k.dispatch(1u, {}, rp, 1u, 1u);
+    dev->flush();
+
+    // --- CPU reference (same bottom-up order the kernel walks) ------------------
+    TreeBlob refTree = tree;
+    std::vector<Bounds> refPacked(nbNodes);
+    for (uint32_t n = 0; n < nbNodes; ++n)
+    { refPacked[n].mn = p72ref::V3{ POISON, POISON, POISON }; refPacked[n].mx = refPacked[n].mn; }
+    for (uint32_t i = maxDepth; i > 0u; --i)
+    {
+        const uint32_t off = refTree.w[wDepthInfo + (i - 1u) * 2u + 0];
+        const uint32_t cnt = refTree.w[wDepthInfo + (i - 1u) * 2u + 1];
+        for (uint32_t j = 0; j < cnt; ++j)
+            refitNodeRef(refTree.w[wRemap + j + off], refTree, refPacked, pos, tris);
+    }
+
+    const auto gTree = downloadBuffer<uint32_t>(dev, bTree.h, treePad.size());
+    const auto gPacked = downloadBuffer<float>(dev, bPacked.h, packedBoundsInit.size());
+    const auto gBounds = downloadBuffer<float>(dev, bBounds.h, boundArrayInit.size());
+
+    size_t mm = 0;
+    for (uint32_t n = 0; n < nbNodes; ++n)
+    {
+        const uint32_t nw = refTree.nodeWord(n);
+        for (uint32_t k2 = 0; k2 < 32u * 4u; ++k2)
+        {
+            if (gTree[nw + W_MMIN + k2] != refTree.w[nw + W_MMIN + k2])
+            { ++mm; std::printf("  node %u mMin word %u MM: ref %08x got %08x\n", n, k2,
+                                refTree.w[nw + W_MMIN + k2], gTree[nw + W_MMIN + k2]); }
+            if (gTree[nw + W_MMAX + k2] != refTree.w[nw + W_MMAX + k2])
+            { ++mm; std::printf("  node %u mMax word %u MM: ref %08x got %08x\n", n, k2,
+                                refTree.w[nw + W_MMAX + k2], gTree[nw + W_MMAX + k2]); }
+        }
+    }
+    for (uint32_t n = 0; n < nbNodes; ++n)
+    {
+        const float r[6] = { refPacked[n].mn.x, refPacked[n].mn.y, refPacked[n].mn.z,
+                             refPacked[n].mx.x, refPacked[n].mx.y, refPacked[n].mx.z };
+        for (uint32_t e = 0; e < 6u; ++e)
+            if (f2u(gPacked[n * 6 + e]) != f2u(r[e]))
+            { ++mm; std::printf("  packedNodeBounds[%u][%u] MM: ref %g got %g\n", n, e, r[e], gPacked[n * 6 + e]); }
+    }
+
+    // The refit MUST have actually run: node 0's aggregate is the whole mesh AABB.
+    p72ref::V3 wholeMin{ PX_MAX_REAL_F, PX_MAX_REAL_F, PX_MAX_REAL_F };
+    p72ref::V3 wholeMax{ -PX_MAX_REAL_F, -PX_MAX_REAL_F, -PX_MAX_REAL_F };
+    for (const TriIdx4& t : tris)
+        for (uint32_t vi : { t.x, t.y, t.z })
+        {
+            wholeMin = p72ref::vmin(wholeMin, p72ref::V3{ pos[vi].x, pos[vi].y, pos[vi].z });
+            wholeMax = p72ref::vmax(wholeMax, p72ref::V3{ pos[vi].x, pos[vi].y, pos[vi].z });
+        }
+    PXG_CHECK_MSG(f2u(refPacked[0].mn.x) == f2u(wholeMin.x) && f2u(refPacked[0].mx.z) == f2u(wholeMax.z),
+                  "reference root bound must equal the whole-mesh AABB (self-check)");
+    PXG_CHECK_MSG(f2u(gPacked[0]) != f2u(POISON), "root packedNodeBounds must be overwritten (refit did not run)");
+
+    // broad-phase slot: root -/+ PxMax(nbUpdates,1) * (originalContactOffset + specCCD)
+    const float contactDist = origContactOffset + specCCD;
+    const float expansion = (nbUpdatesPerStep > 1.0f ? nbUpdatesPerStep : 1.0f) * contactDist;
+    const float refBound[6] = {
+        refPacked[0].mn.x - expansion, refPacked[0].mn.y - expansion, refPacked[0].mn.z - expansion,
+        refPacked[0].mx.x + expansion, refPacked[0].mx.y + expansion, refPacked[0].mx.z + expansion };
+    for (uint32_t e = 0; e < 6u; ++e)
+        if (f2u(gBounds[elemIdx * 6 + e]) != f2u(refBound[e]))
+        { ++mm; std::printf("  boundArray[%u][%u] MM: ref %g got %g\n", elemIdx, e, refBound[e],
+                            gBounds[elemIdx * 6 + e]); }
+    // neighbouring broad-phase slots must be untouched (elemIndex indirection proof)
+    for (uint32_t e = 0; e < 6u; ++e)
+    {
+        if (f2u(gBounds[0 * 6 + e]) != f2u(POISON)) { ++mm; std::printf("  boundArray[0][%u] clobbered\n", e); }
+        if (f2u(gBounds[(elemIdx + 1u) * 6 + e]) != f2u(POISON))
+        { ++mm; std::printf("  boundArray[%u][%u] clobbered\n", elemIdx + 1u, e); }
+    }
+    PXG_CHECK_MSG(mm == 0, "cloth_refitBoundLaunch bit-exact vs CPU (%zu mismatches)", mm);
+
+    // forced-fresh gating check: updateContactPairs == 0 -> the kernel MUST early-out and
+    // leave every output at its poison value (a stub that always refit would fail here).
+    std::vector<float> packed2(nbNodes * 6u, POISON);
+    DevBuf bPacked2 = makeDev(dev, packed2);
+    std::vector<uint32_t> upd0 = { 0u };
+    DevBuf bUpd0 = makeDev(dev, upd0);
+    PxgFEMCloth c2 = c;
+    c2.mPackedNodeBounds = reinterpret_cast<decltype(c2.mPackedNodeBounds)>(size_t(bPacked2.addr));
+    std::vector<PxgFEMCloth> descArr2 = { c2 };
+    DevBuf bDesc2 = makeDev(dev, descArr2);
+    RefitPush rp2 = rp;
+    rp2.femClothes = bDesc2.addr; rp2.updateContactPairs = bUpd0.addr;
+    k.dispatch(1u, {}, rp2, 1u, 1u);
+    dev->flush();
+    const auto gPacked2 = downloadBuffer<float>(dev, bPacked2.h, packed2.size());
+    for (uint32_t e = 0; e < nbNodes * 6u; ++e)
+        PXG_CHECK_MSG(f2u(gPacked2[e]) == f2u(POISON),
+                      "updateContactPairs==0 must skip the refit entirely (slot %u = %g)", e, gPacked2[e]);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bTri.h); dev->destroyBuffer(bTree.h);
+    dev->destroyBuffer(bPacked.h); dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bActive.h);
+    dev->destroyBuffer(bElem.h); dev->destroyBuffer(bSpec.h); dev->destroyBuffer(bCd.h);
+    dev->destroyBuffer(bUpd.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bPacked2.h); dev->destroyBuffer(bUpd0.h); dev->destroyBuffer(bDesc2.h);
+}
+
 } // namespace
