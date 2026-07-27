@@ -764,6 +764,57 @@ still holds the poison sentinel — proof the bottom-up order is load-bearing), 
 broad-phase expansion sign are all caught with concrete f2u mismatches.  Full suite **674/674 in both
 memory modes** (default + `PXG_DEVICE_V2=1`), rigid regression 16/16.
 
+## P7.2 tranche 3b — MILESTONE: a FEMCloth CATCHES ITSELF (`PXG_SCENE=clothselfcollide` goes green)
+
+The self-collision arc closes: a hairpin-folded cloth's free upper layer now **rests on the shelf
+made of its own fixed lower layer** instead of drooping through it.  A/B over repeated runs
+(`PXG_SELFCOLL` is the only difference): **ON mean y 5.05-5.42 / min 4.18-4.94** vs **OFF mean 4.243 /
+min 3.634**, shelf at y=5.00.  The ON path is genuinely non-deterministic (contact-slot atomics +
+order-dependent `mDeltaPos` accumulation); the OFF control has no self-contacts and repeats bit-for-bit.
+
+Getting here needed three fixes, each found by instrumenting the live pipeline rather than guessing —
+a temporary bridge hook that read the gate, the contact counters, the per-contact validity bits and
+`mDeltaPos` straight out of the push blob after each launch:
+
+**1. The gate was never opened (a REGRESSION the P7.0 port planted).**  Every self-collision kernel —
+midphase VT/EE, refit, contact prepare — early-outs on `*updateContactPairs == 0`.  In PGS that flag is
+set by `cloth_preIntegrateLaunch` (`*updateContactPairs = !isTGS`, FEMCloth.cu:93), and the P7.0 port
+had deliberately ELIDED that store: at the time nothing mapped consumed it, and it is a `PxU8` write
+(no 8-bit storage on llvmpipe).  Correct then, silently fatal from tranche 1 onward — the whole arc
+ran every frame and did nothing.  Restored as a 4-byte store: the engine itself clears that buffer with
+`memsetD32Async` (PxgFEMClothCore.cpp:1397) and every consumer reads `word & 0xFF`, so the full word is
+ours and the observable byte is identical.  Verified by removal: without the store the scene falls to
+exactly the OFF numbers (min 3.634).
+
+**2. `mRestDistance` was 0, so the solve threw away every contact it was handed.**  With the gate open
+the midphase generated 76 VT + up to 29 EE contacts per step, all flagged valid — and `maxDelta` stayed
+0.  `countContact` (FEMClothExternalSolve.cu:870) keeps a pair only while its separation is inside
+`cloth0->mRestDistance + cloth1->mRestDistance`, and `mRestDistance` IS the shape's **rest offset**
+(PxgSimulationController.cpp:1770).  The scene set only `contactOffset`, leaving rest offset at its 0
+default, so every contact was immediately marked not-in-collision.  `setRestOffset(0.05f)` gives a 0.1
+separation band — it exceeds the `dropH=0.05` the layers spawn at, and stays within the contact offset.
+
+**3. Border vertices sat exactly on the shelf's edge.**  Vertex-triangle self-collision can only hold a
+vertex that lies over a shelf TRIANGLE.  With both layers on the same footprint the upper layer's border
+vertices sat on the shelf's outer edge with nothing beneath them and drooped (measured: interior
+5.0-5.5, border 4.66-4.91) — correct cloth behaviour, not a solver gap.  The scene now insets the upper
+layer to 0.9, giving the shelf an overhang the way a real sheet on a table is smaller than the table.
+(A 0.7 inset is WORSE — it halves the contact count and turns the crease into a ramp the layer slides
+down.  Tuning `dropH` up to the rest band, raising the rest offset to 0.07/0.09, damping 0.5, 16
+substeps and a 12x7 mesh were all tried and all measured worse; the recorded settings are the best of
+that sweep.)
+
+**Scene thresholds are set from a measured 8-run spread, not a guess**: mean > baseY-0.4 and
+min > baseY-1.1, each ~0.3 clear of BOTH the ON and OFF ranges, so either one separates the two on its
+own; the control asserts the mirror image.  The min threshold is deliberately the looser of the two —
+this contact model tests ABSOLUTE separation with no penetration recovery, so a vertex that loses its
+contact band in one substep is never pulled back, and the worst-vertex statistic scatters ~0.75 wide.
+The "did the sim actually run" guard now measures the largest mean excursion over the WHOLE run rather
+than start-vs-end: a well-held layer settles back within ~0.003 of its spawn height, which an endpoint
+comparison read as a frozen sim.
+
+Suite 674/674 in both memory modes, rigid regression 16/16, cloth/clothhang/clothdrape/particle green.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

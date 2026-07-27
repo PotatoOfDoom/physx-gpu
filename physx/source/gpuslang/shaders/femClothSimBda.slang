@@ -51,21 +51,12 @@
 //     keeps a subgroup op off the llvmpipe predictor entirely (matching the recipe
 //     guard).  maxMagVelSq (fed only by that branch) is likewise dropped.
 //   - the globalThreadIndex==0 bookkeeping writes the PxU32 VT/EE contact-count
-//     resets (4-byte, faithful) but ELIDES the `*updateContactPairs = !isTGS`
-//     PxU8 store: the buffer is exactly sizeof(PxU8) (PxgFEMClothCore.cpp:93) so a
-//     4-byte word store would overrun it, and a byte store would require 8-bit
-//     storage on llvmpipe.  No MAPPED kernel consumes updateContactPairs on the
-//     free-fall path (only the un-ported collision-pair-update path does), so the
-//     elision is unobservable.
-//   - finalize's two-level warp `__any_sync` block-any lowers to a single
-//     groupshared InterlockedOr (a block-wide OR — semantically identical), and its
-//     device atomicOr on mIsActive is a BDA InterlockedOr on the descriptor field.
-//   - sleeping's `__ballot_sync` lowers to a groupshared InterlockedOr ballot
-//     (fcMidphase.slang / npBv32.slang precedent), and the CUDA early-return +
-//     __syncthreads (UB when the block is partly filled — our scene has 1 active
-//     cloth in a 1024-thread block) is restructured to an `if (gid < n)` guard so
-//     ALL threads reach both barriers (llvmpipe requires uniform barrier control
-//     flow).
+//     resets (4-byte, faithful) AND the `*updateContactPairs = !isTGS` gate.  That
+//     gate store was elided by the original P7.0 port (nothing mapped read it then);
+//     P7.2 tranche 3b restored it, because every self-collision kernel early-outs on
+//     it.  It is a 4-byte store, not the CUDA PxU8 (no 8-bit storage on llvmpipe) —
+//     safe because the engine clears the same buffer with memsetD32Async and every
+//     consumer reads `word & 0xFF`.
 
 import pxgSlangFEMClothDesc;
 
@@ -136,13 +127,24 @@ void cloth_preIntegrateLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 grou
         if (groupId.y == 0u)
         {
             // Reset cloth contact counts if adaptive updates are not used (4-byte
-            // PxU32 stores — faithful).  The `*updateContactPairs = !isTGS` PxU8
-            // store is elided (see header): no mapped kernel consumes it.
+            // PxU32 stores — faithful).
             if (!adaptiveCollisionPairUpdate)
             {
                 (Ptr<uint>(gPre.VTContactCounts))[0] = 0u;
                 (Ptr<uint>(gPre.EEContactCounts))[0] = 0u;
             }
+
+            // For TGS, updateContactPairs is updated in "cloth_stepLaunch".
+            // P7.2 tranche 3b: this store was ELIDED by the P7.0 port because no mapped
+            // kernel consumed it back then.  It is now the GATE every self-collision
+            // kernel reads first (cloth_selfCollisionMidphase{VT,EE}, cloth_refitBound,
+            // cloth_clothContactPrepare all early-out on `*updateContactPairs == 0`), so
+            // eliding it silently disabled the entire self-collision arc.  Written as a
+            // 4-byte store rather than the CUDA PxU8 (8-bit storage is not available on
+            // llvmpipe): the engine itself clears this buffer with memsetD32Async
+            // (PxgFEMClothCore.cpp:1397), and every consumer reads it as `word & 0xFF`,
+            // so the whole word is ours to own and the observable low byte is identical.
+            (Ptr<uint>(gPre.updateContactPairs))[0] = isTGS ? 0u : 1u;
         }
     }
 
