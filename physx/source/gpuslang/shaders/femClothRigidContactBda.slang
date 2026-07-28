@@ -84,8 +84,11 @@
 //     frictionless (zero dynamicFriction) rigid+cloth material — the drape target.  The
 //     material-strided friction read (PxsMaterialData::dynamicFriction / cloth
 //     mDynamicFrictions) is a follow-on tranche;
-//   - cloth.mDeltaPos accumulation: the CUDA atomicAdd(&mDeltaPos[v].w, 1) (query) and
-//     atomicAdd(&mDeltaPos[v].x/.y/.z, dP) (solve writeCloth) are emitted as plain
+//   - cloth.mDeltaPos accumulation uses REAL atomics (pxgSlangAtomicFloat), matching the
+//     CUDA atomicAdd(&mDeltaPos[v].w, 1) (query) and atomicAdd(&mDeltaPos[v].x/.y/.z, dP)
+//     (solve writeCloth).  A cloth TRIANGLE contact bumps all three of its vertices and
+//     adjacent triangles share vertices by construction, so contention here is not an
+//     edge case -- it is the normal case.  Previously plain
 //     load-add-store.  For the single-contact unit test (and any contact set with no two
 //     contacts sharing a cloth vertex within one pass) there is no cross-thread
 //     contention, so the read-modify-write is bit-identical to the atomic — same
@@ -100,6 +103,7 @@
 // otherwise, breaking bitwise parity with the -ffp-contract=off reference (same reasoning
 // as psContactSolveTgsBda).
 
+import pxgSlangAtomicFloat;   // atomicAdd(float*) parity — see that module
 import pxgSlangFEMClothDesc;   // PxgFEMClothGpu
 import pxgSlangPrepDesc;       // PxgPrePrepDescGpu, PxgConstraintPrepareDescGpu
 import pxgSlangSolverDesc;     // PxgSolverCoreDescGpu, PxgSolverSharedDescPGSGpu, PxgSolverSharedDescTGSGpu
@@ -733,22 +737,22 @@ void queryRigidClothContactReferenceCount(bool isTGS, uint idx, uint blockX)
                     const uint4 triVertId = Ptr<uint4>(femClothes[clothId].mTriangleVertexIndices)[elementId];
                     if (bc.x > 1e-3f && deformableInvMasses.x != 0.0f)
                     {
-                        float4 d = mDeltaPos[triVertId.x]; d.w += 1.0f; mDeltaPos[triVertId.x] = d;
+                        pxgAtomicAddF4W(femClothes[clothId].mDeltaPos, triVertId.x, 1.0f);
                     }
                     if (bc.y > 1e-3f && deformableInvMasses.y != 0.0f)
                     {
-                        float4 d = mDeltaPos[triVertId.y]; d.w += 1.0f; mDeltaPos[triVertId.y] = d;
+                        pxgAtomicAddF4W(femClothes[clothId].mDeltaPos, triVertId.y, 1.0f);
                     }
                     if (bc.z > 1e-3f && deformableInvMasses.z != 0.0f)
                     {
-                        float4 d = mDeltaPos[triVertId.z]; d.w += 1.0f; mDeltaPos[triVertId.z] = d;
+                        pxgAtomicAddF4W(femClothes[clothId].mDeltaPos, triVertId.z, 1.0f);
                     }
                 }
                 else  // Cloth vertex: bump the single vertex's reference count.
                 {
                     if (deformableInvMasses.x != 0.0f)
                     {
-                        float4 d = mDeltaPos[elementId]; d.w += 1.0f; mDeltaPos[elementId] = d;
+                        pxgAtomicAddF4W(femClothes[clothId].mDeltaPos, elementId, 1.0f);
                     }
                 }
 
@@ -861,11 +865,7 @@ void solveRigidClothContact(bool isTGS, uint idx, uint blockX)
                         if (invMArr[it] > 0.0f)
                         {
                             const float s = invMArr[it] * bcArr[it];
-                            float4 d = mDeltaPos[triArr[it]];
-                            d.x += deltaPos.x * s;
-                            d.y += deltaPos.y * s;
-                            d.z += deltaPos.z * s;
-                            mDeltaPos[triArr[it]] = d;
+                            pxgAtomicAddF4XYZ(femClothes[clothId].mDeltaPos, triArr[it], deltaPos * s);
                         }
                     }
                 }
@@ -874,11 +874,7 @@ void solveRigidClothContact(bool isTGS, uint idx, uint blockX)
                     if (deformableInvMasses.x > 0.0f)
                     {
                         const float s = deformableInvMasses.x;
-                        float4 d = mDeltaPos[elementId];
-                        d.x += deltaPos.x * s;
-                        d.y += deltaPos.y * s;
-                        d.z += deltaPos.z * s;
-                        mDeltaPos[elementId] = d;
+                        pxgAtomicAddF4XYZ(femClothes[clothId].mDeltaPos, elementId, deltaPos * s);
                     }
                 }
 

@@ -81,14 +81,12 @@
 //
 // DEVIATIONS from the CUDA original (recipe policy; each preserves the constraint
 // semantics for a cloth self-contact and is exercised bit-exact by testFemClothSim.cpp):
-//   - cloth.mDeltaPos accumulation: the CUDA atomicAdd(&mDeltaPos[v].w, coeff) (count) and
-//     atomicAdd(&mDeltaPos[v].x/.y/.z, dx) (solve) are emitted as plain load-add-store.
-//     Within a single self-contact the four touched cloth vertices are DISTINCT (VT: the
-//     vertex + the triangle's three vertices; EE: edge0's two + edge1's two), so a single
-//     contact has NO intra-contact aliasing, and a contact set with no two contacts sharing
-//     a cloth vertex within one pass has no cross-thread contention — the read-modify-write
-//     is then bit-identical to the atomic (the femClothRigidContactBda::applyClothDelta /
-//     particle one-way-solve precedent, exercised by the single-self-contact unit tests);
+//   - cloth.mDeltaPos accumulation uses REAL atomics (pxgSlangAtomicFloat), exactly as
+//     the CUDA atomicAdd(&mDeltaPos[v].w, coeff) / atomicAdd(&mDeltaPos[v].x/.y/.z, dx).
+//     This was previously a plain load-add-store, justified by "a single self-contact
+//     touches four DISTINCT vertices".  That is true PER CONTACT and says nothing about
+//     ACROSS contacts, which is where the contention is: in a folded cloth a vertex takes
+//     part in many self-contacts at once.  Measured consequence, see pxgSlangAtomicFloat;
 //   - the PxgFemFemContactInfo reference writes (markValid in the prepare, markInCollision
 //     in the count) touch ONLY the 4-byte auxInd word (@12).  In CUDA the prepare copies
 //     the struct, flips a bit, and writes the whole 16 bytes back (pairInd0/pairInd1
@@ -118,6 +116,7 @@
 // (pure mul/add/sub/div/sqrt/min/max/abs) — this tranche is FULLY bit-exact, no tolerance
 // seam in scope.
 
+import pxgSlangAtomicFloat;   // atomicAdd(float*) parity — see that module
 import pxgSlangFEMClothDesc;   // PxgFEMClothGpu (mPosition_InvMass@16, mDeltaPos@248, ...)
 
 // PxgSoftBodyKernelBlockDim/GridDim::SB_UPDATEROTATION (PxgSoftBodyCoreKernelIndices.h:42/59)
@@ -446,20 +445,17 @@ bool triangleCollisionConstraint(out float3 dx0, out float3 dx1, out float3 dx2,
     return true;
 }
 
-// mDeltaPos accumulators (plain load-add-store RMW — see header).
+// mDeltaPos accumulators — REAL atomics (pxgSlangAtomicFloat), matching the CUDA
+// atomicAdd.  These used to be a plain load-add-store on the argument that a single
+// contact touches four DISTINCT vertices; that is true per contact and irrelevant
+// across contacts, which is where the contention actually is.  See the module header.
 void deltaBumpW(uint64_t deltaBase, uint vertIdx, float coeff)
 {
-    float4 d = Ptr<float4>(deltaBase)[vertIdx];
-    d.w = d.w + coeff;
-    Ptr<float4>(deltaBase)[vertIdx] = d;
+    pxgAtomicAddF4W(deltaBase, vertIdx, coeff);
 }
 void deltaAddXYZ(uint64_t deltaBase, uint vertIdx, float3 dx)
 {
-    float4 d = Ptr<float4>(deltaBase)[vertIdx];
-    d.x = d.x + dx.x;
-    d.y = d.y + dx.y;
-    d.z = d.z + dx.z;
-    Ptr<float4>(deltaBase)[vertIdx] = d;
+    pxgAtomicAddF4XYZ(deltaBase, vertIdx, dx);
 }
 
 // applyContactDelta (FEMClothExternalSolve.cu:605) — the shared VT/EE scatter.  Per

@@ -1224,6 +1224,100 @@ relaxation shifts its centroid ~0.018.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, cloth / clothhang / clothdrape /
 clothselfcollide / particle green.
 
+## P8.1 — the cloth delta accumulators get REAL atomics (and a confirmed, unfixed grid defect)
+
+Three cloth shaders accumulated `mDeltaPos` with a plain load-add-store where CUDA uses
+`atomicAdd`. Each carried the same written justification:
+
+> *"a contact set with no two contacts sharing a cloth vertex within one pass has no
+> cross-thread contention — the read-modify-write is then bit-identical to the atomic"*
+
+**That condition never holds.** A cloth TRIANGLE contact bumps all three of its vertices and
+adjacent triangles share vertices by construction; a folded cloth's self-collision has many
+contacts per vertex. Under contention the RMW drops updates — and because `mDeltaPos.w` is the
+DIVISOR `applyExternalDeltas` mass-averages with (`scale = 1/max(w,1)`), a lost count update
+desynchronises the accumulated `.xyz` from its own divisor. The correction is then applied with
+the wrong weight, which presents as an unstable or under-responsive solve rather than as a lost
+write.
+
+| file | site |
+|---|---|
+| `femClothClothContactBda.slang` | `deltaBumpW` / `deltaAddXYZ` (self-contact) |
+| `femClothRigidContactBda.slang` | the query `.w` bumps (4) + the solve `.xyz` scatters (2) |
+| `femClothRigidAttachBda.slang` | `applyClothDelta` |
+
+`solverTGS.slang:2443` was checked and is NOT an instance — it already runs a proper CAS loop,
+and its non-atomic pre-test mirrors the `.cu` exactly.
+
+New module `pxgSlangAtomicFloat.slang`. Slang's `InterlockedAdd` on a `Ptr<float>` emits
+`OpAtomicFAddEXT` (capability `AtomicFloat32AddEXT`, extension
+`SPV_EXT_shader_atomic_float_add`); the bridge now enables `VK_EXT_shader_atomic_float` +
+`shaderBufferFloat32AtomicAdd` where the device advertises them — llvmpipe does. Note that
+`VkDeviceCreateInfo` previously enabled **no device extensions at all**, so this adds the
+`ppEnabledExtensionNames` path as well, gated on `vkEnumerateDeviceExtensionProperties`.
+
+### What it bought
+
+The determinism the P7.2 tranche documented as inherent — *"the ON path is genuinely
+NON-deterministic (the contact-slot atomics and the mDeltaPos accumulation are
+order-dependent)"* — was mostly this bug. `clothselfcollide`, self-collision ON:
+
+| | mean spread | min spread |
+|---|---|---|
+| before (non-atomic) | 4.971 – 5.199 (**0.23**) | 4.199 – 4.943 (**0.74**) |
+| after (atomic) | 5.045 – 5.050 (**0.006**) | 4.597 – 4.622 (**0.025**) |
+
+Float addition is still not associative, so an atomic accumulation remains order-dependent and
+not bit-reproducible — but that is parity with CUDA's `atomicAdd`, not a regression. What
+disappeared is the 30x wider spread that came from dropping writes outright.
+
+### The grid defect: CONFIRMED, and deliberately NOT fixed yet
+
+While reading the launch site for the softbody midphase, the same launch shape turned up a
+separate, real defect in `femClothSelfCollisionBda`:
+
+- the engine packs `MIDPHASE_WARPS_PER_BLOCK = 2` warps per block and launches
+  `ceil(N / 2)` blocks (`PxgFEMClothCore.cpp:714`);
+- the Vulkan bridge **drops `blockDim`** and passes only `gridDim` through
+  (`PxgVulkanCudaContext.cpp:293`);
+- the shader is `[numthreads(32,1,1)]` and indexes `globalWarpIdx = gid.x`.
+
+So it covers only the first half of the cloth vertices (VT) and of the
+triangles-with-active-edges (EE). That is arithmetic, not conjecture: `mMaxNbClothVerts` is the
+plain vertex count (`PxgSimulationCore.cpp:1959`).
+
+A tree-wide sweep for this class found **no other instance**: `sb_refitBoundLaunch` /
+`cloth_refitBoundLaunch` are correct (`numBlocks == nbActiveBodies`, so `gid.x` IS the body
+index), `convexConvexNphase_stage2Kernel` is correct (`GJK_EPA_WARPS_PER_BLOCK == 1`), and the
+PGS/TGS solver kernels index flat off their descriptors and are covered by the 16/16 rigid
+regression.
+
+The fix (a group-uniform serial loop over the block's warps, keeping one group per warp so the
+traversal barriers stay uniform) was written and **verified correct**: contacts go VT 76 → 152
+and EE 34 → 70, exactly the missing half, and the VT unit test re-dispatched at the engine's own
+`ceil(N/2)` grid still asserts `gCount == 1`, which rules out duplication.
+
+**But with the correct contact set the scene gets markedly worse** — the upper layer falls to
+mean 4.066 / min 3.226, against 5.047 with half coverage and 3.985 with self-collision off. With
+the atomics in place this is now reproducible to four decimals, so it is a real effect and not
+race noise. The prepare and solve kernels were checked and use a fixed grid-stride grid, so
+there is no second mismatch feeding a divisor/numerator desync.
+
+**The cause is not yet understood, so the fix is withheld rather than landed.** Turning a green
+money shot red on a theory is the exact mistake the tranche-6 write-up records; the next step is
+to instrument per-vertex `mDeltaPos.w` and `.xyz` across the two coverage regimes rather than to
+keep reasoning about it.
+
+### A structural gap in the verification protocol
+
+The unit tests **choose their own dispatch grid**, so they cannot catch an engine-grid mismatch
+by construction — the self-collision test dispatches `gridX = numVerts`, a grid the engine never
+issues, which is precisely what made the buggy indexing look correct. Any test for a kernel whose
+engine launch packs warps per block has to mirror the engine's grid formula, not a convenient one.
+
+Suite **674/674 in both memory modes**, rigid regression **16/16**, cloth / clothhang /
+clothdrape / clothselfcollide / particle / softbody green.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

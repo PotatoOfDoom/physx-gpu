@@ -214,9 +214,34 @@ public:
         // Query core + extended features so the Phase-2 runtime profile
         // (RUNTIME_PLAN.md section 1) can be enabled where offered; everything
         // is guarded so reduced devices still create successfully.
+        // VK_EXT_shader_atomic_float: OpAtomicFAddEXT on a buffer-device-address
+        // float.  This is what CUDA's atomicAdd(float*) lowers to, and several
+        // deformable kernels genuinely need it -- their contact solves accumulate
+        // per-vertex position deltas from contacts that DO share vertices, so a
+        // plain read-modify-write silently loses updates under contention.
+        // Enabling the extension is gated on the device advertising it; shaders
+        // that emit OpAtomicFAddEXT will fail pipeline creation without it, so the
+        // capability is recorded and reported rather than silently assumed.
+        bool atomicFloatExtPresent = false;
+        {
+            uint32_t extCount = 0;
+            vkEnumerateDeviceExtensionProperties(mPhysicalDevice, nullptr, &extCount, nullptr);
+            std::vector<VkExtensionProperties> exts(extCount);
+            if (extCount)
+                vkEnumerateDeviceExtensionProperties(mPhysicalDevice, nullptr, &extCount, exts.data());
+            for (const VkExtensionProperties& e : exts)
+                if (std::strcmp(e.extensionName, VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME) == 0)
+                    atomicFloatExtPresent = true;
+        }
+
+        VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomicFloatSupported = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT
+        };
         VkPhysicalDeviceSubgroupSizeControlFeatures sgSizeSupported = {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES
         };
+        if (atomicFloatExtPresent)
+            sgSizeSupported.pNext = &atomicFloatSupported;
         VkPhysicalDeviceVulkan12Features supported12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
         supported12.pNext = &sgSizeSupported;
         VkPhysicalDeviceFeatures2 supported2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
@@ -250,8 +275,18 @@ public:
         enabledSgSize.subgroupSizeControl = sgSizeSupported.subgroupSizeControl;
         enabledSgSize.computeFullSubgroups = sgSizeSupported.computeFullSubgroups;
 
+        VkPhysicalDeviceShaderAtomicFloatFeaturesEXT enabledAtomicFloat = {
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT
+        };
+        enabledAtomicFloat.shaderBufferFloat32AtomicAdd = atomicFloatSupported.shaderBufferFloat32AtomicAdd;
+        enabledAtomicFloat.shaderBufferFloat32Atomics = atomicFloatSupported.shaderBufferFloat32Atomics;
+        mHasShaderBufferFloat32AtomicAdd =
+            atomicFloatExtPresent && atomicFloatSupported.shaderBufferFloat32AtomicAdd == VK_TRUE;
+
         enabled2.pNext = &enabled12;
         enabled12.pNext = &enabledSgSize;
+        if (mHasShaderBufferFloat32AtomicAdd)
+            enabledSgSize.pNext = &enabledAtomicFloat;
 
         VkPhysicalDeviceSubgroupSizeControlProperties sgSizeProps = {
             VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES
@@ -268,10 +303,16 @@ public:
                                        (sgSizeProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
         mSubgroupCaps.fullSubgroups = enabledSgSize.computeFullSubgroups == VK_TRUE;
 
+        std::vector<const char*> deviceExts;
+        if (mHasShaderBufferFloat32AtomicAdd)
+            deviceExts.push_back(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
+
         VkDeviceCreateInfo deviceInfo = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
         deviceInfo.queueCreateInfoCount = 1;
         deviceInfo.pQueueCreateInfos = &queueInfo;
         deviceInfo.pNext = &enabled2;
+        deviceInfo.enabledExtensionCount = uint32_t(deviceExts.size());
+        deviceInfo.ppEnabledExtensionNames = deviceExts.empty() ? nullptr : deviceExts.data();
 
         if (vkCreateDevice(mPhysicalDevice, &deviceInfo, nullptr, &mDevice) != VK_SUCCESS)
             return false;
@@ -1437,6 +1478,9 @@ private:
     bool mRecording = false;
     bool mHasShaderInt64 = false;
     bool mHasBufferDeviceAddress = false;
+    // VK_EXT_shader_atomic_float / shaderBufferFloat32AtomicAdd.  Kernels that
+    // transcribe CUDA's atomicAdd(float*) emit OpAtomicFAddEXT and require it.
+    bool mHasShaderBufferFloat32AtomicAdd = false;
     SubgroupCaps mSubgroupCaps;
 
     std::string mDeviceName;

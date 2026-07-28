@@ -93,6 +93,7 @@
 // velError / tgsError sums feed the compared deltaImpulse — either would fuse to
 // FMAs otherwise, breaking bitwise parity with the -ffp-contract=off reference.
 
+import pxgSlangAtomicFloat;   // atomicAdd(float*) parity — see that module
 import pxgSlangFEMClothDesc;   // PxgFEMClothGpu
 import pxgSlangPrepDesc;       // PxgPrePrepDescGpu, PxgConstraintPrepareDescGpu
 import pxgSlangSolverDesc;     // PxgSolverCoreDescGpu, PxgSolverSharedDescPGSGpu, PxgSolverSharedDescTGSGpu
@@ -407,19 +408,14 @@ void cloth_rigidAttachmentPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, 
 }
 
 // ---------------------------------------------------------------------------
-// The cloth-side attachment scatter (both solves): the CUDA AtomicAdd emitted as a
-// plain read-modify-write (see header).  Vertex attachment only (the world-anchor
+// The cloth-side attachment scatter (both solves): the CUDA AtomicAdd, as a REAL
+// atomic (pxgSlangAtomicFloat).  Vertex attachment only (the world-anchor
 // pin); the triangle-barycentric scatter follows the same shape.
 // ---------------------------------------------------------------------------
 void applyClothDelta(uint64_t deltaPosBase, uint elemIdx, float3 deltaPos, float w)
 {
-    Ptr<float4> deltaPosBuf = Ptr<float4>(deltaPosBase);
-    float4 dp = deltaPosBuf[elemIdx];
-    dp.x += deltaPos.x * w;
-    dp.y += deltaPos.y * w;
-    dp.z += deltaPos.z * w;
-    dp.w += 1.0f;
-    deltaPosBuf[elemIdx] = dp;
+    pxgAtomicAddF4XYZ(deltaPosBase, elemIdx, deltaPos * w);
+    pxgAtomicAddF4W(deltaPosBase, elemIdx, 1.0f);
 }
 
 // ===========================================================================
