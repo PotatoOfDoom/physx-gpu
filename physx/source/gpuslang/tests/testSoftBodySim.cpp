@@ -2023,29 +2023,58 @@ static void runSolveTetraPartition(uint32_t materialModel, bool isTGS, float dam
     const auto gVel = downloadBuffer<F4>(dev, bCpVel.h, cpVel.size());
     const auto gMult = downloadBuffer<uint32_t>(dev, bMult.h, mult.size());
 
+    // TOLERANCE SEAM, inherited — not from the constitutive maths, which is pure
+    // mul/add/sub/div/cross/dot plus one PxSqrt and would be bit-exact on its own, but
+    // from the rotation refresh: computeGMTetrahedronRotations -> extractRotation ->
+    // PxQuat(w, omega) -> sin/cos (the tranche-5 seam).  Every solve term is a function of
+    // that quaternion, so a last-bit difference in it shows up in the emitted positions and
+    // velocities.  The case seeds the rotation at an already-converged unit quaternion and
+    // uses isFirstIteration = false (4 iterations) to keep the amplification small; what
+    // remains is budgeted from measurement, exactly as in tranche 5.
     size_t mm = 0;
+    uint32_t worstUlp = 0;
+    double worstRel = 0.0;
+    auto cmpSoft = [&](const char* what, uint32_t i, const F4& r, const F4& g) {
+        const float rc[4] = { r.x, r.y, r.z, r.w };
+        const float gc[4] = { g.x, g.y, g.z, g.w };
+        for (int e = 0; e < 4; ++e)
+        {
+            const uint32_t u = p80rot::ulpDist(rc[e], gc[e]);
+            if (u > worstUlp) worstUlp = u;
+            const double denom = std::fmax(1.0e-6, std::fabs(double(rc[e])));
+            const double rel = std::fabs(double(rc[e]) - gc[e]) / denom;
+            if (rel > worstRel) worstRel = rel;
+            // Budget from measurement across the five cases: 10-248 ULP / up to 2.24e-5
+            // relative, the damped co-rotational case being the widest (its denominator
+            // carries `1 + damping*dtInv` and a scaledDamping*velocity term, both of which
+            // amplify a last-bit rotation difference).  4096 ULP with a 1e-3 relative cap
+            // sits ~15x above that and ~100x below what a real maths error produces.
+            if (u > 4096u && rel > 1.0e-3)
+            { ++mm; std::printf("  %s[%u].%d beyond budget: ref %.9g got %.9g (%u ULP, rel %.3e)\n",
+                                what, i, e, rc[e], gc[e], u, rel); }
+        }
+    };
     for (uint32_t i = 0; i < uint32_t(cpPos.size()); ++i)
     {
-        if (f2u(refCpPos[i].x) != f2u(gPos[i].x) || f2u(refCpPos[i].y) != f2u(gPos[i].y) ||
-            f2u(refCpPos[i].z) != f2u(gPos[i].z) || f2u(refCpPos[i].w) != f2u(gPos[i].w))
-        { ++mm; std::printf("  cpPos[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", i,
-                            refCpPos[i].x, refCpPos[i].y, refCpPos[i].z, refCpPos[i].w,
-                            gPos[i].x, gPos[i].y, gPos[i].z, gPos[i].w); }
-        if (f2u(refCpVel[i].x) != f2u(gVel[i].x) || f2u(refCpVel[i].y) != f2u(gVel[i].y) ||
-            f2u(refCpVel[i].z) != f2u(gVel[i].z) || f2u(refCpVel[i].w) != f2u(gVel[i].w))
-        { ++mm; std::printf("  cpVel[%u] MM: ref(%g,%g,%g) got(%g,%g,%g)\n", i,
-                            refCpVel[i].x, refCpVel[i].y, refCpVel[i].z, gVel[i].x, gVel[i].y, gVel[i].z); }
+        cmpSoft("cpPos", i, refCpPos[i], gPos[i]);
+        cmpSoft("cpVel", i, refCpVel[i], gVel[i]);
     }
+    std::printf("  [seam] solveTetraPartition(model %u, %s): worst %u ULP, worst relative %.3e\n",
+                materialModel, isTGS ? "TGS" : "PGS", worstUlp, worstRel);
     // The PGS multiplier accumulation must be written back (and must NOT be under TGS).
     for (uint32_t t = 0; t < nbTets; ++t)
         for (uint32_t e = 0; e < 2u; ++e)
         {
             const float want = isTGS ? ((e == 0) ? 0.013f*float(t+1) : -0.007f*float(t+1)) : refMbyz[t*2+e];
             const uint32_t gotW = gMult[SPATIAL_BLOCK_MBYZ_WORD + t*2 + e];
-            if (gotW != f2u(want))
-            { ++mm; std::printf("  multiplier[%u][%u] MM: ref %g got %g\n", t, e, want, u2f(gotW)); }
+            const uint32_t u = p80rot::ulpDist(want, u2f(gotW));
+            if (u > worstUlp) worstUlp = u;
+            const double mrel = std::fabs(double(want) - u2f(gotW)) / std::fmax(1.0e-6, std::fabs(double(want)));
+            if (u > 4096u && mrel > 1.0e-3)
+            { ++mm; std::printf("  multiplier[%u][%u] beyond budget: ref %.9g got %.9g (%u ULP)\n",
+                                t, e, want, u2f(gotW), u); }
         }
-    PXG_CHECK_MSG(mm == 0, "sb_gm_cp_solveTetrahedronsPartitionLaunch bit-exact vs CPU (%zu mismatches)", mm);
+    PXG_CHECK_MSG(mm == 0, "sb_gm_cp_solveTetrahedronsPartitionLaunch within the documented sin/cos budget vs CPU (%zu outliers)", mm);
 
     // The solve must have DONE something: at least one position must have moved.
     size_t moved = 0;
@@ -2060,18 +2089,11 @@ static void runSolveTetraPartition(uint32_t materialModel, bool isTGS, float dam
     dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
 }
 
-// NOT REGISTERED — see the P8.0 tranche 6 section of RUNTIME_STATUS.md.  The kernel and
-// this driver are complete and the SPIR-V validates, but llvmpipe SIGSEGVs in its JIT
-// worker the moment the computed delta is non-zero, so registering these would take the
-// suite red on a DRIVER fault rather than a port defect.  The bisection that pinned the
-// trigger, and everything it ruled out, is recorded in RUNTIME_STATUS.md; re-enable these
-// five lines to pick the investigation back up.
-//   PXG_TEST(softBodySimSolveCorotationalPGS) { runSolveTetraPartition(0u, false, 0.0f); }
-//   PXG_TEST(softBodySimSolveCorotationalDamped) { runSolveTetraPartition(0u, false, 0.35f); }
-//   PXG_TEST(softBodySimSolveCorotationalTGS) { runSolveTetraPartition(0u, true, 0.0f); }
-//   PXG_TEST(softBodySimSolveNeoHookeanPGS) { runSolveTetraPartition(1u, false, 0.0f); }
-//   PXG_TEST(softBodySimSolveNeoHookeanTGS) { runSolveTetraPartition(1u, true, 0.0f); }
-static void (*sbKeepSolveDriverReferenced)(uint32_t, bool, float) = &runSolveTetraPartition;
+PXG_TEST(softBodySimSolveCorotationalPGS) { runSolveTetraPartition(0u, /*isTGS*/ false, /*damping*/ 0.0f); }
+PXG_TEST(softBodySimSolveCorotationalDamped) { runSolveTetraPartition(0u, /*isTGS*/ false, /*damping*/ 0.35f); }
+PXG_TEST(softBodySimSolveCorotationalTGS) { runSolveTetraPartition(0u, /*isTGS*/ true, /*damping*/ 0.0f); }
+PXG_TEST(softBodySimSolveNeoHookeanPGS) { runSolveTetraPartition(1u, /*isTGS*/ false, /*damping*/ 0.0f); }
+PXG_TEST(softBodySimSolveNeoHookeanTGS) { runSolveTetraPartition(1u, /*isTGS*/ true, /*damping*/ 0.0f); }
 
 // MINIMAL REPRO, NOT REGISTERED.  Dispatch only — no CPU reference, no comparison, no
 // downloads, dummy rest poses.  It still SIGSEGVs, which is what proves the tranche-6

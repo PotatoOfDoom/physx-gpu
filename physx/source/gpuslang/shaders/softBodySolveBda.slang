@@ -943,7 +943,14 @@ void sb_gm_cp_solveTetrahedronsPartitionLaunch(uint3 groupThreadId : SV_GroupThr
             // mOrderedMaterialIndices is a PxU16 array — read the containing 32-bit word.
             const uint64_t matIdxAddr = gSoftbodies[softbodyId].mOrderedMaterialIndices +
                                         uint64_t(workIndex) * 2UL;
-            const uint matWord = Ptr<uint>(matIdxAddr & ~3UL)[0];
+            // NOTE THE `~uint64_t(3)`.  Writing the obvious `matIdxAddr & ~3UL` MISCOMPILES:
+            // Slang evaluates `~3UL` in 32 bits, and the resulting 0xFFFFFFFC is then
+            // zero-extended for the 64-bit AND — which silently clears the TOP HALF of the
+            // device address.  The read then lands at a garbage address and the driver
+            // faults.  Verified in isolation (tools/lvprepro): `& ~3UL` faults, while
+            // `& ~uint64_t(3)`, `& 0xFFFFFFFFFFFFFFFCUL` and
+            // `- (matIdxAddr % 4UL)` all run clean on the same shader and data.
+            const uint matWord = Ptr<uint>(matIdxAddr & ~uint64_t(3))[0];
             // Which half of the word: derive it from the ADDRESS, not from workIndex's
             // parity — that only coincides when the array base is 4-aligned, and nothing
             // in the engine promises that.

@@ -1015,71 +1015,67 @@ budget.  The tolerance sits in a wide, empty gap between the noise floor and the
 Suite 674/674 in both memory modes, rigid regression 16/16, cloth / clothselfcollide / particle green.
 **Softbody now 9 of 56 kernels mapped.**
 
-## P8.0 tranche 6 — the FEM-volume constraint SOLVE: ported, SPIR-V-valid, BLOCKED on an llvmpipe fault
+## P8.0 tranche 6 — the FEM-volume constraint SOLVE lands (and the "driver bug" was mine)
 
 `sb_gm_cp_solveTetrahedronsPartitionLaunch` (softBodyGM.cu:1408) — the core of the softbody solver —
-is fully transcribed in `shaders/softBodySolveBda.slang`, together with its whole device-function
-tree: `tetrahedronsSolveGM` (the material dispatcher), both constitutive branches
-(`tetrahedronsSolveInnerNeoHookean` + `volumeSolve` for eNEO_HOOKEAN, `ARAP_constraint` +
-`volume_constraint` for eCO_ROTATIONAL), and the shared compliance primitives
-(`compute_dCdx`, `compute_deltaLambdaXgradC`).  The bit-exact CPU reference and a five-case driver
-(co-rotational PGS / damped / TGS, neo-Hookean PGS / TGS) are written and in the tree.
+is ported, green and mapped, together with its whole device tree: `tetrahedronsSolveGM` (the material
+dispatcher), both constitutive branches (`tetrahedronsSolveInnerNeoHookean` + `volumeSolve` for
+eNEO_HOOKEAN, `ARAP_constraint` + `volume_constraint` for eCO_ROTATIONAL) and the shared compliance
+primitives (`compute_dCdx`, `compute_deltaLambdaXgradC`).  ABI row `{8,8,4,4,4,1,1,8}` (40-byte blob);
+manifest hand-edited, **MAPPED 219 → 220**.
 
-**It is NOT mapped and its tests are NOT registered**, because it does not run: llvmpipe SIGSEGVs in
-its JIT worker thread. Manifest stays at **219**.  Marking it green would be a lie, and registering
-the cases would take the suite red on a driver fault rather than a port defect.
+### The bug, and why in-harness bisection could not find it
 
-### What the bisection established
+An earlier commit recorded this kernel as blocked on an llvmpipe fault, with a long list of ruled-out
+causes.  **That conclusion was wrong.**  The defect was in the port:
 
-The trigger is remarkably specific: **the kernel runs clean whenever the computed delta is ZERO and
-faults as soon as it is non-zero.**  A `dl` set to a hard-coded non-zero constant — with the entire
-material solve, every matrix multiply and every buffer read removed — reproduces the crash exactly.
-That single observation is what rules out the whole arithmetic surface.
+```slang
+Ptr<uint>(matIdxAddr & ~3UL)[0]     // the mOrderedMaterialIndices PxU16 read
+```
 
-Ruled OUT by direct experiment:
-  - either constitutive branch's contents (each one alone crashes; both stubbed out runs clean);
-  - `ARAP_constraint`, `volume_constraint`, and the `mSimTetraMultipliers` read and write (each
-    removed individually — still crashes);
-  - buffer end-of-region effects (every buffer padded by 64+ elements — still crashes), which is the
-    known llvmpipe load-widening artefact that explained the tranche-3a and tranche-6 test faults;
-  - call-frame width (the helpers were restructured onto an `SbMat33`/`SbTetV` struct, cutting the
-    widest signature from 23 parameters to 12 — still crashes);
-  - dynamically-indexed local arrays (both the gather and the scatter were unrolled so no indexed
-    temporary survives into the SPIR-V — still crashes);
-  - shader size / JIT budget (`extractRotation` cut from 100 iterations to 1 — still crashes);
-  - malformed SPIR-V (`spirv-val` passes).
+**Slang evaluates `~3UL` in 32 bits.**  The resulting `0xFFFFFFFC` is zero-extended for the 64-bit
+AND, silently clearing the TOP HALF of the buffer-device address.  The read lands at a garbage
+address and the driver faults — correctly.  `~uint64_t(3)`, `0xFFFFFFFFFFFFFFFCUL` and
+`- (addr % 4UL)` all run clean on the same shader and data.  The `UL` suffix does not make the
+*complement* 64-bit; this is a trap for any BDA port and is now called out at the site.
 
-Ruled OUT afterwards, and this one matters most: **the fault is GPU-side, not host-side.**  A probe
-case that does nothing but build dummy buffers, dispatch and flush — no CPU reference, no comparison,
-no download — still SIGSEGVs.  That kills the remaining "maybe the test driver is at fault" reading.
-The probe is kept in testSoftBodySim.cpp (unregistered, `softBodySimSolveProbe_DISABLED`) as the
-starting point for a standalone Mesa repro: strip the PhysX descriptor and feed the same push blob
-from a bare Vulkan harness.
+The in-harness bisection had produced a **misleading correlation** — "it faults whenever the computed
+delta is non-zero" — that survived every experiment because it was real but not causal: `material` is
+read only on the path the delta enables, so with the solve stubbed out the bad read is dead code and
+gets optimised away.  Chasing that correlation ruled out the arithmetic, the buffer sizes, the
+signature width, the indexed local arrays and the shader size — all correctly, and all irrelevant.
 
-So: the port matches the CUDA line-for-line, the SPIR-V validates, the fault is inside the driver's
-execution of the shader, and it tracks nothing but "does this shader write a value that differs from
-what it read".  Next step is that standalone repro for Mesa — or a run on a second Vulkan
-implementation, which would settle driver-versus-port immediately.
+### What actually settled it
 
-An adversarial transcription pass over the whole device tree (5 sub-trees, each independently
-refuted) finished after the port was written.  It surfaced no defect in the port: it repeatedly
-confirms the argument ORDER of the ported helpers matches CUDA exactly, that the `SbMat33`/`SbTetV`
-bundling and the unrolled gather/scatter are deliberate documented hardenings, and that the manifest
-slot is correctly left unmapped.  Its own suggestions were written against a pre-port snapshot of the
-file and would have reintroduced the constructs already bisected away.
+`tools/lvprepro/` — a standalone Vulkan harness (no PhysX, no descriptor sets, no test framework)
+that dispatches a real compiled `.spv` against synthetic data, building the `PxgSoftBody` descriptor
+by raw byte offset.  The same shader faulted the same way there, which removed PhysX from the
+picture; two substitutions on the masking expression then isolated the cause exactly.  The harness
+and its README are kept, because "shader bug or driver bug?" recurs and the suite cannot answer it.
 
-### What IS confirmed correct along the way
+**Lesson recorded for the next tranche:** a correlation that survives many experiments is not a
+cause.  Once the in-harness search space was exhausted, the right move was to leave the harness — not
+to keep subdividing inside it.
 
-The transcription itself was checked against the CUDA by an adversarial pass per sub-tree, and the
-structural facts it depends on are verified: the ABI row `{8,8,4,4,4,1,1,8}` (40-byte blob, the two
-bools at @28/@29 and the trailing pointer realigned to @32), the `PxsDeformableVolumeMaterialData`
-layout (32-byte stride, `dampingScale`/`materialModel` sharing the word at @16), the `PULL_IND_MASK`
-gather scheme, and the degenerate-rest-pose guard at softBodyGM.cu:1123 (the solve is skipped but the
-scatter still runs with a zero delta).  One hardening beyond the source: the `mOrderedMaterialIndices`
-PxU16 read derives its half-word from the ADDRESS rather than from `workIndex` parity, which only
-coincide when the array base happens to be 4-aligned.
+### Verification
 
-Suite 674/674 in both memory modes, rigid regression 16/16 — unchanged, because nothing was mapped.
+5 cases (co-rotational PGS / damped / TGS, neo-Hookean PGS / TGS) against a full CPU transcription of
+the device tree.  **A tolerance seam is inherited** — not from the constitutive maths, which is
+mul/add/sub/div/cross/dot plus one `PxSqrt` and would be bit-exact alone, but from the rotation
+refresh (`computeGMTetrahedronRotations` → `extractRotation` → `PxQuat(w, omega)` → sin/cos, the
+tranche-5 seam).  Every solve term is a function of that quaternion.  Measured across the five cases:
+**10-248 ULP, up to 2.24e-5 relative**, the damped co-rotational case widest (its denominator carries
+`1 + damping*dtInv` and a `scaledDamping*velocity` term, both of which amplify a last-bit rotation
+difference).  Budget: 4096 ULP AND 1e-3 relative, ~15x above the measurement.
+
+**The seam does not cost the test its teeth.**  5 mutants — ARAP sign flip (F-R → R-F), neo-Hookean
+C offset 3 → 2, `alphaTilde0` missing its `2*mu`, the `dCdx` transpose dropped, and lambda assigned
+instead of accumulated — land at **relative 0.26 to 217**, i.e. 12000x to 10000000x above the budget.
+The tolerance sits in a vast empty gap.
+
+Suite 674/674 in both memory modes, rigid regression 16/16, cloth / clothselfcollide / particle green.
+**Softbody now 10 of 56 kernels mapped**, and the FEM-volume solve — the piece everything else in the
+softbody arc was waiting on — is live.
 
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 

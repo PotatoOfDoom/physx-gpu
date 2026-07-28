@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 219;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 220;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -307,7 +307,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_solveOutputSCDeltaVLaunch", nullptr, nullptr },  // SB_SOLVE_SOFT_CLOTH_BOTH_DELTA (unmapped)
     { "sb_solveOutputSPDeltaVLaunch", nullptr, nullptr },  // SB_SOLVE_PARTICLE_SOFT_DELTA (unmapped)
     { "sb_solveOutputParticleDeltaVLaunch", nullptr, nullptr },  // SB_SOLVE_PARTICLE_PARTICLE_DELTA (unmapped)
-    { "sb_gm_cp_solveTetrahedronsPartitionLaunch", nullptr, nullptr },  // SB_GM_CP_SOLVE_TETRA (P8.0 tranche 6 WIP: ported + SPIR-V-valid, but llvmpipe SIGSEGVs it — see RUNTIME_STATUS.md)
+    { "sb_gm_cp_solveTetrahedronsPartitionLaunch", "softBodySolveBda.spv", "sb_gm_cp_solveTetrahedronsPartitionLaunch" },  // SB_GM_CP_SOLVE_TETRA (P8.0 tranche 6 BDA port)
     { "sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch", nullptr, nullptr },  // SB_GM_CP_SOLVE_TETRA_JACOBI_PARTITION (unmapped)
     { "sb_gm_updateTetModelVertsLaunch", nullptr, nullptr },  // SB_GM_UPDATETETMODELVERTS (unmapped)
     { "sb_gm_zeroTetMultipliers", "softBodySolveBda.spv", "sb_gm_zeroTetMultipliers" },  // SB_GM_ZERO_TETMULTIPLIERS (P8.0 tranche 4 BDA port)
