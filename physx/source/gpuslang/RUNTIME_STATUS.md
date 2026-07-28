@@ -947,6 +947,74 @@ particle green.  **Softbody now 7 of 56 kernels mapped.**  Remaining in the solv
 `sb_updateTetrahedraRotationsLaunch` (the APD / `extractRotation` polar decomposition — the first
 softbody kernel with a genuine transcendental seam), then softbody-vs-rigid contact, then a scene.
 
+## P8.0 tranche 5 — the tetrahedron ROTATION extractors, and the arc's FIRST TOLERANCE SEAM
+
+`sb_gm_updateTetrahedraRotationsLaunch` (softBodyGM.cu:419, sim mesh) and
+`sb_updateTetrahedraRotationsLaunch` (:461, collision mesh), both in
+`shaders/softBodySolveBda.slang`.  Each computes the deformation gradient F = P·Qinv from its
+tetrahedron's displacement field, seeds the quaternion from the stored rotation (or
+`mInitialRotation` on the first frame, detected via the zero-initialised memory), and runs Mueller's
+iterative polar decomposition `extractRotation(F, q, 100)`.  ABI row `{8,8}` (16 B, shared with
+`sb_gm_zeroTetMultipliers`); manifest hand-edited, **MAPPED 217 → 219**.
+
+They differ in exactly three places: the buffer set (sim `mSimTetIndices` @80 /
+`mSimPosition_InvMass` @96 / `mSimTetraRestPoses` @136 / `mSimTetraRotations` @168 / `mNumTetsGM`
+@376, versus collision `mTetIndices` @16 / `mPosition_InvMass` @64 / `mTetraRestPoses` @40 /
+`mTetraRotations` @56 / `mNumTets` @368); the rest-pose LAYOUT (sim reads through `loadPxMat33` from a
+`PxgMat33Block` — 1152-byte stride, the 9 elements split 4/4/1 across `mCol0`/`mCol1`/`mCol2` — while
+collision reads a flat 36-byte `PxMat33`); and the enabling test (collision runs only under
+`eCOMPUTE_STRESS_TENSOR` or when self-collision is ENABLED; sim runs unconditionally).  Both use
+`maxIter = 100`; the 100-vs-4 split lives only in `computeGMTetrahedronRotations`, which neither
+kernel reaches.
+
+### The seam
+
+`extractRotation` builds each update as `PxQuat(w, omega)`, and that constructor (PxQuat.h:86)
+evaluates `PxSinCos` → sinf/cosf, which have no cross-backend rounding guarantee.  The `.cu` picks
+this variant on the default path (the `sb_extractRotationAPD` call sits commented out directly above),
+so **the seam cannot be avoided by configuration** — which is exactly why `npSbExtractRotAPD.slang`
+documents the Mueller variant as non-portable and ports the APD one instead.  Everything else in the
+chain stays bit-exact: `PxVec3::normalize` and `PxQuat::getNormalized` both go through `PxSqrt`
+(IEEE-754 correctly rounded), and the quaternion product and rotation-matrix build are pure arithmetic.
+
+**Two measurement mistakes had to be corrected before the seam could be budgeted honestly**, and both
+were caught by the numbers rather than assumed away:
+  - a raw quaternion compare read **2.1e9 ULP** on the seeded case — because q and −q are the SAME
+    rotation and the iteration is free to land on either representative.  The quaternion is now
+    sign-normalised before any ULP is reported;
+  - the natural-looking `acos(|dot|)` angle metric is badly conditioned near d == 1: a 1-ULP
+    difference reads as **3e-4 rad**, which says nothing about the port.  The primary metric is now
+    the Frobenius distance between the two rotation MATRICES — sign-agnostic by construction, no
+    amplification, and it is what the solver actually consumes.
+
+Measured, and the two regimes genuinely differ: seeded from the STORED rotation (near the fixed
+point) gives **1 ULP / 6e-8**; seeded from `mInitialRotation` (~60° away) gives **860 ULP / 2e-5**.
+The iteration AMPLIFIES the seam rather than washing it out, because the `w < eps` early-exit is
+itself seam-dependent — a last-bit sin/cos difference moves w across the threshold and the two sides
+stop one iteration apart.  2e-5 on the rotation matrix is ~0.001°, irrelevant to the solver, but it is
+a real divergence and is budgeted as such.  Guarantees: **≤ 4096 ULP and < 1e-4 matrix distance**,
+~5x above the measurement.
+
+**The seam does not cost the test its teeth**, which is the point that mattered: 5 mutants (iteration
+count 100→3, a wrong `PxgMat33Block` decode, F = Qinv·P instead of P·Qinv, eps 1e-6→1e-3, and a
+swapped quaternion product) all land at **1e-2 to 1.9** matrix distance — 500x to 100000x above the
+budget.  The tolerance sits in a wide, empty gap between the noise floor and the weakest real error.
+
+**Two findings from the adversarial analysis, both verified by hand:**
+  - `PxgSoftBodyCore::updateSimTetraRotations()` — the launcher for the SIM-mesh kernel — has **zero
+    call sites** in the tree.  `SB_GM_UPDATETETRAROTATIONS` is never dispatched by the shipping
+    pipeline; the sim-mesh rotations are maintained inside the solve kernels via
+    `computeGMTetrahedronRotations` instead.  Only the collision variant actually runs, once per
+    frame, from PxgContext.cpp:2024.  The sim kernel is ported and correct, but it is currently dead
+    weight — worth knowing before anyone spends time on a scene that expects it to fire;
+  - the upcoming solve kernel has a **degenerate-rest-pose guard** that must not be dropped:
+    softBodyGM.cu:1123 `if(!(Qinv == PxMat33(PxZero))) { tetrahedronsSolveGM(...); }` (the scatter
+    still runs, with a zero delta), and :1178 `if(Qinv == PxMat33(PxZero)) return;` — placed AFTER the
+    rotation write, so the quaternion is persisted before the early return.
+
+Suite 674/674 in both memory modes, rigid regression 16/16, cloth / clothselfcollide / particle green.
+**Softbody now 9 of 56 kernels mapped.**
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

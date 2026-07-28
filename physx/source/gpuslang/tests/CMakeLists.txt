@@ -520,7 +520,9 @@ pxg_compile_shader(softBodyRefitBda sb_refitBoundLaunch)
 # PXG_HLSL_ENTRIES.  IS in PXG_NOCONTRACT_SHADERS (`vel + delta * invDt` is a mul feeding
 # an add).  No transcendental and no warp op in either kernel.
 pxg_compile_shader(softBodySolveBda sb_gm_zeroTetMultipliers
-                   sb_gm_applyExternalDeltasLaunch)
+                   sb_gm_applyExternalDeltasLaunch
+                   sb_gm_updateTetrahedraRotationsLaunch
+                   sb_updateTetrahedraRotationsLaunch)
 pxg_compile_shader(contactReduce ctContactReduce)
 pxg_compile_shader(npSbTet ctSbTet)
 pxg_compile_shader(npSbSelf ctSbSelfQuery)

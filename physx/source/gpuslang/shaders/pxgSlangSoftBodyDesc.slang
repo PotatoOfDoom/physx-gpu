@@ -56,10 +56,13 @@ module pxgSlangSoftBodyDesc;
 public static const uint PXG_SOFTBODY_ACTORFLAG_DISABLE_GRAVITY = 2u;
 // PxDeformableBodyFlag (PxDeformableBodyFlag.h:47-51): eENABLE_SPECULATIVE_CCD =
 // (1<<1), eKINEMATIC = (1<<2).  Tested against byte1 of mFlagsWord (mBodyFlags).
+public static const uint PXG_SOFTBODY_BODYFLAG_DISABLE_SELF_COLLISION = 1u;
 public static const uint PXG_SOFTBODY_BODYFLAG_ENABLE_SPECULATIVE_CCD = 2u;
 public static const uint PXG_SOFTBODY_BODYFLAG_KINEMATIC = 4u;
 // PxDeformableVolumeFlag::ePARTIALLY_KINEMATIC (PxDeformableVolumeFlag.h:48) =
 // (1<<1).  Tested against bytes2..3 of mFlagsWord (mVolumeFlags).
+// PxDeformableVolumeFlag::eCOMPUTE_STRESS_TENSOR (PxDeformableVolumeFlag.h:47) = (1<<0).
+public static const uint PXG_SOFTBODY_VOLUMEFLAG_COMPUTE_STRESS_TENSOR = 1u;
 public static const uint PXG_SOFTBODY_VOLUMEFLAG_PARTIALLY_KINEMATIC = 2u;
 
 // Byte-exact mirror of class PxgSoftBody (PxgSoftBody.h:79).  Every pointer is 8

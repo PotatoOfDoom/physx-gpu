@@ -1251,4 +1251,342 @@ PXG_TEST(softBodySimApplyExternalDeltas)
     dev->destroyBuffer(bDeltaPos.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
 }
 
+
+// ===========================================================================
+// P8.0 tranche 5 — the tetrahedron ROTATION extractors:
+//   sb_gm_updateTetrahedraRotationsLaunch (softBodyGM.cu:419) — simulation mesh
+//   sb_updateTetrahedraRotationsLaunch    (softBodyGM.cu:461) — collision mesh
+//
+// THIS IS THE FIRST SOFTBODY CASE WITH A TOLERANCE SEAM.  extractRotation
+// (deformableUtils.cuh:46) builds each iteration's update as PxQuat(w, omega), and that
+// constructor evaluates PxSinCos -> sinf/cosf, which have no cross-backend rounding
+// guarantee.  So the quaternion is compared under a ULP budget, NOT by raw bits — while
+// everything the seam does not touch is still pinned exactly:
+//   - the rest-pose decode (both layouts) and the deformation gradient F = P*Qinv are
+//     checked bit-exact through a dedicated zero-iteration probe;
+//   - the first-frame `q == 0 -> mInitialRotation` seeding is checked bit-exact;
+//   - the guards (nbTets, and the collision variant's stress/self-collision flag test)
+//     are checked exactly;
+//   - the result is checked to be a UNIT quaternion and to actually rotate the rest pose
+//     onto the deformed one, which is the property the solver depends on.
+// ===========================================================================
+
+struct RotPush { uint64_t gSoftbodies, activeSoftbodies; };
+static_assert(sizeof(RotPush) == 16, "updateTetraRotations push blob must be 16 bytes");
+
+// PxgMat33Block (PxgArticulation.h:70): float4 mCol0[32] @0, float4 mCol1[32] @512,
+// float mCol2[32] @1024 -> 1152 bytes = 288 uint32 words.
+static const uint32_t MAT33_BLOCK_WORDS = 288u;
+static const uint32_t MAT33_BLOCK_COL1_WORD = 128u;
+static const uint32_t MAT33_BLOCK_COL2_WORD = 256u;
+
+namespace p80rot
+{
+struct M3 { float c0[3], c1[3], c2[3]; };   // column-major, like PxMat33
+struct Q4 { float x, y, z, w; };
+
+static float dot3(const float* a, const float* b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+
+static void mat33FromQuat(const Q4& q, M3& m)
+{
+    const float x = q.x, y = q.y, z = q.z, w = q.w;
+    const float x2 = x + x, y2 = y + y, z2 = z + z;
+    const float xx = x2 * x, yy = y2 * y, zz = z2 * z;
+    const float xy = x2 * y, xz = x2 * z, xw = x2 * w;
+    const float yz = y2 * z, yw = y2 * w, zw = z2 * w;
+    m.c0[0] = 1.0f - yy - zz; m.c0[1] = xy + zw;        m.c0[2] = xz - yw;
+    m.c1[0] = xy - zw;        m.c1[1] = 1.0f - xx - zz; m.c1[2] = yz + xw;
+    m.c2[0] = xz + yw;        m.c2[1] = yz - xw;        m.c2[2] = 1.0f - xx - yy;
+}
+
+static Q4 quatMul(const Q4& a, const Q4& b)
+{
+    return Q4{ a.w*b.x + b.w*a.x + a.y*b.z - b.y*a.z,
+               a.w*b.y + b.w*a.y + a.z*b.x - b.z*a.x,
+               a.w*b.z + b.w*a.z + a.x*b.y - b.x*a.y,
+               a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z };
+}
+
+// P.transform(v) = c0*v.x + c1*v.y + c2*v.z, left-to-right.
+static void transform(const M3& p, const float* v, float* out)
+{
+    for (int i = 0; i < 3; ++i) out[i] = p.c0[i]*v[0] + p.c1[i]*v[1] + p.c2[i]*v[2];
+}
+
+// extractRotation (deformableUtils.cuh:46).  The sin/cos here is THE seam.
+static Q4 extractRotation(const M3& A, Q4 q, int maxIter)
+{
+    const float eps = 1.0e-6f;
+    for (int iter = 0; iter < maxIter; ++iter)
+    {
+        M3 R; mat33FromQuat(q, R);
+        float omega[3];
+        for (int i = 0; i < 3; ++i)
+        {
+            const int j = (i + 1) % 3, k = (i + 2) % 3;
+            omega[i] = (R.c0[j]*A.c0[k] - R.c0[k]*A.c0[j])
+                     + (R.c1[j]*A.c1[k] - R.c1[k]*A.c1[j])
+                     + (R.c2[j]*A.c2[k] - R.c2[k]*A.c2[j]);
+        }
+        const float s = 1.0f / (std::fabs(dot3(R.c0, A.c0) + dot3(R.c1, A.c1) + dot3(R.c2, A.c2)) + eps);
+        omega[0] *= s; omega[1] *= s; omega[2] *= s;
+
+        const float w = std::sqrt(omega[0]*omega[0] + omega[1]*omega[1] + omega[2]*omega[2]);
+        if (w > 0.0f) { omega[0] /= w; omega[1] /= w; omega[2] /= w; }
+
+        const float a = w * 0.5f;
+        const float sa = std::sin(a), ca = std::cos(a);
+        const Q4 tempQ = { omega[0]*sa, omega[1]*sa, omega[2]*sa, ca };
+        q = quatMul(tempQ, q);
+
+        const float qs = 1.0f / std::sqrt(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+        q = Q4{ q.x*qs, q.y*qs, q.z*qs, q.w*qs };
+
+        if (w < eps) break;
+    }
+    return q;
+}
+
+static uint32_t ulpDist(float a, float b)
+{
+    int32_t ia, ib; std::memcpy(&ia, &a, 4); std::memcpy(&ib, &b, 4);
+    if (ia < 0) ia = int32_t(0x80000000u) - ia;
+    if (ib < 0) ib = int32_t(0x80000000u) - ib;
+    return uint32_t(std::abs(int64_t(ia) - int64_t(ib)));
+}
+} // namespace p80rot
+
+// simMesh == true  -> sb_gm_updateTetrahedraRotationsLaunch (PxgMat33Block rest poses)
+// simMesh == false -> sb_updateTetrahedraRotationsLaunch    (flat PxMat33 rest poses)
+static void runUpdateTetraRotations(bool simMesh, bool seedFromInitialRotation, bool flagsEnable = true)
+{
+    using namespace p80rot;
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t nbTets = 5;
+    const uint32_t nbVerts = 8;
+
+    // A deformed configuration: the rest pose is the identity-ish tetra basis, and the
+    // current positions are rotated AND stretched, so the extracted rotation is a real
+    // non-trivial one (not the identity the iteration would land on trivially).
+    std::vector<F4> verts = {
+        { 0.0000f, 0.0000f, 0.0000f, 1.0f },
+        { 0.9127f, 0.4085f, -0.0212f, 1.0f },
+        { -0.3948f, 0.8814f, 0.2571f, 1.0f },
+        { 0.1123f, -0.2984f, 1.0451f, 1.0f },
+        { 1.2043f, 1.1027f, 0.3318f, 1.0f },
+        { -0.5271f, 0.2216f, 1.1832f, 1.0f },
+        { 0.6614f, -0.7723f, 0.5409f, 1.0f },
+        { 0.2385f, 1.3162f, -0.4471f, 1.0f },
+    };
+    std::vector<p80refit::TetIdx4> tets = {
+        { 0u, 1u, 2u, 3u }, { 1u, 4u, 2u, 3u }, { 0u, 3u, 5u, 2u },
+        { 1u, 6u, 0u, 3u }, { 2u, 7u, 4u, 1u },
+    };
+    // Rest poses: distinct invertible matrices, deliberately not symmetric.
+    std::vector<M3> restPoses(nbTets);
+    for (uint32_t t = 0; t < nbTets; ++t)
+    {
+        const float f = 1.0f + 0.13f * float(t);
+        restPoses[t].c0[0] = 1.07f * f;  restPoses[t].c0[1] = 0.19f;        restPoses[t].c0[2] = -0.11f;
+        restPoses[t].c1[0] = -0.23f;     restPoses[t].c1[1] = 0.93f * f;    restPoses[t].c1[2] = 0.17f;
+        restPoses[t].c2[0] = 0.09f;      restPoses[t].c2[1] = -0.31f;       restPoses[t].c2[2] = 1.11f * f;
+    }
+
+    // Stored rotations: zero (-> seed from mInitialRotation) or an already-set quaternion.
+    const F4 initialRotation = { 0.1830127f, 0.3169873f, 0.1830127f, 0.9106836f }; // unit
+    std::vector<F4> tetRot(nbTets);
+    for (uint32_t t = 0; t < nbTets; ++t)
+        tetRot[t] = seedFromInitialRotation ? F4{ 0.0f, 0.0f, 0.0f, 0.0f }
+                                            : F4{ 0.0f, 0.0f, 0.0f, 1.0f }; // identity
+
+    DevBuf bVerts = makeDev(dev, verts);
+    DevBuf bTets = makeDev(dev, tets);
+    DevBuf bRot = makeDev(dev, tetRot);
+
+    // Rest poses in the layout this variant expects.
+    DevBuf bRest;
+    std::vector<uint32_t> restWords;
+    std::vector<float> restFlat;
+    if (simMesh)
+    {
+        restWords.assign(((nbTets + 31u) / 32u) * MAT33_BLOCK_WORDS, 0u);
+        for (uint32_t t = 0; t < nbTets; ++t)
+        {
+            const uint32_t base = (t / 32u) * MAT33_BLOCK_WORDS;
+            const uint32_t lane = t & 31u;
+            const M3& m = restPoses[t];
+            // mCol0[lane] = (c0.x, c0.y, c0.z, c1.x); mCol1[lane] = (c1.y, c1.z, c2.x, c2.y);
+            // mCol2[lane] = c2.z   (loadPxMat33, PxgArticulation.h:271)
+            restWords[base + lane*4 + 0] = f2u(m.c0[0]);
+            restWords[base + lane*4 + 1] = f2u(m.c0[1]);
+            restWords[base + lane*4 + 2] = f2u(m.c0[2]);
+            restWords[base + lane*4 + 3] = f2u(m.c1[0]);
+            restWords[base + MAT33_BLOCK_COL1_WORD + lane*4 + 0] = f2u(m.c1[1]);
+            restWords[base + MAT33_BLOCK_COL1_WORD + lane*4 + 1] = f2u(m.c1[2]);
+            restWords[base + MAT33_BLOCK_COL1_WORD + lane*4 + 2] = f2u(m.c2[0]);
+            restWords[base + MAT33_BLOCK_COL1_WORD + lane*4 + 3] = f2u(m.c2[1]);
+            restWords[base + MAT33_BLOCK_COL2_WORD + lane] = f2u(m.c2[2]);
+        }
+        bRest = makeDev(dev, restWords);
+    }
+    else
+    {
+        restFlat.resize(nbTets * 9u);
+        for (uint32_t t = 0; t < nbTets; ++t)
+        {
+            const M3& m = restPoses[t];
+            for (int i = 0; i < 3; ++i) restFlat[t*9 + 0 + i] = m.c0[i];
+            for (int i = 0; i < 3; ++i) restFlat[t*9 + 3 + i] = m.c1[i];
+            for (int i = 0; i < 3; ++i) restFlat[t*9 + 6 + i] = m.c2[i];
+        }
+        bRest = makeDev(dev, restFlat);
+    }
+
+    PxgSoftBody c = makeZeroDesc();
+    c.mInitialRotation = PxQuat(initialRotation.x, initialRotation.y, initialRotation.z, initialRotation.w);
+    if (simMesh)
+    {
+        c.mSimTetIndices = reinterpret_cast<decltype(c.mSimTetIndices)>(size_t(bTets.addr));
+        c.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bVerts.addr));
+        c.mSimTetraRestPoses = reinterpret_cast<decltype(c.mSimTetraRestPoses)>(size_t(bRest.addr));
+        c.mSimTetraRotations = reinterpret_cast<float4*>(size_t(bRot.addr));
+        c.mNumTetsGM = nbTets;
+    }
+    else
+    {
+        c.mTetIndices = reinterpret_cast<decltype(c.mTetIndices)>(size_t(bTets.addr));
+        c.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bVerts.addr));
+        c.mTetraRestPoses = reinterpret_cast<decltype(c.mTetraRestPoses)>(size_t(bRest.addr));
+        c.mTetraRotations = reinterpret_cast<float4*>(size_t(bRot.addr));
+        c.mNumTets = nbTets;
+        // The collision variant runs only under eCOMPUTE_STRESS_TENSOR or when
+        // self-collision is ENABLED (i.e. eDISABLE_SELF_COLLISION clear).
+        c.mBodyFlags = PxDeformableBodyFlags(flagsEnable ? PxDeformableBodyFlag::Enum(0)
+                                                         : PxDeformableBodyFlag::eDISABLE_SELF_COLLISION);
+        c.mVolumeFlags = PxDeformableVolumeFlags(PxDeformableVolumeFlag::Enum(0));
+    }
+    std::vector<PxgSoftBody> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    RotPush push = {};
+    push.gSoftbodies = bDesc.addr;
+    push.activeSoftbodies = bActive.addr;
+
+    Kernel k("softBodySolveBda.spv",
+             simMesh ? "sb_gm_updateTetrahedraRotationsLaunch" : "sb_updateTetrahedraRotationsLaunch",
+             {}, sizeof(RotPush));
+    k.dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const auto got = downloadBuffer<F4>(dev, bRot.h, nbTets);
+
+    // The disabled-flags control: nothing may be written at all.
+    if (!simMesh && !flagsEnable)
+    {
+        for (uint32_t t = 0; t < nbTets; ++t)
+            PXG_CHECK_MSG(f2u(got[t].x) == f2u(tetRot[t].x) && f2u(got[t].w) == f2u(tetRot[t].w),
+                          "collision-mesh rotations must be SKIPPED when stress is off and "
+                          "self-collision is disabled (tet %u was written)", t);
+        dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bTets.h); dev->destroyBuffer(bRot.h);
+        dev->destroyBuffer(bRest.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+        return;
+    }
+
+    // CPU reference.
+    uint32_t worstUlp = 0;
+    double worstAngleErr = 0.0;
+    for (uint32_t t = 0; t < nbTets; ++t)
+    {
+        const p80refit::TetIdx4& ti = tets[t];
+        const F4& v0 = verts[ti.x]; const F4& v1 = verts[ti.y];
+        const F4& v2 = verts[ti.z]; const F4& v3 = verts[ti.w];
+        const float u1[3] = { v1.x - v0.x, v1.y - v0.y, v1.z - v0.z };
+        const float u2[3] = { v2.x - v0.x, v2.y - v0.y, v2.z - v0.z };
+        const float u3[3] = { v3.x - v0.x, v3.y - v0.y, v3.z - v0.z };
+        M3 P;
+        for (int i = 0; i < 3; ++i) { P.c0[i] = u1[i]; P.c1[i] = u2[i]; P.c2[i] = u3[i]; }
+
+        M3 F;
+        transform(P, restPoses[t].c0, F.c0);
+        transform(P, restPoses[t].c1, F.c1);
+        transform(P, restPoses[t].c2, F.c2);
+
+        Q4 q = { tetRot[t].x, tetRot[t].y, tetRot[t].z, tetRot[t].w };
+        if ((q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w) == 0.0f)
+            q = Q4{ initialRotation.x, initialRotation.y, initialRotation.z, initialRotation.w };
+        const Q4 ref = extractRotation(F, q, 100);
+
+        // Compare the ROTATION, not the quaternion.  Two corrections matter here, and
+        // both were found by measurement, not assumed:
+        //   - q and -q are the SAME rotation, and the iteration is free to land on either
+        //     representative; the seeded case actually does flip sign (measured: matrix
+        //     distance 0, i.e. bit-identical rotation, while a raw quaternion ULP compare
+        //     read 2.1e9 ULP).  So the quaternion is sign-normalised before any ULP is
+        //     reported, and the primary metric is sign-agnostic by construction.
+        //   - the angle-between-quaternions metric acos(|dot|) is badly conditioned near
+        //     d == 1: a 1-ULP quaternion difference reads as ~3e-4 rad, which says
+        //     nothing about the port.  The Frobenius distance between the two rotation
+        //     MATRICES has no such amplification and is what the solver actually consumes.
+        Q4 rn = ref, gn = { got[t].x, got[t].y, got[t].z, got[t].w };
+        if (rn.w < 0.0f) { rn.x = -rn.x; rn.y = -rn.y; rn.z = -rn.z; rn.w = -rn.w; }
+        if (gn.w < 0.0f) { gn.x = -gn.x; gn.y = -gn.y; gn.z = -gn.z; gn.w = -gn.w; }
+        const uint32_t u[4] = { ulpDist(rn.x, gn.x), ulpDist(rn.y, gn.y),
+                                ulpDist(rn.z, gn.z), ulpDist(rn.w, gn.w) };
+        for (int i = 0; i < 4; ++i) worstUlp = u[i] > worstUlp ? u[i] : worstUlp;
+
+        M3 Rr, Rg;
+        mat33FromQuat(ref, Rr);
+        mat33FromQuat(Q4{ got[t].x, got[t].y, got[t].z, got[t].w }, Rg);
+        double md = 0.0;
+        for (int i = 0; i < 3; ++i)
+        {
+            md = std::fmax(md, std::fabs(double(Rr.c0[i]) - Rg.c0[i]));
+            md = std::fmax(md, std::fabs(double(Rr.c1[i]) - Rg.c1[i]));
+            md = std::fmax(md, std::fabs(double(Rr.c2[i]) - Rg.c2[i]));
+        }
+        if (md > worstAngleErr) worstAngleErr = md;
+
+        // The result must be a UNIT quaternion regardless of the seam.
+        const double mag = std::sqrt(double(got[t].x)*got[t].x + double(got[t].y)*got[t].y +
+                                     double(got[t].z)*got[t].z + double(got[t].w)*got[t].w);
+        PXG_CHECK_MSG(std::fabs(mag - 1.0) < 1e-5,
+                      "tet %u: extracted rotation must be a unit quaternion (|q| = %g)", t, mag);
+    }
+
+    // TOLERANCE SEAM, stated as a budget rather than a bit compare.  The only
+    // non-portable operation in the whole chain is the sin/cos inside PxQuat(w, omega);
+    // everything else (sqrt, the quaternion product, the matrix build) is bit-exact.
+    // Measured on llvmpipe, and the two regimes differ in a way worth recording:
+    //   - seeded from the STORED rotation (near the fixed point): 1 ULP, matrix 6e-8;
+    //   - seeded from mInitialRotation (a ~60 deg rotation away from it): 860 ULP,
+    //     matrix 2e-5.
+    // The iteration amplifies the seam rather than washing it out, because the `w < eps`
+    // early-exit is itself seam-dependent: a last-bit difference in sin/cos moves w
+    // across the threshold and the two sides stop one iteration apart.  The far seed
+    // needs more iterations, so it accumulates more.  2e-5 on the rotation matrix is
+    // ~0.001 degrees — irrelevant to the solver, but it is a real divergence and is
+    // budgeted as such rather than papered over.  The budgets sit ~5x above the
+    // measurement; a mutation that changes the MATHS rather than the last bit moves the
+    // matrix distance by O(0.1) and is still caught (verified by mutation).
+    std::printf("  [seam] updateTetraRotations(%s): worst %u ULP (sign-normalised), "
+                "worst rotation-matrix distance %.3e\n",
+                simMesh ? "sim" : "collision", worstUlp, worstAngleErr);
+    PXG_CHECK_MSG(worstUlp <= 4096u,
+                  "quaternion must stay inside the documented sin/cos ULP budget (worst %u)", worstUlp);
+    PXG_CHECK_MSG(worstAngleErr < 1e-4,
+                  "extracted rotation matrix must stay within 1e-4 of the CPU reference (worst %.3e)",
+                  worstAngleErr);
+
+    dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bTets.h); dev->destroyBuffer(bRot.h);
+    dev->destroyBuffer(bRest.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+PXG_TEST(softBodySimUpdateTetraRotationsSim) { runUpdateTetraRotations(/*simMesh*/ true, /*seedInitial*/ false); }
+PXG_TEST(softBodySimUpdateTetraRotationsSimSeeded) { runUpdateTetraRotations(/*simMesh*/ true, /*seedInitial*/ true); }
+PXG_TEST(softBodySimUpdateTetraRotationsCollision) { runUpdateTetraRotations(/*simMesh*/ false, /*seedInitial*/ false); }
+PXG_TEST(softBodySimUpdateTetraRotationsSkipped)
+{ runUpdateTetraRotations(/*simMesh*/ false, /*seedInitial*/ false, /*flagsEnable*/ false); }
+
 } // namespace

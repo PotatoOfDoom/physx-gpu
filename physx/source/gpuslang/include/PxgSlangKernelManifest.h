@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 217;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 219;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -312,8 +312,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_gm_updateTetModelVertsLaunch", nullptr, nullptr },  // SB_GM_UPDATETETMODELVERTS (unmapped)
     { "sb_gm_zeroTetMultipliers", "softBodySolveBda.spv", "sb_gm_zeroTetMultipliers" },  // SB_GM_ZERO_TETMULTIPLIERS (P8.0 tranche 4 BDA port)
     { "sb_gm_cp_averageVertsLaunch", nullptr, nullptr },  // SB_GM_CP_AVERAGEVERTS (unmapped)
-    { "sb_updateTetrahedraRotationsLaunch", nullptr, nullptr },  // SB_UPDATETETRAROTATIONS (unmapped)
-    { "sb_gm_updateTetrahedraRotationsLaunch", nullptr, nullptr },  // SB_GM_UPDATETETRAROTATIONS (unmapped)
+    { "sb_updateTetrahedraRotationsLaunch", "softBodySolveBda.spv", "sb_updateTetrahedraRotationsLaunch" },  // SB_UPDATETETRAROTATIONS (P8.0 tranche 5 BDA port)
+    { "sb_gm_updateTetrahedraRotationsLaunch", "softBodySolveBda.spv", "sb_gm_updateTetrahedraRotationsLaunch" },  // SB_GM_UPDATETETRAROTATIONS (P8.0 tranche 5 BDA port)
     { "sb_gm_applyExternalDeltasLaunch", "softBodySolveBda.spv", "sb_gm_applyExternalDeltasLaunch" },  // SB_GM_APPLY_EXTERNAL_DELTAS (P8.0 tranche 4 BDA port)
     { "sb_gm_applyDeformationDeltasLaunch", nullptr, nullptr },  // SB_GM_APPLY_DEFORMATION_DELTAS (unmapped)
     { "sb_other_contact_remap_to_simLaunch", nullptr, nullptr },  // SB_OTHER_CONTACT_REMAP_TO_SIM (unmapped)
