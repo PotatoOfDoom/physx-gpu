@@ -1308,6 +1308,48 @@ money shot red on a theory is the exact mistake the tranche-6 write-up records; 
 to instrument per-vertex `mDeltaPos.w` and `.xyz` across the two coverage regimes rather than to
 keep reasoning about it.
 
+### Second investigation round: what the grid defect actually exposes
+
+The fix was re-applied and the scene instrumented per step. The mechanism is now visible, and
+it is NOT lost contacts:
+
+| step | half coverage | full coverage |
+|---|---|---|
+| 0 | mean 5.083 | 5.098 |
+| 5 | 5.195 | 5.264 |
+| 20 | 5.255 (peak) | **5.415** (peak) |
+| 60 | 5.195 | 4.827 |
+| 100 | 5.057 | 4.124 |
+
+The upper layer is pushed **above its own spawn height (5.05)** in BOTH regimes — self-collision
+is meant to arrest the fall, not lift the cloth. Full coverage roughly doubles that push, the two
+layers separate, and the upper layer then passes **through** the shelf (min y 4.31 at step 60,
+shelf at 5.00) instead of being re-caught. It tunnels; it does not settle low.
+
+Ruled out this round, each by measurement rather than by reading:
+
+- **contact-buffer overflow** — capacity 1 048 576, counters in the tens; `checkBufferOverflows`
+  never fires;
+- **duplication by the sub-warp loop** — the VT unit test re-dispatched at the engine's own
+  `ceil(N/2)` grid still asserts `gCount == 1`;
+- **the count pass** — the Slang `countContact` matches `FEMClothExternalSolve.cu:861` exactly:
+  `.w` bumped by `|coeff_i|` (not by 1), the same `> 1e-3` gate, the same
+  `distSq > restDist^2 -> markInCollision(false)` early-out;
+- **the divisor and the clear** — `scale = 1/delta.w` gated on `w != 0`, whole-`float4` clear,
+  identical to `cloth_applyExternalDeltasLaunch` (`FEMClothExternalSolve.cu:1053`);
+- **a second grid mismatch downstream** — the contact prepare and both solve kernels launch on a
+  fixed `SB_UPDATEROTATION` grid with a grid-stride loop, so they see every contact regardless;
+- **solver iteration budget** — 8 / 16 / 32 collision substeps give 4.0658 / 4.0657 / 4.0656.
+  Identical. More iterations cannot help once the layers have separated.
+
+So every link of the chain that can be compared against the `.cu` by reading has been compared,
+and matches. What remains is the per-contact correction magnitude, or the contact-refresh cadence
+under larger displacements — and neither can be settled in a 40-vertex draping scene with no CUDA
+ground truth to compare against. The next step is a unit-level fixture that drives
+count -> solve -> apply end to end on a geometry whose correct outcome is known analytically, run
+at both coverage levels. `PXG_CLOTH_SUBSTEPS` was added to the scene so this margin stays
+measurable rather than assumed.
+
 ### A structural gap in the verification protocol
 
 The unit tests **choose their own dispatch grid**, so they cannot catch an engine-grid mismatch

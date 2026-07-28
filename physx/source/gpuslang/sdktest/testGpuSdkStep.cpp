@@ -1057,7 +1057,10 @@ ClothSelfScene buildClothSelfCollideScene(PxPhysics* physics, PxScene* scene, Px
     if (!surface) { std::printf("FAIL: createDeformableSurface returned null\n"); return out; }
 
     surface->setNbCollisionPairUpdatesPerTimestep(4);
-    surface->setNbCollisionSubsteps(8);   // more self-collision solve iterations -> stiffer hold
+    // PXG_CLOTH_SUBSTEPS overrides the self-collision solve iteration count so the
+    // scene's stability margin can be measured rather than assumed.
+    const char* subEnv = std::getenv("PXG_CLOTH_SUBSTEPS");
+    surface->setNbCollisionSubsteps(subEnv ? PxU32(atoi(subEnv)) : 8u);   // more iterations -> stiffer hold
     surface->setLinearDamping(0.2f);      // bleed off the drape momentum so the hold is clean
     surface->setMaxLinearVelocity(1.0e6f);
     // The rest-pose filter is the self-collision switch (see the scene comment): ON lets the
