@@ -4356,6 +4356,175 @@ static float runClothSelfContactTwoWay(bool bothDirections, bool verbose)
     return sep;
 }
 
+// ===========================================================================
+// P8.1: the K-DISTINCT-TRIANGLES fixture — the configuration the other two miss.
+//
+// The redundancy fixture uses N copies of ONE contact and the two-way fixture uses one
+// contact per direction; both have every participant appearing in exactly ONE contact per
+// role.  That is the ONE case where the count-based mass split is neutral.
+//
+// The realistic configuration is different: one vertex penetrating K DISTINCT opposing
+// triangles at once, which is what a dense fold produces.  Then the vertex's accumulated
+// count is c_v = K (weight 1 per contact) while each triangle corner carries only c_a ~ 1/3
+// from its single contact -- a 3K-fold asymmetry.  Since the scatter is
+// dx_j = c_j * m_j * w_j * lambda * n (femClothClothContactBda.slang:474 x :440), the
+// count enters the correction as a MULTIPLIER, so the separation migrates onto the
+// vertex side as K grows and the triangle side stops moving.
+//
+// This test measures that migration directly.  It asserts nothing about which behaviour is
+// "right" -- upstream PhysX 5.6.1 does the same arithmetic and the port reproduces it
+// faithfully -- it records the K-dependence so the effect is a measured number rather than
+// an argument.
+// ===========================================================================
+static float lastOvershootFactor = 0.0f;   // set by runClothSelfContactManyTriangles
+
+static void runClothSelfContactManyTriangles(uint32_t K)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+    const float m = 0.5f;
+    const float restDistScalar = 0.05f;
+    const float totalRestDist = 2.0f * restDistScalar;
+    const float gap = 0.04f;
+
+    // v0 is the free penetrating vertex.  K congruent FREE triangles sit `gap` above it,
+    // stacked in the vertex buffer but all at the same height, so each contact describes
+    // the same overlap depth while touching a DISTINCT vertex set.
+    std::vector<F4> pos;
+    pos.push_back(F4{ 1.0f / 3.0f, 1.0f / 3.0f, 0.0f, m });   // v0, the vertex side
+    for (uint32_t k = 0; k < K; ++k)
+    {
+        pos.push_back(F4{ 0.0f, 0.0f, gap, m });
+        pos.push_back(F4{ 1.0f, 0.0f, gap, m });
+        pos.push_back(F4{ 0.0f, 1.0f, gap, m });
+    }
+    const uint32_t NV = uint32_t(pos.size());
+    std::vector<F4> rest = pos, prev = pos;
+    std::vector<F4> vel(NV, F4{ 0, 0, 0, 0 }), accum(NV, F4{ 0, 0, 0, 0 }), deltaPos(NV, F4{ 0, 0, 0, 0 });
+    std::vector<float> friction(NV, 0.0f);
+    std::vector<TriIdx4> tris;
+    for (uint32_t k = 0; k < K; ++k)
+        tris.push_back(TriIdx4{ 1u + 3u * k, 2u + 3u * k, 3u + 3u * k, 0u });
+
+    DevBuf bPos = makeDev(dev, pos), bRest = makeDev(dev, rest), bPrev = makeDev(dev, prev);
+    DevBuf bVel = makeDev(dev, vel), bAcc = makeDev(dev, accum), bDelta = makeDev(dev, deltaPos);
+    DevBuf bFric = makeDev(dev, friction), bTri = makeDev(dev, tris);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mRestPosition = reinterpret_cast<decltype(c.mRestPosition)>(size_t(bRest.addr));
+    c.mPrevPositionInContactOffset = reinterpret_cast<decltype(c.mPrevPositionInContactOffset)>(size_t(bPrev.addr));
+    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
+    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
+    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
+    c.mDynamicFrictions = reinterpret_cast<decltype(c.mDynamicFrictions)>(size_t(bFric.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mNbVerts = NV;
+    c.mSelfCollisionFilterDistance = 0.0f;
+    c.mRestDistance = restDistScalar;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<FemFemContactInfoHost> infos(K);
+    for (uint32_t k = 0; k < K; ++k)
+    {
+        infos[k].pairInd0 = (0ull << 20) | 0ull;    // vertex v0
+        infos[k].pairInd1 = (0u << 20) | k;         // triangle k
+        infos[k].auxInd = 0u;
+    }
+    DevBuf bInfos = makeDev(dev, infos);
+    std::vector<uint32_t> numContacts = { K };
+    DevBuf bNum = makeDev(dev, numContacts);
+    std::vector<uint32_t> upd = { 1u };
+    DevBuf bUpd = makeDev(dev, upd);
+    std::vector<uint32_t> activeIds = { 0u };
+    DevBuf bActive = makeDev(dev, activeIds);
+
+    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PrepClothClothPush pp = {};
+    pp.clothes = bDesc.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
+    pp.maxContacts = 256u; pp.clothMaterials = 0ull; pp.updateContactPairs = bUpd.addr;
+    Kernel("femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch", {}, sizeof(PrepClothClothPush))
+        .dispatch(1u, {}, pp, 1u, 1u);
+    dev->flush();
+
+    QueryClothClothPush qp = {};
+    qp.cloths = bDesc.addr; qp.contactInfos = bInfos.addr; qp.numContacts = bNum.addr;
+    Kernel("femClothClothContactBda.spv", "cloth_queryClothClothContactVTCountLaunch", {}, sizeof(QueryClothClothPush))
+        .dispatch(1u, {}, qp, 1u, 1u);
+    dev->flush();
+    const auto afterCount = downloadBuffer<F4>(dev, bDelta.h, NV);
+
+    SolveClothClothPush sp = {};
+    sp.cloths = bDesc.addr; sp.contactInfos = bInfos.addr; sp.numContacts = bNum.addr; sp.dt = dt;
+    Kernel("femClothClothContactBda.spv", "cloth_solveClothClothDeltaVTLaunch", {}, sizeof(SolveClothClothPush))
+        .dispatch(1u, {}, sp, 1u, 1u);
+    dev->flush();
+
+    ApplyExtPush ap = {};
+    ap.clothes = bDesc.addr; ap.activeClothes = bActive.addr; ap.dt = dt;
+    Kernel("femClothRigidAttachBda.spv", "cloth_applyExternalDeltasLaunch", {}, sizeof(ApplyExtPush))
+        .dispatch(1u, {}, ap, 1u, 1u);
+    dev->flush();
+
+    const auto fin = downloadBuffer<F4>(dev, bPos.h, NV);
+    const float deficit = totalRestDist - gap;                 // 0.06, what must be closed
+    const float dVert = fin[0].z - pos[0].z;                   // vertex side (moves -z)
+    const float dCorner = fin[1].z - pos[1].z;                 // one triangle corner (+z)
+    const float sep = (fin[1].z - fin[0].z) - gap;             // achieved extra separation
+
+    lastOvershootFactor = sep / deficit;
+    std::printf("  K=%-3u count[v]=%.4f count[corner]=%.4f | vertex %+.6f  corner %+.6f | "
+                "closed %.6f of %.6f (%.4fx)\n",
+                K, afterCount[0].w, afterCount[1].w, dVert, dCorner, sep, deficit, sep / deficit);
+
+    // The count asymmetry is the mechanism, so pin it: the vertex side accumulates 1 per
+    // contact (K total) while each corner sees only its own contact's |w| (~1/3).
+    PXG_CHECK_MSG(std::fabs(afterCount[0].w - float(K)) < 1e-4f,
+                  "vertex-side count must be K=%u, got %g", K, afterCount[0].w);
+    PXG_CHECK_MSG(afterCount[1].w < 0.5f,
+                  "each corner must carry only its own contact's weight (~1/3), got %g", afterCount[1].w);
+    // MEASURED: the pass OVERSHOOTS, and the overshoot SHRINKS as K grows --
+    //   K = 1  2  4  8  16  ->  1.2000  1.1053  1.0541  1.0274  1.0138
+    // The cause is that mDeltaPos.w accumulates |coeff| rather than 1, so the effective
+    // denominator is sum_j m_j|w_j|^3 instead of the XPBD-correct sum_j m_j w_j^2; the ratio
+    // between them is the overshoot factor.  It is bounded by the vertex side's weight of 1
+    // (so <= 1.2 for a centroid VT hit) and decays as the vertex-side count comes to dominate
+    // the denominator.  This is UPSTREAM PhysX 5.6.1 arithmetic -- the .cu bumps by
+    // PxAbs(coeffs[j]) at FEMClothExternalSolve.cu:882-896 despite its own comment calling it
+    // a reference count -- and the Slang port reproduces it faithfully.  So the bound is a
+    // REGRESSION FENCE, not a correctness claim: it pins the inherited behaviour so a future
+    // port change that alters it fails loudly.
+    PXG_CHECK_MSG(sep <= deficit * 1.25f,
+                  "K=%u: separation %.6f exceeds the inherited overshoot envelope (%.4fx > 1.25x)",
+                  K, sep, deficit, sep / deficit);
+    // The corner side must lose its share as K grows -- that migration IS the mechanism.
+    PXG_CHECK_MSG(dCorner > 0.0f && dCorner < deficit,
+                  "K=%u: the triangle corner must move the other way and by less than the deficit "
+                  "(got %+.6f)", K, dCorner);
+}
+
+PXG_TEST(femClothSimSelfContactManyTriangles)
+{
+    // The K-sweep is the measurement; the per-K checks above are the teeth.  The sweep must
+    // also be MONOTONE: the overshoot decays as the vertex-side count grows, and that shape
+    // is the signature of the |coeff|-vs-1 denominator.  A port change that broke the count
+    // accumulation would keep the individual bounds but destroy the ordering.
+    float prevFactor = 1.0e30f;
+    for (uint32_t K : { 1u, 2u, 4u, 8u, 16u })
+    {
+        runClothSelfContactManyTriangles(K);
+        const float f = lastOvershootFactor;
+        PXG_CHECK_MSG(f < prevFactor,
+                      "the overshoot must decay with contact density: K=%u gave %.4fx, "
+                      "not below the previous %.4fx", K, f, prevFactor);
+        prevFactor = f;
+    }
+    PXG_CHECK_MSG(prevFactor < 1.02f,
+                  "at K=16 the overshoot should have decayed below 1.02x (got %.4fx)", prevFactor);
+}
+
 PXG_TEST(femClothSimSelfContactTwoWay)
 {
     const float totalRestDist = 0.1f;

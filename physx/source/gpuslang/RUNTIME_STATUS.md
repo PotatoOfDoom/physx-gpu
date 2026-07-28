@@ -1398,6 +1398,53 @@ for, since its thresholds were calibrated against half the contacts. The fixture
 permanent artefact: any future change to this chain now has an analytic reference, not a
 mirror.
 
+### Fourth round: the overshoot is FOUND, measured, and inherited from upstream
+
+The two fixtures above both put every participant in exactly **one** contact per role — which
+turns out to be the one configuration where the arithmetic is neutral. The realistic case is
+one vertex penetrating **K distinct** opposing triangles at once, which is what a dense fold
+produces. `femClothSimSelfContactManyTriangles` sweeps it:
+
+| K | count[vertex] | count[corner] | vertex Δ | corner Δ | overshoot |
+|---|---|---|---|---|---|
+| 1 | 1.0 | 0.3333 | −0.054000 | +0.018000 | **1.2000×** |
+| 2 | 2.0 | 0.3333 | −0.056842 | +0.009474 | 1.1053× |
+| 4 | 4.0 | 0.3333 | −0.058378 | +0.004865 | 1.0541× |
+| 8 | 8.0 | 0.3333 | −0.059178 | +0.002466 | 1.0274× |
+| 16 | 16.0 | 0.3333 | −0.059586 | +0.001241 | 1.0138× |
+
+**The pass overshoots.** A lone all-free vertex-triangle contact at the centroid closes 120% of
+the penetration deficit instead of 100%.
+
+**The cause.** `mDeltaPos.w` accumulates `PxAbs(coeffs[j])` — a *weight* — not `1`, despite the
+`.cu`'s own comment at that site calling it "how many times each vertex is referenced"
+(`FEMClothExternalSolve.cu:877-896`). Since the solve multiplies the inverse masses by those
+counts and the apply divides by them, the effective denominator becomes `Σ m_j |w_j|³` where
+XPBD wants `Σ m_j w_j²`. The ratio between the two IS the overshoot factor. It is bounded by
+the vertex side's weight of 1 (hence ≤ 1.2 for a centroid hit) and decays as the vertex-side
+count comes to dominate the denominator — which is exactly the measured shape.
+
+**This is upstream PhysX 5.6.1 arithmetic, not a migration regression.** The `.cu` bumps by
+`PxAbs(coeffs[j])`; `femClothClothContactBda.slang:505-513` does the same. The port is
+faithful. The fixture is therefore written as a **regression fence** — it pins the inherited
+behaviour and its monotone decay, so a future port change that alters either fails loudly —
+not as a correctness claim.
+
+**How this closes the loop on the grid defect.** The overshoot is per *pass*, and
+`applyExternalDeltas` runs many times per frame (VT and EE per collision substep, times the
+substep count, plus the solver iterations). A few percent of over-separation compounded that
+often is exactly the "layer pushed above its own spawn height" seen in the scene. At half
+coverage only half the vertices ever act as the *vertex side* of a contact — the side that
+carries weight 1 and absorbs the overshoot — so the effect is roughly halved. Fixing the grid
+doubles the number of overshooting pushes, the fold separates, and the layer then falls
+through. **The grid fix is correct; what it amplifies is inherited upstream behaviour.**
+
+That reframes the remaining work: this is no longer a hunt for a port defect, it is a decision
+about whether to deviate from upstream (bump `.w` by 1 instead of `|coeff|`, which would make
+the factor identically 1) or to tune the scene around the inherited behaviour. That is a
+judgement call about fidelity-versus-stability and belongs with the project owner, not in a
+silent code change.
+
 ### A structural gap in the verification protocol
 
 The unit tests **choose their own dispatch grid**, so they cannot catch an engine-grid mismatch
