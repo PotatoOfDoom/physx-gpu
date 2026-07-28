@@ -1136,6 +1136,94 @@ indirection dropped; and a write to the sim mesh added.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, cloth / clothdrape /
 clothselfcollide / particle green.
 
+## P8.0 — MILESTONE: a FEM-volume softbody runs live on Vulkan (`PXG_SCENE=softbody`)
+
+`testGpuSdkStep.cpp` gains the softbody money shot: a hand-authored tetrahedral cube (2x2x2 cells,
+27 vertices, 40 tets) built through `immediateCooking::createDeformableVolumeMesh`, attached as a
+real `PxDeformableVolume`, and stepped by the engine over the Vulkan bridge. Three modes, all green:
+
+| invocation | what it proves | measured |
+|---|---|---|
+| `PXG_SCENE=softbody` | the integrate chain | drop 4.98675 vs 4.98675 expected, **0.0000% off** |
+| `+ PXG_SB_STRETCH=1.6` | the constitutive solve under gravity | y-extent 1.600 → 1.076, **87.4% recovered** |
+| `+ PXG_SB_NOGRAVITY=1` | the solve converges and HOLDS | 1.600 → 1.035 (**94.2%**), then constant to **0.0e+00** over 20 steps |
+
+Run any of them with `PXG_SOLVER=pgs PXG_GPU_STEP=1`.
+
+### The observable is the COLLISION mesh, on purpose
+
+The two meshes are produced by different kernels. The SIM mesh (`getSimPositionInvMassBufferD()`)
+is what `sb_gm_preIntegrateLaunch` predicts, `sb_gm_cp_solveTetrahedronsPartitionLaunch` corrects
+and `sb_gm_cp_averageVertsLaunch` folds back. The COLLISION mesh (`getPositionInvMassBufferD()`)
+only ever moves because `sb_gm_updateTetModelVertsLaunch` skins it onto the sim tetrahedra. They
+are separate device allocations (the scene asserts the two pointers differ, so the skin check
+cannot be satisfied by aliasing), and both are read back every step.
+
+**Two A/B runs give the scene its teeth**, each done by hand-editing one manifest row to `nullptr`:
+
+- `sb_gm_updateTetModelVertsLaunch` unmapped → the collision mesh freezes at exactly `4.00000`
+  while the sim mesh falls to `3.42775`. Skin gap 0.57225, two checks fire.
+- `sb_gm_cp_averageVertsLaunch` unmapped → the stretched cube's y-extent stays at exactly
+  `1.60000` forever. The solve still runs; its output simply never reaches the mesh. **That merge
+  is the sole conduit from the partitioned solve to the simulation mesh.**
+
+So the scene is not merely "a softbody moved" — it fails loudly if either tranche-7 kernel is
+removed.
+
+### Two things this scene does NOT do, stated plainly
+
+**It does not settle.** The cube passes straight through the ground box and ends at mean
+y = −0.987. The whole softbody-vs-rigid contact arc (`SB_MIDPHASE_PRIMITIVES`, `SB_PRIMITIVES_CG`,
+`SB_OTHER_CONTACT_REMAP_TO_SIM`, `SB_RS_CONTACTPREPARE`, `SB_SOLVE_RIGID_SOFT_COLLISION`) is still
+unmapped, so there is nothing to catch it. This is a contact-free free-fall scene, exactly as
+`PXG_SCENE=cloth` was at P7.0.
+
+**It does not drive `sb_gm_applyDeformationDeltasLaunch`.** The cooker pins
+`mGridModelNbPartitions` to 8 for a one-tet-per-element mesh, so the Jacobi remainder is empty and
+the host never takes that branch. The kernel stays covered by its unit test only. (The other two
+tranche-7 kernels do run — `averageVerts` because `mUsePartitionAveraging` is set for any mesh with
+one tet per element, `updateTetModelVerts` twice per frame.)
+
+Eleven kernels are refused per step in this scene; all of them contribute only contact, attachment
+or stress corrections that are identically zero without contacts. The refusals are non-fatal.
+
+### The outward creep, and why it is not a port defect
+
+With gravity ON and a stretched spawn, the cube relaxes to y-extent ~1.034 by step 20 and then
+creeps back OUT to ~1.13 by step 120, decelerating. Two experiments placed it:
+
+- **Iteration count is not the cause.** 4x the XPBD position iterations moves the step-119 extent
+  only 1.128 → 1.109, so it is not a convergence residual.
+- **Gravity is.** With `PXG_SB_NOGRAVITY=1` the identical solve converges to 1.03481 and is then
+  constant to five decimal places from step 60 through 120. The constitutive damping term couples
+  to the vertices' ABSOLUTE velocity, and in free fall that grows without bound.
+
+So the falling case only asserts that a substantial contraction happened; the tight
+"relax and hold" assertion lives in the gravity-free mode where the solve is isolated. The
+remaining 3.5% is XPBD's finite compliance, not drift.
+
+`PXG_SB_NOGRAVITY` also earns its keep as coverage: it puts the tranche-1 pre-integrate gravity
+gate (`PxActorFlag::eDISABLE_GRAVITY`) on its skip path — the one branch its unit test could not
+give teeth to, because no case set the flag. The scene budgets the check against what gravity WOULD
+have done (2% of 19.79 at 120 steps) rather than against zero, because a stretched cube's
+relaxation shifts its centroid ~0.018.
+
+### Notes from building it
+
+- `physxextensions` is not linked into this harness (only `ExtJoint.cpp` / `ExtD6Joint.cpp`), so
+  `PxTetMaker` and `PxDeformableVolumeExt` are unavailable. The tet mesh is hand-authored and the
+  host-mirror fill open-codes what `allocateAndInitializeHostMirror` + `transform` + `copyToDevice`
+  do.
+- The alternating 5-tet cube split does **not** produce consistent handedness. Each tet's signed
+  volume is checked and two corners swapped when it comes out negative.
+- `buildGPUData = true` is mandatory and fails **silently**: without it the tet cooker leaves
+  `mGRB_primIndices` NULL and then dereferences it.
+- `setSolverIterationCounts` is called through `PxDeformableBody`; the same-named
+  `PxDeformableVolume` override is `PX_DEPRECATED` and hides the live one.
+
+Suite **674/674 in both memory modes**, rigid regression **16/16**, cloth / clothhang / clothdrape /
+clothselfcollide / particle green.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

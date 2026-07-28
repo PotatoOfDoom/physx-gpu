@@ -1123,6 +1123,302 @@ bool clothTopMinMeanY(const ClothSelfScene& csc, float& minY, float& meanY)
     meanY = float(sum / double(csc.topIdx.size()));
     return finite;
 }
+
+// ===========================================================================
+// PXG_SCENE=softbody (P8.0 tranche 7): the FEM-VOLUME money shot — a tetrahedral
+// cube that falls under gravity, and (with PXG_SB_STRETCH) relaxes back toward its
+// rest shape while it falls.
+//
+// It does NOT settle on the ground box, and deliberately does not claim to: the
+// whole softbody-vs-rigid contact arc (SB_MIDPHASE_PRIMITIVES, SB_PRIMITIVES_CG,
+// SB_OTHER_CONTACT_REMAP_TO_SIM, SB_RS_CONTACTPREPARE, SB_SOLVE_RIGID_SOFT_COLLISION)
+// is still unmapped, so the cube passes straight through.  This is a CONTACT-FREE
+// free-fall scene, exactly as PXG_SCENE=cloth was at P7.0; the settle comes with the
+// contact tranche.
+//
+// This is the softbody analog of PXG_SCENE=cloth / clothdrape, and it is the first
+// scene that can exist at all: the softbody solve loop only closed with tranche 7.
+// The observable is deliberately the COLLISION mesh (getPositionInvMassBufferD()),
+// not the simulation mesh, because the two are produced by different kernels:
+//
+//   the SIM mesh  (getSimPositionInvMassBufferD()) is what sb_gm_preIntegrateLaunch
+//   predicts, what sb_gm_cp_solveTetrahedronsPartitionLaunch corrects, and what
+//   sb_gm_cp_averageVertsLaunch folds back;
+//   the COLLISION mesh (getPositionInvMassBufferD()) only ever moves because
+//   sb_gm_updateTetModelVertsLaunch skins it onto the sim tetrahedra.
+//
+// Of the three tranche-7 kernels this scene drives TWO.  sb_gm_cp_averageVertsLaunch
+// runs because mUsePartitionAveraging is set for any mesh with one tet per element
+// (PxgSimulationCore.cpp:1420), and sb_gm_updateTetModelVertsLaunch runs twice per
+// frame (preIntegrateAndUpdateBoundSoftBody and again in finalizeVelocities).
+// sb_gm_applyDeformationDeltasLaunch does NOT run here: the cooker pins
+// mGridModelNbPartitions to 8 for a one-tet-per-element mesh, so the Jacobi remainder
+// is empty and the host never takes that branch.  It stays covered by its unit test.
+//
+// So a falling collision mesh is end-to-end proof of the WHOLE chain, tranche 1
+// through 7, in a way no unit test can be: the skin kernel reads what the solve
+// wrote, through the engine's own buffers, with the engine choosing the launch
+// dimensions.  Both meshes are read back so a divergence between them localises
+// immediately to the skin.
+//
+// The tetrahedral mesh is hand-authored rather than tetrahedralised: a regular
+// 2x2x2 cell grid (27 vertices, 40 tetrahedra) with each cell cut into 5 tets on
+// ALTERNATING diagonals, which is the standard conforming split — neighbouring
+// cells must use opposite diagonals or their shared face is triangulated two
+// different ways and the mesh is non-conforming.  Hand-authoring keeps the scene
+// free of PxTetMaker (physxextensions is not linked into this harness; only
+// ExtJoint/ExtD6Joint are) and makes the vertex count small enough to print.
+//
+// The same tet mesh is used as BOTH the simulation and the collision mesh, which
+// is what immediateCooking::createDeformableVolumeMesh's "no voxels" path does;
+// the vertex-to-tet mapping is left unassigned so the cooker computes it.
+struct SoftBodyScene
+{
+    PxDeformableVolume* volume = nullptr;
+    PxU32 numCollVerts = 0;
+    PxU32 numSimVerts = 0;
+    float restExtentY = 0.0f;   // the cube's undeformed y extent (its rest shape)
+    float stretchY = 1.0f;      // the spawn-time elongation factor along y
+    bool noGravity = false;     // PXG_SB_NOGRAVITY: pure constitutive relaxation
+    PxCudaContextManager* cudaCtx = nullptr;
+};
+
+SoftBodyScene buildSoftBodyScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
+                                 PxCudaContextManager* cudaCtx, float stretchY)
+{
+    SoftBodyScene out;
+    out.cudaCtx = cudaCtx;
+
+    // As in the cloth and particle scenes: the deformable solve runs inside the rigid
+    // PGS island loop, and rigidSumInternalContactAndJointBatches2 null-derefs the
+    // solver descriptors with zero dynamic rigids, so one live dynamic body is
+    // required to keep that proven path valid.  It rests at y=0.5, far below.
+    addGroundBox(physics, scene, rigidMat);
+    addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+               boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+
+    // --- the tetrahedral cube -------------------------------------------------
+    const PxU32 cells = 2;                        // 2x2x2 cells -> 27 verts, 40 tets
+    const float size = 1.0f;                      // edge length of the whole cube
+    const float h = size / float(cells);
+    const PxU32 n = cells + 1;                    // verts per axis
+
+    std::vector<PxVec3> tverts;
+    tverts.reserve(n * n * n);
+    for (PxU32 i = 0; i < n; ++i)
+        for (PxU32 j = 0; j < n; ++j)
+            for (PxU32 k = 0; k < n; ++k)
+                tverts.push_back(PxVec3(float(i) * h - 0.5f * size,
+                                        float(j) * h - 0.5f * size,
+                                        float(k) * h - 0.5f * size));
+    auto vid = [n](PxU32 i, PxU32 j, PxU32 k) { return (i * n + j) * n + k; };
+
+    std::vector<PxU32> tets;
+    tets.reserve(5 * 4 * cells * cells * cells);
+    for (PxU32 i = 0; i < cells; ++i)
+        for (PxU32 j = 0; j < cells; ++j)
+            for (PxU32 k = 0; k < cells; ++k)
+            {
+                // cube corners, indexed by the (i,j,k) bit pattern
+                const PxU32 c[8] = {
+                    vid(i,     j,     k    ), vid(i + 1, j,     k    ),
+                    vid(i,     j + 1, k    ), vid(i + 1, j + 1, k    ),
+                    vid(i,     j,     k + 1), vid(i + 1, j,     k + 1),
+                    vid(i,     j + 1, k + 1), vid(i + 1, j + 1, k + 1),
+                };
+                // ALTERNATING diagonals — neighbouring cells must disagree or the
+                // shared face gets two different triangulations.
+                static const PxU32 splitA[5][4] = {
+                    {0,1,2,4}, {1,3,2,7}, {1,4,5,7}, {2,4,6,7}, {1,2,4,7}
+                };
+                static const PxU32 splitB[5][4] = {
+                    {0,1,3,5}, {0,3,2,6}, {0,5,4,6}, {3,7,5,6}, {0,3,5,6}
+                };
+                const bool even = ((i + j + k) & 1u) == 0u;
+                for (PxU32 t = 0; t < 5; ++t)
+                {
+                    PxU32 a = c[even ? splitA[t][0] : splitB[t][0]];
+                    PxU32 b = c[even ? splitA[t][1] : splitB[t][1]];
+                    PxU32 cc = c[even ? splitA[t][2] : splitB[t][2]];
+                    PxU32 d = c[even ? splitA[t][3] : splitB[t][3]];
+                    // Orient every tet positively: PhysX expects a non-degenerate,
+                    // consistently wound tetrahedron, and the two splits do not
+                    // agree on handedness.  Swapping any two corners flips the sign.
+                    const PxVec3 e1 = tverts[b] - tverts[a];
+                    const PxVec3 e2 = tverts[cc] - tverts[a];
+                    const PxVec3 e3 = tverts[d] - tverts[a];
+                    if (e1.cross(e2).dot(e3) < 0.0f) { const PxU32 tmp = cc; cc = b; b = tmp; }
+                    tets.push_back(a); tets.push_back(b); tets.push_back(cc); tets.push_back(d);
+                }
+            }
+
+    PxTetrahedronMeshDesc tetDesc;
+    tetDesc.points.count = PxU32(tverts.size());
+    tetDesc.points.stride = sizeof(PxVec3);
+    tetDesc.points.data = tverts.data();
+    tetDesc.tetrahedrons.count = PxU32(tets.size() / 4);
+    tetDesc.tetrahedrons.stride = 4 * sizeof(PxU32);
+    tetDesc.tetrahedrons.data = tets.data();
+
+    // buildGPUData is MANDATORY — the GPU solve needs the BV32 tree that
+    // sb_refitBoundLaunch (tranche 2) refits every frame.
+    PxCookingParams ckParams(physics->getTolerancesScale());
+    ckParams.buildGPUData = true;
+    ckParams.meshWeldTolerance = 0.001f;
+    ckParams.midphaseDesc = PxMeshMidPhase::eBVH34;
+
+    // Simulation mesh == collision mesh; vertexToTet left unassigned so the cooker
+    // computes the embedding itself.
+    PxDeformableVolumeSimulationDataDesc simDataDesc;
+    PxDeformableVolumeMesh* volMesh = immediateCooking::createDeformableVolumeMesh(
+        ckParams, tetDesc, tetDesc, simDataDesc, physics->getPhysicsInsertionCallback());
+    if (!volMesh) { std::printf("FAIL: immediateCooking::createDeformableVolumeMesh returned null\n"); return out; }
+
+    // --- the actor ------------------------------------------------------------
+    // elasticityDamping damps the CONSTITUTIVE response only, not the rigid-body
+    // motion, so it leaves the free fall's closed form untouched while making the
+    // stretched cube settle instead of ringing forever.  It also puts the tranche-6
+    // solve on its DAMPED branch (the `1 + damping*dtInv` denominator plus the
+    // scaledDamping*velocity term), which the undeformed case never reaches.
+    PxDeformableVolumeMaterial* volMat =
+        physics->createDeformableVolumeMaterial(/*youngs*/ 1.e5f, /*poissons*/ 0.3f,
+                                                /*dynamicFriction*/ 0.5f,
+                                                /*elasticityDamping*/ stretchY > 1.0f ? 0.05f : 0.0f);
+    PxDeformableVolumeMaterial* mats[1] = { volMat };
+
+    PxShapeFlags shapeFlags = PxShapeFlag::eSIMULATION_SHAPE | PxShapeFlag::eSCENE_QUERY_SHAPE;
+    PxShape* shape = physics->createShape(PxTetrahedronMeshGeometry(volMesh->getCollisionMesh()),
+                                          mats, PxU16(1), true, shapeFlags);
+    if (!shape) { std::printf("FAIL: createShape (deformable volume) returned null\n"); return out; }
+
+    PxDeformableVolume* volume = physics->createDeformableVolume(*cudaCtx);
+    if (!volume) { std::printf("FAIL: createDeformableVolume returned null\n"); return out; }
+
+    volume->attachShape(*shape);
+    shape->release();
+    volume->attachSimulationMesh(*volMesh->getSimulationMesh(), *volMesh->getDeformableVolumeAuxData());
+
+    // Self-collision OFF: it would drag in the whole sb_selfCollision midphase +
+    // contact-prep arc, none of which is mapped yet, and a solid cube has nothing to
+    // self-collide with anyway.  This also puts the tranche-5 collision-mesh rotation
+    // extractor on its skip path (it is gated on stress OR self-collision).
+    volume->setDeformableBodyFlag(PxDeformableBodyFlag::eDISABLE_SELF_COLLISION, true);
+    // PXG_SB_NOGRAVITY isolates the CONSTITUTIVE response from the fall: with gravity
+    // off, a cube spawned stretched relaxes toward its rest shape and nothing else
+    // moves it, so the steady state is unambiguous.  It also puts the tranche-1
+    // pre-integrate gravity gate (PxActorFlag::eDISABLE_GRAVITY) on its skip path --
+    // the one branch its unit test could not give teeth to, because no case set it.
+    out.noGravity = std::getenv("PXG_SB_NOGRAVITY") != nullptr;
+    if (out.noGravity)
+        volume->setActorFlag(PxActorFlag::eDISABLE_GRAVITY, true);
+    volume->setLinearDamping(0.0f);          // cleanest free fall
+    volume->setMaxLinearVelocity(1.0e6f);    // do not clamp it
+    // PXG_SB_ITERS: XPBD position iterations.  Exposed because the stretched cube's
+    // steady-state extent is an XPBD CONVERGENCE residual, not a fixed offset -- see
+    // the note in RUNTIME_STATUS.md.  4 is the engine's usual default.
+    // Called through PxDeformableBody: the same-named PxDeformableVolume override
+    // (PxDeformableVolume.h:453) is PX_DEPRECATED and hides the live one.
+    const char* itersEnv = std::getenv("PXG_SB_ITERS");
+    static_cast<PxDeformableBody*>(volume)->setSolverIterationCounts(
+        itersEnv ? PxU32(atoi(itersEnv)) : 4u, 1u);
+
+    scene->addActor(*volume);
+
+    // --- the host mirror ------------------------------------------------------
+    // Mirrors PxDeformableVolumeExt::allocateAndInitializeHostMirror + transform +
+    // copyToDevice (ExtDeformableVolumeExt.cpp), open-coded because physxextensions
+    // is not linked into this harness.  The cube is spawned at spawnY with invMass
+    // taken from the cooked aux data (uniform for a uniform mesh) and zero velocity,
+    // so the first frames are a pure free fall with no contact at all.
+    const float spawnY = 4.0f;
+    const PxU32 nbSim = volume->getSimulationMesh()->getNbVertices();
+    out.restExtentY = size;
+    out.stretchY = stretchY;
+    const PxU32 nbColl = volume->getCollisionMesh()->getNbVertices();
+
+    std::vector<PxVec4> simPos(nbSim), simVel(nbSim), collPos(nbColl), restPos(nbColl);
+
+    const PxVec3* simVerts = volume->getSimulationMesh()->getVertices();
+    const PxReal* invMassGM = volume->getDeformableVolumeAuxData()->getGridModelInvMass();
+    for (PxU32 v = 0; v < nbSim; ++v)
+    {
+        const PxReal im = invMassGM ? invMassGM[v] : 1.0f;
+        // stretchY > 1 spawns the cube ELONGATED along y while its rest pose
+        // (mSimTetraRestPoses, computed by the cooker from the undeformed mesh) still
+        // describes the cube.  That is a genuine constitutive violation, so the FEM
+        // solve has real work to do from frame one — see the scene header.
+        simPos[v] = PxVec4(simVerts[v].x, simVerts[v].y * stretchY + spawnY, simVerts[v].z, im);
+        simVel[v] = PxVec4(0.0f, 0.0f, 0.0f, im);
+    }
+    const PxVec3* collVerts = volume->getCollisionMesh()->getVertices();
+    for (PxU32 v = 0; v < nbColl; ++v)
+    {
+        collPos[v] = PxVec4(collVerts[v].x, collVerts[v].y * stretchY + spawnY, collVerts[v].z, 1.0f);
+        restPos[v] = collPos[v];
+    }
+
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getSimPositionInvMassBufferD()),
+                    simPos.data(), nbSim * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getSimVelocityBufferD()),
+                    simVel.data(), nbSim * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getPositionInvMassBufferD()),
+                    collPos.data(), nbColl * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getRestPositionBufferD()),
+                    restPos.data(), nbColl * sizeof(PxVec4));
+    volume->markDirty(PxDeformableVolumeDataFlag::eALL);
+
+    // The skin-gap check below is only meaningful if the two buffers are genuinely
+    // separate device allocations — if they aliased (as the CLOTH buffers do with the
+    // engine's internal arrays) the gap would be identically zero for free.
+    if (volume->getPositionInvMassBufferD() == volume->getSimPositionInvMassBufferD())
+    {
+        std::printf("FAIL: the collision and simulation position buffers ALIAS — the skin check "
+                    "would have no teeth\n");
+        return out;
+    }
+
+    out.volume = volume;
+    out.numSimVerts = nbSim;
+    out.numCollVerts = nbColl;
+    std::printf("  softbody mesh: %u sim verts / %u tets, %u collision verts "
+                "(coll buf %p, sim buf %p)\n",
+                nbSim, volume->getSimulationMesh()->getNbTetrahedrons(), nbColl,
+                static_cast<void*>(volume->getPositionInvMassBufferD()),
+                static_cast<void*>(volume->getSimPositionInvMassBufferD()));
+    return out;
+}
+
+// DtoH-read ONE of the two softbody vertex buffers and fill mean / min y.  `sim`
+// picks the simulation mesh (what the solver moves) over the collision mesh (what
+// sb_gm_updateTetModelVertsLaunch skins).  Returns false on any non-finite coord.
+bool softBodyMeanMinY(const SoftBodyScene& sbs, bool sim, float& meanY, float& minY,
+                      float* extentY = nullptr)
+{
+    const PxU32 nv = sim ? sbs.numSimVerts : sbs.numCollVerts;
+    std::vector<PxVec4> host(nv);
+    PxCudaContext* ctx = sbs.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(),
+                    reinterpret_cast<CUdeviceptr>(sim ? sbs.volume->getSimPositionInvMassBufferD()
+                                                      : sbs.volume->getPositionInvMassBufferD()),
+                    nv * sizeof(PxVec4));
+    double sum = 0.0;
+    float lo = 1.0e30f, hi = -1.0e30f;
+    bool finite = true;
+    for (PxU32 i = 0; i < nv; ++i)
+    {
+        const float y = host[i].y;
+        sum += double(y);
+        lo = PxMin(lo, y);
+        hi = PxMax(hi, y);
+        if (!std::isfinite(y) || !std::isfinite(host[i].x) || !std::isfinite(host[i].z)) finite = false;
+    }
+    meanY = float(sum / double(nv));
+    minY = lo;
+    if (extentY) *extentY = hi - lo;
+    return finite;
+}
+
 } // namespace
 
 int main()
@@ -1633,6 +1929,210 @@ int main()
         return 2;
     }
 
+    // PXG_SCENE=softbody (P8.0 tranche 7): the FEM-VOLUME money shot — a tetrahedral cube
+    // free-falling under gravity.  The pass criterion is deliberately read off the
+    // COLLISION mesh, which only moves because sb_gm_updateTetModelVertsLaunch skins it
+    // onto the simulation tetrahedra; both meshes are reported every step so a divergence
+    // between them localises straight to that kernel.  Softbody runs on PGS — pass
+    // PXG_SOLVER=pgs.
+    if (!std::strcmp(sceneName, "softbody"))
+    {
+        // PXG_SB_STRETCH elongates the cube along y at spawn while leaving its REST pose
+        // (which the cooker computed from the undeformed mesh) alone.  With the default
+        // 1.0 the cube is spawned at rest and the constitutive solve produces a ZERO
+        // delta all the way down, so the fall is a pure integrate test.  With a value > 1
+        // the FEM solve has to pull the cube back toward its rest shape while it falls,
+        // which is the only way this scene exercises the tranche-6 constraint solve and
+        // the tranche-7 partition-copy MERGE at all -- see the extra check below.
+        const char* stretchEnv = std::getenv("PXG_SB_STRETCH");
+        const float stretchY = stretchEnv ? float(atof(stretchEnv)) : 1.0f;
+
+        SoftBodyScene sbs = buildSoftBodyScene(physics, scene, material, cudaCtx, stretchY);
+        if (!sbs.volume || sbs.numCollVerts == 0)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbody scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'softbody' built: %u-vertex FEM-volume cube at y~4 on the GPU "
+                    "(%s, spawn stretch %.2fx)\n", sbs.numCollVerts,
+                    sbs.noGravity ? "gravity OFF" : "free-falling", sbs.stretchY);
+
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: softbody GPU pipeline CONSTRUCTED + live over Vulkan "
+                        "(set PXG_GPU_STEP=1 to step the free fall)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_SB_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 60;
+
+        float meanC0 = 0.0f, minC0 = 0.0f, meanS0 = 0.0f, minS0 = 0.0f, extS0 = 0.0f;
+        bool finite = softBodyMeanMinY(sbs, /*sim*/ false, meanC0, minC0);
+        finite = softBodyMeanMinY(sbs, /*sim*/ true, meanS0, minS0, &extS0) && finite;
+        std::printf("  stepping the softbody (%d x %.4fs), initial coll mean y=%.4f / sim mean y=%.4f, "
+                    "sim y-extent %.4f (rest %.4f)...\n",
+                    steps, dt, meanC0, meanS0, extS0, sbs.restExtentY);
+
+        float prevC = meanC0;
+        int nonMonotonic = 0;
+        float meanC = meanC0, minC = minC0, meanS = meanS0, minS = minS0, extS = extS0;
+        float maxSkinGap = 0.0f;
+        float extSettleRef = extS0;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            finite = softBodyMeanMinY(sbs, /*sim*/ false, meanC, minC) && finite;
+            finite = softBodyMeanMinY(sbs, /*sim*/ true, meanS, minS, &extS) && finite;
+            // The collision mesh is a barycentric skin over the sim tets, so for a rigid
+            // free fall the two means must track each other closely.  A growing gap is the
+            // skin kernel failing to keep up (or not running at all).
+            maxSkinGap = PxMax(maxSkinGap, PxAbs(meanC - meanS));
+            if (i == steps - 21) extSettleRef = extS;   // 20 steps before the end
+            if (i < 5 || i == steps - 1 || (i % 10 == 0))
+                std::printf("    step %3d: coll mean y = %.5f (dy = %+.5f), sim mean y = %.5f, "
+                            "skin gap = %.5f, sim y-extent = %.5f\n",
+                            i, meanC, meanC - prevC, meanS, PxAbs(meanC - meanS), extS);
+            if (meanC > prevC + 1e-3f) ++nonMonotonic;   // free fall: must not rise
+            prevC = meanC;
+        }
+        const float drop = meanC0 - meanC;
+
+        int failures = 0;
+        // The engine integrates gravity semi-implicitly (v += g*dt; x += v*dt), so after n
+        // steps a contact-free body has dropped exactly g*dt^2*n(n+1)/2 -- NOT the
+        // continuous 0.5*g*t^2.  Used twice below: as the closed form the undeformed fall
+        // must match, and as the yardstick the no-gravity run must come nowhere near.
+        const float gAccel = 9.81f;
+        const float expectDrop = gAccel * dt * dt * float(steps) * float(steps + 1) * 0.5f;
+        std::printf("  softbody free fall: coll mean y %.4f -> %.4f (dropped %.4f over %.2fs), "
+                    "sim mean y %.4f -> %.4f\n", meanC0, meanC, drop, steps * dt, meanS0, meanS);
+        if (sbs.noGravity)
+        {
+            // PXG_SB_NOGRAVITY puts the tranche-1 pre-integrate gravity gate
+            // (PxActorFlag::eDISABLE_GRAVITY) on its SKIP path -- the one branch its unit
+            // test could not give teeth to, because no case set the flag.  If the gate did
+            // not take, the cube falls and this fires.
+            // Budgeted against what gravity WOULD have done, not against zero: a stretched
+            // cube's relaxation shifts its centroid slightly (the alternating 5-tet split is
+            // not mirror-symmetric about the mid-plane, and the orientation flips break what
+            // symmetry remains).  Measured at 120 steps: -0.018 against a 19.8 free fall, so
+            // a 2% budget still catches a gravity leak by a factor of ~100.
+            if (!(PxAbs(drop) < 0.02f * expectDrop))
+            { std::printf("FAIL: PXG_SB_NOGRAVITY is set but the cube still moved %.5f in y "
+                          "(gravity would have moved it %.5f) — the pre-integrate gravity gate "
+                          "did not take\n", drop, expectDrop); ++failures; }
+        }
+        else if (!(meanC < meanC0 - 0.05f))
+        { std::printf("FAIL: softbody collision mesh did not fall (drop=%.4f)\n", drop); ++failures; }
+        // QUANTITATIVE free fall: checking the closed form rather than "it went down"
+        // gives the scene teeth on the WHOLE integrate chain (sb_gm_preIntegrateLaunch's
+        // gravity predict, sb_gm_stepSoftbodyLaunch, sb_gm_finalizeVelocitiesLaunch)
+        // instead of only on its sign.  The band is 1%; the measured error is 0.0000%.
+        if (sbs.stretchY != 1.0f || sbs.noGravity)
+            std::printf("  (closed-form free-fall check skipped: %s)\n",
+                        sbs.noGravity ? "gravity is disabled"
+                                      : "the cube was spawned stretched, so its elastic response "
+                                        "moves the mean too");
+        else if (!(PxAbs(drop - expectDrop) < 0.01f * expectDrop))
+        { std::printf("FAIL: free fall does not match semi-implicit Euler: dropped %.5f, "
+                      "expected %.5f (g*dt^2*n(n+1)/2)\n", drop, expectDrop); ++failures; }
+        else
+            std::printf("  free fall matches semi-implicit Euler: %.5f vs %.5f expected "
+                        "(%.4f%% off)\n", drop, expectDrop,
+                        100.0f * PxAbs(drop - expectDrop) / expectDrop);
+        if (!sbs.noGravity && !(meanS < meanS0 - 0.05f))
+        { std::printf("FAIL: softbody simulation mesh did not fall (%.4f -> %.4f)\n", meanS0, meanS); ++failures; }
+        // Monotonicity and the closed form are INTEGRATE assertions: they hold only when
+        // the constitutive solve contributes nothing.  A cube spawned deformed is pulled
+        // by its own elastic response as well as by gravity, and that legitimately moves
+        // the mean both ways -- so these two are gated on the undeformed case.
+        if (sbs.stretchY == 1.0f && !sbs.noGravity && nonMonotonic != 0)
+        { std::printf("FAIL: collision mean y increased on %d step(s)\n", nonMonotonic); ++failures; }
+        if (!finite)
+        { std::printf("FAIL: softbody y went non-finite\n"); ++failures; }
+        // THE tranche-7 assertion: the skin must track the solve.  The cube is spawned
+        // undeformed and falls without contact, so the two meshes are the same point set;
+        // any drift beyond a small band means updateTetModelVerts is not doing its job.
+        if (!(maxSkinGap < 0.05f))
+        { std::printf("FAIL: collision mesh drifted from the simulation mesh (max gap %.5f) — "
+                      "the barycentric skin is not tracking the solve\n", maxSkinGap); ++failures; }
+
+        // THE tranche-6 / partition-merge assertion, only meaningful when the cube was
+        // spawned deformed.  Gravity is uniform, so it can never change the cube's
+        // EXTENT — only the constitutive solve can.  A cube spawned 1.6x too tall must
+        // therefore contract measurably toward its rest height, and it must not blow up.
+        if (sbs.stretchY > 1.0f)
+        {
+            const float spawnExtent = sbs.restExtentY * sbs.stretchY;
+            const float recovered = (spawnExtent - extS) / (spawnExtent - sbs.restExtentY);
+            std::printf("  sim y-extent: %.5f -> %.5f (rest %.5f, spawned %.5f) — the FEM solve "
+                        "recovered %.1f%% of the spawn stretch\n",
+                        extS0, extS, sbs.restExtentY, spawnExtent, 100.0f * recovered);
+
+            // Whatever else happens, the solve must never ADD stretch.
+            if (!(extS < spawnExtent * 1.05f))
+            { std::printf("FAIL: the stretched cube EXPANDED instead of contracting "
+                          "(%.5f -> %.5f) — the solve is unstable\n", spawnExtent, extS); ++failures; }
+
+            if (sbs.noGravity)
+            {
+                // The CLEAN constitutive test: nothing but the solve can move the cube, so it
+                // must relax essentially all the way back and then HOLD STILL.  Measured over
+                // 120 steps: the extent converges to 1.03481 (94.2% recovered) by step ~60 and
+                // is then constant to five decimals.  The 3.5% residual is XPBD's finite
+                // compliance, not drift — 4x the iterations barely moves it (1.128 -> 1.109 in
+                // the falling case at step 119).
+                if (!(recovered > 0.85f))
+                { std::printf("FAIL: with gravity off the solve must relax the cube nearly all "
+                              "the way back (only %.1f%%)\n", 100.0f * recovered); ++failures; }
+                if (!(PxAbs(extS - extSettleRef) < 1.0e-3f))
+                { std::printf("FAIL: the cube never SETTLED — y-extent still moving over the last "
+                              "20 steps (%.5f -> %.5f)\n", extSettleRef, extS); ++failures; }
+                else
+                    std::printf("  and it SETTLED: y-extent constant to %.1e over the last 20 steps\n",
+                                PxAbs(extS - extSettleRef));
+            }
+            else
+            {
+                // WITH gravity the equilibrium creeps outward as the fall speeds up: the
+                // constitutive damping term couples to the vertices' ABSOLUTE velocity, and in
+                // free fall that grows without bound.  Measured: the extent relaxes to ~1.034
+                // by step 20 then creeps to ~1.13 by step 120, decelerating.  That is engine
+                // behaviour, not a port defect — the PXG_SB_NOGRAVITY run isolates the same
+                // solve and shows it dead steady.  So the falling case only asserts that a
+                // substantial contraction happened at all.
+                if (!(recovered > 0.10f))
+                { std::printf("FAIL: the FEM solve did not contract the stretched cube "
+                              "(extent %.5f -> %.5f, %.1f%% of the way back to rest %.5f)\n",
+                              extS0, extS, 100.0f * recovered, sbs.restExtentY); ++failures; }
+            }
+        }
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        if (failures == 0)
+        {
+            if (sbs.noGravity)
+                std::printf("[  OK  ] gpu-sdk-step: FEM-volume softbody RELAXED from a %.2fx stretch back "
+                            "to within %.1f%% of its rest shape and held there — the constitutive solve "
+                            "converges on Vulkan\n", sbs.stretchY,
+                            100.0f * (extS / sbs.restExtentY - 1.0f));
+            else if (sbs.stretchY > 1.0f)
+                std::printf("[  OK  ] gpu-sdk-step: FEM-volume softbody fell under gravity on Vulkan while "
+                            "the solve pulled it back from a %.2fx stretch, collision mesh skinned to the "
+                            "solve (max gap %.5f)\n", sbs.stretchY, maxSkinGap);
+            else
+                std::printf("[  OK  ] gpu-sdk-step: FEM-volume softbody fell monotonically under gravity on "
+                            "Vulkan, collision mesh skinned to the solve (max gap %.5f) — the first live "
+                            "softbody frame\n", maxSkinGap);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: softbody free-fall checks failed (%d)\n", failures);
+        return 2;
+    }
+
     std::vector<RestTarget> targets;
     if      (!std::strcmp(sceneName, "box"))       buildBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "stack"))     buildStackScene(physics, scene, material, targets);
@@ -1642,7 +2142,7 @@ int main()
     else if (!std::strcmp(sceneName, "capsulebox")) buildCapsuleBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "convex"))    buildConvexScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "joint"))     buildJointScene(physics, scene, material, targets);
-    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint|particle|cloth|clothhang|clothdrape|clothselfcollide)\n", sceneName);
+    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint|particle|cloth|clothhang|clothdrape|clothselfcollide|softbody)\n", sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
     if (targets.empty())
     {
