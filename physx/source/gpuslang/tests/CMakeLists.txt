@@ -522,7 +522,8 @@ pxg_compile_shader(softBodyRefitBda sb_refitBoundLaunch)
 pxg_compile_shader(softBodySolveBda sb_gm_zeroTetMultipliers
                    sb_gm_applyExternalDeltasLaunch
                    sb_gm_updateTetrahedraRotationsLaunch
-                   sb_updateTetrahedraRotationsLaunch)
+                   sb_updateTetrahedraRotationsLaunch
+                   sb_gm_cp_solveTetrahedronsPartitionLaunch)
 pxg_compile_shader(contactReduce ctContactReduce)
 pxg_compile_shader(npSbTet ctSbTet)
 pxg_compile_shader(npSbSelf ctSbSelfQuery)

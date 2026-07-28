@@ -448,3 +448,586 @@ void sb_updateTetrahedraRotationsLaunch(uint3 groupThreadId : SV_GroupThreadID, 
         }
     }
 }
+
+
+// ===========================================================================
+// P8.0 tranche 6 — the FEM-VOLUME CONSTRAINT SOLVE, the core of the softbody solver.
+//
+//   sb_gm_cp_solveTetrahedronsPartitionLaunch (softBodyGM.cu:1408,
+//   launch PxgSoftBodyCore.cpp:1202)
+//
+// One thread per tetrahedron of ONE graph-colouring partition.  It gathers the tet's four
+// vertices, refreshes the co-rotational frame, runs the constitutive solve, and scatters
+// the resulting position/velocity corrections back through the partition's remap table.
+// Partitions are dispatched one at a time by the host, which is what makes the
+// Gauss-Seidel scatter race-free without any atomics.
+//
+// SCOPE: the mNumTetsPerElement == 1 (pure tetrahedral mesh) path.  The hexahedral
+// sibling (sb_gm_cp_solveHexahedronsPartition_parallelGS, taken when
+// mNumTetsPerElement != 1) is a separate arg-compatible branch and is NOT ported here;
+// the kernel reproduces the .cu's dispatch and simply performs no work in that case,
+// which is faithful for every tet-mesh softbody (the only kind the harness builds).
+//
+// Doctrine: descriptor through Ptr<> from the byte-exact pxgSlangSoftBodyDesc mirror.
+// Fields touched: mSimVelocity_invMassCP @176, mSimPosition_InvMassCP @184,
+// mSimRemapOutputCP @192, mSimAccumulatedPartitionsCP @208, mSimTetraMultipliers @264,
+// mOrderedMaterialIndices @288, mSimTetraRestPoses @136, mSimTetraRotations @168,
+// mSimPosition_InvMass @96, mSimVelocity_InvMass @88, mInitialRotation @348,
+// mNumTetsGM @376, mNumPartitionsGM @380, mSimPullIndices @400, mNumTetsPerElement @412,
+// plus the external PxsDeformableVolumeMaterialData array (32-byte stride:
+// youngs @0, poissons @4, dynamicFriction @8, elasticityDamping @12, dampingScale @16
+// (PxU16), materialModel @18 (PxU16), deformThreshold @20, ...).
+//
+// TOLERANCE SEAM: inherited, and only from the rotation refresh.  The solve calls
+// computeGMTetrahedronRotations -> extractRotation, whose PxQuat(w, omega) evaluates
+// sin/cos (see the tranche-5 header).  The CONSTITUTIVE MATHS ITSELF IS BIT-EXACT: every
+// operation in volumeSolve / tetrahedronsSolveInnerNeoHookean / ARAP_constraint /
+// volume_constraint / compute_deltaLambdaXgradC is mul/add/sub/div/cross/dot plus a
+// single PxSqrt (IEEE-754 correctly rounded).  The unit test exploits that split — it
+// drives the constitutive path with a PRE-SEEDED rotation and 0 rotation iterations so
+// the material solve is compared bit-exactly, and covers the seam separately.
+//
+// DEVIATIONS from CUDA:
+//   - the opening blockCopy of the descriptor into __shared__ + __syncthreads is dropped
+//     (read-caching only), as in every prior softbody tranche;
+//   - the two __syncwarp() calls are dropped.  They are NOT load-bearing here: each
+//     thread reads and writes only its own tetrahedron's slots, and the gather/scatter go
+//     through per-thread pull/remap indices with no cross-lane exchange whatsoever.  In
+//     CUDA they exist to order the divergent pointer-selection loop against the loads
+//     under the independent-thread-scheduling model; SPIR-V's memory model gives the same
+//     guarantee for a single thread's own accesses without a barrier;
+//   - the `#pragma unroll` 4-iteration gather/scatter loops become explicit 4-element
+//     sequences (Slang has no equivalent pragma and the trip count is a literal 4).
+// ===========================================================================
+
+// Most significant bit is 0, the remaining 31 bits are 1.  The MSB of a pull index stores
+// the tet's flipped state (softBodyGM.cu:1044).
+static const uint PULL_IND_MASK = 0x7fffffffu;
+static const float SB_STIFFNESS_THRESHOLD = 1.0e-18f;
+static const float SB_ARAP_EPSILON = 1.0e-18f;
+
+// PxDeformableVolumeMaterialModel (PxDeformableVolumeMaterial.h:43): eCO_ROTATIONAL = 0
+// (the default), eNEO_HOOKEAN = 1.
+static const uint PXG_SB_MATERIAL_CO_ROTATIONAL = 0u;
+static const uint PXG_SB_MATERIAL_NEO_HOOKEAN = 1u;
+
+// PxsDeformableVolumeMaterialData (PxsDeformableVolumeMaterialCore.h:50), 32-byte stride.
+static const uint64_t SB_MATERIAL_STRIDE = 32UL;
+
+struct SbMaterial
+{
+    float youngs;
+    float poissons;
+    float elasticityDamping;
+    float dampingScale;      // toUniformReal(PxU16) already applied
+    uint materialModel;
+}
+
+SbMaterial sbLoadMaterial(uint64_t materials, uint index)
+{
+    const uint64_t base = materials + uint64_t(index) * SB_MATERIAL_STRIDE;
+    SbMaterial m;
+    m.youngs = Ptr<float>(base)[0];
+    m.poissons = Ptr<float>(base)[1];
+    m.elasticityDamping = Ptr<float>(base)[3];
+    // dampingScale is a PxU16 @16 and materialModel a PxU16 @18 — one 32-bit word.
+    const uint packed = Ptr<uint>(base + 16UL)[0];
+    // toUniformReal(v) = PxReal(v) * (1.0f / 65535.0f)
+    m.dampingScale = float(packed & 0xffffu) * (1.0f / 65535.0f);
+    m.materialModel = (packed >> 16) & 0xffffu;
+    return m;
+}
+
+// --- PxMat33 as a struct of three columns ---------------------------------------------
+// Passing the three columns as separate parameters produced a function with 23 arguments
+// and deeply nested `out` chains, which llvmpipe's JIT miscompiled into a SIGSEGV (the
+// bisection: an EMPTY solve body ran clean, while EITHER material branch alone crashed —
+// i.e. it tracked total call-frame width, not any one expression).  Bundling the columns
+// keeps the transcription line-for-line while cutting the widest signature to 12.
+struct SbMat33
+{
+    float3 c0, c1, c2;
+}
+
+SbMat33 sbMat33(float3 a, float3 b, float3 c) { SbMat33 m; m.c0 = a; m.c1 = b; m.c2 = c; return m; }
+SbMat33 sbMat33Zero() { return sbMat33(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f)); }
+
+// --- PxMat33 helpers, columns as three float3 (see the file header on convention) -----
+
+// A*B: col_i(result) = A.transform(B.col_i)
+SbMat33 sbMat33MulM(SbMat33 a, SbMat33 b)
+{
+    return sbMat33(sbMat33Transform(a.c0, a.c1, a.c2, b.c0),
+                   sbMat33Transform(a.c0, a.c1, a.c2, b.c1),
+                   sbMat33Transform(a.c0, a.c1, a.c2, b.c2));
+}
+
+SbMat33 sbMat33Transpose(SbMat33 m)
+{
+    return sbMat33(float3(m.c0[0], m.c1[0], m.c2[0]),
+                   float3(m.c0[1], m.c1[1], m.c2[1]),
+                   float3(m.c0[2], m.c1[2], m.c2[2]));
+}
+
+SbMat33 sbMat33FromQuatM(float4 q)
+{
+    float3 c0, c1, c2;
+    sbMat33FromQuat(q, c0, c1, c2);
+    return sbMat33(c0, c1, c2);
+}
+
+// PxMat33::getDeterminant() (PxMat33.h): column0.dot(column1.cross(column2))
+float sbMat33Det(SbMat33 m) { return sbDot3(m.c0, sbCross3(m.c1, m.c2)); }
+
+bool sbMat33IsZero(SbMat33 m)
+{
+    return m.c0.x == 0.0f && m.c0.y == 0.0f && m.c0.z == 0.0f &&
+           m.c1.x == 0.0f && m.c1.y == 0.0f && m.c1.z == 0.0f &&
+           m.c2.x == 0.0f && m.c2.y == 0.0f && m.c2.z == 0.0f;
+}
+
+// The four tet vertex weights, bundled so the constraint helpers take one argument.
+struct SbTetV
+{
+    float4 v0, v1, v2, v3;
+}
+
+// --- compute_dCdx (softBodyGM.cu:532) -------------------------------------------------
+// dC/dx = dF/dx : dC/dF, using the ROW vectors of DmInv and dCdF.
+SbMat33 sbComputeDCdx(SbMat33 dCdF, SbMat33 DmInv)
+{
+    // row vectors of DmInv and dCdF
+    const SbMat33 r = sbMat33Transpose(DmInv);
+    const SbMat33 p = sbMat33Transpose(dCdF);
+
+    return sbMat33(float3(sbDot3(r.c0, p.c0), sbDot3(r.c0, p.c1), sbDot3(r.c0, p.c2)),
+                   float3(sbDot3(r.c1, p.c0), sbDot3(r.c1, p.c1), sbDot3(r.c1, p.c2)),
+                   float3(sbDot3(r.c2, p.c0), sbDot3(r.c2, p.c1), sbDot3(r.c2, p.c2)));
+}
+
+// --- compute_deltaLambdaXgradC (softBodyGM.cu:554) ------------------------------------
+// Accumulates deltaLambda * dCdx into deltaLambdaXgradC and advances lambda.
+void sbComputeDeltaLambdaXGradC(inout SbMat33 dl, inout float lambda, float C,
+                                SbMat33 dCdF, SbMat33 DmInv, SbTetV tv,
+                                float alphaTilde, float dtInv, float damping, float scaledDamping)
+{
+    const SbMat33 dCdx = sbComputeDCdx(dCdF, DmInv);
+    const float3 dCdx1 = dCdx.c0, dCdx2 = dCdx.c1, dCdx3 = dCdx.c2;
+    const float4 v0 = tv.v0, v1 = tv.v1, v2 = tv.v2, v3 = tv.v3;
+
+    const float3 dCdx0 = -dCdx1 - dCdx2 - dCdx3;
+    float deltaLambda;
+
+    if (damping == 0.0f) // no damping
+    {
+        const float denom = sbDot3(dCdx0, dCdx0) * v0.w + sbDot3(dCdx1, dCdx1) * v1.w +
+                            sbDot3(dCdx2, dCdx2) * v2.w + sbDot3(dCdx3, dCdx3) * v3.w + alphaTilde;
+        if (abs(denom) < 1.0e-15f)
+            return;
+
+        deltaLambda = (-C - alphaTilde * lambda) / denom;
+    }
+    else
+    {
+        const float denom =
+            (1.0f + damping * dtInv) * (sbDot3(dCdx0, dCdx0) * v0.w + sbDot3(dCdx1, dCdx1) * v1.w +
+                                        sbDot3(dCdx2, dCdx2) * v2.w + sbDot3(dCdx3, dCdx3) * v3.w) +
+            alphaTilde;
+
+        if (abs(denom) < 1.0e-15f)
+        {
+            dl = sbMat33Zero();
+            return;
+        }
+
+        deltaLambda = (-C - alphaTilde * lambda -
+                       scaledDamping * (sbDot3(dCdx0, float3(v0.x, v0.y, v0.z)) +
+                                        sbDot3(dCdx1, float3(v1.x, v1.y, v1.z)) +
+                                        sbDot3(dCdx2, float3(v2.x, v2.y, v2.z)) +
+                                        sbDot3(dCdx3, float3(v3.x, v3.y, v3.z)))) /
+                      denom;
+    }
+
+    lambda += deltaLambda;
+
+    // return: deltaLambda * dCdx  (ACCUMULATES — the caller may already hold a term)
+    dl.c0 += deltaLambda * dCdx1;
+    dl.c1 += deltaLambda * dCdx2;
+    dl.c2 += deltaLambda * dCdx3;
+}
+
+// --- ARAP_constraint (softBodyGM.cu:722) ----------------------------------------------
+void sbARAPConstraint(inout SbMat33 dl, inout float lambda, SbTetV tv, float4 tetR,
+                      SbMat33 F, float dtInv, SbMat33 DmInv,
+                      float alphaTilde, float damping, float scaledDamping)
+{
+    const SbMat33 R = sbMat33FromQuatM(tetR);
+    SbMat33 t = sbMat33(F.c0 - R.c0, F.c1 - R.c1, F.c2 - R.c2);
+
+    // PxSqrt is IEEE-754 correctly rounded -> bit-exact.
+    const float ARAP_C = sqrt(sbDot3(t.c0, t.c0) + sbDot3(t.c1, t.c1) + sbDot3(t.c2, t.c2) + SB_ARAP_EPSILON);
+
+    const float inv = 1.0f / ARAP_C;
+    t.c0 *= inv; t.c1 *= inv; t.c2 *= inv;   // dCdF
+
+    sbComputeDeltaLambdaXGradC(dl, lambda, ARAP_C, t, DmInv, tv, alphaTilde, dtInv, damping, scaledDamping);
+}
+
+// --- volume_constraint (softBodyGM.cu:756) --------------------------------------------
+void sbVolumeConstraint(inout SbMat33 dl, inout float lambda, SbTetV tv,
+                        SbMat33 F, float invDt, SbMat33 DmInv,
+                        float alphaTilde, float damping, float scaledDamping)
+{
+    const float detF = sbMat33Det(F);
+    const float C = detF - 1.0f;
+    const SbMat33 dCdF = sbMat33(sbCross3(F.c1, F.c2), sbCross3(F.c2, F.c0), sbCross3(F.c0, F.c1));
+
+    sbComputeDeltaLambdaXGradC(dl, lambda, C, dCdF, DmInv, tv, alphaTilde, invDt, damping, scaledDamping);
+}
+
+// --- volumeSolve (softBodyGM.cu:621) --------------------------------------------------
+SbMat33 sbVolumeSolve(SbMat33 P, SbTetV tv, float invDtSq, SbMat33 Qinv, float volumeLambda)
+{
+    const float det = sbMat33Det(Qinv);
+    const float volume = 1.0f / (6.0f * det);
+
+    const float alphaTilde = (volumeLambda == 0.0f) ? 0.0f : 1.0f / (volumeLambda * volume * invDtSq);
+
+    const SbMat33 F = sbMat33MulM(P, Qinv);   // F = P * Qinv
+
+    const float3 g0 = sbCross3(F.c1, F.c2);
+    const float3 g1 = sbCross3(F.c2, F.c0);
+    const float3 g2 = sbCross3(F.c0, F.c1);
+
+    const float3 grad1 = g0 * Qinv.c0.x + g1 * Qinv.c1.x + g2 * Qinv.c2.x;
+    const float3 grad2 = g0 * Qinv.c0.y + g1 * Qinv.c1.y + g2 * Qinv.c2.y;
+    const float3 grad3 = g0 * Qinv.c0.z + g1 * Qinv.c1.z + g2 * Qinv.c2.z;
+    const float3 grad0 = -grad1 - grad2 - grad3;
+
+    const float detF = sbDot3(g2, F.c2);
+    const float C = (detF - 1.0f);
+
+    const float w = sbDot3(grad0, grad0) * tv.v0.w
+                  + sbDot3(grad1, grad1) * tv.v1.w
+                  + sbDot3(grad2, grad2) * tv.v2.w
+                  + sbDot3(grad3, grad3) * tv.v3.w;
+
+    const float dlambda = -C / (w + alphaTilde);
+
+    return sbMat33(grad1 * dlambda, grad2 * dlambda, grad3 * dlambda);
+}
+
+// --- tetrahedronsSolveInnerNeoHookean (softBodyGM.cu:657) -----------------------------
+SbMat33 sbSolveInnerNeoHookean(SbMat33 P, SbTetV tv, uint64_t multipliers, float invDtSq,
+                               uint workIndex, SbMat33 Qinv, bool isTGS, float invE)
+{
+    const SbMat33 F = sbMat33MulM(P, Qinv);   // F = P * Qinv
+
+    const float3 g1 = F.c0 * 2.0f * Qinv.c0.x + F.c1 * 2.0f * Qinv.c1.x + F.c2 * 2.0f * Qinv.c2.x;
+    const float3 g2 = F.c0 * 2.0f * Qinv.c0.y + F.c1 * 2.0f * Qinv.c1.y + F.c2 * 2.0f * Qinv.c2.y;
+    const float3 g3 = F.c0 * 2.0f * Qinv.c0.z + F.c1 * 2.0f * Qinv.c1.z + F.c2 * 2.0f * Qinv.c2.z;
+
+    const float C = sbDot3(F.c0, F.c0) + sbDot3(F.c1, F.c1) + sbDot3(F.c2, F.c2) - 3.0f;
+
+    const float3 g0 = -g1 - g2 - g3;
+
+    const float w = sbDot3(g0, g0) * tv.v0.w + sbDot3(g1, g1) * tv.v1.w +
+                    sbDot3(g2, g2) * tv.v2.w + sbDot3(g3, g3) * tv.v3.w;
+
+    const float alpha = invDtSq * invE;
+    float dlambda;
+
+    if (!isTGS)
+    {
+        // mSimTetraMultipliers[workIndex/32].mbyz[workIndex&31] — a float2 in the
+        // PxgSpatialVectorBlock's second array.
+        const uint64_t mbyz = multipliers + uint64_t(workIndex >> 5) * SPATIAL_BLOCK_STRIDE +
+                              SPATIAL_BLOCK_MBYZ_OFFSET + uint64_t(workIndex & 31u) * 8UL;
+        float2 totalLambda = Ptr<float2>(mbyz)[0];
+
+        dlambda = -(C + alpha * totalLambda.x) / (w + alpha);
+
+        totalLambda.x += dlambda;
+        Ptr<float2>(mbyz)[0] = totalLambda;
+    }
+    else
+    {
+        dlambda = -C / (w + alpha);
+    }
+
+    return sbMat33(g1 * dlambda, g2 * dlambda, g3 * dlambda);
+}
+
+// --- tetrahedronsSolveGM (softBodyGM.cu:926) — the material dispatcher ----------------
+SbMat33 sbTetrahedronsSolveGM(SbMat33 U, SbTetV tv, uint64_t multipliers,
+                              float invDtSq, float invDt, uint workIndex,
+                              SbMat33 Qinv, float4 tetR, bool isTGS, SbMaterial material)
+{
+    SbMat33 dl = sbMat33Zero();
+
+    if (material.youngs < SB_STIFFNESS_THRESHOLD)
+        return dl;
+
+    if (material.materialModel == PXG_SB_MATERIAL_NEO_HOOKEAN)
+    {
+        const float invE = 1.0f / material.youngs;
+        const SbMat33 R = sbMat33FromQuatM(tetR);
+        // P = RTranspose * PxMat33(u1, u2, u3)
+        SbMat33 P = sbMat33MulM(sbMat33Transpose(R), U);
+
+        SbMat33 d = sbSolveInnerNeoHookean(P, tv, multipliers, invDtSq, workIndex, Qinv, isTGS, invE);
+
+        const float3 delta0 = -(d.c0 + d.c1 + d.c2) * tv.v0.w;
+        P.c0 += (d.c0 * tv.v1.w - delta0);
+        P.c1 += (d.c1 * tv.v2.w - delta0);
+        P.c2 += (d.c2 * tv.v3.w - delta0);
+
+        if (material.poissons > SB_STIFFNESS_THRESHOLD)
+        {
+            const float nu = material.poissons;
+            const float volumeLambda = (nu < 0.5f - SB_STIFFNESS_THRESHOLD)
+                                           ? nu / ((1.0f - 2.0f * nu) * material.youngs)
+                                           : 0.0f;
+            const SbMat33 sv = sbVolumeSolve(P, tv, invDtSq, Qinv, volumeLambda);
+            d.c0 += sv.c0; d.c1 += sv.c1; d.c2 += sv.c2;
+        }
+
+        // deltaLambdaXgradC = R * delta
+        dl = sbMat33MulM(R, d);
+    }
+    else // PxDeformableVolumeMaterialModel::eCO_ROTATIONAL
+    {
+        // lameParameters (deformableUtils.cuh:124)
+        const float lambdaLame = material.youngs * material.poissons /
+                                 ((1.0f + material.poissons) * (1.0f - 2.0f * material.poissons));
+        const float mu = material.youngs / (2.0f * (1.0f + material.poissons));
+
+        const float det = sbMat33Det(Qinv);
+        const float volume = 1.0f / (6.0f * det);
+        SbMat33 F = sbMat33MulM(U, Qinv);   // F = PxMat33(u1,u2,u3) * Qinv
+
+        const float alphaTilde0 = invDtSq / (2.0f * mu * volume);
+
+        float damping = material.elasticityDamping;
+        float scaledDamping = damping * material.dampingScale;
+
+        const uint64_t mbyz = multipliers + uint64_t(workIndex >> 5) * SPATIAL_BLOCK_STRIDE +
+                              SPATIAL_BLOCK_MBYZ_OFFSET + uint64_t(workIndex & 31u) * 8UL;
+        float2 lambdas = isTGS ? float2(0.0f, 0.0f) : Ptr<float2>(mbyz)[0];
+
+        sbARAPConstraint(dl, lambdas.x, tv, tetR, F, invDt, Qinv, alphaTilde0, damping, scaledDamping);
+
+        const float3 dx0 = -(dl.c0 + dl.c1 + dl.c2) * tv.v0.w;
+        const float3 dx1 = dl.c0 * tv.v1.w;
+        const float3 dx2 = dl.c1 * tv.v2.w;
+        const float3 dx3 = dl.c2 * tv.v3.w;
+
+        const SbMat33 X = sbMat33(U.c0 + (dx1 - dx0), U.c1 + (dx2 - dx0), U.c2 + (dx3 - dx0));
+
+        F = sbMat33MulM(X, Qinv);   // F rebuilt
+
+        if (material.poissons > SB_STIFFNESS_THRESHOLD)
+        {
+            float alphaTilde1 = 0.0f;
+            float ratio = 0.0f;
+
+            if (material.poissons < 0.5f - SB_STIFFNESS_THRESHOLD)
+            {
+                alphaTilde1 = invDtSq / (lambdaLame * volume);
+                ratio = 2.0f * mu / lambdaLame;   // alphaTilde1/alphaTilde0 for volume damping
+            }
+
+            damping *= ratio;
+            scaledDamping *= ratio;
+
+            sbVolumeConstraint(dl, lambdas.y, tv, F, invDt, Qinv, alphaTilde1, damping, scaledDamping);
+        }
+
+        if (!isTGS)
+            Ptr<float2>(mbyz)[0] = lambdas;
+    }
+
+    return dl;
+}
+
+// One vertex of the gather (softBodyGM.cu:1073-1094): the pull index selects between the
+// unordered (shared) buffers and this tet's own slot in the ordered CP buffers.
+void sbGather(Ptr<float4> unorderedPositions, Ptr<float4> unorderedVelocities,
+              Ptr<float4> curPositions, Ptr<float4> velocities,
+              uint pullIndex, uint cpIndex, out float4 p, out float4 v)
+{
+    if (pullIndex < PULL_IND_MASK)
+    {
+        p = unorderedPositions[pullIndex];
+        v = unorderedVelocities[pullIndex];
+    }
+    else
+    {
+        p = curPositions[cpIndex];
+        v = velocities[cpIndex];
+    }
+}
+
+// One vertex of the scatter (softBodyGM.cu:1136-1145), factored out so the loop can be
+// unrolled without a dynamically-indexed local array (see the call site).
+void sbScatter(Ptr<float4> curPositions, Ptr<float4> velocities, uint writeIndex,
+               float4 p, float4 v, float3 deltaPos, float invDt)
+{
+    curPositions[writeIndex] = float4(p.x + deltaPos.x, p.y + deltaPos.y, p.z + deltaPos.z, p.w);
+    const float3 deltaV = deltaPos * invDt;
+    velocities[writeIndex] = float4(v.x + deltaV.x, v.y + deltaV.y, v.z + deltaV.z, v.w);
+}
+
+// ---------------------------------------------------------------------------
+// sb_gm_cp_solveTetrahedronsPartitionLaunch (softBodyGM.cu:1408)
+// CUDA arg pack (PxgSoftBodyCore.cpp:1202): { PxgSoftBody* gSoftbodies,
+// const PxU32* activeSoftbodies, const PxU32 numActiveSoftbodies, const PxReal invDt,
+// const PxU32 partitionId, bool isTGS, bool isFirstIteration,
+// PxsDeformableVolumeMaterialData* materials } -> the two bools land at @28/@29 and the
+// trailing pointer realigns to @32 -> 40-byte blob.  (ABI row {8,8,4,4,4,1,1,8}.)
+// ---------------------------------------------------------------------------
+struct SolveTetraParams
+{
+    uint64_t gSoftbodies;          // @0
+    uint64_t activeSoftbodies;     // @8
+    uint numActiveSoftbodies;      // @16
+    float invDt;                   // @20
+    uint partitionId;              // @24
+    uint flagsWord;                // @28  byte0 = isTGS, byte1 = isFirstIteration
+    uint64_t materials;            // @32  -> 40
+}
+[[vk::push_constant]]
+ConstantBuffer<SolveTetraParams> gSolve;
+
+[shader("compute")]
+[numthreads(64, 1, 1)] // SB_SOLVETETRA; grid (nbBlocks, nbActiveSoftbodies, 1)
+void sb_gm_cp_solveTetrahedronsPartitionLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    Ptr<PxgSoftBodyGpu> gSoftbodies = Ptr<PxgSoftBodyGpu>(gSolve.gSoftbodies);
+    const uint softbodyId = (Ptr<uint>(gSolve.activeSoftbodies))[groupId.y];
+
+    // The @392 fold: byte1 = mBodyFlags.
+    const uint bodyFlags = (gSoftbodies[softbodyId].mFlagsWord >> 8) & 0xffu;
+    if ((bodyFlags & PXG_SOFTBODY_BODYFLAG_KINEMATIC) != 0u)
+        return;
+
+    const uint groupThreadIdx = groupThreadId.x + groupId.x * 64u;
+
+    const uint nbTets = gSoftbodies[softbodyId].mNumTetsGM;
+    const uint numPartitions = gSoftbodies[softbodyId].mNumPartitionsGM;
+
+    if (nbTets > 0u && gSolve.partitionId < numPartitions)
+    {
+        Ptr<uint> accumulatedPartitions = Ptr<uint>(gSoftbodies[softbodyId].mSimAccumulatedPartitionsCP);
+        const uint startInd = gSolve.partitionId > 0u ? accumulatedPartitions[gSolve.partitionId - 1u] : 0u;
+        const uint endInd = accumulatedPartitions[gSolve.partitionId];
+
+        const uint workIndex = startInd + groupThreadIdx;
+
+        // Only the pure-tetrahedral path is ported (see the header); the hexahedral
+        // sibling is a separate kernel body and performs no work here.
+        if (workIndex < endInd && gSoftbodies[softbodyId].mNumTetsPerElement == 1u)
+        {
+            const bool isTGS = (gSolve.flagsWord & 0xffu) != 0u;
+            const bool isFirstIteration = ((gSolve.flagsWord >> 8) & 0xffu) != 0u;
+            const float invDt = gSolve.invDt;
+            const float invDtSq = invDt * invDt;
+
+            Ptr<float4> curPositions = Ptr<float4>(gSoftbodies[softbodyId].mSimPosition_InvMassCP);
+            Ptr<float4> velocities = Ptr<float4>(gSoftbodies[softbodyId].mSimVelocity_invMassCP);
+            Ptr<uint4> writeIndices = Ptr<uint4>(gSoftbodies[softbodyId].mSimRemapOutputCP);
+            Ptr<float4> unorderedPositions = Ptr<float4>(gSoftbodies[softbodyId].mSimPosition_InvMass);
+            Ptr<float4> unorderedVelocities = Ptr<float4>(gSoftbodies[softbodyId].mSimVelocity_InvMass);
+            Ptr<uint4> pullInds = Ptr<uint4>(gSoftbodies[softbodyId].mSimPullIndices);
+
+            // mOrderedMaterialIndices is a PxU16 array — read the containing 32-bit word.
+            const uint64_t matIdxAddr = gSoftbodies[softbodyId].mOrderedMaterialIndices +
+                                        uint64_t(workIndex) * 2UL;
+            const uint matWord = Ptr<uint>(matIdxAddr & ~3UL)[0];
+            // Which half of the word: derive it from the ADDRESS, not from workIndex's
+            // parity — that only coincides when the array base is 4-aligned, and nothing
+            // in the engine promises that.
+            const uint matHalf = uint((matIdxAddr >> 1) & 1UL);
+            const uint globalMaterialIndex = (matHalf != 0u) ? (matWord >> 16) : (matWord & 0xffffu);
+            const SbMaterial material = sbLoadMaterial(gSolve.materials, globalMaterialIndex);
+
+            // --- gather the four vertices ------------------------------------------
+            uint4 pullInd = pullInds[workIndex];
+            pullInd.x &= PULL_IND_MASK;
+
+            // Unrolled for the same reason as the scatter: no dynamically-indexed local
+            // array survives into the SPIR-V.
+            float4 p0, p1, p2, p3, v0, v1, v2, v3;
+            sbGather(unorderedPositions, unorderedVelocities, curPositions, velocities,
+                     pullInd.x, workIndex + 0u * nbTets, p0, v0);
+            sbGather(unorderedPositions, unorderedVelocities, curPositions, velocities,
+                     pullInd.y, workIndex + 1u * nbTets, p1, v1);
+            sbGather(unorderedPositions, unorderedVelocities, curPositions, velocities,
+                     pullInd.z, workIndex + 2u * nbTets, p2, v2);
+            sbGather(unorderedPositions, unorderedVelocities, curPositions, velocities,
+                     pullInd.w, workIndex + 3u * nbTets, p3, v3);
+
+            // --- rest pose + rotation refresh ---------------------------------------
+            const uint64_t restBase = gSoftbodies[softbodyId].mSimTetraRestPoses +
+                                      uint64_t(workIndex >> 5) * MAT33_BLOCK_STRIDE;
+            const uint lane = workIndex & 31u;
+            const float4 c0v = Ptr<float4>(restBase + uint64_t(lane) * 16UL)[0];
+            const float4 c1v = Ptr<float4>(restBase + MAT33_BLOCK_COL1_OFFSET + uint64_t(lane) * 16UL)[0];
+            const float c2v = Ptr<float>(restBase + MAT33_BLOCK_COL2_OFFSET + uint64_t(lane) * 4UL)[0];
+            const SbMat33 Qinv = sbMat33(float3(c0v.x, c0v.y, c0v.z),
+                                         float3(c0v.w, c1v.x, c1v.y),
+                                         float3(c1v.z, c1v.w, c2v));
+
+            Ptr<float4> tetRotations = Ptr<float4>(gSoftbodies[softbodyId].mSimTetraRotations);
+            float4 q = tetRotations[workIndex];
+
+            const float3 u1 = float3(p1.x - p0.x, p1.y - p0.y, p1.z - p0.z);
+            const float3 u2 = float3(p2.x - p0.x, p2.y - p0.y, p2.z - p0.z);
+            const float3 u3 = float3(p3.x - p0.x, p3.y - p0.y, p3.z - p0.z);
+
+            {
+                if ((q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w) == 0.0f)
+                    q = float4(gSoftbodies[softbodyId].mInitialRotationX,
+                               gSoftbodies[softbodyId].mInitialRotationY,
+                               gSoftbodies[softbodyId].mInitialRotationZ,
+                               gSoftbodies[softbodyId].mInitialRotationW);
+
+                // computeGMTetrahedronRotations (softBodyGM.cu:288): F = P*Qinv then
+                // extractRotation with 100 iterations on the first solver iteration, 4
+                // afterwards.  THIS is where the tranche-5 sin/cos seam enters the solve.
+                const SbMat33 Fm = sbMat33MulM(sbMat33(u1, u2, u3), Qinv);
+                q = sbExtractRotation(Fm.c0, Fm.c1, Fm.c2, q, isFirstIteration ? 100 : 4);
+
+                tetRotations[workIndex] = q;
+            }
+
+            // --- constitutive solve, guarded on a degenerate rest pose ---------------
+            // softBodyGM.cu:1123 — the scatter below STILL RUNS with a zero delta when
+            // the rest pose is degenerate; only the solve is skipped.
+            SbMat33 dl = sbMat33Zero();
+            if (!sbMat33IsZero(Qinv))
+            {
+                SbTetV tv; tv.v0 = v0; tv.v1 = v1; tv.v2 = v2; tv.v3 = v3;
+                dl = sbTetrahedronsSolveGM(sbMat33(u1, u2, u3), tv,
+                                           gSoftbodies[softbodyId].mSimTetraMultipliers, invDtSq, invDt,
+                                           workIndex, Qinv, q, isTGS, material);
+            }
+
+            // --- scatter -------------------------------------------------------------
+            // The scatter is written out per-vertex rather than as a 4-iteration loop over
+            // a local float3[3].  That indexed temporary is a llvmpipe LANDMINE: with a
+            // ZERO delta the array folds to a constant and the shader runs, but the moment
+            // its three entries differ the driver materialises a dynamically-indexed local
+            // array and SIGSEGVs in the JIT worker.  Bisected precisely — a CONSTANT
+            // non-zero delta with no matrix work at all reproduces it, which is what ruled
+            // out every arithmetic suspect.  Unrolling removes the dynamic index entirely.
+            const uint4 writeIndex4 = writeIndices[workIndex];
+
+            sbScatter(curPositions, velocities, writeIndex4.x, p0, v0,
+                      -(dl.c0 + dl.c1 + dl.c2) * p0.w, invDt);
+            sbScatter(curPositions, velocities, writeIndex4.y, p1, v1, dl.c0 * p1.w, invDt);
+            sbScatter(curPositions, velocities, writeIndex4.z, p2, v2, dl.c1 * p2.w, invDt);
+            sbScatter(curPositions, velocities, writeIndex4.w, p3, v3, dl.c2 * p3.w, invDt);
+        }
+    }
+}

@@ -466,6 +466,13 @@ static const uint8_t kSbZeroTetMultipliers[] = { 8, 8 };
 //   PxgSoftBodyCore.cpp:874.  Two device pointers + PxReal (@16) -> 20, rounded up to the
 //   pointer alignment -> 24-byte blob.
 static const uint8_t kSbApplyExternalDeltas[] = { 8, 8, 4 };
+//   sb_gm_cp_solveTetrahedronsPartitionLaunch(PxgSoftBody* gSoftbodies,
+//     const PxU32* activeSoftbodies, const PxU32 numActiveSoftbodies, const PxReal invDt,
+//     const PxU32 partitionId, bool isTGS, bool isFirstIteration,
+//     PxsDeformableVolumeMaterialData* materials)  -- launch site PxgSoftBodyCore.cpp:1202.
+//   Two device pointers + three 4-byte scalars (@16/@20/@24) + two bools (@28/@29) + a
+//   device pointer realigned to @32 -> 40-byte blob (P8.0 tranche 6).
+static const uint8_t kSbSolveTetraPartition[] = { 8, 8, 4, 4, 4, 1, 1, 8 };
 //   sb_gm_updateTetrahedraRotationsLaunch / sb_updateTetrahedraRotationsLaunch(
 //     PxgSoftBody* gSoftbodies, const PxU32* activeSoftbodies)  -- launch sites
 //   PxgSoftBodyCore.cpp:747 and :790.  Same two-device-pointer pack as
@@ -826,6 +833,8 @@ static const PxgKernelAbiRow kRows[] = {
     // gpusimulationcontroller softbody tetrahedron rotation extractors (P8.0 tranche 5)
     { "sb_gm_updateTetrahedraRotationsLaunch", kSbZeroTetMultipliers, uint32_t(sizeof(kSbZeroTetMultipliers)) },
     { "sb_updateTetrahedraRotationsLaunch", kSbZeroTetMultipliers, uint32_t(sizeof(kSbZeroTetMultipliers)) },
+    // gpusimulationcontroller softbody FEM-volume constraint solve (P8.0 tranche 6)
+    { "sb_gm_cp_solveTetrahedronsPartitionLaunch", kSbSolveTetraPartition, uint32_t(sizeof(kSbSolveTetraPartition)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },

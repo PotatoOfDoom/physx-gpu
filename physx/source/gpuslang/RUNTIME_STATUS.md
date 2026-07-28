@@ -1015,6 +1015,58 @@ budget.  The tolerance sits in a wide, empty gap between the noise floor and the
 Suite 674/674 in both memory modes, rigid regression 16/16, cloth / clothselfcollide / particle green.
 **Softbody now 9 of 56 kernels mapped.**
 
+## P8.0 tranche 6 — the FEM-volume constraint SOLVE: ported, SPIR-V-valid, BLOCKED on an llvmpipe fault
+
+`sb_gm_cp_solveTetrahedronsPartitionLaunch` (softBodyGM.cu:1408) — the core of the softbody solver —
+is fully transcribed in `shaders/softBodySolveBda.slang`, together with its whole device-function
+tree: `tetrahedronsSolveGM` (the material dispatcher), both constitutive branches
+(`tetrahedronsSolveInnerNeoHookean` + `volumeSolve` for eNEO_HOOKEAN, `ARAP_constraint` +
+`volume_constraint` for eCO_ROTATIONAL), and the shared compliance primitives
+(`compute_dCdx`, `compute_deltaLambdaXgradC`).  The bit-exact CPU reference and a five-case driver
+(co-rotational PGS / damped / TGS, neo-Hookean PGS / TGS) are written and in the tree.
+
+**It is NOT mapped and its tests are NOT registered**, because it does not run: llvmpipe SIGSEGVs in
+its JIT worker thread. Manifest stays at **219**.  Marking it green would be a lie, and registering
+the cases would take the suite red on a driver fault rather than a port defect.
+
+### What the bisection established
+
+The trigger is remarkably specific: **the kernel runs clean whenever the computed delta is ZERO and
+faults as soon as it is non-zero.**  A `dl` set to a hard-coded non-zero constant — with the entire
+material solve, every matrix multiply and every buffer read removed — reproduces the crash exactly.
+That single observation is what rules out the whole arithmetic surface.
+
+Ruled OUT by direct experiment:
+  - either constitutive branch's contents (each one alone crashes; both stubbed out runs clean);
+  - `ARAP_constraint`, `volume_constraint`, and the `mSimTetraMultipliers` read and write (each
+    removed individually — still crashes);
+  - buffer end-of-region effects (every buffer padded by 64+ elements — still crashes), which is the
+    known llvmpipe load-widening artefact that explained the tranche-3a and tranche-6 test faults;
+  - call-frame width (the helpers were restructured onto an `SbMat33`/`SbTetV` struct, cutting the
+    widest signature from 23 parameters to 12 — still crashes);
+  - dynamically-indexed local arrays (both the gather and the scatter were unrolled so no indexed
+    temporary survives into the SPIR-V — still crashes);
+  - shader size / JIT budget (`extractRotation` cut from 100 iterations to 1 — still crashes);
+  - malformed SPIR-V (`spirv-val` passes).
+
+So: the port matches the CUDA line-for-line, the SPIR-V validates, and the fault tracks nothing but
+"does this shader write a value that differs from what it read".  The next step is to reduce it to a
+standalone repro outside the PhysX harness and take it to Mesa — or to test on a second Vulkan
+implementation, which would settle driver-versus-port immediately.
+
+### What IS confirmed correct along the way
+
+The transcription itself was checked against the CUDA by an adversarial pass per sub-tree, and the
+structural facts it depends on are verified: the ABI row `{8,8,4,4,4,1,1,8}` (40-byte blob, the two
+bools at @28/@29 and the trailing pointer realigned to @32), the `PxsDeformableVolumeMaterialData`
+layout (32-byte stride, `dampingScale`/`materialModel` sharing the word at @16), the `PULL_IND_MASK`
+gather scheme, and the degenerate-rest-pose guard at softBodyGM.cu:1123 (the solve is skipped but the
+scatter still runs with a zero delta).  One hardening beyond the source: the `mOrderedMaterialIndices`
+PxU16 read derives its half-word from the ADDRESS rather than from `workIndex` parity, which only
+coincide when the array base happens to be 4-aligned.
+
+Suite 674/674 in both memory modes, rigid regression 16/16 — unchanged, because nothing was mapped.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED
