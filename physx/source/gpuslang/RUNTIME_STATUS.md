@@ -1350,6 +1350,54 @@ count -> solve -> apply end to end on a geometry whose correct outcome is known 
 at both coverage levels. `PXG_CLOTH_SUBSTEPS` was added to the scene so this margin stays
 measurable rather than assumed.
 
+### Third round: two analytic fixtures, and the solve chain is EXONERATED
+
+The existing self-contact tests compare the port against a CPU transcription of the same
+logic, so they agree with each other whether or not that logic is right. Two new fixtures
+in `testFemClothSim.cpp` assert an **analytically known** outcome instead, driving the real
+chain end to end (`prepare -> queryCount -> solve -> applyExternalDeltas`):
+
+**`femClothSimSelfContactRedundancy{1,2,4}`** — a free vertex above a PINNED triangle,
+`gap = 0.04` against a total rest distance of `0.10`. The pinned triangle drops out of the
+constraint (invMass 0), so one pass must place the vertex at exactly the rest distance. With
+N identical contacts describing the one overlap:
+
+| N | `mDeltaPos.w` | `mDeltaPos.z` | displacement |
+|---|---|---|---|
+| 1 | 1.0000 | 0.060000 | **0.060000** |
+| 2 | 2.0000 | 0.120000 | **0.060000** |
+| 4 | 4.0000 | 0.240000 | **0.060000** |
+
+Count and accumulator both scale with N and the divide cancels them exactly. **Redundant
+contacts do not over-respond.**
+
+**`femClothSimSelfContactTwoWay`** — this is what the grid fix actually adds: not copies, but
+the *opposite direction*. Two parallel FREE triangles, `gap = 0.04`; direction 1 is
+`(a0, TB)`, direction 2 is `(b0, TA)`. Both are genuine, distinct constraints on distinct
+endpoint sets, so the mass-averaging above does not relate them.
+
+```
+ONE dir:    separation 0.040000 -> 0.100000   (rest distance 0.100000)
+BOTH dirs:  separation 0.040000 -> 0.100000
+over-separation factor: 1.0000
+```
+
+**The two directions agree rather than add.** Resolving the same overlap from both sides
+lands on the rest distance, not twice past it.
+
+So the `count -> solve -> apply` arithmetic is correct under both regimes that could plausibly
+have produced the over-response, now pinned against closed-form answers rather than against a
+transcription. Combined with the six causes excluded in the previous round, **the solve chain
+is exonerated**: whatever makes the corrected contact set destabilise `clothselfcollide` is
+not in the contact arithmetic.
+
+What that leaves is the contact SET and its cadence — the midphase finding contacts it should
+not, or the pair-refresh rate (`setNbCollisionPairUpdatesPerTimestep`) being too coarse for the
+larger displacements the corrected set produces — or genuine physics the scene was never tuned
+for, since its thresholds were calibrated against half the contacts. The fixtures are the
+permanent artefact: any future change to this chain now has an analytic reference, not a
+mirror.
+
 ### A structural gap in the verification protocol
 
 The unit tests **choose their own dispatch grid**, so they cannot catch an engine-grid mismatch

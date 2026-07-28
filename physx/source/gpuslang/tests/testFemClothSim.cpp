@@ -4060,6 +4060,330 @@ static void runClothSelfContactEE()
     dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bUpd.h);
 }
 
+// ===========================================================================
+// P8.1: the SELF-CONTACT REDUNDANCY fixture — is the applied correction invariant
+// in the number of contacts describing ONE geometric overlap?
+//
+// WHY THIS EXISTS.  Fixing the midphase grid defect DOUBLES the self-collision contact
+// count (VT 76 -> 152 measured) and makes the clothselfcollide scene markedly WORSE: the
+// draping layer is pushed above its own spawn height, the layers separate, and the upper
+// one tunnels through the shelf.  Buffer overflow, contact duplication, the count pass,
+// the divisor, the clear, a downstream grid mismatch and the iteration budget were all
+// excluded by measurement, and every link that can be compared against the .cu by reading
+// matches it.  What was missing was a fixture with an ANALYTICALLY KNOWN answer -- the
+// existing self-contact tests compare the port against a CPU transcription of the same
+// logic, so they agree with each other whether or not that logic is right.
+//
+// THE ALGEBRA, for a free vertex above a PINNED triangle.  Weights are (1, -r, -s, -t)
+// with r+s+t = 1.  countContact bumps mDeltaPos.w by |coeff_i|, so with N identical
+// contacts w[free] = N.  The solve multiplies the inverse masses by those counts
+// (splittedInvMasses, femClothClothContactBda.slang:474) -- so denom = N*m and
+// deltaLambdaN = -CN/(N*m), while dx = normal * deltaLambdaN * (N*m) * 1 = -CN * normal,
+// i.e. each contact contributes the SAME correction regardless of N.  N of them accumulate
+// to N * (-CN*normal) with .w = N, and applyExternalDeltas divides by .w:
+//
+//     displacement = (restDistance - gap) * normal,   INDEPENDENT OF N.
+//
+// The pinned triangle drops out entirely (invMass 0), so the closed form is exact: after
+// one full pass the free vertex must sit at EXACTLY the rest distance from the triangle
+// plane.  That is the assertion -- an analytic outcome, not a transcription.
+//
+// If the measured displacement instead SCALES with N, that is the over-response, and it
+// is what makes the corrected (doubled) contact set destabilise the scene.
+// ===========================================================================
+static void runClothSelfContactRedundancy(uint32_t nbContacts)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+    const float freeInvMass = 0.5f;
+    const float restDistScalar = 0.05f;    // total rest distance = 2 * 0.05 = 0.1
+    const float totalRestDist = 2.0f * restDistScalar;
+
+    // Triangle T0 = {0,1,2} in the z = 0 plane, PINNED (invMass 0 -> it cannot move, so
+    // the free vertex's displacement is the whole story).  v3 hovers `gap` above the
+    // centroid along +z, well inside the triangle.
+    const float gap = 0.04f;               // < totalRestDist -> penetrating
+    std::vector<F4> pos = {
+        { 0.00f, 0.00f, 0.00f, 0.0f },     // v0 (T0) PINNED
+        { 1.00f, 0.00f, 0.00f, 0.0f },     // v1 (T0) PINNED
+        { 0.00f, 1.00f, 0.00f, 0.0f },     // v2 (T0) PINNED
+        { 1.0f / 3.0f, 1.0f / 3.0f, gap, freeInvMass },   // v3, above the centroid
+    };
+    std::vector<F4> rest = pos;            // rest-pose filter distance 0 -> passes
+    std::vector<F4> prev = pos;            // relDelta 0
+    std::vector<F4> vel(4, F4{ 0, 0, 0, 0 });
+    std::vector<F4> accum(4, F4{ 0, 0, 0, 0 });
+    std::vector<F4> deltaPos(4, F4{ 0, 0, 0, 0 });
+    std::vector<float> friction(4, 0.0f);
+    std::vector<TriIdx4> tris = { { 0u, 1u, 2u, 0u } };
+
+    DevBuf bPos = makeDev(dev, pos);
+    DevBuf bRest = makeDev(dev, rest);
+    DevBuf bPrev = makeDev(dev, prev);
+    DevBuf bVel = makeDev(dev, vel);
+    DevBuf bAcc = makeDev(dev, accum);
+    DevBuf bDelta = makeDev(dev, deltaPos);
+    DevBuf bFric = makeDev(dev, friction);
+    DevBuf bTri = makeDev(dev, tris);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mRestPosition = reinterpret_cast<decltype(c.mRestPosition)>(size_t(bRest.addr));
+    c.mPrevPositionInContactOffset = reinterpret_cast<decltype(c.mPrevPositionInContactOffset)>(size_t(bPrev.addr));
+    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
+    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
+    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
+    c.mDynamicFrictions = reinterpret_cast<decltype(c.mDynamicFrictions)>(size_t(bFric.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mNbVerts = 4u;
+    c.mSelfCollisionFilterDistance = 0.0f;
+    c.mRestDistance = restDistScalar;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // N IDENTICAL VT contacts for the one overlap (v3 vs T0).  The midphase is skipped on
+    // purpose: the contact set is the independent variable here, so it is controlled
+    // exactly rather than produced.
+    std::vector<FemFemContactInfoHost> infos(nbContacts);
+    for (uint32_t i = 0; i < nbContacts; ++i)
+    {
+        infos[i].pairInd0 = (0ull << 20) | 3ull;   // encode(cloth 0, vertex 3)
+        infos[i].pairInd1 = (0u << 20) | 0u;       // encode(cloth 0, triangle 0)
+        infos[i].auxInd = 0u;                      // VT (bit30=0), not-yet-valid (bit31=0)
+    }
+    DevBuf bInfos = makeDev(dev, infos);
+    std::vector<uint32_t> numContacts = { nbContacts };
+    DevBuf bNum = makeDev(dev, numContacts);
+    std::vector<uint32_t> upd = { 1u };
+    DevBuf bUpd = makeDev(dev, upd);
+
+    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    const uint32_t MAXC = 64u;
+
+    // ---- the real chain: prepare -> count -> solve -> apply --------------------
+    PrepClothClothPush pp = {};
+    pp.clothes = bDesc.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
+    pp.maxContacts = MAXC; pp.clothMaterials = 0ull; pp.updateContactPairs = bUpd.addr;
+    Kernel kPrep("femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch", {}, sizeof(PrepClothClothPush));
+    kPrep.dispatch(1u, {}, pp, 1u, 1u);
+    dev->flush();
+
+    QueryClothClothPush qp = {};
+    qp.cloths = bDesc.addr; qp.contactInfos = bInfos.addr; qp.numContacts = bNum.addr;
+    Kernel kQuery("femClothClothContactBda.spv", "cloth_queryClothClothContactVTCountLaunch", {}, sizeof(QueryClothClothPush));
+    kQuery.dispatch(1u, {}, qp, 1u, 1u);
+    dev->flush();
+
+    const auto afterCount = downloadBuffer<F4>(dev, bDelta.h, 4);
+
+    SolveClothClothPush sp = {};
+    sp.cloths = bDesc.addr; sp.contactInfos = bInfos.addr; sp.numContacts = bNum.addr; sp.dt = dt;
+    Kernel kSolve("femClothClothContactBda.spv", "cloth_solveClothClothDeltaVTLaunch", {}, sizeof(SolveClothClothPush));
+    kSolve.dispatch(1u, {}, sp, 1u, 1u);
+    dev->flush();
+
+    const auto afterSolve = downloadBuffer<F4>(dev, bDelta.h, 4);
+
+    ApplyExtPush ap = {};
+    ap.clothes = bDesc.addr; ap.activeClothes = 0ull; ap.dt = dt;
+    std::vector<uint32_t> activeIds = { 0u };
+    DevBuf bActive = makeDev(dev, activeIds);
+    ap.activeClothes = bActive.addr;
+    Kernel kApply("femClothRigidAttachBda.spv", "cloth_applyExternalDeltasLaunch", {}, sizeof(ApplyExtPush));
+    kApply.dispatch(1u, {}, ap, 1u, 1u);
+    dev->flush();
+
+    const auto finalPos = downloadBuffer<F4>(dev, bPos.h, 4);
+
+    // ---- the analytic expectation ---------------------------------------------
+    // The triangle lies in z = 0 and is pinned, so the contact normal is +z, the gap is
+    // v3.z, and one full pass must place v3 at EXACTLY the total rest distance.
+    const float movedTo = finalPos[3].z;
+    const float displacement = movedTo - gap;
+    const float expectDisp = totalRestDist - gap;
+
+    std::printf("  N=%u: mDeltaPos[3].w after count = %.4f, .z after solve = %.6f -> v3.z %.6f -> %.6f "
+                "(moved %.6f, expected %.6f)\n",
+                nbContacts, afterCount[3].w, afterSolve[3].z, gap, movedTo, displacement, expectDisp);
+
+    // The pinned triangle must not have moved at all (invMass 0).
+    for (uint32_t v = 0; v < 3u; ++v)
+        PXG_CHECK_MSG(f2u(finalPos[v].z) == f2u(0.0f),
+                      "pinned triangle vertex %u must not move (z = %g)", v, finalPos[v].z);
+
+    // The count must scale with N -- if it does not, the fixture is not testing what it
+    // claims to and every later assertion is meaningless.
+    PXG_CHECK_MSG(std::fabs(afterCount[3].w - float(nbContacts)) < 1e-4f,
+                  "the count pass must accumulate |coeff|=1 per contact: N=%u gave .w=%g",
+                  nbContacts, afterCount[3].w);
+
+    // THE ASSERTION: the applied displacement is the analytic one, independent of N.
+    PXG_CHECK_MSG(std::fabs(displacement - expectDisp) < 1.0e-5f,
+                  "N=%u: one pass must move the free vertex to the rest distance -- moved %.6f, "
+                  "expected %.6f (ratio %.3f)", nbContacts, displacement, expectDisp,
+                  expectDisp != 0.0f ? displacement / expectDisp : 0.0f);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bRest.h); dev->destroyBuffer(bPrev.h);
+    dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h); dev->destroyBuffer(bDelta.h);
+    dev->destroyBuffer(bFric.h); dev->destroyBuffer(bTri.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bUpd.h);
+    dev->destroyBuffer(bActive.h);
+}
+
+// ===========================================================================
+// P8.1: the TWO-DIRECTION fixture — what the grid fix actually adds.
+//
+// The redundancy fixture above proves that N copies of ONE contact are perfectly
+// mass-averaged.  But the grid fix does not add copies: it lets the OTHER layer's
+// vertices act as query vertices too, so each overlap region ends up described from BOTH
+// directions -- (layerA vertex, layerB triangle) AND (layerB vertex, layerA triangle).
+// Those are genuinely different constraints on different endpoint sets, so the averaging
+// above does not relate them.
+//
+// Two parallel FREE triangles a gap apart, gap < restDistance.  Direction 1 is a0 vs TB;
+// direction 2 is b0 vs TA.  The test reports the separation achieved after one full pass
+// with direction 1 alone (what the buggy half-coverage midphase produced) and with both
+// (what the corrected midphase produces).  The correct answer for a contact solve is that
+// the pair ends up at the rest distance EITHER WAY -- resolving one overlap twice from
+// opposite sides must not separate them twice as far.
+// ===========================================================================
+static float runClothSelfContactTwoWay(bool bothDirections, bool verbose)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+    const float m = 0.5f;
+    const float restDistScalar = 0.05f;
+    const float totalRestDist = 2.0f * restDistScalar;
+    const float gap = 0.04f;
+
+    // TA = {0,1,2} in z = 0;  TB = {3,4,5} in z = gap, directly above and congruent.
+    std::vector<F4> pos = {
+        { 0.00f, 0.00f, 0.0f, m }, { 1.00f, 0.00f, 0.0f, m }, { 0.00f, 1.00f, 0.0f, m },
+        { 0.00f, 0.00f, gap, m }, { 1.00f, 0.00f, gap, m }, { 0.00f, 1.00f, gap, m },
+    };
+    // a0 (v0) sits directly under b0 (v3); to make each query vertex project INSIDE the
+    // opposing triangle rather than onto a corner, both are nudged to the centroid in xy.
+    pos[0] = F4{ 1.0f / 3.0f, 1.0f / 3.0f, 0.0f, m };
+    pos[3] = F4{ 1.0f / 3.0f, 1.0f / 3.0f, gap, m };
+
+    std::vector<F4> rest = pos, prev = pos;
+    std::vector<F4> vel(6, F4{ 0, 0, 0, 0 }), accum(6, F4{ 0, 0, 0, 0 }), deltaPos(6, F4{ 0, 0, 0, 0 });
+    std::vector<float> friction(6, 0.0f);
+    std::vector<TriIdx4> tris = { { 0u, 1u, 2u, 0u }, { 3u, 4u, 5u, 0u } };
+
+    DevBuf bPos = makeDev(dev, pos), bRest = makeDev(dev, rest), bPrev = makeDev(dev, prev);
+    DevBuf bVel = makeDev(dev, vel), bAcc = makeDev(dev, accum), bDelta = makeDev(dev, deltaPos);
+    DevBuf bFric = makeDev(dev, friction), bTri = makeDev(dev, tris);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mRestPosition = reinterpret_cast<decltype(c.mRestPosition)>(size_t(bRest.addr));
+    c.mPrevPositionInContactOffset = reinterpret_cast<decltype(c.mPrevPositionInContactOffset)>(size_t(bPrev.addr));
+    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
+    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
+    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
+    c.mDynamicFrictions = reinterpret_cast<decltype(c.mDynamicFrictions)>(size_t(bFric.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mNbVerts = 6u;
+    c.mSelfCollisionFilterDistance = 0.0f;
+    c.mRestDistance = restDistScalar;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<FemFemContactInfoHost> infos;
+    FemFemContactInfoHost ci = {};
+    ci.pairInd0 = (0ull << 20) | 0ull;   // vertex a0 = v0
+    ci.pairInd1 = (0u << 20) | 1u;       // triangle TB = index 1
+    ci.auxInd = 0u;
+    infos.push_back(ci);
+    if (bothDirections)
+    {
+        FemFemContactInfoHost ci2 = {};
+        ci2.pairInd0 = (0ull << 20) | 3ull;  // vertex b0 = v3
+        ci2.pairInd1 = (0u << 20) | 0u;      // triangle TA = index 0
+        ci2.auxInd = 0u;
+        infos.push_back(ci2);
+    }
+    DevBuf bInfos = makeDev(dev, infos);
+    std::vector<uint32_t> numContacts = { uint32_t(infos.size()) };
+    DevBuf bNum = makeDev(dev, numContacts);
+    std::vector<uint32_t> upd = { 1u };
+    DevBuf bUpd = makeDev(dev, upd);
+    std::vector<uint32_t> activeIds = { 0u };
+    DevBuf bActive = makeDev(dev, activeIds);
+
+    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return 0.0f; }
+
+    PrepClothClothPush pp = {};
+    pp.clothes = bDesc.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
+    pp.maxContacts = 64u; pp.clothMaterials = 0ull; pp.updateContactPairs = bUpd.addr;
+    Kernel("femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch", {}, sizeof(PrepClothClothPush))
+        .dispatch(1u, {}, pp, 1u, 1u);
+    dev->flush();
+
+    QueryClothClothPush qp = {};
+    qp.cloths = bDesc.addr; qp.contactInfos = bInfos.addr; qp.numContacts = bNum.addr;
+    Kernel("femClothClothContactBda.spv", "cloth_queryClothClothContactVTCountLaunch", {}, sizeof(QueryClothClothPush))
+        .dispatch(1u, {}, qp, 1u, 1u);
+    dev->flush();
+
+    SolveClothClothPush sp = {};
+    sp.cloths = bDesc.addr; sp.contactInfos = bInfos.addr; sp.numContacts = bNum.addr; sp.dt = dt;
+    Kernel("femClothClothContactBda.spv", "cloth_solveClothClothDeltaVTLaunch", {}, sizeof(SolveClothClothPush))
+        .dispatch(1u, {}, sp, 1u, 1u);
+    dev->flush();
+
+    ApplyExtPush ap = {};
+    ap.clothes = bDesc.addr; ap.activeClothes = bActive.addr; ap.dt = dt;
+    Kernel("femClothRigidAttachBda.spv", "cloth_applyExternalDeltasLaunch", {}, sizeof(ApplyExtPush))
+        .dispatch(1u, {}, ap, 1u, 1u);
+    dev->flush();
+
+    const auto fin = downloadBuffer<F4>(dev, bPos.h, 6);
+    const float sep = fin[3].z - fin[0].z;   // the two facing query vertices
+    if (verbose)
+        std::printf("  %-14s a0.z %.6f -> %.6f | b0.z %.6f -> %.6f | separation %.6f -> %.6f "
+                    "(rest distance %.6f)\n",
+                    bothDirections ? "BOTH dirs:" : "ONE dir:",
+                    pos[0].z, fin[0].z, pos[3].z, fin[3].z, gap, sep, totalRestDist);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bRest.h); dev->destroyBuffer(bPrev.h);
+    dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h); dev->destroyBuffer(bDelta.h);
+    dev->destroyBuffer(bFric.h); dev->destroyBuffer(bTri.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bUpd.h);
+    dev->destroyBuffer(bActive.h);
+    return sep;
+}
+
+PXG_TEST(femClothSimSelfContactTwoWay)
+{
+    const float totalRestDist = 0.1f;
+    const float sepOne = runClothSelfContactTwoWay(/*bothDirections*/ false, /*verbose*/ true);
+    const float sepBoth = runClothSelfContactTwoWay(/*bothDirections*/ true, /*verbose*/ true);
+    if (sepOne == 0.0f && sepBoth == 0.0f) return;   // no-BDA skip
+
+    // A single overlap resolved from ONE side lands exactly on the rest distance -- the
+    // redundancy fixture already pins that mechanism analytically.
+    PXG_CHECK_MSG(std::fabs(sepOne - totalRestDist) < 1.0e-5f,
+                  "one direction must separate the layers to the rest distance: got %.6f, expected %.6f",
+                  sepOne, totalRestDist);
+
+    // THE QUESTION.  Resolving the SAME overlap additionally from the opposite side must
+    // not push it further apart: the second constraint sees a pair that direction 1 has
+    // already separated to the rest distance, so it should contribute nothing.  If the
+    // separation grows instead, the two directions add rather than agree -- and that is
+    // precisely what doubles the push when the midphase grid defect is fixed.
+    std::printf("  over-separation factor: %.4f\n", totalRestDist != 0.0f ? sepBoth / totalRestDist : 0.0f);
+    PXG_CHECK_MSG(std::fabs(sepBoth - totalRestDist) < 1.0e-5f,
+                  "both directions must ALSO land on the rest distance, not overshoot: got %.6f, "
+                  "expected %.6f (factor %.3f)", sepBoth, totalRestDist, sepBoth / totalRestDist);
+}
+
+PXG_TEST(femClothSimSelfContactRedundancy1) { runClothSelfContactRedundancy(1u); }
+PXG_TEST(femClothSimSelfContactRedundancy2) { runClothSelfContactRedundancy(2u); }
+PXG_TEST(femClothSimSelfContactRedundancy4) { runClothSelfContactRedundancy(4u); }
+
 PXG_TEST(femClothSimSelfContactSolveVT) { runClothSelfContactVT(); }
 PXG_TEST(femClothSimSelfContactSolveEE) { runClothSelfContactEE(); }
 
