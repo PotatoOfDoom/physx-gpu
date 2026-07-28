@@ -2073,4 +2073,64 @@ static void runSolveTetraPartition(uint32_t materialModel, bool isTGS, float dam
 //   PXG_TEST(softBodySimSolveNeoHookeanTGS) { runSolveTetraPartition(1u, true, 0.0f); }
 static void (*sbKeepSolveDriverReferenced)(uint32_t, bool, float) = &runSolveTetraPartition;
 
+// MINIMAL REPRO, NOT REGISTERED.  Dispatch only — no CPU reference, no comparison, no
+// downloads, dummy rest poses.  It still SIGSEGVs, which is what proves the tranche-6
+// fault is GPU-side and not a defect in the driver code above.  This is the starting
+// point for a standalone Mesa repro: strip the PhysX descriptor and feed the same push
+// blob from a bare Vulkan harness.  Rename to PXG_TEST to re-enable.
+static void softBodySimSolveProbe_DISABLED()
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t nbTets = 3;
+    std::vector<F4> cpPos(nbTets*4, F4{0.1f,0.2f,0.3f,1.0f}), cpVel(nbTets*4, F4{0,0,0,0.5f});
+    std::vector<F4> unPos(64, F4{0.4f,0.5f,0.6f,2.0f}), unVel(64, F4{0,0,0,0.25f});
+    std::vector<p80refit::TetIdx4> pull(64, {0u,1u,2u,3u}), remap(64, {0u,1u,2u,3u});
+    std::vector<uint32_t> restW(MAT33_BLOCK_WORDS + 512, 0u);
+    for (uint32_t t = 0; t < nbTets; ++t)
+    {
+        restW[t*4+0]=f2u(1.1f); restW[t*4+3]=f2u(0.0f);
+        restW[MAT33_BLOCK_COL1_WORD+t*4+0]=f2u(1.2f);
+        restW[MAT33_BLOCK_COL2_WORD+t]=f2u(1.3f);
+    }
+    std::vector<F4> rot(64, F4{0,0,0,1});
+    std::vector<uint32_t> mult(SPATIAL_BLOCK_WORDS + 512, 0u);
+    std::vector<uint32_t> matW(64, 0u);
+    matW[0]=f2u(1.0e5f); matW[1]=f2u(0.31f); matW[4]=32768u;
+    std::vector<uint16_t> matIdx(64, 0u);
+    std::vector<uint32_t> parts(64, nbTets);
+
+    DevBuf a=makeDev(dev,cpPos), b=makeDev(dev,cpVel), c2=makeDev(dev,unPos), d=makeDev(dev,unVel);
+    DevBuf e=makeDev(dev,pull), f=makeDev(dev,remap), g=makeDev(dev,restW), h=makeDev(dev,rot);
+    DevBuf i2=makeDev(dev,mult), j=makeDev(dev,matW), k2=makeDev(dev,matIdx), l=makeDev(dev,parts);
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mSimPosition_InvMassCP = reinterpret_cast<float4*>(size_t(a.addr));
+    sb.mSimVelocity_invMassCP = reinterpret_cast<float4*>(size_t(b.addr));
+    sb.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(c2.addr));
+    sb.mSimVelocity_InvMass = reinterpret_cast<float4*>(size_t(d.addr));
+    sb.mSimPullIndices = reinterpret_cast<decltype(sb.mSimPullIndices)>(size_t(e.addr));
+    sb.mSimRemapOutputCP = reinterpret_cast<decltype(sb.mSimRemapOutputCP)>(size_t(f.addr));
+    sb.mSimTetraRestPoses = reinterpret_cast<decltype(sb.mSimTetraRestPoses)>(size_t(g.addr));
+    sb.mSimTetraRotations = reinterpret_cast<float4*>(size_t(h.addr));
+    sb.mSimTetraMultipliers = reinterpret_cast<decltype(sb.mSimTetraMultipliers)>(size_t(i2.addr));
+    sb.mOrderedMaterialIndices = reinterpret_cast<PxU16*>(size_t(k2.addr));
+    sb.mSimAccumulatedPartitionsCP = reinterpret_cast<PxU32*>(size_t(l.addr));
+    sb.mNumTetsGM = nbTets; sb.mNumPartitionsGM = 1u; sb.mNumTetsPerElement = 1u;
+    sb.mInitialRotation = PxQuat(0,0,0,1);
+    std::vector<PxgSoftBody> da = { sb };
+    DevBuf m=makeDev(dev,da);
+    std::vector<uint32_t> act = {0u};
+    DevBuf n=makeDev(dev,act);
+
+    SolveTetraPush push = {};
+    push.gSoftbodies=m.addr; push.activeSoftbodies=n.addr; push.numActiveSoftbodies=1u;
+    push.invDt=60.0f; push.partitionId=0u; push.flagsWord=0u; push.materials=j.addr;
+
+    Kernel kk("softBodySolveBda.spv", "sb_gm_cp_solveTetrahedronsPartitionLaunch", {}, sizeof(SolveTetraPush));
+    kk.dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+    std::printf("  [probe] dispatch + flush survived\n");
+}
+static void (*sbKeepSolveProbeReferenced)() = &softBodySimSolveProbe_DISABLED;
+
 } // namespace

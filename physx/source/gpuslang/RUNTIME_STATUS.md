@@ -1049,10 +1049,24 @@ Ruled OUT by direct experiment:
   - shader size / JIT budget (`extractRotation` cut from 100 iterations to 1 — still crashes);
   - malformed SPIR-V (`spirv-val` passes).
 
-So: the port matches the CUDA line-for-line, the SPIR-V validates, and the fault tracks nothing but
-"does this shader write a value that differs from what it read".  The next step is to reduce it to a
-standalone repro outside the PhysX harness and take it to Mesa — or to test on a second Vulkan
+Ruled OUT afterwards, and this one matters most: **the fault is GPU-side, not host-side.**  A probe
+case that does nothing but build dummy buffers, dispatch and flush — no CPU reference, no comparison,
+no download — still SIGSEGVs.  That kills the remaining "maybe the test driver is at fault" reading.
+The probe is kept in testSoftBodySim.cpp (unregistered, `softBodySimSolveProbe_DISABLED`) as the
+starting point for a standalone Mesa repro: strip the PhysX descriptor and feed the same push blob
+from a bare Vulkan harness.
+
+So: the port matches the CUDA line-for-line, the SPIR-V validates, the fault is inside the driver's
+execution of the shader, and it tracks nothing but "does this shader write a value that differs from
+what it read".  Next step is that standalone repro for Mesa — or a run on a second Vulkan
 implementation, which would settle driver-versus-port immediately.
+
+An adversarial transcription pass over the whole device tree (5 sub-trees, each independently
+refuted) finished after the port was written.  It surfaced no defect in the port: it repeatedly
+confirms the argument ORDER of the ported helpers matches CUDA exactly, that the `SbMat33`/`SbTetV`
+bundling and the unrolled gather/scatter are deliberate documented hardenings, and that the manifest
+slot is correctly left unmapped.  Its own suggestions were written against a pre-port snapshot of the
+file and would have reintroduced the constructs already bisected away.
 
 ### What IS confirmed correct along the way
 
