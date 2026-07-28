@@ -51,3 +51,22 @@ lands at a garbage address and the driver faults — correctly.
 
 This is worth knowing for any BDA port: the `UL` suffix does not make the *complement*
 64-bit. Write `~uint64_t(3)`, or avoid the mask.
+
+## `ultest` — the suffix sweep
+
+`ultest.slang` / `ultest.cpp` is the follow-up: it masks one known device address with every
+spelling of the constant and writes each result back, so the failure mode is a *printed
+address* rather than a crash. On llvmpipe:
+
+```
+addr           0x00007f0d6fc7e004
+& ~3UL         0x000000006fc7e004    <-- top half cleared
+& ~3ull        0x00007f0d6fc7e004
+& ~uint64_t(3) 0x00007f0d6fc7e004
+```
+
+So `ull` widens the complement correctly and `UL` does not. This was run as an audit over the
+whole shader tree: the only other 64-bit masking site is `npCvxPlaneNphase.slang:159`, which
+uses `~3ull` and is therefore correct. No second instance of the bug exists in the tree.
+
+Build it the same way as `repro2` (see above), substituting `ultest` for the file stem.

@@ -2155,4 +2155,469 @@ static void softBodySimSolveProbe_DISABLED()
 }
 static void (*sbKeepSolveProbeReferenced)() = &softBodySimSolveProbe_DISABLED;
 
+
+// ===========================================================================
+// P8.0 tranche 7 — the three kernels that CLOSE the softbody step:
+//   sb_gm_cp_averageVertsLaunch        (softBodyGM.cu:1509) — merge the partition copies
+//   sb_gm_applyDeformationDeltasLaunch (softBodyGM.cu:2665) — the Jacobi delta apply
+//   sb_gm_updateTetModelVertsLaunch    (softBodyGM.cu:1589) — skin sim -> collision mesh
+//
+// NO tolerance seam here: not one transcendental between the three.  Everything is
+// compared through raw float bits (f2u), and each case carries teeth aimed at the one
+// thing a plausible-looking port would get wrong.
+// ===========================================================================
+
+// { PxgSoftBody*, const PxU32*, PxReal } -> 24-byte blob; identical to ApplyDeltasPush,
+// but declared separately so the static_asserts document each kernel's own pack.
+struct AvgVertsPush { uint64_t gSoftbodies, activeSoftbodies; float invDt; uint32_t _pad20; };
+static_assert(sizeof(AvgVertsPush) == 24, "averageVerts push blob must be 24 bytes");
+static_assert(offsetof(AvgVertsPush, invDt) == 16, "invDt @16");
+
+// { PxgSoftBody*, const PxU32* } -> 16-byte blob.
+struct SkinPush { uint64_t gSoftbodies, activeSoftbodies; };
+static_assert(sizeof(SkinPush) == 16, "updateTetModelVerts push blob must be 16 bytes");
+
+// ---------------------------------------------------------------------------
+// sb_gm_cp_averageVertsLaunch.
+//
+// The partition solve writes each vertex once PER COPY into mSimPosition_InvMassCP,
+// past a leading block of numElements * numVertsPerElement entries; this kernel folds
+// them back by averaging the displacements.  The case pins, in order:
+//   - the OFFSET into the copy buffer (the leading element-corner block is poisoned
+//     with values that would produce a wildly different average if read by mistake);
+//   - the inclusive-prefix-sum walk of mSimAccumulatedCopiesCP, with a per-vertex copy
+//     count that varies 1/2/3/1/2/1 so vertex 0's implicit start-at-0 and the general
+//     accum[i-1] case are both live;
+//   - the 1/numCopies average (a port that summed without dividing matches only the
+//     single-copy vertices);
+//   - the pos_invMass.w > 0 gate (a pinned vertex must come back untouched);
+//   - the w channel of the velocity write, which carries INVERSE MASS and not a
+//     velocity component.
+// `kinematic` re-runs the whole thing with PxDeformableBodyFlag::eKINEMATIC set, where
+// every buffer must survive completely untouched.
+// ---------------------------------------------------------------------------
+static void runAverageVerts(bool kinematic)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t numVerts = 6u;
+    const uint32_t numTets = 4u;          // numTetsPerElement == 1 -> numElements == 4
+    const uint32_t numVertsPerElement = 4u;
+    const uint32_t offset = numTets * numVertsPerElement;   // 16
+    const float invDt = 60.0f;
+
+    // copies per vertex: 1, 2, 3, 1, 2, 1  -> inclusive prefix sum
+    const uint32_t copies[6] = { 1u, 2u, 3u, 1u, 2u, 1u };
+    std::vector<uint32_t> accum(numVerts);
+    { uint32_t run = 0u; for (uint32_t i = 0; i < numVerts; ++i) { run += copies[i]; accum[i] = run; } }
+    const uint32_t totalCopies = accum[numVerts - 1u];   // 10
+
+    std::vector<F4> pos(numVerts), vel(numVerts), deltaPos(numVerts);
+    for (uint32_t i = 0; i < numVerts; ++i)
+    {
+        // vertex 4 is PINNED (invMass == 0) and must be skipped entirely
+        const float invMass = (i == 4u) ? 0.0f : (0.5f + 0.25f * float(i));
+        pos[i] = { 0.75f * float(i), 3.0f - 0.1f * float(i), -0.3f * float(i), invMass };
+        // the velocity's w channel is deliberately NEVER equal to pos.w — the kernel must
+        // restore it from pos_invMass, and the difference is what gives that check teeth
+        vel[i] = { 0.11f * float(i) + 0.03f, -0.19f * float(i) - 0.07f, 0.13f * float(i) + 0.05f,
+                   0.625f + 0.125f * float(i) };
+        deltaPos[i] = { 0.101f * float(i), -0.203f * float(i), 0.307f * float(i), 77.0f };
+    }
+
+    // The copy buffer: the leading `offset` entries belong to the element corners and
+    // must NEVER be read by this kernel — poison them far away from the real copies.
+    std::vector<F4> cp(offset + totalCopies);
+    for (uint32_t j = 0; j < offset; ++j)
+        cp[j] = { -1000.0f - float(j), 1000.0f + float(j), -2000.0f, 999.0f };
+    for (uint32_t i = 0; i < numVerts; ++i)
+    {
+        const uint32_t start = (i == 0u) ? 0u : accum[i - 1u];
+        for (uint32_t c = 0; c < copies[i]; ++c)
+        {
+            // each copy sits at pos + a distinct displacement, so the average is a
+            // different number for every copy count
+            const float s = 0.01f * float(c + 1u) + 0.003f * float(i);
+            cp[offset + start + c] = { pos[i].x + s, pos[i].y - 2.0f * s, pos[i].z + 3.0f * s,
+                                       pos[i].w + 0.5f };
+        }
+    }
+
+    DevBuf bPos = makeDev(dev, pos), bVel = makeDev(dev, vel), bDeltaPos = makeDev(dev, deltaPos);
+    DevBuf bCp = makeDev(dev, cp), bAccum = makeDev(dev, accum);
+
+    PxgSoftBody c = makeZeroDesc();
+    c.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    c.mSimVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVel.addr));
+    c.mSimDeltaPos = reinterpret_cast<float4*>(size_t(bDeltaPos.addr));
+    c.mSimPosition_InvMassCP = reinterpret_cast<float4*>(size_t(bCp.addr));
+    c.mSimAccumulatedCopiesCP = reinterpret_cast<PxU32*>(size_t(bAccum.addr));
+    c.mNumVertsGM = numVerts;
+    c.mNumTetsGM = numTets;
+    c.mNumTetsPerElement = 1u;
+    if (kinematic)
+        c.mBodyFlags = PxU8(PxDeformableBodyFlag::eKINEMATIC);
+    std::vector<PxgSoftBody> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    AvgVertsPush push = {};
+    push.gSoftbodies = bDesc.addr;
+    push.activeSoftbodies = bActive.addr;
+    push.invDt = invDt;
+
+    Kernel k("softBodySolveBda.spv", "sb_gm_cp_averageVertsLaunch", {}, sizeof(AvgVertsPush));
+    k.dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // CPU reference — expression order transcribed from softBodyGM.cu:1509.
+    std::vector<F4> refPos = pos, refVel = vel, refDeltaPos = deltaPos;
+    if (!kinematic)
+    {
+        for (uint32_t i = 0; i < numVerts; ++i)
+        {
+            if (!(pos[i].w > 0.0f)) continue;
+            const uint32_t start = (i == 0u) ? 0u : accum[i - 1u];
+            const uint32_t end = accum[i];
+            const F4 p = pos[i];
+            F4 diff = { cp[offset + start].x - p.x, cp[offset + start].y - p.y,
+                        cp[offset + start].z - p.z, cp[offset + start].w - p.w };
+            for (uint32_t j = start + 1u; j < end; ++j)
+            {
+                diff.x += cp[offset + j].x - p.x; diff.y += cp[offset + j].y - p.y;
+                diff.z += cp[offset + j].z - p.z; diff.w += cp[offset + j].w - p.w;
+            }
+            const float scale = 1.0f / float(end - start);
+            diff.w = 0.0f;
+            const F4 avgDelta = { diff.x * scale, diff.y * scale, diff.z * scale, diff.w * scale };
+            refPos[i] = { p.x + avgDelta.x, p.y + avgDelta.y, p.z + avgDelta.z, p.w + avgDelta.w };
+            // NOTE: w comes from pos_invMass, not from the averaged velocity
+            refVel[i] = { vel[i].x + avgDelta.x * invDt, vel[i].y + avgDelta.y * invDt,
+                          vel[i].z + avgDelta.z * invDt, p.w };
+            refDeltaPos[i] = { deltaPos[i].x + avgDelta.x, deltaPos[i].y + avgDelta.y,
+                               deltaPos[i].z + avgDelta.z, deltaPos[i].w + avgDelta.w };
+        }
+    }
+
+    const auto gPos = downloadBuffer<F4>(dev, bPos.h, numVerts);
+    const auto gVel = downloadBuffer<F4>(dev, bVel.h, numVerts);
+    const auto gDeltaPos = downloadBuffer<F4>(dev, bDeltaPos.h, numVerts);
+    const auto gCp = downloadBuffer<F4>(dev, bCp.h, cp.size());
+
+    size_t mm = 0;
+    auto cmp = [&](const char* what, uint32_t i, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) ||
+            f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm; std::printf("  %s[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", what, i,
+                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); } };
+    for (uint32_t i = 0; i < numVerts; ++i)
+    {
+        cmp("pos", i, refPos[i], gPos[i]);
+        cmp("vel", i, refVel[i], gVel[i]);
+        cmp("deltaPos", i, refDeltaPos[i], gDeltaPos[i]);
+    }
+    // The copy buffer is read-only for this kernel — including the poisoned prefix.
+    for (uint32_t j = 0; j < uint32_t(cp.size()); ++j)
+        cmp("copyBuffer(readonly)", j, cp[j], gCp[j]);
+
+    PXG_CHECK_MSG(mm == 0, "sb_gm_cp_averageVertsLaunch bit-exact vs CPU (%zu mismatches)", mm);
+
+    if (kinematic)
+    {
+        // Teeth on the eKINEMATIC early-out: NOTHING may move.  Vertex 2 has three copies
+        // all displaced in the same direction, so any port that ran the body would show it.
+        PXG_CHECK_MSG(f2u(gPos[2].x) == f2u(pos[2].x),
+                      "eKINEMATIC must skip the average entirely: pos[2].x %g -> %g",
+                      pos[2].x, gPos[2].x);
+    }
+    else
+    {
+        // Teeth 1 — the DIVIDE.  Vertex 2 has three copies displaced by 0.016/0.026/0.036
+        // in x, so the average is 0.026; a port that summed without dividing lands on
+        // 0.078 and a port that used the wrong copy count lands elsewhere again.
+        const float s0 = 0.01f * 1.0f + 0.003f * 2.0f, s1 = 0.01f * 2.0f + 0.003f * 2.0f,
+                    s2 = 0.01f * 3.0f + 0.003f * 2.0f;
+        const float expect2x = pos[2].x + ((s0 + s1 + s2) * (1.0f / 3.0f));
+        PXG_CHECK_MSG(std::fabs(gPos[2].x - expect2x) < 1e-6f,
+                      "vertex 2 (3 copies) must be averaged by 1/3: ref %g got %g",
+                      expect2x, gPos[2].x);
+        // Teeth 2 — the pos_invMass.w > 0 gate: vertex 4 is pinned and owns two copies
+        // that would move it if the gate were dropped.
+        PXG_CHECK_MSG(f2u(gPos[4].x) == f2u(pos[4].x) && f2u(gVel[4].x) == f2u(vel[4].x),
+                      "pinned vertex 4 (invMass == 0) must be untouched: pos %g vel %g",
+                      gPos[4].x, gVel[4].x);
+        // Teeth 3 — the velocity w channel is the INVERSE MASS, restored from
+        // pos_invMass and NOT the averaged vel.w (which differs for every vertex here).
+        PXG_CHECK_MSG(f2u(gVel[0].w) == f2u(pos[0].w),
+                      "velocity.w must carry pos_invMass.w (%g), got %g", pos[0].w, gVel[0].w);
+        PXG_CHECK_MSG(f2u(gVel[0].w) != f2u(vel[0].w),
+                      "test is toothless: vel[0].w must differ from pos[0].w");
+        // Teeth 4 — the OFFSET.  Vertex 0's single copy sits at cp[16]; reading cp[0]
+        // (the poisoned element-corner block) instead would drag it to about -1000.
+        PXG_CHECK_MSG(gPos[0].x > 0.0f - 1.0f,
+                      "vertex 0 must read the copy at cp[offset], not cp[0] (got %g)", gPos[0].x);
+    }
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bDeltaPos.h);
+    dev->destroyBuffer(bCp.h); dev->destroyBuffer(bAccum.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+PXG_TEST(softBodySimAverageVerts) { runAverageVerts(/*kinematic*/ false); }
+PXG_TEST(softBodySimAverageVertsKinematic) { runAverageVerts(/*kinematic*/ true); }
+
+// ---------------------------------------------------------------------------
+// sb_gm_applyDeformationDeltasLaunch.
+//
+// The Jacobi twin of sb_gm_applyExternalDeltasLaunch, differing in exactly two things,
+// and the case is built so a port that got either wrong FAILS:
+//   - the vertex INDIRECTION through mSimJacobiVertIndices (the indices are a permuted,
+//     non-contiguous subset, and every vertex NOT in the list must survive untouched —
+//     a port that used the lane index directly would move the wrong four);
+//   - mJacobiScale (@428) instead of 1/max(delta.w, 1).  delta.w is set to 4 on one of
+//     the vertices, so the two rules give visibly different answers (0.375 vs 0.25).
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimApplyDeformationDeltas)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t N = 8u;             // sim vertices
+    const uint32_t nbJacobi = 4u;      // the Jacobi subset
+    const float invDt = 60.0f;
+    const float jacobiScale = 0.375f;
+
+    // Deliberately permuted and non-contiguous: lane i does NOT work on vertex i.
+    const std::vector<uint32_t> jacobiIdx = { 5u, 1u, 7u, 2u };
+
+    std::vector<F4> pos(N), vel(N), delta(N), deltaPos(N);
+    const float ws[8] = { 0.0f, 1.0f, 4.0f, 7.0f, 2.5f, 0.5f, 3.0f, 12.0f };
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        pos[i] = { float(i) * 0.75f, 5.0f - float(i) * 0.1f, -0.3f * float(i), 1.0f + 0.25f * float(i) };
+        vel[i] = { 0.11f * float(i) + 0.03f, -0.19f * float(i) - 0.07f, 0.13f * float(i) + 0.05f,
+                   0.5f + 0.125f * float(i) };
+        delta[i] = { 0.031f * float(i) + 0.007f, -0.017f * float(i) - 0.011f,
+                     0.023f * float(i) + 0.013f, ws[i] };
+        deltaPos[i] = { 0.101f * float(i), -0.203f * float(i), 0.307f * float(i), 77.0f };
+    }
+
+    DevBuf bPos = makeDev(dev, pos), bVel = makeDev(dev, vel);
+    DevBuf bDelta = makeDev(dev, delta), bDeltaPos = makeDev(dev, deltaPos);
+    DevBuf bIdx = makeDev(dev, jacobiIdx);
+
+    PxgSoftBody c = makeZeroDesc();
+    c.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    c.mSimVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVel.addr));
+    c.mSimDelta = reinterpret_cast<float4*>(size_t(bDelta.addr));
+    c.mSimDeltaPos = reinterpret_cast<float4*>(size_t(bDeltaPos.addr));
+    c.mSimJacobiVertIndices = reinterpret_cast<PxU32*>(size_t(bIdx.addr));
+    c.mNumJacobiVertices = nbJacobi;
+    c.mNumVertsGM = N;
+    c.mJacobiScale = jacobiScale;
+    std::vector<PxgSoftBody> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    AvgVertsPush push = {};   // same {8,8,4} pack
+    push.gSoftbodies = bDesc.addr;
+    push.activeSoftbodies = bActive.addr;
+    push.invDt = invDt;
+
+    Kernel k("softBodySolveBda.spv", "sb_gm_applyDeformationDeltasLaunch", {}, sizeof(AvgVertsPush));
+    k.dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // CPU reference — expression order transcribed from softBodyGM.cu:2665.
+    std::vector<F4> refPos = pos, refVel = vel, refDelta = delta, refDeltaPos = deltaPos;
+    for (uint32_t lane = 0; lane < nbJacobi; ++lane)
+    {
+        const uint32_t v = jacobiIdx[lane];
+        F4 d = delta[v];
+        d.x *= jacobiScale; d.y *= jacobiScale; d.z *= jacobiScale;
+        d.w = 0.0f;
+        refVel[v] = { vel[v].x + d.x * invDt, vel[v].y + d.y * invDt,
+                      vel[v].z + d.z * invDt, vel[v].w + d.w * invDt };
+        refPos[v] = { pos[v].x + d.x, pos[v].y + d.y, pos[v].z + d.z, pos[v].w + d.w };
+        refDeltaPos[v] = { deltaPos[v].x + d.x, deltaPos[v].y + d.y,
+                           deltaPos[v].z + d.z, deltaPos[v].w + d.w };
+        refDelta[v] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    }
+
+    const auto gPos = downloadBuffer<F4>(dev, bPos.h, N);
+    const auto gVel = downloadBuffer<F4>(dev, bVel.h, N);
+    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, N);
+    const auto gDeltaPos = downloadBuffer<F4>(dev, bDeltaPos.h, N);
+
+    size_t mm = 0;
+    auto cmp = [&](const char* what, uint32_t i, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) ||
+            f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm; std::printf("  %s[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", what, i,
+                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); } };
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        cmp("pos", i, refPos[i], gPos[i]);
+        cmp("vel", i, refVel[i], gVel[i]);
+        cmp("delta", i, refDelta[i], gDelta[i]);
+        cmp("deltaPos", i, refDeltaPos[i], gDeltaPos[i]);
+    }
+    PXG_CHECK_MSG(mm == 0, "sb_gm_applyDeformationDeltasLaunch bit-exact vs CPU (%zu mismatches)", mm);
+
+    // Teeth 1 — mJacobiScale, not 1/max(delta.w,1).  Vertex 2 carries delta.w == 4, so
+    // the external-delta rule would scale by 0.25 while this kernel must scale by 0.375.
+    const float expectJacobi = pos[2].x + delta[2].x * jacobiScale;
+    const float expectExternal = pos[2].x + delta[2].x * 0.25f;
+    PXG_CHECK_MSG(f2u(gPos[2].x) == f2u(expectJacobi),
+                  "vertex 2 must use mJacobiScale (%g), got %g", expectJacobi, gPos[2].x);
+    PXG_CHECK_MSG(f2u(expectJacobi) != f2u(expectExternal),
+                  "test is toothless: the two scale rules must disagree on vertex 2");
+    // Teeth 2 — the INDIRECTION.  Vertices 0, 3, 4 and 6 are not in the Jacobi subset and
+    // must be bit-identical to their inputs, deltas included (NOT cleared).
+    const uint32_t untouched[4] = { 0u, 3u, 4u, 6u };
+    for (uint32_t t = 0; t < 4u; ++t)
+    {
+        const uint32_t v = untouched[t];
+        PXG_CHECK_MSG(f2u(gPos[v].x) == f2u(pos[v].x),
+                      "vertex %u is outside the Jacobi subset and must not move (%g -> %g)",
+                      v, pos[v].x, gPos[v].x);
+        PXG_CHECK_MSG(f2u(gDelta[v].x) == f2u(delta[v].x),
+                      "vertex %u is outside the Jacobi subset and its delta must NOT be cleared", v);
+    }
+    // ...and the four that ARE in it did move and were cleared.
+    for (uint32_t lane = 0; lane < nbJacobi; ++lane)
+    {
+        const uint32_t v = jacobiIdx[lane];
+        PXG_CHECK_MSG(f2u(gPos[v].x) != f2u(pos[v].x),
+                      "test is toothless: Jacobi vertex %u must actually move", v);
+        PXG_CHECK_MSG(f2u(gDelta[v].x) == f2u(0.0f), "Jacobi vertex %u's delta must be cleared", v);
+    }
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bDelta.h);
+    dev->destroyBuffer(bDeltaPos.h); dev->destroyBuffer(bIdx.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+// ---------------------------------------------------------------------------
+// sb_gm_updateTetModelVertsLaunch.
+//
+// The skinning step: each COLLISION vertex is the barycentric combination of its host
+// SIMULATION tetrahedron's four corners.  The case pins:
+//   - mNumVerts (@364, the COLLISION count) as the guard, deliberately DIFFERENT from
+//     mNumVertsGM (@372) — a port that used the sim count would over- or under-run;
+//   - the two-level indirection remapTable -> mSimTetIndices -> mSimPosition_InvMass,
+//     with the four tet corner indices permuted so x/y/z/w cannot be swapped silently;
+//   - the four-term blend p0*b.x + p1*b.y + p2*b.z + p3*b.w including the w channel;
+//   - that only the first mNumVerts entries of mPosition_InvMass are written.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimUpdateTetModelVerts)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t numCollVerts = 5u;
+    const uint32_t numSimVerts = 9u;
+    const uint32_t numSimTets = 3u;
+
+    // Sim tetrahedra with PERMUTED corner indices — x/y/z/w are all distinct vertices and
+    // no tet uses them in ascending order, so a transposed blend shows up immediately.
+    std::vector<p80refit::TetIdx4> simTets = {
+        { 3u, 0u, 7u, 1u },
+        { 5u, 8u, 2u, 4u },
+        { 6u, 1u, 8u, 0u },
+    };
+    // Which sim tet hosts each collision vertex (two share tet 2 -> the map is not 1:1).
+    std::vector<uint32_t> remap = { 1u, 0u, 2u, 2u, 0u };
+    std::vector<F4> bary(numCollVerts);
+    for (uint32_t i = 0; i < numCollVerts; ++i)
+    {
+        // deliberately NOT a partition of unity on every vertex: the kernel does not
+        // normalise, so an implementation that did would diverge here
+        bary[i] = { 0.5f - 0.07f * float(i), 0.2f + 0.05f * float(i),
+                    0.2f - 0.03f * float(i), 0.1f + 0.11f * float(i) };
+    }
+
+    std::vector<F4> simPos(numSimVerts);
+    for (uint32_t i = 0; i < numSimVerts; ++i)
+        simPos[i] = { 1.5f * float(i) - 2.0f, 0.25f * float(i) + 0.5f,
+                      -0.6f * float(i) + 1.0f, 0.125f * float(i) + 0.75f };
+
+    // One extra entry past mNumVerts, poisoned: it must survive.
+    const F4 POISON = { -12345.0f, -12345.0f, -12345.0f, -12345.0f };
+    std::vector<F4> collPos(numCollVerts + 1u, POISON);
+
+    DevBuf bTets = makeDev(dev, simTets), bRemap = makeDev(dev, remap), bBary = makeDev(dev, bary);
+    DevBuf bSimPos = makeDev(dev, simPos), bCollPos = makeDev(dev, collPos);
+
+    PxgSoftBody c = makeZeroDesc();
+    c.mSimTetIndices = reinterpret_cast<decltype(c.mSimTetIndices)>(size_t(bTets.addr));
+    c.mVertsRemapInGridModel = reinterpret_cast<PxU32*>(size_t(bRemap.addr));
+    c.mVertsBarycentricInGridModel = reinterpret_cast<float4*>(size_t(bBary.addr));
+    c.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bSimPos.addr));
+    c.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bCollPos.addr));
+    c.mNumVerts = numCollVerts;      // the guard
+    c.mNumVertsGM = numSimVerts;     // deliberately different
+    c.mNumTetsGM = numSimTets;
+    c.mNumTetsPerElement = 1u;
+    std::vector<PxgSoftBody> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    SkinPush push = {};
+    push.gSoftbodies = bDesc.addr;
+    push.activeSoftbodies = bActive.addr;
+
+    Kernel k("softBodySolveBda.spv", "sb_gm_updateTetModelVertsLaunch", {}, sizeof(SkinPush));
+    k.dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // CPU reference — expression order transcribed from softBodyGM.cu:1589.
+    std::vector<F4> ref = collPos;
+    for (uint32_t i = 0; i < numCollVerts; ++i)
+    {
+        const p80refit::TetIdx4 t = simTets[remap[i]];
+        const F4 p0 = simPos[t.x], p1 = simPos[t.y], p2 = simPos[t.z], p3 = simPos[t.w];
+        const F4 b = bary[i];
+        ref[i] = { p0.x * b.x + p1.x * b.y + p2.x * b.z + p3.x * b.w,
+                   p0.y * b.x + p1.y * b.y + p2.y * b.z + p3.y * b.w,
+                   p0.z * b.x + p1.z * b.y + p2.z * b.z + p3.z * b.w,
+                   p0.w * b.x + p1.w * b.y + p2.w * b.z + p3.w * b.w };
+    }
+
+    const auto got = downloadBuffer<F4>(dev, bCollPos.h, collPos.size());
+    const auto gSimPos = downloadBuffer<F4>(dev, bSimPos.h, numSimVerts);
+
+    size_t mm = 0;
+    for (uint32_t i = 0; i < uint32_t(collPos.size()); ++i)
+        if (f2u(ref[i].x) != f2u(got[i].x) || f2u(ref[i].y) != f2u(got[i].y) ||
+            f2u(ref[i].z) != f2u(got[i].z) || f2u(ref[i].w) != f2u(got[i].w))
+        { ++mm; std::printf("  collPos[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", i,
+                            ref[i].x, ref[i].y, ref[i].z, ref[i].w,
+                            got[i].x, got[i].y, got[i].z, got[i].w); }
+    PXG_CHECK_MSG(mm == 0, "sb_gm_updateTetModelVertsLaunch bit-exact vs CPU (%zu mismatches)", mm);
+
+    // Teeth 1 — the guard is mNumVerts, not mNumVertsGM: entry 5 must keep its poison.
+    PXG_CHECK_MSG(f2u(got[numCollVerts].x) == f2u(POISON.x),
+                  "entry past mNumVerts must be untouched (got %g)", got[numCollVerts].x);
+    // Teeth 2 — the sim mesh is READ-ONLY here.
+    for (uint32_t i = 0; i < numSimVerts; ++i)
+        PXG_CHECK_MSG(f2u(gSimPos[i].x) == f2u(simPos[i].x),
+                      "the simulation mesh must not be written (vertex %u)", i);
+    // Teeth 3 — the CORNER ORDER.  Collision vertices 0 and 4 share barycentrics-shaped
+    // input but different tets; more to the point, blending tet 1 with its corners sorted
+    // ascending (2,4,5,8) instead of as stored (5,8,2,4) gives a different answer.
+    {
+        const F4 b = bary[0];
+        const F4 q0 = simPos[2], q1 = simPos[4], q2 = simPos[5], q3 = simPos[8];
+        const float sorted = q0.x * b.x + q1.x * b.y + q2.x * b.z + q3.x * b.w;
+        PXG_CHECK_MSG(f2u(got[0].x) != f2u(sorted),
+                      "test is toothless: sorted-corner blend must differ from the stored order");
+    }
+    // Teeth 4 — every collision vertex must actually have been written.
+    for (uint32_t i = 0; i < numCollVerts; ++i)
+        PXG_CHECK_MSG(f2u(got[i].x) != f2u(POISON.x), "collision vertex %u was never written", i);
+
+    dev->destroyBuffer(bTets.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bBary.h);
+    dev->destroyBuffer(bSimPos.h); dev->destroyBuffer(bCollPos.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
 } // namespace

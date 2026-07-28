@@ -948,8 +948,10 @@ void sb_gm_cp_solveTetrahedronsPartitionLaunch(uint3 groupThreadId : SV_GroupThr
             // zero-extended for the 64-bit AND — which silently clears the TOP HALF of the
             // device address.  The read then lands at a garbage address and the driver
             // faults.  Verified in isolation (tools/lvprepro): `& ~3UL` faults, while
-            // `& ~uint64_t(3)`, `& 0xFFFFFFFFFFFFFFFCUL` and
-            // `- (matIdxAddr % 4UL)` all run clean on the same shader and data.
+            // `& ~uint64_t(3)`, `& ~3ull`, `& 0xFFFFFFFFFFFFFFFCUL` and
+            // `- (matIdxAddr % 4UL)` all run clean on the same shader and data.  Note that
+            // `ull` DOES widen the complement correctly while `UL` does not — the sweep in
+            // tools/lvprepro/ultest.slang prints the surviving address for each spelling.
             const uint matWord = Ptr<uint>(matIdxAddr & ~uint64_t(3))[0];
             // Which half of the word: derive it from the ADDRESS, not from workIndex's
             // parity — that only coincides when the array base is 4-aligned, and nothing
@@ -1036,5 +1038,273 @@ void sb_gm_cp_solveTetrahedronsPartitionLaunch(uint3 groupThreadId : SV_GroupThr
             sbScatter(curPositions, velocities, writeIndex4.z, p2, v2, dl.c1 * p2.w, invDt);
             sbScatter(curPositions, velocities, writeIndex4.w, p3, v3, dl.c2 * p3.w, invDt);
         }
+    }
+}
+
+
+// ===========================================================================
+// P8.0 tranche 7 — the three kernels that CLOSE the softbody step: the partition
+// average, the Jacobi deformation-delta apply, and the collision-mesh skinning.
+//
+//   sb_gm_cp_averageVertsLaunch        (:1509, launch PxgSoftBodyCore.cpp:1298)
+//       the partition solve writes each vertex once PER COPY (one copy per partition
+//       the vertex participates in) into the copy buffer mSimPosition_InvMassCP; this
+//       kernel folds those copies back into the single canonical vertex by averaging
+//       their displacements.  Without it the partitioned Gauss-Seidel solve produces
+//       no visible motion at all — the copies are written and then dropped.
+//   sb_gm_applyDeformationDeltasLaunch (:2665, launch PxgSoftBodyCore.cpp:1269)
+//       the Jacobi twin of sb_gm_applyExternalDeltasLaunch (tranche 4).  Same
+//       load/scale/store shape, but it walks the JACOBI vertex subset via
+//       mSimJacobiVertIndices and uses the per-softbody precomputed mJacobiScale @428
+//       instead of the per-vertex 1/max(delta.w,1).
+//   sb_gm_updateTetModelVertsLaunch    (:1589, launch PxgSoftBodyCore.cpp:828)
+//       the skinning step: the SIMULATION mesh is what the solver moves, but every
+//       consumer downstream (narrowphase, the render readback, the user's
+//       PxDeformableVolume vertex buffer) reads the COLLISION mesh.  This kernel
+//       reconstructs each collision vertex as the barycentric combination of its
+//       host sim tetrahedron's four corners.  It is the LAST kernel in the step and
+//       the one that makes the motion observable outside the solver.
+//
+// Together with tranches 4-6 this completes the softbody solve loop end to end:
+// zeroTetMultipliers opens it, the partitioned tetrahedron solve runs, averageVerts
+// merges the copies, applyDeformationDeltas folds the Jacobi remainder, and
+// updateTetModelVerts skins the result onto the collision mesh.
+//
+// DEVIATIONS from CUDA (identical in kind to the earlier softbody tranches):
+//   - all three open with a `blockCopy` of the whole 432-byte PxgSoftBody descriptor
+//     into __shared__ followed by __syncthreads, then read the shared copy.  That is
+//     a pure read-caching optimisation; it is dropped and every lane reads the
+//     descriptor directly through Ptr<>, which also removes the kernels' only
+//     barrier (relevant here because averageVerts' early-out sits AFTER the
+//     __syncthreads in the .cu — with no barrier the return is unconditionally safe);
+//   - CUDA's `delta.x *= scale; delta.y *= scale, delta.z *= scale;` in
+//     applyDeformationDeltas (note the comma operator — a typo that behaves
+//     identically) is written as a float3 multiply, as in tranche 4.
+//
+// BLOCK DIMS — note the engine's own mismatch, faithfully mirrored:
+// averageVerts and updateTetModelVerts compute `numBlocks` from SB_SOLVETETRA (64)
+// but launch with SB_PREINTEGRATION (1024) threads per block, so the grid covers 16x
+// the vertex count.  The `groupThreadIdx < numVerts` guard makes the surplus lanes
+// no-ops; the port keeps 1024 so `threadIdx.x + blockIdx.x * blockDim.x` reproduces
+// the same index for the same (block, thread) pair.  applyDeformationDeltas is
+// consistent at 64.
+//
+// All three are NoContraction-stamped (softBodySolveBda is in PXG_NOCONTRACT_SHADERS):
+// averageVerts' `vel + averageDelta * invDt`, applyDeformationDeltas' identical
+// `vel + delta * invDt`, and above all updateTetModelVerts' four-term barycentric
+// blend `p0*b.x + p1*b.y + p2*b.z + p3*b.w` are textbook mul-feeding-add chains that
+// would otherwise fuse into FMAs and break parity with the -ffp-contract=off CPU
+// reference.  NO transcendental in any of the three — this tranche is FULLY
+// bit-exact, no tolerance seam.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// sb_gm_cp_averageVertsLaunch (softBodyGM.cu:1509)
+// ---------------------------------------------------------------------------
+// CUDA arg pack (PxgSoftBodyCore.cpp:1301): { PxgSoftBody* gSoftbodies,
+// const PxU32* activeSoftbodies, const PxReal invDt } -> 20, rounded up to the
+// pointer alignment -> 24-byte blob.  (ABI row {8,8,4}.)
+struct AverageVertsParams
+{
+    uint64_t gSoftbodies;       // @0
+    uint64_t activeSoftbodies;  // @8
+    float invDt;                // @16
+    uint _pad20;                // @20  -> 24
+}
+[[vk::push_constant]]
+ConstantBuffer<AverageVertsParams> gAvg;
+
+[shader("compute")]
+[numthreads(1024, 1, 1)] // SB_PREINTEGRATION; grid (nbBlocks, nbActiveSoftbodies, 1)
+void sb_gm_cp_averageVertsLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    Ptr<PxgSoftBodyGpu> gSoftbodies = Ptr<PxgSoftBodyGpu>(gAvg.gSoftbodies);
+    const uint softbodyId = (Ptr<uint>(gAvg.activeSoftbodies))[groupId.y];
+
+    const uint bodyFlags = (gSoftbodies[softbodyId].mFlagsWord >> 8) & 0xffu;
+
+    // A kinematic body is driven by its targets, not by the solve; a body with more
+    // than one tet per element is a HEXAHEDRAL element whose copies are merged by the
+    // hexahedron path instead.  Both leave the copy buffer untouched.
+    if ((bodyFlags & PXG_SOFTBODY_BODYFLAG_KINEMATIC) != 0u ||
+        gSoftbodies[softbodyId].mNumTetsPerElement != 1u)
+        return;
+
+    const uint groupThreadIdx = groupThreadId.x + groupId.x * 1024u;
+
+    const uint numVerts = gSoftbodies[softbodyId].mNumVertsGM;
+    const uint numTets = gSoftbodies[softbodyId].mNumTetsGM;
+
+    if (groupThreadIdx < numVerts && numTets > 0u)
+    {
+        const uint numTetsPerElement = gSoftbodies[softbodyId].mNumTetsPerElement;
+        const uint numElements = numTets / numTetsPerElement;
+        const uint numVertsPerElement = (numTetsPerElement == 1u) ? 4u : 8u;
+
+        Ptr<float4> gridModelPoses = Ptr<float4>(gSoftbodies[softbodyId].mSimPosition_InvMass);
+        Ptr<float4> gridModelVels = Ptr<float4>(gSoftbodies[softbodyId].mSimVelocity_InvMass);
+        Ptr<float4> deltaPos = Ptr<float4>(gSoftbodies[softbodyId].mSimDeltaPos);
+
+        Ptr<float4> curPositions = Ptr<float4>(gSoftbodies[softbodyId].mSimPosition_InvMassCP);
+        Ptr<uint> accumulatedCopies = Ptr<uint>(gSoftbodies[softbodyId].mSimAccumulatedCopiesCP);
+
+        // The copy buffer holds the PARTITIONED tetrahedron corners first (one entry per
+        // element corner), and the per-vertex copies only start after them.
+        const uint offset = numElements * numVertsPerElement;
+
+        const float4 pos_invMass = gridModelPoses[groupThreadIdx];
+
+        if (pos_invMass.w > 0.0f)
+        {
+            // mSimAccumulatedCopiesCP is an inclusive prefix sum of the per-vertex copy
+            // counts, so vertex i owns copies [accum[i-1], accum[i]).
+            const uint startInd = (groupThreadIdx == 0u) ? 0u : accumulatedCopies[groupThreadIdx - 1u];
+            const uint endInd = accumulatedCopies[groupThreadIdx];
+
+            float4 diff = curPositions[offset + startInd] - pos_invMass;
+
+            for (uint j = startInd + 1u; j < endInd; ++j)
+            {
+                const float4 newDiff = curPositions[offset + j] - pos_invMass;
+                diff += newDiff;
+            }
+
+            const uint numCopies = endInd - startInd;
+            const float scale = 1.0f / float(numCopies);
+
+            diff.w = 0.0f;
+
+            const float4 averageDelta = diff * scale;
+            const float4 averagePos = pos_invMass + averageDelta;
+            const float4 averageVel = gridModelVels[groupThreadIdx] + averageDelta * gAvg.invDt;
+
+            gridModelPoses[groupThreadIdx] = averagePos;
+            // NOTE the w channel: the velocity slot carries the vertex's INVERSE MASS,
+            // not a velocity component, so it is restored from pos_invMass rather than
+            // taken from averageVel.
+            gridModelVels[groupThreadIdx] =
+                float4(averageVel.x, averageVel.y, averageVel.z, pos_invMass.w);
+            deltaPos[groupThreadIdx] = deltaPos[groupThreadIdx] + averageDelta;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sb_gm_applyDeformationDeltasLaunch (softBodyGM.cu:2665)
+// ---------------------------------------------------------------------------
+// CUDA arg pack (PxgSoftBodyCore.cpp:1270): { PxgSoftBody* gSoftbodies,
+// const PxU32* activeSoftbodies, const PxReal invDt } -> 24-byte blob.
+// (ABI row {8,8,4}.)
+struct ApplyDeformationDeltasParams
+{
+    uint64_t gSoftbodies;       // @0
+    uint64_t activeSoftbodies;  // @8
+    float invDt;                // @16
+    uint _pad20;                // @20  -> 24
+}
+[[vk::push_constant]]
+ConstantBuffer<ApplyDeformationDeltasParams> gDeform;
+
+[shader("compute")]
+[numthreads(64, 1, 1)] // SB_SOLVETETRA; grid (nbBlocks, nbActiveSoftbodies, 1)
+void sb_gm_applyDeformationDeltasLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    Ptr<PxgSoftBodyGpu> gSoftbodies = Ptr<PxgSoftBodyGpu>(gDeform.gSoftbodies);
+    const uint softbodyId = (Ptr<uint>(gDeform.activeSoftbodies))[groupId.y];
+
+    Ptr<float4> curPositions = Ptr<float4>(gSoftbodies[softbodyId].mSimPosition_InvMass);
+    Ptr<float4> vels = Ptr<float4>(gSoftbodies[softbodyId].mSimVelocity_InvMass);
+    Ptr<float4> simDelta = Ptr<float4>(gSoftbodies[softbodyId].mSimDelta);
+    Ptr<float4> simDeltaPos = Ptr<float4>(gSoftbodies[softbodyId].mSimDeltaPos);
+    Ptr<uint> jacobiVertIndices = Ptr<uint>(gSoftbodies[softbodyId].mSimJacobiVertIndices);
+
+    const uint groupThreadIdx = groupThreadId.x + groupId.x * 64u;
+    const uint nbJacobiVerts = gSoftbodies[softbodyId].mNumJacobiVertices;
+
+    if (groupThreadIdx < nbJacobiVerts)
+    {
+        // The Jacobi subset is an INDIRECTION: lane i works on sim vertex
+        // mSimJacobiVertIndices[i], not on vertex i.
+        const uint vertIdx = jacobiVertIndices[groupThreadIdx];
+
+        const float4 pos = curPositions[vertIdx];
+        const float4 vel = vels[vertIdx];
+
+        float4 delta = simDelta[vertIdx];
+
+        // The ONLY difference from sb_gm_applyExternalDeltasLaunch: a per-softbody
+        // precomputed scale (mJacobiScale @428) instead of the per-vertex
+        // 1/max(delta.w, 1).  delta.w is ignored entirely here.
+        const float scale = gSoftbodies[softbodyId].mJacobiScale;
+
+        delta.x *= scale; delta.y *= scale; delta.z *= scale;
+        delta.w = 0.0f;
+
+        const float4 newVel = vel + delta * gDeform.invDt;
+
+        curPositions[vertIdx] = pos + delta;
+        vels[vertIdx] = newVel;
+
+        simDeltaPos[vertIdx] = simDeltaPos[vertIdx] + delta;
+
+        // clear delta
+        simDelta[vertIdx] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sb_gm_updateTetModelVertsLaunch (softBodyGM.cu:1589)
+// ---------------------------------------------------------------------------
+// CUDA arg pack (PxgSoftBodyCore.cpp:830): { PxgSoftBody* gSoftbodies,
+// const PxU32* activeSoftbodies } -> 16-byte blob.  (ABI row {8,8}.)
+struct UpdateTetModelVertsParams
+{
+    uint64_t gSoftbodies;       // @0
+    uint64_t activeSoftbodies;  // @8  -> 16
+}
+[[vk::push_constant]]
+ConstantBuffer<UpdateTetModelVertsParams> gSkin;
+
+[shader("compute")]
+[numthreads(1024, 1, 1)] // SB_PREINTEGRATION; grid (nbBlocks, nbActiveSoftbodies, 1)
+void sb_gm_updateTetModelVertsLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    Ptr<PxgSoftBodyGpu> gSoftbodies = Ptr<PxgSoftBodyGpu>(gSkin.gSoftbodies);
+    const uint softbodyId = (Ptr<uint>(gSkin.activeSoftbodies))[groupId.y];
+
+    const uint groupThreadIdx = groupThreadId.x + groupId.x * 1024u;
+
+    // mNumVerts @364 is the COLLISION mesh vertex count (mNumVertsGM @372 is the
+    // simulation mesh's) — this kernel is one thread per collision vertex.
+    const uint numVerts = gSoftbodies[softbodyId].mNumVerts;
+
+    if (groupThreadIdx < numVerts)
+    {
+        Ptr<float4> barycentricCoordinates =
+            Ptr<float4>(gSoftbodies[softbodyId].mVertsBarycentricInGridModel);
+        Ptr<uint> remapTable = Ptr<uint>(gSoftbodies[softbodyId].mVertsRemapInGridModel);
+        Ptr<uint4> tetsGM = Ptr<uint4>(gSoftbodies[softbodyId].mSimTetIndices);
+        Ptr<float4> positionGM = Ptr<float4>(gSoftbodies[softbodyId].mSimPosition_InvMass);
+
+        Ptr<float4> curPositions = Ptr<float4>(gSoftbodies[softbodyId].mPosition_InvMass);
+
+        const uint tetrahedronIdx = remapTable[groupThreadIdx];
+        const uint4 tetInd = tetsGM[tetrahedronIdx];
+        const float4 p0 = positionGM[tetInd.x];
+        const float4 p1 = positionGM[tetInd.y];
+        const float4 p2 = positionGM[tetInd.z];
+        const float4 p3 = positionGM[tetInd.w];
+
+        const float4 barycentric = barycentricCoordinates[groupThreadIdx];
+
+        // The w channel rides along: the sim positions carry inverse mass there, so the
+        // collision vertex ends up with the barycentric blend of the four inverse
+        // masses.  The .cu notes the alternative (`newPos.w = pos.w`) and leaves it
+        // commented out — curPositions.w is re-established downstream by the collision
+        // pass, so the blended value is never consumed.
+        const float4 newPos = p0 * barycentric.x + p1 * barycentric.y +
+                              p2 * barycentric.z + p3 * barycentric.w;
+
+        curPositions[groupThreadIdx] = newPos;
     }
 }

@@ -523,7 +523,15 @@ pxg_compile_shader(softBodySolveBda sb_gm_zeroTetMultipliers
                    sb_gm_applyExternalDeltasLaunch
                    sb_gm_updateTetrahedraRotationsLaunch
                    sb_updateTetrahedraRotationsLaunch
-                   sb_gm_cp_solveTetrahedronsPartitionLaunch)
+                   sb_gm_cp_solveTetrahedronsPartitionLaunch
+# P8.0 tranche 7: the three kernels that CLOSE the softbody step —
+# sb_gm_cp_averageVertsLaunch merges the per-partition vertex copies,
+# sb_gm_applyDeformationDeltasLaunch is the Jacobi twin of applyExternalDeltas, and
+# sb_gm_updateTetModelVertsLaunch skins the simulation mesh onto the collision mesh (the
+# step's last kernel, and the one that makes the motion observable outside the solver).
+                   sb_gm_cp_averageVertsLaunch
+                   sb_gm_applyDeformationDeltasLaunch
+                   sb_gm_updateTetModelVertsLaunch)
 pxg_compile_shader(contactReduce ctContactReduce)
 pxg_compile_shader(npSbTet ctSbTet)
 pxg_compile_shader(npSbSelf ctSbSelfQuery)

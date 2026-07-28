@@ -1077,6 +1077,65 @@ Suite 674/674 in both memory modes, rigid regression 16/16, cloth / clothselfcol
 **Softbody now 10 of 56 kernels mapped**, and the FEM-volume solve — the piece everything else in the
 softbody arc was waiting on — is live.
 
+## P8.0 tranche 7 — the softbody step CLOSES: copy-merge, Jacobi apply, and the skin
+
+Three kernels, ported into `softBodySolveBda.slang`, that together take the solve loop from
+"computes a correct delta" to "moves a mesh anyone can look at":
+
+| kernel | .cu | launch | ABI row | blob |
+|---|---|---|---|---|
+| `sb_gm_cp_averageVertsLaunch` | softBodyGM.cu:1509 | PxgSoftBodyCore.cpp:1298 | `{8,8,4}` | 24 B |
+| `sb_gm_applyDeformationDeltasLaunch` | softBodyGM.cu:2665 | PxgSoftBodyCore.cpp:1269 | `{8,8,4}` | 24 B |
+| `sb_gm_updateTetModelVertsLaunch` | softBodyGM.cu:1589 | PxgSoftBodyCore.cpp:828 | `{8,8}` | 16 B |
+
+Manifest hand-edited, **MAPPED 220 → 223**; softbody **10 → 13 of 56**.
+
+**Why these three and not any other three.** The tranche-6 solve writes each vertex once *per
+partition copy* into `mSimPosition_InvMassCP`, past a leading block of `numElements *
+numVertsPerElement` element-corner entries. Nothing downstream reads that buffer.
+`averageVerts` is what folds the copies back onto the canonical vertex — without it the solve
+runs, produces correct numbers, and the mesh does not move at all. `applyDeformationDeltas` is
+the same closing move for the Jacobi vertex subset. And `updateTetModelVerts` is the last
+kernel of the step: the solver moves the SIMULATION mesh, but narrowphase, the render readback
+and the user's `PxDeformableVolume` vertex buffer all read the COLLISION mesh, which only
+exists as a barycentric skin over the sim tetrahedra. It is the kernel that makes softbody
+motion observable outside the solver.
+
+**The engine's own block-dim mismatch, mirrored rather than fixed.** `averageVerts` and
+`updateTetModelVerts` compute `numBlocks` from `SB_SOLVETETRA` (64) and then launch with
+`SB_PREINTEGRATION` (1024) threads per block — a 16x over-dispatch that the
+`groupThreadIdx < numVerts` guard makes harmless. The port keeps `[numthreads(1024,1,1)]` so
+that `threadIdx.x + blockIdx.x * blockDim.x` reproduces the same index for the same
+(block, thread) pair. `applyDeformationDeltas` is consistent at 64.
+
+**No tolerance seam.** Not one transcendental between the three; everything is compared through
+raw float bits (`f2u`). The shader is in `PXG_NOCONTRACT_SHADERS`, which matters most for
+`updateTetModelVerts`' four-term barycentric blend `p0*b.x + p1*b.y + p2*b.z + p3*b.w` — a
+textbook FMA-fusion candidate.
+
+### Verification
+
+Four cases (`softBodySimAverageVerts`, `…Kinematic`, `softBodySimApplyDeformationDeltas`,
+`softBodySimUpdateTetModelVerts`), all bit-exact against a CPU transcription. The fixtures are
+built so the plausible wrong port is *distinguishable*: the copy buffer's leading element-corner
+block is poisoned far from the real copies; per-vertex copy counts vary 1/2/3/1/2/1 so both
+vertex 0's implicit start-at-0 and the general `accum[i-1]` case are live; one vertex is pinned
+(`invMass == 0`) but owns two copies; the velocity's `w` channel is *never* equal to `pos.w`;
+the Jacobi index list is a permuted, non-contiguous subset; the sim tets' corner indices are
+permuted so a transposed blend shows immediately; and `mNumVerts` is deliberately different
+from `mNumVertsGM`.
+
+**10 mutants, 10 caught** (forced-fresh: `.spv` removed before every rebuild):
+the copy-buffer `offset` dropped; the `1/numCopies` divide dropped; velocity `w` taken from
+the averaged value instead of `pos_invMass`; the `eKINEMATIC` early-out dropped; the
+`pos_invMass.w > 0` gate dropped; the Jacobi indirection replaced by the lane index;
+`mJacobiScale` replaced by the external-delta rule `1/max(delta.w,1)`; the delta clear dropped;
+the skin guard switched to `mNumVertsGM`; the barycentric `z`/`w` swapped; the remap
+indirection dropped; and a write to the sim mesh added.
+
+Suite **674/674 in both memory modes**, rigid regression **16/16**, cloth / clothdrape /
+clothselfcollide / particle green.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

@@ -477,6 +477,13 @@ static const uint8_t kSbSolveTetraPartition[] = { 8, 8, 4, 4, 4, 1, 1, 8 };
 //     PxgSoftBody* gSoftbodies, const PxU32* activeSoftbodies)  -- launch sites
 //   PxgSoftBodyCore.cpp:747 and :790.  Same two-device-pointer pack as
 //   sb_gm_zeroTetMultipliers -> 16-byte blob (P8.0 tranche 5).
+//   sb_gm_cp_averageVertsLaunch / sb_gm_applyDeformationDeltasLaunch(
+//     PxgSoftBody* gSoftbodies, const PxU32* activeSoftbodies, const PxReal invDt)
+//   -- launch sites PxgSoftBodyCore.cpp:1301 and :1270.  Same pack as
+//   sb_gm_applyExternalDeltas -> 24-byte blob (P8.0 tranche 7).
+//   sb_gm_updateTetModelVertsLaunch(PxgSoftBody* gSoftbodies,
+//     const PxU32* activeSoftbodies)  -- launch site PxgSoftBodyCore.cpp:830.  Same
+//   two-device-pointer pack as sb_gm_zeroTetMultipliers -> 16-byte blob (P8.0 tranche 7).
 
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
@@ -835,6 +842,10 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_updateTetrahedraRotationsLaunch", kSbZeroTetMultipliers, uint32_t(sizeof(kSbZeroTetMultipliers)) },
     // gpusimulationcontroller softbody FEM-volume constraint solve (P8.0 tranche 6)
     { "sb_gm_cp_solveTetrahedronsPartitionLaunch", kSbSolveTetraPartition, uint32_t(sizeof(kSbSolveTetraPartition)) },
+    // gpusimulationcontroller softbody step closers (P8.0 tranche 7)
+    { "sb_gm_cp_averageVertsLaunch", kSbApplyExternalDeltas, uint32_t(sizeof(kSbApplyExternalDeltas)) },
+    { "sb_gm_applyDeformationDeltasLaunch", kSbApplyExternalDeltas, uint32_t(sizeof(kSbApplyExternalDeltas)) },
+    { "sb_gm_updateTetModelVertsLaunch", kSbZeroTetMultipliers, uint32_t(sizeof(kSbZeroTetMultipliers)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },

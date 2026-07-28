@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 220;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 223;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -309,13 +309,13 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_solveOutputParticleDeltaVLaunch", nullptr, nullptr },  // SB_SOLVE_PARTICLE_PARTICLE_DELTA (unmapped)
     { "sb_gm_cp_solveTetrahedronsPartitionLaunch", "softBodySolveBda.spv", "sb_gm_cp_solveTetrahedronsPartitionLaunch" },  // SB_GM_CP_SOLVE_TETRA (P8.0 tranche 6 BDA port)
     { "sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch", nullptr, nullptr },  // SB_GM_CP_SOLVE_TETRA_JACOBI_PARTITION (unmapped)
-    { "sb_gm_updateTetModelVertsLaunch", nullptr, nullptr },  // SB_GM_UPDATETETMODELVERTS (unmapped)
+    { "sb_gm_updateTetModelVertsLaunch", "softBodySolveBda.spv", "sb_gm_updateTetModelVertsLaunch" },  // SB_GM_UPDATETETMODELVERTS (P8.0 tranche 7 BDA port)
     { "sb_gm_zeroTetMultipliers", "softBodySolveBda.spv", "sb_gm_zeroTetMultipliers" },  // SB_GM_ZERO_TETMULTIPLIERS (P8.0 tranche 4 BDA port)
-    { "sb_gm_cp_averageVertsLaunch", nullptr, nullptr },  // SB_GM_CP_AVERAGEVERTS (unmapped)
+    { "sb_gm_cp_averageVertsLaunch", "softBodySolveBda.spv", "sb_gm_cp_averageVertsLaunch" },  // SB_GM_CP_AVERAGEVERTS (P8.0 tranche 7 BDA port)
     { "sb_updateTetrahedraRotationsLaunch", "softBodySolveBda.spv", "sb_updateTetrahedraRotationsLaunch" },  // SB_UPDATETETRAROTATIONS (P8.0 tranche 5 BDA port)
     { "sb_gm_updateTetrahedraRotationsLaunch", "softBodySolveBda.spv", "sb_gm_updateTetrahedraRotationsLaunch" },  // SB_GM_UPDATETETRAROTATIONS (P8.0 tranche 5 BDA port)
     { "sb_gm_applyExternalDeltasLaunch", "softBodySolveBda.spv", "sb_gm_applyExternalDeltasLaunch" },  // SB_GM_APPLY_EXTERNAL_DELTAS (P8.0 tranche 4 BDA port)
-    { "sb_gm_applyDeformationDeltasLaunch", nullptr, nullptr },  // SB_GM_APPLY_DEFORMATION_DELTAS (unmapped)
+    { "sb_gm_applyDeformationDeltasLaunch", "softBodySolveBda.spv", "sb_gm_applyDeformationDeltasLaunch" },  // SB_GM_APPLY_DEFORMATION_DELTAS (P8.0 tranche 7 BDA port)
     { "sb_other_contact_remap_to_simLaunch", nullptr, nullptr },  // SB_OTHER_CONTACT_REMAP_TO_SIM (unmapped)
     { "sb_fem_contact_remap_to_simLaunch", nullptr, nullptr },  // SB_FEM_CONTACT_REMAP_TO_SIM (unmapped)
     { "sb_gm_stepSoftbodyLaunch", "softBodySimBda.spv", "sb_gm_stepSoftbodyLaunch" },  // SB_GM_STEPSOFTBODY (P8.0 tranche 3 BDA port)
