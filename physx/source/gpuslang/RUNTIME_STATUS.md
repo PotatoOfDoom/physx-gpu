@@ -1445,6 +1445,44 @@ the factor identically 1) or to tune the scene around the inherited behaviour. T
 judgement call about fidelity-versus-stability and belongs with the project owner, not in a
 silent code change.
 
+### Resolution: the grid fix LANDS, and the scene was the thing that was wrong
+
+Staying faithful to upstream. The grid fix is in
+(`femClothSelfCollisionBda.slang`, a group-uniform serial loop over the block's warps, with
+the unit tests re-dispatched at the engine's own `ceil(N/2)` grid), and `clothselfcollide`
+was rebuilt around the corrected contact set.
+
+**Density was not the lever.** Sweeping the mesh from 40 to 144 vertices changed nothing —
+every configuration landed at mean ≈ 4.03–4.07. **The initial condition was.** The scene
+spawned the upper layer 0.05 above the shelf while the contact rest distance is 0.10, i.e.
+*inside* it — handing the solve a 0.05 penetration deficit on frame one, to be overshot
+every pass forever. With half the contacts that was survivable; with all of them it ejected
+the fold.
+
+The layer now starts at 0.30 above the shelf and **falls**:
+
+| | min y | mean y |
+|---|---|---|
+| self-collision ON | **5.0999** | 5.1105 |
+| expected rest distance | 5.1000 | |
+| control (OFF) | 3.1180 | 3.8751 |
+
+It settles **on** the contact rest distance, 0.0001 off, and the run is **bit-identical over
+five runs** — the scene that P7.2 documented as *"genuinely NON-deterministic (the contact-slot
+atomics and the mDeltaPos accumulation are order-dependent)"*. The atomics removed the
+dropped writes; removing the artificial deficit removed the rest.
+
+The pass criterion is correspondingly sharper. It no longer asks whether the layer stayed
+"roughly up there" against a threshold read off an 8-run spread; it asserts that the layer
+settles **on** `baseY + 2*restOffset` to within 0.03, which is a physical prediction of the
+contact model rather than a fitted number.
+
+This closes the arc. The port is faithful to upstream at every step that was questioned; the
+one real defect (the non-atomic accumulators) is fixed; the one real coverage bug is fixed;
+and the inherited per-pass overshoot is measured, fenced by
+`femClothSimSelfContactManyTriangles`, and no longer papered over by a scene that was
+accidentally tuned to hide it.
+
 ### A structural gap in the verification protocol
 
 The unit tests **choose their own dispatch grid**, so they cannot catch an engine-grid mismatch

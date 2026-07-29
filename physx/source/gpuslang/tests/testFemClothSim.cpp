@@ -3414,7 +3414,15 @@ PXG_TEST(femClothSimSelfCollisionVT)
     SelfCollisionPush push = makeSelfCollisionPush(MAXC, bActive.addr, bCd.addr, bDesc.addr,
                                                    bUpd.addr, bOut.addr, bCount.addr);
     Kernel k("femClothSelfCollisionBda.spv", "cloth_selfCollisionMidphaseVTLaunch", {}, sizeof(SelfCollisionPush));
-    k.dispatch(/*gridX numVerts*/ 4u, {}, push, /*gridY nbActive*/ 1u, 1u);
+    // GRID MIRRORS THE ENGINE, and that is the whole point of this line.  The engine
+    // packs MIDPHASE_WARPS_PER_BLOCK (=2) warps into one block and launches only
+    // ceil(N/2) blocks (PxgFEMClothCore.cpp:714); the bridge drops blockDim and passes
+    // gridDim straight through.  A test that dispatched one group per query would
+    // exercise a grid the engine NEVER issues -- which is exactly how a half-coverage
+    // bug survived here: the shader indexed by gid.x alone and this line handed it the
+    // generous grid that made that correct.  Unit tests choose their own grid, so this
+    // is the ONLY place that mismatch can be caught.
+    k.dispatch(/*gridX ceil(numVerts/2)*/ 2u, {}, push, /*gridY nbActive*/ 1u, 1u);
     dev->flush();
 
     // ---- CPU predicate: exactly vertex 3 penetrates T0 ----
@@ -3458,7 +3466,7 @@ PXG_TEST(femClothSimSelfCollisionVT)
     SelfCollisionPush push2 = push;
     push2.clothes = bDesc2.addr;
     push2.totalContactCount = bCount2.addr;
-    k.dispatch(4u, {}, push2, 1u, 1u);
+    k.dispatch(/*ceil(numVerts/2)*/ 2u, {}, push2, 1u, 1u);
     dev->flush();
     const uint32_t gCount2 = downloadBuffer<uint32_t>(dev, bCount2.h, 1)[0];
     PXG_CHECK_MSG(gCount2 == 0u, "VT self-collision (no penetration) emitted %u contacts (expected 0)", gCount2);
@@ -3530,7 +3538,15 @@ PXG_TEST(femClothSimSelfCollisionEE)
     SelfCollisionPush push = makeSelfCollisionPush(MAXC, bActive.addr, bCd.addr, bDesc.addr,
                                                    bUpd.addr, bOut.addr, bCount.addr);
     Kernel k("femClothSelfCollisionBda.spv", "cloth_selfCollisionMidphaseEELaunch", {}, sizeof(SelfCollisionPush));
-    k.dispatch(/*gridX numTrisWithActiveEdges*/ 2u, {}, push, /*gridY nbActive*/ 1u, 1u);
+    // GRID MIRRORS THE ENGINE, and that is the whole point of this line.  The engine
+    // packs MIDPHASE_WARPS_PER_BLOCK (=2) warps into one block and launches only
+    // ceil(N/2) blocks (PxgFEMClothCore.cpp:714); the bridge drops blockDim and passes
+    // gridDim straight through.  A test that dispatched one group per query would
+    // exercise a grid the engine NEVER issues -- which is exactly how a half-coverage
+    // bug survived here: the shader indexed by gid.x alone and this line handed it the
+    // generous grid that made that correct.  Unit tests choose their own grid, so this
+    // is the ONLY place that mismatch can be caught.
+    k.dispatch(/*gridX ceil(numTrisWithActiveEdges/2)*/ 1u, {}, push, /*gridY nbActive*/ 1u, 1u);
     dev->flush();
 
     // ---- CPU transcription: the T1(query)-vs-T0(found) 3x3 edge loop ----
@@ -3604,7 +3620,7 @@ PXG_TEST(femClothSimSelfCollisionEE)
     SelfCollisionPush push2 = push;
     push2.clothes = bDesc2.addr;
     push2.totalContactCount = bCount2.addr;
-    k.dispatch(2u, {}, push2, 1u, 1u);
+    k.dispatch(/*ceil(numTrisWithActiveEdges/2)*/ 1u, {}, push2, 1u, 1u);
     dev->flush();
     const uint32_t gCount2 = downloadBuffer<uint32_t>(dev, bCount2.h, 1)[0];
     PXG_CHECK_MSG(gCount2 == 0u, "EE self-collision (no crossing) emitted %u contacts (expected 0)", gCount2);

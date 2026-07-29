@@ -365,6 +365,9 @@ float distSqInRestPoseEE(Ptr<float4> restVerts, uint e0v0, uint e0v1, uint e1v0,
 // ---------------------------------------------------------------------------
 // Groupshared state for the one-warp-per-query lowering.
 // ---------------------------------------------------------------------------
+// PxgNpKernelIndices.h:32 — the engine's warps-per-block for every midphase launch.
+static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
+
 groupshared int sStack[STACK_SIZE];   // bv32 to-be-expanded node stack
 groupshared uint sBallot;             // __ballot_sync mask
 groupshared uint sScanStart;          // atomicAdd result broadcast
@@ -412,10 +415,31 @@ void cloth_selfCollisionMidphaseVTLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
     if ((bodyFlags & DISABLE_SELF_COLLISION) != 0u)
         return;
 
-    const uint globalWarpIdx = gid.x;
+    // *** GRID.  The engine packs MIDPHASE_WARPS_PER_BLOCK warps into ONE block and
+    // launches only ceil(N / MIDPHASE_WARPS_PER_BLOCK) of them
+    // (PxgFEMClothCore.cpp:714).  The Vulkan bridge DROPS blockDim and passes only
+    // gridDim through (PxgVulkanCudaContext.cpp:293), so a [numthreads(32,1,1)] group
+    // is one warp -- and indexing the query by gid.x alone covered just the FIRST HALF
+    // of the cloth vertices.  It did exactly that until this loop.
+    //
+    // The one-group-per-warp lowering is KEPT (see the header: packing >1 warp into a
+    // group would put the traversal's barriers in non-uniform control flow across
+    // warps).  The block's warps are walked SERIALLY instead: `sub` and the break are
+    // group-uniform, so every barrier below is still reached uniformly.  Same emitted
+    // contact set as CUDA, different scheduling.
+    //
+    // Landing this DOUBLED the self-collision contact count (VT 76 -> 152, EE 34 -> 70)
+    // and forced clothselfcollide to be re-tuned: the inherited per-pass overshoot in
+    // the contact solve (mDeltaPos.w accumulates |coeff| rather than 1 -- see
+    // femClothSimSelfContactManyTriangles) is absorbed by whichever endpoint acts as
+    // the VERTEX side, and with correct coverage twice as many vertices do.
     const uint numVerts = clothes[clothId].mNbVerts;
+    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    {
+    GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per sub-warp
+    const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
     if (globalWarpIdx >= numVerts)
-        return;
+        break;
 
     const uint elementInd = clothes[clothId].mElementIndex;
     const float contactDist = Ptr<float>(gP.contactDistance)[elementInd] * 2.0f;
@@ -551,6 +575,7 @@ void cloth_selfCollisionMidphaseVTLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
         else
             hasNode = false;
     }
+    }
 }
 
 // ===========================================================================
@@ -573,10 +598,31 @@ void cloth_selfCollisionMidphaseEELaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
     if ((bodyFlags & DISABLE_SELF_COLLISION) != 0u)
         return;
 
-    const uint globalWarpIdx = gid.x;
+    // *** GRID.  The engine packs MIDPHASE_WARPS_PER_BLOCK warps into ONE block and
+    // launches only ceil(N / MIDPHASE_WARPS_PER_BLOCK) of them
+    // (PxgFEMClothCore.cpp:714).  The Vulkan bridge DROPS blockDim and passes only
+    // gridDim through (PxgVulkanCudaContext.cpp:293), so a [numthreads(32,1,1)] group
+    // is one warp -- and indexing the query by gid.x alone covered just the FIRST HALF
+    // of the triangles-with-active-edges.  It did exactly that until this loop.
+    //
+    // The one-group-per-warp lowering is KEPT (see the header: packing >1 warp into a
+    // group would put the traversal's barriers in non-uniform control flow across
+    // warps).  The block's warps are walked SERIALLY instead: `sub` and the break are
+    // group-uniform, so every barrier below is still reached uniformly.  Same emitted
+    // contact set as CUDA, different scheduling.
+    //
+    // Landing this DOUBLED the self-collision contact count (VT 76 -> 152, EE 34 -> 70)
+    // and forced clothselfcollide to be re-tuned: the inherited per-pass overshoot in
+    // the contact solve (mDeltaPos.w accumulates |coeff| rather than 1 -- see
+    // femClothSimSelfContactManyTriangles) is absorbed by whichever endpoint acts as
+    // the VERTEX side, and with correct coverage twice as many vertices do.
     const uint numTriangles = clothes[clothId].mNbTrianglesWithActiveEdges;
+    for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)
+    {
+    GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per sub-warp
+    const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;
     if (globalWarpIdx >= numTriangles)
-        return;
+        break;
 
     const uint elementInd = clothes[clothId].mElementIndex;
     const float contactDist = Ptr<float>(gP.contactDistance)[elementInd] * 2.0f;
@@ -766,5 +812,6 @@ void cloth_selfCollisionMidphaseEELaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
         }
         else
             hasNode = false;
+    }
     }
 }

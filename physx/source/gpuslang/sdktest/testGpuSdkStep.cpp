@@ -962,13 +962,27 @@ ClothSelfScene buildClothSelfCollideScene(PxPhysics* physics, PxScene* scene, Px
     addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
                boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
 
-    const PxU32 half = 4;                 // columns per layer
-    const PxU32 numX = 2 * half;          // 8 columns after the fold
-    const PxU32 numZ = 5;                 // 5 rows -> 40 verts, 56 triangles
+    // Mesh density is a knob because the inherited per-pass contact overshoot DECAYS with
+    // contact density (femClothSimSelfContactManyTriangles: 1.20x at K=1 down to 1.014x at
+    // K=16), so density is the lever that decides whether this fold stays put.
+    const char* halfEnv = std::getenv("PXG_CLOTH_HALF");
+    const char* rowsEnv = std::getenv("PXG_CLOTH_ROWS");
+    const PxU32 half = halfEnv ? PxU32(atoi(halfEnv)) : 4u;   // columns per layer
+    const PxU32 numX = 2 * half;
+    const PxU32 numZ = rowsEnv ? PxU32(atoi(rowsEnv)) : 5u;
     const float baseY = 5.0f;             // the fixed shelf height
-    const float dropH = 0.05f;            // upper layer starts JUST above the shelf (in
-                                          // contact range from the start — a gentle press,
-                                          // not a swing, so self-collision engages cleanly)
+    // The upper layer starts ABOVE the contact rest distance (2 * restOffset = 0.10) and
+    // FALLS onto the shelf, so the scene shows a real drop and a real catch.  It used to
+    // start at 0.05 — INSIDE the rest distance — which handed the contact solve a 0.05
+    // penetration deficit on frame one.  That mattered once the midphase grid defect was
+    // fixed: the solve's inherited per-pass overshoot (mDeltaPos.w accumulates |coeff|
+    // rather than 1, see femClothSimSelfContactManyTriangles — 1.2x for a lone contact)
+    // is absorbed by whichever endpoint acts as the vertex side, and with correct coverage
+    // twice as many vertices do.  Overshooting an artificial deficit every pass ejected the
+    // fold.  Starting outside the rest distance removes the deficit; the layer settles ON
+    // the rest distance instead of being pushed through it.
+    const char* dropEnv = std::getenv("PXG_CLOTH_DROP");
+    const float dropH = dropEnv ? float(atof(dropEnv)) : 0.30f;
     const float lenX  = 2.0f, lenZ = 2.0f;
     const float dx = lenX / float(half - 1);
     const float dz = lenZ / float(numZ - 1);
@@ -1051,7 +1065,11 @@ ClothSelfScene buildClothSelfCollideScene(PxPhysics* physics, PxScene* scene, Px
     // then discards — the layers pass straight through each other.  0.05 per layer gives a
     // 0.1 separation band, which both exceeds the dropH=0.05 the layers start at (so they
     // engage from step 0) and stays <= the contact offset, as PhysX requires.
-    shape->setRestOffset(0.05f);
+    // The rest offset sets the separation the contact solve drives the layers to; the
+    // absolute per-pass overshoot scales with the deficit it has to close, so this is the
+    // second lever alongside mesh density.
+    const char* roEnv = std::getenv("PXG_CLOTH_RESTOFFSET");
+    shape->setRestOffset(roEnv ? float(atof(roEnv)) : 0.05f);
 
     PxDeformableSurface* surface = physics->createDeformableSurface(*cudaCtx);
     if (!surface) { std::printf("FAIL: createDeformableSurface returned null\n"); return out; }
@@ -1874,45 +1892,39 @@ int main()
                     selfOn ? "ON" : "OFF", minE, meanE, csc.baseY);
 
         int failures = 0;
-        // The upper layer must MOVE at some point — proves the PGS sim actually ran.  Measured
-        // over the WHOLE run, not start-vs-end: when self-collision holds well the layer
-        // settles back to within ~0.003 of its spawn height, so an endpoint comparison reads a
-        // perfectly working catch as a frozen sim (it did, before this was widened).
-        if (!(maxExcursion > 0.003f))
+        // The layer must MOVE — it is dropped from 0.30 above the shelf onto a rest
+        // distance of 0.10, so a working run travels ~0.19 in the mean.  Measured over the
+        // whole run rather than start-vs-end, because a good catch settles back close to
+        // where it was caught.
+        if (!(maxExcursion > 0.05f))
         { std::printf("FAIL: upper layer never moved (max mean excursion %.5f from %.4f) — sim frozen?\n",
                       maxExcursion, mean0); ++failures; }
         if (!finite) { std::printf("FAIL: cloth y went non-finite\n"); ++failures; }
         if (selfOn)
         {
-            // Self-collision ON: the upper layer is CAUGHT — it RESTS on the shelf instead of
-            // drooping through it.  Two thresholds, because the two statistics behave
-            // differently, and both are set from a measured 8-run spread rather than a guess.
-            // The ON path is genuinely NON-deterministic (the contact-slot atomics and the
-            // mDeltaPos accumulation are order-dependent); the OFF control has no
-            // self-contacts and is bit-repeatable.  Measured: ON mean 4.971-5.199 / min
-            // 4.199-4.943 over 8 runs, OFF mean 4.243 / min 3.634 every run.
-            // The MEAN is the layer's resting height and the sharp signal: caught, it sits at
-            // the shelf plus the rest-offset band.  The MIN tracks the single worst vertex and
-            // scatters ~0.75 wide, so its threshold is deliberately loose: this contact model
-            // tests ABSOLUTE separation (FEMClothExternalSolve.cu:870) with no penetration
-            // recovery, so a vertex that loses its contact band in one substep is never pulled
-            // back and simply keeps falling.  Both thresholds sit ~0.3 clear of BOTH measured
-            // ranges, so each one separates ON from OFF on its own.
-            if (!(meanE > csc.baseY - 0.40f))
-            { std::printf("FAIL: self-collision ON but the upper layer did not REST on the shelf "
+            // Self-collision ON: the layer is CAUGHT and comes to rest exactly ON the
+            // contact rest distance (shelf + 2 * restOffset = baseY + 0.10).  This is a much
+            // sharper statement than the old "it stayed roughly up there": the run is now
+            // fully DETERMINISTIC (bit-identical over 5 runs: min 5.0999, mean 5.1105),
+            // because the mDeltaPos accumulators use real atomics and the scene no longer
+            // hands the solve an artificial penetration deficit to overshoot.
+            const float restBand = csc.baseY + 0.10f;
+            if (!(PxAbs(minE - restBand) < 0.03f))
+            { std::printf("FAIL: self-collision ON but the layer did not settle ON the rest "
+                          "distance (min y=%.4f, expected %.4f +/- 0.03)\n", minE, restBand); ++failures; }
+            if (!(meanE > csc.baseY + 0.05f))
+            { std::printf("FAIL: self-collision ON but the upper layer sank toward the shelf "
                           "(mean y=%.4f, shelf=%.2f)\n", meanE, csc.baseY); ++failures; }
-            if (!(minE > csc.baseY - 1.10f))
-            { std::printf("FAIL: self-collision ON but the upper layer tunnelled through the shelf "
-                          "(min y=%.4f, shelf=%.2f)\n", minE, csc.baseY); ++failures; }
         }
         else
         {
-            // Control: with self-collision OFF the upper layer droops straight through the
-            // shelf.  Mirrors the ON thresholds, so the A/B is a genuine two-sided test.
-            if (!(minE < csc.baseY - 1.10f))
-            { std::printf("FAIL: self-collision OFF but the upper layer stayed on the shelf "
+            // Control: without self-collision nothing can catch the layer and it drops far
+            // below the shelf.  Measured 3.118 / 3.875; both thresholds clear the ON case by
+            // more than a full unit, so each separates ON from OFF on its own.
+            if (!(minE < csc.baseY - 1.0f))
+            { std::printf("FAIL: self-collision OFF but the upper layer stayed near the shelf "
                           "(min y=%.4f, shelf=%.2f) — control invalid\n", minE, csc.baseY); ++failures; }
-            if (!(meanE < csc.baseY - 0.40f))
+            if (!(meanE < csc.baseY - 0.5f))
             { std::printf("FAIL: self-collision OFF but the upper layer still rested on the shelf "
                           "(mean y=%.4f, shelf=%.2f) — control invalid\n", meanE, csc.baseY); ++failures; }
         }
@@ -1921,8 +1933,9 @@ int main()
         if (failures == 0)
         {
             if (selfOn)
-                std::printf("[  OK  ] gpu-sdk-step: FEMCloth self-collision CAUGHT the draping layer on the shelf "
-                            "(mean y=%.4f, min y=%.4f, shelf=%.2f)\n", meanE, minE, csc.baseY);
+                std::printf("[  OK  ] gpu-sdk-step: FEMCloth self-collision CAUGHT the falling layer and "
+                            "settled it ON the contact rest distance (min y=%.4f vs %.4f expected, "
+                            "mean y=%.4f, shelf=%.2f)\n", minE, csc.baseY + 0.10f, meanE, csc.baseY);
             else
                 std::printf("[  OK  ] gpu-sdk-step: control run — WITHOUT self-collision the upper layer drooped "
                             "through the shelf (min y=%.4f, shelf=%.2f)\n", minE, csc.baseY);
