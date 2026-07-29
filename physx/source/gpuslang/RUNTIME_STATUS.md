@@ -1493,6 +1493,64 @@ engine launch packs warps per block has to mirror the engine's grid formula, not
 Suite **674/674 in both memory modes**, rigid regression **16/16**, cloth / clothhang /
 clothdrape / clothselfcollide / particle / softbody green.
 
+## P8.2 tranche a — the softbody-vs-rigid MIDPHASE opens the contact chain
+
+`sb_midphaseGeneratePairsLaunch` (softbodyMidPhase.cu:199, launch PxgNarrowphaseCore.cpp:4221) is
+ported into the new `softBodyContactGenBda.slang`. One warp per contact-manager pair walks the
+softbody's own BV32 tetrahedron BVH against the rigid's fattened world AABB and appends
+`uint4(cmIdx, tetIdx, 0, 0)` to the shared collision stack. ABI row `{4,4,8,8,8,8,8,8,4,8,8}`
+(80-byte blob); manifest hand-edited, **MAPPED 223 → 224**; softbody **13 → 14 of 56**.
+
+This is the first of the seven kernels standing between the `PXG_SCENE=softbody` cube and actually
+settling on the ground instead of passing through it.
+
+**Almost nothing here was written from scratch.** The BV32 walk, the leaf/child decode and the
+groupshared ballot/scan lowering come verbatim from `femClothSelfCollisionBda`; the traverser body
+(surface-hint gate, `isValidTet`, `tetBoundingBox`) is the already-unit-tested transcription in
+`npMidphaseDeform.slang` lifted onto `Ptr<>` reads; the `PxgContactManagerInput` / `PxgShape`
+mirrors and the `bounds[rigidCacheRef]` read are `femClothContactGenBda`'s.
+
+**The grid was right from the first line.** The engine packs `MIDPHASE_WARPS_PER_BLOCK = 2` warps
+per block and the bridge forwards only `gridDim`, so the block's warps are walked serially in a
+group-uniform loop. That is the same mismatch that shipped undetected in `femClothSelfCollisionBda`
+and cost the whole P8.1 investigation; here the *test* dispatches the engine's own grid
+(`ceil(numTests/2) = 1` group for two pairs) so a regression fails loudly.
+
+### Verification
+
+`softBodySimMidphaseGeneratePairs` drives two contact-manager pairs — pair 0 with the tetrahedron
+mesh as shape0, pair 1 with it as shape1, so both branches of the shape swap run — over five
+tetrahedra that pin each gate independently:
+
+| tet | property | expected |
+|---|---|---|
+| 0 | surface, valid, inside the box | **emitted** |
+| 1 | interior (hint 0), inside | dropped by the surface-hint gate |
+| 2 | surface, valid, far outside | dropped by the tet-bounds test |
+| 3 | surface, **degenerate**, inside | dropped by `isValidTet` |
+| 4 | surface, valid, at x = 2.09 | **emitted** — only the fully fattened box reaches it |
+
+Every child bound in the tree is deliberately generous, so the node-level cull can never stand in
+for a primitive-level gate: each tet must be rejected by its *own* test.
+
+**11 mutants, 11 caught** (forced-fresh `.spv` removal before every rebuild): sub-warp loop dropped,
+surface-hint gate dropped, the `& ~uint64_t(3)` byte-extract alignment dropped, `isValidTet` dropped,
+tet-bounds test dropped, leaf primitive index off by one, shape swap dropped (SIGSEGV — the rigid's
+`particleOrSoftbodyId` is `0xFFFFFFFF`), fattening dropped, fattening from only the rigid's contact
+distance, fattening from only the softbody's, the `stackIndex < stackSize` drop removed, and
+`stackSizeBytes` used without dividing by `sizeof(uint4)`.
+
+Three of those exposed real gaps in the fixture before it had teeth on them, and each was closed:
+the contact distances are now **asymmetric** (0.08 + 0.02) with tet 4 at 2.09, so neither half alone
+reaches it; and the overflow run appends **poison padding** past the undersized stack, because
+counting filled slots cannot see a write that lands beyond the end.
+
+The overflow case is its own assertion: `pushOntoStackFullWarp` reserves with the atomic *before*
+testing capacity, so the pair count must report the true total (4) while at most `stackSize` entries
+are written. The engine depends on exactly that to size the stack for the next frame.
+
+Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes green.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

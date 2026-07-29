@@ -2157,6 +2157,282 @@ static void (*sbKeepSolveProbeReferenced)() = &softBodySimSolveProbe_DISABLED;
 
 
 // ===========================================================================
+// P8.2 tranche a — sb_midphaseGeneratePairsLaunch (softbodyMidPhase.cu:199).
+//
+// One warp per contact-manager pair walks the softbody's own BV32 tetrahedron BVH against
+// the rigid's fattened world AABB and appends uint4(cmIdx, tetIdx, 0, 0) to the shared
+// collision stack for every SURFACE tetrahedron whose bounds overlap.
+//
+// The fixture drives TWO contact-manager pairs, which is deliberate: the engine packs
+// MIDPHASE_WARPS_PER_BLOCK = 2 warps per block and launches ceil(numTests/2) blocks, and
+// the Vulkan bridge forwards only gridDim.  Dispatching ONE group for two pairs is exactly
+// what the engine does, so a port that indexed by gid.x alone would process only pair 0 and
+// this test would see half the expected output.  That is the mismatch that shipped
+// undetected in femClothSelfCollisionBda; here it is a hard assertion.
+//
+// The two pairs also exercise both branches of the shape swap: pair 0 has the tetrahedron
+// mesh as shape0, pair 1 has it as shape1.
+//
+// Four tetrahedra pin the three per-primitive gates independently:
+//   tet 0  surface, valid, inside the box   -> EMITTED
+//   tet 1  INTERIOR (hint 0), inside        -> dropped by the surface-hint gate
+//   tet 2  surface, valid, far outside      -> dropped by the tet-bounds test
+//   tet 3  surface, DEGENERATE, inside      -> dropped by isValidTet
+//   tet 4  surface, valid, in the FATTENING band only -> EMITTED only because the box is
+//          grown by contactDistance[sb] + contactDistance[rigid].  Its min x is 2.05:
+//          min x is 2.09: outside the raw box (2.0), outside it grown by EITHER contact
+//          distance alone (2.08 / 2.02), and inside only when BOTH are summed (2.10).
+//          Without this tet a
+//          port that dropped the fattening passes the test unnoticed -- it did, until the
+//          mutation sweep caught it.
+// Every child bound is deliberately generous so the node-level cull cannot mask a
+// primitive-level gate: each tet must be rejected by its OWN test, not by the tree walk.
+// ===========================================================================
+struct SbMidphasePush
+{
+    uint32_t numTests; float toleranceLength;
+    uint64_t cmInputs, transformCache, bounds, contactDistance, gpuShapes, softbodies;
+    uint32_t stackSizeBytes, pad60;
+    uint64_t stackPtr, midphasePairsNum;
+};
+static_assert(sizeof(SbMidphasePush) == 80, "sb midphase push blob must be 80 bytes");
+static_assert(offsetof(SbMidphasePush, cmInputs) == 8, "cmInputs @8");
+static_assert(offsetof(SbMidphasePush, stackSizeBytes) == 56, "stackSizeBytes @56");
+static_assert(offsetof(SbMidphasePush, stackPtr) == 64, "stackPtr @64");
+
+struct CmInputHost { uint32_t shapeRef0, shapeRef1, cacheRef0, cacheRef1; };
+struct PxgShapeHost
+{
+    float sx, sy, sz, srx, sry, srz, srw;
+    uint32_t materialIndex; uint32_t hullLo, hullHi; uint32_t type, particleOrSoftbodyId;
+};
+static_assert(sizeof(PxgShapeHost) == 48, "PxgShape mirror must be 48 bytes");
+static const uint32_t GEOM_TETRAHEDRONMESH_H = 7u;   // PxGeometryType::eTETRAHEDRONMESH
+
+PXG_TEST(softBodySimMidphaseGeneratePairs)
+{
+    using namespace p80refit;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // ---- the tetrahedron mesh ------------------------------------------------
+    // 16 vertices = 4 tets x 4 corners, so each tet owns its own vertices and can be
+    // placed or degenerated without disturbing the others.
+    const float FAR = 100.0f;
+    std::vector<F4> verts;
+    auto pushTet = [&](float ox, float oy, float oz, bool degenerate) {
+        verts.push_back(F4{ ox,        oy,        oz,        1.0f });
+        verts.push_back(F4{ ox + 1.0f, oy,        oz,        1.0f });
+        verts.push_back(F4{ ox,        oy + 1.0f, oz,        1.0f });
+        // a degenerate tet puts the 4th corner in the plane of the other three
+        verts.push_back(degenerate ? F4{ ox, oy, oz, 1.0f } : F4{ ox, oy, oz + 1.0f, 1.0f });
+    };
+    pushTet(0.0f, 0.0f, 0.0f, false);      // tet 0 — inside the box
+    pushTet(0.0f, 0.0f, 0.0f, false);      // tet 1 — inside, but INTERIOR
+    pushTet(FAR,  FAR,  FAR,  false);      // tet 2 — far outside
+    pushTet(0.0f, 0.0f, 0.0f, true);       // tet 3 — inside, DEGENERATE
+    pushTet(2.09f, 0.0f, 0.0f, false);     // tet 4 — only the FULLY fattened box reaches it
+
+    const uint32_t NB_TETS = 5u;
+    std::vector<TetIdx4> tets;
+    for (uint32_t t = 0; t < NB_TETS; ++t)
+        tets.push_back(TetIdx4{ 4u * t + 0u, 4u * t + 1u, 4u * t + 2u, 4u * t + 3u });
+
+    // mTetMeshSurfaceHint is a PxU8 array: tets 0/2/3 are surface, tet 1 is interior.
+    // Packed into words so the shader's byte extraction is exercised at four distinct
+    // byte offsets within one word.
+    std::vector<uint8_t> hintBytes = { 1u, 0u, 1u, 1u, 1u };
+    std::vector<uint32_t> hints(2, 0u);
+    for (uint32_t i = 0; i < NB_TETS; ++i) hints[i / 4u] |= uint32_t(hintBytes[i]) << (8u * (i % 4u));
+
+    // ---- the BV32 tree: one root node with four LEAF children, one tet each ----
+    const uint32_t nbNodes = 1u, maxDepth = 1u;
+    TreeBlob tree;
+    tree.w.assign(4u + nbNodes * BV32_WORDS + maxDepth * 2u + nbNodes + 4u, 0u);
+    tree.w[0] = uint32_t(verts.size());   // nbVerts
+    tree.w[1] = NB_TETS;                  // nbTets
+    tree.w[2] = maxDepth;
+    tree.w[3] = nbNodes;                  // nbBv32TreeNodes
+    const uint32_t nw = tree.nodeWord(0);
+    tree.w[nw + W_NBNODES] = NB_TETS;
+    for (uint32_t k = 0; k < NB_TETS; ++k)
+    {
+        // GENEROUS child bounds — every child overlaps the rigid box, so the node-level
+        // cull can never stand in for a primitive-level gate.
+        const float lo = -1000.0f, hi = 1000.0f;
+        tree.w[nw + W_MMIN + k * 4 + 0] = f2u(lo);
+        tree.w[nw + W_MMIN + k * 4 + 1] = f2u(lo);
+        tree.w[nw + W_MMIN + k * 4 + 2] = f2u(lo);
+        tree.w[nw + W_MMAX + k * 4 + 0] = f2u(hi);
+        tree.w[nw + W_MMAX + k * 4 + 1] = f2u(hi);
+        tree.w[nw + W_MMAX + k * 4 + 2] = f2u(hi);
+        tree.w[nw + W_MDATA + k] = leafWord(/*startIndex*/ k, /*nbPrims*/ 1u);
+    }
+
+    DevBuf bTree = makeDev(dev, tree.w);
+    DevBuf bVerts = makeDev(dev, verts);
+    DevBuf bTets = makeDev(dev, tets);
+    DevBuf bHints = makeDev(dev, hints);
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mTetMeshData = reinterpret_cast<void*>(size_t(bTree.addr));
+    sb.mTetMeshSurfaceHint = reinterpret_cast<PxU8*>(size_t(bHints.addr));
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bVerts.addr));
+    sb.mNumTets = NB_TETS;
+    sb.mNumVerts = uint32_t(verts.size());
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- the narrowphase inputs ---------------------------------------------
+    // shape 0 = the tetrahedron mesh (softbody 0); shape 1 = a rigid box.
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_TETRAHEDRONMESH_H; shapes[0].particleOrSoftbodyId = 0u;
+    shapes[1].type = 3u /* eBOX */;          shapes[1].particleOrSoftbodyId = 0xFFFFFFFFu;
+    DevBuf bShapes = makeDev(dev, shapes);
+
+    // Pair 0: tetmesh as shape0.  Pair 1: tetmesh as shape1 -> exercises the swap.
+    std::vector<CmInputHost> cms = {
+        { 0u, 1u, /*cacheRef0 sb*/ 0u, /*cacheRef1 rigid*/ 1u },
+        { 1u, 0u, /*cacheRef0 rigid*/ 1u, /*cacheRef1 sb*/ 0u },
+    };
+    DevBuf bCms = makeDev(dev, cms);
+
+    // bounds[]: PxBounds3, 24 B each.  Slot 0 is the softbody's (unused by this kernel),
+    // slot 1 is the rigid's -- a unit box at the origin, which tets 0/1/3 sit inside and
+    // tet 2 (at 100,100,100) is far outside.
+    std::vector<float> bounds = {
+        -50.0f, -50.0f, -50.0f,  50.0f,  50.0f,  50.0f,     // slot 0 (softbody, unused)
+        -2.0f,  -2.0f,  -2.0f,   2.0f,   2.0f,   2.0f,      // slot 1 (rigid)
+    };
+    DevBuf bBounds = makeDev(dev, bounds);
+    // DELIBERATELY ASYMMETRIC: 0.08 + 0.02 = 0.10, and tet 4 sits at 2.09.  Either half
+    // alone falls short (2.08 and 2.02), so only the SUM reaches it.  With equal halves --
+    // and with the tet at 2.05 -- a port that used just one of them still passed; the
+    // mutation sweep tried exactly that twice before this fixture had teeth on it.
+    std::vector<float> contactDist = { 0.08f, 0.02f };      // total 0.1 -> box grows to 2.1
+    DevBuf bCd = makeDev(dev, contactDist);
+
+    const uint32_t STACK_ENTRIES = 32u;
+    const uint32_t POISON = 0xCDCDCDCDu;
+    std::vector<uint32_t> stack(STACK_ENTRIES * 4u, POISON);
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairCount = { 0u };
+    DevBuf bCount = makeDev(dev, pairCount);
+
+    if (!bTree.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    SbMidphasePush push = {};
+    push.numTests = 2u;
+    push.toleranceLength = 1.0f;      // ABI parity only
+    push.cmInputs = bCms.addr;
+    push.transformCache = 0ull;       // ABI parity only — never read
+    push.bounds = bBounds.addr;
+    push.contactDistance = bCd.addr;
+    push.gpuShapes = bShapes.addr;
+    push.softbodies = bDesc.addr;
+    push.stackSizeBytes = STACK_ENTRIES * 16u;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bCount.addr;
+
+    Kernel k("softBodyContactGenBda.spv", "sb_midphaseGeneratePairsLaunch", {}, sizeof(SbMidphasePush));
+    // THE ENGINE'S GRID: ceil(numTests / MIDPHASE_WARPS_PER_BLOCK) = ceil(2/2) = 1.
+    // One group must cover BOTH pairs.
+    k.dispatch(/*gridX*/ 1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+    const auto gStack = downloadBuffer<uint32_t>(dev, bStack.h, stack.size());
+
+    // ---- expected: exactly (0, tet0) and (1, tet0) ---------------------------
+    // tets 0 and 4 for each of the two contact managers.
+    PXG_CHECK_MSG(gCount == 4u,
+                  "midphase must emit exactly 4 pairs (tets 0 and 4 for each of the two "
+                  "contact managers), got %u -- a count of 2 means the sub-warp loop is "
+                  "missing and only pair 0 was processed", gCount);
+
+    bool sawPair0 = false, sawPair1 = false;
+    bool sawFattenTet[2] = { false, false };
+    for (uint32_t i = 0; i < gCount && i < STACK_ENTRIES; ++i)
+    {
+        const uint32_t cm = gStack[i * 4u + 0u], prim = gStack[i * 4u + 1u];
+        const uint32_t z = gStack[i * 4u + 2u], w = gStack[i * 4u + 3u];
+        std::printf("  pair %u: cmIdx=%u tet=%u (z=%u w=%u)\n", i, cm, prim, z, w);
+        PXG_CHECK_MSG(prim == 0u || prim == 4u,
+                      "only tets 0 and 4 may be emitted, got tet %u for cmIdx %u", prim, cm);
+        PXG_CHECK_MSG(z == 0u && w == 0u, "the uint4 payload's z/w must be zero (got %u,%u)", z, w);
+        if (cm == 0u) sawPair0 = true;
+        if (cm == 1u) sawPair1 = true;
+        if (prim == 4u && cm < 2u) sawFattenTet[cm] = true;
+    }
+    PXG_CHECK_MSG(sawPair0, "contact-manager pair 0 produced no entry");
+    // THE FATTENING TEETH: tet 4 sits at x >= 2.05, outside the raw rigid box (2.0) and
+    // inside it only once grown by contactDistance[sb] + contactDistance[rigid] = 0.1.
+    PXG_CHECK_MSG(sawFattenTet[0] && sawFattenTet[1],
+                  "tet 4 is reachable ONLY by the fattened box -- a port that dropped "
+                  "aabb.fattenFast(contactDist) loses it (cm0 %d, cm1 %d)",
+                  int(sawFattenTet[0]), int(sawFattenTet[1]));
+    // THE GRID TEETH: pair 1 only exists if the block's SECOND warp was walked.
+    PXG_CHECK_MSG(sawPair1,
+                  "contact-manager pair 1 produced no entry -- the engine packs 2 warps per "
+                  "block and the bridge forwards only gridDim, so the shader must walk both");
+    // ...and pair 1 also proves the shape swap: its tetmesh is shape1, so a port that always
+    // took shape0 would have read the rigid box's particleOrSoftbodyId (0xFFFFFFFF) as the
+    // softbody index and faulted or produced nothing.
+
+    // Entries past the emitted pairs must keep their poison.
+    for (uint32_t i = gCount; i < STACK_ENTRIES; ++i)
+        for (uint32_t c = 0; c < 4u; ++c)
+            PXG_CHECK_MSG(gStack[i * 4u + c] == POISON,
+                          "stack entry %u word %u was written past the pair count", i, c);
+
+    // ---- overflow: the counter keeps counting, the writes are DROPPED --------
+    // pushOntoStackFullWarp reserves its slot with the atomic FIRST and only then checks
+    // `stackIndex < stackSize` (bv32Traversal.cuh:197-206), so an undersized stack must
+    // still report the true pair count while writing at most stackSize entries.  The engine
+    // relies on exactly that to size mStackSizeNeededOnDevice for the next frame.
+    {
+        const uint32_t SMALL = 2u;
+        const uint32_t PAD = 8u;   // trailing slots that must NEVER be written
+        std::vector<uint32_t> smallStack((SMALL + PAD) * 4u, POISON);
+        DevBuf bSmall = makeDev(dev, smallStack);
+        std::vector<uint32_t> c2 = { 0u };
+        DevBuf bCount2 = makeDev(dev, c2);
+        SbMidphasePush p2 = push;
+        p2.stackSizeBytes = SMALL * 16u;
+        p2.stackPtr = bSmall.addr;
+        p2.midphasePairsNum = bCount2.addr;
+        Kernel k2("softBodyContactGenBda.spv", "sb_midphaseGeneratePairsLaunch", {}, sizeof(SbMidphasePush));
+        k2.dispatch(1u, {}, p2, 1u, 1u);
+        dev->flush();
+        const uint32_t n2 = downloadBuffer<uint32_t>(dev, bCount2.h, 1)[0];
+        const auto s2 = downloadBuffer<uint32_t>(dev, bSmall.h, smallStack.size());
+        PXG_CHECK_MSG(n2 == 4u, "the pair COUNT must be the true total even when the stack "
+                                "overflows (got %u, expected 4)", n2);
+        uint32_t written = 0u;
+        for (uint32_t i = 0; i < SMALL; ++i)
+            if (s2[i * 4u + 0u] != POISON) ++written;
+        PXG_CHECK_MSG(written == SMALL,
+                      "the first %u slots should still have been filled (got %u)", SMALL, written);
+        // THE OVERFLOW TEETH: the surplus must be DROPPED, not written past the end.  Only
+        // this padding can see that -- counting the filled slots cannot, because a port that
+        // skipped the bounds check writes into memory the allocation happens to have.
+        for (uint32_t i = SMALL; i < SMALL + PAD; ++i)
+            for (uint32_t c = 0; c < 4u; ++c)
+                PXG_CHECK_MSG(s2[i * 4u + c] == POISON,
+                              "slot %u word %u was written past stackSize -- the "
+                              "`stackIndex < stackSize` drop is missing", i, c);
+        dev->destroyBuffer(bSmall.h); dev->destroyBuffer(bCount2.h);
+    }
+
+    dev->destroyBuffer(bTree.h); dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bTets.h);
+    dev->destroyBuffer(bHints.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bShapes.h);
+    dev->destroyBuffer(bCms.h); dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bCd.h);
+    dev->destroyBuffer(bStack.h); dev->destroyBuffer(bCount.h);
+}
+
+
+// ===========================================================================
 // P8.0 tranche 7 — the three kernels that CLOSE the softbody step:
 //   sb_gm_cp_averageVertsLaunch        (softBodyGM.cu:1509) — merge the partition copies
 //   sb_gm_applyDeformationDeltasLaunch (softBodyGM.cu:2665) — the Jacobi delta apply

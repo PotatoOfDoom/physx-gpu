@@ -485,6 +485,16 @@ static const uint8_t kSbSolveTetraPartition[] = { 8, 8, 4, 4, 4, 1, 1, 8 };
 //     const PxU32* activeSoftbodies)  -- launch site PxgSoftBodyCore.cpp:830.  Same
 //   two-device-pointer pack as sb_gm_zeroTetMultipliers -> 16-byte blob (P8.0 tranche 7).
 
+// gpunarrowphase softbodyMidPhase.cu (P8.2 tranche a — the softbody-vs-rigid midphase):
+//   sb_midphaseGeneratePairsLaunch(PxU32 numTests, PxReal toleranceLength,
+//     const PxgContactManagerInput* cmInputs, const PxsCachedTransform* transformCache,
+//     const PxBounds3* bounds, const PxReal* contactDistance, const PxgShape* gpuShapes,
+//     const PxgSoftBody* softbodies, PxU32 stackSizeBytes, PxU8* stackPtr,
+//     PxU32* midphasePairsNum)  -- launch site PxgNarrowphaseCore.cpp:4223.  Two 4-byte
+//   scalars (@0/@4), six device pointers (@8..@48), a PxU32 (@56), then two pointers
+//   realigned to @64/@72 -> 80-byte blob.
+static const uint8_t kSbMidphasePrimitives[] = { 4, 4, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
+
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
@@ -846,6 +856,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_gm_cp_averageVertsLaunch", kSbApplyExternalDeltas, uint32_t(sizeof(kSbApplyExternalDeltas)) },
     { "sb_gm_applyDeformationDeltasLaunch", kSbApplyExternalDeltas, uint32_t(sizeof(kSbApplyExternalDeltas)) },
     { "sb_gm_updateTetModelVertsLaunch", kSbZeroTetMultipliers, uint32_t(sizeof(kSbZeroTetMultipliers)) },
+    // gpunarrowphase softbody-vs-rigid midphase (P8.2 tranche a)
+    { "sb_midphaseGeneratePairsLaunch", kSbMidphasePrimitives, uint32_t(sizeof(kSbMidphasePrimitives)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },
