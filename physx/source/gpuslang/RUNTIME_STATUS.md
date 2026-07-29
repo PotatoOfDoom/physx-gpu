@@ -1551,6 +1551,75 @@ are written. The engine depends on exactly that to size the stack for the next f
 
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes green.
 
+## P8.2 tranche b — softbody-vs-rigid contact GENERATION, plane path
+
+`sb_primitiveContactGenLaunch` (softbodyPrimitives.cu:573, launch PxgNarrowphaseCore.cpp:4287)
+turns the midphase's `(cmIdx, tetIdx)` pairs into contact points. ABI row
+`{4,8,8,8,8,8,8,8,8,8,4,8,4,8,80}`; manifest **MAPPED 224 → 225**; softbody **14 → 15 of 56**.
+
+**This port implements the PLANE path only, and that is a deliberate, documented decision.**
+The CUDA kernel branches on the rigid's geometry type: `ePLANE` goes through `tetPlaneCollide`
+(four lanes testing the tet's four corners, no GJK), while `eSPHERE` / `eCAPSULE` / `eBOX` /
+`eCONVEXMESH` go through GJK + EPA over `squawk::EpaScratch` — a much larger body of machinery
+and its own tranche. The non-plane branch here emits nothing and returns.
+
+That is **not a regression** — until now the whole kernel was unmapped, so every rigid type
+produced zero softbody contacts — but it **is** silent from the engine's point of view: a box
+ground still generates no contacts. The test pins that boundary explicitly (see below) so the
+GJK tranche has to change it consciously.
+
+**Correction to an earlier claim.** This tranche does *not* make the softbody cube settle. I
+said it would; that was wrong. Contact generation is one of seven kernels — the contacts still
+need `sb_other_contact_remap_to_sim`, the reorder, `sb_rigidContactPrepare`, the reference-count
+query and the collision solve before anything moves. The plane path shortens the remaining road;
+it does not end it.
+
+### Two things worth recording
+
+**The push blob is 192 bytes.** `PxgFEMContactWriter` is passed BY VALUE as the last CUDA
+argument, so it is inlined into the push constant at @112 (nine pointers + a `PxU32`).
+`paramAlign(80)` returns 16, which happens to land it at @112 either way. llvmpipe reports
+`maxPushConstantsSize = 256` so it fits — but **Vulkan only guarantees 128**, making this the
+first kernel in the port that would fail to load on a device at the floor. Moving the writer to
+a descriptor set is the fix if that ever matters.
+
+**A guarded load in a zero-trip loop still faults.** `findRigidPair`'s binary search cannot
+execute its body when `nbPairs == 0` (`l == r == 0`), so by the language's semantics the pointer
+is never dereferenced. The backend **speculates** the load anyway, and with a null filter-pair
+address that SIGSEGVs. Found by bisection, not by guessing: a probe placed just before the call
+survives, one placed just after it faults. The fix is an explicit `numSoftBodyRigidPairs > 0`
+guard that the source language says is redundant. Same family as the `~3UL` trap in
+`softBodySolveBda` — and the mutation sweep confirms it, since removing the guard reproduces the
+SIGSEGV on demand.
+
+### Verification
+
+`softBodySimPrimitiveContactGenPlane` drives two contact-manager pairs over one tet straddling
+the plane. The corners split 3/1 — three within the 0.10 contact distance, one 5.0 above:
+
+```
+contact 0: point(0.0000, -0.3000, 0.0000) rest=0.0200 normal(0, 1, 0) pen=-0.3000
+contact 1: point(1.0000, -0.1000, 0.0000) rest=0.0200 normal(0, 1, 0) pen=-0.1000
+contact 2: point(0.0000,  0.0500, 1.0000) rest=0.0200 normal(0, 1, 0) pen= 0.0500
+```
+
+Each contact's point is the corner itself, the penetration is its signed plane distance, and the
+normal is the plane's world `+y`. The `static_assert`s on the 192-byte blob are the guard on the
+inlined writer — one wrong field offset and every contact lands in the wrong buffer.
+
+**11 mutants, 11 caught**: wrong plane axis (`.y` instead of `.x`), contact distance dropped,
+`transformInv` reduced to a translation, penetration sign flipped, the material index written
+without clearing bit 31, the sort identity seed replaced by 0, `stackSizeNeeded` in pairs instead
+of bytes, the plane gate removed, the filter-pair guard removed (SIGSEGV), `restDistance[0]`
+instead of `restDistance[cmIdx]`, and the shape swap dropped.
+
+Three of those needed the fixture sharpened first: a **BOX pair** was added so removing the plane
+gate has an observable effect; the plane pair was moved to **cmIdx 1** so `restDistance[cmIdx]`
+can be told from `restDistance[0]`; and both are now asserted directly.
+
+Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
+green.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

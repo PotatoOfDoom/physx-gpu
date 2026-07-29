@@ -494,6 +494,17 @@ static const uint8_t kSbSolveTetraPartition[] = { 8, 8, 4, 4, 4, 1, 1, 8 };
 //   scalars (@0/@4), six device pointers (@8..@48), a PxU32 (@56), then two pointers
 //   realigned to @64/@72 -> 80-byte blob.
 static const uint8_t kSbMidphasePrimitives[] = { 4, 4, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
+//   sb_primitiveContactGenLaunch(PxReal tolerenceLength, const PxgContactManagerInput*,
+//     const PxsCachedTransform*, const PxReal* contactDistance, const PxReal* restDistance,
+//     const PxgShape*, const PxgSoftBody*, const PxNodeIndex* shapeToRigidRemapTable,
+//     PxU8* stackPtr, PxU32* midphasePairsNum, PxU32 stackSizeBytes,
+//     PxgRigidFilterPair* softBodyRigidPairs, PxU32 numSoftBodyRigidPairs,
+//     PxU32* stackSizeNeededOnDevice, PxgFEMContactWriter writer)  -- launch site
+//   PxgNarrowphaseCore.cpp:4289.  The writer is passed BY VALUE (80 B, so paramAlign gives
+//   it 16-byte alignment) and lands at @112; the blob is 192 bytes -- the first kernel in
+//   the port to exceed Vulkan's GUARANTEED 128-byte push-constant minimum.  llvmpipe
+//   reports maxPushConstantsSize = 256, so it fits here.
+static const uint8_t kSbPrimitiveContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 4, 8, 80 };
 
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
@@ -858,6 +869,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_gm_updateTetModelVertsLaunch", kSbZeroTetMultipliers, uint32_t(sizeof(kSbZeroTetMultipliers)) },
     // gpunarrowphase softbody-vs-rigid midphase (P8.2 tranche a)
     { "sb_midphaseGeneratePairsLaunch", kSbMidphasePrimitives, uint32_t(sizeof(kSbMidphasePrimitives)) },
+    { "sb_primitiveContactGenLaunch", kSbPrimitiveContactGen, uint32_t(sizeof(kSbPrimitiveContactGen)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },

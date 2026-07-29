@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 224;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 225;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -277,7 +277,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_gm_preIntegrateLaunch", "softBodySimBda.spv", "sb_gm_preIntegrateLaunch" },  // SB_SIM_PREINTEGRATION (P8.0 BDA port: softbody free-fall predict/integrate)
     { "sb_refitBoundLaunch", "softBodyRefitBda.spv", "sb_refitBoundLaunch" },  // SB_REFITBOUND (P8.0 tranche 2 BDA port)
     { "sb_midphaseGeneratePairsLaunch", "softBodyContactGenBda.spv", "sb_midphaseGeneratePairsLaunch" },  // SB_MIDPHASE_PRIMITIVES (P8.2 tranche a BDA port)
-    { "sb_primitiveContactGenLaunch", nullptr, nullptr },  // SB_PRIMITIVES_CG (unmapped)
+    { "sb_primitiveContactGenLaunch", "softBodyContactGenBda.spv", "sb_primitiveContactGenLaunch" },  // SB_PRIMITIVES_CG (P8.2 tranche b BDA port — PLANE path only, see the shader header)
     { "sb_sbMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_SB_MIDPHASE (unmapped)
     { "sb_psMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_PS_MIDPHASE (unmapped)
     { "sb_psContactGenLaunch", nullptr, nullptr },  // SB_PS_CG (unmapped)

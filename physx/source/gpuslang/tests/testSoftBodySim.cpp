@@ -2431,6 +2431,235 @@ PXG_TEST(softBodySimMidphaseGeneratePairs)
     dev->destroyBuffer(bStack.h); dev->destroyBuffer(bCount.h);
 }
 
+// ===========================================================================
+// P8.2 tranche b — sb_primitiveContactGenLaunch, PLANE path (softbodyPrimitives.cu:573
+// -> tetPlaneCollide :247).  Four lanes test the tet's four corners against the plane and
+// emit one contact per penetrating corner through PxgFEMContactWriter.
+//
+// The writer is passed BY VALUE in CUDA, so it is inlined into the push blob at @112 and
+// the blob is 192 bytes.  The static_asserts below are the guard on that layout -- get one
+// field offset wrong and every contact lands in the wrong buffer.
+//
+// The fixture places ONE tet straddling the y = 0 plane so the four corners split 2/2:
+// two below (penetrating, contacts expected) and two above by more than the contact
+// distance (no contact).  That split is what gives the per-corner test teeth -- a port
+// that emitted per-TET rather than per-CORNER, or that used the wrong plane axis, lands on
+// a different count.
+// ===========================================================================
+struct FemWriterHost
+{
+    uint64_t outPoint, outNormalPen, outBarycentric, outContactInfo, totalContactCount;
+    uint64_t contactByX, tempContactByX, contactIndexSortedByX, contactSortedByX;
+    uint32_t maxNumContacts, pad;
+};
+struct SbContactGenPush
+{
+    float tolerenceLength; uint32_t pad4;
+    uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes,
+             softbodies, shapeToRigidRemapTable, stackPtr, midphasePairsNum;
+    uint32_t stackSizeBytes, pad84;
+    uint64_t softBodyRigidPairs;
+    uint32_t numSoftBodyRigidPairs, pad100;
+    uint64_t stackSizeNeededOnDevice;
+    FemWriterHost w;
+};
+static_assert(sizeof(SbContactGenPush) == 192, "sb contact-gen push blob must be 192 bytes");
+static_assert(offsetof(SbContactGenPush, stackPtr) == 64, "stackPtr @64");
+static_assert(offsetof(SbContactGenPush, stackSizeBytes) == 80, "stackSizeBytes @80");
+static_assert(offsetof(SbContactGenPush, stackSizeNeededOnDevice) == 104, "stackSizeNeeded @104");
+static_assert(offsetof(SbContactGenPush, w) == 112, "the writer is inlined at @112");
+static_assert(offsetof(SbContactGenPush, w) + offsetof(FemWriterHost, maxNumContacts) == 184,
+              "writer.maxNumContacts @184");
+
+// PxgFemOtherContactInfo (16 B): pairInd0 u64 @0, pairInd1 u32 @8, rigidMatInd u32 @12.
+struct FemOtherContactInfoHost { uint64_t pairInd0; uint32_t pairInd1, rigidMatInd; };
+static_assert(sizeof(FemOtherContactInfoHost) == 16, "PxgFemOtherContactInfo is 16 bytes");
+
+PXG_TEST(softBodySimPrimitiveContactGenPlane)
+{
+    using namespace p80refit;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const float cd = 0.05f;             // per-shape contact distance -> total 0.10
+    const float totalCd = 2.0f * cd;
+    const float restD = 0.02f;
+
+    // One tet straddling y = 0: corners 0 and 1 are BELOW (penetrating), corner 2 is just
+    // above but within the contact distance, corner 3 is far above and must be rejected.
+    std::vector<F4> verts = {
+        { 0.0f, -0.30f, 0.0f, 1.0f },   // corner 0 — deep
+        { 1.0f, -0.10f, 0.0f, 1.0f },   // corner 1 — shallow
+        { 0.0f,  0.05f, 1.0f, 1.0f },   // corner 2 — above but INSIDE the 0.10 band
+        { 0.0f,  5.00f, 0.0f, 1.0f },   // corner 3 — far above, rejected
+    };
+    std::vector<TetIdx4> tets = { { 0u, 1u, 2u, 3u }, { 0u, 0u, 0u, 0u } };   // + trailer
+    for (int t = 0; t < 2; ++t) verts.push_back(F4{ 0, 0, 0, 0 });             // + trailer
+    DevBuf bVerts = makeDev(dev, verts);
+    DevBuf bTets = makeDev(dev, tets);
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bVerts.addr));
+    sb.mNumTets = 1u;
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // shape 0 = tetmesh (softbody 0), shape 1 = the PLANE.
+    // shape 2 is a BOX: pair 1 routes the SAME tet at the SAME plane-space depth through a
+    // non-plane rigid, which this tranche deliberately does not handle.  Asserting it
+    // contributes nothing pins the boundary of the partial implementation, so the future GJK
+    // tranche has to change this test consciously rather than silently.
+    std::vector<PxgShapeHost> shapes(3);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_TETRAHEDRONMESH_H; shapes[0].particleOrSoftbodyId = 0u;
+    shapes[1].type = 1u /* ePLANE */;        shapes[1].materialIndex = 7u;
+    shapes[2].type = 3u /* eBOX */;          shapes[2].materialIndex = 9u;
+    DevBuf bShapes = makeDev(dev, shapes);
+    // The PLANE pair is cmIdx 1 ON PURPOSE: restDistance is indexed BY cmIdx, so putting
+    // the observable pair at a nonzero index is the only way to tell restDistance[cmIdx]
+    // from restDistance[0].  The mutation sweep read [0] and passed until this swap.
+    std::vector<CmInputHost> cms = { { 0u, 2u, 0u, 1u }, { 0u, 1u, 0u, 1u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    // A PxPlane's surface is x == 0 in plane space, so a WORLD y = 0 ground plane whose
+    // normal is +y needs the quaternion that maps +x onto +y: a 90-degree rotation about z.
+    const float s45 = 0.70710678f;
+    std::vector<float> xforms = {
+        0,0,0,1,  0,0,0,  0,                      // slot 0 (softbody, unused)
+        0.0f, 0.0f, s45, s45,  0.0f, 0.0f, 0.0f,  0.0f,   // slot 1: plane, +x -> +y
+    };
+    // TRAILER.  llvmpipe widens the final load of a tightly-sized buffer past its end and
+    // faults; the softbody refit test hit the same thing.  Sixteen slack bytes on every
+    // buffer whose last element is read is the standing workaround.
+    for (int t = 0; t < 4; ++t) xforms.push_back(0.0f);
+    DevBuf bXf = makeDev(dev, xforms);
+    std::vector<float> cds = { cd, cd, 0.0f, 0.0f };            // + trailer
+    DevBuf bCd = makeDev(dev, cds);
+    // DISTINCT per cmIdx: slot 0 belongs to the box pair and must never be read.
+    std::vector<float> restDs = { 0.99f, restD, 0.0f, 0.0f };
+    DevBuf bRest = makeDev(dev, restDs);
+    // PxNodeIndex per transform-cache slot; slot 1 is the rigid's.
+    std::vector<uint64_t> remap = { 0ull, 0x00000000ABCDEF01ull, 0ull, 0ull };  // + trailer
+    DevBuf bRemap = makeDev(dev, remap);
+
+    // the midphase's output: one pair (cmIdx 0, tet 0)
+    // two pairs: (cmIdx 0, tet 0) against the PLANE and (cmIdx 1, tet 0) against the BOX
+    // (cmIdx 0, tet 0) against the BOX and (cmIdx 1, tet 0) against the PLANE
+    std::vector<uint32_t> stack = { 0u, 0u, 0u, 0u,  1u, 0u, 0u, 0u,  0u, 0u, 0u, 0u };
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairNum = { 2u };
+    DevBuf bPairNum = makeDev(dev, pairNum);
+    std::vector<uint32_t> stackNeeded = { 0u };
+    DevBuf bNeeded = makeDev(dev, stackNeeded);
+
+    const uint32_t MAXC = 32u;
+    const uint32_t POISON = 0xEEEEEEEEu;
+    std::vector<F4> outPoint(MAXC, F4{ -1, -1, -1, -1 }), outNormal(MAXC, F4{ -1, -1, -1, -1 });
+    std::vector<F4> outBary(MAXC, F4{ 0, 0, 0, 0 });
+    std::vector<FemOtherContactInfoHost> outInfo(MAXC);
+    std::memset(outInfo.data(), 0xEE, outInfo.size() * sizeof(FemOtherContactInfoHost));
+    std::vector<uint64_t> byX(MAXC, 0ull);
+    std::vector<uint32_t> tempByX(MAXC, POISON), idxSorted(MAXC, POISON), sortedByX(MAXC, POISON);
+    std::vector<uint32_t> total = { 0u };
+    DevBuf bPt = makeDev(dev, outPoint), bNp = makeDev(dev, outNormal), bBary = makeDev(dev, outBary);
+    DevBuf bInfo = makeDev(dev, outInfo), bByX = makeDev(dev, byX), bTmp = makeDev(dev, tempByX);
+    DevBuf bIdx = makeDev(dev, idxSorted), bSorted = makeDev(dev, sortedByX), bTotal = makeDev(dev, total);
+
+    if (!bVerts.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    SbContactGenPush push = {};
+    push.tolerenceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.contactDistance = bCd.addr;
+    push.restDistance = bRest.addr;
+    push.gpuShapes = bShapes.addr;
+    push.softbodies = bDesc.addr;
+    push.shapeToRigidRemapTable = bRemap.addr;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairNum.addr;
+    push.stackSizeBytes = 32u;               // two uint4 slots
+    push.softBodyRigidPairs = 0ull;
+    push.numSoftBodyRigidPairs = 0u;         // no attachments -> the filter never matches
+    push.stackSizeNeededOnDevice = bNeeded.addr;
+    push.w.outPoint = bPt.addr; push.w.outNormalPen = bNp.addr; push.w.outBarycentric = bBary.addr;
+    push.w.outContactInfo = bInfo.addr; push.w.totalContactCount = bTotal.addr;
+    push.w.contactByX = bByX.addr; push.w.tempContactByX = bTmp.addr;
+    push.w.contactIndexSortedByX = bIdx.addr; push.w.contactSortedByX = bSorted.addr;
+    push.w.maxNumContacts = MAXC;
+
+    Kernel k("softBodyContactGenBda.spv", "sb_primitiveContactGenLaunch", {}, sizeof(SbContactGenPush));
+    k.dispatch(/*gridX*/ 1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const uint32_t n = downloadBuffer<uint32_t>(dev, bTotal.h, 1)[0];
+    const auto gPt = downloadBuffer<F4>(dev, bPt.h, MAXC);
+    const auto gNp = downloadBuffer<F4>(dev, bNp.h, MAXC);
+    const auto gInfo = downloadBuffer<FemOtherContactInfoHost>(dev, bInfo.h, MAXC);
+    const auto gNeeded = downloadBuffer<uint32_t>(dev, bNeeded.h, 1)[0];
+
+    // Corners 0, 1 and 2 are all within contactDist (0.10) of the plane; corner 3 is not.
+    // Three from the PLANE pair; the BOX pair must contribute NOTHING in this tranche.
+    PXG_CHECK_MSG(n == 3u, "the plane path must emit ONE contact PER PENETRATING CORNER "
+                           "(3 of the tet's 4 are within 0.10 of the plane) and the BOX pair "
+                           "must contribute nothing, got %u", n);
+    for (uint32_t i = 0; i < n && i < MAXC; ++i)
+        PXG_CHECK_MSG(gInfo[i].rigidMatInd != 9u,
+                      "contact %u came from the BOX rigid -- this tranche implements the PLANE "
+                      "path only, so the non-plane branch must emit nothing", i);
+
+    bool seen[4] = { false, false, false, false };
+    for (uint32_t i = 0; i < n && i < MAXC; ++i)
+    {
+        std::printf("  contact %u: point(%.4f, %.4f, %.4f) rest=%.4f normal(%.3f, %.3f, %.3f) pen=%.4f\n",
+                    i, gPt[i].x, gPt[i].y, gPt[i].z, gPt[i].w, gNp[i].x, gNp[i].y, gNp[i].z, gNp[i].w);
+        // the contact point IS the tet corner, and the penetration is its signed height
+        for (uint32_t c = 0; c < 4u; ++c)
+            if (std::fabs(gPt[i].x - verts[c].x) < 1e-5f && std::fabs(gPt[i].y - verts[c].y) < 1e-5f &&
+                std::fabs(gPt[i].z - verts[c].z) < 1e-5f)
+            { seen[c] = true; PXG_CHECK_MSG(std::fabs(gNp[i].w - verts[c].y) < 1e-5f,
+                  "penetration must be the corner's signed plane distance: corner %u y=%g, got pen %g",
+                  c, verts[c].y, gNp[i].w); }
+        // the plane normal is +y in world space
+        PXG_CHECK_MSG(std::fabs(gNp[i].x) < 1e-5f && std::fabs(gNp[i].y - 1.0f) < 1e-5f &&
+                      std::fabs(gNp[i].z) < 1e-5f,
+                      "the world normal must be the plane's +y (got %.4f, %.4f, %.4f)",
+                      gNp[i].x, gNp[i].y, gNp[i].z);
+        PXG_CHECK_MSG(std::fabs(gPt[i].w - restD) < 1e-6f,
+                      "point.w must carry the rest distance %g (got %g)", restD, gPt[i].w);
+        // PxEncodeSoftBodyIndex(0, 0) == 0; the material index rides the low 31 bits.
+        PXG_CHECK_MSG(gInfo[i].pairInd1 == 0u, "pairInd1 must be encode(softbody 0, tet 0) = 0, got %u",
+                      gInfo[i].pairInd1);
+        PXG_CHECK_MSG(gInfo[i].rigidMatInd == 7u,
+                      "the rigid material index must be stored with bit31 cleared (got 0x%08x)",
+                      gInfo[i].rigidMatInd);
+        PXG_CHECK_MSG(gInfo[i].pairInd0 == 0x00000000ABCDEF01ull,
+                      "pairInd0 must be the rigid's PxNodeIndex from the remap table");
+    }
+    PXG_CHECK_MSG(seen[0] && seen[1] && seen[2],
+                  "corners 0, 1 and 2 must each produce a contact (%d %d %d)",
+                  int(seen[0]), int(seen[1]), int(seen[2]));
+    PXG_CHECK_MSG(!seen[3], "corner 3 is 5.0 above the plane and must NOT produce a contact");
+    // the sort side-buffers must be primed for the radix sort that follows
+    const auto gTmp = downloadBuffer<uint32_t>(dev, bTmp.h, MAXC);
+    const auto gIdx = downloadBuffer<uint32_t>(dev, bIdx.h, MAXC);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        PXG_CHECK_MSG(gTmp[i] == 0xABCDEF01u, "tempContactByX must be the low half of the rigid id");
+        PXG_CHECK_MSG(gIdx[i] == i, "contactIndexSortedByX must be seeded with the identity");
+    }
+    // stackSizeNeededOnDevice reports what the midphase actually found, in BYTES.
+    PXG_CHECK_MSG(gNeeded == 32u, "stackSizeNeeded must be numFound * sizeof(uint4) = 32, got %u", gNeeded);
+
+    dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bTets.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bCms.h); dev->destroyBuffer(bXf.h);
+    dev->destroyBuffer(bCd.h); dev->destroyBuffer(bRest.h); dev->destroyBuffer(bRemap.h);
+    dev->destroyBuffer(bStack.h); dev->destroyBuffer(bPairNum.h); dev->destroyBuffer(bNeeded.h);
+    dev->destroyBuffer(bPt.h); dev->destroyBuffer(bNp.h); dev->destroyBuffer(bBary.h);
+    dev->destroyBuffer(bInfo.h); dev->destroyBuffer(bByX.h); dev->destroyBuffer(bTmp.h);
+    dev->destroyBuffer(bIdx.h); dev->destroyBuffer(bSorted.h); dev->destroyBuffer(bTotal.h);
+}
+
 
 // ===========================================================================
 // P8.0 tranche 7 — the three kernels that CLOSE the softbody step:

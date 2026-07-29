@@ -538,7 +538,8 @@ pxg_compile_shader(softBodySolveBda sb_gm_zeroTetMultipliers
 # Ptr<> (BDA, no HLSL cs_6_0 lowering) so it is deliberately absent from PXG_HLSL_ENTRIES.
 # IS in PXG_NOCONTRACT_SHADERS: isValidTet's signed volume is a dot-of-cross that would
 # otherwise fuse to FMAs and break parity with the -ffp-contract=off CPU reference.
-pxg_compile_shader(softBodyContactGenBda sb_midphaseGeneratePairsLaunch)
+pxg_compile_shader(softBodyContactGenBda sb_midphaseGeneratePairsLaunch
+                   sb_primitiveContactGenLaunch)
 pxg_compile_shader(contactReduce ctContactReduce)
 pxg_compile_shader(npSbTet ctSbTet)
 pxg_compile_shader(npSbSelf ctSbSelfQuery)
