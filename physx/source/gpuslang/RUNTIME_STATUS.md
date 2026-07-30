@@ -1678,6 +1678,17 @@ and already proven in `PxgVulkanKernelAbi.cpp`:
 | 6 `sb_queryRigidSoftContactReferenceCountLaunch` | `{8,8,8,8,8,8,8,8,4,8,8}` | 88 B | :1944 (helper :1824), ~117 lines |
 | 7 `sb_solveRigidSoftCollisionLaunch` | `{8,8,8,8,8,8,8,8,8,8,8,4,8,8}` | 112 B | :2062 (helper :1963), ~95 lines |
 
+`PxgSolverSharedDesc<IterativeSolveData>` deserves a note, because it is templated where the
+cloth ABI comment writes it unqualified, and it was flagged as a risk before being checked.
+It is not one. It is a POINTER argument, so the ABI row is 8 bytes either way and the
+88/112-byte blobs are safe regardless of the instantiation. And the mirror already covers the
+derived part: `pxgSlangSolverDesc.slang` carries BOTH `PxgSolverSharedDescTGSGpu` and
+`PxgSolverSharedDescPGSGpu` (base 96 + `iterativeData` 128 = 224 bytes, with `iterativeData`
+flattened as `iter_*`), and `femClothRigidContactBda.slang:504` already has a
+`readRigidVelocity` helper that reads `iter_solverBodyVelPool` through either variant and
+selects on `isTGS` -- which is exactly the machinery kernels 6 and 7 need. That is the
+PxgVelocityReader analogue, already ported.
+
 **No new descriptor mirrors are needed.** All six rigid-side structs the trio touches are
 already mirrored and used together by `femClothRigidContactBda.slang`: `PxgPrePrepDesc`,
 `PxgConstraintPrepareDesc`, `PxgSolverSharedDescBase`, `PxgFemRigidConstraintBlock`,
@@ -1708,6 +1719,60 @@ opposite of the midphase and self-collision tranches. What they do use:
   an optionally-null pointer needs the POINTER selected, not the load guarded, and no block
   may both redefine a loop bound and store.
 
+### PROBE RESULT: the plane path DOES feed a real engine contact — green light
+
+The top-ranked risk below was that kernel 2's PLANE gate is proven only by a unit test, so
+tranche e could end with three green kernels and a cube that still falls through. Probed
+before writing any of them, and the answer is unambiguously yes.
+
+`PXG_SB_PLANE=1` (new, default OFF) adds a static `PxPlaneGeometry` at y=0 to
+`PXG_SCENE=softbody`, coplanar with the ground box's top face. Additive, not a replacement:
+the ground box has to stay, because it is what keeps the rigid PGS island non-empty. The
+step loop now reads back
+`PxSimulationStatistics::gpuDynamicsMemoryConfigStatistics.deformableVolumeContacts` — the
+pinned counter `PxgSoftBodyCore::checkBufferOverflows()` already maintains — and, with no
+particles and self-collision off, softbody-vs-rigid is its only contributor.
+
+```
+plane OFF (control)   max contacts 0,   fall 4.0000 -> -0.98675
+plane ON              max contacts 128, first at step 49
+   step 49  mean y 0.52563   contacts 32     <- bottom face crosses y=0 HERE
+   step 53  mean y -0.04662  contacts 96
+   step 56  mean y -0.50442  contacts 128
+   step 74  mean y -3.76625  contacts 128    (plateau: fully submerged)
+                      fall 4.0000 -> -0.98675, 0.0000% off the closed form
+```
+
+Four things make this conclusive rather than suggestive:
+
+1. **The onset is geometrically timed.** Contacts first appear at step 49, where the mean y is
+   0.52563 — the cube's half-height is 0.5, so its bottom face crosses y=0 exactly there. A
+   spurious or leaked count would not be timed to the geometry.
+2. **It is not a buffer ceiling.** `maxDeformableVolumeContacts` defaults to 1×1024×1024, so
+   128 is five orders of magnitude below the cap, and no overflow warning fires. The plateau
+   at 128 is genuine saturation once the cube is fully through the plane. The 32-granularity
+   (32 → 96 → 128) is the contact-gen writer reserving slots per warp, which is the expected
+   shape.
+3. **The control is intact and the fall is byte-identical.** With the plane on, the cube still
+   falls to exactly -0.98675, 0.0000% off the semi-implicit-Euler closed form — the same value
+   as with the plane off. That is the predicted outcome, and it is the proof that contacts are
+   generated but not yet consumed: nothing between kernel 4 and the vertex update touches them.
+   It also shows the plane perturbed nothing it should not have.
+4. **The trace shows the chain stopping exactly where the manifest says it does.** With
+   `PXG_LAUNCH_TRACE=1` over 55 steps: `sb_reorderPSContactsLaunch` dispatches 55 times and
+   `sb_other_contact_remap_to_simLaunch` 15 times, while `sb_rigidContactPrepareLaunch`,
+   `sb_queryRigidSoftContactReferenceCountLaunch` and `sb_solveRigidSoftCollisionLaunch` each
+   fail their one-time wrangler lookup at init and are never dispatched.
+
+The trace also shows `sb_solveRigidSoftAttachmentLaunch{,TGS}` missing. That is the ATTACHMENT
+path (`solveRigidAttachment`, PxgSoftBodyCore.cpp:1790), not the contact path; the scene has
+no attachments, so it is irrelevant to a settle, but it is a fourth softbody-vs-rigid kernel
+that will be needed for attachment scenes later.
+
+So tranche d/e will pay off, and the settle assertion in tranche e has a working contact
+source to build on. `PXG_SB_PLANE` stays default-off until the solve kernels land, so the
+recorded free-fall baseline remains the control; tranche e flips it on.
+
 ### Proposed tranche cuts
 
 - **tranche d — kernel 5 alone.** Smallest (~67 lines), and 6 and 7 both consume its
@@ -1721,18 +1786,16 @@ opposite of the midphase and self-collision tranches. What they do use:
 
 ### What could still make this drag
 
-Ranked, honestly:
-1. **The plane path may not feed a real settle.** Kernel 2's PLANE gate is proven by a unit
-   test, not by an engine-level contact against a live `PxPlaneGeometry` floor. If the
-   engine's CM/midphase path routes a plane differently than the fixture assumes, tranche e
-   ends with green kernels and a cube that still falls through. Worth probing EARLY — before
-   writing kernel 6 — by adding the plane floor now and checking whether the existing chain
-   produces a nonzero `mRigidTotalContactCountBuf`.
-2. **`PxgSolverSharedDesc<IterativeSolveData>` is templated** in the softbody signatures where
-   the cloth ABI comment writes it unqualified. The mirror is shared, so this is probably
-   nothing, but confirm the instantiation matches before trusting the 88/112-byte blobs.
-3. Kernel 6 at ~117 lines is the largest of the three and the only one with atomics; expect
+Ranked, honestly. The risk that led this list -- that kernel 2's PLANE gate is proven only by
+a unit test and might not feed a real engine contact -- has been RETIRED by the probe above.
+What remains:
+1. Kernel 6 at ~117 lines is the largest of the three and the only one with atomics; expect
    the mutation pass to find the most gaps there.
+2. The plane path feeds contacts, but only 128 of them, saturating once the cube is fully
+   submerged. Whether that set is RICH ENOUGH to hold a 27-vertex cube up -- rather than let
+   it sink slowly -- is not something the probe can answer; it needs the solve. If tranche e
+   produces a cube that sinks instead of settling, suspect the contact SET before suspecting
+   the three kernels.
 
 ## P8.2 tranche c — BOTH chain kernels land, and two llvmpipe defects come out of it
 

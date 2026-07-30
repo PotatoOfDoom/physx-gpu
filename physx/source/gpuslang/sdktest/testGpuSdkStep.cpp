@@ -1201,6 +1201,7 @@ struct SoftBodyScene
     float restExtentY = 0.0f;   // the cube's undeformed y extent (its rest shape)
     float stretchY = 1.0f;      // the spawn-time elongation factor along y
     bool noGravity = false;     // PXG_SB_NOGRAVITY: pure constitutive relaxation
+    bool hasPlane = false;      // PXG_SB_PLANE: a static PxPlaneGeometry floor at y=0
     PxCudaContextManager* cudaCtx = nullptr;
 };
 
@@ -1217,6 +1218,36 @@ SoftBodyScene buildSoftBodyScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     addGroundBox(physics, scene, rigidMat);
     addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
                boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+
+    // PXG_SB_PLANE=1 adds an infinite static PxPlaneGeometry at y=0, coplanar with the
+    // ground box's top face.
+    //
+    // Why a plane and not the box that is already there: sb_primitiveContactGenLaunch is
+    // ported for the PLANE rigid type ONLY -- every other type needs the GJK/EPA tranche --
+    // so a box floor generates ZERO softbody contacts however much of the solve chain is
+    // mapped.  The cloth drape scene settles for exactly this reason: its floor is a plane
+    // (see buildClothDrapeScene).
+    //
+    // It is OFF by default and additive rather than a replacement, deliberately.  The ground
+    // box has to stay (it is what keeps the rigid PGS island non-empty, above), and leaving
+    // the default scene byte-identical means the recorded free-fall baseline still holds as
+    // the CONTROL for this probe: with the plane on, contacts are generated but nothing
+    // consumes them until sb_rigidContactPrepare / queryRigidSoftContactReferenceCount /
+    // solveRigidSoftCollision land, so the cube must still fall to the SAME depth.  A
+    // changed fall depth would mean the plane perturbed something it should not have.
+    if (const char* planeEnv = std::getenv("PXG_SB_PLANE"))
+    {
+        if (atoi(planeEnv) != 0)
+        {
+            PxRigidStatic* floor = physics->createRigidStatic(
+                PxTransformFromPlaneEquation(PxPlane(0.0f, 1.0f, 0.0f, 0.0f)));
+            PxShape* floorShape = physics->createShape(PxPlaneGeometry(), *rigidMat);
+            floor->attachShape(*floorShape);
+            scene->addActor(*floor);
+            floorShape->release();
+            out.hasPlane = true;
+        }
+    }
 
     // --- the tetrahedral cube -------------------------------------------------
     const PxU32 cells = 2;                        // 2x2x2 cells -> 27 verts, 40 tets
@@ -1996,6 +2027,8 @@ int main()
         float meanC = meanC0, minC = minC0, meanS = meanS0, minS = minS0, extS = extS0;
         float maxSkinGap = 0.0f;
         float extSettleRef = extS0;
+        PxU32 maxSbContacts = 0, prevSbContacts = 0;
+        int firstContactStep = -1;
         for (int i = 0; i < steps; ++i)
         {
             scene->simulate(dt);
@@ -2007,16 +2040,49 @@ int main()
             // skin kernel failing to keep up (or not running at all).
             maxSkinGap = PxMax(maxSkinGap, PxAbs(meanC - meanS));
             if (i == steps - 21) extSettleRef = extS;   // 20 steps before the end
-            if (i < 5 || i == steps - 1 || (i % 10 == 0))
+            // The deformable-volume contact count the engine actually reached, read back
+            // from the pinned counter PxgSoftBodyCore::checkBufferOverflows() already
+            // maintains.  With no particles and self-collision off, softbody-vs-RIGID is the
+            // only contributor, so this is a direct measurement of whether the mapped
+            // contact chain (midphase -> plane contact gen -> remap -> reorder) produced
+            // anything at all.  It is the probe that has to answer YES before the three
+            // solve kernels are worth writing.
+            PxSimulationStatistics simStats;
+            scene->getSimulationStatistics(simStats);
+            const PxU32 sbContacts =
+                simStats.gpuDynamicsMemoryConfigStatistics.deformableVolumeContacts;
+            maxSbContacts = PxMax(maxSbContacts, sbContacts);
+            if (sbContacts > 0 && firstContactStep < 0) firstContactStep = i;
+            // Also print on every CHANGE of the contact count, not just on the sampling
+            // grid: a count that only ever appears as one number is indistinguishable from a
+            // buffer ceiling, and the progression is what shows it is a real measurement.
+            if (i < 5 || i == steps - 1 || (i % 10 == 0) || sbContacts != prevSbContacts)
                 std::printf("    step %3d: coll mean y = %.5f (dy = %+.5f), sim mean y = %.5f, "
-                            "skin gap = %.5f, sim y-extent = %.5f\n",
-                            i, meanC, meanC - prevC, meanS, PxAbs(meanC - meanS), extS);
+                            "skin gap = %.5f, sim y-extent = %.5f, sb contacts = %u\n",
+                            i, meanC, meanC - prevC, meanS, PxAbs(meanC - meanS), extS, sbContacts);
+            prevSbContacts = sbContacts;
             if (meanC > prevC + 1e-3f) ++nonMonotonic;   // free fall: must not rise
             prevC = meanC;
         }
         const float drop = meanC0 - meanC;
 
         int failures = 0;
+
+        // ---- the PLANE-path probe ------------------------------------------------
+        // Reported unconditionally, and asserted only where the answer is unambiguous.
+        // Without the plane the floor is a BOX, which sb_primitiveContactGenLaunch does not
+        // handle yet, so zero is the CORRECT answer there and must not fail.
+        std::printf("  contact chain: max deformable-volume contacts = %u, first at step %d "
+                    "(plane floor %s)\n",
+                    maxSbContacts, firstContactStep, sbs.hasPlane ? "ON" : "off");
+        if (sbs.hasPlane && maxSbContacts == 0)
+        {
+            std::printf("FAIL: PXG_SB_PLANE=1 put an infinite plane at y=0 and the cube fell "
+                        "through it having generated ZERO contacts. The mapped chain "
+                        "(midphase -> plane contact gen -> remap -> reorder) is not feeding "
+                        "the engine, so porting the solve kernels cannot make it settle.\n");
+            ++failures;
+        }
         // The engine integrates gravity semi-implicitly (v += g*dt; x += v*dt), so after n
         // steps a contact-free body has dropped exactly g*dt^2*n(n+1)/2 -- NOT the
         // continuous 0.5*g*t^2.  Used twice below: as the closed form the undeformed fall
