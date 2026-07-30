@@ -3673,6 +3673,44 @@ static void refPrepare(SbRigidConstraintHost& c, int slot, V3 normal, V3 p, floa
     c.maxPenBias[slot] = (penBiasClampRigid > penBiasClampFEM) ? penBiasClampRigid : penBiasClampFEM;
     c.barycentric[slot] = barycentric;
 }
+// FEMCollision::initialize + computeFEMChange (deformableUtils.cuh:280 / :488), PGS path,
+// STATIC rigid at rest, null-material friction.  Returns the per-contact position delta.
+// Written so the absolute magnitude of the solve is checkable, not just its shape: a
+// ratio-only assertion cannot see a dropped mass-splitting factor, because that scales
+// every vertex identically.
+struct SolveRef { float deltaLambdaN; V3 deltaPos; };
+static SolveRef refSolvePGS(const SbRigidConstraintHost& c, int slot, float appliedForceRef,
+                            float dt, V3 deformableLinDelta, float massSplit,
+                            float rigidRefCount)
+{
+    const float invDt = 1.0f / dt;
+    const F4 raXn_resp = c.raXn_resp[slot];
+    const F4 normal_biasW = c.normal_errorW[slot];
+    const V3 normal = V3{ normal_biasW.x, normal_biasW.y, normal_biasW.z };
+    const float initPen = normal_biasW.w;
+    const float maxPenBias = c.maxPenBias[slot];
+
+    // static rigid at rest: linVel = angVel = 0, so normalVel = 0 and angDelta = 0.
+    const V3 relLinDelta = V3{ -deformableLinDelta.x, -deformableLinDelta.y, -deformableLinDelta.z };
+    const float error = (initPen + dot3(relLinDelta, normal)) * invDt;
+    const float errorBiased = (maxPenBias > error) ? maxPenBias : error;
+    const float CN = errorBiased;
+
+    SolveRef r;
+    r.deltaLambdaN = 0.0f;
+    r.deltaPos = V3{ 0, 0, 0 };
+    if (!(CN < 0.0f)) return r;   // inactive unless wasActive, which the caller handles
+
+    const float unitResponse = rigidRefCount * raXn_resp.w + massSplit;
+    const float invDenom = (unitResponse > 0.0f) ? (1.0f / unitResponse) : 0.0f;
+    float dLN = -CN * invDenom;
+    if (dLN < -appliedForceRef) dLN = -appliedForceRef;
+    r.deltaLambdaN = dLN;
+    // deltaLambdaT collapses to 0 on the null-material path (combinedFriction == 0).
+    r.deltaPos = V3{ -(dLN * normal.x) * dt, -(dLN * normal.y) * dt, -(dLN * normal.z) * dt };
+    return r;
+}
+
 } // namespace p82dref
 
 static void sbPokePtr(std::vector<uint8_t>& b, size_t off, uint64_t v) { std::memcpy(b.data() + off, &v, 8); }
@@ -4065,6 +4103,551 @@ PXG_TEST(softBodySimRigidContactPrepareStride)
     dev->destroyBuffer(bSolverBodyData.h); dev->destroyBuffer(bSolverTxIData.h);
     dev->destroyBuffer(bSolverBodyIndices.h); dev->destroyBuffer(bPrepDesc.h);
     dev->destroyBuffer(bPrePrepDesc.h);
+}
+
+// ===========================================================================
+// P8.2 tranche e — the query (reference-count) and solve kernels, at UNIT level.
+//
+// The PXG_SCENE=softbody settle proves the chain runs end to end, but it is a coarse
+// instrument: it only sees the aggregate.  Mutation-tested against it, three real defects
+// survive, and each is blind for a structural reason the scene cannot fix:
+//
+//   - dropping the mass-splitting multiply.  With one softbody and one contact per vertex
+//     every reference count is 1, and multiplying by 1 is a no-op.  Needs a vertex shared
+//     by TWO contacts, which is what this fixture builds.
+//   - dropping the applied-force write-back.  The accumulated lambda only bites through
+//     the `max(-CN*invDenom, -accumulated)` clamp on a LATER solver iteration, so a
+//     single-dispatch scene never reads it back.
+//   - ignoring wasActive.  Contacts in the scene stay geometrically active, so the
+//     conservative "once active, stay active" path is never load-bearing there.
+//
+// The fixture drives query -> solve directly on synthetic data, with TWO contacts on the
+// SAME tetrahedron so every vertex is referenced twice.
+// ===========================================================================
+struct SbQueryPush
+{
+    uint64_t softbodies, contactInfos, constraints, numContacts, prePrepDesc, solverCoreDesc;
+    uint64_t artiCoreDesc, sharedDesc;
+    float dt; uint32_t pad68;
+    uint64_t appliedForces, rigidBodyReferenceCounts;
+};
+static_assert(sizeof(SbQueryPush) == 88, "sb query push blob must be 88 bytes");
+static_assert(offsetof(SbQueryPush, dt) == 64, "dt @64");
+static_assert(offsetof(SbQueryPush, rigidBodyReferenceCounts) == 80, "refCounts @80");
+
+struct SbSolvePush
+{
+    uint64_t softbodies, contactInfos, constraints, numContacts, prePrepDesc, solverCoreDesc;
+    uint64_t artiCoreDesc, sharedDesc, rigidDeltaVel, appliedForces, rigidBodyReferenceCounts;
+    float dt; uint32_t pad92;
+    uint64_t materials, rigidBodyMaterials;
+};
+static_assert(sizeof(SbSolvePush) == 112, "sb solve push blob must be 112 bytes");
+static_assert(offsetof(SbSolvePush, rigidDeltaVel) == 64, "rigidDeltaVel @64");
+static_assert(offsetof(SbSolvePush, dt) == 88, "dt @88");
+static_assert(offsetof(SbSolvePush, materials) == 96, "materials @96");
+
+PXG_TEST(softBodySimRigidContactQuerySolve)
+{
+    using namespace p80refit;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+
+    // ONE tet, four movable vertices.  mSimDeltaPos.w carries the inverse mass; mSimDelta
+    // is the accumulator (xyz = position delta, w = reference count).
+    const float invMass = 0.5f;
+    std::vector<F4> simDeltaPos = {
+        { 0.0010f, -0.0020f, 0.0015f, invMass }, { 0.0007f, 0.0011f, -0.0025f, invMass },
+        { -0.0004f, 0.0062f, 0.0017f, invMass }, { 0.0023f, -0.0051f, 0.0088f, invMass },
+    };
+    std::vector<F4> simDelta(4, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
+    std::vector<TetIdx4> simTets = { { 0u, 1u, 2u, 3u }, { 0u, 0u, 0u, 0u } };
+    DevBuf bSimDeltaPos = makeDev(dev, simDeltaPos), bSimDelta = makeDev(dev, simDelta);
+    DevBuf bTets = makeDev(dev, simTets);
+    if (!bSimDeltaPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    const float penBiasClampFEM = -1.0e10f;
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mSimTetIndices = reinterpret_cast<decltype(sb.mSimTetIndices)>(size_t(bTets.addr));
+    sb.mSimDeltaPos = reinterpret_cast<float4*>(size_t(bSimDeltaPos.addr));
+    sb.mSimDelta = reinterpret_cast<float4*>(size_t(bSimDelta.addr));
+    sb.mPenBiasClamp = penBiasClampFEM;
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // TWO contacts, both on tet 0 -> every vertex is referenced twice, so the
+    // mass-splitting multiply by the reference count is observable.
+    const uint32_t kN = 2u;
+    const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
+    std::vector<FemOtherContactInfoHost> infos(kN);
+    std::memset(infos.data(), 0, infos.size() * sizeof(FemOtherContactInfoHost));
+    for (uint32_t i = 0; i < kN; ++i) { infos[i].pairInd0 = staticNodeInd; infos[i].pairInd1 = 0u; }
+    DevBuf bInfos = makeDev(dev, infos);
+    std::vector<uint32_t> numContacts = { kN };
+    DevBuf bNum = makeDev(dev, numContacts);
+
+    // A prepared constraint block: a penetrating contact whose normal points +Y.
+    SbRigidConstraintHost blk;
+    std::memset(&blk, 0, sizeof(blk));
+    const float sqrtInvInertia[9] = { 2.0f, 0.1f, 0.0f, 0.1f, 1.5f, 0.2f, 0.0f, 0.2f, 1.0f };
+    const float penBiasClampRigid = -5.0f;
+    const F4 bary = { 0.4f, 0.2f, 0.3f, 0.1f };
+    for (uint32_t i = 0; i < kN; ++i)
+        // The SOLVER normal, which prepare produces by NEGATING the contact normal.  A
+        // floor whose contact normal is +Y therefore gives -Y here, and
+        // deltaPos = -(lambda * normal) * dt then pushes the vertices UP.  Passing +Y
+        // would model a ceiling and the deltas would legitimately point down.
+        p82dref::refPrepare(blk, int(i), p82dref::V3{ 0.0f, -1.0f, 0.0f },
+                            p82dref::V3{ 0.5f, -0.02f, 0.7f }, -0.02f,
+                            p82dref::V3{ 0.001f, -0.002f, 0.0015f }, bary,
+                            p82dref::V3{ 0, 0, 0 }, 0.0f, penBiasClampRigid,
+                            sqrtInvInertia, penBiasClampFEM, true);
+    std::vector<uint8_t> constraintBytes(sizeof(SbRigidConstraintHost));
+    std::memcpy(constraintBytes.data(), &blk, sizeof(blk));
+    DevBuf bConstraint = makeDev(dev, constraintBytes);
+
+    std::vector<float> appliedForces(kN, 0.0f);
+    DevBuf bForces = makeDev(dev, appliedForces);
+    std::vector<uint32_t> refCounts = { 0u, 0u };
+    DevBuf bRefCounts = makeDev(dev, refCounts);
+    std::vector<F4> rigidDeltaVel(2u * kN, F4{ 9.f, 9.f, 9.f, 9.f });
+    DevBuf bRigidDeltaVel = makeDev(dev, rigidDeltaVel);
+
+    // solver-body scaffolding: a single static body at rest.
+    std::vector<F4> body2World = { { 0, 0, 0, 1 }, { 0, 0, 0, 0 } };
+    DevBuf bBody2World = makeDev(dev, body2World);
+    std::vector<uint8_t> solverBodyData(96, 0);
+    std::memcpy(solverBodyData.data() + 12, &penBiasClampRigid, 4);
+    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
+    std::vector<uint8_t> solverTxIData(64, 0);
+    std::memcpy(solverTxIData.data() + 28, sqrtInvInertia, 9 * 4);
+    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
+    std::vector<uint32_t> solverBodyIndices = { 0u };
+    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
+    std::vector<F4> outSolverVelocity(4, F4{ 0, 0, 0, 0 });
+    DevBuf bOutSolverVel = makeDev(dev, outSolverVelocity);
+    std::vector<F4> solverBodyVelPool(4, F4{ 0, 0, 0, 0 });
+    DevBuf bVelPool = makeDev(dev, solverBodyVelPool);
+
+    std::vector<uint8_t> prepDesc(304, 0);
+    sbPokePtr(prepDesc, 64, bSolverBodyData.addr);
+    sbPokePtr(prepDesc, 72, bSolverTxIData.addr);
+    sbPokePtr(prepDesc, 168, bBody2World.addr);
+    DevBuf bPrepDesc = makeDev(dev, prepDesc);
+    std::vector<uint8_t> prePrepDesc(760, 0);
+    sbPokePtr(prePrepDesc, 272, bSolverBodyIndices.addr);
+    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
+    std::vector<uint8_t> solverCoreDesc(320, 0);
+    sbPokePtr(solverCoreDesc, 0, bOutSolverVel.addr);          // outSolverVelocity @0
+    { const uint32_t one = 1u; std::memcpy(solverCoreDesc.data() + 268, &one, 4); }
+    DevBuf bSolverCoreDesc = makeDev(dev, solverCoreDesc);
+    std::vector<uint8_t> sharedDesc(224, 0);
+    sbPokePtr(sharedDesc, 160, bVelPool.addr);                 // iter_solverBodyVelPool @160
+    DevBuf bSharedDesc = makeDev(dev, sharedDesc);
+
+    // ======================= QUERY =======================
+    SbQueryPush qp = {};
+    qp.softbodies = bDesc.addr; qp.contactInfos = bInfos.addr; qp.constraints = bConstraint.addr;
+    qp.numContacts = bNum.addr; qp.prePrepDesc = bPrePrepDesc.addr;
+    qp.solverCoreDesc = bSolverCoreDesc.addr; qp.artiCoreDesc = 0ull;
+    qp.sharedDesc = bSharedDesc.addr; qp.dt = dt;
+    qp.appliedForces = bForces.addr; qp.rigidBodyReferenceCounts = bRefCounts.addr;
+    Kernel("softBodyRigidContactBda.spv", "sb_queryRigidSoftContactReferenceCountLaunch", {}, sizeof(SbQueryPush))
+        .dispatch(1u, {}, qp, 1u, 1u);
+    dev->flush();
+
+    const auto gDeltaAfterQuery = downloadBuffer<F4>(dev, bSimDelta.h, 4);
+    const auto gInfoAfterQuery = downloadBuffer<FemOtherContactInfoHost>(dev, bInfos.h, kN);
+
+    // Every barycentric weight is > 1e-3 and every inverse mass non-zero, so BOTH contacts
+    // bump ALL FOUR vertices: each count must be exactly 2.  That is what makes the
+    // mass-splitting multiply below observable at all.
+    for (uint32_t v = 0; v < 4u; ++v)
+        PXG_CHECK_MSG(f2u(gDeltaAfterQuery[v].w) == f2u(2.0f),
+                      "vertex %u must be referenced by BOTH contacts (count %g, expected 2)",
+                      v, gDeltaAfterQuery[v].w);
+    for (uint32_t i = 0; i < kN; ++i)
+        PXG_CHECK_MSG((gInfoAfterQuery[i].rigidMatInd & 0x80000000u) != 0u,
+                      "contact %u penetrates, so the query must mark it in-collision", i);
+
+    // ======================= SOLVE =======================
+    SbSolvePush sp = {};
+    sp.softbodies = bDesc.addr; sp.contactInfos = bInfos.addr; sp.constraints = bConstraint.addr;
+    sp.numContacts = bNum.addr; sp.prePrepDesc = bPrePrepDesc.addr;
+    sp.solverCoreDesc = bSolverCoreDesc.addr; sp.artiCoreDesc = 0ull;
+    sp.sharedDesc = bSharedDesc.addr; sp.rigidDeltaVel = bRigidDeltaVel.addr;
+    sp.appliedForces = bForces.addr; sp.rigidBodyReferenceCounts = bRefCounts.addr;
+    sp.dt = dt; sp.materials = 0ull; sp.rigidBodyMaterials = 0ull;
+    Kernel("softBodyRigidContactBda.spv", "sb_solveRigidSoftCollisionLaunch", {}, sizeof(SbSolvePush))
+        .dispatch(1u, {}, sp, 1u, 1u);
+    dev->flush();
+
+    const auto gDelta = downloadBuffer<F4>(dev, bSimDelta.h, 4);
+    const auto gForces = downloadBuffer<float>(dev, bForces.h, kN);
+    const auto gRigidDV = downloadBuffer<F4>(dev, bRigidDeltaVel.h, 2u * kN);
+    std::printf("  after solve: dy = (%.6g, %.6g, %.6g, %.6g), forces = (%.6g, %.6g)\n",
+                gDelta[0].y, gDelta[1].y, gDelta[2].y, gDelta[3].y, gForces[0], gForces[1]);
+
+    // The solve must PUSH THE VERTICES OUT, i.e. along +Y (the constraint normal).
+    for (uint32_t v = 0; v < 4u; ++v)
+        PXG_CHECK_MSG(gDelta[v].y > 0.0f,
+                      "vertex %u must be pushed OUT of the floor (+Y), got dy = %g",
+                      v, gDelta[v].y);
+    // the reference counts must SURVIVE the solve (it reads them, it must not clear them)
+    for (uint32_t v = 0; v < 4u; ++v)
+        PXG_CHECK_MSG(f2u(gDelta[v].w) == f2u(2.0f),
+                      "vertex %u's reference count must survive the solve (%g)", v, gDelta[v].w);
+
+    // THE MASS-SPLIT CHECK, in ABSOLUTE terms.  A ratio between two vertices cannot see a
+    // dropped reference-count multiply, because that scales every vertex identically -- and
+    // mutation-testing confirmed exactly that: the ratio check alone let `no-masssplit`
+    // through.  So the reference computes the whole solve.
+    //
+    // invMass_split = invMass * referenceCount = 0.5 * 2 = 1.0, and BOTH contacts write to
+    // every vertex, so each vertex accumulates twice the single-contact contribution.
+    const p82dref::V3 linDelta = {
+        simDeltaPos[0].x * bary.x + simDeltaPos[1].x * bary.y + simDeltaPos[2].x * bary.z + simDeltaPos[3].x * bary.w,
+        simDeltaPos[0].y * bary.x + simDeltaPos[1].y * bary.y + simDeltaPos[2].y * bary.z + simDeltaPos[3].y * bary.w,
+        simDeltaPos[0].z * bary.x + simDeltaPos[1].z * bary.y + simDeltaPos[2].z * bary.z + simDeltaPos[3].z * bary.w,
+    };
+    const float invMassSplit = invMass * 2.0f;   // the reference count the query wrote
+    const float massSplit = bary.x * bary.x * invMassSplit + bary.y * bary.y * invMassSplit
+                          + bary.z * bary.z * invMassSplit + bary.w * bary.w * invMassSplit;
+    const p82dref::SolveRef sr =
+        p82dref::refSolvePGS(blk, 0, /*appliedForceRef*/ 0.0f, dt, linDelta, massSplit,
+                             /*rigidRefCount*/ 1.0f);
+    const float bcArr[4] = { bary.x, bary.y, bary.z, bary.w };
+    size_t mm = 0;
+    for (uint32_t v = 0; v < 4u; ++v)
+    {
+        const float expect = 2.0f * sr.deltaPos.y * (invMassSplit * bcArr[v]);
+        if (!(std::fabs(gDelta[v].y - expect) < 1e-6f * PxMax(1.0f, std::fabs(expect))))
+        { ++mm; std::printf("  vertex %u delta.y MM: ref %.8g got %.8g\n", v, expect, gDelta[v].y); }
+    }
+    PXG_CHECK_MSG(mm == 0, "the solved per-vertex deltas must match the CPU reference "
+                           "including the mass-splitting factor (%zu mismatches)", mm);
+    PXG_CHECK_MSG(sr.deltaLambdaN > 0.0f,
+                  "the reference must produce a real impulse or the check has no teeth "
+                  "(deltaLambdaN = %g)", sr.deltaLambdaN);
+
+    // the applied force must be accumulated and written back (it is the clamp reference
+    // the NEXT solver iteration reads)
+    for (uint32_t i = 0; i < kN; ++i)
+        PXG_CHECK_MSG(gForces[i] != 0.0f,
+                      "contact %u's accumulated lambda must be written back (got %g)", i, gForces[i]);
+
+    // a STATIC rigid gets a zero delta with count 0 (computeRigidChange is deferred)
+    for (uint32_t i = 0; i < kN; ++i)
+        PXG_CHECK_MSG(f2u(gRigidDV[i].w) == f2u(0.0f),
+                      "a static rigid contact must write count 0 (got %g)", gRigidDV[i].w);
+
+    dev->destroyBuffer(bSimDeltaPos.h); dev->destroyBuffer(bSimDelta.h); dev->destroyBuffer(bTets.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h);
+    dev->destroyBuffer(bConstraint.h); dev->destroyBuffer(bForces.h); dev->destroyBuffer(bRefCounts.h);
+    dev->destroyBuffer(bRigidDeltaVel.h); dev->destroyBuffer(bBody2World.h);
+    dev->destroyBuffer(bSolverBodyData.h); dev->destroyBuffer(bSolverTxIData.h);
+    dev->destroyBuffer(bSolverBodyIndices.h); dev->destroyBuffer(bOutSolverVel.h);
+    dev->destroyBuffer(bVelPool.h); dev->destroyBuffer(bPrepDesc.h);
+    dev->destroyBuffer(bPrePrepDesc.h); dev->destroyBuffer(bSolverCoreDesc.h);
+    dev->destroyBuffer(bSharedDesc.h);
+}
+
+
+// ---------------------------------------------------------------------------
+// "Once active, stay active" (softBody.cu:1888) — and why it needs its own fixture.
+//
+// The query does NOT re-evaluate a contact that is already marked in-collision; it keeps it
+// active unconditionally, to hold the reference count CONSERVATIVE across solver iterations.
+// Neither the scene nor softBodySimRigidContactQuerySolve can see that: in both, every
+// marked contact is still geometrically active, so `wasActive || (CN < 0)` gives the same
+// answer with or without the first term.  Mutation-tested, replacing the wasActive branch
+// with `if (false)` survives both.
+//
+// This fixture makes the two disagree.  It pre-marks the contact in-collision and gives it
+// a SEPARATING geometry (positive penetration), so CN >= 0 and the contact is no longer
+// active on its own.  With the wasActive path it still counts; without it, the reference
+// counts stay zero and the next solve divides by the wrong denominator.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimRigidContactStaysActive)
+{
+    using namespace p80refit;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+
+    const float invMass = 0.5f;
+    std::vector<F4> simDeltaPos(4, F4{ 0.0f, 0.0f, 0.0f, invMass });
+    std::vector<F4> simDelta(4, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
+    std::vector<TetIdx4> simTets = { { 0u, 1u, 2u, 3u }, { 0u, 0u, 0u, 0u } };
+    DevBuf bSimDeltaPos = makeDev(dev, simDeltaPos), bSimDelta = makeDev(dev, simDelta);
+    DevBuf bTets = makeDev(dev, simTets);
+    if (!bSimDeltaPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    const float penBiasClampFEM = -1.0e10f;
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mSimTetIndices = reinterpret_cast<decltype(sb.mSimTetIndices)>(size_t(bTets.addr));
+    sb.mSimDeltaPos = reinterpret_cast<float4*>(size_t(bSimDeltaPos.addr));
+    sb.mSimDelta = reinterpret_cast<float4*>(size_t(bSimDelta.addr));
+    sb.mPenBiasClamp = penBiasClampFEM;
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // TWO contacts on tet 0.  Contact 0 is pre-marked in-collision; contact 1 is not.  Both
+    // are SEPARATING, so neither would activate on its own.
+    const uint32_t kN = 2u;
+    const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
+    std::vector<FemOtherContactInfoHost> infos(kN);
+    std::memset(infos.data(), 0, infos.size() * sizeof(FemOtherContactInfoHost));
+    for (uint32_t i = 0; i < kN; ++i) { infos[i].pairInd0 = staticNodeInd; infos[i].pairInd1 = 0u; }
+    infos[0].rigidMatInd = 0x80000000u;   // markInCollision(true) from a previous iteration
+    DevBuf bInfos = makeDev(dev, infos);
+    std::vector<uint32_t> numContacts = { kN };
+    DevBuf bNum = makeDev(dev, numContacts);
+
+    // POSITIVE penetration -> error > 0 -> CN >= 0 -> not active on geometry alone.
+    SbRigidConstraintHost blk;
+    std::memset(&blk, 0, sizeof(blk));
+    const float sqrtInvInertia[9] = { 2.0f, 0.1f, 0.0f, 0.1f, 1.5f, 0.2f, 0.0f, 0.2f, 1.0f };
+    const float penBiasClampRigid = -5.0f;
+    // Vertex 3's weight is BELOW the 1e-3 gate (softBody.cu:1911), so it must not be
+    // counted: a vertex a contact barely touches has no claim on the mass split.  The other
+    // three are well above it.  Without this, every weight in every fixture is > 1e-3 and
+    // deleting the gate is invisible.
+    const F4 bary = { 0.0005f, 0.5f, 0.4990f, 0.0005f };
+    for (uint32_t i = 0; i < kN; ++i)
+        p82dref::refPrepare(blk, int(i), p82dref::V3{ 0.0f, -1.0f, 0.0f },
+                            p82dref::V3{ 0.5f, 0.30f, 0.7f }, /*pen*/ +0.05f,
+                            p82dref::V3{ 0, 0, 0 }, bary, p82dref::V3{ 0, 0, 0 }, 0.0f,
+                            penBiasClampRigid, sqrtInvInertia, penBiasClampFEM, true);
+    std::vector<uint8_t> constraintBytes(sizeof(SbRigidConstraintHost));
+    std::memcpy(constraintBytes.data(), &blk, sizeof(blk));
+    DevBuf bConstraint = makeDev(dev, constraintBytes);
+
+    std::vector<float> appliedForces(kN, 0.0f);
+    DevBuf bForces = makeDev(dev, appliedForces);
+    std::vector<uint32_t> refCounts = { 0u, 0u };
+    DevBuf bRefCounts = makeDev(dev, refCounts);
+
+    std::vector<F4> body2World = { { 0, 0, 0, 1 }, { 0, 0, 0, 0 } };
+    DevBuf bBody2World = makeDev(dev, body2World);
+    std::vector<uint8_t> solverBodyData(96, 0);
+    std::memcpy(solverBodyData.data() + 12, &penBiasClampRigid, 4);
+    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
+    std::vector<uint8_t> solverTxIData(64, 0);
+    std::memcpy(solverTxIData.data() + 28, sqrtInvInertia, 9 * 4);
+    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
+    std::vector<uint32_t> solverBodyIndices = { 0u };
+    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
+    std::vector<F4> outSolverVelocity(4, F4{ 0, 0, 0, 0 });
+    DevBuf bOutSolverVel = makeDev(dev, outSolverVelocity);
+    std::vector<F4> solverBodyVelPool(4, F4{ 0, 0, 0, 0 });
+    DevBuf bVelPool = makeDev(dev, solverBodyVelPool);
+
+    std::vector<uint8_t> prepDesc(304, 0);
+    sbPokePtr(prepDesc, 64, bSolverBodyData.addr);
+    sbPokePtr(prepDesc, 72, bSolverTxIData.addr);
+    sbPokePtr(prepDesc, 168, bBody2World.addr);
+    DevBuf bPrepDesc = makeDev(dev, prepDesc);
+    std::vector<uint8_t> prePrepDesc(760, 0);
+    sbPokePtr(prePrepDesc, 272, bSolverBodyIndices.addr);
+    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
+    std::vector<uint8_t> solverCoreDesc(320, 0);
+    sbPokePtr(solverCoreDesc, 0, bOutSolverVel.addr);
+    { const uint32_t one = 1u; std::memcpy(solverCoreDesc.data() + 268, &one, 4); }
+    DevBuf bSolverCoreDesc = makeDev(dev, solverCoreDesc);
+    std::vector<uint8_t> sharedDesc(224, 0);
+    sbPokePtr(sharedDesc, 160, bVelPool.addr);
+    DevBuf bSharedDesc = makeDev(dev, sharedDesc);
+
+    SbQueryPush qp = {};
+    qp.softbodies = bDesc.addr; qp.contactInfos = bInfos.addr; qp.constraints = bConstraint.addr;
+    qp.numContacts = bNum.addr; qp.prePrepDesc = bPrePrepDesc.addr;
+    qp.solverCoreDesc = bSolverCoreDesc.addr; qp.artiCoreDesc = 0ull;
+    qp.sharedDesc = bSharedDesc.addr; qp.dt = dt;
+    qp.appliedForces = bForces.addr; qp.rigidBodyReferenceCounts = bRefCounts.addr;
+    Kernel("softBodyRigidContactBda.spv", "sb_queryRigidSoftContactReferenceCountLaunch", {}, sizeof(SbQueryPush))
+        .dispatch(1u, {}, qp, 1u, 1u);
+    dev->flush();
+
+    const auto gDelta = downloadBuffer<F4>(dev, bSimDelta.h, 4);
+    const auto gInfo = downloadBuffer<FemOtherContactInfoHost>(dev, bInfos.h, kN);
+    std::printf("  counts = (%g, %g, %g, %g); contact 1 marked = %d\n",
+                gDelta[0].w, gDelta[1].w, gDelta[2].w, gDelta[3].w,
+                (gInfo[1].rigidMatInd & 0x80000000u) != 0u ? 1 : 0);
+
+    // Contact 1 is separating and was NOT marked, so it must stay inactive: it contributes
+    // nothing.  Contact 0 is separating too but WAS marked, so the wasActive path keeps it
+    // active and it contributes exactly one count per vertex.
+    PXG_CHECK_MSG((gInfo[1].rigidMatInd & 0x80000000u) == 0u,
+                  "a separating, unmarked contact must NOT be marked in-collision -- if it "
+                  "is, the fixture's geometry is not actually separating and it tests nothing");
+    for (uint32_t v = 1; v < 3u; ++v)
+        PXG_CHECK_MSG(f2u(gDelta[v].w) == f2u(1.0f),
+                      "vertex %u must be counted exactly once: only the ALREADY-MARKED "
+                      "contact stays active (count %g, expected 1)", v, gDelta[v].w);
+    // THE 1e-3 GATE, on TWO different components.  Vertices 0 and 3 carry weights of
+    // 0.0005, below the threshold, so the contact must not claim them however active it is.
+    // Two components rather than one because the four gates are separate lines of code:
+    // testing only one leaves the others free to be deleted.
+    PXG_CHECK_MSG(f2u(gDelta[0].w) == f2u(0.0f),
+                  "vertex 0's weight is %g, below the 1e-3 gate, so it must NOT be "
+                  "reference-counted (got %g)", bary.x, gDelta[0].w);
+    PXG_CHECK_MSG(f2u(gDelta[3].w) == f2u(0.0f),
+                  "vertex 3's weight is %g, below the 1e-3 gate, so it must NOT be "
+                  "reference-counted (got %g)", bary.w, gDelta[3].w);
+
+    dev->destroyBuffer(bSimDeltaPos.h); dev->destroyBuffer(bSimDelta.h); dev->destroyBuffer(bTets.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h);
+    dev->destroyBuffer(bConstraint.h); dev->destroyBuffer(bForces.h); dev->destroyBuffer(bRefCounts.h);
+    dev->destroyBuffer(bBody2World.h); dev->destroyBuffer(bSolverBodyData.h);
+    dev->destroyBuffer(bSolverTxIData.h); dev->destroyBuffer(bSolverBodyIndices.h);
+    dev->destroyBuffer(bOutSolverVel.h); dev->destroyBuffer(bVelPool.h);
+    dev->destroyBuffer(bPrepDesc.h); dev->destroyBuffer(bPrePrepDesc.h);
+    dev->destroyBuffer(bSolverCoreDesc.h); dev->destroyBuffer(bSharedDesc.h);
+}
+
+
+// ---------------------------------------------------------------------------
+// An INACTIVE contact must contribute nothing — the solve's isActive guard.
+//
+// softBodySimRigidContactQuerySolve has both contacts active, so forcing the solve's
+// `if (isActive)` to `if (true)` changes nothing there and the mutant survives.  This
+// fixture is the complement: a single contact that is separating and unmarked, so the
+// query leaves it inactive and the solve must leave every buffer alone.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimRigidContactInactive)
+{
+    using namespace p80refit;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+
+    const float invMass = 0.5f;
+    std::vector<F4> simDeltaPos(4, F4{ 0.0f, 0.0f, 0.0f, invMass });
+    std::vector<F4> simDelta(4, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
+    std::vector<TetIdx4> simTets = { { 0u, 1u, 2u, 3u }, { 0u, 0u, 0u, 0u } };
+    DevBuf bSimDeltaPos = makeDev(dev, simDeltaPos), bSimDelta = makeDev(dev, simDelta);
+    DevBuf bTets = makeDev(dev, simTets);
+    if (!bSimDeltaPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    const float penBiasClampFEM = -1.0e10f;
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mSimTetIndices = reinterpret_cast<decltype(sb.mSimTetIndices)>(size_t(bTets.addr));
+    sb.mSimDeltaPos = reinterpret_cast<float4*>(size_t(bSimDeltaPos.addr));
+    sb.mSimDelta = reinterpret_cast<float4*>(size_t(bSimDelta.addr));
+    sb.mPenBiasClamp = penBiasClampFEM;
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ONE contact: separating (positive penetration) and NOT marked in-collision.
+    const uint32_t kN = 1u;
+    const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
+    std::vector<FemOtherContactInfoHost> infos(kN);
+    std::memset(infos.data(), 0, infos.size() * sizeof(FemOtherContactInfoHost));
+    infos[0].pairInd0 = staticNodeInd; infos[0].pairInd1 = 0u;
+    DevBuf bInfos = makeDev(dev, infos);
+    std::vector<uint32_t> numContacts = { kN };
+    DevBuf bNum = makeDev(dev, numContacts);
+
+    SbRigidConstraintHost blk;
+    std::memset(&blk, 0, sizeof(blk));
+    const float sqrtInvInertia[9] = { 2.0f, 0.1f, 0.0f, 0.1f, 1.5f, 0.2f, 0.0f, 0.2f, 1.0f };
+    const float penBiasClampRigid = -5.0f;
+    const F4 bary = { 0.25f, 0.25f, 0.25f, 0.25f };
+    p82dref::refPrepare(blk, 0, p82dref::V3{ 0.0f, -1.0f, 0.0f },
+                        p82dref::V3{ 0.5f, 0.30f, 0.7f }, /*pen*/ +0.05f,
+                        p82dref::V3{ 0, 0, 0 }, bary, p82dref::V3{ 0, 0, 0 }, 0.0f,
+                        penBiasClampRigid, sqrtInvInertia, penBiasClampFEM, true);
+    std::vector<uint8_t> constraintBytes(sizeof(SbRigidConstraintHost));
+    std::memcpy(constraintBytes.data(), &blk, sizeof(blk));
+    DevBuf bConstraint = makeDev(dev, constraintBytes);
+
+    std::vector<float> appliedForces = { 0.0f };
+    DevBuf bForces = makeDev(dev, appliedForces);
+    std::vector<uint32_t> refCounts = { 0u, 0u };
+    DevBuf bRefCounts = makeDev(dev, refCounts);
+    std::vector<F4> rigidDeltaVel(2u * kN, F4{ 9.f, 9.f, 9.f, 9.f });
+    DevBuf bRigidDeltaVel = makeDev(dev, rigidDeltaVel);
+
+    std::vector<F4> body2World = { { 0, 0, 0, 1 }, { 0, 0, 0, 0 } };
+    DevBuf bBody2World = makeDev(dev, body2World);
+    std::vector<uint8_t> solverBodyData(96, 0);
+    std::memcpy(solverBodyData.data() + 12, &penBiasClampRigid, 4);
+    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
+    std::vector<uint8_t> solverTxIData(64, 0);
+    std::memcpy(solverTxIData.data() + 28, sqrtInvInertia, 9 * 4);
+    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
+    std::vector<uint32_t> solverBodyIndices = { 0u };
+    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
+    std::vector<F4> outSolverVelocity(4, F4{ 0, 0, 0, 0 });
+    DevBuf bOutSolverVel = makeDev(dev, outSolverVelocity);
+    std::vector<F4> solverBodyVelPool(4, F4{ 0, 0, 0, 0 });
+    DevBuf bVelPool = makeDev(dev, solverBodyVelPool);
+
+    std::vector<uint8_t> prepDesc(304, 0);
+    sbPokePtr(prepDesc, 64, bSolverBodyData.addr);
+    sbPokePtr(prepDesc, 72, bSolverTxIData.addr);
+    sbPokePtr(prepDesc, 168, bBody2World.addr);
+    DevBuf bPrepDesc = makeDev(dev, prepDesc);
+    std::vector<uint8_t> prePrepDesc(760, 0);
+    sbPokePtr(prePrepDesc, 272, bSolverBodyIndices.addr);
+    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
+    std::vector<uint8_t> solverCoreDesc(320, 0);
+    sbPokePtr(solverCoreDesc, 0, bOutSolverVel.addr);
+    { const uint32_t one = 1u; std::memcpy(solverCoreDesc.data() + 268, &one, 4); }
+    DevBuf bSolverCoreDesc = makeDev(dev, solverCoreDesc);
+    std::vector<uint8_t> sharedDesc(224, 0);
+    sbPokePtr(sharedDesc, 160, bVelPool.addr);
+    DevBuf bSharedDesc = makeDev(dev, sharedDesc);
+
+    SbQueryPush qp = {};
+    qp.softbodies = bDesc.addr; qp.contactInfos = bInfos.addr; qp.constraints = bConstraint.addr;
+    qp.numContacts = bNum.addr; qp.prePrepDesc = bPrePrepDesc.addr;
+    qp.solverCoreDesc = bSolverCoreDesc.addr; qp.artiCoreDesc = 0ull;
+    qp.sharedDesc = bSharedDesc.addr; qp.dt = dt;
+    qp.appliedForces = bForces.addr; qp.rigidBodyReferenceCounts = bRefCounts.addr;
+    Kernel("softBodyRigidContactBda.spv", "sb_queryRigidSoftContactReferenceCountLaunch", {}, sizeof(SbQueryPush))
+        .dispatch(1u, {}, qp, 1u, 1u);
+    dev->flush();
+
+    SbSolvePush sp = {};
+    sp.softbodies = bDesc.addr; sp.contactInfos = bInfos.addr; sp.constraints = bConstraint.addr;
+    sp.numContacts = bNum.addr; sp.prePrepDesc = bPrePrepDesc.addr;
+    sp.solverCoreDesc = bSolverCoreDesc.addr; sp.artiCoreDesc = 0ull;
+    sp.sharedDesc = bSharedDesc.addr; sp.rigidDeltaVel = bRigidDeltaVel.addr;
+    sp.appliedForces = bForces.addr; sp.rigidBodyReferenceCounts = bRefCounts.addr;
+    sp.dt = dt; sp.materials = 0ull; sp.rigidBodyMaterials = 0ull;
+    Kernel("softBodyRigidContactBda.spv", "sb_solveRigidSoftCollisionLaunch", {}, sizeof(SbSolvePush))
+        .dispatch(1u, {}, sp, 1u, 1u);
+    dev->flush();
+
+    const auto gDelta = downloadBuffer<F4>(dev, bSimDelta.h, 4);
+    const auto gInfo = downloadBuffer<FemOtherContactInfoHost>(dev, bInfos.h, kN);
+    const auto gForces = downloadBuffer<float>(dev, bForces.h, kN);
+
+    PXG_CHECK_MSG((gInfo[0].rigidMatInd & 0x80000000u) == 0u,
+                  "a separating contact must not be marked in-collision -- if it is, this "
+                  "fixture's geometry is not separating and it tests nothing");
+    for (uint32_t v = 0; v < 4u; ++v)
+    {
+        PXG_CHECK_MSG(f2u(gDelta[v].w) == f2u(0.0f),
+                      "an inactive contact must not reference-count vertex %u (got %g)",
+                      v, gDelta[v].w);
+        PXG_CHECK_MSG(f2u(gDelta[v].x) == f2u(0.0f) && f2u(gDelta[v].y) == f2u(0.0f) &&
+                      f2u(gDelta[v].z) == f2u(0.0f),
+                      "an inactive contact must not move vertex %u (got %g, %g, %g)",
+                      v, gDelta[v].x, gDelta[v].y, gDelta[v].z);
+    }
+    PXG_CHECK_MSG(f2u(gForces[0]) == f2u(0.0f),
+                  "an inactive contact must not accumulate an applied force (got %g)", gForces[0]);
+
+    dev->destroyBuffer(bSimDeltaPos.h); dev->destroyBuffer(bSimDelta.h); dev->destroyBuffer(bTets.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h);
+    dev->destroyBuffer(bConstraint.h); dev->destroyBuffer(bForces.h); dev->destroyBuffer(bRefCounts.h);
+    dev->destroyBuffer(bRigidDeltaVel.h); dev->destroyBuffer(bBody2World.h);
+    dev->destroyBuffer(bSolverBodyData.h); dev->destroyBuffer(bSolverTxIData.h);
+    dev->destroyBuffer(bSolverBodyIndices.h); dev->destroyBuffer(bOutSolverVel.h);
+    dev->destroyBuffer(bVelPool.h); dev->destroyBuffer(bPrepDesc.h);
+    dev->destroyBuffer(bPrePrepDesc.h); dev->destroyBuffer(bSolverCoreDesc.h);
+    dev->destroyBuffer(bSharedDesc.h);
 }
 
 } // namespace
