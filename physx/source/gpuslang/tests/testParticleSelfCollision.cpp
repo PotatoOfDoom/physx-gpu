@@ -302,6 +302,123 @@ PXG_TEST(particleSelfCollisionNeighborSearch)
     dev->destroyBuffer(bColIdx.h); dev->destroyBuffer(bColForce.h); dev->destroyBuffer(bDesc.h);
 }
 
+// ---------------------------------------------------------------------------
+// DIVERGENT neighbour counts inside one subgroup.
+//
+// particleSelfCollisionNeighborSearch above gives every particle exactly ONE neighbour, so
+// its output-writing loop runs the same number of iterations in every lane.  That makes it
+// blind to a defect this port hit for real in softBodyContactRemapBda: llvmpipe drops a
+// loop's per-lane exit mask when the bound was redefined inside a conditional block that
+// also stores, and then every lane of the subgroup runs the trip count of the longest one.
+// With uniform counts that is invisible; the shape is present here, because
+// `totalCollidedParticles` is assigned inside the `if (globalThreadIndex < numParticles)`
+// block that also writes particleSelfCollisionCounts, and is then the bound of the output
+// loop below it.
+//
+// Three particles in ONE cell, arranged so the counts differ: particle 0 is within the
+// contact distance of both others, and the other two are NOT within it of each other.
+// cellWidthSq = 0.09, and the test is `distanceSq <= contactDistanceSq`:
+//   |p0-p1|^2 = 0.04, |p0-p2|^2 = 0.08  -> both overlap particle 0
+//   |p1-p2|^2 = 0.12                    -> p1 and p2 do not overlap
+// so the counts are (2, 1, 1) and lanes 0..2 of subgroup 0 have different trip counts.
+// The load-bearing assertion is on the SECOND output slot: only particle 0 may write it.
+// ---------------------------------------------------------------------------
+PXG_TEST(particleSelfCollisionDivergentCounts)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t N = 3;
+    const float cellWidth = 0.3f;            // cellWidthSq = 0.09
+    const uint32_t gs = 4;
+    const uint32_t numCells = gs * gs * gs;
+    const uint32_t EMPTY = 0xffffffffu;
+
+    // all three inside cell (0,0,0): every coordinate < cellWidth.
+    std::vector<F4> sortedPos(N);
+    sortedPos[0] = { 0.05f, 0.05f, 0.05f, 1.0f };
+    sortedPos[1] = { 0.25f, 0.05f, 0.05f, 1.0f };
+    sortedPos[2] = { 0.05f, 0.25f, 0.25f, 1.0f };
+
+    std::vector<uint32_t> sortedPhase(N, PHASE_SELF_COLLIDE);
+    std::vector<uint32_t> mapping = { 0u, 1u, 2u };
+    std::vector<uint32_t> cellStart(numCells, EMPTY);
+    std::vector<uint32_t> cellEnd(numCells, 0u);
+    cellStart[0] = 0u; cellEnd[0] = N;
+
+    const uint32_t maxNeighborhood = 8u;
+    std::vector<uint32_t> selfCount(N, 0xdeadbeefu);
+    std::vector<uint32_t> collisionIndex(N * maxNeighborhood, 0xccccccccu);
+    std::vector<F2> collisionForces(N * maxNeighborhood, { 7.0f, 7.0f });
+
+    DevBuf bPos = makeDev(dev, sortedPos);
+    DevBuf bPhase = makeDev(dev, sortedPhase);
+    DevBuf bMap = makeDev(dev, mapping);
+    DevBuf bStart = makeDev(dev, cellStart);
+    DevBuf bEnd = makeDev(dev, cellEnd);
+    DevBuf bCount = makeDev(dev, selfCount);
+    DevBuf bColIdx = makeDev(dev, collisionIndex);
+    DevBuf bColForce = makeDev(dev, collisionForces);
+
+    PxgParticleSystem ps = makeZeroDesc();
+    ps.mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    ps.mSortedPhaseArray = reinterpret_cast<PxU32*>(size_t(bPhase.addr));
+    ps.mSortedToUnsortedMapping = reinterpret_cast<PxU32*>(size_t(bMap.addr));
+    ps.mCellStart = reinterpret_cast<PxU32*>(size_t(bStart.addr));
+    ps.mCellEnd = reinterpret_cast<PxU32*>(size_t(bEnd.addr));
+    ps.mParticleSelfCollisionCount = reinterpret_cast<PxU32*>(size_t(bCount.addr));
+    ps.mCollisionIndex = reinterpret_cast<PxU32*>(size_t(bColIdx.addr));
+    ps.mDensityCollisionImpulses = reinterpret_cast<float2*>(size_t(bColForce.addr));
+    ps.mCommonData.mNumParticles = N;
+    ps.mCommonData.mGridCellWidth = cellWidth;
+    ps.mCommonData.mGridSizeX = gs;
+    ps.mCommonData.mGridSizeY = gs;
+    ps.mCommonData.mGridSizeZ = gs;
+    ps.mCommonData.mMaxNeighborhood = maxNeighborhood;
+    ps.mData.mSolidRestOffset = 0.1f;
+
+    std::vector<PxgParticleSystem> descArr = { ps };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    struct SelfPush { uint64_t particleSystems; uint32_t id; };
+    SelfPush push = { bDesc.addr, 0u };
+    Kernel("particleSelfCollisionBda.spv", "ps_selfCollisionLaunch", {}, sizeof(SelfPush))
+        .dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const auto gCount = downloadBuffer<uint32_t>(dev, bCount.h, N);
+    const auto gIdx = downloadBuffer<uint32_t>(dev, bColIdx.h, N * maxNeighborhood);
+    const auto gForce = downloadBuffer<F2>(dev, bColForce.h, N * maxNeighborhood);
+    std::printf("  counts = (%u, %u, %u)\n", gCount[0], gCount[1], gCount[2]);
+
+    PXG_CHECK_MSG(gCount[0] == 2u && gCount[1] == 1u && gCount[2] == 1u,
+                  "the fixture must produce DIVERGENT counts (2, 1, 1) or it tests nothing -- "
+                  "got (%u, %u, %u)", gCount[0], gCount[1], gCount[2]);
+    // slot k of particle p lives at p + k * numParticles.
+    PXG_CHECK_MSG(gIdx[0] == 1u && gIdx[0 + N] == 2u,
+                  "particle 0 must record both neighbours, got (%u, %u)", gIdx[0], gIdx[0 + N]);
+    PXG_CHECK_MSG(gIdx[1] == 0u && gIdx[2] == 0u,
+                  "particles 1 and 2 must each record particle 0, got (%u, %u)", gIdx[1], gIdx[2]);
+    // THE mask check: slot 1 belongs to particle 0 alone.  Every lane running particle 0's
+    // trip count would write slots 1 + N and 2 + N as well.
+    for (uint32_t p = 1; p < N; ++p)
+    {
+        PXG_CHECK_MSG(gIdx[p + N] == 0xccccccccu,
+                      "particle %u has ONE neighbour, so its second collisionIndex slot must "
+                      "stay untouched (got %u) -- the output loop ran a longer lane's trip "
+                      "count", p, gIdx[p + N]);
+        PXG_CHECK_MSG(f2u(gForce[p + N].x) == f2u(7.0f) && f2u(gForce[p + N].y) == f2u(7.0f),
+                      "particle %u has ONE neighbour, so its second collisionForces slot must "
+                      "stay at the sentinel (got %g, %g)", p, gForce[p + N].x, gForce[p + N].y);
+    }
+    // and the slots that SHOULD be written are zeroed
+    PXG_CHECK_MSG(f2u(gForce[0].x) == f2u(0.0f) && f2u(gForce[0 + N].x) == f2u(0.0f) &&
+                  f2u(gForce[1].x) == f2u(0.0f) && f2u(gForce[2].x) == f2u(0.0f),
+                  "every in-range collisionForces slot must be zeroed");
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bPhase.h); dev->destroyBuffer(bMap.h);
+    dev->destroyBuffer(bStart.h); dev->destroyBuffer(bEnd.h); dev->destroyBuffer(bCount.h);
+    dev->destroyBuffer(bColIdx.h); dev->destroyBuffer(bColForce.h); dev->destroyBuffer(bDesc.h);
+}
+
 // Helper: build a descriptor + material/phase-handle buffers for the solve path.
 struct SolveBufs
 {

@@ -1620,17 +1620,17 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
-## P8.2 tranche c — the sorted-order gather lands; the remap is ported but BLOCKED
+## P8.2 tranche c — BOTH chain kernels land, and two llvmpipe defects come out of it
 
 Chain kernels 3 and 4 were lifted from `npSbRemap.slang`'s unit-tested descriptor-set ports
-onto the BDA ABI, into the new `softBodyContactRemapBda.slang`. **One landed, one did not.**
+onto the BDA ABI, into the new `softBodyContactRemapBda.slang`.
 
 | kernel | ABI row | state |
 |---|---|---|
 | `sb_reorderPSContactsLaunch` | ten pointers, 80 B | **MAPPED**, tested, green |
-| `sb_other_contact_remap_to_simLaunch` | `{8,4,8,8,8,8,8}`, 56 B | ported, SPIR-V-valid, **NOT mapped** — faults |
+| `sb_other_contact_remap_to_simLaunch` | `{8,4,8,8,8,8,8}`, 56 B | **MAPPED**, tested, green |
 
-Manifest **MAPPED 225 → 226**; softbody **15 → 16 of 56**.
+Manifest **MAPPED 225 → 227**; softbody **15 → 17 of 56**.
 
 ### The reorder
 
@@ -1641,36 +1641,97 @@ is `(total + blockDim*gridDim - 1) / blockDim * gridDim` — **missing parenthes
 over-counts by roughly `gridDim²`. Harmless, because the loop returns on `index >= total`;
 the port keeps a plain bounded stride loop rather than reproducing the slip.
 
-### The remap: what is known, and what is not
+### The remap: two driver defects stacked on top of each other
 
-It SIGSEGVs on llvmpipe inside JIT-generated code on a worker thread (gdb shows an
-unsymbolised driver address and an empty host stack — a GPU-side fault, not a host bug). The
-manifest row is left `nullptr` and the unit test renamed `_DISABLED`, exactly how the tranche-6
-FEM solve was carried until a standalone repro cracked it.
+The remap was carried unmapped for a while behind a SIGSEGV, and the in-harness bisection
+recorded in the previous revision of this document was **wrong in every one of its
+exclusions** — it had ruled out the per-lane arrays, the dynamic indexing, the group size,
+both geometry helpers and the loop trip count, and concluded "llvmpipe miscompiles this loop
+nest". It does not. `tools/lvprepro/repro3` settled it in two runs, and there were two
+independent defects, neither of which is specific to this kernel.
 
-**The bisection is recorded in the shader header so the next attempt does not redo it.** A
-probe returning just before the candidate loop SURVIVES; a probe that enters the loop and
-immediately `continue`s FAULTS. Everything between has been excluded individually:
+**1. A conditional load is if-converted across its own null test.** `prevContactCount` is
+optional in CUDA (`prevContactCount ? *prevContactCount : 0`). Slang emits a real branch —
+`OpSelectionMerge` with the `OpLoad` inside the taken side, confirmed with `spirv-dis` — and
+the backend flattens it into an unconditional load plus a masked select, so the load runs on
+a null address *before* the test:
 
-- the 32-element per-candidate arrays → replaced by a single running best. Still faults.
-- dynamic indexing of those arrays → every index forced constant. Still faults.
-- group size → 512 threads (CUDA's block) and 64. Both fault.
-- `computeTetBarycentric` → stubbed to a constant. Still faults.
-- `guClosestPtPointTetrahedron` → stubbed to a constant. Still faults.
-- the candidate loop's trip count. Still faults.
+```
+mov   0x30(%rdx),%r10      ; r10 = prevContactCount == 0
+vmovd (%r10),%xmm1         ; <-- faults, BEFORE the null test
+neg   %r10 / sbb / kmovd   ; the "guard", evaluated afterwards
+```
 
-So it is not the arithmetic, not the helpers, not the private storage, not the indexing. The
-in-harness search space is exhausted, which is precisely the signal to leave the harness: the
-next step is `tools/lvprepro`, dispatching this `.spv` standalone against synthetic data — the
-harness that settled the `~3UL` trap.
+Speculating a load across a null test is illegal, and no arrangement of `if` / `?:` in the
+source forbids it, because the branch is already there. The fix has to remove the faulting
+*address*: **select the pointer, not the loaded value**, so one load reads something valid on
+both paths (`totalContactCount`, dereferenced unconditionally a line earlier, so never null)
+and a second select discards it. This is the stronger form of the speculated-load note in
+`softBodyContactGenBda`, where a zero-trip loop hid the load; here an explicit ternary did not
+stop it. **Any optionally-null device pointer in this port needs this shape, not a guard.**
 
-One deviation was introduced along the way and is worth keeping either way, since it is a
-strict simplification: the per-candidate state is a single running minimum rather than CUDA's
-32 per-lane registers. CUDA's reduction takes the lowest LANE among lanes tied at the global
-minimum; a flat scan takes the lowest CANDIDATE INDEX among candidates tied at it. Those agree
-whenever the minimum is unique, and can differ only on an exact float tie across different
-32-batches, i.e. only when a collision tet has more than 32 candidate sim tets. The
-containment path is untouched.
+This also explains why the bisection pointed the wrong way for so long. A read-only probe
+survived while adding a single store faulted, which reads as "stores are broken here" — and
+that is what put the blame on the arrays and the loop nest. But a read whose result is never
+stored is **dead-code eliminated**: only the version that keeps the descriptor reads *live*
+ever reaches the null load. Under DCE, "adding a store makes it fault" means "the reads
+before it were being deleted", not "the store is at fault". Worth remembering as a
+bisection rule, because it inverts the obvious reading.
+
+With the pointer selected, the per-lane arrays compile and run — verified standalone at
+range 1, 32, 33, 40 and 100 — so **the deviation reported last revision is withdrawn**. The
+kernel now keeps CUDA's 32 per-lane registers and both tie-breaks the warp reduction encodes
+are bit-exact. There is no remaining deviation in the reduction.
+
+**2. A loop loses its per-lane exit mask when the bound is redefined next to a store.** This
+one is SILENT — no fault, wrong results. Transcribing CUDA's contact-count clamp literally:
+
+```slang
+uint n = count[0];
+if (n > max) { n = max; if (firstThread) count[0] = max; }   // MISCOMPILED
+for (uint i = base; i < n; i += stride) { ... }
+```
+
+the whole first **subgroup** ran the loop once regardless of `n`. With 12 contacts declared
+and 3 after the clamp, lanes 0..7 all wrote barycentrics — for contacts 3..7 that are out of
+range — while every later lane correctly did nothing. The write-back itself was correct, so
+nothing reported an error. Splitting the block two ways shows the trigger is the
+**combination**: keeping the mutable `n` but lifting the store out is correct, and keeping the
+nested store but computing `n` with `min` is correct. Only a block that both redefines the
+enclosing loop's bound and stores is miscompiled. The kernel now uses a pure `min` plus a flat
+conditional store, which removes both halves, so a later refactor cannot resurrect it by
+undoing one.
+
+**Sweep for both defects across the shader tree.** Defect 1: the only other guarded-pointer
+sites (`npContactPrePrep.slang:970,973`, `broadphaseIncrementalHistogram.slang:190`) already
+select the *pointer*, which is the safe form. Defect 2 needs the loop — an **early return** in
+its place is unaffected, verified by patching this same kernel into that shape, which is why
+`npSbRemap.slang:275,382` need no change despite looking identical.
+`particleSelfCollisionBda.slang:305/320` does have the loop shape (an accumulator assigned in
+a storing conditional, then used as a bound) and is **verified clean**; its pre-existing
+fixture gave every lane the same trip count and so could not have seen the defect, and
+`particleSelfCollisionDivergentCounts` now pins it with counts that actually differ across
+lanes (2, 1, 1 in one subgroup).
+
+### Mutation coverage
+
+Ten mutants, nine killed. Four needed fixtures that did not exist: `softBodySimContactRemapToSim`
+gained a non-null `prevContactCount` case (the null half is what faulted, so both halves are
+now fenced), and the new `softBodySimContactRemapTieBreaks` supplies the geometry that makes
+the reduction's tie-breaks observable — 54 sim tets across three collision tets, with
+byte-identical duplicate tets placed 32 apart for a same-lane tie, 3 apart for a cross-lane
+tie, and two overlapping containing candidates for the ballot. It also checks that the clamped
+count **bounds the loop** rather than merely being written back, which is defect 2's regression
+fence.
+
+The one surviving mutant is `no-fallback-clamp`, and it **cannot** be killed: the clamp is
+provably a no-op, because `computeTetBarycentric` already clamps every component into [0,1]
+before returning (upstream's `deformableCollision.cuh:133` does the same, so this is CUDA's own
+double clamp, not something the port introduced), and the only value that never passes through
+that helper is the initial one, which is `float4(0,0,0,0)`. CUDA declares `float4 barycentric;`
+**uninitialised**, so upstream's clamp does have a job on the `range == 0` path; initialising
+instead is strictly better defined, and that is what makes the clamp redundant here rather than
+merely unexercised. Kept anyway as a backstop.
 
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.

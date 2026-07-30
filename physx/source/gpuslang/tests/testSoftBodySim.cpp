@@ -2508,12 +2508,7 @@ struct SbReorderPush
 };
 static_assert(sizeof(SbReorderPush) == 80, "sb reorder push blob must be 80 bytes");
 
-// NOT REGISTERED — the remap kernel is ported and SPIR-V-valid but faults on llvmpipe (see
-// softBodyContactRemapBda.slang's header for the bisection record).  The fixture is kept
-// intact and ready: rename to PXG_TEST once the fault is understood.  Same treatment as
-// softBodySimSolveProbe_DISABLED above, which is how the tranche-6 fault was carried until a
-// standalone repro cracked it.
-static void softBodySimContactRemapToSim_DISABLED()
+PXG_TEST(softBodySimContactRemapToSim)
 {
     using namespace p80refit;
     PxgSlangComputeDevice* dev = testDevice();
@@ -2627,12 +2622,225 @@ static void softBodySimContactRemapToSim_DISABLED()
         dev->destroyBuffer(bC2.h);
     }
 
+    // ---- prevContactCount, the pointer that must NOT be dereferenced when null ----
+    // Both halves of the pointer-select in the shader are exercised here: the dispatches
+    // above pass null (start at 0), this one passes a real pointer holding 1 so contact 0
+    // is left alone and only contact 1 is remapped.  Without both, a regression that
+    // simply ignored prevContactCount would pass -- and the null half is what faulted on
+    // llvmpipe, so the two cases together fence the fix from either side.
+    {
+        std::vector<F4> b3(4, F4{ -1, -1, -1, -1 });
+        DevBuf bB3 = makeDev(dev, b3);
+        // a FRESH info buffer: the dispatches above already rewrote pairInd1 in bInfo, and
+        // reusing it would hand this dispatch collision tet 1 (range 0) instead of tet 0,
+        // making the "contact 1 was processed" check pass on an empty candidate set.
+        std::vector<FemOtherContactInfoHost> i3 = infos;
+        DevBuf bI3 = makeDev(dev, i3);
+        std::vector<uint32_t> prev = { 1u, 0u, 0u, 0u };
+        DevBuf bPrev = makeDev(dev, prev);
+        SbRemapPush p3 = push;
+        p3.outBarycentric = bB3.addr;
+        p3.outContactInfo = bI3.addr;
+        p3.prevContactCount = bPrev.addr;
+        Kernel("softBodyContactRemapBda.spv", "sb_other_contact_remap_to_simLaunch", {}, sizeof(SbRemapPush))
+            .dispatch(1u, {}, p3, 1u, 1u);
+        dev->flush();
+        const auto g3 = downloadBuffer<F4>(dev, bB3.h, 4);
+        const auto gi3 = downloadBuffer<FemOtherContactInfoHost>(dev, bI3.h, 4);
+        PXG_CHECK_MSG(g3[0].x == -1.0f,
+                      "prevContactCount = 1 must SKIP contact 0, but its barycentric was "
+                      "written (%.4f)", g3[0].x);
+        PXG_CHECK_MSG(gi3[0].pairInd1 == 0u,
+                      "prevContactCount = 1 must leave contact 0's pairInd1 alone (got 0x%08x)",
+                      gi3[0].pairInd1);
+        // contact 1 still runs the full nearest-candidate search, so it must land on tet 1.
+        PXG_CHECK_MSG((gi3[1].pairInd1 & 0xfffffu) == 1u,
+                      "prevContactCount = 1 must still remap contact 1 to the nearest tet 1 "
+                      "(got tet %u)", gi3[1].pairInd1 & 0xfffffu);
+        PXG_CHECK_MSG(g3[1].x != -1.0f, "contact 1's barycentric must have been written");
+        dev->destroyBuffer(bB3.h); dev->destroyBuffer(bI3.h); dev->destroyBuffer(bPrev.h);
+    }
+
     dev->destroyBuffer(bSv.h); dev->destroyBuffer(bSt.h); dev->destroyBuffer(bRc.h);
     dev->destroyBuffer(bAr.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bPt.h);
     dev->destroyBuffer(bInfo.h); dev->destroyBuffer(bBary.h); dev->destroyBuffer(bCount.h);
 }
 
-static void (*sbKeepRemapFixtureReferenced)() = &softBodySimContactRemapToSim_DISABLED;
+// ===========================================================================
+// The three tie-breaks, and the accumulated-remap START index.
+//
+// softBodySimContactRemapToSim above pins the two OUTCOMES (containment wins; otherwise
+// the nearest candidate wins) but it cannot pin HOW a tie is broken: with three candidates
+// in one batch and no two of them equidistant, every plausible variant of the reduction
+// agrees.  Mutation-tested, four independent defects survived that fixture --
+// `<` weakened to `<=`, the winner scan's `break` dropped, the ballot's
+// "first hit wins" guard dropped, and startInd forced to 0 -- so each gets geometry here
+// that makes it observable:
+//
+//   contact 0 -> collision tet 0, candidates [0, 40): a SAME-LANE tie.  Candidates 5 and
+//     37 are byte-identical tets, 32 apart, so they land in the same lane in different
+//     batches and compare exactly equal.  `<` keeps the first, `<=` takes the second.
+//   contact 1 -> collision tet 1, candidates [40, 50): a CROSS-LANE tie.  Candidates 3
+//     and 6 of that range are byte-identical, so two lanes hold the equal minimum and only
+//     the scan's `break` makes the lower one win.  This contact also has a nonzero
+//     collision tet index, so a startInd forced to 0 searches the wrong candidate range
+//     and lands in contact 0's tets instead.
+//   contact 2 -> collision tet 2, candidates [50, 54): TWO CONTAINING candidates, a unit
+//     tet and a double-size tet sharing the origin corner.  Both contain the point, so
+//     only the ballot's first-hit guard decides, and the two give different barycentrics.
+//
+// The ties are exact because the tied candidates are the SAME tet duplicated at different
+// sim indices -- identical coordinates run identical arithmetic, so the comparison is
+// bit-equal without relying on any float coincidence.
+// ===========================================================================
+PXG_TEST(softBodySimContactRemapTieBreaks)
+{
+    using namespace p80refit;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // A unit tet whose closest point to the ORIGIN is its corner (dx, 0, 0): squared
+    // distance dx*dx, and identical dx gives a bit-identical tet.
+    std::vector<F4> simVerts;
+    std::vector<TetIdx4> simTets;
+    auto pushTet = [&](float ox, float oy, float oz, float s) {
+        const uint32_t base = uint32_t(simVerts.size());
+        simVerts.push_back(F4{ ox, oy, oz, 1.0f });
+        simVerts.push_back(F4{ ox + s, oy, oz, 1.0f });
+        simVerts.push_back(F4{ ox, oy + s, oz, 1.0f });
+        simVerts.push_back(F4{ ox, oy, oz + s, 1.0f });
+        simTets.push_back(TetIdx4{ base, base + 1u, base + 2u, base + 3u });
+    };
+
+    const uint32_t kNear = 5u, kNearTwin = 37u;        // same lane (32 apart), batches 0 and 1
+    for (uint32_t t = 0; t < 40u; ++t)
+        pushTet((t == kNear || t == kNearTwin) ? 2.0f : (6.0f + float(t)), 0.0f, 0.0f, 1.0f);
+    const uint32_t kCross = 43u, kCrossTwin = 46u;     // workIndex 3 and 6 -> different lanes
+    for (uint32_t t = 40u; t < 50u; ++t)
+        pushTet((t == kCross || t == kCrossTwin) ? 2.0f : (6.0f + float(t)), 0.0f, 0.0f, 1.0f);
+    pushTet(0.0f, 0.0f, 0.0f, 1.0f);                   // tet 50: unit tet at the origin
+    pushTet(0.0f, 0.0f, 0.0f, 2.0f);                   // tet 51: double-size, also contains
+    pushTet(20.0f, 0.0f, 0.0f, 1.0f);                  // tet 52: far
+    pushTet(30.0f, 0.0f, 0.0f, 1.0f);                  // tet 53: far
+    PXG_CHECK_MSG(simTets.size() == 54u, "the tie-break fixture needs 54 sim tets, built %zu",
+                  simTets.size());
+
+    // collision tet 0 -> [0,40), collision tet 1 -> [40,50), collision tet 2 -> [50,54).
+    std::vector<uint32_t> remapColToSim(54);
+    for (uint32_t i = 0; i < 54u; ++i) remapColToSim[i] = i;
+    std::vector<uint32_t> accumRemap = { 40u, 50u, 54u, 54u };   // inclusive prefix sum
+
+    DevBuf bSv = makeDev(dev, simVerts), bSt = makeDev(dev, simTets);
+    DevBuf bRc = makeDev(dev, remapColToSim), bAr = makeDev(dev, accumRemap);
+    if (!bSv.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mSimTetIndices = reinterpret_cast<decltype(sb.mSimTetIndices)>(size_t(bSt.addr));
+    sb.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bSv.addr));
+    sb.mTetsRemapColToSim = reinterpret_cast<PxU32*>(size_t(bRc.addr));
+    sb.mTetsAccumulatedRemapColToSim = reinterpret_cast<PxU32*>(size_t(bAr.addr));
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<F4> points = { { 0.0f, 0.0f, 0.0f, 0.0f },      // outside every candidate
+                               { 0.0f, 0.0f, 0.0f, 0.0f },
+                               { 0.1f, 0.1f, 0.1f, 0.0f },      // inside tets 50 AND 51
+                               { 0, 0, 0, 0 } };
+    DevBuf bPt = makeDev(dev, points);
+    std::vector<FemOtherContactInfoHost> infos(4);
+    std::memset(infos.data(), 0, infos.size() * sizeof(FemOtherContactInfoHost));
+    infos[0].pairInd1 = 0u;   // softbody 0, collision tet 0
+    infos[1].pairInd1 = 1u;   // softbody 0, collision tet 1
+    infos[2].pairInd1 = 2u;   // softbody 0, collision tet 2
+    DevBuf bInfo = makeDev(dev, infos);
+    std::vector<F4> bary(4, F4{ -1, -1, -1, -1 });
+    DevBuf bBary = makeDev(dev, bary);
+    std::vector<uint32_t> count = { 3u, 0u, 0u, 0u };
+    DevBuf bCount = makeDev(dev, count);
+
+    SbRemapPush push = {};
+    push.softbodies = bDesc.addr;
+    push.maxNumContacts = 64u;
+    push.point = bPt.addr;
+    push.outBarycentric = bBary.addr;
+    push.outContactInfo = bInfo.addr;
+    push.totalContactCount = bCount.addr;
+    push.prevContactCount = 0ull;
+
+    Kernel("softBodyContactRemapBda.spv", "sb_other_contact_remap_to_simLaunch", {}, sizeof(SbRemapPush))
+        .dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const auto gInfo = downloadBuffer<FemOtherContactInfoHost>(dev, bInfo.h, 4);
+    const auto gBary = downloadBuffer<F4>(dev, bBary.h, 4);
+    for (uint32_t i = 0; i < 3u; ++i)
+        std::printf("  contact %u -> sim tet %u, bary(%.4f, %.4f, %.4f, %.4f)\n",
+                    i, gInfo[i].pairInd1 & 0xfffffu, gBary[i].x, gBary[i].y, gBary[i].z, gBary[i].w);
+
+    PXG_CHECK_MSG((gInfo[0].pairInd1 & 0xfffffu) == kNear,
+                  "a SAME-LANE tie must keep the FIRST candidate (tet %u), not its twin 32 "
+                  "later (tet %u) -- got tet %u", kNear, kNearTwin, gInfo[0].pairInd1 & 0xfffffu);
+    PXG_CHECK_MSG((gInfo[1].pairInd1 & 0xfffffu) == kCross,
+                  "a CROSS-LANE tie must win on the LOWEST lane (tet %u), not the highest "
+                  "(tet %u) -- got tet %u; a startInd of 0 would land near tet %u instead",
+                  kCross, kCrossTwin, gInfo[1].pairInd1 & 0xfffffu, kNear);
+    PXG_CHECK_MSG((gInfo[2].pairInd1 & 0xfffffu) == 50u,
+                  "with two CONTAINING candidates the FIRST one (tet 50) must win, not the "
+                  "last (tet 51) -- got tet %u", gInfo[2].pairInd1 & 0xfffffu);
+    // tet 50 is the unit tet, so (0.1, 0.1, 0.1) has barycentric (0.7, 0.1, 0.1, 0.1);
+    // tet 51 is twice the size and would give (0.85, 0.05, 0.05, 0.05).  Checking the
+    // weights and not just the index keeps the containing-tet choice honest.
+    PXG_CHECK_MSG(std::fabs(gBary[2].x - 0.7f) < 1e-4f && std::fabs(gBary[2].y - 0.1f) < 1e-4f &&
+                  std::fabs(gBary[2].z - 0.1f) < 1e-4f && std::fabs(gBary[2].w - 0.1f) < 1e-4f,
+                  "the containing tet's barycentric must be (0.7, 0.1, 0.1, 0.1), got "
+                  "(%.4f, %.4f, %.4f, %.4f)", gBary[2].x, gBary[2].y, gBary[2].z, gBary[2].w);
+
+    // ---- the count clamp must actually BOUND the loop, not just write itself back ----
+    // The clamp write-back alone is checked in the fixture above.  What is checked here is
+    // that the clamped count is the value the loop USES: with 12 contacts declared and
+    // maxNumContacts 3, contacts 3..11 must be left untouched.  Deleting the clamp of the
+    // local `numContacts` -- while keeping the write-back -- is otherwise invisible.
+    {
+        const uint32_t kBig = 12u;
+        std::vector<F4> pB(kBig, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
+        DevBuf bPB = makeDev(dev, pB);
+        std::vector<FemOtherContactInfoHost> iB(kBig);
+        std::memset(iB.data(), 0, iB.size() * sizeof(FemOtherContactInfoHost));
+        DevBuf bIB = makeDev(dev, iB);
+        std::vector<F4> bB(kBig, F4{ -1, -1, -1, -1 });
+        DevBuf bBB = makeDev(dev, bB);
+        std::vector<uint32_t> cB = { kBig, 0u, 0u, 0u };
+        DevBuf bCB = makeDev(dev, cB);
+
+        SbRemapPush pC = push;
+        pC.maxNumContacts = 3u;
+        pC.point = bPB.addr;
+        pC.outContactInfo = bIB.addr;
+        pC.outBarycentric = bBB.addr;
+        pC.totalContactCount = bCB.addr;
+        Kernel("softBodyContactRemapBda.spv", "sb_other_contact_remap_to_simLaunch", {}, sizeof(SbRemapPush))
+            .dispatch(1u, {}, pC, 1u, 1u);
+        dev->flush();
+
+        const uint32_t back = downloadBuffer<uint32_t>(dev, bCB.h, 1)[0];
+        PXG_CHECK_MSG(back == 3u, "the over-large count must be clamped and written back "
+                                  "(12 -> 3), got %u", back);
+        const auto gB = downloadBuffer<F4>(dev, bBB.h, kBig);
+        for (uint32_t i = 0; i < 3u; ++i)
+            PXG_CHECK_MSG(gB[i].x != -1.0f, "contact %u is within the clamp and must be "
+                                            "remapped", i);
+        for (uint32_t i = 3u; i < kBig; ++i)
+            PXG_CHECK_MSG(gB[i].x == -1.0f,
+                          "contact %u is past the CLAMPED count and must be untouched, but its "
+                          "barycentric was written (%.4f) -- the clamp was written back without "
+                          "bounding the loop", i, gB[i].x);
+        dev->destroyBuffer(bPB.h); dev->destroyBuffer(bIB.h);
+        dev->destroyBuffer(bBB.h); dev->destroyBuffer(bCB.h);
+    }
+
+    dev->destroyBuffer(bSv.h); dev->destroyBuffer(bSt.h); dev->destroyBuffer(bRc.h);
+    dev->destroyBuffer(bAr.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bPt.h);
+    dev->destroyBuffer(bInfo.h); dev->destroyBuffer(bBary.h); dev->destroyBuffer(bCount.h);
+}
 
 PXG_TEST(softBodySimReorderPSContacts)
 {

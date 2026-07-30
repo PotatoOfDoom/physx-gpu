@@ -57,7 +57,8 @@
 //     nearest-point distances with the LOWEST index winning float-equal ties -- CUDA's
 //     warpReduction<MinOpFloat> contract;
 //   - the fallback CLAMPS the barycentric per component.  That clamp exists only in this
-//     kernel; the FEM variant has it commented out;
+//     kernel; the FEM variant has it commented out.  It is kept, and it is also provably
+//     dead -- see the write-up at the site for why, and why that is upstream's shape too;
 //   - the contact count is clamped to maxNumContacts and the clamp is WRITTEN BACK, once,
 //     by the first thread.
 //
@@ -66,7 +67,9 @@
 //     serially in per-lane arrays.  This is npSbRemap's proven lowering: the warp's
 //     cooperation is over CANDIDATES, which one thread can enumerate in the same order,
 //     and it removes every barrier and ballot from the kernel.  Coverage is identical --
-//     both forms visit every contact in [startIndex, numContacts) exactly once;
+//     both forms visit every contact in [startIndex, numContacts) exactly once.  The
+//     per-lane state is kept as real 32-element arrays, so both tie-breaks the warp
+//     reduction encodes stay bit-exact; softBodySimContactRemapTieBreaks pins them;
 //   - the grid is reproduced as constants.  The engine hard-codes grid 1024 x block
 //     (WARP_SIZE, 16) for the remap and grid 1024 x block 256 for the reorder, and the
 //     bridge forwards only gridDim;
@@ -76,26 +79,34 @@
 //     gridDim^2.  It is harmless because the loop returns on `index >= total`; the port
 //     keeps the plain bounded stride loop rather than reproducing the arithmetic slip.
 //
-// *** THE REMAP ENTRY POINT IS NOT MAPPED.  IT COMPILES, IT VALIDATES, IT FAULTS. ***
-// sb_other_contact_remap_to_simLaunch SIGSEGVs on llvmpipe inside JIT-generated code on a
-// worker thread (gdb: an unsymbolised address in the driver, host stack empty), and the
-// cause is not yet understood.  It is therefore left as a nullptr row in the manifest and
-// its unit test is renamed _DISABLED, exactly as the tranche-6 FEM solve was carried until a
-// standalone repro cracked it.  sb_reorderPSContactsLaunch below IS mapped and green.
+// TWO llvmpipe DEFECTS WERE FOUND HERE, and both are general enough that the next kernel
+// in this port will meet them.  Each is written up at its own site below; this is the index.
 //
-// BISECTION RECORD, so the next attempt does not redo it.  A probe that returns just before
-// the candidate loop SURVIVES; a probe that enters the loop and immediately `continue`s
-// FAULTS.  Everything between those two points has been excluded individually:
-//   - the 32-element per-candidate arrays: replaced by a single running best.  Still faults;
-//   - dynamic indexing of those arrays: every index forced to a constant.  Still faults;
-//   - group size: 512 threads (CUDA's block) and 64 threads.  Both fault;
-//   - computeTetBarycentric: stubbed to a constant.  Still faults;
-//   - guClosestPtPointTetrahedron: stubbed to a constant.  Still faults;
-//   - the candidate loop's trip count.  Still faults.
-// So it is not the arithmetic, not the helpers, not the private storage and not the indexing
-// -- it is something about this loop nest that llvmpipe miscompiles, and the in-harness
-// search space is exhausted.  The next step is tools/lvprepro: dispatch this .spv standalone
-// against synthetic data, which is what settled the ~3UL trap.
+//   1. A SPECULATED LOAD THROUGH A NULL POINTER, and the reason a guard does not stop it.
+//      This kernel SIGSEGVd on every dispatch.  Slang emits a proper branch around the
+//      optional `prevContactCount` read -- `OpSelectionMerge` with the `OpLoad` inside the
+//      taken side, confirmed with spirv-dis -- and llvmpipe's backend if-converts it into an
+//      unconditional load plus a masked select, so the load runs on a null address before
+//      the test.  The fix cannot be in the control flow; it has to remove the faulting
+//      address, by selecting the POINTER and loading once from something valid on both
+//      paths.  See the write-up at the `prevAddr` select.
+//
+//      This also explains a bisection that pointed the wrong way for a long time.  A
+//      read-only probe survived while adding a single store faulted, which read as "stores
+//      are broken here" and led to blaming the per-candidate arrays, the helpers, the group
+//      size and the loop nest -- all of them wrongly.  A read whose result is never stored
+//      is dead-code eliminated: only the version that keeps the descriptor reads LIVE ever
+//      reaches the null load.  Under DCE, "adding a store makes it fault" means "the reads
+//      before it were being deleted", not "the store is at fault".
+//
+//   2. A DROPPED PER-LANE LOOP MASK when one block both redefines a loop bound and stores.
+//      With the count clamp written as CUDA writes it, the whole first subgroup ran the
+//      contact loop once regardless of the bound, silently writing barycentrics for
+//      out-of-range contacts.  See the write-up at the clamp.
+//
+// Both were cornered with tools/lvprepro/repro3, which dispatches this .spv standalone
+// against synthetic data -- the same tool that settled the ~3UL trap.  Neither was findable
+// from inside the test harness, because both are shaped like an ordinary port bug.
 //
 // NoContraction-stamped (PXG_NOCONTRACT_SHADERS): the barycentric determinants and the
 // closest-point dots are dot-of-cross chains that would otherwise fuse to FMAs, and the
@@ -262,18 +273,55 @@ ConstantBuffer<SbRemapParams> gRm;
 [numthreads(64, 1, 1)]   // == SB_REMAP_BLOCK; see the note there on why not CUDA's 512
 void sb_other_contact_remap_to_simLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
-    uint numContacts = Ptr<uint>(gRm.totalContactCount)[0];
-    if (numContacts > gRm.maxNumContacts)
-    {
-        numContacts = gRm.maxNumContacts;
-        // The clamp write-back happens exactly once (CUDA: warp 0, lane 0).
-        if (gid.x == 0u && gtid.x == 0u)
-            Ptr<uint>(gRm.totalContactCount)[0] = gRm.maxNumContacts;
-    }
+    // CUDA writes this as one block -- `if (n > max) { n = max; if (warp0 && lane0) *total =
+    // max; }` -- and transcribing it literally MISCOMPILES on llvmpipe.  With a declared
+    // count of 12 clamped to 3, the first SUBGROUP (8 lanes) all ran the contact loop once
+    // and stored, while every later lane correctly did nothing: the loop's per-lane exit
+    // mask is dropped for the subgroup that has any active lane.  The write-back itself was
+    // correct, so the symptom is silent -- out-of-range contacts get barycentrics written,
+    // and nothing reports an error.  Reproduced standalone in tools/lvprepro/repro3.
+    //
+    // The trigger is the COMBINATION, verified by splitting it two ways: keeping the
+    // mutable `numContacts` but lifting the store out of the block is correct, and keeping
+    // the nested store but computing the count with `min` is correct.  Only a block that
+    // both redefines the enclosing loop's bound AND stores is miscompiled.  The form below
+    // removes both halves, so a later refactor cannot resurrect it by undoing one:
+    // `numContacts` is a pure `min` with no phi, and the write-back is a flat conditional.
+    //
+    // Semantics are unchanged from CUDA: min() is the clamp, and the write-back still fires
+    // only when the clamp actually bit, exactly once, from the first thread.
+    const uint rawCount = Ptr<uint>(gRm.totalContactCount)[0];
+    const uint numContacts = min(rawCount, gRm.maxNumContacts);
+    if (rawCount > gRm.maxNumContacts && gid.x == 0u && gtid.x == 0u)
+        Ptr<uint>(gRm.totalContactCount)[0] = gRm.maxNumContacts;
     // prevContactCount is OPTIONAL in CUDA (`prevContactCount ? *prevContactCount : 0`),
-    // so a null pointer means "start at 0" and must not be dereferenced.  See the
-    // speculated-load note in softBodyContactGenBda: the guard is not optional here.
-    const uint startIndex = (gRm.prevContactCount != 0UL) ? Ptr<uint>(gRm.prevContactCount)[0] : 0u;
+    // so a null pointer means "start at 0" and must not be dereferenced.
+    //
+    // SELECT THE POINTER, NOT THE LOADED VALUE.  Guarding the load with a branch is not
+    // enough here, and the reason is worth spelling out because it costs a day to
+    // rediscover.  Slang does emit a real branch -- `OpSelectionMerge` with the
+    // `OpLoad` inside the taken side, verified with spirv-dis -- but llvmpipe's LLVM
+    // backend if-converts it into an unconditional load plus a masked select:
+    //
+    //     mov  0x30(%rdx),%r10        ; r10 = prevContactCount == 0
+    //     vmovd (%r10),%xmm1          ; <-- faults, BEFORE the null test
+    //     neg  %r10 / sbb / kmovd     ; the "guard", evaluated afterwards
+    //
+    // Speculating a load across a null test is illegal, but the driver does it, and no
+    // arrangement of `if`/`?:` in the source can forbid it -- the branch is already
+    // there.  So the fix cannot live in the control flow: it has to remove the faulting
+    // ADDRESS.  Selecting the pointer first leaves exactly one load, from an address
+    // that is valid on both paths (totalContactCount was just dereferenced
+    // unconditionally, so it is never null), and the result is discarded by the second
+    // select.  Whether the driver speculates is then irrelevant.
+    //
+    // This is the stronger form of the speculated-load note in softBodyContactGenBda:
+    // there a zero-trip loop hid the load, here an explicit ternary did not stop it.
+    // Any optionally-null device pointer in this port needs THIS shape, not a guard.
+    const uint64_t prevAddr =
+        (gRm.prevContactCount != 0UL) ? gRm.prevContactCount : gRm.totalContactCount;
+    const uint prevRaw = Ptr<uint>(prevAddr)[0];
+    const uint startIndex = (gRm.prevContactCount != 0UL) ? prevRaw : 0u;
 
     Ptr<PxgSoftBodyGpu> softbodies = Ptr<PxgSoftBodyGpu>(gRm.softbodies);
     const uint stride = SB_REMAP_GRID * SB_REMAP_BLOCK;
@@ -298,29 +346,29 @@ void sb_other_contact_remap_to_simLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
         const uint range = endInd - startInd;
         const uint nbIterations = (range + 31u) / 32u;
 
-        // A SINGLE running best, not CUDA's 32 per-lane registers.
+        // CUDA's 32 per-lane registers, mirrored exactly -- same as npSbRemap's
+        // descriptor-set port.  Declared INSIDE the strided loop, unlike npSbRemap: there
+        // one thread handles one contact, here a thread revisits the loop for
+        // contactIndex + stride and the per-lane minima must start over each time.
         //
-        // npSbRemap's descriptor-set port keeps `uint laneSimTet[32]; float4 laneBary[32];
-        // float laneSqDist[32]` to mirror the warp exactly.  Those arrays cannot survive
-        // here: bisected, a probe returning before the candidate loop survives while a probe
-        // that merely ENTERS the loop and immediately continues faults, at 512 and at 64
-        // threads per group and with every array index forced to a constant.  It is the live
-        // arrays across the loop nest that llvmpipe cannot compile, not their indexing --
-        // the same family as the indexed-local-array landmine documented in
-        // softBodySolveBda's scatter.
-        //
-        // DEVIATION, and its exact scope: CUDA keeps a per-lane minimum, so lane l competes
-        // over candidates {l, l+32, l+64, ...} and the final reduction takes the lowest LANE
-        // among lanes tied at the global minimum.  A flat running minimum with a strict `<`
-        // takes the lowest CANDIDATE INDEX among candidates tied at the global minimum.
-        // Whenever the minimum is unique -- which is every case that is not an exact float
-        // tie -- both pick the same tetrahedron.  They can differ only on an exact tie
-        // between two candidates in different 32-batches, i.e. only when range > 32.  The
-        // containment path is untouched: it still takes the lowest-indexed containing
-        // candidate of the FIRST batch that has any hit, batch by batch.
-        uint bestSimTet = 0xffffffffu;
-        float4 bestBary = float4(0, 0, 0, 0);
-        float bestSqDist = PX_MAX_F32_LOCAL;
+        // These arrays were briefly replaced by a single flat running minimum, on the
+        // conclusion that llvmpipe could not compile them -- a probe entering the
+        // candidate loop faulted while a probe returning before it survived.  That was a
+        // misreading of the null prevContactCount load above: the arrays make the
+        // descriptor reads live, a read whose result is never stored is dead-code
+        // eliminated, and only the live version reached the speculated load.  With the
+        // pointer selected instead of the value, the arrays compile and run -- verified
+        // standalone at range = 1, 32, 33, 40 and 100 -- so there is no deviation to
+        // document here and the warp reduction stays bit-exact.
+        uint laneSimTet[32];
+        float4 laneBary[32];
+        float laneSqDist[32];
+        for (uint li = 0u; li < 32u; ++li)
+        {
+            laneSimTet[li] = 0xffffffffu;
+            laneBary[li] = float4(0, 0, 0, 0);
+            laneSqDist[li] = PX_MAX_F32_LOCAL;
+        }
 
         bool valid = false;
         for (uint j = 0; j < nbIterations && !valid; ++j)
@@ -346,13 +394,13 @@ void sb_other_contact_remap_to_simLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
                     const float3 tmpClosest = guClosestPtPointTetrahedron(contact, a, b, c, d);
                     const float3 v = contact - tmpClosest;
                     const float tmpDist = dot(v, v);
-                    if (tmpDist < bestSqDist)
+                    if (tmpDist < laneSqDist[l])
                     {
-                        bestSqDist = tmpDist;
-                        bestSimTet = tmpSimTetInd;
+                        laneSqDist[l] = tmpDist;
+                        laneSimTet[l] = tmpSimTetInd;
                         float4 cb;
                         computeTetBarycentric(a, b, c, d, tmpClosest, cb);
-                        bestBary = cb;
+                        laneBary[l] = cb;
                     }
                 }
                 else if (hitLane == 0xffffffffu)   // ballot: the LOWEST hitting candidate wins
@@ -372,12 +420,33 @@ void sb_other_contact_remap_to_simLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
 
         if (!valid)
         {
-            // The running minimum already IS warpReduction<MinOpFloat>'s result (see the
-            // deviation note above).  The per-component clamp exists ONLY in this kernel --
-            // the FEM variant has it commented out -- and dropping it silently changes the
-            // weights the solve applies.
-            const float4 bary = clamp(bestBary, float4(0, 0, 0, 0), float4(1, 1, 1, 1));
-            Ptr<uint>(ciBase + 8UL)[0] = encodeSoftBody(softbodyId, bestSimTet);
+            // warpReduction<MinOpFloat>: the global minimum, and among lanes holding a
+            // float-equal minimum the LOWEST lane wins -- the `break` is what encodes that
+            // tie-break, so it is load-bearing, not an early-out optimisation.
+            float best = PX_MAX_F32_LOCAL;
+            for (uint l = 0; l < 32u; ++l) best = min(best, laneSqDist[l]);
+            uint winner = 0u;
+            for (uint l = 0; l < 32u; ++l)
+                if (laneSqDist[l] == best) { winner = l; break; }
+
+            // This clamp is kept for line-for-line fidelity with CUDA
+            // (softbodyPrimitives.cu:2261) but it is PROVABLY A NO-OP here, and the mutation
+            // run says so: deleting it is the one mutant of ten that no fixture kills.  That
+            // is not a gap in the fixtures -- it cannot be killed, for two independent
+            // reasons:
+            //   - computeTetBarycentric already clamps every component into [0,1] before
+            //     returning (deformableCollision.cuh:133 does the same, so this is upstream's
+            //     own double clamp, not something the port introduced);
+            //   - the only value that never passed through that helper is the initial one,
+            //     and it is float4(0,0,0,0) -- already in range.  CUDA declares `float4
+            //     barycentric;` UNINITIALISED (softbodyPrimitives.cu:2187), so upstream's
+            //     clamp does have a job on the range == 0 path: it bounds whatever was in the
+            //     register.  Initialising instead of clamping is strictly better defined, and
+            //     it is what makes the clamp redundant here rather than merely unexercised.
+            // Deliberately not removed: it costs nothing, and the day computeTetBarycentric is
+            // re-synced to a version without the internal clamp, this is the backstop.
+            const float4 bary = clamp(laneBary[winner], float4(0, 0, 0, 0), float4(1, 1, 1, 1));
+            Ptr<uint>(ciBase + 8UL)[0] = encodeSoftBody(softbodyId, laneSimTet[winner]);
             Ptr<float4>(gRm.outBarycentric)[contactIndex] = bary;
         }
     }
