@@ -1773,12 +1773,57 @@ So tranche d/e will pay off, and the settle assertion in tranche e has a working
 source to build on. `PXG_SB_PLANE` stays default-off until the solve kernels land, so the
 recorded free-fall baseline remains the control; tranche e flips it on.
 
+### Verification of the probe change
+
+The probe touches only `sdktest/testGpuSdkStep.cpp`, which is not part of the ctest binary, so
+the suite cannot be affected by it -- re-run anyway rather than argued away:
+
+```
+suite, default memory mode   674/674
+rigid regression             8 scenes x 2 solvers = 16/16
+clothdrape                   mean y 1.5000 -> -0.0000; rest |dy| over the last 45 steps 0.000000
+clothselfcollide             settled ON the rest distance: min y 5.0999 vs 5.1000 expected
+softbody                     coll mean y 4.0000 -> -0.9867, sim mean y identical, skin gap 0.00000
+particle                     mean y 100.7500 -> 80.9665
+cloth / clothhang            free fall and drape unchanged
+```
+
+Every scene value is byte-identical to the recorded baseline, which is the point: the plane is
+default-off, and with it ON the fall is byte-identical too.
+
 ### Proposed tranche cuts
 
 - **tranche d — kernel 5 alone.** Smallest (~67 lines), and 6 and 7 both consume its
-  `PxgFemRigidConstraintBlock` output, so it must be right first. Independently verifiable
-  without any of the others: dispatch it on synthetic contacts and check the constraint block
-  fields against a CPU transcription, the way the cloth prepare fixture does.
+  `PxgFemRigidConstraintBlock` output, so it must be right first. The body maps onto
+  `cloth_rigidContactPrepareLaunch` almost line for line; what actually differs is small and
+  enumerable: `PxgSoftBodyGpu` for `PxgFEMClothGpu`, `PXG_BITSHIFT_TET_ID` (20) /
+  `PX_MAX_NB_DEFORMABLE_VOLUME_TET` for the cloth id shift and triangle mask (both already
+  defined in softBodyContactRemapBda), `mSimDeltaPos` (@128) for `mAccumulatedDeltaPos`,
+  `mSimTetIndices` (@80) for `mTriangleVertexIndices`, and an UNCONDITIONAL 4-weight
+  barycentric projection where the cloth version branches on `barycentric.w == 0` between a
+  3-weight blend and a direct vertex read. `mPenBiasClamp` is already mirrored (@324).
+  The out-of-range action is `continue` on `tetInd == 0xfffff` and `return` on
+  `workIndex >= tNumContacts` -- both, exactly as CUDA has them.
+
+  **`invDt` and `isTGS` are dead parameters.** They are in the CUDA arg pack and therefore in
+  the ABI row, but `prepareFEMContacts` never reads them: brace-matched over its whole
+  122-line body (deformableUtils.cuh:132-253) they appear on the signature line only. The
+  cloth port omitting them from its helper is correct, not a deferral. `bodySims` IS read, at
+  :162, but only inside `if (rigidId.isArticulation())` -- the branch the cloth port already
+  defers, and a static plane floor never takes it.
+
+  **One decision to make first: `prepareFEMContacts` has to be shared, not copied.** It is 78
+  lines (femClothRigidContactBda.slang:280-357) and the softbody kernel needs it byte-for-byte.
+  Its dependencies are already half-shared: `PxgConstraintPrepareDescGpu` and
+  `PxgPrePrepDescGpu` live in `pxgSlangPrepDesc.slang` and `nodeIndex` in `pxgSlangCommon.slang`,
+  while `computeBasisVectors`, `nodeIsStaticBody`, `dotVec`, `crossVec` and the `FRC_*` field
+  offsets are still file-local. Extract those plus the helper into a shared module (the
+  precedent is `pxgSlangAtomicFloat.slang` from P8.1) and import it from both shaders. Copying
+  instead would leave two 78-line constraint-block writers to keep in sync, which is exactly
+  what rots. The risk of touching a green shader is covered cheaply: the cloth kernels are
+  NoContraction-stamped with bit-exact fixtures, so an extraction that perturbs them by one
+  bit fails immediately.
+
 - **tranche e — kernels 6 and 7 together, plus the plane floor and the settle assertion.**
   They share one descriptor set and 7's correctness depends on 6's reference counts, so
   splitting them buys little and doubles the fixture work. The payoff — a softbody cube that
