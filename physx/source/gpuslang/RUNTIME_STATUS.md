@@ -1699,6 +1699,22 @@ thread 0 meets the guard on its first iteration and the contact on its second. W
 that contact is silently dropped, which in a large scene means contacts vanishing behind an
 invalid one.
 
+### Verification
+
+```
+suite, BOTH memory modes     674/674 (default and PXG_DEVICE_V2=1)
+rigid regression             8 scenes x 2 solvers = 16/16
+mutation                     7 of 7 killed
+clothdrape                   mean y 1.5000 -> -0.0000; rest |dy| over the last 45 steps 0.000000
+clothselfcollide             min y 5.0999 vs 5.1000 expected (mean 5.1106, shelf 5.00)
+softbody                     coll mean y 4.0000 -> -0.9867, sim mean y identical, skin gap 0.00000
+cloth / clothhang            free fall and drape unchanged
+```
+
+Every scene value is byte-identical to its recorded baseline. The softbody scene is
+unchanged on purpose: kernel 5 prepares constraints that nothing consumes yet, so the cube
+must still free-fall to exactly -0.98675. It does.
+
 The CPU reference is a second, independent transcription of `prepareFEMContacts`;
 `testFemClothSim.cpp` carries one too. Since the shader-side function is now shared, that
 duplication is a CROSS-CHECK rather than a risk: two independently written references verify
@@ -1913,6 +1929,27 @@ default-off, and with it ON the fall is byte-identical too.
   They share one descriptor set and 7's correctness depends on 6's reference counts, so
   splitting them buys little and doubles the fixture work. The payoff — a softbody cube that
   actually settles — lands here, which is also where the scene change belongs.
+
+  **It starts with the same extraction tranche d did, and the pieces are already identified.**
+  `femClothRigidContactBda.slang` keeps four things file-local that the softbody kernels need
+  verbatim, and one that they do not:
+
+  | file-local in the cloth shader | lines | tranche e |
+  |---|---|---|
+  | `RigidState` + `readRigidVelocity` (:298) | ~55 | EXTRACT — the PxgVelocityReader analogue, PGS/TGS selection included |
+  | `ContactResult` + `contactInitialize` (:364) | ~125 | EXTRACT — FEMCollision::initialize, operates on the constraint block and the rigid state, deformable-agnostic |
+  | `getGlobalRigidBodyId` (:520) | ~12 | EXTRACT |
+  | `readClothVertexInvMasses` (:480) | ~40 | LEAVE — cloth-specific; the softbody needs its own four-vertex tet reader |
+
+  So roughly 190 more lines join `pxgSlangFemRigidContact`, and the softbody side writes only
+  its own inverse-mass reader plus the two kernel bodies. The SPIR-V-identity check that
+  guarded tranche d's extraction applies unchanged and is now a one-liner to re-run: compile
+  each cloth entry point before and after and `cmp` the .spv.
+
+  The four per-vertex reference-count atomics in kernel 6 —
+  `atomicAdd(&softbody.mSimDelta[tetId.*].w, 1.0f)` guarded by `bc.* > 1e-3f &&
+  deformableInvMasses.* != 0` — land exactly on `pxgAtomicAddF4W` from P8.1, and the rigid
+  one is a plain uint atomic. No new atomic infrastructure is needed.
 
 ### What could still make this drag
 
