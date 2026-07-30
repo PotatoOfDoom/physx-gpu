@@ -1620,6 +1620,105 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.2 tranche e — MILESTONE: the softbody cube SETTLES on a plane
+
+Chain kernels 6 and 7 are mapped, so the softbody-vs-rigid contact path runs end to end for
+the first time. Manifest **MAPPED 228 -> 232** (query and solve, each in a PGS and a TGS
+variant); softbody **18 -> 22 of 56**. All seven chain kernels are in.
+
+| kernel | ABI row | blob |
+|---|---|---|
+| `sb_queryRigidSoftContactReferenceCountLaunch{,TGS}` | `{8,8,8,8,8,8,8,8,4,8,8}` | 88 B |
+| `sb_solveRigidSoftCollisionLaunch{,TGS}` | `{8,8,8,8,8,8,8,8,8,8,8,4,8,8}` | 112 B |
+
+### KEY EVIDENCE — the settle
+
+```
+step  49   caught, 32 contacts
+step 100   y = 0.49443  (dy = -0.00002)
+step 150+  y = 0.49753  (dy =  0.00000)   -- at rest
+           sim y-extent 0.99749 = 0.25% compression under its own weight
+CAUGHT by the plane and SETTLED: mean y 0.49753, rest |dy| over the last 50 steps = 0.000002
+```
+
+Settled at **y = 0.49753** against the ideal 0.5 for a unit cube resting on y=0; the
+difference is elastic compression, not error. With the plane off the cube still free-falls to
+exactly -0.98675, so the control is intact.
+
+The scene default rises to **200 steps** when the plane is on. The cube is not caught until
+step ~49 and does not come to rest until ~150, so the old 60-step default measured the
+bounce. That misread cost a round: the first 90-step run looked like "catches but
+oscillates" and was simply not converged.
+
+### contactInitialize was NOT deformable-agnostic, contrary to the recon
+
+The tranche-d recon predicted `contactInitialize` could be extracted unchanged. It could not:
+the mass-splitting term is a 3-wide dot for a triangle and 4-wide for a tetrahedron, which is
+exactly where CUDA templates `FEMCollision` on `PxVec3` / `PxVec4`. Rather than a float4
+signature with a dummy `w` that every cloth caller must remember to zero -- and where a
+garbage `w` of `inf` would poison the product -- that scalar is now a PARAMETER and each
+caller computes its own width.
+
+The cost is that byte-identity no longer holds for the three cloth entry points that call it:
+they grow by 32 bytes, which is **exactly 3 extra `OpLoad` with every arithmetic opcode
+unchanged** (opcode-histogram diff), i.e. data movement across a function boundary and
+nothing else. `cloth_rigidContactPrepareLaunch` is still byte-identical, and the cloth
+fixtures compare bit-exactly against a CPU reference and stay green.
+
+### Mutation: 8 distinct mutants, 6 killed, 2 provably equivalent
+
+The scene alone killed only 4. Three unit fixtures were built for the rest, and each exposed
+that the previous assertion was too coarse:
+
+| mutant | killed by |
+|---|---|
+| drop a reference-count bump | the scene: never settles, \|dy\| stays 0.0049 |
+| don't mark the contact in-collision | the scene: falls through |
+| drop the position-delta scatter | the scene: never settles |
+| unsign the delta | the scene: explodes to -46220 |
+| drop the mass-splitting multiply | `softBodySimRigidContactQuerySolve` with a FULL CPU reference |
+| drop the applied-force write-back | the same fixture |
+| delete a `bc > 1e-3` gate (x or w) | `softBodySimRigidContactStaysActive`, two weights at 0.0005 |
+| — | — |
+| ignore `wasActive` | EQUIVALENT |
+| force the solve's `isActive` guard | EQUIVALENT |
+
+**The two survivors are equivalent, verified at the source rather than assumed.**
+`contactInitialize` computes `isActive = wasActive || (CN < 0)` itself and returns early on
+`!isActive` with a zero lambda. So the outer `if (wasActive)` shortcut cannot change the
+answer, and forcing the solve's `if (isActive)` writes back zeros and the unchanged
+accumulated force. Both are upstream's shape and are kept as the shortcuts they are.
+
+**Three mistakes worth recording, each caught by the next test rather than by inspection:**
+
+1. The mass-split check was a RATIO between vertices. A dropped reference-count factor scales
+   every vertex identically, so the ratio is unchanged and the mutant walked through. Killing
+   it needed `refSolvePGS`, a full CPU transcription of the solve, and an absolute comparison.
+2. The `bc > 1e-3` gate was untested because every barycentric weight in every fixture was
+   above it. Two weights are now below, on two DIFFERENT components, since the four gates are
+   four separate lines of code and testing one leaves the others free to be deleted.
+3. The first solve fixture passed the SOLVER normal as +Y, which models a ceiling. The deltas
+   pointed down, correctly, and the assertion was wrong. A floor gives -Y, because prepare
+   negates the contact normal.
+
+### Verification
+
+```
+suite, BOTH memory modes     674/674 (default and PXG_DEVICE_V2=1)
+rigid regression             8 scenes x 2 solvers = 16/16
+mutation                     6 of 8 killed, 2 provably equivalent
+softbody (plane OFF)         4.0000 -> -0.98675, 0.0000% off the closed form
+softbody (PXG_SB_PLANE=1)    caught step 49, settled y = 0.49753, rest |dy| = 0.000002
+```
+
+**One open point, recorded rather than dismissed.** On the FIRST default-mode suite run of
+this tranche, `gpuslang.npRigidSumBatches` died with SEGFAULT -- one failure in six full-suite
+runs this session. It is not reproducible: the suite rerun is 674/674, 40 targeted runs of
+that test under concurrent suite load are clean, and memory was 14.5 GB free at the time.
+The shader is also untouched by this work -- it does not import the new module and its `.spv`
+is dated from an earlier phase. Treated as a pre-existing intermittent, not a regression, but
+it is a real one-off SEGFAULT and should be re-checked if it recurs.
+
 ## P8.2 tranche d — chain kernel 5 lands, and prepareFEMContacts becomes shared
 
 `sb_rigidContactPrepareLaunch` (softBody.cu:773, launch PxgSoftBodyCore.cpp:2239) is mapped
@@ -2089,8 +2188,8 @@ mapped; three remain:
 | 3 | `sb_other_contact_remap_to_simLaunch` | mapped (this tranche) |
 | 4 | `sb_reorderPSContactsLaunch` | mapped (this tranche) |
 | 5 | `sb_rigidContactPrepareLaunch` | mapped (tranche d) |
-| 6 | `sb_queryRigidSoftContactReferenceCountLaunch` | not started |
-| 7 | `sb_solveRigidSoftCollisionLaunch` | not started |
+| 6 | `sb_queryRigidSoftContactReferenceCountLaunch` | mapped (tranche e) |
+| 7 | `sb_solveRigidSoftCollisionLaunch` | mapped (tranche e) |
 
 So the softbody cube still does not settle, and cannot until 5-7 land — the contacts are now
 correctly addressed and correctly ordered, but nothing consumes them yet. The GJK/EPA tranche
