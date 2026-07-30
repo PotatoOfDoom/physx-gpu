@@ -48,6 +48,7 @@
 #include "PxActor.h"                         // PxActorFlag::eDISABLE_GRAVITY
 #include "PxDeformableBodyFlag.h"            // PxDeformableBodyFlag::eKINEMATIC / eENABLE_SPECULATIVE_CCD
 #include "PxDeformableVolumeFlag.h"          // PxDeformableVolumeFlag::ePARTIALLY_KINEMATIC
+#include "PxgSolverBody.h"                   // PxgSolverBodyData / PxgSolverTxIData (P8.2 tranche d)
 
 #include <cstdint>
 #include <cstddef>
@@ -3560,6 +3561,510 @@ PXG_TEST(softBodySimUpdateTetModelVerts)
     dev->destroyBuffer(bTets.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bBary.h);
     dev->destroyBuffer(bSimPos.h); dev->destroyBuffer(bCollPos.h);
     dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+// ===========================================================================
+// P8.2 tranche d — sb_rigidContactPrepareLaunch (softBody.cu:773), chain kernel 5.
+//
+// Turns a generated softbody-vs-rigid contact into a solver constraint: the response terms
+// scaled by the rigid body's sqrt inverse inertia, the error, and the penetration-bias
+// clamp, written into the block-of-32 PxgFemRigidConstraintBlock that kernels 6 and 7 read.
+//
+// The CPU reference below is a second, independent transcription of prepareFEMContacts
+// (deformableUtils.cuh:132) -- testFemClothSim.cpp carries one too, for the cloth kernel.
+// That duplication is deliberate here and is a CROSS-CHECK rather than a risk: since
+// tranche d the shader-side function is SHARED (pxgSlangFemRigidContact), so the two
+// fixtures verify one implementation from two independently written references. A mistake
+// in either reference shows up as a failure, not as two tests agreeing on a wrong answer.
+// (The references are not shared because each test file carries its own F4 / f2u
+// vocabulary; unifying that is a separate cleanup with no bearing on shipped code.)
+// ===========================================================================
+struct SbRigidConstraintHost
+{
+    F4 raXn_resp[32];          // @0
+    F4 raXnF0_resp[32];        // @512
+    F4 raXnF1_resp[32];        // @1024
+    F4 normal_errorW[32];      // @1536
+    F4 fricTan0_invMass0[32];  // @2048
+    F4 barycentric[32];        // @2560
+    float maxPenBias[32];      // @3072 -> 3200
+};
+static_assert(sizeof(SbRigidConstraintHost) == 3200, "PxgFemRigidConstraintBlock sizeof == 3200");
+static_assert(offsetof(SbRigidConstraintHost, normal_errorW) == 1536, "normal_errorW @1536");
+static_assert(offsetof(SbRigidConstraintHost, maxPenBias) == 3072, "maxPenBias @3072");
+
+struct SbPrepPush
+{
+    uint64_t softbodies, contacts, normalPens, barycentrics, contactInfos, numContacts;
+    uint64_t constraints, prePrepDesc, prepDesc, rigidAppliedForces;
+    float invDt; uint32_t pad84;
+    uint64_t sharedDesc;
+    uint32_t isTGS, pad100;
+};
+static_assert(sizeof(SbPrepPush) == 104, "sb prepare push blob must be 104 bytes");
+static_assert(offsetof(SbPrepPush, invDt) == 80, "invDt @80");
+static_assert(offsetof(SbPrepPush, sharedDesc) == 88, "sharedDesc @88");
+static_assert(offsetof(SbPrepPush, isTGS) == 96, "isTGS @96");
+
+namespace p82dref
+{
+struct V3 { float x, y, z; };
+static V3 cross3(V3 a, V3 b) { return V3{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+static float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static V3 mat33Mul(const float m[9], V3 v)
+{
+    return V3{ m[0] * v.x + m[3] * v.y + m[6] * v.z,
+               m[1] * v.x + m[4] * v.y + m[7] * v.z,
+               m[2] * v.x + m[5] * v.y + m[8] * v.z };
+}
+// PxComputeBasisVectors (PxMathUtils.h:297).
+static void computeBasis(V3 dir, V3& right, V3& up)
+{
+    if (std::fabs(dir.y) <= 0.9999f)
+    {
+        right = V3{ dir.z, 0.0f, -dir.x };
+        const float m = std::sqrt(right.x * right.x + right.y * right.y + right.z * right.z);
+        if (m > 0.0f) right = V3{ right.x / m, right.y / m, right.z / m };
+        up = V3{ dir.y * right.z, dir.z * right.x - dir.x * right.z, -dir.y * right.x };
+    }
+    else
+    {
+        right = V3{ 1.0f, 0.0f, 0.0f };
+        up = V3{ 0.0f, dir.z, -dir.y };
+        const float m = std::sqrt(up.x * up.x + up.y * up.y + up.z * up.z);
+        if (m > 0.0f) up = V3{ up.x / m, up.y / m, up.z / m };
+    }
+}
+// prepareFEMContacts (deformableUtils.cuh:132) — rigid / static (non-articulation) path.
+static void refPrepare(SbRigidConstraintHost& c, int slot, V3 normal, V3 p, float pen, V3 delta,
+                       F4 barycentric, V3 bodyFrameP, float invMass0, float penBiasClampRigid,
+                       const float sqrtInvInertia[9], float penBiasClampFEM, bool isStatic)
+{
+    V3 t0, t1;
+    computeBasis(normal, t0, t1);
+    const bool isKinematic = (invMass0 == 0.0f) && (!isStatic);
+
+    const V3 ra = V3{ p.x - bodyFrameP.x, p.y - bodyFrameP.y, p.z - bodyFrameP.z };
+    const V3 raXn = cross3(ra, normal);
+    const V3 raXF0 = cross3(ra, t0);
+    const V3 raXF1 = cross3(ra, t1);
+
+    const V3 raXnSI = mat33Mul(sqrtInvInertia, raXn);
+    const float resp0 = dot3(raXnSI, raXnSI) + invMass0;
+    const V3 raXF0SI = mat33Mul(sqrtInvInertia, raXF0);
+    const V3 raXF1SI = mat33Mul(sqrtInvInertia, raXF1);
+    const float respF0 = dot3(raXF0SI, raXF0SI) + invMass0;
+    const float respF1 = dot3(raXF1SI, raXF1SI) + invMass0;
+
+    if (isKinematic)
+    {
+        c.raXn_resp[slot] = F4{ raXn.x, raXn.y, raXn.z, resp0 };
+        c.raXnF0_resp[slot] = F4{ raXF0.x, raXF0.y, raXF0.z, respF0 };
+        c.raXnF1_resp[slot] = F4{ raXF1.x, raXF1.y, raXF1.z, respF1 };
+    }
+    else
+    {
+        c.raXn_resp[slot] = F4{ raXnSI.x, raXnSI.y, raXnSI.z, resp0 };
+        c.raXnF0_resp[slot] = F4{ raXF0SI.x, raXF0SI.y, raXF0SI.z, respF0 };
+        c.raXnF1_resp[slot] = F4{ raXF1SI.x, raXF1SI.y, raXF1SI.z, respF1 };
+    }
+    c.normal_errorW[slot] = F4{ normal.x, normal.y, normal.z, pen + dot3(delta, normal) };
+    c.fricTan0_invMass0[slot] = F4{ t0.x, t0.y, t0.z, invMass0 };
+    c.maxPenBias[slot] = (penBiasClampRigid > penBiasClampFEM) ? penBiasClampRigid : penBiasClampFEM;
+    c.barycentric[slot] = barycentric;
+}
+} // namespace p82dref
+
+static void sbPokePtr(std::vector<uint8_t>& b, size_t off, uint64_t v) { std::memcpy(b.data() + off, &v, 8); }
+
+PXG_TEST(softBodySimRigidContactPrepare)
+{
+    using namespace p80refit;   // F4 / TetIdx4 / makeDev / makeZeroDesc vocabulary
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // --- one sim tet, with a DISTINCT delta per vertex ---------------------
+    // The four deltas differ in every component so the FOUR-weight barycentric projection
+    // is observable: dropping the w term, or reusing the triangle projection, lands on a
+    // different `delta` and therefore a different error in normal_errorW.w.
+    std::vector<F4> simDeltaPos = {
+        { 0.0100f, -0.0200f,  0.0300f, 0.5f },
+        { 0.0700f,  0.0110f, -0.0250f, 0.5f },
+        { -0.0400f, 0.0620f,  0.0170f, 0.5f },
+        { 0.0230f, -0.0510f,  0.0880f, 0.5f },
+        { 9.0f, 9.0f, 9.0f, 9.0f },            // trailer: must never be read
+    };
+    std::vector<TetIdx4> simTets = { { 0u, 1u, 2u, 3u }, { 0u, 0u, 0u, 0u } };
+    DevBuf bDelta = makeDev(dev, simDeltaPos), bTets = makeDev(dev, simTets);
+    if (!bDelta.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    // The two clamps must DIFFER, or max() and min() agree and the choice is untestable.
+    const float penBiasClampFEM = -1.0e10f;
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mSimTetIndices = reinterpret_cast<decltype(sb.mSimTetIndices)>(size_t(bTets.addr));
+    sb.mSimDeltaPos = reinterpret_cast<float4*>(size_t(bDelta.addr));
+    sb.mPenBiasClamp = penBiasClampFEM;
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // --- two contacts: one real, one naming the INVALID tet ---------------
+    // The second exists to pin that the appliedForces slot is cleared for EVERY in-range
+    // contact BEFORE the tet guard, and that the guard is `continue` (the thread keeps
+    // striding) rather than `return`.
+    float rawN[3] = { 0.2f, 0.9f, 0.3f };
+    const float nmag = std::sqrt(rawN[0] * rawN[0] + rawN[1] * rawN[1] + rawN[2] * rawN[2]);
+    const p82dref::V3 planeNormal = { rawN[0] / nmag, rawN[1] / nmag, rawN[2] / nmag };
+    const float restW = 0.0125f;    // NON-zero: pen = normal_pen.w - rest must be observable
+    const float penW = -0.0200f;
+    const F4 bary = { 0.4f, 0.2f, 0.3f, 0.1f };   // all four weights nonzero and distinct
+
+    // A THIRD contact at index 33, so the block/offset split has teeth: 33 lands in block 1
+    // slot 1.  With everything at index 0 both `workIndex / 32` and `workIndex & 31` are 0,
+    // and flattening either one is invisible.  Contacts 1..32 are skipped (invalid tet), so
+    // only 0 and 33 write.
+    const uint32_t kSecond = 33u;
+    const uint32_t kN = kSecond + 1u;
+    const F4 bary2 = { 0.1f, 0.5f, 0.15f, 0.25f };
+    const float restW2 = 0.0075f, penW2 = -0.031f;
+    float rawN2[3] = { -0.4f, 0.8f, 0.45f };
+    const float nmag2 = std::sqrt(rawN2[0] * rawN2[0] + rawN2[1] * rawN2[1] + rawN2[2] * rawN2[2]);
+    const p82dref::V3 planeNormal2 = { rawN2[0] / nmag2, rawN2[1] / nmag2, rawN2[2] / nmag2 };
+
+    std::vector<F4> contacts(kN, F4{ 1.0f, 1.0f, 1.0f, 0.0f });
+    std::vector<F4> normalPens(kN, F4{ 0.0f, 1.0f, 0.0f, -0.1f });
+    std::vector<F4> barycentrics(kN, F4{ 1.0f, 0.0f, 0.0f, 0.0f });
+    contacts[0] = F4{ 0.5f, -0.02f, 0.7f, restW };
+    normalPens[0] = F4{ planeNormal.x, planeNormal.y, planeNormal.z, penW };
+    barycentrics[0] = bary;
+    contacts[kSecond] = F4{ -0.3f, 0.11f, 0.45f, restW2 };
+    normalPens[kSecond] = F4{ planeNormal2.x, planeNormal2.y, planeNormal2.z, penW2 };
+    barycentrics[kSecond] = bary2;
+
+    const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
+    std::vector<FemOtherContactInfoHost> infos(kN);
+    std::memset(infos.data(), 0, infos.size() * sizeof(FemOtherContactInfoHost));
+    for (uint32_t i = 0; i < kN; ++i)
+    {
+        infos[i].pairInd0 = staticNodeInd;
+        infos[i].pairInd1 = 0x000fffffu;   // softbody 0, tet 0xfffff -> SKIPPED
+    }
+    infos[0].pairInd1 = 0u;            // softbody 0, sim tet 0
+    infos[kSecond].pairInd1 = 0u;      // softbody 0, sim tet 0
+
+    DevBuf bContacts = makeDev(dev, contacts), bNormalPens = makeDev(dev, normalPens);
+    DevBuf bBary = makeDev(dev, barycentrics), bInfos = makeDev(dev, infos);
+    std::vector<uint32_t> numContacts = { kN };
+    DevBuf bNum = makeDev(dev, numContacts);
+
+    // TWO blocks: contact 33 writes block 1, so a single block would be an out-of-bounds
+    // write and the block-index check below would be testing nothing.
+    std::vector<uint8_t> constraintBytes(2u * sizeof(SbRigidConstraintHost), 0xCD);
+    DevBuf bConstraint = makeDev(dev, constraintBytes);
+    // seeded NON-zero so the unconditional clear is observable for every in-range contact
+    std::vector<float> appliedForces(kN + 1u, 0.0f);
+    for (uint32_t i = 0; i < kN; ++i) appliedForces[i] = 100.0f + float(i);
+    appliedForces[kN] = 789.0f;   // past the count: must survive
+    DevBuf bForces = makeDev(dev, appliedForces);
+
+    // --- static-body frame / mass / inertia (solver body 0) ---------------
+    std::vector<F4> body2World = { { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
+    DevBuf bBody2World = makeDev(dev, body2World);
+    const float penBiasClampRigid = -5.0f;   // > penBiasClampFEM, so max() picks THIS one
+    std::vector<uint8_t> solverBodyData(96, 0);
+    std::memcpy(solverBodyData.data() + 12, &penBiasClampRigid, 4);   // penBiasClamp @12
+    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
+    // a NON-zero, non-symmetric-looking sqrtInvInertia so the response rows have teeth.
+    const float sqrtInvInertia[9] = { 2.0f, 0.1f, 0.0f, 0.1f, 1.5f, 0.2f, 0.0f, 0.2f, 1.0f };
+    std::vector<uint8_t> solverTxIData(64, 0);
+    std::memcpy(solverTxIData.data() + 28, sqrtInvInertia, 9 * 4);    // sqrtInvInertia @28
+    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
+    std::vector<uint32_t> solverBodyIndices = { 0u };   // never dereferenced for a static body
+    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
+
+    std::vector<uint8_t> prepDesc(304, 0);
+    sbPokePtr(prepDesc, 64, bSolverBodyData.addr);      // solverBodyDataPool @64
+    sbPokePtr(prepDesc, 72, bSolverTxIData.addr);       // solverBodyTxIDataPool @72
+    sbPokePtr(prepDesc, 168, bBody2World.addr);         // body2WorldPool @168
+    DevBuf bPrepDesc = makeDev(dev, prepDesc);
+    std::vector<uint8_t> prePrepDesc(760, 0);
+    sbPokePtr(prePrepDesc, 272, bSolverBodyIndices.addr);   // solverBodyIndices @272
+    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
+
+    SbPrepPush pp = {};
+    pp.softbodies = bDesc.addr; pp.contacts = bContacts.addr; pp.normalPens = bNormalPens.addr;
+    pp.barycentrics = bBary.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
+    pp.constraints = bConstraint.addr; pp.prePrepDesc = bPrePrepDesc.addr;
+    pp.prepDesc = bPrepDesc.addr; pp.rigidAppliedForces = bForces.addr;
+    pp.invDt = 60.0f;            // DEFERRED: unread, as in CUDA
+    pp.sharedDesc = 0ull;        // DEFERRED: articulation-only, must not be dereferenced
+    pp.isTGS = 0u;
+
+    Kernel("softBodyRigidContactBda.spv", "sb_rigidContactPrepareLaunch", {}, sizeof(SbPrepPush))
+        .dispatch(1u, {}, pp, 1u, 1u);
+    dev->flush();
+
+    // ---- CPU reference -------------------------------------------------
+    // the FOUR-weight projection of mSimDeltaPos through the tet's vertices
+    const p82dref::V3 delta = {
+        simDeltaPos[0].x * bary.x + simDeltaPos[1].x * bary.y + simDeltaPos[2].x * bary.z + simDeltaPos[3].x * bary.w,
+        simDeltaPos[0].y * bary.x + simDeltaPos[1].y * bary.y + simDeltaPos[2].y * bary.z + simDeltaPos[3].y * bary.w,
+        simDeltaPos[0].z * bary.x + simDeltaPos[1].z * bary.y + simDeltaPos[2].z * bary.z + simDeltaPos[3].z * bary.w,
+    };
+    SbRigidConstraintHost refC;
+    std::memset(&refC, 0xCD, sizeof(refC));
+    const p82dref::V3 solverNormal = { -planeNormal.x, -planeNormal.y, -planeNormal.z };
+    const float pen = penW - restW;
+    p82dref::refPrepare(refC, 0, solverNormal, p82dref::V3{ contacts[0].x, contacts[0].y, contacts[0].z },
+                        pen, delta, bary, p82dref::V3{ 0, 0, 0 }, /*invMass0*/ 0.0f,
+                        penBiasClampRigid, sqrtInvInertia, penBiasClampFEM, /*isStatic*/ true);
+
+    // the second contact's reference, in block 1 slot 1
+    const p82dref::V3 delta2 = {
+        simDeltaPos[0].x * bary2.x + simDeltaPos[1].x * bary2.y + simDeltaPos[2].x * bary2.z + simDeltaPos[3].x * bary2.w,
+        simDeltaPos[0].y * bary2.x + simDeltaPos[1].y * bary2.y + simDeltaPos[2].y * bary2.z + simDeltaPos[3].y * bary2.w,
+        simDeltaPos[0].z * bary2.x + simDeltaPos[1].z * bary2.y + simDeltaPos[2].z * bary2.z + simDeltaPos[3].z * bary2.w,
+    };
+    SbRigidConstraintHost refC2;
+    std::memset(&refC2, 0xCD, sizeof(refC2));
+    p82dref::refPrepare(refC2, int(kSecond & 31u),
+                        p82dref::V3{ -planeNormal2.x, -planeNormal2.y, -planeNormal2.z },
+                        p82dref::V3{ contacts[kSecond].x, contacts[kSecond].y, contacts[kSecond].z },
+                        penW2 - restW2, delta2, bary2, p82dref::V3{ 0, 0, 0 }, 0.0f,
+                        penBiasClampRigid, sqrtInvInertia, penBiasClampFEM, true);
+
+    const auto gBytes = downloadBuffer<uint8_t>(dev, bConstraint.h, 2u * sizeof(SbRigidConstraintHost));
+    SbRigidConstraintHost gotC, gotC1;
+    std::memcpy(&gotC, gBytes.data(), sizeof(gotC));
+    std::memcpy(&gotC1, gBytes.data() + sizeof(gotC), sizeof(gotC1));
+    const auto gForces = downloadBuffer<float>(dev, bForces.h, kN + 1u);
+
+    size_t mm = 0;
+    auto cmp4 = [&](const char* nm, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm; std::printf("  prep %s MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm,
+                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
+    };
+    cmp4("raXn_resp", refC.raXn_resp[0], gotC.raXn_resp[0]);
+    cmp4("raXnF0_resp", refC.raXnF0_resp[0], gotC.raXnF0_resp[0]);
+    cmp4("raXnF1_resp", refC.raXnF1_resp[0], gotC.raXnF1_resp[0]);
+    cmp4("normal_errorW", refC.normal_errorW[0], gotC.normal_errorW[0]);
+    cmp4("fricTan0_invMass0", refC.fricTan0_invMass0[0], gotC.fricTan0_invMass0[0]);
+    cmp4("barycentric", refC.barycentric[0], gotC.barycentric[0]);
+    if (f2u(refC.maxPenBias[0]) != f2u(gotC.maxPenBias[0]))
+    { ++mm; std::printf("  prep maxPenBias MM: ref %g got %g\n", refC.maxPenBias[0], gotC.maxPenBias[0]); }
+    PXG_CHECK_MSG(mm == 0, "sb_rigidContactPrepareLaunch bit-exact vs CPU (%zu mismatches)", mm);
+
+    // teeth: the sqrtInvInertia matrix must actually be exercised
+    PXG_CHECK_MSG(f2u(gotC.raXn_resp[0].x) != 0u || f2u(gotC.raXn_resp[0].y) != 0u ||
+                  f2u(gotC.raXn_resp[0].z) != 0u,
+                  "the prepared raXn response must be non-zero (sqrtInvInertia teeth)");
+    // the NEGATION: the stored normal is the negated contact normal, not the raw one.
+    PXG_CHECK_MSG(f2u(gotC.normal_errorW[0].x) == f2u(-planeNormal.x),
+                  "the constraint normal must be the NEGATED contact normal (got %g, raw %g)",
+                  gotC.normal_errorW[0].x, planeNormal.x);
+    // pen - rest: with restW nonzero, forgetting the subtraction shifts the error by restW.
+    PXG_CHECK_MSG(f2u(gotC.normal_errorW[0].w) != f2u(penW + p82dref::dot3(delta, solverNormal)),
+                  "the error must use pen - restDistance, not the raw penetration");
+
+    // the pen-bias clamp is the MAX of the two, and they differ, so min() lands elsewhere
+    PXG_CHECK_MSG(f2u(gotC.maxPenBias[0]) == f2u(penBiasClampRigid),
+                  "maxPenBias must be max(rigid %g, FEM %g) = %g, got %g",
+                  penBiasClampRigid, penBiasClampFEM, penBiasClampRigid, gotC.maxPenBias[0]);
+
+    // ---- the block / offset split: contact 33 belongs in BLOCK 1, SLOT 1 ----------
+    size_t mm2 = 0;
+    auto cmp4b = [&](const char* nm, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm2; std::printf("  prep[33] %s MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm,
+                             r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
+    };
+    const int sl = int(kSecond & 31u);
+    cmp4b("raXn_resp", refC2.raXn_resp[sl], gotC1.raXn_resp[sl]);
+    cmp4b("normal_errorW", refC2.normal_errorW[sl], gotC1.normal_errorW[sl]);
+    cmp4b("fricTan0_invMass0", refC2.fricTan0_invMass0[sl], gotC1.fricTan0_invMass0[sl]);
+    cmp4b("barycentric", refC2.barycentric[sl], gotC1.barycentric[sl]);
+    PXG_CHECK_MSG(mm2 == 0, "contact 33 must land in constraint BLOCK 1 SLOT 1, bit-exact "
+                            "(%zu mismatches) -- a flattened block index or a zeroed offset "
+                            "writes somewhere else", mm2);
+    // and slot 0 of block 1 must still hold the sentinel: nothing wrote there
+    PXG_CHECK_MSG(f2u(gotC1.barycentric[0].x) == f2u(gotC1.raXn_resp[0].x),
+                  "block 1 slot 0 must be untouched (only contact 33 writes block 1)");
+
+    // contacts 1..32 named the invalid tet: SKIPPED, so block 0 slot 1 keeps the sentinel...
+    PXG_CHECK_MSG(f2u(gotC.normal_errorW[1].x) == f2u(gotC.barycentric[1].x),
+                  "the skipped contact must not have written its constraint slot");
+    // ...but every in-range applied-force slot was still cleared, because the clear precedes
+    // the guard.
+    for (uint32_t i = 0; i < kN; ++i)
+        PXG_CHECK_MSG(f2u(gForces[i]) == 0u,
+                      "applied forces must be cleared for EVERY in-range contact, including "
+                      "the ones the tet guard skips (slot %u = %g)", i, gForces[i]);
+    PXG_CHECK_MSG(f2u(gForces[kN]) == f2u(789.0f),
+                  "the slot past the contact count must be untouched (got %g)", gForces[kN]);
+
+    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bTets.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bContacts.h); dev->destroyBuffer(bNormalPens.h); dev->destroyBuffer(bBary.h);
+    dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bConstraint.h);
+    dev->destroyBuffer(bForces.h); dev->destroyBuffer(bBody2World.h);
+    dev->destroyBuffer(bSolverBodyData.h); dev->destroyBuffer(bSolverTxIData.h);
+    dev->destroyBuffer(bSolverBodyIndices.h); dev->destroyBuffer(bPrepDesc.h);
+    dev->destroyBuffer(bPrePrepDesc.h);
+}
+
+// ---------------------------------------------------------------------------
+// The invalid-tet guard is `continue`, not `return` -- and why that needs its own fixture.
+//
+// In softBodySimRigidContactPrepare above, every thread handles exactly ONE contact, so
+// `continue` and `return` are indistinguishable: there is nothing after the skip for the
+// thread to do.  Mutation-tested, replacing continue with return survives that fixture
+// untouched.  The difference only appears once a thread handles TWO contacts, i.e. once
+//   nbIterationsPerBlock = ceil(ceil(N / 256) / 1024) > 1,
+// which needs N > 262144.  A real scene reaches that easily (maxDeformableVolumeContacts
+// defaults to 1M); a unit fixture cannot allocate for it.
+//
+// It does not have to.  Only the COUNT has to be large -- the buffers only have to cover the
+// indices actually touched.  With gridX = 1 the workIndex is `i * 256 + gtid`, so the single
+// dispatched group touches 0..511 and nothing else, whatever N says.  So: declare 262145
+// contacts, allocate 512, put the INVALID tet at index 0 and a VALID contact at index 256.
+// Thread 0 meets the guard on its first iteration and the real contact on its second.
+// With `continue` the constraint at 256 is written; with `return` it is silently dropped,
+// which in a large scene means contacts vanish behind an invalid one.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimRigidContactPrepareStride)
+{
+    using namespace p80refit;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    std::vector<F4> simDeltaPos = {
+        { 0.0100f, -0.0200f,  0.0300f, 0.5f }, {  0.0700f, 0.0110f, -0.0250f, 0.5f },
+        { -0.0400f, 0.0620f,  0.0170f, 0.5f }, {  0.0230f, -0.0510f, 0.0880f, 0.5f },
+    };
+    std::vector<TetIdx4> simTets = { { 0u, 1u, 2u, 3u }, { 0u, 0u, 0u, 0u } };
+    DevBuf bDelta = makeDev(dev, simDeltaPos), bTets = makeDev(dev, simTets);
+    if (!bDelta.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    const float penBiasClampFEM = -1.0e10f;
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mSimTetIndices = reinterpret_cast<decltype(sb.mSimTetIndices)>(size_t(bTets.addr));
+    sb.mSimDeltaPos = reinterpret_cast<float4*>(size_t(bDelta.addr));
+    sb.mPenBiasClamp = penBiasClampFEM;
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    const uint32_t kTouched = 512u;      // what gridX = 1 actually reaches
+    const uint32_t kDeclared = 262145u;  // > 256 * 1024 -> nbIterationsPerBlock == 2
+    const uint32_t kHit = 256u;          // thread 0's SECOND iteration
+
+    float rawN[3] = { 0.2f, 0.9f, 0.3f };
+    const float nmag = std::sqrt(rawN[0] * rawN[0] + rawN[1] * rawN[1] + rawN[2] * rawN[2]);
+    const p82dref::V3 planeNormal = { rawN[0] / nmag, rawN[1] / nmag, rawN[2] / nmag };
+    const float restW = 0.0125f, penW = -0.0200f;
+    const F4 bary = { 0.4f, 0.2f, 0.3f, 0.1f };
+
+    std::vector<F4> contacts(kTouched, F4{ 1.0f, 1.0f, 1.0f, 0.0f });
+    std::vector<F4> normalPens(kTouched, F4{ 0.0f, 1.0f, 0.0f, -0.1f });
+    std::vector<F4> barycentrics(kTouched, F4{ 1.0f, 0.0f, 0.0f, 0.0f });
+    contacts[kHit] = F4{ 0.5f, -0.02f, 0.7f, restW };
+    normalPens[kHit] = F4{ planeNormal.x, planeNormal.y, planeNormal.z, penW };
+    barycentrics[kHit] = bary;
+
+    const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
+    std::vector<FemOtherContactInfoHost> infos(kTouched);
+    std::memset(infos.data(), 0, infos.size() * sizeof(FemOtherContactInfoHost));
+    for (uint32_t i = 0; i < kTouched; ++i)
+    {
+        infos[i].pairInd0 = staticNodeInd;
+        infos[i].pairInd1 = 0x000fffffu;   // invalid tet -> skipped
+    }
+    infos[kHit].pairInd1 = 0u;             // the ONE real contact, on iteration 2 of thread 0
+
+    DevBuf bContacts = makeDev(dev, contacts), bNormalPens = makeDev(dev, normalPens);
+    DevBuf bBary = makeDev(dev, barycentrics), bInfos = makeDev(dev, infos);
+    std::vector<uint32_t> numContacts = { kDeclared };
+    DevBuf bNum = makeDev(dev, numContacts);
+
+    const uint32_t kBlocks = kTouched / 32u;
+    std::vector<uint8_t> constraintBytes(kBlocks * sizeof(SbRigidConstraintHost), 0xCD);
+    DevBuf bConstraint = makeDev(dev, constraintBytes);
+    std::vector<float> appliedForces(kTouched, 55.0f);
+    DevBuf bForces = makeDev(dev, appliedForces);
+
+    std::vector<F4> body2World = { { 0.0f, 0.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 0.0f, 0.0f } };
+    DevBuf bBody2World = makeDev(dev, body2World);
+    const float penBiasClampRigid = -5.0f;
+    std::vector<uint8_t> solverBodyData(96, 0);
+    std::memcpy(solverBodyData.data() + 12, &penBiasClampRigid, 4);
+    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
+    const float sqrtInvInertia[9] = { 2.0f, 0.1f, 0.0f, 0.1f, 1.5f, 0.2f, 0.0f, 0.2f, 1.0f };
+    std::vector<uint8_t> solverTxIData(64, 0);
+    std::memcpy(solverTxIData.data() + 28, sqrtInvInertia, 9 * 4);
+    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
+    std::vector<uint32_t> solverBodyIndices = { 0u };
+    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
+
+    std::vector<uint8_t> prepDesc(304, 0);
+    sbPokePtr(prepDesc, 64, bSolverBodyData.addr);
+    sbPokePtr(prepDesc, 72, bSolverTxIData.addr);
+    sbPokePtr(prepDesc, 168, bBody2World.addr);
+    DevBuf bPrepDesc = makeDev(dev, prepDesc);
+    std::vector<uint8_t> prePrepDesc(760, 0);
+    sbPokePtr(prePrepDesc, 272, bSolverBodyIndices.addr);
+    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
+
+    SbPrepPush pp = {};
+    pp.softbodies = bDesc.addr; pp.contacts = bContacts.addr; pp.normalPens = bNormalPens.addr;
+    pp.barycentrics = bBary.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
+    pp.constraints = bConstraint.addr; pp.prePrepDesc = bPrePrepDesc.addr;
+    pp.prepDesc = bPrepDesc.addr; pp.rigidAppliedForces = bForces.addr;
+    pp.invDt = 60.0f; pp.sharedDesc = 0ull; pp.isTGS = 0u;
+
+    Kernel("softBodyRigidContactBda.spv", "sb_rigidContactPrepareLaunch", {}, sizeof(SbPrepPush))
+        .dispatch(1u, {}, pp, 1u, 1u);
+    dev->flush();
+
+    const p82dref::V3 delta = {
+        simDeltaPos[0].x * bary.x + simDeltaPos[1].x * bary.y + simDeltaPos[2].x * bary.z + simDeltaPos[3].x * bary.w,
+        simDeltaPos[0].y * bary.x + simDeltaPos[1].y * bary.y + simDeltaPos[2].y * bary.z + simDeltaPos[3].y * bary.w,
+        simDeltaPos[0].z * bary.x + simDeltaPos[1].z * bary.y + simDeltaPos[2].z * bary.z + simDeltaPos[3].z * bary.w,
+    };
+    SbRigidConstraintHost refC;
+    std::memset(&refC, 0xCD, sizeof(refC));
+    p82dref::refPrepare(refC, int(kHit & 31u),
+                        p82dref::V3{ -planeNormal.x, -planeNormal.y, -planeNormal.z },
+                        p82dref::V3{ contacts[kHit].x, contacts[kHit].y, contacts[kHit].z },
+                        penW - restW, delta, bary, p82dref::V3{ 0, 0, 0 }, 0.0f,
+                        penBiasClampRigid, sqrtInvInertia, penBiasClampFEM, true);
+
+    const auto gBytes = downloadBuffer<uint8_t>(dev, bConstraint.h, kBlocks * sizeof(SbRigidConstraintHost));
+    SbRigidConstraintHost gotBlk;
+    std::memcpy(&gotBlk, gBytes.data() + (kHit / 32u) * sizeof(SbRigidConstraintHost), sizeof(gotBlk));
+    const int sl = int(kHit & 31u);
+
+    size_t mm = 0;
+    auto cmp4 = [&](const char* nm, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm; std::printf("  stride %s MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm,
+                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
+    };
+    cmp4("raXn_resp", refC.raXn_resp[sl], gotBlk.raXn_resp[sl]);
+    cmp4("normal_errorW", refC.normal_errorW[sl], gotBlk.normal_errorW[sl]);
+    cmp4("barycentric", refC.barycentric[sl], gotBlk.barycentric[sl]);
+    PXG_CHECK_MSG(mm == 0,
+                  "the contact at index %u is thread 0's SECOND iteration, reached only "
+                  "because the invalid-tet guard is `continue` and not `return` -- it must "
+                  "be prepared bit-exactly (%zu mismatches)", kHit, mm);
+
+    const auto gForces = downloadBuffer<float>(dev, bForces.h, kTouched);
+    PXG_CHECK_MSG(f2u(gForces[kHit]) == 0u,
+                  "the second iteration's applied-force slot must be cleared (got %g)", gForces[kHit]);
+    PXG_CHECK_MSG(f2u(gForces[0]) == 0u, "the first iteration's slot must be cleared too");
+
+    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bTets.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bContacts.h); dev->destroyBuffer(bNormalPens.h); dev->destroyBuffer(bBary.h);
+    dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bConstraint.h);
+    dev->destroyBuffer(bForces.h); dev->destroyBuffer(bBody2World.h);
+    dev->destroyBuffer(bSolverBodyData.h); dev->destroyBuffer(bSolverTxIData.h);
+    dev->destroyBuffer(bSolverBodyIndices.h); dev->destroyBuffer(bPrepDesc.h);
+    dev->destroyBuffer(bPrePrepDesc.h);
 }
 
 } // namespace

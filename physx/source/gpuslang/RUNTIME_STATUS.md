@@ -1620,6 +1620,91 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.2 tranche d — chain kernel 5 lands, and prepareFEMContacts becomes shared
+
+`sb_rigidContactPrepareLaunch` (softBody.cu:773, launch PxgSoftBodyCore.cpp:2239) is mapped
+and tested. Manifest **MAPPED 227 -> 228**; softbody **17 -> 18 of 56**. Five of the seven
+chain kernels are now in; two remain.
+
+| kernel | ABI row | blob | state |
+|---|---|---|---|
+| `sb_rigidContactPrepareLaunch` | `{8,8,8,8,8,8,8,8,8,8,4,8,1}` | 104 B | **MAPPED** |
+
+### prepareFEMContacts is now SHARED, and the extraction is provably a no-op
+
+The 78-line constraint-block writer was file-local in `femClothRigidContactBda.slang`, and the
+softbody kernel needs it byte for byte. It moved to a new module, `pxgSlangFemRigidContact`,
+along with the `FRC_*` block offsets, the small vector helpers and the PxNodeIndex accessors;
+both shaders import it and neither keeps a copy.
+
+The risk of touching a green shader was retired by measurement rather than by argument: all
+**five** cloth entry points compile to **byte-identical SPIR-V** before and after the
+extraction (28936 / 37080 / 37080 / 40172 / 40172 bytes, `cmp` on the .spv). That is a
+stronger statement than "the tests still pass", and it is cheap to re-run if the module is
+ever touched again.
+
+Deliberately NOT a tree-wide de-duplication: `crossVec` / `dotVec` / `mat33MulVec` /
+`computeBasisVectors` are also defined locally in `femClothRigidAttachBda`,
+`psContactSolveBda` and `particleSelfCollisionBda`, and the `CI_*` contact-info offsets in
+`femClothClothContactBda` and `softBodyContactRemapBda`. Those shaders do not import the new
+module and keep their own copies; folding them in is a larger change with no payoff here.
+
+### What the kernel actually does differently from its cloth twin
+
+The CUDA argument packs are position-for-position and type-for-type identical apart from
+argument 0, so the ABI row is the cloth row. The body differs in exactly four places:
+`PxgSoftBodyGpu` for `PxgFEMClothGpu`; the softbody id/tet packing; `mSimDeltaPos` (@128) and
+`mSimTetIndices` (@80) for the cloth fields; and the barycentric projection, which is
+UNCONDITIONAL and over FOUR weights. The cloth version branches on `barycentric.w == 0`
+between a three-weight triangle blend and a direct vertex read, because a cloth contact can
+name either; a softbody contact always names a tetrahedron, and the fourth weight is the
+fourth vertex, not a discriminator.
+
+`invDt` and `isTGS` sit in the push blob and are unread -- so are they in CUDA, where
+brace-matching the whole 122-line `prepareFEMContacts` body (deformableUtils.cuh:132-253)
+finds them on the signature line only. `sharedDesc` is likewise unread: the only thing CUDA
+takes from it is `mBodySimBufferDeviceData` at :162, inside `if (rigidId.isArticulation())`,
+and that branch stays DEFERRED as in the cloth port. The fixture passes a NULL sharedDesc to
+keep that honest -- if the articulation branch is ever transcribed, the test faults rather
+than quietly reading garbage.
+
+### Mutation coverage: 7 of 7
+
+Seven mutants, all killed -- but three of them only after the fixtures were strengthened, and
+one needed a second fixture built specifically for it:
+
+| mutant | killed by |
+|---|---|
+| drop the 4th barycentric weight | four DISTINCT per-vertex deltas, so a 3-weight blend lands elsewhere |
+| don't negate the normal | a direct check against `-planeNormal.x` |
+| use the raw penetration instead of `pen - rest` | a NON-zero rest distance in the contact |
+| clear applied forces AFTER the tet guard | a skipped contact whose force slot must still be zeroed |
+| pick the wrong tet vertex | distinct deltas again |
+| `max` -> `min` on the pen-bias clamp | the two clamps made DIFFERENT (-5 vs -1e10); they were equal, so the choice was untestable |
+| flatten `workIndex / 32`, or zero `workIndex & 31` | a second contact at index 33, which must land in block 1 slot 1 |
+| `continue` -> `return` on the invalid-tet guard | a dedicated stride fixture (below) |
+
+**The `continue`/`return` mutant deserves its own note**, because it is the one that shows a
+fixture can be structurally blind rather than merely weak. With every thread handling one
+contact, the two are indistinguishable -- there is nothing after the skip for the thread to
+do. The difference needs `nbIterationsPerBlock = ceil(ceil(N/256)/1024) > 1`, i.e. **N >
+262144**, which a real scene reaches easily (`maxDeformableVolumeContacts` defaults to 1M)
+but a unit fixture cannot allocate for.
+
+It does not have to. Only the *count* has to be large; the buffers only have to cover the
+indices actually touched. With gridX = 1 the workIndex is `i * 256 + gtid`, so one group
+touches 0..511 whatever N says. `softBodySimRigidContactPrepareStride` declares 262145
+contacts, allocates 512, puts the invalid tet at index 0 and the real contact at index 256 --
+thread 0 meets the guard on its first iteration and the contact on its second. With `return`
+that contact is silently dropped, which in a large scene means contacts vanishing behind an
+invalid one.
+
+The CPU reference is a second, independent transcription of `prepareFEMContacts`;
+`testFemClothSim.cpp` carries one too. Since the shader-side function is now shared, that
+duplication is a CROSS-CHECK rather than a risk: two independently written references verify
+one implementation, so a mistake in either surfaces as a failure instead of two tests
+agreeing on a wrong answer.
+
 ## P8.2 — RECON for the last three chain kernels (5-7), before writing any of them
 
 Read before starting tranche d. Everything below is first-hand from the sources, with
@@ -1779,7 +1864,7 @@ The probe touches only `sdktest/testGpuSdkStep.cpp`, which is not part of the ct
 the suite cannot be affected by it -- re-run anyway rather than argued away:
 
 ```
-suite, default memory mode   674/674
+suite, BOTH memory modes     674/674 (default and PXG_DEVICE_V2=1)
 rigid regression             8 scenes x 2 solvers = 16/16
 clothdrape                   mean y 1.5000 -> -0.0000; rest |dy| over the last 45 steps 0.000000
 clothselfcollide             settled ON the rest distance: min y 5.0999 vs 5.1000 expected
@@ -1966,7 +2051,7 @@ mapped; three remain:
 | 2 | `sb_primitiveContactGenLaunch` | mapped (tranche b) — **PLANE path only** |
 | 3 | `sb_other_contact_remap_to_simLaunch` | mapped (this tranche) |
 | 4 | `sb_reorderPSContactsLaunch` | mapped (this tranche) |
-| 5 | `sb_rigidContactPrepareLaunch` | not started |
+| 5 | `sb_rigidContactPrepareLaunch` | mapped (tranche d) |
 | 6 | `sb_queryRigidSoftContactReferenceCountLaunch` | not started |
 | 7 | `sb_solveRigidSoftCollisionLaunch` | not started |
 

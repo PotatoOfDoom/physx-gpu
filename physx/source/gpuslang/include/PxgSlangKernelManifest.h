@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 227;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 228;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -293,7 +293,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_selfCollisionMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_SELFCOLLISION_MIDPHASE (unmapped)
     { "sb_reorderPSContactsLaunch", "softBodyContactRemapBda.spv", "sb_reorderPSContactsLaunch" },  // SB_REORDER_PS_CONTACTS (P8.2 tranche c BDA lift)
     { "sb_rigidAttachmentPrepareLaunch", nullptr, nullptr },  // SB_RIGID_ATTACHMENT_CONSTRAINT_PREP (unmapped)
-    { "sb_rigidContactPrepareLaunch", nullptr, nullptr },  // SB_RS_CONTACTPREPARE (unmapped)
+    { "sb_rigidContactPrepareLaunch", "softBodyRigidContactBda.spv", "sb_rigidContactPrepareLaunch" },  // SB_RS_CONTACTPREPARE (P8.2 tranche d BDA port; chain kernel 5)
     { "sb_softbodyContactPrepareLaunch", nullptr, nullptr },  // SB_SS_CONTACTPREPARE (unmapped)
     { "sb_clothContactPrepareLaunch", nullptr, nullptr },  // SB_SC_CONTACTPREPARE (unmapped)
     { "sb_particleContactPrepareLaunch", nullptr, nullptr },  // SB_SP_CONTACTPREPARE (unmapped)

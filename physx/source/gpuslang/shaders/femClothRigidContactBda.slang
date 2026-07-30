@@ -108,6 +108,9 @@ import pxgSlangFEMClothDesc;   // PxgFEMClothGpu
 import pxgSlangPrepDesc;       // PxgPrePrepDescGpu, PxgConstraintPrepareDescGpu
 import pxgSlangSolverDesc;     // PxgSolverCoreDescGpu, PxgSolverSharedDescPGSGpu, PxgSolverSharedDescTGSGpu
 import pxgSlangCommon;         // PxgSolverBodyData, PxgSolverTxIData, PxgAlignedTransform
+import pxgSlangFemRigidContact; // prepareFEMContacts + the FRC_* block layout and its helpers
+                               // (extracted so sb_rigidContactPrepareLaunch shares it byte
+                               //  for byte instead of carrying a second copy)
 
 // PxgSoftBodyKernelBlockDim/GridDim::SB_UPDATEROTATION (PxgSoftBodyCoreKernelIndices.h).
 static const uint RC_BLOCK = 256u;
@@ -122,19 +125,6 @@ static const uint PXG_CLOTH_ID_SHIFT = 20u;
 // FEMCollision::initialize friction threshold (deformableUtils.cuh:292).
 static const float FEMC_THRESHOLD = 1.0e-14f;
 
-// ---------------------------------------------------------------------------
-// Byte layout of the block-of-32 PxgFemRigidConstraintBlock (PxgFEMCore.h:167).
-// 32 constraints per block (SoA warp-packed), indexed [offset]; stride 3200.
-// ---------------------------------------------------------------------------
-static const uint FRC_raXn_resp        = 0u;      // float4[32]
-static const uint FRC_raXnF0_resp      = 512u;    // float4[32]
-static const uint FRC_raXnF1_resp      = 1024u;   // float4[32]
-static const uint FRC_normal_errorW    = 1536u;   // float4[32]
-static const uint FRC_fricTan0_invMass = 2048u;   // float4[32]
-static const uint FRC_barycentric      = 2560u;   // float4[32]
-static const uint FRC_maxPenBias       = 3072u;   // float[32]
-static const uint FRC_STRIDE           = 3200u;
-
 // PxgFemOtherContactInfo (PxgFEMCore.h:128, PX_ALIGN(16), 16 bytes):
 //   PxU64 pairInd0 @0 (rigid id), PxU32 pairInd1 @8 (cloth compressed id),
 //   PxU32 rigidMatInd_isInCollision @12 (bit31 = isInCollision).
@@ -143,50 +133,6 @@ static const uint CI_pairInd1    = 8u;
 static const uint CI_rigidMatInd = 12u;
 static const uint CI_STRIDE      = 16u;
 static const uint CI_COLLISION_FLAG = 0x80000000u;
-
-// ---------------------------------------------------------------------------
-// Small vector helpers (byte-for-byte the CUDA foundation math).
-// ---------------------------------------------------------------------------
-float3 crossVec(float3 a, float3 b)
-{
-    return float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
-}
-float dotVec(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-
-// PxMat33 (column-major sqrtInvInertia[9]) * PxVec3.
-float3 mat33MulVec(float m[9], float3 v)
-{
-    return float3(m[0] * v.x + m[3] * v.y + m[6] * v.z,
-                  m[1] * v.x + m[4] * v.y + m[7] * v.z,
-                  m[2] * v.x + m[5] * v.y + m[8] * v.z);
-}
-
-// PxComputeBasisVectors (PxMathUtils.h:297): two orthonormal tangents to `dir`.
-// right.normalize() is a true divide by the magnitude (PxVec3::normalize(), PxVec3.h:295).
-void computeBasisVectors(float3 dir, out float3 right, out float3 up)
-{
-    if (abs(dir.y) <= 0.9999f)
-    {
-        right = float3(dir.z, 0.0f, -dir.x);
-        const float m = sqrt(right.x * right.x + right.y * right.y + right.z * right.z);
-        if (m > 0.0f)
-            right = float3(right.x / m, right.y / m, right.z / m);
-        up = float3(dir.y * right.z, dir.z * right.x - dir.x * right.z, -dir.y * right.x);
-    }
-    else
-    {
-        right = float3(1.0f, 0.0f, 0.0f);
-        up = float3(0.0f, dir.z, -dir.y);
-        const float m = sqrt(up.x * up.x + up.y * up.y + up.z * up.z);
-        if (m > 0.0f)
-            up = float3(up.x / m, up.y / m, up.z / m);
-    }
-}
-
-// PxNodeIndex (PxNodeIndex.h:49) packed in the low/high 32 bits of a PxU64.
-bool nodeIsStaticBody(uint64_t ind) { return uint(ind & 0xffffffffUL) == 0xffffffffu; }
-uint nodeIndex(uint64_t ind) { return uint(ind & 0xffffffffUL); }
-bool nodeIsArticulation(uint64_t ind) { return (uint(ind >> 32) & 1u) != 0u; }
 
 // ===========================================================================
 // Push-constant blobs (byte-identical to the CUDA arg packs / ABI rows).
@@ -273,88 +219,6 @@ struct SolveContactParams
 [[vk::push_constant]] ConstantBuffer<QueryContactParams> gQuery;
 [[vk::push_constant]] ConstantBuffer<SolveContactParams> gSolve;
 
-// ===========================================================================
-// prepareFEMContacts (deformableUtils.cuh:132) — the rigid / static (non-articulation)
-// path.  Writes the block-of-32 PxgFemRigidConstraintBlock slot [offset] at cBase.
-// ===========================================================================
-void prepareFEMContacts(uint64_t cBase, uint offset, float3 normal,
-                        float3 p, float pen, float3 delta, uint64_t rigidId, float4 barycentric,
-                        uint64_t prepDescPtr, uint64_t prePrepDescPtr, float penBiasClampFEM)
-{
-    Ptr<PxgConstraintPrepareDescGpu> prepDesc = Ptr<PxgConstraintPrepareDescGpu>(prepDescPtr);
-    const uint64_t bodyFramesBase = prepDesc[0].body2WorldPool;
-    const uint64_t solverBodyDataBase = prepDesc[0].solverBodyDataPool;
-    const uint64_t solverTxIDataBase = prepDesc[0].solverBodyTxIDataPool;
-
-    // Select two tangent vectors to the normal (PxComputeBasisVectors).
-    float3 t0, t1;
-    computeBasisVectors(normal, t0, t1);
-
-    // ARTICULATION anchor branch DEFERRED (see header): a static floor / sphere is never
-    // an articulation, so the else (rigid / static) path is taken.  solverBodyIdx == 0 for
-    // a static body (solverBodyIndices untouched).
-    const bool isStatic = nodeIsStaticBody(rigidId);
-    uint idx = 0u;
-    if (!isStatic)
-        idx = Ptr<uint>(Ptr<PxgPrePrepDescGpu>(prePrepDescPtr)[0].solverBodyIndices)[nodeIndex(rigidId)];
-
-    PxgSolverTxIData txI = Ptr<PxgSolverTxIData>(solverTxIDataBase)[idx];
-    float invSqrtInertia[9];
-    for (uint k = 0; k < 9u; ++k)
-        invSqrtInertia[k] = txI.sqrtInvInertia[k];
-
-    const PxgSolverBodyData sbd = Ptr<PxgSolverBodyData>(solverBodyDataBase)[idx];
-    const float4 linVel_invMass0 = sbd.initialLinVelXYZ_invMassW;
-    const float penBiasClampRigid = sbd.initialAngVelXYZ_penBiasClamp.w;
-    const float invMass0 = linVel_invMass0.w;
-
-    // both static and kinematic objects have invMass == 0; a static body is never kinematic.
-    const bool isKinematic = (invMass0 == 0.0f) && (!isStatic);
-
-    const float4 bfP = Ptr<float4>(bodyFramesBase + uint64_t(idx) * 32u + 16u)[0];
-    const float3 bodyFrame0p = float3(bfP.x, bfP.y, bfP.z);
-
-    const float3 ra = float3(p.x - bodyFrame0p.x, p.y - bodyFrame0p.y, p.z - bodyFrame0p.z);
-    const float3 raXn = crossVec(ra, normal);
-    const float3 raXF0 = crossVec(ra, t0);
-    const float3 raXF1 = crossVec(ra, t1);
-
-    const float3 raXnSqrtInertia = mat33MulVec(invSqrtInertia, raXn);
-    const float resp0 = dotVec(raXnSqrtInertia, raXnSqrtInertia) + invMass0;
-
-    const float3 raXF0SqrtInertia = mat33MulVec(invSqrtInertia, raXF0);
-    const float3 raXF1SqrtInertia = mat33MulVec(invSqrtInertia, raXF1);
-
-    const float respF0 = dotVec(raXF0SqrtInertia, raXF0SqrtInertia) + invMass0;
-    const float respF1 = dotVec(raXF1SqrtInertia, raXF1SqrtInertia) + invMass0;
-
-    float4 raXn_resp;
-    float4 raXnF0_resp;
-    float4 raXnF1_resp;
-    if (isKinematic)
-    {
-        raXn_resp = float4(raXn.x, raXn.y, raXn.z, resp0);
-        raXnF0_resp = float4(raXF0.x, raXF0.y, raXF0.z, respF0);
-        raXnF1_resp = float4(raXF1.x, raXF1.y, raXF1.z, respF1);
-    }
-    else
-    {
-        raXn_resp = float4(raXnSqrtInertia.x, raXnSqrtInertia.y, raXnSqrtInertia.z, resp0);
-        raXnF0_resp = float4(raXF0SqrtInertia.x, raXF0SqrtInertia.y, raXF0SqrtInertia.z, respF0);
-        raXnF1_resp = float4(raXF1SqrtInertia.x, raXF1SqrtInertia.y, raXF1SqrtInertia.z, respF1);
-    }
-
-    const float maxPenBias = max(penBiasClampRigid, penBiasClampFEM);
-    const float error = pen + dotVec(delta, normal);
-
-    Ptr<float4>(cBase + FRC_normal_errorW)[offset] = float4(normal.x, normal.y, normal.z, error);
-    Ptr<float4>(cBase + FRC_raXn_resp)[offset] = raXn_resp;
-    Ptr<float4>(cBase + FRC_raXnF0_resp)[offset] = raXnF0_resp;
-    Ptr<float4>(cBase + FRC_raXnF1_resp)[offset] = raXnF1_resp;
-    Ptr<float4>(cBase + FRC_fricTan0_invMass)[offset] = float4(t0.x, t0.y, t0.z, invMass0);
-    Ptr<float>(cBase + FRC_maxPenBias)[offset] = maxPenBias;
-    Ptr<float4>(cBase + FRC_barycentric)[offset] = barycentric;
-}
 
 // ===========================================================================
 // cloth_rigidContactPrepareLaunch (FEMClothConstraintPrep.cu:70)

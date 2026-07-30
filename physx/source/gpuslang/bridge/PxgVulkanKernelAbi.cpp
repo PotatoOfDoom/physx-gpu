@@ -515,6 +515,20 @@ static const uint8_t kSbContactRemapToSim[] = { 8, 4, 8, 8, 8, 8, 8 };
 //   PxgSoftBodyCore.cpp:698 -> 80-byte blob.
 static const uint8_t kSbReorderPsContacts[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
 
+// gpusimulationcontroller softbody-vs-rigid CONSTRAINT PREPARE (P8.2 tranche d):
+//   sb_rigidContactPrepareLaunch(PxgSoftBody* softbodies, float4* contacts_restW,
+//     float4* normalPens, float4* barycentrics, PxgFemOtherContactInfo* contactInfos,
+//     PxU32* numContacts, PxgFemRigidConstraintBlock* primitiveConstraints,
+//     PxgPrePrepDesc* preDesc, PxgConstraintPrepareDesc* prepareDesc,
+//     PxReal* rigidAppliedForces, PxReal invDt, PxgSolverSharedDescBase* sharedDesc,
+//     bool isTGS)  -- launch site PxgSoftBodyCore.cpp:2242.  Ten device pointers +
+//   PxReal (@80) + device pointer (@88) + bool (@96) -> natural-alignment blob = 104 bytes.
+//   BYTE-IDENTICAL to kClothRigidContactPrep: the two CUDA argument packs differ only in
+//   argument 0's pointee type (PxgSoftBody vs PxgFEMCloth), which is 8 bytes either way.
+//   Kept as its own row rather than aliased, so a future divergence in either kernel's
+//   signature cannot silently corrupt the other's blob.
+static const uint8_t kSbRigidContactPrep[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 1 };
+
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — grid-cell hash + identity seed.
@@ -881,6 +895,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_primitiveContactGenLaunch", kSbPrimitiveContactGen, uint32_t(sizeof(kSbPrimitiveContactGen)) },
     { "sb_other_contact_remap_to_simLaunch", kSbContactRemapToSim, uint32_t(sizeof(kSbContactRemapToSim)) },
     { "sb_reorderPSContactsLaunch", kSbReorderPsContacts, uint32_t(sizeof(kSbReorderPsContacts)) },
+    { "sb_rigidContactPrepareLaunch", kSbRigidContactPrep, uint32_t(sizeof(kSbRigidContactPrep)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },
