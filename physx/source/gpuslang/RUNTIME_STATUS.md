@@ -1733,8 +1733,38 @@ that helper is the initial one, which is `float4(0,0,0,0)`. CUDA declares `float
 instead is strictly better defined, and that is what makes the clamp redundant here rather than
 merely unexercised. Kept anyway as a backstop.
 
-Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
-green.
+### Where the chain stands
+
+Seven kernels stand between a generated contact and a moving softbody vertex. Four are now
+mapped; three remain:
+
+| # | kernel | state |
+|---|---|---|
+| 1 | `sb_midphaseGeneratePairsLaunch` | mapped (tranche a) |
+| 2 | `sb_primitiveContactGenLaunch` | mapped (tranche b) — **PLANE path only** |
+| 3 | `sb_other_contact_remap_to_simLaunch` | mapped (this tranche) |
+| 4 | `sb_reorderPSContactsLaunch` | mapped (this tranche) |
+| 5 | `sb_rigidContactPrepareLaunch` | not started |
+| 6 | `sb_queryRigidSoftContactReferenceCountLaunch` | not started |
+| 7 | `sb_solveRigidSoftCollisionLaunch` | not started |
+
+So the softbody cube still does not settle, and cannot until 5-7 land — the contacts are now
+correctly addressed and correctly ordered, but nothing consumes them yet. The GJK/EPA tranche
+for the non-plane rigid types in kernel 2 stays separate; `softBodySimPrimitiveContactGenPlane`
+pins that boundary with a BOX pair so it has to be changed consciously.
+
+### Verification
+
+Suite **674/674 in both memory modes**, rigid regression **8 scenes x 2 solvers = 16/16**, and
+all six deformable/particle scenes stepped and byte-unchanged against their recorded baselines:
+
+```
+clothdrape        mean y 1.5000 -> -0.0000; rest |dy| over the last 45 steps = 0.000000
+clothselfcollide  caught and settled ON the rest distance: min y 5.0999 vs 5.1000 expected
+softbody          coll mean y 4.0000 -> -0.9867, sim mean y identical, skin gap 0.00000
+particle          mean y 100.7500 -> 80.9665
+cloth / clothhang free fall and drape unchanged
+```
 
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
