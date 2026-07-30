@@ -1709,7 +1709,15 @@ rigid regression             8 scenes x 2 solvers = 16/16
 mutation                     6 of 8 killed, 2 provably equivalent
 softbody (plane OFF)         4.0000 -> -0.98675, 0.0000% off the closed form
 softbody (PXG_SB_PLANE=1)    caught step 49, settled y = 0.49753, rest |dy| = 0.000002
+clothdrape                   mean y 1.5000 -> -0.0000; rest |dy| over the last 45 steps 0.000000
+clothselfcollide             min y 5.0999 vs 5.1000 expected (mean 5.1105, shelf 5.00)
+particle                     mean y 100.7500 -> 80.9665
+cloth / clothhang            free fall and drape unchanged
 ```
+
+Every scene value is byte-identical to its recorded baseline. The default softbody scene is
+unchanged on purpose -- the plane is opt-in, so the free-fall control still measures exactly
+what it measured before the solve kernels existed.
 
 **One open point, recorded rather than dismissed.** On the FIRST default-mode suite run of
 this tranche, `gpuslang.npRigidSumBatches` died with SEGFAULT -- one failure in six full-suite
