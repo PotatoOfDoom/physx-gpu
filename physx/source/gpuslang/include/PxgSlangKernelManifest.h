@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 225;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 226;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -291,7 +291,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_heightfieldMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_HF_MIDPHASE (unmapped)
     { "sb_heightfieldContactGenLaunch", nullptr, nullptr },  // SB_HF_CG (unmapped)
     { "sb_selfCollisionMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_SELFCOLLISION_MIDPHASE (unmapped)
-    { "sb_reorderPSContactsLaunch", nullptr, nullptr },  // SB_REORDER_PS_CONTACTS (unmapped)
+    { "sb_reorderPSContactsLaunch", "softBodyContactRemapBda.spv", "sb_reorderPSContactsLaunch" },  // SB_REORDER_PS_CONTACTS (P8.2 tranche c BDA lift)
     { "sb_rigidAttachmentPrepareLaunch", nullptr, nullptr },  // SB_RIGID_ATTACHMENT_CONSTRAINT_PREP (unmapped)
     { "sb_rigidContactPrepareLaunch", nullptr, nullptr },  // SB_RS_CONTACTPREPARE (unmapped)
     { "sb_softbodyContactPrepareLaunch", nullptr, nullptr },  // SB_SS_CONTACTPREPARE (unmapped)
@@ -316,7 +316,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_gm_updateTetrahedraRotationsLaunch", "softBodySolveBda.spv", "sb_gm_updateTetrahedraRotationsLaunch" },  // SB_GM_UPDATETETRAROTATIONS (P8.0 tranche 5 BDA port)
     { "sb_gm_applyExternalDeltasLaunch", "softBodySolveBda.spv", "sb_gm_applyExternalDeltasLaunch" },  // SB_GM_APPLY_EXTERNAL_DELTAS (P8.0 tranche 4 BDA port)
     { "sb_gm_applyDeformationDeltasLaunch", "softBodySolveBda.spv", "sb_gm_applyDeformationDeltasLaunch" },  // SB_GM_APPLY_DEFORMATION_DELTAS (P8.0 tranche 7 BDA port)
-    { "sb_other_contact_remap_to_simLaunch", nullptr, nullptr },  // SB_OTHER_CONTACT_REMAP_TO_SIM (unmapped)
+    { "sb_other_contact_remap_to_simLaunch", nullptr, nullptr },  // SB_OTHER_CONTACT_REMAP_TO_SIM (P8.2 tranche c: ported and SPIR-V-valid, NOT mapped — an unresolved llvmpipe fault, see the shader header)
     { "sb_fem_contact_remap_to_simLaunch", nullptr, nullptr },  // SB_FEM_CONTACT_REMAP_TO_SIM (unmapped)
     { "sb_gm_stepSoftbodyLaunch", "softBodySimBda.spv", "sb_gm_stepSoftbodyLaunch" },  // SB_GM_STEPSOFTBODY (P8.0 tranche 3 BDA port)
     { "sb_solveRigidSoftAttachmentLaunchTGS", nullptr, nullptr },  // SB_SOLVE_RIGID_SOFT_ATTACHMENT_TGS (unmapped)

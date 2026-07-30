@@ -1620,6 +1620,61 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.2 tranche c — the sorted-order gather lands; the remap is ported but BLOCKED
+
+Chain kernels 3 and 4 were lifted from `npSbRemap.slang`'s unit-tested descriptor-set ports
+onto the BDA ABI, into the new `softBodyContactRemapBda.slang`. **One landed, one did not.**
+
+| kernel | ABI row | state |
+|---|---|---|
+| `sb_reorderPSContactsLaunch` | ten pointers, 80 B | **MAPPED**, tested, green |
+| `sb_other_contact_remap_to_simLaunch` | `{8,4,8,8,8,8,8}`, 56 B | ported, SPIR-V-valid, **NOT mapped** — faults |
+
+Manifest **MAPPED 225 → 226**; softbody **15 → 16 of 56**.
+
+### The reorder
+
+A pure gather through `remapByRigid` into the sorted contact arrays. The fixture uses a
+permutation with **no fixed points**, so an identity gather cannot pass, and asserts the
+entries past the contact count keep their poison. Also documented: the CUDA iteration count
+is `(total + blockDim*gridDim - 1) / blockDim * gridDim` — **missing parentheses**, so it
+over-counts by roughly `gridDim²`. Harmless, because the loop returns on `index >= total`;
+the port keeps a plain bounded stride loop rather than reproducing the slip.
+
+### The remap: what is known, and what is not
+
+It SIGSEGVs on llvmpipe inside JIT-generated code on a worker thread (gdb shows an
+unsymbolised driver address and an empty host stack — a GPU-side fault, not a host bug). The
+manifest row is left `nullptr` and the unit test renamed `_DISABLED`, exactly how the tranche-6
+FEM solve was carried until a standalone repro cracked it.
+
+**The bisection is recorded in the shader header so the next attempt does not redo it.** A
+probe returning just before the candidate loop SURVIVES; a probe that enters the loop and
+immediately `continue`s FAULTS. Everything between has been excluded individually:
+
+- the 32-element per-candidate arrays → replaced by a single running best. Still faults.
+- dynamic indexing of those arrays → every index forced constant. Still faults.
+- group size → 512 threads (CUDA's block) and 64. Both fault.
+- `computeTetBarycentric` → stubbed to a constant. Still faults.
+- `guClosestPtPointTetrahedron` → stubbed to a constant. Still faults.
+- the candidate loop's trip count. Still faults.
+
+So it is not the arithmetic, not the helpers, not the private storage, not the indexing. The
+in-harness search space is exhausted, which is precisely the signal to leave the harness: the
+next step is `tools/lvprepro`, dispatching this `.spv` standalone against synthetic data — the
+harness that settled the `~3UL` trap.
+
+One deviation was introduced along the way and is worth keeping either way, since it is a
+strict simplification: the per-candidate state is a single running minimum rather than CUDA's
+32 per-lane registers. CUDA's reduction takes the lowest LANE among lanes tied at the global
+minimum; a flat scan takes the lowest CANDIDATE INDEX among candidates tied at it. Those agree
+whenever the minimum is unique, and can differ only on an exact float tie across different
+32-batches, i.e. only when a collision tet has more than 32 candidate sim tets. The
+containment path is untouched.
+
+Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
+green.
+
 ## P6.6 — MILESTONE: the PBD particle bag ALSO settles under the TGS solver (no longer tunnels)
 
 The P6.5 settling bag was a **PGS** result; under **TGS** the same cloud TUNNELLED

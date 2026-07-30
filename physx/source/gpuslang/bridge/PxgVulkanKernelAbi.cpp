@@ -505,6 +505,15 @@ static const uint8_t kSbMidphasePrimitives[] = { 4, 4, 8, 8, 8, 8, 8, 8, 4, 8, 8
 //   the port to exceed Vulkan's GUARANTEED 128-byte push-constant minimum.  llvmpipe
 //   reports maxPushConstantsSize = 256, so it fits here.
 static const uint8_t kSbPrimitiveContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 4, 8, 80 };
+//   sb_other_contact_remap_to_simLaunch(const PxgSoftBody*, PxU32 maxNumContacts,
+//     const float4* point, float4* outBarycentric, PxgFemOtherContactInfo* outContactInfo,
+//     PxU32* totalContactCount, const PxU32* prevContactCount)  -- launch site
+//   PxgNarrowphaseCore.cpp:4100.  8@0, 4@8, then five pointers realigned to @16..@48
+//   -> 56-byte blob.
+static const uint8_t kSbContactRemapToSim[] = { 8, 4, 8, 8, 8, 8, 8 };
+//   sb_reorderPSContactsLaunch(ten device pointers)  -- launch site
+//   PxgSoftBodyCore.cpp:698 -> 80-byte blob.
+static const uint8_t kSbReorderPsContacts[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
 
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
@@ -870,6 +879,8 @@ static const PxgKernelAbiRow kRows[] = {
     // gpunarrowphase softbody-vs-rigid midphase (P8.2 tranche a)
     { "sb_midphaseGeneratePairsLaunch", kSbMidphasePrimitives, uint32_t(sizeof(kSbMidphasePrimitives)) },
     { "sb_primitiveContactGenLaunch", kSbPrimitiveContactGen, uint32_t(sizeof(kSbPrimitiveContactGen)) },
+    { "sb_other_contact_remap_to_simLaunch", kSbContactRemapToSim, uint32_t(sizeof(kSbContactRemapToSim)) },
+    { "sb_reorderPSContactsLaunch", kSbReorderPsContacts, uint32_t(sizeof(kSbReorderPsContacts)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },
