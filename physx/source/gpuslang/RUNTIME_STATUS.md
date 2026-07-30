@@ -1620,6 +1620,120 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.2 — RECON for the last three chain kernels (5-7), before writing any of them
+
+Read before starting tranche d. Everything below is first-hand from the sources, with
+file:line; nothing is inferred from the port's own earlier notes, which have been wrong about
+this chain before.
+
+### Is landing kernels 5-7 sufficient? YES for the kernels — NO for the scene.
+
+Traced `PxgSoftBodyCore::solve` (the PGS path, PxgSoftBodyCore.cpp:2812) and
+`PxgSoftBodyCore::constraintPrep` (:2570) and cross-checked every `PxgKernelIds::` reference
+in the traversed methods against the manifest. On the rigid-vs-softbody path exactly three
+kernels are unmapped, and they are the expected three:
+
+| function | line | kernel | state |
+|---|---|---|---|
+| `sortContacts` | 436 | radix sort ×4, clampMaxValues, `sb_reorderPSContacts` | all MAPPED |
+| `prepRigidContactConstraint` | 2216 | `sb_rigidContactPrepareLaunch` | **UNMAPPED (5)** |
+| `queryRigidContactReferenceCount` | 1743 | `sb_queryRigidSoftContactReferenceCountLaunch` | **UNMAPPED (6)** |
+| `solveRSContactsOutputRigidDelta` | 1035 | `sb_solveRigidSoftCollisionLaunch` | **UNMAPPED (7)** |
+| `applyExternalTetraDeltaGM` | 853 | `sb_gm_applyExternalDeltasLaunch` | MAPPED |
+| `solveCorotationalFEM` | 1165 | solve-tetra partition, averageVerts, applyDeformationDeltas | MAPPED |
+
+Two other unmapped kernels appear in traversed methods and are both **off** this path:
+- `sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch` — taken only when
+  `maxPartitions > SB_PARTITION_LIMIT` (PxgSoftBodyCore.cpp:1185, "8th partition is for
+  Jacobi-style update"). The 2x2x2 / 40-tet test cube does not reach eight partitions, which
+  is why the existing softbody free-fall already works.
+- `sb_softbodyContactPrepareLaunch` (SB_SS_CONTACTPREPARE, :2515) — soft-vs-SOFT (VT)
+  contact prep. `constraintPrep` launches it unconditionally, but with a single softbody and
+  no self-collision its contact count is zero.
+
+**The scene is the real blocker.** `PXG_SCENE=softbody`'s floor is `addGroundBox`
+(testGpuSdkStep.cpp:111-118) — a `PxBoxGeometry(50, 0.5, 50)` at y=-0.5. Kernel 2
+(`sb_primitiveContactGenLaunch`) is **PLANE-path only**, so a box floor generates no softbody
+contacts no matter how many of 5-7 land. The cloth drape scene already shows the fix: a
+static `PxPlaneGeometry` floor built with `PxTransformFromPlaneEquation`
+(testGpuSdkStep.cpp:640-641). The ground box must STAY — it exists so the rigid PGS island
+loop has a live dynamic body (:1213-1218) — so the plane is an addition, not a replacement.
+
+### The cost is far lower than the kernel count suggests: it is a LIFT
+
+`femClothRigidContactBda.slang` already carries all three analogues, mapped and tested:
+`cloth_rigidContactPrepareLaunch` (:364), `cloth_queryRigidClothContactReferenceCountLaunch`
+(:768) and `cloth_solveRigidClothCollisionLaunch` (:893), plus the TGS twins, all at
+`[numthreads(256,1,1)] // SB_UPDATEROTATION`.
+
+The CUDA argument packs are **position-for-position and type-for-type identical** to the
+softbody ones. The only differences in the whole signature set are argument 0
+(`PxgSoftBody*` vs `PxgFEMCloth*`) and kernel 7's argument 12
+(`PxsDeformableVolumeMaterialData*` vs `...Surface...`). So the ABI rows are already written
+and already proven in `PxgVulkanKernelAbi.cpp`:
+
+| kernel | ABI row | blob | CUDA |
+|---|---|---|---|
+| 5 `sb_rigidContactPrepareLaunch` | `{8,8,8,8,8,8,8,8,8,8,4,8,1}` | 104 B | softBody.cu:773, ~67 lines |
+| 6 `sb_queryRigidSoftContactReferenceCountLaunch` | `{8,8,8,8,8,8,8,8,4,8,8}` | 88 B | :1944 (helper :1824), ~117 lines |
+| 7 `sb_solveRigidSoftCollisionLaunch` | `{8,8,8,8,8,8,8,8,8,8,8,4,8,8}` | 112 B | :2062 (helper :1963), ~95 lines |
+
+**No new descriptor mirrors are needed.** All six rigid-side structs the trio touches are
+already mirrored and used together by `femClothRigidContactBda.slang`: `PxgPrePrepDesc`,
+`PxgConstraintPrepareDesc`, `PxgSolverSharedDescBase`, `PxgFemRigidConstraintBlock`,
+`PxgSolverBodyData`, `PxgSolverTxIData`. `PxsDeformableVolumeMaterialData` is already
+mirrored in `softBodySolveBda.slang`, and the rigid `PxsMaterialData` in `pxgSlangNpAbi.slang`.
+This was the risk that could have sunk the tranche; it is not present.
+
+### None of the three uses a warp primitive
+
+Scanned all three bodies for `__ballot_sync`, `__shfl`, `warpReduction`, `lowestSetIndex`,
+`__syncwarp`, `__shared__` and `threadIdx.y`: **zero hits**. They are flat per-contact loops
+with no cross-lane cooperation, which makes them the easiest kernels left in this chain — the
+opposite of the midphase and self-collision tranches. What they do use:
+
+- **`blockDim`/`gridDim` arithmetic** (4 and 2 references each): the
+  `nbBlocksRequired`/`nbIterationsPerBlock` idiom. The bridge drops blockDim, so it must be
+  reproduced as constants — which the cloth port already does, with `RC_BLOCK`/`RC_GRID`
+  matching its own `[numthreads]` (femClothRigidContactBda.slang:367-376). Copy that exactly;
+  this is the grid-mismatch class that bit `femClothSelfCollisionBda`.
+- **atomics, kernel 6 only**: four float `atomicAdd(&softbody.mSimDelta[tetId.*].w, 1.0f)`
+  and one uint `atomicAdd(&rigidBodyReferenceCounts[id], 1)`. The float ones are exactly
+  `pxgAtomicAddF4W` from P8.1, so the infrastructure is in place.
+- **`primitiveConstraints[workIndex/32]`**: `PxgFemRigidConstraintBlock` is a 32-lane
+  struct-of-arrays block, not one constraint. The cloth mirror already has the layout.
+- **`return` on out-of-range, not `continue`** (softBody.cu:800). The cloth port matches. Note
+  this is the EARLY-RETURN shape, which tranche c verified is NOT subject to the dropped
+  loop-mask defect — but the two landmines from tranche c still apply to any new code here:
+  an optionally-null pointer needs the POINTER selected, not the load guarded, and no block
+  may both redefine a loop bound and store.
+
+### Proposed tranche cuts
+
+- **tranche d — kernel 5 alone.** Smallest (~67 lines), and 6 and 7 both consume its
+  `PxgFemRigidConstraintBlock` output, so it must be right first. Independently verifiable
+  without any of the others: dispatch it on synthetic contacts and check the constraint block
+  fields against a CPU transcription, the way the cloth prepare fixture does.
+- **tranche e — kernels 6 and 7 together, plus the plane floor and the settle assertion.**
+  They share one descriptor set and 7's correctness depends on 6's reference counts, so
+  splitting them buys little and doubles the fixture work. The payoff — a softbody cube that
+  actually settles — lands here, which is also where the scene change belongs.
+
+### What could still make this drag
+
+Ranked, honestly:
+1. **The plane path may not feed a real settle.** Kernel 2's PLANE gate is proven by a unit
+   test, not by an engine-level contact against a live `PxPlaneGeometry` floor. If the
+   engine's CM/midphase path routes a plane differently than the fixture assumes, tranche e
+   ends with green kernels and a cube that still falls through. Worth probing EARLY — before
+   writing kernel 6 — by adding the plane floor now and checking whether the existing chain
+   produces a nonzero `mRigidTotalContactCountBuf`.
+2. **`PxgSolverSharedDesc<IterativeSolveData>` is templated** in the softbody signatures where
+   the cloth ABI comment writes it unqualified. The mirror is shared, so this is probably
+   nothing, but confirm the instantiation matches before trusting the 88/112-byte blobs.
+3. Kernel 6 at ~117 lines is the largest of the three and the only one with atomics; expect
+   the mutation pass to find the most gaps there.
+
 ## P8.2 tranche c — BOTH chain kernels land, and two llvmpipe defects come out of it
 
 Chain kernels 3 and 4 were lifted from `npSbRemap.slang`'s unit-tested descriptor-set ports
