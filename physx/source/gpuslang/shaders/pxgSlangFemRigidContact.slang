@@ -60,6 +60,10 @@ module pxgSlangFemRigidContact;
 
 import pxgSlangPrepDesc;   // PxgPrePrepDescGpu, PxgConstraintPrepareDescGpu
 import pxgSlangCommon;     // PxgSolverBodyData, PxgSolverTxIData
+import pxgSlangSolverDesc; // PxgSolverCoreDescGpu, PxgSolverSharedDesc{PGS,TGS}Gpu
+
+// FEMCollision::initialize friction threshold (deformableUtils.cuh:292).
+public static const float FEMC_THRESHOLD = 1.0e-14f;
 
 // ---------------------------------------------------------------------------
 // Byte layout of the block-of-32 PxgFemRigidConstraintBlock (PxgFEMCore.h:167).
@@ -200,4 +204,197 @@ public void prepareFEMContacts(uint64_t cBase, uint offset, float3 normal,
     Ptr<float4>(cBase + FRC_fricTan0_invMass)[offset] = float4(t0.x, t0.y, t0.z, invMass0);
     Ptr<float>(cBase + FRC_maxPenBias)[offset] = maxPenBias;
     Ptr<float4>(cBase + FRC_barycentric)[offset] = barycentric;
+}
+
+// ---------------------------------------------------------------------------
+// PxgVelocityReader (dataReadWriteHelper.cuh:70) — non-articulation rigid path.
+// ARTICULATION branch DEFERRED (see header).  Returns lin/ang velocity (+ lin/ang delta
+// for TGS) of the rigid body; a static body reads solverBodyIdx 0 (zero for a floor).
+// ---------------------------------------------------------------------------
+public struct RigidState
+{
+    float3 linVel;
+    float3 angVel;
+    float3 linDelta;
+    float3 angDelta;
+}
+
+public RigidState readRigidVelocity(uint64_t rigidId, bool isTGS, uint64_t solverCoreDescPtr,
+                             uint64_t sharedDescPtr, uint64_t prePrepDescPtr)
+{
+    Ptr<PxgSolverCoreDescGpu> solverCoreDesc = Ptr<PxgSolverCoreDescGpu>(solverCoreDescPtr);
+    const uint numSolverBodies = solverCoreDesc[0].numSolverBodies;
+    const uint accOffset = solverCoreDesc[0].accumulatedBodyDeltaVOffset;
+
+    const bool isStatic = nodeIsStaticBody(rigidId);
+    uint solverBodyIdx = 0u;
+    if (!isStatic)
+        solverBodyIdx = Ptr<uint>(Ptr<PxgPrePrepDescGpu>(prePrepDescPtr)[0].solverBodyIndices)[nodeIndex(rigidId)];
+
+    RigidState s;
+    s.linVel = float3(0.0f, 0.0f, 0.0f);
+    s.angVel = float3(0.0f, 0.0f, 0.0f);
+    s.linDelta = float3(0.0f, 0.0f, 0.0f);
+    s.angDelta = float3(0.0f, 0.0f, 0.0f);
+
+    if (isTGS)
+    {
+        Ptr<float4> pool = Ptr<float4>(Ptr<PxgSolverSharedDescTGSGpu>(sharedDescPtr)[0].iter_solverBodyVelPool);
+        const float4 v0 = pool[accOffset + solverBodyIdx];
+        const float4 v1 = pool[accOffset + solverBodyIdx + numSolverBodies];
+        const float4 v2 = pool[accOffset + solverBodyIdx + numSolverBodies + numSolverBodies];
+        s.linVel = float3(v0.x, v0.y, v0.z);
+        s.angVel = float3(v0.w, v1.x, v1.y);
+        s.linDelta = float3(v1.z, v1.w, v2.x);
+        s.angDelta = float3(v2.y, v2.z, v2.w);
+    }
+    else
+    {
+        Ptr<float4> initialVel = Ptr<float4>(solverCoreDesc[0].outSolverVelocity);
+        Ptr<float4> pool = Ptr<float4>(Ptr<PxgSolverSharedDescPGSGpu>(sharedDescPtr)[0].iter_solverBodyVelPool);
+        const float4 iv0 = initialVel[solverBodyIdx];
+        const float4 iv1 = initialVel[solverBodyIdx + numSolverBodies];
+        const float4 dv0 = pool[accOffset + solverBodyIdx];
+        const float4 dv1 = pool[accOffset + solverBodyIdx + numSolverBodies];
+        s.linVel = float3(iv0.x + dv0.x, iv0.y + dv0.y, iv0.z + dv0.z);
+        s.angVel = float3(iv1.x + dv1.x, iv1.y + dv1.y, iv1.z + dv1.z);
+    }
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// FEMCollision::initialize (deformableUtils.cuh:280) — deformable vs rigid, static /
+// null-material path.  Returns isActive; on the full path also fills deltaLambdaN,
+// deltaLambdaT, tangent (deltaLambdaT == 0 with the deferred null-material friction).
+// ---------------------------------------------------------------------------
+public struct ContactResult
+{
+    public bool isActive;
+    public float deltaLambdaN;
+    public float deltaLambdaT;
+    public float3 normal;
+    public float3 tangent;
+    public float accumulatedDeltaLambdaN;
+}
+
+// THE MASS-SPLITTING TERM IS A PARAMETER, not computed here, and that is what makes this
+// function deformable-agnostic.  CUDA templates FEMCollision on the vector type -- PxVec3
+// for a cloth triangle, PxVec4 for a softbody tetrahedron -- and the ONLY place the width
+// shows through is `bc.multiply(bc).dot(invMasses)`.  Passing that scalar in lets one
+// implementation serve both, instead of a float4 signature with a dummy w that every cloth
+// caller would have to remember to zero (and where a garbage w of inf would poison the
+// product).  Callers compute their own 3- or 4-wide dot.
+public ContactResult contactInitialize(uint64_t cBase, uint offset, uint64_t rigidId, bool isTGS,
+                                float appliedForceRef, float dt, float3 bcVec,
+                                float3 deformableLinDelta, float deformableInvMass_massSplitting,
+                                uint rigidBodyReferenceCount, bool wasActive, bool checkOnlyActivity,
+                                uint64_t solverCoreDescPtr, uint64_t sharedDescPtr, uint64_t prePrepDescPtr)
+{
+    ContactResult r;
+    r.isActive = false;
+    r.deltaLambdaN = 0.0f;
+    r.deltaLambdaT = 0.0f;
+    r.tangent = float3(0.0f, 0.0f, 0.0f);
+    r.accumulatedDeltaLambdaN = appliedForceRef;
+
+    const float invDt = 1.0f / dt;
+
+    const float4 raXn_resp = Ptr<float4>(cBase + FRC_raXn_resp)[offset];
+    const float4 normal_biasW = Ptr<float4>(cBase + FRC_normal_errorW)[offset];
+    const float4 raXnF0_resp = Ptr<float4>(cBase + FRC_raXnF0_resp)[offset];
+    const float4 raXnF1_resp = Ptr<float4>(cBase + FRC_raXnF1_resp)[offset];
+    const float maxPenBias = Ptr<float>(cBase + FRC_maxPenBias)[offset];
+    const float4 fricTan0_invMass0 = Ptr<float4>(cBase + FRC_fricTan0_invMass)[offset];
+
+    const float3 normal = float3(normal_biasW.x, normal_biasW.y, normal_biasW.z);
+    r.normal = normal;
+    const float3 fric0 = float3(fricTan0_invMass0.x, fricTan0_invMass0.y, fricTan0_invMass0.z);
+    const float3 fric1 = crossVec(normal, fric0);
+    const float initPen = normal_biasW.w;
+    const float3 raXn = float3(raXn_resp.x, raXn_resp.y, raXn_resp.z);
+
+    const RigidState st = readRigidVelocity(rigidId, isTGS, solverCoreDescPtr, sharedDescPtr, prePrepDescPtr);
+    const float3 linVel = st.linVel;
+    const float3 angVel = st.angVel;
+
+    float CN;
+    float3 relLinDelta;
+    float3 angDelta;
+    if (isTGS)
+    {
+        const float normalVel = dotVec(linVel, normal) + dotVec(angVel, raXn);
+        relLinDelta = float3(st.linDelta.x - deformableLinDelta.x, st.linDelta.y - deformableLinDelta.y,
+                             st.linDelta.z - deformableLinDelta.z);
+        angDelta = st.angDelta;
+        const float error = (initPen + dotVec(relLinDelta, normal) + dotVec(angDelta, raXn)) * invDt;
+        const float errorBiased = max(maxPenBias, error);
+        CN = errorBiased + normalVel;
+    }
+    else
+    {
+        const float normalVel = dotVec(linVel, normal) + dotVec(angVel, raXn);
+        relLinDelta = float3(-deformableLinDelta.x, -deformableLinDelta.y, -deformableLinDelta.z);
+        angDelta = float3(0.0f, 0.0f, 0.0f);
+        const float error = (initPen + dotVec(relLinDelta, normal)) * invDt;
+        const float errorBiased = max(maxPenBias, error);
+        CN = errorBiased + normalVel;
+    }
+
+    r.isActive = wasActive || (CN < 0.0f);
+
+    if (checkOnlyActivity)
+        return r;
+
+    if (!r.isActive)
+        return r;
+
+    const float rigidRefCount = float(rigidBodyReferenceCount);
+    const float unitResponse = rigidRefCount * raXn_resp.w + deformableInvMass_massSplitting;
+    const float invDenom = (unitResponse > 0.0f) ? (1.0f / unitResponse) : 0.0f;
+
+    r.deltaLambdaN = max(-CN * invDenom, -r.accumulatedDeltaLambdaN);
+    r.accumulatedDeltaLambdaN += r.deltaLambdaN;
+
+    // Friction constraint in the tangent direction (null-material path -> combinedFriction 0).
+    const float3 raXnF0 = float3(raXnF0_resp.x, raXnF0_resp.y, raXnF0_resp.z);
+    const float3 raXnF1 = float3(raXnF1_resp.x, raXnF1_resp.y, raXnF1_resp.z);
+
+    const float tanVel0 = dotVec(linVel, fric0) + dotVec(angVel, raXnF0);
+    const float tanVel1 = dotVec(linVel, fric1) + dotVec(angVel, raXnF1);
+
+    const float CT0 = (dotVec(fric0, relLinDelta) + dotVec(angDelta, raXnF0)) * invDt + tanVel0;
+    const float CT1 = (dotVec(fric1, relLinDelta) + dotVec(angDelta, raXnF1)) * invDt + tanVel1;
+    const float3 relTanDelta = float3(CT0 * fric0.x + CT1 * fric1.x, CT0 * fric0.y + CT1 * fric1.y,
+                                      CT0 * fric0.z + CT1 * fric1.z);
+    const float tanMagSq = dotVec(relTanDelta, relTanDelta);
+
+    if (tanMagSq > FEMC_THRESHOLD)
+    {
+        const float CT = sqrt(tanMagSq);
+        const float invTanMag = 1.0f / CT;
+        r.tangent = float3(relTanDelta.x * invTanMag, relTanDelta.y * invTanMag, relTanDelta.z * invTanMag);
+
+        const float unitResponseT0 = rigidRefCount * raXnF0_resp.w + deformableInvMass_massSplitting;
+        const float invTanDenom0 = (unitResponseT0 > 0.0f) ? (1.0f / unitResponseT0) : 0.0f;
+        const float unitResponseT1 = rigidRefCount * raXnF1_resp.w + deformableInvMass_massSplitting;
+        const float invTanDenom1 = (unitResponseT1 > 0.0f) ? (1.0f / unitResponseT1) : 0.0f;
+
+        const float deltaLambdaT0 = CT0 * invTanDenom0;
+        const float deltaLambdaT1 = CT1 * invTanDenom1;
+
+        const float dLT = sqrt(deltaLambdaT0 * deltaLambdaT0 + deltaLambdaT1 * deltaLambdaT1);
+        // getCombinedFriction() == 0 (null-material path, DEFERRED): deltaLambdaT == -0.
+        const float combinedFriction = 0.0f;
+        r.deltaLambdaT = -min(dLT, combinedFriction * abs(r.deltaLambdaN));
+    }
+
+    return r;
+}
+
+public int getGlobalRigidBodyId(uint64_t rigidId, uint64_t prePrepDescPtr, uint numSolverBodies)
+{
+    if (nodeIsStaticBody(rigidId))
+        return -1;
+    const uint solverBodyIdx = Ptr<uint>(Ptr<PxgPrePrepDescGpu>(prePrepDescPtr)[0].solverBodyIndices)[nodeIndex(rigidId)];
+    return nodeIsArticulation(rigidId) ? int(numSolverBodies + solverBodyIdx) : int(solverBodyIdx);
 }

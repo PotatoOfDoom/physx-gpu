@@ -528,6 +528,25 @@ static const uint8_t kSbReorderPsContacts[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
 //   Kept as its own row rather than aliased, so a future divergence in either kernel's
 //   signature cannot silently corrupt the other's blob.
 static const uint8_t kSbRigidContactPrep[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 1 };
+// gpusimulationcontroller softbody-vs-rigid COLLISION SOLVE (P8.2 tranche e):
+//   sb_queryRigidSoftContactReferenceCountLaunch{,TGS}(PxgSoftBody* softbodies,
+//     PxgFemOtherContactInfo* contactInfos, PxgFemRigidConstraintBlock* constraints,
+//     PxU32* numContacts, PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
+//     PxgArticulationCoreDesc* artiCoreDesc, PxgSolverSharedDesc* sharedDesc, PxReal dt,
+//     PxReal* appliedForces, PxU32* rigidBodyReferenceCounts)  -- launch site
+//   PxgSoftBodyCore.cpp:1766 (PGS and TGS share the pack).  Eight device pointers + PxReal
+//   (@64) + two device pointers (@72/@80) -> natural-alignment blob = 88 bytes.
+static const uint8_t kSbRigidContactQuery[] = { 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
+//   sb_solveRigidSoftCollisionLaunch{,TGS}(... the query pack with float4* rigidDeltaVel
+//     inserted at @64, then PxReal dt, PxsDeformableVolumeMaterialData* materials,
+//     const PxsMaterialData* rigidBodyMaterials)  -- launch site PxgSoftBodyCore.cpp:1050
+//   (PGS and TGS share the pack).  Eleven device pointers + PxReal (@88) + two device
+//   pointers (@96/@104) -> natural-alignment blob = 112 bytes.
+//   Both rows are byte-identical to their cloth counterparts (kClothRigidContactQuery /
+//   kClothRigidContactSolve): the CUDA packs differ only in argument 0's pointee type and,
+//   for the solve, the deformable material type -- 8 bytes either way.  Kept separate so a
+//   future divergence in either signature cannot silently corrupt the other's blob.
+static const uint8_t kSbRigidContactSolve[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
 
 // gpusimulationcontroller particlesystem.cu (P6.2 PBD grid build + reorder):
 //   ps_calculateHashLaunch(const PxgParticleSystem* particleSystems,
@@ -896,6 +915,10 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_other_contact_remap_to_simLaunch", kSbContactRemapToSim, uint32_t(sizeof(kSbContactRemapToSim)) },
     { "sb_reorderPSContactsLaunch", kSbReorderPsContacts, uint32_t(sizeof(kSbReorderPsContacts)) },
     { "sb_rigidContactPrepareLaunch", kSbRigidContactPrep, uint32_t(sizeof(kSbRigidContactPrep)) },
+    { "sb_queryRigidSoftContactReferenceCountLaunch", kSbRigidContactQuery, uint32_t(sizeof(kSbRigidContactQuery)) },
+    { "sb_queryRigidSoftContactReferenceCountLaunchTGS", kSbRigidContactQuery, uint32_t(sizeof(kSbRigidContactQuery)) },
+    { "sb_solveRigidSoftCollisionLaunch", kSbRigidContactSolve, uint32_t(sizeof(kSbRigidContactSolve)) },
+    { "sb_solveRigidSoftCollisionLaunchTGS", kSbRigidContactSolve, uint32_t(sizeof(kSbRigidContactSolve)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },

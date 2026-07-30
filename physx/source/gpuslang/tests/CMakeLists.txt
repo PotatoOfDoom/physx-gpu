@@ -550,7 +550,11 @@ pxg_compile_shader(softBodyContactRemapBda sb_other_contact_remap_to_simLaunch
 # 78-line constraint-block writer through the new pxgSlangFemRigidContact module rather than
 # copying it.  In PXG_NOCONTRACT_SHADERS: the response terms are dot-of-cross chains through
 # mat33MulVec that would otherwise fuse to FMAs and break parity with the CPU reference.
-pxg_compile_shader(softBodyRigidContactBda sb_rigidContactPrepareLaunch)
+pxg_compile_shader(softBodyRigidContactBda sb_rigidContactPrepareLaunch
+                   sb_queryRigidSoftContactReferenceCountLaunch
+                   sb_queryRigidSoftContactReferenceCountLaunchTGS
+                   sb_solveRigidSoftCollisionLaunch
+                   sb_solveRigidSoftCollisionLaunchTGS)
 pxg_compile_shader(contactReduce ctContactReduce)
 pxg_compile_shader(npSbTet ctSbTet)
 pxg_compile_shader(npSbSelf ctSbSelfQuery)

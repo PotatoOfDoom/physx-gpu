@@ -2013,7 +2013,10 @@ int main()
 
         const float dt = 1.0f / 60.0f;
         const char* stepsEnv = std::getenv("PXG_SB_STEPS");
-        const int steps = stepsEnv ? atoi(stepsEnv) : 60;
+        // 60 is enough for the free fall.  With the plane on the cube is not even caught
+        // until step ~49 and does not come to rest until ~150, so a 60-step run would
+        // measure the bounce and call it a failure.
+        const int steps = stepsEnv ? atoi(stepsEnv) : (sbs.hasPlane ? 200 : 60);
 
         float meanC0 = 0.0f, minC0 = 0.0f, meanS0 = 0.0f, minS0 = 0.0f, extS0 = 0.0f;
         bool finite = softBodyMeanMinY(sbs, /*sim*/ false, meanC0, minC0);
@@ -2029,6 +2032,8 @@ int main()
         float extSettleRef = extS0;
         PxU32 maxSbContacts = 0, prevSbContacts = 0;
         int firstContactStep = -1;
+        float restMaxAbsDy = 0.0f;      // largest |dy| over the last quarter of the run
+        const int restFrom = steps - steps / 4;
         for (int i = 0; i < steps; ++i)
         {
             scene->simulate(dt);
@@ -2062,6 +2067,7 @@ int main()
                             i, meanC, meanC - prevC, meanS, PxAbs(meanC - meanS), extS, sbContacts);
             prevSbContacts = sbContacts;
             if (meanC > prevC + 1e-3f) ++nonMonotonic;   // free fall: must not rise
+            if (i >= restFrom) restMaxAbsDy = PxMax(restMaxAbsDy, PxAbs(meanC - prevC));
             prevC = meanC;
         }
         const float drop = meanC0 - meanC;
@@ -2109,13 +2115,49 @@ int main()
         }
         else if (!(meanC < meanC0 - 0.05f))
         { std::printf("FAIL: softbody collision mesh did not fall (drop=%.4f)\n", drop); ++failures; }
+
+        // ---- PXG_SB_PLANE: the cube must be CAUGHT, not fall through ---------------
+        // With the plane on this is no longer a free fall, so the closed-form and
+        // monotonicity checks above are gated off; these replace them.  A 27-vertex cube of
+        // edge 1 resting on y=0 has its centroid at y=0.5, so "caught" means the mean
+        // settles near 0.5 and, crucially, STOPS well above the depth an uncaught cube
+        // would have reached by the same step.
+        if (sbs.hasPlane)
+        {
+            const float uncaughtY = meanC0 - expectDrop;   // where a free fall would be
+            if (!(meanC > uncaughtY + 1.0f))
+            { std::printf("FAIL: PXG_SB_PLANE=1 and the cube fell THROUGH the plane: mean y "
+                          "%.4f, an uncaught fall would be at %.4f\n", meanC, uncaughtY); ++failures; }
+            else if (!(maxSbContacts > 0u))
+            { std::printf("FAIL: the cube stopped but no contacts were generated (%u)\n",
+                          maxSbContacts); ++failures; }
+            // ...and it must come to REST, not bounce forever.  This is the assertion that
+            // separates "the solve pushes back" from "the solve converges": an unconverged
+            // contact solve oscillates around roughly the right height, which the catch
+            // check above would happily accept.
+            else if (!(restMaxAbsDy < 1e-4f))
+            { std::printf("FAIL: the cube was caught but never settled: |dy| still %.6f over "
+                          "the last %d steps\n", restMaxAbsDy, steps - restFrom); ++failures; }
+            // A cube of edge 1 resting on y=0 has its centroid at 0.5, less its elastic
+            // compression under its own weight.  Anything far from that is the wrong height.
+            else if (!(PxAbs(meanC - 0.5f) < 0.05f))
+            { std::printf("FAIL: settled at the wrong height: mean y %.4f, expected ~0.5 "
+                          "(cube half-height above the plane)\n", meanC); ++failures; }
+            else
+                std::printf("  CAUGHT by the plane and SETTLED: mean y %.5f (ideal 0.5 less "
+                            "elastic compression; an uncaught fall would be at %.4f), rest "
+                            "|dy| over the last %d steps = %.6f, %u contacts from step %d\n",
+                            meanC, uncaughtY, steps - restFrom, restMaxAbsDy,
+                            maxSbContacts, firstContactStep);
+        }
         // QUANTITATIVE free fall: checking the closed form rather than "it went down"
         // gives the scene teeth on the WHOLE integrate chain (sb_gm_preIntegrateLaunch's
         // gravity predict, sb_gm_stepSoftbodyLaunch, sb_gm_finalizeVelocitiesLaunch)
         // instead of only on its sign.  The band is 1%; the measured error is 0.0000%.
-        if (sbs.stretchY != 1.0f || sbs.noGravity)
+        if (sbs.stretchY != 1.0f || sbs.noGravity || sbs.hasPlane)
             std::printf("  (closed-form free-fall check skipped: %s)\n",
-                        sbs.noGravity ? "gravity is disabled"
+                        sbs.hasPlane ? "the plane floor catches the cube, so it is not a free fall"
+                                     : sbs.noGravity ? "gravity is disabled"
                                       : "the cube was spawned stretched, so its elastic response "
                                         "moves the mean too");
         else if (!(PxAbs(drop - expectDrop) < 0.01f * expectDrop))
@@ -2131,7 +2173,7 @@ int main()
         // the constitutive solve contributes nothing.  A cube spawned deformed is pulled
         // by its own elastic response as well as by gravity, and that legitimately moves
         // the mean both ways -- so these two are gated on the undeformed case.
-        if (sbs.stretchY == 1.0f && !sbs.noGravity && nonMonotonic != 0)
+        if (sbs.stretchY == 1.0f && !sbs.noGravity && !sbs.hasPlane && nonMonotonic != 0)
         { std::printf("FAIL: collision mean y increased on %d step(s)\n", nonMonotonic); ++failures; }
         if (!finite)
         { std::printf("FAIL: softbody y went non-finite\n"); ++failures; }

@@ -106,8 +106,10 @@
 
 import pxgSlangCommon;            // PxgSolverBodyData, PxgSolverTxIData
 import pxgSlangPrepDesc;          // PxgPrePrepDescGpu, PxgConstraintPrepareDescGpu
+import pxgSlangSolverDesc;        // PxgSolverCoreDescGpu, PxgSolverSharedDesc{PGS,TGS}Gpu
 import pxgSlangSoftBodyDesc;      // PxgSoftBodyGpu (mSimTetIndices@80, mSimDeltaPos@128, ...)
-import pxgSlangFemRigidContact;   // prepareFEMContacts + the FRC_* block layout
+import pxgSlangAtomicFloat;       // pxgAtomicAddF4W / pxgAtomicAddF4XYZ (P8.1)
+import pxgSlangFemRigidContact;   // prepareFEMContacts, contactInitialize, readRigidVelocity
 
 // PxgSoftBodyKernelGridDim/BlockDim::SB_UPDATEROTATION — the engine's fixed launch
 // (PxgSoftBodyCore.cpp:2259).  RC_BLOCK MUST equal [numthreads] below: the bridge forwards
@@ -126,7 +128,9 @@ static const uint PXG_BITSHIFT_TET_ID = 20u;
 //   PxU32 rigidMatInd_isInCollision @12 (bit31 = isInCollision).
 static const uint CI_pairInd0 = 0u;
 static const uint CI_pairInd1 = 8u;
+static const uint CI_rigidMatInd = 12u;
 static const uint CI_STRIDE   = 16u;
+static const uint CI_COLLISION_FLAG = 0x80000000u;
 
 // ---------------------------------------------------------------------------
 // sb_rigidContactPrepareLaunch push blob.
@@ -231,4 +235,337 @@ void sb_rigidContactPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 
                            gSbPrep.prepDesc, gSbPrep.prePrepDesc,
                            softbodies[softBodyId].mPenBiasClamp);
     }
+}
+
+// ===========================================================================
+// P8.2 tranche e — chain kernels 6 and 7: the softbody-vs-rigid COLLISION SOLVE.
+//
+//   sb_queryRigidSoftContactReferenceCountLaunch (softBody.cu:1944, helper :1824, launch
+//   PxgSoftBodyCore.cpp:1756) — a checkOnlyActivity pass.  It decides which contacts are
+//   ACTIVE, marks them in-collision, and bumps a reference count on every tet vertex the
+//   contact touches (and on the rigid body).  Those counts are the MASS-SPLITTING
+//   denominators the solve below divides by, so this pass is not bookkeeping -- get the
+//   counts wrong and every contact applies the wrong share of its impulse.
+//
+//   sb_solveRigidSoftCollisionLaunch (softBody.cu:2062, helper :1963, launch :1040) — the
+//   solve proper.  For each active contact it evaluates the constraint, accumulates the
+//   applied force, and scatters the position delta onto the four tet vertices.  This is the
+//   kernel that finally MOVES the softbody in response to a rigid contact.
+//
+// Both are near-clones of cloth_queryRigidClothContactReferenceCountLaunch and
+// cloth_solveRigidClothCollisionLaunch, with the same argument packs (positions and types
+// identical apart from argument 0 and the material type), hence the same proven ABI rows.
+// The shared machinery -- readRigidVelocity (PxgVelocityReader), contactInitialize
+// (FEMCollision::initialize) and getGlobalRigidBodyId -- lives in pxgSlangFemRigidContact.
+//
+// WHAT DIFFERS from the cloth pair:
+//   - FOUR tet vertices instead of a triangle-or-vertex branch.  CUDA templates
+//     FEMCollision on PxVec4 here and PxVec3 there; the only place the width reaches the
+//     shared code is the mass-splitting dot, which is why contactInitialize takes it as a
+//     scalar (see the module);
+//   - the reference counts live in mSimDelta.w and the deltas/inverse masses in
+//     mSimDeltaPos -- TWO different buffers, as in cloth (mDeltaPos / mAccumulatedDeltaPos);
+//   - readSoftBody multiplies the inverse masses BY the reference counts
+//     (deformableUtils.cuh:614).  By, not divided by -- that is upstream's mass-splitting
+//     convention and reproducing it is the whole point of the query pass.
+//
+// DEFERRED, exactly as in the cloth port: the ARTICULATION branch, and FRICTION (the
+// null-material path, so getCombinedFriction() == 0 and deltaLambdaT collapses to -0).
+// `materials` and `rigidBodyMaterials` sit in the solve blob unread for that reason.
+// ===========================================================================
+
+// PxgSolverCoreDesc::numSolverBodies @268 (pxgSlangSolverDesc mirror).
+// FEMCollision::readSoftBody (deformableUtils.cuh:580) — the FOUR-vertex tet form.
+// Returns the (optionally mass-split) per-vertex inverse masses and fills the blended
+// linear delta.  countReferenceOnly mirrors CUDA's checkOnlyActivity: on that path the
+// reference-count multiply is SKIPPED, because the counts are still being accumulated.
+float4 readSoftBodyInvMasses(Ptr<PxgSoftBodyGpu> softbodies, uint softBodyId, uint tetId,
+                             float4 bc, bool countReferenceOnly, out float3 deformableLinDelta)
+{
+    Ptr<float4> posDeltas = Ptr<float4>(softbodies[softBodyId].mSimDeltaPos);
+    const uint4 tetId4 = Ptr<uint4>(softbodies[softBodyId].mSimTetIndices)[tetId];
+
+    const float4 pd0 = posDeltas[tetId4.x];
+    const float4 pd1 = posDeltas[tetId4.y];
+    const float4 pd2 = posDeltas[tetId4.z];
+    const float4 pd3 = posDeltas[tetId4.w];
+
+    const float4 softBodyDelta = pd0 * bc.x + pd1 * bc.y + pd2 * bc.z + pd3 * bc.w;
+    deformableLinDelta = float3(softBodyDelta.x, softBodyDelta.y, softBodyDelta.z);
+
+    float4 invM = float4(pd0.w, pd1.w, pd2.w, pd3.w);
+    if (!countReferenceOnly)
+    {
+        // Mass-splitting by the per-vertex reference counts (mSimDelta.w).
+        Ptr<float4> simDelta = Ptr<float4>(softbodies[softBodyId].mSimDelta);
+        invM = float4(invM.x * simDelta[tetId4.x].w, invM.y * simDelta[tetId4.y].w,
+                      invM.z * simDelta[tetId4.z].w, invM.w * simDelta[tetId4.w].w);
+    }
+    return invM;
+}
+
+// the 4-wide mass-splitting term, bc.multiply(bc).dot(invM) -- the tetrahedron form of what
+// the cloth callers compute over three components.
+float tetMassSplit(float4 bc, float4 invM)
+{
+    return bc.x * bc.x * invM.x + bc.y * bc.y * invM.y
+         + bc.z * bc.z * invM.z + bc.w * bc.w * invM.w;
+}
+
+// ---------------------------------------------------------------------------
+// sb_queryRigidSoftContactReferenceCountLaunch push blob.
+// CUDA arg pack (PxgSoftBodyCore.cpp:1766): { PxgSoftBody* softbodies,
+// PxgFemOtherContactInfo* contactInfos, PxgFemRigidConstraintBlock* constraints,
+// PxU32* numContacts, PxgPrePrepDesc* prePrepDesc, PxgSolverCoreDesc* solverCoreDesc,
+// PxgArticulationCoreDesc* artiCoreDesc, PxgSolverSharedDesc* sharedDesc, PxReal dt,
+// PxReal* appliedForces, PxU32* rigidBodyReferenceCounts } -> 88-byte blob.
+// (ABI row {8,8,8,8,8,8,8,8,4,8,8} — identical to the cloth query row.)
+// ---------------------------------------------------------------------------
+struct SbQueryContactParams
+{
+    uint64_t softbodies;                // @0
+    uint64_t contactInfos;              // @8
+    uint64_t constraints;               // @16
+    uint64_t numContacts;               // @24
+    uint64_t prePrepDesc;               // @32
+    uint64_t solverCoreDesc;            // @40
+    uint64_t artiCoreDesc;              // @48 (DEFERRED: articulation never dereferenced)
+    uint64_t sharedDesc;                // @56
+    float dt;                           // @64
+    uint _pad68;                        // @68
+    uint64_t appliedForces;             // @72
+    uint64_t rigidBodyReferenceCounts;  // @80 -> 88
+}
+[[vk::push_constant]]
+ConstantBuffer<SbQueryContactParams> gSbQuery;
+
+// ---------------------------------------------------------------------------
+// sb_solveRigidSoftCollisionLaunch push blob.
+// CUDA arg pack (PxgSoftBodyCore.cpp:1050): the query pack with float4* rigidDeltaVel
+// inserted at @64 and { PxReal dt, PxsDeformableVolumeMaterialData* materials,
+// const PxsMaterialData* rigidBodyMaterials } appended -> 112-byte blob.
+// (ABI row {8,8,8,8,8,8,8,8,8,8,8,4,8,8} — identical to the cloth solve row.)
+// ---------------------------------------------------------------------------
+struct SbSolveContactParams
+{
+    uint64_t softbodies;                // @0
+    uint64_t contactInfos;              // @8
+    uint64_t constraints;               // @16
+    uint64_t numContacts;               // @24
+    uint64_t prePrepDesc;               // @32
+    uint64_t solverCoreDesc;            // @40
+    uint64_t artiCoreDesc;              // @48 (DEFERRED)
+    uint64_t sharedDesc;                // @56
+    uint64_t rigidDeltaVel;             // @64  output
+    uint64_t appliedForces;             // @72  in/out
+    uint64_t rigidBodyReferenceCounts;  // @80
+    float dt;                           // @88
+    uint _pad92;                        // @92
+    uint64_t materials;                 // @96  (DEFERRED: null-material path)
+    uint64_t rigidBodyMaterials;        // @104 (DEFERRED) -> 112
+}
+[[vk::push_constant]]
+ConstantBuffer<SbSolveContactParams> gSbSolve;
+
+void queryRigidSoftContactReferenceCount(bool isTGS, uint idx, uint blockX)
+{
+    const uint numSolverBodies = Ptr<PxgSolverCoreDescGpu>(gSbQuery.solverCoreDesc)[0].numSolverBodies;
+    const uint tNumContacts = Ptr<uint>(gSbQuery.numContacts)[0];
+    const uint nbBlocksRequired = (tNumContacts + RC_BLOCK - 1u) / RC_BLOCK;
+    const uint nbIterationsPerBlock = (nbBlocksRequired + RC_GRID - 1u) / RC_GRID;
+
+    Ptr<PxgSoftBodyGpu> softbodies = Ptr<PxgSoftBodyGpu>(gSbQuery.softbodies);
+    Ptr<float> appliedForces = Ptr<float>(gSbQuery.appliedForces);
+
+    for (uint i = 0; i < nbIterationsPerBlock; ++i)
+    {
+        const uint workIndex = i * RC_BLOCK + idx + nbIterationsPerBlock * blockX * RC_BLOCK;
+        if (workIndex >= tNumContacts)
+            return;
+
+        const uint64_t ciBase = gSbQuery.contactInfos + uint64_t(workIndex) * CI_STRIDE;
+        const uint rigidMatInd = Ptr<uint>(ciBase + CI_rigidMatInd)[0];
+        const bool wasActive = (rigidMatInd & CI_COLLISION_FLAG) != 0u;
+        const uint64_t rigidId = Ptr<uint64_t>(ciBase + CI_pairInd0)[0];
+        const uint pairInd1 = Ptr<uint>(ciBase + CI_pairInd1)[0];
+
+        const uint index = workIndex / 32u;
+        const uint offset = workIndex & 31u;
+        const uint64_t cBase = gSbQuery.constraints + uint64_t(index) * FRC_STRIDE;
+
+        const float4 fricTan0_invMass0 = Ptr<float4>(cBase + FRC_fricTan0_invMass)[offset];
+        const float4 bc = Ptr<float4>(cBase + FRC_barycentric)[offset];
+
+        const uint softBodyId = pairInd1 >> PXG_BITSHIFT_TET_ID;
+        const uint tetId = pairInd1 & PX_MAX_NB_DEFORMABLE_VOLUME_TET;
+
+        if (tetId < PX_MAX_NB_DEFORMABLE_VOLUME_TET)
+        {
+            const int globalRigidBodyId = getGlobalRigidBodyId(rigidId, gSbQuery.prePrepDesc, numSolverBodies);
+
+            float3 deformableLinDelta;
+            const float4 deformableInvMasses =
+                readSoftBodyInvMasses(softbodies, softBodyId, tetId, bc,
+                                      /*countReferenceOnly*/ true, deformableLinDelta);
+
+            bool isActive;
+            if (wasActive)
+            {
+                // Once activated, keep the pair active to maintain a CONSERVATIVE reference
+                // count (softBody.cu:1888).  Dropping this makes the counts oscillate.
+                isActive = true;
+            }
+            else
+            {
+                const float3 bcVec = float3(bc.x, bc.y, bc.z);
+                const ContactResult cr =
+                    contactInitialize(cBase, offset, rigidId, isTGS, appliedForces[workIndex],
+                                      gSbQuery.dt, bcVec, deformableLinDelta,
+                                      tetMassSplit(bc, deformableInvMasses),
+                                      /*rigidRefCount*/ 1u, wasActive, /*checkOnly*/ true,
+                                      gSbQuery.solverCoreDesc, gSbQuery.sharedDesc, gSbQuery.prePrepDesc);
+                isActive = cr.isActive;
+                if (isActive)
+                    Ptr<uint>(ciBase + CI_rigidMatInd)[0] = rigidMatInd | CI_COLLISION_FLAG;
+            }
+
+            if (isActive)
+            {
+                // Increment the reference count of the four tet vertices.  The bc > 1e-3
+                // gate is upstream's (softBody.cu:1911): a vertex a contact barely touches
+                // must not claim a share of the mass split.
+                const uint4 tetId4 = Ptr<uint4>(softbodies[softBodyId].mSimTetIndices)[tetId];
+                const uint64_t simDelta = softbodies[softBodyId].mSimDelta;
+                if (bc.x > 1e-3f && deformableInvMasses.x != 0.0f) pxgAtomicAddF4W(simDelta, tetId4.x, 1.0f);
+                if (bc.y > 1e-3f && deformableInvMasses.y != 0.0f) pxgAtomicAddF4W(simDelta, tetId4.y, 1.0f);
+                if (bc.z > 1e-3f && deformableInvMasses.z != 0.0f) pxgAtomicAddF4W(simDelta, tetId4.z, 1.0f);
+                if (bc.w > 1e-3f && deformableInvMasses.w != 0.0f) pxgAtomicAddF4W(simDelta, tetId4.w, 1.0f);
+
+                if (globalRigidBodyId != -1 && fricTan0_invMass0.w != 0.0f)
+                {
+                    uint prev;
+                    InterlockedAdd((Ptr<uint>(gSbQuery.rigidBodyReferenceCounts))[globalRigidBodyId], 1u, prev);
+                }
+            }
+        }
+    }
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)] // == RC_BLOCK; SB_UPDATEROTATION
+void sb_queryRigidSoftContactReferenceCountLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    queryRigidSoftContactReferenceCount(false, groupThreadId.x, groupId.x);
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)] // == RC_BLOCK; SB_UPDATEROTATION
+void sb_queryRigidSoftContactReferenceCountLaunchTGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    queryRigidSoftContactReferenceCount(true, groupThreadId.x, groupId.x);
+}
+
+void solveRigidSoftContact(bool isTGS, uint idx, uint blockX)
+{
+    const uint numSolverBodies = Ptr<PxgSolverCoreDescGpu>(gSbSolve.solverCoreDesc)[0].numSolverBodies;
+    const uint tNumContacts = Ptr<uint>(gSbSolve.numContacts)[0];
+    const uint nbBlocksRequired = (tNumContacts + RC_BLOCK - 1u) / RC_BLOCK;
+    const uint nbIterationsPerBlock = (nbBlocksRequired + RC_GRID - 1u) / RC_GRID;
+
+    Ptr<PxgSoftBodyGpu> softbodies = Ptr<PxgSoftBodyGpu>(gSbSolve.softbodies);
+    Ptr<float> appliedForces = Ptr<float>(gSbSolve.appliedForces);
+    Ptr<float4> rigidDeltaVel = Ptr<float4>(gSbSolve.rigidDeltaVel);
+
+    for (uint i = 0; i < nbIterationsPerBlock; ++i)
+    {
+        const uint workIndex = i * RC_BLOCK + idx + nbIterationsPerBlock * blockX * RC_BLOCK;
+        if (workIndex >= tNumContacts)
+            return;
+
+        const uint64_t ciBase = gSbSolve.contactInfos + uint64_t(workIndex) * CI_STRIDE;
+        const uint rigidMatInd = Ptr<uint>(ciBase + CI_rigidMatInd)[0];
+        const bool isActive = (rigidMatInd & CI_COLLISION_FLAG) != 0u;
+        const uint64_t rigidId = Ptr<uint64_t>(ciBase + CI_pairInd0)[0];
+        const uint pairInd1 = Ptr<uint>(ciBase + CI_pairInd1)[0];
+
+        const uint index = workIndex / 32u;
+        const uint offset = workIndex & 31u;
+        const uint64_t cBase = gSbSolve.constraints + uint64_t(index) * FRC_STRIDE;
+
+        const float4 fricTan0_invMass0 = Ptr<float4>(cBase + FRC_fricTan0_invMass)[offset];
+        const float4 bc = Ptr<float4>(cBase + FRC_barycentric)[offset];
+
+        const uint softBodyId = pairInd1 >> PXG_BITSHIFT_TET_ID;
+        const uint tetId = pairInd1 & PX_MAX_NB_DEFORMABLE_VOLUME_TET;
+
+        if (tetId < PX_MAX_NB_DEFORMABLE_VOLUME_TET)
+        {
+            float3 deltaLinVel0 = float3(0.0f, 0.0f, 0.0f);
+            float3 deltaAngVel0 = float3(0.0f, 0.0f, 0.0f);
+            float count = 0.0f;
+
+            if (isActive)
+            {
+                // readRigidBody: the reference count is 1 for a static body
+                // (globalRigidBodyId == -1); friction is the DEFERRED null-material path.
+                const int globalRigidBodyId = getGlobalRigidBodyId(rigidId, gSbSolve.prePrepDesc, numSolverBodies);
+                uint rigidBodyReferenceCount = 1u;
+                if (globalRigidBodyId != -1 && fricTan0_invMass0.w != 0.0f)
+                    rigidBodyReferenceCount = Ptr<uint>(gSbSolve.rigidBodyReferenceCounts)[globalRigidBodyId];
+
+                float3 deformableLinDelta;
+                const float4 deformableInvMasses =
+                    readSoftBodyInvMasses(softbodies, softBodyId, tetId, bc,
+                                          /*countReferenceOnly*/ false, deformableLinDelta);
+
+                const float3 bcVec = float3(bc.x, bc.y, bc.z);
+                const ContactResult cr =
+                    contactInitialize(cBase, offset, rigidId, isTGS, appliedForces[workIndex],
+                                      gSbSolve.dt, bcVec, deformableLinDelta,
+                                      tetMassSplit(bc, deformableInvMasses),
+                                      rigidBodyReferenceCount, isActive, /*checkOnly*/ false,
+                                      gSbSolve.solverCoreDesc, gSbSolve.sharedDesc, gSbSolve.prePrepDesc);
+
+                // computeFEMChange: deltaPos = -(deltaLambdaN*normal + deltaLambdaT*tangent)*dt.
+                const float3 deltaPos = float3(
+                    -(cr.deltaLambdaN * cr.normal.x + cr.deltaLambdaT * cr.tangent.x) * gSbSolve.dt,
+                    -(cr.deltaLambdaN * cr.normal.y + cr.deltaLambdaT * cr.tangent.y) * gSbSolve.dt,
+                    -(cr.deltaLambdaN * cr.normal.z + cr.deltaLambdaT * cr.tangent.z) * gSbSolve.dt);
+                appliedForces[workIndex] = cr.accumulatedDeltaLambdaN;
+
+                // writeSoftBody (deformableUtils.cuh:620): scatter onto the four vertices,
+                // each scaled by ITS OWN mass-split inverse mass times ITS barycentric.
+                const uint4 tetId4 = Ptr<uint4>(softbodies[softBodyId].mSimTetIndices)[tetId];
+                const uint64_t simDelta = softbodies[softBodyId].mSimDelta;
+                if (deformableInvMasses.x > 0.0f)
+                    pxgAtomicAddF4XYZ(simDelta, tetId4.x, deltaPos * (deformableInvMasses.x * bc.x));
+                if (deformableInvMasses.y > 0.0f)
+                    pxgAtomicAddF4XYZ(simDelta, tetId4.y, deltaPos * (deformableInvMasses.y * bc.y));
+                if (deformableInvMasses.z > 0.0f)
+                    pxgAtomicAddF4XYZ(simDelta, tetId4.z, deltaPos * (deformableInvMasses.z * bc.z));
+                if (deformableInvMasses.w > 0.0f)
+                    pxgAtomicAddF4XYZ(simDelta, tetId4.w, deltaPos * (deformableInvMasses.w * bc.w));
+
+                // computeRigidChange DEFERRED: a static body leaves count and the deltas 0.
+            }
+
+            // writeRigidBody: for a static contact CUDA writes zeros with count 0.
+            rigidDeltaVel[workIndex] = float4(deltaLinVel0.x, deltaLinVel0.y, deltaLinVel0.z, count);
+            rigidDeltaVel[workIndex + tNumContacts] = float4(deltaAngVel0.x, deltaAngVel0.y, deltaAngVel0.z, 0.0f);
+        }
+    }
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)] // == RC_BLOCK; SB_UPDATEROTATION
+void sb_solveRigidSoftCollisionLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    solveRigidSoftContact(false, groupThreadId.x, groupId.x);
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)] // == RC_BLOCK; SB_UPDATEROTATION
+void sb_solveRigidSoftCollisionLaunchTGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    solveRigidSoftContact(true, groupThreadId.x, groupId.x);
 }
