@@ -1308,3 +1308,209 @@ void sb_gm_updateTetModelVertsLaunch(uint3 groupThreadId : SV_GroupThreadID, uin
         curPositions[groupThreadIdx] = newPos;
     }
 }
+
+// ===========================================================================
+// P8.5 — sb_calculateStressLaunch (softBodyGM.cu:2716, launch
+// PxgSoftBodyCore::calculateStress, PxgSoftBodyCore.cpp:2996, SB_CALC_STRESS).
+//
+// One thread per COLLISION-mesh tetrahedron computes the co-rotated Cauchy stress tensor and
+// the scalar stress coefficient that goes with it, writing both back into the descriptor
+// (mTetraStresses and mTetraStressCoefficient).
+//
+// WHY IT MATTERS HERE.  The scalar coefficient is the input to the SELF-COLLISION stress
+// gate: SbMeshTreeTraverser drops a self-contact whose tetrahedron carries more stress than
+// mSelfCollisionStressTolerance (softbodySoftbodyMidPhase.cu:441, ported in P8.4 tranche a).
+// Until this kernel was mapped, mTetraStressCoefficient held whatever the allocation
+// happened to contain, which is why PXG_SCENE=softbodyselfcollide has to set the tolerance
+// to a value no stress can exceed.  That workaround can now be removed -- and the kernel's
+// own launch gate says as much: it runs when eCOMPUTE_STRESS_TENSOR is set OR when
+// self-collision is enabled, i.e. the stress field exists FOR the self-collision gate.
+//
+// *** THE GRID. ***
+// grid (ceil(maxTetrahedrons / 256), nbActiveSoftbodies, 1), block (256, 1, 1).  The y-grid
+// selects the active body, exactly as in the self-collision midphase, and the bridge
+// forwards it.  blockDim is dropped, so [numthreads(256,1,1)] reproduces
+// PxgSoftBodyKernelBlockDim::SB_UPDATEROTATION by construction and the x index is
+// gtid.x + gid.x * 256 with no stride loop -- the engine sizes the grid to the mesh.
+//
+// DEVIATIONS from CUDA:
+//   - the whole PxgSoftBody is blockCopy'd into shared memory and read from there.  That is
+//     a caching optimisation, not semantics; every field is read directly through Ptr<>
+//     here, as everywhere else in this port, and the __syncthreads it needs goes with it;
+//   - `const PxQuat initialRotation = shSoftbody.mInitialRotation;` is loaded by the CUDA
+//     and NEVER USED.  It is not reproduced -- a dead load is not ABI;
+//   - mMaterialIndices is a PxU16 array; llvmpipe has no 16-bit storage in these shaders, so
+//     the containing 32-bit word is read and the half extracted.
+//
+// NoContraction-stamped: the deformation gradient is two 3x3 products and the stress is a
+// symmetrised difference, all mul-feeding-add chains.  The one non-portable operation is the
+// final sqrt, which produces the scalar coefficient only.
+// ===========================================================================
+
+// PxsDeformableVolumeMaterialData (PxsDeformableVolumeMaterialCore.h:50), 32 B:
+// youngs @0, poissons @4, dynamicFriction @8, ...
+static const uint64_t STRESS_MAT_STRIDE = 32UL;
+
+// PxDeformableVolumeFlag::eCOMPUTE_STRESS_TENSOR is bit 0 of mVolumeFlags (bytes 2..3 of
+// mFlagsWord); eDISABLE_SELF_COLLISION is bit 0 of mBodyFlags (byte 1).
+struct StressParams
+{
+    uint64_t softbodies;         // @0
+    uint64_t activeSoftbodies;   // @8
+    uint64_t materials;          // @16 -> 24
+}
+[[vk::push_constant]] ConstantBuffer<StressParams> gSt;
+
+// A column-major PxMat33 as three columns, matching the 36-byte flat layout on the device.
+struct Mat33 { float3 c0, c1, c2; }
+
+Mat33 mat33Load(uint64_t base)
+{
+    Mat33 m;
+    m.c0 = float3(Ptr<float>(base)[0], Ptr<float>(base)[1], Ptr<float>(base)[2]);
+    m.c1 = float3(Ptr<float>(base)[3], Ptr<float>(base)[4], Ptr<float>(base)[5]);
+    m.c2 = float3(Ptr<float>(base)[6], Ptr<float>(base)[7], Ptr<float>(base)[8]);
+    return m;
+}
+
+void mat33Store(uint64_t base, Mat33 m)
+{
+    Ptr<float>(base)[0] = m.c0.x; Ptr<float>(base)[1] = m.c0.y; Ptr<float>(base)[2] = m.c0.z;
+    Ptr<float>(base)[3] = m.c1.x; Ptr<float>(base)[4] = m.c1.y; Ptr<float>(base)[5] = m.c1.z;
+    Ptr<float>(base)[6] = m.c2.x; Ptr<float>(base)[7] = m.c2.y; Ptr<float>(base)[8] = m.c2.z;
+}
+
+// PxMat33::transform (PxMat33.h:278): column0 * v.x + column1 * v.y + column2 * v.z.
+float3 mat33Transform(Mat33 m, float3 v)
+{
+    return m.c0 * v.x + m.c1 * v.y + m.c2 * v.z;
+}
+
+// PxMat33::operator*(PxMat33) (PxMat33.h:286): each result column is this->transform of the
+// corresponding other column.
+Mat33 mat33Mul(Mat33 a, Mat33 b)
+{
+    Mat33 r;
+    r.c0 = mat33Transform(a, b.c0);
+    r.c1 = mat33Transform(a, b.c1);
+    r.c2 = mat33Transform(a, b.c2);
+    return r;
+}
+
+Mat33 mat33Transpose(Mat33 m)
+{
+    Mat33 r;
+    r.c0 = float3(m.c0.x, m.c1.x, m.c2.x);
+    r.c1 = float3(m.c0.y, m.c1.y, m.c2.y);
+    r.c2 = float3(m.c0.z, m.c1.z, m.c2.z);
+    return r;
+}
+
+// PxMat33(PxQuat) (PxMat33.h:138), transcribed operation for operation.
+Mat33 mat33FromQuat(float4 q)
+{
+    const float x = q.x, y = q.y, z = q.z, w = q.w;
+    const float x2 = x + x, y2 = y + y, z2 = z + z;
+    const float xx = x2 * x, yy = y2 * y, zz = z2 * z;
+    const float xy = x2 * y, xz = x2 * z, xw = x2 * w;
+    const float yz = y2 * z, yw = y2 * w, zw = z2 * w;
+    Mat33 m;
+    m.c0 = float3(1.0f - yy - zz, xy + zw, xz - yw);
+    m.c1 = float3(xy - zw, 1.0f - xx - zz, yz + xw);
+    m.c2 = float3(xz + yw, yz - xw, 1.0f - xx - yy);
+    return m;
+}
+
+// mMaterialIndices is a PxU16 array.  NOTE `& ~uint64_t(3)`: `& ~3UL` MISCOMPILES -- Slang
+// evaluates the complement in 32 bits and clears the top half of the device address.
+uint stressMaterialIndexAt(uint64_t base, uint tetIdx)
+{
+    const uint64_t addr = base + uint64_t(tetIdx) * 2UL;
+    const uint word = Ptr<uint>(addr & ~uint64_t(3))[0];
+    return (addr & 2UL) != 0UL ? (word >> 16u) : (word & 0xffffu);
+}
+
+[shader("compute")]
+[numthreads(256, 1, 1)]   // PxgSoftBodyKernelBlockDim::SB_UPDATEROTATION
+void sb_calculateStressLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    const uint softbodyId = Ptr<uint>(gSt.activeSoftbodies)[gid.y];
+    Ptr<PxgSoftBodyGpu> softbodies = Ptr<PxgSoftBodyGpu>(gSt.softbodies);
+
+    const uint flagsWord = softbodies[softbodyId].mFlagsWord;
+    const uint bodyFlags = (flagsWord >> 8u) & 0xFFu;
+    const uint volumeFlags = (flagsWord >> 16u) & 0xFFFFu;
+
+    // The stress field is computed when it is ASKED FOR, or when self-collision needs it.
+    if (!((volumeFlags & PXG_SOFTBODY_VOLUMEFLAG_COMPUTE_STRESS_TENSOR) != 0u ||
+          (bodyFlags & PXG_SOFTBODY_BODYFLAG_DISABLE_SELF_COLLISION) == 0u))
+        return;
+
+    const uint tetrahedronIdx = gtid.x + gid.x * 256u;
+    if (tetrahedronIdx >= softbodies[softbodyId].mNumTets)
+        return;
+
+    Ptr<float4> positions = Ptr<float4>(softbodies[softbodyId].mPosition_InvMass);
+    const uint4 tetIdx = Ptr<uint4>(softbodies[softbodyId].mTetIndices)[tetrahedronIdx];
+
+    const float4 p0 = positions[tetIdx.x];
+    const float4 p1 = positions[tetIdx.y];
+    const float4 p2 = positions[tetIdx.z];
+    const float4 p3 = positions[tetIdx.w];
+
+    // the displacement field
+    const float3 u1 = p1.xyz - p0.xyz;
+    const float3 u2 = p2.xyz - p0.xyz;
+    const float3 u3 = p3.xyz - p0.xyz;
+
+    // mTetraRestPoses is a FLAT PxMat33 array here (36-byte stride), not a PxgMat33Block --
+    // the same distinction sb_updateTetrahedraRotationsLaunch above turns on.
+    const Mat33 qinv = mat33Load(softbodies[softbodyId].mTetraRestPoses + uint64_t(tetrahedronIdx) * 36UL);
+
+    Mat33 pMat;
+    pMat.c0 = u1; pMat.c1 = u2; pMat.c2 = u3;
+    Mat33 f = mat33Mul(pMat, qinv);
+
+    // the rotation factor, refreshed once per step by sb_updateTetrahedraRotationsLaunch
+    const float4 tetraRot = Ptr<float4>(softbodies[softbodyId].mTetraRotations)[tetrahedronIdx];
+    const Mat33 r = mat33FromQuat(tetraRot);
+
+    // remove the rotation factor from the strain (corotation)
+    f = mat33Mul(mat33Transpose(r), f);
+
+    const uint matIdx = stressMaterialIndexAt(softbodies[softbodyId].mMaterialIndices, tetrahedronIdx);
+    const uint64_t matBase = gSt.materials + uint64_t(matIdx) * STRESS_MAT_STRIDE;
+    const float E = Ptr<float>(matBase)[0];        // youngs
+    const float nu = Ptr<float>(matBase + 4UL)[0]; // poissons
+
+    // Young's modulus -> Lame parameters, then Pixar's Stable Neo-Hookean reparameterisation
+    // for rest stability.  Transcribed in the .cu's order: the two `+=`/`*=` steps come
+    // AFTER both are formed from E and nu, so mu's update must not feed lambda's.
+    float lambda = E * nu / ((1.0f + nu) * (1.0f - 2.0f * nu));
+    float mu = 0.5f * E / (1.0f + nu);
+    lambda += mu * (5.0f / 6.0f);
+    mu = mu * (4.0f / 3.0f);
+
+    // the Cauchy stress: eps = sym(F) - I, sigma = 2*mu*eps + lambda*tr(eps)*I
+    const Mat33 fT = mat33Transpose(f);
+    Mat33 eps;
+    eps.c0 = (fT.c0 + f.c0) * 0.5f - float3(1.0f, 0.0f, 0.0f);
+    eps.c1 = (fT.c1 + f.c1) * 0.5f - float3(0.0f, 1.0f, 0.0f);
+    eps.c2 = (fT.c2 + f.c2) * 0.5f - float3(0.0f, 0.0f, 1.0f);
+
+    const float trace = eps.c0.x + eps.c1.y + eps.c2.z;
+    Mat33 sigma;
+    sigma.c0 = eps.c0 * 2.0f * mu + float3(1.0f, 0.0f, 0.0f) * lambda * trace;
+    sigma.c1 = eps.c1 * 2.0f * mu + float3(0.0f, 1.0f, 0.0f) * lambda * trace;
+    sigma.c2 = eps.c2 * 2.0f * mu + float3(0.0f, 0.0f, 1.0f) * lambda * trace;
+
+    // The scalar coefficient is the von-Mises-like norm of the DIAGONAL strain differences.
+    // eps[i][j] is column i, element j, so eps[0][0]/eps[1][1]/eps[2][2] are the diagonal.
+    const float q1 = eps.c0.x, q2 = eps.c1.y, q3 = eps.c2.z;
+    const float q12 = q1 - q2, q23 = q2 - q3, q31 = q3 - q1;
+    const float constant = 0.70710678118654752440084436210485f;   // 1 / sqrt(2)
+    const float stress = sqrt(q12 * q12 + q23 * q23 + q31 * q31) * constant;
+
+    mat33Store(softbodies[softbodyId].mTetraStresses + uint64_t(tetrahedronIdx) * 36UL, sigma);
+    Ptr<float>(softbodies[softbodyId].mTetraStressCoefficient)[tetrahedronIdx] = stress;
+}

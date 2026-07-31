@@ -1639,9 +1639,17 @@ SoftBodySelfScene buildSoftBodySelfCollideScene(PxPhysics* physics, PxScene* sce
     // 0.25 apart, so 0.3 keeps the fold and drops the neighbours.
     volume->setSelfCollisionFilterDistance(0.3f);
     // The stress gate drops a self-contact whose tetrahedron is under more stress than this.
-    // A large value disables it; the sagging cantilever is under real stress and a small
-    // tolerance would throw the contacts away exactly where they are needed.
-    volume->setSelfCollisionStressTolerance(1.0e30f);
+    // It reads mTetraStressCoefficient, which sb_calculateStressLaunch fills (P8.5) -- and
+    // that kernel's own launch gate runs it precisely BECAUSE self-collision is enabled here.
+    // Until it was mapped the coefficient held whatever the allocation contained, so this had
+    // to be a value no stress could exceed.  PXG_SB_STRESSTOL exposes it now that the field
+    // is real: the default still disables the gate so the scene measures the CONTACT path
+    // rather than the material, and a small value is the way to see the gate bite.
+    {
+        float tol = 1.0e30f;
+        if (const char* e = std::getenv("PXG_SB_STRESSTOL")) tol = float(atof(e));
+        volume->setSelfCollisionStressTolerance(tol);
+    }
 
     scene->addActor(*volume);
 

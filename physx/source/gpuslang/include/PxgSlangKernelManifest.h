@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 240;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 241;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -323,10 +323,10 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_queryRigidSoftContactReferenceCountLaunchTGS", "softBodyRigidContactBda.spv", "sb_queryRigidSoftContactReferenceCountLaunchTGS" },  // SB_QUERY_RIGID_SOFT_REFERENCE_COUNT_TGS (P8.2 tranche e BDA port; chain kernels 6 and 7)
     { "sb_solveRigidSoftCollisionLaunchTGS", "softBodyRigidContactBda.spv", "sb_solveRigidSoftCollisionLaunchTGS" },  // SB_SOLVE_RIGID_SOFT_COLLISION_TGS (P8.2 tranche e BDA port; chain kernels 6 and 7)
     { "sb_solveOutputSSDeltaVLaunchTGS", "softBodySelfSolveBda.spv", "sb_solveOutputSSDeltaVLaunchTGS" },  // SB_SOLVE_SOFT_SOFT_BOTH_DELTA_TGS (P8.4 tranche b BDA port)
-    { "sb_calculateStressLaunch", nullptr, nullptr },  // SB_CALC_STRESS (unmapped)
-    { "sb_plasticDeformLaunch", nullptr, nullptr },  // SB_PLASTIC_DEFORM (unmapped)
-    { "sb_initPlasticDeformLaunch", nullptr, nullptr },  // SB_INIT_PLASTIC_DEFORM (unmapped)
-    { "sb_plasticDeformLaunch2", nullptr, nullptr },  // SB_PLASTIC_DEFORM2 (unmapped)
+    { "sb_calculateStressLaunch", "softBodySolveBda.spv", "sb_calculateStressLaunch" },  // SB_CALC_STRESS (P8.5 BDA port)
+    { "sb_plasticDeformLaunch", nullptr, nullptr },  // SB_PLASTIC_DEFORM (DELIBERATELY unmapped: the CUDA body is gated on a hard-coded `if (false)`, softBodyGM.cu:2844 -- porting it would map an empty kernel and inflate the count)
+    { "sb_initPlasticDeformLaunch", nullptr, nullptr },  // SB_INIT_PLASTIC_DEFORM (DELIBERATELY unmapped: no call site anywhere in PhysX -- the engine never launches it)
+    { "sb_plasticDeformLaunch2", nullptr, nullptr },  // SB_PLASTIC_DEFORM2 (DELIBERATELY unmapped: same hard-coded `if (false)`, softBodyGM.cu:3013)
     { "sb_copyOrApplySoftBodyDataDEPRECATED", nullptr, nullptr },  // SB_COPY_OR_APPLY_SOFTBODY_DATA_DEPRECATED (unmapped)
     { "sb_gm_finalizeVelocitiesLaunch", "softBodySimBda.spv", "sb_gm_finalizeVelocitiesLaunch" },  // SB_GM_FINALIZE_VELOCITIES (P8.0 tranche 3 BDA port)
     { "sb_sleeping", "softBodySimBda.spv", "sb_sleeping" },  // SB_SLEEPING (P8.0 tranche 3 BDA port)

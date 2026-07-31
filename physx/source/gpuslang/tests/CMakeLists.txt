@@ -531,7 +531,11 @@ pxg_compile_shader(softBodySolveBda sb_gm_zeroTetMultipliers
 # step's last kernel, and the one that makes the motion observable outside the solver).
                    sb_gm_cp_averageVertsLaunch
                    sb_gm_applyDeformationDeltasLaunch
-                   sb_gm_updateTetModelVertsLaunch)
+                   sb_gm_updateTetModelVertsLaunch
+# P8.5: sb_calculateStressLaunch, the co-rotated Cauchy stress field.  It lives here because
+# it shares the flat-PxMat33 rest-pose read and the descriptor walk with the rotation
+# extractors above; its output is what the SELF-COLLISION stress gate reads.
+                   sb_calculateStressLaunch)
 # P8.2 tranche a: the SOFTBODY-vs-RIGID midphase -- one warp per contact-manager pair
 # walks the softbody's own BV32 tetrahedron BVH against the rigid's fattened world AABB and
 # appends uint4(cmIdx, tetIdx, 0, 0) to the shared collision stack.  Reads everything through

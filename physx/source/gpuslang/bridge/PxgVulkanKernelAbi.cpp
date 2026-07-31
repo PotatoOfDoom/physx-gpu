@@ -559,6 +559,13 @@ static const uint8_t kSbSsContactPrepare[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 4 };
 //   @40/@48 -> 56-byte blob.
 static const uint8_t kSbSolveOutputSSDeltaV[] = { 8, 8, 8, 8, 4, 4, 8, 8 };
 
+// gpusimulationcontroller softbody CO-ROTATED STRESS FIELD (P8.5):
+//   sb_calculateStressLaunch(PxgSoftBody* gSoftbodies, const PxU32* activeSoftbodies,
+//     PxsDeformableVolumeMaterialData* matData)  -- launch site PxgSoftBodyCore.cpp:2996.
+//   Three device pointers -> 24-byte blob.  The launch is 2D in the GRID
+//   (x = ceil(maxTetrahedrons / 256), y = the active softbodies); the bridge forwards both.
+static const uint8_t kSbCalculateStress[] = { 8, 8, 8 };
+
 // gpusimulationcontroller softbody-vs-rigid CONSTRAINT PREPARE (P8.2 tranche d):
 //   sb_rigidContactPrepareLaunch(PxgSoftBody* softbodies, float4* contacts_restW,
 //     float4* normalPens, float4* barycentrics, PxgFemOtherContactInfo* contactInfos,
@@ -973,6 +980,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_softbodyContactPrepareLaunch", kSbSsContactPrepare, uint32_t(sizeof(kSbSsContactPrepare)) },
     { "sb_solveOutputSSDeltaVLaunch", kSbSolveOutputSSDeltaV, uint32_t(sizeof(kSbSolveOutputSSDeltaV)) },
     { "sb_solveOutputSSDeltaVLaunchTGS", kSbSolveOutputSSDeltaV, uint32_t(sizeof(kSbSolveOutputSSDeltaV)) },
+    // gpusimulationcontroller softbody stress field (P8.5)
+    { "sb_calculateStressLaunch", kSbCalculateStress, uint32_t(sizeof(kSbCalculateStress)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },

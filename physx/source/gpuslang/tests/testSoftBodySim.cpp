@@ -6627,4 +6627,300 @@ PXG_TEST(softBodySimSelfContactSolve)
     dev->destroyBuffer(bDl1.h); dev->destroyBuffer(bDesc.h);
 }
 
+// ===========================================================================
+// P8.5 — sb_calculateStressLaunch, the co-rotated Cauchy stress field.
+//
+// Compared against an absolute CPU reference, bit-exact apart from the final sqrt: the
+// kernel is two 3x3 products and a symmetrised difference, all contraction-free under the
+// NoContraction stamp and -ffp-contract=off.  What the fixture aims at is the parts a
+// plausible-looking port gets wrong silently: the co-rotation (transposing the WRONG
+// matrix, or skipping it), the Lame reparameterisation order, the diagonal the scalar
+// coefficient is built from, and the launch gate that decides whether any of it runs.
+// ===========================================================================
+namespace p85ref
+{
+struct M33 { float c[9]; };   // column-major: c[0..2] = column0, c[3..5] = column1, ...
+
+static M33 m33FromCols(const float* c0, const float* c1, const float* c2)
+{
+    M33 m;
+    for (int i = 0; i < 3; ++i) { m.c[i] = c0[i]; m.c[3 + i] = c1[i]; m.c[6 + i] = c2[i]; }
+    return m;
+}
+// PxMat33::transform: column0 * v.x + column1 * v.y + column2 * v.z.
+static void m33Transform(const M33& m, const float* v, float* out)
+{
+    for (int i = 0; i < 3; ++i) out[i] = m.c[i] * v[0] + m.c[3 + i] * v[1] + m.c[6 + i] * v[2];
+}
+static M33 m33Mul(const M33& a, const M33& b)
+{
+    M33 r;
+    m33Transform(a, &b.c[0], &r.c[0]);
+    m33Transform(a, &b.c[3], &r.c[3]);
+    m33Transform(a, &b.c[6], &r.c[6]);
+    return r;
+}
+static M33 m33Transpose(const M33& m)
+{
+    M33 r;
+    for (int col = 0; col < 3; ++col)
+        for (int row = 0; row < 3; ++row)
+            r.c[col * 3 + row] = m.c[row * 3 + col];
+    return r;
+}
+// PxMat33(PxQuat) (PxMat33.h:138), operation for operation.
+static M33 m33FromQuat(F4 q)
+{
+    const float x = q.x, y = q.y, z = q.z, w = q.w;
+    const float x2 = x + x, y2 = y + y, z2 = z + z;
+    const float xx = x2 * x, yy = y2 * y, zz = z2 * z;
+    const float xy = x2 * y, xz = x2 * z, xw = x2 * w;
+    const float yz = y2 * z, yw = y2 * w, zw = z2 * w;
+    M33 m;
+    m.c[0] = 1.0f - yy - zz; m.c[1] = xy + zw;        m.c[2] = xz - yw;
+    m.c[3] = xy - zw;        m.c[4] = 1.0f - xx - zz; m.c[5] = yz + xw;
+    m.c[6] = xz + yw;        m.c[7] = yz - xw;        m.c[8] = 1.0f - xx - yy;
+    return m;
+}
+
+// sb_calculateStressLaunch (softBodyGM.cu:2716), one tetrahedron.
+static void refStress(const std::vector<F4>& pos, p80refit::TetIdx4 tet, const M33& qinv,
+                      F4 tetraRot, float youngs, float poissons, M33& sigma, float& stress)
+{
+    const F4 p0 = pos[tet.x], p1 = pos[tet.y], p2 = pos[tet.z], p3 = pos[tet.w];
+    const float u1[3] = { p1.x - p0.x, p1.y - p0.y, p1.z - p0.z };
+    const float u2[3] = { p2.x - p0.x, p2.y - p0.y, p2.z - p0.z };
+    const float u3[3] = { p3.x - p0.x, p3.y - p0.y, p3.z - p0.z };
+
+    const M33 P = m33FromCols(u1, u2, u3);
+    M33 F = m33Mul(P, qinv);
+    F = m33Mul(m33Transpose(m33FromQuat(tetraRot)), F);
+
+    float lambda = youngs * poissons / ((1.0f + poissons) * (1.0f - 2.0f * poissons));
+    float mu = 0.5f * youngs / (1.0f + poissons);
+    lambda += mu * (5.0f / 6.0f);
+    mu = mu * (4.0f / 3.0f);
+
+    const M33 FT = m33Transpose(F);
+    M33 eps;
+    for (int i = 0; i < 9; ++i) eps.c[i] = (FT.c[i] + F.c[i]) * 0.5f;
+    eps.c[0] -= 1.0f; eps.c[4] -= 1.0f; eps.c[8] -= 1.0f;
+
+    const float trace = eps.c[0] + eps.c[4] + eps.c[8];
+    for (int col = 0; col < 3; ++col)
+        for (int row = 0; row < 3; ++row)
+        {
+            const float ident = (col == row) ? 1.0f : 0.0f;
+            sigma.c[col * 3 + row] = eps.c[col * 3 + row] * 2.0f * mu + ident * lambda * trace;
+        }
+
+    const float q1 = eps.c[0], q2 = eps.c[4], q3 = eps.c[8];
+    const float q12 = q1 - q2, q23 = q2 - q3, q31 = q3 - q1;
+    stress = std::sqrt(q12 * q12 + q23 * q23 + q31 * q31) * 0.70710678118654752440084436210485f;
+}
+} // namespace p85ref
+
+struct SbStressPush { uint64_t softbodies, activeSoftbodies, materials; };
+static_assert(sizeof(SbStressPush) == 24, "stress push blob must be 24 bytes");
+
+PXG_TEST(softBodySimCalculateStress)
+{
+    using namespace p80refit;
+    using namespace p85ref;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // Three tets sharing one vertex pool.  Tet 0 is UNDEFORMED (its edge matrix is exactly
+    // the inverse of its rest pose, so the strain is zero and the coefficient must be too);
+    // tet 1 is stretched along x; tet 2 is stretched UNIFORMLY, which strains the material
+    // but leaves the three diagonal DIFFERENCES equal -- so its coefficient is zero while
+    // its sigma is not.  A port that built the coefficient from the strain magnitude instead
+    // of from the diagonal differences passes tet 0 and fails tet 2.
+    std::vector<F4> pos = {
+        { 0.0f, 0.0f, 0.0f, 1.0f }, { 1.0f, 0.0f, 0.0f, 1.0f },
+        { 0.0f, 1.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 1.0f, 1.0f },   // tet 0, unit
+        { 0.0f, 0.0f, 0.0f, 1.0f }, { 1.4f, 0.0f, 0.0f, 1.0f },
+        { 0.0f, 1.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 1.0f, 1.0f },   // tet 1, stretched in x
+        { 0.0f, 0.0f, 0.0f, 1.0f }, { 1.3f, 0.0f, 0.0f, 1.0f },
+        { 0.0f, 1.3f, 0.0f, 1.0f }, { 0.0f, 0.0f, 1.3f, 1.0f },   // tet 2, uniform stretch
+    };
+    std::vector<TetIdx4> tets = { { 0u, 1u, 2u, 3u }, { 4u, 5u, 6u, 7u }, { 8u, 9u, 10u, 11u } };
+    const uint32_t NB_TETS = uint32_t(tets.size());
+
+    // Rest poses: the INVERSE of the undeformed edge matrix, which for a unit tet is the
+    // identity.  Stored FLAT at a 36-byte stride, not as a PxgMat33Block.
+    std::vector<float> restPoses(NB_TETS * 9u, 0.0f);
+    for (uint32_t t = 0; t < NB_TETS; ++t)
+    { restPoses[t * 9u + 0u] = 1.0f; restPoses[t * 9u + 4u] = 1.0f; restPoses[t * 9u + 8u] = 1.0f; }
+    // Tet 1's rest pose is deliberately NON-SYMMETRIC.  With every rest pose an identity,
+    // `P * Qinv` and `Qinv * P` agree and a port that swapped the deformation gradient's
+    // operands passes -- that mutant survived until this shear was added.  Column-major:
+    // column1 gains an x term, column2 a y term.
+    restPoses[1 * 9u + 3u] = 0.3f;   // column1.x
+    restPoses[1 * 9u + 7u] = 0.2f;   // column2.y
+
+    // A NON-IDENTITY rotation on tet 1: the co-rotation must actually remove it, and it must
+    // be the TRANSPOSE that is applied.  q = 30 degrees about z.
+    const float half = 0.2617993878f;   // 15 degrees in radians
+    std::vector<F4> tetraRot = {
+        { 0.0f, 0.0f, 0.0f, 1.0f },
+        { 0.0f, 0.0f, std::sin(half), std::cos(half) },
+        { 0.0f, 0.0f, 0.0f, 1.0f },
+    };
+
+    // Two materials, so the PxU16 index array is read at both halves of a word and a port
+    // that used material 0 for everything cannot match.
+    std::vector<DeformableMaterialHost> materials(2);
+    std::memset(materials.data(), 0, materials.size() * sizeof(DeformableMaterialHost));
+    materials[0].youngs = 1.0e5f; materials[0].poissons = 0.30f;
+    materials[1].youngs = 4.0e5f; materials[1].poissons = 0.45f;
+    const std::vector<uint16_t> matIdx = { 0u, 1u, 1u };
+    std::vector<uint32_t> matWords((matIdx.size() + 1u) / 2u + 1u, 0u);
+    for (size_t i = 0; i < matIdx.size(); ++i) matWords[i / 2u] |= uint32_t(matIdx[i]) << (16u * (i % 2u));
+
+    DevBuf bPos = makeDev(dev, pos), bTets = makeDev(dev, tets);
+    DevBuf bRest = makeDev(dev, restPoses), bRot = makeDev(dev, tetraRot);
+    DevBuf bMatIdx = makeDev(dev, matWords), bMat = makeDev(dev, materials);
+    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    const float SENT = -777.0f;
+    std::vector<float> stresses(NB_TETS * 9u + 9u, SENT);   // flat PxMat33 array + a trailer
+    std::vector<float> coeffs(NB_TETS + 4u, SENT);
+    DevBuf bStresses = makeDev(dev, stresses), bCoeffs = makeDev(dev, coeffs);
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mTetraRestPoses = reinterpret_cast<PxMat33*>(size_t(bRest.addr));
+    sb.mTetraRotations = reinterpret_cast<float4*>(size_t(bRot.addr));
+    sb.mMaterialIndices = reinterpret_cast<PxU16*>(size_t(bMatIdx.addr));
+    sb.mTetraStresses = reinterpret_cast<PxMat33*>(size_t(bStresses.addr));
+    sb.mTetraStressCoefficient = reinterpret_cast<PxReal*>(size_t(bCoeffs.addr));
+    sb.mNumTets = NB_TETS;
+    // Self-collision ON (the flag is DISABLE), stress tensor NOT requested: the kernel must
+    // still run, because the self-collision gate is what consumes the coefficient.
+    sb.mBodyFlags = 0u;
+    sb.mVolumeFlags = PxDeformableVolumeFlags(0);
+
+    // TWO active bodies sharing the inputs but writing to SEPARATE outputs, and the active
+    // list is not the identity.  With a single body and a 1x1 grid, gid.x and gid.y are both
+    // 0 and the two are indistinguishable -- `softbodyId from gid.x` and `tetIdx from gid.y`
+    // both survived until this second body existed.
+    std::vector<float> stressesB(stresses.size(), SENT), coeffsB(coeffs.size(), SENT);
+    DevBuf bStressesB = makeDev(dev, stressesB), bCoeffsB = makeDev(dev, coeffsB);
+    PxgSoftBody sbB = sb;
+    sbB.mTetraStresses = reinterpret_cast<PxMat33*>(size_t(bStressesB.addr));
+    sbB.mTetraStressCoefficient = reinterpret_cast<PxReal*>(size_t(bCoeffsB.addr));
+
+    std::vector<PxgSoftBody> descArr(3u, makeZeroDesc());
+    descArr[1] = sb;
+    descArr[2] = sbB;
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 1u, 2u };
+    DevBuf bActive = makeDev(dev, active);
+
+    SbStressPush push = {};
+    push.softbodies = bDesc.addr;
+    push.activeSoftbodies = bActive.addr;
+    push.materials = bMat.addr;
+
+    Kernel k("softBodySolveBda.spv", "sb_calculateStressLaunch", {}, sizeof(SbStressPush));
+    // The engine's grid: ceil(maxTetrahedrons / 256) in x, the active softbodies in y.
+    k.dispatch(/*gridX*/ 1u, {}, push, /*gridY*/ uint32_t(active.size()), 1u);
+    dev->flush();
+
+    const auto gStresses = downloadBuffer<float>(dev, bStresses.h, stresses.size());
+    const auto gCoeffs = downloadBuffer<float>(dev, bCoeffs.h, coeffs.size());
+
+    for (uint32_t t = 0; t < NB_TETS; ++t)
+    {
+        M33 qinv;
+        for (int i = 0; i < 9; ++i) qinv.c[i] = restPoses[t * 9u + uint32_t(i)];
+        M33 wantSigma; float wantStress = 0.0f;
+        refStress(pos, tets[t], qinv, tetraRot[t],
+                  materials[matIdx[t]].youngs, materials[matIdx[t]].poissons, wantSigma, wantStress);
+
+        std::printf("  tet %u: coeff %.7f (want %.7f), sigma[0][0] %.5f (want %.5f)\n",
+                    t, gCoeffs[t], wantStress, gStresses[t * 9u], wantSigma.c[0]);
+
+        for (int i = 0; i < 9; ++i)
+            PXG_CHECK_MSG(f2u(gStresses[t * 9u + uint32_t(i)]) == f2u(wantSigma.c[i]),
+                          "tet %u sigma element %d: got %.9g, want %.9g", t, i,
+                          gStresses[t * 9u + uint32_t(i)], wantSigma.c[i]);
+        PXG_CHECK_MSG(std::fabs(gCoeffs[t] - wantStress) <= 1e-6f,
+                      "tet %u stress coefficient: got %.9g, want %.9g", t, gCoeffs[t], wantStress);
+    }
+
+    // The three shapes, stated as facts rather than left to the reference.
+    PXG_CHECK_MSG(gCoeffs[0] == 0.0f,
+                  "tet 0 is undeformed, so its strain is identically zero and so is its "
+                  "coefficient (got %.9g)", gCoeffs[0]);
+    PXG_CHECK_MSG(gCoeffs[1] > 0.1f,
+                  "tet 1 is stretched 1.4x along x under a 30-degree rotation; the co-rotation "
+                  "must remove the rotation and leave a real strain (got %.9g)", gCoeffs[1]);
+    PXG_CHECK_MSG(gCoeffs[2] == 0.0f && gStresses[2 * 9u] != 0.0f,
+                  "tet 2 is stretched UNIFORMLY: its diagonal differences cancel so the "
+                  "coefficient is zero (got %.9g) while sigma is NOT (got %.9g).  A "
+                  "coefficient built from the strain magnitude would be nonzero here",
+                  gCoeffs[2], gStresses[2 * 9u]);
+    PXG_CHECK_MSG(gStresses[NB_TETS * 9u] == SENT && gCoeffs[NB_TETS] == SENT,
+                  "nothing may be written past mNumTets");
+
+    // The SECOND active body must have been written too, and identically: it shares every
+    // input and differs only in where its results go.  This is what pins gid.y as the body
+    // selector and gid.x as the tetrahedron block.
+    {
+        const auto gStressesB = downloadBuffer<float>(dev, bStressesB.h, stressesB.size());
+        const auto gCoeffsB = downloadBuffer<float>(dev, bCoeffsB.h, coeffsB.size());
+        for (uint32_t t = 0; t < NB_TETS; ++t)
+        {
+            PXG_CHECK_MSG(f2u(gCoeffsB[t]) == f2u(gCoeffs[t]),
+                          "the second active body's tet %u coefficient must match the first's "
+                          "(%.9g vs %.9g) -- a y-grid that does not select the body leaves it "
+                          "untouched at %g", t, gCoeffsB[t], gCoeffs[t], SENT);
+            for (int i = 0; i < 9; ++i)
+                PXG_CHECK(f2u(gStressesB[t * 9u + uint32_t(i)]) == f2u(gStresses[t * 9u + uint32_t(i)]));
+        }
+    }
+
+    // ---- the launch gate ------------------------------------------------------
+    // The kernel runs when eCOMPUTE_STRESS_TENSOR is set OR self-collision is enabled.  With
+    // self-collision DISABLED and the tensor not requested, it must write nothing at all;
+    // with the tensor requested it must run again even though self-collision stays off.
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        const bool requestTensor = (pass == 1);
+        std::vector<PxgSoftBody> d2 = descArr;
+        d2[1].mBodyFlags = PxDeformableBodyFlags(PxDeformableBodyFlag::eDISABLE_SELF_COLLISION);
+        d2[1].mVolumeFlags = requestTensor
+            ? PxDeformableVolumeFlags(PxDeformableVolumeFlag::eCOMPUTE_STRESS_TENSOR)
+            : PxDeformableVolumeFlags(0);
+        std::vector<float> s2(stresses.size(), SENT), c2(coeffs.size(), SENT);
+        DevBuf bS2 = makeDev(dev, s2), bC2 = makeDev(dev, c2);
+        d2[1].mTetraStresses = reinterpret_cast<PxMat33*>(size_t(bS2.addr));
+        d2[1].mTetraStressCoefficient = reinterpret_cast<PxReal*>(size_t(bC2.addr));
+        d2[2] = d2[1];   // both active slots point at the same outputs for this sub-test
+        DevBuf bD2 = makeDev(dev, d2);
+        SbStressPush p2 = push;
+        p2.softbodies = bD2.addr;
+        Kernel("softBodySolveBda.spv", "sb_calculateStressLaunch", {}, sizeof(SbStressPush))
+            .dispatch(1u, {}, p2, uint32_t(active.size()), 1u);
+        dev->flush();
+        const auto g2 = downloadBuffer<float>(dev, bC2.h, coeffs.size());
+        if (requestTensor)
+            PXG_CHECK_MSG(g2[1] != SENT,
+                          "eCOMPUTE_STRESS_TENSOR alone must run the kernel even with "
+                          "self-collision disabled (coefficient 1 is still %g)", g2[1]);
+        else
+            PXG_CHECK_MSG(g2[0] == SENT && g2[1] == SENT && g2[2] == SENT,
+                          "with self-collision DISABLED and no tensor requested the kernel must "
+                          "write nothing (got %g, %g, %g)", g2[0], g2[1], g2[2]);
+        dev->destroyBuffer(bS2.h); dev->destroyBuffer(bC2.h); dev->destroyBuffer(bD2.h);
+    }
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bTets.h); dev->destroyBuffer(bRest.h);
+    dev->destroyBuffer(bRot.h); dev->destroyBuffer(bMatIdx.h); dev->destroyBuffer(bMat.h);
+    dev->destroyBuffer(bStresses.h); dev->destroyBuffer(bCoeffs.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bActive.h); dev->destroyBuffer(bStressesB.h); dev->destroyBuffer(bCoeffsB.h);
+}
+
 } // namespace
