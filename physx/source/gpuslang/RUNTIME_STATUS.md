@@ -1710,6 +1710,25 @@ reaction — the prepare zeroes `rigidDeltaVel` (which this port does) and the s
 into it (which it does not). A softbody pinned to a MOVING rigid needs that last half; pinned
 to the world it does not.
 
+### Verification
+
+| gate | result |
+|---|---|
+| target ctest (`softBodySim*`) | pass |
+| mutation, forced-fresh `.spv` | 12 killed of 12 |
+| full suite, default memory mode | **674 / 674**, 170 s |
+| full suite, `PXG_DEVICE_V2=1` | **674 / 674**, 243 s |
+| rigid regression | 16 / 16 |
+| `PXG_SCENE=cloth` | dropped 4.9867 over 1.00 s |
+| `PXG_SCENE=clothhang` | hangs and drapes |
+| `PXG_SCENE=clothdrape` | settles, rest \|dy\| = 0.000000 |
+| `PXG_SCENE=clothselfcollide` | catches at min y = 5.0999 (5.1000 expected) |
+| `PXG_SCENE=softbody` | falls, skin gap 0.00000 |
+| `PXG_SCENE=particle` | dropped 19.7835 over 2.00 s |
+
+No scene moved. That is the expected outcome — none of the six builds an attachment, so this
+tranche is a pure addition and the regression gates are what it has to clear.
+
 ## P8.2 tranche e — MILESTONE: the softbody cube SETTLES on a plane
 
 Chain kernels 6 and 7 are mapped, so the softbody-vs-rigid contact path runs end to end for
