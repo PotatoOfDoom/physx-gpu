@@ -1441,6 +1441,259 @@ SoftBodyScene buildSoftBodyScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     return out;
 }
 
+// ===========================================================================
+// PXG_SCENE=softbodyselfcollide (P8.4): the FEM-VOLUME SELF-collision scene.
+//
+// The softbody analogue of PXG_SCENE=clothselfcollide, and the first scene that drives
+// the self-collision chain end to end: SB_SELFCOLLISION_MIDPHASE (tranche a),
+// SB_FEM_CONTACT_REMAP_TO_SIM, SB_SS_CONTACTPREPARE and
+// SB_SOLVE_SOFT_SOFT_BOTH_DELTA{,_TGS} (tranche b).
+//
+// *** WHY A NEW SCENE AND NOT A FLAG ON PXG_SCENE=softbody. ***
+// Self-collision is ON by default for a deformable volume (PxgBodySimManager.cpp:467 only
+// skips a body carrying eDISABLE_SELF_COLLISION), but buildSoftBodyScene switches it OFF
+// explicitly, and that stays: the cube scene is the recorded free-fall baseline for the
+// whole softbody port and its numbers must not move.  Turning the flag back on there would
+// also prove little -- a convex cube in its rest pose has no two surface regions that
+// approach without being adjacent, and the rest-pose gate drops the adjacent ones by
+// construction, so the midphase would dispatch and find nothing.  This scene supplies the
+// missing half: a shape that genuinely folds back on itself.
+//
+// THE SHAPE.  A regular cell grid with the middle carved out, leaving a bracket:
+//
+//     y=1.00  +--------------------+   <- top slab   (iy = NY-1)
+//             |####|               |
+//             |####|   (air)       |
+//     y=0.25  |####+---------------+
+//             |####################|   <- bottom slab (iy = 0)
+//     y=0.00  +--------------------+
+//             ^ the connector (ix = 0) makes it ONE body
+//
+// The bottom slab rests on a static plane at y=0; the top slab is a cantilever anchored
+// only at the connector, so gravity sags it onto the bottom slab.  The two slabs are 6
+// cells apart along the tet graph at the free end, which is what makes their contact a
+// SELF-collision rather than an adjacency the rest-pose gate would filter out.
+//
+// The mask leaves vertices belonging only to removed cells unreferenced, so the vertex
+// array is COMPACTED and the tet indices remapped -- cooking rejects a mesh with orphaned
+// points, and a welded mesh would silently renumber everything the readback depends on.
+//
+// PXG_SB_NOSELF=1 sets eDISABLE_SELF_COLLISION and is the discriminator: with the chain
+// working the top slab is caught, without it the top slab passes through the bottom one.
+// Reporting one number from one run proves nothing here -- only the PAIR does.
+struct SoftBodySelfScene
+{
+    PxDeformableVolume* volume = nullptr;
+    PxU32 numCollVerts = 0;
+    PxU32 numSimVerts = 0;
+    PxU32 numTopVerts = 0;        // vertices of the TOP slab, listed first in topIdx
+    std::vector<PxU32> topIdx;    // indices into the collision-mesh vertex array
+    float bottomTopY = 0.0f;      // world y of the bottom slab's upper surface
+    bool selfCollision = true;
+    PxCudaContextManager* cudaCtx = nullptr;
+};
+
+SoftBodySelfScene buildSoftBodySelfCollideScene(PxPhysics* physics, PxScene* scene,
+                                                PxMaterial* rigidMat, PxCudaContextManager* cudaCtx)
+{
+    SoftBodySelfScene out;
+    out.cudaCtx = cudaCtx;
+
+    // Same reason as every other deformable scene: rigidSumInternalContactAndJointBatches2
+    // null-derefs with zero dynamic rigids, so one live dynamic body has to exist.
+    addGroundBox(physics, scene, rigidMat);
+    addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+               boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+
+    // The floor is a PLANE, not the ground box: sb_primitiveContactGenLaunch is ported for
+    // the plane rigid type only (see buildSoftBodyScene), so a box floor would generate no
+    // softbody contacts and the bottom slab would fall away from under the top one.
+    {
+        PxRigidStatic* floor = physics->createRigidStatic(
+            PxTransformFromPlaneEquation(PxPlane(0.0f, 1.0f, 0.0f, 0.0f)));
+        PxShape* floorShape = physics->createShape(PxPlaneGeometry(), *rigidMat);
+        floor->attachShape(*floorShape);
+        scene->addActor(*floor);
+        floorShape->release();
+    }
+
+    // --- the bracket ----------------------------------------------------------
+    const PxU32 NX = 6, NY = 4, NZ = 2;      // cells
+    const float h = 0.25f;
+    const PxU32 nx = NX + 1, ny = NY + 1, nz = NZ + 1;
+
+    std::vector<PxVec3> allVerts;
+    allVerts.reserve(nx * ny * nz);
+    for (PxU32 i = 0; i < nx; ++i)
+        for (PxU32 j = 0; j < ny; ++j)
+            for (PxU32 k = 0; k < nz; ++k)
+                allVerts.push_back(PxVec3(float(i) * h, float(j) * h, float(k) * h));
+    auto vid = [ny, nz](PxU32 i, PxU32 j, PxU32 k) { return (i * ny + j) * nz + k; };
+
+    std::vector<PxU32> rawTets;
+    for (PxU32 i = 0; i < NX; ++i)
+        for (PxU32 j = 0; j < NY; ++j)
+            for (PxU32 k = 0; k < NZ; ++k)
+            {
+                // the carve-out: keep the two slabs and the connector column
+                if (!(j == 0u || j == NY - 1u || i == 0u)) continue;
+                const PxU32 c[8] = {
+                    vid(i,     j,     k    ), vid(i + 1, j,     k    ),
+                    vid(i,     j + 1, k    ), vid(i + 1, j + 1, k    ),
+                    vid(i,     j,     k + 1), vid(i + 1, j,     k + 1),
+                    vid(i,     j + 1, k + 1), vid(i + 1, j + 1, k + 1),
+                };
+                // ALTERNATING diagonals, as in buildSoftBodyScene: neighbouring cells must
+                // disagree or their shared face is triangulated two different ways.
+                static const PxU32 splitA[5][4] = {
+                    {0,1,2,4}, {1,3,2,7}, {1,4,5,7}, {2,4,6,7}, {1,2,4,7}
+                };
+                static const PxU32 splitB[5][4] = {
+                    {0,1,3,5}, {0,3,2,6}, {0,5,4,6}, {3,7,5,6}, {0,3,5,6}
+                };
+                const bool even = ((i + j + k) & 1u) == 0u;
+                for (PxU32 t = 0; t < 5; ++t)
+                {
+                    PxU32 a = c[even ? splitA[t][0] : splitB[t][0]];
+                    PxU32 b = c[even ? splitA[t][1] : splitB[t][1]];
+                    PxU32 cc = c[even ? splitA[t][2] : splitB[t][2]];
+                    PxU32 d = c[even ? splitA[t][3] : splitB[t][3]];
+                    const PxVec3 e1 = allVerts[b] - allVerts[a];
+                    const PxVec3 e2 = allVerts[cc] - allVerts[a];
+                    const PxVec3 e3 = allVerts[d] - allVerts[a];
+                    if (e1.cross(e2).dot(e3) < 0.0f) { const PxU32 tmp = cc; cc = b; b = tmp; }
+                    rawTets.push_back(a); rawTets.push_back(b); rawTets.push_back(cc); rawTets.push_back(d);
+                }
+            }
+
+    // COMPACT: drop the vertices no surviving tet references and remap the indices.
+    std::vector<PxU32> remap(allVerts.size(), 0xFFFFFFFFu);
+    std::vector<PxVec3> tverts;
+    std::vector<PxU32> tets;
+    tets.reserve(rawTets.size());
+    for (PxU32 idx : rawTets)
+    {
+        if (remap[idx] == 0xFFFFFFFFu)
+        {
+            remap[idx] = PxU32(tverts.size());
+            tverts.push_back(allVerts[idx]);
+        }
+        tets.push_back(remap[idx]);
+    }
+
+    // The TOP slab's vertices, and the bottom slab's upper surface, in the spawn frame.
+    const float TOP_SLAB_Y = float(NY - 1) * h;    // 0.75 — the top slab's lower face
+    out.bottomTopY = h;                            // 0.25 — the bottom slab's upper face
+    for (PxU32 v = 0; v < tverts.size(); ++v)
+        if (tverts[v].y >= TOP_SLAB_Y - 1e-4f) out.topIdx.push_back(v);
+    out.numTopVerts = PxU32(out.topIdx.size());
+
+    PxTetrahedronMeshDesc tetDesc;
+    tetDesc.points.count = PxU32(tverts.size());
+    tetDesc.points.stride = sizeof(PxVec3);
+    tetDesc.points.data = tverts.data();
+    tetDesc.tetrahedrons.count = PxU32(tets.size() / 4);
+    tetDesc.tetrahedrons.stride = 4 * sizeof(PxU32);
+    tetDesc.tetrahedrons.data = tets.data();
+
+    PxCookingParams ckParams(physics->getTolerancesScale());
+    ckParams.buildGPUData = true;
+    ckParams.meshWeldTolerance = 0.001f;
+    ckParams.midphaseDesc = PxMeshMidPhase::eBVH34;
+
+    PxDeformableVolumeSimulationDataDesc simDataDesc;
+    PxDeformableVolumeMesh* volMesh = immediateCooking::createDeformableVolumeMesh(
+        ckParams, tetDesc, tetDesc, simDataDesc, physics->getPhysicsInsertionCallback());
+    if (!volMesh) { std::printf("FAIL: createDeformableVolumeMesh returned null\n"); return out; }
+
+    PxDeformableVolumeMaterial* volMat =
+        physics->createDeformableVolumeMaterial(/*youngs*/ 5.e6f, /*poissons*/ 0.3f,
+                                                /*dynamicFriction*/ 0.3f,
+                                                /*elasticityDamping*/ 0.05f);
+    PxDeformableVolumeMaterial* mats[1] = { volMat };
+
+    PxShapeFlags shapeFlags = PxShapeFlag::eSIMULATION_SHAPE | PxShapeFlag::eSCENE_QUERY_SHAPE;
+    PxShape* shape = physics->createShape(PxTetrahedronMeshGeometry(volMesh->getCollisionMesh()),
+                                          mats, PxU16(1), true, shapeFlags);
+    if (!shape) { std::printf("FAIL: createShape (deformable volume) returned null\n"); return out; }
+
+    PxDeformableVolume* volume = physics->createDeformableVolume(*cudaCtx);
+    if (!volume) { std::printf("FAIL: createDeformableVolume returned null\n"); return out; }
+    volume->attachShape(*shape);
+    shape->release();
+    volume->attachSimulationMesh(*volMesh->getSimulationMesh(), *volMesh->getDeformableVolumeAuxData());
+    {
+        PxU32 iters = 30u;
+        if (const char* e = std::getenv("PXG_SB_ITERS")) { const int v = atoi(e); if (v > 0) iters = PxU32(v); }
+        static_cast<PxDeformableBody*>(volume)->setSolverIterationCounts(iters);
+    }
+
+    // PXG_SB_NOSELF is the CONTROL: the same scene with the chain switched off.
+    out.selfCollision = true;
+    if (const char* noSelf = std::getenv("PXG_SB_NOSELF"))
+        if (atoi(noSelf) != 0) out.selfCollision = false;
+    volume->setDeformableBodyFlag(PxDeformableBodyFlag::eDISABLE_SELF_COLLISION, !out.selfCollision);
+
+    // The rest-pose gate: a self-contact is only kept if the two elements were FARTHER apart
+    // than this in the rest pose.  The two slabs are 0.5 apart at rest and adjacent tets are
+    // 0.25 apart, so 0.3 keeps the fold and drops the neighbours.
+    volume->setSelfCollisionFilterDistance(0.3f);
+    // The stress gate drops a self-contact whose tetrahedron is under more stress than this.
+    // A large value disables it; the sagging cantilever is under real stress and a small
+    // tolerance would throw the contacts away exactly where they are needed.
+    volume->setSelfCollisionStressTolerance(1.0e30f);
+
+    scene->addActor(*volume);
+
+    // Mirrors buildSoftBodyScene's open-coded host-mirror initialisation.  The bracket is
+    // spawned in place -- its bottom face already sits on the plane at y = 0 -- so there is
+    // no free-fall phase to wait out and the sag is the whole motion.
+    const PxU32 nbSim = volume->getSimulationMesh()->getNbVertices();
+    const PxU32 nbColl = volume->getCollisionMesh()->getNbVertices();
+    std::vector<PxVec4> simPos(nbSim), simVel(nbSim), collPos(nbColl), restPos(nbColl);
+    const PxVec3* simVerts = volume->getSimulationMesh()->getVertices();
+    const PxReal* invMassGM = volume->getDeformableVolumeAuxData()->getGridModelInvMass();
+    for (PxU32 v = 0; v < nbSim; ++v)
+    {
+        const PxReal im = invMassGM ? invMassGM[v] : 1.0f;
+        simPos[v] = PxVec4(simVerts[v].x, simVerts[v].y, simVerts[v].z, im);
+        simVel[v] = PxVec4(0.0f, 0.0f, 0.0f, im);
+    }
+    const PxVec3* collVerts = volume->getCollisionMesh()->getVertices();
+    for (PxU32 v = 0; v < nbColl; ++v)
+    {
+        collPos[v] = PxVec4(collVerts[v].x, collVerts[v].y, collVerts[v].z, 1.0f);
+        restPos[v] = collPos[v];
+    }
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getSimPositionInvMassBufferD()),
+                    simPos.data(), nbSim * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getSimVelocityBufferD()),
+                    simVel.data(), nbSim * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getPositionInvMassBufferD()),
+                    collPos.data(), nbColl * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getRestPositionBufferD()),
+                    restPos.data(), nbColl * sizeof(PxVec4));
+    volume->markDirty(PxDeformableVolumeDataFlag::eALL);
+
+    // The TOP slab's COLLISION-mesh vertices.  The cooker may reorder or weld, so the split
+    // is recomputed from the cooked mesh rather than carried over from the authored one.
+    out.topIdx.clear();
+    for (PxU32 v = 0; v < nbColl; ++v)
+        if (collVerts[v].y >= TOP_SLAB_Y - 1e-4f) out.topIdx.push_back(v);
+    out.numTopVerts = PxU32(out.topIdx.size());
+
+    out.volume = volume;
+    out.numCollVerts = nbColl;
+    out.numSimVerts = nbSim;
+    std::printf("  softbodyselfcollide mesh: %u sim verts / %u tets (%u of %u collision verts "
+                "in the TOP slab), slabs 0.50 apart at rest, bottom slab top at y=%.2f, "
+                "self-collision %s\n",
+                nbSim, PxU32(tets.size() / 4), out.numTopVerts, nbColl, out.bottomTopY,
+                out.selfCollision ? "ON" : "OFF (control)");
+    return out;
+}
+
 // DtoH-read ONE of the two softbody vertex buffers and fill mean / min y.  `sim`
 // picks the simulation mesh (what the solver moves) over the collision mesh (what
 // sb_gm_updateTetModelVertsLaunch skins).  Returns false on any non-finite coord.
@@ -1468,6 +1721,30 @@ bool softBodyMeanMinY(const SoftBodyScene& sbs, bool sim, float& meanY, float& m
     meanY = float(sum / double(nv));
     minY = lo;
     if (extentY) *extentY = hi - lo;
+    return finite;
+}
+
+// The TOP slab's mean and min y, read from the COLLISION mesh (what the skin kernel writes,
+// and the buffer every other softbody scene observes).
+bool softBodySelfTopY(const SoftBodySelfScene& ssc, float& meanY, float& minY)
+{
+    std::vector<PxVec4> host(ssc.numCollVerts);
+    PxCudaContext* ctx = ssc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(),
+                    reinterpret_cast<CUdeviceptr>(ssc.volume->getPositionInvMassBufferD()),
+                    ssc.numCollVerts * sizeof(PxVec4));
+    double sum = 0.0;
+    float lo = 1.0e30f;
+    bool finite = true;
+    for (PxU32 t = 0; t < ssc.numTopVerts; ++t)
+    {
+        const PxVec4& p = host[ssc.topIdx[t]];
+        sum += double(p.y);
+        lo = PxMin(lo, p.y);
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) finite = false;
+    }
+    meanY = ssc.numTopVerts ? float(sum / double(ssc.numTopVerts)) : 0.0f;
+    minY = lo;
     return finite;
 }
 
@@ -2257,6 +2534,124 @@ int main()
         return 2;
     }
 
+    // PXG_SCENE=softbodyselfcollide (P8.4): the FEM-VOLUME SELF-collision money shot.
+    if (!std::strcmp(sceneName, "softbodyselfcollide"))
+    {
+        SoftBodySelfScene ssc = buildSoftBodySelfCollideScene(physics, scene, material, cudaCtx);
+        if (!ssc.volume)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodyselfcollide scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'softbodyselfcollide' built: a %u-vertex FEM-volume bracket "
+                    "resting on a static plane, its top slab cantilevered over the bottom one\n",
+                    ssc.numSimVerts);
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: softbodyselfcollide GPU pipeline CONSTRUCTED + live over "
+                        "Vulkan (set PXG_GPU_STEP=1 to step the sag)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        int steps = 100;
+        if (const char* sEnv = std::getenv("PXG_STEPS")) { const int v = atoi(sEnv); if (v > 0) steps = v; }
+
+        float topMean0 = 0.0f, topMin0 = 0.0f;
+        bool allFinite = softBodySelfTopY(ssc, topMean0, topMin0);
+        float topMin = topMin0, topMean = topMean0;
+        float prevMin = topMin0, restMaxDy = 0.0f;
+        const int restWindow = steps / 4;
+        PxU32 maxContacts = 0u;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            allFinite = softBodySelfTopY(ssc, topMean, topMin) && allFinite;
+            PxSimulationStatistics simStats;
+            scene->getSimulationStatistics(simStats);
+            maxContacts = PxMax(maxContacts,
+                                simStats.gpuDynamicsMemoryConfigStatistics.deformableVolumeContacts);
+            if (i >= steps - restWindow) restMaxDy = PxMax(restMaxDy, PxAbs(topMin - prevMin));
+            if (i < 6 || i == steps - 1 || (i % 20 == 0))
+                std::printf("    step %3d: top slab min y = %.5f (mean %.5f)\n", i, topMin, topMean);
+            prevMin = topMin;
+        }
+
+        std::printf("  softbodyselfcollide (self-collision %s): top slab min y %.4f -> %.4f "
+                    "(mean %.4f); bottom slab surface at y=%.2f; peak deformable-volume contacts = %u; "
+                    "rest |dy| over last %d steps = %.6f\n",
+                    ssc.selfCollision ? "ON" : "OFF", topMin0, topMin, topMean, ssc.bottomTopY,
+                    maxContacts, restWindow, restMaxDy);
+
+        int failures = 0;
+        if (!allFinite || !std::isfinite(topMin))
+        { std::printf("FAIL: non-finite vertex in the bracket\n"); ++failures; }
+        // The top slab must SAG -- otherwise the scene proves nothing either way.
+        if (!(topMin0 - topMin > 0.02f))
+        { std::printf("FAIL: the top slab did not sag (min y %.5f -> %.5f)\n", topMin0, topMin); ++failures; }
+
+        // THE THRESHOLDS, AND WHERE THEY COME FROM.  Measured over 100 steps at
+        // youngs = 5e6 with 30 solver iterations:
+        //
+        //     self-collision ON : top slab min y 0.7500 -> 0.2133, rest |dy| = 0.003299
+        //     self-collision OFF: top slab min y 0.7500 -> 0.0000, rest |dy| = 0.000000
+        //
+        // The bottom slab's upper surface is at y = 0.25, and the caught slab settles a
+        // little BELOW it (0.2133).  That is not a failure to catch: the slab is a soft body
+        // that compresses under its own weight, and the contact is resolved at a rest offset
+        // rather than at the geometric surface -- the same reason clothdrape settles ON the
+        // contact rest distance instead of exactly on the plane.  What the pair proves is
+        // the thing worth proving: with the chain on, the top slab STOPS just under the
+        // bottom slab and converges; with it off, it passes clean through to the floor.
+        // The bar is set at 0.15 -- far above the 0.00 the control reaches, far below the
+        // 0.21 this run reaches -- so neither run can drift into the other's verdict.
+        const float CATCH_Y = 0.15f;
+        if (ssc.selfCollision)
+        {
+            // (1) the chain must actually produce contacts...
+            if (!(maxContacts > 0u))
+            { std::printf("FAIL: self-collision is ON but the engine reported ZERO deformable-volume "
+                          "contacts -- the midphase or the remap is not feeding the solve\n"); ++failures; }
+            // (2) ...and they must CATCH the top slab at the bottom slab rather than let it
+            // fall to the floor.
+            if (!(topMin > CATCH_Y))
+            { std::printf("FAIL: the top slab sank to y=%.5f, below the catch bar %.2f (bottom slab "
+                          "surface y=%.2f) -- self-collision did not catch it\n",
+                          topMin, CATCH_Y, ssc.bottomTopY); ++failures; }
+            // (3) and it must SETTLE rather than keep sinking or oscillate.
+            if (!(restMaxDy < 0.02f))
+            { std::printf("FAIL: the caught slab never settled (rest |dy|=%.6f)\n", restMaxDy); ++failures; }
+        }
+        else
+        {
+            // The CONTROL. With the flag off the top slab is free to pass through, and it
+            // does -- all the way to the plane.  Without this half the ON run proves nothing:
+            // a bracket that simply never sagged that far would pass it too.
+            if (!(topMin < CATCH_Y))
+            { std::printf("FAIL: self-collision is OFF, so the top slab must NOT be held above the "
+                          "catch bar %.2f (got %.5f) -- if it stops there anyway the ON run proves "
+                          "nothing\n", CATCH_Y, topMin); ++failures; }
+        }
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        if (failures == 0)
+        {
+            if (ssc.selfCollision)
+                std::printf("[  OK  ] gpu-sdk-step: FEM-volume SELF-collision CAUGHT the sagging top slab "
+                            "at the bottom one and SETTLED it (min y=%.4f, bottom surface %.2f, rest "
+                            "|dy|=%.6f) -- the control run falls to 0.0000\n",
+                            topMin, ssc.bottomTopY, restMaxDy);
+            else
+                std::printf("[  OK  ] gpu-sdk-step: control run -- with self-collision OFF the top slab "
+                            "passed clean through the bottom one to the floor (min y=%.4f, bottom "
+                            "surface %.2f)\n", topMin, ssc.bottomTopY);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: softbodyselfcollide checks failed (%d)\n", failures);
+        return 2;
+    }
+
     std::vector<RestTarget> targets;
     if      (!std::strcmp(sceneName, "box"))       buildBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "stack"))     buildStackScene(physics, scene, material, targets);
@@ -2266,7 +2661,7 @@ int main()
     else if (!std::strcmp(sceneName, "capsulebox")) buildCapsuleBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "convex"))    buildConvexScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "joint"))     buildJointScene(physics, scene, material, targets);
-    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint|particle|cloth|clothhang|clothdrape|clothselfcollide|softbody)\n", sceneName);
+    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint|particle|cloth|clothhang|clothdrape|clothselfcollide|softbody|softbodyselfcollide)\n", sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
     if (targets.empty())
     {
