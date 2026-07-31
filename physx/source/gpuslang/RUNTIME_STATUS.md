@@ -1620,6 +1620,80 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.5 — the co-rotated stress field, and the plasticity block settled
+
+`sb_calculateStressLaunch` is mapped: one thread per COLLISION-mesh tetrahedron computes the
+co-rotated Cauchy stress tensor and the scalar coefficient that goes with it. ABI row
+`{8,8,8}`, 24-byte blob, 2D grid (x = tetrahedron blocks, y = the active bodies). Manifest
+**MAPPED 240 -> 241**; softbody **30 -> 31 of 56**. It lives in `softBodySolveBda` because it
+shares the flat-`PxMat33` rest-pose read and the descriptor walk with the rotation extractors
+already there.
+
+### Why this kernel, and why NOT the other three
+
+The scalar coefficient is the input to the SELF-COLLISION stress gate ported in P8.4 tranche
+a — and this kernel's own launch gate runs it when `eCOMPUTE_STRESS_TENSOR` is set **or**
+self-collision is enabled. The field exists *for* that gate. Until it was mapped,
+`mTetraStressCoefficient` held whatever the allocation contained, which is why
+`softbodyselfcollide` had to set a tolerance no stress could exceed.
+
+The three plasticity kernels are **deliberately** left unmapped, and the manifest now says so
+at each entry rather than leaving a bare "unmapped":
+
+| kernel | why not |
+|---|---|
+| `sb_plasticDeformLaunch` | body gated on a hard-coded `if (false)` (softBodyGM.cu:2844) |
+| `sb_plasticDeformLaunch2` | same hard-coded `if (false)` (softBodyGM.cu:3013) |
+| `sb_initPlasticDeformLaunch` | no call site anywhere in PhysX |
+
+Porting them would map empty kernels and move the count without moving anything else. The
+count is supposed to mean something.
+
+### Mutation: 18 of 18
+
+Two needed the fixture rebuilt before they died, and both are the same species of blind spot:
+a fixture whose inputs are too symmetric to distinguish two orderings.
+
+- with every rest pose an identity, `P * Qinv` and `Qinv * P` agree, so a **swapped
+  deformation gradient** passed. Tet 1 now carries a non-symmetric shear;
+- with one active body on a 1x1 grid, `gid.x` and `gid.y` are both 0, so the **body selector
+  and the tetrahedron block** could be swapped. A second active body, sharing every input and
+  differing only in where its results go, separates them.
+
+The three fixture tets are chosen so the coefficient's definition is pinned by shape, not
+only by the reference: tet 0 is undeformed (zero strain, zero coefficient), tet 1 is stretched
+under a 30-degree rotation (the co-rotation must remove it), and tet 2 is stretched
+**uniformly** — its diagonal differences cancel, so its coefficient is zero while its sigma is
+not. A coefficient built from the strain magnitude instead of the diagonal differences passes
+tet 0 and fails tet 2.
+
+### The end-to-end evidence
+
+`PXG_SCENE=softbodyselfcollide` now exposes the tolerance as `PXG_SB_STRESSTOL`, and the
+three-way result is what makes the stress field observable outside a fixture:
+
+| run | top slab min y |
+|---|---|
+| self-collision ON, gate off (default) | **0.2133** |
+| self-collision ON, tolerance 0.001 | **0.0000** |
+| self-collision OFF | **0.0000** |
+
+A tight tolerance drops *every* self-contact, which can only happen if the coefficient carries
+real values — the gate and the field are wired to each other through the engine, not through a
+test harness. The default run is unchanged from before this kernel landed, byte for byte,
+which is the other half of the statement: mapping it perturbed nothing.
+
+### Verification
+
+| gate | result |
+|---|---|
+| target ctest (`gpuslang.softBodySim`) | pass, 46 fixtures |
+| mutation, forced-fresh `.spv` | 18 killed of 18 |
+| full suite, default memory mode | **674 / 674**, 272 s |
+| full suite, `PXG_DEVICE_V2=1` | **674 / 674**, 362 s |
+| rigid regression, 8 scenes x 2 solvers | **16 / 16** |
+| all seven deformable scenes + the self-collision control | unchanged, green |
+
 ## P8.4 tranche b — the self-collision chain closes, and a null pointer that hid in it
 
 `sb_fem_contact_remap_to_simLaunch`, `sb_softbodyContactPrepareLaunch` and
