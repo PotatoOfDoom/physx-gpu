@@ -87,7 +87,7 @@ set(SHADER_COMMON_DEPS
 # to contract undecorated expressions: llvmpipe fuses npCvxCoreEpa's
 # makePlane triple-cross sums into fma chains (1-ulp vs strict IEEE), which
 # breaks the bitwise CPU-vs-GPU doctrine.  The decoration forbids that.
-set(PXG_NOCONTRACT_SHADERS npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npD6JointPrep npArtiExtBody npArti1DPrep npArtiJointHeader npArtiSolve1D npArtiSolveContact npArtiSolve1DTGS npArtiSolveContactTGS npArtiCheckActive npArtiPropagate npArtiPropagateAccel npArtiPropagateAccelJV npArtiSpatialMatVec npArtiSpatialMatMat npArtiTranslateInertia npArtiTranslateSInertia npArtiPropagateZA npArtiPropagateZASph npArtiTranslateInertiaMass npArtiInvertInertia npArtiPropagateImpDof npArtiAccumLinkImp npArtiDriveParams npArtiClampDriveImp npClothDefGrad2D npSbDefGrad npDefMaterial npJacobiRotate npClothAtan npAnisoHelpers npClothDeltaLambda npClothExtractRot2D npClothVelClamp npClothArap2D npClothArea2D npClothWind npSbBaryInvMass npSbVolumeSolve npIsoConcaveCorner npSphSpikyKernel npIsoAcosDecode npSparseGridDomain npDenseGridCell npSbBaryProject npIsoVecNormalize npSbCompliance npSbDeltaLambdaGradC npSbTetConstraint npPsSpecVolume npSbComputeLambda npGridLocation npAnisoOutput npSmoothPos npIsoAvgVerts npPsSolvePC npPsSolvePCTGS npPsWeightKernels npPsDiffuseUpdate npPsDiffuseSpawn npPsDiffuseAvg npPsDiffuseOneWay npSdfBoxDist npSparseGridCellFromPos npIsoGridFilter npSbExtractRotAPD npSbSolveNeoHookean npSbSolveCorot npSbSolveGM npClothMembrane npClothBending npClothSharedEnergy npSbCollisionConstraint npClothCollisionConstraint npSdfBvhMorton npSbStress npSdfHoles npClothTriContact particleSim particleSelfCollisionBda psContactSolveTgsBda femClothSimBda femClothSolveBda femClothSolvePairBda femClothRigidAttachBda femClothContactGenBda femClothRigidContactBda femClothSelfCollisionBda femClothClothContactBda femClothRefitBda softBodySimBda softBodyRefitBda softBodySolveBda softBodyContactGenBda softBodyContactRemapBda softBodyRigidContactBda softBodyRigidAttachBda softBodySelfCollisionBda)
+set(PXG_NOCONTRACT_SHADERS npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npD6JointPrep npArtiExtBody npArti1DPrep npArtiJointHeader npArtiSolve1D npArtiSolveContact npArtiSolve1DTGS npArtiSolveContactTGS npArtiCheckActive npArtiPropagate npArtiPropagateAccel npArtiPropagateAccelJV npArtiSpatialMatVec npArtiSpatialMatMat npArtiTranslateInertia npArtiTranslateSInertia npArtiPropagateZA npArtiPropagateZASph npArtiTranslateInertiaMass npArtiInvertInertia npArtiPropagateImpDof npArtiAccumLinkImp npArtiDriveParams npArtiClampDriveImp npClothDefGrad2D npSbDefGrad npDefMaterial npJacobiRotate npClothAtan npAnisoHelpers npClothDeltaLambda npClothExtractRot2D npClothVelClamp npClothArap2D npClothArea2D npClothWind npSbBaryInvMass npSbVolumeSolve npIsoConcaveCorner npSphSpikyKernel npIsoAcosDecode npSparseGridDomain npDenseGridCell npSbBaryProject npIsoVecNormalize npSbCompliance npSbDeltaLambdaGradC npSbTetConstraint npPsSpecVolume npSbComputeLambda npGridLocation npAnisoOutput npSmoothPos npIsoAvgVerts npPsSolvePC npPsSolvePCTGS npPsWeightKernels npPsDiffuseUpdate npPsDiffuseSpawn npPsDiffuseAvg npPsDiffuseOneWay npSdfBoxDist npSparseGridCellFromPos npIsoGridFilter npSbExtractRotAPD npSbSolveNeoHookean npSbSolveCorot npSbSolveGM npClothMembrane npClothBending npClothSharedEnergy npSbCollisionConstraint npClothCollisionConstraint npSdfBvhMorton npSbStress npSdfHoles npClothTriContact particleSim particleSelfCollisionBda psContactSolveTgsBda femClothSimBda femClothSolveBda femClothSolvePairBda femClothRigidAttachBda femClothContactGenBda femClothRigidContactBda femClothSelfCollisionBda femClothClothContactBda femClothRefitBda softBodySimBda softBodyRefitBda softBodySolveBda softBodyContactGenBda softBodyContactRemapBda softBodyRigidContactBda softBodyRigidAttachBda softBodySelfCollisionBda softBodySelfSolveBda)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
@@ -543,8 +543,22 @@ pxg_compile_shader(softBodyContactGenBda sb_midphaseGeneratePairsLaunch
 # P8.2 tranche c: the collision-mesh -> simulation-mesh contact remap and the sorted-order
 # gather.  Both are LIFTS of npSbRemap.slang's unit-tested descriptor-set ports onto the
 # engine BDA ABI; the geometry helpers are copied from it verbatim.
+# P8.4 tranche b adds sb_fem_contact_remap_to_simLaunch to this file: the
+# DEFORMABLE-vs-DEFORMABLE twin of the remap above, run twice over the same contact array
+# (gridDim.y == 2 selects which half of the pair is remapped).  It shares every helper and
+# both llvmpipe workarounds with its sibling, which is why it lives here rather than in its
+# own shader.
 pxg_compile_shader(softBodyContactRemapBda sb_other_contact_remap_to_simLaunch
-                   sb_reorderPSContactsLaunch)
+                   sb_reorderPSContactsLaunch
+                   sb_fem_contact_remap_to_simLaunch)
+# P8.4 tranche b: the SOFTBODY-vs-SOFTBODY constraint prepare and solve -- chain kernels 2
+# and 3 of the self-collision arc.  Symmetric twins of the rigid-vs-softbody pair from P8.2
+# tranche d/e: both sides are softbody tets, so every step happens twice with the sign
+# flipped.  In PXG_NOCONTRACT_SHADERS: the barycentric blends, the relative-position dot and
+# the friction terms are mul-feeding-add chains compared bit-exactly against a CPU reference.
+pxg_compile_shader(softBodySelfSolveBda sb_softbodyContactPrepareLaunch
+                   sb_solveOutputSSDeltaVLaunch
+                   sb_solveOutputSSDeltaVLaunchTGS)
 # P8.2 tranche d: chain kernel 5, the softbody-vs-rigid CONSTRAINT prepare.  A near-clone of
 # cloth_rigidContactPrepareLaunch -- same ABI row, same 104-byte blob -- sharing its
 # 78-line constraint-block writer through the new pxgSlangFemRigidContact module rather than

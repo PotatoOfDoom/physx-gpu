@@ -536,6 +536,29 @@ static const uint8_t kSbReorderPsContacts[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
 //   y = nbActiveSelfCollisionSoftbodies); the bridge forwards both.
 static const uint8_t kSbSelfCollisionMidphase[] = { 8, 8, 8, 56 };
 
+// gpunarrowphase / gpusimulationcontroller softbody SELF-collision SOLVE chain (P8.4
+// tranche b):
+//   sb_fem_contact_remap_to_simLaunch(const PxgSoftBody* softbodies, float4* outBarycentric0,
+//     float4* outBarycentric1, PxgFemFemContactInfo* outContactInfo, PxU32* totalContactCount,
+//     PxU32* prevContactCount, const PxU32 maxNbContacts)  -- launch site
+//   PxgNarrowphaseCore.cpp:4166.  Six device pointers @0..40 and a PxU32 @48 -> 56-byte
+//   blob.  The launch is 2D in the GRID: gridDim.y == 2 selects which half of the pair is
+//   remapped (1 for cloth-vs-softbody).
+static const uint8_t kSbFemContactRemapToSim[] = { 8, 8, 8, 8, 8, 8, 4 };
+//   sb_softbodyContactPrepareLaunch(PxgSoftBody*, float4* contacts, float4* normalPens,
+//     float4* barycentrics0, float4* barycentrics1, PxgFemFemContactInfo* contactInfos,
+//     PxU32* numContacts, PxgSoftBodySoftBodyConstraintBlock* constraints,
+//     float2* softBodyAppliedForces, const PxU32 maxContacts)  -- launch site
+//   PxgSoftBodyCore.cpp:2547.  Nine device pointers @0..64 and a PxU32 @72 -> 80-byte blob.
+static const uint8_t kSbSsContactPrepare[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 4 };
+//   sb_solveOutputSSDeltaVLaunch{,TGS}(PxgSoftBody*, PxgFemFemContactInfo*,
+//     PxgSoftBodySoftBodyConstraintBlock*, PxU32* numContacts, const PxReal dt,
+//     const PxReal biasCoefficient, float2* appliedForces,
+//     PxsDeformableVolumeMaterialData* materials)  -- launch site PxgSoftBodyCore.cpp:1636.
+//   Four device pointers @0..24, two PxReal at @32/@36, two more pointers realigned to
+//   @40/@48 -> 56-byte blob.
+static const uint8_t kSbSolveOutputSSDeltaV[] = { 8, 8, 8, 8, 4, 4, 8, 8 };
+
 // gpusimulationcontroller softbody-vs-rigid CONSTRAINT PREPARE (P8.2 tranche d):
 //   sb_rigidContactPrepareLaunch(PxgSoftBody* softbodies, float4* contacts_restW,
 //     float4* normalPens, float4* barycentrics, PxgFemOtherContactInfo* contactInfos,
@@ -945,6 +968,11 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_solveRigidSoftCollisionLaunchTGS", kSbRigidContactSolve, uint32_t(sizeof(kSbRigidContactSolve)) },
     // gpunarrowphase softbody SELF-collision midphase (P8.4 tranche a)
     { "sb_selfCollisionMidphaseGeneratePairsLaunch", kSbSelfCollisionMidphase, uint32_t(sizeof(kSbSelfCollisionMidphase)) },
+    // gpunarrowphase / gpusimulationcontroller softbody SELF-collision solve chain (P8.4 tranche b)
+    { "sb_fem_contact_remap_to_simLaunch", kSbFemContactRemapToSim, uint32_t(sizeof(kSbFemContactRemapToSim)) },
+    { "sb_softbodyContactPrepareLaunch", kSbSsContactPrepare, uint32_t(sizeof(kSbSsContactPrepare)) },
+    { "sb_solveOutputSSDeltaVLaunch", kSbSolveOutputSSDeltaV, uint32_t(sizeof(kSbSolveOutputSSDeltaV)) },
+    { "sb_solveOutputSSDeltaVLaunchTGS", kSbSolveOutputSSDeltaV, uint32_t(sizeof(kSbSolveOutputSSDeltaV)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },

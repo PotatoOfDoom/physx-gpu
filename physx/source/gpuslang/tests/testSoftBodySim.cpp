@@ -5642,4 +5642,942 @@ PXG_TEST(softBodySimSelfCollisionMidphase)
     dev->destroyBuffer(bBary1.h); dev->destroyBuffer(bInfo.h); dev->destroyBuffer(bCount.h);
 }
 
+// ===========================================================================
+// P8.4 tranche b — sb_fem_contact_remap_to_simLaunch, the DEFORMABLE-vs-DEFORMABLE remap.
+//
+// The arithmetic is the sibling's and is covered by the two fixtures above.  What is new,
+// and what this pins, is everything the second grid brings: which HALF of the pair each
+// y-grid remaps, which barycentric array it reads the contact point OUT of and writes the
+// result back INTO, the `hasTet` neutralisation branch that the other remap does not have,
+// and the fact that pairInd0 is a PxU64 field taking a PxU32 value.
+// ===========================================================================
+struct FemFemContactInfoHost { uint64_t pairInd0; uint32_t pairInd1, auxInd; };
+static_assert(sizeof(FemFemContactInfoHost) == 16, "PxgFemFemContactInfo is 16 bytes");
+
+struct SbFemRemapPush
+{
+    uint64_t softbodies, outBarycentric0, outBarycentric1, outContactInfo,
+             totalContactCount, prevContactCount;
+    uint32_t maxNbContacts, pad52;
+};
+static_assert(sizeof(SbFemRemapPush) == 56, "fem remap push blob must be 56 bytes");
+static_assert(offsetof(SbFemRemapPush, maxNbContacts) == 48, "maxNbContacts @48");
+
+PXG_TEST(softBodySimFemContactRemap)
+{
+    using namespace p80refit;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // Five sim tets.  0 is far, 1 is nearer, 2 is the unit tet at the origin and CONTAINS
+    // (0.2, 0.2, 0.2); 3 and 4 are DEGENERATE (fourth corner repeats the first), which is
+    // what drives the hasTet branch this kernel has and its sibling does not.
+    std::vector<F4> simVerts = {
+        { 10.0f, 0.0f, 0.0f, 1.0f }, { 11.0f, 0.0f, 0.0f, 1.0f },
+        { 10.0f, 1.0f, 0.0f, 1.0f }, { 10.0f, 0.0f, 1.0f, 1.0f },   // tet 0, far
+        {  2.0f, 0.0f, 0.0f, 1.0f }, {  3.0f, 0.0f, 0.0f, 1.0f },
+        {  2.0f, 1.0f, 0.0f, 1.0f }, {  2.0f, 0.0f, 1.0f, 1.0f },   // tet 1, nearer
+        {  0.0f, 0.0f, 0.0f, 1.0f }, {  1.0f, 0.0f, 0.0f, 1.0f },
+        {  0.0f, 1.0f, 0.0f, 1.0f }, {  0.0f, 0.0f, 1.0f, 1.0f },   // tet 2, contains
+        { 20.0f, 0.0f, 0.0f, 1.0f }, { 21.0f, 0.0f, 0.0f, 1.0f },
+        { 20.0f, 1.0f, 0.0f, 1.0f }, { 20.0f, 0.0f, 0.0f, 1.0f },   // tet 3, DEGENERATE
+        { 30.0f, 0.0f, 0.0f, 1.0f }, { 31.0f, 0.0f, 0.0f, 1.0f },
+        { 30.0f, 1.0f, 0.0f, 1.0f }, { 30.0f, 0.0f, 0.0f, 1.0f },   // tet 4, DEGENERATE
+    };
+    std::vector<TetIdx4> simTets = {
+        { 0u, 1u, 2u, 3u }, { 4u, 5u, 6u, 7u }, { 8u, 9u, 10u, 11u },
+        { 12u, 13u, 14u, 15u }, { 16u, 17u, 18u, 19u },
+    };
+    // collision tet 0 -> sim candidates {0,1,2}; collision tet 1 -> {3,4}, both degenerate.
+    std::vector<uint32_t> remapColToSim = { 0u, 1u, 2u, 3u, 4u, 0u, 0u, 0u };
+    std::vector<uint32_t> accumRemap = { 3u, 5u, 5u, 5u };   // inclusive prefix sum
+
+    DevBuf bSv = makeDev(dev, simVerts), bSt = makeDev(dev, simTets);
+    DevBuf bRc = makeDev(dev, remapColToSim), bAr = makeDev(dev, accumRemap);
+    if (!bSv.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mSimTetIndices = reinterpret_cast<decltype(sb.mSimTetIndices)>(size_t(bSt.addr));
+    sb.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bSv.addr));
+    sb.mTetsRemapColToSim = reinterpret_cast<PxU32*>(size_t(bRc.addr));
+    sb.mTetsAccumulatedRemapColToSim = reinterpret_cast<PxU32*>(size_t(bAr.addr));
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    auto enc = [](uint32_t id, uint32_t elem) { return (id << 20) | elem; };
+
+    // Two contacts, and the two halves of each pair are DELIBERATELY DIFFERENT so that a
+    // port which remapped the wrong half, or read the wrong barycentric array, cannot
+    // produce these numbers:
+    //   contact 0: pairInd1 -> collision tet 0 (three real candidates)
+    //              pairInd0 -> collision tet 1 (two DEGENERATE candidates)
+    //   contact 1: both halves -> collision tet 0, but from different query points.
+    std::vector<FemFemContactInfoHost> infos(4);
+    std::memset(infos.data(), 0, infos.size() * sizeof(FemFemContactInfoHost));
+    // The HIGH word of pairInd0 starts dirty: the shader must zero it, not leave it.
+    infos[0].pairInd0 = (uint64_t(0xDEADBEEFu) << 32) | enc(0u, 1u);
+    infos[0].pairInd1 = enc(0u, 0u);
+    infos[0].auxInd = 0xABCD1234u;
+    infos[1].pairInd0 = (uint64_t(0xDEADBEEFu) << 32) | enc(0u, 0u);
+    infos[1].pairInd1 = enc(0u, 0u);
+    infos[1].auxInd = 0x5A5A5A5Au;
+    DevBuf bInfo = makeDev(dev, infos);
+
+    // The barycentric arrays carry the contact POINT on the way in.
+    const F4 SENT = { -7.0f, -7.0f, -7.0f, -7.0f };
+    std::vector<F4> bary0 = { { 5.0f, 5.0f, 5.0f, 0.0f },      // contact 0 (degenerate side)
+                              { 0.2f, 0.2f, 0.2f, 0.0f },      // contact 1 -> CONTAINED
+                              SENT, SENT };
+    std::vector<F4> bary1 = { { 0.2f, 0.2f, 0.2f, 0.0f },      // contact 0 -> CONTAINED
+                              { 1.6f, 0.2f, 0.2f, 0.0f },      // contact 1 -> nearest = tet 1
+                              SENT, SENT };
+    DevBuf bB0 = makeDev(dev, bary0), bB1 = makeDev(dev, bary1);
+    std::vector<uint32_t> count = { 2u, 0u, 0u, 0u };
+    DevBuf bCount = makeDev(dev, count);
+
+    SbFemRemapPush push = {};
+    push.softbodies = bDesc.addr;
+    push.outBarycentric0 = bB0.addr;
+    push.outBarycentric1 = bB1.addr;
+    push.outContactInfo = bInfo.addr;
+    push.totalContactCount = bCount.addr;
+    push.prevContactCount = 0ull;       // OPTIONAL in CUDA -> must not be dereferenced
+    push.maxNbContacts = 64u;
+
+    // THE ENGINE'S GRID: gridDim.y == 2 (PxgNarrowphaseCore.cpp:4149).  x is deliberately
+    // OVER-SIZED relative to what two contacts need, so an inverted or off-by-one
+    // `gid.x >= SB_REMAP_GRID` early-out shows up as either nothing happening or work
+    // happening twice.
+    Kernel k("softBodyContactRemapBda.spv", "sb_fem_contact_remap_to_simLaunch", {}, sizeof(SbFemRemapPush));
+    k.dispatch(/*gridX*/ 1024u, {}, push, /*gridY*/ 2u, 1u);
+    dev->flush();
+
+    const auto gInfo = downloadBuffer<FemFemContactInfoHost>(dev, bInfo.h, 4);
+    const auto g0 = downloadBuffer<F4>(dev, bB0.h, 4);
+    const auto g1 = downloadBuffer<F4>(dev, bB1.h, 4);
+    for (uint32_t i = 0; i < 2u; ++i)
+        std::printf("  contact %u: pairInd0 -> tet %u (hi 0x%08x), pairInd1 -> tet %u | "
+                    "bary0(%.4f %.4f %.4f %.4f) bary1(%.4f %.4f %.4f %.4f)\n",
+                    i, uint32_t(gInfo[i].pairInd0) & 0xfffffu, uint32_t(gInfo[i].pairInd0 >> 32),
+                    gInfo[i].pairInd1 & 0xfffffu,
+                    g0[i].x, g0[i].y, g0[i].z, g0[i].w, g1[i].x, g1[i].y, g1[i].z, g1[i].w);
+
+    auto near4 = [](float a, float b) { return std::fabs(a - b) < 1e-4f; };
+
+    // ---- y-grid 0 remaps pairInd1 through outBarycentric1 --------------------
+    PXG_CHECK_MSG((gInfo[0].pairInd1 & 0xfffffu) == 2u,
+                  "contact 0's pairInd1 side queries (0.2,0.2,0.2) from outBarycentric1 and is "
+                  "CONTAINED by sim tet 2 (got tet %u)", gInfo[0].pairInd1 & 0xfffffu);
+    PXG_CHECK_MSG(near4(g1[0].x, 0.4f) && near4(g1[0].y, 0.2f) && near4(g1[0].z, 0.2f) &&
+                  near4(g1[0].w, 0.2f),
+                  "and its barycentric must be (0.4,0.2,0.2,0.2), got (%.4f %.4f %.4f %.4f)",
+                  g1[0].x, g1[0].y, g1[0].z, g1[0].w);
+    PXG_CHECK_MSG((gInfo[1].pairInd1 & 0xfffffu) == 1u,
+                  "contact 1's pairInd1 side is outside every candidate, so the NEAREST (sim "
+                  "tet 1) must win (got tet %u)", gInfo[1].pairInd1 & 0xfffffu);
+
+    // ---- y-grid 1 remaps pairInd0 through outBarycentric0 --------------------
+    // If a port had the two grids the wrong way round, contact 1 would land on sim tet 1
+    // here and sim tet 2 above -- so these two together, not either alone, pin the mapping.
+    PXG_CHECK_MSG((uint32_t(gInfo[1].pairInd0) & 0xfffffu) == 2u,
+                  "contact 1's pairInd0 side queries (0.2,0.2,0.2) from outBarycentric0 and is "
+                  "CONTAINED by sim tet 2 (got tet %u)", uint32_t(gInfo[1].pairInd0) & 0xfffffu);
+    PXG_CHECK_MSG(near4(g0[1].x, 0.4f) && near4(g0[1].y, 0.2f) && near4(g0[1].z, 0.2f) &&
+                  near4(g0[1].w, 0.2f),
+                  "and its barycentric must be (0.4,0.2,0.2,0.2), got (%.4f %.4f %.4f %.4f)",
+                  g0[1].x, g0[1].y, g0[1].z, g0[1].w);
+
+    // ---- the hasTet branch ---------------------------------------------------
+    PXG_CHECK_MSG((uint32_t(gInfo[0].pairInd0) & 0xfffffu) == 0u,
+                  "contact 0's pairInd0 side names collision tet 1, whose only two candidates "
+                  "are DEGENERATE -- with no valid tet anywhere the contact must be remapped "
+                  "to sim tet 0 (got tet %u)", uint32_t(gInfo[0].pairInd0) & 0xfffffu);
+    PXG_CHECK_MSG(g0[0].x == 0.0f && g0[0].y == 0.0f && g0[0].z == 0.0f && g0[0].w == 0.0f,
+                  "...and its barycentric must be ZEROED, which is what neutralises it -- got "
+                  "(%.4f %.4f %.4f %.4f)", g0[0].x, g0[0].y, g0[0].z, g0[0].w);
+
+    // ---- pairInd0 is a PxU64 field taking a PxU32 value ----------------------
+    for (uint32_t i = 0; i < 2u; ++i)
+        PXG_CHECK_MSG(uint32_t(gInfo[i].pairInd0 >> 32) == 0u,
+                      "contact %u's pairInd0 high word must be ZEROED, not left at 0x%08x",
+                      i, uint32_t(gInfo[i].pairInd0 >> 32));
+
+    // ---- what must NOT be touched -------------------------------------------
+    PXG_CHECK_MSG(gInfo[0].auxInd == 0xABCD1234u && gInfo[1].auxInd == 0x5A5A5A5Au,
+                  "auxInd carries the validity/pair-type bits and the remap must not write it "
+                  "(got 0x%08x, 0x%08x)", gInfo[0].auxInd, gInfo[1].auxInd);
+    PXG_CHECK_MSG((gInfo[0].pairInd1 >> 20u) == 0u && (uint32_t(gInfo[0].pairInd0) >> 20u) == 0u,
+                  "the softbody id must survive both rewrites");
+    PXG_CHECK_MSG(g0[2].x == SENT.x && g1[2].x == SENT.x,
+                  "contact 2 is past the count and must be untouched");
+
+    // ---- the same result at the engine's OTHER x-grid ------------------------
+    // The remap is NOT idempotent: a second visit would read an already-remapped SIM index
+    // as a collision index and search the wrong candidate range.  The softbody-vs-softbody
+    // call site dispatches 8192 blocks where self-collision dispatches 1024, so the shader
+    // pins one and refuses the rest; running both shapes must give byte-identical output.
+    {
+        std::vector<FemFemContactInfoHost> i2 = infos;
+        std::vector<F4> a0 = bary0, a1 = bary1;
+        DevBuf bI2 = makeDev(dev, i2), bA0 = makeDev(dev, a0), bA1 = makeDev(dev, a1);
+        std::vector<uint32_t> c2 = { 2u, 0u, 0u, 0u };
+        DevBuf bC2 = makeDev(dev, c2);
+        SbFemRemapPush p2 = push;
+        p2.outContactInfo = bI2.addr; p2.outBarycentric0 = bA0.addr;
+        p2.outBarycentric1 = bA1.addr; p2.totalContactCount = bC2.addr;
+        Kernel("softBodyContactRemapBda.spv", "sb_fem_contact_remap_to_simLaunch", {}, sizeof(SbFemRemapPush))
+            .dispatch(8192u, {}, p2, 2u, 1u);
+        dev->flush();
+        const auto j2 = downloadBuffer<FemFemContactInfoHost>(dev, bI2.h, 4);
+        const auto d0 = downloadBuffer<F4>(dev, bA0.h, 4);
+        const auto d1 = downloadBuffer<F4>(dev, bA1.h, 4);
+        for (uint32_t i = 0; i < 2u; ++i)
+        {
+            PXG_CHECK_MSG(j2[i].pairInd0 == gInfo[i].pairInd0 && j2[i].pairInd1 == gInfo[i].pairInd1,
+                          "contact %u must remap identically at gridX 8192 and 1024 "
+                          "(pairInd0 0x%llx vs 0x%llx, pairInd1 0x%08x vs 0x%08x)", i,
+                          (unsigned long long)j2[i].pairInd0, (unsigned long long)gInfo[i].pairInd0,
+                          j2[i].pairInd1, gInfo[i].pairInd1);
+            PXG_CHECK(d0[i].x == g0[i].x && d1[i].x == g1[i].x);
+        }
+        dev->destroyBuffer(bI2.h); dev->destroyBuffer(bA0.h);
+        dev->destroyBuffer(bA1.h); dev->destroyBuffer(bC2.h);
+    }
+
+    // ---- the clamp write-back, and prevContactCount as a REAL pointer --------
+    {
+        std::vector<FemFemContactInfoHost> i3 = infos;
+        std::vector<F4> a0 = bary0, a1 = bary1;
+        DevBuf bI3 = makeDev(dev, i3), bA0 = makeDev(dev, a0), bA1 = makeDev(dev, a1);
+        std::vector<uint32_t> c3 = { 9u, 0u, 0u, 0u };   // more than maxNbContacts
+        DevBuf bC3 = makeDev(dev, c3);
+        std::vector<uint32_t> prev = { 1u, 0u, 0u, 0u };
+        DevBuf bPrev = makeDev(dev, prev);
+        SbFemRemapPush p3 = push;
+        p3.outContactInfo = bI3.addr; p3.outBarycentric0 = bA0.addr;
+        p3.outBarycentric1 = bA1.addr; p3.totalContactCount = bC3.addr;
+        p3.prevContactCount = bPrev.addr; p3.maxNbContacts = 2u;
+        Kernel("softBodyContactRemapBda.spv", "sb_fem_contact_remap_to_simLaunch", {}, sizeof(SbFemRemapPush))
+            .dispatch(1024u, {}, p3, 2u, 1u);
+        dev->flush();
+        const uint32_t back = downloadBuffer<uint32_t>(dev, bC3.h, 1)[0];
+        const auto j3 = downloadBuffer<FemFemContactInfoHost>(dev, bI3.h, 4);
+        const auto e1 = downloadBuffer<F4>(dev, bA1.h, 4);
+        PXG_CHECK_MSG(back == 2u, "an over-large contact count must be CLAMPED and written back "
+                                  "(9 -> maxNbContacts 2), got %u", back);
+        PXG_CHECK_MSG(j3[0].pairInd1 == infos[0].pairInd1,
+                      "prevContactCount = 1 must SKIP contact 0 (pairInd1 became 0x%08x)",
+                      j3[0].pairInd1);
+        PXG_CHECK_MSG(e1[0].x == bary1[0].x,
+                      "prevContactCount = 1 must leave contact 0's barycentric alone (got %.4f)",
+                      e1[0].x);
+        PXG_CHECK_MSG((j3[1].pairInd1 & 0xfffffu) == 1u,
+                      "...and must still remap contact 1 (got tet %u)", j3[1].pairInd1 & 0xfffffu);
+        dev->destroyBuffer(bI3.h); dev->destroyBuffer(bA0.h); dev->destroyBuffer(bA1.h);
+        dev->destroyBuffer(bC3.h); dev->destroyBuffer(bPrev.h);
+    }
+
+    dev->destroyBuffer(bSv.h); dev->destroyBuffer(bSt.h); dev->destroyBuffer(bRc.h);
+    dev->destroyBuffer(bAr.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bInfo.h);
+    dev->destroyBuffer(bB0.h); dev->destroyBuffer(bB1.h); dev->destroyBuffer(bCount.h);
+}
+
+// ===========================================================================
+// P8.4 tranche b — the SOFTBODY-vs-SOFTBODY constraint prepare and solve.
+//
+// CPU reference.  The two kernels are short but every term is a place a symmetric port can
+// go wrong in a way that still looks plausible: a sign, a barycentric scale, which of the
+// two sides an inverse mass came from.  Signs and ratios cannot catch those -- P8.3 learned
+// that the hard way, where mirroring the input flipped both runs alike and the product
+// stayed negative -- so both fixtures compare against an ABSOLUTE reference computed here.
+// The CPU side is built with -ffp-contract=off (tests/CMakeLists.txt:1204) and the shaders
+// are NoContraction-stamped, so the comparisons below are bit-exact apart from the one
+// tangent normalise.
+// ===========================================================================
+namespace p84ref
+{
+using p80refit::V3;
+using p80refit::TetIdx4;
+
+static V3 v3(float x, float y, float z) { return V3{ x, y, z }; }
+static V3 add3(V3 a, V3 b) { return V3{ a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V3 sub3(V3 a, V3 b) { return V3{ a.x - b.x, a.y - b.y, a.z - b.z }; }
+static V3 mul3(V3 a, float s) { return V3{ a.x * s, a.y * s, a.z * s }; }
+static float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+// getSoftBodyInvMass (softBody.cuh:38) — the blended inverse mass scaled by the LENGTH of
+// the barycentric vector.  The same factor P8.3 found in the attachment prepare.
+static float softBodyInvMassScaled(float baryMass, F4 b)
+{
+    const float scale = std::sqrt(b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w);
+    return baryMass * scale;
+}
+
+// computeInvMass (softBody.cu:608).
+static float computeInvMass(TetIdx4 tet, const std::vector<F4>& pos, F4 b)
+{
+    const float blended = pos[tet.x].w * b.x + pos[tet.y].w * b.y +
+                          pos[tet.z].w * b.z + pos[tet.w].w * b.w;
+    return softBodyInvMassScaled(blended, b);
+}
+
+// computeTetraContact (softBody.cuh:61).
+static F4 computeTetraContact(const std::vector<F4>& vals, TetIdx4 tet, F4 b, F4& invMass)
+{
+    const F4 v0 = vals[tet.x], v1 = vals[tet.y], v2 = vals[tet.z], v3 = vals[tet.w];
+    invMass = F4{ v0.w, v1.w, v2.w, v3.w };
+    return F4{ v0.x * b.x + v1.x * b.y + v2.x * b.z + v3.x * b.w,
+               v0.y * b.x + v1.y * b.y + v2.y * b.z + v3.y * b.w,
+               v0.z * b.x + v1.z * b.y + v2.z * b.z + v3.z * b.w,
+               v0.w * b.x + v1.w * b.y + v2.w * b.z + v3.w * b.w };
+}
+
+// PxVec3::normalize — returns the LENGTH and leaves the vector unit.
+static float normalizeInPlace(V3& v)
+{
+    const float m = v.x * v.x + v.y * v.y + v.z * v.z;
+    if (m > 0.0f) { const float len = std::sqrt(m); v = mul3(v, 1.0f / len); return len; }
+    return 0.0f;
+}
+
+// updateTetraPosDelta (softBody.cuh:77) — accumulated into a host mirror of mSimDelta.
+static void updateTetraPosDelta(F4 invMasses, F4 b, TetIdx4 tet, V3 deltaPos,
+                                std::vector<F4>& outDeltas)
+{
+    const uint32_t idx[4] = { tet.x, tet.y, tet.z, tet.w };
+    const float im[4] = { invMasses.x, invMasses.y, invMasses.z, invMasses.w };
+    const float bc[4] = { b.x, b.y, b.z, b.w };
+    for (int k = 0; k < 4; ++k)
+    {
+        if (!(im[k] > 0.0f && std::fabs(bc[k]) > 1e-6f)) continue;
+        const V3 dP = mul3(deltaPos, im[k] * bc[k]);
+        outDeltas[idx[k]].x += dP.x;
+        outDeltas[idx[k]].y += dP.y;
+        outDeltas[idx[k]].z += dP.z;
+        outDeltas[idx[k]].w += 1.0f;   // the averaging weight
+    }
+}
+
+// One softbody's inputs, as the two kernels read them.
+struct SbSide
+{
+    std::vector<F4> simPos;      // mSimPosition_InvMass
+    std::vector<F4> simVel;      // mSimVelocity_InvMass
+    std::vector<F4> simDeltaPos; // mSimDeltaPos  (TGS reads this instead)
+    std::vector<TetIdx4> tets;
+    std::vector<uint16_t> matIdx;
+    float restDistance = 0.0f;
+};
+
+// sb_solveOutputSSDeltaVLaunch{,TGS} (softBody.cu:1424 / :1691), one contact.
+static void refSolveSS(bool isTGS, const SbSide& s0, const SbSide& s1,
+                       uint32_t tetId0, uint32_t tetId1, F4 b0, F4 b1,
+                       F4 normal_pen, float velMultiplier,
+                       const std::vector<float>& matFriction,
+                       float dt, float biasCoefficient,
+                       float& afx, float& afy,
+                       std::vector<F4>& delta0, std::vector<F4>& delta1)
+{
+    const TetIdx4 t0 = s0.tets[tetId0], t1 = s1.tets[tetId1];
+
+    F4 invMasses0, invMasses1;
+    const F4 pos0 = computeTetraContact(isTGS ? s0.simDeltaPos : s0.simPos, t0, b0, invMasses0);
+    const F4 pos1 = computeTetraContact(isTGS ? s1.simDeltaPos : s1.simPos, t1, b1, invMasses1);
+
+    V3 relVel = v3(0, 0, 0);
+    if (!isTGS)
+    {
+        F4 vm0, vm1;
+        const F4 vel0 = computeTetraContact(s0.simVel, t0, b0, vm0);
+        const F4 vel1 = computeTetraContact(s1.simVel, t1, b1, vm1);
+        invMasses0 = vm0; invMasses1 = vm1;
+        relVel = sub3(v3(vel1.x, vel1.y, vel1.z), v3(vel0.x, vel0.y, vel0.z));
+    }
+
+    const float frictionCoefficient =
+        (matFriction[s0.matIdx[tetId0]] + matFriction[s1.matIdx[tetId1]]) * 0.5f;
+
+    const V3 normal = v3(normal_pen.x, normal_pen.y, normal_pen.z);
+    const float rest = normal_pen.w;
+    const V3 relPos = v3(pos1.x - pos0.x, pos1.y - pos0.y, pos1.z - pos0.z);
+    const float projectedErr = dot3(relPos, normal) + rest;
+
+    V3 tanDir; float tanMagnitude, biasedErr, normalVel;
+    if (isTGS)
+    {
+        const float normalPos = dot3(relPos, normal);
+        tanDir = sub3(relPos, mul3(normal, normalPos));
+        tanMagnitude = normalizeInPlace(tanDir);
+        biasedErr = -projectedErr;
+        normalVel = 0.0f;
+    }
+    else
+    {
+        normalVel = dot3(relVel, normal);
+        tanDir = sub3(relVel, mul3(normal, normalVel));
+        tanMagnitude = normalizeInPlace(tanDir);
+        biasedErr = -projectedErr * biasCoefficient;
+    }
+
+    const float deltaF = std::fmax(-afx, (biasedErr - normalVel) * velMultiplier);
+    afx += deltaF;
+    const float friction = afx * frictionCoefficient;
+    const float requiredForce = tanMagnitude * velMultiplier;
+    const float deltaFr = std::fmin(requiredForce + afy, friction) - afy;
+    afy += deltaFr;
+
+    if (deltaF != 0.0f || deltaFr != 0.0f)
+    {
+        V3 deltaPos = mul3(add3(mul3(normal, -deltaF), mul3(tanDir, deltaFr)), dt);
+        if (isTGS)
+            deltaPos = mul3(mul3(add3(mul3(normal, -deltaF), mul3(tanDir, deltaFr)), biasCoefficient), dt);
+        updateTetraPosDelta(invMasses0, b0, t0, deltaPos, delta0);
+        updateTetraPosDelta(invMasses1, b1, t1, mul3(deltaPos, -1.0f), delta1);
+    }
+}
+} // namespace p84ref
+
+struct SbSsPrepPush
+{
+    uint64_t softbodies, contacts, normalPens, barycentrics0, barycentrics1,
+             contactInfos, numContacts, constraints, appliedForces;
+    uint32_t maxContacts, pad76;
+};
+static_assert(sizeof(SbSsPrepPush) == 80, "ss prepare push blob must be 80 bytes");
+static_assert(offsetof(SbSsPrepPush, maxContacts) == 72, "maxContacts @72");
+
+struct SbSsSolvePush
+{
+    uint64_t softbodies, contactInfos, constraints, numContacts;
+    float dt, biasCoefficient;
+    uint64_t appliedForces, materials;
+};
+static_assert(sizeof(SbSsSolvePush) == 56, "ss solve push blob must be 56 bytes");
+static_assert(offsetof(SbSsSolvePush, dt) == 32, "dt @32");
+static_assert(offsetof(SbSsSolvePush, appliedForces) == 40, "appliedForces @40");
+
+// PxgSoftBodySoftBodyConstraintBlock (PxgSoftBodyCore.h:51), block-of-32 SoA, 1792 bytes.
+struct SsConstraintBlockHost
+{
+    F4 barycentric0[32];
+    F4 barycentric1[32];
+    F4 normal_pen[32];
+    float velMultiplier[32];
+    float friction[32];
+};
+static_assert(sizeof(SsConstraintBlockHost) == 1792, "SS constraint block is 1792 bytes");
+
+// ===========================================================================
+// sb_softbodyContactPrepareLaunch.
+//
+// What this pins: the CONSTRAINT BLOCK's block-of-32 SoA addressing (a contact's slot is
+// decided by its INDEX, not by the thread that happens to run it), the negated normal and
+// the folded rest distance, `getSoftBodyInvMass`'s barycentric-length scale on BOTH sides,
+// and the 1e-16 guard that keeps an all-kinematic contact from dividing by zero.
+// ===========================================================================
+PXG_TEST(softBodySimSelfContactPrepare)
+{
+    using namespace p80refit;
+    using namespace p84ref;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // TWO softbodies with DIFFERENT rest distances and different inverse masses, so a port
+    // that read both sides from one descriptor cannot reproduce these numbers.
+    // Softbody 0: tet 0 has invMasses (1,2,3,4); tet 1 is all-KINEMATIC (invMass 0).
+    std::vector<F4> pos0 = {
+        { 0.0f, 0.0f, 0.0f, 1.0f }, { 1.0f, 0.0f, 0.0f, 2.0f },
+        { 0.0f, 1.0f, 0.0f, 3.0f }, { 0.0f, 0.0f, 1.0f, 4.0f },   // tet 0
+        { 5.0f, 0.0f, 0.0f, 0.0f }, { 6.0f, 0.0f, 0.0f, 0.0f },
+        { 5.0f, 1.0f, 0.0f, 0.0f }, { 5.0f, 0.0f, 1.0f, 0.0f },   // tet 1, kinematic
+    };
+    std::vector<TetIdx4> tets0 = { { 0u, 1u, 2u, 3u }, { 4u, 5u, 6u, 7u } };
+    // Softbody 1: tet 0 has invMasses all 0.5; tet 1 is all-KINEMATIC too.
+    std::vector<F4> pos1 = {
+        { 0.0f, 0.0f, 2.0f, 0.5f }, { 1.0f, 0.0f, 2.0f, 0.5f },
+        { 0.0f, 1.0f, 2.0f, 0.5f }, { 0.0f, 0.0f, 3.0f, 0.5f },   // tet 0
+        { 9.0f, 0.0f, 0.0f, 0.0f }, { 10.0f, 0.0f, 0.0f, 0.0f },
+        { 9.0f, 1.0f, 0.0f, 0.0f }, { 9.0f, 0.0f, 1.0f, 0.0f },   // tet 1, kinematic
+    };
+    std::vector<TetIdx4> tets1 = { { 0u, 1u, 2u, 3u }, { 4u, 5u, 6u, 7u } };
+
+    DevBuf bP0 = makeDev(dev, pos0), bT0 = makeDev(dev, tets0);
+    DevBuf bP1 = makeDev(dev, pos1), bT1 = makeDev(dev, tets1);
+    if (!bP0.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgSoftBody a = makeZeroDesc();
+    a.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bP0.addr));
+    a.mSimTetIndices = reinterpret_cast<decltype(a.mSimTetIndices)>(size_t(bT0.addr));
+    a.mRestDistance = 0.05f;
+    PxgSoftBody b = makeZeroDesc();
+    b.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bP1.addr));
+    b.mSimTetIndices = reinterpret_cast<decltype(b.mSimTetIndices)>(size_t(bT1.addr));
+    b.mRestDistance = 0.03f;
+    std::vector<PxgSoftBody> descArr = { a, b };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    auto enc = [](uint32_t id, uint32_t elem) { return (id << 20) | elem; };
+
+    // 34 contacts, so the constraint array spans TWO blocks of 32 and the last one lands at
+    // block 1 lane 1.  Contact 1 uses the two KINEMATIC tets and is the only one whose
+    // inverse masses sum to zero.
+    const uint32_t NBC = 34u;
+    const F4 BARY0 = { 0.4f, 0.2f, 0.2f, 0.2f };
+    const F4 BARY1 = { 0.25f, 0.25f, 0.25f, 0.25f };
+    std::vector<FemFemContactInfoHost> infos(NBC);
+    std::vector<F4> normalPens(NBC), bary0(NBC, BARY0), bary1(NBC, BARY1);
+    std::memset(infos.data(), 0, infos.size() * sizeof(FemFemContactInfoHost));
+    for (uint32_t i = 0; i < NBC; ++i)
+    {
+        const uint32_t kin = (i == 1u) ? 1u : 0u;
+        infos[i].pairInd0 = enc(0u, kin);
+        infos[i].pairInd1 = enc(1u, kin);
+        infos[i].auxInd = 0x8000u | i;
+        // A distinct penetration per contact, so a slot that ends up in the wrong block or
+        // lane is identifiable rather than merely "wrong".
+        normalPens[i] = F4{ 0.0f, 1.0f, 0.0f, 0.5f - 0.001f * float(i) };
+    }
+    DevBuf bInfo = makeDev(dev, infos), bNp = makeDev(dev, normalPens);
+    DevBuf bB0 = makeDev(dev, bary0), bB1 = makeDev(dev, bary1);
+    std::vector<uint32_t> count = { NBC, 0u, 0u, 0u };
+    DevBuf bCount = makeDev(dev, count);
+
+    std::vector<SsConstraintBlockHost> blocks(2);
+    std::memset(blocks.data(), 0xCD, blocks.size() * sizeof(SsConstraintBlockHost));
+    DevBuf bBlocks = makeDev(dev, blocks);
+    std::vector<float> applied(NBC * 2u, -3.0f);   // float2 per contact, poisoned
+    DevBuf bApplied = makeDev(dev, applied);
+
+    SbSsPrepPush push = {};
+    push.softbodies = bDesc.addr;
+    push.contacts = 0ull;                 // ABI parity only — never read
+    push.normalPens = bNp.addr;
+    push.barycentrics0 = bB0.addr;
+    push.barycentrics1 = bB1.addr;
+    push.contactInfos = bInfo.addr;
+    push.numContacts = bCount.addr;
+    push.constraints = bBlocks.addr;
+    push.appliedForces = bApplied.addr;
+    push.maxContacts = 1024u;
+
+    Kernel k("softBodySelfSolveBda.spv", "sb_softbodyContactPrepareLaunch", {}, sizeof(SbSsPrepPush));
+    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);   // PxgSoftBodyKernelGridDim::SB_UPDATEROTATION
+    dev->flush();
+
+    const auto gBlocks = downloadBuffer<SsConstraintBlockHost>(dev, bBlocks.h, 2);
+    const auto gApplied = downloadBuffer<float>(dev, bApplied.h, NBC * 2u);
+
+    // ---- the reference, contact by contact -----------------------------------
+    const float REST = 0.05f + 0.03f;
+    for (uint32_t i = 0; i < NBC; ++i)
+    {
+        const uint32_t blk = i / 32u, lane = i % 32u;
+        const uint32_t kin = (i == 1u) ? 1u : 0u;
+        const float invMass0 = computeInvMass(tets0[kin], pos0, BARY0);
+        const float invMass1 = computeInvMass(tets1[kin], pos1, BARY1);
+        const float wantVm = 1.0f / std::fmax(1e-16f, invMass0 + invMass1);
+        const F4 np = normalPens[i];
+
+        const F4 gN = gBlocks[blk].normal_pen[lane];
+        PXG_CHECK_MSG(f2u(gN.x) == f2u(-np.x) && f2u(gN.y) == f2u(-np.y) && f2u(gN.z) == f2u(-np.z),
+                      "contact %u (block %u lane %u): the prepare must NEGATE the contact "
+                      "normal, got (%g %g %g) for input (%g %g %g)",
+                      i, blk, lane, gN.x, gN.y, gN.z, np.x, np.y, np.z);
+        PXG_CHECK_MSG(f2u(gN.w) == f2u(-REST + np.w),
+                      "contact %u: normal_pen.w must be -rest + pen = %.9g, got %.9g (a slot in "
+                      "the wrong block or lane shows up here first)",
+                      i, -REST + np.w, gN.w);
+        PXG_CHECK_MSG(f2u(gBlocks[blk].velMultiplier[lane]) == f2u(wantVm),
+                      "contact %u: velMultiplier must be 1/max(1e-16, %.9g + %.9g) = %.9g, "
+                      "got %.9g", i, invMass0, invMass1, wantVm, gBlocks[blk].velMultiplier[lane]);
+        PXG_CHECK(f2u(gBlocks[blk].barycentric0[lane].x) == f2u(BARY0.x));
+        PXG_CHECK(f2u(gBlocks[blk].barycentric1[lane].w) == f2u(BARY1.w));
+        PXG_CHECK_MSG(gApplied[i * 2u] == 0.0f && gApplied[i * 2u + 1u] == 0.0f,
+                      "contact %u's applied force must be ZEROED by the prepare (got %g, %g)",
+                      i, gApplied[i * 2u], gApplied[i * 2u + 1u]);
+    }
+
+    // ---- the barycentric-length scale, stated as a number ---------------------
+    // |BARY0| = sqrt(0.28) = 0.529150, so dropping the sqrt in getSoftBodyInvMass changes
+    // invMass0 from 2.2 * 0.529150 to 2.2 -- a factor of ~1.9 on the velMultiplier.  This is
+    // the same term P8.3 found in the attachment prepare and it has no cloth counterpart.
+    {
+        const float blended0 = pos0[0].w * BARY0.x + pos0[1].w * BARY0.y +
+                               pos0[2].w * BARY0.z + pos0[3].w * BARY0.w;
+        const float scaled0 = softBodyInvMassScaled(blended0, BARY0);
+        std::printf("  invMass0: blended %.6f -> scaled %.6f (|bary| = %.6f); velMultiplier[0] = %.6f\n",
+                    blended0, scaled0, scaled0 / blended0, gBlocks[0].velMultiplier[0]);
+        PXG_CHECK_MSG(std::fabs(scaled0 / blended0 - 0.5291503f) < 1e-5f,
+                      "the fixture's barycentric must actually exercise the scale");
+    }
+
+    // ---- the 1e-16 guard ------------------------------------------------------
+    PXG_CHECK_MSG(gBlocks[0].velMultiplier[1] == 1e16f,
+                  "contact 1 joins two all-kinematic tets, so both inverse masses are 0 and "
+                  "the guard must give 1/1e-16 = 1e16 (got %g) -- the contact generation DOES "
+                  "produce such contacts, so this is reachable, not defensive",
+                  gBlocks[0].velMultiplier[1]);
+
+    // ---- the clamp write-back -------------------------------------------------
+    {
+        std::vector<uint32_t> c2 = { 99u, 0u, 0u, 0u };
+        DevBuf bC2 = makeDev(dev, c2);
+        SbSsPrepPush p2 = push;
+        p2.numContacts = bC2.addr;
+        p2.maxContacts = 5u;
+        Kernel("softBodySelfSolveBda.spv", "sb_softbodyContactPrepareLaunch", {}, sizeof(SbSsPrepPush))
+            .dispatch(1024u, {}, p2, 1u, 1u);
+        dev->flush();
+        const uint32_t back = downloadBuffer<uint32_t>(dev, bC2.h, 1)[0];
+        PXG_CHECK_MSG(back == 5u,
+                      "an over-large contact count must be clamped to maxContacts and written "
+                      "back (99 -> 5), got %u", back);
+        dev->destroyBuffer(bC2.h);
+    }
+
+    dev->destroyBuffer(bP0.h); dev->destroyBuffer(bT0.h); dev->destroyBuffer(bP1.h);
+    dev->destroyBuffer(bT1.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bInfo.h);
+    dev->destroyBuffer(bNp.h); dev->destroyBuffer(bB0.h); dev->destroyBuffer(bB1.h);
+    dev->destroyBuffer(bCount.h); dev->destroyBuffer(bBlocks.h); dev->destroyBuffer(bApplied.h);
+}
+
+// ===========================================================================
+// sb_solveOutputSSDeltaVLaunch{,TGS}.
+//
+// The symmetric twin of sb_solveRigidSoftCollisionLaunch: both sides are softbody tets, so
+// the SAME impulse goes into both delta buffers with opposite signs and each side scales it
+// by its OWN inverse masses and barycentric.  Everything is compared to p84ref's absolute
+// reference rather than to a sign or a ratio -- a mirrored fixture flips both runs alike and
+// would let a dropped negation through, which is exactly how P8.3's solve mutant survived
+// its first fixture.
+//
+// The two entry points are checked against SEPARATE reference runs and against each other:
+// PGS and TGS differ in four places (which buffer supplies the positions, whether the error
+// is bias-scaled, whether the normal impulse sees the relative velocity, and whether the
+// tangential magnitude is a velocity or a position), so a TGS entry point that is merely a
+// copy of PGS has to disagree with the TGS reference.
+// ===========================================================================
+struct DeformableMaterialHost   // PxsDeformableVolumeMaterialData, 32 B
+{
+    float youngs, poissons, dynamicFriction, elasticityDamping;
+    uint16_t dampingScale, materialModel;
+    float deformThreshold, deformLowLimitRatio, deformHighLimitRatio;
+};
+static_assert(sizeof(DeformableMaterialHost) == 32, "PxsDeformableVolumeMaterialData is 32 bytes");
+static_assert(offsetof(DeformableMaterialHost, dynamicFriction) == 8, "dynamicFriction @8");
+
+PXG_TEST(softBodySimSelfContactSolve)
+{
+    using namespace p80refit;
+    using namespace p84ref;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // ---- two softbodies, two tets each ---------------------------------------
+    SbSide s0, s1;
+    s0.simPos = {
+        { 0.00f, 0.00f, 0.00f, 1.0f }, { 1.00f, 0.00f, 0.00f, 2.0f },
+        { 0.00f, 1.00f, 0.00f, 0.0f }, { 0.00f, 0.00f, 1.00f, 4.0f },   // tet 0 (one KINEMATIC corner)
+        { 4.00f, 0.00f, 0.00f, 1.5f }, { 5.00f, 0.00f, 0.00f, 0.5f },
+        { 4.00f, 1.00f, 0.00f, 2.5f }, { 4.00f, 0.00f, 1.00f, 3.5f },   // tet 1
+    };
+    // The .w column DELIBERATELY DIFFERS from mSimPosition_InvMass's.  In the real engine
+    // the two hold the same inverse mass, so the difference is unobservable there -- but
+    // CUDA's PGS path takes its inverse masses from the VELOCITY read (softBody.cu:1471-6,
+    // where the second computeTetraContact overwrites the out-parameter), and a fixture
+    // whose two columns agree cannot tell a port that read the position column instead.
+    // The kinematic corner keeps invMass 0 in BOTH so it stays kinematic either way.
+    s0.simVel = {
+        { 0.10f, -0.20f, 0.05f, 1.25f }, { 0.20f, -0.10f, 0.00f, 2.50f },
+        { 0.00f, -0.30f, 0.10f, 0.00f }, { 0.15f, -0.25f, 0.20f, 3.50f },
+        { 0.05f,  0.10f, 0.00f, 1.75f }, { 0.00f,  0.20f, 0.10f, 0.25f },
+        { 0.10f,  0.00f, 0.30f, 2.75f }, { 0.20f,  0.15f, 0.05f, 3.25f },
+    };
+    // TGS reads mSimDeltaPos for BOTH the position and the inverse masses, so its .w column
+    // is deliberately DIFFERENT from mSimPosition_InvMass's: a TGS port that read the
+    // position buffer instead would silently pick up the other column.
+    s0.simDeltaPos = {
+        { 0.010f, -0.020f, 0.005f, 0.7f }, { 0.020f, -0.010f, 0.000f, 1.3f },
+        { 0.000f, -0.030f, 0.010f, 0.0f }, { 0.015f, -0.025f, 0.020f, 2.1f },
+        { 0.005f,  0.010f, 0.000f, 0.9f }, { 0.000f,  0.020f, 0.010f, 0.4f },
+        { 0.010f,  0.000f, 0.030f, 1.7f }, { 0.020f,  0.015f, 0.005f, 2.3f },
+    };
+    s0.tets = { { 0u, 1u, 2u, 3u }, { 4u, 5u, 6u, 7u } };
+    s0.matIdx = { 0u, 3u };            // tet 1 is an ODD index -> the PxU16 high half
+    s0.restDistance = 0.05f;
+
+    s1.simPos = {
+        { 0.00f, 0.00f, 2.00f, 0.5f }, { 1.00f, 0.00f, 2.00f, 1.0f },
+        { 0.00f, 1.00f, 2.00f, 1.5f }, { 0.00f, 0.00f, 3.00f, 0.0f },   // tet 0
+        { 8.00f, 0.00f, 0.00f, 2.0f }, { 9.00f, 0.00f, 0.00f, 1.0f },
+        { 8.00f, 1.00f, 0.00f, 0.5f }, { 8.00f, 0.00f, 1.00f, 1.0f },   // tet 1
+    };
+    s1.simVel = {
+        { -0.05f, 0.30f, 0.00f, 0.75f }, {  0.00f, 0.25f, 0.10f, 1.25f },
+        {  0.10f, 0.40f, 0.05f, 1.75f }, { -0.10f, 0.35f, 0.15f, 0.00f },
+        {  0.20f, 0.05f, 0.10f, 2.25f }, {  0.10f, 0.00f, 0.20f, 1.25f },
+        {  0.00f, 0.15f, 0.05f, 0.75f }, {  0.05f, 0.10f, 0.00f, 1.25f },
+    };
+    s1.simDeltaPos = {
+        { -0.005f, 0.030f, 0.000f, 1.1f }, {  0.000f, 0.025f, 0.010f, 0.6f },
+        {  0.010f, 0.040f, 0.005f, 2.2f }, { -0.010f, 0.035f, 0.015f, 0.0f },
+        {  0.020f, 0.005f, 0.010f, 1.4f }, {  0.010f, 0.000f, 0.020f, 0.8f },
+        {  0.000f, 0.015f, 0.005f, 1.9f }, {  0.005f, 0.010f, 0.000f, 1.2f },
+    };
+    s1.tets = { { 0u, 1u, 2u, 3u }, { 4u, 5u, 6u, 7u } };
+    s1.matIdx = { 1u, 2u };
+    s1.restDistance = 0.03f;
+
+    // Four materials with distinct friction, so the (f0 + f1) * 0.5 mean is identifiable and
+    // a port that used just one side's material, or the wrong PxU16 half, cannot match.
+    std::vector<DeformableMaterialHost> materials(4);
+    std::memset(materials.data(), 0, materials.size() * sizeof(DeformableMaterialHost));
+    const std::vector<float> matFriction = { 0.30f, 0.70f, 0.11f, 0.90f };
+    for (size_t i = 0; i < materials.size(); ++i) materials[i].dynamicFriction = matFriction[i];
+
+    auto packU16 = [](const std::vector<uint16_t>& h) {
+        std::vector<uint32_t> w((h.size() + 1u) / 2u + 1u, 0u);
+        for (size_t i = 0; i < h.size(); ++i) w[i / 2u] |= uint32_t(h[i]) << (16u * (i % 2u));
+        return w;
+    };
+    const std::vector<uint32_t> mat0Words = packU16(s0.matIdx);
+    const std::vector<uint32_t> mat1Words = packU16(s1.matIdx);
+
+    DevBuf bP0 = makeDev(dev, s0.simPos), bV0 = makeDev(dev, s0.simVel), bD0 = makeDev(dev, s0.simDeltaPos);
+    DevBuf bT0 = makeDev(dev, s0.tets), bM0 = makeDev(dev, mat0Words);
+    DevBuf bP1 = makeDev(dev, s1.simPos), bV1 = makeDev(dev, s1.simVel), bD1 = makeDev(dev, s1.simDeltaPos);
+    DevBuf bT1 = makeDev(dev, s1.tets), bM1 = makeDev(dev, mat1Words);
+    DevBuf bMat = makeDev(dev, materials);
+    if (!bP0.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    std::vector<F4> zeroDelta(8, F4{ 0, 0, 0, 0 });
+    DevBuf bDl0 = makeDev(dev, zeroDelta), bDl1 = makeDev(dev, zeroDelta);
+
+    PxgSoftBody a = makeZeroDesc();
+    a.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bP0.addr));
+    a.mSimVelocity_InvMass = reinterpret_cast<float4*>(size_t(bV0.addr));
+    a.mSimDeltaPos = reinterpret_cast<float4*>(size_t(bD0.addr));
+    a.mSimDelta = reinterpret_cast<float4*>(size_t(bDl0.addr));
+    a.mSimTetIndices = reinterpret_cast<decltype(a.mSimTetIndices)>(size_t(bT0.addr));
+    a.mMaterialIndices = reinterpret_cast<PxU16*>(size_t(bM0.addr));
+    a.mRestDistance = s0.restDistance;
+    PxgSoftBody b = makeZeroDesc();
+    b.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bP1.addr));
+    b.mSimVelocity_InvMass = reinterpret_cast<float4*>(size_t(bV1.addr));
+    b.mSimDeltaPos = reinterpret_cast<float4*>(size_t(bD1.addr));
+    b.mSimDelta = reinterpret_cast<float4*>(size_t(bDl1.addr));
+    b.mSimTetIndices = reinterpret_cast<decltype(b.mSimTetIndices)>(size_t(bT1.addr));
+    b.mMaterialIndices = reinterpret_cast<PxU16*>(size_t(bM1.addr));
+    b.mRestDistance = s1.restDistance;
+    std::vector<PxgSoftBody> descArr = { a, b };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    auto enc = [](uint32_t id, uint32_t elem) { return (id << 20) | elem; };
+
+    // Two contacts, deliberately CROSSED over the tets so both PxU16 halves of both
+    // material tables are read and neither side can stand in for the other.
+    const uint32_t NBC = 2u;
+    const uint32_t tetId0[NBC] = { 0u, 1u };
+    const uint32_t tetId1[NBC] = { 1u, 0u };
+    // Contact 1's side-0 barycentric has a ZERO component: a contact sitting on a tet FACE
+    // weighs the opposite corner at 0, and updateTetraPosDelta's `|bary| > 1e-6` gate is
+    // what keeps that corner out of the averaging count.  Without such a component the gate
+    // is unexercised and deleting it passes.
+    const F4 bary0[NBC] = { { 0.4f, 0.2f, 0.2f, 0.2f }, { 0.1f, 0.0f, 0.7f, 0.2f } };
+    const F4 bary1[NBC] = { { 0.25f, 0.25f, 0.25f, 0.25f }, { 0.5f, 0.2f, 0.2f, 0.1f } };
+    // Contact 1's normal points so that the two tets are strongly SEPARATING.  That makes
+    // the raw normal impulse large and negative, which is the only way to reach
+    // `deltaF = max(-appliedForce.x, ...)`: with a starting force of 0.02 the clamp releases
+    // exactly that much and no more.  Without a separating contact the clamp never bites and
+    // deleting it passes.
+    const F4 normalPen[NBC] = { { 0.0f, -1.0f, 0.0f, -0.02f }, { 0.0f, 0.0f, 1.0f, -0.05f } };
+    const float velMult[NBC] = { 0.65f, 1.30f };
+    const float AF_X0 = 0.02f, AF_Y0 = 0.01f;   // a NON-zero starting force: the solve
+                                                // accumulates, it does not assign
+
+    std::vector<FemFemContactInfoHost> infos(NBC);
+    std::memset(infos.data(), 0, infos.size() * sizeof(FemFemContactInfoHost));
+    std::vector<SsConstraintBlockHost> blocks(1);
+    std::memset(blocks.data(), 0, sizeof(SsConstraintBlockHost));
+    std::vector<float> applied(NBC * 2u);
+    for (uint32_t i = 0; i < NBC; ++i)
+    {
+        infos[i].pairInd0 = enc(0u, tetId0[i]);
+        infos[i].pairInd1 = enc(1u, tetId1[i]);
+        infos[i].auxInd = 0x8000u | i;
+        blocks[0].barycentric0[i] = bary0[i];
+        blocks[0].barycentric1[i] = bary1[i];
+        blocks[0].normal_pen[i] = normalPen[i];
+        blocks[0].velMultiplier[i] = velMult[i];
+        applied[i * 2u] = AF_X0;
+        applied[i * 2u + 1u] = AF_Y0;
+    }
+
+    const float DT = 0.0166667f, BIAS = 0.6f;
+
+    auto runOne = [&](bool isTGS, std::vector<F4>& outD0, std::vector<F4>& outD1,
+                      std::vector<float>& outAf)
+    {
+        std::vector<FemFemContactInfoHost> ii = infos;
+        std::vector<SsConstraintBlockHost> bb = blocks;
+        std::vector<float> af = applied;
+        std::vector<F4> d0 = zeroDelta, d1 = zeroDelta;
+        DevBuf bI = makeDev(dev, ii), bB = makeDev(dev, bb), bA = makeDev(dev, af);
+        DevBuf bX0 = makeDev(dev, d0), bX1 = makeDev(dev, d1);
+        std::vector<uint32_t> cnt = { NBC, 0u, 0u, 0u };
+        DevBuf bC = makeDev(dev, cnt);
+
+        // Re-point the descriptors' delta buffers at this run's own copies.
+        std::vector<PxgSoftBody> dd = descArr;
+        dd[0].mSimDelta = reinterpret_cast<float4*>(size_t(bX0.addr));
+        dd[1].mSimDelta = reinterpret_cast<float4*>(size_t(bX1.addr));
+        DevBuf bDd = makeDev(dev, dd);
+
+        SbSsSolvePush p = {};
+        p.softbodies = bDd.addr;
+        p.contactInfos = bI.addr;
+        p.constraints = bB.addr;
+        p.numContacts = bC.addr;
+        p.dt = DT;
+        p.biasCoefficient = BIAS;
+        p.appliedForces = bA.addr;
+        p.materials = bMat.addr;
+
+        Kernel(isTGS ? "softBodySelfSolveBda.spv" : "softBodySelfSolveBda.spv",
+               isTGS ? "sb_solveOutputSSDeltaVLaunchTGS" : "sb_solveOutputSSDeltaVLaunch",
+               {}, sizeof(SbSsSolvePush))
+            .dispatch(/*gridX*/ 1024u, {}, p, 1u, 1u);
+        dev->flush();
+
+        outD0 = downloadBuffer<F4>(dev, bX0.h, 8);
+        outD1 = downloadBuffer<F4>(dev, bX1.h, 8);
+        outAf = downloadBuffer<float>(dev, bA.h, NBC * 2u);
+        dev->destroyBuffer(bI.h); dev->destroyBuffer(bB.h); dev->destroyBuffer(bA.h);
+        dev->destroyBuffer(bX0.h); dev->destroyBuffer(bX1.h); dev->destroyBuffer(bC.h);
+        dev->destroyBuffer(bDd.h);
+    };
+
+    auto reference = [&](bool isTGS, std::vector<F4>& refD0, std::vector<F4>& refD1,
+                         std::vector<float>& refAf)
+    {
+        refD0.assign(8, F4{ 0, 0, 0, 0 });
+        refD1.assign(8, F4{ 0, 0, 0, 0 });
+        refAf.assign(NBC * 2u, 0.0f);
+        for (uint32_t i = 0; i < NBC; ++i)
+        {
+            float afx = AF_X0, afy = AF_Y0;
+            refSolveSS(isTGS, s0, s1, tetId0[i], tetId1[i], bary0[i], bary1[i],
+                       normalPen[i], velMult[i], matFriction, DT, BIAS, afx, afy, refD0, refD1);
+            refAf[i * 2u] = afx;
+            refAf[i * 2u + 1u] = afy;
+        }
+    };
+
+    auto near6 = [](float a, float b) { return std::fabs(a - b) <= 1e-6f * std::fmax(1.0f, std::fabs(b)); };
+
+    std::vector<F4> pgsD0, pgsD1, tgsD0, tgsD1;
+    std::vector<float> pgsAf, tgsAf;
+    runOne(/*isTGS*/ false, pgsD0, pgsD1, pgsAf);
+    runOne(/*isTGS*/ true, tgsD0, tgsD1, tgsAf);
+
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        const bool isTGS = (pass == 1);
+        const char* tag = isTGS ? "TGS" : "PGS";
+        std::vector<F4> rD0, rD1; std::vector<float> rAf;
+        reference(isTGS, rD0, rD1, rAf);
+        const std::vector<F4>& gD0 = isTGS ? tgsD0 : pgsD0;
+        const std::vector<F4>& gD1 = isTGS ? tgsD1 : pgsD1;
+        const std::vector<float>& gAf = isTGS ? tgsAf : pgsAf;
+
+        std::printf("  %s: delta0[0]=(%.7f %.7f %.7f w=%.1f) delta1[0]=(%.7f %.7f %.7f w=%.1f) "
+                    "af0=(%.7f %.7f)\n", tag,
+                    gD0[0].x, gD0[0].y, gD0[0].z, gD0[0].w,
+                    gD1[0].x, gD1[0].y, gD1[0].z, gD1[0].w, gAf[0], gAf[1]);
+
+        for (uint32_t v = 0; v < 8u; ++v)
+        {
+            PXG_CHECK_MSG(near6(gD0[v].x, rD0[v].x) && near6(gD0[v].y, rD0[v].y) &&
+                          near6(gD0[v].z, rD0[v].z) && gD0[v].w == rD0[v].w,
+                          "%s side 0 vertex %u: got (%.8f %.8f %.8f w=%.1f), want "
+                          "(%.8f %.8f %.8f w=%.1f)", tag, v,
+                          gD0[v].x, gD0[v].y, gD0[v].z, gD0[v].w,
+                          rD0[v].x, rD0[v].y, rD0[v].z, rD0[v].w);
+            PXG_CHECK_MSG(near6(gD1[v].x, rD1[v].x) && near6(gD1[v].y, rD1[v].y) &&
+                          near6(gD1[v].z, rD1[v].z) && gD1[v].w == rD1[v].w,
+                          "%s side 1 vertex %u: got (%.8f %.8f %.8f w=%.1f), want "
+                          "(%.8f %.8f %.8f w=%.1f)", tag, v,
+                          gD1[v].x, gD1[v].y, gD1[v].z, gD1[v].w,
+                          rD1[v].x, rD1[v].y, rD1[v].z, rD1[v].w);
+        }
+        for (uint32_t i = 0; i < NBC * 2u; ++i)
+            PXG_CHECK_MSG(near6(gAf[i], rAf[i]),
+                          "%s applied force %u: got %.8f, want %.8f (the solve ACCUMULATES onto "
+                          "the incoming force, it does not assign)", tag, i, gAf[i], rAf[i]);
+    }
+
+    // ---- the .w averaging weight ---------------------------------------------
+    // AtomicAdd(float4&, PxVec3, 1.f) adds a FOURTH component that the later averaging pass
+    // divides by.  Dropping it leaves the deltas looking right here and halves every motion
+    // downstream, so it is checked explicitly rather than only through the reference.
+    {
+        uint32_t touched = 0u;
+        for (uint32_t v = 0; v < 8u; ++v) if (pgsD0[v].w != 0.0f) ++touched;
+        PXG_CHECK_MSG(touched > 0u, "at least one side-0 vertex must have received a delta");
+        for (uint32_t v = 0; v < 8u; ++v)
+            PXG_CHECK_MSG(pgsD0[v].w == 0.0f || pgsD0[v].w == 1.0f,
+                          "each touched vertex gets exactly ONE unit of averaging weight per "
+                          "contact (vertex %u has %g)", v, pgsD0[v].w);
+    }
+
+    // ---- the normal force may not go negative --------------------------------
+    PXG_CHECK_MSG(pgsAf[2] == 0.0f,
+                  "contact 1 is separating hard, so the normal impulse is clamped at exactly "
+                  "-appliedForce.x and the accumulated force lands on 0 (got %g).  A normal "
+                  "force is push-only; without the clamp it would go negative and PULL the "
+                  "two tets together", pgsAf[2]);
+
+    // ---- the ZERO-weight corner is skipped -----------------------------------
+    // Contact 1 weighs side-0 tet 1's second corner (vertex 5) at exactly 0.  That vertex
+    // has a POSITIVE inverse mass, so only the barycentric gate can keep it out -- and it
+    // must, or the averaging pass divides a zero delta by a nonzero count.
+    PXG_CHECK_MSG(pgsD0[5].w == 0.0f && pgsD0[5].x == 0.0f,
+                  "side 0 vertex 5 is weighted 0 by its only contact and must be left alone "
+                  "(got %g %g %g w=%g)", pgsD0[5].x, pgsD0[5].y, pgsD0[5].z, pgsD0[5].w);
+
+    // ---- the KINEMATIC corner is skipped -------------------------------------
+    // s0 tet 0 corner 2 and s1 tet 0 corner 3 both have invMass 0, and updateTetraPosDelta
+    // gates on `invMasses > 0`.  A port that dropped that gate writes into a vertex the
+    // solver is not allowed to move.
+    PXG_CHECK_MSG(pgsD0[2].x == 0.0f && pgsD0[2].y == 0.0f && pgsD0[2].z == 0.0f && pgsD0[2].w == 0.0f,
+                  "side 0 vertex 2 has invMass 0 and must NOT be moved (got %g %g %g w=%g)",
+                  pgsD0[2].x, pgsD0[2].y, pgsD0[2].z, pgsD0[2].w);
+
+    // ---- PGS and TGS must actually differ ------------------------------------
+    bool differs = false;
+    for (uint32_t v = 0; v < 8u && !differs; ++v)
+        differs = (pgsD0[v].x != tgsD0[v].x) || (pgsD0[v].y != tgsD0[v].y) || (pgsD0[v].z != tgsD0[v].z);
+    PXG_CHECK_MSG(differs,
+                  "PGS and TGS differ in four places -- the position source, the bias scale, "
+                  "the normal-velocity term and the tangential magnitude -- so identical "
+                  "output means one entry point is a copy of the other");
+
+    // ---- the symmetry, stated directly ---------------------------------------
+    // Side 1 receives the NEGATED impulse.  Contact 0's side-1 tet is tet 1 (vertices 4..7),
+    // all with positive inverse mass and positive barycentric, so every one of them must
+    // have moved OPPOSITE to the side-0 impulse along the contact normal (0,-1,0).
+    {
+        float sum0 = 0.0f, sum1 = 0.0f;
+        for (uint32_t v = 0; v < 4u; ++v) sum0 += pgsD0[v].y;      // side 0, tet 0
+        for (uint32_t v = 4u; v < 8u; ++v) sum1 += pgsD1[v].y;     // side 1, tet 1
+        std::printf("  symmetry: side0 tet0 sum dy = %.8f, side1 tet1 sum dy = %.8f\n", sum0, sum1);
+        PXG_CHECK_MSG(sum0 * sum1 < 0.0f,
+                      "the two sides of a contact must move in OPPOSITE directions "
+                      "(%.8f and %.8f)", sum0, sum1);
+    }
+
+    dev->destroyBuffer(bP0.h); dev->destroyBuffer(bV0.h); dev->destroyBuffer(bD0.h);
+    dev->destroyBuffer(bT0.h); dev->destroyBuffer(bM0.h); dev->destroyBuffer(bP1.h);
+    dev->destroyBuffer(bV1.h); dev->destroyBuffer(bD1.h); dev->destroyBuffer(bT1.h);
+    dev->destroyBuffer(bM1.h); dev->destroyBuffer(bMat.h); dev->destroyBuffer(bDl0.h);
+    dev->destroyBuffer(bDl1.h); dev->destroyBuffer(bDesc.h);
+}
+
 } // namespace
