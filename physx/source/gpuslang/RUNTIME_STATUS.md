@@ -1620,6 +1620,87 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.6 — GJK/EPA: a softbody settles on a SPHERE
+
+The softbody-vs-rigid contact path no longer stops at `ePLANE`. `sb_primitiveContactGenLaunch`
+now handles **eSPHERE** and **eCAPSULE** through the real GJK + EPA driver; `eBOX` and
+`eCONVEXMESH` still emit nothing, and need only the convex-hull decode on top of the same
+machinery.
+
+### Three modules, because squawk::gjk is one CUDA function
+
+| module | from | was |
+|---|---|---|
+| `pxgSlangGjk` | `gjk.cuh:235-418` | inside `npGjk.slang` |
+| `pxgSlangEpa` | `epa.cuh` | inside `npEpa.slang` |
+| `pxgSlangTetCollide` | `convexNpCommon.h:212` | not ported |
+
+`squawk::gjk` is called by every deformable-vs-convex path in the narrowphase. That is the
+case the port's sharing rule names — one CUDA function used by both, share it or the copies
+rot — and five hundred lines of simplex bookkeeping is the clearest instance of it. Nothing
+but the vertex-cloud plumbing moved: `gVA[vbase + i]` became `a.v[i]` on a `GjkCloud` the
+caller supplies. The leaf shaders are now their descriptor-set ABI plus a call, and their
+unchanged ctests are what pin the extraction.
+
+### The radius is not in the cloud
+
+A sphere's cloud is its CENTRE, a capsule's its two segment endpoints. The radius is folded
+into GJK's contact distance and subtracted back out of the penetration as `penOffset` — that
+is how upstream keeps GJK on point sets rather than inflated hulls. Note also that
+`scale.x` is a sphere's radius but a capsule's HALF-HEIGHT, while the radius used for
+`penOffset` is `scale.y` for both. Upstream's asymmetry, transcribed rather than tidied.
+
+### The money shot
+
+Same cube, same solve chain, same thresholds — only the rigid's type changes:
+
+| floor | cube settles at | rest \|dy\| |
+|---|---|---|
+| `PXG_SB_PLANE=1` | 0.4975 | 0.000002 |
+| `PXG_SB_SPHERE=1` (radius 5 at y = -5) | **0.4844** | 0.000575 |
+
+The sphere floor is the first non-plane rigid a softbody has ever touched in this port. The
+convergence bar is shape-dependent and the two measurements say why: a sphere of radius 5 is
+not flat under a cube of edge 1, so the contact set keeps shifting slightly as the cube beds
+into the curvature. The plane keeps its tighter bar so its convergence cannot quietly degrade
+to the sphere's.
+
+### Three mistakes worth keeping
+
+1. **A shadowed `out` parameter.** The mechanical extraction left `EpaOut o;` as a local
+   inside `epaRun`, where `o` was now the out parameter — the caller's result was never
+   written. `npEpa_driver` caught it, but only in the full suite: my targeted re-run used the
+   regex `ctGjk|ctEpa`, which matches the shader-level targets and NOT the fixture suite
+   `gpuslang.npEpa`.
+2. **A fixture calibrated against broken output.** The `tetPrimitivesCollide2` fixture was
+   written while EPA was silently returning nothing. It "passed" on a penetration depth of
+   -0.2309401, which I explained as the unit tet's slant face. The explanation was plausible
+   and wrong; the real depth is +0.2, the shallowest exit through one of three tied
+   coordinate planes. **A number has to be predictable from the geometry BEFORE it is
+   compared**, or the fixture pins nothing.
+3. **`computeInnerSphere` is not the inscribed sphere.** Upstream takes the CENTROID and the
+   smallest distance to the four face planes. I derived an incentre formula first; it gives a
+   different number for any non-regular tetrahedron, and the value feeds EPA's epsilon.
+
+A fourth, in the OLD scaffolding: the contact-gen kernel strides by
+`SB_CG_GRID * MIDPHASE_WARPS_PER_BLOCK` = 1024, so a one-group dispatch covers only the first
+TWO pairs. The plane fixture has exactly two and never noticed; the new one has three and its
+third silently vanished until the fixture dispatched the engine's 512 blocks.
+
+### Verification
+
+| gate | result |
+|---|---|
+| GJK/EPA leaf tests | 14 / 14, including the HLSL cs_6_0 variants |
+| target ctest (`gpuslang.softBodySim`) | pass, 47 fixtures |
+| full suite, forced-fresh rebuild of every `.spv` | **674 / 674** |
+| `PXG_SCENE=softbody` (no floor / plane / sphere) | all three green |
+
+One `gpuslang.scan` SEGFAULT occurred on one forced-fresh run and did not reproduce (six
+isolated runs clean, full suite green on re-run, 14 GB free). `scan` is a prefix-sum shader
+untouched by this work. Same class as the `npRigidSumBatches` one-off already recorded above,
+and it should be re-checked if either recurs.
+
 ## P8.5 — the co-rotated stress field, and the plasticity block settled
 
 `sb_calculateStressLaunch` is mapped: one thread per COLLISION-mesh tetrahedron computes the
