@@ -1620,6 +1620,96 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.3 — the softbody-vs-rigid ATTACHMENT path
+
+`sb_rigidAttachmentPrepareLaunch` and `sb_solveRigidSoftAttachmentLaunch{,TGS}` are mapped,
+so a softbody can be pinned to a rigid body or to the world. Manifest **MAPPED 232 -> 235**;
+softbody **22 -> 25 of 56**.
+
+| kernel | ABI row | blob |
+|---|---|---|
+| `sb_rigidAttachmentPrepareLaunch` | `{8,8,8,8,4,8,8,8,8,8}` | 80 B |
+| `sb_solveRigidSoftAttachmentLaunch{,TGS}` | `{8,8,4,8,8,8,8,4,8}` | 72 B |
+
+Both rows are the cloth rows: the CUDA packs are position-for-position identical apart from
+argument 0.
+
+### One genuinely new piece of arithmetic
+
+`getSoftBodyInvMass` (softBody.cuh:38) scales the blended inverse mass of a TET attachment by
+the **length** of the barycentric vector — `baryMass * sqrt(bx²+by²+bz²+bw²)` — where the
+cloth path simply takes the blended `.w`. For the fixture's (0.4, 0.2, 0.3, 0.1) that factor
+is sqrt(0.30) = 0.5477, so dropping the square root gives every tet attachment the wrong
+stiffness and every response term with it. It is the only arithmetic in the tranche that has
+no cloth counterpart.
+
+### The sharing rule, and why it cuts the OTHER way here
+
+Tranche d moved `prepareFEMContacts` into a shared module because two copies of it would rot.
+This tranche shares only the BYTE LAYOUTS (`pxgSlangFemRigidAttach`) and keeps the kernel
+bodies duplicated, which is the opposite call for a reason worth stating once:
+
+- **one CUDA function used by both** -> share it, or the copies drift apart silently;
+- **two CUDA functions that happen to agree** -> keep two, or the port stops tracking them.
+
+CUDA itself carries two near-identical attachment prepares (FEMClothConstraintPrep.cu:387 and
+softBodyGM.cu:1822) and two solves. A single shared function would be a port-introduced
+divergence from the source it transcribes; when NVIDIA changes one, two copies change with it.
+`PxgFEMRigidAttachmentConstraint` and `PxgFEMRigidAttachment`, by contrast, are one struct
+each written by one kernel and read by another — an ABI, and ABIs drift silently.
+
+The extraction was measured, not assumed: three of the four cloth attachment entry points
+compile to **byte-identical SPIR-V**, and the fourth — the prepare, the only caller of the
+renamed vertex-type predicate — differs by **exactly one word with an identical opcode
+histogram**, i.e. the `OpName` string and nothing else.
+
+### Mutation: 12 of 12
+
+Four rounds, and each round's survivor showed the previous assertion was too weak:
+
+| mutant | killed by |
+|---|---|
+| drop the `getSoftBodyInvMass` square root | the tet slot's velocity multiplier, bit-exact |
+| skip the quaternion rotate; flip the error sign | a NON-identity anchor rotation and translated frame |
+| drop `vecGetNormalized` on the world axis | bit-exact `axis_angle` |
+| don't zero `rigidDeltaVel`; don't record the attachment id | direct checks |
+| drop the `inertiaScale` multiply, or the identity-inertia branch | a KINEMATIC anchor slot |
+| solve: drop the barycentric scale; drop the reference count; treat a vertex as a tet | the per-vertex ratio and the (2,1,1,1) counts |
+| solve: drop the negation on `deltaPos` | the CPU solve reference |
+| solve: change the bias factor 0.5 -> 1.0 | the CPU solve reference |
+| solve: "fix" the upstream quirk by reading raXn1/2's own error | the CPU solve reference |
+
+**Three things the fixtures had to be rebuilt to see**, each found by mutation rather than by
+inspection:
+
+1. `inertiaScale` is only reachable through `invMass0 == 0 && !isStatic` — a KINEMATIC rigid.
+   With static anchors only, the scale stays 1 and multiplying by it is invisible. Slot 2 of
+   the prepare fixture is now a kinematic anchor, otherwise identical to slot 0, and the two
+   must disagree.
+2. Mirroring the anchor and asserting the delta flips sign does NOT catch a dropped negation:
+   that flips both runs alike, so the product stays negative. Only an absolute reference does.
+   The mirror check is kept because it pins the direction; it is not sufficient alone.
+3. The bias factor and the upstream quirk are both invisible to signs and ratios, for the
+   same reason — they scale or reshuffle everything alike. `refAttachSolvePGS` closes that.
+
+### One narrow comparison exception, scoped and stated
+
+The kinematic slot's identity-inertia row produces a component that is mathematically exactly
+zero, and GPU and CPU disagree on that zero's **sign bit** — `-0` against `+0`. IEEE says the
+two are equal and every consumer adds or multiplies the field, so the bit carries no
+information. The fixture compares raw bits **except** that `v == 0.0f` maps both zeros to
+`+0`, which is true only for the two zeros: every non-zero component stays bit-exact. Widening
+this to a tolerance would give up what the NoContraction stamp buys, so it is not widened.
+The CPU side is built with `-ffp-contract=off` (tests/CMakeLists.txt:1204), so this is not a
+contraction difference.
+
+### Deferred, as in the cloth port and for the same reasons
+
+The ARTICULATION anchor branch; the CONE-LIMIT branch of the solve; and the DYNAMIC-rigid
+reaction — the prepare zeroes `rigidDeltaVel` (which this port does) and the solve accumulates
+into it (which it does not). A softbody pinned to a MOVING rigid needs that last half; pinned
+to the world it does not.
+
 ## P8.2 tranche e — MILESTONE: the softbody cube SETTLES on a plane
 
 Chain kernels 6 and 7 are mapped, so the softbody-vs-rigid contact path runs end to end for

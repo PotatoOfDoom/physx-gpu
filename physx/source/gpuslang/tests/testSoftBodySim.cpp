@@ -3711,8 +3711,103 @@ static SolveRef refSolvePGS(const SbRigidConstraintHost& c, int slot, float appl
     return r;
 }
 
+
+// PxQuat::rotate (PxQuat.h:286) — needed by the attachment prepare reference.
+static V3 quatRotate(F4 q, V3 v)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q.w * q.w - 0.5f;
+    const float dot2 = (q.x * vx + q.y * vy + q.z * vz);
+    return V3{ vx * w2 + (q.y * vz - q.z * vy) * q.w + q.x * dot2,
+               vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * dot2,
+               vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * dot2 };
+}
+static V3 vecNormalized(V3 v)
+{
+    const float m = v.x * v.x + v.y * v.y + v.z * v.z;
+    if (m > 0.0f) { const float rs = 1.0f / std::sqrt(m); return V3{ v.x * rs, v.y * rs, v.z * rs }; }
+    return V3{ 0, 0, 0 };
+}
+// getSoftBodyInvMass (softBody.cuh:38) — the TET attachment's inverse mass.
+static float softBodyInvMass(float baryMass, F4 bary)
+{
+    return baryMass * std::sqrt(bary.x * bary.x + bary.y * bary.y + bary.z * bary.z + bary.w * bary.w);
+}
+
+// The block-of-32 PxgFEMRigidAttachmentConstraint (PxgFEMCore.h:191).
+struct AttachConstraintHost
+{
+    F4 baryOrType[32];        // @0
+    F4 raXn0_biasW[32];       // @512
+    F4 raXn1_biasW[32];       // @1024
+    F4 raXn2_biasW[32];       // @1536
+    F4 velMult_invMass[32];   // @2048
+    F4 low_high_limits[32];   // @2560
+    F4 axis_angle[32];        // @3072
+    uint32_t elemId[32];      // @3584
+    uint64_t rigidId[32];     // @3712 -> 3968
+};
+
+// sb_rigidAttachmentPrepareLaunch (softBodyGM.cu:1822), rigid / static path.
+static void refAttachPrepare(AttachConstraintHost& c, int slot, F4 bodyQ, V3 bodyP, V3 ra4,
+                             V3 point, float invMass1, const float sqrtInvInertia[9],
+                             float invMass0, bool isStatic, F4 axisAngle)
+{
+    const V3 normal0{ 1, 0, 0 }, normal1{ 0, 1, 0 }, normal2{ 0, 0, 1 };
+    float inertia[9];
+    float inertiaScale = 1.0f;
+    if (invMass0 == 0.0f && !isStatic)
+    {
+        for (int k = 0; k < 9; ++k) inertia[k] = (k % 4 == 0) ? 1.0f : 0.0f;   // identity
+        inertiaScale = 0.0f;
+    }
+    else
+        for (int k = 0; k < 9; ++k) inertia[k] = sqrtInvInertia[k];
+
+    const V3 ra = quatRotate(bodyQ, ra4);
+    const V3 error{ ra.x + bodyP.x - point.x, ra.y + bodyP.y - point.y, ra.z + bodyP.z - point.z };
+    const V3 worldAxis = vecNormalized(quatRotate(bodyQ, V3{ axisAngle.x, axisAngle.y, axisAngle.z }));
+
+    const V3 raXn0 = cross3(ra, normal0), raXn1 = cross3(ra, normal1), raXn2 = cross3(ra, normal2);
+    const V3 s0 = mat33Mul(inertia, raXn0), s1 = mat33Mul(inertia, raXn1), s2 = mat33Mul(inertia, raXn2);
+    const float resp0 = dot3(s0, s0) * inertiaScale + invMass0 + invMass1;
+    const float resp1 = dot3(s1, s1) * inertiaScale + invMass0 + invMass1;
+    const float resp2 = dot3(s2, s2) * inertiaScale + invMass0 + invMass1;
+
+    c.raXn0_biasW[slot] = F4{ s0.x, s0.y, s0.z, dot3(error, normal0) };
+    c.raXn1_biasW[slot] = F4{ s1.x, s1.y, s1.z, dot3(error, normal1) };
+    c.raXn2_biasW[slot] = F4{ s2.x, s2.y, s2.z, dot3(error, normal2) };
+    c.velMult_invMass[slot] = F4{ (resp0 > 0.f) ? 1.f / resp0 : 0.f,
+                                  (resp1 > 0.f) ? 1.f / resp1 : 0.f,
+                                  (resp2 > 0.f) ? 1.f / resp2 : 0.f, invMass0 };
+    c.axis_angle[slot] = F4{ worldAxis.x, worldAxis.y, worldAxis.z, axisAngle.w };
+}
+
+// sb_solveRigidSoftAttachmentLaunch (softBodyGM.cu:2085), PGS, STATIC anchor at rest.
+// Returns the position delta the solve applies BEFORE the per-vertex inverse-mass and
+// barycentric scaling.  Needed for an ABSOLUTE check: signs and ratios alone cannot see a
+// dropped negation (it flips every run alike) nor a changed bias factor (it scales
+// everything alike).
+static V3 refAttachSolvePGS(const AttachConstraintHost& c, int slot, V3 linVel1, float dt)
+{
+    const float invDt = 1.0f / dt;
+    const F4 raXn0_biasW = c.raXn0_biasW[slot];
+    const F4 velMult = c.velMult_invMass[slot];
+    // A static anchor at rest contributes no rigid velocity.
+    // NOTE the upstream quirk: all THREE components use raXn0_biasW.w, because CUDA passes
+    // constraint.raXn0_biasW three times -- the Y and Z position errors are never read.
+    const float positionError = raXn0_biasW.w;
+    const float biasFactor = 0.5f;
+    const V3 velError{ linVel1.x - positionError * biasFactor * invDt,
+                       linVel1.y - positionError * biasFactor * invDt,
+                       linVel1.z - positionError * biasFactor * invDt };
+    const V3 impulse{ velError.x * velMult.x, velError.y * velMult.y, velError.z * velMult.z };
+    return V3{ -impulse.x * dt, -impulse.y * dt, -impulse.z * dt };
+}
+
 } // namespace p82dref
 
+struct V3ish { float x, y, z; };
 static void sbPokePtr(std::vector<uint8_t>& b, size_t off, uint64_t v) { std::memcpy(b.data() + off, &v, 8); }
 
 PXG_TEST(softBodySimRigidContactPrepare)
@@ -4642,6 +4737,499 @@ PXG_TEST(softBodySimRigidContactInactive)
     dev->destroyBuffer(bSimDeltaPos.h); dev->destroyBuffer(bSimDelta.h); dev->destroyBuffer(bTets.h);
     dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h);
     dev->destroyBuffer(bConstraint.h); dev->destroyBuffer(bForces.h); dev->destroyBuffer(bRefCounts.h);
+    dev->destroyBuffer(bRigidDeltaVel.h); dev->destroyBuffer(bBody2World.h);
+    dev->destroyBuffer(bSolverBodyData.h); dev->destroyBuffer(bSolverTxIData.h);
+    dev->destroyBuffer(bSolverBodyIndices.h); dev->destroyBuffer(bOutSolverVel.h);
+    dev->destroyBuffer(bVelPool.h); dev->destroyBuffer(bPrepDesc.h);
+    dev->destroyBuffer(bPrePrepDesc.h); dev->destroyBuffer(bSolverCoreDesc.h);
+    dev->destroyBuffer(bSharedDesc.h);
+}
+
+
+// ===========================================================================
+// P8.3 — the softbody-vs-rigid ATTACHMENT prepare, at unit level.
+//
+// TWO attachments in one dispatch, deliberately of DIFFERENT kinds:
+//   slot 0  a VERTEX attachment (baryOrType all zero) -> invMass1 is the vertex's own .w;
+//   slot 1  a TET attachment with four distinct weights -> invMass1 is
+//           getSoftBodyInvMass(blended .w, bary) = blended.w * |bary|.
+//
+// The second is the point of the fixture.  |bary| for (0.4, 0.2, 0.3, 0.1) is
+// sqrt(0.30) = 0.5477, so a port that forgot the square root and used the blended `.w`
+// directly -- which is exactly what the cloth path does -- lands on a velocity multiplier
+// that is wrong by that factor, and every response term with it.
+//
+// The rigid anchor has a NON-IDENTITY rotation and a translated frame, so quatRotateVec and
+// the ra / error chain have teeth; with an identity quaternion the rotate is invisible.
+// ===========================================================================
+struct SbPrepAttachPush
+{
+    uint64_t softbodies, rigidAttachments, activeRigidAttachments, rigidAttachmentIds;
+    uint32_t numRigidAttachments, pad36;
+    uint64_t constraints, prePrepDesc, prepDesc, sharedDesc, rigidDeltaVel;
+};
+static_assert(sizeof(SbPrepAttachPush) == 80, "sb attach prepare blob must be 80 bytes");
+static_assert(offsetof(SbPrepAttachPush, numRigidAttachments) == 32, "count @32");
+static_assert(offsetof(SbPrepAttachPush, constraints) == 40, "constraints @40");
+static_assert(offsetof(SbPrepAttachPush, rigidDeltaVel) == 72, "rigidDeltaVel @72");
+
+struct SbSolveAttachPush
+{
+    uint64_t softbodies, attachments;
+    uint32_t numAttachments, pad20;
+    uint64_t prePrepDesc, solverCoreDesc, artiCoreDesc, sharedDesc;
+    float dt; uint32_t pad60;
+    uint64_t rigidDeltaVel;
+};
+static_assert(sizeof(SbSolveAttachPush) == 72, "sb attach solve blob must be 72 bytes");
+static_assert(offsetof(SbSolveAttachPush, numAttachments) == 16, "count @16");
+static_assert(offsetof(SbSolveAttachPush, dt) == 56, "dt @56");
+static_assert(offsetof(SbSolveAttachPush, rigidDeltaVel) == 64, "rigidDeltaVel @64");
+
+PXG_TEST(softBodySimRigidAttachPrepare)
+{
+    using namespace p80refit;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // four sim vertices with DISTINCT inverse masses, so the blend is observable
+    std::vector<F4> simPos = {
+        { 0.10f, 0.20f, 0.30f, 0.50f }, { 1.10f, 0.25f, 0.35f, 0.25f },
+        { 0.15f, 1.20f, 0.40f, 0.75f }, { 0.20f, 0.30f, 1.30f, 0.60f },
+    };
+    std::vector<TetIdx4> simTets = { { 0u, 1u, 2u, 3u }, { 0u, 0u, 0u, 0u } };
+    DevBuf bPos = makeDev(dev, simPos), bTets = makeDev(dev, simTets);
+    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mSimTetIndices = reinterpret_cast<decltype(sb.mSimTetIndices)>(size_t(bTets.addr));
+    sb.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // --- two attachments, raw bytes at the mirror offsets ------------------
+    // A THIRD attachment on a KINEMATIC anchor.  The prepare swaps in an IDENTITY inertia
+    // and zeroes the inertia scale when `invMass0 == 0 && !isStatic` -- i.e. exactly a
+    // kinematic rigid.  With only static anchors that branch is never taken, `inertiaScale`
+    // stays 1, and multiplying by it is invisible; mutation-tested, deleting the multiply
+    // survives a static-only fixture.  Node index 0 is non-static and the solver body data
+    // is zeroed, so slot 2 is kinematic.
+    const uint32_t kN = 3u;
+    const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
+    const uint64_t kinematicNodeInd = 0x0000000000000000ull;
+    const F4 tetBary = { 0.4f, 0.2f, 0.3f, 0.1f };
+    const F4 axisAngle = { 0.3f, -0.5f, 0.8f, 0.25f };
+    const F4 lowHigh = { -1.0f, 1.0f, -2.0f, 2.0f };
+    const V3ish ra4v = { 0.07f, -0.11f, 0.05f };
+    std::vector<uint8_t> attBytes(kN * 96u, 0);
+    auto pokeAtt = [&](uint32_t i, uint64_t idx0, uint64_t idx1, F4 localPose, F4 bary) {
+        uint8_t* b = attBytes.data() + size_t(i) * 96u;
+        std::memcpy(b + 0, &idx0, 8);
+        std::memcpy(b + 8, &idx1, 8);
+        std::memcpy(b + 32, &localPose, 16);
+        std::memcpy(b + 48, &lowHigh, 16);
+        std::memcpy(b + 64, &axisAngle, 16);
+        std::memcpy(b + 80, &bary, 16);
+    };
+    const F4 localPose0 = { ra4v.x, ra4v.y, ra4v.z, 0.0f };
+    pokeAtt(0, staticNodeInd, 0ull, localPose0, F4{ 0, 0, 0, 0 });   // VERTEX, elemIdx 0
+    pokeAtt(1, staticNodeInd, 0ull, localPose0, tetBary);            // TET, elemIdx 0
+    pokeAtt(2, kinematicNodeInd, 0ull, localPose0, F4{ 0, 0, 0, 0 }); // VERTEX on a KINEMATIC anchor
+    DevBuf bAtt = makeDev(dev, attBytes);
+
+    std::vector<uint32_t> activeAtt = { 0u, 1u, 2u };
+    DevBuf bActive = makeDev(dev, activeAtt);
+    std::vector<uint64_t> attIds(kN, 0xdeadbeefdeadbeefull);
+    DevBuf bAttIds = makeDev(dev, attIds);
+    std::vector<uint8_t> constraintBytes(sizeof(p82dref::AttachConstraintHost), 0xCD);
+    DevBuf bConstraint = makeDev(dev, constraintBytes);
+    std::vector<F4> rigidDeltaVel(2u * kN, F4{ 9.f, 9.f, 9.f, 9.f });
+    DevBuf bRigidDeltaVel = makeDev(dev, rigidDeltaVel);
+
+    // --- the rigid anchor: NON-identity rotation, translated frame ---------
+    // a quaternion for ~37 degrees about a tilted axis, normalised on the host.
+    float qraw[4] = { 0.18f, 0.26f, -0.11f, 0.94f };
+    const float qm = std::sqrt(qraw[0]*qraw[0] + qraw[1]*qraw[1] + qraw[2]*qraw[2] + qraw[3]*qraw[3]);
+    const F4 bodyQ = { qraw[0]/qm, qraw[1]/qm, qraw[2]/qm, qraw[3]/qm };
+    const F4 bodyP = { 0.33f, -0.21f, 0.44f, 0.0f };
+    std::vector<F4> body2World = { bodyQ, bodyP };
+    DevBuf bBody2World = makeDev(dev, body2World);
+
+    const float invMass0 = 0.0f;   // static anchor
+    std::vector<uint8_t> solverBodyData(96, 0);
+    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
+    const float sqrtInvInertia[9] = { 2.0f, 0.1f, 0.0f, 0.1f, 1.5f, 0.2f, 0.0f, 0.2f, 1.0f };
+    std::vector<uint8_t> solverTxIData(64, 0);
+    std::memcpy(solverTxIData.data() + 28, sqrtInvInertia, 9 * 4);
+    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
+    std::vector<uint32_t> solverBodyIndices = { 0u };
+    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
+
+    std::vector<uint8_t> prepDesc(304, 0);
+    sbPokePtr(prepDesc, 64, bSolverBodyData.addr);
+    sbPokePtr(prepDesc, 72, bSolverTxIData.addr);
+    sbPokePtr(prepDesc, 168, bBody2World.addr);
+    DevBuf bPrepDesc = makeDev(dev, prepDesc);
+    std::vector<uint8_t> prePrepDesc(760, 0);
+    sbPokePtr(prePrepDesc, 272, bSolverBodyIndices.addr);
+    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
+
+    SbPrepAttachPush pp = {};
+    pp.softbodies = bDesc.addr; pp.rigidAttachments = bAtt.addr;
+    pp.activeRigidAttachments = bActive.addr; pp.rigidAttachmentIds = bAttIds.addr;
+    pp.numRigidAttachments = kN; pp.constraints = bConstraint.addr;
+    pp.prePrepDesc = bPrePrepDesc.addr; pp.prepDesc = bPrepDesc.addr;
+    pp.sharedDesc = 0ull;   // DEFERRED: articulation-only, must not be dereferenced
+    pp.rigidDeltaVel = bRigidDeltaVel.addr;
+
+    Kernel("softBodyRigidAttachBda.spv", "sb_rigidAttachmentPrepareLaunch", {}, sizeof(SbPrepAttachPush))
+        .dispatch(1u, {}, pp, 1u, 1u);
+    dev->flush();
+
+    // ---- CPU reference ---------------------------------------------------
+    p82dref::AttachConstraintHost ref;
+    std::memset(&ref, 0xCD, sizeof(ref));
+    const p82dref::V3 ra4{ ra4v.x, ra4v.y, ra4v.z };
+    const p82dref::V3 bodyPv{ bodyP.x, bodyP.y, bodyP.z };
+
+    // slot 0: VERTEX -> the vertex's own position and inverse mass
+    const p82dref::V3 pt0{ simPos[0].x, simPos[0].y, simPos[0].z };
+    p82dref::refAttachPrepare(ref, 0, bodyQ, bodyPv, ra4, pt0, simPos[0].w,
+                              sqrtInvInertia, invMass0, true, axisAngle);
+    // slot 1: TET -> the four-weight blend, and the |bary| scale on the inverse mass
+    F4 blended = { 0, 0, 0, 0 };
+    const float bw[4] = { tetBary.x, tetBary.y, tetBary.z, tetBary.w };
+    for (int v = 0; v < 4; ++v)
+    { blended.x += simPos[v].x * bw[v]; blended.y += simPos[v].y * bw[v];
+      blended.z += simPos[v].z * bw[v]; blended.w += simPos[v].w * bw[v]; }
+    const p82dref::V3 pt1{ blended.x, blended.y, blended.z };
+    const float invMass1Tet = p82dref::softBodyInvMass(blended.w, tetBary);
+    p82dref::refAttachPrepare(ref, 1, bodyQ, bodyPv, ra4, pt1, invMass1Tet,
+                              sqrtInvInertia, invMass0, true, axisAngle);
+    // slot 2: the KINEMATIC anchor -> identity inertia, inertiaScale 0
+    p82dref::refAttachPrepare(ref, 2, bodyQ, bodyPv, ra4, pt0, simPos[0].w,
+                              sqrtInvInertia, invMass0, /*isStatic*/ false, axisAngle);
+
+    const auto gBytes = downloadBuffer<uint8_t>(dev, bConstraint.h, sizeof(p82dref::AttachConstraintHost));
+    p82dref::AttachConstraintHost got;
+    std::memcpy(&got, gBytes.data(), sizeof(got));
+    const auto gIds = downloadBuffer<uint64_t>(dev, bAttIds.h, kN);
+    const auto gRDV = downloadBuffer<F4>(dev, bRigidDeltaVel.h, 2u * kN);
+
+    // Bit-exact, with ONE narrow exception: -0 and +0 compare equal.
+    //
+    // The identity-inertia row of the kinematic slot produces a component that is
+    // mathematically exactly zero (raXn2 crossed with +Z has a zero z, and the identity
+    // matrix passes it through).  GPU and CPU agree on the value and disagree on the SIGN
+    // BIT of that zero, which carries no numerical information -- IEEE says -0 == +0, and
+    // every consumer of this field adds or multiplies it.  The exception is scoped to
+    // exactly that: `v == 0.0f` is true only for the two zeros, so every NON-zero component
+    // is still compared by raw bits.  Widening this to a tolerance would give up the
+    // bit-exactness the NoContraction stamp buys.
+    auto f2uz = [](float v) { return f2u(v == 0.0f ? 0.0f : v); };
+    size_t mm = 0;
+    auto cmp4 = [&](const char* nm, int slot, const F4& r, const F4& g) {
+        if (f2uz(r.x) != f2uz(g.x) || f2uz(r.y) != f2uz(g.y) || f2uz(r.z) != f2uz(g.z) || f2uz(r.w) != f2uz(g.w))
+        { ++mm; std::printf("  slot %d %s MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", slot, nm,
+                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
+    };
+    for (int sl = 0; sl < 3; ++sl)
+    {
+        cmp4("raXn0_biasW", sl, ref.raXn0_biasW[sl], got.raXn0_biasW[sl]);
+        cmp4("raXn1_biasW", sl, ref.raXn1_biasW[sl], got.raXn1_biasW[sl]);
+        cmp4("raXn2_biasW", sl, ref.raXn2_biasW[sl], got.raXn2_biasW[sl]);
+        cmp4("velMult_invMass", sl, ref.velMult_invMass[sl], got.velMult_invMass[sl]);
+        cmp4("axis_angle", sl, ref.axis_angle[sl], got.axis_angle[sl]);
+    }
+    PXG_CHECK_MSG(mm == 0, "sb_rigidAttachmentPrepareLaunch bit-exact vs CPU (%zu mismatches)", mm);
+
+    // THE |bary| SCALE: the two slots must NOT agree on the velocity multiplier, or the
+    // tet path is indistinguishable from the vertex path and the sqrt has no teeth.
+    PXG_CHECK_MSG(f2u(got.velMult_invMass[0].x) != f2u(got.velMult_invMass[1].x),
+                  "the vertex and tet attachments must produce DIFFERENT velocity "
+                  "multipliers, or this fixture cannot see getSoftBodyInvMass (both %g)",
+                  got.velMult_invMass[0].x);
+    // and the tet inverse mass must be the blended .w times |bary|, not the blended .w
+    const float naive = blended.w;
+    PXG_CHECK_MSG(std::fabs(invMass1Tet - naive) > 1e-3f,
+                  "the fixture's barycentric must make |bary| differ from 1 (%.5f vs %.5f)",
+                  invMass1Tet, naive);
+
+    // the passthrough fields, and the ids the prepare records
+    // The KINEMATIC slot must differ from the STATIC slot 0, which is otherwise identical
+    // to it -- same point, same inverse mass, same anchor pose.  Only the inertia branch
+    // differs, so if they agree the identity path was not taken and inertiaScale is
+    // untested.
+    PXG_CHECK_MSG(f2u(got.velMult_invMass[0].x) != f2u(got.velMult_invMass[2].x),
+                  "the static and kinematic anchors must produce DIFFERENT velocity "
+                  "multipliers -- the kinematic one takes the identity-inertia branch "
+                  "(both %g)", got.velMult_invMass[0].x);
+
+    for (int sl = 0; sl < 3; ++sl)
+    {
+        PXG_CHECK_MSG(f2u(got.low_high_limits[sl].x) == f2u(lowHigh.x),
+                      "slot %d low_high_limits must pass through unchanged", sl);
+        PXG_CHECK_MSG(got.elemId[sl] == 0u, "slot %d elemId must be recorded", sl);
+        const uint64_t wantId = (sl == 2) ? kinematicNodeInd : staticNodeInd;
+        PXG_CHECK_MSG(got.rigidId[sl] == wantId, "slot %d rigidId must be recorded", sl);
+        PXG_CHECK_MSG(gIds[sl] == wantId,
+                      "rigidAttachmentIds[%d] must be written by the prepare", sl);
+    }
+    // baryOrType passes through: zero for the vertex slot, the weights for the tet slot
+    PXG_CHECK_MSG(f2u(got.baryOrType[0].x) == f2u(0.0f) && f2u(got.baryOrType[1].x) == f2u(tetBary.x),
+                  "baryOrType must pass through per slot (%g, %g)",
+                  got.baryOrType[0].x, got.baryOrType[1].x);
+    // rigidDeltaVel is zeroed for every in-range attachment, both halves
+    for (uint32_t i = 0; i < 2u * kN; ++i)
+        PXG_CHECK_MSG(f2u(gRDV[i].x) == f2u(0.0f),
+                      "rigidDeltaVel[%u] must be zeroed by the prepare (got %g)", i, gRDV[i].x);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bTets.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bAtt.h); dev->destroyBuffer(bActive.h); dev->destroyBuffer(bAttIds.h);
+    dev->destroyBuffer(bConstraint.h); dev->destroyBuffer(bRigidDeltaVel.h);
+    dev->destroyBuffer(bBody2World.h); dev->destroyBuffer(bSolverBodyData.h);
+    dev->destroyBuffer(bSolverTxIData.h); dev->destroyBuffer(bSolverBodyIndices.h);
+    dev->destroyBuffer(bPrepDesc.h); dev->destroyBuffer(bPrePrepDesc.h);
+}
+
+
+// ---------------------------------------------------------------------------
+// P8.3 — the attachment SOLVE.  Prepare then solve, on a constraint the prepare itself
+// produced, so the two halves are checked against each other rather than against a
+// hand-written block that could be wrong in a way both agree on.
+//
+// The anchor is displaced from the attached point, so there is a real position error to
+// correct, and the solve must pull the softbody vertex TOWARD the anchor.  Both the vertex
+// and the tet attachment are driven, and the tet's four vertices must each receive a share
+// scaled by ITS barycentric weight and ITS inverse mass -- the scatter that mirrors CUDA's
+// AtomicAdd loop.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimRigidAttachSolve)
+{
+    using namespace p80refit;
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+
+    const float invMass = 0.5f;
+    std::vector<F4> simPos = {
+        { 0.10f, 0.20f, 0.30f, invMass }, { 1.10f, 0.25f, 0.35f, invMass },
+        { 0.15f, 1.20f, 0.40f, invMass }, { 0.20f, 0.30f, 1.30f, invMass },
+    };
+    // a NON-ZERO velocity, so the solve has something other than the position error to act on
+    std::vector<F4> simVel(4, F4{ 0.05f, -0.12f, 0.07f, invMass });
+    std::vector<F4> simDelta(4, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
+    std::vector<TetIdx4> simTets = { { 0u, 1u, 2u, 3u }, { 0u, 0u, 0u, 0u } };
+    DevBuf bPos = makeDev(dev, simPos), bVel = makeDev(dev, simVel);
+    DevBuf bDelta = makeDev(dev, simDelta), bTets = makeDev(dev, simTets);
+    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mSimTetIndices = reinterpret_cast<decltype(sb.mSimTetIndices)>(size_t(bTets.addr));
+    sb.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    sb.mSimVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVel.addr));
+    sb.mSimDelta = reinterpret_cast<float4*>(size_t(bDelta.addr));
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    const uint32_t kN = 2u;
+    const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
+    const F4 tetBary = { 0.4f, 0.2f, 0.3f, 0.1f };
+    const F4 axisAngle = { 0.0f, 1.0f, 0.0f, 0.25f };
+    const F4 lowHigh = { -1.0f, 1.0f, -2.0f, 2.0f };
+    // the anchor sits WELL AWAY from the attached point -> a real position error
+    const F4 localPose0 = { 0.8f, 0.9f, -0.6f, 0.0f };
+    std::vector<uint8_t> attBytes(kN * 96u, 0);
+    auto pokeAtt = [&](uint32_t i, F4 bary) {
+        uint8_t* b = attBytes.data() + size_t(i) * 96u;
+        const uint64_t i0 = staticNodeInd, i1 = 0ull;
+        std::memcpy(b + 0, &i0, 8); std::memcpy(b + 8, &i1, 8);
+        std::memcpy(b + 32, &localPose0, 16);
+        std::memcpy(b + 48, &lowHigh, 16);
+        std::memcpy(b + 64, &axisAngle, 16);
+        std::memcpy(b + 80, &bary, 16);
+    };
+    pokeAtt(0, F4{ 0, 0, 0, 0 });   // VERTEX
+    pokeAtt(1, tetBary);            // TET
+    DevBuf bAtt = makeDev(dev, attBytes);
+
+    std::vector<uint32_t> activeAtt = { 0u, 1u };
+    DevBuf bActive = makeDev(dev, activeAtt);
+    std::vector<uint64_t> attIds(kN, 0ull);
+    DevBuf bAttIds = makeDev(dev, attIds);
+    std::vector<uint8_t> constraintBytes(sizeof(p82dref::AttachConstraintHost), 0);
+    DevBuf bConstraint = makeDev(dev, constraintBytes);
+    std::vector<F4> rigidDeltaVel(2u * kN, F4{ 9.f, 9.f, 9.f, 9.f });
+    DevBuf bRigidDeltaVel = makeDev(dev, rigidDeltaVel);
+
+    std::vector<F4> body2World = { { 0, 0, 0, 1 }, { 0, 0, 0, 0 } };
+    DevBuf bBody2World = makeDev(dev, body2World);
+    std::vector<uint8_t> solverBodyData(96, 0);
+    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
+    const float sqrtInvInertia[9] = { 2.0f, 0.1f, 0.0f, 0.1f, 1.5f, 0.2f, 0.0f, 0.2f, 1.0f };
+    std::vector<uint8_t> solverTxIData(64, 0);
+    std::memcpy(solverTxIData.data() + 28, sqrtInvInertia, 9 * 4);
+    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
+    std::vector<uint32_t> solverBodyIndices = { 0u };
+    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
+    std::vector<F4> outSolverVelocity(4, F4{ 0, 0, 0, 0 });
+    DevBuf bOutSolverVel = makeDev(dev, outSolverVelocity);
+    std::vector<F4> velPool(4, F4{ 0, 0, 0, 0 });
+    DevBuf bVelPool = makeDev(dev, velPool);
+
+    std::vector<uint8_t> prepDesc(304, 0);
+    sbPokePtr(prepDesc, 64, bSolverBodyData.addr);
+    sbPokePtr(prepDesc, 72, bSolverTxIData.addr);
+    sbPokePtr(prepDesc, 168, bBody2World.addr);
+    DevBuf bPrepDesc = makeDev(dev, prepDesc);
+    std::vector<uint8_t> prePrepDesc(760, 0);
+    sbPokePtr(prePrepDesc, 272, bSolverBodyIndices.addr);
+    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
+    std::vector<uint8_t> solverCoreDesc(320, 0);
+    sbPokePtr(solverCoreDesc, 0, bOutSolverVel.addr);
+    { const uint32_t one = 1u; std::memcpy(solverCoreDesc.data() + 268, &one, 4); }
+    DevBuf bSolverCoreDesc = makeDev(dev, solverCoreDesc);
+    std::vector<uint8_t> sharedDesc(224, 0);
+    sbPokePtr(sharedDesc, 160, bVelPool.addr);
+    DevBuf bSharedDesc = makeDev(dev, sharedDesc);
+
+    // ---- PREPARE, so the solve reads a constraint this port produced ----
+    SbPrepAttachPush pp = {};
+    pp.softbodies = bDesc.addr; pp.rigidAttachments = bAtt.addr;
+    pp.activeRigidAttachments = bActive.addr; pp.rigidAttachmentIds = bAttIds.addr;
+    pp.numRigidAttachments = kN; pp.constraints = bConstraint.addr;
+    pp.prePrepDesc = bPrePrepDesc.addr; pp.prepDesc = bPrepDesc.addr;
+    pp.sharedDesc = 0ull; pp.rigidDeltaVel = bRigidDeltaVel.addr;
+    Kernel("softBodyRigidAttachBda.spv", "sb_rigidAttachmentPrepareLaunch", {}, sizeof(SbPrepAttachPush))
+        .dispatch(1u, {}, pp, 1u, 1u);
+    dev->flush();
+
+    // ---- SOLVE ----
+    SbSolveAttachPush sp = {};
+    sp.softbodies = bDesc.addr; sp.attachments = bConstraint.addr; sp.numAttachments = kN;
+    sp.prePrepDesc = bPrePrepDesc.addr; sp.solverCoreDesc = bSolverCoreDesc.addr;
+    sp.artiCoreDesc = 0ull; sp.sharedDesc = bSharedDesc.addr; sp.dt = dt;
+    sp.rigidDeltaVel = bRigidDeltaVel.addr;
+    Kernel("softBodyRigidAttachBda.spv", "sb_solveRigidSoftAttachmentLaunch", {}, sizeof(SbSolveAttachPush))
+        .dispatch(1u, {}, sp, 1u, 1u);
+    dev->flush();
+
+    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, 4);
+    std::printf("  delta = (%.6g,%.6g,%.6g w=%.3g) (%.6g,%.6g,%.6g w=%.3g)\n",
+                gDelta[0].x, gDelta[0].y, gDelta[0].z, gDelta[0].w,
+                gDelta[1].x, gDelta[1].y, gDelta[1].z, gDelta[1].w);
+
+    // Every vertex must have moved: vertex 0 gets the vertex attachment AND its tet share,
+    // vertices 1..3 get only their tet share.
+    for (uint32_t v = 0; v < 4u; ++v)
+        PXG_CHECK_MSG(gDelta[v].x != 0.0f || gDelta[v].y != 0.0f || gDelta[v].z != 0.0f,
+                      "vertex %u must be moved by the attachment solve (got %g,%g,%g)",
+                      v, gDelta[v].x, gDelta[v].y, gDelta[v].z);
+
+    // Reference counts: vertex 0 is touched TWICE (the vertex attachment and the tet's
+    // first corner), vertices 1..3 once each.  That is the AtomicAdd(..., 1.f) half.
+    PXG_CHECK_MSG(f2u(gDelta[0].w) == f2u(2.0f),
+                  "vertex 0 is touched by BOTH attachments, so its reference count must be 2 "
+                  "(got %g)", gDelta[0].w);
+    for (uint32_t v = 1; v < 4u; ++v)
+        PXG_CHECK_MSG(f2u(gDelta[v].w) == f2u(1.0f),
+                      "vertex %u is touched by the tet attachment only, so its reference "
+                      "count must be 1 (got %g)", v, gDelta[v].w);
+
+    // THE PER-VERTEX SCALE: the tet share of vertices 1..3 is deltaPos * (invMass * bary),
+    // and every inverse mass here is equal, so the ratio between two of them is exactly the
+    // ratio of their barycentric weights.  A scatter that dropped the weight would give
+    // three identical deltas.
+    const float r21 = gDelta[2].y / gDelta[1].y;
+    const float e21 = tetBary.z / tetBary.y;   // 0.3 / 0.2
+    PXG_CHECK_MSG(std::fabs(r21 - e21) < 1e-3f,
+                  "the tet scatter must scale each vertex by ITS barycentric weight: "
+                  "ratio %.5f vs expected %.5f", r21, e21);
+    const float r31 = gDelta[3].y / gDelta[1].y;
+    const float e31 = tetBary.w / tetBary.y;   // 0.1 / 0.2
+    PXG_CHECK_MSG(std::fabs(r31 - e31) < 1e-3f,
+                  "the tet scatter must scale vertex 3 by its weight: ratio %.5f vs %.5f",
+                  r31, e31);
+
+    // ---- ABSOLUTE magnitude, against the CPU reference -------------------------
+    // The constraint block the solve reads was produced by the prepare, which is itself
+    // bit-exact against refAttachPrepare, so recomputing the solve on the host closes the
+    // loop end to end.  This is the check that sees a dropped negation on deltaPos and a
+    // changed bias factor; the sign and ratio checks above see neither.
+    {
+        p82dref::AttachConstraintHost blk;
+        const auto cBytes = downloadBuffer<uint8_t>(dev, bConstraint.h, sizeof(blk));
+        std::memcpy(&blk, cBytes.data(), sizeof(blk));
+        const p82dref::V3 lv{ simVel[0].x, simVel[0].y, simVel[0].z };
+        // vertex 1 is touched by the TET attachment (slot 1) only, so its delta is
+        // deltaPos * (invMass * bary.y) with no second contribution to disentangle.
+        const p82dref::V3 dp = p82dref::refAttachSolvePGS(blk, 1, lv, dt);
+        const float scale = invMass * tetBary.y;
+        const float expectX = dp.x * scale, expectY = dp.y * scale;
+        PXG_CHECK_MSG(std::fabs(gDelta[1].x - expectX) < 1e-6f * PxMax(1.0f, std::fabs(expectX)) &&
+                      std::fabs(gDelta[1].y - expectY) < 1e-6f * PxMax(1.0f, std::fabs(expectY)),
+                      "vertex 1's delta must match the CPU solve reference: ref(%.8g, %.8g) "
+                      "got(%.8g, %.8g)", expectX, expectY, gDelta[1].x, gDelta[1].y);
+        PXG_CHECK_MSG(std::fabs(expectX) > 1e-4f,
+                      "the reference must produce a real displacement or the check has no "
+                      "teeth (%g)", expectX);
+    }
+
+    // ---- DIRECTION: mirror the anchor and the delta must flip sign -------------
+    // Movement and ratios alone cannot see the sign of `deltaPos = -impulse * dt`;
+    // mutation-tested, dropping the negation preserves both.  Running the same solve with
+    // the anchor mirrored through the origin makes the position error change sign, so every
+    // component of every vertex delta must change sign with it.
+    //
+    // All THREE components track the error's X component, not their own: CUDA's
+    // calculateAttachmentDeltaImpulsePGS passes constraint.raXn0_biasW three times, so the
+    // Y and Z position errors are never read.  That upstream quirk is reproduced here, and
+    // this check is where it becomes visible.
+    {
+        std::vector<F4> delta2(4, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
+        DevBuf bDelta2 = makeDev(dev, delta2);
+        PxgSoftBody sb2 = sb;
+        sb2.mSimDelta = reinterpret_cast<float4*>(size_t(bDelta2.addr));
+        std::vector<PxgSoftBody> descArr2 = { sb2 };
+        DevBuf bDesc2 = makeDev(dev, descArr2);
+
+        const F4 mirrored = { -localPose0.x, -localPose0.y, -localPose0.z, 0.0f };
+        std::vector<uint8_t> att2 = attBytes;
+        for (uint32_t i = 0; i < kN; ++i)
+            std::memcpy(att2.data() + size_t(i) * 96u + 32, &mirrored, 16);
+        DevBuf bAtt2 = makeDev(dev, att2);
+        std::vector<uint8_t> constraint2(sizeof(p82dref::AttachConstraintHost), 0);
+        DevBuf bConstraint2 = makeDev(dev, constraint2);
+
+        SbPrepAttachPush pp2 = pp;
+        pp2.softbodies = bDesc2.addr; pp2.rigidAttachments = bAtt2.addr;
+        pp2.constraints = bConstraint2.addr;
+        Kernel("softBodyRigidAttachBda.spv", "sb_rigidAttachmentPrepareLaunch", {}, sizeof(SbPrepAttachPush))
+            .dispatch(1u, {}, pp2, 1u, 1u);
+        dev->flush();
+        SbSolveAttachPush sp2 = sp;
+        sp2.softbodies = bDesc2.addr; sp2.attachments = bConstraint2.addr;
+        Kernel("softBodyRigidAttachBda.spv", "sb_solveRigidSoftAttachmentLaunch", {}, sizeof(SbSolveAttachPush))
+            .dispatch(1u, {}, sp2, 1u, 1u);
+        dev->flush();
+
+        const auto gD2 = downloadBuffer<F4>(dev, bDelta2.h, 4);
+        std::printf("  mirrored delta[1] = (%.6g, %.6g, %.6g)\n", gD2[1].x, gD2[1].y, gD2[1].z);
+        for (uint32_t v = 0; v < 4u; ++v)
+        {
+            PXG_CHECK_MSG(gDelta[v].x * gD2[v].x < 0.0f,
+                          "mirroring the anchor must FLIP the sign of vertex %u's delta.x "
+                          "(%g then %g) -- a solve that dropped the negation on deltaPos "
+                          "would keep both signs", v, gDelta[v].x, gD2[v].x);
+            PXG_CHECK_MSG(gDelta[v].y * gD2[v].y < 0.0f,
+                          "mirroring must flip vertex %u's delta.y (%g then %g)",
+                          v, gDelta[v].y, gD2[v].y);
+        }
+        dev->destroyBuffer(bDelta2.h); dev->destroyBuffer(bDesc2.h);
+        dev->destroyBuffer(bAtt2.h); dev->destroyBuffer(bConstraint2.h);
+    }
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bDelta.h);
+    dev->destroyBuffer(bTets.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bAtt.h);
+    dev->destroyBuffer(bActive.h); dev->destroyBuffer(bAttIds.h); dev->destroyBuffer(bConstraint.h);
     dev->destroyBuffer(bRigidDeltaVel.h); dev->destroyBuffer(bBody2World.h);
     dev->destroyBuffer(bSolverBodyData.h); dev->destroyBuffer(bSolverTxIData.h);
     dev->destroyBuffer(bSolverBodyIndices.h); dev->destroyBuffer(bOutSolverVel.h);
