@@ -551,38 +551,29 @@ PXG_TEST(npTetCollide_driver)
                   "overwritten it", g[0].upperBound);
 
     // (1) deep inside: GJK cannot answer, so the driver MUST enter EPA, and EPA reports the
-    // penetration depth.
-    //
-    // NOTE THE RESULT CODE.  EPA returns eCLOSE, not eOVERLAP, when it measured a real
-    // penetration -- `result = (lowerBound < 0) ? eCLOSE : eOVERLAP` (epa.cuh).  The caller
-    // treats BOTH as intersecting (`intersect = result == eOVERLAP || result == eCLOSE`,
-    // softbodyPrimitives.cu:561), so the code alone does not say whether EPA ran.  What says
-    // it is the NEGATIVE lower bound: GJK's lowerBound is a separation and is never negative,
-    // so only EPA can produce one.
-    //
-    // The value is checkable.  (0.2,0.2,0.2) inside the unit tet is 0.2/1 from each
-    // coordinate plane and (1 - 0.6)/sqrt(3) = 0.2309401 from the slant face, so the
-    // shallowest exit is through the SLANT face and the depth is that number.
-    PXG_CHECK_MSG(std::fabs(g[1].lowerBound + 0.2309401f) < 1e-5f,
-                  "EPA must report the penetration depth to the nearest face, -0.2309401 "
-                  "(the slant face), got %.7f -- a positive value means EPA never ran",
-                  g[1].lowerBound);
-    PXG_CHECK_MSG(g[1].upperBound == 0.0f,
-                  "and the overlap's upper bound is 0 (got %.7f)", g[1].upperBound);
+    // penetration depth.  (0.2,0.2,0.2) inside the unit tet is 0.2 from each of the three
+    // coordinate planes and 0.2309401 from the slant face, so the shallowest exit -- which is
+    // what EPA finds -- is 0.2, through one of the three tied coordinate planes.  Which one it
+    // picks is not specified, so the direction is only checked for being a unit axis.
+    PXG_CHECK_MSG(g[1].result == 2u /*GJK_OVERLAP*/,
+                  "a point inside the tet comes back OVERLAP: EPA's lowerBound is a positive "
+                  "penetration depth, and `result = (lowerBound < 0) ? eCLOSE : eOVERLAP` "
+                  "(epa.cuh) therefore says OVERLAP (got %u)", g[1].result);
+    PXG_CHECK_MSG(std::fabs(g[1].lowerBound - 0.2f) < 1e-5f &&
+                  std::fabs(g[1].upperBound - 0.2f) < 1e-5f,
+                  "and the depth is the shallowest exit, 0.2 (got lower %.7f upper %.7f)",
+                  g[1].lowerBound, g[1].upperBound);
     {
         const float dl = std::sqrt(g[1].direction[0] * g[1].direction[0] +
                                    g[1].direction[1] * g[1].direction[1] +
                                    g[1].direction[2] * g[1].direction[2]);
         PXG_CHECK_MSG(std::fabs(dl - 1.0f) < 1e-3f,
-                      "EPA's penetration direction must be a unit vector (|d| = %.6f) -- a "
-                      "driver that returned GJK's direction here would hand back whatever the "
-                      "overlap simplex left", dl);
-        // ...and it points along the slant face's normal, (-1,-1,-1)/sqrt(3).
-        PXG_CHECK_MSG(std::fabs(g[1].direction[0] + 0.5773503f) < 1e-4f &&
-                      std::fabs(g[1].direction[1] + 0.5773503f) < 1e-4f &&
-                      std::fabs(g[1].direction[2] + 0.5773503f) < 1e-4f,
-                      "and it is the slant face's normal (got %.5f %.5f %.5f)",
-                      g[1].direction[0], g[1].direction[1], g[1].direction[2]);
+                      "EPA's penetration direction must be a unit vector (|d| = %.6f)", dl);
+        float mx = 0.0f;
+        for (int c = 0; c < 3; ++c) mx = std::fmax(mx, std::fabs(g[1].direction[c]));
+        PXG_CHECK_MSG(std::fabs(mx - 1.0f) < 1e-4f,
+                      "and it is one of the three tied coordinate-plane normals, i.e. an AXIS "
+                      "(got %.5f %.5f %.5f)", g[1].direction[0], g[1].direction[1], g[1].direction[2]);
     }
 
     // (2) just outside, within the contact distance: GJK answers CLOSE with no anomaly, so

@@ -381,7 +381,9 @@ public uint epaRun(float input[32], uint size, float releps, GjkCloud a, GjkClou
         nondegenerate = replaceTriangle(S, L, nbVertices, (int)triIndex, e, liveTriangles, releps);
     }
 
-    EpaOut o;
+    // NOTE: no local declaration here.  `o` is the out parameter; a local of the same
+    // name would shadow it and leave the caller's result untouched -- which is exactly what
+    // the mechanical extraction produced, and what npEpa_driver caught.
     o.result = 0u; o.p0 = 0u; o.p1 = 0u; o.q0 = 0.0f; o.q1 = 0.0f;
     o.degenerate = nondegenerate ? 0u : 1u;
     o.lowerBound = lowerBound; o.upperBound = upperBound;
