@@ -1620,6 +1620,127 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.4 tranche b — the self-collision chain closes, and a null pointer that hid in it
+
+`sb_fem_contact_remap_to_simLaunch`, `sb_softbodyContactPrepareLaunch` and
+`sb_solveOutputSSDeltaVLaunch{,TGS}` are mapped, so the contacts tranche a's midphase
+produces are remapped to the simulation mesh, turned into constraints and solved. Manifest
+**MAPPED 236 -> 240**; softbody **26 -> 30 of 56**.
+
+| kernel | ABI row | blob |
+|---|---|---|
+| `sb_fem_contact_remap_to_simLaunch` | `{8,8,8,8,8,8,4}` | 56 B |
+| `sb_softbodyContactPrepareLaunch` | `{8,8,8,8,8,8,8,8,8,4}` | 80 B |
+| `sb_solveOutputSSDeltaVLaunch{,TGS}` | `{8,8,8,8,4,4,8,8}` | 56 B |
+
+The remap joins its sibling in `softBodyContactRemapBda` because it shares every helper and
+both llvmpipe workarounds; it adds a second y-grid (which half of the pair gets remapped),
+an `isValidTet` gate and a `hasTet` branch that neutralises a contact with no valid
+candidate. The prepare and solve are a new file: the symmetric twins of the
+rigid-vs-softbody pair from P8.2 tranche d/e, where the same impulse goes into both delta
+buffers with opposite signs and each side scales it by its own inverse masses.
+
+### The remap's grid had to be decided, not transcribed
+
+This kernel is launched from THREE call sites with THREE block shapes — (8192, 4) for
+softbody-vs-softbody, (1024, 16) for self-collision and for cloth-vs-softbody. CUDA copes
+because its stride is `gridDim.x * blockDim.y` and blockDim travels with the launch; the
+bridge drops blockDim, so one SPIR-V entry point cannot carry three strides. Getting it
+wrong is not a slowdown: the remap is **not idempotent** — a second visit reads an
+already-remapped SIM index as though it were a collision index. So the port pins one grid
+and refuses the groups above it. Coverage stays exact for every call site; only the
+8192-block case loses parallelism it cannot use here.
+
+### Mutation: 37 of 37
+
+Four mutants needed the fixture sharpened before they died, and each gap is worth naming
+because none was visible by inspection:
+
+- `mSimVelocity_InvMass` and `mSimPosition_InvMass` carry the same inverse mass in the real
+  engine, so a fixture whose two `.w` columns agree cannot tell that CUDA's PGS path takes
+  its inverse masses from the **velocity** read. The columns now differ;
+- `updateTetraPosDelta`'s `|bary| > 1e-6` gate needs a contact that actually weighs a corner
+  at zero — a contact on a tet FACE;
+- `deltaF`'s clamp at `-appliedForce.x` needs a **separating** contact with an existing
+  force, or it never bites;
+- `gtid.x & 31` and `workIndex & 31` are provably the same value here (every term of
+  workIndex is either the thread index or a multiple of `blockDim.x` = 256). The
+  CUDA-literal form is kept and the equivalence documented, so that mutant is expected to
+  survive rather than left unnoticed.
+
+### The bug 37 green mutants could not see
+
+The first live self-collision scene SIGSEGVed inside the tranche-a midphase on frame one.
+Root cause: **`mFilteringPairs` is NULL whenever the body has no filter pairs**.
+`PxgSimulationCore` only assigns it inside its dirty-filter branch
+(PxgSimulationCore.cpp:1446), so a body that never registered a filter arrives with a null
+pointer and `mNumFilterPairs == 0` — the common case.
+
+`findFilter`'s binary search is zero-trip for an empty list, which is exactly why this read
+as safe. It is not, on llvmpipe: the first iteration's load is speculated, faults at address
+0, and the value substituted **differs between lanes**. `findFilter` then stops being
+warp-uniform, the caller's `continue` stops being group-uniform, and the workgroup barrier
+after it is reached by only part of the group. That is why the crash moved with the
+groupshared layout — `STACK_SIZE` 192 and 193 behaved differently — and vanished under
+`PXG_SYNC_EACH`: the fault is a **barrier divergence, not a bad store**.
+
+Four plausible hypotheses died on that ambiguity first (a stack overflow, a bad
+`maxContacts`, the stress read, the write bound), each "confirmed" by a probe that merely
+perturbed scheduling. What ended it was refusing to probe further and printing the
+descriptor from the engine side: every other pointer was valid and `mFilteringPairs` was
+`(nil)`. **The lesson is the method, not the pointer**: in this port a probe that changes
+code shape is not evidence, and the cheapest real measurement beats the fourth clever guess.
+
+The fix is the shape `softBodyContactRemapBda` already spells out for `prevContactCount`:
+SELECT THE POINTER, NOT THE LOADED VALUE. A guard cannot work — the branch is already there
+and gets if-converted — so the faulting ADDRESS is removed, substituting a base that is
+never null and forcing the loop bound to 0 so the result stays what CUDA computes for an
+empty list. The fixture had always passed a valid pairs buffer; it now dispatches the same
+case with `mFilteringPairs` zeroed and requires the two filtered vertices to come back.
+
+### PXG_SCENE=softbodyselfcollide
+
+The scene that drives the chain end to end, and the one that found the null pointer. A
+bracket — a cell grid with the middle carved out, leaving a bottom slab on a static plane, a
+top slab cantilevered over it, and a connector column making it one body. The two slabs are
+six cells apart along the tet graph at the free end, so their contact is a genuine self
+collision rather than an adjacency the rest-pose gate would drop.
+
+| run | top slab min y | rest \|dy\| |
+|---|---|---|
+| self-collision **ON** | 0.7500 -> **0.2133** | 0.003299 |
+| self-collision **OFF** (`PXG_SB_NOSELF=1`) | 0.7500 -> **0.0000** | 0.000000 |
+
+The bottom slab's surface is at y = 0.25 and the caught slab settles slightly below it —
+not a failure to catch, but a soft body compressing under its own weight with the contact
+resolved at a rest offset, the same reason `clothdrape` settles ON the contact rest distance
+rather than exactly on the plane. The bar is 0.15, far from both numbers. The control half
+is what makes the ON half mean anything: a bracket that simply never sagged that far would
+pass the ON assertion on its own.
+
+`PXG_SCENE=softbody` keeps `eDISABLE_SELF_COLLISION` set and its recorded free-fall numbers
+unchanged.
+
+### Verification
+
+| gate | result |
+|---|---|
+| target ctest (`gpuslang.softBodySim`) | pass, 45 fixtures |
+| mutation, forced-fresh `.spv` | 37 killed of 37 (tranche b) + the null-pairs mutant |
+| full suite, default memory mode | **674 / 674**, 198 s |
+| full suite, `PXG_DEVICE_V2=1` | **674 / 674**, 246 s |
+| rigid regression, 8 scenes x 2 solvers | **16 / 16** |
+| `PXG_SCENE=cloth` / `clothhang` / `clothdrape` | unchanged |
+| `PXG_SCENE=clothselfcollide` | catches at min y = 5.0999 |
+| `PXG_SCENE=softbody` / `particle` | unchanged |
+| `PXG_SCENE=softbodyselfcollide` | catches at min y = 0.2133, settles |
+| ...with `PXG_SB_NOSELF=1` | falls to 0.0000 |
+
+**A note on the mutation harness**: it restores the pristine shader but does NOT rebuild, so
+the last mutant's `.spv` stays on disk. One full-suite run was spent chasing a `softBodySim`
+SEGFAULT that was simply the previous mutant still installed. Delete the `.spv` and rebuild
+at the end of every sweep, the same forced-fresh rule the sweep itself uses.
+
 ## P8.4 tranche a — the softbody SELF-collision midphase
 
 `sb_selfCollisionMidphaseGeneratePairsLaunch` is mapped. One warp per SURFACE vertex walks
@@ -1700,10 +1821,12 @@ simulation mesh and never solved. That is a safe intermediate state (an unmapped
 no-op, so the contacts are simply ignored) and it is why no scene moves, but a softbody still
 passes through itself until that chain lands.
 
-No sdktest scene reaches this kernel yet either: `nbActiveSelfCollisionSoftbodies` counts
-bodies that have self-collision switched on, and `PXG_SCENE=softbody` does not. The cloth
-port's answer was `PXG_SCENE=clothselfcollide`; the softbody analogue is worth building, but
-only once the chain below can act on what the midphase produces.
+No sdktest scene reached this kernel at the time of writing: `PXG_SCENE=softbody` sets
+`eDISABLE_SELF_COLLISION`, so the midphase was never dispatched. Tranche b builds the
+missing scene (`PXG_SCENE=softbodyselfcollide`), and the first frame of it found a NULL
+`mFilteringPairs` that took the engine down — see that section. The mutation score below is
+therefore 18 of 20 against the fixtures **as they stood**, and one more mutant exists that
+none of them could reach.
 
 ### Verification
 
