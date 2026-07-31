@@ -201,12 +201,34 @@ bool u64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
 
 bool findFilter(uint64_t pairsAddr, uint nbPairs, uint id0, uint id1)
 {
+    // *** mFilteringPairs IS NULL WHEN THE BODY HAS NO FILTER PAIRS. ***
+    // PxgSimulationCore only assigns it inside the dirty-filter branch
+    // (PxgSimulationCore.cpp:1446), so a body that never registered a filter reaches this
+    // kernel with a null pointer and nbPairs == 0 -- which is the common case, and the case
+    // the first live self-collision scene hit immediately.
+    //
+    // A zero-trip `while (l < r)` is NOT enough on llvmpipe.  It speculates the first
+    // iteration's load, faults at address 0, and the garbage it substitutes DIFFERS BETWEEN
+    // LANES -- so `findFilter` stops being warp-uniform, the caller's `continue` stops being
+    // group-uniform, and the workgroup barrier after it is reached by only part of the
+    // group.  That is why the symptom was a SIGSEGV whose location moved with the
+    // groupshared layout (STACK_SIZE 192 vs 193 changed it) and vanished under
+    // PXG_SYNC_EACH: the fault is a barrier divergence, not a bad store.
+    //
+    // The fix is the one softBodyContactRemapBda spells out for prevContactCount: SELECT
+    // THE POINTER, NOT THE LOADED VALUE.  Guarding with `if` cannot work -- the branch is
+    // already there and llvmpipe if-converts it -- so the faulting ADDRESS has to go.
+    // gSc.softbodies is dereferenced unconditionally by every invocation of this kernel, so
+    // it is never null and a speculated 16-byte read at its offset 0 is harmless; forcing
+    // `r` to 0 keeps the RESULT exactly what CUDA computes for an empty list.
+    const bool havePairs = (pairsAddr != 0UL) && (nbPairs != 0u);
+    const uint64_t base = havePairs ? pairsAddr : gSc.softbodies;
     const uint2 q0 = uint2(id0, 0u);
-    uint l = 0u, r = nbPairs;
+    uint l = 0u, r = havePairs ? nbPairs : 0u;
     while (l < r)
     {
         const uint mid = (l + r) / 2u;
-        const uint64_t pAddr = pairsAddr + uint64_t(mid) * NRPAIR_STRIDE;
+        const uint64_t pAddr = base + uint64_t(mid) * NRPAIR_STRIDE;
         const uint2 pIndex0 = uint2(Ptr<uint>(pAddr)[0], Ptr<uint>(pAddr + 4UL)[0]);
         const uint pIndex1 = Ptr<uint>(pAddr + 8UL)[0];
         const uint pIndex2 = Ptr<uint>(pAddr + 12UL)[0];

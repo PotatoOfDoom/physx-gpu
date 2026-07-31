@@ -5614,6 +5614,53 @@ PXG_TEST(softBodySimSelfCollisionMidphase)
         dev->destroyBuffer(bInfo2.h); dev->destroyBuffer(bCount2.h);
     }
 
+    // ---- mFilteringPairs == NULL, which is the COMMON case -------------------
+    // PxgSimulationCore only assigns mFilteringPairs inside its dirty-filter branch
+    // (PxgSimulationCore.cpp:1446), so a body that never registered a filter reaches this
+    // kernel with a NULL pointer and nbPairs == 0.  That is what the first live
+    // self-collision scene hit, and it took the whole engine down: llvmpipe speculates the
+    // zero-trip binary search's first load, faults at address 0, and substitutes garbage
+    // that DIFFERS BETWEEN LANES -- so findFilter stops being uniform, the caller's
+    // `continue` stops being group-uniform, and the workgroup barrier after it is reached
+    // by only part of the group.  The symptom was a SIGSEGV that moved with the groupshared
+    // layout and vanished under PXG_SYNC_EACH, which is why it read as anything but a null
+    // pointer for a long time.
+    //
+    // The original fixture always passed a valid pairs buffer, so it could not see this.
+    // It does now: the same dispatch with mFilteringPairs zeroed must produce the same
+    // three contacts as above, since an empty filter list filters nothing.
+    {
+        std::vector<PxgSoftBody> noFilterDesc = descArr;
+        for (PxgSoftBody& d : noFilterDesc)
+        {
+            d.mFilteringPairs = nullptr;
+            d.mNumFilterPairs = 0u;
+        }
+        DevBuf bNoFilt = makeDev(dev, noFilterDesc);
+        std::vector<uint32_t> info4(MAXC * 4u, POISON);
+        DevBuf bInfo4 = makeDev(dev, info4);
+        std::vector<uint32_t> c4 = { 0u };
+        DevBuf bCount4 = makeDev(dev, c4);
+        SbSelfPush p4 = push;
+        p4.softbodies = bNoFilt.addr;
+        p4.outContactInfo = bInfo4.addr;
+        p4.totalContactCount = bCount4.addr;
+        Kernel("softBodySelfCollisionBda.spv", "sb_selfCollisionMidphaseGeneratePairsLaunch",
+               {}, sizeof(SbSelfPush))
+            .dispatch(1024u, {}, p4, uint32_t(active.size()), 1u);
+        dev->flush();
+        const uint32_t n4 = downloadBuffer<uint32_t>(dev, bCount4.h, 1)[0];
+
+        // q4 and q5 were dropped ONLY by the filters, so with no filter list they survive:
+        // the four contacts above become six.  An empty list must filter nothing -- not
+        // everything, and not something lane-dependent.
+        PXG_CHECK_MSG(n4 == 6u,
+                      "with mFilteringPairs = NULL the two filtered vertices (q4, q5) must come "
+                      "back, giving 6 contacts, got %u.  A null pairs pointer must be READ AS "
+                      "an empty list, not faulted on and not silently made lane-dependent", n4);
+        dev->destroyBuffer(bNoFilt.h); dev->destroyBuffer(bInfo4.h); dev->destroyBuffer(bCount4.h);
+    }
+
     // ---- every active body disabled -> no contacts at all -------------------
     {
         std::vector<uint32_t> onlyDisabled = { 1u, 2u };
