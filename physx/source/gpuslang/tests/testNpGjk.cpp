@@ -456,4 +456,155 @@ PXG_TEST(npGjk_driver)
     for (PxgBufferHandle h : { bVA, bVB, bIn, bOut }) dev->destroyBuffer(h);
 }
 
+// ===========================================================================
+// P8.6 — tetPrimitivesCollide2 (pxgSlangTetCollide), the GJK-then-EPA driver.
+//
+// ctGjk and ctEpa pin the arithmetic underneath this; what is left to pin is the driver's
+// POLICY, and it is checked by OUTCOME CLASS rather than against a CPU reference: porting
+// GJK+EPA to C++ a second time to check a thirty-line router would be the very duplication
+// the extraction just removed.  The three cases below have unambiguous answers by
+// construction -- a point far outside a tetrahedron, one deep inside it, and one just
+// outside within the contact distance -- so the routing is observable without one.
+struct TcIn  { float searchDir[4]; float spheres[4]; uint32_t counts[4]; };
+struct TcOut
+{
+    uint32_t result, degenerate, size, pad;
+    float lowerBound, upperBound, innerSphere, pad2;
+    float direction[4], closestPointA[4], closestPointB[4], tetCenter[4];
+};
+
+PXG_TEST(npTetCollide_driver)
+{
+    const uint32_t MAXV = 64u;
+    const uint32_t N = 3u;
+    std::vector<float> VA(N * MAXV * 4, 0.0f), VB(N * MAXV * 4, 0.0f);
+    std::vector<TcIn> in(N);
+    std::memset(in.data(), 0, in.size() * sizeof(TcIn));
+
+    // The tetrahedron is the unit tet at the origin in every case; only the rigid POINT
+    // moves.  Shape A is a single vertex, which is what a sphere reduces to (its radius is
+    // folded into the contact distance by the caller, exactly as sbPrimitiveCollision does).
+    const float tet[4][3] = { {0,0,0}, {1,0,0}, {0,1,0}, {0,0,1} };
+    const float pts[N][3] = {
+        { 10.0f, 10.0f, 10.0f },   // 0: far outside            -> DISTANT, EPA never runs
+        {  0.2f,  0.2f,  0.2f },   // 1: deep inside            -> OVERLAP via EPA
+        { -0.05f, 0.25f, 0.25f },  // 2: just outside the x face -> CLOSE, EPA never runs
+    };
+    const float cDist[N] = { 0.5f, 0.5f, 0.5f };
+    for (uint32_t t = 0; t < N; ++t)
+    {
+        const uint32_t vb = t * MAXV * 4;
+        for (int c = 0; c < 3; ++c) VA[vb + c] = pts[t][c];
+        for (int v = 0; v < 4; ++v) for (int c = 0; c < 3; ++c) VB[vb + v * 4 + c] = tet[v][c];
+        in[t].counts[0] = 1u; in[t].counts[1] = 4u;
+        in[t].searchDir[0] = pts[t][0]; in[t].searchDir[1] = pts[t][1]; in[t].searchDir[2] = pts[t][2];
+        in[t].searchDir[3] = cDist[t];
+        in[t].spheres[0] = 0.0f;          // a point has no inner sphere
+        in[t].spheres[1] = 0.14433756f;   // the unit tet's, checked below
+    }
+
+    PxgSlangComputeDevice* dev = testDevice();
+    PxgBufferHandle bVA = createBufferFrom(dev, VA);
+    PxgBufferHandle bVB = createBufferFrom(dev, VB);
+    PxgBufferHandle bIn = createBufferFrom(dev, in);
+    std::vector<TcOut> outInit(N);
+    std::memset(outInit.data(), 0xEE, outInit.size() * sizeof(TcOut));
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+
+    struct TcParams { uint32_t numTests, p0, p1, p2; } prm = { N, 0, 0, 0 };
+    Kernel k("npTetCollide.spv", "ctTetCollide",
+             { 16, 16, (uint32_t)sizeof(TcIn), (uint32_t)sizeof(TcOut) }, sizeof(TcParams));
+    k.dispatch(1u, { bVA, bVB, bIn, bOut }, prm);
+    dev->flush();
+
+    const auto g = downloadBuffer<TcOut>(dev, bOut, N);
+    for (uint32_t t = 0; t < N; ++t)
+        std::printf("  case %u: result=%u degenerate=%u lower=%.6f upper=%.6f dir=(%.4f %.4f %.4f) "
+                    "innerSphere=%.7f center=(%.4f %.4f %.4f)\n",
+                    t, g[t].result, g[t].degenerate, g[t].lowerBound, g[t].upperBound,
+                    g[t].direction[0], g[t].direction[1], g[t].direction[2],
+                    g[t].innerSphere, g[t].tetCenter[0], g[t].tetCenter[1], g[t].tetCenter[2]);
+
+    // computeInnerSphere: the CENTROID (0.25, 0.25, 0.25) and the smallest distance from it
+    // to the four faces.  Three coordinate planes are 0.25 away; the slant plane
+    // x + y + z = 1 is (1 - 0.75)/sqrt(3) = 0.1443376 away, so THAT is the answer.  An
+    // incentre formula -- which is what "inner sphere" suggests and what a re-derivation
+    // produces -- gives a different number, and this one feeds EPA's epsilon.
+    for (uint32_t t = 0; t < N; ++t)
+    {
+        PXG_CHECK_MSG(std::fabs(g[t].innerSphere - 0.14433756f) < 1e-6f,
+                      "case %u: the unit tet's inner sphere is the centroid's distance to the "
+                      "SLANT face, 0.1443376, got %.7f", t, g[t].innerSphere);
+        PXG_CHECK(std::fabs(g[t].tetCenter[0] - 0.25f) < 1e-6f &&
+                  std::fabs(g[t].tetCenter[1] - 0.25f) < 1e-6f &&
+                  std::fabs(g[t].tetCenter[2] - 0.25f) < 1e-6f);
+    }
+
+    // (0) far outside: GJK alone answers DISTANT and the driver returns immediately.  EPA
+    // must not have run -- if it had, it would have written a direction and witness points.
+    PXG_CHECK_MSG(g[0].result == 0u /*GJK_DISTANT*/,
+                  "a point 17 units from the tet with a 0.5 contact distance is DISTANT "
+                  "(got result %u)", g[0].result);
+    PXG_CHECK_MSG(g[0].upperBound > 1.0e30f,
+                  "and EPA must NOT have run: the upper bound is still GJK's FLT_MAX initial "
+                  "value (got %g).  A driver that fell through to EPA on DISTANT would have "
+                  "overwritten it", g[0].upperBound);
+
+    // (1) deep inside: GJK cannot answer, so the driver MUST enter EPA, and EPA reports the
+    // penetration depth.
+    //
+    // NOTE THE RESULT CODE.  EPA returns eCLOSE, not eOVERLAP, when it measured a real
+    // penetration -- `result = (lowerBound < 0) ? eCLOSE : eOVERLAP` (epa.cuh).  The caller
+    // treats BOTH as intersecting (`intersect = result == eOVERLAP || result == eCLOSE`,
+    // softbodyPrimitives.cu:561), so the code alone does not say whether EPA ran.  What says
+    // it is the NEGATIVE lower bound: GJK's lowerBound is a separation and is never negative,
+    // so only EPA can produce one.
+    //
+    // The value is checkable.  (0.2,0.2,0.2) inside the unit tet is 0.2/1 from each
+    // coordinate plane and (1 - 0.6)/sqrt(3) = 0.2309401 from the slant face, so the
+    // shallowest exit is through the SLANT face and the depth is that number.
+    PXG_CHECK_MSG(std::fabs(g[1].lowerBound + 0.2309401f) < 1e-5f,
+                  "EPA must report the penetration depth to the nearest face, -0.2309401 "
+                  "(the slant face), got %.7f -- a positive value means EPA never ran",
+                  g[1].lowerBound);
+    PXG_CHECK_MSG(g[1].upperBound == 0.0f,
+                  "and the overlap's upper bound is 0 (got %.7f)", g[1].upperBound);
+    {
+        const float dl = std::sqrt(g[1].direction[0] * g[1].direction[0] +
+                                   g[1].direction[1] * g[1].direction[1] +
+                                   g[1].direction[2] * g[1].direction[2]);
+        PXG_CHECK_MSG(std::fabs(dl - 1.0f) < 1e-3f,
+                      "EPA's penetration direction must be a unit vector (|d| = %.6f) -- a "
+                      "driver that returned GJK's direction here would hand back whatever the "
+                      "overlap simplex left", dl);
+        // ...and it points along the slant face's normal, (-1,-1,-1)/sqrt(3).
+        PXG_CHECK_MSG(std::fabs(g[1].direction[0] + 0.5773503f) < 1e-4f &&
+                      std::fabs(g[1].direction[1] + 0.5773503f) < 1e-4f &&
+                      std::fabs(g[1].direction[2] + 0.5773503f) < 1e-4f,
+                      "and it is the slant face's normal (got %.5f %.5f %.5f)",
+                      g[1].direction[0], g[1].direction[1], g[1].direction[2]);
+    }
+
+    // (2) just outside, within the contact distance: GJK answers CLOSE with no anomaly, so
+    // the driver returns WITHOUT entering EPA and the witness points are GJK's.  Those
+    // satisfy closestPointB = closestPointA + upperBound * direction, which EPA's do not.
+    PXG_CHECK_MSG(g[2].result == 1u /*GJK_CLOSE*/,
+                  "a point 0.05 outside the x face with a 0.5 contact distance is CLOSE "
+                  "(got %u)", g[2].result);
+    {
+        float mx = 0.0f;
+        for (int c = 0; c < 3; ++c)
+            mx = std::fmax(mx, std::fabs(g[2].closestPointB[c] -
+                                         (g[2].closestPointA[c] + g[2].upperBound * g[2].direction[c])));
+        PXG_CHECK_MSG(mx < 1e-5f,
+                      "a CLOSE result's witness points come from GJK, so B = A + upperBound * dir "
+                      "(max deviation %.8f).  Entering EPA on a clean CLOSE would break this",
+                      mx);
+        PXG_CHECK_MSG(std::fabs(g[2].upperBound - 0.05f) < 1e-4f,
+                      "and the separation is the 0.05 gap to the x face (got %.6f)", g[2].upperBound);
+    }
+
+    for (PxgBufferHandle h : { bVA, bVB, bIn, bOut }) dev->destroyBuffer(h);
+}
+
 } // namespace

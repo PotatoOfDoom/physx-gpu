@@ -39,9 +39,17 @@ import pxgSlangGjk;   // GjkCloud, GJK_MAX_CLOUD, and the GJK_* result enum
 
 public struct EpaOut
 {
-    uint result; uint degenerate; uint p0, p1;
-    float lowerBound; float upperBound; float q0, q1;
-    float4 direction; float4 closestPointA; float4 closestPointB;
+    public uint result;
+    public uint degenerate;
+    public uint p0;
+    public uint p1;
+    public float lowerBound;
+    public float upperBound;
+    public float q0;
+    public float q1;
+    public float4 direction;
+    public float4 closestPointA;
+    public float4 closestPointB;
 }
 
 
@@ -68,8 +76,6 @@ public struct EpaOut
 // is bit-for-bit reproducible against the CPU reference.
 
 static const uint EPA_MAX_VERTS = 18u;
-static const uint GJK_CLOSE = 1u;
-static const uint GJK_OVERLAP = 2u;
 static const float EPA_MAX_F32 = 3.4028234663852886e38f;
 
 

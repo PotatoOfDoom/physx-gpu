@@ -56,9 +56,18 @@ public struct GjkCloud
 
 public struct GjkOut
 {
-    uint ret; uint degenerate; uint size; uint pad;
-    float lowerBound; float upperBound; float p1; float p2;
-    float4 direction; float4 closestPointA; float4 closestPointB; float4 closestPointDir;
+    public uint ret;
+    public uint degenerate;
+    public uint size;
+    public uint pad;
+    public float lowerBound;
+    public float upperBound;
+    public float p1;
+    public float p2;
+    public float4 direction;
+    public float4 closestPointA;
+    public float4 closestPointB;
+    public float4 closestPointDir;
 }
 
 
@@ -85,9 +94,9 @@ static const uint DEGENERATE = 0xffffu;
 static const float PX_MAX_F32 = 3.4028234663852886e38f;
 
 // GjkResult::Enum
-static const uint GJK_DISTANT = 0u;
-static const uint GJK_CLOSE   = 1u;
-static const uint GJK_OVERLAP = 2u;
+public static const uint GJK_DISTANT = 0u;
+public static const uint GJK_CLOSE   = 1u;
+public static const uint GJK_OVERLAP = 2u;
 
 
 
@@ -348,9 +357,12 @@ uint supportIdxB(float3 dir, GjkCloud b)
 
 
 // The driver.  Returns through `o`; the return value is o.ret (GJK_DISTANT/CLOSE/OVERLAP).
+// `cachedSimplex` is CUDA's GjkCachedData: the final simplex, which EPA starts from.  The
+// leaf test never looked at it, so npGjk.slang never produced it; tetPrimitivesCollide2 must.
 public uint gjkRun(GjkCloud a, GjkCloud b, float3 initialUnitDir, float minSep,
-                   float convergenceRatio, out GjkOut o)
+                   float convergenceRatio, out GjkOut o, out float cachedSimplex[32])
 {
+    for (uint ci = 0u; ci < 32u; ++ci) cachedSimplex[ci] = 0.0f;
 
 
     // ---- cold-start init (cacheMask = 0) ----
@@ -480,6 +492,7 @@ public uint gjkRun(GjkCloud a, GjkCloud b, float3 initialUnitDir, float minSep,
 
     // ---- output stage ----
     o.pad = 0u;
+    for (uint ci = 0u; ci < 32u; ++ci) cachedSimplex[ci] = simplexV[ci];
     o.degenerate = degenerate ? 1u : 0u;
     o.lowerBound = lowerBound;
     o.upperBound = upperBound;

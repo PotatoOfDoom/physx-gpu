@@ -205,6 +205,11 @@ pxg_compile_shader(npGjk ctGjk)
 pxg_compile_shader(npEpaStart4 ctEpaStart4)
 pxg_compile_shader(npEpaStart123 ctEpaStart123)
 pxg_compile_shader(npEpa ctEpa)
+# P8.6: the GJK-then-EPA driver (tetPrimitivesCollide2) that sits on top of both, plus
+# computeInnerSphere.  Its leaf test pins the driver's POLICY -- which result
+# short-circuits, when EPA is entered, and the degenerate re-run -- while ctGjk and ctEpa
+# pin the arithmetic underneath it.
+pxg_compile_shader(npTetCollide ctTetCollide)
 pxg_compile_shader(npGjkWarm ctGjkWarm)
 pxg_compile_shader(npCvxCvxEE cvxCvxGenEE)
 pxg_compile_shader(npCvxRayPoly cvxRayPoly)

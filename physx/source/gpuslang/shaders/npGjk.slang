@@ -68,6 +68,7 @@ void ctGjk(uint3 dtid : SV_DispatchThreadID)
     }
 
     GjkOut o;
-    gjkRun(a, b, e.initialDir.xyz, e.params.x, e.params.y, o);
+    float cachedSimplex[32];
+    gjkRun(a, b, e.initialDir.xyz, e.params.x, e.params.y, o, cachedSimplex);
     gOut[t] = o;
 }
