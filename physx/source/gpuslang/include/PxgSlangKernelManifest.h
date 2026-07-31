@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 232;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 235;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -292,12 +292,12 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_heightfieldContactGenLaunch", nullptr, nullptr },  // SB_HF_CG (unmapped)
     { "sb_selfCollisionMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_SELFCOLLISION_MIDPHASE (unmapped)
     { "sb_reorderPSContactsLaunch", "softBodyContactRemapBda.spv", "sb_reorderPSContactsLaunch" },  // SB_REORDER_PS_CONTACTS (P8.2 tranche c BDA lift)
-    { "sb_rigidAttachmentPrepareLaunch", nullptr, nullptr },  // SB_RIGID_ATTACHMENT_CONSTRAINT_PREP (unmapped)
+    { "sb_rigidAttachmentPrepareLaunch", "softBodyRigidAttachBda.spv", "sb_rigidAttachmentPrepareLaunch" },  // SB_RIGID_ATTACHMENT_CONSTRAINT_PREP (P8.3 attachment port)
     { "sb_rigidContactPrepareLaunch", "softBodyRigidContactBda.spv", "sb_rigidContactPrepareLaunch" },  // SB_RS_CONTACTPREPARE (P8.2 tranche d BDA port; chain kernel 5)
     { "sb_softbodyContactPrepareLaunch", nullptr, nullptr },  // SB_SS_CONTACTPREPARE (unmapped)
     { "sb_clothContactPrepareLaunch", nullptr, nullptr },  // SB_SC_CONTACTPREPARE (unmapped)
     { "sb_particleContactPrepareLaunch", nullptr, nullptr },  // SB_SP_CONTACTPREPARE (unmapped)
-    { "sb_solveRigidSoftAttachmentLaunch", nullptr, nullptr },  // SB_SOLVE_RIGID_SOFT_ATTACHMENT (unmapped)
+    { "sb_solveRigidSoftAttachmentLaunch", "softBodyRigidAttachBda.spv", "sb_solveRigidSoftAttachmentLaunch" },  // SB_SOLVE_RIGID_SOFT_ATTACHMENT (P8.3 attachment port)
     { "sb_solveOutputSoftBodyAttachmentDeltaVLaunch", nullptr, nullptr },  // SB_SOLVE_SOFTBODY_ATTACHMENT_DELTA (unmapped)
     { "sb_solveOutputClothAttachmentDeltaVLaunch", nullptr, nullptr },  // SB_SOLVE_CLOTH_ATTACHMENT_DELTA (unmapped)
     { "sb_solveOutputParticleAttachmentDeltaVLaunch", nullptr, nullptr },  // SB_SOLVE_PARTICLE_ATTACHMENT_DELTA (unmapped)
@@ -319,7 +319,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_other_contact_remap_to_simLaunch", "softBodyContactRemapBda.spv", "sb_other_contact_remap_to_simLaunch" },  // SB_OTHER_CONTACT_REMAP_TO_SIM (P8.2 tranche c BDA port; the llvmpipe fault was the speculated null prevContactCount load, see the shader)
     { "sb_fem_contact_remap_to_simLaunch", nullptr, nullptr },  // SB_FEM_CONTACT_REMAP_TO_SIM (unmapped)
     { "sb_gm_stepSoftbodyLaunch", "softBodySimBda.spv", "sb_gm_stepSoftbodyLaunch" },  // SB_GM_STEPSOFTBODY (P8.0 tranche 3 BDA port)
-    { "sb_solveRigidSoftAttachmentLaunchTGS", nullptr, nullptr },  // SB_SOLVE_RIGID_SOFT_ATTACHMENT_TGS (unmapped)
+    { "sb_solveRigidSoftAttachmentLaunchTGS", "softBodyRigidAttachBda.spv", "sb_solveRigidSoftAttachmentLaunchTGS" },  // SB_SOLVE_RIGID_SOFT_ATTACHMENT_TGS (P8.3 attachment port)
     { "sb_queryRigidSoftContactReferenceCountLaunchTGS", "softBodyRigidContactBda.spv", "sb_queryRigidSoftContactReferenceCountLaunchTGS" },  // SB_QUERY_RIGID_SOFT_REFERENCE_COUNT_TGS (P8.2 tranche e BDA port; chain kernels 6 and 7)
     { "sb_solveRigidSoftCollisionLaunchTGS", "softBodyRigidContactBda.spv", "sb_solveRigidSoftCollisionLaunchTGS" },  // SB_SOLVE_RIGID_SOFT_COLLISION_TGS (P8.2 tranche e BDA port; chain kernels 6 and 7)
     { "sb_solveOutputSSDeltaVLaunchTGS", nullptr, nullptr },  // SB_SOLVE_SOFT_SOFT_BOTH_DELTA_TGS (unmapped)

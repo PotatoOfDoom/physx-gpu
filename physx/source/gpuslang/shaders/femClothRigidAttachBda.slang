@@ -98,6 +98,9 @@ import pxgSlangFEMClothDesc;   // PxgFEMClothGpu
 import pxgSlangPrepDesc;       // PxgPrePrepDescGpu, PxgConstraintPrepareDescGpu
 import pxgSlangSolverDesc;     // PxgSolverCoreDescGpu, PxgSolverSharedDescPGSGpu, PxgSolverSharedDescTGSGpu
 import pxgSlangCommon;         // PxgSolverBodyData, PxgSolverTxIData, PxgAlignedTransform
+import pxgSlangFemRigidAttach; // the PxgFEMRigidAttachmentConstraint / PxgFEMRigidAttachment
+                               // byte layouts and the quat/normalize helpers, shared with
+                               // the softbody attachment path (see that module's header)
 
 // PxgSoftBodyKernelBlockDim/GridDim::SB_UPDATEROTATION (PxgSoftBodyCoreKernelIndices.h).
 static const uint RA_BLOCK = 256u;
@@ -110,62 +113,6 @@ static const float FEMCLOTH_BIAS_COEFFICIENT = 0.7f;
 // (PxgSimulationCoreDesc.h:41) — the cloth-id / element-index packing.
 static const uint PXG_CLOTH_ELEMENT_MASK = 0x000fffffu;
 static const uint PXG_CLOTH_ID_SHIFT = 20u;
-
-// ---------------------------------------------------------------------------
-// Byte layout of the block-of-32 PxgFEMRigidAttachmentConstraint
-// (PxgFEMCore.h:191).  32 constraints per block (SoA), indexed [offset].
-// ---------------------------------------------------------------------------
-static const uint RAC_baryOrType      = 0u;      // float4[32]
-static const uint RAC_raXn0_biasW     = 512u;    // float4[32]
-static const uint RAC_raXn1_biasW     = 1024u;   // float4[32]
-static const uint RAC_raXn2_biasW     = 1536u;   // float4[32]
-static const uint RAC_velMult_invMass = 2048u;   // float4[32]
-static const uint RAC_low_high_limits = 2560u;   // float4[32]
-static const uint RAC_axis_angle      = 3072u;   // float4[32]
-static const uint RAC_elemId          = 3584u;   // PxU32[32]
-static const uint RAC_rigidId         = 3712u;   // PxU64[32]
-static const uint RAC_STRIDE          = 3968u;
-
-// Byte layout of PxgFEMRigidAttachment (PxgSimulationCoreDesc.h:208, extends
-// PxgRigidFilterPair @0).  96 bytes.
-static const uint RA_index0     = 0u;    // PxU64  (rigid node index)
-static const uint RA_index1     = 8u;    // PxU64  (elemId in low 32 bits)
-static const uint RA_localPose0 = 32u;   // float4 (anchor local pose = ra4)
-static const uint RA_lowHigh    = 48u;   // float4 (coneLimitParams.low_high_limits)
-static const uint RA_axisAngle  = 64u;   // float4 (coneLimitParams.axis_angle)
-static const uint RA_baryOrType1 = 80u;  // float4
-static const uint RA_STRIDE_ATT = 96u;
-
-// PxGetIsVertexType (PxgSimulationCoreDesc.h:145): all four components exactly 0.
-bool clothIsVertexType(float4 baryOrType)
-{
-    return baryOrType.x == 0.0f && baryOrType.y == 0.0f && baryOrType.z == 0.0f && baryOrType.w == 0.0f;
-}
-
-// PxQuat::rotate (PxQuat.h:286).
-float3 quatRotateVec(float4 q, float3 v)
-{
-    const float vx = 2.0f * v.x;
-    const float vy = 2.0f * v.y;
-    const float vz = 2.0f * v.z;
-    const float w2 = q.w * q.w - 0.5f;
-    const float dot2 = (q.x * vx + q.y * vy + q.z * vz);
-    return float3(vx * w2 + (q.y * vz - q.z * vy) * q.w + q.x * dot2,
-                  vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * dot2,
-                  vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * dot2);
-}
-
-// PxVec3::getNormalized (PxVec3.h:286) with recipSqrt = 1.0/sqrt (unix intrinsic).
-float3 vecGetNormalized(float3 v)
-{
-    const float m = v.x * v.x + v.y * v.y + v.z * v.z;
-    if (m > 0.0f)
-    {
-        const float rs = 1.0f / sqrt(m);
-        return float3(v.x * rs, v.y * rs, v.z * rs);
-    }
-    return float3(0.0f, 0.0f, 0.0f);
-}
 
 float3 crossVec(float3 a, float3 b)
 {
@@ -294,7 +241,7 @@ void cloth_rigidAttachmentPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, 
         const uint elemId = uint(attIndex1);
         const uint clothId = elemId >> PXG_CLOTH_ID_SHIFT;
         const uint elemIdx = elemId & PXG_CLOTH_ELEMENT_MASK;
-        const bool elemIsVertex = clothIsVertexType(baryOrType1);
+        const bool elemIsVertex = femIsVertexType(baryOrType1);
 
         Ptr<float4> pos_invMass = Ptr<float4>(clothes[clothId].mPosition_InvMass);
 

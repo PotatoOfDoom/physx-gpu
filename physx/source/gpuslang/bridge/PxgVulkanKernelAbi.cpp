@@ -300,6 +300,16 @@ static const uint8_t kClothRigidAttachPrep[] = { 8, 8, 8, 8, 4, 8, 8, 8, 8, 8 };
 //   device pointers + PxReal (@56) + device pointer -> natural-alignment blob = 72
 //   bytes.
 static const uint8_t kClothRigidAttachSolve[] = { 8, 8, 4, 8, 8, 8, 8, 4, 8 };
+// gpusimulationcontroller softbody-vs-rigid ATTACHMENT (P8.3).  The CUDA argument packs are
+// position-for-position and type-for-type identical to the two cloth rows above apart from
+// argument 0's pointee type (PxgSoftBody vs PxgFEMCloth), 8 bytes either way, so the blobs
+// are the same 80 / 72 bytes.  Kept as their own rows rather than aliased, so a future
+// divergence in either signature cannot silently corrupt the other's blob.
+//   sb_rigidAttachmentPrepareLaunch  -- launch site PxgSoftBodyCore.cpp:2056.
+static const uint8_t kSbRigidAttachPrep[] = { 8, 8, 8, 8, 4, 8, 8, 8, 8, 8 };
+//   sb_solveRigidSoftAttachmentLaunch{,TGS}  -- launch site PxgSoftBodyCore.cpp:1810
+//   (both PGS and TGS share the pack).
+static const uint8_t kSbRigidAttachSolve[] = { 8, 8, 4, 8, 8, 8, 8, 4, 8 };
 
 // gpusimulationcontroller FEMCloth.cu apply-external-deltas (P7.1 tranche 3c):
 //   cloth_applyExternalDeltasLaunch(PxgFEMCloth* femClothes, const PxU32*
@@ -865,6 +875,9 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_rigidAttachmentPrepareLaunch", kClothRigidAttachPrep, uint32_t(sizeof(kClothRigidAttachPrep)) },
     { "cloth_solveRigidClothAttachmentLaunch", kClothRigidAttachSolve, uint32_t(sizeof(kClothRigidAttachSolve)) },
     { "cloth_solveRigidClothAttachmentTGSLaunch", kClothRigidAttachSolve, uint32_t(sizeof(kClothRigidAttachSolve)) },
+    { "sb_rigidAttachmentPrepareLaunch", kSbRigidAttachPrep, uint32_t(sizeof(kSbRigidAttachPrep)) },
+    { "sb_solveRigidSoftAttachmentLaunch", kSbRigidAttachSolve, uint32_t(sizeof(kSbRigidAttachSolve)) },
+    { "sb_solveRigidSoftAttachmentLaunchTGS", kSbRigidAttachSolve, uint32_t(sizeof(kSbRigidAttachSolve)) },
     { "cloth_applyExternalDeltasLaunch", kClothApplyExtDeltas, uint32_t(sizeof(kClothApplyExtDeltas)) },
     // gpunarrowphase FEMCloth-vs-primitive contact GENERATION (P7.1 tranche 4a BDA)
     { "cloth_midphaseGenerateVertexPairsLaunch", kClothMidphaseVertPairs, uint32_t(sizeof(kClothMidphaseVertPairs)) },
