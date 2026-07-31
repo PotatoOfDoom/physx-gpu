@@ -290,7 +290,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_meshContactGenLaunch", nullptr, nullptr },  // SB_MESH_CG (unmapped)
     { "sb_heightfieldMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_HF_MIDPHASE (unmapped)
     { "sb_heightfieldContactGenLaunch", nullptr, nullptr },  // SB_HF_CG (unmapped)
-    { "sb_selfCollisionMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_SELFCOLLISION_MIDPHASE (unmapped)
+    { "sb_selfCollisionMidphaseGeneratePairsLaunch", "softBodySelfCollisionBda.spv", "sb_selfCollisionMidphaseGeneratePairsLaunch" },  // SB_SELFCOLLISION_MIDPHASE (P8.4 tranche a BDA port)
     { "sb_reorderPSContactsLaunch", "softBodyContactRemapBda.spv", "sb_reorderPSContactsLaunch" },  // SB_REORDER_PS_CONTACTS (P8.2 tranche c BDA lift)
     { "sb_rigidAttachmentPrepareLaunch", "softBodyRigidAttachBda.spv", "sb_rigidAttachmentPrepareLaunch" },  // SB_RIGID_ATTACHMENT_CONSTRAINT_PREP (P8.3 attachment port)
     { "sb_rigidContactPrepareLaunch", "softBodyRigidContactBda.spv", "sb_rigidContactPrepareLaunch" },  // SB_RS_CONTACTPREPARE (P8.2 tranche d BDA port; chain kernel 5)

@@ -525,6 +525,17 @@ static const uint8_t kSbContactRemapToSim[] = { 8, 4, 8, 8, 8, 8, 8 };
 //   PxgSoftBodyCore.cpp:698 -> 80-byte blob.
 static const uint8_t kSbReorderPsContacts[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
 
+// gpunarrowphase softbodySoftbodyMidPhase.cu (P8.4 tranche a — the softbody SELF-collision
+// midphase):
+//   sb_selfCollisionMidphaseGeneratePairsLaunch(const PxU32* activeSoftbodies,
+//     const PxReal* contactDistance, const PxgSoftBody* softbodies,
+//     PxgSoftBodyContactWriter writer)  -- launch site PxgSoftBodyCore.cpp:411.  The writer
+//   is passed BY VALUE; sizeof(PxgSoftBodyContactWriter) = 56 (six device pointers + PxU32
+//   maxContacts + 4 tail pad), so paramAlign gives it 8-byte alignment and it lands at @24
+//   -> 80-byte blob.  The launch is 2D in the GRID (x = SB_SBMIDPHASE = 1024,
+//   y = nbActiveSelfCollisionSoftbodies); the bridge forwards both.
+static const uint8_t kSbSelfCollisionMidphase[] = { 8, 8, 8, 56 };
+
 // gpusimulationcontroller softbody-vs-rigid CONSTRAINT PREPARE (P8.2 tranche d):
 //   sb_rigidContactPrepareLaunch(PxgSoftBody* softbodies, float4* contacts_restW,
 //     float4* normalPens, float4* barycentrics, PxgFemOtherContactInfo* contactInfos,
@@ -932,6 +943,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_queryRigidSoftContactReferenceCountLaunchTGS", kSbRigidContactQuery, uint32_t(sizeof(kSbRigidContactQuery)) },
     { "sb_solveRigidSoftCollisionLaunch", kSbRigidContactSolve, uint32_t(sizeof(kSbRigidContactSolve)) },
     { "sb_solveRigidSoftCollisionLaunchTGS", kSbRigidContactSolve, uint32_t(sizeof(kSbRigidContactSolve)) },
+    // gpunarrowphase softbody SELF-collision midphase (P8.4 tranche a)
+    { "sb_selfCollisionMidphaseGeneratePairsLaunch", kSbSelfCollisionMidphase, uint32_t(sizeof(kSbSelfCollisionMidphase)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },

@@ -5238,4 +5238,408 @@ PXG_TEST(softBodySimRigidAttachSolve)
     dev->destroyBuffer(bSharedDesc.h);
 }
 
+// ===========================================================================
+// P8.4 tranche a -- sb_selfCollisionMidphaseGeneratePairsLaunch.
+//
+// WHAT THIS FIXTURE IS FOR.  The traverser ARITHMETIC (closestPtTetrahedron,
+// isPointOutsideOfPlane4, the inside/outside contact decision) is already covered
+// bit-exactly by the npSbSelf / ctSbSelfQuery fixtures, which is where it was ported.
+// This one covers everything the BDA lift ADDS: the 2D grid and the activeSoftbodies
+// indirection, the hard-coded grid stride, the two body-flag early-outs, every gate the
+// driver applies per query vertex, the cross-lane argmin, and the inlined
+// PxgSoftBodyContactWriter.  Geometry is therefore compared to 1e-6; the counts, the
+// encoded pair ids and the drop/keep decisions are compared EXACTLY, and they are what
+// the mutation sweep aims at.
+// ===========================================================================
+struct SbSelfPush
+{
+    uint64_t activeSoftbodies, contactDistance, softbodies;
+    uint64_t outPoint, outNormalPen, outBary0, outBary1, outContactInfo, totalContactCount;
+    uint32_t maxContacts, pad76;
+};
+static_assert(sizeof(SbSelfPush) == 80, "self-collision midphase blob must be 80 bytes");
+
+PXG_TEST(softBodySimSelfCollisionMidphase)
+{
+    using namespace p80refit;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // ---- the tetrahedron mesh ------------------------------------------------
+    // Ten unit tets, each owning its own four corners, spread 10 units apart so a query
+    // vertex can only ever reach its OWN target: every drop below is attributable to the
+    // gate it is aimed at, never to a neighbour stealing the contact.  A unit tet at
+    // origin o has corners o, o+x, o+y, o+z; a query at o + (0.12, 0.15, 0.05) is inside
+    // it and closest to the z-face, so closestP = o + (0.12, 0.15, 0) and the penetration
+    // is -0.05.
+    std::vector<F4> verts;
+    std::vector<TetIdx4> tets;
+    std::vector<uint8_t> tetHint, vertHint;
+    std::vector<float> stress;
+
+    auto addTet = [&](float ox, float oy, float oz, bool degenerate, uint8_t hint, float st) {
+        const uint32_t b = uint32_t(verts.size());
+        verts.push_back(F4{ ox,        oy,        oz,        1.0f });
+        verts.push_back(F4{ ox + 1.0f, oy,        oz,        1.0f });
+        verts.push_back(F4{ ox,        oy + 1.0f, oz,        1.0f });
+        verts.push_back(degenerate ? F4{ ox, oy, oz, 1.0f } : F4{ ox, oy, oz + 1.0f, 1.0f });
+        for (int i = 0; i < 4; ++i) vertHint.push_back(0u);
+        tets.push_back(TetIdx4{ b, b + 1u, b + 2u, b + 3u });
+        tetHint.push_back(hint);
+        stress.push_back(st);
+        return uint32_t(tets.size() - 1u);
+    };
+
+    // ORDER MATTERS: the shallow tet is primitive 0 and therefore LANE 0 of the shared
+    // leaf, the deep one is lane 1.  Put the deep one first and "lane 0 always wins" --
+    // i.e. no argmin at all -- produces the right answer by accident.
+    const uint32_t T_SHALLOW = addTet( 0.0f, 0.0f, 0.02f, false, 0xfu, 0.0f);  // ...not here
+    const uint32_t T_DEEP    = addTet( 0.0f, 0.0f, 0.00f, false, 0xfu, 0.0f);  // q1 wins here
+    const uint32_t T_DEGEN   = addTet( 2.0f, 0.0f, 0.00f, true,  0xfu, 0.0f);  // isValidTet
+    const uint32_t T_STRESS  = addTet(10.0f, 0.0f, 0.00f, false, 0xfu, 5.0f);  // stress gate
+    const uint32_t T_SHARED  = addTet(20.0f, 0.0f, 0.00f, false, 0xfu, 0.0f);  // shared vertex
+    const uint32_t T_FILTPR  = addTet(30.0f, 0.0f, 0.00f, false, 0xfu, 0.0f);  // pair filter
+    const uint32_t T_FILTWC  = addTet(40.0f, 0.0f, 0.00f, false, 0xfu, 0.0f);  // wildcard filter
+    const uint32_t T_REST    = addTet(50.0f, 0.0f, 0.00f, false, 0xfu, 0.0f);  // rest-pose gate
+    const uint32_t T_NOSURF  = addTet(60.0f, 0.0f, 0.00f, false, 0x0u, 0.0f);  // tet hint == 0
+    const uint32_t T_GOOD    = addTet(70.0f, 0.0f, 0.00f, false, 0xfu, 0.0f);  // q9 + q10
+    const uint32_t NB_TETS = uint32_t(tets.size());
+    (void)T_SHALLOW; (void)T_STRESS; (void)T_FILTWC; (void)T_REST; (void)T_NOSURF;
+
+    // The corner of T_SHARED that is ALSO a query vertex.
+    const uint32_t qShared = tets[T_SHARED].x;
+    vertHint[qShared] = 1u;
+
+    auto addQuery = [&](float x, float y, float z, uint8_t hint) {
+        const uint32_t i = uint32_t(verts.size());
+        verts.push_back(F4{ x, y, z, 1.0f });
+        vertHint.push_back(hint);
+        return i;
+    };
+    const uint32_t q1  = addQuery( 0.12f, 0.15f, 0.05f, 1u);   // KEPT   (T_DEEP beats T_SHALLOW)
+    const uint32_t q2  = addQuery( 2.12f, 0.15f, 0.05f, 1u);   // dropped: T_DEGEN is invalid
+    const uint32_t q3  = addQuery( 0.15f, 0.12f, 0.06f, 0u);   // dropped: not a surface VERTEX
+    const uint32_t q4  = addQuery(30.12f, 0.15f, 0.05f, 1u);   // dropped: per-pair filter
+    const uint32_t q5  = addQuery(40.12f, 0.15f, 0.05f, 1u);   // dropped: wildcard filter
+    const uint32_t q6  = addQuery(50.12f, 0.15f, 0.05f, 1u);   // dropped: penetrating at REST
+    const uint32_t q7  = addQuery(10.12f, 0.15f, 0.05f, 1u);   // dropped: tet stress too high
+    const uint32_t q8  = addQuery(60.12f, 0.15f, 0.05f, 1u);   // dropped: tet hint == 0
+    const uint32_t q9  = addQuery(70.12f, 0.15f, 0.05f, 1u);   // KEPT   (inside T_GOOD)
+    // OUTSIDE T_GOOD's x-face by 0.07 -- inside the DOUBLED contact distance (0.1) and
+    // outside the raw one (0.05).  This is the only tooth on `contactDistance * 2`.
+    const uint32_t q10 = addQuery(69.93f, 0.30f, 0.30f, 1u);   // KEPT   (outside branch)
+    // Just outside T_GOOD's a-b EDGE.  The closest point is ON the edge, so the winning
+    // FACE normal (0,0,-1) and the normalised separation (0,-0.217,-0.976) genuinely
+    // differ -- which is the only way to see the `dot(normal, v) > 0.707 -> normal = v`
+    // replacement at all.  q10's separation happens to be parallel to its face normal, so
+    // it cannot see it; that gap let the mutant through until this vertex was added.
+    const uint32_t q11 = addQuery(70.50f, -0.02f, -0.09f, 1u);  // KEPT (edge, normal swap)
+    (void)q2; (void)q3; (void)q7; (void)q8;
+
+    // Rest pose: corners keep their world position; every QUERY vertex is moved 5 units
+    // clear of its target so the rest gate passes -- except q6, whose rest position IS its
+    // world position, i.e. it was already penetrating at rest and must be dropped.
+    std::vector<F4> rest = verts;
+    const uint32_t movedAtRest[] = { q1, q2, q3, q4, q5, q7, q8, q9, q10, q11, qShared };
+    for (uint32_t v : movedAtRest) rest[v].y -= 5.0f;
+
+    // T_DEGEN needs a NON-degenerate REST pose, and that is not cosmetic.  A flat tet makes
+    // every one of isPointOutsideOfPlane4's four plane products identically zero, so the
+    // predicate returns true for ANY point -- including in the rest pose, where it then
+    // reads as "was already penetrating at rest" and drops the contact.  With the rest tet
+    // flat too, the rest gate silently does isValidTet's job and a port that dropped
+    // isValidTet still passes.  isValidTet is checked on the WORLD tet only, so giving the
+    // REST tet real volume separates the two gates and leaves the mutant nowhere to hide.
+    rest[tets[T_DEGEN].w] = F4{ 2.0f, 0.0f, 1.0f, 1.0f };
+
+    // mSurfaceVertsHint / mTetMeshSurfaceHint are PxU8 arrays; pack them into words so the
+    // shader's byte extraction is exercised at all four offsets.
+    auto packBytes = [](const std::vector<uint8_t>& b) {
+        std::vector<uint32_t> w((b.size() + 3u) / 4u + 1u, 0u);
+        for (size_t i = 0; i < b.size(); ++i) w[i / 4u] |= uint32_t(b[i]) << (8u * (i % 4u));
+        return w;
+    };
+    const std::vector<uint32_t> vertHintWords = packBytes(vertHint);
+    const std::vector<uint32_t> tetHintWords = packBytes(tetHint);
+
+    // vertToSurfaceTetRemap: a distinctive value per vertex so pairInd0 cannot pass by
+    // accidentally matching the vertex index or the tet index.
+    std::vector<uint32_t> vertToSurfaceTet(verts.size());
+    for (size_t i = 0; i < vertToSurfaceTet.size(); ++i) vertToSurfaceTet[i] = 100u + uint32_t(i);
+
+    // ---- the BV32 tree -------------------------------------------------------
+    // Child 0 is a leaf holding BOTH T_DEEP and T_SHALLOW, so those two land in DIFFERENT
+    // lanes of the same warp: the deeper one can only win through the cross-lane argmin.
+    // The remaining tets get one leaf each.
+    const uint32_t nbChildren = 1u + (NB_TETS - 2u);
+    const uint32_t nbNodes = 1u, maxDepth = 1u;
+    TreeBlob tree;
+    tree.w.assign(4u + nbNodes * BV32_WORDS + maxDepth * 2u + nbNodes + 4u, 0u);
+    tree.w[0] = uint32_t(verts.size());
+    tree.w[1] = NB_TETS;
+    tree.w[2] = maxDepth;
+    tree.w[3] = nbNodes;
+    const uint32_t nw = tree.nodeWord(0);
+    tree.w[nw + W_NBNODES] = nbChildren;
+    for (uint32_t k = 0; k < nbChildren; ++k)
+    {
+        // GENEROUS child bounds: every child is visited, so the node-level cull can never
+        // stand in for a per-primitive gate.
+        const float lo = -1000.0f, hi = 1000.0f;
+        for (uint32_t c = 0; c < 3u; ++c)
+        {
+            tree.w[nw + W_MMIN + k * 4 + c] = f2u(lo);
+            tree.w[nw + W_MMAX + k * 4 + c] = f2u(hi);
+        }
+        tree.w[nw + W_MDATA + k] = (k == 0u) ? leafWord(/*start*/ 0u, /*nbPrims*/ 2u)
+                                             : leafWord(/*start*/ k + 1u, /*nbPrims*/ 1u);
+    }
+
+    // ---- filter pairs (sorted by index0, then index1) ------------------------
+    const uint32_t SB_ID = 3u;   // NOT zero: the encode shift has to actually shift
+    auto enc = [](uint32_t id, uint32_t elem) { return (id << 20) | elem; };
+    struct PairNRHost { uint64_t index0; uint32_t index1, index2; };
+    std::vector<PairNRHost> filters = {
+        { enc(SB_ID, q4), enc(SB_ID, T_FILTPR), 0u },      // q4 vs its own target only
+        { enc(SB_ID, q5), enc(SB_ID, 0xfffffu), 0u },      // q5 against the whole body
+    };
+    PXG_CHECK(filters[0].index0 < filters[1].index0);      // the binary search needs order
+
+    DevBuf bTree = makeDev(dev, tree.w);
+    DevBuf bVerts = makeDev(dev, verts);
+    DevBuf bRest = makeDev(dev, rest);
+    DevBuf bTets = makeDev(dev, tets);
+    DevBuf bVertHint = makeDev(dev, vertHintWords);
+    DevBuf bTetHint = makeDev(dev, tetHintWords);
+    DevBuf bStress = makeDev(dev, stress);
+    DevBuf bRemap = makeDev(dev, vertToSurfaceTet);
+    DevBuf bFilters = makeDev(dev, filters);
+    if (!bTree.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    // ---- four descriptors; only index 3 may produce contacts -----------------
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mTetMeshData = reinterpret_cast<void*>(size_t(bTree.addr));
+    sb.mTetMeshSurfaceHint = reinterpret_cast<PxU8*>(size_t(bTetHint.addr));
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bVerts.addr));
+    sb.mRestPosition = reinterpret_cast<float4*>(size_t(bRest.addr));
+    sb.mTetraStressCoefficient = reinterpret_cast<PxReal*>(size_t(bStress.addr));
+    sb.mSurfaceVertsHint = reinterpret_cast<PxU8*>(size_t(bVertHint.addr));
+    sb.mSurfaceVertToTetRemap = reinterpret_cast<PxU32*>(size_t(bRemap.addr));
+    sb.mFilteringPairs = reinterpret_cast<decltype(sb.mFilteringPairs)>(size_t(bFilters.addr));
+    sb.mNumFilterPairs = uint32_t(filters.size());
+    sb.mNumTets = NB_TETS;
+    sb.mNumVerts = uint32_t(verts.size());
+    sb.mElementIndex = 1u;                       // contactDistance is indexed by THIS
+    sb.mSelfCollisionFilterDistance = 0.2f;      // squared -> 0.04, the rest-pose floor
+    sb.mSelfCollisionStressTolerance = 1.0f;     // T_STRESS carries 5.0
+    sb.mBodyFlags = 0u;
+
+    std::vector<PxgSoftBody> descArr(4u, makeZeroDesc());
+    descArr[3] = sb;                                                    // the live one
+    descArr[1] = sb; descArr[1].mBodyFlags = PxDeformableBodyFlags(PxDeformableBodyFlag::eDISABLE_SELF_COLLISION);
+    descArr[2] = sb; descArr[2].mBodyFlags = PxDeformableBodyFlags(PxDeformableBodyFlag::eKINEMATIC);
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // activeSoftbodies is DELIBERATELY not the identity: cmIdx 1 -> softbody 3.  A shader
+    // that used gid.x, or skipped the indirection, would land on a disabled body.
+    std::vector<uint32_t> active = { 2u, SB_ID, 1u };
+    DevBuf bActive = makeDev(dev, active);
+
+    // contactDistance[mElementIndex] = 0.05, DOUBLED by the kernel to 0.1.
+    std::vector<float> contactDist = { 999.0f, 0.05f };
+    DevBuf bCd = makeDev(dev, contactDist);
+
+    const uint32_t MAXC = 16u;
+    const uint32_t POISON = 0xCDCDCDCDu;
+    std::vector<F4> zeroF4(MAXC, F4{ 0, 0, 0, 0 });
+    std::vector<uint32_t> poison(MAXC * 4u, POISON);
+    DevBuf bPoint = makeDev(dev, zeroF4);
+    DevBuf bNormalPen = makeDev(dev, zeroF4);
+    DevBuf bBary0 = makeDev(dev, zeroF4);
+    DevBuf bBary1 = makeDev(dev, zeroF4);
+    DevBuf bInfo = makeDev(dev, poison);
+    std::vector<uint32_t> zeroCount = { 0u };
+    DevBuf bCount = makeDev(dev, zeroCount);
+
+    SbSelfPush push = {};
+    push.activeSoftbodies = bActive.addr;
+    push.contactDistance = bCd.addr;
+    push.softbodies = bDesc.addr;
+    push.outPoint = bPoint.addr;
+    push.outNormalPen = bNormalPen.addr;
+    push.outBary0 = bBary0.addr;
+    push.outBary1 = bBary1.addr;
+    push.outContactInfo = bInfo.addr;
+    push.totalContactCount = bCount.addr;
+    push.maxContacts = MAXC;
+
+    Kernel k("softBodySelfCollisionBda.spv", "sb_selfCollisionMidphaseGeneratePairsLaunch",
+             {}, sizeof(SbSelfPush));
+    // THE ENGINE'S GRID, reproduced exactly: x = SB_SBMIDPHASE = 1024 (fixed, independent
+    // of the vertex count), y = the number of active self-collision softbodies.  With the
+    // CUDA stride (blockDim.y * gridDim.x = 2048) every vertex is visited EXACTLY ONCE; a
+    // stride derived from the dispatch size instead would visit most of them 1024 times
+    // and the contact count below would explode.
+    k.dispatch(/*gridX*/ 1024u, {}, push, /*gridY*/ uint32_t(active.size()), 1u);
+    dev->flush();
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+    const auto gPoint = downloadBuffer<F4>(dev, bPoint.h, MAXC);
+    const auto gNormalPen = downloadBuffer<F4>(dev, bNormalPen.h, MAXC);
+    const auto gBary0 = downloadBuffer<F4>(dev, bBary0.h, MAXC);
+    const auto gBary1 = downloadBuffer<F4>(dev, bBary1.h, MAXC);
+    const auto gInfo = downloadBuffer<uint32_t>(dev, bInfo.h, MAXC * 4u);
+
+    for (uint32_t i = 0; i < gCount && i < MAXC; ++i)
+        std::printf("  contact %u: p=(%.5f %.5f %.5f) n=(%.5f %.5f %.5f) pen=%.6f "
+                    "bary0=(%.5f %.5f %.5f) ind0=%u ind1=%u\n",
+                    i, gPoint[i].x, gPoint[i].y, gPoint[i].z, gNormalPen[i].x, gNormalPen[i].y,
+                    gNormalPen[i].z, gNormalPen[i].w, gBary0[i].x, gBary0[i].y, gBary0[i].z,
+                    gInfo[i * 4u + 0u], gInfo[i * 4u + 2u]);
+
+    PXG_CHECK_MSG(gCount == 4u,
+                  "exactly four query vertices survive every gate (q1, q9, q10, q11) -- got "
+                  "%u.  0 means the body-flag early-out or the activeSoftbodies indirection "
+                  "is wrong; more than 4 means a gate was dropped or a vertex was visited "
+                  "more than once", gCount);
+
+    // ---- match each emitted contact to the query it must have come from ------
+    auto near6 = [](float a, float b) { return std::fabs(a - b) <= 1e-6f; };
+    bool sawQ1 = false, sawQ9 = false, sawQ10 = false, sawQ11 = false;
+    for (uint32_t i = 0; i < gCount; ++i)
+    {
+        const uint32_t ind0 = gInfo[i * 4u + 0u];
+        const uint32_t ind0hi = gInfo[i * 4u + 1u];
+        const uint32_t ind1 = gInfo[i * 4u + 2u];
+        PXG_CHECK_MSG(ind0hi == 0u,
+                      "pairInd0 is a PxU64 field taking a PxU32 value: the high word must be "
+                      "ZEROED, not left poisoned (contact %u has 0x%08x)", i, ind0hi);
+
+        if (ind0 == enc(SB_ID, vertToSurfaceTet[q1]))
+        {
+            sawQ1 = true;
+            PXG_CHECK_MSG(ind1 == enc(SB_ID, T_DEEP),
+                          "q1 penetrates T_DEEP by 0.05 and T_SHALLOW by 0.03; the cross-lane "
+                          "argmin must pick the DEEPER one (got tet %u, want %u)",
+                          ind1 & 0xfffffu, T_DEEP);
+            PXG_CHECK(near6(gNormalPen[i].w, -0.05f));
+            PXG_CHECK(near6(gNormalPen[i].x, 0.0f) && near6(gNormalPen[i].y, 0.0f) &&
+                      near6(gNormalPen[i].z, -1.0f));
+            PXG_CHECK(near6(gPoint[i].x, 0.12f) && near6(gPoint[i].y, 0.15f) && near6(gPoint[i].z, 0.0f));
+            // barycentric0 carries the QUERY POINT and barycentric1 the closest point --
+            // that is what the CUDA writer stores, and the sim-mesh remap depends on it.
+            PXG_CHECK_MSG(near6(gBary0[i].x, 0.12f) && near6(gBary0[i].y, 0.15f) &&
+                          near6(gBary0[i].z, 0.05f),
+                          "barycentric0 must be the query POINT, got (%.5f %.5f %.5f)",
+                          gBary0[i].x, gBary0[i].y, gBary0[i].z);
+            PXG_CHECK(near6(gBary1[i].x, gPoint[i].x) && near6(gBary1[i].z, gPoint[i].z));
+        }
+        else if (ind0 == enc(SB_ID, vertToSurfaceTet[q9]))
+        {
+            sawQ9 = true;
+            PXG_CHECK(ind1 == enc(SB_ID, T_GOOD));
+            PXG_CHECK(near6(gNormalPen[i].w, -0.05f));
+        }
+        else if (ind0 == enc(SB_ID, vertToSurfaceTet[q10]))
+        {
+            sawQ10 = true;
+            PXG_CHECK(ind1 == enc(SB_ID, T_GOOD));
+            // The OUTSIDE branch: a positive separation, and the normal replaced by the
+            // normalised separation vector because their dot exceeds 0.707.
+            PXG_CHECK_MSG(near6(gNormalPen[i].w, 0.07f),
+                          "q10 sits 0.07 OUTSIDE T_GOOD's x-face; the outside branch reports "
+                          "a positive distance (got %.6f)", gNormalPen[i].w);
+            PXG_CHECK(near6(gNormalPen[i].x, -1.0f));
+        }
+        else if (ind0 == enc(SB_ID, vertToSurfaceTet[q11]))
+        {
+            sawQ11 = true;
+            PXG_CHECK(ind1 == enc(SB_ID, T_GOOD));
+            PXG_CHECK_MSG(near6(gNormalPen[i].w, 0.09219544f),
+                          "q11's separation is |(0, -0.02, -0.09)| (got %.8f)", gNormalPen[i].w);
+            PXG_CHECK_MSG(near6(gNormalPen[i].y, -0.21693045f) &&
+                          near6(gNormalPen[i].z, -0.97618705f),
+                          "the winning FACE normal is (0,0,-1); because it agrees with the "
+                          "normalised separation to better than 0.707 the contact normal must "
+                          "become the SEPARATION, got (%.6f %.6f %.6f)",
+                          gNormalPen[i].x, gNormalPen[i].y, gNormalPen[i].z);
+        }
+        else
+        {
+            PXG_CHECK_MSG(false, "contact %u came from an unexpected vertex (pairInd0 = 0x%08x, "
+                                 "surface tet %u)", i, ind0, ind0 & 0xfffffu);
+        }
+    }
+    PXG_CHECK_MSG(sawQ1, "q1 must produce a contact -- it is inside T_DEEP");
+    PXG_CHECK_MSG(sawQ9, "q9 must produce a contact -- it is inside T_GOOD");
+    PXG_CHECK_MSG(sawQ10,
+                  "q10 must produce a contact: it is 0.07 outside T_GOOD, which is inside "
+                  "the DOUBLED contact distance (0.05 * 2) and outside the raw one.  This is "
+                  "the only check that sees the `* 2.f`");
+    PXG_CHECK_MSG(sawQ11, "q11 must produce a contact -- it is 0.092 outside T_GOOD's edge");
+
+    // Slots past the count keep their poison -- nothing writes past the reported total.
+    for (uint32_t i = gCount; i < MAXC; ++i)
+        PXG_CHECK_MSG(gInfo[i * 4u + 0u] == POISON,
+                      "contact info slot %u was written past the contact count", i);
+
+    // ---- maxContacts: the counter keeps counting, the writes are DROPPED -----
+    // PxgSoftBodyContactWriter::writeContact reserves the index with the atomic FIRST and
+    // only then checks `index >= maxContacts`, so an undersized buffer must still report
+    // the true total.  checkBufferOverflows() reads exactly that to size the next frame.
+    {
+        std::vector<uint32_t> info2(MAXC * 4u, POISON);
+        DevBuf bInfo2 = makeDev(dev, info2);
+        std::vector<uint32_t> c2 = { 0u };
+        DevBuf bCount2 = makeDev(dev, c2);
+        SbSelfPush p2 = push;
+        p2.outContactInfo = bInfo2.addr;
+        p2.totalContactCount = bCount2.addr;
+        p2.maxContacts = 1u;
+        Kernel k2("softBodySelfCollisionBda.spv", "sb_selfCollisionMidphaseGeneratePairsLaunch",
+                  {}, sizeof(SbSelfPush));
+        k2.dispatch(1024u, {}, p2, uint32_t(active.size()), 1u);
+        dev->flush();
+        const uint32_t n2 = downloadBuffer<uint32_t>(dev, bCount2.h, 1)[0];
+        const auto i2 = downloadBuffer<uint32_t>(dev, bInfo2.h, MAXC * 4u);
+        PXG_CHECK_MSG(n2 == 4u, "the contact COUNT must be the true total even when the "
+                                "buffer overflows (got %u, expected 4)", n2);
+        uint32_t written = 0u;
+        for (uint32_t i = 0; i < MAXC; ++i)
+            if (i2[i * 4u + 0u] != POISON) ++written;
+        PXG_CHECK_MSG(written == 1u,
+                      "with maxContacts = 1 exactly one contact may be STORED (got %u) -- a "
+                      "port that dropped the bound writes into memory it does not own",
+                      written);
+        dev->destroyBuffer(bInfo2.h); dev->destroyBuffer(bCount2.h);
+    }
+
+    // ---- every active body disabled -> no contacts at all -------------------
+    {
+        std::vector<uint32_t> onlyDisabled = { 1u, 2u };
+        DevBuf bActive2 = makeDev(dev, onlyDisabled);
+        std::vector<uint32_t> c3 = { 0u };
+        DevBuf bCount3 = makeDev(dev, c3);
+        SbSelfPush p3 = push;
+        p3.activeSoftbodies = bActive2.addr;
+        p3.totalContactCount = bCount3.addr;
+        Kernel k3("softBodySelfCollisionBda.spv", "sb_selfCollisionMidphaseGeneratePairsLaunch",
+                  {}, sizeof(SbSelfPush));
+        k3.dispatch(1024u, {}, p3, 2u, 1u);
+        dev->flush();
+        const uint32_t n3 = downloadBuffer<uint32_t>(dev, bCount3.h, 1)[0];
+        PXG_CHECK_MSG(n3 == 0u,
+                      "eDISABLE_SELF_COLLISION and eKINEMATIC each suppress the whole body "
+                      "(got %u contacts from two bodies that carry one flag each)", n3);
+        dev->destroyBuffer(bActive2.h); dev->destroyBuffer(bCount3.h);
+    }
+
+    dev->destroyBuffer(bTree.h); dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bRest.h);
+    dev->destroyBuffer(bTets.h); dev->destroyBuffer(bVertHint.h); dev->destroyBuffer(bTetHint.h);
+    dev->destroyBuffer(bStress.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h); dev->destroyBuffer(bCd.h);
+    dev->destroyBuffer(bPoint.h); dev->destroyBuffer(bNormalPen.h); dev->destroyBuffer(bBary0.h);
+    dev->destroyBuffer(bBary1.h); dev->destroyBuffer(bInfo.h); dev->destroyBuffer(bCount.h);
+}
+
 } // namespace
