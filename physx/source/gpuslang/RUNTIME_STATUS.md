@@ -1620,6 +1620,139 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.4 tranche a — the softbody SELF-collision midphase
+
+`sb_selfCollisionMidphaseGeneratePairsLaunch` is mapped. One warp per SURFACE vertex walks
+its own softbody's BV32 tetrahedron BVH, keeps the single deepest surviving
+vertex-vs-tetrahedron contact and appends it through an inlined `PxgSoftBodyContactWriter`.
+Manifest **MAPPED 235 -> 236**; softbody **25 -> 26 of 56**.
+
+| kernel | ABI row | blob |
+|---|---|---|
+| `sb_selfCollisionMidphaseGeneratePairsLaunch` | `{8,8,8,56}` | 80 B |
+
+The traverser BODY is a lift of `npSbSelf.slang` (`ctSbSelfQuery`), the unit-tested
+descriptor-set port of `SbMeshTreeTraverser` — the same relationship `softBodyContactRemapBda`
+has to `npSbRemap`. The BV32 walk, the groupshared stack and the ballot/scan lowering come
+from `softBodyContactGenBda` unchanged. What is new is the DRIVER.
+
+### The grid: 2D *and* grid-striding, which no earlier kernel combined
+
+    grid (SB_SBMIDPHASE = 1024, nbActiveSelfCollisionSoftbodies, 1), block (32, 2, 1)
+    globalWarpIdx = threadIdx.y + blockIdx.x * blockDim.y      // [0, 2048)
+    NbWarps       = blockDim.y * gridDim.x                     // 2048
+    for (vertIdx = globalWarpIdx; vertIdx < numVerts; vertIdx += NbWarps)
+
+The x-grid is FIXED at 1024 regardless of the vertex count, so the kernel strides. The bridge
+forwards gridDimY (`femClothSelfCollisionBda` already relies on that, so `gid.y` is not new),
+but it drops blockDim — hence the two warps per block are walked serially in a group-uniform
+`sub` loop, and the stride stays the CUDA constant 2048 rather than anything derived from the
+dispatch. A stride taken from the dispatch instead visits most vertices 1024 times; the
+fixture dispatches the real engine grid so that mutant shows up as an exploded contact count.
+
+`finalizeFullWarp`'s `minIndex(bestDist, FULL_MASK, sep)` lowers to a groupshared `float[32]`
+plus a strict-`<` scan from lane 0. `minIndex` returns `lowestSetIndex(ballot(minV == v))`,
+i.e. the LOWEST lane holding the minimum, and a strict-`<` scan picks the same lane — which
+matters, because two tetrahedra at the same distance must not both write.
+
+### Mutation: 18 killed of 20, and the two survivors are PROVEN redundant
+
+The fixture drives the engine grid and aims one query vertex at each gate: the surface-vertex
+hint, the surface-TET hint, `isValidTet`, the per-pair and whole-body filter lookups, the
+rest-pose re-check, the stress tolerance, the cross-lane argmin, the `contactDistance * 2`,
+the outside branch's 0.707 normal replacement, the `maxContacts` bound and the zeroing of
+`pairInd0`'s high word. Two mutants survive, and neither is an untested line:
+
+1. **the shared-vertex skip** (`tetIdx1.x == vertIdx || ...`). A vertex that is a corner of
+   the candidate tet is at distance exactly **0** from that tet in the REST pose as well —
+   `restP` IS one of the rest corners, the same array entry. The rest gate demands
+   `!inside2 && newSqDist > filterDistanceSq`, and for a corner `inside2` is true (all four
+   plane products are zero or a square) AND `newSqDist` is 0, which is never strictly greater
+   than a non-negative filter distance. So the rest gate drops the contact whatever the skip
+   does — unconditionally, for every mesh. Deleting the skip AND the rest gate together makes
+   the vertex appear (4 contacts -> 6), which is what pins the diagnosis rather than leaving
+   it an argument. Upstream's skip is a fast path, not a semantic gate.
+2. **the outside branch's `dist < distance`**. Identical to the final `bestDist < distance`,
+   and a rejected candidate can never win an argmin over smaller values. Deleting both
+   together lets ten contacts through where four are correct.
+
+Three fixture gaps were found by mutation rather than by inspection, and each needed a new
+query vertex or a reordering:
+
+- a FLAT tet makes every one of `isPointOutsideOfPlane4`'s four plane products identically
+  zero, so the predicate returns true for any point — including in the rest pose, where it
+  reads as "already penetrating at rest". With the rest tet flat too, the rest gate silently
+  did `isValidTet`'s job. `isValidTet` is checked on the WORLD tet only, so giving the
+  degenerate tet a real REST volume separates them;
+- the deep and shallow candidate tets share one BV32 leaf so they land in different lanes.
+  With the deep one at primitive 0 — lane 0 — "no argmin at all" produced the right answer by
+  accident. Swapping them puts the winner in lane 1;
+- a query vertex whose separation is PARALLEL to the winning face normal cannot see the
+  `dot(normal, v) > 0.707 -> normal = v` replacement. A vertex just outside a tet EDGE, where
+  the face normal is (0,0,-1) and the separation is (0,-0.217,-0.976), can.
+
+### What this does NOT yet do
+
+The rest of the self-collision chain — `sb_fem_contact_remap_to_simLaunch`,
+`sb_softbodyContactPrepareLaunch` and `sb_solveOutputSSDeltaVLaunch{,TGS}` — is still
+unmapped, so the contacts this kernel emits are counted and stored but never remapped to the
+simulation mesh and never solved. That is a safe intermediate state (an unmapped kernel is a
+no-op, so the contacts are simply ignored) and it is why no scene moves, but a softbody still
+passes through itself until that chain lands.
+
+No sdktest scene reaches this kernel yet either: `nbActiveSelfCollisionSoftbodies` counts
+bodies that have self-collision switched on, and `PXG_SCENE=softbody` does not. The cloth
+port's answer was `PXG_SCENE=clothselfcollide`; the softbody analogue is worth building, but
+only once the chain below can act on what the midphase produces.
+
+### Verification
+
+| gate | result |
+|---|---|
+| target ctest (`gpuslang.softBodySim`) | pass, 42 fixtures |
+| mutation, forced-fresh `.spv` | 18 killed of 20, both survivors proven redundant above |
+| full suite, default memory mode | **674 / 674**, 198 s |
+| full suite, `PXG_DEVICE_V2=1` | **674 / 674**, 391 s |
+| rigid regression, 8 scenes x 2 solvers | **16 / 16** |
+| `PXG_SCENE=cloth` | dropped 4.9867 over 1.00 s |
+| `PXG_SCENE=clothhang` | pinned row max \|dev\| 0.00000, rest \|dy\| 0.000000 |
+| `PXG_SCENE=clothdrape` | settles, rest \|dy\| = 0.000000 |
+| `PXG_SCENE=clothselfcollide` | catches at min y = 5.0999 (5.1000 expected) |
+| `PXG_SCENE=softbody` | free fall 4.98675 vs 4.98675 expected, skin gap 0.00000 |
+| `PXG_SCENE=particle` | dropped 19.7835 over 2.00 s |
+
+Every scene is byte-for-byte what P8.3 recorded. It has to be: nothing dispatches this kernel
+yet (see below), so a moved scene would mean the tranche had touched something it should not.
+
+**A note on running the scenes**: they need `PXG_SOLVER=pgs` as well as `PXG_GPU_STEP=1`.
+Without the solver variable the deformable scenes construct and then report a zero drop,
+which looks exactly like a regression and is not one.
+
+The recon for that chain is done, so the next tranche starts from data rather than from
+re-reading the CUDA:
+
+| kernel | CUDA | launch | ABI row | blob |
+|---|---|---|---|---|
+| `sb_fem_contact_remap_to_simLaunch` | softbodyPrimitives.cu:2277 | NarrowphaseCore.cpp:4166 | `{8,8,8,8,8,8,4}` | 56 B |
+| `sb_softbodyContactPrepareLaunch` | softBody.cu:940 | SoftBodyCore.cpp:2547 | `{8,8,8,8,8,8,8,8,8,4}` | 80 B |
+| `sb_solveOutputSSDeltaVLaunch{,TGS}` | softBody.cu:1424 / :1691 | SoftBodyCore.cpp:1636 | `{8,8,8,8,4,4,8,8}` | 56 B |
+
+Two things in there are not routine:
+
+- the remap is the two-grid twin of the already-ported `sb_other_contact_remap_to_simLaunch`
+  (`pairIndex = blockIdx.y` selects which side of the pair gets remapped), so it inherits
+  both llvmpipe workarounds from `softBodyContactRemapBda` — but its BLOCK SHAPE differs per
+  call site: (1024, 16) for self-collision and cloth-vs-softbody, (8192, 4) for
+  softbody-vs-softbody. One SPIR-V entry point cannot carry three strides, and the remap is
+  NOT idempotent (a second pass would read an already-remapped id as a collision-tet id), so
+  the port has to pin one grid and early-out above it. Coverage stays complete; only the
+  parallelism of the 8192 case shrinks;
+- `sb_solveOutputSSDeltaVLaunch` is the near-twin of `sb_solveRigidSoftCollisionLaunch` from
+  tranche e, but symmetric: BOTH sides are softbody tets, so `computeTetraContact` and
+  `updateTetraPosDelta` run twice with opposite `deltaPos`, and the friction coefficient is
+  the mean of the two materials' `dynamicFriction` (`PxsDeformableVolumeMaterialData`, 32 B,
+  `dynamicFriction` @8).
+
 ## P8.3 — the softbody-vs-rigid ATTACHMENT path
 
 `sb_rigidAttachmentPrepareLaunch` and `sb_solveRigidSoftAttachmentLaunch{,TGS}` are mapped,
