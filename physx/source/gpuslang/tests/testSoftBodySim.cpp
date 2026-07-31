@@ -6923,4 +6923,183 @@ PXG_TEST(softBodySimCalculateStress)
     dev->destroyBuffer(bActive.h); dev->destroyBuffer(bStressesB.h); dev->destroyBuffer(bCoeffsB.h);
 }
 
+// ===========================================================================
+// P8.6 — the SPHERE and CAPSULE contact-gen path, through the shared GJK/EPA driver.
+//
+// The geometry is chosen so every expected number is exact BEFORE the run: the tetrahedron
+// is the unit tet at the origin, and each rigid is placed so its nearest approach to the tet
+// is a clean distance along -x from the x = 0 face, whose nearest point is (0, 0.25, 0.25).
+// (That the numbers must be predictable in advance is not a style preference here -- the
+// step-3 driver fixture was calibrated against broken output and "passed" on a value I could
+// explain but had not predicted.)
+//
+//   pair 0  sphere, centre (-0.3, 0.25, 0.25), radius 0.4  -> gap 0.3, pen 0.3 - 0.4 = -0.1
+//   pair 1  sphere, centre (-9.0, 0.25, 0.25), radius 0.4  -> far outside, NO contact
+//   pair 2  capsule, centre (-0.6, 0.25, 0.25), half-height 0.5, radius 0.2
+//                    -> nearest endpoint (-0.1, ...), gap 0.1, pen 0.1 - 0.2 = -0.1
+//
+// The two -0.1 penetrations come from different shapes and different radii, which is the
+// point: the radius is folded into GJK's contact distance and subtracted back out as
+// penOffset, so a port that dropped either half is off by exactly one radius and the two
+// cases disagree about which.
+// ===========================================================================
+PXG_TEST(softBodySimPrimitiveContactGenGjk)
+{
+    using namespace p80refit;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    std::vector<F4> verts = {
+        { 0.0f, 0.0f, 0.0f, 1.0f }, { 1.0f, 0.0f, 0.0f, 1.0f },
+        { 0.0f, 1.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 1.0f, 1.0f },
+    };
+    std::vector<TetIdx4> tets = { { 0u, 1u, 2u, 3u } };
+    DevBuf bVerts = makeDev(dev, verts), bTets = makeDev(dev, tets);
+    if (!bVerts.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bVerts.addr));
+    sb.mNumTets = 1u;
+    sb.mNumVerts = 4u;
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // shape 0 = the tet mesh; shapes 1..3 = the rigids.
+    const uint32_t GEOM_SPHERE_H = 0u, GEOM_CAPSULE_H = 2u;
+    std::vector<PxgShapeHost> shapes(4);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_TETRAHEDRONMESH_H; shapes[0].particleOrSoftbodyId = 0u;
+    // PxMeshScale: for a SPHERE the engine stores the radius in both x and y; the port reads
+    // x for the contact-distance inflation and y for penOffset, as upstream does.
+    shapes[1].type = GEOM_SPHERE_H;  shapes[1].sx = 0.4f; shapes[1].sy = 0.4f; shapes[1].sz = 0.4f;
+    shapes[1].srw = 1.0f; shapes[1].materialIndex = 11u; shapes[1].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[2] = shapes[1]; shapes[2].materialIndex = 12u;
+    // For a CAPSULE x is the HALF-HEIGHT and y is the radius -- deliberately different values
+    // so a port that read the wrong one cannot match.
+    shapes[3].type = GEOM_CAPSULE_H; shapes[3].sx = 0.5f; shapes[3].sy = 0.2f; shapes[3].sz = 0.2f;
+    shapes[3].srw = 1.0f; shapes[3].materialIndex = 13u; shapes[3].particleOrSoftbodyId = 0xFFFFFFFFu;
+    DevBuf bShapes = makeDev(dev, shapes);
+
+    std::vector<CmInputHost> cms = {
+        { 0u, 1u, 0u, 1u },
+        { 0u, 2u, 0u, 2u },
+        { 0u, 3u, 0u, 3u },
+    };
+    DevBuf bCms = makeDev(dev, cms);
+
+    // PxsCachedTransform, 32 B: PxQuat q @0 (identity), PxVec3 p @16.
+    std::vector<float> xf(4 * 8, 0.0f);
+    auto setXf = [&](uint32_t slot, float x, float y, float z) {
+        xf[slot * 8 + 3] = 1.0f;                              // q.w
+        xf[slot * 8 + 4] = x; xf[slot * 8 + 5] = y; xf[slot * 8 + 6] = z;
+    };
+    setXf(0, 0.0f, 0.0f, 0.0f);          // the softbody's slot, unused
+    setXf(1, -0.3f, 0.25f, 0.25f);       // sphere, touching
+    setXf(2, -9.0f, 0.25f, 0.25f);       // sphere, far
+    setXf(3, -0.6f, 0.25f, 0.25f);       // capsule centre
+    DevBuf bXf = makeDev(dev, xf);
+
+    // cDistance = contactDistance[sb] + contactDistance[rigid] = 0, so the ONLY inflation is
+    // the radius the branch folds in.  That isolates the radius handling.
+    std::vector<float> cd(4, 0.0f);
+    DevBuf bCd = makeDev(dev, cd);
+    std::vector<float> rest = { 0.03f, 0.04f, 0.05f };
+    DevBuf bRest = makeDev(dev, rest);
+    std::vector<uint64_t> remap = { 0ull, 0x101ull, 0x202ull, 0x303ull };
+    DevBuf bRemap = makeDev(dev, remap);
+
+    std::vector<uint32_t> stack = { 0u, 0u, 0u, 0u,  1u, 0u, 0u, 0u,  2u, 0u, 0u, 0u };
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairNum = { 3u };
+    DevBuf bPairNum = makeDev(dev, pairNum);
+    std::vector<uint32_t> needed = { 0u };
+    DevBuf bNeeded = makeDev(dev, needed);
+
+    const uint32_t MAXC = 16u;
+    std::vector<F4> outPoint(MAXC, F4{ -1, -1, -1, -1 }), outNormal(MAXC, F4{ -1, -1, -1, -1 });
+    std::vector<F4> outBary(MAXC, F4{ 0, 0, 0, 0 });
+    std::vector<FemOtherContactInfoHost> outInfo(MAXC);
+    std::memset(outInfo.data(), 0xEE, outInfo.size() * sizeof(FemOtherContactInfoHost));
+    std::vector<uint64_t> byX(MAXC, 0ull);
+    std::vector<uint32_t> tempByX(MAXC, 0u), idxSorted(MAXC, 0u), sortedByX(MAXC, 0u), total = { 0u };
+    DevBuf bPt = makeDev(dev, outPoint), bNp = makeDev(dev, outNormal), bBary = makeDev(dev, outBary);
+    DevBuf bInfo = makeDev(dev, outInfo), bByX = makeDev(dev, byX), bTmp = makeDev(dev, tempByX);
+    DevBuf bIdx = makeDev(dev, idxSorted), bSorted = makeDev(dev, sortedByX), bTotal = makeDev(dev, total);
+
+    SbContactGenPush push = {};
+    push.tolerenceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.contactDistance = bCd.addr;
+    push.restDistance = bRest.addr;
+    push.gpuShapes = bShapes.addr;
+    push.softbodies = bDesc.addr;
+    push.shapeToRigidRemapTable = bRemap.addr;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairNum.addr;
+    push.stackSizeBytes = 48u;               // three uint4 slots
+    push.softBodyRigidPairs = 0ull;
+    push.numSoftBodyRigidPairs = 0u;
+    push.stackSizeNeededOnDevice = bNeeded.addr;
+    push.w.outPoint = bPt.addr; push.w.outNormalPen = bNp.addr; push.w.outBarycentric = bBary.addr;
+    push.w.outContactInfo = bInfo.addr; push.w.totalContactCount = bTotal.addr;
+    push.w.contactByX = bByX.addr; push.w.tempContactByX = bTmp.addr;
+    push.w.contactIndexSortedByX = bIdx.addr; push.w.contactSortedByX = bSorted.addr;
+    push.w.maxNumContacts = MAXC;
+
+    Kernel k("softBodyContactGenBda.spv", "sb_primitiveContactGenLaunch", {}, sizeof(SbContactGenPush));
+    // THE ENGINE'S GRID (PxgNarrowphaseCore.cpp:4300): SB_CG_GRID = 512 blocks.  The kernel
+    // strides by SB_CG_GRID * MIDPHASE_WARPS_PER_BLOCK = 1024, so a one-group dispatch covers
+    // only warps 0 and 1 -- i.e. the first TWO pairs.  The plane fixture has exactly two and
+    // never noticed; this one has three, and its third pair vanished until the grid was
+    // right.  Dispatch what the engine dispatches.
+    k.dispatch(/*gridX*/ 512u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const uint32_t n = downloadBuffer<uint32_t>(dev, bTotal.h, 1)[0];
+    const auto gPt = downloadBuffer<F4>(dev, bPt.h, MAXC);
+    const auto gNp = downloadBuffer<F4>(dev, bNp.h, MAXC);
+    const auto gInfo = downloadBuffer<FemOtherContactInfoHost>(dev, bInfo.h, MAXC);
+    for (uint32_t i = 0; i < n && i < MAXC; ++i)
+        std::printf("  contact %u: point=(%.5f %.5f %.5f rest=%.3f) normal=(%.5f %.5f %.5f) "
+                    "pen=%.6f mat=%u\n", i, gPt[i].x, gPt[i].y, gPt[i].z, gPt[i].w,
+                    gNp[i].x, gNp[i].y, gNp[i].z, gNp[i].w, gInfo[i].rigidMatInd & 0x7fffffffu);
+
+    PXG_CHECK_MSG(n == 2u,
+                  "the touching sphere and the capsule must each emit ONE contact and the far "
+                  "sphere none, got %u", n);
+
+    bool sawSphere = false, sawCapsule = false;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        const uint32_t mat = gInfo[i].rigidMatInd & 0x7fffffffu;
+        PXG_CHECK_MSG(mat != 12u, "the far sphere (material 12) must not produce a contact");
+        // The witness on the TET is the x = 0 face point nearest the rigid.
+        PXG_CHECK_MSG(std::fabs(gPt[i].x) < 1e-5f && std::fabs(gPt[i].y - 0.25f) < 1e-5f &&
+                      std::fabs(gPt[i].z - 0.25f) < 1e-5f,
+                      "contact %u's point is the witness on the TET, (0, 0.25, 0.25), got "
+                      "(%.6f %.6f %.6f)", i, gPt[i].x, gPt[i].y, gPt[i].z);
+        PXG_CHECK_MSG(std::fabs(gNp[i].x - 1.0f) < 1e-4f && std::fabs(gNp[i].y) < 1e-4f &&
+                      std::fabs(gNp[i].z) < 1e-4f,
+                      "and the normal is +x, got (%.5f %.5f %.5f)", gNp[i].x, gNp[i].y, gNp[i].z);
+        // BOTH shapes penetrate by exactly 0.1, from different gaps and different radii.
+        PXG_CHECK_MSG(std::fabs(gNp[i].w + 0.1f) < 1e-5f,
+                      "contact %u's penetration is gap - radius = -0.1 (got %.7f).  Dropping "
+                      "the radius from the contact distance, or from penOffset, changes this "
+                      "by exactly one radius -- and the two cases have DIFFERENT radii, so no "
+                      "single wrong constant can satisfy both", i, gNp[i].w);
+        if (mat == 11u) { sawSphere = true;  PXG_CHECK(std::fabs(gPt[i].w - 0.03f) < 1e-6f); }
+        if (mat == 13u) { sawCapsule = true; PXG_CHECK(std::fabs(gPt[i].w - 0.05f) < 1e-6f); }
+    }
+    PXG_CHECK_MSG(sawSphere, "the touching SPHERE produced no contact");
+    PXG_CHECK_MSG(sawCapsule, "the CAPSULE produced no contact -- its cloud is the two segment "
+                              "endpoints, so a port that treated it as a single point would "
+                              "measure from the centre and miss by the half-height");
+
+    for (PxgBufferHandle h : { bVerts.h, bTets.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h,
+                               bRest.h, bRemap.h, bStack.h, bPairNum.h, bNeeded.h, bPt.h,
+                               bNp.h, bBary.h, bInfo.h, bByX.h, bTmp.h, bIdx.h, bSorted.h, bTotal.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace

@@ -93,6 +93,8 @@
 // anywhere, so this tranche is FULLY bit-exact with no tolerance seam.
 
 import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu (mTetMeshData@0, mTetIndices@16, ...)
+import pxgSlangGjk;          // GjkCloud / GjkOut
+import pxgSlangTetCollide;   // tetPrimitivesCollide2, computeInnerSphere
 
 // PxgNpKernelIndices.h:32 — the engine's warps-per-block for every midphase launch.
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
@@ -446,6 +448,9 @@ static const uint SB_CG_GRID = 512u;
 
 // PxGeometryType::ePLANE (PxGeometry.h:51).
 static const uint GEOM_PLANE = 1u;
+// PxGeometryType (PxGeometry.h:57): eSPHERE 0, ePLANE 1, eCAPSULE 2, eBOX 3, eCONVEXMESH 4.
+static const uint GEOM_SPHERE = 0u;
+static const uint GEOM_CAPSULE = 2u;
 
 // PxgRigidFilterPair (PxgSimulationCoreDesc.h, 32 B): index0 u64 @0, index1 u64 @8,
 // index2 u32 @16, tail padding.
@@ -545,6 +550,17 @@ void writeRigidVsDeformableNoBary(uint index, float4 contact, float4 normalPen,
 }
 
 // PxTransform::transformInv(p) = q.rotateInv(p - t); rotateInv is the conjugate rotate.
+// PxQuat::rotate (PxQuat.h:286).
+float3 cgQuatRotate(float4 q, float3 v)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q.w * q.w - 0.5f;
+    const float dot2 = (q.x * vx + q.y * vy + q.z * vz);
+    return float3(vx * w2 + (q.y * vz - q.z * vy) * q.w + q.x * dot2,
+                  vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * dot2,
+                  vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * dot2);
+}
+
 float3 quatRotateInv(float4 q, float3 v)
 {
     const float w = q.w;
@@ -559,6 +575,108 @@ float3 quatBasisVector0(float4 q)
     return float3((q.w * w2) - 1.0f + q.x * x2,
                   (q.z * w2) + q.y * x2,
                   (-q.y * w2) + q.z * x2);
+}
+
+// ===========================================================================
+// P8.6 — the SPHERE and CAPSULE branch of sbPrimitiveCollision
+// (softbodyPrimitives.cu:470-568), on top of the shared GJK/EPA driver.
+//
+// The rigid becomes a POINT CLOUD and the tetrahedron the second one, and
+// tetPrimitivesCollide2 does the rest.  Sphere and capsule are the two types whose cloud
+// needs no convex-hull decode at all -- one vertex for a sphere, two for a capsule's segment
+// endpoints -- which is why they land first; BOX and CONVEXMESH additionally need the hull
+// blob walked and prepareVertices, and stay unmapped for now (they emit nothing, exactly as
+// they did when only the plane path existed).
+//
+// THE RADIUS IS NOT IN THE CLOUD.  A sphere's cloud is its CENTRE and a capsule's is its
+// segment; the radius is folded into the contact distance instead (`cDistance + scale.x` for
+// a sphere, `+ scale.y` for a capsule) and then subtracted back out of the penetration as
+// `penOffset = -radius`.  That is how upstream keeps GJK working on point sets rather than
+// on inflated hulls, and getting it wrong gives contacts that are exactly one radius off.
+//
+// NOTE which scale component is which: PxMeshScale.scale.x is a sphere's radius and a
+// capsule's HALF-HEIGHT, while scale.y is a capsule's radius -- and `radius`, the value used
+// for penOffset, is scale.y for BOTH (softbodyPrimitives.cu:477-481).  For a sphere the
+// engine stores the same radius in x and y, so the two agree; the asymmetry is upstream's
+// and is transcribed rather than tidied.
+//
+// ONE LANE, NOT A WARP.  CUDA runs GJK cooperatively across 32 lanes; the ported driver
+// simulates those lanes with per-thread arrays (see pxgSlangGjk's header), so the whole
+// query belongs to a single thread.  Lane 0 runs it and writes the one contact the pair can
+// produce -- which is what writeContactNoBarycentricFullWarp does anyway: it lets lane 0 take
+// the atomic and broadcasts the index, and only lanes 0..3 store.
+void sbGjkPrimitive(uint lane, PxgShape rigidShape, uint rigidCacheRef, uint softbodyId,
+                    uint tetrahedronIdx, float cDistance, float restDist,
+                    uint2 rigidId, uint softBodyMask, Ptr<PxgSoftBodyGpu> softbodies)
+{
+    if (lane != 0u)
+        return;
+
+    // PxsCachedTransform (32 B): PxQuat q @0, PxVec3 p @16.
+    const uint64_t xf = gCG.transformCache + uint64_t(rigidCacheRef) * 32UL;
+    const float4 rigidQ = Ptr<float4>(xf)[0];
+    const float3 rigidP = float3(Ptr<float>(xf + 16UL)[0],
+                                 Ptr<float>(xf + 20UL)[0],
+                                 Ptr<float>(xf + 24UL)[0]);
+
+    const uint4 tetIdx = Ptr<uint4>(softbodies[softbodyId].mTetIndices)[tetrahedronIdx];
+    Ptr<float4> verts = Ptr<float4>(softbodies[softbodyId].mPosition_InvMass);
+
+    GjkCloud b;
+    b.n = 4u;
+    for (uint i = 0u; i < GJK_MAX_CLOUD; ++i) b.v[i] = float3(0.0f, 0.0f, 0.0f);
+    b.v[0] = verts[tetIdx.x].xyz;
+    b.v[1] = verts[tetIdx.y].xyz;
+    b.v[2] = verts[tetIdx.z].xyz;
+    b.v[3] = verts[tetIdx.w].xyz;
+
+    float3 tetCenter;
+    const float innerSphere = computeInnerSphere(b.v[0], b.v[1], b.v[2], b.v[3], tetCenter);
+
+    GjkCloud a;
+    for (uint i = 0u; i < GJK_MAX_CLOUD; ++i) a.v[i] = float3(0.0f, 0.0f, 0.0f);
+    float contactDist;
+    const float radius = rigidShape.scaleY;
+    if (rigidShape.type == GEOM_SPHERE)
+    {
+        a.n = 1u;
+        a.v[0] = rigidP;
+        contactDist = cDistance + rigidShape.scaleX;
+    }
+    else   // GEOM_CAPSULE
+    {
+        a.n = 2u;
+        const float3 wHalfHeight = cgQuatRotate(rigidQ, float3(rigidShape.scaleX, 0.0f, 0.0f));
+        a.v[0] = rigidP + wHalfHeight;
+        a.v[1] = rigidP - wHalfHeight;
+        contactDist = cDistance + rigidShape.scaleY;
+    }
+
+    GjkOut o;
+    const uint result = tetPrimitivesCollide2(a, b, rigidP - tetCenter, contactDist,
+                                              /*inSphereRadius0*/ 0.0f, innerSphere, o);
+
+    // Both OVERLAP and CLOSE mean "touching" to the caller (softbodyPrimitives.cu:561).
+    if (!(result == GJK_OVERLAP || result == GJK_CLOSE))
+        return;
+
+    // writeContactNoBarycentricFullWarp (softbodyPrimitives.cu:297): the stored point is the
+    // witness on the TET, the normal is GJK/EPA's direction unflipped, and the penetration is
+    // the witness separation projected on it, less the radius that was folded in above.
+    const float3 wA = o.closestPointA.xyz;
+    const float3 wB = o.closestPointB.xyz;
+    const float3 n = o.direction.xyz;
+    const float pen = dot(wB - wA, n) - radius;
+
+    uint index;
+    InterlockedAdd(Ptr<uint>(gCG.w_totalContactCount)[0], 1u, index);
+    if (index >= gCG.w_maxNumContacts)
+        return;
+
+    writeRigidVsDeformableNoBary(index,
+                                 float4(wB.x, wB.y, wB.z, restDist),
+                                 float4(n.x, n.y, n.z, pen),
+                                 rigidId, softBodyMask, rigidId, rigidShape.materialIndex);
 }
 
 [shader("compute")]
@@ -619,7 +737,15 @@ void sb_primitiveContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
                               rigidId, uint2(softBodyMask, 0u)))
                 continue;
 
-            // *** PLANE ONLY — see the header.  Everything else is the GJK tranche. ***
+            // *** SPHERE and CAPSULE go through GJK/EPA; BOX and CONVEXMESH still do not.
+            // See the header. ***
+            if (rigidShape.type == GEOM_SPHERE || rigidShape.type == GEOM_CAPSULE)
+            {
+                sbGjkPrimitive(lane, rigidShape, rigidCacheRef, softbodyId, tetrahedronIdx,
+                               cDistance, restDist, rigidId, softBodyMask, softbodies);
+                continue;
+            }
+
             if (rigidShape.type != GEOM_PLANE)
                 continue;
 
