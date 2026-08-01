@@ -2942,21 +2942,45 @@ PXG_TEST(softBodySimPrimitiveContactGenPlane)
     std::vector<PxgSoftBody> descArr = { sb };
     DevBuf bDesc = makeDev(dev, descArr);
 
-    // shape 0 = tetmesh (softbody 0), shape 1 = the PLANE.
-    // shape 2 is a BOX: pair 1 routes the SAME tet at the SAME plane-space depth through a
-    // non-plane rigid, which this tranche deliberately does not handle.  Asserting it
-    // contributes nothing pins the boundary of the partial implementation, so the future GJK
-    // tranche has to change this test consciously rather than silently.
+    // shape 0 = tetmesh (softbody 0), shape 1 = the PLANE, shape 2 a BOX.
+    //
+    // THE BOX CONTROL CHANGED WHEN THE HULL BRANCH LANDED, DELIBERATELY.  It used to be a
+    // box with no hull at all, sitting on the plane's own transform: while the kernel ignored
+    // every non-plane type that was a valid way to pin the boundary of a partial port, and
+    // the comment here said the GJK tranche would have to change it consciously.  It does --
+    // a bare box now walks its hull pointer and a null one faults the device, which is how
+    // this fixture reported the change (SIGSEGV, not a wrong number).  The control keeps its
+    // job -- pair 1 must contribute nothing -- but now earns it geometrically: a real cooked
+    // cube, parked 100 units away on its own transform slot.  restDistance[0] is still the
+    // value that must never be read.
+    std::vector<F4> boxBlob;
+    {
+        const uint32_t hdr = (12u << 16) | (8u << 8) | 6u;   // nbEdges | nbVerts | nbPolygons
+        auto asF = [](uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; };
+        boxBlob.push_back(F4{ 0, 0, 0, 0 });                          // the skipped float4
+        boxBlob.push_back(F4{ asF(hdr), asF(0u), asF(0u), asF(0u) });  // uint4 header
+        boxBlob.push_back(F4{ 0.0f, 0.0f, 0.0f, 1.0f });               // extents; .w = inner sphere
+        for (uint32_t m = 0; m < 8u; ++m)
+            boxBlob.push_back(F4{ (m & 1u) ? 1.0f : -1.0f, (m & 2u) ? 1.0f : -1.0f,
+                                  (m & 4u) ? 1.0f : -1.0f, 0.0f });
+    }
+    DevBuf bBoxBlob = makeDev(dev, boxBlob);
+
     std::vector<PxgShapeHost> shapes(3);
     std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
     shapes[0].type = GEOM_TETRAHEDRONMESH_H; shapes[0].particleOrSoftbodyId = 0u;
     shapes[1].type = 1u /* ePLANE */;        shapes[1].materialIndex = 7u;
     shapes[2].type = 3u /* eBOX */;          shapes[2].materialIndex = 9u;
+    shapes[2].sx = shapes[2].sy = shapes[2].sz = 0.25f;
+    shapes[2].srw = 1.0f;
+    shapes[2].hullLo = uint32_t(bBoxBlob.addr & 0xFFFFFFFFull);
+    shapes[2].hullHi = uint32_t(bBoxBlob.addr >> 32);
     DevBuf bShapes = makeDev(dev, shapes);
     // The PLANE pair is cmIdx 1 ON PURPOSE: restDistance is indexed BY cmIdx, so putting
     // the observable pair at a nonzero index is the only way to tell restDistance[cmIdx]
     // from restDistance[0].  The mutation sweep read [0] and passed until this swap.
-    std::vector<CmInputHost> cms = { { 0u, 2u, 0u, 1u }, { 0u, 1u, 0u, 1u } };
+    // The box pair takes transform-cache slot 2, which is where the 100-unit offset lives.
+    std::vector<CmInputHost> cms = { { 0u, 2u, 0u, 2u }, { 0u, 1u, 0u, 1u } };
     DevBuf bCms = makeDev(dev, cms);
 
     // A PxPlane's surface is x == 0 in plane space, so a WORLD y = 0 ground plane whose
@@ -2965,19 +2989,20 @@ PXG_TEST(softBodySimPrimitiveContactGenPlane)
     std::vector<float> xforms = {
         0,0,0,1,  0,0,0,  0,                      // slot 0 (softbody, unused)
         0.0f, 0.0f, s45, s45,  0.0f, 0.0f, 0.0f,  0.0f,   // slot 1: plane, +x -> +y
+        0.0f, 0.0f, 0.0f, 1.0f,  100.0f, 100.0f, 100.0f, 0.0f,  // slot 2: the box, far away
     };
     // TRAILER.  llvmpipe widens the final load of a tightly-sized buffer past its end and
     // faults; the softbody refit test hit the same thing.  Sixteen slack bytes on every
     // buffer whose last element is read is the standing workaround.
     for (int t = 0; t < 4; ++t) xforms.push_back(0.0f);
     DevBuf bXf = makeDev(dev, xforms);
-    std::vector<float> cds = { cd, cd, 0.0f, 0.0f };            // + trailer
+    std::vector<float> cds = { cd, cd, cd, 0.0f };              // + trailer
     DevBuf bCd = makeDev(dev, cds);
     // DISTINCT per cmIdx: slot 0 belongs to the box pair and must never be read.
     std::vector<float> restDs = { 0.99f, restD, 0.0f, 0.0f };
     DevBuf bRest = makeDev(dev, restDs);
-    // PxNodeIndex per transform-cache slot; slot 1 is the rigid's.
-    std::vector<uint64_t> remap = { 0ull, 0x00000000ABCDEF01ull, 0ull, 0ull };  // + trailer
+    // PxNodeIndex per transform-cache slot; slot 1 is the rigid's, slot 2 the far box's.
+    std::vector<uint64_t> remap = { 0ull, 0x00000000ABCDEF01ull, 0x00000000BADF00Dull, 0ull };
     DevBuf bRemap = makeDev(dev, remap);
 
     // the midphase's output: one pair (cmIdx 0, tet 0)
@@ -3039,12 +3064,12 @@ PXG_TEST(softBodySimPrimitiveContactGenPlane)
     // Corners 0, 1 and 2 are all within contactDist (0.10) of the plane; corner 3 is not.
     // Three from the PLANE pair; the BOX pair must contribute NOTHING in this tranche.
     PXG_CHECK_MSG(n == 3u, "the plane path must emit ONE contact PER PENETRATING CORNER "
-                           "(3 of the tet's 4 are within 0.10 of the plane) and the BOX pair "
+                           "(3 of the tet's 4 are within 0.10 of the plane) and the far BOX pair "
                            "must contribute nothing, got %u", n);
     for (uint32_t i = 0; i < n && i < MAXC; ++i)
         PXG_CHECK_MSG(gInfo[i].rigidMatInd != 9u,
-                      "contact %u came from the BOX rigid -- this tranche implements the PLANE "
-                      "path only, so the non-plane branch must emit nothing", i);
+                      "contact %u came from the BOX rigid, which sits 100 units away -- the "
+                      "hull branch must still respect the contact distance", i);
 
     bool seen[4] = { false, false, false, false };
     for (uint32_t i = 0; i < n && i < MAXC; ++i)
@@ -3090,7 +3115,8 @@ PXG_TEST(softBodySimPrimitiveContactGenPlane)
     PXG_CHECK_MSG(gNeeded == 32u, "stackSizeNeeded must be numFound * sizeof(uint4) = 32, got %u", gNeeded);
 
     dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bTets.h); dev->destroyBuffer(bDesc.h);
-    dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bCms.h); dev->destroyBuffer(bXf.h);
+    dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bBoxBlob.h);
+    dev->destroyBuffer(bCms.h); dev->destroyBuffer(bXf.h);
     dev->destroyBuffer(bCd.h); dev->destroyBuffer(bRest.h); dev->destroyBuffer(bRemap.h);
     dev->destroyBuffer(bStack.h); dev->destroyBuffer(bPairNum.h); dev->destroyBuffer(bNeeded.h);
     dev->destroyBuffer(bPt.h); dev->destroyBuffer(bNp.h); dev->destroyBuffer(bBary.h);
@@ -7099,6 +7125,397 @@ PXG_TEST(softBodySimPrimitiveContactGenGjk)
     for (PxgBufferHandle h : { bVerts.h, bTets.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h,
                                bRest.h, bRemap.h, bStack.h, bPairNum.h, bNeeded.h, bPt.h,
                                bNp.h, bBary.h, bInfo.h, bByX.h, bTmp.h, bIdx.h, bSorted.h, bTotal.h })
+        dev->destroyBuffer(h);
+}
+
+// ===========================================================================
+// P8.7 — the BOX and CONVEXMESH contact-gen path (the convex-hull branch).
+//
+// Sphere and capsule build their point cloud from the transform alone.  A hull instead has
+// to be READ: the cooked blob is walked (skip one float4, uint4 header, float4 extents, then
+// the vertices), the vertex count is unpacked out of a bit-field, and every vertex goes
+// through vertex2Shape and then the rigid transform.  Four things can be got wrong, and the
+// fixture is built so each one changes an observable number:
+//
+//   * the blob offsets      -> garbage vertices, nothing lands anywhere near the tet;
+//   * the vertex count      -> a partial hull, whose support in +x is smaller;
+//   * PxMeshScale           -> the wrong box size, hence the wrong gap;
+//   * the radius inflation  -> a hull must NOT inflate the contact distance the way a sphere
+//                             does, and must NOT subtract a radius from the penetration.
+//
+// THE EXPECTED VALUES ARE COMPUTED, NOT CALIBRATED.  For a separated convex pair whose
+// nearest feature is one hull CORNER against the interior of the tet's x = 0 face, the answer
+// is the support function and nothing more: take the world corner with the largest x, the
+// witness on the tet is that corner projected onto x = 0, the normal is +x and the separation
+// is -corner.x.  The reference below is that support computation; the tet is the doubled unit
+// tet so the face triangle (y >= 0, z >= 0, y + z <= 2) comfortably contains both projections.
+// A generic rotation is used precisely so ONE corner wins -- with an axis-aligned box the
+// nearest-point pair is a whole rectangle and the witness would not be predictable.
+//
+//   pair 0  BOX,        scale (0.3, 0.2, 0.1), identity mesh-scale rotation, generic rigid
+//                       rotation, centre (-0.45, 0.6, 0.6)  -> gap 0.154364, winner vertex 0
+//   pair 1  BOX,        same hull and scale, identity rotation, centre (-0.70, 0.6, 0.6)
+//                       -> gap 0.4 exactly, and cDistance is 0.3 -> NO contact.  This is the
+//                       inflation trap: a port that added scale.y (0.2) or scale.x (0.3) to
+//                       the contact distance the way the sphere branch does would report a
+//                       contact here.
+//   pair 2  CONVEXMESH, scale (0.4, 0.1, 0.15) under a NON-IDENTITY mesh-scale rotation,
+//                       centre (-0.53, 0.6, 0.6)            -> gap 0.196020, winner vertex 7.
+//                       Ignoring the scale rotation -- treating vertex2Shape as a componentwise
+//                       multiply -- gives 0.13 instead, and the fixture asserts the two differ
+//                       before it compares anything, so the discrimination cannot evaporate.
+//
+// THE HULL IS IRREGULAR AND ITS VERTEX ORDER IS LOAD-BEARING.  The first draft used a unit
+// cube, and a mutant that shifted the vertex-array base by one float4 SURVIVED: a cube is
+// symmetric enough that dropping one corner (and reading one past the end) leaves the support
+// in +x untouched, and reading the extents float4 as a vertex just re-adds a corner the cube
+// already had.  The eight vertices below are irregular and deliberately ordered so that
+// pair 0's supporting vertex is index 0 and pair 2's is index 7 -- the two ends of the array.
+// A base that is one float4 too high loses index 0 and moves pair 0; one too low, or a vertex
+// count read out of the wrong bits, loses index 7 and moves pair 2.
+//
+// ONE INPUT IS NOT PINNED, AND SAYING SO IS BETTER THAN PRETENDING.  `inSphereRadius0`
+// -- extents.w times the smallest axis scale for a box, times 1 for a convex mesh -- reaches
+// nothing but EPA's convergence epsilon, `0.5 * (r0 + r1) * 2.25e-4`, which is order 1e-4.
+// Removing the box's scale factor entirely, or taking the minimum over the wrong two axes,
+// leaves every number this fixture can observe unchanged (verified: both mutants survive,
+// including with pair 3 driving EPA).  It is transcribed from softbodyPrimitives.cu:513-519
+// and carried on trust, not on evidence; a test that could see it would have to be an EPA
+// convergence test, not a contact test.
+// ===========================================================================
+namespace p87hull
+{
+struct HV3 { float x, y, z; };
+struct HQ4 { float x, y, z, w; };
+
+// PxQuat::rotate / rotateInv (PxQuat.h:286, :324), transcribed so the reference and the
+// shader agree term for term rather than merely mathematically.
+inline HV3 qrot(HQ4 q, HV3 v)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q.w * q.w - 0.5f;
+    const float dot2 = q.x * vx + q.y * vy + q.z * vz;
+    return { vx * w2 + (q.y * vz - q.z * vy) * q.w + q.x * dot2,
+             vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * dot2,
+             vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * dot2 };
+}
+inline HV3 qrotInv(HQ4 q, HV3 v)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q.w * q.w - 0.5f;
+    const float dot2 = q.x * vx + q.y * vy + q.z * vz;
+    return { vx * w2 - (q.y * vz - q.z * vy) * q.w + q.x * dot2,
+             vy * w2 - (q.z * vx - q.x * vz) * q.w + q.y * dot2,
+             vz * w2 - (q.x * vy - q.y * vx) * q.w + q.z * dot2 };
+}
+// vertex2Shape (cudaNpCommon.h:270): rotate into the scale frame, scale, rotate back.
+inline HV3 vertex2Shape(HV3 v, HV3 s, HQ4 rot)
+{
+    HV3 t = qrot(rot, v);
+    t.x *= s.x; t.y *= s.y; t.z *= s.z;
+    return qrotInv(rot, t);
+}
+inline HQ4 qnorm(float x, float y, float z, float w)
+{
+    const float m = std::sqrt(x * x + y * y + z * z + w * w);
+    return { x / m, y / m, z / m, w / m };
+}
+// The eight hull vertices in VERTEX space, in the order they sit in the cooked blob.
+// Irregular, and ordered so the two supporting vertices are index 0 and index 7 (see header).
+static const HV3 HULL[8] = {
+    {  0.90f, -0.70f,  0.80f },   // 0 — pair 0's support
+    { -0.80f,  0.50f, -0.60f },
+    { -0.90f, -0.40f,  0.70f },
+    {  0.20f,  0.90f, -0.80f },
+    { -0.30f, -0.90f,  0.20f },
+    {  0.40f,  0.30f, -0.95f },
+    { -0.60f,  0.80f,  0.90f },
+    {  1.00f,  0.60f,  0.35f },   // 7 — pair 2's support
+};
+
+// The support point in +x over the hull, the index that won, and the margin to the runner-up.
+// A small margin would mean the winning vertex is not actually unique and the witness point
+// is not predictable, so the fixture checks it.
+inline HV3 supportMaxX(HV3 scale, HQ4 scaleRot, HQ4 rigidQ, HV3 rigidP, bool useScaleRot,
+                       float& margin, int& winner)
+{
+    HV3 best = { -1e30f, 0.0f, 0.0f };
+    float second = -1e30f;
+    winner = -1;
+    for (int m = 0; m < 8; ++m)
+    {
+        const HV3 c = HULL[m];
+        HV3 sv = useScaleRot ? vertex2Shape(c, scale, scaleRot)
+                             : HV3{ c.x * scale.x, c.y * scale.y, c.z * scale.z };
+        const HV3 r = qrot(rigidQ, sv);
+        const HV3 w = { r.x + rigidP.x, r.y + rigidP.y, r.z + rigidP.z };
+        if (w.x > best.x) { second = best.x; best = w; winner = m; }
+        else if (w.x > second) { second = w.x; }
+    }
+    margin = best.x - second;
+    return best;
+}
+} // namespace p87hull
+
+PXG_TEST(softBodySimPrimitiveContactGenHull)
+{
+    using namespace p80refit;
+    using namespace p87hull;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // The DOUBLED unit tet: the x = 0 face is the triangle y >= 0, z >= 0, y + z <= 2, which
+    // both witness projections fall well inside (see the header).
+    std::vector<F4> verts = {
+        { 0.0f, 0.0f, 0.0f, 1.0f }, { 2.0f, 0.0f, 0.0f, 1.0f },
+        { 0.0f, 2.0f, 0.0f, 1.0f }, { 0.0f, 0.0f, 2.0f, 1.0f },
+    };
+    std::vector<TetIdx4> tets = { { 0u, 1u, 2u, 3u } };
+    DevBuf bVerts = makeDev(dev, verts), bTets = makeDev(dev, tets);
+    if (!bVerts.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bVerts.addr));
+    sb.mNumTets = 1u;
+    sb.mNumVerts = 4u;
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- the cooked hull blob ------------------------------------------------
+    // sbPrimitiveCollision skips one float4 (`convexPtr = hullPtr + sizeof(float4)`), then
+    // reads a uint4 header, then a float4 of extents, then the vertices as float4.  The
+    // vertex count lives in the header's first word as u16High(u32Low), i.e. bits 8..15.
+    const uint32_t NB_HULL_VERTS = 8u;
+    const uint32_t hdr0 = (12u << 16) | (NB_HULL_VERTS << 8) | 6u;   // nbEdges | nbVerts | nbPolys
+    auto asF = [](uint32_t u) { float f; std::memcpy(&f, &u, 4); return f; };
+    std::vector<F4> blob;
+    blob.push_back(F4{ 9.0f, 9.0f, 9.0f, 9.0f });                     // the skipped float4
+    blob.push_back(F4{ asF(hdr0), asF(0u), asF(0u), asF(0u) });        // uint4 header
+    // extents.xyz is never read by this path; .w is the stored inner-sphere radius.  The xyz
+    // are set to a point that could never be a support vertex, so a base offset that read the
+    // extents AS a vertex is not accidentally harmless.
+    blob.push_back(F4{ 0.0f, 0.0f, 0.0f, 1.0f });
+    for (uint32_t m = 0; m < NB_HULL_VERTS; ++m)
+        blob.push_back(F4{ HULL[m].x, HULL[m].y, HULL[m].z, 0.0f });
+    DevBuf bBlob = makeDev(dev, blob);
+
+    // A SECOND blob, the unit cube, for the overlapping pair 3 -- a real box, so its
+    // penetration depth is decidable in advance (see below).  Two blobs also mean the hull
+    // pointer is genuinely per-shape rather than a single global the fixture cannot tell apart.
+    std::vector<F4> blobBox;
+    blobBox.push_back(F4{ 9.0f, 9.0f, 9.0f, 9.0f });
+    blobBox.push_back(F4{ asF(hdr0), asF(0u), asF(0u), asF(0u) });
+    blobBox.push_back(F4{ 0.0f, 0.0f, 0.0f, 1.0f });
+    for (uint32_t m = 0; m < NB_HULL_VERTS; ++m)
+        blobBox.push_back(F4{ (m & 1u) ? 1.0f : -1.0f, (m & 2u) ? 1.0f : -1.0f,
+                              (m & 4u) ? 1.0f : -1.0f, 0.0f });
+    DevBuf bBlobBox = makeDev(dev, blobBox);
+
+    // ---- the four rigids -----------------------------------------------------
+    const uint32_t GEOM_BOX_H = 3u, GEOM_CONVEXMESH_H = 4u;
+    const HQ4 identQ = { 0.0f, 0.0f, 0.0f, 1.0f };
+    const HQ4 rigidQ0 = qnorm(0.13f, 0.27f, 0.19f, 0.94f);  // generic: one vertex wins
+    const HQ4 meshRot2 = qnorm(0.8f, 0.5f, 0.1f, 0.9f);     // generic mesh-scale rotation
+    const HV3 scale0 = { 0.3f, 0.2f, 0.1f };
+    const HV3 scale2 = { 0.4f, 0.1f, 0.15f };
+    const HV3 p0 = { -0.45f, 0.6f, 0.6f }, p1 = { -0.70f, 0.6f, 0.6f }, p2 = { -0.53f, 0.6f, 0.6f };
+    // Pair 3, the OVERLAP: a genuine axis-aligned box of half extents (0.3, 0.2, 0.1) centred
+    // at (-0.25, 0.6, 0.6), so it spans x in [-0.55, 0.05] and pokes 0.05 through the tet's
+    // x = 0 face.  Every other escape is far longer -- 0.4 to the y = 0 and z = 0 faces, 0.26
+    // to the slant face x + y + z = 2 -- so the minimum translation is 0.05 along -x and the
+    // penetration is decidable without running anything.  The WITNESS POINT is not: the
+    // overlap is a slab and any (y, z) in it is a valid pair, so only the normal and the
+    // depth are asserted, and deliberately so.
+    const HV3 p3 = { -0.25f, 0.6f, 0.6f };
+    const float WANT_PEN3 = -0.05f;
+
+    std::vector<PxgShapeHost> shapes(5);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_TETRAHEDRONMESH_H; shapes[0].particleOrSoftbodyId = 0u;
+    auto setHull = [&](uint32_t i, uint32_t type, HV3 s, HQ4 r, uint32_t mat, uint64_t hull) {
+        shapes[i].type = type;
+        shapes[i].sx = s.x; shapes[i].sy = s.y; shapes[i].sz = s.z;
+        shapes[i].srx = r.x; shapes[i].sry = r.y; shapes[i].srz = r.z; shapes[i].srw = r.w;
+        shapes[i].materialIndex = mat;
+        shapes[i].particleOrSoftbodyId = 0xFFFFFFFFu;
+        shapes[i].hullLo = uint32_t(hull & 0xFFFFFFFFull);
+        shapes[i].hullHi = uint32_t(hull >> 32);
+    };
+    setHull(1u, GEOM_BOX_H,        scale0, identQ,   21u, bBlob.addr);
+    setHull(2u, GEOM_BOX_H,        scale0, identQ,   22u, bBlob.addr);
+    setHull(3u, GEOM_CONVEXMESH_H, scale2, meshRot2, 23u, bBlob.addr);
+    setHull(4u, GEOM_BOX_H,        scale0, identQ,   24u, bBlobBox.addr);
+    DevBuf bShapes = makeDev(dev, shapes);
+
+    std::vector<CmInputHost> cms = { { 0u, 1u, 0u, 1u }, { 0u, 2u, 0u, 2u },
+                                     { 0u, 3u, 0u, 3u }, { 0u, 4u, 0u, 4u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    // PxsCachedTransform, 32 B: PxQuat q @0, PxVec3 p @16.
+    std::vector<float> xf(5 * 8, 0.0f);
+    auto setXf = [&](uint32_t slot, HQ4 q, HV3 p) {
+        xf[slot * 8 + 0] = q.x; xf[slot * 8 + 1] = q.y; xf[slot * 8 + 2] = q.z; xf[slot * 8 + 3] = q.w;
+        xf[slot * 8 + 4] = p.x; xf[slot * 8 + 5] = p.y; xf[slot * 8 + 6] = p.z;
+    };
+    setXf(0, identQ, HV3{ 0.0f, 0.0f, 0.0f });
+    setXf(1, rigidQ0, p0);
+    setXf(2, identQ,  p1);
+    setXf(3, identQ,  p2);
+    setXf(4, identQ,  p3);
+    DevBuf bXf = makeDev(dev, xf);
+
+    // cDistance = contactDistance[sbCacheRef] + contactDistance[rigidCacheRef] = 0.3.
+    std::vector<float> cd = { 0.0f, 0.3f, 0.3f, 0.3f, 0.3f };
+    DevBuf bCd = makeDev(dev, cd);
+    std::vector<float> rest = { 0.03f, 0.04f, 0.05f, 0.06f };
+    DevBuf bRest = makeDev(dev, rest);
+    std::vector<uint64_t> remap = { 0ull, 0x101ull, 0x202ull, 0x303ull, 0x404ull };
+    DevBuf bRemap = makeDev(dev, remap);
+
+    std::vector<uint32_t> stack = { 0u, 0u, 0u, 0u,  1u, 0u, 0u, 0u,
+                                    2u, 0u, 0u, 0u,  3u, 0u, 0u, 0u };
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairNum = { 4u };
+    DevBuf bPairNum = makeDev(dev, pairNum);
+    std::vector<uint32_t> needed = { 0u };
+    DevBuf bNeeded = makeDev(dev, needed);
+
+    const uint32_t MAXC = 16u;
+    std::vector<F4> outPoint(MAXC, F4{ -1, -1, -1, -1 }), outNormal(MAXC, F4{ -1, -1, -1, -1 });
+    std::vector<F4> outBary(MAXC, F4{ 0, 0, 0, 0 });
+    std::vector<FemOtherContactInfoHost> outInfo(MAXC);
+    std::memset(outInfo.data(), 0xEE, outInfo.size() * sizeof(FemOtherContactInfoHost));
+    std::vector<uint64_t> byX(MAXC, 0ull);
+    std::vector<uint32_t> tempByX(MAXC, 0u), idxSorted(MAXC, 0u), sortedByX(MAXC, 0u), total = { 0u };
+    DevBuf bPt = makeDev(dev, outPoint), bNp = makeDev(dev, outNormal), bBary = makeDev(dev, outBary);
+    DevBuf bInfo = makeDev(dev, outInfo), bByX = makeDev(dev, byX), bTmp = makeDev(dev, tempByX);
+    DevBuf bIdx = makeDev(dev, idxSorted), bSorted = makeDev(dev, sortedByX), bTotal = makeDev(dev, total);
+
+    SbContactGenPush push = {};
+    push.tolerenceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.contactDistance = bCd.addr;
+    push.restDistance = bRest.addr;
+    push.gpuShapes = bShapes.addr;
+    push.softbodies = bDesc.addr;
+    push.shapeToRigidRemapTable = bRemap.addr;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairNum.addr;
+    push.stackSizeBytes = 64u;               // four uint4 slots
+    push.softBodyRigidPairs = 0ull;
+    push.numSoftBodyRigidPairs = 0u;
+    push.stackSizeNeededOnDevice = bNeeded.addr;
+    push.w.outPoint = bPt.addr; push.w.outNormalPen = bNp.addr; push.w.outBarycentric = bBary.addr;
+    push.w.outContactInfo = bInfo.addr; push.w.totalContactCount = bTotal.addr;
+    push.w.contactByX = bByX.addr; push.w.tempContactByX = bTmp.addr;
+    push.w.contactIndexSortedByX = bIdx.addr; push.w.contactSortedByX = bSorted.addr;
+    push.w.maxNumContacts = MAXC;
+
+    // ---- what must come out, worked out BEFORE the dispatch -------------------
+    float margin0 = 0.0f, margin1 = 0.0f, margin2 = 0.0f, marginN = 0.0f;
+    int win0 = -1, win1 = -1, win2 = -1, winN = -1;
+    const HV3 want0 = supportMaxX(scale0, identQ,   rigidQ0, p0, true,  margin0, win0);
+    const HV3 want1 = supportMaxX(scale0, identQ,   identQ,  p1, true,  margin1, win1);
+    const HV3 want2 = supportMaxX(scale2, meshRot2, identQ,  p2, true,  margin2, win2);
+    const HV3 naive2 = supportMaxX(scale2, meshRot2, identQ, p2, false, marginN, winN);
+    std::printf("  predicted: pair0 vertex %d (%.6f %.6f %.6f) gap %.6f margin %.4f\n",
+                win0, want0.x, want0.y, want0.z, -want0.x, margin0);
+    std::printf("  predicted: pair1 gap %.6f -- outside the 0.3 contact distance, NO contact\n",
+                -want1.x);
+    std::printf("  predicted: pair2 vertex %d (%.6f %.6f %.6f) gap %.6f margin %.4f "
+                "(scale-rotation-blind would give %.6f)\n",
+                win2, want2.x, want2.y, want2.z, -want2.x, margin2, -naive2.x);
+
+    // The premises the prediction rests on, asserted rather than assumed.
+    PXG_CHECK_MSG(margin0 > 0.02f && margin2 > 0.02f,
+                  "the winning vertex must be unique or the witness point is not predictable "
+                  "(margins %.5f, %.5f)", margin0, margin2);
+    PXG_CHECK_MSG(win0 == 0 && win2 == 7,
+                  "the supporting vertices must sit at the two ENDS of the blob's vertex array "
+                  "(got %d and %d) -- that is what makes a one-float4 shift of the array base, "
+                  "or a short vertex count, observable", win0, win2);
+    PXG_CHECK_MSG(-want0.x > 0.0f && -want0.x < 0.3f && -want2.x > 0.0f && -want2.x < 0.3f,
+                  "both hulls must be SEPARATED and inside the 0.3 contact distance "
+                  "(gaps %.5f, %.5f)", -want0.x, -want2.x);
+    PXG_CHECK_MSG(-want1.x > 0.3f && -want1.x < 0.3f + scale0.y,
+                  "the far box must sit in the band between the true contact distance (0.3) "
+                  "and the wrongly-inflated one (0.3 + scale.y = %.2f), got gap %.5f -- outside "
+                  "that band it stops testing the inflation rule",
+                  0.3f + scale0.y, -want1.x);
+    PXG_CHECK_MSG(want0.y > 0.0f && want0.z > 0.0f && (want0.y + want0.z) < 2.0f &&
+                  want2.y > 0.0f && want2.z > 0.0f && (want2.y + want2.z) < 2.0f,
+                  "both corners must project INSIDE the tet's x = 0 face triangle, or the "
+                  "nearest feature is an edge and the witness moves");
+    PXG_CHECK_MSG(std::fabs(want2.x - naive2.x) > 0.01f,
+                  "pair 2 exists to catch a vertex2Shape that ignores the mesh-scale rotation; "
+                  "if the faithful and the blind answer agree (%.6f vs %.6f) it catches nothing",
+                  want2.x, naive2.x);
+
+    Kernel k("softBodyContactGenBda.spv", "sb_primitiveContactGenLaunch", {}, sizeof(SbContactGenPush));
+    k.dispatch(/*gridX*/ 512u, {}, push, 1u, 1u);     // the engine's grid, SB_CG_GRID
+    dev->flush();
+
+    const uint32_t n = downloadBuffer<uint32_t>(dev, bTotal.h, 1)[0];
+    const auto gPt = downloadBuffer<F4>(dev, bPt.h, MAXC);
+    const auto gNp = downloadBuffer<F4>(dev, bNp.h, MAXC);
+    const auto gInfo = downloadBuffer<FemOtherContactInfoHost>(dev, bInfo.h, MAXC);
+    for (uint32_t i = 0; i < n && i < MAXC; ++i)
+        std::printf("  contact %u: point=(%.6f %.6f %.6f rest=%.3f) normal=(%.5f %.5f %.5f) "
+                    "pen=%.6f mat=%u\n", i, gPt[i].x, gPt[i].y, gPt[i].z, gPt[i].w,
+                    gNp[i].x, gNp[i].y, gNp[i].z, gNp[i].w, gInfo[i].rigidMatInd & 0x7fffffffu);
+
+    PXG_CHECK_MSG(n == 3u,
+                  "the near BOX, the CONVEXMESH and the overlapping BOX must each emit one "
+                  "contact and the far box none, got %u", n);
+
+    bool sawBox = false, sawConvex = false, sawOverlap = false;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        const uint32_t mat = gInfo[i].rigidMatInd & 0x7fffffffu;
+        PXG_CHECK_MSG(mat != 22u,
+                      "the far box is 0.4 away and the contact distance is 0.3, so it must NOT "
+                      "produce a contact.  It does if the hull branch inflates the contact "
+                      "distance by a radius the way the sphere branch does");
+        PXG_CHECK_MSG(std::fabs(gNp[i].x - 1.0f) < 1e-3f && std::fabs(gNp[i].y) < 1e-3f &&
+                      std::fabs(gNp[i].z) < 1e-3f,
+                      "the normal is +x, got (%.5f %.5f %.5f)", gNp[i].x, gNp[i].y, gNp[i].z);
+
+        if (mat == 24u)
+        {
+            // The OVERLAP: EPA's answer, not GJK's.  Only the depth is decidable -- the
+            // witness pair is any point of the slab (see the geometry note above).
+            sawOverlap = true;
+            PXG_CHECK_MSG(std::fabs(gNp[i].w - WANT_PEN3) < 2e-3f,
+                          "the overlapping box pokes 0.05 through the x = 0 face and every "
+                          "other escape is at least 0.26, so the depth is %.5f, got %.6f",
+                          WANT_PEN3, gNp[i].w);
+            PXG_CHECK(std::fabs(gPt[i].w - 0.06f) < 1e-6f);
+            continue;
+        }
+
+        const HV3& want = (mat == 21u) ? want0 : want2;
+        PXG_CHECK_MSG(std::fabs(gPt[i].x) < 1e-3f &&
+                      std::fabs(gPt[i].y - want.y) < 1e-3f && std::fabs(gPt[i].z - want.z) < 1e-3f,
+                      "contact %u (material %u): the witness on the TET is the winning hull "
+                      "corner projected onto x = 0, (0, %.6f, %.6f), got (%.6f %.6f %.6f)",
+                      i, mat, want.y, want.z, gPt[i].x, gPt[i].y, gPt[i].z);
+        PXG_CHECK_MSG(std::fabs(gNp[i].w + want.x) < 1e-3f,
+                      "contact %u (material %u): the separation is -corner.x = %.6f, got %.6f.  "
+                      "A hull folds NO radius into the contact distance and subtracts none "
+                      "from the penetration", i, mat, -want.x, gNp[i].w);
+        if (mat == 21u) { sawBox = true;    PXG_CHECK(std::fabs(gPt[i].w - 0.03f) < 1e-6f); }
+        if (mat == 23u) { sawConvex = true; PXG_CHECK(std::fabs(gPt[i].w - 0.05f) < 1e-6f); }
+    }
+    PXG_CHECK_MSG(sawBox, "the near BOX produced no contact");
+    PXG_CHECK_MSG(sawConvex, "the CONVEXMESH produced no contact");
+    PXG_CHECK_MSG(sawOverlap, "the OVERLAPPING box produced no contact -- this is the only pair "
+                              "that drives a hull cloud through EPA rather than GJK alone");
+
+    for (PxgBufferHandle h : { bVerts.h, bTets.h, bDesc.h, bBlob.h, bBlobBox.h, bShapes.h,
+                               bCms.h, bXf.h, bCd.h, bRest.h, bRemap.h, bStack.h, bPairNum.h,
+                               bNeeded.h, bPt.h, bNp.h, bBary.h, bInfo.h, bByX.h, bTmp.h,
+                               bIdx.h, bSorted.h, bTotal.h })
         dev->destroyBuffer(h);
 }
 

@@ -451,6 +451,8 @@ static const uint GEOM_PLANE = 1u;
 // PxGeometryType (PxGeometry.h:57): eSPHERE 0, ePLANE 1, eCAPSULE 2, eBOX 3, eCONVEXMESH 4.
 static const uint GEOM_SPHERE = 0u;
 static const uint GEOM_CAPSULE = 2u;
+static const uint GEOM_BOX = 3u;
+static const uint GEOM_CONVEXMESH = 4u;
 
 // PxgRigidFilterPair (PxgSimulationCoreDesc.h, 32 B): index0 u64 @0, index1 u64 @8,
 // index2 u32 @16, tail padding.
@@ -568,6 +570,32 @@ float3 quatRotateInv(float4 q, float3 v)
     const float vx = w * w - dot(u, u);
     return v * vx - cross(u, v) * (w * 2.0f) + u * (dot(u, v) * 2.0f);
 }
+// PxQuat::rotateInv (PxQuat.h:324), transcribed term for term.  `quatRotateInv` above is a
+// DIFFERENT, algebraically equivalent form that the plane path has always used; the hull
+// decode gets the literal one because vertex2Shape applies it to every hull vertex and the
+// result feeds GJK, where a last-bit difference can flip a support-vertex choice.
+float3 cgQuatRotateInv(float4 q, float3 v)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q.w * q.w - 0.5f;
+    const float dot2 = (q.x * vx + q.y * vy + q.z * vz);
+    return float3(vx * w2 - (q.y * vz - q.z * vy) * q.w + q.x * dot2,
+                  vy * w2 - (q.z * vx - q.x * vz) * q.w + q.y * dot2,
+                  vz * w2 - (q.x * vy - q.y * vx) * q.w + q.z * dot2);
+}
+
+// vertex2Shape (cudaNpCommon.h:270).  PxMeshScale is a NON-UNIFORM scale expressed in a
+// rotated frame: rotate the vertex into that frame, scale it componentwise, rotate back.
+// It is not `v * scale` unless the scale rotation is identity.
+float3 cgVertex2Shape(float3 v, float3 scale, float4 rot)
+{
+    float3 temp = cgQuatRotate(rot, v);
+    temp.x *= scale.x;
+    temp.y *= scale.y;
+    temp.z *= scale.z;
+    return cgQuatRotateInv(rot, temp);
+}
+
 // PxQuat::getBasisVector0() — the rotated x axis.
 float3 quatBasisVector0(float4 q)
 {
@@ -584,15 +612,18 @@ float3 quatBasisVector0(float4 q)
 // The rigid becomes a POINT CLOUD and the tetrahedron the second one, and
 // tetPrimitivesCollide2 does the rest.  Sphere and capsule are the two types whose cloud
 // needs no convex-hull decode at all -- one vertex for a sphere, two for a capsule's segment
-// endpoints -- which is why they land first; BOX and CONVEXMESH additionally need the hull
-// blob walked and prepareVertices, and stay unmapped for now (they emit nothing, exactly as
-// they did when only the plane path existed).
+// endpoints -- which is why they landed first.  BOX and CONVEXMESH followed and share ONE
+// branch: to this code a box is just a cooked eight-vertex hull, so both walk the same blob
+// (uint4 header, float4 extents, float4 vertices) and both run prepareVertices.  The two
+// differ in exactly two scalars -- the inner-sphere scale factor and nothing else.
 //
 // THE RADIUS IS NOT IN THE CLOUD.  A sphere's cloud is its CENTRE and a capsule's is its
 // segment; the radius is folded into the contact distance instead (`cDistance + scale.x` for
 // a sphere, `+ scale.y` for a capsule) and then subtracted back out of the penetration as
 // `penOffset = -radius`.  That is how upstream keeps GJK working on point sets rather than
 // on inflated hulls, and getting it wrong gives contacts that are exactly one radius off.
+// A HULL HAS NO SUCH RADIUS: `radius` stays 0 for box and convex mesh, the contact distance
+// is passed through unmodified, and the penetration needs no correction.
 //
 // NOTE which scale component is which: PxMeshScale.scale.x is a sphere's radius and a
 // capsule's HALF-HEIGHT, while scale.y is a capsule's radius -- and `radius`, the value used
@@ -636,25 +667,75 @@ void sbGjkPrimitive(uint lane, PxgShape rigidShape, uint rigidCacheRef, uint sof
     GjkCloud a;
     for (uint i = 0u; i < GJK_MAX_CLOUD; ++i) a.v[i] = float3(0.0f, 0.0f, 0.0f);
     float contactDist;
-    const float radius = rigidShape.scaleY;
+    float inSphereRadius0 = 0.0f;
+    // `radius` is scale.y for a sphere and a capsule and ZERO for a hull — the hull carries
+    // its own thickness in its vertices, so nothing is folded into the contact distance and
+    // nothing has to be taken back out (softbodyPrimitives.cu:475-481).
+    float radius = 0.0f;
     if (rigidShape.type == GEOM_SPHERE)
     {
         a.n = 1u;
         a.v[0] = rigidP;
         contactDist = cDistance + rigidShape.scaleX;
+        radius = rigidShape.scaleY;
     }
-    else   // GEOM_CAPSULE
+    else if (rigidShape.type == GEOM_CAPSULE)
     {
         a.n = 2u;
         const float3 wHalfHeight = cgQuatRotate(rigidQ, float3(rigidShape.scaleX, 0.0f, 0.0f));
         a.v[0] = rigidP + wHalfHeight;
         a.v[1] = rigidP - wHalfHeight;
         contactDist = cDistance + rigidShape.scaleY;
+        radius = rigidShape.scaleY;
+    }
+    else   // GEOM_BOX or GEOM_CONVEXMESH — both are the same convex-hull blob
+    {
+        // The blob starts with one float4 that the collision code skips
+        // (`convexPtr = hullPtr + sizeof(float4)`, softbodyPrimitives.cu:471); from there
+        // it is a uint4 header, a float4 of extents, then the hull vertices as float4.
+        // hullOrMeshOffset carries `size_t hullOrMeshPtr` verbatim — under this bridge a
+        // CUdeviceptr IS a VkDeviceAddress, so the two halves reassemble into a BDA.
+        const uint64_t hullPtr = uint64_t(rigidShape.hullOrMeshOffset.x) |
+                                 (uint64_t(rigidShape.hullOrMeshOffset.y) << 32);
+        const uint64_t convexPtr = hullPtr + 16UL;
+        const uint4 header = Ptr<uint4>(convexPtr)[0];
+        const float4 extents = Ptr<float4>(convexPtr + 16UL)[0];
+
+        // header.x = polyData0_NbEdgesNbHullVerticesNbPolygons; getNbVerts = u16High(u32Low).
+        uint nbVertices0 = (((header.x & 0xffffu) >> 8) & 0xffu);
+        // CONVEX_MAX_VERTICES_POLYGONS (convexNpCommon.h:52) is 64, which is exactly
+        // GJK_MAX_CLOUD; upstream asserts the bound, we clamp it so a corrupt header cannot
+        // walk off the end of the per-thread cloud.
+        nbVertices0 = min(nbVertices0, GJK_MAX_CLOUD);
+
+        // extents.w is the hull's stored inner-sphere radius in VERTEX space.  A box is the
+        // one type whose PxMeshScale is the half-extent itself, so the radius has to shrink
+        // with the tightest axis; a convex mesh's scale is already baked into the blob and
+        // upstream leaves the factor at 1 (softbodyPrimitives.cu:513-519).
+        float minimumScale = 1.0f;
+        if (rigidShape.type == GEOM_BOX)
+            minimumScale = min(rigidShape.scaleZ, min(rigidShape.scaleX, rigidShape.scaleY));
+        inSphereRadius0 = extents.w * minimumScale;
+
+        // NO radius inflation for a hull.
+        contactDist = cDistance;
+
+        // prepareVertices (cudaNpCommon.h:315): vertex space -> shape space -> world.
+        const float3 scale = float3(rigidShape.scaleX, rigidShape.scaleY, rigidShape.scaleZ);
+        const float4 scaleRot = float4(rigidShape.scaleRotX, rigidShape.scaleRotY,
+                                       rigidShape.scaleRotZ, rigidShape.scaleRotW);
+        Ptr<float4> hullVerts = Ptr<float4>(convexPtr + 32UL);
+        for (uint i = 0u; i < nbVertices0; ++i)
+        {
+            const float3 vv = hullVerts[i].xyz;
+            a.v[i] = cgQuatRotate(rigidQ, cgVertex2Shape(vv, scale, scaleRot)) + rigidP;
+        }
+        a.n = nbVertices0;
     }
 
     GjkOut o;
     const uint result = tetPrimitivesCollide2(a, b, rigidP - tetCenter, contactDist,
-                                              /*inSphereRadius0*/ 0.0f, innerSphere, o);
+                                              inSphereRadius0, innerSphere, o);
 
     // Both OVERLAP and CLOSE mean "touching" to the caller (softbodyPrimitives.cu:561).
     if (!(result == GJK_OVERLAP || result == GJK_CLOSE))
@@ -737,9 +818,10 @@ void sb_primitiveContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
                               rigidId, uint2(softBodyMask, 0u)))
                 continue;
 
-            // *** SPHERE and CAPSULE go through GJK/EPA; BOX and CONVEXMESH still do not.
-            // See the header. ***
-            if (rigidShape.type == GEOM_SPHERE || rigidShape.type == GEOM_CAPSULE)
+            // *** Everything that is not a PLANE goes through GJK/EPA, exactly as in the
+            // .cu: sphere, capsule, box and convex mesh all become point clouds. ***
+            if (rigidShape.type == GEOM_SPHERE || rigidShape.type == GEOM_CAPSULE ||
+                rigidShape.type == GEOM_BOX || rigidShape.type == GEOM_CONVEXMESH)
             {
                 sbGjkPrimitive(lane, rigidShape, rigidCacheRef, softbodyId, tetrahedronIdx,
                                cDistance, restDist, rigidId, softBodyMask, softbodies);
