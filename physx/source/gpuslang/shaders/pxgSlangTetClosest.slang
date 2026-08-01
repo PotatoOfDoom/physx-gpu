@@ -1,0 +1,178 @@
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+//  * Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+//  * Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in the
+//    documentation and/or other materials provided with the distribution.
+//  * Neither the name of NVIDIA CORPORATION nor the names of its
+//    contributors may be used to endorse or promote products derived
+//    from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
+// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+// Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
+
+
+// ===========================================================================
+// pxgSlangTetClosest — the point-vs-tetrahedron geometry the deformable narrowphase shares.
+//
+// Extracted from softBodySelfCollisionBda when the softbody-vs-cloth VERTEX contact generator
+// (P8.8 step 4) turned out to need the same four functions.  Nothing here changed in the
+// move; the self-collision fixture re-verifies the module for free, which is the point of
+// extracting rather than copying.
+//
+//   getNormalized            — rsqrt normalise, zero for a zero vector
+//   isValidTet               — signed volume > 1e-9
+//   isPointOutsideOfPlane4   — the four per-face sign products; ALL >= 0 means the point is
+//                              INSIDE.  The CUDA name reads the other way round and is
+//                              transcribed rather than renamed.
+//   closestPtTetrahedron     — the closest point on the SURFACE faces named by a 4-bit hint,
+//                              with the outward normal of the winning face
+//
+// NoContraction applies at the importer: these are dot-of-cross chains throughout, and the
+// only rsqrt picks a direction rather than a decision.
+// ===========================================================================
+module pxgSlangTetClosest;
+
+public float3 getNormalized(float3 v)
+{
+    const float m = dot(v, v);
+    return m > 0.0f ? v * rsqrt(m) : float3(0, 0, 0);
+}
+
+public bool isValidTet(float3 v0, float3 v1, float3 v2, float3 v3)
+{
+    return dot(v1 - v0, cross(v2 - v0, v3 - v0)) > 1e-9f;
+}
+
+// PointOutsideOfPlane4: per-face product of the point's and the opposite vertex's signed
+// distances; all >= 0 means the point is INSIDE (the CUDA name reads the other way round —
+// it is transcribed, not renamed).
+public bool isPointOutsideOfPlane4(float3 p, float3 a, float3 b, float3 c, float3 d)
+{
+    const float3 ap = p - a;
+    const float3 ab = b - a;
+    const float3 ac = c - a;
+    const float3 ad = d - a;
+
+    const float3 v0 = cross(ab, ac);
+    const float signa0 = dot(v0, ap);
+    const float signd0 = dot(v0, ad);
+
+    const float3 v1 = cross(ac, ad);
+    const float signa1 = dot(v1, ap);
+    const float signd1 = dot(v1, ab);
+
+    const float3 v2 = cross(ad, ab);
+    const float signa2 = dot(v2, ap);
+    const float signd2 = dot(v2, ac);
+
+    const float3 bd = d - b;
+    const float3 bc = c - b;
+    const float3 v3 = cross(bd, bc);
+    const float signd3 = dot(v3, p - b);
+    const float signa3 = dot(v3, a - b);
+
+    return (signa0 * signd0 >= 0.0f) && (signa1 * signd1 >= 0.0f) &&
+           (signa2 * signd2 >= 0.0f) && (signa3 * signd3 >= 0.0f);
+}
+
+float3 closestPtPointTriangle2(float3 p, float3 a, float3 b, float3 c, float3 ab, float3 ac)
+{
+    const float3 ap = p - a;
+    const float d1 = dot(ab, ap);
+    const float d2 = dot(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) return a;
+    const float3 bp = p - b;
+    const float d3 = dot(ab, bp);
+    const float d4 = dot(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3) return b;
+    const float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) { const float v = d1 / (d1 - d3); return a + v * ab; }
+    const float3 cp = p - c;
+    const float d5 = dot(ab, cp);
+    const float d6 = dot(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6) return c;
+    const float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) { const float w = d2 / (d2 - d6); return a + w * ac; }
+    const float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f)
+    { const float w = (d4 - d3) / ((d4 - d3) + (d5 - d6)); return b + w * (c - b); }
+    const float denom = 1.0f / (va + vb + vc);
+    return a + ab * (vb * denom) + ac * (vc * denom);
+}
+
+public void closestPtTetrahedron(float3 point, uint hint, float3 a, float3 b, float3 c, float3 d,
+                          inout float3 normal, inout float3 closestP, inout float sqDist)
+{
+    const float3 ac = c - a;
+    const float3 ab = b - a;
+    const float3 ad = d - a;
+
+    if ((hint & 1u) != 0u)
+    {
+        const float3 tPoint = closestPtPointTriangle2(point, a, b, c, ab, ac);
+        const float3 v = tPoint - point;
+        const float tSqDist = dot(v, v);
+        if (tSqDist < sqDist)
+        {
+            normal = getNormalized(cross(ac, ab));
+            if (dot(ad, normal) < 0.0f) normal = -normal;
+            closestP = tPoint;
+            sqDist = tSqDist;
+        }
+    }
+    if ((hint & 2u) != 0u)
+    {
+        const float3 tPoint = closestPtPointTriangle2(point, a, b, d, ab, ad);
+        const float3 v = tPoint - point;
+        const float tSqDist = dot(v, v);
+        if (tSqDist < sqDist)
+        {
+            normal = getNormalized(cross(ab, ad));
+            if (dot(ac, normal) < 0.0f) normal = -normal;
+            closestP = tPoint;
+            sqDist = tSqDist;
+        }
+    }
+    if ((hint & 4u) != 0u)
+    {
+        const float3 tPoint = closestPtPointTriangle2(point, a, c, d, ac, ad);
+        const float3 v = tPoint - point;
+        const float tSqDist = dot(v, v);
+        if (tSqDist < sqDist)
+        {
+            normal = getNormalized(cross(ac, ad));
+            if (dot(ab, normal) < 0.0f) normal = -normal;
+            closestP = tPoint;
+            sqDist = tSqDist;
+        }
+    }
+    if ((hint & 8u) != 0u)
+    {
+        const float3 bd = d - b;
+        const float3 bc = c - b;
+        const float3 tPoint = closestPtPointTriangle2(point, b, c, d, bc, bd);
+        const float3 v = tPoint - point;
+        const float tSqDist = dot(v, v);
+        if (tSqDist < sqDist)
+        {
+            normal = getNormalized(cross(bc, bd));
+            if (dot(ab, normal) > 0.0f) normal = -normal;
+            closestP = tPoint;
+            sqDist = tSqDist;
+        }
+    }
+}

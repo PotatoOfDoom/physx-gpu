@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 244;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 245;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -284,7 +284,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_clothMidphaseGeneratePairsLaunch", "softBodyClothMidphaseBda.spv", "sb_clothMidphaseGeneratePairsLaunch" },  // SB_CLOTH_MIDPHASE (P8.8 BDA port — the tet-bound BV32 walk over the cloth tree)
     { "sb_clothContactGenLaunch", "softBodyClothContactGenBda.spv", "sb_clothContactGenLaunch" },  // SB_CLOTH_CG (P8.8 step 2 BDA port — tet-vs-triangle GJK/EPA)
     { "sb_clothVertMidphaseGeneratePairsLaunch", "softBodyClothVertMidphaseBda.spv", "sb_clothVertMidphaseGeneratePairsLaunch" },  // SB_CLOTH_VERT_MIDPHASE (P8.8 step 3 BDA port — a cloth vertex queries the softbody tet tree)
-    { "sb_clothVertContactGenLaunch", nullptr, nullptr },  // SB_CLOTH_VERT_CG (unmapped)
+    { "sb_clothVertContactGenLaunch", "softBodyClothVertContactGenBda.spv", "sb_clothVertContactGenLaunch" },  // SB_CLOTH_VERT_CG (P8.8 step 4 BDA port — point-vs-tet closest point)
     { "sb_meshMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_MESH_MIDPHASE (unmapped)
     { "sb_sdfMeshMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_SDF_MESH_MIDPHASE (unmapped)
     { "sb_meshContactGenLaunch", nullptr, nullptr },  // SB_MESH_CG (unmapped)

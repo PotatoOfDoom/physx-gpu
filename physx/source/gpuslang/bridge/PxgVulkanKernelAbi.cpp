@@ -560,6 +560,15 @@ static const uint8_t kSbClothContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 4
 //   padding before a pointer, here it carries a real PxReal.
 static const uint8_t kSbClothVertMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 8, 4, 4, 8, 8 };
 
+// sb_clothVertContactGenLaunch(PxReal tolerenceLength, cmInputs*, transformCache*,
+//   contactDistance*, gpuShapes*, softbodies*, clothes*, PxU32 stackSizeBytes, stackPtr*,
+//   midphasePairsNum*, PxgNonRigidFilterPair* filterPairs, PxU32 nbFilterPairs,
+//   stackSizeNeededOnDevice*, PxgSoftBodyContactWriter writer) -> 4 @0, six pointers @8..@48,
+//   PxU32 @56, pointers @64/@72/@80, PxU32 @88, a pointer @96, the 56-byte writer at @104 ->
+//   160-byte blob.  SAME SIZE and SAME argument count as kSbClothContactGen, but
+//   stackSizeBytes sits BEFORE the stack pointer here and after midphasePairsNum there.
+static const uint8_t kSbClothVertContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 4, 8, 56 };
+
 // gpunarrowphase / gpusimulationcontroller softbody SELF-collision SOLVE chain (P8.4
 // tranche b):
 //   sb_fem_contact_remap_to_simLaunch(const PxgSoftBody* softbodies, float4* outBarycentric0,
@@ -1003,6 +1012,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_clothMidphaseGeneratePairsLaunch", kSbClothMidphase, uint32_t(sizeof(kSbClothMidphase)) },
     { "sb_clothContactGenLaunch", kSbClothContactGen, uint32_t(sizeof(kSbClothContactGen)) },
     { "sb_clothVertMidphaseGeneratePairsLaunch", kSbClothVertMidphase, uint32_t(sizeof(kSbClothVertMidphase)) },
+    { "sb_clothVertContactGenLaunch", kSbClothVertContactGen, uint32_t(sizeof(kSbClothVertContactGen)) },
     // gpunarrowphase / gpusimulationcontroller softbody SELF-collision solve chain (P8.4 tranche b)
     { "sb_fem_contact_remap_to_simLaunch", kSbFemContactRemapToSim, uint32_t(sizeof(kSbFemContactRemapToSim)) },
     { "sb_softbodyContactPrepareLaunch", kSbSsContactPrepare, uint32_t(sizeof(kSbSsContactPrepare)) },

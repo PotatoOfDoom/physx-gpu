@@ -1620,9 +1620,9 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
-## P8.8 — the softbody-vs-CLOTH chain (steps 1 to 3 of 6)
+## P8.8 — the softbody-vs-CLOTH chain (steps 1 to 4 of 6)
 
-Softbody-vs-cloth needs six kernels.  Three are on the engine BDA ABI; the chain does not run
+Softbody-vs-cloth needs six kernels.  Four are on the engine BDA ABI; the chain does not run
 end to end yet, and this section says which half is which rather than implying otherwise.
 
 | # | kernel | state |
@@ -1630,7 +1630,7 @@ end to end yet, and this section says which half is which rather than implying o
 | 1 | `sb_clothMidphaseGeneratePairsLaunch` | **mapped** (step 1) |
 | 2 | `sb_clothContactGenLaunch` | **mapped** (step 2) |
 | 3 | `sb_clothVertMidphaseGeneratePairsLaunch` | **mapped** (step 3) |
-| 4 | `sb_clothVertContactGenLaunch` | unmapped |
+| 4 | `sb_clothVertContactGenLaunch` | **mapped** (step 4) |
 | 5 | `sb_clothContactPrepareLaunch` | unmapped |
 | 6 | `sb_solveOutputSCDeltaVLaunch` | unmapped |
 
@@ -1722,7 +1722,42 @@ caught it (the assertion message still printed its own literal, "got 4, expected
 condition that had become 6).  Edits to this 8000-line multi-fixture file need anchors that
 include surrounding context, not bare substrings.
 
-Manifest hand-edited 241 → 244.  Suite **674/674 in both memory modes** after each step.
+**Step 4 — the vertex contact generator.**  The consumer of step 3's pairs, and the simplest
+kernel of the chain: one thread per (cloth vertex, tetrahedron) pair, no warp cooperation, no
+GJK.  A point-vs-tetrahedron closest-point query answers it outright.
+
+Its two branches are **different contacts, not two spellings of one**.  A vertex INSIDE the
+tetrahedron takes the winning surface face's normal and a NEGATIVE penetration, with **no
+contact-distance test at all** — inside is a contact at any depth.  A vertex OUTSIDE is
+rejected beyond the contact distance, then takes a positive penetration and the
+closest-point direction when that agrees with the face normal past 0.707, the face normal
+otherwise.  So the SIGN of `pen` carries the inside/outside distinction downstream, and both
+branches store the same point: the witness on the tet's surface.
+
+The filter is a **three-way OR**, not step 2's two-level AND-chain — a vertex is a single
+element, so there is nothing to take a conjunction over.  And `barycentric0` is the constant
+`(0, 0, 0, 1)`: the cloth side is one vertex, so upstream stores a degenerate marker rather
+than computing anything.
+
+`closestPtTetrahedron` and its three companions moved out of `softBodySelfCollisionBda` into
+a new module, **`pxgSlangTetClosest`**, rather than being copied — the self-collision fixture
+re-verifies them for free, which is the point of extracting.
+
+Ten mutants killed.  Four needed the geometry sharpened: a vertex INSIDE but FARTHER from the
+face than the contact distance (the only case that shows the inside branch skipping the test);
+a witness on a face CORNER rather than in its interior, so the closest-point direction and the
+face normal actually differ and the 0.707 threshold becomes visible (predicted exactly:
+pen 0.206155, normal −0.24253/0.97014); a stack deliberately smaller than the pair count, so
+"report what was FOUND" can be told from "report what fitted"; and a leading dummy cloth vertex
+so the vertex and tetrahedron indices differ and their order in the contact info is observable.
+
+**One of my own labels was wrong, not the shader.**  The first draft called two vertices at
+positive y "outside"; the tetrahedron sits ABOVE its y = 0 face, so they were inside, and the
+inside branch correctly reported them without a distance test.  The shader was consistent
+throughout — the third vertex matched its prediction exactly on the first run — and the fix was
+to the fixture's geometry and its comments.
+
+Manifest hand-edited 241 → 245.  Suite **674/674 in both memory modes** after each step.
 
 ## P8.7 — MILESTONE: the softbody settles on the ground BOX that was always there
 
