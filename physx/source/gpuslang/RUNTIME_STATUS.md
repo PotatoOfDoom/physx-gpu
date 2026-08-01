@@ -1854,8 +1854,37 @@ What it established, measured rather than assumed:
   iteration).  All report OK;
 * and the sheet falls through anyway.  So the kernels run and produce nothing that pushes.
 
-The next question is whether the narrowphase emits zero contacts or emits contacts the solve
-cannot act on.  That needs a read-back of `mSCTotalContactCountBuffer` — not another guess.
+### The contact-count read-back — the answer, and where the gap actually is
+
+Two temporary probes (one in `testSDKSoftbodyCloth` after the vertex contact-gen, one around the
+`sb_clothContactPrepareLaunch` dispatch, both since reverted) measured the chain on live data:
+
+| stage | measured |
+|---|---|
+| vertex midphase pairs | **170 – 231 per frame** |
+| vertex contact gen | **29 – 48 contacts per frame** |
+| `sb_fem_contact_remap_to_simLaunch` | runs, 16 frames of 40 |
+| prepare: count in / out | **44 → 44**, `mMaxContacts` = 1048576, so nothing is clamped away |
+| prepare: constraint 0 | normal ≈ (0, 1, 0), `velMultiplier` ≈ 0.1 (NON-zero), friction 0.5, barycentric summing to 1 |
+| prepare: penetration over frames | **+0.0923 → −0.0117 → −0.0403 → −0.0602** |
+| solve | 540 launches per 60 steps |
+
+**So the narrowphase emits contacts, the remap runs, and the constraint build is CORRECT on live
+data.**  The normal points up, the penetration tracks the sheet sinking into the cube frame by
+frame, and `velMultiplier` is non-zero — which matters, because a zero there is exactly what
+makes the solve skip a contact.
+
+And the sheet keeps sinking.  The penetration growing monotonically more negative is the tell:
+the constraint sees the interpenetration correctly and nothing corrects it.
+
+**The gap is therefore between the solve WRITING its deltas and those deltas reaching the
+vertices** — not in the midphase, the contact generation, the remap or the prepare, all four of
+which are now verified against live data rather than only against fixtures.  The solve scatters
+into `cloth.mDeltaPos` and `softbody.mSimDelta`; the next step is to establish which pass is
+meant to consume those on the softbody-vs-cloth path, and whether it does.
+
+That is a much smaller question than the one this scene started with, and it is the whole
+reason the scene was worth building before porting anything further.
 
 **One correction to an earlier reading in this session.**  A 3-step launch trace showed no
 vertex-path kernels and I took that to mean the narrowphase function was never reached.  It was

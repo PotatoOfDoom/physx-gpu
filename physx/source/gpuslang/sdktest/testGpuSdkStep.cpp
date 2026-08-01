@@ -1843,9 +1843,16 @@ bool softBodySelfTopY(const SoftBodySelfScene& ssc, float& meanY, float& minY)
 //     540 (once per solver iteration).  All four report OK;
 //   * and the sheet still falls clean through the cube to the plane.
 //
-// So the kernels run and produce nothing that pushes.  The next question is whether the
-// narrowphase emits zero contacts or emits contacts the solve cannot act on -- which needs a
-// read-back of mSCTotalContactCountBuffer, not another guess.
+// So the kernels run and produce nothing that pushes.  A contact-count read-back (two temporary
+// probes, since reverted) narrowed that down: the vertex midphase emits 170-231 PAIRS per frame,
+// the contact generator 29-48 CONTACTS, the remap runs, and the prepare sees the full count
+// (44 in, 44 out, mMaxContacts = 1048576) and builds SANE constraints -- normal (0, 1, 0),
+// velMultiplier ~0.1 (non-zero, so the solve does not skip), friction 0.5, and a penetration
+// that tracks the sheet sinking frame by frame: +0.0923, -0.0117, -0.0403, -0.0602.
+//
+// So everything up to and including the constraint build is correct on LIVE data.  The gap is
+// between the solve writing its deltas -- into cloth.mDeltaPos and softbody.mSimDelta -- and
+// those deltas reaching the vertices.  That is the next thing to establish.
 //
 // ALSO WORTH KNOWING BEFORE SPENDING MORE ON THIS: upstream hard-codes
 // `supportClothTriangleCollision = false` (PxgNarrowphaseCore.cpp:4529), so the TRIANGLE half
