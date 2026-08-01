@@ -1831,28 +1831,37 @@ bool softBodySelfTopY(const SoftBodySelfScene& ssc, float& meanY, float& minY)
 // the softbody scene's header gives: both are real obstacles now that the hull branch exists,
 // and neither belongs in what this scene measures.
 //
-// *** THIS SCENE FAILS TODAY, ON PURPOSE, AND IS NOT A REGRESSION. ***
+// THE MASS RATIO IS PART OF THE SETUP, NOT A DETAIL.  The sheet spent one whole tranche falling
+// straight through the cube while every kernel in the chain dispatched, emitted pairs, emitted
+// contacts and built sane constraints.  The chain was right the entire time; THE SCENE WAS
+// WRONG.  A read-back of the two inverse-mass fields settled it in one line:
 //
-// It is a FRONTIER MARKER, not part of the green suite.  What it established, measured rather
-// than assumed:
+//     clothW = 1        softbody sim vertex W = 192
+//
+// The cube's simulation vertices come out of the cooker at invMass 192 -- about 0.14 kg for the
+// whole cube -- and the sheet had been handed invMass 1, i.e. 1 kg PER VERTEX, 25 kg of cloth.
+// The constraint splits its correction as w_i / (w_cloth + sum bc^2 w_softbody), so 90% of every
+// impulse went into shoving the CUBE out of the way and 10% into holding the sheet.  The solve
+// was doing exactly the right thing with the masses it was given.  Raising the sheet's invMass
+// to 200 (PXG_SC_CLOTHW, see the builder) catches it immediately and it settles.
+//
+// The lesson is worth keeping: "the deltas do not reach the vertices" was the wrong hypothesis
+// twice over.  They reached the vertices the whole time -- a probe on cloth.mDeltaPos right
+// after the solve showed 18-25 non-zero entries per iteration and lambdaN accumulating
+// monotonically (0.0047 -> 0.0197 over nine iterations).  What looked like a dead chain was a
+// live chain moving the lighter of the two bodies.
+//
+// What the passing run establishes, measured rather than assumed:
 //
 //   * the pair IS classified into GPU_BUCKET_ID::eSoftbodyFemCloth (probed directly in
 //     cndCaseTetraMesh: compat = 1, isRigid1 = 0);
-//   * the chain DOES dispatch end to end.  Over 60 steps: sb_clothVertMidphaseGeneratePairs 36
-//     launches, sb_clothVertContactGen 36, sb_clothContactPrepare 60, sb_solveOutputSCDeltaV
-//     540 (once per solver iteration).  All four report OK;
-//   * and the sheet still falls clean through the cube to the plane.
-//
-// So the kernels run and produce nothing that pushes.  A contact-count read-back (two temporary
-// probes, since reverted) narrowed that down: the vertex midphase emits 170-231 PAIRS per frame,
-// the contact generator 29-48 CONTACTS, the remap runs, and the prepare sees the full count
-// (44 in, 44 out, mMaxContacts = 1048576) and builds SANE constraints -- normal (0, 1, 0),
-// velMultiplier ~0.1 (non-zero, so the solve does not skip), friction 0.5, and a penetration
-// that tracks the sheet sinking frame by frame: +0.0923, -0.0117, -0.0403, -0.0602.
-//
-// So everything up to and including the constraint build is correct on LIVE data.  The gap is
-// between the solve writing its deltas -- into cloth.mDeltaPos and softbody.mSimDelta -- and
-// those deltas reaching the vertices.  That is the next thing to establish.
+//   * the chain dispatches end to end.  Over 40 steps: sb_clothVertMidphaseGeneratePairs 16
+//     launches, sb_clothVertContactGen 16, sb_clothContactPrepare 40, sb_solveOutputSCDeltaV
+//     360 (once per solver iteration), sb_fem_contact_remap_to_sim 16;
+//   * the vertex midphase emits 170-231 PAIRS per frame and the generator 29-48 CONTACTS;
+//   * the prepare sees the full count (44 in, 44 out, mMaxContacts = 1048576) and builds sane
+//     constraints -- normal (0, 1, 0), velMultiplier ~0.097, friction 0.5;
+//   * and the sheet is CAUGHT and SETTLES on the cube.
 //
 // ALSO WORTH KNOWING BEFORE SPENDING MORE ON THIS: upstream hard-codes
 // `supportClothTriangleCollision = false` (PxgNarrowphaseCore.cpp:4529), so the TRIANGLE half
@@ -2068,12 +2077,26 @@ SoftBodyClothScene buildSoftBodyClothScene(PxPhysics* physics, PxScene* scene, P
         cshape->release();
         scene->addActor(*surface);
 
-        const float spawnY = 2.0f;
+        // Spawn height.  The default 2.0 is a full metre of free fall onto a 1 m cube: the sheet
+        // arrives at ~4.5 m/s, which is FASTER than one frame's contact-resolution budget (see
+        // RUNTIME_STATUS, P8.8).  PXG_SC_CLOTHY lowers it so the same chain can be exercised at
+        // a speed the constraint solve can actually absorb.
+        float spawnY = 2.0f;
+        if (const char* yEnv = std::getenv("PXG_SC_CLOTHY")) spawnY = float(atof(yEnv));
+
+        // Per-vertex INVERSE mass of the sheet.  This is not cosmetic: the constraint splits
+        // its correction between the two bodies as w_i / (w_cloth + sum bc^2 w_softbody), so
+        // the RATIO of the two inverse masses decides who moves.  The cube's simulation
+        // vertices come out of the cooker at invMass = 192 (mass 1/192 each, ~0.14 kg for the
+        // whole cube); a sheet at invMass = 1 is 25 kg of cloth landing on 0.14 kg of foam and
+        // the solve correctly pushes the CUBE out of the way instead of holding the sheet.
+        float clothInvMass = 200.0f;
+        if (const char* wEnv = std::getenv("PXG_SC_CLOTHW")) clothInvMass = float(atof(wEnv));
         const PxU32 nv = PxU32(verts.size());
         std::vector<PxVec4> posInvMass(nv), vel(nv, PxVec4(0.0f)), rest(nv);
         for (PxU32 v = 0; v < nv; ++v)
         {
-            posInvMass[v] = PxVec4(verts[v].x, spawnY, verts[v].z, 1.0f);
+            posInvMass[v] = PxVec4(verts[v].x, spawnY, verts[v].z, clothInvMass);
             rest[v] = posInvMass[v];
         }
         PxCudaContext* ctx = cudaCtx->getCudaContext();
@@ -2956,11 +2979,11 @@ int main()
                           "deformable-volume contacts -- the cloth chain is not feeding the solve\n");
               ++failures; }
             if (!(minY > CATCH_Y))
-            { std::printf("FAIL (EXPECTED TODAY -- see the scene header, this is a frontier "
-                          "marker and not a regression): the sheet sank to y=%.5f, below the "
-                          "catch bar %.2f (cube top y=%.2f).  All four reachable kernels of the "
-                          "chain dispatch and report OK, so they run and produce nothing that "
-                          "pushes\n", minY, CATCH_Y, sc.cubeTopY); ++failures; }
+            { std::printf("FAIL: the sheet sank to y=%.5f, below the catch bar %.2f (cube top "
+                          "y=%.2f).  If the chain itself still dispatches, check the MASS RATIO "
+                          "first (see the scene header): a sheet heavier than the cube is pushed "
+                          "through it by a correct solve\n", minY, CATCH_Y, sc.cubeTopY);
+              ++failures; }
             if (!(restMaxDy < 0.02f))
             { std::printf("FAIL: the caught sheet never settled (rest |dy|=%.6f)\n", restMaxDy);
               ++failures; }

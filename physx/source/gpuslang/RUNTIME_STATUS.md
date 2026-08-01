@@ -1620,11 +1620,16 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
-## P8.8 — MILESTONE: the softbody-vs-CLOTH chain is COMPLETE (6 of 6)
+## P8.8 — MILESTONE: a FEM sheet is CAUGHT BY A FEM CUBE (the softbody-vs-CLOTH chain, 6 of 6)
 
 Softbody-vs-cloth needs six kernels and **all six are on the engine BDA ABI**.  The chain
 runs end to end: midphase in both directions, contact generation for triangles and vertices,
 constraint prepare and solve.
+
+**`PXG_SCENE=softbodycloth` is GREEN.**  A FEM-surface sheet dropped from y = 2 is caught by a
+FEM-volume cube resting on a plane and settles on it at min y = **0.8688** (rest |dy| =
+0.000034); the control run with the cube removed falls to y = 0.  See "The scene" below — and in
+particular the mass-ratio finding, which is the reason this took two tranches instead of one.
 
 | # | kernel | state |
 |---|---|---|
@@ -1831,8 +1836,9 @@ computes `nbIterationsPerBlock = 1` and simply leaves contacts 256 and up unvisi
 in memory, and that is recorded rather than papered over.
 
 Manifest hand-edited 241 → 247.  Suite **674/674 in both memory modes** after each step, rigid
-regression **16/16**, and the four deformable scenes unchanged — `softbodyselfcollide` still at
-0.2133, the softbody floor matrix still at box 0.4963 / plane 0.4975.
+regression **16/16**, and the deformable scenes unchanged — `softbodyselfcollide` still at
+0.2133, `clothselfcollide` at 5.0999, and the softbody floor matrix bit-identical at box
+**0.49628** / plane **0.49753** / sphere **0.48436**.
 
 ### The scene: `PXG_SCENE=softbodycloth` — and what it found
 
@@ -1840,19 +1846,22 @@ A FEM-surface sheet (0.6 x 0.6) dropped from y = 2 onto a FEM-volume cube of edg
 a plane, with `PXG_SC_NOSOFTBODY=1` as the control.  The sheet is smaller than the cube's top
 face, so "caught" and "missed" are a full unit apart.
 
-**The control run passes: with no cube the sheet falls to the plane.  The main run FAILS: with
-the cube there, the sheet still falls through it.**  The scene is committed as a FRONTIER
-MARKER, not as part of the green suite, and its failure message says so.
+**BOTH RUNS PASS.**  The sheet is caught by the cube and settles at min y = **0.8688** (mean
+0.9642, rest |dy| = 0.000034 over the last 37 of 150 steps, peak 32 deformable-volume contacts);
+the control, with the cube removed and nothing else changed, falls clean through to the plane at
+y = 0.0000.  The softbody-vs-cloth chain runs end to end on live data.
+
+That took one more tranche than it should have, because the scene reached that state only after
+a wrong hypothesis was measured out of the way.  What follows is the record.
 
 What it established, measured rather than assumed:
 
 * the pair IS classified into `GPU_BUCKET_ID::eSoftbodyFemCloth` — probed directly in
   `cndCaseTetraMesh` (`compat = 1`, `isRigid1 = 0`);
-* **the chain DOES dispatch end to end.**  Over 60 steps:
-  `sb_clothVertMidphaseGeneratePairsLaunch` 36 launches, `sb_clothVertContactGenLaunch` 36,
-  `sb_clothContactPrepareLaunch` 60, `sb_solveOutputSCDeltaVLaunch` 540 (once per solver
-  iteration).  All report OK;
-* and the sheet falls through anyway.  So the kernels run and produce nothing that pushes.
+* **the chain dispatches end to end.**  Over 40 steps:
+  `sb_clothVertMidphaseGeneratePairsLaunch` 16 launches, `sb_clothVertContactGenLaunch` 16,
+  `sb_fem_contact_remap_to_simLaunch` 16, `sb_clothContactPrepareLaunch` 40,
+  `sb_solveOutputSCDeltaVLaunch` 360 (once per solver iteration).  All report OK.
 
 ### The contact-count read-back — the answer, and where the gap actually is
 
@@ -1874,17 +1883,61 @@ data.**  The normal points up, the penetration tracks the sheet sinking into the
 frame, and `velMultiplier` is non-zero — which matters, because a zero there is exactly what
 makes the solve skip a contact.
 
-And the sheet keeps sinking.  The penetration growing monotonically more negative is the tell:
-the constraint sees the interpenetration correctly and nothing corrects it.
+And the sheet kept sinking.  From that I concluded: **"the gap is between the solve WRITING its
+deltas and those deltas reaching the vertices."**  That conclusion was wrong, and the next
+section is how it was disproved.
 
-**The gap is therefore between the solve WRITING its deltas and those deltas reaching the
-vertices** — not in the midphase, the contact generation, the remap or the prepare, all four of
-which are now verified against live data rather than only against fixtures.  The solve scatters
-into `cloth.mDeltaPos` and `softbody.mSimDelta`; the next step is to establish which pass is
-meant to consume those on the softbody-vs-cloth path, and whether it does.
+### The delta read-back — the chain was never dead, and the SCENE was the bug
 
-That is a much smaller question than the one this scene started with, and it is the whole
-reason the scene was worth building before porting anything further.
+A third temporary probe (in `PxgSoftBodyCore::solveSCContactsOutputDelta()`, immediately after
+the `sb_solveOutputSCDeltaVLaunch` dispatch, since reverted) read `cloth.mDeltaPos` back on
+every solver iteration.  It killed the hypothesis on the first run:
+
+| measured, per solver iteration | value |
+|---|---|
+| non-zero entries in `cloth.mDeltaPos` (of 25 verts) | **18 – 25** |
+| longest correction | **0.005 – 0.011** |
+| `lambdaN` over the nine iterations of one step | **0.0047 → 0.0197, monotonic** |
+| `cloth_applyExternalDeltasLaunch` (the consumer) | **2320 launches over 40 steps** |
+| cloth max y within one step | **0.96995 → 0.98867** — the correction visibly moves vertices |
+
+The solve wrote, the apply pass consumed, and the vertices moved.  The deltas had been reaching
+the vertices the whole time.
+
+Two more numbers from the same probe named the real cause in one line:
+
+```
+clothW = 1        softbody sim vertex W = 192
+```
+
+Those are the two inverse masses the constraint weighs against each other.  The cube's
+simulation vertices come out of the cooker at **invMass 192** — about 0.14 kg for the whole cube
+— and the scene had handed the sheet **invMass 1**, i.e. 1 kg per vertex, **25 kg of cloth**.
+The constraint splits its correction as `w_i / (w_cloth + Σ bc² w_softbody)`, measured here as
+`velMultiplier` ≈ 0.097, so roughly **90 % of every impulse went into shoving the CUBE out of
+the way and 10 % into holding the sheet**.  The solve was doing exactly the right thing with the
+masses it was given: a 25 kg sheet dropped on 0.14 kg of foam goes through it.
+
+Raising the sheet's inverse mass (new `PXG_SC_CLOTHW`, default **200**) catches it immediately:
+
+| cloth invMass | outcome after 150 steps |
+|---|---|
+| 1 (the old scene) | falls through, min y **0.0000** |
+| 50 | caught, min y **0.8647**, rest \|dy\| 0.000041 |
+| 200 (new default) | caught, min y **0.8688**, rest \|dy\| 0.000034 |
+
+**No shader, no ABI row and no engine source changed to make this pass** — the only edit was the
+scene's own inverse mass.  Six kernels, six fixtures, and the thing that broke the integration
+was a constant in the test harness.
+
+**Two hypotheses were measured out of the way before this one, and both are worth recording as
+wrong.**  First: "the impact is too fast for one frame's impulse budget."  Dropping the sheet
+from 1.02 — two centimetres above the cube, arriving essentially at rest — sank just as surely,
+which kills the speed explanation outright.  Second: "the deltas never reach the vertices", the
+conclusion the previous section reached from correct measurements.  Every measurement behind it
+was right; the inference from them was not.  A constraint that produces a small correction is
+not the same as a constraint that produces none, and only the read-back could tell the two
+apart.
 
 **One correction to an earlier reading in this session.**  A 3-step launch trace showed no
 vertex-path kernels and I took that to mean the narrowphase function was never reached.  It was
