@@ -1246,7 +1246,8 @@ SoftBodyScene buildSoftBodyScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     const bool floorNone   = floorEnv && !std::strcmp(floorEnv, "none");
     const bool floorPlane  = floorEnv && !std::strcmp(floorEnv, "plane");
     const bool floorSphere = floorEnv && !std::strcmp(floorEnv, "sphere");
-    const bool floorBox    = !floorNone && !floorPlane && !floorSphere;
+    const bool floorMesh   = floorEnv && !std::strcmp(floorEnv, "mesh");
+    const bool floorBox    = !floorNone && !floorPlane && !floorSphere && !floorMesh;
 
     PxRigidStatic* ground = addGroundBox(physics, scene, rigidMat);
     if (!floorBox)
@@ -1270,6 +1271,33 @@ SoftBodyScene buildSoftBodyScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         ball->attachShape(*ballShape);
         scene->addActor(*ball);
         ballShape->release();
+    }
+
+    // PXG_SB_FLOOR=mesh (P8.10): a COOKED TRIANGLE MESH floor, the fourth shape the softbody
+    // can land on and the one the softbody-vs-trimesh pair exists for.  A 20 x 20 quad in the
+    // plane y = 0, split into two triangles, wound so their normals point UP.  It is the same
+    // floor HEIGHT as the box, the plane and the sphere's north pole, so its settle number is
+    // directly comparable with theirs -- which is the point of putting it in this matrix
+    // rather than in a scene of its own.
+    if (floorMesh)
+    {
+        const float E = 10.0f;
+        const PxVec3 mverts[4] = { PxVec3(-E, 0.0f, -E), PxVec3(-E, 0.0f, E),
+                                   PxVec3( E, 0.0f, -E), PxVec3( E, 0.0f, E) };
+        const PxU32 mtris[6] = { 0u, 1u, 2u,   2u, 1u, 3u };
+        PxTriangleMeshDesc md;
+        md.points.count = 4; md.points.stride = sizeof(PxVec3); md.points.data = mverts;
+        md.triangles.count = 2; md.triangles.stride = 3 * sizeof(PxU32); md.triangles.data = mtris;
+        PxCookingParams ck(physics->getTolerancesScale());
+        ck.buildGPUData = true;
+        PxTriangleMesh* floorMeshGeom =
+            immediateCooking::createTriangleMesh(ck, md, physics->getPhysicsInsertionCallback());
+        if (!floorMeshGeom) { std::printf("FAIL: createTriangleMesh (floor) returned null\n"); return out; }
+        PxRigidStatic* floor = physics->createRigidStatic(PxTransform(PxVec3(0.0f, 0.0f, 0.0f)));
+        PxShape* fs = physics->createShape(PxTriangleMeshGeometry(floorMeshGeom), *rigidMat);
+        floor->attachShape(*fs);
+        scene->addActor(*floor);
+        fs->release();
     }
 
     out.hasPlane = !floorNone;      // "there is a floor to settle on", whatever its shape
@@ -2849,7 +2877,8 @@ int main()
         // With PXG_SB_FLOOR=none there is no floor at all, so zero is the CORRECT answer
         // there and must not fail.
         const char* floorName = !sbs.hasPlane ? "none"
-                              : sbs.hasPlaneShape ? "plane" : sbs.hasSphere ? "sphere" : "box";
+                              : sbs.hasPlaneShape ? "plane" : sbs.hasSphere ? "sphere"
+                              : sbs.hasBox ? "box" : "mesh";
         std::printf("  contact chain: max deformable-volume contacts = %u, first at step %d "
                     "(floor: %s)\n",
                     maxSbContacts, firstContactStep, floorName);

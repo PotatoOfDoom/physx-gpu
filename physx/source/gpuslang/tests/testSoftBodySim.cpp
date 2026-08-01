@@ -10132,4 +10132,358 @@ PXG_TEST(softBodySimMeshMidphase)
         dev->destroyBuffer(h);
 }
 
+// ===========================================================================
+// P8.10 step 2 -- sb_meshContactGenLaunch, the softbody-vs-TRIANGLE-MESH contact generator.
+//
+// WHAT THIS FIXTURE IS FOR.  The GJK/EPA core (tetPrimitivesCollide2) is covered bit-exactly by
+// the npTet* battery and again by every softbody contact-gen fixture before this one, and the
+// push blob is BYTE-IDENTICAL to sb_primitiveContactGenLaunch's, which its own fixture already
+// covers.  What is new here is the geometry feed and the gate:
+//
+//   * the triangle is read out of the COOKED BLOB and taken to WORLD through vertex2Shape,
+//     which MULTIPLIES by the mesh scale -- the mirror of step 1's shape2Vertex, which divides.
+//     The mesh here carries scale (2, 1, 0.5) and a real 180-degree rotation, so a port that
+//     used the wrong one puts the triangle somewhere else entirely and emits nothing;
+//   * the front-face gate is `dot(gjkDirection, n) >= 0` with
+//     `n = normalize(cross(v2 - v0, v1 - v0))` -- the NEGATIVE of the familiar winding normal.
+//     Two triangles with OPPOSITE windings sit under two identical tetrahedra, so the gate is
+//     two-sided: writing the familiar cross product swaps exactly which of them survives;
+//   * the RIGID-shaped output: pairInd0 is the PxNodeIndex from
+//     shapeToRigidRemapTable[TRIMESH cache ref], the material index comes from the TRIMESH
+//     shape and is folded with & 0x7fffffff, and the three sort side-arrays are written;
+//   * the stack clamp and the unclamped stackSizeNeededOnDevice tail.
+// ===========================================================================
+namespace p810cg
+{
+struct SbMeshCgPush
+{
+    float tolerenceLength; uint32_t pad4;
+    uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes, softbodies,
+             shapeToRigidRemapTable, stackPtr, midphasePairsNum;
+    uint32_t stackSizeBytes, pad84;
+    uint64_t filterPairs;
+    uint32_t nbFilterPairs, pad100;
+    uint64_t stackSizeNeededOnDevice;
+    uint64_t wPoint, wNormalPen, wBarycentric, wContactInfo, wTotalCount, wContactByX,
+             wTempContactByX, wContactIndexSortedByX, wContactSortedByX;
+    uint32_t wMaxContacts, pad188;
+};
+static_assert(sizeof(SbMeshCgPush) == 192, "sb mesh CG blob must be 192 bytes");
+static_assert(offsetof(SbMeshCgPush, stackSizeBytes) == 80, "stackSizeBytes @80");
+static_assert(offsetof(SbMeshCgPush, filterPairs) == 88, "filterPairs @88");
+static_assert(offsetof(SbMeshCgPush, stackSizeNeededOnDevice) == 104, "@104");
+static_assert(offsetof(SbMeshCgPush, wPoint) == 112, "the inlined writer starts @112");
+static_assert(offsetof(SbMeshCgPush, wMaxContacts) == 184, "maxNumContacts @184");
+
+// PxgRigidFilterPair, 32 B.
+struct RigidPairHost { uint64_t index0, index1; uint32_t index2, p0, p1, p2; };
+static_assert(sizeof(RigidPairHost) == 32, "PxgRigidFilterPair is 32 bytes");
+} // namespace p810cg
+
+PXG_TEST(softBodySimMeshContactGen)
+{
+    using namespace p80refit;
+    using namespace p88cloth;      // Bv32NodeHost
+    using namespace p810cg;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // The mesh's placement, the same map step 1's fixture uses:
+    //     world = R * (vertex * scale) + T,   R(x, y, z) = (-x, y, -z)
+    const float SX = 2.0f, SY = 1.0f, SZ = 0.5f;
+    const float TX = 10.0f, TY = 20.0f, TZ = 30.0f;
+    auto toWorld = [&](float vx, float vy, float vz) {
+        return F4{ -(vx * SX) + TX, (vy * SY) + TY, -(vz * SZ) + TZ, 1.0f };
+    };
+
+    // ---- the triangle mesh, in VERTEX space, two unit triangles in the plane y = 0 ---------
+    // TRI_UP is wound so the FAMILIAR normal cross(v1-v0, v2-v0) is +y, which makes the
+    // kernel's n = cross(v2-v0, v1-v0) point DOWN -- the same way GJK's direction points for a
+    // tetrahedron sitting above it, so the gate ADMITS it.
+    // TRI_DOWN is wound the other way, so the kernel's n points UP and the gate REJECTS it.
+    // A port using the familiar cross product swaps exactly these two verdicts.
+    //
+    // *** THE TRIANGLES SIT AWAY FROM THE ORIGIN AND ARE SMALL, AND THAT IS THE ONLY REASON
+    // THE MULTIPLY-VS-DIVIDE MUTANT DIES. ***  A triangle spanning vertex x in [0, 1] still
+    // covers the tetrahedron under EITHER reading of the scale -- the scale is 1 in y, so the
+    // vertical gap never moves, and any horizontal overlap at all yields the same contact.
+    // Measured: that version let the mutant through.  At vertex x in [1.0, 1.4] the two
+    // readings put the triangle at shape x in [2.0, 2.8] and [0.5, 0.7] respectively, 1.4
+    // apart -- far outside the 0.05 contact distance -- so the wrong one emits nothing.
+    std::vector<F4> triVerts;
+    std::vector<TetIdx4> triIdx;
+    const uint32_t TRI_UP = 0u, TRI_DOWN = 1u;
+    {
+        const uint32_t b = uint32_t(triVerts.size());
+        triVerts.push_back(F4{ 1.0f, 0.0f, 0.0f, 0.0f });
+        triVerts.push_back(F4{ 1.0f, 0.0f, 0.4f, 0.0f });
+        triVerts.push_back(F4{ 1.4f, 0.0f, 0.0f, 0.0f });
+        triIdx.push_back({ b, b + 1u, b + 2u, 0u });          // familiar normal +y
+    }
+    {
+        const uint32_t b = uint32_t(triVerts.size());
+        triVerts.push_back(F4{ 3.0f, 0.0f, 0.0f, 0.0f });
+        triVerts.push_back(F4{ 3.4f, 0.0f, 0.0f, 0.0f });
+        triVerts.push_back(F4{ 3.0f, 0.0f, 0.4f, 0.0f });     // familiar normal -y
+        triIdx.push_back({ b, b + 1u, b + 2u, 0u });
+    }
+    const uint32_t NPRIM = uint32_t(triIdx.size());
+    const uint32_t NVERT = uint32_t(triVerts.size());
+
+    // ---- the COOKED BLOB: header | BV32 nodes | vertex pool | index pool -------------------
+    // The tree itself is never walked by this kernel, but the node array still has to be
+    // SKIPPED at the right stride to reach the vertex pool, so a real node is present.
+    std::vector<uint32_t> blob;
+    {
+        Bv32NodeHost node;
+        std::memset(&node, 0, sizeof(node));
+        node.mNbNodes = 1u;
+        node.mData[0] = 1u | (NPRIM << 1);
+        blob.resize(4u, 0u);
+        blob[0] = NVERT; blob[1] = NPRIM; blob[2] = 7u /* header.z, a decoy */; blob[3] = 1u;
+        const size_t nodeWords = sizeof(Bv32NodeHost) / 4u;
+        blob.resize(4u + nodeWords, 0u);
+        std::memcpy(blob.data() + 4, &node, sizeof(node));
+        const size_t vBase = blob.size();
+        blob.resize(vBase + NVERT * 4u, 0u);
+        std::memcpy(blob.data() + vBase, triVerts.data(), NVERT * sizeof(F4));
+        const size_t iBase = blob.size();
+        blob.resize(iBase + NPRIM * 4u, 0u);
+        std::memcpy(blob.data() + iBase, triIdx.data(), NPRIM * sizeof(TetIdx4));
+    }
+    DevBuf bBlob = makeDev(dev, blob);
+    if (!bBlob.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    // ---- the softbody: three identical tets, each 0.02 above a triangle in vertex space ----
+    // GAP is inside the contact distance 0.05, so GJK reports CLOSE rather than OVERLAP and the
+    // emitted penetration is the POSITIVE separation.
+    const float GAP = 0.02f;
+    std::vector<F4> tetVerts;
+    std::vector<TetIdx4> tets;
+    // The footprint is a 0.1 right triangle well inside its 0.4 triangle, and the corners are
+    // wound so isValidTet's signed volume is positive.
+    auto addTetOver = [&](float ox) {
+        const uint32_t b = uint32_t(tetVerts.size());
+        tetVerts.push_back(toWorld(ox + 0.05f, GAP,        0.05f));
+        tetVerts.push_back(toWorld(ox + 0.05f, GAP,        0.15f));
+        tetVerts.push_back(toWorld(ox + 0.15f, GAP,        0.05f));
+        tetVerts.push_back(toWorld(ox + 0.05f, GAP + 1.0f, 0.05f));
+        tets.push_back({ b, b + 1u, b + 2u, b + 3u });
+        return uint32_t(tets.size() - 1u);
+    };
+    const uint32_t TET_HIT  = addTetOver(1.0f);   // over TRI_UP    -> a contact
+    const uint32_t TET_BACK = addTetOver(3.0f);   // over TRI_DOWN  -> gate rejects
+    const uint32_t TET_FILT = addTetOver(1.0f);   // over TRI_UP    -> filtered out
+    DevBuf bTetVerts = makeDev(dev, tetVerts), bTets = makeDev(dev, tets);
+
+    const uint32_t SB_ID = 3u;                    // NOT zero: the encode shift must shift
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bTetVerts.addr));
+    sb.mNumTets = uint32_t(tets.size());
+    sb.mNumVerts = uint32_t(tetVerts.size());
+    std::vector<PxgSoftBody> descArr(SB_ID + 1u, makeZeroDesc());
+    descArr[SB_ID] = sb;
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- the pair.  TRIMESH is shapeRef0 and SOFTBODY shapeRef1, i.e. SWAPPED, so the shape
+    // load has to find the tet mesh by TYPE.  materialIndex carries bit 31 so the
+    // `& 0x7fffffff` fold in the writer is observable.
+    const uint32_t GEOM_TRIANGLEMESH_H = 8u;
+    const uint32_t TRI_MATERIAL = 0x8000002Au;    // -> 0x2A = 42 after the fold
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_TRIANGLEMESH_H;    shapes[0].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[0].sx = SX; shapes[0].sy = SY; shapes[0].sz = SZ; shapes[0].srw = 1.0f;
+    shapes[0].materialIndex = TRI_MATERIAL;
+    shapes[0].hullLo = uint32_t(bBlob.addr & 0xFFFFFFFFull);
+    shapes[0].hullHi = uint32_t(bBlob.addr >> 32);
+    shapes[1].type = GEOM_TETRAHEDRONMESH_H; shapes[1].particleOrSoftbodyId = SB_ID;
+    shapes[1].sx = 1.0f; shapes[1].sy = 1.0f; shapes[1].sz = 1.0f; shapes[1].srw = 1.0f;
+    shapes[1].materialIndex = 999u;               // must NOT be the one that lands in the info
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<CmInputHost> cms = { { 0u, 1u, /*trimesh cache*/ 1u, /*sb cache*/ 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    // PxsCachedTransform, 32 B: slot 0 = the softbody (identity), slot 1 = the trimesh.
+    std::vector<float> xf(2 * 8 + 4, 0.0f);
+    xf[3] = 1.0f;
+    xf[8 + 1] = 1.0f;                                          // 180 deg about y
+    xf[8 + 4] = TX; xf[8 + 5] = TY; xf[8 + 6] = TZ;
+    DevBuf bXf = makeDev(dev, xf);
+
+    // contactDistance is summed over BOTH cache refs: 0.02 + 0.03 = 0.05.
+    std::vector<float> cd = { 0.02f, 0.03f, 0.0f, 0.0f };
+    DevBuf bCd = makeDev(dev, cd);
+    // restDistance is indexed by cmIdx, and slot 0 is a decoy so an off-by-one shows.
+    std::vector<float> rd = { 0.125f, 777.0f };
+    DevBuf bRd = makeDev(dev, rd);
+
+    // shapeToRigidRemapTable is indexed by the TRIMESH cache ref (1), not the softbody's (0).
+    // Slot 0 is a decoy that must never appear in the output.
+    std::vector<uint64_t> remap = { 0xDEAD0000DEAD0000ull, 0x0000000700000005ull };
+    DevBuf bRemap = makeDev(dev, remap);
+    const uint64_t RIGID_ID = remap[1];
+
+    auto enc = [](uint32_t id, uint32_t elem) { return (id << 20) | elem; };
+    std::vector<RigidPairHost> filters = { { RIGID_ID, enc(SB_ID, TET_FILT), 0u, 0u, 0u, 0u } };
+    DevBuf bFilters = makeDev(dev, filters);
+
+    // ---- the midphase stack.  FOUR entries but the kernel is told the stack holds only
+    // THREE, so the last is CLAMPED away -- while stackSizeNeededOnDevice must still report
+    // the UNCLAMPED demand.
+    std::vector<uint32_t> stack;
+    auto pushPair = [&](uint32_t tet, uint32_t tri) {
+        stack.push_back(0u); stack.push_back(tet); stack.push_back(tri); stack.push_back(0u);
+    };
+    pushPair(TET_HIT,  TRI_UP);      // KEPT
+    pushPair(TET_BACK, TRI_DOWN);    // dropped by the front-face gate
+    pushPair(TET_FILT, TRI_UP);      // dropped by the filter
+    pushPair(TET_HIT,  TRI_UP);      // CLAMPED AWAY (beyond the declared stack)
+    const uint32_t NB_STACK_ENTRIES = uint32_t(stack.size() / 4u);
+    const uint32_t DECLARED = NB_STACK_ENTRIES - 1u;
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairNum = { NB_STACK_ENTRIES };
+    DevBuf bPairNum = makeDev(dev, pairNum);
+    std::vector<uint32_t> needed = { 0u };
+    DevBuf bNeeded = makeDev(dev, needed);
+
+    const uint32_t MAXC = 16u;
+    const uint32_t POISON = 0xCDCDCDCDu;
+    std::vector<F4> zeroF4(MAXC, F4{ 0, 0, 0, 0 });
+    std::vector<uint32_t> poison(MAXC * 4u, POISON);
+    std::vector<uint32_t> poison2(MAXC * 2u, POISON);
+    DevBuf bPoint = makeDev(dev, zeroF4), bNormalPen = makeDev(dev, zeroF4),
+           bBary = makeDev(dev, zeroF4), bInfo = makeDev(dev, poison),
+           bByX = makeDev(dev, poison2), bTempByX = makeDev(dev, poison),
+           bIdxSorted = makeDev(dev, poison), bSorted = makeDev(dev, poison);
+    std::vector<uint32_t> zeroCount = { 0u };
+    DevBuf bCount = makeDev(dev, zeroCount);
+
+    SbMeshCgPush push = {};
+    push.tolerenceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.contactDistance = bCd.addr;
+    push.restDistance = bRd.addr;
+    push.gpuShapes = bShapes.addr;
+    push.softbodies = bDesc.addr;
+    push.shapeToRigidRemapTable = bRemap.addr;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairNum.addr;
+    push.stackSizeBytes = DECLARED * 16u;
+    push.filterPairs = bFilters.addr;
+    push.nbFilterPairs = uint32_t(filters.size());
+    push.stackSizeNeededOnDevice = bNeeded.addr;
+    push.wPoint = bPoint.addr;
+    push.wNormalPen = bNormalPen.addr;
+    push.wBarycentric = bBary.addr;
+    push.wContactInfo = bInfo.addr;
+    push.wTotalCount = bCount.addr;
+    push.wContactByX = bByX.addr;
+    push.wTempContactByX = bTempByX.addr;
+    push.wContactIndexSortedByX = bIdxSorted.addr;
+    push.wContactSortedByX = bSorted.addr;
+    push.wMaxContacts = MAXC;
+
+    Kernel k("softBodyMeshContactGenBda.spv", "sb_meshContactGenLaunch", {}, sizeof(SbMeshCgPush));
+    // The engine's grid (PxgNarrowphaseCore.cpp:5152): x = SB_MESHCG = 1024, y = 1.
+    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+    const auto gPoint = downloadBuffer<F4>(dev, bPoint.h, MAXC);
+    const auto gNormalPen = downloadBuffer<F4>(dev, bNormalPen.h, MAXC);
+    const auto gInfo = downloadBuffer<uint32_t>(dev, bInfo.h, MAXC * 4u);
+    const auto gByX = downloadBuffer<uint32_t>(dev, bByX.h, MAXC * 2u);
+    const auto gTempByX = downloadBuffer<uint32_t>(dev, bTempByX.h, MAXC * 4u);
+    const auto gIdxSorted = downloadBuffer<uint32_t>(dev, bIdxSorted.h, MAXC * 4u);
+    const auto gSorted = downloadBuffer<uint32_t>(dev, bSorted.h, MAXC * 4u);
+    const uint32_t gNeeded = downloadBuffer<uint32_t>(dev, bNeeded.h, 1)[0];
+
+    for (uint32_t i = 0; i < gCount && i < MAXC; ++i)
+        std::printf("  contact %u: p=(%.5f %.5f %.5f) rest=%.5f n=(%.5f %.5f %.5f) pen=%.6f "
+                    "ind0=0x%08x%08x ind1=(body %u tet %u) mat=%u\n",
+                    i, gPoint[i].x, gPoint[i].y, gPoint[i].z, gPoint[i].w,
+                    gNormalPen[i].x, gNormalPen[i].y, gNormalPen[i].z, gNormalPen[i].w,
+                    gInfo[i * 4u + 1u], gInfo[i * 4u + 0u],
+                    gInfo[i * 4u + 2u] >> 20, gInfo[i * 4u + 2u] & 0xfffffu,
+                    gInfo[i * 4u + 3u]);
+
+    PXG_CHECK_MSG(gCount == 1u,
+                  "exactly ONE of the four stack entries survives: the back-facing pair is "
+                  "rejected by the gate, the filtered pair by the filter list, and the fourth "
+                  "is clamped away -- got %u.  2 usually means the front-face cross product is "
+                  "the familiar way round; 0 means the triangle is not where vertex2Shape "
+                  "should have put it", gCount);
+
+    // ---- the surviving contact ----------------------------------------------
+    PXG_CHECK_MSG(gInfo[0] == uint32_t(RIGID_ID & 0xFFFFFFFFull) &&
+                  gInfo[1] == uint32_t(RIGID_ID >> 32),
+                  "pairInd0 must be the PxNodeIndex from shapeToRigidRemapTable[TRIMESH cache "
+                  "ref] = 0x%08x%08x, got 0x%08x%08x (0xDEAD.. means the SOFTBODY's ref was "
+                  "used)", uint32_t(RIGID_ID >> 32), uint32_t(RIGID_ID & 0xFFFFFFFFull),
+                  gInfo[1], gInfo[0]);
+    PXG_CHECK_MSG(gInfo[2] == enc(SB_ID, TET_HIT),
+                  "pairInd1 must encode (softbody %u, tet %u); got body %u tet %u",
+                  SB_ID, TET_HIT, gInfo[2] >> 20, gInfo[2] & 0xfffffu);
+    PXG_CHECK_MSG(gInfo[3] == (TRI_MATERIAL & 0x7FFFFFFFu),
+                  "the material index comes from the TRIMESH shape and is folded with "
+                  "& 0x7fffffff: expected %u, got %u", TRI_MATERIAL & 0x7FFFFFFFu, gInfo[3]);
+
+    auto near = [](float a, float b, float t) { return std::fabs(a - b) <= t; };
+    PXG_CHECK_MSG(near(gPoint[0].w, 0.125f, 1e-6f),
+                  "the point's w is restDistance[cmIdx=0] = 0.125, got %.6f (777 means cmIdx "
+                  "was ignored)", gPoint[0].w);
+    // The tet sits above the triangle, GJK's direction runs cloud A (tet) -> cloud B
+    // (triangle), so the normal points DOWN and the separation is POSITIVE.
+    // GJK's direction runs cloud A (the tet, above) -> cloud B (the triangle, below), so it
+    // points DOWN -- and this call site passes flipOutputNormal = true, so what is STORED is
+    // its negation, pointing UP out of the floor.  That is the solver's convention, and it is
+    // the difference between the floor holding the softbody and the floor swallowing it.
+    PXG_CHECK_MSG(near(gNormalPen[0].y, 1.0f, 1e-4f) && near(gNormalPen[0].x, 0.0f, 1e-4f) &&
+                  near(gNormalPen[0].z, 0.0f, 1e-4f),
+                  "the STORED normal is the negation of GJK's direction (flipOutputNormal), so "
+                  "it points UP out of the triangle; got (%.5f %.5f %.5f)",
+                  gNormalPen[0].x, gNormalPen[0].y, gNormalPen[0].z);
+    PXG_CHECK_MSG(near(gNormalPen[0].w, GAP, 2e-4f),
+                  "the tet's bottom face is %.3f above the triangle and the two are separated, "
+                  "so the stored penetration is that POSITIVE gap; got %.6f", GAP,
+                  gNormalPen[0].w);
+    // The stored point is the witness on the SECOND cloud, i.e. on the TRIANGLE (y = TY in
+    // world, since the triangle's vertex-space plane y = 0 maps to world y = TY).
+    PXG_CHECK_MSG(near(gPoint[0].y, TY, 1e-3f),
+                  "the stored point is the witness on the TRIANGLE, at world y = %.3f; got "
+                  "%.5f (a value %.3f higher is the witness on the TET instead)", TY,
+                  gPoint[0].y, GAP);
+
+    // ---- the writer's sort side-arrays ---------------------------------------
+    // THE ALTERNATIVE WRITE MODE.  This call site passes alternativeWriteMode = true, so the
+    // rigid id goes to contactSortedByX (low word only) and contactByX / tempContactByX are
+    // NOT touched.  The hull path does the opposite.  Asserting the hull path's pair here is
+    // exactly the mistake this fixture made first time round.
+    PXG_CHECK_MSG(gSorted[0] == uint32_t(RIGID_ID & 0xFFFFFFFFull),
+                  "contactSortedByX carries the rigid id's LOW word; got 0x%08x", gSorted[0]);
+    PXG_CHECK_MSG(gByX[0] == POISON && gByX[1] == POISON,
+                  "contactByX must be LEFT ALONE in the alternative write mode");
+    PXG_CHECK_MSG(gTempByX[0] == POISON,
+                  "tempContactByX must be LEFT ALONE in the alternative write mode");
+    PXG_CHECK_MSG(gIdxSorted[0] == 0u,
+                  "contactIndexSortedByX is seeded with the identity in BOTH modes");
+    PXG_CHECK_MSG(gPoint[1].x == 0.0f && gNormalPen[1].x == 0.0f && gInfo[4] == POISON,
+                  "nothing beyond the single contact may be touched");
+
+    // ---- the clamp and the unclamped demand ----------------------------------
+    PXG_CHECK_MSG(gNeeded == NB_STACK_ENTRIES * 16u,
+                  "stackSizeNeededOnDevice must report the UNCLAMPED demand %u bytes so the "
+                  "host can grow the stack; got %u (%u is the clamped count and would pin the "
+                  "stack at its current size forever)",
+                  NB_STACK_ENTRIES * 16u, gNeeded, DECLARED * 16u);
+
+    for (PxgBufferHandle h : { bBlob.h, bTetVerts.h, bTets.h, bDesc.h, bShapes.h, bCms.h, bXf.h,
+                               bCd.h, bRd.h, bRemap.h, bFilters.h, bStack.h, bPairNum.h,
+                               bNeeded.h, bPoint.h, bNormalPen.h, bBary.h, bInfo.h, bByX.h,
+                               bTempByX.h, bIdxSorted.h, bSorted.h, bCount.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace

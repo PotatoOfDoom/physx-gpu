@@ -554,6 +554,16 @@ static const uint8_t kSbSbMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 56 };
 //   The launch is 2D in the GRID (x = SB_SBMIDPHASE = 1024, y = numTests).
 static const uint8_t kSbMeshMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
 
+// gpunarrowphase softbody-vs-TRIANGLE-MESH contact gen (P8.10 step 2):
+//   sb_meshContactGenLaunch(PxReal tolerenceLength, cmInputs*, transformCache*,
+//   contactDistance*, restDistance*, gpuShapes*, softbodies*, shapeToRigidRemapTable*,
+//   stackPtr*, midphasePairsNum*, PxU32 stackSizeBytes, filterPairs*, PxU32 nbFilterPairs,
+//   stackSizeNeededOnDevice*, PxgFEMContactWriter writer) -- launch site
+//   PxgNarrowphaseCore.cpp:5130.  This is BYTE-IDENTICAL to sb_primitiveContactGenLaunch's
+//   pack: same fifteen arguments, same order, same sizes -> the same 192-byte blob.  Kept as
+//   its own row rather than aliased, so a future divergence upstream shows up here.
+static const uint8_t kSbMeshContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 4, 8, 80 };
+
 // gpunarrowphase softbody-vs-CLOTH midphase (P8.8):
 //   sb_clothMidphaseGeneratePairsLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
 //   bounds*, contactDistance*, gpuShapes*, softbodies*, clothes*, PxU32 stackSizeBytes,
@@ -1038,6 +1048,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_selfCollisionMidphaseGeneratePairsLaunch", kSbSelfCollisionMidphase, uint32_t(sizeof(kSbSelfCollisionMidphase)) },
     { "sb_sbMidphaseGeneratePairsLaunch", kSbSbMidphase, uint32_t(sizeof(kSbSbMidphase)) },
     { "sb_meshMidphaseGeneratePairsLaunch", kSbMeshMidphase, uint32_t(sizeof(kSbMeshMidphase)) },
+    { "sb_meshContactGenLaunch", kSbMeshContactGen, uint32_t(sizeof(kSbMeshContactGen)) },
     // gpunarrowphase softbody-vs-CLOTH midphase (P8.8)
     { "sb_clothMidphaseGeneratePairsLaunch", kSbClothMidphase, uint32_t(sizeof(kSbClothMidphase)) },
     { "sb_clothContactGenLaunch", kSbClothContactGen, uint32_t(sizeof(kSbClothContactGen)) },

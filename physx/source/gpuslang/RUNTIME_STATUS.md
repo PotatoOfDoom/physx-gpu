@@ -1620,6 +1620,91 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.10 — MILESTONE: a FEM softbody SETTLES ON A COOKED TRIANGLE MESH (step 2 of 2)
+
+`sb_meshContactGenLaunch` is mapped, and with it **softbody-vs-triangle-mesh is complete**.  The
+contacts go into the RIGID contact stream through `PxgFEMContactWriter`, so everything after it
+was already mapped by the softbody-vs-rigid tranches.
+
+**KEY EVIDENCE — a FOURTH entry in the softbody floor matrix.**  `PXG_SB_FLOOR=mesh` builds a
+20 × 20 cooked triangle-mesh quad in the plane y = 0 — the same floor HEIGHT as the box, the
+plane and the sphere's north pole, which is why it belongs in this matrix rather than in a scene
+of its own:
+
+| floor | settle mean y | rest \|dy\| |
+|---|---|---|
+| box | 0.49628 | 0.000899 |
+| plane | 0.49753 | 0.000002 |
+| sphere | 0.48436 | 0.000575 |
+| **mesh (new)** | **0.49666** | **0.000116** |
+
+22 deformable-volume contacts from step 49, and the number lands between the box and the plane —
+which is what a flat cooked floor should give.
+
+**The push blob is BYTE-IDENTICAL to `sb_primitiveContactGenLaunch`'s**: the same fifteen
+arguments in the same order and sizes, the same 192-byte blob, the same ABI row
+`{4,8,8,8,8,8,8,8,8,8,4,8,4,8,80}`.  It is kept as its own row rather than aliased, so a future
+divergence upstream shows up here.
+
+### Two real port bugs, and the scene is what found them
+
+The fixture passed, the mutation sweep was green, and the live scene then had the cube
+**accelerate past free fall on first contact** — mean y −70.1 where an uncaught fall reaches
+−50.8.  Both causes were arguments to the same helper that I had read past:
+
+```
+writeContactNoBarycentricFullWarp(writer, intersect, &closestPointA.x, &closestPointB.x,
+                                  0, &normal.x, /*flipOutputNormal*/ true, restDist,
+                                  pairId0, pairId1, materialIndex, /*alternativeWriteMode*/ true)
+```
+
+**1. `flipOutputNormal = true`.**  The hull path passes `false` (`softbodyPrimitives.cu:568`),
+this one passes `true` (:889), so the xyz that reaches the solver is **−direction**.  The clouds
+are the reason: on this path cloud A is the TETRAHEDRON and cloud B the TRIANGLE, so GJK's
+direction runs deformable → rigid, the opposite of the hull path's rigid → deformable, and the
+flip is what puts both back on the solver's convention.  The PENETRATION is computed from the
+UNFLIPPED direction and is not negated with it.  Getting this wrong does not lose contacts — it
+pushes the softbody INTO the floor, which is exactly what the trajectory showed.
+
+**2. `alternativeWriteMode = true`.**  It selects a *different output buffer*:
+
+| | hull path (`false`) | mesh path (`true`) |
+|---|---|---|
+| `contactByX[i]` | the full 64-bit node index | **untouched** |
+| `tempContactByX[i]` | its low word | **untouched** |
+| `contactSortedByX[i]` | untouched | **the low word** |
+| `contactIndexSortedByX[i]` | `i` | `i` |
+
+I had transcribed the hull path's pair, which leaves `contactSortedByX` stale and fills two
+buffers this path's sort never reads.
+
+**The fixture asserted the wrong behaviour for both**, which is the honest part of this: a green
+fixture and a green mutation sweep certified a shader that pushed a softbody through the floor.
+The scene is what caught it.  Both assertions are now the right way round, and the two new
+mutants (`N1` normal not flipped, `N2` the hull path's write mode) both die.
+
+### A third one, in the step-1 fixture: a mutant that survived
+
+The first `softBodySimMeshContactGen` also let the multiply-vs-divide mutant through.  The
+triangle spanned vertex x in [0, 1], and at that position it still covers the tetrahedron under
+EITHER reading of the scale — the scale is 1 in y, so the vertical gap never moves, and any
+horizontal overlap at all yields the same contact.  Moving the triangles to vertex x in
+[1.0, 1.4] puts the two readings 1.4 apart in shape space, far outside the 0.05 contact
+distance, and the mutant dies.  **A geometric fixture only discriminates where the geometry
+does.**
+
+**Mutation sweep: 12 of 12 killed** against the corrected shader (forced-fresh `.spv` each time)
+— vertex2Shape divides instead of multiplying; the familiar winding cross product; the rigid id
+from the softbody's cache ref; the material from the softbody shape; the `& 0x7fffffff` fold
+dropped; the filter check removed; the stack demand reported clamped; no stack clamp;
+restDistance indexed past cmIdx; the stored point taken from the tetrahedron witness; the normal
+not flipped; the hull path's write mode.
+
+Suite **674/674 in both memory modes**, rigid regression green, and every other scene unchanged
+— `softbodyselfcollide` 0.2133, `softbodycloth` 0.8688, `softbodystack` 0.9822,
+`clothselfcollide` min y 5.0999, and the other three floors bit-identical.  Manifest hand-edited
+249 → 250.
+
 ## P8.10 step 1 — the softbody-vs-TRIANGLE-MESH midphase
 
 `sb_meshMidphaseGeneratePairsLaunch` is mapped.  It is the first of **two** kernels for
