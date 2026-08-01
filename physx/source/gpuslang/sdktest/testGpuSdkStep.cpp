@@ -1201,8 +1201,11 @@ struct SoftBodyScene
     float restExtentY = 0.0f;   // the cube's undeformed y extent (its rest shape)
     float stretchY = 1.0f;      // the spawn-time elongation factor along y
     bool noGravity = false;     // PXG_SB_NOGRAVITY: pure constitutive relaxation
-    bool hasPlane = false;      // PXG_SB_PLANE: a static PxPlaneGeometry floor at y=0
-    bool hasSphere = false;     // PXG_SB_SPHERE: a static PxSphereGeometry floor instead
+    bool hasPlane = false;      // "there is a floor to settle on", whatever shape it is
+    bool hasSphere = false;     // PXG_SB_FLOOR=sphere: a static ball, north pole at y=0
+    bool hasBox = false;        // PXG_SB_FLOOR=box (the DEFAULT): the ground box, top at y=0
+    bool hasPlaneShape = false; // PXG_SB_FLOOR=plane: the one floor that takes the PLANE
+                                // branch of sb_primitiveContactGenLaunch rather than GJK/EPA
     PxCudaContextManager* cudaCtx = nullptr;
 };
 
@@ -1212,67 +1215,78 @@ SoftBodyScene buildSoftBodyScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     SoftBodyScene out;
     out.cudaCtx = cudaCtx;
 
-    // As in the cloth and particle scenes: the deformable solve runs inside the rigid
-    // PGS island loop, and rigidSumInternalContactAndJointBatches2 null-derefs the
-    // solver descriptors with zero dynamic rigids, so one live dynamic body is
-    // required to keep that proven path valid.  It rests at y=0.5, far below.
-    addGroundBox(physics, scene, rigidMat);
-    addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
-               boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+    // ---- the floor ------------------------------------------------------------
+    // PXG_SB_FLOOR selects it: "box" (the default), "plane", "sphere" or "none".
+    //
+    // THE DEFAULT CHANGED WHEN THE HULL BRANCH LANDED, AND THAT IS THE RESULT.  A ground box
+    // -- half extents (50, 0.5, 50) at y = -0.5, so its top face IS the plane y = 0 -- has
+    // stood in this scene since the first softbody frame.  It simply generated no contacts:
+    // sb_primitiveContactGenLaunch handled ePLANE and nothing else, so a box floor was
+    // invisible however much of the solve chain was mapped.  That is why PXG_SB_PLANE had to
+    // exist at all, and why the recorded baseline for this scene was a FREE FALL -- the cube
+    // fell straight through a floor it could not see.
+    //
+    // It can see it now.  The default softbody scene catches the cube on a cooked convex
+    // hull, and the free fall moves to PXG_SB_FLOOR=none, where it is honest.
+    //
+    // The alternatives REPLACE the ground box rather than joining it, because a plane
+    // coplanar with the box's top face and a sphere tangent to it are no longer harmless
+    // duplicates -- all three would generate contacts at the same height and the run would
+    // stop measuring the shape it names.  The ground box does not vanish, though: it sinks to
+    // y = -50.5, far below everything, so the dynamic body below still has something to land
+    // on and the softbody never reaches it.
+    const char* floorEnv = std::getenv("PXG_SB_FLOOR");
+    // The old spellings still work; PXG_SB_PLANE=1 and PXG_SB_SPHERE=1 name the same floors.
+    auto envOn = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v && atoi(v) != 0;
+    };
+    if (!floorEnv && envOn("PXG_SB_PLANE"))  floorEnv = "plane";
+    if (!floorEnv && envOn("PXG_SB_SPHERE")) floorEnv = "sphere";
+    const bool floorNone   = floorEnv && !std::strcmp(floorEnv, "none");
+    const bool floorPlane  = floorEnv && !std::strcmp(floorEnv, "plane");
+    const bool floorSphere = floorEnv && !std::strcmp(floorEnv, "sphere");
+    const bool floorBox    = !floorNone && !floorPlane && !floorSphere;
 
-    // PXG_SB_PLANE=1 adds an infinite static PxPlaneGeometry at y=0, coplanar with the
-    // ground box's top face.
-    //
-    // Why a plane and not the box that is already there: sb_primitiveContactGenLaunch is
-    // ported for the PLANE rigid type ONLY -- every other type needs the GJK/EPA tranche --
-    // so a box floor generates ZERO softbody contacts however much of the solve chain is
-    // mapped.  The cloth drape scene settles for exactly this reason: its floor is a plane
-    // (see buildClothDrapeScene).
-    //
-    // It is OFF by default and additive rather than a replacement, deliberately.  The ground
-    // box has to stay (it is what keeps the rigid PGS island non-empty, above), and leaving
-    // the default scene byte-identical means the recorded free-fall baseline still holds as
-    // the CONTROL for this probe: with the plane on, contacts are generated but nothing
-    // consumes them until sb_rigidContactPrepare / queryRigidSoftContactReferenceCount /
-    // solveRigidSoftCollision land, so the cube must still fall to the SAME depth.  A
-    // changed fall depth would mean the plane perturbed something it should not have.
-    if (const char* planeEnv = std::getenv("PXG_SB_PLANE"))
+    PxRigidStatic* ground = addGroundBox(physics, scene, rigidMat);
+    if (!floorBox)
+        ground->setGlobalPose(PxTransform(PxVec3(0.0f, -50.5f, 0.0f)));
+
+    if (floorPlane)
     {
-        if (atoi(planeEnv) != 0)
-        {
-            PxRigidStatic* floor = physics->createRigidStatic(
-                PxTransformFromPlaneEquation(PxPlane(0.0f, 1.0f, 0.0f, 0.0f)));
-            PxShape* floorShape = physics->createShape(PxPlaneGeometry(), *rigidMat);
-            floor->attachShape(*floorShape);
-            scene->addActor(*floor);
-            floorShape->release();
-            out.hasPlane = true;
-        }
+        PxRigidStatic* floor = physics->createRigidStatic(
+            PxTransformFromPlaneEquation(PxPlane(0.0f, 1.0f, 0.0f, 0.0f)));
+        PxShape* floorShape = physics->createShape(PxPlaneGeometry(), *rigidMat);
+        floor->attachShape(*floorShape);
+        scene->addActor(*floor);
+        floorShape->release();
+    }
+    // A ball of radius 5 centred at y = -5: its north pole is at y = 0, so it is the same
+    // floor height as the other two but gently curved, which is why it settles less tightly.
+    if (floorSphere)
+    {
+        PxRigidStatic* ball = physics->createRigidStatic(PxTransform(PxVec3(0.0f, -5.0f, 0.0f)));
+        PxShape* ballShape = physics->createShape(PxSphereGeometry(5.0f), *rigidMat);
+        ball->attachShape(*ballShape);
+        scene->addActor(*ball);
+        ballShape->release();
     }
 
-    // PXG_SB_SPHERE=1 puts a large static SPHERE under the cube instead of a plane: a ball
-    // of radius 5 centred at y = -5, so its north pole is at y = 0 and it acts as a gently
-    // curved floor.  It is the sphere/capsule counterpart of PXG_SB_PLANE, and the first
-    // scene that can exist at all for a NON-PLANE rigid -- sb_primitiveContactGenLaunch
-    // handled only ePLANE until the GJK/EPA driver landed (P8.6), so a sphere floor
-    // generated zero softbody contacts however much of the solve chain was mapped.
-    //
-    // hasPlane is reused as "there is a floor to settle on"; the settle assertions below do
-    // not care which shape provides it, and that is the point -- the SAME cube, the SAME
-    // solve chain and the SAME thresholds, with only the rigid's type changed.
-    if (const char* sphereEnv = std::getenv("PXG_SB_SPHERE"))
-    {
-        if (atoi(sphereEnv) != 0)
-        {
-            PxRigidStatic* ball = physics->createRigidStatic(PxTransform(PxVec3(0.0f, -5.0f, 0.0f)));
-            PxShape* ballShape = physics->createShape(PxSphereGeometry(5.0f), *rigidMat);
-            ball->attachShape(*ballShape);
-            scene->addActor(*ball);
-            ballShape->release();
-            out.hasPlane = true;
-            out.hasSphere = true;
-        }
-    }
+    out.hasPlane = !floorNone;      // "there is a floor to settle on", whatever its shape
+    out.hasSphere = floorSphere;
+    out.hasBox = floorBox;
+    out.hasPlaneShape = floorPlane;
+
+    // The one dynamic body the rigid PGS island needs: rigidSumInternalContactAndJointBatches2
+    // null-derefs the solver descriptors with zero dynamic rigids, as in the cloth and
+    // particle scenes.  It used to stand at the ORIGIN, and the old comment called it "far
+    // below" -- a 1x1x1 box directly under a cube falling from y = 4.  It was far below only
+    // in the sense that nothing could collide with it; once boxes became visible the falling
+    // cube met it on the way down (contacts from step 41 instead of 49) and came to rest
+    // partly on top of it.  Its one job does not care where it stands, so it stands at x = 10.
+    PxRigidDynamic* island = addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                        boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+    island->setGlobalPose(PxTransform(PxVec3(10.0f, 1.5f, 0.0f)));
 
     // --- the tetrahedral cube -------------------------------------------------
     const PxU32 cells = 2;                        // 2x2x2 cells -> 27 verts, 40 tets
@@ -1526,13 +1540,23 @@ SoftBodySelfScene buildSoftBodySelfCollideScene(PxPhysics* physics, PxScene* sce
 
     // Same reason as every other deformable scene: rigidSumInternalContactAndJointBatches2
     // null-derefs with zero dynamic rigids, so one live dynamic body has to exist.
-    addGroundBox(physics, scene, rigidMat);
-    addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
-               boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+    //
+    // BOTH ARE MOVED OUT OF THE WAY, which they did not used to need to be.  The ground box
+    // and this dynamic box both sat under the slabs and were harmless only because softbody
+    // contact generation handled ePLANE and nothing else.  With the hull branch live they are
+    // real obstacles: the dynamic box stands at the origin, right where the bottom slab is,
+    // and the ground box's top face is the same y = 0 as the plane below.  The dynamic body
+    // moves to x = 10 (its one job does not care where it stands) and the ground box sinks to
+    // y = -50.5, so this scene measures self-collision against a PLANE floor and nothing else.
+    PxRigidStatic* ground = addGroundBox(physics, scene, rigidMat);
+    ground->setGlobalPose(PxTransform(PxVec3(0.0f, -50.5f, 0.0f)));
+    PxRigidDynamic* island = addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                        boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+    island->setGlobalPose(PxTransform(PxVec3(10.0f, 1.5f, 0.0f)));
 
-    // The floor is a PLANE, not the ground box: sb_primitiveContactGenLaunch is ported for
-    // the plane rigid type only (see buildSoftBodyScene), so a box floor would generate no
-    // softbody contacts and the bottom slab would fall away from under the top one.
+    // The floor is a PLANE.  It could now be the ground box -- the hull branch handles one --
+    // but the scene's measured thresholds were taken against a plane and the plane branch is
+    // the denser contact set (one per penetrating corner rather than one per tet), so it stays.
     {
         PxRigidStatic* floor = physics->createRigidStatic(
             PxTransformFromPlaneEquation(PxPlane(0.0f, 1.0f, 0.0f, 0.0f)));
@@ -2384,16 +2408,18 @@ int main()
 
         int failures = 0;
 
-        // ---- the PLANE-path probe ------------------------------------------------
+        // ---- the contact-chain probe ----------------------------------------------
         // Reported unconditionally, and asserted only where the answer is unambiguous.
-        // Without the plane the floor is a BOX, which sb_primitiveContactGenLaunch does not
-        // handle yet, so zero is the CORRECT answer there and must not fail.
+        // With PXG_SB_FLOOR=none there is no floor at all, so zero is the CORRECT answer
+        // there and must not fail.
+        const char* floorName = !sbs.hasPlane ? "none"
+                              : sbs.hasPlaneShape ? "plane" : sbs.hasSphere ? "sphere" : "box";
         std::printf("  contact chain: max deformable-volume contacts = %u, first at step %d "
-                    "(plane floor %s)\n",
-                    maxSbContacts, firstContactStep, sbs.hasPlane ? "ON" : "off");
+                    "(floor: %s)\n",
+                    maxSbContacts, firstContactStep, floorName);
         if (sbs.hasPlane && maxSbContacts == 0)
         {
-            std::printf("FAIL: PXG_SB_PLANE=1 put an infinite plane at y=0 and the cube fell "
+            std::printf("FAIL: there is a floor at y=0 and the cube fell "
                         "through it having generated ZERO contacts. The mapped chain "
                         "(midphase -> plane contact gen -> remap -> reorder) is not feeding "
                         "the engine, so porting the solve kernels cannot make it settle.\n");
@@ -2436,7 +2462,7 @@ int main()
         {
             const float uncaughtY = meanC0 - expectDrop;   // where a free fall would be
             if (!(meanC > uncaughtY + 1.0f))
-            { std::printf("FAIL: PXG_SB_PLANE=1 and the cube fell THROUGH the plane: mean y "
+            { std::printf("FAIL: the cube fell THROUGH the floor: mean y "
                           "%.4f, an uncaught fall would be at %.4f\n", meanC, uncaughtY); ++failures; }
             else if (!(maxSbContacts > 0u))
             { std::printf("FAIL: the cube stopped but no contacts were generated (%u)\n",
@@ -2445,14 +2471,17 @@ int main()
             // separates "the solve pushes back" from "the solve converges": an unconverged
             // contact solve oscillates around roughly the right height, which the catch
             // check above would happily accept.
-            // The bar depends on the FLOOR SHAPE, and the two measured numbers say why:
-            // on the PLANE the cube converges to |dy| = 0.000002, on the SPHERE to 0.000575.
-            // A sphere of radius 5 is not flat under a cube of edge 1 -- the contact set
-            // keeps shifting slightly as the cube beds into the curvature -- so it creeps
-            // where the plane case stops dead.  0.002 is far above the sphere's measured
-            // value and far below anything still falling; the plane keeps its tighter bar so
-            // its own convergence cannot quietly degrade to the sphere's.
-            else if (!(restMaxAbsDy < (sbs.hasSphere ? 2e-3f : 1e-4f)))
+            // THE BAR TRACKS THE BRANCH, NOT THE SHAPE.  sb_primitiveContactGenLaunch has
+            // two of them and they produce different contact DENSITIES: the plane branch
+            // writes one contact PER PENETRATING CORNER, up to four per tetrahedron, while
+            // the GJK/EPA branch writes one witness pair for the whole tet-vs-hull query.
+            // On the same cube that is 32 contacts against a plane and 16 against a box, and
+            // the coarser set converges more slowly -- which is upstream's behaviour, not a
+            // port artefact.  Measured: PLANE |dy| = 0.000002, BOX 0.000899, SPHERE 0.000575.
+            // The plane keeps the tight bar so its own convergence cannot quietly degrade to
+            // the GJK path's; 0.002 sits far above both GJK numbers and far below anything
+            // still falling.
+            else if (!(restMaxAbsDy < (sbs.hasPlaneShape ? 1e-4f : 2e-3f)))
             { std::printf("FAIL: the cube was caught but never settled: |dy| still %.6f over "
                           "the last %d steps\n", restMaxAbsDy, steps - restFrom); ++failures; }
             // A cube of edge 1 resting on y=0 has its centroid at 0.5, less its elastic
@@ -2461,7 +2490,7 @@ int main()
             { std::printf("FAIL: settled at the wrong height: mean y %.4f, expected ~0.5 "
                           "(cube half-height above the plane)\n", meanC); ++failures; }
             else
-                std::printf("  CAUGHT by the plane and SETTLED: mean y %.5f (ideal 0.5 less "
+                std::printf("  CAUGHT by the floor and SETTLED: mean y %.5f (ideal 0.5 less "
                             "elastic compression; an uncaught fall would be at %.4f), rest "
                             "|dy| over the last %d steps = %.6f, %u contacts from step %d\n",
                             meanC, uncaughtY, steps - restFrom, restMaxAbsDy,
@@ -2473,7 +2502,7 @@ int main()
         // instead of only on its sign.  The band is 1%; the measured error is 0.0000%.
         if (sbs.stretchY != 1.0f || sbs.noGravity || sbs.hasPlane)
             std::printf("  (closed-form free-fall check skipped: %s)\n",
-                        sbs.hasPlane ? "the plane floor catches the cube, so it is not a free fall"
+                        sbs.hasPlane ? "the floor catches the cube, so it is not a free fall"
                                      : sbs.noGravity ? "gravity is disabled"
                                       : "the cube was spawned stretched, so its elastic response "
                                         "moves the mean too");

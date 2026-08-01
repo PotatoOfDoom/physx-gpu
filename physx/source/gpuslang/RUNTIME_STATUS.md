@@ -1620,6 +1620,117 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.7 — MILESTONE: the softbody settles on the ground BOX that was always there
+
+`sb_primitiveContactGenLaunch` now handles **every** rigid type the CUDA does. `eBOX` and
+`eCONVEXMESH` share one branch — to this code a box is a cooked eight-vertex hull — on top of
+the GJK/EPA driver P8.6 extracted.
+
+**The hull decode** (`softbodyPrimitives.cu:470-568`). Skip one `float4`
+(`convexPtr = hullPtr + sizeof(float4)`), read the `uint4` header, take the vertex count out of
+bits 8..15 (`getNbVerts = u16High(u32Low)`), read `float4 extents`, then walk the vertex array at
+`+32`. Every vertex goes through `vertex2Shape` — rotate into the mesh-scale frame, scale
+componentwise, rotate back — and then the rigid transform. `hullOrMeshOffset` carries
+`size_t hullOrMeshPtr` verbatim and under this bridge a `CUdeviceptr` **is** a `VkDeviceAddress`,
+so the two halves reassemble into a BDA with no translation.
+
+**A hull folds in no radius.** That is sphere/capsule policy: their cloud is a point or a segment
+and the radius rides in the contact distance, to be subtracted back out as `penOffset`. A hull
+carries its thickness in its vertices, so `contactDistance = cDistance` unmodified and
+`radius = 0`. Applying the sphere rule here is wrong by exactly one radius, in both directions.
+
+`vertex2Shape` gets a **literal transcription of `PxQuat::rotateInv`** rather than the
+algebraically-equivalent form the plane path has always used: it runs on every hull vertex and its
+result picks a support vertex, where a last-bit difference is not a last-bit difference.
+
+**The fixture predicts; it does not calibrate.** For a separated pair whose nearest feature is one
+hull corner against the interior of the tet's `x = 0` face, the answer is the support function and
+nothing else — the largest-x world corner, its projection onto `x = 0`, normal `+x`, separation
+`-corner.x`. That is computed host-side before the dispatch and matched to 1e-3. Four pairs:
+
+| pair | shape | configuration | expected | measured |
+|---|---|---|---|---|
+| 0 | BOX | generic rigid rotation, centre (-0.45, 0.6, 0.6) | gap 0.154364, witness vertex 0 | 0.154364 |
+| 1 | BOX | identity, centre (-0.70, 0.6, 0.6) | gap 0.4 > cDistance 0.3 → **no contact** | none |
+| 2 | CONVEXMESH | non-identity mesh-scale rotation, centre (-0.53, 0.6, 0.6) | gap 0.196020, witness vertex 7 | 0.196020 |
+| 3 | BOX | axis-aligned, 0.05 through the `x = 0` face | depth **-0.05** via EPA | -0.050000 |
+
+Pair 1 sits in the band between the true contact distance (0.3) and the wrongly-inflated one
+(0.3 + scale.y = 0.5), so the no-inflation rule is observable rather than assumed. Pair 3 is the
+only configuration that drives a hull cloud through EPA at all; only its depth is asserted, because
+the overlap is a slab and any `(y, z)` in it is a valid witness pair.
+
+**Two fixture blind spots, found by mutation and fixed in the fixture.** The first draft used a
+unit cube and a mutant that shifted the vertex-array base by one `float4` **survived**: a cube is
+symmetric enough that dropping a corner leaves the support in `+x` untouched, and reading the
+extents `float4` as a vertex re-adds a corner the cube already had. The hull is now irregular and
+ordered so pair 0's supporting vertex is index **0** and pair 2's is index **7** — the two ends of
+the array, so a base one `float4` high loses one and one `float4` low (or a short vertex count)
+loses the other. The fixture asserts both winner indices before it compares anything.
+
+Killed: vertex base `+16` and `+48`, the header bit-field shift, the skipped `float4`, the
+mesh-scale rotation, contact-distance inflation, penetration radius offset.
+
+**Surviving and documented rather than papered over:** `inSphereRadius0` — `extents.w` times the
+smallest axis scale for a box, times 1 for a convex mesh — reaches nothing but EPA's convergence
+epsilon, `0.5 * (r0 + r1) * 2.25e-4`, order 1e-4. Removing the box scale factor entirely, or taking
+the minimum over the wrong two axes, leaves every number the fixture can observe unchanged, pair 3
+included. It is transcribed from `softbodyPrimitives.cu:513-519` and carried on trust; a test that
+could see it would be an EPA convergence test, not a contact test.
+
+### What the port invalidated, and how it reported itself
+
+**The plane unit fixture SIGSEGV'd.** Its negative control was a box with *no hull at all* — valid
+while every non-plane type was ignored, a null-pointer BDA load now. Its own comment had said the
+GJK tranche "has to change this test consciously rather than silently"; it did, by faulting the
+device. The control is now a real cooked cube parked 100 units away, still contributing nothing,
+on geometric grounds this time.
+
+**The scene had two invisible rigids under the softbody.** `buildSoftBodyScene` has always called
+`addGroundBox` (half 50 x 0.5 x 50 at y = -0.5, top face exactly `y = 0`) and spawned a 1x1x1
+dynamic box at the **origin** — described in the code as "far below", which it was only in the
+sense that nothing could collide with it. Both became real. The falling cube started meeting the
+dynamic box on the way down (contacts from step 41 instead of 49) and resting partly on top of it.
+
+The dynamic body exists for one reason — `rigidSumInternalContactAndJointBatches2` null-derefs with
+zero dynamic rigids — and that reason does not care where it stands, so it stands at `x = 10`. The
+same two moves were needed in `softbodyselfcollide`, where the dynamic box sat inside the bottom
+slab.
+
+**The floor is now selected, not accumulated:** `PXG_SB_FLOOR=box|plane|sphere|none`, default
+**box**. The alternatives replace the ground box (which sinks to `y = -50.5` to keep the dynamic
+body fed) rather than joining it — a plane coplanar with the box's top face and a sphere tangent to
+it would all generate contacts at the same height and the run would stop measuring the shape it
+names. `PXG_SB_PLANE=1` and `PXG_SB_SPHERE=1` still work and mean the same floors.
+
+The **free fall moved to `PXG_SB_FLOOR=none`**, where it is honest. It was only ever a free fall
+because the floor was invisible.
+
+**KEY EVIDENCE — the same cube, the same solve chain, four floors (`PXG_SCENE=softbody
+PXG_SOLVER=pgs PXG_GPU_STEP=1`):**
+
+| floor | contacts | settled mean y | rest \|dy\| |
+|---|---|---|---|
+| **box** (default, hull branch) | 16 | **0.49628** | 0.000899 |
+| plane (plane branch) | 32 | 0.49753 | 0.000002 |
+| sphere (hull branch) | 16 | 0.48436 | 0.000575 |
+| none | 0 | free fall to -0.9867, monotonic | — |
+
+The plane and sphere numbers are **bit-identical to their P8.5/P8.6 baselines**, which is the
+control: the hull branch added a floor without perturbing the two that already worked.
+
+**The settle bar now tracks the BRANCH, not the shape.** The two branches produce different contact
+*densities*: the plane branch writes one contact **per penetrating corner**, up to four per
+tetrahedron; the GJK/EPA branch writes one witness pair for the whole tet-vs-hull query. On this
+cube that is 32 against a plane and 16 against a box, and the coarser set converges more slowly —
+upstream's behaviour, not a port artefact. The plane keeps the tight 1e-4 bar so its own convergence
+cannot quietly degrade to the GJK path's; box and sphere get 2e-3, far above both measured values
+and far below anything still falling.
+
+Suite **674/674 in both memory modes** (forced-fresh), rigid regression **16/16**, all deformable
+and particle scenes green, `softbodyselfcollide` back to its recorded 0.2133 with the control run
+still falling clean through to 0.0000.
+
 ## P8.6 — GJK/EPA: a softbody settles on a SPHERE
 
 The softbody-vs-rigid contact path no longer stops at `ePLANE`. `sb_primitiveContactGenLaunch`
