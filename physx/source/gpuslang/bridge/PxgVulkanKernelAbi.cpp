@@ -552,6 +552,14 @@ static const uint8_t kSbClothMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
 //   56-byte writer at @104 -> 160-byte blob.
 static const uint8_t kSbClothContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 4, 8, 56 };
 
+// sb_clothVertMidphaseGeneratePairsLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
+//   bounds*, contactDistance*, gpuShapes*, softbodies*, clothes*, PxU32 stackSizeBytes,
+//   PxReal nbCollisionPairUpdatesPerTimestep, stackPtr*, midphasePairsNum*) -> 4 @0, seven
+//   pointers @8..@56, PxU32 @64, PxReal @68, then a pointer realigned to @72 and @80 ->
+//   88-byte blob.  SAME SIZE as kSbClothMidphase but NOT the same layout: there @68 is dead
+//   padding before a pointer, here it carries a real PxReal.
+static const uint8_t kSbClothVertMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 8, 4, 4, 8, 8 };
+
 // gpunarrowphase / gpusimulationcontroller softbody SELF-collision SOLVE chain (P8.4
 // tranche b):
 //   sb_fem_contact_remap_to_simLaunch(const PxgSoftBody* softbodies, float4* outBarycentric0,
@@ -994,6 +1002,7 @@ static const PxgKernelAbiRow kRows[] = {
     // gpunarrowphase softbody-vs-CLOTH midphase (P8.8)
     { "sb_clothMidphaseGeneratePairsLaunch", kSbClothMidphase, uint32_t(sizeof(kSbClothMidphase)) },
     { "sb_clothContactGenLaunch", kSbClothContactGen, uint32_t(sizeof(kSbClothContactGen)) },
+    { "sb_clothVertMidphaseGeneratePairsLaunch", kSbClothVertMidphase, uint32_t(sizeof(kSbClothVertMidphase)) },
     // gpunarrowphase / gpusimulationcontroller softbody SELF-collision solve chain (P8.4 tranche b)
     { "sb_fem_contact_remap_to_simLaunch", kSbFemContactRemapToSim, uint32_t(sizeof(kSbFemContactRemapToSim)) },
     { "sb_softbodyContactPrepareLaunch", kSbSsContactPrepare, uint32_t(sizeof(kSbSsContactPrepare)) },

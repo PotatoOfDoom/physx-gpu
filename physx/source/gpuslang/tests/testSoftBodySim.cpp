@@ -8158,4 +8158,329 @@ PXG_TEST(softBodySimClothContactGen)
         dev->destroyBuffer(h);
 }
 
+// ===========================================================================
+// P8.8 step 3 — sb_clothVertMidphaseGeneratePairsLaunch, the vertex-side midphase.
+//
+// The opposite direction from step 1: a cloth VERTEX queries the SOFTBODY's tetrahedron tree,
+// AABB against AABB.  Every surviving primitive is written -- there is no top-N cap here --
+// through pushOntoStackFullWarp: one atomicAdd of the population count, each qualifying lane
+// storing at its scan offset.
+//
+// The geometry is all boxes, so every expected pair follows from arithmetic:
+//   * the query volume is a CUBE of half-width cDistance around the vertex, not a sphere;
+//   * a leaf tet passes when its own world AABB touches that cube -- PxBounds3::intersects
+//     counts touching, so the comparisons are not strict;
+//   * a degenerate tet fails isValidTet and is dropped whatever its box says.
+//
+// It also pins the BROADPHASE EARLY-OUT, whose sign is easy to invert: with
+// nbCollisionPairUpdatesPerTimestep > 1 the cloth's bounds are SHRUNK by
+// (n-1) * contactDistance and the pair is dropped if the shrunken box misses the softbody's.
+// Reading that as an inflation turns a skip into a no-op.
+//
+// KILLED BY THIS FIXTURE: the early-out's sign; the cube-vs-sphere query volume; the
+// isValidTet gate; PxBounds3::intersects counting touching; the vert/tet field order; the
+// summed contact distance; inflating only one side of the query cube; the stack-capacity
+// guard; the scan prefix in pushOntoStackFullWarp; and the atomicAdd taking the population
+// count rather than 1.
+//
+// Six of those needed the geometry sharpened first, and each took a fixture change rather
+// than a shader change: a degenerate tet whose flat box the query still MEETS (placed
+// elsewhere the AABB test rejects first and the validity gate is untestable); a query cube
+// touching a box boundary EXACTLY, which needs contact distances that are exact binary
+// fractions (0.0625 + 0.1875) so the sum lands on the boundary rather than a hair past it; a
+// vertex reaching in the NEGATIVE direction; a scrambled vertex-to-tet mapping; two ADJACENT
+// tets so one ballot has two lanes set; and a deliberately undersized stack.
+// ===========================================================================
+namespace p88vm
+{
+struct SbClothVertMidPush
+{
+    float toleranceLength; uint32_t pad4;
+    uint64_t cmInputs, transformCache, bounds, contactDistance, gpuShapes, softbodies, clothes;
+    uint32_t stackSizeBytes; float nbCollisionPairUpdatesPerTimestep;
+    uint64_t stackPtr, midphasePairsNum;
+};
+static_assert(sizeof(SbClothVertMidPush) == 88, "sb_clothVertMidphase push blob must be 88 bytes");
+static_assert(offsetof(SbClothVertMidPush, nbCollisionPairUpdatesPerTimestep) == 68,
+              "the PxReal sits at @68, where step 1's pack has dead padding");
+} // namespace p88vm
+
+PXG_TEST(softBodySimClothVertMidphase)
+{
+    using namespace p80refit;
+    using namespace p88cloth;   // Bv32NodeHost
+    using namespace p88vm;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // ---- the softbody: five tets, each a corner tet of a unit box in its own 4-unit slot ---
+    // Tet t's world AABB is exactly x in [4t, 4t+1], y in [0, 1], z in [0, 1].  Tet 4 is
+    // DEGENERATE (all four corners coplanar), so its AABB is FLAT in y.
+    // Tets 5 and 6 are ADJACENT (x in [20, 21] and [21, 22]) rather than four units apart, so
+    // a single query cube can reach both and TWO lanes of one ballot qualify at once.  With
+    // every ballot holding a single lane the scan prefix is always zero and a mutant that
+    // dropped it survived.
+    const uint32_t NTET = 7u;
+    const float TET_OX[7] = { 0.0f, 4.0f, 8.0f, 12.0f, 16.0f, 20.0f, 21.0f };
+    std::vector<F4> tetVerts;
+    std::vector<TetIdx4> tets;
+    for (uint32_t t = 0; t < NTET; ++t)
+    {
+        const float ox = TET_OX[t];
+        const uint32_t b = uint32_t(tetVerts.size());
+        const float ay = (t == 4u) ? 0.0f : 1.0f;      // tet 4: apex in the base plane
+        tetVerts.push_back(F4{ ox,        0.0f, 0.0f, 1.0f });
+        tetVerts.push_back(F4{ ox,        0.0f, 1.0f, 1.0f });
+        tetVerts.push_back(F4{ ox + 1.0f, 0.0f, 0.0f, 1.0f });
+        tetVerts.push_back(F4{ ox,        ay,   0.0f, 1.0f });
+        tets.push_back({ b, b + 1u, b + 2u, b + 3u });
+    }
+    DevBuf bTetVerts = makeDev(dev, tetVerts), bTets = makeDev(dev, tets);
+    if (!bTetVerts.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    // The softbody's BV32 tree: one root node, one leaf holding all five tets.
+    std::vector<uint32_t> treeBlob;
+    {
+        Bv32NodeHost node;
+        std::memset(&node, 0, sizeof(node));
+        node.mNbNodes = 1u;
+        node.mMin[0][0] = -1.0f; node.mMin[0][1] = -1.0f; node.mMin[0][2] = -1.0f;
+        node.mMax[0][0] = 25.0f; node.mMax[0][1] =  2.0f; node.mMax[0][2] =  2.0f;
+        node.mData[0] = 1u | (NTET << 1) | (0u << 7);
+        treeBlob.resize(4 + sizeof(Bv32NodeHost) / 4, 0u);
+        treeBlob[0] = uint32_t(tetVerts.size()); treeBlob[1] = NTET; treeBlob[2] = 1u; treeBlob[3] = 1u;
+        std::memcpy(treeBlob.data() + 4, &node, sizeof(node));
+    }
+    DevBuf bTree = makeDev(dev, treeBlob);
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mTetMeshData = reinterpret_cast<void*>(size_t(bTree.addr));
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bTetVerts.addr));
+    sb.mNumTets = NTET;
+    sb.mNumVerts = uint32_t(tetVerts.size());
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- the cloth: five query vertices ---------------------------------------------------
+    // cDistance = 0.0625 + 0.1875 = 0.25 EXACTLY -- both terms are binary fractions, so the
+    // sum carries no rounding error and the touching case below lands ON the boundary rather
+    // than a hair past it.  Neither term alone reaches 0.20, so a single-sided read loses
+    // pairs.
+    //
+    // THE VERTEX ORDER IS SCRAMBLED relative to the tets on purpose: with vertex k querying
+    // tet k, a mutant that swapped the two fields of the emitted uint4 survives.
+    //   v0: (7.80, -0.20, 0.5)  -- 0.20 outside TET 2's box in BOTH x and y.  The Euclidean
+    //       distance is 0.283 > 0.25, so a SPHERE query would miss it; the CUBE hits, and
+    //       that is what separates the two.
+    //   v1: (3.60, 0.5, 0.5)    -- 0.40 outside tet 1's box   -> miss
+    //   v2: (-0.10, 0.5, 0.5)   -- 0.10 outside TET 0's box   -> hit
+    //   v3: (16.50, 0.10, 0.5)  -- tet 4's flat AABB spans y = [0, 0]; the query cube reaches
+    //       y = [-0.15, 0.35] and DOES overlap it, so the box test passes and only isValidTet
+    //       can reject.  At y = 0.5 the box test rejects first and the validity gate becomes
+    //       untestable -- which is how a mutant deleting it survived.
+    //   v4: (11.75, 0.5, 0.5)   -- its cube reaches x = 12.0 EXACTLY, where TET 3's box
+    //       begins.  PxBounds3::intersects counts touching, so this is a hit; making the
+    //       comparison strict loses precisely this pair and nothing else.
+    //   v5: (5.10, 0.5, 0.5)    -- 0.10 BEYOND the far side of TET 1's box, so its cube has to
+    //       reach in the NEGATIVE x direction to touch.  Every other hit above reaches
+    //       positively, and a mutant that inflated only the max side survived until this
+    //       vertex existed.
+    //   v6: (21.00, 0.5, 0.5)   -- reaches BOTH tet 5 and tet 6, which are adjacent.  Two
+    //       lanes of the same ballot qualify, which is the only way the scan prefix in
+    //       pushOntoStackFullWarp becomes observable.
+    const float CD_SB = 0.0625f, CD_CLOTH = 0.1875f;
+    std::vector<F4> clothVerts = {
+        {  7.80f, -0.20f, 0.5f, 1.0f },
+        {  3.60f,  0.5f,  0.5f, 1.0f },
+        { -0.10f,  0.5f,  0.5f, 1.0f },
+        { 16.50f,  0.10f, 0.5f, 1.0f },
+        { 11.75f,  0.5f,  0.5f, 1.0f },
+        {  5.10f,  0.5f,  0.5f, 1.0f },
+        { 21.00f,  0.5f,  0.5f, 1.0f },
+    };
+    DevBuf bClothVerts = makeDev(dev, clothVerts);
+
+    PxgFEMCloth cloth;
+    std::memset(&cloth, 0, sizeof(cloth));
+    cloth.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bClothVerts.addr));
+    cloth.mNbVerts = uint32_t(clothVerts.size());
+    std::vector<PxgFEMCloth> clothArr = { cloth };
+    DevBuf bCloth = makeDev(dev, clothArr);
+
+    // Cloth first, so the pair is resolved by TYPE.
+    const uint32_t GEOM_TRIANGLEMESH_H = 8u;
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_TRIANGLEMESH_H;    shapes[0].particleOrSoftbodyId = 0u; shapes[0].srw = 1.0f;
+    shapes[1].type = GEOM_TETRAHEDRONMESH_H; shapes[1].particleOrSoftbodyId = 0u; shapes[1].srw = 1.0f;
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<CmInputHost> cms = { { 0u, 1u, /*cloth cache*/ 1u, /*sb cache*/ 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    std::vector<float> xf(2 * 8 + 4, 0.0f); xf[3] = 1.0f; xf[8 + 3] = 1.0f;
+    DevBuf bXf = makeDev(dev, xf);
+    std::vector<float> cd = { CD_SB, CD_CLOTH, 0.0f, 0.0f };
+    DevBuf bCd = makeDev(dev, cd);
+
+    // PxBounds3 (24 B each): slot 0 = the softbody, slot 1 = the cloth.  Overlapping, so the
+    // early-out does not fire in the main run.
+    std::vector<float> bounds = { -1.0f, -1.0f, -1.0f,  25.0f, 2.0f, 2.0f,
+                                  -1.0f, -1.0f, -1.0f,  25.0f, 2.0f, 2.0f,
+                                   0.0f,  0.0f,  0.0f,   0.0f, 0.0f, 0.0f };
+    DevBuf bBounds = makeDev(dev, bounds);
+
+    const uint32_t CAP = 64u;
+    std::vector<uint32_t> stack(CAP * 4u, 0xFFFFFFFFu);
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairNum = { 0u };
+    DevBuf bPairNum = makeDev(dev, pairNum);
+
+    SbClothVertMidPush push = {};
+    push.toleranceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.bounds = bBounds.addr;
+    push.contactDistance = bCd.addr;
+    push.gpuShapes = bShapes.addr;
+    push.softbodies = bDesc.addr;
+    push.clothes = bCloth.addr;
+    push.stackSizeBytes = CAP * 16u;
+    push.nbCollisionPairUpdatesPerTimestep = 1.0f;   // the early-out is off in the main run
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairNum.addr;
+
+    Kernel k("softBodyClothVertMidphaseBda.spv", "sb_clothVertMidphaseGeneratePairsLaunch",
+             {}, sizeof(SbClothVertMidPush));
+    k.dispatch(/*gridX*/ 1024u, {}, push, /*gridY*/ 1u, 1u);
+    dev->flush();
+
+    const uint32_t nVm = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];
+    const auto gVmStack = downloadBuffer<uint32_t>(dev, bStack.h, CAP * 4u);
+    std::printf("  %u pair(s)\n", nVm);
+    std::set<std::pair<uint32_t, uint32_t>> vmGot;
+    for (uint32_t i = 0; i < nVm && i < CAP; ++i)
+    {
+        std::printf("    pair %u: cmIdx=%u vert=%u tet=%u (w=%u)\n", i,
+                    gVmStack[i * 4 + 0], gVmStack[i * 4 + 1], gVmStack[i * 4 + 2], gVmStack[i * 4 + 3]);
+        PXG_CHECK_MSG(gVmStack[i * 4 + 0] == 0u, "pair %u must carry cmIdx 0", i);
+        PXG_CHECK_MSG(gVmStack[i * 4 + 3] == 0u, "the fourth word is always 0");
+        vmGot.insert({ gVmStack[i * 4 + 1], gVmStack[i * 4 + 2] });
+    }
+
+    PXG_CHECK_MSG(nVm == 6u,
+                  "v0 is 0.20 outside tet 2's box in two axes, v2 is 0.10 outside tet 0's, "
+                  "v4's cube touches tet 3's exactly and v5 reaches tet 1's from BEYOND it; "
+                  "v6 reaches BOTH adjacent tets 5 and 6; v1 is 0.40 away and v3 lands on a "
+                  "DEGENERATE tet.  Six pairs, got %u", nVm);
+    PXG_CHECK_MSG(vmGot.count({ 2u, 0u }) == 1u,
+                  "cloth vertex 2 must pair with tet 0 -- note the indices DIFFER, which is "
+                  "what makes the two fields of the emitted pair distinguishable");
+    PXG_CHECK_MSG(vmGot.count({ 0u, 2u }) == 1u,
+                  "cloth vertex 0 must pair with tet 2.  Its Euclidean distance to the box is "
+                  "0.283, MORE than the 0.25 contact distance -- the query volume is a CUBE, "
+                  "and a port that used a sphere loses exactly this pair");
+    PXG_CHECK_MSG(vmGot.count({ 4u, 3u }) == 1u,
+                  "cloth vertex 4's query cube reaches x = 12.0 exactly, where tet 3's box "
+                  "begins.  PxBounds3::intersects counts TOUCHING, so this is a hit; a strict "
+                  "comparison loses it");
+    PXG_CHECK_MSG(vmGot.count({ 5u, 1u }) == 1u,
+                  "cloth vertex 5 sits 0.10 PAST tet 1's box, so its query cube has to reach "
+                  "in the negative direction; inflating only the max side loses this one");
+    PXG_CHECK_MSG(vmGot.count({ 6u, 5u }) == 1u && vmGot.count({ 6u, 6u }) == 1u,
+                  "cloth vertex 6 reaches BOTH adjacent tets, so one ballot has two lanes set "
+                  "and they must land at DIFFERENT stack slots.  A scan offset that ignores "
+                  "the prefix writes both to the same slot and one pair vanishes from the "
+                  "stack while the counter still says six");
+    PXG_CHECK_MSG(vmGot.count({ 1u, 1u }) == 0u,
+                  "cloth vertex 1 is 0.40 from tet 1's box against a contact distance of 0.25");
+    PXG_CHECK_MSG(vmGot.count({ 3u, 4u }) == 0u,
+                  "cloth vertex 3's query cube DOES overlap tet 4's flat box, so the AABB test "
+                  "passes; tet 4 is degenerate -- its four corners are coplanar -- and only "
+                  "isValidTet can drop it");
+
+    // ---- the broadphase early-out ---------------------------------------------------------
+    // With n > 1 the cloth's bounds shrink by (n-1) * contactDistance[cloth].  A shrink of
+    // 4 * 0.1875 = 0.75 per side pulls the cloth box in to [-0.25, 24.25] x [-0.25, 1.25],
+    // which still meets the softbody's -- so this sub-run must behave EXACTLY as the main one.
+    // A port that INFLATED instead would also still overlap, so that alone proves nothing;
+    // the second sub-run is the one that decides.
+    {
+        std::vector<uint32_t> pn2 = { 0u };
+        DevBuf bPn2 = makeDev(dev, pn2);
+        SbClothVertMidPush p2 = push;
+        p2.nbCollisionPairUpdatesPerTimestep = 5.0f;
+        p2.midphasePairsNum = bPn2.addr;
+        Kernel("softBodyClothVertMidphaseBda.spv", "sb_clothVertMidphaseGeneratePairsLaunch",
+               {}, sizeof(SbClothVertMidPush)).dispatch(1024u, {}, p2, 1u, 1u);
+        dev->flush();
+        const uint32_t n2 = downloadBuffer<uint32_t>(dev, bPn2.h, 1)[0];
+        PXG_CHECK_MSG(n2 == 6u,
+                      "a shrink of 4 * 0.1875 = 0.75 per side still leaves the two boxes "
+                      "overlapping, so the pair survives and the same six come out (got %u)", n2);
+        dev->destroyBuffer(bPn2.h);
+    }
+    {
+        // A cloth box spanning x in [-1.5, -0.6] overlaps the softbody's, which starts at
+        // -1.0.  Its width is 0.9; shrinking by 0.75 per side turns it INSIDE-OUT
+        // ([-0.75, -1.35]) and it can no longer meet anything, so the whole pair is skipped.
+        // Inflating by 0.75 keeps them overlapping and produces the usual three -- which is
+        // what makes this run, and not the one above, the one that pins the sign.
+        std::vector<float> b2 = bounds;
+        b2[6] = -1.5f; b2[7] = -1.5f; b2[8] = -1.5f;      // cloth min
+        b2[9] = -0.6f; b2[10] = 1.5f; b2[11] = 1.5f;      // cloth max
+        DevBuf bB2 = makeDev(dev, b2);
+        std::vector<uint32_t> pn3 = { 0u };
+        DevBuf bPn3 = makeDev(dev, pn3);
+        SbClothVertMidPush p3 = push;
+        p3.nbCollisionPairUpdatesPerTimestep = 5.0f;
+        p3.bounds = bB2.addr;
+        p3.midphasePairsNum = bPn3.addr;
+        Kernel("softBodyClothVertMidphaseBda.spv", "sb_clothVertMidphaseGeneratePairsLaunch",
+               {}, sizeof(SbClothVertMidPush)).dispatch(1024u, {}, p3, 1u, 1u);
+        dev->flush();
+        const uint32_t n3 = downloadBuffer<uint32_t>(dev, bPn3.h, 1)[0];
+        PXG_CHECK_MSG(n3 == 0u,
+                      "the shrunken cloth box is empty and cannot meet the softbody, so the "
+                      "pair must be skipped entirely (got %u).  This is the run that pins the "
+                      "SIGN of the broadphase early-out", n3);
+        dev->destroyBuffer(bB2.h); dev->destroyBuffer(bPn3.h);
+    }
+
+    // ---- the stack cap --------------------------------------------------------------------
+    // A full stack drops the WRITE but not the COUNT: the engine reads the counter back to
+    // size the next allocation, so a kernel that stopped counting would under-allocate and
+    // lose pairs on the following frame.  With room for two slots the counter must still
+    // report all six, and nothing may be written past the second slot.
+    {
+        const uint32_t SMALL = 2u;
+        std::vector<uint32_t> smallStack(CAP * 4u, 0xFFFFFFFFu);
+        DevBuf bSmall = makeDev(dev, smallStack);
+        std::vector<uint32_t> pn4 = { 0u };
+        DevBuf bPn4 = makeDev(dev, pn4);
+        SbClothVertMidPush p4 = push;
+        p4.stackSizeBytes = SMALL * 16u;
+        p4.stackPtr = bSmall.addr;
+        p4.midphasePairsNum = bPn4.addr;
+        Kernel("softBodyClothVertMidphaseBda.spv", "sb_clothVertMidphaseGeneratePairsLaunch",
+               {}, sizeof(SbClothVertMidPush)).dispatch(1024u, {}, p4, 1u, 1u);
+        dev->flush();
+        const uint32_t n4 = downloadBuffer<uint32_t>(dev, bPn4.h, 1)[0];
+        const auto gSmall = downloadBuffer<uint32_t>(dev, bSmall.h, CAP * 4u);
+        PXG_CHECK_MSG(n4 == 6u,
+                      "a full stack must still COUNT every pair -- the engine sizes its next "
+                      "allocation from this number (got %u)", n4);
+        uint32_t written = 0u;
+        for (uint32_t i = 0; i < CAP; ++i)
+            if (gSmall[i * 4 + 0] != 0xFFFFFFFFu) ++written;
+        PXG_CHECK_MSG(written <= SMALL,
+                      "only %u slots exist, so at most that many pairs may be STORED; %u were "
+                      "written", SMALL, written);
+        dev->destroyBuffer(bSmall.h); dev->destroyBuffer(bPn4.h);
+    }
+
+    for (PxgBufferHandle h : { bTetVerts.h, bTets.h, bTree.h, bDesc.h, bClothVerts.h, bCloth.h,
+                               bShapes.h, bCms.h, bXf.h, bCd.h, bBounds.h, bStack.h, bPairNum.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace

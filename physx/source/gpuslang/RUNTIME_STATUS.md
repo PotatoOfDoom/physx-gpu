@@ -1620,16 +1620,16 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
-## P8.8 — the softbody-vs-CLOTH chain (steps 1 and 2 of 6)
+## P8.8 — the softbody-vs-CLOTH chain (steps 1 to 3 of 6)
 
-Softbody-vs-cloth needs six kernels.  Two are on the engine BDA ABI; the chain does not run
+Softbody-vs-cloth needs six kernels.  Three are on the engine BDA ABI; the chain does not run
 end to end yet, and this section says which half is which rather than implying otherwise.
 
 | # | kernel | state |
 |---|---|---|
 | 1 | `sb_clothMidphaseGeneratePairsLaunch` | **mapped** (step 1) |
 | 2 | `sb_clothContactGenLaunch` | **mapped** (step 2) |
-| 3 | `sb_clothVertMidphaseGeneratePairsLaunch` | unmapped |
+| 3 | `sb_clothVertMidphaseGeneratePairsLaunch` | **mapped** (step 3) |
 | 4 | `sb_clothVertContactGenLaunch` | unmapped |
 | 5 | `sb_clothContactPrepareLaunch` | unmapped |
 | 6 | `sb_solveOutputSCDeltaVLaunch` | unmapped |
@@ -1689,7 +1689,40 @@ cannot be told from `& 31` by any harness that walks a leaf with one warp.  And
 `intersectBoxFullWarp` is traverser core: a mutation on it dies in `gpuslang.npTetTriMid`
 (verified, not assumed).
 
-Manifest hand-edited 241 → 243.  Suite **674/674 in both memory modes** after each step.
+**Step 3 — the vertex-side midphase.**  The opposite direction from step 1: a cloth VERTEX
+queries the SOFTBODY's tetrahedron tree, AABB against AABB.  Both directions are needed,
+because a tet-vs-triangle test misses a cloth vertex that has poked into a tet's interior
+without any of its triangles coming near a tet face.  There is no top-N cap here — every
+surviving primitive is written through `pushOntoStackFullWarp`: one atomicAdd of the
+population count, each qualifying lane storing at its scan offset, a full stack dropping the
+WRITE but not the COUNT (the engine sizes its next allocation from that number).
+
+Two details that are easy to get wrong and are pinned by their own sub-runs: the query volume
+is a **CUBE** of half-width `cDistance`, not a sphere; and the broadphase early-out **SHRINKS**
+the cloth's bounds by `(n-1) * contactDistance` before testing them, because the broadphase has
+already inflated them — reading that as an inflation turns a skip into a no-op.
+
+Its ABI row is the trap of this step: the pack is **88 bytes, exactly like step 1's**, but not
+the same layout. Step 1 has a `PxU32` at @64 followed by a pointer, so @68 is dead padding;
+step 3 carries a real `PxReal` there. The row is what tells them apart, and getting it wrong
+shifts every pointer after it.
+
+Ten mutants killed; **six needed the geometry sharpened first**, each a fixture change rather
+than a shader change: a degenerate tet whose flat box the query still MEETS (placed elsewhere
+the AABB test rejects first and `isValidTet` is untestable); a query cube touching a box
+boundary EXACTLY, which needs contact distances that are exact binary fractions
+(0.0625 + 0.1875) so the sum lands on the boundary rather than a hair past it; a vertex
+reaching in the NEGATIVE direction; a scrambled vertex-to-tet mapping; two ADJACENT tets so one
+ballot has two lanes set and the scan prefix matters; and a deliberately undersized stack.
+
+**A process note, because it cost a full suite run.**  Two unrelated fixtures broke during
+step 3 — not from the port but from an unguarded whole-file string replacement in the test
+file, which rewrote `n2 == 4u` in fixtures that had nothing to do with this work.  The suite
+caught it (the assertion message still printed its own literal, "got 4, expected 4", against a
+condition that had become 6).  Edits to this 8000-line multi-fixture file need anchors that
+include surrounding context, not bare substrings.
+
+Manifest hand-edited 241 → 244.  Suite **674/674 in both memory modes** after each step.
 
 ## P8.7 — MILESTONE: the softbody settles on the ground BOX that was always there
 
