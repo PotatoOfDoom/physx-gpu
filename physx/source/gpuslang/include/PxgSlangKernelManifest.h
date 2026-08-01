@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 241;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 242;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -281,7 +281,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_sbMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_SB_MIDPHASE (unmapped)
     { "sb_psMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_PS_MIDPHASE (unmapped)
     { "sb_psContactGenLaunch", nullptr, nullptr },  // SB_PS_CG (unmapped)
-    { "sb_clothMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_CLOTH_MIDPHASE (unmapped)
+    { "sb_clothMidphaseGeneratePairsLaunch", "softBodyClothMidphaseBda.spv", "sb_clothMidphaseGeneratePairsLaunch" },  // SB_CLOTH_MIDPHASE (P8.8 BDA port — the tet-bound BV32 walk over the cloth tree)
     { "sb_clothContactGenLaunch", nullptr, nullptr },  // SB_CLOTH_CG (unmapped)
     { "sb_clothVertMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_CLOTH_VERT_MIDPHASE (unmapped)
     { "sb_clothVertContactGenLaunch", nullptr, nullptr },  // SB_CLOTH_VERT_CG (unmapped)
