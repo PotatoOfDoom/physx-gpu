@@ -1620,6 +1620,77 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.8 — the softbody-vs-CLOTH chain (steps 1 and 2 of 6)
+
+Softbody-vs-cloth needs six kernels.  Two are on the engine BDA ABI; the chain does not run
+end to end yet, and this section says which half is which rather than implying otherwise.
+
+| # | kernel | state |
+|---|---|---|
+| 1 | `sb_clothMidphaseGeneratePairsLaunch` | **mapped** (step 1) |
+| 2 | `sb_clothContactGenLaunch` | **mapped** (step 2) |
+| 3 | `sb_clothVertMidphaseGeneratePairsLaunch` | unmapped |
+| 4 | `sb_clothVertContactGenLaunch` | unmapped |
+| 5 | `sb_clothContactPrepareLaunch` | unmapped |
+| 6 | `sb_solveOutputSCDeltaVLaunch` | unmapped |
+
+**Step 1 — the midphase.**  One warp per query tetrahedron walks the CLOTH's BV32 triangle
+tree and keeps the four closest triangles.  The traverser core
+(`TriangleLeafBoundMinMaxTraverser`) was already transcribed once as the descriptor-set kernel
+`ctTetTriMid`, which carries the derivation and a randomized fixture; the new work is the
+driver — the shape pair found by TYPE, the tree at `mTriMeshData + sizeof(uint4)`, the
+surface-hint gate, the world→cloth-space transform, the summed contact distance, and the
+`uint4(cmIdx, tetIdx, primIndex, 0)` write format.
+
+One thing was **dropped rather than copied**: `npTetTriMid` keeps `satIntersect`'s internal
+back-face cull because it stands in for both template instantiations.  This call site is the
+`<false>` one, where the cull lives at the caller.  Carrying both made the outer gate provably
+redundant, and a mutant deleting it survived.
+
+**Step 2 — the contact generator.**  Each midphase pair becomes a GJK/EPA query between a
+tetrahedron and a triangle on the P8.6 driver.  Both barycentric sets are computed and both
+gate the contact; the 4-bit `mTetMeshSurfaceHint` mask rejects contacts through interior
+faces; the filter is two-level, and its vertex level is an **AND over all three** triangle
+vertices.  The write format is the opposite of the rigid path's — point = the CLOTH witness,
+normal stored NEGATED, `pairInd0` = cloth and `pairInd1` = softbody — and the solve chain
+downstream depends on that order.
+
+**Both fixtures predict rather than calibrate.**  A tetrahedron whose bottom face is
+horizontal at height g above a triangle directly below it separates by exactly g, because
+`satIntersect`'s triangle-plane term is identically zero and every side plane contributes a
+negative number.  The contact fixture pins the sign convention by derivation: the GJK direction
+runs from cloud A to cloud B (softbody → cloth), which is what makes `pen` positive for a
+separated pair and the stored `-direction` point from the cloth up at the softbody.
+
+**Seven fixture blind spots, all found by mutation and all closed in the fixture:**
+
+| what survived | why | the fix |
+|---|---|---|
+| tet/primitive field swap (both fixtures) | tet index == triangle index | triangles laid out in REVERSE |
+| `primStartIndex` shift | the leaf started at primitive 0 | a dummy leading primitive |
+| `primStartIndex` shift, again | the primitive it drops off the end was one the top-4 cap discarded anyway | the stack runs far-to-near |
+| the MaxContacts = 4 cap | no tet saw more than one triangle | a stack of five under one tet |
+| the front-face gate | see the dropped duplicate above | one gate, plus a back-facing triangle |
+| the vertex-level AND | all three vertices were filtered, where AND and OR agree | one tet has exactly ONE vertex filtered |
+| the tet-vs-whole-cloth filter | nothing exercised it | a fifth tet killed by it |
+| a single-sided contact distance | 0.10 + 0.20, and the larger alone carried the test | 0.16 + 0.14, neither reaching the gap |
+
+Also recorded because it cost time: one of my own mutations was **ineffective rather than the
+code being wrong** — flipping the MIDDLE conjunction of the vertex filter to `||` leaves
+`((A0 && A1) || A2)`, which for a single filtered vertex evaluates identically.  The first
+conjunction is the one that discriminates, and it dies.
+
+**Surviving mutants, stated rather than hidden:** the triangle's 1e-6 inner sphere and the box
+inner sphere of P8.7 are the same family — both reach only EPA's ~1e-4 convergence epsilon,
+which no contact test can observe.  Both barycentric gates are defensive: a GJK witness lies on
+its own hull by construction, so its coordinates are inside the simplex and the
+`[-1e-5, 1+1e-5]` window only catches a degenerate solve.  `nbPrimitives = (data >> 1) & 63`
+cannot be told from `& 31` by any harness that walks a leaf with one warp.  And
+`intersectBoxFullWarp` is traverser core: a mutation on it dies in `gpuslang.npTetTriMid`
+(verified, not assumed).
+
+Manifest hand-edited 241 → 243.  Suite **674/674 in both memory modes** after each step.
+
 ## P8.7 — MILESTONE: the softbody settles on the ground BOX that was always there
 
 `sb_primitiveContactGenLaunch` now handles **every** rigid type the CUDA does. `eBOX` and
