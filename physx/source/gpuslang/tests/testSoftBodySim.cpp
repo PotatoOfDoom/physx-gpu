@@ -9454,4 +9454,381 @@ PXG_TEST(softBodySimClothContactSolve)
         dev->destroyBuffer(h);
 }
 
+// ===========================================================================
+// P8.9 -- sb_sbMidphaseGeneratePairsLaunch, the WHOLE softbody-vs-softbody narrowphase.
+//
+// WHAT THIS FIXTURE IS FOR.  The traverser ARITHMETIC (closestPtTetrahedron,
+// isPointOutsideOfPlane4, the inside/outside decision) is already covered bit-exactly by the
+// npSbSelf / ctSbSelfQuery fixtures and again by softBodySimSelfCollisionMidphase.  This one
+// covers what the SS lift ADDS on top of the self-collision kernel:
+//
+//   * blockIdx.z -- the BIDIRECTIONAL pass.  Upstream launches gridDim.z = 2 and flips which
+//     shape supplies the query vertices; dropping it halves the contact set.  The fixture
+//     puts each direction's geometry in its OWN region of space so a missing flip shows up as
+//     a missing contact, not as a changed number;
+//   * TWO descriptors rather than one -- query verts come from softbody0, the tree and its
+//     surface-tet hints from softbody1, the filter list from softbody0;
+//   * the contact distance is the SUM of the two shapes' entries, not one doubled.  Two
+//     query vertices straddle that sum from both sides, so every single-value or
+//     doubled-value reading of it is killed;
+//   * the cmInputs / gpuShapes indirection and the both-must-be-tetmesh early-out;
+//   * the 112-byte blob with PxgSoftBodyContactWriter inlined at @56.
+//
+// Geometry is compared to 1e-6; counts, pair ids and drop/keep decisions are compared EXACTLY.
+// ===========================================================================
+struct SbSbPush
+{
+    float toleranceLength; uint32_t pad4;
+    uint64_t cmInputs, transformCache, bounds, contactDistance, gpuShapes, softbodies;
+    uint64_t outPoint, outNormalPen, outBary0, outBary1, outContactInfo, totalContactCount;
+    uint32_t maxContacts, pad108;
+};
+static_assert(sizeof(SbSbPush) == 112, "sb-sb midphase blob must be 112 bytes");
+static_assert(offsetof(SbSbPush, cmInputs) == 8, "cmInputs @8");
+static_assert(offsetof(SbSbPush, softbodies) == 48, "softbodies @48");
+static_assert(offsetof(SbSbPush, outPoint) == 56, "the inlined writer starts @56");
+static_assert(offsetof(SbSbPush, maxContacts) == 104, "maxContacts @104");
+
+PXG_TEST(softBodySimSoftBodySoftBodyMidphase)
+{
+    using namespace p80refit;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t A_ID = 3u;    // the body that queries on flip = 0
+    const uint32_t B_ID = 5u;    // the body that queries on flip = 1
+    const uint32_t ANY_TET = 0x000fffffu;   // PX_MAX_NB_DEFORMABLE_VOLUME_TET
+    auto enc = [](uint32_t id, uint32_t elem) { return (id << 20) | elem; };
+
+    // ---- geometry ------------------------------------------------------------
+    // REGION X (x ~ 0..71) holds B's tetrahedra and A's query vertices  -> the flip = 0 pass.
+    // REGION Y (x ~ 100)   holds A's tetrahedron and B's query vertex   -> the flip = 1 pass.
+    // Keeping the two directions in disjoint regions is what makes a missing z dimension show
+    // up as a MISSING CONTACT rather than as a changed count somewhere ambiguous.
+    //
+    // A unit tet at origin o has corners o, o+x, o+y, o+z; a query at o + (0.12, 0.15, 0.05)
+    // is inside it and closest to the z-face, so closestP = o + (0.12, 0.15, 0) and pen = -0.05.
+    std::vector<F4> aVerts, bVerts;
+    std::vector<TetIdx4> aTets, bTets;
+    std::vector<uint8_t> aVertHint, bVertHint, aTetHint, bTetHint;
+
+    auto addTet = [](std::vector<F4>& v, std::vector<TetIdx4>& t, std::vector<uint8_t>& vh,
+                     std::vector<uint8_t>& th, float ox, float oy, float oz, bool degenerate,
+                     uint8_t hint) {
+        const uint32_t b = uint32_t(v.size());
+        v.push_back(F4{ ox,        oy,        oz,        1.0f });
+        v.push_back(F4{ ox + 1.0f, oy,        oz,        1.0f });
+        v.push_back(F4{ ox,        oy + 1.0f, oz,        1.0f });
+        v.push_back(degenerate ? F4{ ox, oy, oz, 1.0f } : F4{ ox, oy, oz + 1.0f, 1.0f });
+        for (int i = 0; i < 4; ++i) vh.push_back(0u);   // corners are never queries here
+        t.push_back(TetIdx4{ b, b + 1u, b + 2u, b + 3u });
+        th.push_back(hint);
+        return uint32_t(t.size() - 1u);
+    };
+    auto addQuery = [](std::vector<F4>& v, std::vector<uint8_t>& vh,
+                       float x, float y, float z, uint8_t hint) {
+        const uint32_t i = uint32_t(v.size());
+        v.push_back(F4{ x, y, z, 1.0f });
+        vh.push_back(hint);
+        return i;
+    };
+
+    // B's tets, region X.  ORDER MATTERS: the shallow one is primitive 0 and therefore LANE 0
+    // of the shared leaf, the deep one lane 1.  Put the deep one first and "lane 0 always
+    // wins" -- i.e. no cross-lane argmin at all -- produces the right answer by accident.
+    const uint32_t B_SHALLOW = addTet(bVerts, bTets, bVertHint, bTetHint,  0.0f, 0.0f, 0.02f, false, 0xfu);
+    const uint32_t B_DEEP    = addTet(bVerts, bTets, bVertHint, bTetHint,  0.0f, 0.0f, 0.00f, false, 0xfu);
+    const uint32_t B_DEGEN   = addTet(bVerts, bTets, bVertHint, bTetHint,  2.0f, 0.0f, 0.00f, true,  0xfu);
+    const uint32_t B_FILTPR  = addTet(bVerts, bTets, bVertHint, bTetHint, 30.0f, 0.0f, 0.00f, false, 0xfu);
+    const uint32_t B_FILTWC  = addTet(bVerts, bTets, bVertHint, bTetHint, 40.0f, 0.0f, 0.00f, false, 0xfu);
+    const uint32_t B_NOSURF  = addTet(bVerts, bTets, bVertHint, bTetHint, 60.0f, 0.0f, 0.00f, false, 0x0u);
+    const uint32_t B_GOOD    = addTet(bVerts, bTets, bVertHint, bTetHint, 70.0f, 0.0f, 0.00f, false, 0xfu);
+    const uint32_t NB_B_TETS = uint32_t(bTets.size());
+    (void)B_SHALLOW; (void)B_DEGEN; (void)B_FILTWC; (void)B_NOSURF;
+
+    // A's single tet, region Y -- the target of the flip = 1 pass.
+    const uint32_t A_GOOD = addTet(aVerts, aTets, aVertHint, aTetHint, 100.0f, 0.0f, 0.0f, false, 0xfu);
+
+    // A's query vertices, region X.
+    const uint32_t a1 = addQuery(aVerts, aVertHint,  0.12f, 0.15f, 0.05f, 1u);  // KEPT (B_DEEP)
+    const uint32_t a2 = addQuery(aVerts, aVertHint,  2.12f, 0.15f, 0.05f, 1u);  // drop: degenerate
+    const uint32_t a3 = addQuery(aVerts, aVertHint,  0.15f, 0.12f, 0.06f, 0u);  // drop: vert hint 0
+    const uint32_t a4 = addQuery(aVerts, aVertHint, 30.12f, 0.15f, 0.05f, 1u);  // drop: per-pair filter
+    const uint32_t a5 = addQuery(aVerts, aVertHint, 40.12f, 0.15f, 0.05f, 1u);  // drop: wildcard filter
+    const uint32_t a6 = addQuery(aVerts, aVertHint, 60.12f, 0.15f, 0.05f, 1u);  // drop: tet hint 0
+    const uint32_t a7 = addQuery(aVerts, aVertHint, 70.12f, 0.15f, 0.05f, 1u);  // KEPT (inside B_GOOD)
+    // THE CONTACT-DISTANCE PAIR.  contactDistance[cacheRef0] = 0.03 and [cacheRef1] = 0.02, so
+    // the sum is 0.05.  a8 sits 0.040 outside B_GOOD's x-face and a9 sits 0.055 outside it:
+    //   sum  0.05  -> a8 KEPT, a9 dropped          <- the only reading that gives 1 of 2
+    //   ref0 alone 0.03 -> both dropped
+    //   ref1 alone 0.02 -> both dropped
+    //   2 * ref0   0.06 -> BOTH kept
+    //   2 * ref1   0.04 -> both dropped (the test is strict `<`)
+    const uint32_t a8 = addQuery(aVerts, aVertHint, 69.960f, 0.30f, 0.30f, 1u); // KEPT (outside)
+    const uint32_t a9 = addQuery(aVerts, aVertHint, 69.945f, 0.30f, 0.30f, 1u); // drop: too far
+    (void)a2; (void)a3; (void)a6; (void)a9;
+
+    // B's query vertex, region Y -- the ONLY contact the flip = 1 pass can produce.
+    const uint32_t b1 = addQuery(bVerts, bVertHint, 100.12f, 0.15f, 0.05f, 1u); // KEPT (A_GOOD)
+
+    // mSurfaceVertsHint / mTetMeshSurfaceHint are PxU8 arrays; pack them into words so the
+    // shader's byte extraction is exercised at all four offsets.
+    auto packBytes = [](const std::vector<uint8_t>& b) {
+        std::vector<uint32_t> w((b.size() + 3u) / 4u + 1u, 0u);
+        for (size_t i = 0; i < b.size(); ++i) w[i / 4u] |= uint32_t(b[i]) << (8u * (i % 4u));
+        return w;
+    };
+    const std::vector<uint32_t> aVertHintWords = packBytes(aVertHint);
+    const std::vector<uint32_t> bVertHintWords = packBytes(bVertHint);
+    const std::vector<uint32_t> aTetHintWords = packBytes(aTetHint);
+    const std::vector<uint32_t> bTetHintWords = packBytes(bTetHint);
+
+    // vertToSurfaceTetRemap: DIFFERENT bases per body, and neither is the identity, so pairInd0
+    // cannot pass by accidentally matching a vertex index, a tet index or the other body's remap.
+    std::vector<uint32_t> aRemap(aVerts.size()), bRemap(bVerts.size());
+    for (size_t i = 0; i < aRemap.size(); ++i) aRemap[i] = 100u + uint32_t(i);
+    for (size_t i = 0; i < bRemap.size(); ++i) bRemap[i] = 700u + uint32_t(i);
+
+    // ---- the two BV32 trees --------------------------------------------------
+    // B's tree: child 0 is a leaf holding BOTH B_SHALLOW and B_DEEP, so those land in DIFFERENT
+    // lanes of the same warp and the deeper one can only win through the cross-lane argmin.
+    // The remaining tets get one leaf each.  Child bounds are deliberately GENEROUS so every
+    // child is visited and the node-level cull can never stand in for a per-primitive gate.
+    auto buildTree = [](uint32_t nbVerts, uint32_t nbTets, bool pairFirstLeaf) {
+        const uint32_t nbChildren = pairFirstLeaf ? (1u + (nbTets - 2u)) : nbTets;
+        const uint32_t nbNodes = 1u, maxDepth = 1u;
+        TreeBlob t;
+        t.w.assign(4u + nbNodes * BV32_WORDS + maxDepth * 2u + nbNodes + 4u, 0u);
+        t.w[0] = nbVerts; t.w[1] = nbTets; t.w[2] = maxDepth; t.w[3] = nbNodes;
+        const uint32_t nw = t.nodeWord(0);
+        t.w[nw + W_NBNODES] = nbChildren;
+        for (uint32_t k = 0; k < nbChildren; ++k)
+        {
+            for (uint32_t c = 0; c < 3u; ++c)
+            {
+                t.w[nw + W_MMIN + k * 4 + c] = f2u(-1000.0f);
+                t.w[nw + W_MMAX + k * 4 + c] = f2u(1000.0f);
+            }
+            if (pairFirstLeaf)
+                t.w[nw + W_MDATA + k] = (k == 0u) ? leafWord(0u, 2u) : leafWord(k + 1u, 1u);
+            else
+                t.w[nw + W_MDATA + k] = leafWord(k, 1u);
+        }
+        return t;
+    };
+    TreeBlob bTree = buildTree(uint32_t(bVerts.size()), NB_B_TETS, /*pairFirstLeaf*/ true);
+    TreeBlob aTree = buildTree(uint32_t(aVerts.size()), uint32_t(aTets.size()), false);
+
+    // ---- filter pairs, sorted by index0 then index1 --------------------------
+    // They hang off body A (softbody0 on the flip = 0 pass).  B carries NONE, which also
+    // exercises the null-mFilteringPairs path the self-collision tranche had to harden.
+    struct PairNRHost { uint64_t index0; uint32_t index1, index2; };
+    std::vector<PairNRHost> aFilters = {
+        { enc(A_ID, a4), enc(B_ID, B_FILTPR), 0u },   // a4 against ONE tet of B
+        { enc(A_ID, a5), enc(B_ID, ANY_TET),  0u },   // a5 against the whole of B
+    };
+    PXG_CHECK(aFilters[0].index0 < aFilters[1].index0);   // the binary search needs order
+
+    DevBuf dbATree = makeDev(dev, aTree.w);
+    DevBuf dbBTree = makeDev(dev, bTree.w);
+    DevBuf dbAVerts = makeDev(dev, aVerts);
+    DevBuf dbBVerts = makeDev(dev, bVerts);
+    DevBuf dbATets = makeDev(dev, aTets);
+    DevBuf dbBTets = makeDev(dev, bTets);
+    DevBuf dbAVertHint = makeDev(dev, aVertHintWords);
+    DevBuf dbBVertHint = makeDev(dev, bVertHintWords);
+    DevBuf dbATetHint = makeDev(dev, aTetHintWords);
+    DevBuf dbBTetHint = makeDev(dev, bTetHintWords);
+    DevBuf dbARemap = makeDev(dev, aRemap);
+    DevBuf dbBRemap = makeDev(dev, bRemap);
+    DevBuf dbAFilters = makeDev(dev, aFilters);
+    if (!dbATree.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgSoftBody sbA = makeZeroDesc();
+    sbA.mTetMeshData = reinterpret_cast<void*>(size_t(dbATree.addr));
+    sbA.mTetMeshSurfaceHint = reinterpret_cast<PxU8*>(size_t(dbATetHint.addr));
+    sbA.mTetIndices = reinterpret_cast<decltype(sbA.mTetIndices)>(size_t(dbATets.addr));
+    sbA.mPosition_InvMass = reinterpret_cast<float4*>(size_t(dbAVerts.addr));
+    sbA.mSurfaceVertsHint = reinterpret_cast<PxU8*>(size_t(dbAVertHint.addr));
+    sbA.mSurfaceVertToTetRemap = reinterpret_cast<PxU32*>(size_t(dbARemap.addr));
+    sbA.mFilteringPairs = reinterpret_cast<decltype(sbA.mFilteringPairs)>(size_t(dbAFilters.addr));
+    sbA.mNumFilterPairs = uint32_t(aFilters.size());
+    sbA.mNumTets = uint32_t(aTets.size());
+    sbA.mNumVerts = uint32_t(aVerts.size());
+
+    PxgSoftBody sbB = makeZeroDesc();
+    sbB.mTetMeshData = reinterpret_cast<void*>(size_t(dbBTree.addr));
+    sbB.mTetMeshSurfaceHint = reinterpret_cast<PxU8*>(size_t(dbBTetHint.addr));
+    sbB.mTetIndices = reinterpret_cast<decltype(sbB.mTetIndices)>(size_t(dbBTets.addr));
+    sbB.mPosition_InvMass = reinterpret_cast<float4*>(size_t(dbBVerts.addr));
+    sbB.mSurfaceVertsHint = reinterpret_cast<PxU8*>(size_t(dbBVertHint.addr));
+    sbB.mSurfaceVertToTetRemap = reinterpret_cast<PxU32*>(size_t(dbBRemap.addr));
+    sbB.mFilteringPairs = nullptr;      // the null path
+    sbB.mNumFilterPairs = 0u;
+    sbB.mNumTets = NB_B_TETS;
+    sbB.mNumVerts = uint32_t(bVerts.size());
+
+    std::vector<PxgSoftBody> descArr(8u, makeZeroDesc());
+    descArr[A_ID] = sbA;
+    descArr[B_ID] = sbB;
+    DevBuf dbDesc = makeDev(dev, descArr);
+
+    // gpuShapes: the two live tetmesh shapes sit at NON-adjacent, NON-zero slots, and the
+    // decoy pair's shapes are boxes.  A port that ignored shapeRef and used cmIdx, or that
+    // dropped the both-must-be-tetmesh early-out, lands on a zeroed descriptor and faults.
+    std::vector<PxgShapeHost> shapes(7);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    for (auto& s : shapes) { s.srw = 1.0f; s.particleOrSoftbodyId = 0xFFFFFFFFu; s.type = 3u /*eBOX*/; }
+    shapes[2].type = GEOM_TETRAHEDRONMESH_H; shapes[2].particleOrSoftbodyId = A_ID;
+    shapes[5].type = GEOM_TETRAHEDRONMESH_H; shapes[5].particleOrSoftbodyId = B_ID;
+    DevBuf dbShapes = makeDev(dev, shapes);
+
+    // cmInputs[0] is a DECOY box-vs-box pair; cmInputs[1] is the real one.  Dispatching
+    // gridY = 2 therefore also proves cmIdx comes from gid.y and that the type gate fires.
+    std::vector<CmInputHost> cms = {
+        { 0u, 1u, 0u, 0u },              // decoy: two boxes
+        { 2u, 5u, /*cacheRef0*/ 1u, /*cacheRef1*/ 3u },
+    };
+    DevBuf dbCms = makeDev(dev, cms);
+
+    // contactDistance is indexed by the transform-cache refs; the slots between them are
+    // poison so an off-by-one index is not survivable.
+    std::vector<float> contactDist = { 999.0f, 0.03f, 999.0f, 0.02f, 999.0f };
+    DevBuf dbCd = makeDev(dev, contactDist);
+
+    const uint32_t MAXC = 16u;
+    const uint32_t POISON = 0xCDCDCDCDu;
+    std::vector<F4> zeroF4(MAXC, F4{ 0, 0, 0, 0 });
+    std::vector<uint32_t> poison(MAXC * 4u, POISON);
+    DevBuf dbPoint = makeDev(dev, zeroF4);
+    DevBuf dbNormalPen = makeDev(dev, zeroF4);
+    DevBuf dbBary0 = makeDev(dev, zeroF4);
+    DevBuf dbBary1 = makeDev(dev, zeroF4);
+    DevBuf dbInfo = makeDev(dev, poison);
+    std::vector<uint32_t> zeroCount = { 0u };
+    DevBuf dbCount = makeDev(dev, zeroCount);
+
+    SbSbPush push = {};
+    push.toleranceLength = 1.0f;      // read by nothing -- it is a blob placeholder
+    push.cmInputs = dbCms.addr;
+    push.transformCache = dbCms.addr; // ditto: never dereferenced, but must occupy @16
+    push.bounds = dbCms.addr;         // ditto @24
+    push.contactDistance = dbCd.addr;
+    push.gpuShapes = dbShapes.addr;
+    push.softbodies = dbDesc.addr;
+    push.outPoint = dbPoint.addr;
+    push.outNormalPen = dbNormalPen.addr;
+    push.outBary0 = dbBary0.addr;
+    push.outBary1 = dbBary1.addr;
+    push.outContactInfo = dbInfo.addr;
+    push.totalContactCount = dbCount.addr;
+    push.maxContacts = MAXC;
+
+    Kernel k("softBodySoftBodyMidphaseBda.spv", "sb_sbMidphaseGeneratePairsLaunch",
+             {}, sizeof(SbSbPush));
+    // THE ENGINE'S GRID, reproduced exactly: x = SB_SBMIDPHASE = 1024 (fixed, independent of
+    // the vertex count), y = numTests, z = 2 (the bidirectional flip).  With the CUDA stride
+    // (blockDim.y * gridDim.x = 2048) every vertex is visited EXACTLY ONCE per (y, z).
+    k.dispatch(/*gridX*/ 1024u, {}, push, /*gridY*/ uint32_t(cms.size()), /*gridZ*/ 2u);
+    dev->flush();
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, dbCount.h, 1)[0];
+    const auto gPoint = downloadBuffer<F4>(dev, dbPoint.h, MAXC);
+    const auto gNormalPen = downloadBuffer<F4>(dev, dbNormalPen.h, MAXC);
+    const auto gBary0 = downloadBuffer<F4>(dev, dbBary0.h, MAXC);
+    const auto gBary1 = downloadBuffer<F4>(dev, dbBary1.h, MAXC);
+    const auto gInfo = downloadBuffer<uint32_t>(dev, dbInfo.h, MAXC * 4u);
+
+    for (uint32_t i = 0; i < gCount && i < MAXC; ++i)
+        std::printf("  contact %u: p=(%.5f %.5f %.5f) n=(%.5f %.5f %.5f) pen=%.6f "
+                    "bary0=(%.5f %.5f %.5f) ind0=(body %u elem %u) ind1=(body %u elem %u)\n",
+                    i, gPoint[i].x, gPoint[i].y, gPoint[i].z, gNormalPen[i].x, gNormalPen[i].y,
+                    gNormalPen[i].z, gNormalPen[i].w, gBary0[i].x, gBary0[i].y, gBary0[i].z,
+                    gInfo[i * 4u + 0u] >> 20, gInfo[i * 4u + 0u] & 0xfffffu,
+                    gInfo[i * 4u + 2u] >> 20, gInfo[i * 4u + 2u] & 0xfffffu);
+
+    PXG_CHECK_MSG(gCount == 4u,
+                  "exactly four queries survive every gate -- a1, a7 and a8 on the flip=0 pass "
+                  "and b1 on the flip=1 pass -- got %u.  3 usually means the z dimension was "
+                  "dropped (b1 is the only contact that pass can make); more than 4 means a "
+                  "gate went missing or a vertex was visited more than once", gCount);
+
+    auto near6 = [](float a, float b) { return std::fabs(a - b) <= 1e-6f; };
+    bool sawA1 = false, sawA7 = false, sawA8 = false, sawB1 = false;
+    for (uint32_t i = 0; i < gCount; ++i)
+    {
+        const uint32_t ind0 = gInfo[i * 4u + 0u];
+        const uint32_t ind0hi = gInfo[i * 4u + 1u];
+        const uint32_t ind1 = gInfo[i * 4u + 2u];
+        PXG_CHECK_MSG(ind0hi == 0u,
+                      "pairInd0 is a PxU64 field taking a PxU32 value: the high word must be "
+                      "ZEROED, not left poisoned (contact %u has 0x%08x)", i, ind0hi);
+
+        if (ind0 == enc(A_ID, aRemap[a1]))
+        {
+            sawA1 = true;
+            PXG_CHECK_MSG(ind1 == enc(B_ID, B_DEEP),
+                          "a1 penetrates B_DEEP by 0.05 and B_SHALLOW by 0.03; the cross-lane "
+                          "argmin must pick the DEEPER one (got body %u tet %u, want body %u "
+                          "tet %u)", ind1 >> 20, ind1 & 0xfffffu, B_ID, B_DEEP);
+            PXG_CHECK(near6(gNormalPen[i].w, -0.05f));
+            PXG_CHECK(near6(gNormalPen[i].x, 0.0f) && near6(gNormalPen[i].y, 0.0f) &&
+                      near6(gNormalPen[i].z, -1.0f));
+            PXG_CHECK(near6(gPoint[i].x, 0.12f) && near6(gPoint[i].y, 0.15f) &&
+                      near6(gPoint[i].z, 0.0f));
+            // barycentric0 carries the QUERY POINT and barycentric1 the closest point -- that
+            // is what the CUDA writer stores, and the sim-mesh remap depends on it.
+            PXG_CHECK(near6(gBary0[i].x, 0.12f) && near6(gBary0[i].y, 0.15f) &&
+                      near6(gBary0[i].z, 0.05f));
+            PXG_CHECK(near6(gBary1[i].x, gPoint[i].x) && near6(gBary1[i].z, gPoint[i].z));
+        }
+        else if (ind0 == enc(A_ID, aRemap[a7]))
+        {
+            sawA7 = true;
+            PXG_CHECK(ind1 == enc(B_ID, B_GOOD));
+            PXG_CHECK(near6(gNormalPen[i].w, -0.05f));
+        }
+        else if (ind0 == enc(A_ID, aRemap[a8]))
+        {
+            sawA8 = true;
+            PXG_CHECK(ind1 == enc(B_ID, B_GOOD));
+            // The OUTSIDE branch: pen is the POSITIVE separation and the normal is the
+            // normalised point-to-surface direction, here parallel to the x-face normal.
+            PXG_CHECK_MSG(std::fabs(gNormalPen[i].w - 0.04f) <= 2e-6f,
+                          "a8 sits 0.040 outside B_GOOD's x-face; got pen %.7f", gNormalPen[i].w);
+            PXG_CHECK(near6(gNormalPen[i].y, 0.0f) && near6(gNormalPen[i].z, 0.0f));
+            PXG_CHECK_MSG(gNormalPen[i].x < -0.99f,
+                          "the outside normal must point from the tet towards the query vertex "
+                          "(-x here); got %.5f", gNormalPen[i].x);
+        }
+        else if (ind0 == enc(B_ID, bRemap[b1]))
+        {
+            // THE FLIP.  Note the pair ids are the other way round: body B supplies the vertex
+            // and body A the tetrahedron, which can only happen on blockIdx.z == 1.
+            sawB1 = true;
+            PXG_CHECK_MSG(ind1 == enc(A_ID, A_GOOD),
+                          "on the flipped pass the TET must come from body A (got body %u)",
+                          ind1 >> 20);
+            PXG_CHECK(near6(gNormalPen[i].w, -0.05f));
+            PXG_CHECK(near6(gPoint[i].x, 100.12f) && near6(gPoint[i].z, 0.0f));
+        }
+        else
+            PXG_CHECK_MSG(false, "contact %u came from an unexpected query: ind0 = body %u "
+                                 "elem %u", i, ind0 >> 20, ind0 & 0xfffffu);
+    }
+
+    PXG_CHECK_MSG(sawA1 && sawA7 && sawA8,
+                  "the flip=0 pass must emit a1, a7 and a8 (%d %d %d)",
+                  int(sawA1), int(sawA7), int(sawA8));
+    PXG_CHECK_MSG(sawB1,
+                  "the flip=1 pass must emit b1 -- if this is the only failure, blockIdx.z is "
+                  "being ignored and half the contact set is missing");
+
+    for (PxgBufferHandle h : { dbATree.h, dbBTree.h, dbAVerts.h, dbBVerts.h, dbATets.h,
+                               dbBTets.h, dbAVertHint.h, dbBVertHint.h, dbATetHint.h,
+                               dbBTetHint.h, dbARemap.h, dbBRemap.h, dbAFilters.h, dbDesc.h,
+                               dbShapes.h, dbCms.h, dbCd.h, dbPoint.h, dbNormalPen.h,
+                               dbBary0.h, dbBary1.h, dbInfo.h, dbCount.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace

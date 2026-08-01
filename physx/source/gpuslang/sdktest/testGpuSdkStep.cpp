@@ -1903,6 +1903,111 @@ bool softBodyClothY(const SoftBodyClothScene& sc, float& meanY, float& minY)
     return finite;
 }
 
+// A cooked, GPU-resident FEM-VOLUME cube of edge `size`, its base at y = baseY, centred on the
+// x/z origin unless `offsetX` moves it.  Extracted from buildSoftBodyClothScene at P8.9 so the
+// softbody-vs-softbody stack can raise a second, identical cube -- two cubes from one recipe is
+// what makes "the upper one rests on the lower one" a statement about the CONTACT and not about
+// two slightly different meshes.  Self-collision is disabled: these scenes are about collisions
+// BETWEEN bodies, and leaving it on would let the self-collision chain take the credit.
+PxDeformableVolume* buildFemVolumeCube(PxPhysics* physics, PxScene* scene,
+                                       PxCudaContextManager* cudaCtx, PxU32 cells, float size,
+                                       float baseY, float offsetX = 0.0f)
+{
+    const float h = size / float(cells);
+    const PxU32 n = cells + 1;
+    std::vector<PxVec3> tverts;
+    for (PxU32 i = 0; i < n; ++i)
+        for (PxU32 j = 0; j < n; ++j)
+            for (PxU32 kk = 0; kk < n; ++kk)
+                tverts.push_back(PxVec3(float(i) * h - 0.5f * size + offsetX,
+                                        float(j) * h + baseY,
+                                        float(kk) * h - 0.5f * size));
+    auto vid = [n](PxU32 i, PxU32 j, PxU32 kk) { return (i * n + j) * n + kk; };
+    std::vector<PxU32> tets;
+    for (PxU32 i = 0; i < cells; ++i)
+        for (PxU32 j = 0; j < cells; ++j)
+            for (PxU32 kk = 0; kk < cells; ++kk)
+            {
+                const PxU32 c[8] = {
+                    vid(i, j, kk),         vid(i, j, kk + 1),
+                    vid(i, j + 1, kk),     vid(i, j + 1, kk + 1),
+                    vid(i + 1, j, kk),     vid(i + 1, j, kk + 1),
+                    vid(i + 1, j + 1, kk), vid(i + 1, j + 1, kk + 1) };
+                const PxU32 idx[5][4] = { {0,1,2,4}, {1,2,3,7}, {1,4,5,7}, {2,4,6,7}, {1,2,4,7} };
+                for (int t = 0; t < 5; ++t)
+                {
+                    PxU32 a = c[idx[t][0]], b = c[idx[t][1]], cc = c[idx[t][2]], d = c[idx[t][3]];
+                    const PxVec3 e1 = tverts[b] - tverts[a];
+                    const PxVec3 e2 = tverts[cc] - tverts[a];
+                    const PxVec3 e3 = tverts[d] - tverts[a];
+                    if (e1.cross(e2).dot(e3) < 0.0f) { const PxU32 tmp = cc; cc = b; b = tmp; }
+                    tets.push_back(a); tets.push_back(b); tets.push_back(cc); tets.push_back(d);
+                }
+            }
+
+    PxTetrahedronMeshDesc tetDesc;
+    tetDesc.points.count = PxU32(tverts.size());
+    tetDesc.points.stride = sizeof(PxVec3);
+    tetDesc.points.data = tverts.data();
+    tetDesc.tetrahedrons.count = PxU32(tets.size() / 4);
+    tetDesc.tetrahedrons.stride = 4 * sizeof(PxU32);
+    tetDesc.tetrahedrons.data = tets.data();
+
+    PxCookingParams ck(physics->getTolerancesScale());
+    ck.buildGPUData = true;
+    ck.meshWeldTolerance = 0.001f;
+    ck.midphaseDesc = PxMeshMidPhase::eBVH34;
+    PxDeformableVolumeSimulationDataDesc simDataDesc;
+    PxDeformableVolumeMesh* volMesh = immediateCooking::createDeformableVolumeMesh(
+        ck, tetDesc, tetDesc, simDataDesc, physics->getPhysicsInsertionCallback());
+    if (!volMesh) { std::printf("FAIL: createDeformableVolumeMesh returned null\n"); return nullptr; }
+
+    PxDeformableVolumeMaterial* volMat =
+        physics->createDeformableVolumeMaterial(1.e6f, 0.3f, 0.5f, 0.05f);
+    PxDeformableVolumeMaterial* vmats[1] = { volMat };
+    PxShapeFlags sf = PxShapeFlag::eSIMULATION_SHAPE | PxShapeFlag::eSCENE_QUERY_SHAPE;
+    PxShape* vshape = physics->createShape(
+        PxTetrahedronMeshGeometry(volMesh->getCollisionMesh()), vmats, PxU16(1), true, sf);
+    PxDeformableVolume* volume = physics->createDeformableVolume(*cudaCtx);
+    volume->attachShape(*vshape);
+    vshape->release();
+    volume->attachSimulationMesh(*volMesh->getSimulationMesh(), *volMesh->getDeformableVolumeAuxData());
+    volume->setDeformableBodyFlag(PxDeformableBodyFlag::eDISABLE_SELF_COLLISION, true);
+    volume->setLinearDamping(0.0f);
+    volume->setMaxLinearVelocity(1.0e6f);
+    static_cast<PxDeformableBody*>(volume)->setSolverIterationCounts(8u, 1u);
+    scene->addActor(*volume);
+
+    const PxU32 nbSim = volume->getSimulationMesh()->getNbVertices();
+    const PxU32 nbColl = volume->getCollisionMesh()->getNbVertices();
+    std::vector<PxVec4> simPos(nbSim), simVel(nbSim), collPos(nbColl), restPos(nbColl);
+    const PxVec3* simVerts = volume->getSimulationMesh()->getVertices();
+    const PxReal* invMassGM = volume->getDeformableVolumeAuxData()->getGridModelInvMass();
+    for (PxU32 v = 0; v < nbSim; ++v)
+    {
+        const PxReal im = invMassGM ? invMassGM[v] : 1.0f;
+        simPos[v] = PxVec4(simVerts[v].x, simVerts[v].y, simVerts[v].z, im);
+        simVel[v] = PxVec4(0.0f, 0.0f, 0.0f, im);
+    }
+    const PxVec3* collVerts = volume->getCollisionMesh()->getVertices();
+    for (PxU32 v = 0; v < nbColl; ++v)
+    {
+        collPos[v] = PxVec4(collVerts[v].x, collVerts[v].y, collVerts[v].z, 1.0f);
+        restPos[v] = collPos[v];
+    }
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getSimPositionInvMassBufferD()),
+                    simPos.data(), nbSim * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getSimVelocityBufferD()),
+                    simVel.data(), nbSim * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getPositionInvMassBufferD()),
+                    collPos.data(), nbColl * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getRestPositionBufferD()),
+                    restPos.data(), nbColl * sizeof(PxVec4));
+    volume->markDirty(PxDeformableVolumeDataFlag::eALL);
+    return volume;
+}
+
 SoftBodyClothScene buildSoftBodyClothScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
                                            PxCudaContextManager* cudaCtx)
 {
@@ -1930,103 +2035,12 @@ SoftBodyClothScene buildSoftBodyClothScene(PxPhysics* physics, PxScene* scene, P
     // ---- the FEM-volume cube, resting on the plane -----------------------------------------
     if (!noSoftBody)
     {
-        const PxU32 cells = 2;
         const float size = 1.0f;
-        const float h = size / float(cells);
-        const PxU32 n = cells + 1;
-        std::vector<PxVec3> tverts;
-        for (PxU32 i = 0; i < n; ++i)
-            for (PxU32 j = 0; j < n; ++j)
-                for (PxU32 kk = 0; kk < n; ++kk)
-                    tverts.push_back(PxVec3(float(i) * h - 0.5f * size,
-                                            float(j) * h,             // base at y = 0
-                                            float(kk) * h - 0.5f * size));
-        auto vid = [n](PxU32 i, PxU32 j, PxU32 kk) { return (i * n + j) * n + kk; };
-        std::vector<PxU32> tets;
-        for (PxU32 i = 0; i < cells; ++i)
-            for (PxU32 j = 0; j < cells; ++j)
-                for (PxU32 kk = 0; kk < cells; ++kk)
-                {
-                    const PxU32 c[8] = {
-                        vid(i, j, kk),         vid(i, j, kk + 1),
-                        vid(i, j + 1, kk),     vid(i, j + 1, kk + 1),
-                        vid(i + 1, j, kk),     vid(i + 1, j, kk + 1),
-                        vid(i + 1, j + 1, kk), vid(i + 1, j + 1, kk + 1) };
-                    const PxU32 idx[5][4] = { {0,1,2,4}, {1,2,3,7}, {1,4,5,7}, {2,4,6,7}, {1,2,4,7} };
-                    for (int t = 0; t < 5; ++t)
-                    {
-                        PxU32 a = c[idx[t][0]], b = c[idx[t][1]], cc = c[idx[t][2]], d = c[idx[t][3]];
-                        const PxVec3 e1 = tverts[b] - tverts[a];
-                        const PxVec3 e2 = tverts[cc] - tverts[a];
-                        const PxVec3 e3 = tverts[d] - tverts[a];
-                        if (e1.cross(e2).dot(e3) < 0.0f) { const PxU32 tmp = cc; cc = b; b = tmp; }
-                        tets.push_back(a); tets.push_back(b); tets.push_back(cc); tets.push_back(d);
-                    }
-                }
-
-        PxTetrahedronMeshDesc tetDesc;
-        tetDesc.points.count = PxU32(tverts.size());
-        tetDesc.points.stride = sizeof(PxVec3);
-        tetDesc.points.data = tverts.data();
-        tetDesc.tetrahedrons.count = PxU32(tets.size() / 4);
-        tetDesc.tetrahedrons.stride = 4 * sizeof(PxU32);
-        tetDesc.tetrahedrons.data = tets.data();
-
-        PxCookingParams ck(physics->getTolerancesScale());
-        ck.buildGPUData = true;
-        ck.meshWeldTolerance = 0.001f;
-        ck.midphaseDesc = PxMeshMidPhase::eBVH34;
-        PxDeformableVolumeSimulationDataDesc simDataDesc;
-        PxDeformableVolumeMesh* volMesh = immediateCooking::createDeformableVolumeMesh(
-            ck, tetDesc, tetDesc, simDataDesc, physics->getPhysicsInsertionCallback());
-        if (!volMesh) { std::printf("FAIL: createDeformableVolumeMesh returned null\n"); return out; }
-
-        PxDeformableVolumeMaterial* volMat =
-            physics->createDeformableVolumeMaterial(1.e6f, 0.3f, 0.5f, 0.05f);
-        PxDeformableVolumeMaterial* vmats[1] = { volMat };
-        PxShapeFlags sf = PxShapeFlag::eSIMULATION_SHAPE | PxShapeFlag::eSCENE_QUERY_SHAPE;
-        PxShape* vshape = physics->createShape(
-            PxTetrahedronMeshGeometry(volMesh->getCollisionMesh()), vmats, PxU16(1), true, sf);
-        PxDeformableVolume* volume = physics->createDeformableVolume(*cudaCtx);
-        volume->attachShape(*vshape);
-        vshape->release();
-        volume->attachSimulationMesh(*volMesh->getSimulationMesh(), *volMesh->getDeformableVolumeAuxData());
-        volume->setDeformableBodyFlag(PxDeformableBodyFlag::eDISABLE_SELF_COLLISION, true);
-        volume->setLinearDamping(0.0f);
-        volume->setMaxLinearVelocity(1.0e6f);
-        static_cast<PxDeformableBody*>(volume)->setSolverIterationCounts(8u, 1u);
-        scene->addActor(*volume);
-
-        const PxU32 nbSim = volume->getSimulationMesh()->getNbVertices();
-        const PxU32 nbColl = volume->getCollisionMesh()->getNbVertices();
-        std::vector<PxVec4> simPos(nbSim), simVel(nbSim), collPos(nbColl), restPos(nbColl);
-        const PxVec3* simVerts = volume->getSimulationMesh()->getVertices();
-        const PxReal* invMassGM = volume->getDeformableVolumeAuxData()->getGridModelInvMass();
-        for (PxU32 v = 0; v < nbSim; ++v)
-        {
-            const PxReal im = invMassGM ? invMassGM[v] : 1.0f;
-            simPos[v] = PxVec4(simVerts[v].x, simVerts[v].y, simVerts[v].z, im);
-            simVel[v] = PxVec4(0.0f, 0.0f, 0.0f, im);
-        }
-        const PxVec3* collVerts = volume->getCollisionMesh()->getVertices();
-        for (PxU32 v = 0; v < nbColl; ++v)
-        {
-            collPos[v] = PxVec4(collVerts[v].x, collVerts[v].y, collVerts[v].z, 1.0f);
-            restPos[v] = collPos[v];
-        }
-        PxCudaContext* ctx = cudaCtx->getCudaContext();
-        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getSimPositionInvMassBufferD()),
-                        simPos.data(), nbSim * sizeof(PxVec4));
-        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getSimVelocityBufferD()),
-                        simVel.data(), nbSim * sizeof(PxVec4));
-        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getPositionInvMassBufferD()),
-                        collPos.data(), nbColl * sizeof(PxVec4));
-        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getRestPositionBufferD()),
-                        restPos.data(), nbColl * sizeof(PxVec4));
-        volume->markDirty(PxDeformableVolumeDataFlag::eALL);
-
+        PxDeformableVolume* volume = buildFemVolumeCube(physics, scene, cudaCtx, /*cells*/ 2u,
+                                                        size, /*baseY*/ 0.0f);
+        if (!volume) return out;
         out.volume = volume;
-        out.numSimVerts = nbSim;
+        out.numSimVerts = volume->getSimulationMesh()->getNbVertices();
         out.cubeTopY = size;
     }
 
@@ -2110,6 +2124,121 @@ SoftBodyClothScene buildSoftBodyClothScene(PxPhysics* physics, PxScene* scene, P
         out.surface = surface;
         out.numClothVerts = nv;
     }
+
+    return out;
+}
+
+
+// ===========================================================================
+// PXG_SCENE=softbodystack (P8.9): the scene the softbody-vs-SOFTBODY narrowphase exists for.
+//
+// TWO FEM-VOLUME CUBES from ONE recipe (buildFemVolumeCube): the lower one rests on a static
+// plane with its top face at y = 1, the upper one is dropped from base y = 1.5.  Both cubes are
+// cooked identically, so their per-vertex inverse masses are identical too -- which is not a
+// detail.  P8.8 spent a whole tranche on a scene whose sheet was 192x heavier per vertex than
+// the cube it landed on, where a CORRECT solve pushed the lighter body out of the way.  Two
+// cubes from one recipe cannot reproduce that, by construction.
+//
+// Self-collision is OFF on both (buildFemVolumeCube sets eDISABLE_SELF_COLLISION), so nothing
+// the SELF-collision chain does can be mistaken for the between-bodies chain being alive.
+//
+// THE CONTROL: PXG_SS_NOLOWER=1 removes the lower cube and nothing else.  The upper cube then
+// falls all the way to the plane, base y ~ 0.  Caught and missed are a full unit apart.
+//
+// WHAT IT COVERS.  Softbody-vs-softbody is the one collision pair in this port that is a single
+// kernel: `testSDKSoftbodies` (PxgNarrowphaseCore.cpp:4399) dispatches
+// sb_sbMidphaseGeneratePairsLaunch and nothing else, then remaps to the sim mesh with the
+// already-mapped sb_fem_contact_remap_to_simLaunch.  Prepare and solve are
+// sb_softbodyContactPrepareLaunch and sb_solveOutputSSDeltaVLaunch, both mapped by the
+// self-collision tranche and both shared with it.  So this scene is the first thing that
+// exercises the new kernel against live data, and the only thing that can.
+// ===========================================================================
+struct SoftBodyStackScene
+{
+    PxDeformableVolume* lower = nullptr;
+    PxDeformableVolume* upper = nullptr;
+    PxU32 numUpperSimVerts = 0;
+    bool hasLower = false;
+    float lowerTopY = 1.0f;
+    PxCudaContextManager* cudaCtx = nullptr;
+};
+
+// Read the UPPER cube's simulation vertices back and reduce them.
+bool softBodyStackUpperY(const SoftBodyStackScene& sc, float& meanY, float& minY)
+{
+    std::vector<PxVec4> pos(sc.numUpperSimVerts);
+    PxCudaContext* ctx = sc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(pos.data(),
+                    reinterpret_cast<CUdeviceptr>(sc.upper->getSimPositionInvMassBufferD()),
+                    pos.size() * sizeof(PxVec4));
+    float sum = 0.0f;
+    minY = FLT_MAX;
+    bool finite = true;
+    for (const PxVec4& p : pos)
+    {
+        finite = finite && std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
+        sum += p.y;
+        minY = PxMin(minY, p.y);
+    }
+    meanY = sum / float(pos.size());
+    return finite;
+}
+
+SoftBodyStackScene buildSoftBodyStackScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
+                                           PxCudaContextManager* cudaCtx)
+{
+    SoftBodyStackScene out;
+    out.cudaCtx = cudaCtx;
+
+    // The ground box and the island dynamic are sunk / parked exactly as the softbodycloth
+    // scene's header explains: both are real obstacles now that the hull branch exists, and
+    // neither belongs in what this scene measures.
+    PxRigidStatic* ground = addGroundBox(physics, scene, rigidMat);
+    ground->setGlobalPose(PxTransform(PxVec3(0.0f, -50.5f, 0.0f)));
+    PxRigidDynamic* island = addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                        boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+    island->setGlobalPose(PxTransform(PxVec3(10.0f, 1.5f, 0.0f)));
+
+    {
+        PxRigidStatic* floor = physics->createRigidStatic(
+            PxTransformFromPlaneEquation(PxPlane(0.0f, 1.0f, 0.0f, 0.0f)));
+        PxShape* fs = physics->createShape(PxPlaneGeometry(), *rigidMat);
+        floor->attachShape(*fs);
+        scene->addActor(*floor);
+        fs->release();
+    }
+
+    const float lowerSize = 1.0f;
+    out.lowerTopY = lowerSize;
+
+    const bool noLower = std::getenv("PXG_SS_NOLOWER") != nullptr;
+    out.hasLower = !noLower;
+    if (!noLower)
+    {
+        out.lower = buildFemVolumeCube(physics, scene, cudaCtx, /*cells*/ 2u, lowerSize, /*baseY*/ 0.0f);
+        if (!out.lower) return out;
+    }
+
+    // *** THE UPPER CUBE IS SMALLER, AND THAT IS NOT COSMETIC. ***
+    // Two IDENTICAL cubes stacked flush give coplanar SIDE faces, and every vertex on the
+    // upper cube's bottom rim then sits exactly on one.  The narrowphase is a vertex-versus-
+    // closest-tet-SURFACE-point test, so at a tie between the side face (distance ~0) and the
+    // top face (distance ~0) it takes the side, and the emitted normal comes out HORIZONTAL --
+    // measured at n.y = 0.003 with |pen| < 0.001.  A horizontal contact can never hold a cube
+    // up, and the stack sank with the whole chain running correctly.  Making the upper cube
+    // 0.6 wide puts its entire bottom rim strictly INSIDE the lower cube's 1 x 1 top face, so
+    // the top face is unambiguously the nearest surface and the normal is vertical.  This is
+    // the same reason the softbodycloth scene's sheet is smaller than the cube it lands on.
+    const float upperSize = 0.6f;
+
+    // The upper cube starts half a unit clear of the lower one's top face.  That is a short
+    // enough fall that the contact does not have to absorb a large impact speed in one frame,
+    // and long enough that a scene where nothing collides is unmistakable.
+    float upperBaseY = 1.5f;
+    if (const char* yEnv = std::getenv("PXG_SS_UPPERY")) upperBaseY = float(atof(yEnv));
+    out.upper = buildFemVolumeCube(physics, scene, cudaCtx, /*cells*/ 2u, upperSize, upperBaseY);
+    if (!out.upper) return out;
+    out.numUpperSimVerts = out.upper->getSimulationMesh()->getNbVertices();
 
     return out;
 }
@@ -3009,6 +3138,106 @@ int main()
         else
             std::printf("[  OK  ] gpu-sdk-step: control run -- with no softbody the sheet fell "
                         "clean through to the plane (min y=%.4f)\n", minY);
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        return 0;
+    }
+
+    if (!std::strcmp(sceneName, "softbodystack"))
+    {
+        SoftBodyStackScene ss = buildSoftBodyStackScene(physics, scene, material, cudaCtx);
+        if (!ss.upper)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodystack scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'softbodystack' built: a %u-sim-vertex FEM-volume cube above "
+                    "%s (lower top y=%.2f), both over a static plane at y=0\n",
+                    ss.numUpperSimVerts,
+                    ss.hasLower ? "an identical FEM-volume cube" : "NOTHING (control run)",
+                    ss.lowerTopY);
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: softbodystack GPU pipeline CONSTRUCTED + live over "
+                        "Vulkan (set PXG_GPU_STEP=1 to step the drop)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        int steps = 150;
+        if (const char* sEnv = std::getenv("PXG_STEPS")) { const int v = atoi(sEnv); if (v > 0) steps = v; }
+
+        float meanY0 = 0.0f, minY0 = 0.0f;
+        bool allFinite = softBodyStackUpperY(ss, meanY0, minY0);
+        float meanY = meanY0, minY = minY0, prevMin = minY0, restMaxDy = 0.0f;
+        const int restWindow = steps / 4;
+        PxU32 maxVolContacts = 0u;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            allFinite = softBodyStackUpperY(ss, meanY, minY) && allFinite;
+            PxSimulationStatistics st;
+            scene->getSimulationStatistics(st);
+            maxVolContacts = PxMax(maxVolContacts,
+                                   st.gpuDynamicsMemoryConfigStatistics.deformableVolumeContacts);
+            if (i >= steps - restWindow) restMaxDy = PxMax(restMaxDy, PxAbs(minY - prevMin));
+            if (i < 4 || i == steps - 1 || (i % 30 == 0))
+                std::printf("    step %3d: upper cube min y = %.5f (mean %.5f)\n", i, minY, meanY);
+            prevMin = minY;
+        }
+
+        std::printf("  softbodystack (lower cube %s): upper min y %.4f -> %.4f (mean %.4f); "
+                    "lower top y=%.2f, plane y=0; peak volume contacts = %u; rest |dy| over the "
+                    "last %d steps = %.6f\n",
+                    ss.hasLower ? "PRESENT" : "ABSENT (control)", minY0, minY, meanY,
+                    ss.lowerTopY, maxVolContacts, restWindow, restMaxDy);
+
+        int failures = 0;
+        if (!allFinite || !std::isfinite(minY))
+        { std::printf("FAIL: non-finite vertex in the upper cube\n"); ++failures; }
+        if (!(minY0 - minY > 0.2f))
+        { std::printf("FAIL: the upper cube did not fall (min y %.5f -> %.5f)\n", minY0, minY);
+          ++failures; }
+
+        // Caught means the upper cube's base stays near the lower cube's top face (y = 1, less
+        // whatever the two cubes compress into each other); missed means it reaches the plane.
+        // The bar sits halfway between, far from both.
+        const float CATCH_Y = 0.5f;
+        if (ss.hasLower)
+        {
+            if (!(maxVolContacts > 0u))
+            { std::printf("FAIL: two softbodies overlap but the engine reported ZERO "
+                          "deformable-volume contacts -- sb_sbMidphaseGeneratePairsLaunch is not "
+                          "feeding the solve\n"); ++failures; }
+            if (!(minY > CATCH_Y))
+            { std::printf("FAIL: the upper cube sank to y=%.5f, below the catch bar %.2f (lower "
+                          "top y=%.2f)\n", minY, CATCH_Y, ss.lowerTopY); ++failures; }
+            if (!(restMaxDy < 0.01f))
+            { std::printf("FAIL: the stacked cube never settled (rest |dy|=%.6f)\n", restMaxDy);
+              ++failures; }
+        }
+        else
+        {
+            // The CONTROL.  With no lower cube the upper one falls to the plane.  Without this
+            // half the main run proves nothing: a cube that never fell would pass it too.
+            if (!(minY < CATCH_Y))
+            { std::printf("FAIL: the CONTROL run has no lower cube, so the upper one must fall "
+                          "past %.2f to the plane; it stopped at %.5f\n", CATCH_Y, minY);
+              ++failures; }
+        }
+
+        if (failures)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodystack checks failed (%d)\n", failures);
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        if (ss.hasLower)
+            std::printf("[  OK  ] gpu-sdk-step: the upper FEM-volume cube was CAUGHT by the lower "
+                        "one and SETTLED on it (min y=%.4f, lower top %.2f, rest |dy|=%.6f) -- "
+                        "softbody-vs-softbody runs end to end\n", minY, ss.lowerTopY, restMaxDy);
+        else
+            std::printf("[  OK  ] gpu-sdk-step: control run -- with no lower cube the upper one "
+                        "fell clean through to the plane (min y=%.4f)\n", minY);
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
         return 0;
     }

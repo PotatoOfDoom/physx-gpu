@@ -1620,6 +1620,116 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.9 — MILESTONE: a FEM CUBE STACKS ON A FEM CUBE (softbody-vs-softbody, in ONE kernel)
+
+`sb_sbMidphaseGeneratePairsLaunch` is mapped, and with it **softbody-vs-softbody is complete**.
+
+Every other collision pair in this port needed a chain of four to seven kernels.  This one needs
+**one**: `testSDKSoftbodies` (`PxgNarrowphaseCore.cpp:4399`) dispatches this kernel and nothing
+else, then hands the result to `softbodyFemContactApplyCollisionToSimMeshMapping`, i.e. the
+already-mapped `sb_fem_contact_remap_to_simLaunch`.  Constraint prepare and solve are
+`sb_softbodyContactPrepareLaunch` and `sb_solveOutputSSDeltaVLaunch`, both mapped by the
+SELF-collision tranche (P8.4) and both shared with it verbatim.  So one file closed the pair.
+
+**KEY EVIDENCE — `PXG_SCENE=softbodystack`:** a 0.6-edge FEM-volume cube dropped from base
+y = 1.5 onto a 1.0-edge FEM-volume cube resting on a plane.
+
+| run | result |
+|---|---|
+| lower cube PRESENT | **CAUGHT, min y = 0.982** (lower top 1.00), settles, rest \|dy\| ≈ 0.002 |
+| `PXG_SS_NOLOWER=1` (control) | falls clean through to the plane, **min y = 0.0000** |
+
+Both cubes come out of the SAME recipe — the new `buildFemVolumeCube`, extracted from the
+softbodycloth scene — so their per-vertex inverse masses are identical by construction.  That is
+deliberate: P8.8 lost a tranche to a scene whose sheet was 192× heavier per vertex than the cube
+it landed on, where a correct solve pushed the lighter body aside.  Two cubes from one recipe
+cannot reproduce that.  Self-collision is off on both, so nothing the self-collision chain does
+can be mistaken for the between-bodies chain being alive.
+
+**The kernel.**  One warp per SURFACE vertex of softbody0 walks softbody1's BV32 tetrahedron
+tree and keeps the single deepest surviving vertex-vs-tet contact.  The traverser body is the
+same one `softBodySelfCollisionBda` already carries — the two were transcribed from adjacent
+structs in the same `.cu` — and four things differ, all of them consequences of the query vertex
+and the tree belonging to DIFFERENT bodies:
+
+| | self-collision | softbody-vs-softbody |
+|---|---|---|
+| shared-vertex skip | required | absent (no shared vertices) |
+| rest-pose re-check + stress gate | required | absent (only meaningful within one body) |
+| contact distance | one body's, DOUBLED | the SUM of the two shapes' |
+| emitted pair ids | one body twice | two different bodies |
+
+The inside/outside decision is the same arithmetic in both despite looking different in the two
+structs: upstream's self-collision negates the normal before the branch and tests
+`v.dot(normal) > 0`; upstream's SS leaves it un-negated and tests `v.dot(normal) < 0`, then picks
+`v.dot(normal) < -0.707f ? v : -normal`.  Substituting `normal -> -normal` turns each into the
+other, including the tie-break.  The port keeps the self-collision FORM, because that form is
+the one already covered by fixtures.
+
+**`blockIdx.z` IS NOT A SPARE DIMENSION.**  The engine launches grid
+(SB_SBMIDPHASE = 1024, numTests, **2**) and `blockIdx.z` is a `flip` flag: z = 0 tests shape0's
+vertices against shape1's tree, z = 1 the other way round.  Upstream says why — "we do
+bidirectional collision (A to B and B to A) ... to ensure we don't miss contacts when we have a
+soft body with an insufficiently tessellated tetrahedron mesh."  Dropping it halves the contact
+set and the coarser mesh sinks into the finer one.  The bridge forwards gridDimX/Y/Z verbatim,
+so `flip = gid.z` costs nothing — but it has to be there, and the fixture puts each direction's
+geometry in its own region of space so a missing z shows up as a **missing contact**, not as an
+ambiguous change in a count.
+
+**Fixture** `softBodySimSoftBodySoftBodyMidphase` (55 fixtures in the file now).  Four contacts
+survive every gate — three on the flip = 0 pass and one on the flip = 1 pass — and the
+contact-distance pair `a8`/`a9` straddles the sum from both sides so that *every* single-value
+or doubled-value reading of it is killed:
+
+| reading of the contact distance | a8 (0.040 out) | a9 (0.055 out) |
+|---|---|---|
+| **sum, 0.05** | kept | dropped |
+| ref0 alone, 0.03 | dropped | dropped |
+| ref1 alone, 0.02 | dropped | dropped |
+| 2 × ref0, 0.06 | kept | **kept** |
+| 2 × ref1, 0.04 | dropped | dropped |
+
+**Mutation sweep: 8 of 8 killed** (forced-fresh `.spv` rebuild each time) — drop the
+`blockIdx.z` flip; contact distance from ref0 alone; contact distance doubled; the wildcard
+filter querying tet 0 instead of `PX_MAX_NB_DEFORMABLE_VOLUME_TET`; the surface-tet hint gate
+removed; the cross-lane argmin fixed at lane 0; `pairInd0` carrying the vertex index instead of
+`mSurfaceVertToTetRemap`; the tree taken from softbody0 instead of softbody1.
+
+### What the scene found: two flush cubes cannot stack, and that is geometry, not a bug
+
+The first version of the scene stacked two IDENTICAL 1.0 cubes and the upper one sank straight
+through — with the new kernel dispatching 23 times over 40 steps and the remap right behind it.
+A probe on the SS constraint block (since reverted) read out what the contacts actually were:
+
+```
+contacts=8  cross=8 self=0  pen=[ 0.0375 .. 0.0396]  n.y = 1.0000     <- first touch, correct
+contacts=18 cross=18 self=0 pen=[-0.0009 .. 0.0025]  n.y = 0.0029     <- and then this
+```
+
+`cross=8`/`self=0` says the new kernel is emitting genuine A↔B pairs, so the port was doing its
+job.  The normals are the problem: they go **horizontal**.  Two identical cubes stacked flush
+have COPLANAR SIDE FACES, and every vertex on the upper cube's bottom rim lands exactly on one.
+The narrowphase is a vertex-versus-closest-tet-SURFACE-point test, so at a tie between the side
+face (distance ~0) and the top face (distance ~0) it takes the side, and a horizontal contact
+with |pen| < 0.001 can never hold a cube up.
+
+Making the upper cube 0.6 wide puts its whole bottom rim strictly inside the lower cube's 1 × 1
+top face, the top face becomes unambiguously nearest, and the stack holds.  This is the same
+reason the softbodycloth scene's sheet is smaller than the cube it lands on — recorded here
+because it is the second time a degenerate SCENE looked exactly like a dead kernel, and the
+tell both times was a probe on live data rather than more reading of the shader.
+
+**One measured caveat on the numbers.**  `softbodystack` and `clothselfcollide` vary in their
+last printed digit run to run (0.9822 / 0.9820, rest |dy| 0.002299 / 0.002152; mean y 5.1105 /
+5.1106) because the deformable solves scatter through real float atomics and the summation order
+is not fixed.  `min y` is stable to four decimals across three consecutive runs and every
+assertion bar sits far from the variation.
+
+Manifest hand-edited 247 → 248.  Suite **674/674 in both memory modes**, rigid regression green,
+and every deformable scene unchanged — `softbodyselfcollide` 0.2133, `softbodycloth` 0.8688,
+`clothselfcollide` min y 5.0999, softbody floor matrix bit-identical at box **0.49628** / plane
+**0.49753** / sphere **0.48436**.
+
 ## P8.8 — MILESTONE: a FEM sheet is CAUGHT BY A FEM CUBE (the softbody-vs-CLOTH chain, 6 of 6)
 
 Softbody-vs-cloth needs six kernels and **all six are on the engine BDA ABI**.  The chain

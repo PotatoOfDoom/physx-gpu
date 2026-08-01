@@ -536,6 +536,16 @@ static const uint8_t kSbReorderPsContacts[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
 //   y = nbActiveSelfCollisionSoftbodies); the bridge forwards both.
 static const uint8_t kSbSelfCollisionMidphase[] = { 8, 8, 8, 56 };
 
+// gpunarrowphase softbody-vs-SOFTBODY midphase (P8.9) — the WHOLE softbody-vs-softbody
+// narrowphase, one kernel:
+//   sb_sbMidphaseGeneratePairsLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
+//   bounds*, contactDistance*, gpuShapes*, softbodies*, PxgSoftBodyContactWriter writer)
+//   -- launch site PxgNarrowphaseCore.cpp:4443.  PxReal @0, six pointers realigned to
+//   @8..@48, then the 56-byte writer (paramAlign 8) at @56 -> 112-byte blob.
+//   The launch is 3D in the GRID (x = SB_SBMIDPHASE = 1024, y = numTests, z = 2); the bridge
+//   forwards all three, and z is the bidirectional A->B / B->A flip, not padding.
+static const uint8_t kSbSbMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 56 };
+
 // gpunarrowphase softbody-vs-CLOTH midphase (P8.8):
 //   sb_clothMidphaseGeneratePairsLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
 //   bounds*, contactDistance*, gpuShapes*, softbodies*, clothes*, PxU32 stackSizeBytes,
@@ -1018,6 +1028,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_solveRigidSoftCollisionLaunchTGS", kSbRigidContactSolve, uint32_t(sizeof(kSbRigidContactSolve)) },
     // gpunarrowphase softbody SELF-collision midphase (P8.4 tranche a)
     { "sb_selfCollisionMidphaseGeneratePairsLaunch", kSbSelfCollisionMidphase, uint32_t(sizeof(kSbSelfCollisionMidphase)) },
+    { "sb_sbMidphaseGeneratePairsLaunch", kSbSbMidphase, uint32_t(sizeof(kSbSbMidphase)) },
     // gpunarrowphase softbody-vs-CLOTH midphase (P8.8)
     { "sb_clothMidphaseGeneratePairsLaunch", kSbClothMidphase, uint32_t(sizeof(kSbClothMidphase)) },
     { "sb_clothContactGenLaunch", kSbClothContactGen, uint32_t(sizeof(kSbClothContactGen)) },
