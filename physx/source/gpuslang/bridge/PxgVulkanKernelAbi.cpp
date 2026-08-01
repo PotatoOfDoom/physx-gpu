@@ -575,6 +575,10 @@ static const uint8_t kSbClothVertContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 4, 8, 8, 
 //   realigned to @80 and @88 -> 96-byte blob.
 static const uint8_t kSbClothContactPrepare[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
 
+// sb_solveOutputSCDeltaVLaunch(softbodies*, clothes*, contactInfos*, constraints*,
+//   numContacts*, lambdaNs*) -> six pointers, 48-byte blob.
+static const uint8_t kSbClothSolve[] = { 8, 8, 8, 8, 8, 8 };
+
 // gpunarrowphase / gpusimulationcontroller softbody SELF-collision SOLVE chain (P8.4
 // tranche b):
 //   sb_fem_contact_remap_to_simLaunch(const PxgSoftBody* softbodies, float4* outBarycentric0,
@@ -1020,6 +1024,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_clothVertMidphaseGeneratePairsLaunch", kSbClothVertMidphase, uint32_t(sizeof(kSbClothVertMidphase)) },
     { "sb_clothVertContactGenLaunch", kSbClothVertContactGen, uint32_t(sizeof(kSbClothVertContactGen)) },
     { "sb_clothContactPrepareLaunch", kSbClothContactPrepare, uint32_t(sizeof(kSbClothContactPrepare)) },
+    { "sb_solveOutputSCDeltaVLaunch", kSbClothSolve, uint32_t(sizeof(kSbClothSolve)) },
     // gpunarrowphase / gpusimulationcontroller softbody SELF-collision solve chain (P8.4 tranche b)
     { "sb_fem_contact_remap_to_simLaunch", kSbFemContactRemapToSim, uint32_t(sizeof(kSbFemContactRemapToSim)) },
     { "sb_softbodyContactPrepareLaunch", kSbSsContactPrepare, uint32_t(sizeof(kSbSsContactPrepare)) },

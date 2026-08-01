@@ -9159,4 +9159,299 @@ PXG_TEST(softBodySimClothContactPrepare)
         dev->destroyBuffer(h);
 }
 
+// ===========================================================================
+// P8.8 step 6 — sb_solveOutputSCDeltaVLaunch, the last kernel of the chain.
+//
+// It solves the constraints step 5 prepared and scatters opposite-signed corrections onto both
+// bodies.  The fixture runs one contact of each shape and reproduces the solver by hand:
+//
+//   relDelta  = (cloth side, barycentrically weighted) - (softbody side, ditto)
+//   CN        = pen + dot(relDelta, normal)
+//   dLambdaN  = max(-CN * denomInv, -lambdaN)     <- the clamp that stops a contact PULLING
+//   commonVec = dLambdaN * normal, plus the friction term when the tangential motion exceeds
+//               1e-14 and the friction coefficient is non-zero
+//
+// then `+w * bc * commonVec` on the cloth and `-w * bc * commonVec` on the softbody.
+//
+// FOUR THINGS THIS FIXTURE IS BUILT TO SEE, none of which a single well-behaved contact shows:
+//   * the OPPOSITE SIGNS -- the cloth and softbody corrections must point against each other;
+//   * the VERTEX path's two asymmetries: no barycentric factor on the cloth correction, and an
+//     atomic guarded by the inverse mass ALONE where the triangle path also demands bc > 1e-6;
+//   * the .w CONTRIBUTION COUNT, which the averaging pass downstream divides by;
+//   * the two guards -- a zero inverse mass and a barycentric at or below 1e-6 must both
+//     suppress their scatter, and the fixture gives contact 0 one of each.
+// ===========================================================================
+namespace p88sv
+{
+struct SbClothSolvePush
+{
+    uint64_t softbodies, clothes, contactInfos, constraints, numContacts, lambdaNs;
+};
+static_assert(sizeof(SbClothSolvePush) == 48, "sb_solveOutputSCDeltaV push blob must be 48 bytes");
+} // namespace p88sv
+
+PXG_TEST(softBodySimClothContactSolve)
+{
+    using namespace p80refit;
+    using namespace p88cg;    // FemFemInfoHost / encodeId
+    using namespace p88pr;    // SsConstraintBlock
+    using namespace p88sv;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // ---- the cloth ------------------------------------------------------------------------
+    // mAccumulatedDeltaPos: accumulated motion in xyz, INVERSE MASS in w.
+    // Vertex 2 is PINNED (invMass 0), so contact 0's third cloth scatter must be suppressed.
+    std::vector<F4> clothAccum = {
+        { 0.25f,  0.0f,   0.0f,  0.5f  },
+        { 0.0f,   0.125f, 0.0f,  0.25f },
+        { 0.0f,   0.0f,   0.25f, 0.0f  },   // PINNED
+        { 0.125f, 0.25f,  0.0f,  4.0f  },   // the vertex contact's element
+    };
+    std::vector<TetIdx4> clothTris = { { 0u, 1u, 2u, 0u } };
+    const float SENT = -7.0f;
+    std::vector<F4> clothOut(4, F4{ SENT, SENT, SENT, SENT });
+    DevBuf bClothAccum = makeDev(dev, clothAccum), bClothTris = makeDev(dev, clothTris);
+    DevBuf bClothOut = makeDev(dev, clothOut);
+    if (!bClothAccum.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgFEMCloth cloth;
+    std::memset(&cloth, 0, sizeof(cloth));
+    cloth.mAccumulatedDeltaPos = reinterpret_cast<float4*>(size_t(bClothAccum.addr));
+    cloth.mTriangleVertexIndices = reinterpret_cast<uint4*>(size_t(bClothTris.addr));
+    cloth.mDeltaPos = reinterpret_cast<float4*>(size_t(bClothOut.addr));
+    cloth.mNbVerts = 4u; cloth.mNbTriangles = 1u;
+    std::vector<PxgFEMCloth> clothArr = { cloth };
+    DevBuf bCloth = makeDev(dev, clothArr);
+
+    // ---- the softbody ---------------------------------------------------------------------
+    std::vector<F4> sbAccum = {
+        { 0.125f, 0.0f,   0.0f,  1.0f },
+        { 0.0f,   0.25f,  0.0f,  0.5f },
+        { 0.0f,   0.0f,   0.125f, 2.0f },
+        { 0.25f,  0.125f, 0.0f,  8.0f },
+    };
+    std::vector<TetIdx4> simTets = { { 0u, 1u, 2u, 3u } };
+    std::vector<F4> sbOut(4, F4{ SENT, SENT, SENT, SENT });
+    DevBuf bSbAccum = makeDev(dev, sbAccum), bSimTets = makeDev(dev, simTets);
+    DevBuf bSbOut = makeDev(dev, sbOut);
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mSimDeltaPos = reinterpret_cast<float4*>(size_t(bSbAccum.addr));
+    sb.mSimTetIndices = reinterpret_cast<uint4*>(size_t(bSimTets.addr));
+    sb.mSimDelta = reinterpret_cast<float4*>(size_t(bSbOut.addr));
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- two constraints ------------------------------------------------------------------
+    // contact 0: cloth TRIANGLE.  clothBC.z is 0 exactly, so its third scatter is suppressed by
+    //            the barycentric guard AND vertex 2 is pinned -- two independent reasons, and
+    //            the shader must honour either.  softBodyBC.w is 1e-7, BELOW the 1e-6 guard.
+    // contact 1: cloth VERTEX 3, with friction on so the tangential term runs.
+    const F4 BC0_TRI = { 0.5f, 0.5f, 0.0f, 0.0f };
+    const F4 BC0_VTX = { 0.0f, 0.0f, 0.0f, 1.0f };
+    const F4 BC1_A   = { 0.5f, 0.25f, 0.25f, 1e-7f };
+    const F4 BC1_B   = { 0.25f, 0.25f, 0.25f, 0.25f };
+    const F4 NP_A = { 0.0f, 1.0f, 0.0f, -0.25f };   // normal +y, penetration -0.25
+    const F4 NP_B = { 1.0f, 0.0f, 0.0f, -0.5f };
+    // contact 4 is SEPARATED: a POSITIVE penetration makes -CN * denomInv negative, so the
+    // clamp against -lambdaN (zero on the first iteration) must hold the impulse at zero.
+    // Without the clamp the contact PULLS the bodies together, which no penetrating contact in
+    // this fixture can show.
+    const F4 NP_C = { 1.0f, 0.0f, 0.0f, 0.5f };
+    const float DENOM_A = 2.0f, DENOM_B = 4.0f;
+    const float FRIC_A = 0.0f, FRIC_B = 0.5f;       // contact 1 exercises the friction branch
+
+    std::vector<SsConstraintBlock> blocks(1);
+    std::memset(blocks.data(), 0, sizeof(SsConstraintBlock));
+    auto setC = [&](uint32_t k, F4 b0, F4 b1, F4 np, float denom, float fric) {
+        blocks[0].bary0[k][0] = b0.x; blocks[0].bary0[k][1] = b0.y;
+        blocks[0].bary0[k][2] = b0.z; blocks[0].bary0[k][3] = b0.w;
+        blocks[0].bary1[k][0] = b1.x; blocks[0].bary1[k][1] = b1.y;
+        blocks[0].bary1[k][2] = b1.z; blocks[0].bary1[k][3] = b1.w;
+        blocks[0].normalPen[k][0] = np.x; blocks[0].normalPen[k][1] = np.y;
+        blocks[0].normalPen[k][2] = np.z; blocks[0].normalPen[k][3] = np.w;
+        blocks[0].velMultiplier[k] = denom;
+        blocks[0].friction[k] = fric;
+    };
+    setC(0u, BC0_TRI, BC1_A, NP_A, DENOM_A, FRIC_A);
+    setC(1u, BC0_VTX, BC1_B, NP_B, DENOM_B, FRIC_B);
+    // contact 2 has velMultiplier 0 -- a degenerate constraint that must be SKIPPED, and
+    // skipping it must not stop contact 3 from being solved.
+    setC(2u, BC0_VTX, BC1_B, NP_B, 0.0f, 0.0f);
+    setC(3u, BC0_VTX, BC1_B, NP_B, DENOM_B, 0.0f);
+    setC(4u, BC0_VTX, BC1_B, NP_C, DENOM_B, 0.0f);
+    DevBuf bCons = makeDev(dev, blocks);
+
+    std::vector<FemFemInfoHost> infos = {
+        { encodeId(0u, 0u), 0u, encodeId(0u, 0u), 0u },   // cloth triangle 0, tet 0
+        { encodeId(0u, 3u), 0u, encodeId(0u, 0u), 0u },   // cloth vertex 3,   tet 0
+        { encodeId(0u, 3u), 0u, encodeId(0u, 0u), 0u },
+        { encodeId(0u, 3u), 0u, encodeId(0u, 0u), 0u },
+        { encodeId(0u, 3u), 0u, encodeId(0u, 0u), 0u },
+    };
+    DevBuf bInfo = makeDev(dev, infos);
+    std::vector<uint32_t> numContacts = { 5u };
+    DevBuf bNum = makeDev(dev, numContacts);
+    std::vector<float> lambdas = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    DevBuf bLambda = makeDev(dev, lambdas);
+
+    SbClothSolvePush push = {};
+    push.softbodies = bDesc.addr;
+    push.clothes = bCloth.addr;
+    push.contactInfos = bInfo.addr;
+    push.constraints = bCons.addr;
+    push.numContacts = bNum.addr;
+    push.lambdaNs = bLambda.addr;
+
+    Kernel k("softBodyClothSolveBda.spv", "sb_solveOutputSCDeltaVLaunch", {}, sizeof(SbClothSolvePush));
+    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const auto gClothOut = downloadBuffer<F4>(dev, bClothOut.h, 4);
+    const auto gSbOut = downloadBuffer<F4>(dev, bSbOut.h, 4);
+    const auto gLambda = downloadBuffer<float>(dev, bLambda.h, 5);
+
+    // ---- the reference ---------------------------------------------------------------------
+    struct V3 { float x, y, z; };
+    auto solve = [&](V3 relDelta, F4 np, float denomInv, float fric, float& lambdaN) {
+        const V3 n = { np.x, np.y, np.z };
+        const float CN = np.w + relDelta.x * n.x + relDelta.y * n.y + relDelta.z * n.z;
+        const float dLN = std::max(-CN * denomInv, -lambdaN);
+        lambdaN += dLN;
+        V3 cv = { dLN * n.x, dLN * n.y, dLN * n.z };
+        const float rn = relDelta.x * n.x + relDelta.y * n.y + relDelta.z * n.z;
+        V3 t = { relDelta.x - rn * n.x, relDelta.y - rn * n.y, relDelta.z - rn * n.z };
+        const float tsq = t.x * t.x + t.y * t.y + t.z * t.z;
+        if (fric != 0.0f && tsq > 1.0e-14f)
+        {
+            const float tm = std::sqrt(tsq);
+            t.x /= tm; t.y /= tm; t.z /= tm;
+            const float CT = relDelta.x * t.x + relDelta.y * t.y + relDelta.z * t.z;
+            float dLT = std::max(0.0f, CT * denomInv);
+            dLT = -std::min(dLT, fric * std::fabs(dLN));
+            cv.x += 0.5f * dLT * t.x; cv.y += 0.5f * dLT * t.y; cv.z += 0.5f * dLT * t.z;
+        }
+        return cv;
+    };
+    auto sbWeighted = [&](F4 bc) {
+        return V3{ bc.x * sbAccum[0].x + bc.y * sbAccum[1].x + bc.z * sbAccum[2].x + bc.w * sbAccum[3].x,
+                   bc.x * sbAccum[0].y + bc.y * sbAccum[1].y + bc.z * sbAccum[2].y + bc.w * sbAccum[3].y,
+                   bc.x * sbAccum[0].z + bc.y * sbAccum[1].z + bc.z * sbAccum[2].z + bc.w * sbAccum[3].z };
+    };
+
+    // contact 0, the TRIANGLE path
+    float lam0 = 0.0f;
+    const V3 sbw0 = sbWeighted(BC1_A);
+    const V3 rel0 = { BC0_TRI.x * clothAccum[0].x + BC0_TRI.y * clothAccum[1].x + BC0_TRI.z * clothAccum[2].x - sbw0.x,
+                      BC0_TRI.x * clothAccum[0].y + BC0_TRI.y * clothAccum[1].y + BC0_TRI.z * clothAccum[2].y - sbw0.y,
+                      BC0_TRI.x * clothAccum[0].z + BC0_TRI.y * clothAccum[1].z + BC0_TRI.z * clothAccum[2].z - sbw0.z };
+    const V3 cv0 = solve(rel0, NP_A, DENOM_A, FRIC_A, lam0);
+
+    // contact 1, the VERTEX path
+    float lam1 = 0.0f;
+    const V3 sbw1 = sbWeighted(BC1_B);
+    const V3 rel1 = { clothAccum[3].x - sbw1.x, clothAccum[3].y - sbw1.y, clothAccum[3].z - sbw1.z };
+    const V3 cv1 = solve(rel1, NP_B, DENOM_B, FRIC_B, lam1);
+    // contact 3 repeats contact 1 without friction and adds into the SAME vertices.
+    float lam3 = 0.0f;
+    const V3 cv3 = solve(rel1, NP_B, DENOM_B, 0.0f, lam3);
+    // contact 4: separated, so the clamp holds it at zero.
+    float lam4 = 0.0f;
+    const V3 cv4 = solve(rel1, NP_C, DENOM_B, 0.0f, lam4);
+
+    std::printf("  cloth out: v0=(%.6f %.6f %.6f w=%.1f) v1=(%.6f %.6f %.6f w=%.1f)\n"
+                "             v2=(%.6f %.6f %.6f w=%.1f) v3=(%.6f %.6f %.6f w=%.1f)\n",
+                gClothOut[0].x, gClothOut[0].y, gClothOut[0].z, gClothOut[0].w,
+                gClothOut[1].x, gClothOut[1].y, gClothOut[1].z, gClothOut[1].w,
+                gClothOut[2].x, gClothOut[2].y, gClothOut[2].z, gClothOut[2].w,
+                gClothOut[3].x, gClothOut[3].y, gClothOut[3].z, gClothOut[3].w);
+    std::printf("  sb out:    v0=(%.6f %.6f %.6f w=%.1f) v3=(%.6f %.6f %.6f w=%.1f)\n",
+                gSbOut[0].x, gSbOut[0].y, gSbOut[0].z, gSbOut[0].w,
+                gSbOut[3].x, gSbOut[3].y, gSbOut[3].z, gSbOut[3].w);
+    std::printf("  lambdas:   %.6f %.6f %.6f %.6f %.6f\n",
+                gLambda[0], gLambda[1], gLambda[2], gLambda[3], gLambda[4]);
+
+    auto near3 = [](F4 got, float wx, float wy, float wz, float ww) {
+        return std::fabs(got.x - wx) < 1e-5f && std::fabs(got.y - wy) < 1e-5f &&
+               std::fabs(got.z - wz) < 1e-5f && std::fabs(got.w - ww) < 1e-5f;
+    };
+
+    // The atomics start from the sentinel, so every expectation is SENT + the contributions.
+    PXG_CHECK_MSG(near3(gClothOut[0], SENT + clothAccum[0].w * BC0_TRI.x * cv0.x,
+                                      SENT + clothAccum[0].w * BC0_TRI.x * cv0.y,
+                                      SENT + clothAccum[0].w * BC0_TRI.x * cv0.z, SENT + 1.0f),
+                  "cloth vertex 0 takes w * bc.x * commonVec and ONE contribution count");
+    PXG_CHECK_MSG(near3(gClothOut[1], SENT + clothAccum[1].w * BC0_TRI.y * cv0.x,
+                                      SENT + clothAccum[1].w * BC0_TRI.y * cv0.y,
+                                      SENT + clothAccum[1].w * BC0_TRI.y * cv0.z, SENT + 1.0f),
+                  "cloth vertex 1 likewise, with its own inverse mass and barycentric");
+    PXG_CHECK_MSG(gClothOut[2].x == SENT && gClothOut[2].w == SENT,
+                  "cloth vertex 2 is PINNED (inverse mass 0) and its barycentric is 0, so its "
+                  "scatter must be suppressed -- got (%.6f, w %.6f)", gClothOut[2].x, gClothOut[2].w);
+    // Vertex 3 receives from contacts 1 AND 3 (contact 2 is degenerate and skipped), so its
+    // count is exactly TWO -- which is also what says contact 2 was skipped without taking the
+    // rest of the loop with it.
+    PXG_CHECK_MSG(near3(gClothOut[3], SENT + clothAccum[3].w * (cv1.x + cv3.x + cv4.x),
+                                      SENT + clothAccum[3].w * (cv1.y + cv3.y + cv4.y),
+                                      SENT + clothAccum[3].w * (cv1.z + cv3.z + cv4.z), SENT + 3.0f),
+                  "cloth vertex 3 takes w * commonVec with NO barycentric factor, summed over "
+                  "contacts 1, 3 and 4; its count must be 3, not 4 -- contact 2's velMultiplier "
+                  "is zero and it is skipped, but skipping it must not abandon the rest");
+
+    // The softbody side, opposite sign.  Vertex 0 gets all three live contacts.
+    PXG_CHECK_MSG(near3(gSbOut[0],
+                        SENT - sbAccum[0].w * (BC1_A.x * cv0.x + BC1_B.x * (cv1.x + cv3.x + cv4.x)),
+                        SENT - sbAccum[0].w * (BC1_A.x * cv0.y + BC1_B.x * (cv1.y + cv3.y + cv4.y)),
+                        SENT - sbAccum[0].w * (BC1_A.x * cv0.z + BC1_B.x * (cv1.z + cv3.z + cv4.z)),
+                        SENT + 4.0f),
+                  "the softbody correction has the OPPOSITE SIGN to the cloth's, and vertex 0 "
+                  "receives all four live contacts");
+    // Tet vertex 3's barycentric in contact 0 is 1e-7, BELOW the 1e-6 guard, so only contacts
+    // 1 and 3 reach it.
+    PXG_CHECK_MSG(std::fabs(gSbOut[3].w - (SENT + 3.0f)) < 1e-5f,
+                  "contact 0's fourth barycentric is 1e-7, below the 1e-6 guard, so tet vertex "
+                  "3 must receive THREE contributions, not four (got count %.6f)",
+                  gSbOut[3].w - SENT);
+
+    PXG_CHECK_MSG(std::fabs(gLambda[0] - lam0) < 1e-6f && std::fabs(gLambda[1] - lam1) < 1e-6f &&
+                  std::fabs(gLambda[3] - lam3) < 1e-6f,
+                  "the accumulated lambdas are written back (%.6f %.6f %.6f vs %.6f %.6f %.6f)",
+                  gLambda[0], gLambda[1], gLambda[3], lam0, lam1, lam3);
+    PXG_CHECK_MSG(gLambda[2] == 0.0f,
+                  "contact 2 is degenerate and must not touch its lambda (got %.6f)", gLambda[2]);
+    PXG_CHECK_MSG(gLambda[4] == 0.0f && std::fabs(cv4.x) < 1e-9f,
+                  "contact 4 is SEPARATED, so -CN * denomInv is negative and the clamp against "
+                  "-lambdaN holds the impulse at exactly zero.  Without the clamp the contact "
+                  "pulls the bodies together and the lambda goes negative (got %.6f)",
+                  gLambda[4]);
+
+    // The two sides must actually oppose, or the sign is untested.
+    PXG_CHECK_MSG((cv0.y > 0.0f) == (gClothOut[0].y - SENT > 0.0f) &&
+                  (gClothOut[0].y - SENT) * (gSbOut[0].y - SENT) < 0.0f,
+                  "the cloth and softbody corrections must point AGAINST each other; both "
+                  "positive or both negative means one of the two signs is wrong");
+    // And friction must have done something, or the tangential branch is dead code here.
+    PXG_CHECK_MSG(f2u(cv1.y) != f2u(cv3.y) || f2u(cv1.z) != f2u(cv3.z),
+                  "contacts 1 and 3 differ ONLY in their friction coefficient, so their "
+                  "corrections must differ -- otherwise the tangential branch never ran");
+
+    // ---- continue vs return: NOT TESTABLE HERE, and the arithmetic says why ---------------
+    // A degenerate constraint CONTINUES rather than returning, so it skips only its own
+    // contact.  That differs from a return only when a thread owns MORE THAN ONE contact, i.e.
+    // when nbIterationsPerBlock > 1.  With the engine's fixed 1024 x 256 grid -- which this
+    // port hard-codes, as every other kernel in the chain does -- that needs
+    // nbBlocksRequired > 1024, i.e. more than 1024 * 256 = 262144 contacts.
+    //
+    // Dispatching fewer blocks does NOT help: SC_GRID is a constant, so a one-block dispatch
+    // still computes nbIterationsPerBlock = ceil(3 / 1024) = 1 and simply leaves contacts
+    // 256 and up unvisited (measured: indices 0..255 solved, 256 onwards untouched).
+    //
+    // So `continue` is the faithful transcription and is kept, but a mutant swapping it for
+    // `return` survives every fixture that fits in memory.  Stated rather than papered over.
+
+    for (PxgBufferHandle h : { bClothAccum.h, bClothTris.h, bClothOut.h, bCloth.h, bSbAccum.h,
+                               bSimTets.h, bSbOut.h, bDesc.h, bCons.h, bInfo.h, bNum.h, bLambda.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace

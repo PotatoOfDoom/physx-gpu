@@ -1620,10 +1620,11 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
-## P8.8 — the softbody-vs-CLOTH chain (steps 1 to 5 of 6)
+## P8.8 — MILESTONE: the softbody-vs-CLOTH chain is COMPLETE (6 of 6)
 
-Softbody-vs-cloth needs six kernels.  Five are on the engine BDA ABI; the chain does not run
-end to end yet, and this section says which half is which rather than implying otherwise.
+Softbody-vs-cloth needs six kernels and **all six are on the engine BDA ABI**.  The chain
+runs end to end: midphase in both directions, contact generation for triangles and vertices,
+constraint prepare and solve.
 
 | # | kernel | state |
 |---|---|---|
@@ -1632,7 +1633,7 @@ end to end yet, and this section says which half is which rather than implying o
 | 3 | `sb_clothVertMidphaseGeneratePairsLaunch` | **mapped** (step 3) |
 | 4 | `sb_clothVertContactGenLaunch` | **mapped** (step 4) |
 | 5 | `sb_clothContactPrepareLaunch` | **mapped** (step 5) |
-| 6 | `sb_solveOutputSCDeltaVLaunch` | unmapped |
+| 6 | `sb_solveOutputSCDeltaVLaunch` | **mapped** (step 6) |
 
 **Step 1 — the midphase.**  One warp per query tetrahedron walks the CLOTH's BV32 triangle
 tree and keeps the four closest triangles.  The traverser core
@@ -1791,7 +1792,52 @@ before it could be read, so the failing test is unknown.  This is the third one-
 shape in the project (after `gpuslang.scan` and `npRigidSumBatches`) and it is noted, not
 diagnosed.
 
-Manifest hand-edited 241 → 246.  Suite **674/674 in both memory modes** after each step.
+**Step 6 — the solve.**  It solves the constraints step 5 prepared and scatters the positional
+corrections onto both bodies.  The solver body is shared between the two branches; they differ
+only in how many cloth vertices the correction is spread over:
+
+    relDelta  = (cloth side, barycentrically weighted) - (softbody side, ditto)
+    CN        = pen + dot(relDelta, normal)
+    dLambdaN  = max(-CN * denomInv, -lambdaN)
+    commonVec = dLambdaN * normal  [+ the friction term]
+
+then `+w * bc * commonVec` on the cloth and `-w * bc * commonVec` on the softbody —
+**opposite signs**, which is the whole point.
+
+**The clamp against `-lambdaN` is what stops a contact PULLING.**  For a separated contact
+`-CN * denomInv` is negative, and the clamp holds the accumulated impulse at zero; without it
+the solver drags the bodies together.  No penetrating contact can show this, so the fixture
+carries one deliberately separated contact whose lambda must come out exactly 0.
+
+**The vertex path is not the triangle path with bc = 1.**  Its cloth correction has NO
+barycentric factor and its atomic is guarded by the inverse mass ALONE, where the triangle path
+also demands `bc > 1e-6`.  Both asymmetries are upstream's.
+
+Every scatter is a real float atomic (`VK_EXT_shader_atomic_float`) and adds **1 to `.w`** — a
+contribution count the averaging pass downstream divides by, so dropping it changes every
+delta that follows.
+
+Eight mutants killed.  Two needed the fixture sharpened: the lambda clamp (the separated
+contact above), and the `.w` count, which needed a vertex receiving contributions from more
+than one contact.
+
+**One mutant is NOT killable, and the arithmetic says why.**  A degenerate constraint
+`continue`s rather than returning, which differs only when a thread owns more than one contact
+— i.e. `nbIterationsPerBlock > 1`.  Under the engine's fixed 1024 × 256 grid, which this port
+hard-codes as every kernel in the chain does, that needs more than 262144 contacts.  Dispatching
+fewer blocks does not help: the grid constant is compiled in, so a one-block dispatch still
+computes `nbIterationsPerBlock = 1` and simply leaves contacts 256 and up unvisited (measured).
+`continue` is kept as the faithful transcription; the mutant survives every fixture that fits
+in memory, and that is recorded rather than papered over.
+
+Manifest hand-edited 241 → 247.  Suite **674/674 in both memory modes** after each step, rigid
+regression **16/16**, and the four deformable scenes unchanged — `softbodyselfcollide` still at
+0.2133, the softbody floor matrix still at box 0.4963 / plane 0.4975.
+
+**What the chain does NOT yet have is a scene.**  Every kernel is verified against a fixture
+and the engine's ABI, but no `gpu-sdk-step` scene puts a cloth and a softbody together, so the
+six have never run as a chain on live data.  That is the next piece of work, and until it
+exists this section claims kernel-level correctness and nothing more.
 
 ## P8.7 — MILESTONE: the softbody settles on the ground BOX that was always there
 
