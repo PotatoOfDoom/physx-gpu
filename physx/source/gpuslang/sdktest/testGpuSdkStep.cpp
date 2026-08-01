@@ -1807,6 +1807,283 @@ bool softBodySelfTopY(const SoftBodySelfScene& ssc, float& meanY, float& minY)
 
 } // namespace
 
+
+// ===========================================================================
+// PXG_SCENE=softbodycloth (P8.8): the scene the softbody-vs-CLOTH chain exists for.
+//
+// Six kernels were ported one at a time, each against its own fixture and the engine's ABI.
+// None of that says they work as a CHAIN on live data -- a wrong ABI row that happens to have
+// the right byte count, a dispatch the engine gates off, a buffer the engine never allocates
+// when both actor types are present, all pass a per-kernel fixture and fail here.  This scene
+// is the only thing that can see them.
+//
+// THE SETUP: a static plane at y = 0, a FEM-VOLUME cube of edge 1 resting on it (so its top
+// face is at y = 1), and a small FEM-SURFACE sheet spawned at y = 2 directly above.  The sheet
+// is 0.6 x 0.6, DELIBERATELY SMALLER than the cube's top face, so a sheet that lands on the
+// cube stays entirely on it and one that misses falls all the way to the plane.  The two
+// outcomes are a whole unit apart, which is what makes the control run decisive.
+//
+// THE CONTROL: PXG_SC_NOSOFTBODY=1 removes the cube and nothing else.  The sheet then falls to
+// the plane.  Without that half the main run proves nothing -- a sheet that simply never fell
+// would pass it too.
+//
+// The ground box is sunk to y = -50.5 and the island dynamic stands at x = 10, for the reasons
+// the softbody scene's header gives: both are real obstacles now that the hull branch exists,
+// and neither belongs in what this scene measures.
+//
+// *** THIS SCENE FAILS TODAY, ON PURPOSE, AND IS NOT A REGRESSION. ***
+//
+// It is a FRONTIER MARKER, not part of the green suite.  What it established, measured rather
+// than assumed:
+//
+//   * the pair IS classified into GPU_BUCKET_ID::eSoftbodyFemCloth (probed directly in
+//     cndCaseTetraMesh: compat = 1, isRigid1 = 0);
+//   * the chain DOES dispatch end to end.  Over 60 steps: sb_clothVertMidphaseGeneratePairs 36
+//     launches, sb_clothVertContactGen 36, sb_clothContactPrepare 60, sb_solveOutputSCDeltaV
+//     540 (once per solver iteration).  All four report OK;
+//   * and the sheet still falls clean through the cube to the plane.
+//
+// So the kernels run and produce nothing that pushes.  The next question is whether the
+// narrowphase emits zero contacts or emits contacts the solve cannot act on -- which needs a
+// read-back of mSCTotalContactCountBuffer, not another guess.
+//
+// ALSO WORTH KNOWING BEFORE SPENDING MORE ON THIS: upstream hard-codes
+// `supportClothTriangleCollision = false` (PxgNarrowphaseCore.cpp:4529), so the TRIANGLE half
+// of the chain -- sb_clothMidphaseGeneratePairsLaunch and sb_clothContactGenLaunch, steps 1
+// and 2 of P8.8 -- is dead code in this engine version and can never run as shipped.  Only the
+// VERTEX half (steps 3 and 4) is reachable.  That does not make steps 1 and 2 wrong, but it
+// does mean no scene can exercise them without changing engine source.
+// ===========================================================================
+struct SoftBodyClothScene
+{
+    PxDeformableVolume* volume = nullptr;
+    PxDeformableSurface* surface = nullptr;
+    PxU32 numClothVerts = 0;
+    PxU32 numSimVerts = 0;
+    bool hasSoftBody = false;
+    float cubeTopY = 1.0f;
+    PxCudaContextManager* cudaCtx = nullptr;
+};
+
+// Read the cloth's vertex positions back and reduce them.
+bool softBodyClothY(const SoftBodyClothScene& sc, float& meanY, float& minY)
+{
+    std::vector<PxVec4> pos(sc.numClothVerts);
+    PxCudaContext* ctx = sc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(pos.data(),
+                    reinterpret_cast<CUdeviceptr>(sc.surface->getPositionInvMassBufferD()),
+                    sc.numClothVerts * sizeof(PxVec4));
+    double sum = 0.0;
+    float mn = FLT_MAX;
+    bool finite = true;
+    for (PxU32 v = 0; v < sc.numClothVerts; ++v)
+    {
+        finite = finite && std::isfinite(pos[v].y);
+        sum += double(pos[v].y);
+        mn = PxMin(mn, pos[v].y);
+    }
+    meanY = float(sum / double(sc.numClothVerts));
+    minY = mn;
+    return finite;
+}
+
+SoftBodyClothScene buildSoftBodyClothScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
+                                           PxCudaContextManager* cudaCtx)
+{
+    SoftBodyClothScene out;
+    out.cudaCtx = cudaCtx;
+
+    PxRigidStatic* ground = addGroundBox(physics, scene, rigidMat);
+    ground->setGlobalPose(PxTransform(PxVec3(0.0f, -50.5f, 0.0f)));
+    PxRigidDynamic* island = addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                        boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+    island->setGlobalPose(PxTransform(PxVec3(10.0f, 1.5f, 0.0f)));
+
+    {
+        PxRigidStatic* floor = physics->createRigidStatic(
+            PxTransformFromPlaneEquation(PxPlane(0.0f, 1.0f, 0.0f, 0.0f)));
+        PxShape* fs = physics->createShape(PxPlaneGeometry(), *rigidMat);
+        floor->attachShape(*fs);
+        scene->addActor(*floor);
+        fs->release();
+    }
+
+    const bool noSoftBody = std::getenv("PXG_SC_NOSOFTBODY") != nullptr;
+    out.hasSoftBody = !noSoftBody;
+
+    // ---- the FEM-volume cube, resting on the plane -----------------------------------------
+    if (!noSoftBody)
+    {
+        const PxU32 cells = 2;
+        const float size = 1.0f;
+        const float h = size / float(cells);
+        const PxU32 n = cells + 1;
+        std::vector<PxVec3> tverts;
+        for (PxU32 i = 0; i < n; ++i)
+            for (PxU32 j = 0; j < n; ++j)
+                for (PxU32 kk = 0; kk < n; ++kk)
+                    tverts.push_back(PxVec3(float(i) * h - 0.5f * size,
+                                            float(j) * h,             // base at y = 0
+                                            float(kk) * h - 0.5f * size));
+        auto vid = [n](PxU32 i, PxU32 j, PxU32 kk) { return (i * n + j) * n + kk; };
+        std::vector<PxU32> tets;
+        for (PxU32 i = 0; i < cells; ++i)
+            for (PxU32 j = 0; j < cells; ++j)
+                for (PxU32 kk = 0; kk < cells; ++kk)
+                {
+                    const PxU32 c[8] = {
+                        vid(i, j, kk),         vid(i, j, kk + 1),
+                        vid(i, j + 1, kk),     vid(i, j + 1, kk + 1),
+                        vid(i + 1, j, kk),     vid(i + 1, j, kk + 1),
+                        vid(i + 1, j + 1, kk), vid(i + 1, j + 1, kk + 1) };
+                    const PxU32 idx[5][4] = { {0,1,2,4}, {1,2,3,7}, {1,4,5,7}, {2,4,6,7}, {1,2,4,7} };
+                    for (int t = 0; t < 5; ++t)
+                    {
+                        PxU32 a = c[idx[t][0]], b = c[idx[t][1]], cc = c[idx[t][2]], d = c[idx[t][3]];
+                        const PxVec3 e1 = tverts[b] - tverts[a];
+                        const PxVec3 e2 = tverts[cc] - tverts[a];
+                        const PxVec3 e3 = tverts[d] - tverts[a];
+                        if (e1.cross(e2).dot(e3) < 0.0f) { const PxU32 tmp = cc; cc = b; b = tmp; }
+                        tets.push_back(a); tets.push_back(b); tets.push_back(cc); tets.push_back(d);
+                    }
+                }
+
+        PxTetrahedronMeshDesc tetDesc;
+        tetDesc.points.count = PxU32(tverts.size());
+        tetDesc.points.stride = sizeof(PxVec3);
+        tetDesc.points.data = tverts.data();
+        tetDesc.tetrahedrons.count = PxU32(tets.size() / 4);
+        tetDesc.tetrahedrons.stride = 4 * sizeof(PxU32);
+        tetDesc.tetrahedrons.data = tets.data();
+
+        PxCookingParams ck(physics->getTolerancesScale());
+        ck.buildGPUData = true;
+        ck.meshWeldTolerance = 0.001f;
+        ck.midphaseDesc = PxMeshMidPhase::eBVH34;
+        PxDeformableVolumeSimulationDataDesc simDataDesc;
+        PxDeformableVolumeMesh* volMesh = immediateCooking::createDeformableVolumeMesh(
+            ck, tetDesc, tetDesc, simDataDesc, physics->getPhysicsInsertionCallback());
+        if (!volMesh) { std::printf("FAIL: createDeformableVolumeMesh returned null\n"); return out; }
+
+        PxDeformableVolumeMaterial* volMat =
+            physics->createDeformableVolumeMaterial(1.e6f, 0.3f, 0.5f, 0.05f);
+        PxDeformableVolumeMaterial* vmats[1] = { volMat };
+        PxShapeFlags sf = PxShapeFlag::eSIMULATION_SHAPE | PxShapeFlag::eSCENE_QUERY_SHAPE;
+        PxShape* vshape = physics->createShape(
+            PxTetrahedronMeshGeometry(volMesh->getCollisionMesh()), vmats, PxU16(1), true, sf);
+        PxDeformableVolume* volume = physics->createDeformableVolume(*cudaCtx);
+        volume->attachShape(*vshape);
+        vshape->release();
+        volume->attachSimulationMesh(*volMesh->getSimulationMesh(), *volMesh->getDeformableVolumeAuxData());
+        volume->setDeformableBodyFlag(PxDeformableBodyFlag::eDISABLE_SELF_COLLISION, true);
+        volume->setLinearDamping(0.0f);
+        volume->setMaxLinearVelocity(1.0e6f);
+        static_cast<PxDeformableBody*>(volume)->setSolverIterationCounts(8u, 1u);
+        scene->addActor(*volume);
+
+        const PxU32 nbSim = volume->getSimulationMesh()->getNbVertices();
+        const PxU32 nbColl = volume->getCollisionMesh()->getNbVertices();
+        std::vector<PxVec4> simPos(nbSim), simVel(nbSim), collPos(nbColl), restPos(nbColl);
+        const PxVec3* simVerts = volume->getSimulationMesh()->getVertices();
+        const PxReal* invMassGM = volume->getDeformableVolumeAuxData()->getGridModelInvMass();
+        for (PxU32 v = 0; v < nbSim; ++v)
+        {
+            const PxReal im = invMassGM ? invMassGM[v] : 1.0f;
+            simPos[v] = PxVec4(simVerts[v].x, simVerts[v].y, simVerts[v].z, im);
+            simVel[v] = PxVec4(0.0f, 0.0f, 0.0f, im);
+        }
+        const PxVec3* collVerts = volume->getCollisionMesh()->getVertices();
+        for (PxU32 v = 0; v < nbColl; ++v)
+        {
+            collPos[v] = PxVec4(collVerts[v].x, collVerts[v].y, collVerts[v].z, 1.0f);
+            restPos[v] = collPos[v];
+        }
+        PxCudaContext* ctx = cudaCtx->getCudaContext();
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getSimPositionInvMassBufferD()),
+                        simPos.data(), nbSim * sizeof(PxVec4));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getSimVelocityBufferD()),
+                        simVel.data(), nbSim * sizeof(PxVec4));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getPositionInvMassBufferD()),
+                        collPos.data(), nbColl * sizeof(PxVec4));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(volume->getRestPositionBufferD()),
+                        restPos.data(), nbColl * sizeof(PxVec4));
+        volume->markDirty(PxDeformableVolumeDataFlag::eALL);
+
+        out.volume = volume;
+        out.numSimVerts = nbSim;
+        out.cubeTopY = size;
+    }
+
+    // ---- the FEM-surface sheet, above the cube ----------------------------------------------
+    {
+        const PxU32 numX = 5, numZ = 5;
+        const float sizeX = 0.6f, sizeZ = 0.6f;      // smaller than the cube's 1 x 1 top face
+        const float sx = sizeX / float(numX - 1), sz = sizeZ / float(numZ - 1);
+        std::vector<PxVec3> verts;
+        for (PxU32 i = 0; i < numX; ++i)
+            for (PxU32 j = 0; j < numZ; ++j)
+                verts.push_back(PxVec3(float(i) * sx - 0.5f * sizeX, 0.0f, float(j) * sz - 0.5f * sizeZ));
+        std::vector<PxU32> tris;
+        auto cvid = [numZ](PxU32 x, PxU32 y) { return x * numZ + y; };
+        for (PxU32 i = 1; i < numX; ++i)
+            for (PxU32 j = 1; j < numZ; ++j)
+            {
+                tris.push_back(cvid(i - 1, j - 1)); tris.push_back(cvid(i, j - 1)); tris.push_back(cvid(i - 1, j));
+                tris.push_back(cvid(i - 1, j));     tris.push_back(cvid(i, j - 1)); tris.push_back(cvid(i, j));
+            }
+
+        PxTriangleMeshDesc md;
+        md.points.count = PxU32(verts.size());
+        md.points.stride = sizeof(PxVec3);
+        md.points.data = verts.data();
+        md.triangles.count = PxU32(tris.size() / 3);
+        md.triangles.stride = 3 * sizeof(PxU32);
+        md.triangles.data = tris.data();
+
+        PxCookingParams ck(physics->getTolerancesScale());
+        ck.buildGPUData = true;
+        ck.meshPreprocessParams |= PxMeshPreprocessingFlag::eENABLE_VERT_MAPPING;
+        PxTriangleMesh* triMesh =
+            immediateCooking::createTriangleMesh(ck, md, physics->getPhysicsInsertionCallback());
+        if (!triMesh) { std::printf("FAIL: createTriangleMesh returned null\n"); return out; }
+
+        PxDeformableSurfaceMaterial* clothMat =
+            physics->createDeformableSurfaceMaterial(1.e6f, 0.3f, 0.5f, 0.01f, 1.e-4f);
+        PxDeformableSurfaceMaterial* cmats[1] = { clothMat };
+        PxShapeFlags sf = PxShapeFlag::eSIMULATION_SHAPE | PxShapeFlag::eSCENE_QUERY_SHAPE;
+        PxShape* cshape = physics->createShape(PxTriangleMeshGeometry(triMesh), cmats, PxU16(1), true, sf);
+        PxDeformableSurface* surface = physics->createDeformableSurface(*cudaCtx);
+        surface->setNbCollisionPairUpdatesPerTimestep(4);
+        surface->setNbCollisionSubsteps(1);
+        surface->setLinearDamping(0.0f);
+        surface->setMaxLinearVelocity(1.0e6f);
+        surface->attachShape(*cshape);
+        cshape->release();
+        scene->addActor(*surface);
+
+        const float spawnY = 2.0f;
+        const PxU32 nv = PxU32(verts.size());
+        std::vector<PxVec4> posInvMass(nv), vel(nv, PxVec4(0.0f)), rest(nv);
+        for (PxU32 v = 0; v < nv; ++v)
+        {
+            posInvMass[v] = PxVec4(verts[v].x, spawnY, verts[v].z, 1.0f);
+            rest[v] = posInvMass[v];
+        }
+        PxCudaContext* ctx = cudaCtx->getCudaContext();
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getPositionInvMassBufferD()),
+                        posInvMass.data(), nv * sizeof(PxVec4));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getVelocityBufferD()),
+                        vel.data(), nv * sizeof(PxVec4));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getRestPositionBufferD()),
+                        rest.data(), nv * sizeof(PxVec4));
+
+        out.surface = surface;
+        out.numClothVerts = nv;
+    }
+
+    return out;
+}
+
 int main()
 {
     StepAllocator alloc;
@@ -2604,6 +2881,108 @@ int main()
     }
 
     // PXG_SCENE=softbodyselfcollide (P8.4): the FEM-VOLUME SELF-collision money shot.
+    if (!std::strcmp(sceneName, "softbodycloth"))
+    {
+        SoftBodyClothScene sc = buildSoftBodyClothScene(physics, scene, material, cudaCtx);
+        if (!sc.surface)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodycloth scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'softbodycloth' built: a %u-vertex FEM-surface sheet above %s "
+                    "(cube top y=%.2f), both over a static plane at y=0\n",
+                    sc.numClothVerts,
+                    sc.hasSoftBody ? "a FEM-volume cube" : "NOTHING (control run)", sc.cubeTopY);
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: softbodycloth GPU pipeline CONSTRUCTED + live over "
+                        "Vulkan (set PXG_GPU_STEP=1 to step the drop)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        int steps = 150;
+        if (const char* sEnv = std::getenv("PXG_STEPS")) { const int v = atoi(sEnv); if (v > 0) steps = v; }
+
+        float meanY0 = 0.0f, minY0 = 0.0f;
+        bool allFinite = softBodyClothY(sc, meanY0, minY0);
+        float meanY = meanY0, minY = minY0, prevMin = minY0, restMaxDy = 0.0f;
+        const int restWindow = steps / 4;
+        PxU32 maxVolContacts = 0u, maxSurfContacts = 0u;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            allFinite = softBodyClothY(sc, meanY, minY) && allFinite;
+            PxSimulationStatistics st;
+            scene->getSimulationStatistics(st);
+            maxVolContacts = PxMax(maxVolContacts,
+                                   st.gpuDynamicsMemoryConfigStatistics.deformableVolumeContacts);
+            maxSurfContacts = PxMax(maxSurfContacts,
+                                    st.gpuDynamicsMemoryConfigStatistics.deformableSurfaceContacts);
+            if (i >= steps - restWindow) restMaxDy = PxMax(restMaxDy, PxAbs(minY - prevMin));
+            if (i < 4 || i == steps - 1 || (i % 30 == 0))
+                std::printf("    step %3d: cloth min y = %.5f (mean %.5f)\n", i, minY, meanY);
+            prevMin = minY;
+        }
+
+        std::printf("  softbodycloth (softbody %s): cloth min y %.4f -> %.4f (mean %.4f); "
+                    "cube top y=%.2f, plane y=0; peak volume contacts = %u, surface contacts = %u; "
+                    "rest |dy| over last %d steps = %.6f\n",
+                    sc.hasSoftBody ? "PRESENT" : "ABSENT (control)", minY0, minY, meanY,
+                    sc.cubeTopY, maxVolContacts, maxSurfContacts, restWindow, restMaxDy);
+
+        int failures = 0;
+        if (!allFinite || !std::isfinite(minY))
+        { std::printf("FAIL: non-finite vertex in the sheet\n"); ++failures; }
+        if (!(minY0 - minY > 0.5f))
+        { std::printf("FAIL: the sheet did not fall (min y %.5f -> %.5f)\n", minY0, minY); ++failures; }
+
+        // The sheet is 0.6 x 0.6 and the cube's top face is 1 x 1, so a sheet that lands on the
+        // cube stays ENTIRELY on it.  The two outcomes are a full unit apart -- roughly y = 1
+        // against y = 0 -- and the bar sits halfway between them, far from both.
+        const float CATCH_Y = 0.5f;
+        if (sc.hasSoftBody)
+        {
+            if (!(maxVolContacts > 0u))
+            { std::printf("FAIL: the softbody is present but the engine reported ZERO "
+                          "deformable-volume contacts -- the cloth chain is not feeding the solve\n");
+              ++failures; }
+            if (!(minY > CATCH_Y))
+            { std::printf("FAIL (EXPECTED TODAY -- see the scene header, this is a frontier "
+                          "marker and not a regression): the sheet sank to y=%.5f, below the "
+                          "catch bar %.2f (cube top y=%.2f).  All four reachable kernels of the "
+                          "chain dispatch and report OK, so they run and produce nothing that "
+                          "pushes\n", minY, CATCH_Y, sc.cubeTopY); ++failures; }
+            if (!(restMaxDy < 0.02f))
+            { std::printf("FAIL: the caught sheet never settled (rest |dy|=%.6f)\n", restMaxDy);
+              ++failures; }
+        }
+        else
+        {
+            // The CONTROL.  With no cube the sheet falls to the plane.  Without this half the
+            // main run proves nothing: a sheet that simply hung in the air would pass it.
+            if (!(minY < CATCH_Y))
+            { std::printf("FAIL: the CONTROL run has no softbody, so the sheet must fall past "
+                          "%.2f to the plane; it stopped at %.5f\n", CATCH_Y, minY); ++failures; }
+        }
+
+        if (failures)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodycloth checks failed (%d)\n", failures);
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        if (sc.hasSoftBody)
+            std::printf("[  OK  ] gpu-sdk-step: the FEM-surface sheet was CAUGHT by the FEM-volume "
+                        "cube and SETTLED on it (min y=%.4f, cube top %.2f, rest |dy|=%.6f) -- the "
+                        "softbody-vs-cloth chain runs end to end\n", minY, sc.cubeTopY, restMaxDy);
+        else
+            std::printf("[  OK  ] gpu-sdk-step: control run -- with no softbody the sheet fell "
+                        "clean through to the plane (min y=%.4f)\n", minY);
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        return 0;
+    }
+
     if (!std::strcmp(sceneName, "softbodyselfcollide"))
     {
         SoftBodySelfScene ssc = buildSoftBodySelfCollideScene(physics, scene, material, cudaCtx);

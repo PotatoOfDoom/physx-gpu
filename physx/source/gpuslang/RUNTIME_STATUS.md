@@ -1834,10 +1834,42 @@ Manifest hand-edited 241 → 247.  Suite **674/674 in both memory modes** after 
 regression **16/16**, and the four deformable scenes unchanged — `softbodyselfcollide` still at
 0.2133, the softbody floor matrix still at box 0.4963 / plane 0.4975.
 
-**What the chain does NOT yet have is a scene.**  Every kernel is verified against a fixture
-and the engine's ABI, but no `gpu-sdk-step` scene puts a cloth and a softbody together, so the
-six have never run as a chain on live data.  That is the next piece of work, and until it
-exists this section claims kernel-level correctness and nothing more.
+### The scene: `PXG_SCENE=softbodycloth` — and what it found
+
+A FEM-surface sheet (0.6 x 0.6) dropped from y = 2 onto a FEM-volume cube of edge 1 resting on
+a plane, with `PXG_SC_NOSOFTBODY=1` as the control.  The sheet is smaller than the cube's top
+face, so "caught" and "missed" are a full unit apart.
+
+**The control run passes: with no cube the sheet falls to the plane.  The main run FAILS: with
+the cube there, the sheet still falls through it.**  The scene is committed as a FRONTIER
+MARKER, not as part of the green suite, and its failure message says so.
+
+What it established, measured rather than assumed:
+
+* the pair IS classified into `GPU_BUCKET_ID::eSoftbodyFemCloth` — probed directly in
+  `cndCaseTetraMesh` (`compat = 1`, `isRigid1 = 0`);
+* **the chain DOES dispatch end to end.**  Over 60 steps:
+  `sb_clothVertMidphaseGeneratePairsLaunch` 36 launches, `sb_clothVertContactGenLaunch` 36,
+  `sb_clothContactPrepareLaunch` 60, `sb_solveOutputSCDeltaVLaunch` 540 (once per solver
+  iteration).  All report OK;
+* and the sheet falls through anyway.  So the kernels run and produce nothing that pushes.
+
+The next question is whether the narrowphase emits zero contacts or emits contacts the solve
+cannot act on.  That needs a read-back of `mSCTotalContactCountBuffer` — not another guess.
+
+**One correction to an earlier reading in this session.**  A 3-step launch trace showed no
+vertex-path kernels and I took that to mean the narrowphase function was never reached.  It was
+simply too short: the sheet had not yet fallen close enough for the broadphase.  At 25 steps the
+kernels appear, at 60 they run throughout.  A trace that finds nothing is evidence about the
+trace's window before it is evidence about the code.
+
+**AND A FINDING THAT CHANGES WHAT STEPS 1 AND 2 ARE WORTH.**  Upstream hard-codes
+`supportClothTriangleCollision = false` (`PxgNarrowphaseCore.cpp:4529`), so the TRIANGLE half of
+the chain — `sb_clothMidphaseGeneratePairsLaunch` and `sb_clothContactGenLaunch`, P8.8 steps 1
+and 2 — is **dead code in this engine version and can never run as shipped**.  Only the VERTEX
+half is reachable.  That does not make those two ports wrong, and both are fixture-verified, but
+no scene can exercise them without changing engine source.  Worth knowing before spending more
+on that side.
 
 ## P8.7 — MILESTONE: the softbody settles on the ground BOX that was always there
 
