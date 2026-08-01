@@ -1620,6 +1620,72 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.11 step 1 — the softbody-vs-HEIGHTFIELD midphase
+
+`sb_heightfieldMidphaseGeneratePairsLaunch` is mapped, the first of **two** for
+softbody-vs-heightfield.  Step 2 (`sb_heightfieldContactGenLaunch`) is the remaining one, and it
+is the trimesh path's step 2 with the triangle synthesised from heightfield samples instead of
+read from a blob — same helper, same `flipOutputNormal = true` / `alternativeWriteMode = true`
+(`softbodyPrimitives.cu:1136`), which P8.10 has now validated.
+
+**There is no BVH on this path.**  Every other midphase in the port walks a BV32 tree; a
+heightfield has none.  Its geometry IS its index: the tetrahedron's world AABB is pushed into
+the heightfield's unscaled row/column space and the integer rectangle it lands on names the
+candidate quads directly.  The cooked blob is flat too — `nbRows @0 | nbCols @4 | samples @8` —
+and a sample is four bytes: `PxI16 height`, `PxBitAndByte materialIndex0`, `materialIndex1`.
+
+**The material bytes carry a flag in bit 7** (`tessFlag`, which way the quad splits), and
+`PxBitAndDataT::operator T()` masks it off.  Comparing the raw byte against `eHOLE = 127`
+therefore treats a tessellated hole as solid.
+
+**Fixture** `softBodySimHeightfieldMidphase` (58 in the file).  A 4 × 4 field with a hole in one
+material slot of quad (0,0), a hole-with-the-flag in both slots of quad (0,1), a
+solid-with-the-flag quad at (1,0), a mixed-sign quad at (1,1), and rows 2–3 raised to +50.  Five
+pairs come out — one from quad (0,0), two each from (1,0) and (1,1).
+
+**Mutation sweep: 5 of 7 killed** (forced-fresh `.spv` each time) — the tessFlag not masked off;
+the `PxI16` height read as unsigned; `numTets` taken from `mNumTets` instead of the tetmesh blob
+header; the triangle index without its material-slot bit; the surface-hint gate removed.
+
+**TWO SURVIVE, and the arithmetic says why — both are properties of the kernel, not thin spots
+that more geometry would fix.**
+
+* **`getMinRow` clamping to `rows-1` instead of `rows-2`.**  Upstream's own rectangle guard gets
+  there first: `!(lMin.x > nbRows - 1) || ...`, so a tetrahedron whose minimum row would exceed
+  `rows-2` is either past `nbRows-1` and thrown out by the guard, or below it and clamped
+  identically by both versions.  A tetrahedron placed at row 3.4 to catch it is simply rejected
+  earlier — measured, 0 pairs.
+* **Dropping `fattenFast(contactDist)`.**  The contact distance here is 0.002 in WORLD units,
+  i.e. 0.001 of a row at rowScale 2 — three orders of magnitude below the quad size, so the
+  fattened and unfattened bounds floor and ceil to the same integers.  Raising it enough to
+  cross a boundary would spill every other tetrahedron into its neighbours' quads.  Step 2's
+  fixture is where the contact distance has teeth.
+
+**A third thing the fixture could not cover, for an upstream reason.**  Upstream un-scales the
+local bound by `1/|scale|` and then swaps min and max when the scale is negative.  That is NOT
+the same as dividing by the SIGNED scale: for `rowScale = -1` and a tetrahedron at row 0.2–0.6,
+the shape-space bound is −0.6…−0.2, the division by `|scale|` leaves it there, and the swap
+produces min = −0.2, max = −0.6 — an inverted interval whose clamps collapse to
+`maxRow == minRow`, so nothing is emitted.  The first version of this fixture used
+`rowScale = -1` and got zero pairs for exactly that reason.  The port transcribes the branch as
+upstream has it and the fixture uses positive scales; a mutant deleting the swap survives.
+
+**Two fixture bugs of mine, both found by running it.**  The tetrahedron meant to be rejected
+"entirely below all four corner heights" sat under a quad with two corners at +50 and two at
+−50 — it was straddled, and correctly kept; raising both rows fixed it.  And the signed-height
+mutant survived the first corrected version, because for an all-negative quad the signed read
+rejects through `con1` and the unsigned read through `con0` — both reject, indistinguishably.
+Only a MIXED quad separates them, and quad (1,1) is now built that way.
+
+Manifest hand-edited 250 → 251.  No scene changes — step 2 is still unmapped, so the engine
+refuses it and the midphase output goes unread.  Suite **674/674 in both memory modes**, rigid
+regression green, every deformable scene unchanged, and the softbody floor matrix bit-identical
+at box **0.49628** / plane **0.49753** / sphere **0.48436** / mesh **0.49666**.
+
+*(One transient: the default-mode `ctest -j4` failed once immediately after the forced-fresh
+rebuild and passed 674/674 on the two runs that followed, with V2 green throughout.  This is the
+fourth one-off of that shape in this port; noted, not diagnosed.)*
+
 ## P8.10 — MILESTONE: a FEM softbody SETTLES ON A COOKED TRIANGLE MESH (step 2 of 2)
 
 `sb_meshContactGenLaunch` is mapped, and with it **softbody-vs-triangle-mesh is complete**.  The

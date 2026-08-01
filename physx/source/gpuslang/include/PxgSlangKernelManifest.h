@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 250;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 251;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -288,7 +288,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_meshMidphaseGeneratePairsLaunch", "softBodyMeshMidphaseBda.spv", "sb_meshMidphaseGeneratePairsLaunch" },  // SB_MESH_MIDPHASE (P8.10 step 1 BDA port)
     { "sb_sdfMeshMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_SDF_MESH_MIDPHASE (unmapped)
     { "sb_meshContactGenLaunch", "softBodyMeshContactGenBda.spv", "sb_meshContactGenLaunch" },  // SB_MESH_CG (P8.10 step 2 BDA port)
-    { "sb_heightfieldMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_HF_MIDPHASE (unmapped)
+    { "sb_heightfieldMidphaseGeneratePairsLaunch", "softBodyHfMidphaseBda.spv", "sb_heightfieldMidphaseGeneratePairsLaunch" },  // SB_HF_MIDPHASE (P8.11 step 1 BDA port)
     { "sb_heightfieldContactGenLaunch", nullptr, nullptr },  // SB_HF_CG (unmapped)
     { "sb_selfCollisionMidphaseGeneratePairsLaunch", "softBodySelfCollisionBda.spv", "sb_selfCollisionMidphaseGeneratePairsLaunch" },  // SB_SELFCOLLISION_MIDPHASE (P8.4 tranche a BDA port)
     { "sb_reorderPSContactsLaunch", "softBodyContactRemapBda.spv", "sb_reorderPSContactsLaunch" },  // SB_REORDER_PS_CONTACTS (P8.2 tranche c BDA lift)

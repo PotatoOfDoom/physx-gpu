@@ -564,6 +564,14 @@ static const uint8_t kSbMeshMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
 //   its own row rather than aliased, so a future divergence upstream shows up here.
 static const uint8_t kSbMeshContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 4, 8, 80 };
 
+// gpunarrowphase softbody-vs-HEIGHTFIELD midphase (P8.11 step 1):
+//   sb_heightfieldMidphaseGeneratePairsLaunch(PxU32 numNPWorkItems, PxReal toleranceLength,
+//   cmInputs*, transformCache*, contactDistance*, gpuShapes*, softbodies*,
+//   PxU32 stackSizeBytes, stackPtr*, midphasePairsNum*) -- launch site
+//   PxgNarrowphaseCore.cpp:5343.  Two PxU32-sized scalars at @0 and @4, five pointers
+//   @8..@40, PxU32 @48, then a pointer realigned to @56 and @64 -> 72-byte blob.
+static const uint8_t kSbHfMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 4, 8, 8 };
+
 // gpunarrowphase softbody-vs-CLOTH midphase (P8.8):
 //   sb_clothMidphaseGeneratePairsLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
 //   bounds*, contactDistance*, gpuShapes*, softbodies*, clothes*, PxU32 stackSizeBytes,
@@ -1049,6 +1057,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_sbMidphaseGeneratePairsLaunch", kSbSbMidphase, uint32_t(sizeof(kSbSbMidphase)) },
     { "sb_meshMidphaseGeneratePairsLaunch", kSbMeshMidphase, uint32_t(sizeof(kSbMeshMidphase)) },
     { "sb_meshContactGenLaunch", kSbMeshContactGen, uint32_t(sizeof(kSbMeshContactGen)) },
+    { "sb_heightfieldMidphaseGeneratePairsLaunch", kSbHfMidphase, uint32_t(sizeof(kSbHfMidphase)) },
     // gpunarrowphase softbody-vs-CLOTH midphase (P8.8)
     { "sb_clothMidphaseGeneratePairsLaunch", kSbClothMidphase, uint32_t(sizeof(kSbClothMidphase)) },
     { "sb_clothContactGenLaunch", kSbClothContactGen, uint32_t(sizeof(kSbClothContactGen)) },

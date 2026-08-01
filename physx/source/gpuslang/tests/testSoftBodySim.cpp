@@ -10486,4 +10486,288 @@ PXG_TEST(softBodySimMeshContactGen)
         dev->destroyBuffer(h);
 }
 
+// ===========================================================================
+// P8.11 step 1 -- sb_heightfieldMidphaseGeneratePairsLaunch, the softbody-vs-HEIGHTFIELD
+// midphase.  There is no BVH on this path: the tetrahedron's world AABB is pushed into the
+// heightfield's unscaled row/column space and the integer rectangle it lands on names the
+// candidate quads directly.  What this fixture aims at:
+//
+//   * the flat cooked blob -- nbRows @0, nbCols @4, 4-byte samples @8 -- and the SIGNED 16-bit
+//     height, which a raw mask would read as a huge positive number;
+//   * the material bytes' bit 7 (the tessFlag): a material of 127 WITH the flag set is still a
+//     hole, and one of 255 is a hole too.  Comparing the raw byte gets both backwards;
+//   * the row/column clamps, including that getMinRow clamps to rows-2 and getMaxRow to rows-1;
+//   * the y-range reject: a tetrahedron entirely above (or entirely below) all four corner
+//     heights of a quad contributes nothing;
+//   * the emitted triangle index (vertexIndex << 1) | isMaterial1;
+//   * the transform: a real rotation and a NEGATIVE row scale, which mirrors the axis and
+//     needs the min/max swap;
+//   * the 72-byte blob and the 64-warps-per-contact-manager work partition.
+// ===========================================================================
+namespace p811hf
+{
+struct SbHfMidPush
+{
+    uint32_t numNPWorkItems; float toleranceLength;
+    uint64_t cmInputs, transformCache, contactDistance, gpuShapes, softbodies;
+    uint32_t stackSizeBytes, pad52;
+    uint64_t stackPtr, midphasePairsNum;
+};
+static_assert(sizeof(SbHfMidPush) == 72, "sb heightfield midphase blob must be 72 bytes");
+static_assert(offsetof(SbHfMidPush, cmInputs) == 8, "cmInputs @8");
+static_assert(offsetof(SbHfMidPush, stackSizeBytes) == 48, "stackSizeBytes @48");
+static_assert(offsetof(SbHfMidPush, stackPtr) == 56, "stackPtr @56");
+
+// PxHeightFieldSample, 4 B: PxI16 height, PxBitAndByte materialIndex0, materialIndex1.
+static uint32_t hfSample(int16_t height, uint8_t mat0, uint8_t mat1)
+{
+    return (uint32_t(uint16_t(height))) | (uint32_t(mat0) << 16) | (uint32_t(mat1) << 24);
+}
+} // namespace p811hf
+
+PXG_TEST(softBodySimHeightfieldMidphase)
+{
+    using namespace p80refit;
+    using namespace p811hf;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // ---- the heightfield: 4 rows x 4 columns, flat at height 0 except one raised corner ----
+    // Row index runs along x and column along z in heightfield space.  Sample (r, c) lives at
+    // vertexIndex = r * nbCols + c.
+    const uint32_t NB_ROWS = 4u, NB_COLS = 4u;
+    const uint8_t MAT_SOLID = 3u;
+    const uint8_t MAT_HOLE = 127u;                 // PxHeightFieldMaterial::eHOLE
+    const uint8_t MAT_HOLE_TESS = 127u | 0x80u;    // eHOLE with the tessellation flag set
+    const uint8_t MAT_SOLID_TESS = 3u | 0x80u;     // a SOLID material with the flag set
+
+    std::vector<uint32_t> blob(2u + NB_ROWS * NB_COLS, 0u);
+    blob[0] = NB_ROWS;
+    blob[1] = NB_COLS;
+    auto setSample = [&](uint32_t r, uint32_t c, int16_t h, uint8_t m0, uint8_t m1) {
+        blob[2u + r * NB_COLS + c] = hfSample(h, m0, m1);
+    };
+    for (uint32_t r = 0; r < NB_ROWS; ++r)
+        for (uint32_t c = 0; c < NB_COLS; ++c)
+            setSample(r, c, 0, MAT_SOLID, MAT_SOLID);
+    // Quad (0,0): its FIRST triangle is a hole, its second solid.  Only one pair may come out.
+    setSample(0u, 0u, 0, MAT_HOLE, MAT_SOLID);
+    // Quad (0,1): a hole whose material byte ALSO carries the tessellation flag.  A port that
+    // compares the raw byte sees 255 != 127 and lets both triangles through.
+    setSample(0u, 1u, 0, MAT_HOLE_TESS, MAT_HOLE_TESS);
+    // Quad (1,0): SOLID but with the flag set, i.e. the mirror mistake -- masking wrongly the
+    // other way would turn 131 into something that is not 3 and drop a real triangle.
+    setSample(1u, 0u, 0, MAT_SOLID_TESS, MAT_SOLID_TESS);
+    // Rows 2 AND 3 are RAISED to height 50, so every corner of a quad in row 2 is above the
+    // tetrahedra and the y-range test rejects it.  BOTH rows have to move: with only row 2
+    // raised the quad straddles the tetrahedron -- two corners at +50 and two at 0 or below --
+    // and it is CORRECTLY not rejected.  Measured, on the first version of this fixture.
+    for (uint32_t c = 0; c < NB_COLS; ++c) { setSample(2u, c, 50, MAT_SOLID, MAT_SOLID); }
+    for (uint32_t c = 0; c < NB_COLS; ++c) { setSample(3u, c, 50, MAT_SOLID, MAT_SOLID); }
+    // *** THE ONE PLACE THE HEIGHT'S SIGN IS OBSERVABLE. ***  The heights are PxI16, and reading
+    // them as unsigned turns -1 into 65535.  For a quad whose corners are ALL negative that
+    // changes nothing -- the signed read rejects it through con1 (minY >= 0 > every corner) and
+    // the unsigned read through con0 (maxY < 65535), so both reject and the mutant survives.
+    // It only shows on a MIXED quad: corners at -1 and +50 with a tetrahedron whose maxY is
+    // below both.  Signed: con0 fails on -1 and con1 fails on +50, so the quad is kept.
+    // Unsigned: -1 has become 65535 and now maxY is below ALL FOUR, so con0 fires and the quad
+    // is dropped.  Quad (1,1) is built that way and T_SIGN sits under it.
+    setSample(1u, 1u, -1, MAT_SOLID, MAT_SOLID);
+    setSample(1u, 2u, -1, MAT_SOLID, MAT_SOLID);
+    DevBuf bBlob = makeDev(dev, blob);
+    if (!bBlob.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    // ---- the heightfield's placement -------------------------------------------------------
+    // Non-unit row, height and column scales, so all three divisions matter, plus a rigid
+    // rotation of 180 degrees about y, which is exact in floating point.
+    //     world = R * (hf * scale) + T,   R(x, y, z) = (-x, y, -z)
+    //
+    // *** THE SCALES ARE POSITIVE, AND THE NEGATIVE-SCALE SWAP IS THEREFORE NOT COVERED. ***
+    // Upstream un-scales the local bound by 1/|scale| and then swaps min and max when the
+    // scale is negative (softbodyHFMidPhase.cu:215-229).  That is NOT the same as dividing by
+    // the SIGNED scale: for rowScale = -1 and a tetrahedron at row 0.2..0.6 the shape-space
+    // bound is -0.6..-0.2, the division by |scale| leaves it there, and the swap produces
+    // min = -0.2, max = -0.6 -- an inverted interval whose floor/ceil clamps collapse to
+    // maxRow == minRow, so the quad count is zero and NOTHING is emitted.  Measured: a first
+    // version of this fixture used rowScale = -1 and got 0 pairs for exactly that reason.
+    // The port transcribes the branch as upstream has it; the fixture does not pretend to
+    // exercise it, and a mutant deleting the swap survives.  Stated rather than papered over.
+    const float ROW_SCALE = 2.0f, HEIGHT_SCALE = 0.01f, COL_SCALE = 0.5f;
+    const float TX = 5.0f, TY = 7.0f, TZ = 9.0f;
+    auto toWorld = [&](float hr, float hh, float hc) {
+        return F4{ -(hr * ROW_SCALE) + TX, (hh * HEIGHT_SCALE) + TY, -(hc * COL_SCALE) + TZ, 1.0f };
+    };
+
+    // ---- the softbody: small tetrahedra hovering over chosen quads -------------------------
+    // Each sits just above height 0 in heightfield units, inside ONE quad's footprint.
+    std::vector<F4> tetVerts;
+    std::vector<TetIdx4> tets;
+    std::vector<uint8_t> hints;
+    auto addTet = [&](float r, float c, float h, uint8_t hint) {
+        const uint32_t b = uint32_t(tetVerts.size());
+        tetVerts.push_back(toWorld(r + 0.2f, h,        c + 0.2f));
+        tetVerts.push_back(toWorld(r + 0.2f, h,        c + 0.6f));
+        tetVerts.push_back(toWorld(r + 0.6f, h,        c + 0.2f));
+        tetVerts.push_back(toWorld(r + 0.2f, h + 5.0f, c + 0.2f));
+        tets.push_back({ b, b + 1u, b + 2u, b + 3u });
+        hints.push_back(hint);
+        return uint32_t(tets.size() - 1u);
+    };
+    const uint32_t T_HOLE0   = addTet(0.0f, 0.0f, 1.0f, 1u);  // quad (0,0): 1 of 2 is a hole
+    const uint32_t T_HOLETES = addTet(0.0f, 1.0f, 1.0f, 1u);  // quad (0,1): BOTH are holes
+    const uint32_t T_SOLTES  = addTet(1.0f, 0.0f, 1.0f, 1u);  // quad (1,0): both solid
+    const uint32_t T_BELOW   = addTet(2.0f, 1.0f, 1.0f, 1u);  // under a quad raised to +50
+    const uint32_t T_ABOVE   = addTet(0.0f, 2.0f, 200.0f, 1u); // far ABOVE a quad at height 0
+    const uint32_t T_SIGN    = addTet(1.0f, 1.0f, 1.0f, 1u);  // over the MIXED-sign quad (1,1)
+    const uint32_t T_INNER   = addTet(1.0f, 1.0f, 1.0f, 0u);  // interior tet, hint 0
+    (void)T_BELOW; (void)T_ABOVE; (void)T_INNER;
+    std::vector<uint32_t> hintWords((hints.size() + 3u) / 4u + 1u, 0u);
+    for (size_t i = 0; i < hints.size(); ++i)
+        reinterpret_cast<uint8_t*>(hintWords.data())[i] = hints[i];
+    DevBuf bTetVerts = makeDev(dev, tetVerts), bTets = makeDev(dev, tets),
+           bHints = makeDev(dev, hintWords);
+
+    // numTets comes out of the TETMESH BLOB HEADER (.y), not mNumTets -- so the header carries
+    // the real count and mNumTets is set to a decoy that must never be used.
+    std::vector<uint32_t> tetMeshHeader = { 999u, uint32_t(tets.size()), 1u, 1u };
+    DevBuf bTetMesh = makeDev(dev, tetMeshHeader);
+
+    const uint32_t SB_ID = 2u;
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mTetMeshData = reinterpret_cast<void*>(size_t(bTetMesh.addr));
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bTetVerts.addr));
+    sb.mTetMeshSurfaceHint = reinterpret_cast<PxU8*>(size_t(bHints.addr));
+    sb.mNumTets = 1u;                      // the DECOY: using it would visit one tet only
+    sb.mNumVerts = uint32_t(tetVerts.size());
+    std::vector<PxgSoftBody> descArr(SB_ID + 1u, makeZeroDesc());
+    descArr[SB_ID] = sb;
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- the pair.  HEIGHTFIELD is shapeRef0, SOFTBODY shapeRef1 -- the SWAPPED order.
+    const uint32_t GEOM_HEIGHTFIELD_H = 9u;
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_HEIGHTFIELD_H;     shapes[0].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[0].sx = ROW_SCALE; shapes[0].sy = HEIGHT_SCALE; shapes[0].sz = COL_SCALE;
+    shapes[0].srw = 1.0f;
+    shapes[0].hullLo = uint32_t(bBlob.addr & 0xFFFFFFFFull);
+    shapes[0].hullHi = uint32_t(bBlob.addr >> 32);
+    shapes[1].type = GEOM_TETRAHEDRONMESH_H; shapes[1].particleOrSoftbodyId = SB_ID;
+    shapes[1].sx = 1.0f; shapes[1].sy = 1.0f; shapes[1].sz = 1.0f; shapes[1].srw = 1.0f;
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<CmInputHost> cms = { { 0u, 1u, /*hf cache*/ 1u, /*sb cache*/ 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    std::vector<float> xf(2 * 8 + 4, 0.0f);
+    xf[3] = 1.0f;
+    xf[8 + 1] = 1.0f;                                       // 180 deg about y
+    xf[8 + 4] = TX; xf[8 + 5] = TY; xf[8 + 6] = TZ;
+    DevBuf bXf = makeDev(dev, xf);
+
+    // A SMALL contact distance: the bound is fattened by it in WORLD units before the transform,
+    // and anything large would spill each tetrahedron into its neighbours' quads.
+    std::vector<float> cd = { 0.001f, 0.001f, 0.0f, 0.0f };
+    DevBuf bCd = makeDev(dev, cd);
+
+    const uint32_t CAP = 64u;
+    std::vector<uint32_t> stack(CAP * 4u, 0xFFFFFFFFu);
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairNum = { 0u };
+    DevBuf bPairNum = makeDev(dev, pairNum);
+
+    SbHfMidPush push = {};
+    push.numNPWorkItems = 1u;
+    push.toleranceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.contactDistance = bCd.addr;
+    push.gpuShapes = bShapes.addr;
+    push.softbodies = bDesc.addr;
+    push.stackSizeBytes = CAP * 16u;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairNum.addr;
+
+    Kernel k("softBodyHfMidphaseBda.spv", "sb_heightfieldMidphaseGeneratePairsLaunch",
+             {}, sizeof(SbHfMidPush));
+    // The engine's grid (PxgNarrowphaseCore.cpp:5360): x = SB_SBMIDPHASE = 1024, y = 1.
+    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const uint32_t gNum = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];
+    const auto gStack = downloadBuffer<uint32_t>(dev, bStack.h, CAP * 4u);
+
+    std::set<std::pair<uint32_t, uint32_t>> emitted;   // (tet, triangleIdx)
+    for (uint32_t i = 0; i < gNum && i < CAP; ++i)
+    {
+        PXG_CHECK_MSG(gStack[i * 4u + 0u] == 0u, "pair %u carries cmIdx %u, not 0", i,
+                      gStack[i * 4u + 0u]);
+        emitted.insert({ gStack[i * 4u + 1u], gStack[i * 4u + 2u] });
+        std::printf("  pair %u: tet %u  tri %u (vertexIndex %u, material slot %u)\n",
+                    i, gStack[i * 4u + 1u], gStack[i * 4u + 2u],
+                    gStack[i * 4u + 2u] >> 1, gStack[i * 4u + 2u] & 1u);
+    }
+
+    auto countFor = [&](uint32_t tet) {
+        uint32_t n = 0; for (auto& e : emitted) if (e.first == tet) ++n; return n;
+    };
+    auto has = [&](uint32_t tet, uint32_t vtx, uint32_t slot) {
+        return emitted.count({ tet, (vtx << 1) | slot }) != 0;
+    };
+
+    PXG_CHECK_MSG(countFor(T_HOLE0) == 1u,
+                  "quad (0,0) has ONE hole material and one solid, so exactly one triangle "
+                  "survives; got %u", countFor(T_HOLE0));
+    PXG_CHECK_MSG(has(T_HOLE0, 0u, 1u),
+                  "the surviving triangle of quad (0,0) is the SECOND material slot, so its "
+                  "index is (vertexIndex << 1) | 1");
+    PXG_CHECK_MSG(countFor(T_HOLETES) == 0u,
+                  "quad (0,1) is a hole in BOTH slots, but its material byte carries the "
+                  "tessellation flag as well.  Getting %u instead of 0 means the flag was not "
+                  "masked off before comparing against eHOLE", countFor(T_HOLETES));
+    PXG_CHECK_MSG(countFor(T_SOLTES) == 2u,
+                  "quad (1,0) is SOLID in both slots with the tessellation flag set, so both "
+                  "triangles survive; got %u", countFor(T_SOLTES));
+    PXG_CHECK_MSG(countFor(T_INNER) == 0u,
+                  "the interior tetrahedron (surface hint 0) must be skipped entirely");
+    // The two halves of the y-range test, one each.
+    PXG_CHECK_MSG(countFor(T_BELOW) == 0u,
+                  "this tetrahedron sits entirely BELOW all four corner heights of its quad "
+                  "(+50), so con0 rejects it; got %u", countFor(T_BELOW));
+    PXG_CHECK_MSG(countFor(T_ABOVE) == 0u,
+                  "this tetrahedron sits entirely ABOVE all four corner heights of its quad "
+                  "(0), so con1 rejects it; got %u", countFor(T_ABOVE));
+
+    PXG_CHECK_MSG(countFor(T_SIGN) == 2u,
+                  "quad (1,1) has corners at -1 and +50, both slots solid, so BOTH triangles "
+                  "survive under a SIGNED height read; got %u.  0 means the PxI16 height was "
+                  "read as unsigned and -1 became 65535", countFor(T_SIGN));
+
+    // ---- TWO MUTANTS SURVIVE THIS FIXTURE, AND THE ARITHMETIC SAYS WHY ------------------
+    //
+    // getMinRow clamps to rows-2 and getMaxRow to rows-1, and swapping the first for the
+    // second changes nothing here -- NOT because the fixture is thin, but because upstream's
+    // own rectangle guard gets there first.  The guard is `!(lMin.x > nbRows - 1) || ...`, so
+    // any tetrahedron whose minimum row would exceed rows-2 is either past nbRows-1 and thrown
+    // out by the guard, or below it and clamped identically by both versions.  A tetrahedron
+    // placed at row 3.4 to try to catch it is simply rejected earlier (measured: 0 pairs).
+    //
+    // Dropping `fattenFast(contactDist)` also survives.  The contact distance here is
+    // 0.001 + 0.001 = 0.002 in WORLD units, i.e. 0.001 of a row at rowScale 2 -- three orders
+    // of magnitude below the quad size, so the fattened and unfattened bounds floor and ceil
+    // to the same integers.  Raising it enough to cross a boundary would spill every other
+    // tetrahedron into its neighbours' quads and dissolve the rest of the fixture.  Recorded
+    // rather than papered over; step 2's fixture is where the contact distance has teeth.
+
+    PXG_CHECK_MSG(gNum == 5u,
+                  "five pairs in total -- one from quad (0,0), two from quad (1,0) and two "
+                  "from quad (1,1); got "
+                  "%u.  0 usually means the blob walk or the inverse transform is wrong; a "
+                  "large number means the row/column rectangle is not being clamped and the "
+                  "whole field is being scanned", gNum);
+
+    for (PxgBufferHandle h : { bBlob.h, bTetVerts.h, bTets.h, bHints.h, bTetMesh.h, bDesc.h,
+                               bShapes.h, bCms.h, bXf.h, bCd.h, bStack.h, bPairNum.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace
