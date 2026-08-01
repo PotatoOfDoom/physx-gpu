@@ -1620,9 +1620,9 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
-## P8.8 — the softbody-vs-CLOTH chain (steps 1 to 4 of 6)
+## P8.8 — the softbody-vs-CLOTH chain (steps 1 to 5 of 6)
 
-Softbody-vs-cloth needs six kernels.  Four are on the engine BDA ABI; the chain does not run
+Softbody-vs-cloth needs six kernels.  Five are on the engine BDA ABI; the chain does not run
 end to end yet, and this section says which half is which rather than implying otherwise.
 
 | # | kernel | state |
@@ -1631,7 +1631,7 @@ end to end yet, and this section says which half is which rather than implying o
 | 2 | `sb_clothContactGenLaunch` | **mapped** (step 2) |
 | 3 | `sb_clothVertMidphaseGeneratePairsLaunch` | **mapped** (step 3) |
 | 4 | `sb_clothVertContactGenLaunch` | **mapped** (step 4) |
-| 5 | `sb_clothContactPrepareLaunch` | unmapped |
+| 5 | `sb_clothContactPrepareLaunch` | **mapped** (step 5) |
 | 6 | `sb_solveOutputSCDeltaVLaunch` | unmapped |
 
 **Step 1 — the midphase.**  One warp per query tetrahedron walks the CLOTH's BV32 triangle
@@ -1757,7 +1757,41 @@ inside branch correctly reported them without a distance test.  The shader was c
 throughout — the third vertex matched its prediction exactly on the first run — and the fix was
 to the fixture's geometry and its comments.
 
-Manifest hand-edited 241 → 245.  Suite **674/674 in both memory modes** after each step.
+**Step 5 — the constraint prepare.**  It consumes BOTH contact shapes out of one stream, and
+`clothBC.w` is the discriminator: `0` means the cloth element is a TRIANGLE (step 2), non-zero
+means a VERTEX (step 4) — which is exactly why step 4 writes the degenerate marker
+`(0, 0, 0, 1)`.  The two paths take their friction and their effective mass from different
+places: material table via `mMaterialIndices` and a barycentric-weighted sum over three
+vertices in one case, `mDynamicFrictions` and a single inverse mass in the other.  So `triInd`
+is a triangle index in one case and a vertex index in the other, out of the same field.
+
+**The normal is negated a SECOND time here.**  Steps 2 and 4 store `-direction`; this kernel
+negates again, so the constraint carries the original direction.  Both negations have to be
+present — dropping either flips the constraint and pushes the bodies together.
+
+Two things deliberately NOT ported: the `clothPos` / `softBodyPos` computed at softBody.cu:1128
+are dead stores, never read, and their cloth half indexes `mTriangleVertexIndices` with what is
+a VERTEX index in the vertex case — benign in CUDA, a fault waiting to happen through a BDA
+pointer.  Omitting them is behaviour-preserving and safer.
+
+Every fixture input is a small exact binary fraction, so the host reference and the shader
+agree **bit for bit** rather than within a tolerance.
+
+Eleven mutants killed; two needed the fixture sharpened.  `mMaterialIndices` is `PxU16*` on
+BOTH descriptors, and my first draft read the softbody's as `PxU32*` — the fixture did not
+notice, because at an EVEN index the two happen to yield the same number; the contact now names
+an ODD tet index, where they differ.  And with only two contacts `workIndex & 31 == workIndex`
+and `workIndex / 32 == 0`, so neither half of the block-of-32 SoA addressing was exercised; a
+34-contact sub-run puts the last two in block 1.
+
+**One transient, recorded rather than explained away.**  A single parallel (`ctest -j4`) run in
+each memory mode failed once, immediately after a full forced-fresh rebuild; four subsequent
+runs across both modes passed 674/674, the serial run passed, and the log had been overwritten
+before it could be read, so the failing test is unknown.  This is the third one-off of this
+shape in the project (after `gpuslang.scan` and `npRigidSumBatches`) and it is noted, not
+diagnosed.
+
+Manifest hand-edited 241 → 246.  Suite **674/674 in both memory modes** after each step.
 
 ## P8.7 — MILESTONE: the softbody settles on the ground BOX that was always there
 

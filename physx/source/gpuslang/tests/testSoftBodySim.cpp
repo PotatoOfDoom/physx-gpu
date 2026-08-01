@@ -8833,4 +8833,330 @@ PXG_TEST(softBodySimClothVertContactGen)
         dev->destroyBuffer(h);
 }
 
+// ===========================================================================
+// P8.8 step 5 — sb_clothContactPrepareLaunch, the constraint prepare.
+//
+// It consumes BOTH contact shapes out of one stream, and clothBC.w is the discriminator:
+// w == 0 means the cloth element is a TRIANGLE (step 2), w != 0 means a VERTEX (step 4),
+// which is exactly why step 4 writes the degenerate marker (0, 0, 0, 1).  The two paths take
+// their friction and their effective mass from different places, so the fixture runs one
+// contact of each and computes both by hand:
+//
+//   velMultiplier = 1 / (clothDenom + softBodyDenom), where clothDenom is the
+//     barycentric-squared-weighted sum of the three triangle vertices' inverse masses in the
+//     TRIANGLE case and the single vertex's inverse mass in the VERTEX case;
+//   friction      = 0.5 * (clothFriction + softbodyFriction), the cloth half coming from the
+//     material table via mMaterialIndices in one case and from mDynamicFrictions in the other;
+//   normal        = -stored normal (the SECOND negation);
+//   pen           = storedPen - (clothRest + softbodyRest) - dot(clothDelta - sbDelta, normal).
+//
+// Every input is a small exact binary fraction so the reference and the shader agree bit for
+// bit rather than within a tolerance.
+// ===========================================================================
+namespace p88pr
+{
+struct SbClothPrepPush
+{
+    uint64_t softbodies, clothes, normalPens, barycentrics0, barycentrics1, contactInfos,
+             numContacts, constraints, lambdaNs;
+    uint32_t maxContacts, pad76;
+    uint64_t softbodyMaterials, clothMaterials;
+};
+static_assert(sizeof(SbClothPrepPush) == 96, "sb_clothContactPrepare push blob must be 96 bytes");
+
+// PxgSoftBodySoftBodyConstraintBlock — block-of-32 SoA, 1792 B.
+struct SsConstraintBlock
+{
+    float bary0[32][4];
+    float bary1[32][4];
+    float normalPen[32][4];
+    float velMultiplier[32];
+    float friction[32];
+};
+static_assert(sizeof(SsConstraintBlock) == 1792, "the constraint block is 1792 bytes");
+
+// PxsDeformableVolumeMaterialData / PxsDeformableSurfaceMaterialData: 32 B, friction @8.
+struct MaterialHost { float youngs, poissons, dynamicFriction, pad[5]; };
+static_assert(sizeof(MaterialHost) == 32, "material data is 32 bytes");
+} // namespace p88pr
+
+PXG_TEST(softBodySimClothContactPrepare)
+{
+    using namespace p80refit;
+    using namespace p88cg;    // FemFemInfoHost / encodeId
+    using namespace p88pr;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // ---- the cloth ------------------------------------------------------------------------
+    // mAccumulatedDeltaPos carries the accumulated motion in xyz and the INVERSE MASS in w.
+    // Four vertices: triangle 0 uses 0,1,2; vertex 3 is the one the vertex-contact names.
+    std::vector<F4> clothDelta = {
+        { 0.125f, 0.0f,   0.0f,   0.5f  },   // vertex 0: invMass 0.5
+        { 0.0f,   0.25f,  0.0f,   0.25f },   // vertex 1: invMass 0.25
+        { 0.0f,   0.0f,   0.5f,   2.0f  },   // vertex 2: invMass 2.0
+        { 0.5f,   0.25f,  0.125f, 4.0f  },   // vertex 3: invMass 4.0
+    };
+    std::vector<TetIdx4> clothTris = { { 0u, 1u, 2u, 0u } };
+    std::vector<uint16_t> clothMatIdx = { 1u, 0u, 0u, 0u };   // triangle 0 -> material 1
+    std::vector<float> clothVertFriction = { 0.0f, 0.0f, 0.0f, 0.75f };  // vertex 3 -> 0.75
+    DevBuf bClothDelta = makeDev(dev, clothDelta), bClothTris = makeDev(dev, clothTris);
+    DevBuf bClothMatIdx = makeDev(dev, clothMatIdx), bClothFric = makeDev(dev, clothVertFriction);
+    if (!bClothDelta.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    const float CLOTH_REST = 0.0625f, SB_REST = 0.03125f;
+    PxgFEMCloth cloth;
+    std::memset(&cloth, 0, sizeof(cloth));
+    cloth.mAccumulatedDeltaPos = reinterpret_cast<float4*>(size_t(bClothDelta.addr));
+    cloth.mTriangleVertexIndices = reinterpret_cast<uint4*>(size_t(bClothTris.addr));
+    cloth.mMaterialIndices = reinterpret_cast<PxU16*>(size_t(bClothMatIdx.addr));
+    cloth.mDynamicFrictions = reinterpret_cast<PxReal*>(size_t(bClothFric.addr));
+    cloth.mNbVerts = 4u; cloth.mNbTriangles = 1u;
+    cloth.mRestDistance = CLOTH_REST;
+    std::vector<PxgFEMCloth> clothArr = { cloth };
+    DevBuf bCloth = makeDev(dev, clothArr);
+
+    // ---- the softbody ---------------------------------------------------------------------
+    std::vector<F4> sbDelta = {
+        { 0.25f,  0.0f,   0.0f,  1.0f  },   // invMass 1.0
+        { 0.0f,   0.125f, 0.0f,  0.5f  },
+        { 0.0f,   0.0f,   0.25f, 0.25f },
+        { 0.125f, 0.125f, 0.0f,  8.0f  },
+    };
+    // TWO tets, and the contact names tet 1 -- an ODD index, so mMaterialIndices' PxU16 entry
+    // sits in the HIGH half of its word.  With an even index a PxU32 read of the same address
+    // happens to yield the same number and a mutant on the element width survives.
+    std::vector<TetIdx4> simTets = { { 0u, 1u, 2u, 3u }, { 0u, 1u, 2u, 3u } };
+    std::vector<uint16_t> sbMatIdx = { 0u, 1u, 0u, 0u };    // tet 1 -> material 1
+    DevBuf bSbDelta = makeDev(dev, sbDelta), bSimTets = makeDev(dev, simTets);
+    DevBuf bSbMatIdx = makeDev(dev, sbMatIdx);
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mSimDeltaPos = reinterpret_cast<float4*>(size_t(bSbDelta.addr));
+    sb.mSimTetIndices = reinterpret_cast<uint4*>(size_t(bSimTets.addr));
+    sb.mMaterialIndices = reinterpret_cast<PxU16*>(size_t(bSbMatIdx.addr));
+    sb.mRestDistance = SB_REST;
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // Material 1 is the live one on both sides; material 0 is a decoy, so an index read that
+    // ignored mMaterialIndices and took slot 0 would pick up 0.0 instead.
+    std::vector<MaterialHost> sbMaterials(2), clothMaterials(2);
+    std::memset(sbMaterials.data(), 0, sbMaterials.size() * sizeof(MaterialHost));
+    std::memset(clothMaterials.data(), 0, clothMaterials.size() * sizeof(MaterialHost));
+    sbMaterials[1].dynamicFriction = 0.25f;
+    clothMaterials[1].dynamicFriction = 0.5f;
+    DevBuf bSbMat = makeDev(dev, sbMaterials), bClothMat = makeDev(dev, clothMaterials);
+
+    // ---- two contacts ----------------------------------------------------------------------
+    // contact 0: cloth TRIANGLE 0 (clothBC.w == 0) against tet 0
+    // contact 1: cloth VERTEX 3   (clothBC.w != 0) against tet 0
+    const F4 BC0_TRI = { 0.25f, 0.5f, 0.25f, 0.0f };
+    const F4 BC0_VTX = { 0.0f,  0.0f, 0.0f,  1.0f };
+    const F4 BC1     = { 0.125f, 0.25f, 0.5f, 0.125f };
+    const F4 NP0 = { 0.5f, -0.5f, 0.0f, 0.25f };     // stored normal, stored pen
+    const F4 NP1 = { 0.0f,  1.0f, 0.0f, 0.125f };
+    std::vector<F4> normalPens = { NP0, NP1 };
+    std::vector<F4> bary0 = { BC0_TRI, BC0_VTX };
+    std::vector<F4> bary1 = { BC1, BC1 };
+    std::vector<FemFemInfoHost> infos = {
+        { encodeId(0u, 0u), 0u, encodeId(0u, 1u), 0u },   // cloth triangle 0, tet 1
+        { encodeId(0u, 3u), 0u, encodeId(0u, 1u), 0u },   // cloth vertex 3,   tet 1
+    };
+    DevBuf bNp = makeDev(dev, normalPens), bB0 = makeDev(dev, bary0), bB1 = makeDev(dev, bary1);
+    DevBuf bInfo = makeDev(dev, infos);
+
+    // maxContacts is LARGER than the count, so the clamp is a no-op here; a sub-run below
+    // makes it smaller.
+    std::vector<uint32_t> numContacts = { 2u };
+    DevBuf bNum = makeDev(dev, numContacts);
+
+    const float SENT = -7.0f;
+    std::vector<SsConstraintBlock> blocks(2);
+    std::memset(blocks.data(), 0, blocks.size() * sizeof(SsConstraintBlock));
+    for (uint32_t b = 0; b < 2u; ++b)
+        for (uint32_t k = 0; k < 32u; ++k)
+        { blocks[b].velMultiplier[k] = SENT; blocks[b].friction[k] = SENT;
+          blocks[b].normalPen[k][3] = SENT; }
+    DevBuf bCons = makeDev(dev, blocks);
+    std::vector<float> lambdas(8, SENT);
+    DevBuf bLambda = makeDev(dev, lambdas);
+
+    SbClothPrepPush push = {};
+    push.softbodies = bDesc.addr;
+    push.clothes = bCloth.addr;
+    push.normalPens = bNp.addr;
+    push.barycentrics0 = bB0.addr;
+    push.barycentrics1 = bB1.addr;
+    push.contactInfos = bInfo.addr;
+    push.numContacts = bNum.addr;
+    push.constraints = bCons.addr;
+    push.lambdaNs = bLambda.addr;
+    push.maxContacts = 8u;
+    push.softbodyMaterials = bSbMat.addr;
+    push.clothMaterials = bClothMat.addr;
+
+    Kernel k("softBodyClothPrepareBda.spv", "sb_clothContactPrepareLaunch", {}, sizeof(SbClothPrepPush));
+    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);   // the engine's SB_UPDATEROTATION grid
+    dev->flush();
+
+    const auto gBlocks = downloadBuffer<SsConstraintBlock>(dev, bCons.h, 2);
+    const auto gLambda = downloadBuffer<float>(dev, bLambda.h, 8);
+    const uint32_t gNum = downloadBuffer<uint32_t>(dev, bNum.h, 1)[0];
+
+    // ---- the reference, worked out here rather than read off ------------------------------
+    auto sbDenomOf = [&](F4 bc) {
+        return bc.x * bc.x * sbDelta[0].w + bc.y * bc.y * sbDelta[1].w +
+               bc.z * bc.z * sbDelta[2].w + bc.w * bc.w * sbDelta[3].w;
+    };
+    auto sbProject = [&](F4 bc) {
+        return F4{ bc.x * sbDelta[0].x + bc.y * sbDelta[1].x + bc.z * sbDelta[2].x + bc.w * sbDelta[3].x,
+                   bc.x * sbDelta[0].y + bc.y * sbDelta[1].y + bc.z * sbDelta[2].y + bc.w * sbDelta[3].y,
+                   bc.x * sbDelta[0].z + bc.y * sbDelta[1].z + bc.z * sbDelta[2].z + bc.w * sbDelta[3].z,
+                   0.0f };
+    };
+    struct Want { float nx, ny, nz, pen, velMul, fric; };
+    auto reference = [&](uint32_t idx, F4 bc0, F4 np, uint32_t clothElem, bool triangle) {
+        const F4 cd = clothDelta[clothElem];
+        const F4 sd = sbProject(BC1);
+        const float nx = -np.x, ny = -np.y, nz = -np.z;
+        const float pen = np.w - (CLOTH_REST + SB_REST) -
+                          ((cd.x - sd.x) * nx + (cd.y - sd.y) * ny + (cd.z - sd.z) * nz);
+        float clothDenom, clothFric;
+        if (triangle)
+        {
+            clothDenom = bc0.x * bc0.x * clothDelta[0].w + bc0.y * bc0.y * clothDelta[1].w +
+                         bc0.z * bc0.z * clothDelta[2].w;
+            clothFric = clothMaterials[clothMatIdx[clothElem]].dynamicFriction;
+        }
+        else
+        {
+            clothDenom = clothDelta[clothElem].w;
+            clothFric = clothVertFriction[clothElem];
+        }
+        const float denom = clothDenom + sbDenomOf(BC1);
+        const float sbFric = sbMaterials[sbMatIdx[1]].dynamicFriction;
+        Want w;
+        w.nx = nx; w.ny = ny; w.nz = nz; w.pen = pen;
+        w.velMul = (denom == 0.0f) ? 0.0f : 1.0f / denom;
+        w.fric = 0.5f * (clothFric + sbFric);
+        PX_UNUSED(idx);
+        return w;
+    };
+    const Want w0 = reference(0u, BC0_TRI, NP0, 0u, true);    // triangle 0's vertices are 0,1,2
+    const Want w1 = reference(1u, BC0_VTX, NP1, 3u, false);   // cloth vertex 3
+
+    for (uint32_t c = 0; c < 2u; ++c)
+    {
+        const Want& w = (c == 0u) ? w0 : w1;
+        const auto& B = gBlocks[0];
+        std::printf("  constraint %u: normal=(%.6f %.6f %.6f) pen=%.6f velMul=%.6f fric=%.6f\n",
+                    c, B.normalPen[c][0], B.normalPen[c][1], B.normalPen[c][2],
+                    B.normalPen[c][3], B.velMultiplier[c], B.friction[c]);
+        PXG_CHECK_MSG(f2u(B.normalPen[c][0]) == f2u(w.nx) && f2u(B.normalPen[c][1]) == f2u(w.ny) &&
+                      f2u(B.normalPen[c][2]) == f2u(w.nz),
+                      "constraint %u's normal is the stored one NEGATED, (%.6f %.6f %.6f); got "
+                      "(%.6f %.6f %.6f)", c, w.nx, w.ny, w.nz,
+                      B.normalPen[c][0], B.normalPen[c][1], B.normalPen[c][2]);
+        PXG_CHECK_MSG(f2u(B.normalPen[c][3]) == f2u(w.pen),
+                      "constraint %u's penetration is storedPen - thickness - "
+                      "dot(clothDelta - sbDelta, normal) = %.9g; got %.9g", c, w.pen,
+                      B.normalPen[c][3]);
+        PXG_CHECK_MSG(f2u(B.velMultiplier[c]) == f2u(w.velMul),
+                      "constraint %u's velMultiplier is 1 / (clothDenom + sbDenom) = %.9g; "
+                      "got %.9g", c, w.velMul, B.velMultiplier[c]);
+        PXG_CHECK_MSG(f2u(B.friction[c]) == f2u(w.fric),
+                      "constraint %u's friction is the mean of the two sides, %.9g; got %.9g",
+                      c, w.fric, B.friction[c]);
+        PXG_CHECK_MSG(gLambda[c] == 0.0f, "lambda %u must be initialised to zero", c);
+    }
+
+    // The two paths must actually DIFFER, or the discriminator is untested.
+    PXG_CHECK_MSG(f2u(w0.velMul) != f2u(w1.velMul) && f2u(w0.fric) != f2u(w1.fric),
+                  "the triangle and vertex paths must produce different numbers, or clothBC.w "
+                  "is not being tested at all (velMul %.9g vs %.9g, friction %.9g vs %.9g)",
+                  w0.velMul, w1.velMul, w0.fric, w1.fric);
+    // The barycentrics are copied through verbatim.
+    PXG_CHECK_MSG(gBlocks[0].bary0[0][0] == BC0_TRI.x && gBlocks[0].bary0[1][3] == BC0_VTX.w &&
+                  gBlocks[0].bary1[0][3] == BC1.w,
+                  "both barycentric sets are copied into the block unchanged");
+    PXG_CHECK_MSG(gBlocks[0].velMultiplier[2] == SENT && gLambda[2] == SENT,
+                  "nothing may be written past the contact count");
+    PXG_CHECK_MSG(gNum == 2u, "the count is unchanged when maxContacts exceeds it (got %u)", gNum);
+
+    // ---- the block-of-32 addressing ----------------------------------------------------------
+    // With only two contacts, workIndex & 31 == workIndex and workIndex / 32 == 0, so neither
+    // half of the SoA addressing is exercised.  Thirty-four copies of contact 0 put the last
+    // two in BLOCK 1, slots 0 and 1.
+    {
+        const uint32_t NC = 34u;
+        std::vector<F4> np2(NC, NP0), b02(NC, BC0_TRI), b12(NC, BC1);
+        std::vector<FemFemInfoHost> in2(NC, infos[0]);
+        std::vector<uint32_t> n3 = { NC };
+        std::vector<SsConstraintBlock> b3(3);
+        std::memset(b3.data(), 0, b3.size() * sizeof(SsConstraintBlock));
+        for (uint32_t b = 0; b < 3u; ++b)
+            for (uint32_t j = 0; j < 32u; ++j) b3[b].velMultiplier[j] = SENT;
+        std::vector<float> l3(64, SENT);
+        DevBuf bNp2 = makeDev(dev, np2), bB02 = makeDev(dev, b02), bB12 = makeDev(dev, b12);
+        DevBuf bIn2 = makeDev(dev, in2), bN3 = makeDev(dev, n3);
+        DevBuf bC3 = makeDev(dev, b3), bL3 = makeDev(dev, l3);
+        SbClothPrepPush p3 = push;
+        p3.normalPens = bNp2.addr; p3.barycentrics0 = bB02.addr; p3.barycentrics1 = bB12.addr;
+        p3.contactInfos = bIn2.addr; p3.numContacts = bN3.addr; p3.constraints = bC3.addr;
+        p3.lambdaNs = bL3.addr; p3.maxContacts = 64u;
+        Kernel("softBodyClothPrepareBda.spv", "sb_clothContactPrepareLaunch", {}, sizeof(SbClothPrepPush))
+            .dispatch(1024u, {}, p3, 1u, 1u);
+        dev->flush();
+        const auto gB3 = downloadBuffer<SsConstraintBlock>(dev, bC3.h, 3);
+        for (uint32_t j = 0; j < 32u; ++j)
+            PXG_CHECK_MSG(f2u(gB3[0].velMultiplier[j]) == f2u(w0.velMul),
+                          "block 0 slot %u must be built", j);
+        PXG_CHECK_MSG(f2u(gB3[1].velMultiplier[0]) == f2u(w0.velMul) &&
+                      f2u(gB3[1].velMultiplier[1]) == f2u(w0.velMul),
+                      "contacts 32 and 33 belong to BLOCK 1, slots 0 and 1 -- a slot index "
+                      "that forgot the & 31, or a block index that forgot the / 32, puts them "
+                      "somewhere else entirely");
+        PXG_CHECK_MSG(gB3[1].velMultiplier[2] == SENT && gB3[2].velMultiplier[0] == SENT,
+                      "nothing past contact 33 may be written");
+        for (PxgBufferHandle h : { bNp2.h, bB02.h, bB12.h, bIn2.h, bN3.h, bC3.h, bL3.h })
+            dev->destroyBuffer(h);
+    }
+
+    // ---- the in-place clamp ----------------------------------------------------------------
+    // With maxContacts BELOW the count, the kernel must both stop at the limit AND write the
+    // clamped value back -- everything downstream reads it, so a kernel that clamped only its
+    // own loop would leave the solver walking past the constraints it prepared.
+    {
+        std::vector<uint32_t> n2 = { 2u };
+        DevBuf bN2 = makeDev(dev, n2);
+        std::vector<SsConstraintBlock> b2 = blocks;
+        DevBuf bC2 = makeDev(dev, b2);
+        std::vector<float> l2(8, SENT);
+        DevBuf bL2 = makeDev(dev, l2);
+        SbClothPrepPush p2 = push;
+        p2.maxContacts = 1u;
+        p2.numContacts = bN2.addr;
+        p2.constraints = bC2.addr;
+        p2.lambdaNs = bL2.addr;
+        Kernel("softBodyClothPrepareBda.spv", "sb_clothContactPrepareLaunch", {}, sizeof(SbClothPrepPush))
+            .dispatch(1024u, {}, p2, 1u, 1u);
+        dev->flush();
+        const uint32_t gN2 = downloadBuffer<uint32_t>(dev, bN2.h, 1)[0];
+        const auto gB2 = downloadBuffer<SsConstraintBlock>(dev, bC2.h, 2);
+        PXG_CHECK_MSG(gN2 == 1u,
+                      "maxContacts = 1 below a count of 2 must be written BACK to the counter, "
+                      "not just applied locally (got %u)", gN2);
+        PXG_CHECK_MSG(gB2[0].velMultiplier[1] == SENT,
+                      "the second contact is past the clamped count and must be untouched");
+        PXG_CHECK_MSG(gB2[0].velMultiplier[0] != SENT, "the first contact must still be built");
+        dev->destroyBuffer(bN2.h); dev->destroyBuffer(bC2.h); dev->destroyBuffer(bL2.h);
+    }
+
+    for (PxgBufferHandle h : { bClothDelta.h, bClothTris.h, bClothMatIdx.h, bClothFric.h,
+                               bCloth.h, bSbDelta.h, bSimTets.h, bSbMatIdx.h, bDesc.h,
+                               bSbMat.h, bClothMat.h, bNp.h, bB0.h, bB1.h, bInfo.h, bNum.h,
+                               bCons.h, bLambda.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace
