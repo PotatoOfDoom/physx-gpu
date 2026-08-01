@@ -7851,4 +7851,311 @@ PXG_TEST(softBodySimClothMidphase)
         dev->destroyBuffer(h);
 }
 
+// ===========================================================================
+// P8.8 step 2 — sb_clothContactGenLaunch, the tet-vs-triangle contact generator.
+//
+// Each midphase pair becomes a GJK/EPA query between a TETRAHEDRON and a TRIANGLE.  The
+// driver itself (pxgSlangGjk / pxgSlangEpa / tetPrimitivesCollide2) is the one P8.6 extracted
+// and already carries its own fixtures; what this one is aimed at is the framing:
+//
+//   * the point clouds -- 4 tet vertices against 3 triangle vertices taken to WORLD;
+//   * BOTH barycentric sets, and both gating the contact;
+//   * the surface-FACE rejection through the 4-bit mTetMeshSurfaceHint mask;
+//   * the two-level filter, whose vertex level is an AND over all three triangle vertices;
+//   * the write format: point = the CLOTH witness, normal stored NEGATED, and
+//     pairInd0 = cloth / pairInd1 = softbody, which is the OPPOSITE order to the rigid path.
+//
+// THE NUMBERS ARE PREDICTED FROM THE GEOMETRY.  A tetrahedron sitting a clean distance g
+// above a horizontal triangle that its bottom face projects inside has exactly one nearest
+// pair: some point of the bottom face against the point below it.  The separation is g and
+// the direction is vertical, so pen = +g and the stored normal is (0, -1, 0) negated to
+// (0, +1, 0)... which is to say the sign convention itself is what gets asserted, not a
+// fitted constant.
+//
+// KILLED BY THIS FIXTURE: the normal's negation; storing the softbody witness instead of the
+// cloth one; the pairInd0/pairInd1 order; the surface-face rejection; BOTH levels of the
+// filter, including the vertex level's AND (a partial filter is the only configuration that
+// separates it from an OR -- with all three vertices filtered the two agree); and reading
+// either single contactDistance entry instead of their sum.
+//
+// NOT KILLED, FOR STRUCTURAL REASONS RATHER THAN OVERSIGHT:
+//   * the triangle's inner-sphere radius, upstream's literal 1e-6f, reaches nothing but EPA's
+//     convergence epsilon and no separated pair runs EPA at all.  Same family as the box
+//     inner sphere in P8.7, and recorded for the same reason.
+//   * BOTH barycentric gates are defensive and cannot fail here.  A GJK witness lies ON the
+//     hull it came from by construction, so its barycentric coordinates are inside the
+//     simplex, and the [-1e-5, 1+1e-5] window only catches a numerically degenerate solve.
+//     Deleting either gate changes nothing this fixture -- or any well-conditioned one -- can
+//     see.  They are transcribed because upstream has them, not because a test drives them.
+// ===========================================================================
+namespace p88cg
+{
+// The writer is PxgSoftBodyContactWriter (PxgSoftBodyCore.h:242): six pointers + PxU32.
+struct SbClothCgPush
+{
+    float tolerenceLength; uint32_t pad4;
+    uint64_t cmInputs, transformCache, contactDistance, gpuShapes, softbodies, clothes;
+    uint64_t stackPtr, midphasePairsNum;
+    uint32_t stackSizeBytes, pad76;
+    uint64_t filterPairs;
+    uint32_t nbFilterPairs, pad92;
+    uint64_t stackSizeNeededOnDevice;
+    uint64_t outPoint, outNormalPen, outBarycentric0, outBarycentric1, outContactInfo,
+             totalContactCount;
+    uint32_t maxContacts, pad156;
+};
+static_assert(sizeof(SbClothCgPush) == 160, "sb_clothContactGen push blob must be 160 bytes");
+
+// PxgFemFemContactInfo (PxgFEMCore.h:51), 16 B.
+struct FemFemInfoHost { uint32_t pairInd0Lo, pairInd0Hi, pairInd1, auxInd; };
+static_assert(sizeof(FemFemInfoHost) == 16, "PxgFemFemContactInfo is 16 bytes");
+
+// PxgNonRigidFilterPair (PxgSimulationCoreDesc.h:235), 16 B.
+struct NonRigidPairHost { uint32_t index0Lo, index0Hi, index1, index2; };
+static_assert(sizeof(NonRigidPairHost) == 16, "PxgNonRigidFilterPair is 16 bytes");
+
+static const uint32_t PXG_SHIFT = 20u;
+static inline uint32_t encodeId(uint32_t id, uint32_t elem) { return (id << PXG_SHIFT) | elem; }
+static const uint32_t MAX_TET = 0x000fffffu, MAX_VTX = 0x000fffffu;
+} // namespace p88cg
+
+PXG_TEST(softBodySimClothContactGen)
+{
+    using namespace p80refit;
+    using namespace p88cg;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // ---- the cloth: four triangles in y = 0, wound so the normal is +y --------------------
+    const uint32_t NTRI = 5u;
+    std::vector<F4> triVerts;
+    std::vector<TetIdx4> triIdxArr;
+    // Laid out in REVERSE, so the triangle in tet t's slot is primitive NTRI-1-t.  With a
+    // matching layout every encoded index is 0 and a mutant that swapped pairInd0 with
+    // pairInd1 survived -- the two encodings were literally the same number.
+    for (uint32_t t = 0; t < NTRI; ++t)
+    {
+        const float ox = float(NTRI - 1u - t) * 4.0f;
+        const uint32_t b = uint32_t(triVerts.size());
+        triVerts.push_back(F4{ ox - 1.0f, 0.0f, -1.0f, 0.0f });
+        triVerts.push_back(F4{ ox - 1.0f, 0.0f,  2.0f, 0.0f });
+        triVerts.push_back(F4{ ox + 2.0f, 0.0f, -1.0f, 0.0f });
+        triIdxArr.push_back({ b, b + 1u, b + 2u, 0u });
+    }
+    DevBuf bTriVerts = makeDev(dev, triVerts), bTriIdx = makeDev(dev, triIdxArr);
+    if (!bTriVerts.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgFEMCloth cloth;
+    std::memset(&cloth, 0, sizeof(cloth));
+    cloth.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bTriVerts.addr));
+    cloth.mTriangleVertexIndices = reinterpret_cast<uint4*>(size_t(bTriIdx.addr));
+    cloth.mNbVerts = uint32_t(triVerts.size());
+    cloth.mNbTriangles = NTRI;
+    std::vector<PxgFEMCloth> clothArr = { cloth };
+    DevBuf bCloth = makeDev(dev, clothArr);
+
+    // ---- the softbody: four tets, one per triangle ----------------------------------------
+    // Bottom face horizontal at y = gap, wound so isValidTet holds, footprint well inside the
+    // triangle below.  The face masks differ on purpose:
+    //   tet 0: mask 1 -- face T0 (corners 0,1,2) is the BOTTOM face and is on the surface;
+    //   tet 1: mask 1, larger gap, still inside the contact distance;
+    //   tet 2: mask 0b1110 -- every face EXCEPT the bottom one.  The contact direction is
+    //          vertical, so no surface face opposes it and the pair must be rejected;
+    //   tet 3: mask 1, but filtered out per-vertex on all three triangle vertices;
+    //   tet 4: mask 1, but filtered out at the TET level -- (this tet) vs (the whole cloth).
+    const float GAP0 = 0.20f, GAP1 = 0.35f;
+    const float gaps[5] = { GAP0, GAP1, 0.20f, 0.20f, 0.20f };
+    const uint8_t masks[5] = { 0x1u, 0x1u, 0xEu, 0x1u, 0x1u };
+    std::vector<F4> tetVerts;
+    std::vector<TetIdx4> tets;
+    for (uint32_t t = 0; t < 5u; ++t)
+    {
+        const float ox = float(t) * 4.0f, g = gaps[t];
+        const uint32_t b = uint32_t(tetVerts.size());
+        // corners 0,1,2 form the bottom face; corner 3 is the apex above it.
+        tetVerts.push_back(F4{ ox,        g,        0.0f, 1.0f });
+        tetVerts.push_back(F4{ ox,        g,        1.0f, 1.0f });
+        tetVerts.push_back(F4{ ox + 1.0f, g,        0.0f, 1.0f });
+        tetVerts.push_back(F4{ ox,        g + 1.0f, 0.0f, 1.0f });
+        tets.push_back({ b, b + 1u, b + 2u, b + 3u });
+    }
+    std::vector<uint32_t> hintWords(3u, 0u);
+    for (uint32_t t = 0; t < 5u; ++t)
+        reinterpret_cast<uint8_t*>(hintWords.data())[t] = masks[t];
+    DevBuf bTetVerts = makeDev(dev, tetVerts), bTets = makeDev(dev, tets), bHints = makeDev(dev, hintWords);
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bTetVerts.addr));
+    sb.mTetMeshSurfaceHint = reinterpret_cast<PxU8*>(size_t(bHints.addr));
+    sb.mNumTets = 5u;
+    sb.mNumVerts = uint32_t(tetVerts.size());
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // Cloth first again, so the pair is found by TYPE.
+    const uint32_t GEOM_TRIANGLEMESH_H = 8u;
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_TRIANGLEMESH_H;    shapes[0].particleOrSoftbodyId = 0u; shapes[0].srw = 1.0f;
+    shapes[1].type = GEOM_TETRAHEDRONMESH_H; shapes[1].particleOrSoftbodyId = 0u; shapes[1].srw = 1.0f;
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<CmInputHost> cms = { { 0u, 1u, /*cloth cache*/ 1u, /*sb cache*/ 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    // Identity cloth transform: this fixture is about the contact, not the transform (the
+    // midphase fixture pins that), so the triangle world positions are the stored ones.
+    std::vector<float> xf(2 * 8 + 4, 0.0f);
+    xf[3] = 1.0f; xf[8 + 3] = 1.0f;
+    DevBuf bXf = makeDev(dev, xf);
+
+    // 0.16 + 0.14 = 0.30: gaps of 0.20 are inside the SUM and 0.35 is outside.  Neither term
+    // alone reaches 0.20, so a port that reads only one of the two cache refs -- whichever one
+    // -- loses tet 0's contact.  Values that let one side carry the test on its own let a
+    // single-sided read survive.
+    std::vector<float> cd = { 0.16f, 0.14f, 0.0f, 0.0f };
+    DevBuf bCd = makeDev(dev, cd);
+
+    // The vertex-level filter for tet 3: all THREE of its triangle's vertices, against the
+    // softbody-wide wildcard.  PxgNonRigidFilterPair is searched with index0 as a PxU64 and
+    // index1 as a PxU32, so the array must be sorted by (index0, index1).
+    std::vector<NonRigidPairHost> filters;
+    // Tet 3 pairs with triangle NTRI-1-3: ALL THREE of its vertices are filtered, which is
+    // what it takes to skip a triangle.
+    for (uint32_t k = 0; k < 3u; ++k)
+        filters.push_back({ encodeId(0u, MAX_TET), 0u, encodeId(0u, triIdxArr[NTRI - 1u - 3u].x + k), 0u });
+    // Tet 4 is killed one level up, by the TET-vs-WHOLE-CLOTH entry.  Without it that first
+    // filter is never exercised and deleting it changes nothing.
+    filters.push_back({ encodeId(0u, 4u), 0u, encodeId(0u, MAX_VTX), 0u });
+    // ...and ONE vertex of tet 0's triangle (index NTRI-1) is filtered too.  One is not
+    // enough -- the vertex-level test is an AND over all three -- so tet 0 must STILL produce
+    // its contact.  This is the only configuration that separates the AND from an OR: with
+    // all three filtered the two agree, and a mutant swapping them survived until this pair
+    // existed.
+    filters.push_back({ encodeId(0u, MAX_TET), 0u, encodeId(0u, triIdxArr[NTRI - 1u].x), 0u });
+    std::sort(filters.begin(), filters.end(), [](const NonRigidPairHost& a, const NonRigidPairHost& b) {
+        return (a.index0Lo != b.index0Lo) ? (a.index0Lo < b.index0Lo) : (a.index1 < b.index1);
+    });
+    DevBuf bFilters = makeDev(dev, filters);
+
+    // The midphase output: one pair per tet, each against the triangle of its own slot.
+    std::vector<uint32_t> stack;
+    for (uint32_t t = 0; t < 5u; ++t)
+    { stack.push_back(0u); stack.push_back(t); stack.push_back(NTRI - 1u - t); stack.push_back(0u); }
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairNum = { 5u };
+    DevBuf bPairNum = makeDev(dev, pairNum);
+    std::vector<uint32_t> needed = { 0u };
+    DevBuf bNeeded = makeDev(dev, needed);
+
+    const uint32_t MAXC = 16u;
+    std::vector<F4> outPoint(MAXC, F4{ -9, -9, -9, -9 }), outNp(MAXC, F4{ -9, -9, -9, -9 });
+    std::vector<F4> outB0(MAXC, F4{ -9, -9, -9, -9 }), outB1(MAXC, F4{ -9, -9, -9, -9 });
+    std::vector<FemFemInfoHost> outInfo(MAXC);
+    std::memset(outInfo.data(), 0xEE, outInfo.size() * sizeof(FemFemInfoHost));
+    std::vector<uint32_t> total = { 0u };
+    DevBuf bPt = makeDev(dev, outPoint), bNp = makeDev(dev, outNp);
+    DevBuf bB0 = makeDev(dev, outB0), bB1 = makeDev(dev, outB1);
+    DevBuf bInfo = makeDev(dev, outInfo), bTotal = makeDev(dev, total);
+
+    SbClothCgPush push = {};
+    push.tolerenceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.contactDistance = bCd.addr;
+    push.gpuShapes = bShapes.addr;
+    push.softbodies = bDesc.addr;
+    push.clothes = bCloth.addr;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairNum.addr;
+    push.stackSizeBytes = 5u * 16u;
+    push.filterPairs = bFilters.addr;
+    push.nbFilterPairs = uint32_t(filters.size());
+    push.stackSizeNeededOnDevice = bNeeded.addr;
+    push.outPoint = bPt.addr; push.outNormalPen = bNp.addr;
+    push.outBarycentric0 = bB0.addr; push.outBarycentric1 = bB1.addr;
+    push.outContactInfo = bInfo.addr; push.totalContactCount = bTotal.addr;
+    push.maxContacts = MAXC;
+
+    Kernel k("softBodyClothContactGenBda.spv", "sb_clothContactGenLaunch", {}, sizeof(SbClothCgPush));
+    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);   // the engine's SB_MESHCG grid
+    dev->flush();
+
+    const uint32_t n = downloadBuffer<uint32_t>(dev, bTotal.h, 1)[0];
+    const auto gPt = downloadBuffer<F4>(dev, bPt.h, MAXC);
+    const auto gNp = downloadBuffer<F4>(dev, bNp.h, MAXC);
+    const auto gB0 = downloadBuffer<F4>(dev, bB0.h, MAXC);
+    const auto gB1 = downloadBuffer<F4>(dev, bB1.h, MAXC);
+    const auto gInfo = downloadBuffer<FemFemInfoHost>(dev, bInfo.h, MAXC);
+    for (uint32_t i = 0; i < n && i < MAXC; ++i)
+        std::printf("  contact %u: point=(%.5f %.5f %.5f) normal=(%.5f %.5f %.5f) pen=%.6f\n"
+                    "              bary0=(%.4f %.4f %.4f %.4f) bary1=(%.4f %.4f %.4f %.4f) "
+                    "cloth=0x%05x soft=0x%05x\n",
+                    i, gPt[i].x, gPt[i].y, gPt[i].z, gNp[i].x, gNp[i].y, gNp[i].z, gNp[i].w,
+                    gB0[i].x, gB0[i].y, gB0[i].z, gB0[i].w, gB1[i].x, gB1[i].y, gB1[i].z, gB1[i].w,
+                    gInfo[i].pairInd0Lo, gInfo[i].pairInd1);
+
+    PXG_CHECK_MSG(n == 1u,
+                  "only tet 0 may produce a contact: tet 1 is 0.35 away against a contact "
+                  "distance of 0.30, tet 2's bottom face is not a SURFACE face, tet 3 is "
+                  "filtered on all three triangle vertices and tet 4 is filtered at the TET "
+                  "level.  Tet 0 has ONE of its triangle's vertices filtered, which must NOT "
+                  "be enough.  Got %u", n);
+    if (n == 0u || n > MAXC) { /* the checks below would read poison */ }
+    else
+    {
+        // The pair identity, and its ORDER: pairInd0 is the cloth, pairInd1 the softbody.
+        // Tet 0 pairs with triangle 3, so the two encodings are DIFFERENT numbers and the
+        // order of the two fields is observable.
+        PXG_CHECK_MSG(gInfo[0].pairInd0Lo == encodeId(0u, NTRI - 1u) &&
+                      gInfo[0].pairInd1 == encodeId(0u, 0u),
+                      "pairInd0 must be the CLOTH index (triangle %u) and pairInd1 the "
+                      "SOFTBODY index (tet 0); got 0x%08x / 0x%08x",
+                      NTRI - 1u, gInfo[0].pairInd0Lo, gInfo[0].pairInd1);
+        // The witness on the cloth is on the triangle's plane, y = 0.
+        PXG_CHECK_MSG(std::fabs(gPt[0].y) < 1e-4f,
+                      "the stored point is the witness on the CLOTH, so it lies in y = 0 "
+                      "(got y = %.6f).  Storing the softbody witness instead gives y = %.2f",
+                      gPt[0].y, GAP0);
+        // pen is the separation along the un-negated direction: exactly the gap.
+        PXG_CHECK_MSG(std::fabs(gNp[0].w - GAP0) < 2e-3f,
+                      "the penetration is the witness separation, i.e. the gap %.2f (got %.6f)",
+                      GAP0, gNp[0].w);
+        // THE SIGN, derived rather than read off.  tetPrimitivesCollide2's direction points
+        // from cloud A toward cloud B -- here from the SOFTBODY toward the CLOTH, i.e. -y --
+        // which is what makes pen = dot(wB - wA, direction) come out POSITIVE for a separated
+        // pair.  The writer stores -direction, so the stored normal points from the cloth up
+        // at the softbody: (0, +1, 0).  (The same convention as the rigid path, where the
+        // sphere is cloud A and the normal came out pointing at the tet.)
+        PXG_CHECK_MSG(std::fabs(gNp[0].x) < 1e-3f && std::fabs(gNp[0].z) < 1e-3f &&
+                      std::fabs(gNp[0].y - 1.0f) < 1e-3f,
+                      "the stored normal is -direction and points from the cloth at the "
+                      "softbody, so a tet directly above the sheet gives (0, +1, 0); got "
+                      "(%.5f %.5f %.5f)", gNp[0].x, gNp[0].y, gNp[0].z);
+        // ...and the two are locked together: pen must be the separation measured along the
+        // UN-negated direction.  This is the assertion that catches a missing negation, since
+        // it fails if the normal is stored un-negated while pen keeps its sign.
+        PXG_CHECK_MSG(std::fabs(gNp[0].w - (-(gPt[0].y - GAP0) * gNp[0].y)) < 2e-3f,
+                      "pen (%.6f) must equal dot(wB - wA, -storedNormal)", gNp[0].w);
+        // Both barycentric sets are convex combinations; the triangle one has w == 0 and the
+        // tet one puts no weight on the apex (corner 3), which is a whole unit above.
+        const float s0 = gB0[0].x + gB0[0].y + gB0[0].z;
+        const float s1 = gB1[0].x + gB1[0].y + gB1[0].z + gB1[0].w;
+        PXG_CHECK_MSG(std::fabs(s0 - 1.0f) < 1e-3f && gB0[0].w == 0.0f,
+                      "the TRIANGLE barycentric sums to 1 with a zero fourth component "
+                      "(got %.5f, w = %.5f)", s0, gB0[0].w);
+        PXG_CHECK_MSG(std::fabs(s1 - 1.0f) < 1e-3f,
+                      "the TET barycentric sums to 1 (got %.5f)", s1);
+        PXG_CHECK_MSG(gB1[0].w < 1e-3f,
+                      "the tet witness is on the BOTTOM face, so the apex (component w) "
+                      "carries no weight; got %.5f", gB1[0].w);
+    }
+    PXG_CHECK_MSG(gPt[1].x == -9.0f,
+                  "nothing may be written past the contact count");
+
+    for (PxgBufferHandle h : { bTriVerts.h, bTriIdx.h, bCloth.h, bTetVerts.h, bTets.h, bHints.h,
+                               bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h, bFilters.h, bStack.h,
+                               bPairNum.h, bNeeded.h, bPt.h, bNp.h, bB0.h, bB1.h, bInfo.h, bTotal.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace

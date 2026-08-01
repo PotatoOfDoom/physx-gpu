@@ -544,6 +544,14 @@ static const uint8_t kSbSelfCollisionMidphase[] = { 8, 8, 8, 56 };
 //   (x = SB_SBMIDPHASE = 1024, y = numTests); the bridge forwards both.
 static const uint8_t kSbClothMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
 
+// sb_clothContactGenLaunch(PxReal tolerenceLength, cmInputs*, transformCache*,
+//   contactDistance*, gpuShapes*, softbodies*, clothes*, stackPtr*, midphasePairsNum*,
+//   PxU32 stackSizeBytes, PxgNonRigidFilterPair* filterPairs, PxU32 nbFilterPairs,
+//   stackSizeNeededOnDevice*, PxgSoftBodyContactWriter writer) -> 4 @0, eight pointers
+//   @8..@64, PxU32 @72, a pointer realigned to @80, PxU32 @88, a pointer at @96, then the
+//   56-byte writer at @104 -> 160-byte blob.
+static const uint8_t kSbClothContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 4, 8, 56 };
+
 // gpunarrowphase / gpusimulationcontroller softbody SELF-collision SOLVE chain (P8.4
 // tranche b):
 //   sb_fem_contact_remap_to_simLaunch(const PxgSoftBody* softbodies, float4* outBarycentric0,
@@ -985,6 +993,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_selfCollisionMidphaseGeneratePairsLaunch", kSbSelfCollisionMidphase, uint32_t(sizeof(kSbSelfCollisionMidphase)) },
     // gpunarrowphase softbody-vs-CLOTH midphase (P8.8)
     { "sb_clothMidphaseGeneratePairsLaunch", kSbClothMidphase, uint32_t(sizeof(kSbClothMidphase)) },
+    { "sb_clothContactGenLaunch", kSbClothContactGen, uint32_t(sizeof(kSbClothContactGen)) },
     // gpunarrowphase / gpusimulationcontroller softbody SELF-collision solve chain (P8.4 tranche b)
     { "sb_fem_contact_remap_to_simLaunch", kSbFemContactRemapToSim, uint32_t(sizeof(kSbFemContactRemapToSim)) },
     { "sb_softbodyContactPrepareLaunch", kSbSsContactPrepare, uint32_t(sizeof(kSbSsContactPrepare)) },
