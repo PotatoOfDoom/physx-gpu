@@ -1620,6 +1620,83 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.10 step 1 — the softbody-vs-TRIANGLE-MESH midphase
+
+`sb_meshMidphaseGeneratePairsLaunch` is mapped.  It is the first of **two** kernels for
+softbody-vs-triangle-mesh — the pair that lets a FEM volume rest on cooked static geometry
+rather than on a primitive.  Step 2 (`sb_meshContactGenLaunch`, GJK/EPA per pair) is the
+remaining one; everything after it is already mapped, because the contacts go into the RIGID
+contact stream through `PxgFEMContactWriter` and from there through
+`fem_reorderRigidContactsLaunch` → `sb_other_contact_remap_to_simLaunch` →
+`sb_rigidContactPrepareLaunch` → `sb_solveRigidSoftCollisionLaunch`.
+
+**The traverser is the one `softBodyClothMidphaseBda` already carries**, and that is a measured
+claim rather than a convenience.  Both call the same
+`TriangleLeafBoundMinMaxTraverser<BackFaceCull>` (`softbodySoftbodyMidPhase.cu:117`); the cloth
+path instantiates it `<false>` and this one `<true>`.  The template argument switches ONLY
+`satIntersect`'s internal `plane.distance(tet.centroid) < 0 → PX_MAX_F32` early-out (:79-87),
+and the traverser body already applies exactly that test itself at :148, for BOTH
+instantiations.  So the two instantiations compute the same number at these call sites and the
+traversal is transcribed once.
+
+**What the trimesh lift actually adds**, and what the fixture therefore aims at:
+
+| | cloth midphase | trimesh midphase |
+|---|---|---|
+| geometry source | three descriptor fields | a COOKED BLOB walked from `hullOrMeshPtr` |
+| query tet frame | cloth local | cloth local **and then** mesh VERTEX space |
+| contact distance | the plain sum | the sum **divided by** the smallest \|scale\| component |
+| blob | 88 B | 80 B |
+
+The blob walk (`readTriangleMesh`, `triangleMesh.cuh:120`) is
+`header uint4 @0 | BV32DataPacked[header.w] @16 | float4 verts[header.x] | uint4 indices[header.y]`.
+**`header.z` is `nbBv32TreeNodes` and `header.w` is `nbPackedNodes`** — different counts, and
+only `.w` sizes the node array.  The fixture sets `.z` to a deliberately wrong 7 so a port that
+uses it walks the vertex pointer seven nodes too far.
+
+The transform is two steps and both matter for a scaled mesh: `transformInv` (world → mesh
+local, `q.rotateInv(v - p)`) then `shape2Vertex` (local → vertex space,
+`rot.rotateInv(rot.rotate(v) / scale)`, which DIVIDES).  Skipping the second silently works at
+scale (1,1,1) and breaks everywhere else.
+
+**Fixture** `softBodySimMeshMidphase` (56 in the file).  The mesh carries a non-uniform scale
+(2, 1, 0.5) and a real 180° rotation about y, and the tetrahedra are placed in world through the
+inverse of the full transform, so the gap ladder below is a ladder in vertex space:
+
+| tet | vertex-space gap | correct band 0.40 | undivided 0.20 | ÷ max scale 0.10 |
+|---|---|---|---|---|
+| 0 | 0.20 | in | in | out |
+| 1 | 0.12 | in | in | out |
+| 2 | **0.28** | **in** | **out** | out |
+| 3 | 0.04 | in | in | in |
+| 4 | 0.45 | out | out | out |
+| 5 | 0.02, surface hint 0 | — interior, always skipped | | |
+
+Seven pairs come out: one each for tets 0, 2 and 3, and **four** for tet 1, which sees six
+qualifying triangles and hits the `MaxContacts = 4` cap.  The stack under tet 1 runs FAR TO NEAR
+so the last primitive in the leaf is one the cap KEEPS — ordered the other way the cap discards
+it anyway and a `primStartIndex` mutant changes nothing observable.
+
+**Mutation sweep: 9 of 9 killed** (forced-fresh `.spv` each time) — no scale division; divide by
+max instead of min; node array sized by `header.z`; `shape2Vertex` skipped; the `transformInv`
+rotation skipped; the front-face gate removed; the surface-hint gate removed; `MAX_CONTACTS`
+raised to 8; `primStartIndex` shifted by 8 instead of 7.  The `header.z` mutant kills by
+**SEGFAULT** rather than by a check — the vertex pointer leaves the buffer — which is recorded
+as what it is rather than dressed up as a clean assertion.
+
+**One fixture bug, mine.**  The first run emitted ZERO pairs and I had written a comment
+claiming the mesh's mirroring x/z rotation flips the tet's handedness, so I had "compensated" by
+swapping two corners.  It does not: the corners are given in vertex space and mapped to world
+through the inverse transform, and the kernel undoes that rotation before `isValidTet`, so the
+handedness it sees is the one written down.  The compensation is what produced the negative
+volume (−0.16) that skipped every tetrahedron.  Reverting to the plain ordering fixed it.
+
+No scene changes: `sb_meshContactGenLaunch` is still unmapped, so the engine refuses it and the
+midphase output goes unread.  Suite **674/674 in both memory modes**, rigid regression green,
+and every deformable scene unchanged — `softbodyselfcollide` 0.2133, `softbodycloth` 0.8688,
+`softbodystack` 0.9822, `clothselfcollide` min y 5.0999, softbody floor matrix bit-identical at
+box **0.49628** / plane **0.49753** / sphere **0.48436**.  Manifest hand-edited 248 → 249.
+
 ## P8.9 — MILESTONE: a FEM CUBE STACKS ON A FEM CUBE (softbody-vs-softbody, in ONE kernel)
 
 `sb_sbMidphaseGeneratePairsLaunch` is mapped, and with it **softbody-vs-softbody is complete**.

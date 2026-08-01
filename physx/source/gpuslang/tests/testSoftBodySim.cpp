@@ -58,6 +58,7 @@
 #include <cmath>
 #include <vector>
 #include <set>
+#include <algorithm>
 #include <string>
 
 namespace
@@ -9828,6 +9829,306 @@ PXG_TEST(softBodySimSoftBodySoftBodyMidphase)
                                dbBTetHint.h, dbARemap.h, dbBRemap.h, dbAFilters.h, dbDesc.h,
                                dbShapes.h, dbCms.h, dbCd.h, dbPoint.h, dbNormalPen.h,
                                dbBary0.h, dbBary1.h, dbInfo.h, dbCount.h })
+        dev->destroyBuffer(h);
+}
+
+// ===========================================================================
+// P8.10 step 1 -- sb_meshMidphaseGeneratePairsLaunch, the softbody-vs-TRIANGLE-MESH midphase.
+//
+// WHAT THIS FIXTURE IS FOR.  The traverser is the one softBodySimClothMidphase already covers
+// (same struct, same SAT, same top-4 extraction; the .cu's <true>/<false> template argument
+// only switches a cull the caller already performs).  This fixture aims at what the TRIMESH
+// lift adds and nothing else:
+//
+//   * the COOKED BLOB WALK -- header, BV32 node array, vertex pool, index pool -- including
+//     that the node array is sized by header.w and NOT header.z, which are different counts;
+//   * the two-step transform into the mesh's VERTEX space: world -> mesh local via
+//     transformInv (a real 180-degree rotation here, not identity, so dropping the rotation is
+//     visible) and local -> vertex via shape2Vertex, which DIVIDES by a non-uniform scale;
+//   * the contact distance divided by the smallest |scale| component.  The scale is
+//     (2, 1, 0.5), so the correct band is 0.20 / 0.5 = 0.40 and the tet ladder straddles both
+//     0.40 and the 0.20 an undivided reading would give;
+//   * the 80-byte blob.
+//
+// The mesh is laid out in VERTEX space exactly as the cloth fixture lays out its sheet, and the
+// tetrahedra are placed in WORLD space through the inverse of the full transform, so the gap
+// ladder below is a ladder in vertex space and can be read off directly.
+// ===========================================================================
+namespace p810mesh
+{
+// { PxReal toleranceLength, cmInputs*, transformCache*, bounds*, contactDistance*, gpuShapes*,
+//   softbodies*, PxU32 stackSizeBytes, stackPtr*, midphasePairsNum* }
+struct SbMeshMidPush
+{
+    float toleranceLength; uint32_t pad4;
+    uint64_t cmInputs, transformCache, bounds, contactDistance, gpuShapes, softbodies;
+    uint32_t stackSizeBytes, pad60;
+    uint64_t stackPtr, midphasePairsNum;
+};
+static_assert(sizeof(SbMeshMidPush) == 80, "sb mesh midphase blob must be 80 bytes");
+static_assert(offsetof(SbMeshMidPush, softbodies) == 48, "softbodies @48");
+static_assert(offsetof(SbMeshMidPush, stackSizeBytes) == 56, "stackSizeBytes @56");
+static_assert(offsetof(SbMeshMidPush, stackPtr) == 64, "stackPtr @64");
+} // namespace p810mesh
+
+PXG_TEST(softBodySimMeshMidphase)
+{
+    using namespace p80refit;
+    using namespace p88cloth;      // Bv32NodeHost
+    using namespace p810mesh;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // The mesh's placement.  scaleRot stays identity so shape2Vertex is a plain componentwise
+    // divide and the expected geometry can be written down; the SCALE is non-uniform and the
+    // rigid rotation is a real 180 degrees about y, which is exact in floating point:
+    //     world = R * (vertex * scale) + T,   R(x, y, z) = (-x, y, -z)
+    const float SX = 2.0f, SY = 1.0f, SZ = 0.5f;   // min |scale| = 0.5
+    const float TX = 10.0f, TY = 20.0f, TZ = 30.0f;
+    auto toWorld = [&](float vx, float vy, float vz) {
+        return F4{ -(vx * SX) + TX, (vy * SY) + TY, -(vz * SZ) + TZ, 1.0f };
+    };
+
+    // ---- the triangle mesh, in VERTEX space, in the plane y = 0 with normal +y -------------
+    const uint32_t NTRI = 6u;
+    std::vector<F4> triVerts;
+    std::vector<TetIdx4> triIdx;
+    // Primitive 0 is a DUMMY parked 1000 units away, so the leaf's primStartIndex is 1 rather
+    // than 0.  With a zero start the field is invisible: `data >> 7` and `data >> 8` both yield
+    // 0 and a mutant on the shift survives.
+    const uint32_t TRI_BASE = 1u;
+    {
+        const uint32_t b = uint32_t(triVerts.size());
+        triVerts.push_back(F4{ 1000.0f, 0.0f, 0.0f, 0.0f });
+        triVerts.push_back(F4{ 1000.0f, 0.0f, 1.0f, 0.0f });
+        triVerts.push_back(F4{ 1001.0f, 0.0f, 0.0f, 0.0f });
+        triIdx.push_back({ b, b + 1u, b + 2u, 0u });
+    }
+    for (uint32_t t = 0; t < NTRI; ++t)
+    {
+        // Six unit right triangles side by side along x, laid out in REVERSE so the triangle
+        // in slot k has primitive index NTRI-1-k.  The tets run forwards, so tri == 5 - tet
+        // and the two fields of the emitted uint4 cannot be confused for each other.
+        const float ox = float(NTRI - 1u - t) * 2.0f;
+        const uint32_t b = uint32_t(triVerts.size());
+        triVerts.push_back(F4{ ox,        0.0f, 0.0f, 0.0f });
+        triVerts.push_back(F4{ ox,        0.0f, 1.0f, 0.0f });
+        triVerts.push_back(F4{ ox + 1.0f, 0.0f, 0.0f, 0.0f });
+        triIdx.push_back({ b, b + 1u, b + 2u, 0u });
+    }
+    // A BACK-FACING triangle in tet 0's slot and CLOSER to it (0.05 against a gap of 0.20).
+    // Its normal is -y, so the front-face gate must reject it; without the gate tet 0 reports
+    // two triangles instead of one.
+    {
+        const float ox = 0.0f;
+        const uint32_t b = uint32_t(triVerts.size());
+        triVerts.push_back(F4{ ox,        0.15f, 0.0f, 0.0f });
+        triVerts.push_back(F4{ ox + 1.0f, 0.15f, 0.0f, 0.0f });
+        triVerts.push_back(F4{ ox,        0.15f, 1.0f, 0.0f });   // reversed winding -> n = -y
+        triIdx.push_back({ b, b + 1u, b + 2u, 0u });
+    }
+    // A STACK of five more front-facing triangles under tet 1, so that tet sees SIX qualifying
+    // triangles and the MaxContacts = 4 cap actually binds.  FAR TO NEAR on purpose, so the
+    // LAST primitive in the leaf is one of the four that survive: ordered the other way the
+    // last primitive is the one the cap discards anyway and a primStartIndex mutant -- which
+    // shifts exactly which primitive falls off the end -- changes nothing observable.
+    const uint32_t STACK_TRI0 = TRI_BASE + NTRI + 1u;
+    const uint32_t NB_STACK = 5u;
+    for (uint32_t k = 0; k < NB_STACK; ++k)
+    {
+        const float ox = 2.0f;                       // tet 1's slot
+        const float y = -0.02f * float(NB_STACK - k);
+        const uint32_t b = uint32_t(triVerts.size());
+        triVerts.push_back(F4{ ox,        y, 0.0f, 0.0f });
+        triVerts.push_back(F4{ ox,        y, 1.0f, 0.0f });
+        triVerts.push_back(F4{ ox + 1.0f, y, 0.0f, 0.0f });
+        triIdx.push_back({ b, b + 1u, b + 2u, 0u });
+    }
+    const uint32_t NPRIM = uint32_t(triIdx.size());
+    const uint32_t NVERT = uint32_t(triVerts.size());
+
+    // ---- the COOKED BLOB: header | BV32 nodes | vertex pool | index pool -------------------
+    // This is the shape readTriangleMesh walks (triangleMesh.cuh:120), packed into one buffer
+    // so a wrong stride anywhere lands on the wrong pool rather than on unmapped memory.
+    std::vector<uint32_t> blob;
+    {
+        Bv32NodeHost node;
+        std::memset(&node, 0, sizeof(node));
+        node.mNbNodes = 1u;
+        node.mMin[0][0] = -1.0f; node.mMin[0][1] = -1.0f; node.mMin[0][2] = -1.0f;
+        node.mMax[0][0] = 12.0f; node.mMax[0][1] =  1.0f; node.mMax[0][2] =  2.0f;
+        // isLeaf | nbPrimitives<<1 | primStartIndex<<7; the leaf covers the real triangles.
+        node.mData[0] = 1u | ((NPRIM - TRI_BASE) << 1) | (TRI_BASE << 7);
+
+        blob.resize(4u, 0u);
+        blob[0] = NVERT;
+        blob[1] = NPRIM;
+        // header.z is nbBv32TreeNodes and header.w is nbPackedNodes.  THEY ARE DIFFERENT
+        // COUNTS and only .w sizes the node array -- so .z is set to a deliberately wrong 7
+        // here.  A port that sizes with .z walks the vertex pointer seven nodes too far and
+        // reads garbage triangles.
+        blob[2] = 7u;
+        blob[3] = 1u;                       // nbPackedNodes
+        const size_t nodeWords = sizeof(Bv32NodeHost) / 4u;
+        blob.resize(4u + nodeWords, 0u);
+        std::memcpy(blob.data() + 4, &node, sizeof(node));
+        const size_t vBase = blob.size();
+        blob.resize(vBase + NVERT * 4u, 0u);
+        std::memcpy(blob.data() + vBase, triVerts.data(), NVERT * sizeof(F4));
+        const size_t iBase = blob.size();
+        blob.resize(iBase + NPRIM * 4u, 0u);
+        std::memcpy(blob.data() + iBase, triIdx.data(), NPRIM * sizeof(TetIdx4));
+    }
+    DevBuf bBlob = makeDev(dev, blob);
+    if (!bBlob.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    // ---- the softbody: one tet per triangle slot, at a chosen VERTEX-SPACE gap -------------
+    // The correct contact band is (0.05 + 0.15) / min|scale| = 0.20 / 0.5 = 0.40.  The ladder
+    // straddles it AND the undivided 0.20:
+    //   gap 0.20 -> in either reading            gap 0.28 -> ONLY with the division
+    //   gap 0.12 -> in either reading            gap 0.45 -> in NEITHER
+    const float gaps[6] = { 0.20f, 0.12f, 0.28f, 0.04f, 0.45f, 0.02f };
+    const uint8_t hints[6] = { 1u, 1u, 1u, 1u, 1u, 0u };
+    std::vector<F4> tetVerts;
+    std::vector<TetIdx4> tets;
+    for (uint32_t t = 0; t < 6u; ++t)
+    {
+        const float ox = float(t) * 2.0f, g = gaps[t];
+        const uint32_t b = uint32_t(tetVerts.size());
+        // The winding matters: isValidTet demands dot(v1-v0, cross(v2-v0, v3-v0)) > 1e-9, so
+        // the bottom face is listed counter-clockwise seen from BELOW.  The corners are given
+        // in VERTEX space and mapped to world through the inverse transform, so the handedness
+        // the kernel sees is the one written here -- the mesh's mirroring x/z rotation does
+        // NOT flip it, because the kernel undoes that rotation before the test.  (Reordering
+        // the first two corners "to compensate" gives -0.16 and every tet is silently skipped;
+        // measured.)
+        tetVerts.push_back(toWorld(ox + 0.2f, g,        0.2f));
+        tetVerts.push_back(toWorld(ox + 0.2f, g,        0.6f));
+        tetVerts.push_back(toWorld(ox + 0.6f, g,        0.2f));
+        tetVerts.push_back(toWorld(ox + 0.2f, g + 1.0f, 0.2f));
+        tets.push_back({ b, b + 1u, b + 2u, b + 3u });
+    }
+    std::vector<uint32_t> hintWords((6u + 3u) / 4u, 0u);
+    for (uint32_t t = 0; t < 6u; ++t)
+        reinterpret_cast<uint8_t*>(hintWords.data())[t] = hints[t];
+    DevBuf bTetVerts = makeDev(dev, tetVerts), bTets = makeDev(dev, tets), bHints = makeDev(dev, hintWords);
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bTetVerts.addr));
+    sb.mTetMeshSurfaceHint = reinterpret_cast<PxU8*>(size_t(bHints.addr));
+    sb.mNumTets = 6u;
+    sb.mNumVerts = uint32_t(tetVerts.size());
+    std::vector<PxgSoftBody> descArr = { sb };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- the pair.  The TRIMESH is shapeRef0 and the SOFTBODY shapeRef1, i.e. the SWAPPED
+    // order, so LoadShapePairWarp has to find the tet mesh by TYPE rather than by position.
+    const uint32_t GEOM_TRIANGLEMESH_H = 8u;
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_TRIANGLEMESH_H;    shapes[0].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[0].sx = SX; shapes[0].sy = SY; shapes[0].sz = SZ; shapes[0].srw = 1.0f;  // identity scaleRot
+    shapes[0].hullLo = uint32_t(bBlob.addr & 0xFFFFFFFFull);
+    shapes[0].hullHi = uint32_t(bBlob.addr >> 32);
+    shapes[1].type = GEOM_TETRAHEDRONMESH_H; shapes[1].particleOrSoftbodyId = 0u;
+    shapes[1].sx = 1.0f; shapes[1].sy = 1.0f; shapes[1].sz = 1.0f; shapes[1].srw = 1.0f;
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<CmInputHost> cms = { { 0u, 1u, /*trimesh cache*/ 1u, /*sb cache*/ 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    // PxsCachedTransform, 32 B: PxQuat q @0, PxVec3 p @16.  Slot 0 = the softbody (unused),
+    // slot 1 = the trimesh, rotated 180 degrees about y and translated.
+    std::vector<float> xf(2 * 8 + 4, 0.0f);
+    xf[3] = 1.0f;                                     // slot 0 identity
+    xf[8 + 0] = 0.0f; xf[8 + 1] = 1.0f; xf[8 + 2] = 0.0f; xf[8 + 3] = 0.0f;   // 180 deg about y
+    xf[8 + 4] = TX; xf[8 + 5] = TY; xf[8 + 6] = TZ;
+    DevBuf bXf = makeDev(dev, xf);
+
+    // contactDistance is summed over BOTH cache refs: 0.05 + 0.15 = 0.20, then divided.
+    std::vector<float> cd = { 0.05f, 0.15f, 0.0f, 0.0f };
+    DevBuf bCd = makeDev(dev, cd);
+
+    const uint32_t CAP = 64u;
+    std::vector<uint32_t> stack(CAP * 4u, 0xFFFFFFFFu);
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairNum = { 0u };
+    DevBuf bPairNum = makeDev(dev, pairNum);
+
+    SbMeshMidPush push = {};
+    push.toleranceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.bounds = 0ull;                 // ABI parity only -- the kernel never reads it
+    push.contactDistance = bCd.addr;
+    push.gpuShapes = bShapes.addr;
+    push.softbodies = bDesc.addr;
+    push.stackSizeBytes = CAP * 16u;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairNum.addr;
+
+    Kernel k("softBodyMeshMidphaseBda.spv", "sb_meshMidphaseGeneratePairsLaunch",
+             {}, sizeof(SbMeshMidPush));
+    // The engine's grid (PxgNarrowphaseCore.cpp:5055): x = SB_SBMIDPHASE = 1024, y = numTests.
+    k.dispatch(/*gridX*/ 1024u, {}, push, /*gridY*/ 1u, 1u);
+    dev->flush();
+
+    const uint32_t gNum = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];
+    const auto gStack = downloadBuffer<uint32_t>(dev, bStack.h, CAP * 4u);
+
+    std::vector<std::pair<uint32_t, uint32_t>> emitted;   // (tet, tri)
+    for (uint32_t i = 0; i < gNum && i < CAP; ++i)
+    {
+        PXG_CHECK_MSG(gStack[i * 4u + 0u] == 0u,
+                      "pair %u carries cmIdx %u; blockIdx.y is the ONLY contact-manager index "
+                      "here", i, gStack[i * 4u + 0u]);
+        emitted.push_back({ gStack[i * 4u + 1u], gStack[i * 4u + 2u] });
+        std::printf("  pair %u: tet %u  tri %u\n", i, gStack[i * 4u + 1u], gStack[i * 4u + 2u]);
+    }
+    std::sort(emitted.begin(), emitted.end());
+
+    // tet 0, 2, 3 keep ONE triangle each (their own slot); tet 1 keeps FOUR (the cap);
+    // tet 4 is beyond the band and tet 5 is interior.
+    PXG_CHECK_MSG(gNum == 7u,
+                  "expected 7 pairs -- one each for tets 0, 2 and 3, four for tet 1 (the "
+                  "MaxContacts cap), none for tet 4 (beyond 0.40) and none for tet 5 "
+                  "(interior) -- got %u.  0 usually means the blob walk or the vertex-space "
+                  "transform is wrong; 6 means the scale division is missing (tet 2 at 0.28 "
+                  "falls outside an undivided 0.20 band)", gNum);
+
+    auto has = [&](uint32_t tet, uint32_t tri) {
+        return std::find(emitted.begin(), emitted.end(), std::make_pair(tet, tri)) != emitted.end();
+    };
+    auto countFor = [&](uint32_t tet) {
+        uint32_t n = 0; for (auto& e : emitted) if (e.first == tet) ++n; return n;
+    };
+
+    // tri == 5 - tet for the slot triangles (the mesh is laid out in reverse).
+    PXG_CHECK_MSG(has(0u, TRI_BASE + (NTRI - 1u - 0u)),
+                  "tet 0 must match the triangle in ITS OWN slot");
+    PXG_CHECK_MSG(has(2u, TRI_BASE + (NTRI - 1u - 2u)),
+                  "tet 2 sits 0.28 above its triangle: inside the DIVIDED band 0.40 and "
+                  "outside the undivided 0.20.  Missing means the scale division is gone");
+    PXG_CHECK_MSG(has(3u, TRI_BASE + (NTRI - 1u - 3u)), "tet 3 must match its own slot");
+    PXG_CHECK_MSG(countFor(0u) == 1u,
+                  "tet 0 must keep exactly ONE triangle: the back-facing one at 0.15 is "
+                  "closer, and only the front-face gate keeps it out (got %u)", countFor(0u));
+    PXG_CHECK_MSG(countFor(4u) == 0u, "tet 4 sits 0.45 out, beyond the 0.40 band");
+    PXG_CHECK_MSG(countFor(5u) == 0u, "tet 5 is INTERIOR (surface hint 0) and must be skipped");
+
+    // Tet 1 sees six qualifying triangles and keeps the four CLOSEST: its own slot at 0.12 and
+    // the three nearest of the stack (0.02, 0.04, 0.06 below the plane -> 0.14, 0.16, 0.18).
+    PXG_CHECK_MSG(countFor(1u) == 4u,
+                  "tet 1 sees SIX qualifying triangles; MaxContacts caps it at four (got %u)",
+                  countFor(1u));
+    PXG_CHECK_MSG(has(1u, TRI_BASE + (NTRI - 1u - 1u)),
+                  "tet 1's own slot triangle is the CLOSEST of the six and must survive the cap");
+    PXG_CHECK_MSG(has(1u, STACK_TRI0 + NB_STACK - 1u),
+                  "the nearest stack triangle must survive the cap");
+    PXG_CHECK_MSG(!has(1u, STACK_TRI0),
+                  "the FARTHEST stack triangle must be the one the cap discards");
+
+    for (PxgBufferHandle h : { bBlob.h, bTetVerts.h, bTets.h, bHints.h, bDesc.h, bShapes.h,
+                               bCms.h, bXf.h, bCd.h, bStack.h, bPairNum.h })
         dev->destroyBuffer(h);
 }
 
