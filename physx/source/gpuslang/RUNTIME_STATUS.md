@@ -1620,6 +1620,60 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.15 — `pxgSlangClothMidphase`: the shared cloth-midphase machinery, extracted before it got duplicated
+
+Groundwork for cloth-vs-different-cloth, done as its own step so it can be proved
+behaviour-preserving on its own.  **No kernel was mapped; the manifest is unchanged at 252.**
+
+The two kernels P8.14 scouted are the self-collision midphase with two cloths, so they need the
+same BV32 node readers, the same `closestPtPointTriangle` / `closestPtLineLine`, the same bounds
+and edge-activity predicates, and the same `auxInd` bit layout that `femClothSelfCollisionBda`
+already carries.  The choice was to copy them or to share them.
+
+**This port has already paid for the copy once.**  `softBodyClothMidphaseBda`'s header records
+it: a mutant that deleted an outer front-face gate SURVIVED, because a duplicated inner copy of
+the same cull was still there.  Duplicated geometry does not merely age badly — it silently
+absorbs mutants and makes the sweep report coverage it does not have.  So the helpers moved to
+`pxgSlangClothMidphase.slang`, the same treatment `pxgSlangTetClosest` got at P8.8 step 4 when
+the cloth-vertex contact generator became its second consumer.
+
+**What went, and what deliberately did not:**
+
+| moved | stayed |
+|---|---|
+| BV32 readers (`bvMin`/`bvMax`/`bvData`/`bvNbNodes`) and their offsets | `writeContactInfo` — it dereferences the importing shader's own push constants |
+| `closestPtPointTriangle`, `closestPtLineLine` | `ballotGroup` — it owns groupshared state, and moving it would obscure where the barriers are |
+| `boundsIntersect`, `isType0EdgeActive`, `pxEncodeClothIndex` | `distSqInRestPoseVT` / `...EE` |
+| the `auxInd` bit layout, the barycentric thresholds, `WARP`, `STACK_SIZE`, `MIDPHASE_WARPS_PER_BLOCK` | |
+
+**The rest-pose helpers staying put is a correctness decision, not tidiness.**  The
+different-cloth call passes NULL for both rest buffers, and `distSqInRestPose` returns
+`PX_MAX_REAL` for a null first argument (`femClothClothMidPhase.cu:662-668`), so that filter
+collapses on the new path.  A shared rest-pose helper would invite exactly the null dereference
+the collapse avoids — and on llvmpipe a speculated load through null is a fault whose location
+moves with the groupshared layout, the failure mode this port has chased twice.
+
+The module is PURE: no push constants, no groupshared, no side effects.
+`femClothSelfCollisionBda` shrank 817 → 639 lines (185 deleted, 6 added).
+
+**Proof that the extraction changed nothing**, which is the whole point of doing it separately:
+
+* forced-fresh `.spv`, then the suite through `tools/run_suite.sh` — **674/674 in both memory
+  modes**;
+* `PXG_SCENE=clothselfcollide` on PGS: min y **5.0999**, mean 5.1106, against the recorded
+  baseline of 5.0999 / 5.1105.  The last digit of the mean varies run to run because the
+  deformable solves scatter through real float atomics and the summation order is not fixed —
+  recorded at P8.9, and `min y` is the stable figure;
+* the same scene on TGS (green since P8.12): 5.1000 / 5.1104;
+* `cloth`, `clothdrape`, `clothhang` all still green.
+
+One pre-existing slangc warning (`possible use of uninitialized variable` on the EE path's
+`localEdgeIndices`) moved with its line number and is unchanged from HEAD — the construct is
+byte-identical, and the array is written up to `intersectCount` and read only below it.
+
+Next: `femClothDifferentClothBda` with both entry points, importing this module, with the four
+differences P8.14 lists and the rest-pose block omitted.
+
 ## P8.14 scouting — cloth-vs-DIFFERENT-cloth is LIVE, and the survey's "dead" verdict was wrong
 
 Scouting for the next tranche, `cloth_differentClothCollisionVTLaunch` +
