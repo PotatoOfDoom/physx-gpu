@@ -582,6 +582,18 @@ static const uint8_t kSbHfMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 4, 8, 8 };
 //   -> 64-byte blob.
 static const uint8_t kClothStep[] = { 8, 8, 4, 12, 1, 1, 1, 8, 8, 8 };
 
+// gpunarrowphase cloth-vs-DIFFERENT-cloth midphase, both entry points (P8.16):
+//   cloth_differentClothCollision{VT,EE}Launch(PxU32 maxContacts, PxReal toleranceLength,
+//   cmInputs*, transformCache*, contactDistance*, gpuShapes*, femClothes*,
+//   PxgNonRigidFilterPair* clothClothPairs, PxU32 numClothClothPairs,
+//   const PxU8* updateContactPairs, PxgFemFemContactInfo* outContactInfo,
+//   PxU32* totalContactCount) -- launch site PxgFEMClothCore.cpp:768.  Two 4-byte scalars
+//   pack at @0/@4, six pointers @8..@48, PxU32 @56, then a pointer realigned to @64 and two
+//   more -> 88-byte blob.  NOT the self-collision pack (kClothSelfCollision, 72 bytes): this
+//   one is narrowphase-driven (cmInputs/transformCache/gpuShapes instead of activeClothes)
+//   and carries toleranceLength.
+static const uint8_t kClothDifferentCloth[] = { 4, 4, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8 };
+
 // gpunarrowphase softbody-vs-CLOTH midphase (P8.8):
 //   sb_clothMidphaseGeneratePairsLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
 //   bounds*, contactDistance*, gpuShapes*, softbodies*, clothes*, PxU32 stackSizeBytes,
@@ -1069,6 +1081,9 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_meshContactGenLaunch", kSbMeshContactGen, uint32_t(sizeof(kSbMeshContactGen)) },
     { "sb_heightfieldMidphaseGeneratePairsLaunch", kSbHfMidphase, uint32_t(sizeof(kSbHfMidphase)) },
     { "cloth_stepLaunch", kClothStep, uint32_t(sizeof(kClothStep)) },
+    // gpunarrowphase cloth-vs-DIFFERENT-cloth midphase (P8.16)
+    { "cloth_differentClothCollisionVTLaunch", kClothDifferentCloth, uint32_t(sizeof(kClothDifferentCloth)) },
+    { "cloth_differentClothCollisionEELaunch", kClothDifferentCloth, uint32_t(sizeof(kClothDifferentCloth)) },
     // gpunarrowphase softbody-vs-CLOTH midphase (P8.8)
     { "sb_clothMidphaseGeneratePairsLaunch", kSbClothMidphase, uint32_t(sizeof(kSbClothMidphase)) },
     { "sb_clothContactGenLaunch", kSbClothContactGen, uint32_t(sizeof(kSbClothContactGen)) },

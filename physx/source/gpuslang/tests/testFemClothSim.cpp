@@ -5492,4 +5492,459 @@ PXG_TEST(femClothSimStepDampingAndFlags)
         dev->destroyBuffer(h);
 }
 
+// ===========================================================================
+// P8.16 -- cloth_differentClothCollision{VT,EE}Launch, the cloth-vs-DIFFERENT-cloth
+// midphase.  The sibling femClothSelfCollisionBda deferred these as "a SEPARATE arg
+// pack / ABI"; the traverser bodies are the same C++ structs, so what this fixture has
+// to pin is exactly the five things that differ (femClothClothMidPhase.cu:1240-1384):
+//
+//   * the 88-byte narrowphase-driven blob (cmInputs / gpuShapes / transformCache instead
+//     of an activeClothes list), and that the two cloth ids come from
+//     PxgShape::particleOrSoftbodyId;
+//   * contactDist is the SUM of the two shapes' cached distances, not one doubled --
+//     covered by a pair that is inside the sum but outside 2*cd[ref1], and another that
+//     is outside the sum but inside 2*cd[ref0];
+//   * VT sweeps BOTH directions in one launch (globalWarpIdx < numVerts0 + numVerts1),
+//     each half walking the OTHER cloth's tree; EE runs min(numTri0, numTri1) queries
+//     with the SMALLER cloth always driving, which the second EE dispatch proves by
+//     swapping the pair order and demanding the identical output;
+//   * every `clothId0 != clothId1` guard is live and TRUE, so the self path's three skips
+//     are disabled.  Both are exercised on purpose: the VT scene makes a penetrating
+//     vertex share its INDEX with a corner of the triangle it hits, and the EE scene gives
+//     the two cloths triangles with identical vertex indices, so a mutant that folds
+//     either guard the self way loses contacts;
+//   * markValidity(clothId0 != clothId1) -> bit 31 SET, where the self path leaves it 0.
+//
+// The rest-pose filter is absent by construction (the call passes NULL rest buffers and
+// filterDistSq 0), so the descriptors below leave mRestPosition null -- a port that kept
+// the self-collision lookup would fault on the first contact rather than mis-filter.
+// ===========================================================================
+namespace p816dc
+{
+struct DifferentClothPush
+{
+    uint32_t maxContacts;
+    float toleranceLength;
+    uint64_t cmInputs, transformCache, contactDistance, gpuShapes, femClothes, clothClothPairs;
+    uint32_t numClothClothPairs, pad60;
+    uint64_t updateContactPairs, outContactInfo, totalContactCount;
+};
+static_assert(sizeof(DifferentClothPush) == 88, "different-cloth push blob must be 88 bytes");
+static_assert(offsetof(DifferentClothPush, cmInputs) == 8, "cmInputs @8");
+static_assert(offsetof(DifferentClothPush, femClothes) == 40, "femClothes @40");
+static_assert(offsetof(DifferentClothPush, numClothClothPairs) == 56, "numClothClothPairs @56");
+static_assert(offsetof(DifferentClothPush, updateContactPairs) == 64, "the next pointer realigns @64");
+static_assert(offsetof(DifferentClothPush, totalContactCount) == 80, "totalContactCount @80");
+
+struct CmInputHost { uint32_t shapeRef0, shapeRef1, cacheRef0, cacheRef1; };
+struct PxgShapeHost
+{
+    float sx, sy, sz, srx, sry, srz, srw;
+    uint32_t materialIndex, hullLo, hullHi, type, particleOrSoftbodyId;
+};
+static_assert(sizeof(PxgShapeHost) == 48, "PxgShape mirror must be 48 bytes");
+static const uint32_t GEOM_TRIANGLEMESH_H = 8u;   // PxGeometryType::eTRIANGLEMESH
+
+static const uint32_t VALID_H = 1u << 31;         // markValidity(true)
+
+static PxgShapeHost makeClothShape(uint32_t clothId)
+{
+    PxgShapeHost s = {};
+    s.sx = s.sy = s.sz = 1.0f;
+    s.srw = 1.0f;
+    s.type = GEOM_TRIANGLEMESH_H;
+    s.particleOrSoftbodyId = clothId;
+    return s;
+}
+
+// Sort key for the SET comparison: unlike the self-collision fixtures (one query warp, one
+// leaf) this kernel runs several query warps against a shared atomic counter, so the output
+// ORDER is not deterministic.  The contact set is.
+static bool infoLess(const FemFemContactInfoHost& a, const FemFemContactInfoHost& b)
+{
+    if (a.pairInd0 != b.pairInd0) return a.pairInd0 < b.pairInd0;
+    if (a.pairInd1 != b.pairInd1) return a.pairInd1 < b.pairInd1;
+    return a.auxInd < b.auxInd;
+}
+
+static size_t compareSets(std::vector<FemFemContactInfoHost> got,
+                          std::vector<FemFemContactInfoHost> ref, const char* tag)
+{
+    std::sort(got.begin(), got.end(), infoLess);
+    std::sort(ref.begin(), ref.end(), infoLess);
+    size_t mm = 0;
+    for (size_t i = 0; i < got.size() && i < ref.size(); ++i)
+    {
+        if (std::memcmp(&got[i], &ref[i], sizeof(FemFemContactInfoHost)) != 0)
+        {
+            ++mm;
+            std::printf("  %s contact[%zu] MM: got(p0=%llu,p1=%u,aux=0x%08x) ref(p0=%llu,p1=%u,aux=0x%08x)\n",
+                        tag, i, (unsigned long long)got[i].pairInd0, got[i].pairInd1, got[i].auxInd,
+                        (unsigned long long)ref[i].pairInd0, ref[i].pairInd1, ref[i].auxInd);
+        }
+    }
+    return mm;
+}
+} // namespace p816dc
+
+// ---------------------------------------------------------------------------
+// cloth_differentClothCollisionVTLaunch — both directions in one launch.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimDifferentClothVT)
+{
+    using namespace p816dc;
+    using p72ref::V3;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // contactDist = cd[cacheRef0] + cd[cacheRef1] = 0.05 + 0.02 = 0.07.
+    const float CD0 = 0.05f, CD1 = 0.02f;
+    const float contactDist = CD0 + CD1;
+    const float contactDistSq = contactDist * contactDist;
+
+    // Cloth 0: triangle A = {0,1,2} in the z=0 plane, plus two probe vertices above cloth 1's
+    // triangle.  v4 is 0.03 away (inside 0.07); v3 is 0.085 away -- OUTSIDE the summed
+    // distance but INSIDE 2*CD0 = 0.10, which is the mutant that vertex exists to kill.
+    //
+    // The PENETRATING probe is the LAST vertex on purpose.  Cloth 0 has five vertices and
+    // cloth 1 four, so the two halves of the query range have different lengths -- and an
+    // inverted branchless select (which swaps which half is which) then drops index 4
+    // entirely.  With the probe at index 3 that mutant SURVIVES: both halves still cover
+    // index 3, and the emitted ids come out identical because the select swaps my/other
+    // consistently.  The asymmetry is the only thing that separates them.
+    std::vector<F4> pos0 = {
+        {  0.00f, 0.00f, 0.000f, 1.0f },   // v0 (triangle A)
+        {  1.00f, 0.00f, 0.000f, 1.0f },   // v1 (triangle A)
+        {  0.00f, 1.00f, 0.000f, 1.0f },   // v2 (triangle A)
+        {  0.25f, 0.25f, 0.585f, 1.0f },   // v3 -> dist 0.085, must MISS
+        {  0.25f, 0.25f, 0.530f, 1.0f },   // v4 -> hits cloth 1's triangle B (dist 0.03)
+    };
+    std::vector<TriIdx4> tris0 = { { 0u, 1u, 2u, 0x7u } };
+
+    // Cloth 1: the penetrating vertex is index 0 ON PURPOSE -- it equals triangle A's .x, so
+    // the self path's "vertex is a corner of this triangle" skip would fire.  Here it must not.
+    std::vector<F4> pos1 = {
+        {  0.25f, 0.25f, 0.040f, 1.0f },   // w0 -> hits cloth 0's triangle A (dist 0.04)
+        {  0.00f, 0.00f, 0.500f, 1.0f },   // w1 (triangle B)
+        {  1.00f, 0.00f, 0.500f, 1.0f },   // w2 (triangle B)
+        {  0.00f, 1.00f, 0.500f, 1.0f },   // w3 (triangle B)
+    };
+    std::vector<TriIdx4> tris1 = { { 1u, 2u, 3u, 0x7u } };
+
+    std::vector<uint32_t> tree0 = makeBv32TreeWords(/*nbTriangles*/ 1u, -1000.0f, 1000.0f);
+    std::vector<uint32_t> tree1 = makeBv32TreeWords(/*nbTriangles*/ 1u, -1000.0f, 1000.0f);
+
+    DevBuf bPos0 = makeDev(dev, pos0), bTri0 = makeDev(dev, tris0), bTree0 = makeDev(dev, tree0);
+    DevBuf bPos1 = makeDev(dev, pos1), bTri1 = makeDev(dev, tris1), bTree1 = makeDev(dev, tree1);
+    if (!bPos0.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgFEMCloth c0 = makeZeroDesc();
+    c0.mTriMeshData = reinterpret_cast<void*>(size_t(bTree0.addr));
+    c0.mPosition_InvMass = reinterpret_cast<decltype(c0.mPosition_InvMass)>(size_t(bPos0.addr));
+    c0.mTriangleVertexIndices = reinterpret_cast<decltype(c0.mTriangleVertexIndices)>(size_t(bTri0.addr));
+    c0.mNbVerts = uint32_t(pos0.size());
+    c0.mElementIndex = 0u;   // unused on this path (contactDist comes from the cache refs)
+
+    PxgFEMCloth c1 = makeZeroDesc();
+    c1.mTriMeshData = reinterpret_cast<void*>(size_t(bTree1.addr));
+    c1.mPosition_InvMass = reinterpret_cast<decltype(c1.mPosition_InvMass)>(size_t(bPos1.addr));
+    c1.mTriangleVertexIndices = reinterpret_cast<decltype(c1.mTriangleVertexIndices)>(size_t(bTri1.addr));
+    c1.mNbVerts = uint32_t(pos1.size());
+    c1.mElementIndex = 1u;
+    // mRestPosition stays NULL: the different-cloth call has no rest-pose filter.
+
+    std::vector<PxgFEMCloth> descArr = { c0, c1 };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<PxgShapeHost> shapes = { makeClothShape(0u), makeClothShape(1u) };
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<CmInputHost> cms = { { 0u, 1u, 0u, 1u } };   // shapeRef0/1 = 0/1, cacheRef0/1 = 0/1
+    DevBuf bCm = makeDev(dev, cms);
+    std::vector<float> cd = { CD0, CD1 };
+    DevBuf bCd = makeDev(dev, cd);
+    std::vector<uint32_t> upd = { 1u };
+    DevBuf bUpd = makeDev(dev, upd);
+
+    const uint32_t MAXC = 64u;
+    std::vector<FemFemContactInfoHost> outInfo(MAXC);
+    std::memset(outInfo.data(), 0xAB, outInfo.size() * sizeof(FemFemContactInfoHost));   // poison
+    DevBuf bOut = makeDev(dev, outInfo);
+    std::vector<uint32_t> count = { 0u };
+    DevBuf bCount = makeDev(dev, count);
+
+    DifferentClothPush push = {};
+    push.maxContacts = MAXC;
+    push.toleranceLength = 1.0f;
+    push.cmInputs = bCm.addr;
+    push.transformCache = 0ull;      // unused (ABI parity)
+    push.contactDistance = bCd.addr;
+    push.gpuShapes = bShapes.addr;
+    push.femClothes = bDesc.addr;
+    push.clothClothPairs = 0ull;     // unused (ABI parity)
+    push.numClothClothPairs = 0u;
+    push.updateContactPairs = bUpd.addr;
+    push.outContactInfo = bOut.addr;
+    push.totalContactCount = bCount.addr;
+
+    Kernel k("femClothDifferentClothBda.spv", "cloth_differentClothCollisionVTLaunch", {},
+             sizeof(DifferentClothPush));
+    // GRID MIRRORS THE ENGINE: numBlocks = ceil(2*maxClothVerts / MIDPHASE_WARPS_PER_BLOCK),
+    // gridY = numTests (PxgFEMClothCore.cpp:790).  maxClothVerts = 5 -> 5 blocks, covering
+    // globalWarpIdx 0..9 against numQueries = 5 + 4 = 9.  Handing the shader a per-query grid
+    // instead would hide exactly the half-coverage bug the self-collision port shipped with.
+    const uint32_t maxClothVerts = uint32_t(pos0.size() > pos1.size() ? pos0.size() : pos1.size());
+    const uint32_t gridVT = (2u * maxClothVerts + 1u) / 2u;
+    k.dispatch(gridVT, {}, push, /*gridY numTests*/ 1u, 1u);
+    dev->flush();
+
+    // ---- CPU reference: the full bidirectional sweep, predicate for predicate ----
+    auto v3f = [](const F4& f) { return V3{ f.x, f.y, f.z }; };
+    std::vector<FemFemContactInfoHost> ref;
+    for (uint32_t q = 0; q < uint32_t(pos0.size() + pos1.size()); ++q)
+    {
+        const bool isCloth0 = q < uint32_t(pos0.size());
+        const uint32_t vertexIdx = isCloth0 ? q : q - uint32_t(pos0.size());
+        const uint32_t myId = isCloth0 ? 0u : 1u, otherId = isCloth0 ? 1u : 0u;
+        const std::vector<F4>& myPos = isCloth0 ? pos0 : pos1;
+        const std::vector<F4>& otherPos = isCloth0 ? pos1 : pos0;
+        const std::vector<TriIdx4>& otherTris = isCloth0 ? tris1 : tris0;
+        const V3 vtx = v3f(myPos[vertexIdx]);
+        for (uint32_t p = 0; p < uint32_t(otherTris.size()); ++p)
+        {
+            const TriIdx4& tri = otherTris[p];
+            const bool vtInTri = (vertexIdx == tri.x) || (vertexIdx == tri.y) || (vertexIdx == tri.z);
+            if (!((myId != otherId) || !vtInTri)) continue;   // the skip that is DEAD here
+            const V3 x1 = v3f(otherPos[tri.x]), x2 = v3f(otherPos[tri.y]), x3 = v3f(otherPos[tri.z]);
+            const V3 fat{ contactDist, contactDist, contactDist };
+            const V3 bMin = p72ref::sub(p72ref::vmin(p72ref::vmin(x1, x2), x3), fat);
+            const V3 bMax = p72ref::add(p72ref::vmax(p72ref::vmax(x1, x2), x3), fat);
+            if (vtx.x < bMin.x || vtx.x > bMax.x || vtx.y < bMin.y || vtx.y > bMax.y ||
+                vtx.z < bMin.z || vtx.z > bMax.z) continue;
+            float s, t;
+            const V3 cp = p72ref::closestPtPointTriangle(vtx, x1, x2, x3, s, t);
+            const V3 dir = p72ref::sub(vtx, cp);
+            const float dq = p72ref::dot(dir, dir);
+            if (!(dq < contactDistSq && dq > 1.0e-14f)) continue;
+            ref.push_back(FemFemContactInfoHost{ (uint64_t(myId) << 20) | vertexIdx,
+                                                 (otherId << 20) | p, VALID_H });
+        }
+    }
+    PXG_CHECK_MSG(ref.size() == 2u, "reference: expected 2 bidirectional VT contacts, got %zu", ref.size());
+    // Pin what each of the two IS, so a reference that drifts with the shader is caught.
+    PXG_CHECK_MSG(ref[0].pairInd0 == 4ull && ref[0].pairInd1 == (1u << 20),
+                  "reference[0] must be cloth0 vertex 4 vs cloth1 triangle 0");
+    PXG_CHECK_MSG(ref[1].pairInd0 == (1ull << 20) && ref[1].pairInd1 == 0u,
+                  "reference[1] must be cloth1 vertex 0 vs cloth0 triangle 0 (the corner-index case)");
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+    PXG_CHECK_MSG(gCount == uint32_t(ref.size()), "different-cloth VT emitted %u contacts (expected %zu)",
+                  gCount, ref.size());
+    const auto got = downloadBuffer<FemFemContactInfoHost>(dev, bOut.h, gCount ? gCount : 1u);
+    const size_t mm = compareSets(std::vector<FemFemContactInfoHost>(got.begin(), got.begin() + gCount),
+                                  ref, "VT");
+    PXG_CHECK_MSG(mm == 0, "cloth_differentClothCollisionVT bit-exact vs CPU (%zu mismatches)", mm);
+
+    // ---- *updateContactPairs == 0 -> the whole launch is a no-op ----
+    std::vector<uint32_t> upd0 = { 0u };
+    DevBuf bUpd0 = makeDev(dev, upd0);
+    std::vector<uint32_t> count0 = { 0u };
+    DevBuf bCount0 = makeDev(dev, count0);
+    DifferentClothPush pushOff = push;
+    pushOff.updateContactPairs = bUpd0.addr;
+    pushOff.totalContactCount = bCount0.addr;
+    k.dispatch(gridVT, {}, pushOff, 1u, 1u);
+    dev->flush();
+    PXG_CHECK_MSG(downloadBuffer<uint32_t>(dev, bCount0.h, 1)[0] == 0u,
+                  "different-cloth VT must early-exit when updateContactPairs is 0");
+
+    for (PxgBufferHandle h : { bPos0.h, bTri0.h, bTree0.h, bPos1.h, bTri1.h, bTree1.h, bDesc.h,
+                               bShapes.h, bCm.h, bCd.h, bUpd.h, bOut.h, bCount.h, bUpd0.h, bCount0.h })
+        dev->destroyBuffer(h);
+}
+
+// ---------------------------------------------------------------------------
+// cloth_differentClothCollisionEELaunch — the SMALLER cloth drives, both pair orders.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimDifferentClothEE)
+{
+    using namespace p816dc;
+    using p72ref::V3;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // contactDist = 0.06 + 0.04 = 0.10.  The threshold is chosen against the two crossings'
+    // ACTUAL distSq values (0.006791 and 0.004851) rather than their geometric separation:
+    // closestPtLineLine normalizes b0/b1 by DIFFERENT edge lengths (deformableCollision.cuh:244),
+    // so its distSq is not the true minimum distance between the segments.  Halving to
+    // 2*CD1 = 0.08 drops the first crossing -- which is what makes the summed contact distance
+    // observable here.
+    const float CD0 = 0.06f, CD1 = 0.04f;
+    const float contactDist = CD0 + CD1;              // 0.10
+    const float contactDistSq = contactDist * contactDist;
+
+    // Cloth 0 (ONE triangle-with-active-edges -> always the query side): edge0 is the x-axis
+    // segment at y=z=0; the other two edges dive to z=-1.
+    std::vector<F4> pos0 = {
+        { -0.5f, 0.0f,  0.0f, 1.0f },
+        {  0.5f, 0.0f,  0.0f, 1.0f },
+        {  0.0f, 0.0f, -1.0f, 1.0f },
+    };
+    std::vector<TriIdx4> tris0 = { { 0u, 1u, 2u, 0x7u } };
+    std::vector<uint32_t> twae0 = { 0u };
+
+    // Cloth 1 (TWO triangles-with-active-edges, so it is never the query side):
+    //   tri 0 far away -- proves the leaf walk covers more than one primitive;
+    //   tri 1 at z=0.03 -- its edges 0 and 2 both cross cloth 0's edge0, and BOTH land on the
+    //     same lane, so this is also the multi-element write loop's coverage.  Its vertex
+    //     indices are 0/1/2, IDENTICAL to cloth 0's triangle, so a mutant that keeps the self
+    //     path's connected-edge skip drops both crossings.  z=0.03 is beyond cloth 0's RAW
+    //     bounds (z-max 0), so it also pins the t0_bounds fattening.
+    //
+    // The crossing triangle is primitive ONE, not zero, on purpose.  Cloth 0's tree holds a
+    // single primitive, so a mutant that walks the QUERY cloth's tree instead of the other
+    // one still visits index 0 -- and with the crossing triangle at index 0 it reads exactly
+    // the right triangle and SURVIVES.  Putting the crossing at index 1 makes the wrong tree
+    // find the far triangle instead.
+    std::vector<F4> pos1 = {
+        {  0.0f,  0.3f, 0.030f, 1.0f },
+        {  0.2f, -0.3f, 0.030f, 1.0f },
+        { -0.2f, -0.3f, 0.030f, 1.0f },
+        { 10.0f, 10.0f, 10.0f,  1.0f },
+        { 11.0f, 10.0f, 10.0f,  1.0f },
+        { 10.0f, 11.0f, 10.0f,  1.0f },
+    };
+    std::vector<TriIdx4> tris1 = { { 3u, 4u, 5u, 0x7u }, { 0u, 1u, 2u, 0x7u } };
+    std::vector<uint32_t> twae1 = { 0u, 1u };
+
+    std::vector<uint32_t> tree0 = makeBv32TreeWords(/*nbTriangles*/ 1u, -1000.0f, 1000.0f);
+    std::vector<uint32_t> tree1 = makeBv32TreeWords(/*nbTriangles*/ 2u, -1000.0f, 1000.0f);
+
+    DevBuf bPos0 = makeDev(dev, pos0), bTri0 = makeDev(dev, tris0), bTwae0 = makeDev(dev, twae0),
+           bTree0 = makeDev(dev, tree0);
+    DevBuf bPos1 = makeDev(dev, pos1), bTri1 = makeDev(dev, tris1), bTwae1 = makeDev(dev, twae1),
+           bTree1 = makeDev(dev, tree1);
+    if (!bPos0.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgFEMCloth c0 = makeZeroDesc();
+    c0.mTriMeshData = reinterpret_cast<void*>(size_t(bTree0.addr));
+    c0.mPosition_InvMass = reinterpret_cast<decltype(c0.mPosition_InvMass)>(size_t(bPos0.addr));
+    c0.mTriangleVertexIndices = reinterpret_cast<decltype(c0.mTriangleVertexIndices)>(size_t(bTri0.addr));
+    c0.mTrianglesWithActiveEdges = reinterpret_cast<decltype(c0.mTrianglesWithActiveEdges)>(size_t(bTwae0.addr));
+    c0.mNbTrianglesWithActiveEdges = uint32_t(twae0.size());
+    c0.mElementIndex = 0u;
+
+    PxgFEMCloth c1 = makeZeroDesc();
+    c1.mTriMeshData = reinterpret_cast<void*>(size_t(bTree1.addr));
+    c1.mPosition_InvMass = reinterpret_cast<decltype(c1.mPosition_InvMass)>(size_t(bPos1.addr));
+    c1.mTriangleVertexIndices = reinterpret_cast<decltype(c1.mTriangleVertexIndices)>(size_t(bTri1.addr));
+    c1.mTrianglesWithActiveEdges = reinterpret_cast<decltype(c1.mTrianglesWithActiveEdges)>(size_t(bTwae1.addr));
+    c1.mNbTrianglesWithActiveEdges = uint32_t(twae1.size());
+    c1.mElementIndex = 1u;
+
+    std::vector<PxgFEMCloth> descArr = { c0, c1 };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<PxgShapeHost> shapes = { makeClothShape(0u), makeClothShape(1u) };
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<float> cd = { CD0, CD1 };
+    DevBuf bCd = makeDev(dev, cd);
+    std::vector<uint32_t> upd = { 1u };
+    DevBuf bUpd = makeDev(dev, upd);
+
+    const uint32_t MAXC = 64u;
+    std::vector<FemFemContactInfoHost> outInfo(MAXC);
+    std::memset(outInfo.data(), 0xAB, outInfo.size() * sizeof(FemFemContactInfoHost));
+    DevBuf bOut = makeDev(dev, outInfo);
+
+    // ---- CPU reference: the 3x3 edge loop, query = cloth 0's triangle 0 ----
+    auto v3f = [](const F4& f) { return V3{ f.x, f.y, f.z }; };
+    const uint32_t nextE[3] = { 1u, 2u, 0u };
+    const uint32_t vIndices0[3] = { tris0[0].x, tris0[0].y, tris0[0].z };
+    const V3 t0pts[3] = { v3f(pos0[vIndices0[0]]), v3f(pos0[vIndices0[1]]), v3f(pos0[vIndices0[2]]) };
+    const V3 t0min = p72ref::sub(p72ref::vmin(p72ref::vmin(t0pts[0], t0pts[1]), t0pts[2]),
+                                 V3{ contactDist, contactDist, contactDist });
+    const V3 t0max = p72ref::add(p72ref::vmax(p72ref::vmax(t0pts[0], t0pts[1]), t0pts[2]),
+                                 V3{ contactDist, contactDist, contactDist });
+    std::vector<FemFemContactInfoHost> ref;
+    for (uint32_t p = 0; p < uint32_t(tris1.size()); ++p)
+    {
+        const uint32_t vIndices1[3] = { tris1[p].x, tris1[p].y, tris1[p].z };
+        const V3 t1pts[3] = { v3f(pos1[vIndices1[0]]), v3f(pos1[vIndices1[1]]), v3f(pos1[vIndices1[2]]) };
+        const V3 t1min = p72ref::vmin(p72ref::vmin(t1pts[0], t1pts[1]), t1pts[2]);
+        const V3 t1max = p72ref::vmax(p72ref::vmax(t1pts[0], t1pts[1]), t1pts[2]);
+        if (t1min.x > t0max.x || t0min.x > t1max.x || t1min.y > t0max.y || t0min.y > t1max.y ||
+            t1min.z > t0max.z || t0min.z > t1max.z) continue;
+        for (uint32_t e1 = 0; e1 < 3; ++e1)
+        {
+            const V3 e1x0 = t1pts[e1], e1x1 = t1pts[nextE[e1]];
+            for (uint32_t e0 = 0; e0 < 3; ++e0)
+            {
+                // The connected-edge skip is gated on clothId0 == clothId1 and is DEAD here,
+                // even though cloth 1's triangle 0 reuses cloth 0's vertex indices.
+                const V3 e0x0 = t0pts[e0], e0x1 = t0pts[nextE[e0]];
+                float s, t, dq;
+                p72ref::closestPtLineLine(e0x0, e0x1, e1x0, e1x1, s, t, dq);
+                if ((s < p72ref::BARY_THR) || (s > p72ref::ONE_MINUS_BARY_THR) ||
+                    (t < p72ref::BARY_THR) || (t > p72ref::ONE_MINUS_BARY_THR)) continue;
+                if (!(dq < contactDistSq && dq > 1.0e-14f)) continue;
+                uint32_t aux = PAIR_TYPE_FLAG_MASK_H | VALID_H;
+                aux = (aux & ~AUX_IND0_MASK_H) | (e0 & AUX_IND0_MASK_H);
+                aux = (aux & ~AUX_IND1_MASK_H) | ((e1 & ((1u << AUX_IND1_BITS_H) - 1u)) << AUX_IND0_BITS_H);
+                ref.push_back(FemFemContactInfoHost{ 0ull /*encode(cloth 0, triangle 0)*/,
+                                                     (1u << 20) | p, aux });
+            }
+        }
+    }
+    PXG_CHECK_MSG(ref.size() == 2u, "reference: expected 2 EE crossings against cloth 1's triangle 1, got %zu",
+                  ref.size());
+    PXG_CHECK_MSG(ref[0].pairInd0 == 0ull && ref[0].pairInd1 == ((1u << 20) | 1u),
+                  "reference: the crossings must be cloth0 triangle 0 vs cloth1 PRIMITIVE 1");
+
+    // GRID MIRRORS THE ENGINE: ceil(maxClothTrianglesWithActiveEdges / 2) x numTests.
+    const uint32_t maxTwae = uint32_t(twae0.size() > twae1.size() ? twae0.size() : twae1.size());
+    const uint32_t gridEE = (maxTwae + 1u) / 2u;
+    Kernel k("femClothDifferentClothBda.spv", "cloth_differentClothCollisionEELaunch", {},
+             sizeof(DifferentClothPush));
+
+    // Two dispatches with the pair order SWAPPED.  `isCloth0 = numTri0 <= numTri1` makes the
+    // smaller cloth drive either way, so both must produce the identical contact set -- which
+    // is what proves the branchless id select in its mask == 1 branch.
+    for (uint32_t swapped = 0; swapped < 2u; ++swapped)
+    {
+        std::vector<CmInputHost> cms = swapped ? std::vector<CmInputHost>{ { 1u, 0u, 1u, 0u } }
+                                               : std::vector<CmInputHost>{ { 0u, 1u, 0u, 1u } };
+        DevBuf bCm = makeDev(dev, cms);
+        std::vector<uint32_t> count = { 0u };
+        DevBuf bCount = makeDev(dev, count);
+
+        DifferentClothPush push = {};
+        push.maxContacts = MAXC;
+        push.toleranceLength = 1.0f;
+        push.cmInputs = bCm.addr;
+        push.contactDistance = bCd.addr;
+        push.gpuShapes = bShapes.addr;
+        push.femClothes = bDesc.addr;
+        push.updateContactPairs = bUpd.addr;
+        push.outContactInfo = bOut.addr;
+        push.totalContactCount = bCount.addr;
+
+        k.dispatch(gridEE, {}, push, /*gridY numTests*/ 1u, 1u);
+        dev->flush();
+
+        const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+        PXG_CHECK_MSG(gCount == uint32_t(ref.size()),
+                      "different-cloth EE (%s pair order) emitted %u contacts (expected %zu)",
+                      swapped ? "swapped" : "natural", gCount, ref.size());
+        const auto got = downloadBuffer<FemFemContactInfoHost>(dev, bOut.h, gCount ? gCount : 1u);
+        const size_t mm = compareSets(std::vector<FemFemContactInfoHost>(got.begin(), got.begin() + gCount),
+                                      ref, swapped ? "EE(swap)" : "EE");
+        PXG_CHECK_MSG(mm == 0, "cloth_differentClothCollisionEE (%s pair order) bit-exact vs CPU (%zu mismatches)",
+                      swapped ? "swapped" : "natural", mm);
+
+        dev->destroyBuffer(bCm.h); dev->destroyBuffer(bCount.h);
+    }
+
+    for (PxgBufferHandle h : { bPos0.h, bTri0.h, bTwae0.h, bTree0.h, bPos1.h, bTri1.h, bTwae1.h,
+                               bTree1.h, bDesc.h, bShapes.h, bCd.h, bUpd.h, bOut.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace

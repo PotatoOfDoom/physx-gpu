@@ -1620,6 +1620,115 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.16 — cloth-vs-DIFFERENT-cloth: the two kernels P8.14 scouted, and the scene that proves them
+
+`cloth_differentClothCollisionVTLaunch` + `cloth_differentClothCollisionEELaunch`, on the engine
+BDA ABI. **Manifest 252 → 254.** New shader `femClothDifferentClothBda.slang`, importing the
+`pxgSlangClothMidphase` module P8.15 extracted for exactly this second consumer.
+
+**The blob is NOT the self-collision one.** That was the first thing P8.14 had to establish and
+it is worth repeating here, because the two kernels look like the same family:
+
+| | self-collision | different-cloth |
+|---|---|---|
+| ABI row | `{4,8,8,8,8,4,8,8,8}` (72 B) | `{4,4,8,8,8,8,8,8,4,8,8,8}` (88 B) |
+| where the cloth ids come from | `activeClothes[blockIdx.y]` | `cmInputs[blockIdx.y]` → two `PxgShape::particleOrSoftbodyId` |
+| contact distance | `contactDistance[elementIndex] * 2` | `contactDistance[cacheRef0] + contactDistance[cacheRef1]` |
+| `eDISABLE_SELF_COLLISION` | checked | not checked — that flag gates self-collision only |
+| carries `toleranceLength` | no | yes (stored, never read) |
+
+**The five differences, and what each costs if you transcribe the self path instead.** The two
+traversers are the SAME C++ structs (`ClothTreeVertexTraverser` / `ClothTreeEdgeTraverser`), so
+the leaf and box callbacks are the proven `femClothSelfCollisionBda` transcriptions. What differs
+is everything around them:
+
+1. **The pair is narrowphase-driven** (above).
+2. **The contact distance is a SUM**, not one reference doubled.
+3. **VT sweeps BOTH directions in one launch**: `globalWarpIdx < numVerts0 + numVerts1`, the
+   first `numVerts0` warps querying cloth0's vertices against cloth1's tree and the rest the
+   mirror. EE runs only `min(numTri0, numTri1)` queries with the SMALLER cloth (by
+   triangles-with-active-edges) always driving — `isCloth0 = numTri0 <= numTri1`. Both use the
+   branchless id select the CUDA writes verbatim (`mask * (id1 - id0) + id0`).
+4. **Every `clothId0 != clothId1` guard is live and TRUE**, so the self path's three skips are
+   all disabled: the VT vertex-is-a-corner-of-the-triangle test, the EE `t0_index > primitiveIndex`
+   half-pair dedup, and the EE connected-edge test. The corollary is
+   `markValidity(clothId0 != clothId1)` → **VALID**: a different-cloth pair is final at the
+   midphase, where a self pair is re-checked in `cloth_clothContactPrepareLaunch`.
+5. **The rest-pose filter is GONE.** The call sites pass NULL for both rest buffers and `0.0f`
+   for `filterDistSq` (`femClothClothMidPhase.cu:1298-1300`, `:1370-1371`); `distSqInRestPose`
+   returns `PX_MAX_REAL` for a null first argument (`:662-668`), so `tempRestDistSq > filterDistSq`
+   is unconditionally true. Transcribing the self-collision lookup here would **dereference a null
+   device pointer** — omitting the block is what the CUDA collapses to, not a deviation from it.
+   This is the reason P8.15 deliberately left the rest-pose helpers out of the shared module.
+
+**The fixtures, and the two survivors that made them sharper.** 18 mutants, 16 killed on the
+first sweep. Both survivors were fixture weaknesses, not port defects, and both are the same
+kind of mistake — a scene symmetric enough that the mutant lands back on the right answer:
+
+* **`selMask` inverted** (the VT branchless select). It swaps which half of the query range is
+  which cloth — but with the penetrating probe at vertex index 3, *both* arrangements cover index
+  3, and because the select swaps `my`/`other` consistently the emitted ids come out **identical**.
+  Fix: cloth 0 has five vertices and cloth 1 four, so moving the probe to index **4** makes the
+  two halves cover different index sets, and the mutant drops the contact.
+* **the EE query walking its OWN tree** instead of the other cloth's. Cloth 0's tree holds a
+  single primitive, so the mutant still visits index 0 — and with the crossing triangle at
+  cloth 1's index 0 it read exactly the right triangle. Fix: move the crossing triangle to
+  primitive **1**, so the wrong tree finds the far triangle instead.
+
+Both then died. The remaining 16 cover: the corner skip folded the self way, both halves of the
+contact-distance sum (`2*cd[ref0]` and `2*cd[ref1]`), `markValidity` on both entry points, the VT
+range truncated to `numVerts0`, the second half's `vertexIdx` not rebased, the
+`updateContactPairs` early exit, `pairInd1` encoded with the wrong cloth id, the EE half-pair
+dedup and connected-edge skip folded the self way, `isCloth0`'s comparison flipped, the
+`t0_bounds` fattening dropped, the pair-type bit dropped, `auxInd0`/`auxInd1` swapped, and the
+sub-warp loop truncated to one warp.
+
+One deliberate note on the EE fixture's threshold: it is chosen against the two crossings'
+**actual** `distSq` (0.006791 and 0.004851), not their geometric separation.
+`closestPtLineLine` normalizes `b0`/`b1` by DIFFERENT edge lengths
+(`deformableCollision.cuh:244`), so what it returns is not the true minimum distance between the
+two segments. The first attempt picked the threshold from the geometry and found one crossing
+where it expected two.
+
+**`PXG_SCENE=clothcloth` — the scene, and a decisive control.** Two separate
+`PxDeformableSurface` actors: a fully PINNED lower sheet acting as a cloth table, and a FREE
+upper sheet dropped onto it from 0.30 above. Both are built from the **same recipe** — same
+material, thickness, contact and rest offsets, same grid spacing — because P8.8 spent a whole
+tranche chasing what turned out to be a mass ratio, and a shared recipe removes that confound by
+construction. Self-collision is **disabled on both** (`eDISABLE_SELF_COLLISION`), which makes
+`cloth_selfCollisionMidphase{VT,EE}` early-exit, and there is no rigid body underneath — so the
+two new kernels are the only midphase that can see the pair.
+
+```
+with the port:      final upper sheet min y = 5.1000  (mean 5.1002), table y = 5.00
+kernels unmapped:   final upper sheet min y = -38.9756 (mean -38.9756)
+```
+
+The control is the manifest rows reverted to `nullptr`, which makes the Vulkan bridge refuse the
+dispatch. The sheet settles exactly on the contact rest distance (table + 2 × restOffset = 5.10)
+with the port, and falls forty units through the table without it.
+
+The downstream solve is unchanged: `cloth_clothContactPrepareLaunch` → query →
+`cloth_solveClothClothDelta{VT,EE}`, the same chain the self path uses, ported at P7.2 tranche 2
+— its header already recorded that "the different-cloth pairs flow through the identical generic
+arithmetic", and this scene is the first thing to actually exercise that claim.
+
+**Pre-existing and out of scope:** the scene prints `radixSortCopy` / `radixSortCopyBits` /
+`clampMaxValues` launch failures from `PxgFEMClothCore.cpp`. `PXG_SCENE=clothselfcollide` prints
+the same three, so they are not introduced here — they are unmapped kernels in the cloth contact
+SORT, which no cloth scene has needed yet.
+
+**Verification:** forced-fresh `.spv` (both `femClothDifferentClothBda` and
+`femClothSelfCollisionBda`, since the shared module changed consumers), suite through
+`tools/run_suite.sh` — **674/674 in both memory modes** (the two new fixtures live inside the
+existing `gpuslang.femClothSim` ctest entry, which went 43 → 45); rigid
+regression green; `clothcloth` green with the control red; `clothselfcollide` PGS min y **5.0999**
+/ mean 5.1106 and TGS 5.1000 / 5.1104, both on baseline; `cloth`, `clothdrape`, `clothhang` green.
+
+Next from the P8.14 ranking: cloth-vs-cooked-trimesh (`cloth_meshMidphaseGeneratePairsLaunch` +
+`cloth_meshContactGenLaunch` — and its arg pack is **not** `kSbMeshContactGen`'s), then FEM-FEM
+attachments, then `sb_heightfieldContactGenLaunch` (P8.11 step 2).
+
 ## P8.15 — `pxgSlangClothMidphase`: the shared cloth-midphase machinery, extracted before it got duplicated
 
 Groundwork for cloth-vs-different-cloth, done as its own step so it can be proved

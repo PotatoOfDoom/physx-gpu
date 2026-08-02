@@ -1146,6 +1146,191 @@ bool clothTopMinMeanY(const ClothSelfScene& csc, float& minY, float& meanY)
 }
 
 // ===========================================================================
+// PXG_SCENE=clothcloth (P8.16): the cloth-vs-DIFFERENT-cloth money shot.
+//
+// TWO separate PxDeformableSurface actors, not one folded sheet: a fully PINNED lower sheet
+// (invMass 0 everywhere) acting as a cloth table, and a FREE upper sheet dropped onto it from
+// dropH above.  Both are built from the SAME recipe -- same material, thickness, contact and
+// rest offsets, same grid spacing -- so the only asymmetry is the inverse mass and the inset
+// footprint.  That matters: P8.8's softbody-vs-cloth scene spent a whole tranche chasing what
+// turned out to be a MASS RATIO, and a shared recipe removes that confound by construction.
+//
+// SELF-collision is DISABLED on both sheets (eDISABLE_SELF_COLLISION), which makes
+// cloth_selfCollisionMidphase{VT,EE} early-exit.  A flat sheet cannot fold onto itself anyway,
+// but disabling it means the ONLY midphase that can produce a contact between the two sheets is
+// cloth_differentClothCollision{VT,EE} -- and there is no rigid body under the upper sheet
+// either.  With those two kernels the upper sheet lands on the lower one; without them it falls
+// straight through.  The downstream solve (cloth_clothContactPrepare -> query ->
+// cloth_solveClothClothDelta{VT,EE}) is the SAME chain the self path already uses, ported at
+// P7.2 tranche 2 -- the different-cloth pairs flow through its generic arithmetic.
+//
+// PXG_CC_PINNED=0 makes the lower sheet free too (both fall), which is the frozen-sim guard's
+// counterpart rather than a physics control.
+// ===========================================================================
+struct ClothClothScene
+{
+    PxDeformableSurface* lower = nullptr;   // the pinned cloth "table"
+    PxDeformableSurface* upper = nullptr;   // the free sheet — the observable
+    PxU32 numUpperVerts = 0;
+    PxCudaContextManager* cudaCtx = nullptr;
+    float baseY = 0.0f;
+};
+
+// One flat cloth sheet: numX x numZ grid over lenX x lenZ centred on (0, y, 0), every vertex
+// given the same inverse mass.  Returns null on any cooking/creation failure.
+static PxDeformableSurface* buildFlatClothSheet(PxPhysics* physics, PxScene* scene,
+                                                PxCudaContextManager* cudaCtx, PxU32 numX, PxU32 numZ,
+                                                float lenX, float lenZ, float y, float invMass,
+                                                PxU32& nvOut)
+{
+    nvOut = 0;
+    const float dx = lenX / float(numX - 1);
+    const float dz = lenZ / float(numZ - 1);
+    auto vid = [numZ](PxU32 c, PxU32 r) { return c * numZ + r; };
+
+    std::vector<PxVec3> verts;
+    verts.reserve(numX * numZ);
+    for (PxU32 c = 0; c < numX; ++c)
+        for (PxU32 r = 0; r < numZ; ++r)
+            verts.push_back(PxVec3(float(c) * dx - 0.5f * lenX, y, float(r) * dz - 0.5f * lenZ));
+
+    std::vector<PxU32> tris;
+    tris.reserve(3 * 2 * (numX - 1) * (numZ - 1));
+    for (PxU32 c = 1; c < numX; ++c)
+        for (PxU32 r = 1; r < numZ; ++r)
+        {
+            tris.push_back(vid(c - 1, r - 1)); tris.push_back(vid(c, r - 1)); tris.push_back(vid(c - 1, r));
+            tris.push_back(vid(c - 1, r));     tris.push_back(vid(c, r - 1)); tris.push_back(vid(c, r));
+        }
+
+    PxTriangleMeshDesc meshDesc;
+    meshDesc.points.count = PxU32(verts.size());
+    meshDesc.points.stride = sizeof(PxVec3);
+    meshDesc.points.data = verts.data();
+    meshDesc.triangles.count = PxU32(tris.size() / 3);
+    meshDesc.triangles.stride = 3 * sizeof(PxU32);
+    meshDesc.triangles.data = tris.data();
+
+    PxCookingParams ckParams(physics->getTolerancesScale());
+    ckParams.buildGPUData = true;
+    ckParams.meshPreprocessParams |= PxMeshPreprocessingFlag::eENABLE_VERT_MAPPING;
+
+    PxTriangleMesh* triMesh =
+        immediateCooking::createTriangleMesh(ckParams, meshDesc, physics->getPhysicsInsertionCallback());
+    if (!triMesh) { std::printf("FAIL: clothcloth createTriangleMesh returned null\n"); return nullptr; }
+
+    // Identical recipe for both sheets — see the scene comment on why that is deliberate.
+    PxDeformableSurfaceMaterial* clothMat =
+        physics->createDeformableSurfaceMaterial(/*youngs*/ 1.e6f, /*poissons*/ 0.3f,
+            /*dynamicFriction*/ 0.5f, /*thickness*/ 0.1f, /*bendingStiffness*/ 1.e-4f);
+    PxDeformableSurfaceMaterial* mats[1] = { clothMat };
+
+    PxShapeFlags shapeFlags = PxShapeFlag::eSIMULATION_SHAPE | PxShapeFlag::eSCENE_QUERY_SHAPE;
+    PxShape* shape = physics->createShape(PxTriangleMeshGeometry(triMesh), mats, PxU16(1), true, shapeFlags);
+    if (!shape) { std::printf("FAIL: clothcloth createShape returned null\n"); return nullptr; }
+    shape->setContactOffset(0.1f);
+    // The rest offset is what the contact query actually measures against
+    // (cloth0->mRestDistance + cloth1->mRestDistance, FEMClothExternalSolve.cu:870), so the two
+    // sheets settle 0.10 apart — the same band clothselfcollide's two layers settle to.
+    shape->setRestOffset(0.05f);
+
+    PxDeformableSurface* surface = physics->createDeformableSurface(*cudaCtx);
+    if (!surface) { std::printf("FAIL: clothcloth createDeformableSurface returned null\n"); return nullptr; }
+
+    surface->setNbCollisionPairUpdatesPerTimestep(4);
+    surface->setNbCollisionSubsteps(8);
+    surface->setLinearDamping(0.2f);
+    surface->setMaxLinearVelocity(1.0e6f);
+    // SELF-collision off on both sheets: a flat sheet has nothing to fold onto, and switching it
+    // off leaves cloth_differentClothCollision{VT,EE} as the only midphase that can see the pair.
+    surface->setDeformableBodyFlag(PxDeformableBodyFlag::eDISABLE_SELF_COLLISION, true);
+    // A fully pinned sheet has zero velocity forever; without this it can be put to sleep and
+    // stop producing the contact-manager pair the free sheet needs.
+    surface->setSleepThreshold(0.0f);
+    surface->attachShape(*shape);
+    shape->release();
+
+    scene->addActor(*surface);
+
+    const PxU32 nv = PxU32(verts.size());
+    std::vector<PxVec4> posInvMass(nv), vel(nv, PxVec4(0.0f)), rest(nv);
+    for (PxU32 v = 0; v < nv; ++v)
+    {
+        posInvMass[v] = PxVec4(verts[v].x, verts[v].y, verts[v].z, invMass);
+        rest[v]       = PxVec4(verts[v].x, verts[v].y, verts[v].z, invMass);
+    }
+
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getPositionInvMassBufferD()),
+                    posInvMass.data(), nv * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getVelocityBufferD()),
+                    vel.data(), nv * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getRestPositionBufferD()),
+                    rest.data(), nv * sizeof(PxVec4));
+
+    nvOut = nv;
+    return surface;
+}
+
+ClothClothScene buildClothClothScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
+                                     PxCudaContextManager* cudaCtx)
+{
+    ClothClothScene out;
+    out.cudaCtx = cudaCtx;
+
+    // A live dynamic rigid FAR from the cloths keeps the rigid PGS island non-empty (the cloth
+    // solve runs inside it), exactly as every other cloth scene does.
+    addGroundBox(physics, scene, rigidMat);
+    addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+               boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+
+    const float baseY = 5.0f;
+    const char* dropEnv = std::getenv("PXG_CC_DROP");
+    const float dropH = dropEnv ? float(atof(dropEnv)) : 0.30f;
+    const char* pinEnv = std::getenv("PXG_CC_PINNED");
+    const float lowerInvMass = (pinEnv && pinEnv[0] == '0') ? 1.0f : 0.0f;
+    out.baseY = baseY;
+
+    const PxU32 numX = 8u, numZ = 5u;
+    // The upper sheet's footprint is INSET, the way a real sheet resting on a table is smaller
+    // than the table.  With identical footprints the upper sheet's border vertices sit exactly on
+    // the lower one's outer edge with no triangle beneath them and droop through — correct cloth
+    // behaviour that would otherwise read as a broken hold (clothselfcollide records the same).
+    const float inset = 0.9f;
+    PxU32 nvLower = 0, nvUpper = 0;
+    out.lower = buildFlatClothSheet(physics, scene, cudaCtx, numX, numZ, 2.0f, 2.0f, baseY,
+                                    lowerInvMass, nvLower);
+    if (!out.lower) return out;
+    out.upper = buildFlatClothSheet(physics, scene, cudaCtx, numX, numZ, 2.0f * inset, 2.0f * inset,
+                                    baseY + dropH, 1.0f, nvUpper);
+    if (!out.upper) { out.lower = nullptr; return out; }
+    out.numUpperVerts = nvUpper;
+    return out;
+}
+
+// DtoH-read the FREE upper sheet: min and mean y across all of its vertices.
+bool clothClothUpperMinMeanY(const ClothClothScene& ccs, float& minY, float& meanY)
+{
+    std::vector<PxVec4> host(ccs.numUpperVerts);
+    PxCudaContext* ctx = ccs.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(ccs.upper->getPositionInvMassBufferD()),
+                    ccs.numUpperVerts * sizeof(PxVec4));
+    double sum = 0.0;
+    float lo = 1.0e30f;
+    bool finite = true;
+    for (PxU32 i = 0; i < ccs.numUpperVerts; ++i)
+    {
+        const float y = host[i].y;
+        sum += double(y);
+        lo = PxMin(lo, y);
+        if (!std::isfinite(y) || !std::isfinite(host[i].x) || !std::isfinite(host[i].z)) finite = false;
+    }
+    minY = lo;
+    meanY = float(sum / double(ccs.numUpperVerts));
+    return finite;
+}
+
+// ===========================================================================
 // PXG_SCENE=softbody (P8.0 tranche 7): the FEM-VOLUME money shot — a tetrahedral
 // cube that falls under gravity, and (with PXG_SB_STRETCH) relaxes back toward its
 // rest shape while it falls.
@@ -2771,6 +2956,81 @@ int main()
             return 0;
         }
         std::printf("[ FAIL ] gpu-sdk-step: clothselfcollide checks failed (%d)\n", failures);
+        return 2;
+    }
+
+    // PXG_SCENE=clothcloth (P8.16): the cloth-vs-DIFFERENT-cloth money shot.  A free cloth sheet
+    // is dropped onto a PINNED cloth sheet.  Self-collision is off on both and there is no rigid
+    // body underneath, so cloth_differentClothCollision{VT,EE} are the only midphase kernels that
+    // can produce the pair that catches it.  Cloth runs on PGS — pass PXG_SOLVER=pgs.
+    if (!std::strcmp(sceneName, "clothcloth"))
+    {
+        ClothClothScene ccs = buildClothClothScene(physics, scene, material, cudaCtx);
+        if (!ccs.upper || ccs.numUpperVerts == 0)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: clothcloth scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'clothcloth' built: two FEMCloth sheets — a pinned table at "
+                    "y=%.2f and a %u-vertex free sheet dropped onto it (self-collision OFF on both)\n",
+                    ccs.baseY, ccs.numUpperVerts);
+
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: clothcloth GPU pipeline CONSTRUCTED + live over Vulkan "
+                        "(set PXG_GPU_STEP=1 to step the drop)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_CLOTH_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 200;
+        float min0 = 0.0f, mean0 = 0.0f;
+        bool finite = clothClothUpperMinMeanY(ccs, min0, mean0);
+        float maxExcursion = 0.0f;
+        std::printf("  stepping the drop (%d x %.4fs): upper sheet starts at mean y=%.4f (min %.4f); "
+                    "table y=%.2f...\n", steps, dt, mean0, min0, ccs.baseY);
+
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            float mn = 0.0f, mean = 0.0f;
+            finite = clothClothUpperMinMeanY(ccs, mn, mean) & finite;
+            const float excursion = PxAbs(mean - mean0);
+            if (excursion > maxExcursion) maxExcursion = excursion;
+            if (i < 6 || i == steps - 1 || (i % 20 == 0))
+                std::printf("    step %3d: upper sheet min y=%.5f mean=%.5f (table y=%.2f)\n",
+                            i, mn, mean, ccs.baseY);
+        }
+        float minE = 0.0f, meanE = 0.0f;
+        clothClothUpperMinMeanY(ccs, minE, meanE);
+        std::printf("  clothcloth: final upper sheet min y=%.4f (mean %.4f); table y=%.2f\n",
+                    minE, meanE, ccs.baseY);
+
+        int failures = 0;
+        if (!(maxExcursion > 0.05f))
+        { std::printf("FAIL: upper sheet never moved (max mean excursion %.5f from %.4f) — sim frozen?\n",
+                      maxExcursion, mean0); ++failures; }
+        if (!finite) { std::printf("FAIL: cloth y went non-finite\n"); ++failures; }
+        // Caught: the sheet comes to rest ON the contact rest distance (table + 2 * restOffset).
+        const float restBand = ccs.baseY + 0.10f;
+        if (!(PxAbs(minE - restBand) < 0.05f))
+        { std::printf("FAIL: the upper sheet did not settle ON the rest distance (min y=%.4f, "
+                      "expected %.4f +/- 0.05)\n", minE, restBand); ++failures; }
+        if (!(meanE > ccs.baseY + 0.05f))
+        { std::printf("FAIL: the upper sheet sank into the table (mean y=%.4f, table=%.2f)\n",
+                      meanE, ccs.baseY); ++failures; }
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: cloth-vs-DIFFERENT-cloth collision CAUGHT the falling sheet "
+                        "and settled it ON the contact rest distance (min y=%.4f vs %.4f expected, "
+                        "mean y=%.4f, table=%.2f)\n", minE, ccs.baseY + 0.10f, meanE, ccs.baseY);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: clothcloth checks failed (%d)\n", failures);
         return 2;
     }
 
