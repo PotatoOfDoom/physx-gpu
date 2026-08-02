@@ -1620,6 +1620,72 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.14 scouting — cloth-vs-DIFFERENT-cloth is LIVE, and the survey's "dead" verdict was wrong
+
+Scouting for the next tranche, `cloth_differentClothCollisionVTLaunch` +
+`cloth_differentClothCollisionEELaunch`.  **No kernel was ported in this tranche** — what
+follows is the reachability and porting groundwork, recorded because two of the findings would
+otherwise have to be re-derived, and one of them reverses a verdict that would have caused the
+pair to be skipped entirely.
+
+**1. THE PAIR IS LIVE.  The empty narrowphase bucket entry is BY DESIGN, not dead code.**
+The frontier survey flagged this group as skippable on the grounds that `testSDKFemClothCloth`
+is an empty stub.  It IS an empty stub — and the engine says why, in the function itself
+(`PxgNarrowphaseCore.cpp:6466`):
+
+```cpp
+void PxgGpuNarrowphaseCore::testSDKFemClothCloth(...)
+{
+    // FEMCloth-FEMCloth collision handled in PxgFEMClothCore.cpp
+```
+
+The bucket exists so the contact managers get REGISTERED; the midphase itself runs from the
+SOLVER side, in `PxgFEMClothCore::differentClothCollision()` (`:733`, dispatch at `:785`), which
+`prepareClothClothCollision` (`:1931`) calls unconditionally right beside `selfCollision()` —
+and `selfCollision()` is already mapped and already green in `PXG_SCENE=clothselfcollide`, so
+the enclosing function is demonstrably reached every step.  The only thing gating the two
+kernels is `numTests > 0`, i.e. at least one cloth-vs-cloth contact-manager pair, and two
+`PxDeformableSurface` actors route there unconditionally: `isCloth0 && isCloth1 ->
+GPU_BUCKET_ID::eFemClothes` (`PxgNphaseImplementationContext.cpp:1136-1138`), no compatibility
+test, no fallback.
+
+**The general lesson, worth more than this pair:** an empty narrowphase bucket entry is NOT
+evidence of dead code in this engine.  Three collision pairs are driven from the solver side
+instead, and the bucket entry is a registration hook.  Reachability has to be traced from the
+per-step entry through to the dispatch, not inferred from the bucket table.  (The genuinely dead
+`cloth_clothMidphaseGeneratePairsLaunch` is a DIFFERENT kernel with no dispatch site at all —
+the survey conflated the two.)
+
+**2. THE TWO KERNELS ARE THE ALREADY-MAPPED SELF-COLLISION MIDPHASE WITH TWO CLOTHS.**  Same
+`ClothTreeVertexTraverser` / `ClothTreeEdgeTraverser`, same output buffers
+(`mVolumeContactOrVTContactInfoBuffer` / `mEEContactInfoBuffer`), same
+`*updateContactPairs == 0` early exit, and the downstream solves
+(`cloth_solveClothClothDeltaVTLaunch` / `...EELaunch`) are mapped and already cloth-id-generic.
+Four differences, all consequences of there being two bodies:
+
+| | self-collision (mapped) | different-cloth (to port) |
+|---|---|---|
+| which cloth | `activeClothes[blockIdx.y]` | `cmInputs[blockIdx.y]`, both shapes |
+| query element | `globalWarpIdx < numVerts` | `globalWarpIdx < numVerts0 + numVerts1`, first half queries cloth 0 against cloth 1's tree, second half the reverse |
+| contact distance | one body's, DOUBLED | the SUM of the two cache refs |
+| shared-vertex skip | required | `clothId0 != clothId1 \| !(...)` — never applies |
+
+**3. THE REST-POSE FILTER IS A NO-OP ON THIS PATH, and that is easy to port wrong.**  The
+different-cloth call passes `NULL` for both rest-vertex buffers and `0.0f` for the filter
+distance (`femClothClothMidPhase.cu:1298-1300`), and `distSqInRestPose` returns `PX_MAX_REAL`
+when its first argument is null (`:662-668`).  So `tempRestDistSq > filterDistSq` is
+unconditionally true and the whole block collapses.  Transcribing the self-collision version's
+rest-pose lookup here would dereference a null pointer — on llvmpipe, with the speculated-load
+behaviour this port has hit repeatedly, that is a fault whose location moves with the
+groupshared layout.
+
+**4. THE SCENE.**  Two `PxDeformableSurface` actors, one pinned and one dropped onto it, with
+today's interpenetration as the control — the cheapest new scene in the port, and the pattern
+`softbodystack` already established: both sheets from one recipe so the mass ratio cannot be the
+confound it was in P8.8.
+
+Nothing is claimed to work yet.  Manifest unchanged at 252; suite unchanged.
+
 ## P8.13 — the recurring one-off suite failure: what it is NOT, and how the next one gets caught
 
 Five times across this port the per-tranche `ctest -j4` has failed EXACTLY ONCE, always in the
