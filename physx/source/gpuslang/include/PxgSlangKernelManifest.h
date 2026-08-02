@@ -192,9 +192,9 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "radixSortMultiCalculateRanksLaunchWithCount", "radixSortDesc.spv", "radixSortMultiCalculateRanksLaunchWithCount" },  // RS_CALCULATERANKS_MULTIBLOCK_COUNT (P5 Step 4 BDA port)
     { "radixSortMultiBlockLaunchWithoutCount", "radixSortDesc.spv", "radixSortMultiBlockLaunchWithoutCount" },  // RS_MULTIBLOCK_NO_COUNT (P6.2 BDA port)
     { "radixSortMultiCalculateRanksLaunchWithoutCount", "radixSortDesc.spv", "radixSortMultiCalculateRanksLaunchWithoutCount" },  // RS_CALCULATERANKS_MULTIBLOCK_NO_COUNT (P6.2 BDA port)
-    { "radixSortCopyHigh32Bits", "radixSort64.spv", "radixSortCopyHigh32Bits" },  // RS_COPY_HIGH_32BITS
+    { "radixSortCopyHigh32Bits", "femContactSortBda.spv", "radixSortCopyHigh32Bits" },  // RS_COPY_HIGH_32BITS (P8.20 BDA re-point)
     { "radixSortDoubleCopyHigh32Bits", "particleContactSortBda.spv", "radixSortDoubleCopyHigh32Bits" },  // RS_DOUBLE_COPY_HIGH_32BITS2 (P6.1 BDA re-point)
-    { "radixSortCopy", "radixSortGather.spv", "radixSortCopy" },  // RS_COPY_VALUE
+    { "radixSortCopy", "femContactSortBda.spv", "radixSortCopy" },  // RS_COPY_VALUE (P8.20 BDA re-point)
     { "radixSortDoubleCopy", "particleContactSortBda.spv", "radixSortDoubleCopy" },  // RS_DOUBLE_COPY_VALUE (P6.1 BDA re-point)
     { "radixSortCopyBits2", "radixSortGather.spv", "radixSortCopyBits2" },  // RS_COPY_BITS2
     { "radixSortCopy2", "radixSortGather.spv", "radixSortCopy2" },  // RS_COPY_VALUE2
@@ -440,7 +440,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_applyAccumulatedDeltaVelocity", nullptr, nullptr },  // CLOTH_APPLY_ACCUMULATED_DAMPING (unmapped)
     { "fem_reorderRigidContactsLaunch", "femClothContactSortBda.spv", "fem_reorderRigidContactsLaunch" },  // FEM_REORDER_RS_CONTACTS (P7.1 tranche 4b-1 BDA port)
     { "clampMaxValue", "particleContactSortBda.spv", "clampMaxValue" },  // CLAMP_MAX_VALUE (P6.1 BDA re-point)
-    { "clampMaxValues", "clampValues.spv", "clampMaxValues" },  // CLAMP_MAX_VALUES
+    { "clampMaxValues", "femContactSortBda.spv", "clampMaxValues" },  // CLAMP_MAX_VALUES (P8.20 BDA re-point)
     { "scanPerBlockKernel", "scan.spv", "scanPerBlockKernel" },  // scanPerBlockKernel
     { "scanPerBlockKernel4x4", "scan4x4.spv", "scanPerBlockKernel4x4" },  // scanPerBlockKernel4x4
     { "addBlockSumsKernel", "scan.spv", "addBlockSumsKernel" },  // addBlockSumsKernel

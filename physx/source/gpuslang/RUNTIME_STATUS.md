@@ -7,7 +7,10 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **696/696** green in both modes.
+Test count: **675/675** green in both modes (`ctest -N` in `build-gpuslang`).
+*(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
+reporting 673/674/675 for several tranches while the header kept an older
+figure.  It is now the number `ctest` prints.)*
 
 ## Done
 
@@ -1619,6 +1622,183 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
+
+## P8.20 — the softbody settle failure: three REFUSED launches, and an undamped material
+
+This tranche started as a bisect and ended as two unrelated findings, neither of
+which was the one P8.19 predicted.  Both are recorded here with the measurements
+that decided them, including the places where my own earlier notes were wrong.
+
+### What P8.19 handed over, and why the bisect found nothing
+
+P8.19 recorded `PXG_SCENE=softbody` failing its settle check and named a bisect as
+the next step, on the strength of two claims.  **Both were wrong**, and correcting
+them is the first result of this tranche:
+
+- *"the number is identical across box, plane, sphere and mesh"* — it is not.
+  Re-measured: box **0.015430**, plane **0.012998**, sphere **0.014072**, mesh
+  **0.011728**.  The P8.19 note generalised from a single box run.
+- *"the last recorded green run predates the cloth arc, so the window is wide"* —
+  there is no window.  The failure reproduces at **P8.11 (`81e1a5b`)**, at
+  **P8.7 (`4bf5b57`)** — the commit whose message is "the softbody settles on the
+  ground box" — and at **P8.2 tranche e (`24a4b94`)**, the commit that recorded
+  `rest |dy| = 0.000002`, all with the SAME numbers as HEAD, byte for byte.
+
+Each of those probes wiped every `.spv` first: checking out an older commit does
+NOT retrigger an importer's SPIR-V when only a module changed, and the first pass
+of this bisect was invalid for exactly that reason (three commits apart, three
+identical numbers, because all three ran HEAD's shaders).  The forced-fresh rerun
+gave the same answer, so the conclusion stands on its own.
+
+Ruled out along the way, each by measurement rather than argument: run-to-run
+nondeterminism (three runs, bit-identical), llvmpipe thread count
+(`LP_NUM_THREADS` 1/2/4/8, bit-identical — and the scene drives PhysX through a
+single-threaded `SyncDispatcher` anyway), and toolchain drift (slangc `2026.12.2`,
+Mesa `25.2.8-0ubuntu0.24.04.2`, LLVM `20.1.2` — the exact recorded profile).
+
+**So the numbers in this document for `PXG_SCENE=softbody` — plane `0.000002`, box
+`0.000899`, sphere `0.000575` — are not reproducible at their own commits.**  I
+cannot explain how they were produced and am not going to invent a mechanism; what
+follows is measured on the tree as it stands.
+
+### Finding 1 — three kernels were REFUSED at every launch, silently
+
+`PXG_LAUNCH_TRACE=1` on the softbody scene showed three kernels refused on every
+step, with `PxgSoftBodyCore` logging `fail to launch kernel!!` and stepping on:
+
+| kernel | launched from | CUDA |
+|---|---|---|
+| `clampMaxValues` | `PxgSoftBodyCore.cpp:474`, `PxgFEMClothCore.cpp:826` | `MemCopyBalanced.cu:95` |
+| `radixSortCopyHigh32Bits` | `PxgSoftBodyCore.cpp:559`/`:645`, `PxgFEMClothCore.cpp:935`/`:1019` | `radixSortImpl.cu:119` |
+| `radixSortCopy` | `PxgSoftBodyCore.cpp:614`, `PxgFEMClothCore.cpp:991`/`:1078` | `radixSortImpl.cu:163` |
+
+All three were in the manifest with valid SPIR-V — pointing at the **Phase-1
+resource-binding harness** (`clampValues.slang`, `radixSort64.slang`,
+`radixSortGather.slang`), which takes bound `RWStructuredBuffer`s plus indices in
+the push constant.  The engine hands them the CUDA pack of bare device pointers.
+No ABI row can describe the harness form, so `pushConstantSizeFor()` returned 0
+and the shim refused every launch.  The manifest counted them as mapped, because
+by its own definition — "has a `spirvFile`" — they were: `PXG_SLANG_KERNEL_MAPPED`
+stays at **258** here, and that number has been over-claiming these three all
+along.
+
+New shader `femContactSortBda.slang` ports all three line-for-line onto the BDA
+ABI; the manifest is re-pointed at it (hand-edited, as always) and three ABI rows
+land: `kRadixCopy` `{8,8,8,8}` shared by the two gathers, `kClampMaxValues`
+`{8,8,8,4}`.  After the fix the trace shows **exactly one** refused kernel left in
+the scene — `removeContactManagers_Stage5`, three times over the whole run, in
+teardown.
+
+**Honesty about impact: no scene number moves.**  Measured before and after with a
+forced-fresh build, `clothselfcollide`, `clothcloth`, `clothdrape` and
+`softbodycloth` are character-identical, and the softbody floors are bit-identical.
+Every scene in this harness has at most one rigid actor generating FEM contacts, so
+the by-rigid sort these kernels serve is trivial and a stale rank array gathers the
+same answer as a correct one.  The evidence that the port is right is therefore the
+fixture suite, not a scene: `testFemContactSort.cpp`, three fixtures, each compared
+BIT-EXACT against a CPU transcription of the `.cu`.
+
+**Mutation sweep: 21 mutants, 18 killed, 3 provably equivalent.**  The three
+survivors are equivalent for stated reasons, and each reason is backed by a
+DISCRIMINATING sibling mutant that dies:
+- M4 / M10 (grid stride loses its `WorkgroupCount()` factor) survive because a
+  *shrunk* stride still covers every index with the correct value — the extra
+  writes are redundant and identical.  M19 / M20 *double* the stride instead,
+  which tears real coverage gaps, and both die.
+- M14 (the clamp's `value1` and `value2` pointers swapped) survives because all
+  three slots receive the identical operation, so permuting them is a no-op.  M21
+  writes `value2`'s result into `value1`'s buffer — asymmetric — and dies.
+- M18 (`>` becomes `>=`) differs only when the counter already equals `maxValue`,
+  and then the store writes back the value already there.
+
+The first sweep reported four extra survivors and they were a FIXTURE defect, not
+equivalence: at `numKeys = 700` against a 32 x 1024 = 32768-thread grid the
+grid-stride loop never takes a second turn, so the stride was dead code the test
+could not see.  The fixtures now run `numKeys = 35000` over a 40000 capacity, which
+loops twice and leaves a sentinel tail.
+
+### Finding 2 — the settle failure was an UNDAMPED MATERIAL, not an unconverged solve
+
+With every kernel launching, all four floors still failed, bit-identically.  The
+question the check actually asks is whether the solve CONVERGES, so the next
+measurement was whether the oscillation grows or decays.  Tracing `PXG_SB_TRACE=1`
+over the box floor, the mean-y span per 35-step window:
+
+```
+steps  55- 90: mean y span 0.5774 | sim y-extent span 0.2570
+steps  90-125: mean y span 0.4796 | sim y-extent span 0.4314
+steps 125-160: mean y span 0.2280 | sim y-extent span 0.3865
+steps 160-200: mean y span 0.0582 | sim y-extent span 0.1064
+```
+
+Monotonically decaying.  The solve converges; it is simply nowhere near converged
+after 200 steps.  The cause is in the scene, not the port: `buildSoftBodyScene`
+created its material with
+
+```cpp
+/*elasticityDamping*/ stretchY > 1.0f ? 0.05f : 0.0f
+```
+
+so the damping was gated on the *stretch* knob and every floor case ran with
+**zero constitutive damping**.  A cube dropped 3.5 m onto a hard contact with no
+damping has only the contact solve and the implicit integrator to absorb the
+impact energy, and 200 steps of that does not reach a 2e-3 bar.  The scene's own
+settle assertion was unreachable by construction.  One line confirms the
+mechanism: `PXG_SB_STRETCH=1.02` (which switches the damping on for an unrelated
+reason) settles at `|dy| = 0.000813` on the same floor that fails at `0.015430`
+without it.
+
+The fix gives the damping to every case that has a floor —
+`(stretchY > 1.0f) || !floorNone` — and leaves `PXG_SB_FLOOR=none` undamped, which
+keeps the UNDAMPED branch of the tranche-6 solve covered and keeps the only case
+that still asserts the closed-form free fall on exactly the material it always had.
+
+**The two-tier `|dy|` bar is retired.**  It held the plane to 1e-4 and the GJK
+floors to 2e-3 on the theory that contact density predicts convergence: the plane
+branch writes one contact per penetrating corner (32 on this cube), the GJK/EPA
+branch one witness pair per query (16).  Measured on a damped material the ordering
+does not hold — sphere **0.000102** < plane **0.000153** < mesh **0.000769** < box
+**0.000929** — so the split is removed rather than re-tuned to a number it would
+only accidentally fit.  One bar, 2e-3, and all four numbers stay printed on every
+run so a convergence that degrades within the bar is still visible.
+
+The bar keeps its teeth: the worst passing floor sits 2.2x under it and the
+undamped control sits 7.7x over it, a factor of ~17 between the passing and
+failing states.
+
+### The softbody floor matrix, re-measured
+
+| floor | contacts | settled mean y | rest \|dy\| (bar 2e-3) |
+|---|---|---|---|
+| box (default) | 16 | 0.48955 | 0.000929 |
+| plane | 32 | 0.48951 | 0.000153 |
+| sphere | 16 | 0.47777 | 0.000102 |
+| mesh | 22 | 0.48792 | 0.000769 |
+| none (free fall) | 0 | −0.9867 | closed form 0.0006% off |
+
+Every settled mean y is now BELOW 0.5 — the cube is compressed under its own
+weight, which is what a resting elastic solid should do and what the undamped runs
+never showed (they oscillated about a *stretched* state, y-extent 1.04–1.10 against
+a rest length of 1.0).
+
+### A note on determinism, since this tranche made the sort live
+
+`softbodystack` and `softbodyattach` vary run to run (`|dy|` 0.000476–0.000605;
+attach min y −0.1741/−0.1830).  Checked against a stashed working tree: they varied
+at HEAD too (0.000579–0.000629), so this is the pre-existing atomic-append contact
+ordering, not something P8.20 introduced.  `PXG_SCENE=softbody` on the box floor is
+bit-identical across three runs.
+
+### Verification
+
+Forced-fresh `.spv`, suite through `tools/run_suite.sh` — **675/675 in both memory
+modes** (674 → 675: the new `gpuslang.femContactSort` suite).  Rigid regression
+green (box / sphere / capsule / capsulebox / convex / plane / stack / joint, plus
+`particle`).  Every deformable scene green: `clothselfcollide` PGS and TGS,
+`clothcloth`, `clothdrape` including `PXG_CLOTH_FLOOR=mesh`, `softbodyselfcollide`,
+`softbodycloth`, `softbodystack`, `softbodyattach`, and all five `PXG_SCENE=softbody`
+floor modes — the last of which had not been green in a reproducible way at any
+commit this tranche could find.
 
 ## P8.19 — FEM-vs-FEM attachments: one soft volume hanging off another
 

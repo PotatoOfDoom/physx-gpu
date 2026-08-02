@@ -923,6 +923,23 @@ static const uint8_t kRadixDoubleCopy[] = { 8, 8, 8, 8, 8, 8, 8 };
 //   clampMaxValue(PxU32* value, const PxU32 maxValue) (MemCopyBalanced.cu:88):
 //   pointer@0 + PxU32 by value@8 -> 16-byte blob.  Reuses kPtrU32 = {8,4}.
 
+// gpucommon/src/CUDA/radixSortImpl.cu (P8.20 FEM contact-sort BDA):
+//   radixSortCopyHigh32Bits(const PxU64* inValue, PxU32* outValue, PxU32* rank,
+//     const PxU32* numKeys) (radixSortImpl.cu:119) and radixSortCopy, which takes
+//   a PxU64* outValue instead (radixSortImpl.cu:163).  Only the output element
+//   WIDTH differs, and that lives in the kernel body, not the pack — so the two
+//   share this row for the same reason the twin gathers share kRadixDoubleCopy.
+//   NOT aliased to kRadixDoubleCopy: that one is the SEVEN-pointer twin pack.
+//   numKeys is a const PxU32* DEVICE POINTER (deref'd on-device) -> 32-byte blob.
+static const uint8_t kRadixCopy[] = { 8, 8, 8, 8 };
+// gpucommon/src/CUDA/MemCopyBalanced.cu:95 (P8.20):
+//   clampMaxValues(PxU32* value0, PxU32* value1, PxU32* value2, const PxU32 maxValue)
+//   -> three pointers @0/@8/@16 + a PxU32 BY VALUE @24 = 28 data bytes, rounded to
+//   the 8-byte alignment the pointers impose -> 32-byte blob.  NOT the same kernel
+//   as clampMaxValue (singular, MemCopyBalanced.cu:88, pack {8,4}), which keeps
+//   its own kPtrU32 row.
+static const uint8_t kClampMaxValues[] = { 8, 8, 8, 4 };
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },
@@ -1183,6 +1200,15 @@ static const PxgKernelAbiRow kRows[] = {
     { "radixSortDoubleCopyHigh32Bits", kRadixDoubleCopy, uint32_t(sizeof(kRadixDoubleCopy)) },
     // MemCopyBalanced.cu:88 — clampMaxValue(PxU32* value, const PxU32 maxValue) -> {8,4}
     { "clampMaxValue", kPtrU32, uint32_t(sizeof(kPtrU32)) },
+    // FEM (softbody + cloth) contact-sort kernels (P8.20 BDA).  These three were in
+    // the manifest all along, pointing at the Phase-1 binding harness; with no ABI
+    // row the shim refused every engine launch and PxgSoftBodyCore/PxgFEMClothCore
+    // logged "fail to launch kernel!!" and stepped on.
+    // radixSortImpl.cu:119 / :163 — the single rank-indexed gathers share the pack.
+    { "radixSortCopyHigh32Bits", kRadixCopy, uint32_t(sizeof(kRadixCopy)) },
+    { "radixSortCopy", kRadixCopy, uint32_t(sizeof(kRadixCopy)) },
+    // MemCopyBalanced.cu:95 — clampMaxValues(three PxU32*, const PxU32) -> {8,8,8,4}
+    { "clampMaxValues", kClampMaxValues, uint32_t(sizeof(kClampMaxValues)) },
 };
 
 inline size_t abiAlign(size_t size)
