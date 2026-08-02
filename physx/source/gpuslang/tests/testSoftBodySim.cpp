@@ -10770,4 +10770,367 @@ PXG_TEST(softBodySimHeightfieldMidphase)
         dev->destroyBuffer(h);
 }
 
+// ===========================================================================
+// P8.19 -- the FEM-vs-FEM ATTACHMENT pair.  Two fixtures, deliberately INDEPENDENT: the prepare
+// is checked against an explicit expectation and the solve is fed a constraint block written by
+// the HOST rather than by the prepare, so a scatter bug and a solve bug cannot cancel.
+//
+// What they pin:
+//   * both push blobs (32 and 24 bytes) and the two struct layouts -- the warp-strided
+//     PxgFEMFEMAttachmentConstraint (stride 2688, every field an array of 32 indexed by
+//     workIndex & 31) and PxgFEMFEMAttachment (stride 80);
+//   * the activeFemAttachments INDIRECTION (a non-identity permutation) and the block/offset
+//     split across a 32-attachment boundary;
+//   * that low_high_angles takes (x, y, z, 0) -- the source .w is DROPPED -- and that elemId1,
+//     a PxU32 widened into a PxU64 slot, gets its upper word CLEARED;
+//   * the barycentric anchor interpolation, the inverse-mass split, the `wTot > 0` gate and the
+//     per-corner `invMassBary > 0` gate;
+//   * the cone-limit branch, which no scene reaches (an attachment without a
+//     PxConeLimitedConstraint carries -1 in all three parameters), including the
+//     constraintOffset term that only a non-zero offset can expose.
+// ===========================================================================
+namespace p819att
+{
+struct FemAttachPrepPush
+{
+    uint64_t femAttachments, activeFemAttachments;
+    uint32_t numFemAttachments, pad20;
+    uint64_t attachmentConstraints;
+};
+static_assert(sizeof(FemAttachPrepPush) == 32, "fem attach prepare blob must be 32 bytes");
+static_assert(offsetof(FemAttachPrepPush, numFemAttachments) == 16, "numFemAttachments @16");
+static_assert(offsetof(FemAttachPrepPush, attachmentConstraints) == 24, "constraints @24");
+
+struct FemAttachSolvePush
+{
+    uint64_t softbodies, attachments;
+    uint32_t numAttachments, pad20;
+};
+static_assert(sizeof(FemAttachSolvePush) == 24, "fem attach solve blob must be 24 bytes");
+static_assert(offsetof(FemAttachSolvePush, numAttachments) == 16, "numAttachments @16");
+
+// PxgFEMFEMAttachment (PxgSimulationCoreDesc.h:265), sizeof 80.
+struct FemAttachmentHost
+{
+    F4 lowHighAngle;      // @0   coneLimitParams.low_high_angle
+    F4 barycentric;       // @16  coneLimitParams.barycentric
+    F4 bary0;             // @32
+    F4 bary1;             // @48
+    uint64_t index0;      // @64
+    uint32_t index1;      // @72
+    float constraintOffset; // @76 -> 80
+};
+static_assert(sizeof(FemAttachmentHost) == 80, "PxgFEMFEMAttachment mirror must be 80 bytes");
+static_assert(offsetof(FemAttachmentHost, index0) == 64, "index0 @64");
+static_assert(offsetof(FemAttachmentHost, constraintOffset) == 76, "constraintOffset @76");
+
+// PxgFEMFEMAttachmentConstraint (PxgFEMCore.h:204) -- the warp-strided block.
+static const size_t FAC_STRIDE          = 2688;
+static const size_t FAC_LOW_HIGH_ANGLES = 0;
+static const size_t FAC_ATT_BARYCENTRIC = 512;
+static const size_t FAC_BARYCENTRIC0    = 1024;
+static const size_t FAC_BARYCENTRIC1    = 1536;
+static const size_t FAC_ELEMID0         = 2048;
+static const size_t FAC_ELEMID1         = 2304;
+static const size_t FAC_CONSTR_OFFSET   = 2560;
+
+static const uint32_t SB_ID_SHIFT = 20u;
+static uint32_t encodeSb(uint32_t id, uint32_t elem) { return (id << SB_ID_SHIFT) | elem; }
+} // namespace p819att
+
+PXG_TEST(softBodySimFemAttachmentPrepare)
+{
+    using namespace p819att;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // 34 attachments: enough to straddle the 32-wide block, so blockIdx 0 and 1 and offsets 0
+    // and 1 are all exercised.  The ACTIVE list is a non-identity permutation -- attachment
+    // data must follow activeFemAttachments[workIndex], not workIndex.
+    const uint32_t N = 34u;
+    std::vector<FemAttachmentHost> atts(N);
+    std::vector<uint32_t> active(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        FemAttachmentHost& a = atts[i];
+        // Distinct, recognisable values; the .w of lowHighAngle is POISON and must be dropped.
+        a.lowHighAngle = F4{ 1.0f + float(i), 2.0f + float(i), 3.0f + float(i), 99.0f };
+        a.barycentric  = F4{ 0.1f * float(i), 0.2f, 0.3f, 0.4f };
+        a.bary0        = F4{ float(i), 1.0f, 2.0f, 3.0f };
+        a.bary1        = F4{ 4.0f, float(i), 5.0f, 6.0f };
+        // index0's UPPER word is non-zero on purpose: it is a PxU64 copied WHOLE.
+        a.index0 = (uint64_t(0xABCD0000u + i) << 32) | uint64_t(encodeSb(1u, 7u + i));
+        a.index1 = encodeSb(2u, 11u + i);
+        a.constraintOffset = 0.5f * float(i);
+        active[i] = (i + 7u) % N;    // the permutation
+    }
+    DevBuf bAtt = makeDev(dev, atts);
+    DevBuf bActive = makeDev(dev, active);
+    if (!bAtt.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    // Two constraint blocks, poisoned so an untouched field is visible.
+    const size_t NB_BLOCKS = 2;
+    std::vector<uint32_t> con(NB_BLOCKS * FAC_STRIDE / 4, 0xCDCDCDCDu);
+    DevBuf bCon = makeDev(dev, con);
+
+    FemAttachPrepPush push = {};
+    push.femAttachments = bAtt.addr;
+    push.activeFemAttachments = bActive.addr;
+    push.numFemAttachments = N;
+    push.attachmentConstraints = bCon.addr;
+
+    Kernel k("softBodyFemAttachBda.spv", "femAttachmentPrepareLaunch", {}, sizeof(FemAttachPrepPush));
+    // The engine's grid (PxgSoftBodyCore.cpp:2113): SB_UPDATEROTATION = 1024 blocks of 256.
+    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const auto got = downloadBuffer<uint32_t>(dev, bCon.h, uint32_t(con.size()));
+    auto f4At = [&](size_t byteOff) {
+        const size_t w = byteOff / 4;
+        return F4{ u2f(got[w]), u2f(got[w + 1]), u2f(got[w + 2]), u2f(got[w + 3]) };
+    };
+    auto u64At = [&](size_t byteOff) {
+        const size_t w = byteOff / 4;
+        return uint64_t(got[w]) | (uint64_t(got[w + 1]) << 32);
+    };
+    auto fAt = [&](size_t byteOff) { return u2f(got[byteOff / 4]); };
+    auto nearF = [](float a, float b) { return std::fabs(a - b) < 1e-6f; };
+
+    size_t mm = 0;
+    for (uint32_t w = 0; w < N; ++w)
+    {
+        const size_t blk = w / 32, off = w & 31;
+        const size_t base = blk * FAC_STRIDE;
+        const FemAttachmentHost& a = atts[active[w]];
+
+        const F4 lha = f4At(base + FAC_LOW_HIGH_ANGLES + off * 16);
+        if (!nearF(lha.x, a.lowHighAngle.x) || !nearF(lha.y, a.lowHighAngle.y) ||
+            !nearF(lha.z, a.lowHighAngle.z) || !nearF(lha.w, 0.0f))
+        { ++mm; std::printf("  w=%u low_high_angles MM: got (%.3f %.3f %.3f %.3f) ref (%.3f %.3f %.3f 0)\n",
+                            w, lha.x, lha.y, lha.z, lha.w,
+                            a.lowHighAngle.x, a.lowHighAngle.y, a.lowHighAngle.z); }
+
+        const F4 ab = f4At(base + FAC_ATT_BARYCENTRIC + off * 16);
+        if (!nearF(ab.x, a.barycentric.x) || !nearF(ab.w, a.barycentric.w))
+        { ++mm; std::printf("  w=%u attachmentBarycentric MM\n", w); }
+
+        const F4 b0 = f4At(base + FAC_BARYCENTRIC0 + off * 16);
+        const F4 b1 = f4At(base + FAC_BARYCENTRIC1 + off * 16);
+        if (!nearF(b0.x, a.bary0.x) || !nearF(b0.w, a.bary0.w))
+        { ++mm; std::printf("  w=%u barycentric0 MM: got %.3f ref %.3f\n", w, b0.x, a.bary0.x); }
+        if (!nearF(b1.y, a.bary1.y) || !nearF(b1.w, a.bary1.w))
+        { ++mm; std::printf("  w=%u barycentric1 MM: got %.3f ref %.3f\n", w, b1.y, a.bary1.y); }
+
+        const uint64_t e0 = u64At(base + FAC_ELEMID0 + off * 8);
+        if (e0 != a.index0)
+        { ++mm; std::printf("  w=%u elemId0 MM: got 0x%llx ref 0x%llx (a PxU64 copied WHOLE)\n",
+                            w, (unsigned long long)e0, (unsigned long long)a.index0); }
+        const uint64_t e1 = u64At(base + FAC_ELEMID1 + off * 8);
+        if (e1 != uint64_t(a.index1))
+        { ++mm; std::printf("  w=%u elemId1 MM: got 0x%llx ref 0x%x (a PxU32 zero-EXTENDED)\n",
+                            w, (unsigned long long)e1, a.index1); }
+
+        if (!nearF(fAt(base + FAC_CONSTR_OFFSET + off * 4), a.constraintOffset))
+        { ++mm; std::printf("  w=%u constraintOffset MM\n", w); }
+    }
+    PXG_CHECK_MSG(mm == 0, "femAttachmentPrepare scatter (%zu mismatches)", mm);
+
+    // Slots 34..63 of block 1 were never written and must still be poison -- the strided loop
+    // must not run past numFemAttachments.
+    size_t spill = 0;
+    for (uint32_t w = N; w < 64u; ++w)
+    {
+        const size_t base = (w / 32) * FAC_STRIDE, off = w & 31;
+        if (got[(base + FAC_ELEMID0 + off * 8) / 4] != 0xCDCDCDCDu) ++spill;
+    }
+    PXG_CHECK_MSG(spill == 0, "the prepare wrote %zu slots beyond numFemAttachments", spill);
+
+    for (PxgBufferHandle h : { bAtt.h, bActive.h, bCon.h }) dev->destroyBuffer(h);
+}
+
+PXG_TEST(softBodySimFemAttachmentSolve)
+{
+    using namespace p819att;
+    using p80refit::TetIdx4;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // Two softbodies, three tetrahedra each with DISJOINT vertices, so the three attachments
+    // below never share a corner and each expected delta can be read on its own.
+    //
+    // The inverse masses and the barycentrics are deliberately NON-UNIFORM and DIFFERENT between
+    // the two sides.  With (1,0,0,0) on both -- the first version of this fixture -- four mutants
+    // survived: swapping barycentric0/1 is invisible when they are equal, and with only corner 0
+    // ever weighted, dropping the per-corner `invMassBary > 0` gate and dropping the barycentric
+    // factor from b0w both change nothing.  Two corners now carry weight ZERO for two DIFFERENT
+    // reasons -- one has invMass 0, the other has barycentric 0 -- and each kills one of those.
+    const uint32_t NB_TETS = 3u;
+    const float invM0[3][4] = { { 1.0f, 2.0f, 0.0f, 4.0f }, { 1.0f, 2.0f, 0.0f, 4.0f }, { 0, 0, 0, 0 } };
+    const float invM1[3][4] = { { 0.5f, 0.0f, 1.5f, 2.0f }, { 0.5f, 0.0f, 1.5f, 2.0f }, { 0, 0, 0, 0 } };
+    auto makeVerts = [&](float oy, const float invM[3][4]) {
+        std::vector<F4> v;
+        for (uint32_t t = 0; t < NB_TETS; ++t)
+        {
+            const float ox = 10.0f * float(t);
+            v.push_back(F4{ ox,        oy,        0.0f, invM[t][0] });
+            v.push_back(F4{ ox + 1.0f, oy,        0.0f, invM[t][1] });
+            v.push_back(F4{ ox,        oy + 1.0f, 0.0f, invM[t][2] });
+            v.push_back(F4{ ox,        oy,        1.0f, invM[t][3] });
+        }
+        return v;
+    };
+    std::vector<F4> v0 = makeVerts(0.0f, invM0);
+    std::vector<F4> v1 = makeVerts(2.0f, invM1);
+
+    std::vector<TetIdx4> tets;
+    for (uint32_t t = 0; t < NB_TETS; ++t)
+        tets.push_back(TetIdx4{ t * 4u, t * 4u + 1u, t * 4u + 2u, t * 4u + 3u });
+
+    std::vector<F4> delta0(v0.size(), F4{ 0, 0, 0, 0 }), delta1(v1.size(), F4{ 0, 0, 0, 0 });
+
+    DevBuf bV0 = makeDev(dev, v0), bV1 = makeDev(dev, v1), bTets = makeDev(dev, tets),
+           bD0 = makeDev(dev, delta0), bD1 = makeDev(dev, delta1);
+    if (!bV0.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    PxgSoftBody sb0 = makeZeroDesc(), sb1 = makeZeroDesc();
+    sb0.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bV0.addr));
+    sb0.mSimTetIndices = reinterpret_cast<uint4*>(size_t(bTets.addr));
+    sb0.mSimDelta = reinterpret_cast<float4*>(size_t(bD0.addr));
+    sb1.mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bV1.addr));
+    sb1.mSimTetIndices = reinterpret_cast<uint4*>(size_t(bTets.addr));
+    sb1.mSimDelta = reinterpret_cast<float4*>(size_t(bD1.addr));
+    std::vector<PxgSoftBody> descArr = { sb0, sb1 };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // The constraint block, written by the HOST -- see the section header on why.
+    const uint32_t NB_ATT = 3u;
+    const F4 BARY0{ 0.5f, 0.25f, 0.25f, 0.0f };   // corner 3 carries NO weight despite invMass 4
+    const F4 BARY1{ 0.1f, 0.2f, 0.3f, 0.4f };     // corner 1 carries none because invMass is 0
+    const float CONSTR_OFFSET = 0.4f;
+    std::vector<uint32_t> con(FAC_STRIDE / 4, 0u);
+    auto putF4 = [&](size_t byteOff, F4 v) {
+        const size_t w = byteOff / 4;
+        con[w] = f2u(v.x); con[w + 1] = f2u(v.y); con[w + 2] = f2u(v.z); con[w + 3] = f2u(v.w);
+    };
+    auto putU64 = [&](size_t byteOff, uint64_t v) {
+        const size_t w = byteOff / 4;
+        con[w] = uint32_t(v & 0xFFFFFFFFull); con[w + 1] = uint32_t(v >> 32);
+    };
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        putU64(FAC_ELEMID0 + a * 8, encodeSb(0u, a));   // softbody 0, tet a
+        putU64(FAC_ELEMID1 + a * 8, encodeSb(1u, a));   // softbody 1, tet a
+        putF4(FAC_BARYCENTRIC0 + a * 16, BARY0);
+        putF4(FAC_BARYCENTRIC1 + a * 16, BARY1);
+        // attachment 1 is the CONE case: (minDist, maxDist, maxAngle, _) = (-1, 0.5, -1, _)
+        // -> enabled through maxDist alone, and the angle branch stays on its maxAngle < 0 path.
+        const bool cone = (a == 1u);
+        putF4(FAC_LOW_HIGH_ANGLES + a * 16, cone ? F4{ -1.0f, 0.5f, -1.0f, 0.0f }
+                                                 : F4{ -1.0f, -1.0f, -1.0f, 0.0f });
+        // The cone axis comes from projectP - pos0 with this barycentric.
+        putF4(FAC_ATT_BARYCENTRIC + a * 16, F4{ 0.0f, 1.0f, 0.0f, 0.0f });
+        con[(FAC_CONSTR_OFFSET + a * 4) / 4] = f2u(CONSTR_OFFSET);
+    }
+    DevBuf bCon = makeDev(dev, con);
+
+    FemAttachSolvePush push = {};
+    push.softbodies = bDesc.addr;
+    push.attachments = bCon.addr;
+    push.numAttachments = NB_ATT;
+
+    Kernel k("softBodyFemAttachBda.spv", "sb_solveOutputSoftBodyAttachmentDeltaVLaunch",
+             {}, sizeof(FemAttachSolvePush));
+    k.dispatch(/*gridX*/ 1024u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // ---- the CPU reference, transcribed from the .cu -----------------------------------------
+    std::vector<F4> ref0(v0.size(), F4{ 0, 0, 0, 0 }), ref1(v1.size(), F4{ 0, 0, 0, 0 });
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        const uint32_t base = a * 4u;
+        auto interp = [&](const std::vector<F4>& v, F4 b) {
+            return F4{ v[base].x * b.x + v[base+1].x * b.y + v[base+2].x * b.z + v[base+3].x * b.w,
+                       v[base].y * b.x + v[base+1].y * b.y + v[base+2].y * b.z + v[base+3].y * b.w,
+                       v[base].z * b.x + v[base+1].z * b.y + v[base+2].z * b.z + v[base+3].z * b.w,
+                       0.0f };
+        };
+        const F4 pos0 = interp(v0, BARY0), pos1 = interp(v1, BARY1);
+        float ex = pos1.x - pos0.x, ey = pos1.y - pos0.y, ez = pos1.z - pos0.z;
+
+        if (a == 1u)   // the cone case: maxDist 0.5 clamps the length; maxAngle < 0 -> dir = rel/len
+        {
+            const F4 proj = interp(v0, F4{ 0.0f, 1.0f, 0.0f, 0.0f });
+            float ax = proj.x - pos0.x, ay = proj.y - pos0.y, az = proj.z - pos0.z;
+            const float am = std::sqrt(ax * ax + ay * ay + az * az);
+            if (am > 0.0f) { ax /= am; ay /= am; az /= am; }
+            float rx = ex - ax * CONSTR_OFFSET, ry = ey - ay * CONSTR_OFFSET, rz = ez - az * CONSTR_OFFSET;
+            const float len = std::sqrt(rx * rx + ry * ry + rz * rz);
+            const float dirx = (len > 1e-6f) ? rx / len : ax;
+            const float diry = (len > 1e-6f) ? ry / len : ay;
+            const float dirz = (len > 1e-6f) ? rz / len : az;
+            const float cl = std::fmin(std::fmax(len, -1.0f), 0.5f);
+            ex = rx - cl * dirx; ey = ry - cl * diry; ez = rz - cl * dirz;
+        }
+
+        const float b0w[4] = { BARY0.x * v0[base].w, BARY0.y * v0[base+1].w,
+                               BARY0.z * v0[base+2].w, BARY0.w * v0[base+3].w };
+        const float b1w[4] = { BARY1.x * v1[base].w, BARY1.y * v1[base+1].w,
+                               BARY1.z * v1[base+2].w, BARY1.w * v1[base+3].w };
+        const float bb0[4] = { BARY0.x, BARY0.y, BARY0.z, BARY0.w };
+        const float bb1[4] = { BARY1.x, BARY1.y, BARY1.z, BARY1.w };
+        float wTot = 0.0f;
+        for (int c = 0; c < 4; ++c) wTot += b0w[c] * bb0[c] + b1w[c] * bb1[c];
+        if (!(wTot > 0.0f)) continue;
+        const float dx = ex / wTot, dy = ey / wTot, dz = ez / wTot;
+        for (int c = 0; c < 4; ++c)
+        {
+            if (b1w[c] > 0.0f)
+            {
+                ref1[base + c].x += -dx * b1w[c]; ref1[base + c].y += -dy * b1w[c];
+                ref1[base + c].z += -dz * b1w[c]; ref1[base + c].w += 1.0f;
+            }
+            if (b0w[c] > 0.0f)
+            {
+                ref0[base + c].x += dx * b0w[c]; ref0[base + c].y += dy * b0w[c];
+                ref0[base + c].z += dz * b0w[c]; ref0[base + c].w += 1.0f;
+            }
+        }
+    }
+
+    const auto g0 = downloadBuffer<F4>(dev, bD0.h, uint32_t(delta0.size()));
+    const auto g1 = downloadBuffer<F4>(dev, bD1.h, uint32_t(delta1.size()));
+    auto nearV = [](F4 g, F4 r) {
+        return std::fabs(g.x - r.x) < 2e-5f && std::fabs(g.y - r.y) < 2e-5f &&
+               std::fabs(g.z - r.z) < 2e-5f && std::fabs(g.w - r.w) < 2e-5f;
+    };
+    size_t mm = 0;
+    for (uint32_t c = 0; c < uint32_t(v0.size()); ++c)
+    {
+        if (!nearV(g0[c], ref0[c]))
+        { ++mm; std::printf("  sb0 vert %u MM: got (%.6f %.6f %.6f | %.1f) ref (%.6f %.6f %.6f | %.1f)\n",
+                            c, g0[c].x, g0[c].y, g0[c].z, g0[c].w, ref0[c].x, ref0[c].y, ref0[c].z, ref0[c].w); }
+        if (!nearV(g1[c], ref1[c]))
+        { ++mm; std::printf("  sb1 vert %u MM: got (%.6f %.6f %.6f | %.1f) ref (%.6f %.6f %.6f | %.1f)\n",
+                            c, g1[c].x, g1[c].y, g1[c].z, g1[c].w, ref1[c].x, ref1[c].y, ref1[c].z, ref1[c].w); }
+    }
+    PXG_CHECK_MSG(mm == 0, "sb_solveOutputSoftBodyAttachmentDeltaV (%zu mismatches)", mm);
+
+    // Pin the structural facts the reference alone would not: the two zero-weight corners are
+    // untouched for two DIFFERENT reasons, and attachment 2 writes nothing at all.
+    auto isZero = [&](F4 g) { return g.x == 0.0f && g.y == 0.0f && g.z == 0.0f && g.w == 0.0f; };
+    PXG_CHECK_MSG(isZero(g0[2]), "sb0 corner 2 has invMass 0 and must be untouched");
+    PXG_CHECK_MSG(isZero(g0[3]), "sb0 corner 3 has barycentric 0 and must be untouched even though "
+                                 "its invMass is 4 -- only the PRODUCT gates the write");
+    PXG_CHECK_MSG(isZero(g1[1]), "sb1 corner 1 has invMass 0 and must be untouched");
+    for (uint32_t c = 8; c < 12u; ++c)
+        PXG_CHECK_MSG(isZero(g0[c]) && isZero(g1[c]),
+                      "attachment 2's tetrahedra are fully pinned (wTot == 0) and must be untouched");
+    PXG_CHECK_MSG(!isZero(g0[0]) && !isZero(g0[1]) && !isZero(g1[0]) && !isZero(g1[2]) && !isZero(g1[3]),
+                  "the weighted corners must all have been written");
+
+    std::printf("  att0 sb0=(%.5f %.5f %.5f|%.1f) sb1=(%.5f %.5f %.5f|%.1f)\n",
+                g0[0].x, g0[0].y, g0[0].z, g0[0].w, g1[0].x, g1[0].y, g1[0].z, g1[0].w);
+
+    for (PxgBufferHandle h : { bV0.h, bV1.h, bTets.h, bD0.h, bD1.h, bDesc.h, bCon.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace

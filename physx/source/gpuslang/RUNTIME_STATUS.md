@@ -1620,6 +1620,104 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.19 — FEM-vs-FEM attachments: one soft volume hanging off another
+
+`femAttachmentPrepareLaunch` + `sb_solveOutputSoftBodyAttachmentDeltaVLaunch` on the engine BDA
+ABI. **Manifest 256 → 258.** New shader `softBodyFemAttachBda.slang`.
+
+This is the last piece that lets one FEM volume hang from another with **no contact in the loop**.
+It is the P8.3 rigid-attachment pair with a second deformable in place of the rigid, which makes
+it SIMPLER: no velocity reader, no articulation branch, no rigid response term. Both sides are
+position-based, and the whole constraint is
+
+```
+wTot0 = Σ bary0[i]² · invMass0[i]        wTot1 = Σ bary1[i]² · invMass1[i]
+delta = (pos1 − pos0) / (wTot0 + wTot1)
+softbody1 −= delta · b1w                 softbody0 += delta · b0w
+```
+
+**Neither kernel has a cross-lane operation**, so unlike every midphase port this one keeps the
+CUDA `[numthreads(256,1,1)]` block verbatim and transcribes the strided indexing unchanged.
+
+**The two struct layouts are the whole risk** and are named-offset constants in the shader with
+`static_assert`s in the fixture. Two details are easy to get wrong and both have a mutant:
+`PxgFEMFEMAttachmentConstraint` is a WARP-STRIDED block (every field an array of 32, indexed by
+`workIndex & 31`, block `workIndex / 32`) whose two leading fields are unions; and `elemId1` is a
+PxU32 **widened** into a PxU64 slot by the prepare and **narrowed** back by the solve, so the port
+clears the upper word on write and reads only the low word.
+
+**21 mutants, 20 killed.** The first sweep killed only 17; the four survivors were all one fixture
+weakness — barycentric `(1,0,0,0)` on both sides. With equal barycentrics, swapping
+`barycentric0`/`barycentric1` is invisible, and with only corner 0 ever weighted, neither the
+per-corner `invMassBary > 0` gate nor the barycentric factor in `b0w` does anything observable.
+The fixture now uses `(0.5, 0.25, 0.25, 0)` against `(0.1, 0.2, 0.3, 0.4)` with inverse masses
+`(1, 2, 0, 4)` and `(0.5, 0, 1.5, 2)`, so **two corners carry zero weight for two DIFFERENT
+reasons** — one has `invMass == 0`, the other has `barycentric == 0` despite `invMass == 4` — and
+each kills one of those mutants. (The fourth, dropping the `b0w` barycentric factor, dies with
+them.)
+
+**One mutant survives and is provably equivalent.** Removing the `wTot > 0.0f` gate: `wTot` is
+`Σ bary[i] · (bary[i] · invMass[i])`, so for the clamped-non-negative barycentrics the CUDA
+guarantees, `wTot == 0` forces every `b*w[i]` to zero — and `updateTetPositionDelta` writes
+nothing when the weight is zero. The division by zero produces a NaN that never reaches memory.
+
+### The scene, and the three arrangements that did not work
+
+`PXG_SCENE=softbodyattach`. Getting a scene that actually ISOLATES the attachment took three
+tries, and each failure is worth recording because each looked like a pass:
+
+| arrangement | with the port | control (kernels unmapped) | why it proved nothing |
+|---|---|---|---|
+| stacked flush, gap 0.10 | 1.0554 | **1.2653** | within contact distance — the softbody-vs-softbody narrowphase (P8.9) catches it |
+| stacked, gap 0.25 | 0.9682 | **1.2340** | no contact at spawn, but the cube simply FALLS the 0.25 and lands on the pinned one |
+| offset 2.0 sideways | −42.59 | — | no contact and nothing to land on, but a 2.0 initial error: a position projection closes it in ONE step (mean 1.80 → 0.71 on step 0) and the material blows up by step 90 |
+
+**Anything directly above the pinned cube has something to land on, so no vertical arrangement can
+work at all.** The answer is SIDE BY SIDE at the same height with a 0.20 face gap: far outside the
+default contact offset, nothing beneath the free cube, and an initial constraint error of a
+fraction of a unit instead of two.
+
+```
+with the port:      upper volume mean y 0.3000 ->   0.2633  (min 0.5017 ... -0.1741)
+kernels unmapped:   upper volume mean y 0.3000 -> -44.0902  (both checks red)
+```
+
+The attachment points are chosen at RUNTIME, not hard-coded: the cubes' collision tetrahedra come
+out of the cooker with unpredictable indices, so the builder reads both meshes back, takes the
+pinned cube's largest-x tetrahedra and the free cube's smallest-x, and pairs them by proximity in
+the facing (yz) plane, anchoring both at their centroids.
+
+**Cone limits are ported but dormant on every scene**: an attachment created without a
+`PxConeLimitedConstraint` carries −1 in all three parameters and `isConeLimitedEnabled` is false.
+The branch is transcribed anyway — including its `PxSinCos`, the only transcendental in this
+shader — and the fixture drives it directly, with a non-zero `constraintOffset` so the term that
+only a non-zero offset can expose is covered too.
+
+**Verification:** forced-fresh `.spv`, suite through `tools/run_suite.sh` — **674/674 in both
+memory modes** (`gpuslang.softBodySim` 58 → 60 fixtures); `softbodyattach` green with the control
+red; `softbodyselfcollide`, `softbodycloth` and `softbodystack` green.
+
+### A PRE-EXISTING failure this tranche did not cause, and did not fix
+
+`PXG_SCENE=softbody` fails its settle check on **all four floors**:
+
+```
+FAIL: the cube was caught but never settled: |dy| still 0.015430 over the last 50 steps
+```
+
+It is not P8.19's doing, and that is measured rather than argued: the scene creates no
+attachments, so `getNbSoftBodySoftBodyAttachments()` is zero and neither new kernel is ever
+launched — and stashing the whole working tree and running the scene at **HEAD (574c5a5)**
+reproduces the identical |dy| of 0.015430. The other four softbody scenes
+(`softbodyselfcollide`, `softbodycloth`, `softbodystack`, `softbodyattach`) all pass.
+
+Two facts worth carrying into the investigation: the number is **identical across box, plane,
+sphere and mesh floors**, which points away from any one contact-generation branch and at the
+shared settle path; and the check that fires is a CONVERGENCE bar (`|dy| < 2e-3` for the GJK
+floors, `1e-4` for the plane) rather than a position bar — the cube IS caught, it just keeps
+jittering. The last recorded green run of this scene predates the cloth arc, so the regression
+window is wide and wants a bisect.
+
 ## P8.18 — the cloth-vs-mesh settle: not a port bug, an ACTIVATION WINDOW
 
 **No kernel was ported in this tranche; the manifest is unchanged at 256.**  P8.17 step 2 handed

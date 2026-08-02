@@ -615,6 +615,17 @@ static const uint8_t kClothMeshMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
 //   kernel a byte count where a device pointer belongs.
 static const uint8_t kClothMeshContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 4, 8, 80 };
 
+// gpusimulationcontroller FEM-vs-FEM ATTACHMENT pair (P8.19):
+//   femAttachmentPrepareLaunch(PxgFEMFEMAttachment* femAttachments, PxU32* activeFemAttachments,
+//   PxU32 numFemAttachments, PxgFEMFEMAttachmentConstraint* attachmentConstraints) -- launch
+//   site PxgSoftBodyCore.cpp:2100.  8 @0, 8 @8, PxU32 @16, then a pointer realigned to @24
+//   -> 32-byte blob.
+static const uint8_t kFemAttachPrep[] = { 8, 8, 4, 8 };
+//   sb_solveOutputSoftBodyAttachmentDeltaVLaunch(PxgSoftBody* softbodies,
+//   PxgFEMFEMAttachmentConstraint* attachments, PxU32 numAttachments) -- launch site
+//   PxgSoftBodyCore.cpp:1921.  8 @0, 8 @8, PxU32 @16 -> 24-byte blob.
+static const uint8_t kFemAttachSolve[] = { 8, 8, 4 };
+
 // gpunarrowphase softbody-vs-CLOTH midphase (P8.8):
 //   sb_clothMidphaseGeneratePairsLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
 //   bounds*, contactDistance*, gpuShapes*, softbodies*, clothes*, PxU32 stackSizeBytes,
@@ -1108,6 +1119,9 @@ static const PxgKernelAbiRow kRows[] = {
     // gpunarrowphase cloth-vs-COOKED-TRIANGLE-MESH midphase (P8.17 step 1)
     { "cloth_meshMidphaseGeneratePairsLaunch", kClothMeshMidphase, uint32_t(sizeof(kClothMeshMidphase)) },
     { "cloth_meshContactGenLaunch", kClothMeshContactGen, uint32_t(sizeof(kClothMeshContactGen)) },
+    // gpusimulationcontroller FEM-vs-FEM attachments (P8.19)
+    { "femAttachmentPrepareLaunch", kFemAttachPrep, uint32_t(sizeof(kFemAttachPrep)) },
+    { "sb_solveOutputSoftBodyAttachmentDeltaVLaunch", kFemAttachSolve, uint32_t(sizeof(kFemAttachSolve)) },
     // gpunarrowphase softbody-vs-CLOTH midphase (P8.8)
     { "sb_clothMidphaseGeneratePairsLaunch", kSbClothMidphase, uint32_t(sizeof(kSbClothMidphase)) },
     { "sb_clothContactGenLaunch", kSbClothContactGen, uint32_t(sizeof(kSbClothContactGen)) },

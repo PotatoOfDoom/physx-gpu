@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <vector>
 
 using namespace physx;
@@ -2511,6 +2512,168 @@ SoftBodyStackScene buildSoftBodyStackScene(PxPhysics* physics, PxScene* scene, P
     return out;
 }
 
+// PXG_SCENE=softbodyattach (P8.19): the FEM-vs-FEM ATTACHMENT money shot.
+//
+// A free FEM volume hangs from a PINNED one with NOTHING ELSE in the loop -- no floor under it,
+// no contact between the two (see the gap discussion in the builder), self-collision off on
+// both.  The only thing that can hold the upper cube up is femAttachmentPrepareLaunch +
+// sb_solveOutputSoftBodyAttachmentDeltaVLaunch.  Unmap either and it free-falls, which is
+// exactly the control the verification runs.
+//
+// The attachment points are chosen at RUNTIME rather than hard-coded: the two cubes' collision
+// tetrahedra come out of the cooker and their indices are not predictable, so the builder reads
+// both meshes back, takes the lower cube's HIGHEST tetrahedra and the upper cube's LOWEST, and
+// pairs them by proximity in xz.  Each attachment anchors both tetrahedra at their CENTROIDS
+// (barycentric 0.25 each).
+// ===========================================================================
+struct SoftBodyAttachScene
+{
+    PxDeformableVolume* lower = nullptr;
+    PxDeformableVolume* upper = nullptr;
+    PxU32 numUpperSimVerts = 0;
+    PxU32 nbAttachments = 0;
+    float upperStartY = 0.0f;
+    PxCudaContextManager* cudaCtx = nullptr;
+};
+
+// Read the UPPER cube's simulation vertices back and reduce them.
+bool softBodyAttachUpperY(const SoftBodyAttachScene& sc, float& meanY, float& minY)
+{
+    std::vector<PxVec4> pos(sc.numUpperSimVerts);
+    PxCudaContext* ctx = sc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(pos.data(),
+                    reinterpret_cast<CUdeviceptr>(sc.upper->getSimPositionInvMassBufferD()),
+                    pos.size() * sizeof(PxVec4));
+    float sum = 0.0f;
+    minY = FLT_MAX;
+    bool finite = true;
+    for (const PxVec4& p : pos)
+    {
+        finite = finite && std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z);
+        sum += p.y;
+        minY = PxMin(minY, p.y);
+    }
+    meanY = sum / float(pos.size());
+    return finite;
+}
+
+// Every collision tetrahedron's centroid, so the builder can pick the ones at the interface.
+static void collisionTetCentroids(PxDeformableVolume* vol, std::vector<PxVec3>& out)
+{
+    const PxTetrahedronMesh* mesh = vol->getCollisionMesh();
+    const PxVec3* verts = reinterpret_cast<const PxVec3*>(mesh->getVertices());
+    const PxU32 nbTets = mesh->getNbTetrahedrons();
+    const bool is16 = (mesh->getTetrahedronMeshFlags() & PxTetrahedronMeshFlag::e16_BIT_INDICES);
+    out.resize(nbTets);
+    for (PxU32 t = 0; t < nbTets; ++t)
+    {
+        PxU32 idx[4];
+        if (is16)
+        {
+            const PxU16* p = reinterpret_cast<const PxU16*>(mesh->getTetrahedrons()) + 4 * t;
+            for (int k = 0; k < 4; ++k) idx[k] = p[k];
+        }
+        else
+        {
+            const PxU32* p = reinterpret_cast<const PxU32*>(mesh->getTetrahedrons()) + 4 * t;
+            for (int k = 0; k < 4; ++k) idx[k] = p[k];
+        }
+        out[t] = (verts[idx[0]] + verts[idx[1]] + verts[idx[2]] + verts[idx[3]]) * 0.25f;
+    }
+}
+
+SoftBodyAttachScene buildSoftBodyAttachScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
+                                             PxCudaContextManager* cudaCtx)
+{
+    SoftBodyAttachScene out;
+    out.cudaCtx = cudaCtx;
+
+    // The ground box and the island dynamic are sunk / parked exactly as softbodystack does:
+    // the rigid PGS island must be non-empty, and neither belongs in what this scene measures.
+    // There is deliberately NO floor plane -- the upper cube must have nothing to land on.
+    PxRigidStatic* ground = addGroundBox(physics, scene, rigidMat);
+    ground->setGlobalPose(PxTransform(PxVec3(0.0f, -50.5f, 0.0f)));
+    PxRigidDynamic* island = addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                        boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+    island->setGlobalPose(PxTransform(PxVec3(10.0f, 1.5f, 0.0f)));
+
+    const float lowerSize = 1.0f;
+    const float upperSize = 0.6f;
+    out.lower = buildFemVolumeCube(physics, scene, cudaCtx, /*cells*/ 2u, lowerSize, /*baseY*/ 0.0f);
+    if (!out.lower) return out;
+    // *** THE ARRANGEMENT IS THE WHOLE CONTROL, AND IT TOOK THREE TRIES. ***
+    // (1) STACKED FLUSH (gap 0.10): settles at y ~ 1.05 -- and settles there with the attachment
+    //     kernels UNMAPPED too, because the cubes are within contact distance and the
+    //     softbody-vs-softbody narrowphase (P8.9, already mapped) catches it.  The control read
+    //     1.2653 instead of the -44 a free fall gives: the scene proved nothing.
+    // (2) STACKED WITH A 0.25 GAP: no contact at spawn, but the cube simply FALLS the 0.25 and
+    //     lands on the lower one.  Control read 1.2340.  Anything directly above the pinned cube
+    //     has something to land on, so NO vertical arrangement can work.
+    // (3) OFFSET 2.0 SIDEWAYS: no contact and nothing to land on, but a 2.0 initial constraint
+    //     ERROR, which a position projection closes in ONE step -- yanked from mean 1.80 to 0.71
+    //     on step 0, then the material blows up (-9.9 by step 90).
+    //
+    // SIDE BY SIDE at the SAME height is the answer.  The free cube sits beside the pinned one
+    // with a 0.20 face gap: far outside the default contact offset (the cube's shape sets none),
+    // with NOTHING beneath it, and with an initial constraint error of a fraction of a unit
+    // instead of two.  Unmap the kernels and it falls to -44.
+    const float faceGap = 0.20f;
+    const float upperOffsetX = 0.5f * lowerSize + faceGap + 0.5f * upperSize;
+    out.upper = buildFemVolumeCube(physics, scene, cudaCtx, /*cells*/ 2u, upperSize, /*baseY*/ 0.0f,
+                                   upperOffsetX);
+    if (!out.upper) return out;
+    out.numUpperSimVerts = out.upper->getSimulationMesh()->getNbVertices();
+    out.upperStartY = 0.5f * upperSize;   // the cube's centre
+
+    // PIN the lower cube: every simulation vertex gets invMass 0, so it is an immovable anchor
+    // and the only thing the constraint can move is the upper cube.
+    {
+        const PxU32 nv = out.lower->getSimulationMesh()->getNbVertices();
+        std::vector<PxVec4> pos(nv);
+        PxCudaContext* ctx = cudaCtx->getCudaContext();
+        CUdeviceptr d = reinterpret_cast<CUdeviceptr>(out.lower->getSimPositionInvMassBufferD());
+        ctx->memcpyDtoH(pos.data(), d, nv * sizeof(PxVec4));
+        for (PxU32 i = 0; i < nv; ++i) pos[i].w = 0.0f;
+        ctx->memcpyHtoD(d, pos.data(), nv * sizeof(PxVec4));
+    }
+
+    // Pick the interface tetrahedra and pair them by proximity in xz.
+    std::vector<PxVec3> lowC, upC;
+    collisionTetCentroids(out.lower, lowC);
+    collisionTetCentroids(out.upper, upC);
+
+    std::vector<PxU32> lowTop(lowC.size()), upBottom(upC.size());
+    for (PxU32 i = 0; i < PxU32(lowC.size()); ++i) lowTop[i] = i;
+    for (PxU32 i = 0; i < PxU32(upC.size()); ++i) upBottom[i] = i;
+    // The cubes are side by side, so the FACING tetrahedra are the ones to pair: the lower cube's
+    // largest x against the upper cube's smallest.
+    std::sort(lowTop.begin(), lowTop.end(), [&](PxU32 a, PxU32 b) { return lowC[a].x > lowC[b].x; });
+    std::sort(upBottom.begin(), upBottom.end(), [&](PxU32 a, PxU32 b) { return upC[a].x < upC[b].x; });
+
+    const PxVec4 centroidBary(0.25f, 0.25f, 0.25f, 0.25f);
+    const PxU32 nbPairs = PxMin(PxU32(4), PxMin(PxU32(lowTop.size()), PxU32(upBottom.size())));
+    for (PxU32 k = 0; k < nbPairs; ++k)
+    {
+        const PxU32 upTet = upBottom[k];
+        // the lower tetrahedron whose centroid is nearest in yz (the facing plane)
+        PxU32 best = lowTop[0];
+        float bestD = FLT_MAX;
+        for (PxU32 m = 0; m < PxMin(PxU32(8), PxU32(lowTop.size())); ++m)
+        {
+            const PxU32 lt = lowTop[m];
+            const float dy = lowC[lt].y - upC[upTet].y, dz = lowC[lt].z - upC[upTet].z;
+            const float d = dy * dy + dz * dz;
+            if (d < bestD) { bestD = d; best = lt; }
+        }
+        // upper->addSoftBodyAttachment(lower, tetIdxLower, baryLower, tetIdxUpper, baryUpper)
+        const PxU32 handle = out.upper->addSoftBodyAttachment(out.lower, best, centroidBary,
+                                                              upTet, centroidBary);
+        if (handle != 0xFFFFFFFFu) ++out.nbAttachments;
+    }
+
+    return out;
+}
+
 int main()
 {
     StepAllocator alloc;
@@ -3524,6 +3687,81 @@ int main()
                         "clean through to the plane (min y=%.4f)\n", minY);
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
         return 0;
+    }
+
+    // PXG_SCENE=softbodyattach (P8.19): a free FEM volume hanging from a PINNED one, with no
+    // floor under it and no contact between them.  Only the FEM-FEM attachment pair can hold it.
+    if (!std::strcmp(sceneName, "softbodyattach"))
+    {
+        SoftBodyAttachScene sa = buildSoftBodyAttachScene(physics, scene, material, cudaCtx);
+        if (!sa.upper || sa.numUpperSimVerts == 0)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodyattach scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        if (sa.nbAttachments == 0)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: softbodyattach created no attachments — the scene "
+                        "would be a free-fall test of nothing\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'softbodyattach' built: a %u-vertex FEM volume hung from a "
+                    "PINNED one by %u FEM-FEM attachments (no floor beneath)\n",
+                    sa.numUpperSimVerts, sa.nbAttachments);
+
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: softbodyattach GPU pipeline CONSTRUCTED + live over "
+                        "Vulkan (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_SB_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 180;
+        float mean0 = 0.0f, min0 = 0.0f;
+        bool finite = softBodyAttachUpperY(sa, mean0, min0);
+        std::printf("  stepping the hang (%d x %.4fs): upper volume starts at mean y=%.4f (min %.4f)\n",
+                    steps, dt, mean0, min0);
+
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            float mn = 0.0f, mean = 0.0f;
+            finite = softBodyAttachUpperY(sa, mean, mn) && finite;
+            if (i < 4 || i == steps - 1 || (i % 30 == 0))
+                std::printf("    step %3d: upper volume min y=%.5f mean=%.5f\n", i, mn, mean);
+        }
+        float meanE = 0.0f, minE = 0.0f;
+        softBodyAttachUpperY(sa, meanE, minE);
+        std::printf("  softbodyattach: upper volume mean y %.4f -> %.4f, min y %.4f\n",
+                    mean0, meanE, minE);
+
+        int failures = 0;
+        if (!finite) { std::printf("FAIL: upper volume went non-finite\n"); ++failures; }
+        // It HANGS: gravity pulls for 3 seconds and it must not have fallen away.  Free fall over
+        // this window is roughly -44, so the threshold separates the two by more than an order of
+        // magnitude and does not need to be tight.
+        if (!(minE > -0.5f))
+        { std::printf("FAIL: the upper volume fell away — the attachment did not hold "
+                      "(min y=%.4f)\n", minE); ++failures; }
+        // The constraint pulls the two centroids together, so the cube SETTLES somewhat rather
+        // than staying exactly put.  What matters is that it stops somewhere sane, still above
+        // the pinned cube's base.
+        if (!(meanE > 0.0f))
+        { std::printf("FAIL: the upper volume sank past the pinned one (mean y=%.4f)\n", meanE); ++failures; }
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: FEM-FEM attachments HELD the upper volume against "
+                        "gravity with no contact in the loop (mean y %.4f -> %.4f, min y %.4f)\n",
+                        mean0, meanE, minE);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: softbodyattach checks failed (%d)\n", failures);
+        return 2;
     }
 
     if (!std::strcmp(sceneName, "softbodystack"))

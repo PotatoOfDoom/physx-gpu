@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 256;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 258;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -273,7 +273,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_solveRigidAttachmentsTGSLaunch", nullptr, nullptr },  // PS_SOLVE_RIGID_ATTACHMENTS_TGS (unmapped)
     { "ps_finalizeParticlesLaunch", "psContactSolveTgsBda.spv", "ps_finalizeParticlesLaunch" },  // PS_FINALIZE_PARTICLES (P6.6 BDA port: TGS velocity-iteration finalize)
     { "ps_updateMaterials", nullptr, nullptr },  // PS_UPDATE_MATERIALS (unmapped)
-    { "femAttachmentPrepareLaunch", nullptr, nullptr },  // FEM_ATTACHMENT_CONSTRAINT_PREP (unmapped)
+    { "femAttachmentPrepareLaunch", "softBodyFemAttachBda.spv", "femAttachmentPrepareLaunch" },  // FEM_ATTACHMENT_CONSTRAINT_PREP (unmapped)
     { "sb_gm_preIntegrateLaunch", "softBodySimBda.spv", "sb_gm_preIntegrateLaunch" },  // SB_SIM_PREINTEGRATION (P8.0 BDA port: softbody free-fall predict/integrate)
     { "sb_refitBoundLaunch", "softBodyRefitBda.spv", "sb_refitBoundLaunch" },  // SB_REFITBOUND (P8.0 tranche 2 BDA port)
     { "sb_midphaseGeneratePairsLaunch", "softBodyContactGenBda.spv", "sb_midphaseGeneratePairsLaunch" },  // SB_MIDPHASE_PRIMITIVES (P8.2 tranche a BDA port)
@@ -298,7 +298,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_clothContactPrepareLaunch", "softBodyClothPrepareBda.spv", "sb_clothContactPrepareLaunch" },  // SB_SC_CONTACTPREPARE (P8.8 step 5 BDA port — softbody-vs-cloth constraint prepare)
     { "sb_particleContactPrepareLaunch", nullptr, nullptr },  // SB_SP_CONTACTPREPARE (unmapped)
     { "sb_solveRigidSoftAttachmentLaunch", "softBodyRigidAttachBda.spv", "sb_solveRigidSoftAttachmentLaunch" },  // SB_SOLVE_RIGID_SOFT_ATTACHMENT (P8.3 attachment port)
-    { "sb_solveOutputSoftBodyAttachmentDeltaVLaunch", nullptr, nullptr },  // SB_SOLVE_SOFTBODY_ATTACHMENT_DELTA (unmapped)
+    { "sb_solveOutputSoftBodyAttachmentDeltaVLaunch", "softBodyFemAttachBda.spv", "sb_solveOutputSoftBodyAttachmentDeltaVLaunch" },  // SB_SOLVE_SOFTBODY_ATTACHMENT_DELTA (unmapped)
     { "sb_solveOutputClothAttachmentDeltaVLaunch", nullptr, nullptr },  // SB_SOLVE_CLOTH_ATTACHMENT_DELTA (unmapped)
     { "sb_solveOutputParticleAttachmentDeltaVLaunch", nullptr, nullptr },  // SB_SOLVE_PARTICLE_ATTACHMENT_DELTA (unmapped)
     { "sb_queryRigidSoftContactReferenceCountLaunch", "softBodyRigidContactBda.spv", "sb_queryRigidSoftContactReferenceCountLaunch" },  // SB_QUERY_RIGID_SOFT_REFERENCE_COUNT (P8.2 tranche e BDA port; chain kernels 6 and 7)
