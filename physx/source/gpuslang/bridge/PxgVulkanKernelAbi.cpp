@@ -604,6 +604,17 @@ static const uint8_t kClothDifferentCloth[] = { 4, 4, 8, 8, 8, 8, 8, 8, 4, 8, 8,
 //   shows up here.
 static const uint8_t kClothMeshMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
 
+// gpunarrowphase cloth-vs-COOKED-TRIANGLE-MESH contact gen (P8.17 step 2):
+//   cloth_meshContactGenLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
+//   contactDistance*, restDistance*, gpuShapes*, femClothes*, shapeToRigidRemapTable*,
+//   PxU32 stackSizeBytes, stackPtr*, midphasePairsNum*, filterPairs*, PxU32 nbFilterPairs,
+//   stackSizeNeededOnDevice*, PxgFEMContactWriter writer) -- launch site
+//   PxgNarrowphaseCore.cpp:6671.  NOT kSbMeshContactGen's pack, even though both are 192 bytes
+//   and both end in an 80-byte writer: there stackSizeBytes sits at @80 AFTER the two stack
+//   pointers, here it sits at @64 BEFORE them.  Reading one with the other's layout hands the
+//   kernel a byte count where a device pointer belongs.
+static const uint8_t kClothMeshContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 4, 8, 80 };
+
 // gpunarrowphase softbody-vs-CLOTH midphase (P8.8):
 //   sb_clothMidphaseGeneratePairsLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
 //   bounds*, contactDistance*, gpuShapes*, softbodies*, clothes*, PxU32 stackSizeBytes,
@@ -1096,6 +1107,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_differentClothCollisionEELaunch", kClothDifferentCloth, uint32_t(sizeof(kClothDifferentCloth)) },
     // gpunarrowphase cloth-vs-COOKED-TRIANGLE-MESH midphase (P8.17 step 1)
     { "cloth_meshMidphaseGeneratePairsLaunch", kClothMeshMidphase, uint32_t(sizeof(kClothMeshMidphase)) },
+    { "cloth_meshContactGenLaunch", kClothMeshContactGen, uint32_t(sizeof(kClothMeshContactGen)) },
     // gpunarrowphase softbody-vs-CLOTH midphase (P8.8)
     { "sb_clothMidphaseGeneratePairsLaunch", kSbClothMidphase, uint32_t(sizeof(kSbClothMidphase)) },
     { "sb_clothContactGenLaunch", kSbClothContactGen, uint32_t(sizeof(kSbClothContactGen)) },

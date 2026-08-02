@@ -6404,4 +6404,442 @@ PXG_TEST(femClothSimMeshMidphase)
         dev->destroyBuffer(h);
 }
 
+// ===========================================================================
+// P8.17 step 2 -- cloth_meshContactGenLaunch, the cloth-vs-COOKED-TRIANGLE-MESH contact
+// generation.
+//
+// SCOPE, STATED UP FRONT.  The clipping core (trimTriangleByTriangle ->
+// getDeepestPointSimplified -> computeBarycentric) is a LIFT of fcStaticTriCloth.slang's mode 0,
+// which testFcStaticTriCloth.cpp already checks against a CPU transcription -- the sign-change
+// bookkeeping, the in-place insert branch, the +-tolerance averaging band and the degenerate
+// paths.  Re-transcribing all of that here would duplicate that fixture, not extend it.  What
+// this fixture covers is the part that is NEW: the BDA plumbing.
+//
+//   * the 192-byte blob, whose stackSizeBytes sits at @64 BEFORE the two stack pointers -- the
+//     softbody sibling puts it at @80 AFTER them, and reading one pack with the other's layout
+//     hands the kernel a byte count where a device pointer belongs;
+//   * the pair-stack iteration, the ceil-to-a-warp `l` and the per-warp slot packing.  40 pairs
+//     straddle a warp boundary, with a contact in EACH warp, so both reservations are exercised
+//     and their slots must come out in warp order;
+//   * cloth/mesh resolution by particleOrSoftbodyId with the pair in SWAPPED shape order;
+//   * `meshTriangleIdx` really indexing the mesh (primitive 0 is a decoy 1000 units away);
+//   * the cooked-blob walk sized by header `.w`, not `.z`;
+//   * the transform chain -- vertex2Shape (which MULTIPLIES) then
+//     clothTransform.transformInv(trimeshToWorld) -- with a non-uniform mesh scale and two
+//     DIFFERENT non-trivial rigid transforms;
+//   * the filter skip needing ALL THREE cloth vertices;
+//   * restDistance indexed by cmIdx (not by a cache ref, and not by 0);
+//   * the writer's field mapping, including that the u64 contactByX/tempContactByX keys are
+//     left UNTOUCHED by this variant.
+//
+// The geometry is chosen so the clip outcome is ANALYTIC: each query triangle is built from the
+// mesh triangle's own cloth-local image, offset along its normal by a chosen gap and sideways by
+// a little.  The clip then leaves the triangle whole, all three corners sit at the same depth,
+// and the deepest point is their centroid with barycentric (1/3, 1/3, 1/3).  Crucially the
+// positions are DERIVED FROM the transform chain, so a shader whose chain differs computes a
+// different plane and a different separation.
+// ===========================================================================
+namespace p817cg
+{
+struct ClothMeshCgPush
+{
+    float toleranceLength; uint32_t pad4;
+    uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes, femClothes,
+             shapeToRigidRemapTable;
+    uint32_t stackSizeBytes, pad68;
+    uint64_t stackPtr, midphasePairsNum, filterPairs;
+    uint32_t nbFilterPairs, pad100;
+    uint64_t stackSizeNeededOnDevice;
+    // PxgFEMContactWriter, by value
+    uint64_t wPoint, wNormalPen, wBary, wInfo, wCount, wByX, wTempByX, wIdxByX, wSorted32;
+    uint32_t wMaxContacts, pad188;
+};
+static_assert(sizeof(ClothMeshCgPush) == 192, "cloth mesh CG blob must be 192 bytes");
+static_assert(offsetof(ClothMeshCgPush, shapeToRigidRemapTable) == 56, "remap table @56");
+static_assert(offsetof(ClothMeshCgPush, stackSizeBytes) == 64, "stackSizeBytes @64, BEFORE the stack pointers");
+static_assert(offsetof(ClothMeshCgPush, stackPtr) == 72, "stackPtr @72");
+static_assert(offsetof(ClothMeshCgPush, midphasePairsNum) == 80, "midphasePairsNum @80");
+static_assert(offsetof(ClothMeshCgPush, nbFilterPairs) == 96, "nbFilterPairs @96");
+static_assert(offsetof(ClothMeshCgPush, stackSizeNeededOnDevice) == 104, "stackSizeNeeded @104");
+static_assert(offsetof(ClothMeshCgPush, wPoint) == 112, "the writer starts @112");
+static_assert(offsetof(ClothMeshCgPush, wMaxContacts) == 184, "maxNumContacts @184");
+
+// PxgRigidFilterPair (32 B): u64 index0, u64 index1, u32 index2, padding.
+struct RigidFilterPairHost { uint64_t index0, index1; uint32_t index2, pad0, pad1, pad2; };
+static_assert(sizeof(RigidFilterPairHost) == 32, "PxgRigidFilterPair mirror must be 32 bytes");
+
+using p817mesh::V3;
+using p817mesh::crs;
+using p817mesh::scl;
+using p72ref::sub;
+using p72ref::add;
+using p72ref::dot;
+
+static V3 norm(V3 v) { const float m = dot(v, v); return m > 0.0f ? scl(v, 1.0f / std::sqrt(m)) : V3{ 0, 0, 0 }; }
+
+// PxQuat::rotate / rotateInv, the same formula the shader carries.
+static V3 qRot(const float q[4], V3 v)
+{
+    const float vx = 2 * v.x, vy = 2 * v.y, vz = 2 * v.z;
+    const float w2 = q[3] * q[3] - 0.5f;
+    const float d2 = q[0] * vx + q[1] * vy + q[2] * vz;
+    return V3{ vx * w2 + (q[1] * vz - q[2] * vy) * q[3] + q[0] * d2,
+               vy * w2 + (q[2] * vx - q[0] * vz) * q[3] + q[1] * d2,
+               vz * w2 + (q[0] * vy - q[1] * vx) * q[3] + q[2] * d2 };
+}
+static V3 qRotInv(const float q[4], V3 v)
+{
+    const float vx = 2 * v.x, vy = 2 * v.y, vz = 2 * v.z;
+    const float w2 = q[3] * q[3] - 0.5f;
+    const float d2 = q[0] * vx + q[1] * vy + q[2] * vz;
+    return V3{ vx * w2 - (q[1] * vz - q[2] * vy) * q[3] + q[0] * d2,
+               vy * w2 - (q[2] * vx - q[0] * vz) * q[3] + q[1] * d2,
+               vz * w2 - (q[0] * vy - q[1] * vx) * q[3] + q[2] * d2 };
+}
+// q = a * b (PxQuat::operator*)
+static void qMul(const float a[4], const float b[4], float out[4])
+{
+    out[0] = a[3] * b[0] + b[3] * a[0] + a[1] * b[2] - a[2] * b[1];
+    out[1] = a[3] * b[1] + b[3] * a[1] + a[2] * b[0] - a[0] * b[2];
+    out[2] = a[3] * b[2] + b[3] * a[2] + a[0] * b[1] - a[1] * b[0];
+    out[3] = a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2];
+}
+// vertex2Shape(v, scale, rot) = rot.rotateInv(rot.rotate(v) * scale) -- MULTIPLIES.
+static V3 vertex2Shape(V3 v, V3 scale, const float rot[4])
+{
+    const V3 t = qRot(rot, v);
+    return qRotInv(rot, V3{ t.x * scale.x, t.y * scale.y, t.z * scale.z });
+}
+} // namespace p817cg
+
+PXG_TEST(femClothSimMeshContactGen)
+{
+    using namespace p816dc;        // PxgShapeHost, CmInputHost
+    using namespace p817cg;
+    using p817cg::V3;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // ---- the two rigid transforms and the mesh scale ---------------------------------------
+    // Deliberately DIFFERENT and both non-trivial: a wrong transformInv composition, a dropped
+    // vertex2Shape or a rotate/rotateInv swap all move the static plane in cloth space.
+    const float QS = 0.70710678f;
+    const float clothQ[4] = { 0.0f, 0.0f, QS, QS };   // 90 degrees about z
+    const V3 clothP{ 7.0f, 8.0f, 9.0f };
+    const float meshQ[4] = { 0.0f, QS, 0.0f, QS };    // 90 degrees about y
+    const V3 meshP{ 1.0f, 2.0f, 3.0f };
+    const V3 meshScale{ 2.0f, 1.0f, 0.5f };
+    const float meshScaleRot[4] = { 0.0f, 0.0f, 0.0f, 1.0f };   // identity
+
+    // ---- the cooked mesh: a decoy at index 0, the real triangle at index 1 -------------------
+    // Primitive 0 is parked 1000 up, so a kernel that ignores meshTriangleIdx and always reads
+    // primitive 0 finds nothing at all.
+    std::vector<F4> mv = {
+        { -5.0f, 1000.0f, -5.0f, 0 }, { -5.0f, 1000.0f, 5.0f, 0 }, { 5.0f, 1000.0f, -5.0f, 0 },
+        { -5.0f,    0.0f, -5.0f, 0 }, { -5.0f,    0.0f, 5.0f, 0 }, { 5.0f,    0.0f, -5.0f, 0 },
+    };
+    std::vector<TriIdx4> mi = { { 0u, 1u, 2u, 0u }, { 3u, 4u, 5u, 0u } };
+    const uint32_t REAL_PRIM = 1u;
+
+    std::vector<uint32_t> blob(4u + 292u, 0u);     // header + one (unused) BV32 node
+    const size_t vBase = blob.size();
+    blob.resize(vBase + mv.size() * 4u, 0u);
+    std::memcpy(blob.data() + vBase, mv.data(), mv.size() * sizeof(F4));
+    const size_t iBase = blob.size();
+    blob.resize(iBase + mi.size() * 4u, 0u);
+    std::memcpy(blob.data() + iBase, mi.data(), mi.size() * sizeof(TriIdx4));
+    blob[0] = uint32_t(mv.size());
+    blob[1] = uint32_t(mi.size());
+    blob[2] = 7u;      // header.z: a deliberately WRONG node count -- only .w sizes the array
+    blob[3] = 1u;      // header.w: nbPackedNodes
+
+    DevBuf bBlob = makeDev(dev, blob);
+    if (!bBlob.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    // ---- the mesh triangle's image in CLOTH-LOCAL space -------------------------------------
+    // meshToCloth = clothT.transformInv(meshT):  q = conj(clothQ) * meshQ,
+    //                                            p = conj(clothQ).rotate(meshP - clothP)
+    float clothQConj[4] = { -clothQ[0], -clothQ[1], -clothQ[2], clothQ[3] };
+    float m2cQ[4];
+    qMul(clothQConj, meshQ, m2cQ);
+    const V3 m2cP = qRotInv(clothQ, sub(meshP, clothP));
+    auto toClothLocal = [&](F4 v) {
+        return add(qRot(m2cQ, vertex2Shape(V3{ v.x, v.y, v.z }, meshScale, meshScaleRot)), m2cP);
+    };
+    const V3 A0 = toClothLocal(mv[3]), B0 = toClothLocal(mv[4]), C0 = toClothLocal(mv[5]);
+    const V3 fixNormal = norm(crs(sub(B0, A0), sub(C0, A0)));
+    // A point safely inside the triangle, and an in-plane basis to spread the corners over.
+    const V3 centre{ (A0.x + B0.x + C0.x) / 3.0f, (A0.y + B0.y + C0.y) / 3.0f, (A0.z + B0.z + C0.z) / 3.0f };
+    const V3 t1 = norm(sub(B0, A0));
+    const V3 t2 = crs(fixNormal, t1);
+
+    // ---- the cloth: one query triangle per pair, at a chosen gap along fixNormal -------------
+    const float CD_CLOTH = 0.05f, CD_MESH = 0.15f;
+    const float cDistance = CD_CLOTH + CD_MESH;      // 0.20
+    const uint32_t NB_PAIRS = 40u;                   // straddles a warp boundary: l = 64
+    // Pairs 0, 2 and 4 make contact in warp 0; pair 35 makes the only contact in warp 1.
+    auto gapFor = [&](uint32_t i) -> float {
+        if (i == 0u) return 0.10f;
+        if (i == 2u) return -0.05f;     // penetrating: kept by the -cDistance slab
+        if (i == 4u) return 0.10f;
+        if (i == 3u) return 0.10f;      // would make contact, but all three verts are filtered
+        if (i == 35u) return 0.02f;
+        return 0.25f;                   // outside the +cDistance slab -> clipped to nothing
+    };
+    std::vector<F4> cv;
+    std::vector<TriIdx4> ci;
+    std::vector<V3> corner(NB_PAIRS * 3u);
+    for (uint32_t i = 0; i < NB_PAIRS; ++i)
+    {
+        const float g = gapFor(i);
+        const V3 base = add(centre, scl(fixNormal, g));
+        const V3 c0 = add(base, scl(t1, 0.20f));
+        const V3 c1 = add(base, scl(t2, 0.20f));
+        const V3 c2 = add(base, scl(t1, -0.20f));
+        corner[i * 3 + 0] = c0; corner[i * 3 + 1] = c1; corner[i * 3 + 2] = c2;
+        const uint32_t b = uint32_t(cv.size());
+        cv.push_back(F4{ c0.x, c0.y, c0.z, 1.0f });
+        cv.push_back(F4{ c1.x, c1.y, c1.z, 1.0f });
+        cv.push_back(F4{ c2.x, c2.y, c2.z, 1.0f });
+        ci.push_back(TriIdx4{ b, b + 1u, b + 2u, 0u });
+    }
+    DevBuf bCv = makeDev(dev, cv), bCi = makeDev(dev, ci);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bCv.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bCi.addr));
+    c.mNbTriangles = NB_PAIRS;
+    c.mNbVerts = uint32_t(cv.size());
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- shapes, contact managers, transforms ----------------------------------------------
+    // SWAPPED order: shapeRef0 is the TRIMESH and shapeRef1 the cloth, so the kernel has to find
+    // the cloth by particleOrSoftbodyId rather than by position.
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_TRIANGLEMESH_H; shapes[0].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[0].sx = meshScale.x; shapes[0].sy = meshScale.y; shapes[0].sz = meshScale.z;
+    shapes[0].srw = 1.0f;
+    shapes[0].materialIndex = 0x2Au;
+    shapes[0].hullLo = uint32_t(bBlob.addr & 0xFFFFFFFFull);
+    shapes[0].hullHi = uint32_t(bBlob.addr >> 32);
+    shapes[1].type = GEOM_TRIANGLEMESH_H; shapes[1].particleOrSoftbodyId = 0u;
+    shapes[1].sx = shapes[1].sy = shapes[1].sz = 1.0f; shapes[1].srw = 1.0f;
+    DevBuf bShapes = makeDev(dev, shapes);
+
+    // cmIdx 1 is the live pair; entry 0 exists only so restDistance[cmIdx] can be told from
+    // restDistance[0].
+    const uint32_t CM_IDX = 1u;
+    std::vector<CmInputHost> cms = { { 9u, 9u, 9u, 9u }, { 0u, 1u, /*trimesh cache*/ 1u, /*cloth cache*/ 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    // PxsCachedTransform, 32 B each: slot 0 = the cloth, slot 1 = the trimesh.
+    std::vector<float> xf(2 * 8, 0.0f);
+    xf[0] = clothQ[0]; xf[1] = clothQ[1]; xf[2] = clothQ[2]; xf[3] = clothQ[3];
+    xf[4] = clothP.x;  xf[5] = clothP.y;  xf[6] = clothP.z;
+    xf[8 + 0] = meshQ[0]; xf[8 + 1] = meshQ[1]; xf[8 + 2] = meshQ[2]; xf[8 + 3] = meshQ[3];
+    xf[8 + 4] = meshP.x;  xf[8 + 5] = meshP.y;  xf[8 + 6] = meshP.z;
+    DevBuf bXf = makeDev(dev, xf);
+
+    std::vector<float> cd = { CD_CLOTH, CD_MESH };
+    DevBuf bCd = makeDev(dev, cd);
+    const float REST_D = 0.33f;
+    std::vector<float> rd = { 9.9f, REST_D };     // rd[CM_IDX] is the one that must be written
+    DevBuf bRd = makeDev(dev, rd);
+
+    // shapeToRigidRemapTable is indexed by the TRIMESH cache ref (1).
+    const uint64_t RIGID_ID = 0x1234000056780000ull;
+    std::vector<uint64_t> remap = { 0xDEADull, RIGID_ID };
+    DevBuf bRemap = makeDev(dev, remap);
+
+    // ---- the filter list: all three verts of pair 3, only two of pair 4 ---------------------
+    std::vector<RigidFilterPairHost> filters;
+    auto addFilter = [&](uint32_t vertIdx) {
+        RigidFilterPairHost f = {};
+        f.index0 = RIGID_ID;
+        f.index1 = uint64_t(vertIdx);   // clothId 0 -> the mask IS the vertex index
+        f.index2 = 0u;
+        filters.push_back(f);
+    };
+    for (uint32_t v = 9u; v <= 11u; ++v) addFilter(v);    // pair 3's three vertices
+    addFilter(12u); addFilter(13u);                        // TWO of pair 4's three
+    std::sort(filters.begin(), filters.end(),
+              [](const RigidFilterPairHost& a, const RigidFilterPairHost& b) {
+                  return a.index0 != b.index0 ? a.index0 < b.index0 : a.index1 < b.index1;
+              });
+    DevBuf bFilters = makeDev(dev, filters);
+
+    // ---- the pair stack ---------------------------------------------------------------------
+    std::vector<uint32_t> stack(NB_PAIRS * 4u, 0u);
+    for (uint32_t i = 0; i < NB_PAIRS; ++i)
+    {
+        stack[i * 4 + 0] = CM_IDX;
+        stack[i * 4 + 1] = i;            // the cloth triangle
+        stack[i * 4 + 2] = REAL_PRIM;    // the mesh triangle
+        stack[i * 4 + 3] = 0u;
+    }
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairNum = { NB_PAIRS };
+    DevBuf bPairNum = makeDev(dev, pairNum);
+    std::vector<uint32_t> needed = { 0u };
+    DevBuf bNeeded = makeDev(dev, needed);
+
+    // ---- the writer's output buffers, poisoned so an untouched lane is visible --------------
+    const uint32_t MAXC = 32u;
+    std::vector<F4> outPoint(MAXC), outNormalPen(MAXC), outBary(MAXC);
+    std::memset(outPoint.data(), 0xAB, MAXC * sizeof(F4));
+    std::memset(outNormalPen.data(), 0xAB, MAXC * sizeof(F4));
+    std::memset(outBary.data(), 0xAB, MAXC * sizeof(F4));
+    std::vector<uint32_t> outInfo(MAXC * 4u, 0xABABABABu);
+    std::vector<uint64_t> outByX(MAXC, 0xCDCDCDCDCDCDCDCDull);   // must stay UNTOUCHED
+    std::vector<uint32_t> outTempByX(MAXC, 0xCDCDCDCDu);         // must stay UNTOUCHED
+    std::vector<uint32_t> outIdxByX(MAXC, 0xABABABABu);
+    std::vector<uint32_t> outSorted32(MAXC, 0xABABABABu);
+    std::vector<uint32_t> outCount = { 0u };
+    DevBuf bPoint = makeDev(dev, outPoint), bNormalPen = makeDev(dev, outNormalPen),
+           bBary = makeDev(dev, outBary), bInfo = makeDev(dev, outInfo),
+           bByX = makeDev(dev, outByX), bTempByX = makeDev(dev, outTempByX),
+           bIdxByX = makeDev(dev, outIdxByX), bSorted32 = makeDev(dev, outSorted32),
+           bCount = makeDev(dev, outCount);
+
+    ClothMeshCgPush push = {};
+    push.toleranceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.contactDistance = bCd.addr;
+    push.restDistance = bRd.addr;
+    push.gpuShapes = bShapes.addr;
+    push.femClothes = bDesc.addr;
+    push.shapeToRigidRemapTable = bRemap.addr;
+    push.stackSizeBytes = NB_PAIRS * 16u;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairNum.addr;
+    push.filterPairs = bFilters.addr;
+    push.nbFilterPairs = uint32_t(filters.size());
+    push.stackSizeNeededOnDevice = bNeeded.addr;
+    push.wPoint = bPoint.addr; push.wNormalPen = bNormalPen.addr; push.wBary = bBary.addr;
+    push.wInfo = bInfo.addr;   push.wCount = bCount.addr;
+    push.wByX = bByX.addr;     push.wTempByX = bTempByX.addr;
+    push.wIdxByX = bIdxByX.addr; push.wSorted32 = bSorted32.addr;
+    push.wMaxContacts = MAXC;
+
+    Kernel k("femClothMeshContactGenBda.spv", "cloth_meshContactGenLaunch", {}, sizeof(ClothMeshCgPush));
+    // The engine's grid (PxgNarrowphaseCore.cpp:6694): 2048 blocks of 128 threads.  Only block 0
+    // has pairs in range here, so the emitted slot order is deterministic.
+    k.dispatch(/*gridX*/ 2048u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // ---- the expected contacts, analytically -------------------------------------------------
+    // The clip leaves each in-band triangle whole, so all three corners sit at the same depth,
+    // getDeepestPointSimplified averages them and the barycentric is (1/3, 1/3, 1/3).
+    struct Expect { uint32_t tri; float sep; V3 point; };
+    std::vector<Expect> expect;
+    for (uint32_t i = 0; i < NB_PAIRS; ++i)
+    {
+        if (i == 3u) continue;                       // filtered on all three vertices
+        const float g = gapFor(i);
+        if (!(g < cDistance) || g > cDistance) continue;
+        if (g >= cDistance) continue;
+        if (g > 0.20f) continue;
+        const V3 c0 = corner[i * 3 + 0], c1 = corner[i * 3 + 1], c2 = corner[i * 3 + 2];
+        // sep = planeDistance(plane, c0) -- the FIRST corner sets minDist and the other two only
+        // accumulate into the average.
+        const float sep = dot(fixNormal, c0) - dot(fixNormal, A0);
+        const V3 deepest{ (c0.x + c1.x + c2.x) / 3.0f, (c0.y + c1.y + c2.y) / 3.0f,
+                          (c0.z + c1.z + c2.z) / 3.0f };
+        expect.push_back({ i, sep, add(qRot(clothQ, deepest), clothP) });
+    }
+    PXG_CHECK_MSG(expect.size() == 4u,
+                  "reference: expected 4 contacts (pairs 0, 2, 4 in warp 0 and pair 35 in warp 1), "
+                  "got %zu", expect.size());
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+    PXG_CHECK_MSG(gCount == uint32_t(expect.size()),
+                  "emitted %u contacts, expected %zu.  0 usually means the blob walk or the "
+                  "transform chain is wrong; 5 means the all-three-vertices filter skip became "
+                  "an any-vertex one; 3 means the second warp's reservation was lost",
+                  gCount, expect.size());
+
+    const auto gPoint = downloadBuffer<F4>(dev, bPoint.h, MAXC);
+    const auto gNormalPen = downloadBuffer<F4>(dev, bNormalPen.h, MAXC);
+    const auto gBary = downloadBuffer<F4>(dev, bBary.h, MAXC);
+    const auto gInfo = downloadBuffer<uint32_t>(dev, bInfo.h, MAXC * 4u);
+    const auto gIdx = downloadBuffer<uint32_t>(dev, bIdxByX.h, MAXC);
+    const auto gSorted = downloadBuffer<uint32_t>(dev, bSorted32.h, MAXC);
+
+    const V3 wn = qRot(clothQ, fixNormal);
+    size_t mm = 0;
+    for (uint32_t s = 0; s < gCount && s < expect.size(); ++s)
+    {
+        const Expect& e = expect[s];
+        std::printf("  slot %u: tri %u sep %.6f point (%.4f %.4f %.4f)\n", s, e.tri,
+                    gNormalPen[s].w, gPoint[s].x, gPoint[s].y, gPoint[s].z);
+        auto near1 = [&](float a, float b) { return std::fabs(a - b) < 2.0e-4f; };
+        if (!near1(gPoint[s].x, e.point.x) || !near1(gPoint[s].y, e.point.y) ||
+            !near1(gPoint[s].z, e.point.z))
+        { ++mm; std::printf("  slot %u point MM: got (%.6f %.6f %.6f) ref (%.6f %.6f %.6f)\n", s,
+                            gPoint[s].x, gPoint[s].y, gPoint[s].z, e.point.x, e.point.y, e.point.z); }
+        if (!near1(gPoint[s].w, REST_D))
+        { ++mm; std::printf("  slot %u point.w MM: got %.6f ref %.6f (restDistance[cmIdx])\n",
+                            s, gPoint[s].w, REST_D); }
+        if (!near1(gNormalPen[s].x, wn.x) || !near1(gNormalPen[s].y, wn.y) || !near1(gNormalPen[s].z, wn.z))
+        { ++mm; std::printf("  slot %u normal MM: got (%.6f %.6f %.6f) ref (%.6f %.6f %.6f)\n", s,
+                            gNormalPen[s].x, gNormalPen[s].y, gNormalPen[s].z, wn.x, wn.y, wn.z); }
+        if (!near1(gNormalPen[s].w, e.sep))
+        { ++mm; std::printf("  slot %u separation MM: got %.6f ref %.6f\n", s, gNormalPen[s].w, e.sep); }
+        const float third = 1.0f / 3.0f;
+        if (!near1(gBary[s].x, third) || !near1(gBary[s].y, third) || !near1(gBary[s].z, third))
+        { ++mm; std::printf("  slot %u barycentric MM: got (%.6f %.6f %.6f), expected thirds\n",
+                            s, gBary[s].x, gBary[s].y, gBary[s].z); }
+        // PxgFemOtherContactInfo: pairInd0 = the rigid node index (u64), pairInd1 = the encoded
+        // cloth TRIANGLE, then the rigid material with bit 31 cleared.
+        const uint64_t gotPair0 = uint64_t(gInfo[s * 4 + 0]) | (uint64_t(gInfo[s * 4 + 1]) << 32);
+        if (gotPair0 != RIGID_ID)
+        { ++mm; std::printf("  slot %u pairInd0 MM: got 0x%llx ref 0x%llx\n", s,
+                            (unsigned long long)gotPair0, (unsigned long long)RIGID_ID); }
+        if (gInfo[s * 4 + 2] != e.tri)
+        { ++mm; std::printf("  slot %u pairInd1 MM: got %u ref %u (encoded cloth TRIANGLE)\n",
+                            s, gInfo[s * 4 + 2], e.tri); }
+        if (gInfo[s * 4 + 3] != 0x2Au)
+        { ++mm; std::printf("  slot %u material MM: got 0x%x ref 0x2A\n", s, gInfo[s * 4 + 3]); }
+        if (gSorted[s] != uint32_t(RIGID_ID & 0xFFFFFFFFull))
+        { ++mm; std::printf("  slot %u contactSortedByX MM: got 0x%x ref 0x%x (the LOW word)\n",
+                            s, gSorted[s], uint32_t(RIGID_ID & 0xFFFFFFFFull)); }
+        if (gIdx[s] != s)
+        { ++mm; std::printf("  slot %u contactIndexSortedByX MM: got %u ref %u\n", s, gIdx[s], s); }
+    }
+    PXG_CHECK_MSG(mm == 0, "cloth_meshContactGen contact fields (%zu mismatches)", mm);
+
+    // The u64 sort keys belong to the OTHER writer variant and must be left alone.
+    const auto gByX = downloadBuffer<uint64_t>(dev, bByX.h, MAXC);
+    const auto gTempByX = downloadBuffer<uint32_t>(dev, bTempByX.h, MAXC);
+    size_t touched = 0;
+    for (uint32_t s = 0; s < MAXC; ++s)
+    {
+        if (gByX[s] != 0xCDCDCDCDCDCDCDCDull) ++touched;
+        if (gTempByX[s] != 0xCDCDCDCDu) ++touched;
+    }
+    PXG_CHECK_MSG(touched == 0,
+                  "writeRigidVsDeformableContact32 must NOT write contactByX / tempContactByX -- "
+                  "%zu of those words changed", touched);
+
+    // The slot BEYOND the last contact must still be poison: the reservation is per warp, so a
+    // lost or double reservation shows up as a gap or an overwrite here.
+    PXG_CHECK_MSG(gIdx[expect.size()] == 0xABABABABu,
+                  "slot %zu was written; the two warps must occupy exactly %zu consecutive slots",
+                  expect.size(), expect.size());
+
+    // stackSizeNeededOnDevice is an atomicMax of the BYTE count.
+    const uint32_t gNeeded = downloadBuffer<uint32_t>(dev, bNeeded.h, 1)[0];
+    PXG_CHECK_MSG(gNeeded == NB_PAIRS * 16u,
+                  "stackSizeNeededOnDevice must be the pair count in BYTES (got %u, expected %u)",
+                  gNeeded, NB_PAIRS * 16u);
+
+    for (PxgBufferHandle h : { bBlob.h, bCv.h, bCi.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h,
+                               bRd.h, bRemap.h, bFilters.h, bStack.h, bPairNum.h, bNeeded.h,
+                               bPoint.h, bNormalPen.h, bBary.h, bInfo.h, bByX.h, bTempByX.h,
+                               bIdxByX.h, bSorted32.h, bCount.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace

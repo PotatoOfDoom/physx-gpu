@@ -2794,7 +2794,14 @@ int main()
     // drops then converges to ~floorY), NOT tunnel to -inf and NOT free-fall through.
     if (!std::strcmp(sceneName, "clothdrape"))
     {
-        const ClothDrapeConfig cfg;   // floorY = 0.0, spawnY = 1.5
+        ClothDrapeConfig cfg;         // floorY = 0.0, spawnY = 1.5
+        // PXG_CLOTH_SPAWNY lowers the drop.  It exists because the COOKED MESH floor's contact
+        // pair is a NARROWPHASE pair with a finite contact offset, unlike the infinite plane's:
+        // dropped from 1.5 the sheet is doing ~5 m/s when it arrives and the pair is live for
+        // only about six narrowphase invocations, which is not enough substeps to stop it --
+        // classic tunnelling, and NOT a statement about the contact path.  A short drop keeps
+        // the pair engaged and lets the settle be measured.
+        if (const char* sy = std::getenv("PXG_CLOTH_SPAWNY")) cfg.spawnY = float(atof(sy));
         ClothScene csc = buildClothDrapeScene(physics, scene, material, cudaCtx, cfg);
         if (!csc.surface || csc.numVerts == 0)
         {
@@ -2848,12 +2855,16 @@ int main()
                     "rest |dy| over last %d steps = %.6f\n",
                     mean0, meanEnd, drop, steps * dt, minEnd, restWindow, restMaxDy);
 
-        // PXG_CLOTH_FLOOR=mesh is a DIAGNOSTIC, not a settle test: with only the midphase of the
-        // cloth-vs-trimesh pair ported (P8.17 step 1) the sheet still falls straight through, so
-        // asserting the settle here would be asserting a state that does not exist yet.  What IS
-        // checked is that the run is well-formed -- the sheet falls and the numbers stay finite --
-        // and PXG_LAUNCH_TRACE=1 shows cloth_meshMidphaseGeneratePairsLaunch dispatching.  The
-        // settle assertions come back on when step 2 (cloth_meshContactGenLaunch) lands.
+        // PXG_CLOTH_FLOOR=mesh is a DIAGNOSTIC, not a settle test -- and after P8.17 step 2 that is
+        // a statement about the SOLVE, not about contact generation.  Both mesh kernels are mapped
+        // and both work on this scene: instrumenting the engine shows 64 midphase pairs and 43
+        // contacts arriving at cloth_rigidContactPrepareLaunch with the right normal (0, 1, 0),
+        // the right barycentrics (1/3, 1/3, 1/3, 0) and sane separations.  The sheet still free-
+        // falls with an IDENTICAL total drop even when spawned INSIDE the contact band, so the
+        // impulse is lost downstream, in the cloth-vs-rigid chain's TRIANGLE branch -- which no
+        // scene has ever exercised, because the plane floor only ever produces VERTEX contacts
+        // (barycentric.w != 0).  See RUNTIME_STATUS, P8.17 step 2.  The settle assertions switch
+        // on when that branch is fixed.
         const char* clothFloorEnv2 = std::getenv("PXG_CLOTH_FLOOR");
         const bool meshFloorDiag = clothFloorEnv2 && !std::strcmp(clothFloorEnv2, "mesh");
 
@@ -2876,7 +2887,8 @@ int main()
         {
             if (meshFloorDiag)
                 std::printf("[  OK  ] gpu-sdk-step: clothdrape on a COOKED MESH floor ran cleanly "
-                            "(diagnostic: mean y %.4f, min y %.4f — the settle needs step 2)\n",
+                            "(diagnostic: mean y %.4f, min y %.4f — contacts ARE generated; the "
+                            "settle needs the cloth-vs-rigid TRIANGLE solve branch)\n",
                             meanEnd, minEnd);
             else
                 std::printf("[  OK  ] gpu-sdk-step: FEMCloth fell onto the floor and SETTLED under contact\n");

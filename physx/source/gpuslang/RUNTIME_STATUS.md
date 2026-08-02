@@ -1620,6 +1620,104 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.17 step 2 — cloth-vs-COOKED-TRIANGLE-MESH: the contact generation, and where the impulse is lost
+
+`cloth_meshContactGenLaunch` on the engine BDA ABI. **Manifest 255 → 256.** New shader
+`femClothMeshContactGenBda.slang`. The kernel is ported, fixture-verified and demonstrably
+producing correct contacts on a live scene — and the sheet still falls through, for a reason that
+turns out to sit **downstream of this tranche entirely**. That investigation is the more valuable
+half of this entry, so it is written up in full below.
+
+**The core is a LIFT, not a new transcription.** `fcStaticTriCloth.slang` already ports
+`staticTriangleVsClothCollision` for the descriptor-set engine (its mode 0), with
+`testFcStaticTriCloth.cpp` covering the trim pipeline's sign-change bookkeeping, the in-place
+insert branch, the `±0.01·cDistance` averaging band and the degenerate paths against a CPU
+transcription. The clipping code here is that port verbatim; what is new is the BDA plumbing,
+which is exactly what `fcStaticTriCloth`'s own header lists as "engine glue not ported". Two
+copies of the clipping pipeline is a knowing cost: the descriptor-set shader is a unit-test
+harness with a case-array interface and cannot be imported by a push-constant kernel.
+
+**The arg pack is NOT `sb_meshContactGenLaunch`'s**, even though both are 192 bytes and both end
+in an 80-byte `PxgFEMContactWriter`. The middle differs: `stackSizeBytes` sits at **@64 BEFORE**
+the two stack pointers here and at **@80 AFTER** them there. Reading one with the other's layout
+hands the kernel a byte count where a device pointer belongs — which is the first mutant below,
+and it segfaults.
+
+Beyond the pack, four things differ from the softbody sibling: there is no GJK/EPA (this is a
+polygon clip); the transform runs the OTHER way (step 1 brings the cloth into the mesh's vertex
+space, this brings the mesh triangle into the cloth's local frame — `vertex2Shape` MULTIPLIES);
+the filter skip needs **all three** cloth vertices; and the write is
+`writeRigidVsDeformableContact32`, which fills the barycentrics and the 32-bit
+`contactSortedByX` lane while deliberately leaving the u64 `contactByX`/`tempContactByX` keys
+alone.
+
+**17 mutants, 17 killed** — the softbody field order, inverted cloth/mesh resolution, the `.z`/`.w`
+blob size, `vertex2Shape` dividing, a reversed `transformInv` composition, the filter skip needing
+any vertex instead of all three, `restDistance[0]` instead of `[cmIdx]`, the high word in the sort
+lane, a vertex id in `pairInd1`, the isInCollision bit left set, the sub-warp loop truncated, the
+u64 keys written, the deepest-point tolerance band removed, a flipped `fixNormal`, the stack
+high-water mark in pairs instead of bytes, an inclusive ballot scan, and `meshTriangleIdx` ignored.
+
+The fixture puts 40 pairs on the stack so they **straddle a warp boundary**, with a contact in
+each warp, so both per-warp reservations are exercised and their slots must come out in warp
+order. Its geometry is derived FROM the transform chain — each query triangle is built from the
+mesh triangle's own cloth-local image, offset along its normal — so a shader whose chain differs
+computes a different plane and a different separation.
+
+### The scene: contacts are generated, and the impulse is lost downstream
+
+`PXG_SCENE=clothdrape PXG_CLOTH_FLOOR=mesh` still ends with the sheet at **−44.31**, and the
+instrumentation says why it is not this tranche's fault. Both kernels dispatch (6 times each over
+the run), and a temporary probe in `PxgNarrowphaseCore::testSDKFemClothTrimesh` plus one at
+`PxgFEMClothCore::prepRigidContactConstraint` shows:
+
+```
+[probe] clothTrimesh numTests=1 midphasePairs=64 contacts=43
+[prep]  rigidContacts=43  sorted[0] pt=(-0.667 0.037 -0.667 | 0.000)
+                                    np=(0.000 1.000 0.000 | 0.0374)
+                                    bary=(0.333 0.333 0.333 0.000)
+```
+
+Sixty-four midphase pairs, forty-three contacts, and they arrive at the prepare **already
+reordered** with the right normal, the right barycentrics and sane separations. The contact path
+works end to end.
+
+**And the sheet free-falls with an IDENTICAL total drop (44.3902) whether it is spawned 1.5 above
+the floor, 0.25 above it, or 0.03 above it — INSIDE the 0.1 contact band.** A drop that does not
+change when the sheet starts already in contact is not tunnelling and not a cadence problem: the
+constraints produce **zero impulse**.
+
+The suspect is specific. `writeRigidVsDeformableContact32` emits a **TRIANGLE** contact —
+`pairInd1` is an encoded triangle and `barycentric.w == 0` — and every consumer branches on
+exactly that: `cloth_rigidContactPrepareLaunch` (`FEMClothConstraintPrep.cu:130`),
+`cloth_queryRigidClothContactReferenceCountLaunch` and `cloth_solveRigidClothCollisionLaunch` all
+take a different path for `barycentric.w == 0` than for a vertex contact. **No scene has ever
+exercised that branch**: `clothdrape`'s plane floor, `clothhang` and `clothselfcollide` all
+produce VERTEX contacts (`barycentric = (0,0,0,1)`). `femClothRigidContactBda` carries the
+triangle branch textually — `readClothVertexInvMasses` reads `mTriangleVertexIndices` under
+`bc.w == 0.0f` — so this is not a missing branch but an unverified one, and the mass-splitting it
+does through `mDeltaPos.w` is the part with the most room to be wrong.
+
+**Where the investigation stopped, and what the next step is.** The next tranche should probe
+`mRigidFEMAppliedForcesBuf` (the per-contact λN) right after `cloth_solveRigidClothCollisionLaunch`
+on this scene: a λN of zero puts the fault in the prepare or the query's reference counting, a
+non-zero λN that never reaches `mDeltaPos` puts it in the solve's scatter. The two probes used
+above are the tool — they were removed from the engine sources before committing, and are
+reproduced here so they can be re-applied:
+
+* in `testSDKFemClothTrimesh`, after the contact-gen launch, `memcpyDtoH` of
+  `gpuMidphasePairsNumOnDevice` and `totalNumCountsd`;
+* in `prepRigidContactConstraint`, before the launch, `memcpyDtoH` of `totalContactCountsd` and
+  element 0 of `contactsd` / `normalpensd` / `barycentricsd` / `contactInfosd`.
+
+`PXG_CLOTH_SPAWNY` was added to the drape scene for this work: it lowers the drop so the sheet
+arrives slowly, which is what ruled tunnelling out.
+
+**Verification:** forced-fresh `.spv` for both P8.17 shaders, suite through `tools/run_suite.sh` —
+**674/674 in both memory modes** (`gpuslang.femClothSim` 46 → 47 fixtures); `cloth`, `clothdrape`
+(plane floor), `clothhang`, `clothcloth` and `clothselfcollide` all green. The engine probes were
+reverted; the only engine-source change in this tranche is none.
+
 ## P8.17 step 1 — cloth-vs-COOKED-TRIANGLE-MESH: the midphase
 
 `cloth_meshMidphaseGeneratePairsLaunch` on the engine BDA ABI. **Manifest 254 → 255.** New shader
