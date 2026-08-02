@@ -737,6 +737,28 @@ ClothScene buildClothDrapeScene(PxPhysics* physics, PxScene* scene, PxMaterial* 
     PxShape* shape = physics->createShape(PxTriangleMeshGeometry(triMesh), mats, PxU16(1), true, shapeFlags);
     if (!shape) { std::printf("FAIL: createShape (deformable surface) returned null\n"); return out; }
 
+    // THE REST OFFSET MATTERS ONLY FOR THE MESH FLOOR, and understanding why was the whole of
+    // P8.18.  A contact activates when `CN = (initPen + ...) * invDt + normalVel < 0`
+    // (deformableUtils.cuh:354).  Against a STATIC floor `normalVel` is zero, so with a ZERO rest
+    // offset `initPen` is the raw separation and CN stays POSITIVE for as long as the sheet is
+    // above the floor -- the contact is generated but never activated.  It would activate once
+    // the sheet penetrated, except that a cooked triangle is ONE-SIDED: the midphase's front-face
+    // cull (`triangle1.triPlane.distance(clothCentroid) >= 0`) drops the pair the instant the
+    // centroid crosses the plane.  With no rest offset the window in which the contact both
+    // EXISTS and is ACTIVE is empty, and the sheet sails through.
+    //
+    // An infinite PLANE floor has no such window: its vertex contacts keep being generated with a
+    // growing NEGATIVE separation as the vertex sinks, which is why the plane variant has always
+    // settled without one.  The rest offset moves the activation threshold OUT to where the pair
+    // still exists -- the same thing clothselfcollide and clothcloth already do.  Applied only to
+    // the mesh variant so the plane baseline stays exactly where it was.
+    if (floorIsMesh)
+    {
+        shape->setContactOffset(0.1f);
+        shape->setRestOffset(0.05f);
+    }
+
+
     PxDeformableSurface* surface = physics->createDeformableSurface(*cudaCtx);
     if (!surface) { std::printf("FAIL: createDeformableSurface returned null\n"); return out; }
 
@@ -2795,12 +2817,16 @@ int main()
     if (!std::strcmp(sceneName, "clothdrape"))
     {
         ClothDrapeConfig cfg;         // floorY = 0.0, spawnY = 1.5
-        // PXG_CLOTH_SPAWNY lowers the drop.  It exists because the COOKED MESH floor's contact
-        // pair is a NARROWPHASE pair with a finite contact offset, unlike the infinite plane's:
-        // dropped from 1.5 the sheet is doing ~5 m/s when it arrives and the pair is live for
-        // only about six narrowphase invocations, which is not enough substeps to stop it --
-        // classic tunnelling, and NOT a statement about the contact path.  A short drop keeps
-        // the pair engaged and lets the settle be measured.
+        // The COOKED MESH floor drops from 0.60 rather than 1.50, and that is a statement about
+        // IMPACT SPEED rather than about the contact path: the mesh pair's midphase runs roughly
+        // every sixth step, and from 1.50 the sheet is doing ~5 m/s and crosses the whole 0.1
+        // contact band between two consecutive midphase invocations -- ordinary tunnelling.  From
+        // 0.60, and every height tested below it, it settles cleanly.  The infinite PLANE has no
+        // midphase and keeps its 1.50 baseline.
+        {
+            const char* ff0 = std::getenv("PXG_CLOTH_FLOOR");
+            if (ff0 && !std::strcmp(ff0, "mesh")) cfg.spawnY = 0.60f;
+        }
         if (const char* sy = std::getenv("PXG_CLOTH_SPAWNY")) cfg.spawnY = float(atof(sy));
         ClothScene csc = buildClothDrapeScene(physics, scene, material, cudaCtx, cfg);
         if (!csc.surface || csc.numVerts == 0)
@@ -2855,29 +2881,32 @@ int main()
                     "rest |dy| over last %d steps = %.6f\n",
                     mean0, meanEnd, drop, steps * dt, minEnd, restWindow, restMaxDy);
 
-        // PXG_CLOTH_FLOOR=mesh is a DIAGNOSTIC, not a settle test -- and after P8.17 step 2 that is
-        // a statement about the SOLVE, not about contact generation.  Both mesh kernels are mapped
-        // and both work on this scene: instrumenting the engine shows 64 midphase pairs and 43
-        // contacts arriving at cloth_rigidContactPrepareLaunch with the right normal (0, 1, 0),
-        // the right barycentrics (1/3, 1/3, 1/3, 0) and sane separations.  The sheet still free-
-        // falls with an IDENTICAL total drop even when spawned INSIDE the contact band, so the
-        // impulse is lost downstream, in the cloth-vs-rigid chain's TRIANGLE branch -- which no
-        // scene has ever exercised, because the plane floor only ever produces VERTEX contacts
-        // (barycentric.w != 0).  See RUNTIME_STATUS, P8.17 step 2.  The settle assertions switch
-        // on when that branch is fixed.
+        // PXG_CLOTH_FLOOR=mesh is a FULL settle test.  It settles ON its REST OFFSET rather than
+        // on the floor, and that offset is the whole reason it settles at all -- see the builder.
+        // The plane variant keeps its own thresholds: it has no midphase and no rest offset.
         const char* clothFloorEnv2 = std::getenv("PXG_CLOTH_FLOOR");
-        const bool meshFloorDiag = clothFloorEnv2 && !std::strcmp(clothFloorEnv2, "mesh");
+        const bool meshFloor = clothFloorEnv2 && !std::strcmp(clothFloorEnv2, "mesh");
+        const float meshRestBand = cfg.floorY + 0.05f;   // the cloth shape's rest offset
 
         int failures = 0;
         // (1) the cloth must FALL a real distance under gravity (not stuck at spawn).
-        if (!(drop > 0.5f))          { std::printf("FAIL: cloth did not fall (drop=%.4f)\n", drop); ++failures; }
-        if (!meshFloorDiag)
-        {
+        const float minDrop = meshFloor ? 0.4f : 0.5f;
+        if (!(drop > minDrop))       { std::printf("FAIL: cloth did not fall (drop=%.4f)\n", drop); ++failures; }
         // (2) the drop must CONVERGE — the sheet stops moving over the final quarter.
         if (!(restMaxDy < 0.01f))    { std::printf("FAIL: cloth did not settle (rest |dy|=%.6f)\n", restMaxDy); ++failures; }
-        // (3) it must settle ON the floor: mean near floorY and NOT tunnelled below it.
-        if (!(meanEnd < cfg.floorY + 0.5f)) { std::printf("FAIL: cloth did not reach the floor (meanY=%.4f)\n", meanEnd); ++failures; }
-        if (!(minEnd > cfg.floorY - 0.1f))  { std::printf("FAIL: cloth tunnelled below the floor (minY=%.4f)\n", minEnd); ++failures; }
+        // (3) it must settle ON the floor and NOT tunnel through it.
+        if (meshFloor)
+        {
+            if (!(PxAbs(meanEnd - meshRestBand) < 0.03f))
+            { std::printf("FAIL: cloth did not settle ON the rest offset (meanY=%.4f, expected "
+                          "%.4f +/- 0.03)\n", meanEnd, meshRestBand); ++failures; }
+            if (!(minEnd > cfg.floorY - 0.02f))
+            { std::printf("FAIL: cloth tunnelled through the mesh floor (minY=%.4f)\n", minEnd); ++failures; }
+        }
+        else
+        {
+            if (!(meanEnd < cfg.floorY + 0.5f)) { std::printf("FAIL: cloth did not reach the floor (meanY=%.4f)\n", meanEnd); ++failures; }
+            if (!(minEnd > cfg.floorY - 0.1f))  { std::printf("FAIL: cloth tunnelled below the floor (minY=%.4f)\n", minEnd); ++failures; }
         }
         // (4) nothing NaN/inf.
         if (!allFinite || !std::isfinite(meanEnd)) { std::printf("FAIL: cloth y went non-finite\n"); ++failures; }
@@ -2885,11 +2914,10 @@ int main()
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
         if (failures == 0)
         {
-            if (meshFloorDiag)
-                std::printf("[  OK  ] gpu-sdk-step: clothdrape on a COOKED MESH floor ran cleanly "
-                            "(diagnostic: mean y %.4f, min y %.4f — contacts ARE generated; the "
-                            "settle needs the cloth-vs-rigid TRIANGLE solve branch)\n",
-                            meanEnd, minEnd);
+            if (meshFloor)
+                std::printf("[  OK  ] gpu-sdk-step: FEMCloth fell onto a COOKED TRIANGLE MESH floor "
+                            "and SETTLED on its rest offset (mean y=%.4f vs %.4f expected, min y=%.4f)\n",
+                            meanEnd, meshRestBand, minEnd);
             else
                 std::printf("[  OK  ] gpu-sdk-step: FEMCloth fell onto the floor and SETTLED under contact\n");
             return 0;

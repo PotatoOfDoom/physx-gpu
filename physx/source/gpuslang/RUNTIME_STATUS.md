@@ -1620,6 +1620,97 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.18 — the cloth-vs-mesh settle: not a port bug, an ACTIVATION WINDOW
+
+**No kernel was ported in this tranche; the manifest is unchanged at 256.**  P8.17 step 2 handed
+over a chain that produced correct contacts and a sheet that still fell through, with the
+cloth-vs-rigid TRIANGLE solve branch as the named suspect.  That suspicion was **wrong**, and
+chasing it to the bottom turned `PXG_CLOTH_FLOOR=mesh` from a diagnostic into a full settle test:
+
+```
+mesh floor, before:  mean y 1.5000 -> -42.8902   (free fall, contacts generated, zero impulse)
+mesh floor, after:   mean y 0.6000 ->   0.0496   (settles ON its 0.05 rest offset)
+kernels unmapped:    mean y 0.6000 -> -43.7902   (the control, red)
+```
+
+### What the measurement said
+
+A probe on `PxgFEMClothCore` right after `cloth_solveRigidClothCollisionLaunch`:
+
+```
+[solve] n=44 lambdaN=(0.000000 0.000000 0.000000)
+        bary0=(0.333 0.333 0.333 0.000)   norm0=(-0.000 -1.000 -0.000 | 0.04183)
+        raXn0.w=0.00000  fric0.w=0.00000  deltaPos[0]=(0 0 0 | 0.0)
+```
+
+Forty-four contacts reach the solve with the right barycentrics and the right normal, and every
+λN is zero — and so is every reference count.  `raXn0.w = 0` and `fric0.w = 0` are both CORRECT
+for a static floor (a static rigid contributes no response term), so the constraint block is fine.
+
+The answer is one line, `deformableUtils.cuh:354`:
+
+```cpp
+const PxReal error = (initPen + relLinDelta.dot(normal)) * invDt;
+CN = PxMax(maxPenBias, error) + normalVel;
+const bool isActive = wasActive || CN < 0.0f;
+```
+
+`normalVel` is the **RIGID's** normal velocity, which is zero for a static floor.  `relLinDelta`
+is the cloth's accumulated delta, zero at the first solve iteration of a step.  So
+`CN = initPen * invDt`, and with a **zero rest offset** `initPen` is the raw separation: positive
+for as long as the sheet is above the floor.  **The contact is generated and never activated.**
+
+It would activate the moment the sheet penetrated — except that a cooked triangle is **ONE-SIDED**.
+The midphase's front-face cull (`triangle1.triPlane.distance(clothCentroid) >= 0`,
+`femClothClothMidPhase.cu:138`) drops the pair the instant the cloth triangle's centroid crosses
+the plane.  So the window in which the contact both EXISTS and is ACTIVE is **empty**, and the
+sheet sails through with contacts being generated the whole way down.
+
+### Why the plane floor never showed this
+
+`clothdrape`'s original floor is an infinite `PxPlaneGeometry`.  It has no midphase and no
+front-face cull: `cloth_planeVertContactGenLaunch` keeps emitting contacts with a growing
+NEGATIVE separation as each vertex sinks, so CN goes negative on its own and the constraint
+activates.  That is why the scene has always settled without a rest offset, and why nothing in
+the port had ever needed one.  `clothselfcollide` and `clothcloth` both DO set one (0.05 per side)
+— for the same reason, discovered the same way, and recorded in their own entries.
+
+### The fix, and what it is not
+
+Two lines in the scene, applied ONLY to the mesh variant so the plane baseline is untouched:
+
+```cpp
+if (floorIsMesh) { shape->setContactOffset(0.1f); shape->setRestOffset(0.05f); }
+```
+
+**This is a scene fix, not a shader fix.**  Nothing in `femClothMeshMidphaseBda`,
+`femClothMeshContactGenBda` or `femClothRigidContactBda` changed.  The triangle branch of the
+cloth-vs-rigid solve — the P8.17 suspect — turns out to have been correct all along; it simply had
+never been given an active constraint to work on.
+
+**The drop height is also a real effect, and a separate one.**  Even with the rest offset the
+sheet still tunnels from 1.50: the mesh pair's midphase runs roughly every sixth step, and at
+~5 m/s the sheet crosses the whole 0.1 contact band between two consecutive invocations.  From
+0.60 — and every height tested below it, down to 0.03 — it settles cleanly, so the mesh variant
+drops from 0.60 and the plane variant keeps its 1.50.  Ordinary tunnelling, called out as such in
+the scene rather than tuned away silently.
+
+### Where it landed
+
+`PXG_SCENE=clothdrape PXG_CLOTH_FLOOR=mesh` is now a full settle test: it must fall more than
+0.40, converge, and come to rest within 0.03 of `floorY + 0.05` without any vertex going below
+`floorY - 0.02`.  Measured **0.0496 mean / 0.0478 min**.  With the two manifest rows reverted to
+`nullptr` it reads **-43.7902** and fails all three — the same A/B control `clothcloth` uses.
+
+The engine probes used here were reverted; **no engine source is modified**.  They are the same
+two recorded at the end of the P8.17 step 2 entry, plus one on
+`PxgFEMClothCore::solveRigidContacts` dumping `lambdaNs`, `mRigidConstraintBuf[0]` and
+`mDeltaPos[0..1]`.
+
+**Verification:** suite through `tools/run_suite.sh` — **674/674 in both memory modes**; `cloth`,
+`clothdrape` (plane, 1.50 baseline untouched), `clothdrape` (mesh, new), `clothhang`, `clothcloth`
+and `clothselfcollide` all green.
+
 ## P8.17 step 2 — cloth-vs-COOKED-TRIANGLE-MESH: the contact generation, and where the impulse is lost
 
 `cloth_meshContactGenLaunch` on the engine BDA ABI. **Manifest 255 → 256.** New shader
