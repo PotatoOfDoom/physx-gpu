@@ -1620,6 +1620,64 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.13 — the recurring one-off suite failure: what it is NOT, and how the next one gets caught
+
+Five times across this port the per-tranche `ctest -j4` has failed EXACTLY ONCE, always in the
+first parallel run after a forced-fresh `.spv` rebuild, and passed on every run after — with the
+`PXG_DEVICE_V2=1` mode green throughout.  Each occurrence was noted and deferred.  It has now
+recurred often enough to be worth an attempt, so this tranche is that attempt.
+
+**IT DOES NOT REPRODUCE.  Ten deliberate cycles, none fired:**
+
+| reproducer | cycles | result |
+|---|---|---|
+| forced-fresh `.spv` → rebuild → `ctest -j4` (the recipe step verbatim) | 6 | 674/674 every time |
+| the same, PLUS the test binary RELINKED, `ctest -j8`, and a concurrent `build-sdk` compile loading the machine | 4 | 674/674 every time |
+
+**What that rules out**, together with four things checked directly:
+
+* not the forced-fresh rebuild by itself, and not the relink either;
+* not parallel-test contention — doubling it to `-j8` under load changed nothing;
+* not disk exhaustion: 30 GB free, and the two build trees are 52 MB and 69 MB;
+* not a per-test timeout: no `TIMEOUT` property is set anywhere in the tests' CMakeLists, so
+  ctest's 1500 s default applies, and the slowest test (`cvxCollide`) takes 168 s;
+* not the on-disk pipeline cache: only `testP1PipelineCache` ever sets `pipelineCachePath`, and
+  it uses its own file, so there is no cross-test race over a shared blob.
+
+**WHY IT WAS NEVER DIAGNOSABLE, which turns out to be the real finding.**  ctest overwrites
+`Testing/Temporary/LastTest.log` on the next invocation — and the next invocation was always the
+re-run that confirmed the suite green.  Every one of the five occurrences destroyed its own
+evidence, by the act of checking it.  I never even learned WHICH test failed; the `tail -3` that
+caught the failure cut off the summary line above it.
+
+**So the deliverable is not a fix, it is an instrument.**  `tools/run_suite.sh` replaces the
+bare `ctest -j4` in the tranche recipe.  It runs both memory modes and, on any failure, archives
+`LastTest.log`, the full ctest stdout, and a context snapshot (date, load average, disk, memory)
+into a TIMESTAMPED directory before anything can overwrite them, then prints the failing test
+names.  Per-mode directories, so a second mode's failure cannot destroy the first's evidence.
+
+**The failure path is tested, not assumed.**  Removing one `.spv` and running the wrapper
+produced exactly what it should:
+
+```
+run_suite.sh: FAILURE ARCHIVED -> build-gpuslang/suite-failures/20260802T135937Z-default
+  failing tests:
+      220 - gpuslang.femClothSim (Failed)
+      299 - gpuslang.p4Manifest (Failed)
+```
+
+with `LastTest.log`, `ctest-stdout.txt` and `context.txt` in each of the two per-mode
+directories.  An untested evidence-preservation path is worthless exactly when it is needed, and
+this one had a real bug to catch: written naively, the v2 run's `LastTest.log` overwrites the
+default run's before either is archived.
+
+That run also confirmed a useful second signal: a missing `.spv` fails `p4Manifest` as well as
+the test that uses it, because that fixture asserts every mapped manifest row resolves.
+
+**Honest status: the transient is NOT fixed and NOT explained.**  What changed is that the next
+occurrence will leave evidence instead of erasing it.  `suite-failures/` sits inside the
+git-ignored build tree, so archives never reach a commit.
+
 ## P8.12 — MILESTONE: the TGS CLOTH SOLVER RUNS (`cloth_stepLaunch`, one kernel)
 
 `cloth_stepLaunch` is mapped, and with it **every cloth scene passes on BOTH solvers**.
