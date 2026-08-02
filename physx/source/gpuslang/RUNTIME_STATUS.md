@@ -1620,6 +1620,100 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.12 — MILESTONE: the TGS CLOTH SOLVER RUNS (`cloth_stepLaunch`, one kernel)
+
+`cloth_stepLaunch` is mapped, and with it **every cloth scene passes on BOTH solvers**.
+
+**This kernel's absence was why no cloth moved on TGS.**  On PGS the fall comes from
+`cloth_preIntegrateLaunch` (mapped since P7.0), which does the gravity predict AND the position
+integration in one shot at the top of the step.  On TGS that kernel only predicts; the POSITION
+integration lives in `cloth_stepLaunch`, called once per solver substep from
+`PxgFEMClothCore::step()` inside the `if (mIsTGS)` branch at `PxgFEMClothCore.cpp:1380`
+(dispatch at `:1501`).  With `CLOTH_SIM_STEP` unmapped the bridge refused the launch and the
+cloth simply never advanced.
+
+**KEY EVIDENCE — the proof was a PRE-EXISTING RED SCENE.**  Measured before the port:
+
+```
+PXG_SCENE=clothdrape          (default solver = TGS)
+  clothdrape: mean y 1.5000 -> 1.5000 (dropped 0.0000 over 3.00s)
+  FAIL: cloth did not fall (drop=0.0000)
+```
+
+and after:
+
+```
+  clothdrape: mean y 1.5000 -> -0.0000 (dropped 1.5000 over 3.00s), rest |dy| = 0.000000
+  [  OK  ] FEMCloth fell onto the floor and SETTLED under contact
+```
+
+| scene | TGS before | TGS after | PGS |
+|---|---|---|---|
+| `cloth` | red | **green** | green |
+| `clothdrape` | red | **green** | green |
+| `clothhang` | red | **green** | green |
+| `clothselfcollide` | red | **green** | green |
+
+That inverts the risk the last two tranches were caught by.  P8.10 and P8.11 both had a GREEN
+fixture and a green mutation sweep over a shader that was wrong, and the scene found it.  Here
+the scene was the pre-registered failing test from the start.
+
+**The blob has a trap.**  `PxVec3 gravity` is TWELVE bytes, and `paramAlign(12)` gives 4, not
+16 — so it sits at @20 UNPADDED, the three `bool`s pack at @32/@33/@34, and the next pointer
+realigns to @40.  A 64-byte blob, ABI row `{8,8,4,12,1,1,1,8,8,8}`.  Padding the PxVec3 to 16
+moves every pointer after it.
+
+**What the kernel does, and what a settling scene cannot separate:**
+
+| | |
+|---|---|
+| contact-pair bookkeeping | ONE thread of the dispatch publishes `updateContactPairs` and, on a forced update, zeroes the VT and EE contact counts — that is what makes the narrowphase re-run |
+| gravity + damping | only when `externalForcesEveryTgsIterationEnabled`, gated on invMass != 0 and on `eDISABLE_GRAVITY`; damping is `1 - min(1, linearDamping*dt)` |
+| integration | `delta = vel*dt`, added to the position AND the accumulated delta |
+| displacement clamp | three regimes, measured against `mPrevPositionInRestOffset` rather than the substep start |
+| previous positions | rest-offset copy written ALWAYS, contact-offset copy only on a forced update, with `.w` marked 1 |
+
+**THE `min()` IN THE DAMPING IS THE POINT, NOT A GUARD.**  At `linearDamping * dt > 1` the
+unclamped factor goes NEGATIVE and the damping REVERSES the velocity instead of killing it.  The
+fixture pins it at damping 8, dt 0.25: the correct factor is 0 and the mutant's is −1, turning
+−42 into +42.
+
+**Three fixtures** (`femClothSimStep`, `...StepFlags`, `...StepDampingAndFlags`; 43 in the file),
+every expected value computed by hand at dt = 0.25 and matched exactly.
+
+**Mutation sweep: 13 of 14 killed** (forced-fresh `.spv` each time) — damping without the
+`min()`; gravity applied to pinned vertices; `eDISABLE_GRAVITY` ignored; the clamp correction not
+reaching the velocity; the accumulated delta not updated; the `isPrevPosSet` gate removed; the
+`.w = 1` mark dropped; the mark applied to the rest-offset copy too; the contact-offset copy
+written unconditionally; the contact counts not zeroed; the PxU8 store clobbering its whole word;
+the negative-`maxLinearVelocity` regime using `maxVel*dt`; the clamp measured against the substep
+start.
+
+**ONE SURVIVES, and the arithmetic says why.**  Deleting the `mMaxLinearVelocity < PX_MAX_REAL`
+early-out changes nothing measurable: at `PX_MAX_REAL` the cap becomes `PX_MAX_REAL * dt`, its
+SQUARE overflows to infinity, and `displacementSq > inf` is false for every finite displacement.
+The guard is an early-out, not a behaviour switch, and no fixture can separate the two without a
+displacement of order 1e19.
+
+**Three fixture bugs of mine, all found by running the sweep rather than by reading.**
+(1) The `.w = 1` mark was invisible at inverse mass 1, because the mark and the mass are the same
+number — vertex 2 now carries invMass 2 so the two are separable.  (2) The damping clamp needed
+`damping * dt > 1` to bite; at 0.5 the clamped and unclamped factors agree.  (3) The negative-
+`maxLinearVelocity` regime and the rest-offset reference both needed a vertex that actually
+TRAVELS and whose reference is not its own start position; cloth C is built so the correct answer
+(8.0), the wrong-regime answer (11.75) and the wrong-reference answer (6.0) are three distinct
+numbers.
+
+Manifest hand-edited 251 → 252.  Suite **674/674 in both memory modes**, rigid regression green,
+and every other scene unchanged — `softbodyselfcollide` 0.2133, `softbodycloth` 0.8688,
+`softbodystack` 0.9822, `particle` green, and the softbody floor matrix bit-identical at box
+**0.49628** / plane **0.49753** / sphere **0.48436** / mesh **0.49666**.
+
+*(The default-mode `ctest -j4` failed once immediately after the forced-fresh rebuild and passed
+674/674 on the run that followed, with V2 green throughout.  This is the FIFTH one-off of that
+shape, always in the first parallel run after a forced-fresh rebuild.  It has now recurred often
+enough to be worth a deliberate diagnosis rather than another note.)*
+
 ## P8.11 step 1 — the softbody-vs-HEIGHTFIELD midphase
 
 `sb_heightfieldMidphaseGeneratePairsLaunch` is mapped, the first of **two** for

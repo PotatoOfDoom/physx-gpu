@@ -572,6 +572,16 @@ static const uint8_t kSbMeshContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8,
 //   @8..@40, PxU32 @48, then a pointer realigned to @56 and @64 -> 72-byte blob.
 static const uint8_t kSbHfMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 4, 8, 8 };
 
+// gpusimulationcontroller FEMCloth TGS substep integrator (P8.12):
+//   cloth_stepLaunch(PxgFEMCloth* femCloths, PxU32* activeId, PxReal dt, PxVec3 gravity,
+//   bool externalForcesEveryTgsIterationEnabled, bool adaptiveCollisionPairUpdate,
+//   bool forceUpdateClothContactPairs, PxU8* updateContactPairs, PxU32* VTContactCount,
+//   PxU32* EEContactCount) -- launch site PxgFEMClothCore.cpp:1507.
+//   PxVec3 is TWELVE bytes and paramAlign gives it 4, so it lands at @20 and is NOT padded to
+//   16; the three bools then pack at @32/@33/@34 and the next pointer realigns to @40.
+//   -> 64-byte blob.
+static const uint8_t kClothStep[] = { 8, 8, 4, 12, 1, 1, 1, 8, 8, 8 };
+
 // gpunarrowphase softbody-vs-CLOTH midphase (P8.8):
 //   sb_clothMidphaseGeneratePairsLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
 //   bounds*, contactDistance*, gpuShapes*, softbodies*, clothes*, PxU32 stackSizeBytes,
@@ -1058,6 +1068,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_meshMidphaseGeneratePairsLaunch", kSbMeshMidphase, uint32_t(sizeof(kSbMeshMidphase)) },
     { "sb_meshContactGenLaunch", kSbMeshContactGen, uint32_t(sizeof(kSbMeshContactGen)) },
     { "sb_heightfieldMidphaseGeneratePairsLaunch", kSbHfMidphase, uint32_t(sizeof(kSbHfMidphase)) },
+    { "cloth_stepLaunch", kClothStep, uint32_t(sizeof(kClothStep)) },
     // gpunarrowphase softbody-vs-CLOTH midphase (P8.8)
     { "sb_clothMidphaseGeneratePairsLaunch", kSbClothMidphase, uint32_t(sizeof(kSbClothMidphase)) },
     { "sb_clothContactGenLaunch", kSbClothContactGen, uint32_t(sizeof(kSbClothContactGen)) },

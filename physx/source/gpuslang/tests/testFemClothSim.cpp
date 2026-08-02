@@ -5022,4 +5022,474 @@ PXG_TEST(femClothSimRefitBound)
     dev->destroyBuffer(bPacked2.h); dev->destroyBuffer(bUpd0.h); dev->destroyBuffer(bDesc2.h);
 }
 
+// ===========================================================================
+// P8.12 -- cloth_stepLaunch, the TGS cloth substep integrator.
+//
+// This is the kernel whose absence made every cloth scene refuse to move on the TGS solver.
+// The live proof is PXG_SCENE=clothdrape with PXG_SOLVER unset, which was RED before this port
+// (dropped 0.0000 over 3.00s) and settles afterwards.  This fixture covers the parts a settling
+// scene cannot separate:
+//
+//   * the 64-byte blob, whose PxVec3 gravity sits at @20 UNPADDED and whose three bools pack at
+//     @32/@33/@34 -- get the padding wrong and every pointer after it is off;
+//   * the contact-pair bookkeeping: who writes updateContactPairs, and that a forced update
+//     ZEROES both contact counts;
+//   * the gravity/damping predict, its invMass gate, its eDISABLE_GRAVITY gate, and the
+//     min(1, damping*dt) clamp that stops a large damping REVERSING the velocity;
+//   * all three regimes of the maximum-displacement clamp, its isPrevPosSet gate, and that the
+//     correction reaches the velocity as well as the position;
+//   * that mPrevPositionInRestOffset is written ALWAYS and mPrevPositionInContactOffset only on
+//     a forced update, with .w marked 1.
+// ===========================================================================
+namespace p812step
+{
+struct ClothStepPush
+{
+    uint64_t femCloths, activeId;
+    float dt;
+    float gx, gy, gz;
+    uint8_t externalForces, adaptive, forceUpdate, pad35;
+    uint32_t pad36;
+    uint64_t updateContactPairs, vtContactCount, eeContactCount;
+};
+static_assert(sizeof(ClothStepPush) == 64, "cloth_stepLaunch blob must be 64 bytes");
+static_assert(offsetof(ClothStepPush, dt) == 16, "dt @16");
+static_assert(offsetof(ClothStepPush, gx) == 20, "PxVec3 gravity @20, NOT padded to 16");
+static_assert(offsetof(ClothStepPush, externalForces) == 32, "the three bools pack at @32");
+static_assert(offsetof(ClothStepPush, updateContactPairs) == 40, "the next pointer realigns @40");
+} // namespace p812step
+
+PXG_TEST(femClothSimStep)
+{
+    using namespace p812step;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const float DT = 0.25f;                 // large and exact, so hand arithmetic is exact
+    const float GRAV_X = 0.0f, GRAV_Y = -8.0f, GRAV_Z = 0.0f;
+
+    // ---- the vertices -----------------------------------------------------------------
+    // v0  free, plain integration               v1  PINNED (invMass 0)
+    // v2  clamped by mMaxLinearVelocity         v3  clamp ARMED but isPrevPosSet == 0
+    const uint32_t NV = 4u;
+    std::vector<F4> pos = {
+        F4{ 0.0f, 10.0f, 0.0f, 1.0f },       // invMass 1 -> gravity + damping apply
+        F4{ 1.0f, 10.0f, 0.0f, 0.0f },       // invMass 0 -> PINNED
+        // *** v2's INVERSE MASS IS 2, NOT 1, ON PURPOSE. ***  mPrevPositionInContactOffset is
+        // written as the final position with .w OVERWRITTEN to 1 as a "reference is set" mark.
+        // With invMass 1 that mark is indistinguishable from the mass that was already there,
+        // and a port that drops it passes — measured, the mutant survived.  At invMass 2 the
+        // position keeps .w = 2 and only the contact-offset copy reads 1.
+        F4{ 2.0f, 10.0f, 0.0f, 2.0f },
+        F4{ 3.0f, 10.0f, 0.0f, 1.0f },
+    };
+    std::vector<F4> vel = {
+        F4{ 0.0f, 0.0f, 0.0f, 7.0f },        // .w carries a marker that must be PRESERVED
+        F4{ 0.0f, 0.0f, 0.0f, 8.0f },
+        F4{ 0.0f, -40.0f, 0.0f, 9.0f },      // fast: 40 * 0.25 = 10 of travel, way over the cap
+        F4{ 0.0f, -40.0f, 0.0f, 10.0f },     // the same speed, but with no reference set
+    };
+    std::vector<F4> accum(NV, F4{ 0.0f, 0.0f, 0.0f, 5.0f });   // .w must be PRESERVED
+    // mPrevPositionInContactOffset: .w == 1 marks the reference as set.  v3's is 0.
+    std::vector<F4> prevContact = {
+        F4{ 0.0f, 10.0f, 0.0f, 1.0f },
+        F4{ 1.0f, 10.0f, 0.0f, 1.0f },
+        F4{ 2.0f, 10.0f, 0.0f, 1.0f },
+        F4{ 3.0f, 10.0f, 0.0f, 0.0f },       // NOT set
+    };
+    std::vector<F4> prevRest = pos;          // the clamp measures against THIS
+    DevBuf bPos = makeDev(dev, pos), bVel = makeDev(dev, vel), bAcc = makeDev(dev, accum),
+           bPrevC = makeDev(dev, prevContact), bPrevR = makeDev(dev, prevRest);
+    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    std::vector<uint32_t> vtCount = { 1234u }, eeCount = { 5678u };
+    std::vector<uint32_t> updPairs = { 0xCDCDCDCDu };   // a PxU8 in a poisoned word
+    DevBuf bVt = makeDev(dev, vtCount), bEe = makeDev(dev, eeCount), bUpd = makeDev(dev, updPairs);
+
+    PxgFEMCloth cloth = makeZeroDesc();
+    cloth.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    cloth.mVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVel.addr));
+    cloth.mAccumulatedDeltaPos = reinterpret_cast<float4*>(size_t(bAcc.addr));
+    cloth.mPrevPositionInContactOffset = reinterpret_cast<float4*>(size_t(bPrevC.addr));
+    cloth.mPrevPositionInRestOffset = reinterpret_cast<float4*>(size_t(bPrevR.addr));
+    cloth.mNbVerts = NV;
+    cloth.mLinearDamping = 2.0f;             // damping * dt = 0.5 -> the factor is 0.5
+    cloth.mMaxLinearVelocity = 8.0f;         // 8 * 0.25 = 2.0 of allowed travel
+    cloth.mRestDistance = 0.0f;
+    cloth.mOriginalContactOffset = 0.0f;
+
+    // activeId is DELIBERATELY not the identity: gid.y 0 -> cloth 2.
+    std::vector<PxgFEMCloth> descArr(3u, makeZeroDesc());
+    descArr[2] = cloth;
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 2u };
+    DevBuf bActive = makeDev(dev, active);
+
+    ClothStepPush push = {};
+    push.femCloths = bDesc.addr;
+    push.activeId = bActive.addr;
+    push.dt = DT;
+    push.gx = GRAV_X; push.gy = GRAV_Y; push.gz = GRAV_Z;
+    push.externalForces = 1u;
+    push.adaptive = 0u;
+    push.forceUpdate = 1u;
+    push.updateContactPairs = bUpd.addr;
+    push.vtContactCount = bVt.addr;
+    push.eeContactCount = bEe.addr;
+
+    Kernel k("femClothStepBda.spv", "cloth_stepLaunch", {}, sizeof(ClothStepPush));
+    // The engine's grid (PxgFEMClothCore.cpp:1521): x = ceil(maxClothVerts / CLOTH_STEP),
+    // y = nbActiveFEMCloths.
+    k.dispatch(/*gridX*/ 1u, {}, push, /*gridY*/ 1u, 1u);
+    dev->flush();
+
+    const auto gPos = downloadBuffer<F4>(dev, bPos.h, NV);
+    const auto gVel = downloadBuffer<F4>(dev, bVel.h, NV);
+    const auto gAcc = downloadBuffer<F4>(dev, bAcc.h, NV);
+    const auto gPrevC = downloadBuffer<F4>(dev, bPrevC.h, NV);
+    const auto gPrevR = downloadBuffer<F4>(dev, bPrevR.h, NV);
+    const uint32_t gVt = downloadBuffer<uint32_t>(dev, bVt.h, 1)[0];
+    const uint32_t gEe = downloadBuffer<uint32_t>(dev, bEe.h, 1)[0];
+    const uint32_t gUpd = downloadBuffer<uint32_t>(dev, bUpd.h, 1)[0];
+
+    for (uint32_t i = 0; i < NV; ++i)
+        std::printf("  v%u: pos=(%.5f %.5f %.5f | %.2f) vel=(%.5f %.5f %.5f | %.2f) "
+                    "accum=(%.5f %.5f %.5f | %.2f)\n", i,
+                    gPos[i].x, gPos[i].y, gPos[i].z, gPos[i].w,
+                    gVel[i].x, gVel[i].y, gVel[i].z, gVel[i].w,
+                    gAcc[i].x, gAcc[i].y, gAcc[i].z, gAcc[i].w);
+
+    auto near = [](float a, float b, float t = 1e-5f) { return std::fabs(a - b) <= t; };
+
+    // ---- v0: the plain path ------------------------------------------------------------
+    // vel = (0 + (-8)*0.25) * (1 - min(1, 2*0.25)) = -2 * 0.5 = -1
+    // pos = 10 + (-1)*0.25 = 9.75; the trajectory is 0.25, well inside the 2.0 cap.
+    PXG_CHECK_MSG(near(gVel[0].y, -1.0f),
+                  "v0: gravity gives -2 and the damping factor is 1 - min(1, 2*0.25) = 0.5, so "
+                  "the velocity is -1; got %.6f (-2 means the damping was skipped)", gVel[0].y);
+    PXG_CHECK_MSG(near(gPos[0].y, 9.75f), "v0: pos = 10 + (-1)*0.25; got %.6f", gPos[0].y);
+    PXG_CHECK_MSG(near(gAcc[0].y, -0.25f),
+                  "v0: the accumulated delta takes the SAME delta as the position; got %.6f",
+                  gAcc[0].y);
+    PXG_CHECK_MSG(near(gPos[0].w, 1.0f) && near(gVel[0].w, 7.0f) && near(gAcc[0].w, 5.0f),
+                  "v0: the .w of all three buffers is carried through untouched (invMass, and "
+                  "two markers); got %.2f %.2f %.2f", gPos[0].w, gVel[0].w, gAcc[0].w);
+
+    // ---- v1: PINNED --------------------------------------------------------------------
+    // invMass 0, so no gravity and no damping -- but the integration still runs, and with a
+    // zero velocity that leaves it exactly where it was.
+    PXG_CHECK_MSG(near(gVel[1].y, 0.0f) && near(gPos[1].y, 10.0f),
+                  "v1 has invMass 0: the gravity/damping block must skip it entirely; got vel "
+                  "%.6f pos %.6f", gVel[1].y, gPos[1].y);
+
+    // ---- v2: the maximum-displacement clamp --------------------------------------------
+    // vel = (-40 - 2) * 0.5 = -21; unclamped pos = 10 - 5.25 = 4.75, a trajectory of -5.25
+    // against a cap of mMaxLinearVelocity * dt = 2.0.  correctionScale = 2/5.25, so the
+    // correction is (2/5.25 - 1) * (-5.25) = +3.25 and the clamped position is 8.0.
+    PXG_CHECK_MSG(near(gPos[2].y, 8.0f, 2e-5f),
+                  "v2: the trajectory is clamped to mMaxLinearVelocity * dt = 2.0 below its "
+                  "REST-offset reference of 10, i.e. 8.0; got %.6f (4.75 means the clamp never "
+                  "fired)", gPos[2].y);
+    // The correction reaches the velocity too: -21 + 3.25/0.25 = -21 + 13 = -8.
+    PXG_CHECK_MSG(near(gVel[2].y, -8.0f, 2e-4f),
+                  "v2: the clamp correction must be applied to the VELOCITY as well, scaled by "
+                  "1/dt: -21 + 13 = -8; got %.6f (-21 means only the position was clamped)",
+                  gVel[2].y);
+    PXG_CHECK_MSG(near(gAcc[2].y, -2.0f, 2e-5f),
+                  "v2: the accumulated delta takes the correction too; got %.6f", gAcc[2].y);
+
+    // ---- v3: the same speed, but no reference ------------------------------------------
+    PXG_CHECK_MSG(near(gPos[3].y, 4.75f, 2e-5f),
+                  "v3 has isPrevPosSet == 0, so the clamp must NOT fire and the position is the "
+                  "unclamped 4.75; got %.6f", gPos[3].y);
+
+    // ---- the previous-position buffers -------------------------------------------------
+    PXG_CHECK_MSG(near(gPrevR[0].y, gPos[0].y) && near(gPrevR[2].y, gPos[2].y),
+                  "mPrevPositionInRestOffset is written for EVERY vertex, with the final "
+                  "position");
+    PXG_CHECK_MSG(near(gPrevC[0].y, gPos[0].y) && near(gPrevC[0].w, 1.0f),
+                  "on a forced update mPrevPositionInContactOffset takes the final position "
+                  "with .w MARKED 1; got y %.6f w %.2f", gPrevC[0].y, gPrevC[0].w);
+    // v2 is where the mark is actually separable from the inverse mass — see the note above.
+    PXG_CHECK_MSG(near(gPos[2].w, 2.0f),
+                  "v2's position keeps its inverse mass 2 in .w; got %.2f", gPos[2].w);
+    PXG_CHECK_MSG(near(gPrevC[2].w, 1.0f),
+                  "v2's contact-offset copy has .w OVERWRITTEN to the mark 1, not left at its "
+                  "inverse mass 2; got %.2f", gPrevC[2].w);
+    PXG_CHECK_MSG(near(gPrevR[2].w, 2.0f),
+                  "the mark belongs to the CONTACT-offset copy only: the rest-offset copy keeps "
+                  "the inverse mass 2; got %.2f", gPrevR[2].w);
+    PXG_CHECK_MSG(near(gPrevC[3].w, 1.0f),
+                  "the mark is set for v3 too -- the forced update does not care whether a "
+                  "reference existed before");
+
+    // ---- the contact-pair bookkeeping --------------------------------------------------
+    PXG_CHECK_MSG((gUpd & 0xffu) == 1u,
+                  "updateContactPairs is a PxU8 and must read 1 after a forced update; got "
+                  "0x%02x", gUpd & 0xffu);
+    PXG_CHECK_MSG((gUpd & 0xffffff00u) == 0xCDCDCD00u,
+                  "the PxU8 store must leave the other three bytes of the word alone; got "
+                  "0x%08x", gUpd);
+    PXG_CHECK_MSG(gVt == 0u && gEe == 0u,
+                  "a forced update ZEROES both contact counts (1234/5678 before); got %u/%u",
+                  gVt, gEe);
+
+    for (PxgBufferHandle h : { bPos.h, bVel.h, bAcc.h, bPrevC.h, bPrevR.h, bVt.h, bEe.h,
+                               bUpd.h, bDesc.h, bActive.h })
+        dev->destroyBuffer(h);
+}
+
+// A second run of the same kernel with the OTHER settings of the three flags: external forces
+// OFF, no forced update, and gravity disabled on the actor.  Kept separate because the flags
+// are push constants, so one dispatch can only ever exercise one combination.
+PXG_TEST(femClothSimStepFlags)
+{
+    using namespace p812step;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const float DT = 0.25f;
+    const uint32_t NV = 2u;
+    std::vector<F4> pos = { F4{ 0.0f, 10.0f, 0.0f, 1.0f }, F4{ 1.0f, 10.0f, 0.0f, 1.0f } };
+    std::vector<F4> vel = { F4{ 0.0f, -4.0f, 0.0f, 0.0f }, F4{ 0.0f, -4.0f, 0.0f, 0.0f } };
+    std::vector<F4> accum(NV, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
+    std::vector<F4> prevContact(NV, F4{ 0.0f, 10.0f, 0.0f, 1.0f });
+    std::vector<F4> prevRest = pos;
+    DevBuf bPos = makeDev(dev, pos), bVel = makeDev(dev, vel), bAcc = makeDev(dev, accum),
+           bPrevC = makeDev(dev, prevContact), bPrevR = makeDev(dev, prevRest);
+    if (!bPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    std::vector<uint32_t> vtCount = { 1234u }, eeCount = { 5678u };
+    std::vector<uint32_t> updPairs = { 0x000000FFu };
+    DevBuf bVt = makeDev(dev, vtCount), bEe = makeDev(dev, eeCount), bUpd = makeDev(dev, updPairs);
+
+    PxgFEMCloth cloth = makeZeroDesc();
+    cloth.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    cloth.mVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVel.addr));
+    cloth.mAccumulatedDeltaPos = reinterpret_cast<float4*>(size_t(bAcc.addr));
+    cloth.mPrevPositionInContactOffset = reinterpret_cast<float4*>(size_t(bPrevC.addr));
+    cloth.mPrevPositionInRestOffset = reinterpret_cast<float4*>(size_t(bPrevR.addr));
+    cloth.mNbVerts = NV;
+    cloth.mLinearDamping = 2.0f;
+    // PX_MAX_REAL: the maximum-displacement block is skipped ENTIRELY, however far the vertex
+    // travels.  Without this regime the port could clamp everything and still look right above.
+    cloth.mMaxLinearVelocity = 3.40282347e+38f;
+    std::vector<PxgFEMCloth> descArr = { cloth };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    ClothStepPush push = {};
+    push.femCloths = bDesc.addr;
+    push.activeId = bActive.addr;
+    push.dt = DT;
+    push.gx = 0.0f; push.gy = -8.0f; push.gz = 0.0f;
+    push.externalForces = 0u;      // NO gravity predict at all
+    push.adaptive = 0u;
+    push.forceUpdate = 0u;         // NO forced update
+    push.updateContactPairs = bUpd.addr;
+    push.vtContactCount = bVt.addr;
+    push.eeContactCount = bEe.addr;
+
+    Kernel k("femClothStepBda.spv", "cloth_stepLaunch", {}, sizeof(ClothStepPush));
+    k.dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const auto gPos = downloadBuffer<F4>(dev, bPos.h, NV);
+    const auto gVel = downloadBuffer<F4>(dev, bVel.h, NV);
+    const auto gPrevC = downloadBuffer<F4>(dev, bPrevC.h, NV);
+    const uint32_t gVt = downloadBuffer<uint32_t>(dev, bVt.h, 1)[0];
+    const uint32_t gEe = downloadBuffer<uint32_t>(dev, bEe.h, 1)[0];
+    const uint32_t gUpd = downloadBuffer<uint32_t>(dev, bUpd.h, 1)[0];
+
+    auto near = [](float a, float b, float t = 1e-5f) { return std::fabs(a - b) <= t; };
+
+    PXG_CHECK_MSG(near(gVel[0].y, -4.0f),
+                  "with externalForcesEveryTgsIterationEnabled FALSE the velocity is left "
+                  "alone -- no gravity, no damping; got %.6f", gVel[0].y);
+    // pos = 10 + (-4)*0.25 = 9.0, and with mMaxLinearVelocity == PX_MAX_REAL nothing clamps it
+    // even though the travel is 1.0.
+    PXG_CHECK_MSG(near(gPos[0].y, 9.0f),
+                  "the integration still runs with the predict off, and PX_MAX_REAL disables "
+                  "the displacement clamp entirely; got %.6f", gPos[0].y);
+    PXG_CHECK_MSG(near(gPrevC[0].y, 10.0f),
+                  "without a forced update mPrevPositionInContactOffset must be LEFT ALONE at "
+                  "its old value 10; got %.6f", gPrevC[0].y);
+    PXG_CHECK_MSG((gUpd & 0xffu) == 0u,
+                  "updateContactPairs must be cleared to 0 when forceUpdate is false; got "
+                  "0x%02x", gUpd & 0xffu);
+    PXG_CHECK_MSG(gVt == 1234u && gEe == 5678u,
+                  "the contact counts must NOT be zeroed when forceUpdate is false; got %u/%u",
+                  gVt, gEe);
+
+    for (PxgBufferHandle h : { bPos.h, bVel.h, bAcc.h, bPrevC.h, bPrevR.h, bVt.h, bEe.h,
+                               bUpd.h, bDesc.h, bActive.h })
+        dev->destroyBuffer(h);
+}
+
+// A third run, for the three branches the first two cannot reach: the damping CLAMP (which only
+// bites when linearDamping * dt exceeds 1), the eDISABLE_GRAVITY actor flag, and the NEGATIVE
+// mMaxLinearVelocity regime that measures against 0.8 * mRestDistance instead of a velocity.
+// Two clothes and gridY = 2, since all three live on the descriptor rather than in the blob.
+PXG_TEST(femClothSimStepDampingAndFlags)
+{
+    using namespace p812step;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const float DT = 0.25f;
+
+    // ---- cloth A: gravity ON, damping 8 (so damping*dt = 2, past the clamp), and the
+    // NEGATIVE mMaxLinearVelocity regime with restDistance 5 -> maxDistance = 0.8 * 5 = 4.
+    std::vector<F4> posA = { F4{ 0.0f, 10.0f, 0.0f, 1.0f } };
+    std::vector<F4> velA = { F4{ 0.0f, -40.0f, 0.0f, 0.0f } };
+    std::vector<F4> accA = { F4{ 0.0f, 0.0f, 0.0f, 0.0f } };
+    std::vector<F4> prevCA = { F4{ 0.0f, 10.0f, 0.0f, 1.0f } };
+    std::vector<F4> prevRA = posA;
+    DevBuf bPosA = makeDev(dev, posA), bVelA = makeDev(dev, velA), bAccA = makeDev(dev, accA),
+           bPrevCA = makeDev(dev, prevCA), bPrevRA = makeDev(dev, prevRA);
+    if (!bPosA.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    // ---- cloth B: gravity DISABLED on the actor, no damping, no clamp.
+    std::vector<F4> posB = { F4{ 5.0f, 10.0f, 0.0f, 1.0f } };
+    std::vector<F4> velB = { F4{ 0.0f, 0.0f, 0.0f, 0.0f } };
+    std::vector<F4> accB = { F4{ 0.0f, 0.0f, 0.0f, 0.0f } };
+    std::vector<F4> prevCB = { F4{ 5.0f, 10.0f, 0.0f, 1.0f } };
+    std::vector<F4> prevRB = posB;
+    DevBuf bPosB = makeDev(dev, posB), bVelB = makeDev(dev, velB), bAccB = makeDev(dev, accB),
+           bPrevCB = makeDev(dev, prevCB), bPrevRB = makeDev(dev, prevRB);
+
+    // ---- cloth C: the one vertex that separates the clamp's three moving parts.
+    // It starts at y = 10 with velocity -40, so dt = 0.25 gives a raw delta of -10 and an
+    // unclamped position of 0.  Its REST-offset reference is deliberately NOT its start
+    // position but y = 12, and mMaxLinearVelocity is -1 with mRestDistance 5, so the cap is
+    // 0.8 * 5 = 4.  Three readings, three distinct answers:
+    //     correct        trajectory = 0 - 12 = -12, cap 4   -> pos 8.0
+    //     cap = maxVel*dt (-0.25)                            -> pos 11.75
+    //     trajectory = this substep's delta (-10)            -> pos 6.0
+    // Cloth A cannot do this job: its damping kills the velocity, so it never travels.
+    std::vector<F4> posC = { F4{ 9.0f, 10.0f, 0.0f, 1.0f } };
+    std::vector<F4> velC = { F4{ 0.0f, -40.0f, 0.0f, 0.0f } };
+    std::vector<F4> accC = { F4{ 0.0f, 0.0f, 0.0f, 0.0f } };
+    std::vector<F4> prevCC = { F4{ 9.0f, 10.0f, 0.0f, 1.0f } };   // .w = 1: the reference IS set
+    std::vector<F4> prevRC = { F4{ 9.0f, 12.0f, 0.0f, 1.0f } };   // NOT the start position
+    DevBuf bPosC = makeDev(dev, posC), bVelC = makeDev(dev, velC), bAccC = makeDev(dev, accC),
+           bPrevCC = makeDev(dev, prevCC), bPrevRC = makeDev(dev, prevRC);
+
+    std::vector<uint32_t> vtCount = { 0u }, eeCount = { 0u }, updPairs = { 0u };
+    DevBuf bVt = makeDev(dev, vtCount), bEe = makeDev(dev, eeCount), bUpd = makeDev(dev, updPairs);
+
+    PxgFEMCloth cA = makeZeroDesc();
+    cA.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bPosA.addr));
+    cA.mVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVelA.addr));
+    cA.mAccumulatedDeltaPos = reinterpret_cast<float4*>(size_t(bAccA.addr));
+    cA.mPrevPositionInContactOffset = reinterpret_cast<float4*>(size_t(bPrevCA.addr));
+    cA.mPrevPositionInRestOffset = reinterpret_cast<float4*>(size_t(bPrevRA.addr));
+    cA.mNbVerts = 1u;
+    cA.mLinearDamping = 8.0f;            // 8 * 0.25 = 2 -> min() clamps it to 1, factor 0
+    cA.mMaxLinearVelocity = -1.0f;       // the NEGATIVE regime
+    cA.mRestDistance = 5.0f;             // -> maxDistance = 4
+    cA.mActorFlags = 0u;
+
+    PxgFEMCloth cB = makeZeroDesc();
+    cB.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bPosB.addr));
+    cB.mVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVelB.addr));
+    cB.mAccumulatedDeltaPos = reinterpret_cast<float4*>(size_t(bAccB.addr));
+    cB.mPrevPositionInContactOffset = reinterpret_cast<float4*>(size_t(bPrevCB.addr));
+    cB.mPrevPositionInRestOffset = reinterpret_cast<float4*>(size_t(bPrevRB.addr));
+    cB.mNbVerts = 1u;
+    cB.mLinearDamping = 0.0f;
+    cB.mMaxLinearVelocity = 3.40282347e+38f;
+    cB.mActorFlags = PxU8(PxActorFlag::eDISABLE_GRAVITY);
+
+    PxgFEMCloth cC = makeZeroDesc();
+    cC.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bPosC.addr));
+    cC.mVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVelC.addr));
+    cC.mAccumulatedDeltaPos = reinterpret_cast<float4*>(size_t(bAccC.addr));
+    cC.mPrevPositionInContactOffset = reinterpret_cast<float4*>(size_t(bPrevCC.addr));
+    cC.mPrevPositionInRestOffset = reinterpret_cast<float4*>(size_t(bPrevRC.addr));
+    cC.mNbVerts = 1u;
+    cC.mLinearDamping = 0.0f;
+    cC.mMaxLinearVelocity = -1.0f;       // the NEGATIVE regime, WITH travel this time
+    cC.mRestDistance = 5.0f;             // -> maxDistance = 0.8 * 5 = 4
+    cC.mActorFlags = PxU8(PxActorFlag::eDISABLE_GRAVITY);   // keep the arithmetic exact
+
+    std::vector<PxgFEMCloth> descArr = { cA, cB, cC };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u, 1u, 2u };
+    DevBuf bActive = makeDev(dev, active);
+
+    ClothStepPush push = {};
+    push.femCloths = bDesc.addr;
+    push.activeId = bActive.addr;
+    push.dt = DT;
+    push.gx = 0.0f; push.gy = -8.0f; push.gz = 0.0f;
+    push.externalForces = 1u;
+    push.adaptive = 0u;
+    push.forceUpdate = 0u;
+    push.updateContactPairs = bUpd.addr;
+    push.vtContactCount = bVt.addr;
+    push.eeContactCount = bEe.addr;
+
+    Kernel k("femClothStepBda.spv", "cloth_stepLaunch", {}, sizeof(ClothStepPush));
+    k.dispatch(/*gridX*/ 1u, {}, push, /*gridY*/ 3u, 1u);
+    dev->flush();
+
+    const auto gPosA = downloadBuffer<F4>(dev, bPosA.h, 1);
+    const auto gVelA = downloadBuffer<F4>(dev, bVelA.h, 1);
+    const auto gPosB = downloadBuffer<F4>(dev, bPosB.h, 1);
+    const auto gVelB = downloadBuffer<F4>(dev, bVelB.h, 1);
+    std::printf("  A: pos.y=%.5f vel.y=%.5f   B: pos.y=%.5f vel.y=%.5f\n",
+                gPosA[0].y, gVelA[0].y, gPosB[0].y, gVelB[0].y);
+
+    auto near = [](float a, float b, float t = 1e-5f) { return std::fabs(a - b) <= t; };
+
+    // ---- cloth A ------------------------------------------------------------------------
+    // vel = (-40 + (-8)*0.25) * (1 - min(1, 8*0.25)) = -42 * 0 = 0.
+    // WITHOUT the min() the factor is 1 - 2 = -1 and the velocity comes out at +42 -- the
+    // damping would REVERSE the motion instead of killing it.
+    PXG_CHECK_MSG(near(gVelA[0].y, 0.0f),
+                  "cloth A: linearDamping * dt = 2, so min(1, .) clamps the factor to 0 and the "
+                  "velocity is killed outright; got %.6f (+42 means the min() is missing and "
+                  "the damping REVERSED the velocity)", gVelA[0].y);
+    // With the velocity zeroed there is no travel, so the clamp cannot be seen on A's position;
+    // what IS seen is that a maxLinearVelocity of -1 did not disable the block or divide by it.
+    PXG_CHECK_MSG(near(gPosA[0].y, 10.0f),
+                  "cloth A does not move once the damping has killed its velocity; got %.6f",
+                  gPosA[0].y);
+
+    // ---- cloth B ------------------------------------------------------------------------
+    // eDISABLE_GRAVITY, damping 0: the velocity stays exactly 0 and so does the position.
+    PXG_CHECK_MSG(near(gVelB[0].y, 0.0f),
+                  "cloth B has eDISABLE_GRAVITY, so gravity must NOT be added; got %.6f "
+                  "(-2 means the actor flag was ignored)", gVelB[0].y);
+    PXG_CHECK_MSG(near(gPosB[0].y, 10.0f),
+                  "cloth B therefore does not move; got %.6f", gPosB[0].y);
+
+    // ---- cloth C: the clamp's three moving parts, separated --------------------------
+    const auto gPosC = downloadBuffer<F4>(dev, bPosC.h, 1);
+    const auto gVelC = downloadBuffer<F4>(dev, bVelC.h, 1);
+    std::printf("  C: pos.y=%.5f vel.y=%.5f\n", gPosC[0].y, gVelC[0].y);
+    PXG_CHECK_MSG(near(gPosC[0].y, 8.0f, 2e-5f),
+                  "cloth C: the cap is 0.8 * mRestDistance = 4 and the trajectory is measured "
+                  "from the REST-offset reference at 12, so the clamped position is 8.0; got "
+                  "%.6f.  11.75 means the negative-maxVel regime used maxVel*dt instead; 6.0 "
+                  "means the trajectory was measured from this substep's start", gPosC[0].y);
+    // vel = -40 + 8/0.25 = -8.
+    PXG_CHECK_MSG(near(gVelC[0].y, -8.0f, 2e-4f),
+                  "cloth C's velocity takes the same correction scaled by 1/dt; got %.6f",
+                  gVelC[0].y);
+
+    // ---- ONE MUTANT SURVIVES, AND THE ARITHMETIC SAYS WHY ---------------------------
+    // Deleting the `mMaxLinearVelocity < PX_MAX_REAL` guard that skips the whole clamp block
+    // changes nothing measurable, because the block is a no-op at PX_MAX_REAL anyway: the cap
+    // becomes PX_MAX_REAL * dt, its SQUARE overflows to infinity, and `displacementSq > inf` is
+    // false for every finite displacement.  The guard is an early-out, not a behaviour switch.
+    // No fixture can separate the two without a displacement of order 1e19, which no scene
+    // produces.  Kept as the faithful transcription and recorded rather than papered over.
+
+    for (PxgBufferHandle h : { bPosA.h, bVelA.h, bAccA.h, bPrevCA.h, bPrevRA.h,
+                               bPosB.h, bVelB.h, bAccB.h, bPrevCB.h, bPrevRB.h,
+                               bPosC.h, bVelC.h, bAccC.h, bPrevCC.h, bPrevRC.h,
+                               bVt.h, bEe.h, bUpd.h, bDesc.h, bActive.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace
