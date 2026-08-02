@@ -594,6 +594,16 @@ static const uint8_t kClothStep[] = { 8, 8, 4, 12, 1, 1, 1, 8, 8, 8 };
 //   and carries toleranceLength.
 static const uint8_t kClothDifferentCloth[] = { 4, 4, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8 };
 
+// gpunarrowphase cloth-vs-COOKED-TRIANGLE-MESH midphase (P8.17 step 1):
+//   cloth_meshMidphaseGeneratePairsLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
+//   bounds*, contactDistance*, gpuShapes*, femClothes*, PxU32 stackSizeBytes, stackPtr*,
+//   midphasePairsNum*) -- launch site PxgNarrowphaseCore.cpp:6581, inside
+//   testSDKFemClothTrimesh.  4 @0, six pointers @8..@48, PxU32 @56, then a pointer realigned to
+//   @64 and @72 -> 80-byte blob.  This is the same SHAPE as kSbMeshMidphase (femClothes where
+//   softbodies was); kept as its own row rather than aliased, so a future divergence upstream
+//   shows up here.
+static const uint8_t kClothMeshMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
+
 // gpunarrowphase softbody-vs-CLOTH midphase (P8.8):
 //   sb_clothMidphaseGeneratePairsLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
 //   bounds*, contactDistance*, gpuShapes*, softbodies*, clothes*, PxU32 stackSizeBytes,
@@ -1084,6 +1094,8 @@ static const PxgKernelAbiRow kRows[] = {
     // gpunarrowphase cloth-vs-DIFFERENT-cloth midphase (P8.16)
     { "cloth_differentClothCollisionVTLaunch", kClothDifferentCloth, uint32_t(sizeof(kClothDifferentCloth)) },
     { "cloth_differentClothCollisionEELaunch", kClothDifferentCloth, uint32_t(sizeof(kClothDifferentCloth)) },
+    // gpunarrowphase cloth-vs-COOKED-TRIANGLE-MESH midphase (P8.17 step 1)
+    { "cloth_meshMidphaseGeneratePairsLaunch", kClothMeshMidphase, uint32_t(sizeof(kClothMeshMidphase)) },
     // gpunarrowphase softbody-vs-CLOTH midphase (P8.8)
     { "sb_clothMidphaseGeneratePairsLaunch", kSbClothMidphase, uint32_t(sizeof(kSbClothMidphase)) },
     { "sb_clothContactGenLaunch", kSbClothContactGen, uint32_t(sizeof(kSbClothContactGen)) },

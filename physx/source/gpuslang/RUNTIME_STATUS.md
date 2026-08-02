@@ -1620,6 +1620,95 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.17 step 1 — cloth-vs-COOKED-TRIANGLE-MESH: the midphase
+
+`cloth_meshMidphaseGeneratePairsLaunch` on the engine BDA ABI. **Manifest 254 → 255.** New shader
+`femClothMeshMidphaseBda.slang`. Step 2 (`cloth_meshContactGenLaunch`) is the next tranche — until
+it lands the pairs this kernel produces have no consumer, and the scene below says so out loud
+rather than pretending otherwise.
+
+Both launches sit inside `testSDKFemClothTrimesh` (`PxgNarrowphaseCore.cpp:6534`) under `if (1)`,
+so this is a live path — not one of the four cloth-VERTEX-vs-mesh/HF kernels P8.14 ruled dead.
+
+**This is `softBodyMeshMidphaseBda`'s sibling** — same cooked blob, same top-4 extraction, same
+grid — with a cloth TRIANGLE query instead of a softbody TETRAHEDRON. Four things change, and
+every one is a plausible copy-paste from the sibling:
+
+| | softbody sibling | this kernel |
+|---|---|---|
+| SAT | tet-vs-tri: four plane terms, no cross axes | tri-vs-tri: two plane terms **plus nine edge-cross axes**, each normalized |
+| query gate | `isValidTet` + the `mTetMeshSurfaceHint` byte | none — every cloth triangle is a query |
+| box test | unfattened bound, per-axis **displacement** vs `contactDist²` | **plain AABB overlap** against a **pre-fattened** bound |
+| contact distance | world sum **÷ min\|scale\|** | the world sum, **undivided** |
+
+The last two are the ones worth staring at. `TriangleLeafBoundMinMaxTraverser` is the name of
+**two different structs in two different .cu files**, and they disagree about the box test.  And
+`femClothClothMidPhase.cu:358` really does fatten a vertex-space bound by a raw world distance —
+transcribed as written, because "fixing" it would change the emitted pair set on any scaled mesh.
+
+**The fixture, and what the first version got wrong.** The expected pair set is computed by a CPU
+transcription of the leaf predicate rather than written down, so a mutant anywhere in
+`satIntersect` fails without the fixture having to anticipate which axis it broke. That paid for
+itself immediately: the GPU matched the CPU reference on the first run and my **hand-written**
+expectations were the thing that failed.
+
+The reason is worth recording, because it is a property of this SAT rather than a mistake in the
+port. `satIntersect`'s axis set is the two face normals plus the nine edge crosses — and **for two
+PARALLEL triangles every one of those nine crosses is parallel to the common normal**. So the SAT
+reports the plane gap for a pair of horizontal triangles *no matter how far apart they are in x*.
+The first fixture put every horizontal triangle in one BVH leaf and expected each cloth triangle
+to match only the one beneath it; instead each matched its neighbours' triangles too, at their
+y-gap. The BVH boxes are the only thing that separates laterally-offset parallel triangles — which
+is exactly their job in the engine. The fixture now gives each query slot its own leaf.
+
+**18 mutants, 17 killed.** Five survived the first sweep and every one was a fixture weakness:
+
+* **`rotateInv` → `rotate` on the world→local step.** The transform was 180 degrees about y, which
+  **is its own inverse**. Changed to 90 degrees.
+* **the separating axis left unnormalized.** The cross pair's axis was 4 units long, so dropping
+  the `1/sqrt(magSq)` made the reported separation *larger* and the verdict did not move. The pair
+  now has 0.5-length edges, so the axis is 0.25 long and the same mutant scales 0.25 down to
+  0.0625 — from outside the band to inside it.
+* **the two plane terms applied to the wrong triangle.** Each then measures a triangle against its
+  own plane and returns 0 — but for parallel triangles the *cross* axes recover the true gap, so
+  the answer was unchanged. Killed by a pair whose edges are all 0.03 long: every edge cross then
+  has `magSq ≤ 8.1e-7`, below `satIntersect`'s `1e-5` floor, so all nine are skipped and the plane
+  terms decide alone (0.28 correctly, 0.0 mutated).
+* **the box test swapped for the softbody form.** Axis-aligned offsets cannot tell the two forms
+  apart. Killed by a leaf box offset from the query bound by 0.15 in **both** x and y: the
+  fattened-bound overlap accepts it, the unfattened displacement rejects it
+  (0.15² + 0.15² = 0.045 > 0.20² = 0.04).
+* **three others killed the process rather than a check** (the `.z`/`.w` node-array size, the
+  `nbPrimitives` shift, and the inverted shape selection all read wild addresses). The first sweep
+  reported them as SURVIVED because its kill detection only looked for the `[ FAIL ]` line and
+  ignored the exit code. `tools/`-style sweeps now treat a nonzero return as a kill — a mutant that
+  faults the process is killed just as surely as one that fails an assertion.
+
+**One mutant survives, and it is provably equivalent.** Passing `contactDist` instead of
+`min(bestDistance, contactDist)` as `satIntersect`'s tolerance changes only how early the routine
+gives up. The value it returns on an early-out is always **greater than the tolerance**, and the
+tolerance is `min(bestDistance, contactDist)`: if it was `bestDistance`, the value fails
+`separation < bestDistance` and is not stored; if it was `contactDist`, the stored value is above
+`contactDist` and fails the final band test. The outcome is identical for every input. Recorded
+rather than chased.
+
+**`PXG_CLOTH_FLOOR=mesh` — a diagnostic, not a settle test.** `PXG_SCENE=clothdrape` can now be
+given a cooked 20 × 20 triangle floor instead of the infinite plane, the same floor
+`PXG_SB_FLOOR=mesh` gives the softbody. With only the midphase ported the sheet still falls
+straight through (mean y 1.50 → **−42.89**), so the scene checks only that the run is well-formed
+and prints the numbers; the settle assertions switch back on when step 2 lands. What it *does*
+show is that the kernel is reached: `PXG_LAUNCH_TRACE=1` counts **6 dispatches** of
+`cloth_meshMidphaseGeneratePairsLaunch` over the run, where an unmapped kernel produces none (the
+bridge refuses it before the trace point).
+
+**Verification:** forced-fresh `.spv`, suite through `tools/run_suite.sh` — **674/674 in both
+memory modes** (`gpuslang.femClothSim` 45 → 46 fixtures); `cloth`, `clothdrape`, `clothhang`,
+`clothcloth` and `clothselfcollide` all green.
+
+Next: step 2, `cloth_meshContactGenLaunch` (`femClothPrimitives.cu:3749`, launch
+`PxgNarrowphaseCore.cpp:6669`) — a 15-argument pack ending in a `PxgFEMContactWriter`, which is
+**not** `kSbMeshContactGen`'s layout.
+
 ## P8.16 — cloth-vs-DIFFERENT-cloth: the two kernels P8.14 scouted, and the scene that proves them
 
 `cloth_differentClothCollisionVTLaunch` + `cloth_differentClothCollisionEELaunch`, on the engine

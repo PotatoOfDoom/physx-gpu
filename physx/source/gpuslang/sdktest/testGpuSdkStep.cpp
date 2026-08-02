@@ -636,12 +636,45 @@ ClothScene buildClothDrapeScene(PxPhysics* physics, PxScene* scene, PxMaterial* 
 
     // The STATIC FLOOR: an infinite plane at y = floorY, normal +Y.  This is the surface
     // the cloth contact path must catch (cloth-vertex-vs-plane, the mapped direct path).
-    PxRigidStatic* floor = physics->createRigidStatic(
-        PxTransformFromPlaneEquation(PxPlane(0.0f, 1.0f, 0.0f, -cfg.floorY)));
-    PxShape* floorShape = physics->createShape(PxPlaneGeometry(), *rigidMat);
-    floor->attachShape(*floorShape);
-    scene->addActor(*floor);
-    floorShape->release();
+    //
+    // PXG_CLOTH_FLOOR=mesh (P8.17) swaps it for a COOKED TRIANGLE MESH at the same height --
+    // a 20 x 20 quad split into two up-facing triangles, the same floor
+    // PXG_SB_FLOOR=mesh gives the softbody.  That is the pair
+    // cloth_meshMidphaseGeneratePairsLaunch + cloth_meshContactGenLaunch exist for.  With only
+    // the MIDPHASE ported the sheet still falls through -- the midphase produces pairs and
+    // nothing turns them into contacts -- so this mode is a DIAGNOSTIC, not a settle test, and
+    // the driver treats it as one.  It becomes a settle test when step 2 lands.
+    const char* clothFloorEnv = std::getenv("PXG_CLOTH_FLOOR");
+    const bool floorIsMesh = clothFloorEnv && !std::strcmp(clothFloorEnv, "mesh");
+    if (floorIsMesh)
+    {
+        const float E = 10.0f;
+        const PxVec3 mverts[4] = { PxVec3(-E, cfg.floorY, -E), PxVec3(-E, cfg.floorY, E),
+                                   PxVec3( E, cfg.floorY, -E), PxVec3( E, cfg.floorY, E) };
+        const PxU32 mtris[6] = { 0u, 1u, 2u,   2u, 1u, 3u };
+        PxTriangleMeshDesc md;
+        md.points.count = 4; md.points.stride = sizeof(PxVec3); md.points.data = mverts;
+        md.triangles.count = 2; md.triangles.stride = 3 * sizeof(PxU32); md.triangles.data = mtris;
+        PxCookingParams ck(physics->getTolerancesScale());
+        ck.buildGPUData = true;
+        PxTriangleMesh* floorMeshGeom =
+            immediateCooking::createTriangleMesh(ck, md, physics->getPhysicsInsertionCallback());
+        if (!floorMeshGeom) { std::printf("FAIL: createTriangleMesh (cloth floor) returned null\n"); return out; }
+        PxRigidStatic* floor = physics->createRigidStatic(PxTransform(PxVec3(0.0f)));
+        PxShape* fs = physics->createShape(PxTriangleMeshGeometry(floorMeshGeom), *rigidMat);
+        floor->attachShape(*fs);
+        scene->addActor(*floor);
+        fs->release();
+    }
+    else
+    {
+        PxRigidStatic* floor = physics->createRigidStatic(
+            PxTransformFromPlaneEquation(PxPlane(0.0f, 1.0f, 0.0f, -cfg.floorY)));
+        PxShape* floorShape = physics->createShape(PxPlaneGeometry(), *rigidMat);
+        floor->attachShape(*floorShape);
+        scene->addActor(*floor);
+        floorShape->release();
+    }
 
     // A live dynamic rigid resting on the SAME plane, spawned FAR from the cloth (x=8) so
     // it never interacts with the sheet.  Keeps the rigid PGS island non-empty (see the
@@ -2768,8 +2801,13 @@ int main()
             std::printf("[ FAIL ] gpu-sdk-step: clothdrape scene build failed\n");
             scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
         }
-        std::printf("  [  OK  ] scene 'clothdrape' built: %u-vertex FEMCloth sheet spawned at y~%.2f above a "
-                    "STATIC plane floor at y=%.2f (no pins)\n", csc.numVerts, cfg.spawnY, cfg.floorY);
+        {
+            const char* ff = std::getenv("PXG_CLOTH_FLOOR");
+            const bool isMeshFloor = ff && !std::strcmp(ff, "mesh");
+            std::printf("  [  OK  ] scene 'clothdrape' built: %u-vertex FEMCloth sheet spawned at y~%.2f above a "
+                        "STATIC %s floor at y=%.2f (no pins)\n", csc.numVerts, cfg.spawnY,
+                        isMeshFloor ? "COOKED TRIANGLE MESH" : "plane", cfg.floorY);
+        }
 
         if (!std::getenv("PXG_GPU_STEP"))
         {
@@ -2810,21 +2848,38 @@ int main()
                     "rest |dy| over last %d steps = %.6f\n",
                     mean0, meanEnd, drop, steps * dt, minEnd, restWindow, restMaxDy);
 
+        // PXG_CLOTH_FLOOR=mesh is a DIAGNOSTIC, not a settle test: with only the midphase of the
+        // cloth-vs-trimesh pair ported (P8.17 step 1) the sheet still falls straight through, so
+        // asserting the settle here would be asserting a state that does not exist yet.  What IS
+        // checked is that the run is well-formed -- the sheet falls and the numbers stay finite --
+        // and PXG_LAUNCH_TRACE=1 shows cloth_meshMidphaseGeneratePairsLaunch dispatching.  The
+        // settle assertions come back on when step 2 (cloth_meshContactGenLaunch) lands.
+        const char* clothFloorEnv2 = std::getenv("PXG_CLOTH_FLOOR");
+        const bool meshFloorDiag = clothFloorEnv2 && !std::strcmp(clothFloorEnv2, "mesh");
+
         int failures = 0;
         // (1) the cloth must FALL a real distance under gravity (not stuck at spawn).
         if (!(drop > 0.5f))          { std::printf("FAIL: cloth did not fall (drop=%.4f)\n", drop); ++failures; }
+        if (!meshFloorDiag)
+        {
         // (2) the drop must CONVERGE — the sheet stops moving over the final quarter.
         if (!(restMaxDy < 0.01f))    { std::printf("FAIL: cloth did not settle (rest |dy|=%.6f)\n", restMaxDy); ++failures; }
         // (3) it must settle ON the floor: mean near floorY and NOT tunnelled below it.
         if (!(meanEnd < cfg.floorY + 0.5f)) { std::printf("FAIL: cloth did not reach the floor (meanY=%.4f)\n", meanEnd); ++failures; }
         if (!(minEnd > cfg.floorY - 0.1f))  { std::printf("FAIL: cloth tunnelled below the floor (minY=%.4f)\n", minEnd); ++failures; }
+        }
         // (4) nothing NaN/inf.
         if (!allFinite || !std::isfinite(meanEnd)) { std::printf("FAIL: cloth y went non-finite\n"); ++failures; }
 
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
         if (failures == 0)
         {
-            std::printf("[  OK  ] gpu-sdk-step: FEMCloth fell onto the floor and SETTLED under contact\n");
+            if (meshFloorDiag)
+                std::printf("[  OK  ] gpu-sdk-step: clothdrape on a COOKED MESH floor ran cleanly "
+                            "(diagnostic: mean y %.4f, min y %.4f — the settle needs step 2)\n",
+                            meanEnd, minEnd);
+            else
+                std::printf("[  OK  ] gpu-sdk-step: FEMCloth fell onto the floor and SETTLED under contact\n");
             return 0;
         }
         std::printf("[ FAIL ] gpu-sdk-step: clothdrape settle checks failed (%d)\n", failures);

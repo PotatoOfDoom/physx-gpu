@@ -5947,4 +5947,461 @@ PXG_TEST(femClothSimDifferentClothEE)
         dev->destroyBuffer(h);
 }
 
+// ===========================================================================
+// P8.17 step 1 -- cloth_meshMidphaseGeneratePairsLaunch, the cloth-vs-COOKED-TRIANGLE-MESH
+// midphase.  softBodyMeshMidphaseBda's sibling: same cooked blob, same top-4 extraction, same
+// grid, with a cloth TRIANGLE query.  What this fixture has to pin is the four things that
+// differ from the softbody path, because every one of them is a plausible copy-paste:
+//
+//   * the SAT is TRIANGLE-vs-TRIANGLE with NINE edge-cross axes on top of the two plane terms.
+//     One pair exists purely to kill a missing cross block: two triangles whose planes each cut
+//     the other (both plane terms come out at -0.80) but which are separated by 0.25 along an
+//     edge-cross axis.  With the cross block it is rejected, without it accepted;
+//   * the contact distance is NOT divided by the scale.  min|scale| is 0.5, so the softbody
+//     reading would give a 0.40 band against the correct 0.20 -- and one cloth triangle sits at
+//     0.28, inside the wrong band and outside the right one;
+//   * the box test is a plain AABB overlap against a PRE-FATTENED query bound.  The leaf box is
+//     tight in y (max 0.06), so dropping the fattening loses the 0.12 pair outright;
+//   * there is no isValidTet gate and no surface hint -- every cloth triangle is a query.
+//
+// The expected pair set is computed by a CPU transcription of the leaf predicate rather than
+// written down, so a mutant anywhere in satIntersect fails without the fixture having to
+// anticipate which axis it broke.
+// ===========================================================================
+namespace p817mesh
+{
+struct ClothMeshMidPush
+{
+    float toleranceLength; uint32_t pad4;
+    uint64_t cmInputs, transformCache, bounds, contactDistance, gpuShapes, femClothes;
+    uint32_t stackSizeBytes, pad60;
+    uint64_t stackPtr, midphasePairsNum;
+};
+static_assert(sizeof(ClothMeshMidPush) == 80, "cloth mesh midphase blob must be 80 bytes");
+static_assert(offsetof(ClothMeshMidPush, femClothes) == 48, "femClothes @48");
+static_assert(offsetof(ClothMeshMidPush, stackSizeBytes) == 56, "stackSizeBytes @56");
+static_assert(offsetof(ClothMeshMidPush, stackPtr) == 64, "stackPtr @64");
+
+using p72ref::V3;
+using p72ref::sub;
+using p72ref::dot;
+static V3 crs(V3 a, V3 b) { return V3{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+static V3 scl(V3 a, float s) { return V3{ a.x * s, a.y * s, a.z * s }; }
+
+// PxPlane(p0,p1,p2) — normalize(cross(p1-p0, p2-p0)), d = -p0.dot(n).
+static void makePlane(V3 p0, V3 p1, V3 p2, V3& n, float& d)
+{
+    const V3 c = crs(sub(p1, p0), sub(p2, p0));
+    const float m = dot(c, c);
+    n = (m > 0.0f) ? scl(c, 1.0f / std::sqrt(m)) : V3{ 0, 0, 0 };
+    d = -dot(p0, n);
+}
+// minProject (triangletriangle.cuh:43): the `+ d` lands ONCE, after the min.
+static float minProjectTri(V3 n, float d, V3 v0, V3 v1, V3 v2)
+{
+    return std::fmin(dot(n, v0), std::fmin(dot(n, v1), dot(n, v2))) + d;
+}
+static float testSeparatingAxis(V3 ax, V3 a0, V3 a1, V3 a2, V3 b0, V3 b1, V3 b2)
+{
+    float min0, max0, min1, max1;
+    min0 = max0 = dot(a0, ax);
+    min1 = max1 = dot(b0, ax);
+    const float pa1 = dot(a1, ax), pb1 = dot(b1, ax);
+    min0 = std::fmin(pa1, min0); max0 = std::fmax(pa1, max0);
+    min1 = std::fmin(pb1, min1); max1 = std::fmax(pb1, max1);
+    const float pa2 = dot(a2, ax), pb2 = dot(b2, ax);
+    min0 = std::fmin(pa2, min0); max0 = std::fmax(pa2, max0);
+    min1 = std::fmin(pb2, min1); max1 = std::fmax(pb2, max1);
+    return std::fmax(min1 - max0, min0 - max1);
+}
+// Gu::satIntersect<true>, early-outs included.  `crossRaised` reports whether the cross block
+// pushed sep above what the two plane terms alone gave — the fixture asserts it fires.
+static float satIntersect(V3 a0, V3 a1, V3 a2, V3 nA, float dA,
+                          V3 b0, V3 b1, V3 b2, V3 nB, float dB, float tol, bool* crossRaised)
+{
+    float sep = minProjectTri(nA, dA, b0, b1, b2);
+    if (sep > tol) return sep;
+    sep = std::fmax(sep, minProjectTri(nB, dB, a0, a1, a2));
+    if (sep > tol) return sep;
+    const float planeSep = sep;
+    const V3 ax0[3] = { sub(a1, a0), sub(a2, a0), sub(a2, a1) };
+    const V3 ax1[3] = { sub(b1, b0), sub(b2, b0), sub(b2, b1) };
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+        {
+            V3 sa = crs(ax0[i], ax1[j]);
+            const float m = dot(sa, sa);
+            if (m > 1e-5f)
+            {
+                sa = scl(sa, 1.0f / std::sqrt(m));
+                sep = std::fmax(sep, testSeparatingAxis(sa, a0, a1, a2, b0, b1, b2));
+                if (sep > tol) { if (crossRaised && sep > planeSep) *crossRaised = true; return sep; }
+            }
+        }
+    if (crossRaised && sep > planeSep) *crossRaised = true;
+    return sep;
+}
+} // namespace p817mesh
+
+PXG_TEST(femClothSimMeshMidphase)
+{
+    using namespace p816dc;        // PxgShapeHost, CmInputHost
+    using namespace p817mesh;
+    using p817mesh::V3;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // The mesh's placement.  scaleRot stays identity so shape2Vertex is a plain componentwise
+    // divide; the SCALE is non-uniform (min |scale| = 0.5, which is what the softbody path would
+    // divide the contact distance by) and the rigid rotation is NINETY degrees about y:
+    //     world = q.rotate(vertex * scale) + T
+    // Ninety, not the more convenient hundred and eighty, because a 180-degree rotation IS ITS
+    // OWN INVERSE -- with it, swapping the kernel's world->local `rotateInv` for `rotate` changes
+    // nothing and that mutant survives.  Measured.
+    const float SX = 2.0f, SY = 1.0f, SZ = 0.5f;
+    const float TX = 10.0f, TY = 20.0f, TZ = 30.0f;
+    const float QS = 0.70710678f;                       // sin(45) = cos(45)
+    const float QX = 0.0f, QY = QS, QZ = 0.0f, QW = QS; // 90 degrees about y
+    // PxQuat::rotate (PxQuat.h:310), the same formula the shader carries.
+    auto quatRot = [&](float x, float y, float z) {
+        const float vx = 2.0f * x, vy = 2.0f * y, vz = 2.0f * z;
+        const float w2 = QW * QW - 0.5f;
+        const float d2 = QX * vx + QY * vy + QZ * vz;
+        return V3{ vx * w2 + (QY * vz - QZ * vy) * QW + QX * d2,
+                   vy * w2 + (QZ * vx - QX * vz) * QW + QY * d2,
+                   vz * w2 + (QX * vy - QY * vx) * QW + QZ * d2 };
+    };
+    auto toWorld = [&](float vx, float vy, float vz) {
+        const V3 r = quatRot(vx * SX, vy * SY, vz * SZ);
+        return F4{ r.x + TX, r.y + TY, r.z + TZ, 1.0f };
+    };
+
+    // ---- the cooked mesh, in VERTEX space --------------------------------------------------
+    // ONE BV32 node with SIX LEAF CHILDREN, one per query slot.  The per-slot boxes are what
+    // ISOLATE the slots, and they have to: `satIntersect`'s axis set is the two face normals plus
+    // the nine edge crosses, and for two PARALLEL triangles every one of those nine crosses is
+    // parallel to the common normal.  So the SAT reports the plane gap for a pair of horizontal
+    // triangles no matter how far apart they are in x — measured, not assumed (the first version
+    // of this fixture put every horizontal triangle in one leaf and slot 4 matched three of its
+    // neighbours' triangles at their y-gap).  The BVH boxes are the only thing that separates
+    // them, which is exactly their job in the engine too.
+    //
+    // prim 0        : a DUMMY parked 1000 away and in NO leaf, so every primStartIndex is nonzero
+    //                 -- with a zero start `data >> 7` and `data >> 8` agree and a shift mutant is
+    //                 invisible;
+    // prims 1,2     : slot 0's triangle, and a BACK-FACING one that is CLOSER (0.06 against 0.12)
+    //                 -- only the front-face gate keeps it out;
+    // prims 3..8    : slot 1's triangle plus a stack of five, so that slot sees SIX qualifying
+    //                 triangles and the MaxNumPairs = 4 cap actually binds;
+    // prims 9,10,11 : slots 2, 3 and 4;
+    // prim 12       : the CROSS-AXIS triangle, in a deliberately LOOSE box (see below).
+    std::vector<F4> mv;
+    std::vector<TriIdx4> mi;
+    auto pushTri = [&](F4 p0, F4 p1, F4 p2) {
+        const uint32_t b = uint32_t(mv.size());
+        mv.push_back(p0); mv.push_back(p1); mv.push_back(p2);
+        mi.push_back(TriIdx4{ b, b + 1u, b + 2u, 0u });
+    };
+    // A front-facing (n = +y) unit right triangle at x in [ox, ox+1], height y.
+    auto pushSlab = [&](float ox, float y) {
+        pushTri(F4{ ox, y, 0, 0 }, F4{ ox, y, 1.0f, 0 }, F4{ ox + 1.0f, y, 0, 0 });
+    };
+    pushTri(F4{ 1000.0f, 0, 0, 0 }, F4{ 1000.0f, 0, 1.0f, 0 }, F4{ 1001.0f, 0, 0, 0 });   // prim 0
+    pushSlab(0.0f, 0.0f);                                                                 // prim 1 (slot 0)
+    pushTri(F4{ 0, 0.06f, 0, 0 }, F4{ 1.0f, 0.06f, 0, 0 }, F4{ 0, 0.06f, 1.0f, 0 });       // prim 2, n = -y
+    const uint32_t SLOT1_PRIM = uint32_t(mi.size());                                       // prim 3
+    pushSlab(2.0f, 0.0f);
+    for (uint32_t k = 0; k < 5u; ++k)                                                      // prims 4..8
+        pushSlab(2.0f, -0.02f * float(k + 1u));
+    const uint32_t SLOT2_PRIM = uint32_t(mi.size());  pushSlab(4.0f, 0.0f);                // prim 9
+    const uint32_t SLOT3_PRIM = uint32_t(mi.size());  pushSlab(6.0f, 0.0f);                // prim 10
+    const uint32_t SLOT4_PRIM = uint32_t(mi.size());  pushSlab(8.0f, 0.0f);                // prim 11
+    // The CROSS-AXIS triangle.  Its edges are deliberately SHORT (0.5, not 2.0): the separating
+    // cross product then has |axis| = 0.25, so leaving out the 1/sqrt(magSq) normalization scales
+    // the reported separation down by 4x -- from 0.25, outside the band, to 0.0625, inside it.
+    // With long edges the unnormalized axis is LONGER than unit and the verdict does not change,
+    // which is how that mutant survived the first sweep.
+    const uint32_t CROSS_PRIM = uint32_t(mi.size());                                       // prim 12
+    pushTri(F4{ 12.0f, 0.30f, -0.25f, 0 }, F4{ 12.0f, 0.30f, 0.25f, 0 }, F4{ 12.0f, 0.35f, 0, 0 });
+    // The TINY pair, parked at x = 30.  Every edge is 0.03 long, so EVERY edge cross has
+    // magSq <= 8.1e-7 -- below satIntersect's 1e-5 floor.  All nine cross axes are therefore
+    // skipped and the two PLANE terms alone decide, which is the only configuration in which
+    // applying them to the wrong triangle is observable (it turns 0.28 into 0.0).
+    const float TINY_E = 0.03f;
+    const uint32_t TINY_PRIM = uint32_t(mi.size());                                        // prim 13
+    pushTri(F4{ 30.0f, 0, 0, 0 }, F4{ 30.0f, 0, TINY_E, 0 }, F4{ 30.0f + TINY_E, 0, 0, 0 });
+    // The DIAGONAL pair, parked at x = 20.75.  Its leaf box is offset from the query bound in
+    // BOTH x and y by 0.15 -- so the fattened-bound OVERLAP test (this kernel's) accepts it while
+    // the softbody traverser's unfattened-bound DISPLACEMENT test rejects it
+    // (0.15^2 + 0.15^2 = 0.045 > 0.20^2 = 0.04).  Axis-aligned offsets cannot tell those two
+    // forms apart; only a diagonal one can.
+    const uint32_t DIAG_PRIM = uint32_t(mi.size());                                        // prim 14
+    pushSlab(20.75f, -0.15f);
+
+    const uint32_t NPRIM = uint32_t(mi.size());
+    const uint32_t NVERT = uint32_t(mv.size());
+
+    // ---- the BV32 node: ONE node, SIX leaf children ----------------------------------------
+    // Every slot box is TIGHT IN Y (its own triangle's height), so dropping the query bound's
+    // fattening loses those pairs outright.  Child 5 is deliberately LOOSE -- a BVH box only has
+    // to CONTAIN its primitive, and a loose one decouples the box test from the cross-axis SAT
+    // that child exists to exercise.
+    struct LeafSpec { uint32_t start, count; float mn[3], mx[3]; };
+    const LeafSpec leafSpec[8] = {
+        { 1u,          2u, { 0.0f, 0.00f, 0.0f }, { 1.0f, 0.06f, 1.0f } },   // slot 0 + back-facing
+        { SLOT1_PRIM,  6u, { 2.0f, -0.10f, 0.0f }, { 3.0f, 0.00f, 1.0f } },  // slot 1 + the stack
+        { SLOT2_PRIM,  1u, { 4.0f, 0.00f, 0.0f }, { 5.0f, 0.00f, 1.0f } },
+        { SLOT3_PRIM,  1u, { 6.0f, 0.00f, 0.0f }, { 7.0f, 0.00f, 1.0f } },
+        { SLOT4_PRIM,  1u, { 8.0f, 0.00f, 0.0f }, { 9.0f, 0.00f, 1.0f } },
+        { CROSS_PRIM,  1u, { 10.0f, -1.0f, -2.0f }, { 14.0f, 1.0f, 2.0f } }, // loose, on purpose
+        { TINY_PRIM,   1u, { 29.5f, -0.5f, -0.5f }, { 30.5f, 0.5f, 0.5f } }, // loose, on purpose
+        { DIAG_PRIM,   1u, { 20.75f, -0.15f, 0.0f }, { 21.75f, -0.15f, 1.0f } },
+    };
+    std::vector<uint32_t> blob(4u + 292u, 0u);   // header (4 words) + one 1168-byte node
+    {
+        const uint32_t n = 4u;   // the node starts at byte 16
+        for (uint32_t c = 0; c < 8u; ++c)
+        {
+            for (uint32_t a = 0; a < 3u; ++a)
+            {
+                blob[n + c * 4u + a] = f2u(leafSpec[c].mn[a]);              // mMin[c]
+                blob[n + 128u + c * 4u + a] = f2u(leafSpec[c].mx[a]);       // mMax[c] (byte +512)
+            }
+            // mData: isLeaf | nbPrimitives<<1 | primStartIndex<<7
+            blob[n + 256u + c] = 1u | (leafSpec[c].count << 1) | (leafSpec[c].start << 7);
+        }
+        blob[n + 288] = 8u;   // mNbNodes @byte 1152 — eight children
+        blob[n + 289] = 1u;   // mDepth
+    }
+    const size_t vBase = blob.size();
+    blob.resize(vBase + NVERT * 4u, 0u);
+    std::memcpy(blob.data() + vBase, mv.data(), NVERT * sizeof(F4));
+    const size_t iBase = blob.size();
+    blob.resize(iBase + NPRIM * 4u, 0u);
+    std::memcpy(blob.data() + iBase, mi.data(), NPRIM * sizeof(TriIdx4));
+    blob[0] = NVERT;
+    blob[1] = NPRIM;
+    // header.z is nbBv32TreeNodes and header.w is nbPackedNodes.  They are DIFFERENT counts and
+    // only .w sizes the node array, so .z is a deliberately wrong 7 here: a port that sizes with
+    // .z walks the vertex pointer seven nodes too far and reads garbage.
+    blob[2] = 7u;
+    blob[3] = 1u;
+
+    DevBuf bBlob = makeDev(dev, blob);
+    if (!bBlob.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    // ---- the cloth: one query triangle per slot, plus the cross-axis one -------------------
+    const uint32_t NB_SLOTS = 5u;
+    const float gaps[5] = { 0.12f, 0.04f, 0.28f, 0.45f, 0.02f };
+    std::vector<F4> cv;
+    std::vector<TriIdx4> ci;
+    std::vector<V3> clothVs;   // the same corners in VERTEX space, for the CPU reference
+    auto pushCloth = [&](V3 p0, V3 p1, V3 p2) {
+        const uint32_t b = uint32_t(cv.size());
+        cv.push_back(toWorld(p0.x, p0.y, p0.z));
+        cv.push_back(toWorld(p1.x, p1.y, p1.z));
+        cv.push_back(toWorld(p2.x, p2.y, p2.z));
+        ci.push_back(TriIdx4{ b, b + 1u, b + 2u, 0u });
+        clothVs.push_back(p0); clothVs.push_back(p1); clothVs.push_back(p2);
+    };
+    for (uint32_t t = 0; t < NB_SLOTS; ++t)
+    {
+        const float ox = float(t) * 2.0f, g = gaps[t];
+        pushCloth(V3{ ox + 0.2f, g, 0.2f }, V3{ ox + 0.2f, g, 0.6f }, V3{ ox + 0.6f, g, 0.2f });
+    }
+    // slot 5 — the cross-axis query: its plane cuts prim 12 and prim 12's plane cuts it (the two
+    // plane terms come out at -0.05), and only an edge-cross axis separates them, by 0.25.
+    pushCloth(V3{ 11.55f, 0.0f, 0.0f }, V3{ 12.05f, 0.0f, 0.0f }, V3{ 11.8f, 0.05f, 0.0f });
+    // slot 6 — the tiny query, 0.28 above prim 13 with every edge cross below the 1e-5 floor.
+    pushCloth(V3{ 30.0f, 0.28f, 0.0f }, V3{ 30.0f, 0.28f, TINY_E }, V3{ 30.0f + TINY_E, 0.28f, 0.0f });
+    // slot 7 — the diagonal query, 0.15 above and 0.15 to the left of prim 14's leaf box.
+    pushCloth(V3{ 20.2f, 0.0f, 0.2f }, V3{ 20.2f, 0.0f, 0.6f }, V3{ 20.6f, 0.0f, 0.2f });
+    const uint32_t NB_CLOTH_TRI = uint32_t(ci.size());
+
+    DevBuf bCv = makeDev(dev, cv), bCi = makeDev(dev, ci);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bCv.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bCi.addr));
+    c.mNbTriangles = NB_CLOTH_TRI;
+    c.mNbVerts = uint32_t(cv.size());
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- the pair.  The TRIMESH is shapeRef0 and the CLOTH shapeRef1, i.e. the SWAPPED order.
+    // BOTH shapes are eTRIANGLEMESH here, so the cloth can only be found by its body id.
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_TRIANGLEMESH_H; shapes[0].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[0].sx = SX; shapes[0].sy = SY; shapes[0].sz = SZ; shapes[0].srw = 1.0f;
+    shapes[0].hullLo = uint32_t(bBlob.addr & 0xFFFFFFFFull);
+    shapes[0].hullHi = uint32_t(bBlob.addr >> 32);
+    shapes[1].type = GEOM_TRIANGLEMESH_H; shapes[1].particleOrSoftbodyId = 0u;
+    shapes[1].sx = 1.0f; shapes[1].sy = 1.0f; shapes[1].sz = 1.0f; shapes[1].srw = 1.0f;
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<CmInputHost> cms = { { 0u, 1u, /*trimesh cache*/ 1u, /*cloth cache*/ 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    // PxsCachedTransform, 32 B: PxQuat q @0, PxVec3 p @16.  Slot 0 = the cloth (unused), slot 1
+    // = the trimesh, rotated 180 degrees about y and translated.
+    std::vector<float> xf(2 * 8, 0.0f);
+    xf[3] = 1.0f;                                                              // slot 0 identity
+    xf[8 + 0] = QX; xf[8 + 1] = QY; xf[8 + 2] = QZ; xf[8 + 3] = QW;             // 90 deg about y
+    xf[8 + 4] = TX; xf[8 + 5] = TY; xf[8 + 6] = TZ;
+    DevBuf bXf = makeDev(dev, xf);
+
+    // contactDistance is summed over BOTH cache refs: 0.05 + 0.15 = 0.20, and NOT divided.
+    const float CD_CLOTH = 0.05f, CD_MESH = 0.15f;
+    const float contactDist = CD_CLOTH + CD_MESH;
+    std::vector<float> cd = { CD_CLOTH, CD_MESH };
+    DevBuf bCd = makeDev(dev, cd);
+
+    const uint32_t CAP = 64u;
+    std::vector<uint32_t> stack(CAP * 4u, 0xFFFFFFFFu);
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairNum = { 0u };
+    DevBuf bPairNum = makeDev(dev, pairNum);
+
+    ClothMeshMidPush push = {};
+    push.toleranceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.bounds = 0ull;                 // ABI parity only — the kernel never reads it
+    push.contactDistance = bCd.addr;
+    push.gpuShapes = bShapes.addr;
+    push.femClothes = bDesc.addr;
+    push.stackSizeBytes = CAP * 16u;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairNum.addr;
+
+    Kernel k("femClothMeshMidphaseBda.spv", "cloth_meshMidphaseGeneratePairsLaunch",
+             {}, sizeof(ClothMeshMidPush));
+    // The engine's grid (PxgNarrowphaseCore.cpp:6597): x = SB_SBMIDPHASE = 1024, y = numTests.
+    k.dispatch(/*gridX*/ 1024u, {}, push, /*gridY*/ 1u, 1u);
+    dev->flush();
+
+    // ---- CPU reference: the leaf predicate, per lane, exactly as the warp runs it -----------
+    // Each leaf gives lane L the primitive primStart + L, so with <= 32 primitives per leaf every
+    // lane sees at most one primitive per leaf and its tolerance is min(PX_MAX, contactDist).
+    // The reference walks the SAME six leaves the tree carries.
+    auto meshVert = [&](uint32_t i) { return V3{ mv[i].x, mv[i].y, mv[i].z }; };
+
+    bool crossFired = false;
+    std::vector<std::pair<uint32_t, uint32_t>> ref;   // (clothTri, prim)
+    for (uint32_t t = 0; t < NB_CLOTH_TRI; ++t)
+    {
+        const V3 a0 = clothVs[t * 3 + 0], a1 = clothVs[t * 3 + 1], a2 = clothVs[t * 3 + 2];
+        V3 nA; float dA; p817mesh::makePlane(a0, a1, a2, nA, dA);
+        const V3 cen{ (a0.x + a1.x + a2.x) / 3.0f, (a0.y + a1.y + a2.y) / 3.0f, (a0.z + a1.z + a2.z) / 3.0f };
+        const V3 tMin{ std::fmin(std::fmin(a0.x, a1.x), a2.x) - contactDist,
+                       std::fmin(std::fmin(a0.y, a1.y), a2.y) - contactDist,
+                       std::fmin(std::fmin(a0.z, a1.z), a2.z) - contactDist };
+        const V3 tMax{ std::fmax(std::fmax(a0.x, a1.x), a2.x) + contactDist,
+                       std::fmax(std::fmax(a0.y, a1.y), a2.y) + contactDist,
+                       std::fmax(std::fmax(a0.z, a1.z), a2.z) + contactDist };
+
+        // per-lane best, persisting across the leaves the warp visits
+        std::vector<float> best(32, 3.4028235e38f);
+        std::vector<uint32_t> bestPrim(32, 0xFFFFFFFFu);
+        for (const LeafSpec& lf : leafSpec)
+        {
+            const bool overlap = !(lf.mn[0] > tMax.x || tMin.x > lf.mx[0] ||
+                                   lf.mn[1] > tMax.y || tMin.y > lf.mx[1] ||
+                                   lf.mn[2] > tMax.z || tMin.z > lf.mx[2]);
+            if (!overlap) continue;
+            for (uint32_t lane = 0; lane < lf.count && lane < 32u; ++lane)
+            {
+                const uint32_t p = lf.start + lane;
+                const V3 b0 = meshVert(mi[p].x), b1 = meshVert(mi[p].y), b2 = meshVert(mi[p].z);
+                V3 nB; float dB; p817mesh::makePlane(b0, b1, b2, nB, dB);
+                if (!(p817mesh::dot(nB, cen) + dB >= 0.0f)) continue;   // the front-face gate
+                bool raised = false;
+                const float sep = p817mesh::satIntersect(a0, a1, a2, nA, dA, b0, b1, b2, nB, dB,
+                                                         std::fmin(best[lane], contactDist), &raised);
+                if (raised && sep >= contactDist) crossFired = true;
+                if (sep < best[lane]) { best[lane] = sep; bestPrim[lane] = p; }
+            }
+        }
+        // the top-4 extraction: lanes inside the band, four smallest, lowest lane wins ties
+        std::vector<std::pair<float, uint32_t>> keep;   // (sep, lane)
+        for (uint32_t lane = 0; lane < 32u; ++lane)
+            if (best[lane] < contactDist) keep.push_back({ best[lane], lane });
+        std::sort(keep.begin(), keep.end());
+        if (keep.size() > 4u) keep.resize(4u);
+        for (auto& e : keep) ref.push_back({ t, bestPrim[e.second] });
+    }
+    std::sort(ref.begin(), ref.end());
+
+    PXG_CHECK_MSG(crossFired,
+                  "the fixture must contain a pair the EDGE-CROSS axes reject and the two plane "
+                  "terms alone would accept — without one, deleting satIntersect's cross block "
+                  "is invisible");
+    PXG_CHECK_MSG(ref.size() == 7u,
+                  "reference: expected 7 pairs (slot 0 one, slot 1 four via the cap, slot 4 one, "
+                  "slot 7 one, and none for slots 2, 3, the cross pair or the tiny pair), got %zu",
+                  ref.size());
+
+    const uint32_t gNum = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];
+    const auto gStack = downloadBuffer<uint32_t>(dev, bStack.h, CAP * 4u);
+    std::vector<std::pair<uint32_t, uint32_t>> got;
+    for (uint32_t i = 0; i < gNum && i < CAP; ++i)
+    {
+        PXG_CHECK_MSG(gStack[i * 4u + 0u] == 0u,
+                      "pair %u carries cmIdx %u; blockIdx.y is the ONLY contact-manager index here",
+                      i, gStack[i * 4u + 0u]);
+        got.push_back({ gStack[i * 4u + 1u], gStack[i * 4u + 2u] });
+    }
+    std::sort(got.begin(), got.end());
+    for (auto& e : got) std::printf("  pair: clothTri %u  meshPrim %u\n", e.first, e.second);
+
+    PXG_CHECK_MSG(gNum == uint32_t(ref.size()),
+                  "emitted %u pairs, reference says %zu.  0 usually means the blob walk or the "
+                  "vertex-space transform is wrong; more means the contact distance picked up the "
+                  "softbody path's scale division (the 0.28, cross and tiny pairs all come inside "
+                  "a 0.40 band); fewer means the query bound lost its fattening",
+                  gNum, ref.size());
+    PXG_CHECK_MSG(got == ref, "the emitted pair SET does not match the CPU reference");
+
+    // Pin what the six ARE, so a reference that drifts with the shader is caught too.
+    auto has = [&](uint32_t t, uint32_t p) {
+        return std::find(got.begin(), got.end(), std::make_pair(t, p)) != got.end();
+    };
+    auto countFor = [&](uint32_t t) {
+        uint32_t n = 0; for (auto& e : got) if (e.first == t) ++n; return n;
+    };
+    PXG_CHECK_MSG(has(0u, 1u), "slot 0 must match the triangle in ITS OWN leaf (prim 1)");
+    PXG_CHECK_MSG(countFor(0u) == 1u,
+                  "slot 0 must keep exactly ONE: the back-facing prim 2 shares its leaf and is "
+                  "CLOSER (0.06 against 0.12), and only the front-face gate keeps it out (got %u)",
+                  countFor(0u));
+    PXG_CHECK_MSG(countFor(1u) == 4u,
+                  "slot 1 sees six qualifying triangles in its leaf and the MaxNumPairs cap must "
+                  "hold it to four (got %u)", countFor(1u));
+    PXG_CHECK_MSG(has(1u, SLOT1_PRIM) && has(1u, SLOT1_PRIM + 1u) &&
+                  has(1u, SLOT1_PRIM + 2u) && has(1u, SLOT1_PRIM + 3u),
+                  "slot 1 must keep the FOUR CLOSEST — its own triangle plus the three nearest of "
+                  "the stack, not the first four the leaf happens to hand out");
+    PXG_CHECK_MSG(countFor(2u) == 0u,
+                  "slot 2 sits 0.28 away: outside the correct 0.20 band and inside the 0.40 the "
+                  "softbody path's scale division would give");
+    PXG_CHECK_MSG(countFor(3u) == 0u, "slot 3 sits 0.45 away, outside either reading");
+    PXG_CHECK_MSG(countFor(4u) == 1u && has(4u, SLOT4_PRIM),
+                  "slot 4 sits 0.02 away and must match its own leaf's triangle");
+    PXG_CHECK_MSG(countFor(5u) == 0u,
+                  "the cross-axis pair must be REJECTED: the two plane terms give -0.05 and only "
+                  "the nine edge-cross axes separate it, by 0.25 -- and only once the axis is "
+                  "NORMALIZED (unnormalized it reports 0.0625, inside the 0.20 band)");
+    PXG_CHECK_MSG(countFor(6u) == 0u,
+                  "the tiny pair must be REJECTED at 0.28: every edge cross is below the 1e-5 "
+                  "floor, so the two plane terms decide alone -- and they only give 0.28 when "
+                  "each is applied to the OTHER triangle's vertices");
+    PXG_CHECK_MSG(countFor(7u) == 1u && has(7u, DIAG_PRIM),
+                  "the diagonal pair must be KEPT: its leaf box clears the query bound by 0.15 in "
+                  "x AND y, which the fattened-bound overlap test accepts and the softbody "
+                  "traverser's unfattened displacement test (0.045 > 0.04) would reject");
+
+    for (PxgBufferHandle h : { bBlob.h, bCv.h, bCi.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h,
+                               bStack.h, bPairNum.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace
