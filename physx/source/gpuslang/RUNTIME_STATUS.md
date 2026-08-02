@@ -1623,6 +1623,111 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.21 scouting — the failed-launch inventory: two failure modes, and what is actually missing
+
+P8.20 found three kernels that had been refused at every launch for the whole
+softbody arc without anyone noticing.  That is a failure CLASS, not an incident,
+so before picking another kernel by intuition this tranche measures it across
+every scene.
+
+### There are TWO failure modes, and only one of them is traced
+
+- **REFUSED** — the kernel IS in the manifest with valid SPIR-V, but has no ABI
+  row, so `pushConstantSizeFor()` returns 0 and the shim rejects the blob.
+  `PXG_LAUNCH_TRACE=1` prints `[pxg-launch] ... REFUSED` for these.
+- **No `CUfunction` at all** — the manifest entry is `nullptr` (unmapped).
+  `fromFunc()` fails and `PxgVulkanCudaContext::launchKernel` returns before
+  `traceDispatch()` ever runs, so these produce **NO trace line**.  The only
+  evidence is the engine's own `PxGetFoundation().error(... "fail to launch
+  kernel!!")` on stderr.
+
+A sweep that greps only the trace therefore misses every unmapped kernel, which
+is exactly how the `convexTrimesh` chain below stayed invisible.  Both sweeps:
+
+```
+PXG_LAUNCH_TRACE=1 ... | grep REFUSED                      # mapped, no ABI row
+                    ... | grep -oE "GPU [A-Za-z0-9_]+ fail to launch kernel"   # unmapped
+```
+
+### Mode 1 (REFUSED), all scenes: clean
+
+Across box / stack / plane / sphere / capsule / capsulebox / convex / joint /
+particle / cloth / clothhang / clothdrape / clothselfcollide / softbody (all
+floors) / softbodyselfcollide, the only refusals left after P8.20 are
+`removeContactManagers_Stage5` (1–3 per run) and `initializeManifolds` (1 per
+run).  Both fire in setup/teardown, not per step.  Nothing per-step is refused
+anywhere.
+
+### Mode 2 (unmapped), and the two things it found
+
+| scene | kernel | per run |
+|---|---|---|
+| `clothdrape` + `PXG_CLOTH_FLOOR=mesh` | `cloth_midphaseVertexMeshLaunch` | 174 |
+| `clothdrape` + `PXG_CLOTH_FLOOR=mesh` | `cloth_meshVertexContactGenLaunch` | 174 |
+| `softbody` + `PXG_SB_FLOOR=mesh`, `clothdrape` + mesh | `midphaseGeneratePairs` (`convexTrimeshMidphase`) | 13 / 10 |
+| " | `convexTrimeshNarrowphase`, `sortTriangleIndices`, `convexTrimeshPostProcess`, `convexTrimeshCorrelate` | 13 / 10 |
+
+**Finding A — the cloth VERTEX-vs-mesh pair is launched every step, and its
+contact writer is DISABLED UPSTREAM.**  P8.14's survey called the four cloth
+vertex-vs-mesh/HF kernels "dead".  That verdict is right in its effect and wrong
+in its reasoning: they are launched 174 times per run, once per step, not never.
+But `cloth_meshVertexContactGenLaunch` (`femClothPrimitives.cu:2910`) declares
+`bool hasContacts = false;` and its ONLY assignment is commented out in
+upstream's own source:
+
+```cpp
+    if ((pen <= cDistance) && normal.dot(n) > 0.f)
+    {
+        pairInd0 = rigidId.getInd();
+        pairInd1 = PxEncodeClothIndex(clothId, clothVertIndex);
+        contact = make_float4(closestPt.x, closestPt.y, closestPt.z, restDistance[cmIdx]);
+        //hasContacts = true;                      // <-- upstream, femClothPrimitives.cu:3056
+    }
+```
+
+so the `__ballot_sync` is always empty and `writeRigidVsDeformableContact32` is
+never reached.  The sibling at `:2737` is commented out identically.  The kernel
+computes a full closest-point-on-triangle query and throws the answer away; its
+only surviving effect is the `atomicMax` on `stackSizeNeededOnDevice`.
+
+Porting it line-for-line — which is this project's rule — would faithfully
+reproduce a no-op.  **These two kernels are removed from the queue with evidence
+rather than by verdict**, and that is also why `PXG_CLOTH_FLOOR=mesh` settles
+correctly (P8.18, min y 0.0496) while both halves of the pair fail to launch:
+they would have contributed nothing either way.
+
+**Finding B — the real gap is the rigid convex-vs-trimesh narrowphase**, six
+unmapped kernels that fire in BOTH mesh-floor scenes:
+
+| manifest name | id | CUDA |
+|---|---|---|
+| `midphaseGeneratePairs` | `CONVEX_TRIMESH_MIDPHASE` | `convexMeshMidphase.cu:378` |
+| `convexTrimeshNarrowphase` | `CONVEX_TRIMESH_CORE` | |
+| `sortTriangleIndices` | `CONVEX_TRIMESH_SORT_TRIANGLES` | |
+| `convexTrimeshPostProcess` | `CONVEX_TRIMESH_POST_PROCESS` | |
+| `convexTrimeshCorrelate` | `CONVEX_TRIMESH_CORRELATE` | |
+| `convexTrimeshFinishContacts` | `CONVEX_TRIMESH_FINISHCONTACTS` | |
+
+This is not a deformable gap — it is the pair that lets ANY dynamic rigid body
+collide with a cooked triangle mesh, and it has been missing the whole time.  The
+mesh-floor scenes carry a dynamic rigid box (the one the PGS island needs) which
+currently falls straight through the mesh floor; no scene asserts on it, which is
+why it never surfaced.  Phase 1 already ported the underlying math into harness
+shaders (`npConvexTri`, `npCvxTriEmit`, `npCvxTriFind`, `npCvxTriPurge`,
+`npCvxTriWorldNormal`, `npCvxTriNpSetup`, `npMidphaseCvx`), so the work is the
+usual lift onto the BDA engine ABI rather than a fresh port of the geometry.
+
+Step 1 is `midphaseGeneratePairs`: pack
+`{4,4,8,8,8,8,8,8,8,8,8,8,8,8,4}` = 15 args, 112-byte blob (well inside the
+256-byte push-constant limit), launched at `PxgNarrowphaseCore.cpp:1950` and
+`:2554` with grid `(numBlocks,1,1)` block `(32, MIDPHASE_WARPS_PER_BLOCK, 1)`.
+`midphaseCore` (`convexMeshMidphase.cu:167`) is ~200 lines of warp code over a
+BV32 traversal, comparable in size to the softbody mesh midphase of P8.10.
+
+### Verification
+
+Measurement only — no shader, manifest, ABI or scene file changed in this commit.
+
 ## P8.20 — the softbody settle failure: three REFUSED launches, and an undamped material
 
 This tranche started as a bisect and ended as two unrelated findings, neither of
