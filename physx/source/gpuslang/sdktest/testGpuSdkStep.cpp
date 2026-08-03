@@ -159,6 +159,51 @@ void buildStackScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
     }
 }
 
+// PXG_SCENE=meshfloor (P8.21): one dynamic box dropped onto a COOKED TRIANGLE MESH
+// floor.  Geometrically this is PXG_SCENE=plane with the floor swapped for a
+// trimesh, and that swap is the whole point: it routes the pair through the rigid
+// convex-vs-TRIANGLE-MESH narrowphase instead of the box-plane one.
+//
+// *** THIS SCENE IS EXPECTED TO FAIL UNTIL THE convexTrimesh CHAIN IS MAPPED. ***
+// P8.21's failed-launch inventory found six unmapped kernels behind that pair --
+// midphaseGeneratePairs, convexTrimeshNarrowphase, sortTriangleIndices,
+// convexTrimeshPostProcess, convexTrimeshCorrelate, convexTrimeshFinishContacts --
+// and no scene asserted on any of them, which is exactly why the gap survived the
+// whole port.  A dynamic rigid could not collide with a cooked triangle mesh, and
+// nothing said so.  The scene exists to say so, and to become the milestone
+// assertion when the chain lands.
+//
+// The floor is the SAME 20 x 20 two-triangle quad at y = 0 that PXG_SB_FLOOR=mesh
+// cooks for the softbody, so the two settle numbers are directly comparable and a
+// difference between them points at the pair rather than at the floor.
+void buildMeshFloorScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                         std::vector<RestTarget>& targets)
+{
+    const float E = 10.0f;
+    const PxVec3 mverts[4] = { PxVec3(-E, 0.0f, -E), PxVec3(-E, 0.0f, E),
+                               PxVec3( E, 0.0f, -E), PxVec3( E, 0.0f, E) };
+    const PxU32 mtris[6] = { 0u, 1u, 2u,   2u, 1u, 3u };   // wound so the normals point UP
+    PxTriangleMeshDesc md;
+    md.points.count = 4; md.points.stride = sizeof(PxVec3); md.points.data = mverts;
+    md.triangles.count = 2; md.triangles.stride = 3 * sizeof(PxU32); md.triangles.data = mtris;
+    PxCookingParams ck(physics->getTolerancesScale());
+    ck.buildGPUData = true;   // without this the mesh has no BV32 tree and the GPU pair is inert
+    PxTriangleMesh* floorMeshGeom =
+        immediateCooking::createTriangleMesh(ck, md, physics->getPhysicsInsertionCallback());
+    if (!floorMeshGeom) { std::printf("FAIL: createTriangleMesh (floor) returned null\n"); return; }
+    PxRigidStatic* floor = physics->createRigidStatic(PxTransform(PxVec3(0.0f, 0.0f, 0.0f)));
+    PxShape* fs = physics->createShape(PxTriangleMeshGeometry(floorMeshGeom), *material);
+    floor->attachShape(*fs);
+    scene->addActor(*floor);
+    fs->release();
+
+    // Dropped from the same height as PXG_SCENE=box / plane so the three are one
+    // comparison: a half-0.5 box settling on a floor at y = 0 rests at centre 0.5.
+    PxRigidDynamic* b = addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                   boxInertia(PxVec3(0.5f), 1000.0f), 5.0f);
+    targets.push_back({ b, 5.0f, 0.5f, "boxOnMesh" });
+}
+
 // PXG_SCENE=plane: one dynamic box resting on a static infinite PxPlaneGeometry
 // (y=0).  Exercises the convex/box-plane narrowphase path.
 void buildPlaneScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
@@ -4011,7 +4056,8 @@ int main()
     else if (!std::strcmp(sceneName, "capsulebox")) buildCapsuleBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "convex"))    buildConvexScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "joint"))     buildJointScene(physics, scene, material, targets);
-    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint|particle|cloth|clothhang|clothdrape|clothselfcollide|softbody|softbodyselfcollide)\n", sceneName);
+    else if (!std::strcmp(sceneName, "meshfloor")) buildMeshFloorScene(physics, scene, material, targets);
+    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|particle|cloth|clothhang|clothdrape|clothselfcollide|clothcloth|softbody|softbodyselfcollide|softbodycloth|softbodystack|softbodyattach)\n", sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
     if (targets.empty())
     {

@@ -1623,6 +1623,92 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.22 — `PXG_SCENE=meshfloor`: the assertion that was missing, and the convex-trimesh recon
+
+P8.21 concluded that a dynamic rigid cannot collide with a cooked triangle mesh
+and that no scene said so.  This tranche makes the scene say so, and does the
+reading the port needs.  **No shader, manifest or ABI changed here.**
+
+### The red control
+
+`PXG_SCENE=meshfloor` is `PXG_SCENE=plane` with the floor swapped for the SAME
+20 x 20 two-triangle cooked quad that `PXG_SB_FLOOR=mesh` gives the softbody, so
+the two settle numbers are directly comparable.  A half-0.5 box dropped from
+y = 5 must rest at centre y = 0.5.  Measured today:
+
+```
+  [boxOnMesh] start y=5.000, y after 1 step=4.9973, final y=-73.8070 (rest 0.500), |v|=39.2401
+FAIL: [boxOnMesh] not at rest (|v|=39.240)
+FAIL: [boxOnMesh] below rest band / sank (finalY=-73.807)
+```
+
+with all six `convexTrimesh` kernels failing to launch.  The box does not
+"settle badly" — it passes through the floor and is still accelerating.  **This
+scene is EXPECTED RED until the chain lands**, and it is deliberately not in the
+rigid regression list yet.  It costs nothing to keep red: `gpu-sdk-step` scenes
+are driven by hand, not by `ctest`, so the 675-test suite is unaffected.
+
+### Recon for the port, and one claim that needed checking
+
+A read-only survey of `midphaseGeneratePairs` produced four things worth
+committing before any code is written.
+
+**1. The traversal stack depth is NOT one number, and the deformable ports are
+correct.**  A review flagged that the shipped BDA midphases use `STACK_SIZE =
+192` while `convexNpCommon.h:171` declares `int sBv32Nodes[320]; //10 depth`,
+i.e. that P8.10 and P8.17 might be under PhysX's own bound.  Checked: they are
+not.  There are two scratch structs.  The DEFORMABLE path's
+`femMidphaseScratch` (`gpucommon/src/CUDA/femMidphaseScratch.cuh:57`) declares
+`int sBv32Nodes[192]; // 6 depth of the bv32 tree` — which is exactly what
+`pxgSlangClothMidphase`, `softBodyMeshMidphaseBda` and `femClothMeshMidphaseBda`
+mirror, comment and all.  The 320 belongs to the CONVEX path's `MidphaseScratch`
+alone.  **The convex port must use 320; copying 192 from the deformable template
+would silently corrupt traversal on a deep mesh.**
+
+**2. Half of `midphaseCore` is not the traversal, and that half is the risk.**
+The kernel splits at `fullContactGen = invalidate || lostContacts`
+(`convexMeshMidphase.cu:263`).  Only if that is true does the BV32 traversal run.
+The gate itself is `invalidateManifold` + `refreshManifolds` (`manifold.cuh`),
+and it is the ONLY stateful part of the kernel: `manifold.cuh:84` writes
+penetration back into a persistent 1216-byte record and `:97` destructively
+zeroes `mNbManifolds`.  Everything else is a pure function of this frame.
+
+The consequence for testing is sharp and worth stating before it bites: **a
+single-dispatch golden-vector fixture cannot detect a bug in the gate.**  A port
+that is conservative (always `fullContactGen = true`) yields CORRECT contacts on
+frame 1 and in every isolated fixture, while having destroyed PCM caching — the
+failure appears as solver warm-start drift many frames later.  The gate needs a
+multi-frame test, not a one-shot one.
+
+**3. The gate also carries the only lane-count hazard with a state consequence.**
+`manifold.cuh:52` is `PxU32 i = threadIdxInWarp;` with NO loop, covering 24 slots
+(`MULTIMANIFOLD_MAX_MANIFOLDS 4 x SUBMANIFOLD_MAX_CONTACTS 6`).  It assumes
+`WARP_SIZE >= 24`.  Under this port's sanctioned mapping — 32-lane virtual warps
+over groupshared scans, `[numthreads(32,1,1)]`, four subgroups of 8 per group —
+that holds.  It only breaks if someone "optimises" the group to 8 wide, and then
+it does not merely drop work: 16 of 24 cached contacts keep last frame's
+penetration while 8 are current.
+
+**4. Two BDA alignment traps, both from odd-sized structs.**  `PxBounds3` is 24
+bytes, so `bounds[i]` sits at byte `24*i` — 8-mod-16 for odd `i`, which makes a
+`Ptr<float4>` read MISALIGNED.  `ConvexMeshPair` is 56 bytes with the same
+problem at `cvxTrimeshPair[cmIdx]`, which is precisely why upstream writes it as
+a 14 x 4-byte scatter (`dataReadWriteHelper.cuh:384`).  Both must be read and
+written as scalars.
+
+Also recorded for the port: `cmOutputs` (argument 10 of 15) is **never touched**
+by `midphaseCore` — it is passed and ignored; the two launch sites differ only in
+which bucket they serve (sphere/capsule-vs-mesh at `:1950`, box/convex-vs-mesh at
+`:2554`) and in one memset; and a BV32 leaf's `nbPrimitives` field is 6 bits (up
+to 63) while `bv32Traversal.cuh` maps one lane per primitive and silently drops
+past 32 — so the port must clamp to 32 bug-for-bug rather than write the obvious
+loop.
+
+### Verification
+
+`meshfloor` fails as designed and is documented as such.  Every other scene
+unchanged; the suite is untouched (675/675) because no shader or manifest moved.
+
 ## P8.21 scouting — the failed-launch inventory: two failure modes, and what is actually missing
 
 P8.20 found three kernels that had been refused at every launch for the whole
