@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **679/679** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **680/680** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1622,6 +1622,67 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
+
+## P8.32 — `pxgSlangDeferContact`: the predicate that decides whether to defer at all
+
+Step 2 of P8.31's corrected decomposition, and the counterpart of the classifier
+P8.30 certified.  P8.30 answers "WHICH feature did the contact land on"; this
+answers the prior question, "should this pair be deferred to the second pass AT
+ALL".  Seventeen lines of CUDA (`convexTriangle.cuh:1402`) with four details that
+only literal transcription keeps.
+
+### The four details
+
+1. **The guard is an AND of two inequalities against NON-ADJACENT sentinels.**
+   `TRI_FEATURE_IDX` is `0x7FFFFFFF` and `EDGE_FEATURE_IDX` is `0x80000000`
+   (`triangle.cuh:32/33`).  As unsigned values they are adjacent, but they differ
+   in the top bit, so no range check can stand in for the pair.  When the
+   separating axis IS the triangle face or an edge cross, the pair is never
+   deferred — only a CONVEX HULL FACE normal can defer.
+2. **The triangle normal is negated first.**  `cosTheta` is measured against
+   MINUS the stored triangle local normal.  Dropping the negation flips the
+   predicate on every pair whose axes are within 45° of opposed, which is most of
+   them.
+3. **The comparison is strictly less.**  A pair exactly at the 45° threshold is
+   NOT deferred.
+4. **The threshold is the literal `0.707106781f`** — not a computed `sqrt(0.5)`,
+   and not the `0.985f` sitting commented out one line below it in upstream.  That
+   commented value is a tighter 10° bar someone tried; reinstating it would defer
+   far more pairs and change the contact set on every mesh.
+
+### 12 mutants, 12 killed — after a sweep-harness bug, not a shader bug
+
+The first run reported 7/12 with **five SKIPPED**, and the cause was in the sweep,
+not the code: the module header quotes the guard verbatim, so the anchor matched
+twice — once in the comment and once in the code — and the harness refuses an
+ambiguous anchor rather than guessing.  The same class of miss P8.17 hit with an
+indentation mismatch.  Anchoring on the guard plus the line that follows it (which
+the comment renders differently) disambiguates, and all five then die.
+
+That the harness REFUSES rather than picking one is what made this recoverable.
+A sweep that silently patched the first match would have mutated a comment,
+reported SURVIVED, and left five real gaps looking like equivalences.
+
+Killed: the missing negation, `<` becoming `<=` and being inverted, the 10°
+threshold, each sentinel checked alone, the AND becoming an OR, the guard dropped,
+a range check standing in for the pair, each sentinel off by one, and the default
+return flipped.
+
+### Verification
+
+Forced-fresh `.spv`, **680/680 in both memory modes** (679 → 680).  No engine
+kernel changed.
+
+### Where the chain stands
+
+Certified: PCM gate (P8.23, 21/21), triangle-box SAT (P8.24, opcode-identical),
+BV32 reader (P8.25, opcode-identical over five consumers), the midphase kernel
+itself (P8.27, 15/16, wired, manifest 259), the stack carve-up (P8.29, 12/12), the
+second-pass classifier (P8.30, 12/12), and now the deferral predicate (12/12).
+
+Remaining before the core kernel: the polygon clipper (`polyClip` plus
+`selectPolygonFeatureIndex`), then the kernel wiring all of it, then the four
+kernels after it.  `PXG_SCENE=meshfloor` stays red until those land.
 
 ## P8.31 scouting — a correction: the per-triangle core is POLYGON CLIPPING, not GJK/EPA
 
