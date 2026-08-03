@@ -1623,6 +1623,66 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.34 scouting — the clipper is NOT extractable by the P8.24 pattern, and why
+
+P8.33 named `npConvexPolyClip` as the right Phase-1 shader and predicted the
+tranche shape: "extract into a module, prove the extraction inert by opcode
+sequence, rather than port from the `.cu`".  **That prediction does not hold**,
+and the reason is structural rather than a matter of effort.
+
+### The measurement
+
+`npConvexPolyClip.slang` has no separable clipper function.  The algorithm lives
+inline in the entry point `ctPolyClip` (:137-291), and its contact EMISSION is
+fused with its control flow at four points:
+
+```
+  :206   addContacts(wp, band & 7u, maxSep);     // phase 2 — poly1 in poly0
+  :210   if (!anyOut1) { gCount[t] = wp.contactCount; return; }     // EARLY EXIT
+  :250   addContacts(wp, flag2, maxSep);         // phase 3 — poly0 in poly1
+  :254   if (!anyOut0) { gCount[t] = wp.contactCount; return; }     // EARLY EXIT
+  :286   addContacts(wp, flag3, maxSep);         // phase 4 — edge-edge crossings
+  :290   gCount[t] = wp.contactCount;
+```
+
+and `addContacts` itself (:114) writes straight into the bound
+`RWStructuredBuffer gContacts` (:128).
+
+### Why that forecloses the proof, not just complicates it
+
+P8.24 and P8.25 could prove their extractions inert because what moved was PURE:
+`tbIntersectTriangleBox` and the BV32 accessors take values and return values, so
+the same source compiles to the same instruction stream on either side of the
+move, and a disassembly diff settles it.
+
+This clipper's output path is its IO.  The harness emits to a bound descriptor at
+three interleaved points; the BDA consumer must emit to a device address derived
+from `midphaseAllocate` (P8.29).  Those are different instructions by
+construction, so **no refactor of this code can be opcode-identical**, and a
+"proof" that reported identity would be measuring the wrong thing.
+
+Any refactor that decoupled the emission — accumulating into the `Warp` struct and
+flushing once at the end — would also change WHEN the `NUM_TMP` clamp bites
+relative to the two early exits, which is observable whenever a clip produces more
+than 32 contacts.
+
+### What this changes for the next tranche
+
+The per-triangle core is a **PORT with its own fixture**, not an extraction with a
+proof.  Concretely that means: transcribe `polyClip` + `addContacts`
+(`convexTriangle.cuh:918-1058`) onto the BDA emission path, and certify it the way
+P8.27 certified the midphase — a CPU transcription, a golden-vector fixture and a
+mutation sweep — rather than the way P8.24 certified the SAT.
+
+Budget accordingly: P8.27's sweep needed four rounds and six of its first seven
+survivors were holes in the fixture, on a kernel with a far simpler output path
+than this one.
+
+### Verification
+
+Measurement only — no shader, manifest, ABI or scene changed.  Suite unchanged at
+680/680.
+
 ## P8.33 scouting — the polygon clipper: the right shader is NOT the one named after it
 
 The last piece before the core kernel is the polygon clipper.  There are **three**
