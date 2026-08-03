@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **680/680** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **681/681** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1622,6 +1622,78 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
+
+## P8.35 — `initializeManifolds` on the engine ABI, and a mutation harness that ate its own shader
+
+`initializeManifolds` (`pairManagement.cu:150`) was one of the two REFUSED launches P8.21's
+inventory left in *every* scene.  Both were the P8.20 pattern: in the manifest, valid SPIR-V,
+but pointing at a Phase-1 harness shader with bound buffers, so no ABI row is possible and
+`pushConstantSizeFor()` returns 0 and the shim refuses.  `initManifoldsBda.slang` closes the
+first of the two; only `removeContactManagers_Stage5_CvxTri` is left.
+
+**What the kernel does** is replicate one `dataSize`-byte record `nbTimesToReplicate` times —
+the engine stamps an empty manifold across a freshly grown manifold array
+(`PxgNarrowphaseCore.cpp:8187`).  ABI row `kInitManifolds {8,8,4,4}` → 24-byte blob; grid
+512 × 128 (`PxgNarrowPhaseGridDims/BlockDims::INITIALIZE_MANIFOLDS`).
+
+**The shared-memory transpose is the whole kernel, and it is easy to "simplify" away.**  The
+source is not copied verbatim.  Lanes `0..nbThreadsPerElement-1` each read ONE source `float4`
+and scatter its components into four *separate runs* of the groupshared array — all the x's,
+then all the y's, then the z's, then the w's — and every destination lane gathers its element
+back out with `threadReadIdx = tid % nbThreadsPerElement`.  A port written as
+`dst[i] = src[i % n]` produces the same bytes only because scatter and gather are inverse;
+break either half and the record comes out *transposed*, which does not look corrupt.  It is
+transcribed literally so the pairing stays visible.
+
+`MaxStructureSize` is 4096 **bytes**, so the groupshared array is 1024 floats and the scatter
+writes `4*nbThreadsPerElement = dataSize/4` of them — the bound holds exactly when
+`dataSize <= 4096`.  Upstream does not check it; neither does this.
+
+`testInitManifolds.cpp`: 10 cases over dataSize 64/128/1216/2048 (1216 = a real
+`PxgPersistentContactMultiManifold`, and the one size that does NOT divide 128), each with a
+sentinel record past the end that must stay untouched.
+
+**Mutation sweep 9/12 killed.  All three survivors are explained, and two of them are
+genuinely equivalent mutants** — worth recording because "survivor ⇒ fixture hole" has been
+the right reflex in every previous tranche and here it is wrong:
+
+- **M5, the `maxThreadIdx` guard dropped — EQUIVALENT.**  For any `tid`, the write target is
+  `Ptr<float4>(startPtr)[tid]` and the value is record float4 `tid % n`.  Since
+  `tid = (tid/n)*n + (tid%n)`, index `tid` is *exactly* the correct slot for element
+  `startBlockIdx + tid/n`, component `tid%n`.  So lanes past `maxThreadIdx` write the correct
+  value to the correct address of an element another block also writes — a benign duplicate,
+  not an overrun, because the `idx < nbTimesToReplicate` guard (M4, killed) still bounds it.
+- **M7, the block-stride loop steps by 1 — EQUIVALENT.**  Every workgroup then does every
+  block's work.  Same values to the same addresses; only the cost changes.
+- **M11, the group barrier removed — not killable on llvmpipe.**  Lane `tid` reads slot
+  `tid % n`, which was written by lane `tid % n ≤ tid`.  The dependency only ever points
+  *backwards*, and llvmpipe runs a workgroup as an in-order sweep over 8-lane subgroups, so
+  the producer has always already run.  The barrier stays: on hardware with genuinely
+  concurrent subgroups the race is real.  This is a platform blind spot of the harness, not a
+  fixture hole — no fixture can kill it here.
+
+### The harness lesson: a `finally` is not enough
+
+The sweep is run under `timeout`.  `timeout` sends **SIGTERM**, which kills the process
+*before* the `finally` clause restores the shader — so a killed run leaves the tree MUTATED,
+and successive killed runs **STACK** mutations.  Two timeouts left three mutations layered in
+`initManifoldsBda.slang` at once (M1's scatter, M6's `/4u`, M2's swapped gather); the next run
+then reported `SKIPPED(anchor ×0)` because the text it wanted to patch was already gone.
+The `SKIPPED` was the only reason this was caught — a harness that silently tolerates a
+missing anchor would have reported a clean sweep over a corrupt shader.
+
+Sweep scripts now take a `shutil.copyfile` backup up front and restore it from `atexit` **and**
+from explicit `SIGTERM`/`SIGINT` handlers.  The per-mutant ctest call also carries its own
+`timeout=90` and counts a hang as a kill — the reference does not hang, so a mutant that does
+is distinguished from the reference just as surely as one that returns wrong bytes (M6 was
+caught exactly this way).
+
+Forced-fresh `.spv`, suite **681/681 in both memory modes** (680 → 681).  Engine trace:
+`initializeManifolds` no longer appears as REFUSED in any scene; the default scene is at
+**zero** refused and zero failed launches, and `meshfloor` is down to one refused
+(`removeContactManagers_Stage5_CvxTri`) plus the five still-unmapped convex-trimesh kernels
+(`convexTrimeshCore`, `sortTriangles`, `convexTrimeshPostProcess`, `convexTrimeshCorrelate`,
+`convexTrimesh finishContacts`).
 
 ## P8.34 scouting — the clipper is NOT extractable by the P8.24 pattern, and why
 

@@ -953,6 +953,14 @@ static const uint8_t kClampMaxValues[] = { 8, 8, 8, 4 };
 //   row because the blob must match the CUDA pack byte for byte.
 static const uint8_t kCvxTriMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4 };
 
+// gpunarrowphase/src/CUDA/pairManagement.cu:150 (P8.35):
+//   initializeManifolds(float4* destination, const float4* source,
+//     PxU32 dataSize, PxU32 nbTimesToReplicate)
+//   -> two pointers @0/@8 + two PxU32 @16/@20 = 24-byte blob.  NOT aliased to a
+//   same-shaped sibling: {8,8,4,4} also describes several particle kernels, and
+//   a shared row would hide a future signature change in either.
+static const uint8_t kInitManifolds[] = { 8, 8, 4, 4 };
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },
@@ -1224,6 +1232,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "clampMaxValues", kClampMaxValues, uint32_t(sizeof(kClampMaxValues)) },
     // convexMeshMidphase.cu:378 — the rigid convex-vs-trimesh midphase (P8.27).
     { "midphaseGeneratePairs", kCvxTriMidphase, uint32_t(sizeof(kCvxTriMidphase)) },
+    // pairManagement.cu:150 — the empty-manifold stamp (P8.35).
+    { "initializeManifolds", kInitManifolds, uint32_t(sizeof(kInitManifolds)) },
 };
 
 inline size_t abiAlign(size_t size)

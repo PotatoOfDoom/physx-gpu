@@ -83,7 +83,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "convexConvexNphase_stage1Kernel", "npCvxStage1Refresh.spv", "convexConvexNphase_stage1Kernel" },  // CONVEX_CONVEX_KERNEL_EARLY_OUT
     { "convexConvexNphase_stage2Kernel", "npCvxStage2Setup.spv", "convexConvexNphase_stage2Kernel" },  // CONVEX_CONVEX_KERNEL_MAIN
     { "removeContactManagers_Stage5_CvxTri", "npPairRemoveSwap.spv", "removeContactManagers_Stage5_CvxTri" },  // REMOVE_CONTACT_MANAGERS_5_CVXTRI
-    { "initializeManifolds", "npPairManagement.spv", "initializeManifolds" },  // INITIALIZE_MANIFOLDS
+    { "initializeManifolds", "initManifoldsBda.spv", "initializeManifolds" },  // INITIALIZE_MANIFOLDS (P8.35 BDA re-point)
     { "midphaseGeneratePairs", "convexTrimeshMidphaseBda.spv", "midphaseGeneratePairs" },  // CONVEX_TRIMESH_MIDPHASE (P8.27)
     { "convexTrimeshNarrowphase", nullptr, nullptr },  // CONVEX_TRIMESH_CORE (unmapped)
     { "sortTriangleIndices", nullptr, nullptr },  // CONVEX_TRIMESH_SORT_TRIANGLES (unmapped)
