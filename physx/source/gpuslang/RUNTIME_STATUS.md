@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **678/678** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **679/679** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1622,6 +1622,69 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
+
+## P8.30 — `pxgSlangTriFeature`: the second pass's classifier, and what its ORDER hides
+
+Step 3 of P8.28's decomposition — the part of the convex-trimesh chain with no
+precedent anywhere else in this port.
+
+**What the second pass is.**  `convexTriangleContactGen` does not always emit its
+contacts.  When `delayContacts` is set it appends the pair to a deferral list
+(`convexTriangle.cuh:1849`):
+
+```cpp
+convTriSecondPairPass[atomicAdd(nbSecondPassPairs, 1)] = globalWarpIndex | mask;
+```
+
+`mask` records WHICH FEATURE of the triangle the contact landed on.  A contact on
+a shared edge or vertex cannot be accepted or rejected from one triangle — the
+neighbour decides — so the mask is the question the later pass answers.  It
+occupies the top three bits (`n << 29`) and shares the word with the warp index,
+which is why the enum starts at 1: zero means "interior hit, no feature".
+
+### Two things the classifier's ORDER hides
+
+The classifier (`convexTriangle.cuh:1562`) is one threshold, 0.97, and a strict
+`>`, tested in a fixed sequence.  Both of the following are invisible in a
+paraphrase and both are load-bearing:
+
+- **The vertex tests come first and WIN.**  At `v = 0.98` both `v > 0.97` and
+  `(v + u) > 0.97` hold — a point that close to a vertex is also close to both
+  edges meeting there.  The order is what makes it a VERTEX.  Reordering silently
+  reclassifies every near-vertex contact as an edge one, and the second pass then
+  asks the wrong neighbour.
+- **The pairings are not the obvious ones.**  Edge 0-1 is `v + u`, edge 0-2 is
+  `u + w`, edge 1-2 is `w + v`.  With `v` the weight of vertex 1 and `w` of vertex
+  2 each is the sum of the two vertices the edge JOINS — correct, but the naming
+  invites `v + w` for edge 0-1, which is the OPPOSITE edge.
+
+### 12 mutants, 12 killed — after one fixture gap
+
+The sweep exercises exactly those two properties: reordering the vertex tests
+after the edge tests, and re-pairing E01 as `v + w`, both die.  So do the
+threshold, `>` becoming `>=`, swapped vertex codes, `u` computed as `v + w - 1`,
+a shift of 28 instead of 29, and three ways of getting `barycentricCoordinates`
+wrong.
+
+One survivor needed a fixture fix, and it was the case a dense sweep structurally
+cannot reach: **replacing the exact `totalArea == 0` pin with a plain divide.**
+Upstream substitutes a ZERO reciprocal for a degenerate triangle, so `v = w = 0`
+and the classifier reports V0; a plain divide yields NaN, every comparison is
+false, and the answer silently becomes NONE.  No non-degenerate triangle can tell
+the two apart, and the fixture had only one triangle — a good one.  Three
+degenerate triangles (collinear, duplicated, coincident) now sit at the end of the
+sweep and the mutant dies.
+
+The sweep itself covers `(v, w)` on a 0.01 grid from **−0.08 to 1.08** — outside
+the triangle as well as inside, because the classifier clamps nothing and a port
+that added a clamp would look identical on the inside — plus ten named boundary
+cases, and it asserts that **all seven outcomes actually occur**, so the sweep
+cannot quietly prove less than it appears to.
+
+### Verification
+
+Forced-fresh `.spv`, **679/679 in both memory modes** (678 → 679).  No engine
+kernel changed.
 
 ## P8.29 — `pxgSlangMidphaseAlloc`: the stack carve-up, certified exhaustively
 
