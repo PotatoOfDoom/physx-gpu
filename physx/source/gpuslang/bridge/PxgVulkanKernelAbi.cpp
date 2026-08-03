@@ -940,6 +940,19 @@ static const uint8_t kRadixCopy[] = { 8, 8, 8, 8 };
 //   its own kPtrU32 row.
 static const uint8_t kClampMaxValues[] = { 8, 8, 8, 4 };
 
+// gpunarrowphase/src/CUDA/convexMeshMidphase.cu:378 (P8.27):
+//   midphaseGeneratePairs(PxU32 numContactManagers, PxReal toleranceLength,
+//     const PxgContactManagerInput*, const PxsCachedTransform*, const PxBounds3*,
+//     const PxReal* contactDistance, const PxgShape*, ConvexMeshPair*,
+//     PxgPersistentContactMultiManifold*, PxsContactManagerOutput*, PxU8* stackPtr,
+//     PxU32* stackOffset, PxU32* midphasePairsNum, PxU32* midphasePairsNumPadded,
+//     const PxU32 stackSizeBytes)
+//   -> two PxU32/PxReal by value @0/@4, twelve pointers @8..@104, a PxU32 @104
+//   = 108 data bytes rounded to the pointers' 8-alignment -> 112-byte blob.
+//   Argument 10 (cmOutputs) is passed and NEVER read by the kernel; it is in the
+//   row because the blob must match the CUDA pack byte for byte.
+static const uint8_t kCvxTriMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4 };
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },
@@ -1209,6 +1222,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "radixSortCopy", kRadixCopy, uint32_t(sizeof(kRadixCopy)) },
     // MemCopyBalanced.cu:95 — clampMaxValues(three PxU32*, const PxU32) -> {8,8,8,4}
     { "clampMaxValues", kClampMaxValues, uint32_t(sizeof(kClampMaxValues)) },
+    // convexMeshMidphase.cu:378 — the rigid convex-vs-trimesh midphase (P8.27).
+    { "midphaseGeneratePairs", kCvxTriMidphase, uint32_t(sizeof(kCvxTriMidphase)) },
 };
 
 inline size_t abiAlign(size_t size)

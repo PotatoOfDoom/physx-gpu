@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **676/676** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **677/677** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1622,6 +1622,73 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
+
+## P8.27 — the convex-trimesh midphase is CERTIFIED and WIRED
+
+P8.26 wrote the kernel and deliberately left it unmapped, because a wired-and-wrong
+kernel fails as silently as an unwired one.  This tranche supplies what was
+missing — three fixtures and a mutation sweep — and then wires it.
+`PXG_SLANG_KERNEL_MAPPED` 258 → **259**; ABI row `kCvxTriMidphase`
+`{4,4,8,8,8,8,8,8,8,8,8,8,8,8,4}`, a 112-byte blob.
+
+Measured on `PXG_SCENE=meshfloor`: the chain's failed launches drop from **six to
+four**.  `convexTrimeshMidphase` no longer appears; `convexTrimeshCore`,
+`sortTriangles`, `convexTrimeshPostProcess` and `convexTrimeshCorrelate` remain.
+The box still falls through the floor, and will until those land — this tranche
+does not claim otherwise.
+
+### 16 mutants, 15 killed — and six of the first seven survivors were the FIXTURE
+
+The first sweep killed 9 of 16.  Every one of the seven survivors was diagnosed
+rather than excused, and six turned out to be holes in the test:
+
+- **the grid was too big for a leaf.**  The scene had 34 triangles in ONE BV32
+  leaf, and a leaf is walked with one lane per primitive — so the two back-facing
+  triangles at indices 32 and 33 were never *visited*, let alone culled.  A mutant
+  that DELETED THE FRONT-FACE GATE survived on that alone.  Fixed by shrinking the
+  grid to 18 triangles.
+- **every vertex sat on an integer.**  The 0.04 contact distance never decided
+  anything, so dropping it from the query box was unobservable.  Fixed with a
+  triangle 0.02 above the box face — inside the 0.54 half-extent the contact
+  distance produces, outside the 0.50 the box alone gives.
+- **one leaf with a [-1000, 1000] box.**  A node box that CONTAINS the query box
+  makes the overlap test agree with a swapped-operand version of itself, and with
+  a single leaf the atomic base offset is always zero.  Two mutants — swapped
+  `vMin`/`vMax`, and writing pairs at the bare lane offset — were both
+  unobservable.  Fixed with THREE leaf children boxed tightly around their own
+  primitive ranges, all smaller than the query box.
+- **`deltaP` was 100.**  Any margin invalidates at that distance, so reading the
+  hull extents from the CoM offset changed nothing.  Fixed by moving the cached
+  case to `deltaP = 0.005`, which sits under the real `0.01` threshold and over
+  the `0` a wrong-offset read produces.
+- **one contact manager, already in the right order.**  The mesh/convex swap never
+  fired.  Fixed with a second manager describing the same pair reversed; both must
+  emit the identical set.
+
+That last change immediately found a **bug in the fixture's own scaffolding**:
+manager 1 invalidated while manager 0 stayed cached, because the manifold buffer
+held one 1216-byte record and the kernel indexes it by `cmIdx`.  A single-record
+buffer sends the second manager reading past the end.
+
+After the six fixes, **15 of 16 die**.  The survivor, `nbPrimitives` not clamped
+to 32, is genuinely equivalent: under `[numthreads(32,1,1)]` with a
+`lane < nbPrimitives` guard, 34 and 32 activate exactly the same lanes.  The clamp
+is defensive documentation, not a behaviour change, and this entry says so rather
+than counting it as a kill.
+
+Mutants that DID die on the first sweep are worth naming too, because they are the
+ones the port could plausibly have got wrong: the `stackOffset`/`midphasePairsNum`
+crossing (the drafting bug P8.26 caught by writing its comment), the gate ignored
+(`fullContactGen = true`), the cached sentinel never written, the record carrying
+the mesh transform instead of `aToB`, and `nbPairsPerCM` never accumulating.
+
+### Verification
+
+**677/677 in both memory modes** (676 → 677: the new `gpuslang.convexTrimeshMidphase`
+suite).  Rigid regression green — box, stack, plane, sphere, convex, joint,
+capsule, capsulebox, particle.  Every deformable scene green, and
+`PXG_SCENE=softbody` on the MESH floor still at `|dy|` **0.000769**, bit-identical
+to P8.20 and P8.25.
 
 ## P8.26 — `midphaseGeneratePairs` written: the kernel, and why it is NOT wired yet
 
