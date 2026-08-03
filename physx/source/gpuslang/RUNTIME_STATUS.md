@@ -1623,6 +1623,81 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.28 scouting — `convexTrimeshNarrowphase`: the blocker question, answered first
+
+The next kernel in the chain is `convexTrimeshNarrowphase` (`convexMesh.cu:623`),
+and it is a different order of magnitude from anything ported so far: ~550 lines
+of warp code running a GJK/EPA query PER TRIANGLE, with **21 push-constant
+arguments**.  This is measurement, not code — the facts the port needs before a
+line is written, and the one that could have stopped it dead.
+
+### The blocker: does a 21-argument pack fit in a push constant?
+
+llvmpipe reports `maxPushConstantsSize = 256`.  Laid out at CUDA's natural
+alignment — the same `paramAlign` rule the shim uses — the pack is:
+
+```
+  15 pointers            @0 .. @120
+  stackSizeBytes  u32    @120
+  ( 4 bytes of padding, because the next argument is a pointer )
+  gpuTempContactStack    @128
+  gpuTempContactIndex    @136
+  mMaxConvexMeshTempMemory @144
+  gpuStackShift          @152
+  numTests        u32    @160
+  -> 164 data bytes, rounded to the 8-alignment = 168-byte blob
+```
+
+**168 < 256: it fits**, with room to spare.  Worth establishing before writing
+500 lines rather than after — a pack that overflowed would have forced a
+descriptor-buffer redesign of the whole engine ABI for this one kernel.
+
+### The structural surprise: seven arguments are DOUBLE pointers
+
+`cvxTriNIPtr`, `cvxTriContactsPtr`, `cvxTriMaxDepthPtr`, `cvxTriIntermPtr`,
+`orderedCvxTriIntermPtr`, `cvxTriSecondPassPairsPtr` and `pairsGPU` are declared
+`T**`.  The kernel does not RECEIVE the sub-buffer addresses — it **computes them
+itself**, by calling `midphaseAllocate` (`convexMesh.cu:670`) on one flat
+`stackPtr` and then publishing the results back through those double pointers
+(`:681`).  So the stack layout that P8.27's midphase wrote pairs into is carved
+up here, at runtime, by the consumer.
+
+For the BDA port that means each of the seven is a `Ptr<uint64_t>` — a device
+address holding a device address — and `midphaseAllocate`'s arithmetic has to be
+transcribed exactly, because the six downstream kernels index the same
+sub-buffers by the same rule.  It also explains a detail P8.27 already had to get
+right: `midphasePairsNumPadded` exists solely so this allocation can reserve the
+radix sort's temp space.
+
+### What Phase 1 already covers
+
+The per-triangle geometry is largely transcribed already, in harness form:
+`npConvexTri` (2 entry points), `npCvxTriEmit`, `npCvxTriFind`, `npCvxTriPurge`,
+`npCvxTriWorldNormal`, `npCvxTriNpSetup`, plus the `npCvxCoreGjk` / `npCvxCoreEpa`
+drivers.  The same situation P8.24 found for the SAT — so the tranche shape is
+likely to repeat: extract the shared pieces into modules, prove each extraction
+inert by opcode sequence, then write a thin BDA kernel that wires them.
+
+### Recommended decomposition, and why
+
+Not one tranche.  The three preceding tranches (P8.23 gate, P8.24 SAT, P8.25 BV32)
+each certified one piece on its own, and P8.27 then wired them into a kernel whose
+sweep killed 15 of 16 — with six of the first seven survivors turning out to be
+holes in the FIXTURE, not the shader.  That ratio is the argument: for a kernel
+this size, a single end-to-end fixture would have been the thing that was wrong,
+and the failure would have looked like a passing test.
+
+Order: (1) extract the GJK/EPA-per-triangle driver and certify it standalone;
+(2) transcribe `midphaseAllocate` and certify the layout arithmetic against a CPU
+model — it is pure integer arithmetic and cheap to test exhaustively;
+(3) the second-pass mechanism (`nbSecondPassPairs`, `cvxTriSecondPassPairsPtr`),
+which is the part with no precedent in this port; (4) the kernel itself.
+
+### Verification
+
+Measurement only — no shader, manifest, ABI or scene file changed in this commit.
+Suite unchanged at 677/677.
+
 ## P8.27 — the convex-trimesh midphase is CERTIFIED and WIRED
 
 P8.26 wrote the kernel and deliberately left it unmapped, because a wired-and-wrong
