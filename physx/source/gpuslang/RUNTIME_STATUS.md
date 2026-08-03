@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **682/682** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **683/683** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1622,6 +1622,88 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
+
+## P8.38 — the polygon clipper, and two bugs a uniform fixture could not see
+
+`polyClip` + `addContacts` (`convexTriangle.cuh:918-1058`) is the per-triangle core of rigid
+convex-vs-mesh contact generation — P8.31 corrected the earlier claim that it was GJK/EPA, and
+P8.34 established that it cannot be lifted by the P8.24 extract-and-prove-by-opcode pattern
+because there the emission is fused with the control flow.  So `pxgSlangPolyClip` is a PORT,
+with its own fixture and its own oracle.
+
+**The oracle is an independent transcription**: a scalar C++ simulation with the shuffles as
+array reads and the ballots as explicit loops over 32 lanes.  It shares the maths with the
+shader but not the shape, which is what lets it catch a mistake in the virtual-warp machinery
+rather than only in the geometry.  Agreement is **bitwise**, not within a tolerance — the
+`NoContraction` stamp plus matching operand order makes that achievable, and it is the only
+comparison that can treat a NaN as equal to the same NaN.
+
+**One warp per group, and this is a hard requirement on every consumer.**  `polyClip` returns
+early on `!__any_sync(out1)` and again on `!__any_sync(out0)`.  Those are warp-uniform but not
+group-uniform, so with two warps per group one could leave while the other runs into a barrier
+— and llvmpipe does not diagnose a divergent barrier, it hangs.  The CUDA kernel packs
+`NP_TRIMESH_WARPS_PER_BLOCK = 2`; a consumer here dispatches twice as many groups instead,
+which is legal because pairs are independent.
+
+### The two bugs
+
+**A race in the ballot primitive.**  Each reduction ends by reading the groupshared word after
+its trailing barrier, and the next one opens by resetting that same word.  With no barrier in
+front of the reset, lane 0 can clear the word before another lane has performed its read.
+`addContacts` runs two ballots back to back, so the second clobbered the first: every lane read
+an exclusive-scan base of 0, two contacts were written on top of each other at the same index —
+and because `nbContacts` still counted two, **the count looked right and only the second slot
+came back empty**.  The fix is a leading barrier in `pcReduceOr`/`pcReduceAnd`.
+
+**A shuffle that ran off the end of its lane run.**  CUDA specifies that `__shfl_sync` takes a
+source lane outside `[0, width-1]` modulo the width, and `polyClip` relies on it: the next-vertex
+index `tI + 1 == nbVerts0 ? 0 : tI + 1` is 32 for lane 31 whenever `nbVerts0 < 32`.  In a
+groupshared staging array that index is not lane 0 — it is one past the end of the x-component
+run, i.e. lane 0's **y**.  Live for exactly one lane, and invisible until the fixture stopped
+padding.
+
+### The fixture-hole lesson: uniform padding hides more than one thing at a time
+
+The first fixture filled every lane past `nbVerts0` with vertex 0 — which is also the wrap
+target of the next-vertex index.  That single choice hid the shuffle bug *and* two mutants: one
+that dropped the wrap entirely (it read the padding and got the right answer) and one that
+stopped masking `in0`/`out0` to the three triangle planes (the padded triangle lanes all
+collapsed to a zero-length edge, so the extra ballot bits were always zero).  Giving the padding
+lanes **distinct** values — which cannot change the true result, since those lanes are masked
+out of every path — killed both mutants and exposed the bug.
+
+Sweep **17/24 first, 23/24 after sharpening the fixture**.  The five that needed new coverage:
+a NaN vertex (the `!(sep > maxSep)` spelling differs from `sep <= maxSep` only for NaN, and
+with finite geometry every path that could make one is already guarded to `PX_MAX_F32`); a
+31-gon with a non-zero base so the capacity guard actually bites (5 + 31 candidates for 32
+slots); a triangle vertex exactly on a poly0 edge, with another vertex sticking out so the
+classification reaches `e1cross` instead of leaving at the first early-out; and the distinct
+padding above.
+
+**The one survivor, M24, is an equivalent mutant**: removing the SECOND early-out changes
+nothing, because when every `out0` is zero, `e0cross = (in0 & out0p) | (in0p & out0)` is zero
+for every lane, so `c` is zero, `a` is zero and the edge-edge loop never runs.  The FIRST
+early-out is not like that — M23 dies — which is exactly the asymmetry the CUDA comment at
+`:911` describes: the early-outs "are not actually an optimization, but have a functional
+purpose in an edge case", and the case is two polygons exactly on top of one another, where
+continuing past the first one emits the same points twice.
+
+**Winding, recorded because it cost a debugging round.**  `polyClip` classifies with
+`t < 0 -> inside` and builds its two edge-plane normals with the operands SWAPPED —
+`cross(e0, axis)` for poly0 and `cross(axis, e1)` for the triangle.  With `axis = +z` that means
+poly0 must be wound counter-clockwise and the triangle clockwise.  Getting both backwards does
+not fail loudly: every case simply comes out with zero contacts through the edge-edge path
+instead of three through the early-out.
+
+An upstream landmine, left alone: with `nbVerts0 == 32` the CUDA's own `(1 << nbVerts0) - 1`
+shifts by the full word width, which is undefined in C++ and in SPIR-V alike.  The fixture uses
+31 rather than pinning a behaviour whose expected value would be a guess.
+
+Not an engine kernel yet — this is the module plus its scaffolding, and the shader is absent
+from the manifest.  `convexTrimeshNarrowphase` is what will import it.
+
+Suite **683/683 in both memory modes** (682 -> 683).  No engine-facing change: no manifest
+entry, no ABI row, so the trace is untouched.
 
 ## P8.37 — the contact-manager removal chain, all five stages at once
 
