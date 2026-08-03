@@ -1623,6 +1623,73 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.26 — `midphaseGeneratePairs` written: the kernel, and why it is NOT wired yet
+
+The convex-vs-trimesh midphase is transcribed onto the engine ABI as
+`convexTrimeshMidphaseBda.slang`.  It compiles, is contraction-stamped (241 ops),
+and is built by CMake — and it is **deliberately absent from the manifest and
+from the ABI table.**
+
+### Why it is not enabled
+
+P8.20's finding cuts both ways.  A kernel with no ABI row is REFUSED, silently
+but harmlessly — the engine logs and steps on.  A kernel that is wired and WRONG
+does not fail loudly either: it writes into `gpuIntermStack` and bumps two atomic
+counters that five downstream kernels will eventually read.  Until this one has
+a fixture, "mapped" is strictly worse than "unmapped", so it stays unmapped.  It
+is step 1 of 6, banked and reviewable, not certified.
+
+### What the kernel is made of
+
+Almost nothing in it is new, which was the point of the previous three tranches:
+
+| piece | tranche | certification |
+|---|---|---|
+| the PCM gate | P8.23 | 21/21 mutants, six-dispatch fixture |
+| `Gu::intersectTriangleBox_RefImpl<true>` | P8.24 | opcode-sequence identical across extraction |
+| the `BV32DataPacked` reader | P8.25 | opcode-sequence identical across five consumers |
+
+What is genuinely new is the wiring, the query-box construction, the pair
+emission with its overflow clamp, and the `ConvexMeshPair` record.
+
+### One bug found by writing the comment rather than the code
+
+The first draft bumped `midphasePairsNum` inside the traversal loop.  That is
+wrong, and the mistake is easy to make because both counters are `PxU32*`
+arguments sitting next to each other in the pack.  `MidphaseTreeTraverser` is
+constructed with **`stackOffset`** as its counter (`convexMeshMidphase.cu:349`,
+fifth constructor argument) and bumps it per LEAF; `midphasePairsNum` is a
+different counter, bumped **once at the end** with this manager's total
+(`:353`).  Crossing them writes pairs at the wrong slot AND hands the core kernel
+a `startIndex` pointing into another manager's range — a corruption that would
+have produced plausible contacts on a one-manager scene and garbage on any scene
+with two.  Every current `meshfloor`-style scene has exactly one contact manager,
+so no scene in this harness would have caught it.
+
+### Decisions recorded in the shader, each with its reason
+
+- **Stack depth 320, not 192.**  The deformable midphases use 192 because
+  `femMidphaseScratch` declares `sBv32Nodes[192]`; the convex path has a separate
+  `MidphaseScratch` declaring `sBv32Nodes[320]`.  Copying the deformable constant
+  would corrupt traversal on a deep mesh.  (P8.22 raised this against the shipped
+  deformable ports; checking it is what established the two-struct fact.)
+- **`nbPrimitives` clamped to 32, bug for bug** — six-bit field, one lane per
+  primitive, CUDA silently drops the rest.
+- **`PxBounds3` (24 B) and `ConvexMeshPair` (56 B) read and written as scalars**,
+  because both land 8-mod-16 on odd indices.  Upstream writes the pair record as
+  a 14 x 4-byte scatter for exactly this reason.
+- **`cmOutputs` is carried and never touched** — argument 10 of 15 exists in the
+  CUDA signature and the blob must match byte for byte, but `midphaseCore` does
+  not read or write it.
+
+### Verification
+
+**676/676 in both memory modes** — which for this tranche only establishes that
+adding an unreferenced shader broke nothing.  The kernel itself has NO fixture
+yet and NO mutation sweep, and this entry should not be read as saying otherwise.
+Next: the fixture, then the ABI row and the manifest entry, then the remaining
+five kernels of the chain.
+
 ## P8.25 — `pxgSlangBv32`: four copies of the BV32 reader become one
 
 P8.24 extracted the triangle-box SAT because the convex-vs-trimesh midphase was
