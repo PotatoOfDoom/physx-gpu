@@ -1623,6 +1623,51 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.33 scouting — the polygon clipper: the right shader is NOT the one named after it
+
+The last piece before the core kernel is the polygon clipper.  There are **three**
+Phase-1 shaders with clipper-shaped names, and the obvious one is the wrong one —
+worth a note, because P8.31 already showed what a wrong pointer costs.
+
+| shader | what it actually is |
+|---|---|
+| `npCvxPolyClip` | the **convex-vs-CONVEX** clipper from `cudaGJKEPA.cu`, used by `generateConvexContacts`.  Its own header says "distinct from the convex-vs-triangle clippers".  **Not this chain's.** |
+| `npPolyClip4` | `polyClip4` from `femClothPrimitives.cu` — the **CLOTH** convex-vs-triangle clipper.  Also not this chain's. |
+| **`npConvexPolyClip`** | "the RIGID convex-polygon vs triangle clipper `polyClip` (`convexTriangle.cuh:943-1058`) plus `addContacts` (`:918-940`)".  **This is the one.** |
+
+And the stage after it is already transcribed too: `npCvxTriEmit` is
+"the contact-reduce-and-emit stage of `convexTriangleContactGen`
+(`convexTriangle.cuh:1769-1821`)".
+
+So both halves of the per-triangle core exist in harness form, and the expected
+tranche shape is the one P8.24 and P8.25 established — extract into a module,
+prove the extraction inert by opcode sequence, rather than port from the `.cu`.
+
+### The chain, in full
+
+Certified so far:
+
+| piece | tranche | result |
+|---|---|---|
+| PCM manifold gate | P8.23 | 21/21 mutants, six-dispatch fixture |
+| triangle-box SAT | P8.24 | opcode-identical across extraction |
+| BV32 reader | P8.25 | opcode-identical across five consumers |
+| the midphase kernel | P8.27 | 15/16, wired, manifest 259 |
+| stack carve-up | P8.29 | 12/12, exhaustive over the padding boundary |
+| second-pass classifier | P8.30 | 12/12 |
+| deferral predicate | P8.32 | 12/12 |
+
+Remaining: extract `polyClip` + `addContacts` and the emit stage; write
+`convexTrimeshNarrowphase` (21 args, 168-byte blob, verified to fit in P8.28);
+then `sortTriangleIndices`, `convexTrimeshPostProcess`, `convexTrimeshCorrelate`
+and `convexTrimeshFinishContacts`.  `PXG_SCENE=meshfloor` stays red until the box
+stops falling through the floor at y = −73.8.
+
+### Verification
+
+Measurement only — no shader, manifest, ABI or scene changed.  Suite unchanged at
+680/680.
+
 ## P8.32 — `pxgSlangDeferContact`: the predicate that decides whether to defer at all
 
 Step 2 of P8.31's corrected decomposition, and the counterpart of the classifier
