@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **677/677** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **678/678** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1622,6 +1622,59 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
+
+## P8.29 — `pxgSlangMidphaseAlloc`: the stack carve-up, certified exhaustively
+
+Step 2 of the decomposition P8.28 recommended.  `midphaseAllocate`
+(`midphaseAllocate.cuh:129`) is not a private detail of one kernel: the convex-
+trimesh chain receives ONE flat collision stack, `convexTrimeshNarrowphase` carves
+seven intermediate buffers out of it at runtime, and the five kernels after it
+re-derive the same layout.  It is a contract, so it is extracted and certified on
+its own — the same reason P8.23 took the PCM gate first.
+
+`pxgSlangMidphaseAlloc.slang` owns the arithmetic; `midphaseAllocBda.slang` is a
+dispatch wrapper so it can be tested before its first real consumer exists (the
+scaffolding pattern `pcmManifoldBda` established).  Neither is in the manifest.
+
+### The two things a paraphrase would lose
+
+**The allocation order is NOT the argument order.**  The signature lists NI,
+Contacts, MaxDepth, Interm, Ordered, SecondPass, Pairs.  The body allocates
+Pairs, NI, Contacts, **Ordered**, MaxDepth, Interm, SecondPass — `ordered` moves
+from fifth in the signature to fourth in memory, pushing `maxDepth` and `interm`
+down behind it.  Following the signature puts three of the seven buffers at wrong
+addresses, and every one of those addresses is still INSIDE the stack allocation,
+so the corruption reads as bad contacts rather than as a fault.
+
+**`ordered` is sized by the OTHER counter.**  Six of the seven use
+`numPairsAfterMP = (unpadded + 3) & ~3`.  The ordered array alone uses
+`numPaddedPairsAfterMP` — the separately-accumulated atomic the midphase bumps
+with `((nbPairsPerCM + 3) & ~3) * 2`, already padded AND doubled because the radix
+sort needs its temp space inline.  That is the whole reason
+`midphasePairsNumPadded` exists as a second counter, a question P8.27 raised and
+this answers.
+
+### 12 mutants, 12 killed
+
+Pure integer arithmetic is cheap to test exhaustively, so the fixture is
+exhaustive where it matters: every unpadded count from **0 to 64** — the
+`(n+3)&~3` rounding has a four-step period, so that covers every residue many
+times and pins both boundaries (0 stays 0; 1..4 all round to 4) — plus ten
+adversarial pairs including a padded counter SMALLER than the rounded unpadded
+one and one far larger, which is what a port that "simplified away" the second
+counter would produce.
+
+The sweep needed no second round: `+3` changed to `+4` (off by one only at exact
+multiples of four), the padding rounding down, `ordered` sized by the wrong
+counter, `ordered` moved to its signature position, each of the four element
+sizes, two pairs of buffers swapped, and a base multiplied instead of offset —
+all twelve die.
+
+### Verification
+
+Forced-fresh `.spv`, **678/678 in both memory modes** (677 → 678: the new
+`gpuslang.midphaseAlloc` suite).  No engine kernel changed, so no scene number can
+move.
 
 ## P8.28 scouting — `convexTrimeshNarrowphase`: the blocker question, answered first
 
