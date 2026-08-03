@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **675/675** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **676/676** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1622,6 +1622,89 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
+
+## P8.23 — the PCM manifold GATE, extracted and certified before the traversal
+
+`midphaseGeneratePairs` splits in two at `fullContactGen = invalidate ||
+lostContacts` (`convexMeshMidphase.cu:263`).  P8.22 established that the SMALLER
+half — the gate — is the risky one, because it is the only stateful part of the
+kernel.  This tranche ports that half on its own, the same move P8.6 made for the
+GJK and EPA drivers and P8.15 for the cloth midphase.
+
+New module `pxgSlangPcmManifold.slang` exports `mmInvalidateManifold` and
+`mmRefreshSlot`; `pcmManifoldBda.slang` drives them as a standalone dispatch.
+**Neither is in the manifest** — this is not an engine kernel yet, and
+`convexTrimeshMidphaseBda` will import the module and inline the same sequence.
+Every scene number is therefore unchanged, which is the expected result and was
+confirmed rather than assumed (`softbody` box `|dy|` 0.000929, identical to P8.20).
+
+**What stays in the caller, and why.**  `refreshManifolds` ends with a warp-wide
+`__any_sync` and a lane-0 `mNbManifolds = 0`.  The module returns the PER-LANE
+`lostContact` and leaves both to the consumer: the group-wide OR is the caller's
+groupshared emulation of a ballot (this port has no subgroup-native path), and
+keeping the barrier in the caller keeps it in provably UNIFORM control flow.  The
+CUDA has the same property for the same reason — its `__any_sync` sits OUTSIDE
+`if (curManifoldIdx < numManifolds)` so every lane reaches it.  A
+`GroupMemoryBarrierWithGroupSync` in divergent flow does not error on llvmpipe,
+it hangs.
+
+### The fixtures, and the four times they were the thing that was wrong
+
+**21 mutants, 21 killed.**  Getting there took four rounds, and every survivor
+turned out to be a hole in the TEST rather than an equivalent mutant.  Recording
+them because each is a trap the next fixture in this project can fall into:
+
+- *no boundary case.*  `deltaQ <= thresholdQ` survived because no record had a
+  quaternion dot of exactly 0.9998.  Since `aToB.q` is identity in that fixture,
+  `dot(aToB.q, prevQ)` is exactly `prevQ.w`, so the boundary is constructible
+  by writing 0.9998 straight into the stored quaternion.
+- *an accidentally-signed input.*  Dropping `abs()` from the position delta
+  survived because every stored transform happened to sit BEHIND `aToB`, making
+  each delta positive.  Fixed by a record whose stored position is AHEAD, so the
+  delta is −0.06 and only its magnitude crosses.
+- *a degenerate rotation.*  Dropping the `q.w * t` term from `quatRotate`
+  survived because every dispatch used an identity quaternion, whose vector part
+  is zero — so `t` is zero and the term vanishes.  The multi-frame fixture now
+  rotates by a tenth of a degree: enough to make the term load-bearing, small
+  enough that the records still must survive all six frames.
+- *a builder that measured the wrong thing.*  Reducing the group-wide OR to lane
+  0 survived because the fixture's `pointB` was placed at `pointA.y +
+  penetration`, which leaves a residual of `2*penetration` in the projected
+  difference — large enough that EVERY slot was already "lost", lane 0 included.
+  The correct placement is `pointA - normal*pen + (drift,0,0)`, which makes the
+  measured difference exactly the drift and nothing else.  With that fixed, a
+  record that drifts on slot 7 ALONE distinguishes a real reduction from lane 0.
+
+Fixing the last one turned `projectedPoint` using `penNew` instead of `penOld`
+into a genuinely EQUIVALENT mutant: under an identity transform `penNew ==
+penOld` exactly, so the two lines are the same expression.  They are only
+distinguishable when the transform moves the point along its own normal, so the
+frame fixture now runs a SECOND dispatch translating 0.03 along the contact
+normal — with `penOld` the projected difference carries that 0.03 and breaks the
+0.02 threshold, with `penNew` it cancels and does not.  It is a second dispatch
+rather than a change to the first because the first has a job the new transform
+would destroy: a normal-direction move loses every slot, which would let the
+lane-0 mutant pass again.
+
+### The multi-frame fixture
+
+`pcmManifoldRefreshMulti` dispatches SIX times over an evolving transform with a
+CPU model carried forward in lockstep, so each frame's input is the previous
+frame's output.  It exists because of a property stated in the module header
+before any code was written: **a single-dispatch golden-vector fixture cannot
+detect a bug in this gate.**  A port that always reported "regenerate
+everything" yields correct contacts on frame one and in every isolated fixture,
+while having silently destroyed PCM caching.  Mutant M20 is exactly that port —
+`mNbManifolds` zeroed unconditionally — and it is killed only by the assertion
+that the surviving records still hold their manifold count after six frames.
+
+### Verification
+
+Forced-fresh `.spv`, suite through `tools/run_suite.sh` — **676/676 in both
+memory modes** (675 → 676: the new `gpuslang.pcmManifold` suite).  Scenes spot-
+checked unchanged (`box`, `plane`, `softbodystack`, `clothselfcollide` green;
+`softbody` box `|dy|` 0.000929, bit-identical to P8.20), which is the expected
+outcome for a shader no manifest entry points at.
 
 ## P8.22 — `PXG_SCENE=meshfloor`: the assertion that was missing, and the convex-trimesh recon
 
