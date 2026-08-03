@@ -56,13 +56,26 @@
 // gather are inverse; break either half and the record is transposed, not
 // corrupted-looking.  Transcribed literally so the pairing stays visible.
 //
-// GRID.  512 blocks x 128 threads (PxgNarrowPhaseGridDims / BlockDims
-// ::INITIALIZE_MANIFOLDS).  The block-stride loop `for (a = blockIdx.x;
-// a < nbBlocksRequired; a += gridDim.x)` is mirrored on WorkgroupCount().
+// GRID.  128 blocks x 512 threads — `PxgNarrowPhaseGridDims::INITIALIZE_MANIFOLDS`
+// is 128 and `PxgNarrowPhaseBlockDims::INITIALIZE_MANIFOLDS` is 512
+// (PxgNarrowphaseCore.cpp:8193 passes grid first, then block).  The block-stride
+// loop `for (a = blockIdx.x; a < nbBlocksRequired; a += gridDim.x)` is mirrored on
+// WorkgroupCount().
 //
-// `MaxStructureSize` is 4096 BYTES, so the groupshared array is 1024 floats —
-// and the scatter writes up to `4*nbThreadsPerElement = dataSize/4` of them, so
-// the bound holds exactly when dataSize <= 4096.  Upstream does not check it;
+// THE BLOCK SIZE IS LOAD-BEARING, not just a performance knob.  `nbPerBlock =
+// blockDim.x / nbThreadsPerElement` is an integer division that the kernel then
+// DIVIDES BY (`nbBlocksRequired`), so the block must hold at least one whole
+// record: blockDim.x >= dataSize/16.  `MaxStructureSize` is 4096 BYTES, i.e.
+// nbThreadsPerElement up to 256, which 512 covers and 128 would not — a
+// 128-thread port divides by zero for any record above 2048 bytes.  (Both
+// manifolds in the tree are below that — PxgPersistentContactManifold is 256 B
+// and PxgPersistentContactMultiManifold 1216 B — so the cliff is latent, not
+// live.  The shim ignores the launch's block dims and uses the declared
+// numthreads, so nothing else enforces this.)
+//
+// The groupshared array is `MaxStructureSize / sizeof(float)` = 1024 floats, and
+// the scatter writes up to `4*nbThreadsPerElement = dataSize/4` of them, so that
+// bound also holds exactly when dataSize <= 4096.  Upstream does not check it;
 // neither does this.
 
 static const uint MAX_STRUCTURE_FLOATS = 1024u;   // MaxStructureSize / sizeof(float)
@@ -81,13 +94,13 @@ ConstantBuffer<InitManifoldsParams> gIm;
 groupshared float sSourceData[MAX_STRUCTURE_FLOATS];
 
 [shader("compute")]
-[numthreads(128, 1, 1)]
+[numthreads(512, 1, 1)]
 void initializeManifolds(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     const uint tid = gtid.x;
 
     const uint nbThreadsPerElement = gIm.dataSize / 16u;   // dataSize / sizeof(float4)
-    const uint nbPerBlock = 128u / nbThreadsPerElement;
+    const uint nbPerBlock = 512u / nbThreadsPerElement;    // == blockDim.x / nbThreadsPerElement
     const uint maxThreadIdx = nbPerBlock * nbThreadsPerElement;
     const uint nbBlocksRequired = (gIm.nbTimesToReplicate + nbPerBlock - 1u) / nbPerBlock;
 

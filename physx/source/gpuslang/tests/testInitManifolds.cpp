@@ -47,16 +47,21 @@ PXG_TEST(initManifoldsReplicate)
 {
     PxgSlangComputeDevice* dev = testDevice();
 
-    // (dataSize in bytes, nbTimesToReplicate).  1216 is the real
-    // PxgPersistentContactMultiManifold size; the others probe the block packing:
-    // 128 B gives nbThreadsPerElement = 8 and nbPerBlock = 16, so one workgroup
-    // covers 16 records and the counts below straddle that boundary.
+    // (dataSize in bytes, nbTimesToReplicate).  256 and 1216 are the two real
+    // manifold sizes (PxgPersistentContactManifold / ...MultiManifold); the others
+    // probe the block packing.  With the engine's 512-thread block, 128 B gives
+    // nbThreadsPerElement = 8 and nbPerBlock = 64, so one workgroup covers 64
+    // records and the counts below straddle that boundary.
     struct Case { uint32_t dataSize, count; };
     const Case cases[] = {
         { 1216u, 1u }, { 1216u, 7u }, { 1216u, 64u },
-        { 128u, 1u }, { 128u, 15u }, { 128u, 16u }, { 128u, 17u }, { 128u, 100u },
-        { 64u, 33u },       // nbThreadsPerElement = 4 -> nbPerBlock = 32
-        { 2048u, 3u },      // nbThreadsPerElement = 128 -> nbPerBlock = 1, ragged
+        { 256u, 5u },       // PxgPersistentContactManifold
+        { 128u, 1u }, { 128u, 63u }, { 128u, 64u }, { 128u, 65u }, { 128u, 100u },
+        { 64u, 33u },       // nbThreadsPerElement = 4 -> nbPerBlock = 128
+        { 2048u, 3u },      // nbThreadsPerElement = 128 -> nbPerBlock = 4, ragged
+        { 4096u, 3u },      // MaxStructureSize: nbThreadsPerElement = 256, the
+                            // largest record the groupshared array can hold, and
+                            // the one a 128-thread block would divide by zero on
     };
 
     size_t mm = 0;
@@ -82,9 +87,10 @@ PXG_TEST(initManifoldsReplicate)
         push.dataSize = c.dataSize;
         push.nbTimesToReplicate = c.count;
 
-        // grid 512 x block 128 mirrors PxgNarrowPhaseGridDims/BlockDims.
+        // grid 128 x block 512 mirrors PxgNarrowPhaseGridDims/BlockDims
+        // ::INITIALIZE_MANIFOLDS (the block size is declared in the shader).
         Kernel k("initManifoldsBda.spv", "initializeManifolds", {}, sizeof(InitPush));
-        k.dispatch(512u, {}, push, 1u, 1u);
+        k.dispatch(128u, {}, push, 1u, 1u);
         dev->flush();
 
         const auto got = downloadBuffer<float>(dev, bD, uint32_t(dst.size()));

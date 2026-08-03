@@ -1623,6 +1623,47 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.36 — the grid/block transposition in P8.35, and why the fixture could not see it
+
+P8.35 shipped `initializeManifolds` as **512 groups × 128 threads**.  The launch is
+`launchKernel(fn, GridDims::INITIALIZE_MANIFOLDS, 1, 1, BlockDims::INITIALIZE_MANIFOLDS, 1, 1, …)`
+(`PxgNarrowphaseCore.cpp:8193`) — grid first, then block — and those constants are **128** and
+**512**.  I had them the other way round.
+
+**Why nothing caught it.**  The shim ignores the launch's block dims entirely (the parameters
+are unnamed in `PxgVulkanCudaContext.cpp:293`) and uses the workgroup size declared in the
+SPIR-V, so the engine accepted the wrong shape silently.  And the kernel's output is
+decomposition-independent — every record is written exactly once with the same value whatever
+the block size — so all ten fixture cases passed at 128 threads, and would pass at any block
+size that is a multiple of `nbThreadsPerElement`.
+
+**But the block size is not a performance knob here.**  `nbPerBlock = blockDim.x /
+nbThreadsPerElement` is an integer division that the very next line *divides by*:
+
+    nbBlocksRequired = (nbTimesToReplicate + nbPerBlock - 1) / nbPerBlock
+
+so the block must hold at least one whole record, i.e. `blockDim.x >= dataSize/16`.
+`MaxStructureSize` is 4096 bytes → `nbThreadsPerElement` up to 256, which 512 covers and 128
+does not.  A 128-thread block divides by zero for any record above 2048 bytes.
+
+The two manifolds in the tree (`PxgPersistentContactManifold` 256 B,
+`PxgPersistentContactMultiManifold` 1216 B) are both well under that, so the cliff was latent
+rather than live — which is exactly why the fixture had to be extended to reach it.  A
+`dataSize = 4096` case was added, and reverting the block size to 128 with it in place does
+not merely fail, it **hangs** llvmpipe (confirmed: the whole ctest run was terminated at 90 s).
+That case is now mutant **M13**, so the transposition cannot come back unnoticed.
+
+Sweep re-run at the corrected dims: **10/13 killed**, the same three survivors as P8.35 and for
+the same reasons (M5 and M7 output-equivalent, M11 unkillable on llvmpipe).  M6 flipped from
+`KILLED(hang)` to `KILLED(rc=8)` — with 512 threads its bogus `nbThreadsPerElement` still lands
+inside the guards, so it now produces wrong bytes instead of running away.  Suite 681/681 in
+both memory modes.
+
+**The general lesson**: a kernel whose *output* is decomposition-independent can still have a
+launch geometry that is load-bearing, and no output comparison will tell you.  When a port
+hard-codes a dimension the CUDA reads from `blockDim`/`gridDim`, the constant has to be checked
+against the call site, not against the test.
+
 ## P8.35 — `initializeManifolds` on the engine ABI, and a mutation harness that ate its own shader
 
 `initializeManifolds` (`pairManagement.cu:150`) was one of the two REFUSED launches P8.21's
@@ -1634,7 +1675,9 @@ first of the two; only `removeContactManagers_Stage5_CvxTri` is left.
 **What the kernel does** is replicate one `dataSize`-byte record `nbTimesToReplicate` times —
 the engine stamps an empty manifold across a freshly grown manifold array
 (`PxgNarrowphaseCore.cpp:8187`).  ABI row `kInitManifolds {8,8,4,4}` → 24-byte blob; grid
-512 × 128 (`PxgNarrowPhaseGridDims/BlockDims::INITIALIZE_MANIFOLDS`).
+128 × block 512 (`PxgNarrowPhaseGridDims/BlockDims::INITIALIZE_MANIFOLDS`).
+*(This tranche first landed with those two transposed — see P8.36, which is the
+fix and the reason it was not merely cosmetic.)*
 
 **The shared-memory transpose is the whole kernel, and it is easy to "simplify" away.**  The
 source is not copied verbatim.  Lanes `0..nbThreadsPerElement-1` each read ONE source `float4`
