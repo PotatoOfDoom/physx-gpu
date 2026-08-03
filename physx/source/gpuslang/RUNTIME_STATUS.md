@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **681/681** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **682/682** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1622,6 +1622,75 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
+
+## P8.37 — the contact-manager removal chain, all five stages at once
+
+`removeContactManagers_Stage5_CvxTri` was the last REFUSED launch in the engine trace.  It is
+**not** a one-kernel tranche.  `removeLostPairsGpuInternal` (`PxgNarrowphaseCore.cpp:8521-8553`)
+launches five kernels back to back with the *same* argument pack, and stages 1-4 exist only to
+build the run-sum buffer that stage 5 binary-searches.  Stages 1-4 were `nullptr` in the
+manifest, so they failed the UNMAPPED way — `fromFunc()` fails and `launchKernel` returns
+before `traceDispatch()`, so there is no trace line at all, only the engine's stderr — while
+stage 5, being mapped to a bound-buffer Phase-1 shader, showed up as the loud REFUSED.
+**Porting stage 5 alone would have made the trace clean and the result wrong**: it would have
+binary-searched a run-sum nobody had filled in.  That asymmetry between the two failure modes
+is exactly what makes a refused-launch count a bad completion metric on its own.
+
+`npPairMgmtBda.slang` ports all six entry points (the five stages plus `_Stage5_CvxTri`).
+ABI row `kPairMgmt {8,1}` — `(const PxgPairManagementData*, bool copyManifold)` — which
+`pxgKernelAbiPushSize` rounds to a 16-byte blob.  Manifest 259 → **263** (stages 1-4 newly
+mapped; the two stage-5 entries re-pointed off the harness shader).
+
+**Everything else arrives through the struct pointer**, so the tranche stands or falls on
+`PxgPairManagementData`'s layout.  The one offset that is not obvious is the last field: the
+two `PxU32` at 72/76 do *not* let `mPersistentContactManagers` follow at 84 — it re-aligns to
+8, lands at **80**, and the struct is **88** bytes, not 84.  `pairMgmtLayout` pins all twelve
+offsets and the size with `offsetof` against the real header, and mutant M20 (reading the
+pointer at 84) is killed by the chain test.
+
+**Dimensions**: grid 32 × block 512, and here NUM_BLOCKS genuinely is not free — the engine
+allocates the cross-block accumulator as exactly `sizeof(PxU32) * 32`
+(`PxgNarrowphaseCore.cpp:8446`), and stages 3 and 4 must agree on the same partition.  The
+CUDA blocks are 2D `(WARP_SIZE, blockDim/WARP_SIZE)` and index with
+`threadIdx.x + WARP_SIZE*threadIdx.y`, which is just the linear thread id; `threadIdx.x & 15`
+in stage 5 is therefore `linear & 15`, and the 1D port says so directly.
+
+**Bit-exact moves, not typed moves.**  The six contact-manager arrays are copied as scalar
+words: `PxsContactManagerOutput` is 48 bytes, so its odd elements are not 16-aligned, and the
+P8.26 `PxBounds3` lesson applies.  The manifold moves as `uint4` rather than `float4` so a slot
+holding a bit pattern that happens to be a signalling NaN comes back byte-identical instead of
+canonicalised — the fixture fills half the rest distances with NaN payloads and the manifolds
+with `0xCD…` words precisely to make a float-typed copy visible.
+
+The fixture runs the five stages exactly as the engine does and compares against a CPU
+transcription of `SparseRemove.cuh` — the run-sum itself plus all seven arrays — over removals
+entirely inside the kept region, entirely in the tail (`nbToSwap == 0`, stage 5 must do
+nothing), straddling, `N=1, K=1`, `copyManifold` false, and N past one scan block (512) and
+past a whole grid's worth (512×32 = 16384) so the cross-block prefix actually carries.
+
+**Sweep 18/20.**  Both survivors are equivalent mutants, and both for the same structural
+reason — a cooperative loop whose work happens to fit in one pass:
+
+- **M14, every lane moves the payload instead of lane 0.**  All 16 lanes of a swap share
+  `dstIndex`/`srcIndex`, so they write identical bytes to identical addresses.  Distinct swaps
+  never alias (dst is a hole in the kept region, src a survivor in the tail), so it is a benign
+  duplicate write.
+- **M16, the manifold walked with a 32-lane stride in the 16-lane variant.**
+  `for (idx = lane; idx < 16; idx += stride)` with `lane < 16` runs exactly once for stride 16
+  and stride 32 alike — `sizeof(PxgPersistentContactManifold)/sizeof(float4)` is 16, precisely
+  the lane count, so the stride is unobservable.  It is observable in the `_CvxTri` variant
+  (76 float4 over 32 lanes), which is why M17 — swapping the manifold size — dies.
+
+Suite **682/682 in both memory modes** (681 → 682: the one new `pairMgmt` ctest entry, which
+runs all three fixtures), rigid regression 8×2 = **16/16**.
+
+**The engine trace is now at ZERO refused launches in every scene.**  P8.21's inventory of
+"kernel is in the manifest, has valid SPIR-V, has no ABI row, so the shim refuses" is closed:
+P8.20 took the radix-sort trio, P8.35 `initializeManifolds`, and this tranche the removal
+chain.  What is left in `meshfloor` is the other failure mode entirely — five kernels that are
+still `nullptr` in the manifest and so never reach the shim at all: `convexTrimeshCore`,
+`sortTriangles`, `convexTrimeshPostProcess`, `convexTrimeshCorrelate` and
+`convexTrimesh finishContacts`.  The default scene stays at zero of both.
 
 ## P8.36 — the grid/block transposition in P8.35, and why the fixture could not see it
 

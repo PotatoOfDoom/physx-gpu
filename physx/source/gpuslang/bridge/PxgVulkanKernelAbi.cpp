@@ -961,6 +961,16 @@ static const uint8_t kCvxTriMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8
 //   a shared row would hide a future signature change in either.
 static const uint8_t kInitManifolds[] = { 8, 8, 4, 4 };
 
+// pairManagement.cu:45-145 (P8.37): all five removeContactManagers stages, and
+// both stage-5 variants, take the SAME pack —
+//   (const PxgPairManagementData* pairData, bool copyManifold)
+// -> 8 @0 + 1 @8 = 9-byte blob.  Shaped like kBpDescBool but kept separate: the
+// two have nothing to do with each other and a shared row would make a signature
+// change in one look like a change in both.  Stages 1-4 ignore the bool; the pack
+// is uniform because removeLostPairsGpuInternal builds it once and launches all
+// five with it.
+static const uint8_t kPairMgmt[] = { 8, 1 };
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },
@@ -1234,6 +1244,13 @@ static const PxgKernelAbiRow kRows[] = {
     { "midphaseGeneratePairs", kCvxTriMidphase, uint32_t(sizeof(kCvxTriMidphase)) },
     // pairManagement.cu:150 — the empty-manifold stamp (P8.35).
     { "initializeManifolds", kInitManifolds, uint32_t(sizeof(kInitManifolds)) },
+    // pairManagement.cu:45-145 — the contact-manager removal chain (P8.37).
+    { "removeContactManagers_Stage1", kPairMgmt, uint32_t(sizeof(kPairMgmt)) },
+    { "removeContactManagers_Stage2", kPairMgmt, uint32_t(sizeof(kPairMgmt)) },
+    { "removeContactManagers_Stage3", kPairMgmt, uint32_t(sizeof(kPairMgmt)) },
+    { "removeContactManagers_Stage4", kPairMgmt, uint32_t(sizeof(kPairMgmt)) },
+    { "removeContactManagers_Stage5", kPairMgmt, uint32_t(sizeof(kPairMgmt)) },
+    { "removeContactManagers_Stage5_CvxTri", kPairMgmt, uint32_t(sizeof(kPairMgmt)) },
 };
 
 inline size_t abiAlign(size_t size)

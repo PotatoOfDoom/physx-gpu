@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 259;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 263;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -65,11 +65,11 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "copyReports", "broadphaseReports.spv", "copyReports" },  // BP_COPY_REPORTS
     { "finishContactsKernel", "npCvxFinishContacts.spv", "finishContactsKernel" },  // FINISH_CONTACTS_KERNEL
     { "MemCopyBalanced", "memCopy.spv", "MemCopyBalanced" },  // MEM_COPY_BALANCED_KERNEL
-    { "removeContactManagers_Stage1", nullptr, nullptr },  // REMOVE_CONTACT_MANAGERS_1 (unmapped)
-    { "removeContactManagers_Stage2", nullptr, nullptr },  // REMOVE_CONTACT_MANAGERS_2 (unmapped)
-    { "removeContactManagers_Stage3", nullptr, nullptr },  // REMOVE_CONTACT_MANAGERS_3 (unmapped)
-    { "removeContactManagers_Stage4", nullptr, nullptr },  // REMOVE_CONTACT_MANAGERS_4 (unmapped)
-    { "removeContactManagers_Stage5", "npPairRemoveSwap.spv", "removeContactManagers_Stage5" },  // REMOVE_CONTACT_MANAGERS_5
+    { "removeContactManagers_Stage1", "npPairMgmtBda.spv", "removeContactManagers_Stage1" },  // REMOVE_CONTACT_MANAGERS_1 (P8.37 BDA)
+    { "removeContactManagers_Stage2", "npPairMgmtBda.spv", "removeContactManagers_Stage2" },  // REMOVE_CONTACT_MANAGERS_2 (P8.37 BDA)
+    { "removeContactManagers_Stage3", "npPairMgmtBda.spv", "removeContactManagers_Stage3" },  // REMOVE_CONTACT_MANAGERS_3 (P8.37 BDA)
+    { "removeContactManagers_Stage4", "npPairMgmtBda.spv", "removeContactManagers_Stage4" },  // REMOVE_CONTACT_MANAGERS_4 (P8.37 BDA)
+    { "removeContactManagers_Stage5", "npPairMgmtBda.spv", "removeContactManagers_Stage5" },  // REMOVE_CONTACT_MANAGERS_5 (P8.37 BDA re-point)
     { "prepareLostFoundPairs_Stage1", "npCvxLostFound.spv", "prepareLostFoundPairs_Stage1" },  // COMPACT_LOST_FOUND_PAIRS_1
     { "prepareLostFoundPairs_Stage2", "npCvxLostFound.spv", "prepareLostFoundPairs_Stage2" },  // COMPACT_LOST_FOUND_PAIRS_2
     { "sphereNphase_Kernel", "npSphereNphase.spv", "sphereNphase_Kernel" },  // SPHERE_KERNEL_MAIN
@@ -82,7 +82,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "convexCoreClothmeshNphase_Kernel32", nullptr, nullptr },  // CONVEXCORE_CLOTHMESH_KERNEL32_MAIN (unmapped)
     { "convexConvexNphase_stage1Kernel", "npCvxStage1Refresh.spv", "convexConvexNphase_stage1Kernel" },  // CONVEX_CONVEX_KERNEL_EARLY_OUT
     { "convexConvexNphase_stage2Kernel", "npCvxStage2Setup.spv", "convexConvexNphase_stage2Kernel" },  // CONVEX_CONVEX_KERNEL_MAIN
-    { "removeContactManagers_Stage5_CvxTri", "npPairRemoveSwap.spv", "removeContactManagers_Stage5_CvxTri" },  // REMOVE_CONTACT_MANAGERS_5_CVXTRI
+    { "removeContactManagers_Stage5_CvxTri", "npPairMgmtBda.spv", "removeContactManagers_Stage5_CvxTri" },  // REMOVE_CONTACT_MANAGERS_5_CVXTRI (P8.37 BDA re-point)
     { "initializeManifolds", "initManifoldsBda.spv", "initializeManifolds" },  // INITIALIZE_MANIFOLDS (P8.35 BDA re-point)
     { "midphaseGeneratePairs", "convexTrimeshMidphaseBda.spv", "midphaseGeneratePairs" },  // CONVEX_TRIMESH_MIDPHASE (P8.27)
     { "convexTrimeshNarrowphase", nullptr, nullptr },  // CONVEX_TRIMESH_CORE (unmapped)
