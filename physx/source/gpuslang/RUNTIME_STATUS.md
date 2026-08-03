@@ -1623,6 +1623,57 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.25 — `pxgSlangBv32`: four copies of the BV32 reader become one
+
+P8.24 extracted the triangle-box SAT because the convex-vs-trimesh midphase was
+about to become its second consumer.  The same audit found a worse case one level
+down: the `Gu::BV32DataPacked` reader — five constants and five accessors —
+existed as **four byte-identical private copies**, in `pxgSlangClothMidphase`,
+`softBodyMeshMidphaseBda`, `femClothMeshMidphaseBda` and
+`softBodySoftBodyMidphaseBda`.  The convex midphase would have made it five.
+
+`pxgSlangBv32.slang` now owns them.  `pxgSlangClothMidphase` re-exports the module
+(`__exported import`) so its own consumers — `femClothSelfCollisionBda` and
+`femClothDifferentClothBda` — keep reaching the names unchanged; the three BDA
+midphases import it plainly.
+
+### Proven inert across every consumer, not just the ones edited
+
+The technique P8.24 established, applied to all five shaders that end up
+containing this code — including the two that only see it through the cloth
+module's re-export.  Disassembled before and after, the **full opcode sequence is
+identical, position for position**, in every one:
+
+| shader | instructions |
+|---|---|
+| `softBodyMeshMidphaseBda` | 2032 |
+| `femClothMeshMidphaseBda` | 1944 |
+| `softBodySoftBodyMidphaseBda` | 2216 |
+| `femClothSelfCollisionBda` | 2538 |
+| `femClothDifferentClothBda` | 2610 |
+
+The two cloth shaders matter most here: nothing in them was edited, so an
+identical sequence is what proves the `__exported import` re-export is
+transparent rather than merely compiling.
+
+### One thing the module records that no copy did
+
+`mData`'s `nbPrimitives` field is **six bits wide — it can express 63** — while
+`bv32Traversal.cuh` maps one lane per primitive and therefore silently drops
+anything past 32.  A consumer that writes the obvious
+`for (base = 0; base < nbPrimitives; base += LANES)` emits triangles CUDA never
+emitted.  The clamp has to stay in the consumer, because it is a property of the
+traversal's lane mapping rather than of the node format — but the fact now lives
+next to the decoder instead of in one reviewer's head.
+
+### Verification
+
+Forced-fresh `.spv`, **676/676 in both memory modes** (unchanged: an extraction
+adds no fixtures).  Scenes green: `clothselfcollide`, `clothcloth`,
+`softbodystack`, `softbodycloth`, and `PXG_SCENE=softbody` on the MESH floor at
+`|dy|` **0.000769** — bit-identical to the number P8.20 recorded, which is the
+scene that actually walks a BV32 tree.
+
 ## P8.24 — `pxgSlangTriBox`: the SAT extracted, with the extraction PROVEN inert
 
 The second half of `midphaseGeneratePairs` is a BV32 traversal whose per-triangle

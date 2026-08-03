@@ -114,11 +114,7 @@ static const uint WARP = 32u;
 static const float PX_MAX_F32 = 3.4028235e38f;
 
 // Gu::BV32DataPacked: 1168 B — mMin[32] @0, mMax[32] @512, mData[32] @1024, mNbNodes @1152.
-static const uint64_t BV32_STRIDE = 1168UL;
-static const uint64_t BV32_MMAX_OFFSET = 512UL;
-static const uint64_t BV32_MDATA_OFFSET = 1024UL;
-static const uint64_t BV32_MNBNODES_OFFSET = 1152UL;
-static const uint GU_BV4_CHILD_OFFSET_SHIFT_COUNT = 11u;
+import pxgSlangBv32;   // P8.25: the BV32 reader, shared
 
 // femMidphaseScratch.sBv32Nodes[192] — a 6-deep BV32 tree's worst-case pending set.
 static const uint STACK_SIZE = 192u;
@@ -168,23 +164,6 @@ struct PxgShape                 // PxgConvexConvexShape.h, 48 B
 // ---------------------------------------------------------------------------
 // BV32DataPacked field readers (explicit byte offset through Ptr<>).
 // ---------------------------------------------------------------------------
-uint64_t bvNodeBase(uint64_t treeAddr, uint nodeIdx) { return treeAddr + uint64_t(nodeIdx) * BV32_STRIDE; }
-float3 bvMin(uint64_t treeAddr, uint nodeIdx, uint k)
-{
-    return Ptr<float4>(bvNodeBase(treeAddr, nodeIdx) + uint64_t(k) * 16UL)[0].xyz;
-}
-float3 bvMax(uint64_t treeAddr, uint nodeIdx, uint k)
-{
-    return Ptr<float4>(bvNodeBase(treeAddr, nodeIdx) + BV32_MMAX_OFFSET + uint64_t(k) * 16UL)[0].xyz;
-}
-uint bvData(uint64_t treeAddr, uint nodeIdx, uint k)
-{
-    return Ptr<uint>(bvNodeBase(treeAddr, nodeIdx) + BV32_MDATA_OFFSET + uint64_t(k) * 4UL)[0];
-}
-uint bvNbNodes(uint64_t treeAddr, uint nodeIdx)
-{
-    return Ptr<uint>(bvNodeBase(treeAddr, nodeIdx) + BV32_MNBNODES_OFFSET)[0];
-}
 
 // ---------------------------------------------------------------------------
 // Geometry.

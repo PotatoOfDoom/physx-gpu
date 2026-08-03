@@ -58,11 +58,7 @@ public static const uint PXG_CLOTH_ID_SHIFT = 20u;
 // Gu::BV32DataPacked (GuBV32.h:88) layout, 1168 bytes:
 //   PxVec4 mMin[32] @0 (512), PxVec4 mMax[32] @512 (512), PxU32 mData[32] @1024 (128),
 //   PxU32 mNbNodes @1152, PxU32 mDepth @1156, + 8 tail pad -> stride 1168.
-public static const uint64_t BV32_STRIDE      = 1168UL;
-public static const uint64_t BV32_MMAX_OFFSET = 512UL;
-public static const uint64_t BV32_MDATA_OFFSET = 1024UL;
-public static const uint64_t BV32_MNBNODES_OFFSET = 1152UL;
-public static const uint GU_BV4_CHILD_OFFSET_SHIFT_COUNT = 11u;
+__exported import pxgSlangBv32;   // P8.25: the BV32 reader, shared (re-exported so this module's own consumers keep it)
 
 // deformableCollision.cuh:37/38.
 public static const float DEFORMABLE_BARYCENTRIC_THRESHOLD = 1.0e-6f;
@@ -87,23 +83,6 @@ public static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
 // BV32DataPacked field readers (explicit byte offset through Ptr<> — no whole-node copy).
 // treeAddr = mTriMeshData + sizeof(uint4).
 // ---------------------------------------------------------------------------
-public uint64_t bvNodeBase(uint64_t treeAddr, uint nodeIdx) { return treeAddr + uint64_t(nodeIdx) * BV32_STRIDE; }
-public float3 bvMin(uint64_t treeAddr, uint nodeIdx, uint k)
-{
-    return Ptr<float4>(bvNodeBase(treeAddr, nodeIdx) + uint64_t(k) * 16UL)[0].xyz;
-}
-public float3 bvMax(uint64_t treeAddr, uint nodeIdx, uint k)
-{
-    return Ptr<float4>(bvNodeBase(treeAddr, nodeIdx) + BV32_MMAX_OFFSET + uint64_t(k) * 16UL)[0].xyz;
-}
-public uint bvData(uint64_t treeAddr, uint nodeIdx, uint k)
-{
-    return Ptr<uint>(bvNodeBase(treeAddr, nodeIdx) + BV32_MDATA_OFFSET + uint64_t(k) * 4UL)[0];
-}
-public uint bvNbNodes(uint64_t treeAddr, uint nodeIdx)
-{
-    return Ptr<uint>(bvNodeBase(treeAddr, nodeIdx) + BV32_MNBNODES_OFFSET)[0];
-}
 
 // ---------------------------------------------------------------------------
 // Geometry helpers (proven bit-exact transcriptions).
