@@ -1623,6 +1623,58 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.31 scouting — a correction: the per-triangle core is POLYGON CLIPPING, not GJK/EPA
+
+P8.28's scouting note described `convexTrimeshNarrowphase` as "running a GJK/EPA
+query PER TRIANGLE" and made that the first item of its recommended decomposition.
+**That is wrong**, and it is worth correcting before a tranche is spent on it.
+
+Reading what `convexTriangleContactGen` (`convexTriangle.cuh:1640`) actually calls:
+
+```
+  selectPolygonFeatureIndex        polyClip
+  getNbPolygons / getNbVerts       delayGenerateContact
+  vertex2Shape                     PxPlane
+```
+
+No `gjk*`, no `epa*`, anywhere in the body.  The per-triangle algorithm is
+SAT feature selection followed by **polygon clipping** — the same family as the
+convex-vs-convex path's `npCvxPolyClip` / `npCvxTriEmit` / `npCvxTriFind` /
+`npCvxTriPurge`, all of which Phase 1 already transcribed in harness form.
+
+`pxgSlangGjk` and `pxgSlangEpa` do exist as shared modules — P8.6 extracted them
+for the softbody-vs-rigid path — but they are **not** what this chain needs, and
+starting from them would have produced a module with no consumer.
+
+### The corrected decomposition
+
+What is already certified for this chain, from the tranches so far:
+
+| piece | tranche | result |
+|---|---|---|
+| PCM manifold gate | P8.23 | 21/21 mutants, six-dispatch fixture |
+| triangle-box SAT | P8.24 | opcode-identical across extraction |
+| BV32 reader | P8.25 | opcode-identical across five consumers |
+| the midphase kernel | P8.27 | 15/16, wired, manifest 259 |
+| stack carve-up | P8.29 | 12/12, exhaustive over the padding boundary |
+| second-pass classifier | P8.30 | 12/12 |
+
+What remains before the core kernel:
+
+1. **The polygon clipper** — `polyClip` plus `selectPolygonFeatureIndex`, the real
+   per-triangle core.  Phase 1 has it in harness form, so the likely shape is
+   another extraction with an opcode-sequence proof (P8.24 / P8.25), not a port.
+2. **`delayGenerateContact`** — the predicate that decides whether a contact is
+   emitted now or deferred to the second pass.  It is the counterpart of the
+   classifier P8.30 certified: P8.30 answers "which feature", this answers
+   "defer at all".
+3. The core kernel itself, wiring all of the above.
+
+### Verification
+
+Measurement only — no shader, manifest, ABI or scene changed.  Suite unchanged at
+679/679.
+
 ## P8.30 — `pxgSlangTriFeature`: the second pass's classifier, and what its ORDER hides
 
 Step 3 of P8.28's decomposition — the part of the convex-trimesh chain with no
