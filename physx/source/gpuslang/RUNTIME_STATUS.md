@@ -1623,6 +1623,74 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.24 — `pxgSlangTriBox`: the SAT extracted, with the extraction PROVEN inert
+
+The second half of `midphaseGeneratePairs` is a BV32 traversal whose per-triangle
+test is `Gu::intersectTriangleBox_RefImpl<true>` — the Akenine-Moller
+separating-axis test, thirteen axes.  Before writing the BDA midphase this
+tranche checks what already exists, and the answer is: all of it.  Phase 1
+transcribed the whole SAT into the harness shader `npMidphaseCvx.slang`, where it
+has a passing fixture.
+
+So this is an extraction, not a port: `pxgSlangTriBox.slang` now owns
+`tbPlaneBoxOverlap` and `tbIntersectTriangleBox`, and `npMidphaseCvx` imports
+them.  The same move P8.15 made for the cloth midphase and P8.6 for the GJK/EPA
+drivers, taken for the reason this port has already paid for once — a mutant that
+deleted an OUTER gate survived because a DUPLICATED inner copy still culled.  One
+copy, one place to mutate.
+
+### The extraction is proven inert, not assumed inert
+
+A refactor that "still passes the tests" is a weaker claim than this project
+should accept for geometry, so the `.spv` was compared directly across the move:
+
+```
+before extraction: 46122dc9b0ed26d9e31d64f9a70df7df1113646a09a22d7f3642bb2a36670186
+after  extraction: 6048f41024059957492d0aa8b4cdb022fd5042e943c07d325b4f6b43b62131b2
+```
+
+Different — which proves nothing on its own, since moving code into a module
+renumbers every SPIR-V id.  Disassembling both and comparing the OPCODE STREAM
+does settle it: the histogram is identical, and so is the full **1562-instruction
+opcode SEQUENCE**, position for position.  The two binaries differ only in id
+numbering.  Together with the `gpuslang.npMidphaseCvx` fixture staying green,
+that is a behaviour-preservation argument rather than an absence of evidence.
+
+### Two details recorded in the module, because only literal transcription keeps them
+
+- **`planeBoxOverlap` is asymmetric.**  The near-corner test rejects on `> 0.0f`
+  and the far-corner test accepts on `>= 0.0f`
+  (`GuIntersectionTriangleBoxRef.h:99-104`).  A triangle plane exactly touching
+  the far corner counts as an overlap; one exactly touching the near corner does
+  not.  Making the two agree in either direction changes the emitted triangle set
+  on any exactly-tangent plane.
+- **The three vertex-in-box checks are an early-out for the whole conjunction**,
+  not a fourteenth axis.  They can only fire where the conjunction would also
+  succeed, so they change no result — but they change which float expressions are
+  evaluated, and under NaN input they are the only path that returns true without
+  touching an axis test.
+
+### A contraction asymmetry that is deliberate, and worth knowing before it surprises someone
+
+Every AXISTEST is literally `p = a*v.y - b*v.z` compared against
+`rad = fa*extents.y + fb*extents.z` — mul feeding add, exactly the shape
+contraction moves.  `npMidphaseCvx`, the Phase-1 harness consumer, is **not** in
+`PXG_NOCONTRACT_SHADERS`.  The BDA consumer that follows **will** be, as every
+other mesh midphase in this port is.  So the two will compile this one source to
+different arithmetic on near-tangent triangles.  That is correct rather than an
+oversight — the stamp is a property of the `.spv`, not of the module, and it is
+the engine-path shader whose float behaviour has to match nvcc's contracted
+reference — but it does mean the harness fixture's expectations do not transfer
+unchanged to the BDA shader, and the BDA shader will need its own.
+
+### Verification
+
+Forced-fresh `.spv`, suite through `tools/run_suite.sh` — **676/676 in both
+memory modes** (unchanged: an extraction adds no fixtures).  Scenes spot-checked
+green (`box`, `convex`, `plane`, `clothdrape`, `softbodystack`).  A pre-existing
+slangc warning at `npMidphaseCvx.slang:141` (`if (currentNodeIndex & 1)`, implicit
+uint-to-bool) sits in untouched traversal code and is not from this change.
+
 ## P8.23 — the PCM manifold GATE, extracted and certified before the traversal
 
 `midphaseGeneratePairs` splits in two at `fullContactGen = invalidate ||

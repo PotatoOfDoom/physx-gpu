@@ -50,6 +50,7 @@
 // npBv32.slang.
 
 import pxgSlangCommon;
+import pxgSlangTriBox;   // P8.24: the SAT, extracted so the BDA midphase shares it
 
 static const uint GU_BV4_CHILD_OFFSET_SHIFT_COUNT = 11;
 
@@ -116,130 +117,6 @@ float3 getNormalized(float3 v)
     return m > 0.0f ? v * rsqrt(m) : float3(0, 0, 0);
 }
 
-// --- Gu::intersectTriangleBox_RefImpl<true> ---------------------------------
-
-bool planeBoxOverlap(float3 normal, float d, float3 maxbox)
-{
-    float3 vmin, vmax;
-    if (normal.x > 0.0f) { vmin.x = -maxbox.x; vmax.x = maxbox.x; }
-    else { vmin.x = maxbox.x; vmax.x = -maxbox.x; }
-    if (normal.y > 0.0f) { vmin.y = -maxbox.y; vmax.y = maxbox.y; }
-    else { vmin.y = maxbox.y; vmax.y = -maxbox.y; }
-    if (normal.z > 0.0f) { vmin.z = -maxbox.z; vmax.z = maxbox.z; }
-    else { vmin.z = maxbox.z; vmax.z = -maxbox.z; }
-
-    if (dot(normal, vmin) + d > 0.0f)
-        return false;
-    if (dot(normal, vmax) + d >= 0.0f)
-        return true;
-    return false;
-}
-
-// The 9 edge-cross axis tests + 3 AABB axes + plane test, vertex checks
-// enabled, in the CUDA's exact evaluation order.
-bool intersectTriangleBox(float3 boxcenter, float3 extents, float3 tp0, float3 tp1, float3 tp2)
-{
-    const float3 v0 = tp0 - boxcenter;
-    const float3 v1 = tp1 - boxcenter;
-    const float3 v2 = tp2 - boxcenter;
-
-    // bDoVertexChecks
-    if (abs(v0.x) <= extents.x && abs(v0.y) <= extents.y && abs(v0.z) <= extents.z)
-        return true;
-    if (abs(v1.x) <= extents.x && abs(v1.y) <= extents.y && abs(v1.z) <= extents.z)
-        return true;
-    if (abs(v2.x) <= extents.x && abs(v2.y) <= extents.y && abs(v2.z) <= extents.z)
-        return true;
-
-    const float3 e0 = v1 - v0;
-    const float3 e1 = v2 - v1;
-    const float3 e2 = v0 - v2;
-
-    float minimum, maximum, rad, p0, p1, p2;
-
-    float fex = abs(e0.x);
-    float fey = abs(e0.y);
-    float fez = abs(e0.z);
-    // AXISTEST_X01(e0.z, e0.y, fez, fey)
-    p0 = e0.z * v0.y - e0.y * v0.z;
-    p2 = e0.z * v2.y - e0.y * v2.z;
-    minimum = min(p0, p2); maximum = max(p0, p2);
-    rad = fez * extents.y + fey * extents.z;
-    if (minimum > rad || maximum < -rad) return false;
-    // AXISTEST_Y02(e0.z, e0.x, fez, fex)
-    p0 = -e0.z * v0.x + e0.x * v0.z;
-    p2 = -e0.z * v2.x + e0.x * v2.z;
-    minimum = min(p0, p2); maximum = max(p0, p2);
-    rad = fez * extents.x + fex * extents.z;
-    if (minimum > rad || maximum < -rad) return false;
-    // AXISTEST_Z12(e0.y, e0.x, fey, fex)
-    p1 = e0.y * v1.x - e0.x * v1.y;
-    p2 = e0.y * v2.x - e0.x * v2.y;
-    minimum = min(p1, p2); maximum = max(p1, p2);
-    rad = fey * extents.x + fex * extents.y;
-    if (minimum > rad || maximum < -rad) return false;
-
-    fex = abs(e1.x);
-    fey = abs(e1.y);
-    fez = abs(e1.z);
-    // AXISTEST_X01(e1.z, e1.y, fez, fey)
-    p0 = e1.z * v0.y - e1.y * v0.z;
-    p2 = e1.z * v2.y - e1.y * v2.z;
-    minimum = min(p0, p2); maximum = max(p0, p2);
-    rad = fez * extents.y + fey * extents.z;
-    if (minimum > rad || maximum < -rad) return false;
-    // AXISTEST_Y02(e1.z, e1.x, fez, fex)
-    p0 = -e1.z * v0.x + e1.x * v0.z;
-    p2 = -e1.z * v2.x + e1.x * v2.z;
-    minimum = min(p0, p2); maximum = max(p0, p2);
-    rad = fez * extents.x + fex * extents.z;
-    if (minimum > rad || maximum < -rad) return false;
-    // AXISTEST_Z0(e1.y, e1.x, fey, fex)
-    p0 = e1.y * v0.x - e1.x * v0.y;
-    p1 = e1.y * v1.x - e1.x * v1.y;
-    minimum = min(p0, p1); maximum = max(p0, p1);
-    rad = fey * extents.x + fex * extents.y;
-    if (minimum > rad || maximum < -rad) return false;
-
-    fex = abs(e2.x);
-    fey = abs(e2.y);
-    fez = abs(e2.z);
-    // AXISTEST_X2(e2.z, e2.y, fez, fey)
-    p0 = e2.z * v0.y - e2.y * v0.z;
-    p1 = e2.z * v1.y - e2.y * v1.z;
-    minimum = min(p0, p1); maximum = max(p0, p1);
-    rad = fez * extents.y + fey * extents.z;
-    if (minimum > rad || maximum < -rad) return false;
-    // AXISTEST_Y1(e2.z, e2.x, fez, fex)
-    p0 = -e2.z * v0.x + e2.x * v0.z;
-    p1 = -e2.z * v1.x + e2.x * v1.z;
-    minimum = min(p0, p1); maximum = max(p0, p1);
-    rad = fez * extents.x + fex * extents.z;
-    if (minimum > rad || maximum < -rad) return false;
-    // AXISTEST_Z12(e2.y, e2.x, fey, fex)
-    p1 = e2.y * v1.x - e2.x * v1.y;
-    p2 = e2.y * v2.x - e2.x * v2.y;
-    minimum = min(p1, p2); maximum = max(p1, p2);
-    rad = fey * extents.x + fex * extents.y;
-    if (minimum > rad || maximum < -rad) return false;
-
-    // AABB axes
-    minimum = min(min(v0.x, v1.x), v2.x); maximum = max(max(v0.x, v1.x), v2.x);
-    if (minimum > extents.x || maximum < -extents.x) return false;
-    minimum = min(min(v0.y, v1.y), v2.y); maximum = max(max(v0.y, v1.y), v2.y);
-    if (minimum > extents.y || maximum < -extents.y) return false;
-    minimum = min(min(v0.z, v1.z), v2.z); maximum = max(max(v0.z, v1.z), v2.z);
-    if (minimum > extents.z || maximum < -extents.z) return false;
-
-    // plane of the triangle
-    const float3 normal = cross(e0, e1);
-    const float d = -dot(normal, v0);
-    if (!planeBoxOverlap(normal, d, extents))
-        return false;
-
-    return true;
-}
-
 // ---------------------------------------------------------------------------
 // One 32-thread group per work item (convex-vs-mesh pair).
 [shader("compute")]
@@ -290,7 +167,7 @@ void ctMidphaseCvx(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
                     const float3 worldSpaceP1 = quatRotate(w.meshToWorldQ, vertex2Shape(triV1, w.scale.xyz, w.scaleRotQ)) + w.meshToWorldP.xyz;
                     const float3 worldSpaceP2 = quatRotate(w.meshToWorldQ, vertex2Shape(triV2, w.scale.xyz, w.scaleRotQ)) + w.meshToWorldP.xyz;
 
-                    primitiveIntersects = intersectTriangleBox(w.center.xyz, w.inflatedExtents.xyz,
+                    primitiveIntersects = tbIntersectTriangleBox(w.center.xyz, w.inflatedExtents.xyz,
                                                                worldSpaceP0, worldSpaceP1, worldSpaceP2);
                 }
             }
