@@ -1623,6 +1623,52 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.40 attempt — DEFERRED: a reproducible segfault in the SAT module, and everything it is not
+
+The first two SAT stages (`satConvexFaceNormals`, `satTriangleNormal`) were written, and the
+shader **agreed with a scalar 32-lane oracle on every value in all six fixture cases**.  It is
+not landed, because in the plain formulation the dispatch reliably **segfaults inside the
+JIT-compiled shader** on llvmpipe.  The code is parked in the session scratchpad rather than
+committed; this entry exists so the next attempt starts from the eliminations rather than
+repeating them.
+
+**What was ruled out**, each by a build-and-run:
+
+| hypothesis | result |
+|---|---|
+| the early `return false` after the disjoint ballot | crashes with a single-exit rewrite too |
+| a groupshared index past the 64-entry arrays | crashes with every index clamped |
+| hull-blob misalignment breaking a `Ptr<float4>` load | all blobs measured 256-aligned |
+| the two global loads in the polygon loop (`chPolyDesc`, `chPlane`) | crashes with both stubbed to constants |
+| the divergent `break` in the strided loop | crashes with the break removed |
+| the whole strided loop | crashes with the loop deleted entirely |
+| `#include`-ing pxgSlangWarpInc (a header that owns groupshared) into a module that also owns groupshared | crashes with hand-rolled local primitives instead |
+| a data-dependent path | all six cases crash individually, including the trivially separated one |
+
+What survives is a stage-1 function reduced to nothing but **a sequence of barrier-bearing
+reductions** — a ballot, a max-with-winner-lane, and three broadcasts — and that still crashes.
+
+**The decisive clue is that the crash is sensitive to unrelated control flow.**  Adding two
+`continue` branches that are never taken at runtime made it disappear; removing them brought it
+back.  That is the signature of a miscompile, not of a logic error in the port, and it is why
+further bisection was stopped: the remaining difference from the working `polyClipBda` is
+compositional (three barrier-bearing module calls plus two bare barriers in the shader body,
+versus one module call), not semantic.
+
+**The other finding from the attempt is a fixture bug worth recording**, because it is silent:
+`minIndex` in a cooked polygon descriptor is the vertex with the **smallest** projection along
+that face's normal — the hull's near extent, which `satConvexFaceNormals` uses as `min0`.  The
+first fixture seeded it with a vertex lying ON the face, which makes `min0 == max0` and reports
+every overlapping pair as separated.  Nothing failed: the shader and the oracle both consumed
+the same malformed hull and agreed perfectly.  Only the explicit path-coverage assertion — "some
+case must pass both stages" — exposed it.  That is the second time in three tranches that a
+coverage assertion, not a value comparison, caught the real defect.
+
+Where to resume: build the same module but with the composition that is known to work — one
+module entry point per dispatch, barriers confined to a single called function, no bare barriers
+in the shader body — and see whether the crash follows the composition.  If it does, the finding
+is a platform constraint on how these ports may be structured, and it belongs in the doctrine.
+
 ## P8.39 — the cooked convex-hull blob reader, plus a survey of what the core kernel actually needs
 
 `pxgSlangConvexHull` transcribes the `ConvexScratch` accessors (`convexTriangle.cuh:55-136`) as
