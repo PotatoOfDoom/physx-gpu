@@ -1253,8 +1253,11 @@ void writebackBlocks(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_
                 : 0u;
             constraintWriteBack[forceWritebackOffset].angularImpulse_residual =
                 float4(angVel, constraintErrorSq);
+            // The broken flag is the SIGN BIT of a zero, and llvmpipe folds
+            // `cond ? -0.0f : 0.0f` away — see the twin in solverTGS.slang for why.
+            // Select the bit pattern, not the float.
             constraintWriteBack[forceWritebackOffset].linearImpulse_broken =
-                float4(linVel, broken != 0 ? -0.0f : 0.0f);
+                float4(linVel, asfloat(broken != 0 ? 0x80000000u : 0u));
         }
     }
 }

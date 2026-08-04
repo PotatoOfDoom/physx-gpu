@@ -1177,6 +1177,7 @@ PXG_TEST(solverPGS_concludeAndWriteback)
     auto refPatchBlocks = frictionPatchBlocks;
     std::vector<float> refForce = forceInit;
     std::vector<ConstraintWriteback> refWb = wbInit;
+    size_t refBrokenJoints = 0; // guard against a fixture that never breaks a joint
     std::vector<FrictionPatchGPU> refPatches = patches;
     std::vector<ThresholdElement> refStream;
 
@@ -1288,6 +1289,8 @@ PXG_TEST(solverPGS_concludeAndWriteback)
                         : 0;
                     refWb[fwo].angularImpulse_residual = Float4{ angVel.x, angVel.y, angVel.z, errSq };
                     refWb[fwo].linearImpulse_broken = Float4{ linVel.x, linVel.y, linVel.z, broken ? -0.0f : 0.0f };
+                    if (broken)
+                        ++refBrokenJoints;
                 }
             }
         }
@@ -1314,6 +1317,12 @@ PXG_TEST(solverPGS_concludeAndWriteback)
     std::vector<ThresholdElement> gpuStream(gpuTsCount);
     if (gpuTsCount)
         shim.memcpyDtoH(gpuStream.data(), dTs, gpuTsCount * sizeof(ThresholdElement));
+
+    // COVERAGE: the broken flag is the SIGN BIT of a zero.  A platform that drops
+    // signed zeros writes a record that is bit-perfect everywhere else and never
+    // reports a broken joint, so the memcmp below can only see it if the fixture
+    // actually breaks one.
+    PXG_CHECK_MSG(refBrokenJoints > 0, "writeback fixture breaks no joint (the sign-bit path is untested)");
 
     size_t mismatches = 0;
     for (size_t i = 0; i < contactPoints.size(); ++i)

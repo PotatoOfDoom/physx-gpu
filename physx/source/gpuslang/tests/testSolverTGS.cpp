@@ -1139,7 +1139,8 @@ PXG_TEST(solverTGS_writebackBlocksAbi)
     std::vector<ConstraintWriteback> refWb = wbInit;
     std::vector<FrictionPatchGPU> refPatches = patches;
     std::vector<ThresholdElement> refStream;
-    size_t refMutations = 0; // guard against an all-no-op fixture
+    size_t refMutations = 0;    // guard against an all-no-op fixture
+    size_t refBrokenJoints = 0; // guard against a fixture that never breaks a joint
 
     for (uint32_t k = 0; k < numBatches; ++k)
     {
@@ -1240,11 +1241,18 @@ PXG_TEST(solverTGS_writebackBlocksAbi)
                     refWb[fwo].linearImpulse_broken =
                         Float4{ linVel.x, linVel.y, linVel.z, broken ? -0.0f : 0.0f };
                     ++refMutations;
+                    if (broken)
+                        ++refBrokenJoints;
                 }
             }
         }
     }
     PXG_CHECK_MSG(refMutations > 0, "writeback fixture mutated nothing (too weak / no-op?)");
+    // COVERAGE: the broken flag is the SIGN BIT of a zero.  A platform that drops
+    // signed zeros writes a record that is bit-perfect everywhere else and never
+    // reports a broken joint, so the memcmp below can only see it if the fixture
+    // actually breaks one.
+    PXG_CHECK_MSG(refBrokenJoints > 0, "writeback fixture breaks no joint (the sign-bit path is untested)");
 
     // ---- download + compare ----
     std::vector<TGSJointRowCon> gpuRows(jrows.size());

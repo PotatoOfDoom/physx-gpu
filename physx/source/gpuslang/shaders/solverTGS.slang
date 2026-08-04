@@ -1188,8 +1188,15 @@ void writebackBlocksTGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : 
                 : 0u;
             constraintWriteBack[forceWritebackOffset].angularImpulse_residual =
                 float4(angVel, constraintErrorSq);
+            // THE BROKEN FLAG IS THE SIGN BIT OF A ZERO (solverBlockTGS.cuh:1172), and it
+            // must NOT travel through a float select.  Vulkan does not require
+            // SignedZeroInfNanPreserve, and llvmpipe folds `cond ? -0.0f : 0.0f` to a
+            // plain +0.0f: the two arms compare equal, so the select is dead under
+            // no-signed-zeros semantics.  The result is a joint that never reports as
+            // broken — silently, because every other component of the writeback is
+            // bit-exact.  Selecting the BIT PATTERN and reinterpreting keeps the sign.
             constraintWriteBack[forceWritebackOffset].linearImpulse_broken =
-                float4(linVel, broken != 0 ? -0.0f : 0.0f);
+                float4(linVel, asfloat(broken != 0 ? 0x80000000u : 0u));
         }
     }
 }

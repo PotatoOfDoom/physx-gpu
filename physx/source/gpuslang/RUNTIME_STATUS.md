@@ -1623,6 +1623,63 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.43 — a signed zero that llvmpipe folded away, and the joint that never broke
+
+A forced-fresh rebuild — every `.spv` deleted first — turned `solverTGS_writebackBlocksAbi`
+red with 16 mismatches, in a shader that had not been touched since P5 Step 4 tranche 20.
+Every mismatching record was bit-identical except for ONE component:
+`ConstraintWriteback::linearImpulse_broken.w`, where the GPU wrote `+0.0` and the reference
+`-0.0`.
+
+### Why that single bit is the whole flag
+
+PhysX encodes "this joint broke" as the SIGN of a zero (`solverBlockTGS.cuh:1172`):
+
+```cuda
+writeback.linearImpulse_broken = make_float4(linVel.x, linVel.y, linVel.z, broken ? -0.0f : 0.0f);
+```
+
+The port transcribed that literally.  **Vulkan does not require signed-zero preservation** —
+`SignedZeroInfNanPreserve` is an optional execution mode — so a compiler is free to treat the
+two arms of `cond ? -0.0f : 0.0f` as equal and delete the select.  llvmpipe does exactly that:
+`0 of 139` writeback records came back with the sign bit set where the oracle had `16`.
+
+Selecting the BIT PATTERN and reinterpreting it survives, because the select is then an integer
+one and no float rule applies:
+
+```slang
+float4(linVel, asfloat(broken != 0 ? 0x80000000u : 0u))
+```
+
+**The fold is not deterministic across shaders.**  `solverPGS.slang` carries the same three
+lines with the same shape, and its 29 broken joints came back with their sign bits intact even
+before the fix.  Two shaders, one source pattern, opposite outcomes — which is the argument for
+spelling it defensively in both rather than only where it was observed to break.
+
+### The rule this hands the port
+
+**A bit pattern that carries a flag must never travel through a float select.**  Signed zeros
+and NaN payloads are not values the compiler is obliged to keep.  P8.37 already met the other
+half of this — it moves manifolds as `uint4` rather than `float4` so NaN canonicalisation
+cannot touch them — and this is the same rule arriving from the arithmetic side.
+
+### What made it invisible, and what now makes it loud
+
+The PGS twin's fixture DOES break joints, and its test still passed with the bug present,
+because on that shader the sign happened to survive.  Nothing in either test asserted that the
+sign-bit path was exercised at all, so a fixture that never broke a joint would have read as
+full coverage.  Both writeback tests now count the broken joints their oracle produces and
+assert the count is non-zero — the same shape of coverage assertion the SAT tranches use.
+
+### On when this broke
+
+The shader source has not changed since the writeback tranche landed, and the failure appears
+on the first forced-fresh build after a container restart.  Whether an older `.spv` on disk had
+been compiled by a toolchain that kept the select, or the suite had been reporting green over a
+stale binary, cannot be established after the fact — the old `.spv` files were deleted to force
+the rebuild that exposed this.  What is certain is that the CURRENT toolchain folds it and the
+current source no longer relies on it.
+
 ## P8.42 — the SAT driver and the face selection the clipper consumes
 
 `convexMeshSAT` (`convexTriangle.cuh:868`), `delayGenerateContact` (:1402) and
