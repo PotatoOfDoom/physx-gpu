@@ -454,6 +454,37 @@ PXG_TEST(contactReduceWarp)
         cases.push_back(c);
     }
 
+    {   // 9: EVERY POINT PROJECTS TO THE SAME PLACE.  The contacts differ only
+        //     ALONG the normal, so `point` is identical on every lane while
+        //     `pointRaw` is not -- they are not duplicates and none is culled, but
+        //     the distance from p0 is 0 on every lane.  maxIndex then falls back
+        //     to the lowest-lane rule, and because p0 is itself lane 0, a p1 pick
+        //     that forgets to exclude the anchors already chosen re-picks p0 and
+        //     the manifold comes back one contact short.  This is a stack of
+        //     contacts along the normal, which is an ordinary thing for a clipper
+        //     to produce, and no amount of random data lands on it.
+        //     THE SEPARATIONS MUST NOT FOLLOW THE LANE ORDER.  With every distance
+        //     zero the anchors fall to the lowest lanes, and the fill loop then
+        //     picks the DEEPEST remaining -- so if depth and lane index agree, the
+        //     fill silently restores exactly the lane the bad p1 lost and the
+        //     mutant survives.  Lane 3 is therefore made shallow and the two
+        //     deepest contacts parked out at lanes 10 and 20.
+        CrWarpCase c;
+        for (uint32_t j = 0; j < 32; ++j)
+        {
+            c.p[j] = { 0.3f, -0.2f, 0.05f * float(j) };     // same x,y for all
+            c.s[j] = -0.1f - 0.001f * float(j);
+        }
+        c.s[0] = 0.05f;      // the largest separation -> p0 is lane 0
+        c.s[3] = 0.0f;       // shallow, so the fill never reaches for it
+        c.s[10] = -0.9f;     // the two deepest, far from the low lanes
+        c.s[20] = -0.8f;
+        c.normal = { 0.0f, 0.0f, 1.0f };
+        c.allMask = 0xFFFFFFFFu;
+        c.name = "all points project onto one place";
+        cases.push_back(c);
+    }
+
     const uint32_t nConstructed = uint32_t(cases.size());
 
     // Random cases, same generator as the scalar test but pinned to this
