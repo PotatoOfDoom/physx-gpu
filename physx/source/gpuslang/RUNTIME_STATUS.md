@@ -1623,6 +1623,131 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.41 — satEdgeCrossDirection2, the third and last SAT stage
+
+`satEdgeCrossDirection2` (`convexTriangle.cuh:575-696`) closes `convexMeshSAT`: for every
+(convex edge, triangle edge) pair the cross product is a candidate separating axis.  It is the
+only stage that READS what an earlier stage wrote — the shape-space plane normals stage 1 left
+in groupshared are its gate — so getting it green also confirms P8.40 wrote them correctly.
+
+### What the transcription keeps, and what it drops
+
+- `_separation` starts from the **running best**, not `-PX_MAX_F32`, so an edge axis only wins
+  if it strictly beats what the face and triangle stages already committed.
+- The two hull side-tables are read with the CUDA's little-endian trick: an edge's two vertex
+  indices as one `uint`, its two face indices as one `ushort`.  Both runs are 4-aligned from
+  the blob base, so the packed loads are legal — the argument P8.39 made for its own readers.
+- `magSquared` and `dp` are computed and never used in the CUDA, and `convexScale` /
+  `convexScaleRot` are loaded and never used.  Dropped: dead code cannot move an output bit.
+- `shapeNormal` is the RAW triangle normal.  The `shape2Vertex` version sits commented out in
+  the CUDA at :595 and stays commented out here.
+- The `__any_sync` early-out is INSIDE the iteration loop, so a warp that finds a separating
+  axis leaves without scanning the rest.  The loop bound is warp-uniform, so the reduction
+  inside it is too — the P8.38 rule about barriers in provably uniform control flow.
+
+Per P8.40's rule the caller resolves the two section base addresses and passes them in; the
+stage never dereferences an address it read out of memory.
+
+### Three fixture cases, each built for one thing the stage does
+
+Reaching stage 3 is not the same as exercising it.  The stage was reachable the moment it was
+wired up and every value already agreed with the oracle — and none of that observed the half of
+the stage that only runs when an edge axis actually wins.
+
+- **"edge-cross axis wins"** — a triangle whose first edge crosses diagonally past the box
+  corner at x=y=1.  Along the resulting axis, the xy diagonal, the hulls overlap by 0.141
+  against the 1.0 the best face normal gives, so the edge axis takes the lead and the tail of
+  the stage — the argmax across lanes, the sign choice between the two overlaps, the
+  `EDGE_FEATURE_IDX` write — becomes observable.  THE GATE MATTERS HERE: the vertical edge
+  nearest the crossing is REJECTED, because its two faces are +x and +y and the triangle normal
+  has a positive dot with both.  The axis arrives from the three other vertical edges.  All
+  three yield the identical vector, so their separations are bitwise equal and the lowest-lane
+  rule decides — and the lowest of the three is lane 1, holding index 33, a value carried out
+  of the SECOND pass of the strided loop.
+- **"separated by an edge-cross axis only"** — all six face normals and the triangle normal
+  overlap; only the same xy diagonal pulls the pair apart.  This is the only case that drives
+  `isPassed = false`, so it is the only one that exercises the early-out inside the loop.  Its
+  first separating index is 24, inside the FIRST pass, so the loop leaves without ever looking
+  at indices 32..35.
+- **"edge-cross with adjacency flags"** — the same geometry with the triangle's second edge
+  marked non-convex and its third carrying a plain neighbour index.  Every other case leaves
+  all three at BOUNDARY, so without it `csIsActiveEdge` is only ever asked the BOUNDARY
+  question.  It also pins the pairing between an edge's own flag and the edge it spans: closing
+  the triangle the other way round, `(vStart+2)%3`, yields the same three edge directions
+  negated, and the stage tries both signs anyway, so under all-BOUNDARY adjacency that mistake
+  is **invisible**.  With the flags set it is not — the winning diagonal is never formed.
+
+### What the second memory mode caught
+
+The "separated by an edge-cross axis only" case first went in with `probeIndex = 6` on a hull
+that has six polygons — one past the end.  The probe reads `convexPlaneN/D` at that index, and
+stage 1 only ever writes the first `nbPolygons` entries of that groupshared array, so the read
+returned whatever the previous dispatch had left there.  Under the default allocator that
+happened to be zero, which is exactly what the oracle expects for an unwritten entry, and the
+case passed.  Under `PXG_DEVICE_V2=1` it was not zero and the case failed.
+
+Nothing about the port was wrong; the fixture was.  It is the clearest payment yet for running
+both memory modes on every tranche rather than one.  The probe index is now asserted to be
+inside the hull before the blob is built, so the same mistake fails loudly and in both modes.
+
+### Sweep 28/37, and what the survivors mean
+
+M2, M3, M4 and M8 are P8.40's four stage-1 survivors, unchanged and already argued there.  The
+five new ones:
+
+- **M23**, closing the triangle edge the wrong way round, **survived the first sweep and was
+  then killed** by the adjacency-flag case above.  That is the one survivor this tranche turned
+  into a kill rather than an argument.
+- **M17**, seeding the edge stage from `-PX_MAX_F32` instead of the running best — equivalent
+  by the same algebra as M1: the stage commits iff `max over edges > running`, and that
+  predicate is unchanged by the seed.  Only the value held by lanes that processed no edge
+  moves, and those lanes never win the argmax when an edge does.
+- **M20** (the gate keeps the faces pointing TOWARDS the triangle) and **M25** (an edge's second
+  face index unpacked from the wrong byte, so the gate tests the first face twice) both survive
+  for the same structural reason.  Write A for the edges with at least one face pointing away
+  and B for those with at least one pointing towards; every edge has two faces, so A ∩ B is
+  exactly the SILHOUETTE edges, and both spellings of the gate keep all of them.  The winning
+  edge-cross axis is attained at a silhouette edge, so neither mutation can move it.  That is
+  an argument rather than a proof, so it was checked: several thousand randomised triangles
+  against both the box and the 34-polygon drum produced **no** configuration where either
+  mutation changed an output bit.
+- **M36**, striding the edge loop by one instead of by a warp — every edge index is still
+  visited, just redundantly, and the lowest-lane rule then resolves to lane 0 holding the same
+  best value.  Slower, not different.
+
+One anomaly is recorded rather than smoothed over: **M1 came back KILLED on the first sweep and
+SURVIVED on three targeted re-runs**, with six back-to-back runs of the unmutated fixture also
+clean.  M1 is equivalent by construction — the caller passes exactly `-PX_MAX_F32`, which is
+what the mutation substitutes — so the first result was the outlier.
+
+### The P8.13 one-off fired twice here, and gave up its first real evidence
+
+The recurring one-off suite failure described in P8.13 — always the first parallel run after a
+forced-fresh `.spv` rebuild, always the default mode, never `PXG_DEVICE_V2=1`, never reproducible
+— fired **twice** in this tranche, in 2 of 5 full default-mode runs.  Both times it was
+`gpuslang.scan`, and this is the first occurrence in the whole port where the failing test is
+even known: every earlier one destroyed its own log before it could be read.
+
+**What the log shows is new.**  The record for the failed run contains the command, the start
+time, and then `<end of output>` — **not one line of the test's own output, not even the backend
+banner** that every run prints before the first check.  It dies before or during device
+creation, not inside any kernel.  That is consistent with every negative result P8.13 collected
+(it is not a kernel, not a timeout, not disk, not the pipeline cache) and it narrows the target
+sharply for the next attempt.
+
+It did not reproduce in three solo re-runs, in 24 synthetic 8-way concurrent starts of the same
+test, or in eight repeats of the first 24 tests at `-j4`.  The M1 sweep anomaly above fits the
+same shape — a one-off in a run that had just deleted the `.spv` and rebuilt.
+
+One process note against myself: these runs used bare `ctest -j4` rather than
+`tools/run_suite.sh`, which P8.13 added precisely so an occurrence archives its own evidence.
+The second crash's log survived only because nothing happened to overwrite it in between.  The
+final verification for this tranche was re-run through the wrapper.
+
+Suite **685/685 in both memory modes**.  Still not an engine kernel: no manifest entry, no ABI
+row.  `convexMeshSAT` now has all three of its stages, so the next tranche is the clipper hookup
+and the emit stage of `convexTriangleContactGen`.
+
 ## P8.40 — the first two SAT stages, and the llvmpipe fault that held them up for four passes
 
 `satConvexFaceNormals` (`convexTriangle.cuh:217`) and `satTriangleNormal` (:303), plus the

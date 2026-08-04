@@ -51,6 +51,9 @@ const uint32_t LANES = 32u;
 const uint32_t MAXP = 64u;
 const float MAXF = 3.4028234663852886e+38f;
 const uint32_t TRI_FEATURE_IDX = 0x7FFFFFFFu;
+const uint32_t EDGE_FEATURE_IDX = 0x80000000u;
+const uint32_t BOUNDARY = 0xffffffffu;
+const uint32_t NONCONVEX_FLAG = 0x80000000u;
 
 struct V3 { float x, y, z; };
 V3 mk(float x, float y, float z) { return V3{ x, y, z }; }
@@ -100,10 +103,13 @@ struct SatCase
     std::vector<V3> verts;      // vertex-space hull vertices
     std::vector<float> planes;  // 4 per polygon
     std::vector<uint32_t> polyDescs;
+    std::vector<uint32_t> vbe;   // verticesByEdges16, 2 per edge
+    std::vector<uint32_t> fbe;   // facesByEdges8, 2 per edge
     V3 scale{}; float rot[4]{};
     float contactDist = 0.0f;
     V3 t[3]{}; V3 triN{};
     uint32_t probeIndex = 0;
+    uint32_t adj[3] = { 0xffffffffu, 0xffffffffu, 0xffffffffu };   // BOUNDARY = active
     const char* name = "";
 };
 
@@ -126,13 +132,18 @@ void buildBlob(SatCase& c)
     { f32(c.verts[i].x); f32(c.verts[i].y); f32(c.verts[i].z); f32(0.0f); }
     for (uint32_t i = 0; i < 4u * c.nbPolygons; ++i) f32(c.planes[i]);
     for (uint32_t i = 0; i < c.nbPolygons; ++i) u32(c.polyDescs[i]);
-    for (uint32_t i = 0; i < 4u * c.nbEdges + 2u * c.nbEdges + 3u * c.nbVerts + 64u; ++i)
-        b.push_back(0);
+    // verticesByEdges16: two ushorts per edge
+    for (uint32_t e = 0; e < c.nbEdges; ++e)
+    { const uint32_t w = (c.vbe[2*e+1] << 16) | c.vbe[2*e+0]; u32(w); }
+    // facesByEdges8: two bytes per edge
+    for (uint32_t e = 0; e < c.nbEdges; ++e)
+    { b.push_back(uint8_t(c.fbe[2*e+0])); b.push_back(uint8_t(c.fbe[2*e+1])); }
+    for (uint32_t i = 0; i < 3u * c.nbVerts + 64u; ++i) b.push_back(0);
 }
 
 struct SatResult
 {
-    bool p1 = false, p2 = false;
+    bool p1 = false, p2 = false, p3 = false;
     uint32_t feature = 0xffffffffu;
     V3 faceNormal{};
     float separation = -MAXF;
@@ -215,6 +226,65 @@ SatResult refSat(const SatCase& c)
         r.separation = sep2;
         r.feature = TRI_FEATURE_IDX;
     }
+
+    // ---- stage 3: satEdgeCrossDirection2 -----------------------------------
+    // The plane normals stage 1 stored are the gate, so this stage is simulated
+    // against `planeN`, not recomputed.
+    {
+        float lSep3[LANES]; V3 lNorm3[LANES]; bool lPassed[LANES];
+        for (uint32_t l = 0; l < LANES; ++l)
+        { lSep3[l] = r.separation; lNorm3[l] = r.faceNormal; lPassed[l] = true; }
+
+        const uint32_t nbEdges = c.nbEdges;
+        bool bailed = false;
+        for (uint32_t it = 0; it < nbEdges * 3u && !bailed; it += LANES)
+        {
+            for (uint32_t l = 0; l < LANES; ++l)
+            {
+                const uint32_t index = it + l;
+                if (index >= nbEdges * 3u) continue;
+                const uint32_t vStart = index % 3u;
+                const uint32_t adj = c.adj[vStart];
+                const bool active = (adj == BOUNDARY) || ((adj & NONCONVEX_FLAG) == 0u);
+                if (!active) continue;
+                const uint32_t vEnd = (vStart + 1u) % 3u;
+                const uint32_t e = index / 3u;
+                const uint32_t v0 = c.vbe[2 * e + 0], v1 = c.vbe[2 * e + 1];
+                const uint32_t f0 = c.fbe[2 * e + 0], f1 = c.fbe[2 * e + 1];
+                if (!(dot3(c.triN, planeN[f0]) < 0.0f || dot3(c.triN, planeN[f1]) < 0.0f)) continue;
+                const V3 convexEdge = sub(sv[v0], sv[v1]);
+                const V3 triEdge = sub(c.t[vEnd], c.t[vStart]);
+                const V3 v = cross3(convexEdge, triEdge);
+                if (!(dot3(v, v) > 1e-10f)) continue;
+                const float m = std::sqrt(dot3(v, v));
+                const V3 sv3 = mk(v.x / m, v.y / m, v.z / m);
+                float minTri = MAXF, maxTri = -MAXF, minConv = MAXF, maxConv = -MAXF;
+                for (uint32_t k = 0; k < 3; ++k)
+                { const float d = dot3(c.t[k], sv3); minTri = std::fmin(d, minTri); maxTri = std::fmax(d, maxTri); }
+                for (uint32_t k = 0; k < c.nbVerts; ++k)
+                { const float d = dot3(sv[k], sv3); minConv = std::fmin(d, minConv); maxConv = std::fmax(d, maxConv); }
+                const float o0 = minTri - maxConv, o1 = minConv - maxTri;
+                if (minConv > (maxTri + c.contactDist) || minTri > (maxConv + c.contactDist))
+                    lPassed[l] = false;
+                else
+                {
+                    if (lSep3[l] < o0) { lSep3[l] = o0; lNorm3[l] = sv3; }
+                    if (lSep3[l] < o1) { lSep3[l] = o1; lNorm3[l] = mk(-sv3.x, -sv3.y, -sv3.z); }
+                }
+            }
+            for (uint32_t l = 0; l < LANES; ++l) if (!lPassed[l]) bailed = true;
+        }
+        if (bailed)
+            return r;
+        r.p3 = true;
+
+        float best3 = -MAXF;
+        for (uint32_t l = 0; l < LANES; ++l) best3 = std::fmax(best3, lSep3[l]);
+        uint32_t w3 = 0;
+        for (uint32_t l = 0; l < LANES; ++l) if (lSep3[l] == best3) { w3 = l; break; }
+        if (r.separation < best3)
+        { r.faceNormal = lNorm3[w3]; r.separation = best3; r.feature = EDGE_FEATURE_IDX; }
+    }
     return r;
 }
 
@@ -235,6 +305,16 @@ void makeBox(SatCase& c, float hx, float hy, float hz)
     // is what the first version of this fixture did, and the symptom was that no
     // case reached stage 2 at all.
     const uint32_t minIdx[6] = { 0, 1, 0, 2, 0, 4 };
+    // The 12 box edges: two vertices and the two faces meeting there.  The edge
+    // stage needs a real table -- with zeros every edge degenerates to vertex 0
+    // and the whole stage tests nothing.
+    const uint32_t E[12][4] = {
+        {0,1,3,5},{1,2,0,5},{2,3,2,5},{3,0,1,5},
+        {4,5,3,4},{5,6,0,4},{6,7,2,4},{7,4,1,4},
+        {0,4,1,3},{1,5,0,3},{2,6,0,2},{3,7,1,2} };
+    c.vbe.clear(); c.fbe.clear();
+    for (uint32_t e = 0; e < 12; ++e)
+    { c.vbe.push_back(E[e][0]); c.vbe.push_back(E[e][1]); c.fbe.push_back(E[e][2]); c.fbe.push_back(E[e][3]); }
     c.planes.clear(); c.polyDescs.clear();
     for (uint32_t i = 0; i < 6; ++i)
     {
@@ -275,6 +355,14 @@ void makeDrum(SatCase& c, uint32_t sides, float r, float hz)
         { const float d = c.verts[v].x * nx + c.verts[v].y * ny; if (d < bestD) { bestD = d; best = v; } }
         c.polyDescs.push_back(packPolyDesc(4u * i, 4u, best & 0xffu));
     }
+    // edges: the two rings plus the verticals, 3*sides in total
+    c.vbe.clear(); c.fbe.clear();
+    for (uint32_t i = 0; i < sides; ++i)   // bottom ring: side face i and the -z cap
+    { c.vbe.push_back(i); c.vbe.push_back((i + 1u) % sides); c.fbe.push_back(i); c.fbe.push_back(sides + 1u); }
+    for (uint32_t i = 0; i < sides; ++i)   // top ring: side face i and the +z cap
+    { c.vbe.push_back(sides + i); c.vbe.push_back(sides + (i + 1u) % sides); c.fbe.push_back(i); c.fbe.push_back(sides); }
+    for (uint32_t i = 0; i < sides; ++i)   // verticals: two neighbouring side faces
+    { c.vbe.push_back(i); c.vbe.push_back(sides + i); c.fbe.push_back((i + sides - 1u) % sides); c.fbe.push_back(i); }
     // +z and -z caps
     c.planes.push_back(0.0f); c.planes.push_back(0.0f); c.planes.push_back(1.0f); c.planes.push_back(-hz);
     c.polyDescs.push_back(packPolyDesc(0u, 4u, 0u));
@@ -374,18 +462,112 @@ PXG_TEST(convexSatStages)
         cases.push_back(c);
     }
 
+    {   // 10: THE EDGE-CROSS AXIS WINS.  Without this case stage 3 runs but never
+        //     commits, so the whole tail of satEdgeCrossDirection2 -- the argmax
+        //     across lanes, the sign choice between the two overlaps, and the
+        //     EDGE_FEATURE_IDX write -- is dead code the fixture cannot see.
+        //
+        //     The triangle's first edge, (1.8,0,-1) -> (0,1.8,1), passes diagonally
+        //     across the corner of the box near x=y=1.  Crossed with any of the
+        //     box's vertical edges it yields the pure xy diagonal (1,1,0)/sqrt(2),
+        //     along which the two hulls overlap by only 0.141 -- far less than the
+        //     1.0 that the best face normal gives, so the edge axis takes the lead.
+        //
+        //     THE GATE MATTERS HERE.  The vertical edge closest to the crossing,
+        //     edge 10 at (x=1,y=1), is REJECTED: its two faces are +x and +y and
+        //     the triangle normal has a positive dot with both.  The axis arrives
+        //     from the three other vertical edges, whose faces point away.  All
+        //     three produce the identical vector (0,0,-2), so their separations are
+        //     bitwise equal and the lowest-lane rule decides -- and the lowest of
+        //     the three is lane 1, holding index 33, i.e. a value carried out of
+        //     the SECOND pass of the strided loop.
+        SatCase c; makeBox(c, 1.0f, 1.0f, 1.0f);
+        c.scale = mk(1, 1, 1); c.rot[3] = 1.0f; c.contactDist = 0.02f;
+        c.t[0] = mk(1.8f, 0.0f, -1.0f); c.t[1] = mk(0.0f, 1.8f, 1.0f); c.t[2] = mk(2.0f, 2.0f, 2.0f);
+        {
+            const V3 e1 = sub(c.t[1], c.t[0]), e2 = sub(c.t[2], c.t[0]);
+            V3 nn = cross3(e1, e2);
+            const float m = std::sqrt(dot3(nn, nn));
+            c.triN = mk(nn.x / m, nn.y / m, nn.z / m);
+        }
+        c.probeIndex = 1; c.name = "edge-cross axis wins";
+        cases.push_back(c);
+    }
+
+    {   // 11: SEPARATED BY AN EDGE-CROSS AXIS ALONE.  All six face normals and the
+        //     triangle normal overlap; only cross(box vertical edge, triangle edge)
+        //     -- again the xy diagonal -- pulls the two apart.  This is the only
+        //     case that drives `isPassed = false` and therefore the only one that
+        //     exercises the __any_sync early-out INSIDE the iteration loop.
+        //
+        //     The triangle passes diagonally outside the corner at x=y=1: its
+        //     nearest projection along (1,1,0)/sqrt(2) is 1.838, the box reaches
+        //     1.414, and contactDist is 0.02.  Three vertical edges report it, the
+        //     first at index 24 -- inside the FIRST pass -- so the loop leaves
+        //     without ever looking at indices 32..35.
+        SatCase c; makeBox(c, 1.0f, 1.0f, 1.0f);
+        c.scale = mk(1, 1, 1); c.rot[3] = 1.0f; c.contactDist = 0.02f;
+        c.t[0] = mk(2.0f, 0.6f, -2.0f); c.t[1] = mk(0.6f, 2.0f, 2.0f); c.t[2] = mk(2.0f, 2.0f, 0.0f);
+        {
+            const V3 e1 = sub(c.t[1], c.t[0]), e2 = sub(c.t[2], c.t[0]);
+            V3 nn = cross3(e1, e2);
+            const float m = std::sqrt(dot3(nn, nn));
+            c.triN = mk(nn.x / m, nn.y / m, nn.z / m);
+        }
+        c.probeIndex = 3; c.name = "separated by an edge-cross axis only";
+        cases.push_back(c);
+    }
+
+    {   // 12: THE ADJACENCY FLAGS.  Case 10's geometry again, but the triangle's
+        //     second edge is marked non-convex and its third carries a plain
+        //     neighbour index.  Every other case leaves all three at BOUNDARY, so
+        //     without this one `csIsActiveEdge` is only ever asked the BOUNDARY
+        //     question and the vStart -> adj selection is untested.
+        //
+        //     It also pins the pairing between an edge's OWN flag and the edge it
+        //     spans.  Closing the triangle the other way round -- (vStart+2)%3 --
+        //     yields the same three edge directions negated, and the stage tries
+        //     both signs anyway, so with all-BOUNDARY adjacency that mistake is
+        //     invisible.  Here it is not: vStart 0 pairs with t0->t2 instead of
+        //     t0->t1, the winning xy diagonal is never formed, and the committed
+        //     axis moves to (0, 0.832, -0.555).
+        SatCase c; makeBox(c, 1.0f, 1.0f, 1.0f);
+        c.scale = mk(1, 1, 1); c.rot[3] = 1.0f; c.contactDist = 0.02f;
+        c.t[0] = mk(1.8f, 0.0f, -1.0f); c.t[1] = mk(0.0f, 1.8f, 1.0f); c.t[2] = mk(2.0f, 2.0f, 2.0f);
+        {
+            const V3 e1 = sub(c.t[1], c.t[0]), e2 = sub(c.t[2], c.t[0]);
+            V3 nn = cross3(e1, e2);
+            const float m = std::sqrt(dot3(nn, nn));
+            c.triN = mk(nn.x / m, nn.y / m, nn.z / m);
+        }
+        c.adj[0] = BOUNDARY;                  // active: the boundary case
+        c.adj[1] = NONCONVEX_FLAG | 7u;       // inactive: a flagged neighbour
+        c.adj[2] = 5u;                        // active: a plain neighbour index
+        c.probeIndex = 1; c.name = "edge-cross with adjacency flags";
+        cases.push_back(c);
+    }
+
     const uint32_t n = uint32_t(cases.size());
     std::vector<PxgBufferHandle> hullBufs;
     std::vector<float> input;
     for (SatCase& c : cases)
     {
+        // The probe reads convexPlaneN/D at `probeIndex`, and stage 1 only writes
+        // the first nbPolygons entries of that groupshared array.  An out-of-range
+        // probe therefore reads whatever the previous dispatch left behind -- which
+        // happened to be zero in the default allocator and was NOT zero under
+        // PXG_DEVICE_V2, so the first version of the "separated by an edge-cross
+        // axis only" case passed one memory mode and failed the other.
+        PXG_CHECK_MSG(c.probeIndex < c.nbPolygons && c.probeIndex < c.nbVerts,
+                      "[%s] probeIndex %u is inside the hull (%u polygons, %u vertices)",
+                      c.name, c.probeIndex, c.nbPolygons, c.nbVerts);
         buildBlob(c);
         PxgBufferHandle hb = createBufferFrom(dev, c.hull);
         hullBufs.push_back(hb);
         const uint64_t addr = dev->getBufferDeviceAddress(hb);
 
         const size_t base = input.size();
-        input.resize(base + 112 / 4, 0.0f);
+        input.resize(base + 128 / 4, 0.0f);
         float* p = input.data() + base;
         std::memcpy(p, &addr, 8);
         std::memcpy(p + 2, &c.probeIndex, 4);
@@ -394,6 +576,7 @@ PXG_TEST(convexSatStages)
         for (uint32_t k = 0; k < 3; ++k)
         { p[12 + 4 * k] = c.t[k].x; p[13 + 4 * k] = c.t[k].y; p[14 + 4 * k] = c.t[k].z; }
         p[24] = c.triN.x; p[25] = c.triN.y; p[26] = c.triN.z;
+        std::memcpy(p + 28, c.adj, 12);   // @112 triAdjTrisIdx
     }
 
     PxgBufferHandle bIn = createBufferFrom(dev, input);
@@ -417,7 +600,7 @@ PXG_TEST(convexSatStages)
     auto same = [](float a, float b) { uint32_t x, y; std::memcpy(&x, &a, 4); std::memcpy(&y, &b, 4); return x == y; };
 
     bool sawStage1Reject = false, sawStage2Reject = false, sawBothPass = false, sawTriFeature = false;
-    bool sawManyPolys = false;
+    bool sawManyPolys = false, sawEdgeFeature = false, sawStage3 = false, sawStage3Reject = false;
     for (uint32_t i = 0; i < n; ++i)
     {
         const SatResult e = refSat(cases[i]);
@@ -430,6 +613,9 @@ PXG_TEST(convexSatStages)
         else sawBothPass = true;
         if (e.feature == TRI_FEATURE_IDX) sawTriFeature = true;
         if (cases[i].nbPolygons > 32u && e.p1) sawManyPolys = true;
+        if (e.feature == EDGE_FEATURE_IDX) sawEdgeFeature = true;
+        if (e.p3) sawStage3 = true;
+        else if (e.p2) sawStage3Reject = true;
 
         const char* nm = cases[i].name;
         auto chkU = [&](const char* w, uint32_t g, uint32_t x) {
@@ -439,6 +625,8 @@ PXG_TEST(convexSatStages)
 
         chkU("stage1", p1, e.p1 ? 1u : 0u);
         chkU("stage2", p2, e.p2 ? 1u : 0u);
+        uint32_t p3; std::memcpy(&p3, r + 3, 4);
+        chkU("stage3", p3, e.p3 ? 1u : 0u);
         if (e.p1)
         {
             chkU("feature", feat, e.feature);
@@ -462,6 +650,9 @@ PXG_TEST(convexSatStages)
     PXG_CHECK_MSG(bad == 0, "the SAT stages match the scalar oracle (%zu mismatches)", bad);
     PXG_CHECK_MSG(sawTriFeature, "some case commits the triangle normal as the axis");
     PXG_CHECK_MSG(sawManyPolys, "some case has more than 32 polygons and passes stage 1");
+    PXG_CHECK_MSG(sawStage3, "some case reaches the edge-cross stage");
+    PXG_CHECK_MSG(sawEdgeFeature, "some case commits an edge-cross axis");
+    PXG_CHECK_MSG(sawStage3Reject, "some case is rejected by the edge-cross stage alone");
     (void)sawStage2Reject;
 }
 

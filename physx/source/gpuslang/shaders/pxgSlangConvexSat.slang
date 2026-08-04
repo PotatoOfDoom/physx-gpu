@@ -79,6 +79,7 @@ import pxgSlangNpAbi;
 // pxgSlangClothMidphase re-exports pxgSlangBv32 for the same reason.
 __exported import pxgSlangConvexHull;
 
+static const uint CS_WARP = PXG_WARP_SIZE;
 public static const uint CS_MAX_VERTS_POLYS = 64u;   // CONVEX_MAX_VERTICES_POLYGONS
 public static const uint CS_TRI_FEATURE_IDX = 0x7FFFFFFFu;
 static const float CS_MAX_F32 = 3.4028234663852886e+38f;
@@ -261,6 +262,168 @@ public bool csSatTriangleNormal(uint lane, uint hullDesc, float contactDist,
         faceNormal = -n0;
         separation = _separation;
         feature = CS_TRI_FEATURE_IDX;
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// satEdgeCrossDirection2 (convexTriangle.cuh:575)
+//
+// The edge-cross axes: for every (convex edge, triangle edge) pair, the cross
+// product is a candidate separating axis.  Runs LAST, and it is the only stage
+// that READS what stage 1 wrote — `convexPlaneN` is the gate.
+//
+// FOUR THINGS THE TRANSCRIPTION KEEPS EXACTLY:
+//   1. `_separation` starts from the RUNNING BEST, not -PX_MAX_F32, so an edge
+//      axis only wins if it strictly beats the face and triangle stages.
+//   2. The two hull side-tables are read with the CUDA's little-endian trick: the
+//      edge's two vertex indices as one uint, its two face indices as one ushort.
+//      Both runs are 4-aligned from the blob base, so the packed loads are legal.
+//   3. `magSquared` and `dp` are computed and never used in the CUDA, and
+//      `convexScale`/`convexScaleRot` are loaded and never used.  Omitted: dead
+//      code cannot move an output bit.  `shapeNormal` is the RAW triangle normal —
+//      the shape2Vertex version sits commented out above it at :595.
+//   4. The `__any_sync` early-out is INSIDE the iteration loop, so a warp that
+//      finds a separating axis leaves before scanning the rest.  The loop bound is
+//      warp-uniform, so the barrier inside it is too.
+//
+// The edge-parallel guard is `v.magnitudeSquared() > 1e-10f`, recomputed rather
+// than reusing `magSquared` — same value, kept as written.
+// ---------------------------------------------------------------------------
+
+static const uint CS_BOUNDARY = 0xffffffffu;
+static const uint CS_NONCONVEX_FLAG = 0x80000000u;
+public static const uint CS_EDGE_FEATURE_IDX = 0x80000000u;
+
+// triangle.cuh:556
+bool csIsActiveEdge(uint edgeIndex)
+{
+    return edgeIndex == CS_BOUNDARY || (edgeIndex & CS_NONCONVEX_FLAG) == 0u;
+}
+
+// facesByEdges8 is byte-addressed but 4-aligned at its base, so a pair of face
+// indices is one aligned ushort.
+uint csUshortAt(uint64_t base, uint shortIndex)
+{
+    const uint64_t addr = base + uint64_t(2u * shortIndex);
+    const uint64_t aligned = (addr / 4UL) * 4UL;
+    const uint word = Ptr<uint>(aligned)[0];
+    return (word >> (8u * uint(addr - aligned))) & 0xffffu;
+}
+
+void csSupportTriangle(float3 t0, float3 t1, float3 t2, float3 dir, out float minVal, out float maxVal)
+{
+    const float d0 = dot(t0, dir), d1 = dot(t1, dir), d2 = dot(t2, dir);
+    minVal = min(d0, min(d1, d2));
+    maxVal = max(d0, max(d1, d2));
+}
+
+void csSupportConvex(uint nbVerts, float3 dir, out float minVal, out float maxVal)
+{
+    minVal = CS_MAX_F32;
+    maxVal = -CS_MAX_F32;
+    for (uint i = 0u; i < nbVerts; ++i)
+    {
+        const float d = dot(csScaledVert(i), dir);
+        minVal = min(d, minVal);
+        maxVal = max(d, maxVal);
+    }
+}
+
+public bool csSatEdgeCrossDirection2(uint lane, uint64_t vbeBase, uint64_t fbeBase,
+                                     uint nbEdges, uint nbVerts, float contactDist,
+                                     uint adj0, uint adj1, uint adj2,
+                                     float3 t0, float3 t1, float3 t2, float3 triangleLocNormal,
+                                     inout uint feature, inout float3 faceNormal,
+                                     inout float separation)
+{
+    float3 _faceNormal = faceNormal;
+    float _separation = separation;
+
+    const float3 shapeNormal = triangleLocNormal;
+
+    bool isPassed = true;
+    for (uint it = 0u; it < nbEdges * 3u; it += CS_WARP)
+    {
+        const uint index = it + lane;
+
+        if (index < nbEdges * 3u)
+        {
+            const uint vStartIndex = index % 3u;
+            const uint adj = (vStartIndex == 0u) ? adj0 : ((vStartIndex == 1u) ? adj1 : adj2);
+
+            if (csIsActiveEdge(adj))
+            {
+                const uint vEndIndex = (vStartIndex + 1u) % 3u;
+                const uint convexEdgeIdx = index / 3u;
+
+                const uint vIndices = Ptr<uint>(vbeBase)[convexEdgeIdx];
+                const uint v0idx1 = vIndices & 0xffffu;
+                const uint v1idx1 = (vIndices >> 16) & 0xffffu;
+
+                const uint fIndices = csUshortAt(fbeBase, convexEdgeIdx);
+                const uint f10 = fIndices & 0xffu;
+                const uint f11 = (fIndices >> 8) & 0xffu;
+
+                if (dot(shapeNormal, csPlaneN(f10)) < 0.0f || dot(shapeNormal, csPlaneN(f11)) < 0.0f)
+                {
+                    const float3 convexEdge = csScaledVert(v0idx1) - csScaledVert(v1idx1);
+
+                    const float3 tS = (vStartIndex == 0u) ? t0 : ((vStartIndex == 1u) ? t1 : t2);
+                    const float3 tE = (vEndIndex == 0u) ? t0 : ((vEndIndex == 1u) ? t1 : t2);
+                    const float3 triEdge = tE - tS;
+                    const float3 v = cross(convexEdge, triEdge);
+
+                    if (dot(v, v) > 1e-10f)
+                    {
+                        const float m = sqrt(dot(v, v));
+                        const float3 shapeSpaceV = (m > 0.0f) ? (v / m) : v;
+
+                        float minTri, maxTri, minConv, maxConv;
+                        csSupportTriangle(t0, t1, t2, shapeSpaceV, minTri, maxTri);
+                        csSupportConvex(nbVerts, shapeSpaceV, minConv, maxConv);
+
+                        const float tempOverlap0 = minTri - maxConv;
+                        const float tempOverlap1 = minConv - maxTri;
+
+                        if (minConv > (maxTri + contactDist) || minTri > (maxConv + contactDist))
+                        {
+                            isPassed = false;
+                        }
+                        else
+                        {
+                            if (_separation < tempOverlap0)
+                            {
+                                _separation = tempOverlap0;
+                                _faceNormal = shapeSpaceV;
+                            }
+                            if (_separation < tempOverlap1)
+                            {
+                                _separation = tempOverlap1;
+                                _faceNormal = -shapeSpaceV;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (pxgAnySync(PXG_FULL_MASK, lane, !isPassed))
+            return false;
+    }
+
+    uint winnerLane;
+    _separation = pxgWarpReduceMaxWinnerF(PXG_FULL_MASK, lane, _separation, 5u, winnerLane);
+
+    if (separation < _separation)
+    {
+        const float nx = pxgShflSyncF(PXG_FULL_MASK, lane, _faceNormal.x, int(winnerLane), CS_WARP);
+        const float ny = pxgShflSyncF(PXG_FULL_MASK, lane, _faceNormal.y, int(winnerLane), CS_WARP);
+        const float nz = pxgShflSyncF(PXG_FULL_MASK, lane, _faceNormal.z, int(winnerLane), CS_WARP);
+        faceNormal = float3(nx, ny, nz);
+        separation = _separation;
+        feature = CS_EDGE_FEATURE_IDX;
     }
 
     return true;

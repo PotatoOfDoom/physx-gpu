@@ -63,7 +63,7 @@ struct ConvexSatParams
 [[vk::push_constant]]
 ConstantBuffer<ConvexSatParams> gCs;
 
-static const uint CSB_IN_STRIDE = 112u;
+static const uint CSB_IN_STRIDE = 128u;   // @112 uint3 triAdjTrisIdx
 static const uint CSB_OUT_STRIDE = 64u;
 
 [shader("compute")]
@@ -92,6 +92,7 @@ void convexSatLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
         const float3 t1 = Ptr<float4>(inBase + 64UL)[0].xyz;
         const float3 t2 = Ptr<float4>(inBase + 80UL)[0].xyz;
         const float3 triN = Ptr<float4>(inBase + 96UL)[0].xyz;
+        const uint4 adj = Ptr<uint4>(inBase + 112UL)[0];
 
         const uint desc = chHullDesc(hull);
 
@@ -114,12 +115,22 @@ void convexSatLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
             p2 = csSatTriangleNormal(lane, desc, scaleDist.w, triN, t0,
                                      feature, faceNormal, separation);
 
+        // Stage 3 reads convexPlaneN, which stage 1 wrote, so it only runs when
+        // stage 1 accepted.  Section bases resolved by the caller, per P8.40.
+        bool p3 = false;
+        if (p1 && p2)
+            p3 = csSatEdgeCrossDirection2(lane, chVerticesByEdges16(hull, desc),
+                                          chFacesByEdges8(hull, desc),
+                                          chNbEdges(desc), chNbVerts(desc), scaleDist.w,
+                                          adj.x, adj.y, adj.z, t0, t1, t2, triN,
+                                          feature, faceNormal, separation);
+
         if (lane == 0u)
         {
             Ptr<uint>(outBase)[0] = p1 ? 1u : 0u;
             Ptr<uint>(outBase)[1] = p2 ? 1u : 0u;
             Ptr<uint>(outBase)[2] = feature;
-            Ptr<uint>(outBase)[3] = 0u;
+            Ptr<uint>(outBase)[3] = p3 ? 1u : 0u;
             Ptr<float4>(outBase + 16UL)[0] = float4(faceNormal, separation);
             Ptr<float4>(outBase + 32UL)[0] = float4(csPlaneN(probeIndex), csPlaneD(probeIndex));
             Ptr<float4>(outBase + 48UL)[0] = float4(csScaledVert(probeIndex), 0.0f);
