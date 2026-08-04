@@ -1664,10 +1664,57 @@ the same malformed hull and agreed perfectly.  Only the explicit path-coverage a
 case must pass both stages" — exposed it.  That is the second time in three tranches that a
 coverage assertion, not a value comparison, caught the real defect.
 
-Where to resume: build the same module but with the composition that is known to work — one
-module entry point per dispatch, barriers confined to a single called function, no bare barriers
-in the shader body — and see whether the crash follows the composition.  If it does, the finding
-is a platform constraint on how these ports may be structured, and it belongs in the doctrine.
+### Second pass: the composition theory is wrong too, and the reproducer will not hold still
+
+The follow-up restructured the module to `polyClipBda`'s proven shape — one module entry point
+per dispatch iteration, every barrier inside it — and it **still crashes**.  So does every one
+of these:
+
+| further hypothesis | result |
+|---|---|
+| single module call per iteration instead of three | crashes |
+| groupshared reads hoisted out of the `lane == 0` branch | crashes |
+| plain `import` instead of `__exported import` of the hull module | crashes |
+| running values as plain locals instead of `inout` struct fields | crashes |
+| the `Ptr<float4>` hull load inside the loop, stubbed to a constant | crashes |
+| the `pxgSlangNpAbi` quaternion call inside the loop, stubbed | crashes |
+| the strided loop given a lane-uniform trip count | crashes |
+| the loop replaced by a manual two-step unroll | crashes |
+| writing one groupshared array instead of three | crashes |
+| blobs padded to 256 bytes; every hull address measured 16-aligned | crashes |
+| `LP_NUM_THREADS=1` (llvmpipe fully serialised) | crashes identically — not a race |
+| `spirv-val` on the generated module | **clean**, and so is polyClipBda's |
+| total workgroup storage | 2 KB (eight 64-entry arrays), nowhere near any limit |
+
+By the end, the whole SAT was stripped out and the crash reduced to `csScaleVerts` alone:
+
+```slang
+const uint nbVerts = chNbVerts(hullDesc);
+if (lane < nbVerts)             gsCsVertX[lane]      = <float>;   // crashes
+if (lane + 32u < nbVerts)       gsCsVertX[lane + 32] = <float>;
+GroupMemoryBarrierWithGroupSync();
+```
+
+while, **in the same module, the same shader and the same dispatch**, this runs fine:
+
+```slang
+gsCsVertX[lane] = <float>;                                        // runs
+GroupMemoryBarrierWithGroupSync();
+const float v = gsCsVertX[(lane + 1u) & 31u];
+```
+
+A guarded groupshared store before a barrier is not an exotic construct — `pxgSlangPolyClip`
+does exactly that in `pcAddContacts` and works.  **The reproducer moves as the surrounding code
+changes**: never-taken `continue` branches made it vanish, removing them brought it back, and
+each successful reduction step relocated rather than shrank the trigger.  That is the signature
+of a codegen defect whose manifestation depends on whole-module output, not of a nameable
+construct, and it is why bisecting DOWN from the port has stopped paying.
+
+Where to resume, and the method matters: build UP from the fragment that is known to run, one
+statement at a time, in a dedicated scratch shader — instead of reducing down from the port.
+The first version that crashes is then the minimal reproducer by construction, and it can be
+taken to slangc or to Mesa as a bug report rather than worked around blind.  Until that exists,
+the SAT tranche stays out of the tree.
 
 ## P8.39 — the cooked convex-hull blob reader, plus a survey of what the core kernel actually needs
 
