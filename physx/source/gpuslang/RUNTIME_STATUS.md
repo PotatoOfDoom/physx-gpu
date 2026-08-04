@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **685/685** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **686/686** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1622,6 +1622,86 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
+
+## P8.42 — the SAT driver and the face selection the clipper consumes
+
+`convexMeshSAT` (`convexTriangle.cuh:868`), `delayGenerateContact` (:1402) and
+`selectPolygonFeatureIndex` (:1420): the piece that turns a SAT verdict into the one or two
+convex faces `polyClip` runs against.  With this, everything between the hull blob and the
+already-ported clipper exists.
+
+### Three things in the driver that are not visible from the call sequence
+
+- **The barrier sits BEFORE the first early return.**  Stage 1 writes `convexPlaneN/D` and the
+  CUDA's `__syncwarp()` at :877 is ahead of `if (!passedSAT) return false`.  `passedSAT` is
+  warp-uniform, so every lane reaches it whatever stage 1 decided; moving it after the return
+  would put a barrier in divergent control flow, which on llvmpipe hangs rather than errors.
+- **The three seeds are the caller's** (:1649-1651), folded in here because
+  `convexTriangleContactGen` is the only caller.  `minNormal` is seeded with `+PX_MAX_REAL` in
+  ALL THREE components — not the zero vector the per-stage fixture uses.
+- **Only a convex FACE axis can delay contacts.**  If the winner was the triangle normal or an
+  edge cross, `delayGenerateContact` is false whatever the geometry.
+
+### selectPolygonFeatureIndex, where every mistake is quiet
+
+- `maxDpSq` is seeded with `minProj * minProj` — the REDUCED, warp-uniform best face
+  projection.  An edge only displaces the face if it beats the face's own alignment, so the
+  seed is the comparison's floor, not merely an initial value.
+- the edge test is `sqDp > maxDpSq * enMagSq` but the store is `sqDp / enMagSq`.  Multiplying
+  on one side and dividing on the other is how the CUDA compares normalised alignments without
+  normalising `edgeN`.
+- `maxDpSq2` starts at `-10.0f`, below any squared dot product, so the first neighbour of the
+  winning face a lane meets always takes it.
+- the second reduction is skipped entirely when an edge won, because the two faces then come
+  from the edge itself.
+
+### The fixture: a shared case list, and why the box was not enough
+
+The case list is now shared by both tests in the file — `convexSatStages` checks the three SAT
+stages one at a time, `convexSelectFace` checks the driver and the selection that runs on their
+result — so a case added to sharpen one is automatically under the other's oracle.
+
+The first sweep came back **12/24**, and the reason was one property of the fixture hull rather
+than twelve separate gaps.  **Every box edge joins two PERPENDICULAR faces, so every box edge
+normal has the same squared length, 2.**  With `enMagSq` constant, `sqDp > maxDpSq * enMagSq`
+and `sqDp > maxDpSq / enMagSq` order the edges identically, the seed's scale stops mattering,
+and four mutations become invisible at once.  Three cases against the 34-polygon drum — whose
+edges join two side faces 11.25 degrees apart (`enMagSq` about 3.92) or a side face and a cap
+(exactly 2) — killed six survivors between them.
+
+Two more cases close a different gap.  Every stage-1 rejection in the fixture was ALSO a
+stage-2 rejection, so a driver that ignored stage 1's verdict still returned "did not pass" and
+read as correct.  A triangle out at x in [-3, -1.5] is rejected by the -x face while its own
+normal axis still overlaps, and a large slanted triangle whose plane misses the box is rejected
+by the triangle stage while every face and edge-cross axis overlaps.  `convexSatStages` now
+asserts both rejections, which it previously tracked and threw away.
+
+### What the driver leaves behind when the SAT fails is asserted too
+
+That still left the stage-1 mutant alive, and the fix was not another case but a stronger
+oracle.  `convexMeshSAT` returns by reference and does not undo a commit: a pair rejected by
+stage 2 or 3 carries whatever stage 1 wrote, and ONLY a stage-1 rejection leaves the caller's
+seeds untouched.  Asserting those outputs unconditionally — rather than only when the SAT
+passed — is what makes "ran a stage it should have skipped" observable at all, and it killed
+both the ignored-verdict mutant and the wrong-seed one.
+
+### Sweep 21/24
+
+The three survivors are argued:
+
+- **S1**, dropping the driver's barrier — redundant on this platform because stage 1's last
+  groupshared write is followed by `pxgAnySync`, whose emulation already carries a barrier that
+  every lane reaches before the array is read.  The explicit one is kept because it is what the
+  CUDA has and because that helper's internals are not a contract.
+- **S10**, seeding the face argmax with 0 instead of `-PX_MAX_REAL` — for a CLOSED hull the
+  face normals positively span R³, so some face always has a strictly positive dot with any
+  direction and the seed can never survive the loop.
+- **S18**, seeding the neighbour search with 0 instead of `-10.0f` — the quantity compared is a
+  SQUARE, so the two seeds differ only when the best neighbour's alignment is exactly zero.
+
+Suite **686/686 in both memory modes** — one test more than P8.41, the new `convexSelect`.
+Still no manifest entry and no ABI row; the next tranche is the emit stage that turns the
+clipped contacts into the engine's output buffers.
 
 ## P8.41 — satEdgeCrossDirection2, the third and last SAT stage
 

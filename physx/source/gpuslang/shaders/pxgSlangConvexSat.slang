@@ -428,3 +428,189 @@ public bool csSatEdgeCrossDirection2(uint lane, uint64_t vbeBase, uint64_t fbeBa
 
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// convexMeshSAT (convexTriangle.cuh:868), doEdgeEdge = true
+//
+// The three-stage driver.  Two things about it are load-bearing and neither is
+// obvious from the call sequence:
+//
+//   1. THE BARRIER SITS BEFORE THE FIRST EARLY RETURN.  `satConvexFaceNormals`
+//      writes `convexPlaneN/D`, and the CUDA's `__syncwarp()` at :877 is placed
+//      ahead of the `if (!passedSAT) return false`.  `passedSAT` is warp-uniform,
+//      so every lane reaches that barrier whatever stage 1 decided — moving it
+//      after the return would put a barrier in divergent control flow, which on
+//      llvmpipe hangs rather than errors (the P8.38 rule).
+//   2. The three seeds are the CALLER's (:1649-1651) and they are folded in here
+//      because `convexTriangleContactGen` is the only caller and it always
+//      supplies exactly these.  `minNormal` is seeded with +PX_MAX_REAL in ALL
+//      THREE components, not with a zero vector.
+// ---------------------------------------------------------------------------
+public bool csConvexMeshSAT(uint lane, uint64_t hull, uint hullDesc, float3 scale, float4 scaleRot,
+                            float contactDist, float3 t0, float3 t1, float3 t2, float3 triangleLocNormal,
+                            uint adj0, uint adj1, uint adj2,
+                            out uint featureIndex, out float separation, out float3 minNormal)
+{
+    featureIndex = 0xffffffffu;
+    separation = -CS_MAX_F32;
+    minNormal = float3(CS_MAX_F32, CS_MAX_F32, CS_MAX_F32);
+
+    bool passedSAT = csSatConvexFaceNormals(lane, hull, hullDesc, scale, scaleRot, contactDist,
+                                            t0, t1, t2, featureIndex, minNormal, separation);
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (!passedSAT)
+        return false;
+
+    passedSAT = csSatTriangleNormal(lane, hullDesc, contactDist, triangleLocNormal, t0,
+                                    featureIndex, minNormal, separation);
+
+    if (!passedSAT)
+        return false;
+
+    return csSatEdgeCrossDirection2(lane, chVerticesByEdges16(hull, hullDesc),
+                                    chFacesByEdges8(hull, hullDesc),
+                                    chNbEdges(hullDesc), chNbVerts(hullDesc), contactDist,
+                                    adj0, adj1, adj2, t0, t1, t2, triangleLocNormal,
+                                    featureIndex, minNormal, separation);
+}
+
+// ---------------------------------------------------------------------------
+// delayGenerateContact (convexTriangle.cuh:1402)
+//
+// Whether the pair goes to the second-pass buffer instead of generating contacts
+// now.  Only a CONVEX FACE axis can be delayed: if the winner was the triangle
+// normal or an edge cross, the answer is false whatever the geometry.  The test
+// is against the NEGATED triangle normal, and 0.707106781f is the literal in the
+// CUDA — not `sqrtf(0.5f)`, which differs in the last bit.
+// ---------------------------------------------------------------------------
+public bool csDelayGenerateContact(float3 minNormal, float3 triangleLocNormal, uint featureIndex)
+{
+    if (featureIndex != CS_EDGE_FEATURE_IDX && featureIndex != CS_TRI_FEATURE_IDX)
+    {
+        const float3 triLocNormal = -triangleLocNormal;
+        const float cosTheta = dot(minNormal, triLocNormal);
+        const float threshold = 0.707106781f;   // about 45 degrees
+        return cosTheta < threshold;
+    }
+
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// selectPolygonFeatureIndex (convexTriangle.cuh:1420)
+//
+// Turns the SAT winner into the ONE OR TWO convex faces the clipper runs against.
+// If the winner was already a face index there is nothing to do and `polyIndex2`
+// keeps the caller's 0xFFFFFFFF.  Otherwise three warp reductions run, and the
+// ways they can be got wrong are all quiet:
+//
+//   * `maxDpSq` is SEEDED WITH `minProj * minProj` — the REDUCED, warp-uniform
+//     best face projection, not the lane's own.  An edge only displaces the face
+//     if it beats the face's own alignment, so the seed is the comparison's
+//     floor and not merely an initial value.
+//   * the edge test is `sqDp > maxDpSq * enMagSq` but the STORE is
+//     `sqDp / enMagSq`.  Multiplying on one side and dividing on the other is
+//     how the CUDA compares normalised alignments without normalising `edgeN`,
+//     and the two spellings are not interchangeable once `enMagSq != 1`.
+//   * `maxDpSq2` starts at -10.0f, which is below any squared dot product, so
+//     the FIRST neighbour of `polyFaceIndex` a lane meets always takes it.
+//   * the second reduction is skipped entirely when an edge won, because the two
+//     faces then come from the edge itself.  `closestEdge` is warp-uniform after
+//     its shuffle, so that branch is uniform and the barrier inside the reduction
+//     in the other arm is safe.
+//
+// `polyIndex2` is `inout`: the caller seeds it with 0xFFFFFFFF (:1698) and the
+// no-edge arm broadcasts the winner's value, which may still be that seed if no
+// lane ever saw a neighbour.
+// ---------------------------------------------------------------------------
+public uint csSelectPolygonFeatureIndex(uint lane, uint64_t hull, uint hullDesc, float3 minNormal,
+                                        uint featureIndex, inout uint polyIndex2)
+{
+    uint polyFaceIndex = featureIndex;
+
+    if (featureIndex == CS_TRI_FEATURE_IDX || featureIndex == CS_EDGE_FEATURE_IDX)
+    {
+        const uint nbPolygons0 = chNbPolygons(hullDesc);
+
+        float minProj = -CS_MAX_F32;
+        uint bestConvexFaceIndex = 0u;
+
+        for (uint i = lane; i < nbPolygons0; i += CS_WARP)
+        {
+            const float proj = dot(minNormal, csPlaneN(i));
+            if (minProj < proj)
+            {
+                minProj = proj;
+                bestConvexFaceIndex = i;
+            }
+        }
+
+        uint winnerLane;
+        minProj = pxgWarpReduceMaxWinnerF(PXG_FULL_MASK, lane, minProj, 5u, winnerLane);
+        polyFaceIndex = pxgShflSyncU(PXG_FULL_MASK, lane, bestConvexFaceIndex, int(winnerLane), CS_WARP);
+
+        const uint nbEdges = chNbEdges(hullDesc);
+        const uint64_t fbeBase = chFacesByEdges8(hull, hullDesc);
+
+        uint closestEdge = 0xFFFFFFFFu;
+        float maxDpSq = minProj * minProj;
+        float maxDpSq2 = -10.0f;
+
+        for (uint i = lane; i < nbEdges; i += CS_WARP)
+        {
+            const uint fIndices = csUshortAt(fbeBase, i);
+            const uint f0 = fIndices & 0xffu;
+            const uint f1 = (fIndices >> 8) & 0xffu;
+
+            const float3 edgeN = csPlaneN(f0) + csPlaneN(f1);
+            const float enMagSq = dot(edgeN, edgeN);
+            const float dp = dot(edgeN, minNormal);
+            const float sqDp = dp * dp;
+
+            if ((f0 == polyFaceIndex || f1 == polyFaceIndex) && (sqDp > maxDpSq2))
+            {
+                maxDpSq2 = sqDp;
+                polyIndex2 = (f0 == polyFaceIndex) ? f1 : f0;
+            }
+
+            if (dp > 0.0f && sqDp > (maxDpSq * enMagSq))
+            {
+                maxDpSq = sqDp / enMagSq;
+                closestEdge = i;
+            }
+        }
+
+        maxDpSq = pxgWarpReduceMaxWinnerF(PXG_FULL_MASK, lane, maxDpSq, 5u, winnerLane);
+        closestEdge = pxgShflSyncU(PXG_FULL_MASK, lane, closestEdge, int(winnerLane), CS_WARP);
+
+        if (closestEdge != 0xFFFFFFFFu)
+        {
+            const uint fIndices = csUshortAt(fbeBase, closestEdge);
+            const uint f0 = fIndices & 0xffu;
+            const uint f1 = (fIndices >> 8) & 0xffu;
+
+            const float dp0 = dot(csPlaneN(f0), minNormal);
+            const float dp1 = dot(csPlaneN(f1), minNormal);
+
+            if (dp0 > dp1)
+            {
+                polyFaceIndex = f0;
+                polyIndex2 = f1;
+            }
+            else
+            {
+                polyFaceIndex = f1;
+                polyIndex2 = f0;
+            }
+        }
+        else
+        {
+            maxDpSq2 = pxgWarpReduceMaxWinnerF(PXG_FULL_MASK, lane, maxDpSq2, 5u, winnerLane);
+            polyIndex2 = pxgShflSyncU(PXG_FULL_MASK, lane, polyIndex2, int(winnerLane), CS_WARP);
+        }
+    }
+
+    return polyFaceIndex;
+}

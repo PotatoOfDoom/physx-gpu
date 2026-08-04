@@ -58,6 +58,7 @@ const uint32_t NONCONVEX_FLAG = 0x80000000u;
 struct V3 { float x, y, z; };
 V3 mk(float x, float y, float z) { return V3{ x, y, z }; }
 V3 sub(V3 a, V3 b) { return mk(a.x - b.x, a.y - b.y, a.z - b.z); }
+V3 add(V3 a, V3 b) { return mk(a.x + b.x, a.y + b.y, a.z + b.z); }
 float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 V3 cross3(V3 a, V3 b)
 { return mk(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
@@ -148,6 +149,9 @@ struct SatResult
     V3 faceNormal{};
     float separation = -MAXF;
     V3 planeN{}; float planeD = 0.0f;
+    // the whole shape-space plane-normal array stage 1 left in groupshared, which
+    // selectPolygonFeatureIndex reads back -- not just the probed entry
+    std::vector<V3> planeAll;
     V3 scaledVert{};
 };
 
@@ -193,6 +197,7 @@ SatResult refSat(const SatCase& c)
     bool anyDisjoint = false;
     for (uint32_t l = 0; l < LANES; ++l) anyDisjoint = anyDisjoint || lDisjoint[l];
 
+    r.planeAll = planeN;
     r.planeN = planeN[c.probeIndex];
     r.planeD = planeD[c.probeIndex];
     r.scaledVert = (c.probeIndex < c.nbVerts) ? sv[c.probeIndex] : mk(0.0f, 0.0f, 0.0f);
@@ -372,12 +377,12 @@ void makeDrum(SatCase& c, uint32_t sides, float r, float hz)
 
 struct SatPush { uint64_t input, output; uint32_t numCases, pad; };
 
-PXG_TEST(convexSatStages)
+// The case list is shared by both tests in this file: convexSatStages checks the
+// three SAT stages one at a time, convexSelectFace checks the driver plus the
+// face selection that runs on their result.  Sharing it means a case added to
+// sharpen one is automatically under the other's oracle too.
+void buildCases(std::vector<SatCase>& cases)
 {
-    PxgSlangComputeDevice* dev = testDevice();
-
-    std::vector<SatCase> cases;
-
     {   // 1: the triangle sits well above the box -> stage 1 separates
         SatCase c; makeBox(c, 1.0f, 1.0f, 1.0f);
         c.scale = mk(1, 1, 1); c.rot[3] = 1.0f; c.contactDist = 0.01f;
@@ -547,6 +552,130 @@ PXG_TEST(convexSatStages)
         cases.push_back(c);
     }
 
+    {   // 13: THE OTHER ARM OF selectPolygonFeatureIndex.  When the SAT winner is
+        //     the triangle normal or an edge cross, the selection first picks the
+        //     best-aligned convex face and then asks whether some EDGE normal is
+        //     better still.  In every case above the answer is yes, so the arm that
+        //     instead keeps the face and looks for its best NEIGHBOUR never runs.
+        //
+        //     Which arm wins is a cone, and for a box it is a sharp one.  Write t
+        //     for the angle between the winning axis and the nearest face normal.
+        //     A box edge normal is the sum of two perpendicular face normals, so
+        //     its squared normalised alignment is (1 + sin 2t)/2 against the face's
+        //     cos^2 t = (1 + cos 2t)/2: the edge wins exactly when t > 22.5 deg.
+        //     This triangle is nearly parallel to the +x face, which puts the
+        //     triangle-normal axis about 9 deg off it -- inside the cone, so no
+        //     edge can displace the face and the neighbour arm runs.
+        SatCase c; makeBox(c, 1.0f, 1.0f, 1.0f);
+        c.scale = mk(1, 1, 1); c.rot[3] = 1.0f; c.contactDist = 0.02f;
+        c.t[0] = mk(1.0f, -0.5f, 2.0f); c.t[1] = mk(0.5f, 1.0f, -2.0f); c.t[2] = mk(0.5f, -2.0f, -0.5f);
+        {
+            const V3 e1 = sub(c.t[1], c.t[0]), e2 = sub(c.t[2], c.t[0]);
+            V3 nn = cross3(e1, e2);
+            const float m = std::sqrt(dot3(nn, nn));
+            c.triN = mk(nn.x / m, nn.y / m, nn.z / m);
+        }
+        c.probeIndex = 0; c.name = "face keeps its best neighbour";
+        cases.push_back(c);
+    }
+
+    {   // 14: REJECTED BY THE FACE STAGE AND BY NOTHING ELSE.  A small triangle
+        //     sitting out at x in [-3, -1.5]: the -x face separates the pair, but
+        //     the triangle's own normal axis still overlaps the box, so a driver
+        //     that ran stage 2 anyway would come back with the same verdict for
+        //     the wrong reason.  Every earlier stage-1 rejection is also a stage-2
+        //     rejection, which is why this case exists.
+        SatCase c; makeBox(c, 1.0f, 1.0f, 1.0f);
+        c.scale = mk(1, 1, 1); c.rot[3] = 1.0f; c.contactDist = 0.02f;
+        c.t[0] = mk(-3.0f, 0.0f, -1.5f); c.t[1] = mk(-2.5f, 1.0f, -1.5f); c.t[2] = mk(-1.5f, 1.0f, -0.5f);
+        {
+            const V3 e1 = sub(c.t[1], c.t[0]), e2 = sub(c.t[2], c.t[0]);
+            V3 nn = cross3(e1, e2);
+            const float m = std::sqrt(dot3(nn, nn));
+            c.triN = mk(nn.x / m, nn.y / m, nn.z / m);
+        }
+        c.probeIndex = 1; c.name = "rejected by the face stage alone";
+        cases.push_back(c);
+    }
+
+    {   // 15: REJECTED BY THE TRIANGLE-NORMAL STAGE AND BY NOTHING ELSE.  Every
+        //     face axis overlaps and every edge-cross axis overlaps; only the
+        //     triangle's own plane separates the pair.  The mirror of case 14, and
+        //     the reason both exist is the same: without them a driver that
+        //     ignored a stage's verdict would still report the right answer.
+        SatCase c; makeBox(c, 1.0f, 1.0f, 1.0f);
+        c.scale = mk(1, 1, 1); c.rot[3] = 1.0f; c.contactDist = 0.02f;
+        c.t[0] = mk(-1.0f, -3.0f, -2.5f); c.t[1] = mk(1.0f, 0.5f, -1.5f); c.t[2] = mk(2.5f, -2.5f, 1.0f);
+        {
+            const V3 e1 = sub(c.t[1], c.t[0]), e2 = sub(c.t[2], c.t[0]);
+            V3 nn = cross3(e1, e2);
+            const float m = std::sqrt(dot3(nn, nn));
+            c.triN = mk(nn.x / m, nn.y / m, nn.z / m);
+        }
+        c.probeIndex = 2; c.name = "rejected by the triangle stage alone";
+        cases.push_back(c);
+    }
+
+    // Cases 16-18 all run the face SELECTION against the 34-polygon drum rather
+    // than the box, and the reason is one property the box does not have.  Every
+    // box edge joins two perpendicular faces, so every edge normal has the same
+    // squared length, 2.  selectPolygonFeatureIndex compares `sqDp > maxDpSq *
+    // enMagSq` and stores `sqDp / enMagSq`; with a single constant enMagSq the
+    // multiply and the divide are interchangeable and so is the seed's scale.
+    // The drum's edges join two side faces 11.25 degrees apart (enMagSq ~ 3.92)
+    // or a side face and a cap (enMagSq = 2), so the two are told apart.
+    {   // 16: the seed's scale and the multiply/divide asymmetry, plus the order
+        //     of the winning edge's two faces
+        SatCase c; makeDrum(c, 32u, 1.0f, 1.0f);
+        c.scale = mk(1, 1, 1); c.rot[3] = 1.0f; c.contactDist = 0.02f;
+        c.t[0] = mk(1.5f, 0.0f, -2.5f); c.t[1] = mk(0.5f, -2.0f, 2.0f); c.t[2] = mk(-1.5f, 0.5f, 3.0f);
+        {
+            const V3 e1 = sub(c.t[1], c.t[0]), e2 = sub(c.t[2], c.t[0]);
+            V3 nn = cross3(e1, e2);
+            const float m = std::sqrt(dot3(nn, nn));
+            c.triN = mk(nn.x / m, nn.y / m, nn.z / m);
+        }
+        c.probeIndex = 33; c.name = "drum: triangle axis selects a face";
+        cases.push_back(c);
+    }
+    {   // 17: the winning face is owned by a lane other than 0, which a 6-polygon
+        //     box cannot show once the edge arm overwrites the answer anyway
+        SatCase c; makeDrum(c, 32u, 1.0f, 1.0f);
+        c.scale = mk(1, 1, 1); c.rot[3] = 1.0f; c.contactDist = 0.02f;
+        c.t[0] = mk(2.5f, 1.5f, 0.5f); c.t[1] = mk(-1.0f, 2.5f, 0.5f); c.t[2] = mk(-0.5f, -2.0f, -0.5f);
+        {
+            const V3 e1 = sub(c.t[1], c.t[0]), e2 = sub(c.t[2], c.t[0]);
+            V3 nn = cross3(e1, e2);
+            const float m = std::sqrt(dot3(nn, nn));
+            c.triN = mk(nn.x / m, nn.y / m, nn.z / m);
+        }
+        c.probeIndex = 20; c.name = "drum: the winner is not lane 0";
+        cases.push_back(c);
+    }
+    {   // 18: an EDGE feature into the selection, with the edge comparison's seed
+        //     doing real work -- from -PX_MAX_REAL a different edge wins
+        SatCase c; makeDrum(c, 32u, 1.0f, 1.0f);
+        c.scale = mk(1, 1, 1); c.rot[3] = 1.0f; c.contactDist = 0.02f;
+        c.t[0] = mk(3.0f, -0.5f, -1.0f); c.t[1] = mk(1.5f, 0.5f, 2.0f); c.t[2] = mk(0.0f, -0.5f, -2.5f);
+        {
+            const V3 e1 = sub(c.t[1], c.t[0]), e2 = sub(c.t[2], c.t[0]);
+            V3 nn = cross3(e1, e2);
+            const float m = std::sqrt(dot3(nn, nn));
+            c.triN = mk(nn.x / m, nn.y / m, nn.z / m);
+        }
+        c.probeIndex = 5; c.name = "drum: edge axis selects two faces";
+        cases.push_back(c);
+    }
+
+}
+
+PXG_TEST(convexSatStages)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    std::vector<SatCase> cases;
+    buildCases(cases);
+
     const uint32_t n = uint32_t(cases.size());
     std::vector<PxgBufferHandle> hullBufs;
     std::vector<float> input;
@@ -653,7 +782,235 @@ PXG_TEST(convexSatStages)
     PXG_CHECK_MSG(sawStage3, "some case reaches the edge-cross stage");
     PXG_CHECK_MSG(sawEdgeFeature, "some case commits an edge-cross axis");
     PXG_CHECK_MSG(sawStage3Reject, "some case is rejected by the edge-cross stage alone");
-    (void)sawStage2Reject;
+    PXG_CHECK_MSG(sawStage2Reject, "some case is rejected by the triangle-normal stage");
+}
+
+// ===========================================================================
+// convexMeshSAT + delayGenerateContact + selectPolygonFeatureIndex
+// ===========================================================================
+
+struct SelectResult
+{
+    bool passed = false, delayContacts = false;
+    // which arm of selectPolygonFeatureIndex produced faceIndex2: an edge that
+    // beat every face, or the best neighbour of the winning face
+    bool ranSelect = false, edgeBeatFace = false;
+    uint32_t featureIndex = 0xffffffffu;
+    uint32_t faceIndex1 = 0xFFFFFFFFu, faceIndex2 = 0xFFFFFFFFu;
+    float separation = -MAXF;
+    V3 minNormal{};
+};
+
+// The scalar 32-lane simulation of the driver's tail.  refSat already reproduces
+// the three stages, so this reuses its result rather than re-deriving it: the
+// point under test here is what happens AFTER the SAT, and re-simulating the SAT
+// would let a mistake in the copy hide a mistake in the port.
+SelectResult refSelect(const SatCase& c)
+{
+    SelectResult r;
+    const SatResult sat = refSat(c);
+
+    r.passed = sat.p1 && sat.p2 && sat.p3;
+
+    // WHAT THE DRIVER LEAVES BEHIND WHEN THE SAT FAILS IS OBSERVABLE, and the
+    // fixture asserts it.  convexMeshSAT returns by reference and does not undo a
+    // commit: a pair rejected by stage 2 or stage 3 still carries whatever stage 1
+    // wrote, and only a stage-1 rejection leaves the caller's seeds untouched.
+    // Those seeds are the driver's own -- separation -PX_MAX_REAL, feature
+    // 0xffffffff, and minNormal +PX_MAX_REAL in ALL THREE components, which is not
+    // the zero vector the per-stage fixture uses.
+    //
+    // Asserting them is what makes a driver that ignores a stage's verdict
+    // visible.  Without it, running stage 2 after stage 1 already rejected still
+    // yields "did not pass", and the mistake reads as correct.
+    if (sat.p1)
+    {
+        r.featureIndex = sat.feature;
+        r.separation = sat.separation;
+        r.minNormal = sat.faceNormal;
+    }
+    else
+    {
+        r.featureIndex = 0xffffffffu;
+        r.separation = -MAXF;
+        r.minNormal = mk(MAXF, MAXF, MAXF);
+    }
+
+    if (!r.passed)
+        return r;
+
+    // delayGenerateContact
+    if (r.featureIndex != EDGE_FEATURE_IDX && r.featureIndex != TRI_FEATURE_IDX)
+    {
+        const V3 triLocNormal = mk(-c.triN.x, -c.triN.y, -c.triN.z);
+        r.delayContacts = dot3(r.minNormal, triLocNormal) < 0.707106781f;
+    }
+
+    // selectPolygonFeatureIndex.  The plane normals are the ones stage 1 stored,
+    // which refSat hands back through sat.planeAll -- the same array the shader
+    // reads out of groupshared.
+    r.faceIndex1 = r.featureIndex;
+    if (r.featureIndex == TRI_FEATURE_IDX || r.featureIndex == EDGE_FEATURE_IDX)
+    {
+        r.ranSelect = true;
+        float lProj[LANES]; uint32_t lBest[LANES];
+        for (uint32_t l = 0; l < LANES; ++l) { lProj[l] = -MAXF; lBest[l] = 0; }
+        for (uint32_t l = 0; l < LANES; ++l)
+            for (uint32_t i = l; i < c.nbPolygons; i += LANES)
+            {
+                const float proj = dot3(r.minNormal, sat.planeAll[i]);
+                if (lProj[l] < proj) { lProj[l] = proj; lBest[l] = i; }
+            }
+        float minProj = -MAXF;
+        for (uint32_t l = 0; l < LANES; ++l) minProj = std::fmax(minProj, lProj[l]);
+        uint32_t w = 0;
+        for (uint32_t l = 0; l < LANES; ++l) if (lProj[l] == minProj) { w = l; break; }
+        r.faceIndex1 = lBest[w];
+
+        float lDp[LANES], lDp2[LANES]; uint32_t lEdge[LANES], lP2[LANES];
+        for (uint32_t l = 0; l < LANES; ++l)
+        { lDp[l] = minProj * minProj; lDp2[l] = -10.0f; lEdge[l] = 0xFFFFFFFFu; lP2[l] = 0xFFFFFFFFu; }
+
+        for (uint32_t l = 0; l < LANES; ++l)
+            for (uint32_t i = l; i < c.nbEdges; i += LANES)
+            {
+                const uint32_t f0 = c.fbe[2 * i + 0], f1 = c.fbe[2 * i + 1];
+                const V3 edgeN = add(sat.planeAll[f0], sat.planeAll[f1]);
+                const float enMagSq = dot3(edgeN, edgeN);
+                const float dp = dot3(edgeN, r.minNormal);
+                const float sqDp = dp * dp;
+                if ((f0 == r.faceIndex1 || f1 == r.faceIndex1) && (sqDp > lDp2[l]))
+                { lDp2[l] = sqDp; lP2[l] = (f0 == r.faceIndex1) ? f1 : f0; }
+                if (dp > 0.0f && sqDp > (lDp[l] * enMagSq))
+                { lDp[l] = sqDp / enMagSq; lEdge[l] = i; }
+            }
+
+        float maxDpSq = -MAXF;
+        for (uint32_t l = 0; l < LANES; ++l) maxDpSq = std::fmax(maxDpSq, lDp[l]);
+        w = 0;
+        for (uint32_t l = 0; l < LANES; ++l) if (lDp[l] == maxDpSq) { w = l; break; }
+        const uint32_t closestEdge = lEdge[w];
+
+        if (closestEdge != 0xFFFFFFFFu)
+        {
+            r.edgeBeatFace = true;
+            const uint32_t f0 = c.fbe[2 * closestEdge + 0], f1 = c.fbe[2 * closestEdge + 1];
+            const float dp0 = dot3(sat.planeAll[f0], r.minNormal);
+            const float dp1 = dot3(sat.planeAll[f1], r.minNormal);
+            if (dp0 > dp1) { r.faceIndex1 = f0; r.faceIndex2 = f1; }
+            else           { r.faceIndex1 = f1; r.faceIndex2 = f0; }
+        }
+        else
+        {
+            float maxDpSq2 = -MAXF;
+            for (uint32_t l = 0; l < LANES; ++l) maxDpSq2 = std::fmax(maxDpSq2, lDp2[l]);
+            w = 0;
+            for (uint32_t l = 0; l < LANES; ++l) if (lDp2[l] == maxDpSq2) { w = l; break; }
+            r.faceIndex2 = lP2[w];
+        }
+    }
+    return r;
+}
+
+PXG_TEST(convexSelectFace)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    std::vector<SatCase> cases;
+    buildCases(cases);
+
+    const uint32_t n = uint32_t(cases.size());
+    std::vector<PxgBufferHandle> hullBufs;
+    std::vector<float> input;
+    for (SatCase& c : cases)
+    {
+        buildBlob(c);
+        PxgBufferHandle hb = createBufferFrom(dev, c.hull);
+        hullBufs.push_back(hb);
+        const uint64_t addr = dev->getBufferDeviceAddress(hb);
+
+        const size_t base = input.size();
+        input.resize(base + 128 / 4, 0.0f);
+        float* p = input.data() + base;
+        std::memcpy(p, &addr, 8);
+        std::memcpy(p + 2, &c.probeIndex, 4);
+        p[4] = c.scale.x; p[5] = c.scale.y; p[6] = c.scale.z; p[7] = c.contactDist;
+        p[8] = c.rot[0]; p[9] = c.rot[1]; p[10] = c.rot[2]; p[11] = c.rot[3];
+        for (uint32_t k = 0; k < 3; ++k)
+        { p[12 + 4 * k] = c.t[k].x; p[13 + 4 * k] = c.t[k].y; p[14 + 4 * k] = c.t[k].z; }
+        p[24] = c.triN.x; p[25] = c.triN.y; p[26] = c.triN.z;
+        std::memcpy(p + 28, c.adj, 12);
+    }
+
+    PxgBufferHandle bIn = createBufferFrom(dev, input);
+    std::vector<float> outInit(size_t(n) * (32 / 4), -12345.0f);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+
+    SatPush push{};
+    push.input = dev->getBufferDeviceAddress(bIn);
+    push.output = dev->getBufferDeviceAddress(bOut);
+    push.numCases = n;
+
+    {
+        Kernel k("convexSatBda.spv", "convexSelectLaunch", {}, sizeof(SatPush));
+        k.dispatch(n, {}, push, 1u, 1u);
+        dev->flush();
+    }
+
+    const auto got = downloadBuffer<float>(dev, bOut, outInit.size());
+
+    size_t bad = 0;
+    auto same = [](float a, float b) { uint32_t x, y; std::memcpy(&x, &a, 4); std::memcpy(&y, &b, 4); return x == y; };
+
+    bool sawDelay = false, sawNoDelay = false, sawTwoFaces = false, sawEdgePick = false;
+    bool sawFacePassthrough = false, sawSelectRun = false, sawNeighbourPick = false;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        const SelectResult e = refSelect(cases[i]);
+        const float* r = got.data() + size_t(i) * (32 / 4);
+        uint32_t passed, feat, delay, f1, f2;
+        std::memcpy(&passed, r + 0, 4); std::memcpy(&feat, r + 1, 4);
+        std::memcpy(&delay, r + 2, 4);  std::memcpy(&f1, r + 3, 4);
+        std::memcpy(&f2, r + 4, 4);
+
+        if (e.passed)
+        {
+            if (e.delayContacts) sawDelay = true; else sawNoDelay = true;
+            if (e.ranSelect) sawSelectRun = true; else sawFacePassthrough = true;
+            if (e.faceIndex2 != 0xFFFFFFFFu) sawTwoFaces = true;
+            if (e.ranSelect) { if (e.edgeBeatFace) sawEdgePick = true; else sawNeighbourPick = true; }
+        }
+
+        const char* nm = cases[i].name;
+        auto chkU = [&](const char* w, uint32_t g, uint32_t x) {
+            if (g != x) { ++bad; if (bad <= 12) std::printf("  [%s] %s: got=%u exp=%u\n", nm, w, g, x); } };
+        auto chkF = [&](const char* w, float g, float x) {
+            if (!same(g, x)) { ++bad; if (bad <= 12) std::printf("  [%s] %s: got=%.9g exp=%.9g\n", nm, w, g, x); } };
+
+        chkU("satPassed", passed, e.passed ? 1u : 0u);
+        chkU("featureIndex", feat, e.featureIndex);
+        chkF("separation", r[5], e.separation);
+        chkF("minNormal.x", r[6], e.minNormal.x);
+        chkF("minNormal.y", r[7], e.minNormal.y);
+        if (e.passed)
+        {
+            chkU("delayContacts", delay, e.delayContacts ? 1u : 0u);
+            chkU("faceIndex1", f1, e.faceIndex1);
+            chkU("faceIndex2", f2, e.faceIndex2);
+        }
+    }
+    for (PxgBufferHandle h : hullBufs) dev->destroyBuffer(h);
+    dev->destroyBuffer(bIn);
+    dev->destroyBuffer(bOut);
+
+    PXG_CHECK_MSG(bad == 0, "the SAT driver and face selection match the scalar oracle (%zu mismatches)", bad);
+    PXG_CHECK_MSG(sawSelectRun, "some case selects a face from a tri or edge axis");
+    PXG_CHECK_MSG(sawFacePassthrough, "some case already has a face index and passes it through");
+    PXG_CHECK_MSG(sawTwoFaces, "some case comes back with a second face");
+    PXG_CHECK_MSG(sawDelay, "some case delays its contacts");
+    PXG_CHECK_MSG(sawNoDelay, "some case does not delay its contacts");
+    PXG_CHECK_MSG(sawEdgePick, "some case picks both faces of an edge that beats every face");
+    PXG_CHECK_MSG(sawNeighbourPick, "some case picks the best neighbour of the winning face");
 }
 
 } // namespace

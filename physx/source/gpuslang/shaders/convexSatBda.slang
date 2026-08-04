@@ -139,3 +139,81 @@ void convexSatLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
         GroupMemoryBarrierWithGroupSync();
     }
 }
+
+// ---------------------------------------------------------------------------
+// convexSelectLaunch — the same input record, driving the OTHER half of the
+// tranche: convexMeshSAT as a whole, then delayGenerateContact, then
+// selectPolygonFeatureIndex.  Separate entry point rather than more output
+// fields on the first, because the first one's 64-byte record is full and
+// because the two are then independently dispatchable from the fixture.
+//
+// Output record, 32 bytes:
+//   @0   uint satPassed | uint featureIndex | uint delayContacts | uint faceIndex1
+//   @16  uint faceIndex2 | float separation | float2 minNormal.xy
+//
+// minNormal.z is dropped rather than padded to 48: the fixture compares x and y
+// bitwise, and a third component that agrees adds no discrimination the first
+// two do not already give.
+// ---------------------------------------------------------------------------
+static const uint CSB_SEL_OUT_STRIDE = 32u;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void convexSelectLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    const uint lane = gtid.x;
+
+    const uint c = gid.x;
+    if (c < gCs.numCases)
+    {
+        const uint64_t inBase = gCs.input + uint64_t(c) * uint64_t(CSB_IN_STRIDE);
+        const uint64_t outBase = gCs.output + uint64_t(c) * uint64_t(CSB_SEL_OUT_STRIDE);
+
+        const uint64_t hull = Ptr<uint64_t>(inBase)[0];
+        const float4 scaleDist = Ptr<float4>(inBase + 16UL)[0];
+        const float4 scaleRot = Ptr<float4>(inBase + 32UL)[0];
+        const float3 t0 = Ptr<float4>(inBase + 48UL)[0].xyz;
+        const float3 t1 = Ptr<float4>(inBase + 64UL)[0].xyz;
+        const float3 t2 = Ptr<float4>(inBase + 80UL)[0].xyz;
+        const float3 triN = Ptr<float4>(inBase + 96UL)[0].xyz;
+        const uint4 adj = Ptr<uint4>(inBase + 112UL)[0];
+
+        const uint desc = chHullDesc(hull);
+
+        csScaleVerts(lane, hull, desc, scaleDist.xyz, scaleRot);
+
+        uint featureIndex;
+        float separation;
+        float3 minNormal;
+        const bool passed = csConvexMeshSAT(lane, hull, desc, scaleDist.xyz, scaleRot, scaleDist.w,
+                                            t0, t1, t2, triN, adj.x, adj.y, adj.z,
+                                            featureIndex, separation, minNormal);
+
+        // convexTriangleContactGen's __syncwarp() at :1683, between convexMeshSAT
+        // and the reads of convexPlaneN/D below it.
+        GroupMemoryBarrierWithGroupSync();
+
+        bool delayContacts = false;
+        uint faceIndex1 = 0xFFFFFFFFu;
+        uint faceIndex2 = 0xFFFFFFFFu;
+
+        if (passed)
+        {
+            delayContacts = csDelayGenerateContact(minNormal, triN, featureIndex);
+            faceIndex1 = csSelectPolygonFeatureIndex(lane, hull, desc, minNormal,
+                                                     featureIndex, faceIndex2);
+        }
+
+        if (lane == 0u)
+        {
+            Ptr<uint>(outBase)[0] = passed ? 1u : 0u;
+            Ptr<uint>(outBase)[1] = featureIndex;
+            Ptr<uint>(outBase)[2] = delayContacts ? 1u : 0u;
+            Ptr<uint>(outBase)[3] = faceIndex1;
+            Ptr<uint>(outBase)[4] = faceIndex2;
+            Ptr<float>(outBase + 20UL)[0] = separation;
+            Ptr<float>(outBase + 24UL)[0] = minNormal.x;
+            Ptr<float>(outBase + 28UL)[0] = minNormal.y;
+        }
+    }
+}
