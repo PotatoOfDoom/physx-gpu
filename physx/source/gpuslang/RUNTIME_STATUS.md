@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **684/684** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **685/685** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1623,171 +1623,92 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
-## P8.40 attempt — DEFERRED: a reproducible segfault in the SAT module, and everything it is not
+## P8.40 — the first two SAT stages, and the llvmpipe fault that held them up for four passes
 
-The first two SAT stages (`satConvexFaceNormals`, `satTriangleNormal`) were written, and the
-shader **agreed with a scalar 32-lane oracle on every value in all six fixture cases**.  It is
-not landed, because in the plain formulation the dispatch reliably **segfaults inside the
-JIT-compiled shader** on llvmpipe.  The code is parked in the session scratchpad rather than
-committed; this entry exists so the next attempt starts from the eliminations rather than
-repeating them.
+`satConvexFaceNormals` (`convexTriangle.cuh:217`) and `satTriangleNormal` (:303), plus the
+vertex-scaling prologue that feeds them, on a 32-lane virtual warp.  The oracle is a scalar
+32-lane simulation, the same shape as P8.38's.  What made this tranche expensive was not the
+port — it agreed with the oracle on every value early on — but a **segfault inside the
+JIT-compiled shader** that took five passes to pin down.
 
-**What was ruled out**, each by a build-and-run:
+### The fault, and the thing that finally cracked it
 
-| hypothesis | result |
-|---|---|
-| the early `return false` after the disjoint ballot | crashes with a single-exit rewrite too |
-| a groupshared index past the 64-entry arrays | crashes with every index clamped |
-| hull-blob misalignment breaking a `Ptr<float4>` load | all blobs measured 256-aligned |
-| the two global loads in the polygon loop (`chPolyDesc`, `chPlane`) | crashes with both stubbed to constants |
-| the divergent `break` in the strided loop | crashes with the break removed |
-| the whole strided loop | crashes with the loop deleted entirely |
-| `#include`-ing pxgSlangWarpInc (a header that owns groupshared) into a module that also owns groupshared | crashes with hand-rolled local primitives instead |
-| a data-dependent path | all six cases crash individually, including the trivially separated one |
+Four passes of bisecting DOWN from the port ruled out, each by a build-and-run: the early
+return, groupshared indexing, blob alignment, the two global loads, the divergent `break`, the
+whole strided loop, the `pxgSlangWarpInc` include, the module boundary itself (everything
+inlined into one shader), `spirv-opt -O` over the binary, `__exported import`, `inout` struct
+fields, and data dependence.  `spirv-val` was clean throughout and `LP_NUM_THREADS=1` reproduced
+exactly.  A one-line flip *was* found in a scratch reproducer, and then the fix it suggested —
+computing loop bounds in the caller — turned out not to fix the real module.  That prediction
+had been written into this file before it was tested; the correction is the P8.40 entry's own
+history.
 
-What survives is a stage-1 function reduced to nothing but **a sequence of barrier-bearing
-reductions** — a ballot, a max-with-winner-lane, and three broadcasts — and that still crashes.
+What cracked it was the suggestion to **take the environment out of the picture entirely**: a
+standalone Vulkan host, 130 lines of C, no PhysX, no test framework, nothing from this repo but
+the SPIR-V.  It crashed there too — which exonerated the harness and, far more usefully, gave a
+five-second edit-compile-run loop instead of a forty-second one.  Building UP in that loop
+reached the trigger in about fifteen steps.
 
-**The decisive clue is that the crash is sensitive to unrelated control flow.**  Adding two
-`continue` branches that are never taken at runtime made it disappear; removing them brought it
-back.  That is the signature of a miscompile, not of a logic error in the port, and it is why
-further bisection was stopped: the remaining difference from the working `polyClipBda` is
-compositional (three barrier-bearing module calls plus two bare barriers in the shader body,
-versus one module call), not semantic.
-
-**The other finding from the attempt is a fixture bug worth recording**, because it is silent:
-`minIndex` in a cooked polygon descriptor is the vertex with the **smallest** projection along
-that face's normal — the hull's near extent, which `satConvexFaceNormals` uses as `min0`.  The
-first fixture seeded it with a vertex lying ON the face, which makes `min0 == max0` and reports
-every overlapping pair as separated.  Nothing failed: the shader and the oracle both consumed
-the same malformed hull and agreed perfectly.  Only the explicit path-coverage assertion — "some
-case must pass both stages" — exposed it.  That is the second time in three tranches that a
-coverage assertion, not a value comparison, caught the real defect.
-
-### Second pass: the composition theory is wrong too, and the reproducer will not hold still
-
-The follow-up restructured the module to `polyClipBda`'s proven shape — one module entry point
-per dispatch iteration, every barrier inside it — and it **still crashes**.  So does every one
-of these:
-
-| further hypothesis | result |
-|---|---|
-| single module call per iteration instead of three | crashes |
-| groupshared reads hoisted out of the `lane == 0` branch | crashes |
-| plain `import` instead of `__exported import` of the hull module | crashes |
-| running values as plain locals instead of `inout` struct fields | crashes |
-| the `Ptr<float4>` hull load inside the loop, stubbed to a constant | crashes |
-| the `pxgSlangNpAbi` quaternion call inside the loop, stubbed | crashes |
-| the strided loop given a lane-uniform trip count | crashes |
-| the loop replaced by a manual two-step unroll | crashes |
-| writing one groupshared array instead of three | crashes |
-| blobs padded to 256 bytes; every hull address measured 16-aligned | crashes |
-| `LP_NUM_THREADS=1` (llvmpipe fully serialised) | crashes identically — not a race |
-| `spirv-val` on the generated module | **clean**, and so is polyClipBda's |
-| total workgroup storage | 2 KB (eight 64-entry arrays), nowhere near any limit |
-
-By the end, the whole SAT was stripped out and the crash reduced to `csScaleVerts` alone:
+### The trigger
 
 ```slang
-const uint nbVerts = chNbVerts(hullDesc);
-if (lane < nbVerts)             gsCsVertX[lane]      = <float>;   // crashes
-if (lane + 32u < nbVerts)       gsCsVertX[lane + 32] = <float>;
-GroupMemoryBarrierWithGroupSync();
-```
-
-while, **in the same module, the same shader and the same dispatch**, this runs fine:
-
-```slang
-gsCsVertX[lane] = <float>;                                        // runs
-GroupMemoryBarrierWithGroupSync();
-const float v = gsCsVertX[(lane + 1u) & 31u];
-```
-
-A guarded groupshared store before a barrier is not an exotic construct — `pxgSlangPolyClip`
-does exactly that in `pcAddContacts` and works.  **The reproducer moves as the surrounding code
-changes**: never-taken `continue` branches made it vanish, removing them brought it back, and
-each successful reduction step relocated rather than shrank the trigger.  That is the signature
-of a codegen defect whose manifestation depends on whole-module output, not of a nameable
-construct, and it is why bisecting DOWN from the port has stopped paying.
-
-### Third pass: the build-up worked, and there is now a one-line reproducer
-
-Building UP from a fragment known to run — instead of reducing down from the port — produced
-the reproducer in about a dozen steps.  Each of these was added to a working shader and the
-result still ran: the module boundary, `import pxgSlangNpAbi`, `import pxgSlangConvexHull`,
-`#include "pxgSlangWarpInc.slang"`, seven 64-entry groupshared arrays, a strided
-`for (i = lane; i < n; i += 32)` loop, a guarded store, a `Ptr<float4>` load from a second
-buffer reached through an address stored in memory, a public accessor that reads groupshared and
-is called from the shader, a 64-byte output stride with `float4` stores, and a full
-SAT-shaped function with warp reductions, shuffles and an early return — first uncalled, then
-called.  All of it runs.
-
-**The delta that flips it is one line.**  In a module function whose loop writes a groupshared
-array:
-
-```slang
-public float reproStep(uint lane, uint nbVerts,  uint64_t hull, float f)   // RUNS
-public float reproStep(uint lane, uint hullDesc, uint64_t hull, float f)   // SEGFAULTS
+for (uint c = gid.x; c < gCs.numCases; c += WorkgroupCount().x)   // CRASHES
 {
-    const uint nbVerts = (hullDesc >> 8) & 0xffu;   // <- only difference
-    for (uint i = lane; i < nbVerts; i += 32u) { gsA[i] = …; }
-    GroupMemoryBarrierWithGroupSync();
-    …
+    const uint64_t hull = Ptr<uint64_t>(gCs.input + uint64_t(c) * 112UL)[0];
+    const uint desc = Ptr<uint>(hull + 16UL)[0];
+    if (gtid.x == 0u) Ptr<uint>(gCs.output + uint64_t(c) * 64UL)[0] = desc;
 }
 ```
 
-Both compute **the same value, 8**, from the same descriptor.  The version that receives it as a
-parameter runs; the version that derives it inside the function by a shift and a mask faults.
-It also faults as `chNbVerts(hullDesc)` and as `min(chNbVerts(hullDesc), 64u)` — so it is
-neither the cross-module call nor a range the compiler might exploit, and clamping to the array
-size does not help.  `spirv-val` is clean and `LP_NUM_THREADS=1` reproduces it exactly.
+A **chained buffer-device-address load** — a 64-bit address read out of memory and then
+dereferenced — inside a grid-stride loop.  Replace the loop with `const uint c = gid.x; if (c <
+gCs.numCases)` and the identical body runs.  No groupshared, no barriers, no imports are
+involved in the reproducer at all.  Reassembling the address from two 32-bit loads still
+crashes, and so does a `while` form, so it is the loop plus the indirection rather than the
+64-bit load itself.  The loop executes exactly ONE iteration in the failing run.
 
-The reproducer — two modules, a shader and a driver, differing by that one line — is parked in
-the session scratchpad under `p840-repro/` with a README.  It is small enough to file against
-slangc or Mesa.
+That also explains why `polyClipBda` never hit it despite the same loop shape: its per-pair
+addresses are computed from the push constant directly.  It never dereferences an address it
+read out of memory.  **This is the first tranche in the port that needed a chained BDA load
+inside its dispatch loop, and it is the first one that crashed.**
 
-**The workaround that reproducer suggested does NOT fix the real module** — and that prediction
-was written here before it was tested, so this corrects it.  The port was rebuilt with every
-loop bound computed in the caller and passed in, and then again with the section base addresses
-(`chPlanes`, `chPolyDescs`) resolved in the caller too, so that no module function derives
-anything from the hull descriptor.  Both still segfault.
+The reproducer — `iso.slang`, `host.c`, `try.sh` — is parked in the session scratchpad under
+`p840-iso/`.  It is small enough to file against slangc or Mesa as it stands.
 
-So the state is: the one-line flip in the reproducer is real and repeatable, and it is NOT a
-sufficient explanation of the real module's fault.  Two things follow.
+### The rule this hands the port
 
-1. The reproducer keeps its value on its own terms.  It is four small files, it flips on one
-   line, `spirv-val` is clean on both sides, and `LP_NUM_THREADS=1` reproduces — enough to file
-   against slangc or Mesa without any of this port's context.
-2. For the port itself, the remaining honest description is the one from the second pass: a
-   codegen sensitivity keyed to whole-module output that no single construct accounts for.
-   Built up from a working fragment, an equivalent of every part of this module runs; assembled
-   as the real module, it faults.
+**Do not put a chained BDA load inside a grid-stride loop.**  Dispatch one workgroup per item
+and guard with `if (index < count)`.  The consumer already dispatched one group per case, so
+this cost nothing; every future kernel that reads a pointer out of a descriptor struct is
+subject to the same rule.
 
-### Fourth pass: the module boundary and the toolchain are out too
+### The tranche itself
 
-Three of the four remaining leads were tried, and none of them is it:
+Sweep **11/16**, and the five survivors are argued rather than ignored:
 
-| lead | result |
-|---|---|
-| **no module boundary at all** — the whole module inlined into the consuming shader, one file | crashes |
-| that inlined file with both SAT function definitions DELETED, only the prologue called | crashes |
-| `spirv-opt -O` over the compiled binary (revalidated clean afterwards) | crashes |
-| `slangc -O1/-O2/-O3` | unavailable — slangc cannot load `spirv-opt` as a downstream compiler, so the optimisation-level axis cannot be varied at all |
-| removing a read of groupshared that the stripped shader never writes | crashes |
+- **M2, the `break` turned into a `continue` — equivalent, and it corrects the module's own
+  comment.**  I had written that a `continue` would let a later polygon owned by the same lane
+  win the argmax.  It cannot: if any lane sets `disjoint` the function returns false and the
+  argmax and plane arrays are discarded wholesale, so the break only saves work.  The comment
+  now says that.
+- **M1**, seeding the running best with the incoming `separation` instead of `-PX_MAX_F32` —
+  the caller passes `-PX_MAX_F32`, so the two are identical in this call order.
+- **M4**, dropping the second half of the separation test — for a CLOSED hull, whenever
+  `min0 > max1 + contactDist` fires for one face, `min1 > max0 + contactDist` fires for the
+  roughly opposite one, so the pair is still rejected.  That is an argument, not a proof, and
+  it is recorded as such.
+- **M3 and M8**, turning `>` into `>=` and `<` into `<=` — both need exact float equality at a
+  boundary that the fixture does not construct.
 
-So the fault survives reduction of the shader down to ~90 lines of code: three imports, seven
-groupshared arrays, one function that scales hull vertices into them, and an output write.  An
-independently built shader of the same shape runs.
+Three fixture cases were added to kill the earlier survivors: a **34-polygon drum**, so a lane
+owns more than one face and the strided loop actually iterates (this killed both the `break`
+mutant's cousin and the one that records the lane instead of the polygon index); a pair
+separated only by the second half of the test; and a **tilted triangle whose own normal wins the
+axis**, without which the sign of the committed normal is never observed.  Coverage assertions
+now pin all three.
 
-**What that leaves is the half never held constant.**  Every experiment so far varied the
-shader and kept its own fixture; the one cross-over — the real module driven by the reproducer's
-fixture — was run while the module still carried everything, so it proved less than it looked.
-With the shader now minimal, the next step is the mirror image: drive the minimal crashing
-shader from the reproducer's fixture, and drive the reproducer's shader from this fixture.  One
-of those two will localise it to a side, and only then is further shader bisection worth doing.
-
-The tranche stays out of the tree until that lands, because a port that depends on an
-unexplained miscompile is not a port.
+Suite **685/685 in both memory modes**.  Not an engine kernel yet — no manifest entry, no ABI
+row.  `satEdgeCrossDirection2`, the third SAT stage, is the next tranche.
 
 ## P8.39 — the cooked convex-hull blob reader, plus a survey of what the core kernel actually needs
 
