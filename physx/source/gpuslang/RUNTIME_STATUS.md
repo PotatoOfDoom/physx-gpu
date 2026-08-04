@@ -1623,6 +1623,101 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.44 — contactReduceShared on the virtual warp, and a fill loop that turns out to be dead
+
+`contactReduceShared` (contactReduction.cuh:55-165) at the ONE instantiation the
+convex-vs-triangle emit tail reaches — `contactReduce<false, true, 5, true>`
+(convexTriangle.cuh:1789) — plus `maxIndex`/`minIndex` (nputils.cuh:137-163).
+
+### Why port something that is already green
+
+`contactReduce.slang` covers the same algorithm and its test drives 4096 random cases through
+it, but it is a SCALAR harness: one thread walks all 32 contacts out of per-lane arrays.  That
+proves the ALGORITHM and says nothing about the warp.  So the new module is driven against the
+SAME C++ oracle, `refReduce`, which is what makes a divergence attributable to the warp
+emulation rather than to the algorithm — and both tests now live in the same file so a case
+added for one is available to the other.
+
+### maxIndex is not the generic helper, and the difference is real
+
+`pxgWarpReduceMaxWinnerF` (pxgSlangWarpInc.slang:313) resolves the winner as
+`lowestSetIndex(ballot(mask, best == value))` — ONE mask in both the sync role and the
+selection role.  The CUDA ballots over `FULL_MASK` and ANDs the RESULT with the set mask,
+having neutralised out-of-set lanes with `-FLT_MAX` BEFORE the butterfly.  The equality is
+tested against the lane's ORIGINAL value, so an out-of-set lane holding a value equal to the
+in-set maximum sets its ballot bit and only the `& mask` removes it.  Random data essentially
+never lands there; the fixture constructs it — lane 0 outside `allMask`, carrying the winning
+separation.  That case kills the mutant.
+
+### Self-contained on purpose
+
+No `#include "pxgSlangWarpInc.slang"`.  The emit tail composes this module with
+`pxgSlangConvexSat`, which does include it, and a Slang `import` is a module boundary: each
+importer would carry its own copy of the warp library's groupshared scratch.
+`pxgSlangPolyClip` solves it the same way, and the three primitives needed here — shuffle,
+ballot, ffs — are forty lines.  Everything is prefixed `cr`/`gsCr`.
+
+### Sweep 27/37, and the ten survivors are accounted for individually
+
+Six are EQUIVALENT BY PROOF, not by argument:
+
+- **M26 / M27**, negating the edge direction.  `d` flips sign, so the argmax and the argmin
+  swap — and the two are ORed into the same `mask`, so the union is identical.
+- **M28**, measuring the signed distance from the origin instead of from p0.  That adds
+  `dot(dir, p0)`, which is warp-uniform, to every lane; an argmax is invariant under adding a
+  constant.  (Exactly invariant in exact arithmetic; the fixture's near-tie tracker skips the
+  cases where rounding could separate two previously equal values.)
+- **M25**, squaring the distance instead of taking the magnitude.  `sqrt` is monotone on the
+  non-negatives and maps equal inputs to equal outputs, so both the winner and the tie
+  structure are preserved.
+- **M17**, the early-out off by one the other way.  With exactly five candidates the full path
+  selects four distinct anchors and then the PCM pick, i.e. all five — the same mask the
+  early-out would have returned.
+- **M31 / M32**, moving or removing the `popc(mask) == 4` gate on the PCM pick.  At
+  `TClustering = false` the PCM pick and the fill loop use the SAME criterion, the raw
+  separation, so it does not matter which of the two contributes the fifth point.  The gate
+  only earns its keep with clustering, where the fill switches to the BIASED separation.
+
+Two mutate code that cannot run:
+
+- **M34 / M37**, the fill loop.  `i0` is drawn from `allMask`, `i1` from `allMask & ~mask`, `f`
+  and `g` from the mask minus what came before — so the four anchors are DISTINCT BY
+  CONSTRUCTION, and the sets are non-empty because the early-out already guaranteed more than
+  five candidates.  Therefore `popc(mask) == 4` always holds here, the PCM pick always fires,
+  `count` is always 5, and the fill loop's range `[5, 5)` is empty.  **The fill loop is dead
+  code at TMaxPoints = 5.**  It is kept because `TMaxPoints` is a template parameter in the
+  original and the scalar test does reach it at 6.  M35 and M36, which force the loop to run,
+  are both killed — which is the empirical half of the same claim.
+
+The last two need a coincidence no fixture can construct: **M12** wants `d` exactly equal to
+`1e-8f` at the dupe gate.
+
+### The case that killed the anchor mutant, and why the obvious version of it did not
+
+"p1 may re-pick p0" survived the sweep, and the first case built for it did not kill it either
+— which was the more useful result.  Making every contact project onto the same point in the
+normal plane does drive the mutant down the wrong path: every distance is zero, the anchors
+fall back to the lowest-lane rule, and a `p1` that does not exclude the anchors already chosen
+re-picks p0 and ends up one anchor short.  The returned mask was NEVERTHELESS IDENTICAL,
+because the fill loop picks the deepest remaining contacts and restored exactly the lane the
+bad pick had lost.
+
+The case only bites once DEPTH ORDER AND LANE ORDER ARE DECOUPLED — lane 3 made shallow so the
+fill never reaches for it, the two deepest contacts parked out at lanes 10 and 20.  The
+original then returns `{0,1,2,3,10}` and the mutant `{0,1,2,10,20}`.  It is a stack of contacts
+along the normal, which is an ordinary thing for a clipper to produce.
+
+That compensation is the same mechanism that keeps M31/M32 alive, and noticing it is what
+turned the fill-loop survivors from "the fixture is thin here" into the reachability proof
+above.
+
+Suite **686/686 in both memory modes** — the SAME count as P8.43, deliberately.  `ctest` counts
+suites, not tests, and `contactReduceWarp` was given no suite of its own: it lives in
+testContactReduce.cpp beside the scalar port and runs under the existing
+`gpuslang.contactReduce`.  A suite of its own would have matched by substring and run the test
+twice.  Still no manifest entry and no ABI row; the next tranche is the emit tail itself
+(convexTriangle.cuh:1769-1881), which this module exists to serve.
+
 ## P8.43 — a signed zero that llvmpipe folded away, and the joint that never broke
 
 A forced-fresh rebuild — every `.spv` deleted first — turned `solverTGS_writebackBlocksAbi`
