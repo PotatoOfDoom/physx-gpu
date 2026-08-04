@@ -1710,11 +1710,47 @@ each successful reduction step relocated rather than shrank the trigger.  That i
 of a codegen defect whose manifestation depends on whole-module output, not of a nameable
 construct, and it is why bisecting DOWN from the port has stopped paying.
 
-Where to resume, and the method matters: build UP from the fragment that is known to run, one
-statement at a time, in a dedicated scratch shader — instead of reducing down from the port.
-The first version that crashes is then the minimal reproducer by construction, and it can be
-taken to slangc or to Mesa as a bug report rather than worked around blind.  Until that exists,
-the SAT tranche stays out of the tree.
+### Third pass: the build-up worked, and there is now a one-line reproducer
+
+Building UP from a fragment known to run — instead of reducing down from the port — produced
+the reproducer in about a dozen steps.  Each of these was added to a working shader and the
+result still ran: the module boundary, `import pxgSlangNpAbi`, `import pxgSlangConvexHull`,
+`#include "pxgSlangWarpInc.slang"`, seven 64-entry groupshared arrays, a strided
+`for (i = lane; i < n; i += 32)` loop, a guarded store, a `Ptr<float4>` load from a second
+buffer reached through an address stored in memory, a public accessor that reads groupshared and
+is called from the shader, a 64-byte output stride with `float4` stores, and a full
+SAT-shaped function with warp reductions, shuffles and an early return — first uncalled, then
+called.  All of it runs.
+
+**The delta that flips it is one line.**  In a module function whose loop writes a groupshared
+array:
+
+```slang
+public float reproStep(uint lane, uint nbVerts,  uint64_t hull, float f)   // RUNS
+public float reproStep(uint lane, uint hullDesc, uint64_t hull, float f)   // SEGFAULTS
+{
+    const uint nbVerts = (hullDesc >> 8) & 0xffu;   // <- only difference
+    for (uint i = lane; i < nbVerts; i += 32u) { gsA[i] = …; }
+    GroupMemoryBarrierWithGroupSync();
+    …
+}
+```
+
+Both compute **the same value, 8**, from the same descriptor.  The version that receives it as a
+parameter runs; the version that derives it inside the function by a shift and a mask faults.
+It also faults as `chNbVerts(hullDesc)` and as `min(chNbVerts(hullDesc), 64u)` — so it is
+neither the cross-module call nor a range the compiler might exploit, and clamping to the array
+size does not help.  `spirv-val` is clean and `LP_NUM_THREADS=1` reproduces it exactly.
+
+The reproducer — two modules, a shader and a driver, differing by that one line — is parked in
+the session scratchpad under `p840-repro/` with a README.  It is small enough to file against
+slangc or Mesa.
+
+**The workaround this hands the port** is concrete: compute loop bounds in the CALLER and pass
+them in, rather than deriving them inside a module function that writes groupshared.  That costs
+nothing — `convexTrimeshNarrowphaseCore` already decodes the hull descriptor once per warp — and
+it is the shape P8.40 should be rebuilt in.  The tranche stays out of the tree until it is,
+because a port that depends on an unexplained miscompile is not a port.
 
 ## P8.39 — the cooked convex-hull blob reader, plus a survey of what the core kernel actually needs
 
