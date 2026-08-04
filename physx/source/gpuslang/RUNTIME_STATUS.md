@@ -1746,11 +1746,29 @@ The reproducer — two modules, a shader and a driver, differing by that one lin
 the session scratchpad under `p840-repro/` with a README.  It is small enough to file against
 slangc or Mesa.
 
-**The workaround this hands the port** is concrete: compute loop bounds in the CALLER and pass
-them in, rather than deriving them inside a module function that writes groupshared.  That costs
-nothing — `convexTrimeshNarrowphaseCore` already decodes the hull descriptor once per warp — and
-it is the shape P8.40 should be rebuilt in.  The tranche stays out of the tree until it is,
-because a port that depends on an unexplained miscompile is not a port.
+**The workaround that reproducer suggested does NOT fix the real module** — and that prediction
+was written here before it was tested, so this corrects it.  The port was rebuilt with every
+loop bound computed in the caller and passed in, and then again with the section base addresses
+(`chPlanes`, `chPolyDescs`) resolved in the caller too, so that no module function derives
+anything from the hull descriptor.  Both still segfault.
+
+So the state is: the one-line flip in the reproducer is real and repeatable, and it is NOT a
+sufficient explanation of the real module's fault.  Two things follow.
+
+1. The reproducer keeps its value on its own terms.  It is four small files, it flips on one
+   line, `spirv-val` is clean on both sides, and `LP_NUM_THREADS=1` reproduces — enough to file
+   against slangc or Mesa without any of this port's context.
+2. For the port itself, the remaining honest description is the one from the second pass: a
+   codegen sensitivity keyed to whole-module output that no single construct accounts for.
+   Built up from a working fragment, an equivalent of every part of this module runs; assembled
+   as the real module, it faults.
+
+What is left untried, in the order I would try it: pin a different slangc build, since the
+toolchain is the one component never varied; compare the two disassemblies instruction by
+instruction rather than by construct, which is the one comparison not yet made; and, failing
+both, write the SAT stages directly in the consuming shader with no module boundary at all.
+The tranche stays out of the tree until one of those lands, because a port that depends on an
+unexplained miscompile is not a port.
 
 ## P8.39 — the cooked convex-hull blob reader, plus a survey of what the core kernel actually needs
 
