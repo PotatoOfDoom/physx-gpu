@@ -1763,11 +1763,30 @@ sufficient explanation of the real module's fault.  Two things follow.
    Built up from a working fragment, an equivalent of every part of this module runs; assembled
    as the real module, it faults.
 
-What is left untried, in the order I would try it: pin a different slangc build, since the
-toolchain is the one component never varied; compare the two disassemblies instruction by
-instruction rather than by construct, which is the one comparison not yet made; and, failing
-both, write the SAT stages directly in the consuming shader with no module boundary at all.
-The tranche stays out of the tree until one of those lands, because a port that depends on an
+### Fourth pass: the module boundary and the toolchain are out too
+
+Three of the four remaining leads were tried, and none of them is it:
+
+| lead | result |
+|---|---|
+| **no module boundary at all** — the whole module inlined into the consuming shader, one file | crashes |
+| that inlined file with both SAT function definitions DELETED, only the prologue called | crashes |
+| `spirv-opt -O` over the compiled binary (revalidated clean afterwards) | crashes |
+| `slangc -O1/-O2/-O3` | unavailable — slangc cannot load `spirv-opt` as a downstream compiler, so the optimisation-level axis cannot be varied at all |
+| removing a read of groupshared that the stripped shader never writes | crashes |
+
+So the fault survives reduction of the shader down to ~90 lines of code: three imports, seven
+groupshared arrays, one function that scales hull vertices into them, and an output write.  An
+independently built shader of the same shape runs.
+
+**What that leaves is the half never held constant.**  Every experiment so far varied the
+shader and kept its own fixture; the one cross-over — the real module driven by the reproducer's
+fixture — was run while the module still carried everything, so it proved less than it looked.
+With the shader now minimal, the next step is the mirror image: drive the minimal crashing
+shader from the reproducer's fixture, and drive the reproducer's shader from this fixture.  One
+of those two will localise it to a side, and only then is further shader bisection worth doing.
+
+The tranche stays out of the tree until that lands, because a port that depends on an
 unexplained miscompile is not a port.
 
 ## P8.39 — the cooked convex-hull blob reader, plus a survey of what the core kernel actually needs
