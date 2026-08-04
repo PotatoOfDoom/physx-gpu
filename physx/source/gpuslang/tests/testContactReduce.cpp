@@ -332,4 +332,266 @@ PXG_TEST(contactReduce_all)
     dev->destroyBuffer(bP); dev->destroyBuffer(bC); dev->destroyBuffer(bO);
 }
 
+// ---------------------------------------------------------------------------
+// The 32-LANE VIRTUAL WARP port (pxgSlangContactReduce), at the one
+// instantiation the convex-vs-triangle emit tail reaches:
+// contactReduce<false, true, 5, true> (convexTriangle.cuh:1789).
+//
+// It is driven against `refReduce` above -- the SAME oracle the scalar port
+// uses -- which is the point: the scalar shader proves the algorithm, so a
+// divergence here is attributable to the warp emulation and nothing else.
+//
+// The random cases come from the same generator, but random data alone cannot
+// reach the places a warp version can differ from a scalar one, so the list
+// opens with constructed cases that each pin exactly one of them.
+// ---------------------------------------------------------------------------
+
+struct CrWarpCase
+{
+    V3 p[32];
+    float s[32];
+    V3 normal;
+    uint32_t allMask;
+    const char* name;
+};
+
+struct CrWarpPush { uint64_t input, output; uint32_t numCases, pad; };
+
+PXG_TEST(contactReduceWarp)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const int MAXP = 5;
+    const bool CLUSTERING = false, KEEPDEEPEST = true, DUPETEST = true, REDUCE2 = false;
+    const float BIAS = 0.0f;
+
+    std::vector<CrWarpCase> cases;
+
+    // A spread of points on the z=0 plane, deliberately far from any tie, used
+    // as the neutral background for the constructed cases.
+    auto spread = [](CrWarpCase& c) {
+        for (uint32_t j = 0; j < 32; ++j)
+        {
+            const float a = 0.19634954f * float(j);          // 2*pi/32
+            c.p[j] = { std::cos(a) * (1.0f + 0.03f * float(j)),
+                       std::sin(a) * (1.0f + 0.03f * float(j)),
+                       0.011f * float(j) };
+            c.s[j] = -0.02f - 0.011f * float(j);             // strictly decreasing, distinct
+        }
+        c.normal = { 0.0f, 0.0f, 1.0f };
+        c.allMask = 0xFFFFFFFFu;
+    };
+
+    {   // 1: THE EARLY-OUT.  popc(allMask) <= TMaxPoints, so the function returns
+        //    allMask before a single point is projected.  Nothing downstream runs.
+        CrWarpCase c; spread(c);
+        c.allMask = (1u << 3) | (1u << 9) | (1u << 17) | (1u << 30);
+        c.name = "early-out, popc 4";
+        cases.push_back(c);
+    }
+    {   // 2: ALL 32 LANES LIVE, so every stage of the butterfly carries a real
+        //    value and the ballot spans the whole word.
+        CrWarpCase c; spread(c);
+        c.name = "all 32 lanes";
+        cases.push_back(c);
+    }
+    {   // 3: AN OUT-OF-MASK LANE HOLDS THE WINNING VALUE.  This is the single case
+        //    that separates a correct maxIndex from one that ballots over the set
+        //    mask instead of ANDing with it: lane 0 is NOT in allMask but carries
+        //    the deepest separation, so a port that forgets the `& mask` picks it
+        //    as p0 and every anchor after it moves.
+        CrWarpCase c; spread(c);
+        c.allMask = 0xFFFFFFFEu;                 // lane 0 excluded
+        c.s[0] = c.s[5];                         // ... but equal to an in-set value
+        c.name = "out-of-mask lane ties the winner";
+        cases.push_back(c);
+    }
+    {   // 4: EXACT-TIE SEPARATIONS ON TWO LANES.  The lowest-lane rule decides p0,
+        //    and nothing else in the algorithm does.
+        CrWarpCase c; spread(c);
+        c.s[7] = -0.005f;
+        c.s[21] = -0.005f;                       // the same deepest value, twice
+        c.name = "exact tie on the deepest separation";
+        cases.push_back(c);
+    }
+    {   // 5: COINCIDENT POINTS, EQUAL SEPARATIONS, LOW LANE FIRST.  The dupe rule
+        //    is `sep < separation || (sep == separation && i > lane)`, so of two
+        //    identical contacts the HIGHER lane is culled.
+        CrWarpCase c; spread(c);
+        c.p[11] = c.p[4]; c.s[11] = c.s[4];
+        c.name = "coincident pair, equal separation";
+        cases.push_back(c);
+    }
+    {   // 6: COINCIDENT POINTS, THE DEEPER ONE ON THE HIGHER LANE.  Now the
+        //    separation comparison decides rather than the lane index, and it must
+        //    cull the other one -- the opposite lane from case 5.
+        CrWarpCase c; spread(c);
+        c.p[11] = c.p[4]; c.s[11] = c.s[4] - 0.05f;
+        c.name = "coincident pair, deeper on the higher lane";
+        cases.push_back(c);
+    }
+    {   // 7: A DUPE CULL THAT DROPS THE SET BELOW TMaxPoints, so the early-out is
+        //    reached through the cull rather than through the input mask.
+        CrWarpCase c; spread(c);
+        c.allMask = 0u;
+        const uint32_t live[7] = { 1, 2, 3, 4, 5, 6, 7 };
+        for (uint32_t k = 0; k < 7; ++k) c.allMask |= 1u << live[k];
+        c.p[5] = c.p[1]; c.s[5] = c.s[1] - 0.01f;   // 5 culled
+        c.p[6] = c.p[2]; c.s[6] = c.s[2] - 0.01f;   // 6 culled
+        c.name = "cull drops the set to the early-out";
+        cases.push_back(c);
+    }
+    {   // 8: A FLAT SET.  Every point lies on one line through the origin in the
+        //    normal plane, so the cross-axis distance d is 0 for every lane and the
+        //    f/g picks are decided purely by the lowest-lane rule.
+        CrWarpCase c; spread(c);
+        for (uint32_t j = 0; j < 32; ++j)
+        {
+            c.p[j] = { 0.05f * float(j) - 0.8f, 0.0f, 0.0f };
+            c.s[j] = -0.02f - 0.007f * float((j * 13u) % 32u);
+        }
+        c.name = "collinear points, zero cross-axis";
+        cases.push_back(c);
+    }
+
+    const uint32_t nConstructed = uint32_t(cases.size());
+
+    // Random cases, same generator as the scalar test but pinned to this
+    // instantiation.
+    std::mt19937 rng(90210);
+    std::uniform_real_distribution<float> uv(-1, 1);
+    std::uniform_real_distribution<float> us(-0.5f, 0.1f);
+    std::normal_distribution<float> gn(0, 1);
+    const uint32_t NRAND = 640;
+    for (uint32_t t = 0; t < NRAND; ++t)
+    {
+        CrWarpCase c;
+        V3 n = { gn(rng), gn(rng), gn(rng) };
+        const float nl = 1.0f / std::sqrt(dot3(n, n));
+        c.normal = muls(n, nl);
+
+        V3 centers[4];
+        for (int k = 0; k < 4; ++k) centers[k] = { uv(rng), uv(rng), uv(rng) };
+        for (uint32_t j = 0; j < 32; ++j)
+        {
+            const V3 ctr = centers[rng() % 4];
+            c.p[j] = { ctr.x + 0.25f * uv(rng), ctr.y + 0.25f * uv(rng), ctr.z + 0.25f * uv(rng) };
+            c.s[j] = us(rng);
+        }
+        if (t % 3 == 0)
+            for (int k = 0; k < 3; ++k)
+            {
+                const uint32_t a = rng() % 32, b = rng() % 32;
+                if (a == b) continue;
+                c.p[b] = c.p[a];
+                if (rng() % 2) c.p[b].x += 2e-5f * uv(rng);
+                if (rng() % 2) c.s[b] = c.s[a];
+                else c.s[b] = c.s[a] + 0.01f + 0.05f * (rng() % 100) / 100.0f;
+            }
+
+        const uint32_t pop = 2 + rng() % 31;
+        uint32_t lanes[32];
+        for (uint32_t j = 0; j < 32; ++j) lanes[j] = j;
+        for (uint32_t j = 0; j < pop; ++j) std::swap(lanes[j], lanes[j + rng() % (32 - j)]);
+        c.allMask = 0;
+        for (uint32_t j = 0; j < pop; ++j) c.allMask |= 1u << lanes[j];
+        c.name = "random";
+        cases.push_back(c);
+    }
+
+    const uint32_t N = uint32_t(cases.size());
+
+    // ---- reference + coverage ---------------------------------------------
+    std::vector<uint32_t> refMask(N);
+    std::vector<uint8_t> skip(N, 0);
+    size_t earlyOut = 0, dupeCulled = 0, pcmFired = 0, fillRan = 0, skipped = 0;
+    for (uint32_t t = 0; t < N; ++t)
+    {
+        const CrWarpCase& c = cases[t];
+        Slack sl;
+        refMask[t] = refReduce(c.p, c.s, c.normal, c.allMask, BIAS, CLUSTERING, KEEPDEEPEST,
+                               MAXP, DUPETEST, REDUCE2, sl);
+        // The constructed cases are constructed to sit ON ties, so the slack
+        // tracker must not be allowed to skip them -- they would then assert
+        // nothing at all.  Their ties are all in RAW uploaded separations, which
+        // compare bit-exactly on both sides.
+        skip[t] = (t >= nConstructed && sl.near) ? 1 : 0;
+
+        uint32_t cullMask = c.allMask;
+        for (uint32_t j = 0; j < 32; ++j)
+            if ((c.allMask >> j) & 1)
+                for (uint32_t i = 0; i < 32; ++i)
+                    if (((c.allMask >> i) & 1) && i != j)
+                    {
+                        const V3 dv = sub(c.p[i], c.p[j]);
+                        if (dot3(dv, dv) < 1e-8f && (c.s[i] < c.s[j] || (c.s[i] == c.s[j] && i > j)))
+                            cullMask &= ~(1u << j);
+                    }
+        if (cullMask != c.allMask) ++dupeCulled;
+        if (__builtin_popcount(cullMask) <= MAXP) ++earlyOut;
+        else
+        {
+            ++pcmFired;
+            if (__builtin_popcount(refMask[t]) == MAXP) ++fillRan;
+        }
+    }
+
+    // ---- upload ------------------------------------------------------------
+    // 544-byte record: float4 normal | uint4 allMask | float4[32] point.xyz, sep
+    std::vector<float> input(size_t(N) * (544 / 4), 0.0f);
+    for (uint32_t t = 0; t < N; ++t)
+    {
+        float* r = input.data() + size_t(t) * (544 / 4);
+        const CrWarpCase& c = cases[t];
+        r[0] = c.normal.x; r[1] = c.normal.y; r[2] = c.normal.z;
+        std::memcpy(r + 4, &c.allMask, 4);
+        for (uint32_t j = 0; j < 32; ++j)
+        {
+            float* q = r + 8 + 4 * j;
+            q[0] = c.p[j].x; q[1] = c.p[j].y; q[2] = c.p[j].z; q[3] = c.s[j];
+        }
+    }
+
+    PxgBufferHandle bIn = createBufferFrom(dev, input);
+    std::vector<uint32_t> outInit(N, 0xdeadbeefu);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+
+    CrWarpPush push{};
+    push.input = dev->getBufferDeviceAddress(bIn);
+    push.output = dev->getBufferDeviceAddress(bOut);
+    push.numCases = N;
+
+    {
+        Kernel k("contactReduceWarpBda.spv", "contactReduceWarpLaunch", {}, sizeof(CrWarpPush));
+        k.dispatch(N, {}, push, 1u, 1u);
+        dev->flush();
+    }
+
+    const auto got = downloadBuffer<uint32_t>(dev, bOut, N);
+
+    size_t mm = 0, checked = 0;
+    for (uint32_t t = 0; t < N; ++t)
+    {
+        if (skip[t]) { ++skipped; continue; }
+        ++checked;
+        if (got[t] != refMask[t])
+        {
+            ++mm;
+            if (mm <= 8)
+                std::printf("  [%s] case %u: got=%08x exp=%08x allMask=%08x\n",
+                            cases[t].name, t, got[t], refMask[t], cases[t].allMask);
+        }
+    }
+
+    dev->destroyBuffer(bIn);
+    dev->destroyBuffer(bOut);
+
+    PXG_CHECK_MSG(mm == 0, "contactReduceWarp: %zu mask mismatches", mm);
+    PXG_CHECK_MSG(checked > N * 3 / 4, "contactReduceWarp: too many skipped (%zu)", skipped);
+    PXG_CHECK_MSG(earlyOut > 20, "contactReduceWarp: early-out thin (%zu)", earlyOut);
+    PXG_CHECK_MSG(dupeCulled > 100, "contactReduceWarp: dupe cull thin (%zu)", dupeCulled);
+    PXG_CHECK_MSG(pcmFired > 200, "contactReduceWarp: full path thin (%zu)", pcmFired);
+    PXG_CHECK_MSG(fillRan > 200, "contactReduceWarp: five-point results thin (%zu)", fillRan);
+}
+
 } // namespace
