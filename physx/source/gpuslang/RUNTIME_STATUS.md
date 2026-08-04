@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **683/683** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **684/684** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1622,6 +1622,85 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
+
+## P8.39 — the cooked convex-hull blob reader, plus a survey of what the core kernel actually needs
+
+`pxgSlangConvexHull` transcribes the `ConvexScratch` accessors (`convexTriangle.cuh:55-136`) as
+address arithmetic over a Buffer Device Address.  Every remaining kernel of the convex-vs-mesh
+chain re-derives these offsets — the SAT phase walks planes and edge lists, the clipper walks a
+face's vertex list, the post-process walks faces-by-vertices — and one wrong offset reads
+plausible floats from the neighbouring section, which is the failure mode hardest to spot
+downstream.  Same reasoning as P8.25's BV32 reader.
+
+The blob, from `PxgShape::hullOrMeshPtr`:
+
+    @0                      float4  centerOfMass
+    @16                     uint4   (.x = the packed hull descriptor)
+    @32                     float4  (not read by this chain)
+    @48                     float4  vertices[nbVerts]
+    +16*nbVerts             float4  planes[nbPolygons]
+    +16*nbPolygons          uint    polyDescs[nbPolygons]
+    +4*nbPolygons           uint16  verticesByEdges16[2*nbEdges]
+    +4*nbEdges              uint8   facesByEdges8[2*nbEdges]
+    +2*nbEdges              uint8   facesByVertices8[3*nbVerts]
+    +3*nbVerts              uint8   vertexData8[...]
+
+**The two packed words are not the same packing.**  Both are three fields in one uint, but the
+hull descriptor's top half is a 16-bit edge count while a polygon descriptor's top half is a
+16-bit vertex reference.  The CUDA returns `PxU8`/`PxU16` from those decoders, so the masks are
+load-bearing rather than decorative: a hull with 300 polygons wraps, and this port wraps
+identically.
+
+**The oracle is the construction, not a formula.**  The fixture builds each blob by APPENDING
+sections and recording where each landed; the expected offsets are those recorded positions.
+Restating the shader's closed-form arithmetic in the test would be circular — the same slip in
+both would cancel — whereas append-and-record derives the layout from the section sizes alone.
+Every section is also filled with values encoding (section, index), so a wrong address is caught
+twice: by the reported offset and by the value read through it.  Seven hull shapes, including
+counts that leave every run past the planes unaligned, and the 8- and 16-bit field maxima.
+
+**Sweep 20/21, and the survivor corrects something I wrote.**  M14 replaced the byte reader's
+address rounding with index rounding — the spelling this port originally had.  I described that
+as a bug the fixture would catch.  **It is not a value bug at all**: both spellings extract the
+byte at `base + byteIndex`, because rounding the index down and shifting by its low two bits
+lands on exactly the same byte as rounding the sum down and shifting by the sum's low two bits.
+What differs is only the address the uint load is issued at, which in the index-rounding
+spelling inherits the section base's misalignment.  Vulkan requires a scalar load to be
+naturally aligned, so that is undefined behaviour — but llvmpipe services it, and **no fixture
+on this platform can distinguish the two**.  It is recorded as an equivalent mutant, and the
+absolute-address form is kept because it is the one that is actually defined.
+
+### What the recon established for the tranches after this one
+
+A read-only survey (six parallel readers plus a completeness critic) mapped the rest of the
+chain.  The load-bearing corrections to my earlier notes:
+
+- **`convexTrimeshNarrowphaseCore` is `convexMesh.cu:74-215`, not 74-470**, and it is pure
+  per-warp setup with no algorithm-selecting branch: it fills a `ConvexMeshScratch` and
+  tail-calls `convexTriangleContactGen` (`convexTriangle.cuh:1640-1882`).  The sphere and
+  capsule cores that follow it in the file belong to a different kernel.
+- **The core performs zero global writes.**  All seven per-pair outputs are written by
+  `convexTriangleContactGen`.
+- **The SAT is three staged sub-phases with early-out** — `satConvexFaceNormals` (:217),
+  `satTriangleNormal` (:303), `satEdgeCrossDirection2` (:575) — behind `convexMeshSAT<true>`
+  (:867).  `CONVEX_MAX_VERTICES_POLYGONS` is 64.
+- **`ConvexTriNormalAndIndex`** is 16 B (normal @0, index @12) with `DeferredContactMask =
+  0x80000000` and `NbContactsShift = 27`; `ConvexTriContacts` and `ConvexTriIntermediateData`
+  are 4 B each; `ConvexTriContact` is a bare float4 (point in convex-local space, `.w` =
+  separation).
+- **The second-pass entry packs `pairIdx & 0x1fffffff` with a `VoronoiState` in bits 29-31**,
+  which is exactly what P8.30's classifier produces.
+
+Four upstream oddities were found and are being left alone deliberately, recorded here so a
+future reader does not "fix" them into a behaviour difference: `convexMeshPostProcess.cu:363`
+masks with `0x0ffffff` (24 bits) where `getTriangleIndex` uses 27; `(1 << numContactsGenerated)
+- 1` at `convexTriangle.cuh:1781` shifts by the full word width when the contact count reaches
+its 32 ceiling; `cvxTriContacts[off].index` is written before the overflow check that zeroes the
+count; and the convex path does not swap `triAdjTrisIdx.x/.z` under a negative mesh-scale
+determinant while the sphere and capsule paths do.
+
+Suite **684/684 in both memory modes** (683 -> 684).  No engine-facing change: no manifest
+entry, no ABI row.
 
 ## P8.38 — the polygon clipper, and two bugs a uniform fixture could not see
 
