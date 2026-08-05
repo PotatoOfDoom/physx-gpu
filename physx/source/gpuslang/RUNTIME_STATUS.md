@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **686/686** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **687/687** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1622,6 +1622,111 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
+
+## P8.45 — the emit tail, and a mutant that cannot be killed on this platform
+
+The tail of `convexTriangleContactGen` (convexTriangle.cuh:1769-1881) as one unit: the
+reduction, the temp-stream reservation, the scatter, and the five per-pair records the rest
+of the chain reads.  With this, everything between the hull blob and the engine kernel
+exists.
+
+### Why one unit and not the two the existing scalar shaders suggest
+
+The tail looks like two stages, and there are two Phase-1 scalar shaders shaped that way.
+That is the wrong seam.  The output half reads the RAW clipper staging slot 0, recovers the
+triangle's other vertices by unconditional shuffle, and runs for EVERY pair INCLUDING SAT
+failures, while the emit half runs only inside `if (isSATPassed)` and
+`if (numContactsGenerated)`.  They are one control-flow unit over one warp's groupshared
+state.
+
+### Five things kept that look like mistakes
+
+Each is documented in the module together with what "fixing" it would cost:
+
+- `.index` is stored BEFORE the overflow test and the atomic reservation is never rolled
+  back.  On overflow the index stays out of range and only the zeroed `nbOutputContacts`
+  stops the post-process dereferencing it — the downstream filter is on the COUNT, not the
+  depth, so reordering the store is not equivalent.
+- `delayContacts &&= numContactsGenerated` ANDs the RAW clipper count, not the
+  `nbOutputContacts` the overflow guard may have just zeroed.  Under temp-buffer pressure a
+  port that used the output count would append fewer pairs to the second-pass list.
+- The second-pass classifier reads raw staging slot 0 — the clipper's FIRST contact, which
+  the reduction may well have discarded.
+- `mask | triangleIdx` is a bitwise OR while the neighbouring NI word is an ADDITION.  The
+  mixed spelling is load-bearing: a remap index at or above 2^27 CARRIES into the four-bit
+  count field, and the fixture now has a case that proves it.
+- `getTriangleActiveMask` returns 0 for a contact strictly inside the triangle, which the
+  post-process turns into a silent kill.  The obviously-safe default would KEEP contacts
+  PhysX drops.
+
+### One deliberate deviation, and it is a narrowing
+
+The CUDA writes `verts1` only on lanes < 3 and only inside the SAT branch, then shuffles it
+UNCONDITIONALLY — so a SAT-failed pair shuffles a register that was never written.  Here the
+three vertices are warp-uniform parameters: the same values wherever the CUDA's are defined,
+defined everywhere the CUDA's are not.  Staging them under the branch instead would put a
+barrier in non-uniform control flow, which llvmpipe hangs on rather than erroring.
+
+### The atomics shaped the fixture
+
+Reservation order across groups is not predictable, so the test asserts what is: the cursor
+advances by the sum of EVERY reservation including the dropped ones (the CUDA never rolls
+one back), each payload is checked at the index the GPU itself reported, the slices tile the
+reserved range with no gap or overlap, and the second-pass list is compared as a multiset.
+The three overflow cases run one pair per dispatch so `startIndex` is deterministic.
+
+### Sweep 29/41, then 35/41
+
+The first sweep left twelve survivors and — unlike P8.44's — SIX OF THEM WERE REAL FIXTURE
+GAPS, each blind for a reason worth recording:
+
+- every case carried the normal `(0, 0, 1)`, so the x and y words of the NI record were both
+  zero and permuting them in the four-lane cooperative write was invisible;
+- the deepest contact always sat below lane 16, which the default separation ramp happened
+  to guarantee, so dropping the ONE butterfly stage that crosses between the warp halves
+  changed nothing;
+- every separation was negative, so the unselected lanes could never win the depth minimum
+  and taking it over all lanes agreed with taking it over the selected ones;
+- no triangle was degenerate, so the zero-area guard in the barycentrics was never taken;
+- five contacts never included a duplicate, and at exactly five `>` and `>=` as the
+  reduction gate agree unless the dupe cull has something to do;
+- no remap index reached 2^27, so the ADD-versus-OR distinction in the NI word was invisible.
+
+### The case that found a bug in the test rather than the shader
+
+Adding the 2^27 remap index turned the test red — and the shader was right.  The expected
+contact count was being recovered from the GPU's own NI word by masking and shifting, which
+is circular, and it breaks on exactly the case that matters: the word is an ADDITION, so the
+carry makes the read-back count one too high.  The expectation is now derived from the
+reference; only the overflow VERDICT still comes from the reported index, because the
+reservation order genuinely cannot be predicted.
+
+### The six remaining survivors, and one that cannot be killed here
+
+- **M5 and M6**, feeding the reduction unguarded staging and widening the live-lane test by
+  one.  Both are covered by the argument the module already carries: the reduction
+  neutralises out-of-set lanes before its butterflies and ANDs the set mask into every
+  ballot, so their values can neither win an anchor nor set a cull bit that survives.
+- **M34**, `+` instead of `|` in the ordered word.  Equivalent while the triangle index fits
+  in 31 bits, which the 27-bit field guarantees.  (Its twin in the NI word is NOT equivalent,
+  and is now killed.)
+- **M28**, making the 0.97 region bound inclusive — needs exact float equality at the bound.
+- **M24**, "the classifier reads the first EMITTED contact".  NOT FORMULABLE IN THIS MODULE:
+  the raw slot is an explicit parameter and the classifier runs on lane 0, where the lane's
+  own staged value IS slot 0.  The mistake is only available to the CALLER, so it belongs to
+  the engine-kernel tranche, not here.  Recorded rather than argued away.
+- **M20**, letting every lane scatter instead of only the selected ones.  This one is
+  **provably unkillable on this platform**, and the proof is worth having.  The exclusive
+  scan increments exactly at a selected lane, so the lanes that collide on slot `c+1` are the
+  non-selected lanes above selected lane `j` plus the next selected lane `j'` — and `j'`, the
+  one holding the CORRECT value, is always the HIGHEST lane in the group.  Any implementation
+  that resolves same-address writes in ascending lane order therefore lands on the right
+  value every time.  That is not equivalence; it is a platform-dependent masking, and no
+  fixture on llvmpipe can see through it.
+
+Suite **687/687 in both memory modes** — one suite more than P8.44, the new `cvxTriEmit`.
+Still no manifest entry and no ABI row — the next tranche is `convexTrimeshNarrowphase` itself, where the chained buffer-device-address loads
+of the setup stage finally do fall under the P8.40 rule.
 
 ## P8.44 — contactReduceShared on the virtual warp, and a fill loop that turns out to be dead
 
