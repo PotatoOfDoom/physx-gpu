@@ -156,9 +156,13 @@ PXG_TEST(cvxTriSetupPrologue)
     //      accidentally agree between them ----------------------------------
     Mesh meshA, meshB;
     meshA.verts = { { 0, 0, 0, 0 }, { 2, 0, 0, 0 }, { 0, 3, 0, 0 }, { 1, 1, 4, 0 }, { -2, 1, 1, 0 } };
-    meshA.idx = { 0, 1, 2, 0,   1, 3, 2, 0,   4, 0, 2, 0 };
-    meshA.adj = { 11, 12, 13, 0,   0xffffffffu, 21, 0x80000000u, 0,   31, 32, 33, 0 };
-    meshA.remap = { 700, 701, 702 };
+    // Triangle 3 is DEGENERATE (two coincident vertices), so the cross product is
+    // the zero vector and getNormalized() has to take its zero branch rather than
+    // divide.  Without it that guard is never exercised.
+    meshA.idx = { 0, 1, 2, 0,   1, 3, 2, 0,   4, 0, 2, 0,   1, 1, 3, 0 };
+    meshA.adj = { 11, 12, 13, 0,   0xffffffffu, 21, 0x80000000u, 0,
+                  31, 32, 33, 0,   51, 52, 53, 0 };
+    meshA.remap = { 700, 701, 702, 703 };
     buildMesh(meshA, 3);
 
     meshB.verts = { { 1, -1, 0, 0 }, { 4, 0, 1, 0 }, { 0, 5, -2, 0 }, { 2, 2, 2, 0 } };
@@ -180,7 +184,7 @@ PXG_TEST(cvxTriSetupPrologue)
     // ---- shapes ------------------------------------------------------------
     // 0: convex.  1: mesh A, positive scale.  2: mesh B, NEGATIVE determinant.
     // 3: a second convex with a different scale rotation.
-    std::vector<GpuShape> shapes(4);
+    std::vector<GpuShape> shapes(5);
     auto setShape = [](GpuShape& s, V3 sc, V4 rot, uint64_t ptr, uint32_t type) {
         s.sx = sc.x; s.sy = sc.y; s.sz = sc.z;
         s.rx = rot.x; s.ry = rot.y; s.rz = rot.z; s.rw = rot.w;
@@ -191,22 +195,41 @@ PXG_TEST(cvxTriSetupPrologue)
         s.particleOrSoftbodyId = 0;
     };
     setShape(shapes[0], { 1.3f, 0.8f, 1.1f }, { 0, 0, 0, 1 }, addrHull, GEOM_CONVEXMESH);
-    setShape(shapes[1], { 1.0f, 1.0f, 1.0f }, { 0, 0, 0, 1 }, addrMeshA, GEOM_TRIANGLEMESH);
+    {
+        // A NON-IDENTITY MESH SCALE ROTATION.  With every scale rotation the
+        // identity, vertex2Shape degenerates to a componentwise multiply and both
+        // quaternion rotations inside it become no-ops -- so dropping either one
+        // is invisible.
+        const float a = 0.9f;
+        setShape(shapes[1], { 1.0f, 1.6f, 0.7f },
+                 { std::sin(a * 0.5f), 0.0f, 0.0f, std::cos(a * 0.5f) }, addrMeshA, GEOM_TRIANGLEMESH);
+    }
     setShape(shapes[2], { 1.5f, -0.7f, 1.2f }, { 0, 0, 0, 1 }, addrMeshB, GEOM_TRIANGLEMESH);
     {
         const float a = 0.4f;
         setShape(shapes[3], { 0.9f, 1.4f, 0.6f },
                  { 0.0f, std::sin(a * 0.5f), 0.0f, std::cos(a * 0.5f) }, addrHull, GEOM_CONVEXMESH);
     }
+    // TWO negative scale components: the determinant is POSITIVE, so the winding
+    // must NOT flip.  A guard written as "any component is negative" agrees with
+    // the determinant whenever exactly one is negative, which is the only shape
+    // the fixture had.
+    setShape(shapes[4], { -1.5f, -0.7f, 1.2f }, { 0, 0, 0, 1 }, addrMeshB, GEOM_TRIANGLEMESH);
 
     // ---- transforms (PxsCachedTransform: quat @0, pos @16, 32 B) -----------
-    std::vector<float> xf(4 * 8, 0.0f);
+    std::vector<float> xf(6 * 8, 0.0f);
     auto setXf = [&](uint32_t i, V4 q, V3 p) {
         float* r = xf.data() + i * 8;
         r[0] = q.x; r[1] = q.y; r[2] = q.z; r[3] = q.w;
         r[4] = p.x; r[5] = p.y; r[6] = p.z;
     };
-    setXf(0, { 0, 0, 0, 1 }, { 0.5f, -0.25f, 1.0f });
+    // THE CONVEX BODY MUST ROTATE.  The composition is conj(q0)*q1 with
+    // rotInv(q0, p1 - p0); with q0 the identity the conjugate is a no-op and the
+    // translation needs no rotating, so three separate mistakes become invisible.
+    {
+        const float a = 0.55f;
+        setXf(0, { 0.0f, 0.0f, std::sin(a * 0.5f), std::cos(a * 0.5f) }, { 0.5f, -0.25f, 1.0f });
+    }
     {
         const float a = 0.7f;
         setXf(1, { std::sin(a * 0.5f), 0.0f, 0.0f, std::cos(a * 0.5f) }, { -1.0f, 2.0f, 0.5f });
@@ -215,24 +238,33 @@ PXG_TEST(cvxTriSetupPrologue)
         const float a = -1.1f;
         setXf(2, { 0.0f, 0.0f, std::sin(a * 0.5f), std::cos(a * 0.5f) }, { 3.0f, 0.0f, -1.5f });
     }
-    setXf(3, { 0, 0, 0, 1 }, { 0.0f, 0.0f, 0.0f });
+    {
+        const float a = -0.8f;
+        setXf(3, { std::sin(a * 0.5f), 0.0f, 0.0f, std::cos(a * 0.5f) }, { 1.5f, -2.0f, 0.75f });
+    }
+    setXf(4, { 0, 0, 0, 1 }, { -0.5f, 1.25f, 2.0f });
+    setXf(5, { 0, 0, 0, 1 }, { 2.25f, 0.5f, -1.0f });
 
-    std::vector<float> cdist = { 0.02f, 0.031f, 0.047f, 0.013f };
+    std::vector<float> cdist = { 0.02f, 0.031f, 0.047f, 0.013f, 0.005f, 0.061f };
 
     // ---- contact managers --------------------------------------------------
     // 0: convex first.  1: MESH FIRST, so the swap has to fire.  2: the negative
     // scale.  3: the rotated convex.
+    // THE TRANSFORM REFS MUST NOT EQUAL THE SHAPE REFS.  While they match, the
+    // contact distance -- which is indexed by the TRANSFORM refs -- reads the same
+    // slots either way, so indexing it by the shape refs is invisible.
     std::vector<CmInput> cms = {
-        { 0, 1, 0, 1 },
-        { 1, 0, 1, 0 },   // shapeRef0 IS the mesh -> swap
+        { 0, 1, 4, 5 },
+        { 1, 0, 5, 4 },   // shapeRef0 IS the mesh -> swap
         { 0, 2, 0, 2 },
         { 3, 1, 3, 1 },
+        { 0, 4, 4, 2 },   // two negative scale components: no flip
     };
 
     // ---- ConvexMeshPair, 56 B: startIndex @28, roundedStartIndex @40 -------
     // Deliberately different values so a port reading `count`/`cmIndex` instead
     // (the offsets the declaration's trailing comment numbers suggest) is caught.
-    std::vector<uint8_t> pairBlob(cms.size() * 56, 0);
+    std::vector<uint8_t> pairBlob(8 * 56, 0);
     auto setPair = [&](uint32_t cm, uint32_t startIndex, uint32_t count, uint32_t cmIndex,
                        uint32_t rounded) {
         uint8_t* r = pairBlob.data() + size_t(cm) * 56;
@@ -245,6 +277,7 @@ PXG_TEST(cvxTriSetupPrologue)
     setPair(1, 300, 9, 66, 400);
     setPair(2, 500, 3, 77, 600);
     setPair(3, 800, 5, 88, 900);
+    setPair(4, 1100, 6, 99, 1200);
 
     // ---- the pairs to run --------------------------------------------------
     struct Pair { uint32_t cm, tri, off, pad; };
@@ -254,6 +287,8 @@ PXG_TEST(cvxTriSetupPrologue)
         { 1, 1, 1, 0 },     // the swapped pair
         { 2, 1, 2, 0 },     // the negative determinant
         { 3, 1, 4, 0 },     // a rotated convex scale
+        { 0, 3, 5, 0 },     // the DEGENERATE triangle
+        { 4, 0, 6, 0 },     // two negative scale components -> determinant positive
     };
 
     const uint32_t n = uint32_t(pairs.size());
@@ -287,6 +322,7 @@ PXG_TEST(cvxTriSetupPrologue)
 
     size_t bad = 0;
     size_t sawSwap = 0, sawFlip = 0, sawBoundaryAdj = 0, sawRotatedScale = 0;
+    size_t sawDegenerate = 0, sawNegativePairNoFlip = 0;
     auto sameF = [](float a, float b)
     { uint32_t x, y; std::memcpy(&x, &a, 4); std::memcpy(&y, &b, 4); return x == y; };
 
@@ -315,6 +351,8 @@ PXG_TEST(cvxTriSetupPrologue)
         const V4 triRot = { tri.rx, tri.ry, tri.rz, tri.rw };
         const bool flip = (triScale.x * triScale.y * triScale.z) < 0.0f;
         if (flip) ++sawFlip;
+        if (!flip && (triScale.x < 0.0f || triScale.y < 0.0f || triScale.z < 0.0f))
+            ++sawNegativePairNoFlip;
         if ((cvx.rx != 0.0f) || (cvx.ry != 0.0f) || (cvx.rz != 0.0f)) ++sawRotatedScale;
 
         V3 loc[3];
@@ -330,6 +368,8 @@ PXG_TEST(cvxTriSetupPrologue)
         const V3 e2 = flip ? loc[1] : loc[2];
         const V3 en = normalized(cross3(sub(e1, e0), sub(e2, e0)));
 
+        if (dot3(cross3(sub(e1, e0), sub(e2, e0)), cross3(sub(e1, e0), sub(e2, e0))) == 0.0f)
+            ++sawDegenerate;
         const uint32_t adjX = mesh.adj[4 * pr.tri + 0];
         if (adjX == 0xffffffffu) ++sawBoundaryAdj;
 
@@ -381,6 +421,9 @@ PXG_TEST(cvxTriSetupPrologue)
     PXG_CHECK_MSG(sawFlip > 0, "no case has a negative scale determinant (the winding flip is untested)");
     PXG_CHECK_MSG(sawBoundaryAdj > 0, "no case carries a BOUNDARY adjacency word");
     PXG_CHECK_MSG(sawRotatedScale > 0, "no case has a non-identity convex scale rotation");
+    PXG_CHECK_MSG(sawDegenerate > 0, "no case has a degenerate triangle (the zero-normal branch)");
+    PXG_CHECK_MSG(sawNegativePairNoFlip > 0,
+                  "no case has negative scale components WITHOUT a negative determinant");
 }
 
 } // namespace
