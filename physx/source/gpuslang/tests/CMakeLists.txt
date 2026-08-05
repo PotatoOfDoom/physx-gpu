@@ -465,6 +465,11 @@ pxg_compile_shader(contactReduceWarpBda contactReduceWarpLaunch)
 # chain of cross-then-dot signed areas compared against 0.97, which is exactly
 # where contraction moves a contact from one Voronoi region to the next.
 pxg_compile_shader(cvxTriEmitBda cvxTriEmitLaunch)
+# P8.46 prerequisite: an atomic read-modify-write through a buffer device address
+# that points into PINNED HOST memory.  Test scaffolding, absent from the manifest.
+# Absent from PXG_HLSL_ENTRIES (Ptr<>) and from PXG_NOCONTRACT_SHADERS (integer
+# only, nothing to contract).
+pxg_compile_shader(pinnedAtomicBda pinnedAtomicLaunch)
 pxg_compile_shader(npPairMgmtBda removeContactManagers_Stage1 removeContactManagers_Stage2 removeContactManagers_Stage3 removeContactManagers_Stage4 removeContactManagers_Stage5 removeContactManagers_Stage5_CvxTri)
 # P6.2: PBD particle spatial-hash grid build + reorder on the engine ABI (BDA).
 # Both kernels read the PxgParticleSystem descriptor array through Ptr<> and

@@ -289,6 +289,41 @@ public:
         std::fflush(stderr);
     }
 
+    // Pinned-host pointer arguments: substitute the buffer device address.
+    //
+    // Under CUDA's unified addressing a cuMemHostAlloc pointer IS a device
+    // pointer, so PhysX passes such pointers to kernels unchanged.  Here pinned
+    // memory is a host-visible Vulkan buffer whose CPU mapping and device address
+    // are unrelated numbers, and the blob builders copy argument bytes verbatim —
+    // so any argument the ABI row marks must be translated on the way in.
+    //
+    // A null pointer stays null (CUDA parity: kernels null-check these).  A
+    // non-null pointer that does not resolve is a REFUSED LAUNCH rather than a
+    // silent zero, because the alternative is a shader writing to address 0.
+    bool translateHostPtrs(const PxgKernelAbiRow* abi, std::vector<uint8_t>& blob,
+                           const std::vector<size_t>& offsets) const
+    {
+        if (!abi || abi->hostPtrMask == 0)
+            return true;
+        for (uint32_t i = 0; i < abi->argCount && i < offsets.size(); ++i)
+        {
+            if (((abi->hostPtrMask >> i) & 1u) == 0u)
+                continue;
+            if (abi->argSizes[i] != 8 || offsets[i] + 8 > blob.size())
+                return false;
+            uint64_t hostAddr = 0;
+            std::memcpy(&hostAddr, blob.data() + offsets[i], 8);
+            if (hostAddr == 0)
+                continue;
+            const PxgDevicePtr dev = mShim->hostGetDevicePointer(reinterpret_cast<const void*>(uintptr_t(hostAddr)));
+            if (dev == 0)
+                return false;
+            const uint64_t devAddr = uint64_t(dev);
+            std::memcpy(blob.data() + offsets[i], &devAddr, 8);
+        }
+        return true;
+    }
+
     PxCUresult launchKernel(CUfunction f, unsigned int gridDimX, unsigned int gridDimY, unsigned int gridDimZ,
                             unsigned int /*blockDimX*/, unsigned int /*blockDimY*/, unsigned int /*blockDimZ*/,
                             unsigned int /*sharedMemBytes*/, CUstream /*hStream*/, PxCudaKernelParam* kernelParams,
@@ -313,12 +348,15 @@ public:
         // first argument starts at offset 0, so the blob is an identity copy.
         const uint32_t count = uint32_t(kernelParamsSizeInBytes / sizeof(PxCudaKernelParam));
         std::vector<uint8_t> blob;
+        std::vector<size_t> offsets;
+        offsets.reserve(count);
         size_t maxAlign = 1;
         for (uint32_t i = 0; i < count; ++i)
         {
             const size_t a = paramAlign(kernelParams[i].size);
             if (a > maxAlign) maxAlign = a;
             blob.resize((blob.size() + (a - 1)) & ~(a - 1));   // pad to natural alignment
+            offsets.push_back(blob.size());
             const uint8_t* d = static_cast<const uint8_t*>(kernelParams[i].data);
             blob.insert(blob.end(), d, d + kernelParams[i].size);
         }
@@ -327,6 +365,14 @@ public:
         // not 12).  The Slang side sees exactly that struct, so round the blob to match,
         // otherwise the shim's blobSize == pushConstantSize gate rejects the launch.
         blob.resize((blob.size() + (maxAlign - 1)) & ~(maxAlign - 1));
+        {
+            const PxgKernelAbiRow* abi = id < mManifestCount ? pxgFindKernelAbi(mManifest[id].cudaName) : nullptr;
+            if (!translateHostPtrs(abi, blob, offsets))
+            {
+                traceLaunch("sized", id, false);
+                return record(PxgResult::InvalidValue);
+            }
+        }
         traceDispatch("sized", id);
         const PxgResult res = mShim->launchKernel(id, gridDimX, gridDimY, gridDimZ, blob.data(),
                                                   uint32_t(blob.size()));
@@ -356,16 +402,24 @@ public:
         }
 
         std::vector<uint8_t> blob;
+        std::vector<size_t> offsets;
+        offsets.reserve(abi->argCount);
         size_t maxAlign = 1;
         for (uint32_t i = 0; i < abi->argCount; ++i)
         {
             const size_t a = paramAlign(abi->argSizes[i]);
             if (a > maxAlign) maxAlign = a;
             blob.resize((blob.size() + (a - 1)) & ~(a - 1));
+            offsets.push_back(blob.size());
             const uint8_t* d = static_cast<const uint8_t*>(kernelParams[i]);
             blob.insert(blob.end(), d, d + abi->argSizes[i]);
         }
         blob.resize((blob.size() + (maxAlign - 1)) & ~(maxAlign - 1));
+        if (!translateHostPtrs(abi, blob, offsets))
+        {
+            traceLaunch("void**", id, false);
+            return record(PxgResult::InvalidValue);
+        }
         traceDispatch("void**", id);
         const PxgResult res = mShim->launchKernel(id, gridDimX, gridDimY, gridDimZ, blob.data(),
                                                   uint32_t(blob.size()));

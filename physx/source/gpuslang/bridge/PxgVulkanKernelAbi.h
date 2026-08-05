@@ -51,6 +51,25 @@ struct PxgKernelAbiRow
     const char* cudaName;     // CUDA __global__ name (registry key)
     const uint8_t* argSizes;  // per-argument byte sizes, in signature order
     uint32_t argCount;
+
+    // Bit i set: argument i is a pointer into PINNED HOST memory and must be
+    // TRANSLATED to a buffer device address before it reaches the shader.
+    //
+    // WHY THIS EXISTS.  Under CUDA's unified addressing a `cuMemHostAlloc`
+    // pointer is simultaneously a valid device pointer, so PhysX hands such
+    // pointers straight to kernels — `mMaxConvexMeshTempMemory`
+    // (PxgNarrowphaseCore.cpp:223) is one, written on the GPU with an atomicMax
+    // and read on the CPU with no copy at all (:1644).  This runtime backs pinned
+    // memory with a HOST-VISIBLE VULKAN BUFFER (PxgCudaShim::memHostAlloc), whose
+    // CPU mapping and whose device address are unrelated numbers.  The blob
+    // builder copies argument bytes verbatim, so without this mask the shader
+    // would receive a CPU virtual address and dereference nonsense.
+    //
+    // Zero for every row that has no such argument, which is all of them today:
+    // the four kernels that take that pointer — the convex/sphere trimesh and
+    // heightfield cores — are all still unmapped, so this is a prerequisite for
+    // bringing them up rather than a fix for a live fault.
+    uint32_t hostPtrMask;
 };
 
 // nullptr when the kernel has no ABI row yet (not brought up on the engine path).

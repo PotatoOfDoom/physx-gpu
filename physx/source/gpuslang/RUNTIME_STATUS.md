@@ -1623,6 +1623,66 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.46a — the pinned-host pointer the engine kernel has to write to
+
+A prerequisite for `convexTrimeshNarrowphase`, resolved before writing a line of it, because
+the answer could have made the kernel's prologue unportable.
+
+### The question
+
+The kernel's prologue does an `atomicMax` on `maxTempMemRequirement` (convexMesh.cu:674).
+That word is allocated in PINNED HOST memory (PxgNarrowphaseCore.cpp:223, via
+`mMappedMemoryAllocators` → `cuMemHostAlloc`) and read on the CPU with NO COPY AT ALL
+(:1644), where it drives the `collisionStackSize buffer overflow detected` warning.  Two
+things had to be true for the port to keep that behaviour, and neither was established.
+
+### One: atomics on pinned memory work
+
+`p3ShimPinned` already proved a pinned allocation is device-writable and host-coherent
+through its mapping — but only for ordinary STORES.  An atomic read-modify-write is a
+separate promise.  `p3ShimPinnedAtomic` now drives 4096 invocations contending on one pinned
+word with `InterlockedMax` and a second with `InterlockedAdd`: the maximum is exact over a
+deliberately non-monotonic sequence, no increment is lost, and the CPU reads both through
+the mapping without a DtoH.  So the prologue's atomic is neither a fault nor a silent no-op.
+
+### Two: the pointer itself does not survive the trip — except here
+
+Under CUDA's unified addressing a `cuMemHostAlloc` pointer IS a valid device pointer, which
+is why PhysX hands such pointers straight to kernels.  This runtime backs pinned memory with
+a host-visible Vulkan buffer (`PxgCudaShim::memHostAlloc`), and **the blob builders copy
+argument bytes verbatim** — there is no translation anywhere on the launch path, in either
+the sized or the `void**` form.  A pinned pointer argument would therefore reach the shader
+as a CPU virtual address.
+
+`PxgKernelAbiRow` now carries a `hostPtrMask`: bit *i* marks argument *i* as a pinned-host
+pointer, and both blob builders substitute the buffer device address via
+`hostGetDevicePointer` (which already resolves interior pointers).  A null pointer stays
+null, matching the kernels' own null checks; a non-null pointer that does not resolve is a
+REFUSED LAUNCH rather than a silent zero, because the alternative is a shader writing to
+address 0.
+
+**The mask is inert today and, on this platform, untestable.**  llvmpipe is a software
+rasteriser living in the calling process's address space, and its buffer device addresses
+ARE the CPU mappings: the test reports `host == dev == 139835543642112`.  An untranslated
+pinned pointer therefore works here BY ACCIDENT, exactly as it does under CUDA, and no
+fixture on this device can tell a translated argument from an untranslated one.  The test
+says so in a printed note rather than asserting it in either direction — demanding the two
+differ fails here, and demanding they match would bake a backend accident into the suite.
+This is the same category as P8.45's write-order masking: a correctness requirement the
+platform cannot demonstrate, named rather than argued away.
+
+### Scope of the hazard
+
+Four kernels take that pointer — the convex and sphere trimesh and heightfield cores
+(PxgNarrowphaseCore.cpp:2019, :2319, :2625, :2927) — and ALL FOUR are still unmapped
+(PxgSlangKernelManifest.h:88, :95, :96, :97).  So this is not a fix for a live fault; it is
+the thing that has to exist before any of them can be brought up.  Every other pinned
+allocation in the engine (`mBpDesc`, `mPairManagementData`, the patch/contact readback) is
+staged through a copy rather than passed as a kernel argument, and is unaffected.
+
+Suite **687/687 in both memory modes**, forced-fresh.  The change touches the launch path of
+every kernel, so the full run in both modes is the point rather than a formality.
+
 ## P8.45 — the emit tail, and a mutant that cannot be killed on this platform
 
 The tail of `convexTriangleContactGen` (convexTriangle.cuh:1769-1881) as one unit: the

@@ -233,6 +233,83 @@ PXG_TEST(p3Shim)
 // that read it by device address (copy-descriptor queues, pinned mirrors,
 // PxPinnedArray) — and reads kernel output back through the same mapping with
 // no explicit DtoH.  Both directions are verified bitwise through shimAxpy.
+// An ATOMIC read-modify-write through a buffer device address that points into
+// PINNED HOST memory, and the numeric fact that makes the ABI's hostPtrMask
+// necessary in the first place.
+//
+// p3ShimPinned proves an ordinary store into pinned memory is visible through the
+// CPU mapping.  The convex-vs-trimesh core kernel's prologue needs more than that:
+// it does an atomicMax on `maxTempMemRequirement` (convexMesh.cu:674), a word
+// PhysX allocates pinned and reads on the CPU with no copy at all
+// (PxgNarrowphaseCore.cpp:223, :1644).  If an atomic on host-visible memory were a
+// fault or a silent no-op here, the collisionStackSize overflow warning would stop
+// firing while contacts were being dropped -- exactly the kind of silence this
+// port has been bitten by before.
+PXG_TEST(p3ShimPinnedAtomic)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    struct PinnedAtomicParams { uint64_t target, counter; uint32_t count, pad; };
+    const PxgKernelDef manifest[] = {
+        { "pinnedAtomicBda.spv", "pinnedAtomicLaunch", uint32_t(sizeof(PinnedAtomicParams)), 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &shimLoader);
+
+    void* hw = nullptr;
+    if (shim.memHostAlloc(&hw, 2 * sizeof(uint32_t)) != PxgResult::Success)
+    {
+        std::printf("  NOTE: no pinned-mapped support on this backend -> skip\n");
+        return;
+    }
+    uint32_t* words = static_cast<uint32_t*>(hw);
+    words[0] = 0;
+    words[1] = 0;
+
+    const PxgDevicePtr dw = shim.hostGetDevicePointer(hw);
+    PXG_CHECK_MSG(dw != 0, "the pinned word has a device address");
+
+    // THE ABI's hostPtrMask IS A CORRECTNESS REQUIREMENT THIS PLATFORM CANNOT
+    // DEMONSTRATE.  Under CUDA's unified addressing a pinned host pointer IS a
+    // device pointer, which is why PhysX hands such pointers straight to kernels;
+    // Vulkan makes no such promise, so the bridge must translate the argument.
+    //
+    // On llvmpipe it does not have to: the software rasteriser lives in the
+    // calling process's address space and its buffer device addresses ARE the CPU
+    // mappings, so the two numbers coincide and an untranslated pointer works by
+    // accident.  This is reported rather than asserted in either direction --
+    // demanding they differ fails here, and demanding they match would bake a
+    // backend accident into the suite.  The mask is exercised for real only on a
+    // device where they diverge.
+    if (uint64_t(dw) == uint64_t(uintptr_t(hw)))
+        std::printf("  NOTE: this backend maps pinned memory at its device address "
+                    "(host == dev == %llu); the ABI hostPtrMask is inert here\n",
+                    (unsigned long long)dw);
+    PXG_CHECK_MSG(shim.hostGetDevicePointer(static_cast<uint8_t*>(hw) + 4) == dw + 4,
+                  "the interior pinned pointer the mask would translate resolves correctly");
+
+    const uint32_t N = 4096;
+    uint32_t expectedMax = 0;
+    for (uint32_t i = 0; i < N; ++i)
+        expectedMax = std::max(expectedMax, ((i * 2654435761u) >> 8) & 0xffffu);
+
+    PinnedAtomicParams prm;
+    prm.target = dw;
+    prm.counter = dw + 4;
+    prm.count = N;
+    prm.pad = 0;
+    PXG_CHECK_MSG(shim.launchKernel(0, (N + 63) / 64, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launchKernel doing atomics on pinned memory");
+    shim.streamSynchronize();
+
+    // Read THROUGH THE MAPPING, no DtoH -- the engine's model for this word.
+    PXG_CHECK_MSG(words[0] == expectedMax, "atomicMax on pinned memory: got=%u exp=%u",
+                  words[0], expectedMax);
+    PXG_CHECK_MSG(words[1] == N, "atomicAdd on pinned memory lost updates: got=%u exp=%u",
+                  words[1], N);
+
+    shim.memFreeHost(hw);
+}
+
 PXG_TEST(p3ShimPinned)
 {
     PxgSlangComputeDevice* dev = testDevice();
