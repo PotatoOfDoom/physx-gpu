@@ -1694,6 +1694,66 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.47 recon — the shift rule, restated correctly, before it is relied on twice
+
+Reading `radixSortSingleWarpKeysOnly` (RadixSort.cuh:579-699) for the next tranche turned up
+an error in P8.45's own reasoning, and correcting it is worth more than the port it was
+found during.
+
+### PTX CLAMPS, it does not mask
+
+The emit tail guards `(1 << numContactsGenerated) - 1` because the count can be exactly 32.
+The guard is right and the fixture proves it.  The JUSTIFICATION written next to it was not:
+it said PTX `shl.b32` masks the shift amount to five bits.  That is the x86 rule, and it does
+not even explain the behaviour it was invoked to explain — under masking `1 << 32` is 1 and
+`(1 << 32) - 1` is 0, whereas the CUDA demonstrably lands on 0xFFFFFFFF.  PTX **clamps** the
+shift to the register width, so `1 << 32` is ZERO and the subtraction gives 0xFFFFFFFF.
+
+### Why the distinction is load-bearing rather than pedantic
+
+`radixSortWarp` (RadixSort.cuh:135-170) packs two radix counts into each 32-bit accumulator
+and selects the half with
+
+```cuda
+accum = (1u << ((radix.x - bit) << 4));
+```
+
+`radix - bit` is UNSIGNED.  For the two radixes this slot owns it is 0 or 1, giving `1 << 0`
+and `1 << 16`.  For every other radix it is 2 or more — or, when `radix < bit`, an enormous
+wrapped value — so the shift is 32 or more and CLAMPING makes the term zero: the radix
+contributes nothing to a slot it does not belong to.  Under masking it would contribute 1 to
+the slot's LOW half and quietly corrupt the histogram of a radix sort.
+
+So the same construct appears twice in this chain with OPPOSITE intents — one wants
+0xFFFFFFFF out of an over-wide shift, the other wants 0 — and both are correct only under
+clamping.
+
+**The rule for the port: a shift by the operand width or more must be written out
+explicitly, because the CUDA relies on it producing zero.**  SPIR-V leaves it undefined, so
+neither behaviour may be assumed.  This joins the two rules already standing — no chained
+buffer-device-address load inside a grid-stride loop (P8.40), and no flag carried through a
+float select (P8.43).
+
+### What else the recon found in the sort
+
+- **`sanitizeKeys` (RadixSort.cuh:110-129) is a FALLTHROUGH switch.**  `badVals == 3` sets
+  `.y`, `.z` and `.w`; `badVals == 2` sets `.z` and `.w`; `badVals == 1` sets `.w` alone.
+  Transcribed as a normal switch it would leave stale keys in the tail of the last uint4,
+  and they would sort into the result as ordinary values.  It never touches `.x`, which is
+  safe only because the caller's index arithmetic keeps `goodVals` at least 1.
+- **The pass count's parity is load-bearing.**  The driver ping-pongs between the input and
+  the temp buffer once per pass and runs EIGHT of them, so the sorted result ends up back in
+  the ORIGINAL buffer.  That is why `sortTriangleIndices` can pass
+  `orderedCvxTriInterm + startIndex` as the input and the same pointer plus `nbUint4` as the
+  temp, and why the caller reads its answer from the input buffer afterwards.  An odd pass
+  count would leave the answer in the scratch half.
+- **Still open from the emit-stage recon**: whether the uninitialised padding in
+  `orderedCvxTriInterm`, between a pair's triangle count and the uint4-rounded count, can
+  sort into the binary-searched prefix.  `sanitizeKeys` pushes the tail of the LAST uint4 to
+  0xFFFFFFFF, which sorts high, but that covers the rounding to four — not the separate
+  padding the midphase's doubled counter reserves.  This has to be answered before the sort
+  lands, not after.
+
 ## P8.46b — the setup prologue, and a fixture made almost entirely of identities
 
 `convexTrimeshNarrowphaseCore`'s prologue (convexMesh.cu:99-210): the shape and transform

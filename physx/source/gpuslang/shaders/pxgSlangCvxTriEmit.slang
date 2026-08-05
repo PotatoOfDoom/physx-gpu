@@ -229,11 +229,19 @@ public void cteEmitTail(
 
         // THE SHIFT.  `numContactsGenerated` can be exactly 32 — the clipper's
         // write cap is `index < NUM_TMP_CONTACTS_PER_PAIR` and its count is a
-        // popcount of a ballot, so [0, 32] inclusive.  PTX `shl.b32` masks the
-        // shift amount to five bits, so `1 << 32` is 1 and the CUDA lands on
-        // 0xFFFFFFFF, which is the value it wants.  SPIR-V leaves a shift at or
-        // past the operand width UNDEFINED.  Unguarded, a full 32-contact face
-        // silently collapses to one contact.
+        // popcount of a ballot, so [0, 32] inclusive.  PTX `shl.b32` CLAMPS the
+        // shift amount to the register width, so `1 << 32` is ZERO and
+        // `(1 << 32) - 1` is 0xFFFFFFFF — which is the value the CUDA wants.
+        // SPIR-V leaves a shift at or past the operand width UNDEFINED.
+        // Unguarded, a full 32-contact face silently collapses to one contact.
+        //
+        // (An earlier version of this comment said PTX MASKS the shift amount to
+        // five bits.  That is the x86 rule, not the PTX one, and it does not even
+        // explain the CUDA's behaviour: masking would make `1 << 32` equal 1 and
+        // `(1 << 32) - 1` equal 0, not 0xFFFFFFFF.  The guard below was right; the
+        // reason given for it was not.  The distinction is load-bearing elsewhere
+        // — `radixSortWarp` relies on the SAME clamping to make an out-of-range
+        // radix contribute nothing, where masking would corrupt its bucket.)
         uint mask = (numContactsGenerated >= CTE_WARP)
                         ? 0xffffffffu
                         : ((1u << numContactsGenerated) - 1u);
