@@ -971,8 +971,32 @@ static const uint8_t kInitManifolds[] = { 8, 8, 4, 4 };
 // five with it.
 static const uint8_t kPairMgmt[] = { 8, 1 };
 
+// convexTrimeshNarrowphase(cmInputs*, transformCache*, contactDistance*,
+//   gpuShapes*, cvxTrimeshPair*, cvxTriNIPtr**, cvxTriContactsPtr**,
+//   cvxTriMaxDepthPtr**, cvxTriIntermPtr**, orderedCvxTriIntermPtr**,
+//   cvxTriSecondPassPairsPtr**, stackPtr*, nbPairsGlobal*, nbPaddedPairsGlobal*,
+//   nbSecondPassPairs*, PxU32 stackSizeBytes, tempConvexTriContacts*,
+//   pTempContactIndex*, maxTempMemRequirement*, midPhasePairsNeeded*,
+//   PxU32 nbContactManagers)
+//
+// Fifteen pointers @0..@112, a PxU32 @120, then four more pointers @128..@152
+// (the PxU32 forces eight bytes of padding), a PxU32 @160 -> 164, rounded to the
+// largest alignment seen -> 168 BYTES.  That is under llvmpipe's 256-byte push
+// range but ABOVE Vulkan's guaranteed 128, so it is portable only where the
+// device reports more; nothing in the runtime enforces the cap.
+//
+// ARGUMENT 18 IS A PINNED HOST POINTER.  `maxTempMemRequirement` is
+// cuMemHostAlloc'd (PxgNarrowphaseCore.cpp:223) and read by the CPU with no copy,
+// so the bridge must translate it to a buffer device address -- see the
+// hostPtrMask comment in PxgVulkanKernelAbi.h.  It is the first row in this table
+// to need that.
+static const uint8_t kCvxTriCore[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+                                       4, 8, 8, 8, 8, 4 };
+static const uint32_t kCvxTriCoreHostPtrMask = 1u << 18;
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
+    { "convexTrimeshNarrowphase", kCvxTriCore, uint32_t(sizeof(kCvxTriCore)), kCvxTriCoreHostPtrMask },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },
     { "clearNewFlagLaunch", kOnePtr, 1u },
     { "bpSignalComplete", kOnePtr, 1u },

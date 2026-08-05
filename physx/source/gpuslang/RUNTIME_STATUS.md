@@ -1623,6 +1623,77 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
 
+## P8.46c — convexTrimeshNarrowphase becomes an engine kernel
+
+`convexTrimeshNarrowphase` (convexMesh.cu:621-759) on the engine BDA ABI, composed from the
+six modules the preceding tranches built and verified one at a time: the stack carve, the
+setup prologue, the hull-blob reader, the three SAT stages with their driver and face
+selection, the clipper, and the emit tail (which pulls in the contact reduction).  Manifest
+263 -> **264**.
+
+### The three numbers that had to come out right
+
+- The push-constant blob lands at **exactly 168 bytes** — the figure computed from the
+  21-argument pack before a line of the shader existed.  It is not obvious: the `PxU32` at
+  offset 120 forces eight bytes of padding before the four pointers that follow it.
+- `spirv-val` is clean over the composed shader.
+- `p4Manifest` passes, which checks the row, the entry-point name and the mapped counter.
+
+168 bytes is under llvmpipe's 256-byte push range but **above Vulkan's guaranteed 128**, so
+the kernel is portable only where the device reports more — and nothing in the runtime
+enforces that cap.  Recorded here because no test can see it on this device.
+
+### The first ABI row with a hostPtrMask
+
+Argument 18, `maxTempMemRequirement`, is a pinned-host pointer, which is what P8.46a was
+built for.  This is the first row in the table to set the bit.
+
+### The dispatch shape, and the coverage it gives up
+
+The CUDA is a grid-stride loop whose body performs a chained buffer-device-address load
+(`hullOrMeshPtr` read out of the shape array and dereferenced) — the pattern P8.40 proved
+segfaults llvmpipe.  **The obvious remedy is not available**: one workgroup per pair needs
+the pair count, and that is a DEVICE value while the grid is computed on the host, with no
+indirect dispatch reachable from the CUDA shim path.
+
+So this takes the shape `convexTrimeshMidphaseBda` already ships green: one workgroup per
+CUDA block, and a loop of CONSTANT trip count over that block's two warps.  That shader
+performs a chained BDA load inside exactly this kind of loop and does not crash, which is
+the evidence that the hazard is the grid-stride form and not loops as such.
+
+**THE COVERAGE THIS GIVES UP IS REAL.**  The CUDA's grid-stride loop makes a second and
+further pass when there are more pairs than grid slots; this shader makes exactly one.  The
+ceiling is `2 * gridDim.x` pairs — for meshfloor, 8192 slots for at most two pairs, but a
+scene dense enough to exceed it would lose contacts SILENTLY.  Closing it needs either
+indirect dispatch in the shim or a host-side grid derived from the same device counter.
+
+One warp per workgroup is likewise forced: the clipper and the reduction both require
+`[numthreads(32,1,1)]` because their early-outs are warp-uniform but not group-uniform, and
+llvmpipe hangs on a divergent barrier rather than erroring.  The CUDA's two warps per block
+become two sequential iterations.
+
+### The allocator pointers corrupt rather than fault
+
+`maCompute` returns its seven addresses in ALLOCATION order, which is not the order of the
+CUDA function's out-parameters, and every one of them points inside the same stack
+allocation.  Writing `a.maxDepth` where `a.interm` belongs still lands in valid memory and
+silently overwrites another section's records.  The six publishing stores are written by
+NAME against the struct, never by position.  `a.pairs` is deliberately not published —
+downstream consumers know that region as the stack base.
+
+### What this does NOT yet do
+
+The kernel is mapped and launchable, but `meshfloor` cannot step on it alone: four kernels of
+the chain are still unmapped — `sortTriangleIndices`, `convexTrimeshPostProcess`,
+`convexTrimeshCorrelate` and the finish-contacts kernel.  Until they exist the contacts this
+kernel produces are never consumed, so the scene's behaviour is unchanged.  What HAS changed
+is that its launch is no longer refused.
+
+Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged from P8.46b:
+this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
+it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
+behind it is the six module tranches, each swept and green on its own.
+
 ## P8.46b — the setup prologue, and a fixture made almost entirely of identities
 
 `convexTrimeshNarrowphaseCore`'s prologue (convexMesh.cu:99-210): the shape and transform
