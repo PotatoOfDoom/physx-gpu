@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **687/687** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **688/688** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1622,6 +1622,78 @@ can be told from `restDistance[0]`; and both are now asserted directly.
 
 Suite **674/674 in both memory modes**, rigid regression **16/16**, all six deformable scenes
 green.
+
+## P8.46b — the setup prologue, and a fixture made almost entirely of identities
+
+`convexTrimeshNarrowphaseCore`'s prologue (convexMesh.cu:99-210): the shape and transform
+resolve, the walk down the cooked mesh to the adjacency and face-remap sections, and the
+triangle in convex-local space with its normal.  With this, every input
+`convexTriangleContactGen` needs exists.
+
+### The offset this almost got wrong
+
+`ConvexMeshPair`'s declaration (convexNpCommon.h:70-81) carries trailing numbers that are
+RUNNING END OFFSETS, not field offsets.  Read as field offsets they put `startIndex` at 32
+and `roundedStartIndex` at 36 — which are `count` and `cmIndex`.  Both are small
+non-negative integers, so the pair records would land at plausible places in the output
+arrays and nothing would fault.  The real offsets are 28 and 40.  The fixture gives all four
+fields different values so the confusion cannot pass.
+
+### Three more things the transcription pins
+
+- **The mesh header's `.z` word is not the node count** — `.w` is.  Mis-sizing the BV32 tree
+  shifts the vertices, the indices, the adjacencies and the face remap all at once.  The
+  fixture fills the tree with a recognisable pattern rather than zeros, so a mis-sized walk
+  reports nonsense instead of zeros that could pass for data, and gives its two meshes
+  different node counts so a wrong stride cannot accidentally agree between them.
+- **The swap.**  Slot 0 must end up the convex and slot 1 the mesh, and the transform refs
+  swap WITH the shape refs, before the transforms are read.
+- **The winding flip.**  A negative scale DETERMINANT reverses the mesh winding, and the
+  CUDA compensates with `writeIndex = lane ^ 3` — which for lanes 1 and 2 is exactly a swap
+  of the last two vertices, lane 0 being guarded by `lane > 0`.  Without it the triangle
+  normal points into the mesh and every contact is generated against the far side.
+
+The transform composition runs the OTHER way round from the midphase's: this one is
+convex-relative, `conj(q0)*q1` with `rotInv(q0, p1 - p0)`, where the midphase is
+mesh-relative.
+
+The module is warp-uniform throughout.  The CUDA spreads the work across lanes and syncs
+three times; here the values are cheap enough that computing them redundantly costs less
+than the barriers, and it removes three uniformity preconditions from the caller.
+
+### Sweep 33/40, then 40/40 — and six of the seven survivors had ONE cause
+
+Every survivor of the first sweep was a real fixture gap rather than an equivalence, and six
+of them came from the same thing: **the fixture was made almost entirely of identities.**
+
+- Every convex body transform was the identity, which hides THREE separate mistakes at once.
+  The composition is `conj(q0)*q1` with `rotInv(q0, p1 - p0)`, so with `q0` the identity the
+  conjugate is a no-op, the translation needs no rotating, and `quatRotateInv` cannot be
+  told from `quatRotate`.
+- Every mesh scale rotation was the identity, which degenerates `vertex2Shape` to a
+  componentwise multiply and makes both quaternion rotations inside it invisible — that
+  accounts for the seventh survivor too.
+- The transform refs equalled the shape refs in every contact manager, so the contact
+  distance — which is indexed by the TRANSFORM refs — read the same slots either way.
+- The only negative scale had exactly ONE negative component, where "determinant < 0" and
+  "any component < 0" agree.
+- No triangle was degenerate, so `getNormalized` never took its zero branch.
+
+The fixture now carries a rotating convex body, a rotated mesh scale, transform refs that
+diverge from shape refs, a scale with TWO negative components (positive determinant, so NO
+flip) and a degenerate triangle, each pinned by its own coverage assertion.  The second
+sweep kills all forty.
+
+**A clean sweep is a statement about the STAGE, not only about the fixture.**  This is the
+first in the convex-vs-trimesh chain with no survivors, and the reason is that it is pure
+address arithmetic and exact transforms: there are no float-boundary mutants of the kind
+that survive in P8.44 and P8.45 because no fixture can construct exact equality at a
+threshold, and no unreachable code of the kind P8.44 documented.
+
+Suite **688/688 in both memory modes** — one suite more than P8.46a, the new `cvxTriSetup`.
+Still no manifest entry and no ABI row; what remains for the engine kernel is the wiring
+itself — the shader that composes the six
+modules, the ABI row for the 168-byte blob, and the manifest row.
 
 ## P8.46a — the pinned-host pointer the engine kernel has to write to
 
