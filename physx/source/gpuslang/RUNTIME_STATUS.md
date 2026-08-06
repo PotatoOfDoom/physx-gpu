@@ -1694,6 +1694,80 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.50a — the SECOND contactReduce instantiation: clustering, as a real warp
+
+`contactReduce<true, false, 6, false>` (convexMeshCorrelate.cu:277) added to
+`pxgSlangContactReduce.slang` as `crContactReduce6Cluster`.  This is what
+`convexTrimeshCorrelate` reaches, and it is the prerequisite for that kernel —
+P8.44 covered only `<false, true, 5, true>`, the emit tail's instantiation.
+
+Three differences from the one already there, and the third is a whole branch the
+module did not have:
+
+* **no dupe test** — coincident contacts survive into the anchor search;
+* **no PCM-deepest step** — with six slots the fill stage reaches those points
+  anyway;
+* **clustering is ON** — instead of filling the remaining slots with the deepest
+  unselected contacts, every contact is LABELLED with the anchor nearest to it in
+  the normal plane, one representative is taken per non-empty cluster, and only
+  then are the leftover slots filled.  The anchors are biased deeper by
+  `clusterBias` so a cluster prefers the anchor that defined it, which is what
+  stops the manifold flickering between near-equal contacts frame to frame.  The
+  bias is a live host value here (PxgNarrowphaseCore.cpp:2718), not the zero the
+  emit tail passes.
+
+Driven against `refReduce` — the SAME C++ oracle the scalar port uses — so a
+divergence is attributable to the clustering branch and the warp emulation, not
+to the algorithm.  New suite entry `contactReduceWarpCluster6` inside
+`gpuslang.contactReduce`: 12 constructed cases plus 512 random ones.
+
+**Two structural facts were derived from the CUDA rather than assumed**, and both
+shaped the fixture:
+
+1. `popc(mask)` after the four anchors is ALWAYS 4 at this instantiation — each
+   anchor is drawn from `allMask & ~mask`, so they land on four distinct lanes,
+   and the candidate set cannot be exhausted because `popc(allMask) > 6`.  So
+   `nbClusters` is always 4 and the fill loop always runs exactly twice.
+2. a cluster is normally non-empty, because an anchor is zero distance from
+   itself and the label test is a strict `<`.  The ONE way to empty one is **two
+   anchors at the same position**: the later is zero away from the earlier, the
+   earlier wins the strict test, and nothing labels itself into the later cluster.
+   That cluster then costs a slot the fill loop — which counts from `nbClusters`,
+   not from the points actually selected — never gives back, and the patch comes
+   out with FIVE contacts instead of six.
+
+Constructing (2) took real geometry work: `p1` is the furthest point from `p0` and
+`p2`/`p3` are the extremes of the signed distance to the `p0-p1` line, so a
+coincident pair — at distance zero from `p0`, sitting on the line — is normally
+neither.  The construction that works puts every other point strictly on ONE side
+of that line, which forces the argmin onto `p0`'s twin.  (First attempt failed:
+the angular sweep ran past π at lane 31, putting that lane on the wrong side and
+letting it win the argmin instead.)
+
+**Sweep 28/32**, after a first pass of 15/28 whose gaps were all closed rather
+than excused:
+
+| Was surviving | Closed by |
+|---|---|
+| a five-point early-out bound; a strict `<=` | a six-lane case with coincident anchors — the early-out returns all six, the full path returns five |
+| the label tie going to the LATER anchor | a lane equidistant from two anchors whose loser cannot be recovered by the fill, so the two answers stay apart |
+| the empty-cluster guard dropped | holding lane 31 out of the set, so the `crLowestSetIndex(0) == -1` shift lands on a provably-wrong bit |
+| `p1` allowed to collide with `p0` | all 32 contacts at one point — the only input where the distance-from-`p0` argmax has nothing to prefer |
+
+Six more mutants had been SKIPPED because their anchor text is shared with
+`crContactReduce5`; re-run against the cluster function's own text, five of them
+die.
+
+The four survivors have proofs, recorded in the module header: `label`'s initial
+value is never read (the first anchor always assigns); reversing the edge
+direction negates `d`, which merely swaps `f` and `g` and leaves the anchor SET
+identical; measuring `d` from `p1` instead of `p0` differs by `dot(dir, p1 - p0)`,
+which is exactly zero because `dir` is perpendicular to `p1 - p0` by construction;
+and the fourth is the deliberate control (argmax is invariant under `sqrt`).
+
+Suite **691/691 in both memory modes**, forced-fresh.  The kernel itself
+(`convexTrimeshCorrelate`) follows in P8.50b.
+
 ## P8.49 — `convexTrimeshPostProcess`, the silhouette cull, on the engine ABI
 
 `convexTrimeshPostProcess` (convexMeshPostProcess.cu:369, core at :182) mapped as

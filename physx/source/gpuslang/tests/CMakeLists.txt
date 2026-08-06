@@ -459,7 +459,7 @@ pxg_compile_shader(convexSatBda convexSatLaunch convexSelectLaunch)
 # cross-then-dot, which is exactly where contraction moves the winner one lane.
 # Its test lives in testContactReduce.cpp beside the scalar port's, so both run
 # under the existing gpuslang.contactReduce suite against the same oracle.
-pxg_compile_shader(contactReduceWarpBda contactReduceWarpLaunch)
+pxg_compile_shader(contactReduceWarpBda contactReduceWarpLaunch contactReduceWarpCluster6Launch)
 # P8.45: the TAIL of convexTriangleContactGen (convexTriangle.cuh:1769-1881) --
 # the reduction, the temp-stream reservation and the five per-pair records the
 # rest of the convex-vs-trimesh chain reads.  Test scaffolding, absent from the

@@ -625,4 +625,345 @@ PXG_TEST(contactReduceWarp)
     PXG_CHECK_MSG(fillRan > 200, "contactReduceWarp: five-point results thin (%zu)", fillRan);
 }
 
+
+// ---------------------------------------------------------------------------
+// The SECOND warp instantiation: contactReduce<true, false, 6, false>
+// (convexMeshCorrelate.cu:277), which convexTrimeshCorrelate reaches.
+//
+// Driven against the SAME refReduce oracle, with clustering on, the PCM step off,
+// six slots and no dupe test -- so a divergence is attributable to the clustering
+// branch and the warp emulation, not to the algorithm.
+//
+// TWO STRUCTURAL FACTS shape the constructed cases, and both were derived from the
+// CUDA rather than assumed:
+//
+//   * popc(mask) after the four anchors is ALWAYS 4 at this instantiation.  Each
+//     anchor is picked from `allMask & ~mask`, so they land on four distinct
+//     lanes, and the set cannot be exhausted because popc(allMask) > 6.  So
+//     nbClusters is always 4 and the fill loop always runs exactly twice.
+//   * a cluster is normally non-empty, because an anchor is at distance zero from
+//     itself and the label test is a strict `<`.  The ONE way to empty one is two
+//     anchors at the SAME POSITION: the later anchor is zero away from the earlier
+//     one, the earlier one wins the strict test, and nothing is left to label
+//     itself into the later cluster.  That cluster then costs a slot that the fill
+//     loop -- which counts from nbClusters, not from the points actually selected
+//     -- never gives back, and the result has FIVE points instead of six.
+// ---------------------------------------------------------------------------
+
+PXG_TEST(contactReduceWarpCluster6)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const int MAXP = 6;
+    const bool CLUSTERING = true, KEEPDEEPEST = false, DUPETEST = false, REDUCE2 = false;
+    const float BIAS = 0.05f;
+
+    std::vector<CrWarpCase> cases;
+
+    auto spread = [](CrWarpCase& c) {
+        for (uint32_t j = 0; j < 32; ++j)
+        {
+            const float a = 0.19634954f * float(j);          // 2*pi/32
+            c.p[j] = { std::cos(a) * (1.0f + 0.03f * float(j)),
+                       std::sin(a) * (1.0f + 0.03f * float(j)),
+                       0.011f * float(j) };
+            c.s[j] = -0.02f - 0.011f * float(j);             // strictly decreasing, distinct
+        }
+        c.normal = { 0.0f, 0.0f, 1.0f };
+        c.allMask = 0xFFFFFFFFu;
+    };
+
+    {   // 1: THE EARLY-OUT at exactly six lanes.  Six is the boundary: `<=` returns
+        //    allMask untouched, so nothing downstream runs.
+        CrWarpCase c; spread(c);
+        c.allMask = (1u << 1) | (1u << 4) | (1u << 9) | (1u << 17) | (1u << 24) | (1u << 30);
+        c.name = "early-out, popc 6";
+        cases.push_back(c);
+    }
+    {   // 2: SEVEN LANES -- one past the early-out, the smallest input that reaches
+        //    the clustering branch at all.
+        CrWarpCase c; spread(c);
+        c.allMask = (1u << 1) | (1u << 4) | (1u << 9) | (1u << 17) | (1u << 24) | (1u << 30) | (1u << 31);
+        c.name = "seven lanes, the narrowest full path";
+        cases.push_back(c);
+    }
+    {   // 3: ALL 32 LANES LIVE.
+        CrWarpCase c; spread(c);
+        c.name = "all 32 lanes";
+        cases.push_back(c);
+    }
+    {   // 4: THE CLUSTER BIAS DECIDES A REPRESENTATIVE.  Lane 3 is deeper than
+        //    lane 7 by less than the bias.  Lane 7 is arranged to be an anchor
+        //    (the deepest overall, hence p0) and lane 3 sits right next to it, so
+        //    both land in the same cluster: with the bias the anchor keeps the
+        //    slot, without it lane 3 takes it.
+        CrWarpCase c; spread(c);
+        c.s[7] = -0.001f;                     // the deepest -> p0
+        c.s[3] = -0.001f - BIAS * 0.5f;       // deeper than the biased anchor? no: less deep
+        c.p[3] = { c.p[7].x + 0.002f, c.p[7].y + 0.002f, c.p[7].z };
+        c.name = "cluster bias keeps the anchor";
+        cases.push_back(c);
+    }
+    {   // 5: TWO ANCHORS AT THE SAME POSITION -> an empty cluster -> five points.
+        //
+        //    Getting two anchors to coincide takes a specific geometry, because
+        //    p1 is the FURTHEST point from p0 and p2/p3 are the extremes of the
+        //    signed distance to the p0-p1 line -- a coincident pair sits at
+        //    distance 0 from p0 and on the line, so it is normally neither.
+        //
+        //    The construction that works: put every other point strictly on ONE
+        //    side of the p0-p1 line.  Then the signed distance is >= 0 everywhere
+        //    and its MINIMUM is zero, attained only on the line itself -- so p3
+        //    (the argmin) is forced onto p0's coincident twin.
+        //
+        //      lane 0  (0,0,0)   separation -0.001, the largest -> p0
+        //      lane 1  (0,0,0)   p0's twin, much deeper so it cannot be p0
+        //      lane 2  (20,0,0)  by far the furthest from p0        -> p1
+        //      3..31             y > 0, so d > 0                    -> p2 = max y
+        //                                                              p3 = lane 1
+        //
+        //    Anchors walk in lane order 0, 1, 2, p2.  Anchor 1 is zero away from
+        //    anchor 0, the label test is a strict `<`, so nothing -- not even
+        //    lane 1 itself -- lands in cluster 1.  Three representatives plus two
+        //    fills is FIVE points, and the missing sixth is the quirk.
+        CrWarpCase c; spread(c);
+        c.p[0] = { 0.0f, 0.0f, 0.0f };
+        c.p[1] = { 0.0f, 0.0f, 0.0f };
+        c.p[2] = { 20.0f, 0.0f, 0.0f };
+        c.s[0] = -0.001f;
+        c.s[1] = -0.5f;
+        c.s[2] = -0.3f;
+        for (uint32_t j = 3; j < 32; ++j)
+        {
+            // The sweep must stay strictly inside (0, pi): at lane 31 an angle of
+            // pi/30 per lane would be PAST pi, sin would go negative, and that
+            // lane -- not lane 1 -- would win the argmin.
+            const float a = 0.09f * float(j);                // max 2.79 < pi
+            c.p[j] = { std::cos(a) * (1.0f + 0.02f * float(j)),
+                       std::sin(a) * (0.5f + 0.03f * float(j)) + 0.05f,
+                       0.0f };
+            c.s[j] = -0.02f - 0.011f * float(j);
+        }
+        // Lane 31 is held OUT of the set.  A port that dropped the empty-cluster
+        // guard asks crMinIndex to reduce over nothing, which hands back
+        // crLowestSetIndex(0) == -1 and shifts by it -- and a shift by 31 is what
+        // that lands on.  With lane 31 excluded, any bit 31 in the answer is
+        // provably wrong rather than coincidentally right.
+        c.allMask = 0x7FFFFFFFu;
+        c.name = "coincident anchors leave a cluster empty";
+        cases.push_back(c);
+    }
+    {   // 6: A LANE EQUIDISTANT FROM TWO ANCHORS.  The label test is a strict `<`,
+        //    so the EARLIER anchor keeps it -- the only thing that decides.
+        CrWarpCase c; spread(c);
+        c.p[10] = { -12.0f, 0.0f, 0.0f };
+        c.p[20] = { 12.0f, 0.0f, 0.0f };
+        c.p[15] = { 0.0f, 0.0f, 0.0f };        // exactly between them
+        c.name = "equidistant lane goes to the earlier anchor";
+        cases.push_back(c);
+    }
+    {   // 7: AN EXACT TIE IN THE BIASED SEPARATION inside one cluster.  The lowest
+        //    lane wins, and nothing else in the algorithm breaks that tie.
+        CrWarpCase c; spread(c);
+        c.p[12] = { 0.30f, 0.05f, 0.0f };
+        c.p[13] = { 0.31f, 0.05f, 0.0f };       // neighbours -> same cluster
+        c.s[12] = -0.007f;
+        c.s[13] = -0.007f;                      // bit-identical separations
+        c.name = "exact separation tie inside a cluster";
+        cases.push_back(c);
+    }
+    {   // 8: AN OUT-OF-MASK LANE HOLDS THE DEEPEST SEPARATION.  Labels are assigned
+        //    to every lane, but the representative pick is restricted to allMask --
+        //    a port that dropped the `& allMask` would elect a dead lane.
+        CrWarpCase c; spread(c);
+        c.allMask = 0xFFFFFFFEu;                // lane 0 excluded
+        c.s[0] = -0.0001f;                      // ... and it is the deepest of all
+        c.name = "out-of-mask lane is the deepest";
+        cases.push_back(c);
+    }
+    {   // 9: ZERO BIAS.  The bias must be a real term, not folded away: with it at
+        //    zero the anchors get no preference and the representatives are simply
+        //    the deepest per cluster.
+        CrWarpCase c; spread(c);
+        c.name = "zero bias (driven separately below)";
+        cases.push_back(c);
+    }
+    {   // 10: A LANE EXACTLY EQUIDISTANT FROM TWO ANCHORS, arranged so the tie
+        //     actually changes the answer.  The four anchors are pinned by
+        //     construction -- lane 0 has the largest separation (p0), lane 1 is
+        //     twenty units away (p1), and lanes 2 and 3 are the extreme +y and -y
+        //     (p2, p3).  Lane 4 sits at (10, 0), the same distance from lane 2 as
+        //     from lane 3, and is deeper than either even after their anchor bias,
+        //     so it takes whichever cluster the tie awards it -- and the OTHER
+        //     cluster's representative changes with it.
+        //
+        //     The loser must NOT come back through the fill loop, or the two
+        //     answers converge again.  Lanes 2 and 3 are therefore made SHALLOW,
+        //     and three genuinely deep lanes are parked at the end of the warp so
+        //     the two fill slots go to them instead.
+        CrWarpCase c;
+        c.normal = { 0.0f, 0.0f, 1.0f };
+        c.allMask = 0xFFFFFFFFu;
+        c.p[0] = { 0.0f, 0.0f, 0.0f };      c.s[0] = -0.001f;   // p0
+        c.p[1] = { 20.0f, 0.0f, 0.0f };     c.s[1] = -0.05f;    // p1
+        c.p[2] = { 10.0f, 5.0f, 0.0f };     c.s[2] = -0.02f;    // p2, shallow
+        c.p[3] = { 10.0f, -5.0f, 0.0f };    c.s[3] = -0.02f;    // p3, shallow
+        c.p[4] = { 10.0f, 0.0f, 0.0f };     c.s[4] = -0.20f;    // equidistant, deep
+        for (uint32_t j = 5; j < 32; ++j)
+        {
+            c.p[j] = { 1.0f + 0.05f * float(j), 0.5f + 0.05f * float(j), 0.0f };
+            c.s[j] = -0.01f - 0.001f * float(j);
+        }
+        c.s[29] = -0.40f; c.s[30] = -0.41f; c.s[31] = -0.42f;   // the fill's targets
+        c.name = "equidistant lane, and the loser cannot be refilled";
+        cases.push_back(c);
+    }
+    {   // 11: SIX LANES WITH TWO COINCIDENT ANCHORS.  popc(allMask) is exactly the
+        //     boundary, so the early-out returns all six untouched -- while the
+        //     full path would lose a slot to the empty cluster and return five.
+        //     That difference is the only thing separating `<=` from `<`.
+        CrWarpCase c;
+        c.normal = { 0.0f, 0.0f, 1.0f };
+        c.allMask = 0x3Fu;
+        for (uint32_t j = 0; j < 32; ++j) { c.p[j] = { 0.0f, 0.0f, 0.0f }; c.s[j] = -1.0f; }
+        c.p[0] = { 0.0f, 0.0f, 0.0f };   c.s[0] = -0.001f;
+        c.p[1] = { 0.0f, 0.0f, 0.0f };   c.s[1] = -0.5f;
+        c.p[2] = { 20.0f, 0.0f, 0.0f };  c.s[2] = -0.3f;
+        c.p[3] = { 1.0f, 0.4f, 0.0f };   c.s[3] = -0.1f;
+        c.p[4] = { 2.0f, 0.9f, 0.0f };   c.s[4] = -0.12f;
+        c.p[5] = { 1.5f, 1.4f, 0.0f };   c.s[5] = -0.15f;
+        c.name = "six lanes, early-out vs a five-point full path";
+        cases.push_back(c);
+    }
+    {   // 12: EVERY CONTACT AT THE SAME POINT.  Degenerate but reachable, and the
+        //     only input that can make p1 collide with p0: the distance from p0 is
+        //     zero for every lane, so the argmax has nothing to prefer and falls to
+        //     the lowest candidate.  Lane 0 is given the largest separation so it
+        //     is p0 AND the lowest lane -- a port that searched `allMask` instead
+        //     of `allMask & ~mask` would hand p1 straight back to p0.
+        CrWarpCase c;
+        c.normal = { 0.0f, 0.0f, 1.0f };
+        c.allMask = 0xFFFFFFFFu;
+        for (uint32_t j = 0; j < 32; ++j)
+        {
+            c.p[j] = { 0.25f, -0.75f, 0.0f };
+            c.s[j] = -0.05f - 0.003f * float(j);
+        }
+        c.s[0] = -0.001f;                       // the largest -> p0, and lane 0
+        c.name = "all 32 contacts coincide";
+        cases.push_back(c);
+    }
+    const uint32_t nConstructed = uint32_t(cases.size());
+
+    std::mt19937 rng(577215);
+    for (uint32_t t = 0; t < 512; ++t)
+    {
+        CrWarpCase c;
+        for (uint32_t j = 0; j < 32; ++j)
+        {
+            c.p[j] = { -1.5f + 3.0f * float(rng() % 1000) / 1000.0f,
+                       -1.5f + 3.0f * float(rng() % 1000) / 1000.0f,
+                       -0.2f + 0.4f * float(rng() % 1000) / 1000.0f };
+            c.s[j] = -0.4f * float(rng() % 1000) / 1000.0f;
+        }
+        c.normal = { 0.0f, 0.0f, 1.0f };
+        // Between 7 and 32 live lanes: below 7 every case would early out.
+        const uint32_t pop = 7 + rng() % 26;
+        uint32_t lanes[32];
+        for (uint32_t j = 0; j < 32; ++j) lanes[j] = j;
+        for (uint32_t j = 0; j < pop; ++j) std::swap(lanes[j], lanes[j + rng() % (32 - j)]);
+        c.allMask = 0;
+        for (uint32_t j = 0; j < pop; ++j) c.allMask |= 1u << lanes[j];
+        c.name = "random";
+        cases.push_back(c);
+    }
+
+    const uint32_t N = uint32_t(cases.size());
+
+    // Case 9 runs with a zero bias; everything else with BIAS.
+    std::vector<float> biasOf(N, BIAS);
+    biasOf[8] = 0.0f;
+
+    std::vector<uint32_t> refMask(N);
+    std::vector<uint8_t> skip(N, 0);
+    size_t earlyOut = 0, fullPath = 0, sixPoints = 0, shortPatch = 0, skipped = 0;
+    for (uint32_t t = 0; t < N; ++t)
+    {
+        const CrWarpCase& c = cases[t];
+        Slack sl;
+        refMask[t] = refReduce(c.p, c.s, c.normal, c.allMask, biasOf[t], CLUSTERING, KEEPDEEPEST,
+                               MAXP, DUPETEST, REDUCE2, sl);
+        skip[t] = (t >= nConstructed && sl.near) ? 1 : 0;
+
+        if (__builtin_popcount(c.allMask) <= MAXP) ++earlyOut;
+        else
+        {
+            ++fullPath;
+            const int pc = __builtin_popcount(refMask[t]);
+            if (pc == MAXP) ++sixPoints;
+            else if (pc < MAXP) ++shortPatch;   // an empty cluster cost a slot
+        }
+    }
+
+    std::vector<float> input(size_t(N) * (544 / 4), 0.0f);
+    for (uint32_t t = 0; t < N; ++t)
+    {
+        float* r = input.data() + size_t(t) * (544 / 4);
+        const CrWarpCase& c = cases[t];
+        r[0] = c.normal.x; r[1] = c.normal.y; r[2] = c.normal.z;
+        r[3] = biasOf[t];                       // the bias rides in normal.w
+        std::memcpy(r + 4, &c.allMask, 4);
+        for (uint32_t j = 0; j < 32; ++j)
+        {
+            float* q = r + 8 + 4 * j;
+            q[0] = c.p[j].x; q[1] = c.p[j].y; q[2] = c.p[j].z; q[3] = c.s[j];
+        }
+    }
+
+    PxgBufferHandle bIn = createBufferFrom(dev, input);
+    std::vector<uint32_t> outInit(N, 0xdeadbeefu);
+    PxgBufferHandle bOut = createBufferFrom(dev, outInit);
+
+    CrWarpPush push{};
+    push.input = dev->getBufferDeviceAddress(bIn);
+    push.output = dev->getBufferDeviceAddress(bOut);
+    push.numCases = N;
+
+    {
+        Kernel k("contactReduceWarpBda.spv", "contactReduceWarpCluster6Launch", {}, sizeof(CrWarpPush));
+        k.dispatch(N, {}, push, 1u, 1u);
+        dev->flush();
+    }
+
+    const auto got = downloadBuffer<uint32_t>(dev, bOut, N);
+
+    size_t mm = 0, checked = 0;
+    for (uint32_t t = 0; t < N; ++t)
+    {
+        if (skip[t]) { ++skipped; continue; }
+        ++checked;
+        if (got[t] != refMask[t])
+        {
+            ++mm;
+            if (mm <= 8)
+                std::printf("  [%s] case %u: got=%08x exp=%08x allMask=%08x bias=%g\n",
+                            cases[t].name, t, got[t], refMask[t], cases[t].allMask, biasOf[t]);
+        }
+    }
+
+    dev->destroyBuffer(bIn);
+    dev->destroyBuffer(bOut);
+
+    PXG_CHECK_MSG(mm == 0, "contactReduceWarpCluster6: %zu mask mismatches", mm);
+    PXG_CHECK_MSG(checked > N * 3 / 4, "contactReduceWarpCluster6: too many skipped (%zu)", skipped);
+    PXG_CHECK_MSG(earlyOut > 0, "contactReduceWarpCluster6: the early-out never fires");
+    PXG_CHECK_MSG(fullPath > 300, "contactReduceWarpCluster6: full path thin (%zu)", fullPath);
+    PXG_CHECK_MSG(sixPoints > 200, "contactReduceWarpCluster6: six-point results thin (%zu)", sixPoints);
+    // Without this the empty-cluster quirk is untested, and it is the one place
+    // the fill loop's `i = nbClusters` start differs from `i = popc(mask)`.
+    PXG_CHECK_MSG(shortPatch > 0,
+                  "contactReduceWarpCluster6: no case produced fewer than six points, so the "
+                  "empty-cluster slot loss is unexercised");
+}
+
 } // namespace

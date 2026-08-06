@@ -82,3 +82,29 @@ void contactReduceWarpLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Group
     if (lane == 0u)
         Ptr<uint>(gCr.output)[c] = mask;
 }
+
+// The SECOND instantiation, `contactReduce<true, false, 6, false>`, which
+// convexTrimeshCorrelate reaches.  Same record layout with one addition: the
+// cluster bias, which is a live value here rather than the zero the emit tail
+// passes, rides in the normal's unused .w slot.
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void contactReduceWarpCluster6Launch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    const uint lane = gtid.x;
+    const uint c = gid.x;
+
+    if (c >= gCr.numCases)
+        return;
+
+    const uint64_t inBase = gCr.input + uint64_t(c) * uint64_t(CRB_IN_STRIDE);
+
+    const float4 nrm = Ptr<float4>(inBase)[0];
+    const uint allMask = Ptr<uint>(inBase + 16UL)[0];
+    const float4 pt = Ptr<float4>(inBase + 32UL)[lane];
+
+    const uint mask = crContactReduce6Cluster(lane, pt.xyz, pt.w, nrm.xyz, allMask, nrm.w);
+
+    if (lane == 0u)
+        Ptr<uint>(gCr.output)[c] = mask;
+}
