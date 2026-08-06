@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **690/690** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **691/691** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,71 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.49 — `convexTrimeshPostProcess`, the silhouette cull, on the engine ABI
+
+`convexTrimeshPostProcess` (convexMeshPostProcess.cu:369, core at :182) mapped as
+an engine kernel — `cvxTriPostProcessBda.slang`, manifest row 266, ABI row of
+eight pointers (64-byte blob).
+
+Contact generation emits contacts on every triangle it touches, including on edges
+and vertices shared with a neighbour that also produced contacts.  Those duplicates
+fight each other in the solver, so this kernel re-examines each pair flagged for a
+second pass and, when the feature it sat on is already covered, CLEARS the contact
+count.  The logic is a lift of `npCvxPostProcess.slang` (the Phase-1 verbatim port
+of the same core): what changes is only where the bytes come from — fixture arrays
+become `Ptr<>` reads through the engine's real pointers.  The heightfield half of
+that module is a different kernel and is not part of this one.
+
+**No loop at all, so the chained loads are free.**  The CUDA is a grid-stride loop
+whose body chains through `gpuShapes[shapeID].hullOrMeshPtr` — the P8.40 pattern
+that segfaults llvmpipe.  Avoiding it costs nothing here: the host launches
+`max(8192, 4 * numTests)` blocks of 64 threads (PxgNarrowphaseCore.cpp:2667-2670),
+so the first pass alone covers at least 524288 second-pass pairs.  One workgroup
+per CUDA block and ONE PAIR PER THREAD reproduces that pass exactly, with no loop
+for a chained load to sit in.  The ceiling is P8.46c's, with four orders of
+magnitude more headroom.
+
+New suite `gpuslang.cvxTriPostProcess`: 19 cases over a deliberately non-manifold
+6-triangle mesh, each one thread, each pinning one decision, with the expected
+clear/no-clear derived by hand from the CUDA and written beside it.  The fixture's
+structure is doing specific work:
+
+* CM0's ordered list holds T1 as a FACE contact and T2 as an EDGE contact and
+  nothing else — that split is what separates the two searches, because the edge
+  branch looks only for face contacts while the vertex branch accepts either.
+* v4's reference list puts its only match LAST, so a loop stopping one entry early
+  misses it.
+* T5 exists solely because it is the only triangle boundary on `.x` and `.z` but
+  not on `.y`, which separates eV0's `(.x, .z)` pair from an `(.x, .y)` misread.
+* `nbContacts` is 1 wherever it can be: 1 is the only count a shift by 28 instead
+  of 27 turns into zero.
+* CM2 has `count == 0` with a live-looking word at its slice start, which is the
+  only way to reach `findTriangle`'s range guard (the core's `assert` against a
+  zero count is debug-only; the guard is the release path).
+* the real cases start at second-pass index 64, behind 64 no-ops, so dropping the
+  `gid.x * 64` term reaches none of them; pair indices are `100 + case`, never the
+  thread index.
+
+**Sweep 48/51.**  The first pass was 40/49 and every one of the six closeable
+survivors got a fixture case rather than an excuse — the shift width, the
+accumulated-refs off-by-one, the two adjacency-word swaps, the range guard and the
+loop bound.  Two mutants were added while closing them (a coverage-LOSING block
+size, and the `.z`-for-`.y` mirror), both killed.  The three that remain are
+structural:
+
+| Survivor | Why no fixture reaches it |
+|---|---|
+| `PP_THREADS_PER_BLOCK` lowered to 32 | `numthreads` stays 64, so a smaller stride makes coverage a strict SUPERSET — some pairs processed twice.  The kernel's only effect is `index &= 0x00FFFFFF`, which is IDEMPOTENT, so a second visit is invisible by construction.  The constant does matter the other way and that IS tested: raising it to 128 loses pairs 64-127 and dies. |
+| `PP_EMASK` widened to `0xf8000000` | It differs from `0xe0000000` only in bits 27-28, and the low half of the same word is the pair index.  Reaching those bits needs a pair index ≥ 2^27 — 134 million stack entries — so the separating input cannot be allocated. |
+| the searches bounded by the ROUNDED count | The entries past `count` are the radix sort's `0xFFFFFFFF` padding, which is ≥ every target the searches can form (`index \| flag`, flag in the top two bits, index far below 2^27).  Extending the range can neither add a match nor move the index binarySearch returns.  Equality would need `triangleIndex == 0xFFFFFFFF`, which the boundary branch short-circuits first. |
+
+One fixture bug found and fixed on the way, worth recording because it looked like
+a shader bug for one run: the 64 no-op entries were marked with `0x0F000000`, and
+`0x0F000000 >> 27` is **1**, not 0 — bit 27 is inside the count field.  The no-ops
+therefore ran the full path and cleared a slot.  The marker is now `0x07000000`.
+
+Suite **691/691 in both memory modes**, forced-fresh.
 
 ## P8.49a — a wrong BV32 stride that a clean mutation sweep could not have caught
 

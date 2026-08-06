@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 265;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 266;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -87,7 +87,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "midphaseGeneratePairs", "convexTrimeshMidphaseBda.spv", "midphaseGeneratePairs" },  // CONVEX_TRIMESH_MIDPHASE (P8.27)
     { "convexTrimeshNarrowphase", "convexTrimeshCoreBda.spv", "convexTrimeshNarrowphase" },  // CONVEX_TRIMESH_CORE (P8.46c)
     { "sortTriangleIndices", "sortTriIndicesBda.spv", "sortTriangleIndices" },  // CONVEX_TRIMESH_SORT_TRIANGLES (P8.48)
-    { "convexTrimeshPostProcess", nullptr, nullptr },  // CONVEX_TRIMESH_POST_PROCESS (unmapped)
+    { "convexTrimeshPostProcess", "cvxTriPostProcessBda.spv", "convexTrimeshPostProcess" },  // CONVEX_TRIMESH_POST_PROCESS (P8.49)
     { "convexHeightfieldPostProcess", nullptr, nullptr },  // CONVEX_HEIGHTFIELD_POST_PROCESS (unmapped)
     { "convexTrimeshCorrelate", nullptr, nullptr },  // CONVEX_TRIMESH_CORRELATE (unmapped)
     { "convexTrimeshFinishContacts", nullptr, nullptr },  // CONVEX_TRIMESH_FINISHCONTACTS (unmapped)
