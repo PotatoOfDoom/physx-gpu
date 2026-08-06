@@ -1747,12 +1747,33 @@ float select (P8.43).
   `orderedCvxTriInterm + startIndex` as the input and the same pointer plus `nbUint4` as the
   temp, and why the caller reads its answer from the input buffer afterwards.  An odd pass
   count would leave the answer in the scratch half.
-- **Still open from the emit-stage recon**: whether the uninitialised padding in
-  `orderedCvxTriInterm`, between a pair's triangle count and the uint4-rounded count, can
-  sort into the binary-searched prefix.  `sanitizeKeys` pushes the tail of the LAST uint4 to
-  0xFFFFFFFF, which sorts high, but that covers the rounding to four — not the separate
-  padding the midphase's doubled counter reserves.  This has to be answered before the sort
-  lands, not after.
+### The padding question, answered — and the recon's own framing of it was wrong
+
+The emit-stage recon left open whether uninitialised padding in `orderedCvxTriInterm` can
+sort into the binary-searched prefix, and the note above framed it as two problems.  It is
+one, and it is closed.  There are TWO regions of padding and they are not the same kind of
+thing:
+
+- **The rounding padding**, between a pair's `count` and its uint4-rounded count.  The sort
+  DOES read it: `numUint4 = (count + 3) / 4`, so the last uint4 straddles the boundary.
+  `sanitizeKeys` is exactly what covers it — it forces every lane past `count` in that last
+  uint4 to 0xFFFFFFFF.  Those entries are then sorted like any other key and land at the END,
+  because a real ordered word is `faceFlag | triangleIdx` with the flag in bit 31 and the
+  index below 2^27, so at most 0x87FFFFFF — strictly less than the sentinel.  The consumer
+  bounds itself by `count` (`findTriangle` and its two siblings pass the pair's own count to
+  `binarySearch` and then re-check `index < count`), so it never reaches them.
+- **The doubled half**, which the midphase's padded counter reserves with
+  `((nbPairsPerCM + 3) & ~3) * 2`.  That is NOT padding at all — it is the radix sort's temp
+  buffer, handed to `radixSortSingleWarpKeysOnly` as `input + nbUint4`.  It is fully written
+  by the first pass before the second reads it, and the eight-pass parity leaves the answer
+  back in the first half.  The recon called this "separate padding the doubled counter
+  reserves", which mistook a scratch buffer for uninitialised data.
+
+So nothing uninitialised reaches the prefix, and the port has to preserve two things for
+that to keep holding: `sanitizeKeys`' fallthrough, and the sentinel being strictly greater
+than any real key.  The second is worth an assertion in the fixture rather than a comment —
+a mesh with a triangle index at 0x7FFFFFFF would make a real key collide with the sentinel,
+which is the same 2^27-boundary family as the NI word's carry.
 
 ## P8.46b — the setup prologue, and a fixture made almost entirely of identities
 
