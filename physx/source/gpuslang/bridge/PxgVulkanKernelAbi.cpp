@@ -992,11 +992,16 @@ static const uint8_t kPairMgmt[] = { 8, 1 };
 // to need that.
 static const uint8_t kCvxTriCore[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
                                        4, 8, 8, 8, 8, 4 };
+
+// sortTriangleIndices(ConvexMeshPair*, PxU32** orderedCvxTriIntermPtr,
+//   PxU32 nbPairs) -> 8 @0, 8 @8, 4 @16, rounded to the largest alignment -> 24.
+static const uint8_t kSortTriIndices[] = { 8, 8, 4 };
 static const uint32_t kCvxTriCoreHostPtrMask = 1u << 18;
 
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "convexTrimeshNarrowphase", kCvxTriCore, uint32_t(sizeof(kCvxTriCore)), kCvxTriCoreHostPtrMask },
+    { "sortTriangleIndices", kSortTriIndices, uint32_t(sizeof(kSortTriIndices)) },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },
     { "clearNewFlagLaunch", kOnePtr, 1u },
     { "bpSignalComplete", kOnePtr, 1u },

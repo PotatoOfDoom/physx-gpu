@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **689/689** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **690/690** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,58 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.48 — `sortTriangleIndices` on the engine ABI: the first convex-trimesh kernel with NO coverage ceiling
+
+`sortTriangleIndices` (convexMeshPostProcess.cu:623) mapped as an engine kernel —
+`sortTriIndicesBda.slang`, manifest row 265, ABI row `{ 8, 8, 4 }` (a 24-byte blob).
+It is a thin wrapper: it hands each contact manager's run of `faceFlag | triangleIdx`
+words to the warp radix sort landed in P8.47.
+
+**The dispatch is EXACT, which P8.46c's was not.**  The core kernel of P8.46c had to
+give up coverage: its CUDA is a grid-stride loop whose trip count is a DEVICE value,
+so a host-computed grid can only cover the first pass.  This kernel has no grid-stride
+loop at all.  The host launches `ceil(numTests / 2)` blocks of two warps and passes
+`numTests` as `nbPairs` (PxgNarrowphaseCore.cpp:2649-2654), so one workgroup per CUDA
+block with a constant-trip-2 loop over its warps reproduces the CUDA's coverage
+*identically*.  No ceiling, nothing silently skipped, nothing to close later.
+
+**The offset trap this tranche exists to pin.**  `ConvexMeshPair` (convexNpCommon.h:70-81)
+carries running END offsets in its trailing comments, so reading them as field offsets
+puts `count` on `cmIndex` and `roundedStartIndex` on `pad`.  P8.46b nearly took that
+route.  Here both reads — `count` @32 and `roundedStartIndex` @40 — are pinned by a
+fixture that gives @28/@36/@44 plausible-but-wrong values pointing at scratch regions,
+so a misread is a mismatch and never an out-of-bounds write.
+
+New suite: `gpuslang.sortTriIndices` (testSortTriIndices.cpp), one test, seven contact
+managers whose regions are laid out in an order that is NOT pair order — a kernel that
+derived the run base from the pair index instead of reading @40 fails it.
+
+**The sweep: 15 of 22 mutants killed, and the seven survivors are all accounted for.**
+Six are structural; the seventh is the deliberate control (hoisting a loop-invariant
+chained load, which must survive or the sweep is just rejecting every edit).
+
+| Survivor | Why no fixture can kill it |
+|---|---|
+| either early-out dropped, or both | `(0 + 3) / 4` and `(0xFFFFFFFF + 3) / 4` are BOTH zero — the second because the round-up wraps — so a skipped run reaches the sort with zero uint4s and every loop inside has zero trips.  The guard is defensive, not load-bearing.  Kept: the CUDA has it, and a change to the rounding would make it matter again. |
+| temp half at `input + count * 4` instead of `input + nbUint4 * 16` | The two differ only when the count is not a multiple of four, and then the wrong window starts exactly at the FIRST PADDING WORD — never on a live key — and ends *earlier* than the right one, so it can neither corrupt a key nor overrun the region.  What it does clobber is the sanitised tail, and the scatter re-sanitises on every read (pxgSlangRadixWarp.slang:208), erasing the clobber before it is used. |
+| `NP_TRIMESH_WARPS_PER_BLOCK` raised to 4 | The HOST fixes the grid at `ceil(nbPairs / 2)`.  A wider block only stretches each block's range of UNIQUE warp indices, so every pair is still covered exactly once and the extra indices fall out on the bounds check.  Equivalent modulo wasted workgroups. |
+| the loop-top barrier dropped | Every groupshared access in the sort is already bracketed by its own barriers (rsPass:192, the scatter tail at :256/:266, rsReduceAdd at :94/:96).  Provably redundant today; kept because it is the only thing that stays correct if those internal barriers move. |
+
+**One survivor WAS a fixture gap, and it is now closed.**  Dropping
+`globalWarpIndex >= nbPairs` survived the first sweep: with `nbPairs = 7` the grid
+reaches index 7, and reading one entry past the array returned zeros, which the
+early-out swallowed.  The fixture now allocates the pair array with ONE ENTRY MORE
+than `nbPairs` and makes it a live-looking decoy pointing at scratch — which is what
+the engine's capacity-sized array really holds.  The mutant now sorts the decoy into
+scratch and dies.
+
+Suite **690/690 in both memory modes**, forced-fresh.  *Recorded honestly:* the first
+forced-fresh default-mode run reported `npRigidSumBatches (SEGFAULT)`.  It passed 5/5
+when re-run alone and the whole default-mode suite came back 690/690 on a straight
+re-run with no code change — a `-j4` flake, almost certainly memory pressure while
+`cvxCollide` (≈350 s of llvmpipe) runs alongside.  It is noted here rather than
+dropped, because a segfault that appears once should be findable if it appears again.
 
 ## P8.47 — the warp radix sort, and three survivors with real proofs
 
