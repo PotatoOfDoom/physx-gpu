@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **688/688** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **689/689** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,56 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.47 — the warp radix sort, and three survivors with real proofs
+
+`radixSortSingleWarpKeysOnly` (RadixSort.cuh:579-720) as a 32-lane virtual warp: eight
+four-bit passes, least significant nibble first.  This is what `sortTriangleIndices` calls,
+and it is the only piece of the convex-vs-trimesh chain with no Phase-1 Slang to lean on.
+
+### The shift is the algorithm
+
+Both the histogram and the scatter select a sub-field by shifting a 1 by an amount that is
+DELIBERATELY out of range for every key that does not belong to the word being accumulated.
+`radix - bit` is unsigned: 0 or 1 for the radixes the word owns (0..3 in the scatter), 2 or
+more — or an enormous wrapped value when `radix < bit` — for every other.  Only PTX's
+CLAMPING makes a foreign radix contribute nothing.  Every such shift goes through `rsShl`,
+which returns zero explicitly, because SPIR-V leaves the case undefined and the plausible
+wrong answer would add 1 to the word's low half and corrupt the histogram of a sort.
+
+### The oracle is std::sort, and the padding is not the sentinel
+
+Eight least-significant-first four-bit passes ARE an ascending unsigned sort, so the expected
+output is simply the input sorted — including the tail `sanitizeKeys` forces to 0xFFFFFFFF.
+The fixture writes its own padding as 0xCDCDCDCD, deliberately NOT the sentinel, so a missing
+`sanitizeKeys` shows up as padding sorting into the MIDDLE rather than as a no-op.  Keys
+carry bit 31 on purpose: a signed comparison would put the flagged entries first.
+
+Twelve cases straddle every boundary the pass loops have — below one uint4, exactly one, one
+past it, a full warp of keys, exactly one warp of uint4s, one past that, and two strided
+passes — plus reversed, all-equal and already-sorted inputs.
+
+### Sweep 34/37, and every survivor is proved rather than argued
+
+Unlike P8.45's and P8.46b's first sweeps, none of these is a fixture gap.  Each is
+equivalent for a reason that can be checked by reading the code rather than by adding a case:
+
+- **M3**, moving the shift guard from `>= 32` to `>= 31`.  The guard would then also zero a
+  shift of exactly 31 — which never occurs: every shift amount here is `rank << 3` or
+  `(radix - bit) << 4`, so it is a multiple of 8 or of 16.  31 is unreachable.
+- **M11**, letting `sanitizeKeys` admit a full uint4 (`goodVals <= 4`).  At `goodVals == 4`
+  the body computes `badVals == 0` and all three of its tests are false, so it does nothing.
+- **M32**, dropping the scatter's `accum != 0` guard.  When `accum` is zero all four ranks
+  are 4 or more, so all four inner `rank < 4` tests fail and nothing is written.  The guard
+  is a pure optimisation, exactly as in the CUDA.
+
+That the survivors are all provable, rather than needing new cases, is itself the same signal
+P8.46b gave: an integer-only stage with no float boundaries leaves no room for the
+"needs exact equality at a threshold" survivors that the SAT and reduction tranches carry.
+
+Suite **689/689 in both memory modes**.  The kernel `sortTriangleIndices` itself is not yet
+mapped — this is the algorithm it delegates to, verified on its own first, which is the same
+order P8.44 through P8.46 followed.
 
 ## P8.47 recon — the shift rule, restated correctly, before it is relied on twice
 
