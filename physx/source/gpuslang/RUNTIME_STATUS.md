@@ -1694,6 +1694,64 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.49a — a wrong BV32 stride that a clean mutation sweep could not have caught
+
+`pxgSlangCvxTriSetup.slang` walked the cooked mesh blob with a BV32 node stride of
+**160**.  `sizeof(Gu::BV32DataPacked)` (GuBV32.h:88) is **1168** — mMin[32] float4 =
+512, mMax[32] = 512, mData[32] = 128, mNbNodes + mDepth + padding[2] = 16.  Every
+section past the tree — verts, indices, adjacencies, faceRemap — therefore sat at
+the wrong address against real device memory, off by `1008 * nbPackedNodes` bytes.
+
+Found while starting P8.49, because `npCvxPostProcess.slang` (a Phase-1 module
+covering the same blob) carries 1168, and so does every other mesh-walking shader
+in this tree: `convexTrimeshMidphaseBda` via `pxgSlangBv32`, `femClothRefitBda`,
+`npBv32`, `npMidphaseCvx`, `npSbSelf`, `psMeshMid`, and six more.  The setup module
+was the only one that disagreed.
+
+**Why the P8.46b sweep came back 40/40 clean anyway.**  `testCvxTriSetup.cpp`
+built its cooked-mesh blob with `static const uint32_t BV32_STRIDE = 160;` — the
+same wrong number, typed independently.  Fixture and shader agreed with each
+other and disagreed with the engine.  A mutation sweep cannot see that: mutating
+the constant in the shader makes it disagree with the fixture, so the mutant dies
+and the sweep reports the constant as *well covered*.  **A fixture that DEFINES a
+layout cannot check it.**  This is a different failure mode from the survivors
+P8.44-P8.48 catalogued: those were mutants no input could distinguish; this was a
+mutant the fixture killed for the wrong reason.
+
+**The fix makes the compiler the oracle.**  The fixture now takes the stride from
+the engine header:
+
+```cpp
+#include "GuBV32.h"
+static const uint32_t BV32_STRIDE = uint32_t(sizeof(physx::Gu::BV32DataPacked)); // 1168
+static_assert(sizeof(physx::Gu::BV32DataPacked) == 1168, ...);
+```
+
+and `testNpAbiLayout.cpp` — whose stated job is layout proof — now pins every
+number the convex-trimesh BDA shaders bake in, against the real headers:
+
+| Pinned | Value |
+|---|---|
+| `sizeof(Gu::BV32DataPacked)` | 1168 |
+| `sizeof(ConvexMeshPair)` | 56 |
+| `offsetof(ConvexMeshPair, startIndex / count / cmIndex / roundedStartIndex / materialIndices)` | 28 / 32 / 36 / 40 / 48 |
+| `sizeof(ConvexTriNormalAndIndex)`, `offsetof(…, index)` | 16, 12 |
+| `sizeof(ConvexTriIntermediateData)` / `ConvexTriContacts` / `ConvexTriContact` | 4 / 4 / 16 |
+| `calculateConvexMeshPairMemRequirement()` | 56 |
+
+The last two 56s are **different numbers that happen to coincide** — one is the
+ConvexMeshPair stride, the other the per-pair stack budget
+(midphaseAllocate.cuh:93).  Both are now pinned separately and the coincidence is
+called out in `convexTrimeshCoreBda.slang`, so changing one is never taken as
+licence to change the other.
+
+Verified the fix is load-bearing rather than cosmetic: with the corrected fixture,
+reverting the shader to 160 now FAILS `gpuslang.cvxTriSetup`, as does 1152 (one
+node's trailing fields).  Before the fixture change, 160 passed and 1168 failed —
+exactly backwards.
+
+Suite **690/690 in both memory modes**, forced-fresh.
+
 ## P8.48 — `sortTriangleIndices` on the engine ABI: the first convex-trimesh kernel with NO coverage ceiling
 
 `sortTriangleIndices` (convexMeshPostProcess.cu:623) mapped as an engine kernel —

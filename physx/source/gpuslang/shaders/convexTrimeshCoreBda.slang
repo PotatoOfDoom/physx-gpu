@@ -99,7 +99,13 @@ import pxgSlangCvxTriEmit;
 
 // PxgNpKernelIndices.h:33
 static const uint NP_TRIMESH_WARPS_PER_BLOCK = 2u;
-static const uint CTC_MEM_PER_PAIR = 56u;          // calculateConvexMeshPairMemRequirement()
+// calculateConvexMeshPairMemRequirement() (midphaseAllocate.cuh:93): uint4 16 +
+// ConvexTriNormalAndIndex 16 + ConvexTriContacts 4 + PxReal 4 +
+// ConvexTriIntermediateData 4 + PxU32 4 + PxU32 * 2 = 56.  NOT the ConvexMeshPair
+// stride, which is also 56 -- two unrelated numbers that happen to coincide, so
+// changing one must never be taken as licence to change the other.  Both are
+// pinned to the engine headers by static_assert in testNpAbiLayout.cpp.
+static const uint CTC_MEM_PER_PAIR = 56u;
 static const float CTC_ORTHO_EPS = 1e-6f;
 
 // The 21-argument pack of convexMesh.cu:622-647, at CUDA's natural-alignment

@@ -36,6 +36,13 @@
 
 #include "pxgTestFramework.h"
 
+// The BV32 node stride is taken from the ENGINE HEADER, never typed by hand.  It
+// was typed by hand once (160) and the shader carried the same wrong number, so
+// the fixture and the shader agreed with each other and disagreed with the
+// engine — a mutation sweep cannot catch that, because the fixture IS the oracle
+// for a layout it also defines.  Anchoring it here makes the compiler the oracle.
+#include "GuBV32.h"
+
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -91,7 +98,10 @@ static V3 normalized(V3 v)
     return m > 0.0f ? V3{ v.x / m, v.y / m, v.z / m } : V3{ 0, 0, 0 };
 }
 
-static const uint32_t BV32_STRIDE = 160;
+static const uint32_t BV32_STRIDE = uint32_t(sizeof(physx::Gu::BV32DataPacked)); // 1168
+static_assert(sizeof(physx::Gu::BV32DataPacked) == 1168,
+              "BV32DataPacked changed size; the cooked-mesh walk in "
+              "pxgSlangCvxTriSetup.slang carries this number too");
 static const uint32_t GEOM_TRIANGLEMESH = 4;
 static const uint32_t GEOM_CONVEXMESH = 5;
 

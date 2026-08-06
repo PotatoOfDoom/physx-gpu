@@ -44,8 +44,11 @@
 #include "PxsContactManagerState.h"
 #include "PxsMaterialCore.h"
 #include "cudaNpCommon.h"
+#include "convexNpCommon.h"
+#include "GuBV32.h"
 #include "PxsTransformCache.h"
 
+#include <cstddef>
 #include <cstring>
 #include <vector>
 
@@ -77,6 +80,36 @@ PXG_TEST(npAbiLayout_probe)
     static_assert(sizeof(PxsMaterialData) == 24, "PxsMaterialData size");
     static_assert(sizeof(PxgPatchAndContactCounters) == 16, "PxgPatchAndContactCounters size");
     static_assert(sizeof(PxGpuContactPair) == 80, "PxGpuContactPair size");
+
+    // ---- the convex-trimesh strides the BDA shaders type by hand ------------
+    //
+    // Added in P8.49 after finding that pxgSlangCvxTriSetup.slang and its own
+    // fixture BOTH carried 160 for the BV32 node stride, which is 1168.  They
+    // agreed with each other and disagreed with the engine, and the P8.46b
+    // mutation sweep came back 40/40 clean regardless: a fixture that DEFINES a
+    // layout cannot check it, because mutating the constant moves the oracle too.
+    // Every number the convex-trimesh shaders bake in is pinned to the engine
+    // header here, so the compiler is the oracle instead.
+    static_assert(sizeof(Gu::BV32DataPacked) == 1168, "BV32 node stride");
+    static_assert(sizeof(ConvexMeshPair) == 56, "ConvexMeshPair stride");
+    static_assert(offsetof(ConvexMeshPair, startIndex) == 28, "ConvexMeshPair::startIndex");
+    static_assert(offsetof(ConvexMeshPair, count) == 32, "ConvexMeshPair::count");
+    static_assert(offsetof(ConvexMeshPair, cmIndex) == 36, "ConvexMeshPair::cmIndex");
+    static_assert(offsetof(ConvexMeshPair, roundedStartIndex) == 40, "ConvexMeshPair::roundedStartIndex");
+    static_assert(offsetof(ConvexMeshPair, materialIndices) == 48, "ConvexMeshPair::materialIndices");
+    static_assert(sizeof(ConvexTriNormalAndIndex) == 16, "ConvexTriNormalAndIndex stride");
+    static_assert(offsetof(ConvexTriNormalAndIndex, index) == 12, "ConvexTriNormalAndIndex::index");
+    static_assert(sizeof(ConvexTriIntermediateData) == 4, "ConvexTriIntermediateData stride");
+    static_assert(sizeof(ConvexTriContacts) == 4, "ConvexTriContacts stride");
+    static_assert(sizeof(ConvexTriContact) == 16, "ConvexTriContact stride");
+
+    // convexTrimeshCoreBda bakes CTC_MEM_PER_PAIR = 56.  It is NOT the
+    // ConvexMeshPair stride above -- the two 56s are unrelated numbers that
+    // happen to coincide.  This one is the per-pair stack budget
+    // (calculateConvexMeshPairMemRequirement, midphaseAllocate.cuh:93).
+    static_assert(sizeof(uint4) + sizeof(ConvexTriNormalAndIndex) + sizeof(ConvexTriContacts)
+                  + sizeof(PxReal) + sizeof(ConvexTriIntermediateData) + sizeof(PxU32)
+                  + sizeof(PxU32) * 2 == 56, "calculateConvexMeshPairMemRequirement()");
 
     PxgSlangComputeDevice* dev = testDevice();
     const PxgKernelDef manifest[] = {

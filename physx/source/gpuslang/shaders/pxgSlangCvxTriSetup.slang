@@ -65,7 +65,20 @@
 // (no imports: the setup stage is pure address arithmetic over the two blobs)
 
 static const uint CT_WARP = 32u;
-static const uint CT_BV32_STRIDE = 160u;   // sizeof(Gu::BV32DataPacked)
+// sizeof(Gu::BV32DataPacked) (GuBV32.h:88): mMin[32] float4 = 512, mMax[32] = 512,
+// mData[32] uint = 128, mNbNodes + mDepth + padding[2] = 16.  1168, and every
+// other mesh-walking shader in this tree already carries that number.
+//
+// THIS READ 160 UNTIL P8.49, AND THE FIXTURE READ 160 TOO.  They agreed with each
+// other and disagreed with the engine, so every section past the tree — verts,
+// indices, adjacencies, faceRemap — sat at the wrong address against real device
+// memory, and the P8.46b sweep came back 40/40 clean anyway.  That is the failure
+// mode of a fixture that DEFINES the layout it is meant to check: mutating the
+// constant moves shader and oracle together.  The fixture now takes the stride
+// from the engine header (`sizeof(physx::Gu::BV32DataPacked)`) with a
+// static_assert, so the compiler is the oracle and this can only drift again if
+// the engine struct itself changes.
+static const uint CT_BV32_STRIDE = 1168u;
 
 public static const uint CT_GEOM_TRIANGLEMESH = 4u;   // PxGeometryType::eTRIANGLEMESH
 
