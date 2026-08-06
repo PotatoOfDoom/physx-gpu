@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **691/691** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **692/692** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,92 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.50b — `convexTrimeshCorrelate`: the convex-trimesh chain reaches the solver
+
+`convexTrimeshCorrelate` (convexMeshCorrelate.cu:348, core at :95) mapped as an
+engine kernel — `cvxTriCorrelateBda.slang`, manifest row 267, ABI row of eleven
+arguments (`{8,8,8,8,8,8,8,4,4,8,8}`, an 80-byte blob; the two scalars sit at @56
+and @60 and the pointer after them realigns to @64, confirmed against `spirv-dis`).
+
+This is the patch builder, and the last stage before contacts reach the solver.
+Contact generation has by now produced, per contact manager, a run of triangles
+each carrying a normal, a contact count and a slice of contact points.  This
+kernel turns that into at most four PATCHES of at most six contacts: repeatedly
+pick the deepest triangle still holding contacts, accept every triangle whose
+normal agrees with it to within `PATCH_ACCEPTANCE_EPS`, pull all their contacts
+into the warp, and reduce to six with the clustering `contactReduce` landed in
+P8.50a.
+
+**Coverage is exact.**  The host launches `ceil(numTests / 2)` blocks of two warps
+and passes numTests as `numPairs` — no grid-stride loop, so one workgroup per CUDA
+block with a constant-trip-2 loop covers every pair exactly once.  Nothing is
+skipped and there is no ceiling to close later.
+
+`[numthreads(32,1,1)]` is mandatory rather than preferred: `crContactReduce6Cluster`
+carries barriers in warp-uniform control flow, and llvmpipe HANGS on a divergent
+barrier.  The two warps of a CUDA block are serialised through one 32-thread group.
+
+**Two places needed device-memory barriers, not groupshared ones.**
+`purgeEmptyTriangles` compacts the depth and nic runs IN PLACE — on CUDA a warp's
+loads all retire before its stores, but a 32-thread workgroup on llvmpipe gives no
+such guarantee, so the record is read into registers, an `AllMemoryBarrier`
+is taken, and only then written.  The same applies to the per-patch `tempCounts`
+clear, which the next patch's deepest scan reads back.
+
+**One deliberate deviation, stated rather than hidden.**  `purgeEmptyTriangles`
+guards its depth load with `tI < nbToLoad` but its nic load with `nbToLoad` — the
+block size, not the lane test (cu:70-71) — so lanes past the end read one record
+beyond the run.  The value is PROVABLY discarded (their depth is FLT_MAX, so
+`valid` is false), so this port clamps the index: the result is identical, and an
+unclamped read would be an out-of-bounds BDA load that can take llvmpipe down
+rather than return garbage.
+
+Every documented quirk is ported verbatim: the FOUR-bit contact count purge stores
+against the THREE-bit count the patch loop reads back (at exactly 8 a triangle
+contributes zero contacts yet keeps a nonzero `tempCounts` forever, so
+`remainingTriangles` never reaches zero and the loop runs out its four
+iterations); the zero-triangle early-out writing `mNbManifolds` of the **pairIndex**
+manifold while everything else writes the **cmIndex** one; `mNbContacts[patch]`
+written even for empty patches.
+
+New suite `gpuslang.cvxTriCorrelate`, in the same file as the Phase-1 test and
+driven against the SAME `refCorrelate` oracle — the scalar shader proves the
+algorithm, so a divergence here is attributable to the BDA plumbing and the warp
+emulation and nothing else.  240 cases; the fixture rebases every per-case index
+onto shared engine buffers (pair *i* owns depth/nic/tempCounts slots
+`[i*64, i*64+64)` and contact-pool entries `[i*128, i*128+128)`, and the cbuf
+VALUES are rebased too since they index the pool).  The two output slots are
+modelled honestly: the engine cmIndex is set to the SAME slot as pairIndex when
+the oracle's cmIndex is 0 — the aliasing the engine really hits — and to a
+distinct slot otherwise, with every manifold word starting at `0xFFFFFFFF` so
+"not written" is observable.
+
+Coverage asserted, not hoped for: cached pairs, the zero-triangle early-out, the
+cm1 split, a reduce actually running, multi-patch results, the 4-bit/3-bit quirk,
+survivor runs spanning two 32-lane blocks, and BOTH depth ties — across lanes
+(lowest lane wins the exact min) and within one lane (the first strided index wins
+the strict `<`).  Those two are precisely what a scalar harness cannot reach.
+
+**Sweep 35/37.**  Both survivors are unreachable rather than untested: firing the
+reduce at `>= 6` instead of `> 6` calls a function that opens with
+`countbits(allMask) <= 6 -> return allMask`, so the extra call is a no-op; and
+writing `mRelativeTransform` unconditionally is indistinguishable because the
+zero-triangle path has already returned, `remainingTriangles` is at least one, and
+the patch loop therefore always runs at least once — `nbPatches == 0` never
+happens.
+
+A third mutant is worth recording for HOW it died: removing the reduce entirely
+does not produce wrong contacts, it **hangs**.  With more than six contacts held
+and nothing to cull them, `readMask = ~currentContactMask` empties out and
+`c += countbits(readMask)` stops advancing.  The reduction is load-bearing for
+TERMINATION, not only for manifold quality.
+
+**With this the whole convex-vs-trimesh chain is mapped** — setup prologue,
+midphase, SAT and clipping, contact reduction, emit tail, the composed core
+kernel, the triangle-index sort, the silhouette cull, and now the patch builder.
+
+Suite **692/692 in both memory modes**, forced-fresh.
 
 ## P8.50a — the SECOND contactReduce instantiation: clustering, as a real warp
 

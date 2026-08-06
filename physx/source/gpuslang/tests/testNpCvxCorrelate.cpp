@@ -594,4 +594,344 @@ PXG_TEST(npCvxCorrelate_correlate)
     for (PxgBufferHandle h : { bIn, bOut }) dev->destroyBuffer(h);
 }
 
+
+// ---------------------------------------------------------------------------
+// cvxTriCorrelateBda -- the SAME core on the engine BDA ABI, as a real 32-lane
+// warp writing real PxgPersistentContactMultiManifold records.
+//
+// Driven against the SAME refCorrelate above, which is the point: the scalar
+// shader proves the algorithm, so a divergence here is attributable to the BDA
+// plumbing and the warp emulation and nothing else.
+//
+// THE LAYOUT MAPPING.  refCorrelate works on one self-contained record with
+// 64 depth/nic/cbuf slots and 128 temp contacts.  The engine's buffers are shared
+// across contact managers and indexed globally, so every per-case index is
+// rebased: pair i owns depth/nic/tempCounts slots [i*64, i*64+64), contact-pool
+// entries [i*128, i*128+128), and its ConvexMeshPair carries `startIndex = i*64 +
+// localStart`.  The cbuf VALUES are rebased too, since they index the contact pool.
+//
+// THE TWO OUTPUT SLOTS.  The zero-triangle early-out writes mNbManifolds of
+// outBuffer[pairIndex] while everything else writes outBuffer[cmIndex] -- so the
+// oracle models "slot 0" (pairIndex) and "slot cmIndex".  Here pairIndex is the
+// case index, and the engine cmIndex is set to the SAME slot when the oracle's
+// cmIndex is 0 (the aliasing case the engine really hits) and to a distinct slot
+// N+i when it is 1.  Every manifold word starts at 0xFFFFFFFF, so "not written"
+// is observable rather than assumed.
+// ---------------------------------------------------------------------------
+
+struct CcPush
+{
+    uint64_t pairs, depthsPtr, normalAndIndexPtr, contactsPtr, output, cmOutputs;
+    uint64_t tempCountAndOffsetBuffer;
+    uint32_t numPairs;
+    float clusterBias;
+    uint64_t tempConvexTriContacts, pTempContactIndex;
+};
+
+const uint32_t MANIFOLD_WORDS = 1216 / 4;
+const uint32_t NBC_W = 1152 / 4;    // mNbContacts[0]
+const uint32_t RELXF_W = 1168 / 4;  // mRelativeTransform.q
+const uint32_t NBMAN_W = 1200 / 4;  // mNbManifolds
+
+PXG_TEST(cvxTriCorrelate)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    std::mt19937 rng(90210017);
+    const uint32_t N = 240;
+    auto rf = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng() % 1000000) / 1000000.f); };
+    auto randQuat = [&]() { V3 ax = unit(V3{ rf(-1, 1), rf(-1, 1), rf(-1, 1) }); const float a = rf(-3.1f, 3.1f);
+                            return F4{ ax.x * std::sin(a * .5f), ax.y * std::sin(a * .5f), ax.z * std::sin(a * .5f), std::cos(a * .5f) }; };
+
+    std::vector<CorrIn> in(N);
+    std::vector<CorrOut> ref(N);
+    std::vector<uint8_t> skip(N, 0);
+    size_t nSkip = 0, cCached = 0, cZeroTri = 0, cCm1 = 0, cReduce = 0, cMultiPatch = 0,
+           cQuirk8 = 0, cTwoBlocks = 0, cTie = 0;
+
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        CorrIn s{};
+        s.aToBq = randQuat();
+        s.aToBp = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), rf(0.01f, 0.1f) };
+
+        const bool cached = (i % 29 == 0);
+        uint32_t start = (i % 3 == 0) ? 8u : 0u;
+        uint32_t count = 1 + rng() % 48;
+        if (i % 5 == 2) { start = 0; count = 56 + rng() % 8; }   // survivors span two 32-lane blocks
+        if (start + count > 64) count = 64 - start;
+        const uint32_t cmIndex = (i % 3 == 1) ? 1u : 0u;
+        s.hdr = U4{ cached ? CACHED : count, start, cmIndex, 0 };
+
+        V3 cn[3];
+        cn[0] = unit(V3{ 1, rf(-0.2f, 0.2f), rf(-0.2f, 0.2f) });
+        cn[1] = unit(V3{ rf(-0.2f, 0.2f), 1, rf(-0.2f, 0.2f) });
+        cn[2] = unit(V3{ rf(-0.2f, 0.2f), rf(-0.2f, 0.2f), -1 });
+
+        for (uint32_t jj = 0; jj < 64; ++jj)
+        {
+            const V3 n = cn[rng() % 3];
+            s.nrm[jj] = F4{ n.x, n.y, n.z, 0 };
+            uint32_t nb = rng() % 8;
+            if (i % 17 == 4 && (jj & 7) == 3) nb = 8 + rng() % 8;   // the 4-bit/3-bit quirk
+            (&s.nicIdx[jj / 4].x)[jj & 3] = ((rng() & 1u) << 31) | (nb << 27) | (rng() & 0x07FFFFFFu);
+            (&s.cbuf[jj / 4].x)[jj & 3] = rng() % 112;              // 112 + 15 < 128
+            (&s.depth[jj / 4].x)[jj & 3] = (rng() % 4 == 0) ? FLTMAX : rf(-1.f, 1.f);
+        }
+        for (int jj = 0; jj < 128; ++jj)
+            s.tempC[jj] = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), rf(-0.5f, 0.5f) };
+
+        if (i % 23 == 7)
+        {
+            for (uint32_t jj = 0; jj < 64; ++jj) (&s.depth[jj / 4].x)[jj & 3] = FLTMAX;  // zero-triangle
+        }
+        else if ((i % 31 == 6 || i % 31 == 17) && !cached)
+        {
+            // The two DEPTH TIES the warp decides and a scalar loop cannot: across
+            // lanes (lowest lane wins the exact min) and within one lane (the first
+            // strided index wins the strict <).  Both pick a different bestNormal,
+            // so a wrong tie-break changes the whole first patch.
+            start = 0; count = 56;
+            s.hdr = U4{ count, 0, cmIndex, 0 };
+            for (uint32_t jj = 0; jj < 64; ++jj)
+            {
+                float& d = (&s.depth[jj / 4].x)[jj & 3];
+                if (d == FLTMAX) d = rf(-1.f, 1.f);
+                uint32_t& w = (&s.nicIdx[jj / 4].x)[jj & 3];
+                const uint32_t nb = getNb(w);
+                if (nb == 0 || nb > 7) w = (w & ~(15u << 27)) | ((1 + rng() % 7) << 27);
+            }
+            if (i % 31 == 6)
+            {
+                (&s.depth[0].x)[2] = -2.0f; s.depth[9].y = -2.0f;   // slots 2 and 37: lanes 2 vs 5
+                s.nrm[2] = F4{ cn[0].x, cn[0].y, cn[0].z, 0 };
+                s.nrm[37] = F4{ cn[1].x, cn[1].y, cn[1].z, 0 };
+            }
+            else
+            {
+                (&s.depth[0].x)[3] = -2.0f; s.depth[8].w = -2.0f;   // slots 3 and 35: both lane 3
+                s.nrm[3] = F4{ cn[1].x, cn[1].y, cn[1].z, 0 };
+                s.nrm[35] = F4{ cn[2].x, cn[2].y, cn[2].z, 0 };
+            }
+            ++cTie;
+        }
+        else if (i % 41 == 13 && !cached)
+        {
+            // The acceptance test sitting EXACTLY on PATCH_ACCEPTANCE_EPS.  Strict
+            // `>` must reject; the dot is bitwise equal on both sides, so this is a
+            // decision, not a near-tie.
+            start = 0; count = 24;
+            s.hdr = U4{ count, 0, cmIndex, 0 };
+            const V3 ex{ 1.f, 0.f, 0.f };
+            for (uint32_t jj = 0; jj < 64; ++jj)
+            {
+                float& d = (&s.depth[jj / 4].x)[jj & 3];
+                if (d == FLTMAX) d = rf(-1.f, 1.f);
+                uint32_t& w = (&s.nicIdx[jj / 4].x)[jj & 3];
+                const uint32_t nb = getNb(w);
+                if (nb == 0 || nb > 7) w = (w & ~(15u << 27)) | ((1 + rng() % 7) << 27);
+                if (rng() % 2) s.nrm[jj] = F4{ ex.x, ex.y, ex.z, 0 };
+            }
+            (&s.depth[0].x)[2] = -2.0f;
+            s.nrm[2] = F4{ ex.x, ex.y, ex.z, 0 };
+            s.nrm[5] = F4{ EPS_ACC, 0.08715574f, 0.f, 0 };
+            s.depth[1].y = -1.0f;
+        }
+
+        in[i] = s;
+        bool marg = false, reduceRan = false;
+        refCorrelate(s, ref[i], marg, reduceRan);
+        skip[i] = marg ? 1 : 0;
+        if (marg) { ++nSkip; continue; }
+        if (cached) ++cCached;
+        else if (ref[i].misc.z == 0) ++cZeroTri;
+        if (cmIndex == 1) ++cCm1;
+        if (ref[i].misc.z > 32) ++cTwoBlocks;
+        if (reduceRan) ++cReduce;
+        for (int jj = 0; jj < 64; ++jj)
+            if ((u32At(ref[i].tempOut, (uint32_t)jj) & 15u) > 7u) { ++cQuirk8; break; }
+        const uint32_t nbMan = (cmIndex == 0) ? ref[i].misc.x : ref[i].misc.y;
+        if (!cached && ref[i].misc.z > 0 && nbMan != UNTOUCHED && nbMan > 1) ++cMultiPatch;
+    }
+
+    // ---- lay the cases out as real engine buffers ---------------------------
+    std::vector<uint32_t> pairBuf(N * 14, 0u);
+    std::vector<float> depthBuf(N * 64, 0.0f);
+    std::vector<float> nicBuf(N * 64 * 4, 0.0f);
+    std::vector<uint32_t> cbufBuf(N * 64, 0u);
+    std::vector<uint32_t> tempCounts(N * 64, 0u);      // the oracle models these as zero
+    std::vector<float> tempC(N * 128 * 4, 0.0f);
+    std::vector<uint32_t> manifolds(2 * N * MANIFOLD_WORDS, 0xFFFFFFFFu);
+
+    std::vector<uint32_t> cmSlot(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const CorrIn& s = in[i];
+        // cmIndex 0 means the two writes ALIAS, which is what the engine does when
+        // a pair's contact-manager index equals its pair index.
+        cmSlot[i] = (s.hdr.z == 0) ? i : (N + i);
+
+        uint32_t* w = &pairBuf[i * 14];
+        std::memcpy(&w[0], &s.aToBq, 16);                 // PxQuat q @0
+        std::memcpy(&w[4], &s.aToBp, 12);                 // PxVec3 p @16
+        w[7] = i * 64 + s.hdr.y;                          // startIndex @28, rebased
+        w[8] = s.hdr.x;                                   // count @32
+        w[9] = cmSlot[i];                                 // cmIndex @36
+        w[10] = 0xAAAA0000u | i;                          // roundedStartIndex @40, unread here
+        w[11] = 0xBBBB0000u | i;
+
+        for (uint32_t j = 0; j < 64; ++j)
+        {
+            depthBuf[i * 64 + j] = fAt(s.depth, j);
+            const F4& n = s.nrm[j];
+            nicBuf[(i * 64 + j) * 4 + 0] = n.x;
+            nicBuf[(i * 64 + j) * 4 + 1] = n.y;
+            nicBuf[(i * 64 + j) * 4 + 2] = n.z;
+            const uint32_t idx = u32At(s.nicIdx, j);
+            std::memcpy(&nicBuf[(i * 64 + j) * 4 + 3], &idx, 4);
+            cbufBuf[i * 64 + j] = i * 128 + u32At(s.cbuf, j);   // values index the pool
+        }
+        for (uint32_t j = 0; j < 128; ++j)
+        {
+            tempC[(i * 128 + j) * 4 + 0] = s.tempC[j].x;
+            tempC[(i * 128 + j) * 4 + 1] = s.tempC[j].y;
+            tempC[(i * 128 + j) * 4 + 2] = s.tempC[j].z;
+            tempC[(i * 128 + j) * 4 + 3] = s.tempC[j].w;
+        }
+    }
+
+    PxgBufferHandle bPairs = createBufferFrom(dev, pairBuf);
+    PxgBufferHandle bDepth = createBufferFrom(dev, depthBuf);
+    PxgBufferHandle bNic = createBufferFrom(dev, nicBuf);
+    PxgBufferHandle bCbuf = createBufferFrom(dev, cbufBuf);
+    PxgBufferHandle bTemp = createBufferFrom(dev, tempCounts);
+    PxgBufferHandle bTempC = createBufferFrom(dev, tempC);
+    PxgBufferHandle bOut = createBufferFrom(dev, manifolds);
+
+    std::vector<uint64_t> pDepth(1, dev->getBufferDeviceAddress(bDepth));
+    std::vector<uint64_t> pNic(1, dev->getBufferDeviceAddress(bNic));
+    std::vector<uint64_t> pCbuf(1, dev->getBufferDeviceAddress(bCbuf));
+    PxgBufferHandle bPDepth = createBufferFrom(dev, pDepth);
+    PxgBufferHandle bPNic = createBufferFrom(dev, pNic);
+    PxgBufferHandle bPCbuf = createBufferFrom(dev, pCbuf);
+
+    CcPush push{};
+    push.pairs = dev->getBufferDeviceAddress(bPairs);
+    push.depthsPtr = dev->getBufferDeviceAddress(bPDepth);
+    push.normalAndIndexPtr = dev->getBufferDeviceAddress(bPNic);
+    push.contactsPtr = dev->getBufferDeviceAddress(bPCbuf);
+    push.output = dev->getBufferDeviceAddress(bOut);
+    push.cmOutputs = 0ull;
+    push.tempCountAndOffsetBuffer = dev->getBufferDeviceAddress(bTemp);
+    push.numPairs = N;
+    push.clusterBias = 0.0f;   // per case, overwritten below
+    push.tempConvexTriContacts = dev->getBufferDeviceAddress(bTempC);
+    push.pTempContactIndex = 0ull;
+
+    // The bias is a scalar in the push blob, so it is uniform across a dispatch.
+    // Every case therefore uses the SAME bias, and the oracle is fed the same
+    // value through aToBp.w -- which the case builder above already wrote.
+    const float BIAS = in[0].aToBp.w;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        CorrIn s = in[i];
+        s.aToBp.w = BIAS;
+        if (s.aToBp.w != in[i].aToBp.w)
+        {
+            in[i] = s;
+            bool marg = false, rr = false;
+            refCorrelate(s, ref[i], marg, rr);
+            skip[i] = marg ? 1 : 0;
+        }
+        std::memcpy(&pairBuf[i * 14 + 4], &s.aToBp, 12);
+    }
+    push.clusterBias = BIAS;
+    dev->destroyBuffer(bPairs);
+    bPairs = createBufferFrom(dev, pairBuf);
+    push.pairs = dev->getBufferDeviceAddress(bPairs);
+
+    {
+        Kernel k("cvxTriCorrelateBda.spv", "convexTrimeshCorrelate", {}, sizeof(CcPush));
+        k.dispatch((N + 1) / 2, {}, push, 1u, 1u);
+        dev->flush();
+    }
+
+    const auto gMan = downloadBuffer<uint32_t>(dev, bOut, manifolds.size());
+    const auto gTemp = downloadBuffer<uint32_t>(dev, bTemp, tempCounts.size());
+    const auto gDepth = downloadBuffer<float>(dev, bDepth, depthBuf.size());
+
+    size_t mmC = 0, mmN = 0, mmR = 0, mmM = 0, mmT = 0, mmD = 0, checked = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        if (skip[i]) continue;
+        ++checked;
+        const CorrOut& r = ref[i];
+        const uint32_t* man = &gMan[cmSlot[i] * MANIFOLD_WORDS];
+        const uint32_t* pairMan = &gMan[i * MANIFOLD_WORDS];
+
+        // mNbManifolds: the oracle's misc.x is the pairIndex slot, misc.y the
+        // cmIndex slot; UNTOUCHED means the kernel must not have written it.
+        if (pairMan[NBMAN_W] != r.misc.x && !(in[i].hdr.z == 0 && man[NBMAN_W] == r.misc.x)) ++mmM;
+        if (in[i].hdr.z == 1 && man[NBMAN_W] != r.misc.y) ++mmM;
+
+        for (uint32_t p = 0; p < 4; ++p)
+        {
+            const uint32_t expNb = (&r.nbC.x)[p];
+            if (man[NBC_W + p] != expNb) { ++mmN; break; }
+        }
+
+        const uint32_t nbMan = (in[i].hdr.z == 0) ? r.misc.x : r.misc.y;
+        if (nbMan != UNTOUCHED && nbMan > 0)
+        {
+            float q[4], pp[4];
+            std::memcpy(q, &man[RELXF_W], 16);
+            std::memcpy(pp, &man[RELXF_W + 4], 16);
+            if (!bitEq(q[0], r.relQ.x) || !bitEq(q[1], r.relQ.y) || !bitEq(q[2], r.relQ.z) ||
+                !bitEq(q[3], r.relQ.w) || !bitEq(pp[0], r.relP.x) || !bitEq(pp[1], r.relP.y) ||
+                !bitEq(pp[2], r.relP.z))
+                ++mmR;
+
+            for (uint32_t p = 0; p < nbMan && p < 4; ++p)
+                for (uint32_t c = 0; c < (&r.nbC.x)[p]; ++c)
+                {
+                    const uint32_t base = (p * 6 + c) * 3;
+                    const float* cp = reinterpret_cast<const float*>(&man[(p * 6 + c) * 12]);
+                    const F4& e0 = r.contacts[base + 0];   // pointA, penetration
+                    const F4& e1 = r.contacts[base + 1];   // pointB, asfloat(triIndex)
+                    const F4& e2 = r.contacts[base + 2];   // normal
+                    uint32_t gotTri; std::memcpy(&gotTri, &man[(p * 6 + c) * 12 + 10], 4);
+                    uint32_t expTri; std::memcpy(&expTri, &e1.w, 4);
+                    if (!eqF(cp[0], e0.x) || !eqF(cp[1], e0.y) || !eqF(cp[2], e0.z) ||
+                        !eqF(cp[3], e1.x) || !eqF(cp[4], e1.y) || !eqF(cp[5], e1.z) ||
+                        !eqF(cp[6], e2.x) || !eqF(cp[7], e2.y) || !eqF(cp[8], e2.z) ||
+                        !eqF(cp[9], e0.w) || gotTri != expTri)
+                    { ++mmC; break; }
+                }
+        }
+
+        for (uint32_t j = 0; j < 64; ++j)
+        {
+            if (gTemp[i * 64 + j] != u32At(r.tempOut, j)) { ++mmT; break; }
+            if (!bitEq(gDepth[i * 64 + j], fAt(r.depthOut, j))) { ++mmD; break; }
+        }
+    }
+
+    for (PxgBufferHandle h : { bPairs, bDepth, bNic, bCbuf, bTemp, bTempC, bOut,
+                               bPDepth, bPNic, bPCbuf })
+        dev->destroyBuffer(h);
+
+    PXG_CHECK_MSG(mmC == 0, "cvxTriCorrelate: %zu contact mismatches", mmC);
+    PXG_CHECK_MSG(mmN == 0, "cvxTriCorrelate: %zu nbContacts mismatches", mmN);
+    PXG_CHECK_MSG(mmR == 0, "cvxTriCorrelate: %zu relTransform mismatches", mmR);
+    PXG_CHECK_MSG(mmM == 0, "cvxTriCorrelate: %zu mNbManifolds mismatches", mmM);
+    PXG_CHECK_MSG(mmT == 0, "cvxTriCorrelate: %zu tempCounts mismatches", mmT);
+    PXG_CHECK_MSG(mmD == 0, "cvxTriCorrelate: %zu depth mismatches", mmD);
+    PXG_CHECK_MSG(checked > N / 2, "cvxTriCorrelate: too many marginal (%zu/%u)", nSkip, N);
+    PXG_CHECK_MSG(cCached > 0 && cZeroTri > 0 && cCm1 > N / 5 && cReduce > 0 &&
+                  cMultiPatch > 0 && cQuirk8 > 0 && cTwoBlocks > 0 && cTie > 0,
+                  "cvxTriCorrelate: coverage thin (cached %zu zeroTri %zu cm1 %zu reduce %zu "
+                  "multi %zu quirk8 %zu blocks2 %zu tie %zu)",
+                  cCached, cZeroTri, cCm1, cReduce, cMultiPatch, cQuirk8, cTwoBlocks, cTie);
+}
+
 } // namespace

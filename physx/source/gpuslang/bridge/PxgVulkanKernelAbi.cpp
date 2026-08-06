@@ -1001,6 +1001,13 @@ static const uint8_t kSortTriIndices[] = { 8, 8, 4 };
 //   ConvexTriIntermediateData**, const PxU32**, PxU32**, PxU8* stackPtr,
 //   PxU32* nbSecondPassPairs, PxgShape*) -- eight pointers, 64 bytes flat.
 static const uint8_t kCvxTriPostProcess[] = { 8, 8, 8, 8, 8, 8, 8, 8 };
+
+// convexTrimeshCorrelate(ConvexMeshPair*, PxReal**, ConvexTriNormalAndIndex**,
+//   ConvexTriContacts**, PxgPersistentContactMultiManifold*,
+//   PxsContactManagerOutput*, PxU32* tempCountAndOffset, PxU32 numPairs,
+//   PxReal clusterBias, ConvexTriContact*, PxU32*) -- the two 4-byte scalars sit
+//   at @56 and @60, and the pointer after them realigns to @64.  Total 80.
+static const uint8_t kCvxTriCorrelate[] = { 8, 8, 8, 8, 8, 8, 8, 4, 4, 8, 8 };
 static const uint32_t kCvxTriCoreHostPtrMask = 1u << 18;
 
 static const PxgKernelAbiRow kRows[] = {
@@ -1008,6 +1015,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "convexTrimeshNarrowphase", kCvxTriCore, uint32_t(sizeof(kCvxTriCore)), kCvxTriCoreHostPtrMask },
     { "sortTriangleIndices", kSortTriIndices, uint32_t(sizeof(kSortTriIndices)) },
     { "convexTrimeshPostProcess", kCvxTriPostProcess, uint32_t(sizeof(kCvxTriPostProcess)) },
+    { "convexTrimeshCorrelate", kCvxTriCorrelate, uint32_t(sizeof(kCvxTriCorrelate)) },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },
     { "clearNewFlagLaunch", kOnePtr, 1u },
     { "bpSignalComplete", kOnePtr, 1u },
