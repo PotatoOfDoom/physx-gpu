@@ -1694,6 +1694,69 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.51 — MILESTONE: a box falls and RESTS on a cooked triangle mesh, on Vulkan
+
+```
+[boxOnMesh] start y=5.000, y after 1 step=4.9973, final y=0.5000 (rest 0.500), |v|=0.0000
+[  OK  ] gpu-sdk-step: scene 'meshfloor' stepped on the Vulkan GPU pipeline (all 1 body(ies) fell + rested)
+```
+
+`PXG_SCENE=meshfloor` under `PXG_GPU_STEP=1`: a dynamic box dropped from y=5 onto a
+COOKED TRIANGLE MESH comes to rest at exactly its rest height with zero residual
+velocity, with **zero refused and zero failed launches**.  This scene has been red
+since P8.21.
+
+**What it took to close it was one kernel.**  Running the scene after P8.50b showed
+the whole chain launching except for a single repeated error —
+`GPU convexTrimesh finishContacts fail to launch kernel!!` — so the remaining work
+was exactly one map, not a hunt.
+
+`convexTrimeshFinishContacts` (convexMeshOutput.cu:116-346) is now
+`cvxTriFinishBda.slang`, manifest row 268, ABI row of twenty-one arguments
+(`{8,8,8,8,8,8,4,8,8,8,8,1,8,8,8,8,8,8,4,4,4}`, 160 bytes — the same shape as the
+convex-convex `finishContactsKernel`, one 1-byte bool included).  It turns a
+multi-manifold into the contact patches, points and face indices the solver reads:
+the reservations become real `InterlockedAdd`s on the shared
+`PxgPatchAndContactCounters`, and the three streams become real writes.
+
+Lifted from `npCvxTrimeshOut.slang`, the Phase-1 verbatim port of the same kernel,
+with every quirk intact:
+
+* the reservation is **lane 0's alone**, and `insertAveragePoint` inflates
+  `totalNumContacts` on lane 0 ONLY — so the face-index region base is PER-LANE
+  DIVERGENT and lane 0's slot can collide with another lane's.  That is a genuine
+  unordered intra-warp write conflict in the CUDA; it is reproduced, not repaired.
+  The average contacts themselves are never written — the slots are reserved and
+  left stale, because `getAvgContactValue` is dead code.
+* the overflow tests are a **chained else-if** over the full reservation sizes, so
+  at most one error bit is ever set even when two limits are blown.
+* a pair with manifolds but no contacts skips the reservation entirely, leaving
+  the offsets at `0xFFFFFFFF`, yet still passes the gate and stores
+  `base + 0xFFFFFFFF` as its output pointers — wrapped.  Nothing dereferences
+  them because every stream write is behind `hasContacts`.
+* `getWorldNormal` does NOT average despite its comment: it takes the manifold's
+  FIRST contact normal, rotates it by the trimesh transform and normalizes.
+
+One guard is NOT verbatim and is flagged in the shader: the patch write carries an
+extra `patchByteOffset != 0xFFFFFFFF` test the CUDA does not have.  It is provably
+unreachable — the reservation runs whenever `totalNumContacts != 0`, and reaching
+that line needs `popcContacts > 0` — but it is kept because the alternative
+failure mode is a WILD WRITE at `patchStream + 0xFFFFFFFF` rather than a wrong
+value.
+
+**What stands behind this kernel today, stated plainly:** the Phase-1 verbatim port
+with its own fixture and sweep (`npCvxTrimeshOut`), plus the live scene above.  It
+does NOT yet have an engine-ABI fixture of its own with a mutation sweep, the way
+P8.48-P8.50b do.  That is the next tranche, not a claim being made here.
+
+Suite **692/692 in both memory modes**, forced-fresh.  No regression: ,
+`box`, `stack`, `plane`, `convex`, `joint`, `capsulebox` and `sphere` all fall and
+rest on the Vulkan pipeline.
+
+**The convex-vs-trimesh chain is complete**: setup prologue, midphase, SAT and
+clipping, contact reduction, emit tail, the composed core kernel, the triangle-index
+sort, the silhouette cull, the patch builder, and now the output stage.
+
 ## P8.50b — `convexTrimeshCorrelate`: the convex-trimesh chain reaches the solver
 
 `convexTrimeshCorrelate` (convexMeshCorrelate.cu:348, core at :95) mapped as an
