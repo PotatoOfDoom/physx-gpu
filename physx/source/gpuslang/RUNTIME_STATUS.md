@@ -1749,7 +1749,7 @@ with its own fixture and sweep (`npCvxTrimeshOut`), plus the live scene above.  
 does NOT yet have an engine-ABI fixture of its own with a mutation sweep, the way
 P8.48-P8.50b do.  That is the next tranche, not a claim being made here.
 
-Suite **692/692 in both memory modes**, forced-fresh.  No regression: ,
+Suite **692/692 in both memory modes**, forced-fresh.  No regression: `meshfloor`,
 `box`, `stack`, `plane`, `convex`, `joint`, `capsulebox` and `sphere` all fall and
 rest on the Vulkan pipeline.
 
