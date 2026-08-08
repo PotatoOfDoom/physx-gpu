@@ -1694,6 +1694,46 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.61 — the dispatch-67 fault: the port is clean, so the data is not
+
+Read the shader against the CUDA before digging further, and the result narrows the
+search a lot: **`updateChangedAABBMgrHandlesLaunch` is correctly bounded against its
+own descriptor.**
+
+```slang
+for (uint w = groupId.x; w < numWords; w += WorkgroupCount().x)   // w < numWords
+    const uint i = w * 32u + lane;
+    if (i < numElements && updated[i] != 0u)                      // i < numWords*32
+    ...
+    if (lane == 0) changed[w] = gAabbMgrWord;                     // w < numWords
+```
+
+Every index is derived from `mBitMapWordCounts` and checked against it.  The CUDA
+(updateTransformAndBoundArray.cu:192) does the same arithmetic with a ballot
+instead of a groupshared OR.  There is no unguarded index here of the kind P8.59
+found in the solver, so **the fault is not in the translation — it is in the data
+the descriptor hands it**: `mUpdated` or `mChangedAABBMgrHandles` null, or
+`mBitMapWordCounts` garbage.
+
+**Where to look, precisely.**  `PxgSimulationCore::constructDescriptor`
+(PxgSimulationCore.cpp:612) fills both: `mUpdated = mUpdatedBuffer.getTypedPtr()`
+and `mBitMapWordCounts = bitMapWordCounts`, the latter passed in by the caller.
+The shader reads `bitMapWordCounts * 32` elements out of `mUpdatedBuffer`, so the
+check is whether that buffer is sized for that many — **on the host, no device
+readback needed**, exactly as P8.60's answer came from reading an `allocate()` call
+rather than dumping memory.
+
+**Why this is probably the same bug twice.**  P8.60's fault was a buffer sized by a
+rigid-only count and indexed by a total count, exposed only because an articulation
+inflates one and not the other.  An articulation adds link shapes, which get AABB
+manager handles, which is exactly what `bitMapWordCounts` counts.  A second
+instance of that class is the first thing to rule out — and if it is one, the fix is
+again upstream in the engine, not in this port.
+
+*Stopping the dig here deliberately:* the next step is a host-side size comparison,
+which is a clean five-minute check with a clear yes/no, and it is better handed
+over stated exactly than started and left half-answered.
+
 ## P8.60 — CONFIRMED: an articulation-only island empties `solverBodyReferences`
 
 The read, not the write, was the fault — and the cause is an **array-sizing
