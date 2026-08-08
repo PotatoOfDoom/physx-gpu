@@ -170,8 +170,77 @@ void artiBlockProbe()
         o[i++] = uint64_t(asuint(bottom.z));
     }
 
-    // the first word of the embedded constraint block, which pins its offset
-    o[i++] = uint64_t(abU32(d, PXG_AB_DOF_mConstraintData, AP_LANE));
+    // ---- the embedded PxgArticulationInternalConstraintData, at lane 3 ----
+    //
+    // Its base offset inside the dof block is pinned by reading a field the
+    // block's own neighbours cannot produce, and every field below is read
+    // through the constraint block's own offsets so both numbers are live.
+    {
+        const uint64_t c = d + PXG_AB_DOF_mConstraintData;
+        o[i++] = uint64_t(PXG_AB_IC_SIZE);
+
+        // the four spatial-vector rows, 768 bytes apart
+        float3 top, bottom;
+        abLoadSpatialVector(c, PXG_AB_IC_mRow0, AP_LANE, top, bottom);
+        o[i++] = uint64_t(asuint(top.x));
+        abLoadSpatialVector(c, PXG_AB_IC_mRow1, AP_LANE, top, bottom);
+        o[i++] = uint64_t(asuint(top.y));
+        abLoadSpatialVector(c, PXG_AB_IC_mDeltaVA, AP_LANE, top, bottom);
+        o[i++] = uint64_t(asuint(bottom.x));
+        abLoadSpatialVector(c, PXG_AB_IC_mDeltaVB, AP_LANE, top, bottom);
+        o[i++] = uint64_t(asuint(bottom.z));
+
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mRecipResponse, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mResponse, AP_LANE)));
+
+        // the two float2[32] arrays: element stride 8, and they are adjacent
+        {
+            const float2 lim = abF2(c, PXG_AB_IC_mLimits_LowLimitX_highLimitY, AP_LANE);
+            o[i++] = uint64_t(asuint(lim.x));
+            o[i++] = uint64_t(asuint(lim.y));
+            const float2 err = abF2(c, PXG_AB_IC_mLimitError_LowX_highY, AP_LANE);
+            o[i++] = uint64_t(asuint(err.x));
+            o[i++] = uint64_t(asuint(err.y));
+        }
+
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mHighImpulse, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mLowImpulse, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mMaxJointVelocity, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mDriveImpulse, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mConstraintMaxImpulse, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mMaxForce, AP_LANE)));
+        // the one PxU32 array in a run of PxReals
+        o[i++] = uint64_t(abU32(c, PXG_AB_IC_mDriveType, AP_LANE));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mMaxEffort, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mMaxActuatorVelocity, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mVelocityDependentResistance, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mSpeedEffortGradient, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mDriveTargetPos, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mArmature, AP_LANE)));
+        {
+            const float4 dd = abF4(c,
+                PXG_AB_IC_mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW,
+                AP_LANE);
+            o[i++] = uint64_t(asuint(dd.x));
+            o[i++] = uint64_t(asuint(dd.w));
+        }
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mDriveStiffness, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mDamping, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mDriveTargetVel, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mTargetPosBias, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mAccumulatedFrictionImpulse, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mMaxFrictionForce, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mFrictionCoefficient, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mStaticFrictionEffort, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mDynamicFrictionEffort, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(c, PXG_AB_IC_mViscousFrictionCoefficient, AP_LANE)));
+
+        // Dy::SpatialSubspaceMatrix: 80 bytes, three UnAlignedSpatialVector
+        // columns of 24 plus tail.  Column 2, so the 24-byte column stride is
+        // load-bearing and not confusable with the 16 a float4 would imply.
+        o[i++] = uint64_t(PXG_AR_SUBSPACE_SIZE);
+        o[i++] = uint64_t(PXG_AR_SPATIAL_VECTOR_SIZE);
+    }
 
     // ---- PxgMat33Block[1] and PxgSpatialTransformBlock[1], lane 3 ----
     const uint64_t m = gArtiBlockProbe.mat33 + uint64_t(AP_ELEM) * PXG_AB_MAT33_BLOCK_SIZE;

@@ -1694,6 +1694,47 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.71 — the last address map: the internal constraint block
+
+`PxgArticulationInternalConstraintData` (7296 bytes, embedded in every
+`PxgArticulationBlockDofData` at offset 5440) and `Dy::SpatialSubspaceMatrix`.
+With these, **no number the articulation solver addresses with is unproven** —
+descriptor, block layout, record structs and now the constraint block are all
+generated from the engine headers, pinned by `static_assert`, and read back
+functionally by `artiBlockProbe`.
+
+Four `PxgSpatialVectorBlock` rows then thirty scalar `[32]` arrays: the drive,
+limit, friction and envelope parameters `jcalc`'s per-dof loop fills and the
+solver reads back.  Two shapes in it that a uniform-looking run hides:
+
+* **`mLimits_LowLimitX_highLimitY` and `mLimitError_LowX_highY` are `float2[32]`**,
+  element stride 8 rather than 4, and they are adjacent — reading either at a
+  4-byte stride lands inside the other.  Both the offsets and `abF2`'s stride are
+  swept.
+* **`mDriveType` is the only `PxU32` array** in a run of thirty `PxReal`s.
+
+**176 probed values, all correct on the first run.**  Sweep **23 of 24 killed**.
+
+The survivor is not an invariance and not a gap — it is a **badly chosen mutant**,
+and saying so is cheaper than dressing it up: it read `mDriveType` through `abF32`
+and converted straight back with `asuint`.  `abF32` is `asfloat(abU32(...))`, so
+that mutant is *literally the same code*; no test can distinguish it.  The hazard
+the module comment warns about is real but lives one step further on, where a
+consumer treats the value as a float — the comment now says that instead of
+implying the probe covers it.
+
+Suite **697/697** both memory modes; manifest unchanged at **270 of 501**.
+
+**What this closes.**  Four tranches of address map (P8.66, P8.67, P8.68, P8.70,
+P8.71) have moved the manifest by one kernel between them, and that is the honest
+number.  What they bought is that the next five tranches — `jcalc`'s three phases —
+write kernel code against constants that have each been proven twice, rather than
+against numbers read out of a header by eye.  Two of those maps already caught
+traps that would have been silent corruption rather than build errors (the 6x6
+response matrix beside a 7-column block; `nbDof` as a byte at a word-aligned
+offset).  Whether that investment pays is measurable and will be measured: the
+first articulation *dynamics* kernel lands at the end of the `jcalc` chain.
+
 ## P8.70 — the record structs the block fill reads from
 
 The last ABI layer before `jcalc`'s record→block copy path can be written:

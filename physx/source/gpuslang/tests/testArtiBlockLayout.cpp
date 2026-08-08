@@ -223,6 +223,43 @@ static_assert(sizeof(Dy::ArticulationJointCoreData) == 8, "PXG_AR_JOINT_CORE_DAT
 static_assert(sizeof(Dy::ArticulationJointCoreData::nbDof) == 1, "nbDof is a byte");
 static_assert(offsetof(Dy::ArticulationJointCoreData, nbDof) == 4, "PXG_AR_JCD_nbDof");
 static_assert(offsetof(Dy::ArticulationJointCoreData, jointOffset) == 0, "PXG_AR_JCD_jointOffset");
+static_assert(sizeof(PxgArticulationInternalConstraintData) == 7296, "PXG_AB_IC_SIZE");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mRow0) == 0, "PXG_AB_IC_mRow0");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mRow1) == 768, "PXG_AB_IC_mRow1");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mDeltaVA) == 1536, "PXG_AB_IC_mDeltaVA");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mDeltaVB) == 2304, "PXG_AB_IC_mDeltaVB");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mRecipResponse) == 3072, "PXG_AB_IC_mRecipResponse");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mResponse) == 3200, "PXG_AB_IC_mResponse");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mLimits_LowLimitX_highLimitY) == 3328, "PXG_AB_IC_mLimits_LowLimitX_highLimitY");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mLimitError_LowX_highY) == 3584, "PXG_AB_IC_mLimitError_LowX_highY");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mHighImpulse) == 3840, "PXG_AB_IC_mHighImpulse");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mLowImpulse) == 3968, "PXG_AB_IC_mLowImpulse");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mMaxJointVelocity) == 4096, "PXG_AB_IC_mMaxJointVelocity");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mDriveImpulse) == 4224, "PXG_AB_IC_mDriveImpulse");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mConstraintMaxImpulse) == 4352, "PXG_AB_IC_mConstraintMaxImpulse");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mMaxForce) == 4480, "PXG_AB_IC_mMaxForce");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mDriveType) == 4608, "PXG_AB_IC_mDriveType");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mMaxEffort) == 4736, "PXG_AB_IC_mMaxEffort");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mMaxActuatorVelocity) == 4864, "PXG_AB_IC_mMaxActuatorVelocity");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mVelocityDependentResistance) == 4992, "PXG_AB_IC_mVelocityDependentResistance");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mSpeedEffortGradient) == 5120, "PXG_AB_IC_mSpeedEffortGradient");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mDriveTargetPos) == 5248, "PXG_AB_IC_mDriveTargetPos");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mArmature) == 5376, "PXG_AB_IC_mArmature");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW) == 5504, "PXG_AB_IC_mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mDriveStiffness) == 6016, "PXG_AB_IC_mDriveStiffness");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mDamping) == 6144, "PXG_AB_IC_mDamping");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mDriveTargetVel) == 6272, "PXG_AB_IC_mDriveTargetVel");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mTargetPosBias) == 6400, "PXG_AB_IC_mTargetPosBias");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mAccumulatedFrictionImpulse) == 6528, "PXG_AB_IC_mAccumulatedFrictionImpulse");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mMaxFrictionForce) == 6656, "PXG_AB_IC_mMaxFrictionForce");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mFrictionCoefficient) == 6784, "PXG_AB_IC_mFrictionCoefficient");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mStaticFrictionEffort) == 6912, "PXG_AB_IC_mStaticFrictionEffort");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mDynamicFrictionEffort) == 7040, "PXG_AB_IC_mDynamicFrictionEffort");
+static_assert(offsetof(PxgArticulationInternalConstraintData, mViscousFrictionCoefficient) == 7168, "PXG_AB_IC_mViscousFrictionCoefficient");
+
+static_assert(sizeof(Dy::SpatialSubspaceMatrix) == 80, "PXG_AR_SUBSPACE_SIZE");
+static_assert(offsetof(Dy::SpatialSubspaceMatrix, columns) == 0, "PXG_AR_SUBSPACE_COLUMNS");
+static_assert(sizeof(Cm::UnAlignedSpatialVector) == 24, "PXG_AR_SPATIAL_VECTOR_SIZE");
 } // namespace pin
 
 // distinct sentinels: element index and lane both enter every value, so no two
@@ -413,7 +450,46 @@ PXG_TEST(artiBlockLayout)
                                                     sentF32(e, l, 132 + k * 6), sentF32(e, l, 133 + k * 6));
                 svb[k]->mbyz[l] = make_float2(sentF32(e, l, 134 + k * 6), sentF32(e, l, 135 + k * 6));
             }
-            reinterpret_cast<PxU32*>(&D.mConstraintData)[l] = sentU32(e, l, 199);
+            PxgArticulationInternalConstraintData& C = D.mConstraintData;
+            uint32_t g = 500;
+            PxgSpatialVectorBlock* rows[4] = { &C.mRow0, &C.mRow1, &C.mDeltaVA, &C.mDeltaVB };
+            for (uint32_t v = 0; v < 4; ++v)
+            {
+                rows[v]->mTopxyz_bx[l] = make_float4(sentF32(e, l, g), sentF32(e, l, g + 1),
+                                                     sentF32(e, l, g + 2), sentF32(e, l, g + 3));
+                rows[v]->mbyz[l] = make_float2(sentF32(e, l, g + 4), sentF32(e, l, g + 5));
+                g += 6;
+            }
+            C.mRecipResponse[l] = sentF32(e, l, g++);
+            C.mResponse[l] = sentF32(e, l, g++);
+            C.mLimits_LowLimitX_highLimitY[l] = make_float2(sentF32(e, l, g), sentF32(e, l, g + 1)); g += 2;
+            C.mLimitError_LowX_highY[l] = make_float2(sentF32(e, l, g), sentF32(e, l, g + 1)); g += 2;
+            C.mHighImpulse[l] = sentF32(e, l, g++);
+            C.mLowImpulse[l] = sentF32(e, l, g++);
+            C.mMaxJointVelocity[l] = sentF32(e, l, g++);
+            C.mDriveImpulse[l] = sentF32(e, l, g++);
+            C.mConstraintMaxImpulse[l] = sentF32(e, l, g++);
+            C.mMaxForce[l] = sentF32(e, l, g++);
+            C.mDriveType[l] = sentU32(e, l, g++);   // the one PxU32 in the run
+            C.mMaxEffort[l] = sentF32(e, l, g++);
+            C.mMaxActuatorVelocity[l] = sentF32(e, l, g++);
+            C.mVelocityDependentResistance[l] = sentF32(e, l, g++);
+            C.mSpeedEffortGradient[l] = sentF32(e, l, g++);
+            C.mDriveTargetPos[l] = sentF32(e, l, g++);
+            C.mArmature[l] = sentF32(e, l, g++);
+            C.mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW[l] =
+                make_float4(sentF32(e, l, g), sentF32(e, l, g + 1),
+                            sentF32(e, l, g + 2), sentF32(e, l, g + 3)); g += 4;
+            C.mDriveStiffness[l] = sentF32(e, l, g++);
+            C.mDamping[l] = sentF32(e, l, g++);
+            C.mDriveTargetVel[l] = sentF32(e, l, g++);
+            C.mTargetPosBias[l] = sentF32(e, l, g++);
+            C.mAccumulatedFrictionImpulse[l] = sentF32(e, l, g++);
+            C.mMaxFrictionForce[l] = sentF32(e, l, g++);
+            C.mFrictionCoefficient[l] = sentF32(e, l, g++);
+            C.mStaticFrictionEffort[l] = sentF32(e, l, g++);
+            C.mDynamicFrictionEffort[l] = sentF32(e, l, g++);
+            C.mViscousFrictionCoefficient[l] = sentF32(e, l, g++);
         }
     }
 
@@ -528,7 +604,47 @@ PXG_TEST(artiBlockLayout)
     expect.push_back(bits(D.mIsW.mTopxyz_bx[LANE].x));
     expect.push_back(bits(D.mJointAxis.mTopxyz_bx[LANE].x));
     expect.push_back(bits(D.mJointAxis.mbyz[LANE].y));
-    expect.push_back(reinterpret_cast<const PxU32*>(&D.mConstraintData)[LANE]);
+    {
+        const PxgArticulationInternalConstraintData& C = D.mConstraintData;
+        expect.push_back(sizeof(PxgArticulationInternalConstraintData));
+        expect.push_back(bits(C.mRow0.mTopxyz_bx[LANE].x));
+        expect.push_back(bits(C.mRow1.mTopxyz_bx[LANE].y));
+        expect.push_back(bits(C.mDeltaVA.mTopxyz_bx[LANE].w));   // bottom.x
+        expect.push_back(bits(C.mDeltaVB.mbyz[LANE].y));         // bottom.z
+        expect.push_back(bits(C.mRecipResponse[LANE]));
+        expect.push_back(bits(C.mResponse[LANE]));
+        expect.push_back(bits(C.mLimits_LowLimitX_highLimitY[LANE].x));
+        expect.push_back(bits(C.mLimits_LowLimitX_highLimitY[LANE].y));
+        expect.push_back(bits(C.mLimitError_LowX_highY[LANE].x));
+        expect.push_back(bits(C.mLimitError_LowX_highY[LANE].y));
+        expect.push_back(bits(C.mHighImpulse[LANE]));
+        expect.push_back(bits(C.mLowImpulse[LANE]));
+        expect.push_back(bits(C.mMaxJointVelocity[LANE]));
+        expect.push_back(bits(C.mDriveImpulse[LANE]));
+        expect.push_back(bits(C.mConstraintMaxImpulse[LANE]));
+        expect.push_back(bits(C.mMaxForce[LANE]));
+        expect.push_back(C.mDriveType[LANE]);
+        expect.push_back(bits(C.mMaxEffort[LANE]));
+        expect.push_back(bits(C.mMaxActuatorVelocity[LANE]));
+        expect.push_back(bits(C.mVelocityDependentResistance[LANE]));
+        expect.push_back(bits(C.mSpeedEffortGradient[LANE]));
+        expect.push_back(bits(C.mDriveTargetPos[LANE]));
+        expect.push_back(bits(C.mArmature[LANE]));
+        expect.push_back(bits(C.mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW[LANE].x));
+        expect.push_back(bits(C.mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW[LANE].w));
+        expect.push_back(bits(C.mDriveStiffness[LANE]));
+        expect.push_back(bits(C.mDamping[LANE]));
+        expect.push_back(bits(C.mDriveTargetVel[LANE]));
+        expect.push_back(bits(C.mTargetPosBias[LANE]));
+        expect.push_back(bits(C.mAccumulatedFrictionImpulse[LANE]));
+        expect.push_back(bits(C.mMaxFrictionForce[LANE]));
+        expect.push_back(bits(C.mFrictionCoefficient[LANE]));
+        expect.push_back(bits(C.mStaticFrictionEffort[LANE]));
+        expect.push_back(bits(C.mDynamicFrictionEffort[LANE]));
+        expect.push_back(bits(C.mViscousFrictionCoefficient[LANE]));
+        expect.push_back(sizeof(Dy::SpatialSubspaceMatrix));
+        expect.push_back(sizeof(Cm::UnAlignedSpatialVector));
+    }
 
     expect.push_back(bits(mat33[ELEM].mCol0[LANE].x));
     expect.push_back(bits(mat33[ELEM].mCol1[LANE].y));

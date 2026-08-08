@@ -238,6 +238,61 @@ public static const uint PXG_AR_JCD_nbDof                                   =   
 public static const uint PXG_AR_JCD_jointOffset                             =      0;
 
 // ---------------------------------------------------------------------------
+// PxgArticulationInternalConstraintData (7296 bytes), embedded in every
+// PxgArticulationBlockDofData at offset 5440 -- the LAST unmapped layer of the
+// articulation solver.  Four PxgSpatialVectorBlocks then thirty scalar [32]
+// arrays: the drive, limit, friction and envelope parameters jcalc's per-dof
+// loop fills and the solver reads back.
+//
+// Two things to notice before using it.  `mDriveType` is the only PxU32 array
+// in a run of PxReals; `abF32` is `asfloat(abU32(...))`, so reading it the wrong
+// way is only harmful once a CONSUMER treats the value as a float -- a probe
+// that reads it as a float and converts straight back cannot tell, and the
+// sweep mutant that tried was a tautology rather than a finding.  And
+// `mLimits_LowLimitX_highLimitY` and
+// `mLimitError_LowX_highY` are float2[32], so their element stride is 8 bytes,
+// not 4, and they sit adjacent: reading either at a 4-byte stride lands inside
+// the other.
+// ---------------------------------------------------------------------------
+public static const uint PXG_AB_IC_SIZE                                           =   7296;
+public static const uint PXG_AB_IC_mRow0                                          =      0;
+public static const uint PXG_AB_IC_mRow1                                          =    768;
+public static const uint PXG_AB_IC_mDeltaVA                                       =   1536;
+public static const uint PXG_AB_IC_mDeltaVB                                       =   2304;
+public static const uint PXG_AB_IC_mRecipResponse                                 =   3072;
+public static const uint PXG_AB_IC_mResponse                                      =   3200;
+public static const uint PXG_AB_IC_mLimits_LowLimitX_highLimitY                   =   3328;
+public static const uint PXG_AB_IC_mLimitError_LowX_highY                         =   3584;
+public static const uint PXG_AB_IC_mHighImpulse                                   =   3840;
+public static const uint PXG_AB_IC_mLowImpulse                                    =   3968;
+public static const uint PXG_AB_IC_mMaxJointVelocity                              =   4096;
+public static const uint PXG_AB_IC_mDriveImpulse                                  =   4224;
+public static const uint PXG_AB_IC_mConstraintMaxImpulse                          =   4352;
+public static const uint PXG_AB_IC_mMaxForce                                      =   4480;
+public static const uint PXG_AB_IC_mDriveType                                     =   4608;
+public static const uint PXG_AB_IC_mMaxEffort                                     =   4736;
+public static const uint PXG_AB_IC_mMaxActuatorVelocity                           =   4864;
+public static const uint PXG_AB_IC_mVelocityDependentResistance                   =   4992;
+public static const uint PXG_AB_IC_mSpeedEffortGradient                           =   5120;
+public static const uint PXG_AB_IC_mDriveTargetPos                                =   5248;
+public static const uint PXG_AB_IC_mArmature                                      =   5376;
+public static const uint PXG_AB_IC_mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW =   5504;
+public static const uint PXG_AB_IC_mDriveStiffness                                =   6016;
+public static const uint PXG_AB_IC_mDamping                                       =   6144;
+public static const uint PXG_AB_IC_mDriveTargetVel                                =   6272;
+public static const uint PXG_AB_IC_mTargetPosBias                                 =   6400;
+public static const uint PXG_AB_IC_mAccumulatedFrictionImpulse                    =   6528;
+public static const uint PXG_AB_IC_mMaxFrictionForce                              =   6656;
+public static const uint PXG_AB_IC_mFrictionCoefficient                           =   6784;
+public static const uint PXG_AB_IC_mStaticFrictionEffort                          =   6912;
+public static const uint PXG_AB_IC_mDynamicFrictionEffort                         =   7040;
+public static const uint PXG_AB_IC_mViscousFrictionCoefficient                    =   7168;
+
+public static const uint PXG_AR_SUBSPACE_SIZE                                     =     80;
+public static const uint PXG_AR_SUBSPACE_COLUMNS                                  =      0;
+public static const uint PXG_AR_SPATIAL_VECTOR_SIZE                               =     24;
+
+// ---------------------------------------------------------------------------
 // Lane accessors.  `base` is the address of the block element (i.e. the array
 // base plus warpIndex * stride); `fieldOffset` is one of the constants above.
 // ---------------------------------------------------------------------------
