@@ -57,6 +57,7 @@
 
 #include "PxArticulationTendonData.h"
 #include "PxgArticulation.h"
+#include "PxgArticulationLink.h"
 
 #include <cstring>
 #include <vector>
@@ -176,6 +177,52 @@ static_assert(offsetof(PxgArticulationBlockLinkData, mJointType) == 28832, "PXG_
 static_assert(offsetof(PxgArticulationBlockLinkData, mInvDofIds) == 28864, "PXG_AB_LINK_mInvDofIds");
 static_assert(offsetof(PxgArticulationBlockLinkData, mDisableGravity) == 29056, "PXG_AB_LINK_mDisableGravity");
 static_assert(offsetof(PxgArticulationBlockLinkData, mRetainsAcceleration) == 29088, "PXG_AB_LINK_mRetainsAcceleration");
+static_assert(sizeof(PxgArticulationLink) == 80, "PXG_AR_LINK_SIZE");
+static_assert(offsetof(PxgArticulationLink, initialAngVel) == 0, "PXG_AR_LINK_initialAngVel");
+static_assert(offsetof(PxgArticulationLink, penBiasClamp) == 12, "PXG_AR_LINK_penBiasClamp");
+static_assert(offsetof(PxgArticulationLink, initialLinVel) == 16, "PXG_AR_LINK_initialLinVel");
+static_assert(offsetof(PxgArticulationLink, invMass) == 28, "PXG_AR_LINK_invMass");
+static_assert(offsetof(PxgArticulationLink, offsetSlop) == 60, "PXG_AR_LINK_offsetSlop");
+static_assert(offsetof(PxgArticulationLink, pathToRoot) == 64, "PXG_AR_LINK_pathToRoot");
+static_assert(offsetof(PxgArticulationLink, childrenOffset) == 52, "PXG_AR_LINK_childrenOffset");
+static_assert(offsetof(PxgArticulationLink, numChildren) == 58, "PXG_AR_LINK_numChildren");
+static_assert(offsetof(PxgArticulationLink, pathToRootOffset) == 48, "PXG_AR_LINK_pathToRootOffset");
+static_assert(offsetof(PxgArticulationLink, numPathToRoot) == 56, "PXG_AR_LINK_numPathToRoot");
+static_assert(offsetof(PxgArticulationLink, linearDamping) == 40, "PXG_AR_LINK_linearDamping");
+static_assert(offsetof(PxgArticulationLink, angularDamping) == 44, "PXG_AR_LINK_angularDamping");
+static_assert(offsetof(PxgArticulationLink, maxLinearVelocitySq) == 36, "PXG_AR_LINK_maxLinearVelocitySq");
+static_assert(offsetof(PxgArticulationLink, maxAngularVelocitySq) == 32, "PXG_AR_LINK_maxAngularVelocitySq");
+static_assert(offsetof(PxgArticulationLink, disableGravity) == 76, "PXG_AR_LINK_disableGravity");
+static_assert(offsetof(PxgArticulationLink, retainsAccelerations) == 77, "PXG_AR_LINK_retainsAccelerations");
+static_assert(offsetof(PxgArticulationLink, cfmScale) == 72, "PXG_AR_LINK_cfmScale");
+
+static_assert(sizeof(Dy::ArticulationJointCore) == 544, "PXG_AR_JOINT_CORE_SIZE");
+static_assert(offsetof(Dy::ArticulationJointCore, parentPose) == 0, "PXG_AR_JOINT_parentPose");
+static_assert(offsetof(Dy::ArticulationJointCore, childPose) == 28, "PXG_AR_JOINT_childPose");
+static_assert(offsetof(Dy::ArticulationJointCore, limits) == 56, "PXG_AR_JOINT_limits");
+static_assert(offsetof(Dy::ArticulationJointCore, drives) == 104, "PXG_AR_JOINT_drives");
+static_assert(offsetof(Dy::ArticulationJointCore, targetP) == 296, "PXG_AR_JOINT_targetP");
+static_assert(offsetof(Dy::ArticulationJointCore, targetV) == 320, "PXG_AR_JOINT_targetV");
+static_assert(offsetof(Dy::ArticulationJointCore, armature) == 344, "PXG_AR_JOINT_armature");
+static_assert(offsetof(Dy::ArticulationJointCore, frictionParams) == 420, "PXG_AR_JOINT_frictionParams");
+static_assert(offsetof(Dy::ArticulationJointCore, maxJointVelocity) == 492, "PXG_AR_JOINT_maxJointVelocity");
+static_assert(offsetof(Dy::ArticulationJointCore, jointPos) == 368, "PXG_AR_JOINT_jointPos");
+static_assert(offsetof(Dy::ArticulationJointCore, jointVel) == 392, "PXG_AR_JOINT_jointVel");
+static_assert(offsetof(Dy::ArticulationJointCore, dofIds) == 520, "PXG_AR_JOINT_dofIds");
+static_assert(offsetof(Dy::ArticulationJointCore, invDofIds) == 532, "PXG_AR_JOINT_invDofIds");
+static_assert(offsetof(Dy::ArticulationJointCore, motion) == 526, "PXG_AR_JOINT_motion");
+static_assert(offsetof(Dy::ArticulationJointCore, frictionCoefficient) == 416, "PXG_AR_JOINT_frictionCoefficient");
+static_assert(offsetof(Dy::ArticulationJointCore, jointOffset) == 516, "PXG_AR_JOINT_jointOffset");
+static_assert(offsetof(Dy::ArticulationJointCore, jCalcUpdateFrames) == 538, "PXG_AR_JOINT_jCalcUpdateFrames");
+static_assert(offsetof(Dy::ArticulationJointCore, jointType) == 539, "PXG_AR_JOINT_jointType");
+static_assert(sizeof(PxArticulationDrive) == 32, "PXG_AR_DRIVE_SIZE");
+static_assert(sizeof(PxArticulationLimit) == 8, "PXG_AR_LIMIT_SIZE");
+static_assert(sizeof(PxJointFrictionParams) == 12, "PXG_AR_FRICTION_SIZE");
+
+static_assert(sizeof(Dy::ArticulationJointCoreData) == 8, "PXG_AR_JOINT_CORE_DATA_SIZE");
+static_assert(sizeof(Dy::ArticulationJointCoreData::nbDof) == 1, "nbDof is a byte");
+static_assert(offsetof(Dy::ArticulationJointCoreData, nbDof) == 4, "PXG_AR_JCD_nbDof");
+static_assert(offsetof(Dy::ArticulationJointCoreData, jointOffset) == 0, "PXG_AR_JCD_jointOffset");
 } // namespace pin
 
 // distinct sentinels: element index and lane both enter every value, so no two
@@ -196,7 +243,7 @@ PXG_TEST(artiBlockLayout)
 
     PxgSlangComputeDevice* dev = testDevice();
     const PxgKernelDef manifest[] = {
-        { "npArtiBlockProbe.spv", "artiBlockProbe", 48u, 0 }, // { u64 x6 }
+        { "npArtiBlockProbe.spv", "artiBlockProbe", 56u, 0 }, // { u64 x7 }
     };
     PxgCudaShim shim(dev, manifest, 1, &artiBlockLoader);
 
@@ -370,6 +417,60 @@ PXG_TEST(artiBlockLayout)
         }
     }
 
+    // ---- the RECORD structs: PxgArticulationLink[2], ArticulationJointCore[2],
+    //      ArticulationJointCoreData[2], packed back to back in one buffer ----
+    const size_t RECBYTES = 2 * sizeof(PxgArticulationLink) +
+                            2 * sizeof(Dy::ArticulationJointCore) +
+                            2 * sizeof(Dy::ArticulationJointCoreData);
+    std::vector<uint8_t> rec(RECBYTES, 0xEE);
+    PxgArticulationLink* recLinks = reinterpret_cast<PxgArticulationLink*>(rec.data());
+    Dy::ArticulationJointCore* recJoints = reinterpret_cast<Dy::ArticulationJointCore*>(
+        rec.data() + 2 * sizeof(PxgArticulationLink));
+    Dy::ArticulationJointCoreData* recJointData =
+        reinterpret_cast<Dy::ArticulationJointCoreData*>(
+            rec.data() + 2 * sizeof(PxgArticulationLink) + 2 * sizeof(Dy::ArticulationJointCore));
+    for (uint32_t e = 0; e < 2; ++e)
+    {
+        PxgArticulationLink& L = recLinks[e];
+        L.penBiasClamp = sentF32(e, 0, 400);
+        L.invMass = sentF32(e, 0, 401);
+        L.maxAngularVelocitySq = sentF32(e, 0, 402);
+        L.maxLinearVelocitySq = sentF32(e, 0, 403);
+        L.linearDamping = sentF32(e, 0, 404);
+        L.angularDamping = sentF32(e, 0, 405);
+        L.pathToRootOffset = sentU32(e, 0, 406);
+        L.childrenOffset = sentU32(e, 0, 407);
+        L.numPathToRoot = PxU16(0x1100u + e);
+        L.numChildren = PxU16(0x2200u + e);
+        L.cfmScale = sentF32(e, 0, 408);
+        L.disableGravity = (e == 0);
+        L.retainsAccelerations = (e == 1);
+
+        Dy::ArticulationJointCore& J = recJoints[e];
+        std::memset(&J, 0xEE, sizeof(J));
+        J.parentPose.q.x = sentF32(e, 0, 410);
+        J.childPose.q.x = sentF32(e, 0, 411);
+        for (uint32_t a = 0; a < PxArticulationAxis::eCOUNT; ++a)
+        {
+            J.limits[a].low = sentF32(e, a, 420);
+            J.drives[a].stiffness = sentF32(e, a, 430);
+            J.armature[a] = sentF32(e, a, 440);
+            J.frictionParams[a].staticFrictionEffort = sentF32(e, a, 450);
+            J.maxJointVelocity[a] = sentF32(e, a, 460);
+            J.jointPos[a] = sentF32(e, a, 470);
+            J.jointVel[a] = sentF32(e, a, 480);
+            J.dofIds[a] = PxU8(0x30u + a * 2u + e);
+            J.motion[a] = PxU8(0x60u + a * 2u + e);
+            J.invDofIds[a] = PxU8(0x90u + a * 2u + e);
+        }
+        J.frictionCoefficient = sentF32(e, 0, 490);
+        J.jointOffset = sentU32(e, 0, 491);
+        J.jointType = PxU8(2u + e);
+
+        recJointData[e].jointOffset = sentU32(e, 0, 492);
+        recJointData[e].nbDof = PxU8(0xA0u + e);   // PxU8, not PxU32
+    }
+
     // ---- the expected values, in the probe's emit order ----
     std::vector<uint64_t> expect;
     expect.push_back(sizeof(PxgSpatialVectorBlock));
@@ -488,15 +589,56 @@ PXG_TEST(artiBlockLayout)
     expect.push_back(K.mInvDofIds[2][LANE]);
     expect.push_back(K.mInvDofIds[5][LANE]);
 
+    {
+        const PxgArticulationLink& L = recLinks[ELEM];
+        expect.push_back(sizeof(PxgArticulationLink));
+        expect.push_back(bits(L.penBiasClamp));
+        expect.push_back(bits(L.invMass));
+        expect.push_back(bits(L.maxAngularVelocitySq));
+        expect.push_back(bits(L.maxLinearVelocitySq));
+        expect.push_back(bits(L.linearDamping));
+        expect.push_back(bits(L.angularDamping));
+        expect.push_back(L.pathToRootOffset);
+        expect.push_back(L.childrenOffset);
+        expect.push_back(L.numPathToRoot);
+        expect.push_back(L.numChildren);
+        expect.push_back(bits(L.cfmScale));
+        expect.push_back(L.disableGravity ? 1u : 0u);
+        expect.push_back(L.retainsAccelerations ? 1u : 0u);
+
+        const Dy::ArticulationJointCore& J = recJoints[ELEM];
+        expect.push_back(sizeof(Dy::ArticulationJointCore));
+        expect.push_back(bits(J.parentPose.q.x));
+        expect.push_back(bits(J.childPose.q.x));
+        expect.push_back(bits(J.limits[4].low));
+        expect.push_back(bits(J.drives[4].stiffness));
+        expect.push_back(bits(J.armature[4]));
+        expect.push_back(bits(J.frictionParams[4].staticFrictionEffort));
+        expect.push_back(bits(J.maxJointVelocity[4]));
+        expect.push_back(bits(J.jointPos[4]));
+        expect.push_back(bits(J.jointVel[4]));
+        expect.push_back(bits(J.frictionCoefficient));
+        expect.push_back(J.jointOffset);
+        expect.push_back(J.dofIds[4]);
+        expect.push_back(J.motion[4]);
+        expect.push_back(J.invDofIds[4]);
+        expect.push_back(J.jointType);
+
+        expect.push_back(sizeof(Dy::ArticulationJointCoreData));
+        expect.push_back(recJointData[ELEM].jointOffset);
+        expect.push_back(recJointData[ELEM].nbDof);
+    }
+
     // ---- upload, dispatch, compare ----
-    PxgDevicePtr dBlocks = 0, dDofs = 0, dMat33 = 0, dXform = 0, dLinks = 0, dOut = 0;
+    PxgDevicePtr dBlocks = 0, dDofs = 0, dMat33 = 0, dXform = 0, dLinks = 0, dRec = 0, dOut = 0;
     shim.memAlloc(&dBlocks, blocks.size() * sizeof(PxgArticulationBlockData));
     shim.memAlloc(&dDofs, dofs.size() * sizeof(PxgArticulationBlockDofData));
     shim.memAlloc(&dMat33, mat33.size() * sizeof(PxgMat33Block));
     shim.memAlloc(&dXform, xform.size() * sizeof(PxgSpatialTransformBlock));
     shim.memAlloc(&dLinks, links.size() * sizeof(PxgArticulationBlockLinkData));
+    shim.memAlloc(&dRec, rec.size());
     shim.memAlloc(&dOut, expect.size() * 8);
-    if (!dBlocks || !dDofs || !dMat33 || !dXform || !dLinks || !dOut)
+    if (!dBlocks || !dDofs || !dMat33 || !dXform || !dLinks || !dRec || !dOut)
     {
         std::printf("  NOTE: no BDA -> skip\n");
         return;
@@ -506,11 +648,12 @@ PXG_TEST(artiBlockLayout)
     shim.memcpyHtoD(dMat33, mat33.data(), mat33.size() * sizeof(PxgMat33Block));
     shim.memcpyHtoD(dXform, xform.data(), xform.size() * sizeof(PxgSpatialTransformBlock));
     shim.memcpyHtoD(dLinks, links.data(), links.size() * sizeof(PxgArticulationBlockLinkData));
+    shim.memcpyHtoD(dRec, rec.data(), rec.size());
     shim.memsetD32(dOut, 0, uint32_t(expect.size() * 2));
 
-    struct Params { uint64_t blockData, dofData, mat33, transform, linkData, out; } prm = {
+    struct Params { uint64_t blockData, dofData, mat33, transform, linkData, records, out; } prm = {
         uint64_t(dBlocks), uint64_t(dDofs), uint64_t(dMat33), uint64_t(dXform),
-        uint64_t(dLinks), uint64_t(dOut)
+        uint64_t(dLinks), uint64_t(dRec), uint64_t(dOut)
     };
     PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
                   "launch artiBlockProbe");

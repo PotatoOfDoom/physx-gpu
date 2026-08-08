@@ -1694,6 +1694,46 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.70 — the record structs the block fill reads from
+
+The last ABI layer before `jcalc`'s record→block copy path can be written:
+`PxgArticulationLink`, `Dy::ArticulationJointCore` and
+`Dy::ArticulationJointCoreData`.  Plain arrays-of-structs this time, not SoA, so
+only a stride and a field offset apply per access — but the fields themselves are
+where the traps are.
+
+**`PxgArticulationLink` is declared twice.**  Behind `#if !PX_CUDA_COMPILER`
+(PxgArticulationLink.h:54-63) the host sees `PxVec3 initialAngVel; PxReal
+penBiasClamp; PxVec3 initialLinVel; PxReal invMass;` and the device sees
+`float4 initialAngVelXYZ_penBiasClamp; float4 initialLinVelXYZ_invMassW;` over
+the same bytes.  `offsetof` can only see the host spelling, the kernels read the
+device one, and the two agree only because 0/12/16/28 line up.  Generating the
+constants from the host declaration and naming them after the device one is the
+only way to get both halves right at once — reading either declaration by eye
+gives you one of them.
+
+**Not everything small is a word.**  `numPathToRoot` and `numChildren` are PxU16
+sharing one word at 56/58; `disableGravity` and `retainsAccelerations` are single
+bytes at 76/77; `dofIds`, `motion` and `invDofIds` are `PxU8[6]` runs at 520/526/
+532 with `jCalcUpdateFrames` and `jointType` as single bytes at 538/539.  A word
+read anywhere in there returns its neighbours.
+
+**138 of 139 probed values were right on the first run.**  The one that was not is
+worth keeping: `ArticulationJointCoreData::nbDof` sits at offset 4 in an 8-byte
+struct, which reads like a `PxU32` — it is a **PxU8**
+(DyFeatherstoneArticulationJointData.h:103).  The probe read a word and got
+`0xEEEEEEED` against an expected `0xED`: the 0xEE fill plus the real byte.  A
+generated offset is not a generated *width*, and the generator cannot catch that
+because `offsetof` says nothing about size.  Only a functional probe against a
+poisoned buffer does.
+
+**Sweep: 24 of 24 killed** — every field moved onto its neighbour, all four
+strides, both PxU16s, both single bytes, the per-axis array indexing, and the
+`nbDof` byte read reverted to a word.  No survivors.
+
+The probe now checks **139 values** across five block structs and three record
+structs.  Suite **697/697** both memory modes; manifest unchanged at **270 of 501**.
+
 ## P8.69 — the joint-frame math, bit-exact against the engine itself
 
 The first piece of real articulation **dynamics** in the port: `computeJointAxis`

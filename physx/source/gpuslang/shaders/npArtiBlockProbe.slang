@@ -44,6 +44,7 @@
 // same address and prove nothing.
 
 import pxgSlangArticulationBlocks;
+import pxgSlangArticulationDesc;   // artiU16Field: the packed PxU16 pairs
 
 struct ArtiBlockProbeParams
 {
@@ -57,6 +58,8 @@ struct ArtiBlockProbeParams
     uint64_t mat33;     // PxgMat33Block[2]
     uint64_t transform; // PxgSpatialTransformBlock[2]
     uint64_t linkData;  // PxgArticulationBlockLinkData[2]
+    uint64_t records;   // PxgArticulationLink[2] then Dy::ArticulationJointCore[2]
+                        // then Dy::ArticulationJointCoreData[2], packed
     uint64_t out;       // uint64_t[]
 };
 
@@ -254,4 +257,66 @@ void artiBlockProbe()
     o[i++] = uint64_t(abU8(k, PXG_AB_LINK_mInvDofIds + 0u * 32u, AP_LANE));
     o[i++] = uint64_t(abU8(k, PXG_AB_LINK_mInvDofIds + 2u * 32u, AP_LANE));
     o[i++] = uint64_t(abU8(k, PXG_AB_LINK_mInvDofIds + 5u * 32u, AP_LANE));
+
+    // ---- the RECORD structs, element [1] of each ----
+    //
+    // Not SoA: one record per link, so `lane` does not apply and the only two
+    // numbers are the stride and the field offset.  Element [1] again, so the
+    // stride is load-bearing; element [0] carries a different sentinel set.
+    {
+        const uint64_t base = gArtiBlockProbe.records;
+        const uint64_t lk = base + uint64_t(AP_ELEM) * PXG_AR_LINK_SIZE;
+        o[i++] = uint64_t(PXG_AR_LINK_SIZE);
+        o[i++] = uint64_t(asuint(abF32(lk, PXG_AR_LINK_penBiasClamp, 0u)));
+        o[i++] = uint64_t(asuint(abF32(lk, PXG_AR_LINK_invMass, 0u)));
+        o[i++] = uint64_t(asuint(abF32(lk, PXG_AR_LINK_maxAngularVelocitySq, 0u)));
+        o[i++] = uint64_t(asuint(abF32(lk, PXG_AR_LINK_maxLinearVelocitySq, 0u)));
+        o[i++] = uint64_t(asuint(abF32(lk, PXG_AR_LINK_linearDamping, 0u)));
+        o[i++] = uint64_t(asuint(abF32(lk, PXG_AR_LINK_angularDamping, 0u)));
+        o[i++] = uint64_t(abU32(lk, PXG_AR_LINK_pathToRootOffset, 0u));
+        o[i++] = uint64_t(abU32(lk, PXG_AR_LINK_childrenOffset, 0u));
+        // PxU16 pair sharing one word: read as halfwords, not as a word each
+        o[i++] = uint64_t(artiU16Field(lk, PXG_AR_LINK_numPathToRoot));
+        o[i++] = uint64_t(artiU16Field(lk, PXG_AR_LINK_numChildren));
+        o[i++] = uint64_t(asuint(abF32(lk, PXG_AR_LINK_cfmScale, 0u)));
+        // single BYTES, adjacent: a word read here returns both plus padding
+        o[i++] = uint64_t(abU8(lk, PXG_AR_LINK_disableGravity & ~3u,
+                               PXG_AR_LINK_disableGravity & 3u));
+        o[i++] = uint64_t(abU8(lk, PXG_AR_LINK_retainsAccelerations & ~3u,
+                               PXG_AR_LINK_retainsAccelerations & 3u));
+
+        const uint64_t jcBase = base + 2ull * PXG_AR_LINK_SIZE;
+        const uint64_t jc = jcBase + uint64_t(AP_ELEM) * PXG_AR_JOINT_CORE_SIZE;
+        o[i++] = uint64_t(PXG_AR_JOINT_CORE_SIZE);
+        o[i++] = uint64_t(asuint(abF32(jc, PXG_AR_JOINT_parentPose, 0u)));
+        o[i++] = uint64_t(asuint(abF32(jc, PXG_AR_JOINT_childPose, 0u)));
+        // the six-element per-axis arrays: axis 4 of each, so both the base and
+        // the element stride matter
+        o[i++] = uint64_t(asuint(abF32(jc, PXG_AR_JOINT_limits + 4u * PXG_AR_LIMIT_SIZE, 0u)));
+        o[i++] = uint64_t(asuint(abF32(jc, PXG_AR_JOINT_drives + 4u * PXG_AR_DRIVE_SIZE, 0u)));
+        o[i++] = uint64_t(asuint(abF32(jc, PXG_AR_JOINT_armature + 4u * 4u, 0u)));
+        o[i++] = uint64_t(asuint(abF32(jc, PXG_AR_JOINT_frictionParams + 4u * PXG_AR_FRICTION_SIZE, 0u)));
+        o[i++] = uint64_t(asuint(abF32(jc, PXG_AR_JOINT_maxJointVelocity + 4u * 4u, 0u)));
+        o[i++] = uint64_t(asuint(abF32(jc, PXG_AR_JOINT_jointPos + 4u * 4u, 0u)));
+        o[i++] = uint64_t(asuint(abF32(jc, PXG_AR_JOINT_jointVel + 4u * 4u, 0u)));
+        o[i++] = uint64_t(asuint(abF32(jc, PXG_AR_JOINT_frictionCoefficient, 0u)));
+        o[i++] = uint64_t(abU32(jc, PXG_AR_JOINT_jointOffset, 0u));
+        // PxU8[6] runs: dofIds @520, motion @526, invDofIds @532, then the two
+        // single bytes at 538 and 539.  Every one of these is a byte extract.
+        o[i++] = uint64_t(abU8(jc, (PXG_AR_JOINT_dofIds + 4u) & ~3u, (PXG_AR_JOINT_dofIds + 4u) & 3u));
+        o[i++] = uint64_t(abU8(jc, (PXG_AR_JOINT_motion + 4u) & ~3u, (PXG_AR_JOINT_motion + 4u) & 3u));
+        o[i++] = uint64_t(abU8(jc, (PXG_AR_JOINT_invDofIds + 4u) & ~3u, (PXG_AR_JOINT_invDofIds + 4u) & 3u));
+        o[i++] = uint64_t(abU8(jc, PXG_AR_JOINT_jointType & ~3u, PXG_AR_JOINT_jointType & 3u));
+
+        const uint64_t jdBase = jcBase + 2ull * PXG_AR_JOINT_CORE_SIZE;
+        const uint64_t jd = jdBase + uint64_t(AP_ELEM) * PXG_AR_JOINT_CORE_DATA_SIZE;
+        o[i++] = uint64_t(PXG_AR_JOINT_CORE_DATA_SIZE);
+        o[i++] = uint64_t(abU32(jd, PXG_AR_JCD_jointOffset, 0u));
+        // nbDof is a PxU8 (DyFeatherstoneArticulationJointData.h:103), not the
+        // PxU32 its 4-byte offset suggests -- a word read here returns three
+        // bytes of whatever follows it.  The first version of this probe read a
+        // word and came back 0xEEEEEEED against an expected 0xED, which is the
+        // fill byte plus the real value: the one mismatch in 139.
+        o[i++] = uint64_t(abU8(jd, PXG_AR_JCD_nbDof & ~3u, PXG_AR_JCD_nbDof & 3u));
+    }
 }

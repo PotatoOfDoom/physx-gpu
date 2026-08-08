@@ -173,6 +173,71 @@ public static const uint PXG_AB_LINK_mDisableGravity                          = 
 public static const uint PXG_AB_LINK_mRetainsAcceleration                     =  29088;
 
 // ---------------------------------------------------------------------------
+// The RECORD structs the block fill reads FROM: PxgArticulationLink,
+// Dy::ArticulationJointCore and Dy::ArticulationJointCoreData.  Plain
+// arrays-of-structs, not SoA -- one record per link or per joint, indexed by
+// link id, so only a stride and a field offset apply.
+//
+// PxgArticulationLink is declared TWICE, behind `#if !PX_CUDA_COMPILER`
+// (PxgArticulationLink.h:54-63): the host sees `PxVec3 initialAngVel; PxReal
+// penBiasClamp; PxVec3 initialLinVel; PxReal invMass;` and the device sees
+// `float4 initialAngVelXYZ_penBiasClamp; float4 initialLinVelXYZ_invMassW;`
+// over the SAME bytes.  The offsets below are generated from the host spelling
+// because that is what `offsetof` can see; the kernels read the device one.
+// Both agree at 0/12/16/28, which is why the two declarations can coexist -- and
+// why a generator is safer here than reading either declaration by eye.
+//
+// Note also that the small integer fields are NOT all 32-bit: numPathToRoot and
+// numChildren are PxU16 at 56 and 58, and disableGravity / retainsAccelerations
+// are single bytes at 76 and 77.  Reading any of them as a word picks up its
+// neighbour.
+public static const uint PXG_AR_LINK_SIZE                                   =     80;
+public static const uint PXG_AR_LINK_initialAngVel                          =      0;
+public static const uint PXG_AR_LINK_penBiasClamp                           =     12;
+public static const uint PXG_AR_LINK_initialLinVel                          =     16;
+public static const uint PXG_AR_LINK_invMass                                =     28;
+public static const uint PXG_AR_LINK_offsetSlop                             =     60;
+public static const uint PXG_AR_LINK_pathToRoot                             =     64;
+public static const uint PXG_AR_LINK_childrenOffset                         =     52;
+public static const uint PXG_AR_LINK_numChildren                            =     58;
+public static const uint PXG_AR_LINK_pathToRootOffset                       =     48;
+public static const uint PXG_AR_LINK_numPathToRoot                          =     56;
+public static const uint PXG_AR_LINK_linearDamping                          =     40;
+public static const uint PXG_AR_LINK_angularDamping                         =     44;
+public static const uint PXG_AR_LINK_maxLinearVelocitySq                    =     36;
+public static const uint PXG_AR_LINK_maxAngularVelocitySq                   =     32;
+public static const uint PXG_AR_LINK_disableGravity                         =     76;
+public static const uint PXG_AR_LINK_retainsAccelerations                   =     77;
+public static const uint PXG_AR_LINK_cfmScale                               =     72;
+
+public static const uint PXG_AR_JOINT_CORE_SIZE                             =    544;
+public static const uint PXG_AR_JOINT_parentPose                            =      0;
+public static const uint PXG_AR_JOINT_childPose                             =     28;
+public static const uint PXG_AR_JOINT_limits                                =     56;
+public static const uint PXG_AR_JOINT_drives                                =    104;
+public static const uint PXG_AR_JOINT_targetP                               =    296;
+public static const uint PXG_AR_JOINT_targetV                               =    320;
+public static const uint PXG_AR_JOINT_armature                              =    344;
+public static const uint PXG_AR_JOINT_frictionParams                        =    420;
+public static const uint PXG_AR_JOINT_maxJointVelocity                      =    492;
+public static const uint PXG_AR_JOINT_jointPos                              =    368;
+public static const uint PXG_AR_JOINT_jointVel                              =    392;
+public static const uint PXG_AR_JOINT_dofIds                                =    520;
+public static const uint PXG_AR_JOINT_invDofIds                             =    532;
+public static const uint PXG_AR_JOINT_motion                                =    526;
+public static const uint PXG_AR_JOINT_frictionCoefficient                   =    416;
+public static const uint PXG_AR_JOINT_jointOffset                           =    516;
+public static const uint PXG_AR_JOINT_jCalcUpdateFrames                     =    538;
+public static const uint PXG_AR_JOINT_jointType                             =    539;
+public static const uint PXG_AR_DRIVE_SIZE                                  =     32;
+public static const uint PXG_AR_LIMIT_SIZE                                  =      8;
+public static const uint PXG_AR_FRICTION_SIZE                               =     12;
+
+public static const uint PXG_AR_JOINT_CORE_DATA_SIZE                        =      8;
+public static const uint PXG_AR_JCD_nbDof                                   =      4;
+public static const uint PXG_AR_JCD_jointOffset                             =      0;
+
+// ---------------------------------------------------------------------------
 // Lane accessors.  `base` is the address of the block element (i.e. the array
 // base plus warpIndex * stride); `fieldOffset` is one of the constants above.
 // ---------------------------------------------------------------------------
