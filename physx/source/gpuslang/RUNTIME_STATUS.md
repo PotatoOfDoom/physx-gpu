@@ -1694,6 +1694,61 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.56 — the articulation fault is a MAPPED kernel, and P8.55 read it backwards
+
+P8.55 called the articulation crash "a call through an unresolved function pointer,
+not a bad dereference inside known code".  That was wrong, and the evidence that
+settles it is one line:
+
+```
+FAULT PC 0x7fffecc14617 IS IN: 0x7fffecc10000  0x7fffecc1e000  0xe000  0x0  r-xp
+```
+
+The faulting address sits in an **anonymous executable mapping** — no file backing,
+`r-xp` — which is llvmpipe's **JIT-compiled shader code**.  The absent caller frame
+that P8.55 leaned on proves nothing: JIT frames carry no unwind information, so gdb
+cannot walk out of them.  Two llvmpipe worker threads fault at the *identical* PC
+while the main thread sits inside `libvulkan_lvp.so`, which is what two workers
+running one shader looks like.
+
+So this is a P8.40-class fault — a shader taking down the process on a bad
+buffer-device-address access — not a shim gap.
+
+**`PXG_LAUNCH_TRACE=1` names it exactly.**  The scene reaches dispatch **52**, and
+the trace stops mid-dispatch:
+
+```
+[pxg-dispatch] sized ZeroBodiesTGS ...
+[pxg-launch]   sized ZeroBodiesTGS OK
+[pxg-dispatch] sized initializeSolverVelocitiesTGS ...      <-- never returns
+```
+
+`initializeSolverVelocitiesTGS` (solverMultiBlockTGS.cu:673) is **already mapped**
+and runs green in all twenty other scenes.  All 51 dispatches before it returned OK
+and **not one launch was refused** — so the "an unmapped articulation kernel
+refused upstream and left a null behind" story is not supported by the trace
+either.  Something about an articulation-bearing scene makes this specific solver
+kernel read out of bounds.
+
+**What is established:**
+
+* the fault is inside JIT-compiled shader code, not PhysX host code;
+* the shader is `initializeSolverVelocitiesTGS`, dispatch 52, during scene
+  construction;
+* no launch is refused before it;
+* it is deterministic across five runs now (plain, redirected, gdb ×2, traced).
+
+**What is not:** why that kernel goes out of bounds only when an articulation is
+present.  It reads `outSolverVelocity[bodyId]` and `[bodyId + allBodiesCount]`
+under a `bodyId < allBodiesCount` guard, so the suspects are the descriptor values
+themselves — `numSolverBodies`, `numSlabs`, `accumulatedBodyDeltaVOffset`, or the
+`outSolverVelocity` / `islandContextPool` pointers — one of which is presumably
+null or absurd because the articulation path never populated it.
+
+Next step: have the shim dump that dispatch's descriptor (it already has the push
+blob) and compare the same fields against the `joint` scene, which is the closest
+green neighbour.
+
 ## P8.55 — the articulation scene, and the wall it hits BEFORE any kernel runs
 
 `PXG_SCENE=articulation` added to `gpu-sdk-step`: the smallest articulation that
@@ -1713,8 +1768,9 @@ Thread 7 "gpu-sdk-step" received signal SIGSEGV
 #1  0x0000000000000000 in ?? ()
 ```
 
-That shape — a call into an address with no symbol and no return frame — is a call
-through an unresolved function pointer, not a bad dereference inside known code.
+*(P8.56 shows this reading was WRONG — see below.  The address is inside JIT
+code, and the missing caller frame is an artefact of JIT frames carrying no
+unwind information, not evidence of an unresolved pointer.)*
 
 **This matters for the roadmap P8.54 just wrote.**  The articulation frontier is
 NOT simply "map ~85 kernels": something in the articulation setup path calls
