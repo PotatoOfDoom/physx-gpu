@@ -52,6 +52,17 @@
 //     transform refs and negates the patch normal, but NOT the per-contact
 //     world point.
 
+// ===========================================================================
+// THE ONE SWEEP SURVIVOR, AND WHY IT IS UNREACHABLE
+// ===========================================================================
+//
+// 46 of 47 mutants die.  The one that lives drops the `nbManifolds == 0` term
+// from the cu:257 gate.  It cannot be observed: with no manifolds every lane's
+// `numContacts` is zero (the `mIdx >= nbManifolds` test), so `hasContacts` is
+// false across the whole warp and every write below sits behind it.  The body
+// still runs, reads valid memory and produces nothing.  The term is the CUDA's
+// and is kept, but the per-lane guards already do its job.
+
 import pxgSlangNpAbi;
 
 static const uint CF_WARP = 32u;

@@ -424,4 +424,426 @@ PXG_TEST(npCvxTrimeshOut_finish)
     for (PxgBufferHandle h : { bIn, bOut, bMat }) dev->destroyBuffer(h);
 }
 
+
+// ---------------------------------------------------------------------------
+// cvxTriFinishBda -- the SAME kernel on the engine BDA ABI, with real atomics on
+// a real PxgPatchAndContactCounters and real writes into the three streams.
+//
+// Driven against the SAME refTrimeshOut oracle, so a divergence is attributable
+// to the BDA plumbing and the warp emulation rather than to the algorithm.
+//
+// ONE PAIR PER DISPATCH, AND THAT IS NOT A SHORTCUT.  The reservations are
+// InterlockedAdds on a shared cursor, so with several pairs in flight the byte
+// offsets each pair receives depend on the order the atomics land -- which is
+// exactly what the oracle cannot predict.  Every case therefore gets its own
+// counters, its own streams and its own output record (a per-case slice of one
+// buffer, addressed through the push blob), and is dispatched on its own with
+// numPairs == 1.  All the dispatches are queued and flushed together; they touch
+// disjoint memory, so the atomics are deterministic per case.
+// ---------------------------------------------------------------------------
+
+struct CfPush
+{
+    uint64_t pairs, transformCache, gpuShapes, cmInputs, cmOutputs, cmMultiManifold;
+    uint32_t numPairs, _pad52;
+    uint64_t materials, contactStream, patchStream, forceAndIndiceStream;
+    uint32_t insertAveragePointWord, _pad92;
+    uint64_t patchAndContactCounters, touchChangeFlags, patchChangeFlags;
+    uint64_t startContactPatches, startContactPoints, startContactForces;
+    uint32_t patchBytesLimit, contactBytesLimit, forceBytesLimit, _pad156;
+};
+static_assert(sizeof(CfPush) == 160, "CfParams blob is 160 bytes");
+
+PXG_TEST(cvxTriFinish)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    std::mt19937 rng(4242001);
+    const uint32_t N = 220, NMAT = 32;
+    const uint32_t STREAM = 2048;   // per-case slice of each of the three streams
+    auto rf = [&](float lo, float hi) { return lo + (hi - lo) * (float(rng() % 1000000) / 1000000.f); };
+    auto randQuat = [&]() { float a[4]; float m2 = 0; for (int k = 0; k < 4; ++k) { a[k] = rf(-1, 1); m2 += a[k] * a[k]; }
+                            const float i = 1.f / std::sqrt(m2 > 0 ? m2 : 1.f);
+                            return F4{ a[0] * i, a[1] * i, a[2] * i, a[3] * i }; };
+
+    std::vector<MaterialData> mats(NMAT);
+    for (auto& m : mats)
+    {
+        m.dynamicFriction = rf(0, 1.5f); m.staticFriction = rf(0, 2.f);
+        m.restitution = rf(-1.f, 1.f); m.damping = rf(0, 2.f);
+        m.flags = (rng() % 4 == 0 ? 1u : 0u) | (rng() % 3 == 0 ? 16u : 0u) | (rng() % 5 == 0 ? 256u : 0u);
+        m.fricMode = rng() % 4; m.restMode = rng() % 4; m.dampMode = rng() % 4;
+    }
+
+    std::vector<TmoIn> in(N);
+    std::vector<TmoOut> ref(N);
+    std::vector<uint32_t> maskWord(N, 0xFFFFFFFFu);
+    size_t cOvfP = 0, cOvfC = 0, cOvfF = 0, cZeroMan = 0, cNoRes = 0, cAvg = 0, cFlip = 0,
+           cSphere = 0, cCapsule = 0, cConflict = 0, cExact = 0, cRollbackPatch = 0;
+
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        TmoIn s{};
+        const uint32_t nbMan = (i % 13 == 0) ? 0u : (1 + rng() % 4);
+        const bool insertAvg = (rng() % 5) < 2;
+        // allflags carries a random previous status/patch count so the
+        // touch-change and patch-change decisions are exercised in both directions.
+        s.hdr = U4{ nbMan, uint32_t(rng()), insertAvg ? 1u : 0u, 0 };
+        uint32_t pcExpect = 0;
+        for (int m = 0; m < 4; ++m)
+        {
+            uint32_t nc = rng() % 7;
+            if (i % 7 == 3) nc = (m == 0) ? 0u : nc;   // manifold 0 empty: lane 0 holds no contact
+            (&s.nbC.x)[m] = nc;
+            if (uint32_t(m) < nbMan) pcExpect += nc;
+        }
+        if (i % 11 == 5) { s.nbC = U4{ 0, 0, 0, 0 }; pcExpect = 0; }  // the no-reservation path
+
+        const bool flip = rng() & 1;
+        const uint32_t other = (rng() % 3 == 0) ? T_SPHERE : ((rng() % 2) ? T_CAPSULE : T_CONVEX);
+        s.shapeInfo = U4{ flip ? T_TRIMESH : other, flip ? other : T_TRIMESH,
+                          uint32_t(rng() % NMAT), uint32_t(rng() % NMAT) };
+        s.scaleA = F4{ rf(0.5f, 2), rf(0.1f, 1.5f), rf(0.5f, 2), 0 };
+        s.scaleB = F4{ rf(0.5f, 2), rf(0.1f, 1.5f), rf(0.5f, 2), 0 };
+        s.tAq = randQuat(); s.tAp = F4{ rf(-5, 5), rf(-5, 5), rf(-5, 5), 0 };
+        s.tBq = randQuat(); s.tBp = F4{ rf(-5, 5), rf(-5, 5), rf(-5, 5), 0 };
+
+        for (int c = 0; c < 24; ++c)
+        {
+            s.contacts[c * 3 + 0] = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), rf(-0.5f, 0.5f) };
+            s.contacts[c * 3 + 1] = F4{ rf(-2, 2), rf(-2, 2), rf(-2, 2), u2f(rng() & 0x07FFFFFFu) };
+            const F4 q = randQuat();   // NON-unit xyz, so getNormalized is load-bearing
+            s.contacts[c * 3 + 2] = F4{ q.x, q.y, q.z, 0 };
+        }
+
+        const uint32_t total0 = pcExpect + (insertAvg ? nbMan : 0);
+        const uint32_t initP = 64 * (rng() % 8), initC = 16 * (rng() % 16), initF = 8 * (rng() % 16);
+        uint32_t limP = initP + 64 * 20, limC = initC + 16 * 40, limF = initF + 8 * 40;
+        const uint32_t v = rng() % 8;
+        if (v == 1) limP = initP + 64 * (nbMan ? rng() % nbMan : 0);
+        else if (v == 2 && total0) limC = initC + 16 * (rng() % total0);
+        else if (v == 3 && total0) limF = initF + 8 * (rng() % total0);
+        else if (v == 4) { limP = initP + 64 * nbMan; limC = initC + 16 * total0; limF = initF + 8 * total0; if (total0) ++cExact; }
+        else if (v == 5) { limP = initP + 64 * (nbMan ? rng() % nbMan : 0); limC = initC; }  // chained else-if: only the FIRST overflow is reported
+        if (i % 9 == 4 && nbMan > 0)
+        {
+            // prevPatches == nbManifolds AND a forced overflow.  The patch-change
+            // flag is then `prevPatches != 0` (true) if the ROLLED-BACK count is
+            // used and `prevPatches != nbManifolds` (false) if the pre-rollback one
+            // is -- the only input that separates them.
+            s.hdr.y = (s.hdr.y & ~0xFF00u) | ((nbMan & 0xFFu) << 8);
+            limP = initP;   // patch reservation cannot fit
+            s.cfg = U4{ limP, limC, limF, 0 };
+            ++cRollbackPatch;
+        }
+        else
+            s.cfg = U4{ limP, limC, limF, 0 };
+        s.counters = U4{ initP, initC, initF, 0 };
+
+        in[i] = s;
+        maskWord[i] = refTrimeshOut(s, mats, ref[i]);
+        const uint32_t f = ref[i].counters.w;
+        if (f & 4u) ++cOvfP;
+        if (f & 1u) ++cOvfC;
+        if (f & 2u) ++cOvfF;
+        if (nbMan == 0) ++cZeroMan;
+        if (nbMan > 0 && pcExpect == 0 && !insertAvg) ++cNoRes;
+        if (insertAvg) ++cAvg;
+        if (flip) ++cFlip;
+        if (!flip && other == T_SPHERE) ++cSphere;
+        if (!flip && other == T_CAPSULE) ++cCapsule;
+        if (maskWord[i] != 0xFFFFFFFFu) ++cConflict;
+    }
+
+    // ---- engine buffers, one slice per case --------------------------------
+    // TWO PAIRS PER DISPATCH.  Pair 1 is a DECOY with no manifolds, so under the
+    // correct 1216-byte stride it reserves nothing and the counters are the real
+    // pair's alone.  A kernel using a 1200-byte stride reads the decoy's header
+    // from a different place -- where a live-looking count is planted -- and its
+    // reservation moves the counters, which the counter comparison already checks.
+    // It also means the constant-trip-2 warp loop is exercised rather than assumed.
+    std::vector<uint32_t> pairBuf(N * 2 * 14, 0u);
+    std::vector<float> cacheBuf(N * 2 * 8, 0.0f);      // PxsCachedTransform, 32 B
+    std::vector<uint32_t> shapeBuf(N * 2 * 12, 0u);    // PxgShape, 48 B
+    std::vector<uint32_t> inputBuf(N * 2 * 4, 0u);     // PxgContactManagerInput, 16 B
+    std::vector<uint32_t> outBuf(N * 2 * 12, 0u);      // PxsContactManagerOutput, 48 B
+    std::vector<uint32_t> manBuf(N * 2 * (1216 / 4), 0u);
+    const uint32_t OVF_SEED = 8u;   // not one of PATCH/CONTACT/FORCE_OVF
+    std::vector<uint32_t> ctrBuf(N * 4, 0u);
+    std::vector<uint32_t> touchBuf(N * 2, 0xDEADBEEFu), patchChgBuf(N * 2, 0xDEADBEEFu);
+    std::vector<uint32_t> patchStream(N * (STREAM / 4), 0u);
+    std::vector<uint32_t> contactStream(N * (STREAM / 4), 0u);
+    std::vector<uint32_t> forceStream(N * (STREAM / 4), 0u);
+    std::vector<uint32_t> matBuf(NMAT * 6, 0u);        // PxsMaterialData, 24 B
+
+    for (uint32_t m = 0; m < NMAT; ++m)
+    {
+        uint32_t* w = &matBuf[m * 6];
+        std::memcpy(&w[0], &mats[m].dynamicFriction, 4);
+        std::memcpy(&w[1], &mats[m].staticFriction, 4);
+        std::memcpy(&w[2], &mats[m].restitution, 4);
+        std::memcpy(&w[3], &mats[m].damping, 4);
+        w[4] = (mats[m].flags & 0xFFFFu) | ((mats[m].fricMode & 0xFFu) << 16) | ((mats[m].restMode & 0xFFu) << 24);
+        w[5] = mats[m].dampMode & 0xFFu;
+    }
+
+    // The stored allflags must round-trip: the kernel reads it, rewrites it, and
+    // preserves the upper half of nbContactsFlags.
+    std::vector<uint32_t> origNbFlags(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const TmoIn& s = in[i];
+        pairBuf[i * 28 + 12] = s.shapeInfo.z;   // materialIndices.x @48
+        pairBuf[i * 28 + 13] = s.shapeInfo.w;   // materialIndices.y @52
+
+        auto putXf = [&](uint32_t slot, const F4& q, const F4& p) {
+            float* w = &cacheBuf[(i * 2 + slot) * 8];
+            w[0] = q.x; w[1] = q.y; w[2] = q.z; w[3] = q.w;
+            w[4] = p.x; w[5] = p.y; w[6] = p.z;
+        };
+        putXf(0, s.tAq, s.tAp);
+        putXf(1, s.tBq, s.tBp);
+
+        auto putShape = [&](uint32_t slot, const F4& sc, uint32_t type) {
+            uint32_t* w = &shapeBuf[(i * 2 + slot) * 12];
+            std::memcpy(&w[0], &sc.x, 4); std::memcpy(&w[1], &sc.y, 4); std::memcpy(&w[2], &sc.z, 4);
+            w[6] = 0x3F800000u;   // scaleRot.w
+            w[10] = type;
+        };
+        putShape(0, s.scaleA, s.shapeInfo.x);
+        putShape(1, s.scaleB, s.shapeInfo.y);
+
+        for (uint32_t pr = 0; pr < 2; ++pr)
+        {
+            uint32_t* ci = &inputBuf[(i * 2 + pr) * 4];
+            ci[0] = 0; ci[1] = 1; ci[2] = 0; ci[3] = 1;   // shapeRef0/1, tcRef0/1
+        }
+
+        origNbFlags[i] = 0xABCD0000u | (i & 0xFFFFu);
+        uint32_t* co = &outBuf[i * 24];
+        co[8] = s.hdr.y;          // allflagsWord @32
+        co[9] = origNbFlags[i];   // nbContactsFlags @36
+        outBuf[i * 24 + 12 + 8] = 0u;   // the decoy's allflags
+        outBuf[i * 24 + 12 + 9] = 0u;
+
+        uint32_t* mm = &manBuf[i * 2 * (1216 / 4)];
+        for (uint32_t m = 0; m < 4; ++m)
+            for (uint32_t c = 0; c < 6; ++c)
+            {
+                const uint32_t base = (m * 6 + c) * 3;
+                float* cp = reinterpret_cast<float*>(&mm[(m * 6 + c) * 12]);
+                cp[0] = s.contacts[base + 0].x; cp[1] = s.contacts[base + 0].y; cp[2] = s.contacts[base + 0].z;
+                cp[3] = s.contacts[base + 1].x; cp[4] = s.contacts[base + 1].y; cp[5] = s.contacts[base + 1].z;
+                cp[6] = s.contacts[base + 2].x; cp[7] = s.contacts[base + 2].y; cp[8] = s.contacts[base + 2].z;
+                cp[9] = s.contacts[base + 0].w;                                  // penetration
+                std::memcpy(&mm[(m * 6 + c) * 12 + 10], &s.contacts[base + 1].w, 4); // triIndex
+            }
+        mm[1152 / 4 + 0] = s.nbC.x; mm[1152 / 4 + 1] = s.nbC.y;
+        mm[1152 / 4 + 2] = s.nbC.z; mm[1152 / 4 + 3] = s.nbC.w;
+        mm[1200 / 4] = s.hdr.x;   // mNbManifolds
+
+        // The decoy, at slot 1.  Its real header says "no manifolds"; the words a
+        // 1200-stride reader would take instead say "two manifolds, six contacts".
+        mm[2416 / 4] = 0u;                        // correct mNbManifolds  (1216 + 1200)
+        mm[2400 / 4] = 2u;                        // what a 1200 stride reads
+        mm[2352 / 4 + 0] = 3u; mm[2352 / 4 + 1] = 3u;   // ... and its mNbContacts
+        mm[2352 / 4 + 2] = 0u; mm[2352 / 4 + 3] = 0u;
+
+        uint32_t* ct = &ctrBuf[i * 4];
+        // The error word starts with an UNRELATED bit already set.  setOverflowError
+        // is an atomicOr, so that bit must survive; a plain store would clobber it,
+        // and with one pair per dispatch nothing else could tell the two apart.
+        ct[0] = s.counters.x; ct[1] = s.counters.y; ct[2] = s.counters.z; ct[3] = OVF_SEED;
+    }
+
+    PxgBufferHandle bPairs = createBufferFrom(dev, pairBuf);
+    PxgBufferHandle bCache = createBufferFrom(dev, cacheBuf);
+    PxgBufferHandle bShapes = createBufferFrom(dev, shapeBuf);
+    PxgBufferHandle bInputs = createBufferFrom(dev, inputBuf);
+    PxgBufferHandle bOut = createBufferFrom(dev, outBuf);
+    PxgBufferHandle bMan = createBufferFrom(dev, manBuf);
+    PxgBufferHandle bCtr = createBufferFrom(dev, ctrBuf);
+    PxgBufferHandle bTouch = createBufferFrom(dev, touchBuf);
+    PxgBufferHandle bPatchChg = createBufferFrom(dev, patchChgBuf);
+    PxgBufferHandle bPS = createBufferFrom(dev, patchStream);
+    PxgBufferHandle bCS = createBufferFrom(dev, contactStream);
+    PxgBufferHandle bFS = createBufferFrom(dev, forceStream);
+    PxgBufferHandle bMat = createBufferFrom(dev, matBuf);
+
+    const uint64_t aPairs = dev->getBufferDeviceAddress(bPairs);
+    const uint64_t aCache = dev->getBufferDeviceAddress(bCache);
+    const uint64_t aShapes = dev->getBufferDeviceAddress(bShapes);
+    const uint64_t aInputs = dev->getBufferDeviceAddress(bInputs);
+    const uint64_t aOut = dev->getBufferDeviceAddress(bOut);
+    const uint64_t aMan = dev->getBufferDeviceAddress(bMan);
+    const uint64_t aCtr = dev->getBufferDeviceAddress(bCtr);
+    const uint64_t aTouch = dev->getBufferDeviceAddress(bTouch);
+    const uint64_t aPatchChg = dev->getBufferDeviceAddress(bPatchChg);
+    const uint64_t aPS = dev->getBufferDeviceAddress(bPS);
+    const uint64_t aCS = dev->getBufferDeviceAddress(bCS);
+    const uint64_t aFS = dev->getBufferDeviceAddress(bFS);
+    const uint64_t aMat = dev->getBufferDeviceAddress(bMat);
+
+    {
+        Kernel k("cvxTriFinishBda.spv", "convexTrimeshFinishContacts", {}, sizeof(CfPush));
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            CfPush push{};
+            push.pairs = aPairs + uint64_t(i) * 112ull;
+            push.transformCache = aCache + uint64_t(i) * 64ull;
+            push.gpuShapes = aShapes + uint64_t(i) * 96ull;
+            push.cmInputs = aInputs + uint64_t(i) * 32ull;
+            push.cmOutputs = aOut + uint64_t(i) * 96ull;
+            push.cmMultiManifold = aMan + uint64_t(i) * 2432ull;
+            push.numPairs = (i % 5 == 2) ? 1u : 2u;   // an ODD count leaves the
+                                                      // loop's second trip out of
+                                                      // range, which is the only
+                                                      // way to reach the guard
+            push.materials = aMat;
+            push.contactStream = aCS + uint64_t(i) * STREAM;
+            push.patchStream = aPS + uint64_t(i) * STREAM;
+            push.forceAndIndiceStream = aFS + uint64_t(i) * STREAM;
+            push.insertAveragePointWord = in[i].hdr.z;
+            push.patchAndContactCounters = aCtr + uint64_t(i) * 16ull;
+            push.touchChangeFlags = aTouch + uint64_t(i) * 8ull;
+            push.patchChangeFlags = aPatchChg + uint64_t(i) * 8ull;
+            push.startContactPatches = aPS + uint64_t(i) * STREAM;
+            push.startContactPoints = aCS + uint64_t(i) * STREAM;
+            push.startContactForces = aFS + uint64_t(i) * STREAM;
+            push.patchBytesLimit = in[i].cfg.x;
+            push.contactBytesLimit = in[i].cfg.y;
+            push.forceBytesLimit = in[i].cfg.z;
+            k.dispatch(1u, {}, push, 1u, 1u);
+        }
+        dev->flush();
+    }
+
+    const auto gOutB = downloadBuffer<uint32_t>(dev, bOut, outBuf.size());
+    const auto gCtr = downloadBuffer<uint32_t>(dev, bCtr, ctrBuf.size());
+    const auto gTouch = downloadBuffer<uint32_t>(dev, bTouch, N * 2);
+    const auto gPatchChg = downloadBuffer<uint32_t>(dev, bPatchChg, N * 2);
+    const auto gPS = downloadBuffer<uint32_t>(dev, bPS, patchStream.size());
+    const auto gCS = downloadBuffer<uint32_t>(dev, bCS, contactStream.size());
+    const auto gFS = downloadBuffer<uint32_t>(dev, bFS, forceStream.size());
+
+    size_t mmFlags = 0, mmCtr = 0, mmPtr = 0, mmPatch = 0, mmContact = 0, mmFace = 0;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const TmoOut& r = ref[i];
+        const uint32_t* co = &gOutB[i * 24];
+
+        if (co[8] != r.res.x) ++mmFlags;
+        if ((co[9] & 0xFFFFu) != (r.res.w & 0xFFFFu)) ++mmFlags;
+        if ((co[9] & 0xFFFF0000u) != (origNbFlags[i] & 0xFFFF0000u)) ++mmFlags;  // upper half preserved
+        if (gTouch[i * 2] != r.res.y) ++mmFlags;
+        if (gPatchChg[i * 2] != r.res.z) ++mmFlags;
+
+        // THE DECOY'S OWN OUTPUT.  Its allflags start at zero and it has no
+        // manifolds, so the lane-0 block -- which runs whatever the manifold count
+        // -- must leave exactly this behind.  Checking it is what pins the
+        // constant-trip-2 warp loop: a kernel covering one warp per block would
+        // never reach pair 1 and these words would keep their 0xDEADBEEF/0 init.
+        const uint32_t* dco = &gOutB[i * 24 + 12];
+        if (i % 5 == 2)
+        {
+            // numPairs == 1: the loop's second trip is OUT OF RANGE and must be
+            // skipped, so the decoy's record has to come back exactly as uploaded.
+            if (dco[8] != 0u || dco[9] != 0u) ++mmFlags;
+            if (gTouch[i * 2 + 1] != 0xDEADBEEFu) ++mmFlags;
+            if (gPatchChg[i * 2 + 1] != 0xDEADBEEFu) ++mmFlags;
+        }
+        else
+        {
+            if (dco[8] != 0x00010000u) ++mmFlags;    // (prevPatches<<8 | HAS_NO_TOUCH) << 16
+            if (dco[9] != 0u) ++mmFlags;
+            if (gTouch[i * 2 + 1] != 1u) ++mmFlags;  // touch was never known before
+            if (gPatchChg[i * 2 + 1] != 0u) ++mmFlags;
+        }
+
+        const uint32_t* ct = &gCtr[i * 4];
+        if (ct[0] != r.counters.x || ct[1] != r.counters.y || ct[2] != r.counters.z ||
+            ct[3] != (OVF_SEED | r.counters.w)) ++mmCtr;
+
+        // Output pointers: the engine stores base + offset; overflow stores a
+        // literal null, which the oracle models as the NULLS sentinel.
+        uint64_t pF, pP, pC;
+        std::memcpy(&pF, &co[4], 8); std::memcpy(&pP, &co[0], 8); std::memcpy(&pC, &co[2], 8);
+        const uint64_t bF = aFS + uint64_t(i) * STREAM, bP = aPS + uint64_t(i) * STREAM,
+                       bC = aCS + uint64_t(i) * STREAM;
+        auto ptrOk = [&](uint64_t got, uint64_t base, uint32_t expOff) {
+            if (expOff == NULLS) return got == 0ull;
+            return got == base + uint64_t(expOff);
+        };
+        if (!ptrOk(pF, bF, r.outputs.x) || !ptrOk(pP, bP, r.outputs.y) || !ptrOk(pC, bC, r.outputs.z))
+            ++mmPtr;
+
+        // Stream contents, only where a reservation actually happened.
+        const uint32_t po = r.outputs.y, cob = r.outputs.z, fo = r.outputs.x;
+        const uint32_t* ps = &gPS[i * (STREAM / 4)];
+        const uint32_t* cs = &gCS[i * (STREAM / 4)];
+        const uint32_t* fs = &gFS[i * (STREAM / 4)];
+
+        // AN OVERFLOWING PAIR MUST WRITE NOTHING AT ALL.  Skipping the streams here
+        // would leave the cu:257 gate untested: on a patch overflow the CONTACT and
+        // FORCE offsets keep their reserved values, so a kernel that ignored the
+        // overflow ballot would happily fill those two streams.
+        if (r.counters.w != 0u)
+        {
+            for (uint32_t w = 0; w < STREAM / 4; ++w)
+                if (ps[w] != 0u || cs[w] != 0u || fs[w] != 0u) { ++mmPatch; break; }
+        }
+
+        if (po != NULLS && po != 0xFFFFFFFFu)
+            for (uint32_t w = 0; w < 16; ++w)
+            {
+                const U4& e = r.patches[w];
+                const uint32_t* g = &ps[po / 4 + w * 4];
+                if (g[0] != e.x || g[1] != e.y || g[2] != e.z || g[3] != e.w)
+                {
+                    // patch words 1 and 2 carry floats: allow the float slack the
+                    // scalar test allows, exact for the rest.
+                    const bool floaty = (w % 4 == 1) || (w % 4 == 2);
+                    if (!floaty || !eqF(u2f(g[0]), u2f(e.x)) || !eqF(u2f(g[1]), u2f(e.y)) ||
+                        !eqF(u2f(g[2]), u2f(e.z)) ||
+                        ((w % 4 == 1) ? !eqF(u2f(g[3]), u2f(e.w)) : (g[3] != e.w)))
+                    { ++mmPatch; break; }
+                }
+            }
+
+        if (cob != NULLS && cob != 0xFFFFFFFFu)
+            for (uint32_t c = 0; c < 24; ++c)
+            {
+                const F4& e = r.cstream[c];
+                const float* g = reinterpret_cast<const float*>(&cs[cob / 4 + c * 4]);
+                if (!eqF(g[0], e.x) || !eqF(g[1], e.y) || !eqF(g[2], e.z) || !eqF(g[3], e.w))
+                { ++mmContact; break; }
+            }
+
+        if (fo != NULLS && fo != 0xFFFFFFFFu)
+            for (uint32_t w = 0; w < 64; ++w)
+            {
+                if (w == maskWord[i]) continue;   // the documented intra-warp write conflict
+                const uint32_t e = (&r.fstream[w / 4].x)[w & 3];
+                if (fs[fo / 4 + w] != e) { ++mmFace; break; }
+            }
+    }
+
+    for (PxgBufferHandle h : { bPairs, bCache, bShapes, bInputs, bOut, bMan, bCtr, bTouch,
+                               bPatchChg, bPS, bCS, bFS, bMat })
+        dev->destroyBuffer(h);
+
+    PXG_CHECK_MSG(mmFlags == 0, "cvxTriFinish: %zu status/flag mismatches", mmFlags);
+    PXG_CHECK_MSG(mmCtr == 0, "cvxTriFinish: %zu counter mismatches", mmCtr);
+    PXG_CHECK_MSG(mmPtr == 0, "cvxTriFinish: %zu output-pointer mismatches", mmPtr);
+    PXG_CHECK_MSG(mmPatch == 0, "cvxTriFinish: %zu patch-stream mismatches", mmPatch);
+    PXG_CHECK_MSG(mmContact == 0, "cvxTriFinish: %zu contact-stream mismatches", mmContact);
+    PXG_CHECK_MSG(mmFace == 0, "cvxTriFinish: %zu face-index mismatches", mmFace);
+    PXG_CHECK_MSG(cOvfP > 0 && cOvfC > 0 && cOvfF > 0 && cZeroMan > 0 && cNoRes > 0 &&
+                  cAvg > 0 && cFlip > 0 && cSphere > 0 && cCapsule > 0 && cExact > 0 && cRollbackPatch > 0,
+                  "cvxTriFinish: coverage thin (ovfP %zu ovfC %zu ovfF %zu zeroMan %zu noRes %zu "
+                  "avg %zu flip %zu sphere %zu capsule %zu exact %zu conflict %zu)",
+                  cOvfP, cOvfC, cOvfF, cZeroMan, cNoRes, cAvg, cFlip, cSphere, cCapsule,
+                  cExact, cConflict);
+}
+
 } // namespace

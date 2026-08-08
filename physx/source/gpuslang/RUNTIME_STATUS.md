@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **692/692** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **693/693** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,66 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.52 — the engine-ABI fixture P8.51 shipped without, and a 46/47 sweep
+
+P8.51 landed `cvxTriFinishBda` on the strength of the Phase-1 verbatim port plus a
+live scene, and said so plainly: no engine-ABI fixture of its own, no mutation
+sweep.  This closes that.
+
+New suite `gpuslang.cvxTriFinish`, in the same file as the Phase-1 test and driven
+against the SAME `refTrimeshOut` oracle — so a divergence is attributable to the
+BDA plumbing and the warp emulation rather than to the algorithm.  220 cases with
+real atomics on a real `PxgPatchAndContactCounters` and real writes into all three
+streams.
+
+**ONE PAIR PER DISPATCH, AND THAT IS NOT A SHORTCUT.**  The reservations are
+`InterlockedAdd`s on a shared cursor, so with several pairs in flight the byte
+offsets each pair receives depend on the order the atomics land — exactly what the
+oracle cannot predict.  Every case therefore gets its own counters, streams and
+output record as a per-case slice addressed through the push blob, and the
+dispatches are queued and flushed together because they touch disjoint memory.
+
+**Sweep 46/47**, after a first pass of 39/44 whose five survivors were worked
+through one at a time rather than waved off:
+
+| Was surviving | Closed by |
+|---|---|
+| the manifold stride 1200 vs 1216 | a SECOND pair per dispatch — a decoy with no manifolds, and a live-looking count planted where a 1200-stride reader would find its header.  The decoy's reservation then moves the counters, which the existing check already sees.  It also stops the constant-trip-2 warp loop from being assumed. |
+| `setOverflowError` as a store instead of an atomic OR | seeding the error word with an unrelated bit.  With one pair per dispatch and a zero start, a single overflow sets one bit either way; the seed makes OR and store differ. |
+| the patch-change flag reading the pre-rollback manifold count | a case where `prevPatches == nbManifolds` AND the patch reservation is forced to overflow.  The flag is then `prevPatches != 0` (true) with the rolled-back count and `prevPatches != nbManifolds` (false) without — the only input that separates them. |
+| the cu:257 gate ignoring the overflow ballot | asserting an overflowing pair writes NOTHING rather than skipping its streams.  On a patch overflow the CONTACT and FORCE offsets keep their reserved values, so a kernel that ignored the ballot would fill those two streams — and the old comparison never looked. |
+| the bounds check on the loop's second trip | dispatching every fifth case with an ODD pair count, so the second trip is genuinely out of range, and requiring the decoy's record to come back exactly as uploaded. |
+
+Two more dispatch mutants were added while closing those and both die: covering one
+warp per block instead of two, and dropping the sub-warp from the pair index.
+
+**The single survivor is unreachable, not untested.**  Dropping the
+`nbManifolds == 0` term from the gate cannot be observed: with no manifolds every
+lane's `numContacts` is zero, so `hasContacts` is false across the warp and every
+write sits behind it.  The body runs, reads valid memory and produces nothing.
+
+Coverage is asserted rather than hoped for: all three overflow kinds, the
+zero-manifold path, the no-reservation path that stores a wrapped
+`base + 0xFFFFFFFF`, `insertAveragePoint`, `flip`, the sphere and capsule world-point
+paths, exact-fit reservations, and the rollback case above.  The documented
+intra-warp face-index write conflict is masked from comparison, as it is in the
+Phase-1 test — it is a real unordered write in the CUDA, not something a port can
+fix.
+
+**Verification, stated exactly.**  `PXG_DEVICE_V2=1`: **693/693** under `-j4`,
+forced-fresh.  Default mode: **693/693 SERIAL**, but `-j4` fails
+`gpuslang.scan` with a SEGFAULT — REPRODUCIBLY, on two separate full runs.
+
+That is not the one-off `-j4` flake recorded in P8.48.  What rules out a
+correctness problem is the shape of it: `gpuslang.scan` passes 5/5 alone, passes
+under `-j4` in a five-test group alongside the new test, and the whole 693-test
+suite passes serially — it only falls over when 4 llvmpipe processes are live
+across the full run, next to `cvxCollide`'s ~180 s of allocation.  `gpuslang.scan`
+is also test #1, unrelated to this tranche and to anything the convex-trimesh
+chain touches.  The reading is a host-side resource interaction in the harness,
+not a shader defect, and it is written down here rather than averaged away because
+a segfault that reproduces deserves its own tranche, not a footnote.
 
 ## P8.51 — MILESTONE: a box falls and RESTS on a cooked triangle mesh, on Vulkan
 
