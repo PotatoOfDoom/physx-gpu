@@ -1694,6 +1694,60 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.62 — the READ is provably fine; the suspicion moves to the WRITE
+
+P8.61 predicted a second instance of the P8.60 class — a buffer sized by a
+rigid-only count and indexed by a total count.  **That prediction is wrong**, and
+the allocation says so outright (PxgSimulationCore.cpp:2160-2163):
+
+```cpp
+const PxU32 bitMapWordCounts = changedHandleMap.getWordCount();
+const PxU32 roundElement = bitMapWordCounts * 32;
+mUpdatedBuffer.allocate(roundElement * sizeof(PxU32), PX_FL);
+```
+
+`mUpdated` is sized *exactly* `bitMapWordCounts * 32`, which is exactly the bound
+the shader checks `i` against.  **The read is in bounds by construction.**  One
+grep, hypothesis dead — which is the point of checking before digging.
+
+**What the same passage exposes instead is an asymmetry in the WRITE.**  On the
+GPU-broadphase path the descriptor is built as (:2177):
+
+```cpp
+constructDescriptor(..., aabbManager->getChangedAABBMgrHandles(), nbTotalShapes,
+                    bitMapWordCounts);   // <- bitMapWordCounts is the SIM CORE's
+```
+
+so `mChangedAABBMgrHandles` is the **AABB manager's** buffer while
+`mBitMapWordCounts` is the **simulation core's** word count
+(`changedHandleMap.getWordCount()`).  The shader writes `changed[w]` for
+`w < mBitMapWordCounts`.  Two different maps sizing the two halves of one write.
+
+The CPU-broadphase branch immediately below does not have this shape — it allocates
+`mChangedAABBMgrHandlesBuffer` at `bitMapWordCounts` itself, so buffer and bound
+share a source.  And elsewhere the code is explicitly careful about exactly this
+pairing (:3142-3143):
+
+```cpp
+mUpdatedActorDataDesc->mChangedAABBMgrHandles = aabbManager->getChangedAABBMgrHandles();
+mUpdatedActorDataDesc->mBitMapWordCounts     = aabbManager->getChangedAABBMgrHandlesWordCount();
+```
+
+— the AABB manager's buffer paired with the AABB manager's count.  Line 2177 pairs
+the AABB manager's buffer with the *other* map's count.
+
+**Stated at the strength the evidence supports:** this is an asymmetry, not yet a
+proven overrun.  It becomes the fault only if the simulation core's word count can
+exceed the AABB manager's buffer, and an articulation adding link shapes is a
+plausible way for the two maps to diverge — but that is unverified.  The check is
+one host-side comparison of `changedHandleMap.getWordCount()` against
+`aabbManager->getChangedAABBMgrHandlesWordCount()` with the articulation scene
+loaded, and it is the next move.
+
+*Record of a wrong turn, kept deliberately:* P8.61 reasoned by analogy from P8.60
+and named the wrong buffer.  The analogy was reasonable and the conclusion was
+false; what made that cheap was checking the allocation before writing any code.
+
 ## P8.61 — the dispatch-67 fault: the port is clean, so the data is not
 
 Read the shader against the CUDA before digging further, and the result narrows the
