@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **695/695** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **696/696** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,60 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.67 — the articulation block-layout address map
+
+`computeUnconstrainedVelocities1TLaunch` is a thin wrapper around a device
+function that fills the **block-layout scratch**, and that scratch is the real
+obstacle: `PxgArticulationBlockLinkData` alone is 29184 bytes, `PxgArticulationBlockDofData`
+12800, `PxgArticulationBlockData` 7168.  Each holds thirty-two articulations
+interleaved as structure-of-arrays, so every field access is three numbers —
+
+```
+block[warpIndex] . field [lane]
+^ struct stride    ^ offset  ^ element stride
+```
+
+— and none is inferable from the others.  No articulation dynamics kernel can be
+written until that map exists and is proven, so this tranche is the map, landed on
+its own.  That is not a new precedent: `testSimCoreDescLayout`,
+`testSolverDescLayout`, `testPrepDescLayout` and `testNpAbiLayout` are all standalone
+layout proofs, and they are what made the kernel tranches after them safe.
+
+**Every constant was GENERATED, not transcribed.**  A throwaway host program
+emitted both the Slang constant block and the C++ `static_assert` list from the same
+`sizeof`/`offsetof` expressions against the real engine headers.  Hand-copying fifty
+offsets out of a 29 KB SoA header is precisely how P8.49a's BV32 stride bug
+happened — shader and fixture carried the same wrong number and agreed with each
+other instead of with the engine.  Generation removes that failure mode by
+construction.
+
+**Proven twice.**  Compile time: every Slang constant has a matching `static_assert`.
+Run time: `artiBlockProbe` reads element **[1]** of a two-element array at lane **3**
+and 57 values come back for a bitwise compare.  Both indices are deliberate — at
+element [0] lane 0 the struct stride, the field offset and the lane stride all
+collapse to the same address and the probe would prove nothing.  Element [0] is
+filled with a *different* sentinel set rather than zeros, so a wrong stride reads
+plausible wrong data instead of an obvious hole.
+
+**Sweep: 40 of 40 killed.**  Of the first 37, thirty-five died.  The two survivors
+were `PXG_AB_MAT33_COL1` and `PXG_AB_STB_P` — and they survived because **the probe
+never read them**: `PxgMat33Block` and `PxgSpatialTransformBlock` occur only inside
+`PxgArticulationBlockLinkData`, which this tranche does not map, so both were pinned
+by size alone.  A constant nothing reads is a constant nothing can prove.  Both are
+now probed standalone (with `mCol2` read as the `float[32]` it is, not the
+`float4[32]` its neighbours are), and both mutants die, along with three new
+sub-block mutants.  The earlier 35 were not re-run: the fixture only gained checks,
+so a killed mutant cannot become invisible.
+
+**What is deliberately NOT here.**  `PxgArticulationBlockLinkData` — the biggest of
+the three and the one the link loops walk — is left for the next tranche.  Mapping
+29 KB of fields in the same stretch as the map's own infrastructure would have made
+both harder to review.
+
+Suite **696/696** both memory modes.  Manifest unchanged at **270 of 501**: this
+tranche maps no kernel, and saying otherwise would inflate the number that drives
+the estimate.
 
 ## P8.66 — `dmaArticulationResidual`, and the address map the rest of the block needs
 

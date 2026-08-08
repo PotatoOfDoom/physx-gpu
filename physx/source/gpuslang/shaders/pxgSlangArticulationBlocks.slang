@@ -1,0 +1,172 @@
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions
+// are met:
+//  * Redistributions of source code must retain the above copyright
+//    notice, this list of conditions and the following disclaimer.
+//  * Redistributions in binary form must reproduce the above copyright
+//    notice, this list of conditions and the following disclaimer in the
+//    documentation and/or other materials provided with the distribution.
+//  * Neither the name of NVIDIA CORPORATION nor the names of its
+//    contributors may be used to endorse or promote products derived
+//    from this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS ''AS IS'' AND ANY
+// EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+// PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT OWNER OR
+// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+// EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+// PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+// PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+// OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+//
+// Copyright (c) 2008-2025 NVIDIA Corporation. All rights reserved.
+
+// pxgSlangArticulationBlocks.slang
+//
+// The BLOCK-LAYOUT address map: PxgArticulationBlockData and
+// PxgArticulationBlockDofData (gpusimulationcontroller/include/PxgArticulation.h)
+// and the three sub-blocks they are built from.
+//
+// These are not ordinary structs.  Each one holds the state of THIRTY-TWO
+// articulations interleaved as structure-of-arrays: every field is a `[32]`
+// array indexed by the lane, and each field array is padded so the whole struct
+// is a multiple of 128 bytes for coalesced loads.  So a field access is
+//
+//     block[warpIndex] . field [lane]
+//     ^ struct stride    ^ field offset  ^ element stride
+//
+// — three numbers, every one of them part of the ABI, and none of them
+// inferable from the others.  `PxgArticulationBlockLinkData` alone is 29184
+// bytes of such fields.
+//
+// EVERY CONSTANT BELOW WAS GENERATED from host-side `sizeof`/`offsetof` of the
+// real engine structs rather than transcribed, and each is pinned again by
+// static_assert in tests/testArtiBlockLayout.cpp.  Hand-copying fifty offsets
+// out of a 29 KB SoA header is exactly the kind of work that produced the BV32
+// stride bug in P8.49a, where shader and fixture carried the same wrong number
+// and agreed with each other instead of with the engine.
+//
+// The layout is proven functionally as well: the artiBlockProbe kernel reads
+// element [1] of a two-element array at lane 3 — so the struct stride, the
+// field offset and the lane stride are each independently wrong-able — and the
+// test compares every value against the real engine struct filled with
+// sentinels on the host.
+module pxgSlangArticulationBlocks;
+
+// ---------------------------------------------------------------------------
+// Sub-blocks
+// ---------------------------------------------------------------------------
+public static const uint PXG_AB_SPATIAL_VECTOR_BLOCK_SIZE               =    768;
+public static const uint PXG_AB_SVB_TOPXYZ_BX                           =      0;
+public static const uint PXG_AB_SVB_BYZ                                 =    512;
+public static const uint PXG_AB_MAT33_BLOCK_SIZE                        =   1152;
+public static const uint PXG_AB_MAT33_COL0                              =      0;
+public static const uint PXG_AB_MAT33_COL1                              =    512;
+public static const uint PXG_AB_MAT33_COL2                              =   1024;
+public static const uint PXG_AB_SPATIAL_MATRIX_BLOCK_SIZE               =   3584;
+public static const uint PXG_AB_SPATIAL_TRANSFORM_BLOCK_SIZE            =   1024;
+public static const uint PXG_AB_STB_Q                                   =      0;
+public static const uint PXG_AB_STB_P                                   =    512;
+
+public static const uint PXG_AB_BLOCK_SIZE                              =   7168;
+public static const uint PXG_AB_mInvSpatialArticulatedInertia           =      0;
+public static const uint PXG_AB_mFlags                                  =   3584;
+public static const uint PXG_AB_mNumLinks                               =   3712;
+public static const uint PXG_AB_mNumSpatialTendons                      =   3840;
+public static const uint PXG_AB_mNumFixedTendons                        =   3968;
+public static const uint PXG_AB_mNumMimicJoints                         =   4096;
+public static const uint PXG_AB_mTotalDofs                              =   4224;
+public static const uint PXG_AB_mArticulationIndex                      =   4352;
+public static const uint PXG_AB_mSleepThreshold                         =   4480;
+public static const uint PXG_AB_mCommonLinkDeltaVelocity                =   4608;
+public static const uint PXG_AB_mLinkWithDeferredImpulse                =   5376;
+public static const uint PXG_AB_mMotionVelocitiesPtr                    =   5504;
+public static const uint PXG_AB_mRootDeferredZ                          =   5760;
+public static const uint PXG_AB_mCOM_TotalInvMassW                      =   6528;
+public static const uint PXG_AB_mStateDirty                             =   7040;
+public static const uint PXG_AB_mTotalSelfConstraintCount               =   7072;
+public static const uint PXG_AB_mSelfConstraintOffset                   =   7076;
+
+public static const uint PXG_AB_DOF_SIZE                                =  12800;
+public static const uint PXG_AB_DOF_mJointPositions                     =      0;
+public static const uint PXG_AB_DOF_mJointVelocities                    =    128;
+public static const uint PXG_AB_DOF_mJointUnconstrainedVelocities       =    256;
+public static const uint PXG_AB_DOF_mPosJointVelocities                 =    384;
+public static const uint PXG_AB_DOF_mJointAccel                         =    512;
+public static const uint PXG_AB_DOF_mQstZ                               =    640;
+public static const uint PXG_AB_DOF_mQstZIcInternal                     =    768;
+public static const uint PXG_AB_DOF_mDeferredQstZ                       =    896;
+public static const uint PXG_AB_DOF_mTmpQstZ                            =   1024;
+public static const uint PXG_AB_DOF_mWorldMotionMatrix                  =   1152;
+public static const uint PXG_AB_DOF_mLocalMotionMatrix                  =   1920;
+public static const uint PXG_AB_DOF_mIsInvDW                            =   2688;
+public static const uint PXG_AB_DOF_mIsW                                =   3456;
+public static const uint PXG_AB_DOF_mJointAxis                          =   4224;
+public static const uint PXG_AB_DOF_mInvStIsT_x                         =   4992;
+public static const uint PXG_AB_DOF_mInvStIsT_y                         =   5120;
+public static const uint PXG_AB_DOF_mInvStIsT_z                         =   5248;
+public static const uint PXG_AB_DOF_mDofIds                             =   5376;
+public static const uint PXG_AB_DOF_mMotion                             =   5408;
+public static const uint PXG_AB_DOF_mConstraintData                     =   5440;
+
+// ---------------------------------------------------------------------------
+// Lane accessors.  `base` is the address of the block element (i.e. the array
+// base plus warpIndex * stride); `fieldOffset` is one of the constants above.
+// ---------------------------------------------------------------------------
+public uint abU32(uint64_t base, uint fieldOffset, uint lane)
+{
+    return (Ptr<uint>(base + uint64_t(fieldOffset)))[lane];
+}
+
+public float abF32(uint64_t base, uint fieldOffset, uint lane)
+{
+    return asfloat(abU32(base, fieldOffset, lane));
+}
+
+public uint64_t abU64(uint64_t base, uint fieldOffset, uint lane)
+{
+    return (Ptr<uint64_t>(base + uint64_t(fieldOffset)))[lane];
+}
+
+// PxU8[32] fields: a byte array, read as a word plus a byte extract.  SPIR-V
+// without the Int8 capability cannot load a byte directly, and requiring that
+// capability for a bookkeeping flag would be a portability cost for nothing.
+public uint abU8(uint64_t base, uint fieldOffset, uint lane)
+{
+    const uint word = (Ptr<uint>(base + uint64_t(fieldOffset)))[lane >> 2];
+    return (word >> ((lane & 3u) * 8u)) & 0xFFu;
+}
+
+public float4 abF4(uint64_t base, uint fieldOffset, uint lane)
+{
+    return (Ptr<float4>(base + uint64_t(fieldOffset)))[lane];
+}
+
+public float2 abF2(uint64_t base, uint fieldOffset, uint lane)
+{
+    return (Ptr<float2>(base + uint64_t(fieldOffset)))[lane];
+}
+
+// a PxU32 that is NOT a [32] array -- mTotalSelfConstraintCount and
+// mSelfConstraintOffset are per-BLOCK scalars sitting in the tail padding, so
+// they take no lane index.  Reading one with a lane index would silently walk
+// into the padding.
+public uint abBlockScalar(uint64_t base, uint fieldOffset)
+{
+    return (Ptr<uint>(base + uint64_t(fieldOffset)))[0];
+}
+
+// PxgSpatialVectorBlock is stored as float4 mTopxyz_bx[32] + float2 mbyz[32]:
+// the top three components plus the bottom X in one float4, the bottom Y and Z
+// in a float2.  Returns (top.xyz, bottom.xyz) as two float3s.
+public void abLoadSpatialVector(uint64_t base, uint fieldOffset, uint lane,
+                                out float3 top, out float3 bottom)
+{
+    const float4 t = abF4(base, fieldOffset + PXG_AB_SVB_TOPXYZ_BX, lane);
+    const float2 b = abF2(base, fieldOffset + PXG_AB_SVB_BYZ, lane);
+    top = t.xyz;
+    bottom = float3(t.w, b.x, b.y);
+}
