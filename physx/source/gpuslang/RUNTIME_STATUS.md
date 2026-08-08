@@ -1694,6 +1694,50 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.54 — MILESTONE: every scene in the harness passes, and what is actually left
+
+```
+OK box   OK stack  OK plane            OK sphere      OK capsule
+OK capsulebox      OK convex           OK joint       OK meshfloor
+OK particle        OK cloth            OK clothhang   OK clothdrape
+OK clothselfcollide                    OK clothcloth
+OK softbody        OK softbodyselfcollide             OK softbodycloth
+OK softbodystack   OK softbodyattach
+```
+
+**All twenty `gpu-sdk-step` scenes step on the Vulkan/llvmpipe pipeline** — every
+rigid scene, the cooked triangle mesh, particles, all five cloth scenes and all
+five softbody scenes.  There is no red scene left in the harness.
+
+That is a good moment to stop and count what is NOT done, because "all scenes
+pass" is a much weaker statement than it sounds.  The manifest holds **501 kernel
+rows, 268 mapped and 233 unmapped** — the scenes pass because the unmapped
+kernels are ones no scene reaches, not because the port is finished.
+
+**The 233, by subsystem:**
+
+| Count | Block | Note |
+|---|---|---|
+| ~85 | **articulations** | 69 `arti*` plus `computeUnconstrained*`, `updateBodies*`, `setupInternalConstraint*`, `accumulateDeltaVRigid*`, `getD6Joint*` |
+| ~45 | isosurface + sparse grid (`iso_*`, `sg_*`) | fluid surface extraction, not simulation |
+| 31 | particle variants (`ps_*`) | paths the one particle scene does not take |
+| 22 | SDF (13) + BVH build (9) | SDF collision and its tree build |
+| 17 | cloth variants | |
+| 11 | heightfield | a whole collision shape type |
+| 5 | convex-core | the newer contact-gen path |
+| 7 | broadphase merge / frozen-unfrozen | |
+| 2 | trimesh-vs-trimesh | |
+
+**Articulations are the next frontier, and it is not close.**  They are the single
+biggest coherent block, they are a headline PhysX feature — ragdolls, robots,
+vehicles — and they are *completely* untested here: the harness has no
+articulation scene at all, so not one of those ~85 kernels has ever been asked to
+run.  Every other block is either a variant of something already working or a
+feature no scene exercises.
+
+The route is the one the softbody and convex-trimesh chains took: add the scene
+first, run it, and let the refused launches name the work.
+
 ## P8.53 — a correction: the `gpuslang.scan` segfault is NOT reproducible
 
 P8.52 recorded a `gpuslang.scan` SEGFAULT under `-j4` in default memory mode and
