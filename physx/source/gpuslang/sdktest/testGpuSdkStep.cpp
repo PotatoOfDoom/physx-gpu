@@ -2789,6 +2789,16 @@ SoftBodyAttachScene buildSoftBodyAttachScene(PxPhysics* physics, PxScene* scene,
 
 int main()
 {
+    // LINE-BUFFER STDOUT.  This harness exists to drive scenes that crash, and a
+    // block-buffered stdout loses every progress line the process had printed but
+    // not flushed -- which is exactly how P8.55 and P8.56 came to place the
+    // articulation SIGSEGV in scene construction when it is really in the first
+    // simulate().  PhysX's own error callback is unbuffered, so the surviving
+    // output was all engine errors and no harness context, and the crash looked
+    // like it happened three phases earlier than it did.  One line, and every
+    // future crash here locates itself.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+
     StepAllocator alloc;
     StepError err;
 

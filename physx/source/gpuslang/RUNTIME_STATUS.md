@@ -1694,6 +1694,46 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.58 — the one-line fix for the thing that actually cost three tranches
+
+The articulation hunt burned P8.55, P8.56 and half of P8.57 on a wrong premise —
+that the crash was in scene construction — and the cause was not subtle: the
+harness's stdout is block-buffered when redirected, so every progress line it had
+printed but not flushed died with the process.  PhysX's own error callback is
+unbuffered, so what survived was all engine noise and no harness context, and the
+crash appeared to happen three phases earlier than it did.
+
+`main()` now line-buffers stdout:
+
+```cpp
+std::setvbuf(stdout, nullptr, _IOLBF, 0);
+```
+
+The articulation scene now locates its own crash with no external tooling:
+
+```
+creating GPU scene (eENABLE_GPU_DYNAMICS + eGPU broadphase, TGS)...
+[  OK  ] GPU scene constructed: the Pxg* pipeline is live over Vulkan
+[  OK  ] scene 'articulation' built: 1 dynamic body(ies) + ground on the GPU
+stepping the GPU scene 'articulation' (240 x 0.0167s)...          <-- then SIGSEGV
+```
+
+`meshfloor`, `box` and `softbody` re-checked green.  This harness exists to drive
+scenes that crash; it should never again be the reason a crash is mislocated.
+
+**The shader bound is DEFERRED, and deliberately so.**  P8.57 proposed bounding
+`remappedBodyIndex` in `initializeSolverVelocitiesTGS` so a missing upstream kernel
+yields a diagnosable frame instead of a wild write.  That is still the right idea
+and it is not done, for a concrete reason: the solver descriptor carries **no
+`solverBodyVelPool` size field**, so an exact bound is not derivable from what the
+shader can see.  A bound would have to be inferred from the pool layout —
+`accumulatedBodyDeltaVOffset` plus the averaging region — and inferring a layout
+inside a shader that twenty green scenes depend on, to guard a case that only
+occurs when something upstream is already missing, is a bad trade made in a hurry.
+Doing it properly means either adding the size to the descriptor mirror or
+compiling a debug shader variant selected at load time.  Left open rather than
+half-done.
+
 ## P8.57 — the articulation crash, fully diagnosed (and two more of my claims corrected)
 
 **Correction 1: it is not scene construction.**  P8.55 and P8.56 both placed the
