@@ -189,6 +189,41 @@ public static const uint PXG_ARTI_DIRTY_JOINT_TARGET_POS = 8192;
 public static const uint PXG_ARTI_DIRTY_EXT_ACCEL = 512;
 
 // ---------------------------------------------------------------------------
+// PxgArticulationCoreDesc (gpuarticulation/include/PxgArticulationCoreDesc.h,
+// 360 bytes) — the descriptor the WHOLE articulation solver block shares.
+//
+// Addressed by named byte offset for the same reason PxgArticulation is: it
+// carries ~30 device pointers into block-layout scratch (link blocks, dof
+// blocks, tendon blocks, bitfield stacks) and each converted kernel touches a
+// handful.  A full mirror would be thirty fields that must stay in step with a
+// header this port does not own, every one a silent wrong-address bug on drift.
+// Constants are added as kernels need them, each pinned by static_assert.
+// ---------------------------------------------------------------------------
+public static const uint PXG_ARTI_CORE_BODY_SIM_POOL = 0;      // PxgBodySim*
+public static const uint PXG_ARTI_CORE_SLEEP_DATA = 8;         // PxgSolverBodySleepData*
+public static const uint PXG_ARTI_CORE_ISLAND_NODE_INDICES = 16; // PxNodeIndex*
+public static const uint PXG_ARTI_CORE_SOLVER_BODY_INDICES = 24; // PxU32*
+public static const uint PXG_ARTI_CORE_ARTICULATIONS = 32;     // PxgArticulation*
+public static const uint PXG_ARTI_CORE_ARTICULATION_OFFSET = 40; // PxU32
+public static const uint PXG_ARTI_CORE_NB_ARTICULATIONS = 44;  // PxU32
+
+// PxgArticulation's two residual accumulators, and the stride of one.
+// Dy::ErrorAccumulator is 12 bytes of plain scalars, so the whole-struct
+// assignment the CUDA writes is a 12-byte copy at any granularity.
+public static const uint PXG_ARTI_INTERNAL_RESIDUAL = 512;
+public static const uint PXG_ARTI_CONTACT_RESIDUAL = 524;
+public static const uint PXG_ARTI_ERROR_ACCUMULATOR_SIZE = 12;
+
+// PxNodeIndex is a PxU64 whose low word is the index and whose high word
+// carries the articulation flag + link id (pxgSlangCommon::nodeIndexIndex).
+public static const uint PXG_NODE_INDEX_SIZE = 8;
+
+// PxgBodySim::articulationRemapId (pxgSlangCommon mirrors the struct at 224
+// bytes; this is the byte offset the raw-addressed path needs).
+public static const uint PXG_BODY_SIM_SIZE = 224;
+public static const uint PXG_BODY_SIM_ARTICULATION_REMAP_ID = 176;
+
+// ---------------------------------------------------------------------------
 // Field accessors
 // ---------------------------------------------------------------------------
 

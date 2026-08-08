@@ -507,6 +507,11 @@ pxg_compile_shader(cvxTriFinishBda convexTrimeshFinishContacts)
 # absent from PXG_HLSL_ENTRIES; integer/copy only, so absent from
 # PXG_NOCONTRACT_SHADERS.
 pxg_compile_shader(newArticulationsBda newArticulationsLaunch)
+# P8.66: dmaArticulationResidual (forwardDynamic2.cu:3766) -- one thread per
+# articulation, and the kernel that forces the PxgArticulationCoreDesc address
+# map the rest of the articulation block needs.  Ptr<> throughout (no HLSL
+# lowering); integer/copy only (no float contraction to pin).
+pxg_compile_shader(dmaArtiResidualBda dmaArticulationResidual)
 pxg_compile_shader(npPairMgmtBda removeContactManagers_Stage1 removeContactManagers_Stage2 removeContactManagers_Stage3 removeContactManagers_Stage4 removeContactManagers_Stage5 removeContactManagers_Stage5_CvxTri)
 # P6.2: PBD particle spatial-hash grid build + reorder on the engine ABI (BDA).
 # Both kernels read the PxgParticleSystem descriptor array through Ptr<> and
@@ -1249,6 +1254,7 @@ add_executable(gpuslang-tests
     testSortTriIndices.cpp
     testCvxTriPostProcess.cpp
     testNewArticulations.cpp
+    testDmaArtiResidual.cpp
     testNpSbTet.cpp
     testNpSbSelf.cpp
     testNpSbSb.cpp
@@ -1381,6 +1387,7 @@ target_include_directories(gpuslang-tests PRIVATE ${GPUSLANG_ROOT}/../../include
     ${GPUSLANG_ROOT}/nocuda
     ${GPUSLANG_ROOT}/../gpubroadphase/include ${GPUSLANG_ROOT}/../gpunarrowphase/include
     ${GPUSLANG_ROOT}/../gpusimulationcontroller/include ${GPUSLANG_ROOT}/../gpusolver/include
+    ${GPUSLANG_ROOT}/../gpuarticulation/include
     ${GPUSLANG_ROOT}/../common/src
     ${GPUSLANG_ROOT}/../lowlevel/api/include
     ${GPUSLANG_ROOT}/../lowlevel/common/include/pipeline ${GPUSLANG_ROOT}/../lowlevel/common/include/utils
@@ -1447,6 +1454,7 @@ target_include_directories(PhysXGpuVulkan PRIVATE
     ${GPUSLANG_ROOT}/nocuda
     ${GPUSLANG_ROOT}/../gpubroadphase/include ${GPUSLANG_ROOT}/../gpunarrowphase/include
     ${GPUSLANG_ROOT}/../gpusimulationcontroller/include ${GPUSLANG_ROOT}/../gpusolver/include
+    ${GPUSLANG_ROOT}/../gpuarticulation/include
     ${GPUSLANG_ROOT}/../common/src
     ${GPUSLANG_ROOT}/../lowlevel/api/include
     ${GPUSLANG_ROOT}/../lowlevel/common/include/pipeline ${GPUSLANG_ROOT}/../lowlevel/common/include/utils
@@ -1479,7 +1487,7 @@ foreach(suite scan radixSort radixSortDesc radixSortGather preIntegration integr
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout particleSelfCollision newArticulations)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout particleSelfCollision newArticulations dmaArtiResidual)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")

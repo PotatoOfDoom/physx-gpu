@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **694/694** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **695/695** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,61 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.66 — `dmaArticulationResidual`, and the address map the rest of the block needs
+
+A small kernel chosen for what it forces rather than what it does.  One thread per
+articulation reads the two residual accumulators out of the pool and writes them
+into a pinned-host array the solver reads back on the CPU — but to do that it has to
+address `PxgArticulationCoreDesc`, the 360-byte descriptor the **whole** articulation
+solver block threads through every one of its kernels.  That address map now exists
+and is pinned; every remaining articulation tranche reuses it.
+
+**The three-hop index chain, transcribed and tested hop by hop:**
+
+```
+islandNodeIndices[tid + articulationOffset].index()  -> nodeIndex
+bodySimPool[nodeIndex].articulationRemapId           -> poolIndex
+articulations[poolIndex].{internal,contact}Residual  -> the payload
+```
+
+The dispatch index is a position in the island's articulation *range*, not an
+articulation id.  The fixture uses offset 2, node indices 7/3/11 and pool slots
+1/2/0, so no two hops agree and skipping any one of them is visible.
+
+**The pinned-host argument.**  `errorPinnedHost` is
+`PxPinnedArray<Dy::ErrorAccumulator>::begin()` cast straight to `CUdeviceptr`
+(PxgTGSCudaSolverCore.cpp:1601) — legal under CUDA unified addressing, meaningless
+here, so the launch-ABI row sets `hostPtrMask` bit 1 and the bridge substitutes the
+device address.  The fixture allocates a **real** `memHostAlloc` buffer, passes the
+CPU address, and reads the result back through the CPU mapping, so the mask bit is
+exercised end to end rather than assumed.
+
+**Sweep: 19 of 20 killed.**  The survivor is an invariance with a proof, not a gap:
+
+* **the remap hop replaced by the dispatch index.**  Both the source record and the
+  destination slot are indexed by the *same* `index`, and the engine's own assert
+  (`index < nbArticulations`, forwardDynamic2.cu:3786) forces the remap to be a
+  permutation of `[0, nbArticulations)`.  So over a full dispatch the correct code
+  writes `{out[p] = pool[p] : p in [0,n)}` and so does the mutant — **byte-identical
+  for every legal input**.  The remap carries no observable information *in this
+  kernel*; the first kernel that can validate it is one whose output is indexed by
+  the dispatch index while its input is indexed by the remap.  Recorded so the next
+  tranche knows the hop is still unvalidated.
+
+*A fixture bug worth keeping:* the first draft used pool index 4 with
+`nbArticulations = 3`, which made one articulation's contact slot
+(`index + nbArticulations`) collide with another's internal slot.  The test failed
+and the **fixture** was wrong, not the shader — the engine invariant that keeps the
+two output halves disjoint is exactly the assert above.  Reading the CUDA's asserts
+is reading its preconditions.
+
+**No scene reaches this kernel.**  Per-articulation residual reporting is off in the
+harness, so `PXG_SCENE=articulation` never dispatches it (verified: zero occurrences
+in the trace).  Its only validation is the fixture and the sweep, and that is stated
+rather than papered over.
+
+Suite **695/695** both memory modes; manifest **270 of 501**.
 
 ## P8.65 — MILESTONE: the articulation scene runs 240 steps
 

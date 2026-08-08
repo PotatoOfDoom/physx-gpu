@@ -1108,6 +1108,13 @@ static const PxgKernelAbiRow kRows[] = {
     // getMappedDevicePtr before the launch (PxgSimulationCore.cpp:2376), so
     // neither argument reaches us as a raw pinned-host pointer.  (P8.65)
     { "newArticulationsLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    // forwardDynamic2.cu:3766 dmaArticulationResidual(
+    //     PxgArticulationCoreDesc*, Dy::ErrorAccumulator* errorPinnedHost)
+    // -> kTwoPtr (16 bytes).  ARGUMENT 1 IS A PINNED HOST POINTER: the solver
+    // core passes PxPinnedArray<Dy::ErrorAccumulator>::begin() cast straight to
+    // CUdeviceptr (PxgTGSCudaSolverCore.cpp:1601), untranslated, because under
+    // CUDA unified addressing that is already a device pointer.  (P8.66)
+    { "dmaArticulationResidual", kTwoPtr, uint32_t(sizeof(kTwoPtr)), 1u << 1 },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)
