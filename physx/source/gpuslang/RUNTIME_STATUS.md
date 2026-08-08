@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **696/696** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **697/697** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,83 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.69 — the joint-frame math, bit-exact against the engine itself
+
+The first piece of real articulation **dynamics** in the port: `computeJointAxis`
+(forwardDynamic2.cu:337) and `ArticulationJointCore::setJointFrame` /
+`computeMotionMatrix` (DyArticulationJointCore.h:139-207), the head of `jcalc`.
+
+It was taken first for one reason: both engine functions are `PX_CUDA_CALLABLE`,
+so the fixture **calls the real engine implementation on the host** over the same
+inputs and compares bit patterns.  There is no transcribed oracle to drift — the
+strongest check available anywhere in this port, and it is what made the rest of
+this entry possible.
+
+**Bitwise, not tolerant.**  `rotateAndNormalize` is a hand-fused rotate-then-
+normalize whose expression order is part of the result, and `getNormalized()` is
+`m > 0 ? v * PxRecipSqrt(m) : 0` — a reciprocal square root with an explicit
+zero-length guard.  The Slang side spells all of it out rather than reaching for
+`normalize()` or `rsqrt`, and the module is registered in `PXG_NOCONTRACT_SHADERS`
+so no multiply-add is fused behind the transcription's back.  13 joints across
+every branch — prismatic, revolute, revolute-unwrapped, spherical at 1/2/3 dofs,
+fix, a LOCKED axis (dofId 0xFF, the zero-axis input the normalize guard exists
+for), and two cross-typed dof ids — all bit-identical.
+
+### Five rewrites of correct code, and the measurement that ended it
+
+The first run failed **55 of 242 values**.  So did the second, the third, the
+fourth and the fifth — after a record-layout fix, a branch-free axis
+construction, a switch from `out` array parameters to a returned struct, and
+finally the removal of every array.  **Exactly 55 each time.**
+
+The cause was none of those.  `PxArticulationJointType` is `eFIX = 0,
+ePRISMATIC = 1, eREVOLUTE = 2, eREVOLUTE_UNWRAPPED = 3, eSPHERICAL = 4`, and the
+Slang constants had been taken from the order the types appear in
+`computeMotionMatrix`'s **switch** — off by one, with `eFIX` at the end instead of
+the front.
+
+What made that survive five attempts is the shape of the resulting failure.  Every
+case that landed on a neighbouring branch which happens to compute the same thing
+**passed**:
+
+| case | host value | branch it hit | result |
+|---|---|---|---|
+| eREVOLUTE | 2 | the unwrapped label | same maths — PASS |
+| eREVOLUTE_UNWRAPPED | 3 | the spherical label, dofs == 1 | same maths — PASS |
+| eFIX | 0 | prismatic, with a zero axis | zero either way — PASS |
+| ePRISMATIC | 1 | revolute — reads `.top`, not `.bottom` | zeros — FAIL |
+| eSPHERICAL | 4 | fix — writes nothing | zeros — FAIL |
+
+A subset of cases correct is the worst shape a bug can take, and every wrong
+hypothesis it provoked was individually plausible.  What ended it was making the
+shader **echo its own inputs back to the host**: one run showed `jointType = 1`
+where the port expected `ePRISMATIC = 0`, and the whole pattern fell out at once.
+
+*The rule, and it generalises past enums:* **when a fix does not move the failure
+count, stop fixing and start measuring.** Five structurally different rewrites
+produced the identical 55 — that constancy was the evidence, and it was on screen
+from the second attempt.
+
+*Also corrected here:* an intermediate version of this entry and of the shader
+comment claimed that Slang `out`-array parameters and struct-of-array returns do
+not survive lowering on this toolchain.  **That claim was wrong** — those forms
+were rewritten while chasing the enum bug and neither was ever shown to be at
+fault.  The array-free form is kept because it is what was in place when the real
+cause surfaced, not because arrays are known broken.  A false platform rule left
+in the record is worse than no rule.
+
+**Sweep: 19 of 20 killed.**  Two first-round survivors were real gaps and were
+closed by adding a rotational joint carrying a linear dof id and a fixed joint
+carrying one — neither is a configuration the engine builds, but these are unit
+tests of two functions, not of a scene, and the engine oracle handles both without
+complaint.  The remaining survivor is `rsqrt` substituted for `1.0f / sqrt`: on
+llvmpipe the two lower identically, so no fixture can separate them **here**.  The
+spelling stays anyway — `rsqrt` is permitted to be an approximation, and the
+constant is defence against a different driver, not against this one.
+
+Suite **697/697** both memory modes.  Manifest unchanged at **270 of 501**: this
+lands a shared helper, not a kernel.
 
 ## P8.68 — the link block, the last 29 KB of the map
 
