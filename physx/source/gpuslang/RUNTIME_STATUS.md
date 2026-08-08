@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **697/697** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **698/698** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,55 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.72 — `jcalc` phase A: the first articulation dynamics that writes
+
+The record-side recompute (forwardDynamic2.cu:379-432) is ported: the per-joint
+loop that fills `jointAxis`, `motionMatrix` and `relativeQuat` in the articulation
+record, plus `jointOffsets`, `cfmScale` and `cfms`.
+
+**The oracle splits, and the split is the point.**  The only non-trivial maths here
+is `computeJointAxis` + `setJointFrame`, and the fixture takes that from **the
+engine itself** — the same `PX_CUDA_CALLABLE` functions P8.69 proved bit-exact,
+now driven through a four-link loop.  What is left over — the dof accumulation,
+`jointOffsets`, two cfm multiplies — is arithmetic the fixture computes from its own
+inputs, where a transcribed expectation carries no real risk.  So phase A does *not*
+inherit the weak-oracle caveat that phases B and C will.
+
+*A cross-check that was tried and ruled out:* `FeatherstoneArticulation::jcalc`
+(DyFeatherstoneArticulation.cpp:3378) turns out to be thin — per link it calls
+`setJointFrame` and nothing else — so it has no counterpart to the GPU phase's cfm
+products or offset writes.  It is not an oracle for this; its inner call already is.
+
+**The flag that is easy to miss.**  `setJointFrame` is a **no-op unless the joint's
+`jCalcUpdateFrames` byte is set**, and it *clears* that byte on the way out.  The
+CUDA calls it unconditionally and lets the flag decide.  Skipping the flag would
+recompute frames every frame — not wrong numerically but not what the engine does —
+and failing to clear it would be wrong outright.  One fixture link carries the flag
+clear, so both sides are exercised: its joint offset and cfm are still written while
+its relative quat and motion matrix stay untouched.
+
+**Fixture shape, and why each choice is load-bearing.**  Four links —
+revolute (1 dof, jointOffset 0), spherical (2 dof, offset 1), prismatic (1 dof,
+offset 3) — so `totalDofs` accumulates 0 → 1 → 3 and `jointOffset` diverges from
+`linkID`.  Four dispatches cover the `(confiDirty, dataDirty)` matrix with the
+fixed-base flag toggled, so both sides of the root's `? 0 :` run and the (0,0)
+early-out is checked against poisoned destinations that must stay poisoned.
+
+**Sweep: 19 of 22 killed, then 20 of 22.**  One survivor was a real gap and the
+fixture was changed rather than excused: `ArticulationJointCoreData::nbDof` is a
+`PxU8` at offset 4 of an 8-byte struct, so a *word* read there returns nbDof plus
+the three bytes after it — and the fixture had `memset` those to **zero**, which
+makes the wrong read give the right answer.  Poisoning them to 0xEE kills it.  That
+is the same hazard P8.70 found by measurement, resurfacing one layer up: a byte
+field whose neighbours happen to be zero is a byte field nothing tests.
+
+Two mutants **SKIPPED on a bad anchor** (their text lives in the descriptor module,
+not the shader) and are recorded as untested rather than counted as killed.
+
+Suite **698/698** both memory modes.  Manifest still **270 of 501** — phase A is one
+of five pieces of `computeUnconstrainedVelocities1TLaunch`; the kernel is mapped
+when the chain is complete, not before.
 
 ## P8.71 — the last address map: the internal constraint block
 

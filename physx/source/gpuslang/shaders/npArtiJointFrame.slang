@@ -64,6 +64,8 @@
 // with NaNs for exactly the configurations a fixed joint produces.
 
 import pxgSlangCommon;
+import pxgSlangArticulationDesc;
+import pxgSlangArticulationBlocks;   // the PXG_AR_* record offsets (P8.70)
 
 // PxArticulationJointType (PxArticulationReducedCoordinate.h:301-306).
 //
@@ -283,4 +285,152 @@ void artiJointFrame(uint3 dispatchThreadId : SV_DispatchThreadID)
     r.mm2Top = float4(mm.top2, 0.0f);
     r.mm2Bottom = float4(mm.bottom2, 0.0f);
     o[idx] = r;
+}
+
+
+// ===========================================================================
+// P8.72: jcalc PHASE A -- the record-side recompute (forwardDynamic2.cu:379-432)
+// ===========================================================================
+//
+// Guarded by `confiDirty || dataDirty`, one thread per articulation (the CUDA is
+// single-threaded here too -- the "1T" in the caller's name).  It recomputes the
+// joint axes, motion matrices and relative quats INTO THE ARTICULATION RECORD,
+// and fills jointOffsets / cfmScale / cfms alongside.  The block-format copy is
+// a separate phase.
+//
+// The per-joint maths is the code above, already proven bit-exact against the
+// engine's own setJointFrame (P8.69).  What is new here is the loop, the dof
+// accumulation and five record writes.
+//
+// THE FLAG THAT IS EASY TO MISS: setJointFrame is a NO-OP unless the joint's
+// `jCalcUpdateFrames` byte is set, and it CLEARS that byte on the way out.  The
+// CUDA calls it unconditionally and lets the flag decide, so the port must read
+// and clear it too -- skipping that would recompute frames every frame for every
+// joint, which is not wrong numerically but is not what the engine does, and
+// leaving it set would be.
+
+struct JcalcAParams
+{
+    uint64_t articulation;   // one PxgArticulation record
+    float invLengthScale;
+    uint pad0;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<JcalcAParams> gJcalcA;
+
+// Cm::UnAlignedSpatialVector store: six tightly packed floats, no padding, so a
+// float3 store would be wrong at the 12-byte boundary.
+void ajStoreSpatialVector(uint64_t addr, float3 top, float3 bottom)
+{
+    Ptr<float> f = Ptr<float>(addr);
+    f[0] = top.x;    f[1] = top.y;    f[2] = top.z;
+    f[3] = bottom.x; f[4] = bottom.y; f[5] = bottom.z;
+}
+
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void artiJcalcPhaseA()
+{
+    const uint64_t a = gJcalcA.articulation;
+
+    const uint flags = artiU8Field(a, PXG_ARTI_DATA_FLAGS);
+    const bool confiDirty = artiU8Field(a, PXG_ARTI_DATA_CONFI_DIRTY) != 0u;
+    const bool dataDirty = artiU32Field(a, PXG_ARTI_DATA_UPDATE_DIRTY) != 0u;
+    if (!(confiDirty || dataDirty))
+        return;
+
+    const bool fixBase = (flags & PXG_ARTI_FLAG_FIX_BASE) != 0u;
+    const uint numLinks = artiU16Field(a, PXG_ARTI_DATA_NUM_LINKS);
+    const float invLengthScale = gJcalcA.invLengthScale;
+
+    const uint64_t links = artiPtrField(a, PXG_ARTI_LINKS);
+    const uint64_t props = artiPtrField(a, PXG_ARTI_LINK_PROPS);
+    const uint64_t joints = artiPtrField(a, PXG_ARTI_JOINTS);
+    const uint64_t jointData = artiPtrField(a, PXG_ARTI_JOINT_DATA);
+    const uint64_t jointAxis = artiPtrField(a, PXG_ARTI_JOINT_AXIS);
+    const uint64_t motionMatrix = artiPtrField(a, PXG_ARTI_MOTION_MATRIX);
+    const uint64_t relativeQuat = artiPtrField(a, PXG_ARTI_RELATIVE_QUAT);
+    Ptr<uint> jointOffsets = Ptr<uint>(artiPtrField(a, PXG_ARTI_JOINT_OFFSETS));
+    Ptr<float> cfmScale = Ptr<float>(artiPtrField(a, PXG_ARTI_CFM_SCALE));
+    Ptr<float> cfms = Ptr<float>(artiPtrField(a, PXG_ARTI_CFMS));
+
+    // the root, whose cfm is zero when the base is fixed
+    if (confiDirty)
+        cfmScale[0] = fixBase ? 0.0f
+            : asfloat((Ptr<uint>(links + PXG_ARTI_LINK_CFM_SCALE))[0]) * invLengthScale;
+    if (dataDirty)
+        cfms[0] = fixBase ? 0.0f
+            : asfloat((Ptr<uint>(props + PXG_ARTI_LINK_PROP_INV_MASS))[0]) * cfmScale[0];
+
+    uint totalDofs = 0u;
+    for (uint linkID = 1u; linkID < numLinks; ++linkID)
+    {
+        const uint64_t jd = jointData + uint64_t(linkID) * PXG_ARTI_JOINT_CORE_DATA_SIZE;
+        const uint dof = artiU8Field(jd, PXG_AR_JCD_nbDof);     // PxU8, not PxU32
+        const uint offset = artiU32Field(jd, PXG_AR_JCD_jointOffset);
+
+        const uint64_t jc = joints + uint64_t(linkID) * PXG_ARTI_JOINT_CORE_SIZE;
+        const uint dofIdWord = artiU32Field(jc, PXG_AR_JOINT_dofIds);
+
+        // computeJointAxis: dof unit spatial vectors at jointAxis[totalDofs..]
+        for (uint i = 0u; i < 3u; ++i)
+        {
+            if (i < dof)
+                ajStoreSpatialVector(
+                    jointAxis + uint64_t(totalDofs + i) * PXG_ARTI_SPATIAL_VECTOR_SIZE,
+                    ajAxisTop(dofIdWord, i), ajAxisBottom(dofIdWord, i));
+        }
+
+        // setJointFrame, flag and all
+        if (artiU8Field(jc, PXG_AR_JOINT_jCalcUpdateFrames) != 0u)
+        {
+            const uint jointType = artiU8Field(jc, PXG_AR_JOINT_jointType);
+            const float4 parentQ = float4(asfloat((Ptr<uint>(jc + PXG_AR_JOINT_parentPose))[0]),
+                                          asfloat((Ptr<uint>(jc + PXG_AR_JOINT_parentPose))[1]),
+                                          asfloat((Ptr<uint>(jc + PXG_AR_JOINT_parentPose))[2]),
+                                          asfloat((Ptr<uint>(jc + PXG_AR_JOINT_parentPose))[3]));
+            // PxTransform is { PxQuat q; PxVec3 p; } -- q first, then p at +16
+            const float4 childQ = float4(asfloat((Ptr<uint>(jc + PXG_AR_JOINT_childPose))[0]),
+                                         asfloat((Ptr<uint>(jc + PXG_AR_JOINT_childPose))[1]),
+                                         asfloat((Ptr<uint>(jc + PXG_AR_JOINT_childPose))[2]),
+                                         asfloat((Ptr<uint>(jc + PXG_AR_JOINT_childPose))[3]));
+            const float3 childP = float3(asfloat((Ptr<uint>(jc + PXG_AR_JOINT_childPose))[4]),
+                                         asfloat((Ptr<uint>(jc + PXG_AR_JOINT_childPose))[5]),
+                                         asfloat((Ptr<uint>(jc + PXG_AR_JOINT_childPose))[6]));
+
+            const float4 conj = float4(-parentQ.x, -parentQ.y, -parentQ.z, parentQ.w);
+            const float4 prod = quatMul(childQ, conj);
+            const float m = prod.x * prod.x + prod.y * prod.y + prod.z * prod.z + prod.w * prod.w;
+            const float4 rq = prod * (1.0f / sqrt(m));
+
+            Ptr<uint> rqOut = Ptr<uint>(relativeQuat + uint64_t(linkID) * PXG_ARTI_QUAT_SIZE);
+            rqOut[0] = asuint(rq.x); rqOut[1] = asuint(rq.y);
+            rqOut[2] = asuint(rq.z); rqOut[3] = asuint(rq.w);
+
+            const AjMotionMatrix mm =
+                ajComputeMotionMatrix(jointType, dof, childQ, childP, dofIdWord);
+            const uint64_t mmBase = motionMatrix + uint64_t(linkID) * PXG_ARTI_SUBSPACE_STRIDE;
+            ajStoreSpatialVector(mmBase + 0u * PXG_ARTI_SPATIAL_VECTOR_SIZE, mm.top0, mm.bottom0);
+            ajStoreSpatialVector(mmBase + 1u * PXG_ARTI_SPATIAL_VECTOR_SIZE, mm.top1, mm.bottom1);
+            ajStoreSpatialVector(mmBase + 2u * PXG_ARTI_SPATIAL_VECTOR_SIZE, mm.top2, mm.bottom2);
+
+            artiStoreU8Field(jc, PXG_AR_JOINT_jCalcUpdateFrames, 0u);
+        }
+
+        jointOffsets[linkID] = offset;
+
+        if (confiDirty)
+            cfmScale[linkID] = asfloat((Ptr<uint>(links + uint64_t(linkID) * PXG_ARTI_LINK_SIZE
+                                                  + PXG_ARTI_LINK_CFM_SCALE))[0]) * invLengthScale;
+        if (dataDirty)
+            cfms[linkID] = asfloat((Ptr<uint>(props + uint64_t(linkID) * PXG_ARTI_LINK_PROP_SIZE
+                                              + PXG_ARTI_LINK_PROP_INV_MASS))[0]) * cfmScale[linkID];
+
+        totalDofs += dof;
+    }
+
+    // confiDirty is cleared; updateDirty deliberately is NOT -- the CUDA holds on
+    // to it until the block copy in phase C has consumed it.
+    artiStoreU8Field(a, PXG_ARTI_DATA_CONFI_DIRTY, 0u);
 }

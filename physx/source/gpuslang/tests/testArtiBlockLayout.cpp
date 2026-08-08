@@ -260,6 +260,23 @@ static_assert(offsetof(PxgArticulationInternalConstraintData, mViscousFrictionCo
 static_assert(sizeof(Dy::SpatialSubspaceMatrix) == 80, "PXG_AR_SUBSPACE_SIZE");
 static_assert(offsetof(Dy::SpatialSubspaceMatrix, columns) == 0, "PXG_AR_SUBSPACE_COLUMNS");
 static_assert(sizeof(Cm::UnAlignedSpatialVector) == 24, "PXG_AR_SPATIAL_VECTOR_SIZE");
+static_assert(offsetof(PxgArticulation, jointAxis) == 232, "PXG_ARTI_jointAxis");
+static_assert(offsetof(PxgArticulation, motionMatrix) == 216, "PXG_ARTI_motionMatrix");
+static_assert(offsetof(PxgArticulation, relativeQuat) == 280, "PXG_ARTI_relativeQuat");
+static_assert(offsetof(PxgArticulation, jointOffsets) == 160, "PXG_ARTI_jointOffsets");
+static_assert(offsetof(PxgArticulation, cfmScale) == 344, "PXG_ARTI_cfmScale");
+static_assert(offsetof(PxgArticulation, cfms) == 336, "PXG_ARTI_cfms");
+static_assert(offsetof(PxgArticulationData, flags) == 26, "PXG_ARTI_DATA_FLAGS");
+static_assert(offsetof(PxgArticulationData, confiDirty) == 27, "PXG_ARTI_DATA_CONFI_DIRTY");
+static_assert(offsetof(PxgArticulationData, updateDirty) == 12, "PXG_ARTI_DATA_UPDATE_DIRTY");
+static_assert(offsetof(PxgArticulationLinkProp, invMass) == 12, "PXG_ARTI_LINK_PROP_INV_MASS");
+static_assert(offsetof(PxgArticulationLink, cfmScale) == 72, "PXG_ARTI_LINK_CFM_SCALE");
+static_assert(uint32_t(PxArticulationFlag::eFIX_BASE) == 1, "PXG_ARTI_FLAG_FIX_BASE");
+static_assert(sizeof(Dy::SpatialSubspaceMatrix) == 80, "PXG_ARTI_SUBSPACE_STRIDE");
+static_assert(sizeof(PxQuat) == 16, "PXG_ARTI_QUAT_SIZE");
+static_assert(sizeof(PxgArticulationData::flags) == 1, "flags is a byte");
+static_assert(sizeof(PxgArticulationData::confiDirty) == 1, "confiDirty is a byte");
+static_assert(sizeof(PxgArticulationData::updateDirty) == 4, "updateDirty is a word");
 } // namespace pin
 
 // distinct sentinels: element index and lane both enter every value, so no two

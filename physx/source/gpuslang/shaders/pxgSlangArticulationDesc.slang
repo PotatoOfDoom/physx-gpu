@@ -224,6 +224,46 @@ public static const uint PXG_BODY_SIM_SIZE = 224;
 public static const uint PXG_BODY_SIM_ARTICULATION_REMAP_ID = 176;
 
 // ---------------------------------------------------------------------------
+// The fields jcalc's phase A recomputes (P8.72).  Note the two SINGLE BYTES
+// sharing one word: `flags` at 26 and `confiDirty` at 27.  Writing confiDirty
+// therefore means a read-modify-write of that word, which is safe here only
+// because phase A runs one thread per articulation -- no other thread touches
+// this record concurrently.  `updateDirty` is a PxU32 at 12 and needs no such
+// care.  (Widths measured, not inferred: the ArticulationJointCoreData::nbDof
+// byte in P8.70 is why.)
+// ---------------------------------------------------------------------------
+public static const uint PXG_ARTI_JOINT_AXIS                             =    232;
+public static const uint PXG_ARTI_MOTION_MATRIX                          =    216;
+public static const uint PXG_ARTI_RELATIVE_QUAT                          =    280;
+public static const uint PXG_ARTI_JOINT_OFFSETS                          =    160;
+public static const uint PXG_ARTI_CFM_SCALE                              =    344;
+public static const uint PXG_ARTI_CFMS                                   =    336;
+public static const uint PXG_ARTI_DATA_FLAGS                            =     26;
+public static const uint PXG_ARTI_DATA_CONFI_DIRTY                      =     27;
+public static const uint PXG_ARTI_DATA_UPDATE_DIRTY                     =     12;
+public static const uint PXG_ARTI_LINK_PROP_INV_MASS                    =     12;
+public static const uint PXG_ARTI_LINK_CFM_SCALE                        =     72;
+public static const uint PXG_ARTI_FLAG_FIX_BASE                         =      1;
+public static const uint PXG_ARTI_SUBSPACE_STRIDE                       =     80;
+public static const uint PXG_ARTI_QUAT_SIZE                             =     16;
+
+// reads a single byte out of a record, via the containing word
+public uint artiU8Field(uint64_t rec, uint fieldByteOffset)
+{
+    const uint word = (Ptr<uint>(rec + uint64_t(fieldByteOffset & ~3u)))[0];
+    return (word >> ((fieldByteOffset & 3u) * 8u)) & 0xFFu;
+}
+
+// writes a single byte, preserving the other three in its word.  Single-writer
+// only -- see the note above.
+public void artiStoreU8Field(uint64_t rec, uint fieldByteOffset, uint value)
+{
+    Ptr<uint> w = Ptr<uint>(rec + uint64_t(fieldByteOffset & ~3u));
+    const uint shift = (fieldByteOffset & 3u) * 8u;
+    w[0] = (w[0] & ~(0xFFu << shift)) | ((value & 0xFFu) << shift);
+}
+
+// ---------------------------------------------------------------------------
 // Field accessors
 // ---------------------------------------------------------------------------
 
