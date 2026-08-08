@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **693/693** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **694/694** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1694,6 +1694,127 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.65 — MILESTONE: the articulation scene runs 240 steps
+
+`newArticulationsLaunch` (updateBodiesAndShapes.cu:228) is mapped, and with it the
+articulation scene stops crashing and starts *reporting*:
+
+| | dispatches before it dies |
+|---|---|
+| P8.55 (articulation alone) | 52 — `initializeSolverVelocitiesTGS` |
+| P8.60 (+ one companion rigid body) | 67 — `updateTransformCacheAndBoundArrayLaunch` |
+| **P8.65 (pool filled)** | **16279 — it does not die** |
+
+240 steps, exit 2 instead of SIGSEGV, and the engine names the six kernels it still
+cannot launch: `artiContactConstraintPrepare`, `artiPropagateVelocity`,
+`artiPropagateImpulses2`, `artiSolveInternalTendonAndMimicJointConstraints1T`,
+`solveInternalConstraints`, `solveSelfConstraints`.  That is Phase 0's whole point:
+the scene now names its own next kernel, which is how the softbody and
+convex-trimesh chains were built.
+
+The physics is of course wrong — the link snaps from y=3 to y=0 in one step and the
+companion box hangs at y=3.73 instead of resting at 0.5 — because the six solver
+kernels above are exactly the ones that would hold the joint together.  The scene
+reports both as FAIL rather than pretending otherwise.
+
+**What the kernel does.**  The host builds one 544-byte `PxgArticulation` record per
+new articulation — device pointers into buffers it has just allocated
+(PxgSimulationCore.cpp:884-933) — and stages them.  This kernel copies each record
+into the persistent `mArticulationPool` at its own `data.index`, zeroes the
+articulation's solver sleep data, and then fills every array those pointers name:
+links, wake counters, link props, parents, children, both link transform arrays,
+joint cores and joint data, spatial and fixed tendons (including the per-tendon
+attachment / tendon-joint element copies reached *through* the tendon records),
+mimic joint cores, the path-to-root table, the zeroed per-link state, and the five
+dof arrays — each taken from `dofData` or zeroed depending on its dirty flag.
+
+**Three transcription decisions, each load-bearing.**
+
+*Every copy is a u32 copy.*  The CUDA walks each array with `warpCopy<T>` at a `T`
+chosen for coalescing — uint4 for the aligned blocks, uint2 for spatial vectors,
+uint for the 28-byte transforms.  `warpCopy` is an elementwise strided copy over a
+destination that never overlaps its source, so the bytes that land in memory do not
+depend on the element width used to walk them; every `totalSize` here is a multiple
+of 4, and every value-fill is ZERO, which has the same bytes at every width.  The
+width is a CUDA performance choice and nothing else.  This is bit-exact, not an
+approximation — and it drops `warpCopy`'s 16-byte alignment assertions, which the
+u32 form does not need.
+
+*The shared-memory staging is gone, and it had to go.*  The CUDA stages the record
+in shared memory, `__syncwarp()`s, copies shared -> pool, then reads the record's
+pointer fields from the shared copy.  The source is never written, so reading those
+fields straight from it is identical.  Keeping the staging would have been unsafe:
+the workgroup is (32, 8, 1) and the whole body sits under
+`globalWarpIndex < nbArticulations`, a guard that varies with `threadIdx.y` — so a
+`GroupMemoryBarrierWithGroupSync()` inside it is a barrier in control flow that is
+NOT uniform across the workgroup, and llvmpipe HANGS on those instead of erroring.
+There is no cross-lane communication anywhere in this kernel, so no barrier is
+needed at all.
+
+*One engine quirk transcribed, not fixed.*  `numJointDofs` is a PxU16 that the CUDA
+reads twice at different widths: `const PxU8 dofs` sizes the zero-fills, `const
+PxU32 numDofs` sizes the copies from `dofData`.  Above 255 dofs (64 links x up to 6
+is reachable) they disagree and the else-branches would zero only `dofs & 0xFF`
+entries.  Kept exactly as written.
+
+**Verification.**  `gpuslang.newArticulations` drives ten articulations across TWO
+blocks of eight virtual warps.  The count is not decoration: with a single block the
+`groupId.x * NA_WARPS_PER_BLOCK` term is always zero and a wrong warps-per-block
+constant is invisible, so the two interesting articulations sit at warp indices 8
+and 9.  They differ in every way that could hide a bug — pool slots 3 and 1 (neither
+equals its warp index, and slots 0/2/12 must stay poisoned), source slices starting
+at link 1 and link 5, one with a spatial tendon + a fixed tendon + two mimic joints
+and one with none, and dirty flags chosen so that for each of the five dof arrays one
+articulation copies while the other zero-fills.  Every destination is checked
+byte-exactly against the source pool, and 64 poison bytes past each region catch
+overruns.  Every layout constant is pinned to host-side `sizeof`/`offsetof` of the
+real engine structs by `static_assert` — the P8.49a lesson: a fixture carrying its
+own copy of a constant cannot detect that the constant is wrong.
+
+**Sweep: 47 of 50 mutants killed.**  The three survivors, with proofs rather than
+excuses:
+
+* **the PxU8 dof truncation dropped.**  The intended control.  The fixture's dof
+  counts are 5 and 2, so truncating to 8 bits changes nothing; separating the two
+  reads needs an articulation with more than 255 dofs, i.e. 43+ links.  It survives
+  by construction, and it is what shows the sweep is not simply rejecting every edit.
+* **the copy stride lowered from 32 to 8.**  Lanes 0-7 still cover every index;
+  lanes 8-31 rewrite the same values from the same source.  Coverage becomes a strict
+  SUPERSET and the writes are idempotent, so the result is identical.  The constant
+  matters in the *other* direction and that is tested: stride 64 loses elements and
+  dies (both for the copy and, after the fixture grew A to six links so the largest
+  zero-fill exceeds 32 words, for the fill).
+* **warps-per-block lowered from 8 to 4.**  Same shape of invariance: block 1's base
+  becomes 4 instead of 8, so articulations 4-7 are processed twice — idempotently —
+  and 8 and 9 are still reached.  Raising it to 16 SKIPS articulations 8 and 9 and
+  dies.
+
+Two mutants survived the first sweep as genuine coverage gaps and the fixture was
+changed to close them, not written off: the offset advance after the FORCES copy was
+dead (nothing dirty followed it on either articulation) and the TARGET_POS/TARGET_VEL
+bits were indistinguishable (one articulation had neither, the other had both).
+Giving A `JOINT_TARGET_POS` but not `JOINT_TARGET_VEL` kills both.
+
+Suite **694/694** in both memory modes (693 + `gpuslang.newArticulations`); manifest
+**269 of 501**.  All twenty P8.54 scenes still green (`box stack plane sphere capsule
+capsulebox convex joint meshfloor particle cloth clothhang clothdrape
+clothselfcollide clothcloth softbody softbodyselfcollide softbodycloth softbodystack
+softbodyattach`), so mapping this kernel changed nothing for the scenes that never
+build an articulation.  `gpuslang.p4Wrangler` caught the audited mapped count still
+reading 268 and was the reason it got bumped — that guard works.
+
+### Correction to P8.64: `PXG_SYNC_EACH` already existed
+
+P8.64 said it "ships the diagnostic".  It did not — `PXG_SYNC_EACH` has been in
+`PxgCudaShim::launchKernel` since commit 5c44c1c, with a comment describing exactly
+the attribution problem P8.61-P8.63 then spent three tranches failing to solve.
+What P8.64 actually added was a second, redundant implementation of it one layer up
+in `PxgVulkanCudaContext`; that duplicate is reverted here, and the `traceDispatch`
+comment now points at the knob that exists.
+
+The real lesson is worse than the one P8.64 drew, and worth keeping: the tool was
+already there and documented. Nothing was missing but the decision to reach for it.
+
 ## P8.64 — the fault was never in dispatch 67; four tranches chased the wrong kernel
 
 Two answers, and the second invalidates the question the first answered.
@@ -2234,7 +2355,7 @@ kernels are ones no scene reaches, not because the port is finished.
 
 | Count | Block | Note |
 |---|---|---|
-| ~85 | **articulations** | 69 `arti*` plus `computeUnconstrained*`, `updateBodies*`, `setupInternalConstraint*`, `accumulateDeltaVRigid*`, `getD6Joint*` |
+| ~85 | **articulations** | 69 `arti*` plus `computeUnconstrained*`, `updateBodies*`, `setupInternalConstraint*`, `accumulateDeltaVRigid*`, `getD6Joint*` — **both numbers are WRONG, see the correction below** |
 | ~45 | isosurface + sparse grid (`iso_*`, `sg_*`) | fluid surface extraction, not simulation |
 | 31 | particle variants (`ps_*`) | paths the one particle scene does not take |
 | 22 | SDF (13) + BVH build (9) | SDF collision and its tree build |
@@ -2243,6 +2364,14 @@ kernels are ones no scene reaches, not because the port is finished.
 | 5 | convex-core | the newer contact-gen path |
 | 7 | broadphase merge / frozen-unfrozen | |
 | 2 | trimesh-vs-trimesh | |
+
+*Correction (P8.65).* The "~85" and the "69 `arti*`" in that table are both
+inflated by a substring match: `arti` also matches every **p·arti·cle** kernel, so
+the particle rows were counted twice — once as particles and once as
+articulations.  Counted properly the articulation block is **65 kernels** (49 core
+plus 16 solver-side), and the particle block is 45, not 31.  The conclusion the
+table draws is unaffected — articulations are still the largest coherent block and
+still the next frontier — but the figure carried into planning should be 65.
 
 **Articulations are the next frontier, and it is not close.**  They are the single
 biggest coherent block, they are a headline PhysX feature — ragdolls, robots,

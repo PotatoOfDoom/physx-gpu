@@ -1101,6 +1101,13 @@ static const PxgKernelAbiRow kRows[] = {
     // updateBodiesAndShapes.cu: updateJointsLaunch(const PxgUpdatedJointsDesc*)
     // -> single device pointer {8} (P5 Step 5 tranche 12: the joint CPU->GPU scatter)
     { "updateJointsLaunch", kOnePtr, 1u },
+    // updateBodiesAndShapes.cu:228 newArticulationsLaunch(
+    //     const PxgUpdateArticulationDesc*, const PxReal* dofData)
+    // -> kTwoPtr (16 bytes).  hostPtrMask stays 0: the descriptor is a device
+    // buffer address and the engine already resolves dofData through
+    // getMappedDevicePtr before the launch (PxgSimulationCore.cpp:2376), so
+    // neither argument reaches us as a raw pinned-host pointer.  (P8.65)
+    { "newArticulationsLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

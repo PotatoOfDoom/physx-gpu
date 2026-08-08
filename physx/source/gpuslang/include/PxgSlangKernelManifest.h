@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 268;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 269;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -24,7 +24,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "updateShapesLaunch", "bodyUpdate.spv", "updateShapesLaunch" },  // UPDATE_SHAPES
     { "updateBodiesLaunch", "bodyUpdate.spv", "updateBodiesLaunch" },  // UPDATE_BODIES
     { "updateBodiesLaunchDirectAPI", "bodyUpdate.spv", "updateBodiesLaunchDirectAPI" },  // UPDATE_BODIES_DIRECT_API
-    { "newArticulationsLaunch", nullptr, nullptr },  // NEW_ARTICULATIONS (unmapped)
+    { "newArticulationsLaunch", "newArticulationsBda.spv", "newArticulationsLaunch" },  // NEW_ARTICULATIONS (P8.65 BDA)
     { "updateArticulationsLaunch", nullptr, nullptr },  // UPDATE_ARTICULATIONS (unmapped)
     { "updateJointsLaunch", "bodyUpdate.spv", "updateJointsLaunch" },  // UPDATE_JOINTS (P5 Step 5 BDA port)
     { "updateTransformCacheAndBoundArrayLaunch", "updateBounds.spv", "updateTransformCacheAndBoundArrayLaunch" },  // UPDATE_TRANSFORMCACHE_AND_BOUNDARRAY
