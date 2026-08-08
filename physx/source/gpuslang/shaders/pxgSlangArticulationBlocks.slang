@@ -113,6 +113,66 @@ public static const uint PXG_AB_DOF_mMotion                             =   5408
 public static const uint PXG_AB_DOF_mConstraintData                     =   5440;
 
 // ---------------------------------------------------------------------------
+// PxgArticulationBlockLinkData (29184 bytes) — the largest of the three, and
+// the one the link loops walk.  Deferred out of the first block tranche so the
+// map's infrastructure and its biggest consumer could be reviewed separately.
+//
+// Note the two irregular members among the otherwise uniform [32] arrays:
+//   * mInvDofIds is PxU8[6][32] — a 6 x 32 table, so its element stride is 32
+//     bytes per AXIS and the lane indexes within a row.  Reading it like the
+//     neighbouring PxU8[32] fields silently lands on axis 0 only.
+//   * mSpatialResponseMatrix is a 6x6 block (9 float4 columns, 4608 bytes), not
+//     the 7-column 3584-byte PxgSpatialMatrixBlock immediately before it.
+// ---------------------------------------------------------------------------
+public static const uint PXG_AB_LINK_SIZE                                     =  29184;
+public static const uint PXG_AB_SPATIAL_MATRIX_6X6_BLOCK_SIZE                 =   4608;
+public static const uint PXG_AB_LINK_mSpatialArticulatedInertia               =      0;
+public static const uint PXG_AB_LINK_mSpatialResponseMatrix                   =   3584;
+public static const uint PXG_AB_LINK_mIsolatedInertia                         =   8192;
+public static const uint PXG_AB_LINK_mMass                                    =   9344;
+public static const uint PXG_AB_LINK_mMotionVelocity                          =   9472;
+public static const uint PXG_AB_LINK_mPosMotionVelocity                       =  10240;
+public static const uint PXG_AB_LINK_mDeltaMotion                             =  11008;
+public static const uint PXG_AB_LINK_mScratchImpulse                          =  11776;
+public static const uint PXG_AB_LINK_mScratchDeltaV                           =  12544;
+public static const uint PXG_AB_LINK_mSolverSpatialDeltaVel                   =  13312;
+public static const uint PXG_AB_LINK_mSolverSpatialImpulse                    =  14080;
+public static const uint PXG_AB_LINK_mSolverSpatialInternalConstraintImpulse  =  14848;
+public static const uint PXG_AB_LINK_mZAVector                                =  15616;
+public static const uint PXG_AB_LINK_mZAIntVector                             =  16384;
+public static const uint PXG_AB_LINK_mCoriolis                                =  17152;
+public static const uint PXG_AB_LINK_mConstraintForces                        =  17920;
+public static const uint PXG_AB_LINK_mMotionAcceleration                      =  18688;
+public static const uint PXG_AB_LINK_mMotionAccelerationInternal              =  19456;
+public static const uint PXG_AB_LINK_mBiasForce                               =  20224;
+public static const uint PXG_AB_LINK_mDeltaScale                              =  20992;
+public static const uint PXG_AB_LINK_mRw_x                                    =  21120;
+public static const uint PXG_AB_LINK_mRw_y                                    =  21248;
+public static const uint PXG_AB_LINK_mRw_z                                    =  21376;
+public static const uint PXG_AB_LINK_mRelativeQuat                            =  21504;
+public static const uint PXG_AB_LINK_mNbStaticContacts                        =  22016;
+public static const uint PXG_AB_LINK_mStaticContactStartIndex                 =  22144;
+public static const uint PXG_AB_LINK_mNbStaticJoints                          =  22272;
+public static const uint PXG_AB_LINK_mStaticJointStartIndex                   =  22400;
+public static const uint PXG_AB_LINK_mPreTransform                            =  22528;
+public static const uint PXG_AB_LINK_mAccumulatedPose                         =  23552;
+public static const uint PXG_AB_LINK_mChildPose                               =  24576;
+public static const uint PXG_AB_LINK_mParentPose                              =  25600;
+public static const uint PXG_AB_LINK_mDeltaQ                                  =  26624;
+public static const uint PXG_AB_LINK_mLinDampingX_AngDampingY_maxLinVelSqZ_maxAngVelSqW =  27136;
+public static const uint PXG_AB_LINK_mInvInertiaXYZ_invMassW                  =  27648;
+public static const uint PXG_AB_LINK_mCfm                                     =  28160;
+public static const uint PXG_AB_LINK_mChildrenOffset                          =  28288;
+public static const uint PXG_AB_LINK_mNumChildren                             =  28416;
+public static const uint PXG_AB_LINK_mJointOffset                             =  28544;
+public static const uint PXG_AB_LINK_mParents                                 =  28672;
+public static const uint PXG_AB_LINK_mDofs                                    =  28800;
+public static const uint PXG_AB_LINK_mJointType                               =  28832;
+public static const uint PXG_AB_LINK_mInvDofIds                               =  28864;
+public static const uint PXG_AB_LINK_mDisableGravity                          =  29056;
+public static const uint PXG_AB_LINK_mRetainsAcceleration                     =  29088;
+
+// ---------------------------------------------------------------------------
 // Lane accessors.  `base` is the address of the block element (i.e. the array
 // base plus warpIndex * stride); `fieldOffset` is one of the constants above.
 // ---------------------------------------------------------------------------

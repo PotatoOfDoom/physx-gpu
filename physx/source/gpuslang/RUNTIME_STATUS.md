@@ -1694,6 +1694,34 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.68 — the link block, the last 29 KB of the map
+
+`PxgArticulationBlockLinkData` is mapped: 47 fields across 29184 bytes, every one
+generated from the engine header, probed at element [1] lane 3, and swept.  The
+articulation block-layout map is now complete — `computeUnconstrainedVelocities1TLaunch`
+and the `jcalc` chain are writable.
+
+**Two irregular members, and both are the kind that a uniform-looking header hides:**
+
+* **`mSpatialResponseMatrix` is a 6x6 block (9 float4 columns, 4608 bytes), not the
+  7-column 3584-byte `PxgSpatialMatrixBlock` immediately before it.**  Two matrix
+  blocks, adjacent, differently sized.  Reading the second at the first's stride is
+  the natural mistake and it lands inside the same struct, so it corrupts quietly
+  rather than faulting.  The probe reads column 8 — which does not exist in the
+  7-column block — so the confusion cannot survive.
+* **`mInvDofIds` is `PxU8[6][32]`, axis-major.**  Every neighbour in that byte run
+  (`mDofs`, `mJointType`, `mDisableGravity`, `mRetainsAcceleration`) is a plain
+  `PxU8[32]`, so the natural read returns axis 0 for every axis.  The probe reads
+  axes 0, 2 and 5 with a distinct value per (axis, lane), which pins the row stride
+  as well as the base.
+
+**Sweep: 28 of 28 killed** — every field offset moved onto its neighbour, both
+irregular members attacked at their specific weakness, and the struct stride tested
+with and without the tail padding.  No survivors, so nothing here needs an excuse.
+
+The probe now checks **106 values**.  Suite **696/696** both memory modes; manifest
+still **270 of 501** — again, this maps no kernel.
+
 ## P8.67 — the articulation block-layout address map
 
 `computeUnconstrainedVelocities1TLaunch` is a thin wrapper around a device

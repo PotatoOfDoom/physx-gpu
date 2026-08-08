@@ -129,6 +129,53 @@ static_assert(offsetof(PxgArticulationBlockDofData, mInvStIsT_z) == 5248, "PXG_A
 static_assert(offsetof(PxgArticulationBlockDofData, mDofIds) == 5376, "PXG_AB_DOF_mDofIds");
 static_assert(offsetof(PxgArticulationBlockDofData, mMotion) == 5408, "PXG_AB_DOF_mMotion");
 static_assert(offsetof(PxgArticulationBlockDofData, mConstraintData) == 5440, "PXG_AB_DOF_mConstraintData");
+static_assert(sizeof(PxgArticulationBlockLinkData) == 29184, "PXG_AB_LINK_SIZE");
+static_assert(sizeof(PxgSpatialMatrix6x6Block) == 4608, "PXG_AB_SPATIAL_MATRIX_6X6_BLOCK_SIZE");
+static_assert(offsetof(PxgArticulationBlockLinkData, mSpatialArticulatedInertia) == 0, "PXG_AB_LINK_mSpatialArticulatedInertia");
+static_assert(offsetof(PxgArticulationBlockLinkData, mSpatialResponseMatrix) == 3584, "PXG_AB_LINK_mSpatialResponseMatrix");
+static_assert(offsetof(PxgArticulationBlockLinkData, mIsolatedInertia) == 8192, "PXG_AB_LINK_mIsolatedInertia");
+static_assert(offsetof(PxgArticulationBlockLinkData, mMass) == 9344, "PXG_AB_LINK_mMass");
+static_assert(offsetof(PxgArticulationBlockLinkData, mMotionVelocity) == 9472, "PXG_AB_LINK_mMotionVelocity");
+static_assert(offsetof(PxgArticulationBlockLinkData, mPosMotionVelocity) == 10240, "PXG_AB_LINK_mPosMotionVelocity");
+static_assert(offsetof(PxgArticulationBlockLinkData, mDeltaMotion) == 11008, "PXG_AB_LINK_mDeltaMotion");
+static_assert(offsetof(PxgArticulationBlockLinkData, mScratchImpulse) == 11776, "PXG_AB_LINK_mScratchImpulse");
+static_assert(offsetof(PxgArticulationBlockLinkData, mScratchDeltaV) == 12544, "PXG_AB_LINK_mScratchDeltaV");
+static_assert(offsetof(PxgArticulationBlockLinkData, mSolverSpatialDeltaVel) == 13312, "PXG_AB_LINK_mSolverSpatialDeltaVel");
+static_assert(offsetof(PxgArticulationBlockLinkData, mSolverSpatialImpulse) == 14080, "PXG_AB_LINK_mSolverSpatialImpulse");
+static_assert(offsetof(PxgArticulationBlockLinkData, mSolverSpatialInternalConstraintImpulse) == 14848, "PXG_AB_LINK_mSolverSpatialInternalConstraintImpulse");
+static_assert(offsetof(PxgArticulationBlockLinkData, mZAVector) == 15616, "PXG_AB_LINK_mZAVector");
+static_assert(offsetof(PxgArticulationBlockLinkData, mZAIntVector) == 16384, "PXG_AB_LINK_mZAIntVector");
+static_assert(offsetof(PxgArticulationBlockLinkData, mCoriolis) == 17152, "PXG_AB_LINK_mCoriolis");
+static_assert(offsetof(PxgArticulationBlockLinkData, mConstraintForces) == 17920, "PXG_AB_LINK_mConstraintForces");
+static_assert(offsetof(PxgArticulationBlockLinkData, mMotionAcceleration) == 18688, "PXG_AB_LINK_mMotionAcceleration");
+static_assert(offsetof(PxgArticulationBlockLinkData, mMotionAccelerationInternal) == 19456, "PXG_AB_LINK_mMotionAccelerationInternal");
+static_assert(offsetof(PxgArticulationBlockLinkData, mBiasForce) == 20224, "PXG_AB_LINK_mBiasForce");
+static_assert(offsetof(PxgArticulationBlockLinkData, mDeltaScale) == 20992, "PXG_AB_LINK_mDeltaScale");
+static_assert(offsetof(PxgArticulationBlockLinkData, mRw_x) == 21120, "PXG_AB_LINK_mRw_x");
+static_assert(offsetof(PxgArticulationBlockLinkData, mRw_y) == 21248, "PXG_AB_LINK_mRw_y");
+static_assert(offsetof(PxgArticulationBlockLinkData, mRw_z) == 21376, "PXG_AB_LINK_mRw_z");
+static_assert(offsetof(PxgArticulationBlockLinkData, mRelativeQuat) == 21504, "PXG_AB_LINK_mRelativeQuat");
+static_assert(offsetof(PxgArticulationBlockLinkData, mNbStaticContacts) == 22016, "PXG_AB_LINK_mNbStaticContacts");
+static_assert(offsetof(PxgArticulationBlockLinkData, mStaticContactStartIndex) == 22144, "PXG_AB_LINK_mStaticContactStartIndex");
+static_assert(offsetof(PxgArticulationBlockLinkData, mNbStaticJoints) == 22272, "PXG_AB_LINK_mNbStaticJoints");
+static_assert(offsetof(PxgArticulationBlockLinkData, mStaticJointStartIndex) == 22400, "PXG_AB_LINK_mStaticJointStartIndex");
+static_assert(offsetof(PxgArticulationBlockLinkData, mPreTransform) == 22528, "PXG_AB_LINK_mPreTransform");
+static_assert(offsetof(PxgArticulationBlockLinkData, mAccumulatedPose) == 23552, "PXG_AB_LINK_mAccumulatedPose");
+static_assert(offsetof(PxgArticulationBlockLinkData, mChildPose) == 24576, "PXG_AB_LINK_mChildPose");
+static_assert(offsetof(PxgArticulationBlockLinkData, mParentPose) == 25600, "PXG_AB_LINK_mParentPose");
+static_assert(offsetof(PxgArticulationBlockLinkData, mDeltaQ) == 26624, "PXG_AB_LINK_mDeltaQ");
+static_assert(offsetof(PxgArticulationBlockLinkData, mLinDampingX_AngDampingY_maxLinVelSqZ_maxAngVelSqW) == 27136, "PXG_AB_LINK_mLinDampingX_AngDampingY_maxLinVelSqZ_maxAngVelSqW");
+static_assert(offsetof(PxgArticulationBlockLinkData, mInvInertiaXYZ_invMassW) == 27648, "PXG_AB_LINK_mInvInertiaXYZ_invMassW");
+static_assert(offsetof(PxgArticulationBlockLinkData, mCfm) == 28160, "PXG_AB_LINK_mCfm");
+static_assert(offsetof(PxgArticulationBlockLinkData, mChildrenOffset) == 28288, "PXG_AB_LINK_mChildrenOffset");
+static_assert(offsetof(PxgArticulationBlockLinkData, mNumChildren) == 28416, "PXG_AB_LINK_mNumChildren");
+static_assert(offsetof(PxgArticulationBlockLinkData, mJointOffset) == 28544, "PXG_AB_LINK_mJointOffset");
+static_assert(offsetof(PxgArticulationBlockLinkData, mParents) == 28672, "PXG_AB_LINK_mParents");
+static_assert(offsetof(PxgArticulationBlockLinkData, mDofs) == 28800, "PXG_AB_LINK_mDofs");
+static_assert(offsetof(PxgArticulationBlockLinkData, mJointType) == 28832, "PXG_AB_LINK_mJointType");
+static_assert(offsetof(PxgArticulationBlockLinkData, mInvDofIds) == 28864, "PXG_AB_LINK_mInvDofIds");
+static_assert(offsetof(PxgArticulationBlockLinkData, mDisableGravity) == 29056, "PXG_AB_LINK_mDisableGravity");
+static_assert(offsetof(PxgArticulationBlockLinkData, mRetainsAcceleration) == 29088, "PXG_AB_LINK_mRetainsAcceleration");
 } // namespace pin
 
 // distinct sentinels: element index and lane both enter every value, so no two
@@ -149,7 +196,7 @@ PXG_TEST(artiBlockLayout)
 
     PxgSlangComputeDevice* dev = testDevice();
     const PxgKernelDef manifest[] = {
-        { "npArtiBlockProbe.spv", "artiBlockProbe", 40u, 0 }, // { u64 x5 }
+        { "npArtiBlockProbe.spv", "artiBlockProbe", 48u, 0 }, // { u64 x6 }
     };
     PxgCudaShim shim(dev, manifest, 1, &artiBlockLoader);
 
@@ -168,6 +215,83 @@ PXG_TEST(artiBlockLayout)
     std::memset(mat33.data(), 0xEE, mat33.size() * sizeof(PxgMat33Block));
     std::vector<PxgSpatialTransformBlock> xform(2);
     std::memset(xform.data(), 0xEE, xform.size() * sizeof(PxgSpatialTransformBlock));
+    // the link block: the largest of the three, filled field by field
+    std::vector<PxgArticulationBlockLinkData> links(2);
+    std::memset(links.data(), 0xEE, links.size() * sizeof(PxgArticulationBlockLinkData));
+    for (uint32_t e = 0; e < 2; ++e)
+        for (uint32_t l = 0; l < 32; ++l)
+        {
+            PxgArticulationBlockLinkData& K = links[e];
+            uint32_t f = 300;
+            for (uint32_t c = 0; c < 7; ++c)
+                K.mSpatialArticulatedInertia.columns[c][l] =
+                    make_float4(sentF32(e, l, f), sentF32(e, l, f + 1),
+                                sentF32(e, l, f + 2), sentF32(e, l, f + 3)), f += 4;
+            for (uint32_t c = 0; c < 9; ++c)
+                K.mSpatialResponseMatrix.columns[c][l] =
+                    make_float4(sentF32(e, l, f), sentF32(e, l, f + 1),
+                                sentF32(e, l, f + 2), sentF32(e, l, f + 3)), f += 4;
+            K.mIsolatedInertia.mCol0[l] = make_float4(sentF32(e, l, f), sentF32(e, l, f + 1),
+                                                      sentF32(e, l, f + 2), sentF32(e, l, f + 3)); f += 4;
+            K.mIsolatedInertia.mCol1[l] = make_float4(sentF32(e, l, f), sentF32(e, l, f + 1),
+                                                      sentF32(e, l, f + 2), sentF32(e, l, f + 3)); f += 4;
+            K.mIsolatedInertia.mCol2[l] = sentF32(e, l, f++);
+            K.mMass[l] = sentF32(e, l, f++);
+            PxgSpatialVectorBlock* sv[15] = {
+                &K.mMotionVelocity, &K.mPosMotionVelocity, &K.mDeltaMotion, &K.mScratchImpulse,
+                &K.mScratchDeltaV, &K.mSolverSpatialDeltaVel, &K.mSolverSpatialImpulse,
+                &K.mSolverSpatialInternalConstraintImpulse, &K.mZAVector, &K.mZAIntVector,
+                &K.mCoriolis, &K.mConstraintForces, &K.mMotionAcceleration,
+                &K.mMotionAccelerationInternal, &K.mBiasForce };
+            for (uint32_t v = 0; v < 15; ++v)
+            {
+                sv[v]->mTopxyz_bx[l] = make_float4(sentF32(e, l, f), sentF32(e, l, f + 1),
+                                                   sentF32(e, l, f + 2), sentF32(e, l, f + 3));
+                sv[v]->mbyz[l] = make_float2(sentF32(e, l, f + 4), sentF32(e, l, f + 5));
+                f += 6;
+            }
+            K.mDeltaScale[l] = sentF32(e, l, f++);
+            K.mRw_x[l] = sentF32(e, l, f++);
+            K.mRw_y[l] = sentF32(e, l, f++);
+            K.mRw_z[l] = sentF32(e, l, f++);
+            K.mRelativeQuat[l] = make_float4(sentF32(e, l, f), sentF32(e, l, f + 1),
+                                             sentF32(e, l, f + 2), sentF32(e, l, f + 3)); f += 4;
+            K.mNbStaticContacts[l] = sentU32(e, l, f++);
+            K.mStaticContactStartIndex[l] = sentU32(e, l, f++);
+            K.mNbStaticJoints[l] = sentU32(e, l, f++);
+            K.mStaticJointStartIndex[l] = sentU32(e, l, f++);
+            PxgSpatialTransformBlock* tb[4] = { &K.mPreTransform, &K.mAccumulatedPose,
+                                                &K.mChildPose, &K.mParentPose };
+            for (uint32_t v = 0; v < 4; ++v)
+            {
+                tb[v]->q[l] = make_float4(sentF32(e, l, f), sentF32(e, l, f + 1),
+                                          sentF32(e, l, f + 2), sentF32(e, l, f + 3));
+                tb[v]->p[l] = make_float4(sentF32(e, l, f + 4), sentF32(e, l, f + 5),
+                                          sentF32(e, l, f + 6), sentF32(e, l, f + 7));
+                f += 8;
+            }
+            K.mDeltaQ[l] = make_float4(sentF32(e, l, f), sentF32(e, l, f + 1),
+                                       sentF32(e, l, f + 2), sentF32(e, l, f + 3)); f += 4;
+            K.mLinDampingX_AngDampingY_maxLinVelSqZ_maxAngVelSqW[l] =
+                make_float4(sentF32(e, l, f), sentF32(e, l, f + 1),
+                            sentF32(e, l, f + 2), sentF32(e, l, f + 3)); f += 4;
+            K.mInvInertiaXYZ_invMassW[l] = make_float4(sentF32(e, l, f), sentF32(e, l, f + 1),
+                                                       sentF32(e, l, f + 2), sentF32(e, l, f + 3)); f += 4;
+            K.mCfm[l] = sentF32(e, l, f++);
+            K.mChildrenOffset[l] = sentU32(e, l, f++);
+            K.mNumChildren[l] = sentU32(e, l, f++);
+            K.mJointOffset[l] = sentU32(e, l, f++);
+            K.mParents[l] = sentU32(e, l, f++);
+            K.mDofs[l] = PxU8(0x11u + e * 4u + l % 4u);
+            K.mJointType[l] = PxU8(0x22u + e * 4u + l % 4u);
+            K.mDisableGravity[l] = PxU8(0x33u + e * 4u + l % 4u);
+            K.mRetainsAcceleration[l] = PxU8(0x44u + e * 4u + l % 4u);
+            // axis-major: a distinct value per (axis, lane) so a probe that
+            // ignores the row stride returns axis 0 three times
+            for (uint32_t axis = 0; axis < 6; ++axis)
+                K.mInvDofIds[axis][l] = PxU8(0x50u + axis * 16u + e * 4u + l % 4u);
+        }
+
     for (uint32_t e = 0; e < 2; ++e)
         for (uint32_t l = 0; l < 32; ++l)
         {
@@ -311,14 +435,68 @@ PXG_TEST(artiBlockLayout)
     expect.push_back(bits(xform[ELEM].q[LANE].z));
     expect.push_back(bits(xform[ELEM].p[LANE].x));
 
+    const PxgArticulationBlockLinkData& K = links[ELEM];
+    expect.push_back(sizeof(PxgArticulationBlockLinkData));
+    expect.push_back(sizeof(PxgSpatialMatrix6x6Block));
+    expect.push_back(bits(K.mSpatialArticulatedInertia.columns[6][LANE].y));
+    expect.push_back(bits(K.mSpatialResponseMatrix.columns[8][LANE].z));
+    expect.push_back(bits(K.mIsolatedInertia.mCol1[LANE].w));
+    expect.push_back(bits(K.mMass[LANE]));
+    {
+        const PxgSpatialVectorBlock* sv[15] = {
+            &K.mMotionVelocity, &K.mPosMotionVelocity, &K.mDeltaMotion, &K.mScratchImpulse,
+            &K.mScratchDeltaV, &K.mSolverSpatialDeltaVel, &K.mSolverSpatialImpulse,
+            &K.mSolverSpatialInternalConstraintImpulse, &K.mZAVector, &K.mZAIntVector,
+            &K.mCoriolis, &K.mConstraintForces, &K.mMotionAcceleration,
+            &K.mMotionAccelerationInternal, &K.mBiasForce };
+        // the probe cycles top.x/y/z then bottom.x/y/z; bottom is (w, byz.x, byz.y)
+        const int comp[15] = { 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2 };
+        for (uint32_t v = 0; v < 15; ++v)
+        {
+            const float4 t = sv[v]->mTopxyz_bx[LANE];
+            const float2 b = sv[v]->mbyz[LANE];
+            const float vals[6] = { t.x, t.y, t.z, t.w, b.x, b.y };
+            expect.push_back(bits(vals[comp[v]]));
+        }
+    }
+    expect.push_back(bits(K.mDeltaScale[LANE]));
+    expect.push_back(bits(K.mRw_x[LANE]));
+    expect.push_back(bits(K.mRw_y[LANE]));
+    expect.push_back(bits(K.mRw_z[LANE]));
+    expect.push_back(bits(K.mRelativeQuat[LANE].w));
+    expect.push_back(K.mNbStaticContacts[LANE]);
+    expect.push_back(K.mStaticContactStartIndex[LANE]);
+    expect.push_back(K.mNbStaticJoints[LANE]);
+    expect.push_back(K.mStaticJointStartIndex[LANE]);
+    expect.push_back(bits(K.mPreTransform.q[LANE].x));
+    expect.push_back(bits(K.mAccumulatedPose.p[LANE].y));
+    expect.push_back(bits(K.mChildPose.q[LANE].z));
+    expect.push_back(bits(K.mParentPose.p[LANE].w));
+    expect.push_back(bits(K.mDeltaQ[LANE].x));
+    expect.push_back(bits(K.mLinDampingX_AngDampingY_maxLinVelSqZ_maxAngVelSqW[LANE].z));
+    expect.push_back(bits(K.mInvInertiaXYZ_invMassW[LANE].w));
+    expect.push_back(bits(K.mCfm[LANE]));
+    expect.push_back(K.mChildrenOffset[LANE]);
+    expect.push_back(K.mNumChildren[LANE]);
+    expect.push_back(K.mJointOffset[LANE]);
+    expect.push_back(K.mParents[LANE]);
+    expect.push_back(K.mDofs[LANE]);
+    expect.push_back(K.mJointType[LANE]);
+    expect.push_back(K.mDisableGravity[LANE]);
+    expect.push_back(K.mRetainsAcceleration[LANE]);
+    expect.push_back(K.mInvDofIds[0][LANE]);
+    expect.push_back(K.mInvDofIds[2][LANE]);
+    expect.push_back(K.mInvDofIds[5][LANE]);
+
     // ---- upload, dispatch, compare ----
-    PxgDevicePtr dBlocks = 0, dDofs = 0, dMat33 = 0, dXform = 0, dOut = 0;
+    PxgDevicePtr dBlocks = 0, dDofs = 0, dMat33 = 0, dXform = 0, dLinks = 0, dOut = 0;
     shim.memAlloc(&dBlocks, blocks.size() * sizeof(PxgArticulationBlockData));
     shim.memAlloc(&dDofs, dofs.size() * sizeof(PxgArticulationBlockDofData));
     shim.memAlloc(&dMat33, mat33.size() * sizeof(PxgMat33Block));
     shim.memAlloc(&dXform, xform.size() * sizeof(PxgSpatialTransformBlock));
+    shim.memAlloc(&dLinks, links.size() * sizeof(PxgArticulationBlockLinkData));
     shim.memAlloc(&dOut, expect.size() * 8);
-    if (!dBlocks || !dDofs || !dMat33 || !dXform || !dOut)
+    if (!dBlocks || !dDofs || !dMat33 || !dXform || !dLinks || !dOut)
     {
         std::printf("  NOTE: no BDA -> skip\n");
         return;
@@ -327,10 +505,12 @@ PXG_TEST(artiBlockLayout)
     shim.memcpyHtoD(dDofs, dofs.data(), dofs.size() * sizeof(PxgArticulationBlockDofData));
     shim.memcpyHtoD(dMat33, mat33.data(), mat33.size() * sizeof(PxgMat33Block));
     shim.memcpyHtoD(dXform, xform.data(), xform.size() * sizeof(PxgSpatialTransformBlock));
+    shim.memcpyHtoD(dLinks, links.data(), links.size() * sizeof(PxgArticulationBlockLinkData));
     shim.memsetD32(dOut, 0, uint32_t(expect.size() * 2));
 
-    struct Params { uint64_t blockData, dofData, mat33, transform, out; } prm = {
-        uint64_t(dBlocks), uint64_t(dDofs), uint64_t(dMat33), uint64_t(dXform), uint64_t(dOut)
+    struct Params { uint64_t blockData, dofData, mat33, transform, linkData, out; } prm = {
+        uint64_t(dBlocks), uint64_t(dDofs), uint64_t(dMat33), uint64_t(dXform),
+        uint64_t(dLinks), uint64_t(dOut)
     };
     PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
                   "launch artiBlockProbe");

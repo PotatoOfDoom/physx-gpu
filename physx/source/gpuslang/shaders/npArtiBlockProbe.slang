@@ -56,6 +56,7 @@ struct ArtiBlockProbeParams
     // had PXG_AB_MAT33_COL1 and PXG_AB_STB_P survive for exactly that reason.
     uint64_t mat33;     // PxgMat33Block[2]
     uint64_t transform; // PxgSpatialTransformBlock[2]
+    uint64_t linkData;  // PxgArticulationBlockLinkData[2]
     uint64_t out;       // uint64_t[]
 };
 
@@ -181,4 +182,76 @@ void artiBlockProbe()
                        uint64_t(AP_ELEM) * PXG_AB_SPATIAL_TRANSFORM_BLOCK_SIZE;
     o[i++] = uint64_t(asuint(abF4(t, PXG_AB_STB_Q, AP_LANE).z));
     o[i++] = uint64_t(asuint(abF4(t, PXG_AB_STB_P, AP_LANE).x));
+
+    // ---- PxgArticulationBlockLinkData[1], lane 3 ----
+    const uint64_t k = gArtiBlockProbe.linkData + uint64_t(AP_ELEM) * PXG_AB_LINK_SIZE;
+    o[i++] = uint64_t(PXG_AB_LINK_SIZE);
+    o[i++] = uint64_t(PXG_AB_SPATIAL_MATRIX_6X6_BLOCK_SIZE);
+
+    // the two leading matrix blocks, which are DIFFERENT sizes (7 columns vs 9):
+    // reading the second at the first's stride is the mistake this catches
+    o[i++] = uint64_t(asuint(abF4(k, PXG_AB_LINK_mSpatialArticulatedInertia + 6u * 512u, AP_LANE).y));
+    o[i++] = uint64_t(asuint(abF4(k, PXG_AB_LINK_mSpatialResponseMatrix + 8u * 512u, AP_LANE).z));
+    o[i++] = uint64_t(asuint(abF4(k, PXG_AB_LINK_mIsolatedInertia + PXG_AB_MAT33_COL1, AP_LANE).w));
+    o[i++] = uint64_t(asuint(abF32(k, PXG_AB_LINK_mMass, AP_LANE)));
+
+    // every PxgSpatialVectorBlock member, one component each -- fifteen fields
+    // 768 bytes apart, so any one of them landing on a neighbour is visible
+    {
+        float3 top, bottom;
+#define AP_SVB(FIELD, COMP) { abLoadSpatialVector(k, FIELD, AP_LANE, top, bottom); \
+                              o[i++] = uint64_t(asuint(COMP)); }
+        AP_SVB(PXG_AB_LINK_mMotionVelocity, top.x)
+        AP_SVB(PXG_AB_LINK_mPosMotionVelocity, top.y)
+        AP_SVB(PXG_AB_LINK_mDeltaMotion, top.z)
+        AP_SVB(PXG_AB_LINK_mScratchImpulse, bottom.x)
+        AP_SVB(PXG_AB_LINK_mScratchDeltaV, bottom.y)
+        AP_SVB(PXG_AB_LINK_mSolverSpatialDeltaVel, bottom.z)
+        AP_SVB(PXG_AB_LINK_mSolverSpatialImpulse, top.x)
+        AP_SVB(PXG_AB_LINK_mSolverSpatialInternalConstraintImpulse, top.y)
+        AP_SVB(PXG_AB_LINK_mZAVector, top.z)
+        AP_SVB(PXG_AB_LINK_mZAIntVector, bottom.x)
+        AP_SVB(PXG_AB_LINK_mCoriolis, bottom.y)
+        AP_SVB(PXG_AB_LINK_mConstraintForces, bottom.z)
+        AP_SVB(PXG_AB_LINK_mMotionAcceleration, top.x)
+        AP_SVB(PXG_AB_LINK_mMotionAccelerationInternal, top.y)
+        AP_SVB(PXG_AB_LINK_mBiasForce, top.z)
+#undef AP_SVB
+    }
+
+    o[i++] = uint64_t(asuint(abF32(k, PXG_AB_LINK_mDeltaScale, AP_LANE)));
+    o[i++] = uint64_t(asuint(abF32(k, PXG_AB_LINK_mRw_x, AP_LANE)));
+    o[i++] = uint64_t(asuint(abF32(k, PXG_AB_LINK_mRw_y, AP_LANE)));
+    o[i++] = uint64_t(asuint(abF32(k, PXG_AB_LINK_mRw_z, AP_LANE)));
+    o[i++] = uint64_t(asuint(abF4(k, PXG_AB_LINK_mRelativeQuat, AP_LANE).w));
+    o[i++] = uint64_t(abU32(k, PXG_AB_LINK_mNbStaticContacts, AP_LANE));
+    o[i++] = uint64_t(abU32(k, PXG_AB_LINK_mStaticContactStartIndex, AP_LANE));
+    o[i++] = uint64_t(abU32(k, PXG_AB_LINK_mNbStaticJoints, AP_LANE));
+    o[i++] = uint64_t(abU32(k, PXG_AB_LINK_mStaticJointStartIndex, AP_LANE));
+
+    // the four transform blocks, q and p alternating so a swapped pair shows up
+    o[i++] = uint64_t(asuint(abF4(k, PXG_AB_LINK_mPreTransform + PXG_AB_STB_Q, AP_LANE).x));
+    o[i++] = uint64_t(asuint(abF4(k, PXG_AB_LINK_mAccumulatedPose + PXG_AB_STB_P, AP_LANE).y));
+    o[i++] = uint64_t(asuint(abF4(k, PXG_AB_LINK_mChildPose + PXG_AB_STB_Q, AP_LANE).z));
+    o[i++] = uint64_t(asuint(abF4(k, PXG_AB_LINK_mParentPose + PXG_AB_STB_P, AP_LANE).w));
+
+    o[i++] = uint64_t(asuint(abF4(k, PXG_AB_LINK_mDeltaQ, AP_LANE).x));
+    o[i++] = uint64_t(asuint(abF4(k, PXG_AB_LINK_mLinDampingX_AngDampingY_maxLinVelSqZ_maxAngVelSqW, AP_LANE).z));
+    o[i++] = uint64_t(asuint(abF4(k, PXG_AB_LINK_mInvInertiaXYZ_invMassW, AP_LANE).w));
+    o[i++] = uint64_t(asuint(abF32(k, PXG_AB_LINK_mCfm, AP_LANE)));
+    o[i++] = uint64_t(abU32(k, PXG_AB_LINK_mChildrenOffset, AP_LANE));
+    o[i++] = uint64_t(abU32(k, PXG_AB_LINK_mNumChildren, AP_LANE));
+    o[i++] = uint64_t(abU32(k, PXG_AB_LINK_mJointOffset, AP_LANE));
+    o[i++] = uint64_t(abU32(k, PXG_AB_LINK_mParents, AP_LANE));
+    o[i++] = uint64_t(abU8(k, PXG_AB_LINK_mDofs, AP_LANE));
+    o[i++] = uint64_t(abU8(k, PXG_AB_LINK_mJointType, AP_LANE));
+    o[i++] = uint64_t(abU8(k, PXG_AB_LINK_mDisableGravity, AP_LANE));
+    o[i++] = uint64_t(abU8(k, PXG_AB_LINK_mRetainsAcceleration, AP_LANE));
+
+    // mInvDofIds is PxU8[6][32]: axis-major, so axis a starts 32 bytes in.
+    // Probing axes 0, 2 and 5 pins both the base offset and the row stride --
+    // a field read that ignores the row would return axis 0 for all three.
+    o[i++] = uint64_t(abU8(k, PXG_AB_LINK_mInvDofIds + 0u * 32u, AP_LANE));
+    o[i++] = uint64_t(abU8(k, PXG_AB_LINK_mInvDofIds + 2u * 32u, AP_LANE));
+    o[i++] = uint64_t(abU8(k, PXG_AB_LINK_mInvDofIds + 5u * 32u, AP_LANE));
 }
