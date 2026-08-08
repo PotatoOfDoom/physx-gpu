@@ -1694,6 +1694,58 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.59 — the pool bound lands; it does NOT fix the articulation crash
+
+P8.58 deferred bounding `remappedBodyIndex` because the descriptor "carries no
+`solverBodyVelPool` size field".  That was true and beside the point: the size is
+**derivable exactly** from two values the shader already holds.
+PxgTGSCudaSolverCore.cpp:412-423 allocates
+
+```
+totalBodiesSize = mirrorBodies + accumulationBodies + numOutputBodies
+mSolverBodyOutputVelocityOffset = mirrorBodies + accumulationBodies
+numOutputBodies = roundUp32(numSolverBodies) * 3
+```
+
+and PxgSolverCore.cpp:469 assigns that offset to `accumulatedBodyDeltaVOffset`.
+So the pool's float4 count is exactly `accumulatedBodyDeltaVOffset +
+roundUp32(numSolverBodies) * 3` — no descriptor change, no inferred layout:
+
+```slang
+const uint velPoolSize = outputOffset + (((allBodiesCount + 31u) & ~31u) * 3u);
+...
+if (remappedBodyIndex != INVALID && (remappedBodyIndex + 64u) < velPoolSize)
+```
+
+**A deliberate divergence, and the only one in this shader.**  Rejecting an
+out-of-pool index cannot change a correct execution — a legitimate index is in the
+pool by construction — so it only suppresses a write that is already undefined
+behaviour, and turns a process kill into a survivable frame.
+
+**It does not fix the articulation scene, and saying otherwise would be wrong.**
+With the bound in place the scene still SIGSEGVs, and the launch trace still stops
+at the same place:
+
+```
+[pxg-dispatch] sized initializeSolverVelocitiesTGS ...     <-- dispatch 52, still
+```
+
+So the faulting access is NOT the guarded write.  What is left unguarded in that
+kernel is the READ that feeds it — `solverReferences[bodyIndex]`, with
+`bodyIndex = numSlabs * (bodyId - bodyOffset) + b` — plus the two descriptor loads
+and `velocities[bodyId]`.  The evidence now points at `desc.solverBodyReferences`
+or `desc.outSolverVelocity` being **null or short** for an articulation-bearing
+scene, which a guard on the value read *out* of that array can do nothing about.
+
+The bound is kept regardless: it removes a real wild-write hazard that the CUDA
+only survives because its arrays are always initialised, and it is exactly derived
+rather than guessed.  Regression: suite **693/693** under `-j4`, and `box`,
+`stack`, `joint`, `softbodystack`, `meshfloor` all still green.
+
+Next: print the descriptor pointers at that dispatch and compare the articulation
+scene against `joint`.  A null `solverBodyReferences` would explain everything and
+is one memcpy to confirm.
+
 ## P8.58 — the one-line fix for the thing that actually cost three tranches
 
 The articulation hunt burned P8.55, P8.56 and half of P8.57 on a wrong premise —

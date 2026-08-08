@@ -91,6 +91,16 @@ void initializeSolverVelocitiesTGS(uint3 gtid : SV_GroupThreadID, uint3 gid : SV
     Ptr<float4> velocities = Ptr<float4>(desc.outSolverVelocity);
     const uint outputOffset = desc.accumulatedBodyDeltaVOffset;
 
+    // THE SIZE OF solverBodyVelPool, DERIVED EXACTLY -- not guessed.
+    // PxgTGSCudaSolverCore.cpp:412-423 allocates
+    //     totalBodiesSize = mirrorBodies + accumulationBodies + numOutputBodies
+    // and sets mSolverBodyOutputVelocityOffset = mirrorBodies + accumulationBodies,
+    // with numOutputBodies = roundUp32(numSolverBodies) * 3.  PxgSolverCore.cpp:469
+    // assigns that same offset to accumulatedBodyDeltaVOffset, so the pool's total
+    // float4 count is exactly the offset plus the output region -- both of which
+    // this shader already holds.  No descriptor change, no inferred layout.
+    const uint velPoolSize = outputOffset + (((allBodiesCount + 31u) & ~31u) * 3u);
+
     const uint pow2Slabs = (numSlabs & (numSlabs - 1u)) == 0 ? numSlabs : nextPowerOfTwo(numSlabs);
     const uint numThreadsPerBody = min(pow2Slabs, 32u);
     const uint numBodiesPerWarp = 32u / numThreadsPerBody;
@@ -117,7 +127,23 @@ void initializeSolverVelocitiesTGS(uint3 gtid : SV_GroupThreadID, uint3 gid : SV
                 const uint bodyIndex = numSlabs * (bodyId - bodyOffset) + b;
                 const uint remappedBodyIndex = solverReferences[bodyIndex];
 
-                if (remappedBodyIndex != INVALID)
+                // THE BOUND IS A DELIBERATE DIVERGENCE FROM THE CUDA, and it is the
+                // only one in this shader.  `remappedBodyIndex` is read straight out
+                // of solverBodyReferences and used to address the pool; the CUDA
+                // guards it against INVALID and nothing else, which is safe there
+                // only because the constraint-prep path always fills that array.
+                // When an upstream kernel is UNMAPPED -- as every `arti*`
+                // constraint-prep kernel still is -- the array holds allocator
+                // garbage, garbage is overwhelmingly unlikely to equal INVALID, and
+                // the write lands at an arbitrary index.  On llvmpipe that is a
+                // SIGSEGV inside JIT code with no usable stack, which is precisely
+                // the fault P8.55-P8.57 spent three tranches chasing.
+                //
+                // Rejecting an out-of-pool index cannot change a correct execution:
+                // a legitimate index is in the pool by construction.  It only
+                // suppresses a write that is already undefined behaviour, and turns
+                // a process kill into a survivable frame.
+                if (remappedBodyIndex != INVALID && (remappedBodyIndex + 64u) < velPoolSize)
                 {
                     bodyVelocities[remappedBodyIndex] = vel0;
                     bodyVelocities[remappedBodyIndex + 32u] = vel1;
