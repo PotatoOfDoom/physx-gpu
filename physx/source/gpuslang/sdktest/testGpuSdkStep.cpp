@@ -92,7 +92,7 @@ PxFilterFlags stepFilterShader(PxFilterObjectAttributes, PxFilterData, PxFilterO
 // A dynamic body expected to come to rest at a known centre height on the GPU.
 struct RestTarget
 {
-    PxRigidDynamic* body;
+    PxRigidBody* body;   // PxRigidDynamic, or a PxArticulationLink
     float startY;   // spawn centre height
     float restY;    // expected resting centre height
     const char* label;
@@ -352,6 +352,60 @@ void buildJointScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
     joint->setMotion(PxD6Axis::eSWING2, PxD6Motion::eFREE);
 
     targets.push_back({ box, spawnY, restY, "boxOnD6Joint" });
+}
+
+// PXG_SCENE=articulation (P8.55): the first ARTICULATION scene, and the first
+// thing in this harness to ask the ~85 unmapped `arti*` kernels to run.
+//
+// A reduced-coordinate articulation with a FIXED BASE and one revolute link.  The
+// link is spawned horizontal, so gravity has maximum leverage on the joint, and it
+// swings down to hang vertically: centre from (0.7, 3, 0) to (0.2, 2.5, 0).
+// Angular damping settles it well inside the 240-step window -- an undamped
+// pendulum would still be swinging and the rest check would (correctly) fail.
+//
+// Deliberately the SMALLEST articulation that exercises the feature: one inbound
+// joint, one degree of freedom, no contacts, no self-collision.  Anything the
+// scene refuses is therefore attributable to the articulation pipeline itself.
+void buildArticulationScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                            std::vector<RestTarget>& targets)
+{
+    const float baseY = 3.0f;
+    const float baseHalf = 0.2f;
+    const float linkHalf = 0.5f;      // half-length along x
+
+    PxArticulationReducedCoordinate* arti = physics->createArticulationReducedCoordinate();
+    arti->setArticulationFlag(PxArticulationFlag::eFIX_BASE, true);
+
+    PxArticulationLink* base = arti->createLink(NULL, PxTransform(PxVec3(0.0f, baseY, 0.0f)));
+    PxShape* bs = physics->createShape(PxBoxGeometry(baseHalf, baseHalf, baseHalf), *material);
+    base->attachShape(*bs);
+    base->setMass(10.0f);
+    base->setMassSpaceInertiaTensor(boxInertia(PxVec3(baseHalf), 10.0f));
+
+    // Spawned horizontal: centre one link-half past the base's +x face.
+    const float linkX = baseHalf + linkHalf;
+    PxArticulationLink* link =
+        arti->createLink(base, PxTransform(PxVec3(linkX, baseY, 0.0f)));
+    PxShape* ls = physics->createShape(PxBoxGeometry(linkHalf, 0.1f, 0.1f), *material);
+    link->attachShape(*ls);
+    link->setMass(10.0f);
+    link->setMassSpaceInertiaTensor(boxInertia(PxVec3(linkHalf, 0.1f, 0.1f), 10.0f));
+    link->setAngularDamping(3.0f);
+    link->setLinearDamping(1.0f);
+
+    // The hinge sits on the base's +x face; rotation about Z swings the link in
+    // the x-y plane, which is where gravity acts.
+    PxArticulationJointReducedCoordinate* joint = link->getInboundJoint();
+    joint->setJointType(PxArticulationJointType::eREVOLUTE);
+    joint->setParentPose(PxTransform(PxVec3(baseHalf, 0.0f, 0.0f)));
+    joint->setChildPose(PxTransform(PxVec3(-linkHalf, 0.0f, 0.0f)));
+    joint->setMotion(PxArticulationAxis::eSWING2, PxArticulationMotion::eFREE);
+    joint->setFrictionCoefficient(0.5f);
+
+    scene->addArticulation(*arti);
+
+    // Hanging straight down puts the link centre one half-length below the hinge.
+    targets.push_back({ link, baseY, baseY - linkHalf, "artiLink" });
 }
 
 // PXG_SCENE=particle (P6.0): the first deformable/particle scene.  A PBD particle
@@ -4057,7 +4111,8 @@ int main()
     else if (!std::strcmp(sceneName, "convex"))    buildConvexScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "joint"))     buildJointScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "meshfloor")) buildMeshFloorScene(physics, scene, material, targets);
-    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|particle|cloth|clothhang|clothdrape|clothselfcollide|clothcloth|softbody|softbodyselfcollide|softbodycloth|softbodystack|softbodyattach)\n", sceneName);
+    else if (!std::strcmp(sceneName, "articulation")) buildArticulationScene(physics, scene, material, targets);
+    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|articulation|particle|cloth|clothhang|clothdrape|clothselfcollide|clothcloth|softbody|softbodyselfcollide|softbodycloth|softbodystack|softbodyattach)\n", sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
     if (targets.empty())
     {

@@ -1694,6 +1694,47 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.55 — the articulation scene, and the wall it hits BEFORE any kernel runs
+
+`PXG_SCENE=articulation` added to `gpu-sdk-step`: the smallest articulation that
+exercises the feature — a reduced-coordinate articulation with a FIXED BASE and one
+revolute link, spawned horizontal so gravity has maximum leverage, swinging down to
+hang.  One inbound joint, one degree of freedom, no contacts, no self-collision, so
+anything it refuses is attributable to the articulation pipeline itself.
+
+**It does not reach the stepping loop.**  The process takes a SIGSEGV during scene
+construction, right after `creating GPU scene`, on a worker thread — deterministic
+across three runs (plain, redirected, under gdb).  The stack is a jump through a
+bad pointer with no caller frame:
+
+```
+Thread 7 "gpu-sdk-step" received signal SIGSEGV
+#0  0x00007fffecc14617 in ?? ()
+#1  0x0000000000000000 in ?? ()
+```
+
+That shape — a call into an address with no symbol and no return frame — is a call
+through an unresolved function pointer, not a bad dereference inside known code.
+
+**This matters for the roadmap P8.54 just wrote.**  The articulation frontier is
+NOT simply "map ~85 kernels": something in the articulation setup path calls
+through a pointer the Vulkan shim never populated, and it does so at
+`addArticulation` time rather than at launch time.  Every other subsystem in this
+port degrades gracefully when a kernel is missing — the wrangler reports
+`fail to launch kernel` and the frame continues, which is exactly how the softbody
+and convex-trimesh chains were driven forward one kernel at a time.  Articulations
+do not get that far, so the usual method (run the scene, read the refused
+launches, map the next kernel) **cannot start until this fault is understood**.
+
+The scene is committed anyway, and deliberately: it reproduces the crash on demand
+and it is the instrument the next tranche needs.  It is not wired into any green
+list and claims nothing.
+
+Next diagnostic step: build with symbols/`-g` for the GPU module and re-run under
+gdb to name the call site, or bisect by disabling `eENABLE_GPU_DYNAMICS` for the
+articulation scene to see whether the fault is in the GPU articulation module or in
+the shared setup path.
+
 ## P8.54 — MILESTONE: every scene in the harness passes, and what is actually left
 
 ```
