@@ -1694,6 +1694,68 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.57 — the articulation crash, fully diagnosed (and two more of my claims corrected)
+
+**Correction 1: it is not scene construction.**  P8.55 and P8.56 both placed the
+crash "during scene construction", because the harness printed `creating GPU
+scene` and nothing after it.  Re-running under `stdbuf -oL` shows what was
+actually happening:
+
+```
+  creating GPU scene (eENABLE_GPU_DYNAMICS + eGPU broadphase, TGS)...
+  [  OK  ] GPU scene constructed: the Pxg* pipeline is live over Vulkan
+  [  OK  ] scene 'articulation' built: 1 dynamic body(ies) + ground on the GPU
+  stepping the GPU scene 'articulation' (240 x 0.0167s)...        <-- then SIGSEGV
+```
+
+The scene builds fine and the articulation is created fine.  The fault is in the
+**first `simulate()`**.  Those three lines were in an unflushed stdout buffer and
+died with the process; only PhysX's own error callback, which is unbuffered, got
+through — which is exactly why the earlier logs looked like a setup crash.
+
+**Correction 2: the "unmapped kernel upstream" story was right after all.**  P8.56
+dismissed it because the trace showed no refused launch before the fault.  That
+was bad reasoning: an unmapped kernel never reaches the dispatch path at all — the
+wrangler hands back a null function at startup (those `Could not find registered
+CUDA function` lines) and the engine skips it silently.  **Absence of a refusal in
+the trace is not evidence that everything upstream ran.**
+
+**The mechanism.**  `initializeSolverVelocitiesTGS` ends in an unchecked indirect
+write (solverInitVelocitiesTGS.slang, mirroring solverMultiBlockTGS.cu:729):
+
+```slang
+const uint remappedBodyIndex = solverReferences[bodyIndex];
+if (remappedBodyIndex != INVALID)
+{
+    bodyVelocities[remappedBodyIndex]        = vel0;   // <-- index straight out of memory
+    bodyVelocities[remappedBodyIndex + 32u]  = vel1;
+    bodyVelocities[remappedBodyIndex + 64u]  = vel2;
+}
+```
+
+`solverReferences` is `PxgSolverCoreDesc::solverBodyReferences`, and the only thing
+that ever writes it is the constraint-prep path (constraintPrepShared.cuh:145).
+With an articulation in the scene that path runs through the **`arti*` constraint-prep
+kernels, which are unmapped** — so for the articulation's bodies the array is never
+written and holds allocator garbage.  Garbage is overwhelmingly unlikely to equal
+`INVALID` (0xFFFFFFFF), so the guard passes and the shader performs a **wild write**
+at an arbitrary 32-bit index.  That is the JIT-code segfault P8.56 located.
+
+**Two separate things follow, and they are not the same size.**
+
+1. The articulation frontier needs its constraint-prep kernels mapped.  That is the
+   ~85-kernel job P8.54 already scoped, and this is simply the first place the
+   absence bites.
+2. **Independently: an unchecked index out of device memory turns a missing kernel
+   into a process kill.**  Every other subsystem degrades to a wrong-but-alive
+   frame; this one takes the process down, which is why articulations could not be
+   driven forward the way softbody and convex-trimesh were.  The CUDA has the same
+   unchecked write and gets away with it because the array is always initialised
+   there.  Worth considering a debug-mode bound on `remappedBodyIndex` so a missing
+   upstream kernel produces a diagnosable frame instead of a JIT segfault — a
+   deliberate divergence, not a silent one, and it would have turned this
+   three-tranche hunt into one line of output.
+
 ## P8.56 — the articulation fault is a MAPPED kernel, and P8.55 read it backwards
 
 P8.55 called the articulation crash "a call through an unresolved function pointer,
@@ -1757,9 +1819,10 @@ revolute link, spawned horizontal so gravity has maximum leverage, swinging down
 hang.  One inbound joint, one degree of freedom, no contacts, no self-collision, so
 anything it refuses is attributable to the articulation pipeline itself.
 
-**It does not reach the stepping loop.**  The process takes a SIGSEGV during scene
-construction, right after `creating GPU scene`, on a worker thread — deterministic
-across three runs (plain, redirected, under gdb).  The stack is a jump through a
+**It takes a SIGSEGV on a worker thread**, deterministic across three runs (plain,
+redirected, under gdb).  *(P8.55 and P8.56 both said "during scene construction".
+That was wrong — see P8.57: the harness's own progress prints were sitting in an
+unflushed stdout buffer, and the crash is actually in the FIRST `simulate()`.)*  The stack is a jump through a
 bad pointer with no caller frame:
 
 ```
