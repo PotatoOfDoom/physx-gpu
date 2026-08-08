@@ -1694,6 +1694,38 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.53 — a correction: the `gpuslang.scan` segfault is NOT reproducible
+
+P8.52 recorded a `gpuslang.scan` SEGFAULT under `-j4` in default memory mode and
+called it **reproducible**, on the evidence of two failing full runs.  That word
+was wrong, and this entry exists to say so rather than quietly drop it.
+
+Nine full `-j4` default-mode runs are now on record: the **first two failed, the
+next seven all passed**, across every variation worth trying —
+
+* a plain `ctest -j4`;
+* `ctest -j4 --output-on-failure` (to capture the crash, which never came);
+* four back-to-back `-j4` runs measuring a rate;
+* two forced-fresh runs (`rm *.spv`, full shader rebuild, then `-j4`), because both
+  original failures sat near a forced-fresh rebuild and that looked like a lead.
+
+It is not the rebuild, and it is not something that reproduces on demand.  Two
+mechanisms were checked and ruled out on the way: the box has **16 GB with 13.5 GB
+free and no cgroup limit**, so it is not a global OOM; and the Vulkan pipeline
+cache is only ever file-backed by `testP1PipelineCache`, which uses its own path —
+the main test device leaves `pipelineCachePath` empty and touches no shared file,
+so concurrent cache corruption is out.
+
+**What is actually known**, and it is less than P8.52 implied: two crashes, both in
+`gpuslang.scan`, both in default mode, both adjacent in time, never since.
+`gpuslang.scan` is test #1 and unrelated to anything the convex-trimesh chain
+touches.  Correctness is not in question — the suite passes serially, passes under
+`-j4` seven times running, and passes in both memory modes.
+
+The honest label is an **intermittent host-side flake of unknown cause, observed
+twice in nine runs and not reproducible**.  It stays on the board rather than being
+closed as fixed, because nothing was fixed.
+
 ## P8.52 — the engine-ABI fixture P8.51 shipped without, and a 46/47 sweep
 
 P8.51 landed `cvxTriFinishBda` on the strength of the Phase-1 verbatim port plus a
@@ -1740,19 +1772,9 @@ intra-warp face-index write conflict is masked from comparison, as it is in the
 Phase-1 test — it is a real unordered write in the CUDA, not something a port can
 fix.
 
-**Verification, stated exactly.**  `PXG_DEVICE_V2=1`: **693/693** under `-j4`,
-forced-fresh.  Default mode: **693/693 SERIAL**, but `-j4` fails
-`gpuslang.scan` with a SEGFAULT — REPRODUCIBLY, on two separate full runs.
-
-That is not the one-off `-j4` flake recorded in P8.48.  What rules out a
-correctness problem is the shape of it: `gpuslang.scan` passes 5/5 alone, passes
-under `-j4` in a five-test group alongside the new test, and the whole 693-test
-suite passes serially — it only falls over when 4 llvmpipe processes are live
-across the full run, next to `cvxCollide`'s ~180 s of allocation.  `gpuslang.scan`
-is also test #1, unrelated to this tranche and to anything the convex-trimesh
-chain touches.  The reading is a host-side resource interaction in the harness,
-not a shader defect, and it is written down here rather than averaged away because
-a segfault that reproduces deserves its own tranche, not a footnote.
+**Verification.**  `PXG_DEVICE_V2=1`: **693/693** under `-j4`, forced-fresh.
+Default mode: **693/693** serially, and **693/693** under `-j4` — see the P8.53
+correction below for why that sentence needed rewriting once.
 
 ## P8.51 — MILESTONE: a box falls and RESTS on a cooked triangle mesh, on Vulkan
 
