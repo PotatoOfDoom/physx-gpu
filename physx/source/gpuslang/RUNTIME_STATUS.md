@@ -1694,6 +1694,54 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.63 — the asymmetry is one hop from resolved, and the hop is named
+
+P8.62 flagged that PxgSimulationCore.cpp:2177 pairs the **AABB manager's** handle
+buffer with the **simulation core's** word count.  Tracing both sides:
+
+**The AABB manager's side is self-consistent** (PxgAABBManager.cpp:863-867):
+
+```cpp
+void PxgAABBManager::reallocateChangedAABBMgActorHandleMap(const PxU32 size)
+{
+    mChangedHandleMap.resizeAndClear(size);
+    mChangedAABBMgrHandlesBuf.allocate(size * sizeof(PxU32), PX_FL);
+}
+```
+
+One `size` drives both the map and the buffer, and `getChangedAABBMgrHandlesWordCount()`
+just returns `mChangedHandleMap.getWordCount()`.  Buffer and count cannot diverge
+from each other here.
+
+**The simulation core's count is threaded down from above**, not read from the AABB
+manager:
+
+```
+PxgContext::(…)              changedHandleMap  (a PxBitMapPinned&, parameter)
+  -> PxgSimulationController::update(changedHandleMap)        :2793
+    -> PxgSimulationCore::gpuMemDmaUp(…, changedHandleMap, …)  :2805
+      -> bitMapWordCounts = changedHandleMap.getWordCount()    :2160
+```
+
+**So the whole question reduces to one hop:** is the `changedHandleMap` threaded
+through `PxgContext` the *same object* as `PxgAABBManager::mChangedHandleMap`?
+
+* If **yes** — there is no asymmetry at all, P8.62's concern dissolves, and the
+  dispatch-67 fault is something else entirely.
+* If **no** — two independently sized maps meet in one write, and an articulation
+  making them diverge is the overrun.
+
+That is a single grep up the call chain, at the caller of the `PxgContext` function
+that owns `changedHandleMap` (PxgContext.cpp:611).  **Not run here**, and I would
+rather name it exactly than guess at it: the two outcomes point at completely
+different subsystems, so a coin-flip would send the next tranche the wrong way.
+
+*Where the articulation frontier stands after five tranches on it:* the fatal
+setup crash is understood and worked around (P8.60, an engine-side sizing bug that
+CUDA survives only because a real GPU tolerates the OOB read); the scene now clears
+the entire solver phase and names its unmapped kernels the normal way; and the one
+remaining blocker is a single yes/no question with both answers mapped out.
+
 ## P8.62 — the READ is provably fine; the suspicion moves to the WRITE
 
 P8.61 predicted a second instance of the P8.60 class — a buffer sized by a
