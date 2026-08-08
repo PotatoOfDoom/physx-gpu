@@ -1694,6 +1694,81 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.64 — the fault was never in dispatch 67; four tranches chased the wrong kernel
+
+Two answers, and the second invalidates the question the first answered.
+
+**Answer 1 — the two maps are the same object.**  `Sc::Scene::updateDynamicsPostPartitioning`
+(ScPipeline.cpp:2119) passes `mAABBManager->getChangedAABBMgActorHandleMap()`, which
+returns `Bp::AABBManagerBase::mChangedHandleMap` (BpAABBManagerBase.h:201), and
+`PxgAABBManager : public Bp::AABBManagerBase`.  So the word count at
+PxgSimulationCore.cpp:2177 and the buffer at `getChangedAABBMgrHandles()` are two
+views of one bitmap, and **the P8.62 asymmetry does not exist**.  Measured live with
+the articulation scene, to leave nothing to inference:
+
+```
+[dbg] preBpUpdate: alloc 4 bytes (words=1)
+[dbg] wordCount(solve)=1 wordCount(bp)=1 updatedBytes=128 nbTotalShapes=4
+```
+
+One word, a 4-byte target buffer, a 128-byte source for `1 * 32` elements.  Every
+index the shader forms is in bounds, exactly as P8.61 and P8.62 argued.
+
+**Answer 2 — and that is because the faulting kernel is a different one.**
+`launchKernel` only RECORDS a `vkCmdDispatch`, and `submit()` signals a timeline
+semaphore instead of waiting on a fence, so a batch is still executing while the
+trace prints its `OK` lines.  The trace's last line names the kernel recorded last,
+**not** the kernel running when the process died.  Adding `PXG_SYNC_EACH=1` — drain
+the stream after every launch — collapses that gap, and the trace ends:
+
+```
+[pxg-dispatch] sized updateTransformCacheAndBoundArrayLaunch ...     <- no OK line
+```
+
+The fault belongs to `updateTransformCacheAndBoundArrayLaunch`, dispatch **66**.
+`updateChangedAABBMgrHandlesLaunch` was merely the next kernel recorded.
+
+**The root cause, and it is not an engine bug this time.**  Dispatch 66 is the only
+kernel in the trace with an articulation branch, and that branch chases a pointer
+stored *inside* the articulation pool:
+
+```slang
+Ptr<PxgTransform28> linkBody2Worlds = Ptr<PxgTransform28>(
+    artiLinkTransformArray(gArticulations, articulationId, PXG_ARTI_LINK_BODY2WORLDS_OFFSET));
+```
+
+`mArticulationPool` is filled by `newArticulationsLaunch`, which copies the staged
+`PxgArticulation` records (PxgSimulationCore.cpp:935) into the pool.  That kernel is
+**unmapped** — manifest row 27, `{ "newArticulationsLaunch", nullptr, nullptr }` — and
+its launch result is `PX_UNUSED`'d (PxgSimulationCore.cpp:2391), so nothing is even
+printed.  The pool therefore holds uninitialised memory, `linkBody2Worlds` is
+whatever bytes were there, and the shader dereferences a wild address.  Consistent
+with the fault: `rip` in an anonymous `r-xp` mapping (JIT'd shader code) on the
+lavapipe queue thread, `si_addr` unreportable.
+
+**So Phase 0 is not a workaround, it is the first port.**  The articulation scene
+does not need an engine-side guard; it needs `newArticulationsLaunch` mapped.  That
+is sub-chain 1, kernel 1 of the articulation plan — the scene named its own next
+kernel, which is exactly how the softbody and convex-trimesh chains were built.
+
+**What ships here** is the diagnostic that made this findable: `PXG_SYNC_EACH=1` in
+`PxgVulkanCudaContext`, one submit-and-wait per launch, off by default and paired
+with `PXG_LAUNCH_TRACE=1`.  The comment on `traceDispatch` that claimed a
+pre-dispatch line "attributes a GPU fault to the exact launch" is corrected — it
+cannot, on its own, and believing it did cost P8.61 through P8.63.
+
+*Kept deliberately, because the shape of the error matters more than the error:*
+those three tranches each reasoned carefully and each reached a sound conclusion
+about the wrong kernel.  Nothing in the reasoning was going to catch that; only
+changing the measurement was.  When a fault is attributed by "what printed last",
+check what "last" means before trusting the name.
+
+Suite **693/693 in both memory modes**, count unchanged — the new env knob is inert
+when unset and there is no shader change to sweep.  One run of the `PXG_DEVICE_V2`
+pass hit the **known intermittent `gpuslang.scan` segfault under `-j4`** (2 in 9 runs
+as of P8.53, still unattributed, still open); it passed on immediate rerun.  Recorded
+rather than hidden: it is the same open item, not a regression from this tranche.
+
 ## P8.63 — the asymmetry is one hop from resolved, and the hop is named
 
 P8.62 flagged that PxgSimulationCore.cpp:2177 pairs the **AABB manager's** handle

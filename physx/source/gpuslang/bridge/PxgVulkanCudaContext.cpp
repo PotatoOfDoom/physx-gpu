@@ -274,9 +274,14 @@ public:
         std::fprintf(stderr, "[pxg-launch] %s %s %s\n", form, name, ok ? "OK" : "REFUSED");
     }
 
-    // PXG_LAUNCH_TRACE=1: name the kernel BEFORE the dispatch, so a shader-side
-    // GPU fault (which never returns to print the "OK" line) is still attributed
-    // to the exact launch that triggered it.
+    // PXG_LAUNCH_TRACE=1: name the kernel BEFORE handing it to the shim, so the
+    // trace brackets every launch with a "...\" line and an "OK"/"REFUSED" line.
+    //
+    // NOTE what this does NOT buy on its own: launchKernel only RECORDS a
+    // vkCmdDispatch, and submission signals a timeline semaphore rather than
+    // waiting on a fence, so a batch of dispatches is still in flight when the
+    // "OK" lines print.  A shader that faults therefore kills the process
+    // several trace lines after the launch that caused it — see syncEachLaunch.
     void traceDispatch(const char* form, PxgKernelId id)
     {
         static const bool on = std::getenv("PXG_LAUNCH_TRACE") != nullptr;
@@ -287,6 +292,26 @@ public:
             : (id < mManifestCount && mManifest[id].entry ? mManifest[id].entry : "?");
         std::fprintf(stderr, "[pxg-dispatch] %s %s ...\n", form, name);
         std::fflush(stderr);
+    }
+
+    // PXG_SYNC_EACH=1: drain the stream after every launch, turning the
+    // asynchronous submission model into one dispatch per submit-and-wait.
+    //
+    // This is the tool that ATTRIBUTES a GPU-side fault.  Without it the trace's
+    // last line names whichever kernel was recorded last, not the one executing
+    // when the process died -- which cost four tranches of work chasing
+    // updateChangedAABBMgrHandlesLaunch for a fault that belonged to
+    // updateTransformCacheAndBoundArrayLaunch, its immediate predecessor.  With
+    // it, the kernel whose "[pxg-dispatch] ..." line has no matching "OK" line
+    // is exactly the kernel that faulted.
+    //
+    // Ruinous for throughput, so it is opt-in and off by default; pair it with
+    // PXG_LAUNCH_TRACE=1, which is what makes the missing "OK" readable.
+    void syncEachLaunch()
+    {
+        static const bool on = std::getenv("PXG_SYNC_EACH") != nullptr;
+        if (on)
+            mShim->streamSynchronize(0u);
     }
 
     // Pinned-host pointer arguments: substitute the buffer device address.
@@ -376,6 +401,7 @@ public:
         traceDispatch("sized", id);
         const PxgResult res = mShim->launchKernel(id, gridDimX, gridDimY, gridDimZ, blob.data(),
                                                   uint32_t(blob.size()));
+        syncEachLaunch();
         traceLaunch("sized", id, res == PxgResult::Success);
         return record(res);
     }
@@ -423,6 +449,7 @@ public:
         traceDispatch("void**", id);
         const PxgResult res = mShim->launchKernel(id, gridDimX, gridDimY, gridDimZ, blob.data(),
                                                   uint32_t(blob.size()));
+        syncEachLaunch();
         traceLaunch("void**", id, res == PxgResult::Success);
         return record(res);
     }
