@@ -1694,6 +1694,53 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.60 — CONFIRMED: an articulation-only island empties `solverBodyReferences`
+
+The read, not the write, was the fault — and the cause is an **array-sizing
+mismatch that only an articulation-only island can produce**.
+
+`mSolverBodyReferences` is allocated as `totalActiveBodyCount * numSlabs`
+(PxgTGSCudaSolverCore.cpp:552) and memset to `INVALID`.  But
+`initializeSolverVelocitiesTGS` indexes it as
+`numSlabs * (bodyId - bodyOffset) + b` with `bodyId < numSolverBodies`.  Those are
+two different counts.  My P8.55 scene had **no plain dynamic rigid body at all** —
+just the articulation — so `totalActiveBodyCount` was zero, the allocation was
+empty, and the shader read straight off the end of it.
+
+**The experiment that proves it:** add one ordinary dynamic box beside the
+articulation, change nothing else.
+
+| | dispatches before the fault |
+|---|---|
+| articulation alone | **52** — dies in `initializeSolverVelocitiesTGS` |
+| articulation + one rigid body | **67** — sails past it |
+
+Fifteen dispatches further, through the entire solver phase, and the run now emits
+ordinary `fail to launch kernel` messages for the unmapped `arti*` kernels
+(`solveInternalConstraints`, `solveSelfConstraints`,
+`artiSolveInternalTendonAndMimicJointConstraints1T`) — the graceful degradation
+every other subsystem has, and exactly what the one-kernel-at-a-time route needs.
+
+**The crash has MOVED, not gone.**  The process still dies, now at dispatch 67 in
+`updateChangedAABBMgrHandlesLaunch`.  That is a different problem in a different
+subsystem and is not claimed to be understood.
+
+*(A caveat on my own earlier reading: one intermediate run of this experiment
+appeared to exit cleanly.  It did not — `... | grep | head` had closed the pipe and
+`$?` reported head's status, not the program's.  The scene has never yet completed.)*
+
+**What this unblocks.**  P8.55 concluded that articulations "cannot be driven
+forward the usual way until this fault is understood".  It is understood, and the
+route is open: with a companion rigid body the articulation scene reaches the
+articulation kernels and names them one at a time, which is how the softbody and
+convex-trimesh chains were built.
+
+**And a bug worth reporting upstream, separately from this port:** the sizing
+mismatch is in the ENGINE, not in the Slang translation.  The CUDA reads the same
+empty array with the same indices; it survives only because a real GPU tolerates
+the out-of-bounds read where llvmpipe faults.  An articulation-only island on CUDA
+is reading uninitialised memory too — it just does not crash.
+
 ## P8.59 — the pool bound lands; it does NOT fix the articulation crash
 
 P8.58 deferred bounding `remappedBodyIndex` because the descriptor "carries no

@@ -404,6 +404,18 @@ void buildArticulationScene(PxPhysics* physics, PxScene* scene, PxMaterial* mate
 
     scene->addArticulation(*arti);
 
+    // A PLAIN DYNAMIC BODY ALONGSIDE THE ARTICULATION.  Not decoration: the solver
+    // sizes mSolverBodyReferences as totalActiveBodyCount * numSlabs
+    // (PxgTGSCudaSolverCore.cpp:552) while initializeSolverVelocitiesTGS indexes it
+    // by numSolverBodies.  An articulation-only island makes the first count zero
+    // and the second non-zero, so the array is empty and the shader reads off the
+    // end.  Adding one rigid body is the experiment that separates that from every
+    // other explanation -- see the P8.60 entry in RUNTIME_STATUS.md.
+    addGroundBox(physics, scene, material);
+    PxRigidDynamic* b = addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                   boxInertia(PxVec3(0.5f), 1000.0f), 5.0f);
+    targets.push_back({ b, 5.0f, 0.5f, "artiCompanionBox" });
+
     // Hanging straight down puts the link centre one half-length below the hinge.
     targets.push_back({ link, baseY, baseY - linkHalf, "artiLink" });
 }
