@@ -1497,3 +1497,130 @@ void artiJcalcGpuDirty(uint3 groupThreadId : SV_GroupThreadID)
                        gJcalcGpuDirty.maxNumAttachments, gJcalcGpuDirty.maxNumTendonJoints,
                        lane);
 }
+
+
+// ===========================================================================
+// P8.80: initialize() and the block-header fill
+// ===========================================================================
+//
+// Two functions that bracket jcalc in computeUnconstrainedVelocitiesInternal1T:
+// the header fill (:941-957, guarded by `refillBlockData || confiDirty`) runs
+// before it, `initialize()` (:62-102) between them.  Both are plain SoA writes --
+// but between them they touch FOUR element strides, which is the only thing here
+// that can go quietly wrong:
+//
+//   PxU32[32]/PxReal[32]  4 bytes   the counters, the header words
+//   PxU8[32]             1 byte    mStateDirty -- four lanes per word, so the
+//                                  atomic and/or pair, not a plain store
+//   float4[32]           16 bytes  mDeltaQ
+//   pointer[32]          8 bytes   mMotionVelocitiesPtr
+//
+// THE ONE NON-ZERO WRITE IN A FUNCTION WHOSE JOB IS ZEROING: `mDeltaQ` is set to
+// the IDENTITY QUATERNION (0,0,0,1), not to zero.  A memset-shaped port produces a
+// zero quaternion, which is not a rotation at all and will not announce itself
+// until something rotates by it.
+//
+// Same oracle caveat as P8.73-P8.79: __device__-only, expectation from the
+// fixture, carried by generated offsets, whole-region poison comparison and the
+// sweep.
+
+struct JcalcInitParams
+{
+    uint64_t articulations;
+    uint64_t artiBlocks;
+    uint64_t linkBlocks;
+    uint64_t dofBlocks;
+    uint numLinks;
+    uint totalDofs;
+    uint articulationIndex;
+    float sleepThreshold;
+    uint nbArticulations;
+    uint doHeader;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<JcalcInitParams> gJcalcInit;
+
+// zero a PxgSpatialVectorBlock lane
+void jcalcZeroSpatialVector(uint64_t blk, uint fieldOffset, uint lane)
+{
+    abStoreSpatialVector(blk, fieldOffset, lane, float3(0.0f, 0.0f, 0.0f),
+                         float3(0.0f, 0.0f, 0.0f));
+}
+
+void jcalcInitializeBlocks(uint64_t artiBlock, uint64_t linkBlocks, uint64_t dofBlocks,
+                           uint numLinks, uint totalDofs, uint lane)
+{
+    for (uint i = 0u; i < numLinks; ++i)
+    {
+        const uint64_t blk = linkBlocks + uint64_t(i) * PXG_AB_LINK_SIZE;
+
+        jcalcZeroSpatialVector(blk, PXG_AB_LINK_mDeltaMotion, lane);
+        jcalcZeroSpatialVector(blk, PXG_AB_LINK_mPosMotionVelocity, lane);
+        // the identity quaternion, NOT zero
+        abStoreF4(blk, PXG_AB_LINK_mDeltaQ, lane, float4(0.0f, 0.0f, 0.0f, 1.0f));
+        jcalcZeroSpatialVector(blk, PXG_AB_LINK_mScratchImpulse, lane);
+        jcalcZeroSpatialVector(blk, PXG_AB_LINK_mSolverSpatialDeltaVel, lane);
+        jcalcZeroSpatialVector(blk, PXG_AB_LINK_mSolverSpatialImpulse, lane);
+        jcalcZeroSpatialVector(blk, PXG_AB_LINK_mSolverSpatialInternalConstraintImpulse, lane);
+        jcalcZeroSpatialVector(blk, PXG_AB_LINK_mConstraintForces, lane);
+
+        abStoreU32(blk, PXG_AB_LINK_mStaticContactStartIndex, lane, 0u);
+        abStoreU32(blk, PXG_AB_LINK_mNbStaticContacts, lane, 0u);
+        abStoreU32(blk, PXG_AB_LINK_mStaticJointStartIndex, lane, 0u);
+        abStoreU32(blk, PXG_AB_LINK_mNbStaticJoints, lane, 0u);
+        abStoreF32(blk, PXG_AB_LINK_mDeltaScale, lane, 0.0f);
+    }
+
+    jcalcZeroSpatialVector(artiBlock, PXG_AB_mRootDeferredZ, lane);
+    jcalcZeroSpatialVector(artiBlock, PXG_AB_mCommonLinkDeltaVelocity, lane);
+    abStoreU32(artiBlock, PXG_AB_mLinkWithDeferredImpulse, lane, 0u);
+
+    for (uint i = 0u; i < totalDofs; ++i)
+    {
+        const uint64_t dof = dofBlocks + uint64_t(i) * PXG_AB_DOF_SIZE;
+        abStoreF32(dof, PXG_AB_DOF_mDeferredQstZ, lane, 0.0f);
+        abStoreF32(dof, PXG_AB_DOF_mInvStIsT_x, lane, 0.0f);
+        abStoreF32(dof, PXG_AB_DOF_mInvStIsT_y, lane, 0.0f);
+        abStoreF32(dof, PXG_AB_DOF_mInvStIsT_z, lane, 0.0f);
+    }
+}
+
+// `articulationIndex` and `sleepThreshold` come from OUTSIDE the articulation
+// record -- the remap id and the body sim's sleep threshold, both of which the
+// launch wrapper resolves -- so they are parameters rather than reads.
+void jcalcFillBlockHeader(uint64_t a, uint64_t artiBlock, uint articulationIndex,
+                          float sleepThreshold, uint lane)
+{
+    abStoreU32(artiBlock, PXG_AB_mNumLinks, lane,
+               artiU16Field(a, PXG_ARTI_DATA_NUM_LINKS));
+    abStoreU32(artiBlock, PXG_AB_mTotalDofs, lane,
+               artiU16Field(a, PXG_ARTI_DATA_NUM_JOINT_DOFS));
+    // flags is a PxU8 in the record and a PxU32 in the block
+    abStoreU32(artiBlock, PXG_AB_mFlags, lane, artiU8Field(a, PXG_ARTI_DATA_FLAGS));
+    abStoreU32(artiBlock, PXG_AB_mArticulationIndex, lane, articulationIndex);
+    abStoreF32(artiBlock, PXG_AB_mSleepThreshold, lane, sleepThreshold);
+    // mStateDirty is a PxU8[32]: four lanes per word
+    abStoreU8(artiBlock, PXG_AB_mStateDirty, lane, 0u);
+    // a device POINTER lane array: 8-byte stride among 4-byte neighbours
+    abStoreU64(artiBlock, PXG_AB_mMotionVelocitiesPtr, lane,
+               artiPtrField(a, PXG_ARTI_MOTION_VELOCITIES));
+}
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void artiJcalcInit(uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint lane = groupThreadId.x;
+    if (lane >= gJcalcInit.nbArticulations)
+        return;
+
+    const uint64_t a = gJcalcInit.articulations + uint64_t(lane) * PXG_ARTI_STRIDE;
+
+    if (gJcalcInit.doHeader != 0u)
+        jcalcFillBlockHeader(a, gJcalcInit.artiBlocks, gJcalcInit.articulationIndex + lane,
+                             gJcalcInit.sleepThreshold + float(lane), lane);
+
+    jcalcInitializeBlocks(gJcalcInit.artiBlocks, gJcalcInit.linkBlocks, gJcalcInit.dofBlocks,
+                          gJcalcInit.numLinks, gJcalcInit.totalDofs, lane);
+}

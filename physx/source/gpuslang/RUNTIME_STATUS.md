@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **704/704** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **705/705** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,57 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.80 — `initialize()` and the block-header fill
+
+The two functions that bracket `jcalc` inside
+`computeUnconstrainedVelocitiesInternal1T`: the header fill (:941-957, guarded by
+`refillBlockData || confiDirty`) and `initialize()` (:62-102).  Suite 704 → **705**;
+manifest unchanged at **270 of 501**.
+
+There is no arithmetic here at all — the entire risk surface is that between them
+these two functions touch **four element strides in one basic block**:
+
+| | | |
+|---|---|---|
+| `PxU32[32]` / `PxReal[32]` | 4 bytes | the counters and header words |
+| `PxU8[32]` | 1 byte | `mStateDirty` — four lanes per word, so the atomic pair |
+| `float4[32]` | 16 bytes | `mDeltaQ` |
+| pointer `[32]` | 8 bytes | `mMotionVelocitiesPtr` |
+
+**The one non-zero write in a function whose entire job is zeroing** is `mDeltaQ`,
+set to the **identity quaternion `(0,0,0,1)`**.  A `memset`-shaped port yields a zero
+quaternion — not a rotation at all — and nothing complains until something rotates by
+it.  Both mutants aimed at it die: zeroing it outright, and putting the 1 in `x`.
+
+No new ABI.  `mSleepThreshold` comes from
+`bodySim.freezeThresholdX_wakeCounterY_sleepThresholdZ_bodySimIndex.z` and
+`PxgBodySim` is already mirrored in `pxgSlangCommon.slang`; `articulationIndex` and
+the sleep threshold are **parameters** rather than record reads, because both are
+resolved by the launch wrapper — which is what keeps the function composable for
+P8.82.
+
+**Sweep: 16 of 16 — after two fixture fixes, both of them the same lesson again.**
+The first pass was 14/16:
+
+* *"the per-link loop runs over `totalDofs`"* survived because the link block array
+  was allocated at exactly `numLinks`, so the extra iterations wrote **past the end
+  of the checked region** and the comparison never saw them.  Sizing the array past
+  `numLinks` (6 blocks for 3 links) kills it.  **An overrun has to land somewhere the
+  test looks** — poison only proves anything inside the region you read back.
+* *"`flags` read as a word instead of a byte"* survived because the record was
+  `memset` to **zero**: `flags` is a `PxU8` at offset 26 with `confiDirty` at 27 and
+  `numPathToRoots` at 28, so a word read there returned `flags` exactly.  Poisoning
+  the record to 0xEE kills it.  That is the **fourth** time in this chain a
+  convenient zero or a coincidental equality has hidden a mutant — after `nbDof`'s
+  zeroed neighbours (P8.72), `mNbElements == maxNumAttachments` (P8.78) and
+  `numLinks == totalDofs` (P8.79).
+
+Loop bounds in this fixture are deliberately all different — 5 lanes, 3 links, 6
+dofs — for exactly that reason.
+
+Suite **705/705** both memory modes.  What remains: the fused C2P/link-velocity loop
+(P8.81, where the engine oracle returns) and the wrapper (P8.82).
 
 ## P8.79 — the `gpuDirtyFlag` block, and the refactor it forced
 
