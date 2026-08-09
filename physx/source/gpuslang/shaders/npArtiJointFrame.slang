@@ -1624,3 +1624,178 @@ void artiJcalcInit(uint3 groupThreadId : SV_GroupThreadID)
     jcalcInitializeBlocks(gJcalcInit.artiBlocks, gJcalcInit.linkBlocks, gJcalcInit.dofBlocks,
                           gJcalcInit.numLinks, gJcalcInit.totalDofs, lane);
 }
+
+
+// ===========================================================================
+// P8.81: the fused computeRelativeTransformC2P + computeLinkVelocities loop
+// (forwardDynamic2.cu:971-1053)
+// ===========================================================================
+//
+// The last piece of real work in computeUnconstrainedVelocitiesInternal1T, and
+// the only part of it with actual NUMERICS rather than data movement -- which is
+// why it is also the first tranche since P8.69 with a real engine oracle:
+// Cm::UnAlignedSpatialVector::rotate is PX_CUDA_CALLABLE, so the fixture computes
+// the expectation with the engine's own arithmetic on the host and compares bit
+// patterns.  npArtiJointFrame is in PXG_NOCONTRACT_SHADERS, so no a*b+c is fused
+// behind the transcription's back.
+//
+// FOUR THINGS TRANSCRIBED RATHER THAN TIDIED:
+//
+//  1. TWO PASSES, NOT ONE.  The velocity-clamp `ratio` is the minimum over EVERY
+//     dof and is only then applied.  Fusing the passes would scale early dofs by a
+//     ratio a later dof would have lowered.
+//
+//  2. `dofs` IS A RUNNING CURSOR, not `jointOffset + i`.  It advances once per
+//     active dof, and the dof count comes from the LINK BLOCK's mDofs (phase B2
+//     filled it), not from the record.  After jcalc the two agree; the cursor is
+//     what the engine actually walks.
+//
+//  3. THE ROOT'S mPreTransform IS A RAW float4 COPY of mAccumulatedPose, `p.w`
+//     included; every other link goes through storeSpatialTransform, which writes
+//     `p.w = 0`.  That asymmetry is observable, and a port that unifies the two
+//     code paths silently changes the root's fourth component.
+//
+//  4. rootPreMotionVelocity is written THROUGH THE RECORD, not the block, and it
+//     is a single Cm::UnAlignedSpatialVector rather than an array.
+//
+// The parent's motion velocity is read from the block after an earlier iteration
+// wrote it, so the link loop is strictly sequential -- `parents[linkID] < linkID`
+// is the engine invariant that makes that safe.
+
+struct JcalcVelParams
+{
+    uint64_t articulations;
+    uint64_t linkBlocks;
+    uint64_t dofBlocks;
+    uint numLinks;
+    uint nbArticulations;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<JcalcVelParams> gJcalcVel;
+
+// PxTransform::rotate(v) = q.rotate(v), spelled out rather than left to a builtin
+float3 jcalcQuatRotate(float4 q, float3 v)
+{
+    const float vx = 2.0f * v.x;
+    const float vy = 2.0f * v.y;
+    const float vz = 2.0f * v.z;
+    const float w2 = q.w * q.w - 0.5f;
+    const float dot2 = (q.x * vx + q.y * vy + q.z * vz);
+    return float3((vx * w2 + (q.y * vz - q.z * vy) * q.w + q.x * dot2),
+                  (vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * dot2),
+                  (vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * dot2));
+}
+
+float3 jcalcCross(float3 a, float3 b)
+{
+    return float3(a.y * b.z - a.z * b.y,
+                  a.z * b.x - a.x * b.z,
+                  a.x * b.y - a.y * b.x);
+}
+
+void jcalcComputeLinkVelocities(uint64_t a, uint64_t linkBlocks, uint64_t dofBlocks,
+                                uint numLinks, uint lane)
+{
+    // ---- the root's pre-transform, a raw float4 copy (see note 3) ----
+    const float4 rootQ = abF4(linkBlocks, PXG_AB_LINK_mAccumulatedPose + PXG_AB_STB_Q, lane);
+    const float4 rootP = abF4(linkBlocks, PXG_AB_LINK_mAccumulatedPose + PXG_AB_STB_P, lane);
+    abStoreF4(linkBlocks, PXG_AB_LINK_mPreTransform + PXG_AB_STB_Q, lane, rootQ);
+    abStoreF4(linkBlocks, PXG_AB_LINK_mPreTransform + PXG_AB_STB_P, lane, rootP);
+
+    float3 rootTop, rootBottom;
+    abLoadSpatialVector(linkBlocks, PXG_AB_LINK_mMotionVelocity, lane, rootTop, rootBottom);
+
+    // ---- PASS ONE: the clamp ratio over every dof ----
+    float ratio = 1.0f;
+    {
+        uint cursor = 0u;
+        for (uint linkID = 1u; linkID < numLinks; ++linkID)
+        {
+            const uint64_t blk = linkBlocks + uint64_t(linkID) * PXG_AB_LINK_SIZE;
+            const uint dof = abU8(blk, PXG_AB_LINK_mDofs, lane);
+            for (uint ind = 0u; ind < 3u; ++ind)
+            {
+                if (ind < dof)
+                {
+                    const uint64_t d = dofBlocks + uint64_t(cursor) * PXG_AB_DOF_SIZE;
+                    const float maxJVelocity =
+                        abF32(d + PXG_AB_DOF_mConstraintData, PXG_AB_IC_mMaxJointVelocity, lane);
+                    const float jVel = abF32(d, PXG_AB_DOF_mJointVelocities, lane);
+                    if (jVel != 0.0f)
+                        ratio = min(ratio, maxJVelocity / abs(jVel));
+                    ++cursor;
+                }
+            }
+        }
+    }
+
+    // ---- the root's pre-motion velocity, through the RECORD ----
+    ajStoreSpatialVector(artiPtrField(a, PXG_ARTI_ROOT_PRE_MOTION_VELOCITY),
+                         rootTop, rootBottom);
+
+    // ---- PASS TWO ----
+    uint cursor = 0u;
+    for (uint linkID = 1u; linkID < numLinks; ++linkID)
+    {
+        const uint64_t blk = linkBlocks + uint64_t(linkID) * PXG_AB_LINK_SIZE;
+        const uint parent = abU32(blk, PXG_AB_LINK_mParents, lane);
+        const uint64_t pblk = linkBlocks + uint64_t(parent) * PXG_AB_LINK_SIZE;
+
+        // loadSpatialTransform drops p.w; storeSpatialTransform writes it back as 0
+        const float4 q = abF4(blk, PXG_AB_LINK_mAccumulatedPose + PXG_AB_STB_Q, lane);
+        const float4 p = abF4(blk, PXG_AB_LINK_mAccumulatedPose + PXG_AB_STB_P, lane);
+        const uint dof = abU8(blk, PXG_AB_LINK_mDofs, lane);
+
+        float3 vTop, vBottom;
+        abLoadSpatialVector(pblk, PXG_AB_LINK_mMotionVelocity, lane, vTop, vBottom);
+        const float4 pp = abF4(pblk, PXG_AB_LINK_mAccumulatedPose + PXG_AB_STB_P, lane);
+
+        abStoreSpatialTransform(blk, PXG_AB_LINK_mPreTransform, lane, q, p.xyz);
+
+        const float3 rw = float3(p.x - pp.x, p.y - pp.y, p.z - pp.z);
+        abStoreF32(blk, PXG_AB_LINK_mRw_x, lane, rw.x);
+        abStoreF32(blk, PXG_AB_LINK_mRw_y, lane, rw.y);
+        abStoreF32(blk, PXG_AB_LINK_mRw_z, lane, rw.z);
+
+        // translateSpatialVectorInPlace(-rw, v): bottom += offset.cross(top)
+        vBottom += jcalcCross(float3(-rw.x, -rw.y, -rw.z), vTop);
+
+        for (uint ind = 0u; ind < 3u; ++ind)
+        {
+            if (ind < dof)
+            {
+                const uint64_t d = dofBlocks + uint64_t(cursor) * PXG_AB_DOF_SIZE;
+
+                float3 mmTop, mmBottom;
+                abLoadSpatialVector(d, PXG_AB_DOF_mLocalMotionMatrix, lane, mmTop, mmBottom);
+                // UnAlignedSpatialVector::rotate rotates BOTH halves
+                const float3 wTop = jcalcQuatRotate(q, mmTop);
+                const float3 wBottom = jcalcQuatRotate(q, mmBottom);
+
+                const float jVel = abF32(d, PXG_AB_DOF_mJointVelocities, lane) * ratio;
+                vTop += wTop * jVel;
+                vBottom += wBottom * jVel;
+
+                abStoreF32(d, PXG_AB_DOF_mJointVelocities, lane, jVel);
+                abStoreSpatialVector(d, PXG_AB_DOF_mWorldMotionMatrix, lane, wTop, wBottom);
+                ++cursor;
+            }
+        }
+
+        abStoreSpatialVector(blk, PXG_AB_LINK_mMotionVelocity, lane, vTop, vBottom);
+    }
+}
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void artiJcalcLinkVel(uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint lane = groupThreadId.x;
+    if (lane >= gJcalcVel.nbArticulations)
+        return;
+
+    jcalcComputeLinkVelocities(gJcalcVel.articulations + uint64_t(lane) * PXG_ARTI_STRIDE,
+                               gJcalcVel.linkBlocks, gJcalcVel.dofBlocks,
+                               gJcalcVel.numLinks, lane);
+}

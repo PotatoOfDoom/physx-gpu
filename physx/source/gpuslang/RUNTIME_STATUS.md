@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **705/705** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **706/706** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,64 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.81 — the fused C2P + link-velocity loop, and the oracle comes back
+
+forwardDynamic2.cu:971-1053, the last piece of real work in
+`computeUnconstrainedVelocitiesInternal1T` and the **only part of it with actual
+numerics** rather than data movement.  Suite 705 → **706**; manifest unchanged at
+**270 of 501**.  One new ABI constant, `rootPreMotionVelocity` at 104, generated and
+pinned.
+
+**The oracle is back.**  Every tranche since P8.69 compared against a *transcribed*
+expectation, because `jcalc` and its neighbours are `__device__`-only.  This one is
+different: `Cm::UnAlignedSpatialVector::rotate` is `PX_CUDA_CALLABLE`, so the fixture
+computes the expectation **by calling the engine** — its `rotate`, its
+`PxVec3::cross`, its `PxMin`/`PxAbs` — on the host and compares bit patterns.
+Nothing about the maths is transcribed, and it was bit-exact on the first run.
+
+**Four behaviours transcribed rather than tidied, each with its mutant dead:**
+
+1. **Two passes, not one.**  The clamp ratio is the minimum over *every* dof and only
+   then applied.  The fixture puts the tightest limit on the **last** dof, so a fused
+   single pass scales the earlier ones by 1 and fails.
+2. **`dofs` is a running cursor**, driven by the link block's `mDofs` (phase B2
+   filled it), not indexed by a joint offset.  Dof counts are 2/1/3 — all different
+   and none equal to its `linkID`.
+3. **The root's `mPreTransform` is a raw `float4` copy of `mAccumulatedPose`, `p.w`
+   included; every other link goes through `storeSpatialTransform`, which writes
+   `p.w = 0`.**  The fixture puts a non-zero value in every accumulated pose's `p.w`,
+   so the root's must survive and the links' must not.  **Both** mutants die — the one
+   that unifies on the store path and the one that unifies on the copy path.
+4. `rootPreMotionVelocity` is written **through the record**, not the block.
+
+**Sweep: 19 of 20, and the survivor is proven equivalent by measurement.**
+
+`U16` (mRw_y/mRw_z swapped) survived the first pass and was a **real fixture gap**:
+link positions were built as `(fv(4), fv(5), fv(6)) * 8`, a linear ramp, so the
+per-component offsets were the same constant for every link and
+`rw = p_child - p_parent` came out with `rw.y == rw.z` *exactly*.  Different
+multipliers plus a quadratic term break the cancellation and the mutant dies.  That
+is the fifth fixture coincidence this chain has surfaced — and the first one that was
+an arithmetic degeneracy rather than an equal size or a zeroed neighbour.
+
+`U19` (dropping the `jVel != 0` guard on the clamp) survives, and the reason is
+measured, not assumed:
+
+* with a **non-zero** limit, `k / |0| = +inf` and `min(ratio, +inf) = ratio` — the
+  guard is provably a no-op;
+* the only input that could discriminate it is a **zero limit on a zero-velocity
+  dof**, i.e. `0/0 = NaN`.  That case was added to the fixture explicitly, and the
+  mutant **still** survives: llvmpipe's `min` returns the non-NaN operand.
+
+So the guard cannot be discriminated on this driver at all.  It stays, for two
+reasons: the CUDA has it, and SPIR-V's `FMin` with a NaN operand is *not* specified
+to behave the way `NMin` does — this is a driver behaviour we measured, not a
+guarantee we can port on.
+
+Suite **706/706** both memory modes.  With this, everything
+`computeUnconstrainedVelocities1TLaunch` is made of is ported; what remains is the
+wrapper, the ABI row and the manifest entry (P8.82) — **270 → 271**.
 
 ## P8.80 — `initialize()` and the block-header fill
 

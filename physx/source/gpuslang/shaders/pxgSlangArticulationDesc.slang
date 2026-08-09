@@ -70,6 +70,9 @@ public static const uint PXG_ARTI_MOTION_VELOCITIES = 56;
 public static const uint PXG_ARTI_MOTION_ACCELERATIONS = 64;
 public static const uint PXG_ARTI_CORIOLISE_VECTORS = 80;
 public static const uint PXG_ARTI_EXTERNAL_ACCELERATIONS = 96;
+public static const uint PXG_ARTI_ROOT_PRE_MOTION_VELOCITY = 104;  // a SINGLE
+                                                                  // Cm::UnAlignedSpatialVector,
+                                                                  // not an array
 public static const uint PXG_ARTI_JOINT_POSITIONS = 112;
 public static const uint PXG_ARTI_JOINT_VELOCITIES = 120;
 public static const uint PXG_ARTI_JOINT_FORCE = 136;

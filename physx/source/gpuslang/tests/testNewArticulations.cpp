@@ -147,6 +147,8 @@ static_assert(sizeof(PxGpuFixedTendonData) == 32, "PXG_ARTI_FIXED_TENDON_DATA_SI
 static_assert(offsetof(PxgArticulationTendon, mFixedElements) == 0, "PXG_TENDON_FIXED_ELEMENTS");
 static_assert(offsetof(PxgArticulationTendon, mModElements) == 8, "PXG_TENDON_MOD_ELEMENTS");
 static_assert(offsetof(PxgArticulationTendon, mNbElements) == 16, "PXG_TENDON_NB_ELEMENTS");
+static_assert(offsetof(PxgArticulation, rootPreMotionVelocity) == 104,
+              "PXG_ARTI_ROOT_PRE_MOTION_VELOCITY");
 
 static_assert(sizeof(PxgArticulationSimUpdate) == 48, "PxgArticulationSimUpdateGpu stride");
 static_assert(offsetof(PxgArticulationSimUpdate, dirtyFlags) == 0, "dirtyFlags");
