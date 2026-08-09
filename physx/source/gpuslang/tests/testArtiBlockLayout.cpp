@@ -89,6 +89,8 @@ static_assert(sizeof(PxgSpatialMatrixBlock) == 3584, "PXG_AB_SPATIAL_MATRIX_BLOC
 static_assert(sizeof(PxgSpatialTransformBlock) == 1024, "PXG_AB_SPATIAL_TRANSFORM_BLOCK_SIZE");
 static_assert(offsetof(PxgSpatialTransformBlock, q) == 0, "PXG_AB_STB_Q");
 static_assert(offsetof(PxgSpatialTransformBlock, p) == 512, "PXG_AB_STB_P");
+static_assert(sizeof(PxgArticulationBitFieldStackData) == 256, "PXG_AB_BITFIELD_STACK_SIZE");
+static_assert(offsetof(PxgArticulationBitFieldStackData, bitField) == 0, "bitField at 0");
 
 static_assert(sizeof(PxgArticulationBlockData) == 7168, "PXG_AB_BLOCK_SIZE");
 static_assert(offsetof(PxgArticulationBlockData, mInvSpatialArticulatedInertia) == 0, "PXG_AB_mInvSpatialArticulatedInertia");

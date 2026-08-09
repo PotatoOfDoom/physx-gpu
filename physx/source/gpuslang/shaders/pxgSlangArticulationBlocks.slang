@@ -70,6 +70,9 @@ public static const uint PXG_AB_SPATIAL_MATRIX_BLOCK_SIZE               =   3584
 public static const uint PXG_AB_SPATIAL_TRANSFORM_BLOCK_SIZE            =   1024;
 public static const uint PXG_AB_STB_Q                                   =      0;
 public static const uint PXG_AB_STB_P                                   =    512;
+// PxgArticulationBitFieldStackData is a lone `PxU64 bitField[32]`, so the field
+// offset is 0 and the only number that matters is the element stride.
+public static const uint PXG_AB_BITFIELD_STACK_SIZE                      =    256;
 
 public static const uint PXG_AB_BLOCK_SIZE                              =   7168;
 public static const uint PXG_AB_mInvSpatialArticulatedInertia           =      0;
@@ -349,4 +352,68 @@ public void abLoadSpatialVector(uint64_t base, uint fieldOffset, uint lane,
     const float2 b = abF2(base, fieldOffset + PXG_AB_SVB_BYZ, lane);
     top = t.xyz;
     bottom = float3(t.w, b.x, b.y);
+}
+
+// ---------------------------------------------------------------------------
+// Lane STORES (P8.73).  Mirror images of the loads above, with one exception
+// that is not cosmetic -- see abStoreU8.
+// ---------------------------------------------------------------------------
+public void abStoreU32(uint64_t base, uint fieldOffset, uint lane, uint value)
+{
+    (Ptr<uint>(base + uint64_t(fieldOffset)))[lane] = value;
+}
+
+public void abStoreF32(uint64_t base, uint fieldOffset, uint lane, float value)
+{
+    abStoreU32(base, fieldOffset, lane, asuint(value));
+}
+
+public void abStoreU64(uint64_t base, uint fieldOffset, uint lane, uint64_t value)
+{
+    (Ptr<uint64_t>(base + uint64_t(fieldOffset)))[lane] = value;
+}
+
+public void abStoreF4(uint64_t base, uint fieldOffset, uint lane, float4 value)
+{
+    (Ptr<float4>(base + uint64_t(fieldOffset)))[lane] = value;
+}
+
+// A PxU8[32] field: FOUR LANES SHARE ONE 32-BIT WORD, and they run concurrently.
+// CUDA issues a native byte store here and the lanes never meet; SPIR-V without
+// the Int8 capability cannot address a byte, so a naive read-modify-write would
+// have three of every four lanes lose their value to whichever neighbour wrote
+// last.  The and/or pair below is atomic per operation and each lane touches
+// disjoint bits, so any interleaving lands the same result -- the same fix
+// storeHeaderU16 (constraintPrepPGS.slang) uses for packed PxU16 header fields.
+//
+// NOTE this is NOT interchangeable with artiStoreU8Field in
+// pxgSlangArticulationDesc.slang: that one is a plain RMW documented as
+// single-writer-only, which is correct for the record structs (one thread per
+// articulation record) and wrong for every block field.
+public void abStoreU8(uint64_t base, uint fieldOffset, uint lane, uint value)
+{
+    Ptr<uint> w = Ptr<uint>(base + uint64_t(fieldOffset));
+    const uint shift = (lane & 3u) * 8u;
+    uint prev;
+    InterlockedAnd(w[lane >> 2], ~(0xFFu << shift), prev);
+    InterlockedOr(w[lane >> 2], (value & 0xFFu) << shift, prev);
+}
+
+public void abStoreSpatialVector(uint64_t base, uint fieldOffset, uint lane,
+                                 float3 top, float3 bottom)
+{
+    (Ptr<float4>(base + uint64_t(fieldOffset + PXG_AB_SVB_TOPXYZ_BX)))[lane] =
+        float4(top.x, top.y, top.z, bottom.x);
+    (Ptr<float2>(base + uint64_t(fieldOffset + PXG_AB_SVB_BYZ)))[lane] =
+        float2(bottom.y, bottom.z);
+}
+
+// PxgSpatialTransformBlock is float4 q[32] + float4 p[32]; the engine writes an
+// explicit 0 into p.w rather than leaving it, so the port does too.
+public void abStoreSpatialTransform(uint64_t base, uint fieldOffset, uint lane,
+                                    float4 q, float3 p)
+{
+    (Ptr<float4>(base + uint64_t(fieldOffset + PXG_AB_STB_Q)))[lane] = q;
+    (Ptr<float4>(base + uint64_t(fieldOffset + PXG_AB_STB_P)))[lane] =
+        float4(p.x, p.y, p.z, 0.0f);
 }

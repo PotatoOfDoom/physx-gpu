@@ -434,3 +434,156 @@ void artiJcalcPhaseA()
     // to it until the block copy in phase C has consumed it.
     artiStoreU8Field(a, PXG_ARTI_DATA_CONFI_DIRTY, 0u);
 }
+
+
+// ===========================================================================
+// P8.73: jcalc PHASE B part 1 -- the root link fill and the path-to-root
+// bitfields (forwardDynamic2.cu:437-467 and :553-566)
+// ===========================================================================
+//
+// Phase B copies the record into the BLOCK format, and this half of it does the
+// root link (which has no joint, so it is filled outside the per-link loop) plus
+// the whole path-to-root bitfield build.  The bitfield writes are lifted out of
+// the link loop deliberately: they are the only thing in that loop that does not
+// touch the link block, and keeping them together makes the wordSize indexing
+// checkable on its own.
+//
+// ---------------------------------------------------------------------------
+// THE HAZARD THAT IS NEW HERE: FOUR LANES PER WORD
+// ---------------------------------------------------------------------------
+//
+// Every thread here is one articulation -- `threadIndexInWarp` is the lane, and
+// the block arrays are shared by the whole warp.  mDofs, mDisableGravity and
+// mRetainsAcceleration are PxU8[32] fields, so lanes 0-3 write four bytes of the
+// SAME 32-bit word at the same time.  CUDA emits a byte store and the lanes never
+// interact; SPIR-V has no byte store here, so the port needs the atomic and/or
+// pair in abStoreU8 (pxgSlangArticulationBlocks.slang).  A plain read-modify-write
+// compiles, runs, and silently loses three writes in four.
+//
+// The 64-bit bitfields are the benign case: PxgArticulationBitFieldStackData is
+// PxU64[32], so each lane owns eight contiguous bytes and a load/or/store is
+// race-free.
+//
+// ---------------------------------------------------------------------------
+// VERIFICATION IS WEAKER HERE THAN IN PHASE A, AND THAT IS WORTH SAYING
+// ---------------------------------------------------------------------------
+//
+// Phase A's maths came from `setJointFrame`, which is PX_CUDA_CALLABLE, so the
+// fixture could call the engine.  `jcalc` itself is __device__-only: there is no
+// engine function to compare phase B against, and the expectation in
+// testArtiJcalcPhaseB1.cpp is therefore built by the fixture.  What carries the
+// weight instead is (a) every offset used below being generated from the engine
+// headers and pinned by static_assert, (b) the bitfields being derived a SECOND
+// way in the fixture -- by walking the parent chain rather than replaying this
+// loop -- and (c) a heavier mutation sweep.  That is not the same thing as an
+// oracle and the tranche note says so.
+
+struct JcalcB1Params
+{
+    uint64_t articulations;    // PxgArticulation[lane]
+    uint64_t linkBlocks;       // this warp's PxgArticulationBlockLinkData[maxNumLinks]
+    uint64_t bitFieldBlocks;   // this warp's bitfield rows [maxNumLinks * wordSize]
+    uint maxNumLinks;
+    uint nbArticulations;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<JcalcB1Params> gJcalcB1;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void artiJcalcPhaseB1(uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint lane = groupThreadId.x;
+    if (lane >= gJcalcB1.nbArticulations)
+        return;
+
+    const uint64_t a = gJcalcB1.articulations + uint64_t(lane) * PXG_ARTI_STRIDE;
+    const uint numLinks = artiU16Field(a, PXG_ARTI_DATA_NUM_LINKS);
+    const uint maxNumLinks = gJcalcB1.maxNumLinks;
+
+    const uint64_t links = artiPtrField(a, PXG_ARTI_LINKS);
+    const uint64_t body2Worlds = artiPtrField(a, PXG_ARTI_LINK_BODY2WORLDS);
+    const Ptr<uint> pathToRootElems = Ptr<uint>(artiPtrField(a, PXG_ARTI_PATH_TO_ROOT));
+
+    // ---- the root link block (element 0 of the warp's link block array) ----
+    const uint64_t root = gJcalcB1.linkBlocks;
+
+    abStoreU8(root, PXG_AB_LINK_mDisableGravity, lane,
+              artiU8Field(links, PXG_AR_LINK_disableGravity));
+    abStoreU8(root, PXG_AB_LINK_mRetainsAcceleration, lane,
+              artiU8Field(links, PXG_AR_LINK_retainsAccelerations));
+    // the root has no inbound joint, so its dof count is zero by definition and
+    // is written rather than copied
+    abStoreU8(root, PXG_AB_LINK_mDofs, lane, 0u);
+
+    abStoreF4(root, PXG_AB_LINK_mLinDampingX_AngDampingY_maxLinVelSqZ_maxAngVelSqW, lane,
+              float4(asfloat(artiU32Field(links, PXG_AR_LINK_linearDamping)),
+                     asfloat(artiU32Field(links, PXG_AR_LINK_angularDamping)),
+                     asfloat(artiU32Field(links, PXG_AR_LINK_maxLinearVelocitySq)),
+                     asfloat(artiU32Field(links, PXG_AR_LINK_maxAngularVelocitySq))));
+
+    // initialAngVelXYZ_penBiasClamp / initialLinVelXYZ_invMassW: the device sees
+    // two float4s where the host declares PxVec3+PxReal pairs over the same bytes,
+    // and only the xyz halves go into the motion velocity -- the .w components
+    // (penBiasClamp, invMass) are unrelated fields that happen to share the vector.
+    const float3 initAng = float3(asfloat(artiU32Field(links, PXG_AR_LINK_initialAngVel + 0u)),
+                                  asfloat(artiU32Field(links, PXG_AR_LINK_initialAngVel + 4u)),
+                                  asfloat(artiU32Field(links, PXG_AR_LINK_initialAngVel + 8u)));
+    const float3 initLin = float3(asfloat(artiU32Field(links, PXG_AR_LINK_initialLinVel + 0u)),
+                                  asfloat(artiU32Field(links, PXG_AR_LINK_initialLinVel + 4u)),
+                                  asfloat(artiU32Field(links, PXG_AR_LINK_initialLinVel + 8u)));
+    // Cm::UnAlignedSpatialVector(angular, linear) -- top is the ANGULAR half
+    abStoreSpatialVector(root, PXG_AB_LINK_mMotionVelocity, lane, initAng, initLin);
+
+    // PxTransform is { PxQuat q; PxVec3 p; }: q at +0, p at +16
+    const uint64_t b2w0 = body2Worlds;
+    abStoreSpatialTransform(root, PXG_AB_LINK_mAccumulatedPose, lane,
+                            float4(asfloat(artiU32Field(b2w0, 0u)),
+                                   asfloat(artiU32Field(b2w0, 4u)),
+                                   asfloat(artiU32Field(b2w0, 8u)),
+                                   asfloat(artiU32Field(b2w0, 12u))),
+                            float3(asfloat(artiU32Field(b2w0, 16u)),
+                                   asfloat(artiU32Field(b2w0, 20u)),
+                                   asfloat(artiU32Field(b2w0, 24u))));
+
+    abStoreU32(root, PXG_AB_LINK_mChildrenOffset, lane,
+               artiU32Field(links, PXG_AR_LINK_childrenOffset));
+    // numChildren is a PxU16 in the record and a PxU32 in the block
+    abStoreU32(root, PXG_AB_LINK_mNumChildren, lane,
+               artiU16Field(links, PXG_AR_LINK_numChildren));
+
+    // ---- the path-to-root bitfields ----
+    const uint wordSize = (maxNumLinks + 63u) / 64u;
+    const uint64_t bf = gJcalcB1.bitFieldBlocks;
+
+    for (uint i = 0u; i < maxNumLinks * wordSize; ++i)
+        abStoreU64(bf + uint64_t(i) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane, uint64_t(0));
+
+    // the root is on its own path
+    abStoreU64(bf, 0u, lane, abU64(bf, 0u, lane) | uint64_t(1));
+
+    for (uint linkID = 1u; linkID < numLinks; ++linkID)
+    {
+        const uint64_t lrec = links + uint64_t(linkID) * PXG_ARTI_LINK_SIZE;
+        const uint offset = artiU32Field(lrec, PXG_AR_LINK_pathToRootOffset);
+        const uint numPathToRoot = artiU16Field(lrec, PXG_AR_LINK_numPathToRoot);
+
+        const uint64_t rowBase = bf + uint64_t(linkID * wordSize) * PXG_AB_BITFIELD_STACK_SIZE;
+
+        for (uint j = 0u; j < numPathToRoot; ++j)
+        {
+            const uint index = pathToRootElems[offset + j];
+            const uint word = index / 64u;
+            const uint64_t slot = rowBase + uint64_t(word) * PXG_AB_BITFIELD_STACK_SIZE;
+            // the shift is (index - 64*word), i.e. index % 64, and it is a 64-bit
+            // shift -- writing it as `1 << index` would be the P8.47 trap, where a
+            // 32-bit shift CLAMPS instead of wrapping
+            const uint64_t bit = uint64_t(1) << (index - 64u * word);
+            abStoreU64(slot, 0u, lane, abU64(slot, 0u, lane) | bit);
+        }
+
+        // and the root again, unconditionally, into word 0 of this link's row
+        abStoreU64(rowBase, 0u, lane, abU64(rowBase, 0u, lane) | uint64_t(1));
+    }
+}

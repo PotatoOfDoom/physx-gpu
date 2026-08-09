@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **698/698** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **699/699** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,87 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.73 — `jcalc` phase B1: the root link block and the path-to-root bitfields
+
+The first half of the block-format copy (forwardDynamic2.cu:437-467 plus the
+bitfield build at :553-566, lifted out of the link loop it sits in because it is
+the only part of that loop which does not touch the link block).  New entry
+`artiJcalcPhaseB1` in `npArtiJointFrame.slang`, new test `artiJcalcPhaseB1`,
+suite 698 → **699**.  Manifest unchanged at **270 of 501**.
+
+**The hazard this tranche exists to solve: four lanes per word.**  Every thread in
+`jcalc` is one articulation and `threadIndexInWarp` is its lane, so the PxU8[32]
+block fields — `mDofs`, `mDisableGravity`, `mRetainsAcceleration` — have lanes 0-3
+writing four bytes of the **same 32-bit word concurrently**.  CUDA emits a native
+byte store and the lanes never meet.  SPIR-V without the Int8 capability cannot
+address a byte, so the obvious read-modify-write compiles, runs, and silently loses
+three writes in four.
+
+The fix is not new: `abStoreU8` (pxgSlangArticulationBlocks.slang) does
+`InterlockedAnd(word, ~mask)` then `InterlockedOr(word, value << shift)` through the
+BDA pointer — the same pair `storeHeaderU16` (constraintPrepPGS.slang:1028) uses for
+packed PxU16 header fields.  Lanes touch disjoint bits, so any interleaving lands
+the same result.  **It is deliberately NOT the same helper as P8.72's
+`artiStoreU8Field`**, whose own comment says single-writer-only: that one is correct
+for record structs, where there is one thread per record, and wrong for every block
+field.  Both mutants that removed the atomicity (`M15` dropping the And, `M16` a
+plain RMW) were killed, so the hazard is measured, not assumed.
+
+The 64-bit bitfields are the benign half: `PxgArticulationBitFieldStackData` is
+`PxU64 bitField[32]`, each lane owns eight contiguous bytes, and a load/or/store is
+race-free.  One new constant, `PXG_AB_BITFIELD_STACK_SIZE = 256`, pinned by
+`static_assert` alongside the rest.
+
+**Verification is weaker here than in phase A, and the tranche says so instead of
+pretending otherwise.**  Phase A could call the engine's own `PX_CUDA_CALLABLE`
+`setJointFrame`; `jcalc` itself is `__device__`-only, so there is no engine function
+to compare phase B against.  Three things carry it instead:
+
+1. every offset the shader uses is generated from the engine headers and pinned by
+   `static_assert`, so the P8.49a failure mode — shader and fixture sharing one wrong
+   number — is closed by construction;
+2. the expected bitfields are derived a **second way**.  The input is the engine's
+   flat `pathToRoot` array in the layout `FeatherstoneArticulation::initPathToRoot`
+   builds (root gets count 0; every other link gets its ancestors **excluding** the
+   root, which is exactly why the kernel ORs bit 0 in separately).  The expectation
+   walks the parent array instead of replaying the kernel's loop, so the two agree
+   only if both the array construction and the kernel's reading of it are right;
+3. the **whole** destination is compared byte for byte against a 0xAB poison image,
+   so anything written outside the expected fields is a failure — including a byte
+   store spilling into a neighbouring lane, which is the check that makes M15/M16
+   fail rather than pass quietly.
+
+Fixture shape is chosen to break two specific things: **five** articulations at
+lanes 0-4, so word 0 is fully contended and word 1 is entered (with one
+articulation none of the byte-store hazard is observable, and lanes 5-31 must stay
+at poison); and **two sub-cases**, `maxNumLinks` 4 (wordSize 1) and 70 (wordSize 2)
+with a 70-link chain, so path indices run past 63.
+
+**Sweep: 20 of 22 killed, then 21 of 22 after fixing a real fixture gap.**
+
+`M13` (numChildren read as a PxU32 instead of a PxU16) survived the first run, and
+it is the **P8.72 trap for the third time**: `numChildren` is a PxU16 at offset 58
+and `offsetSlop` sits at 60, so a word read at 58 returns numChildren in its low
+half plus offsetSlop's low half above it — and the fixture had `memset` the link
+records to **zero**, which makes the wrong-width read give the right answer.
+Poisoning them to 0xEE kills it.  Three tranches running, the same mistake in a
+different struct: *a generated offset is not a generated width, and a zeroed
+neighbour is a width nothing tests.*
+
+`M5` — `uint64_t(1) << index` instead of `1 << (index - 64*word)` — survived and is
+**equivalent on this platform, with the sweep run itself as the proof**.  The
+wordSize-2 case has links whose path indices are ≥ 64; under the mutant those bits
+still landed correctly, which means llvmpipe lowered the 64-bit shift to x86 `shl`,
+whose count is masked by 63.  The masking is not a language guarantee: SPIR-V leaves
+a shift ≥ the operand width undefined, and **P8.47 measured the opposite behaviour
+on the other platform**, where PTX `shl.b32` CLAMPS to zero rather than masking.  So
+the explicit form stays — it is the one that is defined everywhere — and it is
+recorded as untestable here rather than counted as a kill.
+
+Suite **699/699** both memory modes.  Phase B2 (the per-link and per-dof loops) and
+phase C are still open; `computeUnconstrainedVelocities1TLaunch` gets mapped when
+the chain is complete, not before.
 
 ## P8.72 — `jcalc` phase A: the first articulation dynamics that writes
 
