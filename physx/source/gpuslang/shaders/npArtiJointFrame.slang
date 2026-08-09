@@ -705,3 +705,162 @@ void artiJcalcPhaseB2(uint3 groupThreadId : SV_GroupThreadID)
     jcalcFillLinkBlocks(gJcalcB2.articulations + uint64_t(lane) * PXG_ARTI_STRIDE,
                         gJcalcB2.linkBlocks, lane);
 }
+
+
+// ===========================================================================
+// P8.75: jcalc PHASE B3 -- the per-dof fill (forwardDynamic2.cu:505-544)
+// ===========================================================================
+//
+// The innermost loop of phase B: for every dof of every link, one
+// PxgArticulationBlockDofData and the 7296-byte
+// PxgArticulationInternalConstraintData embedded in it at +5440.  Twenty-four
+// writes per dof, and they are the parameters the internal-constraint solver
+// reads back every substep, so this is the tranche that decides whether the
+// solver sees the joint the user configured.
+//
+// TWO INDICES THAT ARE NOT THE SAME AND ARE EASY TO CONFUSE:
+//
+//   i      -- the dof's position within THIS joint, 0..nbDofs-1
+//   dofId  -- joint.dofIds[i], the PxArticulationAxis the dof drives, 0..5
+//
+// The dof BLOCK is addressed by (jointOffset + i); every per-axis parameter --
+// drives, limits, armature, friction, maxJointVelocity, motion -- is addressed by
+// dofId.  And `mInvDofIds[dofId] = i` is the inverse map written back into the
+// LINK block, which is the one write in this loop that does not go to the dof
+// block at all.  Using i where dofId belongs is silent: for a revolute joint
+// with dofIds[0] = eTWIST = 0 the two coincide, and only a spherical or a joint
+// on a non-first axis tells them apart.  The fixture is built so they never
+// coincide.
+//
+// The values are copied as raw 32-bit words rather than through floats.  Nothing
+// here computes -- it moves — and a float round-trip would invite the compiler to
+// canonicalise a NaN or flush a denormal that the engine kept.
+
+struct JcalcB3Params
+{
+    uint64_t articulations;
+    uint64_t linkBlocks;
+    uint64_t dofBlocks;
+    uint nbArticulations;
+    uint pad0;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<JcalcB3Params> gJcalcB3;
+
+void jcalcFillDofBlocks(uint64_t a, uint64_t linkBlocks, uint64_t dofBlocks, uint lane)
+{
+    const uint numLinks = artiU16Field(a, PXG_ARTI_DATA_NUM_LINKS);
+
+    const uint64_t joints = artiPtrField(a, PXG_ARTI_JOINTS);
+    const uint64_t jointData = artiPtrField(a, PXG_ARTI_JOINT_DATA);
+    const uint64_t jointAxis = artiPtrField(a, PXG_ARTI_JOINT_AXIS);
+    const uint64_t motionMatrix = artiPtrField(a, PXG_ARTI_MOTION_MATRIX);
+    const Ptr<uint> jointPositions = Ptr<uint>(artiPtrField(a, PXG_ARTI_JOINT_POSITIONS));
+    const Ptr<uint> jointVelocities = Ptr<uint>(artiPtrField(a, PXG_ARTI_JOINT_VELOCITIES));
+    const Ptr<uint> jointTargetPos = Ptr<uint>(artiPtrField(a, PXG_ARTI_JOINT_TARGET_POSITIONS));
+    const Ptr<uint> jointTargetVel = Ptr<uint>(artiPtrField(a, PXG_ARTI_JOINT_TARGET_VELOCITIES));
+
+    for (uint linkID = 1u; linkID < numLinks; ++linkID)
+    {
+        const uint64_t blk = linkBlocks + uint64_t(linkID) * PXG_AB_LINK_SIZE;
+        const uint64_t jc = joints + uint64_t(linkID) * PXG_ARTI_JOINT_CORE_SIZE;
+        const uint64_t jd = jointData + uint64_t(linkID) * PXG_ARTI_JOINT_CORE_DATA_SIZE;
+
+        const uint nbDofs = artiU8Field(jd, PXG_AR_JCD_nbDof);
+        const uint jointOffset = artiU32Field(jd, PXG_AR_JCD_jointOffset);
+        const uint64_t mmBase = motionMatrix + uint64_t(linkID) * PXG_ARTI_SUBSPACE_STRIDE;
+
+        for (uint i = 0u; i < nbDofs; ++i)
+        {
+            const uint64_t dof = dofBlocks + uint64_t(jointOffset + i) * PXG_AB_DOF_SIZE;
+            const uint64_t ic = dof + PXG_AB_DOF_mConstraintData;
+
+            // the joint axis phase A computed, in block form
+            const uint64_t ax =
+                jointAxis + uint64_t(jointOffset + i) * PXG_ARTI_SPATIAL_VECTOR_SIZE;
+            abStoreSpatialVector(dof, PXG_AB_DOF_mJointAxis, lane,
+                                 float3(asfloat(artiU32Field(ax, 0u)),
+                                        asfloat(artiU32Field(ax, 4u)),
+                                        asfloat(artiU32Field(ax, 8u))),
+                                 float3(asfloat(artiU32Field(ax, 12u)),
+                                        asfloat(artiU32Field(ax, 16u)),
+                                        asfloat(artiU32Field(ax, 20u))));
+
+            // dofIds is a PxU8[6]; the axis it names indexes every per-axis array
+            const uint dofId = artiU8Field(jc, PXG_AR_JOINT_dofIds + i);
+            abStoreU8(dof, PXG_AB_DOF_mDofIds, lane, dofId);
+            // the inverse map, and the only write here that lands in the LINK block
+            abStoreU8(blk, PXG_AB_LINK_mInvDofIds + dofId * 32u, lane, i);
+
+            const uint64_t dr = jc + PXG_AR_JOINT_drives + uint64_t(dofId) * PXG_AR_DRIVE_SIZE;
+            const uint64_t env = dr + PXG_AR_DRIVE_envelope;
+            const uint64_t lim = jc + PXG_AR_JOINT_limits + uint64_t(dofId) * PXG_AR_LIMIT_SIZE;
+            const uint64_t fp = jc + PXG_AR_JOINT_frictionParams
+                              + uint64_t(dofId) * PXG_AR_FRICTION_SIZE;
+
+            abStoreU32(ic, PXG_AB_IC_mDriveStiffness, lane,
+                       artiU32Field(dr, PXG_AR_DRIVE_stiffness));
+            abStoreU32(ic, PXG_AB_IC_mDamping, lane, artiU32Field(dr, PXG_AR_DRIVE_damping));
+            abStoreU32(ic, PXG_AB_IC_mDriveTargetVel, lane, jointTargetVel[jointOffset + i]);
+            // written as a literal zero by the CUDA, not copied from anywhere
+            abStoreF32(ic, PXG_AB_IC_mTargetPosBias, lane, 0.0f);
+            abStoreU32(ic, PXG_AB_IC_mArmature, lane,
+                       artiU32Field(jc, PXG_AR_JOINT_armature + dofId * 4u));
+            abStoreU32(ic, PXG_AB_IC_mDriveTargetPos, lane, jointTargetPos[jointOffset + i]);
+            // a float2[32] field: element stride 8
+            abStoreF2(ic, PXG_AB_IC_mLimits_LowLimitX_highLimitY, lane,
+                      float2(asfloat(artiU32Field(lim, PXG_AR_LIMIT_low)),
+                             asfloat(artiU32Field(lim, PXG_AR_LIMIT_high))));
+
+            // the old scalar friction coefficient is per JOINT, not per axis
+            abStoreU32(ic, PXG_AB_IC_mFrictionCoefficient, lane,
+                       artiU32Field(jc, PXG_AR_JOINT_frictionCoefficient));
+            abStoreU32(ic, PXG_AB_IC_mStaticFrictionEffort, lane,
+                       artiU32Field(fp, PXG_AR_FRICTION_staticFrictionEffort));
+            abStoreU32(ic, PXG_AB_IC_mDynamicFrictionEffort, lane,
+                       artiU32Field(fp, PXG_AR_FRICTION_dynamicFrictionEffort));
+            abStoreU32(ic, PXG_AB_IC_mViscousFrictionCoefficient, lane,
+                       artiU32Field(fp, PXG_AR_FRICTION_viscousFrictionCoefficient));
+
+            abStoreU32(ic, PXG_AB_IC_mMaxForce, lane, artiU32Field(dr, PXG_AR_DRIVE_maxForce));
+            abStoreU32(ic, PXG_AB_IC_mMaxEffort, lane, artiU32Field(env, PXG_AR_ENV_maxEffort));
+            abStoreU32(ic, PXG_AB_IC_mMaxActuatorVelocity, lane,
+                       artiU32Field(env, PXG_AR_ENV_maxActuatorVelocity));
+            abStoreU32(ic, PXG_AB_IC_mVelocityDependentResistance, lane,
+                       artiU32Field(env, PXG_AR_ENV_velocityDependentResistance));
+            abStoreU32(ic, PXG_AB_IC_mSpeedEffortGradient, lane,
+                       artiU32Field(env, PXG_AR_ENV_speedEffortGradient));
+            abStoreU32(ic, PXG_AB_IC_mDriveType, lane, artiU32Field(dr, PXG_AR_DRIVE_driveType));
+            abStoreU32(ic, PXG_AB_IC_mMaxJointVelocity, lane,
+                       artiU32Field(jc, PXG_AR_JOINT_maxJointVelocity + dofId * 4u));
+
+            abStoreU8(dof, PXG_AB_DOF_mMotion, lane,
+                      artiU8Field(jc, PXG_AR_JOINT_motion + dofId));
+            abStoreU32(dof, PXG_AB_DOF_mJointPositions, lane, jointPositions[jointOffset + i]);
+            abStoreU32(dof, PXG_AB_DOF_mJointVelocities, lane, jointVelocities[jointOffset + i]);
+
+            // motionMatrix[linkID].columns[i], the local motion matrix column
+            const uint64_t mm = mmBase + uint64_t(i) * PXG_ARTI_SPATIAL_VECTOR_SIZE;
+            abStoreSpatialVector(dof, PXG_AB_DOF_mLocalMotionMatrix, lane,
+                                 float3(asfloat(artiU32Field(mm, 0u)),
+                                        asfloat(artiU32Field(mm, 4u)),
+                                        asfloat(artiU32Field(mm, 8u))),
+                                 float3(asfloat(artiU32Field(mm, 12u)),
+                                        asfloat(artiU32Field(mm, 16u)),
+                                        asfloat(artiU32Field(mm, 20u))));
+        }
+    }
+}
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void artiJcalcPhaseB3(uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint lane = groupThreadId.x;
+    if (lane >= gJcalcB3.nbArticulations)
+        return;
+
+    jcalcFillDofBlocks(gJcalcB3.articulations + uint64_t(lane) * PXG_ARTI_STRIDE,
+                       gJcalcB3.linkBlocks, gJcalcB3.dofBlocks, lane);
+}

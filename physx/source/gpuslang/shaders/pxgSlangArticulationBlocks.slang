@@ -236,6 +236,25 @@ public static const uint PXG_AR_DRIVE_SIZE                                  =   
 public static const uint PXG_AR_LIMIT_SIZE                                  =      8;
 public static const uint PXG_AR_FRICTION_SIZE                               =     12;
 
+// Sub-fields of the three per-axis parameter structs the per-dof fill reads
+// (P8.75).  PxPerformanceEnvelope is nested INSIDE PxArticulationDrive at +12,
+// so an envelope field is drive[dofId] + PXG_AR_DRIVE_envelope + PXG_AR_ENV_*.
+public static const uint PXG_AR_DRIVE_stiffness                             =      0;
+public static const uint PXG_AR_DRIVE_damping                               =      4;
+public static const uint PXG_AR_DRIVE_maxForce                              =      8;
+public static const uint PXG_AR_DRIVE_envelope                              =     12;
+public static const uint PXG_AR_DRIVE_driveType                             =     28;
+public static const uint PXG_AR_ENV_SIZE                                    =     16;
+public static const uint PXG_AR_ENV_maxEffort                               =      0;
+public static const uint PXG_AR_ENV_maxActuatorVelocity                     =      4;
+public static const uint PXG_AR_ENV_velocityDependentResistance             =      8;
+public static const uint PXG_AR_ENV_speedEffortGradient                     =     12;
+public static const uint PXG_AR_LIMIT_low                                   =      0;
+public static const uint PXG_AR_LIMIT_high                                  =      4;
+public static const uint PXG_AR_FRICTION_staticFrictionEffort               =      0;
+public static const uint PXG_AR_FRICTION_dynamicFrictionEffort              =      4;
+public static const uint PXG_AR_FRICTION_viscousFrictionCoefficient         =      8;
+
 public static const uint PXG_AR_JOINT_CORE_DATA_SIZE                        =      8;
 public static const uint PXG_AR_JCD_nbDof                                   =      4;
 public static const uint PXG_AR_JCD_jointOffset                             =      0;
@@ -376,6 +395,12 @@ public void abStoreU64(uint64_t base, uint fieldOffset, uint lane, uint64_t valu
 public void abStoreF4(uint64_t base, uint fieldOffset, uint lane, float4 value)
 {
     (Ptr<float4>(base + uint64_t(fieldOffset)))[lane] = value;
+}
+
+// float2[32] fields (the limit pairs) -- element stride 8, not 4
+public void abStoreF2(uint64_t base, uint fieldOffset, uint lane, float2 value)
+{
+    (Ptr<float2>(base + uint64_t(fieldOffset)))[lane] = value;
 }
 
 // A PxU8[32] field: FOUR LANES SHARE ONE 32-BIT WORD, and they run concurrently.

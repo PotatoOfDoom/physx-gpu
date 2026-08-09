@@ -220,6 +220,21 @@ static_assert(offsetof(Dy::ArticulationJointCore, jointType) == 539, "PXG_AR_JOI
 static_assert(sizeof(PxArticulationDrive) == 32, "PXG_AR_DRIVE_SIZE");
 static_assert(sizeof(PxArticulationLimit) == 8, "PXG_AR_LIMIT_SIZE");
 static_assert(sizeof(PxJointFrictionParams) == 12, "PXG_AR_FRICTION_SIZE");
+static_assert(offsetof(PxArticulationDrive, stiffness) == 0, "PXG_AR_DRIVE_stiffness");
+static_assert(offsetof(PxArticulationDrive, damping) == 4, "PXG_AR_DRIVE_damping");
+static_assert(offsetof(PxArticulationDrive, maxForce) == 8, "PXG_AR_DRIVE_maxForce");
+static_assert(offsetof(PxArticulationDrive, envelope) == 12, "PXG_AR_DRIVE_envelope");
+static_assert(offsetof(PxArticulationDrive, driveType) == 28, "PXG_AR_DRIVE_driveType");
+static_assert(sizeof(PxPerformanceEnvelope) == 16, "PXG_AR_ENV_SIZE");
+static_assert(offsetof(PxPerformanceEnvelope, maxEffort) == 0, "PXG_AR_ENV_maxEffort");
+static_assert(offsetof(PxPerformanceEnvelope, maxActuatorVelocity) == 4, "PXG_AR_ENV_maxActuatorVelocity");
+static_assert(offsetof(PxPerformanceEnvelope, velocityDependentResistance) == 8, "PXG_AR_ENV_velocityDependentResistance");
+static_assert(offsetof(PxPerformanceEnvelope, speedEffortGradient) == 12, "PXG_AR_ENV_speedEffortGradient");
+static_assert(offsetof(PxArticulationLimit, low) == 0, "PXG_AR_LIMIT_low");
+static_assert(offsetof(PxArticulationLimit, high) == 4, "PXG_AR_LIMIT_high");
+static_assert(offsetof(PxJointFrictionParams, staticFrictionEffort) == 0, "PXG_AR_FRICTION_staticFrictionEffort");
+static_assert(offsetof(PxJointFrictionParams, dynamicFrictionEffort) == 4, "PXG_AR_FRICTION_dynamicFrictionEffort");
+static_assert(offsetof(PxJointFrictionParams, viscousFrictionCoefficient) == 8, "PXG_AR_FRICTION_viscousFrictionCoefficient");
 
 static_assert(sizeof(Dy::ArticulationJointCoreData) == 8, "PXG_AR_JOINT_CORE_DATA_SIZE");
 static_assert(sizeof(Dy::ArticulationJointCoreData::nbDof) == 1, "nbDof is a byte");
