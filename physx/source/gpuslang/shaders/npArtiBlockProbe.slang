@@ -60,6 +60,9 @@ struct ArtiBlockProbeParams
     uint64_t linkData;  // PxgArticulationBlockLinkData[2]
     uint64_t records;   // PxgArticulationLink[2] then Dy::ArticulationJointCore[2]
                         // then Dy::ArticulationJointCoreData[2], packed
+    uint64_t tendons;   // P8.77: the five tendon/mimic BLOCK structs [2] each,
+                        // then the six record structs [2] each, packed in the
+                        // order the reads below take them
     uint64_t out;       // uint64_t[]
 };
 
@@ -387,5 +390,134 @@ void artiBlockProbe()
         // word and came back 0xEEEEEEED against an expected 0xED, which is the
         // fill byte plus the real value: the one mismatch in 139.
         o[i++] = uint64_t(abU8(jd, PXG_AR_JCD_nbDof & ~3u, PXG_AR_JCD_nbDof & 3u));
+    }
+
+    // ---- P8.77: the tendon and mimic-joint blocks, and their records ----
+    //
+    // Same discipline: element [1] at lane 3.  Two element strides here are new
+    // and both are read at a lane that makes them wrong-able -- mRelativeOffset
+    // is a PxVec3[32] (stride 12, so lane 3 sits at +36, not +48) and mLinkIndex
+    // is a PxU16[32] (stride 2, lane 3 in the upper half of word 1).
+    {
+        const uint64_t st = gArtiBlockProbe.tendons + uint64_t(AP_ELEM) * PXG_AB_ST_SIZE;
+        o[i++] = uint64_t(PXG_AB_ST_SIZE);
+        o[i++] = uint64_t(abU32(st, PXG_AB_ST_mNumAttachments, AP_LANE));
+        o[i++] = uint64_t(abU32(st, PXG_AB_ST_mNumConstraints, AP_LANE));
+        o[i++] = uint64_t(asuint(abF32(st, PXG_AB_ST_mStiffness, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(st, PXG_AB_ST_mDamping, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(st, PXG_AB_ST_mLimitStiffness, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(st, PXG_AB_ST_mOffset, AP_LANE)));
+
+        const uint64_t ftBase = gArtiBlockProbe.tendons + 2ull * PXG_AB_ST_SIZE;
+        const uint64_t ft = ftBase + uint64_t(AP_ELEM) * PXG_AB_FT_SIZE;
+        o[i++] = uint64_t(PXG_AB_FT_SIZE);
+        o[i++] = uint64_t(abU32(ft, PXG_AB_FT_mNumTendonJoints, AP_LANE));
+        o[i++] = uint64_t(abU32(ft, PXG_AB_FT_mNumConstraints, AP_LANE));
+        o[i++] = uint64_t(asuint(abF32(ft, PXG_AB_FT_mStiffness, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(ft, PXG_AB_FT_mDamping, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(ft, PXG_AB_FT_mLimitStiffness, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(ft, PXG_AB_FT_mOffset, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(ft, PXG_AB_FT_mLowLimit, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(ft, PXG_AB_FT_mHighLimit, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(ft, PXG_AB_FT_mRestLength, AP_LANE)));
+
+        const uint64_t atBase = ftBase + 2ull * PXG_AB_FT_SIZE;
+        const uint64_t at = atBase + uint64_t(AP_ELEM) * PXG_AB_AT_SIZE;
+        o[i++] = uint64_t(PXG_AB_AT_SIZE);
+        const float3 ro = abF3(at, PXG_AB_AT_mRelativeOffset, AP_LANE);
+        o[i++] = uint64_t(asuint(ro.x));
+        o[i++] = uint64_t(asuint(ro.y));
+        o[i++] = uint64_t(asuint(ro.z));
+        o[i++] = uint64_t(asuint(abF32(at, PXG_AB_AT_mRestDistance, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(at, PXG_AB_AT_mCoefficient, AP_LANE)));
+        o[i++] = abU64(at, PXG_AB_AT_mChildrens, AP_LANE);
+        o[i++] = uint64_t(abU16(at, PXG_AB_AT_mLinkIndex, AP_LANE));
+        o[i++] = uint64_t(abU32(at, PXG_AB_AT_mParents, AP_LANE));
+        o[i++] = uint64_t(asuint(abF32(at, PXG_AB_AT_mLowLimit, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(at, PXG_AB_AT_mHighLimit, AP_LANE)));
+
+        const uint64_t tjBase = atBase + 2ull * PXG_AB_AT_SIZE;
+        const uint64_t tj = tjBase + uint64_t(AP_ELEM) * PXG_AB_TJ_SIZE;
+        o[i++] = uint64_t(PXG_AB_TJ_SIZE);
+        o[i++] = uint64_t(abU32(tj, PXG_AB_TJ_mAxis, AP_LANE));
+        o[i++] = uint64_t(asuint(abF32(tj, PXG_AB_TJ_mCoefficient, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(tj, PXG_AB_TJ_mRecipCoefficient, AP_LANE)));
+        o[i++] = abU64(tj, PXG_AB_TJ_mChildrens, AP_LANE);
+        o[i++] = uint64_t(abU16(tj, PXG_AB_TJ_mLinkIndex, AP_LANE));
+        o[i++] = uint64_t(abU32(tj, PXG_AB_TJ_mParents, AP_LANE));
+        o[i++] = uint64_t(abU32(tj, PXG_AB_TJ_mConstraintId, AP_LANE));
+
+        const uint64_t mjBase = tjBase + 2ull * PXG_AB_TJ_SIZE;
+        const uint64_t mj = mjBase + uint64_t(AP_ELEM) * PXG_AB_MJ_SIZE;
+        o[i++] = uint64_t(PXG_AB_MJ_SIZE);
+        o[i++] = uint64_t(abU32(mj, PXG_AB_MJ_mLinkA, AP_LANE));
+        o[i++] = uint64_t(abU32(mj, PXG_AB_MJ_mAxisA, AP_LANE));
+        o[i++] = uint64_t(abU32(mj, PXG_AB_MJ_mLinkB, AP_LANE));
+        o[i++] = uint64_t(abU32(mj, PXG_AB_MJ_mAxisB, AP_LANE));
+        o[i++] = uint64_t(asuint(abF32(mj, PXG_AB_MJ_mGearRatio, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(mj, PXG_AB_MJ_mOffset, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(mj, PXG_AB_MJ_mNaturalFrequency, AP_LANE)));
+        o[i++] = uint64_t(asuint(abF32(mj, PXG_AB_MJ_mDampingRatio, AP_LANE)));
+        // the nested internal-data block, addressed through its parent
+        const uint64_t imj = mj + PXG_AB_MJ_mInternalData;
+        o[i++] = uint64_t(PXG_AB_IMJ_SIZE);
+        o[i++] = uint64_t(abU32(imj, PXG_AB_IMJ_mDofA, AP_LANE));
+        o[i++] = uint64_t(abU32(imj, PXG_AB_IMJ_mDofB, AP_LANE));
+        o[i++] = uint64_t(asuint(abF32(imj, PXG_AB_IMJ_recipEffectiveInertia, AP_LANE)));
+
+        // ---- the record structs: plain AoS, so lane 0 and element [1] ----
+        const uint64_t recBase = mjBase + 2ull * PXG_AB_MJ_SIZE;
+
+        const uint64_t tef = recBase + uint64_t(AP_ELEM) * PXG_ARTI_TENDON_FIXED_ELEM_SIZE;
+        o[i++] = abU64(tef, PXG_AR_TEF_children, 0u);
+        o[i++] = uint64_t(abU32(tef, PXG_AR_TEF_parent, 0u));
+        o[i++] = uint64_t(abU32(tef, PXG_AR_TEF_linkInd, 0u));
+
+        const uint64_t stdBase = recBase + 2ull * PXG_ARTI_TENDON_FIXED_ELEM_SIZE;
+        const uint64_t sd = stdBase + uint64_t(AP_ELEM) * PXG_ARTI_SPATIAL_TENDON_DATA_SIZE;
+        o[i++] = uint64_t(asuint(abF32(sd, PXG_AR_STD_stiffness, 0u)));
+        o[i++] = uint64_t(asuint(abF32(sd, PXG_AR_STD_damping, 0u)));
+        o[i++] = uint64_t(asuint(abF32(sd, PXG_AR_STD_limitStiffness, 0u)));
+        o[i++] = uint64_t(asuint(abF32(sd, PXG_AR_STD_offset, 0u)));
+
+        const uint64_t ftdBase = stdBase + 2ull * PXG_ARTI_SPATIAL_TENDON_DATA_SIZE;
+        const uint64_t fd = ftdBase + uint64_t(AP_ELEM) * PXG_ARTI_FIXED_TENDON_DATA_SIZE;
+        o[i++] = uint64_t(asuint(abF32(fd, PXG_AR_FTD_stiffness, 0u)));
+        o[i++] = uint64_t(asuint(abF32(fd, PXG_AR_FTD_damping, 0u)));
+        o[i++] = uint64_t(asuint(abF32(fd, PXG_AR_FTD_limitStiffness, 0u)));
+        o[i++] = uint64_t(asuint(abF32(fd, PXG_AR_FTD_offset, 0u)));
+        o[i++] = uint64_t(asuint(abF32(fd, PXG_AR_FTD_lowLimit, 0u)));
+        o[i++] = uint64_t(asuint(abF32(fd, PXG_AR_FTD_highLimit, 0u)));
+        o[i++] = uint64_t(asuint(abF32(fd, PXG_AR_FTD_restLength, 0u)));
+
+        const uint64_t tadBase = ftdBase + 2ull * PXG_ARTI_FIXED_TENDON_DATA_SIZE;
+        const uint64_t ad = tadBase + uint64_t(AP_ELEM) * PXG_ARTI_ATTACHMENT_MOD_SIZE;
+        o[i++] = uint64_t(asuint(abF32(ad, PXG_AR_TAD_relativeOffset + 0u, 0u)));
+        o[i++] = uint64_t(asuint(abF32(ad, PXG_AR_TAD_relativeOffset + 4u, 0u)));
+        o[i++] = uint64_t(asuint(abF32(ad, PXG_AR_TAD_relativeOffset + 8u, 0u)));
+        o[i++] = uint64_t(asuint(abF32(ad, PXG_AR_TAD_restLength, 0u)));
+        o[i++] = uint64_t(asuint(abF32(ad, PXG_AR_TAD_coefficient, 0u)));
+        o[i++] = uint64_t(asuint(abF32(ad, PXG_AR_TAD_lowLimit, 0u)));
+        o[i++] = uint64_t(asuint(abF32(ad, PXG_AR_TAD_highLimit, 0u)));
+
+        const uint64_t tjcBase = tadBase + 2ull * PXG_ARTI_ATTACHMENT_MOD_SIZE;
+        const uint64_t cd = tjcBase + uint64_t(AP_ELEM) * PXG_ARTI_TENDON_JOINT_COEFF_SIZE;
+        o[i++] = uint64_t(asuint(abF32(cd, PXG_AR_TJC_coefficient, 0u)));
+        o[i++] = uint64_t(asuint(abF32(cd, PXG_AR_TJC_recipCoefficient, 0u)));
+        o[i++] = uint64_t(abU32(cd, PXG_AR_TJC_axis, 0u));
+
+        // ArticulationMimicJointCore is laid out linkA, axisA, linkB, axisB --
+        // NOT in the order the CUDA copy lists them.  Reading it in copy order
+        // swaps two fields, and only a generated offset catches that.
+        const uint64_t mjcBase = tjcBase + 2ull * PXG_ARTI_TENDON_JOINT_COEFF_SIZE;
+        const uint64_t mc = mjcBase + uint64_t(AP_ELEM) * PXG_ARTI_MIMIC_JOINT_CORE_SIZE;
+        o[i++] = uint64_t(abU32(mc, PXG_AR_MJC_linkA, 0u));
+        o[i++] = uint64_t(abU32(mc, PXG_AR_MJC_axisA, 0u));
+        o[i++] = uint64_t(abU32(mc, PXG_AR_MJC_linkB, 0u));
+        o[i++] = uint64_t(abU32(mc, PXG_AR_MJC_axisB, 0u));
+        o[i++] = uint64_t(asuint(abF32(mc, PXG_AR_MJC_gearRatio, 0u)));
+        o[i++] = uint64_t(asuint(abF32(mc, PXG_AR_MJC_offset, 0u)));
+        o[i++] = uint64_t(asuint(abF32(mc, PXG_AR_MJC_naturalFrequency, 0u)));
+        o[i++] = uint64_t(asuint(abF32(mc, PXG_AR_MJC_dampingRatio, 0u)));
     }
 }

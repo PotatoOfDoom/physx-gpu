@@ -315,6 +315,114 @@ public static const uint PXG_AR_SUBSPACE_COLUMNS                                
 public static const uint PXG_AR_SPATIAL_VECTOR_SIZE                               =     24;
 
 // ---------------------------------------------------------------------------
+// P8.77: the TENDON and MIMIC-JOINT block structs, and the records they copy
+// from.  Generated like everything else above; pinned by static_assert in
+// tests/testArtiBlockLayout.cpp and read back functionally by artiBlockProbe.
+//
+// Two element strides appear here that no earlier articulation block used, and
+// both are traps a uniform-looking `[32]` array hides:
+//
+//   * `PxgArticulationBlockAttachmentData::mRelativeOffset` is a `PxVec3[32]` --
+//     384 bytes, so the element stride is TWELVE, not sixteen.  Every other
+//     three-component field in these blocks is a float4 lane or a packed spatial
+//     vector; this one is bare PxVec3s butted together.
+//   * `mLinkIndex` is a `PxU16[32]` -- 64 bytes, stride two, so TWO LANES SHARE A
+//     32-BIT WORD.  Same hazard as the PxU8[32] fields, one size up.
+//
+// One ordering trap in the records: `Dy::ArticulationMimicJointCore` is laid out
+// linkA, axisA, linkB, axisB, but the CUDA copies it in the order linkA, linkB,
+// axisA, axisB.  Reading it in declaration-of-the-copy order swaps two fields.
+// ---------------------------------------------------------------------------
+public static const uint PXG_AB_ST_SIZE                                               =    768;
+public static const uint PXG_AB_ST_mNumAttachments                                    =      0;
+public static const uint PXG_AB_ST_mNumConstraints                                    =    128;
+public static const uint PXG_AB_ST_mStiffness                                         =    256;
+public static const uint PXG_AB_ST_mDamping                                           =    384;
+public static const uint PXG_AB_ST_mLimitStiffness                                    =    512;
+public static const uint PXG_AB_ST_mOffset                                            =    640;
+public static const uint PXG_AB_FT_SIZE                                               =   1152;
+public static const uint PXG_AB_FT_mNumTendonJoints                                   =      0;
+public static const uint PXG_AB_FT_mNumConstraints                                    =    128;
+public static const uint PXG_AB_FT_mStiffness                                         =    256;
+public static const uint PXG_AB_FT_mDamping                                           =    384;
+public static const uint PXG_AB_FT_mLimitStiffness                                    =    512;
+public static const uint PXG_AB_FT_mOffset                                            =    640;
+public static const uint PXG_AB_FT_mLowLimit                                          =    768;
+public static const uint PXG_AB_FT_mHighLimit                                         =    896;
+public static const uint PXG_AB_FT_mRestLength                                        =   1024;
+public static const uint PXG_AB_AT_SIZE                                               =   1344;
+public static const uint PXG_AB_AT_mRelativeOffset                                    =      0;
+public static const uint PXG_AB_AT_mRestDistance                                      =    384;
+public static const uint PXG_AB_AT_mCoefficient                                       =    512;
+public static const uint PXG_AB_AT_mChildrens                                         =    640;
+public static const uint PXG_AB_AT_mLinkIndex                                         =    896;
+public static const uint PXG_AB_AT_mParents                                           =    960;
+public static const uint PXG_AB_AT_mLowLimit                                          =   1088;
+public static const uint PXG_AB_AT_mHighLimit                                         =   1216;
+public static const uint PXG_AB_TJ_SIZE                                               =    960;
+public static const uint PXG_AB_TJ_mAxis                                              =      0;
+public static const uint PXG_AB_TJ_mCoefficient                                       =    128;
+public static const uint PXG_AB_TJ_mRecipCoefficient                                  =    256;
+public static const uint PXG_AB_TJ_mChildrens                                         =    384;
+public static const uint PXG_AB_TJ_mLinkIndex                                         =    640;
+public static const uint PXG_AB_TJ_mParents                                           =    704;
+public static const uint PXG_AB_TJ_mConstraintId                                      =    832;
+public static const uint PXG_AB_MJ_SIZE                                               =   1408;
+public static const uint PXG_AB_MJ_mLinkA                                             =      0;
+public static const uint PXG_AB_MJ_mAxisA                                             =    128;
+public static const uint PXG_AB_MJ_mLinkB                                             =    256;
+public static const uint PXG_AB_MJ_mAxisB                                             =    384;
+public static const uint PXG_AB_MJ_mGearRatio                                         =    512;
+public static const uint PXG_AB_MJ_mOffset                                            =    640;
+public static const uint PXG_AB_MJ_mNaturalFrequency                                  =    768;
+public static const uint PXG_AB_MJ_mDampingRatio                                      =    896;
+public static const uint PXG_AB_MJ_mInternalData                                      =   1024;
+public static const uint PXG_AB_IMJ_SIZE                                              =    384;
+public static const uint PXG_AB_IMJ_mDofA                                             =      0;
+public static const uint PXG_AB_IMJ_mDofB                                             =    128;
+public static const uint PXG_AB_IMJ_recipEffectiveInertia                             =    256;
+
+// The element STRIDES of these records already live in pxgSlangArticulationDesc
+// (PXG_ARTI_TENDON_SIZE, PXG_ARTI_TENDON_FIXED_ELEM_SIZE,
+// PXG_ARTI_SPATIAL_TENDON_DATA_SIZE, PXG_ARTI_FIXED_TENDON_DATA_SIZE,
+// PXG_ARTI_ATTACHMENT_MOD_SIZE, PXG_ARTI_TENDON_JOINT_COEFF_SIZE,
+// PXG_ARTI_MIMIC_JOINT_CORE_SIZE), as do PxgArticulationTendon's three field
+// offsets (PXG_TENDON_FIXED_ELEMENTS / _MOD_ELEMENTS / _NB_ELEMENTS).  Those are
+// NOT restated here: a size generated independently into two modules is exactly
+// the PXG_ARTI_LINK_SIZE / PXG_AR_LINK_SIZE duplicate this port already carries,
+// and one of those is enough.  Only genuinely new field offsets appear below.
+public static const uint PXG_AR_TEF_children                                          =      0;
+public static const uint PXG_AR_TEF_parent                                            =      8;
+public static const uint PXG_AR_TEF_linkInd                                           =     12;
+public static const uint PXG_AR_STD_stiffness                                         =      0;
+public static const uint PXG_AR_STD_damping                                           =      4;
+public static const uint PXG_AR_STD_limitStiffness                                    =      8;
+public static const uint PXG_AR_STD_offset                                            =     12;
+public static const uint PXG_AR_FTD_stiffness                                         =      0;
+public static const uint PXG_AR_FTD_damping                                           =      4;
+public static const uint PXG_AR_FTD_limitStiffness                                    =      8;
+public static const uint PXG_AR_FTD_offset                                            =     12;
+public static const uint PXG_AR_FTD_lowLimit                                          =     16;
+public static const uint PXG_AR_FTD_highLimit                                         =     20;
+public static const uint PXG_AR_FTD_restLength                                        =     24;
+public static const uint PXG_AR_TAD_relativeOffset                                    =      0;
+public static const uint PXG_AR_TAD_restLength                                        =     12;
+public static const uint PXG_AR_TAD_coefficient                                       =     16;
+public static const uint PXG_AR_TAD_lowLimit                                          =     20;
+public static const uint PXG_AR_TAD_highLimit                                         =     24;
+public static const uint PXG_AR_TJC_coefficient                                       =      0;
+public static const uint PXG_AR_TJC_recipCoefficient                                  =      4;
+public static const uint PXG_AR_TJC_axis                                              =      8;
+public static const uint PXG_AR_MJC_linkA                                             =      0;
+public static const uint PXG_AR_MJC_linkB                                             =      8;
+public static const uint PXG_AR_MJC_axisA                                             =      4;
+public static const uint PXG_AR_MJC_axisB                                             =     12;
+public static const uint PXG_AR_MJC_gearRatio                                         =     16;
+public static const uint PXG_AR_MJC_offset                                            =     20;
+public static const uint PXG_AR_MJC_naturalFrequency                                  =     24;
+public static const uint PXG_AR_MJC_dampingRatio                                      =     28;
+
+// ---------------------------------------------------------------------------
 // Lane accessors.  `base` is the address of the block element (i.e. the array
 // base plus warpIndex * stride); `fieldOffset` is one of the constants above.
 // ---------------------------------------------------------------------------
@@ -350,6 +458,22 @@ public float4 abF4(uint64_t base, uint fieldOffset, uint lane)
 public float2 abF2(uint64_t base, uint fieldOffset, uint lane)
 {
     return (Ptr<float2>(base + uint64_t(fieldOffset)))[lane];
+}
+
+// PxVec3[32] (attachment mRelativeOffset): element stride TWELVE.  Slang's
+// float3 is 16-byte aligned, so `Ptr<float3>[lane]` would stride by 16 and walk
+// off the end of a 384-byte field -- the three components are read separately.
+public float3 abF3(uint64_t base, uint fieldOffset, uint lane)
+{
+    Ptr<float> f = Ptr<float>(base + uint64_t(fieldOffset) + uint64_t(lane) * 12);
+    return float3(f[0], f[1], f[2]);
+}
+
+// PxU16[32]: TWO lanes per 32-bit word
+public uint abU16(uint64_t base, uint fieldOffset, uint lane)
+{
+    const uint word = (Ptr<uint>(base + uint64_t(fieldOffset)))[lane >> 1];
+    return (word >> ((lane & 1u) * 16u)) & 0xFFFFu;
 }
 
 // a PxU32 that is NOT a [32] array -- mTotalSelfConstraintCount and
@@ -423,6 +547,12 @@ public void abStoreU8(uint64_t base, uint fieldOffset, uint lane, uint value)
     InterlockedAnd(w[lane >> 2], ~(0xFFu << shift), prev);
     InterlockedOr(w[lane >> 2], (value & 0xFFu) << shift, prev);
 }
+
+// NOTE the matching STORES for these two strides (abStoreF3, abStoreU16) are
+// deliberately absent until P8.78, the first tranche that writes a tendon block.
+// An accessor nothing calls is an accessor nothing can prove -- the same reason
+// PXG_AB_MAT33_COL1 and PXG_AB_STB_P survived P8.67's sweep until the probe read
+// them.
 
 public void abStoreSpatialVector(uint64_t base, uint fieldOffset, uint lane,
                                  float3 top, float3 bottom)

@@ -58,6 +58,8 @@
 #include "PxArticulationTendonData.h"
 #include "PxgArticulation.h"
 #include "PxgArticulationLink.h"
+#include "PxgArticulationTendon.h"
+#include "DyArticulationMimicJointCore.h"
 
 #include <cstring>
 #include <vector>
@@ -294,6 +296,93 @@ static_assert(sizeof(PxQuat) == 16, "PXG_ARTI_QUAT_SIZE");
 static_assert(sizeof(PxgArticulationData::flags) == 1, "flags is a byte");
 static_assert(sizeof(PxgArticulationData::confiDirty) == 1, "confiDirty is a byte");
 static_assert(sizeof(PxgArticulationData::updateDirty) == 4, "updateDirty is a word");
+static_assert(sizeof(PxgArticulationData::gpuDirtyFlag) == 4, "gpuDirtyFlag is a word");
+
+// ---------------------------------------------------------------------------
+// P8.77: the tendon / mimic-joint blocks and the records they copy from.
+// The record SIZES and PxgArticulationTendon's field offsets are already pinned
+// in testNewArticulations.cpp and are deliberately not restated here.
+// ---------------------------------------------------------------------------
+static_assert(sizeof(PxgArticulationBlockSpatialTendonData) == 768, "PXG_AB_ST_SIZE");
+static_assert(offsetof(PxgArticulationBlockSpatialTendonData, mNumAttachments) == 0, "PXG_AB_ST_mNumAttachments");
+static_assert(offsetof(PxgArticulationBlockSpatialTendonData, mNumConstraints) == 128, "PXG_AB_ST_mNumConstraints");
+static_assert(offsetof(PxgArticulationBlockSpatialTendonData, mStiffness) == 256, "PXG_AB_ST_mStiffness");
+static_assert(offsetof(PxgArticulationBlockSpatialTendonData, mDamping) == 384, "PXG_AB_ST_mDamping");
+static_assert(offsetof(PxgArticulationBlockSpatialTendonData, mLimitStiffness) == 512, "PXG_AB_ST_mLimitStiffness");
+static_assert(offsetof(PxgArticulationBlockSpatialTendonData, mOffset) == 640, "PXG_AB_ST_mOffset");
+static_assert(sizeof(PxgArticulationBlockFixedTendonData) == 1152, "PXG_AB_FT_SIZE");
+static_assert(offsetof(PxgArticulationBlockFixedTendonData, mNumTendonJoints) == 0, "PXG_AB_FT_mNumTendonJoints");
+static_assert(offsetof(PxgArticulationBlockFixedTendonData, mNumConstraints) == 128, "PXG_AB_FT_mNumConstraints");
+static_assert(offsetof(PxgArticulationBlockFixedTendonData, mStiffness) == 256, "PXG_AB_FT_mStiffness");
+static_assert(offsetof(PxgArticulationBlockFixedTendonData, mDamping) == 384, "PXG_AB_FT_mDamping");
+static_assert(offsetof(PxgArticulationBlockFixedTendonData, mLimitStiffness) == 512, "PXG_AB_FT_mLimitStiffness");
+static_assert(offsetof(PxgArticulationBlockFixedTendonData, mOffset) == 640, "PXG_AB_FT_mOffset");
+static_assert(offsetof(PxgArticulationBlockFixedTendonData, mLowLimit) == 768, "PXG_AB_FT_mLowLimit");
+static_assert(offsetof(PxgArticulationBlockFixedTendonData, mHighLimit) == 896, "PXG_AB_FT_mHighLimit");
+static_assert(offsetof(PxgArticulationBlockFixedTendonData, mRestLength) == 1024, "PXG_AB_FT_mRestLength");
+static_assert(sizeof(PxgArticulationBlockAttachmentData) == 1344, "PXG_AB_AT_SIZE");
+static_assert(offsetof(PxgArticulationBlockAttachmentData, mRelativeOffset) == 0, "PXG_AB_AT_mRelativeOffset");
+static_assert(offsetof(PxgArticulationBlockAttachmentData, mRestDistance) == 384, "PXG_AB_AT_mRestDistance");
+static_assert(offsetof(PxgArticulationBlockAttachmentData, mCoefficient) == 512, "PXG_AB_AT_mCoefficient");
+static_assert(offsetof(PxgArticulationBlockAttachmentData, mChildrens) == 640, "PXG_AB_AT_mChildrens");
+static_assert(offsetof(PxgArticulationBlockAttachmentData, mLinkIndex) == 896, "PXG_AB_AT_mLinkIndex");
+static_assert(offsetof(PxgArticulationBlockAttachmentData, mParents) == 960, "PXG_AB_AT_mParents");
+static_assert(offsetof(PxgArticulationBlockAttachmentData, mLowLimit) == 1088, "PXG_AB_AT_mLowLimit");
+static_assert(offsetof(PxgArticulationBlockAttachmentData, mHighLimit) == 1216, "PXG_AB_AT_mHighLimit");
+static_assert(sizeof(PxgArticulationBlockTendonJointData) == 960, "PXG_AB_TJ_SIZE");
+static_assert(offsetof(PxgArticulationBlockTendonJointData, mAxis) == 0, "PXG_AB_TJ_mAxis");
+static_assert(offsetof(PxgArticulationBlockTendonJointData, mCoefficient) == 128, "PXG_AB_TJ_mCoefficient");
+static_assert(offsetof(PxgArticulationBlockTendonJointData, mRecipCoefficient) == 256, "PXG_AB_TJ_mRecipCoefficient");
+static_assert(offsetof(PxgArticulationBlockTendonJointData, mChildrens) == 384, "PXG_AB_TJ_mChildrens");
+static_assert(offsetof(PxgArticulationBlockTendonJointData, mLinkIndex) == 640, "PXG_AB_TJ_mLinkIndex");
+static_assert(offsetof(PxgArticulationBlockTendonJointData, mParents) == 704, "PXG_AB_TJ_mParents");
+static_assert(offsetof(PxgArticulationBlockTendonJointData, mConstraintId) == 832, "PXG_AB_TJ_mConstraintId");
+static_assert(sizeof(PxgArticulationBlockMimicJointData) == 1408, "PXG_AB_MJ_SIZE");
+static_assert(offsetof(PxgArticulationBlockMimicJointData, mLinkA) == 0, "PXG_AB_MJ_mLinkA");
+static_assert(offsetof(PxgArticulationBlockMimicJointData, mAxisA) == 128, "PXG_AB_MJ_mAxisA");
+static_assert(offsetof(PxgArticulationBlockMimicJointData, mLinkB) == 256, "PXG_AB_MJ_mLinkB");
+static_assert(offsetof(PxgArticulationBlockMimicJointData, mAxisB) == 384, "PXG_AB_MJ_mAxisB");
+static_assert(offsetof(PxgArticulationBlockMimicJointData, mGearRatio) == 512, "PXG_AB_MJ_mGearRatio");
+static_assert(offsetof(PxgArticulationBlockMimicJointData, mOffset) == 640, "PXG_AB_MJ_mOffset");
+static_assert(offsetof(PxgArticulationBlockMimicJointData, mNaturalFrequency) == 768, "PXG_AB_MJ_mNaturalFrequency");
+static_assert(offsetof(PxgArticulationBlockMimicJointData, mDampingRatio) == 896, "PXG_AB_MJ_mDampingRatio");
+static_assert(offsetof(PxgArticulationBlockMimicJointData, mInternalData) == 1024, "PXG_AB_MJ_mInternalData");
+static_assert(sizeof(PxgArticulationBlockInternallMimicJointData) == 384, "PXG_AB_IMJ_SIZE");
+static_assert(offsetof(PxgArticulationBlockInternallMimicJointData, mDofA) == 0, "PXG_AB_IMJ_mDofA");
+static_assert(offsetof(PxgArticulationBlockInternallMimicJointData, mDofB) == 128, "PXG_AB_IMJ_mDofB");
+static_assert(offsetof(PxgArticulationBlockInternallMimicJointData, recipEffectiveInertia) == 256, "PXG_AB_IMJ_recipEffectiveInertia");
+static_assert(offsetof(PxgArticulationTendonElementFixedData, children) == 0, "PXG_AR_TEF_children");
+static_assert(offsetof(PxgArticulationTendonElementFixedData, parent) == 8, "PXG_AR_TEF_parent");
+static_assert(offsetof(PxgArticulationTendonElementFixedData, linkInd) == 12, "PXG_AR_TEF_linkInd");
+static_assert(offsetof(PxGpuSpatialTendonData, stiffness) == 0, "PXG_AR_STD_stiffness");
+static_assert(offsetof(PxGpuSpatialTendonData, damping) == 4, "PXG_AR_STD_damping");
+static_assert(offsetof(PxGpuSpatialTendonData, limitStiffness) == 8, "PXG_AR_STD_limitStiffness");
+static_assert(offsetof(PxGpuSpatialTendonData, offset) == 12, "PXG_AR_STD_offset");
+static_assert(offsetof(PxGpuFixedTendonData, stiffness) == 0, "PXG_AR_FTD_stiffness");
+static_assert(offsetof(PxGpuFixedTendonData, damping) == 4, "PXG_AR_FTD_damping");
+static_assert(offsetof(PxGpuFixedTendonData, limitStiffness) == 8, "PXG_AR_FTD_limitStiffness");
+static_assert(offsetof(PxGpuFixedTendonData, offset) == 12, "PXG_AR_FTD_offset");
+static_assert(offsetof(PxGpuFixedTendonData, lowLimit) == 16, "PXG_AR_FTD_lowLimit");
+static_assert(offsetof(PxGpuFixedTendonData, highLimit) == 20, "PXG_AR_FTD_highLimit");
+static_assert(offsetof(PxGpuFixedTendonData, restLength) == 24, "PXG_AR_FTD_restLength");
+static_assert(offsetof(PxGpuTendonAttachmentData, relativeOffset) == 0, "PXG_AR_TAD_relativeOffset");
+static_assert(offsetof(PxGpuTendonAttachmentData, restLength) == 12, "PXG_AR_TAD_restLength");
+static_assert(offsetof(PxGpuTendonAttachmentData, coefficient) == 16, "PXG_AR_TAD_coefficient");
+static_assert(offsetof(PxGpuTendonAttachmentData, lowLimit) == 20, "PXG_AR_TAD_lowLimit");
+static_assert(offsetof(PxGpuTendonAttachmentData, highLimit) == 24, "PXG_AR_TAD_highLimit");
+static_assert(offsetof(PxGpuTendonJointCoefficientData, coefficient) == 0, "PXG_AR_TJC_coefficient");
+static_assert(offsetof(PxGpuTendonJointCoefficientData, recipCoefficient) == 4, "PXG_AR_TJC_recipCoefficient");
+static_assert(offsetof(PxGpuTendonJointCoefficientData, axis) == 8, "PXG_AR_TJC_axis");
+static_assert(offsetof(Dy::ArticulationMimicJointCore, linkA) == 0, "PXG_AR_MJC_linkA");
+static_assert(offsetof(Dy::ArticulationMimicJointCore, linkB) == 8, "PXG_AR_MJC_linkB");
+static_assert(offsetof(Dy::ArticulationMimicJointCore, axisA) == 4, "PXG_AR_MJC_axisA");
+static_assert(offsetof(Dy::ArticulationMimicJointCore, axisB) == 12, "PXG_AR_MJC_axisB");
+static_assert(offsetof(Dy::ArticulationMimicJointCore, gearRatio) == 16, "PXG_AR_MJC_gearRatio");
+static_assert(offsetof(Dy::ArticulationMimicJointCore, offset) == 20, "PXG_AR_MJC_offset");
+static_assert(offsetof(Dy::ArticulationMimicJointCore, naturalFrequency) == 24, "PXG_AR_MJC_naturalFrequency");
+static_assert(offsetof(Dy::ArticulationMimicJointCore, dampingRatio) == 28, "PXG_AR_MJC_dampingRatio");
+static_assert(offsetof(PxgArticulationData, gpuDirtyFlag) == 8, "PXG_ARTI_DATA_gpuDirtyFlag");
+
 } // namespace pin
 
 // distinct sentinels: element index and lane both enter every value, so no two
@@ -314,7 +403,7 @@ PXG_TEST(artiBlockLayout)
 
     PxgSlangComputeDevice* dev = testDevice();
     const PxgKernelDef manifest[] = {
-        { "npArtiBlockProbe.spv", "artiBlockProbe", 56u, 0 }, // { u64 x7 }
+        { "npArtiBlockProbe.spv", "artiBlockProbe", 64u, 0 }, // { u64 x8 }
     };
     PxgCudaShim shim(dev, manifest, 1, &artiBlockLoader);
 
@@ -779,16 +868,254 @@ PXG_TEST(artiBlockLayout)
         expect.push_back(recJointData[ELEM].nbDof);
     }
 
+    // ---- P8.77: the tendon / mimic-joint blocks and their records ----
+    //
+    // Packed in the order the probe walks them.  Everything is poisoned to 0xEE
+    // first and only the probed fields are written, so a read that lands on a
+    // neighbour comes back as fill rather than as a plausible value.
+    const size_t TENBYTES =
+        2 * sizeof(PxgArticulationBlockSpatialTendonData) +
+        2 * sizeof(PxgArticulationBlockFixedTendonData) +
+        2 * sizeof(PxgArticulationBlockAttachmentData) +
+        2 * sizeof(PxgArticulationBlockTendonJointData) +
+        2 * sizeof(PxgArticulationBlockMimicJointData) +
+        2 * sizeof(PxgArticulationTendonElementFixedData) +
+        2 * sizeof(PxGpuSpatialTendonData) +
+        2 * sizeof(PxGpuFixedTendonData) +
+        2 * sizeof(PxGpuTendonAttachmentData) +
+        2 * sizeof(PxGpuTendonJointCoefficientData) +
+        2 * sizeof(Dy::ArticulationMimicJointCore);
+    std::vector<uint8_t> ten(TENBYTES, 0xEE);
+    size_t tOff = 0;
+    auto claim = [&](size_t bytes) { const size_t o = tOff; tOff += bytes; return ten.data() + o; };
+    auto* tST = reinterpret_cast<PxgArticulationBlockSpatialTendonData*>(
+        claim(2 * sizeof(PxgArticulationBlockSpatialTendonData)));
+    auto* tFT = reinterpret_cast<PxgArticulationBlockFixedTendonData*>(
+        claim(2 * sizeof(PxgArticulationBlockFixedTendonData)));
+    auto* tAT = reinterpret_cast<PxgArticulationBlockAttachmentData*>(
+        claim(2 * sizeof(PxgArticulationBlockAttachmentData)));
+    auto* tTJ = reinterpret_cast<PxgArticulationBlockTendonJointData*>(
+        claim(2 * sizeof(PxgArticulationBlockTendonJointData)));
+    auto* tMJ = reinterpret_cast<PxgArticulationBlockMimicJointData*>(
+        claim(2 * sizeof(PxgArticulationBlockMimicJointData)));
+    auto* rTEF = reinterpret_cast<PxgArticulationTendonElementFixedData*>(
+        claim(2 * sizeof(PxgArticulationTendonElementFixedData)));
+    auto* rSTD = reinterpret_cast<PxGpuSpatialTendonData*>(
+        claim(2 * sizeof(PxGpuSpatialTendonData)));
+    auto* rFTD = reinterpret_cast<PxGpuFixedTendonData*>(
+        claim(2 * sizeof(PxGpuFixedTendonData)));
+    auto* rTAD = reinterpret_cast<PxGpuTendonAttachmentData*>(
+        claim(2 * sizeof(PxGpuTendonAttachmentData)));
+    auto* rTJC = reinterpret_cast<PxGpuTendonJointCoefficientData*>(
+        claim(2 * sizeof(PxGpuTendonJointCoefficientData)));
+    auto* rMJC = reinterpret_cast<Dy::ArticulationMimicJointCore*>(
+        claim(2 * sizeof(Dy::ArticulationMimicJointCore)));
+
+    for (uint32_t e = 0; e < 2; ++e)
+    {
+        for (uint32_t l = 0; l < 32; ++l)
+        {
+            uint32_t f = 900;
+            tST[e].mNumAttachments[l] = sentU32(e, l, f++);
+            tST[e].mNumConstraints[l] = sentU32(e, l, f++);
+            tST[e].mStiffness[l] = sentF32(e, l, f++);
+            tST[e].mDamping[l] = sentF32(e, l, f++);
+            tST[e].mLimitStiffness[l] = sentF32(e, l, f++);
+            tST[e].mOffset[l] = sentF32(e, l, f++);
+
+            tFT[e].mNumTendonJoints[l] = sentU32(e, l, f++);
+            tFT[e].mNumConstraints[l] = sentU32(e, l, f++);
+            tFT[e].mStiffness[l] = sentF32(e, l, f++);
+            tFT[e].mDamping[l] = sentF32(e, l, f++);
+            tFT[e].mLimitStiffness[l] = sentF32(e, l, f++);
+            tFT[e].mOffset[l] = sentF32(e, l, f++);
+            tFT[e].mLowLimit[l] = sentF32(e, l, f++);
+            tFT[e].mHighLimit[l] = sentF32(e, l, f++);
+            tFT[e].mRestLength[l] = sentF32(e, l, f++);
+
+            tAT[e].mRelativeOffset[l] = PxVec3(sentF32(e, l, f), sentF32(e, l, f + 1),
+                                               sentF32(e, l, f + 2)); f += 3;
+            tAT[e].mRestDistance[l] = sentF32(e, l, f++);
+            tAT[e].mCoefficient[l] = sentF32(e, l, f++);
+            tAT[e].mChildrens[l] = (PxU64(sentU32(e, l, f)) << 32) | PxU64(sentU32(e, l, f + 1));
+            f += 2;
+            tAT[e].mLinkIndex[l] = PxU16(0x3300u + e * 32 + l);
+            tAT[e].mParents[l] = sentU32(e, l, f++);
+            tAT[e].mLowLimit[l] = sentF32(e, l, f++);
+            tAT[e].mHighLimit[l] = sentF32(e, l, f++);
+
+            tTJ[e].mAxis[l] = sentU32(e, l, f++);
+            tTJ[e].mCoefficient[l] = sentF32(e, l, f++);
+            tTJ[e].mRecipCoefficient[l] = sentF32(e, l, f++);
+            tTJ[e].mChildrens[l] = (PxU64(sentU32(e, l, f)) << 32) | PxU64(sentU32(e, l, f + 1));
+            f += 2;
+            tTJ[e].mLinkIndex[l] = PxU16(0x4400u + e * 32 + l);
+            tTJ[e].mParents[l] = sentU32(e, l, f++);
+            tTJ[e].mConstraintId[l] = sentU32(e, l, f++);
+
+            tMJ[e].mLinkA[l] = sentU32(e, l, f++);
+            tMJ[e].mAxisA[l] = sentU32(e, l, f++);
+            tMJ[e].mLinkB[l] = sentU32(e, l, f++);
+            tMJ[e].mAxisB[l] = sentU32(e, l, f++);
+            tMJ[e].mGearRatio[l] = sentF32(e, l, f++);
+            tMJ[e].mOffset[l] = sentF32(e, l, f++);
+            tMJ[e].mNaturalFrequency[l] = sentF32(e, l, f++);
+            tMJ[e].mDampingRatio[l] = sentF32(e, l, f++);
+            tMJ[e].mInternalData.mDofA[l] = sentU32(e, l, f++);
+            tMJ[e].mInternalData.mDofB[l] = sentU32(e, l, f++);
+            tMJ[e].mInternalData.recipEffectiveInertia[l] = sentF32(e, l, f++);
+        }
+
+        uint32_t g = 990;
+        rTEF[e].children = (PxU64(sentU32(e, 0, g)) << 32) | PxU64(sentU32(e, 0, g + 1)); g += 2;
+        rTEF[e].parent = sentU32(e, 0, g++);
+        rTEF[e].linkInd = sentU32(e, 0, g++);
+
+        rSTD[e].stiffness = sentF32(e, 0, g++);
+        rSTD[e].damping = sentF32(e, 0, g++);
+        rSTD[e].limitStiffness = sentF32(e, 0, g++);
+        rSTD[e].offset = sentF32(e, 0, g++);
+
+        rFTD[e].stiffness = sentF32(e, 0, g++);
+        rFTD[e].damping = sentF32(e, 0, g++);
+        rFTD[e].limitStiffness = sentF32(e, 0, g++);
+        rFTD[e].offset = sentF32(e, 0, g++);
+        rFTD[e].lowLimit = sentF32(e, 0, g++);
+        rFTD[e].highLimit = sentF32(e, 0, g++);
+        rFTD[e].restLength = sentF32(e, 0, g++);
+
+        rTAD[e].relativeOffset = PxVec3(sentF32(e, 0, g), sentF32(e, 0, g + 1),
+                                        sentF32(e, 0, g + 2)); g += 3;
+        rTAD[e].restLength = sentF32(e, 0, g++);
+        rTAD[e].coefficient = sentF32(e, 0, g++);
+        rTAD[e].lowLimit = sentF32(e, 0, g++);
+        rTAD[e].highLimit = sentF32(e, 0, g++);
+
+        rTJC[e].coefficient = sentF32(e, 0, g++);
+        rTJC[e].recipCoefficient = sentF32(e, 0, g++);
+        rTJC[e].axis = sentU32(e, 0, g++);
+
+        rMJC[e].linkA = sentU32(e, 0, g++);
+        rMJC[e].axisA = PxArticulationAxis::Enum(e + 1);
+        rMJC[e].linkB = sentU32(e, 0, g++);
+        rMJC[e].axisB = PxArticulationAxis::Enum(e + 3);
+        rMJC[e].gearRatio = sentF32(e, 0, g++);
+        rMJC[e].offset = sentF32(e, 0, g++);
+        rMJC[e].naturalFrequency = sentF32(e, 0, g++);
+        rMJC[e].dampingRatio = sentF32(e, 0, g++);
+    }
+
+    {
+        const PxgArticulationBlockSpatialTendonData& S = tST[ELEM];
+        expect.push_back(sizeof(PxgArticulationBlockSpatialTendonData));
+        expect.push_back(S.mNumAttachments[LANE]);
+        expect.push_back(S.mNumConstraints[LANE]);
+        expect.push_back(bits(S.mStiffness[LANE]));
+        expect.push_back(bits(S.mDamping[LANE]));
+        expect.push_back(bits(S.mLimitStiffness[LANE]));
+        expect.push_back(bits(S.mOffset[LANE]));
+
+        const PxgArticulationBlockFixedTendonData& F = tFT[ELEM];
+        expect.push_back(sizeof(PxgArticulationBlockFixedTendonData));
+        expect.push_back(F.mNumTendonJoints[LANE]);
+        expect.push_back(F.mNumConstraints[LANE]);
+        expect.push_back(bits(F.mStiffness[LANE]));
+        expect.push_back(bits(F.mDamping[LANE]));
+        expect.push_back(bits(F.mLimitStiffness[LANE]));
+        expect.push_back(bits(F.mOffset[LANE]));
+        expect.push_back(bits(F.mLowLimit[LANE]));
+        expect.push_back(bits(F.mHighLimit[LANE]));
+        expect.push_back(bits(F.mRestLength[LANE]));
+
+        const PxgArticulationBlockAttachmentData& A = tAT[ELEM];
+        expect.push_back(sizeof(PxgArticulationBlockAttachmentData));
+        expect.push_back(bits(A.mRelativeOffset[LANE].x));
+        expect.push_back(bits(A.mRelativeOffset[LANE].y));
+        expect.push_back(bits(A.mRelativeOffset[LANE].z));
+        expect.push_back(bits(A.mRestDistance[LANE]));
+        expect.push_back(bits(A.mCoefficient[LANE]));
+        expect.push_back(A.mChildrens[LANE]);
+        expect.push_back(A.mLinkIndex[LANE]);
+        expect.push_back(A.mParents[LANE]);
+        expect.push_back(bits(A.mLowLimit[LANE]));
+        expect.push_back(bits(A.mHighLimit[LANE]));
+
+        const PxgArticulationBlockTendonJointData& T = tTJ[ELEM];
+        expect.push_back(sizeof(PxgArticulationBlockTendonJointData));
+        expect.push_back(T.mAxis[LANE]);
+        expect.push_back(bits(T.mCoefficient[LANE]));
+        expect.push_back(bits(T.mRecipCoefficient[LANE]));
+        expect.push_back(T.mChildrens[LANE]);
+        expect.push_back(T.mLinkIndex[LANE]);
+        expect.push_back(T.mParents[LANE]);
+        expect.push_back(T.mConstraintId[LANE]);
+
+        const PxgArticulationBlockMimicJointData& M = tMJ[ELEM];
+        expect.push_back(sizeof(PxgArticulationBlockMimicJointData));
+        expect.push_back(M.mLinkA[LANE]);
+        expect.push_back(M.mAxisA[LANE]);
+        expect.push_back(M.mLinkB[LANE]);
+        expect.push_back(M.mAxisB[LANE]);
+        expect.push_back(bits(M.mGearRatio[LANE]));
+        expect.push_back(bits(M.mOffset[LANE]));
+        expect.push_back(bits(M.mNaturalFrequency[LANE]));
+        expect.push_back(bits(M.mDampingRatio[LANE]));
+        expect.push_back(sizeof(PxgArticulationBlockInternallMimicJointData));
+        expect.push_back(M.mInternalData.mDofA[LANE]);
+        expect.push_back(M.mInternalData.mDofB[LANE]);
+        expect.push_back(bits(M.mInternalData.recipEffectiveInertia[LANE]));
+
+        expect.push_back(rTEF[ELEM].children);
+        expect.push_back(rTEF[ELEM].parent);
+        expect.push_back(rTEF[ELEM].linkInd);
+
+        expect.push_back(bits(rSTD[ELEM].stiffness));
+        expect.push_back(bits(rSTD[ELEM].damping));
+        expect.push_back(bits(rSTD[ELEM].limitStiffness));
+        expect.push_back(bits(rSTD[ELEM].offset));
+
+        expect.push_back(bits(rFTD[ELEM].stiffness));
+        expect.push_back(bits(rFTD[ELEM].damping));
+        expect.push_back(bits(rFTD[ELEM].limitStiffness));
+        expect.push_back(bits(rFTD[ELEM].offset));
+        expect.push_back(bits(rFTD[ELEM].lowLimit));
+        expect.push_back(bits(rFTD[ELEM].highLimit));
+        expect.push_back(bits(rFTD[ELEM].restLength));
+
+        expect.push_back(bits(rTAD[ELEM].relativeOffset.x));
+        expect.push_back(bits(rTAD[ELEM].relativeOffset.y));
+        expect.push_back(bits(rTAD[ELEM].relativeOffset.z));
+        expect.push_back(bits(rTAD[ELEM].restLength));
+        expect.push_back(bits(rTAD[ELEM].coefficient));
+        expect.push_back(bits(rTAD[ELEM].lowLimit));
+        expect.push_back(bits(rTAD[ELEM].highLimit));
+
+        expect.push_back(bits(rTJC[ELEM].coefficient));
+        expect.push_back(bits(rTJC[ELEM].recipCoefficient));
+        expect.push_back(rTJC[ELEM].axis);
+
+        expect.push_back(rMJC[ELEM].linkA);
+        expect.push_back(uint32_t(rMJC[ELEM].axisA));
+        expect.push_back(rMJC[ELEM].linkB);
+        expect.push_back(uint32_t(rMJC[ELEM].axisB));
+        expect.push_back(bits(rMJC[ELEM].gearRatio));
+        expect.push_back(bits(rMJC[ELEM].offset));
+        expect.push_back(bits(rMJC[ELEM].naturalFrequency));
+        expect.push_back(bits(rMJC[ELEM].dampingRatio));
+    }
+
     // ---- upload, dispatch, compare ----
-    PxgDevicePtr dBlocks = 0, dDofs = 0, dMat33 = 0, dXform = 0, dLinks = 0, dRec = 0, dOut = 0;
+    PxgDevicePtr dBlocks = 0, dDofs = 0, dMat33 = 0, dXform = 0, dLinks = 0, dRec = 0,
+                 dTen = 0, dOut = 0;
     shim.memAlloc(&dBlocks, blocks.size() * sizeof(PxgArticulationBlockData));
     shim.memAlloc(&dDofs, dofs.size() * sizeof(PxgArticulationBlockDofData));
     shim.memAlloc(&dMat33, mat33.size() * sizeof(PxgMat33Block));
     shim.memAlloc(&dXform, xform.size() * sizeof(PxgSpatialTransformBlock));
     shim.memAlloc(&dLinks, links.size() * sizeof(PxgArticulationBlockLinkData));
     shim.memAlloc(&dRec, rec.size());
+    shim.memAlloc(&dTen, ten.size());
     shim.memAlloc(&dOut, expect.size() * 8);
-    if (!dBlocks || !dDofs || !dMat33 || !dXform || !dLinks || !dRec || !dOut)
+    if (!dBlocks || !dDofs || !dMat33 || !dXform || !dLinks || !dRec || !dTen || !dOut)
     {
         std::printf("  NOTE: no BDA -> skip\n");
         return;
@@ -799,11 +1126,15 @@ PXG_TEST(artiBlockLayout)
     shim.memcpyHtoD(dXform, xform.data(), xform.size() * sizeof(PxgSpatialTransformBlock));
     shim.memcpyHtoD(dLinks, links.data(), links.size() * sizeof(PxgArticulationBlockLinkData));
     shim.memcpyHtoD(dRec, rec.data(), rec.size());
+    shim.memcpyHtoD(dTen, ten.data(), ten.size());
     shim.memsetD32(dOut, 0, uint32_t(expect.size() * 2));
 
-    struct Params { uint64_t blockData, dofData, mat33, transform, linkData, records, out; } prm = {
+    struct Params
+    {
+        uint64_t blockData, dofData, mat33, transform, linkData, records, tendons, out;
+    } prm = {
         uint64_t(dBlocks), uint64_t(dDofs), uint64_t(dMat33), uint64_t(dXform),
-        uint64_t(dLinks), uint64_t(dRec), uint64_t(dOut)
+        uint64_t(dLinks), uint64_t(dRec), uint64_t(dTen), uint64_t(dOut)
     };
     PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
                   "launch artiBlockProbe");

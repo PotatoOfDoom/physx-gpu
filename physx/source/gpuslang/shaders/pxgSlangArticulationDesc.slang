@@ -248,6 +248,7 @@ public static const uint PXG_ARTI_CFMS                                   =    33
 public static const uint PXG_ARTI_DATA_FLAGS                            =     26;
 public static const uint PXG_ARTI_DATA_CONFI_DIRTY                      =     27;
 public static const uint PXG_ARTI_DATA_UPDATE_DIRTY                     =     12;
+public static const uint PXG_ARTI_DATA_gpuDirtyFlag                      =      8;
 public static const uint PXG_ARTI_LINK_PROP_INV_MASS                    =     12;
 public static const uint PXG_ARTI_LINK_CFM_SCALE                        =     72;
 public static const uint PXG_ARTI_FLAG_FIX_BASE                         =      1;
