@@ -1078,3 +1078,225 @@ void artiJcalcPhaseC(uint3 groupThreadId : SV_GroupThreadID)
     jcalcRefreshBlocks(gJcalcC.articulations + uint64_t(lane) * PXG_ARTI_STRIDE,
                        gJcalcC.linkBlocks, gJcalcC.dofBlocks, gJcalcC.directAPI != 0u, lane);
 }
+
+
+// ===========================================================================
+// P8.78: the TENDON and MIMIC-JOINT block helpers (forwardDynamic2.cu:106-350)
+// ===========================================================================
+//
+// Six functions in the CUDA, three here: `initialize*Block` and `update*Block`
+// differ by EXACTLY the structural fields, so each pair is one copy function
+// plus an `initialize` guard -- which is how the CUDA itself writes the mimic
+// pair, sharing `copyMimicJointsBlock`.
+//
+// What only the initialize side writes:
+//
+//   spatial tendon  mNumAttachments, and per attachment mParents / mChildrens /
+//                   mLinkIndex; plus artiBlock.mNumSpatialTendons
+//   fixed tendon    mNumTendonJoints, and per tendon joint mParents /
+//                   mChildrens / mLinkIndex; plus artiBlock.mNumFixedTendons
+//   mimic joint     nothing per joint -- only artiBlock.mNumMimicJoints
+//
+// The topology fields are structural: they come from `mFixedElements`, which the
+// name says is fixed at initialisation, while the update path re-reads only
+// `mModElements`, the run-time-modifiable half.  An update that also wrote the
+// topology would be correct today and wrong the moment a tendon is re-pointed
+// without a re-init, so the fixture poisons the destinations and requires the
+// update path to leave those bytes alone.
+//
+// TWO-LEVEL INDEXING, and the inner bound is not the outer one:
+//
+//     attachmentBlocks[i * maxNumAttachments + j],  j < tendon.mNbElements
+//
+// `mNbElements` comes from the RECORD; `maxNumAttachments` is the per-warp
+// allocation pitch.  With mNbElements == maxNumAttachments the two collapse and
+// a wrong pitch is invisible, so the fixture uses mNbElements < maxNumAttachments
+// and more than one tendon.
+
+struct JcalcTendonParams
+{
+    uint64_t articulations;
+    uint64_t artiBlocks;           // PxgArticulationBlockData for this warp
+    uint64_t spatialTendonBlocks;
+    uint64_t attachmentBlocks;
+    uint64_t fixedTendonBlocks;
+    uint64_t tendonJointBlocks;
+    uint64_t mimicJointBlocks;
+    uint maxNumAttachments;
+    uint maxNumTendonJoints;
+    uint nbArticulations;
+    uint initialize;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<JcalcTendonParams> gJcalcTendon;
+
+void jcalcCopySpatialTendonsBlock(uint64_t a, uint64_t artiBlock, uint64_t tendonBlocks,
+                                  uint64_t attachmentBlocks, uint maxNumAttachments,
+                                  uint lane, bool initialize)
+{
+    const uint numSpatialTendons = artiU16Field(a, PXG_ARTI_DATA_NUM_SPATIAL_TENDONS);
+    const uint64_t params = artiPtrField(a, PXG_ARTI_SPATIAL_TENDON_PARAMS);
+    const uint64_t tendons = artiPtrField(a, PXG_ARTI_SPATIAL_TENDONS);
+
+    for (uint i = 0u; i < numSpatialTendons; ++i)
+    {
+        const uint64_t tendon = tendons + uint64_t(i) * PXG_ARTI_TENDON_SIZE;
+        const uint64_t tp = params + uint64_t(i) * PXG_ARTI_SPATIAL_TENDON_DATA_SIZE;
+        const uint64_t tb = tendonBlocks + uint64_t(i) * PXG_AB_ST_SIZE;
+
+        const uint nbElements = artiU32Field(tendon, PXG_TENDON_NB_ELEMENTS);
+        if (initialize)
+            abStoreU32(tb, PXG_AB_ST_mNumAttachments, lane, nbElements);
+
+        abStoreU32(tb, PXG_AB_ST_mStiffness, lane, artiU32Field(tp, PXG_AR_STD_stiffness));
+        abStoreU32(tb, PXG_AB_ST_mLimitStiffness, lane,
+                   artiU32Field(tp, PXG_AR_STD_limitStiffness));
+        abStoreU32(tb, PXG_AB_ST_mDamping, lane, artiU32Field(tp, PXG_AR_STD_damping));
+        abStoreU32(tb, PXG_AB_ST_mOffset, lane, artiU32Field(tp, PXG_AR_STD_offset));
+
+        const uint64_t ab = attachmentBlocks + uint64_t(i * maxNumAttachments) * PXG_AB_AT_SIZE;
+        const uint64_t fixedData = artiPtrField(tendon, PXG_TENDON_FIXED_ELEMENTS);
+        const uint64_t modData = artiPtrField(tendon, PXG_TENDON_MOD_ELEMENTS);
+
+        for (uint j = 0u; j < nbElements; ++j)
+        {
+            const uint64_t slot = ab + uint64_t(j) * PXG_AB_AT_SIZE;
+            const uint64_t md = modData + uint64_t(j) * PXG_ARTI_ATTACHMENT_MOD_SIZE;
+
+            if (initialize)
+            {
+                const uint64_t fd = fixedData + uint64_t(j) * PXG_ARTI_TENDON_FIXED_ELEM_SIZE;
+                abStoreU32(slot, PXG_AB_AT_mParents, lane, artiU32Field(fd, PXG_AR_TEF_parent));
+                abStoreU64(slot, PXG_AB_AT_mChildrens, lane,
+                           (Ptr<uint64_t>(fd + PXG_AR_TEF_children))[0]);
+                // linkInd is a PxU32 in the record and a PxU16 in the block
+                abStoreU16(slot, PXG_AB_AT_mLinkIndex, lane,
+                           artiU32Field(fd, PXG_AR_TEF_linkInd));
+            }
+
+            abStoreF3(slot, PXG_AB_AT_mRelativeOffset, lane,
+                      float3(asfloat(artiU32Field(md, PXG_AR_TAD_relativeOffset + 0u)),
+                             asfloat(artiU32Field(md, PXG_AR_TAD_relativeOffset + 4u)),
+                             asfloat(artiU32Field(md, PXG_AR_TAD_relativeOffset + 8u))));
+            abStoreU32(slot, PXG_AB_AT_mRestDistance, lane,
+                       artiU32Field(md, PXG_AR_TAD_restLength));
+            abStoreU32(slot, PXG_AB_AT_mCoefficient, lane,
+                       artiU32Field(md, PXG_AR_TAD_coefficient));
+            abStoreU32(slot, PXG_AB_AT_mLowLimit, lane, artiU32Field(md, PXG_AR_TAD_lowLimit));
+            abStoreU32(slot, PXG_AB_AT_mHighLimit, lane, artiU32Field(md, PXG_AR_TAD_highLimit));
+        }
+    }
+
+    if (initialize)
+        abStoreU32(artiBlock, PXG_AB_mNumSpatialTendons, lane, numSpatialTendons);
+}
+
+void jcalcCopyFixedTendonsBlock(uint64_t a, uint64_t artiBlock, uint64_t tendonBlocks,
+                                uint64_t tendonJointBlocks, uint maxNumTendonJoints,
+                                uint lane, bool initialize)
+{
+    const uint numFixedTendons = artiU16Field(a, PXG_ARTI_DATA_NUM_FIXED_TENDONS);
+    const uint64_t params = artiPtrField(a, PXG_ARTI_FIXED_TENDON_PARAMS);
+    const uint64_t tendons = artiPtrField(a, PXG_ARTI_FIXED_TENDONS);
+
+    for (uint i = 0u; i < numFixedTendons; ++i)
+    {
+        const uint64_t tendon = tendons + uint64_t(i) * PXG_ARTI_TENDON_SIZE;
+        const uint64_t tp = params + uint64_t(i) * PXG_ARTI_FIXED_TENDON_DATA_SIZE;
+        const uint64_t tb = tendonBlocks + uint64_t(i) * PXG_AB_FT_SIZE;
+
+        const uint nbElements = artiU32Field(tendon, PXG_TENDON_NB_ELEMENTS);
+        if (initialize)
+            abStoreU32(tb, PXG_AB_FT_mNumTendonJoints, lane, nbElements);
+
+        abStoreU32(tb, PXG_AB_FT_mStiffness, lane, artiU32Field(tp, PXG_AR_FTD_stiffness));
+        abStoreU32(tb, PXG_AB_FT_mDamping, lane, artiU32Field(tp, PXG_AR_FTD_damping));
+        abStoreU32(tb, PXG_AB_FT_mLimitStiffness, lane,
+                   artiU32Field(tp, PXG_AR_FTD_limitStiffness));
+        abStoreU32(tb, PXG_AB_FT_mOffset, lane, artiU32Field(tp, PXG_AR_FTD_offset));
+        abStoreU32(tb, PXG_AB_FT_mLowLimit, lane, artiU32Field(tp, PXG_AR_FTD_lowLimit));
+        abStoreU32(tb, PXG_AB_FT_mHighLimit, lane, artiU32Field(tp, PXG_AR_FTD_highLimit));
+        abStoreU32(tb, PXG_AB_FT_mRestLength, lane, artiU32Field(tp, PXG_AR_FTD_restLength));
+
+        const uint64_t jb = tendonJointBlocks + uint64_t(i * maxNumTendonJoints) * PXG_AB_TJ_SIZE;
+        const uint64_t fixedData = artiPtrField(tendon, PXG_TENDON_FIXED_ELEMENTS);
+        const uint64_t modData = artiPtrField(tendon, PXG_TENDON_MOD_ELEMENTS);
+
+        for (uint j = 0u; j < nbElements; ++j)
+        {
+            const uint64_t slot = jb + uint64_t(j) * PXG_AB_TJ_SIZE;
+            const uint64_t cd = modData + uint64_t(j) * PXG_ARTI_TENDON_JOINT_COEFF_SIZE;
+
+            if (initialize)
+            {
+                const uint64_t fd = fixedData + uint64_t(j) * PXG_ARTI_TENDON_FIXED_ELEM_SIZE;
+                abStoreU32(slot, PXG_AB_TJ_mParents, lane, artiU32Field(fd, PXG_AR_TEF_parent));
+                abStoreU64(slot, PXG_AB_TJ_mChildrens, lane,
+                           (Ptr<uint64_t>(fd + PXG_AR_TEF_children))[0]);
+                abStoreU16(slot, PXG_AB_TJ_mLinkIndex, lane,
+                           artiU32Field(fd, PXG_AR_TEF_linkInd));
+            }
+
+            abStoreU32(slot, PXG_AB_TJ_mCoefficient, lane,
+                       artiU32Field(cd, PXG_AR_TJC_coefficient));
+            abStoreU32(slot, PXG_AB_TJ_mRecipCoefficient, lane,
+                       artiU32Field(cd, PXG_AR_TJC_recipCoefficient));
+            abStoreU32(slot, PXG_AB_TJ_mAxis, lane, artiU32Field(cd, PXG_AR_TJC_axis));
+        }
+    }
+
+    if (initialize)
+        abStoreU32(artiBlock, PXG_AB_mNumFixedTendons, lane, numFixedTendons);
+}
+
+void jcalcCopyMimicJointsBlock(uint64_t a, uint64_t artiBlock, uint64_t mimicJointBlocks,
+                               uint lane, bool initialize)
+{
+    const uint numMimicJoints = artiU16Field(a, PXG_ARTI_DATA_NUM_MIMIC_JOINTS);
+    const uint64_t cores = artiPtrField(a, PXG_ARTI_MIMIC_JOINT_CORES);
+
+    for (uint i = 0u; i < numMimicJoints; ++i)
+    {
+        const uint64_t c = cores + uint64_t(i) * PXG_ARTI_MIMIC_JOINT_CORE_SIZE;
+        const uint64_t mb = mimicJointBlocks + uint64_t(i) * PXG_AB_MJ_SIZE;
+
+        // the record is laid out linkA, axisA, linkB, axisB -- NOT in the order
+        // the CUDA copy lists them (P8.77)
+        abStoreU32(mb, PXG_AB_MJ_mLinkA, lane, artiU32Field(c, PXG_AR_MJC_linkA));
+        abStoreU32(mb, PXG_AB_MJ_mLinkB, lane, artiU32Field(c, PXG_AR_MJC_linkB));
+        abStoreU32(mb, PXG_AB_MJ_mAxisA, lane, artiU32Field(c, PXG_AR_MJC_axisA));
+        abStoreU32(mb, PXG_AB_MJ_mAxisB, lane, artiU32Field(c, PXG_AR_MJC_axisB));
+        abStoreU32(mb, PXG_AB_MJ_mGearRatio, lane, artiU32Field(c, PXG_AR_MJC_gearRatio));
+        abStoreU32(mb, PXG_AB_MJ_mOffset, lane, artiU32Field(c, PXG_AR_MJC_offset));
+        abStoreU32(mb, PXG_AB_MJ_mNaturalFrequency, lane,
+                   artiU32Field(c, PXG_AR_MJC_naturalFrequency));
+        abStoreU32(mb, PXG_AB_MJ_mDampingRatio, lane, artiU32Field(c, PXG_AR_MJC_dampingRatio));
+    }
+
+    // the ONLY difference between initializeMimicJointsBlock and
+    // updateMimicJointsBlock in the CUDA
+    if (initialize)
+        abStoreU32(artiBlock, PXG_AB_mNumMimicJoints, lane, numMimicJoints);
+}
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void artiJcalcTendons(uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint lane = groupThreadId.x;
+    if (lane >= gJcalcTendon.nbArticulations)
+        return;
+
+    const uint64_t a = gJcalcTendon.articulations + uint64_t(lane) * PXG_ARTI_STRIDE;
+    const bool init = gJcalcTendon.initialize != 0u;
+
+    jcalcCopySpatialTendonsBlock(a, gJcalcTendon.artiBlocks, gJcalcTendon.spatialTendonBlocks,
+                                 gJcalcTendon.attachmentBlocks, gJcalcTendon.maxNumAttachments,
+                                 lane, init);
+    jcalcCopyFixedTendonsBlock(a, gJcalcTendon.artiBlocks, gJcalcTendon.fixedTendonBlocks,
+                               gJcalcTendon.tendonJointBlocks, gJcalcTendon.maxNumTendonJoints,
+                               lane, init);
+    jcalcCopyMimicJointsBlock(a, gJcalcTendon.artiBlocks, gJcalcTendon.mimicJointBlocks,
+                              lane, init);
+}

@@ -548,11 +548,26 @@ public void abStoreU8(uint64_t base, uint fieldOffset, uint lane, uint value)
     InterlockedOr(w[lane >> 2], (value & 0xFFu) << shift, prev);
 }
 
-// NOTE the matching STORES for these two strides (abStoreF3, abStoreU16) are
-// deliberately absent until P8.78, the first tranche that writes a tendon block.
-// An accessor nothing calls is an accessor nothing can prove -- the same reason
-// PXG_AB_MAT33_COL1 and PXG_AB_STB_P survived P8.67's sweep until the probe read
-// them.
+// PxVec3[32] (attachment mRelativeOffset), element stride TWELVE -- see abF3
+public void abStoreF3(uint64_t base, uint fieldOffset, uint lane, float3 value)
+{
+    Ptr<float> f = Ptr<float>(base + uint64_t(fieldOffset) + uint64_t(lane) * 12);
+    f[0] = value.x;
+    f[1] = value.y;
+    f[2] = value.z;
+}
+
+// PxU16[32]: TWO lanes share a 32-bit word, so this is abStoreU8's atomic
+// and/or pair with a 16-bit mask -- storeHeaderU16's shape
+// (constraintPrepPGS.slang:1028) applied to a block field.
+public void abStoreU16(uint64_t base, uint fieldOffset, uint lane, uint value)
+{
+    Ptr<uint> w = Ptr<uint>(base + uint64_t(fieldOffset));
+    const uint shift = (lane & 1u) * 16u;
+    uint prev;
+    InterlockedAnd(w[lane >> 1], ~(0xFFFFu << shift), prev);
+    InterlockedOr(w[lane >> 1], (value & 0xFFFFu) << shift, prev);
+}
 
 public void abStoreSpatialVector(uint64_t base, uint fieldOffset, uint lane,
                                  float3 top, float3 bottom)

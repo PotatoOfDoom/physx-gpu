@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **702/702** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **703/703** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,56 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.78 — the tendon and mimic-joint block helpers
+
+Six CUDA functions (forwardDynamic2.cu:106-350) become **three plus an
+`initialize` guard**, because `initialize*Block` and `update*Block` differ by
+exactly the structural fields — which is how the CUDA itself writes the mimic pair,
+sharing `copyMimicJointsBlock`.  Suite 702 → **703**; manifest unchanged at **270 of
+501**.
+
+**What only the initialize side writes**, and the whole point of the test:
+
+| | |
+|---|---|
+| spatial tendon | `mNumAttachments`; per attachment `mParents` / `mChildrens` / `mLinkIndex`; `artiBlock.mNumSpatialTendons` |
+| fixed tendon | `mNumTendonJoints`; per tendon joint the same three; `artiBlock.mNumFixedTendons` |
+| mimic joint | nothing per joint — only `artiBlock.mNumMimicJoints` |
+
+Those topology fields come from `mFixedElements` — fixed at initialisation by its
+own name — while the update path re-reads only `mModElements`, the
+run-time-modifiable half.  An update that also wrote them would be **correct today
+and wrong the moment a tendon is re-pointed without a re-init**, which is precisely
+the class of bug a passing test can hide.  Four mutants that widen the guard (`R1`
+topology, `R2` count, `R3` tendon counters, `R4` mimic counter) all die on the
+poison check.
+
+**The two-level index, and why the fixture uses unequal bounds.**
+
+```
+attachmentBlocks[i * maxNumAttachments + j],   j < tendon.mNbElements
+```
+
+`mNbElements` comes from the **record**; `maxNumAttachments` is the per-warp
+allocation pitch.  With `mNbElements == maxNumAttachments` the two collapse and a
+wrong pitch is invisible, so the fixture uses **2 elements at pitch 3, with two
+tendons**.  Both pitch mutants (`R5`, `R6`) and the one that runs the inner loop to
+the pitch (`R7`) die; none of them would have with equal bounds.
+
+**The two accessors P8.77 deliberately withheld land here with their caller**, and
+both are now proven rather than asserted: `abStoreF3` (PxVec3[32], stride twelve)
+and `abStoreU16` (PxU16[32], two lanes per word, the atomic and/or pair with a
+16-bit mask).  The mutant that makes `abStoreU16` a plain read-modify-write dies —
+with five articulations, lanes 0/1 and 2/3 each share a word, so one lane of every
+pair would lose its value.  Storing `linkInd` as a full word instead (`R12`) dies
+too: it clobbers the neighbouring lane's halfword.
+
+**Sweep: 18 of 18 killed.**
+
+Suite **703/703** both memory modes.  What remains before
+`computeUnconstrainedVelocities1TLaunch` can be assembled is the `gpuDirtyFlag`
+block (P8.79) — whose tendon branches now have their ABI.
 
 ## P8.77 — the tendon/mimic address map: the last unmapped articulation ABI
 
