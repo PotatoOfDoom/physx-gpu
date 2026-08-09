@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **703/703** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **704/704** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,55 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.79 — the `gpuDirtyFlag` block, and the refactor it forced
+
+The direct-GPU-API refresh (forwardDynamic2.cu:754-905): the host pokes values
+straight into the articulation record and raises bits saying which.  **Ten branches
+over nine flags**, then the flag is cleared.  Suite 703 → **704**; manifest unchanged
+at **270 of 501**.
+
+**`eDIRTY_POSITIONS` drives two branches**, and separating them is the whole design
+of the fixture:
+
+```
+POSITIONS                      -> every dof's mJointPositions
+ROOT_TRANSFORM | POSITIONS     -> every LINK's mAccumulatedPose, from linkID 0
+```
+
+A port that hangs the pose loop off `ROOT_TRANSFORM` alone passes a
+root-transform-only case and a velocities-only case and fails positions-only; one
+that hangs it off `POSITIONS` alone fails the reverse.  The sub-case matrix runs all
+three, and mutants `S1` and `S2` — one for each mistake — both die.  The pose loop
+also starts at **linkID 0**, unlike the phase B2 and phase C link loops that start at
+1 because the root has no joint; here the root's pose is exactly what a
+root-transform poke changes.  `S3` dies on lane-0 link 0.
+
+**The refactor this tranche forced.**  The four tendon branches are the *two halves*
+of P8.78's copy functions, **separately guarded** — `eDIRTY_SPATIAL_TENDON` refreshes
+only the params, `eDIRTY_SPATIAL_TENDON_ATTACHMENT` only the per-attachment mod
+fields — where `jcalc` always runs both.  Rather than transcribe those field lists a
+third time, each copy function was split into
+`jcalcCopySpatialTendonParams` / `…Attachments` (and the fixed pair), with the
+composed `jcalcCopy*TendonsBlock` calling both.  The existing `artiJcalcTendons` test
+covers the composed path, so the refactor was verified the moment it landed.  All
+four halves are called here with the structural guard **false**: a direct-API poke
+changes values, never topology.  Three mutants that flip that guard to true (`S9`,
+`S10`, `S11`) die on the poison check.
+
+**Sweep: 16 of 16 killed — after a real fixture fix.**  The first pass was 14/16, and
+both survivors had **one cause**: the fixture had `NB_LINKS == TOTAL_DOFS == 3`, so
+"the dof loop runs over `numLinks`" and "`totalDofs` read out of the `numLinks`
+field" were literal no-ops.  Setting `TOTAL_DOFS = 4` kills both.  *Two loop bounds
+that happen to coincide are two loop bounds nothing tests* — the same shape as
+P8.78's `mNbElements == maxNumAttachments`, and the third time in this chain that a
+fixture's convenient equality hid a mutant.
+
+Suite **704/704** both memory modes.  What remains before
+`computeUnconstrainedVelocities1TLaunch`: `initialize()` plus the block-header fill
+(P8.80), the fused C2P/link-velocity loop (P8.81 — where a real engine oracle comes
+back, `Cm::UnAlignedSpatialVector::rotate` being `PX_CUDA_CALLABLE`), and the wrapper
+(P8.82).
 
 ## P8.78 — the tendon and mimic-joint block helpers
 

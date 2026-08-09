@@ -1131,9 +1131,12 @@ struct JcalcTendonParams
 [[vk::push_constant]]
 ConstantBuffer<JcalcTendonParams> gJcalcTendon;
 
-void jcalcCopySpatialTendonsBlock(uint64_t a, uint64_t artiBlock, uint64_t tendonBlocks,
-                                  uint64_t attachmentBlocks, uint maxNumAttachments,
-                                  uint lane, bool initialize)
+// The two halves are SEPARATELY GUARDED in the gpuDirtyFlag block (P8.79):
+// eDIRTY_SPATIAL_TENDON refreshes only the params, eDIRTY_SPATIAL_TENDON_ATTACHMENT
+// only the per-attachment mod fields.  jcalc runs both together.  Splitting them
+// here keeps one field list per field rather than a third transcription.
+void jcalcCopySpatialTendonParams(uint64_t a, uint64_t tendonBlocks, uint lane,
+                                  bool withCounts)
 {
     const uint numSpatialTendons = artiU16Field(a, PXG_ARTI_DATA_NUM_SPATIAL_TENDONS);
     const uint64_t params = artiPtrField(a, PXG_ARTI_SPATIAL_TENDON_PARAMS);
@@ -1141,19 +1144,34 @@ void jcalcCopySpatialTendonsBlock(uint64_t a, uint64_t artiBlock, uint64_t tendo
 
     for (uint i = 0u; i < numSpatialTendons; ++i)
     {
-        const uint64_t tendon = tendons + uint64_t(i) * PXG_ARTI_TENDON_SIZE;
         const uint64_t tp = params + uint64_t(i) * PXG_ARTI_SPATIAL_TENDON_DATA_SIZE;
         const uint64_t tb = tendonBlocks + uint64_t(i) * PXG_AB_ST_SIZE;
 
-        const uint nbElements = artiU32Field(tendon, PXG_TENDON_NB_ELEMENTS);
-        if (initialize)
-            abStoreU32(tb, PXG_AB_ST_mNumAttachments, lane, nbElements);
+        if (withCounts)
+        {
+            const uint64_t tendon = tendons + uint64_t(i) * PXG_ARTI_TENDON_SIZE;
+            abStoreU32(tb, PXG_AB_ST_mNumAttachments, lane,
+                       artiU32Field(tendon, PXG_TENDON_NB_ELEMENTS));
+        }
 
         abStoreU32(tb, PXG_AB_ST_mStiffness, lane, artiU32Field(tp, PXG_AR_STD_stiffness));
         abStoreU32(tb, PXG_AB_ST_mLimitStiffness, lane,
                    artiU32Field(tp, PXG_AR_STD_limitStiffness));
         abStoreU32(tb, PXG_AB_ST_mDamping, lane, artiU32Field(tp, PXG_AR_STD_damping));
         abStoreU32(tb, PXG_AB_ST_mOffset, lane, artiU32Field(tp, PXG_AR_STD_offset));
+    }
+}
+
+void jcalcCopySpatialTendonAttachments(uint64_t a, uint64_t attachmentBlocks,
+                                       uint maxNumAttachments, uint lane, bool withTopology)
+{
+    const uint numSpatialTendons = artiU16Field(a, PXG_ARTI_DATA_NUM_SPATIAL_TENDONS);
+    const uint64_t tendons = artiPtrField(a, PXG_ARTI_SPATIAL_TENDONS);
+
+    for (uint i = 0u; i < numSpatialTendons; ++i)
+    {
+        const uint64_t tendon = tendons + uint64_t(i) * PXG_ARTI_TENDON_SIZE;
+        const uint nbElements = artiU32Field(tendon, PXG_TENDON_NB_ELEMENTS);
 
         const uint64_t ab = attachmentBlocks + uint64_t(i * maxNumAttachments) * PXG_AB_AT_SIZE;
         const uint64_t fixedData = artiPtrField(tendon, PXG_TENDON_FIXED_ELEMENTS);
@@ -1164,7 +1182,7 @@ void jcalcCopySpatialTendonsBlock(uint64_t a, uint64_t artiBlock, uint64_t tendo
             const uint64_t slot = ab + uint64_t(j) * PXG_AB_AT_SIZE;
             const uint64_t md = modData + uint64_t(j) * PXG_ARTI_ATTACHMENT_MOD_SIZE;
 
-            if (initialize)
+            if (withTopology)
             {
                 const uint64_t fd = fixedData + uint64_t(j) * PXG_ARTI_TENDON_FIXED_ELEM_SIZE;
                 abStoreU32(slot, PXG_AB_AT_mParents, lane, artiU32Field(fd, PXG_AR_TEF_parent));
@@ -1187,14 +1205,22 @@ void jcalcCopySpatialTendonsBlock(uint64_t a, uint64_t artiBlock, uint64_t tendo
             abStoreU32(slot, PXG_AB_AT_mHighLimit, lane, artiU32Field(md, PXG_AR_TAD_highLimit));
         }
     }
-
-    if (initialize)
-        abStoreU32(artiBlock, PXG_AB_mNumSpatialTendons, lane, numSpatialTendons);
 }
 
-void jcalcCopyFixedTendonsBlock(uint64_t a, uint64_t artiBlock, uint64_t tendonBlocks,
-                                uint64_t tendonJointBlocks, uint maxNumTendonJoints,
-                                uint lane, bool initialize)
+void jcalcCopySpatialTendonsBlock(uint64_t a, uint64_t artiBlock, uint64_t tendonBlocks,
+                                  uint64_t attachmentBlocks, uint maxNumAttachments,
+                                  uint lane, bool initialize)
+{
+    jcalcCopySpatialTendonParams(a, tendonBlocks, lane, initialize);
+    jcalcCopySpatialTendonAttachments(a, attachmentBlocks, maxNumAttachments, lane, initialize);
+
+    if (initialize)
+        abStoreU32(artiBlock, PXG_AB_mNumSpatialTendons, lane,
+                   artiU16Field(a, PXG_ARTI_DATA_NUM_SPATIAL_TENDONS));
+}
+
+void jcalcCopyFixedTendonParams(uint64_t a, uint64_t tendonBlocks, uint lane,
+                                bool withCounts)
 {
     const uint numFixedTendons = artiU16Field(a, PXG_ARTI_DATA_NUM_FIXED_TENDONS);
     const uint64_t params = artiPtrField(a, PXG_ARTI_FIXED_TENDON_PARAMS);
@@ -1202,13 +1228,15 @@ void jcalcCopyFixedTendonsBlock(uint64_t a, uint64_t artiBlock, uint64_t tendonB
 
     for (uint i = 0u; i < numFixedTendons; ++i)
     {
-        const uint64_t tendon = tendons + uint64_t(i) * PXG_ARTI_TENDON_SIZE;
         const uint64_t tp = params + uint64_t(i) * PXG_ARTI_FIXED_TENDON_DATA_SIZE;
         const uint64_t tb = tendonBlocks + uint64_t(i) * PXG_AB_FT_SIZE;
 
-        const uint nbElements = artiU32Field(tendon, PXG_TENDON_NB_ELEMENTS);
-        if (initialize)
-            abStoreU32(tb, PXG_AB_FT_mNumTendonJoints, lane, nbElements);
+        if (withCounts)
+        {
+            const uint64_t tendon = tendons + uint64_t(i) * PXG_ARTI_TENDON_SIZE;
+            abStoreU32(tb, PXG_AB_FT_mNumTendonJoints, lane,
+                       artiU32Field(tendon, PXG_TENDON_NB_ELEMENTS));
+        }
 
         abStoreU32(tb, PXG_AB_FT_mStiffness, lane, artiU32Field(tp, PXG_AR_FTD_stiffness));
         abStoreU32(tb, PXG_AB_FT_mDamping, lane, artiU32Field(tp, PXG_AR_FTD_damping));
@@ -1218,6 +1246,19 @@ void jcalcCopyFixedTendonsBlock(uint64_t a, uint64_t artiBlock, uint64_t tendonB
         abStoreU32(tb, PXG_AB_FT_mLowLimit, lane, artiU32Field(tp, PXG_AR_FTD_lowLimit));
         abStoreU32(tb, PXG_AB_FT_mHighLimit, lane, artiU32Field(tp, PXG_AR_FTD_highLimit));
         abStoreU32(tb, PXG_AB_FT_mRestLength, lane, artiU32Field(tp, PXG_AR_FTD_restLength));
+    }
+}
+
+void jcalcCopyFixedTendonJoints(uint64_t a, uint64_t tendonJointBlocks,
+                                uint maxNumTendonJoints, uint lane, bool withTopology)
+{
+    const uint numFixedTendons = artiU16Field(a, PXG_ARTI_DATA_NUM_FIXED_TENDONS);
+    const uint64_t tendons = artiPtrField(a, PXG_ARTI_FIXED_TENDONS);
+
+    for (uint i = 0u; i < numFixedTendons; ++i)
+    {
+        const uint64_t tendon = tendons + uint64_t(i) * PXG_ARTI_TENDON_SIZE;
+        const uint nbElements = artiU32Field(tendon, PXG_TENDON_NB_ELEMENTS);
 
         const uint64_t jb = tendonJointBlocks + uint64_t(i * maxNumTendonJoints) * PXG_AB_TJ_SIZE;
         const uint64_t fixedData = artiPtrField(tendon, PXG_TENDON_FIXED_ELEMENTS);
@@ -1228,7 +1269,7 @@ void jcalcCopyFixedTendonsBlock(uint64_t a, uint64_t artiBlock, uint64_t tendonB
             const uint64_t slot = jb + uint64_t(j) * PXG_AB_TJ_SIZE;
             const uint64_t cd = modData + uint64_t(j) * PXG_ARTI_TENDON_JOINT_COEFF_SIZE;
 
-            if (initialize)
+            if (withTopology)
             {
                 const uint64_t fd = fixedData + uint64_t(j) * PXG_ARTI_TENDON_FIXED_ELEM_SIZE;
                 abStoreU32(slot, PXG_AB_TJ_mParents, lane, artiU32Field(fd, PXG_AR_TEF_parent));
@@ -1245,9 +1286,18 @@ void jcalcCopyFixedTendonsBlock(uint64_t a, uint64_t artiBlock, uint64_t tendonB
             abStoreU32(slot, PXG_AB_TJ_mAxis, lane, artiU32Field(cd, PXG_AR_TJC_axis));
         }
     }
+}
+
+void jcalcCopyFixedTendonsBlock(uint64_t a, uint64_t artiBlock, uint64_t tendonBlocks,
+                                uint64_t tendonJointBlocks, uint maxNumTendonJoints,
+                                uint lane, bool initialize)
+{
+    jcalcCopyFixedTendonParams(a, tendonBlocks, lane, initialize);
+    jcalcCopyFixedTendonJoints(a, tendonJointBlocks, maxNumTendonJoints, lane, initialize);
 
     if (initialize)
-        abStoreU32(artiBlock, PXG_AB_mNumFixedTendons, lane, numFixedTendons);
+        abStoreU32(artiBlock, PXG_AB_mNumFixedTendons, lane,
+                   artiU16Field(a, PXG_ARTI_DATA_NUM_FIXED_TENDONS));
 }
 
 void jcalcCopyMimicJointsBlock(uint64_t a, uint64_t artiBlock, uint64_t mimicJointBlocks,
@@ -1299,4 +1349,151 @@ void artiJcalcTendons(uint3 groupThreadId : SV_GroupThreadID)
                                lane, init);
     jcalcCopyMimicJointsBlock(a, gJcalcTendon.artiBlocks, gJcalcTendon.mimicJointBlocks,
                               lane, init);
+}
+
+
+// ===========================================================================
+// P8.79: the gpuDirtyFlag block (forwardDynamic2.cu:754-905)
+// ===========================================================================
+//
+// The direct-GPU-API refresh: the host has poked values straight into the
+// articulation record and raised bits saying which.  TEN branches, not nine --
+// eDIRTY_POSITIONS drives two of them -- and then the flag is cleared.
+//
+// TWO THINGS THAT LOOK LIKE ONE:
+//
+//   eDIRTY_POSITIONS                        -> every dof's mJointPositions
+//   eDIRTY_ROOT_TRANSFORM | eDIRTY_POSITIONS -> every LINK's mAccumulatedPose
+//
+// so raising positions alone rewrites the poses too, and a fixture that only
+// tests the flags one at a time in the obvious pairing would never separate them.
+// That second loop also runs from linkID **0**, unlike the phase B2 and phase C
+// link loops which start at 1 because the root has no joint -- here the root's
+// pose is exactly what a root-transform poke changes.
+//
+// The four tendon branches are the two halves of the P8.78 copy functions,
+// SEPARATELY guarded: eDIRTY_SPATIAL_TENDON refreshes only the params and
+// eDIRTY_SPATIAL_TENDON_ATTACHMENT only the per-attachment mod fields, where
+// jcalc always runs both.  That is why those functions were split rather than
+// their field lists transcribed a third time -- and the halves are called here
+// with the topology/count guard FALSE, because a direct-API poke changes values,
+// never structure.
+
+struct JcalcGpuDirtyParams
+{
+    uint64_t articulations;
+    uint64_t linkBlocks;
+    uint64_t dofBlocks;
+    uint64_t spatialTendonBlocks;
+    uint64_t attachmentBlocks;
+    uint64_t fixedTendonBlocks;
+    uint64_t tendonJointBlocks;
+    uint maxNumAttachments;
+    uint maxNumTendonJoints;
+    uint nbArticulations;
+    uint pad0;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<JcalcGpuDirtyParams> gJcalcGpuDirty;
+
+void jcalcApplyGpuDirty(uint64_t a, uint64_t linkBlocks, uint64_t dofBlocks,
+                        uint64_t spatialTendonBlocks, uint64_t attachmentBlocks,
+                        uint64_t fixedTendonBlocks, uint64_t tendonJointBlocks,
+                        uint maxNumAttachments, uint maxNumTendonJoints, uint lane)
+{
+    const uint dirty = artiU32Field(a, PXG_ARTI_DATA_gpuDirtyFlag);
+    if (dirty == 0u)
+        return;
+
+    const uint totalDofs = artiU16Field(a, PXG_ARTI_DATA_NUM_JOINT_DOFS);
+    const uint numLinks = artiU16Field(a, PXG_ARTI_DATA_NUM_LINKS);
+
+    if ((dirty & PXG_ARTI_DIRTY_POSITIONS) != 0u)
+    {
+        const Ptr<uint> jointPositions = Ptr<uint>(artiPtrField(a, PXG_ARTI_JOINT_POSITIONS));
+        for (uint i = 0u; i < totalDofs; ++i)
+            abStoreU32(dofBlocks + uint64_t(i) * PXG_AB_DOF_SIZE,
+                       PXG_AB_DOF_mJointPositions, lane, jointPositions[i]);
+    }
+
+    if ((dirty & PXG_ARTI_DIRTY_VELOCITIES) != 0u)
+    {
+        const Ptr<uint> jointVelocities = Ptr<uint>(artiPtrField(a, PXG_ARTI_JOINT_VELOCITIES));
+        for (uint i = 0u; i < totalDofs; ++i)
+            abStoreU32(dofBlocks + uint64_t(i) * PXG_AB_DOF_SIZE,
+                       PXG_AB_DOF_mJointVelocities, lane, jointVelocities[i]);
+    }
+
+    // NOTE the `| POSITIONS`: a joint-position poke moves every link, so the
+    // accumulated poses are re-read even when only positions were raised
+    if ((dirty & (PXG_ARTI_DIRTY_ROOT_TRANSFORM | PXG_ARTI_DIRTY_POSITIONS)) != 0u)
+    {
+        const uint64_t body2Worlds = artiPtrField(a, PXG_ARTI_LINK_BODY2WORLDS);
+        for (uint linkID = 0u; linkID < numLinks; ++linkID)   // from 0, root included
+            jcalcStorePose(linkBlocks + uint64_t(linkID) * PXG_AB_LINK_SIZE,
+                           PXG_AB_LINK_mAccumulatedPose, lane,
+                           body2Worlds + uint64_t(linkID) * PXG_ARTI_TRANSFORM_SIZE);
+    }
+
+    if ((dirty & PXG_ARTI_DIRTY_ROOT_VELOCITIES) != 0u)
+    {
+        // motionVelocities[0], a Cm::UnAlignedSpatialVector: six packed floats
+        const uint64_t mv = artiPtrField(a, PXG_ARTI_MOTION_VELOCITIES);
+        abStoreSpatialVector(linkBlocks, PXG_AB_LINK_mMotionVelocity, lane,
+                             float3(asfloat(artiU32Field(mv, 0u)),
+                                    asfloat(artiU32Field(mv, 4u)),
+                                    asfloat(artiU32Field(mv, 8u))),
+                             float3(asfloat(artiU32Field(mv, 12u)),
+                                    asfloat(artiU32Field(mv, 16u)),
+                                    asfloat(artiU32Field(mv, 20u))));
+    }
+
+    if ((dirty & PXG_ARTI_DIRTY_JOINT_TARGET_VEL) != 0u)
+    {
+        const Ptr<uint> tv = Ptr<uint>(artiPtrField(a, PXG_ARTI_JOINT_TARGET_VELOCITIES));
+        for (uint i = 0u; i < totalDofs; ++i)
+            abStoreU32(dofBlocks + uint64_t(i) * PXG_AB_DOF_SIZE + PXG_AB_DOF_mConstraintData,
+                       PXG_AB_IC_mDriveTargetVel, lane, tv[i]);
+    }
+
+    if ((dirty & PXG_ARTI_DIRTY_JOINT_TARGET_POS) != 0u)
+    {
+        const Ptr<uint> tp = Ptr<uint>(artiPtrField(a, PXG_ARTI_JOINT_TARGET_POSITIONS));
+        for (uint i = 0u; i < totalDofs; ++i)
+            abStoreU32(dofBlocks + uint64_t(i) * PXG_AB_DOF_SIZE + PXG_AB_DOF_mConstraintData,
+                       PXG_AB_IC_mDriveTargetPos, lane, tp[i]);
+    }
+
+    // the tendon halves, with the structural guard OFF: a direct-API poke changes
+    // values, never topology
+    if ((dirty & PXG_ARTI_DIRTY_SPATIAL_TENDON) != 0u)
+        jcalcCopySpatialTendonParams(a, spatialTendonBlocks, lane, false);
+
+    if ((dirty & PXG_ARTI_DIRTY_SPATIAL_TENDON_ATTACHMENT) != 0u)
+        jcalcCopySpatialTendonAttachments(a, attachmentBlocks, maxNumAttachments, lane, false);
+
+    if ((dirty & PXG_ARTI_DIRTY_FIXED_TENDON) != 0u)
+        jcalcCopyFixedTendonParams(a, fixedTendonBlocks, lane, false);
+
+    if ((dirty & PXG_ARTI_DIRTY_FIXED_TENDON_JOINT) != 0u)
+        jcalcCopyFixedTendonJoints(a, tendonJointBlocks, maxNumTendonJoints, lane, false);
+
+    (Ptr<uint>(a + PXG_ARTI_DATA_gpuDirtyFlag))[0] = 0u;
+}
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void artiJcalcGpuDirty(uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint lane = groupThreadId.x;
+    if (lane >= gJcalcGpuDirty.nbArticulations)
+        return;
+
+    jcalcApplyGpuDirty(gJcalcGpuDirty.articulations + uint64_t(lane) * PXG_ARTI_STRIDE,
+                       gJcalcGpuDirty.linkBlocks, gJcalcGpuDirty.dofBlocks,
+                       gJcalcGpuDirty.spatialTendonBlocks, gJcalcGpuDirty.attachmentBlocks,
+                       gJcalcGpuDirty.fixedTendonBlocks, gJcalcGpuDirty.tendonJointBlocks,
+                       gJcalcGpuDirty.maxNumAttachments, gJcalcGpuDirty.maxNumTendonJoints,
+                       lane);
 }

@@ -187,6 +187,8 @@ public static const uint PXG_ARTI_DIRTY_FORCES = 8;
 public static const uint PXG_ARTI_DIRTY_JOINT_TARGET_VEL = 4096;
 public static const uint PXG_ARTI_DIRTY_JOINT_TARGET_POS = 8192;
 public static const uint PXG_ARTI_DIRTY_EXT_ACCEL = 512;
+public static const uint PXG_ARTI_DIRTY_ROOT_TRANSFORM = 16;                // 1 << 4
+public static const uint PXG_ARTI_DIRTY_ROOT_VELOCITIES = 32;               // 1 << 5
 // the tendon and mimic-joint bits jcalc phase C masks OUT before deciding whether
 // the block refresh has anything left to do (P8.76)
 public static const uint PXG_ARTI_DIRTY_SPATIAL_TENDON = 16384;             // 1 << 14
