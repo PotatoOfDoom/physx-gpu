@@ -187,6 +187,13 @@ public static const uint PXG_ARTI_DIRTY_FORCES = 8;
 public static const uint PXG_ARTI_DIRTY_JOINT_TARGET_VEL = 4096;
 public static const uint PXG_ARTI_DIRTY_JOINT_TARGET_POS = 8192;
 public static const uint PXG_ARTI_DIRTY_EXT_ACCEL = 512;
+// the tendon and mimic-joint bits jcalc phase C masks OUT before deciding whether
+// the block refresh has anything left to do (P8.76)
+public static const uint PXG_ARTI_DIRTY_SPATIAL_TENDON = 16384;             // 1 << 14
+public static const uint PXG_ARTI_DIRTY_SPATIAL_TENDON_ATTACHMENT = 32768;  // 1 << 15
+public static const uint PXG_ARTI_DIRTY_FIXED_TENDON = 65536;               // 1 << 16
+public static const uint PXG_ARTI_DIRTY_FIXED_TENDON_JOINT = 131072;        // 1 << 17
+public static const uint PXG_ARTI_DIRTY_MIMIC_JOINT = 262144;               // 1 << 18
 
 // ---------------------------------------------------------------------------
 // PxgArticulationCoreDesc (gpuarticulation/include/PxgArticulationCoreDesc.h,

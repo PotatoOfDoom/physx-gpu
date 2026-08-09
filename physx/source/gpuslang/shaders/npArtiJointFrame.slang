@@ -864,3 +864,217 @@ void artiJcalcPhaseB3(uint3 groupThreadId : SV_GroupThreadID)
     jcalcFillDofBlocks(gJcalcB3.articulations + uint64_t(lane) * PXG_ARTI_STRIDE,
                        gJcalcB3.linkBlocks, gJcalcB3.dofBlocks, lane);
 }
+
+
+// ===========================================================================
+// P8.76: jcalc PHASE C -- the `else if (dataDirty)` refresh (fwdDynamic2.cu:586-736)
+// ===========================================================================
+//
+// The path taken when the block layout is already valid and only VALUES have
+// changed.  It is emphatically NOT a cheaper phase B: it writes a strict SUBSET
+// of the same fields, and which fields it leaves alone is the whole content of
+// this tranche.  Phase C does NOT touch
+//
+//     mRetainsAcceleration, mDofs, mJointType, mJointOffset, mParents,
+//     mChildrenOffset, mNumChildren, mInvDofIds, mDofIds, mMotion, mJointAxis
+//
+// even though phase B writes every one of them, because those are structural and
+// the structure has not changed.  Writing one of them here would be invisible in
+// any test that only checks the fields that ARE written -- so the fixture poisons
+// the destinations and requires every untouched field to come back poison.
+//
+// TWO BRANCHES THAT ARE EASY TO DROP:
+//
+//  * The tendon and mimic-joint dirty bits are masked OUT before asking whether
+//    anything is left to do.  An articulation whose ONLY dirty bit is
+//    eDIRTY_SPATIAL_TENDON must skip the whole block refresh -- the tendon blocks
+//    are updated by their own helpers.  Forgetting the mask turns that into a full
+//    refresh, which is not wrong numerically and is wrong in cost, every frame.
+//  * `directAPI` suppresses the root motion-velocity write ONLY.  Under the direct
+//    GPU state API the root velocity in the block is authoritative and the record's
+//    initial velocity is stale; copying it would silently undo a user write.
+//
+// `updateDirty` is cleared here -- this is the consumer phase A deliberately left
+// it for.
+//
+// The CUDA hand-preloads the next link's data into `next*` locals.  That is a
+// latency transform with identical results, EXCEPT that it reads gJoints[1],
+// links[1] and gJointData[1] before the loop guard, so a single-link articulation
+// touches element [1] of a one-element array.  The port reads in the loop instead:
+// same values, no out-of-bounds read.  Likewise `dofId = i ? joint.dofIds[i] :
+// dofId0` is just `joint.dofIds[i]` with the first one preloaded.
+
+struct JcalcCParams
+{
+    uint64_t articulations;
+    uint64_t linkBlocks;
+    uint64_t dofBlocks;
+    uint nbArticulations;
+    uint directAPI;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<JcalcCParams> gJcalcC;
+
+void jcalcRefreshBlocks(uint64_t a, uint64_t linkBlocks, uint64_t dofBlocks,
+                        bool directAPI, uint lane)
+{
+    const uint dirtyAll = artiU32Field(a, PXG_ARTI_DATA_UPDATE_DIRTY);
+
+    const uint TENDON_BITS = PXG_ARTI_DIRTY_SPATIAL_TENDON
+                           | PXG_ARTI_DIRTY_SPATIAL_TENDON_ATTACHMENT
+                           | PXG_ARTI_DIRTY_FIXED_TENDON
+                           | PXG_ARTI_DIRTY_FIXED_TENDON_JOINT;
+    const uint updateDirty = dirtyAll & ~TENDON_BITS;
+
+    if (updateDirty != 0u)
+    {
+        const uint numLinks = artiU16Field(a, PXG_ARTI_DATA_NUM_LINKS);
+
+        const uint64_t links = artiPtrField(a, PXG_ARTI_LINKS);
+        const uint64_t joints = artiPtrField(a, PXG_ARTI_JOINTS);
+        const uint64_t jointData = artiPtrField(a, PXG_ARTI_JOINT_DATA);
+        const uint64_t body2Worlds = artiPtrField(a, PXG_ARTI_LINK_BODY2WORLDS);
+        const uint64_t motionMatrix = artiPtrField(a, PXG_ARTI_MOTION_MATRIX);
+        const uint64_t relativeQuats = artiPtrField(a, PXG_ARTI_RELATIVE_QUAT);
+        const Ptr<uint> jointPositions = Ptr<uint>(artiPtrField(a, PXG_ARTI_JOINT_POSITIONS));
+        const Ptr<uint> jointVelocities = Ptr<uint>(artiPtrField(a, PXG_ARTI_JOINT_VELOCITIES));
+        const Ptr<uint> jointTargetPos = Ptr<uint>(artiPtrField(a, PXG_ARTI_JOINT_TARGET_POSITIONS));
+        const Ptr<uint> jointTargetVel = Ptr<uint>(artiPtrField(a, PXG_ARTI_JOINT_TARGET_VELOCITIES));
+
+        // ---- the root: three fields, and the velocity only when not direct-API ----
+        const uint64_t root = linkBlocks;
+        abStoreU8(root, PXG_AB_LINK_mDisableGravity, lane,
+                  artiU8Field(links, PXG_AR_LINK_disableGravity));
+        abStoreF4(root, PXG_AB_LINK_mLinDampingX_AngDampingY_maxLinVelSqZ_maxAngVelSqW, lane,
+                  float4(asfloat(artiU32Field(links, PXG_AR_LINK_linearDamping)),
+                         asfloat(artiU32Field(links, PXG_AR_LINK_angularDamping)),
+                         asfloat(artiU32Field(links, PXG_AR_LINK_maxLinearVelocitySq)),
+                         asfloat(artiU32Field(links, PXG_AR_LINK_maxAngularVelocitySq))));
+
+        if (!directAPI)
+        {
+            const float3 initAng =
+                float3(asfloat(artiU32Field(links, PXG_AR_LINK_initialAngVel + 0u)),
+                       asfloat(artiU32Field(links, PXG_AR_LINK_initialAngVel + 4u)),
+                       asfloat(artiU32Field(links, PXG_AR_LINK_initialAngVel + 8u)));
+            const float3 initLin =
+                float3(asfloat(artiU32Field(links, PXG_AR_LINK_initialLinVel + 0u)),
+                       asfloat(artiU32Field(links, PXG_AR_LINK_initialLinVel + 4u)),
+                       asfloat(artiU32Field(links, PXG_AR_LINK_initialLinVel + 8u)));
+            abStoreSpatialVector(root, PXG_AB_LINK_mMotionVelocity, lane, initAng, initLin);
+        }
+
+        jcalcStorePose(root, PXG_AB_LINK_mAccumulatedPose, lane, body2Worlds);
+
+        for (uint linkID = 1u; linkID < numLinks; ++linkID)
+        {
+            const uint64_t blk = linkBlocks + uint64_t(linkID) * PXG_AB_LINK_SIZE;
+            const uint64_t lrec = links + uint64_t(linkID) * PXG_ARTI_LINK_SIZE;
+            const uint64_t jc = joints + uint64_t(linkID) * PXG_ARTI_JOINT_CORE_SIZE;
+            const uint64_t jd = jointData + uint64_t(linkID) * PXG_ARTI_JOINT_CORE_DATA_SIZE;
+
+            const uint nbDofs = artiU8Field(jd, PXG_AR_JCD_nbDof);
+            const uint jointOffset = artiU32Field(jd, PXG_AR_JCD_jointOffset);
+            const uint64_t mmBase = motionMatrix + uint64_t(linkID) * PXG_ARTI_SUBSPACE_STRIDE;
+            const uint frictionCoefficient = artiU32Field(jc, PXG_AR_JOINT_frictionCoefficient);
+
+            for (uint i = 0u; i < nbDofs; ++i)
+            {
+                const uint64_t dof = dofBlocks + uint64_t(jointOffset + i) * PXG_AB_DOF_SIZE;
+                const uint64_t ic = dof + PXG_AB_DOF_mConstraintData;
+                const uint dofId = artiU8Field(jc, PXG_AR_JOINT_dofIds + i);
+
+                const uint64_t dr = jc + PXG_AR_JOINT_drives + uint64_t(dofId) * PXG_AR_DRIVE_SIZE;
+                const uint64_t env = dr + PXG_AR_DRIVE_envelope;
+                const uint64_t lim = jc + PXG_AR_JOINT_limits + uint64_t(dofId) * PXG_AR_LIMIT_SIZE;
+                const uint64_t fp = jc + PXG_AR_JOINT_frictionParams
+                                  + uint64_t(dofId) * PXG_AR_FRICTION_SIZE;
+
+                abStoreU32(ic, PXG_AB_IC_mDriveStiffness, lane,
+                           artiU32Field(dr, PXG_AR_DRIVE_stiffness));
+                abStoreU32(ic, PXG_AB_IC_mDamping, lane, artiU32Field(dr, PXG_AR_DRIVE_damping));
+                abStoreU32(ic, PXG_AB_IC_mDriveTargetVel, lane, jointTargetVel[jointOffset + i]);
+                abStoreF32(ic, PXG_AB_IC_mTargetPosBias, lane, 0.0f);
+                abStoreU32(ic, PXG_AB_IC_mArmature, lane,
+                           artiU32Field(jc, PXG_AR_JOINT_armature + dofId * 4u));
+                abStoreF2(ic, PXG_AB_IC_mLimits_LowLimitX_highLimitY, lane,
+                          float2(asfloat(artiU32Field(lim, PXG_AR_LIMIT_low)),
+                                 asfloat(artiU32Field(lim, PXG_AR_LIMIT_high))));
+                abStoreU32(ic, PXG_AB_IC_mFrictionCoefficient, lane, frictionCoefficient);
+                abStoreU32(ic, PXG_AB_IC_mStaticFrictionEffort, lane,
+                           artiU32Field(fp, PXG_AR_FRICTION_staticFrictionEffort));
+                abStoreU32(ic, PXG_AB_IC_mDynamicFrictionEffort, lane,
+                           artiU32Field(fp, PXG_AR_FRICTION_dynamicFrictionEffort));
+                abStoreU32(ic, PXG_AB_IC_mViscousFrictionCoefficient, lane,
+                           artiU32Field(fp, PXG_AR_FRICTION_viscousFrictionCoefficient));
+                abStoreU32(ic, PXG_AB_IC_mMaxForce, lane,
+                           artiU32Field(dr, PXG_AR_DRIVE_maxForce));
+                abStoreU32(ic, PXG_AB_IC_mMaxEffort, lane,
+                           artiU32Field(env, PXG_AR_ENV_maxEffort));
+                abStoreU32(ic, PXG_AB_IC_mMaxActuatorVelocity, lane,
+                           artiU32Field(env, PXG_AR_ENV_maxActuatorVelocity));
+                abStoreU32(ic, PXG_AB_IC_mVelocityDependentResistance, lane,
+                           artiU32Field(env, PXG_AR_ENV_velocityDependentResistance));
+                abStoreU32(ic, PXG_AB_IC_mSpeedEffortGradient, lane,
+                           artiU32Field(env, PXG_AR_ENV_speedEffortGradient));
+                abStoreU32(ic, PXG_AB_IC_mDriveType, lane,
+                           artiU32Field(dr, PXG_AR_DRIVE_driveType));
+                abStoreU32(ic, PXG_AB_IC_mMaxJointVelocity, lane,
+                           artiU32Field(jc, PXG_AR_JOINT_maxJointVelocity + dofId * 4u));
+
+                // these three are written regardless of directAPI -- the CUDA comment
+                // above them says so explicitly and flags it as an open question
+                abStoreU32(dof, PXG_AB_DOF_mJointPositions, lane,
+                           jointPositions[jointOffset + i]);
+                abStoreU32(dof, PXG_AB_DOF_mJointVelocities, lane,
+                           jointVelocities[jointOffset + i]);
+                abStoreU32(ic, PXG_AB_IC_mDriveTargetPos, lane, jointTargetPos[jointOffset + i]);
+
+                const uint64_t mm = mmBase + uint64_t(i) * PXG_ARTI_SPATIAL_VECTOR_SIZE;
+                abStoreSpatialVector(dof, PXG_AB_DOF_mLocalMotionMatrix, lane,
+                                     float3(asfloat(artiU32Field(mm, 0u)),
+                                            asfloat(artiU32Field(mm, 4u)),
+                                            asfloat(artiU32Field(mm, 8u))),
+                                     float3(asfloat(artiU32Field(mm, 12u)),
+                                            asfloat(artiU32Field(mm, 16u)),
+                                            asfloat(artiU32Field(mm, 20u))));
+            }
+
+            const uint64_t rq = relativeQuats + uint64_t(linkID) * PXG_ARTI_QUAT_SIZE;
+            abStoreF4(blk, PXG_AB_LINK_mRelativeQuat, lane,
+                      float4(asfloat(artiU32Field(rq, 0u)), asfloat(artiU32Field(rq, 4u)),
+                             asfloat(artiU32Field(rq, 8u)), asfloat(artiU32Field(rq, 12u))));
+            abStoreF4(blk, PXG_AB_LINK_mLinDampingX_AngDampingY_maxLinVelSqZ_maxAngVelSqW, lane,
+                      float4(asfloat(artiU32Field(lrec, PXG_AR_LINK_linearDamping)),
+                             asfloat(artiU32Field(lrec, PXG_AR_LINK_angularDamping)),
+                             asfloat(artiU32Field(lrec, PXG_AR_LINK_maxLinearVelocitySq)),
+                             asfloat(artiU32Field(lrec, PXG_AR_LINK_maxAngularVelocitySq))));
+            abStoreU8(blk, PXG_AB_LINK_mDisableGravity, lane,
+                      artiU8Field(lrec, PXG_AR_LINK_disableGravity));
+
+            jcalcStorePose(blk, PXG_AB_LINK_mChildPose, lane, jc + PXG_AR_JOINT_childPose);
+            jcalcStorePose(blk, PXG_AB_LINK_mParentPose, lane, jc + PXG_AR_JOINT_parentPose);
+            jcalcStorePose(blk, PXG_AB_LINK_mAccumulatedPose, lane,
+                           body2Worlds + uint64_t(linkID) * PXG_ARTI_TRANSFORM_SIZE);
+        }
+    }
+
+    // the tendon and mimic-joint refreshes hang off the bits masked out above and
+    // are separate subsystems; they are not part of this tranche.
+
+    // updateDirty is cleared here, and only here -- phase A left it set on purpose
+    (Ptr<uint>(a + PXG_ARTI_DATA_UPDATE_DIRTY))[0] = 0u;
+}
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void artiJcalcPhaseC(uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint lane = groupThreadId.x;
+    if (lane >= gJcalcC.nbArticulations)
+        return;
+
+    jcalcRefreshBlocks(gJcalcC.articulations + uint64_t(lane) * PXG_ARTI_STRIDE,
+                       gJcalcC.linkBlocks, gJcalcC.dofBlocks, gJcalcC.directAPI != 0u, lane);
+}

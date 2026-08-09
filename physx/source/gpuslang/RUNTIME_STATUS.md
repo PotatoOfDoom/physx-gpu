@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **701/701** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **702/702** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,64 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.76 — `jcalc` phase C: the refresh path, and what it deliberately does NOT write
+
+The `else if (dataDirty)` branch (forwardDynamic2.cu:586-736), taken when the block
+layout is already valid and only values changed.  Suite 701 → **702**; manifest
+unchanged at **270 of 501**.  The tendon and mimic-joint refresh helpers hanging off
+the masked-out bits are separate subsystems and are not in this tranche.
+
+**Phase C is not a cheaper phase B.**  It writes a strict SUBSET of the same fields,
+and the subset is the whole content of the tranche.  It must leave
+
+```
+mRetainsAcceleration  mDofs  mJointType  mJointOffset  mParents
+mChildrenOffset  mNumChildren  mInvDofIds  mDofIds  mMotion  mJointAxis
+```
+
+alone — every one of them a field phase B writes — because those are *structural*
+and the structure has not changed.  An extra write here is invisible to any test
+that only checks what is supposed to be written, so the destinations are poisoned
+and every untouched byte must come back 0xAB.  Two mutants that add a structural
+write (`C7` mRetainsAcceleration, `C8` mDofs) and one that adds `mJointAxis` (`C14`)
+all die on that check alone.
+
+**Two branches that are easy to drop, and both are now measured:**
+
+* **The tendon bits are masked out before asking whether anything is left to do.**
+  An articulation whose only dirty bit is `eDIRTY_SPATIAL_TENDON` must skip the
+  entire block refresh.  Dropping the mask is not numerically wrong — it is a full
+  refresh every frame that nothing needed.  Sub-case 3 of the fixture drives exactly
+  that state; `C1` (no mask) and `C2` (inverted mask) both die.
+* **`directAPI` suppresses the root motion-velocity write, and only that.**  Under
+  the direct GPU state API the block holds the authoritative root velocity and the
+  record's initial velocity is stale, so copying it would silently undo a user
+  write.  `C4` (never suppress) and `C5` (suppress inverted) both die.
+
+`updateDirty` is cleared here, and **only** here — this is the consumer phase A
+deliberately left it for.  The fixture checks it comes back zero in all four
+sub-cases, including the two that write nothing.
+
+**A CUDA transform deliberately not reproduced.**  The original hand-preloads the
+next link's data into `next*` locals.  That is a latency transform with identical
+results, except that it reads `gJoints[1]`, `links[1]` and `gJointData[1]` **before
+the loop guard**, so a single-link articulation touches element [1] of a
+one-element array.  The port reads inside the loop: same values, no out-of-bounds
+read.  Likewise `dofId = i ? joint.dofIds[i] : dofId0` is just `joint.dofIds[i]`
+with the first iteration preloaded.
+
+**Sweep: 16 of 16 killed** (15 in the first pass, of which one — `C11`, "the root
+accumulated pose is skipped" — was **written wrongly**: the replacement still
+performed the store via `body2Worlds + 0`, so its SURVIVED verdict said nothing.
+Rewritten to actually delete the store, it dies, and a second mutant reading link
+1's transform into the root slot dies too.  A mutant that does not mutate is a bug
+in the sweep, not a result.)
+
+Suite **702/702** both memory modes.  With phases A, B1-B3 and C done, what is left
+before `computeUnconstrainedVelocities1TLaunch` can be assembled is the
+`gpuDirtyFlag` block after phase C and the three `initialize*Block` tendon/mimic
+helpers.
 
 ## P8.75 — `jcalc` phase B3: the per-dof fill and the internal constraint block
 
