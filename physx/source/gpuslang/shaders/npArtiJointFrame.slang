@@ -490,24 +490,37 @@ struct JcalcB1Params
 [[vk::push_constant]]
 ConstantBuffer<JcalcB1Params> gJcalcB1;
 
-[shader("compute")]
-[numthreads(32, 1, 1)]
-void artiJcalcPhaseB1(uint3 groupThreadId : SV_GroupThreadID)
+// The phase bodies are FUNCTIONS, not entry points, so that assembling
+// computeUnconstrainedVelocities1TLaunch later is composition rather than a
+// second transcription of the same CUDA.  Each entry point below is a thin
+// harness that supplies the lane and the block bases the engine kernel will
+// supply from the core descriptor.
+// PxTransform is { PxQuat q; PxVec3 p; } -- q at +0, p at +16, 28 bytes with no
+// tail padding, so the two halves are read as seven scalars rather than as a
+// float4 pair (`p` is not 16-byte aligned for odd link indices).
+void jcalcStorePose(uint64_t blk, uint fieldOffset, uint lane, uint64_t src)
 {
-    const uint lane = groupThreadId.x;
-    if (lane >= gJcalcB1.nbArticulations)
-        return;
+    abStoreSpatialTransform(blk, fieldOffset, lane,
+                            float4(asfloat(artiU32Field(src, 0u)),
+                                   asfloat(artiU32Field(src, 4u)),
+                                   asfloat(artiU32Field(src, 8u)),
+                                   asfloat(artiU32Field(src, 12u))),
+                            float3(asfloat(artiU32Field(src, 16u)),
+                                   asfloat(artiU32Field(src, 20u)),
+                                   asfloat(artiU32Field(src, 24u))));
+}
 
-    const uint64_t a = gJcalcB1.articulations + uint64_t(lane) * PXG_ARTI_STRIDE;
+void jcalcFillRootLinkAndBitFields(uint64_t a, uint64_t linkBlocks, uint64_t bitFields,
+                                   uint maxNumLinks, uint lane)
+{
     const uint numLinks = artiU16Field(a, PXG_ARTI_DATA_NUM_LINKS);
-    const uint maxNumLinks = gJcalcB1.maxNumLinks;
 
     const uint64_t links = artiPtrField(a, PXG_ARTI_LINKS);
     const uint64_t body2Worlds = artiPtrField(a, PXG_ARTI_LINK_BODY2WORLDS);
     const Ptr<uint> pathToRootElems = Ptr<uint>(artiPtrField(a, PXG_ARTI_PATH_TO_ROOT));
 
     // ---- the root link block (element 0 of the warp's link block array) ----
-    const uint64_t root = gJcalcB1.linkBlocks;
+    const uint64_t root = linkBlocks;
 
     abStoreU8(root, PXG_AB_LINK_mDisableGravity, lane,
               artiU8Field(links, PXG_AR_LINK_disableGravity));
@@ -536,16 +549,7 @@ void artiJcalcPhaseB1(uint3 groupThreadId : SV_GroupThreadID)
     // Cm::UnAlignedSpatialVector(angular, linear) -- top is the ANGULAR half
     abStoreSpatialVector(root, PXG_AB_LINK_mMotionVelocity, lane, initAng, initLin);
 
-    // PxTransform is { PxQuat q; PxVec3 p; }: q at +0, p at +16
-    const uint64_t b2w0 = body2Worlds;
-    abStoreSpatialTransform(root, PXG_AB_LINK_mAccumulatedPose, lane,
-                            float4(asfloat(artiU32Field(b2w0, 0u)),
-                                   asfloat(artiU32Field(b2w0, 4u)),
-                                   asfloat(artiU32Field(b2w0, 8u)),
-                                   asfloat(artiU32Field(b2w0, 12u))),
-                            float3(asfloat(artiU32Field(b2w0, 16u)),
-                                   asfloat(artiU32Field(b2w0, 20u)),
-                                   asfloat(artiU32Field(b2w0, 24u))));
+    jcalcStorePose(root, PXG_AB_LINK_mAccumulatedPose, lane, body2Worlds);
 
     abStoreU32(root, PXG_AB_LINK_mChildrenOffset, lane,
                artiU32Field(links, PXG_AR_LINK_childrenOffset));
@@ -555,7 +559,7 @@ void artiJcalcPhaseB1(uint3 groupThreadId : SV_GroupThreadID)
 
     // ---- the path-to-root bitfields ----
     const uint wordSize = (maxNumLinks + 63u) / 64u;
-    const uint64_t bf = gJcalcB1.bitFieldBlocks;
+    const uint64_t bf = bitFields;
 
     for (uint i = 0u; i < maxNumLinks * wordSize; ++i)
         abStoreU64(bf + uint64_t(i) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane, uint64_t(0));
@@ -586,4 +590,118 @@ void artiJcalcPhaseB1(uint3 groupThreadId : SV_GroupThreadID)
         // and the root again, unconditionally, into word 0 of this link's row
         abStoreU64(rowBase, 0u, lane, abU64(rowBase, 0u, lane) | uint64_t(1));
     }
+}
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void artiJcalcPhaseB1(uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint lane = groupThreadId.x;
+    if (lane >= gJcalcB1.nbArticulations)
+        return;
+
+    jcalcFillRootLinkAndBitFields(gJcalcB1.articulations + uint64_t(lane) * PXG_ARTI_STRIDE,
+                                  gJcalcB1.linkBlocks, gJcalcB1.bitFieldBlocks,
+                                  gJcalcB1.maxNumLinks, lane);
+}
+
+
+// ===========================================================================
+// P8.74: jcalc PHASE B2 -- the per-link block fields (forwardDynamic2.cu:545-575)
+// ===========================================================================
+//
+// The rest of phase B's link loop, minus the per-dof fill: for every link from 1
+// up, the relative quat, joint offset, dof count, joint type, damping float4,
+// parent index, children offsets, gravity flags and the three poses.  The
+// bitfield writes that sit interleaved with these in the CUDA are P8.73's.
+//
+// Three shapes here that a uniform-looking run hides:
+//
+//  * mDofs and mJointType are PxU8[32] and mJointOffset/mParents/mChildrenOffset/
+//    mNumChildren are PxU32[32] -- SAME LOOP, different element strides, so a
+//    single "store a lane" helper used for all of them would be wrong for half.
+//  * mRelativeQuat is a bare float4[32] and NOT a PxgSpatialTransformBlock, even
+//    though it holds a quaternion and sits next to blocks that are; the CUDA
+//    reinterpret_casts the PxQuat array to float4* and copies 16 bytes.
+//  * nbDof is read out of ArticulationJointCoreData, where it is a PxU8 at
+//    offset 4 -- the byte-not-word trap P8.70 and P8.72 both hit.
+
+struct JcalcB2Params
+{
+    uint64_t articulations;
+    uint64_t linkBlocks;
+    uint nbArticulations;
+    uint pad0;
+};
+
+[[vk::push_constant]]
+ConstantBuffer<JcalcB2Params> gJcalcB2;
+
+void jcalcFillLinkBlocks(uint64_t a, uint64_t linkBlocks, uint lane)
+{
+    const uint numLinks = artiU16Field(a, PXG_ARTI_DATA_NUM_LINKS);
+
+    const uint64_t links = artiPtrField(a, PXG_ARTI_LINKS);
+    const uint64_t joints = artiPtrField(a, PXG_ARTI_JOINTS);
+    const uint64_t jointData = artiPtrField(a, PXG_ARTI_JOINT_DATA);
+    const uint64_t body2Worlds = artiPtrField(a, PXG_ARTI_LINK_BODY2WORLDS);
+    const uint64_t relativeQuats = artiPtrField(a, PXG_ARTI_RELATIVE_QUAT);
+    const Ptr<uint> parents = Ptr<uint>(artiPtrField(a, PXG_ARTI_PARENTS));
+
+    for (uint linkID = 1u; linkID < numLinks; ++linkID)
+    {
+        const uint64_t blk = linkBlocks + uint64_t(linkID) * PXG_AB_LINK_SIZE;
+        const uint64_t lrec = links + uint64_t(linkID) * PXG_ARTI_LINK_SIZE;
+        const uint64_t jc = joints + uint64_t(linkID) * PXG_ARTI_JOINT_CORE_SIZE;
+        const uint64_t jd = jointData + uint64_t(linkID) * PXG_ARTI_JOINT_CORE_DATA_SIZE;
+
+        // relativeQuats is a PxQuat array the CUDA reinterprets as float4 -- a
+        // straight 16-byte copy, not a transform block
+        const uint64_t rq = relativeQuats + uint64_t(linkID) * PXG_ARTI_QUAT_SIZE;
+        abStoreF4(blk, PXG_AB_LINK_mRelativeQuat, lane,
+                  float4(asfloat(artiU32Field(rq, 0u)), asfloat(artiU32Field(rq, 4u)),
+                         asfloat(artiU32Field(rq, 8u)), asfloat(artiU32Field(rq, 12u))));
+
+        abStoreU32(blk, PXG_AB_LINK_mJointOffset, lane,
+                   artiU32Field(jd, PXG_AR_JCD_jointOffset));
+        // nbDof is a PxU8 at offset 4 of an 8-byte struct
+        abStoreU8(blk, PXG_AB_LINK_mDofs, lane, artiU8Field(jd, PXG_AR_JCD_nbDof));
+        abStoreU8(blk, PXG_AB_LINK_mJointType, lane, artiU8Field(jc, PXG_AR_JOINT_jointType));
+
+        abStoreF4(blk, PXG_AB_LINK_mLinDampingX_AngDampingY_maxLinVelSqZ_maxAngVelSqW, lane,
+                  float4(asfloat(artiU32Field(lrec, PXG_AR_LINK_linearDamping)),
+                         asfloat(artiU32Field(lrec, PXG_AR_LINK_angularDamping)),
+                         asfloat(artiU32Field(lrec, PXG_AR_LINK_maxLinearVelocitySq)),
+                         asfloat(artiU32Field(lrec, PXG_AR_LINK_maxAngularVelocitySq))));
+
+        abStoreU32(blk, PXG_AB_LINK_mParents, lane, parents[linkID]);
+
+        abStoreU32(blk, PXG_AB_LINK_mChildrenOffset, lane,
+                   artiU32Field(lrec, PXG_AR_LINK_childrenOffset));
+        abStoreU32(blk, PXG_AB_LINK_mNumChildren, lane,
+                   artiU16Field(lrec, PXG_AR_LINK_numChildren));
+
+        abStoreU8(blk, PXG_AB_LINK_mDisableGravity, lane,
+                  artiU8Field(lrec, PXG_AR_LINK_disableGravity));
+        abStoreU8(blk, PXG_AB_LINK_mRetainsAcceleration, lane,
+                  artiU8Field(lrec, PXG_AR_LINK_retainsAccelerations));
+
+        // the joint's own frames, then the link's world pose
+        jcalcStorePose(blk, PXG_AB_LINK_mChildPose, lane, jc + PXG_AR_JOINT_childPose);
+        jcalcStorePose(blk, PXG_AB_LINK_mParentPose, lane, jc + PXG_AR_JOINT_parentPose);
+        jcalcStorePose(blk, PXG_AB_LINK_mAccumulatedPose, lane,
+                       body2Worlds + uint64_t(linkID) * PXG_ARTI_TRANSFORM_SIZE);
+    }
+}
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void artiJcalcPhaseB2(uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint lane = groupThreadId.x;
+    if (lane >= gJcalcB2.nbArticulations)
+        return;
+
+    jcalcFillLinkBlocks(gJcalcB2.articulations + uint64_t(lane) * PXG_ARTI_STRIDE,
+                        gJcalcB2.linkBlocks, lane);
 }

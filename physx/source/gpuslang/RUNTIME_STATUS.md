@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **699/699** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **700/700** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,56 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.74 — `jcalc` phase B2: the per-link block fields
+
+The rest of phase B's link loop minus the per-dof fill (forwardDynamic2.cu:545-575):
+per link, the relative quat, joint offset, dof count, joint type, damping float4,
+parent, children offset and count, the two gravity flags and the three poses.
+Suite 699 → **700**; manifest unchanged at **270 of 501**.
+
+**The phase bodies became FUNCTIONS in this tranche**, not entry points.
+`jcalcFillRootLinkAndBitFields`, `jcalcFillLinkBlocks` and the shared
+`jcalcStorePose` are ordinary functions; `artiJcalcPhaseB1/B2` are thin harnesses
+that supply the lane and the block bases the engine kernel will take from the core
+descriptor.  Assembling `computeUnconstrainedVelocities1TLaunch` is then composition
+rather than a second transcription of the same CUDA — which is the failure mode that
+would otherwise be waiting at the end of this chain, with each phase proven
+separately and the assembly proven by nothing.
+
+Three shapes a uniform-looking loop hides, each one a killed mutant:
+
+* **the same loop writes three different element strides** — `mDofs`/`mJointType`
+  are `PxU8[32]`, `mJointOffset`/`mParents`/`mChildrenOffset`/`mNumChildren` are
+  `PxU32[32]`, `mRelativeQuat` and the damping are `float4[32]`.  One "store a lane"
+  helper for all of them would be wrong for two thirds;
+* **`mRelativeQuat` is a bare `float4[32]`, not a `PxgSpatialTransformBlock`**, even
+  though it holds a quaternion and sits among blocks that are — the CUDA
+  reinterpret_casts the `PxQuat` array and copies sixteen bytes;
+* **`PxTransform` is 28 bytes with no tail padding**, so `body2Worlds[linkID]` is
+  only 4-byte aligned for odd links and the two halves have to be read as seven
+  scalars.  Striding it by 32 is killed (N12).
+
+**Sweep: 17 of 19 killed; both survivors are equivalent, with the reason, not the
+excuse.**
+
+* `N4` reads `nbDof` as a `PxU32` instead of a `PxU8`.  Equivalent **here** because
+  the destination is a byte field and `abStoreU8` masks with `0xFF`, so the three
+  neighbouring bytes are discarded before the store.  The same mutant is NOT
+  equivalent where `nbDof` feeds arithmetic — it was killed in P8.72's phase A,
+  where it accumulates into `totalDofs`.  A width bug is only invisible when the
+  consumer is as narrow as the field.
+* `N18` swaps `PXG_ARTI_LINK_SIZE` for `PXG_AR_LINK_SIZE`.  Tautological: **both
+  constants are 80**, because the size of `PxgArticulationLink` is generated
+  independently into the descriptor module and the blocks module.  Harmless today
+  and pinned in both places, but it is a duplicate the assembly tranche should
+  collapse rather than inherit.
+
+Two mutants first came back `SKIPPED` on a non-unique anchor (their text also
+appears in phase A) and were re-run with a two-line anchor; both then killed.  A
+skipped mutant is recorded as untested, never counted.
+
+Suite **700/700** both memory modes.
 
 ## P8.73 — `jcalc` phase B1: the root link block and the path-to-root bitfields
 
