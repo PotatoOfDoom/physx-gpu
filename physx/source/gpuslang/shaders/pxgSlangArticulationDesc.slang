@@ -278,6 +278,12 @@ public static const uint PXG_NODE_INDEX_SIZE = 8;
 // bytes; this is the byte offset the raw-addressed path needs).
 public static const uint PXG_BODY_SIM_SIZE = 224;
 public static const uint PXG_BODY_SIM_ARTICULATION_REMAP_ID = 176;
+// P8.83: the block header's mSleepThreshold comes from `.z` of the float4
+// `freezeThresholdX_wakeCounterY_sleepThresholdZ_bodySimIndex` at 96 -- so 104,
+// which is a DERIVED offset and therefore pinned in its own right rather than
+// left as "96 + 8" at the call site.  Reading it as the float4's `.x` or `.y`
+// picks up the freeze threshold or the wake counter, both plausible reals.
+public static const uint PXG_BODY_SIM_SLEEP_THRESHOLD = 104;
 
 // ---------------------------------------------------------------------------
 // The fields jcalc's phase A recomputes (P8.72).  Note the two SINGLE BYTES

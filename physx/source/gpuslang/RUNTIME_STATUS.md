@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **706/706** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **707/707** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,138 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.83 — `computeUnconstrainedVelocities1TLaunch` assembled — manifest **271**
+
+Twelve tranches after the articulation dynamics were opened, the first real
+articulation solver kernel is mapped.  Manifest **270 → 271**; suite 706 →
+**707**; the engine's unmapped-kernel list **231 → 230**, and the one that left it
+is this one.
+
+**The wrapper is composition, not transcription, and that was the point of every
+tranche since P8.74.**  Every part of `computeUnconstrainedVelocitiesInternal1T`
+is already a Slang *function* with its own fixture and its own sweep, so the entry
+point is 60 lines of index chain, per-warp bases and guards over eleven calls.
+Phase A was the last piece still living inside its entry point; it is now
+`jcalcRecomputeRecord` — and its two flags are **parameters**, which is
+load-bearing rather than tidy (see below).
+
+**The launch shape, and a stale comment in the engine.**
+`PxgArticulationCore.cpp:437` launches block **(32, 2, 1)** with
+`num1TBlocks = (nbArticulations + 63) / 64`.  The comment beside it says "each
+warp will work on one articulation"; the code says
+`globalThreadIndex = threadIdx.x + globalWarpIndex * WARP_SIZE` guarded by
+`< nbArticulations`, which is **one thread** per articulation.  The grid
+arithmetic settles it — 64 articulations per block, not 2 — so the code is right
+and the comment is not.  No barriers and no groupshared anywhere in the kernel,
+which is why the divergent early return is safe on llvmpipe.
+
+**Three orderings the wrapper has to get right, none of which any phase fixture
+could have caught:**
+
+1. **`confiDirty` is read once, before phase A clears it.**  The CUDA reads it
+   into a local at :372, phase A writes `artiData.confiDirty = false` at :429, and
+   the branch at :436 tests the **local**.  A body that re-read the record would
+   skip phase B on exactly the frame that needs it.  Same shape for
+   `refillBlockData`, computed from the block's `mArticulationIndex` *before*
+   `jcalcFillBlockHeader` overwrites it.
+2. **`updateDirty` is read before `jcalcRefreshBlocks`, which clears it.**  The
+   engine's `else if (dataDirty)` branch runs the refresh, *then* the three
+   tendon/mimic updates guarded by bits of `updateDirty`, and only then zeroes it
+   (:751).  Our refresh function clears it at its own end — that is what its own
+   fixture pins — so the guards must use the saved value.
+3. **The per-warp bases are not one pitch.**  Attachments are
+   `maxSpatialTendons * maxAttachments` per warp, tendon joints are
+   `maxFixedTendons * maxTendonJoints`, and the bitfields are
+   `maxLinks * wordSize` with `wordSize = (maxLinks + 63) / 64`.
+
+ABI row `{ 8, 1, 1 }` → a 16-byte blob, the first row in the table with **two
+adjacent one-byte arguments**; both bools come out of one push-constant word with
+a shift, the way `broadphaseEndPtHistogram` does for its one.  One new constant,
+`PXG_BODY_SIM_SLEEP_THRESHOLD = 104` — a *derived* offset (`.z` of the float4 at
+96), so it is pinned in its own right rather than left as "96 + 8" at the call
+site.  Manifest hand-edited, as always.
+
+### The fixture, and the four survivors that turned into fixture work
+
+`testArtiUnconstrainedVel` drives the whole kernel on the engine's own launch
+geometry.  It does **not** re-derive the eleven phases' field-level expectations —
+that would be the second transcription this chain has spent twelve tranches
+avoiding.  It checks what only the wrapper can get wrong (the three-hop index
+chain, `solverBodyIndices`, the nine per-warp bases, the guard order, the launch
+shape), one witness per composed piece, and two allocated-but-unreached warp
+slices that must come back entirely 0xAB.
+
+**The first sweep killed 28 of 42.  Every one of the fourteen survivors was
+examined, and eleven of them were the fixture, not the shader** — the sixth
+consecutive tranche where that is the finding:
+
+* **four pitches were equal.**  `maxSpatialTendons == maxFixedTendons == 2` and
+  `maxAttachments == maxTendonJoints == 3`, so a base built from the wrong one was
+  a no-op.  All seven pitches are now distinct.
+* **`wordSize` was 1.**  With `maxLinks = 3` the bitfield base's `* wordSize` is
+  the identity.  `maxLinks = 65` makes it 2.
+* **one tendon of each kind.**  The element index is `t * maxElements + j`, so a
+  single tendon puts everything at slot 0 whatever the pitch is.  Two tendons with
+  two elements each, and the attachment / tendon-joint regions are now compared
+  slot-by-slot against poison.
+* **the fifth guard case was missing.**  Every `confiDirty` lane also had
+  `refillBlockData` true, so re-reading `confiDirty` after phase A cleared it
+  changed nothing.  A lane with `confiDirty` set *and* a matching cached block
+  index discriminates it.
+* **the record was never read back.**  `updateDirty` is cleared by the refresh and
+  by nothing else, and `confiDirty` by phase A and nothing else — reading both
+  back separates "the refresh ran" from "the fill ran" and gives phase A a witness
+  at wrapper level.
+* **the ABI bools were only ever launched as zero.**  Three passes now:
+  `(0,0)`, `(1,0)`, `(0,1)`.
+* **ONE BLOCK.**  This is the interesting one.  `blockIdx.x * blockDim.y` is zero
+  in a single block whatever the multiplier is.  At **two** blocks a multiplier of
+  1 maps `(block 1, warp 0)` onto warp slice 1 — which block 0 already covered with
+  the same data — so the duplicated work is *idempotent* and the mutant still
+  survives.  Only at **three** blocks does the wrong multiplier leave a hole:
+  warp indices 0,1,1,2,2,3 cover threads 0..127 and articulations 128 and 129 are
+  never processed.  130 articulations, three blocks, five live warp slices.
+
+One survivor was a **sweep bug** and is recorded as untested rather than counted:
+`lane = globalThreadIndex & 31` is bit-for-bit `groupThreadId.x & 31`, since
+`globalThreadIndex = x + warp * 32`.  Re-anchored to `lane = globalWarpIndex & 31`,
+which dies.
+
+**Second sweep: 40 of 42, and both survivors are proven equivalent by argument
+rather than excused:**
+
+* `V40`, dropping the **second** `mFlags` write (:584).  Its guard
+  (`confiDirty || refillBlockData`) is the same predicate as the header fill's
+  (`refillBlockData || confiDirty`), the source is the same `data.flags` byte, and
+  phase A does not touch it.  It is redundant *today*; it is transcribed because
+  the CUDA has it and because "redundant" becomes "load-bearing" the moment either
+  guard changes upstream.  No mutant can tell the difference and the port says so.
+* `V42`, decoding `directAPI` from the whole push-constant word instead of its low
+  byte.  `directAPI` is consumed by exactly one callee, `jcalcRefreshBlocks`, which
+  runs only when `refillBlockData` is false, which requires
+  `forceRecomputeBlockFormat` false, which means bits 8..15 are zero — and the CUDA
+  blob's bytes 10..11 are zero-filled padding.  So on this kernel `word != 0` and
+  `(word & 0xff) != 0` are equivalent *by the branch structure*, not by the ABI.
+  The masked form stays, because the equivalence is a property of a downstream
+  branch and not of the argument encoding.
+
+### Verification, including the part a fixture cannot do
+
+Suite **707/707** in both memory modes, forced-fresh.  And the live scene, which is
+the oracle this tranche actually turns on: `PXG_GPU_STEP=1 PXG_SCENE=articulation`
+now reports **230** "Could not find registered CUDA function" names instead of 231,
+with `computeUnconstrainedVelocities1TLaunch` the one that left, the 240 steps
+still completing, and no fault under `PXG_SYNC_EACH=1`.  The scene's two step
+checks still fail exactly as before — unchanged on purpose: the kernels that
+consume what this one produces (`computeUnconstrainedSpatialInertiaLaunch1T`,
+`computeUnconstrainedAccelerationsLaunch1T`) are still unmapped, so nothing reads
+its output yet.  What changed is that its launch is no longer refused.
+
+**A note for the next sweep.**  Piping the sweep script through `head` kills it
+with SIGPIPE mid-mutant: `atexit` restores the *source* but the mutated `.spv` is
+left on disk, and the next test run fails against a shader that no longer matches
+any source.  Read the full output or redirect it; do not truncate it.
 
 ## P8.82 — the rest of the `PxgArticulationCoreDesc` map, and one duplicate collapsed
 

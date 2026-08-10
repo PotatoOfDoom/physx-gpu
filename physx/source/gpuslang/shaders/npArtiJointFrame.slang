@@ -328,21 +328,19 @@ void ajStoreSpatialVector(uint64_t addr, float3 top, float3 bottom)
     f[3] = bottom.x; f[4] = bottom.y; f[5] = bottom.z;
 }
 
-[shader("compute")]
-[numthreads(1, 1, 1)]
-void artiJcalcPhaseA()
+// P8.83: phase A is a FUNCTION like every phase after it, so the assembly is
+// composition.  The two flags are PARAMETERS and not re-read here, and that is
+// load-bearing rather than tidy: jcalc reads `confiDirty` ONCE at its top, this
+// body CLEARS the record's byte on the way out, and the branch that follows
+// (`if (confiDirty || refillBlockData)`) tests the value read BEFORE the clear.
+// A body that re-read the byte would see 0 and the caller's guard would read
+// the cleared value too -- phase B would be skipped on exactly the frame it is
+// needed.  The entry point below does the read and the guard, as jcalc does.
+void jcalcRecomputeRecord(uint64_t a, float invLengthScale, bool confiDirty, bool dataDirty)
 {
-    const uint64_t a = gJcalcA.articulation;
-
     const uint flags = artiU8Field(a, PXG_ARTI_DATA_FLAGS);
-    const bool confiDirty = artiU8Field(a, PXG_ARTI_DATA_CONFI_DIRTY) != 0u;
-    const bool dataDirty = artiU32Field(a, PXG_ARTI_DATA_UPDATE_DIRTY) != 0u;
-    if (!(confiDirty || dataDirty))
-        return;
-
     const bool fixBase = (flags & PXG_ARTI_FLAG_FIX_BASE) != 0u;
     const uint numLinks = artiU16Field(a, PXG_ARTI_DATA_NUM_LINKS);
-    const float invLengthScale = gJcalcA.invLengthScale;
 
     const uint64_t links = artiPtrField(a, PXG_ARTI_LINKS);
     const uint64_t props = artiPtrField(a, PXG_ARTI_LINK_PROPS);
@@ -433,6 +431,20 @@ void artiJcalcPhaseA()
     // confiDirty is cleared; updateDirty deliberately is NOT -- the CUDA holds on
     // to it until the block copy in phase C has consumed it.
     artiStoreU8Field(a, PXG_ARTI_DATA_CONFI_DIRTY, 0u);
+}
+
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void artiJcalcPhaseA()
+{
+    const uint64_t a = gJcalcA.articulation;
+
+    const bool confiDirty = artiU8Field(a, PXG_ARTI_DATA_CONFI_DIRTY) != 0u;
+    const bool dataDirty = artiU32Field(a, PXG_ARTI_DATA_UPDATE_DIRTY) != 0u;
+    if (!(confiDirty || dataDirty))
+        return;
+
+    jcalcRecomputeRecord(a, gJcalcA.invLengthScale, confiDirty, dataDirty);
 }
 
 
@@ -1798,4 +1810,241 @@ void artiJcalcLinkVel(uint3 groupThreadId : SV_GroupThreadID)
     jcalcComputeLinkVelocities(gJcalcVel.articulations + uint64_t(lane) * PXG_ARTI_STRIDE,
                                gJcalcVel.linkBlocks, gJcalcVel.dofBlocks,
                                gJcalcVel.numLinks, lane);
+}
+
+// ===========================================================================
+// P8.83: computeUnconstrainedVelocities1TLaunch (forwardDynamic2.cu:1056)
+// ===========================================================================
+//
+// The wrapper, and with it the whole of `computeUnconstrainedVelocitiesInternal1T`
+// (:1116-1210).  Eleven tranches went into the pieces; this one only puts them
+// together, which is the point -- every part below is a call to a function that
+// already has its own fixture and its own sweep, so nothing here is a second
+// transcription of the same CUDA.
+//
+// ---------------------------------------------------------------------------
+// LAUNCH SHAPE, MEASURED FROM THE HOST
+// ---------------------------------------------------------------------------
+//
+// PxgArticulationCore.cpp:437 launches with block (32, 2, 1) and
+// `num1TBlocks = (nbArticulations + 63) / 64`, i.e. 64 articulations per block.
+// The stale comment beside it says "each warp will work on one articulation";
+// the CODE says `globalThreadIndex = threadIdx.x + globalWarpIndex * WARP_SIZE`
+// guarded by `globalThreadIndex < nbArticulations`, which is ONE THREAD per
+// articulation.  The grid arithmetic (64 per block, not 2) settles it: the code
+// is right and the comment is not, so this is one thread per articulation.
+//
+// `threadIdx.y` therefore selects the warp within the block and `threadIdx.x`
+// the lane within that warp -- and the lane is what indexes the block-format
+// SoA arrays, which are shared by the whole warp.  `blockDim.y` is a literal 2
+// here rather than a value read from anywhere: it comes from
+// COMPUTE_UNCONSTRAINED_VELOCITES (64) / WARP_SIZE (32), both compile-time.
+//
+// NO BARRIERS AND NO GROUPSHARED.  Every thread works on its own articulation
+// through its own lane of the block arrays; nothing is exchanged between lanes.
+// That is why the divergent early return below is safe on llvmpipe, where a
+// barrier in divergent control flow hangs.
+//
+// ---------------------------------------------------------------------------
+// THE ARGUMENT ABI
+// ---------------------------------------------------------------------------
+//
+// (const PxgArticulationCoreDesc*, const bool directAPI, const bool
+// recomputeBlockFormat) -> { 8, 1, 1 }: the pointer at @0 and the two CUDA
+// `bool`s at @8 and @9, in a 16-byte blob.  Two one-byte arguments in a row are
+// new for this port (kBpDescBool has one), so the two flags are read out of a
+// single word with a shift rather than as two fields -- Slang has no 8-bit type
+// in a push constant here, exactly as broadphaseEndPtHistogram does for its one.
+//
+// ---------------------------------------------------------------------------
+// THE THREE THINGS THIS FILE HAS TO GET RIGHT THAT NO PIECE COULD
+// ---------------------------------------------------------------------------
+//
+// 1. **`confiDirty` is read ONCE, at the top, and phase A clears it.**  The
+//    CUDA reads it into a local at :372, phase A writes `artiData.confiDirty =
+//    false` at :429, and the branch at :436 tests the LOCAL.  Re-reading the
+//    record after phase A would skip phase B on the very frame that needs it.
+//    Same shape for `refillBlockData`, which is computed from the block's
+//    mArticulationIndex BEFORE jcalcFillBlockHeader overwrites it.
+//
+// 2. **`updateDirty` is read before jcalcRefreshBlocks, which clears it.**  The
+//    CUDA's `else if (dataDirty)` branch runs the block refresh, THEN the three
+//    tendon/mimic updates guarded by bits of `artiData.updateDirty`, and only
+//    then sets it to 0 (:751).  jcalcRefreshBlocks clears it at its own end
+//    (that is what its fixture pins), so the guards here must use the value
+//    saved before the call.
+//
+// 3. **The per-warp bases are not all one pitch.**  Attachments are
+//    `maxSpatialTendons * maxAttachments` per warp and tendon joints are
+//    `maxFixedTendons * maxTendonJoints`; the bitfields are
+//    `maxLinks * wordSize` with `wordSize = (maxLinks + 63) / 64`, which is the
+//    articulation's link count rounded up to whole 64-bit words -- not maxLinks
+//    and not 1.
+
+struct ArtiUnconstrainedVelParams
+{
+    uint64_t scDesc;    // @0  PxgArticulationCoreDesc*
+    uint boolsWord;     // @8  directAPI in byte 0, recomputeBlockFormat in byte 1
+    uint pad0;          // @12 the blob's tail padding to the 8-byte alignment
+};
+
+[[vk::push_constant]]
+ConstantBuffer<ArtiUnconstrainedVelParams> gArtiUncVel;
+
+// COMPUTE_UNCONSTRAINED_VELOCITES / WARP_SIZE -- the block's warp count, and the
+// multiplier on blockIdx.x that turns a block index into a warp index.
+static const uint AUV_WARPS_PER_BLOCK = 2u;
+
+[shader("compute")]
+[numthreads(32, 2, 1)]
+void computeUnconstrainedVelocities1TLaunch(uint3 groupThreadId : SV_GroupThreadID,
+                                            uint3 groupId : SV_GroupID)
+{
+    const uint64_t d = gArtiUncVel.scDesc;
+    const bool directAPI = (gArtiUncVel.boolsWord & 0xffu) != 0u;
+    const bool forceRecomputeBlockFormat = ((gArtiUncVel.boolsWord >> 8u) & 0xffu) != 0u;
+
+    const uint globalWarpIndex = groupId.x * AUV_WARPS_PER_BLOCK + groupThreadId.y;
+    const uint globalThreadIndex = groupThreadId.x + globalWarpIndex * 32u;
+    const uint lane = groupThreadId.x & 31u;
+
+    const uint nbArticulations = artiU32Field(d, PXG_ARTI_CORE_NB_ARTICULATIONS);
+    if (globalThreadIndex >= nbArticulations)
+        return;
+
+    // ---- the per-warp pitches, read once ----
+    const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);
+    const uint maxDofs = artiU32Field(d, PXG_ARTI_CORE_MAX_DOFS);
+    const uint maxSpatialTendons = artiU32Field(d, PXG_ARTI_CORE_MAX_SPATIAL_TENDONS);
+    const uint maxAttachments = artiU32Field(d, PXG_ARTI_CORE_MAX_ATTACHMENTS);
+    const uint maxFixedTendons = artiU32Field(d, PXG_ARTI_CORE_MAX_FIXED_TENDONS);
+    const uint maxTendonJoints = artiU32Field(d, PXG_ARTI_CORE_MAX_TENDON_JOINTS);
+    const uint maxMimicJoints = artiU32Field(d, PXG_ARTI_CORE_MAX_MIMIC_JOINTS);
+
+    // ---- the index chain: island slot -> node -> body sim -> articulation ----
+    const uint articulationOffset = artiU32Field(d, PXG_ARTI_CORE_ARTICULATION_OFFSET);
+    const uint64_t islandNodeIndices = artiPtrField(d, PXG_ARTI_CORE_ISLAND_NODE_INDICES);
+    const uint2 node = (Ptr<uint2>(islandNodeIndices))[globalThreadIndex + articulationOffset];
+    const uint nodeIndex = nodeIndexIndex(node);
+
+    // the kernel's one side effect outside the block format: the island's node
+    // index learns which dispatch slot owns it, which is what the solver reads
+    // back to find this articulation later
+    (Ptr<uint>(artiPtrField(d, PXG_ARTI_CORE_SOLVER_BODY_INDICES)))[nodeIndex] = globalThreadIndex;
+
+    const uint64_t bodySim = artiPtrField(d, PXG_ARTI_CORE_BODY_SIM_POOL)
+                           + uint64_t(nodeIndex) * PXG_BODY_SIM_SIZE;
+    const uint articulationIndex = artiU32Field(bodySim, PXG_BODY_SIM_ARTICULATION_REMAP_ID);
+    const float sleepThreshold = asfloat(artiU32Field(bodySim, PXG_BODY_SIM_SLEEP_THRESHOLD));
+
+    const uint64_t a = artiPtrField(d, PXG_ARTI_CORE_ARTICULATIONS)
+                     + uint64_t(articulationIndex) * PXG_ARTI_STRIDE;
+    const float invLengthScale = asfloat(artiU32Field(d, PXG_ARTI_CORE_INV_LENGTH_SCALE));
+
+    // ---- this warp's slice of every block array ----
+    const uint wordSize = (maxLinks + 63u) / 64u;
+    const uint64_t w = uint64_t(globalWarpIndex);
+
+    const uint64_t artiBlock = artiPtrField(d, PXG_ARTI_CORE_ARTICULATION_BLOCKS)
+                             + w * PXG_AB_BLOCK_SIZE;
+    const uint64_t linkBlocks = artiPtrField(d, PXG_ARTI_CORE_LINK_BLOCKS)
+                              + w * uint64_t(maxLinks) * PXG_AB_LINK_SIZE;
+    const uint64_t dofBlocks = artiPtrField(d, PXG_ARTI_CORE_DOF_BLOCKS)
+                             + w * uint64_t(maxDofs) * PXG_AB_DOF_SIZE;
+    const uint64_t spatialTendonBlocks = artiPtrField(d, PXG_ARTI_CORE_SPATIAL_TENDON_BLOCKS)
+                                       + w * uint64_t(maxSpatialTendons) * PXG_AB_ST_SIZE;
+    const uint64_t attachmentBlocks = artiPtrField(d, PXG_ARTI_CORE_ATTACHMENT_BLOCKS)
+                                    + w * uint64_t(maxSpatialTendons) * uint64_t(maxAttachments)
+                                        * PXG_AB_AT_SIZE;
+    const uint64_t fixedTendonBlocks = artiPtrField(d, PXG_ARTI_CORE_FIXED_TENDON_BLOCKS)
+                                     + w * uint64_t(maxFixedTendons) * PXG_AB_FT_SIZE;
+    const uint64_t tendonJointBlocks = artiPtrField(d, PXG_ARTI_CORE_TENDON_JOINT_BLOCKS)
+                                     + w * uint64_t(maxFixedTendons) * uint64_t(maxTendonJoints)
+                                         * PXG_AB_TJ_SIZE;
+    const uint64_t mimicJointBlocks = artiPtrField(d, PXG_ARTI_CORE_MIMIC_JOINT_BLOCKS)
+                                    + w * uint64_t(maxMimicJoints) * PXG_AB_MJ_SIZE;
+    const uint64_t bitFields = artiPtrField(d, PXG_ARTI_CORE_PATH_TO_ROOT_BITFIELD_BLOCKS)
+                             + w * uint64_t(maxLinks) * uint64_t(wordSize)
+                                 * PXG_AB_BITFIELD_STACK_SIZE;
+
+    // ---- the header fill, and where numLinks/totalDofs come from ----
+    // refillBlockData is computed BEFORE jcalcFillBlockHeader writes the index.
+    const bool refillBlockData =
+        (abU32(artiBlock, PXG_AB_mArticulationIndex, lane) != articulationIndex)
+        || forceRecomputeBlockFormat;
+
+    const bool confiDirty = artiU8Field(a, PXG_ARTI_DATA_CONFI_DIRTY) != 0u;
+
+    uint numLinks;
+    uint totalDofs;
+    if (refillBlockData || confiDirty)
+    {
+        numLinks = artiU16Field(a, PXG_ARTI_DATA_NUM_LINKS);
+        totalDofs = artiU16Field(a, PXG_ARTI_DATA_NUM_JOINT_DOFS);
+        jcalcFillBlockHeader(a, artiBlock, articulationIndex, sleepThreshold, lane);
+    }
+    else
+    {
+        numLinks = abU32(artiBlock, PXG_AB_mNumLinks, lane);
+        totalDofs = abU32(artiBlock, PXG_AB_mTotalDofs, lane);
+    }
+
+    jcalcInitializeBlocks(artiBlock, linkBlocks, dofBlocks, numLinks, totalDofs, lane);
+
+    // ================= jcalc (:351-906) =================
+    // updateDirty is read here because jcalcRefreshBlocks clears it, and the
+    // tendon/mimic guards below run AFTER that call in the engine's order.
+    const uint updateDirty = artiU32Field(a, PXG_ARTI_DATA_UPDATE_DIRTY);
+    const bool dataDirty = updateDirty != 0u;
+
+    if (confiDirty || dataDirty)
+        jcalcRecomputeRecord(a, invLengthScale, confiDirty, dataDirty);
+
+    if (confiDirty || refillBlockData)
+    {
+        jcalcFillRootLinkAndBitFields(a, linkBlocks, bitFields, maxLinks, lane);
+        jcalcFillLinkBlocks(a, linkBlocks, lane);
+        jcalcFillDofBlocks(a, linkBlocks, dofBlocks, lane);
+
+        jcalcCopySpatialTendonsBlock(a, artiBlock, spatialTendonBlocks, attachmentBlocks,
+                                     maxAttachments, lane, true);
+        jcalcCopyFixedTendonsBlock(a, artiBlock, fixedTendonBlocks, tendonJointBlocks,
+                                   maxTendonJoints, lane, true);
+        jcalcCopyMimicJointsBlock(a, artiBlock, mimicJointBlocks, lane, true);
+
+        // :584 -- mFlags written a SECOND time, after the copies.  It is
+        // redundant and this port says so rather than inventing a reason: this
+        // branch's guard (`confiDirty || refillBlockData`) is the same predicate
+        // as the header fill's (`refillBlockData || confiDirty`), the source is
+        // the same `data.flags` byte, and phase A does not touch it.  It is
+        // transcribed because the CUDA has it and because "redundant today"
+        // becomes "load-bearing" the moment either guard is changed upstream --
+        // not because a mutant can tell the difference.  One cannot.
+        abStoreU32(artiBlock, PXG_AB_mFlags, lane, artiU8Field(a, PXG_ARTI_DATA_FLAGS));
+    }
+    else if (dataDirty)
+    {
+        jcalcRefreshBlocks(a, linkBlocks, dofBlocks, directAPI, lane);
+
+        const uint SPATIAL_BITS = PXG_ARTI_DIRTY_SPATIAL_TENDON
+                                | PXG_ARTI_DIRTY_SPATIAL_TENDON_ATTACHMENT;
+        const uint FIXED_BITS = PXG_ARTI_DIRTY_FIXED_TENDON
+                              | PXG_ARTI_DIRTY_FIXED_TENDON_JOINT;
+
+        if ((updateDirty & SPATIAL_BITS) != 0u)
+            jcalcCopySpatialTendonsBlock(a, artiBlock, spatialTendonBlocks, attachmentBlocks,
+                                         maxAttachments, lane, false);
+        if ((updateDirty & FIXED_BITS) != 0u)
+            jcalcCopyFixedTendonsBlock(a, artiBlock, fixedTendonBlocks, tendonJointBlocks,
+                                       maxTendonJoints, lane, false);
+        if ((updateDirty & PXG_ARTI_DIRTY_MIMIC_JOINT) != 0u)
+            jcalcCopyMimicJointsBlock(a, artiBlock, mimicJointBlocks, lane, false);
+    }
+
+    jcalcApplyGpuDirty(a, linkBlocks, dofBlocks, spatialTendonBlocks, attachmentBlocks,
+                       fixedTendonBlocks, tendonJointBlocks, maxAttachments, maxTendonJoints,
+                       lane);
+    // ================= end jcalc =================
+
+    jcalcComputeLinkVelocities(a, linkBlocks, dofBlocks, numLinks, lane);
 }

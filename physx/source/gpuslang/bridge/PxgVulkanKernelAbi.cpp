@@ -64,6 +64,15 @@ static const uint8_t kRadixDesc[] = { 8, 4, 4 };
 // broadphase.cu: (const PxgBroadPhaseDesc* bpDesc, bool isIncremental)
 static const uint8_t kBpDescBool[] = { 8, 1 };
 
+// forwardDynamic2.cu:1056 computeUnconstrainedVelocities1TLaunch(
+//   const PxgArticulationCoreDesc*, const bool directAPI,
+//   const bool recomputeBlockFormat)
+// -> pointer @0, bools @8 and @9 -> 10, rounded to the 8-alignment = 16-byte
+// blob.  Shaped like kBpDescBool with a second one-byte argument: the first row
+// in this table with TWO adjacent bools, which is why the shader reads both out
+// of one word rather than declaring two fields.  (P8.83)
+static const uint8_t kArtiDescTwoBool[] = { 8, 1, 1 };
+
 // gpusolver/src/CUDA/preIntegration.cu:
 //   initStaticKinematics(PxU32 nbStaticKinematics, PxU32 nbSolverBodies,
 //                        PxgSolverBodyData*, PxgSolverTxIData*, PxAlignedTransform*,
@@ -1115,6 +1124,13 @@ static const PxgKernelAbiRow kRows[] = {
     // CUdeviceptr (PxgTGSCudaSolverCore.cpp:1601), untranslated, because under
     // CUDA unified addressing that is already a device pointer.  (P8.66)
     { "dmaArticulationResidual", kTwoPtr, uint32_t(sizeof(kTwoPtr)), 1u << 1 },
+    // forwardDynamic2.cu:1056 computeUnconstrainedVelocities1TLaunch(
+    //     const PxgArticulationCoreDesc*, const bool directAPI,
+    //     const bool recomputeBlockFormat)
+    // -> 16-byte blob.  hostPtrMask 0: the descriptor is a device buffer address
+    // (PxgArticulationCore.cpp:426) and the other two arguments are bytes.
+    // Launched block (32, 2, 1), grid ceil(nbArticulations / 64).  (P8.83)
+    { "computeUnconstrainedVelocities1TLaunch", kArtiDescTwoBool, uint32_t(sizeof(kArtiDescTwoBool)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)
