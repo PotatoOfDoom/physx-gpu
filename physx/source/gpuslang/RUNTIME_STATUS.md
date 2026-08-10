@@ -1694,6 +1694,84 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.82 — the rest of the `PxgArticulationCoreDesc` map, and one duplicate collapsed
+
+P8.81 closed with "what remains is the wrapper, the ABI row and the manifest entry
+(P8.82)".  Reading the wrapper first turned up something that had been glossed:
+**only seven of the descriptor's fields were mapped.**  P8.66 mapped exactly what
+`dmaArticulationResidual` addressed and no more, which was right at the time;
+`computeUnconstrainedVelocities1TLaunch` addresses seventeen more.  Folding an
+address map into the assembly tranche is the one thing this chain has consistently
+refused to do, so it is its own tranche and the assembly moves to P8.83.
+
+Suite **706/706**, unchanged — this adds no test *suite*, it extends the one that
+already owns this descriptor.  Manifest unchanged at **270 of 501**.
+
+**Seventeen constants, all generated, none in the order a reader would guess.**  The
+throwaway host program emits `offsetof` against the real header for each; three of
+the results are things transcription would have got wrong:
+
+* **`mPathToRootBitFieldBlocks` is at 176 — *before* `mArticulationDofBlocks` (184)
+  and every tendon block pointer.**  The header declares it in the middle of the
+  temp-bitfield group, nowhere near the block pointers the launch code uses it
+  alongside.  A port that lays the constants out in the order the wrapper *reads*
+  them puts it after the tendon blocks.
+* **The pitches are not in launch order either**:
+  `mMaxMimicJointsPerArticulation` (256) sits between `mMaxDofsPerArticulation` (252)
+  and `mMaxSpatialTendonsPerArticulation` (260).  Four of the seven land one slot off
+  if the declaration order is assumed to match the usage order.
+* **`invLengthScale` (64) follows `gravity`, a `PxVec3`** — it is precisely the field
+  a wrong `sizeof(PxVec3)` assumption lands on, and 60 vs 64 vs 68 cannot be settled
+  by reading the struct.  Both wrong answers are mutants below.
+
+The gaps are deliberate and accounted for in the module comment (dt 48, gravity 52,
+the external-forces bool 68, the impulse/slab/partition group 72..127, the traversal
+stack 144 and the three *temp* bitfield pointers 152/160/168).  Two of the gaps are
+traps rather than blanks: **200 and 224 are the tendon CONSTRAINT block pointers**,
+which bracket the tendon block pointers this tranche does map.  They stay unmapped —
+this port adds a constant when a kernel needs it — but they are now pinned by
+`static_assert` anyway, so a header change that shifts them fails the build instead
+of silently re-aiming `SPATIAL_TENDON_BLOCKS` and `TENDON_JOINT_BLOCKS` at the wrong
+arrays.
+
+**A `static_assert` is not enough here, and saying why is the point of the probe.**
+The assert proves the constant matches the header.  It says nothing about whether the
+*shader* reads at the offset it names — a constant used at the wrong call site
+type-checks perfectly, and seventeen of these have no kernel behind them yet.  So
+`dmaArtiResidualBda.slang` gains a second entry point, `artiCoreDescProbe`, which
+reads all **24** mapped fields through their named constants and writes the raw bits
+out in a fixed slot order.  The fixture fills every mapped field *through its real
+C++ member* with a value no other field carries, memsets the rest to `0x5A`, and
+derives the expectation **out of the struct** rather than restating it — a restated
+expectation and a wrong constant can agree.  A swapped pair of constants then yields
+a *different field's* value; a constant aimed into a gap yields the poison; two
+trailing poison slots catch a probe that writes one entry too many.
+
+The fixture sets the member with `reinterpret_cast<decltype(probe.f)>(...)`, so it
+never names the fourteen block struct types and cannot pick the wrong one for a
+field.
+
+**The duplicate is gone.**  `PXG_AR_LINK_SIZE` (pxgSlangArticulationBlocks) and
+`PXG_ARTI_LINK_SIZE` (pxgSlangArticulationDesc) were both 80, generated independently
+into two modules — P8.74's `N18` swapped one for the other and nothing happened,
+which is what a duplicate looks like right up until the day one is regenerated and
+the other is not.  The blocks-module copy is deleted and `npArtiBlockProbe` (which
+already imports both modules) now uses the surviving one.  Mutant `C17` mis-sizes it
+to 88 and kills `artiBlockLayout` and `newArticulations` together, which is the proof
+that the collapse did not quietly orphan a call site.
+
+**Sweep: 23 of 23, no survivors and no excuses.**  Sixteen mutants move a single
+constant onto a plausible neighbour (the `invLengthScale` 60/68 pair, the two pitch
+swaps, each block pointer onto the pointer before or after it, the two tendon
+CONSTRAINT pointers); one mis-sizes the collapsed stride; six attack the probe itself
+— reading a pitch as a pointer, a pointer as a `u32`, emitting two slots in the wrong
+order, dropping a slot so everything after shifts, writing one slot too many, and
+duplicating a read.  Every one dies.
+
+Suite **706/706** both memory modes, forced-fresh.  What remains for
+`computeUnconstrainedVelocities1TLaunch` is now only the composition, the `{8,1,1}`
+ABI row and the hand-edited manifest entry — **P8.83, 270 → 271**.
+
 ## P8.81 — the fused C2P + link-velocity loop, and the oracle comes back
 
 forwardDynamic2.cu:971-1053, the last piece of real work in

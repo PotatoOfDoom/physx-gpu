@@ -337,8 +337,8 @@ void artiBlockProbe()
     // stride is load-bearing; element [0] carries a different sentinel set.
     {
         const uint64_t base = gArtiBlockProbe.records;
-        const uint64_t lk = base + uint64_t(AP_ELEM) * PXG_AR_LINK_SIZE;
-        o[i++] = uint64_t(PXG_AR_LINK_SIZE);
+        const uint64_t lk = base + uint64_t(AP_ELEM) * PXG_ARTI_LINK_SIZE;
+        o[i++] = uint64_t(PXG_ARTI_LINK_SIZE);
         o[i++] = uint64_t(asuint(abF32(lk, PXG_AR_LINK_penBiasClamp, 0u)));
         o[i++] = uint64_t(asuint(abF32(lk, PXG_AR_LINK_invMass, 0u)));
         o[i++] = uint64_t(asuint(abF32(lk, PXG_AR_LINK_maxAngularVelocitySq, 0u)));
@@ -357,7 +357,7 @@ void artiBlockProbe()
         o[i++] = uint64_t(abU8(lk, PXG_AR_LINK_retainsAccelerations & ~3u,
                                PXG_AR_LINK_retainsAccelerations & 3u));
 
-        const uint64_t jcBase = base + 2ull * PXG_AR_LINK_SIZE;
+        const uint64_t jcBase = base + 2ull * PXG_ARTI_LINK_SIZE;
         const uint64_t jc = jcBase + uint64_t(AP_ELEM) * PXG_AR_JOINT_CORE_SIZE;
         o[i++] = uint64_t(PXG_AR_JOINT_CORE_SIZE);
         o[i++] = uint64_t(asuint(abF32(jc, PXG_AR_JOINT_parentPose, 0u)));

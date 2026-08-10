@@ -181,7 +181,7 @@ static_assert(offsetof(PxgArticulationBlockLinkData, mJointType) == 28832, "PXG_
 static_assert(offsetof(PxgArticulationBlockLinkData, mInvDofIds) == 28864, "PXG_AB_LINK_mInvDofIds");
 static_assert(offsetof(PxgArticulationBlockLinkData, mDisableGravity) == 29056, "PXG_AB_LINK_mDisableGravity");
 static_assert(offsetof(PxgArticulationBlockLinkData, mRetainsAcceleration) == 29088, "PXG_AB_LINK_mRetainsAcceleration");
-static_assert(sizeof(PxgArticulationLink) == 80, "PXG_AR_LINK_SIZE");
+static_assert(sizeof(PxgArticulationLink) == 80, "PXG_ARTI_LINK_SIZE");
 static_assert(offsetof(PxgArticulationLink, initialAngVel) == 0, "PXG_AR_LINK_initialAngVel");
 static_assert(offsetof(PxgArticulationLink, penBiasClamp) == 12, "PXG_AR_LINK_penBiasClamp");
 static_assert(offsetof(PxgArticulationLink, initialLinVel) == 16, "PXG_AR_LINK_initialLinVel");

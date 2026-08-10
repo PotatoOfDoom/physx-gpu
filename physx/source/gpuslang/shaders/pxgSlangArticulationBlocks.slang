@@ -194,7 +194,13 @@ public static const uint PXG_AB_LINK_mRetainsAcceleration                     = 
 // numChildren are PxU16 at 56 and 58, and disableGravity / retainsAccelerations
 // are single bytes at 76 and 77.  Reading any of them as a word picks up its
 // neighbour.
-public static const uint PXG_AR_LINK_SIZE                                   =     80;
+//
+// The element STRIDE is deliberately NOT restated here: `PXG_ARTI_LINK_SIZE`
+// in pxgSlangArticulationDesc is the same 80 bytes, and P8.82 collapsed the
+// two after P8.74's sweep produced a tautological mutant -- swapping one
+// constant for the other changed nothing, which is what a duplicate generated
+// independently into two modules always looks like right up until the day one
+// of them is regenerated and the other is not.  Only field offsets below.
 public static const uint PXG_AR_LINK_initialAngVel                          =      0;
 public static const uint PXG_AR_LINK_penBiasClamp                           =     12;
 public static const uint PXG_AR_LINK_initialLinVel                          =     16;
@@ -389,8 +395,9 @@ public static const uint PXG_AB_IMJ_recipEffectiveInertia                       
 // PXG_ARTI_MIMIC_JOINT_CORE_SIZE), as do PxgArticulationTendon's three field
 // offsets (PXG_TENDON_FIXED_ELEMENTS / _MOD_ELEMENTS / _NB_ELEMENTS).  Those are
 // NOT restated here: a size generated independently into two modules is exactly
-// the PXG_ARTI_LINK_SIZE / PXG_AR_LINK_SIZE duplicate this port already carries,
-// and one of those is enough.  Only genuinely new field offsets appear below.
+// the PXG_ARTI_LINK_SIZE / PXG_AR_LINK_SIZE duplicate this port carried until
+// P8.82 collapsed it, and one of those is enough.  Only genuinely new field
+// offsets appear below.
 public static const uint PXG_AR_TEF_children                                          =      0;
 public static const uint PXG_AR_TEF_parent                                            =      8;
 public static const uint PXG_AR_TEF_linkInd                                           =     12;

@@ -511,7 +511,7 @@ pxg_compile_shader(newArticulationsBda newArticulationsLaunch)
 # articulation, and the kernel that forces the PxgArticulationCoreDesc address
 # map the rest of the articulation block needs.  Ptr<> throughout (no HLSL
 # lowering); integer/copy only (no float contraction to pin).
-pxg_compile_shader(dmaArtiResidualBda dmaArticulationResidual)
+pxg_compile_shader(dmaArtiResidualBda dmaArticulationResidual artiCoreDescProbe)
 # P8.67: the articulation BLOCK-LAYOUT address map, proven functionally.  The
 # probe reads element [1] of a two-element array at lane 3, so struct stride,
 # field offset and lane stride are each independently wrong-able.
