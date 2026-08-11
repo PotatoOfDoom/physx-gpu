@@ -585,6 +585,70 @@ public void abStoreSpatialVector(uint64_t base, uint fieldOffset, uint lane,
         float2(bottom.y, bottom.z);
 }
 
+// ---------------------------------------------------------------------------
+// P8.84: the two matrix blocks.
+//
+// Both are packed formats, not plain SoA, and both are transcribed from the
+// engine's own PX_CUDA_CALLABLE writers rather than inferred from the sizes:
+// storeSpatialMatrix / storePxMat33 (PxgArticulation.h:130 / 282).  The fixture
+// pins them by calling those same functions on the host, so the packing here is
+// checked rather than asserted.
+//
+// PxgSpatialMatrixBlock is `float4 columns[7][32]` -- 27 floats of a
+// Dy::SpatialMatrix (topLeft, topRight, bottomLeft, all row-major 3x3) packed
+// four at a time with a single 0 in the last slot.  The BOTTOM RIGHT block is
+// not stored at all: it is topLeft transposed (SpatialMatrix::getBottomRight),
+// which is the whole reason this is 7 columns and not 9.
+// A PxMat33 as the engine spells it: THREE COLUMNS.  `PxMat33::operator[](i)`
+// returns column i, so the engine's `mat.topLeft[1][2]` is column 1's z -- not
+// row 1's z.  Carrying the columns explicitly rather than a float3x3 keeps that
+// convention from having to be remembered at every call site, and Slang's
+// float3x3 indexes rows first, which is exactly the confusion to avoid.
+public struct AbMat33
+{
+    public float3 c0;
+    public float3 c1;
+    public float3 c2;
+};
+
+public AbMat33 abMat33Zero()
+{
+    AbMat33 m;
+    m.c0 = float3(0.0f, 0.0f, 0.0f);
+    m.c1 = float3(0.0f, 0.0f, 0.0f);
+    m.c2 = float3(0.0f, 0.0f, 0.0f);
+    return m;
+}
+
+public void abStoreSpatialMatrix(uint64_t base, uint fieldOffset, uint lane,
+                                 AbMat33 topLeft, AbMat33 topRight, AbMat33 bottomLeft)
+{
+    Ptr<float4> c = Ptr<float4>(base + uint64_t(fieldOffset));
+    c[0u * 32u + lane] = float4(topLeft.c0.x, topLeft.c0.y, topLeft.c0.z, topLeft.c1.x);
+    c[1u * 32u + lane] = float4(topLeft.c1.y, topLeft.c1.z, topLeft.c2.x, topLeft.c2.y);
+    c[2u * 32u + lane] = float4(topLeft.c2.z, topRight.c0.x, topRight.c0.y, topRight.c0.z);
+    c[3u * 32u + lane] = float4(topRight.c1.x, topRight.c1.y, topRight.c1.z, topRight.c2.x);
+    c[4u * 32u + lane] = float4(topRight.c2.y, topRight.c2.z, bottomLeft.c0.x, bottomLeft.c0.y);
+    c[5u * 32u + lane] = float4(bottomLeft.c0.z, bottomLeft.c1.x, bottomLeft.c1.y, bottomLeft.c1.z);
+    c[6u * 32u + lane] = float4(bottomLeft.c2.x, bottomLeft.c2.y, bottomLeft.c2.z, 0.0f);
+}
+
+// PxgMat33Block is `float4 mCol0[32]; float4 mCol1[32]; float mCol2[32]` -- nine
+// floats packed as 4 + 4 + 1, so the THIRD array has element stride four while
+// the first two have sixteen.
+public static const uint PXG_AB_M33_COL0 = 0;
+public static const uint PXG_AB_M33_COL1 = 512;
+public static const uint PXG_AB_M33_COL2 = 1024;
+
+public void abStorePxMat33(uint64_t base, uint fieldOffset, uint lane, AbMat33 m)
+{
+    (Ptr<float4>(base + uint64_t(fieldOffset + PXG_AB_M33_COL0)))[lane] =
+        float4(m.c0.x, m.c0.y, m.c0.z, m.c1.x);
+    (Ptr<float4>(base + uint64_t(fieldOffset + PXG_AB_M33_COL1)))[lane] =
+        float4(m.c1.y, m.c1.z, m.c2.x, m.c2.y);
+    (Ptr<float>(base + uint64_t(fieldOffset + PXG_AB_M33_COL2)))[lane] = m.c2.z;
+}
+
 // PxgSpatialTransformBlock is float4 q[32] + float4 p[32]; the engine writes an
 // explicit 0 into p.w rather than leaving it, so the port does too.
 public void abStoreSpatialTransform(uint64_t base, uint fieldOffset, uint lane,

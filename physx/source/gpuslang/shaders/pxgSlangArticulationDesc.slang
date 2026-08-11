@@ -69,6 +69,11 @@ public static const uint PXG_ARTI_JOINT_DATA = 48;
 public static const uint PXG_ARTI_MOTION_VELOCITIES = 56;
 public static const uint PXG_ARTI_MOTION_ACCELERATIONS = 64;
 public static const uint PXG_ARTI_CORIOLISE_VECTORS = 80;
+// P8.84.  Despite the name this is not only an inverse-dynamics buffer: when
+// isExternalForcesEveryTgsIterationEnabled is set, computeSpatialInertiaW parks
+// the ISOLATED external Z force per link here, because externalAccelerations
+// (96) is only refreshed on demand and must not be overwritten.
+public static const uint PXG_ARTI_ZA_FORCES = 88;
 public static const uint PXG_ARTI_EXTERNAL_ACCELERATIONS = 96;
 public static const uint PXG_ARTI_ROOT_PRE_MOTION_VELOCITY = 104;  // a SINGLE
                                                                   // Cm::UnAlignedSpatialVector,
@@ -245,6 +250,14 @@ public static const uint PXG_ARTI_CORE_NB_ARTICULATIONS = 44;  // PxU32
 // tendon block pointers mapped above and must not be confused with them.
 // Unmapped on purpose --
 // this port adds a constant when a kernel needs it, never speculatively.
+// P8.84: the three step parameters computeSpatialInertiaW needs.  `gravity` is
+// the PxVec3 at 52 that invLengthScale at 64 sits behind, which is why a wrong
+// sizeof(PxVec3) lands on invLengthScale and not on gravity itself; and
+// isExternalForcesEveryTgsIterationEnabled is a `bool`, i.e. ONE BYTE at 68 --
+// reading it as a word picks up the four padding bytes before `impulses` at 72.
+public static const uint PXG_ARTI_CORE_DT = 48;                 // PxReal
+public static const uint PXG_ARTI_CORE_GRAVITY = 52;            // PxVec3
+public static const uint PXG_ARTI_CORE_EXTERNAL_FORCES_EVERY_TGS_ITER = 68;  // bool
 public static const uint PXG_ARTI_CORE_INV_LENGTH_SCALE = 64;   // PxReal
 public static const uint PXG_ARTI_CORE_ARTICULATION_BLOCKS = 128;        // PxgArticulationBlockData*
 public static const uint PXG_ARTI_CORE_LINK_BLOCKS = 136;                // PxgArticulationBlockLinkData*

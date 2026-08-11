@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **707/707** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **708/708** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,110 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.84 — `computeSpatialInertiaW`, and a fourth platform rule
+
+forwardDynamic2.cu:1114-1310 — the per-link body of
+`computeUnconstrainedSpatialInertiaLaunchPartial1T`, and the largest single block
+of real numerics in the articulation chain.  Suite 707 → **708**; manifest
+unchanged at **271 of 501** (the wrapper is P8.85).
+
+**Two things made this cheaper than it looked, both checked before the code was
+written rather than discovered during it.**  Every block field it writes —
+`mSpatialArticulatedInertia`, `mIsolatedInertia`, `mMass`, `mZAVector`,
+`mZAIntVector`, `mCoriolis`, `mBiasForce`, `mInvInertiaXYZ_invMassW` and the
+articulation block's `mCOM_TotalInvMassW` — was **already mapped** by the
+wholesale generation in P8.67/P8.68, so the ABI delta is four constants
+(`dt` 48, `gravity` 52, `isExternalForcesEveryTgsIterationEnabled` 68,
+`zAForces` 88) and two new accessors.  And the oracle is back, stronger than
+P8.81's: `Cm::transformInertiaTensor` is `PX_CUDA_CALLABLE`, and so are
+`storeSpatialMatrix`, `storePxMat33` and `storeSpatialVector`, so the fixture
+builds the **entire expected block image — arithmetic and SoA packing both — by
+calling the engine** into a real `PxgArticulationBlockLinkData` on the host, and
+compares bit patterns.  Neither the maths nor the packing is retyped as a
+literal anywhere.
+
+New module `npArtiSpatialInertia.slang` in `PXG_NOCONTRACT_SHADERS`, plus
+`abStoreSpatialMatrix` (7 × float4, the `Dy::SpatialMatrix` packing) and
+`abStorePxMat33` (4+4+1 floats, so the third array's element stride is FOUR
+where the first two are sixteen).  Both carry their matrices as an `AbMat33` of
+three **columns**, because `PxMat33::operator[](i)` returns column *i* and
+Slang's `float3x3` indexes rows first — a convention clash that would otherwise
+have to be remembered at every call site.
+
+### A fourth standing platform rule: `x + 0.0` is folded away, and that is not IEEE
+
+The first run failed on seven bytes, every one of them `0x80` against `0x00`:
+**negative zero against positive zero, all on the two static links**.
+
+Measured, in two layers:
+
+* **slangc** compiles `float3 acc = float3(0,0,0); acc += v * m;` to SPIR-V
+  containing the multiply and **no `OpFAdd` at all**, at `-O0`.  The shader now
+  seeds those accumulators from a *runtime* zero (`abs(dt) * 0.0f`, which does
+  survive), and `spirv-dis` confirms the `OpFAdd` is then emitted.
+* **The result is still `-0`.**  That is the proof that a second fold happens
+  *below* SPIR-V, in the driver's algebraic pass, where this port has no reach.
+
+The fold is wrong for exactly one input: IEEE says `(-0) + (+0)` is `+0`.  It is
+reachable here because a static link has `m == 0`, and every `something * m` is
+then a signed zero whose sign follows `something`.  The engine's C++ performs
+the add; the shader cannot.
+
+The fixture therefore forgives **exactly** this: compared word by word, a
+mismatch is accepted only when both words are `0x00000000` or `0x80000000`, and
+the count is printed (7).  Poison against a written zero still fails, and so
+does every real value.  The shader keeps the runtime-zero seeding even though
+this driver folds it anyway, because that makes *our* artifact correct — the
+residual is the driver's.  The earlier articulation modules are green because
+their fixtures never produce a negative zero as an accumulator's first term, not
+because they are immune; any future accumulator in this port starts from
+`asiRuntimeZero()`.
+
+### The convention that flips, and the CUDA's own names being wrong
+
+`Cm::UnAlignedSpatialVector` means (angular, linear) for a **motion** and
+(linear force, torque) for a **force** — the Featherstone dual basis, and
+correct.  What is *not* correct is the CUDA's local naming in the Coriolis
+block: the variables are literally called `force` and `torque` and hold an
+angular and a linear **acceleration**, stored top/bottom in that order.  A port
+that "fixes" either naming by swapping slots looks plausible and is wrong; both
+directions are mutants and both die.
+
+### Sweep: 47 of 49, and the fixture work that got it there
+
+The first sweep killed **42**.  Six of the seven survivors were the fixture:
+
+* **five of them in one block.**  `damped` was a single bool setting *both*
+  damping coefficients, which made `linDamping > 0 || angDamping > 0` and `&&`
+  the same predicate and left four mutants alive on the coincidence — the guard,
+  the `min(coeff, invDt)` clamp (both coefficients were below `invDt`), and the
+  angular cap's threshold (no magnitude lay *between* the two caps).  Replaced
+  by five damping modes (none / linear only / angular only / both / both above
+  `invDt`) and six velocity modes, with the mode coverage **asserted**: the test
+  fails if any mode stops occurring.
+* **two survivors needed searched inputs, not chosen ones.**  `v * (1/m)` and
+  `v / m` round identically for every round-numbered velocity, and
+  `sqrt(cap)/sqrt(mag)` and `sqrt(cap/mag)` for every round-numbered cap.  A grid
+  search found `(0.125, -0.125, 0.75)` for the first and `angCap = 0.65` against
+  a magnitude-squared of `1.625` for the second.  The reciprocal mutant then died.
+
+One survivor was a **sweep bug** and is recorded as untested: `zDamp += X` where
+`zDamp` is zero-initialised is `zDamp = X`, so the mutant changed nothing.
+Re-anchored to seed `zDamp` from `zExt` instead of zero, which dies.
+
+**The two remaining survivors, measured rather than excused:**
+
+* `S31`, `sqrt(cap/mag)` for `sqrt(cap)/sqrt(mag)`.  The searched pair differs by
+  1 ulp under glibc's `sqrt` on the host — and produces **identical bits on
+  llvmpipe** for every (cap, magnitude) pair in the fixture, across 17 links and
+  two passes of a byte-exact comparison.  So the difference is real in principle
+  and this driver's rounding hides it.  The port uses the engine's spelling.
+* `S49`, reverting the runtime-zero seeding.  Equivalent *on this driver* by
+  construction — it is the fold described above — and included in the sweep on
+  purpose, as the check that the workaround's cost is understood.
+
+Suite **708/708** in both memory modes, forced-fresh.
 
 ## P8.83 — `computeUnconstrainedVelocities1TLaunch` assembled — manifest **271**
 
