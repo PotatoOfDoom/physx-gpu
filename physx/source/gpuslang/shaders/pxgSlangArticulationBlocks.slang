@@ -633,6 +633,38 @@ public void abStoreSpatialMatrix(uint64_t base, uint fieldOffset, uint lane,
     c[6u * 32u + lane] = float4(bottomLeft.c2.x, bottomLeft.c2.y, bottomLeft.c2.z, 0.0f);
 }
 
+// P8.86: the load half of the pair above, mirroring loadSpatialMatrix
+// (PxgArticulation.h:90).  Note it reads SEVEN float4s and reconstructs NINE
+// columns' worth of matrix -- the bottom-right block is not in the block at all,
+// and a caller that wants it takes topLeft's transpose (asmBottomRight).
+//
+// The engine writes `mat.topLeft[0][1]`, which is column 0's y: PxMat33's
+// operator[] returns a COLUMN.  Hence c0.y here and not c1.x.
+public void abLoadSpatialMatrix(uint64_t base, uint fieldOffset, uint lane,
+                                out AbMat33 topLeft, out AbMat33 topRight, out AbMat33 bottomLeft)
+{
+    Ptr<float4> c = Ptr<float4>(base + uint64_t(fieldOffset));
+    const float4 v0 = c[0u * 32u + lane];
+    const float4 v1 = c[1u * 32u + lane];
+    const float4 v2 = c[2u * 32u + lane];
+    const float4 v3 = c[3u * 32u + lane];
+    const float4 v4 = c[4u * 32u + lane];
+    const float4 v5 = c[5u * 32u + lane];
+    const float4 v6 = c[6u * 32u + lane];
+
+    topLeft.c0 = float3(v0.x, v0.y, v0.z);
+    topLeft.c1 = float3(v0.w, v1.x, v1.y);
+    topLeft.c2 = float3(v1.z, v1.w, v2.x);
+
+    topRight.c0 = float3(v2.y, v2.z, v2.w);
+    topRight.c1 = float3(v3.x, v3.y, v3.z);
+    topRight.c2 = float3(v3.w, v4.x, v4.y);
+
+    bottomLeft.c0 = float3(v4.z, v4.w, v5.x);
+    bottomLeft.c1 = float3(v5.y, v5.z, v5.w);
+    bottomLeft.c2 = float3(v6.x, v6.y, v6.z);
+}
+
 // PxgMat33Block is `float4 mCol0[32]; float4 mCol1[32]; float mCol2[32]` -- nine
 // floats packed as 4 + 4 + 1, so the THIRD array has element stride four while
 // the first two have sixteen.
@@ -647,6 +679,22 @@ public void abStorePxMat33(uint64_t base, uint fieldOffset, uint lane, AbMat33 m
     (Ptr<float4>(base + uint64_t(fieldOffset + PXG_AB_M33_COL1)))[lane] =
         float4(m.c1.y, m.c1.z, m.c2.x, m.c2.y);
     (Ptr<float>(base + uint64_t(fieldOffset + PXG_AB_M33_COL2)))[lane] = m.c2.z;
+}
+
+// loadPxMat33 (PxgArticulation.h:271), the mirror of the store above: the third
+// array is a plain float[32], so its element stride is FOUR while the first two
+// are sixteen.
+public AbMat33 abLoadPxMat33(uint64_t base, uint fieldOffset, uint lane)
+{
+    const float4 v0 = (Ptr<float4>(base + uint64_t(fieldOffset + PXG_AB_M33_COL0)))[lane];
+    const float4 v1 = (Ptr<float4>(base + uint64_t(fieldOffset + PXG_AB_M33_COL1)))[lane];
+    const float v2 = (Ptr<float>(base + uint64_t(fieldOffset + PXG_AB_M33_COL2)))[lane];
+
+    AbMat33 m;
+    m.c0 = float3(v0.x, v0.y, v0.z);
+    m.c1 = float3(v0.w, v1.x, v1.y);
+    m.c2 = float3(v1.z, v1.w, v2);
+    return m;
 }
 
 // PxgSpatialTransformBlock is float4 q[32] + float4 p[32]; the engine writes an

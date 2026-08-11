@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **709/709** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **711/711** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,112 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.86 — the spatial-matrix algebra layer
+
+`Dy::SpatialMatrix` and the `PxMat33` arithmetic it is built from, ported once as a
+module rather than transcribed per kernel: **`shaders/pxgSlangSpatialMatrix.slang`**,
+with `abLoadSpatialMatrix` / `abLoadPxMat33` added beside the store twins P8.84
+landed.  Suite 709 → **711**; manifest unchanged at **272 of 501** — this tranche
+maps no kernel, it is what the next two are built out of.
+
+Everything remaining in the articulation solver stands on this: `computeIs`,
+`computePropagateSpatialInertia_ZA_ZIc`, `computeArticulatedSpatialInertiaW` and the
+whole impulse-response chain.  Thirty-two operations, one module, one fixture.
+
+### The cleanest oracle in the chain so far
+
+Every operation has a `PX_CUDA_CALLABLE` counterpart the fixture **calls** —
+`PxMat33`'s operators, `Dy::SpatialMatrix`'s operators, `invertSym33`,
+`invertInertia`, both `constructSpatialMatrix` forms, and
+`Cm::UnAlignedSpatialVector::innerProduct / dot / cross`.  Nothing about the
+arithmetic is retyped into an expectation; the expectation *is* the engine.
+
+Two exceptions, stated rather than glossed: `translateInertia`
+(forwardDynamic2.cu:1546) and `constructSkewSymmetricMatrix` (:1561) are
+`static __device__` and unreachable from the host.  Their host mirrors are five
+lines of structure over the engine's own `PxMat33` operators — the arithmetic is
+still the engine's, only the ORDER is transcribed, and that order is exactly what
+trap 5 is about, so the sweep attacks it directly (S46-S51, all dead).
+
+### Two fixtures, and how a wrong SLOT fails as loudly as a wrong number
+
+`artiSpatialMatrix` is table-driven: 32 opcodes × 127 cases, one thread each.  The
+output buffer is uploaded **pre-filled with a per-case, per-word poison pattern**;
+the shader loads it, writes only the slots its opcode owns, and stores it back.  So
+an operation that writes a slot it does not own fails, one that writes the right
+value into the wrong slot fails twice, `translateInertia` leaving `topRight` alone is
+*checked* rather than assumed, and the `.w` of every output `float4` is a further
+poison word that must survive.  4064 cases × 60 words, **zero signed-zero
+forgiveness needed** — every word bit-identical.
+
+`artiSpatialMatrixBlockIo` pins the two new loads, and deliberately **not** by
+round-tripping through our own stores: a load and a store wrong in mirrored ways copy
+perfectly.  The ENGINE's `storeSpatialMatrix` / `storePxMat33` build the block image,
+our loaders read it, and the components are compared against what the ENGINE's own
+`loadSpatialMatrix` / `loadPxMat33` return from the same bytes.  The same dispatch
+also re-stores the loaded matrix through `asmStoreSpatialMatrix` into a second,
+poisoned block, compared whole against the engine's `storeSpatialMatrix` image of the
+engine-loaded matrix — that wrapper hands three separate `AbMat33`s onward, so a
+permutation in the forwarding compiles, and two mutants say so.  All 32 lanes carry
+different matrices and every one of a lane's 27 + 9 values is distinct, so a
+transposition, a lane-stride error and a packing error land on different numbers.
+The packing's one unused word — `columns[6][lane].w`, which the engine's store
+zeroes — is **overwritten with poison after the store**, so a loader that reads it
+produces garbage instead of a zero it could get away with (S62 dies on exactly that).
+
+### The stripes, and the coincidences they exist to rule out
+
+The standing rule from eight earlier tranches is that a survivor is nearly always a
+fixture coincidence.  Here they are specific and each gets a stripe: an **exactly**
+singular `M` (column 1 zeroed, so both determinants are exactly +0 and both inverses
+take their identity branch — near-singular proves nothing, both sides take the other
+branch); a symmetric `M` *and* a non-symmetric majority; a symmetric `A.topLeft`,
+which is the only place `transform` and `transformTranspose` agree; an
+**antisymmetric** `A.bottomLeft`, which makes `(bl + bl^T) * 0.5` exactly zero so
+`invertInertia` reaches `invertSym33`'s identity branch INTERNALLY — the fixed-base
+case, through the real call chain; zero-`v.top` and zero-`v.bottom` stripes; and zero
+and negative scalars.  Every stripe period (7, 11, 13, 17, 19) is odd and the opcode
+count is 32, so each stripe reaches every operation instead of clustering.
+
+### Sweep 73 of 74, and the one survivor is proven equivalent
+
+No build failures, no skipped anchors.  One mutant is the control that asks whether
+the poison comparison is vacuous — dropping the store entirely — and it dies, so the
+block image really is being checked.  The five named traps all die, and so does
+`S09` — `dot` re-associated as `x + (y + z)` — which is the evidence that the fixture
+is genuinely bit-sensitive and not merely close.
+
+**S43 survived: `invertInertia` using `PxMat33::getInverse` instead of `invertSym33`
+for `AAInv`.**  That is an equivalence, not a hole, and it was measured rather than
+argued: `aa` is symmetrised on the line above, and on a symmetric input the two
+routines are the same expression up to exactly-rounding identities — the products are
+the same pairs (`c1.z*c2.y` vs `c2.y*c1.z`), the negated spelling `-(A - B)` equals
+`B - A` exactly, and `x * r` equals `r * x`.  A host probe over **200 000 random
+symmetric matrices (1.8 M words) found zero differing words, not even in the sign of a
+zero**; the same probe on non-symmetric inputs differs in a third of all words.
+
+The sharp corollary is that **S44 — the same substitution for `LL` — DIES.**  The
+Schur complement `S = ll + z·laᵀ` is *not* symmetric (only `ll` was symmetrised), so
+`invertSym33` there is not a general inverse and is not interchangeable.  That is
+trap 3 as a live measurement rather than a comment: the spherical-joint path in P8.87
+must use `getInverse`, and this path must not.
+
+### What is deliberately not here
+
+No manifest row, no ABI row, no new descriptor constant.  P8.84's delta was four
+descriptor constants; this one's is zero, and P8.88's will be zero too — every field
+`computeArticulatedSpatialInertiaW` touches is already mapped.  That is the answer to
+the question this plan posed after P8.84 and it is *no*: the articulation block does
+not keep needing new address maps.
+
+Suite **711/711** in both memory modes, forced-fresh.  All 21 scenes unchanged: the
+articulation scene still completes its 240 steps with no fault under
+`PXG_SYNC_EACH=1`, its unmapped-kernel list still reads **229** (a module tranche maps
+nothing), and its two step checks still fail for the reason P8.85 records —
+`computeUnconstrainedSpatialInertiaLaunch1T`, `computeMassMatrix1T` and
+`computeUnconstrainedAccelerationsLaunch1T` are still unmapped, so the acceleration
+that would move the link is never computed.
 
 ## P8.85 — the spatial-inertia wrapper — manifest **272**
 
