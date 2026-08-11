@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **708/708** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **709/709** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,74 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.85 — the spatial-inertia wrapper — manifest **272**
+
+`computeUnconstrainedSpatialInertiaLaunchPartial1T` (forwardDynamic2.cu:1312-1343),
+twenty-five lines around P8.84's function.  Manifest 271 → **272**; suite 708 →
+**709**; the engine's unmapped-kernel list **230 → 229**, and the one that left is
+this one.
+
+**The tranche's real job is not the twenty-five lines.**  P8.84 handed `gravity`,
+`dt` and `isExternalForcesEveryTgsIterationEnabled` to the function through push
+constants, so their descriptor offsets — 52, 48 and 68 — were pinned by
+`static_assert` and by nothing else.  Here they are read out of a real
+`PxgArticulationCoreDesc` for the first time, and four mutants say so: gravity read
+one component late, gravity read backwards, `dt` read from `invLengthScale`'s slot
+at 64, and the flag read one byte late.  All four die.
+
+**The flag is a `bool`, one byte at 68**, and bytes 69..71 are structure padding
+before `impulses` at 72.  The fixture memsets the whole descriptor to `0x5A` before
+filling it, so those padding bytes are *not* zero — which turns "read it as a word"
+from an accident that happens to work into a mutant that dies.  It does.
+
+### Three differences from the velocity kernel's wrapper, each a mutant
+
+The two kernels launch with the same geometry and read the same first three hops,
+which makes the places they diverge exactly the ones a copy gets wrong:
+
+1. **This one does NOT write `solverBodyIndices`.**  The velocity kernel writes it
+   on every dispatch.  The fixture leaves that array poisoned and requires every
+   slot back at `0xAB` — a stronger check than a right value in a right slot, and
+   free.
+2. **`numLinks` comes from the RECORD**, unconditionally: no refill guard, no block
+   fallback.  The fixture seeds the block header with `0xFEED` so the two disagree,
+   and the mutant that reads the block dies.
+3. **`artiBlock` advances by ONE block per warp** while the link and dof arrays
+   beside it advance by `maxLinks` and `maxDofs`.  Both the "no offset" and the
+   "offset by a pitch" mutants die.
+
+### The mirror was hoisted rather than copied
+
+`testArtiSpatialInertia.cpp` already held a mirror of the CUDA built entirely from
+`PX_CUDA_CALLABLE` engine calls.  It is now a file-static function taking per-warp
+and per-articulation **slices**, and both tests in that translation unit call it —
+the per-link body test and this wrapper test.  A second copy would have been the
+transcription this chain exists to avoid; a header for two callers in one directory
+would have been ceremony.  The hoist was verified as behaviour-neutral before the
+new test was written: same fixture, same 7 forgiven signed-zero bytes, still green.
+
+Geometry is P8.83's, and for P8.83's measured reason: **130 articulations, three
+blocks of (32, 2, 1), five live warp slices, two allocated and left poisoned.**  At
+two blocks a warps-per-block of 1 maps block 1's first warp onto a slice block 0
+has already filled with identical data — idempotent, and the mutant survives.  At
+three it leaves a hole.  `W1` dies here.
+
+`ASI_WARPS_PER_BLOCK` is deliberately **per-kernel and not hoisted into a shared
+header**: the next two kernels in this launch sequence
+(`computeUnconstrainedSpatialInertiaLaunch1T`, `computeMassMatrix1T`) run with block
+(32, **1**, 1) and twice the grid, so a shared constant would be wrong for them by a
+factor of two.
+
+**Sweep 22 of 22, no survivors and no equivalences to explain.**  ABI row is the
+existing `kOnePtr` (`{ 8 }`); manifest hand-edited.
+
+Suite **709/709** in both memory modes, forced-fresh.  The live scene completes its
+240 steps with no fault under `PXG_SYNC_EACH=1`, and its two step checks still fail
+exactly as before — on purpose: `computeUnconstrainedSpatialInertiaLaunch1T`,
+`computeMassMatrix1T` and `computeUnconstrainedAccelerationsLaunch1T` are still
+unmapped, so the acceleration that would move the link is never computed.  The first
+tranche that can change the scene's verdict is the one that lands the last of those.
 
 ## P8.84 — `computeSpatialInertiaW`, and a fourth platform rule
 

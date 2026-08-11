@@ -481,3 +481,102 @@ void artiSpatialInertiaW(uint3 groupThreadId : SV_GroupThreadID)
                               float3(gAsi.gravityX, gAsi.gravityY, gAsi.gravityZ), gAsi.dt,
                               gAsi.externalForcesEveryTgsIteration != 0u, lane);
 }
+
+// ===========================================================================
+// P8.85: computeUnconstrainedSpatialInertiaLaunchPartial1T
+// (forwardDynamic2.cu:1312-1343)
+// ===========================================================================
+//
+// Twenty-five lines of index chain and per-warp bases over the function above,
+// and the tranche that turns P8.84's descriptor offsets from `static_assert`ed
+// into *read*: `gravity` (52), `dt` (48) and
+// `isExternalForcesEveryTgsIterationEnabled` (68) reached the function through
+// push constants until now.
+//
+// ---------------------------------------------------------------------------
+// THREE DIFFERENCES FROM computeUnconstrainedVelocities1TLaunch
+// ---------------------------------------------------------------------------
+//
+// The two kernels launch with the same geometry — block (32, 2, 1), grid
+// ceil(nbArticulations / 64) — and read the same first three hops, which makes
+// the places they diverge the easy ones to get wrong by copying:
+//
+//  1. **This one does NOT write `solverBodyIndices`.**  The velocity kernel does,
+//     on every dispatch.  Here that array must stay exactly as it was.
+//  2. **`numLinks` comes from the RECORD**, unconditionally.  There is no refill
+//     guard and no block-header fallback here, so a port that reuses the velocity
+//     kernel's resolved count is wrong the moment the two disagree.
+//  3. **`artiBlock` advances by ONE block per warp**, not by a pitch — while the
+//     link and dof arrays beside it advance by `maxLinks` and `maxDofs`.
+//
+// `isExternalForcesEveryTgsIterationEnabled` is a CUDA `bool`, i.e. ONE BYTE at
+// 68, and bytes 69..71 are structure padding before `impulses` at 72.  Reading it
+// as a word would pick that padding up, so it goes through `artiU8Field`.
+
+struct AsiLaunchParams
+{
+    uint64_t scDesc;   // @0  PxgArticulationCoreDesc*
+};
+
+[[vk::push_constant]]
+ConstantBuffer<AsiLaunchParams> gAsiLaunch;
+
+// COMPUTE_UNCONSTRAINED_VELOCITES / WARP_SIZE.  Per KERNEL, not shared: the two
+// spatial-inertia kernels that follow this one launch with block (32, 1, 1) and
+// twice the grid, so a constant hoisted into a common header would be wrong for
+// them by a factor of two.
+static const uint ASI_WARPS_PER_BLOCK = 2u;
+
+[shader("compute")]
+[numthreads(32, 2, 1)]
+void computeUnconstrainedSpatialInertiaLaunchPartial1T(uint3 groupThreadId : SV_GroupThreadID,
+                                                       uint3 groupId : SV_GroupID)
+{
+    const uint64_t d = gAsiLaunch.scDesc;
+
+    const uint globalWarpIndex = groupId.x * ASI_WARPS_PER_BLOCK + groupThreadId.y;
+    const uint globalThreadIndex = groupThreadId.x + globalWarpIndex * 32u;
+    const uint lane = groupThreadId.x & 31u;
+
+    const uint nbArticulations = artiU32Field(d, PXG_ARTI_CORE_NB_ARTICULATIONS);
+    if (globalThreadIndex >= nbArticulations)
+        return;
+
+    const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);
+    const uint maxDofs = artiU32Field(d, PXG_ARTI_CORE_MAX_DOFS);
+
+    const uint64_t w = uint64_t(globalWarpIndex);
+    const uint64_t linkBlocks = artiPtrField(d, PXG_ARTI_CORE_LINK_BLOCKS)
+                              + w * uint64_t(maxLinks) * PXG_AB_LINK_SIZE;
+    const uint64_t dofBlocks = artiPtrField(d, PXG_ARTI_CORE_DOF_BLOCKS)
+                             + w * uint64_t(maxDofs) * PXG_AB_DOF_SIZE;
+    // ONE block per warp -- not a pitch, unlike the two above
+    const uint64_t artiBlock = artiPtrField(d, PXG_ARTI_CORE_ARTICULATION_BLOCKS)
+                             + w * PXG_AB_BLOCK_SIZE;
+
+    const uint articulationOffset = artiU32Field(d, PXG_ARTI_CORE_ARTICULATION_OFFSET);
+    const uint64_t islandNodeIndices = artiPtrField(d, PXG_ARTI_CORE_ISLAND_NODE_INDICES);
+    const uint2 node = (Ptr<uint2>(islandNodeIndices))[globalThreadIndex + articulationOffset];
+    const uint nodeIndex = nodeIndexIndex(node);
+
+    const uint64_t bodySim = artiPtrField(d, PXG_ARTI_CORE_BODY_SIM_POOL)
+                           + uint64_t(nodeIndex) * PXG_BODY_SIM_SIZE;
+    const uint articulationIndex = artiU32Field(bodySim, PXG_BODY_SIM_ARTICULATION_REMAP_ID);
+
+    const uint64_t a = artiPtrField(d, PXG_ARTI_CORE_ARTICULATIONS)
+                     + uint64_t(articulationIndex) * PXG_ARTI_STRIDE;
+
+    // the RECORD's link count, with no guard and no block fallback
+    const uint numLinks = artiU16Field(a, PXG_ARTI_DATA_NUM_LINKS);
+
+    // gravity is a PxVec3 at 52 -- three scalars, not a float4 load
+    const float3 gravity = float3(asfloat(artiU32Field(d, PXG_ARTI_CORE_GRAVITY + 0u)),
+                                  asfloat(artiU32Field(d, PXG_ARTI_CORE_GRAVITY + 4u)),
+                                  asfloat(artiU32Field(d, PXG_ARTI_CORE_GRAVITY + 8u)));
+    const float dt = asfloat(artiU32Field(d, PXG_ARTI_CORE_DT));
+    const bool externalForcesEveryTgsIteration =
+        artiU8Field(d, PXG_ARTI_CORE_EXTERNAL_FORCES_EVERY_TGS_ITER) != 0u;
+
+    asiComputeSpatialInertiaW(a, artiBlock, linkBlocks, dofBlocks, numLinks, gravity, dt,
+                              externalForcesEveryTgsIteration, lane);
+}

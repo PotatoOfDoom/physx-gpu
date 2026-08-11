@@ -1131,6 +1131,13 @@ static const PxgKernelAbiRow kRows[] = {
     // (PxgArticulationCore.cpp:426) and the other two arguments are bytes.
     // Launched block (32, 2, 1), grid ceil(nbArticulations / 64).  (P8.83)
     { "computeUnconstrainedVelocities1TLaunch", kArtiDescTwoBool, uint32_t(sizeof(kArtiDescTwoBool)) },
+    // forwardDynamic2.cu:1312 computeUnconstrainedSpatialInertiaLaunchPartial1T(
+    //     const PxgArticulationCoreDesc*)
+    // -> kOnePtr.  Same launch geometry as the velocity kernel above -- block
+    // (32, 2, 1), grid ceil(nbArticulations / 64) -- but a single argument, and
+    // it reads dt / gravity / isExternalForcesEveryTgsIterationEnabled out of the
+    // descriptor rather than taking them as parameters.  (P8.85)
+    { "computeUnconstrainedSpatialInertiaLaunchPartial1T", kOnePtr, 1u },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)
