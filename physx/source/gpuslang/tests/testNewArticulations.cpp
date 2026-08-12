@@ -111,6 +111,13 @@ static_assert(offsetof(PxgArticulation, externalAccelerations) == 96, "PXG_ARTI_
 static_assert(offsetof(PxgArticulation, jointPositions) == 112, "PXG_ARTI_JOINT_POSITIONS");
 static_assert(offsetof(PxgArticulation, jointVelocities) == 120, "PXG_ARTI_JOINT_VELOCITIES");
 static_assert(offsetof(PxgArticulation, jointForce) == 136, "PXG_ARTI_JOINT_FORCE");
+// P8.89: the per-link 6x6 impulse-response matrices computeMassMatrix1T writes
+// through.  GENERATED, not guessed -- the plan's estimate for this one was off by
+// a hundred bytes, which is precisely why it is pinned here rather than trusted.
+static_assert(offsetof(PxgArticulation, spatialResponseMatrixW) == 176,
+              "PXG_ARTI_SPATIAL_RESPONSE_MATRIX_W");
+static_assert(sizeof(PxSpatialMatrix) == 144, "PXG_ARTI_SPATIAL_MATRIX_6X6_SIZE");
+static_assert(sizeof(PxgSpatialMatrix6x6Block) == 4608, "the 6x6 block is 9 float4 columns");
 static_assert(offsetof(PxgArticulation, jointTargetPositions) == 144, "PXG_ARTI_JOINT_TARGET_POSITIONS");
 static_assert(offsetof(PxgArticulation, jointTargetVelocities) == 152, "PXG_ARTI_JOINT_TARGET_VELOCITIES");
 static_assert(offsetof(PxgArticulation, linkBody2Worlds) == 184, "PXG_ARTI_LINK_BODY2WORLDS");

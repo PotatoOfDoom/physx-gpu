@@ -545,13 +545,17 @@ PXG_TEST(artiSpatialMatrixBlockIo)
 
     PxgSlangComputeDevice* dev = testDevice();
     const PxgKernelDef manifest[] = {
-        // { u64 x4, u32 x2 } -> 40 bytes
-        { "npArtiSpatialMatrix.spv", "artiSpatialMatrixBlockIo", 40u, 0 },
+        // { u64 x7, u32 x2 } -> 64 bytes
+        { "npArtiSpatialMatrix.spv", "artiSpatialMatrixBlockIo", 64u, 0 },
     };
     PxgCudaShim shim(dev, manifest, 1, &artiSpatialMatrixLoader);
 
-    const uint32_t LANES = 32;
-    const uint32_t FLOATS_PER_LANE = 36;
+    // 21 live, 11 left poisoned.  With all 32 live the union of every lane's
+    // slots IS the whole block, and a helper that zeroes the whole block instead
+    // of one lane's nine slots is indistinguishable -- the sweep caught that.
+    const uint32_t LANES = 21;
+    const uint32_t LANE_SLOTS = 32;
+    const uint32_t FLOATS_PER_LANE = 72;   // 27 + 9 + 36 (P8.89's 6x6)
 
     // 36 distinct, non-round values per lane, and distinct BETWEEN lanes.
     auto val = [](uint32_t lane, uint32_t k) {
@@ -560,10 +564,12 @@ PXG_TEST(artiSpatialMatrixBlockIo)
 
     PxgSpatialMatrixBlock smBlock;
     PxgMat33Block m33Block;
+    PxgSpatialMatrix6x6Block m6Block;
     std::memset(&smBlock, 0xAB, sizeof(smBlock));
     std::memset(&m33Block, 0xAB, sizeof(m33Block));
+    std::memset(&m6Block, 0xAB, sizeof(m6Block));
 
-    for (uint32_t lane = 0; lane < LANES; ++lane)
+    for (uint32_t lane = 0; lane < LANE_SLOTS; ++lane)
     {
         SpatialMatrix mat;
         float* mp[3] = { &mat.topLeft.column0.x, &mat.topRight.column0.x,
@@ -579,6 +585,15 @@ PXG_TEST(artiSpatialMatrixBlockIo)
         storeSpatialMatrix(smBlock, lane, mat);
         storePxMat33(m33Block, lane, q);
 
+        // P8.89: the FULL 6x6.  36 distinct values per lane, none shared with the
+        // seven-column matrix above, so a helper that reaches into the wrong block
+        // lands on numbers from a different decade.
+        PxSpatialMatrix m6;
+        for (uint32_t i = 0; i < 6; ++i)
+            for (uint32_t j = 0; j < 6; ++j)
+                m6.column[i][j] = val(lane, 40 + i * 6 + j) * 3.0f + 100.0f;
+        storeSpatialMatrix(m6Block, lane, m6);
+
         // the packing's one unused word, poisoned after the engine zeroed it
         smBlock.columns[6][lane].w = u2f(0xDEAD0000u | lane);
     }
@@ -587,13 +602,22 @@ PXG_TEST(artiSpatialMatrixBlockIo)
     // float4 columns of every lane and nothing outside them
     PxgSpatialMatrixBlock smOutPoison;
     std::memset(&smOutPoison, 0xAB, sizeof(smOutPoison));
+    // two more destinations for P8.89: one re-stored, one zeroed in place.  Both
+    // start poisoned, and only the LIVE lanes may change -- the zeroing helper
+    // touches one lane's nine slots and must leave the other 31 alone.
+    PxgSpatialMatrix6x6Block m6OutPoison, m6ZeroPoison;
+    std::memset(&m6OutPoison, 0xAB, sizeof(m6OutPoison));
+    std::memset(&m6ZeroPoison, 0xAB, sizeof(m6ZeroPoison));
 
-    PxgDevicePtr dSm = 0, dM33 = 0, dOut = 0, dSmOut = 0;
+    PxgDevicePtr dSm = 0, dM33 = 0, dOut = 0, dSmOut = 0, dM6 = 0, dM6Out = 0, dM6Zero = 0;
     shim.memAlloc(&dSm, sizeof(smBlock));
     shim.memAlloc(&dM33, sizeof(m33Block));
     shim.memAlloc(&dOut, size_t(LANES) * FLOATS_PER_LANE * sizeof(float));
     shim.memAlloc(&dSmOut, sizeof(smOutPoison));
-    if (!dSm || !dM33 || !dOut || !dSmOut)
+    shim.memAlloc(&dM6, sizeof(m6Block));
+    shim.memAlloc(&dM6Out, sizeof(m6OutPoison));
+    shim.memAlloc(&dM6Zero, sizeof(m6ZeroPoison));
+    if (!dSm || !dM33 || !dOut || !dSmOut || !dM6 || !dM6Out || !dM6Zero)
     {
         std::printf("  NOTE: no BDA -> skip\n");
         return;
@@ -607,13 +631,17 @@ PXG_TEST(artiSpatialMatrixBlockIo)
     shim.memcpyHtoD(dM33, &m33Block, sizeof(m33Block));
     shim.memcpyHtoD(dOut, outPoison.data(), outPoison.size() * sizeof(float));
     shim.memcpyHtoD(dSmOut, &smOutPoison, sizeof(smOutPoison));
+    shim.memcpyHtoD(dM6, &m6Block, sizeof(m6Block));
+    shim.memcpyHtoD(dM6Out, &m6OutPoison, sizeof(m6OutPoison));
+    shim.memcpyHtoD(dM6Zero, &m6ZeroPoison, sizeof(m6ZeroPoison));
 
     struct Params
     {
-        uint64_t smBlock, m33Block, outFloats, smBlockOut;
+        uint64_t smBlock, m33Block, outFloats, smBlockOut, m6Block, m6BlockOut, m6BlockZero;
         uint32_t nbLanes, pad0;
-    } prm = { uint64_t(dSm), uint64_t(dM33), uint64_t(dOut), uint64_t(dSmOut), LANES, 0u };
-    PXG_CHECK_MSG(sizeof(prm) == 40, "push-constant blob is %zu bytes", sizeof(prm));
+    } prm = { uint64_t(dSm),  uint64_t(dM33),    uint64_t(dOut),     uint64_t(dSmOut),
+              uint64_t(dM6),  uint64_t(dM6Out),  uint64_t(dM6Zero),  LANES, 0u };
+    PXG_CHECK_MSG(sizeof(prm) == 64, "push-constant blob is %zu bytes", sizeof(prm));
 
     PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
                   "launch artiSpatialMatrixBlockIo");
@@ -623,18 +651,26 @@ PXG_TEST(artiSpatialMatrixBlockIo)
     shim.memcpyDtoH(got.data(), dOut, got.size() * sizeof(float));
     PxgSpatialMatrixBlock gotSmOut;
     shim.memcpyDtoH(&gotSmOut, dSmOut, sizeof(gotSmOut));
+    PxgSpatialMatrix6x6Block gotM6Out, gotM6Zero;
+    shim.memcpyDtoH(&gotM6Out, dM6Out, sizeof(gotM6Out));
+    shim.memcpyDtoH(&gotM6Zero, dM6Zero, sizeof(gotM6Zero));
 
     // the expectation: the ENGINE's loaders reading the very same bytes, and the
     // ENGINE's writer re-storing what they returned
     PxgSpatialMatrixBlock wantSmOut = smOutPoison;
+    PxgSpatialMatrix6x6Block wantM6Out = m6OutPoison, wantM6Zero = m6ZeroPoison;
     size_t bad = 0;
     for (uint32_t lane = 0; lane < LANES; ++lane)
     {
         SpatialMatrix mat;
         PxMat33 q;
+        PxSpatialMatrix m6;
         loadSpatialMatrix(smBlock, lane, mat);
         loadPxMat33(m33Block, lane, q);
+        loadSpatialMatrix(m6Block, lane, m6);
         storeSpatialMatrix(wantSmOut, lane, mat);
+        storeSpatialMatrix(wantM6Out, lane, m6);
+        zeroSpatialMatrix(wantM6Zero, lane);
 
         float want[FLOATS_PER_LANE];
         const float* mp[3] = { &mat.topLeft.column0.x, &mat.topRight.column0.x,
@@ -644,6 +680,9 @@ PXG_TEST(artiSpatialMatrixBlockIo)
                 want[b * 9 + k] = mp[b][k];
         for (uint32_t k = 0; k < 9; ++k)
             want[27 + k] = (&q.column0.x)[k];
+        for (uint32_t i = 0; i < 6; ++i)
+            for (uint32_t j = 0; j < 6; ++j)
+                want[36 + i * 6 + j] = m6.column[i][j];
 
         for (uint32_t k = 0; k < FLOATS_PER_LANE; ++k)
         {
@@ -676,10 +715,33 @@ PXG_TEST(artiSpatialMatrixBlockIo)
     }
     PXG_CHECK_MSG(badStore == 0, "asmStoreSpatialMatrix image identical to storeSpatialMatrix");
 
+    // P8.89: the two 6x6 destinations, whole-block, poison included
+    size_t bad6 = 0;
+    {
+        auto cmpBlock = [&](const char* what, const void* wp, const void* gp, size_t bytes) {
+            const uint32_t* w = reinterpret_cast<const uint32_t*>(wp);
+            const uint32_t* g = reinterpret_cast<const uint32_t*>(gp);
+            for (size_t k = 0; k < bytes / 4; ++k)
+            {
+                if (w[k] == g[k])
+                    continue;
+                if (bad6 < 8)
+                    std::printf("MM %s word %zu  ref %08x  gpu %08x\n", what, k, w[k], g[k]);
+                ++bad6;
+            }
+        };
+        cmpBlock("6x6 store", &wantM6Out, &gotM6Out, sizeof(wantM6Out));
+        cmpBlock("6x6 zero", &wantM6Zero, &gotM6Zero, sizeof(wantM6Zero));
+    }
+    PXG_CHECK_MSG(bad6 == 0, "the 6x6 store and zero match storeSpatialMatrix / zeroSpatialMatrix");
+
     shim.memFree(dSm);
     shim.memFree(dM33);
     shim.memFree(dOut);
     shim.memFree(dSmOut);
+    shim.memFree(dM6);
+    shim.memFree(dM6Out);
+    shim.memFree(dM6Zero);
 }
 
 }  // namespace

@@ -681,6 +681,71 @@ public void abStorePxMat33(uint64_t base, uint fieldOffset, uint lane, AbMat33 m
     (Ptr<float>(base + uint64_t(fieldOffset + PXG_AB_M33_COL2)))[lane] = m.c2.z;
 }
 
+// ---------------------------------------------------------------------------
+// P8.89: the FULL 6x6, PxSpatialMatrix
+// ---------------------------------------------------------------------------
+//
+// A different animal from the seven-block Dy::SpatialMatrix above.  This one has
+// no implied block: `PxSpatialMatrix` is a plain `PxReal column[6][6]`
+// (PxSpatialMatrix.h:53) and `PxgSpatialMatrix6x6Block` is `float4 columns[9][32]`
+// -- 36 floats chunked four at a time, at the usual lane stride of 32.  The
+// packing is therefore FLAT, not the interleaved one the seven-column form uses:
+// `columns[k]` holds flat indices `4k .. 4k+3`, and flat `f` is
+// `column[f / 6][f % 6]`.  Nine columns, 4608 bytes, no bottom-right trick.
+//
+// Held as a flat 36 rather than six float3x3s or a nested array because that is
+// what the block is, and because the impulse-response code writes it a COLUMN at
+// a time (`response.column[i][0..5]`) while reading it as a matrix-vector
+// product -- see PxgArticulation.h:141 / 163 / 176 for the three originals the
+// fixture pins these against.
+public struct AbMatrix6x6
+{
+    public float e[36];   // e[i * 6 + j] == PxSpatialMatrix::column[i][j]
+};
+
+public float abM6Get(AbMatrix6x6 m, uint i, uint j) { return m.e[i * 6u + j]; }
+
+public AbMatrix6x6 abMatrix6x6Zero()
+{
+    AbMatrix6x6 m;
+    for (uint k = 0u; k < 36u; ++k)
+        m.e[k] = 0.0f;
+    return m;
+}
+
+public AbMatrix6x6 abLoadSpatialMatrix6x6(uint64_t base, uint fieldOffset, uint lane)
+{
+    Ptr<float4> c = Ptr<float4>(base + uint64_t(fieldOffset));
+    AbMatrix6x6 m;
+    for (uint k = 0u; k < 9u; ++k)
+    {
+        const float4 v = c[k * 32u + lane];
+        m.e[k * 4u + 0u] = v.x;
+        m.e[k * 4u + 1u] = v.y;
+        m.e[k * 4u + 2u] = v.z;
+        m.e[k * 4u + 3u] = v.w;
+    }
+    return m;
+}
+
+public void abStoreSpatialMatrix6x6(uint64_t base, uint fieldOffset, uint lane, AbMatrix6x6 m)
+{
+    Ptr<float4> c = Ptr<float4>(base + uint64_t(fieldOffset));
+    for (uint k = 0u; k < 9u; ++k)
+        c[k * 32u + lane] =
+            float4(m.e[k * 4u + 0u], m.e[k * 4u + 1u], m.e[k * 4u + 2u], m.e[k * 4u + 3u]);
+}
+
+// zeroSpatialMatrix (PxgArticulation.h:176).  The engine writes nine explicit
+// zeroed float4s rather than memsetting, and this lane's nine slots are the only
+// ones it touches -- the other 31 lanes' are somebody else's articulation.
+public void abZeroSpatialMatrix6x6(uint64_t base, uint fieldOffset, uint lane)
+{
+    Ptr<float4> c = Ptr<float4>(base + uint64_t(fieldOffset));
+    for (uint k = 0u; k < 9u; ++k)
+        c[k * 32u + lane] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+}
+
 // loadPxMat33 (PxgArticulation.h:271), the mirror of the store above: the third
 // array is a plain float[32], so its element stride is FOUR while the first two
 // are sixteen.

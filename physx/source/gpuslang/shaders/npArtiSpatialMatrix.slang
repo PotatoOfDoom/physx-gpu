@@ -271,16 +271,19 @@ struct SmxIoParams
 {
     uint64_t smBlock;     // @0   PxgSpatialMatrixBlock*   (source)
     uint64_t m33Block;    // @8   PxgMat33Block*
-    uint64_t outFloats;   // @16  float[nbLanes * 36]
+    uint64_t outFloats;   // @16  float[nbLanes * (36 + 36)]
     uint64_t smBlockOut;  // @24  PxgSpatialMatrixBlock*   (destination)
-    uint nbLanes;         // @32
-    uint pad0;            // @36 -> 40 bytes
+    uint64_t m6Block;     // @32  PxgSpatialMatrix6x6Block* (source, P8.89)
+    uint64_t m6BlockOut;  // @40  PxgSpatialMatrix6x6Block* (destination)
+    uint64_t m6BlockZero; // @48  PxgSpatialMatrix6x6Block* (zeroed in place)
+    uint nbLanes;         // @56
+    uint pad0;            // @60 -> 64 bytes
 };
 
 [[vk::push_constant]]
 ConstantBuffer<SmxIoParams> gSmxIo;
 
-static const uint SMX_IO_FLOATS_PER_LANE = 36u;
+static const uint SMX_IO_FLOATS_PER_LANE = 72u;   // 27 + 9 + 36 (P8.89)
 
 [shader("compute")]
 [numthreads(32, 1, 1)]
@@ -311,4 +314,18 @@ void artiSpatialMatrixBlockIo(uint3 groupThreadId : SV_GroupThreadID)
     o[33] = q.c2.x; o[34] = q.c2.y; o[35] = q.c2.z;
 
     asmStoreSpatialMatrix(gSmxIo.smBlockOut, 0u, lane, m);
+
+    // P8.89: the FULL 6x6.  Same arrangement -- the engine wrote the source
+    // block, we load it and dump the 36 components, we re-store it into a second
+    // block compared against the engine's own image, and a third block is zeroed
+    // in place so `abZeroSpatialMatrix6x6` is exercised on live lanes only.
+    const AbMatrix6x6 m6 = abLoadSpatialMatrix6x6(gSmxIo.m6Block, 0u, lane);
+    // dumped through the ACCESSOR, not the flat array, so `abM6Get`'s row-major
+    // convention is exercised rather than merely declared
+    for (uint i = 0u; i < 6u; ++i)
+        for (uint j = 0u; j < 6u; ++j)
+            o[36u + i * 6u + j] = abM6Get(m6, i, j);
+
+    abStoreSpatialMatrix6x6(gSmxIo.m6BlockOut, 0u, lane, m6);
+    abZeroSpatialMatrix6x6(gSmxIo.m6BlockZero, 0u, lane);
 }

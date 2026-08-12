@@ -81,6 +81,14 @@ public static const uint PXG_ARTI_ROOT_PRE_MOTION_VELOCITY = 104;  // a SINGLE
 public static const uint PXG_ARTI_JOINT_POSITIONS = 112;
 public static const uint PXG_ARTI_JOINT_VELOCITIES = 120;
 public static const uint PXG_ARTI_JOINT_FORCE = 136;
+// PxSpatialMatrix* -- the per-link 6x6 impulse-response matrices, one array per
+// articulation.  P8.89: GENERATED, not guessed.  The plan expected it between
+// pathToRoot (272) and spatialTendonParams (304); it is nowhere near, which is
+// exactly the P8.49a failure mode (shader and fixture sharing one wrong number)
+// that generating it closes.
+public static const uint PXG_ARTI_SPATIAL_RESPONSE_MATRIX_W = 176;
+// sizeof(PxSpatialMatrix) -- a plain PxReal column[6][6]
+public static const uint PXG_ARTI_SPATIAL_MATRIX_6X6_SIZE = 144;
 public static const uint PXG_ARTI_JOINT_TARGET_POSITIONS = 144;
 public static const uint PXG_ARTI_JOINT_TARGET_VELOCITIES = 152;
 public static const uint PXG_ARTI_LINK_BODY2WORLDS = 184;

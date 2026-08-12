@@ -1694,6 +1694,58 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.89 — the 6×6 `PxSpatialMatrix` block layer
+
+The response matrices `computeMassMatrix1T` writes are the **full 6×6**
+`PxSpatialMatrix` (`PxReal column[6][6]`), not the seven-block `Dy::SpatialMatrix`
+P8.86 covers, and their block form is a different packing.  This tranche lands the
+three helpers and the one address that was missing.  Suite unchanged at
+**714/714**; manifest unchanged at **273** — a helper tranche, and the last one
+before the articulation chain starts using real warp cooperation.
+
+### The packing is FLAT, unlike the seven-column one
+
+`PxgSpatialMatrix6x6Block` is `float4 columns[9][32]` — 36 floats chunked four at a
+time at the usual lane stride of 32, with `columns[k]` holding flat indices
+`4k .. 4k+3` and flat `f` being `column[f / 6][f % 6]`.  No implied block, no
+interleaving: 4608 bytes of straightforward SoA.  `abLoadSpatialMatrix6x6`,
+`abStoreSpatialMatrix6x6` and `abZeroSpatialMatrix6x6` all have `PX_CUDA_CALLABLE`
+originals (PxgArticulation.h:141 / 163 / 176), so the fixture is P8.86b's
+arrangement exactly — the engine writes the image, our loader reads it, and the
+components are compared against the engine's own loader.  Never a round trip
+through our own store.
+
+### The one new address, and why guessing it would have been wrong
+
+`PxgArticulation::spatialResponseMatrixW` had no constant.  **The plan predicted it
+between `pathToRoot` (272) and `spatialTendonParams` (304); it is at 176** — off by
+a hundred bytes.  Generated, `static_assert`ed in `testNewArticulations.cpp` beside
+`jointForce`, and it is exactly the P8.49a failure mode (shader and fixture sharing
+one wrong number) that generating it closes.  `sizeof(PxSpatialMatrix) == 144` and
+`sizeof(PxgSpatialMatrix6x6Block) == 4608` are pinned with it.
+
+### Sweep 14 of 14, after the sweep found three fixture weaknesses
+
+The first pass was 11/14 with one skipped anchor and two survivors, and **all three
+were the fixture, not the code**:
+
+* one anchor matched twice — the store and the zero helper share a loop header —
+  so it was **untested, not passed**, and was re-anchored to include the store's
+  own body;
+* **zeroing the whole block instead of one lane's nine slots survived**, because
+  the fixture drove all 32 lanes: the union of every lane's slots *is* the whole
+  block, so the two are indistinguishable.  The test now drives **21 live lanes and
+  leaves 11 poisoned**, and the mutant dies;
+* **`abM6Get`'s row-major convention survived** because nothing called it — the
+  entry point dumped the flat array directly.  It now dumps *through the accessor*,
+  and the transposed mutant dies.
+
+That is the standing rule holding for the ninth tranche running: a survivor is
+almost always a coincidence in the fixture, and the fix is to remove the
+coincidence rather than to explain it.
+
+Suite **714/714** in both memory modes, forced-fresh.
+
 ## P8.88 — the articulated-inertia sweep + its kernel — manifest **273**
 
 forwardDynamic2.cu:1580-1697.  The leaf-to-root propagation that reduces each
