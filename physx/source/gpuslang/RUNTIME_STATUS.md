@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **711/711** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **712/712** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,111 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.87 — `computeIs` + `computePropagateSpatialInertia_ZA_ZIc`
+
+forwardDynamic2.cu:1345-1544 — the per-dof algebra that turns a link's articulated
+spatial inertia into the term the parent's inertia is reduced by, and accumulates
+the joint's contribution into the zero-acceleration force vectors on the way past.
+New module `shaders/npArtiPropagateInertia.slang`; suite 711 → **712**; manifest
+unchanged at **272 of 501** — this is the second of the three tranches under
+`computeUnconstrainedSpatialInertiaLaunch1T`, and **zero new ABI** again.
+
+### The oracle, stated honestly
+
+Both CUDA functions are `static __device__` and unreachable from the host, so this
+is the P8.73-P8.80 arrangement and not P8.86's: the mirror is the CUDA's **control
+flow** with the engine's arithmetic and the engine's block writers inside it —
+`SpatialMatrix::operator*`, `innerProduct`, `PxMat33::getInverse`, both
+`constructSpatialMatrix` forms, `loadSpatialVector` / `storeSpatialVector`.  Every
+one of those got its own fixture in P8.86, so what this tranche tests is the control
+flow, which is exactly what the sweep attacks.
+
+One engine duplication was named rather than reproduced: the local
+`constructSpatialMatrix(Is, stI)` at :1367 is byte-for-byte the body of
+`SpatialMatrix::constructSpatialMatrix(SpatialVectorF, SpatialVectorF)` at
+DyFeatherstoneArticulationUtils.h:364.  The port has one function and a note.
+
+### The traps, and the one that is worth the tranche on its own
+
+* **`PxMat33 invStIs(PxIdentity)` starts as the IDENTITY, not zero.**  A two-dof
+  spherical joint never writes the third row or column, so those entries stay
+  `(0,0,1)` and the matrix inverts.  Seed it from zero and it is singular,
+  `getInverse` returns the identity, and every number downstream is wrong — silently,
+  because the shape is right.  The fixture has one-, two- and three-dof spherical
+  lanes and the mutant dies on the two-dof one.
+* **It inverts with `PxMat33::getInverse`, not `invertSym33`**, and the engine's own
+  commented-out `//invStIs = SpatialMatrix::invertSym33(invStIs);` sits above it.
+  P8.86 measured why that matters; the substitution dies here in situ.
+* **`qstZ` ignores the joint force and `qstZIcInternal` uses it** — with the engine's
+  commented-out `//link.qstZIc[ind] = jF[ind] - stZ;` right there to make "fixing" it
+  look right.  Both directions die.
+* **`stI` swaps the halves** (`(Is.bottom, Is.top)`), and the spherical case spells
+  the same swap as "columns 0..2 from `.bottom`, 3..5 from `.top`".  Both die.
+* **`iStIs = stIs > 0 ? 1/stIs : 0`** — `> 0`, not `!= 0`.  The fixture drives `stIs`
+  exactly to zero on one lane and negative on another, and **asserts the sign it
+  computed** rather than assuming it; that assertion caught a lane whose dense
+  default happened to land negative when it was meant to be positive.
+* The write-back is **transposed**: dof `ind2` takes row `ind2` of the inverse.
+* The `default` case (`eFIX`, `eUNDEFINED`) writes **nothing**, which the poison
+  proves; a lane with `eUNDEFINED` and a *non-zero* dof count pins that it is the
+  switch and not the count that selects it.
+
+### Sweep 54 of 55, and what the two survivors taught
+
+The first run was 53/55 with two survivors, and **neither was an equivalence — both
+were fixture weaknesses, and fixing them changed the tranche's conclusions.**
+
+**P32 — dropping the inner `ind < dofs` guard — survived because the entry point
+seeded `Is[3]` with zeros.**  The CUDA leaves those entries *uninitialised*; zeros
+made an unguarded read harmless.  The entry point and the mirror now seed the same
+**non-zero poison**, and the mutant dies.  A control mutant that changes the poison
+in the shader only confirms the seed is never read by correct code.
+
+**P47 — seeding the seven accumulators with `-0` — survived, and chasing it
+overturned what this tranche had already written down about P8.84's rule.**  Three
+measurements, in order:
+
+1. A literal-zero seed and P8.84's `abs(x) * 0.0f` runtime-zero seed produce the
+   **same SPIR-V `OpFAdd` count (12)**, and the fixture was green either way.  The
+   first conclusion drawn — "no fold happens here" — was **wrong**, and it was wrong
+   because the fixture could not see the fold.
+2. **The seed's sign is washed out by IEEE itself.**  `(-0) + (+0) = +0`, so one
+   ordinary term erases it.  A three-dof spherical joint with a diagonal `invStIs` —
+   the obvious construction, and the fixture's lane 6 — contributes a `-0` first term
+   and then wipes it on the next iteration.  That is why P47 survived and why the
+   hazard looked absent.
+3. The shape that **does** expose it is a **one-dof spherical joint whose `Is` is all
+   negative zeros**: exactly one accumulated term, nothing to wash it out.  Lane 10
+   builds that from a zero spatial inertia (a massless link) against an all-negative
+   motion matrix, and it **fails immediately** — twelve words, every one `00000000`
+   against `80000000`.
+
+So the fold is real, it is the **driver's** and not slangc's, and P8.84's runtime-zero
+remedy does not defeat it — re-measured here, unchanged output.  The resolution is
+P8.84's other one: a tolerance scoped to `0x00000000` vs `0x80000000` and nothing
+else, with the count printed and bounded, plus an assertion that the count is
+**non-zero** so the lane cannot silently stop exercising the hazard.  P47 then
+survives *by construction*: the driver discards the seed, so the seed's sign has no
+observable effect — which is the same fact the tolerance encodes.
+
+**The correction is worth stating plainly**: this tranche's module header first
+claimed the fold did not occur, on the strength of an `OpFAdd` count.  An op count
+was the wrong instrument; only a fixture that can observe the difference settles it,
+and building one took a mutant surviving to prompt it.
+
+### ABI and shape
+
+No manifest row, no ABI row, no new descriptor or block constant: `mWorldMotionMatrix`
+1152, `mIsW` 3456, `mIsInvDW` 2688, `mQstZ` 640, `mQstZIcInternal` 768,
+`mInvStIsT_{x,y,z}` 4992/5120/5248, the armature at `mConstraintData` 5440 +
+`mArmature` 5376, `mJointType` 28832 and `mDofs` 28800 were all already mapped.
+`jF` is carried as a device address where **0 means NULL**, the natural port of the
+CUDA pointer, and the mutant that reads one as the other dies.
+
+Suite **712/712** in both memory modes, forced-fresh; all 21 scenes unchanged and the
+articulation scene's unmapped-kernel list still reads **229**, as a module tranche
+should leave it.
 
 ## P8.86 — the spatial-matrix algebra layer
 
