@@ -95,6 +95,7 @@
 #include "CmSpatialVector.h"
 #include "DyFeatherstoneArticulationUtils.h"
 #include "PxgArticulation.h"
+#include "pxgArtiRefHelpers.h"
 
 #include <cmath>
 #include <cstdint>
@@ -238,39 +239,17 @@ static void putSVec(SmxOut& o, const physx::Cm::UnAlignedSpatialVector& v)
     putVec3(o.vecBot, v.bottom);
 }
 
-// ---------------------------------------------------------------------------
-// The two engine functions that are __device__-only, mirrored out of the
-// engine's own PxMat33 operators.  Only the ORDER is transcribed — which is
-// precisely what trap 5 is about, so the sweep attacks it rather than trusting
-// it.  Both are byte-for-byte the CUDA at forwardDynamic2.cu:1546 and :1561.
-// ---------------------------------------------------------------------------
-static PxMat33 refSkewSymmetric(const F4& r)
-{
-    return PxMat33(PxVec3(0.f, r.z, -r.y),
-                   PxVec3(-r.z, 0.f, r.x),
-                   PxVec3(r.y, -r.x, 0.f));
-}
-
-static void refTranslateInertia(const PxMat33& sTod, physx::Dy::SpatialMatrix& inertia)
-{
-    const PxMat33 dTos = sTod.getTranspose();
-
-    PxMat33 bl = sTod * inertia.topLeft + inertia.bottomLeft;
-    PxMat33 br = sTod * inertia.topRight + inertia.getBottomRight();
-
-    inertia.topLeft = inertia.topLeft + inertia.topRight * dTos;
-    inertia.bottomLeft = bl + br * dTos;
-
-    inertia.bottomLeft = (inertia.bottomLeft + inertia.bottomLeft.getTranspose()) * 0.5f;
-}
-
-// translateSpatialVectorInPlace (forwardDynamic2.cu:57) — one line, and the top
-// half is deliberately untouched.
-static void refTranslateSpatialVectorInPlace(const PxVec3& offset,
-                                             physx::Cm::UnAlignedSpatialVector& vec)
-{
-    vec.bottom += offset.cross(vec.top);
-}
+// The three `static __device__` helpers the engine keeps in forwardDynamic2.cu --
+// `constructSkewSymmetricMatrix`, `translateInertia` and
+// `translateSpatialVectorInPlace` -- are mirrored ONCE in pxgArtiRefHelpers.h and
+// shared with P8.88's fixture rather than transcribed per test.  Only their
+// five-line structure is transcribed; every operation inside is the engine's own,
+// which is what trap 5 is about and what the sweep attacks.
+//
+// `refSkewSymmetric` there takes three floats rather than the engine's float4:
+// the `w` component is ignored by the CUDA, and passing it would invite a fixture
+// to think it mattered.  The opcode below keeps feeding `rvec.w` a live value so
+// a port that reads it still fails.
 
 PXG_TEST(artiSpatialMatrix)
 {
@@ -405,7 +384,7 @@ PXG_TEST(artiSpatialMatrix)
         case SMX_M33_TRANSPOSE:   putM33(o, A.topLeft.getTranspose()); break;
         case SMX_M33_INVERSE:     putM33(o, M.getInverse()); break;
         case SMX_INVERT_SYM33:    putM33(o, SpatialMatrix::invertSym33(M)); break;
-        case SMX_SKEW:            putM33(o, refSkewSymmetric(c.rvec)); break;
+        case SMX_SKEW:            putM33(o, refSkewSymmetric(c.rvec.x, c.rvec.y, c.rvec.z)); break;
         case SMX_BOTTOM_RIGHT:    putM33(o, A.getBottomRight()); break;
 
         case SMX_M33_TRANSFORM:   putVec3(o.vecTop, A.topLeft * v.top); break;

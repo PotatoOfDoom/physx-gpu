@@ -1138,6 +1138,14 @@ static const PxgKernelAbiRow kRows[] = {
     // it reads dt / gravity / isExternalForcesEveryTgsIterationEnabled out of the
     // descriptor rather than taking them as parameters.  (P8.85)
     { "computeUnconstrainedSpatialInertiaLaunchPartial1T", kOnePtr, 1u },
+    // forwardDynamic2.cu:1667 computeUnconstrainedSpatialInertiaLaunch1T(
+    //     const PxgArticulationCoreDesc*)
+    // -> kOnePtr, the same single descriptor pointer.  The LAUNCH GEOMETRY is not
+    // the same: block (32, 1, 1) and grid num1TBlocks * 2, i.e. one warp per block
+    // and twice as many blocks (PxgArticulationCore.cpp).  Same total warps, but a
+    // port that reuses the partial kernel's warps-per-block of 2 processes half the
+    // articulations.  (P8.88)
+    { "computeUnconstrainedSpatialInertiaLaunch1T", kOnePtr, 1u },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

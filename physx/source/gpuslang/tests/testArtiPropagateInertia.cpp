@@ -93,6 +93,10 @@
 #include "CmSpatialVector.h"
 #include "DyFeatherstoneArticulationUtils.h"
 #include "PxgArticulation.h"
+#include "PxgArticulationCoreDesc.h"
+#include "PxgBodySim.h"
+#include "PxNodeIndex.h"
+#include "pxgArtiRefHelpers.h"
 
 #include <cmath>
 #include <cstdint>
@@ -653,6 +657,522 @@ PXG_TEST(artiPropagateInertia)
     shim.memFree(dScratch);
     shim.memFree(dInertia);
     shim.memFree(dJf);
+}
+
+// ===========================================================================
+// P8.88: computeArticulatedSpatialInertiaW + computeUnconstrainedSpatialInertiaLaunch1T
+// ===========================================================================
+//
+// The leaf-to-root sweep over the function above, and the kernel around it.  The
+// mirror below is `apiMirror` wrapped in the CUDA's loop — ONE transcription of
+// the per-dof algebra, three users, which is the arrangement P8.85 established.
+//
+// The topology is deliberately not a straight chain: `loopParent` returns a
+// parent that is `< linkID` but usually NOT `linkID - 1`, so a port that assumes
+// the obvious chain accumulates into the wrong link.  Joint types cycle through
+// all five so every branch of the per-dof switch runs inside the loop, and the
+// dof cursor (`mJointOffset`) advances by each joint's own dof count rather than
+// by one.
+
+static const uint32_t J_TYPE_CYCLE[6] = { J_PRISMATIC, J_REVOLUTE, J_SPHERICAL,
+                                          J_FIX, J_REVOLUTE_UNWRAPPED, J_SPHERICAL };
+
+static uint8_t loopJointType(uint32_t k, uint32_t i) { return uint8_t(J_TYPE_CYCLE[(k + i) % 6]); }
+
+static uint8_t loopDofs(uint32_t k, uint32_t i)
+{
+    const uint8_t t = loopJointType(k, i);
+    if (t == J_FIX) return 0;
+    if (t == J_SPHERICAL) return uint8_t(2 + ((k + i) % 2));
+    return 1;
+}
+
+// < linkID always, and only equal to linkID-1 by coincidence
+static uint32_t loopParent(uint32_t k, uint32_t i) { return i <= 1 ? 0u : ((i - 1u + k) % i); }
+
+static uint32_t loopTotalDofs(uint32_t k, uint32_t numLinks)
+{
+    uint32_t n = 0;
+    for (uint32_t i = 1; i < numLinks; ++i)
+        n += loopDofs(k, i);
+    return n;
+}
+
+static size_t gClampFires = 0;   // how often PxMax(0, .) actually changed a value
+
+// ---------------------------------------------------------------------------
+// The loop mirror: the CUDA's control flow around apiMirror
+// ---------------------------------------------------------------------------
+static void apiLoopMirror(PxgArticulationBlockLinkData* lk, PxgArticulationBlockDofData* df,
+                          PxgArticulationBlockData& ab, const PxReal* jointForces,
+                          bool extEveryIter, uint32_t numLinks, uint32_t lane)
+{
+    for (PxU32 linkID = numLinks - 1; linkID > 0; --linkID)
+    {
+        PxgArticulationBlockLinkData& blk = lk[linkID];
+        const PxU32 parent = blk.mParents[lane];
+        const PxU32 dof = blk.mDofs[lane];
+        const PxU32 jointOffset = blk.mJointOffset[lane];
+        const PxVec3 rw(blk.mRw_x[lane], blk.mRw_y[lane], blk.mRw_z[lane]);
+        PxgArticulationBlockDofData* dofData = df + jointOffset;
+
+        // every parent read happens before anything is written
+        SpatialMatrix parentInertia;
+        loadSpatialMatrix(lk[parent].mSpatialArticulatedInertia, lane, parentInertia);
+        SpatialMatrix articulatedInertia;
+        loadSpatialMatrix(blk.mSpatialArticulatedInertia, lane, articulatedInertia);
+        const UnAlignedSpatialVector coriolis = loadSpatialVector(blk.mCoriolis, lane);
+        const UnAlignedSpatialVector spatialZA = loadSpatialVector(blk.mZAVector, lane);
+        const UnAlignedSpatialVector spatialZAInt = loadSpatialVector(blk.mZAIntVector, lane);
+        const UnAlignedSpatialVector parentZA = loadSpatialVector(lk[parent].mZAVector, lane);
+        const UnAlignedSpatialVector parentZAInt = loadSpatialVector(lk[parent].mZAIntVector, lane);
+
+        const UnAlignedSpatialVector Ic = articulatedInertia * coriolis;
+        const UnAlignedSpatialVector ZIcInt = spatialZAInt + Ic;
+        UnAlignedSpatialVector translatedZA = spatialZA;
+        UnAlignedSpatialVector translatedZAInt = ZIcInt;
+
+        const PxReal* jF = extEveryIter ? NULL : (jointForces + jointOffset);
+
+        SpatialMatrix sub(PxZero);
+        apiMirror(blk, dofData, articulatedInertia, jF, spatialZA, ZIcInt, translatedZA,
+                  translatedZAInt, sub, lane);
+        SpatialMatrix spatialInertiaW = articulatedInertia - sub;
+
+        refTranslateSpatialVectorInPlace(rw, translatedZA);
+        refTranslateSpatialVectorInPlace(rw, translatedZAInt);
+        storeSpatialVector(lk[parent].mZAVector, parentZA + translatedZA, lane);
+        storeSpatialVector(lk[parent].mZAIntVector, parentZAInt + translatedZAInt, lane);
+
+        // the CUDA re-loads the two vectors here and never uses them -- dead code,
+        // dropped in the port and in the mirror alike
+
+        refTranslateInertia(refSkewSymmetric(rw.x, rw.y, rw.z), spatialInertiaW);
+
+        float* diag[3] = { &spatialInertiaW.bottomLeft.column0.x,
+                           &spatialInertiaW.bottomLeft.column1.y,
+                           &spatialInertiaW.bottomLeft.column2.z };
+        for (uint32_t c = 0; c < 3; ++c)
+        {
+            const float before = *diag[c];
+            *diag[c] = PxMax(0.f, before);
+            if (f2u(*diag[c]) != f2u(before))
+                ++gClampFires;
+        }
+
+        storeSpatialMatrix(lk[parent].mSpatialArticulatedInertia, lane,
+                           parentInertia + spatialInertiaW);
+    }
+
+    SpatialMatrix inertia;
+    if (ab.mFlags[lane] & PxArticulationFlag::eFIX_BASE)
+        inertia.setZero();
+    else
+    {
+        loadSpatialMatrix(lk[0].mSpatialArticulatedInertia, lane, inertia);
+        inertia = inertia.invertInertia();
+    }
+    storeSpatialMatrix(ab.mInvSpatialArticulatedInertia, lane, inertia);
+}
+
+// Fills one articulation's slice of a link/dof block run.  Shared by both P8.88
+// tests so the topology cannot drift between them.
+static void loopFillBlocks(PxgArticulationBlockLinkData* lk, PxgArticulationBlockDofData* df,
+                           PxgArticulationBlockData& ab, uint32_t k, uint32_t numLinks,
+                           bool fixBase, uint32_t lane)
+{
+    auto v = [&](uint32_t i, uint32_t f) {
+        return (float(k % 17) * 5.0f + float(i) * 2.0f + float(f) + 1.0f) * 0.0625f - 2.0f;
+    };
+
+    ab.mNumLinks[lane] = numLinks;
+    ab.mFlags[lane] = fixBase ? PxU32(PxArticulationFlag::eFIX_BASE) : 0u;
+
+    uint32_t cursor = 0;
+    for (uint32_t i = 0; i < numLinks; ++i)
+    {
+        PxgArticulationBlockLinkData& b = lk[i];
+        const uint8_t dofs = (i == 0) ? 0 : loopDofs(k, i);
+        b.mParents[lane] = loopParent(k, i);
+        b.mDofs[lane] = dofs;
+        b.mJointType[lane] = (i == 0) ? uint8_t(J_FIX) : loopJointType(k, i);
+        b.mJointOffset[lane] = cursor;
+        b.mRw_x[lane] = v(i, 0);
+        b.mRw_y[lane] = v(i, 1);
+        b.mRw_z[lane] = v(i, 2);
+
+        // a dense, non-symmetric articulated inertia, and the three spatial vectors
+        SpatialMatrix m(PxMat33(PxVec3(v(i, 3), v(i, 4), v(i, 5)),
+                                PxVec3(v(i, 6), v(i, 7), v(i, 8)),
+                                PxVec3(v(i, 9), v(i, 10), v(i, 11))),
+                        PxMat33(PxVec3(v(i, 12), v(i, 13), v(i, 14)),
+                                PxVec3(v(i, 15), v(i, 16), v(i, 17)),
+                                PxVec3(v(i, 18), v(i, 19), v(i, 20))),
+                        PxMat33(PxVec3(v(i, 21), v(i, 22), v(i, 23)),
+                                PxVec3(v(i, 24), v(i, 25), v(i, 26)),
+                                PxVec3(v(i, 27), v(i, 28), v(i, 29))));
+        storeSpatialMatrix(b.mSpatialArticulatedInertia, lane, m);
+        storeSpatialVector(b.mCoriolis,
+                           UnAlignedSpatialVector(PxVec3(v(i, 30), v(i, 31), v(i, 32)),
+                                                  PxVec3(v(i, 33), v(i, 34), v(i, 35))), lane);
+        storeSpatialVector(b.mZAVector,
+                           UnAlignedSpatialVector(PxVec3(v(i, 36), v(i, 37), v(i, 38)),
+                                                  PxVec3(v(i, 39), v(i, 40), v(i, 41))), lane);
+        storeSpatialVector(b.mZAIntVector,
+                           UnAlignedSpatialVector(PxVec3(v(i, 42), v(i, 43), v(i, 44)),
+                                                  PxVec3(v(i, 45), v(i, 46), v(i, 47))), lane);
+
+        for (uint32_t dd = 0; dd < dofs; ++dd)
+        {
+            PxgArticulationBlockDofData& d = df[cursor + dd];
+            storeSpatialVector(d.mWorldMotionMatrix,
+                               UnAlignedSpatialVector(
+                                   PxVec3(v(i, 50 + dd * 6 + 0), v(i, 50 + dd * 6 + 1),
+                                          v(i, 50 + dd * 6 + 2)),
+                                   PxVec3(v(i, 50 + dd * 6 + 3), v(i, 50 + dd * 6 + 4),
+                                          v(i, 50 + dd * 6 + 5))),
+                               lane);
+            d.mConstraintData.mArmature[lane] = 0.25f + 0.125f * float((k + i + dd) % 5);
+        }
+        cursor += dofs;
+    }
+}
+
+static const uint32_t LOOP_LANES = 6;
+static const uint32_t LMAX_LINKS = 7;    // > every per-lane link count
+static const uint32_t LMAX_DOFS = 11;
+static const uint32_t LOOP_JF_PER_LANE = 8;
+
+PXG_TEST(artiArticulatedInertia)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        // { u64 x4, u32 x4 } -> 48 bytes
+        { "npArtiPropagateInertia.spv", "artiArticulatedInertia", 48u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &artiPropagateLoader);
+
+    // link counts 1..6, all distinct and none equal to LMAX_LINKS; the base is
+    // fixed on half of them so both root branches run
+    const uint32_t NUM_LINKS[LOOP_LANES] = { 1, 2, 3, 4, 5, 6 };
+    const bool FIX_BASE[LOOP_LANES] = { true, false, true, false, true, false };
+
+    uint32_t seenType[6] = { 0, 0, 0, 0, 0, 0 };
+    for (uint32_t L = 0; L < LOOP_LANES; ++L)
+    {
+        PXG_CHECK_MSG(loopTotalDofs(L, NUM_LINKS[L]) <= LMAX_DOFS,
+                      "lane %u needs %u dofs, LMAX_DOFS is %u", L, loopTotalDofs(L, NUM_LINKS[L]),
+                      LMAX_DOFS);
+        for (uint32_t i = 1; i < NUM_LINKS[L]; ++i)
+            seenType[loopJointType(L, i)] += 1u;
+    }
+    std::printf("[ info ] loop joint types seen: fix %u pris %u rev %u revU %u sph %u\n",
+                seenType[J_FIX], seenType[J_PRISMATIC], seenType[J_REVOLUTE],
+                seenType[J_REVOLUTE_UNWRAPPED], seenType[J_SPHERICAL]);
+    for (uint32_t t = 0; t < 5; ++t)
+        PXG_CHECK_MSG(seenType[t] > 0, "joint type %u never occurs in the loop fixture", t);
+
+    std::vector<PxgArticulationBlockLinkData> lkImg(LMAX_LINKS);
+    std::vector<PxgArticulationBlockDofData> dfImg(LMAX_DOFS);
+    std::vector<PxgArticulationBlockData> abImg(1);
+    std::memset(lkImg.data(), 0xAB, lkImg.size() * sizeof(PxgArticulationBlockLinkData));
+    std::memset(dfImg.data(), 0xAB, dfImg.size() * sizeof(PxgArticulationBlockDofData));
+    std::memset(abImg.data(), 0xAB, abImg.size() * sizeof(PxgArticulationBlockData));
+    for (uint32_t L = 0; L < LOOP_LANES; ++L)
+        loopFillBlocks(lkImg.data(), dfImg.data(), abImg[0], L, NUM_LINKS[L], FIX_BASE[L], L);
+
+    std::vector<float> jointForces(size_t(LOOP_LANES) * LOOP_JF_PER_LANE);
+    for (size_t j = 0; j < jointForces.size(); ++j)
+        jointForces[j] = 0.375f * float(j % 11) - 1.25f;
+
+    PxgDevicePtr dLk = 0, dDf = 0, dAb = 0, dJf = 0;
+    shim.memAlloc(&dLk, lkImg.size() * sizeof(PxgArticulationBlockLinkData));
+    shim.memAlloc(&dDf, dfImg.size() * sizeof(PxgArticulationBlockDofData));
+    shim.memAlloc(&dAb, abImg.size() * sizeof(PxgArticulationBlockData));
+    shim.memAlloc(&dJf, jointForces.size() * sizeof(float));
+    if (!dLk || !dDf || !dAb || !dJf)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+    shim.memcpyHtoD(dJf, jointForces.data(), jointForces.size() * sizeof(float));
+
+    size_t bad = 0, signedZeros = 0;
+    gClampFires = 0;
+
+    for (uint32_t pass = 0; pass < 2; ++pass)
+    {
+        const bool extEveryIter = (pass == 1);
+
+        shim.memcpyHtoD(dLk, lkImg.data(), lkImg.size() * sizeof(PxgArticulationBlockLinkData));
+        shim.memcpyHtoD(dDf, dfImg.data(), dfImg.size() * sizeof(PxgArticulationBlockDofData));
+        shim.memcpyHtoD(dAb, abImg.data(), abImg.size() * sizeof(PxgArticulationBlockData));
+
+        std::vector<PxgArticulationBlockLinkData> wantLk = lkImg;
+        std::vector<PxgArticulationBlockDofData> wantDf = dfImg;
+        std::vector<PxgArticulationBlockData> wantAb = abImg;
+        for (uint32_t L = 0; L < LOOP_LANES; ++L)
+            apiLoopMirror(wantLk.data(), wantDf.data(), wantAb[0],
+                          jointForces.data() + size_t(L) * LOOP_JF_PER_LANE, extEveryIter,
+                          NUM_LINKS[L], L);
+
+        struct Params
+        {
+            uint64_t linkBlocks, dofBlocks, artiBlock, jointForces;
+            uint32_t nbLanes, extEveryIter, pad0, pad1;
+        } prm = { uint64_t(dLk), uint64_t(dDf),  uint64_t(dAb),          uint64_t(dJf),
+                  LOOP_LANES,    extEveryIter ? 1u : 0u, 0u, 0u };
+        PXG_CHECK_MSG(sizeof(prm) == 48, "push-constant blob is %zu bytes", sizeof(prm));
+
+        PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                      "launch artiArticulatedInertia");
+        shim.streamSynchronize();
+
+        std::vector<PxgArticulationBlockLinkData> gotLk(lkImg.size());
+        std::vector<PxgArticulationBlockDofData> gotDf(dfImg.size());
+        std::vector<PxgArticulationBlockData> gotAb(abImg.size());
+        shim.memcpyDtoH(gotLk.data(), dLk, gotLk.size() * sizeof(PxgArticulationBlockLinkData));
+        shim.memcpyDtoH(gotDf.data(), dDf, gotDf.size() * sizeof(PxgArticulationBlockDofData));
+        shim.memcpyDtoH(gotAb.data(), dAb, gotAb.size() * sizeof(PxgArticulationBlockData));
+
+        auto cmp = [&](const char* what, const void* wp, const void* gp, size_t bytes) {
+            const uint32_t* w = reinterpret_cast<const uint32_t*>(wp);
+            const uint32_t* g = reinterpret_cast<const uint32_t*>(gp);
+            for (size_t x = 0; x < bytes / 4; ++x)
+            {
+                if (w[x] == g[x])
+                    continue;
+                if ((w[x] == 0u && g[x] == 0x80000000u) || (w[x] == 0x80000000u && g[x] == 0u))
+                {
+                    ++signedZeros;
+                    continue;
+                }
+                if (bad < 12)
+                    std::printf("MM pass %u %s word %zu  ref %08x  gpu %08x\n", pass, what, x,
+                                w[x], g[x]);
+                ++bad;
+            }
+        };
+        cmp("link", wantLk.data(), gotLk.data(),
+            wantLk.size() * sizeof(PxgArticulationBlockLinkData));
+        cmp("dof", wantDf.data(), gotDf.data(), wantDf.size() * sizeof(PxgArticulationBlockDofData));
+        cmp("arti", wantAb.data(), gotAb.data(), wantAb.size() * sizeof(PxgArticulationBlockData));
+    }
+
+    std::printf("[ info ] loop: clamp fired %zu times, signed zeros forgiven %zu\n", gClampFires,
+                signedZeros);
+    PXG_CHECK_MSG(gClampFires > 0,
+                  "PxMax(0, .) must actually clamp something, or the guard is untested");
+    PXG_CHECK_MSG(bad == 0, "the leaf-to-root sweep matches the engine-built mirror");
+
+    shim.memFree(dLk);
+    shim.memFree(dDf);
+    shim.memFree(dAb);
+    shim.memFree(dJf);
+}
+
+// ===========================================================================
+// P8.88b: computeUnconstrainedSpatialInertiaLaunch1T -- the kernel
+// ===========================================================================
+//
+// The index chain of P8.85's wrapper with three differences, each a mutant:
+//
+//  1. **Block (32, 1, 1) and grid `num1TBlocks * 2`** — one warp per block, twice
+//     the blocks.  The fixture uses 130 articulations, so `num1TBlocks` is 3 and
+//     the grid is 6; a port that reuses the partial kernel's warps-per-block of 2
+//     visits warp slices 0, 2, 4 only and leaves 1 and 3 poisoned.
+//  2. **`numLinks` comes from the BLOCK**, not the record — the opposite of P8.85.
+//     The records here carry a *different* link count so the two disagree.
+//  3. It hands the loop `articulation.jointForce`, the record pointer, which the
+//     loop then offsets per link by that link's own `jointOffset`.
+
+static const uint32_t WNB_ARTI = 130;
+static const uint32_t WWARPS_ALLOC = 7;   // five carry work, two stay poison
+static const uint32_t WMAX_LINKS = 8;     // > every per-articulation link count
+static const uint32_t WMAX_DOFS = 12;
+static const uint32_t WJF_SLOTS = 16;     // per articulation, > any total dof count
+
+PXG_TEST(artiArticulatedInertiaLaunch)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        // engine ABI { 8 } -- the descriptor pointer alone
+        { "npArtiPropagateInertia.spv", "computeUnconstrainedSpatialInertiaLaunch1T", 8u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &artiPropagateLoader);
+
+    // link counts 1..6, never equal to the lane index and never WMAX_LINKS
+    auto numLinksOf = [](uint32_t k) { return 1u + ((k * 5u) % 6u); };
+    auto fixBaseOf = [](uint32_t k) { return (k % 3u) == 1u; };
+
+    // ---- the index chain: three hops, none of them the identity ----
+    const uint32_t ARTI_OFFSET = 5;
+    const uint32_t ISLAND_SLOTS = ARTI_OFFSET + WNB_ARTI + 3;
+    const uint32_t BODY_SIM_SLOTS = 192;
+    std::vector<uint32_t> NODE(WNB_ARTI), POOL(WNB_ARTI);
+    for (uint32_t k = 0; k < WNB_ARTI; ++k)
+    {
+        NODE[k] = (k * 7u + 11u) % BODY_SIM_SLOTS;
+        POOL[k] = (k + 13u) % WNB_ARTI;
+    }
+
+    std::vector<PxNodeIndex> island(ISLAND_SLOTS);
+    for (uint32_t i = 0; i < ISLAND_SLOTS; ++i)
+        island[i] = PxNodeIndex(0x0BAD00u + i);
+    for (uint32_t k = 0; k < WNB_ARTI; ++k)
+        island[ARTI_OFFSET + k] = PxNodeIndex(NODE[k]);
+
+    std::vector<PxgBodySim> bodySims(BODY_SIM_SLOTS);
+    std::memset(bodySims.data(), 0xEE, bodySims.size() * sizeof(PxgBodySim));
+    for (uint32_t i = 0; i < BODY_SIM_SLOTS; ++i)
+        bodySims[i].articulationRemapId = 0xDEAD0000u + i;
+    for (uint32_t k = 0; k < WNB_ARTI; ++k)
+        bodySims[NODE[k]].articulationRemapId = POOL[k];
+
+    // ---- the block images, one warp slice per 32 articulations ----
+    std::vector<PxgArticulationBlockLinkData> lkImg(size_t(WWARPS_ALLOC) * WMAX_LINKS);
+    std::vector<PxgArticulationBlockDofData> dfImg(size_t(WWARPS_ALLOC) * WMAX_DOFS);
+    std::vector<PxgArticulationBlockData> abImg(WWARPS_ALLOC);
+    std::memset(lkImg.data(), 0xAB, lkImg.size() * sizeof(PxgArticulationBlockLinkData));
+    std::memset(dfImg.data(), 0xAB, dfImg.size() * sizeof(PxgArticulationBlockDofData));
+    std::memset(abImg.data(), 0xAB, abImg.size() * sizeof(PxgArticulationBlockData));
+    for (uint32_t k = 0; k < WNB_ARTI; ++k)
+    {
+        const uint32_t warp = k / 32u, lane = k % 32u;
+        PXG_CHECK_MSG(loopTotalDofs(k, numLinksOf(k)) <= WMAX_DOFS,
+                      "articulation %u needs %u dofs", k, loopTotalDofs(k, numLinksOf(k)));
+        loopFillBlocks(lkImg.data() + size_t(warp) * WMAX_LINKS,
+                       dfImg.data() + size_t(warp) * WMAX_DOFS, abImg[warp], k, numLinksOf(k),
+                       fixBaseOf(k), lane);
+    }
+
+    std::vector<float> jointForces(size_t(WNB_ARTI) * WJF_SLOTS);
+    for (size_t j = 0; j < jointForces.size(); ++j)
+        jointForces[j] = 0.375f * float(j % 11) - 1.25f;
+
+    PxgDevicePtr dIsland = 0, dBodySims = 0, dDesc = 0, dArtis = 0, dJf = 0;
+    PxgDevicePtr dLk = 0, dDf = 0, dAb = 0;
+    shim.memAlloc(&dIsland, island.size() * sizeof(PxNodeIndex));
+    shim.memAlloc(&dBodySims, bodySims.size() * sizeof(PxgBodySim));
+    shim.memAlloc(&dDesc, sizeof(PxgArticulationCoreDesc));
+    shim.memAlloc(&dArtis, size_t(WNB_ARTI) * sizeof(PxgArticulation));
+    shim.memAlloc(&dJf, jointForces.size() * sizeof(float));
+    shim.memAlloc(&dLk, lkImg.size() * sizeof(PxgArticulationBlockLinkData));
+    shim.memAlloc(&dDf, dfImg.size() * sizeof(PxgArticulationBlockDofData));
+    shim.memAlloc(&dAb, abImg.size() * sizeof(PxgArticulationBlockData));
+    if (!dIsland || !dBodySims || !dDesc || !dArtis || !dJf || !dLk || !dDf || !dAb)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+
+    // The records carry a DIFFERENT link count from the blocks, so a port that
+    // reads the record (P8.85's rule) rather than the block is wrong immediately.
+    std::vector<PxgArticulation> recs(WNB_ARTI);
+    std::memset(recs.data(), 0, recs.size() * sizeof(PxgArticulation));
+    for (uint32_t k = 0; k < WNB_ARTI; ++k)
+    {
+        PxgArticulation& r = recs[POOL[k]];
+        r.data.numLinks = PxU16(0xFEE0u + k);   // never a plausible link count
+        r.jointForce = reinterpret_cast<PxReal*>(
+            dJf + PxgDevicePtr(size_t(k) * WJF_SLOTS * sizeof(float)));
+    }
+    shim.memcpyHtoD(dIsland, island.data(), island.size() * sizeof(PxNodeIndex));
+    shim.memcpyHtoD(dBodySims, bodySims.data(), bodySims.size() * sizeof(PxgBodySim));
+    shim.memcpyHtoD(dArtis, recs.data(), recs.size() * sizeof(PxgArticulation));
+    shim.memcpyHtoD(dJf, jointForces.data(), jointForces.size() * sizeof(float));
+
+    size_t bad = 0, signedZeros = 0;
+
+    for (uint32_t pass = 0; pass < 2; ++pass)
+    {
+        const bool extEveryIter = (pass == 1);
+
+        shim.memcpyHtoD(dLk, lkImg.data(), lkImg.size() * sizeof(PxgArticulationBlockLinkData));
+        shim.memcpyHtoD(dDf, dfImg.data(), dfImg.size() * sizeof(PxgArticulationBlockDofData));
+        shim.memcpyHtoD(dAb, abImg.data(), abImg.size() * sizeof(PxgArticulationBlockData));
+
+        // 0x5A everywhere first, so the three padding bytes after the one-byte
+        // bool at 68 are NOT zero -- a word read there is then caught rather than
+        // merely lucky.
+        PxgArticulationCoreDesc desc;
+        std::memset(&desc, 0x5A, sizeof(desc));
+        desc.mBodySimBufferDeviceData = reinterpret_cast<PxgBodySim*>(dBodySims);
+        desc.islandNodeIndices = reinterpret_cast<PxNodeIndex*>(dIsland);
+        desc.articulations = reinterpret_cast<PxgArticulation*>(dArtis);
+        desc.articulationOffset = ARTI_OFFSET;
+        desc.nbArticulations = WNB_ARTI;
+        desc.isExternalForcesEveryTgsIterationEnabled = extEveryIter;
+        desc.mArticulationBlocks = reinterpret_cast<PxgArticulationBlockData*>(dAb);
+        desc.mArticulationLinkBlocks = reinterpret_cast<PxgArticulationBlockLinkData*>(dLk);
+        desc.mArticulationDofBlocks = reinterpret_cast<PxgArticulationBlockDofData*>(dDf);
+        desc.mMaxLinksPerArticulation = WMAX_LINKS;
+        desc.mMaxDofsPerArticulation = WMAX_DOFS;
+        shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
+
+        std::vector<PxgArticulationBlockLinkData> wantLk = lkImg;
+        std::vector<PxgArticulationBlockDofData> wantDf = dfImg;
+        std::vector<PxgArticulationBlockData> wantAb = abImg;
+        for (uint32_t k = 0; k < WNB_ARTI; ++k)
+        {
+            const uint32_t warp = k / 32u, lane = k % 32u;
+            apiLoopMirror(wantLk.data() + size_t(warp) * WMAX_LINKS,
+                          wantDf.data() + size_t(warp) * WMAX_DOFS, wantAb[warp],
+                          jointForces.data() + size_t(k) * WJF_SLOTS, extEveryIter,
+                          numLinksOf(k), lane);
+        }
+
+        struct Params { uint64_t desc; } prm = { uint64_t(dDesc) };
+        const uint32_t num1TBlocks = (WNB_ARTI + 63u) / 64u;
+        PXG_CHECK_MSG(num1TBlocks == 3u, "fixture assumes three 1T blocks, got %u", num1TBlocks);
+        // block (32, 1, 1) and TWICE the blocks -- not the partial kernel's shape
+        PXG_CHECK_MSG(shim.launchKernel(0, num1TBlocks * 2u, 1, 1, &prm, sizeof(prm))
+                          == PxgResult::Success,
+                      "launch computeUnconstrainedSpatialInertiaLaunch1T");
+        shim.streamSynchronize();
+
+        std::vector<PxgArticulationBlockLinkData> gotLk(lkImg.size());
+        std::vector<PxgArticulationBlockDofData> gotDf(dfImg.size());
+        std::vector<PxgArticulationBlockData> gotAb(abImg.size());
+        shim.memcpyDtoH(gotLk.data(), dLk, gotLk.size() * sizeof(PxgArticulationBlockLinkData));
+        shim.memcpyDtoH(gotDf.data(), dDf, gotDf.size() * sizeof(PxgArticulationBlockDofData));
+        shim.memcpyDtoH(gotAb.data(), dAb, gotAb.size() * sizeof(PxgArticulationBlockData));
+
+        auto cmp = [&](const char* what, const void* wp, const void* gp, size_t bytes) {
+            const uint32_t* w = reinterpret_cast<const uint32_t*>(wp);
+            const uint32_t* g = reinterpret_cast<const uint32_t*>(gp);
+            for (size_t x = 0; x < bytes / 4; ++x)
+            {
+                if (w[x] == g[x])
+                    continue;
+                if ((w[x] == 0u && g[x] == 0x80000000u) || (w[x] == 0x80000000u && g[x] == 0u))
+                {
+                    ++signedZeros;
+                    continue;
+                }
+                if (bad < 12)
+                    std::printf("MM pass %u %s word %zu  ref %08x  gpu %08x\n", pass, what, x,
+                                w[x], g[x]);
+                ++bad;
+            }
+        };
+        cmp("link", wantLk.data(), gotLk.data(),
+            wantLk.size() * sizeof(PxgArticulationBlockLinkData));
+        cmp("dof", wantDf.data(), gotDf.data(), wantDf.size() * sizeof(PxgArticulationBlockDofData));
+        cmp("arti", wantAb.data(), gotAb.data(), wantAb.size() * sizeof(PxgArticulationBlockData));
+    }
+
+    std::printf("[ info ] launch: signed zeros forgiven %zu\n", signedZeros);
+    PXG_CHECK_MSG(bad == 0, "the wrapper's whole block image matches the mirror");
+
+    shim.memFree(dIsland);
+    shim.memFree(dBodySims);
+    shim.memFree(dDesc);
+    shim.memFree(dArtis);
+    shim.memFree(dJf);
+    shim.memFree(dLk);
+    shim.memFree(dDf);
+    shim.memFree(dAb);
 }
 
 }  // namespace

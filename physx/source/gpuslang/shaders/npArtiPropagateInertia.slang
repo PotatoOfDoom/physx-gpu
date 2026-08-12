@@ -135,6 +135,7 @@
 // convention is written down once instead of being re-derived at each use.
 
 import pxgSlangCommon;
+import pxgSlangArticulationDesc;
 import pxgSlangArticulationBlocks;
 import pxgSlangSpatialMatrix;
 
@@ -490,4 +491,269 @@ void artiPropagateInertia(uint3 groupThreadId : SV_GroupThreadID)
     apiStoreM33(s, 33u, r.topRight);
     apiStoreM33(s, 42u, r.bottomLeft);
     s[51] = float(dofs);
+}
+
+// ===========================================================================
+// P8.88: computeArticulatedSpatialInertiaW (forwardDynamic2.cu:1580-1663)
+// ===========================================================================
+//
+// The leaf-to-root sweep.  Every link from the last back to (but not including)
+// the root reduces its own articulated inertia by the term the function above
+// returns, translates the remainder into the parent's frame, and ACCUMULATES it —
+// along with the two zero-acceleration force vectors — into the parent.  Then the
+// root is inverted, or zeroed if the base is fixed.
+//
+// ---------------------------------------------------------------------------
+// STRICTLY SEQUENTIAL, AND THE READS COME FIRST
+// ---------------------------------------------------------------------------
+//
+// The loop is a genuine dependency chain: a link's own inertia was already
+// increased by its children in earlier iterations, which is why `parents[linkID] <
+// linkID` is the invariant that makes the single descending pass correct.  No
+// reordering, no parallelising over links.
+//
+// Every parent field is loaded at the TOP of the iteration, before anything is
+// written.  With a strictly sequential loop that is the same as loading at the
+// store, but only by luck — a port that re-loads at the store is right for the
+// wrong reason, so the order is kept.
+//
+// The CUDA re-loads the parent's two ZA vectors immediately AFTER storing them
+// (`pSpatialZA`, `pspatialZAInt`) and never uses either result.  That is dead
+// code and the port drops it rather than transcribing a load nobody reads.
+//
+// ---------------------------------------------------------------------------
+// THE CLAMP IS PxMax, NOT max
+// ---------------------------------------------------------------------------
+//
+// `PxMax(0.f, x)` is `a < b ? b : a` (PxMath.h), i.e. `0 < x ? x : 0` — which
+// returns 0 for a NaN, because the comparison is false.  Slang's `max` lowers to
+// `OpFMax`, whose NaN behaviour is the other way round on most drivers.  The
+// engine's spelling is kept verbatim.
+//
+// It exists because a propagated inertia can go slightly negative on the
+// principal axes through rounding, and a negative diagonal there makes the root
+// inverse meaningless.
+
+// PxMax(a, b) -- PxMath.h's `a < b ? b : a`, not the intrinsic
+float apiPxMax(float a, float b)
+{
+    return (a < b) ? b : a;
+}
+
+public void apiComputeArticulatedSpatialInertiaW(uint numLinks, uint64_t linkBlocks,
+                                                 uint64_t dofBlocks, uint64_t artiBlock,
+                                                 uint64_t jointForces, bool extEveryIter,
+                                                 uint lane)
+{
+    for (uint linkID = numLinks - 1u; linkID > 0u; --linkID)
+    {
+        const uint64_t blk = linkBlocks + uint64_t(linkID) * PXG_AB_LINK_SIZE;
+
+        const uint parent = abU32(blk, PXG_AB_LINK_mParents, lane);
+        const uint dof = abU8(blk, PXG_AB_LINK_mDofs, lane);
+        const uint jointOffset = abU32(blk, PXG_AB_LINK_mJointOffset, lane);
+
+        const float3 rw = float3(abF32(blk, PXG_AB_LINK_mRw_x, lane),
+                                 abF32(blk, PXG_AB_LINK_mRw_y, lane),
+                                 abF32(blk, PXG_AB_LINK_mRw_z, lane));
+
+        const uint64_t dofData = dofBlocks + uint64_t(jointOffset) * PXG_AB_DOF_SIZE;
+        const uint64_t pblk = linkBlocks + uint64_t(parent) * PXG_AB_LINK_SIZE;
+
+        // ALL of the parent's state, read before anything is written
+        const AbSpatialMatrix parentInertia =
+            asmLoadSpatialMatrix(pblk, PXG_AB_LINK_mSpatialArticulatedInertia, lane);
+        const AbSpatialMatrix articulatedInertia =
+            asmLoadSpatialMatrix(blk, PXG_AB_LINK_mSpatialArticulatedInertia, lane);
+
+        float3 t, b;
+        abLoadSpatialVector(blk, PXG_AB_LINK_mCoriolis, lane, t, b);
+        const AbSpatialVector coriolis = asmSVec(t, b);
+        abLoadSpatialVector(blk, PXG_AB_LINK_mZAVector, lane, t, b);
+        const AbSpatialVector spatialZA = asmSVec(t, b);
+        abLoadSpatialVector(blk, PXG_AB_LINK_mZAIntVector, lane, t, b);
+        const AbSpatialVector spatialZAInt = asmSVec(t, b);
+        abLoadSpatialVector(pblk, PXG_AB_LINK_mZAVector, lane, t, b);
+        const AbSpatialVector parentZA = asmSVec(t, b);
+        abLoadSpatialVector(pblk, PXG_AB_LINK_mZAIntVector, lane, t, b);
+        const AbSpatialVector parentZAInt = asmSVec(t, b);
+
+        const AbSpatialVector Ic = asmMulVec(articulatedInertia, coriolis);
+        const AbSpatialVector ZIcInt = asmSVecAdd(spatialZAInt, Ic);
+
+        // the two inout seeds the per-dof function accumulates onto
+        AbSpatialVector translatedZA = spatialZA;
+        AbSpatialVector translatedZAInt = ZIcInt;
+
+        // NULL when the external forces are applied every TGS iteration
+        const uint64_t jF = extEveryIter ? 0 : (jointForces + uint64_t(jointOffset) * 4);
+
+        // the CUDA leaves msIs uninitialised; nothing reads an entry at or beyond
+        // `dof`, and the seed here is deliberately not zero so that a dropped guard
+        // inside apiComputeIs / the propagate shows up as a wrong number
+        AbSpatialVector msIs[3];
+        for (uint k = 0u; k < 3u; ++k)
+        {
+            const float p = 900.0f + float(lane) * 11.0f + float(linkID) * 7.0f + float(k) * 3.0f;
+            msIs[k] = asmSVec(float3(p + 0.0f, p + 1.0f, p + 2.0f),
+                              float3(p + 3.0f, p + 4.0f, p + 5.0f));
+        }
+
+        apiComputeIs(dof, articulatedInertia, dofData, lane, msIs);
+
+        AbSpatialMatrix spatialInertiaW =
+            asmSub(articulatedInertia,
+                   apiPropagateSpatialInertiaZaZIc(blk, dofData, msIs, jF, spatialZA, ZIcInt,
+                                                   translatedZA, translatedZAInt, lane));
+
+        // shift the children's accumulated zero-acceleration forces to the parent
+        asmTranslateSpatialVectorInPlace(rw, translatedZA);
+        asmTranslateSpatialVectorInPlace(rw, translatedZAInt);
+
+        const AbSpatialVector newParentZA = asmSVecAdd(parentZA, translatedZA);
+        const AbSpatialVector newParentZAInt = asmSVecAdd(parentZAInt, translatedZAInt);
+        abStoreSpatialVector(pblk, PXG_AB_LINK_mZAVector, lane,
+                             newParentZA.top, newParentZA.bottom);
+        abStoreSpatialVector(pblk, PXG_AB_LINK_mZAIntVector, lane,
+                             newParentZAInt.top, newParentZAInt.bottom);
+
+        // and the inertia, into the parent's frame
+        asmTranslateInertia(asmSkewSymmetric(float4(rw.x, rw.y, rw.z, 0.0f)), spatialInertiaW);
+
+        // do not propagate a negative inertia about a principal axis
+        spatialInertiaW.bottomLeft.c0.x = apiPxMax(0.0f, spatialInertiaW.bottomLeft.c0.x);
+        spatialInertiaW.bottomLeft.c1.y = apiPxMax(0.0f, spatialInertiaW.bottomLeft.c1.y);
+        spatialInertiaW.bottomLeft.c2.z = apiPxMax(0.0f, spatialInertiaW.bottomLeft.c2.z);
+
+        asmStoreSpatialMatrix(pblk, PXG_AB_LINK_mSpatialArticulatedInertia, lane,
+                              asmAdd(parentInertia, spatialInertiaW));
+    }
+
+    // the root: a fixed base has no free acceleration at all, so its inverse
+    // articulated inertia is ZERO rather than the inverse of anything
+    AbSpatialMatrix inertia;
+    const uint flags = abU32(artiBlock, PXG_AB_mFlags, lane);
+    if ((flags & PXG_ARTI_FLAG_FIX_BASE) != 0u)
+        inertia = asmMatrixZero();
+    else
+        inertia = asmInvertInertia(
+            asmLoadSpatialMatrix(linkBlocks, PXG_AB_LINK_mSpatialArticulatedInertia, lane));
+
+    asmStoreSpatialMatrix(artiBlock, PXG_AB_mInvSpatialArticulatedInertia, lane, inertia);
+}
+
+// ===========================================================================
+// P8.88: computeUnconstrainedSpatialInertiaLaunch1T (forwardDynamic2.cu:1667)
+// ===========================================================================
+//
+// The same index chain as P8.85's wrapper with THREE differences, each a mutant:
+//
+//  1. **Block (32, 1, 1) and TWICE the grid.**  One warp per block, not two.
+//     P8.85 left `ASI_WARPS_PER_BLOCK` per-kernel for exactly this; reusing 2 here
+//     halves the articulations that get processed.
+//  2. **`numLinks` comes from the BLOCK** — `articulationBlocks->mNumLinks[lane]`
+//     — which is the OPPOSITE of P8.85, where it comes from the record.
+//  3. It passes `articulation.jointForce`, the record pointer, which the loop then
+//     offsets per link by that link's `jointOffset`.
+
+struct ApiLaunchParams
+{
+    uint64_t scDesc;   // @0  PxgArticulationCoreDesc*
+};
+
+[[vk::push_constant]]
+ConstantBuffer<ApiLaunchParams> gApiLaunch;
+
+// ONE warp per block -- deliberately not shared with npArtiSpatialInertia's 2
+static const uint API_WARPS_PER_BLOCK = 1u;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void computeUnconstrainedSpatialInertiaLaunch1T(uint3 groupThreadId : SV_GroupThreadID,
+                                                uint3 groupId : SV_GroupID)
+{
+    const uint64_t d = gApiLaunch.scDesc;
+
+    const uint lane = groupThreadId.x & 31u;
+    const uint globalWarpIndex = groupId.x * API_WARPS_PER_BLOCK + groupThreadId.y;
+    const uint globalThreadIndex = globalWarpIndex * 32u + groupThreadId.x;
+
+    const uint nbArticulations = artiU32Field(d, PXG_ARTI_CORE_NB_ARTICULATIONS);
+    if (globalThreadIndex >= nbArticulations)
+        return;
+
+    const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);
+    const uint maxDofs = artiU32Field(d, PXG_ARTI_CORE_MAX_DOFS);
+
+    const uint64_t w = uint64_t(globalWarpIndex);
+    const uint64_t linkBlocks = artiPtrField(d, PXG_ARTI_CORE_LINK_BLOCKS)
+                              + w * uint64_t(maxLinks) * PXG_AB_LINK_SIZE;
+    const uint64_t dofBlocks = artiPtrField(d, PXG_ARTI_CORE_DOF_BLOCKS)
+                             + w * uint64_t(maxDofs) * PXG_AB_DOF_SIZE;
+    const uint64_t artiBlock = artiPtrField(d, PXG_ARTI_CORE_ARTICULATION_BLOCKS)
+                             + w * PXG_AB_BLOCK_SIZE;
+
+    const uint articulationOffset = artiU32Field(d, PXG_ARTI_CORE_ARTICULATION_OFFSET);
+    const uint64_t islandNodeIndices = artiPtrField(d, PXG_ARTI_CORE_ISLAND_NODE_INDICES);
+    const uint2 node = (Ptr<uint2>(islandNodeIndices))[globalThreadIndex + articulationOffset];
+    const uint nodeIndex = nodeIndexIndex(node);
+
+    const uint64_t bodySim = artiPtrField(d, PXG_ARTI_CORE_BODY_SIM_POOL)
+                           + uint64_t(nodeIndex) * PXG_BODY_SIM_SIZE;
+    const uint articulationIndex = artiU32Field(bodySim, PXG_BODY_SIM_ARTICULATION_REMAP_ID);
+
+    // the BLOCK's link count, not the record's
+    const uint numLinks = abU32(artiBlock, PXG_AB_mNumLinks, lane);
+
+    const uint64_t a = artiPtrField(d, PXG_ARTI_CORE_ARTICULATIONS)
+                     + uint64_t(articulationIndex) * PXG_ARTI_STRIDE;
+    const uint64_t jointForces = artiPtrField(a, PXG_ARTI_JOINT_FORCE);
+
+    const bool extEveryIter =
+        artiU8Field(d, PXG_ARTI_CORE_EXTERNAL_FORCES_EVERY_TGS_ITER) != 0u;
+
+    apiComputeArticulatedSpatialInertiaW(numLinks, linkBlocks, dofBlocks, artiBlock, jointForces,
+                                         extEveryIter, lane);
+}
+
+// ---------------------------------------------------------------------------
+// The loop's own test harness entry point
+// ---------------------------------------------------------------------------
+//
+// One articulation per lane, block bases handed in directly, `numLinks` read from
+// the articulation block exactly as the wrapper reads it.  The joint forces are
+// sliced per lane so a lane-stride error there lands on a neighbour's forces.
+
+struct ApiLoopParams
+{
+    uint64_t linkBlocks;    // @0
+    uint64_t dofBlocks;     // @8
+    uint64_t artiBlock;     // @16
+    uint64_t jointForces;   // @24  0 == NULL is NOT used here; the flag below is
+    uint nbLanes;           // @32
+    uint extEveryIter;      // @36
+    uint pad0;              // @40
+    uint pad1;              // @44 -> 48 bytes
+};
+
+[[vk::push_constant]]
+ConstantBuffer<ApiLoopParams> gApiLoop;
+
+static const uint API_LOOP_JF_PER_LANE = 8u;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void artiArticulatedInertia(uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint lane = groupThreadId.x;
+    if (lane >= gApiLoop.nbLanes)
+        return;
+
+    const uint numLinks = abU32(gApiLoop.artiBlock, PXG_AB_mNumLinks, lane);
+
+    apiComputeArticulatedSpatialInertiaW(numLinks, gApiLoop.linkBlocks, gApiLoop.dofBlocks,
+                                         gApiLoop.artiBlock,
+                                         gApiLoop.jointForces
+                                             + uint64_t(lane) * API_LOOP_JF_PER_LANE * 4,
+                                         gApiLoop.extEveryIter != 0u, lane);
 }

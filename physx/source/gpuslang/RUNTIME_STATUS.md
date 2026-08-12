@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **712/712** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **714/714** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,91 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.88 — the articulated-inertia sweep + its kernel — manifest **273**
+
+forwardDynamic2.cu:1580-1697.  The leaf-to-root propagation that reduces each
+link's articulated inertia by P8.87's term, translates the remainder into the
+parent's frame and accumulates it there, then inverts the root — plus
+`computeUnconstrainedSpatialInertiaLaunch1T`, the kernel around it.  Manifest
+272 → **273**; suite 712 → **714**; the engine's unmapped-kernel list **229 →
+228**, and the one that left is this kernel.
+
+**Third tranche in a row with zero new ABI.**  P8.84's delta was four descriptor
+constants, P8.86's and P8.87's were none, and this one's is none either — the
+question the plan posed after P8.84 ("will the rest of the articulation block keep
+needing new address maps?") is answered, and the answer is no.
+
+### What is transcribed rather than tidied
+
+* **The loop is a genuine dependency chain.**  A link's own inertia has already
+  been increased by its children in earlier iterations, which is what makes the
+  single descending pass correct — `parents[linkID] < linkID` is the engine's
+  invariant.  The mutant that runs it root-to-leaf dies, as does the one that skips
+  link 1.
+* **Every parent field is read at the TOP of the iteration**, before anything is
+  written.  A port that re-loads at the store is right *for the wrong reason*; the
+  order is kept, and the tranche note says why the sweep cannot tell them apart.
+* **`PxMax(0.f, x)` is `a < b ? b : a`, not `max`.**  PhysX's spelling returns 0
+  for a NaN because the comparison is false; Slang's `max` lowers to `OpFMax`,
+  whose NaN behaviour is the other way round.  The engine's form is written out.
+  The fixture **asserts the clamp actually fires** — it does, twice — so the guard
+  is exercised rather than merely present.
+* **The CUDA re-loads the parent's two ZA vectors right after storing them and
+  never uses either result.**  Dead code; the port drops it and the mirror drops it
+  too, rather than transcribing a load nobody reads.
+
+### The kernel's three differences from P8.85's wrapper, each a mutant
+
+1. **Block (32, `1`, 1) and grid `num1TBlocks * 2`** — one warp per block, twice
+   the blocks.  `ASI_WARPS_PER_BLOCK` was deliberately left per-kernel in P8.85 for
+   exactly this; the fixture's 130 articulations give `num1TBlocks == 3` and a grid
+   of 6, and the mutant that reuses 2 visits warp slices 0, 2, 4 only.
+2. **`numLinks` comes from the BLOCK**, the opposite of P8.85's record read.  The
+   fixture's records carry `0xFEE0 + k` — never a plausible link count — so the two
+   cannot agree by accident.
+3. It hands the loop the record's `jointForce` pointer, which the loop then offsets
+   **per link by that link's own `jointOffset`**, not by the link index.
+
+### The fixture, and one mirror for three users
+
+`testArtiPropagateInertia.cpp` now holds three tests over ONE transcription of the
+per-dof algebra: `apiMirror` (P8.87), `apiLoopMirror` wrapping it in the CUDA's
+loop, and the two P8.88 tests calling that.  The three `static __device__` helpers
+the engine keeps in forwardDynamic2.cu moved to `tests/pxgArtiRefHelpers.h` so
+P8.86's fixture and this one share them instead of holding a copy each.
+
+The topology is deliberately **not a straight chain**: `loopParent` returns a
+parent `< linkID` that is only equal to `linkID - 1` by coincidence, so a port that
+assumes the obvious chain accumulates into the wrong link.  Joint types cycle
+through all five — asserted, not assumed — so every branch of P8.87's switch runs
+*inside* the loop, and the dof cursor advances by each joint's own dof count.  Link
+counts run 1..6, including the **one-link** case where the loop body never executes
+and only the root inverse runs, and the base is fixed on a third of the
+articulations so both root branches are exercised.
+
+### Sweep 35 of 36
+
+Two mutants did not compile on the first pass — `pblk` and `globalWarpIndex` are
+declared after the lines they were anchored to — and per the standing rule a
+non-compiling mutant is **not** a kill: both were re-anchored to a real hazard (the
+dof count read as a word rather than a byte; the lane taken from the block index)
+and both then died.
+
+**One survivor, proven equivalent:** re-loading the parent's inertia at the store
+instead of reading it at the top.  Nothing between the two writes that field — the
+stores in between are the parent's ZA vectors — and the loop is strictly
+sequential, so the two spellings cannot differ.  It is kept in the read-first form
+because the equivalence depends on the loop's sequencing rather than on anything
+local.
+
+Suite **714/714** in both memory modes, forced-fresh.  All 21 scenes green.  The
+articulation scene completes its 240 steps with no fault under `PXG_SYNC_EACH=1`
+and its refused-kernel list shrinks by exactly this one — **but its two step checks
+still fail, on purpose**: `computeMassMatrix1T` and
+`computeUnconstrainedAccelerationsLaunch1T` are still unmapped, so the acceleration
+that would move the link is still never computed.  The first tranche that can
+change the scene's verdict is the one that lands the last of those.
 
 ## P8.87 — `computeIs` + `computePropagateSpatialInertia_ZA_ZIc`
 
