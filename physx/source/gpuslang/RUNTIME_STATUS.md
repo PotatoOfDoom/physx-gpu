@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **721/721** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **722/722** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,66 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.92b — `computeLinkAcceleration`, and the `+=` association
+
+forwardDynamic2.cu:1931-2316, into `shaders/npArtiLinkAccel.slang`.  Suite 721 →
+**722**; manifest unchanged at **274**; zero new ABI.  The wrapper — the one that
+changes the scene's verdict — is P8.92c.
+
+Five sections, four of which look alike: the root's EXTERNAL acceleration, pass
+one root-to-leaf, the root's INTERNAL acceleration plus the start of the momentum
+bookkeeping, pass two root-to-leaf, and the momentum-conservation tail.
+
+### The two passes are not the same loop, in six places
+
+The port shares one body between them behind an `internal` flag, and the six
+differences are what the flag selects.  Each gets **two** mutants — one collapsing
+the pass onto the other's behaviour in each direction — and all twelve die:
+
+| | pass one | pass two |
+|---|---|---|
+| a | reads the parent's `mMotionAcceleration` | …`mMotionAccelerationInternal` |
+| b | `mQstZ` | `mQstZIcInternal` |
+| c | no Coriolis term | ADDS `mCoriolis` |
+| d | ASSIGNS `mJointAccel` | ADDS to it |
+| e | stores `mMotionAcceleration` | stores `mMotionAccelerationInternal` |
+| f | velocity read at the top of the iteration | re-loaded, and used PRE-update for `preMomentum.bottom` |
+
+And one they share, which is a trap in pass two only: **`jAccel` is taken against
+the PROPAGATED parent acceleration, not against the running accumulator the
+Coriolis term has already moved.**
+
+### What the fixture found: the `+=` association
+
+The first run was off by up to **eight ULP** in the link block, and it was not
+contraction — the module is in `PXG_NOCONTRACT_SHADERS`.  The CUDA writes
+
+```
+preMomentum.bottom += inertia * motionVel.top + offset.cross(...) * mass;
+```
+
+which is `x + (A + B)`: the two new terms associate with **each other** first and
+only then with the accumulator.  The port had `(x + A) + B`, which is the natural
+way to write it and the wrong one.  Two places, both fixed, and both get a mutant
+that restores the wrong association and dies.
+
+### Sweep: 52/54 killed, two proven equivalences
+
+* **Pass one's `motionVelocities[linkID]` write is dead** — pass two loops over
+  exactly the same range and overwrites every slot it touches.  Transcribed
+  anyway: the day pass two stops covering the same links, the engine's version is
+  the one that stays right.  Pass TWO's write is not dead, and for a fixed base it
+  is the only one; removing it dies.
+* **Pass one's starting velocity may be read before or after the propagation** —
+  the propagation writes dof fields and the link's acceleration, never its
+  velocity.  Reading the WRONG link's velocity dies.
+
+Two mutants in the first run came back `SKIPPED` because the `+=` fix had moved
+their anchor text.  Per the standing rule they were recorded as untested and
+re-anchored rather than counted; both then die.
+
+Suite **722/722 in both memory modes**.
 
 ## P8.92a — the bias-force sweep and the parallel-axis theorem
 

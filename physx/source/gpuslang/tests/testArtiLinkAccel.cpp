@@ -85,6 +85,7 @@ using physx::PxQuat;
 using physx::PxReal;
 using physx::PxU32;
 using physx::PxVec3;
+using physx::loadPxVec3;
 using physx::Cm::UnAlignedSpatialVector;
 using physx::Dy::FeatherstoneArticulation;
 using physx::gpuslang::PxgCudaShim;
@@ -422,6 +423,497 @@ PXG_TEST(artiJointFriction)
 
     shim.memFree(dLk);
     shim.memFree(dCounts);
+}
+
+
+// ===========================================================================
+// P8.92b: computeLinkAcceleration
+// ===========================================================================
+//
+// The mirror below follows the CUDA's structure — TWO separate down-sweep loops,
+// written out — deliberately, because the shader shares one body between them
+// behind an `internal` flag.  A mirror that copied the shader's refactor would
+// agree with it whichever of the six differences went wrong.
+//
+// Everything inside is the engine's: `Dy::SpatialMatrix::operator*`,
+// `PxMat33::operator*` on a vector, `PxVec3::cross` and `magnitude`,
+// `translateSpatialVector`, `PxMat33::getInverse`, `refTranslateInertiaMass`, and
+// the engine's own load/store helpers.
+//
+// The fixture's cases, beyond the standing poison discipline:
+//
+//   * fixed-base and free-base articulations in the same warp — for a fixed base
+//     the whole momentum tail is skipped and three root fields are zeroed
+//     instead, so the two paths write DIFFERENT sets of fields;
+//   * link counts 1..6, distinct from the lane index.  A count of 1 is the
+//     degenerate articulation where both down-sweeps have no iterations at all;
+//   * a lane with zero mass and zero isolated inertia, so `postMomentum.bottom`
+//     is exactly zero and the `angRatio` guard fires — and the compound inertia
+//     is singular, so `getInverse` returns the identity;
+//   * `dt` is not 1, so every `x * dt` is observable;
+//   * a per-lane slice of the flat `motionVelocities` array, each with a poisoned
+//     tail, so a write past a lane's own link count lands where it can be seen.
+
+const uint32_t LA_LANES = 19;
+const uint32_t LA_MAX_LINKS = 6;
+const uint32_t LA_MAX_DOFS = 11;      // distinct from MAX_LINKS and from every count
+const uint32_t LA_VEL_SLOTS = 9;      // > LA_MAX_LINKS: an overrun has room to show
+const float LA_DT = 0.03125f;         // not 1
+
+static uint32_t laNumLinks(uint32_t k) { return 1u + ((k * 5u + 2u) % 6u); }
+static bool laFixBase(uint32_t k) { return (k % 4u) == 1u; }
+static bool laMassless(uint32_t k) { return (k % 11u) == 6u; }
+static uint8_t laDofs(uint32_t k, uint32_t i) { return uint8_t(1u + ((k + i) % 3u)); }
+
+static uint32_t laTotalDofs(uint32_t k, uint32_t numLinks)
+{
+    uint32_t t = 0;
+    for (uint32_t i = 1; i < numLinks; ++i)
+        t += laDofs(k, i);
+    return t;
+}
+
+static void laFill(physx::PxgArticulationBlockLinkData* lk, physx::PxgArticulationBlockDofData* df,
+                   physx::PxgArticulationBlockData& ab, uint32_t k, uint32_t numLinks, uint32_t lane)
+{
+    auto v = [&](uint32_t i, uint32_t f) {
+        return (float((k * 23u + i * 13u + f) % 397u) + 1.0f) * 0.01953125f - 3.5f;
+    };
+    const bool massless = laMassless(k);
+
+    ab.mNumLinks[lane] = numLinks;
+    ab.mFlags[lane] = laFixBase(k) ? PxU32(physx::PxArticulationFlag::eFIX_BASE
+                                           | physx::PxArticulationFlag::eDRIVE_LIMITS_ARE_FORCES)
+                                   : PxU32(physx::PxArticulationFlag::eDISABLE_SELF_COLLISION);
+    ab.mCOM_TotalInvMassW[lane] = make_float4(v(0, 90), v(0, 91), v(0, 92), v(0, 93) * 0.1f + 0.4f);
+
+    physx::Dy::SpatialMatrix invInertia(
+        PxMat33(PxVec3(v(0, 1), v(0, 2), v(0, 3)), PxVec3(v(0, 4), v(0, 5), v(0, 6)),
+                PxVec3(v(0, 7), v(0, 8), v(0, 9))),
+        PxMat33(PxVec3(v(0, 10), v(0, 11), v(0, 12)), PxVec3(v(0, 13), v(0, 14), v(0, 15)),
+                PxVec3(v(0, 16), v(0, 17), v(0, 18))),
+        PxMat33(PxVec3(v(0, 19), v(0, 20), v(0, 21)), PxVec3(v(0, 22), v(0, 23), v(0, 24)),
+                PxVec3(v(0, 25), v(0, 26), v(0, 27))));
+    storeSpatialMatrix(ab.mInvSpatialArticulatedInertia, lane, invInertia);
+
+    uint32_t cursor = 0;
+    for (uint32_t i = 0; i < numLinks; ++i)
+    {
+        physx::PxgArticulationBlockLinkData& b = lk[i];
+        const uint8_t dofs = (i == 0) ? uint8_t(0) : laDofs(k, i);
+        b.mParents[lane] = (i == 0) ? 0u : (i - 1u);
+        b.mDofs[lane] = dofs;
+        b.mJointOffset[lane] = cursor;
+        b.mRw_x[lane] = v(i, 30);
+        b.mRw_y[lane] = v(i, 31);
+        b.mRw_z[lane] = v(i, 32);
+        b.mMass[lane] = massless ? 0.f : (v(i, 33) * 0.5f + 3.0f);
+
+        PxMat33 iso(PxVec3(v(i, 34), v(i, 35), v(i, 36)), PxVec3(v(i, 37), v(i, 38), v(i, 39)),
+                    PxVec3(v(i, 40), v(i, 41), v(i, 42)));
+        if (massless)
+            iso = PxMat33(physx::PxZero);
+        storePxMat33(b.mIsolatedInertia, lane, iso);
+
+        b.mAccumulatedPose.p[lane] = make_float4(v(i, 43), v(i, 44), v(i, 45), 0.f);
+        b.mAccumulatedPose.q[lane] = make_float4(0.f, 0.f, 0.f, 1.f);
+
+        storeSpatialVector(b.mMotionVelocity,
+                           UnAlignedSpatialVector(PxVec3(v(i, 46), v(i, 47), v(i, 48)),
+                                                  PxVec3(v(i, 49) * 2.f, v(i, 50) * 2.f,
+                                                         v(i, 51) * 2.f)),
+                           lane);
+        storeSpatialVector(b.mCoriolis,
+                           UnAlignedSpatialVector(PxVec3(v(i, 52), v(i, 53), v(i, 54)),
+                                                  PxVec3(v(i, 55) * 3.f, v(i, 56) * 3.f,
+                                                         v(i, 57) * 3.f)),
+                           lane);
+        storeSpatialVector(b.mZAVector,
+                           UnAlignedSpatialVector(PxVec3(v(i, 58), v(i, 59), v(i, 60)),
+                                                  PxVec3(v(i, 61), v(i, 62), v(i, 63))),
+                           lane);
+        storeSpatialVector(b.mZAIntVector,
+                           UnAlignedSpatialVector(PxVec3(v(i, 64) * 0.25f, v(i, 65) * 0.25f,
+                                                         v(i, 66) * 0.25f),
+                                                  PxVec3(v(i, 67), v(i, 68), v(i, 69))),
+                           lane);
+
+        for (uint32_t dd = 0; dd < dofs; ++dd)
+        {
+            physx::PxgArticulationBlockDofData& d = df[cursor + dd];
+            const uint32_t o = 70 + dd * 20;
+            storeSpatialVector(d.mIsW,
+                               UnAlignedSpatialVector(PxVec3(v(i, o + 0), v(i, o + 1), v(i, o + 2)),
+                                                      PxVec3(v(i, o + 3) * 5.f, v(i, o + 4) * 5.f,
+                                                             v(i, o + 5) * 5.f)),
+                               lane);
+            storeSpatialVector(d.mWorldMotionMatrix,
+                               UnAlignedSpatialVector(PxVec3(v(i, o + 6), v(i, o + 7), v(i, o + 8)),
+                                                      PxVec3(v(i, o + 9) * 7.f, v(i, o + 10) * 7.f,
+                                                             v(i, o + 11) * 7.f)),
+                               lane);
+            // the two per-dof terms, DIFFERENT so neither can stand in for the other
+            d.mQstZ[lane] = v(i, o + 12);
+            d.mQstZIcInternal[lane] = v(i, o + 13) * 4.0f + 1.0f;
+            d.mJointVelocities[lane] = v(i, o + 14);
+            // seeded NON-ZERO: pass one ASSIGNS this, pass two ADDS to it
+            d.mJointAccel[lane] = v(i, o + 15) * 9.0f;
+            d.mJointUnconstrainedVelocities[lane] = v(i, o + 16) * 13.0f;
+            d.mInvStIsT_x[lane] = v(i, o + 17);
+            d.mInvStIsT_y[lane] = v(i, o + 18);
+            d.mInvStIsT_z[lane] = v(i, o + 19);
+        }
+        cursor += dofs;
+    }
+}
+
+// The CUDA's structure, the engine's arithmetic.  `flatVel` is this lane's slice
+// of the flat motion-velocity array.
+static void laMirror(physx::PxgArticulationBlockLinkData* lk,
+                     physx::PxgArticulationBlockDofData* df, physx::PxgArticulationBlockData& ab,
+                     UnAlignedSpatialVector* flatVel, uint32_t numLinks, float dt, uint32_t lane)
+{
+    const bool fixBase = (ab.mFlags[lane] & PxU32(physx::PxArticulationFlag::eFIX_BASE)) != 0;
+    const float4 COM_invMassW = ab.mCOM_TotalInvMassW[lane];
+    const PxVec3 COM(COM_invMassW.x, COM_invMassW.y, COM_invMassW.z);
+
+    UnAlignedSpatialVector preMomentum(PxVec3(0.f), PxVec3(0.f));
+    UnAlignedSpatialVector postMomentum(PxVec3(0.f), PxVec3(0.f));
+    PxMat33 compoundInertia(physx::PxZero);
+
+    if (!fixBase)
+    {
+        physx::Dy::SpatialMatrix invInertia;
+        loadSpatialMatrix(ab.mInvSpatialArticulatedInertia, lane, invInertia);
+        const UnAlignedSpatialVector za = loadSpatialVector(lk[0].mZAVector, lane);
+        const UnAlignedSpatialVector accel = -(invInertia * za);
+        storeSpatialVector(lk[0].mMotionAcceleration, accel, lane);
+        const UnAlignedSpatialVector motionVel =
+            loadSpatialVector(lk[0].mMotionVelocity, lane) + accel * dt;
+        const PxReal mass = lk[0].mMass[lane];
+        preMomentum.top = motionVel.bottom * mass;
+        storeSpatialVector(lk[0].mMotionVelocity, motionVel, lane);
+    }
+    else
+    {
+        storeSpatialVector(lk[0].mMotionAcceleration, UnAlignedSpatialVector::Zero(), lane);
+        storeSpatialVector(lk[0].mMotionAccelerationInternal, UnAlignedSpatialVector::Zero(), lane);
+        storeSpatialVector(lk[0].mMotionVelocity, UnAlignedSpatialVector::Zero(), lane);
+        flatVel[0] = UnAlignedSpatialVector::Zero();
+    }
+
+    for (uint32_t linkID = 1; linkID < numLinks; ++linkID)
+    {
+        physx::PxgArticulationBlockLinkData& tLink = lk[linkID];
+        physx::PxgArticulationBlockDofData* tDofs = df + tLink.mJointOffset[lane];
+        const PxU32 parent = tLink.mParents[lane];
+        const PxVec3 rw(tLink.mRw_x[lane], tLink.mRw_y[lane], tLink.mRw_z[lane]);
+
+        const UnAlignedSpatialVector linkMotionVel = loadSpatialVector(tLink.mMotionVelocity, lane);
+        const UnAlignedSpatialVector pMotionAcceleration =
+            FeatherstoneArticulation::translateSpatialVector(
+                -rw, loadSpatialVector(lk[parent].mMotionAcceleration, lane));
+
+        UnAlignedSpatialVector motionAcceleration = pMotionAcceleration;
+        const PxU32 dofs = tLink.mDofs[lane];
+
+        PxReal tJAccel[3] = { 0.f, 0.f, 0.f };
+        for (PxU32 ind = 0; ind < 3; ++ind)
+            if (ind < dofs)
+                tJAccel[ind] = tDofs[ind].mQstZ[lane]
+                             - loadSpatialVector(tDofs[ind].mIsW, lane)
+                                   .innerProduct(pMotionAcceleration);
+
+        for (PxU32 ind = 0; ind < 3; ++ind)
+        {
+            if (ind < dofs)
+            {
+                const PxReal jAccel = tDofs[ind].mInvStIsT_x[lane] * tJAccel[0]
+                                    + tDofs[ind].mInvStIsT_y[lane] * tJAccel[1]
+                                    + tDofs[ind].mInvStIsT_z[lane] * tJAccel[2];
+                tDofs[ind].mJointAccel[lane] = jAccel;
+                const PxReal jVel = tDofs[ind].mJointVelocities[lane] + jAccel * dt;
+                tDofs[ind].mJointVelocities[lane] = jVel;
+                tDofs[ind].mJointUnconstrainedVelocities[lane] = jVel;
+                motionAcceleration +=
+                    loadSpatialVector(tDofs[ind].mWorldMotionMatrix, lane) * jAccel;
+            }
+        }
+
+        storeSpatialVector(tLink.mMotionAcceleration, motionAcceleration, lane);
+        const UnAlignedSpatialVector motionVel = linkMotionVel + motionAcceleration * dt;
+        const PxReal mass = tLink.mMass[lane];
+        preMomentum.top += motionVel.bottom * mass;
+        flatVel[linkID] = motionVel;
+        storeSpatialVector(tLink.mMotionVelocity, motionVel, lane);
+    }
+
+    const PxVec3 preRootVel = preMomentum.top * COM_invMassW.w;
+
+    if (!fixBase)
+    {
+        physx::Dy::SpatialMatrix invInertia;
+        loadSpatialMatrix(ab.mInvSpatialArticulatedInertia, lane, invInertia);
+        const UnAlignedSpatialVector zaInt = loadSpatialVector(lk[0].mZAIntVector, lane);
+        const UnAlignedSpatialVector accel = -(invInertia * zaInt);
+        storeSpatialVector(lk[0].mMotionAccelerationInternal, accel, lane);
+        addSpatialVector(lk[0].mMotionAcceleration, accel, lane);
+        UnAlignedSpatialVector motionVel = loadSpatialVector(lk[0].mMotionVelocity, lane);
+
+        PxMat33 inertia;
+        loadPxMat33(lk[0].mIsolatedInertia, lane, inertia);
+        const PxReal mass = lk[0].mMass[lane];
+        const PxVec3 pos = loadPxVec3(lk[0].mAccumulatedPose.p, lane);
+        const PxVec3 offset = (pos - COM);
+
+        preMomentum.bottom = inertia * motionVel.top
+                           + offset.cross(motionVel.bottom - preRootVel) * mass;
+        compoundInertia += refTranslateInertiaMass(inertia, mass, offset);
+        motionVel += accel * dt;
+        postMomentum.top = motionVel.bottom * mass;
+        storeSpatialVector(lk[0].mMotionVelocity, motionVel, lane);
+        flatVel[0] = motionVel;
+    }
+
+    for (uint32_t linkID = 1; linkID < numLinks; ++linkID)
+    {
+        physx::PxgArticulationBlockLinkData& tLink = lk[linkID];
+        physx::PxgArticulationBlockDofData* tDofs = df + tLink.mJointOffset[lane];
+        const PxU32 parent = tLink.mParents[lane];
+        const PxVec3 rw(tLink.mRw_x[lane], tLink.mRw_y[lane], tLink.mRw_z[lane]);
+
+        const UnAlignedSpatialVector pMotionAcceleration =
+            FeatherstoneArticulation::translateSpatialVector(
+                -rw, loadSpatialVector(lk[parent].mMotionAccelerationInternal, lane));
+
+        UnAlignedSpatialVector motionAcceleration =
+            pMotionAcceleration + loadSpatialVector(tLink.mCoriolis, lane);
+        const PxU32 dofs = tLink.mDofs[lane];
+
+        PxReal tJAccel[3] = { 0.f, 0.f, 0.f };
+        for (PxU32 ind = 0; ind < 3; ++ind)
+            if (ind < dofs)
+                tJAccel[ind] = tDofs[ind].mQstZIcInternal[lane]
+                             - loadSpatialVector(tDofs[ind].mIsW, lane)
+                                   .innerProduct(pMotionAcceleration);
+
+        for (PxU32 ind = 0; ind < 3; ++ind)
+        {
+            if (ind < dofs)
+            {
+                const PxReal jAccel = tDofs[ind].mInvStIsT_x[lane] * tJAccel[0]
+                                    + tDofs[ind].mInvStIsT_y[lane] * tJAccel[1]
+                                    + tDofs[ind].mInvStIsT_z[lane] * tJAccel[2];
+                tDofs[ind].mJointAccel[lane] += jAccel;
+                const PxReal jVel = tDofs[ind].mJointVelocities[lane] + jAccel * dt;
+                tDofs[ind].mJointVelocities[lane] = jVel;
+                tDofs[ind].mJointUnconstrainedVelocities[lane] = jVel;
+                motionAcceleration +=
+                    loadSpatialVector(tDofs[ind].mWorldMotionMatrix, lane) * jAccel;
+            }
+        }
+
+        storeSpatialVector(tLink.mMotionAccelerationInternal, motionAcceleration, lane);
+
+        const PxVec3 pos = loadPxVec3(tLink.mAccumulatedPose.p, lane);
+        UnAlignedSpatialVector motionVel = loadSpatialVector(tLink.mMotionVelocity, lane);
+
+        PxMat33 inertia;
+        loadPxMat33(tLink.mIsolatedInertia, lane, inertia);
+        const PxReal mass = tLink.mMass[lane];
+        const PxVec3 offset = (pos - COM);
+
+        compoundInertia += refTranslateInertiaMass(inertia, mass, offset);
+        preMomentum.bottom += inertia * motionVel.top
+                            + offset.cross(motionVel.bottom - preRootVel) * mass;
+
+        motionVel += motionAcceleration * dt;
+        postMomentum.top += motionVel.bottom * mass;
+        flatVel[linkID] = motionVel;
+        storeSpatialVector(tLink.mMotionVelocity, motionVel, lane);
+    }
+
+    if (!fixBase)
+    {
+        const PxVec3 postRootVel = postMomentum.top * COM_invMassW.w;
+
+        for (uint32_t linkID = 0; linkID < numLinks; ++linkID)
+        {
+            const physx::PxgArticulationBlockLinkData& tLink = lk[linkID];
+            const UnAlignedSpatialVector motionVel = loadSpatialVector(tLink.mMotionVelocity, lane);
+            PxMat33 inertia;
+            loadPxMat33(tLink.mIsolatedInertia, lane, inertia);
+            const PxReal mass = tLink.mMass[lane];
+            const PxVec3 pos = loadPxVec3(tLink.mAccumulatedPose.p, lane);
+            const PxVec3 offset = (pos - COM);
+            postMomentum.bottom += inertia * motionVel.top
+                                 + offset.cross(motionVel.bottom - postRootVel) * mass;
+        }
+
+        const PxMat33 invCompoundInertia = compoundInertia.getInverse();
+        const PxReal denom0 = postMomentum.bottom.magnitude();
+        const PxReal num = preMomentum.bottom.magnitude();
+        const PxReal angRatio = denom0 == 0.f ? 1.f : num / denom0;
+        const PxVec3 deltaAngMom = postMomentum.bottom * (angRatio - 1.f);
+        const PxVec3 deltaAng = invCompoundInertia * deltaAngMom;
+
+        for (uint32_t linkID = 0; linkID < numLinks; ++linkID)
+        {
+            const PxVec3 offset = (loadPxVec3(lk[linkID].mAccumulatedPose.p, lane) - COM);
+            const UnAlignedSpatialVector velChange(deltaAng, offset.cross(deltaAng));
+            addSpatialVector(lk[linkID].mMotionVelocity, velChange, lane);
+            postMomentum.top += velChange.bottom * lk[linkID].mMass[lane];
+        }
+
+        const PxVec3 deltaLinMom = preMomentum.top - postMomentum.top;
+        const PxVec3 deltaLin = deltaLinMom * COM_invMassW.w;
+
+        for (uint32_t linkID = 0; linkID < numLinks; ++linkID)
+        {
+            UnAlignedSpatialVector vel = loadSpatialVector(lk[linkID].mMotionVelocity, lane);
+            vel.bottom += deltaLin;
+            storeSpatialVector(lk[linkID].mMotionVelocity, vel, lane);
+            flatVel[linkID] = vel;
+        }
+    }
+}
+
+PXG_TEST(artiLinkAcceleration)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        { "npArtiLinkAccel.spv", "artiLinkAcceleration", 48u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &artiLinkAccelLoader);
+
+    std::vector<physx::PxgArticulationBlockLinkData> lkImg(LA_MAX_LINKS);
+    std::vector<physx::PxgArticulationBlockDofData> dfImg(LA_MAX_DOFS);
+    std::vector<physx::PxgArticulationBlockData> abImg(1);
+    std::memset(lkImg.data(), 0xAB, lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    std::memset(dfImg.data(), 0xAB, dfImg.size() * sizeof(physx::PxgArticulationBlockDofData));
+    std::memset(abImg.data(), 0xAB, abImg.size() * sizeof(physx::PxgArticulationBlockData));
+
+    std::vector<uint32_t> numLinks(32, 0u);
+    uint32_t fixed = 0, freeBase = 0, massless = 0, single = 0;
+    for (uint32_t lane = 0; lane < LA_LANES; ++lane)
+    {
+        numLinks[lane] = laNumLinks(lane);
+        PXG_CHECK_MSG(numLinks[lane] <= LA_MAX_LINKS, "lane %u has %u links", lane, numLinks[lane]);
+        PXG_CHECK_MSG(numLinks[lane] != lane, "lane %u's link count equals its index", lane);
+        PXG_CHECK_MSG(laTotalDofs(lane, numLinks[lane]) <= LA_MAX_DOFS,
+                      "lane %u needs %u dofs", lane, laTotalDofs(lane, numLinks[lane]));
+        laFill(lkImg.data(), dfImg.data(), abImg[0], lane, numLinks[lane], lane);
+        laFixBase(lane) ? ++fixed : ++freeBase;
+        if (laMassless(lane)) ++massless;
+        if (numLinks[lane] == 1) ++single;
+    }
+    std::printf("[ info ] la: %u fixed-base, %u free-base, %u massless, %u single-link\n", fixed,
+                freeBase, massless, single);
+    PXG_CHECK(fixed > 3 && freeBase > 8 && massless > 0 && single > 1);
+
+    // per-lane slices of the flat array, each with a poisoned tail
+    std::vector<uint32_t> velPoison(size_t(32) * LA_VEL_SLOTS * 6);
+    for (size_t j = 0; j < velPoison.size(); ++j)
+        velPoison[j] = 0xAC000000u | uint32_t(j & 0xFFFFFFu);
+
+    PxgDevicePtr dLk = 0, dDf = 0, dAb = 0, dCounts = 0, dVel = 0;
+    shim.memAlloc(&dLk, lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    shim.memAlloc(&dDf, dfImg.size() * sizeof(physx::PxgArticulationBlockDofData));
+    shim.memAlloc(&dAb, abImg.size() * sizeof(physx::PxgArticulationBlockData));
+    shim.memAlloc(&dCounts, numLinks.size() * sizeof(uint32_t));
+    shim.memAlloc(&dVel, velPoison.size() * 4);
+    if (!dLk || !dDf || !dAb || !dCounts || !dVel)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+
+    // the per-lane pointer the block carries -- a stride-7 permutation over the
+    // 32 slices, so no lane writes its own index's slice
+    uint32_t sliceOf[32];
+    for (uint32_t lane = 0; lane < 32; ++lane)
+        sliceOf[lane] = (lane * 7u + 5u) % 32u;
+    for (uint32_t lane = 0; lane < 32; ++lane)
+    {
+        PXG_CHECK_MSG(sliceOf[lane] != lane, "lane %u writes its own slice", lane);
+        abImg[0].mMotionVelocitiesPtr[lane] = reinterpret_cast<UnAlignedSpatialVector*>(
+            dVel + PxgDevicePtr(size_t(sliceOf[lane]) * LA_VEL_SLOTS * 6 * sizeof(float)));
+    }
+
+    shim.memcpyHtoD(dLk, lkImg.data(), lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    shim.memcpyHtoD(dDf, dfImg.data(), dfImg.size() * sizeof(physx::PxgArticulationBlockDofData));
+    shim.memcpyHtoD(dAb, abImg.data(), abImg.size() * sizeof(physx::PxgArticulationBlockData));
+    shim.memcpyHtoD(dCounts, numLinks.data(), numLinks.size() * sizeof(uint32_t));
+    shim.memcpyHtoD(dVel, velPoison.data(), velPoison.size() * 4);
+
+    struct Params
+    {
+        uint64_t artiBlock, linkBlocks, dofBlocks, numLinksPer;
+        float dt;
+        uint32_t nbLanes, pad0, pad1;
+    } prm = { uint64_t(dAb), uint64_t(dLk), uint64_t(dDf), uint64_t(dCounts), LA_DT, LA_LANES, 0,
+              0 };
+    PXG_CHECK_MSG(sizeof(prm) == 48, "push-constant blob is %zu bytes", sizeof(prm));
+
+    PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch artiLinkAcceleration");
+    shim.streamSynchronize();
+
+    // ---- the expectation ----
+    std::vector<physx::PxgArticulationBlockLinkData> wantLk = lkImg;
+    std::vector<physx::PxgArticulationBlockDofData> wantDf = dfImg;
+    std::vector<physx::PxgArticulationBlockData> wantAb = abImg;
+    std::vector<uint32_t> wantVel = velPoison;
+    for (uint32_t lane = 0; lane < LA_LANES; ++lane)
+        laMirror(wantLk.data(), wantDf.data(), wantAb[0],
+                 reinterpret_cast<UnAlignedSpatialVector*>(wantVel.data())
+                     + size_t(sliceOf[lane]) * LA_VEL_SLOTS,
+                 numLinks[lane], LA_DT, lane);
+
+    std::vector<physx::PxgArticulationBlockLinkData> gotLk(lkImg.size());
+    std::vector<physx::PxgArticulationBlockDofData> gotDf(dfImg.size());
+    std::vector<physx::PxgArticulationBlockData> gotAb(abImg.size());
+    std::vector<uint32_t> gotVel(velPoison.size());
+    shim.memcpyDtoH(gotLk.data(), dLk, gotLk.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    shim.memcpyDtoH(gotDf.data(), dDf, gotDf.size() * sizeof(physx::PxgArticulationBlockDofData));
+    shim.memcpyDtoH(gotAb.data(), dAb, gotAb.size() * sizeof(physx::PxgArticulationBlockData));
+    shim.memcpyDtoH(gotVel.data(), dVel, gotVel.size() * 4);
+
+    size_t bad = 0, signedZeros = 0;
+    auto cmp = [&](const char* what, const void* wp, const void* gp, size_t bytes) {
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(wp);
+        const uint32_t* g = reinterpret_cast<const uint32_t*>(gp);
+        for (size_t k = 0; k < bytes / 4; ++k)
+        {
+            if (w[k] == g[k])
+                continue;
+            if ((w[k] == 0u && g[k] == 0x80000000u) || (w[k] == 0x80000000u && g[k] == 0u))
+            {
+                ++signedZeros;
+                continue;
+            }
+            if (bad < 12)
+                std::printf("MM la %s word %zu  ref %08x  gpu %08x\n", what, k, w[k], g[k]);
+            ++bad;
+        }
+    };
+    cmp("link", wantLk.data(), gotLk.data(),
+        wantLk.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    cmp("dof", wantDf.data(), gotDf.data(),
+        wantDf.size() * sizeof(physx::PxgArticulationBlockDofData));
+    // the articulation block is an INPUT here: nothing may touch it
+    cmp("arti", wantAb.data(), gotAb.data(),
+        wantAb.size() * sizeof(physx::PxgArticulationBlockData));
+    cmp("flat vel", wantVel.data(), gotVel.data(), wantVel.size() * 4);
+
+    std::printf("[ info ] la: signed zeros forgiven %zu\n", signedZeros);
+    PXG_CHECK_MSG(bad == 0, "the acceleration sweep matches the engine-built mirror");
+
+    shim.memFree(dLk);
+    shim.memFree(dDf);
+    shim.memFree(dAb);
+    shim.memFree(dCounts);
+    shim.memFree(dVel);
 }
 
 }  // namespace

@@ -218,3 +218,455 @@ void artiTranslateInertiaMass(uint3 dispatchThreadId : SV_DispatchThreadID)
     o[3] = r.c1.x; o[4] = r.c1.y; o[5] = r.c1.z;
     o[6] = r.c2.x; o[7] = r.c2.y; o[8] = r.c2.z;
 }
+
+// ===========================================================================
+// P8.92b: computeLinkAcceleration (forwardDynamic2.cu:1931-2316)
+// ===========================================================================
+//
+// The root-to-leaf acceleration sweep, and the thing the articulation scene has
+// been waiting for since P8.65: this is what turns the spatial inertia and the
+// response matrices into an acceleration that actually moves the link.
+//
+// It is FIVE sections, and the whole difficulty is that four of them look alike:
+//
+//   1. the root's EXTERNAL acceleration, from `mZAVector`;
+//   2. pass one, root to leaf, propagating that acceleration down;
+//   3. the root's INTERNAL acceleration, from `mZAIntVector`, plus the start of
+//      the momentum bookkeeping;
+//   4. pass two, root to leaf again, propagating the INTERNAL acceleration and
+//      the Coriolis term;
+//   5. the momentum-conservation tail, free base only.
+//
+// Zero new ABI, still.
+//
+// ===========================================================================
+// PASS ONE AND PASS TWO ARE NOT THE SAME LOOP, IN SIX PLACES
+// ===========================================================================
+//
+// Each of these gets its own mutant, because a port that shares one body between
+// the two passes is wrong in exactly these six ways and in no other:
+//
+//   a. pass one reads the parent's `mMotionAcceleration`, pass two the parent's
+//      `mMotionAccelerationInternal`;
+//   b. pass one's per-dof term is `mQstZ`, pass two's is `mQstZIcInternal`;
+//   c. pass one seeds `motionAcceleration` from the propagated parent value
+//      alone; pass two ADDS `mCoriolis`;
+//   d. pass one ASSIGNS `mJointAccel`, pass two ADDS to it;
+//   e. pass one stores `mMotionAcceleration`, pass two stores
+//      `mMotionAccelerationInternal`;
+//   f. pass one takes its starting velocity from a load at the TOP of the
+//      iteration; pass two re-loads `mMotionVelocity`, which pass one has since
+//      written, and uses the PRE-update value for `preMomentum.bottom` before
+//      adding `motionAcceleration * dt` to it.
+//
+// And one they DO share, which is a trap of its own: **`jAccel` is taken against
+// the PROPAGATED parent acceleration, not against the running `motionAcceleration`
+// the Coriolis term has already been added to.**  In pass two those two differ,
+// so a port that uses the accumulator produces plausible numbers.
+//
+// ===========================================================================
+// THE MOMENTUM TAIL
+// ===========================================================================
+//
+// Free base only, three more loops over every link:
+//
+//   * `postRootVel` comes from `postMomentum.top` as it stands after pass two,
+//     and the loop that follows MUTATES `postMomentum.top` while iterating — so
+//     the two cannot be fused;
+//   * `angRatio = denom == 0 ? 1 : num / denom`, a guarded ratio of two
+//     MAGNITUDES (square roots), not of their squares;
+//   * `deltaAng` goes through the general inverse of the compound inertia;
+//   * every link's velocity picks up `(deltaAng, offset x deltaAng)` and then, in
+//     a third loop, a flat `deltaLin` on the bottom half only.
+//
+// Two locals the CUDA computes and never uses -- `angVel` and `linVel` -- are
+// dropped, and this note is the record of that rather than a transcription of a
+// value nobody reads.  There is a THIRD dead thing, and unlike those two it is a
+// STORE rather than a local: **pass one's `motionVelocities[linkID]` write is
+// always overwritten by pass two**, which loops over exactly the same range.  It
+// is transcribed anyway, and the sweep records its removal as a proven
+// equivalence rather than a gap -- because the day pass two stops covering the
+// same links, the engine's version is the one that stays right.
+//
+// One more measured equivalence, for the same reason: pass one reads its starting
+// velocity BEFORE calling the propagation, and moving that read after it changes
+// nothing, because the propagation writes dof fields and the link's acceleration,
+// never its velocity.  Reading the WRONG link's velocity is a different matter
+// and dies.  So is the "preload next link data" pair at the top of pass
+// one: it is a latency optimisation for a real warp, it changes no result, and on
+// llvmpipe it would only add a redundant load.
+//
+// ===========================================================================
+// P8.40, PRE-EMPTED
+// ===========================================================================
+//
+// `motionVelocities` is a pointer loaded out of the articulation block and then
+// indexed inside three separate loops.  That is exactly the shape that faulted in
+// P8.91c.  The load happens ONCE, at the top of the function, before any loop --
+// which is also what the CUDA does -- and the loops do address arithmetic on the
+// value rather than re-reading it.  The note is here so nobody "tidies" the load
+// into the loop that uses it.
+
+// Cm::UnAlignedSpatialVector is six tightly packed floats -- no padding, unlike
+// its aligned twin.  This is the flat array the constraint prep reads, which does
+// not understand block data.
+void alaStoreFlatVel(uint64_t base, uint index, AbSpatialVector v)
+{
+    Ptr<float> p = Ptr<float>(base + uint64_t(index) * 24u);
+    p[0] = v.top.x;
+    p[1] = v.top.y;
+    p[2] = v.top.z;
+    p[3] = v.bottom.x;
+    p[4] = v.bottom.y;
+    p[5] = v.bottom.z;
+}
+
+AbSpatialVector alaLoadSV(uint64_t base, uint fieldOffset, uint lane)
+{
+    float3 t, b;
+    abLoadSpatialVector(base, fieldOffset, lane, t, b);
+    return asmSVec(t, b);
+}
+
+void alaStoreSV(uint64_t base, uint fieldOffset, uint lane, AbSpatialVector v)
+{
+    abStoreSpatialVector(base, fieldOffset, lane, v.top, v.bottom);
+}
+
+AbSpatialVector alaNeg(AbSpatialVector v) { return asmSVec(-v.top, -v.bottom); }
+
+// PxVec3::magnitude() == PxSqrt(magnitudeSquared()), spelled out rather than
+// reached for via `length()`, for the reason P8.69 gives.
+float alaMagnitude(float3 v) { return sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
+
+// One iteration of either down-sweep.  `internal` selects between the six
+// differences the header lists; everything else is shared on purpose, because the
+// two CUDA loops ARE the same arithmetic over different fields.
+void alaPropagateLink(uint64_t linkBlocks, uint64_t dofBlocks, uint linkID, float dt, bool internal,
+                      uint lane, out AbSpatialVector motionAccelerationOut)
+{
+    const uint64_t tLink = linkBlocks + uint64_t(linkID) * PXG_AB_LINK_SIZE;
+    const uint jointOffset = abU32(tLink, PXG_AB_LINK_mJointOffset, lane);
+    const uint64_t tDofs = dofBlocks + uint64_t(jointOffset) * PXG_AB_DOF_SIZE;
+    const uint parent = abU32(tLink, PXG_AB_LINK_mParents, lane);
+    const uint64_t parentLink = linkBlocks + uint64_t(parent) * PXG_AB_LINK_SIZE;
+
+    const float3 rw = float3(abF32(tLink, PXG_AB_LINK_mRw_x, lane),
+                             abF32(tLink, PXG_AB_LINK_mRw_y, lane),
+                             abF32(tLink, PXG_AB_LINK_mRw_z, lane));
+
+    // difference (a): which of the parent's two acceleration fields
+    const AbSpatialVector parentAccel =
+        alaLoadSV(parentLink,
+                  internal ? PXG_AB_LINK_mMotionAccelerationInternal
+                           : PXG_AB_LINK_mMotionAcceleration,
+                  lane);
+    const AbSpatialVector pMotionAcceleration = adTranslateSpatialVector(-rw, parentAccel);
+
+    // difference (c): pass two adds the Coriolis term, pass one does not
+    AbSpatialVector motionAcceleration = pMotionAcceleration;
+    if (internal)
+        motionAcceleration =
+            asmSVecAdd(motionAcceleration, alaLoadSV(tLink, PXG_AB_LINK_mCoriolis, lane));
+
+    const uint dofs = abU8(tLink, PXG_AB_LINK_mDofs, lane);
+
+    AbSpatialVector isWs[3];
+    float qstZ[3];
+    float jointVel[3];
+    AbSpatialVector axes[3];
+    float3 invStIsT[3];
+
+    for (uint ind = 0u; ind < 3u; ++ind)
+    {
+        isWs[ind] = asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
+        qstZ[ind] = 0.0f;
+        jointVel[ind] = 0.0f;
+        axes[ind] = isWs[ind];
+        invStIsT[ind] = float3(0.0f, 0.0f, 0.0f);
+
+        if (ind < dofs)
+        {
+            const uint64_t d = tDofs + uint64_t(ind) * PXG_AB_DOF_SIZE;
+            isWs[ind] = alaLoadSV(d, PXG_AB_DOF_mIsW, lane);
+            // difference (b): which per-dof term
+            qstZ[ind] = abF32(d, internal ? PXG_AB_DOF_mQstZIcInternal : PXG_AB_DOF_mQstZ, lane);
+            jointVel[ind] = abF32(d, PXG_AB_DOF_mJointVelocities, lane);
+            axes[ind] = alaLoadSV(d, PXG_AB_DOF_mWorldMotionMatrix, lane);
+            invStIsT[ind] = float3(abF32(d, PXG_AB_DOF_mInvStIsT_x, lane),
+                                   abF32(d, PXG_AB_DOF_mInvStIsT_y, lane),
+                                   abF32(d, PXG_AB_DOF_mInvStIsT_z, lane));
+        }
+    }
+
+    // against the PROPAGATED parent acceleration, NOT the running accumulator --
+    // in pass two the Coriolis term has already moved the latter
+    float tJAccel[3];
+    for (uint ind = 0u; ind < 3u; ++ind)
+    {
+        float jAccel = 0.0f;
+        if (ind < dofs)
+            jAccel = qstZ[ind] - asmInnerProduct(isWs[ind], pMotionAcceleration);
+        tJAccel[ind] = jAccel;
+    }
+
+    for (uint ind = 0u; ind < 3u; ++ind)
+    {
+        if (ind < dofs)
+        {
+            const uint64_t d = tDofs + uint64_t(ind) * PXG_AB_DOF_SIZE;
+            const float3 i = invStIsT[ind];
+            const float jAccel = i.x * tJAccel[0] + i.y * tJAccel[1] + i.z * tJAccel[2];
+
+            // difference (d): assign in pass one, accumulate in pass two
+            abStoreF32(d, PXG_AB_DOF_mJointAccel, lane,
+                       internal ? abF32(d, PXG_AB_DOF_mJointAccel, lane) + jAccel : jAccel);
+
+            const float jVel = jointVel[ind] + jAccel * dt;
+            abStoreF32(d, PXG_AB_DOF_mJointVelocities, lane, jVel);
+            abStoreF32(d, PXG_AB_DOF_mJointUnconstrainedVelocities, lane, jVel);
+
+            motionAcceleration = asmSVecAdd(motionAcceleration, asmSVecScale(axes[ind], jAccel));
+        }
+    }
+
+    motionAccelerationOut = motionAcceleration;
+}
+
+public void alaComputeLinkAcceleration(uint64_t artiBlock, uint64_t linkBlocks, uint64_t dofBlocks,
+                                       uint numLinks, float dt, uint lane)
+{
+    const uint flags = abU32(artiBlock, PXG_AB_mFlags, lane);
+    const bool fixBase = (flags & PXG_ARTI_FLAG_FIX_BASE) != 0u;
+
+    // P8.40: loaded ONCE, before every loop -- see the header
+    const uint64_t motionVelocities = abU64(artiBlock, PXG_AB_mMotionVelocitiesPtr, lane);
+
+    const float4 COM_invMassW = abF4(artiBlock, PXG_AB_mCOM_TotalInvMassW, lane);
+    const float3 COM = COM_invMassW.xyz;
+
+    const AbSpatialVector zeroSV = asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
+    AbSpatialVector preMomentum = zeroSV;
+    AbSpatialVector postMomentum = zeroSV;
+    AbMat33 compoundInertia = abMat33Zero();
+
+    // ---- 1. the root's EXTERNAL acceleration ----
+    if (!fixBase)
+    {
+        const AbSpatialMatrix invInertia =
+            asmLoadSpatialMatrix(artiBlock, PXG_AB_mInvSpatialArticulatedInertia, lane);
+        const AbSpatialVector za = alaLoadSV(linkBlocks, PXG_AB_LINK_mZAVector, lane);
+
+        const AbSpatialVector accel = alaNeg(asmMulVec(invInertia, za));
+        alaStoreSV(linkBlocks, PXG_AB_LINK_mMotionAcceleration, lane, accel);
+
+        const AbSpatialVector motionVel =
+            asmSVecAdd(alaLoadSV(linkBlocks, PXG_AB_LINK_mMotionVelocity, lane),
+                       asmSVecScale(accel, dt));
+
+        const float mass = abF32(linkBlocks, PXG_AB_LINK_mMass, lane);
+        preMomentum.top = motionVel.bottom * mass;
+
+        alaStoreSV(linkBlocks, PXG_AB_LINK_mMotionVelocity, lane, motionVel);
+    }
+    else
+    {
+        // A fixed base has no free acceleration and no velocity at all -- and note
+        // it also zeroes mMotionAccelerationInternal, which the free-base branch
+        // does NOT (section 3 writes it there).
+        alaStoreSV(linkBlocks, PXG_AB_LINK_mMotionAcceleration, lane, zeroSV);
+        alaStoreSV(linkBlocks, PXG_AB_LINK_mMotionAccelerationInternal, lane, zeroSV);
+        alaStoreSV(linkBlocks, PXG_AB_LINK_mMotionVelocity, lane, zeroSV);
+        alaStoreFlatVel(motionVelocities, 0u, zeroSV);
+    }
+
+    // ---- 2. pass one, root to leaf ----
+    for (uint linkID = 1u; linkID < numLinks; ++linkID)
+    {
+        const uint64_t tLink = linkBlocks + uint64_t(linkID) * PXG_AB_LINK_SIZE;
+
+        // difference (f): the starting velocity is read BEFORE the propagation
+        const AbSpatialVector linkMotionVel = alaLoadSV(tLink, PXG_AB_LINK_mMotionVelocity, lane);
+
+        AbSpatialVector motionAcceleration;
+        alaPropagateLink(linkBlocks, dofBlocks, linkID, dt, false, lane, motionAcceleration);
+
+        // difference (e)
+        alaStoreSV(tLink, PXG_AB_LINK_mMotionAcceleration, lane, motionAcceleration);
+
+        const AbSpatialVector motionVel =
+            asmSVecAdd(linkMotionVel, asmSVecScale(motionAcceleration, dt));
+
+        const float mass = abF32(tLink, PXG_AB_LINK_mMass, lane);
+        preMomentum.top = preMomentum.top + motionVel.bottom * mass;
+
+        alaStoreFlatVel(motionVelocities, linkID, motionVel);
+        alaStoreSV(tLink, PXG_AB_LINK_mMotionVelocity, lane, motionVel);
+    }
+
+    // Computed OUTSIDE the guard below and used inside it AND in pass two -- for a
+    // fixed base every momentum quantity is dead, but it is still computed, and
+    // transcribing that is cheaper than proving it unobservable.
+    const float3 preRootVel = preMomentum.top * COM_invMassW.w;
+
+    // ---- 3. the root's INTERNAL acceleration, and the momentum bookkeeping ----
+    if (!fixBase)
+    {
+        const AbSpatialMatrix invInertia =
+            asmLoadSpatialMatrix(artiBlock, PXG_AB_mInvSpatialArticulatedInertia, lane);
+        const AbSpatialVector zaInt = alaLoadSV(linkBlocks, PXG_AB_LINK_mZAIntVector, lane);
+
+        const AbSpatialVector accel = alaNeg(asmMulVec(invInertia, zaInt));
+        alaStoreSV(linkBlocks, PXG_AB_LINK_mMotionAccelerationInternal, lane, accel);
+
+        // addSpatialVector: the EXTERNAL field accumulates the internal one
+        alaStoreSV(linkBlocks, PXG_AB_LINK_mMotionAcceleration, lane,
+                   asmSVecAdd(alaLoadSV(linkBlocks, PXG_AB_LINK_mMotionAcceleration, lane), accel));
+
+        AbSpatialVector motionVel = alaLoadSV(linkBlocks, PXG_AB_LINK_mMotionVelocity, lane);
+
+        const AbMat33 inertia = abLoadPxMat33(linkBlocks, PXG_AB_LINK_mIsolatedInertia, lane);
+        const float mass = abF32(linkBlocks, PXG_AB_LINK_mMass, lane);
+
+        const float3 pos = abF4(linkBlocks, PXG_AB_LINK_mAccumulatedPose + PXG_AB_STB_P, lane).xyz;
+        const float3 offset = pos - COM;
+
+        preMomentum.bottom = asmM33Transform(inertia, motionVel.top)
+                           + asmCross(offset, motionVel.bottom - preRootVel) * mass;
+
+        compoundInertia = asmM33Add(compoundInertia,
+                                    asmTranslateInertiaMass(inertia, mass, offset));
+
+        motionVel = asmSVecAdd(motionVel, asmSVecScale(accel, dt));
+
+        postMomentum.top = motionVel.bottom * mass;
+        alaStoreSV(linkBlocks, PXG_AB_LINK_mMotionVelocity, lane, motionVel);
+        alaStoreFlatVel(motionVelocities, 0u, motionVel);
+    }
+
+    // ---- 4. pass two, root to leaf ----
+    for (uint linkID = 1u; linkID < numLinks; ++linkID)
+    {
+        const uint64_t tLink = linkBlocks + uint64_t(linkID) * PXG_AB_LINK_SIZE;
+
+        AbSpatialVector motionAcceleration;
+        alaPropagateLink(linkBlocks, dofBlocks, linkID, dt, true, lane, motionAcceleration);
+
+        // difference (e)
+        alaStoreSV(tLink, PXG_AB_LINK_mMotionAccelerationInternal, lane, motionAcceleration);
+
+        const float3 pos = abF4(tLink, PXG_AB_LINK_mAccumulatedPose + PXG_AB_STB_P, lane).xyz;
+        // difference (f): re-loaded, and used BEFORE the update below
+        AbSpatialVector motionVel = alaLoadSV(tLink, PXG_AB_LINK_mMotionVelocity, lane);
+
+        const AbMat33 inertia = abLoadPxMat33(tLink, PXG_AB_LINK_mIsolatedInertia, lane);
+        const float mass = abF32(tLink, PXG_AB_LINK_mMass, lane);
+        const float3 offset = pos - COM;
+
+        compoundInertia = asmM33Add(compoundInertia,
+                                    asmTranslateInertiaMass(inertia, mass, offset));
+
+        // `+=` in the CUDA, so the two new terms associate with EACH OTHER first
+        // and only then with the accumulator -- `x + (A + B)`, not `(x + A) + B`.
+        // Measured: the other association is eight ULP out by the end of the loop.
+        preMomentum.bottom = preMomentum.bottom
+                           + (asmM33Transform(inertia, motionVel.top)
+                              + asmCross(offset, motionVel.bottom - preRootVel) * mass);
+
+        motionVel = asmSVecAdd(motionVel, asmSVecScale(motionAcceleration, dt));
+
+        postMomentum.top = postMomentum.top + motionVel.bottom * mass;
+
+        alaStoreFlatVel(motionVelocities, linkID, motionVel);
+        alaStoreSV(tLink, PXG_AB_LINK_mMotionVelocity, lane, motionVel);
+    }
+
+    // ---- 5. the momentum-conservation tail, free base only ----
+    if (!fixBase)
+    {
+        // taken from postMomentum.top as it stands NOW: the loop after the next
+        // one mutates it while iterating
+        const float3 postRootVel = postMomentum.top * COM_invMassW.w;
+
+        for (uint linkID = 0u; linkID < numLinks; ++linkID)
+        {
+            const uint64_t tLink = linkBlocks + uint64_t(linkID) * PXG_AB_LINK_SIZE;
+            const AbSpatialVector motionVel = alaLoadSV(tLink, PXG_AB_LINK_mMotionVelocity, lane);
+
+            const AbMat33 inertia = abLoadPxMat33(tLink, PXG_AB_LINK_mIsolatedInertia, lane);
+            const float mass = abF32(tLink, PXG_AB_LINK_mMass, lane);
+
+            const float3 pos = abF4(tLink, PXG_AB_LINK_mAccumulatedPose + PXG_AB_STB_P, lane).xyz;
+            const float3 offset = pos - COM;
+
+            postMomentum.bottom = postMomentum.bottom
+                                + (asmM33Transform(inertia, motionVel.top)
+                                   + asmCross(offset, motionVel.bottom - postRootVel) * mass);
+        }
+
+        const AbMat33 invCompoundInertia = asmM33Inverse(compoundInertia);
+
+        // a ratio of MAGNITUDES, guarded at zero -- not of their squares
+        const float denom0 = alaMagnitude(postMomentum.bottom);
+        const float num = alaMagnitude(preMomentum.bottom);
+        const float angRatio = denom0 == 0.0f ? 1.0f : num / denom0;
+
+        const float3 deltaAngMom = postMomentum.bottom * (angRatio - 1.0f);
+        const float3 deltaAng = asmM33Transform(invCompoundInertia, deltaAngMom);
+
+        for (uint linkID = 0u; linkID < numLinks; ++linkID)
+        {
+            const uint64_t tLink = linkBlocks + uint64_t(linkID) * PXG_AB_LINK_SIZE;
+            const float3 offset =
+                abF4(tLink, PXG_AB_LINK_mAccumulatedPose + PXG_AB_STB_P, lane).xyz - COM;
+            const AbSpatialVector velChange = asmSVec(deltaAng, asmCross(offset, deltaAng));
+
+            alaStoreSV(tLink, PXG_AB_LINK_mMotionVelocity, lane,
+                       asmSVecAdd(alaLoadSV(tLink, PXG_AB_LINK_mMotionVelocity, lane), velChange));
+
+            // mutated INSIDE the loop, which is why postRootVel was taken before it
+            postMomentum.top =
+                postMomentum.top + velChange.bottom * abF32(tLink, PXG_AB_LINK_mMass, lane);
+        }
+
+        const float3 deltaLinMom = preMomentum.top - postMomentum.top;
+        const float3 deltaLin = deltaLinMom * COM_invMassW.w;
+
+        for (uint linkID = 0u; linkID < numLinks; ++linkID)
+        {
+            const uint64_t tLink = linkBlocks + uint64_t(linkID) * PXG_AB_LINK_SIZE;
+            AbSpatialVector vel = alaLoadSV(tLink, PXG_AB_LINK_mMotionVelocity, lane);
+            vel.bottom = vel.bottom + deltaLin;
+            alaStoreSV(tLink, PXG_AB_LINK_mMotionVelocity, lane, vel);
+            alaStoreFlatVel(motionVelocities, linkID, vel);
+        }
+    }
+}
+
+struct AlaAccelParams
+{
+    uint64_t artiBlock;    // @0
+    uint64_t linkBlocks;   // @8
+    uint64_t dofBlocks;    // @16
+    uint64_t numLinksPer;  // @24  uint32[nbLanes]
+    float dt;              // @32
+    uint nbLanes;          // @36
+    uint pad0;             // @40
+    uint pad1;             // @44 -> 48 bytes
+};
+
+[[vk::push_constant]]
+ConstantBuffer<AlaAccelParams> gAlaAccel;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void artiLinkAcceleration(uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint lane = groupThreadId.x;
+    if (lane >= gAlaAccel.nbLanes)
+        return;
+
+    const uint numLinks = (Ptr<uint>(gAlaAccel.numLinksPer))[lane];
+    alaComputeLinkAcceleration(gAlaAccel.artiBlock, gAlaAccel.linkBlocks, gAlaAccel.dofBlocks,
+                               numLinks, gAlaAccel.dt, lane);
+}
