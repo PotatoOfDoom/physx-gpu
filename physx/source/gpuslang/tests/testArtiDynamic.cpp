@@ -61,6 +61,7 @@
 #include "foundation/PxVec3.h"
 #include "CmSpatialVector.h"
 #include "DyFeatherstoneArticulation.h"
+#include "pxgArtiRefHelpers.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -107,56 +108,11 @@ static void put3(F4& d, const PxVec3& v) { d.x = v.x; d.y = v.y; d.z = v.z; }
 // ---------------------------------------------------------------------------
 // The two mirrors: the CUDA's structure, the engine's arithmetic
 // ---------------------------------------------------------------------------
-static UnAlignedSpatialVector refPropagateImpulseW(const UnAlignedSpatialVector* isInvD,
-                                                   const PxVec3& childToParent,
-                                                   const UnAlignedSpatialVector* motionMatrix,
-                                                   const UnAlignedSpatialVector& Z, PxU32 dofCount,
-                                                   PxReal* qstZ)
-{
-    UnAlignedSpatialVector temp = Z;
-    for (PxU32 ind = 0; ind < 3; ++ind)
-    {
-        if (ind < dofCount)
-        {
-            const PxReal stZ = -motionMatrix[ind].innerProduct(Z);
-            qstZ[ind] += stZ;
-            temp += isInvD[ind] * stZ;
-        }
-    }
-    return FeatherstoneArticulation::translateSpatialVector(childToParent, temp);
-}
-
-static UnAlignedSpatialVector refPropagateAccelerationW(
-    const PxVec3& parentToChild, const PxVec3* invStISW,
-    const UnAlignedSpatialVector* motionMatrix,
-    const UnAlignedSpatialVector& parentLinkAccelerationW, PxU32 dofCount,
-    const UnAlignedSpatialVector* IsW, const PxReal* QMinusSTZ)
-{
-    UnAlignedSpatialVector pDeltaV =
-        FeatherstoneArticulation::translateSpatialVector(-parentToChild, parentLinkAccelerationW);
-
-    PxReal tJointDelta[3] = { 0.f, 0.f, 0.f };
-    for (PxU32 ind = 0; ind < 3; ++ind)
-    {
-        if (ind < dofCount)
-        {
-            const PxReal temp = IsW[ind].innerProduct(pDeltaV);
-            tJointDelta[ind] = (QMinusSTZ[ind] - temp);
-        }
-    }
-
-    for (PxU32 ind = 0; ind < 3; ++ind)
-    {
-        if (ind < dofCount)
-        {
-            const PxVec3 iStIsTi = invStISW[ind];
-            const PxReal jDelta = iStIsTi.x * tJointDelta[0] + iStIsTi.y * tJointDelta[1]
-                                + iStIsTi.z * tJointDelta[2];
-            pDeltaV += motionMatrix[ind] * jDelta;
-        }
-    }
-    return pDeltaV;
-}
+//
+// `refPropagateImpulseW` / `refPropagateAccelerationW` moved to
+// `pxgArtiRefHelpers.h` in P8.91c, where `computeMassMatrix1T`'s fixture — which
+// calls this pair six times per link — shares them rather than transcribing the
+// same twelve lines a third time.  Their traps are documented at the definition.
 
 PXG_TEST(artiDynamic)
 {

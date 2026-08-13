@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **717/717** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **719/719** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,138 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.91c — `computeMassMatrix1T` — manifest **274**, and P8.40 bites for real
+
+forwardDynamic2.cu:1736-1930, assembled on top of P8.91a/b into
+`shaders/npArtiMassMatrix.slang`.  Manifest 273 → **274**, suite 717 → **719**,
+the engine's refused-kernel list **228 → 227** with this kernel the one that
+leaves, and all 240 steps of the articulation scene still complete.  **Zero new
+ABI for the fourth tranche running** — every block field and every record pointer
+it touches was already mapped.
+
+### The fault that took the tranche, and the rule it confirms
+
+The kernel passed both fixtures bit-for-bit on the first run and then **segfaulted
+the live scene**.  Bisecting it inside the shader, one guard at a time, produced a
+result worth writing down precisely:
+
+```
+  a = articulations + artiInd * 544
+  mmWarpCopyU(load_u64(a + 176), ...)          <-- inside the set-bit walk: FAULTS
+  mmWarpCopyU(responseMatrices, ...)           <-- same pointer VALUE, resolved
+                                                   before the loop: works
+```
+
+A host-side probe (temporarily wired into the launch path) confirmed every input
+was correct — `nbArticulations` 1, lane 0 active, `mArticulationIndex` 0, flags
+`eFIX_BASE`, `numLinks` 2 — and a shader-side dump confirmed the walk itself:
+`fixMask` 1, `lowestSetIndex` 0, the broadcast index 0, and the loaded pointer
+`0x…ba00`, which the host could read AND write.  A single four-byte store through
+that value from inside the loop still faulted; the identical value resolved
+outside the loop did not.
+
+That is **platform rule P8.40** — no chained BDA load inside a loop — in its
+sharpest form yet: not a grid-stride loop, not a wrong address, and not a
+bounds problem.  A pointer *loaded through* a buffer device address and
+dereferenced in the same loop is what llvmpipe cannot do.
+
+The port's answer is to broadcast the **already-resolved pointer** in two halves
+instead of the articulation index:
+
+```slang
+const int src = pxgLowestSetIndex(m);
+const uint lo = pxgShflSyncU(FULL, lane, uint(responseMatrices & 0xFFFFFFFF), src, 32u);
+const uint hi = pxgShflSyncU(FULL, lane, uint(responseMatrices >> 32),        src, 32u);
+mmWarpCopyU(uint64_t(lo) | (uint64_t(hi) << 32), 0u, 144u, lane);
+```
+
+This is the same pointer, not an approximation: `responseMatrices` was set to
+exactly `articulations[articulationIndex].spatialResponseMatrixW` for every ACTIVE
+lane, and only active lanes can be in `fixMask` — which is what the CUDA's own
+`assert(artiInd != invalidArticulationId)` asserts.  P8.91b's zero-walk fixture
+was reshaped to the same form, so the idiom under test is the idiom in the kernel.
+
+**Neither fixture could have caught this**, and the note says so rather than
+pretending otherwise: the harness allocates its own record table, and the pointer
+chain it builds happens to survive the same shape.  The live scene is what found
+it — the third time in this chain that the scene has been the oracle a fixture
+could not be.
+
+### The seven transcription traps
+
+1. the grid is over **articulation blocks**, `ceil(nbArticulations / 32)`, with a
+   SECOND per-lane `active` test — lanes past the end stay in every ballot;
+2. `articulationIndex` comes from the **block**, not from the island-node/bodySim
+   chain the two kernels before it walk (third kernel, third source);
+3. the fixed-base path zeroes the **record** through `warpCopy` and the **block**
+   through `zeroSpatialMatrix` — two mechanisms, because one is contiguous and the
+   other is a 32-lane interleave;
+4. `cfm` is a max over three DIAGONAL entries and **the index pattern differs**:
+   `bottomLeft.{c0.x, c1.y, c2.z}` of the inverse inertia at the root,
+   `response.column[i][3 + i]` per link;
+5. the unit impulse is **negated for the links and not for the root**;
+6. `maxLinksInWarp` is a warp MAX, so short articulations keep iterating with
+   `thisThreadActive` false rather than dropping out;
+7. `response` is left uninitialised for an inactive lane and handed to
+   `writeMatrix` anyway; the port zeroes it, which is unobservable because that
+   lane's matrix is never staged.
+
+Two things the CUDA leaves lying around are dropped with a note rather than
+transcribed: `articulationsInBlock` is computed and never used, and the mixture of
+`threadIdx.x` with `threadIndexInWarp` inside the link loop is an engine
+inconsistency that is only safe because `blockDim.x == 32` (the P8.88 unification).
+
+### The oracle
+
+Both fixtures compare against **one mirror**, built from
+`Dy::SpatialMatrix::operator*`, `PxSpatialMatrix::operator*`, the engine's
+`loadSpatialMatrix` / `storeSpatialMatrix` / `zeroSpatialMatrix` in both the
+7-column and 6×6 forms, and `refPropagateImpulseW` / `refPropagateAccelerationW`
+— which moved into `tests/pxgArtiRefHelpers.h` this tranche so P8.90's fixture and
+this one share them instead of transcribing the same twelve lines a third time.
+Nothing in the expectation is hand-computed.
+
+The module also joins `PXG_NOCONTRACT_SHADERS`, which P8.91b had deliberately left
+it out of: it moved bits then and does dense float work now.  Without it the
+six-axis response differs from the engine by one ULP in a few hundred words —
+which is exactly what the flag exists for, and what the first fixture run showed.
+
+### Fixture and sweep
+
+`artiMassMatrixBody` drives the body over one warp — 27 live lanes and five past
+the end, fixed-base and free-base in the same warp (9 / 18), link counts differing
+within it so `maxLinksInWarp` (6) exceeds several lanes' own count, a record index
+permutation so no lane writes its own slot, a per-link `cfmScale`, and record link
+counts that DISAGREE with the block's.  `artiMassMatrixLaunch` adds the geometry:
+130 articulations, grid `num1TBlocks * 2`, block (32, 1, 1), a sixth warp slice
+allocated and left poisoned, and an island/bodySim chain filled with values that
+would resolve to DIFFERENT records if the kernel used it.
+
+**Sweep 49/52 killed, and all three survivors are proven equivalences:**
+
+* `linkID <= maxLinksInWarp` — the extra pass has an empty ballot and writes
+  nothing.  Re-anchored to a stride that stops one link SHORT, which dies.
+* the per-dof load ignoring its `dof` bound — the four arrays are only read at
+  `ind < dofCount`, so the extra loads are unused; the guard bounds the READ, which
+  is why it stays.  Re-anchored to dropping the LAST dof, which dies.
+* guarding the `mFlags` READ by `active` — equivalent, but it makes the `&& active`
+  in the ballot dead.  The port reads the flags unconditionally exactly as the CUDA
+  does, and that is what lets the ballot's guard be tested: the fixture's poison
+  flags have the fix bit set, so an inactive lane reaching the walk would resolve
+  the invalid articulation id.
+
+Two of the four first-round survivors were **fixture** coincidences of the usual
+kind and were removed rather than explained: the free-base flag word was zero (so
+`flags != 0` stood in for the bit test), and the guarded flags read made the
+ballot's own guard untestable.  Both mutants die now.
+
+Suite **719/719 in both memory modes**; all 21 scenes still green.
+
+**The articulation scene still reports its two step failures**, exactly as the
+plan said it would: `computeUnconstrainedAccelerationsLaunch1T` is the last
+unmapped kernel of the sequence, so the acceleration that would move the link is
+still never computed.  That is P8.92, and it is the one that changes the verdict.
 
 ## P8.91b — `writeMatrix`: the first warp-cooperative articulation code
 

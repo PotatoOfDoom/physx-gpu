@@ -1146,6 +1146,12 @@ static const PxgKernelAbiRow kRows[] = {
     // port that reuses the partial kernel's warps-per-block of 2 processes half the
     // articulations.  (P8.88)
     { "computeUnconstrainedSpatialInertiaLaunch1T", kOnePtr, 1u },
+    // forwardDynamic2.cu:1736 computeMassMatrix1T(const PxgArticulationCoreDesc*)
+    // -> kOnePtr again, and the same (32, 1, 1) / num1TBlocks * 2 geometry as the
+    // kernel above.  Here one warp per block is not just the launch shape: the
+    // staged scatter's shared arrays are per BLOCK, so a second warp would
+    // overwrite the first one's staging slots.  (P8.91c)
+    { "computeMassMatrix1T", kOnePtr, 1u },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

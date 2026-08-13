@@ -103,8 +103,10 @@
 #include "pxgSlangWarpInc.slang"
 
 import pxgSlangCommon;
+import pxgSlangArticulationDesc;
 import pxgSlangArticulationBlocks;
 import pxgSlangSpatialMatrix;
+import pxgSlangArticulationDynamic;
 
 static const uint MM_WARP = 32u;
 static const uint MM_FULL_MASK = 0xFFFFFFFFu;
@@ -183,12 +185,394 @@ void mmWarpCopyU(uint64_t dst, uint value, uint totalBytes, uint lane)
 }
 
 // ===========================================================================
+// P8.91c: the body of `computeMassMatrix1T` (forwardDynamic2.cu:1736-1930)
+// ===========================================================================
+//
+// The impulse-response matrix of every link: apply a unit impulse on each of the
+// six spatial axes in turn, propagate it up to the parent, take the parent's
+// already-computed response, and propagate the resulting acceleration back down.
+// Six columns per link, one link at a time, the whole warp in lockstep.
+//
+// Zero new ABI for the FOURTH tranche running: every field it touches —
+// `mInvSpatialArticulatedInertia` (0), `mSpatialResponseMatrix` (3584), `mCfm`
+// (28160), `mJointOffset` (28544), `mParents` (28672), `mDofs` (28800),
+// `mWorldMotionMatrix` (1152), `mIsInvDW` (2688), `mIsW` (3456),
+// `mInvStIsT_{x,y,z}` (4992/5120/5248) — and the record's
+// `spatialResponseMatrixW` (176), `cfms` (336) and `cfmScale` (344) were already
+// mapped.
+//
+// ===========================================================================
+// SEVEN THINGS TO TRANSCRIBE RATHER THAN TIDY, EACH A MUTANT
+// ===========================================================================
+//
+//  1. **The grid is over ARTICULATION BLOCKS, not articulations**, and the guard
+//     is `globalWarpIndex < nbArticulationBlocks` with a SECOND per-lane `active`
+//     test.  P8.83-P8.88 all returned early on `globalThreadIndex >=
+//     nbArticulations`; doing that here removes lanes from every ballot and every
+//     `writeMatrix` they are required to take part in.
+//  2. **`articulationIndex` comes from the BLOCK** (`mArticulationIndex[lane]`),
+//     not from the island-node/bodySim chain P8.83 and P8.85 walk and not from
+//     the record.  Third kernel, third source.
+//  3. **The fixed-base path zeroes the record through `warpCopy` but the block
+//     through `zeroSpatialMatrix`** — two mechanisms for the same logical zero,
+//     because the record's matrix is one contiguous 144-byte object per
+//     articulation while the block's is a 32-lane interleave.
+//  4. **`cfm` is a max over three DIAGONAL entries, and the index pattern differs
+//     between the root and the links.**  Root: `bottomLeft.{c0.x, c1.y, c2.z}` of
+//     the INVERSE articulated inertia.  Link: `response.column[i][3 + i]` for
+//     i = 0,1,2.  The two are not the same slots of the same object.
+//  5. **The unit impulse is NEGATED for the links and NOT for the root.**  The
+//     root builds its response from `+1` on each axis of the inverse inertia
+//     directly; the link path drives `propagateImpulseW` with `-1`.
+//  6. **`maxLinksInWarp` is a warp MAX, so lanes iterate past their own link
+//     count** — with `thisThreadActive` false — precisely so they stay in the
+//     ballot and in `writeMatrix`.
+//  7. **`response` is left UNINITIALISED for an inactive lane** and handed to
+//     `writeMatrix` anyway, which never reads it for such a lane.  The port zeroes
+//     it instead of leaving it undefined, which is a strict improvement and is
+//     unobservable for exactly that reason.
+//
+// And two the CUDA itself leaves lying around, dropped by the port with a note
+// rather than transcribed: `articulationsInBlock` is computed and never used, and
+// the mixture of `threadIdx.x` with `threadIndexInWarp` inside the link loop is
+// an engine inconsistency that is only safe because `blockDim.x == 32` (the same
+// unification P8.88 recorded).
+//
+// ---------------------------------------------------------------------------
+// The signed-zero seed, and why it is the CALLER's problem
+// ---------------------------------------------------------------------------
+//
+// `PxReal qstZ[3] = { 0.f, 0.f, 0.f }` is the literal-zero accumulator P8.87
+// identified: `adPropagateImpulseW` does `qstZ[ind] = qstZ[ind] + stZ`, so with a
+// single accumulated term the driver's `x + 0.0` fold makes a `-0` term survive
+// as `-0` where the engine's C++ returns `+0`.  `pxgSlangArticulationDynamic`'s
+// header says this is the caller's fixture problem; this is that caller, and the
+// fixture carries the scoped tolerance with its count printed and bounded.
+
+// Load the six per-dof quantities the link path needs.  `dof` is a PxU8 in the
+// block and is read as one -- a word read here picks up `mDisableGravity` and
+// friends, which is the P8.88 hazard that cost a sweep round.
+struct MmDofData
+{
+    AbSpatialVector motionV[3];
+    float3 invStIsT[3];
+    AbSpatialVector isInvD[3];
+    AbSpatialVector isW[3];
+};
+
+MmDofData mmLoadDofData(uint64_t dofData, uint dof, uint lane)
+{
+    MmDofData d;
+    for (uint i = 0u; i < 3u; ++i)
+    {
+        d.motionV[i] = asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
+        d.invStIsT[i] = float3(0.0f, 0.0f, 0.0f);
+        d.isInvD[i] = asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
+        d.isW[i] = asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
+
+        if (i < dof)
+        {
+            const uint64_t b = dofData + uint64_t(i) * PXG_AB_DOF_SIZE;
+            float3 t, bo;
+            abLoadSpatialVector(b, PXG_AB_DOF_mWorldMotionMatrix, lane, t, bo);
+            d.motionV[i] = asmSVec(t, bo);
+            d.invStIsT[i] = float3(abF32(b, PXG_AB_DOF_mInvStIsT_x, lane),
+                                   abF32(b, PXG_AB_DOF_mInvStIsT_y, lane),
+                                   abF32(b, PXG_AB_DOF_mInvStIsT_z, lane));
+            abLoadSpatialVector(b, PXG_AB_DOF_mIsInvDW, lane, t, bo);
+            d.isInvD[i] = asmSVec(t, bo);
+            abLoadSpatialVector(b, PXG_AB_DOF_mIsW, lane, t, bo);
+            d.isW[i] = asmSVec(t, bo);
+        }
+    }
+    return d;
+}
+
+// `Cm::UnAlignedSpatialVector::operator[]`: 0..2 index the TOP half, 3..5 the
+// bottom one.  Used to build `vec[i] = +/-1` without a six-way branch.
+AbSpatialVector mmAxis(uint i, float s)
+{
+    return asmSVec(float3(i == 0u ? s : 0.0f, i == 1u ? s : 0.0f, i == 2u ? s : 0.0f),
+                   float3(i == 3u ? s : 0.0f, i == 4u ? s : 0.0f, i == 5u ? s : 0.0f));
+}
+
+// `response.column[i][0..5] = (r.top, r.bottom)` -- one COLUMN per axis, and
+// `AbMatrix6x6::e[i * 6 + j] == column[i][j]`.
+void mmSetColumn(inout AbMatrix6x6 m, uint i, AbSpatialVector r)
+{
+    m.e[i * 6u + 0u] = r.top.x;
+    m.e[i * 6u + 1u] = r.top.y;
+    m.e[i * 6u + 2u] = r.top.z;
+    m.e[i * 6u + 3u] = r.bottom.x;
+    m.e[i * 6u + 4u] = r.bottom.y;
+    m.e[i * 6u + 5u] = r.bottom.z;
+}
+
+// PxMax (PxMath.h): `a < b ? b : a`.  Spelled out because the nesting order is
+// transcribed and `max()` would be the tidy version of a different expression.
+float mmPxMax(float a, float b) { return a < b ? b : a; }
+
+// The whole kernel body, with the block bases and the record pointers resolved.
+// Split out from the entry point so the fixture can drive it with hand-fed bases
+// exactly as P8.88's loop mirror does.
+void mmComputeMassMatrix(uint64_t artiBlock, uint64_t linkBlocks, uint64_t dofBlocks,
+                         uint64_t articulationsBase, bool active, uint lane)
+{
+    // zero for an inactive lane -- it still takes part in the reduction below
+    const uint numLinks = active ? abU32(artiBlock, PXG_AB_mNumLinks, lane) : 0u;
+
+    // the articulation index comes from the BLOCK -- trap 2.  An inactive lane
+    // keeps the invalid id and null record pointers; nothing below dereferences
+    // them, and the CUDA's own `assert(artiInd != invalidArticulationId)` says the
+    // walk must never reach one.
+    uint articulationIndex = 0xFFFFFFFFu;
+    uint64_t responseMatrices = 0;
+    uint64_t cfms = 0;
+    uint64_t cfmScale = 0;
+    if (active)
+    {
+        articulationIndex = abU32(artiBlock, PXG_AB_mArticulationIndex, lane);
+        const uint64_t a = articulationsBase + uint64_t(articulationIndex) * PXG_ARTI_STRIDE;
+        responseMatrices = artiPtrField(a, PXG_ARTI_SPATIAL_RESPONSE_MATRIX_W);
+        cfms = artiPtrField(a, PXG_ARTI_CFMS);
+        cfmScale = artiPtrField(a, PXG_ARTI_CFM_SCALE);
+    }
+
+    // The flags are read UNCONDITIONALLY, exactly as the CUDA reads them: the
+    // block slice is allocated for all 32 lanes, and it is `active` in the line
+    // below that keeps an inactive lane out of the ballot.  Guarding the read
+    // instead would make that `&& active` dead — and the sweep says so, because
+    // the fixture's poison flags have the fix bit set, so an inactive lane that
+    // reached the fixed-base walk would resolve `articulationIndex` 0xFFFFFFFF.
+    const uint flags = abU32(artiBlock, PXG_AB_mFlags, lane);
+    const bool fixBase = active && (flags & PXG_ARTI_FLAG_FIX_BASE) != 0u;
+    const bool notFixBase = !fixBase && active;
+
+    const uint fixMask = pxgBallotSync(MM_FULL_MASK, lane, fixBase);
+    const uint notFixMask = pxgBallotSync(MM_FULL_MASK, lane, notFixBase);
+
+    if (fixMask != 0u)
+    {
+        // the BLOCK's matrix: a 32-lane interleave, so one lane's slots -- trap 3
+        if (fixBase)
+            abZeroSpatialMatrix6x6(linkBlocks, PXG_AB_LINK_mSpatialResponseMatrix, lane);
+
+        // The RECORD's matrix: 144 contiguous bytes per articulation, so the whole
+        // warp clears one at a time, walking the ballot's set bits.
+        //
+        // PLATFORM RULE P8.40 APPLIES HERE, and it is what this loop is shaped
+        // around.  The CUDA broadcasts the ARTICULATION INDEX and then resolves
+        // `articulations[artiInd].spatialResponseMatrixW` inside the loop — a
+        // pointer LOADED through a BDA and immediately dereferenced, one level
+        // down, inside a loop.  On llvmpipe that faults: measured, with the
+        // identical pointer value, resolving it outside the loop works and
+        // resolving it inside does not.  So the port broadcasts the ALREADY
+        // RESOLVED pointer instead, in two halves.
+        //
+        // That is the same pointer, not an approximation: `responseMatrices` was
+        // set to exactly `articulations[articulationIndex].spatialResponseMatrixW`
+        // for every ACTIVE lane, and only active lanes can be in `fixMask` — the
+        // CUDA's own `assert(artiInd != invalidArticulationId)` says so.
+        for (uint m = fixMask; m != 0u; m = pxgClearLowestSetBit(m))
+        {
+            const int src = pxgLowestSetIndex(m);
+            const uint lo = pxgShflSyncU(MM_FULL_MASK, lane,
+                                         uint(responseMatrices & 0xFFFFFFFFull), src, 32u);
+            const uint hi = pxgShflSyncU(MM_FULL_MASK, lane, uint(responseMatrices >> 32), src,
+                                         32u);
+            mmWarpCopyU(uint64_t(lo) | (uint64_t(hi) << 32), 0u, MM_MATRIX_BYTES, lane);
+        }
+
+        if (fixBase)
+        {
+            (Ptr<float>(cfms))[0] = 0.0f;
+            abStoreF32(linkBlocks, PXG_AB_LINK_mCfm, lane, 0.0f);
+        }
+    }
+
+    if (notFixMask != 0u)
+    {
+        AbMatrix6x6 response = abMatrix6x6Zero();   // trap 7
+
+        if (notFixBase)
+        {
+            const AbSpatialMatrix inv =
+                asmLoadSpatialMatrix(artiBlock, PXG_AB_mInvSpatialArticulatedInertia, lane);
+
+            // the root's unit impulses are POSITIVE -- trap 5
+            for (uint i = 0u; i < 6u; ++i)
+                mmSetColumn(response, i, asmMulVec(inv, mmAxis(i, 1.0f)));
+
+            abStoreSpatialMatrix6x6(linkBlocks, PXG_AB_LINK_mSpatialResponseMatrix, lane, response);
+
+            // the root's cfm reads the INVERSE INERTIA's bottomLeft diagonal -- trap 4
+            const float cfmVal =
+                (Ptr<float>(cfmScale))[0]
+                * mmPxMax(inv.bottomLeft.c0.x, mmPxMax(inv.bottomLeft.c1.y, inv.bottomLeft.c2.z));
+
+            (Ptr<float>(cfms))[0] = cfmVal;
+            abStoreF32(linkBlocks, PXG_AB_LINK_mCfm, lane, cfmVal);
+        }
+
+        mmWriteMatrix(response, responseMatrices, notFixMask, lane, notFixBase);
+    }
+
+    // a warp MAX, so short articulations keep iterating with thisThreadActive
+    // false rather than dropping out of the ballots -- trap 6
+    const uint maxLinksInWarp = pxgWarpReduceMaxU(MM_FULL_MASK, lane, numLinks, 5u);
+
+    for (uint linkID = 1u; linkID < maxLinksInWarp; ++linkID)
+    {
+        AbMatrix6x6 response = abMatrix6x6Zero();   // trap 7
+
+        const bool thisThreadActive = linkID < numLinks;
+        const uint activeThreadMask = pxgBallotSync(MM_FULL_MASK, lane, thisThreadActive);
+
+        if (thisThreadActive)
+        {
+            const uint64_t thisLink = linkBlocks + uint64_t(linkID) * PXG_AB_LINK_SIZE;
+            const uint jointOffset = abU32(thisLink, PXG_AB_LINK_mJointOffset, lane);
+            const uint64_t dofData = dofBlocks + uint64_t(jointOffset) * PXG_AB_DOF_SIZE;
+
+            const uint parentId = abU32(thisLink, PXG_AB_LINK_mParents, lane);
+            const float3 rw = float3(abF32(thisLink, PXG_AB_LINK_mRw_x, lane),
+                                     abF32(thisLink, PXG_AB_LINK_mRw_y, lane),
+                                     abF32(thisLink, PXG_AB_LINK_mRw_z, lane));
+            const uint dof = abU8(thisLink, PXG_AB_LINK_mDofs, lane);
+
+            const MmDofData d = mmLoadDofData(dofData, dof, lane);
+
+            // the parent's response, written by an earlier iteration of THIS loop
+            // (`parents[linkID] < linkID` is the engine's invariant)
+            const AbMatrix6x6 parentResponse = abLoadSpatialMatrix6x6(
+                linkBlocks + uint64_t(parentId) * PXG_AB_LINK_SIZE,
+                PXG_AB_LINK_mSpatialResponseMatrix, lane);
+
+            for (uint i = 0u; i < 6u; ++i)
+            {
+                // the impulse is NEGATED here -- trap 5
+                const AbSpatialVector vec = mmAxis(i, -1.0f);
+
+                // the literal-zero seed -- see the signed-zero note in the header
+                float qstZ[3] = { 0.0f, 0.0f, 0.0f };
+
+                // (1) propagate the impulse up to the parent
+                const AbSpatialVector Zp =
+                    adPropagateImpulseW(d.isInvD, rw, d.motionV, vec, dof, qstZ);
+
+                // (2) the parent's deltaV response, negated, propagated back down
+                const AbSpatialVector Zr = asmSVecScale(asmM6MulVec(parentResponse, Zp), -1.0f);
+                const AbSpatialVector deltaV =
+                    adPropagateAccelerationW(rw, d.invStIsT, d.motionV, Zr, dof, d.isW, qstZ);
+
+                mmSetColumn(response, i, deltaV);
+            }
+
+            // the link's cfm reads the RESPONSE's off-block diagonal -- trap 4
+            const float cfmVal =
+                (Ptr<float>(cfmScale))[linkID]
+                * mmPxMax(abM6Get(response, 0u, 3u),
+                          mmPxMax(abM6Get(response, 1u, 4u), abM6Get(response, 2u, 5u)));
+
+            (Ptr<float>(cfms))[linkID] = cfmVal;
+            abStoreF32(thisLink, PXG_AB_LINK_mCfm, lane, cfmVal);
+
+            abStoreSpatialMatrix6x6(thisLink, PXG_AB_LINK_mSpatialResponseMatrix, lane, response);
+        }
+
+        mmWriteMatrix(response, responseMatrices + uint64_t(linkID) * MM_MATRIX_BYTES,
+                      activeThreadMask, lane, thisThreadActive);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// computeMassMatrix1T (forwardDynamic2.cu:1736)
+// ---------------------------------------------------------------------------
+//
+// Block (32, 1, 1), grid `num1TBlocks * 2` — the same shape as P8.88's kernel,
+// and the reason `MM_WARPS_PER_BLOCK` is its own constant rather than shared with
+// P8.85's 2.  Here it is also load-bearing for a second reason: `writeMatrix`'s
+// shared arrays are per BLOCK, so a second warp in the block would scribble on
+// the first one's staging slots.
+
+struct MmLaunchParams
+{
+    uint64_t scDesc;   // @0  PxgArticulationCoreDesc*
+};
+
+[[vk::push_constant]]
+ConstantBuffer<MmLaunchParams> gMmLaunch;
+
+static const uint MM_WARPS_PER_BLOCK = 1u;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void computeMassMatrix1T(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    const uint64_t d = gMmLaunch.scDesc;
+
+    const uint lane = groupThreadId.x & 31u;
+    const uint globalWarpIndex = groupId.x * MM_WARPS_PER_BLOCK + groupThreadId.y;
+    const uint globalThreadIndex = globalWarpIndex * 32u + groupThreadId.x;
+
+    const uint nbArticulations = artiU32Field(d, PXG_ARTI_CORE_NB_ARTICULATIONS);
+    const uint nbArticulationBlocks = (nbArticulations + 31u) / 32u;
+
+    // the guard is over BLOCKS, and the per-lane test is separate -- trap 1
+    if (globalWarpIndex >= nbArticulationBlocks)
+        return;
+
+    const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);
+    const uint maxDofs = artiU32Field(d, PXG_ARTI_CORE_MAX_DOFS);
+
+    const uint64_t w = uint64_t(globalWarpIndex);
+    const uint64_t artiBlock = artiPtrField(d, PXG_ARTI_CORE_ARTICULATION_BLOCKS)
+                             + w * PXG_AB_BLOCK_SIZE;
+    const uint64_t linkBlocks = artiPtrField(d, PXG_ARTI_CORE_LINK_BLOCKS)
+                              + w * uint64_t(maxLinks) * PXG_AB_LINK_SIZE;
+    const uint64_t dofBlocks = artiPtrField(d, PXG_ARTI_CORE_DOF_BLOCKS)
+                             + w * uint64_t(maxDofs) * PXG_AB_DOF_SIZE;
+
+    const uint64_t articulations = artiPtrField(d, PXG_ARTI_CORE_ARTICULATIONS);
+
+    const bool active = globalThreadIndex < nbArticulations;
+
+    mmComputeMassMatrix(artiBlock, linkBlocks, dofBlocks, articulations, active, lane);
+}
+
+// The same body with the block bases handed in directly, one warp, so the fixture
+// can drive it without building a descriptor -- the P8.88 loop-mirror arrangement.
+struct MmBodyParams
+{
+    uint64_t artiBlock;      // @0
+    uint64_t linkBlocks;     // @8
+    uint64_t dofBlocks;      // @16
+    uint64_t articulations;  // @24
+    uint nbLanes;            // @32
+    uint pad0;               // @36
+    uint pad1;               // @40
+    uint pad2;               // @44 -> 48 bytes
+};
+
+[[vk::push_constant]]
+ConstantBuffer<MmBodyParams> gMmBody;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void artiMassMatrixBody(uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint lane = groupThreadId.x;
+    mmComputeMassMatrix(gMmBody.artiBlock, gMmBody.linkBlocks, gMmBody.dofBlocks,
+                        gMmBody.articulations, lane < gMmBody.nbLanes, lane);
+}
+
+// ===========================================================================
 // The fixture entry points
 // ===========================================================================
 //
 // Neither of these is an engine kernel; they are the smallest shapes that drive
 // the three helpers above with the same lane arithmetic `computeMassMatrix1T`
-// will.  The kernel itself is P8.91c.
+// does.
 
 struct MmWriteParams
 {
@@ -252,11 +636,19 @@ void artiMassMatrixZeroWalk(uint3 groupThreadId : SV_GroupThreadID)
 
     Ptr<uint64_t> ptrTable = Ptr<uint64_t>(gMmWrite.ptrTable);
 
+    // The record pointer is resolved ONCE, outside the loop, and the loop
+    // broadcasts the resolved value rather than the index -- P8.40 again.  See
+    // the mass-matrix walk above for the measurement: the pointer LOAD is what
+    // must not happen inside the loop, and re-resolving `ptrTable[artiInd]` per
+    // iteration is exactly that shape.
+    const uint64_t myRecord = ptrTable[articulationIndex];
+
     for (uint m = gMmWrite.zeroMask; m != 0u; m = pxgClearLowestSetBit(m))
     {
-        const uint srcLane = uint(pxgLowestSetIndex(m));
-        const uint artiInd = pxgShflSyncU(MM_FULL_MASK, lane, articulationIndex, int(srcLane), 32u);
+        const int src = pxgLowestSetIndex(m);
+        const uint lo = pxgShflSyncU(MM_FULL_MASK, lane, uint(myRecord & 0xFFFFFFFFull), src, 32u);
+        const uint hi = pxgShflSyncU(MM_FULL_MASK, lane, uint(myRecord >> 32), src, 32u);
 
-        mmWarpCopyU(ptrTable[artiInd], 0u, gMmWrite.zeroBytes, lane);
+        mmWarpCopyU(uint64_t(lo) | (uint64_t(hi) << 32), 0u, gMmWrite.zeroBytes, lane);
     }
 }
