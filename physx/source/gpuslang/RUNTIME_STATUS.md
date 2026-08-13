@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **715/715** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **717/717** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,88 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.91b — `writeMatrix`: the first warp-cooperative articulation code
+
+`writeMatrix` (forwardDynamic2.cu:1699), `warpCopy<uint>` (copy.cuh:54) and the
+`for (m = mask; m; m = clearLowestSetBit(m))` set-bit walk, as new module
+`shaders/npArtiMassMatrix.slang` with `tests/testArtiMassMatrix.cpp`.  Suite
+715 → **717**; manifest unchanged at **273**; no new ABI.  `pxgClearLowestSetBit`
+joins `pxgSlangWarpInc.slang` — the one warp helper P8.91a deferred, landing now
+that it has a caller and a fixture.
+
+### What changes with this tranche
+
+P8.83-P8.90 were one thread per articulation with **no cross-lane traffic**,
+which is why none of them touched the P2.1 warp library.  Everything here does,
+and the failure mode changes with it: not a wrong offset but a lane-divergence or
+mask bug, on a platform where `pxgSyncWarp` lowers to a **workgroup barrier**
+because llvmpipe's subgroup is 8.  Barrier uniformity therefore stops being
+advisory — every loop containing one is bounded by `countbits(mask)`, and every
+call site in the kernel to come sits inside a warp-uniform branch derived from a
+ballot or a reduction.  A port that made any of those per-lane would deadlock the
+workgroup here while working on a real warp.
+
+### The fixture, and the three coincidences removed before the sweep ran
+
+No engine oracle exists — both functions are `__device__`-only and are pure lane
+arithmetic — so this is the P8.73-P8.80 arrangement, and the tranche note says so
+rather than presenting the sweep as one.  What carries it is that **the
+expectation is a permutation, not a computation**: every active lane's 144 bytes
+must appear at that lane's destination and nowhere else, over a whole region that
+starts at `0xAB…`, so an extra write fails as loudly as a wrong one.
+
+Three fixture coincidences were designed out rather than discovered:
+
+* a **contiguous** mask makes a lane's rank equal its lane index → all four masks
+  are scattered and three have lane 0 clear;
+* a destination table in **lane order** makes a permuted scatter look right → the
+  slot map is a stride-13 permutation over 40 slots;
+* a count that is a **multiple of eight** hides both the `min` and the unsigned
+  wrap → the four counts are 21, 5, 0 and 32.
+
+The zero walk's record stride is **192 bytes, not 144**, so the 48 bytes past each
+`PxSpatialMatrix` must come back poisoned — which is what makes `warpCopy`'s
+`totalSize / sizeof(T)` element count observable rather than merely plausible.
+
+### Sweep: 26/28 killed, and **both survivors are proven equivalences**
+
+The kills cover the rank-versus-lane confusion (from both sides — the shader's use
+and `pxgWarpRankInMask`'s inclusive/exclusive boundary), the unsigned wrap in
+`off = offset - i`, the staging bound, the pass stride at +1, the 18-lane `uint2`
+copy at both boundaries and in its pairing, the pointer's high half, the staging
+stride, **both barriers**, all four of `warpCopy`'s loop terms, and every part of
+the set-bit walk including `clearLowestSetBit` itself.
+
+The two survivors, with their proofs:
+
+* **`nbToProcess = NbPerPass` (the `min` dropped) DIED** — which is worth
+  recording, because the module header had predicted it would be equivalent.  The
+  reasoning was half right: a staged matrix and its destination travel in the same
+  slot, so a stale slot re-writes an earlier result with its own value and is
+  invisible.  What that argument misses is the **first** pass of a call whose
+  count is below eight, where the leftover slots have never been written at all
+  and the pointer is whatever shared memory happened to hold.  The 5-bit mask is
+  exactly that case, and it is what killed the mutant.
+* **`isActive` dropped from the staging guard — SURVIVES, equivalent here.**
+  Ranks are monotone non-decreasing in the lane index and only step up *after* an
+  active lane, so an inactive lane always shares its slot with a **strictly
+  higher** active lane; the only exception is the lanes above the top active one,
+  whose slot is always exactly one past that pass's `nbToProcess` and is never
+  copied out.  So the copied-out image can only change if the same-address
+  groupshared race resolves in favour of the *lower* lane.  The guard is
+  transcribed anyway, because that resolution is a property of this driver and not
+  something the Vulkan memory model promises.
+* **A pass stride of SEVEN — SURVIVES, equivalent.**  At pass `i` slot `j` holds
+  rank `i + j`, so every copy is a correct pair regardless of the stride, and a
+  stride below the window merely repeats work.  A stride of **nine** is the nearby
+  mutant that is not equivalent — it skips rank 8 entirely — and it was added and
+  died.  The original `i += 1` mutant is equivalent for the same reason and was
+  re-anchored rather than counted.
+
+`gpuslang.scan` segfaulted once under `-j4` in `PXG_DEVICE_V2=1` and passed on
+re-run — the intermittent from the open-items list, now 3 failures in ~11 full
+runs, still unattributed and still not this tranche's.
 
 ## P8.91a — the 6×6 matrix-vector product, and the fold made observable on purpose
 

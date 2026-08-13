@@ -541,6 +541,12 @@ pxg_compile_shader(npArtiPropagateInertia artiPropagateInertia computeUnconstrai
 # MUST be in PXG_NOCONTRACT_SHADERS: compared bit-for-bit against the engine's own
 # translateSpatialVector / innerProduct on the host.
 pxg_compile_shader(npArtiDynamic artiDynamicOps)
+# P8.91b: the warp-cooperative machinery of computeMassMatrix1T -- writeMatrix's
+# staged scatter, warpCopy and the set-bit walk.  Deliberately ABSENT from
+# PXG_NOCONTRACT_SHADERS: it moves bits and does no float arithmetic at all, so
+# there is nothing for FMA contraction to change.  Absent from PXG_HLSL_ENTRIES
+# too (Ptr<> plus the groupshared warp emulation).
+pxg_compile_shader(npArtiMassMatrix artiMassMatrixWrite artiMassMatrixZeroWalk)
 pxg_compile_shader(npPairMgmtBda removeContactManagers_Stage1 removeContactManagers_Stage2 removeContactManagers_Stage3 removeContactManagers_Stage4 removeContactManagers_Stage5 removeContactManagers_Stage5_CvxTri)
 # P6.2: PBD particle spatial-hash grid build + reorder on the engine ABI (BDA).
 # Both kernels read the PxgParticleSystem descriptor array through Ptr<> and
@@ -1300,6 +1306,7 @@ add_executable(gpuslang-tests
     testArtiSpatialMatrix.cpp
     testArtiPropagateInertia.cpp
     testArtiDynamic.cpp
+    testArtiMassMatrix.cpp
     testNpSbTet.cpp
     testNpSbSelf.cpp
     testNpSbSb.cpp
@@ -1532,7 +1539,7 @@ foreach(suite scan radixSort radixSortDesc radixSortGather preIntegration integr
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout particleSelfCollision newArticulations dmaArtiResidual artiBlockLayout artiJointFrame artiJcalcPhaseA artiJcalcPhaseB1 artiJcalcPhaseB2 artiJcalcPhaseB3 artiJcalcPhaseC artiJcalcTendons artiJcalcGpuDirty artiJcalcInit artiJcalcLinkVel artiUnconstrainedVel artiSpatialInertia artiSpatialInertiaLaunch artiSpatialMatrix artiSpatialMatrixBlockIo artiPropagateInertia artiArticulatedInertia artiArticulatedInertiaLaunch artiDynamic)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout particleSelfCollision newArticulations dmaArtiResidual artiBlockLayout artiJointFrame artiJcalcPhaseA artiJcalcPhaseB1 artiJcalcPhaseB2 artiJcalcPhaseB3 artiJcalcPhaseC artiJcalcTendons artiJcalcGpuDirty artiJcalcInit artiJcalcLinkVel artiUnconstrainedVel artiSpatialInertia artiSpatialInertiaLaunch artiSpatialMatrix artiSpatialMatrixBlockIo artiPropagateInertia artiArticulatedInertia artiArticulatedInertiaLaunch artiDynamic artiMassMatrixWrite artiMassMatrixZeroWalk)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")

@@ -102,6 +102,11 @@ int pxgFfs(uint v) { return v == 0u ? 0 : int(firstbitlow(v)) + 1; }
 // utils.cuh lowestSetIndex = __ffs(v) - 1  (-1 when v == 0).
 int pxgLowestSetIndex(uint v) { return pxgFfs(v) - 1; }
 
+// utils.cuh clearLowestSetBit = v & (v - 1)  (0 when v == 0, since 0 - 1 wraps
+// to 0xFFFFFFFF and the AND leaves 0).  The `for (m = mask; m; m = clear(m))`
+// idiom that iterates a ballot's set bits depends on that zero case terminating.
+uint pxgClearLowestSetBit(uint v) { return v & (v - 1u); }
+
 // utils.cuh highestSetIndex = 31 - __clz(v)  (-1 when v == 0).
 int pxgHighestSetIndex(uint v) { return v == 0u ? -1 : int(firstbithigh(v)); }
 
