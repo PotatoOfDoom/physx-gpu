@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **714/714** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **715/715** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,60 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.90 — the impulse-response pair, LIFTED rather than re-ported
+
+`propagateImpulseW_everythingPreLoaded` and
+`propagateAccelerationW_everythingPreLoaded` (articulationDynamic.cuh:167 / :206)
+— the Featherstone/Mirtich pair `computeMassMatrix1T` calls six times per link.
+New module `shaders/pxgSlangArticulationDynamic.slang`; suite 714 → **715**;
+manifest unchanged at **273**.
+
+### The bodies already existed, and re-deriving them would have been the mistake
+
+Phase 1 ported both, as `npArtiPropagate.slang` and `npArtiPropagateAccel.slang`,
+each with its traps already written down.  The module's bodies are **lifted from
+those** — same expressions in the same order — not derived a second time from the
+CUDA.
+
+The Phase-1 pair stays put rather than being rewired to call the module, and the
+reason is concrete: both are in `PXG_HLSL_ENTRIES` and must keep lowering to
+cs_6_0, while the module imports the BDA block layer, which does not lower.  What
+keeps the two copies honest is that **the module's fixture compares against the
+ENGINE** — `Dy::FeatherstoneArticulation::translateSpatialVector` is
+`PX_CUDA_CALLABLE` (DyFeatherstoneArticulation.h:828), as are `innerProduct`,
+`cross` and `dot` — where the Phase-1 fixtures compare against a host
+transcription.  The lift is therefore checked against a *stronger* reference than
+the thing it was lifted from.
+
+### Sweep 24 of 25, and the one survivor was predicted in writing
+
+514 cases over both directions, all four dof counts, 12 words each, **no
+signed-zero forgiveness needed**.
+
+**D17 survived: bounding the `jDelta` three-lane dot by `dofCount`.**  That is
+trap 5, and the module header states the equivalence *before* the sweep ran — the
+lanes at or beyond `dofCount` are zero, so the mask is implicit and bounding the
+dot is right today.  What makes this a proof rather than an excuse is its
+partner: **D20 — seeding `tJointDelta` from `QMinusSTZ` instead of zero — DIES.**
+Together they pin exactly the invariant the header names: the dot is unbounded
+because the seeding makes it safe, and the moment the seeding changes it stops
+being safe.
+
+**D21 was a bug in the sweep, not a result.**  The first attempt mutated which
+`invStISW` row is read for `ind >= dofCount` — a branch that never executes, so
+the mutant changed nothing.  Per the standing rule it was recorded as untested,
+re-anchored to actually drop the guard, and it dies; a second mutant dropping the
+*first* pass's guard was added at the same time and dies too.
+
+The fixture's cases exist for the traps rather than for coverage: a **non-zero**
+`qstZ` seed, because the CUDA's own caller passes zeros and cannot tell
+"accumulates" from "assigns"; **loud** `QMinusSTZ` lanes past `dofCount`, which is
+what gives D17/D20 their meaning; a zero-offset stripe where the negation's sign
+is invisible beside a majority where it is not; and motion matrices whose halves
+differ in magnitude so the dual product and the Euclidean one cannot coincide.
+
+Suite **715/715** in both memory modes, forced-fresh.
 
 ## P8.89 — the 6×6 `PxSpatialMatrix` block layer
 
