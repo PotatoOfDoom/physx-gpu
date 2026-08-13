@@ -670,3 +670,80 @@ void artiLinkAcceleration(uint3 groupThreadId : SV_GroupThreadID)
     alaComputeLinkAcceleration(gAlaAccel.artiBlock, gAlaAccel.linkBlocks, gAlaAccel.dofBlocks,
                                numLinks, gAlaAccel.dt, lane);
 }
+
+// ===========================================================================
+// P8.92c: computeUnconstrainedAccelerationsLaunch1T (forwardDynamic2.cu:2358)
+// ===========================================================================
+//
+// The last kernel of `computeUnconstrainedVelocities`' five-kernel sequence, and
+// the one everything since P8.83 has been building state for: this is where the
+// acceleration that moves the link is finally written back into the block and the
+// flat velocity array the constraint prep reads.
+//
+// Eight lines of index arithmetic and two calls.  Its differences from the four
+// wrappers before it, each a mutant:
+//
+//  1. **Block (32, `2`, 1) and grid `num1TBlocks`** — P8.85's shape, not P8.88's
+//     and P8.91c's (32, 1, 1) with twice the grid.  `numWarpsPerBlock` is
+//     `COMPUTE_UNCONSTRAINED_VELOCITES / 32 == 2`
+//     (PxgArticulationCore.cpp:376/479).  A port that carries P8.91c's 1 forward
+//     processes half the articulations.
+//  2. **The guard is per THREAD again** — `globalThreadIndex < nbArticulations`,
+//     an `if` rather than an early return, and there is no ballot anywhere in
+//     here, so nothing needs the inactive lanes.  That is the opposite of
+//     P8.91c's block-level guard, and the two kernels sit next to each other in
+//     the launch sequence.
+//  3. **No island-node / bodySim chain and no record at all.**  Every input comes
+//     from the block; `numLinks` from `mNumLinks`, not from a record.  P8.83 and
+//     P8.85 walk the chain, P8.91c reads the block's articulation index — this
+//     one needs neither.
+//  4. **It calls BOTH bodies**, in order: the acceleration sweep and then the
+//     bias-force sweep, which reads the two acceleration fields the first one
+//     wrote.  Swapping them feeds the friction pass the previous step's values.
+
+struct AlaLaunchParams
+{
+    uint64_t scDesc;   // @0  PxgArticulationCoreDesc*
+};
+
+[[vk::push_constant]]
+ConstantBuffer<AlaLaunchParams> gAlaLaunch;
+
+// TWO warps per block -- deliberately not shared with npArtiMassMatrix's 1
+static const uint ALA_WARPS_PER_BLOCK = 2u;
+
+[shader("compute")]
+[numthreads(32, 2, 1)]
+void computeUnconstrainedAccelerationsLaunch1T(uint3 groupThreadId : SV_GroupThreadID,
+                                               uint3 groupId : SV_GroupID)
+{
+    const uint64_t d = gAlaLaunch.scDesc;
+
+    const uint lane = groupThreadId.x & 31u;
+    const uint globalWarpIndex = groupId.x * ALA_WARPS_PER_BLOCK + groupThreadId.y;
+    const uint globalThreadIndex = globalWarpIndex * 32u + groupThreadId.x;
+
+    const uint nbArticulations = artiU32Field(d, PXG_ARTI_CORE_NB_ARTICULATIONS);
+    if (globalThreadIndex >= nbArticulations)
+        return;
+
+    const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);
+    const uint maxDofs = artiU32Field(d, PXG_ARTI_CORE_MAX_DOFS);
+
+    const uint64_t w = uint64_t(globalWarpIndex);
+    const uint64_t artiBlock = artiPtrField(d, PXG_ARTI_CORE_ARTICULATION_BLOCKS)
+                             + w * PXG_AB_BLOCK_SIZE;
+    const uint64_t linkBlocks = artiPtrField(d, PXG_ARTI_CORE_LINK_BLOCKS)
+                              + w * uint64_t(maxLinks) * PXG_AB_LINK_SIZE;
+    const uint64_t dofBlocks = artiPtrField(d, PXG_ARTI_CORE_DOF_BLOCKS)
+                             + w * uint64_t(maxDofs) * PXG_AB_DOF_SIZE;
+
+    // from the BLOCK, with no record in sight
+    const uint numLinks = abU32(artiBlock, PXG_AB_mNumLinks, lane);
+    const float dt = asfloat(artiU32Field(d, PXG_ARTI_CORE_DT));
+
+    alaComputeLinkAcceleration(artiBlock, linkBlocks, dofBlocks, numLinks, dt, lane);
+
+    // AFTER the sweep: it reads both acceleration fields the sweep just wrote
+    alaJointTransmittedFrictionForce(linkBlocks, numLinks, lane);
+}

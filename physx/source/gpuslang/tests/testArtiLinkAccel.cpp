@@ -70,6 +70,7 @@
 #include "DyFeatherstoneArticulationUtils.h"
 #include "DyFeatherstoneArticulation.h"
 #include "PxgArticulation.h"
+#include "PxgArticulationCoreDesc.h"
 #include "pxgArtiRefHelpers.h"
 
 #include <cstdint>
@@ -914,6 +915,159 @@ PXG_TEST(artiLinkAcceleration)
     shim.memFree(dAb);
     shim.memFree(dCounts);
     shim.memFree(dVel);
+}
+
+
+// ---------------------------------------------------------------------------
+// P8.92c: the kernel
+// ---------------------------------------------------------------------------
+//
+// 130 articulations, grid `num1TBlocks` = 3, block (32, `2`, 1) — the shape of
+// the PARTIAL kernel, not of the two (32, 1, 1) kernels between them.  Five live
+// warp slices and a sixth allocated and left entirely poisoned.  The mirror is
+// the same `laMirror` the body test uses, followed by `frMirror`, in that order:
+// the friction sweep reads both acceleration fields the acceleration sweep wrote.
+
+const uint32_t LAK_NB_ARTI = 130;
+const uint32_t LAK_WARPS_ALLOC = 6;
+
+PXG_TEST(artiAccelerationLaunch)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const PxgKernelDef manifest[] = {
+        // engine ABI { 8 } -- the descriptor pointer alone
+        { "npArtiLinkAccel.spv", "computeUnconstrainedAccelerationsLaunch1T", 8u, 0 },
+    };
+    PxgCudaShim shim(dev, manifest, 1, &artiLinkAccelLoader);
+
+    std::vector<physx::PxgArticulationBlockLinkData> lkImg(size_t(LAK_WARPS_ALLOC) * LA_MAX_LINKS);
+    std::vector<physx::PxgArticulationBlockDofData> dfImg(size_t(LAK_WARPS_ALLOC) * LA_MAX_DOFS);
+    std::vector<physx::PxgArticulationBlockData> abImg(LAK_WARPS_ALLOC);
+    std::memset(lkImg.data(), 0xAB, lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    std::memset(dfImg.data(), 0xAB, dfImg.size() * sizeof(physx::PxgArticulationBlockDofData));
+    std::memset(abImg.data(), 0xAB, abImg.size() * sizeof(physx::PxgArticulationBlockData));
+
+    std::vector<uint32_t> numLinks(LAK_NB_ARTI);
+    for (uint32_t k = 0; k < LAK_NB_ARTI; ++k)
+    {
+        numLinks[k] = laNumLinks(k);
+        const uint32_t warp = k / 32u, lane = k % 32u;
+        PXG_CHECK_MSG(laTotalDofs(k, numLinks[k]) <= LA_MAX_DOFS, "articulation %u needs %u dofs",
+                      k, laTotalDofs(k, numLinks[k]));
+        laFill(lkImg.data() + size_t(warp) * LA_MAX_LINKS, dfImg.data() + size_t(warp) * LA_MAX_DOFS,
+               abImg[warp], k, numLinks[k], lane);
+    }
+
+    std::vector<uint32_t> velPoison(size_t(LAK_NB_ARTI + 8) * LA_VEL_SLOTS * 6);
+    for (size_t j = 0; j < velPoison.size(); ++j)
+        velPoison[j] = 0xAC000000u | uint32_t(j & 0xFFFFFFu);
+
+    PxgDevicePtr dLk = 0, dDf = 0, dAb = 0, dVel = 0, dDesc = 0;
+    shim.memAlloc(&dLk, lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    shim.memAlloc(&dDf, dfImg.size() * sizeof(physx::PxgArticulationBlockDofData));
+    shim.memAlloc(&dAb, abImg.size() * sizeof(physx::PxgArticulationBlockData));
+    shim.memAlloc(&dVel, velPoison.size() * 4);
+    shim.memAlloc(&dDesc, sizeof(physx::PxgArticulationCoreDesc));
+    if (!dLk || !dDf || !dAb || !dVel || !dDesc)
+    {
+        std::printf("  NOTE: no BDA -> skip\n");
+        return;
+    }
+
+    // a stride-31 permutation over the slices, so no articulation writes the slice
+    // its own index would name
+    std::vector<uint32_t> sliceOf(LAK_NB_ARTI);
+    for (uint32_t k = 0; k < LAK_NB_ARTI; ++k)
+    {
+        sliceOf[k] = (k * 31u + 17u) % (LAK_NB_ARTI + 8u);
+        const uint32_t warp = k / 32u, lane = k % 32u;
+        abImg[warp].mMotionVelocitiesPtr[lane] = reinterpret_cast<UnAlignedSpatialVector*>(
+            dVel + PxgDevicePtr(size_t(sliceOf[k]) * LA_VEL_SLOTS * 6 * sizeof(float)));
+    }
+
+    shim.memcpyHtoD(dLk, lkImg.data(), lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    shim.memcpyHtoD(dDf, dfImg.data(), dfImg.size() * sizeof(physx::PxgArticulationBlockDofData));
+    shim.memcpyHtoD(dAb, abImg.data(), abImg.size() * sizeof(physx::PxgArticulationBlockData));
+    shim.memcpyHtoD(dVel, velPoison.data(), velPoison.size() * 4);
+
+    physx::PxgArticulationCoreDesc desc;
+    std::memset(&desc, 0x5A, sizeof(desc));
+    desc.nbArticulations = LAK_NB_ARTI;
+    desc.dt = LA_DT;
+    desc.mArticulationBlocks = reinterpret_cast<physx::PxgArticulationBlockData*>(dAb);
+    desc.mArticulationLinkBlocks = reinterpret_cast<physx::PxgArticulationBlockLinkData*>(dLk);
+    desc.mArticulationDofBlocks = reinterpret_cast<physx::PxgArticulationBlockDofData*>(dDf);
+    desc.mMaxLinksPerArticulation = LA_MAX_LINKS;
+    desc.mMaxDofsPerArticulation = LA_MAX_DOFS;
+    shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
+
+    struct Params { uint64_t desc; } prm = { uint64_t(dDesc) };
+    const uint32_t num1TBlocks = (LAK_NB_ARTI + 63u) / 64u;
+    PXG_CHECK_MSG(num1TBlocks == 3u, "fixture assumes three 1T blocks, got %u", num1TBlocks);
+    // grid num1TBlocks and TWO warps per block -- not the (32, 1, 1) x 2 shape
+    PXG_CHECK_MSG(shim.launchKernel(0, num1TBlocks, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch computeUnconstrainedAccelerationsLaunch1T");
+    shim.streamSynchronize();
+
+    std::vector<physx::PxgArticulationBlockLinkData> wantLk = lkImg;
+    std::vector<physx::PxgArticulationBlockDofData> wantDf = dfImg;
+    std::vector<physx::PxgArticulationBlockData> wantAb = abImg;
+    std::vector<uint32_t> wantVel = velPoison;
+    for (uint32_t k = 0; k < LAK_NB_ARTI; ++k)
+    {
+        const uint32_t warp = k / 32u, lane = k % 32u;
+        physx::PxgArticulationBlockLinkData* lk = wantLk.data() + size_t(warp) * LA_MAX_LINKS;
+        laMirror(lk, wantDf.data() + size_t(warp) * LA_MAX_DOFS, wantAb[warp],
+                 reinterpret_cast<UnAlignedSpatialVector*>(wantVel.data())
+                     + size_t(sliceOf[k]) * LA_VEL_SLOTS,
+                 numLinks[k], LA_DT, lane);
+        // AFTER the sweep, and reading what it wrote
+        frMirror(lk, numLinks[k], lane);
+    }
+
+    std::vector<physx::PxgArticulationBlockLinkData> gotLk(lkImg.size());
+    std::vector<physx::PxgArticulationBlockDofData> gotDf(dfImg.size());
+    std::vector<physx::PxgArticulationBlockData> gotAb(abImg.size());
+    std::vector<uint32_t> gotVel(velPoison.size());
+    shim.memcpyDtoH(gotLk.data(), dLk, gotLk.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    shim.memcpyDtoH(gotDf.data(), dDf, gotDf.size() * sizeof(physx::PxgArticulationBlockDofData));
+    shim.memcpyDtoH(gotAb.data(), dAb, gotAb.size() * sizeof(physx::PxgArticulationBlockData));
+    shim.memcpyDtoH(gotVel.data(), dVel, gotVel.size() * 4);
+
+    size_t bad = 0, signedZeros = 0;
+    auto cmp = [&](const char* what, const void* wp, const void* gp, size_t bytes) {
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(wp);
+        const uint32_t* g = reinterpret_cast<const uint32_t*>(gp);
+        for (size_t k = 0; k < bytes / 4; ++k)
+        {
+            if (w[k] == g[k])
+                continue;
+            if ((w[k] == 0u && g[k] == 0x80000000u) || (w[k] == 0x80000000u && g[k] == 0u))
+            {
+                ++signedZeros;
+                continue;
+            }
+            if (bad < 12)
+                std::printf("MM lak %s word %zu  ref %08x  gpu %08x\n", what, k, w[k], g[k]);
+            ++bad;
+        }
+    };
+    cmp("link", wantLk.data(), gotLk.data(),
+        wantLk.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    cmp("dof", wantDf.data(), gotDf.data(),
+        wantDf.size() * sizeof(physx::PxgArticulationBlockDofData));
+    cmp("arti", wantAb.data(), gotAb.data(),
+        wantAb.size() * sizeof(physx::PxgArticulationBlockData));
+    cmp("flat vel", wantVel.data(), gotVel.data(), wantVel.size() * 4);
+
+    std::printf("[ info ] lak: signed zeros forgiven %zu\n", signedZeros);
+    PXG_CHECK_MSG(bad == 0, "the kernel's whole block image matches the mirror");
+
+    shim.memFree(dLk);
+    shim.memFree(dDf);
+    shim.memFree(dAb);
+    shim.memFree(dVel);
+    shim.memFree(dDesc);
 }
 
 }  // namespace

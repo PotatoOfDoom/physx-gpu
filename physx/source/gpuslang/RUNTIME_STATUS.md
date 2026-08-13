@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **722/722** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **723/723** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,59 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.92c — `computeUnconstrainedAccelerationsLaunch1T` — manifest **275**, and a done-criterion that was WRONG
+
+forwardDynamic2.cu:2358, the last kernel of `computeUnconstrainedVelocities`'
+five-kernel sequence.  Manifest 274 → **275**, suite 722 → **723**, the engine's
+refused-kernel list **227 → 226** with this kernel the one that leaves.  Zero new
+ABI.  Sweep **14/14, no survivors**; all 21 scenes still run, and the other 20
+still pass.
+
+Eight lines of index arithmetic and two calls, with four differences from the
+wrappers before it, each a mutant that dies:
+
+1. **Block (32, `2`, 1), grid `num1TBlocks`** — P8.85's shape, not the (32, 1, 1)
+   × 2 shape of the two kernels immediately before it in the same sequence
+   (`numWarpsPerBlock = COMPUTE_UNCONSTRAINED_VELOCITES / 32 == 2`,
+   PxgArticulationCore.cpp:479);
+2. **the guard is per THREAD again**, an `if` rather than a block-level early
+   return — there is no ballot in here, so nothing needs the inactive lanes;
+3. **no island-node / bodySim chain and no record at all** — every input comes
+   from the block, including `numLinks`;
+4. **it calls both bodies, acceleration first**, because the bias-force sweep
+   reads the two acceleration fields the first one writes.
+
+### The done-criterion this plan set for P8.92 was wrong, and this says so
+
+The plan stated it up front so it could not drift: *"`PXG_SCENE=articulation` must
+stop reporting its two step failures — the link swings down and comes to rest —
+with the refused-kernel list at 227."*  The list is at **226**, one better than
+predicted, and **the scene's verdict is unchanged**.
+
+The prediction was built on the assumption that this five-kernel sequence was the
+last thing between the scene and a moving link.  It is not.  With the sequence
+complete the engine now gets as far as `solveInternalConstraints` and fails to
+launch it: of the **67** kernels the scene still refuses, **24 are the solver-side
+articulation chain** (`artiSolveInternalConstraints{,TGS}1T`,
+`artiPropagateVelocity{,TGS}`, `artiPushImpulse`, the constraint-prep and
+batch-sum families), plus `stepArticulation1TTGS`, `artiOutputVelocity`,
+`updateArticulationsLaunch` and `dmaBackArticulationDataLaunch`.  Sub-chains 3, 4
+and 5 of the phase plan, in other words — not one tranche.
+
+Two measurements worth keeping, because they aim the next one:
+
+* **`artiLink` reads `y = 0.0000` after the FIRST step, and read exactly that
+  before this tranche too** (P8.91c's run, byte for byte the same line).  A link
+  that were merely un-accelerated would sit at 3.000; a value of 0 is a link whose
+  pose never comes back at all.  `dmaBackArticulationDataLaunch` is refused, and
+  it is the first thing to look at — but the cause is not yet established and this
+  note does not claim it is.
+* **`artiCompanionBox` reads 3.7329, also unchanged**, so the rigid half of the
+  scene is unaffected by the articulation work in either direction.
+
+The plan's phase-level done-criterion — "the articulation scene settles" — stands.
+What was wrong was attaching it to this tranche.
 
 ## P8.92b — `computeLinkAcceleration`, and the `+=` association
 

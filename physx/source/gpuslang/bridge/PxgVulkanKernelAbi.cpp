@@ -1152,6 +1152,13 @@ static const PxgKernelAbiRow kRows[] = {
     // staged scatter's shared arrays are per BLOCK, so a second warp would
     // overwrite the first one's staging slots.  (P8.91c)
     { "computeMassMatrix1T", kOnePtr, 1u },
+    // forwardDynamic2.cu:2358 computeUnconstrainedAccelerationsLaunch1T(
+    //     PxgArticulationCoreDesc*)
+    // -> kOnePtr.  The geometry goes BACK to block (32, 2, 1) and grid
+    // num1TBlocks (PxgArticulationCore.cpp:479, numWarpsPerBlock =
+    // COMPUTE_UNCONSTRAINED_VELOCITES / 32 == 2) -- the shape of the partial
+    // kernel, not of the two (32, 1, 1) kernels between them.  (P8.92c)
+    { "computeUnconstrainedAccelerationsLaunch1T", kOnePtr, 1u },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)
