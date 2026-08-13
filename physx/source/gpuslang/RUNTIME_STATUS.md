@@ -1694,6 +1694,78 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.91a — the 6×6 matrix-vector product, and the fold made observable on purpose
+
+`PxSpatialMatrix::operator*` (PxSpatialMatrix.h:58) as `asmM6MulVec` in
+`shaders/pxgSlangSpatialMatrix.slang`, dumped through the existing
+`artiSpatialMatrixBlockIo` entry.  No new module, no new test, no new ABI, manifest
+unchanged at **273**, suite unchanged at **715/715** in both memory modes.  This is
+the first of three pieces of `computeMassMatrix1T`: the algebra (here), then
+`writeMatrix`'s warp-cooperative scatter, then the kernel.
+
+### The indexing, which is the whole trap
+
+```
+result[i] = 0.f;
+for (j = 0..5)  result[i] += column[j][i] * st[j];
+```
+
+The **outer** index walks the result and the **inner** one walks `column`'s FIRST
+subscript — so despite the field being called `column`, the contraction is over the
+first subscript, i.e. this multiplies by the transpose of the reading a name-driven
+port would give it.  For the impulse-response matrices that mistake produces a
+plausible-looking wrong answer rather than an obvious one, which is why it gets two
+mutants (`abM6Get(m, i, j)` for `abM6Get(m, j, i)`, and `st[i]` for `st[j]`) rather
+than one.  Both die.
+
+### The fold lane, and why this tranche went looking for it
+
+P8.87 sharpened P8.84's fourth platform rule into something narrow enough to be
+testable: the `x + 0.0` fold is the **driver's**, no shader-level workaround defeats
+it, and the seed's sign is washed out by IEEE's `(-0) + (+0) = +0` **unless every
+accumulated term in a component is `-0`**.  This function is exactly that shape —
+a literal-zero seed and six `+=` terms — so the fixture builds the one input that
+exposes it rather than leaving the hazard theoretical:
+
+* **lane 3's entire 6×6 is `+0`**, and
+* the spatial vector it is applied to is **entirely negative** (`topLeft.column0`
+  and `topRight.column0` overridden to `-0.51 … -5.77`, values deliberately off the
+  generator's 0.09375 grid so they cannot coincide with another lane's).
+
+Every product is then `+0 × negative = -0`, all six terms are `-0`, and the folded
+result is `-0` where the engine's C++ returns `+0`.  Measured: **exactly six words**,
+one per result component.  The tolerance is scoped to those six slots of that one
+lane, the count is printed, and **both** bounds are asserted — `> 0` so the lane
+cannot silently stop exercising the hazard (or the driver stop folding without
+telling us), `<= 6` so the fold cannot spread unnoticed.
+
+### The oracle
+
+`PxSpatialMatrix::operator*` is `PX_CUDA_CALLABLE`, so the expectation is the
+engine's own arithmetic on the host over the bytes the engine's own
+`storeSpatialMatrix` wrote — the P8.86b arrangement, not a transcription.  The
+source vector is taken from the seven-column matrix's own first column, so a helper
+reaching into the wrong source lands on numbers from a different decade.
+
+### Sweep
+
+**14/14 killed, no survivors**, forced-fresh (`rm build-gpuslang/shaders/*.spv`
+first).  Nine on the algebra — transposed contraction, source-indexed inner term,
+un-reset accumulator, subtraction, half-length contraction, half-length result,
+swapped input halves, swapped output halves, a permutation inside one half — and
+five on the fixture side, including the per-lane output stride left at its old 72.
+
+### What was deliberately NOT added
+
+The plan's P8.91a line also mentioned the small warp helpers.  `lowestSetIndex` and
+`warpScanExclusive(mask, lane)` **already exist** in `shaders/pxgSlangWarpInc.slang`
+as `pxgLowestSetIndex` and `pxgWarpRankInMask` (the latter's comment already names
+its CUDA original), and `clearLowestSetBit` is `v & (v - 1)` with no caller yet.
+Landing an untested one-liner ahead of the loop that needs it is the opposite of
+this chain's discipline, so it goes in with P8.91b's `writeMatrix`, where a fixture
+can drive it.  `warpCopy` likewise: it is a lane-strided copy whose element type is
+fixed by its caller, not a warp primitive.
+
 ## P8.90 — the impulse-response pair, LIFTED rather than re-ported
 
 `propagateImpulseW_everythingPreLoaded` and

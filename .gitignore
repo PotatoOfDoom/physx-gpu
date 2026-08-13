@@ -4,3 +4,4 @@
 /build-sdk/
 # Claude Code local session state (agent worktrees, task tracking) — never project content
 /.claude/
+*.sweepbak

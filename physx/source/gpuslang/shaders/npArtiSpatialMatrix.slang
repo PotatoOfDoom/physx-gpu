@@ -283,7 +283,7 @@ struct SmxIoParams
 [[vk::push_constant]]
 ConstantBuffer<SmxIoParams> gSmxIo;
 
-static const uint SMX_IO_FLOATS_PER_LANE = 72u;   // 27 + 9 + 36 (P8.89)
+static const uint SMX_IO_FLOATS_PER_LANE = 78u;   // 27 + 9 + 36 + 6 (P8.91a)
 
 [shader("compute")]
 [numthreads(32, 1, 1)]
@@ -328,4 +328,12 @@ void artiSpatialMatrixBlockIo(uint3 groupThreadId : SV_GroupThreadID)
 
     abStoreSpatialMatrix6x6(gSmxIo.m6BlockOut, 0u, lane, m6);
     abZeroSpatialMatrix6x6(gSmxIo.m6BlockZero, 0u, lane);
+
+    // P8.91a: the 6x6 applied to a spatial vector.  The vector comes from the
+    // seven-column matrix's own first column, so a helper that reaches into the
+    // wrong source lands on numbers from a different decade.
+    const AbSpatialVector sv = asmSVec(m.topLeft.c0, m.topRight.c0);
+    const AbSpatialVector mv = asmM6MulVec(m6, sv);
+    o[72] = mv.top.x;    o[73] = mv.top.y;    o[74] = mv.top.z;
+    o[75] = mv.bottom.x; o[76] = mv.bottom.y; o[77] = mv.bottom.z;
 }

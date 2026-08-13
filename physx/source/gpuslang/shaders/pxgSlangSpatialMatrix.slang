@@ -453,6 +453,40 @@ public void asmTranslateInertia(AbMat33 sTod, inout AbSpatialMatrix inertia)
 }
 
 // ---------------------------------------------------------------------------
+// PxSpatialMatrix (the full 6x6) times a spatial vector
+// ---------------------------------------------------------------------------
+//
+// PxSpatialMatrix.h:58.  Note the indexing: `result[i] += column[j][i] * st[j]`
+// -- the OUTER index walks the result and the INNER one walks `column`'s first
+// subscript, so despite the field being called `column` this contracts over the
+// first subscript.  Feeding it `column[i][j]` transposes the matrix, and for the
+// impulse-response matrices that is a plausible-looking wrong answer rather than
+// an obvious one.
+//
+// The accumulator starts at a LITERAL zero and is built with `+=` over six terms,
+// which is P8.87's driver-fold shape: if every one of the six products is a
+// negative zero the engine's C++ yields `+0` and the folded form yields `-0`.
+// That needs an entirely zero result row against an all-negative input, which the
+// fixture builds on purpose -- see testArtiSpatialMatrix.cpp's lane 3.
+public AbSpatialVector asmM6MulVec(AbMatrix6x6 m, AbSpatialVector s)
+{
+    float st[6];
+    st[0] = s.top.x;    st[1] = s.top.y;    st[2] = s.top.z;
+    st[3] = s.bottom.x; st[4] = s.bottom.y; st[5] = s.bottom.z;
+
+    float result[6];
+    for (uint i = 0u; i < 6u; ++i)
+    {
+        result[i] = 0.0f;
+        for (uint j = 0u; j < 6u; ++j)
+            result[i] = result[i] + abM6Get(m, j, i) * st[j];
+    }
+
+    return asmSVec(float3(result[0], result[1], result[2]),
+                   float3(result[3], result[4], result[5]));
+}
+
+// ---------------------------------------------------------------------------
 // Cm::UnAlignedSpatialVector
 // ---------------------------------------------------------------------------
 

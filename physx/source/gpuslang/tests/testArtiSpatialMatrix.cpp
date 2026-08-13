@@ -555,7 +555,17 @@ PXG_TEST(artiSpatialMatrixBlockIo)
     // of one lane's nine slots is indistinguishable -- the sweep caught that.
     const uint32_t LANES = 21;
     const uint32_t LANE_SLOTS = 32;
-    const uint32_t FLOATS_PER_LANE = 72;   // 27 + 9 + 36 (P8.89's 6x6)
+    const uint32_t FLOATS_PER_LANE = 78;   // 27 + 9 + 36 (P8.89) + 6 (P8.91a)
+
+    // P8.91a's fold lane.  Its 6x6 is entirely +0 and the spatial vector it is
+    // applied to is entirely NEGATIVE, so every one of the six accumulated terms
+    // in every result component is `+0 * negative = -0`.  That is the only shape
+    // P8.87 could find that survives IEEE's `(-0) + (+0) = +0`, and it is what
+    // makes the driver's `x + 0.0` fold observable: folded, the literal-zero seed
+    // vanishes and the result is `-0`; the engine's C++ keeps the seed and
+    // returns `+0`.  Not lane 0 and not the last lane, so a lane-index error in
+    // either direction lands on a live lane instead.
+    const uint32_t FOLD_LANE = 3;
 
     // 36 distinct, non-round values per lane, and distinct BETWEEN lanes.
     auto val = [](uint32_t lane, uint32_t k) {
@@ -578,6 +588,16 @@ PXG_TEST(artiSpatialMatrixBlockIo)
             for (uint32_t k = 0; k < 9; ++k)
                 mp[b][k] = val(lane, b * 9 + k);
 
+        if (lane == FOLD_LANE)
+        {
+            // the two columns the P8.91a product reads, forced negative.  Values
+            // deliberately OFF `val`'s 0.09375 grid so they cannot coincide with
+            // any other lane's, and all six distinct so a component permutation
+            // in the product still shows.
+            mat.topLeft.column0 = PxVec3(-0.51f, -1.27f, -2.73f);
+            mat.topRight.column0 = PxVec3(-3.59f, -4.23f, -5.77f);
+        }
+
         PxMat33 q;
         for (uint32_t k = 0; k < 9; ++k)
             (&q.column0.x)[k] = val(lane, 27 + k);
@@ -591,7 +611,9 @@ PXG_TEST(artiSpatialMatrixBlockIo)
         PxSpatialMatrix m6;
         for (uint32_t i = 0; i < 6; ++i)
             for (uint32_t j = 0; j < 6; ++j)
-                m6.column[i][j] = val(lane, 40 + i * 6 + j) * 3.0f + 100.0f;
+                m6.column[i][j] = (lane == FOLD_LANE)
+                                      ? 0.0f
+                                      : val(lane, 40 + i * 6 + j) * 3.0f + 100.0f;
         storeSpatialMatrix(m6Block, lane, m6);
 
         // the packing's one unused word, poisoned after the engine zeroed it
@@ -659,7 +681,7 @@ PXG_TEST(artiSpatialMatrixBlockIo)
     // ENGINE's writer re-storing what they returned
     PxgSpatialMatrixBlock wantSmOut = smOutPoison;
     PxgSpatialMatrix6x6Block wantM6Out = m6OutPoison, wantM6Zero = m6ZeroPoison;
-    size_t bad = 0;
+    size_t bad = 0, foldZeros = 0;
     for (uint32_t lane = 0; lane < LANES; ++lane)
     {
         SpatialMatrix mat;
@@ -684,11 +706,39 @@ PXG_TEST(artiSpatialMatrixBlockIo)
             for (uint32_t j = 0; j < 6; ++j)
                 want[36 + i * 6 + j] = m6.column[i][j];
 
+        // P8.91a: the 6x6 applied to the seven-column matrix's own first column.
+        // `PxSpatialMatrix::operator*` is PX_CUDA_CALLABLE (PxSpatialMatrix.h:58),
+        // so this is the engine's arithmetic and not a transcription -- including
+        // the detail the shader header warns about, that `result[i]` contracts
+        // over the FIRST subscript of a member called `column`.
+        {
+            const Cm::UnAlignedSpatialVector sv(mat.topLeft.column0, mat.topRight.column0);
+            const Cm::UnAlignedSpatialVector mv = m6 * sv;
+            want[72] = mv.top.x;
+            want[73] = mv.top.y;
+            want[74] = mv.top.z;
+            want[75] = mv.bottom.x;
+            want[76] = mv.bottom.y;
+            want[77] = mv.bottom.z;
+        }
+
         for (uint32_t k = 0; k < FLOATS_PER_LANE; ++k)
         {
             const float g = got[size_t(lane) * FLOATS_PER_LANE + k];
             if (bitEq(want[k], g))
                 continue;
+            // The one tolerated difference, scoped to the six product slots of
+            // the fold lane and to one bit of them: +0 against -0.  See the
+            // FOLD_LANE note above; the count is printed and bounded so it cannot
+            // drift, and required non-zero so the lane cannot silently stop
+            // exercising the hazard.
+            if (k >= 72 && lane == FOLD_LANE &&
+                ((f2u(want[k]) == 0x00000000u && f2u(g) == 0x80000000u) ||
+                 (f2u(want[k]) == 0x80000000u && f2u(g) == 0x00000000u)))
+            {
+                ++foldZeros;
+                continue;
+            }
             if (bad < 12)
                 std::printf("MM lane %u slot %u  ref %.9g (%08x)  gpu %.9g (%08x)\n", lane, k,
                             want[k], f2u(want[k]), g, f2u(g));
@@ -696,6 +746,14 @@ PXG_TEST(artiSpatialMatrixBlockIo)
         }
     }
 
+    std::printf("[ info ] signed-zero words forgiven: %zu (the driver's `x + 0.0` fold)\n",
+                foldZeros);
+    // Measured: exactly six, one per component of the fold lane's result.  Both
+    // bounds are tripwires -- zero would mean the lane has stopped exercising the
+    // hazard (or the driver has stopped folding, which is worth being told), and
+    // more than six would mean the fold has spread somewhere it was not before.
+    PXG_CHECK_MSG(foldZeros > 0, "the fold lane must actually exercise the `x + 0.0` fold");
+    PXG_CHECK_MSG(foldZeros <= 6, "the signed-zero count has drifted: %zu", foldZeros);
     PXG_CHECK_MSG(bad == 0, "block loads identical to loadSpatialMatrix / loadPxMat33");
 
     // asmStoreSpatialMatrix forwards three separate blocks to abStoreSpatialMatrix,
