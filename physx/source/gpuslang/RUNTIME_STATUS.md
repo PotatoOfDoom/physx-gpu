@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **719/719** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **721/721** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,85 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.92a — the bias-force sweep and the parallel-axis theorem
+
+`computeJointTransmittedFrictionForce` (forwardDynamic2.cu:2317) as new module
+`shaders/npArtiLinkAccel.slang`, and the free `translateInertia(inertia, mass,
+offset)` (forwardDynamic2.cu:1569) as `asmTranslateInertiaMass` beside the rest of
+the algebra.  Suite 719 → **721**; manifest unchanged at **274**; **zero new ABI
+for the fifth tranche running** — `mBiasForce` (20224), `mMotionAcceleration`
+(18688), `mMotionAccelerationInternal` (19456), `mInvInertiaXYZ_invMassW` (27648),
+`mAccumulatedPose` (23552), `mParents` (28672) and `mRw_{x,y,z}` were all mapped
+in P8.68.
+
+These are the two pieces of `computeUnconstrainedAccelerationsLaunch1T` that stand
+on their own.  `computeLinkAcceleration` itself is P8.92b and the wrapper — the
+one that changes the scene's verdict — is P8.92c.
+
+### The oracle, and it is a strong one
+
+Everything both bodies are built from is `PX_CUDA_CALLABLE`: `PxQuat::rotate` and
+`rotateInv`, `PxVec3::multiply`, `PxMat33::getTranspose` and both `operator*`
+forms, `FeatherstoneArticulation::translateSpatialVector`, and the engine's own
+`loadSpatialVector` / `storeSpatialVector`.  The expectation is therefore the
+engine's arithmetic on the host, compared bit for bit; only the loop's STRUCTURE
+is transcribed, which is where every trap lives.
+
+### The traps
+
+1. the sweep is **leaf-to-root and strictly sequential** — each iteration
+   accumulates into its parent, which a later one reads as its own `Ia`;
+2. the parent's bias force is **loaded at the top**, before this link's own `Ia`
+   is stored (the P8.88 read-modify-write shape);
+3. the inertia and the mass are **per-component reciprocals with their own zero
+   guards** — a static link has `invMass == 0`, which the scene contains;
+4. **the dual basis crosses over**: the TORQUE half of the force picks up the
+   ANGULAR half of the acceleration, and the LINEAR FORCE half picks up the
+   LINEAR half.  A port that keeps them parallel produces plausible numbers;
+5. the inertia is applied **in the body frame**,
+   `rot.rotate(rot.rotateInv(a.top).multiply(inertia))` — and `multiply` is the
+   componentwise product, not a dot;
+6. `motionAcceleration` is the **SUM** of the external and internal fields;
+7. the root's bias force is **zeroed after the loop**, discarding everything the
+   loop accumulated into link 0.
+
+And the sign: `translateSpatialVector(+rw, Ia)`, NOT negated — the opposite of the
+acceleration direction.
+
+### The fixture
+
+Three topologies in one warp — a **chain**, a **binary tree** and a **star**.  The
+tree is the one that earns its place: with three or more links, links 1 and 2 both
+hang off link 0, so an interior node receives TWO accumulations and a port that
+assigns where it should add is wrong somewhere other than the root.  Beside that:
+link counts 2..7, each distinct from its lane index; a link with `invMass == 0`
+and a different one with a single zero inertia component, so both guards fire
+alone; a lane whose quaternion is the IDENTITY beside lanes with a general
+rotation; both acceleration halves non-zero and different; `mBiasForce` pre-seeded
+NON-ZERO so `+=` is distinguishable from `=` and the root's zeroing is a real
+change; and the whole link-block region compared byte for byte against `0xAB`.
+
+### Sweep: 32/35 killed, three proven equivalences
+
+Two of them are the same fact, and it is worth recording because it bounds what
+this call site can check at all: **`s` is skew, so `s^T == -s`**, and therefore
+`s^T s`, `s s^T` and `(-s)^T (-s)` are the same sums of the same products in the
+same order — bit-identical, since `(-a) * (-b)` is exactly `a * b` in IEEE.  Both
+substitutions survive, and neither is a gap: the skew's SIGN CONVENTION is simply
+unverifiable here.  That is the argument for keeping the engine's spelling rather
+than "simplifying" to `|t|^2 I - t t^T` — the convention IS load-bearing at
+`asmSkewSymmetric`'s other call sites, and this one must not drift from it.  The
+nearby mutants that break skewness itself (a diagonal entry; a symmetrised
+off-diagonal) were added and both die.
+
+The third: **re-loading the parent's bias force at the store** is equivalent,
+because nothing writes that slot between the load and the store — a link is never
+its own parent.  Hoisting the load OUT of the loop is not equivalent, and the star
+topology is what proves it: several links share one parent, so the second of them
+would read a stale value.  Added, and it dies.
+
+Suite **721/721 in both memory modes**.
 
 ## P8.91c — `computeMassMatrix1T` — manifest **274**, and P8.40 bites for real
 

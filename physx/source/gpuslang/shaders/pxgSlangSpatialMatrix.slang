@@ -452,6 +452,37 @@ public void asmTranslateInertia(AbMat33 sTod, inout AbSpatialMatrix inertia)
                                                asmM33Transpose(inertia.bottomLeft)), 0.5f);
 }
 
+// The OTHER translateInertia (forwardDynamic2.cu:1569), and it is a different
+// function from the one above despite the shared name: this one is the parallel
+// axis theorem on a plain 3x3, `I + m * s(t)^T s(t)`, and it RETURNS rather than
+// mutating.  `computeLinkAcceleration`'s compound inertia is built out of it.
+//
+// Two things transcribed rather than tidied:
+//   * `s` is the skew of `t` with the SAME sign convention as
+//     `constructSkewSymmetricMatrix`, so `s^T s` is the symmetric positive
+//     semi-definite `|t|^2 I - t t^T` -- but it is spelled as a product of two
+//     matrices, and the port keeps that spelling because the fixture compares bit
+//     patterns;
+//   * the association is `((s^T * s) * mass) + inertia`, left to right.  Folding
+//     the mass into either factor first changes the last bit.
+//
+// What this call site CANNOT check, measured rather than assumed: `s` is skew, so
+// `s^T == -s`, and therefore `s^T s`, `s s^T` and `(-s)^T (-s)` are all the same
+// sums of the same products in the same order — bit-identical, since `(-a)*(-b)`
+// is exactly `a*b` in IEEE.  The sweep confirms it: both substitutions survive.
+// The skew's SIGN CONVENTION is thus unverifiable here, which is precisely why the
+// port keeps the engine's spelling instead of "simplifying" to `|t|^2 I - t t^T`
+// — the convention is load-bearing at `asmSkewSymmetric`'s other call sites, and
+// this one must not be allowed to drift away from it.
+public AbMat33 asmTranslateInertiaMass(AbMat33 inertia, float mass, float3 t)
+{
+    const AbMat33 s = asmM33(float3(0.0f, t.z, -t.y),
+                             float3(-t.z, 0.0f, t.x),
+                             float3(t.y, -t.x, 0.0f));
+
+    return asmM33Add(asmM33Scale(asmM33Mul(asmM33Transpose(s), s), mass), inertia);
+}
+
 // ---------------------------------------------------------------------------
 // PxSpatialMatrix (the full 6x6) times a spatial vector
 // ---------------------------------------------------------------------------

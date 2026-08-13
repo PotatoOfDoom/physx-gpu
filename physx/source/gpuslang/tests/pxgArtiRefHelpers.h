@@ -156,6 +156,19 @@ inline physx::Cm::UnAlignedSpatialVector refPropagateAccelerationW(
     return pDeltaV;
 }
 
+// The OTHER translateInertia (forwardDynamic2.cu:1569) -- the parallel axis
+// theorem on a plain 3x3, which RETURNS rather than mutating.  Structure only;
+// `getTranspose`, both `operator*` forms and `operator+` are the engine's.
+//
+// The association is load-bearing: `((s^T * s) * mass) + inertia`, left to right.
+inline physx::PxMat33 refTranslateInertiaMass(const physx::PxMat33& inertia, physx::PxReal mass,
+                                              const physx::PxVec3& t)
+{
+    using physx::PxVec3;
+    const physx::PxMat33 s(PxVec3(0.f, t.z, -t.y), PxVec3(-t.z, 0.f, t.x), PxVec3(t.y, -t.x, 0.f));
+    return s.getTranspose() * s * mass + inertia;
+}
+
 }  // namespace pxgtest
 
 #endif
