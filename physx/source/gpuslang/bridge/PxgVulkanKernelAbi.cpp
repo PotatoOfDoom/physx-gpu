@@ -1159,6 +1159,14 @@ static const PxgKernelAbiRow kRows[] = {
     // COMPUTE_UNCONSTRAINED_VELOCITES / 32 == 2) -- the shape of the partial
     // kernel, not of the two (32, 1, 1) kernels between them.  (P8.92c)
     { "computeUnconstrainedAccelerationsLaunch1T", kOnePtr, 1u },
+    // forwardDynamic2.cu:3794 dmaBackArticulationDataLaunch(
+    //     PxgArticulationCoreDesc*, PxgArticulationOutputDesc*)
+    // -> kTwoPtr.  Block (32, 2, 1), grid ceil(nbActiveArticulations / 2)
+    // (PxgArticulationCore.cpp:1007).  This is the kernel that fills the PINNED
+    // staging buffer the host copies into every link's bodyCore->body2World, so
+    // a refused launch does not leave the pose stale -- it overwrites it with
+    // whatever the staging buffer held.  (P8.93)
+    { "dmaBackArticulationDataLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

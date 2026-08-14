@@ -291,6 +291,56 @@ public static const uint PXG_ARTI_INTERNAL_RESIDUAL = 512;
 public static const uint PXG_ARTI_CONTACT_RESIDUAL = 524;
 public static const uint PXG_ARTI_ERROR_ACCUMULATOR_SIZE = 12;
 
+// ---------------------------------------------------------------------------
+// P8.93: PxgArticulationOutputDesc (32 bytes) and what feeds it
+// ---------------------------------------------------------------------------
+//
+// The scene-wide staging struct `dmaBackArticulationDataLaunch` writes into.
+// Generated from the engine headers and pinned by static_assert in
+// tests/testArtiDmaBack.cpp -- the P8.49a failure mode (shader and fixture
+// sharing one wrong number) is closed only by generation.
+public static const uint PXG_ARTI_OUT_STATE_DATA = 0;    // PxU8*  linkAndJointAndRootStateData
+public static const uint PXG_ARTI_OUT_SLEEP_DATA = 8;    // PxgSolverBodySleepData*
+public static const uint PXG_ARTI_OUT_ERROR_ACC = 16;    // Dy::ErrorAccumulator*   per articulation
+public static const uint PXG_ARTI_OUT_CONTACT_ACC = 24;  // Dy::ErrorAccumulator*   one for the scene
+public static const uint PXG_ARTI_OUT_DESC_SIZE = 32;
+
+// PxgArticulationCoreDesc::mContactErrorAccumulator -- a VALUE, not a pointer,
+// and it sits at the very end of the 360-byte descriptor.
+public static const uint PXG_ARTI_CORE_CONTACT_ERROR_ACC = 344;
+
+// PxgArticulation::linkJointRootStateDataBuffer -- the per-articulation source
+// the scene-wide staging buffer is filled FROM.  Every one of
+// `linkBody2Worlds`, `motionVelocities`, `motionAccelerations`,
+// `linkIncomingJointForces`, `jointPositions`, `jointVelocities`,
+// `jointAccelerations` and `rootPreMotionVelocity` is a sub-range of it
+// (PxgSimulationCore.cpp:893), which is why copying this one buffer copies the
+// whole articulation state.
+public static const uint PXG_ARTI_LINK_JOINT_ROOT_STATE = 192;
+
+// PxgArticulationLinkJointRootStateData's arithmetic (PxgArticulation.h:768).
+// sizeof(PxTransform) is 28, NOT 32 -- it is a quat and a vec3 with no padding,
+// and a port that rounds it up gets every link's stride wrong.
+public static const uint PXG_ARTI_STATE_TRANSFORM_SIZE = 28;
+public static const uint PXG_ARTI_STATE_SVEC_SIZE = 24;   // Cm::UnAlignedSpatialVector
+
+// (sizeof(PxTransform) + 3 * sizeof(UnAlignedSpatialVector)) * links
+//   + 3 * sizeof(PxReal) * dofs + sizeof(UnAlignedSpatialVector)
+public static uint artiStateBytesRaw(uint maxLinks, uint maxDofs)
+{
+    return (PXG_ARTI_STATE_TRANSFORM_SIZE + 3u * PXG_ARTI_STATE_SVEC_SIZE) * maxLinks
+         + 3u * 4u * maxDofs + PXG_ARTI_STATE_SVEC_SIZE;
+}
+
+// The per-articulation stride, rounded UP to 16 -- and note the engine multiplies
+// the ALIGNED per-articulation size by the count, so the rounding happens once
+// per articulation rather than once for the whole ensemble.
+public static uint artiStateBytesAligned16(uint maxLinks, uint maxDofs, uint nbArticulations)
+{
+    const uint raw = artiStateBytesRaw(maxLinks, maxDofs);
+    return ((raw + 15u) & ~15u) * nbArticulations;
+}
+
 // PxNodeIndex is a PxU64 whose low word is the index and whose high word
 // carries the articulation flag + link id (pxgSlangCommon::nodeIndexIndex).
 public static const uint PXG_NODE_INDEX_SIZE = 8;

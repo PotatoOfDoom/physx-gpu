@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 275;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 276;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -136,7 +136,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "bpSignalComplete", "broadphaseClearNewFlag.spv", "bpSignalComplete" },  // BP_SIGNAL_COMPLETE
     { "dmaConstraintResidual", "solverDmaBack.spv", "dmaConstraintResidual" },  // DMA_CONSTRAINT_RESIDUAL
     { "dmaArticulationResidual", "dmaArtiResidualBda.spv", "dmaArticulationResidual" },  // DMA_ARTICULATION_RESIDUAL (P8.66 BDA)
-    { "dmaBackArticulationDataLaunch", nullptr, nullptr },  // ARTI_DMA_DATA (unmapped)
+    { "dmaBackArticulationDataLaunch", "npArtiLinkAccel.spv", "dmaBackArticulationDataLaunch" },  // ARTI_DMA_DATA (P8.93 BDA)
     { "artiSumInternalContactAndJointBatches1Launch", nullptr, nullptr },  // ARTI_STATIC_BATCH_PREP_FIRST (unmapped)
     { "artiSumInternalContactAndJointBatches2Launch", nullptr, nullptr },  // ARTI_STATIC_BATCH_PREP_SECOND (unmapped)
     { "artiSolveInternalConstraints1T", nullptr, nullptr },  // ARTI_SOLVE_INTERNAL_CONSTRAINTS (unmapped)

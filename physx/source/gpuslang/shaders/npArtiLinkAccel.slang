@@ -94,6 +94,13 @@ import pxgSlangArticulationBlocks;
 import pxgSlangSpatialMatrix;
 import pxgSlangArticulationDynamic;
 
+// __syncwarp().  This module needs no other warp primitive, so it declares the
+// barrier itself rather than pulling in the whole P2.1 library (the precedent is
+// pxgSlangContactReduce, which is self-contained for the same reason).  On
+// llvmpipe the subgroup is 8, so a warp barrier must be a WORKGROUP barrier --
+// which is stronger, and legal only because every thread reaches it.
+void pxgSyncWarpAla() { GroupMemoryBarrierWithGroupSync(); }
+
 // The per-component reciprocal with its own zero guard -- trap 3.
 float alaRecip(float v) { return v == 0.0f ? 0.0f : 1.0f / v; }
 
@@ -746,4 +753,190 @@ void computeUnconstrainedAccelerationsLaunch1T(uint3 groupThreadId : SV_GroupThr
 
     // AFTER the sweep: it reads both acceleration fields the sweep just wrote
     alaJointTransmittedFrictionForce(linkBlocks, numLinks, lane);
+}
+
+// ===========================================================================
+// P8.93: dmaBackArticulationDataLaunch (forwardDynamic2.cu:3794)
+// ===========================================================================
+//
+// WHY THIS KERNEL, AND WHY NOW.  The articulation scene reports its link at
+// `y = 0.0000` after the very first step, and has since P8.65.  Reading the
+// engine establishes why, rather than leaving it a guess:
+//
+//   * `PxgPostSolveArticulationTask::runInternal` (PxgContext.cpp:805) does
+//     `link.bodyCore->body2World = sBody2Worlds[i]` for every link, EVERY step,
+//     unconditionally;
+//   * `sBody2Worlds` is decomposed out of `mLinkAndJointAndRootStates`, a pinned
+//     HOST array;
+//   * the only thing that ever fills that array is this kernel.
+//
+// So a refused `dmaBackArticulationDataLaunch` does not mean "the pose is not
+// updated" — it means **the pose is overwritten with the staging buffer's
+// initial contents**, which is where the zero comes from.  Mapping it makes the
+// host read the GPU's actual link poses.
+//
+// ===========================================================================
+// TWO INDEX CONVENTIONS IN ONE KERNEL
+// ===========================================================================
+//
+// This is the trap, and it is unlike anything else in the chain:
+//
+//   * the **sleep-data** copy is guarded by `globalThreadIndex < nbArticulations`
+//     — one THREAD per articulation, so with `nbArticulations <= 32` the whole
+//     copy is done by the low lanes of warp 0 and every other warp skips it;
+//   * the **state-buffer** copy is guarded by `globalWarpIndex < nbArticulations`
+//     — one WARP per articulation, the convention the rest of the file uses.
+//
+// Both resolve their own `nodeIndex -> bodySim -> articulationRemapId` chain
+// independently, from different indices.  A port that unifies them is wrong for
+// every articulation but the first.
+//
+// The `__syncwarp()` between them sits OUTSIDE both guards, so every thread
+// reaches it — which is what makes it safe to lower to a workgroup barrier here,
+// where the block is (32, 2, 1) and the barrier therefore covers 64 threads
+// rather than 32.  The port uses `if` blocks rather than early returns for
+// exactly that reason.
+//
+// ===========================================================================
+// THE OTHER FOUR THINGS TO TRANSCRIBE
+// ===========================================================================
+//
+//  1. **The destination stride uses the DESCRIPTOR's maxima, the copy length the
+//     ARTICULATION's own counts.**  `getArticulationStateDataBuffer` is indexed
+//     with `mMaxLinksPerArticulation` / `mMaxDofsPerArticulation`; `outSize`
+//     comes from `articulation.data.numLinks` / `numJointDofs`.  Using one for
+//     both is right only when every articulation is the largest.
+//  2. **`sizeof(PxTransform)` is 28, not 32.**  A quat and a vec3 with no
+//     padding.  Rounding it up puts every link's velocity at the wrong offset.
+//  3. **The 16-byte rounding is PER ARTICULATION**, applied before the multiply
+//     by the count — not once for the whole ensemble.
+//  4. **Both accumulator writes are guarded by their pointer being non-null**,
+//     and they are two different pointers: `errorAccumulator` is per articulation
+//     and indexed by the REMAP id (twice, at `index` and `index + nbArticulations`),
+//     while `contactResidualAccumulator` is one value for the scene written by
+//     thread 0 alone.  That `index + nbArticulations` addressing only works
+//     because `articulationRemapId` is the engine's COMPACT index, strictly below
+//     `nbArticulations` -- a fact the fixture has to honour, and did not at first.
+//
+// Two things the sweep measured as UNOBSERVABLE here, recorded rather than
+// tidied away:
+//
+//   * **the `globalThreadIndex == 0` guard on the scene accumulator.**  Every
+//     thread would write the same three words to the same address, so any subset
+//     writing them is equivalent.  The guard is transcribed because a benign race
+//     is still a race, and the Vulkan memory model does not bless it.  A guard no
+//     thread satisfies is observable, and dies.
+//   * **the `__syncwarp()` between the two halves.**  They touch disjoint buffers
+//     (`sleepData` and `linkAndJointAndRootStateData`) and there is no shared
+//     memory in this kernel at all, so it orders nothing.  Transcribed because
+//     the CUDA has it and because nothing stops a host from pointing both at one
+//     allocation.
+
+// warpCopy<uint4> (copy.cuh:38): a lane-strided COPY, element size 16.
+void alaWarpCopy4(uint64_t dst, uint64_t src, uint totalBytes, uint lane)
+{
+    Ptr<uint4> d = Ptr<uint4>(dst);
+    Ptr<uint4> s = Ptr<uint4>(src);
+    const uint requiredThreads = totalBytes / 16u;
+    for (uint i = lane; i < requiredThreads; i += 32u)
+        d[i] = s[i];
+}
+
+struct AlaDmaParams
+{
+    uint64_t scDesc;      // @0  PxgArticulationCoreDesc*
+    uint64_t outputDesc;  // @8  PxgArticulationOutputDesc*
+};
+
+[[vk::push_constant]]
+ConstantBuffer<AlaDmaParams> gAlaDma;
+
+static const uint ALA_DMA_WARPS_PER_BLOCK = 2u;
+
+[shader("compute")]
+[numthreads(32, 2, 1)]
+void dmaBackArticulationDataLaunch(uint3 groupThreadId : SV_GroupThreadID,
+                                   uint3 groupId : SV_GroupID)
+{
+    const uint64_t d = gAlaDma.scDesc;
+    const uint64_t o = gAlaDma.outputDesc;
+
+    const uint lane = groupThreadId.x & 31u;
+    const uint globalWarpIndex = groupId.x * ALA_DMA_WARPS_PER_BLOCK + groupThreadId.y;
+    const uint globalThreadIndex = globalWarpIndex * 32u + groupThreadId.x;
+
+    const uint nbArticulations = artiU32Field(d, PXG_ARTI_CORE_NB_ARTICULATIONS);
+    const uint articulationOffset = artiU32Field(d, PXG_ARTI_CORE_ARTICULATION_OFFSET);
+
+    const uint64_t islandNodeIndices = artiPtrField(d, PXG_ARTI_CORE_ISLAND_NODE_INDICES);
+    const uint64_t bodySimPool = artiPtrField(d, PXG_ARTI_CORE_BODY_SIM_POOL);
+    const uint64_t articulations = artiPtrField(d, PXG_ARTI_CORE_ARTICULATIONS);
+    const uint64_t sleepDataIn = artiPtrField(d, PXG_ARTI_CORE_SLEEP_DATA);
+
+    const uint64_t contactAcc = artiPtrField(o, PXG_ARTI_OUT_CONTACT_ACC);
+    if (globalThreadIndex == 0u && contactAcc != 0)
+    {
+        // Dy::ErrorAccumulator is 12 bytes -- three words, copied as three words
+        // rather than as a struct, because there is no struct to copy through.
+        Ptr<uint> dstAcc = Ptr<uint>(contactAcc);
+        for (uint k = 0u; k < 3u; ++k)
+            dstAcc[k] = artiU32Field(d, PXG_ARTI_CORE_CONTACT_ERROR_ACC + k * 4u);
+    }
+
+    // ---- ONE THREAD per articulation ----
+    if (globalThreadIndex < nbArticulations)
+    {
+        const uint2 node = (Ptr<uint2>(islandNodeIndices))[globalThreadIndex + articulationOffset];
+        const uint nodeIndex = nodeIndexIndex(node);
+        const uint64_t bodySim = bodySimPool + uint64_t(nodeIndex) * PXG_BODY_SIM_SIZE;
+        const uint index = artiU32Field(bodySim, PXG_BODY_SIM_ARTICULATION_REMAP_ID);
+
+        // PxgSolverBodySleepData is 8 bytes, copied as one uint2 by the CUDA
+        const uint64_t sleepOut = artiPtrField(o, PXG_ARTI_OUT_SLEEP_DATA);
+        (Ptr<uint2>(sleepOut))[globalThreadIndex] =
+            (Ptr<uint2>(sleepDataIn))[index];
+    }
+
+    // outside both guards, so every thread reaches it
+    pxgSyncWarpAla();
+
+    // ---- ONE WARP per articulation ----
+    if (globalWarpIndex < nbArticulations)
+    {
+        const uint2 node = (Ptr<uint2>(islandNodeIndices))[globalWarpIndex + articulationOffset];
+        const uint nodeIndex = nodeIndexIndex(node);
+        const uint64_t bodySim = bodySimPool + uint64_t(nodeIndex) * PXG_BODY_SIM_SIZE;
+        const uint index = artiU32Field(bodySim, PXG_BODY_SIM_ARTICULATION_REMAP_ID);
+
+        const uint64_t a = articulations + uint64_t(index) * PXG_ARTI_STRIDE;
+
+        const uint64_t errorAcc = artiPtrField(o, PXG_ARTI_OUT_ERROR_ACC);
+        if (errorAcc != 0)
+        {
+            Ptr<uint> dstAcc = Ptr<uint>(errorAcc);
+            for (uint k = 0u; k < 3u; ++k)
+            {
+                dstAcc[uint(index) * 3u + k] =
+                    artiU32Field(a, PXG_ARTI_INTERNAL_RESIDUAL + k * 4u);
+                dstAcc[(uint(index) + nbArticulations) * 3u + k] =
+                    artiU32Field(a, PXG_ARTI_CONTACT_RESIDUAL + k * 4u);
+            }
+        }
+
+        // the destination stride uses the DESCRIPTOR's maxima -- trap 1
+        const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);
+        const uint maxDofs = artiU32Field(d, PXG_ARTI_CORE_MAX_DOFS);
+        const uint64_t outBuff = artiPtrField(o, PXG_ARTI_OUT_STATE_DATA)
+                               + uint64_t(artiStateBytesAligned16(maxLinks, maxDofs,
+                                                                 globalWarpIndex));
+
+        // ...the copy LENGTH the articulation's own counts -- trap 1 again
+        const uint numLinks = artiU16Field(a, PXG_ARTI_DATA_NUM_LINKS);
+        const uint numDofs = artiU16Field(a, PXG_ARTI_DATA_NUM_JOINT_DOFS);
+        const uint outSize = artiStateBytesAligned16(numLinks, numDofs, 1u);
+
+        const uint64_t src = artiPtrField(a, PXG_ARTI_LINK_JOINT_ROOT_STATE);
+
+        alaWarpCopy4(outBuff, src, outSize, lane);
+    }
 }

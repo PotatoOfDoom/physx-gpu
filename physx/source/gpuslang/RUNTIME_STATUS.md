@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **723/723** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **724/724** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,88 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.93 — `dmaBackArticulationDataLaunch` — manifest **276**, and the y=0 mystery solved
+
+forwardDynamic2.cu:3794.  Manifest 275 → **276**, suite 723 → **724**, the
+refused-kernel list **226 → 225**.  Sweep **26/28**, both survivors proven
+unobservable.  The five-tranche zero-ABI streak ends here: this kernel needs the
+output descriptor, which was not mapped.
+
+### The diagnosis, established from the engine source rather than guessed
+
+P8.92c recorded that `artiLink` reads `y = 0.0000` after the very first step and
+has done since P8.65, and flagged the writeback as the thing to look at *without
+claiming it was the cause*.  Reading the engine settles it:
+
+* `PxgPostSolveArticulationTask::runInternal` (PxgContext.cpp:805) does
+  `link.bodyCore->body2World = sBody2Worlds[i]` for every link, **every step,
+  unconditionally**;
+* `sBody2Worlds` is decomposed out of `mLinkAndJointAndRootStates`, a **pinned
+  host array**;
+* the only thing that ever fills that array is this kernel.
+
+So a refused launch does not leave the pose stale — it **overwrites the pose with
+the staging buffer's initial contents**.  That is where the zero came from.
+
+**The scene confirms it, and the symptom changed exactly as the diagnosis
+predicted:**
+
+| | before P8.93 | after |
+|---|---|---|
+| `y` after 1 step | 0.0000 | **3.0000** |
+| final `y` | 0.0000 | **3.0000** |
+| `\|v\|` | 0.0000 | **4.7765** |
+| verdict | "below rest band / sank" | "did not begin falling" + "not at rest" |
+
+The link now reports its **real** pose — unchanged, because the solver chain that
+would integrate it is unmapped — and a **real, non-zero velocity**, which is the
+first end-to-end evidence that P8.83–P8.92's unconstrained-velocity chain is
+producing motion at all.  The failing-check count went 2 → 3 because the failure
+splits into two assertions; that is a sharper diagnosis, not a regression.
+
+### Two index conventions in one kernel
+
+This is the trap, and it is unlike anything else in the chain:
+
+* the **sleep-data** copy is guarded by `globalThreadIndex < nbArticulations` —
+  one THREAD per articulation;
+* the **state-buffer** copy is guarded by `globalWarpIndex < nbArticulations` —
+  one WARP per articulation.
+
+Both resolve their own island-node → bodySim → remap-id chain independently, from
+different indices.  Collapsing them either way is a mutant, and both die.  The
+`__syncwarp()` between them sits outside both guards, which is what makes it safe
+to lower to a workgroup barrier over the block's 64 threads — and the port uses
+`if` blocks rather than early returns for exactly that reason.
+
+Three more transcribed rather than tidied: the destination stride uses the
+**descriptor's maxima** while the copy length uses the **articulation's own
+counts**; `sizeof(PxTransform)` is **28, not 32** (a quat and a vec3, no padding);
+and the 16-byte rounding is applied **per articulation**, before the multiply.
+
+### The fixture bug this tranche found in itself
+
+The first run failed on the per-articulation error accumulator, and the cause was
+the fixture, not the shader: it built `articulationRemapId` as a permutation of
+the 64 record SLOTS rather than of `[0, nbArticulations)`.  The engine addresses
+that accumulator at `index` and at `index + nbArticulations`, which only stays
+collision-free because the remap id is the engine's **compact** articulation
+index.  A remap running past `nbArticulations` makes the two ranges overlap and
+the fixture "fails" on a collision the engine cannot produce.  Fixed, and the
+invariant is now written down at the point that depends on it.
+
+### The two unobservable guards
+
+* **`globalThreadIndex == 0` on the scene accumulator** — every thread would write
+  the same three words to the same address, so any subset writing them is
+  equivalent.  Transcribed because a benign race is still a race the Vulkan memory
+  model does not bless.  A guard no thread satisfies is observable, and dies.
+* **the `__syncwarp()`** — the two halves touch disjoint buffers and there is no
+  shared memory in this kernel, so it orders nothing.  Transcribed because nothing
+  stops a host from pointing both at one allocation.
+
+Suite **724/724 in both memory modes**; the other 20 scenes still green.
 
 ## P8.92c — `computeUnconstrainedAccelerationsLaunch1T` — manifest **275**, and a done-criterion that was WRONG
 
