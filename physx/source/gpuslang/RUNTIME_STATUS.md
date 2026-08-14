@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **728/728** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **729/729** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,112 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.94b — `PxcFsFlushVelocity`, and a guard the sweep cannot see
+
+articulationDynamic.cuh:390, the deferred-impulse flush `stepArticulation1TTGS`
+runs before it integrates (forwardDynamic2.cu:3023) and that four other launches
+share.  Manifest unchanged at **276**.  Suite 728 → **729**.  Sweep **32/37**,
+all five survivors proven.  **Zero new ABI** for the second tranche running —
+every field it touches was mapped in P8.67/P8.68.
+
+New module `shaders/npArtiFlushVel.slang` (in `PXG_NOCONTRACT_SHADERS`), new
+fixture `tests/testArtiFlushVel.cpp`, and one small change to
+`pxgSlangArticulationDynamic.slang`.
+
+### There are TWO functions with this name, and taking the wrong one is silent
+
+`articulationDynamic.cuh:390` takes six arguments and accumulates
+`mSolverSpatialDeltaVel`.  `forwardDynamic2.cu:3990` takes eight, writes the
+solver's `outVelocity` buffer instead, and **does not touch
+`mSolverSpatialDeltaVel` at all**.  They are otherwise nearly identical, which is
+exactly what would make picking the wrong one hard to notice.  The step kernel
+calls the six-argument one; the port takes that, and the module header says so
+rather than leaving the reader to check.
+
+### The lifted body, not a second transcription
+
+`propagateAccelerationW_nothingpreloaded_updateJointDofVels`
+(articulationDynamic.cuh:329) differs from P8.90's
+`propagateAccelerationW_everythingPreLoaded` in two ways: it does its own block
+loads, and it **writes the joint velocities back** — `mJointVelocities[ind] +=
+jDelta`, the `_updateJointDofVels` half of the name.  P8.90 computes that
+`jDelta` and discards it.
+
+Rather than transcribe the body again, the body moved into
+`adPropagateAccelerationWEx` with `jDelta` as an out parameter and the original
+signature became a two-line forwarder.  P8.90's five test batteries keep driving
+exactly the code this tranche drives, which the sweep confirms: the three
+`D*` mutants target that shared body and are killed by the P8.90 tests and this
+one together.
+
+### Nine traps, each with a mutant that dies
+
+1. **`deferredZ` is negated at the load** and the same negated value is used
+   twice — once as the right-hand side of the inverse-inertia product, once as
+   the increment to the ROOT's `mConstraintForces` (F01, F02).
+2. **A fixed base still writes.**  The `!fixBase` block is skipped, but
+   `deltaV` stays zero and `mScratchDeltaV`, `mConstraintForces` and
+   `mCommonLinkDeltaVelocity` are still written, and the whole per-link loop
+   still runs (F07, F08, F10).
+3. **`mRootDeferredZ` is zeroed only for a free base; `mCommonLinkDeltaVelocity`
+   is zeroed unconditionally.**  Two adjacent zeroing stores on opposite sides
+   of the same guard (F05, F06).
+4. **The root's constraint force takes `deferredZ`; every other link's takes
+   `deltaV`.**  The single easiest thing to tidy wrong (F03, F30).
+5. **Three accumulations at the root**, and only two of them inside the guard
+   (F11, F12, F13).
+6. **`deltaV` carries between iterations** and is re-loaded from
+   `artiLinks[parent].mScratchDeltaV` only when `parent != i - 1` (F17, F19,
+   F20).
+7. **`dofs` is a running cursor** advanced by the LINK block's `mDofs` (F22,
+   F23).
+8. **`mDeferredQstZ` is zeroed after it is read** (F24, F25, F26).
+9. **The prefetch reads link `i + 1` before link `i` is written** (F15).
+
+### The survivors, and one of them is a finding rather than a formality
+
+Two were predicted in the module header *before* the sweep ran, and they held:
+
+* **F18 / F21 — the parent re-load made unconditional.**  Iteration `i - 1`
+  stored exactly the carried `deltaV` into link `i - 1`'s `mScratchDeltaV`, and
+  the root stores it too, which is what makes `i == 1` work; so re-loading when
+  `parent == i - 1` reads back the value already in hand.  F21 is the same
+  mutation spelled differently — `parent < i` is the engine's tree invariant, so
+  `parent != i` is always true.
+* **F33 — the constraint force re-loaded at the store.**  Every store in an
+  iteration targets link `i` alone and the only cross-link read is the parent's
+  scratch, so nothing an iteration writes can change what its own preload read.
+
+**F14 and F16 are the interesting pair.**  `linkCount > 1` and
+`(i + 1) < linkCount` guard nothing but the PREFETCH, whose results a
+single-link lane or a final iteration never uses.  They are write-equivalent,
+and **no bit-comparison test can see them** — which is not the same as saying
+they are redundant.  Without them the prefetch reads `artiLinks[linkCount]`,
+past this warp's link array in the engine's real allocation.  The guards stay,
+and the reason they survive is recorded as a property of what a sweep measures
+rather than as a property of the code.
+
+### A sweep bug caught by the standing rule, not by luck
+
+F24's first spelling inserted the `mDeferredQstZ` zeroing between the load loop
+and the propagate call — where `qstZ` is already in registers, so it changed
+nothing.  Per the hygiene rule earned in P8.73-P8.78, *a mutant that does not
+change behaviour is a bug in the sweep, not a result*: it was re-anchored to
+zero **before the load**, which is the ordering that is actually load-bearing,
+and it dies.  The sweep script keeps the note beside the mutant so the next
+reader does not re-derive it.
+
+### The fixture
+
+23 lanes, link counts 1..7 (never equal to the lane index), fixed-base and
+free-base side by side (8 / 15), **four single-link lanes** so the whole
+per-link loop is skipped while the root writes must still land, **15
+re-parented links** so the `deltaV` re-load is distinguishable from the carry,
+**16 zero-dof links** sitting between links that do advance the cursor, and all
+four dof counts 0..3 occurring 15+ times each.  Everything poisoned at 0xAB and
+compared **bit for bit** — no tolerance anywhere, because unlike P8.94a there is
+no transcendental in this function.  Zero signed-zero pairs, first run.
 
 ## P8.94a — the position-integration algebra, and the first oracle that is NOT bit-exact
 

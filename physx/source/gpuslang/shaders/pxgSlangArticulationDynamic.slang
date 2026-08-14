@@ -124,11 +124,29 @@ public AbSpatialVector adPropagateImpulseW(AbSpatialVector isInvD[3], float3 chi
 //
 // `invStISW[ind]` is a ROW of the inverse joint-space inertia -- the same three
 // floats `computeIs`' spherical path wrote to `mInvStIsT_{x,y,z}` for dof `ind`.
+// P8.94b needs the per-dof `jDelta` this function computes and discards -- the
+// `_updateJointDofVels` variant (articulationDynamic.cuh:329) writes
+// `mJointVelocities[ind] += jDelta` with it.  Rather than transcribe the body a
+// second time, the body lives here with `jDelta` as an out parameter and the
+// original signature is a two-line forwarder, so P8.90's fixtures keep driving
+// exactly the code P8.94b drives.
 public AbSpatialVector adPropagateAccelerationW(float3 parentToChild, float3 invStISW[3],
                                                 AbSpatialVector motionMatrix[3],
                                                 AbSpatialVector parentLinkAccelerationW,
                                                 uint dofCount, AbSpatialVector IsW[3],
                                                 float QMinusSTZ[3])
+{
+    float jDeltaOut[3];
+    return adPropagateAccelerationWEx(parentToChild, invStISW, motionMatrix,
+                                      parentLinkAccelerationW, dofCount, IsW, QMinusSTZ,
+                                      jDeltaOut);
+}
+
+public AbSpatialVector adPropagateAccelerationWEx(float3 parentToChild, float3 invStISW[3],
+                                                  AbSpatialVector motionMatrix[3],
+                                                  AbSpatialVector parentLinkAccelerationW,
+                                                  uint dofCount, AbSpatialVector IsW[3],
+                                                  float QMinusSTZ[3], out float jDeltaOut[3])
 {
     // NEGATED offset -- see trap 3
     AbSpatialVector pDeltaV = adTranslateSpatialVector(-parentToChild, parentLinkAccelerationW);
@@ -145,6 +163,7 @@ public AbSpatialVector adPropagateAccelerationW(float3 parentToChild, float3 inv
     }
 
     // pass two: only this one mutates pDeltaV
+    jDeltaOut = { 0.0f, 0.0f, 0.0f };
     for (uint ind = 0u; ind < 3u; ++ind)
     {
         if (ind < dofCount)
@@ -156,6 +175,7 @@ public AbSpatialVector adPropagateAccelerationW(float3 parentToChild, float3 inv
                                + iStIsTi.y * tJointDelta[1]
                                + iStIsTi.z * tJointDelta[2];
 
+            jDeltaOut[ind] = jDelta;
             pDeltaV = asmSVecAdd(pDeltaV, asmSVecScale(motionMatrix[ind], jDelta));
         }
     }
