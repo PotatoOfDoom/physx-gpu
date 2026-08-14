@@ -5,3 +5,8 @@
 # Claude Code local session state (agent worktrees, task tracking) — never project content
 /.claude/
 *.sweepbak
+
+# ctest scribbles its LastTest.log wherever its cwd happens to be; the one at
+# the repo root was committed by accident in the P5 era and dirtied the tree on
+# every test run since
+Testing/
