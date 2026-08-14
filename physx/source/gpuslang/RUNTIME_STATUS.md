@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **724/724** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **728/728** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,148 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.94a — the position-integration algebra, and the first oracle that is NOT bit-exact
+
+forwardDynamic2.cu:2388 / :2410 / :2514 / :2534 — `toRotationVector`,
+`computeSphericalJointPositions`, `updateRootBody` and `propagateLink<isSubstep>`,
+the four `static __device__` functions `stepArticulation1TTGS` is built from.
+Manifest unchanged at **276** (a `__device__` function is not a kernel; the
+kernel itself is P8.94d).  Suite 724 → **728**.  Sweep **41/42**, the one
+survivor proven equivalent.  **Zero new ABI** — every field is already mapped.
+
+New module `shaders/npArtiStep.slang` (in `PXG_NOCONTRACT_SHADERS`), new fixture
+`tests/testArtiStep.cpp` with four entries: `artiStepAlgebra` and three probes.
+
+### The finding: llvmpipe's transcendentals are not glibc's, and it was MEASURED
+
+Every articulation tranche since P8.81 has compared bit-for-bit against the
+engine's own `PX_CUDA_CALLABLE` arithmetic on the host, and every one has
+matched exactly.  This one does not, and the reason is not the port.
+
+`PxExp` and the `PxQuat(angle, axis)` constructor go through `sin`/`cos`;
+`toRotationVector` goes through `atan2`.  Rather than assume the difference was
+transcendental and loosen a bound, the tranche isolated the functions:
+
+| probe | what it measures | result |
+|---|---|---|
+| `artiStepQuatProbe` | `PxExp` and `PxQuat(angle, axis)`, 257 cases each | exact **198/257** and **193/257**, worst **2 ULP** |
+| `artiStepRotVecProbe` | `toRotationVector`, 193 cases | exact **21/193**, worst **272 ULP** but **2.64e-6 absolute** |
+
+The rotation-vector spread looks alarming and is not: for a near-identity
+quaternion the angle is `atan2(tiny, ~1)`, so two ULP inside the `atan2` is a
+large *relative* error on a correspondingly tiny rotation vector.  The probe
+therefore asks for ULP-close **or** absolutely-close and prints both, with the
+absolute bound set just above the measured worst case rather than at a
+comfortable round number.  On a component of order one, 4e-6 is ~33 ULP — loose,
+and still three orders of magnitude tighter than the cheapest algebraic error
+the sweep produces there (`w` vs `-w`, a dropped half-angle, a missing factor of
+two all move a component by O(0.1)).
+
+So `artiStepAlgebra` tolerates a bounded drift on **`mAccumulatedPose` and
+`mJointPositions` only** — 8 ULP at the root, which goes through exactly one
+`PxExp`, and 384 on a chained link, which inherits its parent's pose and adds a
+quaternion multiply, a normalize and a rotate of its own (measured at 136 over
+the current fixture).  **Every other word of the link and dof blocks, poison
+included, is compared bit for bit and matches exactly**, which is what still
+pins the joint-type dispatch, the wrap, the clamp, the offsets and the
+`isSubstep` field selection.  `bad == 0`.
+
+### Two guards that decide a BRANCH do not survive a value tolerance
+
+Both were sweep survivors on the first pass, and neither was fixable by
+tightening a bound:
+
+* **S36, `toRotationVector`'s tiny-axis branch,** is not reachable from the block
+  fixture at all — it needs a spherical joint whose relative quaternion exactly
+  cancels its parent's computed pose, and that pose is itself an output of the
+  mirror.  `artiStepRotVecProbe` drives the function directly and checks the
+  identity inputs **bit-exactly** (12/12); that branch touches no transcendental,
+  so there is nothing to tolerate.
+* **S31, the spherical small-angle guard,** *is* reachable — the fixture puts a
+  sub-threshold angular velocity on a spherical link and counts it back — but
+  below the threshold the rotation the guard skips is at most 1e-6 rad, i.e.
+  ~4 ULP on a unit quaternion.  That is inside the noise floor the
+  transcendentals force on the pose comparison, so **no bound `artiStepAlgebra`
+  can carry will separate the mutant from the original.**  The mutation is real;
+  the test was blind to it.
+
+The fix for S31 is the honest one and it is exact: below the threshold the engine
+does not *approximate* the rotation, it returns the **old quaternion untouched**.
+That is a bit-exact claim with no transcendental in it.  `asIntegrateWorldQ` was
+factored out of `asPropagateLink` — one body, two callers, no second
+transcription — and `artiStepSphGuardProbe` checks `==` on the raw words for 103
+sub-threshold cases while requiring all 84 above-threshold cases to actually
+move (without that second check the first is vacuous: a shader that never rotates
+would pass it).  S31 now dies.
+
+### The recurring fixture lesson, instance ~16, and a new shape of it
+
+S22 ("the revolute clamp is dropped") survived the first sweep even though the
+fixture *had* a past-the-clamp case, seeded three times over.  The predicate was
+`stPastClamp(k) = (k % 7 == 5)`, keyed on the **lane**, while the joint type is
+`stJointType(k, i) = (k + i) % 5`.  Over 25 lanes the clamp fired on lanes 5, 12
+and 19 — whose link-1 joints are PRISMATIC, REVOLUTE_UNWRAPPED and FIX.  The
+case existed and landed on a revolute exactly never.
+
+This is the standing lesson with a twist worth recording: it is not enough for
+every bound and width in a fixture to be distinct.  **A case predicate must be
+keyed on the same quantity as the branch it is meant to reach.**  Both extremes
+are now `(k + i) % 3`, i.e. keyed on the same `k + i` the joint type is; since
+`gcd(3, 5) == 1`, a revolute link takes all three residues, so coverage is a
+property of the construction rather than a coincidence between two moduli.  The
+counters print 5 wrap and 6 clamp, and they now count what `stFill` actually
+applies rather than what the lane predicate says.
+
+A related repair on the same pass: `stNumLinks` and the tiny-angular-velocity
+predicate had both collided with the lane index earlier in the tranche and were
+already fixed; S25 and S31's fixture halves died with them.
+
+### The survivor, with a proof
+
+**S29 — `PxVec3::normalize` drops its positivity guard.**  `asNormalizeInPlace`
+has exactly one caller, `asIntegrateWorldQ`, which uses its two results as
+`dist = m * dt` and `if (dist > 1e-6f)`.  `m` is a `sqrt`, so it is never
+negative and the guard excludes exactly two inputs: `m == 0` and `m == NaN`.  In
+both, `dist` is `0` or `NaN`, and `0 > 1e-6f` and `NaN > 1e-6f` are **both**
+false — so the NaN the mutant writes into `worldAngVel` is never read.  The
+guard's only observable effect is on a value that is dead exactly when the guard
+fires.  The fixture reaches the `m == 0` case anyway, which is what makes the
+proof checkable rather than merely argued: were the reasoning wrong, the mutant
+would die there.
+
+### The traps, all eight of them killed
+
+1. `isSubstep` chooses the velocity — `mJointVelocities`/`mMotionVelocity` for a
+   substep, `mPosJointVelocities`/`mPosMotionVelocity` for a full step.  Four
+   separate reads (S18, S19).
+2. `childOffset` is NEGATED at the load, `parentOffset` is not (S11, S12).
+3. The three one-dof types differ: prismatic writes a position and builds an
+   offset; revolute wraps by `∓4π` **and then** clamps to the same range — two
+   operations, not one; revolute-unwrapped does neither (S20, S21, S22, S25).
+4. The revolute angle is NEGATED, then flipped to the shortest arc (S23, S24).
+5. The spherical path integrates in the WORLD frame and recovers the joint
+   positions from the result — the CUDA's own commented-out three lines show the
+   alternative it does not take (S30–S35).
+6. `normalize` returns the magnitude and divides componentwise, not by a
+   reciprocal (S28; S29 is the survivor above).
+7. `r = e + d + offset` with `e` the ROTATED parent offset (S13, S14).
+8. `body2World.q = pBody2World.q * newParentToChild.getConjugate()` — the
+   conjugate, parent on the left (S15, S16, S17).
+
+And one the port drops with a note rather than transcribing:
+`computeSphericalJointPositions` has an `if (0)` branch using `getImaginaryPart`
+and `compAng`.  It is dead code in the engine and it is absent here.
+
+### What this does NOT do
+
+The scene's verdict is unchanged, and this entry says so up front rather than
+letting it be discovered.  Nothing here is launchable yet: `stepArticulation1TTGS`
+(P8.94d) is what calls these functions, and even with it mapped the link cannot
+move until `updateBodiesLaunch_Part2` copies `mAccumulatedPose` into the record's
+`linkBody2Worlds` (forwardDynamic2.cu:3189) — the buffer P8.93's DMA-back hands to
+the host.  `PxcFsFlushVelocity` (P8.94b) and `averageLinkImpulsesAndPropagate`
+(P8.94c) come first.
 
 ## P8.93 — `dmaBackArticulationDataLaunch` — manifest **276**, and the y=0 mystery solved
 
