@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **729/729** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **730/730** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,87 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.94c — `averageLinkImpulsesAndPropagate`, and an alignment branch that collapses
+
+articulationImpulseResponse.cuh:114 — the slab-averaging impulse gather and the
+leaf→root propagate `stepArticulation1TTGS` runs immediately before
+`PxcFsFlushVelocity`, guarded by `eHAS_IMPULSES` (forwardDynamic2.cu:3020).
+Manifest unchanged at **276**.  Suite 729 → **730**.  Sweep **39/44**, all five
+survivors proven.  **Zero new ABI for the third tranche running.**
+
+New module `shaders/npArtiAvgImpulse.slang`, new fixture
+`tests/testArtiAvgImpulse.cpp`.
+
+### The alignment dance, and why the port is allowed to collapse it
+
+`impulses` is an array of 24-byte `Cm::UnAlignedSpatialVector`, so from a
+16-byte-aligned base every other element is only 8-byte aligned.  The CUDA
+branches on `ptr & 0xf` and issues either `float2` then `float4` or `float4`
+then `float2`, reading six components and then zeroing through the same two
+pointers.
+
+Read carefully, **both branches touch the same 24 bytes and map them to the same
+six components**: `top.{x,y,z}, bottom.{x,y,z}` are floats 0..5 from `ptr`
+either way, and the two stores together zero exactly `[ptr, ptr+24)` either way.
+The branch picks a vectorised load *width*; it does not change which bytes are
+read.  So the port is six plain float loads and six zero stores, with no branch.
+
+That is an argument, not a licence, so the fixture checks it: **the mirror keeps
+the branch literally**, the impulse array is laid out so both alignments occur,
+and the test counts them and requires both — measured at **32 aligned / 36
+unaligned**.  If the reading above were wrong the comparison would fail on the
+unaligned half.
+
+### The algebra is called, not transcribed — third time
+
+`propagateImpulseW<WriteToDeferredQstZ>` with a null joint force is P8.90's
+`adPropagateImpulseW` exactly.  Seeding its `inout qstZ` from `mDeferredQstZ`
+and writing the result back **is** the `+=` the engine's `WriteToDeferredQstZ`
+performs, so the module calls it and the two `D*` mutants aimed at that shared
+body die under P8.90's fixtures and this one together.
+
+### Ten traps, and the sweep kills the lot
+
+The scale ladder (1, 1/2, 1/3, 1/4) and its two guards; the `maxIndex` seed from
+`mLinkWithDeferredImpulse` rather than zero; the unconditional slab reset; the
+two *different* strides — `slabOffset` by `maxLinks * nbArticulations`,
+`slabDirtyIndex` by `nbArticulations`, and `deltaIdx` scaling the dirty link by
+`nbArticulations` again; the scale applied at the STORE; the leaf→root loop; the
+**backwards** `dofData` cursor decremented by the PREFETCHED dof count; the two
+loads that cannot be preloaded and the one that can; and the root tail's split
+timing — `mRootDeferredZ` read before the loop, `artiLinks[0].mScratchImpulse`
+read after it, each with the CUDA's own comment saying why.
+
+### The survivors, and a category that is now recognised rather than discovered
+
+Three are **guards that protect only READS**, the class P8.94b named one tranche
+ago: dropping `if (maxIndex != 0)` leaves a loop that never iterates; widening
+the prefetch guard reads link 0 and discards it; and moving the slab reset
+inside the dirty guard skips a store that would have written the value already
+there.  All three are invisible to a test that measures writes, and all three
+are kept because the CUDA has them.
+
+The other two are one arithmetic fact stated twice, and both were predicted
+while the mutants were being written: `1.0f / 1.0f` is exactly `1.0f`, and a
+count of zero means `scale` is never read.  **So `count > 1` is a
+divide-by-zero guard and nothing else** — it does not change the averaging for
+any reachable input.  That is worth recording because the natural reading of the
+line is that a single contributing slab is deliberately left unscaled, and that
+reading is right about the intent while being vacuous about the behaviour.
+
+### The fixture
+
+19 lanes, link counts 2..6 never equal to the lane index, **two dispatches with
+`nbSlabs` 4 and 1** so the whole scale computation's guard is straddled, per-lane
+dirty-slab counts of 0..4 each occurring on 3+ lanes so every value of `scale` is
+reached, dirty pairs with only `.x`, only `.y`, both and neither,
+`mLinkWithDeferredImpulse` seeded above every dirty index on some lanes and at
+zero on others, lanes where `maxIndex` ends at zero so the propagate loop is
+skipped while the root tail must still run, a branching parent chain, and dof
+counts 0..3.  Everything poisoned at 0xAB, compared **bit for bit** across the
+dirty array, the impulse array and all three block regions.  Zero signed-zero
+pairs, first run.
 
 ## P8.94b — `PxcFsFlushVelocity`, and a guard the sweep cannot see
 
