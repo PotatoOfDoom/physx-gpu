@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **731/731** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **732/732** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,66 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.95a — `sleepCheck1T`, and a dead condition made live
+
+forwardDynamic2.cu:2706 — the per-link wake-counter and sleep-energy update
+that `updateBodiesLaunch_Part2` (P8.95b) runs last.  Manifest unchanged at
+**277**.  Suite 731 → **732**.  Sweep **22/23 on the first pass, 23/23 after
+the fixture earned the last kill** — the third consecutive tranche whose final
+sweep has no survivors.
+
+New module `shaders/npArtiSleep.slang` (in `PXG_NOCONTRACT_SHADERS`), new
+fixture `tests/testArtiSleep.cpp`.  ABI delta: one record-pointer constant
+(`PXG_ARTI_LINK_INCOMING_JOINT_FORCES` 72, generated and pinned), the two
+link-record float4 offsets — where the **ANGULAR half sits at 0 and the LINEAR
+at 16**, which the CUDA's field names make look arbitrary and the host
+declaration order pins — and the two sleep-data offsets (0/16).
+
+### The oracle is bit-exact again
+
+No transcendental anywhere: `PxQuat::rotateInv`, dot products, one divide.
+The mirror computes with the engine's own arithmetic and the comparison is
+`==` on the raw words — the first articulation tranche since P8.93 that can
+say so, and it did on the first run.  One transcription hazard was caught by
+READING rather than by the sweep: `rotateInv` was first written from memory in
+the `rotate` shape; PxQuat.h:324's actual spelling (doubled input components,
+`w2 = w*w - 0.5`, the cross term scaled by `w`) replaced it before the fixture
+ever ran.  The sweep's L08/L22 now pin that spelling permanently.
+
+### A condition that is DEAD at engine timesteps, and the counter that said so
+
+The guard is `wc < resetTime/2 || wc < dt` with `resetTime/2 = 0.2`.  At any
+engine-plausible `dt` (≤ 0.04 in the fixture's first draft) the second
+condition can only fire when the first already has — the coverage counter
+printed `dtOnly = 42` from a predicate that *classified* cases as dt-only, but
+re-derivation showed every one of them entered through the first condition.
+The second condition's only independent life is `wc ∈ [resetTime/2, dt)`,
+i.e. **a timestep larger than 0.2 seconds**.  The fixture now constructs
+exactly that (dt = 0.25, wc = 0.22, 9 cases), and the mutant that drops the
+second condition dies.  The counter was counting a classification, not a
+behaviour — the same lesson as P8.94d's alignment counter, one tranche apart.
+
+### The last kill had to be CONSTRUCTED
+
+L12 (`>=` relaxed to `>`) survived the first sweep because no case had
+`normalizedEnergy == sleepThreshold` to the bit — and no amount of seeding
+luck will produce exact float equality between an accumulated energy and an
+independent threshold.  The fixture now computes the energy at fill time and
+writes THAT value as the threshold (7 cases), which required extracting the
+energy computation into a helper the fill and the mirror share — one
+computation, two users, so the boundary case cannot drift out of sync with
+the expectation.  L12 dies.
+
+### The traps, all pinned
+
+The `> 0 ? 1/x : 1` inertia reciprocal (ONE, not zero — a degenerate component
+contributes the angular velocity squared itself); only the ANGULAR accumulator
+changes frame; `invMass == 0` becomes 1; the reset writes
+`factor * 0.5 * resetTime` with the factor clamped at 2 and forced to 2 for a
+zero threshold; the decrement only when the reset did not fire, clamped at
+zero; the second, separate accumulator zeroing at `wc == 0`; and both stores
+writing `w = 0` over poisoned w-lanes.
 
 ## P8.94d — `stepArticulation1TTGS` — manifest **277**, and the fixture that reached 1e8 radians
 

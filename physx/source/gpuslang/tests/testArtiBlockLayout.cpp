@@ -292,6 +292,18 @@ static_assert(offsetof(PxgArticulationLinkProp, invMass) == 12, "PXG_ARTI_LINK_P
 static_assert(offsetof(PxgArticulationLink, cfmScale) == 72, "PXG_ARTI_LINK_CFM_SCALE");
 static_assert(uint32_t(PxArticulationFlag::eFIX_BASE) == 1, "PXG_ARTI_FLAG_FIX_BASE");
 static_assert(uint32_t(PxgArtiStateDirtyFlag::eVEL_DIRTY) == 1, "PXG_ARTI_STATE_VEL_DIRTY");
+static_assert(offsetof(PxgArticulation, linkIncomingJointForces) == 72,
+              "PXG_ARTI_LINK_INCOMING_JOINT_FORCES");
+static_assert(offsetof(PxgArticulationLink, initialAngVel) == 0,
+              "PXG_ARTI_LINKREC_INITIAL_ANGVEL_PENBIAS");
+static_assert(offsetof(PxgArticulationLink, penBiasClamp) == 12, "..the w of the angular float4");
+static_assert(offsetof(PxgArticulationLink, initialLinVel) == 16,
+              "PXG_ARTI_LINKREC_INITIAL_LINVEL_INVMASS");
+static_assert(offsetof(PxgArticulationLink, invMass) == 28, "..the w of the linear float4");
+static_assert(offsetof(PxgArticulationLinkSleepData, sleepLinVelAcc) == 0,
+              "PXG_ARTI_SLEEPDATA_LINVEL");
+static_assert(offsetof(PxgArticulationLinkSleepData, sleepAngVelAcc) == 16,
+              "PXG_ARTI_SLEEPDATA_ANGVEL");
 static_assert(uint32_t(PxgArtiStateDirtyFlag::eHAS_IMPULSES) == 2, "PXG_ARTI_STATE_HAS_IMPULSES");
 static_assert(sizeof(Dy::SpatialSubspaceMatrix) == 80, "PXG_ARTI_SUBSPACE_STRIDE");
 static_assert(sizeof(PxQuat) == 16, "PXG_ARTI_QUAT_SIZE");

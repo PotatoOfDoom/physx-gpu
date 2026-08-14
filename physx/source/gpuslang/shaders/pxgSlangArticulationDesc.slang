@@ -68,6 +68,16 @@ public static const uint PXG_ARTI_JOINTS = 40;
 public static const uint PXG_ARTI_JOINT_DATA = 48;
 public static const uint PXG_ARTI_MOTION_VELOCITIES = 56;
 public static const uint PXG_ARTI_MOTION_ACCELERATIONS = 64;
+// P8.95a: the incoming-joint-force output array and the two per-link-record
+// initial-velocity float4s updateBodiesLaunch_Part2 rewrites.  NOTE THE ORDER
+// in the record: the ANGULAR half sits at 0 and the LINEAR at 16 -- the CUDA's
+// field names (initialAngVelXYZ_penBiasClamp, initialLinVelXYZ_invMassW) make
+// that look arbitrary; the host declaration order is what pins it.
+public static const uint PXG_ARTI_LINK_INCOMING_JOINT_FORCES = 72;  // Cm::UnAlignedSpatialVector*
+public static const uint PXG_ARTI_LINKREC_INITIAL_ANGVEL_PENBIAS = 0;   // float4 in PxgArticulationLink
+public static const uint PXG_ARTI_LINKREC_INITIAL_LINVEL_INVMASS = 16;  // float4 in PxgArticulationLink
+public static const uint PXG_ARTI_SLEEPDATA_LINVEL = 0;   // float4 in PxgArticulationLinkSleepData
+public static const uint PXG_ARTI_SLEEPDATA_ANGVEL = 16;  // float4
 public static const uint PXG_ARTI_CORIOLISE_VECTORS = 80;
 // P8.84.  Despite the name this is not only an inverse-dynamics buffer: when
 // isExternalForcesEveryTgsIterationEnabled is set, computeSpatialInertiaW parks
