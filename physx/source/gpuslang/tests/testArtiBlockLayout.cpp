@@ -291,6 +291,8 @@ static_assert(offsetof(PxgArticulationData, updateDirty) == 12, "PXG_ARTI_DATA_U
 static_assert(offsetof(PxgArticulationLinkProp, invMass) == 12, "PXG_ARTI_LINK_PROP_INV_MASS");
 static_assert(offsetof(PxgArticulationLink, cfmScale) == 72, "PXG_ARTI_LINK_CFM_SCALE");
 static_assert(uint32_t(PxArticulationFlag::eFIX_BASE) == 1, "PXG_ARTI_FLAG_FIX_BASE");
+static_assert(uint32_t(PxgArtiStateDirtyFlag::eVEL_DIRTY) == 1, "PXG_ARTI_STATE_VEL_DIRTY");
+static_assert(uint32_t(PxgArtiStateDirtyFlag::eHAS_IMPULSES) == 2, "PXG_ARTI_STATE_HAS_IMPULSES");
 static_assert(sizeof(Dy::SpatialSubspaceMatrix) == 80, "PXG_ARTI_SUBSPACE_STRIDE");
 static_assert(sizeof(PxQuat) == 16, "PXG_ARTI_QUAT_SIZE");
 static_assert(sizeof(PxgArticulationData::flags) == 1, "flags is a byte");

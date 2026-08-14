@@ -59,6 +59,7 @@
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
+#include "pxgArtiRefHelpers.h"
 
 #include "foundation/PxQuat.h"
 #include "foundation/PxTransform.h"
@@ -107,7 +108,12 @@ static uint32_t stUlpDiff(float a, float b)
 }
 
 
-enum JointType : uint8_t { J_FIX = 0, J_PRISMATIC, J_REVOLUTE, J_REVOLUTE_UNWRAPPED, J_SPHERICAL };
+using pxgref::JointType;
+using pxgref::J_FIX;
+using pxgref::J_PRISMATIC;
+using pxgref::J_REVOLUTE;
+using pxgref::J_REVOLUTE_UNWRAPPED;
+using pxgref::J_SPHERICAL;
 
 const uint32_t ST_LANES = 25;
 const uint32_t ST_MAX_LINKS = 6;
@@ -254,151 +260,11 @@ static void stFill(physx::PxgArticulationBlockLinkData* lk, physx::PxgArticulati
 // The mirror: the CUDA's structure, the engine's arithmetic
 // ---------------------------------------------------------------------------
 
-static PxVec3 refToRotationVector(const PxQuat& q)
-{
-    const float quatEpsilon = 1.0e-8f;
-    const float s2 = q.x * q.x + q.y * q.y + q.z * q.z;
-    PxReal angle;
-    PxVec3 axis;
-    if (s2 < quatEpsilon * quatEpsilon)
-    {
-        angle = 0.0f;
-        axis = PxVec3(1.0f, 0.0f, 0.0f);
-    }
-    else
-    {
-        const float s = physx::PxRecipSqrt(s2);
-        axis = PxVec3(q.x, q.y, q.z) * s;
-        angle = physx::PxAbs(q.w) < quatEpsilon ? physx::PxPi
-                                                : physx::PxAtan2(s2 * s, q.w) * 2.0f;
-    }
-    return axis * angle;
-}
+using pxgref::refToRotationVector;
+using pxgref::refUpdateRootBody;
+using pxgref::refSphericalJointPositions;
+using pxgref::refPropagateLink;
 
-static PxTransform refUpdateRootBody(const UnAlignedSpatialVector& motionVelocity,
-                                     const PxTransform& preTransform, PxReal dt)
-{
-    const PxVec3 comLinVel = motionVelocity.bottom;
-    const PxVec3 newP = (preTransform.p) + comLinVel * dt;
-    const PxQuat deltaQ = physx::PxExp(motionVelocity.top * dt);
-    return PxTransform(newP, (deltaQ * preTransform.q).getNormalized());
-}
-
-static PxQuat refSphericalJointPositions(const PxQuat& relativeQuat, const PxQuat& newRot,
-                                         const PxQuat& pBody2WorldRot,
-                                         physx::PxgArticulationBlockDofData* dofData, PxU32 dofs,
-                                         uint32_t lane)
-{
-    PxQuat newParentToChild = (newRot.getConjugate() * pBody2WorldRot).getNormalized();
-    if (newParentToChild.w < 0.f)
-        newParentToChild = -newParentToChild;
-
-    PxQuat jointRotation = newParentToChild * relativeQuat.getConjugate();
-    if (jointRotation.w < 0)
-        jointRotation = -jointRotation;
-
-    const PxVec3 axis = refToRotationVector(jointRotation);
-    for (PxU32 dd = 0; dd < dofs; ++dd)
-    {
-        const float4 top = dofData[dd].mLocalMotionMatrix.mTopxyz_bx[lane];
-        const PxReal ang = -PxVec3(top.x, top.y, top.z).dot(axis);
-        dofData[dd].mJointPositions[lane] = ang;
-    }
-    return newParentToChild;
-}
-
-static PxTransform refPropagateLink(physx::PxgArticulationBlockLinkData* lk,
-                                    physx::PxgArticulationBlockDofData* df, uint32_t linkID,
-                                    PxReal dt, bool isSubstep, uint32_t lane)
-{
-    physx::PxgArticulationBlockLinkData& link = lk[linkID];
-    const PxU32 jointOffset = link.mJointOffset[lane];
-    const PxU32 jointType = link.mJointType[lane];
-    const PxU32 parent = link.mParents[lane];
-    physx::PxgArticulationBlockDofData* dof = df + jointOffset;
-
-    const PxTransform pBody2World = loadSpatialTransform(lk[parent].mAccumulatedPose, lane);
-
-    const float4 co = link.mChildPose.p[lane];
-    const float4 po = link.mParentPose.p[lane];
-    const float4 rq = link.mRelativeQuat[lane];
-    const PxVec3 childOffset(-co.x, -co.y, -co.z);
-    const PxVec3 parentOffset(po.x, po.y, po.z);
-    const PxQuat relativeQuat(rq.x, rq.y, rq.z, rq.w);
-
-    PxQuat newParentToChild = relativeQuat;
-    PxVec3 offset(0.f);
-
-    if (jointType == J_PRISMATIC)
-    {
-        const PxReal delta = (isSubstep ? dof[0].mJointVelocities[lane]
-                                        : dof[0].mPosJointVelocities[lane]) * dt;
-        const PxReal pos = dof[0].mJointPositions[lane] + delta;
-        dof[0].mJointPositions[lane] = pos;
-        newParentToChild = relativeQuat;
-        const UnAlignedSpatialVector mm = loadSpatialVector(dof[0].mLocalMotionMatrix, lane);
-        offset = mm.bottom * pos;
-    }
-    else if (jointType == J_REVOLUTE)
-    {
-        const PxReal delta = (isSubstep ? dof[0].mJointVelocities[lane]
-                                        : dof[0].mPosJointVelocities[lane]) * dt;
-        PxReal jPos = dof[0].mJointPositions[lane] + delta;
-        if (jPos > physx::PxTwoPi)
-            jPos -= physx::PxTwoPi * 2.f;
-        else if (jPos < -physx::PxTwoPi)
-            jPos += physx::PxTwoPi * 2.f;
-        jPos = physx::PxClamp(jPos, -physx::PxTwoPi * 2.f, physx::PxTwoPi * 2.f);
-        dof[0].mJointPositions[lane] = jPos;
-        const float4 u = dof[0].mLocalMotionMatrix.mTopxyz_bx[lane];
-        PxQuat jointRotation = PxQuat(-jPos, PxVec3(u.x, u.y, u.z));
-        if (jointRotation.w < 0)
-            jointRotation = -jointRotation;
-        newParentToChild = (jointRotation * relativeQuat).getNormalized();
-    }
-    else if (jointType == J_REVOLUTE_UNWRAPPED)
-    {
-        const PxReal delta = (isSubstep ? dof[0].mJointVelocities[lane]
-                                        : dof[0].mPosJointVelocities[lane]) * dt;
-        const PxReal jPos = dof[0].mJointPositions[lane] + delta;
-        dof[0].mJointPositions[lane] = jPos;
-        const float4 u = dof[0].mLocalMotionMatrix.mTopxyz_bx[lane];
-        PxQuat jointRotation = PxQuat(-jPos, PxVec3(u.x, u.y, u.z));
-        if (jointRotation.w < 0)
-            jointRotation = -jointRotation;
-        newParentToChild = (jointRotation * relativeQuat).getNormalized();
-    }
-    else if (jointType == J_SPHERICAL)
-    {
-        const PxU32 nbDofs = link.mDofs[lane];
-        const PxTransform oldTransform = loadSpatialTransform(link.mAccumulatedPose, lane);
-        UnAlignedSpatialVector worldVel = isSubstep
-                                              ? loadSpatialVector(link.mMotionVelocity, lane)
-                                              : loadSpatialVector(link.mPosMotionVelocity, lane);
-        PxVec3 worldAngVel = worldVel.top;
-        const PxReal dist = worldAngVel.normalize() * dt;
-        PxQuat newWorldQ;
-        if (dist > 1e-6f)
-            newWorldQ = PxQuat(dist, worldAngVel) * oldTransform.q;
-        else
-            newWorldQ = oldTransform.q;
-        newParentToChild =
-            refSphericalJointPositions(relativeQuat, newWorldQ, pBody2World.q, dof, nbDofs, lane);
-    }
-    else
-    {
-        newParentToChild = relativeQuat;
-    }
-
-    const PxVec3 e = newParentToChild.rotate(parentOffset);
-    const PxVec3 d = childOffset;
-    const PxVec3 r = e + d + offset;
-
-    PxTransform body2World;
-    body2World.q = (pBody2World.q * newParentToChild.getConjugate()).getNormalized();
-    body2World.p = pBody2World.p + body2World.q.rotate(r);
-    return body2World;
-}
 
 static void stMirror(physx::PxgArticulationBlockLinkData* lk,
                      physx::PxgArticulationBlockDofData* df, uint32_t numLinks, PxReal dt,

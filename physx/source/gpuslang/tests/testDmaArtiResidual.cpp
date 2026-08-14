@@ -113,6 +113,16 @@ static_assert(offsetof(PxgArticulationCoreDesc, mMaxAttachmentPerArticulation) =
 static_assert(offsetof(PxgArticulationCoreDesc, mMaxFixedTendonsPerArticulation) == 268, "..MAX_FIXED_TENDONS");
 static_assert(offsetof(PxgArticulationCoreDesc, mMaxTendonJointPerArticulation) == 272, "..MAX_TENDON_JOINTS");
 
+// ---- P8.94d: the impulse/slab group, for stepArticulation1TTGS.
+// nbPartitions (84) between them stays unmapped; slabDirtyMasks (96) is the
+// NEXT field after slabHasChanges and a different array -- pinned so a header
+// change shifting it fails here rather than silently re-aiming slabHasChanges.
+static_assert(offsetof(PxgArticulationCoreDesc, impulses) == 72, "..IMPULSES");
+static_assert(offsetof(PxgArticulationCoreDesc, nbSlabs) == 80, "..NB_SLABS");
+static_assert(offsetof(PxgArticulationCoreDesc, slabHasChanges) == 88, "..SLAB_HAS_CHANGES");
+static_assert(offsetof(PxgArticulationCoreDesc, slabDirtyMasks) == 96,
+              "slabDirtyMasks moved -- recheck 88");
+
 // The two tendon CONSTRAINT block pointers are NOT mapped and must stay
 // unmapped until a kernel needs them -- pinned here only so that a header
 // change which shifts them (and therefore shifts the tendon block pointers

@@ -1167,6 +1167,14 @@ static const PxgKernelAbiRow kRows[] = {
     // a refused launch does not leave the pose stale -- it overwrites it with
     // whatever the staging buffer held.  (P8.93)
     { "dmaBackArticulationDataLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    // forwardDynamic2.cu:3873 stepArticulation1TTGS(
+    //     const PxgArticulationCoreDesc*, PxReal stepDt)
+    // -> pointer@0 + float by value@8 = 16-byte blob, the kPtrU32 shape (the row
+    // describes sizes, not types).  Block (32, 2, 1), grid
+    // ceil(nbActiveArticulations / 64), launched once per TGS position
+    // iteration from PxgTGSCudaSolverCore::solveContactMultiBlockParallel with
+    // stepDt = dt / nbPositionIterations.  (P8.94d)
+    { "stepArticulation1TTGS", kPtrU32, uint32_t(sizeof(kPtrU32)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

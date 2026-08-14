@@ -69,6 +69,7 @@
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
+#include "pxgArtiRefHelpers.h"
 
 #include "foundation/PxVec3.h"
 #include "CmSpatialVector.h"
@@ -137,151 +138,9 @@ static float ai(uint32_t i, uint32_t k)
 // ---------------------------------------------------------------------------
 
 // propagateImpulseW<WriteToDeferredQstZ>, jointForce NULL.
-static UnAlignedSpatialVector aiPropagateImpulse(const PxVec3& parentToChild,
-                                                 physx::PxgArticulationBlockDofData* dofData,
-                                                 const UnAlignedSpatialVector& Z, PxU32 dofCount,
-                                                 uint32_t lane)
-{
-    UnAlignedSpatialVector temp = Z;
-    for (PxU32 ind = 0; ind < 3; ++ind)
-    {
-        if (ind < dofCount)
-        {
-            const UnAlignedSpatialVector sas = loadSpatialVector(dofData[ind].mWorldMotionMatrix,
-                                                                 lane);
-            const UnAlignedSpatialVector isInvD = loadSpatialVector(dofData[ind].mIsInvDW, lane);
-            const PxReal stZ = 0.0f - sas.innerProduct(Z);
-            dofData[ind].mDeferredQstZ[lane] += stZ;
-            temp += isInvD * stZ;
-        }
-    }
-    return physx::Dy::FeatherstoneArticulation::translateSpatialVector(parentToChild, temp);
-}
+using pxgref::aiPropagateImpulse;
+using pxgref::aiMirror;
 
-static void aiMirror(uint32_t* isSlabDirty, float* impulses,
-                     physx::PxgArticulationBlockData* ab,
-                     physx::PxgArticulationBlockLinkData* lk,
-                     physx::PxgArticulationBlockDofData* df, uint32_t articulationId,
-                     uint32_t maxLinks, uint32_t nbArticulations, uint32_t nbSlabs, uint32_t lane,
-                     uint32_t& alignedHits, uint32_t& unalignedHits)
-{
-    const PxU32 slabStepSize = maxLinks * nbArticulations;
-
-    PxReal scale = 1.0f;
-    if (nbSlabs > 1)
-    {
-        PxReal count = 0.0f;
-        for (PxU32 s = 0, di = articulationId; s < nbSlabs; ++s, di += nbArticulations)
-        {
-            if (isSlabDirty[di * 2 + 0] != AI_NONE || isSlabDirty[di * 2 + 1] != AI_NONE)
-                count += 1.0f;
-        }
-        scale = count > 1.0f ? 1.0f / count : 1.0f;
-    }
-
-    PxU32 maxIndex = ab->mLinkWithDeferredImpulse[lane];
-
-    for (PxU32 s = 0, slabOffset = articulationId, di = articulationId; s < nbSlabs;
-         ++s, slabOffset += slabStepSize, di += nbArticulations)
-    {
-        const PxU32 dx = isSlabDirty[di * 2 + 0];
-        const PxU32 dy = isSlabDirty[di * 2 + 1];
-        for (PxU32 i = 0, dirtyIndex = dx; i < 2; ++i, dirtyIndex = dy)
-        {
-            if (dirtyIndex != AI_NONE)
-            {
-                const UnAlignedSpatialVector preloadedScratchImpulse =
-                    loadSpatialVector(lk[dirtyIndex].mScratchImpulse, lane);
-
-                const PxU32 deltaIdx = slabOffset + dirtyIndex * nbArticulations;
-
-                // THE BRANCH, kept literally -- see the header
-                UnAlignedSpatialVector impulse;
-                float* base = impulses + size_t(deltaIdx) * 6;
-                const size_t ptr = reinterpret_cast<size_t>(base);
-                if (ptr & 0xf)
-                {
-                    ++unalignedHits;
-                    float* f2 = base;
-                    float* f4 = base + 2;
-                    impulse.top.x = f2[0]; impulse.top.y = f2[1]; impulse.top.z = f4[0];
-                    impulse.bottom.x = f4[1]; impulse.bottom.y = f4[2]; impulse.bottom.z = f4[3];
-                    for (int z = 0; z < 4; ++z) f4[z] = 0.f;
-                    for (int z = 0; z < 2; ++z) f2[z] = 0.f;
-                }
-                else
-                {
-                    ++alignedHits;
-                    float* f4 = base;
-                    float* f2 = base + 4;
-                    impulse.top.x = f4[0]; impulse.top.y = f4[1]; impulse.top.z = f4[2];
-                    impulse.bottom.x = f4[3]; impulse.bottom.y = f2[0]; impulse.bottom.z = f2[1];
-                    for (int z = 0; z < 4; ++z) f4[z] = 0.f;
-                    for (int z = 0; z < 2; ++z) f2[z] = 0.f;
-                }
-
-                storeSpatialVector(lk[dirtyIndex].mScratchImpulse,
-                                   preloadedScratchImpulse + impulse * scale, lane);
-                maxIndex = physx::PxMax(dirtyIndex, maxIndex);
-            }
-        }
-        isSlabDirty[di * 2 + 0] = AI_NONE;
-        isSlabDirty[di * 2 + 1] = AI_NONE;
-    }
-
-    const UnAlignedSpatialVector preloadedRootDeferredZ = loadSpatialVector(ab->mRootDeferredZ,
-                                                                           lane);
-    if (maxIndex)
-    {
-        physx::PxgArticulationBlockDofData* dofData = &df[lk[maxIndex].mJointOffset[lane]];
-
-        PxU32 nextParent = lk[maxIndex].mParents[lane];
-        PxU32 nextDofs = lk[maxIndex].mDofs[lane];
-        float nx = lk[maxIndex].mRw_x[lane];
-        float ny = lk[maxIndex].mRw_y[lane];
-        float nz = lk[maxIndex].mRw_z[lane];
-
-        for (PxU32 linkID = maxIndex; linkID > 0; linkID--)
-        {
-            physx::PxgArticulationBlockLinkData& linkData = lk[linkID];
-
-            const UnAlignedSpatialVector Z = loadSpatialVector(linkData.mScratchImpulse, lane);
-            const UnAlignedSpatialVector solverSpatialImpulse =
-                loadSpatialVector(linkData.mSolverSpatialImpulse, lane);
-
-            const PxU32 parent = nextParent;
-            const UnAlignedSpatialVector parentScratchImpulse =
-                loadSpatialVector(lk[parent].mScratchImpulse, lane);
-            const float cx = nx, cy = ny, cz = nz;
-            const PxU32 dofCount = nextDofs;
-
-            if (linkID > 1)
-            {
-                const PxU32 nextIndex = linkID - 1;
-                nextParent = lk[nextIndex].mParents[lane];
-                nextDofs = lk[nextIndex].mDofs[lane];
-                nx = lk[nextIndex].mRw_x[lane];
-                ny = lk[nextIndex].mRw_y[lane];
-                nz = lk[nextIndex].mRw_z[lane];
-            }
-
-            const UnAlignedSpatialVector propagatedZ =
-                aiPropagateImpulse(PxVec3(cx, cy, cz), dofData, Z, dofCount, lane);
-
-            storeSpatialVector(linkData.mSolverSpatialImpulse, solverSpatialImpulse + Z, lane);
-            storeSpatialVector(lk[parent].mScratchImpulse, parentScratchImpulse + propagatedZ,
-                               lane);
-            storeSpatialVector(linkData.mScratchImpulse, UnAlignedSpatialVector::Zero(), lane);
-
-            dofData -= nextDofs;
-        }
-    }
-    const UnAlignedSpatialVector preloadedRootScratchImpulse =
-        loadSpatialVector(lk[0].mScratchImpulse, lane);
-    storeSpatialVector(lk[0].mScratchImpulse, UnAlignedSpatialVector::Zero(), lane);
-    storeSpatialVector(ab->mRootDeferredZ, preloadedRootScratchImpulse + preloadedRootDeferredZ,
-                       lane);
-}
 
 // ---------------------------------------------------------------------------
 

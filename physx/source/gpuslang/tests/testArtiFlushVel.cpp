@@ -66,6 +66,7 @@
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
+#include "pxgArtiRefHelpers.h"
 
 #include "foundation/PxVec3.h"
 #include "CmSpatialVector.h"
@@ -252,136 +253,11 @@ static void fvFill(physx::PxgArticulationBlockData* ab,
 // The mirror: the CUDA's structure, the engine's arithmetic
 // ---------------------------------------------------------------------------
 
-static UnAlignedSpatialVector fvPropagateAccel(physx::PxgArticulationBlockLinkData& link,
-                                               physx::PxgArticulationBlockDofData* dofData,
-                                               PxU32 dofCount,
-                                               const UnAlignedSpatialVector& parentAccel,
-                                               uint32_t lane)
-{
-    const float rx = link.mRw_x[lane];
-    const float ry = link.mRw_y[lane];
-    const float rz = link.mRw_z[lane];
+using pxgref::fvPropagateAccel;
 
-    PxVec3 invStIsT[3];
-    PxReal tJointDelta[3] = { 0.f, 0.f, 0.f };
-    UnAlignedSpatialVector isW[3];
-    UnAlignedSpatialVector motionMatrix[3];
-    PxReal jVel[3] = { 0.f, 0.f, 0.f };
 
-    for (PxU32 ind = 0; ind < 3; ++ind)
-    {
-        if (ind < dofCount)
-        {
-            isW[ind] = loadSpatialVector(dofData[ind].mIsW, lane);
-            tJointDelta[ind] = dofData[ind].mDeferredQstZ[lane];
-            jVel[ind] = dofData[ind].mJointVelocities[lane];
-            invStIsT[ind] = PxVec3(dofData[ind].mInvStIsT_x[lane], dofData[ind].mInvStIsT_y[lane],
-                                   dofData[ind].mInvStIsT_z[lane]);
-            motionMatrix[ind] = loadSpatialVector(dofData[ind].mWorldMotionMatrix, lane);
-        }
-    }
+using pxgref::fvMirror;
 
-    UnAlignedSpatialVector pDeltaV =
-        physx::Dy::FeatherstoneArticulation::translateSpatialVector(PxVec3(-rx, -ry, -rz),
-                                                                    parentAccel);
-
-    for (PxU32 ind = 0; ind < 3; ++ind)
-        if (ind < dofCount)
-            tJointDelta[ind] -= isW[ind].innerProduct(pDeltaV);
-
-    for (PxU32 ind = 0; ind < 3; ++ind)
-    {
-        if (ind < dofCount)
-        {
-            const PxReal jDelta = invStIsT[ind].x * tJointDelta[0]
-                                + invStIsT[ind].y * tJointDelta[1]
-                                + invStIsT[ind].z * tJointDelta[2];
-            dofData[ind].mJointVelocities[lane] = jVel[ind] + jDelta;
-            pDeltaV += motionMatrix[ind] * jDelta;
-        }
-    }
-    return pDeltaV;
-}
-
-static void fvMirror(physx::PxgArticulationBlockData* ab,
-                     physx::PxgArticulationBlockLinkData* lk,
-                     physx::PxgArticulationBlockDofData* df, uint32_t linkCount, bool fixBase,
-                     uint32_t lane)
-{
-    UnAlignedSpatialVector deltaV = UnAlignedSpatialVector::Zero();
-    const UnAlignedSpatialVector deferredZ = -loadSpatialVector(ab->mRootDeferredZ, lane);
-
-    if (!fixBase)
-    {
-        const UnAlignedSpatialVector motionVelocity0 = loadSpatialVector(lk[0].mMotionVelocity,
-                                                                        lane);
-        const UnAlignedSpatialVector solverSpatialDeltaVel0 =
-            loadSpatialVector(lk[0].mSolverSpatialDeltaVel, lane);
-
-        physx::Dy::SpatialMatrix invInertia;
-        loadSpatialMatrix(ab->mInvSpatialArticulatedInertia, lane, invInertia);
-
-        deltaV = invInertia * deferredZ;
-
-        storeSpatialVector(lk[0].mMotionVelocity, motionVelocity0 + deltaV, lane);
-        storeSpatialVector(ab->mRootDeferredZ, UnAlignedSpatialVector::Zero(), lane);
-        storeSpatialVector(lk[0].mSolverSpatialDeltaVel, solverSpatialDeltaVel0 + deltaV, lane);
-    }
-
-    storeSpatialVector(lk[0].mScratchDeltaV, deltaV, lane);
-    storeSpatialVector(lk[0].mConstraintForces,
-                       loadSpatialVector(lk[0].mConstraintForces, lane) + deferredZ, lane);
-    storeSpatialVector(ab->mCommonLinkDeltaVelocity, UnAlignedSpatialVector::Zero(), lane);
-
-    physx::PxgArticulationBlockDofData* dofs = df;
-
-    if (linkCount > 1)
-    {
-        UnAlignedSpatialVector nextMotionV = loadSpatialVector(lk[1].mMotionVelocity, lane);
-        PxU32 nextNbDofs = lk[1].mDofs[lane];
-        PxU32 nextParent = lk[1].mParents[lane];
-
-        for (PxU32 i = 1; i < linkCount; i++)
-        {
-            physx::PxgArticulationBlockLinkData& tLink = lk[i];
-            const PxU32 nbDofs = nextNbDofs;
-            const PxU32 parent = nextParent;
-
-            const UnAlignedSpatialVector preloadedConstraintForces =
-                loadSpatialVector(tLink.mConstraintForces, lane);
-            const UnAlignedSpatialVector preloadedSolverSpatialDeltaVel =
-                loadSpatialVector(tLink.mSolverSpatialDeltaVel, lane);
-
-            UnAlignedSpatialVector motionV = nextMotionV;
-
-            if ((i + 1) < linkCount)
-            {
-                nextMotionV = loadSpatialVector(lk[i + 1].mMotionVelocity, lane);
-                nextNbDofs = lk[i + 1].mDofs[lane];
-                nextParent = lk[i + 1].mParents[lane];
-            }
-
-            if (parent != (i - 1))
-                deltaV = loadSpatialVector(lk[parent].mScratchDeltaV, lane);
-
-            deltaV = fvPropagateAccel(tLink, dofs, nbDofs, deltaV, lane);
-
-            storeSpatialVector(tLink.mSolverSpatialDeltaVel,
-                               preloadedSolverSpatialDeltaVel + deltaV, lane);
-
-            for (PxU32 ind = 0; ind < nbDofs; ++ind)
-                dofs[ind].mDeferredQstZ[lane] = 0.f;
-
-            motionV += deltaV;
-
-            storeSpatialVector(tLink.mScratchDeltaV, deltaV, lane);
-            storeSpatialVector(tLink.mMotionVelocity, motionV, lane);
-            storeSpatialVector(tLink.mConstraintForces, preloadedConstraintForces + deltaV, lane);
-
-            dofs += nbDofs;
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 

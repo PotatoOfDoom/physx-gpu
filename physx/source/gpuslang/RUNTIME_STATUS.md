@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **730/730** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **731/731** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,103 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.94d — `stepArticulation1TTGS` — manifest **277**, and the fixture that reached 1e8 radians
+
+forwardDynamic2.cu:3873 — the TGS sub-step integrator, launched once per
+position iteration from `PxgTGSCudaSolverCore::solveContactMultiBlockParallel`
+with `stepDt = dt / nbPositionIterations`.  Manifest 276 → **277**, suite 730 →
+****731****, the refused-kernel list **225 → **224** with this kernel the one that leaves**.  Sweep
+**32/32, no survivors** — the first clean sweep since P8.85.  ABI: the first
+articulation row with a BY-VALUE float (`{8, 4}`, the kPtrU32 shape).
+
+New module `npArtiStepKernel.slang`, new fixture `testArtiStepKernel.cpp`.
+Three descriptor constants generated and pinned (`IMPULSES` 72, `NB_SLABS` 80,
+`SLAB_HAS_CHANGES` 88, with `slabDirtyMasks` at 96 pinned as the neighbour that
+must not be confused), plus the two `PxgArtiStateDirtyFlag` values — pinned
+host-side, because `mStateDirty` is a MASK (3 is reachable), not a bool.
+
+### Composition, and the first np-module cross-import
+
+Every body this kernel runs was landed, fixtured and swept in its own tranche:
+`aiAverageAndPropagate` (P8.94c), the six-argument `PxcFsFlushVelocity`
+(P8.94b), `asUpdateRootBody` / `asPropagateLink<true>` (P8.94a).  The module
+IMPORTS the three np modules — the first time an np module imports another —
+and the concern that made that novel was measured before relying on it: slangc
+prunes the imported modules' push-constant globals per entry point, so the
+compiled SPIR-V carries exactly one push-constant block.
+
+What is genuinely new is the bookkeeping the kernel wraps around those calls
+(deltaQ with the shortest-arc flip, the velocity-integrated `mDeltaMotion` —
+the engine's own comment PX-3638 explains why it is NOT recovered from the pose
+difference — and `mPosMotionVelocity`), the state-dirty dispatch, and the
+index/stride plumbing.  All 32 mutants aimed at exactly that layer, and all 32
+died.
+
+### The mirrors moved, not copied
+
+The fixture composes all three earlier mirrors plus the new bookkeeping.  They
+were file-static in three test TUs, so they moved VERBATIM (static → inline is
+the whole diff) into `pxgArtiRefHelpers.h` under `namespace pxgref`, and the
+three original fixtures now consume them from there — one mirror, four users.
+The hoist was proven behaviour-neutral by rerunning the three source suites
+before anything else changed.
+
+### The finding: llvmpipe's sin/cos at 1e8 radians is a different function
+
+The fixture's first version seeded every response term at ±3, and the
+impulse → deferredQstZ → flush chain amplified that geometrically across six
+links: the post-flush angular velocity reached **2.97e9 — bit-identical on
+both sides** — so the integration computed `sin(|w| * stepDt)` at an argument
+of **1e8 radians**.  There llvmpipe's argument reduction and glibc's are
+different algorithms, and the results are uncorrelated O(1): the spherical
+link's pose came back a ~28°-different rotation with every input word equal.
+
+That is not a port bug, and no ULP bound survives it; no engine scene reaches
+it either, because velocities are clamped upstream.  The fix is fixture
+realism, recorded in the fixture header: inverse-inertia-like seeds at ~0.1,
+impulses at ~0.05, keeping every substep rotation at a few radians — the
+regime P8.94a's budget was measured in.  After the rescale: max abs error
+**2.86e-6**, inside the transcendental envelope, with the tolerance still
+scoped to exactly three fields (`mAccumulatedPose`, `mJointPositions`,
+`mDeltaQ`) and every other word — the flush's, the averaging's, the poison —
+bit-exact.
+
+Diagnosis was measurement, not narrowing by guesswork: masking the averaging
+bit isolated the trigger, enabling it for ONE articulation reproduced it, and
+a host-side variant probe (integrate from pre-flush vs post-flush velocities)
+plus a dump of the bit-identical 2.97e9 velocity pinned the mechanism.
+
+### The recurring fixture lesson, again, in a new costume
+
+The first sweep-adjacent failure of this fixture was neither of the above:
+`askStateDirty` was keyed mod 4 and `askDirtySlabs` mod 4 too, so every lane
+that both averaged AND had a dirty slab satisfied `a ≡ 1 (mod 4)` — every
+impulse read was an ODD element and the 16-aligned counter read zero.  The
+predicates now use coprime moduli (4 and 5), and the counter check
+(`alignedHits > 5 && unalignedHits > 5`) is what caught it — the check on the
+CHECK, not the comparison itself.
+
+### Geometry
+
+130 articulations → grid 3, block (32, 2, 1), five live warp slices (the fifth
+2/32 occupied), a sixth allocated slice that must come back fully poisoned.
+`stateDirty` 0/1/2/3 on 32/32/33/33 lanes, 43 fixed / 87 free bases, dirty
+pairs with only `.x`, only `.y`, both and neither, impulse reads 80 aligned /
+77 unaligned.
+
+### What the scene says
+
+**The scene's verdict changed for the first time since P8.55.**  The step
+failures went **3 → 2**: the "not at rest" check now measures `|v| = 0.1294`
+where every run since P8.65 measured 4.7765 — the solver's impulses, the
+deferred-Z flush and the sub-step integration are now demonstrably working
+TOGETHER on the live scene, damping the link toward rest across the 240 steps.
+The link still reports y = 3.0000 ("did not begin falling") because the record
+buffer the host reads is filled by `updateBodiesLaunch_Part2`
+(forwardDynamic2.cu:3189), which is still unmapped — exactly the two-kernel
+dependency P8.94a's module header predicted.  The engine's next refusals are
+`solveInternalConstraints` and `artiSolveInternalTendonAndMimicJointConstraints1T`.
 
 ## P8.94c — `averageLinkImpulsesAndPropagate`, and an alignment branch that collapses
 
