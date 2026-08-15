@@ -1183,6 +1183,12 @@ static const PxgKernelAbiRow kRows[] = {
     // articulation chain's first Z dimension (PxgArticulationCore.cpp:953-965).
     // (P8.95b)
     { "updateBodiesLaunch_Part2", kSapBoxInit, uint32_t(sizeof(kSapBoxInit)) },
+    // internalConstraints2.cu:3371 artiSumInternalContactAndJointBatches1Launch(
+    //     const PxgArticulationCoreDesc*, PxgPrePrepDesc*, PxU32 nbArticulations)
+    // -> two pointers + a PxU32 by value = 24-byte blob, the kTwoPtrU32 shape.
+    // Grid (32, 1, 1) FIXED, block (512, 1, 1)
+    // (PxgArticulationCore.cpp:305/330).  (P8.96a)
+    { "artiSumInternalContactAndJointBatches1Launch", kTwoPtrU32, uint32_t(sizeof(kTwoPtrU32)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

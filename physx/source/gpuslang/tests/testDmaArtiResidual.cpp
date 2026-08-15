@@ -123,6 +123,24 @@ static_assert(offsetof(PxgArticulationCoreDesc, slabHasChanges) == 88, "..SLAB_H
 static_assert(offsetof(PxgArticulationCoreDesc, slabDirtyMasks) == 96,
               "slabDirtyMasks moved -- recheck 88");
 
+// ---- P8.96a: the eight temp reduction blocks, a contiguous run
+static_assert(offsetof(PxgArticulationCoreDesc, mTempContactUniqueIndicesBlock) == 280,
+              "..TEMP_CONTACT_UNIQUE");
+static_assert(offsetof(PxgArticulationCoreDesc, mTempConstraintUniqueIndicesBlock) == 288,
+              "..TEMP_CONSTRAINT_UNIQUE");
+static_assert(offsetof(PxgArticulationCoreDesc, mTempContactHeaderBlock) == 296,
+              "..TEMP_CONTACT_HEADER");
+static_assert(offsetof(PxgArticulationCoreDesc, mTempConstraintHeaderBlock) == 304,
+              "..TEMP_CONSTRAINT_HEADER");
+static_assert(offsetof(PxgArticulationCoreDesc, mTempSelfContactUniqueIndicesBlock) == 312,
+              "..TEMP_SELF_CONTACT_UNIQUE");
+static_assert(offsetof(PxgArticulationCoreDesc, mTempSelfConstraintUniqueIndicesBlock) == 320,
+              "..TEMP_SELF_CONSTRAINT_UNIQUE");
+static_assert(offsetof(PxgArticulationCoreDesc, mTempSelfContactHeaderBlock) == 328,
+              "..TEMP_SELF_CONTACT_HEADER");
+static_assert(offsetof(PxgArticulationCoreDesc, mTempSelfConstraintHeaderBlock) == 336,
+              "..TEMP_SELF_CONSTRAINT_HEADER");
+
 // The two tendon CONSTRAINT block pointers are NOT mapped and must stay
 // unmapped until a kernel needs them -- pinned here only so that a header
 // change which shifts them (and therefore shifts the tendon block pointers

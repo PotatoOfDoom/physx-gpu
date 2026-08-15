@@ -295,6 +295,18 @@ public static const uint PXG_ARTI_CORE_ATTACHMENT_BLOCKS = 208;          // PxgA
 public static const uint PXG_ARTI_CORE_FIXED_TENDON_BLOCKS = 216;        // PxgArticulationBlockFixedTendonData*
 public static const uint PXG_ARTI_CORE_TENDON_JOINT_BLOCKS = 232;        // PxgArticulationBlockTendonJointData*
 public static const uint PXG_ARTI_CORE_MIMIC_JOINT_BLOCKS = 240;         // PxgArticulationBlockMimicJointData*
+// P8.96a: the eight per-block scratch arrays artiSumInternalContactAndJoint-
+// Batches1 reduces into (contiguous run 280..343, generated and pinned).  The
+// UNIQUE-INDICES arrays carry plain per-block SUMS; the HEADER arrays carry
+// sums of PER-WARP-CHUNK MAXES -- same convention as the rigid twin's four.
+public static const uint PXG_ARTI_CORE_TEMP_CONTACT_UNIQUE = 280;        // PxU32*
+public static const uint PXG_ARTI_CORE_TEMP_CONSTRAINT_UNIQUE = 288;     // PxU32*
+public static const uint PXG_ARTI_CORE_TEMP_CONTACT_HEADER = 296;        // PxU32*
+public static const uint PXG_ARTI_CORE_TEMP_CONSTRAINT_HEADER = 304;     // PxU32*
+public static const uint PXG_ARTI_CORE_TEMP_SELF_CONTACT_UNIQUE = 312;   // PxU32*
+public static const uint PXG_ARTI_CORE_TEMP_SELF_CONSTRAINT_UNIQUE = 320; // PxU32*
+public static const uint PXG_ARTI_CORE_TEMP_SELF_CONTACT_HEADER = 328;   // PxU32*
+public static const uint PXG_ARTI_CORE_TEMP_SELF_CONSTRAINT_HEADER = 336; // PxU32*
 public static const uint PXG_ARTI_CORE_MAX_LINKS = 248;                  // PxU32
 public static const uint PXG_ARTI_CORE_MAX_DOFS = 252;                   // PxU32
 public static const uint PXG_ARTI_CORE_MAX_MIMIC_JOINTS = 256;           // PxU32

@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **733/733** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **734/734** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,45 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.96a — `artiSumInternalContactAndJointBatches1Launch` — manifest **279**, the prep chain opens
+
+internalConstraints2.cu:3371 (body :2864) — the first kernel of the
+articulation constraint-PREP chain (sub-chain 3), and the articulation twin of
+`rigidSumInternalContactAndJointBatches1`.  Manifest 278 → **279**, suite 733 →
+**734** green in both memory modes, refused-kernel list **223 → 222** with this
+kernel the one that leaves.  Sweep **6/9 first pass, 8/9 after the fixture
+earned two kills**, the one survivor equivalent by construction.  ABI: eight
+new descriptor constants (the temp reduction blocks, a contiguous run 280..343,
+generated and pinned), the kTwoPtrU32 row shape, grid **(32, 1, 1) FIXED** with
+block (512, 1, 1).
+
+The port is the rigid twin's serial-recompute strategy unchanged: under
+subgroup 8 a faithful 16-warp shared-memory reduction buys nothing, so only
+the thread that STORES in the CUDA runs, recomputing the block's reductions as
+pure loops — deterministic uint adds and maxes, bit-exact trivially.  The
+UNIQUE-INDICES outputs are plain block sums; the HEADER outputs are sums of
+PER-WARP-CHUNK maxes, and the 32-element chunk structure is reproduced exactly.
+
+### Two mutants that were IDENTITIES at fixture scale
+
+`workIndex = i*512 + t + numIter*b*512` — with any `nbArticulations ≤ 16384`,
+`numIter == 1` and the mutation `numIter*b*512 → b*512` changes NOTHING; the
+floor-vs-ceil mutation on `numIter` is equally invisible.  Both survived the
+first sweep as identities, not as gaps.  The fixture now runs a second size,
+**17000 articulations** (numIter = 2, every block owning two consecutive
+512-spans), where both mutations change the answer and both die.  The lesson
+joins the P8.94a family: a mutant that cannot fire at the fixture's scale
+proves nothing about the code — the scale is part of the case.
+
+The one survivor (which single thread runs the serial recompute) is equivalent
+by construction: the CUDA's choice of thread warpPerBlock−1 matters there
+because only that thread holds the accumulated shared-memory sums; here every
+thread computes the same eight values, and the guard keeps the CUDA's spelling
+for diffability.
+
+The scene: 20 of 21 green, artiLink still settles at rest height, the
+companion box unchanged (its chain is the solve side, not the prep side).
 
 ## P8.95b — MILESTONE: THE LINK FALLS — `updateBodiesLaunch_Part2`, manifest **278**
 
