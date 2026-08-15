@@ -63,22 +63,6 @@ import pxgSlangArticulationDesc;
 
 static const float ASL_WAKE_COUNTER_RESET_TIME = 20.0f * 0.02f;
 
-// PxQuat::rotateInv (PxQuat.h:324), transcribed EXACTLY: the doubled input
-// components, `w2 = w*w - 0.5`, and the cross term scaled by w -- not the
-// conjugate-multiply-multiply form, and not `rotate` with the cross sign
-// flipped.  Bit-exactness rides on this spelling.
-float3 aslRotateInv(float4 q, float3 v)
-{
-    const float vx = 2.0f * v.x;
-    const float vy = 2.0f * v.y;
-    const float vz = 2.0f * v.z;
-    const float w2 = q.w * q.w - 0.5f;
-    const float dot2 = (q.x * vx + q.y * vy + q.z * vz);
-    return float3(vx * w2 - (q.y * vz - q.z * vy) * q.w + q.x * dot2,
-                  vy * w2 - (q.z * vx - q.x * vz) * q.w + q.y * dot2,
-                  vz * w2 - (q.x * vy - q.y * vx) * q.w + q.z * dot2);
-}
-
 // sleepCheck1T (forwardDynamic2.cu:2706).  `sleepData` is the RECORD-side
 // PxgArticulationLinkSleepData for this link; `wakeCounter` is in/out.
 public float aslSleepCheck1T(uint64_t sleepData, inout float wakeCounter, float4 body2WorldQ,
@@ -109,7 +93,9 @@ public float aslSleepCheck1T(uint64_t sleepData, inout float wakeCounter, float4
 
         sleepLinVelAcc = linearMotionVel;
         // trap 3: only the ANGULAR half changes frame
-        sleepAngVelAcc = aslRotateInv(body2WorldQ, angularMotionVel);
+        // pxgSlangCommon's quatRotateInv IS PxQuat::rotateInv's spelling to the
+        // bit (P8.95a first carried a private copy; one shared body, not two)
+        sleepAngVelAcc = quatRotateInv(body2WorldQ, angularMotionVel);
 
         sleepLinVelAcc.x += sleepLinVelAccXYZ.x;
         sleepLinVelAcc.y += sleepLinVelAccXYZ.y;

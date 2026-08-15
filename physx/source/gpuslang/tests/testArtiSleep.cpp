@@ -49,6 +49,7 @@
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
+#include "pxgArtiRefHelpers.h"
 
 #include "foundation/PxQuat.h"
 #include "foundation/PxVec3.h"
@@ -80,85 +81,8 @@ static float aslV(uint32_t i, uint32_t k)
     return (float((i * 37u + k * 19u) % 431u) + 1.0f) * 0.0078125f - 1.6875f;
 }
 
-// The energy computation, extracted so the FILL can hit the threshold
-// comparison EXACTLY: the sweep's first run left "the >= relaxed to >" alive
-// because no case had normalizedEnergy == sleepThreshold to the bit.  A case
-// whose threshold IS the computed energy is constructible, but only if fill
-// and mirror share one computation -- so it lives here, used by both.
-static PxReal aslEnergy(const float* sleepData, const PxQuat& q, const PxVec3& linearMotionVel,
-                        const PxVec3& angularMotionVel, const float inv[4])
-{
-    const PxVec3 inertia(inv[0] > 0.f ? 1.0f / inv[0] : 1.f, inv[1] > 0.f ? 1.0f / inv[1] : 1.f,
-                         inv[2] > 0.f ? 1.0f / inv[2] : 1.f);
-    PxVec3 lin = linearMotionVel;
-    PxVec3 ang = q.rotateInv(angularMotionVel);
-    lin.x += sleepData[0]; lin.y += sleepData[1]; lin.z += sleepData[2];
-    ang.x += sleepData[4]; ang.y += sleepData[5]; ang.z += sleepData[6];
-    PxReal invMass = inv[3];
-    if (invMass == 0.f)
-        invMass = 1.f;
-    const PxReal angular = ang.multiply(ang).dot(inertia) * invMass;
-    const PxReal linear = lin.magnitudeSquared();
-    return 0.5f * (angular + linear);
-}
-
-// the mirror: the CUDA's structure, the engine's arithmetic
-static PxReal aslMirror(float* sleepData, PxReal& wakeCounter, const PxQuat& q,
-                        const PxVec3& linearMotionVel, const PxVec3& angularMotionVel,
-                        float dt, float sleepThreshold, const float inv[4])
-{
-    const PxReal wakeCounterResetTime = 20.0f * 0.02f;
-
-    const float sl0 = sleepData[0], sl1 = sleepData[1], sl2 = sleepData[2];
-    const float sa0 = sleepData[4], sa1 = sleepData[5], sa2 = sleepData[6];
-
-    PxReal wc = wakeCounter;
-    bool alreadyUpdateWC = false;
-    PxVec3 sleepLinVelAcc(0.f), sleepAngVelAcc(0.f);
-
-    if (wc < wakeCounterResetTime * 0.5f || wc < dt)
-    {
-        sleepLinVelAcc = linearMotionVel;
-        sleepAngVelAcc = q.rotateInv(angularMotionVel);
-
-        sleepLinVelAcc.x += sl0;
-        sleepLinVelAcc.y += sl1;
-        sleepLinVelAcc.z += sl2;
-        sleepAngVelAcc.x += sa0;
-        sleepAngVelAcc.y += sa1;
-        sleepAngVelAcc.z += sa2;
-
-        const PxReal normalizedEnergy =
-            aslEnergy(sleepData, q, linearMotionVel, angularMotionVel, inv);
-
-        if (normalizedEnergy >= sleepThreshold)
-        {
-            sleepLinVelAcc = PxVec3(0);
-            sleepAngVelAcc = PxVec3(0);
-            const float factor = sleepThreshold == 0.f
-                                     ? 2.0f
-                                     : physx::PxMin(normalizedEnergy / sleepThreshold, 2.0f);
-            wc = factor * 0.5f * wakeCounterResetTime;
-            alreadyUpdateWC = true;
-        }
-    }
-
-    if (!alreadyUpdateWC)
-        wc = physx::PxMax(wc - dt, 0.0f);
-
-    if (wc == 0.0f)
-    {
-        sleepLinVelAcc = PxVec3(0);
-        sleepAngVelAcc = PxVec3(0);
-    }
-
-    wakeCounter = wc;
-    sleepData[0] = sleepLinVelAcc.x; sleepData[1] = sleepLinVelAcc.y;
-    sleepData[2] = sleepLinVelAcc.z; sleepData[3] = 0.f;
-    sleepData[4] = sleepAngVelAcc.x; sleepData[5] = sleepAngVelAcc.y;
-    sleepData[6] = sleepAngVelAcc.z; sleepData[7] = 0.f;
-    return wc;
-}
+using pxgref::aslEnergy;
+using pxgref::aslMirror;
 
 PXG_TEST(artiSleepCheck)
 {

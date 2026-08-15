@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **732/732** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **733/733** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,87 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.95b — MILESTONE: THE LINK FALLS — `updateBodiesLaunch_Part2`, manifest **278**
+
+forwardDynamic2.cu:3077.  Manifest 277 → **278**, suite 732 → **733** green in
+both memory modes, the refused-kernel list **224 → 223** with this kernel the
+one that leaves.  Sweep **24/26 first pass, 25/26 after the fixture earned the
+U25 kill**, the one survivor proven equivalent.  New module
+`npArtiUpdateBodies.slang`, new fixture `testArtiUpdateBodies.cpp`, and the
+articulation chain's first Z-dimensioned launch: grid
+(blocks, 1, ceil(maxLinks/4)), block (32, 2, **4**).
+
+### The number that has not moved since P8.65, and now does
+
+```
+[artiLink] start y=3.000, y after 1 step=2.9980, final y=2.5000 (rest 2.500), |v|=0.1294
+```
+
+**Both artiLink step checks PASS.**  Every run since P8.65 reported
+`y after 1 step = 3.0000` and `final y = 3.0000`; the link now begins falling
+on the very first step and comes to rest at EXACTLY the rest height.  This is
+the two-kernel dependency P8.94a's header predicted, closed: P8.94d integrates
+`mAccumulatedPose`, and this kernel copies it into the record's
+`linkBody2Worlds` — the buffer the DMA-back (P8.93) hands to the pinned host
+staging area that `PxgPostSolveArticulationTask` writes into every link's
+`bodyCore->body2World`.
+
+The scene's remaining failure is the COMPANION BOX (final y 3.733 vs rest
+0.500): a rigid body resting on the articulation, whose contacts run through
+`solveInternalConstraints` / `artiPropagateVelocity` /
+`solveSelfConstraints` — the solver-side chain the engine now names as its
+next refusals.  One articulation check left, and it is not about the
+articulation.
+
+### What the tranche is made of
+
+The kernel writes **no block field at all** — every store is record-side,
+per-(articulation, link) disjoint, which is what makes the Z-parallel launch
+race-free and what the fixture requires byte-for-byte (the whole block region
+must come back at its seed).  The bodies it composes: the incoming-joint-force
+algebra (P8.86's `asmMulVec`, the P8.91c-hoisted translate, quat/transform
+helpers that pxgSlangCommon has carried since P2), and P8.95a's
+`aslSleepCheck1T`.  The oracle is bit-exact — no transcendental anywhere —
+and it was bit-exact on the fixture's first run, both `integrate` modes.
+
+Traps that got their own mutants, all dead: the TWO guards (fleet maxLinks vs
+this articulation's linkCount); the root's forceless branch and its
+internal-acceleration-free sum; `-dW` with `dW = Gc.rotate(Lc.p)` and the
+`GcLc = Gc * Lc` product order; the **28-byte packed PxTransform array** (a
+32-byte stride corrupts the next element's quaternion — the mutant dies on the
+overrun canary element); the record float4s whose ANGULAR half sits at offset
+0 with `.w` lanes (invMass, penBiasClamp) that must survive; `posMotionV *=
+invDt` only when NOT integrating; and the record lookup through
+`mArticulationIndex`, pinned by a fixture remap that is a fixed-point-free
+permutation.
+
+### The two survivors' stories
+
+**U25 (killed after a fixture fix)** — reading the `integrate` bool as a whole
+word.  The CUDA arg pack carries the bool in ONE byte at offset 12; the three
+bytes above are padding with UNSPECIFIED content.  The first fixture passed a
+clean 0/1 word, so the mask was invisible; it now poisons the padding
+(`0xA7A5A301` / `0xB6B4B200`), and the whole-word read takes the wrong branch
+on the false case.  The same fixture blindness as P8.85's word-read of a bool
+descriptor field, at the arg-pack layer instead.
+
+**U01 (proven equivalent)** — dropping `linkIndex < maxLinks` from the fleet
+guard.  The second guard (`linkIndex < linkCount`, `linkCount <= maxLinks`
+always) subsumes it before any write, and the loads between the two guards
+address the BLOCK, whose base does not depend on linkIndex.  A guard
+protecting only reads that cannot go out of bounds: the P8.94b/P8.94c class,
+third tranche running.
+
+### Also in this tranche
+
+`npArtiSleep`'s private `aslRotateInv` was replaced by pxgSlangCommon's
+`quatRotateInv` — the spellings are identical to the bit, and one shared body
+beats two.  The sleep mirror and its energy helper moved verbatim into
+`pxgArtiRefHelpers.h` (`pxgref`), fourth hoist of the pattern.  The ABI row is
+the kSapBoxInit shape (`{8, 4, 1}`); three record constants were generated and
+pinned, including the two link-record float4 offsets whose ANGULAR-first order
+the CUDA field names disguise.
 
 ## P8.95a — `sleepCheck1T`, and a dead condition made live
 

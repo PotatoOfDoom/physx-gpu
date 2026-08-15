@@ -1175,6 +1175,14 @@ static const PxgKernelAbiRow kRows[] = {
     // iteration from PxgTGSCudaSolverCore::solveContactMultiBlockParallel with
     // stepDt = dt / nbPositionIterations.  (P8.94d)
     { "stepArticulation1TTGS", kPtrU32, uint32_t(sizeof(kPtrU32)) },
+    // forwardDynamic2.cu:3077 updateBodiesLaunch_Part2(
+    //     const PxgArticulationCoreDesc*, PxReal dt, bool integrate)
+    // -> pointer@0 + float@8 + bool@12 = 16-byte blob, the kSapBoxInit shape
+    // (the row describes sizes, not meanings).  Grid
+    // (num1TBlocks, 1, ceil(maxLinks / 4)), block (32, 2, 4) -- the
+    // articulation chain's first Z dimension (PxgArticulationCore.cpp:953-965).
+    // (P8.95b)
+    { "updateBodiesLaunch_Part2", kSapBoxInit, uint32_t(sizeof(kSapBoxInit)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)
