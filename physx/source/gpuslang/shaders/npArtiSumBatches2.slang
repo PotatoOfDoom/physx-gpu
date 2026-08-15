@@ -62,9 +62,16 @@ static const uint ASB2_BLOCK_DIM = 512u;
 static const uint ASB2_WARPS = 16u;
 static const uint ASB2_GRID = 32u;
 
+// CLAMP THE INDEX, NOT JUST THE VALUE (the P8.96c finding, dmesg-verified):
+// llvmpipe compiles this guarded uniform load to an UNCONDITIONAL scalar load
+// + select, so the unclamped form reads up to numIter*32*512-1 -- tens of KB
+// past the counts array -- and segfaults whenever the pages behind the buffer
+// are unmapped (an allocation-layout lottery; THIS fixture drew ~35%).
 uint asb2CountAt(Ptr<uint> counts, uint workIndex, uint nb)
 {
-    return workIndex < nb ? counts[workIndex] : 0u;
+    const uint idx = workIndex < nb ? workIndex : 0u;
+    const uint v = counts[idx];
+    return workIndex < nb ? v : 0u;
 }
 
 // the per-link bookkeeping both scatter loops share (traps 1, 6, 7)

@@ -492,6 +492,11 @@ public uint abBlockScalar(uint64_t base, uint fieldOffset)
     return (Ptr<uint>(base + uint64_t(fieldOffset)))[0];
 }
 
+public void abStoreBlockScalar(uint64_t base, uint fieldOffset, uint value)
+{
+    (Ptr<uint>(base + uint64_t(fieldOffset)))[0] = value;
+}
+
 // PxgSpatialVectorBlock is stored as float4 mTopxyz_bx[32] + float2 mbyz[32]:
 // the top three components plus the bottom X in one float4, the bottom Y and Z
 // in a float2.  Returns (top.xyz, bottom.xyz) as two float3s.

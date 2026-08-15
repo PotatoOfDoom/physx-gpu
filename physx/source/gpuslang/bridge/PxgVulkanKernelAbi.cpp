@@ -1196,6 +1196,13 @@ static const PxgKernelAbiRow kRows[] = {
     // -> four pointers + a PxU32 by value = 40-byte blob.  Same fixed
     // 32-block x 512-thread launch as its pair.  (P8.96b)
     { "artiSumInternalContactAndJointBatches2Launch", kFourPtrU32, uint32_t(sizeof(kFourPtrU32)) },
+    // internalConstraints2.cu:3441 artiSumSelfContactAndJointBatches(
+    //     const PxgArticulationCoreDesc*, PxgSolverCoreDesc*, PxgPrePrepDesc*,
+    //     PxgConstraintPrepareDesc*, PxU32 nbArticulations)
+    // -> the SAME signature and 40-byte blob as its static twin, launched
+    // back to back with it on the solver stream (PxgArticulationCore.cpp:362).
+    // (P8.96c)
+    { "artiSumSelfContactAndJointBatches", kFourPtrU32, uint32_t(sizeof(kFourPtrU32)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

@@ -71,11 +71,19 @@ import pxgSlangPrepDesc;
 static const uint ASB_BLOCK_DIM = 512u;   // COMPUTE_STATIC_CONTACT_CONSTRAINT_COUNT
 static const uint ASB_WARPS = 16u;        // warpPerBlock
 
+// CLAMP THE INDEX, NOT JUST THE VALUE (the P8.96c finding, dmesg-verified):
+// llvmpipe compiles the guarded uniform load `wi < nb ? counts[wi] : 0` to an
+// UNCONDITIONAL scalar load + select (cmp/sbb mask, then an unmasked
+// vbroadcastss), so the load itself executes with wi up to numIter*32*512-1 --
+// tens of KB past the array -- and segfaults whenever the pages behind the
+// buffer happen to be unmapped (an allocation-layout lottery, ~35% in the
+// batches2 fixture).  With the index clamped the speculated load is always
+// in bounds and the select still returns 0 for the out-of-range lanes.
 uint asbCountAt(Ptr<uint> counts, uint workIndex, uint nbArticulations)
 {
-    if (workIndex >= nbArticulations)
-        return 0u;
-    return counts[workIndex];
+    const uint idx = workIndex < nbArticulations ? workIndex : 0u;
+    const uint v = counts[idx];
+    return workIndex < nbArticulations ? v : 0u;
 }
 
 struct AsbParams

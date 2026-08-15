@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **735/735** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **736/736** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,87 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.96c — `artiSumSelfContactAndJointBatches` — manifest **281**, and the segfault was OURS
+
+internalConstraints2.cu:3441-3749 — the SELF-batch scatter, third and last
+kernel of the articulation batch-prep chain, serial-recomputed like its twins.
+Manifest 280 → **281**, suite 735 → **736** green in both memory modes,
+refused-kernel list **221 → 220** with this kernel the one that leaves.  Sweep
+**13/13, no survivors** — run twice, before and after the mid-tranche fix
+below, because the shipped source changed.  **Zero new ABI**: the four
+TEMP_SELF_* constants are P8.96a's, the prep-descriptor self fields are the P5
+layer, the two per-BLOCK scalars (mTotalSelfConstraintCount /
+mSelfConstraintOffset at 7072/7076) are P8.68's, and the ABI row is the
+twin's kFourPtrU32 — the only new code outside the module is
+`abStoreBlockScalar` beside P8.68's read half.
+
+Differences from the static twin, each with a mutant behind it: NO
+PartitionNodeData bookkeeping (instead each warp's lane 0 writes the two
+per-BLOCK scalars, BEFORE the scatter loops advance the cursor, and for
+zero-count warps too); every derived offset gains a STATIC addend (the batch
+base takes numArtiStaticBatches, the uid bases take numTotalStaticArti*, the
+header batch index and both batch-index arrays take numArtiStatic*Batches) —
+five new input scalars, all nonzero and distinct; block 0's totals land in the
+three Self fields and the island's mSelfArtiBatchCount at @56, one field past
+the twin's @52.  The fixture was bit-exact on the first run over both sizes
+(700 / 17000), and the static input scalars are asserted UNCHANGED on
+readback — this kernel reads its predecessor's outputs and owns only the Self
+fields.
+
+### The P8.96b segfault was NOT the known intermittent — a fifth platform rule
+
+The verification window opened with the P8.96b entry's classification standing
+("one -j2 failure, standalone 5/5, two full reruns green — the #29 class").
+**That classification was WRONG, and the correction is the most important
+thing in this tranche.**  A V2-mode suite run failed on artiSumBatches2 again;
+20 standalone runs then failed **7 times in EACH memory mode** — the earlier
+5/5 was a ~12%-likely run of luck.  The core dump put the fault in llvmpipe's
+JIT thread, and dmesg's instruction bytes identified it exactly: `cmp wi,nb;
+sbb` (the guard) immediately followed by an **UNMASKED** `vbroadcastss
+[rsi+rcx*4]` — the guarded uniform load
+
+```
+return workIndex < nb ? counts[workIndex] : 0u;
+```
+
+compiled to an **unconditional scalar load + select**.  The load itself runs
+for every wi up to `numIter*32*512 - 1`, tens of KB past the counts array, and
+segfaults whenever the pages behind the buffer happen to be unmapped — an
+allocation-layout lottery, which is why the rate was ~35% in the batches2
+fixture and **0% in the structurally identical batches1 and self fixtures**
+(different buffer sizes, different heap layout), why results were bit-exact
+whenever it survived (the select discards the out-of-range value), and why a
+stub experiment that removed the suspected bookkeeping chains still crashed
+6/20.
+
+**The rule: CLAMP THE INDEX, NOT JUST THE VALUE.**
+
+```
+const uint idx = workIndex < nb ? workIndex : 0u;   // select on the INDEX
+const uint v = counts[idx];                          // speculated load in bounds
+return workIndex < nb ? v : 0u;
+```
+
+Applied to all three CountAt helpers (batches1 / batches2 / self); batches2
+went from ~35% to **0/40**, the twins 0/40 each, the self kernel 0/60 under
+parallel load.  Branch-guarded loads (`if (cond) { v = p[i]; }`) were NOT
+observed to speculate — the hazard is the ternary/select form on a UNIFORM
+address.  The same pattern exists elsewhere in the corpus (e.g.
+broadphaseAggSelfCollision.slang:279) — task #66 tracks the audit, and #29
+(the gpuslang.scan -j4 segfault) should be re-examined under this lens first.
+
+What remains genuinely intermittent: ONE parallel-suite run in this window had
+a single failure (this new test, 736-green on the immediate rerun), and dmesg
+shows two WRITE faults (error 7, differing IPs) in that run — a different
+signature from the read-speculation bug, at #29's historical rate.  That
+residue keeps #29 open; it is no longer allowed to absorb reproducible
+failures without a dmesg signature check.
+
+The scenes (build-sdk at manifest 281): 20 of 21 green, artiLink still at rest
+(final y = 2.5000), the companion box unchanged at finalY = 3.733 — next is
+the solve chain itself: `setupInternalConstraintLaunch1T` (:1200), then
+`artiSolveInternalConstraintsTGS1T` (:2841).
 
 ## P8.96b — `artiSumInternalContactAndJointBatches2Launch` — manifest **280**, the prep pair closes
 
