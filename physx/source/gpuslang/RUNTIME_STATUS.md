@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **734/734** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **735/735** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,60 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.96b — `artiSumInternalContactAndJointBatches2Launch` — manifest **280**, the prep pair closes
+
+internalConstraints2.cu:3390 (body :3031-3368) — the scatter half of the
+static-batch prep pair: batches1's per-block sums become batch headers,
+interleaved unique-id arrays, per-link static contact/joint bookkeeping and
+the four scalar outputs.  Manifest 279 → **280**, suite 734 → **735** green in
+both memory modes, refused-kernel list **222 → 221** with this kernel the one
+that leaves.  Sweep **12/12, no survivors** — one mutant (the joint cursor
+restart) was first written as a dead variable, a sweep bug per the standing
+rule, and was rewritten to actually restart the cursor; it dies.  ABI: one new
+row shape `kFourPtrU32` ({8,8,8,8,4}, a 40-byte blob); **zero new descriptor
+constants** — the entire surface is the P5 prep/solver-desc layer plus
+P8.68's block fields, audited before the port rather than discovered during
+it.
+
+The port is the serial-recompute strategy for the third time: one thread per
+block recomputes the 32-entry block histogram (an exclusive scan of batches1's
+temp sums, identical in every block), then per iteration the 16 warp sums and
+maxes and their exclusive scan, then per warp the interleaved uid scatter
+(`contactStaticUniqueIds[workIndex + nbArticulations * i]`, column-major) and
+the header writes.  The traps that got mutants: the one SHARED `blockOffset`
+cursor that runs contacts first and lets joints CONTINUE from where contacts
+ended; the `mStartPartitionIndex` subtraction differing between contacts
+(rigid + rigid-static contacts) and joints (rigid + rigid-static joints); the
+batch-index arrays offset by the DYNAMIC arti batch counts and storing
+`blockOffset - numRigidBatches`; the first-hit-only `mStatic*StartIndex`
+(count == 0 tested BEFORE the increment); and both PxNodeIndex ends of a pair
+being articulations (self-contact), so both bookkeeping branches run for one
+pair.
+
+The fixture was bit-exact on the first run over BOTH sizes (700 articulations
+at numIter 1, 17000 at numIter 2 — the P8.96a scale lesson applied from the
+start), across both uid arrays, the header array with poison canaries past the
+live batches, both batch-index arrays, the link blocks' bookkeeping fields,
+the three descriptor scalars and the island context.  Every derived-offset
+scalar is nonzero and distinct, so a dropped term in any of the six offset
+sums is visible.
+
+### An intermittent worth recording, and its classification
+
+One forced-fresh full-suite `ctest -j2` run had `gpuslang.artiSumBatches2
+***Exception: SegFault 0.13 sec`; the PXG_DEVICE_V2 run behind it passed.
+Standalone reruns: **5/5 green**.  Two further full `ctest -j2` runs: **735/735
+green both times** (293 s / 295 s).  One failure in four parallel-suite runs,
+never standalone — the exact signature of the known intermittent (task #29,
+`gpuslang.scan` under `-j4`, 2 in 9 runs, unattributed).  Classified with #29
+as a parallel-ctest-only intermittent rather than a defect of the new kernel;
+if it recurs it now has a tally to join.
+
+The scenes (build-sdk REBUILT first — the P8.94d lesson): 20 of 21 green,
+artiLink still settles at rest height (final y = 2.5000, |v| = 0.13), the
+companion box unchanged at finalY = 3.733 — its contacts wait on the solve
+chain (`solveInternalConstraints` next), not on prep.
 
 ## P8.96a — `artiSumInternalContactAndJointBatches1Launch` — manifest **279**, the prep chain opens
 
