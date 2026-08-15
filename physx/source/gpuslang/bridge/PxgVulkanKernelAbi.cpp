@@ -168,6 +168,7 @@ static const uint8_t kPropagateStaticPGS[] = { 8, 8, 4, 4, 4 };
 //   clearFrictionPatchCounts(PxU32* frictionPatchCount,
 //   PxU32* edgeIndicesToClear, PxU32 nbToClear) in constraintBlockPrePrep.cu.
 static const uint8_t kTwoPtrU32[] = { 8, 8, 4 };
+static const uint8_t kFourPtrU32[] = { 8, 8, 8, 8, 4 };
 
 // gpusimulationcontroller updateBodiesAndShapes.cu:
 //   updateShapesLaunch(const PxgNewShapeSim*, PxgShapeSim*, PxU32 nbNewShapes)
@@ -1189,6 +1190,12 @@ static const PxgKernelAbiRow kRows[] = {
     // Grid (32, 1, 1) FIXED, block (512, 1, 1)
     // (PxgArticulationCore.cpp:305/330).  (P8.96a)
     { "artiSumInternalContactAndJointBatches1Launch", kTwoPtrU32, uint32_t(sizeof(kTwoPtrU32)) },
+    // internalConstraints2.cu:3390 artiSumInternalContactAndJointBatches2Launch(
+    //     const PxgArticulationCoreDesc*, PxgSolverCoreDesc*, PxgPrePrepDesc*,
+    //     PxgConstraintPrepareDesc*, PxU32 nbArticulations)
+    // -> four pointers + a PxU32 by value = 40-byte blob.  Same fixed
+    // 32-block x 512-thread launch as its pair.  (P8.96b)
+    { "artiSumInternalContactAndJointBatches2Launch", kFourPtrU32, uint32_t(sizeof(kFourPtrU32)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)
