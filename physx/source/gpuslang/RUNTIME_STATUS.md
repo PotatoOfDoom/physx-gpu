@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **736/736** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **737/737** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,85 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.97a — `setupInternalConstraints`, the solve chain's front door
+
+internalConstraints2.cu:122-352 plus its two private helpers (:53, :64) — the
+per-dof drive/limit/friction setup that fills the internal-constraint block
+for `artiSolveInternalConstraintsTGS1T`.  A module tranche: manifest stays
+**281** (the wrapper `setupInternalConstraintLaunch1T` and the three
+tendon/mimic setups are P8.97b/c), suite 736 → **737** green in both memory
+modes, forced-fresh.  Sweep **16/18**, the two survivors equivalent by the
+code's own structure (below).  **Zero new ABI** — the whole surface is
+P8.68/P8.75/P8.87's block maps.  The launch-trace evidence that names this
+chain: the three batch-prep kernels now run 240× OK in the scene, the engine
+calls `setupInternalConstraints` unconditionally every TGS frame
+(PxgContext.cpp:2047), and a null-function launch simply never reaches the
+trace — the refused list, not the trace, is where an unmapped kernel shows.
+
+Two pieces of groundwork paid first: the implicit-drive scalar family
+(force/accel drive, driveImpulse, frictionImpulse) was LIFTED from the
+Phase-1 fixture module `npArtiDriveParams.slang` into
+`pxgSlangArticulationDynamic.slang` as public functions — one body, two
+users, the P8.90 arrangement, with the existing driveParams test pinning the
+lift; and the per-dof propagate calls compose P8.90's `adPropagateImpulseW` /
+`adPropagateAccelerationW` unchanged (mRw passes through with NO sign
+fiddling: the CUDA's parameter is named parentToChild, its callers pass a
+local named child2Parent, and both negate internally — the engine's naming is
+the misleading part, transcribed as-is with a comment).
+
+**The oracle is the strongest since P8.81**: PxQuat algebra,
+`PxSpatialMatrix::operator*`, `translateSpatialVector`, the block
+load/stores, and `Dy::computeImplicitDriveParams` + `setImplicitDriveDesc`
+are all PX_CUDA_CALLABLE — the mirror computes the whole drive path with the
+engine's own arithmetic.  Bit-exact except the ONE transcendental site: the
+spherical drive-error's angle-axis quat (sin/cos), compared under the P8.94a
+mixed bound — measured **max 4-5 ULP**, tolerance 512, masked per (dof block,
+lane) so everything else stays exact.
+
+### What the fixture caught before the sweep even ran
+
+Three real transcription faults died against the oracle on the first runs:
+`eDRIVE_LIMITS_ARE_FORCES` is `1<<1`, not `1<<2` (caught as a clean factor
+1/dt on `mConstraintMaxImpulse`); `PxArticulationDriveType::eNONE` is **2**,
+not 3; and the drive dispatch is a THREE-way switch whose default is a ZERO
+desc — a two-way `isAccel ? accel : force` select treats eNONE as a force
+drive and invents drives on driveless dofs (the engine even PX_ASSERTs on
+eNONE reaching it).
+
+### A fixture lesson with a number attached
+
+The first case distribution, `(a*5 + linkID*7) % 8`, never produced cases
+2/3/5/6/7: `numLinks = 1 + a%4` gates which (a, linkID) pairs exist, and a
+linear form modulo 8 collapses on that stride-4 orbit.  The guard-or mutant
+(`&&` → `||` on the drive guard) survived on exactly that hole, because the
+zero-drive case it needed never occurred.  Replaced with a hash and a
+nine-bin coverage histogram the test now CHECKS — the P8.95a "count
+behaviour, not classification" rule, this time as an assertion.
+
+The two remaining survivors are equivalent by construction, not excused:
+dropping normalize's `m>0` guard is masked by the `angle<1e-12` fallback
+overwriting the vector on the only path where the guard matters; dropping
+the fallback itself changes behaviour only for |driveAxis| ∈ (0, 1e-12),
+where sin(angle/2) bounds the driveError shift at ~1e-12 — eight orders under
+the tolerance and any reachable target.  Both spelled out in the module.
+
+The traps that got mutants and died: the LOCAL motion matrix in the drive
+axis (world is the natural wrong choice); the targetQ sign flip on a 4D dot;
+the −2·imaginary(conj(targetQ)·qB2qA) error; the rotate-only (no translate)
+joint offsets in the linear path; |bias| as |top|+|bottom| (the SUM of two
+magnitudes); cfm = max not min; mRow1 = −axis1 (a double negation); the
+TGS/PGS drive-dt select; the qstZ sign in the dof-aligned propagate; r1+r0
+vs r0; the eLIMITED-only limit error; the running dof cursor; and the
+`nbDofs > 1` spherical bound.  The driveError scratch persists across links
+(CUDA: uninitialized __shared__; port: a zero-initialized local — divergence
+possible only for a locked+driven angular dof with NO prior write, which the
+engine's API cannot produce; the fixture's locked+driven case sits AFTER a
+spherical write, so both implementations read the same persisted value).
+
+Scene: unchanged (artiLink at rest, companion box waiting), as a module
+tranche must be.  Next: P8.97b, the tendon/mimic setups (:824/:1015 + the
+mimic body), then the wrapper → manifest 282.
 
 ## P8.96c — `artiSumSelfContactAndJointBatches` — manifest **281**, and the segfault was OURS
 

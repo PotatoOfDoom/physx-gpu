@@ -36,64 +36,13 @@
 // velMultiplier, impulseMultiplier, targetPosBias).  All pure scalar arithmetic
 // (a few divides + branches on isTGSSolver / unitResponse>0 / friction abs).
 // NoContraction-stamped; +-0 eqFZ.
+//
+// P8.97a: the bodies were LIFTED into pxgSlangArticulationDynamic.slang
+// (adForceDrive / adAccelDrive / adDriveImpulse / adFrictionImpulse) so
+// setupInternalConstraints drives the same code this fixture pins.  This
+// entry point keeps its test shape and now composes the lifted functions.
 
-struct DriveDesc { float tvBias, biasCoef, velMul, impMul, posBias; }
-
-DriveDesc forceDrive(float stiffness, float damping, float dt, float simDt,
-                     float unitResponse, float geomError, float targetVelocity, bool isTGS)
-{
-    const float a = dt * (dt * stiffness + damping);
-    const float b = dt * (damping * targetVelocity);
-    const float x = unitResponse > 0.0f ? 1.0f / (1.0f + a * unitResponse) : 0.0f;
-    const float initialBias = geomError - (simDt - dt) * targetVelocity;
-    const float biasCoefficient = stiffness * x * dt;
-    DriveDesc d;
-    d.tvBias = (x * b) + biasCoefficient * initialBias;
-    d.velMul = -x * a;
-    d.biasCoef = biasCoefficient;
-    d.impMul = isTGS ? 1.0f : (1.0f - x);
-    d.posBias = isTGS ? (biasCoefficient * targetVelocity) : 0.0f;
-    return d;
-}
-
-DriveDesc accelDrive(float stiffness, float damping, float dt, float simDt,
-                     float recipUnitResponse, float geomError, float targetVelocity, bool isTGS)
-{
-    const float a = dt * (dt * stiffness + damping);
-    const float b = dt * (damping * targetVelocity);
-    const float x = 1.0f / (1.0f + a);
-    const float initialBias = geomError - (simDt - dt) * targetVelocity;
-    const float biasCoefficient = stiffness * x * recipUnitResponse * dt;
-    DriveDesc d;
-    d.tvBias = (x * b * recipUnitResponse) + biasCoefficient * initialBias;
-    d.velMul = -x * a * recipUnitResponse;
-    d.biasCoef = biasCoefficient;
-    d.impMul = isTGS ? 1.0f : (1.0f - x);
-    d.posBias = isTGS ? (biasCoefficient * targetVelocity) : 0.0f;
-    return d;
-}
-
-float driveImpulse(float accum, float jointVel, float jointDeltaPos, float elapsed, DriveDesc d)
-{
-    return accum * d.impMul
-         + jointVel * d.velMul
-         + d.tvBias
-         - jointDeltaPos * d.biasCoef
-         + elapsed * d.posBias;
-}
-
-float frictionImpulse(float fImp, float staticF, float dynamicF, float viscous, float jointVel)
-{
-    if (abs(fImp) > staticF)
-    {
-        const float lo = -dynamicF - viscous * abs(jointVel);
-        const float hi = dynamicF + viscous * abs(jointVel);
-        // PxClamp(v, lo, hi) = PxMin(hi, PxMax(lo, v)); PxMax(a,b)=(a>b)?a:b, PxMin(a,b)=(a<b)?a:b
-        const float mx = (lo > fImp) ? lo : fImp;
-        fImp = (hi < mx) ? hi : mx;
-    }
-    return fImp;
-}
+import pxgSlangArticulationDynamic;
 
 struct DpIn
 {
@@ -134,12 +83,12 @@ void driveParams(uint3 dtid : SV_DispatchThreadID)
     const bool isTGS = asuint(s.misc.y) == 1u;
     const bool isAccel = asuint(s.misc.z) == 1u;
 
-    const DriveDesc fd = forceDrive(stiffness, damping, dt, simDt, unitResp, geomError, targetVel, isTGS);
-    const DriveDesc ad = accelDrive(stiffness, damping, dt, simDt, recipUnitResp, geomError, targetVel, isTGS);
-    const DriveDesc sel = isAccel ? ad : fd;
+    const AdDriveDesc fd = adForceDrive(stiffness, damping, dt, simDt, unitResp, geomError, targetVel, isTGS);
+    const AdDriveDesc ad = adAccelDrive(stiffness, damping, dt, simDt, recipUnitResp, geomError, targetVel, isTGS);
+    const AdDriveDesc sel = isAccel ? ad : fd;
 
-    const float drimp = driveImpulse(s.di.x, s.di.y, s.di.z, s.di.w, sel);
-    const float frimp = frictionImpulse(s.fr.x, s.fr.y, s.fr.z, s.fr.w, s.misc.x);
+    const float drimp = adDriveImpulse(s.di.x, s.di.y, s.di.z, s.di.w, sel);
+    const float frimp = adFrictionImpulse(s.fr.x, s.fr.y, s.fr.z, s.fr.w, s.misc.x);
 
     DpOut o;
     o.forceDesc0 = float4(fd.tvBias, fd.biasCoef, fd.velMul, fd.impMul);

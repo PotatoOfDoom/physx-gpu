@@ -182,3 +182,72 @@ public AbSpatialVector adPropagateAccelerationWEx(float3 parentToChild, float3 i
 
     return pDeltaV;
 }
+
+// ===========================================================================
+// The implicit-drive scalar family (DyCpuGpuArticulation.h), LIFTED from
+// npArtiDriveParams.slang in P8.97a so setupInternalConstraints and the
+// Phase-1 fixture drive the same bodies.  computeImplicitDriveParamsForceDrive
+// (L74-90), computeImplicitDriveParamsAccelerationDrive (L93-109),
+// computeDriveImpulse (L184-195), computeFrictionImpulse (L165-173).  The
+// eFORCE/eACCELERATION dispatch of computeImplicitDriveParams (L127) is a
+// select at the caller.  ArticulationImplicitDriveDesc = (targetVelPlusInitial
+// Bias, biasCoefficient, velMultiplier, impulseMultiplier, targetPosBias).
+// ===========================================================================
+
+public struct AdDriveDesc { public float tvBias; public float biasCoef; public float velMul; public float impMul; public float posBias; }
+
+public AdDriveDesc adForceDrive(float stiffness, float damping, float dt, float simDt,
+                                float unitResponse, float geomError, float targetVelocity, bool isTGS)
+{
+    const float a = dt * (dt * stiffness + damping);
+    const float b = dt * (damping * targetVelocity);
+    const float x = unitResponse > 0.0f ? 1.0f / (1.0f + a * unitResponse) : 0.0f;
+    const float initialBias = geomError - (simDt - dt) * targetVelocity;
+    const float biasCoefficient = stiffness * x * dt;
+    AdDriveDesc d;
+    d.tvBias = (x * b) + biasCoefficient * initialBias;
+    d.velMul = -x * a;
+    d.biasCoef = biasCoefficient;
+    d.impMul = isTGS ? 1.0f : (1.0f - x);
+    d.posBias = isTGS ? (biasCoefficient * targetVelocity) : 0.0f;
+    return d;
+}
+
+public AdDriveDesc adAccelDrive(float stiffness, float damping, float dt, float simDt,
+                                float recipUnitResponse, float geomError, float targetVelocity, bool isTGS)
+{
+    const float a = dt * (dt * stiffness + damping);
+    const float b = dt * (damping * targetVelocity);
+    const float x = 1.0f / (1.0f + a);
+    const float initialBias = geomError - (simDt - dt) * targetVelocity;
+    const float biasCoefficient = stiffness * x * recipUnitResponse * dt;
+    AdDriveDesc d;
+    d.tvBias = (x * b * recipUnitResponse) + biasCoefficient * initialBias;
+    d.velMul = -x * a * recipUnitResponse;
+    d.biasCoef = biasCoefficient;
+    d.impMul = isTGS ? 1.0f : (1.0f - x);
+    d.posBias = isTGS ? (biasCoefficient * targetVelocity) : 0.0f;
+    return d;
+}
+
+public float adDriveImpulse(float accum, float jointVel, float jointDeltaPos, float elapsed, AdDriveDesc d)
+{
+    return accum * d.impMul
+         + jointVel * d.velMul
+         + d.tvBias
+         - jointDeltaPos * d.biasCoef
+         + elapsed * d.posBias;
+}
+
+public float adFrictionImpulse(float fImp, float staticF, float dynamicF, float viscous, float jointVel)
+{
+    if (abs(fImp) > staticF)
+    {
+        const float lo = -dynamicF - viscous * abs(jointVel);
+        const float hi = dynamicF + viscous * abs(jointVel);
+        // PxClamp(v, lo, hi) = PxMin(hi, PxMax(lo, v)); PxMax(a,b)=(a>b)?a:b, PxMin(a,b)=(a<b)?a:b
+        const float mx = (lo > fImp) ? lo : fImp;
+        fImp = (hi < mx) ? hi : mx;
+    }
+    return fImp;
+}
