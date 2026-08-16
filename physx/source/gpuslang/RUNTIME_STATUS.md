@@ -1694,6 +1694,39 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.97a+ — the clamp-rule corpus audit: 286 sites, 6 confirmed, 7 fixed
+
+Task #66 executed as a two-phase fan-out over the 74 shader files the
+candidate grep hit: classify every guarded-load ternary (and early-return
+helper), then adversarially verify each suspect — every verifier prompted to
+REFUTE, with the file, the fixtures and the engine allocation sites as
+evidence.  **286 sites classified: 57 groupshared, 84 local-array, 84
+bounded, 58+3 suspects → 6 CONFIRMED after verification** (55 refuted).  The
+refutations sharpen the rule: nearly every refuted suspect had a per-lane
+DIVERGENT address (llvmpipe emits masked gathers there — not the faulting
+shape) or sat in a descriptor-bound SSBO (`RWStructuredBuffer`, robust
+bounds-checked — one verifier confirmed via spirv-dis that no
+PhysicalStorageBufferAddresses capability is even present).  The hazard is
+specifically the **warp-UNIFORM select-guarded load through a BDA pointer**.
+
+All six confirmed sites are ONE family — the prefix-sum read
+`p > 0 ? accum[p-1] : 0` with a uniform push-constant guard and an
+exactly-partition-count-sized buffer, speculated at index 0xFFFFFFFF on the
+p == 0 dispatch that every solve issues: femClothSolveBda.slang:190/222,
+femClothSolvePairBda.slang:368/406, softBodySolveBda.slang:922, and
+solverPGS.slang:762 (`partitionIndex == 0` with `startPartitionIndex - 1`
+underflowing).  A verifier's note flagged the same shape in solverTGS.slang's
+solveBlockUnified — confirmed by reading, so **7 sites fixed** (the TGS one
+included), each with the three-line clamp whose in-bounds fallback element is
+proven by an adjacent unconditional read.  These are the same latent lottery
+the P8.96b segfault came from — the cloth/softbody solve path just never drew
+an unlucky layout in the fixtures.
+
+Suite **737/737 both memory modes** forced-fresh after the clamps, and the
+twelve cloth/softbody/solver scenes all green — the clamps are
+semantics-preserving by construction (the selected VALUE is unchanged; only
+the speculated address moves in bounds).
+
 ## P8.97a — `setupInternalConstraints`, the solve chain's front door
 
 internalConstraints2.cu:122-352 plus its two private helpers (:53, :64) — the

@@ -919,7 +919,13 @@ void sb_gm_cp_solveTetrahedronsPartitionLaunch(uint3 groupThreadId : SV_GroupThr
     if (nbTets > 0u && gSolve.partitionId < numPartitions)
     {
         Ptr<uint> accumulatedPartitions = Ptr<uint>(gSoftbodies[softbodyId].mSimAccumulatedPartitionsCP);
-        const uint startInd = gSolve.partitionId > 0u ? accumulatedPartitions[gSolve.partitionId - 1u] : 0u;
+        // CLAMP THE INDEX, NOT JUST THE VALUE (P8.96c): partitionId == 0 is
+        // dispatched on every solve, and the speculated 0u-1u index leaves the
+        // partition-count-sized buffer.  Element 0 is in bounds by the same
+        // guard that admits this dispatch.
+        const uint prevIdx = gSolve.partitionId > 0u ? gSolve.partitionId - 1u : 0u;
+        const uint prevAccum = accumulatedPartitions[prevIdx];
+        const uint startInd = gSolve.partitionId > 0u ? prevAccum : 0u;
         const uint endInd = accumulatedPartitions[gSolve.partitionId];
 
         const uint workIndex = startInd + groupThreadIdx;

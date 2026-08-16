@@ -759,9 +759,16 @@ void solveBlockPartition(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId :
     if (sharedDesc.iter_blockConstraintBatch != 0 && island.mNumPartitions != 0 &&
         partitionIndex < island.mNumPartitions)
     {
-        const uint startIndex = (partitionIndex == 0)
-            ? island.mBatchStartIndex
-            : constraintsPerPartition[partitionIndex + startPartitionIndex - 1u];
+        // CLAMP THE INDEX, NOT JUST THE VALUE (P8.96c): the load sits on the
+        // partitionIndex != 0 arm but is speculated on the == 0 dispatch too,
+        // where startPartitionIndex - 1u can underflow to 0xFFFFFFFF.  The
+        // clamp target [partitionIndex + startPartitionIndex] is in bounds
+        // because the endIndex line reads it unconditionally.
+        const uint prevIdx = (partitionIndex == 0)
+            ? partitionIndex + startPartitionIndex
+            : partitionIndex + startPartitionIndex - 1u;
+        const uint prevCpp = constraintsPerPartition[prevIdx];
+        const uint startIndex = (partitionIndex == 0) ? island.mBatchStartIndex : prevCpp;
         const uint endIndex = constraintsPerPartition[partitionIndex + startPartitionIndex];
 
         for (uint k = startIndex + warpIndex; k < endIndex; k += numWarpsInGrid)

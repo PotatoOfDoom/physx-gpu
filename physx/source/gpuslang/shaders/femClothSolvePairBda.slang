@@ -365,7 +365,14 @@ void cloth_solveTrianglePairEnergyLaunch(uint3 groupThreadId : SV_GroupThreadID,
     {
         Ptr<uint> accum = Ptr<uint>(isSharedPartition ? femCloths[id].mSharedTriPairAccumulatedPartitionsCP
                                                        : femCloths[id].mNonSharedTriPairAccumulatedPartitionsCP);
-        const uint startInd = partitionId > 0u ? accum[partitionId - 1u] : 0u;
+        // CLAMP THE INDEX, NOT JUST THE VALUE (P8.96c): the guarded uniform
+        // BDA load compiles to an unconditional load + select, and on the
+        // partitionId == 0 dispatch the speculated index 0u-1u leaves the
+        // exactly-partition-count-sized buffer.  accum[0] is in bounds here
+        // because this body only runs with partitionId < the partition count.
+        const uint prevIdx = partitionId > 0u ? partitionId - 1u : 0u;
+        const uint prevAccum = accum[prevIdx];
+        const uint startInd = partitionId > 0u ? prevAccum : 0u;
         const uint endInd = accum[partitionId];
 
         const uint groupThreadIdx = groupThreadId.x + groupId.x * CLOTH_SOLVESHELL;
@@ -403,7 +410,14 @@ void cloth_solveTrianglePairEnergyClusterLaunch(uint3 groupThreadId : SV_GroupTh
 
     for (uint partitionId = firstClusterId; partitionId < maxPartitions; ++partitionId)
     {
-        const uint startInd = partitionId > 0u ? accum[partitionId - 1u] : 0u;
+        // CLAMP THE INDEX, NOT JUST THE VALUE (P8.96c): the guarded uniform
+        // BDA load compiles to an unconditional load + select, and on the
+        // partitionId == 0 dispatch the speculated index 0u-1u leaves the
+        // exactly-partition-count-sized buffer.  accum[0] is in bounds here
+        // because this body only runs with partitionId < the partition count.
+        const uint prevIdx = partitionId > 0u ? partitionId - 1u : 0u;
+        const uint prevAccum = accum[prevIdx];
+        const uint startInd = partitionId > 0u ? prevAccum : 0u;
         const uint endInd = accum[partitionId];
 
         const uint groupThreadIdx = groupThreadId.x + groupId.x * CLOTH_SOLVESHELL;
