@@ -105,6 +105,8 @@ static_assert(offsetof(PxgArticulationCoreDesc, mArticulationAttachmentBlocks) =
 static_assert(offsetof(PxgArticulationCoreDesc, mArticulationFixedTendonBlocks) == 216, "..FIXED_TENDON_BLOCKS");
 static_assert(offsetof(PxgArticulationCoreDesc, mArticulationTendonJointBlocks) == 232, "..TENDON_JOINT_BLOCKS");
 static_assert(offsetof(PxgArticulationCoreDesc, mArticulationMimicJointBlocks) == 240, "..MIMIC_JOINT_BLOCKS");
+static_assert(offsetof(PxgArticulationCoreDesc, mArticulationSpatialTendonConstraintBlocks) == 200, "..SPATIAL_TENDON_CONSTRAINT_BLOCKS");
+static_assert(offsetof(PxgArticulationCoreDesc, mArticulationFixedTendonConstraintBlocks) == 224, "..FIXED_TENDON_CONSTRAINT_BLOCKS");
 static_assert(offsetof(PxgArticulationCoreDesc, mMaxLinksPerArticulation) == 248, "..MAX_LINKS");
 static_assert(offsetof(PxgArticulationCoreDesc, mMaxDofsPerArticulation) == 252, "..MAX_DOFS");
 static_assert(offsetof(PxgArticulationCoreDesc, mMaxMimicJointsPerArticulation) == 256, "..MAX_MIMIC_JOINTS");

@@ -388,6 +388,34 @@ public static const uint PXG_AB_IMJ_mDofA                                       
 public static const uint PXG_AB_IMJ_mDofB                                             =    128;
 public static const uint PXG_AB_IMJ_recipEffectiveInertia                             =    256;
 
+// PxgArticulationInternalTendonConstraintData (PxgArticulation.h:545) -- the
+// OUTPUT block the tendon setups fill and the tendon solver reads.  Generated
+// P8.97b (gen97b), pinned in testArtiBlockLayout.cpp.
+public static const uint PXG_AB_ITC_SIZE                                              =   4224;
+public static const uint PXG_AB_ITC_mRow0                                             =      0;
+public static const uint PXG_AB_ITC_mRow1                                             =    768;
+public static const uint PXG_AB_ITC_mDeltaVB                                          =   1536;
+public static const uint PXG_AB_ITC_mRecipResponse                                    =   2304;
+public static const uint PXG_AB_ITC_mAccumulatedLength                                =   2432;
+public static const uint PXG_AB_ITC_mBiasCoefficient                                  =   2560;
+public static const uint PXG_AB_ITC_mVelMultiplier                                    =   2688;
+public static const uint PXG_AB_ITC_mImpulseMultiplier                                =   2816;
+public static const uint PXG_AB_ITC_mAppliedForce                                     =   2944;
+public static const uint PXG_AB_ITC_mLimitBiasCoefficient                             =   3072;
+public static const uint PXG_AB_ITC_mLimitImpulseMultiplier                           =   3200;
+public static const uint PXG_AB_ITC_mLimitAppliedForce                                =   3328;
+public static const uint PXG_AB_ITC_mLink0                                            =   3456;
+public static const uint PXG_AB_ITC_mLink1                                            =   3584;
+public static const uint PXG_AB_ITC_mDeltaVA                                          =   3712;
+public static const uint PXG_AB_ITC_mRestDistance                                     =   3840;
+public static const uint PXG_AB_ITC_mLowLimit                                         =   3968;
+public static const uint PXG_AB_ITC_mHighLimit                                        =   4096;
+
+// DyVArticulation.h:63 / DyCpuGpuArticulation.h:39 -- the tendon traversal
+// bound and the response floor the tendon setups use.
+public static const uint PXG_DY_ARTICULATION_TENDON_MAX_SIZE                          =     64;
+public static const float PXG_DY_ARTICULATION_MIN_RESPONSE                            = 1e-12f;
+
 // The element STRIDES of these records already live in pxgSlangArticulationDesc
 // (PXG_ARTI_TENDON_SIZE, PXG_ARTI_TENDON_FIXED_ELEM_SIZE,
 // PXG_ARTI_SPATIAL_TENDON_DATA_SIZE, PXG_ARTI_FIXED_TENDON_DATA_SIZE,
