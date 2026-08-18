@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **740/740** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **741/741** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,48 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.98a — `pxcFsGetVelocity` + `pxcFsApplyImpulses`, and a SIXTH summation-order lesson
+
+The two deferred-impulse workhorses every internal-constraint solve body
+composes (internalConstraints2.cu:2116 / :2190), as a module tranche
+(`npArtiSolveTendons.slang`, in NOCONTRACT): manifest stays **282**, suite
+740 → **741** green in both memory modes, forced-fresh.  Sweep **12/12**,
+no survivors.  ZERO new ABI.  Also new in
+pxgSlangArticulationDynamic: `adPropagateImpulseWJf`, the
+propagateImpulseW<WriteQstZ> TEMPLATE instance (articulationDynamic.cuh:129)
+with the optional per-dof joint impulse — deliberately NOT a forwarder
+around adPropagateImpulseW, because the template spells `stZ = jf - dot`
+where the preloaded variant spells `-dot`, and `0.0f - (+0)` is `+0` where
+`-(+0)` is `-0`.  Both spellings exist in the engine; both exist here.
+
+**The order lesson (one first-run red, 306 words at 1-2 ULP, then exact):**
+`propagateAccelerationW_child2ParentPreLoaded` (:257) accumulates the
+per-dof contributions into a SEPARATE `jointSpatialDeltaV` and returns
+`pDeltaV + jointSpatialDeltaV` at the end, where
+`propagateAccelerationW_everythingPreLoaded` (:206, the P8.90 module body)
+accumulates directly onto `pDeltaV` per dof — for a two-dof joint that is
+`pd + (a + b)` versus `(pd + a) + b`.  The divergence surfaced on exactly
+the free-base fixture cases and vanished when the module spelled the
+child2Parent order.  Joins P8.97c's shared-impulse-sum in the family: the
+engine's propagate variants are NOT interchangeable spellings of one
+function, and each port names which variant it is.
+
+svGetVelocity carries the walk facts (word-0-up, LOWEST-bit-first, root
+skipped AFTER the word-offset add; the speed report only from the link's
+own hop; the root deltaV `M * -rootDeferredZ` under the free-base guard
+only); svApplyImpulses the three-walk shape (common ancestor via TOP-word-
+down HIGHEST-bit; Z built negated with linear in the top half;
+mSolverSpatialImpulse accumulating the PRE-propagation Z per hop; the
+joint impulse moved to the common walk when its link IS the common link,
+accumulated from both ends; the common walk skipped for commonLink == 0,
+dropping a root-side joint impulse).  Fixture: branch topology (parents
+0,1,1,2,3) so a disjoint pair with both walks non-empty exists in EVERY
+lane; mDeferredQstZ seeded non-zero (it accumulates); getVelocity checked
+as a PURE READ (every input buffer byte-compared back).  Next: P8.98b, the
+three solve bodies (spatial :2317, fixed :2435, mimic :2693 — the mimic
+oracle is host-callable computeMimicJointImpulses), then the wrapper →
+manifest 283.
 
 ## P8.97d — `setupInternalConstraintLaunch1T` assembled — manifest **282**
 

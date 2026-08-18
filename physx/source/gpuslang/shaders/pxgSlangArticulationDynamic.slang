@@ -120,6 +120,42 @@ public AbSpatialVector adPropagateImpulseW(AbSpatialVector isInvD[3], float3 chi
     return adTranslateSpatialVector(childToParent, temp);
 }
 
+// propagateImpulseW<WriteQstZ> (articulationDynamic.cuh:129) — the TEMPLATE
+// variant, which differs from propagateImpulseW_everythingPreLoaded above in
+// two ways that both matter to the bit pattern:
+//
+//  1. it applies an optional JOINT impulse/force to each dof of the inbound
+//     joint: `jf = jointForce ? jointForce[ind] * jointForceMultiplier : 0.0f`
+//     and `stZ = jf - sas.innerProduct(Z)`.  The NULL path computes
+//     `0.0f - dot`, which differs from the preloaded variant's `-dot` at
+//     exactly dot == +0 (`0 - (+0) = +0` where `-(+0) = -0`) — so this is NOT
+//     a forwarder around adPropagateImpulseW; the two spellings coexist in the
+//     engine and they coexist here.  `hasJf` reproduces the NULL-pointer test.
+//  2. the qstZ accumulation target is the caller's choice (the template
+//     parameter): callers seed `qstZ` from mDeferredQstZ / mTmpQstZ / a local
+//     and write it back, exactly as P8.94b/c already do for the accel side.
+public AbSpatialVector adPropagateImpulseWJf(AbSpatialVector isInvD[3], float3 childToParent,
+                                             AbSpatialVector motionMatrix[3], AbSpatialVector Z,
+                                             uint dofCount, inout float qstZ[3],
+                                             float jf[3], float jfMult, bool hasJf)
+{
+    AbSpatialVector temp = Z;
+
+    for (uint ind = 0u; ind < 3u; ++ind)
+    {
+        if (ind < dofCount)
+        {
+            const float jfv = hasJf ? jf[ind] * jfMult : 0.0f;
+            // against Z, NOT against temp
+            const float stZ = jfv - asmInnerProduct(motionMatrix[ind], Z);
+            qstZ[ind] = qstZ[ind] + stZ;
+            temp = asmSVecAdd(temp, asmSVecScale(isInvD[ind], stZ));
+        }
+    }
+
+    return adTranslateSpatialVector(childToParent, temp);
+}
+
 // propagateAccelerationW_everythingPreLoaded (articulationDynamic.cuh:206).
 //
 // `invStISW[ind]` is a ROW of the inverse joint-space inertia -- the same three
