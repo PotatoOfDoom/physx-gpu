@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **755/755** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **756/756** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,66 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.103 — artiTGSJointConstraintBlockPrepareParallelLaunch (Manifest 289)
+
+Der Arti-Joint-Prep (artiConstraintPrep2.cu:1964 ->
+artiJointConstraintBlockPrepare :1861 -> setupArtiSolverConstraintBlockGPU
+TGS :1771 -> preprocessRowsBlock :1396 + setUpArti1DConstraintBlock TGS
+:1594 + intializeTGSBlock1D :1545; :1396-1968 dieses Fenster VOLLSTAENDIG
+gelesen).  Die Row-MATHEMATIK war als Phase-1-Batterie npArti1DPrep/a1dTGS
+laengst portiert und geswept — das neue Modul `npArtiJointPrep.slang` ist
+der Lift auf die Engine-Layouts ueber die P8.102a-Body-Schicht (AcpBody /
+acp*, per np-Modul-Import) plus Header-Fill und Desc-Wrapper.  Ein Hoist
+vorweg: queryReduced1dConstraintSolverConstantsTGS zog aus npArti1DPrep
+(dritter Nutzer) nach pxgSlangPrepCommon; die uebrige Skalar-Familie
+(computeJointSpeedTGS/computeMaxBiasVelocityTGS/
+computeMinMaxImpulseOrForceAsImpulse/raiseInternalFlagsTGS) war dort
+schon public.  NULL neue ABI-Konstanten; ABI kTwoPtr {8,8}; Launch
+ceil(nb/2) x (32,2,1) wie der Kontakt-Prep.
+
+Traps 1-14 im Modulkopf, u.a.: der Batch-Guard summiert 1d+static+SELF;
+die Row-Pools indizieren VERSCHIEDEN (Data per descIndexBatch, Vel/Par
+per descIndexBatch * MAX_CONSTRAINT_ROWS(20)); writeBackOffset ueber die
+Zwei-Hop-Indirektion solverConstantData[artiConstraintUniqueIndices[
+mStartPartitionIndex + lane]]; params.dt = sharedDesc->stepDt -> BEIDE
+Break-Impulse skalieren mit dem STEP-dt; die Header-Vorzeichen-Asymmetrie
+(-ims.x/+ims.z, -ims.y/+ims.w); rowCounts ist der SETUP-RETURN (uchar4
+mit breakable in Byte 1); erp = 0.5*biasCoefficient; degenerierte Rows
+(unitResponse <= 1e-12) schreiben in TGS NICHTS; computeJointSpeedTGS
+ungated und isKinematic-keyed; computeMaxBiasVelocityTGS mit
+isExtendedConstraint=TRUE; angularErrorScale OHNE Nullung der
+Jacobian-Lanes; Insertion-Sort nach solveHint STABIL.
+
+**Fixture** (`testArtiJointPrepWrap.cpp`): echte Desc-Images, VOLLER
+Host-Mirror — refCreateExtBody + DIE ENGINE-EIGENEN Dy::-Funktionen
+(DyCpuGpu1dConstraint.h ist PX_CUDA_CALLABLE: computeJointSpeedTGS,
+computeMaxBiasVelocityTGS, queryReduced1dConstraintSolverConstantsTGS,
+computeMinMaxImpulseOrForceAsImpulse, raiseInternalFlagsTGS werden
+AUFGERUFEN, nicht transkribiert).  Gleiche Batch-Geometrie wie P8.102c
+(4 lebende Batches hinter Offset 3, Stride 26/13/32/7, 6 Warps, 2 pinnen
+den Guard); Row-Counts 0..6 inkl. Null-Row-Lanes, solveHint-TIES,
+konstruierte DEGENERIERTE Rows (winzige Jacobians), Break-Kraefte
+endlich/PX_MAX_F32 beide Wege, disjunkte Con-/Response-Fenster (die
+P8.102c-Lektion) — alles coverage-asserted.  **Erster Lauf bit-exakt,
+0 tolerierte +-0.**
+
+Sweep: **20/20 KILLED, keine Ueberlebenden, erster Lauf**: guard-no-self,
+offset-dropped (rc=139), arti-uses-plain-index, writeback-one-hop,
+writeback-not-partition, break-simdt, header-sign-dropped,
+inertiascale1-negated, rowcounts-numrows, rowcount-pack-swapped,
+breakable-and, erp-full-bias, degen-threshold-zero,
+jointspeed-rigid-keyed, maxbias-not-extended, angular-scale-inverted,
+minmax-stepdt, sort-dropped, sort-unstable, con-cursor-row-indexed.
+
+Suite: **756/756 ctest (677/677 Binary) in BEIDEN Memory-Modi.**
+Manifest 288 -> **289**; build-sdk neu gebaut; Szene: Refused-Liste
+213 -> **212**.  Der Kernel startet in DIESER Szene 0x — die
+Artikulation hat keine externen Joints (nur interne, die
+setupInternalConstraints abdeckt), also nbArtiJointBatches = 0; die
+Ausfuehrung deckt die Launch-Fixture ab.  Companion-Box unveraendert:
+als naechstes artiSolveBlockPartition + artiOutputVelocity (die
+Solve/Output-Kette der dynamischen Arti-Kontakt-Batches).
 
 ## P8.102c — artiTGSContactConstraintBlockPrepareLaunch ASSEMBLED (Manifest 288)
 

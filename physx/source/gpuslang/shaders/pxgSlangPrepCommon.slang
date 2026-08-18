@@ -332,6 +332,53 @@ public float computeMaxBiasVelocityTGS(uint constraintFlags, float jointSpeedFor
     return maxBiasSpeed;
 }
 
+// mirrors Dy::queryReduced1dConstraintSolverConstantsTGS (DyCpuGpu1dConstraint.h L489-539)
+public void queryReduced1dConstraintSolverConstantsTGS(uint constraintFlags, float springStiffness, float springDamping,
+                        float restitution, float bounceThreshold, float geometricError,
+                        float velocityTarget, float jointSpeedForRestitutionBounce,
+                        float initJointSpeed, float erp, float stepDt, float recipStepDt,
+                        out float coeff0, out float coeff1, out float coeff2, out float coeff3)
+{
+    // coeff0: initJointSpeed, coeff1: biasScale
+    coeff0 = initJointSpeed;
+
+    if ((constraintFlags & PX1D_FLAG_SPRING) != 0u)
+    {
+        // coeff2: a, coeff3: b
+        const float a = stepDt * (stepDt * springStiffness + springDamping);
+        const float b = stepDt * (springDamping * velocityTarget);
+        coeff2 = a;
+        coeff3 = b;
+
+        if ((constraintFlags & PX1D_FLAG_ACCELERATION_SPRING) != 0u)
+        {
+            const float x = 1.0f / (1.0f + a);
+            coeff1 = -x * springStiffness * stepDt;  // biasScale * unitResponse recovered later
+        }
+        else
+        {
+            coeff1 = -springStiffness * stepDt;  // to recover biasScale, multiply by x
+        }
+    }
+    else
+    {
+        // coeff2: bounceVel, coeff3: velocityTarget
+        const float bounceVel = computeBounceVelocity(constraintFlags, jointSpeedForRestitutionBounce,
+                                                      bounceThreshold, restitution, geometricError);
+        coeff2 = bounceVel;
+        coeff3 = velocityTarget;
+
+        if (bounceVel != 0.0f)
+        {
+            coeff1 = 0.0f;
+        }
+        else
+        {
+            coeff1 = -recipStepDt * erp;
+        }
+    }
+}
+
 // mirrors Dy::computeJointSpeedTGS()
 public void computeJointSpeedTGS(float normalVel0, bool isKinematic0, float normalVel1, bool isKinematic1,
                                  out float jointSpeedForRestitutionBounce, out float initJointSpeed)

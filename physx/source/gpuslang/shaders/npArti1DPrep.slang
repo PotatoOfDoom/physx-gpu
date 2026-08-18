@@ -378,52 +378,8 @@ void a1dPGS(uint3 dtid : SV_DispatchThreadID)
 //   - intializeTGSBlock1D's resp0/resp1/minRowResponse params are dead in
 //     its body (kept dead here).
 
-// mirrors Dy::queryReduced1dConstraintSolverConstantsTGS (DyCpuGpu1dConstraint.h L489-539)
-void queryReduced1dTGSQ(uint constraintFlags, float springStiffness, float springDamping,
-                        float restitution, float bounceThreshold, float geometricError,
-                        float velocityTarget, float jointSpeedForRestitutionBounce,
-                        float initJointSpeed, float erp, float stepDt, float recipStepDt,
-                        out float coeff0, out float coeff1, out float coeff2, out float coeff3)
-{
-    // coeff0: initJointSpeed, coeff1: biasScale
-    coeff0 = initJointSpeed;
-
-    if ((constraintFlags & PX1D_FLAG_SPRING) != 0u)
-    {
-        // coeff2: a, coeff3: b
-        const float a = stepDt * (stepDt * springStiffness + springDamping);
-        const float b = stepDt * (springDamping * velocityTarget);
-        coeff2 = a;
-        coeff3 = b;
-
-        if ((constraintFlags & PX1D_FLAG_ACCELERATION_SPRING) != 0u)
-        {
-            const float x = 1.0f / (1.0f + a);
-            coeff1 = -x * springStiffness * stepDt;  // biasScale * unitResponse recovered later
-        }
-        else
-        {
-            coeff1 = -springStiffness * stepDt;  // to recover biasScale, multiply by x
-        }
-    }
-    else
-    {
-        // coeff2: bounceVel, coeff3: velocityTarget
-        const float bounceVel = computeBounceVelocity(constraintFlags, jointSpeedForRestitutionBounce,
-                                                      bounceThreshold, restitution, geometricError);
-        coeff2 = bounceVel;
-        coeff3 = velocityTarget;
-
-        if (bounceVel != 0.0f)
-        {
-            coeff1 = 0.0f;
-        }
-        else
-        {
-            coeff1 = -recipStepDt * erp;
-        }
-    }
-}
+// (queryReduced1dConstraintSolverConstantsTGS: HOISTED to pxgSlangPrepCommon
+//  in P8.103 -- the engine-layout arti joint prep is the second user)
 
 struct T1In
 {
@@ -568,7 +524,7 @@ void a1dTGS(uint3 dtid : SV_DispatchThreadID)
             geometricError, true /* isExtendedConstraint */, lengthScale, recipSimDt);
 
         float coeff0, coeff1, coeff2, coeff3;
-        queryReduced1dTGSQ(rpFlags, stiffness, damping, restitution, bounceVelocityThreshold,
+        queryReduced1dConstraintSolverConstantsTGS(rpFlags, stiffness, damping, restitution, bounceVelocityThreshold,
                            geometricError, velocityTarget, jointSpeedForRestitutionBounce,
                            initJointSpeed, erp, stepDt, recipStepDt, coeff0, coeff1, coeff2,
                            coeff3);

@@ -1295,6 +1295,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "constraint1DPrePrepLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "contactConstraintBlockPrepareParallelLaunchTGS", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "artiTGSContactConstraintBlockPrepareLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "artiTGSJointConstraintBlockPrepareParallelLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "contactConstraintBlockPrepareParallelLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "jointConstraintBlockPrepareParallelLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     // jointConstraintBlockPrepareParallelLaunchTGS (P5 Step 5 tranche 13 BDA):
