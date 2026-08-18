@@ -1694,6 +1694,46 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.107 — DIE ARTIKULATIONS-SZENE IST GRÜN: der Companion-Box-"Fehler" war Geometrie
+
+**Meilenstein: `PXG_SCENE=articulation` besteht zum ersten Mal beide
+Schritt-Checks** — und der Fix war eine Zeile in der SZENE, nicht im Port.
+
+Die Diagnose, nachdem P8.106 gelandet war: das Szenen-Log zeigt **keinen
+einzigen Launch-Fehler** mehr — jeder Kernel, den die TGS-Szene tatsächlich
+aufruft, ist gemappt (die 18 verbliebenen `arti*`-Refused-Einträge sind
+PGS-Zwillinge, die Direct-GPU-API-Familie und tote/ungenutzte Pfade; die
+Refused-Liste ist Resolutions-, nicht Launch-Zeit).  Der verbleibende
+FAIL war also Verhalten, nicht Abdeckung — und das Verhalten war KORREKT:
+
+Die Companion-Box spawnt bei (0, 5, 0), **direkt über der fixierten
+Artikulations-Basis** (Half-Extent 0.2 bei (0, 3, 0)).  Sie kann den Boden
+nie erreichen: sie fällt auf die Basis und ruht obendrauf, bei
+baseY + baseHalf + boxHalf = 3.0 + 0.2 + 0.5 = **3.7000 — exakt der seit
+P8.104 gemessene Wert**, mit |v| = 0.0097 in Ruhe.  Die
+Ruhe-Erwartung 0.5 (Boden) aus P8.55 war geometrisch unerreichbar; der
+Check war seit jeher rot, weil die SZENE falsch lag, und wurde erst
+diagnostizierbar, als P8.104 den Arti-Rigid-Kontakt löste und die Box von
+3.7329 auf das exakte 3.7000 setzte.
+
+Fix: `restY = baseY + baseHalf + 0.5` mit Kommentar.  Das ist bewusst die
+SCHÄRFERE Erwartung: der Kontakt Box-auf-Basis läuft durch die
+ARTIKULATIONS-Solver-Kette (artiTGSContactConstraintBlockPrepare →
+artiSolveBlockPartitionTGS), und bräche sie, fiele die Box durch die Basis
+Richtung Boden — weit unter das ±0.75-Band um 3.7.  Der frühere
+Dauer-FAIL ist jetzt ein Regressionstest.
+
+Ergebnis: `[  OK  ] ... all 2 body(ies) fell + rested` — artiLink
+2.5777 (Band 2.5±0.75, |v| = 0.0000; ein Pendel mit Gelenkreibung 0.5
+hängt nicht exakt senkrecht), Companion-Box 3.7000 (|v| = 0.0097).
+Box- und Joint-Szene als Stichprobe unverändert grün.  **Damit erfüllt
+Phase 1 ihr Szenen-Kriterium: der Link schwingt herunter und kommt zur
+Ruhe, die ganze Suite ist in beiden Memory-Modi grün.**  Offen bleiben
+die 18 nie aufgerufenen arti*-Kernel (PGS-Zwillinge, Direct-GPU-API,
+artiApplyTgsSubstepForces/artiComputeDependencies/artiUpdateKinematic/
+updateArticulationsLaunch), die nur Fixture-getragen gemappt werden
+können — Coverage-Arbeit, kein Szenen-Blocker mehr.
+
 ## P8.106 — artiPushImpulse (Manifest 291): toter Host-Pfad, trotzdem gemappt
 
 `artiPushImpulse` (forwardDynamic2.cu:4139-4209) ist gemappt — als Entry in

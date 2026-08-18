@@ -411,10 +411,21 @@ void buildArticulationScene(PxPhysics* physics, PxScene* scene, PxMaterial* mate
     // and the second non-zero, so the array is empty and the shader reads off the
     // end.  Adding one rigid body is the experiment that separates that from every
     // other explanation -- see the P8.60 entry in RUNTIME_STATUS.md.
+    //
+    // P8.107: it spawns at (0, 5, 0) -- DIRECTLY ABOVE the fixed base at
+    // (0, 3, 0) -- so it falls onto the base and rests on top of it, never on
+    // the ground.  The rest height is therefore baseY + baseHalf + its own
+    // half-extent = 3.7, NOT 0.5; the original 0.5 expectation was
+    // geometrically unreachable and kept this check red long after the
+    // physics was right (the box measured 3.7000 exactly once P8.104 landed
+    // the arti-rigid contact solve).  The corrected expectation is the
+    // sharper check: the contact is solved through the ARTICULATION solver
+    // chain, and if that chain breaks, the box falls through the base toward
+    // the ground -- far below the +-0.75 band around 3.7.
     addGroundBox(physics, scene, material);
     PxRigidDynamic* b = addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f),
                                    boxInertia(PxVec3(0.5f), 1000.0f), 5.0f);
-    targets.push_back({ b, 5.0f, 0.5f, "artiCompanionBox" });
+    targets.push_back({ b, 5.0f, baseY + baseHalf + 0.5f, "artiCompanionBox" });
 
     // Hanging straight down puts the link centre one half-length below the hinge.
     targets.push_back({ link, baseY, baseY - linkHalf, "artiLink" });
