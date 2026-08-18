@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **759/759** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **760/760** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,63 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.108 — artiApplyTgsSubstepForces (Manifest 292) + ALLE 21 SZENEN BESTÄTIGT
+
+Zuerst der volle Beleg für P8.107: **alle 21 Szenen einzeln gefahren, alle
+grün** (box stack plane sphere capsule capsulebox convex joint meshfloor
+articulation particle cloth clothhang clothdrape clothselfcollide clothcloth
+softbody softbodyselfcollide softbodycloth softbodystack softbodyattach).
+Parallel dazu ein Scout-Durchgang über die 18 verbliebenen arti*-Refused-
+Kernel (Größe, Launch-Form, ABI, Aufrufer, Wiederverwendung) — Wahl fiel auf
+den kleinsten Kernel mit echtem TGS-Pfad.
+
+`artiApplyTgsSubstepForces` (forwardDynamic2.cu:3482-3557) ist gemappt — als
+Entry in `npArtiAvgImpulse.slang`.  Aufrufer: einmal pro TGS-Positions-
+Iteration aus PxgTGSCudaSolverCore::solveContactMultiBlockParallel (:1377),
+gegattert auf `eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS` — unsere Szene
+setzt das Flag nicht, also 0 Dispatches dort (erwartet; die Refused-Liste
+ist Resolutions-Zeit).  Der Kernel verwandelt die pro-Substep isolierten
+externen Kräfte (die zAForces des RECORDS, von computeSpatialInertiaW unter
+genau diesem Flag gefüllt, P8.84) plus die User-Joint-Kräfte in deferred
+Impulse: Leaf-nach-Root, `articulatedYW = zExt[link]*stepDt +
+mScratchImpulse` (Scratch kann nicht-null sein: addieren, danach nullen),
+`propagateImpulseW<WriteToDeferredQstZ>` MIT Joint-Kraft (`jf =
+jointForce[ind] * stepDt` PRO DOF innerhalb des Propagates —
+adPropagateImpulseWJf mit hasJf=true, Multiplier stepDt; der Slice
+`&jointForces[jointOffset]` ist mit dem BLOCK-jointOffset in das
+RECORD-Array indiziert), Parent-Add mit `(parent > 0 || !fixedBase)`
+gegattert (ein Kind der FIXEN Wurzel verwirft seinen propagierten Impuls,
+nullt aber sein Scratch), freier Root-Schwanz ADDIERT (anders als
+artiPushImpulses Store) `zExt[0]*stepDt + scratch0` in mRootDeferredZ,
+fixe Basis überspringt den Schwanz (Root-Scratch ÜBERLEBT), und
+`mStateDirty = eVEL_DIRTY` wird ZUGEWIESEN, nicht ver-odert.
+Ein Thread pro Artikulation, Block (64,1,1): lane = tid & 31,
+warp = globalThreadIndex/32 — NICHT groupId.x.  ABI: die bestehende
+kPtrU32-Zeile {8,4}.
+
+**Fixture** `testArtiApplyTgsSubstepForces.cpp`: echter Record-Pool (40 x
+544-Byte-PxgArticulation-Bilder, NUR die zwei Zeiger zAForces@88 /
+jointForce@136 lebendig, Rest 0xAB — und nach dem Lauf byte-identisch
+zurückverlangt), Scratch überall nicht-null geseedet, mRootDeferredZ groß,
+mStateDirty-Seeds {0,2,3} (nie 1 — die Zuweisung ist auf jeder lebenden
+Lane sichtbar), umgedrehte Dof-Fenster (103 Offsets neben dem Cursor),
+stepDt = 0.0234375.  Spiegel: `pxgref::aiPropagateImpulseJf` (neu — die
+Template-Spelling `jf - sas.innerProduct(Z)` mit Multiplier) über
+Engine-Primitive.  **Bit-exakt im ersten Lauf, 0 signed zeros.**
+
+**Sweep 17/17 im ersten Durchlauf**, Restore grün (auch
+artiPushImpulse/artiAvgImpulse): Scratch überschrieben statt addiert,
+jf verworfen / Multiplier 1 / Slice ohne Offset, Parent-Gate gestrichen und
+zu weit, Scratch nicht genullt (Loop und Root getrennt), Root-Tail auf
+Fixed, Root-Add wird Store, Dirty ver-odert / übersprungen, Warp aus
+Blockbreite 64, Lane-Maske 63 (rc=139), Root-zExt unskaliert,
+Guard-Off-by-one (rc=139), Record-Stride mit Warp-Index.
+
+Szene: Refused-Liste 210 → **209**; Artikulations-Szene weiter grün
+(Companion-Box 3.7000, artiLink 2.5777).
+
+Suite: **760/760 ctest in BEIDEN Memory-Modi** (Binary 681/681).
 
 ## P8.107 — DIE ARTIKULATIONS-SZENE IST GRÜN: der Companion-Box-"Fehler" war Geometrie
 

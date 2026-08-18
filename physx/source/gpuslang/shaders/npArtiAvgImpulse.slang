@@ -692,3 +692,157 @@ void artiPushImpulse(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_
         aiStoreSV(linkBase, PXG_AB_LINK_mScratchImpulse, lane, AI_ZERO);
     }
 }
+
+// ===========================================================================
+// P8.108: artiApplyTgsSubstepForces (forwardDynamic2.cu:3482-3557).  Grid
+// ceil(nb/64), block (64,1,1) -- ONE THREAD per articulation, TWO warps per
+// block: lane = tid & 31, warp = globalThreadIndex / 32 (not groupId.x).
+// Launched once per TGS position iteration (PxgTGSCudaSolverCore.cpp:1377)
+// when the scene enables eENABLE_EXTERNAL_FORCES_EVERY_ITERATION_TGS.
+//
+// Turns the per-substep isolated external forces (the RECORD's zAForces,
+// filled by computeSpatialInertiaW when that flag is set) plus the user
+// joint forces into deferred impulses.
+//
+// TRAPS, each a sweep mutant:
+//  1. articulatedYW = zExt[link] * stepDt + mScratchImpulse -- the scratch
+//     may be NON-ZERO on entry (multi-child accumulation): add, never
+//     overwrite; and the scratch is re-zeroed after propagating.
+//  2. The propagate is propagateImpulseW<WriteToDeferredQstZ> WITH a joint
+//     force: jf = jointForce[ind] * stepDt happens PER DOF inside the
+//     propagate (adPropagateImpulseWJf, hasJf = true, multiplier = stepDt),
+//     and the slice &jointForces[jointOffset] is indexed by the BLOCK's
+//     mJointOffset while the array itself lives in the RECORD.
+//  3. The parent add is GATED: (parent > 0 || !isFixedBase) -- a child of a
+//     FIXED root drops its propagated impulse (the root cannot move), but
+//     its own scratch is still zeroed.
+//  4. The free-base root tail ADDS zExt[0]*stepDt + scratch0 into
+//     mRootDeferredZ (an add, unlike artiPushImpulse's store) and zeroes
+//     scratch0; a FIXED base skips the tail entirely, so the root's scratch
+//     SURVIVES there.
+//  5. mStateDirty is ASSIGNED eVEL_DIRTY (1) -- not OR-ed -- clobbering any
+//     eHAS_IMPULSES bit, unconditionally for every live thread.
+// ===========================================================================
+
+struct AtsParams
+{
+    uint64_t desc;   // @0  PxgArticulationCoreDesc*
+    float stepDt;    // @8
+    uint pad0;       // @12 -> 16
+};
+
+[[vk::push_constant]]
+ConstantBuffer<AtsParams> gAts;
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void artiApplyTgsSubstepForces(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint64_t d = gAts.desc;
+    const float stepDt = gAts.stepDt;
+    const uint globalThreadIndex = dispatchThreadId.x;
+    const uint lane = globalThreadIndex & 31u;
+    const uint globalWarpIndex = globalThreadIndex / 32u;
+
+    const uint nbArticulations = artiU32Field(d, PXG_ARTI_CORE_NB_ARTICULATIONS);
+    const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);
+    const uint maxDofs = artiU32Field(d, PXG_ARTI_CORE_MAX_DOFS);
+
+    if (globalThreadIndex >= nbArticulations)
+        return;
+
+    const uint64_t record = artiPtrField(d, PXG_ARTI_CORE_ARTICULATIONS)
+                          + uint64_t(globalThreadIndex) * PXG_ARTI_STRIDE;
+    const uint64_t zExt = artiPtrField(record, PXG_ARTI_ZA_FORCES);
+    const uint64_t jointForces = artiPtrField(record, PXG_ARTI_JOINT_FORCE);
+
+    const uint64_t artiBlock = artiPtrField(d, PXG_ARTI_CORE_ARTICULATION_BLOCKS)
+                             + uint64_t(globalWarpIndex) * PXG_AB_BLOCK_SIZE;
+    const uint64_t linkBase = artiPtrField(d, PXG_ARTI_CORE_LINK_BLOCKS)
+                            + uint64_t(globalWarpIndex) * uint64_t(maxLinks) * PXG_AB_LINK_SIZE;
+    const uint64_t dofBase = artiPtrField(d, PXG_ARTI_CORE_DOF_BLOCKS)
+                           + uint64_t(globalWarpIndex) * uint64_t(maxDofs) * PXG_AB_DOF_SIZE;
+
+    const uint numLinks = abU32(artiBlock, PXG_AB_mNumLinks, lane);
+    const bool isFixedBase = (abU32(artiBlock, PXG_AB_mFlags, lane) & 1u) != 0u;
+
+    for (uint linkIdx = numLinks - 1u; linkIdx > 0u; --linkIdx)
+    {
+        const uint64_t tLink = linkBase + uint64_t(linkIdx) * PXG_AB_LINK_SIZE;
+
+        const uint parent = abU32(tLink, PXG_AB_LINK_mParents, lane);
+        const float3 rw = float3(abF32(tLink, PXG_AB_LINK_mRw_x, lane),
+                                 abF32(tLink, PXG_AB_LINK_mRw_y, lane),
+                                 abF32(tLink, PXG_AB_LINK_mRw_z, lane));
+        const uint dofCount = abU8(tLink, PXG_AB_LINK_mDofs, lane);
+        const uint jointOffset = abU32(tLink, PXG_AB_LINK_mJointOffset, lane);
+        const uint64_t dofData = dofBase + uint64_t(jointOffset) * PXG_AB_DOF_SIZE;
+
+        // trap 1: isolated * stepDt PLUS whatever the scratch accumulated
+        Ptr<float> z = Ptr<float>(zExt + uint64_t(linkIdx) * PXG_ARTI_SPATIAL_VECTOR_SIZE);
+        const AbSpatialVector isolatedYW =
+            asmSVec(float3(z[0], z[1], z[2]), float3(z[3], z[4], z[5]));
+        const AbSpatialVector articulatedYW =
+            asmSVecAdd(asmSVecScale(isolatedYW, stepDt),
+                       aiLoadSV(tLink, PXG_AB_LINK_mScratchImpulse, lane));
+
+        AbSpatialVector isInvD[3];
+        AbSpatialVector motionMatrix[3];
+        float qstZ[3];
+        float jf[3];
+        Ptr<float> jfSlice = Ptr<float>(jointForces + uint64_t(jointOffset) * 4u);
+        for (uint ind = 0u; ind < 3u; ++ind)
+        {
+            isInvD[ind] = AI_ZERO;
+            motionMatrix[ind] = AI_ZERO;
+            qstZ[ind] = 0.0f;
+            jf[ind] = 0.0f;
+            if (ind < dofCount)
+            {
+                const uint64_t dd = dofData + uint64_t(ind) * PXG_AB_DOF_SIZE;
+                isInvD[ind] = aiLoadSV(dd, PXG_AB_DOF_mIsInvDW, lane);
+                motionMatrix[ind] = aiLoadSV(dd, PXG_AB_DOF_mWorldMotionMatrix, lane);
+                qstZ[ind] = abF32(dd, PXG_AB_DOF_mDeferredQstZ, lane);
+                // trap 2: the joint force is read here, multiplied inside the
+                // propagate by jfMult = stepDt
+                jf[ind] = jfSlice[ind];
+            }
+        }
+
+        const AbSpatialVector propagatedYWParent =
+            adPropagateImpulseWJf(isInvD, rw, motionMatrix, articulatedYW, dofCount, qstZ, jf,
+                                  stepDt, true);
+
+        for (uint ind = 0u; ind < 3u; ++ind)
+            if (ind < dofCount)
+                abStoreF32(dofData + uint64_t(ind) * PXG_AB_DOF_SIZE, PXG_AB_DOF_mDeferredQstZ,
+                           lane, qstZ[ind]);
+
+        // trap 3
+        if (parent > 0u || !isFixedBase)
+        {
+            const uint64_t pLink = linkBase + uint64_t(parent) * PXG_AB_LINK_SIZE;
+            aiStoreSV(pLink, PXG_AB_LINK_mScratchImpulse, lane,
+                      asmSVecAdd(aiLoadSV(pLink, PXG_AB_LINK_mScratchImpulse, lane),
+                                 propagatedYWParent));
+        }
+        aiStoreSV(tLink, PXG_AB_LINK_mScratchImpulse, lane, AI_ZERO);
+    }
+
+    // trap 4
+    if (!isFixedBase)
+    {
+        Ptr<float> z = Ptr<float>(zExt);
+        const AbSpatialVector isolatedYW =
+            asmSVec(float3(z[0], z[1], z[2]), float3(z[3], z[4], z[5]));
+        const AbSpatialVector articulatedYW =
+            asmSVecAdd(asmSVecScale(isolatedYW, stepDt),
+                       aiLoadSV(linkBase, PXG_AB_LINK_mScratchImpulse, lane));
+
+        aiStoreSV(artiBlock, PXG_AB_mRootDeferredZ, lane,
+                  asmSVecAdd(aiLoadSV(artiBlock, PXG_AB_mRootDeferredZ, lane), articulatedYW));
+        aiStoreSV(linkBase, PXG_AB_LINK_mScratchImpulse, lane, AI_ZERO);
+    }
+
+    abStoreU8(artiBlock, PXG_AB_mStateDirty, lane, 1u);   // trap 5: eVEL_DIRTY ASSIGNED
+}

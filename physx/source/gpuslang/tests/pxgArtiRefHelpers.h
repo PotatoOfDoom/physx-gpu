@@ -577,6 +577,34 @@ inline UnAlignedSpatialVector aiPropagateImpulse(const PxVec3& parentToChild,
     return physx::Dy::FeatherstoneArticulation::translateSpatialVector(parentToChild, temp);
 }
 
+// P8.108: propagateImpulseW<WriteToDeferredQstZ> WITH a joint force -- the
+// template's `jf = jointForce[ind] * jointForceMultiplier` spelling, applied
+// per dof inside the loop (artiApplyTgsSubstepForces passes multiplier =
+// stepDt).  Identical to aiPropagateImpulse above when jointForce == NULL.
+inline UnAlignedSpatialVector aiPropagateImpulseJf(const PxVec3& parentToChild,
+                                                   physx::PxgArticulationBlockDofData* dofData,
+                                                   const UnAlignedSpatialVector& Z,
+                                                   PxU32 dofCount, uint32_t lane,
+                                                   const PxReal* jointForce,
+                                                   PxReal jointForceMultiplier)
+{
+    UnAlignedSpatialVector temp = Z;
+    for (PxU32 ind = 0; ind < 3; ++ind)
+    {
+        if (ind < dofCount)
+        {
+            const UnAlignedSpatialVector sas = loadSpatialVector(dofData[ind].mWorldMotionMatrix,
+                                                                 lane);
+            const UnAlignedSpatialVector isInvD = loadSpatialVector(dofData[ind].mIsInvDW, lane);
+            const PxReal jf = jointForce ? jointForce[ind] * jointForceMultiplier : 0.0f;
+            const PxReal stZ = jf - sas.innerProduct(Z);
+            dofData[ind].mDeferredQstZ[lane] += stZ;
+            temp += isInvD * stZ;
+        }
+    }
+    return physx::Dy::FeatherstoneArticulation::translateSpatialVector(parentToChild, temp);
+}
+
 // P8.99c: the Ex form carries the CUDA's `scale` parameter (default 0 = the
 // internal non-momentum-conserving count; the self-solve wrapper passes
 // 1/referenceCount from countActiveSlabs).  The old name forwards with 0.
