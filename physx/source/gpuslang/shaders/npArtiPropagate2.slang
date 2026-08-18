@@ -341,3 +341,87 @@ void artiPropagateVelocity(uint3 groupThreadId : SV_GroupThreadID,
     p2vPropagateVelocity(gP2v.scDesc, gP2v.partitionId, gP2v.velocityOutput, false,
                          groupThreadId.x, groupId.x * 2u + groupThreadId.y, groupId.y);
 }
+
+// ===========================================================================
+// P8.110: artiSaveVelocity1TPGS (forwardDynamic2.cu:3255-3313).  Grid
+// ceil(nb/64), block (32,2,1).  The PGS "save velocities" step, launched
+// once per PGS solve from PxgCudaSolverCore::solveContactMultiBlockParallel:
+// flush any pending impulses, then snapshot the motion and joint velocities
+// into their mPos* twins.
+//
+// TRAPS, each a sweep mutant:
+//  1. The average runs ONLY under the eHAS_IMPULSES bit (&2); a lane with
+//     eVEL_DIRTY alone flushes WITHOUT averaging.
+//  2. The flush runs for ANY non-zero dirty value, and the flag is cleared
+//     to 0 inside that branch.
+//  3. The two snapshot loops run UNCONDITIONALLY -- clean lanes copy too.
+//  4. The link snapshot starts at link 0 (the root included); the dof
+//     snapshot is bounded by the HEADER's mTotalDofs field, not by a
+//     recomputed per-link sum (the fixture seeds them apart on some lanes).
+//  5. The copies are RAW -- load/store with no arithmetic.
+// ===========================================================================
+
+struct SvpParams
+{
+    uint64_t scDesc;   // @0  PxgArticulationCoreDesc*
+}
+
+[[vk::push_constant]]
+ConstantBuffer<SvpParams> gSvp;
+
+[shader("compute")]
+[numthreads(32, 2, 1)]
+void artiSaveVelocity1TPGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    const uint64_t d = gSvp.scDesc;
+    const uint lane = groupThreadId.x;
+    const uint globalWarpIndex = groupId.x * 2u + groupThreadId.y;
+    const uint globalThreadIndex = globalWarpIndex * 32u + lane;
+
+    const uint nbArticulations = artiU32Field(d, PXG_ARTI_CORE_NB_ARTICULATIONS);
+    if (globalThreadIndex >= nbArticulations)
+        return;
+
+    const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);
+    const uint maxDofs = artiU32Field(d, PXG_ARTI_CORE_MAX_DOFS);
+
+    const uint64_t w = uint64_t(globalWarpIndex);
+    const uint64_t artiBlock = artiPtrField(d, PXG_ARTI_CORE_ARTICULATION_BLOCKS)
+                             + w * PXG_AB_BLOCK_SIZE;
+    const uint64_t linkBase = artiPtrField(d, PXG_ARTI_CORE_LINK_BLOCKS)
+                            + w * uint64_t(maxLinks) * PXG_AB_LINK_SIZE;
+    const uint64_t dofBase = artiPtrField(d, PXG_ARTI_CORE_DOF_BLOCKS)
+                           + w * uint64_t(maxDofs) * PXG_AB_DOF_SIZE;
+
+    const uint numLinks = abU32(artiBlock, PXG_AB_mNumLinks, lane);
+    const uint totalDofs = abU32(artiBlock, PXG_AB_mTotalDofs, lane);   // trap 4
+    const bool fixBase = (abU32(artiBlock, PXG_AB_mFlags, lane) & PXG_ARTI_FLAG_FIX_BASE) != 0u;
+
+    const uint stateDirty = abU8(artiBlock, PXG_AB_mStateDirty, lane);
+    if (stateDirty != 0u)
+    {
+        if ((stateDirty & P2_HAS_IMPULSES) != 0u)   // trap 1
+        {
+            aiAverageAndPropagate(artiPtrField(d, PXG_ARTI_CORE_SLAB_HAS_CHANGES),
+                                  artiPtrField(d, PXG_ARTI_CORE_IMPULSES), artiBlock, linkBase,
+                                  dofBase, globalThreadIndex, maxLinks, nbArticulations,
+                                  artiU32Field(d, PXG_ARTI_CORE_NB_SLABS), lane);
+        }
+        fvFlushVelocity(artiBlock, linkBase, dofBase, numLinks, fixBase, lane);   // trap 2
+        abStoreU8(artiBlock, PXG_AB_mStateDirty, lane, 0u);
+    }
+
+    // trap 3 + 5: unconditional raw snapshots
+    for (uint linkID = 0u; linkID < numLinks; ++linkID)
+    {
+        const uint64_t tLink = linkBase + uint64_t(linkID) * PXG_AB_LINK_SIZE;
+        const AbSpatialVector mv = svLoadSV(tLink, PXG_AB_LINK_mMotionVelocity, lane);
+        abStoreSpatialVector(tLink, PXG_AB_LINK_mPosMotionVelocity, lane, mv.top, mv.bottom);
+    }
+    for (uint dofId = 0u; dofId < totalDofs; ++dofId)
+    {
+        const uint64_t dd = dofBase + uint64_t(dofId) * PXG_AB_DOF_SIZE;
+        abStoreF32(dd, PXG_AB_DOF_mPosJointVelocities, lane,
+                   abF32(dd, PXG_AB_DOF_mJointVelocities, lane));
+    }
+}

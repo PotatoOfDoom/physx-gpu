@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **760/760** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **761/761** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,41 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.110 — artiSaveVelocity1TPGS (Manifest 295): reine Komposition
+
+`artiSaveVelocity1TPGS` (forwardDynamic2.cu:3255-3313) ist gemappt — als
+Kompositions-Entry in `npArtiPropagate2.slang` (das Modul importiert schon
+alles): der PGS-Save-Velocities-Schritt, einmal pro PGS-Solve aus
+PxgCudaSolverCore::solveContactMultiBlockParallel.  Ablauf: unter
+eHAS_IMPULSES (&2) `aiAverageAndPropagate` (P8.94c), unter JEDEM
+Dirty-Wert `fvFlushVelocity` (P8.94b) + Flag auf 0, dann BEDINGUNGSLOS die
+rohen Snapshots `mMotionVelocity -> mPosMotionVelocity` (ab Link 0, der
+Root eingeschlossen) und `mJointVelocities -> mPosJointVelocities` —
+letzterer über das HEADER-Feld `mTotalDofs`, nicht über eine neu
+aufsummierte Link-Summe.
+
+**Fixture** `testArtiSaveVelocity.cpp`: die Dirty-Leiter {0,1,2,3}
+(clean muss trotzdem snapshotten; eVEL_DIRTY allein flusht OHNE Average;
+Single-Link-Lanes tragen nie Bit 2), `mTotalDofs` auf einigen Lanes EINS
+KLEINER als die echte Summe geseedet (der letzte Dof behält seinen
+geseedeten mPos-Wert — das pinnt die Feld-Lesung gegen die Neuberechnung),
+mPos*-Ziele mit Werten (nicht Poison) geseedet, Slab-/Impulse-Arena nach
+dem P8.94c-Muster.  Spiegel: `pxgref::aiMirror` + `pxgref::fvMirror` +
+die Kopien — dieselben Bausteine, die der Entry auf dem Device
+komponiert, jeder für sich bereits gesweept.  **Bit-exakt im ersten Lauf,
+0 signed zeros.**
+
+**Sweep 11/11**: Average auf jedem Dirty / gestrichen, Flush hinter dem
+Impulse-Bit, Flag nicht gelöscht, Snapshots hinter dem Dirty-Gate,
+Link-Kopie überspringt den Root, mTotalDofs neu aufsummiert (die
+Short-Total-Lanes töten es), mPosMotion-Hälften vertauscht, Dof-Kopie
+gestrichen, Guard-Off-by-one (rc=139), nbSlabs hart auf 1.
+
+Szene: Refused-Liste 207 → **206**; Artikulations-Szene weiter grün.
+PGS — keine Szene ruft ihn; Fixture und Sweep tragen ihn.
+
+Suite: **761/761 ctest in BEIDEN Memory-Modi** (Binary 682/682).
 
 ## P8.109 — die PGS-Propagate-Zwillinge (Manifest 294): zwei Kernel, ein Refactor
 
