@@ -99,14 +99,14 @@ struct P2iParams
 [[vk::push_constant]]
 ConstantBuffer<P2iParams> gP2i;
 
-[shader("compute")]
-[numthreads(32, 2, 1)]
-void artiPropagateImpulses2TGS(uint3 groupThreadId : SV_GroupThreadID,
-                               uint3 groupId : SV_GroupID)
+// P8.109: the body, shared by the TGS and PGS entries.  The ONLY
+// type-dependent value in the template (forwardDynamic2.cu:3560) is
+// iterativeData.solverEncodedReferenceCount, which both mirrors carry at the
+// same offset (@176) -- each entry resolves it through its OWN typed mirror
+// and passes the pointer in.
+void p2iPropagateImpulses2(uint64_t d, uint64_t solverDescA, uint64_t encodedRefCountA,
+                           uint partitionId, uint lane, uint globalWarpIndex)
 {
-    const uint64_t d = gP2i.scDesc;
-    const uint lane = groupThreadId.x;
-    const uint globalWarpIndex = groupId.x * 2u + groupThreadId.y;
     const uint globalThreadIndex = globalWarpIndex * 32u + lane;
 
     const uint nbArticulations = artiU32Field(d, PXG_ARTI_CORE_NB_ARTICULATIONS);
@@ -129,7 +129,7 @@ void artiPropagateImpulses2TGS(uint3 groupThreadId : SV_GroupThreadID,
                            + w * uint64_t(maxDofs) * PXG_AB_DOF_SIZE;
     const uint numLinks = abU32(artiBlock, PXG_AB_mNumLinks, lane);
 
-    if (gP2i.partitionId == 0u)
+    if (partitionId == 0u)
     {
         const bool fixBase =
             (abU32(artiBlock, PXG_AB_mFlags, lane) & PXG_ARTI_FLAG_FIX_BASE) != 0u;
@@ -138,7 +138,7 @@ void artiPropagateImpulses2TGS(uint3 groupThreadId : SV_GroupThreadID,
     }
     else if ((dirtyFlag & P2_HAS_IMPULSES) != 0u)
     {
-        const uint offset = globalThreadIndex + gP2i.partitionId * nbArticulations;
+        const uint offset = globalThreadIndex + partitionId * nbArticulations;
         const float partitionAverageScale =
             (Ptr<float>(artiPtrField(d, PXG_ARTI_CORE_PARTITION_AVERAGE_SCALE)))[offset];
 
@@ -152,18 +152,17 @@ void artiPropagateImpulses2TGS(uint3 groupThreadId : SV_GroupThreadID,
             const uint nbArticulationBatchPerPartition = (nbArticulations + 31u) / 32u;
             const uint wordSize = (maxLinks + 63u) / 64u;
             const uint offset2 = globalWarpIndex
-                               + gP2i.partitionId * nbArticulationBatchPerPartition * wordSize;
+                               + partitionId * nbArticulationBatchPerPartition * wordSize;
             const uint64_t pathToRootPerPartition =
                 artiPtrField(d, PXG_ARTI_CORE_PATH_TO_ROOTS_PER_PARTITION)
                 + uint64_t(offset2) * PXG_AB_BITFIELD_STACK_SIZE;
 
-            Ptr<PxgSolverCoreDescGpu> solverDesc = Ptr<PxgSolverCoreDescGpu>(gP2i.solverDesc);
+            Ptr<PxgSolverCoreDescGpu> solverDesc = Ptr<PxgSolverCoreDescGpu>(solverDescA);
             Ptr<PxgIslandContextGpu> island = Ptr<PxgIslandContextGpu>(solverDesc[0].islandContextPool);
             const uint articulationReferenceCountOffset = island[0].mBodyCount + island[0].mBodyStartIndex;
             const uint numSolverBodies = articulationReferenceCountOffset + nbArticulations;
 
-            Ptr<PxgSolverSharedDescTGSGpu> sharedDesc = Ptr<PxgSolverSharedDescTGSGpu>(gP2i.sharedDesc);
-            Ptr<uint> encodedRefCount = Ptr<uint>(sharedDesc[0].iter_solverEncodedReferenceCount);
+            Ptr<uint> encodedRefCount = Ptr<uint>(encodedRefCountA);
             const uint referenceCount = pxgCountActiveSlabsBda(
                 articulationReferenceCountOffset + globalThreadIndex, nbSlabs, numSolverBodies,
                 encodedRefCount);
@@ -181,6 +180,32 @@ void artiPropagateImpulses2TGS(uint3 groupThreadId : SV_GroupThreadID,
     }
 }
 
+[shader("compute")]
+[numthreads(32, 2, 1)]
+void artiPropagateImpulses2TGS(uint3 groupThreadId : SV_GroupThreadID,
+                               uint3 groupId : SV_GroupID)
+{
+    Ptr<PxgSolverSharedDescTGSGpu> sharedDesc =
+        Ptr<PxgSolverSharedDescTGSGpu>(gP2i.sharedDesc);
+    p2iPropagateImpulses2(gP2i.scDesc, gP2i.solverDesc,
+                          sharedDesc[0].iter_solverEncodedReferenceCount, gP2i.partitionId,
+                          groupThreadId.x, groupId.x * 2u + groupThreadId.y);
+}
+
+// P8.109: the PGS twin (forwardDynamic2.cu:3635) -- the same body over
+// PxgSolverSharedDesc<IterativeSolveData>.
+[shader("compute")]
+[numthreads(32, 2, 1)]
+void artiPropagateImpulses2PGS(uint3 groupThreadId : SV_GroupThreadID,
+                               uint3 groupId : SV_GroupID)
+{
+    Ptr<PxgSolverSharedDescPGSGpu> sharedDesc =
+        Ptr<PxgSolverSharedDescPGSGpu>(gP2i.sharedDesc);
+    p2iPropagateImpulses2(gP2i.scDesc, gP2i.solverDesc,
+                          sharedDesc[0].iter_solverEncodedReferenceCount, gP2i.partitionId,
+                          groupThreadId.x, groupId.x * 2u + groupThreadId.y);
+}
+
 // ---------------------------------------------------------------------------
 // artiPropagateVelocityTGS
 // ---------------------------------------------------------------------------
@@ -196,23 +221,21 @@ struct P2vParams
 [[vk::push_constant]]
 ConstantBuffer<P2vParams> gP2v;
 
-[shader("compute")]
-[numthreads(32, 2, 1)]
-void artiPropagateVelocityTGS(uint3 groupThreadId : SV_GroupThreadID,
-                              uint3 groupId : SV_GroupID)
+// P8.109: the body, shared by the TGS and PGS entries
+// (artiPropagateVelocityInternal<isTGS>, forwardDynamic2.cu:3652) -- they
+// differ ONLY in the output tail.
+void p2vPropagateVelocity(uint64_t d, uint partitionId, uint64_t velocityOutput, bool isTGS,
+                          uint lane, uint globalWarpIndex, uint slabIdIn)
 {
-    const uint64_t d = gP2v.scDesc;
-    const uint lane = groupThreadId.x;
-    const uint globalWarpIndex = groupId.x * 2u + groupThreadId.y;
     const uint globalThreadIndex = globalWarpIndex * 32u + lane;
 
     const uint nbArticulations = artiU32Field(d, PXG_ARTI_CORE_NB_ARTICULATIONS);
     if (globalThreadIndex >= nbArticulations)
         return;
 
-    const uint slabId = groupId.y;   // the 2D grid: blockIdx.y IS the slab
+    const uint slabId = slabIdIn;   // the 2D grid: blockIdx.y IS the slab
 
-    const uint offset = globalThreadIndex + gP2v.partitionId * nbArticulations;
+    const uint offset = globalThreadIndex + partitionId * nbArticulations;
     const float partitionAverageScale =
         (Ptr<float>(artiPtrField(d, PXG_ARTI_CORE_PARTITION_AVERAGE_SCALE)))[offset];
     if (partitionAverageScale == 0.0f)
@@ -239,7 +262,7 @@ void artiPropagateVelocityTGS(uint3 groupThreadId : SV_GroupThreadID,
 
     // one uint4 per (articulation, slab), stepped per PARTITION
     const uint64_t slabDirtyMasks = artiPtrField(d, PXG_ARTI_CORE_SLAB_DIRTY_MASKS)
-        + uint64_t(slabPartitionOffset) * uint64_t(gP2v.partitionId) * 16u;
+        + uint64_t(slabPartitionOffset) * uint64_t(partitionId) * 16u;
     const uint4 dirtyIndex4 =
         (Ptr<uint4>(slabDirtyMasks))[globalThreadIndex + slabId * nbArticulations];
 
@@ -252,7 +275,7 @@ void artiPropagateVelocityTGS(uint3 groupThreadId : SV_GroupThreadID,
             const uint64_t dLink = linkBase + uint64_t(dirtyIndex) * PXG_AB_LINK_SIZE;
             AbSpatialVector velocity = svLoadSV(dLink, PXG_AB_LINK_mMotionVelocity, lane);
 
-            if (gP2v.partitionId != 0u && dirtyLink != P2_NONE)
+            if (partitionId != 0u && dirtyLink != P2_NONE)
             {
                 AbSpatialVector deltaV = svLoadSV(artiBlock, PXG_AB_mCommonLinkDeltaVelocity, lane);
 
@@ -276,15 +299,45 @@ void artiPropagateVelocityTGS(uint3 groupThreadId : SV_GroupThreadID,
                 velocity = asmSVecAdd(velocity, deltaV);
             }
 
-            // the TGS packing: three float4 slots at writeIndex, +32, +64
-            const AbSpatialVector deltaMotion = svLoadSV(dLink, PXG_AB_LINK_mDeltaMotion, lane);
-            Ptr<float4> outp = Ptr<float4>(gP2v.velocityOutput);
-            outp[writeIndex] = float4(velocity.bottom.x, velocity.bottom.y, velocity.bottom.z,
-                                      velocity.top.x);
-            outp[writeIndex + 32u] = float4(velocity.top.y, velocity.top.z,
-                                            deltaMotion.bottom.x, deltaMotion.bottom.y);
-            outp[writeIndex + 64u] = float4(deltaMotion.bottom.z, deltaMotion.top.x,
-                                            deltaMotion.top.y, deltaMotion.top.z);
+            Ptr<float4> outp = Ptr<float4>(velocityOutput);
+            if (isTGS)
+            {
+                // the TGS packing: three float4 slots at writeIndex, +32, +64
+                const AbSpatialVector deltaMotion =
+                    svLoadSV(dLink, PXG_AB_LINK_mDeltaMotion, lane);
+                outp[writeIndex] = float4(velocity.bottom.x, velocity.bottom.y,
+                                          velocity.bottom.z, velocity.top.x);
+                outp[writeIndex + 32u] = float4(velocity.top.y, velocity.top.z,
+                                                deltaMotion.bottom.x, deltaMotion.bottom.y);
+                outp[writeIndex + 64u] = float4(deltaMotion.bottom.z, deltaMotion.top.x,
+                                                deltaMotion.top.y, deltaMotion.top.z);
+            }
+            else
+            {
+                // the PGS packing: two slots, w = 0, NO deltaMotion
+                outp[writeIndex] = float4(velocity.bottom, 0.0f);
+                outp[writeIndex + 32u] = float4(velocity.top, 0.0f);
+            }
         }
     }
+}
+
+[shader("compute")]
+[numthreads(32, 2, 1)]
+void artiPropagateVelocityTGS(uint3 groupThreadId : SV_GroupThreadID,
+                              uint3 groupId : SV_GroupID)
+{
+    p2vPropagateVelocity(gP2v.scDesc, gP2v.partitionId, gP2v.velocityOutput, true,
+                         groupThreadId.x, groupId.x * 2u + groupThreadId.y, groupId.y);
+}
+
+// P8.109: the PGS twin (forwardDynamic2.cu:3752) --
+// artiPropagateVelocityInternal<false>.
+[shader("compute")]
+[numthreads(32, 2, 1)]
+void artiPropagateVelocity(uint3 groupThreadId : SV_GroupThreadID,
+                           uint3 groupId : SV_GroupID)
+{
+    p2vPropagateVelocity(gP2v.scDesc, gP2v.partitionId, gP2v.velocityOutput, false,
+                         groupThreadId.x, groupId.x * 2u + groupThreadId.y, groupId.y);
 }

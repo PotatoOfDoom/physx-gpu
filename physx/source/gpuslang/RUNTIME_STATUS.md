@@ -1694,6 +1694,49 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.109 — die PGS-Propagate-Zwillinge (Manifest 294): zwei Kernel, ein Refactor
+
+`artiPropagateImpulses2PGS` (forwardDynamic2.cu:3635) und
+`artiPropagateVelocity` (:3752) sind gemappt — die PGS-Instanziierungen der
+in P8.101 geporteten TGS-Körper.  Kein neuer Körper: die beiden TGS-Entries
+in `npArtiPropagate2.slang` wurden zu file-lokalen Funktionen
+(`p2iPropagateImpulses2`, `p2vPropagateVelocity`) gehoben, vier dünne
+Entries darüber.  Die zwei echten Deltas, beide verifiziert statt
+angenommen:
+
+* **Impulses2**: der Template-Parameter steuert im CUDA nur den Typ von
+  `sharedDesc` — gelesen wird ausschließlich
+  `iterativeData.solverEncodedReferenceCount`, und BEIDE Spiegel
+  (PxgSolverSharedDescTGSGpu / PxgSolverSharedDescPGSGpu, pxgSlangSolverDesc)
+  tragen das Feld bei @176.  Jeder Entry löst den Zeiger über seinen EIGENEN
+  typisierten Spiegel auf und reicht ihn in den gemeinsamen Körper.
+* **Velocity**: `artiPropagateVelocityInternal<isTGS>` unterscheidet sich
+  NUR im Ausgabe-Schwanz — TGS packt drei float4-Slots (writeIndex, +32,
+  +64) mit mDeltaMotion, PGS zwei Slots mit w = 0 und liest mDeltaMotion
+  GAR NICHT; die dritte Slot-Region bleibt unberührt.
+
+**Fixture**: `testArtiPropagate2.cpp` um einen isTGS-Parameter erweitert —
+vier Runden (TGS p=2/p=0 wie gehabt, PGS p=2/p=0 mit frischen Salts), die
+PGS-Spiegel-Packung schreibt zwei Slots und lässt die dritte Region im
+Poison (der Byte-Vergleich beweist, dass der PGS-Kernel sie nie anfasst).
+**Alle vier Runden bit-exakt im ersten Lauf.**
+
+**Sweep 7/7**: Tail fest auf TGS / fest auf PGS, PGS-w trägt top.x,
+PGS-Velocity-Entry ruft TGS / verliert die Slab-Dimension,
+PGS-Impulses-Entry mit partitionId 0 / mit unaufgelöstem
+sharedDesc-Zeiger als RefCount.  NICHT im Sweep: ein Entry, der den
+RefCount über den JEWEILS ANDEREN Spiegel auflöst, ist unfangbar — beide
+Strukturen sind layoutgleich (@176), die Trennung ist Transkriptionstreue,
+und diese Notiz sagt es.
+
+Szene: Refused-Liste 209 → **207**; Artikulations-Szene weiter grün.
+Die PGS-Kernel laufen in keiner Szene (TGS-Harness) — Fixture und Sweep
+tragen sie; der verbleibende artiPropagate*-Eintrag auf der Liste ist
+artiPropagateRigidImpulsesAndSolveSelfConstraints1T (der PGS-Solve-Zwilling).
+
+Suite: **760/760 ctest in BEIDEN Memory-Modi** (unverändert — bestehende
+Fixture erweitert, kein neuer Suite-Eintrag).
+
 ## P8.108 — artiApplyTgsSubstepForces (Manifest 292) + ALLE 21 SZENEN BESTÄTIGT
 
 Zuerst der volle Beleg für P8.107: **alle 21 Szenen einzeln gefahren, alle

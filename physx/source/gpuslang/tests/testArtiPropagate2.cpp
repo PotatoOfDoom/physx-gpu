@@ -470,7 +470,7 @@ static void p2MirrorImpulses(P2Arena& W, uint32_t partitionId,
     }
 }
 
-static void p2MirrorVelocity(P2Arena& W, uint32_t partitionId,
+static void p2MirrorVelocity(P2Arena& W, uint32_t partitionId, bool isTGS,
                              uint32_t& writes, uint32_t& corrected, uint32_t& earlyOuts)
 {
     for (uint32_t slabId = 0; slabId < P2_NB_SLABS; ++slabId)
@@ -522,17 +522,30 @@ static void p2MirrorVelocity(P2Arena& W, uint32_t partitionId,
                     ++corrected;
                 }
 
-                const UnAlignedSpatialVector deltaMotion =
-                    loadSpatialVector(lk[dirtyIndex].mDeltaMotion, lane);
                 float* o0 = &W.velOut[size_t(writeIndex) * 4];
                 float* o1 = &W.velOut[size_t(writeIndex + 32) * 4];
-                float* o2 = &W.velOut[size_t(writeIndex + 64) * 4];
-                o0[0] = velocity.bottom.x; o0[1] = velocity.bottom.y;
-                o0[2] = velocity.bottom.z; o0[3] = velocity.top.x;
-                o1[0] = velocity.top.y; o1[1] = velocity.top.z;
-                o1[2] = deltaMotion.bottom.x; o1[3] = deltaMotion.bottom.y;
-                o2[0] = deltaMotion.bottom.z; o2[1] = deltaMotion.top.x;
-                o2[2] = deltaMotion.top.y; o2[3] = deltaMotion.top.z;
+                if (isTGS)
+                {
+                    const UnAlignedSpatialVector deltaMotion =
+                        loadSpatialVector(lk[dirtyIndex].mDeltaMotion, lane);
+                    float* o2 = &W.velOut[size_t(writeIndex + 64) * 4];
+                    o0[0] = velocity.bottom.x; o0[1] = velocity.bottom.y;
+                    o0[2] = velocity.bottom.z; o0[3] = velocity.top.x;
+                    o1[0] = velocity.top.y; o1[1] = velocity.top.z;
+                    o1[2] = deltaMotion.bottom.x; o1[3] = deltaMotion.bottom.y;
+                    o2[0] = deltaMotion.bottom.z; o2[1] = deltaMotion.top.x;
+                    o2[2] = deltaMotion.top.y; o2[3] = deltaMotion.top.z;
+                }
+                else
+                {
+                    // the PGS packing: two slots, w = 0, NO deltaMotion -- the
+                    // third slot region stays poisoned and the byte compare
+                    // proves the PGS kernel never touches it
+                    o0[0] = velocity.bottom.x; o0[1] = velocity.bottom.y;
+                    o0[2] = velocity.bottom.z; o0[3] = 0.f;
+                    o1[0] = velocity.top.x; o1[1] = velocity.top.y;
+                    o1[2] = velocity.top.z; o1[3] = 0.f;
+                }
                 ++writes;
             }
         }
@@ -555,7 +568,7 @@ struct P2vParamsHost
 };
 static_assert(sizeof(P2vParamsHost) == 24, "velocity blob");
 
-static size_t p2Run(PxgCudaShim& shim, uint32_t partitionId, uint32_t salt)
+static size_t p2Run(PxgCudaShim& shim, uint32_t partitionId, uint32_t salt, bool isTGS)
 {
     P2Arena A;
     p2Seed(A, salt);
@@ -564,11 +577,12 @@ static size_t p2Run(PxgCudaShim& shim, uint32_t partitionId, uint32_t salt)
     uint32_t flushes = 0, partials = 0, scaleSkips = 0;
     p2MirrorImpulses(W, partitionId, flushes, partials, scaleSkips);
     uint32_t writes = 0, corrected = 0, earlyOuts = 0;
-    p2MirrorVelocity(W, partitionId, writes, corrected, earlyOuts);
+    p2MirrorVelocity(W, partitionId, isTGS, writes, corrected, earlyOuts);
 
-    std::printf("[ info ] prop2(p=%u): flushes %u, partials %u, scaleSkips %u; "
+    std::printf("[ info ] prop2(p=%u,%s): flushes %u, partials %u, scaleSkips %u; "
                 "writes %u, corrected %u, earlyOuts %u\n",
-                partitionId, flushes, partials, scaleSkips, writes, corrected, earlyOuts);
+                partitionId, isTGS ? "tgs" : "pgs", flushes, partials, scaleSkips, writes,
+                corrected, earlyOuts);
     if (partitionId == 0)
         PXG_CHECK_MSG(flushes > 0 && corrected == 0, "partition-0 coverage");
     else
@@ -626,11 +640,13 @@ static size_t p2Run(PxgCudaShim& shim, uint32_t partitionId, uint32_t salt)
     }
 
     P2iParamsHost pi = { uint64_t(dDesc), uint64_t(dSd), uint64_t(dSh), partitionId, 0u };
-    PXG_CHECK_MSG(shim.launchKernel(0, P2_BLOCKS, 1, 1, &pi, sizeof(pi)) == PxgResult::Success,
-                  "launch artiPropagateImpulses2TGS");
+    PXG_CHECK_MSG(shim.launchKernel(isTGS ? 0 : 2, P2_BLOCKS, 1, 1, &pi, sizeof(pi)) ==
+                      PxgResult::Success,
+                  "launch artiPropagateImpulses2");
     P2vParamsHost pv = { uint64_t(dDesc), partitionId, 0u, uint64_t(dVo) };
-    PXG_CHECK_MSG(shim.launchKernel(1, P2_BLOCKS, P2_NB_SLABS, 1, &pv, sizeof(pv)) == PxgResult::Success,
-                  "launch artiPropagateVelocityTGS");
+    PXG_CHECK_MSG(shim.launchKernel(isTGS ? 1 : 3, P2_BLOCKS, P2_NB_SLABS, 1, &pv, sizeof(pv)) ==
+                      PxgResult::Success,
+                  "launch artiPropagateVelocity");
     shim.streamSynchronize();
 
     size_t bad = 0;
@@ -673,11 +689,17 @@ PXG_TEST(artiPropagate2)
     const PxgKernelDef manifest[] = {
         { "npArtiPropagate2.spv", "artiPropagateImpulses2TGS", 32u, 0 },
         { "npArtiPropagate2.spv", "artiPropagateVelocityTGS", 24u, 0 },
+        { "npArtiPropagate2.spv", "artiPropagateImpulses2PGS", 32u, 0 },
+        { "npArtiPropagate2.spv", "artiPropagateVelocity", 24u, 0 },
     };
-    PxgCudaShim shim(dev, manifest, 2, &p2Loader);
+    PxgCudaShim shim(dev, manifest, 4, &p2Loader);
 
     size_t bad = 0;
-    bad += p2Run(shim, 2u, 43);   // the partial-propagate + corrected-velocity path
-    bad += p2Run(shim, 0u, 47);   // the flush path + uncorrected velocity
+    bad += p2Run(shim, 2u, 43, true);    // the partial-propagate + corrected-velocity path
+    bad += p2Run(shim, 0u, 47, true);    // the flush path + uncorrected velocity
+    // P8.109: the PGS twins over fresh arenas -- same bodies, the velocity
+    // tail packs two slots instead of three
+    bad += p2Run(shim, 2u, 53, false);
+    bad += p2Run(shim, 0u, 59, false);
     PXG_CHECK_MSG(bad == 0, "%zu mismatches", bad);
 }

@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 292;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 294;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -162,9 +162,9 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "artiOutputVelocity", "npArtiFlushVel.spv", "artiOutputVelocity" },  // ARTI_OUTPUT_VELOCITY (P8.105)
     { "artiPushImpulse", "npArtiAvgImpulse.spv", "artiPushImpulse" },  // ARTI_PUSH_IMPULSE (P8.106)
     { "artiComputeDependencies", nullptr, nullptr },  // ARTI_COMPUTE_DEPENDENCIES (unmapped)
-    { "artiPropagateImpulses2PGS", nullptr, nullptr },  // ARTI_PROPAGATE_IMPULSE_PGS (unmapped)
+    { "artiPropagateImpulses2PGS", "npArtiPropagate2.spv", "artiPropagateImpulses2PGS" },  // ARTI_PROPAGATE_IMPULSE_PGS (P8.109)
     { "artiPropagateImpulses2TGS", "npArtiPropagate2.spv", "artiPropagateImpulses2TGS" },  // ARTI_PROPAGATE_IMPULSE_TGS (P8.101b)
-    { "artiPropagateVelocity", nullptr, nullptr },  // ARTI_PROPAGATE_VELOCITY (unmapped)
+    { "artiPropagateVelocity", "npArtiPropagate2.spv", "artiPropagateVelocity" },  // ARTI_PROPAGATE_VELOCITY (P8.109)
     { "artiPropagateVelocityTGS", "npArtiPropagate2.spv", "artiPropagateVelocityTGS" },  // ARTI_PROPAGATE_VELOCITY_TGS (P8.101c)
     { "artiSumSelfContactAndJointBatches", "npArtiSumSelfBatches.spv", "artiSumSelfContactAndJointBatches" },  // ARTI_SUM_SELF
     { "artiPropagateRigidImpulsesAndSolveSelfConstraints1T", nullptr, nullptr },  // ARTI_PROPAGATE_RIGID_IMPULSES_AND_SOLVE_SELF (unmapped)

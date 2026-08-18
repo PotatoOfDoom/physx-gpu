@@ -1286,6 +1286,9 @@ static const PxgKernelAbiRow kRows[] = {
     // is (ceil(nb/64), nbSlabs).  (P8.101b/c)
     { "artiPropagateImpulses2TGS", kArtiPropImp2, uint32_t(sizeof(kArtiPropImp2)) },
     { "artiPropagateVelocityTGS", kArtiPropVel, uint32_t(sizeof(kArtiPropVel)) },
+    // P8.109: the PGS twins share the TGS rows byte for byte
+    { "artiPropagateImpulses2PGS", kArtiPropImp2, uint32_t(sizeof(kArtiPropImp2)) },
+    { "artiPropagateVelocity", kArtiPropVel, uint32_t(sizeof(kArtiPropVel)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)
