@@ -130,6 +130,9 @@ static const uint8_t kInitStaticKin[] = { 4, 4, 8, 8, 8, 8, 8, 8 };
 // gpusolver TGS kernels taking (PxgSolverCoreDesc*, PxgSolverSharedDesc<...>*)
 static const uint8_t kTwoPtr[] = { 8, 8 };
 static const uint8_t kTwoPtrBool[] = { 8, 8, 1 };
+// computeArtiCOM(PxVec3* data, PxArticulationGPUIndex* gpuIndices, bool rootFrame,
+//   const PxgArticulation* articulations) -- P8.112
+static const uint8_t kTwoPtrBoolPtr[] = { 8, 8, 1, 8 };
 
 // solverTGS: propagateAverageSolverBodyVelocityTGS(desc, sharedDesc,
 //   bool isVelocityIteration, bool isLastPosIteration, PxReal biasCoefficient)
@@ -1291,6 +1294,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "artiPropagateVelocity", kArtiPropVel, uint32_t(sizeof(kArtiPropVel)) },
     { "artiSaveVelocity1TPGS", kOnePtr, 1u },
     { "artiComputeDependencies", kPtrU32, uint32_t(sizeof(kPtrU32)) },
+    { "computeArtiCOM", kTwoPtrBoolPtr, uint32_t(sizeof(kTwoPtrBoolPtr)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

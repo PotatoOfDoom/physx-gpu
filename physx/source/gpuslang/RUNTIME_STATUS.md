@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **762/762** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **763/763** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,56 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.112 — computeArtiCOM (Manifest 297): die Direct-GPU-API-Familie beginnt
+
+`computeArtiCOM` (inverseDynamic.cu:1019-1075) ist gemappt — im NEUEN Modul
+`npArtiInverseDyn.slang` (NOCONTRACT), das die sechs Inverse-Dynamics-Kernel
+der PxDirectGPUAPI-Familie aufnehmen wird.  Neues Muster: RECORD-seitig, ein
+Warp pro Job (Block (32,8,1)), gpuIndices REMAPPT Jobs auf den
+Artikulations-Pool, GLOBALE Float-Atomics in den User-Ausgabepuffer.  ABI:
+neue Zeile kTwoPtrBoolPtr {8,8,1,8}.
+
+Der Kernel: Massensumme atomar nach data[job].x, Barriere, totalMass
+zurücklesen, massengewichtete Positionssummen atomar auf x/y/z, Lane-0-Tail:
+Massensumme wieder abziehen, PxVec3::operator/= (EIN Reziprok, drei
+Multiplikationen — die P8.102b-Spelling), optional der Root-Frame-Umzug als
+getInverse()-dann-transform() — ZWEI Rotationen und ein Add, nicht eine
+Rotation von (v - p).
+
+**ACHTER Upstream-Bug-Kandidat** (verbatim): KEIN jobIndex-Guard — ein
+Launch mit nbElements nicht durch 8 teilbar hat Überhang-Warps, die
+gpuIndices hinter dem Ende lesen und den so benannten Record dereferenzieren.
+
+**Dokumentierte ABWEICHUNG**: die CUDA hat keinen Sync zwischen der
+Positions-Schleife und dem Lane-0-Tail (Warp-Lockstep-Annahme); auf unserer
+Subgroup-8-Emulation spannt ein Warp vier Subgroups, der Port setzt dort
+(und beim ersten __syncwarp) AllMemoryBarrierWithGroupSync — wertneutral,
+beide Punkte blockuniform.
+
+**Fixture** `testArtiComputeCOM.cpp` — die ATOMIC-ORDNUNGS-DISZIPLIN:
+Float-Atomics sind reihenfolge-nichtdeterministisch, also ist jeder Summand
+EXAKT (Massen = Zweierpotenzen via invMass = 2^-n, Positionen kleine
+Ganzzahlen, alle Partialsummen < 2^24) — die Summen sind in JEDER
+Reihenfolge bitgleich, und der Spiegel rechnet sie in Schleifenreihenfolge
+mit Engine-Primitiven (PxVec3, PxTransform::getInverse().transform).
+16 Jobs (exaktes Vielfaches von 8), permutiert auf 24 Records mit
+unreferenzierten Ködern, Link-Zahlen bis 40 (die Warp-Stride-Schleife
+läuft zweimal), zwei Runden rootFrame aus/an, Ausgabe exakt genullt (der
+Engine-Vertrag: ein x0 != 0 verschmutzte den DIVISOR).  **Bit-exakt im
+ersten Lauf, beide Runden.**
+
+**Sweep 13/13**: Remap zur Identität, beide Schleifen auf Stride 64,
+Massensumme nicht abgezogen, echte Division statt Reziprok-Multiplikation,
+rootFrame invertiert / als Ein-Schritt-Rotation / invP unnegiert /
+Konjugation gestrichen, Masse aus dem Decoy-Lane, Position aus q.w,
+numLinks als Wort gelesen (rc=135 — das Poison dahinter), Tail auf jeder
+Lane.
+
+Szene: Refused-Liste 205 → **204**; Artikulations-Szene weiter grün.
+Direct-GPU-API — keine Szene ruft ihn; Fixture und Sweep tragen ihn.
+
+Suite: **763/763 ctest in BEIDEN Memory-Modi** (Binary 684/684).
 
 ## P8.111 — artiComputeDependencies (Manifest 296) + der SIEBTE Upstream-Bug-Kandidat
 
