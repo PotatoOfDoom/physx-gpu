@@ -141,6 +141,7 @@ import pxgSlangCommon;
 import pxgSlangArticulationBlocks;
 import pxgSlangSpatialMatrix;
 import pxgSlangArticulationDynamic;
+import npArtiSolveTendons;   // svHighestBit64 (P8.101a)
 
 static const AbSpatialVector AI_ZERO = { float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f) };
 static const uint AI_NONE = 0xFFFFFFFFu;
@@ -359,4 +360,202 @@ public void aiAverageAndPropagate(uint64_t isSlabDirty, uint64_t impulses, uint6
 {
     aiAverageAndPropagateEx(isSlabDirty, impulses, artiBlock, linkBlocks, dofBlocks,
                             articulationId, maxLinks, nbArticulations, nbSlabs, 0.0f, lane);
+}
+
+// ===========================================================================
+// P8.101a: averageLinkImpulsesAndPropagate2
+// (articulationImpulseResponse.cuh:263-385) — the PARTIAL propagate the
+// per-partition impulse kernel artiPropagateImpulses2 runs: instead of
+// walking all the way to the root, it propagates the scratch impulses down
+// the precomputed per-partition dirty path until it reaches the COMMON NODE
+// (mImpulseHoldingLink), caches the common node's deltaV in
+// mCommonLinkDeltaVelocity, and leaves the common node's scratch impulse
+// UNPROPAGATED for the eventual full walk.
+//
+// Traps, each a sweep mutant unless marked:
+//  1. The slab-average phase runs ONLY under dirtyFlags & eHAS_IMPULSES; the
+//     walk and the tail run REGARDLESS.
+//  2. The slab phase is the Ex phase minus the maxIndex tracking and minus
+//     the internal-count branch — scale is always the caller's.
+//  3. The walk goes word HIGHEST-first (j = wordSize-1 down) and bit
+//     HIGHEST-first within a word (deepest link first).
+//  4. **`break` at the common node exits only the CURRENT word's loop** —
+//     lower words keep processing (the engine's own spelling; with the
+//     common node in word 1, path bits in word 0 — its ancestors — are
+//     still propagated).  Transcribed as-is; the fixture pins it.
+//  5. The bit clear is `word &= ~(uint64_t(1) << bitIndex)` — the 64-bit
+//     LHS expression, never the 32-bit `1uL` literal (the P8.99b lesson).
+//  6. mSolverSpatialImpulse books += Z with NO −ZInternalConstraint (unlike
+//     the DFS backprop booking).
+//  7. The common node's scratch impulse is NOT zeroed (a load-bearing
+//     engine comment: it has not been propagated to the root yet) — the
+//     tail READS it for the deltaV but leaves it in place.
+//  8. The tail stores mCommonLinkDeltaVelocity = response6x6 * (−scratch)
+//     and mLinkWithDeferredImpulse = commonNode, both UNCONDITIONALLY.
+// ===========================================================================
+
+public void aiAverageAndPropagate2(uint64_t isSlabDirty, uint64_t impulses, uint64_t artiBlock,
+                                   uint64_t linkBlocks, uint64_t dofBlocks, uint articulationId,
+                                   uint maxLinks, uint nbArticulations, uint nbSlabs,
+                                   float scale, uint64_t pathToRootPerPartition, uint wordSize,
+                                   uint commonNode, uint dirtyFlags, uint lane)
+{
+    // trap 1: only the averaging is gated
+    if ((dirtyFlags & 2u) != 0u)   // PxgArtiStateDirtyFlag::eHAS_IMPULSES
+    {
+        const uint slabStepSize = maxLinks * nbArticulations;
+        for (uint s = 0u, slabOffset = articulationId, di = articulationId; s < nbSlabs;
+             ++s, slabOffset += slabStepSize, di += nbArticulations)
+        {
+            const uint2 pair = (Ptr<uint2>(isSlabDirty))[di];
+            for (uint i = 0u; i < 2u; ++i)
+            {
+                const uint dirtyIndex = (i == 0u) ? pair.x : pair.y;
+                if (dirtyIndex != AI_NONE)
+                {
+                    const uint64_t dLink = linkBlocks + uint64_t(dirtyIndex) * PXG_AB_LINK_SIZE;
+                    const AbSpatialVector preloadedScratchImpulse =
+                        aiLoadSV(dLink, PXG_AB_LINK_mScratchImpulse, lane);
+
+                    const uint deltaIdx = slabOffset + dirtyIndex * nbArticulations;
+
+                    // the alignment dance collapses to six floats (see header)
+                    Ptr<float> f = Ptr<float>(impulses + uint64_t(deltaIdx) * 24u);
+                    const AbSpatialVector impulse = asmSVec(float3(f[0], f[1], f[2]),
+                                                            float3(f[3], f[4], f[5]));
+                    for (uint z = 0u; z < 6u; ++z)
+                        f[z] = 0.0f;
+
+                    aiStoreSV(dLink, PXG_AB_LINK_mScratchImpulse, lane,
+                              asmSVecAdd(preloadedScratchImpulse, asmSVecScale(impulse, scale)));
+                }
+            }
+            // reset for EVERY slab, outside the guard
+            (Ptr<uint2>(isSlabDirty))[di] = uint2(AI_NONE, AI_NONE);
+        }
+    }
+
+    // trap 3: words from the top, bits highest-first
+    for (int j = int(wordSize) - 1; j >= 0; --j)
+    {
+        const uint bitOffset = uint(j) * 64u;
+        uint64_t word = (Ptr<uint64_t>(pathToRootPerPartition
+                                       + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE))[lane];
+        if (word != 0uL)
+        {
+            while (word != 0uL)
+            {
+                const uint bitIndex = svHighestBit64(word);
+                const uint index = bitIndex + bitOffset;
+
+                if (index == commonNode)
+                    break;   // trap 4: only THIS word's loop ends
+
+                word &= ~(uint64_t(1) << bitIndex);   // trap 5
+
+                const uint64_t linkData = linkBlocks + uint64_t(index) * PXG_AB_LINK_SIZE;
+                const uint jointOffset = abU32(linkData, PXG_AB_LINK_mJointOffset, lane);
+                const uint parent = abU32(linkData, PXG_AB_LINK_mParents, lane);
+                const float c2px = abF32(linkData, PXG_AB_LINK_mRw_x, lane);
+                const float c2py = abF32(linkData, PXG_AB_LINK_mRw_y, lane);
+                const float c2pz = abF32(linkData, PXG_AB_LINK_mRw_z, lane);
+                const uint dofCount = abU8(linkData, PXG_AB_LINK_mDofs, lane);
+
+                const AbSpatialVector Z = aiLoadSV(linkData, PXG_AB_LINK_mScratchImpulse, lane);
+                const uint64_t pLink = linkBlocks + uint64_t(parent) * PXG_AB_LINK_SIZE;
+                const AbSpatialVector parentScratchImpulse =
+                    aiLoadSV(pLink, PXG_AB_LINK_mScratchImpulse, lane);
+                const AbSpatialVector solverSpatialImpulse =
+                    aiLoadSV(linkData, PXG_AB_LINK_mSolverSpatialImpulse, lane);
+
+                // propagateImpulseW<WriteToDeferredQstZ>: P8.90's body seeded
+                // from mDeferredQstZ so the write-back is the engine's +=
+                const uint64_t dofData = dofBlocks + uint64_t(jointOffset) * PXG_AB_DOF_SIZE;
+                AbSpatialVector isInvD[3];
+                AbSpatialVector motionMatrix[3];
+                float qstZ[3];
+                for (uint ind = 0u; ind < 3u; ++ind)
+                {
+                    isInvD[ind] = AI_ZERO;
+                    motionMatrix[ind] = AI_ZERO;
+                    qstZ[ind] = 0.0f;
+                    if (ind < dofCount)
+                    {
+                        const uint64_t d = dofData + uint64_t(ind) * PXG_AB_DOF_SIZE;
+                        isInvD[ind] = aiLoadSV(d, PXG_AB_DOF_mIsInvDW, lane);
+                        motionMatrix[ind] = aiLoadSV(d, PXG_AB_DOF_mWorldMotionMatrix, lane);
+                        qstZ[ind] = abF32(d, PXG_AB_DOF_mDeferredQstZ, lane);
+                    }
+                }
+
+                const AbSpatialVector propagatedZ =
+                    adPropagateImpulseW(isInvD, float3(c2px, c2py, c2pz), motionMatrix, Z,
+                                        dofCount, qstZ);
+
+                for (uint ind = 0u; ind < 3u; ++ind)
+                    if (ind < dofCount)
+                        abStoreF32(dofData + uint64_t(ind) * PXG_AB_DOF_SIZE,
+                                   PXG_AB_DOF_mDeferredQstZ, lane, qstZ[ind]);
+
+                // trap 6: NO internal-constraint share subtracted here
+                aiStoreSV(linkData, PXG_AB_LINK_mSolverSpatialImpulse, lane,
+                          asmSVecAdd(solverSpatialImpulse, Z));
+
+                aiStoreSV(pLink, PXG_AB_LINK_mScratchImpulse, lane,
+                          asmSVecAdd(parentScratchImpulse, propagatedZ));
+                aiStoreSV(linkData, PXG_AB_LINK_mScratchImpulse, lane, AI_ZERO);
+            }
+        }
+    }
+
+    // trap 7/8: the tail — read the common node's scratch, do NOT zero it
+    const uint64_t cLink = linkBlocks + uint64_t(commonNode) * PXG_AB_LINK_SIZE;
+    const AbMatrix6x6 mat = abLoadSpatialMatrix6x6(cLink, PXG_AB_LINK_mSpatialResponseMatrix, lane);
+    const AbSpatialVector cScratch = aiLoadSV(cLink, PXG_AB_LINK_mScratchImpulse, lane);
+    const AbSpatialVector deltaV = asmM6MulVec(mat, asmSVec(-cScratch.top, -cScratch.bottom));
+
+    aiStoreSV(artiBlock, PXG_AB_mCommonLinkDeltaVelocity, lane, deltaV);
+    abStoreU32(artiBlock, PXG_AB_mLinkWithDeferredImpulse, lane, commonNode);
+}
+
+// ---------------------------------------------------------------------------
+// test entry for the partial propagate
+// ---------------------------------------------------------------------------
+struct Ai2Params
+{
+    uint64_t isSlabDirty;    // @0
+    uint64_t impulses;       // @8
+    uint64_t artiBlock;      // @16
+    uint64_t linkBlocks;     // @24
+    uint64_t dofBlocks;      // @32
+    uint64_t pathToRoot;     // @40  per-lane words: base + j*256 + lane*8
+    uint64_t io;             // @48  per-lane: scale @0, commonNode @4, dirtyFlags @8 (12 floats stride)
+    uint maxLinks;           // @56
+    uint nbArticulations;    // @60
+    uint nbSlabs;            // @64
+    uint wordSize;           // @68
+    uint nbLanes;            // @72
+    uint pad0;               // @76 -> 80
+};
+
+[[vk::push_constant]]
+ConstantBuffer<Ai2Params> gAi2;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void aiAvg2Test(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint lane = dispatchThreadId.x;
+    if (lane >= gAi2.nbLanes)
+        return;
+
+    Ptr<uint> pio = Ptr<uint>(gAi2.io + uint64_t(lane) * 12u);
+    const float scale = asfloat(pio[0]);
+    const uint commonNode = pio[1];
+    const uint dirtyFlags = pio[2];
+
+    aiAverageAndPropagate2(gAi2.isSlabDirty, gAi2.impulses, gAi2.artiBlock, gAi2.linkBlocks,
+                           gAi2.dofBlocks, lane, gAi2.maxLinks, gAi2.nbArticulations,
+                           gAi2.nbSlabs, scale, gAi2.pathToRoot, gAi2.wordSize,
+                           commonNode, dirtyFlags, lane);
 }

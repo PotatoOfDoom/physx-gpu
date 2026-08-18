@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **750/750** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **751/751** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,56 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.101a — averageLinkImpulsesAndPropagate2, der partielle Partition-Propagate
+
+Die Szene hat nach P8.100d selbst benannt, was fehlt: artiPropagateImpulses2 +
+artiPropagateVelocity.  Deren Kern ist `averageLinkImpulsesAndPropagate2`
+(articulationImpulseResponse.cuh:263-385, VOLLSTAENDIG GELESEN) — der
+PARTIELLE Propagate: statt bis zur Wurzel laeuft er den vorberechneten
+Per-Partition-Pfad nur bis zum COMMON NODE (mImpulseHoldingLink), cached
+dessen deltaV in mCommonLinkDeltaVelocity und laesst den Scratch-Impuls des
+Common Node UNPROPAGIERT liegen (ein tragender Engine-Kommentar).  Gelandet
+als `aiAverageAndPropagate2` in npArtiAvgImpulse.slang (+ svHighestBit64-
+Import aus npArtiSolveTendons), Spiegel `pxgref::aiMirror2` in
+pxgArtiRefHelpers.h, Fixture `testArtiAvgImpulse2.cpp`.
+
+Traps (Modulkopf, jede im Sweep): die Slab-Mittelung laeuft NUR unter
+dirtyFlags & eHAS_IMPULSES, Walk und Tail IMMER; kein Internal-Count-Zweig
+(Scale kommt immer vom Aufrufer); der Walk geht Wort-hoechst-zuerst und
+Bit-hoechst-zuerst; **`break` am Common Node beendet nur die Schleife des
+AKTUELLEN Worts** — niedrigere Woerter (die Vorfahren eines Common Node in
+Wort 1) werden weiterverarbeitet, die Engine-eigene Schreibweise,
+transkribiert und von der Fixture GEPINNT (225 lowerWordHits);
+`word &= ~(uint64_t(1) << bitIndex)` — der 64-Bit-Ausdruck, nie das
+32-Bit-Literal (P8.99b-Lektion, der Mutant dazu stirbt real: die Ketten
+erreichen Bit 63 in Wort 0); mSolverSpatialImpulse bucht += Z OHNE
+−ZInternalConstraint (anders als der DFS-Backprop); der Common-Node-Scratch
+wird NICHT genullt.
+
+**Fixture:** 21 Lanes, maxLinks 70 (wordSize 2), Ketten mit 60-70 Links
+(jeder 7. re-parentet auf i-3); Pfad-Bits OHNE die Wurzel (die Engine-Daten
+tragen Bit 0 nie — vgl. das assert im Velocity-Kernel); Common-Node-Rotation
+Wurzel / Wort-0-Vorfahr / Wort-1-Vorfahr (>= 64) / Ein-Hop; jede dritte Lane
+ohne eHAS_IMPULSES (Slab-Paare muessen LIVE zurueckkommen); per-Lane-Scale.
+**Erster Lauf bit-exakt** (43 Slab-Hits, 733 Walk-Hits, 0 Signed-Zeros).
+
+Sweep: **17/17 KILLED, keine Ueberlebenden** (forced-fresh): gate-always,
+gate-wrong-bit, scale-not-applied, slab-reset-dropped, words-lowest-first,
+bits-lowest-first, break-becomes-return, bitclear-32bit-literal,
+booking-dropped, child-scratch-not-zeroed, common-scratch-zeroed,
+tail-sign-dropped, tail-link-not-stored, tail-deltav-not-stored,
+qstz-not-written-back, parent-scratch-not-accumulated,
+deltaidx-stride-swapped.
+
+Suite: 751/751 ctest (672/672 Binary) in BEIDEN Memory-Modi.  Szene:
+unveraendert zu P8.100d (refused 216, artiLink 2.5777, Box 3.7329) — der
+npArtiSolveTendons-Import baute die drei gelaunchten Importer neu, ohne
+Verhaltensaenderung.  Kein Manifest-Change; die zwei Wrapper (P8.101b/c)
+folgen, dazu die vier neuen Desc-Zeiger slabDirtyMasks@96 /
+mPathToRootsPerPartition@104 / mImpulseHoldingLink@112 /
+mPartitionAverageScale@120 (aus den gepinnten Nachbarn 88 und 128
+abgeleitet; Pins folgen mit dem Wrapper-Tranche).
 
 ## P8.100d — artiSolveInternalConstraintsTGS1T ASSEMBLED (Manifest 285)
 

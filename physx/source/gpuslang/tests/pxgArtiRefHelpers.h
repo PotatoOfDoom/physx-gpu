@@ -625,6 +625,109 @@ inline void aiMirrorEx(uint32_t* isSlabDirty, float* impulses,
                        lane);
 }
 
+// ===========================================================================
+// P8.101a: the averageLinkImpulsesAndPropagate2 mirror
+// (articulationImpulseResponse.cuh:263-385) — the PARTIAL per-partition
+// propagate: slab-average (gated on eHAS_IMPULSES), then the bitfield walk
+// down to the COMMON NODE (break exits only the current word — the engine's
+// own spelling), then the cached common-node deltaV.  The hop is the same
+// aiPropagateImpulse the full walk uses; the 6x6 response goes through the
+// ENGINE's loadSpatialMatrix + PxSpatialMatrix::operator*.
+// ===========================================================================
+
+inline uint32_t aiHighestBit64(uint64_t v) { return 63u - uint32_t(__builtin_clzll(v)); }
+
+inline void aiMirror2(uint32_t* isSlabDirty, float* impulses,
+                      physx::PxgArticulationBlockData* ab,
+                      physx::PxgArticulationBlockLinkData* lk,
+                      physx::PxgArticulationBlockDofData* df, uint32_t articulationId,
+                      uint32_t maxLinks, uint32_t nbArticulations, uint32_t nbSlabs,
+                      float scale, const uint64_t* pathToRootWords, uint32_t wordSize,
+                      uint32_t commonNode, uint32_t dirtyFlags, uint32_t lane,
+                      uint32_t& slabHits, uint32_t& walkHits, uint32_t& lowerWordHits)
+{
+    using physx::Cm::UnAlignedSpatialVector;
+
+    if (dirtyFlags & 2u)   // eHAS_IMPULSES
+    {
+        const PxU32 slabStepSize = maxLinks * nbArticulations;
+        for (PxU32 s = 0, slabOffset = articulationId, di = articulationId; s < nbSlabs;
+             ++s, slabOffset += slabStepSize, di += nbArticulations)
+        {
+            const uint32_t dx = isSlabDirty[di * 2 + 0];
+            const uint32_t dy = isSlabDirty[di * 2 + 1];
+            for (PxU32 i = 0; i < 2; ++i)
+            {
+                const uint32_t dirtyIndex = (i == 0) ? dx : dy;
+                if (dirtyIndex != AI_NONE)
+                {
+                    ++slabHits;
+                    const UnAlignedSpatialVector preloadedScratchImpulse =
+                        loadSpatialVector(lk[dirtyIndex].mScratchImpulse, lane);
+                    const PxU32 deltaIdx = slabOffset + dirtyIndex * nbArticulations;
+                    float* f = impulses + size_t(deltaIdx) * 6;
+                    UnAlignedSpatialVector impulse;
+                    impulse.top = PxVec3(f[0], f[1], f[2]);
+                    impulse.bottom = PxVec3(f[3], f[4], f[5]);
+                    for (PxU32 z = 0; z < 6; ++z) f[z] = 0.0f;
+                    storeSpatialVector(lk[dirtyIndex].mScratchImpulse,
+                                       preloadedScratchImpulse + impulse * scale, lane);
+                }
+            }
+            isSlabDirty[di * 2 + 0] = AI_NONE;
+            isSlabDirty[di * 2 + 1] = AI_NONE;
+        }
+    }
+
+    for (int32_t j = int32_t(wordSize) - 1; j >= 0; --j)
+    {
+        const uint32_t bitOffset = uint32_t(j) * 64u;
+        uint64_t word = pathToRootWords[size_t(j) * 32 + lane];
+        if (word != 0)
+        {
+            while (word)
+            {
+                const uint32_t bitIndex = aiHighestBit64(word);
+                const uint32_t index = bitIndex + bitOffset;
+                if (index == commonNode)
+                    break;   // only THIS word's loop ends
+                if (bitOffset == 0 && commonNode >= 64u) ++lowerWordHits;
+                word &= ~(uint64_t(1) << bitIndex);
+
+                ++walkHits;
+                physx::PxgArticulationBlockLinkData& linkData = lk[index];
+                physx::PxgArticulationBlockDofData* dofData = &df[linkData.mJointOffset[lane]];
+                const PxU32 parent = linkData.mParents[lane];
+                const float cx = linkData.mRw_x[lane];
+                const float cy = linkData.mRw_y[lane];
+                const float cz = linkData.mRw_z[lane];
+                const PxU32 dofCount = linkData.mDofs[lane];
+
+                const UnAlignedSpatialVector Z = loadSpatialVector(linkData.mScratchImpulse, lane);
+                const UnAlignedSpatialVector parentScratchImpulse =
+                    loadSpatialVector(lk[parent].mScratchImpulse, lane);
+                const UnAlignedSpatialVector solverSpatialImpulse =
+                    loadSpatialVector(linkData.mSolverSpatialImpulse, lane);
+
+                const UnAlignedSpatialVector propagatedZ =
+                    aiPropagateImpulse(PxVec3(cx, cy, cz), dofData, Z, dofCount, lane);
+
+                storeSpatialVector(linkData.mSolverSpatialImpulse, solverSpatialImpulse + Z, lane);
+                storeSpatialVector(lk[parent].mScratchImpulse, parentScratchImpulse + propagatedZ,
+                                   lane);
+                storeSpatialVector(linkData.mScratchImpulse, UnAlignedSpatialVector::Zero(), lane);
+            }
+        }
+    }
+
+    physx::PxSpatialMatrix mat;
+    loadSpatialMatrix(lk[commonNode].mSpatialResponseMatrix, lane, mat);
+    const UnAlignedSpatialVector deltaV =
+        mat * (-loadSpatialVector(lk[commonNode].mScratchImpulse, lane));
+    storeSpatialVector(ab->mCommonLinkDeltaVelocity, deltaV, lane);
+    ab->mLinkWithDeferredImpulse[lane] = commonNode;
+}
+
 inline void aiMirror(uint32_t* isSlabDirty, float* impulses,
                      physx::PxgArticulationBlockData* ab,
                      physx::PxgArticulationBlockLinkData* lk,
