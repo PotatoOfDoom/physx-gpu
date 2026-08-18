@@ -75,8 +75,10 @@ import pxgSlangCommon;
 import pxgSlangArticulationBlocks;
 import pxgSlangSpatialMatrix;
 import pxgSlangArticulationDesc;
-import pxgSlangPrepCommon;   // PX_RIGID_BODY_FLAG_KINEMATIC
+import pxgSlangPrepCommon;   // PX_RIGID_BODY_FLAG_KINEMATIC + the patch helpers
 import pxgSlangSolverBlocks; // PxgTGSBlockSolver* + PxgArticulationBlockResponse
+import pxgSlangPrepDesc;     // PxgConstraintPrepareDescGpu + PxgBlockConstraintBatchGpu
+import pxgSlangSolverDesc;   // PxgSolverSharedDescTGSGpu
 
 public static const float ACP_MAX_F32 = 3.402823466e+38f;
 
@@ -867,4 +869,216 @@ void acpSetupTest(uint3 dispatchThreadId : SV_DispatchThreadID)
         gAcs.solverOffsetSlop, float2(gAcs.torsionalX, gAcs.torsionalY), gAcs.totalDt);
 
     pio[lane] = uint4(io.x, io.y, io.z, written);
+}
+
+// ===========================================================================
+// P8.102c: the ENGINE entry -- artiTGSContactConstraintBlockPrepareLaunch
+// (artiConstraintPrep2.cu:1388 -> artiContactConstraintBlockPrepare :1201
+//  -> artiCreateFinalizeSolverContactsBlockGPU :1114).
+//
+// TRAPS (continuing the module's numbering; each carries a sweep mutant):
+// 20. **The batch guard is nbArtiContactBatches + nbArtiStaticContactBatches
+//     + nbArtiSelfContactBatches**, and the batch index is offset by
+//     prepDesc->numBatches (the NON-articulation batch count).
+// 21. **The body index selects remappedBodyA/BIndex only for articulation
+//     node indices**; rigids read bodyA/BIndex.
+// 22. **nbContacts comes from the MATERIAL byte** (packed word & 0xFF), not
+//     from a separate count -- the P8.102b setup received it as a parameter,
+//     here it is byte 0 of contactData.w.
+// 23. **solverOffsetSlop is max(b0.offsetSlop, b1.offsetSlop)** -- the
+//     commented-out old call in the CUDA used prepDesc->solverOffsetSlop and
+//     the live one does NOT.
+// 24. **The friction-index scatter** writes createPatchIndex(descIndexBatch,
+//     lane) at edgeIndex + totalCurrentEdges * mPatchIndex[lane] -- the
+//     PREVIOUS-edge total feeds getFrictionPatches instead.
+// 25. **getFrictionPatches is gated on !(perPointFriction || disableFriction),
+//     growPatches on !disableFriction alone**; frictionPatch.broken[lane]=0
+//     always.  (The CUDA's __syncwarp() after correlate is dropped exactly as
+//     the rigid twin's port established: every lane touches only its own
+//     [lane] column, there is no cross-lane traffic to order.)
+// 26. **The post-setup writes**: patchIndex[lane] = mFrictionPatchIndex[lane],
+//     then anchorPoints[0/1] = b0.body2World.transform(body0Anchors[0/1])
+//     gated on anchorCount >= 1 / == 2 -- through BODY 0's transform, w = 0.
+// 27. **The TGS dt mapping** (:1392): invDt=stepInvDtF32, stepDt=stepDt,
+//     invTotalDt=invDtF32, totalDt=dt.
+// ===========================================================================
+
+struct AcwParams
+{
+    uint64_t prepDesc;    // PxgConstraintPrepareDesc*
+    uint64_t sharedDesc;  // PxgSolverSharedDesc<IterativeSolveDataTGS>*
+}
+
+[[vk::push_constant]]
+ConstantBuffer<AcwParams> gAcw;
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void artiTGSContactConstraintBlockPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID,
+                                                uint3 groupId : SV_GroupID)
+{
+    const uint blockStride = 64u / 32u;
+    const uint warpIndex = groupId.x * blockStride + groupThreadId.x / 32u;
+    const uint lane = groupThreadId.x & 31u;
+
+    Ptr<PxgConstraintPrepareDescGpu> prepDesc =
+        Ptr<PxgConstraintPrepareDescGpu>(gAcw.prepDesc);
+    Ptr<PxgSolverSharedDescTGSGpu> sharedDesc =
+        Ptr<PxgSolverSharedDescTGSGpu>(gAcw.sharedDesc);
+
+    // trap 20
+    const uint nbContactBatchesWithSelf = prepDesc[0].numArtiContactBatches
+        + prepDesc[0].numArtiStaticContactBatches + prepDesc[0].numArtiSelfContactBatches;
+    const uint i = warpIndex;
+    if (i >= nbContactBatchesWithSelf)
+        return;
+
+    Ptr<uint> batchIndices = Ptr<uint>(prepDesc[0].artiContactConstraintBatchIndices);
+    const uint batchIndex = batchIndices[i] + prepDesc[0].numBatches;
+
+    Ptr<PxgBlockConstraintBatchGpu> batches =
+        Ptr<PxgBlockConstraintBatchGpu>(sharedDesc[0].iter_blockConstraintBatch);
+    const uint descIndexBatch = batches[batchIndex].mConstraintBatchIndex;
+    const uint responseIndex = batches[batchIndex].mArticulationResponseIndex;
+    const uint descStride = batches[batchIndex].descStride_constraintType & 0xFFFFu;
+
+    if (lane >= descStride)
+        return;
+
+    const uint2 nodeIndexA = batches[batchIndex].bodyANodeIndex[lane];
+    const uint2 nodeIndexB = batches[batchIndex].bodyBNodeIndex[lane];
+
+    // trap 21
+    const uint bodyAIndex = nodeIndexIsArticulation(nodeIndexA)
+        ? batches[batchIndex].remappedBodyAIndex[lane] : batches[batchIndex].bodyAIndex[lane];
+    const uint bodyBIndex = nodeIndexIsArticulation(nodeIndexB)
+        ? batches[batchIndex].remappedBodyBIndex[lane] : batches[batchIndex].bodyBIndex[lane];
+
+    Ptr<PxgBlockWorkUnit> workUnits = Ptr<PxgBlockWorkUnit>(prepDesc[0].blockWorkUnit);
+    Ptr<uint2> currFrictionIndices = Ptr<uint2>(prepDesc[0].blockCurrentFrictionIndices);
+    Ptr<uint2> prevFrictionIndices = Ptr<uint2>(prepDesc[0].blockPreviousFrictionIndices);
+
+    // trap 24: PxgBlockFrictionIndex::createPatchIndex(descIndexBatch, lane)
+    const uint edgeIndex = workUnits[descIndexBatch].mEdgeIndex[lane];
+    const uint frictionIndex =
+        edgeIndex + prepDesc[0].totalCurrentEdges * workUnits[descIndexBatch].mPatchIndex[lane];
+    currFrictionIndices[frictionIndex] =
+        uint2((descIndexBatch << 5) | lane, descIndexBatch >> 27);
+
+    AcpBody b0, b1;
+    acpCreateSolverExtBody(nodeIndexA, bodyAIndex, sharedDesc[0].articulations,
+                           prepDesc[0].solverBodyDataPool, prepDesc[0].solverBodyTxIDataPool,
+                           prepDesc[0].body2WorldPool, b0);
+    acpCreateSolverExtBody(nodeIndexB, bodyBIndex, sharedDesc[0].articulations,
+                           prepDesc[0].solverBodyDataPool, prepDesc[0].solverBodyTxIDataPool,
+                           prepDesc[0].body2WorldPool, b1);
+
+    // trap 23
+    const float offsetSlop = max(b0.offsetSlop, b1.offsetSlop);
+
+    const uint forceWritebackOffset = workUnits[descIndexBatch].mWriteback[lane];
+    const float2 torsionalData = workUnits[descIndexBatch].mTorsionalFrictionData[lane];
+
+    // ---- artiCreateFinalizeSolverContactsBlockGPU (:1114) ----
+
+    Ptr<PxgBlockContactData> contactPrepPool =
+        Ptr<PxgBlockContactData>(prepDesc[0].blockContactCurrentPrepPool);
+
+    // trap 22
+    const float4 cd4 = contactPrepPool[descIndexBatch].contactData[lane];
+    const uint materialWord = asuint(cd4.w);
+    const uint nbContacts = materialWord & 0xFFu;
+    const uint flags = (materialWord >> 8) & 0xFFu;
+    const uint prevFrictionPatchCount = (materialWord >> 16) & 0xFFu;
+
+    const float4 normal4 = contactPrepPool[descIndexBatch].normal_restitutionW[lane];
+
+    // PxAlignedTransform(PxTransform): p.w = 0
+    PxgAlignedTransform bodyFrame0;
+    bodyFrame0.q = b0.b2wQ;
+    bodyFrame0.p = float4(b0.b2wP, 0.0f);
+    PxgAlignedTransform bodyFrame1;
+    bodyFrame1.q = b1.b2wQ;
+    bodyFrame1.p = float4(b1.b2wP, 0.0f);
+
+    Ptr<PxgBlockFrictionPatch> currFrictionPatches =
+        Ptr<PxgBlockFrictionPatch>(sharedDesc[0].blockCurrentFrictionPatches);
+    Ptr<PxgBlockFrictionPatch> prevFrictionPatches =
+        Ptr<PxgBlockFrictionPatch>(sharedDesc[0].blockPreviousFrictionPatches);
+    Ptr<PxgBlockFrictionAnchorPatch> currAnchors =
+        Ptr<PxgBlockFrictionAnchorPatch>(prepDesc[0].blockCurrentAnchorPatches);
+    Ptr<PxgBlockFrictionAnchorPatch> prevAnchors =
+        Ptr<PxgBlockFrictionAnchorPatch>(prepDesc[0].blockPreviousAnchorPatches);
+    Ptr<PxgBlockContactPoint> contactPrepPoints =
+        Ptr<PxgBlockContactPoint>(prepDesc[0].blockContactPoints);
+    const uint contactBase = batches[batchIndex].blockContactIndex;
+
+    correlatePatchesPtr(currFrictionPatches, descIndexBatch, nbContacts, normal4.xyz,
+                        bodyFrame0, bodyFrame1, lane);
+
+    const bool perPointFriction = (flags & PXG_SC_FLAG_PER_POINT_FRICTION) != 0;
+    const bool disableFriction = (flags & PXG_SC_FLAG_DISABLE_FRICTION) != 0;
+
+    currFrictionPatches[descIndexBatch].broken[lane] = 0;
+    float patchExtents = 0.0f;
+
+    // trap 25
+    if (!(perPointFriction || disableFriction))
+    {
+        getFrictionPatchesPtr(currFrictionPatches, descIndexBatch, currAnchors, descIndexBatch,
+                              prevFrictionIndices, prepDesc[0].blockPreviousFrictionIndices != 0,
+                              edgeIndex, prevFrictionPatches, prevAnchors, prevFrictionPatchCount,
+                              bodyFrame0, bodyFrame1, prepDesc[0].correlationDistance, lane,
+                              prepDesc[0].totalPreviousEdges, patchExtents, nbContacts);
+    }
+
+    if (!disableFriction)
+        growPatchesPtr(currFrictionPatches, descIndexBatch, currAnchors, descIndexBatch,
+                       contactPrepPoints, contactBase, nbContacts, bodyFrame0, bodyFrame1,
+                       prepDesc[0].frictionOffsetThreshold + cd4.x, lane, patchExtents);
+
+    Ptr<PxgTGSBlockSolverContactHeader> contactHeaders =
+        Ptr<PxgTGSBlockSolverContactHeader>(sharedDesc[0].iter_blockContactHeaders);
+    Ptr<PxgTGSBlockSolverFrictionHeader> frictionHeaders =
+        Ptr<PxgTGSBlockSolverFrictionHeader>(sharedDesc[0].iter_blockFrictionHeaders);
+    Ptr<PxgTGSBlockSolverContactPoint> outContactPoints =
+        Ptr<PxgTGSBlockSolverContactPoint>(sharedDesc[0].iter_blockContactPoints);
+    Ptr<PxgTGSBlockSolverContactFriction> outFrictions =
+        Ptr<PxgTGSBlockSolverContactFriction>(sharedDesc[0].iter_blockFrictions);
+    Ptr<PxgArticulationBlockResponse> responses =
+        Ptr<PxgArticulationBlockResponse>(sharedDesc[0].iter_artiResponse);
+
+    // trap 27: (stepInvDtF32, stepDt, invDtF32, dt)
+    acpSetupFinalizeExtTGS(
+        contactPrepPool, descIndexBatch,
+        contactPrepPoints, contactBase, nbContacts,
+        currFrictionPatches, descIndexBatch,
+        currAnchors, descIndexBatch,
+        b0, b1,
+        sharedDesc[0].stepInvDtF32, sharedDesc[0].stepDt, sharedDesc[0].invDtF32,
+        prepDesc[0].bounceThresholdF32, prepDesc[0].biasCoefficient,
+        lane, forceWritebackOffset, perPointFriction,
+        contactHeaders, descIndexBatch,
+        frictionHeaders, descIndexBatch,
+        outContactPoints, batches[batchIndex].startConstraintIndex,
+        outFrictions, batches[batchIndex].startFrictionIndex,
+        responses, responseIndex,
+        offsetSlop, torsionalData, sharedDesc[0].dt);
+
+    // trap 26
+    currFrictionPatches[descIndexBatch].patchIndex[lane] =
+        workUnits[descIndexBatch].mFrictionPatchIndex[lane];
+
+    if (currFrictionPatches[descIndexBatch].anchorCount[lane] >= 1u)
+    {
+        const float3 a0 = currAnchors[descIndexBatch].body0Anchors0[lane].xyz;
+        currFrictionPatches[descIndexBatch].anchorPoints0[lane] =
+            float4(quatRotate(b0.b2wQ, a0) + b0.b2wP, 0.0f);
+    }
+    if (currFrictionPatches[descIndexBatch].anchorCount[lane] == 2u)
+    {
+        const float3 a1 = currAnchors[descIndexBatch].body0Anchors1[lane].xyz;
+        currFrictionPatches[descIndexBatch].anchorPoints1[lane] =
+            float4(quatRotate(b0.b2wQ, a1) + b0.b2wP, 0.0f);
+    }
 }

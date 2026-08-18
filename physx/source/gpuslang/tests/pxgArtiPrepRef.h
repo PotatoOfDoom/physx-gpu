@@ -556,6 +556,226 @@ inline uint32_t refSetupExtContactsTGS(
     return responsesWritten;
 }
 
+// ---------------------------------------------------------------------------
+// P8.102c: the friction-patch helpers of artiCreateFinalizeSolverContactsBlockGPU
+// on the ENGINE structs, over the engine's own PX_CUDA_CALLABLE
+// PxAlignedTransform arithmetic (correlatePatches / getFrictionPatches /
+// growPatches, contactConstraintBlockPrep.cuh).  The optional out-flags are
+// COVERAGE instrumentation only -- they change nothing observable.
+// ---------------------------------------------------------------------------
+
+inline void refCorrelatePatches(PxgBlockFrictionPatch& fp, uint32_t lane, uint32_t nbContacts,
+                                const PxVec3& normal, const PxAlignedTransform& bf0,
+                                const PxAlignedTransform& bf1)
+{
+    if (nbContacts > 0)
+    {
+        const PxVec3 b0n = bf0.rotateInv(normal);
+        const PxVec3 b1n = bf1.rotateInv(normal);
+        fp.contactID[0][lane] = 0xff;
+        fp.contactID[1][lane] = 0xff;
+        fp.body0Normal[lane] = make_float4(b0n.x, b0n.y, b0n.z, 0.f);
+        fp.body1Normal[lane] = make_float4(b1n.x, b1n.y, b1n.z, 0.f);
+        fp.anchorCount[lane] = 0;
+        fp.broken[lane] = 0;
+    }
+}
+
+inline bool refPointsAreClose(const PxAlignedTransform& body1ToBody0, const float4& la0,
+                              const float4& la1, const float4& axis, float correlDist)
+{
+    const float4 p1 = body1ToBody0.transform(la1);
+    const PxVec3 d(la0.x - p1.x, la0.y - p1.y, la0.z - p1.z);
+    return PxAbs(d.dot(PxVec3(axis.x, axis.y, axis.z))) < correlDist;
+}
+
+inline void refGetFrictionPatches(PxgBlockFrictionPatch& curr, PxgBlockFrictionAnchorPatch& currA,
+                                  uint32_t lane, const PxU64* prevIndices, bool hasPrevIndices,
+                                  uint32_t prevFrictionStartIndex,
+                                  const PxgBlockFrictionPatch* prevPatches,
+                                  const PxgBlockFrictionAnchorPatch* prevAnchors,
+                                  uint32_t frictionPatchCount, const PxAlignedTransform& bf0,
+                                  const PxAlignedTransform& bf1, float correlationDistance,
+                                  uint32_t totalNbEdges, float& patchExtents, uint32_t nbContacts,
+                                  bool* inherited = nullptr)
+{
+    if (prevFrictionStartIndex == 0xFFFFFFFFu || frictionPatchCount == 0 || !hasPrevIndices)
+        return;
+
+    for (uint32_t a = 0; a < frictionPatchCount; ++a)
+    {
+        const PxU64 index = prevIndices[prevFrictionStartIndex + a * totalNbEdges];
+        const uint32_t oldThreadId = uint32_t(index & 31u);
+        const uint32_t patchIndex = uint32_t(index >> 5);
+
+        const PxgBlockFrictionPatch& oldP = prevPatches[patchIndex];
+        const PxgBlockFrictionAnchorPatch& oldA = prevAnchors[patchIndex];
+
+        if (oldP.broken[oldThreadId] == 0)
+        {
+            const float4 oldBody0Normal = oldP.body0Normal[oldThreadId];
+            const float4 curr0N = curr.body0Normal[lane];
+            if (oldBody0Normal.x * curr0N.x + oldBody0Normal.y * curr0N.y
+                    + oldBody0Normal.z * curr0N.z > 0.999f)   // PXC_SAME_NORMAL
+            {
+                const uint32_t anchorCount = oldP.anchorCount[oldThreadId];
+                if (anchorCount != 0)
+                {
+                    if (anchorCount <= nbContacts)
+                    {
+                        const PxAlignedTransform body1ToBody0 = bf0.transformInv(bf1);
+                        const float4 oldBody1Normal = oldP.body1Normal[oldThreadId];
+                        const float4 rot = body1ToBody0.rotate(oldBody1Normal);
+                        if (oldBody0Normal.x * rot.x + oldBody0Normal.y * rot.y
+                                + oldBody0Normal.z * rot.z > 0.999f)
+                        {
+                            const float4 b0a0 = oldA.body0Anchors[0][oldThreadId];
+                            const float4 b1a0 = oldA.body1Anchors[0][oldThreadId];
+                            if (anchorCount == 0 ||
+                                refPointsAreClose(body1ToBody0, b0a0, b1a0, oldBody0Normal,
+                                                  correlationDistance))
+                            {
+                                const float4 b0a1 = oldA.body0Anchors[1][oldThreadId];
+                                const float4 b1a1 = oldA.body1Anchors[1][oldThreadId];
+                                if (anchorCount < 2 ||
+                                    refPointsAreClose(body1ToBody0, b0a1, b1a1, oldBody0Normal,
+                                                      correlationDistance))
+                                {
+                                    curr.contactID[0][lane] = 0xff;
+                                    curr.contactID[1][lane] = 0xff;
+                                    curr.anchorCount[lane] = anchorCount;
+                                    curr.body0Normal[lane] = oldBody0Normal;
+                                    curr.body1Normal[lane] = oldBody1Normal;
+                                    currA.body0Anchors[0][lane] = b0a0;
+                                    currA.body0Anchors[1][lane] = b0a1;
+                                    currA.body1Anchors[0][lane] = b1a0;
+                                    currA.body1Anchors[1][lane] = b1a1;
+                                    const float ex = b0a0.x - b0a1.x;
+                                    const float ey = b0a0.y - b0a1.y;
+                                    const float ez = b0a0.z - b0a1.z;
+                                    patchExtents = ex * ex + ey * ey + ez * ez;
+                                    if (inherited) *inherited = true;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+inline void refGrowPatches(PxgBlockFrictionPatch& fp, PxgBlockFrictionAnchorPatch& fa,
+                           uint32_t lane, const PxgBlockContactPoint* contacts,
+                           uint32_t contactBase, uint32_t numContacts,
+                           const PxAlignedTransform& bf0, const PxAlignedTransform& bf1,
+                           float frictionOffsetThreshold, float anchorSqDistance,
+                           bool* keptTwo = nullptr)
+{
+    PxVec3 boundsMin(PX_MAX_F32), boundsMax(-PX_MAX_F32);
+    for (uint32_t i = 0; i < numContacts; ++i)
+    {
+        const float4 cp = contacts[contactBase + i].point_separationW[lane];
+        boundsMin = boundsMin.minimum(PxVec3(cp.x, cp.y, cp.z));
+        boundsMax = boundsMax.maximum(PxVec3(cp.x, cp.y, cp.z));
+    }
+
+    uint32_t oldAnchorCount = fp.anchorCount[lane];
+    if (oldAnchorCount == 2)
+    {
+        const PxVec3 dims = boundsMax - boundsMin;
+        const float diagSq = dims.dot(dims);
+        if ((anchorSqDistance * 4.f) >= diagSq)
+        {
+            if (keptTwo) *keptTwo = true;
+            return;
+        }
+        oldAnchorCount = 0;
+    }
+
+    PxVec3 worldAnchor0(0.f), worldAnchor1(0.f);
+    uint32_t contactID0 = 0, contactID1 = 0;
+    uint32_t anchorCount = 0;
+    float pointDistSq = 0.f;
+
+    if (oldAnchorCount == 1)
+    {
+        const float4 a0 = fa.body0Anchors[0][lane];
+        worldAnchor0 = bf0.transform(PxVec3(a0.x, a0.y, a0.z));
+        contactID0 = 0xFF;
+        anchorCount++;
+    }
+
+    const float eps = 1e-8f;
+    for (uint32_t j = 0; j < numContacts; ++j)
+    {
+        const float4 wp4 = contacts[contactBase + j].point_separationW[lane];
+        if (wp4.w < frictionOffsetThreshold)
+        {
+            const PxVec3 worldPoint(wp4.x, wp4.y, wp4.z);
+            if (anchorCount == 0)
+            {
+                contactID0 = j & 0xFFFFu;
+                worldAnchor0 = worldPoint;
+                anchorCount++;
+            }
+            else if (anchorCount == 1)
+            {
+                const PxVec3 d = worldPoint - worldAnchor0;
+                pointDistSq = d.dot(d);
+                if (pointDistSq > eps)
+                {
+                    contactID1 = j;
+                    worldAnchor1 = worldPoint;
+                    anchorCount++;
+                }
+            }
+            else
+            {
+                const PxVec3 d0v = worldPoint - worldAnchor0;
+                const PxVec3 d1v = worldPoint - worldAnchor1;
+                const float dist0 = d0v.dot(d0v);
+                const float dist1 = d1v.dot(d1v);
+                if (dist0 > dist1)
+                {
+                    if (dist0 > pointDistSq)
+                    {
+                        contactID1 = j & 0xFFFFu;
+                        worldAnchor1 = worldPoint;
+                        pointDistSq = dist0;
+                    }
+                }
+                else if (dist1 > pointDistSq)
+                {
+                    contactID0 = j & 0xFFFFu;
+                    worldAnchor0 = worldPoint;
+                    pointDistSq = dist1;
+                }
+            }
+        }
+    }
+
+    if (anchorCount == 2)
+    {
+        const PxVec3 lp0 = bf0.transformInv(worldAnchor1);
+        const PxVec3 lp1 = bf1.transformInv(worldAnchor1);
+        fa.body0Anchors[1][lane] = make_float4(lp0.x, lp0.y, lp0.z, 0.f);
+        fa.body1Anchors[1][lane] = make_float4(lp1.x, lp1.y, lp1.z, 0.f);
+        fp.contactID[1][lane] = contactID1;
+    }
+    if (anchorCount >= 1 && oldAnchorCount == 0)
+    {
+        const PxVec3 lp0 = bf0.transformInv(worldAnchor0);
+        const PxVec3 lp1 = bf1.transformInv(worldAnchor0);
+        fa.body0Anchors[0][lane] = make_float4(lp0.x, lp0.y, lp0.z, 0.f);
+        fa.body1Anchors[0][lane] = make_float4(lp1.x, lp1.y, lp1.z, 0.f);
+        fp.contactID[0][lane] = contactID0;
+    }
+
+    fp.anchorCount[lane] = anchorCount;
+}
+
 #endif  // PXG_ARTI_PREP_REF_FLOAT_ONLY
 
 }  // namespace pxgtest

@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **754/754** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **755/755** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,82 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.102c — artiTGSContactConstraintBlockPrepareLaunch ASSEMBLED (Manifest 288)
+
+Der Bogen schliesst: der Dispatcher
+artiCreateFinalizeSolverContactsBlockGPU (:1114-1189), das
+Block-Prepare-Template (:1201-1378, dieses Fenster VOLLSTAENDIG gelesen)
+und der extern-Wrapper (:1388) sind als EIN Engine-Entry in
+npArtiConstraintPrep.slang gelandet — Komposition aus P8.102a
+(acpCreateSolverExtBody), den gehoisteten Patch-Helfern
+(correlate/get/growPatchesPtr aus pxgSlangPrepCommon) und P8.102b
+(acpSetupFinalizeExtTGS), modelliert nach dem Rigid-Zwilling
+(constraintPrepTGS.slang), dessen Desc-Mirrors
+(PxgConstraintPrepareDescGpu / PxgSolverSharedDescTGSGpu /
+PxgBlockConstraintBatchGpu / PxgBlockWorkUnit) restlos ausreichten —
+NULL neue ABI-Konstanten.  ABI-Zeile kTwoPtr {8,8}; Launch grid
+ceil(nbBatches/2) x (32,2,1) (ARTI_CONSTRAINT_PREPARE = 64).
+`ccdMaxSeparation` ist im TGS-Setup-Overload ein TOTER Parameter (nur
+PGS nutzt ihn :214/:348) — P8.102b hatte also nichts verpasst.
+
+Traps 20-27 im Modulkopf: der Batch-Guard summiert contact+static+SELF;
+batchIndex += numBatches (der NICHT-Arti-Offset); remappedBodyA/BIndex
+NUR fuer Arti-Nodes; nbContacts kommt aus dem MATERIAL-Byte (nicht als
+Parameter); solverOffsetSlop = max(b0,b1).offsetSlop (der auskommentierte
+Alt-Call las prepDesc->solverOffsetSlop — der lebende NICHT); der
+FrictionIndex-Scatter schreibt (descIndexBatch<<5)|lane bei edgeIndex +
+totalCURRENTEdges*mPatchIndex waehrend getFrictionPatches mit
+totalPREVIOUSEdges laeuft; die Gates (perPoint||disable vs. disable);
+die Post-Writes patchIndex + anchorPoints[0/1] durch BODY-0s Transform;
+das dt-Mapping (stepInvDtF32, stepDt, invDtF32, dt).  Das __syncwarp()
+nach correlate ist wie im Rigid-Port gedroppt (nur [lane]-Spalten,
+kein Cross-Lane-Verkehr).
+
+**Fixture** (`testArtiConstraintPrepWrap.cpp`): ECHTE Engine-Descs
+(PxgConstraintPrepareDesc 304 B, PxgSolverSharedDesc<IterativeSolveDataTGS>
+224 B, per static_assert gepinnt) mit Device-Pointern gefuellt, der Rest
+Poison; VOLLER Host-Mirror: refCreateExtBody + NEU
+refCorrelatePatches/refGetFrictionPatches/refGrowPatches (pxgArtiPrepRef.h,
+ueber die PX_CUDA_CALLABLE PxAlignedTransform-Arithmetik der Engine — ein
+echtes Orakel fuer die Patch-Kette) + refSetupExtContactsTGS + die
+Post-Writes via PxTransform::transform.  4 lebende Batches (2 contact + 1
+static + 1 self) hinter Rigid-Offset 3, batchIndices permutiert,
+descStride 26/13/32/7, 3 Bloecke = 6 Warps (2 pinnen den Guard).
+Engineerte Friction-Cache-Lanes auf desc 1: Vererbung mit keep-two,
+Vererbung mit Rebuild (Match in Prev-Slot a=1, Slot a=0 rejected),
+Ein-Anker-Vererbung (grows keep-one-add-one-Pfad), vier Reject-Gruende
+(broken / Normal / anchorCount>nbContacts / pointsAreClose) und eine
+perPoint-Lane MIT passendem Cache, die das Gate pinnt — alles
+coverage-asserted.  Alle ACHT Ausgabepuffer byte-verglichen (+-0
+gezaehlt: 44).
+
+Drei Fixture-Lektionen aus dem ersten Anlauf: (1) die
+responseIndex-Fenster der Warps muessen DISJUNKT sein (Zeilen teilen
+sich Spalten — ueberlappende Fenster racen zwischen Warps); (2)
+EDGE_BASE[0] != 0, sonst ist edgeIndex == lane und der
+prevStart-not-edge-Mutant eine Identitaet; (3) eine Gate-Pin-Lane
+braucht GECLUSTERTE Kontakte, sonst verwirft growPatches das illegal
+Geerbte und baut bit-identisch neu.
+
+Sweep: **19/19 KILLED** (17 im ersten Lauf; die zwei Ueberlebenden
+starben nach den Fixture-Haertungen (2)+(3)): guard-no-self,
+offset-dropped (rc=139), arti-uses-plain-index, rigid-uses-remapped,
+friction-index-prev-edges, patch-index-scatter-swapped,
+offsetslop-b0-only, nbcontacts-wrong-byte, prevcount-wrong-byte
+(rc=139), broken-not-zeroed, getpatches-gate-widened, grow-gate-dropped,
+prevstart-not-edge, setup-invdt-crossed, setup-totaldt-stepdt,
+contactbase-zero, patchindex-post-write-dropped, anchorpoints-through-b1,
+anchorpoints-gate-eq1.
+
+Suite: **755/755 ctest (676/676 Binary) in BEIDEN Memory-Modi.**
+Manifest 287 -> **288**; build-sdk neu gebaut; Szene: Refused-Liste
+214 -> **213** (artiTGSContactConstraintBlockPrepareLaunch raus; das
+verbleibende artiContactConstraintBlockPrepareLaunch ist der
+PGS-Zwilling), Launch-Trace **420x OK** ueber die 240 Frames, artiLink
+final y=2.5777 unveraendert.  Die Companion-Box braucht als naechstes
+den Joint-Prep (artiTGSJointConstraintBlockPrepareParallelLaunch :1964)
+und die Solve/Output-Kette (artiSolveBlockPartition, artiOutputVelocity).
 
 ## P8.102b — das TGS-Ext-Kontakt-Row-Setup, und der FUENFTE Upstream-Bug-Kandidat
 
