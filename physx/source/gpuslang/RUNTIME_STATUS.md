@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **738/738** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **739/739** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,51 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.97c — `setupMimicJoints`, the shared propagate pair, and the poison-size lesson
+
+internalConstraints2.cu:354-657 — the third and last setup body
+`setupInternalConstraintLaunch1T` composes: `setupMimicJoints` (:617) over
+`getImpulseSelfResponseMimicJoints` (:411 same-path, :480 cross-path) and
+the path-to-root bitfield walks.  A module tranche
+(`npArtiSetupMimic.slang`): manifest stays **281**, suite 738 → **739**
+green in both memory modes, forced-fresh.  Sweep **13/13**, no survivors.
+ZERO new ABI — every field down to the bitfield stack and mDeferredQstZ was
+already mapped.
+
+**The oracle is the full engine pair, host-called.**  Unlike the tendon
+family (P8.97b's transcribed hops), the mimic responses call the SHARED
+DyCpuGpuArticulation.h `propagateImpulseW` (:494) and
+`propagateAccelerationW` (:549), which are host-callable — so the fixture
+computes every response scalar by calling the engine's own functions plus
+`computeRecipMimicJointEffectiveInertia`, bit for bit.  Strongest oracle
+since P8.81 for a solve-side body.
+
+**Trap 1, and why the shared pair needed its own port:** the shared
+`propagateImpulseW` sums per-dof terms first and adds YChildW at the END
+((t1+t2)+Z), where the ad* module (articulationDynamic.cuh) computes
+Z+t1+t2 — different rounding.  `mjPropagateImpulseShared` transcribes the
+shared order; reusing `adPropagateImpulse` is up to a few ULP off and the
+fixture sees it.  The acceleration side IS bit-equal to
+`adPropagateAccelerationWEx` for zero-seeded accumulators, and is reused.
+
+**The poison-size lesson (one first-run survivor, then killed):** the
+`root-skip-dropped` mutant translates an impulse by the root link's rw —
+which the fixture had left at 0xAB byte poison.  0xAB float bit patterns
+are ~1e-12: the translation contribution vanished below rounding and the
+mutant was an identity AT FIXTURE SCALE.  Unread-by-design fields need
+LARGE sentinels to keep poison discipline visible; with rw = (7.5, -3.25,
+9.0) on the root the mutant dies.  Joins P8.96a (thresholds) and P8.97b
+(call order) in the fixture-scale family.
+
+Other facts pinned by the sweep: the A→root walk is top-word-down,
+highest-bit-first, root (bit 0) skipped; root→B is word-0-up,
+lowest-bit-first; mDeferredQstZ is zeroed on entry AND exit over
+mTotalDofs (the scratch contract — observable state per P8.95a/P8.97b);
+recipEffectiveInertia = rAA + g*(rAB+rBA) + g*g*rBB with the gearRatio
+squared on the BB term only.  Scenes: unchanged by construction (nothing
+launched changed); next is P8.97d, the wrapper
+`setupInternalConstraintLaunch1T` (:1200-1266) → manifest 282.
 
 ## P8.97b — the tendon setups, and TWO new bit-exactness spelling rules
 
