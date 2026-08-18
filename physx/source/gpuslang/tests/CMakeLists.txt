@@ -1339,6 +1339,7 @@ add_executable(gpuslang-tests
     testArtiSumBatches2.cpp
     testArtiSumSelfBatches.cpp
     testArtiSetupInternal.cpp
+    testArtiSetupTendons.cpp
     testNpSbTet.cpp
     testNpSbSelf.cpp
     testNpSbSb.cpp
@@ -1571,7 +1572,7 @@ foreach(suite scan radixSort radixSortDesc radixSortGather preIntegration integr
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout particleSelfCollision newArticulations dmaArtiResidual artiBlockLayout artiJointFrame artiJcalcPhaseA artiJcalcPhaseB1 artiJcalcPhaseB2 artiJcalcPhaseB3 artiJcalcPhaseC artiJcalcTendons artiJcalcGpuDirty artiJcalcInit artiJcalcLinkVel artiUnconstrainedVel artiSpatialInertia artiSpatialInertiaLaunch artiSpatialMatrix artiSpatialMatrixBlockIo artiPropagateInertia artiArticulatedInertia artiArticulatedInertiaLaunch artiDynamic artiMassMatrixWrite artiMassMatrixZeroWalk artiMassMatrixBody artiMassMatrixLaunch artiJointFriction artiTranslateInertiaMass artiLinkAcceleration artiAccelerationLaunch artiDmaBack artiStepAlgebra artiStepQuatProbe artiStepRotVecProbe artiStepSphGuardProbe artiFlushVelocity artiAvgImpulse artiStepKernel artiSleepCheck artiUpdateBodies2 artiSumBatches1 artiSumBatches2 artiSumSelfBatches artiSetupInternal)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout particleSelfCollision newArticulations dmaArtiResidual artiBlockLayout artiJointFrame artiJcalcPhaseA artiJcalcPhaseB1 artiJcalcPhaseB2 artiJcalcPhaseB3 artiJcalcPhaseC artiJcalcTendons artiJcalcGpuDirty artiJcalcInit artiJcalcLinkVel artiUnconstrainedVel artiSpatialInertia artiSpatialInertiaLaunch artiSpatialMatrix artiSpatialMatrixBlockIo artiPropagateInertia artiArticulatedInertia artiArticulatedInertiaLaunch artiDynamic artiMassMatrixWrite artiMassMatrixZeroWalk artiMassMatrixBody artiMassMatrixLaunch artiJointFriction artiTranslateInertiaMass artiLinkAcceleration artiAccelerationLaunch artiDmaBack artiStepAlgebra artiStepQuatProbe artiStepRotVecProbe artiStepSphGuardProbe artiFlushVelocity artiAvgImpulse artiStepKernel artiSleepCheck artiUpdateBodies2 artiSumBatches1 artiSumBatches2 artiSumSelfBatches artiSetupInternal artiSetupTendons)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")

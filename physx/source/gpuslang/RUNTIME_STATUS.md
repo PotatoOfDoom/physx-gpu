@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **737/737** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **738/738** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,69 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.97b — the tendon setups, and TWO new bit-exactness spelling rules
+
+internalConstraints2.cu:824-1198 plus the link-pair impulse-response family
+(:95 fast, :658 slow, :787 dispatcher) — the second of the three setup
+bodies `setupInternalConstraintLaunch1T` composes.  A module tranche:
+manifest stays **281**, suite 737 → **738** green in both memory modes,
+forced-fresh.  Sweep **20/20 after one fixture fix**, no survivors.  The
+groundwork (committed separately): the ITC output-block map (18 offsets +
+4224 stride, generated and pinned), the two descriptor pointers at 200/224
+P8.82 skipped, and the DY constants.  With those, ZERO new ABI — and the
+P8.70 width lesson fired again before first run: `mLinkIndex` is
+**PxU16[32]** in both the attachment and tendon-joint blocks; a U32 read
+picks up the neighbour lane.
+
+**Two additions to the bit-exactness rulebook, both measured against the
+oracle mirror rather than assumed:**
+
+1. **`dot()` / `cross()` intrinsics escape the NoContraction stamp.**  They
+   compile to OpDot/OpCross, which the spv_nocontract pass does not
+   decorate, and llvmpipe lowers them with fused multiply-adds — 1-2 ULP
+   off the engine's component spelling.  Every dot and cross on a bit-exact
+   path must use the spelled-out `asmDot`/`asmCross` (which is what the
+   P8.86 layer always did; this module was the first to slip an intrinsic
+   in).
+2. **`PxVec3::operator/` is RECIPROCAL-MULTIPLY** (`f = 1/f; x*f, y*f,
+   z*f` — PxVec3.h:219), not a true division.  The tendon axis
+   normalisation `dif / distance` written as a real divide diverged up to
+   ~48 ULP after the slow-path walks compounded it.  Any PxVec3-by-scalar
+   division a kernel performs must be transcribed as the reciprocal
+   multiply.
+
+The `WriteToTempQstZ`/`ReadFromTempQstZ` policies (the slow path's per-dof
+scratch) became a load of `mTmpQstZ` into the qstZ[3] array around the SAME
+P8.90 `ad*` calls — the .cuh policies accumulate the identical
+`jf - innerProduct` term, so no propagate body was transcribed a second
+time.  The fixture drives all four dispatch combinations (spatial/fixed ×
+TGS/PGS) over trees with a branch link, and compares EVERY buffer
+byte-for-byte — the mTmpQstZ scratch the slow path leaves behind included,
+which is what made the last surviving mutant killable.
+
+### The always-slow survivor, and what it taught about observable state
+
+Forcing the dispatcher to the slow path is bit-identical in its RETURNED
+deltaVs for a direct parent-child pair (the negation algebra is exact:
+`-((-i0) + Z1')` and `i0 - Z1'` round to the same bits, and round-to-nearest
+is sign-symmetric).  What differs is the SCRATCH: slow zeroes and rewrites
+every dof's mTmpQstZ, fast leaves it alone.  The first sweep's fixture
+processed a slow leaf LAST in every tendon, so the mutant's extra scratch
+was re-zeroed and erased before the readback — the mutant survived on
+call-ORDER, not on values.  With the fast leaf moved to the end of the DFS
+(att3 under the non-leaf, so it pops last), the mutant's trailing slow call
+leaves different scratch and dies.  The lesson joins P8.95a's family:
+observable state includes what a function LEAVES BEHIND, and the fixture
+must order calls so the last writer differs.
+
+Also in the sweep: the sub-millimetre attachment case (world distance
+exactly 4e-4, constructible because both points rotate with the same quat)
+that makes the `> 0.001` threshold mutation fire — at the original
+distances a 0.001 → 0 mutation was an identity, the P8.96a scale lesson in
+millimetres.  Scenes: unchanged by construction (nothing launched changed);
+next is P8.97c, the mimic-joint setup family (:354-657), then the wrapper →
+manifest 282.
 
 ## P8.97a+ — the clamp-rule corpus audit: 286 sites, 6 confirmed, 7 fixed
 

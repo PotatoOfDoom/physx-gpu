@@ -393,7 +393,8 @@ public void stSetupSpatialTendons(uint64_t artiBlock, uint64_t linkBase, uint64_
 
         accumLength[parent] = offset * coefficient;
 
-        const uint rAttachmentLinkIndex = abU32(attachmentBlock, PXG_AB_AT_mLinkIndex, lane);
+        // mLinkIndex is PxU16[32] -- a U32 read here picks up the neighbour lane
+        const uint rAttachmentLinkIndex = abU16(attachmentBlock, PXG_AB_AT_mLinkIndex, lane);
         const uint64_t rAttachmentLink = linkBase
                                        + uint64_t(rAttachmentLinkIndex) * PXG_AB_LINK_SIZE;
         const PxgTransform28 rB2w = stLoadPose(rAttachmentLink, PXG_AB_LINK_mAccumulatedPose, lane);
@@ -412,7 +413,7 @@ public void stSetupSpatialTendons(uint64_t artiBlock, uint64_t linkBase, uint64_
 
             const uint64_t attachment = attachmentBlock + uint64_t(child) * PXG_AB_AT_SIZE;
 
-            const uint linkInd = abU32(attachment, PXG_AB_AT_mLinkIndex, lane);
+            const uint linkInd = abU16(attachment, PXG_AB_AT_mLinkIndex, lane);
             const uint64_t cLink = linkBase + uint64_t(linkInd) * PXG_AB_LINK_SIZE;
 
             // trap 3: the CHILD's cfm alone
@@ -427,17 +428,20 @@ public void stSetupSpatialTendons(uint64_t artiBlock, uint64_t linkBase, uint64_
             if (parent == 0u)
             {
                 dif = rAttachPoint - cAttachPoint;
-                const float distanceSq = dot(dif, dif);
+                const float distanceSq = asmDot(dif, dif);
                 distance = sqrt(distanceSq);
 
                 // trap 9: the 0.001 threshold
-                rAxis = distance > 0.001f ? (dif / distance) : float3(0.0f, 0.0f, 0.0f);
-                rRaXn = cross(rRa, rAxis);
+                // PxVec3::operator/ is RECIPROCAL-MULTIPLY (f = 1/f; x*f...),
+                // not a true divide -- the CUDA runs that exact spelling
+                const float rInv = 1.0f / distance;
+                rAxis = distance > 0.001f ? (dif * rInv) : float3(0.0f, 0.0f, 0.0f);
+                rRaXn = asmCross(rRa, rAxis);
             }
             else
             {
                 const uint64_t pAttachment = attachmentBlock + uint64_t(parent) * PXG_AB_AT_SIZE;
-                const uint pLinkInd = abU32(pAttachment, PXG_AB_AT_mLinkIndex, lane);
+                const uint pLinkInd = abU16(pAttachment, PXG_AB_AT_mLinkIndex, lane);
                 const uint64_t pLink = linkBase + uint64_t(pLinkInd) * PXG_AB_LINK_SIZE;
 
                 const PxgTransform28 pB2w = stLoadPose(pLink, PXG_AB_LINK_mAccumulatedPose, lane);
@@ -445,7 +449,7 @@ public void stSetupSpatialTendons(uint64_t artiBlock, uint64_t linkBase, uint64_
                 const float3 pAttachPoint = pB2w.p() + ra;
 
                 dif = pAttachPoint - cAttachPoint;
-                const float distanceSq = dot(dif, dif);
+                const float distanceSq = asmDot(dif, dif);
                 distance = sqrt(distanceSq);
             }
 
@@ -462,9 +466,10 @@ public void stSetupSpatialTendons(uint64_t artiBlock, uint64_t linkBase, uint64_
             else
             {
                 // trap 2: only leaves emit constraints
-                const float3 axis = distance > 0.001f ? (dif / distance)
+                const float lInv = 1.0f / distance;   // PxVec3::operator/ spelling
+                const float3 axis = distance > 0.001f ? (dif * lInv)
                                                       : float3(0.0f, 0.0f, 0.0f);
-                const float3 rbXn = cross(rb, axis);
+                const float3 rbXn = asmCross(rb, axis);
 
                 const AbSpatialVector axis0 = asmSVec(rAxis, rRaXn);
                 const AbSpatialVector axis1 = asmSVec(-axis, -rbXn);
@@ -474,8 +479,8 @@ public void stSetupSpatialTendons(uint64_t artiBlock, uint64_t linkBase, uint64_
                                       deltaV0, deltaV1, artiBlock, linkBase, dofBlocks, lane);
 
                 // trap 6: explicit dot pairs, minus
-                const float r0 = dot(deltaV0.bottom, rAxis) + dot(deltaV0.top, rRaXn);
-                const float r1 = dot(deltaV1.bottom, axis) + dot(deltaV1.top, rbXn);
+                const float r0 = asmDot(deltaV0.bottom, rAxis) + asmDot(deltaV0.top, rRaXn);
+                const float r1 = asmDot(deltaV1.bottom, axis) + asmDot(deltaV1.top, rbXn);
 
                 const float unitResponse = r0 - r1;
 
@@ -568,7 +573,8 @@ public void stSetupFixedTendons(uint64_t artiBlock, uint64_t linkBase, uint64_t 
         uint numConstraints = 0u;
 
         // trap 11: the root link pose, loaded once before the loop
-        const uint sLinkIndex = abU32(tjBlock, PXG_AB_TJ_mLinkIndex, lane);
+        // mLinkIndex is PxU16[32] here too
+        const uint sLinkIndex = abU16(tjBlock, PXG_AB_TJ_mLinkIndex, lane);
         const uint64_t sLink = linkBase + uint64_t(sLinkIndex) * PXG_AB_LINK_SIZE;
         const PxgTransform28 sB2w = stLoadPose(sLink, PXG_AB_LINK_mAccumulatedPose, lane);
 
@@ -586,7 +592,7 @@ public void stSetupFixedTendons(uint64_t artiBlock, uint64_t linkBase, uint64_t 
 
             const uint tjAxis = abU32(tj, PXG_AB_TJ_mAxis, lane);
 
-            const uint cLinkInd = abU32(tj, PXG_AB_TJ_mLinkIndex, lane);
+            const uint cLinkInd = abU16(tj, PXG_AB_TJ_mLinkIndex, lane);
             const uint64_t cLink = linkBase + uint64_t(cLinkInd) * PXG_AB_LINK_SIZE;
 
             // trap 3: max(parent link, child link) here
@@ -618,7 +624,7 @@ public void stSetupFixedTendons(uint64_t artiBlock, uint64_t linkBase, uint64_t 
                     const PxgTransform28 parentPose =
                         stLoadPose(cLink, PXG_AB_LINK_mParentPose, lane);
                     const PxgTransform28 cA2w = transformTransform(sB2w, parentPose);
-                    const float3 ang0 = cross(cA2w.p() - sB2w.p(), worldMotionVector.bottom);
+                    const float3 ang0 = asmCross(cA2w.p() - sB2w.p(), worldMotionVector.bottom);
                     sAxis = worldMotionVector.bottom;
                     sRaXn = ang0;
                 }
@@ -638,7 +644,7 @@ public void stSetupFixedTendons(uint64_t artiBlock, uint64_t linkBase, uint64_t 
                 const PxgTransform28 childPose = stLoadPose(cLink, PXG_AB_LINK_mChildPose, lane);
                 const PxgTransform28 cB2wJoint = transformTransform(cB2w, childPose);
                 axis = worldMotionVector.bottom;
-                rbXn = cross(cB2wJoint.p() - cB2w.p(), axis);
+                rbXn = asmCross(cB2wJoint.p() - cB2w.p(), axis);
             }
 
             const AbSpatialVector axis0 = asmSVec(sAxis, sRaXn);
@@ -648,8 +654,8 @@ public void stSetupFixedTendons(uint64_t artiBlock, uint64_t linkBase, uint64_t 
             stImpulseSelfResponse(sLinkIndex, cLinkInd, axis0, axis1,
                                   deltaV0, deltaV1, artiBlock, linkBase, dofBlocks, lane);
 
-            const float r0 = dot(deltaV0.bottom, sAxis) + dot(deltaV0.top, sRaXn);
-            const float r1 = dot(deltaV1.bottom, axis) + dot(deltaV1.top, rbXn);
+            const float r0 = asmDot(deltaV0.bottom, sAxis) + asmDot(deltaV0.top, sRaXn);
+            const float r1 = asmDot(deltaV1.bottom, axis) + asmDot(deltaV1.top, rbXn);
 
             const float unitResponse = r0 - r1;
 
