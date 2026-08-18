@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **752/752** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **753/753** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,58 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.102a — die PxgSolverExtBody2-Schicht des Arti-Constraint-Prep
+
+Die Szene benannte artiContactConstraintPrepare als einzigen verbleibenden
+Launch-Fehler; der Kernel dahinter ist
+artiTGSContactConstraintBlockPrepareLaunch (artiConstraintPrep2.cu:1388,
+Datei 1968 Zeilen — ein Mehr-Tranchen-Bogen).  P8.102a landet die
+Fundament-Schicht: createPxgSolverExtBody (:55-134, BEIDE Arme),
+createImpulseResponseVector (:136), projectVelocity/projectAngular
+(:152/:157), getImpulseResponse (:162) als `acp*`-Funktionen im neuen Modul
+`npArtiConstraintPrep.slang` (NOCONTRACT).  Die MATHEMATIK dieser Schicht
+war als Phase-1-Batterie npArtiExtBody.slang (abstrahierte Flat-Inputs)
+laengst portiert — P8.102a ist der Lift auf die ECHTEN Layouts; die
+Fetches sind die neue Oberflaeche.
+
+Traps (Modulkopf, jede im Sweep): der Arti-Arm indiziert den RECORD-Pool
+mit solverBodyIndex, die Link-Arrays mit articulationLinkId (High-Word >>
+1); linkBody2Worlds ist ein 28-Byte-PxTransform-Array (q@0, p@16),
+spatialResponseMatrixW 144-Byte-PxSpatialMatrix, motionVelocities 24-Byte,
+links das 80-Byte-PxgArticulationLink-Array (penBiasClamp@12,
+offsetSlop@60); Arti-maxImpulse ist PX_MAX_F32 (das Engine-eigene TODO);
+ein STATISCHER Rigid ueberspringt die Velocity/penBias/invMass-Loads,
+liest aber flags/maxImpulse UND bodyFrames; static ODER kinematic nullt
+die ganze 6x6-Response, nur ein lebender Dynamic baut sie ueber
+PxSpatialMatrix::initialize (Masse auf der oberen rechten Diagonale, die
+sqrt-Inertia im unteren linken 3x3); createImpulseResponseVector laesst
+Artikulationen UND Kinematics unveraendert, ein Dynamic mappt den TOP durch
+multiplyInertia; projectVelocity ist das PLAIN-Dot, nicht das Dual-Produkt.
+
+**Fixture** (`testArtiConstraintPrepBody.cpp`): DAS ORAKEL IST DIE ENGINE —
+PxSpatialMatrix::initialize / multiplyInertia / operator* sind
+PX_CUDA_CALLABLE und werden auf dem Host AUFGERUFEN; nur der
+createPxgSolverExtBody-Kontrollfluss ist transkribiert.  26 Lanes ueber
+eine gemischte Node-Tabelle (Arti-Links aus 6 Records mit echten
+Per-Record-Device-Arrays; dynamische, STATISCHE (Poison-Velocity-Felder
+duerfen nie durchschlagen) und KINEMATISCHE (Poison-txIData) Rigids);
+70 Ausgabefelder pro Lane, bitweise; der Slack-Schwanz bleibt beidseitig
+Poison.  Ein Fixture-Bau-Fehler beim ersten Anlauf (io-Stride 64 < 70
+geschriebene Felder — Host-Heap-Korruption, per gdb attribuiert, Stride
+72) — danach **bit-exakt ueber alle 26 Lanes**.
+
+Sweep: **16/16 KILLED, keine Ueberlebenden** (forced-fresh):
+b2w-index-crossed, b2w-pq-swapped, record-6x6-transposed, penbias-not-w,
+offsetslop-off-by-one, arti-maximpulse-zero, mv-halves-swapped,
+static-loads-anyway, kinematic-response-built, mass-diagonal-topleft,
+inertia-transposed, rigid-linkindex-zero, respvec-kinematic-mapped,
+multiplyinertia-first-row-wrong, projv-dual, rigid-cfm-not-zero.
+
+Suite: 753/753 ctest (674/674 Binary) in BEIDEN Memory-Modi.  Kein
+Manifest-Change; als naechstes P8.102b (das TGS-Kontakt-Row-Setup
+:617-1113) und P8.102c (Dispatcher + Block-Prepare-Template + Wrapper ->
+Manifest 288).
 
 ## P8.101b/c — das averageDeltaV-Paar ASSEMBLED (Manifest 287)
 
