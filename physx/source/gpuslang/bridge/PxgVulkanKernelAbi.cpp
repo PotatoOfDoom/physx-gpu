@@ -95,6 +95,20 @@ static const uint8_t kArtiSolveTM[] = { 8, 4, 4, 4, 1, 1 };
 //     bool doFriction)
 static const uint8_t kArtiSolveSelf[] = { 8, 8, 1, 4, 8, 1 };
 
+// internalConstraints2.cu:2841 artiSolveInternalConstraintsTGS1T(
+//     PxgArticulationCoreDesc*, PxReal dt, PxReal invDt, bool velocityIteration,
+//     PxReal elapsedTime, PxReal biasCoefficient, const PxU32* staticContactUniqueIds,
+//     const PxU32* staticJointUniqueIds, const PxgSolverSharedDesc<IterativeSolveDataTGS>*,
+//     bool doFriction, bool residualReportingEnabled, bool isExternalForceEveryStep,
+//     bool doFrictionDrivePosLimit, Dy::...::VelLimit::Enum doVelLimit,
+//     bool doStaticContactsAnd1dConstraints)
+// -> pointer @0, floats @8/@12, bool @16, floats @20/@24, three pointers
+// @32/@40/@48 (the 4-byte tail-pad after @24 realigns @32), FOUR adjacent bool
+// bytes @56..@59 (one word read in the shader), enum word @60, bool @64 =
+// 65 -> 72-byte blob.  The two UID pointers and doFriction are dead on the TGS
+// path but stay in the row.  (P8.100d)
+static const uint8_t kArtiSolveInternalTGS[] = { 8, 4, 4, 1, 4, 4, 8, 8, 8, 1, 1, 1, 1, 4, 1 };
+
 // gpusolver/src/CUDA/preIntegration.cu:
 //   initStaticKinematics(PxU32 nbStaticKinematics, PxU32 nbSolverBodies,
 //                        PxgSolverBodyData*, PxgSolverTxIData*, PxAlignedTransform*,
@@ -1247,6 +1261,13 @@ static const PxgKernelAbiRow kRows[] = {
     // directly.  Launched once per solver iteration (PxgArticulationCore.cpp).
     // doFriction is ignored on the TGS path.  (P8.99c)
     { "artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T", kArtiSolveSelf, uint32_t(sizeof(kArtiSolveSelf)) },
+    // internalConstraints2.cu:2841 artiSolveInternalConstraintsTGS1T
+    // -> the kArtiSolveInternalTGS row above.  Grid ceil(nbArticulations / 32),
+    // block (32, 1, 1) -- SOLVE_INTERNAL_CONSTRAINTS = 32, numWarpsPerBlock = 1
+    // (PxgArticulationCore.cpp:634-637, launch :699-718), once per solver
+    // iteration when the config gate (doFDPL || doStatic || velLimit != NONE)
+    // is on.  (P8.100d)
+    { "artiSolveInternalConstraintsTGS1T", kArtiSolveInternalTGS, uint32_t(sizeof(kArtiSolveInternalTGS)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

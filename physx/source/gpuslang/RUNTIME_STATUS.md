@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **749/749** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **750/750** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,85 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.100d — artiSolveInternalConstraintsTGS1T ASSEMBLED (Manifest 285)
+
+Der groesste verbleibende Solver-Body ist LIVE: der Wrapper
+(internalConstraints2.cu:2841, Template :1579-2012) komponiert die drei
+gesweepten Schichten P8.100a/b/c zu einem Kernel-Entry in
+npArtiSolveInternal.slang — Manifest 284 -> **285**, ABI-Zeile NEU
+{8,4,4,1,4,4,8,8,8,1,1,1,1,4,1} (72-Byte-Blob: Pointer @0, Floats @8/@12,
+Bool @16, Floats @20/@24, drei Pointer @32/@40/@48, VIER Bool-Bytes @56-59
+als ein Wort gelesen, Enum-Wort @60, Bool @64).
+
+**Die Komposition** (jede Zeile ein Sweep-Mutant, sofern nicht anders
+vermerkt): Record-Resolve ueber islandNodeIndices (+articulationOffset) ->
+bodySim (Stride 224) -> articulationRemapId -> 544-Byte-Record;
+Residual-Reset BEIDER Record-Akkumulatoren (@512/@524, je drei Nullen) nur
+unter residualReportingEnabled; aiAverageAndPropagate OHNE Scale unter
+eHAS_IMPULSES (der Internal-Count-Zweig — anders als der P8.99c-Kernel, der
+1/refCount uebergibt; KEIN countActiveSlabs/resetSlabCount hier, der
+CUDA-Kommentar dazu ist stale); mStateDirty = eVEL_DIRTY IMMER; der
+Root-Static-Solve unter !fixBase && doStatic (parentDeltaV = M *
+-rootDeferredZ ueber die 7-Spalten-Inverse, rootVel = link0.mMotionVelocity
++ parentDeltaV, storeParentDeltaV VOR dem Solve gefangen, constraintCounts0
+= link0.mNbStaticJoints); siSolveInternalDFS; Epilog mRootDeferredZ =
+rootDeferredZ + finalImp + No-Atomics-Residual-Akkumulation in den Record.
+erp = min(0.7, biasCoefficient) im Entry (:2852); sceneDt kommt aus dem
+DESKRIPTOR @48, nicht aus dem dt-Argument (:1766); die zwei UID-Pointer und
+doFriction sind auf dem TGS-Pfad TOT, bleiben aber in der ABI-Zeile.  Die
+Residual-Flag-Aequivalenz (der CUDA liest fuer die statischen 1D-Rows
+mContactErrorAccumulator.mCounter >= 0 statt des Template-Parameters, in der
+Engine stets synchron) ist dokumentiert wie in P8.100a.
+
+**Vorab der Hoist:** der P8.100c-DFS-Spiegel zog als
+refSolveInternalDFSLane (+ refPropImpulseNoWrite) VERBATIM nach
+pxgArtiInternalRef.h; testArtiSolveDFS.cpp wurde Nutzer und lief gruen,
+BEVOR die Launch-Fixture entstand.
+
+**Fixture** (`testArtiSolveInternalLaunch.cpp`): voller Host-Spiegel ueber
+device-residente Deskriptoren, nach dem P8.99c-Muster.  68 Artikulationen in
+3 Warps (dritter PARTIELL — der Thread-Guard), Baeume der P8.100c-Familie
+(4-6 Links, Parents {0,0,1,1,2,3}); Record-Resolve ueber ZWEI Permutationen
+(nodeId = 3g+11 mod 80, remap = 7g+3 mod 68) mit articulationOffset 7 und
+Poison davor; jointForce pro Record als Slice EINES Device-Pools (der
+Pointer wird vor dem Spiegel-Kopieren in beide Bilder gepatcht — Records
+byteweise vergleichbar); per-Warp DISJUNKTE Static-Batch-Fenster (Lanes
+verschiedener Warps schrieben sonst dieselbe Batch-Lane-Spalte); fixBase =
+(a%3==0) laesst den Root-Static-Solve aussetzen (23 Skips, 45 Laeufe, 12 mit
+lebendem Joint-Fenster); mStateDirty a%4 (34 unter eHAS_IMPULSES);
+dead-UID-Pointer als Junk-Werte (eine Dereferenz faultet); doFriction
+ABSICHTLICH != residualReporting in zwei Runden (ein gekreuztes Byte-Read
+kann nicht als Koinzidenz bestehen).  Drei Runden: posIter/residual/BEFORE/
+static/bias 0.9 (der erp-Clamp), velIter/KEIN residual (die Akkumulatoren
+muessen als 0xAB zurueckkommen)/AFTER/bias 0.5, posIter/perSubset/kein
+static/kein FDPL/VelLimit NONE.  Traversal-Stack, Records und alle Pools
+byteweise verglichen.  **Erster Lauf bit-exakt** ueber alle drei Runden.
+
+Sweep: **20/20 KILLED, keine Ueberlebenden** (forced-fresh; nur die
+Wrapper-Oberflaeche — die DFS-Interna sind P8.100c): erp-not-clamped,
+minpen-zero-always, scenedt-is-dt, remap-skipped, nodeoffset-dropped
+(rc=139), reset-always, reset-skipped, avg-gate-widened (dirty!=0 statt &2),
+veldirty-not-stored, fixbase-ignored, counts0-contacts, storepdv-dropped,
+storepdv-captured-after, rootimp-not-threaded, stack-not-sliced,
+epilogue-no-add, epilogue-max-dropped, dovellimit-as-bool,
+residual-byte-crossed, guard-dropped.
+
+Suite: 750/750 ctest (671/671 Binary) in BEIDEN Memory-Modi.  Hinweis: der
+ERSTE Default-Lauf endete rc=139 (Absturz irgendwo nach npCvxBvhGlue_glue,
+gepufferte stdout verlor den genauen Test) und reproduzierte sich weder im
+zeilengepufferten Sofort-Rerun (671/671) noch im V2-Lauf — Task #29
+(intermittierender, unattribuierter Fault, bisher nur unter ctest -j4)
+erweitert um den ersten SERIELLEN Treffer; die Absturzregion ist die
+npCvx*-Batterie, nicht der Artikulations-Code.
+
+Szene: refused **217 -> 216** (dieser Kernel verlaesst die Liste), 240
+Steps, rc wie zuvor PARTIAL.  Der artiLink bewegt sich erstmals durch den
+Internal-Solve: final y=2.5777 (zuvor exakt 2.500; |v|=0, im Rest-Band —
+die Impuls-Propagation haengt noch aus, s.u.).  Companion-Box unveraendert
+3.7329.  Die Szene benennt die naechste Arbeit selbst:
+artiPropagateImpulses2 (PxgArticulationCore.cpp:881) und
+artiPropagateVelocity (:895) — P8.101.
 
 ## P8.100c — siSolveInternalDFS: der Traversal-Stack-Walk
 

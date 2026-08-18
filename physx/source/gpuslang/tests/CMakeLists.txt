@@ -574,7 +574,7 @@ pxg_compile_shader(npArtiSolveTendons svGetVelTest svApplyImpTest svSolveSpatial
 pxg_compile_shader(npArtiSolveTMKernel artiSolveInternalTendonAndMimicJointConstraints1T)
 pxg_compile_shader(npArtiSolveExtTGS svxContactTest svx1DTest)
 pxg_compile_shader(npArtiSolveSelf ssSolveSelfTest artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T)
-pxg_compile_shader(npArtiSolveInternal siStaticTest siDofTest siDfsTest)
+pxg_compile_shader(npArtiSolveInternal siStaticTest siDofTest siDfsTest artiSolveInternalConstraintsTGS1T)
 pxg_compile_shader(npPairMgmtBda removeContactManagers_Stage1 removeContactManagers_Stage2 removeContactManagers_Stage3 removeContactManagers_Stage4 removeContactManagers_Stage5 removeContactManagers_Stage5_CvxTri)
 # P6.2: PBD particle spatial-hash grid build + reorder on the engine ABI (BDA).
 # Both kernels read the PxgParticleSystem descriptor array through Ptr<> and
@@ -1359,6 +1359,7 @@ add_executable(gpuslang-tests
     testArtiSolveStatic.cpp
     testArtiSolveDof.cpp
     testArtiSolveDFS.cpp
+    testArtiSolveInternalLaunch.cpp
     testNpSbTet.cpp
     testNpSbSelf.cpp
     testNpSbSb.cpp
@@ -1591,7 +1592,7 @@ foreach(suite scan radixSort radixSortDesc radixSortGather preIntegration integr
         broadphaseClearNewFlag broadphaseAggregateBounds broadphaseAggregateDirty
         broadphaseAggregatePairsAdd broadphaseAggregateFinalize broadphaseAggregatePairsRemove
         broadphaseAggregateBoxPruning broadphaseAggPairCollision broadphaseAggSelfCollision broadphaseAggSortProjections
-        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout particleSelfCollision newArticulations dmaArtiResidual artiBlockLayout artiJointFrame artiJcalcPhaseA artiJcalcPhaseB1 artiJcalcPhaseB2 artiJcalcPhaseB3 artiJcalcPhaseC artiJcalcTendons artiJcalcGpuDirty artiJcalcInit artiJcalcLinkVel artiUnconstrainedVel artiSpatialInertia artiSpatialInertiaLaunch artiSpatialMatrix artiSpatialMatrixBlockIo artiPropagateInertia artiArticulatedInertia artiArticulatedInertiaLaunch artiDynamic artiMassMatrixWrite artiMassMatrixZeroWalk artiMassMatrixBody artiMassMatrixLaunch artiJointFriction artiTranslateInertiaMass artiLinkAcceleration artiAccelerationLaunch artiDmaBack artiStepAlgebra artiStepQuatProbe artiStepRotVecProbe artiStepSphGuardProbe artiFlushVelocity artiAvgImpulse artiStepKernel artiSleepCheck artiUpdateBodies2 artiSumBatches1 artiSumBatches2 artiSumSelfBatches artiSetupInternal artiSetupTendons artiSetupMimic artiSetupICLaunch artiSolveVelImp artiSolveBodies artiSolveTMLaunch artiSolveExtTGS artiSolveSelf artiSolveSelfLaunch artiSolveStatic artiSolveDof artiSolveDFS)
+        p0Subgroup p0Bda p1DeviceV2 p1HeapAlloc npWarpLib npAtomicLib npTex3d warpNative p1PipelineCache p1Timestamps p6Indirect p3Shim p3CudaContext p3CudaContextManager p3KernelWrangler p3ContextHardening p4Manifest p4Loader p4Foundation p4Heap p4Wrangler p4Broadphase p4Aabb solverDescLayout simCoreDescLayout prepDescLayout npAbiLayout particleSelfCollision newArticulations dmaArtiResidual artiBlockLayout artiJointFrame artiJcalcPhaseA artiJcalcPhaseB1 artiJcalcPhaseB2 artiJcalcPhaseB3 artiJcalcPhaseC artiJcalcTendons artiJcalcGpuDirty artiJcalcInit artiJcalcLinkVel artiUnconstrainedVel artiSpatialInertia artiSpatialInertiaLaunch artiSpatialMatrix artiSpatialMatrixBlockIo artiPropagateInertia artiArticulatedInertia artiArticulatedInertiaLaunch artiDynamic artiMassMatrixWrite artiMassMatrixZeroWalk artiMassMatrixBody artiMassMatrixLaunch artiJointFriction artiTranslateInertiaMass artiLinkAcceleration artiAccelerationLaunch artiDmaBack artiStepAlgebra artiStepQuatProbe artiStepRotVecProbe artiStepSphGuardProbe artiFlushVelocity artiAvgImpulse artiStepKernel artiSleepCheck artiUpdateBodies2 artiSumBatches1 artiSumBatches2 artiSumSelfBatches artiSetupInternal artiSetupTendons artiSetupMimic artiSetupICLaunch artiSolveVelImp artiSolveBodies artiSolveTMLaunch artiSolveExtTGS artiSolveSelf artiSolveSelfLaunch artiSolveStatic artiSolveDof artiSolveDFS artiSolveInternalLaunch)
     add_test(NAME gpuslang.${suite} COMMAND gpuslang-tests ${suite})
     set_tests_properties(gpuslang.${suite} PROPERTIES
         ENVIRONMENT "PXG_SHADER_DIR=${SHADER_OUT_DIR}")

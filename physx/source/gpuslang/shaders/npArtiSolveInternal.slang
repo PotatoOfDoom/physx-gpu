@@ -66,8 +66,11 @@ import pxgSlangArticulationBlocks;
 import pxgSlangSpatialMatrix;
 import pxgSlangArticulationDynamic;
 import pxgSlangSolverBlocks;
+import pxgSlangArticulationDesc;
+import pxgSlangSolverDesc;
 import npArtiSolveTendons;
 import npArtiSolveExtTGS;
+import npArtiAvgImpulse;
 
 static const uint SI_BATCH_STRIDE = 1536u;   // sizeof(PxgBlockConstraintBatch)
 
@@ -828,4 +831,218 @@ void siDfsTest(uint3 groupThreadId : SV_GroupThreadID)
     fout[3] = finalImp.bottom.x; fout[4] = finalImp.bottom.y; fout[5] = finalImp.bottom.z;
     fout[6] = error.sumOfSquares; fout[7] = float(error.counter); fout[8] = error.maxError;
     fout[9] = contactError.sumOfSquares; fout[10] = float(contactError.counter); fout[11] = contactError.maxError;
+}
+
+// ===========================================================================
+// P8.100d: the kernel — artiSolveInternalConstraintsTGS1T
+// (internalConstraints2.cu:2841, template body :1579-2012), composing:
+//
+//   1. record resolve via islandNodeIndices -> bodySim -> articulations
+//   2. residual reset on BOTH record accumulators (Dy::ErrorAccumulator::
+//      reset, three zeros each) when reporting
+//   3. aiAverageAndPropagate WITHOUT scale under eHAS_IMPULSES — the CUDA
+//      calls the .cuh function with its scale default (0 -> internal-count
+//      branch), unlike the P8.99c kernel which passes 1/refCount.  No
+//      countActiveSlabs and no resetSlabCount here — those belong to the
+//      P8.99c kernel; the extern's comment claiming this kernel resets
+//      reference counts is stale, the body does not.
+//   4. mStateDirty = eVEL_DIRTY ALWAYS (for every live thread)
+//   5. the root static solve under !fixBase && doStatic: parentDeltaV =
+//      M * -rootDeferredZ (the 7-column inverse articulated inertia),
+//      rootVel = link0.mMotionVelocity + parentDeltaV, storeParentDeltaV
+//      captured BEFORE the static solve mutates parentDeltaV,
+//      constraintCounts0 = link0.mNbStaticJoints
+//   6. siSolveInternalDFS (P8.100c)
+//   7. epilogue: mRootDeferredZ = rootDeferredZ + finalImp; both residual
+//      accumulators pushed into the record with NO atomics (one thread owns
+//      the articulation): += sum, += count, max on maxError.
+//
+// Wrapper-level facts, each a sweep mutant unless marked:
+//  * erp = min(0.7, biasCoefficient), computed HERE (the extern's own line
+//    :2852); the template calls the erp parameter "biasCoefficient".
+//  * minPen = velocityIteration ? 0 : -PX_MAX_F32.
+//  * sceneDt (the per-dof solve's non-perSubset effective dt) is the
+//    DESCRIPTOR's dt at 48 — NOT the kernel's dt argument (:1766).
+//  * staticContactUniqueIds / staticJointUniqueIds are DEAD parameters (the
+//    body reads the static windows from the link blocks); doFriction is dead
+//    on the TGS path (only the PGS static overload reads it).  The ABI row
+//    still carries all three.
+//  * launch: grid ceil(nbArticulations/32), block (32,1,1)
+//    (SOLVE_INTERNAL_CONSTRAINTS = 32, numWarpsPerBlock = 1,
+//    PxgArticulationCore.cpp:634-637) — the per-warp slice index is
+//    groupId.x directly (blockIdx.x in the CUDA).
+//  * the residual flags: the record reset + epilogue + the solve bodies run
+//    under the residualReportingEnabled PARAM; the CUDA's static 1D rows
+//    read scDesc->mContactErrorAccumulator.mCounter >= 0 instead (:1462) —
+//    in the engine the two are always in sync (documented equivalence, the
+//    port passes the param through, as P8.100a did).
+// ===========================================================================
+
+struct SipParams
+{
+    uint64_t scDesc;                 // @0  PxgArticulationCoreDesc*
+    float dt;                        // @8
+    float invDt;                     // @12
+    uint velIterWord;                // @16 bool byte 0 (bridge zero-pads 17..19)
+    float elapsedTime;               // @20
+    float biasCoefficient;           // @24
+    uint pad0;                       // @28 natural-alignment hole before the pointer
+    uint64_t staticContactUniqueIds; // @32 DEAD — the body reads link-block windows
+    uint64_t staticJointUniqueIds;   // @40 DEAD
+    uint64_t sharedDesc;             // @48 PxgSolverSharedDesc<IterativeSolveDataTGS>*
+    uint solveFlagsWord;             // @56: byte0 doFriction (dead on TGS),
+                                     //      byte1 residualReportingEnabled,
+                                     //      byte2 isExternalForceEveryStep,
+                                     //      byte3 doFrictionDrivePosLimit
+    uint doVelLimit;                 // @60 VelLimit enum: 0 none / 1 before / 2 after
+    uint doStaticWord;               // @64 bool byte 0
+    uint pad1;                       // @68 -> 72 B blob
+}
+
+[[vk::push_constant]]
+ConstantBuffer<SipParams> gSip;
+
+static const uint SIP_VEL_DIRTY = 1u;      // PxgArtiStateDirtyFlag::eVEL_DIRTY
+static const uint SIP_HAS_IMPULSES = 2u;   // PxgArtiStateDirtyFlag::eHAS_IMPULSES
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void artiSolveInternalConstraintsTGS1T(uint3 groupThreadId : SV_GroupThreadID,
+                                       uint3 groupId : SV_GroupID)
+{
+    const uint64_t d = gSip.scDesc;
+    const uint lane = groupThreadId.x;
+    const uint globalThreadIndex = groupId.x * 32u + lane;   // blockStride = blockDim.x
+
+    const uint nbArticulations = artiU32Field(d, PXG_ARTI_CORE_NB_ARTICULATIONS);
+    if (globalThreadIndex >= nbArticulations)
+        return;
+
+    const bool velocityIteration = (gSip.velIterWord & 0xFFu) != 0u;
+    const bool residualReporting = ((gSip.solveFlagsWord >> 8u) & 0xFFu) != 0u;
+    const bool isExternalForceEveryStep = ((gSip.solveFlagsWord >> 16u) & 0xFFu) != 0u;
+    const bool doFrictionDrivePosLimit = ((gSip.solveFlagsWord >> 24u) & 0xFFu) != 0u;
+    const bool doStatic = (gSip.doStaticWord & 0xFFu) != 0u;
+
+    const float erp = min(0.7f, gSip.biasCoefficient);              // :2852
+    const float minPen = velocityIteration ? 0.0f : -3.402823466e+38f;  // -PX_MAX_F32
+    const float sceneDt = asfloat(artiU32Field(d, PXG_ARTI_CORE_DT));   // :1766
+
+    SvxError error = { 0.0f, 0, 0.0f };
+    SvxError contactError = { 0.0f, 0, 0.0f };
+
+    // record resolve (:1605-1610)
+    const uint articulationOffset = artiU32Field(d, PXG_ARTI_CORE_ARTICULATION_OFFSET);
+    const uint64_t islandNodeIndices = artiPtrField(d, PXG_ARTI_CORE_ISLAND_NODE_INDICES);
+    const uint2 node = (Ptr<uint2>(islandNodeIndices))[globalThreadIndex + articulationOffset];
+    const uint nodeIndex = nodeIndexIndex(node);
+    const uint64_t bodySim = artiPtrField(d, PXG_ARTI_CORE_BODY_SIM_POOL)
+                           + uint64_t(nodeIndex) * PXG_BODY_SIM_SIZE;
+    const uint articulationIndex = artiU32Field(bodySim, PXG_BODY_SIM_ARTICULATION_REMAP_ID);
+    const uint64_t a = artiPtrField(d, PXG_ARTI_CORE_ARTICULATIONS)
+                     + uint64_t(articulationIndex) * PXG_ARTI_STRIDE;
+
+    if (residualReporting)
+    {
+        // Dy::ErrorAccumulator::reset() on both record accumulators (:1614-1615)
+        Ptr<float> ir = Ptr<float>(a + PXG_ARTI_INTERNAL_RESIDUAL);
+        ir[0] = 0.0f; (Ptr<int>(a + PXG_ARTI_INTERNAL_RESIDUAL))[1] = 0; ir[2] = 0.0f;
+        Ptr<float> cr = Ptr<float>(a + PXG_ARTI_CONTACT_RESIDUAL);
+        cr[0] = 0.0f; (Ptr<int>(a + PXG_ARTI_CONTACT_RESIDUAL))[1] = 0; cr[2] = 0.0f;
+    }
+
+    const uint64_t w = uint64_t(groupId.x);   // the per-warp slice index, DIRECTLY
+    const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);
+    const uint maxDofs = artiU32Field(d, PXG_ARTI_CORE_MAX_DOFS);
+    const uint64_t artiBlock = artiPtrField(d, PXG_ARTI_CORE_ARTICULATION_BLOCKS)
+                             + w * PXG_AB_BLOCK_SIZE;
+    const uint64_t linkBase = artiPtrField(d, PXG_ARTI_CORE_LINK_BLOCKS)
+                            + w * uint64_t(maxLinks) * PXG_AB_LINK_SIZE;
+    const uint64_t dofBase = artiPtrField(d, PXG_ARTI_CORE_DOF_BLOCKS)
+                           + w * uint64_t(maxDofs) * PXG_AB_DOF_SIZE;
+
+    // averaging preamble (:1628-1632): NO scale — the internal-count branch
+    if ((abU8(artiBlock, PXG_AB_mStateDirty, lane) & SIP_HAS_IMPULSES) != 0u)
+    {
+        const uint nbSlabs = artiU32Field(d, PXG_ARTI_CORE_NB_SLABS);
+        const uint64_t slabHasChanges = artiPtrField(d, PXG_ARTI_CORE_SLAB_HAS_CHANGES);
+        const uint64_t impulses = artiPtrField(d, PXG_ARTI_CORE_IMPULSES);
+        aiAverageAndPropagate(slabHasChanges, impulses, artiBlock, linkBase, dofBase,
+                              globalThreadIndex, maxLinks, nbArticulations, nbSlabs, lane);
+    }
+    abStoreU8(artiBlock, PXG_AB_mStateDirty, lane, SIP_VEL_DIRTY);   // ALWAYS (:1633)
+
+    const bool fixBase = (abU32(artiBlock, PXG_AB_mFlags, lane) & PXG_ARTI_FLAG_FIX_BASE) != 0u;
+    const AbSpatialVector rootDeferredZ = svLoadSV(artiBlock, PXG_AB_mRootDeferredZ, lane);
+
+    const AbSpatialVector zeroSV = asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
+    AbSpatialVector parentDeltaV = zeroSV;
+    AbSpatialVector storeParentDeltaV = zeroSV;
+    AbSpatialVector parentImp = zeroSV;
+
+    Ptr<PxgSolverSharedDescTGSGpu> sharedDesc = Ptr<PxgSolverSharedDescTGSGpu>(gSip.sharedDesc);
+    const uint64_t batches = sharedDesc[0].iter_blockConstraintBatch;
+    const uint64_t contactHeaders = sharedDesc[0].iter_blockContactHeaders;
+    const uint64_t frictionHeaders = sharedDesc[0].iter_blockFrictionHeaders;
+    const uint64_t contactPoints = sharedDesc[0].iter_blockContactPoints;
+    const uint64_t frictionPoints = sharedDesc[0].iter_blockFrictions;
+    const uint64_t jointHeaders = sharedDesc[0].iter_blockJointConstraintHeaders;
+    const uint64_t jointRowsCon = sharedDesc[0].iter_blockJointConstraintRowsCon;
+    const uint64_t responses = sharedDesc[0].iter_artiResponse;
+
+    // the root static solve (:1643-1660)
+    if (!fixBase && doStatic)
+    {
+        const uint constraintCounts0 = abU32(linkBase, PXG_AB_LINK_mNbStaticJoints, lane);
+        const AbSpatialMatrix m =
+            asmLoadSpatialMatrix(artiBlock, PXG_AB_mInvSpatialArticulatedInertia, lane);
+        const AbSpatialVector motionVelocity0 = svLoadSV(linkBase, PXG_AB_LINK_mMotionVelocity, lane);
+
+        parentDeltaV = asmMulVec(m, asmSVec(-rootDeferredZ.top, -rootDeferredZ.bottom));
+        AbSpatialVector rootVel = asmSVecAdd(motionVelocity0, parentDeltaV);
+        storeParentDeltaV = parentDeltaV;   // captured BEFORE the solve mutates parentDeltaV
+
+        siSolveStaticConstraintsTGS(linkBase, batches,
+                                    contactHeaders, frictionHeaders,
+                                    contactPoints, frictionPoints,
+                                    jointHeaders, jointRowsCon, responses,
+                                    rootVel, parentImp, parentDeltaV,
+                                    lane, minPen, gSip.elapsedTime,
+                                    residualReporting, contactError, constraintCounts0);
+    }
+
+    const uint64_t stackBase = artiPtrField(d, PXG_ARTI_CORE_TRAVERSAL_STACK)
+                             + w * uint64_t(maxLinks) * PXG_AB_TRAVERSAL_STACK_SIZE;
+    const uint64_t jointForces = artiPtrField(a, PXG_ARTI_JOINT_FORCE);
+
+    const AbSpatialVector finalImp = siSolveInternalDFS(
+        linkBase, dofBase, stackBase, jointForces,
+        batches, contactHeaders, frictionHeaders, contactPoints, frictionPoints,
+        jointHeaders, jointRowsCon, responses,
+        gSip.dt, sceneDt, gSip.invDt, gSip.elapsedTime, erp, minPen,
+        velocityIteration, isExternalForceEveryStep,
+        doFrictionDrivePosLimit, gSip.doVelLimit, doStatic,
+        storeParentDeltaV, parentImp, parentDeltaV,
+        residualReporting, error, contactError, lane);
+
+    // epilogue (:2004-2010)
+    const AbSpatialVector newRootZ = asmSVecAdd(rootDeferredZ, finalImp);
+    abStoreSpatialVector(artiBlock, PXG_AB_mRootDeferredZ, lane, newRootZ.top, newRootZ.bottom);
+
+    if (residualReporting)
+    {
+        Ptr<float> ir = Ptr<float>(a + PXG_ARTI_INTERNAL_RESIDUAL);
+        ir[0] = ir[0] + error.sumOfSquares;
+        Ptr<int> irc = Ptr<int>(a + PXG_ARTI_INTERNAL_RESIDUAL);
+        irc[1] = irc[1] + error.counter;
+        if (error.maxError > ir[2])
+            ir[2] = error.maxError;
+
+        Ptr<float> cr = Ptr<float>(a + PXG_ARTI_CONTACT_RESIDUAL);
+        cr[0] = cr[0] + contactError.sumOfSquares;
+        Ptr<int> crc = Ptr<int>(a + PXG_ARTI_CONTACT_RESIDUAL);
+        crc[1] = crc[1] + contactError.counter;
+        if (contactError.maxError > cr[2])
+            cr[2] = contactError.maxError;
+    }
 }
