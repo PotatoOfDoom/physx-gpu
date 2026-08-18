@@ -34,6 +34,9 @@
 #include "pxgRefMath.h"
 #include "PxgCudaShim.h"
 
+#define PXG_ARTI_PREP_REF_FLOAT_ONLY
+#include "pxgArtiPrepRef.h"   // computeCompliantDamping / ...CoefficientsTGS (P8.102b hoist)
+
 // engine descriptors for the ENGINE-ABI TGS contact prep test
 #include "PxNodeIndex.h" // completes PxNodeIndex for the PxgNarrowphaseCore.h chain
 #include "PxgSolverCoreDesc.h"
@@ -78,7 +81,6 @@ const uint32_t RB_SPEC_CCD = 1u << 4;
 const uint32_t SC_HAS_FORCE_THRESHOLDS = 1u << 0;
 const uint32_t SC_PER_POINT_FRICTION = 1u << 1;
 const uint32_t SC_DISABLE_FRICTION = 1u << 2;
-const uint32_t SC_COMPLIANT_ACCEL_SPRING = 1u << 3;
 
 const uint32_t DY_SC_OUTPUT_FORCE = 1u << 1;
 const uint32_t DY_SC_KEEP_BIAS = 1u << 2;
@@ -430,11 +432,6 @@ bool pointsAreClose(const AFrame& body1ToBody0, const Float4& la0, const Float4&
     return std::fabs(d.x * axis.x + d.y * axis.y + d.z * axis.z) < correlDist;
 }
 
-float computeCompliantDamping(bool isSeparated, bool collidingWithVrel, float damping)
-{
-    return (isSeparated && !collidingWithVrel) ? 0.0f : damping;
-}
-
 void queryReducedCompliantContactCoefficients(float dt, uint32_t /*flags*/, float restitution, float damping,
                                               float penetration, float /*targetVelocity*/, bool isSeparated,
                                               bool collidingWithVrel, float& coeff0, float& coeff1)
@@ -443,22 +440,6 @@ void queryReducedCompliantContactCoefficients(float dt, uint32_t /*flags*/, floa
     const float dampingIfEnabled = computeCompliantDamping(isSeparated, collidingWithVrel, damping);
     coeff0 = dt * (dampingIfEnabled - nrdt);
     coeff1 = -nrdt * penetration;
-}
-
-float computeCompliantContactCoefficientsTGS(float stepDt, uint32_t flags, float restitution, float damping,
-                                             float unitResponse, float recipResponse, bool isSeparated,
-                                             bool collidingWithVrel, float& velMultiplier, float& scaledBias)
-{
-    const bool accelSpring = (flags & SC_COMPLIANT_ACCEL_SPRING) != 0;
-    const float massIfAccelElseOne = accelSpring ? recipResponse : 1.0f;
-    const float oneIfAccelElseR = accelSpring ? 1.0f : unitResponse;
-    const float dampingIfEnabled = computeCompliantDamping(isSeparated, collidingWithVrel, damping);
-    const float nrdt = stepDt * restitution;
-    const float a = stepDt * (dampingIfEnabled - nrdt);
-    const float x = 1.0f / (a * oneIfAccelElseR + 1.0f);
-    velMultiplier = x * a * massIfAccelElseOne;
-    scaledBias = nrdt * x * oneIfAccelElseR;
-    return a;
 }
 
 float computeRecipUnitResponse(float unitResponse, float minRowResponse)

@@ -60,6 +60,11 @@
 #include "PxgSolverBody.h"
 #include "PxNodeIndex.h"
 #include "PxRigidBody.h"
+#include "PxgConstraintPrep.h"
+#include "PxgFrictionPatch.h"
+#include "PxgSolverConstraintBlock1D.h"
+#include "PxgConstraintBlock.h"
+#include "pxgArtiPrepRef.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -211,70 +216,15 @@ PXG_TEST(artiConstraintPrepBody)
     {
         PxgSolverExtBody2 b;
         const PxNodeIndex node = nodes[lane];
-        const uint32_t bi = bodyIdx[lane];
-        if (node.isArticulation())
-        {
-            const uint32_t r = bi;
-            const uint32_t linkID = node.articulationLinkId();
-            const uint32_t gi = linkBases[r] + linkID;
-            b.bodyIndex = bi;
-            b.linkIndex = PxU16(linkID);
-            b.body2World = b2w[gi];
-            b.mSpatialResponse = resp[gi];
-            b.isKinematic = false;
-            b.islandNodeIndex = node;
-            b.penBiasClamp = links[gi].penBiasClamp;
-            b.maxImpulse = PX_MAX_F32;
-            b.velocity = mv[gi];
-            b.cfm = cfms[gi];
-            b.offsetSlop = links[gi].offsetSlop;
-        }
-        else
-        {
-            const bool isStatic = node.isStaticBody();
-            const PxgSolverBodyData& solverBody = sbd[bi];
-            const bool isKinematic = (solverBody.flags & PxRigidBodyFlag::eKINEMATIC) != 0;
-            UnAlignedSpatialVector velocity(PxVec3(0.f), PxVec3(0.f));
-            PxReal penBiasClamp = -PX_MAX_F32;
-            PxReal invMass = 0.f;
-            const PxAlignedTransform body2World = frames[bi];
-            PxReal offsetSlop = 0.f;
-            if (!isStatic)
-            {
-                penBiasClamp = solverBody.penBiasClamp;
-                invMass = solverBody.invMass;
-                velocity.top = solverBody.initialAngVel;
-                velocity.bottom = solverBody.initialLinVel;
-                offsetSlop = solverBody.offsetSlop;
-            }
-            if (isStatic || isKinematic)
-                std::memset(b.mSpatialResponse.column, 0, sizeof(b.mSpatialResponse));
-            else
-                b.mSpatialResponse.initialize(txi[bi].sqrtInvInertia, invMass);
-            b.isKinematic = isKinematic;
-            b.linkIndex = PxSolverConstraintDesc::RIGID_BODY;
-            b.bodyIndex = bi;
-            b.islandNodeIndex = node;
-            b.penBiasClamp = penBiasClamp;
-            b.body2World.p = PxVec3(body2World.p.x, body2World.p.y, body2World.p.z);
-            b.body2World.q = PxQuat(body2World.q.q.x, body2World.q.q.y, body2World.q.q.z,
-                                    body2World.q.q.w);
-            b.maxImpulse = solverBody.maxImpulse;
-            b.velocity = velocity;
-            b.cfm = 0.f;
-            b.offsetSlop = offsetSlop;
-        }
+        pxgtest::refCreateExtBody(node, bodyIdx[lane], linkBases.data(), b2w.data(), resp.data(),
+                                  mv.data(), cfms.data(), links.data(), sbd.data(), txi.data(),
+                                  frames.data(), b);
 
         const UnAlignedSpatialVector probe(
             PxVec3(0.3f + 0.01f * float(lane), -0.2f, 0.5f),
             PxVec3(0.7f, 0.11f * float(lane), -0.4f));
 
-        UnAlignedSpatialVector respVec;
-        if (b.islandNodeIndex.isArticulation() || b.isKinematic)
-            respVec = probe;
-        else
-            respVec = UnAlignedSpatialVector(b.mSpatialResponse.multiplyInertia(probe.top),
-                                             probe.bottom);
+        const UnAlignedSpatialVector respVec = pxgtest::refCreateImpulseResponseVector(b, probe);
         const UnAlignedSpatialVector impResp = b.mSpatialResponse * probe;
         const float projV = b.velocity.dot(probe);
         const float projA = b.velocity.top.dot(probe.top);

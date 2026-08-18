@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **753/753** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **754/754** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,94 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.102b — das TGS-Ext-Kontakt-Row-Setup, und der FUENFTE Upstream-Bug-Kandidat
+
+`setupFinalizeExtSolverConstraintsBlock` (TGS-Overload,
+artiConstraintPrep2.cu:617-1112) ist als `acpSetupFinalizeExtTGS` (~380
+Zeilen) plus Test-Entry `acpSetupTest` in npArtiConstraintPrep.slang
+gelandet — der komplette Kontakt- und Friction-Row-Bau des
+artiTGSContactConstraintBlockPrepareLaunch.  Zwei Hoists vorweg, damit
+nichts dreifach transkribiert wird: (1) die drei Ptr-Form-Helfer
+correlatePatchesPtr/getFrictionPatchesPtr/growPatchesPtr zogen aus
+constraintPrepTGS.slang (PGS-Zwilling textidentisch, beide Datei-Lokale
+geloescht) nach pxgSlangPrepCommon.slang; (2) das Compliant-Koeffizienten-
+Trio aus testConstraintPrep.cpp und die refCreateExtBody-Helfer aus
+testArtiConstraintPrepBody.cpp in den neuen Header `pxgArtiPrepRef.h`
+(mit `PXG_ARTI_PREP_REF_FLOAT_ONLY`-Guard fuer den Float-only-Nutzer,
+dessen eigene Struct-Mirrors mit den Engine-Typen kollidieren).
+
+**Der FUENFTE Upstream-Bug-Kandidat, :837**: `cTargetVel + isGreater2 ?
+(-vrel)*restitution : 0.f` parst per C-Praezedenz als `(cTargetVel +
+(float)isGreater2) != 0 ? ... : 0` — die BEDINGUNG ist die Summe, der
+Bounce-Arm ERSETZT die Target-Velocity, sobald die Summe ungleich 0 ist,
+und ein cTargetVel != 0 OHNE Bounce waehlt trotzdem den Bounce-Arm (und
+VERWIRFT cTargetVel).  Der Rigid-Zwilling (constraintPrepTGS.slang:359)
+hat die geklammerte Form; der Arti-Pfad ausserdem `restitution > 1e-5`
+statt `> 0`.  Beides ist WOERTLICH transkribiert und per Fixture-Pins
+festgenagelt: Lane 2 (isGreater2 UND cTargetVel == -1 exakt: Summe 0 ->
+targetVelocity 0, die "reparierte" Form ergaebe 0.5) und Lane 5 (kein
+Bounce, cTargetVel 0.5: Quirk ergibt (-vrel)*rest = -0.4, die Reparatur
+0.5) — beide ueber die Mirror-eigenen Zahlen coverage-asserted, und der
+Sweep-Mutant `precedence-fixed` (die geklammerte Form) STIRBT.
+
+Weitere Traps (9-19 im Modulkopf, jede im Sweep): der contactCount==0-
+Early-Out schreibt EXAKT vier Header-Felder; der invMass-Swizzle
+(x,z,y,w); frictionHeader.biasCoefficient = invDt (NICHT invDt*p8); der
+Per-Kontakt-Slop skaliert mit max(angNorVel/linNorVel, 1) samt
+linNorVel==0-Guard (Friction-Rows nehmen den ROHEN Slop); minNormalForce
+= (Summe deltaF / count) * 0.25; Kinematics ziehen ihre PROJIZIERTE
+Velocity vom Target ab; anchorCount = aCount*2 (+1 torsional nur bei
+aCount==1 und Torsional-Daten != 0); frictionScale 0.5 bei aCount==2;
+Anchors rotieren durch die Body-Quats, error = (ra-rb)+(frame0p-frame1p);
+die Torsional-Row baut ihre Responses aus (normal, 0) OHNE Hebelarme,
+torsionalScale = max(data.y, sqrt(max(0,-minPen)*data.x)); jede Row
+appended eine PxgArticulationBlockResponse, ein Cursor ueber
+Normals -> t0/t1-Paare -> Torsional.
+
+**Zwei Plattform-Spelling-Lektionen** (Fortsetzung von P8.97b):
+`normalize()` als Intrinsic liegt auf llvmpipe 1 ULP neben JEDER
+Host-Spelling — ausgeschrieben ist es Recip-MULTIPLY (`v * (1/sqrt(m2))`),
+denn auch PxVec3s operator/ rechnet 1/f und multipliziert (der
+Divide-Versuch traf dieselben Bits wie der Member-normalize, weil BEIDE
+Host-Formen zu Recip-Multiply kollabieren).  Der Rigid-Zwilling hat das
+nie gepinnt: sein Fixture vergleicht mit 2e-4-Toleranz.  Und die
+Vorzeichen-Nullen der 6x6-Multiplikation (asmM6MulVec, Literal-Null-Seed
+vom Treiber gefaltet) schlagen hier zum ersten Mal im Arti-Pfad durch —
+P8.102a sah sie nicht, weil dessen Probe-Vektor mit POSITIVER erster
+Komponente startete; das Setup fuettert (-normal, ...) und ein statischer
+b1 liefert die Null-Matrix.  Aufloesung wie in P8.86/P8.91a: +-0 wird
+TOLERIERT und GEZAEHLT (113/77 Woerter in Runde A/B), nie still.
+
+**Fixture** (`testArtiConstraintPrepSetup.cpp`): Mirror =
+pxgtest::refSetupExtContactsTGS ueber die Engine-Structs, Bodies via
+refCreateExtBody ueber DIESELBEN Pools wie das Device (die P8.102a-
+Maschinerie, jetzt zwei Bodies pro Lane).  26 Lanes: contactCount
+0(Early-Out)/1..3, aCount lane%3, perPointFriction (lane>>1)&1 mit
+contactID != 0, Restitution nach lane%7 inkl. compliant (negativ, beide
+Accel-Spring-Flag-Zustaende) und 1e-6 (unter der 1e-5-Schwelle, Pin-Lane
+25 mit erfuellten Bounce-Bedingungen); sechs konstruierte Lanes (A/B wie
+oben, C: linNorVel == 0 exakt mit angNorVel != 0, SLOP: Skalierungsfaktor
+~360, E: Bounce mit targetVelocity 1.8 fuer den Bounce-Error-Term, D wie
+oben); zwei Runden (Torsional an/aus, bias 0.9 -> p8-Klemme auf 0.8 vs.
+0.5, verschiedene dts/Slops).  ALLE sechs Ausgabepuffer (beide Header,
+Kontakt-/Friction-Rows, Responses, io) byte-verglichen gegen Poison-
+Images; respCount pro Lane ueber io.w.
+
+Sweep: **20/20 KILLED, keine Ueberlebenden** (forced-fresh):
+early-out-narrowed, swizzle-unswizzled, fh-bias-p8, slop-unscaled,
+slop-guard-dropped, precedence-fixed, rest-threshold-zero,
+bounce-error-dropped, deltaf-clamp-dropped, min-normal-force-unquartered,
+kinematic-normal-adjust-dropped, friction-scale-dropped,
+max-impulse-uncapped, rest-distance-dropped, anchor-wrong-quat,
+error-no-reltr, perpoint-ignored, resp-cursor-stuck-t0,
+torsional-lever-arms, torsional-gate-widened.
+
+Suite: 754/754 ctest (675/675 Binary) in BEIDEN Memory-Modi; die
+Prep-Zwillinge (constraintPrepTGS/PGS) nach dem Hoist gruen.  Kein
+Manifest-Change; als naechstes P8.102c: der Dispatcher
+artiCreateFinalizeSolverContactsBlockGPU (:1114-1189) + das
+Block-Prepare-Template (:1191-1378) + der Wrapper -> Manifest 288.
 
 ## P8.102a — die PxgSolverExtBody2-Schicht des Arti-Constraint-Prep
 
