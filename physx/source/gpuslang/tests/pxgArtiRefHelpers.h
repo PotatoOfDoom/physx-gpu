@@ -492,25 +492,33 @@ inline UnAlignedSpatialVector aiPropagateImpulse(const PxVec3& parentToChild,
     return physx::Dy::FeatherstoneArticulation::translateSpatialVector(parentToChild, temp);
 }
 
-inline void aiMirror(uint32_t* isSlabDirty, float* impulses,
-                     physx::PxgArticulationBlockData* ab,
-                     physx::PxgArticulationBlockLinkData* lk,
-                     physx::PxgArticulationBlockDofData* df, uint32_t articulationId,
-                     uint32_t maxLinks, uint32_t nbArticulations, uint32_t nbSlabs, uint32_t lane,
-                     uint32_t& alignedHits, uint32_t& unalignedHits)
+// P8.99c: the Ex form carries the CUDA's `scale` parameter (default 0 = the
+// internal non-momentum-conserving count; the self-solve wrapper passes
+// 1/referenceCount from countActiveSlabs).  The old name forwards with 0.
+inline void aiMirrorEx(uint32_t* isSlabDirty, float* impulses,
+                       physx::PxgArticulationBlockData* ab,
+                       physx::PxgArticulationBlockLinkData* lk,
+                       physx::PxgArticulationBlockDofData* df, uint32_t articulationId,
+                       uint32_t maxLinks, uint32_t nbArticulations, uint32_t nbSlabs,
+                       float scaleIn, uint32_t lane,
+                       uint32_t& alignedHits, uint32_t& unalignedHits)
 {
     const PxU32 slabStepSize = maxLinks * nbArticulations;
 
-    PxReal scale = 1.0f;
-    if (nbSlabs > 1)
+    PxReal scale = scaleIn;
+    if (scaleIn == 0.0f)
     {
-        PxReal count = 0.0f;
-        for (PxU32 s = 0, di = articulationId; s < nbSlabs; ++s, di += nbArticulations)
+        scale = 1.0f;
+        if (nbSlabs > 1)
         {
-            if (isSlabDirty[di * 2 + 0] != AI_NONE || isSlabDirty[di * 2 + 1] != AI_NONE)
-                count += 1.0f;
+            PxReal count = 0.0f;
+            for (PxU32 s = 0, di = articulationId; s < nbSlabs; ++s, di += nbArticulations)
+            {
+                if (isSlabDirty[di * 2 + 0] != AI_NONE || isSlabDirty[di * 2 + 1] != AI_NONE)
+                    count += 1.0f;
+            }
+            scale = count > 1.0f ? 1.0f / count : 1.0f;
         }
-        scale = count > 1.0f ? 1.0f / count : 1.0f;
     }
 
     PxU32 maxIndex = ab->mLinkWithDeferredImpulse[lane];
@@ -615,6 +623,17 @@ inline void aiMirror(uint32_t* isSlabDirty, float* impulses,
     storeSpatialVector(lk[0].mScratchImpulse, UnAlignedSpatialVector::Zero(), lane);
     storeSpatialVector(ab->mRootDeferredZ, preloadedRootScratchImpulse + preloadedRootDeferredZ,
                        lane);
+}
+
+inline void aiMirror(uint32_t* isSlabDirty, float* impulses,
+                     physx::PxgArticulationBlockData* ab,
+                     physx::PxgArticulationBlockLinkData* lk,
+                     physx::PxgArticulationBlockDofData* df, uint32_t articulationId,
+                     uint32_t maxLinks, uint32_t nbArticulations, uint32_t nbSlabs, uint32_t lane,
+                     uint32_t& alignedHits, uint32_t& unalignedHits)
+{
+    aiMirrorEx(isSlabDirty, impulses, ab, lk, df, articulationId, maxLinks, nbArticulations,
+               nbSlabs, 0.0f, lane, alignedHits, unalignedHits);
 }
 
 // ===========================================================================

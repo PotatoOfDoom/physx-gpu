@@ -217,3 +217,31 @@ public struct PxgIslandContextGpu
     public uint mStaticRigidBatchCount; // @60
     public float mBiasCoefficient;      // @64
 }                                       // = 68 (4-aligned; the array stride)
+
+// ---------------------------------------------------------------------------
+// P8.99c: countActiveSlabs / resetSlabCount (solverBlock.cuh:84/:100) as
+// PUBLIC helpers, hoisted VERBATIM from the file-local copies the two solver
+// entry modules carry, so the articulation self-solve wrapper composes them
+// rather than adding a fourth transcription.  solverPGS/solverTGS still hold
+// their own file-local twins (unifying them means recompiling and re-verifying
+// two launched solver modules -- a follow-up cleanup, tracked in
+// RUNTIME_STATUS, not a P8.99c side effect).
+// ---------------------------------------------------------------------------
+
+public uint pxgCountActiveSlabsBda(uint index, uint numSlabs, uint numSolverBodies,
+                                   Ptr<uint> encodedReferenceCount)
+{
+    uint referenceCount = 0;
+    const uint num32Slabs = (numSlabs + 31) / 32;
+    for (uint i = 0; i < num32Slabs; ++i)
+        referenceCount += countbits(encodedReferenceCount[index + i * numSolverBodies]);
+    return max(1u, referenceCount);
+}
+
+public void pxgResetSlabCountBda(uint index, uint numSlabs, uint numSolverBodies,
+                                 Ptr<uint> encodedReferenceCount)
+{
+    const uint num32Slabs = (numSlabs + 31) / 32;
+    for (uint i = 0; i < num32Slabs; ++i)
+        encodedReferenceCount[index + i * numSolverBodies] = 0u;
+}

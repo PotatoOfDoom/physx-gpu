@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **745/745** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **746/746** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,60 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.99c — artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T ASSEMBLED (manifest 284)
+
+Der per-Iteration-Solve-Kernel Nummer eins (internalConstraints2.cu:4107, Body
+:3802-4095) ist LIVE: Manifest 283 -> **284**, ABI-Zeile {8,8,1,4,8,1}
+(desc, solverDesc, velocityIteration-Byte, elapsedTime, sharedDesc,
+doFriction-Byte), Grid ceil(nb/32) x Block (32,1,1) — ein Warp pro Block, der
+Block-Slice-Index ist blockIdx.x DIREKT.
+
+Komposition im Kernel-Entry (npArtiSolveSelf.slang, gleiche .spv wie der
+P8.99b-Block):
+* articulationReferenceCountOffset = islandContextPool[0].mBodyCount +
+  mBodyStartIndex (Ptr<PxgSolverCoreDescGpu>/@48, Ptr<PxgIslandContextGpu> —
+  die pxgSlangSolverDesc-Structs tragen die komplette ABI schon);
+* unter eHAS_IMPULSES: pxgCountActiveSlabsBda (nach pxgSlangSolverDesc
+  GEHOISTET, verbatim; solverPGS/solverTGS behalten vorerst ihre file-lokalen
+  Zwillinge — Cleanup-Task, s.u.) -> scale = 1/referenceCount ->
+  aiAverageAndPropagateEx MIT scale (der scaleIn!=0-Pfad, neu exerziert);
+* pxgResetSlabCountBda IMMER (pro Live-Thread), mStateDirty = eVEL_DIRTY immer;
+* die drei Temp-Bitfeld-Slices mit der NAMENS/ROLLEN-KREUZUNG des CUDA
+  (:3866-3868): A(pathToRootBitFieldA) = mTempSHAREDBitFieldBlocks,
+  B = mTempROOTBitFieldBlocks, common = mTempPATHTOROOTBitFieldBlocks;
+* minPen = velocityIteration ? 0 : -PX_MAX_F32; accumulateError = der
+  SIGNED PxI32 bei CONTACT_ERROR_ACC+4 >= 0; doFriction wird auf dem
+  TGS-Pfad IGNORIERT (die ABI-Zeile traegt das Byte trotzdem);
+* dann ssSolveSelfConstraints mit den iter_*-Pointern aus
+  PxgSolverSharedDescTGSGpu (@96..216).
+
+**Fixture** (`testArtiSolveSelfLaunch.cpp`) — VOLLER Host-Mirror ueber
+device-residente Deskriptoren (die P8.98c-Anordnung): drei Warps, der dritte
+PARTIELL (68 Artikulationen); nbSlabs=34, also ZWEI Reference-Count-Woerter;
+refCountOffset = 5+9 = 14 bewusst nicht null; mStateDirty-Modi a%4;
+per-Warp-Skalar-Batchfenster (3@1 / 2@4 / 1@6) in EINEM globalen Batch-Array
+mit Poison-Enden; MAX_LINKS=65 -> wordSize=2 (Slice-Pitch-Mutanten sind
+toetbar, s. Sweep); eine Artikulation mit komplett leeren Count-Zeilen (der
+max(1,.)-Klemm-Zweig); zwei Runden (pos: minPen=-MAX/mCounter=+3;
+vel: minPen=0/mCounter=-1 — 1D-Residuen muessen POISON bleiben).
+Mirror-Bausteine, jeder fuer sich schon gesweept: countActiveSlabs/reset
+(8 Zeilen transkribiert), pxgref::aiMirrorEx (die averageLinkImpulses-
+AndPropagate-Spiegelung, um den scale-Parameter erweitert, alter Name
+forwardet mit 0), pxgtest::refSolveSelfLane (aus testArtiSolveSelf.cpp nach
+pxgArtiSelfRef.h gehoistet — Parametrisierung ist der ganze Diff; das
+P8.99b-Fixture ist jetzt USER).  **Erster Lauf bit-exakt**, alle 19 Puffer,
+beide Runden; Coverage asserted (Kontakt 38 / 1D 31 Batches, hasImpulses 34,
+ref>1 33, geklemmt 1, word1-Hops 28, equal 14, emptyB 31, inactive 95).
+
+Sweep (Wrapper-Oberflaeche): **14/14 KILLED** (count-offset-dropped, reset-offset-dropped, scale-zero, stride-nbarti, reset-under-dirty, veldirty-conditional, linkslice-no-pitch, tmpslice-no-wordsize, tmpAB-swapped, minpen-inverted, elapsed-zero, errcounter-unsigned, island-field-swap, wordsize-hardcoded); Restore gruen
+
+Suite: 746/746 ctest (667/667 Binary) in BEIDEN Memory-Modi.  Szene: refused 218 -> **217** (der TGS-Kernel launcht, 1200x OK = 240 Frames x 5 Solver-Iterationen, gleicher Takt wie der TM-Kernel), 240 Steps komplett, artiLink weiter exakt y=2.500; der noch refusede Namensvetter ist der PGS-Zwilling artiPropagateRigidImpulsesAndSolveSelfConstraints1T (Wrangler-Lookup, die TGS-Szene launcht ihn nie).
+
+Cleanup-Backlog: die file-lokalen countActiveSlabsBda/resetSlabCountBda-
+Kopien in solverPGS.slang und solverTGS.slang auf die pxgSlangSolverDesc-
+Publics umziehen (aendert zwei gelaunchte Solver-Module — eigener Tranche-
+Schritt mit deren Suiten, nicht ein P8.99c-Nebeneffekt).
 
 ## P8.99b — ssSolveSelfConstraints: der Self-Constraint-Solve-Block (Suite 745)
 

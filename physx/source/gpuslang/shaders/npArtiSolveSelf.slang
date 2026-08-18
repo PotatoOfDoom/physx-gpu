@@ -98,8 +98,11 @@ import pxgSlangArticulationBlocks;
 import pxgSlangSpatialMatrix;
 import pxgSlangArticulationDynamic;
 import pxgSlangSolverBlocks;
+import pxgSlangArticulationDesc;
+import pxgSlangSolverDesc;
 import npArtiSolveTendons;
 import npArtiSolveExtTGS;
+import npArtiAvgImpulse;
 
 static const uint SS_ARTI_CONTACT = 3u;      // PxgSolverConstraintDesc::eARTICULATION_CONTACT
 static const uint SS_BATCH_STRIDE = 1536u;   // sizeof(PxgBlockConstraintBatch), pinned by the P8.99a fixture
@@ -402,5 +405,132 @@ void ssSolveSelfTest(uint3 groupThreadId : SV_GroupThreadID)
                            gSs.contactPoints, gSs.frictionPoints,
                            gSs.jointHeaders, gSs.jointRowsCon, gSs.responses,
                            gSs.elapsedTime, gSs.minPen, gSs.accumulateError != 0u,
+                           lane);
+}
+
+// ===========================================================================
+// P8.99c: the kernel — artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T
+// (internalConstraints2.cu:4107, the TGS extern; body :3802-4095).
+//
+// Launch: grid ceil(nbArticulations/32), block (32,1,1) — ONE warp per block
+// (PxgArticulationCore.cpp's SOLVE_INTERNAL_CONSTRAINTS = 32), so the
+// per-warp block-slice index is groupId.x DIRECTLY, exactly as the CUDA
+// indexes mArticulationBlocks[blockIdx.x].
+//
+// Wrapper-level facts, each a sweep mutant unless marked:
+//  * articulationReferenceCountOffset = islandContextPool[0].mBodyCount +
+//    mBodyStartIndex; the reference-count rows for articulations start THERE,
+//    and numTotalBodies (the row stride) adds nbArticulations on top.
+//  * countActiveSlabs/scale run ONLY under eHAS_IMPULSES; resetSlabCount runs
+//    ALWAYS (for every live thread); mStateDirty = eVEL_DIRTY always.
+//  * scale = 1/referenceCount is PASSED to aiAverageAndPropagateEx — passing 0
+//    would enter the CUDA's internal-count default branch, a different number.
+//  * the three temp bitfield slices come from three DIFFERENT desc pointers
+//    whose names cross their roles: A(=pathToRootBitFieldA in the CUDA) is
+//    mTempSHAREDBitFieldBlocks, B is mTempROOTBitFieldBlocks, common is
+//    mTempPATHTOROOTBitFieldBlocks (:3866-3868).
+//  * minPen = velocityIteration ? 0 : -PX_MAX_F32; elapsedTime is the TGS
+//    accumulated time; doFriction is IGNORED on the TGS path (the CUDA's
+//    solveConstraints TGS overload never reads it) — the ABI row still
+//    carries the byte.
+//  * accumulateError = scDesc->mContactErrorAccumulator.mCounter >= 0 — the
+//    PxI32 at CONTACT_ERROR_ACC + 4, compared SIGNED.
+// ===========================================================================
+
+struct SskParams
+{
+    uint64_t desc;        // @0  PxgArticulationCoreDesc*
+    uint64_t solverDesc;  // @8  PxgSolverCoreDesc*
+    uint velIterWord;     // @16 bool byte 0 (bridge zero-pads 17..19)
+    float elapsedTime;    // @20
+    uint64_t sharedDesc;  // @24 PxgSolverSharedDesc<IterativeSolveDataTGS>*
+    uint doFrictionWord;  // @32 bool byte 0 — unused on the TGS path
+    uint pad0;            // @36
+}
+
+[[vk::push_constant]]
+ConstantBuffer<SskParams> gSsk;
+
+static const uint SSK_VEL_DIRTY = 1u;      // PxgArtiStateDirtyFlag::eVEL_DIRTY
+static const uint SSK_HAS_IMPULSES = 2u;   // PxgArtiStateDirtyFlag::eHAS_IMPULSES
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T(uint3 groupThreadId : SV_GroupThreadID,
+                                                            uint3 groupId : SV_GroupID)
+{
+    const uint64_t d = gSsk.desc;
+    const uint lane = groupThreadId.x;
+    const uint globalThreadIndex = groupId.x * 32u + lane;   // blockStride = blockDim.x
+
+    const uint nbArticulations = artiU32Field(d, PXG_ARTI_CORE_NB_ARTICULATIONS);
+    if (globalThreadIndex >= nbArticulations)
+        return;
+
+    const uint nbSlabs = artiU32Field(d, PXG_ARTI_CORE_NB_SLABS);
+
+    const bool velocityIteration = (gSsk.velIterWord & 0xFFu) != 0u;
+    const float minPen = velocityIteration ? 0.0f : -3.402823466e+38f;  // -PX_MAX_F32
+
+    const uint64_t w = uint64_t(groupId.x);   // the per-warp slice index, DIRECTLY
+    const uint64_t artiBlock = artiPtrField(d, PXG_ARTI_CORE_ARTICULATION_BLOCKS)
+                             + w * PXG_AB_BLOCK_SIZE;
+    const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);
+    const uint maxDofs = artiU32Field(d, PXG_ARTI_CORE_MAX_DOFS);
+    const uint64_t linkBase = artiPtrField(d, PXG_ARTI_CORE_LINK_BLOCKS)
+                            + w * uint64_t(maxLinks) * PXG_AB_LINK_SIZE;
+    const uint64_t dofBase = artiPtrField(d, PXG_ARTI_CORE_DOF_BLOCKS)
+                           + w * uint64_t(maxDofs) * PXG_AB_DOF_SIZE;
+
+    Ptr<PxgSolverCoreDescGpu> solverDesc = Ptr<PxgSolverCoreDescGpu>(gSsk.solverDesc);
+    Ptr<PxgIslandContextGpu> island = Ptr<PxgIslandContextGpu>(solverDesc[0].islandContextPool);
+    const uint articulationReferenceCountOffset = island[0].mBodyCount + island[0].mBodyStartIndex;
+    const uint numTotalBodies = articulationReferenceCountOffset + nbArticulations;
+
+    Ptr<PxgSolverSharedDescTGSGpu> sharedDesc = Ptr<PxgSolverSharedDescTGSGpu>(gSsk.sharedDesc);
+    Ptr<uint> encodedRefCount = Ptr<uint>(sharedDesc[0].iter_solverEncodedReferenceCount);
+
+    const uint dirtyState = abU8(artiBlock, PXG_AB_mStateDirty, lane);
+    if (dirtyState != 0u)
+    {
+        if ((dirtyState & SSK_HAS_IMPULSES) != 0u)
+        {
+            const uint referenceCount = pxgCountActiveSlabsBda(articulationReferenceCountOffset + globalThreadIndex, nbSlabs, numTotalBodies, encodedRefCount);
+            const float scale = 1.0f / float(referenceCount);
+            const uint64_t slabHasChanges = artiPtrField(d, PXG_ARTI_CORE_SLAB_HAS_CHANGES);
+            const uint64_t impulses = artiPtrField(d, PXG_ARTI_CORE_IMPULSES);
+            aiAverageAndPropagateEx(slabHasChanges, impulses, artiBlock, linkBase, dofBase,
+                                    globalThreadIndex, maxLinks, nbArticulations, nbSlabs,
+                                    scale, lane);
+        }
+    }
+
+    // ALWAYS, for every live thread (:3855)
+    pxgResetSlabCountBda(articulationReferenceCountOffset + globalThreadIndex, nbSlabs, numTotalBodies, encodedRefCount);
+
+    abStoreU8(artiBlock, PXG_AB_mStateDirty, lane, SSK_VEL_DIRTY);
+
+    const uint wordSize = (maxLinks + 63u) / 64u;
+    const uint64_t linkBitFields = artiPtrField(d, PXG_ARTI_CORE_PATH_TO_ROOT_BITFIELD_BLOCKS)
+        + w * uint64_t(maxLinks) * uint64_t(wordSize) * PXG_AB_BITFIELD_STACK_SIZE;
+    // the role/name crossing — see the header note
+    const uint64_t tmpA = artiPtrField(d, PXG_ARTI_CORE_TEMP_SHARED_BITFIELD_BLOCKS) + w * uint64_t(wordSize) * PXG_AB_BITFIELD_STACK_SIZE;
+    const uint64_t tmpB = artiPtrField(d, PXG_ARTI_CORE_TEMP_ROOT_BITFIELD_BLOCKS) + w * uint64_t(wordSize) * PXG_AB_BITFIELD_STACK_SIZE;
+    const uint64_t tmpCommon = artiPtrField(d, PXG_ARTI_CORE_TEMP_PATH_TO_ROOT_BITFIELD_BLOCKS) + w * uint64_t(wordSize) * PXG_AB_BITFIELD_STACK_SIZE;
+
+    const bool accumulateError = int(artiU32Field(d, PXG_ARTI_CORE_CONTACT_ERROR_ACC + 4u)) >= 0;
+
+    ssSolveSelfConstraints(artiBlock, linkBase, dofBase,
+                           linkBitFields, tmpA, tmpB, tmpCommon,
+                           wordSize,
+                           sharedDesc[0].iter_blockConstraintBatch,
+                           sharedDesc[0].iter_blockContactHeaders,
+                           sharedDesc[0].iter_blockFrictionHeaders,
+                           sharedDesc[0].iter_blockContactPoints,
+                           sharedDesc[0].iter_blockFrictions,
+                           sharedDesc[0].iter_blockJointConstraintHeaders,
+                           sharedDesc[0].iter_blockJointConstraintRowsCon,
+                           sharedDesc[0].iter_artiResponse,
+                           gSsk.elapsedTime, minPen, accumulateError,
                            lane);
 }

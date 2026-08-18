@@ -89,6 +89,12 @@ static const uint8_t kArtiSetupInternal[] = { 8, 4, 4, 4, 1 };
 // isTGS in byte 1 -- the P8.83 two-bool arrangement).  (P8.98c)
 static const uint8_t kArtiSolveTM[] = { 8, 4, 4, 4, 1, 1 };
 
+// internalConstraints2.cu:4107 artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T(
+//     PxgArticulationCoreDesc*, const PxgSolverCoreDesc*, const bool velocityIteration,
+//     const PxReal elapsedTime, const PxgSolverSharedDesc<IterativeSolveDataTGS>*,
+//     bool doFriction)
+static const uint8_t kArtiSolveSelf[] = { 8, 8, 1, 4, 8, 1 };
+
 // gpusolver/src/CUDA/preIntegration.cu:
 //   initStaticKinematics(PxU32 nbStaticKinematics, PxU32 nbSolverBodies,
 //                        PxgSolverBodyData*, PxgSolverTxIData*, PxAlignedTransform*,
@@ -1235,6 +1241,12 @@ static const PxgKernelAbiRow kRows[] = {
     // when the config gate mDoSpatialTendonsFixedTendonsMimicJoints is on.
     // (P8.98c)
     { "artiSolveInternalTendonAndMimicJointConstraints1T", kArtiSolveTM, uint32_t(sizeof(kArtiSolveTM)) },
+    // internalConstraints2.cu:4107 artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T
+    // -> the kArtiSolveSelf row above.  Grid ceil(nbArticulations / 32), block
+    // (32, 1, 1) -- one warp per block, the per-warp slice index is blockIdx.x
+    // directly.  Launched once per solver iteration (PxgArticulationCore.cpp).
+    // doFriction is ignored on the TGS path.  (P8.99c)
+    { "artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T", kArtiSolveSelf, uint32_t(sizeof(kArtiSolveSelf)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)
