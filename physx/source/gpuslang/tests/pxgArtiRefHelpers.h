@@ -471,6 +471,91 @@ inline void fvMirror(physx::PxgArticulationBlockData* ab,
     }
 }
 
+// P8.105: the EIGHT-argument PxcFsFlushVelocity overload
+// (forwardDynamic2.cu:3990) -- fvMirror minus the two mSolverSpatialDeltaVel
+// accumulations, plus the solver outVelocity writes (linear at [i], angular
+// at [i + offset], w = 0).
+inline void fvMirrorOut(physx::PxgArticulationBlockData* ab,
+                        physx::PxgArticulationBlockLinkData* lk,
+                        physx::PxgArticulationBlockDofData* df, uint32_t linkCount, bool fixBase,
+                        uint32_t lane, float4* outVelocity, uint32_t offset)
+{
+    UnAlignedSpatialVector deltaV = UnAlignedSpatialVector::Zero();
+    const UnAlignedSpatialVector deferredZ = -loadSpatialVector(ab->mRootDeferredZ, lane);
+
+    if (!fixBase)
+    {
+        const UnAlignedSpatialVector motionVelocity0 = loadSpatialVector(lk[0].mMotionVelocity,
+                                                                         lane);
+
+        physx::Dy::SpatialMatrix invInertia;
+        loadSpatialMatrix(ab->mInvSpatialArticulatedInertia, lane, invInertia);
+
+        deltaV = invInertia * deferredZ;
+
+        const UnAlignedSpatialVector vel = motionVelocity0 + deltaV;
+
+        outVelocity[0] = make_float4(vel.bottom.x, vel.bottom.y, vel.bottom.z, 0.f);
+        outVelocity[offset] = make_float4(vel.top.x, vel.top.y, vel.top.z, 0.f);
+
+        storeSpatialVector(lk[0].mMotionVelocity, vel, lane);
+        storeSpatialVector(ab->mRootDeferredZ, UnAlignedSpatialVector::Zero(), lane);
+    }
+
+    storeSpatialVector(lk[0].mScratchDeltaV, deltaV, lane);
+    storeSpatialVector(lk[0].mConstraintForces,
+                       loadSpatialVector(lk[0].mConstraintForces, lane) + deferredZ, lane);
+    storeSpatialVector(ab->mCommonLinkDeltaVelocity, UnAlignedSpatialVector::Zero(), lane);
+
+    physx::PxgArticulationBlockDofData* dofs = df;
+
+    if (linkCount > 1)
+    {
+        UnAlignedSpatialVector nextMotionV = loadSpatialVector(lk[1].mMotionVelocity, lane);
+        PxU32 nextNbDofs = lk[1].mDofs[lane];
+        PxU32 nextParent = lk[1].mParents[lane];
+
+        for (PxU32 i = 1; i < linkCount; i++)
+        {
+            physx::PxgArticulationBlockLinkData& tLink = lk[i];
+            const PxU32 nbDofs = nextNbDofs;
+            const PxU32 parent = nextParent;
+
+            const UnAlignedSpatialVector preloadedConstraintForces =
+                loadSpatialVector(tLink.mConstraintForces, lane);
+
+            UnAlignedSpatialVector motionV = nextMotionV;
+
+            if ((i + 1) < linkCount)
+            {
+                nextMotionV = loadSpatialVector(lk[i + 1].mMotionVelocity, lane);
+                nextNbDofs = lk[i + 1].mDofs[lane];
+                nextParent = lk[i + 1].mParents[lane];
+            }
+
+            if (parent != (i - 1))
+                deltaV = loadSpatialVector(lk[parent].mScratchDeltaV, lane);
+
+            deltaV = fvPropagateAccel(tLink, dofs, nbDofs, deltaV, lane);
+
+            for (PxU32 ind = 0; ind < nbDofs; ++ind)
+                dofs[ind].mDeferredQstZ[lane] = 0.f;
+
+            motionV += deltaV;
+
+            storeSpatialVector(tLink.mScratchDeltaV, deltaV, lane);
+
+            outVelocity[i] = make_float4(motionV.bottom.x, motionV.bottom.y, motionV.bottom.z, 0.f);
+            outVelocity[i + offset] = make_float4(motionV.top.x, motionV.top.y, motionV.top.z, 0.f);
+
+            storeSpatialVector(tLink.mMotionVelocity, motionV, lane);
+            storeSpatialVector(tLink.mConstraintForces, preloadedConstraintForces + deltaV, lane);
+
+            dofs += nbDofs;
+        }
+    }
+}
+
 inline UnAlignedSpatialVector aiPropagateImpulse(const PxVec3& parentToChild,
                                                  physx::PxgArticulationBlockDofData* dofData,
                                                  const UnAlignedSpatialVector& Z, PxU32 dofCount,

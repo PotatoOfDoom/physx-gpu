@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **757/757** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **758/758** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,71 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.105 — artiOutputVelocity (Manifest 290): der Solver-Geschwindigkeits-Writeback
+
+`artiOutputVelocity` (forwardDynamic2.cu:4076-4137) ist gemappt: der Kernel,
+der nach den Solver-Iterationen die Link-Geschwindigkeiten der Artikulationen
+in den `outArtiVelocity`-Puffer des Solvers schreibt, aus dem die Partikel-,
+Softbody- und FEM-Cloth-Solver sie lesen.  Drei Teile:
+
+* **Die ACHT-Argument-Überladung von `PxcFsFlushVelocity`**
+  (forwardDynamic2.cu:3990-4073), als `fvFlushVelocityOut` neben der
+  P8.94b-Sechs-Argument-Fassung in `npArtiFlushVel.slang`: derselbe Rumpf
+  MINUS die beiden `mSolverSpatialDeltaVel`-Akkumulationen, PLUS die
+  Ausgabe-Schreibungen (linear bei `[i]`, angular bei `[i + offset]`, w = 0;
+  die Wurzel nimmt die AKTUALISIERTE Geschwindigkeit und schreibt nur auf dem
+  Free-Base-Pfad).
+* **Der Kernel-Rumpf**: Guard `globalThreadIndex >= nbArticulations`
+  (Grid ceil(nb/32), Block (32,1,1), ein Warp pro Block), Dirty-Dispatch
+  (`mStateDirty != 0` → Flush + Löschen auf 0; sauber → reine
+  `mMotionVelocity`-Kopie ohne Flush), und der isTGS-Schwanz, der
+  `mDeltaMotion` UNABHÄNGIG vom Dirty-Flag bei `[i + 2*offset]` /
+  `[i + 3*offset]` ablegt.  `eFIX_BASE` ist Bit 0 von `mFlags`;
+  `offset = nbArticulations * maxLinks`; die Ausgabebasis ist pro
+  ARTIKULATION (`globalThreadIndex * maxLinks`), nicht pro Warp.
+* **Verdrahtung**: Manifest-Zeile von Hand editiert (`npArtiFlushVel.spv`),
+  `PXG_SLANG_KERNEL_MAPPED` 289 → **290**; neue ABI-Zeile `{8, 8, 1}`
+  (zwei Desc-Zeiger + das CUDA-`bool` als Ein-Byte-Eintrag).
+
+**Fixture** `testArtiOutputVelocity.cpp`: eine LAUNCH-Fixture über den
+Engine-Einstieg — ein echtes 360-Byte-`PxgArticulationCoreDesc`-Bild
+(Skalare @44/@248/@252, Pools @128/@136/@184, Rest 0xAB), ein echter
+`PxgSolverCoreDesc` (nur `outArtiVelocity` gesetzt), 40 Artikulationen über
+zwei Warp-Slices (Warp 1 zu 8/32 belegt → der Guard hat echte Arbeit),
+`mStateDirty` mit Periode 4 gegen `fixBase` mit Periode 3 (jede Kombination
+kommt vor, auch dirty-fixed und clean-free), Decoy-Bits über Bit 0 in
+`mFlags`, Link-Zahlen 1..7 mit umgehängten Eltern und Null-Dof-Links
+(die FV-Form), `mDeltaMotion` bewusst anders geseedet als `mMotionVelocity`
+(die vier Ausgaberegionen können einander nie zufällig gleichen), Ausgabe-
+Puffer 4*offset float4 als 0xAB-Poison, zwei Runden isTGS an/aus mit
+frischem Seeding.  Spiegel: `pxgref::fvMirrorOut` (Engine-Primitive) für
+dirty, die reine Kopie für clean, der mDeltaMotion-Schwanz für TGS.
+**Bit-exakt im ersten Lauf, beide Runden, 0 signed zeros.**
+
+**Sweep 20/20 im ersten Durchlauf**, Restore grün — darunter alle
+vorgemerkten Kandidaten: die 6-Arg-Verwechslung (`mSolverSpatialDeltaVel`
+akkumuliert), Pre-Update-Wurzelausgabe, Fixed-Base schreibt `out[0]`,
+Clean-Zweig flusht, TGS-Schwanz invertiert / liest `mMotionVelocity` /
+Region gekreuzt, Offset über `maxDofs`, Link-/Dof-Pool-Pitch gekreuzt,
+Ausgabebasis pro Warp statt pro Artikulation, `mStateDirty` nicht gelöscht,
+`eFIX_BASE` als Bit 1, Guard-Off-by-one (rc=139 — Poison-`mNumLinks`
+läuft ins Nichts), Halbe-Vertauschungen in allen drei Schreibpfaden,
+Parent-Reload und QstZ-Nullung der Acht-Argument-Kopie.
+
+**Szene**: Refused-Liste 212 → **211** (`artiOutputVelocity` ist raus,
+`artiPushImpulse` ist der nächste).  Launch-Trace zeigt **0 Dispatches in
+der Artikulations-Szene — das ist KORREKT**: der Aufruf
+(PxgTGSCudaSolverCore.cpp:1422/1680) ist mit
+`softbodyCore || numParticleCores > 0 || femClothCore` gegattert, und die
+Szene hat nichts davon; umgekehrt haben die Softbody-/Partikel-Szenen keine
+Artikulation (`mNbActiveArticulation == 0` → `numBlocks == 0`).  Kein
+heutiges Szenen-Szenario dispatcht ihn also — was ihn trägt, sind die
+Fixture und der Sweep, nicht die Szene.  Beide Schritt-Checks der
+Artikulations-Szene unverändert (Companion-Box y=3.7000 |v|=0.0097,
+artiLink y=2.5777 in Ruhe); Softbody-Szene als Gate-Regression grün.
+
+Suite: **758/758 ctest in BEIDEN Memory-Modi** (Binary 679/679).
 
 ## P8.104 — artiSolveBlockPartitionTGSInternal: die COMPANION-BOX BEWEGT SICH
 

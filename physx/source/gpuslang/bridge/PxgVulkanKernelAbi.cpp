@@ -129,6 +129,7 @@ static const uint8_t kInitStaticKin[] = { 4, 4, 8, 8, 8, 8, 8, 8 };
 
 // gpusolver TGS kernels taking (PxgSolverCoreDesc*, PxgSolverSharedDesc<...>*)
 static const uint8_t kTwoPtr[] = { 8, 8 };
+static const uint8_t kTwoPtrBool[] = { 8, 8, 1 };
 
 // solverTGS: propagateAverageSolverBodyVelocityTGS(desc, sharedDesc,
 //   bool isVelocityIteration, bool isLastPosIteration, PxReal biasCoefficient)
@@ -1296,6 +1297,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "contactConstraintBlockPrepareParallelLaunchTGS", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "artiTGSContactConstraintBlockPrepareLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "artiTGSJointConstraintBlockPrepareParallelLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "artiOutputVelocity", kTwoPtrBool, uint32_t(sizeof(kTwoPtrBool)) },
     { "contactConstraintBlockPrepareParallelLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "jointConstraintBlockPrepareParallelLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     // jointConstraintBlockPrepareParallelLaunchTGS (P5 Step 5 tranche 13 BDA):

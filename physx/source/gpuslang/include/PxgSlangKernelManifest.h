@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 289;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 290;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -159,7 +159,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "stepArticulation1TTGS", "npArtiStepKernel.spv", "stepArticulation1TTGS" },  // ARTI_STEP_TGS (P8.94d)
     { "artiTGSContactConstraintBlockPrepareLaunch", "npArtiConstraintPrep.spv", "artiTGSContactConstraintBlockPrepareLaunch" },  // ARTI_CONTACT_PREP_TGS
     { "artiTGSJointConstraintBlockPrepareParallelLaunch", "npArtiJointPrep.spv", "artiTGSJointConstraintBlockPrepareParallelLaunch" },  // ARTI_JOINT_PREP_TGS
-    { "artiOutputVelocity", nullptr, nullptr },  // ARTI_OUTPUT_VELOCITY (unmapped)
+    { "artiOutputVelocity", "npArtiFlushVel.spv", "artiOutputVelocity" },  // ARTI_OUTPUT_VELOCITY (P8.105)
     { "artiPushImpulse", nullptr, nullptr },  // ARTI_PUSH_IMPULSE (unmapped)
     { "artiComputeDependencies", nullptr, nullptr },  // ARTI_COMPUTE_DEPENDENCIES (unmapped)
     { "artiPropagateImpulses2PGS", nullptr, nullptr },  // ARTI_PROPAGATE_IMPULSE_PGS (unmapped)
