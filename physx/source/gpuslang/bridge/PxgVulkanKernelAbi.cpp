@@ -73,6 +73,14 @@ static const uint8_t kBpDescBool[] = { 8, 1 };
 // of one word rather than declaring two fields.  (P8.83)
 static const uint8_t kArtiDescTwoBool[] = { 8, 1, 1 };
 
+// internalConstraints2.cu:1200 setupInternalConstraintLaunch1T(
+//   PxgArticulationCoreDesc*, PxReal stepDt, PxReal dt, PxReal invDt,
+//   bool isTGSSolver)
+// -> pointer @0, floats @8/@12/@16, bool as ONE byte @20 = 21-byte blob (the
+// shader reads the word at 20 and masks 0xFF, the updateBodiesLaunch_Part2
+// arrangement).  (P8.97d)
+static const uint8_t kArtiSetupInternal[] = { 8, 4, 4, 4, 1 };
+
 // gpusolver/src/CUDA/preIntegration.cu:
 //   initStaticKinematics(PxU32 nbStaticKinematics, PxU32 nbSolverBodies,
 //                        PxgSolverBodyData*, PxgSolverTxIData*, PxAlignedTransform*,
@@ -1203,6 +1211,13 @@ static const PxgKernelAbiRow kRows[] = {
     // back to back with it on the solver stream (PxgArticulationCore.cpp:362).
     // (P8.96c)
     { "artiSumSelfContactAndJointBatches", kFourPtrU32, uint32_t(sizeof(kFourPtrU32)) },
+    // internalConstraints2.cu:1200 setupInternalConstraintLaunch1T(
+    //     PxgArticulationCoreDesc*, PxReal stepDt, PxReal dt, PxReal invDt,
+    //     bool isTGSSolver)
+    // -> the kArtiSetupInternal row above.  Grid ceil(nbArticulations / 32),
+    // block (32, 1, 1) -- numWarpsPerBlock = 1 on the host
+    // (PxgArticulationCore.cpp:492-517), the P8.88 one-warp shape.  (P8.97d)
+    { "setupInternalConstraintLaunch1T", kArtiSetupInternal, uint32_t(sizeof(kArtiSetupInternal)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

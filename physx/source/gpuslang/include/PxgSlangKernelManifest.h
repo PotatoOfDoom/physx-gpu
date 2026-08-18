@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 281;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 282;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -151,7 +151,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "updateBodiesLaunch1T", nullptr, nullptr },  // ARTI_UPDATE_BODIES (unmapped)
     { "updateBodiesLaunch_Part2", "npArtiUpdateBodies.spv", "updateBodiesLaunch_Part2" },  // ARTI_UPDATE_BODIES2 (P8.95b)
     { "updateBodiesLaunch_Part3", nullptr, nullptr },  // ARTI_UPDATE_BODIES3 (unmapped)
-    { "setupInternalConstraintLaunch1T", nullptr, nullptr },  // ARTI_SETUP_INTERNAL (unmapped)
+    { "setupInternalConstraintLaunch1T", "npArtiSetupICKernel.spv", "setupInternalConstraintLaunch1T" },  // ARTI_SETUP_INTERNAL (P8.97d)
     { "artiContactConstraintBlockPrepareLaunch", nullptr, nullptr },  // ARTI_CONTACT_PREP (unmapped)
     { "artiJointConstraintBlockPrepareParallelLaunch", nullptr, nullptr },  // ARTI_JOINT_PREP (unmapped)
     { "artiSolveBlockPartition", nullptr, nullptr },  // ARTI_SOLVE_BLOCK_PARTITION (unmapped)

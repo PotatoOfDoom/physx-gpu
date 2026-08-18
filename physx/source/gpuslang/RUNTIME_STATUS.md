@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **739/739** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **740/740** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,48 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.97d — `setupInternalConstraintLaunch1T` assembled — manifest **282**
+
+internalConstraints2.cu:1200-1266 — the wrapper that composes the three
+swept setup bodies (siSetupInternalConstraints, stSetupSpatialTendons,
+stSetupFixedTendons, mjSetupMimicJoints) in the engine's order over the
+descriptor's per-warp slices.  Manifest 281 → **282**
+(`npArtiSetupICKernel.spv`), suite 739 → **740** green in both memory
+modes, forced-fresh.  Sweep **12/12**, no survivors.  New ABI row
+`kArtiSetupInternal` {8,4,4,4,1}: desc* + stepDt + dt + invDt +
+isTGSSolver as ONE byte at 20 (the shader reads the word and masks 0xFF,
+the updateBodiesLaunch_Part2 arrangement).  Launch shape: grid
+ceil(nbArticulations/32), block (32,1,1) — numWarpsPerBlock = 1 on the
+host (PxgArticulationCore.cpp:492-517), the P8.88 one-warp shape.
+
+**A new verification arrangement: the GPU differential.**  The wrapper is
+pure composition; its own surface is the index chain and the argument
+pack.  So the fixture (`testArtiSetupICLaunch.cpp`) does not transcribe a
+fourth oracle: one seeded arena is uploaded TWICE, the real kernel runs
+over a device-resident PxgArticulationCoreDesc on copy A, the four
+already-swept per-family test entries run slice-by-slice on copy B in the
+engine's order, and every buffer is compared byte for byte — poison,
+dead fourth warp slice and descriptor image included, no tolerance
+(both sides execute the identical imported module code at -O0 +
+nocontract).  Vacuity is closed explicitly: side B must differ from the
+seed in the ITC, dof and mimic buffers after the reference run.  Every
+per-warp pitch is distinct (links 6, dofs 8, spatial tendons 2,
+attachments 5, fixed tendons 3, tendon joints 4, mimic joints 7), so
+each of the twelve stride/pointer/scalar mutants lands warp >= 1 on
+different bytes — five of them died as OOB segfaults, seven as byte
+diffs.  Both solver modes dispatched.
+
+**Scene evidence:** refused list 220 → **219** with exactly this kernel
+leaving; PXG_LAUNCH_TRACE shows it dispatched AND launched OK **240x**
+(once per frame — the engine calls it unconditionally per TGS step).
+The two step checks are unchanged by design: artiLink still rests at
+y = 2.500 and the companion box still hangs at 3.733, because the
+per-iteration solve dispatcher (PxgArticulationCore.cpp:626-720:
+artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T,
+artiSolveInternalTendonAndMimicJointConstraints1T,
+artiSolveInternalConstraintsTGS1T) and artiSolveBlockPartition /
+artiOutputVelocity are still refused — that chain is next.
 
 ## P8.97c — `setupMimicJoints`, the shared propagate pair, and the poison-size lesson
 
