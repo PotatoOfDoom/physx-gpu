@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **742/742** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **743/743** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,43 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.98c — `artiSolveInternalTendonAndMimicJointConstraints1T` — manifest **283**
+
+internalConstraints2.cu:2775-2815 — the per-iteration tendon/mimic solve
+kernel, composing aiAverageAndPropagate (P8.94c) under the eHAS_IMPULSES
+gate with the three P8.98b solve bodies.  Manifest 282 → **283**
+(`npArtiSolveTMKernel.spv`), suite 742 → **743** green in both memory
+modes, forced-fresh.  Sweep **8/8**, no survivors.  New ABI row
+`kArtiSolveTM` {8,4,4,4,1,1}: desc* + biasCoefficient + dt + recipDt +
+TWO adjacent bool bytes at 20/21 (velocityIteration byte 0, isTGS byte 1
+— the P8.83 two-bool arrangement, read as one masked word).  Launch:
+grid ceil(nbArticulations/32), block (32,1,1), per-warp slice index =
+blockIdx directly.
+
+**The fixture is the FULL wrapper mirror over the two helper headers**
+(`testArtiSolveTMLaunch.cpp`): aiMirror (pxgArtiRefHelpers.h) for the
+averaging preamble, the refSolve* bodies (pxgArtiSolveRef.h — hoisted
+from testArtiSolveBodies this tranche, their second user), driven over a
+device-resident PxgArticulationCoreDesc with the real launch shape and
+the real 22-byte argument pack, everything byte-compared.  First run
+bit-exact in both bool-cross rounds.  Gate coverage counted and
+asserted: mStateDirty 0/1/2/3 across lanes (preamble 28 / no-preamble
+30), every seventh lane with NO tendons and NO mimic joints — the outer
+guard skips it ENTIRELY and its mStateDirty byte comes back untouched
+even though its word-mates were rewritten (the sub-word store hazard);
+guarded lanes all end at eVEL_DIRTY; both impulse alignments 56/56.
+
+**Scene evidence:** refused list 219 → **218** with exactly this kernel
+leaving; PXG_LAUNCH_TRACE shows it dispatched AND launched OK **1200x**
+(240 frames x 5 solver iterations).  The step checks are unchanged by
+design — the remaining refusals in the solve phase are
+artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T (:4107, the
+propagate+self-constraints kernel), artiSolveInternalConstraintsTGS1T
+(:2841, the 15-arg drive/limit/friction/static kernel),
+artiPropagateImpulses2/artiPropagateVelocity, artiSolveBlockPartition
+(the companion box's contact batches) and artiOutputVelocity.  Next:
+P8.99, artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T.
 
 ## P8.98b — the three internal-constraint solve bodies, first-run bit-exact
 

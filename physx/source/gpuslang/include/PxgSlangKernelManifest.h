@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 282;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 283;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -141,7 +141,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "artiSumInternalContactAndJointBatches2Launch", "npArtiSumBatches2.spv", "artiSumInternalContactAndJointBatches2Launch" },  // ARTI_STATIC_BATCH_PREP_SECOND (P8.96b)
     { "artiSolveInternalConstraints1T", nullptr, nullptr },  // ARTI_SOLVE_INTERNAL_CONSTRAINTS (unmapped)
     { "artiSolveInternalConstraintsTGS1T", nullptr, nullptr },  // ARTI_SOLVE_INTERNAL_CONSTRAINTS_TGS (unmapped)
-    { "artiSolveInternalTendonAndMimicJointConstraints1T", nullptr, nullptr },  // ARTI_SOLVE_INTERNAL_TENDON_AND_MIMIC_JOINT (unmapped)
+    { "artiSolveInternalTendonAndMimicJointConstraints1T", "npArtiSolveTMKernel.spv", "artiSolveInternalTendonAndMimicJointConstraints1T" },  // ARTI_SOLVE_INTERNAL_TENDON_AND_MIMIC_JOINT (P8.98c)
     { "computeUnconstrainedVelocities1TLaunch", "npArtiJointFrame.spv", "computeUnconstrainedVelocities1TLaunch" },  // ARTI_COMPUTE_UNCONSTRAINED (P8.83 BDA)
     { "computeUnconstrainedSpatialInertiaLaunchPartial1T", "npArtiSpatialInertia.spv", "computeUnconstrainedSpatialInertiaLaunchPartial1T" },  // ARTI_COMPUTE_SPATIAL_PARTIAL (P8.85 BDA)
     { "computeUnconstrainedSpatialInertiaLaunch1T", "npArtiPropagateInertia.spv", "computeUnconstrainedSpatialInertiaLaunch1T" },  // ARTI_COMPUTE_UNCONSTRAINED_SPATIAL_INERTIA (P8.88 BDA)

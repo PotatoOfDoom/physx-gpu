@@ -81,6 +81,14 @@ static const uint8_t kArtiDescTwoBool[] = { 8, 1, 1 };
 // arrangement).  (P8.97d)
 static const uint8_t kArtiSetupInternal[] = { 8, 4, 4, 4, 1 };
 
+// internalConstraints2.cu:2777 artiSolveInternalTendonAndMimicJointConstraints1T(
+//   const PxgArticulationCoreDesc*, PxReal biasCoefficient, PxReal dt,
+//   PxReal recipDt, bool velocityIteration, bool isTGS)
+// -> pointer @0, floats @8/@12/@16, TWO adjacent bool bytes @20 and @21 =
+// 22-byte blob (the shader reads one word at 20: velocityIteration in byte 0,
+// isTGS in byte 1 -- the P8.83 two-bool arrangement).  (P8.98c)
+static const uint8_t kArtiSolveTM[] = { 8, 4, 4, 4, 1, 1 };
+
 // gpusolver/src/CUDA/preIntegration.cu:
 //   initStaticKinematics(PxU32 nbStaticKinematics, PxU32 nbSolverBodies,
 //                        PxgSolverBodyData*, PxgSolverTxIData*, PxAlignedTransform*,
@@ -1218,6 +1226,15 @@ static const PxgKernelAbiRow kRows[] = {
     // block (32, 1, 1) -- numWarpsPerBlock = 1 on the host
     // (PxgArticulationCore.cpp:492-517), the P8.88 one-warp shape.  (P8.97d)
     { "setupInternalConstraintLaunch1T", kArtiSetupInternal, uint32_t(sizeof(kArtiSetupInternal)) },
+    // internalConstraints2.cu:2777 artiSolveInternalTendonAndMimicJointConstraints1T(
+    //     const PxgArticulationCoreDesc*, PxReal biasCoefficient, PxReal dt,
+    //     PxReal recipDt, bool velocityIteration, bool isTGS)
+    // -> the kArtiSolveTM row above.  Grid ceil(nbArticulations / 32), block
+    // (32, 1, 1) -- SOLVE_INTERNAL_CONSTRAINTS = 32, numWarpsPerBlock = 1
+    // (PxgArticulationCore.cpp:634-637), launched once per solver iteration
+    // when the config gate mDoSpatialTendonsFixedTendonsMimicJoints is on.
+    // (P8.98c)
+    { "artiSolveInternalTendonAndMimicJointConstraints1T", kArtiSolveTM, uint32_t(sizeof(kArtiSolveTM)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

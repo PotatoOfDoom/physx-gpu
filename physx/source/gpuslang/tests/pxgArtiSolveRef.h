@@ -266,6 +266,404 @@ inline void refApplyImpulses(
                        loadSpatialVector(ab.mRootDeferredZ, lane) + ZCommon, lane);
 }
 
+
+// The four P8.98b solve-body mirrors.  These use unqualified physx names
+// freely; the enclosing namespace block below provides them.
+namespace sbref_detail { using namespace physx; using physx::Cm::UnAlignedSpatialVector; }
+using namespace physx;
+using physx::Cm::UnAlignedSpatialVector;
+
+// ---- the transcribed solve-body mirrors (P8.98b), parameterised ----
+
+// updateSolveInternalTendonConstraintsTGS (:2015)
+inline void refUpdateTendonTGS(physx::PxgArticulationBlockData& ab,
+                               PxgArticulationBlockLinkData* lk,
+                               physx::PxgArticulationBlockSpatialTendonData* st,
+                               physx::PxgArticulationInternalTendonConstraintData* itc,
+                               physx::PxgArticulationBlockAttachmentData* at,
+                               physx::PxU32 maxAttachments, physx::PxU32 lane)
+{
+    const PxU32 numTendons = ab.mNumSpatialTendons[lane];
+    PxReal accumLength[64];
+    for (PxU32 k = 0; k < 64; ++k) accumLength[k] = 0.f;
+
+    for (PxU32 i = 0; i < numTendons; ++i)
+    {
+        const PxReal offset = st[i].mOffset[lane];
+        PxgArticulationBlockAttachmentData* attachmentBlock = &at[i * maxAttachments];
+        PxgArticulationInternalTendonConstraintData* constraintBlock = &itc[i * maxAttachments];
+
+        uint64_t bitStack = attachmentBlock[0].mChildrens[lane];
+        const PxReal coefficient = attachmentBlock[0].mCoefficient[lane];
+        PxU32 stackCount = PxU32(__builtin_popcountll(bitStack));
+        PxU32 parent = 0, numConstraints = 0;
+        accumLength[parent] = offset * coefficient;
+        PxU32 child = PxU32(63 - __builtin_clzll(bitStack));
+
+        while (stackCount != 0)
+        {
+            stackCount--;
+            PxgArticulationBlockAttachmentData& attachmentData = attachmentBlock[child];
+            PxgArticulationBlockAttachmentData& pAttachmentData = attachmentBlock[parent];
+
+            const PxU32 linkInd = attachmentData.mLinkIndex[lane];
+            const PxU32 pLinkInd = pAttachmentData.mLinkIndex[lane];
+            const PxTransform cB2w = loadSpatialTransform(lk[linkInd].mAccumulatedPose, lane);
+            const PxTransform pB2w = loadSpatialTransform(lk[pLinkInd].mAccumulatedPose, lane);
+
+            const PxVec3 rb = cB2w.q.rotate(attachmentData.mRelativeOffset[lane]);
+            const PxVec3 ra = pB2w.q.rotate(pAttachmentData.mRelativeOffset[lane]);
+            const PxVec3 cAttachPoint = cB2w.p + rb;
+            const PxVec3 pAttachPoint = pB2w.p + ra;
+            const PxVec3 dif = pAttachPoint - cAttachPoint;
+            const PxReal distance = PxSqrt(dif.dot(dif));
+
+            const PxReal u = distance * attachmentData.mCoefficient[lane] + accumLength[parent];
+            const uint64_t children = attachmentData.mChildrens[lane];
+
+            if (children)
+            {
+                stackCount += PxU32(__builtin_popcountll(children));
+                accumLength[child] = u;
+            }
+            else
+            {
+                constraintBlock[numConstraints++].mAccumulatedLength[lane] = u;
+            }
+
+            if (stackCount > 0)
+            {
+                bitStack &= (~(1ull << child));
+                bitStack |= children;
+                child = PxU32(63 - __builtin_clzll(bitStack));
+                parent = attachmentBlock[child].mParents[lane];
+            }
+        }
+    }
+}
+
+// solveInternalSpatialConstraints (:2317)
+inline void refSolveSpatial(physx::PxgArticulationBlockData& ab,
+                            physx::PxgArticulationBlockLinkData* lk,
+                            physx::PxgArticulationBlockDofData* df, const uint64_t* bf,
+                            physx::PxU32 wordSize,
+                            physx::PxgArticulationBlockSpatialTendonData* st,
+                            physx::PxgArticulationInternalTendonConstraintData* itc,
+                            physx::PxgArticulationBlockAttachmentData* at,
+                            physx::PxU32 maxAttachments, bool isTGS, physx::PxU32 lane,
+                            physx::PxU32& nOver, physx::PxU32& nUnder,
+                            physx::PxU32& nInside, physx::PxU32& nZeroDf)
+{
+    const bool fixBase = (ab.mFlags[lane] & 1u) != 0;
+
+    if (isTGS)
+        refUpdateTendonTGS(ab, lk, st, itc, at, maxAttachments, lane);
+
+    const PxU32 numTendons = ab.mNumSpatialTendons[lane];
+    for (PxU32 i = 0; i < numTendons; ++i)
+    {
+        PxgArticulationInternalTendonConstraintData* constraintBlock = &itc[i * maxAttachments];
+        const PxU32 numConstraints = st[i].mNumConstraints[lane];
+        if (numConstraints == 0)
+            continue;
+
+        const PxU32 parentID = constraintBlock[numConstraints - 1].mLink0[lane];
+        const UnAlignedSpatialVector parentVel =
+            refGetVelocity(ab, lk, df, bf, wordSize, parentID, fixBase, NULL, lane);
+        PxReal parentV =
+            loadSpatialVector(constraintBlock[0].mRow0, lane).innerProduct(parentVel);
+
+        for (PxI32 j = PxI32(numConstraints) - 1; j >= 0; --j)
+        {
+            PxgArticulationInternalTendonConstraintData& C = constraintBlock[j];
+            const PxU32 childID = C.mLink1[lane];
+            const UnAlignedSpatialVector childVel =
+                refGetVelocity(ab, lk, df, bf, wordSize, childID, fixBase, NULL, lane);
+
+            const PxReal accumLength = C.mAccumulatedLength[lane];
+            const PxReal error = C.mRestDistance[lane] - accumLength;
+            PxReal error2 = 0.f;
+            if (accumLength > C.mHighLimit[lane]) { error2 = C.mHighLimit[lane] - accumLength; ++nOver; }
+            else if (accumLength < C.mLowLimit[lane]) { error2 = C.mLowLimit[lane] - accumLength; ++nUnder; }
+            else ++nInside;
+
+            const UnAlignedSpatialVector row1 = loadSpatialVector(C.mRow1, lane);
+            const UnAlignedSpatialVector row0 = loadSpatialVector(C.mRow0, lane);
+            const PxReal jointV = row1.innerProduct(childVel) - parentV;
+
+            const PxReal unclampedForce = jointV * C.mVelMultiplier[lane]
+                                        + error * C.mBiasCoefficient[lane]
+                                        + C.mAppliedForce[lane] * C.mImpulseMultiplier[lane];
+            const PxReal unclampedForce2 = (error2 * C.mLimitBiasCoefficient[lane])
+                                         + C.mLimitAppliedForce[lane] * C.mLimitImpulseMultiplier[lane];
+            const PxReal deltaF = (unclampedForce - C.mAppliedForce[lane])
+                                + (unclampedForce2 - C.mLimitAppliedForce[lane]);
+
+            C.mAppliedForce[lane] = unclampedForce;
+            C.mLimitAppliedForce[lane] = unclampedForce2;
+            parentV += C.mDeltaVA[lane] * -deltaF;
+
+            if (deltaF != 0.f)
+            {
+                const UnAlignedSpatialVector i0 = row0 * (-deltaF);
+                const UnAlignedSpatialVector i1 = row1 * deltaF;
+                refApplyImpulses(ab, lk, df, bf, wordSize,
+                                 parentID, i0.top, i0.bottom, NULL,
+                                 childID, i1.top, i1.bottom, NULL, lane);
+            }
+            else
+                ++nZeroDf;
+        }
+    }
+}
+
+// solveInternalFixedConstraints (:2435)
+inline void refSolveFixed(physx::PxgArticulationBlockData& ab,
+                          physx::PxgArticulationBlockLinkData* lk,
+                          physx::PxgArticulationBlockDofData* df, const uint64_t* bf,
+                          physx::PxU32 wordSize,
+                          physx::PxgArticulationBlockFixedTendonData* ft,
+                          physx::PxgArticulationInternalTendonConstraintData* itc,
+                          physx::PxgArticulationBlockTendonJointData* tj,
+                          physx::PxU32 maxTendonJoints, physx::PxU32 lane,
+                          physx::PxU32& nOver, physx::PxU32& nUnder, physx::PxU32& nInside)
+{
+    const bool fixBase = (ab.mFlags[lane] & 1u) != 0;
+    const PxU32 numTendons = ab.mNumFixedTendons[lane];
+
+    for (PxU32 i = 0; i < numTendons; ++i)
+    {
+        PxgArticulationBlockFixedTendonData& tendonData = ft[i];
+        const PxReal lowLimit = tendonData.mLowLimit[lane];
+        const PxReal highLimit = tendonData.mHighLimit[lane];
+
+        PxgArticulationBlockTendonJointData* tendonJointBlock = &tj[i * maxTendonJoints];
+        PxgArticulationInternalTendonConstraintData* constraintBlock = &itc[i * maxTendonJoints];
+
+        uint64_t bitStack = tendonJointBlock[0].mChildrens[lane];
+        PxU32 stackCount = PxU32(__builtin_popcountll(bitStack));
+
+        const PxU32 sLinkIndex = tendonJointBlock[0].mLinkIndex[lane];
+        PxgArticulationBlockLinkData& sLink = lk[sLinkIndex];
+
+        const UnAlignedSpatialVector parentVel =
+            refGetVelocity(ab, lk, df, bf, wordSize, sLinkIndex, fixBase, NULL, lane);
+        const UnAlignedSpatialVector velA = loadSpatialVector(sLink.mMotionVelocity, lane);
+        const UnAlignedSpatialVector delta = parentVel - velA;
+        storeSpatialVector(sLink.mScratchImpulse, UnAlignedSpatialVector(PxVec3(0.f), PxVec3(0.f)), lane);
+        storeSpatialVector(sLink.mScratchDeltaV, delta, lane);
+
+        PxReal rootImp = 0.f;
+        uint64_t totalStack = 0;
+        PxReal error = 0.f, velocity = 0.f;
+        const PxU32 firstChild = PxU32(63 - __builtin_clzll(bitStack));
+        totalStack |= bitStack;
+
+        while (stackCount != 0)
+        {
+            const PxU32 child = PxU32(63 - __builtin_clzll(bitStack));
+            bitStack &= (~(1ull << child));
+            stackCount--;
+
+            PxgArticulationBlockTendonJointData& tjData = tendonJointBlock[child];
+            const PxU32 cLinkInd = tjData.mLinkIndex[lane];
+            PxgArticulationBlockLinkData& cLink = lk[cLinkInd];
+            const PxU32 pLinkInd = cLink.mParents[lane];
+            PxgArticulationBlockLinkData& pLink = lk[pLinkInd];
+            const PxU32 jointOffset = cLink.mJointOffset[lane];
+            const PxU32 dofCount = cLink.mDofs[lane];
+            const PxVec3 c2p(cLink.mRw_x[lane], cLink.mRw_y[lane], cLink.mRw_z[lane]);
+
+            const PxU32 constraintId = tjData.mConstraintId[lane];
+            PxgArticulationInternalTendonConstraintData& C = constraintBlock[constraintId];
+            const PxU32 tjAxis = tjData.mAxis[lane];
+            const PxReal coefficient = tjData.mCoefficient[lane];
+            const PxU32 dofIndex = cLink.mInvDofIds[tjAxis][lane];
+            const PxReal jointPose = df[jointOffset + dofIndex].mJointPositions[lane];
+
+            const UnAlignedSpatialVector parentDeltaV = loadSpatialVector(pLink.mScratchDeltaV, lane);
+            const UnAlignedSpatialVector parentV =
+                loadSpatialVector(pLink.mMotionVelocity, lane) + parentDeltaV;
+
+            const UnAlignedSpatialVector cDeltaV =
+                refPropAccelDeferred(df, jointOffset, dofCount, c2p, parentDeltaV, NULL, lane);
+            storeSpatialVector(cLink.mScratchDeltaV, cDeltaV, lane);
+
+            const UnAlignedSpatialVector velB = loadSpatialVector(cLink.mMotionVelocity, lane);
+            const UnAlignedSpatialVector childVel = velB + cDeltaV;
+
+            storeSpatialVector(cLink.mScratchImpulse, UnAlignedSpatialVector(PxVec3(0.f), PxVec3(0.f)), lane);
+
+            const uint64_t children = tjData.mChildrens[lane];
+
+            const UnAlignedSpatialVector row0 = loadSpatialVector(C.mRow0, lane);
+            const UnAlignedSpatialVector row1 = loadSpatialVector(C.mRow1, lane);
+            const PxReal jointV = row1.innerProduct(childVel) - row0.innerProduct(parentV);
+
+            error += jointPose * coefficient;
+            velocity += jointV * coefficient;
+
+            if (children)
+            {
+                stackCount += PxU32(__builtin_popcountll(children));
+                bitStack |= children;
+                totalStack |= children;
+            }
+        }
+
+        const PxU32 count = PxU32(__builtin_popcountll(totalStack));
+        const PxReal scale = count ? 1.f / PxReal(count) : 0.f;
+
+        const PxReal length = error + tendonData.mOffset[lane];
+        PxReal limitError = 0.f;
+        if (length < lowLimit) { limitError = length - lowLimit; ++nUnder; }
+        else if (length > highLimit) { limitError = length - highLimit; ++nOver; }
+        else ++nInside;
+
+        error = (length - tendonData.mRestLength[lane]) * scale;
+        limitError *= scale;
+        velocity *= scale;
+
+        while (totalStack != 0)
+        {
+            const PxU32 child = PxU32(63 - __builtin_clzll(totalStack));
+            totalStack &= (~(1ull << child));
+
+            PxgArticulationBlockTendonJointData& tjData = tendonJointBlock[child];
+            const PxU32 cLinkInd = tjData.mLinkIndex[lane];
+            PxgArticulationBlockLinkData& cLink = lk[cLinkInd];
+            const PxU32 pLinkInd = cLink.mParents[lane];
+            PxgArticulationBlockLinkData& pLink = lk[pLinkInd];
+            const PxU32 jointOffset = cLink.mJointOffset[lane];
+            const PxU32 dofCount = cLink.mDofs[lane];
+            const PxVec3 c2p(cLink.mRw_x[lane], cLink.mRw_y[lane], cLink.mRw_z[lane]);
+
+            const PxU32 constraintId = tjData.mConstraintId[lane];
+            PxgArticulationInternalTendonConstraintData& C = constraintBlock[constraintId];
+
+            const PxReal recipCoefficient = tjData.mRecipCoefficient[lane];
+            const PxReal unclampedForce =
+                ((velocity * C.mVelMultiplier[lane] + error * C.mBiasCoefficient[lane]) * recipCoefficient)
+                + C.mAppliedForce[lane] * C.mImpulseMultiplier[lane];
+            const PxReal unclampedForce2 =
+                (limitError * C.mLimitBiasCoefficient[lane] * recipCoefficient)
+                + C.mLimitAppliedForce[lane] * C.mLimitImpulseMultiplier[lane];
+            const PxReal deltaF = ((unclampedForce - C.mAppliedForce[lane])
+                                 + (unclampedForce2 - C.mLimitAppliedForce[lane]));
+
+            C.mAppliedForce[lane] = unclampedForce;
+            C.mLimitAppliedForce[lane] = unclampedForce2;
+            rootImp += deltaF;
+
+            const UnAlignedSpatialVector cImpulse = loadSpatialVector(cLink.mScratchImpulse, lane);
+            const UnAlignedSpatialVector impulse =
+                loadSpatialVector(C.mRow1, lane) * (-deltaF) + cImpulse;
+
+            storeSpatialVector(cLink.mSolverSpatialImpulse,
+                               loadSpatialVector(cLink.mSolverSpatialImpulse, lane) + cImpulse,
+                               lane);
+
+            const UnAlignedSpatialVector propagatedImpulse =
+                refPropImpulseDeferred(df, jointOffset, dofCount, c2p, impulse, NULL, 1.0f, lane);
+
+            storeSpatialVector(pLink.mScratchImpulse,
+                               loadSpatialVector(pLink.mScratchImpulse, lane) + propagatedImpulse,
+                               lane);
+        }
+
+        const PxU32 firstConstraint = tendonJointBlock[firstChild].mConstraintId[lane];
+        const PxgArticulationInternalTendonConstraintData& C0 = constraintBlock[firstConstraint];
+
+        const UnAlignedSpatialVector propagatedImpulse = loadSpatialVector(sLink.mScratchImpulse, lane);
+        UnAlignedSpatialVector Z = propagatedImpulse + loadSpatialVector(C0.mRow0, lane) * rootImp;
+
+        for (PxU32 linkID = sLinkIndex; linkID; linkID = lk[linkID].mParents[lane])
+        {
+            PxgArticulationBlockLinkData& link = lk[linkID];
+            const PxU32 jointOffset = link.mJointOffset[lane];
+            const PxU32 dofCount = link.mDofs[lane];
+            const PxVec3 c2p(link.mRw_x[lane], link.mRw_y[lane], link.mRw_z[lane]);
+            Z = refPropImpulseDeferred(df, jointOffset, dofCount, c2p, Z, NULL, 1.0f, lane);
+        }
+
+        storeSpatialVector(ab.mRootDeferredZ,
+                           loadSpatialVector(ab.mRootDeferredZ, lane) + Z, lane);
+    }
+
+    if (numTendons > 0)
+    {
+        const PxU32 nbLinks = ab.mNumLinks[lane];
+        for (PxU32 i = 0; i < nbLinks; ++i)
+            storeSpatialVector(lk[i].mScratchImpulse,
+                               UnAlignedSpatialVector(PxVec3(0.f), PxVec3(0.f)), lane);
+    }
+}
+
+// solveInternalMimicJointConstraints (:2693) -- the impulse scalar itself by
+// the ENGINE's Dy::computeMimicJointImpulses
+inline void refSolveMimic(physx::PxgArticulationBlockData& ab,
+                          physx::PxgArticulationBlockLinkData* lk,
+                          physx::PxgArticulationBlockDofData* df, const uint64_t* bf,
+                          physx::PxU32 wordSize,
+                          physx::PxgArticulationBlockMimicJointData* mjb,
+                          physx::PxReal biasCoefficient, physx::PxReal dt,
+                          physx::PxReal recipDt, bool isVelocityIteration,
+                          physx::PxU32 lane,
+                          physx::PxU32& nCompliant, physx::PxU32& nHard)
+{
+    const bool fixBase = (ab.mFlags[lane] & 1u) != 0;
+    const PxU32 numMimicJoints = ab.mNumMimicJoints[lane];
+
+    for (PxU32 i = 0; i < numMimicJoints; ++i)
+    {
+        const PxgArticulationBlockMimicJointData& M = mjb[i];
+        const PxU32 linkA = M.mLinkA[lane];
+        const PxU32 linkB = M.mLinkB[lane];
+        const PxU32 dofA = M.mInternalData.mDofA[lane];
+        const PxU32 dofB = M.mInternalData.mDofB[lane];
+        const PxReal r = M.mInternalData.recipEffectiveInertia[lane];
+        const PxReal gearRatio = M.mGearRatio[lane];
+        const PxReal offset = M.mOffset[lane];
+        const PxReal naturalFrequency = M.mNaturalFrequency[lane];
+        const PxReal dampingRatio = M.mDampingRatio[lane];
+
+        if (naturalFrequency > 0.f && dampingRatio > 0.f && !isVelocityIteration) ++nCompliant;
+        else ++nHard;
+
+        const PxU32 jointOffsetA = lk[linkA].mJointOffset[lane];
+        const PxU32 jointOffsetB = lk[linkB].mJointOffset[lane];
+        const PxReal qA = df[jointOffsetA + dofA].mJointPositions[lane];
+        const PxReal qB = df[jointOffsetB + dofB].mJointPositions[lane];
+
+        PxReal qADot = 0.f, qBDot = 0.f;
+        {
+            PxReal jointDofSpeedsA[3] = { 0, 0, 0 };
+            PxReal jointDofSpeedsB[3] = { 0, 0, 0 };
+            refGetVelocity(ab, lk, df, bf, wordSize, linkA, fixBase, jointDofSpeedsA, lane);
+            refGetVelocity(ab, lk, df, bf, wordSize, linkB, fixBase, jointDofSpeedsB, lane);
+            qADot = jointDofSpeedsA[dofA];
+            qBDot = jointDofSpeedsB[dofB];
+        }
+
+        PxReal jointImpulseA[3] = { 0, 0, 0 };
+        PxReal jointImpulseB[3] = { 0, 0, 0 };
+        {
+            PxReal jointImpDofA = 0.f, jointImpDofB = 0.f;
+            Dy::computeMimicJointImpulses(biasCoefficient, dt, recipDt, qA, qB, qADot, qBDot,
+                                          gearRatio, offset, naturalFrequency, dampingRatio,
+                                          r, isVelocityIteration, jointImpDofA, jointImpDofB);
+            jointImpulseA[dofA] = jointImpDofA;
+            jointImpulseB[dofB] = jointImpDofB;
+        }
+
+        const PxVec3 zero(0.f);
+        refApplyImpulses(ab, lk, df, bf, wordSize,
+                         linkA, zero, zero, jointImpulseA,
+                         linkB, zero, zero, jointImpulseB, lane);
+    }
+}
+
+
 } // namespace pxgtest
 
 #endif // PXG_ARTI_SOLVE_REF_H
