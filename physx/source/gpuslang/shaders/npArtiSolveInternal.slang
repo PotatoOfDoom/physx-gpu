@@ -64,6 +64,7 @@
 import pxgSlangCommon;
 import pxgSlangArticulationBlocks;
 import pxgSlangSpatialMatrix;
+import pxgSlangArticulationDynamic;
 import pxgSlangSolverBlocks;
 import npArtiSolveTendons;
 import npArtiSolveExtTGS;
@@ -236,4 +237,278 @@ void siStaticTest(uint3 groupThreadId : SV_GroupThreadID)
     fout[12] = deltaV.top.x; fout[13] = deltaV.top.y; fout[14] = deltaV.top.z;
     fout[15] = deltaV.bottom.x; fout[16] = deltaV.bottom.y; fout[17] = deltaV.bottom.z;
     fout[18] = error.sumOfSquares; fout[19] = float(error.counter); fout[20] = error.maxError;
+}
+
+// ===========================================================================
+// P8.100b: the per-dof internal solve (the dof loop of
+// artiSolveInternalConstraints1T, :1747-1890) and
+// accumulateLinkImpulsesAndLinkVelocities (:1554-1575).  This module is the
+// TGS instantiation: isTGS is TRUE by construction, so
+//   * the deprecated friction model's appliedFriction is 0 (PGS accumulates);
+//   * the drive's unclamped impulse degenerates to the applied impulse on
+//     velocity iterations, and the implicit drive desc is loaded only on
+//     position iterations (on velocity iterations it is never used);
+//   * perSubset = isExternalForceEveryStep && !isVelIter picks dt over the
+//     scene dt for every effort-to-impulse conversion.
+//
+// TRAPS (each a sweep mutant unless marked equivalent):
+//  1. **mDriveImpulse's writeback in the maxImpulse>0 arm is a memory RMW
+//     against the ORIGINAL stored value** (`+= driveDeltaF`), while
+//     driveDeltaF itself is measured against the perSubset-ZEROED copy —
+//     under perSubset the two bases differ.
+//  2. **jointV is threaded**: friction (old model) -> drive -> friction (new
+//     model) -> limit -> velocity limit, each `jointV += deltaF * response`.
+//  3. **The joint speed is the DUAL inner product row1*childV - row0*parentV**,
+//     and the position delta the same over the TGS delta motions.
+//  4. **externalJointImpulse enters and leaves the clamp** (`clamp(applied +
+//     ext, unclamped + ext, ...) - ext`).
+//  5. **The limit writeback**: computeLimitImpulse updates low/high impulses
+//     conditionally; the port loads both, passes inout, stores both — the
+//     unchanged one stores its own loaded bytes (equivalent, documented).
+//  6. eLOCKED dofs are skipped ENTIRELY (no error counter tick either).
+//  7. The residual counter ticks for every non-locked dof EVEN IF deltaF is
+//     zero — the RMS depends on the count.
+//  8. accumulateLinkImpulsesAndLinkVelocities: the deltas are deltaV{A,B} *
+//     MINUS deltaF; the impulse rows are parentImp += row0 * deltaF and
+//     impulse -= row1 * deltaF — three sign asymmetries in one helper.
+// ===========================================================================
+
+static const uint SI_MOTION_LOCKED = 0u;    // PxArticulationMotion (PxSolverDefs.h:288)
+static const uint SI_MOTION_LIMITED = 1u;
+
+public void siAccumulate(float deltaF,
+                         AbSpatialVector deltaVA, AbSpatialVector deltaVB,
+                         AbSpatialVector row0, AbSpatialVector row1,
+                         inout AbSpatialVector parentDeltaV, inout AbSpatialVector deltaV,
+                         inout AbSpatialVector parentV, inout AbSpatialVector childV,
+                         inout AbSpatialVector parentImp, inout AbSpatialVector impulse)
+{
+    const AbSpatialVector pDelta = asmSVecScale(deltaVA, -deltaF);
+    const AbSpatialVector cDelta = asmSVecScale(deltaVB, -deltaF);
+
+    parentDeltaV = asmSVecAdd(parentDeltaV, pDelta);
+    deltaV = asmSVecAdd(deltaV, cDelta);
+
+    parentV = asmSVecAdd(parentV, pDelta);
+    childV = asmSVecAdd(childV, cDelta);
+
+    parentImp = asmSVecAdd(parentImp, asmSVecScale(row0, deltaF));
+    impulse = asmSVecSub(impulse, asmSVecScale(row1, deltaF));
+}
+
+public void siSolveDofConstraints(
+    uint64_t dofBlocks, uint jointOffset, uint dofCount,
+    uint64_t jointForces,               // the RECORD's jointForce array (float[dof])
+    float dt, float sceneDt, float invDt, float elapsedTime, float erp,
+    bool isVelIter, bool isExternalForceEveryStep,
+    bool doFrictionDrivePosLimit, bool velLimitBefore,
+    AbSpatialVector childDelta, AbSpatialVector parentDelta,
+    inout AbSpatialVector parentDeltaV, inout AbSpatialVector deltaV,
+    inout AbSpatialVector parentV, inout AbSpatialVector childV,
+    inout AbSpatialVector parentImp, inout AbSpatialVector impulse,
+    bool residualReporting, inout SvxError error,
+    uint lane)
+{
+    for (uint dof = 0u; dof < dofCount; ++dof)
+    {
+        const uint64_t d = dofBlocks + uint64_t(jointOffset + dof) * PXG_AB_DOF_SIZE;
+        const uint motion = abU8(d, PXG_AB_DOF_mMotion, lane);
+        if (motion == SI_MOTION_LOCKED)
+            continue;
+
+        const uint64_t ic = d + PXG_AB_DOF_mConstraintData;
+        const float maxJointVel = abF32(ic, PXG_AB_IC_mMaxJointVelocity, lane);
+        const AbSpatialVector row0 = svLoadSV(ic, PXG_AB_IC_mRow0, lane);
+        const AbSpatialVector row1 = svLoadSV(ic, PXG_AB_IC_mRow1, lane);
+        const float maxDriveForce = abF32(ic, PXG_AB_IC_mConstraintMaxImpulse, lane);
+        const float appliedDriveImpulseOrig = abF32(ic, PXG_AB_IC_mDriveImpulse, lane);
+        const float recipResponse = abF32(ic, PXG_AB_IC_mRecipResponse, lane);
+        const float response = abF32(ic, PXG_AB_IC_mResponse, lane);
+        const float maxFrictionForce = abF32(ic, PXG_AB_IC_mMaxFrictionForce, lane);
+        const AbSpatialVector deltaVA = svLoadSV(ic, PXG_AB_IC_mDeltaVA, lane);
+        const AbSpatialVector deltaVB = svLoadSV(ic, PXG_AB_IC_mDeltaVB, lane);
+
+        const bool perSubset = isExternalForceEveryStep && !isVelIter;   // isTGS == true
+        const float effectiveDt = perSubset ? dt : sceneDt;
+
+        const float staticFrictionImpulse = abF32(ic, PXG_AB_IC_mStaticFrictionEffort, lane) * effectiveDt;
+        const float dynamicFrictionImpulse = abF32(ic, PXG_AB_IC_mDynamicFrictionEffort, lane) * effectiveDt;
+        const float viscousFrictionCoefficient = abF32(ic, PXG_AB_IC_mViscousFrictionCoefficient, lane) * effectiveDt;
+
+        const float maxImpulse = abF32(ic, PXG_AB_IC_mMaxEffort, lane) * effectiveDt;
+        const float speedImpulseGradient = abF32(ic, PXG_AB_IC_mSpeedEffortGradient, lane) / effectiveDt;
+        const float velocityDependentResistance = abF32(ic, PXG_AB_IC_mVelocityDependentResistance, lane) * effectiveDt;
+        const float externalJointImpulse = (Ptr<float>(jointForces))[jointOffset + dof] * effectiveDt;
+        const float maxActuatorVelocity = abF32(ic, PXG_AB_IC_mMaxActuatorVelocity, lane);
+
+        AdDriveDesc driveDesc;
+        driveDesc.tvBias = 0.0f; driveDesc.biasCoef = 0.0f; driveDesc.velMul = 0.0f;
+        driveDesc.impMul = 0.0f; driveDesc.posBias = 0.0f;
+        if (!isVelIter)   // !(isTGS && isVelIter), isTGS == true
+        {
+            const float4 packed = abF4(ic, PXG_AB_IC_mTargetVelPlusInitialBiasX_DriveBiasCoefficientY_VelMultiplierZ_ImpulseMultiplierW, lane);
+            driveDesc.tvBias = packed.x;
+            driveDesc.biasCoef = packed.y;
+            driveDesc.velMul = packed.z;
+            driveDesc.impMul = packed.w;
+            driveDesc.posBias = abF32(ic, PXG_AB_IC_mTargetPosBias, lane);
+        }
+
+        float jointV = asmInnerProduct(row1, childV) - asmInnerProduct(row0, parentV);
+        const float jointDeltaP = asmInnerProduct(row1, childDelta) - asmInnerProduct(row0, parentDelta);
+
+        float frictionDeltaF = 0.0f;
+        float driveDeltaF = 0.0f;
+        float posLimitDeltaF = 0.0f;
+        if (doFrictionDrivePosLimit)
+        {
+            const bool newFrictionModel = staticFrictionImpulse != 0.0f || viscousFrictionCoefficient != 0.0f;
+
+            // deprecated friction model; appliedFriction is 0 on TGS
+            if (!newFrictionModel)
+            {
+                const float appliedFriction = 0.0f;
+                const float frictionForce = adPClamp(-jointV * recipResponse + appliedFriction, -maxFrictionForce, maxFrictionForce);
+                abStoreF32(ic, PXG_AB_IC_mAccumulatedFrictionImpulse, lane, frictionForce);
+                frictionDeltaF = frictionForce - appliedFriction;
+                jointV += frictionDeltaF * response;
+            }
+
+            if (maxImpulse > 0.0f)
+            {
+                const float appliedDriveImpulse = perSubset ? 0.0f : appliedDriveImpulseOrig;
+                const float unclampedImpulse = isVelIter ? appliedDriveImpulse : adDriveImpulse(appliedDriveImpulse, jointV, jointDeltaP, elapsedTime, driveDesc);
+                const float clampedImpulse = adClampDriveImpulse(jointV, appliedDriveImpulse + externalJointImpulse, unclampedImpulse + externalJointImpulse, response, maxActuatorVelocity, maxImpulse, speedImpulseGradient, velocityDependentResistance) - externalJointImpulse;
+                driveDeltaF = clampedImpulse - appliedDriveImpulse;
+                // trap 1: the RMW base is the ORIGINAL stored value
+                abStoreF32(ic, PXG_AB_IC_mDriveImpulse, lane, appliedDriveImpulseOrig + driveDeltaF);
+            }
+            else
+            {
+                const float unclampedForce = isVelIter ? appliedDriveImpulseOrig : adDriveImpulse(appliedDriveImpulseOrig, jointV, jointDeltaP, elapsedTime, driveDesc);
+                const float clampedForce = adPClamp(unclampedForce, -maxDriveForce, maxDriveForce);
+                driveDeltaF = clampedForce - appliedDriveImpulseOrig;
+                abStoreF32(ic, PXG_AB_IC_mDriveImpulse, lane, clampedForce);
+            }
+            jointV += driveDeltaF * response;
+
+            if (newFrictionModel)
+            {
+                const float appliedFriction = perSubset ? 0.0f : abF32(ic, PXG_AB_IC_mAccumulatedFrictionImpulse, lane);
+                float totalImpulse = appliedFriction - jointV * recipResponse;
+                totalImpulse = adFrictionImpulse(totalImpulse, staticFrictionImpulse, dynamicFrictionImpulse, viscousFrictionCoefficient, jointV);
+                frictionDeltaF = totalImpulse - appliedFriction;
+                abStoreF32(ic, PXG_AB_IC_mAccumulatedFrictionImpulse, lane, abF32(ic, PXG_AB_IC_mAccumulatedFrictionImpulse, lane) + frictionDeltaF);
+                jointV += frictionDeltaF * response;
+            }
+
+            if (motion == SI_MOTION_LIMITED)
+            {
+                const float2 limitErr = abF2(ic, PXG_AB_IC_mLimitError_LowX_highY, lane);
+                float lowImp = abF32(ic, PXG_AB_IC_mLowImpulse, lane);
+                float highImp = abF32(ic, PXG_AB_IC_mHighImpulse, lane);
+                posLimitDeltaF = adLimitImpulse(dt, invDt, isVelIter, response, recipResponse, erp, limitErr.x, limitErr.y, jointDeltaP, lowImp, highImp, jointV);
+                // trap 5: the conditional writeback stores loaded bytes when unchanged
+                abStoreF32(ic, PXG_AB_IC_mLowImpulse, lane, lowImp);
+                abStoreF32(ic, PXG_AB_IC_mHighImpulse, lane, highImp);
+            }
+        }
+
+        float velLimitDeltaF = 0.0f;
+        if (velLimitBefore && (abs(jointV) > maxJointVel))
+        {
+            const float newJointV = adPClamp(jointV, -maxJointVel, maxJointVel);
+            velLimitDeltaF = (newJointV - jointV) * recipResponse;
+            jointV = newJointV;
+        }
+
+        const float deltaF = frictionDeltaF + driveDeltaF + posLimitDeltaF + velLimitDeltaF;
+
+        // trap 7: the counter ticks even for a zero deltaF
+        if (residualReporting)
+            svxAccumulateError(error, deltaF, recipResponse);
+
+        siAccumulate(deltaF, deltaVA, deltaVB, row0, row1,
+                     parentDeltaV, deltaV, parentV, childV, parentImp, impulse);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// test entry for the dof solve
+// ---------------------------------------------------------------------------
+
+struct SdParams
+{
+    uint64_t dofBlocks;    // @0
+    uint64_t jointForces;  // @8   fixture scaffolding: per-lane slices
+    uint64_t link;         // @16  jointOffset/dofCount come from here, as in the kernel
+    uint64_t io;           // @24
+    float dt;              // @32
+    float sceneDt;         // @36
+    float invDt;           // @40
+    float elapsedTime;     // @44
+    float erp;             // @48
+    uint flagsWord;        // @52  bit0 velIter, bit1 extEvery, bit2 doFDPL, bit3 velBefore, bit4 residual
+    uint nbLanes;          // @56
+    uint maxDofs;          // @60  the per-lane jointForces slice stride (scaffolding)
+}
+
+[[vk::push_constant]]
+ConstantBuffer<SdParams> gSd;
+
+static const uint SD_IO_STRIDE = 48u;
+static const uint SD_IO_OUT_BASE = 32u * 48u;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void siDofTest(uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint lane = groupThreadId.x;
+    if (lane >= gSd.nbLanes)
+        return;
+
+    Ptr<float> fin = Ptr<float>(gSd.io + uint64_t(lane * SD_IO_STRIDE) * 4u);
+    AbSpatialVector parentV = asmSVec(float3(fin[0], fin[1], fin[2]), float3(fin[3], fin[4], fin[5]));
+    AbSpatialVector childV = asmSVec(float3(fin[6], fin[7], fin[8]), float3(fin[9], fin[10], fin[11]));
+    AbSpatialVector parentDeltaV = asmSVec(float3(fin[12], fin[13], fin[14]), float3(fin[15], fin[16], fin[17]));
+    AbSpatialVector deltaV = asmSVec(float3(fin[18], fin[19], fin[20]), float3(fin[21], fin[22], fin[23]));
+    AbSpatialVector parentImp = asmSVec(float3(fin[24], fin[25], fin[26]), float3(fin[27], fin[28], fin[29]));
+    AbSpatialVector impulse = asmSVec(float3(fin[30], fin[31], fin[32]), float3(fin[33], fin[34], fin[35]));
+    const AbSpatialVector childDelta = asmSVec(float3(fin[36], fin[37], fin[38]), float3(fin[39], fin[40], fin[41]));
+    const AbSpatialVector parentDelta = asmSVec(float3(fin[42], fin[43], fin[44]), float3(fin[45], fin[46], fin[47]));
+
+    const uint jointOffset = abU32(gSd.link, PXG_AB_LINK_mJointOffset, lane);
+    const uint dofCount = abU8(gSd.link, PXG_AB_LINK_mDofs, lane);
+
+    // fixture scaffolding: the kernel passes the articulation's own record
+    const uint64_t jf = gSd.jointForces + uint64_t(lane) * uint64_t(gSd.maxDofs) * 4u;
+
+    const bool velIter = (gSd.flagsWord & 1u) != 0u;
+    const bool extEvery = (gSd.flagsWord & 2u) != 0u;
+    const bool doFDPL = (gSd.flagsWord & 4u) != 0u;
+    const bool velBefore = (gSd.flagsWord & 8u) != 0u;
+    const bool residual = (gSd.flagsWord & 16u) != 0u;
+
+    SvxError error = { 0.0f, 0, 0.0f };
+    siSolveDofConstraints(gSd.dofBlocks, jointOffset, dofCount, jf,
+                          gSd.dt, gSd.sceneDt, gSd.invDt, gSd.elapsedTime, gSd.erp,
+                          velIter, extEvery, doFDPL, velBefore,
+                          childDelta, parentDelta,
+                          parentDeltaV, deltaV, parentV, childV, parentImp, impulse,
+                          residual, error, lane);
+
+    Ptr<float> fout = Ptr<float>(gSd.io + uint64_t(SD_IO_OUT_BASE + lane * SD_IO_STRIDE) * 4u);
+    fout[0] = parentV.top.x; fout[1] = parentV.top.y; fout[2] = parentV.top.z;
+    fout[3] = parentV.bottom.x; fout[4] = parentV.bottom.y; fout[5] = parentV.bottom.z;
+    fout[6] = childV.top.x; fout[7] = childV.top.y; fout[8] = childV.top.z;
+    fout[9] = childV.bottom.x; fout[10] = childV.bottom.y; fout[11] = childV.bottom.z;
+    fout[12] = parentDeltaV.top.x; fout[13] = parentDeltaV.top.y; fout[14] = parentDeltaV.top.z;
+    fout[15] = parentDeltaV.bottom.x; fout[16] = parentDeltaV.bottom.y; fout[17] = parentDeltaV.bottom.z;
+    fout[18] = deltaV.top.x; fout[19] = deltaV.top.y; fout[20] = deltaV.top.z;
+    fout[21] = deltaV.bottom.x; fout[22] = deltaV.bottom.y; fout[23] = deltaV.bottom.z;
+    fout[24] = parentImp.top.x; fout[25] = parentImp.top.y; fout[26] = parentImp.top.z;
+    fout[27] = parentImp.bottom.x; fout[28] = parentImp.bottom.y; fout[29] = parentImp.bottom.z;
+    fout[30] = impulse.top.x; fout[31] = impulse.top.y; fout[32] = impulse.top.z;
+    fout[33] = impulse.bottom.x; fout[34] = impulse.bottom.y; fout[35] = impulse.bottom.z;
+    fout[36] = error.sumOfSquares; fout[37] = float(error.counter); fout[38] = error.maxError;
 }

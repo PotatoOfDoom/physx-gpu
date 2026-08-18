@@ -38,97 +38,10 @@
 // PX_MAX_F32 = 0x7f7fffff (FLT_MAX); PX_EPS_F32 = 0x34000000 (FLT_EPSILON=2^-23).
 // All float arith NoContraction-stamped; +-0 eqFZ.
 
-static const float PX_MAX_F32 = asfloat(0x7f7fffffu);
-static const float PX_EPS_F32 = asfloat(0x34000000u);
-
-float pmin(float a, float b) { return (a < b) ? a : b; }
-float pmax(float a, float b) { return (a > b) ? a : b; }
-float pclamp(float v, float lo, float hi) { return pmin(hi, pmax(lo, v)); }
-
-// returns (bound1, bound2)
-float2 boundsNeg(float velDeviation, float maxv, float denom1, float denom2, float impulse)
-{
-    if (abs(denom1) < PX_EPS_F32)
-        return float2(-PX_MAX_F32, PX_MAX_F32);
-    if (abs(denom2) < PX_EPS_F32)
-    {
-        const float bound1 = (velDeviation - maxv) / denom1;
-        float bound2;
-        if (abs(velDeviation + maxv) < PX_EPS_F32)
-            bound2 = PX_MAX_F32;
-        else
-            bound2 = (velDeviation + maxv) > 0.0f ? PX_MAX_F32 : -PX_MAX_F32;
-        return float2(bound1, pmin(0.0f, bound2));
-    }
-    const float bound1 = (velDeviation - maxv) / denom1;
-    const float bound2 = (velDeviation + maxv) / denom2;
-    if (denom2 >= 0.0f)
-        return float2(pmax(bound1, impulse), pmin(0.0f, bound2));
-    return float2(pmax(pmax(bound1, bound2), impulse), 0.0f);
-}
-
-float2 boundsPos(float velDeviation, float maxv, float denom1, float denom2, float impulse)
-{
-    if (abs(denom2) < PX_EPS_F32)
-        return float2(-PX_MAX_F32, PX_MAX_F32);
-    if (abs(denom1) < PX_EPS_F32)
-    {
-        const float bound2 = (velDeviation + maxv) / denom2;
-        float bound1;
-        if (abs(velDeviation - maxv) < PX_EPS_F32)
-            bound1 = -PX_MAX_F32;
-        else
-            bound1 = (velDeviation - maxv) > 0.0f ? PX_MAX_F32 : -PX_MAX_F32;
-        return float2(pmax(0.0f, bound1), bound2);
-    }
-    const float bound1 = (velDeviation - maxv) / denom1;
-    const float bound2 = (velDeviation + maxv) / denom2;
-    if (denom1 >= 0.0f)
-        return float2(pmax(0.0f, bound1), pmin(bound2, impulse));
-    return float2(0.0f, pmin(pmin(bound1, bound2), impulse));
-}
-
-float clampDriveImpulse(float jointVel0, float driveImpulse0, float driveImpulse, float response,
-                        float maxJointVel, float maxImpulse, float speedImpulseGradient, float vdr)
-{
-    const float velDeviation = driveImpulse0 * response - jointVel0;
-    float2 bounds1, bounds2;
-
-    if (driveImpulse > 0.0f)
-    {
-        float denom1 = response - speedImpulseGradient;
-        float denom2 = response + speedImpulseGradient;
-        bounds1 = boundsPos(velDeviation, maxJointVel, denom1, denom2, driveImpulse);
-        if (vdr == 0.0f)
-            bounds2 = float2(-maxImpulse, maxImpulse);
-        else
-        {
-            denom1 = response - 1.0f / vdr;
-            denom2 = response + 1.0f / vdr;
-            bounds2 = boundsPos(velDeviation, maxImpulse / vdr, denom1, denom2, driveImpulse);
-        }
-    }
-    else
-    {
-        float denom1 = response + speedImpulseGradient;
-        float denom2 = response - speedImpulseGradient;
-        bounds1 = boundsNeg(velDeviation, maxJointVel, denom1, denom2, driveImpulse);
-        if (vdr == 0.0f)
-            bounds2 = float2(-maxImpulse, maxImpulse);
-        else
-        {
-            denom1 = response + 1.0f / vdr;
-            denom2 = response - 1.0f / vdr;
-            bounds2 = boundsNeg(velDeviation, maxImpulse / vdr, denom1, denom2, driveImpulse);
-        }
-    }
-
-    const float lowerBound = pmax(bounds1.x, bounds2.x);
-    const float upperBound = pmin(bounds1.y, bounds2.y);
-    if (lowerBound > upperBound)
-        return 0.0f;
-    return pclamp(driveImpulse, lowerBound, upperBound);
-}
+// P8.100b: the bodies moved VERBATIM into pxgSlangArticulationDynamic
+// (adBoundsNeg/adBoundsPos/adClampDriveImpulse) so the internal-constraint
+// dof solve composes them; this battery now drives the lifted code.
+import pxgSlangArticulationDynamic;
 
 struct CdIn
 {
@@ -154,7 +67,7 @@ void clampDriveImp(uint3 dtid : SV_DispatchThreadID)
     if (tid >= gParams.numTests) return;
     const CdIn s = gIn[tid];
 
-    const float r = clampDriveImpulse(s.a.x, s.a.y, s.a.z, s.a.w, s.b.x, s.b.y, s.b.z, s.b.w);
+    const float r = adClampDriveImpulse(s.a.x, s.a.y, s.a.z, s.a.w, s.b.x, s.b.y, s.b.z, s.b.w);
 
     CdOut o;
     o.outs = float4(r, 0.0f, 0.0f, 0.0f);

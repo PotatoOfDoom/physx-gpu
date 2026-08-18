@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **747/747** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **748/748** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,60 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.100b — der per-Dof-Solve, mit VIER Engine-Orakeln
+
+`siSolveDofConstraints` (npArtiSolveInternal.slang) — die Dof-Schleife von
+artiSolveInternalConstraintsTGS1T (:1747-1890) samt
+accumulateLinkImpulsesAndLinkVelocities (:1554), als TGS-Instanz (isTGS ist
+konstruktionsbedingt TRUE: das alte Friction-Modell akkumuliert nicht, der
+Drive degeneriert auf Velocity-Iterationen zum applied impulse, der
+Implicit-Drive-Desc wird nur auf Positions-Iterationen geladen, perSubset =
+isExternalForceEveryStep && !isVelIter schaltet dt gegen den Scene-dt in
+JEDER Effort->Impuls-Konversion — mSpeedEffortGradient ist der einzige
+DIVISOR darunter).
+
+**Zwei Lifts vorab:** die Drive-Clamp-Familie (computeBoundsForNegative/
+PositiveImpulse + clampDriveImpulse, DyCpuGpuArticulation.h:197-331) zog
+VERBATIM aus npArtiClampDriveImp.slang nach pxgSlangArticulationDynamic
+(adClampDriveImpulse; die Phase-1-Batterie importiert und forwardet — ein
+Body, zwei Nutzer, npArtiClampDriveImp bleibt gruen), und computeLimitImpulse
+(:352-455) ist frisch als adLimitImpulse transkribiert.  svxAccumulateError
+(der PxgErrorAccumulator-Spiegel) wurde public.
+
+Kern-Traps (Modulkopf, jede im Sweep): der mDriveImpulse-Writeback im
+maxImpulse>0-Arm ist ein Speicher-RMW gegen den ORIGINALWERT, waehrend
+driveDeltaF gegen die perSubset-GENULLTE Kopie gemessen wird; jointV faedelt
+durch Friction(alt) -> Drive -> Friction(neu) -> Limit -> VelLimit; die
+Joint-Geschwindigkeit ist das DUALE Produkt row1*childV - row0*parentV;
+externalJointImpulse geht in die Clamp HINEIN und wieder HERAUS; eLOCKED
+ueberspringt alles (auch den Residual-Tick); der Residual-Zaehler tickt auch
+bei deltaF == 0 (der RMS haengt am Count); accumulate hat drei
+Vorzeichen-Asymmetrien (deltaV* mit MINUS deltaF, parentImp += row0*deltaF,
+impulse -= row1*deltaF).
+
+**Fixture** (`testArtiSolveDof.cpp`): DAS ORAKEL IST DIE ENGINE — jede
+skalare Entscheidung der Schleife ist ein PX_CUDA_CALLABLE-Original auf dem
+Host (Dy::computeDriveImpulse, Dy::clampDriveImpulse,
+Dy::computeFrictionImpulse, Dy::computeLimitImpulse — dessen konditionale
+Low/High-Writebacks laufen nativ ueber Referenzen in die Struktur —,
+PxgArticulationInternalConstraintData::getImplicitDriveDesc); nur die
+Schleifenstruktur und der Accumulate-Helfer sind transkribiert.  Alle drei
+Motion-Modi, beide Drive-Arme, beide Friction-Modelle, Limit-Flavors
+(verletzt/kuenftig-verletzt/frei->Pull-back), VelLimit-Hits; vier
+Flag-Runden inkl. perSubset und doFrictionDrivePosLimit=false.
+**Erster Lauf bit-exakt** ueber alle vier Runden.
+
+Sweep: **15/15 KILLED nach einem Fixture-Fix** (rmw-base-wrong, jointv-not-threaded, dual-swapped, ext-imp-not-subtracted, locked-not-skipped, limited-eq-free, counter-gated, accum-sign-dropped, impulse-row-sign, persubset-ignored, desc-never-loaded, friction-base-wrong, speedgrad-mult, limit-dt-swap, old-model-pgs).  `counter-gated` ueberlebte den ersten Lauf: die einzige Runde mit vielen deltaF==0-Rows (doFDPL aus, nur VelLimit) hatte residual AUS — jetzt an, der Mutant stirbt am Zaehlerstand im Retest
+
+Suite: 748/748 ctest (669/669 Binary) in BEIDEN Memory-Modi.  Kein Manifest-Change; der svxAccumulateError-Public und
+der Clamp-Lift aendern npArtiSolveExtTGS.spv/npArtiClampDriveImp.spv (beide
+ungelauncht) und pxgSlangArticulationDynamic — dessen Importer npArtiStepKernel
+(gelauncht, manifest 277) wurde neu gebaut; Szene: refused unveraendert 217, 240 Steps, artiLink exakt y=2.500.
+
+Dokumentierte Aequivalenz: den Drive-Desc auch auf Velocity-Iterationen zu
+laden waere ein reiner Load ohne Nutzung (computeDriveImpulse laeuft dort
+nie) — nicht gesweept.
 
 ## P8.100a — der Static-Constraint-Solve von artiSolveInternalConstraintsTGS1T
 

@@ -287,3 +287,202 @@ public float adFrictionImpulse(float fImp, float staticF, float dynamicF, float 
     }
     return fImp;
 }
+
+// ===========================================================================
+// P8.100b lifts.  The drive-impulse performance-envelope clamp
+// (DyCpuGpuArticulation.h:197-331) moves here VERBATIM from
+// npArtiClampDriveImp.slang (which now imports and forwards — one body, two
+// users), and computeLimitImpulse (:352-455) is transcribed fresh with the
+// ENGINE's host-callable original as the fixture oracle.
+// ===========================================================================
+
+static const float AD_MAX_F32 = asfloat(0x7f7fffffu);
+static const float AD_EPS_F32 = asfloat(0x34000000u);
+
+public float adPMin(float a, float b) { return (a < b) ? a : b; }
+public float adPMax(float a, float b) { return (a > b) ? a : b; }
+public float adPClamp(float v, float lo, float hi) { return adPMin(hi, adPMax(lo, v)); }
+
+// computeBoundsForNegativeImpulse (L197-228); returns (bound1, bound2)
+float2 adBoundsNeg(float velDeviation, float maxv, float denom1, float denom2, float impulse)
+{
+    if (abs(denom1) < AD_EPS_F32)
+        return float2(-AD_MAX_F32, AD_MAX_F32);
+    if (abs(denom2) < AD_EPS_F32)
+    {
+        const float bound1 = (velDeviation - maxv) / denom1;
+        float bound2;
+        if (abs(velDeviation + maxv) < AD_EPS_F32)
+            bound2 = AD_MAX_F32;
+        else
+            bound2 = (velDeviation + maxv) > 0.0f ? AD_MAX_F32 : -AD_MAX_F32;
+        return float2(bound1, adPMin(0.0f, bound2));
+    }
+    const float bound1 = (velDeviation - maxv) / denom1;
+    const float bound2 = (velDeviation + maxv) / denom2;
+    if (denom2 >= 0.0f)
+        return float2(adPMax(bound1, impulse), adPMin(0.0f, bound2));
+    return float2(adPMax(adPMax(bound1, bound2), impulse), 0.0f);
+}
+
+// computeBoundsForPositiveImpulse (L231-266)
+float2 adBoundsPos(float velDeviation, float maxv, float denom1, float denom2, float impulse)
+{
+    if (abs(denom2) < AD_EPS_F32)
+        return float2(-AD_MAX_F32, AD_MAX_F32);
+    if (abs(denom1) < AD_EPS_F32)
+    {
+        const float bound2 = (velDeviation + maxv) / denom2;
+        float bound1;
+        if (abs(velDeviation - maxv) < AD_EPS_F32)
+            bound1 = -AD_MAX_F32;
+        else
+            bound1 = (velDeviation - maxv) > 0.0f ? AD_MAX_F32 : -AD_MAX_F32;
+        return float2(adPMax(0.0f, bound1), bound2);
+    }
+    const float bound1 = (velDeviation - maxv) / denom1;
+    const float bound2 = (velDeviation + maxv) / denom2;
+    if (denom1 >= 0.0f)
+        return float2(adPMax(0.0f, bound1), adPMin(bound2, impulse));
+    return float2(0.0f, adPMin(adPMin(bound1, bound2), impulse));
+}
+
+// clampDriveImpulse (L279-331)
+public float adClampDriveImpulse(float jointVel0, float driveImpulse0, float driveImpulse,
+                                 float response, float maxJointVel, float maxImpulse,
+                                 float speedImpulseGradient, float vdr)
+{
+    const float velDeviation = driveImpulse0 * response - jointVel0;
+    float2 bounds1, bounds2;
+
+    if (driveImpulse > 0.0f)
+    {
+        float denom1 = response - speedImpulseGradient;
+        float denom2 = response + speedImpulseGradient;
+        bounds1 = adBoundsPos(velDeviation, maxJointVel, denom1, denom2, driveImpulse);
+        if (vdr == 0.0f)
+            bounds2 = float2(-maxImpulse, maxImpulse);
+        else
+        {
+            denom1 = response - 1.0f / vdr;
+            denom2 = response + 1.0f / vdr;
+            bounds2 = adBoundsPos(velDeviation, maxImpulse / vdr, denom1, denom2, driveImpulse);
+        }
+    }
+    else
+    {
+        float denom1 = response + speedImpulseGradient;
+        float denom2 = response - speedImpulseGradient;
+        bounds1 = adBoundsNeg(velDeviation, maxJointVel, denom1, denom2, driveImpulse);
+        if (vdr == 0.0f)
+            bounds2 = float2(-maxImpulse, maxImpulse);
+        else
+        {
+            denom1 = response + 1.0f / vdr;
+            denom2 = response - 1.0f / vdr;
+            bounds2 = adBoundsNeg(velDeviation, maxImpulse / vdr, denom1, denom2, driveImpulse);
+        }
+    }
+
+    const float lowerBound = adPMax(bounds1.x, bounds2.x);
+    const float upperBound = adPMin(bounds1.y, bounds2.y);
+    if (lowerBound > upperBound)
+        return 0.0f;
+    return adPClamp(driveImpulse, lowerBound, upperBound);
+}
+
+// computeLimitImpulse (DyCpuGpuArticulation.h:352-455) — the joint-limit
+// impulse with the future-violation lookahead, the repulsive-only clamps and
+// the pull-back branch when no limit is active.  The impulse WRITEBACK is
+// conditional (newLow/newHigh) — an unconditional write of the unchanged
+// value would be byte-identical; kept faithful anyway.
+public float adLimitImpulse(float dt, float recipDt, bool isVelIter,
+                            float response, float recipResponse, float erp,
+                            float errorLow, float errorHigh, float jointPDelta,
+                            inout float lowImpulse_, inout float highImpulse_,
+                            inout float jointV_)
+{
+    float jointV = jointV_;
+    float lowImpulse = lowImpulse_;
+    float highImpulse = highImpulse_;
+
+    const float futureDeltaJointP = jointPDelta + jointV * dt;
+
+    const float currErrLow = errorLow + jointPDelta;
+    const float nextErrLow = errorLow + futureDeltaJointP;
+    const float currErrHigh = errorHigh - jointPDelta;
+    const float nextErrHigh = errorHigh - futureDeltaJointP;
+
+    bool limited = false;
+    bool newLow = false;
+    bool newHigh = false;
+
+    const float tolerance = 0.0f;
+
+    float deltaF = 0.0f;
+    if (currErrLow < tolerance || nextErrLow < tolerance)
+    {
+        float newJointV = jointV;
+        limited = true;
+        if (currErrLow < tolerance)
+        {
+            if (!isVelIter)
+                newJointV = -currErrLow * recipDt * erp;
+        }
+        else
+        {
+            newJointV = -currErrLow * recipDt;
+        }
+
+        const float deltaV = newJointV - jointV;
+        deltaF = adPMax(lowImpulse + deltaV * recipResponse, 0.0f) - lowImpulse;
+        lowImpulse += deltaF;
+        newLow = true;
+    }
+    else if (currErrHigh < tolerance || nextErrHigh < tolerance)
+    {
+        float newJointV = jointV;
+        limited = true;
+        if (currErrHigh < tolerance)
+        {
+            if (!isVelIter)
+                newJointV = currErrHigh * recipDt * erp;
+        }
+        else
+        {
+            newJointV = currErrHigh * recipDt;
+        }
+
+        const float deltaV = newJointV - jointV;
+        deltaF = adPMin(highImpulse + deltaV * recipResponse, 0.0f) - highImpulse;
+        highImpulse += deltaF;
+        newHigh = true;
+    }
+
+    if (!limited)
+    {
+        const float impulseForZeroVel = -jointV * recipResponse;
+        if (jointV > 0.0f)
+        {
+            deltaF = adPMax(impulseForZeroVel, -lowImpulse);
+            lowImpulse += deltaF;
+            newLow = true;
+        }
+        else
+        {
+            deltaF = adPMin(impulseForZeroVel, -highImpulse);
+            highImpulse += deltaF;
+            newHigh = true;
+        }
+    }
+
+    jointV += deltaF * response;
+
+    if (newLow)
+        lowImpulse_ = lowImpulse;
+    if (newHigh)
+        highImpulse_ = highImpulse;
+    jointV_ = jointV;
+
+    return deltaF;
+}

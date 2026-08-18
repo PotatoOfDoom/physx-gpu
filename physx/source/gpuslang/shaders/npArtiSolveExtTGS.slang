@@ -92,7 +92,7 @@ public struct SvxError
     public float maxError;
 }
 
-void svxAccumulateError(inout SvxError e, float deltaF, float velocityMultiplier)
+public void svxAccumulateError(inout SvxError e, float deltaF, float velocityMultiplier)
 {
     const float r = velocityMultiplier == 0.0f ? 0.0f : deltaF / velocityMultiplier;
     e.sumOfSquares += r * r;
