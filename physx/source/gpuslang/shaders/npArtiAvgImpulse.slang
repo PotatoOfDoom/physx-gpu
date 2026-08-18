@@ -142,6 +142,7 @@ import pxgSlangArticulationBlocks;
 import pxgSlangSpatialMatrix;
 import pxgSlangArticulationDynamic;
 import npArtiSolveTendons;   // svHighestBit64 (P8.101a)
+import pxgSlangArticulationDesc;   // P8.106: the artiPushImpulse desc walk
 
 static const AbSpatialVector AI_ZERO = { float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f) };
 static const uint AI_NONE = 0xFFFFFFFFu;
@@ -558,4 +559,136 @@ void aiAvg2Test(uint3 dispatchThreadId : SV_DispatchThreadID)
                            gAi2.dofBlocks, lane, gAi2.maxLinks, gAi2.nbArticulations,
                            gAi2.nbSlabs, scale, gAi2.pathToRoot, gAi2.wordSize,
                            commonNode, dirtyFlags, lane);
+}
+
+// ===========================================================================
+// P8.106: artiPushImpulse (forwardDynamic2.cu:4139-4209).  Grid ceil(nb/32),
+// block (32,1,1) -- one warp per block, w = groupId.x (the P8.105 shape).
+// NOTE: PxgArticulationCore::pushImpulse has NO caller in PhysX 5.6.1 -- the
+// kernel is dead host code that the wrangler still resolves eagerly; mapping
+// it removes it from the refused list, and the fixture + sweep are what
+// verify it (no scene can dispatch it).
+//
+// TRAPS, each a sweep mutant:
+//  1. Gated on mStateDirty != 0, and the flag is NOT written -- unlike
+//     artiOutputVelocity, which clears it.
+//  2. The per-link walk indexes dofs via the link's mJointOffset field --
+//     NOT the running cursor aiAverageAndPropagateEx uses.
+//  3. Leaf -> root (index = nbLinks-1 down to 1): a child adds into its
+//     parent's mScratchImpulse BEFORE the parent is processed; ascending
+//     order loses every grandchild contribution.
+//  4. The propagate is the TEMPLATE propagateImpulseW<WriteToDeferredQstZ>
+//     with jointForce == NULL, i.e. the `0.0f - dot` spelling
+//     (adPropagateImpulseWJf with hasJf = false), not the preloaded `-dot`.
+//  5. Each link's mScratchImpulse is zeroed AFTER propagating; the parent
+//     target comes from mParents, not index - 1.
+//  6. The root tail runs only for a FREE base (eFIX_BASE is bit 0 with
+//     decoys above it): deltaV = response6x6 * (-scratch0), STORED to
+//     mRootDeferredZ (an overwrite, NOT an add), scratch0 zeroed.
+//     The engine stores a VELOCITY-dimension quantity into a field every
+//     reader treats as an impulse (PxcFsFlushVelocity computes
+//     invInertia * (-mRootDeferredZ)) -- transcribed verbatim; flagged in
+//     RUNTIME_STATUS as the sixth upstream-bug candidate.
+// ===========================================================================
+
+struct PiParams
+{
+    uint64_t desc;   // @0  PxgArticulationCoreDesc*
+}
+
+[[vk::push_constant]]
+ConstantBuffer<PiParams> gPi;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void artiPushImpulse(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    const uint64_t d = gPi.desc;
+    const uint lane = groupThreadId.x;
+    const uint globalWarpIndex = groupId.x;
+    const uint globalThreadIndex = globalWarpIndex * 32u + lane;
+
+    const uint nbArticulations = artiU32Field(d, PXG_ARTI_CORE_NB_ARTICULATIONS);
+    if (globalThreadIndex >= nbArticulations)
+        return;
+
+    const uint64_t artiBlock = artiPtrField(d, PXG_ARTI_CORE_ARTICULATION_BLOCKS)
+                             + uint64_t(globalWarpIndex) * PXG_AB_BLOCK_SIZE;
+
+    const uint dirtyFlag = abU8(artiBlock, PXG_AB_mStateDirty, lane);   // trap 1
+    if (dirtyFlag == 0u)
+        return;
+
+    const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);
+    const uint maxDofs = artiU32Field(d, PXG_ARTI_CORE_MAX_DOFS);
+    const uint64_t linkBase = artiPtrField(d, PXG_ARTI_CORE_LINK_BLOCKS)
+                            + uint64_t(globalWarpIndex) * uint64_t(maxLinks) * PXG_AB_LINK_SIZE;
+    const uint64_t dofBase = artiPtrField(d, PXG_ARTI_CORE_DOF_BLOCKS)
+                           + uint64_t(globalWarpIndex) * uint64_t(maxDofs) * PXG_AB_DOF_SIZE;
+
+    const uint nbLinks = abU32(artiBlock, PXG_AB_mNumLinks, lane);
+
+    for (uint index = nbLinks - 1u; index > 0u; --index)   // trap 3
+    {
+        const uint64_t tLink = linkBase + uint64_t(index) * PXG_AB_LINK_SIZE;
+        // trap 2: the dof window comes from the link's own field
+        const uint jointOffset = abU32(tLink, PXG_AB_LINK_mJointOffset, lane);
+        const uint64_t dofData = dofBase + uint64_t(jointOffset) * PXG_AB_DOF_SIZE;
+
+        const uint parent = abU32(tLink, PXG_AB_LINK_mParents, lane);
+        const float3 rw = float3(abF32(tLink, PXG_AB_LINK_mRw_x, lane),
+                                 abF32(tLink, PXG_AB_LINK_mRw_y, lane),
+                                 abF32(tLink, PXG_AB_LINK_mRw_z, lane));
+        const uint dofCount = abU8(tLink, PXG_AB_LINK_mDofs, lane);
+
+        const AbSpatialVector Z = aiLoadSV(tLink, PXG_AB_LINK_mScratchImpulse, lane);
+
+        AbSpatialVector isInvD[3];
+        AbSpatialVector motionMatrix[3];
+        float qstZ[3];
+        float jfNone[3];
+        for (uint ind = 0u; ind < 3u; ++ind)
+        {
+            isInvD[ind] = AI_ZERO;
+            motionMatrix[ind] = AI_ZERO;
+            qstZ[ind] = 0.0f;
+            jfNone[ind] = 0.0f;
+            if (ind < dofCount)
+            {
+                const uint64_t dd = dofData + uint64_t(ind) * PXG_AB_DOF_SIZE;
+                isInvD[ind] = aiLoadSV(dd, PXG_AB_DOF_mIsInvDW, lane);
+                motionMatrix[ind] = aiLoadSV(dd, PXG_AB_DOF_mWorldMotionMatrix, lane);
+                qstZ[ind] = abF32(dd, PXG_AB_DOF_mDeferredQstZ, lane);
+            }
+        }
+
+        // trap 4: the NULL-jointForce template spelling
+        const AbSpatialVector propagatedZ =
+            adPropagateImpulseWJf(isInvD, rw, motionMatrix, Z, dofCount, qstZ, jfNone, 1.0f,
+                                  false);
+
+        for (uint ind = 0u; ind < 3u; ++ind)
+            if (ind < dofCount)
+                abStoreF32(dofData + uint64_t(ind) * PXG_AB_DOF_SIZE, PXG_AB_DOF_mDeferredQstZ,
+                           lane, qstZ[ind]);
+
+        // trap 5
+        const uint64_t pLink = linkBase + uint64_t(parent) * PXG_AB_LINK_SIZE;
+        aiStoreSV(pLink, PXG_AB_LINK_mScratchImpulse, lane,
+                  asmSVecAdd(aiLoadSV(pLink, PXG_AB_LINK_mScratchImpulse, lane), propagatedZ));
+        aiStoreSV(tLink, PXG_AB_LINK_mScratchImpulse, lane, AI_ZERO);
+    }
+
+    const bool fixedBase = (abU32(artiBlock, PXG_AB_mFlags, lane) & 1u) != 0u;   // trap 6
+    if (!fixedBase)
+    {
+        const AbMatrix6x6 mat =
+            abLoadSpatialMatrix6x6(linkBase, PXG_AB_LINK_mSpatialResponseMatrix, lane);
+        const AbSpatialVector scratch0 = aiLoadSV(linkBase, PXG_AB_LINK_mScratchImpulse, lane);
+        const AbSpatialVector deltaV =
+            asmM6MulVec(mat, asmSVec(-scratch0.top, -scratch0.bottom));
+
+        aiStoreSV(artiBlock, PXG_AB_mRootDeferredZ, lane, deltaV);   // a STORE, not an add
+        aiStoreSV(linkBase, PXG_AB_LINK_mScratchImpulse, lane, AI_ZERO);
+    }
 }

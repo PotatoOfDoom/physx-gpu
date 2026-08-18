@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **758/758** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **759/759** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,67 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.106 — artiPushImpulse (Manifest 291): toter Host-Pfad, trotzdem gemappt
+
+`artiPushImpulse` (forwardDynamic2.cu:4139-4209) ist gemappt — als Entry in
+`npArtiAvgImpulse.slang`, wo die Leaf-nach-Root-Impulsmaschinerie schon wohnt.
+**`PxgArticulationCore::pushImpulse` hat in PhysX 5.6.1 KEINEN Aufrufer** —
+toter Host-Code; der Wrangler löst den Kernel trotzdem eager auf, weshalb er
+auf der Refused-Liste stand.  Keine Szene kann ihn je dispatchen; was ihn
+trägt, sind Fixture und Sweep.
+
+Der Kernel: unter `mStateDirty != 0` (das Flag wird NUR GELESEN, anders als
+artiOutputVelocity) läuft der Leaf-nach-Root-Walk (`index = nbLinks-1` runter
+bis 1): pro Link das Dof-Fenster über das **`mJointOffset`-FELD** (nicht den
+laufenden Cursor, den aiAverageAndPropagateEx führt), `Z = mScratchImpulse`,
+`propagateImpulseW<WriteToDeferredQstZ>` mit `jointForce == NULL` — also die
+TEMPLATE-Spelling `0.0f - dot` (`adPropagateImpulseWJf` mit `hasJf = false`),
+nicht das `-dot` der Preloaded-Variante — mit `mDeferredQstZ`-Akkumulation,
+dann Parent-Scratch += propagiert (Ziel aus `mParents`), eigener Scratch = 0.
+Am Ende, NUR für freie Basis (`eFIX_BASE` Bit 0):
+`deltaV = response6x6 * (-scratch0)` (die 6x6-P8.89-Matrix, nicht die
+7-Spalten-Dy::SpatialMatrix), als **STORE — kein Add — nach `mRootDeferredZ`**,
+Scratch 0 genullt.
+
+**Sechster Upstream-Bug-Kandidat**: dieser Store legt eine Größe der
+Dimension GESCHWINDIGKEIT (Response mal Impuls) in ein Feld, das jeder Leser
+als IMPULS behandelt — `PxcFsFlushVelocity` rechnet
+`invInertia * (-mRootDeferredZ)`, würde die Inverse also doppelt anwenden.
+Verbatim transkribiert, nicht "repariert"; da der Kernel toten Host-Code
+bedient, ist der Bug heute unbeobachtbar.
+
+**Fixture** `testArtiPushImpulse.cpp` (P8.105-Geometrie, neue Seeds):
+40 Artikulationen / 2 Warp-Slices, `mStateDirty` Periode 4 (verschoben) gegen
+`fixBase` Periode 3, Decoy-Bits über Bit 0, umgehängte Eltern,
+Null-Dof-Links — und die Dof-Fenster in UMGEKEHRTER Link-Reihenfolge
+vergeben, disjunkt, aber an 103 Stellen ungleich dem Vorwärts-Cursor (die
+Feld-Lesung ist vom Cursor unterscheidbar).  `mRootDeferredZ` mit GROSSEN
+Werten geseedet (die P8.97c-Poison-Lektion): muss fixed/clean überleben und
+frei-dirty ÜBERSCHRIEBEN werden.  Spiegel: `pxgref::aiPropagateImpulse`
+(exakt die WriteToDeferredQstZ-NULL-Spelling) + Host-`loadSpatialMatrix`
+(6x6) + `PxSpatialMatrix::operator*` — Engine-Primitive durchgehend.
+**Bit-exakt im ersten Lauf, 0 signed zeros.**
+
+**Sweep 17/17 im ersten Durchlauf**, Restore grün (auch artiAvgImpulse/2):
+Gate invertiert, Flag fälschlich gelöscht, Guard-Off-by-one (rc=139),
+Index-Fenster statt mJointOffset, Loop aufsteigend, Parent = index-1,
+Scratch nicht genullt (beide Stellen), QstZ-Writeback fehlt / Seed 0
+(Replace statt Accumulate), Parent-Store statt -Add, Root-Tail auf Fixed,
+falsches Flag-Bit, Negation fehlt, Root-STORE wird Add, Link-Pool-Pitch
+gekreuzt (rc=139), Response-Matrix vom falschen Link.  NICHT im Sweep: die
+Jf-vs-Preloaded-Spelling-Mutante (`0.0f - dot` vs `-dot`) — ihr einziger
+Unterschied ist ein ±0 im QstZ-Rückschrieb, und der gezählt-tolerante
+±0-Vergleich (P8.84-Präzedenz) schluckt genau das per Design; die Spelling
+ist nur durch die Transkription gepinnt, und diese Notiz sagt es, statt
+einen Survivor zu kaschieren.
+
+**Szene**: Refused-Liste 211 → **210** (`artiPushImpulse` ist raus).
+Launch-Trace-Erwartung: 0 Dispatches überall — kein Aufrufer.  Beide
+Schritt-Checks der Artikulations-Szene unverändert (Companion-Box y=3.7000
+|v|=0.0097, artiLink y=2.5777 in Ruhe).
+
+Suite: **759/759 ctest in BEIDEN Memory-Modi** (Binary 680/680).
 
 ## P8.105 — artiOutputVelocity (Manifest 290): der Solver-Geschwindigkeits-Writeback
 
