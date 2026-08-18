@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **746/746** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **747/747** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,58 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.100a — der Static-Constraint-Solve von artiSolveInternalConstraintsTGS1T
+
+Der Einstieg in den groessten verbleibenden Body (internalConstraints2.cu:2842,
+Template :1579-2013, VOLLSTAENDIG GELESEN samt der beiden solveStatic-
+Constraints-Overloads :1268-1552 und accumulateLinkImpulsesAndLinkVelocities
+:1554): `siSolveStaticConstraintsTGS` (neues Modul `npArtiSolveInternal.slang`,
+solveStaticConstraints TGS-Overload :1395-1552) — ein Link gegen seine
+Static-World-Batch-FENSTER (mStaticJointStartIndex / mStaticContactStartIndex
+/ mNbStaticContacts aus dem P8.96b-Prep; der JOINT-Count kommt vom CALLER,
+wie im CUDA).  Joints VOR Kontakten, `vel` faedelt durch beide Schleifen;
+der artikulierte Link sitzt pro Batch auf Seite A ODER B
+(PxNodeIndex::isArticulation), die statische Seite bekommt Null-
+Geschwindigkeit/Delta und Identity-deltaQ und ihr Impuls-Output wird
+VERWORFEN; deltaQ wird nur bei Joint-Count > 0 geladen; `deltaV += vel -
+oldVel` nur wenn ueberhaupt ein Batch lief.  doFriction stirbt hier auf dem
+TGS-Pfad (der Contact-Body nimmt es nicht).
+
+Kernel-Fahrplan (aus der Volllektuere): der Body ist (1) Prologue
+(avgImpulses OHNE scale + eVEL_DIRTY), (2) Root-Static-Solve unter !fixBase,
+(3) ein DFS ueber den Traversal-Stack (PxgArticulationTraversalStackData
+@desc 144 — indices[32] @0, impulseStack @128, deltaVStack @1152; NEUE ABI),
+Vorwaertspass = svPropagateAccelDeferred (die child2Parent-Ordnung!) + der
+per-Dof-Solve (Drive/Friction/Limit/VelLimit ueber die PX_CUDA_CALLABLE-
+Orakel computeDriveImpulse/clampDriveImpulse/computeFrictionImpulse/
+computeLimitImpulse) + Static-Solve pro Link + optionaler AFTER-Static-
+VelLimit-Pass, Rueckwaertspass = propagateImpulseW<WriteToDeferredQstZ> +
+6x6-SpatialResponse (P8.89-Layer) mit der mSolverSpatialImpulse-Buchung
+`+ impulse - ZInternalConstraint`; (4) mRootDeferredZ += parentImp +
+Residual-Flush in die RECORD-Akkumulatoren.  Die 15-Argument-ABI:
+{8,4,4,1,4,4,8,8,8,1,1,1,1,4,1}; erp = min(0.7, biasCoefficient) im Extern;
+staticContactUniqueIds/staticJointUniqueIds sind TOTE Parameter (der Body
+liest die Fenster aus den Link-Bloecken) — sie bleiben in der ABI-Zeile.
+P8.100b: der per-Dof-Solve (+ die adClampDriveImpulse/adLimitImpulse-Lifts);
+P8.100c: DFS+Backprop; P8.100d: Wrapper -> Manifest 285.
+
+**Fixture** (`testArtiSolveStatic.cpp`): per-Lane-FENSTER in geteilte
+globale Batch-Pools (ueberlappende Fenster sind der Normalzustand der
+Engine; die per-Lane-Writes landen am exclusive-popcount-Offset); Seite A
+41x / Seite B 18x; je ein Loecher-Mask pro Pool (Offset-Verschiebung); eine
+Lane mit BEIDEN Counts null, deren deltaV-Seed eine NEGATIVE NULL traegt —
+der unconditional-deltaV-Mutant stirbt an `-0 + +0 = +0`, nicht an Glueck;
+zwei Runden (minPen/accumErr).  Mirror: die zwei Schleifen ueber die
+gehoisteten pxgArtiExtSolveRef-Spiegel.  **Erster Lauf bit-exakt** (alle 10
+Puffer, beide Runden).
+
+Sweep: **10/10 KILLED nach einem Fixture-Fix** (vel-not-threaded, side-inverted, offset-is-lane, deltaq-never-loaded, deltav-unconditional [der -0-Seed], jwindow-from-contact [segfault], ccount-is-jcount, impulse-both-sides, elapsed-not-1d, err-flag-contact-inverted).  `elapsed-not-1d` UEBERLEBTE den ersten Lauf: ALLE Non-Spring-Rows trugen bounceVel != 0, was in compute1dConstraintSolverConstantsTGS biasScale auf 0 zwingt — elapsedTime erreicht den 1D-Bias NUR ueber Non-Spring-Rows mit bounceVel == 0.  Die Fixture seedet jetzt beide Bounce-Geschmaecker; der Mutant stirbt im Retest.  (Dieselbe Luecke steckt im P8.99a-Fixture testArtiSolveExtTGS — dessen geoerr-Mutant starb ueber den Spring-Pfad; Backlog-Notiz.)  Suite 747/747 ctest (668/668 Binary) in BEIDEN Memory-Modi; kein Manifest-Change, keine gelaunchten Artefakte beruehrt — kein Szenen-Lauf.
+
+Dokumentierte Aequivalenzen (nicht gesweept): deltaQ unconditional zu laden
+waere ein reiner Load ohne Seiteneffekt (Trap 4); die delta/deltaQ-
+Reassignments nach jedem Batch stellen by-value-Parameter wieder her
+(Trap 6).
 
 ## P8.99c — artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T ASSEMBLED (manifest 284)
 
