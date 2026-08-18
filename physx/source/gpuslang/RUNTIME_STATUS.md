@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **743/743** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **744/744** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,50 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.99a — the ext-solve pair on the ENGINE BLOCK LAYOUT
+
+`solveExtContactBlockTGS` (solver.cuh:430-735) and `solveExt1DBlockTGS`
+(solverBlockTGS.cuh:932-1089) — the two bodies the self-constraint and
+partition solves dispatch through batch.constraintType — as public BDA
+functions in a new module (`npArtiSolveExtTGS.slang`, NOCONTRACT).  The
+Phase-1 batteries (npArtiSolveContact/1D(+TGS)) pinned this math on
+ABSTRACTED flat inputs; this tranche is the same math over the real
+PxgTGSBlockSolver* SoA blocks.  Manifest stays **283**, suite 743 →
+**744** green in both memory modes, forced-fresh.  Sweep **14/14**, no
+survivors, first fixture run bit-exact in all four rounds.
+
+**The struct hoist:** the TGS block SoA mirrors (PxgBlockConstraintBatch,
+the contact/friction headers and rows, the 1D header/rows) moved from
+solverTGS.slang's file scope into the importable
+`pxgSlangSolverBlocks.slang` (+ PxgArticulationBlockResponse, newly
+mirrored from PxgConstraintBlock.h:99 — twelve float[32] rows);
+solverTGS.slang now imports them and the solver tests stayed green
+through the move.  solverPGS keeps its own PGS-typed file-local mirrors.
+
+**The oracle:** the 1D constants come from the ENGINE's PX_CUDA_CALLABLE
+Dy::compute1dConstraintSolverConstantsTGS (the reduced-coefficient
+overload, DyCpuGpu1dConstraint.h:545) and Dy::computeRecipUnitResponse —
+the scalar computeResolvedGeometricErrorTGS / computeMinBiasTGS overloads
+are __device__-only and transcribed (the SIMD twins are host-callable but
+not bit-comparable).  Facts pinned by the sweep: the response cursor is a
+RUNNING pointer (one row per contact, two per friction pair, one for the
+torsional tail); the contact impulse halves accumulate minus-into-imp0 /
+plus-into-imp1 with the SYMMETRIC final scale (top*invMass,
+bottom*angDom — the TGS shape); the friction pair clamps a COMBINED
+magnitude with the minNormalForce floor applied BEFORE the friction loop;
+the torsional tail exists on ODD friction counts, uses only angular
+velocities, and skips the .top impulse halves; the TGS normal update has
+NO impulse multiplier; the 1D vMul/constant are recipResponse-scaled only
+for NON-spring rows; the packed uchar4 row count is the LOW byte; the 1D
+lever arms rotate by the delta quats; the 1D final impulse packs LINEAR
+in .top scaled by invMass.  Fixture: one batch per family, 32 lanes as 32
+slots, counts 0..6 with odd friction counts, all five 1D row modes
+(hard/inequality/spring/accel-spring/bounce) coverage-asserted, non-zero
+start indices pinning all three index bases, refs (1,1) and (0.75,1.25).
+Next: P8.99b, the self-constraint solve block (batch masks +
+warpScanExclusive + the three temp-bitfield walks), then the wrapper →
+manifest 284.
 
 ## P8.98c — `artiSolveInternalTendonAndMimicJointConstraints1T` — manifest **283**
 

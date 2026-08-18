@@ -59,6 +59,7 @@
 
 import pxgSlangCommon;
 import pxgSlangSolverDesc;
+import pxgSlangSolverBlocks;
 
 static const uint DY_SC_FLAG_OUTPUT_FORCE = 1u << 1;
 static const uint DY_SC_FLAG_KEEP_BIAS = 1u << 2;
@@ -92,116 +93,9 @@ static const float PX_MAX_F32 = 3.4028234663852885981170418348452e+38f;
 // TGS block SoA structures (byte-identical mirrors)
 // ---------------------------------------------------------------------------
 
-// mirrors PxgBlockConstraintBatch (1536 bytes) — same as solverPGS.slang
-struct PxgBlockConstraintBatch
-{
-    uint descStride_constraintType;
-    uint blockContactIndex;
-    uint mConstraintBatchIndex;
-    uint startConstraintIndex;
-    uint startFrictionIndex;
-    uint mStartPartitionIndex;
-    uint mArticulationResponseIndex;
-    uint mask;
-    uint pad0[24];
-    uint2 bodyANodeIndex[32];
-    uint2 bodyBNodeIndex[32];
-    uint bodyAIndex[32];
-    uint bodyBIndex[32];
-    uint remappedBodyAIndex[32];
-    uint remappedBodyBIndex[32];
-    uint slabId[32];
-    uint2 shapeInteraction[32];
-}
-
-// mirrors PxgTGSBlockSolverContactHeader (2048 bytes)
-struct PxgTGSBlockSolverContactHeader
-{
-    float4 invMass0_1_angDom0_1[32];  // 0
-    float4 normal_staticFriction[32]; // 512
-    float minNormalForce[32];         // 1024
-    float maxPenBias[32];             // 1152
-    uint flags[32];                   // 1280
-    uint numNormalConstr[32];         // 1408
-    uint forceWritebackOffset[32];    // 1536
-    float restitutionXdt[32];         // 1664
-    float cfm[32];                    // 1792
-    float p8[32];                     // 1920
-}                                     // = 2048
-
-// mirrors PxgTGSBlockSolverFrictionHeader (1664 bytes)
-struct PxgTGSBlockSolverFrictionHeader
-{
-    float4 frictionNormals0[32];   // 0
-    float4 frictionNormals1[32];   // 512
-    uint numFrictionConstr[32];    // 1024
-    float dynamicFriction[32];     // 1152
-    uint broken[32];               // 1280
-    float biasCoefficient[32];     // 1408
-    float torsionalFrictionScale[32]; // 1536
-}                                  // = 1664
-
-// mirrors PxgTGSBlockSolverContactPoint (1792 bytes)
-struct PxgTGSBlockSolverContactPoint
-{
-    float4 raXn_extraCoeff[32]; // 0 (w = compliant coefficient "a")
-    float4 rbXn_targetVelW[32]; // 512
-    float separation[32];       // 1024
-    float maxImpulse[32];       // 1152
-    float appliedForce[32];     // 1280
-    float biasCoefficient[32];  // 1408
-    float resp0[32];            // 1536
-    float resp1[32];            // 1664
-}                               // = 1792
-
-// mirrors PxgTGSBlockSolverContactFriction (1408 bytes)
-struct PxgTGSBlockSolverContactFriction
-{
-    float4 raXn_error[32];      // 0 (w = initial error)
-    float4 rbXn_targetVelW[32]; // 512
-    float appliedForce[32];     // 1024
-    float resp0[32];            // 1152
-    float resp1[32];            // 1280
-}                               // = 1408
-
-// mirrors PxgTGSBlockSolverConstraint1DHeader (4992 bytes)
-struct PxgTGSBlockSolverConstraint1DHeader
-{
-    uint rowCounts_breakable_orthoAxisCount[32]; // 0 (uchar4 per lane)
-    float4 rAWorld_invMass0D0[32];               // 128
-    float4 rBWorld_invMass1D1[32];               // 640
-    float invInertiaScale0[32];                  // 1152
-    float invInertiaScale1[32];                  // 1280
-    uint writeBackOffset[32];                    // 1408
-    float4 angOrthoAxis0_recipResponseW0[32];    // 1536 (angOrthoAxis0_recipResponseW[0])
-    float4 angOrthoAxis0_recipResponseW1[32];    // 2048
-    float4 angOrthoAxis0_recipResponseW2[32];    // 2560
-    float4 angOrthoAxis1_ErrorW0[32];            // 3072 (angOrthoAxis1_ErrorW[0])
-    float4 angOrthoAxis1_ErrorW1[32];            // 3584
-    float4 angOrthoAxis1_ErrorW2[32];            // 4096
-    float linBreakImpulse[32];                   // 4608
-    float angBreakImpulse[32];                   // 4736
-    float cfm[32];                               // 4864
-}                                                // = 4992
-
-// mirrors PxgTGSBlockSolverConstraint1DCon (3328 bytes)
-struct PxgTGSBlockSolverConstraint1DCon
-{
-    float4 lin0XYZ_initBiasOrCoeff0[32];      // 0
-    float4 lin1XYZ_biasScaleOrCoeff1[32];     // 512
-    float4 ang0XYZ_velMultiplierOrCoeff2[32]; // 1024
-    float4 ang1XYZ_velTargetOrCoeff3[32];     // 1536
-    float resp0[32];                          // 2048
-    float resp1[32];                          // 2176
-    float geometricError[32];                 // 2304
-    float minImpulse[32];                     // 2432
-    float maxImpulse[32];                     // 2560
-    float maxBias[32];                        // 2688
-    float angularErrorScale[32];              // 2816
-    uint flags[32];                           // 2944
-    float appliedForce[32];                   // 3072
-    float residual[32];                       // 3200
-}                                             // = 3328
+// The TGS block SoA mirrors (batch, contact/friction headers and rows, the
+// 1D header/rows, and the articulation response block) moved to the
+// importable pxgSlangSolverBlocks module in P8.99a.
 
 // mirrors PxgBlockFrictionPatch (2816 bytes, PX_ALIGN(256)) — same as solverPGS.slang
 struct PxgBlockFrictionPatch
