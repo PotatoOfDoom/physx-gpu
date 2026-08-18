@@ -288,6 +288,8 @@ public static const uint PXG_ARTI_CORE_EXTERNAL_FORCES_EVERY_TGS_ITER = 68;  // 
 public static const uint PXG_ARTI_CORE_INV_LENGTH_SCALE = 64;   // PxReal
 public static const uint PXG_ARTI_CORE_ARTICULATION_BLOCKS = 128;        // PxgArticulationBlockData*
 public static const uint PXG_ARTI_CORE_LINK_BLOCKS = 136;                // PxgArticulationBlockLinkData*
+// P8.100c: the DFS traversal stack of artiSolveInternalConstraints
+public static const uint PXG_ARTI_CORE_TRAVERSAL_STACK = 144;   // PxgArticulationTraversalStackData*
 // P8.99b: the three per-batch scratch bitfield buffers the self-constraint
 // solve stages its link-path masks into (mTempPathToRootBitFieldBlocks /
 // mTempSharedBitFieldBlocks / mTempRootBitFieldBlocks -- header lines 87-89,

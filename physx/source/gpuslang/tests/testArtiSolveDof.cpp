@@ -54,6 +54,7 @@
 #include "PxgArticulation.h"
 #include "pxgArtiSolveRef.h"
 #include "pxgArtiExtSolveRef.h"
+#include "pxgArtiInternalRef.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -191,13 +192,7 @@ static void sdSeed(SdArena& B, uint32_t salt)
 
 // ---- mirror ----
 
-struct SdCov
-{
-    uint32_t locked = 0, limited = 0, freeDof = 0, oldModel = 0, newModel = 0;
-    uint32_t maxArm = 0, forceArm = 0, velHits = 0;
-};
-
-static void sdMirror(SdArena& W, uint32_t flags, SdCov& cov)
+static void sdMirror(SdArena& W, uint32_t flags, DofCov& cov)
 {
     const bool velIter = (flags & 1u) != 0;
     const bool extEvery = (flags & 2u) != 0;
@@ -223,131 +218,13 @@ static void sdMirror(SdArena& W, uint32_t flags, SdCov& cov)
         const float* jf = &W.jf[lane * SD_MAX_DOFS];
 
         RefError err;
-        for (uint32_t dof = 0; dof < dofCount; ++dof)
-        {
-            PxgArticulationBlockDofData& D = W.df[jointOffset + dof];
-            PxgArticulationInternalConstraintData& ic = D.mConstraintData;
-            const uint32_t motion = D.mMotion[lane];
-            if (motion == PxArticulationMotion::eLOCKED) { ++cov.locked; continue; }
-            if (motion == PxArticulationMotion::eLIMITED) ++cov.limited; else ++cov.freeDof;
-
-            const float maxJointVel = ic.mMaxJointVelocity[lane];
-            const UnAlignedSpatialVector row0 = loadSpatialVector(ic.mRow0, lane);
-            const UnAlignedSpatialVector row1 = loadSpatialVector(ic.mRow1, lane);
-            const float maxDriveForce = ic.mConstraintMaxImpulse[lane];
-            const float appliedDriveImpulseOrig = ic.mDriveImpulse[lane];
-            const float recipResponse = ic.mRecipResponse[lane];
-            const float response = ic.mResponse[lane];
-            const float maxFrictionForce = ic.mMaxFrictionForce[lane];
-            const UnAlignedSpatialVector dVA = loadSpatialVector(ic.mDeltaVA, lane);
-            const UnAlignedSpatialVector dVB = loadSpatialVector(ic.mDeltaVB, lane);
-
-            const bool perSubset = extEvery && !velIter;
-            const float effectiveDt = perSubset ? SD_DT : SD_SCENE_DT;
-
-            const float staticFrictionImpulse = ic.mStaticFrictionEffort[lane] * effectiveDt;
-            const float dynamicFrictionImpulse = ic.mDynamicFrictionEffort[lane] * effectiveDt;
-            const float viscousFrictionCoefficient = ic.mViscousFrictionCoefficient[lane] * effectiveDt;
-            const float maxImpulse = ic.mMaxEffort[lane] * effectiveDt;
-            const float speedImpulseGradient = ic.mSpeedEffortGradient[lane] / effectiveDt;
-            const float velocityDependentResistance = ic.mVelocityDependentResistance[lane] * effectiveDt;
-            const float externalJointImpulse = jf[jointOffset + dof] * effectiveDt;
-            const float maxActuatorVelocity = ic.mMaxActuatorVelocity[lane];
-
-            Dy::ArticulationImplicitDriveDesc driveDesc(PxZero);
-            if (!velIter)
-                driveDesc = ic.getImplicitDriveDesc(lane);
-
-            float jointV = row1.innerProduct(childV) - row0.innerProduct(parentV);
-            const float jointDeltaP = row1.innerProduct(childDelta) - row0.innerProduct(parentDelta);
-
-            float frictionDeltaF = 0.0f, driveDeltaF = 0.0f, posLimitDeltaF = 0.0f;
-            if (doFDPL)
-            {
-                const bool newFrictionModel = staticFrictionImpulse != 0.0f || viscousFrictionCoefficient != 0.0f;
-                if (!newFrictionModel)
-                {
-                    ++cov.oldModel;
-                    const float appliedFriction = 0.0f;   // TGS
-                    const float frictionForce = PxClamp(-jointV * recipResponse + appliedFriction,
-                                                        -maxFrictionForce, maxFrictionForce);
-                    ic.mAccumulatedFrictionImpulse[lane] = frictionForce;
-                    frictionDeltaF = frictionForce - appliedFriction;
-                    jointV += frictionDeltaF * response;
-                }
-
-                if (maxImpulse > 0.0f)
-                {
-                    ++cov.maxArm;
-                    const float appliedDriveImpulse = perSubset ? 0.0f : appliedDriveImpulseOrig;
-                    const float unclampedImpulse = velIter ? appliedDriveImpulse
-                        : Dy::computeDriveImpulse(appliedDriveImpulse, jointV, jointDeltaP, SD_ELAPSED, driveDesc);
-                    const float clampedImpulse = Dy::clampDriveImpulse(jointV,
-                        appliedDriveImpulse + externalJointImpulse, unclampedImpulse + externalJointImpulse,
-                        response, maxActuatorVelocity, maxImpulse, speedImpulseGradient,
-                        velocityDependentResistance) - externalJointImpulse;
-                    driveDeltaF = clampedImpulse - appliedDriveImpulse;
-                    ic.mDriveImpulse[lane] = appliedDriveImpulseOrig + driveDeltaF;
-                }
-                else
-                {
-                    ++cov.forceArm;
-                    const float unclampedForce = velIter ? appliedDriveImpulseOrig
-                        : Dy::computeDriveImpulse(appliedDriveImpulseOrig, jointV, jointDeltaP, SD_ELAPSED, driveDesc);
-                    const float clampedForce = PxClamp(unclampedForce, -maxDriveForce, maxDriveForce);
-                    driveDeltaF = clampedForce - appliedDriveImpulseOrig;
-                    ic.mDriveImpulse[lane] = clampedForce;
-                }
-                jointV += driveDeltaF * response;
-
-                if (newFrictionModel)
-                {
-                    ++cov.newModel;
-                    const float appliedFriction = perSubset ? 0.0f : ic.mAccumulatedFrictionImpulse[lane];
-                    float totalImpulse = appliedFriction - jointV * recipResponse;
-                    totalImpulse = Dy::computeFrictionImpulse(totalImpulse, staticFrictionImpulse,
-                                                              dynamicFrictionImpulse,
-                                                              viscousFrictionCoefficient, jointV);
-                    frictionDeltaF = totalImpulse - appliedFriction;
-                    ic.mAccumulatedFrictionImpulse[lane] += frictionDeltaF;
-                    jointV += frictionDeltaF * response;
-                }
-
-                if (motion == PxArticulationMotion::eLIMITED)
-                {
-                    const float errorLow = ic.mLimitError_LowX_highY[lane].x;
-                    const float errorHigh = ic.mLimitError_LowX_highY[lane].y;
-                    posLimitDeltaF = Dy::computeLimitImpulse(SD_DT, SD_INV_DT, velIter,
-                                                             response, recipResponse, SD_ERP,
-                                                             errorLow, errorHigh, jointDeltaP,
-                                                             ic.mLowImpulse[lane],
-                                                             ic.mHighImpulse[lane], jointV);
-                }
-            }
-
-            float velLimitDeltaF = 0.0f;
-            if (velBefore && PxAbs(jointV) > maxJointVel)
-            {
-                ++cov.velHits;
-                const float newJointV = PxClamp(jointV, -maxJointVel, maxJointVel);
-                velLimitDeltaF = (newJointV - jointV) * recipResponse;
-                jointV = newJointV;
-            }
-
-            const float deltaF = frictionDeltaF + driveDeltaF + posLimitDeltaF + velLimitDeltaF;
-            if (residual)
-                err.add(deltaF, recipResponse);
-
-            // accumulateLinkImpulsesAndLinkVelocities (:1554)
-            const UnAlignedSpatialVector pDelta = dVA * -deltaF;
-            const UnAlignedSpatialVector cDelta = dVB * -deltaF;
-            parentDeltaV += pDelta;
-            deltaV += cDelta;
-            parentV += pDelta;
-            childV += cDelta;
-            parentImp += row0 * deltaF;
-            impulse -= row1 * deltaF;
-        }
+        // hoisted to pxgArtiInternalRef.h in P8.100c; this fixture is a user
+        refSolveDofLane(W.df.data(), jointOffset, dofCount, jf,
+                        SD_DT, SD_SCENE_DT, SD_INV_DT, SD_ELAPSED, SD_ERP,
+                        velIter, extEvery, doFDPL, velBefore,
+                        childDelta, parentDelta,
+                        parentDeltaV, deltaV, parentV, childV, parentImp, impulse,
+                        residual, err, lane, &cov);
 
         float* out = &W.io[SD_IO_OUT + lane * SD_IO_STRIDE];
         out[0] = parentV.top.x; out[1] = parentV.top.y; out[2] = parentV.top.z;
@@ -382,7 +259,7 @@ static size_t sdRun(PxgCudaShim& shim, uint32_t flags, uint32_t salt)
     sdSeed(A, salt);
 
     SdArena W = A;
-    SdCov cov;
+    DofCov cov;
     sdMirror(W, flags, cov);
     std::printf("[ info ] dof(flags %02x): locked %u, limited %u, free %u; friction old %u/new %u; "
                 "drive max %u/force %u; velHits %u\n",

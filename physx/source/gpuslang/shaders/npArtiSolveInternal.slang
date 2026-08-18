@@ -512,3 +512,320 @@ void siDofTest(uint3 groupThreadId : SV_GroupThreadID)
     fout[33] = impulse.bottom.x; fout[34] = impulse.bottom.y; fout[35] = impulse.bottom.z;
     fout[36] = error.sumOfSquares; fout[37] = float(error.counter); fout[38] = error.maxError;
 }
+
+// ===========================================================================
+// P8.100c: the DFS — the traversal-stack walk of artiSolveInternalConstraints
+// (:1662-2002).  Forward pass: propagateAccelerationW_child2ParentPreLoaded
+// <ReadFromDeferredQstZ> (svPropagateAccelDeferred — the SEPARATE-sum order,
+// which THIS kernel uses, unlike the self-solve's direct order), the per-dof
+// solve, the static solve, the optional AFTER-static velocity-limit pass.
+// Backprop: propagateImpulseW<WriteToDeferredQstZ> (svPropagateImpulseDeferred)
+// and the 6x6 spatial response deltaV = R * -parentImp.
+//
+// TRAPS (each a sweep mutant unless marked equivalent):
+//  1. **The backprop's mSolverSpatialImpulse booking subtracts the link's
+//     mSolverSpatialInternalConstraintImpulse**: solverSpatialImpulse +=
+//     impulse - ZInternalConstraint — the internal-constraint share is
+//     tracked separately and must not double-count.
+//  2. **The backprop stores ONLY the parent's impulseStack**, never its
+//     deltaVStack — parentDeltaV continues in the register.
+//  3. **On a leaf (numChildren == 0) linkID stays put**, so the next
+//     iteration sees parent == linkID and back-propagates.
+//  4. **stack[parent].impulseStack is stored TWICE in the forward pass**
+//     (once for the parent, once for the link) and parentImp/parentDeltaV
+//     hand over to the child at the block end (parentDeltaV = deltaV).
+//  5. **The AFTER-static velocity-limit pass propagates the STATIC impulse
+//     inwards with the dof array at its BASE** — `dofData`, NOT
+//     `dofData + jointOffset` (:1927/:1928).  That reads JOINT 0's dof rows
+//     for every link; almost certainly an engine bug, transcribed as-is and
+//     recorded here.  Its qstZ target is NULL (WriteToProvidedQstZ) — the
+//     hop must NOT touch mDeferredQstZ.
+//  6. **The AFTER pass recomputes jointV against parentV + deltaVParent**
+//     (the parent velocity corrected by the static impulse response), with
+//     the 6x6 response of the PARENT.
+//  7. childImpulseInternal = the dof-solve impulse PLUS the AFTER pass's
+//     velocity-limit contribution — the static share is excluded.
+// ===========================================================================
+
+public AbSpatialVector siSolveInternalDFS(
+    uint64_t linkBase, uint64_t dofBlocks, uint64_t stackBase,
+    uint64_t jointForces,
+    uint64_t batches,
+    uint64_t contactHeaders, uint64_t frictionHeaders,
+    uint64_t contactPoints, uint64_t frictionPoints,
+    uint64_t jointHeaders, uint64_t jointRowsCon, uint64_t responses,
+    float dt, float sceneDt, float invDt, float elapsedTime, float erp, float minPen,
+    bool isVelIter, bool isExternalForceEveryStep,
+    bool doFrictionDrivePosLimit, uint doVelLimit,   // 0 none / 1 before / 2 after
+    bool doStaticContactsAnd1dConstraints,
+    AbSpatialVector storeParentDeltaV, AbSpatialVector parentImpIn,
+    AbSpatialVector parentDeltaVIn,
+    bool residualReporting, inout SvxError error, inout SvxError contactError,
+    uint lane)
+{
+    AbSpatialVector parentDeltaV = parentDeltaVIn;
+    AbSpatialVector parentImp = parentImpIn;
+
+    uint parent = 0u;
+
+    abStoreSpatialVector(stackBase + uint64_t(parent) * PXG_AB_TRAVERSAL_STACK_SIZE, PXG_AB_TRAVERSAL_deltaVStack, lane, storeParentDeltaV.top, storeParentDeltaV.bottom);
+    abStoreSpatialVector(stackBase + uint64_t(parent) * PXG_AB_TRAVERSAL_STACK_SIZE, PXG_AB_TRAVERSAL_impulseStack, lane, parentImp.top, parentImp.bottom);
+
+    uint offset = abU32(linkBase + uint64_t(parent) * PXG_AB_LINK_SIZE, PXG_AB_LINK_mChildrenOffset, lane);
+    uint numChildren = abU32(linkBase + uint64_t(parent) * PXG_AB_LINK_SIZE, PXG_AB_LINK_mNumChildren, lane);
+
+    for (uint i = 0u; i < numChildren; ++i)
+        abStoreU32(stackBase + uint64_t(i) * PXG_AB_TRAVERSAL_STACK_SIZE, PXG_AB_TRAVERSAL_indices, lane, offset + i);
+
+    uint stackCount = numChildren;
+    uint linkID = (stackCount != 0u)
+        ? abU32(stackBase + uint64_t(stackCount - 1u) * PXG_AB_TRAVERSAL_STACK_SIZE, PXG_AB_TRAVERSAL_indices, lane)
+        : 0xffffffffu;
+
+    while (stackCount != 0u)
+    {
+        const bool isBackProp = (parent == linkID);
+
+        const uint64_t link = linkBase + uint64_t(linkID) * PXG_AB_LINK_SIZE;
+        const float3 c2p = float3(abF32(link, PXG_AB_LINK_mRw_x, lane),
+                                  abF32(link, PXG_AB_LINK_mRw_y, lane),
+                                  abF32(link, PXG_AB_LINK_mRw_z, lane));
+        const uint jointOffset = abU32(link, PXG_AB_LINK_mJointOffset, lane);
+        const uint dofCount = abU8(link, PXG_AB_LINK_mDofs, lane);
+
+        if (isBackProp)
+        {
+            parent = abU32(link, PXG_AB_LINK_mParents, lane);
+
+            const AbSpatialVector solverSpatialImpulse = svLoadSV(link, PXG_AB_LINK_mSolverSpatialImpulse, lane);
+            const AbSpatialVector ZInternalConstraint = svLoadSV(link, PXG_AB_LINK_mSolverSpatialInternalConstraintImpulse, lane);
+
+            const AbMatrix6x6 spatialResponse = abLoadSpatialMatrix6x6(linkBase + uint64_t(parent) * PXG_AB_LINK_SIZE, PXG_AB_LINK_mSpatialResponseMatrix, lane);
+
+            stackCount--;
+
+            const AbSpatialVector impulse = parentImp;
+
+            const uint64_t pStack = stackBase + uint64_t(parent) * PXG_AB_TRAVERSAL_STACK_SIZE;
+            parentDeltaV = svLoadSV(pStack, PXG_AB_TRAVERSAL_deltaVStack, lane);
+            parentImp = svLoadSV(pStack, PXG_AB_TRAVERSAL_impulseStack, lane);
+
+            // trap 1: the internal-constraint share is subtracted
+            const AbSpatialVector booked = asmSVecSub(asmSVecAdd(solverSpatialImpulse, impulse), ZInternalConstraint);
+            abStoreSpatialVector(link, PXG_AB_LINK_mSolverSpatialImpulse, lane, booked.top, booked.bottom);
+
+            linkID = (stackCount > 0u)
+                ? abU32(stackBase + uint64_t(stackCount - 1u) * PXG_AB_TRAVERSAL_STACK_SIZE, PXG_AB_TRAVERSAL_indices, lane)
+                : 0xffffffffu;
+
+            float jfNone[3] = { 0.0f, 0.0f, 0.0f };
+            const AbSpatialVector propagateImp = svPropagateImpulseDeferred(c2p, dofBlocks, jointOffset, dofCount, impulse, lane, jfNone, 1.0f, false);
+
+            parentImp = asmSVecAdd(parentImp, propagateImp);
+
+            const AbSpatialVector deltaV = asmM6MulVec(spatialResponse, asmSVec(-parentImp.top, -parentImp.bottom));
+
+            parentDeltaV = asmSVecAdd(parentDeltaV, deltaV);
+
+            // trap 2: only the impulse frame goes back to the stack
+            abStoreSpatialVector(pStack, PXG_AB_TRAVERSAL_impulseStack, lane, parentImp.top, parentImp.bottom);
+        }
+        else
+        {
+            const uint64_t parentLink = linkBase + uint64_t(parent) * PXG_AB_LINK_SIZE;
+            AbSpatialVector parentV = asmSVecAdd(parentDeltaV, svLoadSV(parentLink, PXG_AB_LINK_mMotionVelocity, lane));
+            const AbSpatialVector childDelta = svLoadSV(link, PXG_AB_LINK_mDeltaMotion, lane);
+            const AbSpatialVector parentDelta = svLoadSV(parentLink, PXG_AB_LINK_mDeltaMotion, lane);
+
+            float dsp[3] = { 0.0f, 0.0f, 0.0f };
+            AbSpatialVector deltaV = svPropagateAccelDeferred(c2p, dofBlocks, jointOffset, dofCount, parentDeltaV, lane, dsp, false);
+
+            AbSpatialVector childV = asmSVecAdd(deltaV, svLoadSV(link, PXG_AB_LINK_mMotionVelocity, lane));
+
+            abStoreSpatialVector(stackBase + uint64_t(linkID) * PXG_AB_TRAVERSAL_STACK_SIZE, PXG_AB_TRAVERSAL_deltaVStack, lane, deltaV.top, deltaV.bottom);
+
+            AbSpatialVector impulse = asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
+
+            siSolveDofConstraints(dofBlocks, jointOffset, dofCount, jointForces,
+                                  dt, sceneDt, invDt, elapsedTime, erp,
+                                  isVelIter, isExternalForceEveryStep,
+                                  doFrictionDrivePosLimit, doVelLimit == 1u,
+                                  childDelta, parentDelta,
+                                  parentDeltaV, deltaV, parentV, childV, parentImp, impulse,
+                                  residualReporting, error, lane);
+
+            const uint constraintCounts = abU32(link, PXG_AB_LINK_mNbStaticJoints, lane);
+            numChildren = abU32(link, PXG_AB_LINK_mNumChildren, lane);
+
+            AbSpatialVector childImpulseInternal = impulse;
+
+            AbSpatialVector childImpulseFromStatic = asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
+            if (doStaticContactsAnd1dConstraints)
+            {
+                const AbSpatialVector before = impulse;
+                siSolveStaticConstraintsTGS(link, batches,
+                                            contactHeaders, frictionHeaders,
+                                            contactPoints, frictionPoints,
+                                            jointHeaders, jointRowsCon, responses,
+                                            childV, impulse, deltaV,
+                                            lane, minPen, elapsedTime,
+                                            residualReporting, contactError, constraintCounts);
+                childImpulseFromStatic = asmSVecSub(impulse, before);
+            }
+
+            if (doVelLimit == 2u)   // eAFTER_STATIC_CONSTRAINTS
+            {
+                const AbSpatialVector i1BeforeVelLimit = impulse;
+
+                // trap 5: the dof array at its BASE (the engine's own spelling)
+                AbSpatialVector motionB[3]; AbSpatialVector isInvDB[3]; AbSpatialVector isWB[3]; float3 invStIsTB[3];
+                svLoadDofArrays(dofBlocks, 0u, dofCount, lane, motionB, isInvDB, isWB, invStIsTB);
+                float qstzLocal[3] = { 0.0f, 0.0f, 0.0f };
+                float jfNone2[3] = { 0.0f, 0.0f, 0.0f };
+                const AbSpatialVector propagatedImpulseAtParentW = adPropagateImpulseWJf(isInvDB, c2p, motionB, childImpulseFromStatic, dofCount, qstzLocal, jfNone2, 0.0f, false);
+
+                const AbMatrix6x6 mat = abLoadSpatialMatrix6x6(parentLink, PXG_AB_LINK_mSpatialResponseMatrix, lane);
+                const AbSpatialVector deltaVParent = asmM6MulVec(mat, asmSVec(-propagatedImpulseAtParentW.top, -propagatedImpulseAtParentW.bottom));
+
+                const AbSpatialVector parentVCorrected = asmSVecAdd(parentV, deltaVParent);
+
+                for (uint dof = 0u; dof < dofCount; ++dof)
+                {
+                    const uint64_t d = dofBlocks + uint64_t(jointOffset + dof) * PXG_AB_DOF_SIZE;
+                    const uint motion = abU8(d, PXG_AB_DOF_mMotion, lane);
+                    if (motion == SI_MOTION_LOCKED)
+                        continue;
+                    const uint64_t ic = d + PXG_AB_DOF_mConstraintData;
+                    const float maxJointVel = abF32(ic, PXG_AB_IC_mMaxJointVelocity, lane);
+                    const AbSpatialVector row0 = svLoadSV(ic, PXG_AB_IC_mRow0, lane);
+                    const AbSpatialVector row1 = svLoadSV(ic, PXG_AB_IC_mRow1, lane);
+                    const float recipResponse = abF32(ic, PXG_AB_IC_mRecipResponse, lane);
+                    const AbSpatialVector dVA = svLoadSV(ic, PXG_AB_IC_mDeltaVA, lane);
+                    const AbSpatialVector dVB = svLoadSV(ic, PXG_AB_IC_mDeltaVB, lane);
+                    float jointV = asmInnerProduct(row1, childV) - asmInnerProduct(row0, parentVCorrected);
+
+                    float velLimitDeltaF = 0.0f;
+                    if (abs(jointV) > maxJointVel)
+                    {
+                        const float newJointV = adPClamp(jointV, -maxJointVel, maxJointVel);
+                        velLimitDeltaF = (newJointV - jointV) * recipResponse;
+                        jointV = newJointV;
+                    }
+
+                    if (residualReporting)
+                        svxAccumulateError(error, velLimitDeltaF, recipResponse);
+
+                    siAccumulate(velLimitDeltaF, dVA, dVB, row0, row1,
+                                 parentDeltaV, deltaV, parentV, childV, parentImp, impulse);
+                }
+
+                // trap 7: only the velocity-limit share joins the internal booking
+                childImpulseInternal = asmSVecAdd(childImpulseInternal, asmSVecSub(impulse, i1BeforeVelLimit));
+            }
+
+            abStoreSpatialVector(link, PXG_AB_LINK_mSolverSpatialInternalConstraintImpulse, lane, childImpulseInternal.top, childImpulseInternal.bottom);
+
+            abStoreSpatialVector(stackBase + uint64_t(parent) * PXG_AB_TRAVERSAL_STACK_SIZE, PXG_AB_TRAVERSAL_impulseStack, lane, parentImp.top, parentImp.bottom);
+            abStoreSpatialVector(stackBase + uint64_t(linkID) * PXG_AB_TRAVERSAL_STACK_SIZE, PXG_AB_TRAVERSAL_impulseStack, lane, impulse.top, impulse.bottom);
+
+            {
+                parent = linkID;
+                // trap 3: with no children the linkID stays -> next round backprops
+                if (numChildren > 0u)
+                {
+                    offset = abU32(link, PXG_AB_LINK_mChildrenOffset, lane);
+                    for (uint i = 0u; i < numChildren; ++i)
+                    {
+                        abStoreU32(stackBase + uint64_t(stackCount) * PXG_AB_TRAVERSAL_STACK_SIZE, PXG_AB_TRAVERSAL_indices, lane, offset + i);
+                        stackCount++;
+                    }
+                    linkID = abU32(stackBase + uint64_t(stackCount - 1u) * PXG_AB_TRAVERSAL_STACK_SIZE, PXG_AB_TRAVERSAL_indices, lane);
+                }
+
+                parentDeltaV = deltaV;
+                parentImp = impulse;
+            }
+        }
+    }
+
+    return parentImp;
+}
+
+// ---------------------------------------------------------------------------
+// test entry for the DFS
+// ---------------------------------------------------------------------------
+
+struct SfParams
+{
+    uint64_t linkBase;        // @0
+    uint64_t dofBlocks;       // @8
+    uint64_t stackBase;       // @16
+    uint64_t jointForces;     // @24  fixture scaffolding: per-lane slices
+    uint64_t batches;         // @32
+    uint64_t contactHeaders;  // @40
+    uint64_t frictionHeaders; // @48
+    uint64_t contactPoints;   // @56
+    uint64_t frictionPoints;  // @64
+    uint64_t jointHeaders;    // @72
+    uint64_t jointRowsCon;    // @80
+    uint64_t responses;       // @88
+    uint64_t io;              // @96
+    float dt;                 // @104
+    float sceneDt;            // @108
+    float invDt;              // @112
+    float elapsedTime;        // @116
+    float erp;                // @120
+    float minPen;             // @124
+    uint flagsWord;           // @128  bit0 velIter, bit1 extEvery, bit2 doFDPL,
+                              //       bits 3-4 doVelLimit, bit5 doStatic, bit6 residual
+    uint nbLanes;             // @132
+    uint maxDofs;             // @136  jointForces slice stride (scaffolding)
+    uint pad0;                // @140
+}
+
+[[vk::push_constant]]
+ConstantBuffer<SfParams> gSf;
+
+static const uint SF_IO_STRIDE = 24u;
+static const uint SF_IO_OUT_BASE = 32u * 24u;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void siDfsTest(uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint lane = groupThreadId.x;
+    if (lane >= gSf.nbLanes)
+        return;
+
+    Ptr<float> fin = Ptr<float>(gSf.io + uint64_t(lane * SF_IO_STRIDE) * 4u);
+    const AbSpatialVector storeParentDeltaV = asmSVec(float3(fin[0], fin[1], fin[2]), float3(fin[3], fin[4], fin[5]));
+    const AbSpatialVector parentImpIn = asmSVec(float3(fin[6], fin[7], fin[8]), float3(fin[9], fin[10], fin[11]));
+    const AbSpatialVector parentDeltaVIn = asmSVec(float3(fin[12], fin[13], fin[14]), float3(fin[15], fin[16], fin[17]));
+
+    const uint64_t jf = gSf.jointForces + uint64_t(lane) * uint64_t(gSf.maxDofs) * 4u;
+
+    const bool velIter = (gSf.flagsWord & 1u) != 0u;
+    const bool extEvery = (gSf.flagsWord & 2u) != 0u;
+    const bool doFDPL = (gSf.flagsWord & 4u) != 0u;
+    const uint doVelLimit = (gSf.flagsWord >> 3u) & 3u;
+    const bool doStatic = (gSf.flagsWord & 32u) != 0u;
+    const bool residual = (gSf.flagsWord & 64u) != 0u;
+
+    SvxError error = { 0.0f, 0, 0.0f };
+    SvxError contactError = { 0.0f, 0, 0.0f };
+    const AbSpatialVector finalImp = siSolveInternalDFS(
+        gSf.linkBase, gSf.dofBlocks, gSf.stackBase, jf,
+        gSf.batches, gSf.contactHeaders, gSf.frictionHeaders,
+        gSf.contactPoints, gSf.frictionPoints,
+        gSf.jointHeaders, gSf.jointRowsCon, gSf.responses,
+        gSf.dt, gSf.sceneDt, gSf.invDt, gSf.elapsedTime, gSf.erp, gSf.minPen,
+        velIter, extEvery, doFDPL, doVelLimit, doStatic,
+        storeParentDeltaV, parentImpIn, parentDeltaVIn,
+        residual, error, contactError, lane);
+
+    Ptr<float> fout = Ptr<float>(gSf.io + uint64_t(SF_IO_OUT_BASE + lane * SF_IO_STRIDE) * 4u);
+    fout[0] = finalImp.top.x; fout[1] = finalImp.top.y; fout[2] = finalImp.top.z;
+    fout[3] = finalImp.bottom.x; fout[4] = finalImp.bottom.y; fout[5] = finalImp.bottom.z;
+    fout[6] = error.sumOfSquares; fout[7] = float(error.counter); fout[8] = error.maxError;
+    fout[9] = contactError.sumOfSquares; fout[10] = float(contactError.counter); fout[11] = contactError.maxError;
+}

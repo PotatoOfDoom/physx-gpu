@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **748/748** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **749/749** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,72 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.100c — siSolveInternalDFS: der Traversal-Stack-Walk
+
+Der DFS-Kern von artiSolveInternalConstraints (internalConstraints2.cu:1662-2002)
+als `siSolveInternalDFS` in npArtiSolveInternal.slang, plus siDfsTest-Entry
+(SfParams, 144 B Push-Constants) und Fixture `testArtiSolveDFS.cpp`.  Vorab die
+Stack-ABI, build-verifiziert: PXG_AB_TRAVERSAL_STACK_SIZE = 1664, _indices = 0,
+_impulseStack = 128, _deltaVStack = 896 (pxgSlangArticulationBlocks) und
+PXG_ARTI_CORE_TRAVERSAL_STACK = 144 (pxgSlangArticulationDesc), gepinnt per
+static_assert gegen PxgArticulationTraversalStackData in testDmaArtiResidual.cpp
+und erneut in der Fixture.
+
+**Der Hoist davor:** refSolveDofLane/refSolveStaticLane (+ DofCov/StaticCov)
+zogen VERBATIM aus testArtiSolveDof.cpp/testArtiSolveStatic.cpp in das neue
+`pxgArtiInternalRef.h`; beide Ursprungs-Suiten liefen als Nutzer des Headers
+gruen, BEVOR die DFS-Arbeit begann — Hoist-beim-zweiten-Nutzer-Doktrin, die
+Parametrisierung ist der ganze Diff.
+
+**Der Spiegel:** die DFS voll transkribiert ueber die gehobenen Refs —
+refPropAccelDeferred (die child2Parent-Separate-Sum-Ordnung DIESES Kernels),
+refPropImpulseDeferred (WriteToDeferredQstZ) fuer den Backprop,
+refSolveDofLane + refSolveStaticLane (beide ueber Engine-Orakel), die Engine-
+eigene loadSpatialMatrix + PxSpatialMatrix::operator* fuer die 6x6-Response,
+und sfPropImpulseNoWrite — ein lokaler No-Write-Hop fuer den AFTER-Pass, dessen
+qstZ verworfen wird.
+
+**Fixture:** 30 Lanes, Baeume mit 4-6 Links ueber Parents {0,0,1,1,2,3}
+(Konsekutiv-Kinder-Invariante), 1-2 Dofs pro Joint, maxDofs 11 mit der
+Root-Slice bei 9-10 unter x11-Sentinels.  Static-Fenster pro Link (Counts 0/1,
+Joint via %4 und Contact via %5 — die beiden Counts divergieren pro Link).  Der
+Traversal-Stack ist DEVICE STATE und wird byteweise verglichen: Indices,
+Impulse-Frames, deltaV-Frames und das Poison jenseits jeder Live-Range.  io:
+drei ABSICHTLICH verschiedene 6-Float-Eingaben pro Lane (storeParentDeltaV /
+parentImpIn / parentDeltaVIn — pinnt, dass Stack-Slot 0 aus storeParentDeltaV
+gesaeet wird, nicht aus parentDeltaVIn).  Vier Runden:
+posIter/BEFORE/static/residual (Salt 61), velIter/AFTER/static/residual (67),
+perSubset/BEFORE/kein-static (71), NONE/static/kein-residual (73).
+**Erster Lauf bit-exakt** ueber alle vier Runden — Stack, Link-Block-Buchungen
+und io-Ausgaben byte-identisch zum Spiegel.
+
+**Der Engine-Quirk, transkribiert wie vorgefunden (dritter Upstream-Bug-
+Kandidat):** der AFTER-Static-VelLimit-Pass (:1927) laedt seine Dof-Arrays an
+der BASIS des Dof-Arrays (`dofData`), nicht an `dofData + jointOffset` — jeder
+Link propagiert mit den Rows von Joint 0.  Der Port buchstabiert das als
+`svLoadDofArrays(dofBlocks, 0u, ...)` mit Trap-Kommentar; der Sweep-Mutant
+`after-dof-at-jointoffset` ist die "offensichtliche Korrektur" und STIRBT —
+die Fixture pinnt den Quirk, statt beide Schreibweisen zu tolerieren.
+
+Sweep: **19/19 KILLED, keine Ueberlebenden** (forced-fresh).  Darunter:
+booking-no-sub (mSolverSpatialImpulse ohne −ZInternalConstraint),
+booked-wrong-impulse, backprop-stores-deltav (deltaV-Frame auch im Backprop
+zurueckgeschrieben), backprop-parent-not-reloaded (rc=124, haengende
+Traversierung), after-dof-at-jointoffset (der Quirk-Pin), after-parentv-
+uncorrected, booking-includes-static (Static-Anteil in der Internal-Buchung),
+hop-c2p-negated, response-not-negated (6x6-Response auf +parentImp),
+children-push-off-by-one (rc=139, OOB wie vorhergesagt), parentimp-not-reloaded
+(Geschwister-Summe startet bei null), parentdeltav-not-reloaded,
+handover-dropped, static-counts-contacts (die %4/%5-Divergenz zahlt sich aus),
+before-flag-widened, after-guard-widened, root-frame-crossed (die drei
+distinkten io-Eingaben zahlen sich aus), fwd-parent-imp-store-dropped,
+deltav-store-wrong-slot.
+
+Suite: 749/749 ctest (670/670 Binary) in BEIDEN Memory-Modi.  Kein
+Manifest-Change (siDfsTest ist ein Test-Entry; npArtiSolveInternal.spv wird von
+keiner Szene gelauncht — der Wrapper ist P8.100d), daher kein Szenen-Lauf
+noetig.
 
 ## P8.100b — der per-Dof-Solve, mit VIER Engine-Orakeln
 

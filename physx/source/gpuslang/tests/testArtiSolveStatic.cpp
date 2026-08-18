@@ -53,6 +53,7 @@
 #include "PxgArticulation.h"
 #include "pxgArtiSolveRef.h"
 #include "pxgArtiExtSolveRef.h"
+#include "pxgArtiInternalRef.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -341,65 +342,17 @@ static void siMirror(SiArena& W, float minPen, bool accumErr,
             PxVec3(W.io[lane * SI_IO_STRIDE + 15], W.io[lane * SI_IO_STRIDE + 16], W.io[lane * SI_IO_STRIDE + 17]));
 
         const uint32_t constraintCounts = L.mNbStaticJoints[lane];
-        const uint32_t jStart = L.mStaticJointStartIndex[lane];
-        const uint32_t cStart = L.mStaticContactStartIndex[lane];
-        const uint32_t contactCounts = L.mNbStaticContacts[lane];
-        if (constraintCounts + contactCounts == 0) ++bothZero;
-
-        const UnAlignedSpatialVector oldVel = vel;
-        UnAlignedSpatialVector delta = loadSpatialVector(L.mDeltaMotion, lane);
-        PxQuat deltaQ(PxIdentity);
-        if (constraintCounts > 0)
-        {
-            const float4 q = L.mDeltaQ[lane];
-            deltaQ = PxQuat(q.x, q.y, q.z, q.w);
-        }
+        if (constraintCounts + L.mNbStaticContacts[lane] == 0) ++bothZero;
 
         RefError err;
-        for (uint32_t i = 0; i < constraintCounts; ++i)
-        {
-            PxgBlockConstraintBatch& batch = W.bt[jStart + i];
-            const uint32_t offset = PxU32(__builtin_popcount(batch.mask & ((1u << lane) - 1u)));
-            const bool aIsArti = batch.bodyANodeIndex[offset].isArticulation() != 0;
-            if (aIsArti) ++aSide; else ++bSide;
-
-            UnAlignedSpatialVector vel0, vel1, delta0, delta1;
-            PxQuat q0, q1;
-            if (aIsArti) { vel0 = vel; delta0 = delta; q0 = deltaQ;
-                           vel1 = UnAlignedSpatialVector::Zero(); delta1 = UnAlignedSpatialVector::Zero(); q1 = PxQuat(PxIdentity); }
-            else         { vel0 = UnAlignedSpatialVector::Zero(); delta0 = UnAlignedSpatialVector::Zero(); q0 = PxQuat(PxIdentity);
-                           vel1 = vel; delta1 = delta; q1 = deltaQ; }
-            UnAlignedSpatialVector imp0(PxVec3(0.f), PxVec3(0.f)), imp1(PxVec3(0.f), PxVec3(0.f));
-            refSolveExt1DTGS(batch, vel0, vel1, delta0, delta1, offset,
-                             W.jh.data(), W.jr.data(), W.rs.data(), q0, q1,
-                             SI_ELAPSED, imp0, imp1, accumErr, 1.f, 1.f);
-            if (aIsArti) { impulse += imp0; vel = vel0; delta = delta0; deltaQ = q0; }
-            else         { impulse += imp1; vel = vel1; delta = delta1; deltaQ = q1; }
-        }
-        for (uint32_t i = 0; i < contactCounts; ++i)
-        {
-            PxgBlockConstraintBatch& batch = W.bt[cStart + i];
-            const uint32_t offset = PxU32(__builtin_popcount(batch.mask & ((1u << lane) - 1u)));
-            const bool aIsArti = batch.bodyANodeIndex[offset].isArticulation() != 0;
-            if (aIsArti) ++aSide; else ++bSide;
-
-            UnAlignedSpatialVector vel0, vel1, delta0, delta1;
-            PxQuat q0, q1;
-            if (aIsArti) { vel0 = vel; delta0 = delta; q0 = deltaQ;
-                           vel1 = UnAlignedSpatialVector::Zero(); delta1 = UnAlignedSpatialVector::Zero(); q1 = PxQuat(PxIdentity); }
-            else         { vel0 = UnAlignedSpatialVector::Zero(); delta0 = UnAlignedSpatialVector::Zero(); q0 = PxQuat(PxIdentity);
-                           vel1 = vel; delta1 = delta; q1 = deltaQ; }
-            UnAlignedSpatialVector imp0(PxVec3(0.f), PxVec3(0.f)), imp1(PxVec3(0.f), PxVec3(0.f));
-            refSolveExtContactTGS(batch, vel0, vel1, delta0, delta1, offset,
-                                  W.ch.data(), W.fh.data(), W.cp.data(), W.fp.data(),
-                                  W.rs.data(), SI_ELAPSED, minPen, imp0, imp1,
-                                  accumErr ? &err : NULL, 1.f, 1.f);
-            if (aIsArti) { impulse += imp0; vel = vel0; delta = delta0; deltaQ = q0; }
-            else         { impulse += imp1; vel = vel1; delta = delta1; deltaQ = q1; }
-        }
-
-        if (constraintCounts + contactCounts > 0)
-            deltaV += vel - oldVel;
+        StaticCov scov;
+        // hoisted to pxgArtiInternalRef.h in P8.100c; this fixture is a user
+        refSolveStaticLane(L, lane, W.bt.data(), W.ch.data(), W.fh.data(), W.cp.data(),
+                           W.fp.data(), W.jh.data(), W.jr.data(), W.rs.data(),
+                           SI_ELAPSED, minPen, accumErr, vel, impulse, deltaV, err,
+                           constraintCounts, &scov);
+        aSide += scov.aSide;
+        bSide += scov.bSide;
 
         float* out = &W.io[SI_IO_OUT + lane * SI_IO_STRIDE];
         out[0] = vel.top.x; out[1] = vel.top.y; out[2] = vel.top.z;

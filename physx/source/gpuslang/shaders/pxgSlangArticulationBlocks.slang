@@ -804,3 +804,15 @@ public void abStoreSpatialTransform(uint64_t base, uint fieldOffset, uint lane,
     (Ptr<float4>(base + uint64_t(fieldOffset + PXG_AB_STB_P)))[lane] =
         float4(p.x, p.y, p.z, 0.0f);
 }
+
+// ---------------------------------------------------------------------------
+// P8.100c: PxgArticulationTraversalStackData (PxgArticulation.h:340) — the
+// per-link DFS stack artiSolveInternalConstraints walks: PxU32 indices[32]
+// at 0, then two PxgSpatialVectorBlock frames (768 bytes each: float4
+// mTopxyz_bx[32] + float2 mbyz[32], the layout every abLoad/StoreSpatialVector
+// already speaks).  Pinned by static_assert in testArtiSolveDFS.cpp.
+// ---------------------------------------------------------------------------
+public static const uint PXG_AB_TRAVERSAL_STACK_SIZE          = 1664;
+public static const uint PXG_AB_TRAVERSAL_indices             =    0;
+public static const uint PXG_AB_TRAVERSAL_impulseStack        =  128;
+public static const uint PXG_AB_TRAVERSAL_deltaVStack         =  896;
