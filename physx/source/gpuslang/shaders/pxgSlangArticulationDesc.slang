@@ -282,6 +282,12 @@ public static const uint PXG_ARTI_CORE_NB_ARTICULATIONS = 44;  // PxU32
 public static const uint PXG_ARTI_CORE_IMPULSES = 72;           // Cm::UnAlignedSpatialVector*
 public static const uint PXG_ARTI_CORE_NB_SLABS = 80;           // PxU32
 public static const uint PXG_ARTI_CORE_SLAB_HAS_CHANGES = 88;   // uint2*
+// P8.101b: the per-partition propagate pointers, bracketed by the pinned
+// neighbors SLAB_HAS_CHANGES (88) and ARTICULATION_BLOCKS (128)
+public static const uint PXG_ARTI_CORE_SLAB_DIRTY_MASKS = 96;              // uint4*
+public static const uint PXG_ARTI_CORE_PATH_TO_ROOTS_PER_PARTITION = 104;  // PxgArticulationBitFieldStackData*
+public static const uint PXG_ARTI_CORE_IMPULSE_HOLDING_LINK = 112;         // PxU32*
+public static const uint PXG_ARTI_CORE_PARTITION_AVERAGE_SCALE = 120;      // PxReal*
 public static const uint PXG_ARTI_CORE_DT = 48;                 // PxReal
 public static const uint PXG_ARTI_CORE_GRAVITY = 52;            // PxVec3
 public static const uint PXG_ARTI_CORE_EXTERNAL_FORCES_EVERY_TGS_ITER = 68;  // bool

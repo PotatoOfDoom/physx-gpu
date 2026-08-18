@@ -109,6 +109,18 @@ static const uint8_t kArtiSolveSelf[] = { 8, 8, 1, 4, 8, 1 };
 // path but stay in the row.  (P8.100d)
 static const uint8_t kArtiSolveInternalTGS[] = { 8, 4, 4, 1, 4, 4, 8, 8, 8, 1, 1, 1, 1, 4, 1 };
 
+// forwardDynamic2.cu:3643 artiPropagateImpulses2TGS(PxgArticulationCoreDesc*,
+//     const PxgSolverCoreDesc*, const PxgSolverSharedDesc<IterativeSolveDataTGS>*,
+//     PxU32 partitionId)
+// -> three pointers @0/@8/@16 + PxU32 @24 = 28 -> 32-byte blob.  (P8.101b)
+static const uint8_t kArtiPropImp2[] = { 8, 8, 8, 4 };
+
+// forwardDynamic2.cu:3759 artiPropagateVelocityTGS(PxgArticulationCoreDesc*,
+//     PxU32 partitionId, float4* velocityOutput)
+// -> pointer @0, PxU32 @8 (4-byte tail-pad), pointer @16 = 24-byte blob.
+// The GRID IS 2D: gridDim.y = nbSlabs (blockIdx.y is the slab id).  (P8.101c)
+static const uint8_t kArtiPropVel[] = { 8, 4, 8 };
+
 // gpusolver/src/CUDA/preIntegration.cu:
 //   initStaticKinematics(PxU32 nbStaticKinematics, PxU32 nbSolverBodies,
 //                        PxgSolverBodyData*, PxgSolverTxIData*, PxAlignedTransform*,
@@ -1268,6 +1280,11 @@ static const PxgKernelAbiRow kRows[] = {
     // iteration when the config gate (doFDPL || doStatic || velLimit != NONE)
     // is on.  (P8.100d)
     { "artiSolveInternalConstraintsTGS1T", kArtiSolveInternalTGS, uint32_t(sizeof(kArtiSolveInternalTGS)) },
+    // forwardDynamic2.cu:3643/:3759 -- the averageDeltaV pair.  Grid
+    // ceil(nbArticulations/64) x block (32,2,1); the velocity kernel's grid
+    // is (ceil(nb/64), nbSlabs).  (P8.101b/c)
+    { "artiPropagateImpulses2TGS", kArtiPropImp2, uint32_t(sizeof(kArtiPropImp2)) },
+    { "artiPropagateVelocityTGS", kArtiPropVel, uint32_t(sizeof(kArtiPropVel)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

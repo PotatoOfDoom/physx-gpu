@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **751/751** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **752/752** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,69 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.101b/c — das averageDeltaV-Paar ASSEMBLED (Manifest 287)
+
+`artiPropagateImpulses2TGS` (forwardDynamic2.cu:3643, Body :3560-3633) und
+`artiPropagateVelocityTGS` (:3759, Body :3652-3749) als neues Modul
+`npArtiPropagate2.slang` — Manifest 285 -> **287**, zwei neue ABI-Zeilen
+{8,8,8,4} (32 B) und {8,4,8} (24 B).  Beide Kernel: Block (32,2,1) — ZWEI
+Warps pro Block (COMPUTE_UNCONSTRAINED_VELOCITES=64), globalWarpIndex =
+blockIdx.x*2 + threadIdx.y; der Velocity-Kernel hat ein 2D-Grid
+(gridDim.y = nbSlabs, blockIdx.y IST die Slab-Id — die erste 2D-Dispatch
+der Artikulationskette).
+
+**Impulses2 komponiert:** Dirty-Gate (saubere Artikulation wird komplett
+uebersprungen); Partition 0 -> fvFlushVelocity (P8.94b) + mStateDirty = 0
+(NULL, nicht eVEL_DIRTY); Partition != 0 nur unter eHAS_IMPULSES und nur
+bei mPartitionAverageScale > 0: countActiveSlabs (P8.99c-Helper) -> scale
+= 1/refCount -> aiAverageAndPropagate2 (P8.101a); die Dirty-Flags werden
+absichtlich NICHT geloescht (:3627).
+
+**VIERTER Upstream-Bug-Kandidat, transkribiert wie vorgefunden:** offset2 =
+globalWarpIndex + partitionId * ceil(nb/32) * wordSize — innerhalb einer
+Partition beginnt Warp w bei Eintrag w, NICHT bei w*wordSize.  Mit wordSize
+2 TEILEN sich benachbarte Warps einen Eintrag (Warp 0 liest e0,e1; Warp 1
+liest e1,e2).  Nur oberhalb von 64 Links ueberhaupt erreichbar.  Der
+Sweep-Mutant `offset2-times-wordsize` ist die "offensichtliche Korrektur"
+und STIRBT (rc=139) — die Fixture beschickt das ueberlappende Layout
+konsistent auf beiden Seiten und pinnt es.
+
+**Velocity komponiert:** Early-Out bei Scale 0 (ein Write-Side-Skip); die
+uint4-slabDirtyMasks (pro Partition gestuffed, pro (Arti, Slab) indiziert,
+zwei (dirtyIndex, writeIndex)-Paare); der wordA & ~wordB-Walk (Pfad des
+dirty Links minus Pfad des Holding-Links) LOWEST-first ueber den
+DIRECT-Order-NoJVel-Hop (P8.99b), geseedet aus mCommonLinkDeltaVelocity,
+nur bei partitionId != 0 UND dirtyLink != ~0; das TGS-Packing in DREI
+float4-Slots bei writeIndex/+32/+64 (Velocity + DeltaMotion verschraenkt).
+
+**Fixture** (`testArtiPropagate2.cpp`): voller Host-Spiegel (fvMirror +
+aiMirror2 + refPropAccelNoJVel + die countActiveSlabs-Transkription), 68
+Artikulationen in 2 Bloecken (Warp 3 komplett im Guard), maxLinks 70
+(wordSize 2), beide Kernel in Engine-Reihenfolge gelauncht (Velocity mit
+echtem 2D-Grid).  Zwei Runden: Partition 2 (Partial + korrigierte
+Velocity, 27 Partials / 136 Korrekturen / 7 Scale-Skips) und Partition 0
+(51 Flushes + unkorrigierte Velocity); Early-Outs 42/39.
+**Erster Lauf bit-exakt** ueber beide Runden.
+
+Sweep: **18/18 KILLED, keine Ueberlebenden** (forced-fresh):
+imp2-one-warp-shape, vel-one-warp-shape, dirty-gate-dropped,
+p0-sets-veldirty, p0-check-swapped (rc=139), has-impulses-gate-widened
+(rc=139), offset-without-partition (rc=139), offset2-times-wordsize
+(rc=139 — der Overlap-Pin), refcount-scale-dropped, dirtyflags-cleared,
+vel-earlyout-dropped, masks-not-stepped, slab-row-dropped,
+correction-on-p0, path-not-subtracted, walk-highest-first,
+packing-third-slot-dropped, velocity-not-accumulated.
+
+Suite: 752/752 ctest (673/673 Binary) in BEIDEN Memory-Modi.  Szene:
+refused **216 -> 214** (beide TGS-Kernel verlassen die Liste; die
+:881/:895-Launch-Fehler sind weg), 240 Steps, artiLink 2.5777 / Box 3.7329
+unveraendert — der Konsument des velocityOutput fehlt noch.  Die Szene
+benennt die naechste Arbeit selbst und eindeutig: **der EINZIGE
+verbleibende Launch-Fehler ist artiContactConstraintPrepare (210x)** — der
+Arti-Kontakt-Prep, der Anfang der Companion-Box-Kette.  Neue Desc-Pins:
+slabDirtyMasks@96 (war schon gepinnt), mPathToRootsPerPartition@104,
+mImpulseHoldingLink@112, mPartitionAverageScale@120.
 
 ## P8.101a — averageLinkImpulsesAndPropagate2, der partielle Partition-Propagate
 

@@ -128,6 +128,13 @@ static_assert(offsetof(PxgArticulationCoreDesc, nbSlabs) == 80, "..NB_SLABS");
 static_assert(offsetof(PxgArticulationCoreDesc, slabHasChanges) == 88, "..SLAB_HAS_CHANGES");
 static_assert(offsetof(PxgArticulationCoreDesc, slabDirtyMasks) == 96,
               "slabDirtyMasks moved -- recheck 88");
+// ---- P8.101b: the per-partition propagate pointers
+static_assert(offsetof(PxgArticulationCoreDesc, mPathToRootsPerPartition) == 104,
+              "..PATH_TO_ROOTS_PER_PARTITION");
+static_assert(offsetof(PxgArticulationCoreDesc, mImpulseHoldingLink) == 112,
+              "..IMPULSE_HOLDING_LINK");
+static_assert(offsetof(PxgArticulationCoreDesc, mPartitionAverageScale) == 120,
+              "..PARTITION_AVERAGE_SCALE");
 
 // ---- P8.96a: the eight temp reduction blocks, a contiguous run
 static_assert(offsetof(PxgArticulationCoreDesc, mTempContactUniqueIndicesBlock) == 280,
