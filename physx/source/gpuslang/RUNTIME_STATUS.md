@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **756/756** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **757/757** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,71 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.104 — artiSolveBlockPartitionTGSInternal: die COMPANION-BOX BEWEGT SICH
+
+Der Artikulations-Zweig von solveBlockUnified (blockIdx.y != 0 ->
+artiSolveBlockPartitionTGSInternal, solverMultiBlockTGS.cu:756-996, dieses
+Fenster VOLLSTAENDIG gelesen) war seit dem P5-Rigid-Port ein bewusster
+No-op-Early-Return — die P8.102-Kontakt-Rows wurden praepariert, aber nie
+GELOEST.  Jetzt lebt er: neues Modul `npArtiSolvePartition.slang` (eine
+public Funktion, damit solverTGS' Import nichts anderes sichtbar macht),
+komponiert aus svxSolveExtContactBlockTGS/svxSolveExt1DBlockTGS (P8.99a),
+pxgCountActiveSlabsBda (P8.99c) und den Block-Helfern; in solverTGS.slang
+wurde der Fehler-Akkumulations-Tail in eine geteilte Funktion
+(solveUnifiedErrorTail) extrahiert, die BEIDE Zweige rufen (uniformer
+Kontrollfluss um die Barrieren — die per-Lane-Returns des CUDA werden
+Guards im Modul, tote Lanes tragen Nullen bei).  **solverTGS wanderte
+dafuer in PXG_NOCONTRACT_SHADERS** (der importierte svx-Code haette sonst
+kontrahiert); alle Rigid-Suiten und -Szenen blieben gruen.
+
+Traps 1-9 im Modulkopf, u.a.: startIndex partition-0-speziell
+(mArtiBatchStartIndex vs. artiConstraintsPerPartition[idx-1]), endIndex
+MIT batch-Offset / startIndex OHNE; **articulationBatchOffset und
+nbArticulations lesen islandContextPool[0]** (der CUDA-POINTER-Deref),
+waehrend island pool[islandIndex] ist; die 3-Slot-Staging-Ladung
+(k*192+lane, TGS-Packung); curRef via countActiveSlabs (Arti: remapped +
+numDynamicBodies + bodyOffset; Rigid nur bei id >= bodyOffset); deltaQ nur
+fuer 1D-Batches (Arti: Block-mDeltaQ Spalte artiId&31, Rigid:
+txIData.deltaBody2World.q @0); Rigid-Writeback an den REMAPPED-Index;
+Arti-Writeback streut den IMPULS nach deferredZ[computeDeltaVIndex] +
+isSlabDirty.x/.y + mStateDirty = eHAS_IMPULSES|eVEL_DIRTY (sub-word
+atomarer And/Or).
+
+**Fixture** (`testArtiSolvePartitionWrap.cpp`): der ECHTE Engine-Entry mit
+Grid (2,2,1) — Rigid-Zweig gegen eine LEERE Partition, Arti-Zweig gegen
+2 lebende Batches (Kontakt Stride 26, 1D Stride 13) mit gemischten
+Arti/Rigid-Paaren auf beiden Seiten (global eindeutige (artiId, slab)-
+Paare pro Seite); Mirror = refSolveExtContactTGS/refSolveExt1DTGS
+(P8.99a) + die countActiveSlabs-Popcount-Formel + die Staging/Writeback-
+Transkription; zwei Runden (Partition 2/Residual aus vs. Partition 0/
+Residual an).  Zwei Erst-Anlauf-Lektionen: (1) der globale
+Fehler-Akkumulator reduziert die 32 Lanes per BUTTERFLY-Baum — eine
+lineare Lane-Summe im Mirror liegt 1 ULP daneben; (2) DY_SC_FLAG_SPRING
+ist Bit 5 (nicht 1), und Non-Spring-Rows mit bounceVel != 0 erzwingen
+biasScale = 0 — der deltaQ-Fehlerterm braucht eine bounce-freie Row,
+sonst sind die deltaQ-Mutanten unbeobachtbar.  Danach **bit-exakt, beide
+Runden, 0 tolerierte +-0.**
+
+Sweep: **21/21 KILLED** (18 im ersten Lauf; die drei deltaQ-Ueberlebenden
+starben nach Lektion (2)): start-arm-collapsed, offset-island-indexed
+(rc=139), nbarti-island-indexed (rc=139), endindex-no-offset,
+staging-b-slot-crossed, stage-unpack-crossed, refcount-plain-index,
+refcount-static-counted, deltaq-never-loaded, deltaq-column-crossed,
+deltaq-rigid-reads-p, type-discriminator-flipped (rc=139),
+rigid-writeback-plain-index, deltav-index-swapped, impulse-vel-scattered,
+slabdirty-xy-crossed, statedirty-veldirty-only, residual-strict-positive,
+curref-swapped, arti-warp-index-unscaled, arti-tail-skipped.
+
+Suite: **757/757 ctest (678/678 Binary) in BEIDEN Memory-Modi.**  Kein
+Manifest-Change (solveBlockUnified war gemappt — der Zweig war das Loch).
+Szene: die Companion-Box hat zum ERSTEN MAL eine Reaktion aus dem
+Arti-Kontakt: final y 3.7329 -> **3.7000**, |v| 0.0000 -> **0.0097**; der
+artiLink unveraendert 2.5777.  Rigid-Spot-Checks (box, stack, joint,
+meshfloor, convex, softbody, cloth) alle gruen unter dem
+NOCONTRACT-solverTGS.  Fuer die volle Reaktion fehlt als naechstes
+artiOutputVelocity (der Writeback der geloesten Arti-Geschwindigkeiten in
+den Solver-Pool) und dann die restliche Refused-Arti-Liste.
 
 ## P8.103 — artiTGSJointConstraintBlockPrepareParallelLaunch (Manifest 289)
 

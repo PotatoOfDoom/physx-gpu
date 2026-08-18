@@ -60,6 +60,7 @@
 import pxgSlangCommon;
 import pxgSlangSolverDesc;
 import pxgSlangSolverBlocks;
+import npArtiSolvePartition;   // P8.104: the articulation branch of solveBlockUnified
 
 static const uint DY_SC_FLAG_OUTPUT_FORCE = 1u << 1;
 static const uint DY_SC_FLAG_KEEP_BIAS = 1u << 2;
@@ -2400,6 +2401,74 @@ void solveWholeIslandTGS(uint3 groupThreadId : SV_GroupThreadID)
 // PxgConstraintType encoding).  Like the .cu, the contact-residual statistics
 // are accumulated into solverDesc->contactErrorAccumulator when residual
 // reporting is enabled (accumulateErrorGlobalFullWarp).
+// P8.104: PxgErrorAccumulator::accumulateErrorGlobalFullWarp(), extracted so
+// BOTH branches of solveBlockUnified (rigid and articulation) share it: a
+// per-warp sum/sum/max butterfly reduction through the groupshared scratch,
+// then lane 0 of each warp accumulates into solverDesc->contactErrorAccumulator.
+// The reduction runs unconditionally (uniform control flow around the
+// barriers); a disabled launch skips only the atomics.
+void solveUnifiedErrorTail(uint localIdx, uint threadIndexInWarp, float errSumSq, float errMax,
+                           uint errCount, bool residualAccumulationEnabled,
+                           Ptr<PxgSolverCoreDescGpu> descPtr)
+{
+    GroupMemoryBarrierWithGroupSync();
+    shUnifiedErrSum[localIdx] = errSumSq;
+    shUnifiedErrMax[localIdx] = errMax;
+    shUnifiedErrCount[localIdx] = errCount;
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint radius = 16u; radius > 0u; radius >>= 1)
+    {
+        const uint partner = localIdx ^ radius; // stays inside the warp's 32 lanes
+        const float s = shUnifiedErrSum[partner];
+        const float m = shUnifiedErrMax[partner];
+        const uint c = shUnifiedErrCount[partner];
+        GroupMemoryBarrierWithGroupSync();
+        shUnifiedErrSum[localIdx] += s;
+        shUnifiedErrMax[localIdx] = max(shUnifiedErrMax[localIdx], m);
+        shUnifiedErrCount[localIdx] += c;
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (residualAccumulationEnabled && threadIndexInWarp == 0u)
+    {
+        const float sumSq = shUnifiedErrSum[localIdx];
+        const uint count = shUnifiedErrCount[localIdx];
+        const float maxErr = shUnifiedErrMax[localIdx];
+
+        // atomicAdd(&mErrorSumOfSquares, s): float atomic add via CAS on raw bits
+        uint assumed = descPtr[0].contactErrorAccumulator_mErrorSumOfSquares;
+        for (;;)
+        {
+            const uint newBits = asuint(asfloat(assumed) + sumSq);
+            uint old;
+            InterlockedCompareExchange(descPtr[0].contactErrorAccumulator_mErrorSumOfSquares, assumed,
+                                       newBits, old);
+            if (old == assumed)
+                break;
+            assumed = old;
+        }
+
+        int oldCount;
+        InterlockedAdd(descPtr[0].contactErrorAccumulator_mCounter, int(count), oldCount);
+
+        if (maxErr > asfloat(descPtr[0].contactErrorAccumulator_mMaxError))
+        {
+            assumed = descPtr[0].contactErrorAccumulator_mMaxError;
+            for (;;)
+            {
+                const uint newBits = asuint(max(maxErr, asfloat(assumed)));
+                uint old;
+                InterlockedCompareExchange(descPtr[0].contactErrorAccumulator_mMaxError, assumed,
+                                           newBits, old);
+                if (old == assumed)
+                    break;
+                assumed = old;
+            }
+        }
+    }
+}
+
 struct SolveBlockUnifiedAbiParams
 {
     uint64_t solverCoreDesc; // @0
@@ -2425,12 +2494,28 @@ groupshared uint  shUnifiedErrCount[64];
 [numthreads(32, 2, 1)]
 void solveBlockUnified(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
 {
-    // Deferred articulation path: the engine only dispatches groupId.y != 0
-    // (blockY == 2) for partitions with articulation batches, which a rigid-only
-    // scene never produces.  artiSolveBlockPartitionTGSInternal is out of scope
-    // for this tranche, so the articulation warps are a clean no-op.
+    // P8.104: the articulation branch (blockIdx.y != 0 ->
+    // artiSolveBlockPartitionTGSInternal, solverMultiBlockTGS.cu:756) lives in
+    // npArtiSolvePartition.slang; the shared error tail keeps every barrier in
+    // uniform control flow (the CUDA's per-lane early returns become guards
+    // inside the module function, contributing zeros to the reduction).
     if (groupId.y != 0)
+    {
+        float aErrSumSq;
+        float aErrMax;
+        uint aErrCount;
+        bool aResidual;
+        aspSolveBlockPartitionTGS(gSolveUnifiedAbi.solverCoreDesc, gSolveUnifiedAbi.sharedDesc,
+                                  gSolveUnifiedAbi.islandIndex, gSolveUnifiedAbi.partitionIndex,
+                                  gSolveUnifiedAbi.elapsedTime, gSolveUnifiedAbi.minPen,
+                                  gSolveUnifiedAbi.artiDesc,
+                                  groupId.x * 2u + groupThreadId.y, groupThreadId.x,
+                                  aErrSumSq, aErrMax, aErrCount, aResidual);
+        solveUnifiedErrorTail(groupThreadId.y * 32u + groupThreadId.x, groupThreadId.x,
+                              aErrSumSq, aErrMax, aErrCount, aResidual,
+                              Ptr<PxgSolverCoreDescGpu>(gSolveUnifiedAbi.solverCoreDesc));
         return;
+    }
 
     Ptr<PxgSolverCoreDescGpu> descPtr = Ptr<PxgSolverCoreDescGpu>(gSolveUnifiedAbi.solverCoreDesc);
     PxgSolverCoreDescGpu desc = descPtr[0];
@@ -2586,68 +2671,8 @@ void solveBlockUnified(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : S
         }
     }
 
-    // PxgErrorAccumulator::accumulateErrorGlobalFullWarp(): per-warp sum/sum/max
-    // butterfly reduction, then lane 0 of each warp accumulates into
-    // solverDesc->contactErrorAccumulator.  Mirrors solveStaticBlockTGS (same
-    // 64-thread / 2-warp block).  The reduction runs unconditionally (uniform
-    // control flow around the barriers); warps that solved joints only reduce
-    // their zero-init accumulators, and a disabled launch skips only the atomics.
-    GroupMemoryBarrierWithGroupSync();
-    shUnifiedErrSum[localIdx] = error.sumOfSquares;
-    shUnifiedErrMax[localIdx] = error.maxError;
-    shUnifiedErrCount[localIdx] = uint(error.counter);
-    GroupMemoryBarrierWithGroupSync();
-
-    for (uint radius = 16u; radius > 0u; radius >>= 1)
-    {
-        const uint partner = localIdx ^ radius; // stays inside the warp's 32 lanes
-        const float s = shUnifiedErrSum[partner];
-        const float m = shUnifiedErrMax[partner];
-        const uint c = shUnifiedErrCount[partner];
-        GroupMemoryBarrierWithGroupSync();
-        shUnifiedErrSum[localIdx] += s;
-        shUnifiedErrMax[localIdx] = max(shUnifiedErrMax[localIdx], m);
-        shUnifiedErrCount[localIdx] += c;
-        GroupMemoryBarrierWithGroupSync();
-    }
-
-    if (residualAccumulationEnabled && threadIndexInWarp == 0u)
-    {
-        const float sumSq = shUnifiedErrSum[localIdx];
-        const uint count = shUnifiedErrCount[localIdx];
-        const float maxErr = shUnifiedErrMax[localIdx];
-
-        // atomicAdd(&mErrorSumOfSquares, s): float atomic add via CAS on raw bits
-        uint assumed = descPtr[0].contactErrorAccumulator_mErrorSumOfSquares;
-        for (;;)
-        {
-            const uint newBits = asuint(asfloat(assumed) + sumSq);
-            uint old;
-            InterlockedCompareExchange(descPtr[0].contactErrorAccumulator_mErrorSumOfSquares, assumed,
-                                       newBits, old);
-            if (old == assumed)
-                break;
-            assumed = old;
-        }
-
-        int oldCount;
-        InterlockedAdd(descPtr[0].contactErrorAccumulator_mCounter, int(count), oldCount);
-
-        if (maxErr > asfloat(descPtr[0].contactErrorAccumulator_mMaxError))
-        {
-            assumed = descPtr[0].contactErrorAccumulator_mMaxError;
-            for (;;)
-            {
-                const uint newBits = asuint(max(maxErr, asfloat(assumed)));
-                uint old;
-                InterlockedCompareExchange(descPtr[0].contactErrorAccumulator_mMaxError, assumed,
-                                           newBits, old);
-                if (old == assumed)
-                    break;
-                assumed = old;
-            }
-        }
-    }
+    solveUnifiedErrorTail(localIdx, threadIndexInWarp, error.sumOfSquares, error.maxError,
+                          uint(error.counter), residualAccumulationEnabled, descPtr);
 }
 
 // ---------------------------------------------------------------------------
