@@ -288,6 +288,13 @@ public static const uint PXG_ARTI_CORE_EXTERNAL_FORCES_EVERY_TGS_ITER = 68;  // 
 public static const uint PXG_ARTI_CORE_INV_LENGTH_SCALE = 64;   // PxReal
 public static const uint PXG_ARTI_CORE_ARTICULATION_BLOCKS = 128;        // PxgArticulationBlockData*
 public static const uint PXG_ARTI_CORE_LINK_BLOCKS = 136;                // PxgArticulationBlockLinkData*
+// P8.99b: the three per-batch scratch bitfield buffers the self-constraint
+// solve stages its link-path masks into (mTempPathToRootBitFieldBlocks /
+// mTempSharedBitFieldBlocks / mTempRootBitFieldBlocks -- header lines 87-89,
+// between mTraversalStack at 144 and mPathToRootBitFieldBlocks at 176).
+public static const uint PXG_ARTI_CORE_TEMP_PATH_TO_ROOT_BITFIELD_BLOCKS = 152; // PxgArticulationBitFieldStackData*
+public static const uint PXG_ARTI_CORE_TEMP_SHARED_BITFIELD_BLOCKS = 160;       // PxgArticulationBitFieldStackData*
+public static const uint PXG_ARTI_CORE_TEMP_ROOT_BITFIELD_BLOCKS = 168;         // PxgArticulationBitFieldStackData*
 public static const uint PXG_ARTI_CORE_PATH_TO_ROOT_BITFIELD_BLOCKS = 176; // PxgArticulationBitFieldData*
 public static const uint PXG_ARTI_CORE_DOF_BLOCKS = 184;                 // PxgArticulationBlockDofData*
 public static const uint PXG_ARTI_CORE_SPATIAL_TENDON_BLOCKS = 192;      // PxgArticulationBlockSpatialTendonData*

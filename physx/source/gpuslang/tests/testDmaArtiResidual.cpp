@@ -98,6 +98,9 @@ static_assert(offsetof(PxgBodySim, articulationRemapId) == 176, "..ARTICULATION_
 static_assert(offsetof(PxgArticulationCoreDesc, invLengthScale) == 64, "..INV_LENGTH_SCALE");
 static_assert(offsetof(PxgArticulationCoreDesc, mArticulationBlocks) == 128, "..ARTICULATION_BLOCKS");
 static_assert(offsetof(PxgArticulationCoreDesc, mArticulationLinkBlocks) == 136, "..LINK_BLOCKS");
+static_assert(offsetof(PxgArticulationCoreDesc, mTempPathToRootBitFieldBlocks) == 152, "..TEMP_PATH_TO_ROOT_BITFIELD_BLOCKS");
+static_assert(offsetof(PxgArticulationCoreDesc, mTempSharedBitFieldBlocks) == 160, "..TEMP_SHARED_BITFIELD_BLOCKS");
+static_assert(offsetof(PxgArticulationCoreDesc, mTempRootBitFieldBlocks) == 168, "..TEMP_ROOT_BITFIELD_BLOCKS");
 static_assert(offsetof(PxgArticulationCoreDesc, mPathToRootBitFieldBlocks) == 176, "..PATH_TO_ROOT_BITFIELD_BLOCKS");
 static_assert(offsetof(PxgArticulationCoreDesc, mArticulationDofBlocks) == 184, "..DOF_BLOCKS");
 static_assert(offsetof(PxgArticulationCoreDesc, mArticulationSpatialTendonBlocks) == 192, "..SPATIAL_TENDON_BLOCKS");

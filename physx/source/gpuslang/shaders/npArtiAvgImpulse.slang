@@ -157,27 +157,35 @@ void aiStoreSV(uint64_t base, uint fieldOffset, uint lane, AbSpatialVector v)
     abStoreSpatialVector(base, fieldOffset, lane, v.top, v.bottom);
 }
 
-// averageLinkImpulsesAndPropagate (articulationImpulseResponse.cuh:114), with
-// the caller's default `scale == 0`.
-public void aiAverageAndPropagate(uint64_t isSlabDirty, uint64_t impulses, uint64_t artiBlock,
-                                  uint64_t linkBlocks, uint64_t dofBlocks, uint articulationId,
-                                  uint maxLinks, uint nbArticulations, uint nbSlabs, uint lane)
+// averageLinkImpulsesAndPropagate (articulationImpulseResponse.cuh:114).  The
+// CUDA has ONE function with a `scale = 0.0f` default: scale == 0 computes the
+// (non-momentum-conserving) slab count internally; a caller-provided scale
+// (P8.99's 1/referenceCount) skips that.  The Ex form carries the parameter;
+// the old name forwards with 0, entering exactly the CUDA's default branch.
+public void aiAverageAndPropagateEx(uint64_t isSlabDirty, uint64_t impulses, uint64_t artiBlock,
+                                    uint64_t linkBlocks, uint64_t dofBlocks, uint articulationId,
+                                    uint maxLinks, uint nbArticulations, uint nbSlabs,
+                                    float scaleIn, uint lane)
 {
     const uint slabStepSize = maxLinks * nbArticulations;
 
     // trap 1: the count is over slabs whose pair is not both-empty, and the
     // reciprocal is taken only above one
-    float scale = 1.0f;
-    if (nbSlabs > 1u)
+    float scale = scaleIn;
+    if (scaleIn == 0.0f)
     {
-        float count = 0.0f;
-        for (uint s = 0u, di = articulationId; s < nbSlabs; ++s, di += nbArticulations)
+        scale = 1.0f;
+        if (nbSlabs > 1u)
         {
-            const uint2 dirty = (Ptr<uint2>(isSlabDirty))[di];
-            if (dirty.x != AI_NONE || dirty.y != AI_NONE)
-                count += 1.0f;
+            float count = 0.0f;
+            for (uint s = 0u, di = articulationId; s < nbSlabs; ++s, di += nbArticulations)
+            {
+                const uint2 dirty = (Ptr<uint2>(isSlabDirty))[di];
+                if (dirty.x != AI_NONE || dirty.y != AI_NONE)
+                    count += 1.0f;
+            }
+            scale = count > 1.0f ? 1.0f / count : 1.0f;
         }
-        scale = count > 1.0f ? 1.0f / count : 1.0f;
     }
 
     // trap 2: SEEDED from the block, not from zero
@@ -343,4 +351,12 @@ void artiAvgImpulse(uint3 dispatchThreadId : SV_DispatchThreadID)
     aiAverageAndPropagate(gAi.isSlabDirty, gAi.impulses, gAi.artiBlock, gAi.linkBlocks,
                           gAi.dofBlocks, lane, gAi.maxLinks, gAi.nbArticulations, gAi.nbSlabs,
                           lane);
+}
+
+public void aiAverageAndPropagate(uint64_t isSlabDirty, uint64_t impulses, uint64_t artiBlock,
+                                  uint64_t linkBlocks, uint64_t dofBlocks, uint articulationId,
+                                  uint maxLinks, uint nbArticulations, uint nbSlabs, uint lane)
+{
+    aiAverageAndPropagateEx(isSlabDirty, impulses, artiBlock, linkBlocks, dofBlocks,
+                            articulationId, maxLinks, nbArticulations, nbSlabs, 0.0f, lane);
 }

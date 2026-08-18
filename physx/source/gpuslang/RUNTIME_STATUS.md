@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **744/744** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **745/745** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,86 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.99b — ssSolveSelfConstraints: der Self-Constraint-Solve-Block (Suite 745)
+
+`artiPropagateRigidImpulsesAndSolveSelfConstraints1T`s Herzstueck
+(internalConstraints2.cu:3861-4093, TGS-Instanz) als swept BDA-Funktionen in
+`npArtiSolveSelf.slang`:
+
+* `svPropagateAccelNoJVel` <- propagateAccelerationWNoJVelUpdate
+  (articulationImpulseResponse.cuh:59) — der deferred Beschleunigungs-Hop in
+  der DIREKTEN (everythingPreLoaded-)Summenordnung, Q-stZ aus mDeferredQstZ;
+  Body = adPropagateAccelerationWEx ueber Block-Loads.  NICHT
+  svPropagateAccelDeferred (child2Parent-Ordnung, P8.98a) — der Sweep-Mutant
+  `accel-order-swapped` belegt, dass die Fixture die beiden Ordnungen trennt.
+* `ssSolveSelfConstraints` — die Batch-Schleife: pro aktiver Lane
+  (batch.mask, offset = exclusive popcount) die Link-IDs aus den
+  PxNodeIndex-Paaren, drei Temp-Bitfeld-Puffer (A, B, common=A&B) aus den
+  per-Link-Path-to-Root-Woertern, Velocity-Walks root->link (lowest-first,
+  Root-Skip NACH dem Word-Offset-Add), Ext-Solve-Dispatch (constraintType =
+  HIGH-Halbwort von descStride_constraintType; eARTICULATION_CONTACT=3 ->
+  svxSolveExtContactBlockTGS, sonst svxSolveExt1DBlockTGS — beide mit dem
+  kompakten OFFSET als threadIndex, die Link-Loads mDeltaMotion/mDeltaQ aber
+  mit der LANE), Impuls-Walks leaf->root (highest-first, B, dann A, dann
+  impulse0+=impulse1, dann common mit Root-BREAK) via svPropagateImpulseDeferred
+  (WriteToDeferredQstZ, NULL-jf-Pfad `0.0f - dot`), rootDeferredZ als REGISTER
+  ueber die Batches akkumuliert und einmal gespeichert.
+
+**Zwei neue Plattform-Lektionen, beide eine Session Debugging wert:**
+
+1. **`ConstantBuffer` ohne `[[vk::push_constant]]` wird als UBO-Descriptor
+   (Set 0, Binding 0) kompiliert, den der Test-Shim nie bindet** — die
+   Parameter lesen sich als Garbage-Pointer, jeder Deref segfaultet.  Alle
+   bisherigen Module trugen das Attribut; das neue hatte es nicht, und der
+   Segfault sah exakt wie ein OOB im neuen Walk-Code aus.  Diagnose: spirv-dis
+   auf gSs (`OpVariable ... Uniform` statt `PushConstant`).
+2. **SECHSTE Plattformregel: `1uL` ist in Slang ein 32-BIT-Literal.**
+   `word &= ~(1uL << index)` emittiert `OpShiftLeftLogical %uint` — fuer
+   index >= 32 (Links 32..63 in Wort 0) ist der Shift undefiniert (llvmpipe:
+   je nach Codegen falsche Bits ODER Segfault).  Fix: `uint64_t(1) << index`.
+   Der Bug war LATENT in npArtiSolveTendons (drei `1uL << child`-Stellen,
+   mitgefixt): alle P8.98-Fixtures hatten WORDSIZE=1 und child < 32, die
+   Szene erreicht mit bis zu 64 Attachments pro Tendon aber auch dort
+   Indizes >= 32.  Korpus-Audit: keine weiteren 64-Bit-Literal-Shifts.
+   Merksatz: ein 64-Bit-Shift braucht einen 64-Bit-LHS-AUSDRUCK, kein
+   Suffix — slangc warnt nicht.
+
+**Fixture** (`testArtiSolveSelf.cpp`): 1 Block, 32 Lanes (30 live),
+MAX_LINKS=70 -> wordSize=2 — die Wort-Grenz-Buchfuehrung (wordOffset-Adds,
+top-word-down-Walks) ist LIVE, anders als in den WORDSIZE=1-Tendon-Fixtures,
+wo ein vergessener wordOffset eine Identitaet waere.  Per-Lane-Topologien
+verschieden (Branch-Schritt haengt an der Lane), Stamm 0..7 lane-invariant;
+fuenf Node-Paar-Szenarien (beide Links in Wort 1 / je eins pro Wort /
+linkA==linkB / Vorfahren-Paar mit leerem B-Walk / Root-only-Common); fuenf
+Batches ab Offset 2, Kontakt/1D alternierend, Masken mit Loechern
+(offset != lane 52x), eine Maske erreicht die abgeschirmten Lanes 30/31.
+Root-Link mit GROSSEN Sentinels (P8.97c-Lektion).  Zwei Runden
+(minPen=-MAX/accumErr an; minPen=0/accumErr aus — 1D-Residuen muessen
+POISON bleiben).  Mirror: Kontrollfluss ueber Engine-Loads +
+pxgtest::refPropagateAccelerationW (direkte Ordnung) + refPropImpulseDeferred
++ die nach `pxgArtiExtSolveRef.h` GEHOISTETEN P8.99a-Ext-Solve-Mirrors
+(Engine-Structs, 1D-Konstanten aus Dy::compute1dConstraintSolverConstantsTGS).
+15 Puffer byte-exakt, Coverage-asserted (Kontakt 32 / 1D 29 Batches,
+word1-Hops 102, equal pairs 12, empty B 29, root-only-common 13, zero-resp).
+
+**Der offset-als-threadIndex-Fund:** solveConstraints (:3999) uebergibt
+`offset` (nicht threadIdx.x) an die Solve-Bodies — die Batch-Constraint-
+Bloecke sind vom Prep kompakt nach Scan-Position gepackt.  Die Link-Loads
+(:3779, :3791) bleiben auf threadIdx.x.  Der erste Fixture-Lauf hatte den
+Mirror auf `lane` und divergierte exakt an den Lanes mit offset != lane.
+
+Sweep: **16/16 KILLED** (accel-order-swapped, commondelta-stale, root-skip-dropped, offset-is-lane, imp-order-lowest, deltavb-from-commondelta, strip-b-dropped, join-dropped, rootz-overwrite, type-swapped [segfault], word1-offset-dropped, scalars-lane-read [segfault], stage-common-or, stage-b-copypaste, delta-loads-offset, residual-flag-inverted); Restore gruen.  Suite 745/745 ctest / 666/666 Binary in BEIDEN Memory-Modi; Szene: 240 Steps OK, refused unveraendert 218 (kein Manifest-Change), artiLink weiter exakt y=2.500 — der Tendon-Shift-Fix aendert das gelaunchte npArtiSolveTMKernel.spv, die 1200 Launches bleiben gruen.
+
+Dokumentierte Aequivalenz (nicht gesweept): der mRootDeferredZ-Store bei
+nbSelfConstraints==0 unconditional statt geguardet schriebe die ungeaenderten
+Bytes zurueck (Trap 12 im Modulkopf); Root-BREAK vs Root-SKIP im Common-
+Impuls-Walk ist aequivalent, weil Root Bit 0 von Wort 0 ist — die letzte
+Position eines highest-first-Walks (Trap 5).
+
+__syncwarp(mask) vor dem Solve ist im Port ein lane-lokales No-Op (die
+Solve-Bodies tauschen nichts ueber Lanes, die Temp-Puffer sind lane-indiziert)
+— bewusst weggelassen, Trap 10 im Modulkopf.
 
 ## P8.99a — the ext-solve pair on the ENGINE BLOCK LAYOUT
 

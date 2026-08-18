@@ -80,26 +80,26 @@ import pxgSlangArticulationBlocks;
 import pxgSlangSpatialMatrix;
 import pxgSlangArticulationDynamic;
 
-uint svHighestBit64(uint64_t v)
+public uint svHighestBit64(uint64_t v)
 {
     const uint hi = uint(v >> 32);
     return hi != 0u ? 32u + firstbithigh(hi) : firstbithigh(uint(v));
 }
 
-uint svLowestBit64(uint64_t v)
+public uint svLowestBit64(uint64_t v)
 {
     const uint lo = uint(v);
     return lo != 0u ? firstbitlow(lo) : 32u + firstbitlow(uint(v >> 32));
 }
 
-AbSpatialVector svLoadSV(uint64_t base, uint fieldOffset, uint lane)
+public AbSpatialVector svLoadSV(uint64_t base, uint fieldOffset, uint lane)
 {
     float3 top, bottom;
     abLoadSpatialVector(base, fieldOffset, lane, top, bottom);
     return asmSVec(top, bottom);
 }
 
-void svAddSV(uint64_t base, uint fieldOffset, uint lane, AbSpatialVector v)
+public void svAddSV(uint64_t base, uint fieldOffset, uint lane, AbSpatialVector v)
 {
     const AbSpatialVector cur = svLoadSV(base, fieldOffset, lane);
     const AbSpatialVector sum = asmSVecAdd(cur, v);
@@ -107,7 +107,7 @@ void svAddSV(uint64_t base, uint fieldOffset, uint lane, AbSpatialVector v)
 }
 
 // the per-link dof arrays every propagation hop needs
-void svLoadDofArrays(uint64_t dofBlocks, uint jointOffset, uint dofCount, uint lane,
+public void svLoadDofArrays(uint64_t dofBlocks, uint jointOffset, uint dofCount, uint lane,
                      out AbSpatialVector motion[3], out AbSpatialVector isInvD[3],
                      out AbSpatialVector isW[3], out float3 invStIsT[3])
 {
@@ -141,7 +141,7 @@ void svLoadDofArrays(uint64_t dofBlocks, uint jointOffset, uint dofCount, uint l
 // that is `pd + (a + b)` versus `(pd + a) + b`, a different rounding, and
 // the fixture measured 1-2 ULP divergence on exactly the free-base cases
 // before this was spelled per the .cuh.
-AbSpatialVector svPropagateAccelDeferred(float3 parentToChild, uint64_t dofBlocks,
+public AbSpatialVector svPropagateAccelDeferred(float3 parentToChild, uint64_t dofBlocks,
                                          uint jointOffset, uint dofCount,
                                          AbSpatialVector parentDeltaV, uint lane,
                                          inout float deltaJointSpeeds[3], bool wantSpeeds)
@@ -191,7 +191,7 @@ AbSpatialVector svPropagateAccelDeferred(float3 parentToChild, uint64_t dofBlock
 
 // propagateImpulseW<WriteToDeferredQstZ>: qstZ seeded from mDeferredQstZ,
 // accumulated by adPropagateImpulseWJf, written back (trap 9).
-AbSpatialVector svPropagateImpulseDeferred(float3 childToParent, uint64_t dofBlocks,
+public AbSpatialVector svPropagateImpulseDeferred(float3 childToParent, uint64_t dofBlocks,
                                            uint jointOffset, uint dofCount,
                                            AbSpatialVector Z, uint lane,
                                            float jf[3], float jfMult, bool hasJf)
@@ -644,7 +644,7 @@ public void svUpdateTendonConstraintsTGS(uint64_t artiBlock, uint64_t linkBase,
 
             if (stackCount > 0u)
             {
-                bitStack &= (~(1uL << child));
+                bitStack &= (~(uint64_t(1) << child));
                 bitStack |= children;
                 child = svHighestBit64(bitStack);
                 parent = abU32(attachmentBlock + uint64_t(child) * PXG_AB_AT_SIZE,
@@ -816,7 +816,7 @@ public void svSolveFixedConstraints(uint64_t artiBlock, uint64_t linkBase,
         while (stackCount != 0u)
         {
             const uint child = svHighestBit64(bitStack);
-            bitStack &= (~(1uL << child));
+            bitStack &= (~(uint64_t(1) << child));
             stackCount--;
 
             const uint64_t tj = tendonJointBlock + uint64_t(child) * PXG_AB_TJ_SIZE;
@@ -899,7 +899,7 @@ public void svSolveFixedConstraints(uint64_t artiBlock, uint64_t linkBase,
         while (totalStack != 0uL)
         {
             const uint child = svHighestBit64(totalStack);
-            totalStack &= (~(1uL << child));
+            totalStack &= (~(uint64_t(1) << child));
 
             const uint64_t tj = tendonJointBlock + uint64_t(child) * PXG_AB_TJ_SIZE;
 
