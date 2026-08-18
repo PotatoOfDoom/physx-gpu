@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **761/761** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **762/762** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,61 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.111 — artiComputeDependencies (Manifest 296) + der SIEBTE Upstream-Bug-Kandidat
+
+`artiComputeDependencies` (forwardDynamic2.cu:3315-3480) ist gemappt — als
+Entry in `npArtiPropagate2.slang`: die Pro-Partitions-Vorberechnung
+(Common Node, Slab-Average-Scale, Propagate-Up-Pfad), die
+artiPropagateImpulses2/artiPropagateVelocity konsumieren.  Reine
+Per-Thread-Bitfeld-Algebra über Desc-Pools — KEINE Artikulations-Blöcke,
+keine Warp-Ops.  Die Fallen: die Nullungs-Schleife löscht VIER Pools (die
+drei mTemp* plus den Partition-0-Slot), die Common-Link-Suche läuft
+Wörter-höchstes-zuerst mit zwei Modi (roher Pfad vs Schnitt mit
+sharedBitField), `commonNode = min(...)` akkumuliert ÜBER Partitionen,
+der rootBitField-Reload feuert nur bei Änderung (was die indizierte
+Lesung in den Grenzen hält), der Partitions-Output geht in den Slot der
+NÄCHSTEN Partition, sharedPathEmpty ist MONOTON, und
+`scale = count < 1 ? 0 : 1/count` zählt Slabs mit mindestens einem
+Dirty-Index (x oder z; y/w werden hier nie gelesen).
+
+**SIEBTER Upstream-Bug-Kandidat** (verbatim transkribiert): die
+Nullungs-Schleife indiziert mPathToRootsPerPartition mit `w * wordSize`,
+der Partitions-Write (und der propagate2-READ, :3609) mit
+`w + partition * nbArticulationBatchPerPartition * wordSize` — bei
+wordSize >= 2 (mehr als 64 Links) ÜBERLAPPEN die Slots benachbarter
+Warps: ein Cross-Warp-Data-Race auf denselben (Slot, Lane)-Wörtern.
+Bei wordSize == 1 (jede heutige Szene) unsichtbar.
+
+**Fixture** `testArtiComputeDeps.cpp`, ZWEI race-frei gewählte Runden:
+A = 40 Artikulationen / 2 Warps / maxLinks 7 (wordSize 1 — die
+Multi-Warp-Adressierung), B = 20 / 1 Warp / maxLinks 70 (wordSize 2 —
+die Wort-Schleifen tragen echte Arbeit, kein zweiter Warp fürs Race).
+Seeds: gemischte Null-/Dicht-Wörter (die Suche muss Null-Wörter
+überspringen), x-only/z-only/beide/keine-Masken mit Junk in y/w, Lanes
+deren erster Dirty-Link erst ab Partition 2 auftaucht (der
+No-Reload-Pfad).  **Der erste Lauf schlug fehl — und der Fehler lag in
+der FIXTURE**: die Seeds hatten Pfad-Bits >= maxLinks gesetzt; die
+Engine-Invariante ist, dass ein Path-to-Root nur existierende Links
+markiert, sonst wird commonNode eine unmögliche Link-ID und der Reload
+liest OOB (der Spiegel lieferte commonNode 48 bei maxLinks 7).  Nach der
+Maskierung bit-exakt in beiden Runden.
+
+**Sweep 17/17**: p0-Slot nicht genullt, count nur über x, beide
+Suchrichtungen invertiert, niedrigstes statt höchstes Bit, Schnitt
+ignoriert shared, min wird Letzter, Reload gestrichen, Output in die
+EIGENE Partition / ungeguarded, Tail-shared per OR statt Assign,
+Pfad nicht genullt, Scale ohne Klemme (inf), Holding unpartitioniert,
+Slab-Masken nicht gesteppt, Guard-Off-by-one, sharedPathEmpty
+überschrieben statt akkumuliert.  NICHT im Sweep, als Äquivalenzen
+dokumentiert: ein Reload bei UNVERÄNDERTEM commonNode schreibt denselben
+Inhalt (idempotent), und ein fehlendes `oldCommonNode`-Update ebenso.
+
+Szene: Refused-Liste 206 → **205**; Artikulations-Szene weiter grün.
+Der Kernel läuft nur auf dem PGS-Pfad (precomputeDependencies) — Fixture
+und Sweep tragen ihn.
+
+Suite: **762/762 ctest in BEIDEN Memory-Modi** (Binary 683/683).
 
 ## P8.110 — artiSaveVelocity1TPGS (Manifest 295): reine Komposition
 

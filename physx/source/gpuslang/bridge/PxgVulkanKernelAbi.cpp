@@ -1290,6 +1290,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "artiPropagateImpulses2PGS", kArtiPropImp2, uint32_t(sizeof(kArtiPropImp2)) },
     { "artiPropagateVelocity", kArtiPropVel, uint32_t(sizeof(kArtiPropVel)) },
     { "artiSaveVelocity1TPGS", kOnePtr, 1u },
+    { "artiComputeDependencies", kPtrU32, uint32_t(sizeof(kPtrU32)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

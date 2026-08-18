@@ -425,3 +425,226 @@ void artiSaveVelocity1TPGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId
                    abF32(dd, PXG_AB_DOF_mJointVelocities, lane));
     }
 }
+
+// ===========================================================================
+// P8.111: artiComputeDependencies (forwardDynamic2.cu:3315-3480).  Grid
+// ceil(nb/64), block (32,2,1), one THREAD per articulation.  Precomputes,
+// per partition: the common node (mImpulseHoldingLink), the slab-count
+// average scale (mPartitionAverageScale), and the per-partition
+// propagate-up path (mPathToRootsPerPartition) that artiPropagateImpulses2
+// and artiPropagateVelocity consume.  Pure per-thread bitfield algebra --
+// no warp ops, no block SoA (only the desc-level bitfield pools).
+//
+// TRAPS, each a sweep mutant unless marked:
+//  1. The zero loop clears FOUR pools: the three mTemp* scratches AND the
+//     partition-0 slot of mPathToRootsPerPartition (at w * wordSize).
+//  2. The common-link search walks words HIGHEST-first and takes the
+//     highest set bit; the sharedPathEmpty mode searches the RAW link path,
+//     the other mode the INTERSECTION with sharedBitField.
+//  3. commonNode = min(commonLink, commonNode) accumulates ACROSS
+//     partitions -- never reset.
+//  4. rootBitField reloads from the common node's path ONLY when commonNode
+//     changed (initially 0xFFFFFFFF == old, so no reload until a dirty link
+//     exists -- which is what keeps the indexed read in bounds).
+//  5. The per-partition output goes to the NEXT partition's slot, and only
+//     when nextPartition < nbPartitions.
+//  6. After each partition: sharedBitField := rootBitField, sharedPathEmpty
+//     keeps accumulating (it is MONOTONIC -- once false, false forever),
+//     pathToRootBitField is zeroed.
+//  7. count counts SLABS with at least one dirty index (x or z);
+//     scale = count < 1 ? 0 : 1/count.
+//
+// SEVENTH UPSTREAM-BUG CANDIDATE (transcribed verbatim, not fixed): the
+// zero loop indexes mPathToRootsPerPartition at `w * wordSize`, but the
+// per-partition write (and the propagate2 READ, :3609) at
+// `w + partition * nbArticulationBatchPerPartition * wordSize` -- for
+// wordSize >= 2 (more than 64 links) adjacent warps' slots OVERLAP, a
+// cross-warp data race on the same (slot, lane) words.  Invisible at
+// wordSize == 1, which is every scene today.  The fixture's rounds are
+// chosen race-free (multi-warp only at wordSize 1; wordSize 2 single-warp).
+// ===========================================================================
+
+struct CdParams
+{
+    uint64_t scDesc;      // @0  PxgArticulationCoreDesc*
+    uint nbPartitions;    // @8
+    uint pad0;            // @12 -> 16
+}
+
+[[vk::push_constant]]
+ConstantBuffer<CdParams> gCd;
+
+[shader("compute")]
+[numthreads(32, 2, 1)]
+void artiComputeDependencies(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    const uint64_t d = gCd.scDesc;
+    const uint nbPartitions = gCd.nbPartitions;
+    const uint lane = groupThreadId.x;
+    const uint globalWarpIndex = groupId.x * 2u + groupThreadId.y;
+    const uint globalThreadIndex = globalWarpIndex * 32u + lane;
+
+    const uint nbArticulations = artiU32Field(d, PXG_ARTI_CORE_NB_ARTICULATIONS);
+    if (globalThreadIndex >= nbArticulations)
+        return;
+
+    const uint articulationId = globalThreadIndex;
+    const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);
+    const uint nbSlabs = artiU32Field(d, PXG_ARTI_CORE_NB_SLABS);
+    const uint64_t slabDirtyMasksBase = artiPtrField(d, PXG_ARTI_CORE_SLAB_DIRTY_MASKS);
+    Ptr<uint> dirtyLink = Ptr<uint>(artiPtrField(d, PXG_ARTI_CORE_IMPULSE_HOLDING_LINK));
+    Ptr<float> partitionAverageScale =
+        Ptr<float>(artiPtrField(d, PXG_ARTI_CORE_PARTITION_AVERAGE_SCALE));
+
+    const uint slabPartitionStride = nbArticulations * nbSlabs;
+    const uint wordSize = (maxLinks + 63u) / 64u;
+    const uint64_t w = uint64_t(globalWarpIndex);
+
+    const uint64_t pathToRootBitField = artiPtrField(d, PXG_ARTI_CORE_TEMP_PATH_TO_ROOT_BITFIELD_BLOCKS)
+                                      + w * wordSize * PXG_AB_BITFIELD_STACK_SIZE;
+    const uint64_t sharedBitField = artiPtrField(d, PXG_ARTI_CORE_TEMP_SHARED_BITFIELD_BLOCKS)
+                                  + w * wordSize * PXG_AB_BITFIELD_STACK_SIZE;
+    const uint64_t rootBitField = artiPtrField(d, PXG_ARTI_CORE_TEMP_ROOT_BITFIELD_BLOCKS)
+                                + w * wordSize * PXG_AB_BITFIELD_STACK_SIZE;
+    const uint64_t linkBitFieldBlocks = artiPtrField(d, PXG_ARTI_CORE_PATH_TO_ROOT_BITFIELD_BLOCKS)
+        + w * uint64_t(maxLinks) * wordSize * PXG_AB_BITFIELD_STACK_SIZE;
+    const uint64_t pathsPerPartition = artiPtrField(d, PXG_ARTI_CORE_PATH_TO_ROOTS_PER_PARTITION);
+
+    // trap 1: four pools zeroed, incl. the partition-0 slot at w * wordSize
+    {
+        const uint64_t p0 = pathsPerPartition + w * wordSize * PXG_AB_BITFIELD_STACK_SIZE;
+        for (uint j = 0u; j < wordSize; ++j)
+        {
+            abStoreU64(pathToRootBitField + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane, 0uL);
+            abStoreU64(rootBitField + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane, 0uL);
+            abStoreU64(sharedBitField + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane, 0uL);
+            abStoreU64(p0 + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane, 0uL);
+        }
+    }
+
+    uint commonNode = 0xFFFFFFFFu;
+    uint oldCommonNode = commonNode;
+    bool sharedPathEmpty = true;
+
+    const uint nbArticulationBatchPerPartition = (nbArticulations + 31u) / 32u;
+
+    for (uint partition = 0u; partition < nbPartitions; ++partition)
+    {
+        const uint partitionOffset = articulationId + nbArticulations * partition;
+        const uint64_t slabDirtyMasks = slabDirtyMasksBase
+                                      + uint64_t(slabPartitionStride) * partition * 16u;
+
+        float count = 0.0f;
+
+        for (uint s = 0u; s < nbSlabs; ++s)
+        {
+            const uint slabDirtyIndex = articulationId + s * nbArticulations;
+            const uint4 dirtyIndex2 = (Ptr<uint4>(slabDirtyMasks))[slabDirtyIndex];
+
+            if (dirtyIndex2.x != 0xFFFFFFFFu || dirtyIndex2.z != 0xFFFFFFFFu)
+                count += 1.0f;   // trap 7
+
+            for (uint i = 0u; i < 2u; ++i)
+            {
+                const uint dirtyIndex = (i == 0u) ? dirtyIndex2.x : dirtyIndex2.z;
+                if (dirtyIndex != 0xFFFFFFFFu)
+                {
+                    const uint64_t linkPathToRoot = linkBitFieldBlocks
+                        + uint64_t(dirtyIndex) * wordSize * PXG_AB_BITFIELD_STACK_SIZE;
+                    uint commonLink = 0u;
+                    if (sharedPathEmpty)
+                    {
+                        // trap 2: the raw path, highest word first
+                        for (int j = int(wordSize) - 1; j >= 0; --j)
+                        {
+                            const uint64_t word = abU64(
+                                linkPathToRoot + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u,
+                                lane);
+                            if (word != 0uL)
+                            {
+                                commonLink = svHighestBit64(word) + uint(j) * 64u;
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // trap 2: the INTERSECTION with the shared path
+                        for (int j = int(wordSize) - 1; j >= 0; --j)
+                        {
+                            const uint64_t word0 = abU64(
+                                sharedBitField + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u,
+                                lane);
+                            const uint64_t word1 = abU64(
+                                linkPathToRoot + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u,
+                                lane);
+                            const uint64_t word = word0 & word1;
+                            if (word != 0uL)
+                            {
+                                commonLink = svHighestBit64(word) + uint(j) * 64u;
+                                break;
+                            }
+                        }
+                    }
+
+                    commonNode = min(commonLink, commonNode);   // trap 3
+
+                    for (uint j = 0u; j < wordSize; ++j)
+                    {
+                        const uint64_t jOff = uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE;
+                        const uint64_t word = abU64(linkPathToRoot + jOff, 0u, lane);
+                        abStoreU64(pathToRootBitField + jOff, 0u, lane,
+                                   abU64(pathToRootBitField + jOff, 0u, lane) | word);
+                        abStoreU64(sharedBitField + jOff, 0u, lane,
+                                   abU64(sharedBitField + jOff, 0u, lane) | word);
+                        sharedPathEmpty = sharedPathEmpty && (word == 0uL);
+                    }
+                }
+            }
+        }
+
+        // trap 4: reload only on change
+        if (commonNode != oldCommonNode)
+        {
+            const uint64_t linkPathToRoot = linkBitFieldBlocks
+                + uint64_t(commonNode) * wordSize * PXG_AB_BITFIELD_STACK_SIZE;
+            for (uint j = 0u; j < wordSize; ++j)
+            {
+                const uint64_t jOff = uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE;
+                abStoreU64(rootBitField + jOff, 0u, lane, abU64(linkPathToRoot + jOff, 0u, lane));
+            }
+            oldCommonNode = commonNode;
+        }
+
+        // trap 5: the NEXT partition's slot (the engine's own addressing --
+        // see the seventh-candidate note above)
+        const uint nextPartition = partition + 1u;
+        if (nextPartition < nbPartitions)
+        {
+            const uint64_t outSlot = pathsPerPartition
+                + uint64_t(globalWarpIndex
+                           + nextPartition * nbArticulationBatchPerPartition * wordSize)
+                      * PXG_AB_BITFIELD_STACK_SIZE;
+            for (uint j = 0u; j < wordSize; ++j)
+            {
+                const uint64_t jOff = uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE;
+                abStoreU64(outSlot + jOff, 0u, lane,
+                           abU64(pathToRootBitField + jOff, 0u, lane));
+            }
+        }
+
+        // trap 6
+        for (uint j = 0u; j < wordSize; ++j)
+        {
+            const uint64_t jOff = uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE;
+            const uint64_t word = abU64(rootBitField + jOff, 0u, lane);
+            abStoreU64(sharedBitField + jOff, 0u, lane, word);
+            sharedPathEmpty = sharedPathEmpty && (word == 0uL);
+            abStoreU64(pathToRootBitField + jOff, 0u, lane, 0uL);
+        }
+
+        const float scale = count < 1.0f ? 0.0f : 1.0f / count;
+        dirtyLink[partitionOffset] = commonNode;
+        partitionAverageScale[partitionOffset] = scale;
+    }
+}
