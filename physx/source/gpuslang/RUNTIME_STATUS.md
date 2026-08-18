@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **741/741** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **742/742** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,53 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.98b — the three internal-constraint solve bodies, first-run bit-exact
+
+`solveInternalSpatialConstraints` (internalConstraints2.cu:2317, with the
+TGS length-refresh DFS :2015), `solveInternalFixedConstraints` (:2435) and
+`solveInternalMimicJointConstraints` (:2693), composed onto P8.98a's
+workhorses in the same module.  Manifest stays **282**, suite 741 →
+**742** green in both memory modes, forced-fresh.  Sweep **18/18 after
+one fixture fix**, no survivors.  ZERO new ABI.  The mimic impulse scalar
+is transcribed from `computeMimicJointImpulses`
+(DyCpuGpuArticulation.h:637) — which is PX_CUDA_CALLABLE, so the fixture
+computes that path with the ENGINE's own function: the strongest oracle
+in the solve chain so far.  The spatial/fixed mirrors are transcriptions
+over the P8.98a hoisted helpers (`pxgArtiSolveRef.h` — hoisted this
+tranche so this fixture is their second USER, the P8.94d arrangement).
+
+**First run: all five rounds bit-exact** (spatial TGS + PGS, fixed,
+mimic position + velocity iteration) — the P8.98a order lessons were
+already paid for.  Facts pinned: the spatial parent velocity is computed
+ONCE (from the LAST constraint's mLink0, seeded through constraint 0's
+row0) and updated as a SCALAR via `mDeltaVA * -deltaF` with the
+constraint loop running BACKWARDS; the fixed solve keeps TWO bit stacks
+(the DFS-consumed one and the union replayed highest-first), scales by
+`1/popcount(union)`, accumulates `cImpulse` ALONE into
+mSolverSpatialImpulse (impulse - YInt == cImpulse), and re-zeroes
+mScratchImpulse over nbLinks after the tendon loop while mScratchDeltaV
+survives as observable scratch; the fixed DFS reads the LINK parent, not
+the tendon-joint parent (whose mParents the fixture leaves POISONED to
+prove non-reading); the dead isTGS parameters of the fixed and mimic
+bodies and the dead `parent = child` store are dropped (the P8.87
+arrangement); the mimic compliance branch is three-way (compliant only
+when naturalFrequency > 0 AND dampingRatio > 0 AND not a velocity
+iteration).
+
+**The sweep's one survivor was the fixture again** (the P8.96a family):
+the attachment tree had no non-leaf below the root, so the TGS refresh's
+`children != 0` arm never ran and a mutant storing a constraint at EVERY
+node was an identity at fixture scale.  With att1 a non-leaf (att3
+beneath it) the mutant dies — and the limit seeding had to give every
+fifth lane a HIGH low limit so the refreshed lengths also land BELOW it
+(branch coverage is counted on the host and PXG_CHECKed for all three
+limit regimes, the exact-zero deltaF skip arm, and both compliance
+modes).  Next: P8.98c, the wrapper
+`artiSolveInternalTendonAndMimicJointConstraints1T` (:2775) → manifest
+283, ABI {8,4,4,4,1,1}, with the eHAS_IMPULSES →
+averageLinkImpulsesAndPropagate preamble (P8.94c's aiAverageAndPropagate,
+already mapped) and the mStateDirty → eVEL_DIRTY transition.
 
 ## P8.98a — `pxcFsGetVelocity` + `pxcFsApplyImpulses`, and a SIXTH summation-order lesson
 

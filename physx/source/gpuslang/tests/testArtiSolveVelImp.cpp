@@ -67,6 +67,7 @@
 #include "DyFeatherstoneArticulation.h"
 #include "PxSpatialMatrix.h"
 #include "PxgArticulation.h"
+#include "pxgArtiSolveRef.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -104,220 +105,6 @@ static uint32_t svParent(uint32_t l)
     return p[l];
 }
 static uint32_t svDofs(uint32_t a, uint32_t l) { return 1u + ((a + l) % 2u); }
-
-// ---- the transcribed hops (articulationDynamic.cuh template instances) ----
-
-// propagateImpulseW<WriteToDeferredQstZ> (:129): temp seeds from Z, per-dof
-// adds, qstZ accumulates into mDeferredQstZ, `stZ = jf - dot`.
-static UnAlignedSpatialVector refPropImpulseDeferred(PxgArticulationBlockDofData* dofs,
-                                                     PxU32 jointOffset, PxU32 dofCount,
-                                                     const PxVec3& c2p,
-                                                     const UnAlignedSpatialVector& Z,
-                                                     const PxReal* jf, PxReal jfMult,
-                                                     PxU32 lane)
-{
-    UnAlignedSpatialVector temp = Z;
-    for (PxU32 ind = 0; ind < 3; ++ind)
-    {
-        if (ind < dofCount)
-        {
-            PxgArticulationBlockDofData& dd = dofs[jointOffset + ind];
-            const UnAlignedSpatialVector sas = loadSpatialVector(dd.mWorldMotionMatrix, lane);
-            const UnAlignedSpatialVector isInvD = loadSpatialVector(dd.mIsInvDW, lane);
-            const PxReal jfv = jf ? jf[ind] * jfMult : 0.0f;
-            const PxReal stZ = jfv - sas.innerProduct(Z);
-            dd.mDeferredQstZ[lane] += stZ;
-            temp += isInvD * stZ;
-        }
-    }
-    return Dy::FeatherstoneArticulation::translateSpatialVector(c2p, temp);
-}
-
-// propagateAccelerationW_child2ParentPreLoaded<ReadFromDeferredQstZ> (:257):
-// two passes, every tJointDelta from the PRE-accumulation pDeltaV, the full
-// three-lane dot in pass two, optional jDelta report.
-static UnAlignedSpatialVector refPropAccelDeferred(const PxgArticulationBlockDofData* dofs,
-                                                   PxU32 jointOffset, PxU32 dofCount,
-                                                   const PxVec3& c2p,
-                                                   const UnAlignedSpatialVector& parentDeltaV,
-                                                   PxReal* jDeltaOut, PxU32 lane)
-{
-    const UnAlignedSpatialVector pDeltaV =
-        Dy::FeatherstoneArticulation::translateSpatialVector(-c2p, parentDeltaV);
-
-    PxReal tJointDelta[3] = { 0.f, 0.f, 0.f };
-    for (PxU32 ind = 0; ind < 3; ++ind)
-    {
-        if (ind < dofCount)
-        {
-            const PxgArticulationBlockDofData& dd = dofs[jointOffset + ind];
-            const UnAlignedSpatialVector IsW = loadSpatialVector(dd.mIsW, lane);
-            const PxReal temp = IsW.innerProduct(pDeltaV);
-            tJointDelta[ind] = dd.mDeferredQstZ[lane] - temp;
-        }
-    }
-
-    UnAlignedSpatialVector jointSpatialDeltaV(PxVec3(0.f), PxVec3(0.f));
-    for (PxU32 ind = 0; ind < 3; ++ind)
-    {
-        if (ind < dofCount)
-        {
-            const PxgArticulationBlockDofData& dd = dofs[jointOffset + ind];
-            const UnAlignedSpatialVector sas = loadSpatialVector(dd.mWorldMotionMatrix, lane);
-            const PxReal jDelta = dd.mInvStIsT_x[lane] * tJointDelta[0]
-                                + dd.mInvStIsT_y[lane] * tJointDelta[1]
-                                + dd.mInvStIsT_z[lane] * tJointDelta[2];
-            if (jDeltaOut)
-                jDeltaOut[ind] = jDelta;
-            jointSpatialDeltaV += sas * jDelta;
-        }
-    }
-
-    return pDeltaV + jointSpatialDeltaV;
-}
-
-// pxcFsGetVelocity (:2116)
-static UnAlignedSpatialVector refGetVelocity(const PxgArticulationBlockData& ab,
-                                             PxgArticulationBlockLinkData* lk,
-                                             const PxgArticulationBlockDofData* df,
-                                             const uint64_t* bf,
-                                             PxU32 linkID, bool fixBase,
-                                             PxReal* jointDofSpeeds, PxU32 lane)
-{
-    UnAlignedSpatialVector deltaV(PxVec3(0.f), PxVec3(0.f));
-    if (!fixBase)
-    {
-        const UnAlignedSpatialVector rootDeferredZ = loadSpatialVector(ab.mRootDeferredZ, lane);
-        Dy::SpatialMatrix m;
-        loadSpatialMatrix(ab.mInvSpatialArticulatedInertia, lane, m);
-        deltaV = m * -rootDeferredZ;
-    }
-
-    PxReal deltaJointDofSpeeds[3] = { 0.f, 0.f, 0.f };
-    const PxgArticulationBlockLinkData& link = lk[linkID];
-
-    for (PxU32 j = 0, wordOffset = 0; j < SV_WORDSIZE; ++j, wordOffset += 64)
-    {
-        uint64_t pathToRoot = bf[(linkID * SV_WORDSIZE + j) * 32 + lane];
-        while (pathToRoot != 0)
-        {
-            unsigned long idx;
-            // lowest set bit
-            idx = __builtin_ctzll(pathToRoot);
-            const PxU32 index = PxU32(idx) + wordOffset;
-            if (index != 0)
-            {
-                const PxgArticulationBlockLinkData& cLink = lk[index];
-                const PxU32 jointOffset = cLink.mJointOffset[lane];
-                const PxU32 dofCount = cLink.mDofs[lane];
-                const PxVec3 c2p(cLink.mRw_x[lane], cLink.mRw_y[lane], cLink.mRw_z[lane]);
-                PxReal* opt = ((linkID == index) && jointDofSpeeds) ? deltaJointDofSpeeds
-                                                                    : NULL;
-                deltaV = refPropAccelDeferred(df, jointOffset, dofCount, c2p, deltaV, opt,
-                                              lane);
-            }
-            pathToRoot &= (pathToRoot - 1);
-        }
-    }
-
-    if (jointDofSpeeds)
-    {
-        const PxU32 dofCount = link.mDofs[lane];
-        const PxU32 jointOffset = link.mJointOffset[lane];
-        for (PxU32 i = 0; i < dofCount; ++i)
-            jointDofSpeeds[i] = df[jointOffset + i].mJointVelocities[lane]
-                              + deltaJointDofSpeeds[i];
-    }
-
-    const UnAlignedSpatialVector motionVelocity = loadSpatialVector(link.mMotionVelocity, lane);
-    return motionVelocity + deltaV;
-}
-
-// pxcFsApplyImpulses (:2190)
-static void refApplyImpulses(PxgArticulationBlockData& ab,
-                             PxgArticulationBlockLinkData* lk,
-                             PxgArticulationBlockDofData* df,
-                             const uint64_t* bf,
-                             PxU32 linkID0, const PxVec3& linear0, const PxVec3& angular0,
-                             const PxReal* ji0,
-                             PxU32 linkID1, const PxVec3& linear1, const PxVec3& angular1,
-                             const PxReal* ji1, PxU32 lane)
-{
-    PxU32 commonLink = 0;
-    for (PxI32 i = PxI32(SV_WORDSIZE) - 1; i >= 0; --i)
-    {
-        const uint64_t wordA = bf[(linkID0 * SV_WORDSIZE + i) * 32 + lane];
-        const uint64_t wordB = bf[(linkID1 * SV_WORDSIZE + i) * 32 + lane];
-        const uint64_t commonId = wordA & wordB;
-        if (commonId != 0)
-        {
-            commonLink = PxU32(63 - __builtin_clzll(commonId)) + PxU32(i) * 64;
-            break;
-        }
-    }
-
-    UnAlignedSpatialVector Z0(-linear0, -angular0);
-    UnAlignedSpatialVector Z1(-linear1, -angular1);
-
-    for (PxU32 i = linkID1; i != commonLink; i = lk[i].mParents[lane])
-    {
-        PxgArticulationBlockLinkData& tlink = lk[i];
-        const PxU32 jointOffset = tlink.mJointOffset[lane];
-        const PxU32 dofCount = tlink.mDofs[lane];
-        const PxVec3 c2p(tlink.mRw_x[lane], tlink.mRw_y[lane], tlink.mRw_z[lane]);
-        const PxReal* apply = (linkID1 == i) ? ji1 : NULL;
-        storeSpatialVector(tlink.mSolverSpatialImpulse,
-                           loadSpatialVector(tlink.mSolverSpatialImpulse, lane) + Z1, lane);
-        Z1 = refPropImpulseDeferred(df, jointOffset, dofCount, c2p, Z1, apply, 1.0f, lane);
-    }
-
-    for (PxU32 i = linkID0; i != commonLink; i = lk[i].mParents[lane])
-    {
-        PxgArticulationBlockLinkData& tlink = lk[i];
-        const PxU32 jointOffset = tlink.mJointOffset[lane];
-        const PxU32 dofCount = tlink.mDofs[lane];
-        const PxVec3 c2p(tlink.mRw_x[lane], tlink.mRw_y[lane], tlink.mRw_z[lane]);
-        const PxReal* apply = (linkID0 == i) ? ji0 : NULL;
-        storeSpatialVector(tlink.mSolverSpatialImpulse,
-                           loadSpatialVector(tlink.mSolverSpatialImpulse, lane) + Z0, lane);
-        Z0 = refPropImpulseDeferred(df, jointOffset, dofCount, c2p, Z0, apply, 1.0f, lane);
-    }
-
-    UnAlignedSpatialVector ZCommon = Z0 + Z1;
-
-    PxReal jiCommon[3] = { 0.f, 0.f, 0.f };
-    bool hasJiCommon = false;
-    if (((linkID0 == commonLink) && ji0) || ((linkID1 == commonLink) && ji1))
-    {
-        hasJiCommon = true;
-        const PxU32 dofCountAtCommon = lk[commonLink].mDofs[lane];
-        const PxU32 linkIndices[2] = { linkID0, linkID1 };
-        const PxReal* jis[2] = { ji0, ji1 };
-        for (PxU32 k = 0; k < 2; ++k)
-        {
-            if ((linkIndices[k] == commonLink) && jis[k])
-                for (PxU32 i = 0; i < dofCountAtCommon; ++i)
-                    jiCommon[i] += jis[k][i];
-        }
-    }
-
-    for (PxU32 i = commonLink; i; i = lk[i].mParents[lane])
-    {
-        PxgArticulationBlockLinkData& tlink = lk[i];
-        const PxU32 jointOffset = tlink.mJointOffset[lane];
-        const PxU32 dofCount = tlink.mDofs[lane];
-        const PxVec3 c2p(tlink.mRw_x[lane], tlink.mRw_y[lane], tlink.mRw_z[lane]);
-        const PxReal* apply = ((commonLink == i) && hasJiCommon) ? jiCommon : NULL;
-        storeSpatialVector(tlink.mSolverSpatialImpulse,
-                           loadSpatialVector(tlink.mSolverSpatialImpulse, lane) + ZCommon,
-                           lane);
-        ZCommon = refPropImpulseDeferred(df, jointOffset, dofCount, c2p, ZCommon, apply,
-                                         1.0f, lane);
-    }
-
-    storeSpatialVector(ab.mRootDeferredZ,
-                       loadSpatialVector(ab.mRootDeferredZ, lane) + ZCommon, lane);
-}
 
 // ---- the seed ----
 
@@ -480,7 +267,7 @@ static size_t svRunGetVel(PxgCudaShim& shim)
             const UnAlignedSpatialVector v = refGetVelocity(
                 A.ab[w], &A.lk[size_t(w) * SV_MAX_LINKS], &A.df[size_t(w) * SV_MAX_DOFS],
                 &A.bf[size_t(w) * SV_MAX_LINKS * SV_WORDSIZE * 32],
-                linkID, fixBase, wantSpeeds ? speeds : NULL, lane);
+                SV_WORDSIZE, linkID, fixBase, wantSpeeds ? speeds : NULL, lane);
             float* o = &want[(size_t(c) * SV_NB + a) * 9];
             o[0] = v.top.x; o[1] = v.top.y; o[2] = v.top.z;
             o[3] = v.bottom.x; o[4] = v.bottom.y; o[5] = v.bottom.z;
@@ -590,7 +377,7 @@ static size_t svRunApplyImp(PxgCudaShim& shim)
             refApplyImpulses(W.ab[w], &W.lk[size_t(w) * SV_MAX_LINKS],
                              &W.df[size_t(w) * SV_MAX_DOFS],
                              &W.bf[size_t(w) * SV_MAX_LINKS * SV_WORDSIZE * 32],
-                             spec0 & 0xFF, linear0, angular0,
+                             SV_WORDSIZE, spec0 & 0xFF, linear0, angular0,
                              (spec0 & 0x100u) ? ji0 : NULL,
                              spec1 & 0xFF, linear1, angular1,
                              (spec1 & 0x100u) ? ji1 : NULL, lane);
