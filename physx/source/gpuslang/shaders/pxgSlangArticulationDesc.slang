@@ -215,6 +215,7 @@ public static const uint PXG_ARTI_DIRTY_JOINT_TARGET_POS = 8192;
 public static const uint PXG_ARTI_DIRTY_EXT_ACCEL = 512;
 public static const uint PXG_ARTI_DIRTY_ROOT_TRANSFORM = 16;                // 1 << 4
 public static const uint PXG_ARTI_DIRTY_ROOT_VELOCITIES = 32;               // 1 << 5
+public static const uint PXG_ARTI_DIRTY_NEEDS_KINEMATIC_UPDATE = 1048576;   // 1 << 20 (P8.117)
 // the tendon and mimic-joint bits jcalc phase C masks OUT before deciding whether
 // the block refresh has anything left to do (P8.76)
 public static const uint PXG_ARTI_DIRTY_SPATIAL_TENDON = 16384;             // 1 << 14
@@ -447,6 +448,15 @@ public static const uint PXG_ARTI_DY_SPATIAL_MATRIX_AOS_STRIDE          =    112
 // [jointOffset + dof] at stride 24 -- NOT the [link][dof] stride-80 layout the
 // motionMatrix field itself uses.
 public static const uint PXG_ARTI_WORLD_MOTION_MATRIX                   =    224;
+// P8.117 (artiUpdateKinematic), all pinned by static_assert in
+// testArtiUpdateKinematic.cpp: bodySimIndex is data-absolute (data @0,
+// index@0 bodySimIndex@4); tempParentToChilds is a PxQuat* (16-byte stride),
+// tempRs a PxVec3* (12-byte TIGHT stride).
+public static const uint PXG_ARTI_DATA_BODY_SIM_INDEX                    =      4;
+public static const uint PXG_ARTI_JOINT_ACCELERATIONS                    =    128;
+// (PXG_ARTI_LINK_BODY2ACTORS = 200 already declared above)
+public static const uint PXG_ARTI_TEMP_PARENT_TO_CHILDS                 =    288;
+public static const uint PXG_ARTI_TEMP_RS                               =    296;
 public static const uint PXG_ARTI_QUAT_SIZE                             =     16;
 
 // reads a single byte out of a record, via the containing word

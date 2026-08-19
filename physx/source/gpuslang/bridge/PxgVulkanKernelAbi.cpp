@@ -146,6 +146,8 @@ static const uint8_t kGravityForces[] = { 4, 8, 8, 4, 1, 8, 12 };
 //   PxArticulationGPUIndex*, PxU32 maxDofs, bool rootMotion,
 //   const PxgArticulation*) -- P8.115
 static const uint8_t kCentrifugal[] = { 4, 8, 8, 4, 1, 8 };
+// P8.117: artiUpdateKinematic -- six pointers, u32, pointer, pointer, u32, bool
+static const uint8_t kUpdateKin[] = { 8, 8, 8, 8, 8, 8, 4, 8, 8, 4, 1 };
 
 // solverTGS: propagateAverageSolverBodyVelocityTGS(desc, sharedDesc,
 //   bool isVelocityIteration, bool isLastPosIteration, PxReal biasCoefficient)
@@ -1313,6 +1315,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "computeArtiGravityForces", kGravityForces, uint32_t(sizeof(kGravityForces)) },
     { "computeArtiCentrifugalForces", kCentrifugal, uint32_t(sizeof(kCentrifugal)) },
     { "computeArtiMassMatrices", kCentrifugal, uint32_t(sizeof(kCentrifugal)) },  // P8.116: same six params
+    { "artiUpdateKinematic", kUpdateKin, uint32_t(sizeof(kUpdateKin)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

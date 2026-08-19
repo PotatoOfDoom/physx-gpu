@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **767/767** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **768/768** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,73 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.117 — artiUpdateKinematic (Manifest 303): eine NEUE Deviation-Klasse, gemessen
+
+`artiUpdateKinematic` (articulationDirectGpuApi.cu:295, Body
+updateKinematicInternal<zeroSimOutput> :63-292) ist gemappt — der
+Kinematik-Refresh nach User-Schreibzugriffen über die Direct-GPU-API:
+Joint-Posen → newParentToChild/r pro Gelenk (Warp-parallel), die
+sequentielle body2World-Kette (Lane 0), optional Link-Velocities +
+Sim-Output-Nullung, dann Transform-Cache + World-Bounds pro Link-Shape
+über die P8.117a-Maschinerie.  Neues Modul `npArtiUpdateKin.slang`
+(NOCONTRACT), ABI-Zeile kUpdateKin {8,8,8,8,8,8,4,8,8,4,1} (80 B),
+Launch (32,2,1) GRID-STRIDED.
+
+**DIE NEUE ABWEICHUNGS-KLASSE — das Dirty-Flag-RMW-Race, im ersten Lauf
+GEMESSEN**: das CUDA lässt ALLE 32 Lanes des Warps das gpuDirtyFlag
+lesen-und-clearen und verlässt sich auf Lockstep (alle Reads vor allen
+Writes).  Auf Subgroup-8 laufen die vier Subgroups des Warps sequentiell:
+Subgroup 0 cleart eNEEDS_KINEMATIC_UPDATE, Subgroups 1-3 lesen das
+BEREITS GECLEARTE Flag und schalten sich ab — messbar als exakt die
+Zeroing-Pass-Wörter der Lanes >= 8, die Poison blieben (Phasen A/B/D
+passen zufällig in Lanes 0-7 und waren grün).  Port: Lane 0 liest,
+staged den PRE-Clear-Wert in groupshared, cleart; alle Lanes gaten auf
+dem gestagten Wert.  Ein Sweep-Mutant, der das Race restauriert, stirbt
+deterministisch (Regressionswächter).  Zweite Abweichung (P8.114-Klasse):
+Block-uniformer Trip-Count über den Grid-Stride, tote Iterationen
+live-prädiziert, die drei __syncwarp-Slots (:184/:226/:260) als uniforme
+Barrieren im uniformen Loop plus der Staging-Slot.
+
+**Fallen**: gpuIndices darf NULL sein (Pre-Sim-Pfad: ALLE
+scDesc->nbArticulations per Index); das eNEEDS-Bit cleart AUCH für
+Artikulationen, die der !zeroSimOutput && !positionsDirty-Early-Out dann
+überspringt (positionsDirty = ROOT_TRANSFORM|POSITIONS NACH dem Clear);
+tempParentToChilds ist PxQuat* (16-B-Stride), tempRs PxVec3* (12-B-TIGHT,
+beide @288/@296 gepinnt, bodySimIndex @data+4, jointAccelerations @128);
+der Revolute-Winkel ist NEGIERT mit Shortest-Angle-Flip (w<0 → negieren);
+die Prismatic-Achse ist motionMatrix.BOTTOM (Revolute: .top); der
+Spherical-Exp-Map mit In-Place-normalize (Recip-Multiply, nur m>0) und
+Identity unter 1e-10; Phase B: q = (parent.q * ntc.getConjugate())
+.getNormalized(), p = parent.p + q.rotate(r); die zeroSim-Velocity mit
+translate(-c2p) und dem UPDATED body2World; Phase D: PxNodeIndex
+(bodySimIndex, (link<<1)|1), Binary-Search + RÜCKWÄRTS-Walk, ungültige
+shapeIndices übersprungen aber dekrementiert.
+
+**TRANSZENDENTEN, geschichtet**: sin/cos (asQuatAngleAxis).  Trig-freie
+Records (fix/prismatic/Spherical-Null-Positionen) vergleichen BIT-EXAKT;
+Trig-Records mit der testArtiStepKernel-Toleranz (ULP-oder-absolut, laut
+gezählt) — gemessen max **12 ULP** bei Winkeln > pi, 0 laut.
+
+**Fixture** `testArtiUpdateKinematic.cpp`: 12 live + 4 WÄCHTER-Records
+(eNEEDS gesetzt, nie in einem Job — ein gefallener i<nb-Guard cleart ihre
+Dirty-Wörter sichtbar; die erste Sweep-Runde fand 12/6 = keine toten
+Iterationen, die P8.113-Geometrie-Lektion), 18-Eintrag-Shape-Tabelle
+(Kugel/Kapsel/Box/echter Convex-Hull inkl. Nicht-Identity-Mesh-Scale/
+Fast-Path, Rigid-Einträge, ungültige Einträge, Shapes auf übersprungenen
+und unberührten Records), Revolute-jPos > pi (der Flip FEUERT — der
+zweite Erstrunden-Überlebende), drei Runden (zeroSim x Index/NULL).
+**Nach dem Race-Fix bit-exakt/in-Toleranz in allen drei Runden.**
+
+**Sweep 18/18** (nach Härtung; Erstlauf 16/18, beide Überlebende
+Fixture-Schwächen): Guard weg, Clear weg, Gate ignoriert eNEEDS,
+Early-Out weg, NULL-Pfad verschoben, tempRs-Stride 16, Prismatic nutzt
+.top, Winkel unnegiert, Flip weg, Spherical-normalize weg, Konjugation
+weg, rotate mit Parent-q, +c2p, jointAccel-Nullung weg, NodeIndex ohne
+Arti-Bit, Walk vorwärts, b2a/shape2a vertauscht, Race restauriert.
+
+Szene: Refused-Liste 199 → **198**.  Suite: **768/768 ctest in BEIDEN
+Memory-Modi**.  Manifest **303/501**.
 
 ## P8.117a — der Cache/Bounds-Lift (pxgSlangCacheBound.slang)
 
