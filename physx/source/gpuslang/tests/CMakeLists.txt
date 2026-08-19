@@ -71,6 +71,7 @@ set(SHADER_COMMON_DEPS
     ${SHADER_DIR}/pxgSlangSolverDesc.slang
     ${SHADER_DIR}/pxgSlangSolverBlocks.slang
     ${SHADER_DIR}/pxgSlangSimCoreDesc.slang
+    ${SHADER_DIR}/pxgSlangCacheBound.slang
     ${SHADER_DIR}/pxgSlangPrepDesc.slang
     ${SHADER_DIR}/pxgSlangParticleDesc.slang
     ${SHADER_DIR}/pxgSlangFEMClothDesc.slang

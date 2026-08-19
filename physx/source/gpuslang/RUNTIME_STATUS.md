@@ -1694,6 +1694,26 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.117a — der Cache/Bounds-Lift (pxgSlangCacheBound.slang)
+
+Vorarbeit für `artiUpdateKinematic` (articulationDirectGpuApi.cu:295): dessen
+Tail ist EXAKT die Transform-Cache/Bounds-Maschinerie von
+updateCacheAndBound.cuh, die als file-lokale Funktionen in updateBounds.slang
+lag.  Statt einer zweiten Transkription: der P8.90-Lift — getAbsPose,
+basisExtent, transformFastBounds, meshScaleToMat33, updateBoundsBda,
+updateCacheAndBoundBda wandern VERBATIM als public-Funktionen in das neue
+importierbare Modul `pxgSlangCacheBound.slang`; updateBounds.slang importiert
+es und seine Entries treiben denselben Code — der Lift ist durch die
+bestehende updateTransformCacheAndBoundArrayLaunch/setRigidDynamicGlobalPose-
+Abdeckung in dem Moment verifiziert, in dem er landet.  Neu dazu:
+`binarySearchNodeIndexBda` (die BDA-Form der binarySearch<PxNodeIndex>-
+Portierung — artiUpdateKinematic bekommt das sortierte Array als
+Kernel-PARAMETER, nicht als gebundenen Buffer).
+
+Kein Verhalten geändert, kein neuer Kernel.  Suite **767/767 in BEIDEN
+Memory-Modi**; Szenen box, convex (der gehobene Sphere/Box/Convex-Hull-
+Bounds-Pfad live) und articulation (Refused unverändert 199) grün.
+
 ## P8.116 — computeArtiMassMatrices (Manifest 302): die Direct-API-Inverse-Dynamics-Familie ist KOMPLETT
 
 `computeArtiMassMatrices` (inverseDynamic.cu:336-584) ist gemappt — die
