@@ -1694,6 +1694,32 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## MEILENSTEIN — PHASE 1 (ARTIKULATIONEN) ABGESCHLOSSEN: die Szene SETZT SICH
+
+Mit P8.124 ist das Done-Kriterium der Artikulationsphase aus dem Plan
+vollständig erfüllt, alle drei Teile im selben Fenster gemessen:
+
+1. **Die Artikulationsszene setzt sich**: der artiLink schwingt von y=3.0
+   herunter und kommt ZUR RUHE (final y=2.578, |v|=0.0000); die
+   Companion-Box fällt von y=5.0 exakt auf ihre Resthöhe 3.700
+   (|v|=0.0097).  Szenen-Verdikt: `[ OK ] ... all 2 body(ies) fell +
+   rested` — 240 Schritte, 0 Segfaults, 0 Refused-Arti-Kernel.
+2. **Suite grün in BEIDEN Memory-Modi**: 701/701 (780 ctest-Tests).
+3. **Alle 21 Szenen grün** (Batterie in diesem Fenster gefahren): box,
+   stack, meshfloor, plane, sphere, capsule, capsulebox, convex, joint,
+   articulation, particle, cloth, clothdrape, clothhang,
+   clothselfcollide, clothcloth, softbody, softbodyselfcollide,
+   softbodycloth, softbodystack, softbodyattach.
+
+Die Refused-Liste der Szene ist ARTIKULATIONSFREI (der letzte
+„arti"-Substring-Treffer ist sb_gm_cp_solveTetrahedronsJacobiP-arti-tion —
+ein Softbody-Kernel; die Substring-Falle aus der Plankorrektur).  Manifest
+**324/501**; die Phase hat ELF Upstream-Bug-Kandidaten dokumentiert (keiner
+gemeldet) und fünf Plattformregeln etabliert.
+
+Nächste Phase laut Plan: Phase 2 — die Varianten der laufenden Subsysteme
+(Particle 45, Cloth 23, Softbody 12 Kernel), Szenen-benannt wie gehabt.
+
 ## P8.124 — updateArticulationsLaunch, der Dirty-Scatter (Manifest 324) — DER LETZTE REFUSED-ARTI-KERNEL
 
 Der Per-Frame-Dirty-Scatter (updateBodiesAndShapes.cu:559-907, VOLLSTÄNDIG
