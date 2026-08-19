@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **775/775** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **779/779** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,60 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.123 — artiSolveInternalConstraints1T, der PGS-Internal-Solve (Manifest 323)
+
+Der PGS-Zwilling des P8.100-Internal-Solves — DASSELBE Template
+(internalConstraints2.cu:1579-2012) mit IterativeSolveData und isTGS==false,
+Extern-Wrapper :2820.  Vier Subtranchen in npArtiSolveInternal.slang:
+
+**a) siSolveStaticConstraintsPgs** (CUDA-Overload :1268-1392): minPen und
+elapsedTime sind im PGS-Overload TOTE Parameter (auskommentierte Namen —
+gedroppt); KEINE delta/deltaQ-Loads; der 1D-Dispatch trägt rowsMod und
+versetzt die Response-Basis um batch.mArticulationResponseIndex (der
+TGS-Zwilling übergibt sie UNVERSETZT); doFriction ist im Contact-Dispatch
+LIVE.  Fixture `testArtiSolveStaticPgs.cpp` (PGS-Pools, mDeltaMotion/mDeltaQ
+vergiftet, drei Runden inkl. doFriction=0).  **Sweep 12/12.**
+
+**b) siSolveDofConstraintsPgs** (Dof-Schleife :1747-1890, isTGS==false):
+perSubset IMMER false → effectiveDt ist IMMER das Szenen-dt und
+isExternalForceEveryStep tot (Param gedroppt); der Implicit-Drive-Desc wird
+UNBEDINGT geladen (:1778); das alte Reibungsmodell liest den AKKUMULIERTEN
+Impuls (:1796); BEIDE Drive-Arme rufen adDriveImpulse auch auf
+Velocity-Iterationen (:1811/:1832 — der Shortcut ist TGS-only), elapsedTime
+damit auf jedem Iterationstyp live; das neue Reibungsmodell liest immer den
+Akkumulator (:1845).  Spiegel `refSolveDofLanePgs` (Engine-Orakel:
+Dy::computeDriveImpulse/clampDriveImpulse/computeFrictionImpulse/
+computeLimitImpulse).  Fixture `testArtiSolveDofPgs.cpp` (drei Runden inkl.
+der Schlüsselrunde VELOCITY-Iteration).
+
+**c) siSolveInternalDFSPgs** (Walk :1662-2002): Klon des gesweepten
+TGS-Walks mit PGS-Dispatch; die AFTER-Pass-Maschinerie (dof-Basis 0,
+Engine-Eigenheit) unverändert; contactError als SvpError.  Spiegel
+`refSolveInternalDFSLanePgs`.  Fixture `testArtiSolveDFSPgs.cpp` (vier
+Runden inkl. doFriction=0+static).  **Sweep b+c zusammen 15/15** (14 im
+ersten Lauf + 1 nach Anker-Korrektur: der childImpulseFromStatic-Text
+existiert wortgleich im TGS-Zwilling — Re-Anker über die PGS-only-Zeile
+`lane, doFriction,`).
+
+**d) Entry `artiSolveInternalConstraints1T`**: **erp = biasCoefficient
+UNGEKLEMMT** (der TGS-Extern rechnet min(0.7, bias) — :2852 vs :2820);
+doFriction (Flags-Byte 0) LIVE; minPen existiert nicht;
+isExternalForceEveryStep (Byte 2) TOT (ABI-Byte getragen, Fixture variiert
+es und erwartet Identität); SharedDesc = PxgSolverSharedDescPGSGpu mit
+iter_blockJointConstraintRowsMod@120 zusätzlich konsumiert.  ABI
+kArtiSolveInternalTGS wiederverwendet (identische Extern-Signatur).
+Fixture `testArtiSolveInternalLaunchPgs.cpp` (Vollspiegel; Runde 1 mit
+bias 0.9 ungeklemmt, doFriction != residual gegen Byte-Verwechslung).
+**Sweep 8/8 (7 im ersten Lauf; der Flags-Swap-Mutant überlebte eine Fixture-Koinzidenz — in Runden 1/2 waren velIter und doFriction GLEICH, in Runde 3 beide unkonsumiert — und starb nach einer vierten Runde mit velIter=1/doFriction=0 bei aktiven Konsumenten).**  **Alle vier Fixtures bit-exakt im ersten Lauf.**
+
+Die geklonten Prolog/Walk/Limit-Zeilen sind textidentisch zum TGS-Zwilling
+und dort gesweept (Anker wären nicht eindeutig) — der Sweep deckt die
+Divergenzfläche: 12 + 15 + SWEEPD Mutanten, alle getötet.
+
+Szene: Refused-Liste 179 → **178**.  Suite: **779/779 ctest in BEIDEN
+Memory-Modi**.  Manifest **323/501**.  Verbleibender Refused-Arti-Kernel:
+nur noch updateArticulationsLaunch (P8.124).
 
 ## P8.122c — artiPropagateRigidImpulsesAndSolveSelfConstraints1T, der PGS-Self-Solve (Manifest 322)
 

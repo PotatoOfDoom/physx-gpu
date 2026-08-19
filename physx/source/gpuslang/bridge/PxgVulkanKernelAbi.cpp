@@ -1310,6 +1310,11 @@ static const PxgKernelAbiRow kRows[] = {
     // iteration when the config gate (doFDPL || doStatic || velLimit != NONE)
     // is on.  (P8.100d)
     { "artiSolveInternalConstraintsTGS1T", kArtiSolveInternalTGS, uint32_t(sizeof(kArtiSolveInternalTGS)) },
+    // internalConstraints2.cu:2820 artiSolveInternalConstraints1T -- the PGS
+    // twin, IDENTICAL extern signature (elapsedTime/extEvery bytes dead on
+    // the PGS path; biasCoefficient reaches the template UNCLAMPED).  Same
+    // launch shape.  (P8.123d)
+    { "artiSolveInternalConstraints1T", kArtiSolveInternalTGS, uint32_t(sizeof(kArtiSolveInternalTGS)) },
     // forwardDynamic2.cu:3643/:3759 -- the averageDeltaV pair.  Grid
     // ceil(nbArticulations/64) x block (32,2,1); the velocity kernel's grid
     // is (ceil(nb/64), nbSlabs).  (P8.101b/c)

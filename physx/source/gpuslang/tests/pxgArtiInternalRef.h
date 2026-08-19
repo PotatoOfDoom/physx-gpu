@@ -199,6 +199,156 @@ inline void refSolveDofLane(PxgArticulationBlockDofData* df, PxU32 jointOffset, 
     }
 }
 
+// ===========================================================================
+// P8.123b: the PGS per-dof solve mirror (the dof loop with isTGS == false).
+// Divergences from refSolveDofLane, each transcribed from the template:
+//  * perSubset = isTGS && extEvery && !velIter (:1765) is FALSE always, so
+//    effectiveDt is ALWAYS the scene dt and extEvery is dead (param dropped);
+//  * the implicit drive desc is loaded UNCONDITIONALLY (:1778);
+//  * the deprecated friction model reads the ACCUMULATED impulse (:1796);
+//  * BOTH drive arms call computeDriveImpulse even on velocity iterations
+//    (:1811/:1832 — the isVelIter shortcut is TGS-only), so elapsedTime is
+//    live on every iteration type;
+//  * the new friction model reads the accumulated impulse always (:1845).
+// ===========================================================================
+
+inline void refSolveDofLanePgs(PxgArticulationBlockDofData* df, PxU32 jointOffset, PxU32 dofCount,
+                               const float* jf,
+                               float dt, float sceneDt, float invDt, float elapsedTime, float erp,
+                               bool velIter, bool doFDPL, bool velBefore,
+                               const UnAlignedSpatialVector& childDelta,
+                               const UnAlignedSpatialVector& parentDelta,
+                               UnAlignedSpatialVector& parentDeltaV, UnAlignedSpatialVector& deltaV,
+                               UnAlignedSpatialVector& parentV, UnAlignedSpatialVector& childV,
+                               UnAlignedSpatialVector& parentImp, UnAlignedSpatialVector& impulse,
+                               bool residual, RefError& err, PxU32 lane, DofCov* cov)
+{
+    for (PxU32 dof = 0; dof < dofCount; ++dof)
+    {
+        PxgArticulationBlockDofData& D = df[jointOffset + dof];
+        PxgArticulationInternalConstraintData& ic = D.mConstraintData;
+        const PxU32 motion = D.mMotion[lane];
+        if (motion == PxArticulationMotion::eLOCKED) { if (cov) ++cov->locked; continue; }
+        if (cov) { if (motion == PxArticulationMotion::eLIMITED) ++cov->limited; else ++cov->freeDof; }
+
+        const float maxJointVel = ic.mMaxJointVelocity[lane];
+        const UnAlignedSpatialVector row0 = loadSpatialVector(ic.mRow0, lane);
+        const UnAlignedSpatialVector row1 = loadSpatialVector(ic.mRow1, lane);
+        const float maxDriveForce = ic.mConstraintMaxImpulse[lane];
+        const float appliedDriveImpulseOrig = ic.mDriveImpulse[lane];
+        const float recipResponse = ic.mRecipResponse[lane];
+        const float response = ic.mResponse[lane];
+        const float maxFrictionForce = ic.mMaxFrictionForce[lane];
+        const UnAlignedSpatialVector dVA = loadSpatialVector(ic.mDeltaVA, lane);
+        const UnAlignedSpatialVector dVB = loadSpatialVector(ic.mDeltaVB, lane);
+
+        const float effectiveDt = sceneDt;   // perSubset is false on PGS
+
+        const float staticFrictionImpulse = ic.mStaticFrictionEffort[lane] * effectiveDt;
+        const float dynamicFrictionImpulse = ic.mDynamicFrictionEffort[lane] * effectiveDt;
+        const float viscousFrictionCoefficient = ic.mViscousFrictionCoefficient[lane] * effectiveDt;
+        const float maxImpulse = ic.mMaxEffort[lane] * effectiveDt;
+        const float speedImpulseGradient = ic.mSpeedEffortGradient[lane] / effectiveDt;
+        const float velocityDependentResistance = ic.mVelocityDependentResistance[lane] * effectiveDt;
+        const float externalJointImpulse = jf[jointOffset + dof] * effectiveDt;
+        const float maxActuatorVelocity = ic.mMaxActuatorVelocity[lane];
+
+        // loaded UNCONDITIONALLY on PGS (:1778)
+        Dy::ArticulationImplicitDriveDesc driveDesc(PxZero);
+        driveDesc = ic.getImplicitDriveDesc(lane);
+
+        float jointV = row1.innerProduct(childV) - row0.innerProduct(parentV);
+        const float jointDeltaP = row1.innerProduct(childDelta) - row0.innerProduct(parentDelta);
+
+        float frictionDeltaF = 0.0f, driveDeltaF = 0.0f, posLimitDeltaF = 0.0f;
+        if (doFDPL)
+        {
+            const bool newFrictionModel = staticFrictionImpulse != 0.0f || viscousFrictionCoefficient != 0.0f;
+            if (!newFrictionModel)
+            {
+                if (cov) ++cov->oldModel;
+                const float appliedFriction = ic.mAccumulatedFrictionImpulse[lane];   // PGS accumulates
+                const float frictionForce = PxClamp(-jointV * recipResponse + appliedFriction,
+                                                    -maxFrictionForce, maxFrictionForce);
+                ic.mAccumulatedFrictionImpulse[lane] = frictionForce;
+                frictionDeltaF = frictionForce - appliedFriction;
+                jointV += frictionDeltaF * response;
+            }
+
+            if (maxImpulse > 0.0f)
+            {
+                if (cov) ++cov->maxArm;
+                const float appliedDriveImpulse = appliedDriveImpulseOrig;   // no perSubset zero
+                const float unclampedImpulse =
+                    Dy::computeDriveImpulse(appliedDriveImpulse, jointV, jointDeltaP, elapsedTime, driveDesc);
+                const float clampedImpulse = Dy::clampDriveImpulse(jointV,
+                    appliedDriveImpulse + externalJointImpulse, unclampedImpulse + externalJointImpulse,
+                    response, maxActuatorVelocity, maxImpulse, speedImpulseGradient,
+                    velocityDependentResistance) - externalJointImpulse;
+                driveDeltaF = clampedImpulse - appliedDriveImpulse;
+                ic.mDriveImpulse[lane] = appliedDriveImpulseOrig + driveDeltaF;
+            }
+            else
+            {
+                if (cov) ++cov->forceArm;
+                const float unclampedForce =
+                    Dy::computeDriveImpulse(appliedDriveImpulseOrig, jointV, jointDeltaP, elapsedTime, driveDesc);
+                const float clampedForce = PxClamp(unclampedForce, -maxDriveForce, maxDriveForce);
+                driveDeltaF = clampedForce - appliedDriveImpulseOrig;
+                ic.mDriveImpulse[lane] = clampedForce;
+            }
+            jointV += driveDeltaF * response;
+
+            if (newFrictionModel)
+            {
+                if (cov) ++cov->newModel;
+                const float appliedFriction = ic.mAccumulatedFrictionImpulse[lane];   // PGS accumulates
+                float totalImpulse = appliedFriction - jointV * recipResponse;
+                totalImpulse = Dy::computeFrictionImpulse(totalImpulse, staticFrictionImpulse,
+                                                          dynamicFrictionImpulse,
+                                                          viscousFrictionCoefficient, jointV);
+                frictionDeltaF = totalImpulse - appliedFriction;
+                ic.mAccumulatedFrictionImpulse[lane] += frictionDeltaF;
+                jointV += frictionDeltaF * response;
+            }
+
+            if (motion == PxArticulationMotion::eLIMITED)
+            {
+                const float errorLow = ic.mLimitError_LowX_highY[lane].x;
+                const float errorHigh = ic.mLimitError_LowX_highY[lane].y;
+                posLimitDeltaF = Dy::computeLimitImpulse(dt, invDt, velIter,
+                                                         response, recipResponse, erp,
+                                                         errorLow, errorHigh, jointDeltaP,
+                                                         ic.mLowImpulse[lane],
+                                                         ic.mHighImpulse[lane], jointV);
+            }
+        }
+
+        float velLimitDeltaF = 0.0f;
+        if (velBefore && PxAbs(jointV) > maxJointVel)
+        {
+            if (cov) ++cov->velHits;
+            const float newJointV = PxClamp(jointV, -maxJointVel, maxJointVel);
+            velLimitDeltaF = (newJointV - jointV) * recipResponse;
+            jointV = newJointV;
+        }
+
+        const float deltaF = frictionDeltaF + driveDeltaF + posLimitDeltaF + velLimitDeltaF;
+        if (residual)
+            err.add(deltaF, recipResponse);
+
+        // accumulateLinkImpulsesAndLinkVelocities (:1554)
+        const UnAlignedSpatialVector pDelta = dVA * -deltaF;
+        const UnAlignedSpatialVector cDelta = dVB * -deltaF;
+        parentDeltaV += pDelta;
+        deltaV += cDelta;
+        parentV += pDelta;
+        childV += cDelta;
+        parentImp += row0 * deltaF;
+        impulse -= row1 * deltaF;
+    }
+}
+
 inline void refSolveStaticLane(const PxgArticulationBlockLinkData& L, PxU32 lane,
                                PxgBlockConstraintBatch* bt,
                                PxgTGSBlockSolverContactHeader* ch,
@@ -264,6 +414,74 @@ inline void refSolveStaticLane(const PxgArticulationBlockLinkData& L, PxU32 lane
                               accumErr ? &err : NULL, 1.f, 1.f);
         if (aIsArti) { impulse += imp0; vel = vel0; delta = delta0; deltaQ = q0; }
         else         { impulse += imp1; vel = vel1; delta = delta1; deltaQ = q1; }
+    }
+
+    if (constraintCounts + contactCounts > 0)
+        deltaV += vel - oldVel;
+}
+
+// ===========================================================================
+// P8.123a: the PGS static-solve mirror (solveStaticConstraints PGS overload,
+// internalConstraints2.cu:1268-1392) over the P8.122a PGS ext-solve mirrors.
+// Divergences from refSolveStaticLane: no delta/deltaQ, doFriction live,
+// 1D carries rowsMod with the response base OFFSET by
+// batch.mArticulationResponseIndex, minPen/elapsedTime dead (dropped).
+// ===========================================================================
+
+inline void refSolveStaticLanePgs(const PxgArticulationBlockLinkData& L, PxU32 lane,
+                                  PxgBlockConstraintBatch* bt,
+                                  PxgBlockSolverContactHeader* ch,
+                                  PxgBlockSolverFrictionHeader* fh,
+                                  PxgBlockSolverContactPoint* cp,
+                                  PxgBlockSolverContactFriction* fp,
+                                  PxgBlockSolverConstraint1DHeader* jh,
+                                  PxgBlockSolverConstraint1DCon* jr,
+                                  PxgBlockSolverConstraint1DMod* jm,
+                                  PxgArticulationBlockResponse* rs,
+                                  bool doFriction, bool accumErr,
+                                  UnAlignedSpatialVector& vel, UnAlignedSpatialVector& impulse,
+                                  UnAlignedSpatialVector& deltaV,
+                                  RefError& err, PxU32 constraintCounts, StaticCov* cov)
+{
+    const PxU32 jStart = L.mStaticJointStartIndex[lane];
+    const PxU32 cStart = L.mStaticContactStartIndex[lane];
+    const PxU32 contactCounts = L.mNbStaticContacts[lane];
+
+    const UnAlignedSpatialVector oldVel = vel;
+
+    for (PxU32 i = 0; i < constraintCounts; ++i)
+    {
+        PxgBlockConstraintBatch& batch = bt[jStart + i];
+        const PxU32 offset = PxU32(__builtin_popcount(batch.mask & ((1u << lane) - 1u)));
+        const bool aIsArti = batch.bodyANodeIndex[offset].isArticulation() != 0;
+        if (cov) { if (aIsArti) ++cov->aSide; else ++cov->bSide; }
+
+        UnAlignedSpatialVector vel0, vel1;
+        if (aIsArti) { vel0 = vel; vel1 = UnAlignedSpatialVector::Zero(); }
+        else         { vel0 = UnAlignedSpatialVector::Zero(); vel1 = vel; }
+        UnAlignedSpatialVector imp0(PxVec3(0.f), PxVec3(0.f)), imp1(PxVec3(0.f), PxVec3(0.f));
+        refSolveExt1DPGS(batch, vel0, vel1, offset,
+                         jh, jr, jm, &rs[batch.mArticulationResponseIndex],
+                         imp0, imp1, accumErr, 1.f, 1.f);
+        if (aIsArti) { impulse += imp0; vel = vel0; }
+        else         { impulse += imp1; vel = vel1; }
+    }
+    for (PxU32 i = 0; i < contactCounts; ++i)
+    {
+        PxgBlockConstraintBatch& batch = bt[cStart + i];
+        const PxU32 offset = PxU32(__builtin_popcount(batch.mask & ((1u << lane) - 1u)));
+        const bool aIsArti = batch.bodyANodeIndex[offset].isArticulation() != 0;
+        if (cov) { if (aIsArti) ++cov->aSide; else ++cov->bSide; }
+
+        UnAlignedSpatialVector vel0, vel1;
+        if (aIsArti) { vel0 = vel; vel1 = UnAlignedSpatialVector::Zero(); }
+        else         { vel0 = UnAlignedSpatialVector::Zero(); vel1 = vel; }
+        UnAlignedSpatialVector imp0(PxVec3(0.f), PxVec3(0.f)), imp1(PxVec3(0.f), PxVec3(0.f));
+        refSolveExtContactPGS(batch, vel0, vel1, doFriction, offset,
+                              ch, fh, cp, fp, rs, imp0, imp1,
+                              accumErr ? &err : NULL, 1.f, 1.f);
+        if (aIsArti) { impulse += imp0; vel = vel0; }
+        else         { impulse += imp1; vel = vel1; }
     }
 
     if (constraintCounts + contactCounts > 0)
@@ -397,6 +615,179 @@ inline Cm::UnAlignedSpatialVector refSolveInternalDFSLane(
                 refSolveStaticLane(L, lane, bt, ch, fh, cp, fp, jh, jr, rs,
                                    elapsedTime, minPen, residual,
                                    childV, impulse, deltaV, contactErr, constraintCounts, NULL);
+                childImpulseFromStatic = impulse - before;
+            }
+
+            if (doVelLimit == 2u)
+            {
+                const UnAlignedSpatialVector i1BeforeVelLimit = impulse;
+                const UnAlignedSpatialVector propagatedImpulseAtParentW =
+                    refPropImpulseNoWrite(df, 0, dofCount, c2p, childImpulseFromStatic, lane);
+                PxSpatialMatrix mat;
+                loadSpatialMatrix(lk[parent].mSpatialResponseMatrix, lane, mat);
+                const UnAlignedSpatialVector deltaVParent = mat * (-propagatedImpulseAtParentW);
+                const UnAlignedSpatialVector parentVCorrected = parentV + deltaVParent;
+
+                for (uint32_t dof = 0; dof < dofCount; ++dof)
+                {
+                    PxgArticulationBlockDofData& D = df[jointOffset + dof];
+                    PxgArticulationInternalConstraintData& ic = D.mConstraintData;
+                    if (D.mMotion[lane] == PxArticulationMotion::eLOCKED)
+                        continue;
+                    const float maxJointVel = ic.mMaxJointVelocity[lane];
+                    const UnAlignedSpatialVector row0 = loadSpatialVector(ic.mRow0, lane);
+                    const UnAlignedSpatialVector row1 = loadSpatialVector(ic.mRow1, lane);
+                    const float recipResponse = ic.mRecipResponse[lane];
+                    const UnAlignedSpatialVector dVA = loadSpatialVector(ic.mDeltaVA, lane);
+                    const UnAlignedSpatialVector dVB = loadSpatialVector(ic.mDeltaVB, lane);
+                    float jointV = row1.innerProduct(childV) - row0.innerProduct(parentVCorrected);
+
+                    float velLimitDeltaF = 0.0f;
+                    if (PxAbs(jointV) > maxJointVel)
+                    {
+                        const float newJointV = PxClamp(jointV, -maxJointVel, maxJointVel);
+                        velLimitDeltaF = (newJointV - jointV) * recipResponse;
+                        jointV = newJointV;
+                    }
+                    if (residual)
+                        err.add(velLimitDeltaF, recipResponse);
+
+                    const UnAlignedSpatialVector pDelta = dVA * -velLimitDeltaF;
+                    const UnAlignedSpatialVector cDelta = dVB * -velLimitDeltaF;
+                    parentDeltaV += pDelta;
+                    deltaV += cDelta;
+                    parentV += pDelta;
+                    childV += cDelta;
+                    parentImp += row0 * velLimitDeltaF;
+                    impulse -= row1 * velLimitDeltaF;
+                }
+                childImpulseInternal += (impulse - i1BeforeVelLimit);
+            }
+
+            storeSpatialVector(L.mSolverSpatialInternalConstraintImpulse, childImpulseInternal, lane);
+            storeSpatialVector(stack[parent].impulseStack, parentImp, lane);
+            storeSpatialVector(stack[linkID].impulseStack, impulse, lane);
+
+            parent = linkID;
+            if (numChildren > 0)
+            {
+                offset = L.mChildrenOffset[lane];
+                for (uint32_t i = 0; i < numChildren; ++i)
+                    stack[stackCount++].indices[lane] = offset + i;
+                linkID = stack[stackCount - 1].indices[lane];
+            }
+            parentDeltaV = deltaV;
+            parentImp = impulse;
+        }
+    }
+
+    return parentImp;
+}
+
+// ===========================================================================
+// P8.123c: the PGS DFS mirror — the walk with the PGS dispatch
+// (refSolveDofLanePgs / refSolveStaticLanePgs over the PGS pools).  minPen
+// and extEvery are dead on the PGS path and dropped; doFriction is live.
+// ===========================================================================
+
+inline Cm::UnAlignedSpatialVector refSolveInternalDFSLanePgs(
+    PxgArticulationBlockLinkData* lk, PxgArticulationBlockDofData* df,
+    PxgArticulationTraversalStackData* stack, const float* jf,
+    PxgBlockConstraintBatch* bt,
+    PxgBlockSolverContactHeader* ch, PxgBlockSolverFrictionHeader* fh,
+    PxgBlockSolverContactPoint* cp, PxgBlockSolverContactFriction* fp,
+    PxgBlockSolverConstraint1DHeader* jh, PxgBlockSolverConstraint1DCon* jr,
+    PxgBlockSolverConstraint1DMod* jm,
+    PxgArticulationBlockResponse* rs,
+    float dt, float sceneDt, float invDt, float elapsedTime, float erp,
+    bool velIter, bool doFriction, bool doFDPL, uint32_t doVelLimit, bool doStatic,
+    bool residual,
+    const Cm::UnAlignedSpatialVector& storeParentDeltaV,
+    Cm::UnAlignedSpatialVector parentImp, Cm::UnAlignedSpatialVector parentDeltaV,
+    RefError& err, RefError& contactErr, PxU32 lane)
+{
+    using Cm::UnAlignedSpatialVector;
+
+    uint32_t parent = 0;
+    storeSpatialVector(stack[parent].deltaVStack, storeParentDeltaV, lane);
+    storeSpatialVector(stack[parent].impulseStack, parentImp, lane);
+
+    uint32_t offset = lk[parent].mChildrenOffset[lane];
+    uint32_t numChildren = lk[parent].mNumChildren[lane];
+    for (uint32_t i = 0; i < numChildren; ++i)
+        stack[i].indices[lane] = offset + i;
+    uint32_t stackCount = numChildren;
+    uint32_t linkID = stackCount != 0 ? stack[stackCount - 1].indices[lane] : 0xffffffffu;
+
+    while (stackCount != 0)
+    {
+        const bool isBackProp = (parent == linkID);
+        PxgArticulationBlockLinkData& L = lk[linkID];
+        const PxVec3 c2p(L.mRw_x[lane], L.mRw_y[lane], L.mRw_z[lane]);
+        const uint32_t jointOffset = L.mJointOffset[lane];
+        const uint32_t dofCount = L.mDofs[lane];
+
+        if (isBackProp)
+        {
+            parent = L.mParents[lane];
+            const UnAlignedSpatialVector solverSpatialImpulse = loadSpatialVector(L.mSolverSpatialImpulse, lane);
+            const UnAlignedSpatialVector ZInternalConstraint =
+                loadSpatialVector(L.mSolverSpatialInternalConstraintImpulse, lane);
+            PxSpatialMatrix spatialResponse;
+            loadSpatialMatrix(lk[parent].mSpatialResponseMatrix, lane, spatialResponse);
+
+            stackCount--;
+            const UnAlignedSpatialVector impulse = parentImp;
+            parentDeltaV = loadSpatialVector(stack[parent].deltaVStack, lane);
+            parentImp = loadSpatialVector(stack[parent].impulseStack, lane);
+
+            storeSpatialVector(L.mSolverSpatialImpulse,
+                               solverSpatialImpulse + impulse - ZInternalConstraint, lane);
+
+            linkID = stackCount > 0 ? stack[stackCount - 1].indices[lane] : 0xffffffffu;
+
+            const UnAlignedSpatialVector propagateImp =
+                refPropImpulseDeferred(df, jointOffset, dofCount, c2p, impulse, NULL, 1.f, lane);
+            parentImp += propagateImp;
+
+            const UnAlignedSpatialVector deltaV = spatialResponse * -parentImp;
+            parentDeltaV += deltaV;
+
+            storeSpatialVector(stack[parent].impulseStack, parentImp, lane);
+        }
+        else
+        {
+            UnAlignedSpatialVector parentV =
+                parentDeltaV + loadSpatialVector(lk[parent].mMotionVelocity, lane);
+            const UnAlignedSpatialVector childDelta = loadSpatialVector(L.mDeltaMotion, lane);
+            const UnAlignedSpatialVector parentDelta = loadSpatialVector(lk[parent].mDeltaMotion, lane);
+
+            UnAlignedSpatialVector deltaV =
+                refPropAccelDeferred(df, jointOffset, dofCount, c2p, parentDeltaV, NULL, lane);
+            UnAlignedSpatialVector childV = deltaV + loadSpatialVector(L.mMotionVelocity, lane);
+
+            storeSpatialVector(stack[linkID].deltaVStack, deltaV, lane);
+
+            UnAlignedSpatialVector impulse(PxVec3(0.f), PxVec3(0.f));
+
+            refSolveDofLanePgs(df, jointOffset, dofCount, jf,
+                               dt, sceneDt, invDt, elapsedTime, erp,
+                               velIter, doFDPL, doVelLimit == 1u,
+                               childDelta, parentDelta,
+                               parentDeltaV, deltaV, parentV, childV, parentImp, impulse,
+                               residual, err, lane, NULL);
+
+            const uint32_t constraintCounts = L.mNbStaticJoints[lane];
+            numChildren = L.mNumChildren[lane];
+
+            UnAlignedSpatialVector childImpulseInternal = impulse;
+            UnAlignedSpatialVector childImpulseFromStatic(PxVec3(0.f), PxVec3(0.f));
+            if (doStatic)
+            {
+                const UnAlignedSpatialVector before = impulse;
+                refSolveStaticLanePgs(L, lane, bt, ch, fh, cp, fp, jh, jr, jm, rs,
+                                      doFriction, residual,
+                                      childV, impulse, deltaV, contactErr, constraintCounts, NULL);
                 childImpulseFromStatic = impulse - before;
             }
 

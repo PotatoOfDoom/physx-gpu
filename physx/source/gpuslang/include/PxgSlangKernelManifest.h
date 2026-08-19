@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 322;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 323;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -139,7 +139,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "dmaBackArticulationDataLaunch", "npArtiLinkAccel.spv", "dmaBackArticulationDataLaunch" },  // ARTI_DMA_DATA (P8.93 BDA)
     { "artiSumInternalContactAndJointBatches1Launch", "npArtiSumBatches.spv", "artiSumInternalContactAndJointBatches1Launch" },  // ARTI_STATIC_BATCH_PREP_FIRST (P8.96a)
     { "artiSumInternalContactAndJointBatches2Launch", "npArtiSumBatches2.spv", "artiSumInternalContactAndJointBatches2Launch" },  // ARTI_STATIC_BATCH_PREP_SECOND (P8.96b)
-    { "artiSolveInternalConstraints1T", nullptr, nullptr },  // ARTI_SOLVE_INTERNAL_CONSTRAINTS (unmapped)
+    { "artiSolveInternalConstraints1T", "npArtiSolveInternal.spv", "artiSolveInternalConstraints1T" },  // ARTI_SOLVE_INTERNAL_CONSTRAINTS (P8.123d)
     { "artiSolveInternalConstraintsTGS1T", "npArtiSolveInternal.spv", "artiSolveInternalConstraintsTGS1T" },  // ARTI_SOLVE_INTERNAL_CONSTRAINTS_TGS (P8.100d)
     { "artiSolveInternalTendonAndMimicJointConstraints1T", "npArtiSolveTMKernel.spv", "artiSolveInternalTendonAndMimicJointConstraints1T" },  // ARTI_SOLVE_INTERNAL_TENDON_AND_MIMIC_JOINT (P8.98c)
     { "computeUnconstrainedVelocities1TLaunch", "npArtiJointFrame.spv", "computeUnconstrainedVelocities1TLaunch" },  // ARTI_COMPUTE_UNCONSTRAINED (P8.83 BDA)
