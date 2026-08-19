@@ -75,6 +75,10 @@ const uint32_t GS_MAX_LINKS = 6;
 const uint32_t GS_MAX_DOFS = 12;
 const uint32_t GS_RECORD_SIZE = 544;
 const uint32_t GS_IDX_ENTRIES = 1024;   // covers every overhang groupIndex at grid 2
+const uint32_t GS_MAX_SPT = 2;    // maxSpatialTendonsPerArticulation (desc @260)
+const uint32_t GS_MAX_ATT = 3;    // maxAttachmentPerArticulation (desc @264)
+const uint32_t GS_MAX_FT = 2;     // maxFixedTendonsPerArticulation (desc @268)
+const uint32_t GS_MAX_TJ = 3;     // maxTendonJointPerArticulation (desc @272)
 
 static uint32_t gsNumLinks(uint32_t r) { return r == 5u ? 1u : 2u + (r % 5u); }
 static uint32_t gsDofCount(uint32_t r) { return 1u + ((r * 7u) % (GS_MAX_DOFS - 1u)); }
@@ -89,12 +93,19 @@ static PxQuat gsQuat(uint32_t i, uint32_t k)
     return q.getNormalized();
 }
 static uint32_t gsDirtyWord(uint32_t r) { return 0x40000u | (r << 24) | 8u; }
+static uint32_t gsNumSpt(uint32_t r) { return r % 3u; }        // 0..2 spatial tendons
+static uint32_t gsNumFt(uint32_t r) { return (r + 1u) % 3u; }  // 0..2 fixed tendons
+static uint32_t gsNbAtt(uint32_t r, uint32_t t) { return 1u + ((r + t) % GS_MAX_ATT); }
+static uint32_t gsNbTj(uint32_t r, uint32_t t) { return 1u + ((r * 2u + t) % GS_MAX_TJ); }
 
 struct GsArena
 {
     std::vector<uint8_t> rec;
     std::vector<float> dofArr[6];   // jpos jvel jacc jforce jtvel jtpos
     std::vector<float> mvel, macc, incoming, xw, xa, props, extAccel;
+    std::vector<float> sptParams, ftParams;         // 16 B / 32 B per tendon
+    std::vector<uint8_t> sptTendons, ftTendons;     // PxgArticulationTendon images, 24 B
+    std::vector<float> attMod, tjMod;               // mModElements blocks, 32 B / 16 B
     std::vector<uint32_t> idx;
 };
 
@@ -111,6 +122,12 @@ static void gsSeed(GsArena& A, uint32_t salt)
     A.props.assign(size_t(GS_NB_RECORDS) * GS_MAX_LINKS * 4, 0.f);
     A.extAccel.assign(size_t(GS_NB_RECORDS) * GS_MAX_LINKS * 6, 0.f);
     std::memset(A.extAccel.data(), 0xAB, A.extAccel.size() * 4);
+    A.sptParams.assign(size_t(GS_NB_RECORDS) * GS_MAX_SPT * 4, 0.f);
+    A.ftParams.assign(size_t(GS_NB_RECORDS) * GS_MAX_FT * 8, 0.f);
+    A.sptTendons.assign(size_t(GS_NB_RECORDS) * GS_MAX_SPT * 24, 0xAB);
+    A.ftTendons.assign(size_t(GS_NB_RECORDS) * GS_MAX_FT * 24, 0xAB);
+    A.attMod.assign(size_t(GS_NB_RECORDS) * GS_MAX_SPT * GS_MAX_ATT * 8, 0.f);
+    A.tjMod.assign(size_t(GS_NB_RECORDS) * GS_MAX_FT * GS_MAX_TJ * 4, 0.f);
 
     for (uint32_t r = 0; r < GS_NB_RECORDS; ++r)
     {
@@ -120,6 +137,9 @@ static void gsSeed(GsArena& A, uint32_t salt)
         const uint16_t nl16 = uint16_t(gsNumLinks(r)), nd16 = uint16_t(gsDofCount(r));
         std::memcpy(R + 16, &nl16, 2);
         std::memcpy(R + 18, &nd16, 2);
+        const uint16_t nspt16 = uint16_t(gsNumSpt(r)), nft16 = uint16_t(gsNumFt(r));
+        std::memcpy(R + 20, &nspt16, 2);
+        std::memcpy(R + 22, &nft16, 2);
         for (int a = 0; a < 6; ++a)
             for (uint32_t d = 0; d < GS_MAX_DOFS; ++d)
                 A.dofArr[a][size_t(r) * GS_MAX_DOFS + d] = gsf(r, 50u + a * 20u + d + salt);
@@ -145,6 +165,28 @@ static void gsSeed(GsArena& A, uint32_t salt)
             pp[2] = 0.75f + 0.03125f * float((r + 2u * l) % 6u);
             pp[3] = 0.375f + 0.25f * float((r + l) % 3u);
         }
+        for (uint32_t t = 0; t < GS_MAX_SPT; ++t)
+            for (uint32_t c = 0; c < 4; ++c)
+                A.sptParams[(size_t(r) * GS_MAX_SPT + t) * 4 + c] =
+                    gsf(r, 600u + t * 4u + c + salt);
+        for (uint32_t t = 0; t < GS_MAX_FT; ++t)
+            for (uint32_t c = 0; c < 8; ++c)
+                A.ftParams[(size_t(r) * GS_MAX_FT + t) * 8 + c] =
+                    gsf(r, 640u + t * 8u + c + salt);
+        // mod-element content is per (record, element) -- IDENTICAL across
+        // tendons, so the transcribed ninth-candidate behavior (the missing
+        // tendonIndex in the user-buffer offset, incl. the get-side write
+        // race) stays deterministic
+        for (uint32_t t = 0; t < GS_MAX_SPT; ++t)
+            for (uint32_t a = 0; a < GS_MAX_ATT; ++a)
+                for (uint32_t c = 0; c < 8; ++c)
+                    A.attMod[((size_t(r) * GS_MAX_SPT + t) * GS_MAX_ATT + a) * 8 + c] =
+                        gsf(r, 700u + a * 8u + c + salt);
+        for (uint32_t t = 0; t < GS_MAX_FT; ++t)
+            for (uint32_t j2 = 0; j2 < GS_MAX_TJ; ++j2)
+                for (uint32_t c = 0; c < 4; ++c)
+                    A.tjMod[((size_t(r) * GS_MAX_FT + t) * GS_MAX_TJ + j2) * 4 + c] =
+                        gsf(r, 760u + j2 * 4u + c + salt);
     }
     A.idx.resize(GS_IDX_ENTRIES);
     for (uint32_t j = 0; j < GS_IDX_ENTRIES; ++j)
@@ -159,6 +201,7 @@ struct GsDev
     PxgDevicePtr dRec = 0, dDesc = 0, dIdx = 0;
     PxgDevicePtr dDof[6] = { 0, 0, 0, 0, 0, 0 };
     PxgDevicePtr dMv = 0, dMa = 0, dIn = 0, dXw = 0, dXa = 0, dPr = 0, dEa = 0;
+    PxgDevicePtr dSp = 0, dFp = 0, dSt = 0, dFt = 0, dAm = 0, dJm = 0;
     bool ok = true;
 };
 
@@ -181,6 +224,35 @@ static void gsUpload(PxgCudaShim& shim, GsArena& A, GsDev& D)
     D.dXa = up(A.xa.data(), A.xa.size() * 4);
     D.dPr = up(A.props.data(), A.props.size() * 4);
     D.dEa = up(A.extAccel.data(), A.extAccel.size() * 4);
+    D.dSp = up(A.sptParams.data(), A.sptParams.size() * 4);
+    D.dFp = up(A.ftParams.data(), A.ftParams.size() * 4);
+    D.dAm = up(A.attMod.data(), A.attMod.size() * 4);
+    D.dJm = up(A.tjMod.data(), A.tjMod.size() * 4);
+    // PxgArticulationTendon images: mFixedElements stays poison, mModElements
+    // points into the mod blocks, mNbElements is the per-tendon count
+    for (uint32_t r = 0; r < GS_NB_RECORDS; ++r)
+    {
+        for (uint32_t t = 0; t < GS_MAX_SPT; ++t)
+        {
+            uint8_t* T = A.sptTendons.data() + (size_t(r) * GS_MAX_SPT + t) * 24;
+            const uint64_t mp = uint64_t(D.dAm)
+                + ((size_t(r) * GS_MAX_SPT + t) * GS_MAX_ATT) * 32u;
+            std::memcpy(T + 8, &mp, 8);
+            const uint32_t nb = gsNbAtt(r, t);
+            std::memcpy(T + 16, &nb, 4);
+        }
+        for (uint32_t t = 0; t < GS_MAX_FT; ++t)
+        {
+            uint8_t* T = A.ftTendons.data() + (size_t(r) * GS_MAX_FT + t) * 24;
+            const uint64_t mp = uint64_t(D.dJm)
+                + ((size_t(r) * GS_MAX_FT + t) * GS_MAX_TJ) * 16u;
+            std::memcpy(T + 8, &mp, 8);
+            const uint32_t nb = gsNbTj(r, t);
+            std::memcpy(T + 16, &nb, 4);
+        }
+    }
+    D.dSt = up(A.sptTendons.data(), A.sptTendons.size());
+    D.dFt = up(A.ftTendons.data(), A.ftTendons.size());
 
     // record field offsets: jpos 112, jvel 120, jacc 128, jforce 136,
     // jtpos 144, jtvel 152 -- note dofArr order is jpos jvel jacc jforce
@@ -199,14 +271,23 @@ static void gsUpload(PxgCudaShim& shim, GsArena& A, GsDev& D)
         put(200, uint64_t(D.dXa) + uint64_t(r) * GS_MAX_LINKS * 28u);
         put(256, uint64_t(D.dPr) + uint64_t(r) * GS_MAX_LINKS * 16u);
         put(96, uint64_t(D.dEa) + uint64_t(r) * GS_MAX_LINKS * 24u);
+        put(304, uint64_t(D.dSp) + uint64_t(r) * GS_MAX_SPT * 16u);
+        put(312, uint64_t(D.dSt) + uint64_t(r) * GS_MAX_SPT * 24u);
+        put(320, uint64_t(D.dFp) + uint64_t(r) * GS_MAX_FT * 32u);
+        put(328, uint64_t(D.dFt) + uint64_t(r) * GS_MAX_FT * 24u);
     }
     D.dRec = up(A.rec.data(), A.rec.size());
-    std::vector<uint8_t> desc(96, 0xAB);
+    std::vector<uint8_t> desc(288, 0xAB);
     {
         const uint64_t v = uint64_t(D.dRec);
         std::memcpy(desc.data() + 32, &v, 8);
         const uint32_t nb = GS_NB_LIVE;
         std::memcpy(desc.data() + 44, &nb, 4);
+        const uint32_t mspt = GS_MAX_SPT, matt = GS_MAX_ATT, mft = GS_MAX_FT, mtj = GS_MAX_TJ;
+        std::memcpy(desc.data() + 260, &mspt, 4);
+        std::memcpy(desc.data() + 264, &matt, 4);
+        std::memcpy(desc.data() + 268, &mft, 4);
+        std::memcpy(desc.data() + 272, &mtj, 4);
     }
     D.dDesc = up(desc.data(), desc.size());
     D.dIdx = up(A.idx.data(), A.idx.size() * 4);
@@ -272,8 +353,14 @@ PXG_TEST(artiGetSet)
         { "npArtiGetSet.spv", "setArtiRootVelocityState", 32u, 0 },
         { "npArtiGetSet.spv", "setArtiLinkForceState", 32u, 0 },
         { "npArtiGetSet.spv", "setArtiLinkTorqueState", 32u, 0 },
+        { "npArtiGetSet.spv", "getArtiTendonState", 36u, 0 },
+        { "npArtiGetSet.spv", "setArtiTendonState", 36u, 0 },
+        { "npArtiGetSet.spv", "getArtiSpatialTendonAttachmentState", 32u, 0 },
+        { "npArtiGetSet.spv", "setArtiSpatialTendonAttachmentState", 32u, 0 },
+        { "npArtiGetSet.spv", "getArtiFixedTendonJointState", 28u, 0 },
+        { "npArtiGetSet.spv", "setArtiFixedTendonJointState", 28u, 0 },
     };
-    PxgCudaShim shim(dev, manifest, 9, &artiGsLoader);
+    PxgCudaShim shim(dev, manifest, 15, &artiGsLoader);
     gsBad = 0;
 
     auto jobsOf = [&](const GsArena& A, uint32_t j) { return A.idx[j]; };
@@ -588,6 +675,156 @@ PXG_TEST(artiGetSet)
         for (auto p : D.bufs) if (p) shim.memFree(p);
     }
 
-    std::printf("[ info ] gs: 25 dispatches over 9 kernels, %zu mismatching words\n", gsBad);
+    // ---- get/setArtiTendonState: spatial (R17/W12) and fixed (R15/W10) ----
+    for (uint32_t which = 0; which < 4; ++which)
+    {
+        const bool isGet = which < 2;
+        const bool isSpt = (which % 2u) == 0u;
+        const uint32_t type = isGet ? (isSpt ? 17u : 15u) : (isSpt ? 12u : 10u);
+        const uint32_t maxT = isSpt ? GS_MAX_SPT : GS_MAX_FT;
+        const uint32_t strideF = isSpt ? 4u : 8u;   // floats per tendon datum
+        GsArena A;
+        gsSeed(A, 141u + which);
+        GsDev D;
+        gsUpload(shim, A, D);
+        if (!D.ok) { for (auto p : D.bufs) if (p) shim.memFree(p); continue; }
+        const uint32_t bufGroups = (2u * 512u - 1u) / maxT + 1u;
+        std::vector<float> user(size_t(bufGroups) * maxT * strideF, 0.f);
+        if (isGet)
+            std::memset(user.data(), 0xAB, user.size() * 4);
+        else
+            for (size_t k = 0; k < user.size(); ++k) user[k] = gsf(uint32_t(k), 811u + which);
+        PxgDevicePtr dU = 0;
+        shim.memAlloc(&dU, user.size() * 4);
+        shim.memcpyHtoD(dU, user.data(), user.size() * 4);
+        P6 prm = { uint64_t(D.dDesc), uint64_t(dU), uint64_t(D.dIdx), GS_NB_LIVE, maxT, type };
+        PXG_CHECK_MSG(shim.launchKernel(isGet ? 9 : 10, 2, 1, 1, &prm, 36u) ==
+                          PxgResult::Success,
+                      "launch tendon state");
+        shim.streamSynchronize();
+        uint32_t wantDirty[GS_NB_RECORDS];
+        for (uint32_t r = 0; r < GS_NB_RECORDS; ++r) wantDirty[r] = gsDirtyWord(r);
+        if (isGet)
+        {
+            std::vector<float> want = user;
+            const std::vector<float>& src = isSpt ? A.sptParams : A.ftParams;
+            for (uint32_t j = 0; j < GS_NB_LIVE; ++j)
+            {
+                const uint32_t r = jobsOf(A, j);
+                const uint32_t n = isSpt ? gsNumSpt(r) : gsNumFt(r);
+                for (uint32_t t = 0; t < n; ++t)
+                    for (uint32_t c = 0; c < strideF; ++c)
+                        want[(size_t(j) * maxT + t) * strideF + c] =
+                            src[(size_t(r) * maxT + t) * strideF + c];
+            }
+            gsCmp(shim, dU, want, "getTendon");
+        }
+        else
+        {
+            std::vector<float> want = isSpt ? A.sptParams : A.ftParams;
+            for (uint32_t j = 0; j < GS_NB_LIVE; ++j)
+            {
+                const uint32_t r = jobsOf(A, j);
+                const uint32_t n = isSpt ? gsNumSpt(r) : gsNumFt(r);
+                for (uint32_t t = 0; t < n; ++t)
+                    for (uint32_t c = 0; c < strideF; ++c)
+                        want[(size_t(r) * maxT + t) * strideF + c] =
+                            user[(size_t(j) * maxT + t) * strideF + c];
+                wantDirty[r] |= isSpt ? 16384u : 65536u;   // set even when n == 0 (trap 8)
+            }
+            gsCmp(shim, isSpt ? D.dSp : D.dFp, want, "setTendon");
+            gsCmpRecDirty(shim, D.dRec, wantDirty, "setTendon");
+        }
+        shim.memFree(dU);
+        for (auto p : D.bufs) if (p) shim.memFree(p);
+    }
+
+    // ---- get/setArtiSpatialTendonAttachmentState + get/setArtiFixedTendonJointState ----
+    for (uint32_t which = 0; which < 4; ++which)
+    {
+        const bool isGet = which < 2;
+        const bool isAtt = (which % 2u) == 0u;
+        const uint32_t maxT = isAtt ? (GS_MAX_SPT * GS_MAX_ATT) : (GS_MAX_FT * GS_MAX_TJ);
+        const uint32_t elemF = isAtt ? 8u : 4u;   // floats per element
+        GsArena A;
+        gsSeed(A, 171u + which);
+        GsDev D;
+        gsUpload(shim, A, D);
+        if (!D.ok) { for (auto p : D.bufs) if (p) shim.memFree(p); continue; }
+        const uint32_t bufGroups = (2u * 512u - 1u) / maxT + 1u;
+        std::vector<float> user(size_t(bufGroups) * maxT * elemF, 0.f);
+        if (isGet)
+            std::memset(user.data(), 0xAB, user.size() * 4);
+        else
+            for (size_t k = 0; k < user.size(); ++k) user[k] = gsf(uint32_t(k), 911u + which);
+        PxgDevicePtr dU = 0;
+        shim.memAlloc(&dU, user.size() * 4);
+        shim.memcpyHtoD(dU, user.data(), user.size() * 4);
+        if (isAtt)
+        {
+            P5 prm = { uint64_t(D.dDesc), uint64_t(dU), uint64_t(D.dIdx), GS_NB_LIVE, maxT };
+            PXG_CHECK_MSG(shim.launchKernel(isGet ? 11 : 12, 2, 1, 1, &prm, 32u) ==
+                              PxgResult::Success,
+                          "launch attachment state");
+        }
+        else
+        {
+            P4 prm = { uint64_t(D.dDesc), uint64_t(dU), uint64_t(D.dIdx), GS_NB_LIVE };
+            PXG_CHECK_MSG(shim.launchKernel(isGet ? 13 : 14, 2, 1, 1, &prm, 28u) ==
+                              PxgResult::Success,
+                          "launch tendon-joint state");
+        }
+        shim.streamSynchronize();
+        const uint32_t nT = isAtt ? GS_MAX_SPT : GS_MAX_FT;
+        const uint32_t nE = isAtt ? GS_MAX_ATT : GS_MAX_TJ;
+        uint32_t wantDirty[GS_NB_RECORDS];
+        for (uint32_t r = 0; r < GS_NB_RECORDS; ++r) wantDirty[r] = gsDirtyWord(r);
+        if (isGet)
+        {
+            // the ninth candidate, transcribed: the user offset carries the
+            // element index only; every live tendon writes the same slots
+            // (equal content keeps it deterministic)
+            std::vector<float> want = user;
+            const std::vector<float>& mod = isAtt ? A.attMod : A.tjMod;
+            for (uint32_t j = 0; j < GS_NB_LIVE; ++j)
+            {
+                const uint32_t r = jobsOf(A, j);
+                const uint32_t n = isAtt ? gsNumSpt(r) : gsNumFt(r);
+                for (uint32_t t = 0; t < n; ++t)
+                {
+                    const uint32_t nb = isAtt ? gsNbAtt(r, t) : gsNbTj(r, t);
+                    for (uint32_t e = 0; e < nb; ++e)
+                        for (uint32_t c = 0; c < elemF; ++c)
+                            want[(size_t(j) * maxT + e) * elemF + c] =
+                                mod[((size_t(r) * nT + t) * nE + e) * elemF + c];
+                }
+            }
+            gsCmp(shim, dU, want, isAtt ? "getAttach" : "getTendonJoint");
+        }
+        else
+        {
+            std::vector<float> want = isAtt ? A.attMod : A.tjMod;
+            for (uint32_t j = 0; j < GS_NB_LIVE; ++j)
+            {
+                const uint32_t r = jobsOf(A, j);
+                const uint32_t n = isAtt ? gsNumSpt(r) : gsNumFt(r);
+                for (uint32_t t = 0; t < n; ++t)
+                {
+                    const uint32_t nb = isAtt ? gsNbAtt(r, t) : gsNbTj(r, t);
+                    for (uint32_t e = 0; e < nb; ++e)
+                        for (uint32_t c = 0; c < elemF; ++c)
+                            want[((size_t(r) * nT + t) * nE + e) * elemF + c] =
+                                user[(size_t(j) * maxT + e) * elemF + c];
+                }
+                wantDirty[r] |= isAtt ? 32768u : 131072u;   // outside the guard (trap 8)
+            }
+            gsCmp(shim, isAtt ? D.dAm : D.dJm, want, isAtt ? "setAttach" : "setTendonJoint");
+            gsCmpRecDirty(shim, D.dRec, wantDirty, isAtt ? "setAttach" : "setTendonJoint");
+        }
+        shim.memFree(dU);
+        for (auto p : D.bufs) if (p) shim.memFree(p);
+    }
+
+    std::printf("[ info ] gs: 33 dispatches over 15 kernels, %zu mismatching words\n", gsBad);
     PXG_CHECK_MSG(gsBad == 0, "%zu mismatches", gsBad);
 }

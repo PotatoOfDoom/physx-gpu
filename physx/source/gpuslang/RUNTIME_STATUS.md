@@ -1694,6 +1694,50 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.119 — die sechs Tendon-get/set-Kernel (Manifest 318) + der NEUNTE Upstream-Bug-Kandidat
+
+Die zweite Hälfte der Direct-API-Zustandsfamilie
+(articulationDirectGpuApi.cu:822-1110), alle in `npArtiGetSet.slang`
+dazu: get/setArtiTendonState (Spatial-Params 16 B / Fixed-Params 32 B,
+verschiedene Dirty-Bits 1<<14 / 1<<16), get/setArtiSpatialTendonAttachmentState
+(32-B-Attachment-Blöcke durch tendon.mModElements), get/setArtiFixedTendonJointState
+(16-B-Koeffizienten).  ABI: kGetSet6/kGetSet5/kThreePtrU32 wiederverwendet;
+die Attachment/TendonJoint-Kernel lesen maxSpatialTendons/maxAttachments/
+maxFixedTendons/maxTendonJoints aus dem DESKRIPTOR (@260/264/268/272).
+
+**NEUNTER UPSTREAM-BUG-KANDIDAT (verbatim transkribiert, beide Seiten)**:
+die Attachment- und TendonJoint-Kopien indizieren den USER-Puffer NUR mit
+attachmentIndex/tendonJointIndex — der tendonIndex geht NIE in den Offset
+ein (:949/:997/:1049/:1095).  Mit mehr als einem Tendon pro Artikulation
+speist der Setter jeden Tendon aus dem Block von Tendon 0, und der Getter
+hat ein Cross-Tendon-WRITE-RACE in dieselben Ausgabe-Slots.  Die Fixture
+hält die Mod-Element-Blöcke von Multi-Tendon-Artikulationen IDENTISCH über
+Tendons, damit das transkribierte Verhalten deterministisch bleibt; der
+Sweep-Mutant, der den tendonIndex "korrekt" in den Offset einbaut, STIRBT
+— die Fixture pinnt den Kandidaten statt ihn zu verstecken.
+
+**Weitere Fallen**: setArtiTendonState setzt sein Dirty-Bit bei
+tendonIndex==0 AUSSERHALB des Count-Guards — eine Artikulation mit NULL
+Tendons der geschriebenen Art bekommt das Bit trotzdem (Mutant, der den
+Guard einzieht, stirbt); die Struct-Kopien laufen als uint4s INKLUSIVE
+der Padding-Wörter.
+
+**Fixture**: +8 Dispatches (33 gesamt über 15 Kernel), Tendon-Zählungen
+0..2 pro Record (numSpatialTendons = r%3, numFixedTendons = (r+1)%3 —
+die Null-Tendon-Records beobachten das Outside-Guard-Bit), mNbElements
+1..3 pro Tendon.  Der erste Lauf war ROT durch einen FIXTURE-Bug (die
+u16-Zählfelder @20/@22 waren nie geseedet — Poison 0xABAB machte jeden
+Guard durchlässig); nach dem Seed bit-exakt in allen 33 Dispatches.
+
+**Sweep 24/24** (die 16 von P8.118 erneut + 8 neue): Count-Swap,
+Fixed-Stride 16, Dirty-in-Guard, halbe Fixed-Kopie, Desc-Max-Swap,
+Kandidat-"Fix" (tendonIndex in den Offset), nbElements ignoriert,
+falsches TJ-Dirty-Bit.
+
+Szene: Refused-Liste 189 → **183** (alle sechs verschwinden; die 15
+Direct-API-Zustandskernel sind KOMPLETT).  Suite: **769/769 ctest in
+BEIDEN Memory-Modi**.  Manifest **318/501**.
+
 ## P8.118 — die neun Nicht-Tendon-get/set-Kernel der Direct-API (Manifest 312)
 
 NEUN Kernel in EINER Tranche — die mechanische Gather/Scatter-Hälfte der

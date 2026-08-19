@@ -454,3 +454,292 @@ void setArtiLinkTorqueState(uint3 dispatchThreadId : SV_DispatchThreadID)
         }
     }
 }
+
+// ===========================================================================
+// P8.119: the six tendon get/set kernels (articulationDirectGpuApi.cu:
+// 822-1110).  Same launch family (512-wide blocks, one thread per element).
+//
+// TRAPS, each a sweep mutant unless marked:
+//  8. setArtiTendonState raises the dirty bit at tendonIndex == 0 OUTSIDE
+//     the tendonIndex < numTendons guard -- an articulation with ZERO
+//     tendons of the written kind still gets its flag set.  Spatial and
+//     fixed params have different strides (16 vs 32 bytes) and different
+//     bits (1<<14 vs 1<<16).
+//  9. The attachment / tendon-joint kernels read maxAttachments /
+//     maxSpatialTendons / maxFixedTendons / maxTendonJoints from the
+//     DESCRIPTOR (not from the kernel parameter), and their per-job source
+//     pitch is desc.maxSpatialTendons * desc.maxAttachments.
+//
+// NINTH UPSTREAM-BUG CANDIDATE (transcribed verbatim, both sides): the
+// attachment and tendon-joint copies index the USER buffer by
+// attachmentIndex / tendonJointIndex ALONE -- the tendonIndex never enters
+// the offset (:949/:997/:1049/:1095).  With more than one tendon per
+// articulation the setter feeds every tendon from tendon 0's block of the
+// user buffer, and the getter has a cross-tendon WRITE RACE into the same
+// output slots.  The fixture keeps multi-tendon articulations' mod-element
+// blocks IDENTICAL across tendons so the transcribed behavior stays
+// deterministic, and documents the candidate instead of "fixing" it.
+// ===========================================================================
+
+[shader("compute")]
+[numthreads(512, 1, 1)]
+void getArtiTendonState(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint globalThreadIndex = dispatchThreadId.x;
+    const uint maxTendons = gGs6.maxN;
+    const uint groupIndex = globalThreadIndex / maxTendons;
+    const uint tendonIndex = globalThreadIndex % maxTendons;
+
+    if (groupIndex < gGs6.nbElements)
+    {
+        const uint64_t record = gsRecord(gGs6.scDesc, gGs6.idx, groupIndex);
+        if (gGs6.typeWord == 17u)   // PxArticulationGPUAPIReadType::eSPATIAL_TENDON
+        {
+            const uint num = artiU16Field(record, PXG_ARTI_DATA_NUM_SPATIAL_TENDONS);
+            if (tendonIndex < num)
+            {
+                Ptr<uint4> dst = Ptr<uint4>(gGs6.data
+                                            + (uint64_t(groupIndex) * maxTendons + tendonIndex)
+                                                  * PXG_ARTI_SPATIAL_TENDON_DATA_SIZE);
+                Ptr<uint4> src = Ptr<uint4>(artiPtrField(record, PXG_ARTI_SPATIAL_TENDON_PARAMS)
+                                            + uint64_t(tendonIndex)
+                                                  * PXG_ARTI_SPATIAL_TENDON_DATA_SIZE);
+                dst[0] = src[0];
+            }
+        }
+        else if (gGs6.typeWord == 15u)   // eFIXED_TENDON
+        {
+            const uint num = artiU16Field(record, PXG_ARTI_DATA_NUM_FIXED_TENDONS);
+            if (tendonIndex < num)
+            {
+                Ptr<uint4> dst = Ptr<uint4>(gGs6.data
+                                            + (uint64_t(groupIndex) * maxTendons + tendonIndex)
+                                                  * PXG_ARTI_FIXED_TENDON_DATA_SIZE);
+                Ptr<uint4> src = Ptr<uint4>(artiPtrField(record, PXG_ARTI_FIXED_TENDON_PARAMS)
+                                            + uint64_t(tendonIndex)
+                                                  * PXG_ARTI_FIXED_TENDON_DATA_SIZE);
+                dst[0] = src[0];
+                dst[1] = src[1];
+            }
+        }
+    }
+}
+
+[shader("compute")]
+[numthreads(512, 1, 1)]
+void setArtiTendonState(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint globalThreadIndex = dispatchThreadId.x;
+    const uint maxTendons = gGs6.maxN;
+    const uint groupIndex = globalThreadIndex / maxTendons;
+    const uint tendonIndex = globalThreadIndex % maxTendons;
+
+    if (groupIndex < gGs6.nbElements)
+    {
+        const uint64_t record = gsRecord(gGs6.scDesc, gGs6.idx, groupIndex);
+        Ptr<uint> dirty = Ptr<uint>(record + PXG_ARTI_DATA_gpuDirtyFlag);
+        if (gGs6.typeWord == 12u)   // PxArticulationGPUAPIWriteType::eSPATIAL_TENDON
+        {
+            const uint num = artiU16Field(record, PXG_ARTI_DATA_NUM_SPATIAL_TENDONS);
+            if (tendonIndex < num)
+            {
+                Ptr<uint4> src = Ptr<uint4>(gGs6.data
+                                            + (uint64_t(groupIndex) * maxTendons + tendonIndex)
+                                                  * PXG_ARTI_SPATIAL_TENDON_DATA_SIZE);
+                Ptr<uint4> dst = Ptr<uint4>(artiPtrField(record, PXG_ARTI_SPATIAL_TENDON_PARAMS)
+                                            + uint64_t(tendonIndex)
+                                                  * PXG_ARTI_SPATIAL_TENDON_DATA_SIZE);
+                dst[0] = src[0];
+            }
+            if (tendonIndex == 0u)   // trap 8: OUTSIDE the count guard
+                dirty[0] = dirty[0] | PXG_ARTI_DIRTY_SPATIAL_TENDON;
+        }
+        else if (gGs6.typeWord == 10u)   // eFIXED_TENDON
+        {
+            const uint num = artiU16Field(record, PXG_ARTI_DATA_NUM_FIXED_TENDONS);
+            if (tendonIndex < num)
+            {
+                Ptr<uint4> src = Ptr<uint4>(gGs6.data
+                                            + (uint64_t(groupIndex) * maxTendons + tendonIndex)
+                                                  * PXG_ARTI_FIXED_TENDON_DATA_SIZE);
+                Ptr<uint4> dst = Ptr<uint4>(artiPtrField(record, PXG_ARTI_FIXED_TENDON_PARAMS)
+                                            + uint64_t(tendonIndex)
+                                                  * PXG_ARTI_FIXED_TENDON_DATA_SIZE);
+                dst[0] = src[0];
+                dst[1] = src[1];
+            }
+            if (tendonIndex == 0u)
+                dirty[0] = dirty[0] | PXG_ARTI_DIRTY_FIXED_TENDON;
+        }
+    }
+}
+
+[shader("compute")]
+[numthreads(512, 1, 1)]
+void getArtiSpatialTendonAttachmentState(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint maxTendonAttachments =
+        (Ptr<uint>(gGs5.scDesc + PXG_ARTI_CORE_MAX_ATTACHMENTS))[0];   // trap 9
+    const uint maxSpatialTendons =
+        (Ptr<uint>(gGs5.scDesc + PXG_ARTI_CORE_MAX_SPATIAL_TENDONS))[0];
+
+    const uint globalThreadIndex = dispatchThreadId.x;
+    const uint maxTendons = gGs5.maxN;
+    const uint groupIndex = globalThreadIndex / maxTendons;
+    const uint elementIndex = globalThreadIndex % maxTendons;
+    const uint tendonIndex = elementIndex / maxTendonAttachments;
+    const uint attachmentIndex = elementIndex % maxTendonAttachments;
+
+    if (groupIndex < gGs5.nbElements)
+    {
+        const uint64_t record = gsRecord(gGs5.scDesc, gGs5.idx, groupIndex);
+        const uint numSpatialTendons = artiU16Field(record, PXG_ARTI_DATA_NUM_SPATIAL_TENDONS);
+        if (tendonIndex < numSpatialTendons)
+        {
+            const uint64_t tendon = artiPtrField(record, PXG_ARTI_SPATIAL_TENDONS)
+                                    + uint64_t(tendonIndex) * PXG_ARTI_TENDON_SIZE;
+            const uint64_t modElements = (Ptr<uint64_t>(tendon + PXG_TENDON_MOD_ELEMENTS))[0];
+            const uint numTendonAttachments = (Ptr<uint>(tendon + PXG_TENDON_NB_ELEMENTS))[0];
+            if (attachmentIndex < numTendonAttachments)
+            {
+                // NINTH CANDIDATE: no tendonIndex in the user-buffer offset
+                Ptr<uint4> dst = Ptr<uint4>(gGs5.data
+                                            + (uint64_t(groupIndex) * maxSpatialTendons
+                                                   * maxTendonAttachments
+                                               + attachmentIndex) * 32u);
+                Ptr<uint4> src = Ptr<uint4>(modElements + uint64_t(attachmentIndex) * 32u);
+                dst[0] = src[0];
+                dst[1] = src[1];
+            }
+        }
+    }
+}
+
+[shader("compute")]
+[numthreads(512, 1, 1)]
+void setArtiSpatialTendonAttachmentState(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint maxTendonAttachments =
+        (Ptr<uint>(gGs5.scDesc + PXG_ARTI_CORE_MAX_ATTACHMENTS))[0];   // trap 9
+    const uint maxSpatialTendons =
+        (Ptr<uint>(gGs5.scDesc + PXG_ARTI_CORE_MAX_SPATIAL_TENDONS))[0];
+
+    const uint globalThreadIndex = dispatchThreadId.x;
+    const uint maxTendons = gGs5.maxN;
+    const uint groupIndex = globalThreadIndex / maxTendons;
+    const uint elementIndex = globalThreadIndex % maxTendons;
+    const uint tendonIndex = elementIndex / maxTendonAttachments;
+    const uint attachmentIndex = elementIndex % maxTendonAttachments;
+
+    if (groupIndex < gGs5.nbElements)
+    {
+        const uint64_t record = gsRecord(gGs5.scDesc, gGs5.idx, groupIndex);
+        if (elementIndex == 0u)   // trap 8's shape: outside the tendon guard
+        {
+            Ptr<uint> dirty = Ptr<uint>(record + PXG_ARTI_DATA_gpuDirtyFlag);
+            dirty[0] = dirty[0] | PXG_ARTI_DIRTY_SPATIAL_TENDON_ATTACHMENT;
+        }
+        const uint numSpatialTendons = artiU16Field(record, PXG_ARTI_DATA_NUM_SPATIAL_TENDONS);
+        if (tendonIndex < numSpatialTendons)
+        {
+            const uint64_t tendon = artiPtrField(record, PXG_ARTI_SPATIAL_TENDONS)
+                                    + uint64_t(tendonIndex) * PXG_ARTI_TENDON_SIZE;
+            const uint64_t modElements = (Ptr<uint64_t>(tendon + PXG_TENDON_MOD_ELEMENTS))[0];
+            const uint numTendonAttachments = (Ptr<uint>(tendon + PXG_TENDON_NB_ELEMENTS))[0];
+            if (attachmentIndex < numTendonAttachments)
+            {
+                // NINTH CANDIDATE: no tendonIndex in the user-buffer offset
+                Ptr<uint4> src = Ptr<uint4>(gGs5.data
+                                            + (uint64_t(groupIndex) * maxSpatialTendons
+                                                   * maxTendonAttachments
+                                               + attachmentIndex) * 32u);
+                Ptr<uint4> dst = Ptr<uint4>(modElements + uint64_t(attachmentIndex) * 32u);
+                dst[0] = src[0];
+                dst[1] = src[1];
+            }
+        }
+    }
+}
+
+[shader("compute")]
+[numthreads(512, 1, 1)]
+void getArtiFixedTendonJointState(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint maxFixedTendons =
+        (Ptr<uint>(gGs4.scDesc + PXG_ARTI_CORE_MAX_FIXED_TENDONS))[0];   // trap 9
+    const uint maxTendonJoints =
+        (Ptr<uint>(gGs4.scDesc + PXG_ARTI_CORE_MAX_TENDON_JOINTS))[0];
+    const uint maxTendons = maxFixedTendons * maxTendonJoints;
+
+    const uint globalThreadIndex = dispatchThreadId.x;
+    const uint groupIndex = globalThreadIndex / maxTendons;
+    const uint elementIndex = globalThreadIndex % maxTendons;
+    const uint tendonIndex = elementIndex / maxTendonJoints;
+    const uint tendonJointIndex = elementIndex % maxTendonJoints;
+
+    if (groupIndex < gGs4.nbElements)
+    {
+        const uint64_t record = gsRecord(gGs4.scDesc, gGs4.idx, groupIndex);
+        const uint numFixedTendons = artiU16Field(record, PXG_ARTI_DATA_NUM_FIXED_TENDONS);
+        if (tendonIndex < numFixedTendons)
+        {
+            const uint64_t tendon = artiPtrField(record, PXG_ARTI_FIXED_TENDONS)
+                                    + uint64_t(tendonIndex) * PXG_ARTI_TENDON_SIZE;
+            const uint64_t modElements = (Ptr<uint64_t>(tendon + PXG_TENDON_MOD_ELEMENTS))[0];
+            const uint numTendonJoints = (Ptr<uint>(tendon + PXG_TENDON_NB_ELEMENTS))[0];
+            if (tendonJointIndex < numTendonJoints)
+            {
+                // NINTH CANDIDATE: no tendonIndex in the user-buffer offset
+                Ptr<uint4> dst = Ptr<uint4>(gGs4.data
+                                            + (uint64_t(groupIndex) * maxTendons
+                                               + tendonJointIndex) * 16u);
+                Ptr<uint4> src = Ptr<uint4>(modElements + uint64_t(tendonJointIndex) * 16u);
+                dst[0] = src[0];
+            }
+        }
+    }
+}
+
+[shader("compute")]
+[numthreads(512, 1, 1)]
+void setArtiFixedTendonJointState(uint3 dispatchThreadId : SV_DispatchThreadID)
+{
+    const uint maxFixedTendons =
+        (Ptr<uint>(gGs4.scDesc + PXG_ARTI_CORE_MAX_FIXED_TENDONS))[0];   // trap 9
+    const uint maxTendonJoints =
+        (Ptr<uint>(gGs4.scDesc + PXG_ARTI_CORE_MAX_TENDON_JOINTS))[0];
+    const uint maxTendons = maxFixedTendons * maxTendonJoints;
+
+    const uint globalThreadIndex = dispatchThreadId.x;
+    const uint groupIndex = globalThreadIndex / maxTendons;
+    const uint elementIndex = globalThreadIndex % maxTendons;
+    const uint tendonIndex = elementIndex / maxTendonJoints;
+    const uint tendonJointIndex = elementIndex % maxTendonJoints;
+
+    if (groupIndex < gGs4.nbElements)
+    {
+        const uint64_t record = gsRecord(gGs4.scDesc, gGs4.idx, groupIndex);
+        if (elementIndex == 0u)   // trap 8's shape: outside the tendon guard
+        {
+            Ptr<uint> dirty = Ptr<uint>(record + PXG_ARTI_DATA_gpuDirtyFlag);
+            dirty[0] = dirty[0] | PXG_ARTI_DIRTY_FIXED_TENDON_JOINT;
+        }
+        const uint numFixedTendons = artiU16Field(record, PXG_ARTI_DATA_NUM_FIXED_TENDONS);
+        if (tendonIndex < numFixedTendons)
+        {
+            const uint64_t tendon = artiPtrField(record, PXG_ARTI_FIXED_TENDONS)
+                                    + uint64_t(tendonIndex) * PXG_ARTI_TENDON_SIZE;
+            const uint64_t modElements = (Ptr<uint64_t>(tendon + PXG_TENDON_MOD_ELEMENTS))[0];
+            const uint numTendonJoints = (Ptr<uint>(tendon + PXG_TENDON_NB_ELEMENTS))[0];
+            if (tendonJointIndex < numTendonJoints)
+            {
+                // NINTH CANDIDATE: no tendonIndex in the user-buffer offset
+                Ptr<uint4> src = Ptr<uint4>(gGs4.data
+                                            + (uint64_t(groupIndex) * maxTendons
+                                               + tendonJointIndex) * 16u);
+                Ptr<uint4> dst = Ptr<uint4>(modElements + uint64_t(tendonJointIndex) * 16u);
+                dst[0] = src[0];
+            }
+        }
+    }
+}

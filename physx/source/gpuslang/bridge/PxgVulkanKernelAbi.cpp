@@ -1328,6 +1328,12 @@ static const PxgKernelAbiRow kRows[] = {
     { "setArtiRootVelocityState", kGetSet5, uint32_t(sizeof(kGetSet5)) },
     { "setArtiLinkForceState", kGetSet5, uint32_t(sizeof(kGetSet5)) },
     { "setArtiLinkTorqueState", kGetSet5, uint32_t(sizeof(kGetSet5)) },
+    { "getArtiTendonState", kGetSet6, uint32_t(sizeof(kGetSet6)) },
+    { "setArtiTendonState", kGetSet6, uint32_t(sizeof(kGetSet6)) },
+    { "getArtiSpatialTendonAttachmentState", kGetSet5, uint32_t(sizeof(kGetSet5)) },
+    { "setArtiSpatialTendonAttachmentState", kGetSet5, uint32_t(sizeof(kGetSet5)) },
+    { "getArtiFixedTendonJointState", kThreePtrU32, uint32_t(sizeof(kThreePtrU32)) },
+    { "setArtiFixedTendonJointState", kThreePtrU32, uint32_t(sizeof(kThreePtrU32)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

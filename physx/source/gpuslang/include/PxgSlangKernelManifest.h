@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 312;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 318;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -358,12 +358,12 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "setArtiRootVelocityState", "npArtiGetSet.spv", "setArtiRootVelocityState" },  // ARTI_SET_ROOT_VELOCITY_STATE (unmapped)
     { "setArtiLinkForceState", "npArtiGetSet.spv", "setArtiLinkForceState" },  // ARTI_SET_LINK_FORCE_STATE (unmapped)
     { "setArtiLinkTorqueState", "npArtiGetSet.spv", "setArtiLinkTorqueState" },  // ARTI_SET_LINK_TORQUE_STATE (unmapped)
-    { "setArtiTendonState", nullptr, nullptr },  // ARTI_SET_TENDON_STATE (unmapped)
-    { "setArtiSpatialTendonAttachmentState", nullptr, nullptr },  // ARTI_SET_SPATIAL_TENDON_ATTACHMENT_STATE (unmapped)
-    { "setArtiFixedTendonJointState", nullptr, nullptr },  // ARTI_SET_FIXED_TENDON_JOINT_STATE (unmapped)
-    { "getArtiTendonState", nullptr, nullptr },  // ARTI_GET_TENDON_STATE (unmapped)
-    { "getArtiSpatialTendonAttachmentState", nullptr, nullptr },  // ARTI_GET_SPATIAL_TENDON_ATTACHMENT_STATE (unmapped)
-    { "getArtiFixedTendonJointState", nullptr, nullptr },  // ARTI_GET_FIXED_TENDON_JOINT_STATE (unmapped)
+    { "setArtiTendonState", "npArtiGetSet.spv", "setArtiTendonState" },  // ARTI_SET_TENDON_STATE (unmapped)
+    { "setArtiSpatialTendonAttachmentState", "npArtiGetSet.spv", "setArtiSpatialTendonAttachmentState" },  // ARTI_SET_SPATIAL_TENDON_ATTACHMENT_STATE (unmapped)
+    { "setArtiFixedTendonJointState", "npArtiGetSet.spv", "setArtiFixedTendonJointState" },  // ARTI_SET_FIXED_TENDON_JOINT_STATE (unmapped)
+    { "getArtiTendonState", "npArtiGetSet.spv", "getArtiTendonState" },  // ARTI_GET_TENDON_STATE (unmapped)
+    { "getArtiSpatialTendonAttachmentState", "npArtiGetSet.spv", "getArtiSpatialTendonAttachmentState" },  // ARTI_GET_SPATIAL_TENDON_ATTACHMENT_STATE (unmapped)
+    { "getArtiFixedTendonJointState", "npArtiGetSet.spv", "getArtiFixedTendonJointState" },  // ARTI_GET_FIXED_TENDON_JOINT_STATE (unmapped)
     { "getD6JointForces", nullptr, nullptr },  // D6_JOINT_GET_FORCE (unmapped)
     { "getD6JointTorques", nullptr, nullptr },  // D6_JOINT_GET_TORQUE (unmapped)
     { "updateDirtyAggregate", "broadphaseAggregateDirty.spv", "updateDirtyAggregate" },  // UPDATE_DIRTY_AGGREGATE
