@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **768/768** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **769/769** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,49 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.118 — die neun Nicht-Tendon-get/set-Kernel der Direct-API (Manifest 312)
+
+NEUN Kernel in EINER Tranche — die mechanische Gather/Scatter-Hälfte der
+Direct-GPU-API-Zustandsfamilie (articulationDirectGpuApi.cu:350-819), alle
+in `npArtiGetSet.slang` (NOCONTRACT): getArtiDofStates,
+getArtiTransformStates, getArtiVelocityStates, getArtiSpatialForceStates,
+setArtiDofStates, setArtiRootGlobalPoseState, setArtiRootVelocityState,
+setArtiLinkForceState, setArtiLinkTorqueState.  Die sechs Tendon-Kernel
+folgen als P8.119.  ABI: kGetSet6 {8,8,8,4,4,4}, kGetSet5 {8,8,8,4,4},
+kThreePtrU32 wiederverwendet.  Blöcke 512/480 (die Engine-BlockDims),
+1 Thread pro Element.
+
+**Fallen**: die Sechs-Lese- vs. Fünf-Schreib-Enum-Tabellen (ihre
+Reihenfolgen UNTERSCHEIDEN sich — Read hat eJOINT_ACCELERATION, Write
+nicht); Max-Pitch-Indexzerlegung vs. Real-Count-Guards (tote Pitch-Slots
+bleiben Poison); die per-Typ-Dirty-Bit-Sätze (Positionen/Velocities heben
+auch eNEEDS_KINEMATIC_UPDATE, Forces/Targets nicht — jedes von GENAU EINEM
+Thread gesetzt, kein RMW-Race wie in P8.117); getTransform =
+body2World * body2Actor.getInverse() vs. setRootPose = actorPose *
+body2Actor (einer invertiert, der andere NICHT); Root-Varianten klemmen
+numLinks auf 1, die AUSGABE-Pitch bleibt maxLinks; die
+Spatial-Vector-Hälften als rohe floats (angular @0, linear @+3, Stride 6);
+externalAccelerations.top = force * invMass (.w) vs. .bottom =
+q.rotate(invInertia .* q.rotateInv(torque)).
+
+**Fixture** `testArtiGetSet.cpp`: 25 Dispatches über die 9 Kernel × alle
+Enum-Varianten, ALLES bit-exakt (keine Transzendenten — nur
+Quat-Multiplikation/Rotation und eine komponentenweise Skalierung).
+12 live + 4 Wächter-Records; der 1024-Einträge-Index-Puffer deckt JEDEN
+Overhang-groupIndex des Grid-2×512-Launches (die P8.113-Lektion auf einen
+512er-Block angewandt); Getter-Ausgaben mit vollem Overhang-Slack
+allokiert und Poison-verglichen; Dirty-Wörter aller 16 Records exakt.
+**Bit-exakt im ersten Lauf, alle 25 Dispatches.**
+
+**Sweep 16/16**: Remap zu Identity, Pitch-Guard weg, Target-Swap im
+Read-Switch, Root-Clamp weg, getInverse weg, Hälften vertauscht (get und
+set), Stride 12 statt 24, falsches Quellfeld, Forces heben eNEEDS,
+Force-Feld-Swap im Write-Switch, setRootPose invertiert, falsches
+Dirty-Bit, invMass weg, rotateInv weg, Torque schreibt .top.
+
+Szene: Refused-Liste 198 → **189** (alle neun verschwinden).  Suite:
+**769/769 ctest in BEIDEN Memory-Modi**.  Manifest **312/501**.
 
 ## P8.117 — artiUpdateKinematic (Manifest 303): eine NEUE Deviation-Klasse, gemessen
 

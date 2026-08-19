@@ -148,6 +148,9 @@ static const uint8_t kGravityForces[] = { 4, 8, 8, 4, 1, 8, 12 };
 static const uint8_t kCentrifugal[] = { 4, 8, 8, 4, 1, 8 };
 // P8.117: artiUpdateKinematic -- six pointers, u32, pointer, pointer, u32, bool
 static const uint8_t kUpdateKin[] = { 8, 8, 8, 8, 8, 8, 4, 8, 8, 4, 1 };
+// P8.118: the direct-API get/set family -- three pointers plus one to three u32
+static const uint8_t kGetSet6[] = { 8, 8, 8, 4, 4, 4 };
+static const uint8_t kGetSet5[] = { 8, 8, 8, 4, 4 };
 
 // solverTGS: propagateAverageSolverBodyVelocityTGS(desc, sharedDesc,
 //   bool isVelocityIteration, bool isLastPosIteration, PxReal biasCoefficient)
@@ -1316,6 +1319,15 @@ static const PxgKernelAbiRow kRows[] = {
     { "computeArtiCentrifugalForces", kCentrifugal, uint32_t(sizeof(kCentrifugal)) },
     { "computeArtiMassMatrices", kCentrifugal, uint32_t(sizeof(kCentrifugal)) },  // P8.116: same six params
     { "artiUpdateKinematic", kUpdateKin, uint32_t(sizeof(kUpdateKin)) },
+    { "getArtiDofStates", kGetSet6, uint32_t(sizeof(kGetSet6)) },
+    { "getArtiTransformStates", kGetSet6, uint32_t(sizeof(kGetSet6)) },
+    { "getArtiVelocityStates", kGetSet6, uint32_t(sizeof(kGetSet6)) },
+    { "getArtiSpatialForceStates", kGetSet5, uint32_t(sizeof(kGetSet5)) },
+    { "setArtiDofStates", kGetSet6, uint32_t(sizeof(kGetSet6)) },
+    { "setArtiRootGlobalPoseState", kThreePtrU32, uint32_t(sizeof(kThreePtrU32)) },
+    { "setArtiRootVelocityState", kGetSet5, uint32_t(sizeof(kGetSet5)) },
+    { "setArtiLinkForceState", kGetSet5, uint32_t(sizeof(kGetSet5)) },
+    { "setArtiLinkTorqueState", kGetSet5, uint32_t(sizeof(kGetSet5)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 303;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 312;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -349,15 +349,15 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "setRigidDynamicAngularVelocity", "directApi.spv", "setRigidDynamicAngularVelocity" },  // RIGID_DYNAMIC_SET_ANGVEL
     { "setRigidDynamicForce", "directApi.spv", "setRigidDynamicForce" },  // RIGID_DYNAMIC_SET_FORCE
     { "setRigidDynamicTorque", "directApi.spv", "setRigidDynamicTorque" },  // RIGID_DYNAMIC_SET_TORQUE
-    { "getArtiDofStates", nullptr, nullptr },  // ARTI_GET_DOF_STATES (unmapped)
-    { "getArtiTransformStates", nullptr, nullptr },  // ARTI_GET_TRANSFORM_STATES (unmapped)
-    { "getArtiVelocityStates", nullptr, nullptr },  // ARTI_GET_VELOCITY_STATES (unmapped)
-    { "getArtiSpatialForceStates", nullptr, nullptr },  // ARTI_GET_SPATIAL_FORCE_STATES (unmapped)
-    { "setArtiDofStates", nullptr, nullptr },  // ARTI_SET_DOF_STATES (unmapped)
-    { "setArtiRootGlobalPoseState", nullptr, nullptr },  // ARTI_SET_ROOT_GLOBAL_POSE_STATE (unmapped)
-    { "setArtiRootVelocityState", nullptr, nullptr },  // ARTI_SET_ROOT_VELOCITY_STATE (unmapped)
-    { "setArtiLinkForceState", nullptr, nullptr },  // ARTI_SET_LINK_FORCE_STATE (unmapped)
-    { "setArtiLinkTorqueState", nullptr, nullptr },  // ARTI_SET_LINK_TORQUE_STATE (unmapped)
+    { "getArtiDofStates", "npArtiGetSet.spv", "getArtiDofStates" },  // ARTI_GET_DOF_STATES (unmapped)
+    { "getArtiTransformStates", "npArtiGetSet.spv", "getArtiTransformStates" },  // ARTI_GET_TRANSFORM_STATES (unmapped)
+    { "getArtiVelocityStates", "npArtiGetSet.spv", "getArtiVelocityStates" },  // ARTI_GET_VELOCITY_STATES (unmapped)
+    { "getArtiSpatialForceStates", "npArtiGetSet.spv", "getArtiSpatialForceStates" },  // ARTI_GET_SPATIAL_FORCE_STATES (unmapped)
+    { "setArtiDofStates", "npArtiGetSet.spv", "setArtiDofStates" },  // ARTI_SET_DOF_STATES (unmapped)
+    { "setArtiRootGlobalPoseState", "npArtiGetSet.spv", "setArtiRootGlobalPoseState" },  // ARTI_SET_ROOT_GLOBAL_POSE_STATE (unmapped)
+    { "setArtiRootVelocityState", "npArtiGetSet.spv", "setArtiRootVelocityState" },  // ARTI_SET_ROOT_VELOCITY_STATE (unmapped)
+    { "setArtiLinkForceState", "npArtiGetSet.spv", "setArtiLinkForceState" },  // ARTI_SET_LINK_FORCE_STATE (unmapped)
+    { "setArtiLinkTorqueState", "npArtiGetSet.spv", "setArtiLinkTorqueState" },  // ARTI_SET_LINK_TORQUE_STATE (unmapped)
     { "setArtiTendonState", nullptr, nullptr },  // ARTI_SET_TENDON_STATE (unmapped)
     { "setArtiSpatialTendonAttachmentState", nullptr, nullptr },  // ARTI_SET_SPATIAL_TENDON_ATTACHMENT_STATE (unmapped)
     { "setArtiFixedTendonJointState", nullptr, nullptr },  // ARTI_SET_FIXED_TENDON_JOINT_STATE (unmapped)
