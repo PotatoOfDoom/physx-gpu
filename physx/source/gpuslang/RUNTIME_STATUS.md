@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **763/763** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **764/764** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,56 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.113 — computeArtiDenseJacobians + computeArtiCentroidalMomentumMatrices (Manifest 299)
+
+Die zwei kleinen Direct-API-Kernel (inverseDynamic.cu:230-318 / :1079-1149)
+sind gemappt — beide in `npArtiInverseDyn.slang`, beide GEGUARDED (anders
+als computeArtiCOM), keine Atomics: die Spiegel sind reine Transkriptionen
+über Engine-Primitive, jeder Wert deterministisch.  ABI-Zeilen
+kDenseJac {8,8,4,4,4,8} und kCentroidal {8,8,4,4,8}.
+
+**Jacobians** (Warp pro Job, Block (32,16,1)): Identity-Block 6xcolCount
+für freie Basis, dann pro Link ein 6-Zeilen-Band, spalten-parallel über den
+Warp.  Fallen: der Ausgabe-PITCH nutzt maxCols*maxRows (MAX-Größen), die
+Zeilen-Indizierung aber colCount (die ECHTE Spaltenzahl); das Parent-Band
+liest die Zeilen des PARENTS (nicht link-1) in derselben Spalte; das
+Own-Joint-Band liest jointOffset (u32@0) und nbDof (**U8@4** — die
+P8.71-Breiten-Lektion, Poison in Bytes 5..7 gepinnt) und rotiert
+motionMatrix[link*80 + dof*24] mit body2World.q.  DATENFLUSS-ANALYSE statt
+blinder Übernahme: im Link-Loop ist jeder Read Lane-lokal (die Parent-Zeilen
+einer Spalte schrieb DIESELBE Lane in einer früheren Iteration) — der
+In-Loop-__syncwarp ist als Lane-lokales No-Op gestrichen
+(npArtiSolveSelf-Trap-10-Präzedenz); der Identity-Block→Link-Loop-Übergang
+IST Cross-Lane (Element i schreibt Lane i%32, liest Lane dof%32) — dort die
+blockuniform GEHOBENE Barriere (aus dem !fixedBase-Branch und dem Guard
+heraus).
+
+**Centroidal** (Warp pro Job, Block (32,8,1), nur freie Basis): kombiniert
+die vom User vorberechneten Massenmatrizen und Coriolis-Kräfte (im SELBEN
+data-Puffer, vier MAX-groß dimensionierte Regionen) in Momentum-Matrix und
+-Bias.  Fallen: Regionen-Layout mit (maxDofs+6), Element-Indizierung mit
+(dofCount+6); pg aus drei VERSTREUTEN Elementen des Root-Trägheitsblocks,
+Division als Reziprok-Multiplikation; die Skew-Matrix SPALTEN-konstruiert;
+Zeilen 3..5 akkumulieren (+=) auf die Kopie; fixe Basis schreibt NICHTS.
+ABWEICHUNG (gleiche Klasse wie P8.112): die CUDA hat KEINEN __syncwarp
+zwischen Kopier- und Add-Schleife trotz Cross-Lane-RMW — der Port setzt die
+gehobene Barriere.
+
+**Fixture** `testArtiInverseDyn2.cpp` (gemeinsamer 24-Record-Pool, permutierte
+Indizes, Guard-tote Jobs): bit-exakt im ersten Lauf.  **Sweep 16/17 im
+ersten Durchlauf; der eine Survivor (dj-guard-dropped) war ein
+FIXTURE-Zufall** — die toten Jobs lasen Allocator-Slack hinter dem
+20-Einträge-Indexpuffer und schrieben außerhalb der verglichenen Region.
+Fix nach der stehenden Regel: Indexpuffer und Ausgaberegion decken alle
+32 Warps ab (tote Slots müssen Poison zurückgeben) — danach ist der Mutant
+deterministisch tot: **17/17**.
+
+Szene: Refused-Liste 204 → **202**; Artikulations-Szene weiter grün.
+Verbleibend: 11 arti*-Kernel (3 Direct-API mittel/groß, artiUpdateKinematic,
+updateArticulationsLaunch, die PGS-Solve-Familie, die PGS-Prep-Zwillinge).
+
+Suite: **764/764 ctest in BEIDEN Memory-Modi** (Binary 685/685).
 
 ## P8.112 — computeArtiCOM (Manifest 297): die Direct-GPU-API-Familie beginnt
 

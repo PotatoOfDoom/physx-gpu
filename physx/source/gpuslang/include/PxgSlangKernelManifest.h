@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 297;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 299;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -332,12 +332,12 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_sleeping", "softBodySimBda.spv", "sb_sleeping" },  // SB_SLEEPING (P8.0 tranche 3 BDA port)
     { "compressContactStage1", "npCompressContacts.spv", "compressContactStage1" },  // COMPRESS_CONTACT_STAGE_1
     { "compressContactStage2", "npCompressContacts2.spv", "compressContactStage2" },  // COMPRESS_CONTACT_STAGE_2
-    { "computeArtiDenseJacobians", nullptr, nullptr },  // COMPUTE_ARTI_DENSE_JACOBIANS (unmapped)
+    { "computeArtiDenseJacobians", "npArtiInverseDyn.spv", "computeArtiDenseJacobians" },  // COMPUTE_ARTI_DENSE_JACOBIANS (unmapped)
     { "computeArtiMassMatrices", nullptr, nullptr },  // COMPUTE_ARTI_MASS_MATRICES (unmapped)
     { "computeArtiGravityForces", nullptr, nullptr },  // COMPUTE_ARTI_GRAVITY_FORCES (unmapped)
     { "computeArtiCentrifugalForces", nullptr, nullptr },  // COMPUTE_ARTI_CENTRIFUGAL_FORCES (unmapped)
     { "computeArtiCOM", "npArtiInverseDyn.spv", "computeArtiCOM" },  // COMPUTE_ARTI_COM (unmapped)
-    { "computeArtiCentroidalMomentumMatrices", nullptr, nullptr },  // COMPUTE_ARTI_CENTROIDAL_MATRICES (unmapped)
+    { "computeArtiCentroidalMomentumMatrices", "npArtiInverseDyn.spv", "computeArtiCentroidalMomentumMatrices" },  // COMPUTE_ARTI_CENTROIDAL_MATRICES (unmapped)
     { "applyParticleBufferDataDEPRECATED", nullptr, nullptr },  // APPLY_PARTICLE_BUFFER_DATA_DEPRECATED (unmapped)
     { "getRigidDynamicGlobalPose", "directApi.spv", "getRigidDynamicGlobalPose" },  // RIGID_DYNAMIC_GET_GLOBAL_POSE
     { "getRigidDynamicLinearVelocity", "directApi.spv", "getRigidDynamicLinearVelocity" },  // RIGID_DYNAMIC_GET_LINVEL
