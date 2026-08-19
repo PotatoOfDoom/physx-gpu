@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **770/770** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **771/771** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,73 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.121 — artiContactConstraintBlockPrepareLaunch, der PGS-Kontakt-Zwilling (Manifest 320)
+
+Der PGS-Zwilling des P8.102-TGS-Kontakt-Preps (artiConstraintPrep2.cu:1380 —
+DASSELBE Template :1201, instanziiert mit PxgContactBlockParams +
+IterativeSolveData und dem dt-Mapping (invDtF32, dt, invDtF32, dt); die
+tiefe Divergenz ist der PGS-Setup-Overload :169-613, portiert als
+`acpSetupFinalizeExtPGS` in `npArtiConstraintPrep.slang` neben dem
+TGS-Setup).  Die PGS-Block-Mirrors (ContactHeader 1920 B, FrictionHeader
+1408 B, ContactPoint 1664 B mit coeff0/coeff1, ContactFriction 1408 B)
+sind als AcpPgs* file-lokal kopiert (das P8.120-Muster); die volle
+computeCompliantContactCoefficients-Form (constraintPrepShared.cuh:274)
+lokal transkribiert — die Rigid-PGS-Prep kommt mit der Reduced-Query-Form
+aus, der Arti-Pfad braucht velMultiplier für das minNormalForce-deltaF.
+ABI: kTwoPtr wiederverwendet.  Die Correlate/getFrictionPatches/
+growPatches-Maschinerie ist die bewährte P8.102-Schicht, unverändert.
+
+**PGS-vs-TGS-Fallen (Modul-Traps 28-45, alle mit Mutant)**: der
+Zero-Contact-Early-Out schreibt DREI Felder (TGS nullt zusätzlich
+invMass — PGS lässt es vergiftet); p8 = 0.8 FIX (biasCoefficient tot;
+TGS clampt min(0.8, bias)); der Header trägt restitution + cfm (keine
+restitutionXdt/p8/maxPenBias-Slots); isSeparated ist `>=` (TGS: `>`);
+penetrationInvDt skaliert mit DEMSELBEN invDt und der pt8-Arm clampt
+von UNTEN bei maxPenBias; isGreater2 testet restitution > 0 (TGS:
+> 1e-5); targetVelocity ist die GEKLAMMERTE Form — der :837-Präzedenz-
+Quirk des Arti-TGS-Zwillings (fünfter Upstream-Kandidat) FEHLT in PGS;
+der Geschwindigkeits-Abgleich keyt auf !isArticulation (JEDER Rigid,
+nicht nur Kinematik wie in TGS) — in den Normal- UND Friction-Zeilen;
+das ccd-Gate ist Engine-eigener toter Code (isCCD hart false →
+ccdMaxSeparation = PX_MAX_F32 → jeder Bounce nullt scaledBias);
+deltaF nutzt das VOR dem Abgleich gesicherte tvel und die Spelling
+(tvel - (vrel + max(penInvDt, 0))); der Friction-Fehler ist
+(ra + p0) - (rb + p1) — NICHT das TGS-(ra-rb)+relTr (Rundung differiert);
+jede Friction-Zeile speichert bias = t·error * invDt in raXn_bias.w
+(der PGS-FrictionHeader hat kein biasCoefficient-Feld); KEIN
+Torsional-Friction (anchorCount = aCount*2 exakt, mTorsionalFrictionData
+wird vom PGS-Entry nie gelesen, kein minPen-Tracking); invTotalDt,
+totalDt, biasCoefficient, ccdMaxSeparationThreshold sind tote Parameter
+und im Port weggelassen (dokumentiert als Trap 45).
+
+**Fixture** `testArtiConstraintPrepPgs.cpp` (Python-Transform-Klon der
+P8.102c-Wrap-Fixture: dieselbe Geometrie — 4 Batches hinter Rigid-Offset
+3, Strides 26/13/32/7, 6 Warps mit 4 live, die Friction-Cache-Lanes
+2..16 — plus Spiegel `refSetupExtContactsPGS` in pxgArtiPrepRef.h) mit
+PGS-Pins auf Warp-0-Lanes (b0 gepinnter Rigid, ra == 0 exakt):
+Lane 18 Bounce + cTargetVel 0.5 → ADDITIV 0.5+3·0.9+3 (der Quirk-Mutant
+ersetzt statt addiert); Lane 20 DYNAMIC-Rigid-Abgleich (-1.5) UND die
+maxPenBias-Klammer (-0.01 > -0.0686 → coeff0 = -1.49); Lane 22
+restitution 1e-6 BOUNCED in PGS; Lane 24 penetration == 0 EXAKT mit
+POSITIVEM penBiasClamp (+0.3), damit >= vs > beobachtbar wird (mit
+negativem Clamp wären beide Arme 0 — eine Fixture-Koinzidenz, vor dem
+Sweep gehärtet); Lane 0 der Scaled-Slop-Pin (kinematisches b0,
+linNorVel 0.01, |angVel| 4 → Slop-Skala ~360).  Alle Pins über die
+Spiegel-eigenen Zahlen assertet, Coverage-Zähler (isGreater2 ≥ 2,
+compliant ≥ 2, pen==0, scaledBias>0, Scaled-Slop, PenClamp) assertet.
+**Bit-exakt im ersten Lauf, 35 tolerierte ±0.**
+
+**Sweep 24/24**: Early-Out-invMass/Writeback, p8=bias, isSeparated
+strikt, 1e-5-Schwelle, Quirk-Arm, Kinematik-Keying (Normal + Friction),
+PenClamp weg, tvel-post-adjust, deltaF-TGS-Form, error-relTr-Form,
+bias ohne invDt, restitution*dt, Torsional-anchorCount, unbiased-Guard
+weg, coeff1-Vorzeichen, Bounce-Bias-Gate weg, Slop roh, Batch-Offset
+weg (rc=139), dt-Mapping-TGS, cfm-min, perPoint-Index 0, offsetSlop-min.
+Restore grün inkl. TGS-Zwilling.
+
+Szene: Refused-Liste 182 → **181**.  Suite: **771/771 ctest in BEIDEN
+Memory-Modi**.  Manifest **320/501**.
 
 ## P8.120 — artiJointConstraintBlockPrepareParallelLaunch, der PGS-Zwilling (Manifest 319)
 

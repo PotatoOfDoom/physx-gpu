@@ -1082,3 +1082,715 @@ void artiTGSContactConstraintBlockPrepareLaunch(uint3 groupThreadId : SV_GroupTh
             float4(quatRotate(b0.b2wQ, a1) + b0.b2wP, 0.0f);
     }
 }
+
+// ===========================================================================
+// P8.121: the PGS twin -- setupFinalizeExtSolverConstraintsBlock, PGS
+// overload (artiConstraintPrep2.cu:169-613), and the engine entry
+// artiContactConstraintBlockPrepareLaunch (:1380 -> the shared template
+// body :1201 with the PGS dt mapping).  The output block types are the PGS
+// PxgBlockSolver* family (PxgConstraintBlock.h), mirrored file-locally as
+// AcpPgs* exactly as P8.120 mirrored the 1D family into npArtiJointPrep.
+//
+// TRAPS, continuing the module numbering (each a sweep mutant unless the
+// note says the fixture pins it structurally):
+// 28. **The contactCount == 0 early-out writes exactly THREE fields**
+//     (numFrictionConstr 0, numNormalConstr 0, forceWritebackOffset ~0) --
+//     the TGS twin (trap 9) also zeroes invMass0_1_angDom0_1; PGS leaves it
+//     POISONED.
+// 29. **p8 is FIXED at 0.8** -- the biasCoefficient parameter is DEAD in the
+//     PGS overload (the TGS twin clamps min(0.8, biasCoefficient)).
+// 30. **The header stores restitution and cfm** (the TGS twin's
+//     restitutionXdt/p8/maxPenBias slots do not exist in the PGS header);
+//     accumNormalForce is never written by prep.
+// 31. **isSeparated is penetration >= 0** (the TGS twin tests > 0).
+// 32. **penetrationInvDt scales by the SAME invDt** (the TGS twin uses the
+//     total-dt inverse), and the non-separated bias arm clamps from BELOW at
+//     maxPenBias: fmaxf(maxPenBias, penetration * invDtp8).
+// 33. **isGreater2 tests restitution > 0** (the TGS twin: > 1e-5).
+// 34. **targetVelocity is the PARENTHESIZED form**
+//     cTargetVel + (isGreater2 ? (-vrel)*restitution : 0) -- the arti TGS
+//     twin's :837 precedence quirk (fifth upstream candidate) is ABSENT in
+//     the PGS overload.
+// 35. **The velocity adjust is keyed on !islandNodeIndex.isArticulation()**
+//     -- ANY rigid (dynamic, static, kinematic), not just kinematic as in
+//     the TGS twin; same for the friction rows via projectVelocity.
+// 36. **The ccd gate is the engine's own dead code**: isCCD is hard-coded
+//     false (:213), so ccdMaxSeparation == PX_MAX_F32 and
+//     (ccdSeparationCondition && isGreater2) reduces to isGreater2 -- every
+//     bounce zeroes scaledBias.  Transcribed with the constant-true compare.
+// 37. **The compliant branch returns coeff0 = a from the FULL
+//     computeCompliantContactCoefficients and coeff1 = -(dt*restitution) *
+//     penetration**; the rigid-PGS prep uses the REDUCED query form, but the
+//     arti path needs velMultiplier for the deltaF below.  The non-compliant
+//     branch stores coeff0 = biasedErr, coeff1 = unbiasedErr, with
+//     unbiasedErr -= max(0, scaledBias) only when !isGreater2.
+// 38. **deltaF uses tvel saved BEFORE the rigid-velocity adjust** and the
+//     spelling (tvel - (vrel + max(penetrationInvDt, 0))) * velMultiplier
+//     (the TGS twin: (targetVelocity + (-penetrationInvDt - vrel))).
+// 39. The PGS contact row carries raXn_targetVelocity / rbXn_maxImpulse
+//     (min'd against min(b0,b1).maxImpulse) / resp0 / resp1 / coeff0 /
+//     coeff1 / appliedForce.
+// 40. **The friction anchor error is (ra + frame0p) - (rb + frame1p)** --
+//     NOT the TGS twin's (ra - rb) + relTr spelling; the rounding differs.
+// 41. **Each friction row stores bias = t.dot(error) * invDt in
+//     raXn_bias.w** (the TGS twin stores the raw frictionError; its invDt
+//     lives in the friction header's biasCoefficient, which the PGS header
+//     does not have).
+// 42. Friction rows use the RAW solverOffsetSlop (normal rows the scaled
+//     one) -- shared with the TGS twin, swept once more here.
+// 43. perPointFriction reads frictionPatch.contactID[j] for the
+//     target-velocity contact index, else contact 0.
+// 44. **NO torsional friction in PGS**: anchorCount = aCount * 2 exactly,
+//     no torsional row, and the work unit's mTorsionalFrictionData is never
+//     read by the PGS entry.  (No minPen tracking either -- it only fed the
+//     TGS torsional scale.)
+// 45. The engine dt mapping (:1384) is (invDtF32, dt, invDtF32, dt), and
+//     the PGS setup body reads only the first two -- invTotalDt, totalDt,
+//     biasCoefficient, ccdMaxSeparationThreshold and torsionalFrictionData
+//     are dead parameters, dropped here with this note.
+// ===========================================================================
+
+// mirrors PxgBlockSolverContactHeader (1920 bytes, PxgConstraintBlock.h:45)
+struct AcpPgsContactHeader
+{
+    float4 invMass0_1_angDom0_1[32];  // 0
+    float4 normal_staticFriction[32]; // 512
+    float accumNormalForce[32];       // 1024 (solver-side; prep never writes)
+    float minNormalForce[32];         // 1152
+    uint flags[32];                   // 1280
+    uint numNormalConstr[32];         // 1408
+    uint forceWritebackOffset[32];    // 1536
+    float restitution[32];            // 1664
+    float cfm[32];                    // 1792
+}                                     // = 1920
+
+// mirrors PxgBlockSolverFrictionHeader (1408 bytes)
+struct AcpPgsFrictionHeader
+{
+    float4 frictionNormals0[32];  // 0
+    float4 frictionNormals1[32];  // 512
+    uint numFrictionConstr[32];   // 1024
+    float dynamicFriction[32];    // 1152
+    uint broken[32];              // 1280
+}                                 // = 1408
+
+// mirrors PxgBlockSolverContactPoint (1664 bytes)
+struct AcpPgsContactPoint
+{
+    float4 raXn_targetVelocity[32]; // 0
+    float4 rbXn_maxImpulse[32];     // 512
+    float appliedForce[32];         // 1024
+    float resp0[32];                // 1152
+    float resp1[32];                // 1280
+    float coeff0[32];               // 1408
+    float coeff1[32];               // 1536
+}                                   // = 1664
+
+// mirrors PxgBlockSolverContactFriction (1408 bytes)
+struct AcpPgsContactFriction
+{
+    float4 raXn_bias[32];       // 0
+    float4 rbXn_targetVelW[32]; // 512
+    float appliedForce[32];     // 1024
+    float resp0[32];            // 1152
+    float resp1[32];            // 1280
+}                               // = 1408
+
+// mirrors computeCompliantContactCoefficients (constraintPrepShared.cuh:274)
+// -- the FULL PGS form.  The rigid-PGS prep gets away with the reduced
+// queryReducedCompliantContactCoefficients; the arti path cannot, because
+// velMultiplier feeds the minNormalForce deltaF (trap 38).
+float acpComputeCompliantContactCoefficientsPGS(
+    float dt, uint flags, float restitution, float damping, float unitResponse,
+    float recipResponse, float penetration, float targetVelocity, bool isSeparated,
+    bool collidingWithVrel, inout float velMultiplier, out float impulseMultiplier,
+    out float unbiasedErr, out float biasedErr)
+{
+    const bool accelSpring = (flags & PXG_SC_FLAG_COMPLIANT_ACCELERATION_SPRING) != 0u;
+    const float massIfAccelElseOne = accelSpring ? recipResponse : 1.0f;
+    const float oneIfAccelElseR = accelSpring ? 1.0f : unitResponse;
+
+    const float nrdt = dt * restitution;
+    const float dampingIfEnabled = computeCompliantDamping(isSeparated, collidingWithVrel, damping);
+    const float a = dt * (dampingIfEnabled - nrdt);
+    const float b = -(nrdt * penetration * massIfAccelElseOne);
+    const float x = 1.0f / (a * oneIfAccelElseR + 1.0f);
+    const float scaledBias = x * b;
+
+    velMultiplier = x * a * massIfAccelElseOne;
+    impulseMultiplier = 1.0f - x;
+    biasedErr = targetVelocity * velMultiplier - scaledBias;
+    unbiasedErr = biasedErr;
+
+    return a;
+}
+
+uint acpSetupFinalizeExtPGS(
+    Ptr<PxgBlockContactData> contactData, uint cdi,
+    Ptr<PxgBlockContactPoint> contacts, uint contactBase,
+    uint contactCount,
+    Ptr<PxgBlockFrictionPatch> frictionPatch, uint fpi,
+    Ptr<PxgBlockFrictionAnchorPatch> fAnchor, uint fai,
+    AcpBody b0, AcpBody b1,
+    float invDt, float dt, float bounceThresholdF32,
+    uint threadIndex, uint forceWritebackBufferOffset, bool perPointFriction,
+    Ptr<AcpPgsContactHeader> contactHeader, uint chi,
+    Ptr<AcpPgsFrictionHeader> frictionHeader, uint fhi,
+    Ptr<AcpPgsContactPoint> contactPoints, uint cpBase,
+    Ptr<AcpPgsContactFriction> frictions, uint frBase,
+    Ptr<PxgArticulationBlockResponse> responses, uint respBase,
+    float solverOffsetSlop)
+{
+    const float4 cd4 = contactData[cdi].contactData[threadIndex];
+    const uint packedW = asuint(cd4.w);
+    const uint flags = (packedW >> 8) & 0xFFu;   // mSolverFlags
+    const float restDistance = cd4.x;
+    const float staticFrictionIn = cd4.y;
+    const float dynamicFrictionIn = cd4.z;
+
+    const float3 bodyFrame0p = b0.b2wP;
+    const float3 bodyFrame1p = b1.b2wP;
+
+    const float maxPenBias = max(b0.penBiasClamp, b1.penBiasClamp);
+    const float p8 = 0.8f;   // trap 29: FIXED; biasCoefficient is dead here
+    const float bounceThreshold = bounceThresholdF32;
+    const float invDtp8 = invDt * p8;
+
+    const float4 lin0X_ang0Y_lin1Z_ang1W = contactData[cdi].mInvMassScale[threadIndex];
+
+    const float3 linVel0 = b0.velocity.bottom;
+    const float3 linVel1 = b1.velocity.bottom;
+    const float3 angVel0 = b0.velocity.top;
+    const float3 angVel1 = b1.velocity.top;
+
+    const float cfm = max(b0.cfm, b1.cfm);
+
+    uint responsesWritten = 0u;
+
+    const uint aCount = frictionPatch[fpi].anchorCount[threadIndex];
+    const uint anchorCount = aCount * 2u;   // trap 44: no torsional row
+
+    if (contactCount == 0u)
+    {
+        // trap 28: exactly these three, then out
+        frictionHeader[fhi].numFrictionConstr[threadIndex] = 0u;
+        contactHeader[chi].numNormalConstr[threadIndex] = 0u;
+        contactHeader[chi].forceWritebackOffset[threadIndex] = 0xffffffffu;
+        return 0u;
+    }
+
+    const float maxImpulse = min(b0.maxImpulse, b1.maxImpulse);
+
+    contactHeader[chi].forceWritebackOffset[threadIndex] = forceWritebackBufferOffset;
+    contactHeader[chi].flags[threadIndex] = flags;
+    // the invMassScale swizzle, shared with the TGS twin (trap 10)
+    contactHeader[chi].invMass0_1_angDom0_1[threadIndex] =
+        float4(lin0X_ang0Y_lin1Z_ang1W.x, lin0X_ang0Y_lin1Z_ang1W.z,
+               lin0X_ang0Y_lin1Z_ang1W.y, lin0X_ang0Y_lin1Z_ang1W.w);
+
+    const float4 normal4_rW = contactData[cdi].normal_restitutionW[threadIndex];
+    const float3 normal = normal4_rW.xyz;
+    const float restitution = normal4_rW.w;
+    const float damping = contactData[cdi].damping[threadIndex];
+    const float norVel0 = dot(normal, linVel0);
+    const float norVel1 = dot(normal, linVel1);
+    const float linNorVel = norVel0 - norVel1;
+
+    // trap 30
+    contactHeader[chi].restitution[threadIndex] = restitution;
+    contactHeader[chi].cfm[threadIndex] = cfm;
+
+    float normalForce = 0.0f;
+
+    for (uint j = 0u; j < contactCount; ++j)
+    {
+        const float4 point4_separationW = contacts[contactBase + j].point_separationW[threadIndex];
+        const float3 point = point4_separationW.xyz;
+        const float separation = point4_separationW.w;
+
+        const float4 targetVel4_maxImpulseW =
+            contacts[contactBase + j].targetVel_maxImpulseW[threadIndex];
+        const float3 targetVel = targetVel4_maxImpulseW.xyz;
+        const float cTargetVel = dot(normal, targetVel);
+
+        const float3 ra = point - bodyFrame0p;
+        const float3 rb = point - bodyFrame1p;
+
+        float3 raXn = cross(ra, normal);
+        float3 rbXn = cross(rb, normal);
+
+        const float angNorVel = dot(raXn, angVel0) - dot(rbXn, angVel1);
+
+        // the scaled slop (shared with the TGS twin, trap 12)
+        const float slop = solverOffsetSlop
+                         * max(linNorVel == 0.0f ? 1.0f : angNorVel / linNorVel, 1.0f);
+        raXn.x = abs(raXn.x) < slop ? 0.0f : raXn.x;
+        raXn.y = abs(raXn.y) < slop ? 0.0f : raXn.y;
+        raXn.z = abs(raXn.z) < slop ? 0.0f : raXn.z;
+        rbXn.x = abs(rbXn.x) < slop ? 0.0f : rbXn.x;
+        rbXn.y = abs(rbXn.y) < slop ? 0.0f : rbXn.y;
+        rbXn.z = abs(rbXn.z) < slop ? 0.0f : rbXn.z;
+
+        const AbSpatialVector response0 = acpCreateImpulseResponseVector(b0, asmSVec(raXn, normal));
+        const AbSpatialVector response1 =
+            acpCreateImpulseResponseVector(b1, asmSVec(-rbXn, -normal));
+
+        const AbSpatialVector deltaV0 = acpGetImpulseResponse(
+            b0, asmSVec(normal * lin0X_ang0Y_lin1Z_ang1W.x, raXn * lin0X_ang0Y_lin1Z_ang1W.y));
+        const AbSpatialVector deltaV1 = acpGetImpulseResponse(
+            b1, asmSVec(-normal * lin0X_ang0Y_lin1Z_ang1W.z, -rbXn * lin0X_ang0Y_lin1Z_ang1W.w));
+
+        const float resp0 = dot(deltaV0.top, response0.top) + dot(deltaV0.bottom, response0.bottom);
+        const float resp1 = dot(deltaV1.top, response1.top) + dot(deltaV1.bottom, response1.bottom);
+        const float unitResponse = resp0 + resp1;
+
+        const float vrel1 = norVel0 + acpProjectAngular(b0, raXn);
+        const float vrel2 = norVel1 + acpProjectAngular(b1, rbXn);
+        const float vrel = vrel1 - vrel2;
+
+        const float penetration = separation - restDistance;
+        const bool isSeparated = penetration >= 0.0f;   // trap 31: >=
+        // trap 32: the SAME invDt, and the p8 arm clamps at maxPenBias
+        const float penetrationInvDt = penetration * invDt;
+        const float penetrationInvDtPt8 = max(maxPenBias, penetration * invDtp8);
+
+        const bool collidingWithVrel = (-vrel) > penetrationInvDt;
+        // trap 33: > 0, not > 1e-5
+        const bool isGreater2 = (restitution > 0.0f) && (bounceThreshold > vrel)
+                             && collidingWithVrel;
+
+        // trap 36: isCCD is the engine's own hard-coded false, so this
+        // compare is constant-true and the gate reduces to isGreater2
+        const bool ccdSeparationCondition = ACP_MAX_F32 >= penetration;
+
+        // trap 34: the PARENTHESIZED form -- no precedence quirk in PGS
+        float targetVelocity = cTargetVel + (isGreater2 ? (-vrel) * restitution : 0.0f);
+
+        // trap 38: saved BEFORE the adjust
+        const float tvel = targetVelocity;
+
+        // trap 35: ANY rigid, not just kinematic
+        if (!nodeIndexIsArticulation(b0.islandNodeIndex))
+            targetVelocity -= vrel1;
+        if (!nodeIndexIsArticulation(b1.islandNodeIndex))
+            targetVelocity += vrel2;
+
+        const float recipResponse = (unitResponse > 0.0f) ? (1.0f / (unitResponse + cfm)) : 0.0f;
+        float velMultiplier = recipResponse;
+
+        float coeff0;
+        float coeff1;
+        if (restitution < 0.0f)   // compliant contact
+        {
+            float impulseMultiplier;
+            float unbiasedErr;
+            float biasedErr;
+            // trap 37: coeff0 = a (the return), velMultiplier updated
+            coeff0 = acpComputeCompliantContactCoefficientsPGS(
+                dt, flags, restitution, damping, unitResponse, recipResponse,
+                penetration, targetVelocity, isSeparated, collidingWithVrel,
+                velMultiplier, impulseMultiplier, unbiasedErr, biasedErr);
+
+            const float nrdt = dt * restitution;
+            coeff1 = -nrdt * penetration;
+        }
+        else
+        {
+            float scaledBias = isSeparated ? penetrationInvDt : penetrationInvDtPt8;
+            if (ccdSeparationCondition && isGreater2)
+                scaledBias = 0.0f;
+
+            float unbiasedErr = targetVelocity;
+            const float biasedErr = unbiasedErr - scaledBias;
+
+            if (!isGreater2)
+                unbiasedErr -= max(0.0f, scaledBias);
+
+            coeff0 = biasedErr;
+            coeff1 = unbiasedErr;
+        }
+
+        // trap 39: the PGS row layout
+        contactPoints[cpBase + j].raXn_targetVelocity[threadIndex] =
+            float4(response0.top, targetVelocity);
+        contactPoints[cpBase + j].rbXn_maxImpulse[threadIndex] =
+            float4(-response1.top, min(maxImpulse, targetVel4_maxImpulseW.w));
+        contactPoints[cpBase + j].resp0[threadIndex] = resp0;
+        contactPoints[cpBase + j].resp1[threadIndex] = resp1;
+        contactPoints[cpBase + j].coeff0[threadIndex] = coeff0;
+        contactPoints[cpBase + j].coeff1[threadIndex] = coeff1;
+        contactPoints[cpBase + j].appliedForce[threadIndex] = 0.0f;
+
+        // trap 38: the PRE-adjust tvel and the max(penInvDt, 0) spelling
+        const float deltaF =
+            max((tvel - (vrel + max(penetrationInvDt, 0.0f))) * velMultiplier, 0.0f);
+        normalForce += deltaF;
+
+        const uint r = respBase + responsesWritten;
+        responses[r].deltaRALin_x[threadIndex] = deltaV0.bottom.x;
+        responses[r].deltaRALin_y[threadIndex] = deltaV0.bottom.y;
+        responses[r].deltaRALin_z[threadIndex] = deltaV0.bottom.z;
+        responses[r].deltaRAAng_x[threadIndex] = deltaV0.top.x;
+        responses[r].deltaRAAng_y[threadIndex] = deltaV0.top.y;
+        responses[r].deltaRAAng_z[threadIndex] = deltaV0.top.z;
+        responses[r].deltaRBLin_x[threadIndex] = deltaV1.bottom.x;
+        responses[r].deltaRBLin_y[threadIndex] = deltaV1.bottom.y;
+        responses[r].deltaRBLin_z[threadIndex] = deltaV1.bottom.z;
+        responses[r].deltaRBAng_x[threadIndex] = deltaV1.top.x;
+        responses[r].deltaRBAng_y[threadIndex] = deltaV1.top.y;
+        responses[r].deltaRBAng_z[threadIndex] = deltaV1.top.z;
+        responsesWritten++;
+    }
+
+    contactHeader[chi].minNormalForce[threadIndex] = (normalForce / float(contactCount)) * 0.25f;
+
+    const float frictionScale = (aCount == 2u) ? 0.5f : 1.0f;
+    const float staticFriction = staticFrictionIn * frictionScale;
+    const float dynamicFriction = dynamicFrictionIn * frictionScale;
+
+    const bool haveFriction = anchorCount != 0u;
+    contactHeader[chi].numNormalConstr[threadIndex] = contactCount;
+    frictionHeader[fhi].numFrictionConstr[threadIndex] = anchorCount;
+
+    contactHeader[chi].normal_staticFriction[threadIndex] = float4(normal, staticFriction);
+    frictionHeader[fhi].dynamicFriction[threadIndex] = dynamicFriction;
+
+    if (haveFriction)
+    {
+        const float3 vrel3 = linVel0 - linVel1;
+
+        const float orthoThreshold = 0.70710678f;
+        const float p1 = 0.0001f;
+        const float3 t0Fallback1 = float3(0.0f, -normal.z, normal.y);
+        const float3 t0Fallback2 = float3(-normal.y, normal.x, 0.0f);
+        const float3 t0Fallback = orthoThreshold > abs(normal.x) ? t0Fallback1 : t0Fallback2;
+
+        float3 t0 = vrel3 - normal * dot(normal, vrel3);
+        t0 = dot(t0, t0) > p1 ? t0 : t0Fallback;
+        // the explicit recip-multiply spelling (see the TGS twin's note)
+        t0 = t0 * (1.0f / sqrt(dot(t0, t0)));
+
+        const float3 t1 = cross(normal, t0);
+
+        frictionHeader[fhi].broken[threadIndex] = 0u;
+        frictionHeader[fhi].frictionNormals0[threadIndex] = float4(t0, 0.0f);
+        frictionHeader[fhi].frictionNormals1[threadIndex] = float4(t1, 0.0f);
+
+        for (uint j = 0u; j < aCount; ++j)
+        {
+            const uint f0i = frBase + 2u * j;
+            const uint f1i = frBase + 2u * j + 1u;
+
+            const float4 body0Anchor4 = (j == 0u) ? fAnchor[fai].body0Anchors0[threadIndex]
+                                                  : fAnchor[fai].body0Anchors1[threadIndex];
+            const float4 body1Anchor4 = (j == 0u) ? fAnchor[fai].body1Anchors0[threadIndex]
+                                                  : fAnchor[fai].body1Anchors1[threadIndex];
+
+            const float3 ra = quatRotate(b0.b2wQ, body0Anchor4.xyz);
+            const float3 rb = quatRotate(b1.b2wQ, body1Anchor4.xyz);
+
+            // trap 40: (ra + p0) - (rb + p1), NOT (ra - rb) + relTr
+            const float3 error = (ra + bodyFrame0p) - (rb + bodyFrame1p);
+
+            // trap 43
+            const uint index = perPointFriction
+                ? ((j == 0u) ? frictionPatch[fpi].contactID0[threadIndex]
+                             : frictionPatch[fpi].contactID1[threadIndex])
+                : 0u;
+            const float4 targetVel4 = contacts[contactBase + index].targetVel_maxImpulseW[threadIndex];
+            const float3 tvel = targetVel4.xyz;
+
+            // t0 row
+            {
+                float3 raXn = cross(ra, t0);
+                float3 rbXn = cross(rb, t0);
+                raXn.x = abs(raXn.x) < solverOffsetSlop ? 0.0f : raXn.x;
+                raXn.y = abs(raXn.y) < solverOffsetSlop ? 0.0f : raXn.y;
+                raXn.z = abs(raXn.z) < solverOffsetSlop ? 0.0f : raXn.z;
+                rbXn.x = abs(rbXn.x) < solverOffsetSlop ? 0.0f : rbXn.x;
+                rbXn.y = abs(rbXn.y) < solverOffsetSlop ? 0.0f : rbXn.y;
+                rbXn.z = abs(rbXn.z) < solverOffsetSlop ? 0.0f : rbXn.z;
+
+                const AbSpatialVector response0 =
+                    acpCreateImpulseResponseVector(b0, asmSVec(raXn, t0));
+                const AbSpatialVector response1 =
+                    acpCreateImpulseResponseVector(b1, asmSVec(-rbXn, -t0));
+                const AbSpatialVector deltaV0 = acpGetImpulseResponse(
+                    b0, asmSVec(t0 * lin0X_ang0Y_lin1Z_ang1W.x, raXn * lin0X_ang0Y_lin1Z_ang1W.y));
+                const AbSpatialVector deltaV1 = acpGetImpulseResponse(
+                    b1, asmSVec(-t0 * lin0X_ang0Y_lin1Z_ang1W.z, -rbXn * lin0X_ang0Y_lin1Z_ang1W.w));
+
+                const float resp0 =
+                    dot(deltaV0.top, response0.top) + dot(deltaV0.bottom, response0.bottom);
+                const float resp1 =
+                    dot(deltaV1.top, response1.top) + dot(deltaV1.bottom, response1.bottom);
+
+                float targetVelF = dot(tvel, t0);
+                // trap 35/42: !isArticulation-keyed, via projectVelocity
+                if (!nodeIndexIsArticulation(b0.islandNodeIndex))
+                    targetVelF -= acpProjectVelocity(b0, asmSVec(raXn, t0));
+                if (!nodeIndexIsArticulation(b1.islandNodeIndex))
+                    targetVelF += acpProjectVelocity(b1, asmSVec(rbXn, t0));
+
+                // trap 41
+                const float bias = dot(t0, error) * invDt;
+                frictions[f0i].raXn_bias[threadIndex] = float4(response0.top, bias);
+                frictions[f0i].rbXn_targetVelW[threadIndex] = float4(-response1.top, targetVelF);
+                frictions[f0i].appliedForce[threadIndex] = 0.0f;
+                frictions[f0i].resp0[threadIndex] = resp0;
+                frictions[f0i].resp1[threadIndex] = resp1;
+
+                const uint r = respBase + responsesWritten;
+                responses[r].deltaRALin_x[threadIndex] = deltaV0.bottom.x;
+                responses[r].deltaRALin_y[threadIndex] = deltaV0.bottom.y;
+                responses[r].deltaRALin_z[threadIndex] = deltaV0.bottom.z;
+                responses[r].deltaRAAng_x[threadIndex] = deltaV0.top.x;
+                responses[r].deltaRAAng_y[threadIndex] = deltaV0.top.y;
+                responses[r].deltaRAAng_z[threadIndex] = deltaV0.top.z;
+                responses[r].deltaRBLin_x[threadIndex] = deltaV1.bottom.x;
+                responses[r].deltaRBLin_y[threadIndex] = deltaV1.bottom.y;
+                responses[r].deltaRBLin_z[threadIndex] = deltaV1.bottom.z;
+                responses[r].deltaRBAng_x[threadIndex] = deltaV1.top.x;
+                responses[r].deltaRBAng_y[threadIndex] = deltaV1.top.y;
+                responses[r].deltaRBAng_z[threadIndex] = deltaV1.top.z;
+                responsesWritten++;
+            }
+
+            // t1 row
+            {
+                float3 raXn = cross(ra, t1);
+                float3 rbXn = cross(rb, t1);
+                raXn.x = abs(raXn.x) < solverOffsetSlop ? 0.0f : raXn.x;
+                raXn.y = abs(raXn.y) < solverOffsetSlop ? 0.0f : raXn.y;
+                raXn.z = abs(raXn.z) < solverOffsetSlop ? 0.0f : raXn.z;
+                rbXn.x = abs(rbXn.x) < solverOffsetSlop ? 0.0f : rbXn.x;
+                rbXn.y = abs(rbXn.y) < solverOffsetSlop ? 0.0f : rbXn.y;
+                rbXn.z = abs(rbXn.z) < solverOffsetSlop ? 0.0f : rbXn.z;
+
+                const AbSpatialVector response0 =
+                    acpCreateImpulseResponseVector(b0, asmSVec(raXn, t1));
+                const AbSpatialVector response1 =
+                    acpCreateImpulseResponseVector(b1, asmSVec(-rbXn, -t1));
+                const AbSpatialVector deltaV0 = acpGetImpulseResponse(
+                    b0, asmSVec(t1 * lin0X_ang0Y_lin1Z_ang1W.x, raXn * lin0X_ang0Y_lin1Z_ang1W.y));
+                const AbSpatialVector deltaV1 = acpGetImpulseResponse(
+                    b1, asmSVec(-t1 * lin0X_ang0Y_lin1Z_ang1W.z, -rbXn * lin0X_ang0Y_lin1Z_ang1W.w));
+
+                const float resp0 =
+                    dot(deltaV0.top, response0.top) + dot(deltaV0.bottom, response0.bottom);
+                const float resp1 =
+                    dot(deltaV1.top, response1.top) + dot(deltaV1.bottom, response1.bottom);
+
+                float targetVelF = dot(tvel, t1);
+                if (!nodeIndexIsArticulation(b0.islandNodeIndex))
+                    targetVelF -= acpProjectVelocity(b0, asmSVec(raXn, t1));
+                if (!nodeIndexIsArticulation(b1.islandNodeIndex))
+                    targetVelF += acpProjectVelocity(b1, asmSVec(rbXn, t1));
+
+                const float bias = dot(t1, error) * invDt;
+                frictions[f1i].raXn_bias[threadIndex] = float4(response0.top, bias);
+                frictions[f1i].rbXn_targetVelW[threadIndex] = float4(-response1.top, targetVelF);
+                frictions[f1i].appliedForce[threadIndex] = 0.0f;
+                frictions[f1i].resp0[threadIndex] = resp0;
+                frictions[f1i].resp1[threadIndex] = resp1;
+
+                const uint r = respBase + responsesWritten;
+                responses[r].deltaRALin_x[threadIndex] = deltaV0.bottom.x;
+                responses[r].deltaRALin_y[threadIndex] = deltaV0.bottom.y;
+                responses[r].deltaRALin_z[threadIndex] = deltaV0.bottom.z;
+                responses[r].deltaRAAng_x[threadIndex] = deltaV0.top.x;
+                responses[r].deltaRAAng_y[threadIndex] = deltaV0.top.y;
+                responses[r].deltaRAAng_z[threadIndex] = deltaV0.top.z;
+                responses[r].deltaRBLin_x[threadIndex] = deltaV1.bottom.x;
+                responses[r].deltaRBLin_y[threadIndex] = deltaV1.bottom.y;
+                responses[r].deltaRBLin_z[threadIndex] = deltaV1.bottom.z;
+                responses[r].deltaRBAng_x[threadIndex] = deltaV1.top.x;
+                responses[r].deltaRBAng_y[threadIndex] = deltaV1.top.y;
+                responses[r].deltaRBAng_z[threadIndex] = deltaV1.top.z;
+                responsesWritten++;
+            }
+        }
+    }
+
+    return responsesWritten;
+}
+
+// ---------------------------------------------------------------------------
+// the ENGINE entry -- artiContactConstraintBlockPrepareLaunch (:1380), the
+// PGS instantiation of the shared template body (:1201).  Identical to the
+// TGS entry above through the body creation and friction machinery; the
+// differences are the PGS shared desc, the PGS output block types, and the
+// dt mapping (trap 45).  gAcw is reused: the CUDA parameter pack is the
+// same two pointers.
+// ---------------------------------------------------------------------------
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void artiContactConstraintBlockPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID,
+                                             uint3 groupId : SV_GroupID)
+{
+    const uint blockStride = 64u / 32u;
+    const uint warpIndex = groupId.x * blockStride + groupThreadId.x / 32u;
+    const uint lane = groupThreadId.x & 31u;
+
+    Ptr<PxgConstraintPrepareDescGpu> prepDesc =
+        Ptr<PxgConstraintPrepareDescGpu>(gAcw.prepDesc);
+    Ptr<PxgSolverSharedDescPGSGpu> sharedDesc =
+        Ptr<PxgSolverSharedDescPGSGpu>(gAcw.sharedDesc);
+
+    // trap 20 (shared with the TGS twin)
+    const uint nbContactBatchesWithSelf = prepDesc[0].numArtiContactBatches
+        + prepDesc[0].numArtiStaticContactBatches + prepDesc[0].numArtiSelfContactBatches;
+    const uint i = warpIndex;
+    if (i >= nbContactBatchesWithSelf)
+        return;
+
+    Ptr<uint> batchIndices = Ptr<uint>(prepDesc[0].artiContactConstraintBatchIndices);
+    const uint batchIndex = batchIndices[i] + prepDesc[0].numBatches;
+
+    Ptr<PxgBlockConstraintBatchGpu> batches =
+        Ptr<PxgBlockConstraintBatchGpu>(sharedDesc[0].iter_blockConstraintBatch);
+    const uint descIndexBatch = batches[batchIndex].mConstraintBatchIndex;
+    const uint responseIndex = batches[batchIndex].mArticulationResponseIndex;
+    const uint descStride = batches[batchIndex].descStride_constraintType & 0xFFFFu;
+
+    if (lane >= descStride)
+        return;
+
+    const uint2 nodeIndexA = batches[batchIndex].bodyANodeIndex[lane];
+    const uint2 nodeIndexB = batches[batchIndex].bodyBNodeIndex[lane];
+
+    // trap 21
+    const uint bodyAIndex = nodeIndexIsArticulation(nodeIndexA)
+        ? batches[batchIndex].remappedBodyAIndex[lane] : batches[batchIndex].bodyAIndex[lane];
+    const uint bodyBIndex = nodeIndexIsArticulation(nodeIndexB)
+        ? batches[batchIndex].remappedBodyBIndex[lane] : batches[batchIndex].bodyBIndex[lane];
+
+    Ptr<PxgBlockWorkUnit> workUnits = Ptr<PxgBlockWorkUnit>(prepDesc[0].blockWorkUnit);
+    Ptr<uint2> currFrictionIndices = Ptr<uint2>(prepDesc[0].blockCurrentFrictionIndices);
+    Ptr<uint2> prevFrictionIndices = Ptr<uint2>(prepDesc[0].blockPreviousFrictionIndices);
+
+    // trap 24
+    const uint edgeIndex = workUnits[descIndexBatch].mEdgeIndex[lane];
+    const uint frictionIndex =
+        edgeIndex + prepDesc[0].totalCurrentEdges * workUnits[descIndexBatch].mPatchIndex[lane];
+    currFrictionIndices[frictionIndex] =
+        uint2((descIndexBatch << 5) | lane, descIndexBatch >> 27);
+
+    AcpBody b0, b1;
+    acpCreateSolverExtBody(nodeIndexA, bodyAIndex, sharedDesc[0].articulations,
+                           prepDesc[0].solverBodyDataPool, prepDesc[0].solverBodyTxIDataPool,
+                           prepDesc[0].body2WorldPool, b0);
+    acpCreateSolverExtBody(nodeIndexB, bodyBIndex, sharedDesc[0].articulations,
+                           prepDesc[0].solverBodyDataPool, prepDesc[0].solverBodyTxIDataPool,
+                           prepDesc[0].body2WorldPool, b1);
+
+    // trap 23
+    const float offsetSlop = max(b0.offsetSlop, b1.offsetSlop);
+
+    const uint forceWritebackOffset = workUnits[descIndexBatch].mWriteback[lane];
+    // trap 44: mTorsionalFrictionData is NOT read by the PGS entry
+
+    // ---- artiCreateFinalizeSolverContactsBlockGPU (:1114), PGS ----
+
+    Ptr<PxgBlockContactData> contactPrepPool =
+        Ptr<PxgBlockContactData>(prepDesc[0].blockContactCurrentPrepPool);
+
+    // trap 22
+    const float4 cd4 = contactPrepPool[descIndexBatch].contactData[lane];
+    const uint materialWord = asuint(cd4.w);
+    const uint nbContacts = materialWord & 0xFFu;
+    const uint flags = (materialWord >> 8) & 0xFFu;
+    const uint prevFrictionPatchCount = (materialWord >> 16) & 0xFFu;
+
+    const float4 normal4 = contactPrepPool[descIndexBatch].normal_restitutionW[lane];
+
+    // PxAlignedTransform(PxTransform): p.w = 0
+    PxgAlignedTransform bodyFrame0;
+    bodyFrame0.q = b0.b2wQ;
+    bodyFrame0.p = float4(b0.b2wP, 0.0f);
+    PxgAlignedTransform bodyFrame1;
+    bodyFrame1.q = b1.b2wQ;
+    bodyFrame1.p = float4(b1.b2wP, 0.0f);
+
+    Ptr<PxgBlockFrictionPatch> currFrictionPatches =
+        Ptr<PxgBlockFrictionPatch>(sharedDesc[0].blockCurrentFrictionPatches);
+    Ptr<PxgBlockFrictionPatch> prevFrictionPatches =
+        Ptr<PxgBlockFrictionPatch>(sharedDesc[0].blockPreviousFrictionPatches);
+    Ptr<PxgBlockFrictionAnchorPatch> currAnchors =
+        Ptr<PxgBlockFrictionAnchorPatch>(prepDesc[0].blockCurrentAnchorPatches);
+    Ptr<PxgBlockFrictionAnchorPatch> prevAnchors =
+        Ptr<PxgBlockFrictionAnchorPatch>(prepDesc[0].blockPreviousAnchorPatches);
+    Ptr<PxgBlockContactPoint> contactPrepPoints =
+        Ptr<PxgBlockContactPoint>(prepDesc[0].blockContactPoints);
+    const uint contactBase = batches[batchIndex].blockContactIndex;
+
+    correlatePatchesPtr(currFrictionPatches, descIndexBatch, nbContacts, normal4.xyz,
+                        bodyFrame0, bodyFrame1, lane);
+
+    const bool perPointFriction = (flags & PXG_SC_FLAG_PER_POINT_FRICTION) != 0;
+    const bool disableFriction = (flags & PXG_SC_FLAG_DISABLE_FRICTION) != 0;
+
+    currFrictionPatches[descIndexBatch].broken[lane] = 0;
+    float patchExtents = 0.0f;
+
+    // trap 25
+    if (!(perPointFriction || disableFriction))
+    {
+        getFrictionPatchesPtr(currFrictionPatches, descIndexBatch, currAnchors, descIndexBatch,
+                              prevFrictionIndices, prepDesc[0].blockPreviousFrictionIndices != 0,
+                              edgeIndex, prevFrictionPatches, prevAnchors, prevFrictionPatchCount,
+                              bodyFrame0, bodyFrame1, prepDesc[0].correlationDistance, lane,
+                              prepDesc[0].totalPreviousEdges, patchExtents, nbContacts);
+    }
+
+    if (!disableFriction)
+        growPatchesPtr(currFrictionPatches, descIndexBatch, currAnchors, descIndexBatch,
+                       contactPrepPoints, contactBase, nbContacts, bodyFrame0, bodyFrame1,
+                       prepDesc[0].frictionOffsetThreshold + cd4.x, lane, patchExtents);
+
+    Ptr<AcpPgsContactHeader> contactHeaders =
+        Ptr<AcpPgsContactHeader>(sharedDesc[0].iter_blockContactHeaders);
+    Ptr<AcpPgsFrictionHeader> frictionHeaders =
+        Ptr<AcpPgsFrictionHeader>(sharedDesc[0].iter_blockFrictionHeaders);
+    Ptr<AcpPgsContactPoint> outContactPoints =
+        Ptr<AcpPgsContactPoint>(sharedDesc[0].iter_blockContactPoints);
+    Ptr<AcpPgsContactFriction> outFrictions =
+        Ptr<AcpPgsContactFriction>(sharedDesc[0].iter_blockFrictions);
+    Ptr<PxgArticulationBlockResponse> responses =
+        Ptr<PxgArticulationBlockResponse>(sharedDesc[0].iter_artiResponse);
+
+    // trap 45: (invDtF32, dt) -- the PGS setup reads no other dt
+    acpSetupFinalizeExtPGS(
+        contactPrepPool, descIndexBatch,
+        contactPrepPoints, contactBase, nbContacts,
+        currFrictionPatches, descIndexBatch,
+        currAnchors, descIndexBatch,
+        b0, b1,
+        sharedDesc[0].invDtF32, sharedDesc[0].dt,
+        prepDesc[0].bounceThresholdF32,
+        lane, forceWritebackOffset, perPointFriction,
+        contactHeaders, descIndexBatch,
+        frictionHeaders, descIndexBatch,
+        outContactPoints, batches[batchIndex].startConstraintIndex,
+        outFrictions, batches[batchIndex].startFrictionIndex,
+        responses, responseIndex,
+        offsetSlop);
+
+    // trap 26
+    currFrictionPatches[descIndexBatch].patchIndex[lane] =
+        workUnits[descIndexBatch].mFrictionPatchIndex[lane];
+
+    if (currFrictionPatches[descIndexBatch].anchorCount[lane] >= 1u)
+    {
+        const float3 a0 = currAnchors[descIndexBatch].body0Anchors0[lane].xyz;
+        currFrictionPatches[descIndexBatch].anchorPoints0[lane] =
+            float4(quatRotate(b0.b2wQ, a0) + b0.b2wP, 0.0f);
+    }
+    if (currFrictionPatches[descIndexBatch].anchorCount[lane] == 2u)
+    {
+        const float3 a1 = currAnchors[descIndexBatch].body0Anchors1[lane].xyz;
+        currFrictionPatches[descIndexBatch].anchorPoints1[lane] =
+            float4(quatRotate(b0.b2wQ, a1) + b0.b2wP, 0.0f);
+    }
+}
