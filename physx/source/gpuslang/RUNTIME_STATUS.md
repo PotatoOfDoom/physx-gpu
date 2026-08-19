@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **766/766** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **767/767** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,88 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.116 — computeArtiMassMatrices (Manifest 302): die Direct-API-Inverse-Dynamics-Familie ist KOMPLETT
+
+`computeArtiMassMatrices` (inverseDynamic.cu:336-584) ist gemappt — die
+CRB-generalisierte Massenmatrix der Direct-API (eGENERALIZED_MASS_MATRICES
+ohne, eMASS_MATRICES mit Root-Motion).  Damit sind ALLE sechs
+Inverse-Dynamics-Kernel des `PxDirectGPUAPI::computeArticulationData`-Pfads
+in `npArtiInverseDyn.slang` gelandet.  ABI: die kCentrifugal-Zeile
+{4,8,8,4,1,8} wird VERBATIM wiederverwendet (identische sechs Parameter).
+
+**ZWEI Scratch-Reinterpretationen gleichzeitig**:
+worldSpatialArticulatedInertia (@168) als Dy::SpatialMatrix* mit Stride 112
+(das P8.114-Paar) — diesmal INKLUSIVE des Padding-Worts @108: der Init
+schreibt es als Teil der Struct-Kopie auf 0, der Level-Prepass mutiert es
+zu Level-Nummern (PxU32&-Referenzen schreiben durch), operator+= lässt es
+unangetastet; alle drei Zustände sind BEOBACHTBARER Scratch-State und
+werden verglichen.  Und NEU vermessen: worldMotionMatrix (@224, per
+static_assert gepinnt) als FLACHES Cm::UnAlignedSpatialVector*-Array,
+indiziert [jointOffset + dof] mit Stride 24 — NICHT das
+[link][dof]-Stride-80-Layout, das sein eigener Typ deklariert.
+
+**ABWEICHUNG (dokumentiert, mit Beweis)**: die level-geplante
+Baum-Akkumulation (#if 1, der kompilierte Zweig: Lane-0-Prepass,
+__shfl_sync-maxStep-Broadcast, Level-Schleife mit __syncwarp pro Level)
+ist auf Subgroup-8 nicht ausdrückbar — der Warp-Trip-Count variiert pro
+Warp.  Der Port ersetzt sie durch die ENGINE-EIGENE #else-Referenz:
+sequentielle Akkumulation in absteigender Link-Reihenfolge auf Lane 0.
+Bit-Identität bewiesen: der Prepass gibt Geschwistern strikt AUFSTEIGENDE
+Level in ABSTEIGENDER Index-Reihenfolge (jedes Kind stößt das ps des
+Parents auf sein s+1), also IST die Level-Reihenfolge pro Parent die
+absteigende Kind-Reihenfolge; über Parents hinweg sind die Ziele disjunkt;
+ein Link wird erst auf seinen Parent gedrückt, wenn alle eigenen Kinder
+gelandet sind (s(link) >= max(s(kind))+1).  Der maxStep-Broadcast entfällt
+mit der Level-Schleife; der PREPASS BLEIBT (Padding beobachtbar).  Die
+übrige __syncwarp-Choreografie wird zu VIER uniformen Barrieren-Slots
+(P8.114-Klasse); das nachlaufende :582-Sync entfällt (nichts Beobachtbares
+folgt); der rootMotion-Root-Tail hat im CUDA KEIN Sync davor und braucht
+keins (liest nur spatialInertias[0], Slot 3; schreibt disjunkte Zellen).
+
+**Weitere Fallen, jede mit Mutant**: rootDof (rootMotion && !frei) indiziert
+Zeilen/Spalten, aber die Puffer-PITCH nutzt bufferDof (rootMotion allein) —
+(maxDofs+bufferDof)^2 pro Job auch für Fixed-Base-Jobs, und nur matSize^2
+Einträge werden genullt (der Rest der Pitch bleibt Poison); der
+Einwärts-Walk translatiert die wm-Scratch-Vektoren IN PLACE Hop für Hop
+(rw = child.p - parent.p, POSITIV) — der Endzustand sind die auf die Wurzel
+translatieren I*m-Vektoren, die die !rootMotion-Korrektur dann konsumiert
+(-= m0 . (invertInertia(I0) * m1), im CUDA mit Stride dofCount
+buchstabiert); die Parent-Bänder rotieren FRISCH aus motionMatrix (nicht
+aus dem Scratch, der I*m hält); die Root-Kopplung (+= in [col][row] UND
+[row][col], nur rootMotion+frei); der Root-6x6-Tail liest ROHE floats aus
+spatialInertias[0] mit der Linear/Angular-Inversions-Indexkarte
+offset = (row>2) ? 18 : (col<3)*9; per-Komponenten-Null-Guards (statischer
+Link); der Dual-Produkt-Skalar in allen drei Band-Formeln.
+
+**Fixture** `testArtiMassMatrices.cpp`: Spiegel sequentiell über
+Engine-Primitive (transformInertiaTensor, PxMat33(q), refSkew/
+refTranslateInertia, Dy::SpatialMatrix +/*/invertInertia,
+FeatherstoneArticulation::translateSpatialVector, rotate(PxTransform),
+das Dual-Produkt, UnAlignedSpatialVector::operator[]).  12 Jobs auf 16
+Slots über 18 Records (P8.113-Guard-Lektion: tote Slots zeigen auf
+disjunkte tote Records), 4 fixe / 8 freie Basen, 4 Multi-Child-Bäume
+(Link 1 mit Kindern {2,3} — die Geschwister-Reihenfolge ist über dichte
+Mantissen beobachtbar), Walk-Tiefe bis 2 Nicht-Root-Ahnen, ein statischer
+Link, ein EIN-Link-Frei-Basis-Record (der Root-Tail ist die ganze Matrix;
+ohne rootMotion ist matSize 0 und der Slot bleibt komplett Poison), zwei
+Runden (rootMotion an/aus).  Verglichen: massMatrix-Puffer (volle Pitch
+inkl. Poison), Trägheits-Scratch inkl. der PADDING-Worte, wm-Scratch.
+**Bit-exakt im ersten Lauf, beide Runden — auch durch die
+Sequentialisierung der Baum-Akkumulation.**
+
+**Sweep 18/18**: Guard weg, Trägheits-Store bei 144, Padding nicht genullt,
+Prepass gestrichen, Akkumulation aufsteigend, rootDof ignoriert fixBase,
+Pitch nutzt rootDof, Null-Schleife gestrichen, wm-Scratch mit
+Link-Stride 80, Walk-rw negiert, childP nicht nachgeführt, Root-Kopplung
+gestrichen, Root-Tail-Indexkarte verstümmelt, Korrektur-Vorzeichen,
+Parent-Band aus dem Scratch, plain-Dot statt Dual, Korrektur ohne
+invertInertia, Masse ohne Guard.  Restore grün über alle fünf
+Modul-Fixtures.
+
+Szene: Refused-Liste 200 → **199**, `computeArtiMassMatrices` ist der
+Kernel, der geht; beide Körper fallen + ruhen weiter.  Suite: **767/767
+ctest in BEIDEN Memory-Modi**.  Manifest **302/501**.
 
 ## P8.115 — computeArtiCentrifugalForces (Manifest 301)
 

@@ -441,6 +441,12 @@ public static const uint PXG_ARTI_SUBSPACE_STRIDE                       =     80
 // topLeft @0, topRight @36, bottomLeft @72, PxMat33 column-major.
 public static const uint PXG_ARTI_WORLD_SPATIAL_ARTICULATED_INERTIA     =    168;
 public static const uint PXG_ARTI_DY_SPATIAL_MATRIX_AOS_STRIDE          =    112;
+// P8.116: worldMotionMatrix (the pointer right after motionMatrix @216;
+// pinned by static_assert in testArtiMassMatrices.cpp).  computeArtiMassMatrices
+// reinterpret_casts it to a FLAT Cm::UnAlignedSpatialVector* scratch indexed
+// [jointOffset + dof] at stride 24 -- NOT the [link][dof] stride-80 layout the
+// motionMatrix field itself uses.
+public static const uint PXG_ARTI_WORLD_MOTION_MATRIX                   =    224;
 public static const uint PXG_ARTI_QUAT_SIZE                             =     16;
 
 // reads a single byte out of a record, via the containing word

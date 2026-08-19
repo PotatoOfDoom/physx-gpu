@@ -1312,6 +1312,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "computeArtiCentroidalMomentumMatrices", kCentroidal, uint32_t(sizeof(kCentroidal)) },
     { "computeArtiGravityForces", kGravityForces, uint32_t(sizeof(kGravityForces)) },
     { "computeArtiCentrifugalForces", kCentrifugal, uint32_t(sizeof(kCentrifugal)) },
+    { "computeArtiMassMatrices", kCentrifugal, uint32_t(sizeof(kCentrifugal)) },  // P8.116: same six params
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

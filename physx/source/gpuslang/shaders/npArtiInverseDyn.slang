@@ -1085,3 +1085,315 @@ void computeArtiCentrifugalForces(uint3 groupThreadId : SV_GroupThreadID,
     }
     AllMemoryBarrierWithGroupSync();   // trailing
 }
+
+// ===========================================================================
+// P8.116: computeArtiMassMatrices (inverseDynamic.cu:336-584).
+// Grid ceil(nbIndices/8), block (32, 8, 1), GUARDED.  The CRB generalized
+// mass matrix of the direct API -- eGENERALIZED_MASS_MATRICES (rootMotion
+// false) and eMASS_MATRICES (rootMotion true).  ABI row: kCentrifugal
+// reused verbatim ({4,8,8,4,1,8} -- the same six parameters).
+//
+// TRAPS, each a sweep mutant unless marked:
+//  1. TWO record-scratch reinterpretations: worldSpatialArticulatedInertia
+//     (@168) as Dy::SpatialMatrix* at stride 112 (the P8.114 pair), and
+//     worldMotionMatrix (@224) as a FLAT Cm::UnAlignedSpatialVector* indexed
+//     [jointOffset + dof] at stride 24 -- NOT the [link][dof] stride-80
+//     layout its own type declares.
+//  2. rootDof = (rootMotion && !fixBase) ? 6 : 0 indexes rows/cols, but the
+//     buffer PITCH uses bufferDof = rootMotion ? 6 : 0 -- (maxDofs +
+//     bufferDof)^2 floats per job even for fixed-base jobs.  matSize =
+//     dofCount + rootDof; only matSize^2 entries are zeroed, the rest of
+//     the pitch stays untouched.
+//  3. The init loop's struct assignment copies ALL 112 bytes -- including
+//     padding = 0 at +108.  The prepass then MUTATES the padding words into
+//     level numbers (PxU32& references write through), and operator+= does
+//     NOT touch padding.  The padding words are OBSERVABLE scratch state.
+//  4. The level-scheduled tree accumulation (#if 1, the compiled branch) is
+//     replaced by the engine's own #else sequential order: descending link
+//     index on lane 0.  PROOF of bit-identity: the prepass gives siblings
+//     strictly ascending step values in descending index order (each child
+//     bumps the parent's ps to its own s+1, so a later-processed = lower-
+//     indexed sibling reads a strictly larger ps), so within any parent the
+//     level-scheduled accumulation order IS descending child index; across
+//     parents the targets are disjoint; a link is pushed to its parent only
+//     at a step strictly after all its own children landed (s(link) >=
+//     max(s(child))+1).  The __shfl_sync maxStep broadcast is dropped with
+//     the level loop (DEVIATION, documented in RUNTIME_STATUS).  The
+//     prepass itself is KEPT for its observable padding writes.
+//  5. Per-component zero guards on mass and inertia (static links).
+//  6. The floating-base root coupling (+= into [col][row] and [row][col],
+//     rootMotion only) vs the !rootMotion tail correction: massMatrix -=
+//     m0 . (invertInertia(I0) * m1) over the root-translated scratch
+//     vectors, spelled with stride dofCount (== matSize in that branch).
+//  7. The root 6x6 tail (rootMotion, lane 0) copies RAW floats out of
+//     spatialInertias[0] with the linear/angular inversion index map
+//     offset = (row>2) ? 18 : (col<3)*9, index = offset + colSI*3 + rowSI.
+//  8. The inward walk translates the SCRATCH vectors in place hop by hop
+//     (rw = child.p - parent.p, POSITIVE), so the final scratch state is
+//     the root-translated I*m vectors -- observable, and exactly what the
+//     !rootMotion correction then consumes.
+//  9. The parent bands recompute parentWorldMotionMatrix FRESH from
+//     motionMatrix (rotated) -- NOT from the scratch (which holds I*m).
+//
+// DOCUMENTED DEVIATION (the P8.114 class): the __syncwarp choreography
+// (:368, :385, :401, the per-level :420s, :568 inside the else-branch,
+// :582 trailing) becomes FOUR uniform AllMemoryBarrierWithGroupSync slots
+// every thread of the block reaches; segments run under live&&cond
+// predicates between them.  The trailing :582 sync is dropped (nothing
+// observable follows).  The rootMotion root tail has NO engine sync before
+// it and needs none: it reads only spatialInertias[0] (synced at slot 3)
+// and writes massMatrix cells no other lane touches.
+// ===========================================================================
+
+struct MmParams
+{
+    uint nbIndices;          // @0
+    uint pad0;               // @4
+    uint64_t data;           // @8  float* mass matrices
+    uint64_t gpuIndices;     // @16 PxArticulationGPUIndex* (u32)
+    uint maxDofs;            // @24
+    uint rootMotionWord;     // @28 bool byte 0
+    uint64_t articulations;  // @32 PxgArticulation* (544-byte records)
+}
+
+[[vk::push_constant]]
+ConstantBuffer<MmParams> gMm;
+
+[shader("compute")]
+[numthreads(32, 8, 1)]
+void computeArtiMassMatrices(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    const uint jobIndex = groupThreadId.y + groupId.x * 8u;
+    const uint threadIndex = groupThreadId.x;
+    const bool rootMotion = (gMm.rootMotionWord & 0xFFu) != 0u;
+
+    const bool live = jobIndex < gMm.nbIndices;
+    uint linkCount = 0u, dofCount = 0u, rootDof = 0u, matSize = 0u;
+    bool fixBase = false;
+    uint64_t record = 0uL, mmOut = 0uL;
+    uint64_t linkProps = 0uL, body2Worlds = 0uL, jointData = 0uL, motionMatrix = 0uL;
+    uint64_t inertias = 0uL, wmScratch = 0uL;
+    Ptr<uint> parents;
+    if (live)
+    {
+        const uint artiIndex = (Ptr<uint>(gMm.gpuIndices))[jobIndex];
+        record = gMm.articulations + uint64_t(artiIndex) * PXG_ARTI_STRIDE;
+        linkCount = artiU16Field(record, PXG_ARTI_DATA_NUM_LINKS);
+        dofCount = artiU16Field(record, PXG_ARTI_DATA_NUM_JOINT_DOFS);
+        fixBase = (artiU8Field(record, PXG_ARTI_DATA_FLAGS) & 1u) != 0u;
+        rootDof = (rootMotion && !fixBase) ? 6u : 0u;   // trap 2
+        const uint bufferDof = rootMotion ? 6u : 0u;    // trap 2: the PITCH ignores fixBase
+        matSize = dofCount + rootDof;
+        mmOut = gMm.data + uint64_t(jobIndex) * (gMm.maxDofs + bufferDof)
+                               * (gMm.maxDofs + bufferDof) * 4u;
+
+        linkProps = artiPtrField(record, PXG_ARTI_LINK_PROPS);
+        body2Worlds = artiPtrField(record, PXG_ARTI_LINK_BODY2WORLDS);
+        jointData = artiPtrField(record, PXG_ARTI_JOINT_DATA);
+        motionMatrix = artiPtrField(record, PXG_ARTI_MOTION_MATRIX);
+        parents = Ptr<uint>(artiPtrField(record, PXG_ARTI_PARENTS));
+        inertias = artiPtrField(record, PXG_ARTI_WORLD_SPATIAL_ARTICULATED_INERTIA);   // trap 1
+        wmScratch = artiPtrField(record, PXG_ARTI_WORLD_MOTION_MATRIX);                // trap 1
+    }
+
+    // ---- S0: zero the matSize x matSize window ----
+    if (live)
+    {
+        Ptr<float> m = Ptr<float>(mmOut);
+        for (uint i = threadIndex; i < matSize * matSize; i += ID_WARP)
+            m[i] = 0.0f;
+    }
+    AllMemoryBarrierWithGroupSync();   // slot 1 (:368)
+
+    // ---- S1: per-link spatial inertias into the 112-stride scratch ----
+    if (live)
+    {
+        for (uint link = threadIndex; link < linkCount; link += ID_WARP)
+        {
+            Ptr<float> pp = Ptr<float>(linkProps + uint64_t(link) * 16u);
+            const float mass = pp[3] == 0.0f ? 0.0f : (1.0f / pp[3]);   // trap 5
+            const float3 localInertia = float3(pp[0] == 0.0f ? 0.0f : (1.0f / pp[0]),
+                                               pp[1] == 0.0f ? 0.0f : (1.0f / pp[1]),
+                                               pp[2] == 0.0f ? 0.0f : (1.0f / pp[2]));
+            Ptr<float> bw = Ptr<float>(body2Worlds + uint64_t(link) * PXG_ARTI_TRANSFORM_SIZE);
+            AbMat33 topRight = abMat33Zero();
+            topRight.c0.x = mass; topRight.c1.y = mass; topRight.c2.z = mass;
+            const AbMat33 bottomLeft = asiTransformInertiaTensor(
+                localInertia, asiMat33FromQuat(float4(bw[0], bw[1], bw[2], bw[3])));
+            const uint64_t addr =
+                inertias + uint64_t(link) * PXG_ARTI_DY_SPATIAL_MATRIX_AOS_STRIDE;
+            idStoreSM(addr, asmMatrix(abMat33Zero(), topRight, bottomLeft));
+            (Ptr<uint>(addr))[27] = 0u;   // trap 3: padding @108 is part of the copy
+        }
+    }
+    AllMemoryBarrierWithGroupSync();   // slot 2 (:385)
+
+    // ---- S2: lane-0 tree phase -- level prepass + sequential accumulation ----
+    if (live && threadIndex == 0u)
+    {
+        // (a) the level prepass: the padding words are observable (trap 3)
+        for (uint link = linkCount - 1u; link > 0u; --link)
+        {
+            Ptr<uint> s = Ptr<uint>(
+                inertias + uint64_t(link) * PXG_ARTI_DY_SPATIAL_MATRIX_AOS_STRIDE + 108u);
+            const uint parentLink = parents[link];
+            Ptr<uint> ps = Ptr<uint>(
+                inertias + uint64_t(parentLink) * PXG_ARTI_DY_SPATIAL_MATRIX_AOS_STRIDE + 108u);
+            if (s[0] < ps[0]) s[0] = ps[0];
+            ps[0] = s[0] + 1u;
+        }
+        // (b) the accumulation, in the engine's own #else sequential order (trap 4)
+        for (uint link = linkCount - 1u; link > 0u; --link)
+        {
+            Ptr<float> bw = Ptr<float>(body2Worlds + uint64_t(link) * PXG_ARTI_TRANSFORM_SIZE);
+            const uint parentLink = parents[link];
+            Ptr<float> pbw =
+                Ptr<float>(body2Worlds + uint64_t(parentLink) * PXG_ARTI_TRANSFORM_SIZE);
+            const float3 rw = float3(bw[4] - pbw[4], bw[5] - pbw[5], bw[6] - pbw[6]);
+            AbSpatialMatrix parentSpace =
+                idLoadSM(inertias + uint64_t(link) * PXG_ARTI_DY_SPATIAL_MATRIX_AOS_STRIDE);
+            asmTranslateInertia(asmSkewSymmetric(float4(rw, 0.0f)), parentSpace);
+            const uint64_t pAddr =
+                inertias + uint64_t(parentLink) * PXG_ARTI_DY_SPATIAL_MATRIX_AOS_STRIDE;
+            idStoreSM(pAddr, asmAdd(idLoadSM(pAddr), parentSpace));   // += leaves padding alone
+        }
+    }
+    AllMemoryBarrierWithGroupSync();   // slot 3 (:401 + the level loop's :420s)
+
+    // ---- S3: the per-link bands + inward walks (parallel over links) ----
+    if (live)
+    {
+        for (uint link = threadIndex + 1u; link < linkCount; link += ID_WARP)
+        {
+            Ptr<float> bw = Ptr<float>(body2Worlds + uint64_t(link) * PXG_ARTI_TRANSFORM_SIZE);
+            const uint jo =
+                (Ptr<uint>(jointData + uint64_t(link) * PXG_ARTI_JOINT_CORE_DATA_SIZE))[0];
+            const uint nbDof =
+                (Ptr<uint>(jointData + uint64_t(link) * PXG_ARTI_JOINT_CORE_DATA_SIZE))[1] & 0xFFu;
+            const AbSpatialMatrix I =
+                idLoadSM(inertias + uint64_t(link) * PXG_ARTI_DY_SPATIAL_MATRIX_AOS_STRIDE);
+
+            AbSpatialVector wm[3];
+            const float4 q = float4(bw[0], bw[1], bw[2], bw[3]);
+            for (uint dof = 0u; dof < nbDof; ++dof)
+            {
+                Ptr<float> m = Ptr<float>(motionMatrix + uint64_t(link) * PXG_ARTI_SUBSPACE_STRIDE
+                                          + uint64_t(dof) * PXG_ARTI_SPATIAL_VECTOR_SIZE);
+                wm[dof] = asmSVec(quatRotate(q, float3(m[0], m[1], m[2])),
+                                  quatRotate(q, float3(m[3], m[4], m[5])));
+                idStoreSV(wmScratch + uint64_t(jo + dof) * 24u, asmMulVec(I, wm[dof]));   // trap 1
+            }
+
+            // the diagonal block
+            for (uint dof0 = 0u; dof0 < nbDof; ++dof0)
+            {
+                const AbSpatialVector Im0 = idLoadSV(wmScratch + uint64_t(jo + dof0) * 24u);
+                const uint row = jo + dof0 + rootDof;
+                for (uint dof1 = 0u; dof1 < nbDof; ++dof1)
+                    (Ptr<float>(mmOut))[row * matSize + (jo + dof1 + rootDof)] =
+                        asmInnerProduct(wm[dof1], Im0);
+            }
+
+            // the inward walk (trap 8)
+            float3 childP = float3(bw[4], bw[5], bw[6]);
+            uint parentLink = parents[link];
+            for (;;)
+            {
+                Ptr<float> pbw =
+                    Ptr<float>(body2Worlds + uint64_t(parentLink) * PXG_ARTI_TRANSFORM_SIZE);
+                const float3 rw = childP - float3(pbw[4], pbw[5], pbw[6]);
+                for (uint dof = 0u; dof < nbDof; ++dof)
+                    idStoreSV(wmScratch + uint64_t(jo + dof) * 24u,
+                              adTranslateSpatialVector(
+                                  rw, idLoadSV(wmScratch + uint64_t(jo + dof) * 24u)));
+                childP = float3(pbw[4], pbw[5], pbw[6]);
+
+                if (parentLink == 0u)
+                {
+                    if (!fixBase && rootMotion)   // trap 6: the root coupling
+                    {
+                        for (uint dof0 = 0u; dof0 < nbDof; ++dof0)
+                        {
+                            const AbSpatialVector Im0 =
+                                idLoadSV(wmScratch + uint64_t(jo + dof0) * 24u);
+                            const uint col = jo + dof0 + rootDof;
+                            for (uint row = 0u; row < 6u; ++row)
+                            {
+                                const float v = row < 3u ? Im0.top[row] : Im0.bottom[row - 3u];
+                                (Ptr<float>(mmOut))[col * matSize + row] += v;
+                                (Ptr<float>(mmOut))[col + row * matSize] += v;
+                            }
+                        }
+                    }
+                    break;
+                }
+
+                const uint pjo =
+                    (Ptr<uint>(jointData + uint64_t(parentLink) * PXG_ARTI_JOINT_CORE_DATA_SIZE))[0];
+                const uint pnbDof =
+                    (Ptr<uint>(jointData + uint64_t(parentLink) * PXG_ARTI_JOINT_CORE_DATA_SIZE))[1]
+                    & 0xFFu;
+                const float4 pq = float4(pbw[0], pbw[1], pbw[2], pbw[3]);
+                AbSpatialVector pwm[3];
+                for (uint dof = 0u; dof < pnbDof; ++dof)   // trap 9: fresh, NOT the scratch
+                {
+                    Ptr<float> m =
+                        Ptr<float>(motionMatrix + uint64_t(parentLink) * PXG_ARTI_SUBSPACE_STRIDE
+                                   + uint64_t(dof) * PXG_ARTI_SPATIAL_VECTOR_SIZE);
+                    pwm[dof] = asmSVec(quatRotate(pq, float3(m[0], m[1], m[2])),
+                                       quatRotate(pq, float3(m[3], m[4], m[5])));
+                }
+                for (uint dof0 = 0u; dof0 < nbDof; ++dof0)
+                {
+                    const AbSpatialVector Im0 = idLoadSV(wmScratch + uint64_t(jo + dof0) * 24u);
+                    const uint row = jo + dof0 + rootDof;
+                    for (uint dof1 = 0u; dof1 < pnbDof; ++dof1)
+                    {
+                        const uint col = pjo + dof1 + rootDof;
+                        const float v = asmInnerProduct(pwm[dof1], Im0);
+                        (Ptr<float>(mmOut))[row * matSize + col] = v;
+                        (Ptr<float>(mmOut))[row + col * matSize] = v;
+                    }
+                }
+                parentLink = parents[parentLink];
+            }
+        }
+
+        // the rootMotion root tail (:537) -- no engine sync before it (see header)
+        if (threadIndex == 0u && !fixBase && rootMotion)
+        {
+            Ptr<float> rootI = Ptr<float>(inertias);   // raw floats of spatialInertias[0]
+            for (uint row = 0u; row < 6u; ++row)
+            {
+                const uint rowSI = (row < 3u) ? row : row - 3u;
+                for (uint col = row; col < 6u; ++col)
+                {
+                    const uint offset = (row > 2u) ? 18u : ((col < 3u) ? 9u : 0u);   // trap 7
+                    const uint colSI = (col < 3u) ? col : col - 3u;
+                    const float v = rootI[offset + colSI * 3u + rowSI];
+                    (Ptr<float>(mmOut))[row * matSize + col] = v;
+                    (Ptr<float>(mmOut))[col * matSize + row] = v;
+                }
+            }
+        }
+    }
+    AllMemoryBarrierWithGroupSync();   // slot 4 (:568, hoisted out of the else-branch)
+
+    // ---- S4: the free-base correction (!rootMotion only, trap 6) ----
+    if (live && !fixBase && !rootMotion)
+    {
+        const AbSpatialMatrix baseInvI = asmInvertInertia(idLoadSM(inertias));
+        for (uint row = threadIndex; row < dofCount; row += ID_WARP)
+        {
+            const AbSpatialVector m0 = idLoadSV(wmScratch + uint64_t(row) * 24u);
+            for (uint col = 0u; col < dofCount; ++col)
+            {
+                const AbSpatialVector m1 = idLoadSV(wmScratch + uint64_t(col) * 24u);
+                // the CUDA spells the stride dofCount here; matSize == dofCount in this branch
+                (Ptr<float>(mmOut))[row * dofCount + col] -=
+                    asmInnerProduct(m0, asmMulVec(baseInvI, m1));
+            }
+        }
+    }
+    // the trailing :582 __syncwarp is dropped -- nothing observable follows
+}
