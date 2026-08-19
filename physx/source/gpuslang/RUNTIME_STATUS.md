@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **779/779** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **780/780** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,65 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.124 — updateArticulationsLaunch, der Dirty-Scatter (Manifest 324) — DER LETZTE REFUSED-ARTI-KERNEL
+
+Der Per-Frame-Dirty-Scatter (updateBodiesAndShapes.cu:559-907, VOLLSTÄNDIG
+gelesen): ein Warp pro PxgArticulationSimUpdate kopiert die dirty-markierten
+Slices der flachen new-*-Pools durch die Zeiger des persistenten
+Pool-Records.  Als `updateArticulationsBda.slang` (NOCONTRACT — die
+directAPI-Rekonsiliation ist Quaternion-Algebra).  Launch: Grid
+ceil(nb/8) × Block (32,8,1); ABI NEU kUpdateArticulations {8,8,4,8,1}
+(Bool-Byte bei 32; die zwei Mapped-Host-Zeiger sind vor dem Launch durch
+getMappedDevicePtr aufgelöst — hostPtrMask 0).
+
+**Die gedroppten Stagings und die TOTEN Schreiber (ELFTER
+Upstream-Bug-Kandidat)**: Das Block-Shared-Staging der SimUpdates und das
+544-Byte-Record-Staging sind reine Bandbreiten-Optimierungen (P8.65-
+Argument, gegen DIESEN Kernel neu geprüft: jeder uint4-Walk deckt ein
+16er-Vielfaches — die CUDA-Größenkommentare "12 bytes"/"74 bytes" sind
+veraltet).  ABER: `data.confiDirty = true` unter eDIRTY_JOINTS (:646) und
+die fünf/sechs `gpuDirtyFlag |=`-Writes (:838-:895) schreiben in die
+VERWORFENE Shared-Kopie — kein Copy-back existiert; die echten Pool-Writes
+(:884-885 USER_FLAGS-Paar, :905 updateDirty) zeigen die gemeinte
+Schreibweise.  Wirkungslos auch in der Engine; der Port lässt sie weg und
+die Pool-Record-Vergleiche beweisen es (gpuDirtyFlag-Sentinel überlebt).
+
+**Die CUDA-__syncwarp()-Falle (:793)**: der Rekonsiliations-LESER von
+linkBody2Actors und der Kopier-SCHREIBER (:805) desselben Arrays sind im
+CUDA durch die Warp-Barriere geordnet.  Eine Workgroup-Barriere wäre hier
+DIVERGENT (Guard variiert mit threadIdx.y — llvmpipe hängt, P8.65-Notiz),
+also ist die body2Actor-Kopie in die Per-Link-Schleife FUSIONIERT: jeder
+Link wird von genau einer Lane gelesen und geschrieben, byte-identisches
+Ergebnis ohne Cross-Lane-Hazard.
+
+**Traps (je Mutant)**: links unter LINKS **ODER** ROOT_VELOCITIES,
+props/parents/children/b2a nur unter LINKS; body2Worlds dreiwegig
+(directAPI-Rekonsiliation mit EXAKTEM float-== — PxTransform::operator==,
+-0/+0 gilt als gleich — vs. Plain-Copy vs. else-if-POSITIONS-Refresh nur
+wenn KEIN links-Arm feuerte); dof-Cursor nur auf Dirty-Branches in fester
+Reihenfolge OHNE Zero-Fill-Else (anders als newArticulationsLaunch);
+directAPI gated Tendons/Dofs/ExtAccel, NICHT Mimic/Wakecounter;
+USER_FLAGS-Byte-Paar (userFlags ist u8 @40 des 48-Byte-Updates) und
+updateDirty = flags & ~(FORCES|IN_DIRTY_LIST) als Lane-0-Pool-Writes (im
+CUDA ein gutartiges Same-Value-Warp-Race); laufender Attachment/
+TendonJoint-Quellcursor über die EIGENEN Tendon-Records.
+
+**Fixture** `testUpdateArticulations.cpp`: 10 Updates über 2 Blöcke
+(Warps-per-Block 8 lasttragend), 7 Clean-Filler (einziger Write:
+updateDirty=0), A/B/C mit disjunkten Flächen (A: 11 Flags inkl. LINKS —
+der else-if darf NICHT feuern; B: ROOT_VELOCITIES+POSITIONS — der
+else-if darf ebenfalls NICHT feuern, die Links-Only-Felder bleiben Gift;
+C: POSITIONS solo — der else-if MUSS feuern); zwei Runden
+(directAPI 0/1); Rekonsiliations-Orakel = die ENGINE-eigene
+PxTransform-Arithmetik auf dem Host, bit-exakt verglichen, mit den drei
+Fällen bit-identisch / NUR -0-vs-+0 (kein Recompute!) / verschieden.
+**Beide Runden bit-exakt im ersten Lauf.**
+
+**Sweep 19/19 (17 im ersten Lauf; der Warps-per-Block-Mutant war bei 10 Updates eine Identität — beide Blöcke erreichen mit y=0..7 alle Indizes und Duplikate sind idempotent — und starb nach Erweiterung auf 16 Updates mit den interessanten Warps 13..15; der userFlags-Word-Read-Mutant maskierte sich selbst über den u8-Store und wurde durch den Falsch-Byte-Read ersetzt, der stirbt).**  Szene: Refused-Liste 178 → **177** —
+**DAMIT IST DIE REFUSED-LISTE ARTIKULATIONSFREI**: alle 65 Artikulations-
+Kernel des Plans sind gemappt.  Suite: **780/780 ctest in BEIDEN
+Memory-Modi**.  Manifest **324/501**.
 
 ## P8.123 — artiSolveInternalConstraints1T, der PGS-Internal-Solve (Manifest 323)
 

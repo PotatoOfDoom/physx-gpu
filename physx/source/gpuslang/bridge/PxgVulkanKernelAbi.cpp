@@ -250,6 +250,14 @@ static const uint8_t kFourPtrU32[] = { 8, 8, 8, 8, 4 };
 //   updateShapesLaunch(const PxgNewShapeSim*, PxgShapeSim*, PxU32 nbNewShapes)
 static const uint8_t kUpdateShapes[] = { 8, 8, 4 };
 
+// updateBodiesAndShapes.cu:559 updateArticulationsLaunch(
+//     const PxgUpdateArticulationDesc*, const PxgArticulationSimUpdate*,
+//     PxU32 nbSimUpdates, const PxReal* dofData, bool directAPI)
+// -> 40-byte blob (the bool byte lands at 32 after dofData realigns to 24).
+// hostPtrMask 0: the engine resolves simUpdates/dofData through
+// getMappedDevicePtr before the launch (PxgSimulationCore.cpp:2431-2433).
+static const uint8_t kUpdateArticulations[] = { 8, 8, 4, 8, 1 };
+
 // gpunarrowphase cudaBox.cu: boxBoxNphase_Kernel(PxU32 numTests, 14 device
 //   pointers, PxU32 patchBytesLimit, contactBytesLimit, forceBytesLimit,
 //   PxReal toleranceLength) — the box-vs-box contact generator.
@@ -1195,6 +1203,10 @@ static const PxgKernelAbiRow kRows[] = {
     // getMappedDevicePtr before the launch (PxgSimulationCore.cpp:2376), so
     // neither argument reaches us as a raw pinned-host pointer.  (P8.65)
     { "newArticulationsLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    // updateBodiesAndShapes.cu:559 updateArticulationsLaunch -- the per-frame
+    // dirty scatter.  Grid ceil(nbSimUpdates/8) x block (32,8,1)
+    // (NEW_ARTICULATION = 256, PxgSimulationCore.cpp:2446-2451).  (P8.124)
+    { "updateArticulationsLaunch", kUpdateArticulations, uint32_t(sizeof(kUpdateArticulations)) },
     // forwardDynamic2.cu:3766 dmaArticulationResidual(
     //     PxgArticulationCoreDesc*, Dy::ErrorAccumulator* errorPinnedHost)
     // -> kTwoPtr (16 bytes).  ARGUMENT 1 IS A PINNED HOST POINTER: the solver

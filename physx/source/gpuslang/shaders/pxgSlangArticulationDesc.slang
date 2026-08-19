@@ -223,6 +223,16 @@ public static const uint PXG_ARTI_DIRTY_SPATIAL_TENDON_ATTACHMENT = 32768;  // 1
 public static const uint PXG_ARTI_DIRTY_FIXED_TENDON = 65536;               // 1 << 16
 public static const uint PXG_ARTI_DIRTY_FIXED_TENDON_JOINT = 131072;        // 1 << 17
 public static const uint PXG_ARTI_DIRTY_MIMIC_JOINT = 262144;               // 1 << 18
+// P8.124 (updateArticulationsLaunch) additions, pinned against
+// Dy::ArticulationDirtyFlag (DyFeatherstoneArticulation.h:531-550)
+public static const uint PXG_ARTI_DIRTY_JOINTS = 1;                          // 1 << 0
+public static const uint PXG_ARTI_DIRTY_LINKS = 64;                          // 1 << 6
+public static const uint PXG_ARTI_IN_DIRTY_LIST = 128;                       // 1 << 7
+public static const uint PXG_ARTI_DIRTY_WAKECOUNTER = 256;                   // 1 << 8
+public static const uint PXG_ARTI_DIRTY_USER_FLAGS = 524288;                 // 1 << 19
+// PxgArticulationSimUpdate::userFlags -- a PxU8 at byte 40 of the 48-byte
+// record (after the ten PxU32 indices); the GPU mirror carries it inside pad0
+public static const uint PXG_SIM_UPDATE_USER_FLAGS = 40;
 
 // ---------------------------------------------------------------------------
 // PxgArticulationCoreDesc (gpuarticulation/include/PxgArticulationCoreDesc.h,
