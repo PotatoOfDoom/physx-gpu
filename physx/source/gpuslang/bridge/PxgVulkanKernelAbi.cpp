@@ -1345,6 +1345,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "contactConstraintBlockPrepareParallelLaunchTGS", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "artiTGSContactConstraintBlockPrepareLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "artiTGSJointConstraintBlockPrepareParallelLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "artiJointConstraintBlockPrepareParallelLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "artiOutputVelocity", kTwoPtrBool, uint32_t(sizeof(kTwoPtrBool)) },
     { "artiPushImpulse", kOnePtr, 1u },
     { "artiApplyTgsSubstepForces", kPtrU32, uint32_t(sizeof(kPtrU32)) },

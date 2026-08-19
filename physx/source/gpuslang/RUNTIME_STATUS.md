@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **769/769** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **770/770** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,54 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.120 — artiJointConstraintBlockPrepareParallelLaunch, der PGS-Zwilling (Manifest 319)
+
+Der PGS-Zwilling des P8.103-TGS-Joint-Preps (artiConstraintPrep2.cu:1958 —
+DASSELBE Template :1861, instanziiert mit PxgJointBlockParams +
+IterativeSolveData; der PGS-Setup-Overload :1718 →
+setUpArti1DConstraintBlock PGS :1424 → intializeBlock1D +
+Dy::computeJointSpeedPGS).  Zweiter Entry in `npArtiJointPrep.slang`;
+die Zeilenmathematik ist die geswepte a1dPGS-Batterie; die PGS-Block-Mirrors
+(1DHeader 1664 B mit u16-rowCounts/breakable via Interlocked-And/Or-Paar,
+1DCon 2304 B, 1DMod 1024 B) sind aus dem BEWÄHRTEN constraintPrepPGS
+kopiert.  ABI: kTwoPtr wiederverwendet.
+
+**PGS-vs-TGS-Fallen (alle mit Mutant)**: erp = 1.0 (TGS: 0.5*bias);
+ang0Writeback landet in Slot (conBase+outCount) VOR dem Degenerate-Skip —
+das cang0 einer NACHLAUFENDEN degenerierten Zeile BLEIBT im Slot
+(beobachtbarer Speicher jenseits von rowCounts); driveScale =
+fminf(dt,1) direkt auf min/maxImpulse (nicht
+computeMinMaxImpulseOrForceAsImpulse); der Joint-Speed ist GEGATED
+(needNormalVel || rigid0 || rigid1) und keyt auf RIGID-DYNAMIC
+(linkIndex == RIGID_BODY), nicht isKinematic; der Header schreibt
+rowCounts ZWEIMAL (mNumRows, dann der Setup-Return) und trägt die
+SKALEN allein (-ims.x/+ims.z/-ims.y/+ims.w — der Rigid-PGS-Header
+multipliziert mit invMass, der Arti-Header NICHT); die
+Prä-intializeBlock1D-SPRING/ACCEL-Raises sind TOT (Flags frisch von 0,
+OUTPUT_FORCE danach); cfm = max(b0,b1) in den Header, die Kopie in die
+Zeilenfüllung tot; die Mod-Zeilen (coeff0/coeff1, appliedForce =
+residual = 0) existieren nur in PGS.
+
+**Fixture** `testArtiJointPrepPgs.cpp` (Klon der TGS-Geometrie: 4 Batches
+hinter Rigid-Offset 3, Strides 26/13/32/7, degenerierte Zeilen,
+solveHint-Ties, Zero-Row-Lanes, Kinematik-Lanes): Spiegel über
+pxgArtiPrepRef.h; queryReduced...PGS und computeJointSpeedPGS
+TRANSKRIBIERT (der Dy::-Query ist __device__-only, und der
+Dy::-Joint-Speed assertet !(rigid0 && rigid1), was die
+Rigid-Rigid-Lanes der Fixture legitim verletzen); **dt = 1.3** — die
+TGS-Fixture nutzt 0.35, womit fminf(dt,1) unbeobachtbar wäre (der
+Clamp-Mutant wäre eine Fixture-Koinzidenz).  **Bit-exakt im ersten
+Lauf, 0 tolerierte ±0.**
+
+**Sweep 15/15**: erp-TGS, ang0-Preskip verschoben, Clamp weg,
+Kinematik-Keying, invMass-Vorzeichen, linBreak unskaliert,
+rowCounts=numRows, breakable-&&, cfm-min, residual weg, Sort instabil,
+initJointSpeed genullt, OUTPUT_FORCE weg, Batch-Offset weg (rc=139),
+Mod-Pool auf Con-Pool.  Restore grün inkl. TGS-Zwilling.
+
+Szene: Refused-Liste 183 → **182**.  Suite: **770/770 ctest in BEIDEN
+Memory-Modi**.  Manifest **319/501**.
 
 ## P8.119 — die sechs Tendon-get/set-Kernel (Manifest 318) + der NEUNTE Upstream-Bug-Kandidat
 
