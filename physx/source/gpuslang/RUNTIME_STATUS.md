@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **765/765** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **766/766** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,66 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.115 — computeArtiCentrifugalForces (Manifest 301)
+
+`computeArtiCentrifugalForces` (inverseDynamic.cu:803-1013) ist gemappt —
+der eGENERALIZED_CORIOLIS_AND_CENTRIFUGAL_FORCES-Kernel der Direct-API,
+der vierte und letzte mittelgroße Inverse-Dynamics-Kernel in
+`npArtiInverseDyn.slang`.  ABI-Zeile kCentrifugal {4,8,8,4,1,8} (40 B:
+nbIndices@0, data@8, gpuIndices@16, maxDofs@24, rootMotion-Byte@28,
+articulations@32).
+
+**Die größte Falle ist ein Zeiger-ALIAS**: `corioliseVectors` (Record @80)
+und die "motionAccelerations" dieses Kernels sind DERSELBE Puffer — die
+CUDA nimmt den Coriolis-Zeiger und benutzt ihn ab Segment 1 als
+Beschleunigungs-Array (Root genullt, dann Parent-Akkumulation IN-PLACE
+über die Coriolis-Werte).  Der Port führt EINEN Zeiger (`coriolis`) durch
+alle Segmente; die Korrektheit hängt allein an der Schleifenreihenfolge
+(Parent < Link, sequentiell).  Ein Mutant, der die Hälften auf getrennte
+Puffer "entwirrt", stirbt.
+
+**Weitere Fallen, jede mit Mutant**: der jVel-Clamp ist NUR nach oben
+(`v < max ? v : max` — negative Geschwindigkeiten passieren ungeklemmt,
+auch unter -max; maxJointVelocity liegt im JOINT-CORE @492+dof*4, pro
+Dof); die Drehmoment-Formel mit dem Faktor 2 im mittleren Term
+(`w x (w x r) + 2 w x v + a x v`); die zA-Initialisierung mit GEKREUZTEN
+Hälften (`top = acc.bottom * mass`, `bottom = v x (I v) + I*acc.top` —
+Motion- vs. Force-Konvention); das Lane-0-Staging der Dof-Projektionswerte
+durch den AUSGABE-Puffer (Link-Index als float, wie P8.114);
+motionVelocities[1..] ist beobachtbarer OUTPUT (der Kernel schreibt die
+propagierten Geschwindigkeiten zurück), aber motionVelocities[0] ist
+lebender INPUT; der `!rootMotion`-Recompute der Root-Beschleunigung
+(-invertInertia()*zA[0]) läuft NUR ohne Root-Motion-Flag — mit Flag kommt
+die Root-Zeile stattdessen als Tail (rootMotion && lane 0 && !fixBase)
+direkt aus zA[0].
+
+**ABWEICHUNG (die P8.114-Klasse)**: die __syncwarp-Choreografie wird zu
+SIEBEN uniformen Barrieren-Slots, die jeder Thread des Blocks erreicht;
+die Segmente S0-S7 (Lane-0-Velocity+Coriolis-Recompute, Alias-Akkumulation,
+strided zA-Init, Lane-0-zA-Akkumulation+Staging, Floating-Base-Solve,
+Dof-Projektion+Root-Tail) arbeiten unter live&&cond-Prädikaten dazwischen.
+Begründung wie P8.114: ein Warp überspannt hier vier Subgroups.
+
+**Fixture** `testArtiCentrifugal.cpp`: CfArena mit Joint-Core-Blobs
+(544 B, maxJointVelocity @492 gepinnt), Joint-Geschwindigkeiten über,
+unter und negativ zur Kappe (18 Über-Kappe-Dofs, 16 negative), EIN
+`cor`-Puffer als Alias (der Spiegel läuft sequentiell über
+Engine-Primitive durch denselben), 12 Jobs auf 16 Slots über 18 Records
+permutiert (die P8.113-Guard-Lektion), fixe und freie Basen, zwei Runden
+(rootMotion an/aus).  Verglichen: out, motionVelocities, der
+Coriolis-Alias, zA-Scratch, Trägheits-Scratch.  **Bit-exakt im ersten
+Lauf, beide Runden.**
+
+**Sweep 15/15**: Guard weg, Alias auf zA umgebogen, jVel ungeklemmt, jVel
+symmetrisch geklemmt, 2x-Term gestrichen, Force-Cross vertauscht,
+zA-Hälften nicht gekreuzt, Staging weg, Root-Accel trotz rootMotion,
+Velocity-Translate mit +rw, motionVel-Store weg, Root-Tail unbedingt,
+S1-Root nicht genullt, maxVel ohne Dof-Stride, Fixed-Base-Solve läuft.
+Restore grün über alle vier Modul-Fixtures.
+
+Szene: Refused-Liste 201 → **200**.  Suite: **766/766 ctest in BEIDEN
+Memory-Modi** (Binary 687/687).  Manifest **301/501**.
 
 ## P8.114 — computeArtiGravityForces (Manifest 300): die 300er-Marke
 
