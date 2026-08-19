@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **771/771** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **772/772** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,74 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.122a — das PGS-Ext-Solve-Paar auf dem Engine-Block-Layout + der ZEHNTE Upstream-Bug-Kandidat
+
+`solveExtContactsBlock` (solver.cuh:54-320) und `solveExt1DBlock`
+(solverBlock.cuh:208-326) — die beiden Bodies, auf die
+artiSolveBlockPartition (P8.122b) über batch.constraintType dispatcht —
+als `npArtiSolveExtPGS.slang` über die echten PxgBlockSolver*-SoA-Blöcke
+(file-lokale SvpPgs*-Mirrors) + PxgArticulationBlockResponse.  Das
+TGS-Gegenstück ist npArtiSolveExtTGS (P8.99a); die Phase-1-Batterien
+(npArtiSolveContact/npArtiSolve1D) hatten die Mathematik auf abstrakten
+Inputs gepinnt.
+
+**Der ZEHNTE Upstream-Bug-Kandidat (verbatim transkribiert, beidseitig)**:
+die finale Kontakt-Impuls-Skalierung ist zwischen den Körpern ASYMMETRISCH
+— `impulse0 = imp0.scale(ref0*angDom0, ref0*lin0)` (solver.cuh:315:
+Faktoren z, x) gegen `impulse1 = imp1.scale(ref1*lin1, ref1*ang1)` (:316:
+y, w), obwohl imp0.top und imp1.top DIESELBEN Normalenrichtungs-Summen
+akkumulieren.  Körper A's Faktoren sind sowohl gegen Körper B als auch
+gegen den TGS-Zwilling (:732: x, z) vertauscht.  Der „fixende" Mutant
+(x, z) STIRBT — der Port reproduziert die Engine bitgenau.
+
+**Weitere PGS-vs-TGS-Fallen (Modul-Traps 1-12, je Mutant)**: p8 = 0.8 FIX
+(kein Header-Slot); der Normal-Update trägt den IMPULSE-MULTIPLIER
+(appliedForce*iMul + deltaF; TGS ohne), Koeffizienten via
+computeContactCoefficients über die ROHE Header-Restitution + coeff0/1;
+der Friction-velMultiplier teilt durch resp ALLEIN (TGS: resp+cfm);
+Friction-Zeilen clampen UNABHÄNGIG pro Zeile (TGS: kombinierte
+Paar-Magnitude), Tangente alterniert als frictionNormals[i&1]; KEIN
+Torsional-Tail, keine Motion-Terme (Bias vorberechnet in raXn_bias.w);
+1D: Akkumulatoren SEEDEN aus den inout-Impulsen (gekreuzte Hälften; der
+Partition-Caller übergibt Nullen), iMul auf appliedForce, unitResponse
+MIT Header-cfm, recip via DY_MIN_RESPONSE 1e-12, u16-rowCounts
+(zwei Lanes pro Wort), Finale linear-in-top/angular-in-bottom.  Der
+Software-Pipeline-Prefetch des CUDA ist zu Direktlesungen entrollt
+(Trap 1: die Friction-Zeilen setzen den Response-Cursor FORT; die
+Erreichbarkeits-Invariante — Null-Kontakte ⇒ Null-Frictions — kommt aus
+dem Prep-Early-Out und ist in der Fixture eingehalten).
+
+**Fixture** `testArtiSolveExtPgs.cpp` (die P8.99a-Anordnung: eine Batch,
+32 Lanes als unabhängige Slots, Indexbasen 2/3/5 gepinnt): Orakel für
+den 1D-Pfad ist die ENGINE-eigene host-callable
+Dy::compute1dConstraintSolverConstantsPGS + computeRecipUnitResponse;
+die Kontakt-Koeffizienten sind transkribiert (__device__-only).
+Abdeckung asserted: 8 Compliant-Lanes (Accel-Spring beide Zustände),
+5 Null-Kontakt-Lanes (Frictions dann 0 — die Prep-Invariante), 6
+Big-Floor-Lanes (minNormalForce ÜBER der akkumulierten Kraft), 18
+Friction-Lanes (0/2/4, nur GERADE), enge Impulsfenster (beide Clamps
+feuern), 1D-Modi hart/Spring/Accel-Spring je >5.  Sechs Runden:
+Kontakt (doFriction, ref0, ref1) = (1,1,1)/(1,¾,1¼)/(0,1,1) — die
+doFriction-0-Runde muss Friction-Pool und broken VERGIFTET lassen;
+1D residual an/an/aus — die Aus-Runde lässt mod.residual vergiftet.
+**Bit-exakt im ersten Lauf, alle sechs Runden.**
+
+**Sweep 21/22**: p8-Header, iMul weg (Kontakt + 1D), deltaF/newForce
+unclamped, recip ohne cfm, cfm in unitResponse, Floor weg, Friction-cfm
+(TGS-Form), Tangente fix, Bias-Vorzeichen, Statik-Clamp, broken-last,
+Response-Cursor-Restart, **Kandidat-10-Fix (x,z) — STIRBT**,
+Error-Gate, 1D-cfm weg, Residual-Gate, rowCounts-Low-Half,
+Response-Basis unversetzt, Hard-vMul=-1, velBias.  Der EINE Überlebende
+(1d-velbias auf unbiasedConstant) ist BEWEISBAR äquivalent:
+unbiasedConstant ist im Ext-1D-Body ungelesener Helfer-Output — nur
+constant/vMul/iMul werden konsumiert; der Konsument von
+unbiasedConstant (conclude1DBlock, Velocity-Iterationen) liegt
+außerhalb dieses Moduls.  Restore grün inkl. TGS-Zwilling.
+
+Kein Manifest-Delta (ein __device__-Body ist kein Kernel — P8.122b
+macht daraus artiSolveBlockPartition).  Suite: **772/772 ctest in
+BEIDEN Memory-Modi.**
 
 ## P8.121 — artiContactConstraintBlockPrepareLaunch, der PGS-Kontakt-Zwilling (Manifest 320)
 

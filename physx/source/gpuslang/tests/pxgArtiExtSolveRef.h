@@ -541,6 +541,352 @@ inline void refSolveExt1DTGS(const PxgBlockConstraintBatch& batch,
     impulse1.top = li1 * invMass1; impulse1.bottom = ai1 * invInertiaScale1;
 }
 
+// ===========================================================================
+// P8.122a: the PGS twins -- solveExtContactsBlock (solver.cuh:54-320) and
+// solveExt1DBlock (solverBlock.cuh:208-326) over the engine structs.  The 1D
+// constants come from the ENGINE's host-callable
+// Dy::compute1dConstraintSolverConstantsPGS / Dy::computeRecipUnitResponse;
+// the contact-side computeContactCoefficients (constraintPrepShared.cuh:314)
+// is __device__-only and transcribed here.  The CUDA's software-pipelined
+// prefetch is un-pipelined into direct loads with the same indices (see the
+// module's trap 1).  The body-A final-scale factor swap at solver.cuh:315
+// (the TENTH upstream-bug candidate) is transcribed verbatim.
+// ===========================================================================
+
+inline void refComputeContactCoefficientsPGS(uint32_t flags, float restitution,
+                                             float unitResponse, float recipResponse,
+                                             float targetVelocity, float coeff0, float coeff1,
+                                             float& velMultiplier, float& impulseMultiplier,
+                                             float& unbiasedErr, float& biasedErr)
+{
+    if (restitution < 0.f)
+    {
+        const bool accelSpring = (flags & COMPLIANT_ACCEL) != 0;
+        const float massIfAccelElseOne = accelSpring ? recipResponse : 1.0f;
+        const float oneIfAccelElseR = accelSpring ? 1.0f : unitResponse;
+
+        const float a = coeff0;
+        const float b = coeff1 * massIfAccelElseOne;
+
+        const float x = 1.f / (a * oneIfAccelElseR + 1.f);
+        const float scaledBias = x * b;
+
+        velMultiplier = x * a * massIfAccelElseOne;
+        impulseMultiplier = 1.f - x;
+        unbiasedErr = biasedErr = targetVelocity * velMultiplier - scaledBias;
+    }
+    else
+    {
+        velMultiplier = recipResponse;
+        biasedErr = coeff0 * velMultiplier;
+        unbiasedErr = coeff1 * velMultiplier;
+        impulseMultiplier = 1.f;
+    }
+}
+
+// solveExtContactsBlock (solver.cuh:54-320), transcribed over the engine structs
+inline void refSolveExtContactPGS(const PxgBlockConstraintBatch& batch,
+                                  UnAlignedSpatialVector& vel0, UnAlignedSpatialVector& vel1,
+                                  bool doFriction, PxU32 ti,
+                                  PxgBlockSolverContactHeader* contactHeaders,
+                                  PxgBlockSolverFrictionHeader* frictionHeaders,
+                                  PxgBlockSolverContactPoint* contactPoints,
+                                  PxgBlockSolverContactFriction* frictionPoints,
+                                  PxgArticulationBlockResponse* responses,
+                                  UnAlignedSpatialVector& impulse0,
+                                  UnAlignedSpatialVector& impulse1,
+                                  RefError* error, float ref0, float ref1)
+{
+    UnAlignedSpatialVector imp0(PxVec3(0.f), PxVec3(0.f)), imp1(PxVec3(0.f), PxVec3(0.f));
+
+    PxgBlockSolverContactHeader& contactHeader = contactHeaders[batch.mConstraintBatchIndex];
+    PxgBlockSolverFrictionHeader& frictionHeader = frictionHeaders[batch.mConstraintBatchIndex];
+
+    const float4 invMass0_1_angDom0_1 = contactHeader.invMass0_1_angDom0_1[ti];
+
+    const PxU32 numNormalConstr = contactHeader.numNormalConstr[ti];
+    const PxU32 numFrictionConstr = frictionHeader.numFrictionConstr[ti];
+
+    const float restitution = contactHeader.restitution[ti];
+    const float p8 = 0.8f;   // FIXED (module trap 2)
+    const float cfm = contactHeader.cfm[ti];
+    const PxU8 flags = PxU8(contactHeader.flags[ti]);
+
+    PxgBlockSolverContactPoint* contacts = &contactPoints[batch.startConstraintIndex];
+
+    PxReal accumulatedNormalImpulse = 0.f;
+
+    UnAlignedSpatialVector v0 = vel0;
+    UnAlignedSpatialVector v1 = vel1;
+
+    const float4 normal_staticFriction = contactHeader.normal_staticFriction[ti];
+    const PxVec3 normal(normal_staticFriction.x, normal_staticFriction.y,
+                        normal_staticFriction.z);
+    const PxReal staticCof = normal_staticFriction.w;
+
+    PxU32 respIndex = batch.mArticulationResponseIndex;
+
+    PxgBlockSolverContactFriction* frictions = &frictionPoints[batch.startFrictionIndex];
+
+    for (PxU32 i = 0; i < numNormalConstr; ++i)
+    {
+        PxgBlockSolverContactPoint& c = contacts[i];
+        const PxgArticulationBlockResponse& resp = responses[respIndex];
+        respIndex++;
+
+        const float4 raXn_targetVelocity = c.raXn_targetVelocity[ti];
+        const float4 rbXn_maxImpulse = c.rbXn_maxImpulse[ti];
+        const float appliedForce = c.appliedForce[ti];
+        const float resp0 = c.resp0[ti];
+        const float resp1 = c.resp1[ti];
+        const float coeff0 = c.coeff0[ti];
+        const float coeff1 = c.coeff1[ti];
+
+        const PxVec3 deltaRALin(resp.deltaRALin_x[ti], resp.deltaRALin_y[ti], resp.deltaRALin_z[ti]);
+        const PxVec3 deltaRAAng(resp.deltaRAAng_x[ti], resp.deltaRAAng_y[ti], resp.deltaRAAng_z[ti]);
+        const PxVec3 deltaRBLin(resp.deltaRBLin_x[ti], resp.deltaRBLin_y[ti], resp.deltaRBLin_z[ti]);
+        const PxVec3 deltaRBAng(resp.deltaRBAng_x[ti], resp.deltaRBAng_y[ti], resp.deltaRBAng_z[ti]);
+
+        const PxVec3 raXn(raXn_targetVelocity.x, raXn_targetVelocity.y, raXn_targetVelocity.z);
+        const PxVec3 rbXn(rbXn_maxImpulse.x, rbXn_maxImpulse.y, rbXn_maxImpulse.z);
+        const float targetVelocity = raXn_targetVelocity.w;
+        const float maxImpulse = rbXn_maxImpulse.w;
+
+        const float unitResponse = ref0 * resp0 + ref1 * resp1;
+        const float recipResponse = (unitResponse > 0.0f) ? 1.0f / (unitResponse + cfm) : 0.0f;
+        float velMultiplier = recipResponse;
+        float impulseMul = 1.0f;
+        float unbiasedError, biasedErr;
+
+        refComputeContactCoefficientsPGS(flags, restitution, unitResponse, recipResponse,
+                                         targetVelocity, coeff0, coeff1,
+                                         velMultiplier, impulseMul, unbiasedError, biasedErr);
+
+        const UnAlignedSpatialVector deltaVA(ref0 * deltaRAAng, ref0 * deltaRALin);
+        const UnAlignedSpatialVector deltaVB(ref1 * deltaRBAng, ref1 * deltaRBLin);
+
+        const float v0_ = v0.bottom.dot(normal) + v0.top.dot(raXn);
+        const float v1_ = v1.bottom.dot(normal) + v1.top.dot(rbXn);
+        const float normalVel = v0_ - v1_;
+
+        const float tempDeltaF = biasedErr - normalVel * velMultiplier;
+        const float _deltaF = fmaxf(tempDeltaF, -appliedForce);
+        const float _newForce = appliedForce * impulseMul + _deltaF;
+        const float newForce = fminf(_newForce, maxImpulse);
+        const float deltaF = newForce - appliedForce;
+
+        if (error)
+            error->add(deltaF, velMultiplier);
+        c.appliedForce[ti] = newForce;
+
+        imp0.bottom -= raXn * deltaF;
+        imp0.top -= normal * deltaF;
+        imp1.bottom += rbXn * deltaF;
+        imp1.top += normal * deltaF;
+
+        v0 += deltaVA * deltaF;
+        v1 += deltaVB * deltaF;
+
+        accumulatedNormalImpulse = accumulatedNormalImpulse + newForce;
+    }
+
+    accumulatedNormalImpulse = PxMax(accumulatedNormalImpulse, contactHeader.minNormalForce[ti]);
+
+    if (numFrictionConstr && doFriction)
+    {
+        const float dynamicFrictionCof = frictionHeader.dynamicFriction[ti];
+        const float maxFrictionImpulse = staticCof * accumulatedNormalImpulse;
+        const float maxDynFrictionImpulse = dynamicFrictionCof * accumulatedNormalImpulse;
+
+        PxU32 broken = 0;
+
+        for (PxU32 i = 0; i < numFrictionConstr; ++i)
+        {
+            PxgBlockSolverContactFriction& f = frictions[i];
+            const PxgArticulationBlockResponse& resp = responses[respIndex];
+            respIndex++;
+
+            const float4 frictionNormal = frictionHeader.frictionNormals[i & 1][ti];
+
+            const float4 raXn_extraCoeff = f.raXn_bias[ti];
+            const float4 rbXn_targetVelW = f.rbXn_targetVelW[ti];
+            const float resp0 = f.resp0[ti];
+            const float resp1 = f.resp1[ti];
+            const float appliedForce = f.appliedForce[ti];
+
+            const PxVec3 deltaRALin(resp.deltaRALin_x[ti], resp.deltaRALin_y[ti], resp.deltaRALin_z[ti]);
+            const PxVec3 deltaRAAng(resp.deltaRAAng_x[ti], resp.deltaRAAng_y[ti], resp.deltaRAAng_z[ti]);
+            const PxVec3 deltaRBLin(resp.deltaRBLin_x[ti], resp.deltaRBLin_y[ti], resp.deltaRBLin_z[ti]);
+            const PxVec3 deltaRBAng(resp.deltaRBAng_x[ti], resp.deltaRBAng_y[ti], resp.deltaRBAng_z[ti]);
+
+            const PxVec3 raXn(raXn_extraCoeff.x, raXn_extraCoeff.y, raXn_extraCoeff.z);
+            const PxVec3 rbXn(rbXn_targetVelW.x, rbXn_targetVelW.y, rbXn_targetVelW.z);
+
+            const float resp_ = ref0 * resp0 + ref1 * resp1;
+            const float velMultiplier = (resp_ > SVX_EPS_REAL) ? (p8 / resp_) : 0.f;
+            const float bias = raXn_extraCoeff.w;
+            const float targetVel = rbXn_targetVelW.w;
+
+            const UnAlignedSpatialVector deltaVA(ref0 * deltaRAAng, ref0 * deltaRALin);
+            const UnAlignedSpatialVector deltaVB(ref1 * deltaRBAng, ref1 * deltaRBLin);
+
+            const PxVec3 fNormal(frictionNormal.x, frictionNormal.y, frictionNormal.z);
+
+            const float v0_ = v0.top.dot(raXn) + v0.bottom.dot(fNormal);
+            const float v1_ = v1.top.dot(rbXn) + v1.bottom.dot(fNormal);
+            const float normalVel = v0_ - v1_;
+
+            const float tmp1 = appliedForce - (bias - targetVel) * velMultiplier;
+            const float totalImpulse = tmp1 - normalVel * velMultiplier;
+
+            const bool doClamp = fabsf(totalImpulse) > maxFrictionImpulse;
+            const float totalClamped =
+                fminf(maxDynFrictionImpulse, fmaxf(-maxDynFrictionImpulse, totalImpulse));
+            const float newAppliedForce = doClamp ? totalClamped : totalImpulse;
+            const float deltaF = newAppliedForce - appliedForce;
+
+            if (error)
+                error->add(deltaF, velMultiplier);
+
+            v0 += deltaVA * deltaF;
+            v1 += deltaVB * deltaF;
+
+            imp0.bottom -= raXn * deltaF;
+            imp0.top -= fNormal * deltaF;
+            imp1.bottom += rbXn * deltaF;
+            imp1.top += fNormal * deltaF;
+
+            f.appliedForce[ti] = newAppliedForce;
+            broken = broken | (doClamp ? 1u : 0u);
+        }
+        frictionHeader.broken[ti] = broken;
+    }
+
+    // the TENTH upstream-bug candidate, verbatim (body A's factors swapped)
+    impulse0 = imp0.scale(ref0 * invMass0_1_angDom0_1.z, ref0 * invMass0_1_angDom0_1.x);
+    impulse1 = imp1.scale(ref1 * invMass0_1_angDom0_1.y, ref1 * invMass0_1_angDom0_1.w);
+
+    vel0 = v0;
+    vel1 = v1;
+}
+
+// solveExt1DBlock (solverBlock.cuh:208-326); the constants come from the
+// ENGINE's Dy::compute1dConstraintSolverConstantsPGS
+inline void refSolveExt1DPGS(const PxgBlockConstraintBatch& batch,
+                             UnAlignedSpatialVector& vel0, UnAlignedSpatialVector& vel1,
+                             PxU32 ti,
+                             const PxgBlockSolverConstraint1DHeader* headers,
+                             PxgBlockSolverConstraint1DCon* rowsCon,
+                             PxgBlockSolverConstraint1DMod* rowsMod,
+                             PxgArticulationBlockResponse* artiResponse,
+                             UnAlignedSpatialVector& impulse0,
+                             UnAlignedSpatialVector& impulse1,
+                             bool residualReportingEnabled, float ref0, float ref1)
+{
+    const PxgBlockSolverConstraint1DHeader* header = &headers[batch.mConstraintBatchIndex];
+    PxgBlockSolverConstraint1DCon* baseCon = &rowsCon[batch.startConstraintIndex];
+    PxgBlockSolverConstraint1DMod* baseMod = &rowsMod[batch.startConstraintIndex];
+
+    PxVec3 linVel0 = vel0.bottom;
+    PxVec3 linVel1 = vel1.bottom;
+    PxVec3 angVel0 = vel0.top;
+    PxVec3 angVel1 = vel1.top;
+
+    // the accumulators SEED from the inout impulses (module trap 8)
+    PxVec3 li0 = impulse0.bottom;
+    PxVec3 li1 = impulse1.bottom;
+    PxVec3 ai0 = impulse0.top;
+    PxVec3 ai1 = impulse1.top;
+
+    const float invMass0 = ref0 * header->invMass0D0[ti];
+    const float invMass1 = ref1 * header->invMass1D1[ti];
+
+    const float invInertiaScale0 = ref0 * header->invInertiaScale0[ti];
+    const float invInertiaScale1 = ref1 * header->invInertiaScale1[ti];
+
+    const float cfm = header->cfm[ti];
+
+    const PxU32 numRows = header->rowCounts[ti];
+    for (PxU32 i = 0; i < numRows; ++i)
+    {
+        PxgBlockSolverConstraint1DCon& ccon = baseCon[i];
+        PxgBlockSolverConstraint1DMod& cmod = baseMod[i];
+        const PxgArticulationBlockResponse& response = artiResponse[i];
+
+        const float4 _clinVel0_minImpulse = ccon.lin0XYZ_minImpulse[ti];
+        const float4 _clinVel1_maxImpulse = ccon.lin1XYZ_maxImpulse[ti];
+        const float4 _cangVel0_resp0 = ccon.ang0XYZ_resp0[ti];
+        const float4 _cangVel1_resp1 = ccon.ang1XYZ_resp1[ti];
+
+        const PxReal resp0 = ref0 * _cangVel0_resp0.w;
+        const PxReal resp1 = ref1 * _cangVel1_resp1.w;
+        const PxReal initJointSpeed = ccon.initJointSpeed[ti];
+
+        const PxVec3 clinVel0(_clinVel0_minImpulse.x, _clinVel0_minImpulse.y, _clinVel0_minImpulse.z);
+        const PxVec3 clinVel1(_clinVel1_maxImpulse.x, _clinVel1_maxImpulse.y, _clinVel1_maxImpulse.z);
+        const PxVec3 cangVel0(_cangVel0_resp0.x, _cangVel0_resp0.y, _cangVel0_resp0.z);
+        const PxVec3 cangVel1(_cangVel1_resp1.x, _cangVel1_resp1.y, _cangVel1_resp1.z);
+
+        const PxReal coeff0 = cmod.coeff0[ti];
+        const PxReal coeff1 = cmod.coeff1[ti];
+        const PxU32 flags = cmod.flags[ti];
+
+        const PxReal unitResponse = resp0 + resp1 + cfm;   // module trap 10
+
+        const PxReal recipResponse = Dy::computeRecipUnitResponse(unitResponse, DY_MIN_RESPONSE);
+
+        PxReal constant, unbiasedConstant, vMul, iMul;
+
+        const bool isSpring = (flags & DY_FLAG_SPRING) != 0;
+        const bool isAccelerationSpring = (flags & DY_FLAG_ACCEL) != 0;
+
+        Dy::compute1dConstraintSolverConstantsPGS(isSpring, isAccelerationSpring, coeff0, coeff1,
+                                                  initJointSpeed, unitResponse, recipResponse,
+                                                  constant, unbiasedConstant, vMul, iMul);
+
+        const float appliedForce = cmod.appliedForce[ti];
+        const float maxImpulse = _clinVel1_maxImpulse.w;
+        const float minImpulse = _clinVel0_minImpulse.w;
+
+        const float v0 = linVel0.dot(clinVel0) + angVel0.dot(cangVel0);
+        const float v1 = linVel1.dot(clinVel1) + angVel1.dot(cangVel1);
+        const float normalVel = v0 - v1;
+
+        const float unclampedForce = iMul * appliedForce + (vMul * normalVel + constant);
+        const float clampedForce = fminf(maxImpulse, fmaxf(minImpulse, unclampedForce));
+        const float deltaF = clampedForce - appliedForce;
+
+        cmod.appliedForce[ti] = clampedForce;
+        if (residualReportingEnabled)
+            cmod.residual[ti] = (vMul == 0.f) ? 0.f : deltaF / vMul;
+
+        li0 = clinVel0 * deltaF + li0;
+        ai0 = cangVel0 * deltaF + ai0;
+        li1 = clinVel1 * deltaF + li1;
+        ai1 = cangVel1 * deltaF + ai1;
+
+        const PxVec3 linVa = ref0 * PxVec3(response.deltaRALin_x[ti], response.deltaRALin_y[ti],
+                                           response.deltaRALin_z[ti]);
+        const PxVec3 angVa = ref0 * PxVec3(response.deltaRAAng_x[ti], response.deltaRAAng_y[ti],
+                                           response.deltaRAAng_z[ti]);
+        const PxVec3 linVb = ref1 * PxVec3(response.deltaRBLin_x[ti], response.deltaRBLin_y[ti],
+                                           response.deltaRBLin_z[ti]);
+        const PxVec3 angVb = ref1 * PxVec3(response.deltaRBAng_x[ti], response.deltaRBAng_y[ti],
+                                           response.deltaRBAng_z[ti]);
+
+        linVel0 = linVa * deltaF + linVel0;
+        angVel0 = angVa * deltaF + angVel0;
+        linVel1 = linVb * deltaF + linVel1;
+        angVel1 = angVb * deltaF + angVel1;
+    }
+
+    vel0.top = angVel0; vel0.bottom = linVel0;
+    vel1.top = angVel1; vel1.bottom = linVel1;
+
+    impulse0.top = li0 * invMass0; impulse0.bottom = ai0 * invInertiaScale0;
+    impulse1.top = li1 * invMass1; impulse1.bottom = ai1 * invInertiaScale1;
+}
+
 }  // namespace pxgtest
 
 #endif  // PXG_ARTI_EXT_SOLVE_REF_H
