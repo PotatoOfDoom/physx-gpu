@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **772/772** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **775/775** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,51 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.122c — artiPropagateRigidImpulsesAndSolveSelfConstraints1T, der PGS-Self-Solve (Manifest 322)
+
+Der PGS-Zwilling des P8.99-Self-Solves — DASSELBE Template
+(internalConstraints2.cu:3802) mit IterativeSolveData und elapsedTime
+vom Extern-Wrapper (:4103) HART auf 0 gesetzt; die Divergenz ist der
+solveConstraints-Overload (:3751 vs :3774).  Als `ssSolveSelfConstraintsPgs`
++ PGS-Entry in `npArtiSolveSelf.slang` (die Walk-/Bitfeld-Maschinerie und
+der Prologue — countActiveSlabs/aiAverageAndPropagateEx/resetSlabCount/
+mStateDirty — sind wortgleiche Klone der GESWEPTEN P8.99b/c-Ports; das
+P8.122a-Solve-Paar kommt via import npArtiSolveExtPGS, dessen SvpPgs*-
+Typen dafür public wurden).  ABI: kArtiSolveSelf {8,8,1,4,8,1}
+wiederverwendet (identische Extern-Signatur — elapsedTime-Byte tot).
+
+**PGS-vs-TGS-Fallen (Modul-Traps 14-17, je Mutant)**: doFriction ist in
+PGS LIVE (der TGS-Overload liest es nie) — eine doFriction-0-Runde muss
+Friction-Pools und broken vergiftet lassen; KEINE delta/deltaQ-Loads
+(mDeltaMotion/mDeltaQ bleiben ungelesen); der 1D-Dispatch trägt rowsMod
+und versetzt die Response-Basis um batch.mArticulationResponseIndex;
+elapsedTime/velocityIteration/minPen sind auf dem PGS-Pfad TOT (die
+ABI-Bytes werden weiter getragen; die Fixture variiert beide und
+erwartet Identität).
+
+**Fixtures** (Klone der P8.99b/c-Fixtures via Python-Transform +
+PGS-Seeding, Spiegel `refSolveSelfLanePgs` in pxgArtiSelfRef.h):
+`testArtiSolveSelfPgs.cpp` — der Block-Level-Fixture (wordSize 2,
+Fünf-Szenarien-Paare, Masken mit Löchern, Root-Sentinels; drei Runden:
+Residual an/aus/doFriction aus); `testArtiSolveSelfLaunchPgs.cpp` — der
+Kernel-Fixture (drei Warps mit partiellem dritten, refCountOffset 14,
+nbSlabs 34 → zwei Ref-Wörter, mStateDirty-Modi a%4, Pool[0]-Fenster;
+drei Runden inkl. velIter-Byte-Variation als Totheits-Beweis).
+**Beide bit-exakt im ersten Lauf, alle Runden.**
+
+**Sweep 10/10 über die DIVERGENZFLÄCHE** (die geklonten Walk-Zeilen sind
+textidentisch zum TGS-Zwilling und dort mit 8/8 + Wrap-Sweeps gedeckt —
+Anker in den Klonzeilen wären nicht eindeutig): doFriction erzwungen,
+Error-Acc-Basisoffset (ohne +4), Mods→Con-Verwechslung (Dispatch UND
+Entry), constraintType-Low-Half, Solve mit lane statt offset,
+Dispatch-Friction aus, Response-Basis unversetzt, tmpA/tmpB im Entry
+vertauscht, velA-Add weg.  Restore grün inkl. beider TGS-Zwillinge.
+
+Szene: Refused-Liste 180 → **179**.  Suite: **775/775 ctest in BEIDEN
+Memory-Modi**.  Manifest **322/501**.  Verbleibende Refused-Arti-Kernel:
+artiSolveInternalConstraints1T (der große PGS-Zwilling von P8.96/100)
+und updateArticulationsLaunch.
 
 ## P8.122b — artiSolveBlockPartition, der PGS-Partition-Solve (Manifest 321)
 

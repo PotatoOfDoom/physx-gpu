@@ -294,6 +294,206 @@ inline void refSolveSelfLane(PxgArticulationBlockData& ab,
     storeSpatialVector(ab.mRootDeferredZ, rootZ, lane);
 }
 
+// ---------------------------------------------------------------------------
+// P8.122c: the PGS lane mirror -- the SAME walks, the PGS solveConstraints
+// overload (internalConstraints2.cu:3751): doFriction LIVE, no delta/deltaQ,
+// jointRowsMod carried, the 1D response base offset by
+// batch.mArticulationResponseIndex, refs (1, 1).
+// ---------------------------------------------------------------------------
+inline void refSolveSelfLanePgs(PxgArticulationBlockData& ab,
+                                PxgArticulationBlockLinkData* lk,
+                                PxgArticulationBlockDofData* df,
+                                const uint64_t* bf, PxU32 wordSize,
+                                uint64_t* tmpA, uint64_t* tmpB, uint64_t* tmpC,
+                                PxgBlockConstraintBatch* bt,
+                                PxgBlockSolverContactHeader* ch,
+                                PxgBlockSolverFrictionHeader* fh,
+                                PxgBlockSolverContactPoint* cp,
+                                PxgBlockSolverContactFriction* fp,
+                                PxgBlockSolverConstraint1DHeader* jh,
+                                PxgBlockSolverConstraint1DCon* jr,
+                                PxgBlockSolverConstraint1DMod* jm,
+                                PxgArticulationBlockResponse* rs,
+                                bool doFriction, bool accumErr,
+                                RefError& err, SelfCoverage& cov, PxU32 lane)
+{
+    const PxU32 nbSelf = ab.mTotalSelfConstraintCount;
+    const PxU32 start = ab.mSelfConstraintOffset;
+
+    UnAlignedSpatialVector rootZ = loadSpatialVector(ab.mRootDeferredZ, lane);
+    Dy::SpatialMatrix M;
+    loadSpatialMatrix(ab.mInvSpatialArticulatedInertia, lane, M);
+
+    if (!nbSelf) return;
+
+    for (PxU32 b = 0; b < nbSelf; ++b)
+    {
+        PxgBlockConstraintBatch& batch = bt[start + b];
+        const PxU32 mask = batch.mask;
+        if (!(mask & (1u << lane))) { ++cov.inactive; continue; }
+
+        const UnAlignedSpatialVector commonDelta = M * -rootZ;
+        const PxU32 offset = PxU32(__builtin_popcount(mask & ((1u << lane) - 1u)));
+        if (offset != lane) ++cov.offsetNeLane;
+
+        const PxU32 linkIDA = batch.bodyANodeIndex[offset].articulationLinkId();
+        const PxU32 linkIDB = batch.bodyBNodeIndex[offset].articulationLinkId();
+        if (linkIDA == linkIDB) ++cov.equalPairs;
+
+        for (PxU32 j = 0; j < wordSize; ++j)
+        {
+            const uint64_t wordA = bf[size_t(linkIDA * wordSize + j) * 32 + lane];
+            const uint64_t wordB = bf[size_t(linkIDB * wordSize + j) * 32 + lane];
+            tmpA[size_t(j) * 32 + lane] = wordA;
+            tmpB[size_t(j) * 32 + lane] = wordB;
+            tmpC[size_t(j) * 32 + lane] = wordA & wordB;
+        }
+
+        UnAlignedSpatialVector velA = loadSpatialVector(lk[linkIDA].mMotionVelocity, lane);
+        UnAlignedSpatialVector velB = loadSpatialVector(lk[linkIDB].mMotionVelocity, lane);
+
+        UnAlignedSpatialVector deltaVA = commonDelta;
+        {
+            bool sawNonRoot = false;
+            for (PxU32 j = 0, wo = 0; j < wordSize; ++j, wo += 64)
+            {
+                uint64_t word = tmpC[size_t(j) * 32 + lane];
+                while (word != 0)
+                {
+                    const PxU32 index = PxU32(__builtin_ctzll(word)) + wo;
+                    if (index != 0)
+                    {
+                        sawNonRoot = true;
+                        if (index >= 64) ++cov.word1Hops;
+                        deltaVA = refPropAccelNoJVel(lk, index, df, deltaVA, lane);
+                    }
+                    word &= (word - 1);
+                }
+            }
+            if (!sawNonRoot) ++cov.rootOnlyCommon;
+        }
+
+        UnAlignedSpatialVector deltaVB = deltaVA;
+
+        for (PxU32 j = 0; j < wordSize; ++j)
+        {
+            const uint64_t common = tmpC[size_t(j) * 32 + lane];
+            tmpA[size_t(j) * 32 + lane] &= ~common;
+            tmpB[size_t(j) * 32 + lane] &= ~common;
+        }
+
+        for (PxU32 j = 0, wo = 0; j < wordSize; ++j, wo += 64)
+        {
+            uint64_t word = tmpA[size_t(j) * 32 + lane];
+            while (word != 0)
+            {
+                const PxU32 index = PxU32(__builtin_ctzll(word)) + wo;
+                if (index >= 64) ++cov.word1Hops;
+                deltaVA = refPropAccelNoJVel(lk, index, df, deltaVA, lane);
+                word &= (word - 1);
+            }
+        }
+        {
+            bool any = false;
+            for (PxU32 j = 0, wo = 0; j < wordSize; ++j, wo += 64)
+            {
+                uint64_t word = tmpB[size_t(j) * 32 + lane];
+                while (word != 0)
+                {
+                    any = true;
+                    const PxU32 index = PxU32(__builtin_ctzll(word)) + wo;
+                    if (index >= 64) ++cov.word1Hops;
+                    deltaVB = refPropAccelNoJVel(lk, index, df, deltaVB, lane);
+                    word &= (word - 1);
+                }
+            }
+            if (!any) ++cov.emptyBWalks;
+        }
+
+        velA += deltaVA;
+        velB += deltaVB;
+
+        UnAlignedSpatialVector impulse0(PxVec3(0.f), PxVec3(0.f));
+        UnAlignedSpatialVector impulse1(PxVec3(0.f), PxVec3(0.f));
+
+        // the PGS dispatch: no delta/deltaQ loads (module trap 15)
+        if (batch.constraintType == PxgSolverConstraintDesc::eARTICULATION_CONTACT)
+        {
+            ++cov.contacts;
+            const PxgBlockSolverContactHeader& H = ch[batch.mConstraintBatchIndex];
+            if (H.restitution[offset] < 0.f) ++cov.compliant;
+            const PxgBlockSolverContactPoint& C0 = cp[batch.startConstraintIndex];
+            if (C0.resp0[offset] == 0.f && C0.resp1[offset] == 0.f) ++cov.zeroResp;
+            refSolveExtContactPGS(batch, velA, velB, doFriction, offset,
+                                  ch, fh, cp, fp, rs, impulse0, impulse1,
+                                  accumErr ? &err : NULL, 1.f, 1.f);
+        }
+        else
+        {
+            ++cov.oneD;
+            const PxU32 rc = jh[batch.mConstraintBatchIndex].rowCounts[offset];
+            for (PxU32 i = 0; i < rc; ++i)
+                if (jm[batch.startConstraintIndex + i].flags[offset] & DY_FLAG_SPRING)
+                    ++cov.springRows;
+            refSolveExt1DPGS(batch, velA, velB, offset,
+                             jh, jr, jm, &rs[batch.mArticulationResponseIndex],
+                             impulse0, impulse1, accumErr, 1.f, 1.f);
+        }
+
+        // impulse walks: top word down, highest bit first
+        for (int j = int(wordSize) - 1; j >= 0; --j)
+        {
+            const PxU32 wo = PxU32(j) * 64u;
+            uint64_t word = tmpB[size_t(j) * 32 + lane];
+            while (word != 0)
+            {
+                const PxU32 index = PxU32(63 - __builtin_clzll(word));
+                word &= ~(uint64_t(1) << index);
+                const PxgArticulationBlockLinkData& L = lk[index + wo];
+                const PxVec3 c2p(L.mRw_x[lane], L.mRw_y[lane], L.mRw_z[lane]);
+                impulse1 = refPropImpulseDeferred(df, L.mJointOffset[lane], L.mDofs[lane],
+                                                  c2p, impulse1, NULL, 1.f, lane);
+            }
+        }
+        for (int j = int(wordSize) - 1; j >= 0; --j)
+        {
+            const PxU32 wo = PxU32(j) * 64u;
+            uint64_t word = tmpA[size_t(j) * 32 + lane];
+            while (word != 0)
+            {
+                const PxU32 index = PxU32(63 - __builtin_clzll(word));
+                word &= ~(uint64_t(1) << index);
+                const PxgArticulationBlockLinkData& L = lk[index + wo];
+                const PxVec3 c2p(L.mRw_x[lane], L.mRw_y[lane], L.mRw_z[lane]);
+                impulse0 = refPropImpulseDeferred(df, L.mJointOffset[lane], L.mDofs[lane],
+                                                  c2p, impulse0, NULL, 1.f, lane);
+            }
+        }
+
+        impulse0 += impulse1;
+
+        for (int j = int(wordSize) - 1; j >= 0; --j)
+        {
+            const PxU32 wo = PxU32(j) * 64u;
+            uint64_t word = tmpC[size_t(j) * 32 + lane];
+            while (word != 0)
+            {
+                const PxU32 index = PxU32(63 - __builtin_clzll(word));
+                if ((index + wo) == 0) break;    // root: leaf-to-root, so done
+                word &= ~(uint64_t(1) << index);
+                const PxgArticulationBlockLinkData& L = lk[index + wo];
+                const PxVec3 c2p(L.mRw_x[lane], L.mRw_y[lane], L.mRw_z[lane]);
+                impulse0 = refPropImpulseDeferred(df, L.mJointOffset[lane], L.mDofs[lane],
+                                                  c2p, impulse0, NULL, 1.f, lane);
+            }
+        }
+
+        rootZ += impulse0;
+    }
+
+    storeSpatialVector(ab.mRootDeferredZ, rootZ, lane);
+}
+
 }  // namespace pxgtest
 
 #endif  // PXG_ARTI_SELF_REF_H

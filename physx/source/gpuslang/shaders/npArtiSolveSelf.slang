@@ -102,6 +102,7 @@ import pxgSlangArticulationDesc;
 import pxgSlangSolverDesc;
 import npArtiSolveTendons;
 import npArtiSolveExtTGS;
+import npArtiSolveExtPGS;   // the PGS solve pair (P8.122c)
 import npArtiAvgImpulse;
 
 static const uint SS_ARTI_CONTACT = 3u;      // PxgSolverConstraintDesc::eARTICULATION_CONTACT
@@ -533,4 +534,357 @@ void artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T(uint3 groupThreadId 
                            sharedDesc[0].iter_artiResponse,
                            gSsk.elapsedTime, minPen, accumulateError,
                            lane);
+}
+
+// ===========================================================================
+// P8.122c: the PGS twin -- artiPropagateRigidImpulsesAndSolveSelfConstraints1T
+// (internalConstraints2.cu:4100, the IterativeSolveData instantiation of the
+// SAME template :3802 with elapsedTime FORCED to 0).  The prologue
+// (countActiveSlabs / averageLinkImpulsesAndPropagate / resetSlabCount /
+// mStateDirty) and the bitfield-walk machinery are IDENTICAL; the divergence
+// is the solveConstraints overload (:3751 vs :3774):
+//
+// TRAPS (continuing the module numbering; each a sweep mutant unless noted):
+// 14. **doFriction is LIVE in PGS** -- the PGS solveConstraints passes it to
+//     solveExtContactsBlock (the TGS overload never reads it; the TGS entry's
+//     header note said so).  A doFriction=0 dispatch must leave the friction
+//     pools and broken untouched.
+// 15. **No delta/deltaQ loads anywhere** -- the PGS solve bodies take no
+//     motion terms; mDeltaMotion/mDeltaQ of the link blocks stay unread.
+// 16. **The 1D dispatch passes rowsMod and offsets the response base by
+//     batch.mArticulationResponseIndex** (the PGS solveExt1DBlock signature);
+//     the impulses seed from the zero-initialized inout pair.
+// 17. elapsedTime is hard-zeroed by the extern wrapper and minPen
+//     (velocityIteration ? 0 : -PX_MAX_F32) is computed but DEAD -- the PGS
+//     overload ignores both; the port drops the computation with this note.
+//     velocityIteration therefore has no observable effect (the ABI byte is
+//     still carried).
+// ===========================================================================
+
+public void ssSolveSelfConstraintsPgs(
+    uint64_t artiBlock, uint64_t artiLinks, uint64_t artiDofs,
+    uint64_t linkBitFields, uint64_t tmpFieldA, uint64_t tmpFieldB, uint64_t tmpFieldCommon,
+    uint wordSize,
+    uint64_t batches,
+    uint64_t contactHeaders, uint64_t frictionHeaders,
+    uint64_t contactPoints, uint64_t frictionPoints,
+    uint64_t jointHeaders, uint64_t jointRowsCon, uint64_t jointRowsMod,
+    uint64_t responses,
+    bool doFriction, bool accumulateError,
+    uint lane)
+{
+    // trap 7: per-block scalars, lane 0
+    const uint nbSelfConstraints = abU32(artiBlock, PXG_AB_mTotalSelfConstraintCount, 0u);
+    const uint startIndex = abU32(artiBlock, PXG_AB_mSelfConstraintOffset, 0u);
+
+    AbSpatialVector rootDeferredZ = svLoadSV(artiBlock, PXG_AB_mRootDeferredZ, lane);
+    const AbSpatialMatrix rootInvInertia =
+        asmLoadSpatialMatrix(artiBlock, PXG_AB_mInvSpatialArticulatedInertia, lane);
+
+    if (nbSelfConstraints != 0u)
+    {
+        SvpError error = { 0.0f, 0, 0.0f };
+
+        for (uint b = 0u; b < nbSelfConstraints; ++b)
+        {
+            Ptr<PxgBlockConstraintBatch> batch =
+                Ptr<PxgBlockConstraintBatch>(batches + uint64_t(startIndex + b) * SS_BATCH_STRIDE);
+
+            const uint mask = batch[0].mask;
+
+            if ((mask & (1u << lane)) != 0u)
+            {
+                // trap 1: per constraint, from the REGISTER rootDeferredZ
+                const AbSpatialVector commonDelta = asmMulVec(rootInvInertia, asmSVec(-rootDeferredZ.top, -rootDeferredZ.bottom));
+
+                // trap 8: the exclusive-popcount offset, not the lane
+                const uint offset = countbits(mask & ((1u << lane) - 1u));
+
+                const uint linkIDA = nodeIndexArticulationLinkId(batch[0].bodyANodeIndex[offset]);
+                const uint linkIDB = nodeIndexArticulationLinkId(batch[0].bodyBNodeIndex[offset]);
+
+                const uint64_t linkA = artiLinks + uint64_t(linkIDA) * PXG_AB_LINK_SIZE;
+                const uint64_t linkB = artiLinks + uint64_t(linkIDB) * PXG_AB_LINK_SIZE;
+
+                // stage the three temp bitfield buffers (lane-indexed words)
+                for (uint j = 0u; j < wordSize; ++j)
+                {
+                    const uint64_t wordA = abU64(linkBitFields + uint64_t(linkIDA * wordSize + j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane);
+                    const uint64_t wordB = abU64(linkBitFields + uint64_t(linkIDB * wordSize + j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane);
+                    abStoreU64(tmpFieldA + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane, wordA);
+                    abStoreU64(tmpFieldB + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane, wordB);
+                    abStoreU64(tmpFieldCommon + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane, wordA & wordB);
+                }
+
+                AbSpatialVector velA = svLoadSV(linkA, PXG_AB_LINK_mMotionVelocity, lane);
+                AbSpatialVector velB = svLoadSV(linkB, PXG_AB_LINK_mMotionVelocity, lane);
+
+                AbSpatialVector deltaVA = commonDelta;
+
+                // velocity walk 1: the common path, root->down (trap 2)
+                for (uint j = 0u, wordOffset = 0u; j < wordSize; ++j, wordOffset += 64u)
+                {
+                    uint64_t word = abU64(tmpFieldCommon + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane);
+                    while (word != 0uL)
+                    {
+                        const uint index = svLowestBit64(word) + wordOffset;
+                        if (index != 0u)   // root skip, AFTER the offset add
+                        {
+                            deltaVA = svPropagateAccelNoJVel(artiLinks, index, artiDofs, deltaVA, lane);
+                        }
+                        word &= (word - 1uL);
+                    }
+                }
+
+                // trap 3: B branches from the post-common-walk deltaVA
+                AbSpatialVector deltaVB = deltaVA;
+
+                // trap 4: strip the common bits out of A and B
+                for (uint j = 0u; j < wordSize; ++j)
+                {
+                    const uint64_t common = abU64(tmpFieldCommon + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane);
+                    abStoreU64(tmpFieldA + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane, abU64(tmpFieldA + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane) & (~common));
+                    abStoreU64(tmpFieldB + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane, abU64(tmpFieldB + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane) & (~common));
+                }
+
+                // velocity walk 2: A \ common (never contains the root)
+                for (uint j = 0u, wordOffset = 0u; j < wordSize; ++j, wordOffset += 64u)
+                {
+                    uint64_t word = abU64(tmpFieldA + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane);
+                    while (word != 0uL)
+                    {
+                        const uint index = svLowestBit64(word) + wordOffset;
+                        deltaVA = svPropagateAccelNoJVel(artiLinks, index, artiDofs, deltaVA, lane);
+                        word &= (word - 1uL);
+                    }
+                }
+
+                // velocity walk 3: B \ common
+                for (uint j = 0u, wordOffset = 0u; j < wordSize; ++j, wordOffset += 64u)
+                {
+                    uint64_t word = abU64(tmpFieldB + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane);
+                    while (word != 0uL)
+                    {
+                        const uint index = svLowestBit64(word) + wordOffset;
+                        deltaVB = svPropagateAccelNoJVel(artiLinks, index, artiDofs, deltaVB, lane);
+                        word &= (word - 1uL);
+                    }
+                }
+
+                velA = asmSVecAdd(velA, deltaVA);
+                velB = asmSVecAdd(velB, deltaVB);
+
+                AbSpatialVector impulse0 = asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
+                AbSpatialVector impulse1 = asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
+
+                // solveConstraints (:3751, the PGS overload) -- traps 14/15/16
+                const uint constraintType = batch[0].descStride_constraintType >> 16u;
+                if (constraintType == SS_ARTI_CONTACT)
+                {
+                    svpSolveExtContactsBlock(batch, velA, velB, doFriction, offset,
+                                             Ptr<SvpPgsContactHeader>(contactHeaders),
+                                             Ptr<SvpPgsFrictionHeader>(frictionHeaders),
+                                             Ptr<SvpPgsContactPoint>(contactPoints),
+                                             Ptr<SvpPgsContactFriction>(frictionPoints),
+                                             Ptr<PxgArticulationBlockResponse>(responses),
+                                             impulse0, impulse1,
+                                             error, accumulateError, 1.0f, 1.0f);
+                }
+                else
+                {
+                    const uint responseIndex = batch[0].mArticulationResponseIndex;
+                    Ptr<PxgArticulationBlockResponse> respBase = Ptr<PxgArticulationBlockResponse>(
+                        responses + uint64_t(responseIndex) * 1536u);
+                    svpSolveExt1DBlock(batch, velA, velB, offset,
+                                       Ptr<SvpPgs1DHeader>(jointHeaders),
+                                       Ptr<SvpPgs1DCon>(jointRowsCon),
+                                       Ptr<SvpPgs1DMod>(jointRowsMod),
+                                       respBase,
+                                       impulse0, impulse1,
+                                       accumulateError, 1.0f, 1.0f);
+                }
+
+                // impulse walk 1: B \ common, leaf->root (trap 2)
+                for (int j = int(wordSize) - 1; j >= 0; --j)
+                {
+                    const uint wordOffset = uint(j) * 64u;
+                    uint64_t word = abU64(tmpFieldB + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane);
+                    while (word != 0uL)
+                    {
+                        const uint index = svHighestBit64(word);
+                        word &= ~(uint64_t(1) << index);
+                        impulse1 = ssPropagateImpulseHop(artiLinks, index + wordOffset, artiDofs, impulse1, lane);
+                    }
+                }
+
+                // impulse walk 2: A \ common
+                for (int j = int(wordSize) - 1; j >= 0; --j)
+                {
+                    const uint wordOffset = uint(j) * 64u;
+                    uint64_t word = abU64(tmpFieldA + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane);
+                    while (word != 0uL)
+                    {
+                        const uint index = svHighestBit64(word);
+                        word &= ~(uint64_t(1) << index);
+                        impulse0 = ssPropagateImpulseHop(artiLinks, index + wordOffset, artiDofs, impulse0, lane);
+                    }
+                }
+
+                // trap 6: join before the shared path
+                impulse0 = asmSVecAdd(impulse0, impulse1);
+
+                // impulse walk 3: the common path, with the root BREAK (trap 5)
+                for (int j = int(wordSize) - 1; j >= 0; --j)
+                {
+                    const uint wordOffset = uint(j) * 64u;
+                    uint64_t word = abU64(tmpFieldCommon + uint64_t(j) * PXG_AB_BITFIELD_STACK_SIZE, 0u, lane);
+                    while (word != 0uL)
+                    {
+                        const uint index = svHighestBit64(word);
+                        if ((index + wordOffset) == 0u)
+                            break;
+                        word &= ~(uint64_t(1) << index);
+                        impulse0 = ssPropagateImpulseHop(artiLinks, index + wordOffset, artiDofs, impulse0, lane);
+                    }
+                }
+
+                rootDeferredZ = asmSVecAdd(rootDeferredZ, impulse0);
+            }
+        }
+
+        abStoreSpatialVector(artiBlock, PXG_AB_mRootDeferredZ, lane, rootDeferredZ.top, rootDeferredZ.bottom);
+    }
+}
+
+// test entry for the PGS self-constraint block: the SsParams blob is reused
+// with jointRowsMod passed through the (TGS-unused) minPen/elapsedTime slots'
+// place -- a separate blob keeps it honest instead:
+struct SspParams
+{
+    uint64_t artiBlock;        // @0
+    uint64_t artiLinks;        // @8
+    uint64_t artiDofs;         // @16
+    uint64_t linkBitFields;    // @24
+    uint64_t tmpFieldA;        // @32
+    uint64_t tmpFieldB;        // @40
+    uint64_t tmpFieldCommon;   // @48
+    uint64_t batches;          // @56
+    uint64_t contactHeaders;   // @64
+    uint64_t frictionHeaders;  // @72
+    uint64_t contactPoints;    // @80
+    uint64_t frictionPoints;   // @88
+    uint64_t jointHeaders;     // @96
+    uint64_t jointRowsCon;     // @104
+    uint64_t jointRowsMod;     // @112
+    uint64_t responses;        // @120
+    uint wordSize;             // @128
+    uint accumulateError;      // @132
+    uint doFriction;           // @136
+    uint nbLanes;              // @140 -> 144
+}
+
+[[vk::push_constant]]
+ConstantBuffer<SspParams> gSsp;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void ssSolveSelfPgsTest(uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint lane = groupThreadId.x;
+    if (lane >= gSsp.nbLanes)
+        return;
+
+    ssSolveSelfConstraintsPgs(gSsp.artiBlock, gSsp.artiLinks, gSsp.artiDofs,
+                              gSsp.linkBitFields, gSsp.tmpFieldA, gSsp.tmpFieldB, gSsp.tmpFieldCommon,
+                              gSsp.wordSize,
+                              gSsp.batches,
+                              gSsp.contactHeaders, gSsp.frictionHeaders,
+                              gSsp.contactPoints, gSsp.frictionPoints,
+                              gSsp.jointHeaders, gSsp.jointRowsCon, gSsp.jointRowsMod,
+                              gSsp.responses,
+                              gSsp.doFriction != 0u, gSsp.accumulateError != 0u,
+                              lane);
+}
+
+// the PGS ENGINE entry -- same ABI blob as the TGS twin ({8,8,1,4,8,1});
+// elapsedTime is dead (the extern wrapper zeroes it before the template),
+// and so is velocityIteration/minPen on the PGS path (trap 17)
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void artiPropagateRigidImpulsesAndSolveSelfConstraints1T(uint3 groupThreadId : SV_GroupThreadID,
+                                                         uint3 groupId : SV_GroupID)
+{
+    const uint64_t d = gSsk.desc;
+    const uint lane = groupThreadId.x;
+    const uint globalThreadIndex = groupId.x * 32u + lane;   // blockStride = blockDim.x
+
+    const uint nbArticulations = artiU32Field(d, PXG_ARTI_CORE_NB_ARTICULATIONS);
+    if (globalThreadIndex >= nbArticulations)
+        return;
+
+    const uint nbSlabs = artiU32Field(d, PXG_ARTI_CORE_NB_SLABS);
+
+    const uint64_t w = uint64_t(groupId.x);   // the per-warp slice index, DIRECTLY
+    const uint64_t artiBlock = artiPtrField(d, PXG_ARTI_CORE_ARTICULATION_BLOCKS)
+                             + w * PXG_AB_BLOCK_SIZE;
+    const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);
+    const uint maxDofs = artiU32Field(d, PXG_ARTI_CORE_MAX_DOFS);
+    const uint64_t linkBase = artiPtrField(d, PXG_ARTI_CORE_LINK_BLOCKS)
+                            + w * uint64_t(maxLinks) * PXG_AB_LINK_SIZE;
+    const uint64_t dofBase = artiPtrField(d, PXG_ARTI_CORE_DOF_BLOCKS)
+                           + w * uint64_t(maxDofs) * PXG_AB_DOF_SIZE;
+
+    Ptr<PxgSolverCoreDescGpu> solverDesc = Ptr<PxgSolverCoreDescGpu>(gSsk.solverDesc);
+    Ptr<PxgIslandContextGpu> island = Ptr<PxgIslandContextGpu>(solverDesc[0].islandContextPool);
+    const uint articulationReferenceCountOffset = island[0].mBodyCount + island[0].mBodyStartIndex;
+    const uint numTotalBodies = articulationReferenceCountOffset + nbArticulations;
+
+    Ptr<PxgSolverSharedDescPGSGpu> sharedDesc = Ptr<PxgSolverSharedDescPGSGpu>(gSsk.sharedDesc);
+    Ptr<uint> encodedRefCount = Ptr<uint>(sharedDesc[0].iter_solverEncodedReferenceCount);
+
+    const uint dirtyState = abU8(artiBlock, PXG_AB_mStateDirty, lane);
+    if (dirtyState != 0u)
+    {
+        if ((dirtyState & SSK_HAS_IMPULSES) != 0u)
+        {
+            const uint referenceCount = pxgCountActiveSlabsBda(articulationReferenceCountOffset + globalThreadIndex, nbSlabs, numTotalBodies, encodedRefCount);
+            const float scale = 1.0f / float(referenceCount);
+            const uint64_t slabHasChanges = artiPtrField(d, PXG_ARTI_CORE_SLAB_HAS_CHANGES);
+            const uint64_t impulses = artiPtrField(d, PXG_ARTI_CORE_IMPULSES);
+            aiAverageAndPropagateEx(slabHasChanges, impulses, artiBlock, linkBase, dofBase,
+                                    globalThreadIndex, maxLinks, nbArticulations, nbSlabs,
+                                    scale, lane);
+        }
+    }
+
+    // ALWAYS, for every live thread (:3855)
+    pxgResetSlabCountBda(articulationReferenceCountOffset + globalThreadIndex, nbSlabs, numTotalBodies, encodedRefCount);
+
+    abStoreU8(artiBlock, PXG_AB_mStateDirty, lane, SSK_VEL_DIRTY);
+
+    const uint wordSize = (maxLinks + 63u) / 64u;
+    const uint64_t linkBitFields = artiPtrField(d, PXG_ARTI_CORE_PATH_TO_ROOT_BITFIELD_BLOCKS)
+        + w * uint64_t(maxLinks) * uint64_t(wordSize) * PXG_AB_BITFIELD_STACK_SIZE;
+    // the role/name crossing -- see the TGS entry's header note
+    const uint64_t tmpA = artiPtrField(d, PXG_ARTI_CORE_TEMP_SHARED_BITFIELD_BLOCKS) + w * uint64_t(wordSize) * PXG_AB_BITFIELD_STACK_SIZE;
+    const uint64_t tmpB = artiPtrField(d, PXG_ARTI_CORE_TEMP_ROOT_BITFIELD_BLOCKS) + w * uint64_t(wordSize) * PXG_AB_BITFIELD_STACK_SIZE;
+    const uint64_t tmpCommon = artiPtrField(d, PXG_ARTI_CORE_TEMP_PATH_TO_ROOT_BITFIELD_BLOCKS) + w * uint64_t(wordSize) * PXG_AB_BITFIELD_STACK_SIZE;
+
+    const bool accumulateError = int(artiU32Field(d, PXG_ARTI_CORE_CONTACT_ERROR_ACC + 4u)) >= 0;
+    const bool doFriction = (gSsk.doFrictionWord & 0xFFu) != 0u;   // trap 14: LIVE in PGS
+
+    ssSolveSelfConstraintsPgs(artiBlock, linkBase, dofBase,
+                              linkBitFields, tmpA, tmpB, tmpCommon,
+                              wordSize,
+                              sharedDesc[0].iter_blockConstraintBatch,
+                              sharedDesc[0].iter_blockContactHeaders,
+                              sharedDesc[0].iter_blockFrictionHeaders,
+                              sharedDesc[0].iter_blockContactPoints,
+                              sharedDesc[0].iter_blockFrictions,
+                              sharedDesc[0].iter_blockJointConstraintHeaders,
+                              sharedDesc[0].iter_blockJointConstraintRowsCon,
+                              sharedDesc[0].iter_blockJointConstraintRowsMod,
+                              sharedDesc[0].iter_artiResponse,
+                              doFriction, accumulateError,
+                              lane);
 }

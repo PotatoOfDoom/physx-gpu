@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 321;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 322;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -167,7 +167,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "artiPropagateVelocity", "npArtiPropagate2.spv", "artiPropagateVelocity" },  // ARTI_PROPAGATE_VELOCITY (P8.109)
     { "artiPropagateVelocityTGS", "npArtiPropagate2.spv", "artiPropagateVelocityTGS" },  // ARTI_PROPAGATE_VELOCITY_TGS (P8.101c)
     { "artiSumSelfContactAndJointBatches", "npArtiSumSelfBatches.spv", "artiSumSelfContactAndJointBatches" },  // ARTI_SUM_SELF
-    { "artiPropagateRigidImpulsesAndSolveSelfConstraints1T", nullptr, nullptr },  // ARTI_PROPAGATE_RIGID_IMPULSES_AND_SOLVE_SELF (unmapped)
+    { "artiPropagateRigidImpulsesAndSolveSelfConstraints1T", "npArtiSolveSelf.spv", "artiPropagateRigidImpulsesAndSolveSelfConstraints1T" },  // ARTI_PROPAGATE_RIGID_IMPULSES_AND_SOLVE_SELF
     { "artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T", "npArtiSolveSelf.spv", "artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T" },  // ARTI_PROPAGATE_RIGID_IMPULSES_AND_SOLVE_SELF_TGS (P8.99c)
     { "artiApplyTgsSubstepForces", "npArtiAvgImpulse.spv", "artiApplyTgsSubstepForces" },  // ARTI_APPLY_TGS_SUBSTEP_FORCES (unmapped)
     { "ZeroBodiesTGS", "solverZeroBodies.spv", "ZeroBodiesTGS" },  // ZERO_BODIES_TGS

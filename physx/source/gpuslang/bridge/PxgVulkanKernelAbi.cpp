@@ -1302,6 +1302,7 @@ static const PxgKernelAbiRow kRows[] = {
     // directly.  Launched once per solver iteration (PxgArticulationCore.cpp).
     // doFriction is ignored on the TGS path.  (P8.99c)
     { "artiPropagateRigidImpulsesAndSolveSelfConstraintsTGS1T", kArtiSolveSelf, uint32_t(sizeof(kArtiSolveSelf)) },
+    { "artiPropagateRigidImpulsesAndSolveSelfConstraints1T", kArtiSolveSelf, uint32_t(sizeof(kArtiSolveSelf)) },
     // internalConstraints2.cu:2841 artiSolveInternalConstraintsTGS1T
     // -> the kArtiSolveInternalTGS row above.  Grid ceil(nbArticulations / 32),
     // block (32, 1, 1) -- SOLVE_INTERNAL_CONSTRAINTS = 32, numWarpsPerBlock = 1

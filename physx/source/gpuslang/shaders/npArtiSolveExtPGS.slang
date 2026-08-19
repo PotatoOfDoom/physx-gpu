@@ -107,7 +107,7 @@ static const uint SVP_COMPLIANT_ACCEL_SPRING = 1u << 3;   // contact header flag
 // ---------------------------------------------------------------------------
 
 // mirrors PxgBlockSolverContactHeader (1920 bytes)
-struct SvpPgsContactHeader
+public struct SvpPgsContactHeader
 {
     float4 invMass0_1_angDom0_1[32];  // 0
     float4 normal_staticFriction[32]; // 512
@@ -121,7 +121,7 @@ struct SvpPgsContactHeader
 }                                     // = 1920
 
 // mirrors PxgBlockSolverFrictionHeader (1408 bytes)
-struct SvpPgsFrictionHeader
+public struct SvpPgsFrictionHeader
 {
     float4 frictionNormals0[32];  // 0
     float4 frictionNormals1[32];  // 512
@@ -131,7 +131,7 @@ struct SvpPgsFrictionHeader
 }                                 // = 1408
 
 // mirrors PxgBlockSolverContactPoint (1664 bytes)
-struct SvpPgsContactPoint
+public struct SvpPgsContactPoint
 {
     float4 raXn_targetVelocity[32]; // 0
     float4 rbXn_maxImpulse[32];     // 512
@@ -143,7 +143,7 @@ struct SvpPgsContactPoint
 }                                   // = 1664
 
 // mirrors PxgBlockSolverContactFriction (1408 bytes)
-struct SvpPgsContactFriction
+public struct SvpPgsContactFriction
 {
     float4 raXn_bias[32];       // 0
     float4 rbXn_targetVelW[32]; // 512
@@ -154,7 +154,7 @@ struct SvpPgsContactFriction
 
 // mirrors PxgBlockSolverConstraint1DHeader (1664 bytes; PxU16 rowCounts /
 // breakable are packed two lanes per word)
-struct SvpPgs1DHeader
+public struct SvpPgs1DHeader
 {
     uint rowCounts[16];    // 0
     uint pad0[16];
@@ -171,7 +171,7 @@ struct SvpPgs1DHeader
 }                                                // = 1664
 
 // mirrors PxgBlockSolverConstraint1DCon (2304 bytes)
-struct SvpPgs1DCon
+public struct SvpPgs1DCon
 {
     float4 lin0XYZ_minImpulse[32]; // 0
     float4 lin1XYZ_maxImpulse[32]; // 512
@@ -182,7 +182,7 @@ struct SvpPgs1DCon
 }                                  // = 2304
 
 // mirrors PxgBlockSolverConstraint1DMod (1024 bytes)
-struct SvpPgs1DMod
+public struct SvpPgs1DMod
 {
     float ang0Writeback[96]; // 0: PxVec3[32], tightly packed
     float appliedForce[32];  // 384
@@ -305,7 +305,7 @@ void svp1dConstantsPGS(bool isSpring, bool isAccelerationSpring, float coeff0,
 // solveExtContactsBlock (solver.cuh:54-320)
 // ===========================================================================
 
-void svpSolveExtContactsBlock(
+public void svpSolveExtContactsBlock(
     Ptr<PxgBlockConstraintBatch> batch,
     inout AbSpatialVector vel0, inout AbSpatialVector vel1,
     bool doFriction,
@@ -536,7 +536,7 @@ void svpSolveExtContactsBlock(
 // solveExt1DBlock (solverBlock.cuh:208-326)
 // ===========================================================================
 
-void svpSolveExt1DBlock(
+public void svpSolveExt1DBlock(
     Ptr<PxgBlockConstraintBatch> batch,
     inout AbSpatialVector vel0, inout AbSpatialVector vel1,
     uint threadIndex,
