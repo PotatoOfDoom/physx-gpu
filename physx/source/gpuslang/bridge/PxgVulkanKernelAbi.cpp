@@ -188,6 +188,12 @@ static const uint8_t kMarkActiveSlabTGS[] = { 8, 8, 4, 4, 4, 4, 8 };
 //   (bool byte @24, bytes 25..31 padding)
 static const uint8_t kSolveBlockPartitionPGS[] = { 8, 8, 4, 4, 1 };
 
+// artiSolveBlockPartition(PxgSolverCoreDesc*, const PxgSolverSharedDesc<IterativeSolveData>*,
+//   PxU32 islandIndex, PxU32 partitionIndex, bool doFriction,
+//   const PxgArticulationCoreDesc*) -> 40-byte blob (the bool byte at 24,
+//   the trailing pointer realigned to 32)
+static const uint8_t kArtiSolveBlockPartitionPGS[] = { 8, 8, 4, 4, 1, 8 };
+
 // concludeBlocks / writebackBlocks / writeBackBodies
 //   (desc, sharedDesc, PxU32 islandIndex) -> 24-byte blob
 static const uint8_t kDescsIslandPGS[] = { 8, 8, 4 };
@@ -1158,6 +1164,7 @@ static const PxgKernelAbiRow kRows[] = {
     // gpusolver PGS solver kernels (P5 Step 5 BDA)
     { "ZeroBodies", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "solveBlockPartition", kSolveBlockPartitionPGS, uint32_t(sizeof(kSolveBlockPartitionPGS)) },
+    { "artiSolveBlockPartition", kArtiSolveBlockPartitionPGS, uint32_t(sizeof(kArtiSolveBlockPartitionPGS)) },
     { "concludeBlocks", kDescsIslandPGS, uint32_t(sizeof(kDescsIslandPGS)) },
     { "writebackBlocks", kDescsIslandPGS, uint32_t(sizeof(kDescsIslandPGS)) },
     { "writeBackBodies", kDescsIslandPGS, uint32_t(sizeof(kDescsIslandPGS)) },

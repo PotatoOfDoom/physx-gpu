@@ -1694,6 +1694,65 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P8.122b — artiSolveBlockPartition, der PGS-Partition-Solve (Manifest 321)
+
+Der PGS-Zwilling des P8.104-TGS-Partition-Solves — anders als dort ein
+EIGENSTÄNDIGER Kernel (solver.cu:47-266, kein solveBlockUnified-Arm),
+als dritter Entry in `npArtiSolveExtPGS.slang` (die SvpPgs*-Mirrors und
+das P8.122a-Solve-Paar sind file-lokal dort).  Launch: Grid nbArtiBlocks
+× Block (32,2,1) (PxgCudaSolverCore.cpp:1194); ABI NEU
+kArtiSolveBlockPartitionPGS {8,8,4,4,1,8} (Bool-Byte bei 24, Zeiger
+realigned auf 32 → 40-Byte-Blob).
+
+**PGS-vs-TGS-Fallen (Entry-Traps 13-20, je Mutant)**: startIndex
+partition-0-speziell (mArtiBatchStartIndex vs
+artiConstraintsPerPartition[idx-1], mit der P8.96c-Index-Klammer gegen
+den spekulierten Unterlauf); endIndex addiert
+islandContextPool[0].mBatchCount, startIndex NICHT;
+mBatchCount/mArticulationCount/mBodyStartIndex/mBodyCount lesen
+pool[0] (der Pointer-Deref), mStartPartitionIndex/mArtiBatchStartIndex
+pool[islandIndex]; das 2-SLOT-Staging bei k*128 (lin/ang als GANZE
+Hälften — TGS: 3-Slot-Split bei k*192); curRef zählt aktive Slabs
+(Arti: remappedIndex + numDyn + bodyOffset); Rigid-Writeback in die
+remapped-Indizes als (bottom,0)/(top,0)-Paar; der Arti-Writeback
+streut den IMPULS nach deferredZ[computeDeltaVIndex], schreibt
+isSlabDirty[...].x/.y = linkIndex und mStateDirty =
+eHAS_IMPULSES|eVEL_DIRTY über das Sub-Wort-Atomic-Paar (der DOPPELTE
+deferredZ-Store des CUDA für Körper B — Direktzuweisung :249 +
+storeSpatialVector :250 auf dieselben 24 Bytes — kollabiert zu einem,
+dokumentiert); constraintType == eARTICULATION_CONTACT (3) wählt den
+Kontakt-Solve; doFriction erreicht NUR den Kontakt-Solve; KEIN
+deltaQ/elapsedTime/minPen (PGS braucht keine Motion-Terme); der
+Lane-Guard ist ein Body-Guard, kein Return (die Butterfly-Reduktion
+braucht jede Lane — die P8.104-Trap-3-Disziplin); die
+Fehler-Akkumulation ist die bewährte solverPGS-Anordnung
+(Groupshared-Butterfly + CAS-Float-Atomics in den Desc).
+
+**Fixture** `testArtiSolvePartitionPgs.cpp` (die P8.104-Geometrie,
+PGS-adjustiert: 2 Live-Batches k=8 Kontakt Stride 26 / k=9 1D Stride 13
+hinter Offset 3, pool[0]-vs-pool[1]-DECOYS, Warps 2-3 pinnen den
+k-Guard, (artiId, Slab) global eindeutig je Seite, gemischte
+Arti/Rigid-Lanes mit Statik-Refs): Spiegel über refSolveExtContactPGS /
+refSolveExt1DPGS + Popcount-Slab-Zählung + Butterfly in Baumordnung
+(lineare Summe wäre 1 ULP daneben).  Drei Runden: Partition 2 /
+Residual AUS (Akkumulator-Wörter unangetastet), Partition 0 / Residual
+AN (Butterfly + Atomic-Tail exakt verglichen), Partition 2 /
+doFriction=0 (Friction-Pools und broken bleiben VERGIFTET).
+**Bit-exakt im ersten Lauf, alle drei Runden, 0 tolerierte ±0.**
+
+**Sweep 15/15**: Start-Arm kollabiert, endIndex ohne Offset,
+mBatchCount/nbArticulations via pool[islandIndex], Staging vertauscht,
+readIndex-TGS-Stride (192), Ref-Remap weg, Rigid-Out auf readIndex,
+deltaV-Index vertauscht, slabDirty .y→.x, mStateDirty nur eVEL,
+doFriction erzwungen, 1D-Response-Basis unversetzt, Butterfly halbiert,
+maxLinks hartkodiert.  Restore grün inkl. P8.122a-Fixture.
+
+Szene: Refused-Liste 181 → **180**.  Suite: **773/773 ctest in BEIDEN
+Memory-Modi**.  Manifest **321/501**.  Verbleibende Refused-Arti-Kernel:
+artiSolveInternalConstraints1T,
+artiPropagateRigidImpulsesAndSolveSelfConstraints1T,
+updateArticulationsLaunch.
+
 ## P8.122a — das PGS-Ext-Solve-Paar auf dem Engine-Block-Layout + der ZEHNTE Upstream-Bug-Kandidat
 
 `solveExtContactsBlock` (solver.cuh:54-320) und `solveExt1DBlock`

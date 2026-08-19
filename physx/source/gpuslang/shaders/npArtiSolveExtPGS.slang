@@ -89,7 +89,10 @@
 
 import pxgSlangCommon;
 import pxgSlangSpatialMatrix;
-import pxgSlangSolverBlocks;   // PxgBlockConstraintBatch + PxgArticulationBlockResponse
+import pxgSlangSolverBlocks;        // PxgBlockConstraintBatch + PxgArticulationBlockResponse
+import pxgSlangSolverDesc;          // PxgSolverCoreDescGpu + PGS shared desc + countActiveSlabs
+import pxgSlangArticulationBlocks;  // abStoreU8 + PXG_AB_* (the P8.122b entry)
+import pxgSlangArticulationDesc;    // artiPtrField / PXG_ARTI_CORE_*
 
 static const float SVP_PX_MAX_F32 = 3.4028234663852885981170418348452e+38f;
 static const float SVP_PX_EPS_REAL = 1.192092896e-07f;
@@ -770,4 +773,338 @@ void svp1DTest(uint3 groupThreadId : SV_GroupThreadID)
                        (gSvp.flagsWord & 1u) != 0u, gSvp.ref0, gSvp.ref1);
 
     svpStoreIo(lane, vel0, vel1, imp0, imp1, err);
+}
+
+// ===========================================================================
+// P8.122b: the ENGINE entry -- artiSolveBlockPartition (solver.cu:47-266),
+// the PGS twin of P8.104's artiSolveBlockPartitionTGSInternal.  Launch:
+// grid nbArtiBlocks x block (32, 2, 1) (COMPUTE_UNCONSTRAINED_VELOCITES/32
+// warps per block, PxgCudaSolverCore.cpp:1194).  Params (8,8,4,4,1,8).
+//
+// TRAPS, continuing the module numbering (each a sweep mutant):
+// 13. **startIndex is partition-0-special** (island.mArtiBatchStartIndex vs
+//     artiConstraintsPerPartition[partitionIndex + startPartitionIndex - 1]);
+//     endIndex adds islandContextPool[0].mBatchCount, startIndex does NOT
+//     (it enters k separately).
+// 14. **mBatchCount / mArticulationCount / mBodyStartIndex / mBodyCount read
+//     islandContextPool[0]** (the CUDA derefs the POINTER), while
+//     mStartPartitionIndex/mArtiBatchStartIndex read pool[islandIndex].
+// 15. **The 2-slot velocity staging** at readIndex = k*128 + lane: slots
+//     0/32 = body A lin/ang, 64/96 = body B -- the PGS packing carries the
+//     halves whole ((ang.xyz) top, (lin.xyz) bottom), unlike the TGS
+//     3-slot split (trap 4 of P8.104).
+// 16. curRef counts active slabs for articulations at remappedBodyIndex +
+//     numDynamicBodies + bodyOffset, for rigids only when solverBodyId >=
+//     bodyOffset; both default to 1.  (Shared with P8.104, swept again.)
+// 17. **The rigid writeback goes to remappedBodyA/BIndex** in the 2-slot
+//     packing (bottom, 0) / (top, 0); the arti writeback scatters the
+//     IMPULSE to deferredZ[computeDeltaVIndex(...)], writes isSlabDirty
+//     [artiId + slabId*nbArticulations].x = linkIndexA (.y for body B) and
+//     sets mStateDirty = eHAS_IMPULSES | eVEL_DIRTY through the sub-word
+//     atomic pair.  (The CUDA stores body B's deferredZ TWICE -- a direct
+//     assignment at :249 immediately followed by storeSpatialVector on the
+//     same 24 bytes; the port stores once.)
+// 18. constraintType == eARTICULATION_CONTACT (3) selects the contact solve,
+//     everything else the 1D solve (the CUDA asserts 1D); the 1D response
+//     base is &responses[batch.mArticulationResponseIndex].
+// 19. **The lane guard must not skip the error reduction**: the CUDA returns
+//     for lanes >= mDescStride before the accumulate (zero contribution);
+//     the port guards the body so the groupshared butterfly stays in
+//     uniform control flow (the P8.104 trap-3 discipline).
+// 20. doFriction reaches ONLY the contact solve; there is no elapsedTime /
+//     minPen / deltaQ anywhere (the PGS solve needs no motion terms).
+// ===========================================================================
+
+static const uint SVP_ARTI_CONTACT = 3u;   // PxgSolverConstraintDesc::eARTICULATION_CONTACT
+static const uint SVP_DIRTY = 3u;          // eHAS_IMPULSES | eVEL_DIRTY
+
+// computeDeltaVIndex (PxgArticulation.h:967)
+uint svpDeltaVIndex(uint maxArticulations, uint maxLinks, uint articulationID,
+                    uint linkID, uint slabID)
+{
+    return articulationID + linkID * maxArticulations + slabID * maxArticulations * maxLinks;
+}
+
+struct SvpPartParams
+{
+    uint64_t solverCoreDesc;   // @0
+    uint64_t sharedDesc;       // @8
+    uint islandIndex;          // @16
+    uint partitionIndex;       // @20
+    uint doFrictionWord;       // @24 (bool byte, read masked)
+    uint pad0;                 // @28
+    uint64_t artiDesc;         // @32 -> 40
+}
+
+[[vk::push_constant]]
+ConstantBuffer<SvpPartParams> gSvpPart;
+
+// per-warp residual-reduction scratch: block = (32,2) -> 2 warps
+groupshared float shSvpErrSum[64];
+groupshared float shSvpErrMax[64];
+groupshared uint  shSvpErrCount[64];
+
+[shader("compute")]
+[numthreads(32, 2, 1)]
+void artiSolveBlockPartition(uint3 groupThreadId : SV_GroupThreadID,
+                             uint3 groupId : SV_GroupID)
+{
+    const uint lane = groupThreadId.x;
+    const uint warpIndex = groupThreadId.y;
+    const uint globalWarpIndex = groupId.x * 2u + warpIndex;
+    const uint threadInBlock = warpIndex * 32u + lane;
+
+    Ptr<PxgSolverCoreDescGpu> solverDesc = Ptr<PxgSolverCoreDescGpu>(gSvpPart.solverCoreDesc);
+    Ptr<PxgSolverSharedDescPGSGpu> sharedDesc =
+        Ptr<PxgSolverSharedDescPGSGpu>(gSvpPart.sharedDesc);
+    Ptr<PxgIslandContextGpu> islandPool =
+        Ptr<PxgIslandContextGpu>(solverDesc[0].islandContextPool);
+
+    const bool accumulateError = solverDesc[0].contactErrorAccumulator_mCounter >= 0;
+
+    const uint64_t d = gSvpPart.artiDesc;
+    const uint64_t gArticulations = artiPtrField(d, PXG_ARTI_CORE_ARTICULATION_BLOCKS);
+    const uint maxLinks = artiU32Field(d, PXG_ARTI_CORE_MAX_LINKS);
+    const uint64_t deferredZ = sharedDesc[0].articulationDeferredZ;
+    const uint64_t isSlabDirty = artiPtrField(d, PXG_ARTI_CORE_SLAB_HAS_CHANGES);
+
+    const uint startPartitionIndex = islandPool[gSvpPart.islandIndex].mStartPartitionIndex;
+    Ptr<uint> artiConstraintsPerPartition = Ptr<uint>(solverDesc[0].artiConstraintsPerPartition);
+
+    // trap 13 (with the P8.96c index clamp: the [idx-1] load is speculated on
+    // the partition-0 arm too, where it would underflow)
+    const uint prevIdx = (gSvpPart.partitionIndex == 0u)
+        ? gSvpPart.partitionIndex + startPartitionIndex
+        : gSvpPart.partitionIndex + startPartitionIndex - 1u;
+    const uint prevCpp = artiConstraintsPerPartition[prevIdx];
+    const uint startIndex = (gSvpPart.partitionIndex == 0u)
+        ? islandPool[gSvpPart.islandIndex].mArtiBatchStartIndex
+        : prevCpp;
+
+    // trap 14: the POINTER deref -- element 0
+    const uint articulationBatchOffset = islandPool[0].mBatchCount;
+    const uint endIndex =
+        artiConstraintsPerPartition[gSvpPart.partitionIndex + startPartitionIndex]
+        + articulationBatchOffset;
+
+    const uint k = startIndex + globalWarpIndex + articulationBatchOffset;
+
+    SvpError error = { 0.0f, 0, 0.0f };
+
+    if (k < endIndex)
+    {
+        const bool doFriction = (gSvpPart.doFrictionWord & 0xFFu) != 0u;
+
+        Ptr<PxgBlockConstraintBatch> batches =
+            Ptr<PxgBlockConstraintBatch>(sharedDesc[0].iter_blockConstraintBatch);
+        Ptr<PxgBlockConstraintBatch> batch = batches + k;
+
+        const uint descStride = batch[0].descStride_constraintType & 0xFFFFu;
+        const uint constraintType = batch[0].descStride_constraintType >> 16u;
+
+        // trap 19: guard, not return -- the butterfly below needs every lane
+        if (lane < descStride)
+        {
+            const uint nbArticulations = islandPool[0].mArticulationCount;
+
+            const uint2 igNodeIndexA = batch[0].bodyANodeIndex[lane];
+            const uint2 igNodeIndexB = batch[0].bodyBNodeIndex[lane];
+            const uint slabId = batch[0].slabId[lane];
+            const uint solverBodyId0 = batch[0].bodyAIndex[lane];
+            const uint solverBodyId1 = batch[0].bodyBIndex[lane];
+            const uint linkIndexA = nodeIndexArticulationLinkId(igNodeIndexA);
+            const uint linkIndexB = nodeIndexArticulationLinkId(igNodeIndexB);
+            const bool isArtiA = nodeIndexIsArticulation(igNodeIndexA);
+            const bool isArtiB = nodeIndexIsArticulation(igNodeIndexB);
+
+            const uint readIndex = k * 128u + lane;
+
+            Ptr<float4> bodyVelocities = Ptr<float4>(sharedDesc[0].iter_solverBodyVelPool);
+
+            // trap 15: the 2-slot staging
+            AbSpatialVector vel0, vel1;
+            {
+                const float4 lin = bodyVelocities[readIndex];
+                const float4 ang = bodyVelocities[readIndex + 32u];
+                vel0 = asmSVec(ang.xyz, lin.xyz);
+            }
+            {
+                const float4 lin = bodyVelocities[readIndex + 64u];
+                const float4 ang = bodyVelocities[readIndex + 96u];
+                vel1 = asmSVec(ang.xyz, lin.xyz);
+            }
+
+            // trap 16: reference counts
+            float curRef0 = 1.0f;
+            float curRef1 = 1.0f;
+            {
+                const uint bodyOffset = islandPool[0].mBodyStartIndex;
+                const uint numDynamicBodies = islandPool[0].mBodyCount;
+                Ptr<uint> encodedReferenceCount =
+                    Ptr<uint>(sharedDesc[0].iter_solverEncodedReferenceCount);
+                const uint numTotalBodies = bodyOffset + numDynamicBodies + nbArticulations;
+                const uint numSlabs = solverDesc[0].numSlabs;
+
+                if (isArtiA)
+                {
+                    const uint globalBodyIdA =
+                        batch[0].remappedBodyAIndex[lane] + numDynamicBodies + bodyOffset;
+                    curRef0 = float(pxgCountActiveSlabsBda(globalBodyIdA, numSlabs,
+                                                           numTotalBodies, encodedReferenceCount));
+                }
+                else if (solverBodyId0 >= bodyOffset)
+                {
+                    curRef0 = float(pxgCountActiveSlabsBda(solverBodyId0, numSlabs,
+                                                           numTotalBodies, encodedReferenceCount));
+                }
+
+                if (isArtiB)
+                {
+                    const uint globalBodyIdB =
+                        batch[0].remappedBodyBIndex[lane] + numDynamicBodies + bodyOffset;
+                    curRef1 = float(pxgCountActiveSlabsBda(globalBodyIdB, numSlabs,
+                                                           numTotalBodies, encodedReferenceCount));
+                }
+                else if (solverBodyId1 >= bodyOffset)
+                {
+                    curRef1 = float(pxgCountActiveSlabsBda(solverBodyId1, numSlabs,
+                                                           numTotalBodies, encodedReferenceCount));
+                }
+            }
+
+            AbSpatialVector impulse0 = asmSVec(float3(0.0f, 0.0f, 0.0f), float3(0.0f, 0.0f, 0.0f));
+            AbSpatialVector impulse1 = impulse0;
+
+            // trap 18/20
+            if (constraintType == SVP_ARTI_CONTACT)
+            {
+                svpSolveExtContactsBlock(batch, vel0, vel1, doFriction, lane,
+                                         Ptr<SvpPgsContactHeader>(sharedDesc[0].iter_blockContactHeaders),
+                                         Ptr<SvpPgsFrictionHeader>(sharedDesc[0].iter_blockFrictionHeaders),
+                                         Ptr<SvpPgsContactPoint>(sharedDesc[0].iter_blockContactPoints),
+                                         Ptr<SvpPgsContactFriction>(sharedDesc[0].iter_blockFrictions),
+                                         Ptr<PxgArticulationBlockResponse>(sharedDesc[0].iter_artiResponse),
+                                         impulse0, impulse1,
+                                         error, accumulateError, curRef0, curRef1);
+            }
+            else
+            {
+                const uint responseIndex = batch[0].mArticulationResponseIndex;
+                Ptr<PxgArticulationBlockResponse> respBase = Ptr<PxgArticulationBlockResponse>(
+                    sharedDesc[0].iter_artiResponse + uint64_t(responseIndex) * 1536u);
+                svpSolveExt1DBlock(batch, vel0, vel1, lane,
+                                   Ptr<SvpPgs1DHeader>(sharedDesc[0].iter_blockJointConstraintHeaders),
+                                   Ptr<SvpPgs1DCon>(sharedDesc[0].iter_blockJointConstraintRowsCon),
+                                   Ptr<SvpPgs1DMod>(sharedDesc[0].iter_blockJointConstraintRowsMod),
+                                   respBase,
+                                   impulse0, impulse1,
+                                   accumulateError, curRef0, curRef1);
+            }
+
+            // trap 17: the writebacks
+            if (!isArtiA)
+            {
+                const uint outIndex = batch[0].remappedBodyAIndex[lane];
+                bodyVelocities[outIndex] = float4(vel0.bottom, 0.0f);
+                bodyVelocities[outIndex + 32u] = float4(vel0.top, 0.0f);
+            }
+            else
+            {
+                const uint index =
+                    svpDeltaVIndex(nbArticulations, maxLinks, solverBodyId0, linkIndexA, slabId);
+                Ptr<float> z = Ptr<float>(deferredZ + uint64_t(index) * 24u);
+                z[0] = impulse0.top.x; z[1] = impulse0.top.y; z[2] = impulse0.top.z;
+                z[3] = impulse0.bottom.x; z[4] = impulse0.bottom.y; z[5] = impulse0.bottom.z;
+
+                (Ptr<uint>(isSlabDirty))[(solverBodyId0 + slabId * nbArticulations) * 2u] =
+                    linkIndexA;
+
+                const uint articBlockId = solverBodyId0 / 32u;
+                abStoreU8(gArticulations + uint64_t(articBlockId) * PXG_AB_BLOCK_SIZE,
+                          PXG_AB_mStateDirty, solverBodyId0 & 31u, SVP_DIRTY);
+            }
+
+            if (!isArtiB)
+            {
+                const uint outIndex = batch[0].remappedBodyBIndex[lane];
+                bodyVelocities[outIndex] = float4(vel1.bottom, 0.0f);
+                bodyVelocities[outIndex + 32u] = float4(vel1.top, 0.0f);
+            }
+            else
+            {
+                // (the CUDA's duplicated deferredZ store collapses to one)
+                const uint index =
+                    svpDeltaVIndex(nbArticulations, maxLinks, solverBodyId1, linkIndexB, slabId);
+                Ptr<float> z = Ptr<float>(deferredZ + uint64_t(index) * 24u);
+                z[0] = impulse1.top.x; z[1] = impulse1.top.y; z[2] = impulse1.top.z;
+                z[3] = impulse1.bottom.x; z[4] = impulse1.bottom.y; z[5] = impulse1.bottom.z;
+
+                (Ptr<uint>(isSlabDirty))[(solverBodyId1 + slabId * nbArticulations) * 2u + 1u] =
+                    linkIndexB;
+
+                const uint articBlockId = solverBodyId1 / 32u;
+                abStoreU8(gArticulations + uint64_t(articBlockId) * PXG_AB_BLOCK_SIZE,
+                          PXG_AB_mStateDirty, solverBodyId1 & 31u, SVP_DIRTY);
+            }
+        }
+    }
+
+    // PxgErrorAccumulator::accumulateErrorGlobalFullWarp: per-warp butterfly,
+    // then lane 0 of each warp accumulates atomically (the solverPGS
+    // solveBlockPartition arrangement; uniform control flow around barriers)
+    GroupMemoryBarrierWithGroupSync();
+    shSvpErrSum[threadInBlock] = error.sumOfSquares;
+    shSvpErrMax[threadInBlock] = error.maxError;
+    shSvpErrCount[threadInBlock] = uint(error.counter);
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint radius = 16u; radius > 0u; radius >>= 1)
+    {
+        const uint partner = threadInBlock ^ radius;   // stays inside the warp
+        const float s = shSvpErrSum[partner];
+        const float m = shSvpErrMax[partner];
+        const uint c = shSvpErrCount[partner];
+        GroupMemoryBarrierWithGroupSync();
+        shSvpErrSum[threadInBlock] += s;
+        shSvpErrMax[threadInBlock] = max(shSvpErrMax[threadInBlock], m);
+        shSvpErrCount[threadInBlock] += c;
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (accumulateError && lane == 0u)
+    {
+        const float sumSq = shSvpErrSum[threadInBlock];
+        const uint count = shSvpErrCount[threadInBlock];
+        const float maxErr = shSvpErrMax[threadInBlock];
+
+        uint assumed = solverDesc[0].contactErrorAccumulator_mErrorSumOfSquares;
+        for (;;)
+        {
+            const uint newBits = asuint(asfloat(assumed) + sumSq);
+            uint old;
+            InterlockedCompareExchange(solverDesc[0].contactErrorAccumulator_mErrorSumOfSquares,
+                                       assumed, newBits, old);
+            if (old == assumed)
+                break;
+            assumed = old;
+        }
+
+        int oldCount;
+        InterlockedAdd(solverDesc[0].contactErrorAccumulator_mCounter, int(count), oldCount);
+
+        if (maxErr > asfloat(solverDesc[0].contactErrorAccumulator_mMaxError))
+        {
+            assumed = solverDesc[0].contactErrorAccumulator_mMaxError;
+            for (;;)
+            {
+                const uint newBits = asuint(max(maxErr, asfloat(assumed)));
+                uint old;
+                InterlockedCompareExchange(solverDesc[0].contactErrorAccumulator_mMaxError,
+                                           assumed, newBits, old);
+                if (old == assumed)
+                    break;
+                assumed = old;
+            }
+        }
+    }
 }
