@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **764/764** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **765/765** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,65 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P8.114 — computeArtiGravityForces (Manifest 300): die 300er-Marke
+
+`computeArtiGravityForces` (inverseDynamic.cu:593-799) ist gemappt — der
+Gravitations-Kompensations-Kernel der Direct-API, BEIDE Branches:
+
+* **rootMotion || fixBase**: reine Impuls-Propagation — zA = (-gravity)*mass
+  pro Link, Leaf-nach-Root-Akkumulation, Dof-Projektion, und für
+  rootMotion+freie Basis die sechs Root-Zeilen direkt aus zA[0];
+* **sonst** (das deprecatede eGENERALIZED_GRAVITY_FORCES auf freier Basis):
+  der volle Inverse-Dynamics-Durchlauf — Spatial-Trägheiten
+  (transformInertiaTensor), Leaf-nach-Root-Akkumulation via
+  translateInertia(skew(rw)), Root-Geschwindigkeits-Propagation
+  (**motionVelocities[0] ist ein LEBENDER INPUT aus dem Record**),
+  zA.top = +gravity*mass (**die Vorzeichen-Inkonsistenz der Engine zwischen
+  den Branches — ihr eigener Kommentar sagt es; transkribiert**),
+  bottom = v x (I v), Root-Beschleunigung -(invertInertia() * zA[0]),
+  Root-nach-Leaf-Propagation mit zA += I*accel, Dof-Projektion.
+
+**Neu vermessen und gepinnt**: worldSpatialArticulatedInertia @168 im
+Record, und die REINTERPRETATION — das Feld ist PxSpatialMatrix* (144 B),
+der Kernel castet auf Dy::SpatialMatrix* und indiziert mit DESSEN Stride
+**112** (108 B Matrizentripel + 4 Padding; Member @0/@36/@72).  Beide
+Zahlen per static_assert in der Fixture.
+
+**Fallen**: der Dof-Index-Staging-Trick (Link-Index als float durch den
+AUSGABE-Puffer, mit float->uint-Cast zurück), rootDof (nur
+rootMotion+frei) vs bufferDof (immer bei rootMotion) — Offsets vs Pitch,
+per-Komponenten-Null-Guards (statische Links), die negierte
+Root-Beschleunigung, beide Rotations-Hälften + Dual-Produkt in der
+Projektion.
+
+**ABWEICHUNG (die P8.112-Klasse, verbreitert)**: die
+__syncwarp-Choreografie (2 Mid-Syncs in Branch A, 6 in Branch B) wird zu
+SECHS uniformen Barrieren-Slots, die JEDER Thread des Blocks erreicht;
+die Branches arbeiten in Segmenten unter live&&branch-Prädikaten dazwischen.
+Zusätzliche Barrieren für den kurzen Branch sind wertneutral; die
+Verbreiterung ist nötig, weil ein Warp hier vier Subgroups überspannt und
+die Branch-Bedingungen pro Job variieren.
+
+**Fixture** `testArtiGravityForces.cpp`: Spiegel = die CUDA-Struktur
+sequentiell über Engine-Primitive (Cm::transformInertiaTensor,
+PxMat33(quat), refSkew/refTranslateInertia, SpatialMatrix +/*/
+invertInertia, translateSpatialVector, rotate(PxTransform), Dual-Produkt).
+Zwei Runden (rootMotion an/aus), fixe und freie Basen in beiden, ein
+statischer Link, 16 Slots decken alle Warps (die P8.113-Lektion),
+Job->Record-Permutation mit disjunkten toten Records.  **Bit-exakt im
+ersten Lauf, beide Runden — auch durch die Barrieren-Restrukturierung.**
+
+**Sweep 16/16**: Guard weg, Reinterpretation bei 144, rootDof ignoriert
+fixBase, bufferDof folgt rootDof (rc=139), Masse ohne Guard, Staging als
+Bits gelesen, zA-Hälften vertauscht, Serial aufsteigend, die
+Vorzeichen-Inkonsistenz "konsistent gemacht", Root-Accel unnegiert,
+seg2-rw-Vorzeichen, plain-Dot statt Dual, Root-Tail weg,
+Trägheits-Akkumulation als Store, translateInertia gestrichen,
+Coriolis-Cross vertauscht.
+
+Szene: Refused-Liste 202 → **201**.  Suite: **765/765 ctest in BEIDEN
+Memory-Modi** (Binary 686/686).  **Manifest 300/501 — die 300er-Marke.**
 
 ## P8.113 — computeArtiDenseJacobians + computeArtiCentroidalMomentumMatrices (Manifest 299)
 

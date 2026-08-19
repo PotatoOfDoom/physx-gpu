@@ -96,7 +96,7 @@ float3 asiMul(AbMat33 m, float3 v)
 
 // PxMat33(PxQuat), PxMat33.h:136.  The doubling comes first and the products
 // are formed from the doubled components -- `x2 * y`, not `2.0f * (x * y)`.
-AbMat33 asiMat33FromQuat(float4 q)
+public AbMat33 asiMat33FromQuat(float4 q)
 {
     const float x2 = q.x + q.x;
     const float y2 = q.y + q.y;
@@ -129,7 +129,7 @@ AbMat33 asiMat33FromQuat(float4 q)
 // Note the first parameter is named `invD` in the engine but this call site
 // passes the NON-inverse inertia tensor.  The function does not care; the name
 // is a leftover from its rigid-body use.
-AbMat33 asiTransformInertiaTensor(float3 invD, AbMat33 M)
+public AbMat33 asiTransformInertiaTensor(float3 invD, AbMat33 M)
 {
     const float axx = invD.x * M.c0.x, axy = invD.x * M.c0.y, axz = invD.x * M.c0.z;
     const float byx = invD.y * M.c1.x, byy = invD.y * M.c1.y, byz = invD.y * M.c1.z;

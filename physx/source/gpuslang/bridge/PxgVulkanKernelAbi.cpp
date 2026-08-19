@@ -139,6 +139,9 @@ static const uint8_t kDenseJac[] = { 8, 8, 4, 4, 4, 8 };
 // computeArtiCentroidalMomentumMatrices(float*, PxArticulationGPUIndex*,
 //   PxU32 nbIndices, PxU32 maxDofs, const PxgArticulation*) -- P8.113b
 static const uint8_t kCentroidal[] = { 8, 8, 4, 4, 8 };
+// computeArtiGravityForces(PxU32 nbIndices, float* data, PxArticulationGPUIndex*,
+//   PxU32 maxDofs, bool rootMotion, const PxgArticulation*, PxVec3 gravity) -- P8.114
+static const uint8_t kGravityForces[] = { 4, 8, 8, 4, 1, 8, 12 };
 
 // solverTGS: propagateAverageSolverBodyVelocityTGS(desc, sharedDesc,
 //   bool isVelocityIteration, bool isLastPosIteration, PxReal biasCoefficient)
@@ -1303,6 +1306,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "computeArtiCOM", kTwoPtrBoolPtr, uint32_t(sizeof(kTwoPtrBoolPtr)) },
     { "computeArtiDenseJacobians", kDenseJac, uint32_t(sizeof(kDenseJac)) },
     { "computeArtiCentroidalMomentumMatrices", kCentroidal, uint32_t(sizeof(kCentroidal)) },
+    { "computeArtiGravityForces", kGravityForces, uint32_t(sizeof(kGravityForces)) },
     { "preIntegrationLaunchTGS", kPreIntegrateTGS, uint32_t(sizeof(kPreIntegrateTGS)) },
     { "preIntegrationLaunch", kPreIntegratePGS, uint32_t(sizeof(kPreIntegratePGS)) },
     // gpusolver contact/joint constraint prep (P5 Step 4 BDA; PGS twins P5 Step 5)

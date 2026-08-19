@@ -433,6 +433,14 @@ public static const uint PXG_ARTI_FLAG_FIX_BASE                         =      1
 public static const uint PXG_ARTI_STATE_VEL_DIRTY                       =      1;
 public static const uint PXG_ARTI_STATE_HAS_IMPULSES                    =      2;
 public static const uint PXG_ARTI_SUBSPACE_STRIDE                       =     80;
+// P8.114: the inverse-dynamics scratch reinterpretation --
+// worldSpatialArticulatedInertia is a PxSpatialMatrix* (144-byte elements)
+// that computeArtiGravityForces/CentrifugalForces reinterpret_cast to
+// Dy::SpatialMatrix* and index at ITS stride: sizeof(Dy::SpatialMatrix) is
+// 112 (measured; 108 bytes of PxMat33 triple + 4 tail padding), members
+// topLeft @0, topRight @36, bottomLeft @72, PxMat33 column-major.
+public static const uint PXG_ARTI_WORLD_SPATIAL_ARTICULATED_INERTIA     =    168;
+public static const uint PXG_ARTI_DY_SPATIAL_MATRIX_AOS_STRIDE          =    112;
 public static const uint PXG_ARTI_QUAT_SIZE                             =     16;
 
 // reads a single byte out of a record, via the containing word

@@ -49,6 +49,10 @@
 import pxgSlangCommon;
 import pxgSlangArticulationDesc;
 import pxgSlangAtomicFloat;
+import pxgSlangArticulationBlocks; // P8.114: AbMat33 + abMat33Zero
+import pxgSlangSpatialMatrix;      // P8.114: the Dy::SpatialMatrix algebra
+import pxgSlangArticulationDynamic; // P8.114: adTranslateSpatialVector
+import npArtiSpatialInertia;        // P8.114: asiMat33FromQuat / asiTransformInertiaTensor
 
 static const uint ID_WARP = 32u;
 
@@ -416,4 +420,364 @@ void computeArtiCentroidalMomentumMatrices(uint3 groupThreadId : SV_GroupThreadI
         cb[4] += cross3.y;
         cb[5] += cross3.z;
     }
+}
+
+// ===========================================================================
+// P8.114: computeArtiGravityForces (inverseDynamic.cu:593-799).  Grid
+// ceil(nbIndices/8), block (32, 8, 1), GUARDED.  Two branches:
+//
+//  * rootMotion || fixBase: gravity forces by pure impulse propagation --
+//    per-link zA = (-gravity) * mass, leaf-to-root accumulation, per-dof
+//    projection dofMotion . zA, and (rootMotion && !fixBase) the six root
+//    rows straight from zA[0];
+//  * else (deprecated eGENERALIZED_GRAVITY_FORCES on a floating base): the
+//    full inverse-dynamics pass -- per-link spatial inertias (topLeft zero,
+//    topRight diag(mass), bottomLeft = transformInertiaTensor), leaf-to-root
+//    inertia accumulation via translateInertia(skew(rw)), root-velocity
+//    propagation (motionVelocities[0] is a LIVE INPUT from the record),
+//    zA[link].top = +gravity*mass (the engine's own sign inconsistency vs
+//    the first branch -- its comment says so; transcribed), bottom =
+//    v x (I v), leaf-to-root zA accumulation, root acceleration
+//    -(invertInertia() * zA[0]), root-to-leaf acceleration propagation with
+//    zA[link] += I[link] * accel[link], and the same per-dof projection.
+//
+// The RECORD SCRATCH reinterpretation (see the desc-map note): the four
+// scratch arrays live in the record's own pools -- zAForces (24-byte
+// UnAlignedSpatialVector AoS), worldSpatialArticulatedInertia REINTERPRETED
+// from PxSpatialMatrix (144 B) to Dy::SpatialMatrix at ITS stride of 112,
+// motionVelocities/motionAccelerations (24-byte AoS).
+//
+// TRAPS, each a sweep mutant unless marked:
+//  1. The dof-index staging trick: the serial loops store the LINK index
+//     into gravityCompensationForces[jointOffset + lane (+rootDof)] as a
+//     float, and the final dof loop reads it back with a float->uint cast.
+//  2. rootDof = 6 only for rootMotion && !fixBase; bufferDof = 6 whenever
+//     rootMotion -- the output pitch uses bufferDof, the offsets rootDof.
+//  3. mass and inertia inverses carry PER-COMPONENT zero guards.
+//  4. motionVelocities[0] is read, never written -- a live input.
+//  5. The root acceleration is NEGATED: -(invInertia * zA[0]).
+//  6. dofMotion = motionMatrix[link][dof - jointOffset].rotate(body2World):
+//     BOTH halves rotated by q, then the DUAL innerProduct against zA.
+//
+// DEVIATION (the P8.112 class, widened): the CUDA's __syncwarp choreography
+// (2 mid-syncs in the first branch, 6 in the second) becomes SIX uniform
+// AllMemoryBarrierWithGroupSync slots that every thread in the block
+// reaches; each branch does its segment work under `live && branch`
+// predicates between them.  Extra barriers for the short branch are
+// value-preserving; the widening is required because a warp spans four
+// subgroups on this device and the branch conditions vary per job.
+// ===========================================================================
+
+struct GfParams
+{
+    uint nbIndices;          // @0
+    uint pad0;               // @4
+    uint64_t data;           // @8
+    uint64_t gpuIndices;     // @16
+    uint maxDofs;            // @24
+    uint rootMotionWord;     // @28 bool byte
+    uint64_t articulations;  // @32
+    float gx;                // @40
+    float gy;                // @44
+    float gz;                // @48
+    uint pad1;               // @52 -> 56
+}
+
+[[vk::push_constant]]
+ConstantBuffer<GfParams> gGf;
+
+AbSpatialVector idLoadSV(uint64_t base)
+{
+    Ptr<float> p = Ptr<float>(base);
+    return asmSVec(float3(p[0], p[1], p[2]), float3(p[3], p[4], p[5]));
+}
+
+void idStoreSV(uint64_t base, AbSpatialVector v)
+{
+    Ptr<float> p = Ptr<float>(base);
+    p[0] = v.top.x; p[1] = v.top.y; p[2] = v.top.z;
+    p[3] = v.bottom.x; p[4] = v.bottom.y; p[5] = v.bottom.z;
+}
+
+AbMat33 idLoadM33(uint64_t base)
+{
+    Ptr<float> p = Ptr<float>(base);
+    return asmM33(float3(p[0], p[1], p[2]), float3(p[3], p[4], p[5]), float3(p[6], p[7], p[8]));
+}
+
+void idStoreM33(uint64_t base, AbMat33 m)
+{
+    Ptr<float> p = Ptr<float>(base);
+    p[0] = m.c0.x; p[1] = m.c0.y; p[2] = m.c0.z;
+    p[3] = m.c1.x; p[4] = m.c1.y; p[5] = m.c1.z;
+    p[6] = m.c2.x; p[7] = m.c2.y; p[8] = m.c2.z;
+}
+
+// the Dy::SpatialMatrix AoS at stride 112: topLeft @0, topRight @36,
+// bottomLeft @72
+AbSpatialMatrix idLoadSM(uint64_t base)
+{
+    return asmMatrix(idLoadM33(base), idLoadM33(base + 36u), idLoadM33(base + 72u));
+}
+
+void idStoreSM(uint64_t base, AbSpatialMatrix m)
+{
+    idStoreM33(base, m.topLeft);
+    idStoreM33(base + 36u, m.topRight);
+    idStoreM33(base + 72u, m.bottomLeft);
+}
+
+[shader("compute")]
+[numthreads(32, 8, 1)]
+void computeArtiGravityForces(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    const uint jobIndex = groupThreadId.y + groupId.x * 8u;
+    const uint threadIndex = groupThreadId.x;
+    const bool rootMotion = (gGf.rootMotionWord & 0xFFu) != 0u;
+    const float3 gravity = float3(gGf.gx, gGf.gy, gGf.gz);
+
+    const bool live = jobIndex < gGf.nbIndices;
+    uint linkCount = 0u, dofCount = 0u, rootDof = 0u;
+    bool fixBase = false, branchA = false;
+    uint64_t record = 0uL, gcf = 0uL;
+    uint64_t linkProps = 0uL, body2Worlds = 0uL, jointData = 0uL, motionMatrix = 0uL;
+    uint64_t zA = 0uL, inertias = 0uL, motionVel = 0uL, motionAcc = 0uL;
+    Ptr<uint> parents;
+    const float3 tGravity = -gravity;
+    if (live)
+    {
+        const uint artiIndex = (Ptr<uint>(gGf.gpuIndices))[jobIndex];
+        record = gGf.articulations + uint64_t(artiIndex) * PXG_ARTI_STRIDE;
+        linkCount = artiU16Field(record, PXG_ARTI_DATA_NUM_LINKS);
+        dofCount = artiU16Field(record, PXG_ARTI_DATA_NUM_JOINT_DOFS);
+        fixBase = (artiU8Field(record, PXG_ARTI_DATA_FLAGS) & 1u) != 0u;
+        rootDof = (rootMotion && !fixBase) ? 6u : 0u;   // trap 2
+        const uint bufferDof = rootMotion ? 6u : 0u;
+        gcf = gGf.data + uint64_t(jobIndex) * (gGf.maxDofs + bufferDof) * 4u;
+        branchA = rootMotion || fixBase;
+
+        linkProps = artiPtrField(record, PXG_ARTI_LINK_PROPS);
+        body2Worlds = artiPtrField(record, PXG_ARTI_LINK_BODY2WORLDS);
+        jointData = artiPtrField(record, PXG_ARTI_JOINT_DATA);
+        motionMatrix = artiPtrField(record, PXG_ARTI_MOTION_MATRIX);
+        parents = Ptr<uint>(artiPtrField(record, PXG_ARTI_PARENTS));
+        zA = artiPtrField(record, PXG_ARTI_ZA_FORCES);
+        inertias = artiPtrField(record, PXG_ARTI_WORLD_SPATIAL_ARTICULATED_INERTIA);
+        motionVel = artiPtrField(record, PXG_ARTI_MOTION_VELOCITIES);
+        motionAcc = artiPtrField(record, PXG_ARTI_MOTION_ACCELERATIONS);
+    }
+
+    // ---- segment 0 ----
+    if (live && branchA)
+    {
+        for (uint link = threadIndex; link < linkCount; link += ID_WARP)
+        {
+            const float invM = (Ptr<float>(linkProps + uint64_t(link) * 16u))[3];
+            const float mass = invM == 0.0f ? 0.0f : (1.0f / invM);   // trap 3
+            idStoreSV(zA + uint64_t(link) * 24u,
+                      asmSVec(tGravity * mass, float3(0.0f, 0.0f, 0.0f)));
+        }
+    }
+    else if (live)
+    {
+        for (uint link = threadIndex; link < linkCount; link += ID_WARP)
+        {
+            Ptr<float> pp = Ptr<float>(linkProps + uint64_t(link) * 16u);
+            const float mass = pp[3] == 0.0f ? 0.0f : (1.0f / pp[3]);
+            const float3 localInertia = float3(pp[0] == 0.0f ? 0.0f : (1.0f / pp[0]),
+                                               pp[1] == 0.0f ? 0.0f : (1.0f / pp[1]),
+                                               pp[2] == 0.0f ? 0.0f : (1.0f / pp[2]));
+            Ptr<float> bw = Ptr<float>(body2Worlds + uint64_t(link) * PXG_ARTI_TRANSFORM_SIZE);
+            AbMat33 topRight = abMat33Zero();
+            topRight.c0.x = mass; topRight.c1.y = mass; topRight.c2.z = mass;
+            const AbMat33 bottomLeft = asiTransformInertiaTensor(
+                localInertia, asiMat33FromQuat(float4(bw[0], bw[1], bw[2], bw[3])));
+            idStoreSM(inertias + uint64_t(link) * PXG_ARTI_DY_SPATIAL_MATRIX_AOS_STRIDE,
+                      asmMatrix(abMat33Zero(), topRight, bottomLeft));
+        }
+    }
+    AllMemoryBarrierWithGroupSync();   // slot 1
+
+    // ---- segment 1 ----
+    if (live && branchA)
+    {
+        for (uint link = linkCount - 1u; link > 0u; --link)
+        {
+            Ptr<float> bw = Ptr<float>(body2Worlds + uint64_t(link) * PXG_ARTI_TRANSFORM_SIZE);
+            const uint parentLink = parents[link];
+            Ptr<float> pbw =
+                Ptr<float>(body2Worlds + uint64_t(parentLink) * PXG_ARTI_TRANSFORM_SIZE);
+
+            if (threadIndex == 0u)
+            {
+                const float3 rw = float3(bw[4] - pbw[4], bw[5] - pbw[5], bw[6] - pbw[6]);
+                idStoreSV(zA + uint64_t(parentLink) * 24u,
+                          asmSVecAdd(idLoadSV(zA + uint64_t(parentLink) * 24u),
+                                     adTranslateSpatialVector(rw,
+                                                              idLoadSV(zA + uint64_t(link) * 24u))));
+            }
+            const uint jo =
+                (Ptr<uint>(jointData + uint64_t(link) * PXG_ARTI_JOINT_CORE_DATA_SIZE))[0];
+            const uint nbDof =
+                (Ptr<uint>(jointData + uint64_t(link) * PXG_ARTI_JOINT_CORE_DATA_SIZE))[1] & 0xFFu;
+            if (threadIndex < nbDof)
+                (Ptr<float>(gcf))[jo + threadIndex + rootDof] = float(link);   // trap 1
+        }
+    }
+    else if (live)
+    {
+        if (threadIndex == 0u)
+        {
+            for (uint link = linkCount - 1u; link > 0u; --link)
+            {
+                Ptr<float> bw = Ptr<float>(body2Worlds + uint64_t(link) * PXG_ARTI_TRANSFORM_SIZE);
+                const uint parentLink = parents[link];
+                Ptr<float> pbw =
+                    Ptr<float>(body2Worlds + uint64_t(parentLink) * PXG_ARTI_TRANSFORM_SIZE);
+                const float3 rw = float3(bw[4] - pbw[4], bw[5] - pbw[5], bw[6] - pbw[6]);
+                AbSpatialMatrix parentSpace =
+                    idLoadSM(inertias + uint64_t(link) * PXG_ARTI_DY_SPATIAL_MATRIX_AOS_STRIDE);
+                asmTranslateInertia(asmSkewSymmetric(float4(rw, 0.0f)), parentSpace);
+                const uint64_t pAddr =
+                    inertias + uint64_t(parentLink) * PXG_ARTI_DY_SPATIAL_MATRIX_AOS_STRIDE;
+                idStoreSM(pAddr, asmAdd(idLoadSM(pAddr), parentSpace));
+            }
+        }
+    }
+    AllMemoryBarrierWithGroupSync();   // slot 2
+
+    // ---- segment 2: branch B only -- root-velocity propagation (trap 4) ----
+    if (live && !branchA && threadIndex == 0u)
+    {
+        for (uint link = 1u; link < linkCount; ++link)
+        {
+            Ptr<float> bw = Ptr<float>(body2Worlds + uint64_t(link) * PXG_ARTI_TRANSFORM_SIZE);
+            const uint parentLink = parents[link];
+            Ptr<float> pbw =
+                Ptr<float>(body2Worlds + uint64_t(parentLink) * PXG_ARTI_TRANSFORM_SIZE);
+            const float3 rw = float3(pbw[4] - bw[4], pbw[5] - bw[5], pbw[6] - bw[6]);
+            idStoreSV(motionVel + uint64_t(link) * 24u,
+                      adTranslateSpatialVector(rw,
+                                               idLoadSV(motionVel + uint64_t(parentLink) * 24u)));
+        }
+    }
+    AllMemoryBarrierWithGroupSync();   // slot 3
+
+    // ---- segment 3: branch B only -- zA init ----
+    if (live && !branchA)
+    {
+        for (uint link = threadIndex; link < linkCount; link += ID_WARP)
+        {
+            const float invM = (Ptr<float>(linkProps + uint64_t(link) * 16u))[3];
+            const float mass = invM == 0.0f ? 0.0f : (1.0f / invM);
+            const AbMat33 I =
+                idLoadM33(inertias + uint64_t(link) * PXG_ARTI_DY_SPATIAL_MATRIX_AOS_STRIDE + 72u);
+            const float3 vA = idLoadSV(motionVel + uint64_t(link) * 24u).top;
+            // the engine's own sign inconsistency vs branch A -- transcribed
+            const float3 Iv = I.c0 * vA.x + I.c1 * vA.y + I.c2 * vA.z;
+            idStoreSV(zA + uint64_t(link) * 24u,
+                      asmSVec(-tGravity * mass, cross(vA, Iv)));
+        }
+    }
+    AllMemoryBarrierWithGroupSync();   // slot 4
+
+    // ---- segment 4: branch B only -- leaf-to-root zA accumulation ----
+    if (live && !branchA && threadIndex == 0u)
+    {
+        for (uint link = linkCount - 1u; link > 0u; --link)
+        {
+            Ptr<float> bw = Ptr<float>(body2Worlds + uint64_t(link) * PXG_ARTI_TRANSFORM_SIZE);
+            const uint parentLink = parents[link];
+            Ptr<float> pbw =
+                Ptr<float>(body2Worlds + uint64_t(parentLink) * PXG_ARTI_TRANSFORM_SIZE);
+            const float3 rw = float3(bw[4] - pbw[4], bw[5] - pbw[5], bw[6] - pbw[6]);
+            idStoreSV(zA + uint64_t(parentLink) * 24u,
+                      asmSVecAdd(idLoadSV(zA + uint64_t(parentLink) * 24u),
+                                 adTranslateSpatialVector(rw, idLoadSV(zA + uint64_t(link) * 24u))));
+        }
+    }
+    AllMemoryBarrierWithGroupSync();   // slot 5
+
+    // ---- segment 5 ----
+    if (live && branchA)
+    {
+        for (uint dof = threadIndex; dof < dofCount; dof += ID_WARP)
+        {
+            const uint link = uint((Ptr<float>(gcf))[dof + rootDof]);   // trap 1
+            const uint jo =
+                (Ptr<uint>(jointData + uint64_t(link) * PXG_ARTI_JOINT_CORE_DATA_SIZE))[0];
+            Ptr<float> bw = Ptr<float>(body2Worlds + uint64_t(link) * PXG_ARTI_TRANSFORM_SIZE);
+            const float4 q = float4(bw[0], bw[1], bw[2], bw[3]);
+            Ptr<float> mm = Ptr<float>(motionMatrix + uint64_t(link) * PXG_ARTI_SUBSPACE_STRIDE
+                                       + uint64_t(dof - jo) * PXG_ARTI_SPATIAL_VECTOR_SIZE);
+            // trap 6: BOTH halves rotated, then the dual product
+            const AbSpatialVector dofMotion =
+                asmSVec(quatRotate(q, float3(mm[0], mm[1], mm[2])),
+                        quatRotate(q, float3(mm[3], mm[4], mm[5])));
+            (Ptr<float>(gcf))[dof + rootDof] =
+                asmInnerProduct(dofMotion, idLoadSV(zA + uint64_t(link) * 24u));
+        }
+        if (threadIndex == 0u && rootDof == 6u)
+        {
+            const AbSpatialVector z0 = idLoadSV(zA);
+            Ptr<float> o = Ptr<float>(gcf);
+            o[0] = z0.top.x; o[1] = z0.top.y; o[2] = z0.top.z;
+            o[3] = z0.bottom.x; o[4] = z0.bottom.y; o[5] = z0.bottom.z;
+        }
+    }
+    else if (live)
+    {
+        if (threadIndex == 0u)
+        {
+            const AbSpatialMatrix invInertia = asmInvertInertia(idLoadSM(inertias));
+            const AbSpatialVector a0 = asmMulVec(invInertia, idLoadSV(zA));
+            idStoreSV(motionAcc, asmSVec(-a0.top, -a0.bottom));   // trap 5
+        }
+        for (uint link = 1u; link < linkCount; ++link)
+        {
+            Ptr<float> bw = Ptr<float>(body2Worlds + uint64_t(link) * PXG_ARTI_TRANSFORM_SIZE);
+            const uint parentLink = parents[link];
+            Ptr<float> pbw =
+                Ptr<float>(body2Worlds + uint64_t(parentLink) * PXG_ARTI_TRANSFORM_SIZE);
+            if (threadIndex == 0u)
+            {
+                const float3 rw = float3(pbw[4] - bw[4], pbw[5] - bw[5], pbw[6] - bw[6]);
+                const AbSpatialVector acc = adTranslateSpatialVector(
+                    rw, idLoadSV(motionAcc + uint64_t(parentLink) * 24u));
+                idStoreSV(motionAcc + uint64_t(link) * 24u, acc);
+                const AbSpatialMatrix I =
+                    idLoadSM(inertias + uint64_t(link) * PXG_ARTI_DY_SPATIAL_MATRIX_AOS_STRIDE);
+                idStoreSV(zA + uint64_t(link) * 24u,
+                          asmSVecAdd(asmMulVec(I, acc), idLoadSV(zA + uint64_t(link) * 24u)));
+            }
+            const uint jo =
+                (Ptr<uint>(jointData + uint64_t(link) * PXG_ARTI_JOINT_CORE_DATA_SIZE))[0];
+            const uint nbDof =
+                (Ptr<uint>(jointData + uint64_t(link) * PXG_ARTI_JOINT_CORE_DATA_SIZE))[1] & 0xFFu;
+            if (threadIndex < nbDof)
+                (Ptr<float>(gcf))[jo + threadIndex] = float(link);
+        }
+    }
+    AllMemoryBarrierWithGroupSync();   // slot 6
+
+    // ---- segment 6: branch B only -- the per-dof projection ----
+    if (live && !branchA)
+    {
+        for (uint dof = threadIndex; dof < dofCount; dof += ID_WARP)
+        {
+            const uint link = uint((Ptr<float>(gcf))[dof]);
+            const uint jo =
+                (Ptr<uint>(jointData + uint64_t(link) * PXG_ARTI_JOINT_CORE_DATA_SIZE))[0];
+            Ptr<float> bw = Ptr<float>(body2Worlds + uint64_t(link) * PXG_ARTI_TRANSFORM_SIZE);
+            const float4 q = float4(bw[0], bw[1], bw[2], bw[3]);
+            Ptr<float> mm = Ptr<float>(motionMatrix + uint64_t(link) * PXG_ARTI_SUBSPACE_STRIDE
+                                       + uint64_t(dof - jo) * PXG_ARTI_SPATIAL_VECTOR_SIZE);
+            const AbSpatialVector dofMotion =
+                asmSVec(quatRotate(q, float3(mm[0], mm[1], mm[2])),
+                        quatRotate(q, float3(mm[3], mm[4], mm[5])));
+            (Ptr<float>(gcf))[dof] =
+                asmInnerProduct(dofMotion, idLoadSV(zA + uint64_t(link) * 24u));
+        }
+    }
+    AllMemoryBarrierWithGroupSync();   // trailing
 }

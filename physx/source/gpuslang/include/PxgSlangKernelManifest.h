@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 299;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 300;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -334,7 +334,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "compressContactStage2", "npCompressContacts2.spv", "compressContactStage2" },  // COMPRESS_CONTACT_STAGE_2
     { "computeArtiDenseJacobians", "npArtiInverseDyn.spv", "computeArtiDenseJacobians" },  // COMPUTE_ARTI_DENSE_JACOBIANS (unmapped)
     { "computeArtiMassMatrices", nullptr, nullptr },  // COMPUTE_ARTI_MASS_MATRICES (unmapped)
-    { "computeArtiGravityForces", nullptr, nullptr },  // COMPUTE_ARTI_GRAVITY_FORCES (unmapped)
+    { "computeArtiGravityForces", "npArtiInverseDyn.spv", "computeArtiGravityForces" },  // COMPUTE_ARTI_GRAVITY_FORCES (unmapped)
     { "computeArtiCentrifugalForces", nullptr, nullptr },  // COMPUTE_ARTI_CENTRIFUGAL_FORCES (unmapped)
     { "computeArtiCOM", "npArtiInverseDyn.spv", "computeArtiCOM" },  // COMPUTE_ARTI_COM (unmapped)
     { "computeArtiCentroidalMomentumMatrices", "npArtiInverseDyn.spv", "computeArtiCentroidalMomentumMatrices" },  // COMPUTE_ARTI_CENTROIDAL_MATRICES (unmapped)
