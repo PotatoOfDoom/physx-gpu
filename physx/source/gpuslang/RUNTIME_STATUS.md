@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **781/781** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **782/782** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,112 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.1b — ps_calculateDensityAndPotentialLaunch, die SPH-Dichte (Manifest 326) — der erste reproduzierte Upstream-Bug
+
+Der erste der beiden Density-Kernel.  CUDA-Quelle ist das `__device__`-**Template**
+`calculateDensityAndPotential` (particlesystem.cu:3222-3384); der `extern "C"`-Kernel
+bei :3386-3395 ist ein sechszeiliger Dispatcher, der es zweimal über den bool
+instanziiert.
+
+**Template → Laufzeit-Bool.**  Der bool ist nur deshalb ein Template-Parameter,
+damit `hasDiffuseParticles` zur Übersetzungszeit faltet; er beeinflusst weder ABI
+noch Signatur.  Der Port benutzt **einen** Entry-Point mit einem Laufzeit-Bool aus
+dem Push-Blob — so passt der Manifest-Eintragsname zum Kernelnamen, und es gibt
+**einen** Rumpf zu sweepen statt zwei.  ABI-Zeile ist die bestehende
+`kTwoPtrBool {8,8,1}`; Grid `(ceil(getMaxParticles()/256), nbActive, 1)`,
+Block `(256,1,1)`, `mStream`.
+
+**Staging gestrichen** (bandbreitenbedingt, wie bei particleSim /
+particleSelfCollisionBda), und schleifeninvariante Skalare (`mSpiky1`, `mSpiky2`,
+der Kontaktdistanz-Kehrwert) sind aus der Nachbarschleife herausgezogen: in der
+CUDA sind das kostenlose `__shared__`-Lesezugriffe, hier wären es wiederholte
+globale Loads, und der Wert ändert sich nicht.
+
+**Zwölf Fallen, jede mit Mutanten** (T1–T12 im Modulkopf).  Die drei
+interessantesten: `d` ist **`1.f/rsqrtf(dSq)`, nicht `sqrtf(dSq)`** — ein doppelter
+Kehrwert ist auf Floats nicht die Identität, also muss der Host-Mirror ihn genauso
+buchstabieren; bei `dSq == 0` ergibt das `rd = inf`, `d = 0`, und weil `W(0) =
+spiky1` ist, geht ein **deckungsgleiches** Paar sehr wohl in `rho` ein (es gibt
+hier, anders als in den Geschwisterkerneln, keinen `dSq > 0`-Guard), während die
+`d > 0`-Hälfte des Gradienten-Guards es aus der Normalen heraushält.  Der
+Distanz-Guard ist **strikt `<`**, wo Vorticity und SolveVelocity `<=` benutzen.
+Und die `mat`-Bindung bei :3268 ist **tot** — nichts in der ganzen Funktion liest
+sie (die einzigen Materialzugriffe sind drei Mal
+`derivedMaterial.surfaceTensionDerived`); der Port lässt sowohl das
+`getParticleMaterial`-Deref als auch das `phaseToMat[group]` weg, das es speist.
+`group` überlebt, weil das **Derived**-Array danach indiziert wird.
+
+### Upstream-Kandidat 13 wird REPRODUZIERT, nicht repariert
+
+Dies ist die erste Tranche, in der ein bestätigter Engine-Bug bewusst
+nachgebildet wird, und die Fixture beweist das strukturell statt nur numerisch.
+
+particlesystem.cu:3296-3304 setzt `offset += numParticles` **zwischen** das Laden
+der Position und das Laden der Geschwindigkeit des ersten Nachbarn, sodass der
+Vorspann `pos[idx[0]]` mit `vel[idx[1]]` paart.  Geschlossene Form:
+
+```
+Position bei Iteration i : idx[i]           (überall korrekt)
+Geschwindigkeit bei i    : idx[max(i, 1)]   (falsch nur bei i == 0)
+```
+
+`vel[idx[0]]` wird also nie gelesen und `vel[idx[1]]` zweimal.  Betroffen ist
+ausschließlich `div` → `potentials[p].x`; `rho`, `weight`, `densities[p]` und die
+Oberflächennormale konsumieren nur Positionen und sind sauber.
+
+**Die Fixture behauptet das nicht nur, sie prüft es von beiden Seiten.**  Sie
+berechnet die Erwartung ein zweites Mal mit dem **korrigierten** Index und
+verlangt (a) dass sich die beiden Fassungen überhaupt unterscheiden — sonst wäre
+die Fixture blind für den Bug — und (b) dass **kein einziges** Ausgabewort der GPU
+mit der korrigierten Fassung übereinstimmt, wo sich die beiden unterscheiden.  Ein
+Port, der den Bug stillschweigend repariert hätte, fällt damit durch.  Der
+Sweep-Mutant `cd-velocity-index-FIXED` ist genau dieser Fall und wird getötet.
+
+**Eine bewusste Sicherheitsabweichung, die einzige Stelle, an der der Port der
+CUDA nicht folgt.**  Bei `contactCount == 1` und aktiven Diffuse-Partikeln hat
+`ps_selfCollisionLaunch` Slot 1 für dieses Partikel nie beschrieben; er enthält
+einen abgestandenen oder uninitialisierten `PxU32`, und
+`sortedNewVelocities[dieserWert]` ist ein **ungebundener** Device-Zugriff.  Nach der
+P8.96c-Klemmregel faultet ein ungebundener BDA-Load auf llvmpipe, also klemmt der
+Port den resultierenden **Partikelindex** auf `< numParticles`.  Für jeden echten
+Kontakt ist die Klemme ein No-op, sie ändert also nur den Fall, in dem der Zugriff
+der CUDA selbst undefiniert ist.
+
+**Sweep 37/37 getötet** — nach einer Fixture-Korrektur, wieder eine Identität:
+`cd-numparticles-guard-dropped` (die `p < numParticles`-Schranke durch die
+Grid-Ausdehnung ersetzt) überlebte, weil es **jenseits** von `numParticles` nichts
+zu beobachten gab.  Jetzt ist jedes Per-Partikel-Array `PAD = 544` Einträge lang,
+während der Deskriptor nur `numParticles` meldet, und der Schwanz muss vergiftet
+zurückkommen; die aufgefüllten Partikel sind **fluid mit null Kontakten**, sodass
+so ein Mutant deterministisch in den Schwanz schreibt (fluid ⇒ kein Early-out;
+null Kontakte ⇒ er läuft keine Nachbarliste ab, die nur für die echten Partikel
+dimensioniert ist).  `PAD > GRID_X * BLOCK` steht als Assertion in der Fixture.
+
+Das ist die dritte Identität in zwei Tranchen.  Die Regel dahinter, jetzt scharf
+formuliert: **eine Schranke ist nur dann getestet, wenn es auf der falschen Seite
+von ihr etwas Vergiftetes zu treffen gibt.**
+
+**Fixture-Geometrie:** vier Systeme im Pool, **drei** aktiv, Aktivliste `{2,0,3}`
+(keine Permutation — die P9.1a-Lektion); A mit 500 Partikeln,
+`mRestDensityBoundary > 0` und Diffuse-Partikeln; ein **Köder** auf Poolindex 1,
+der vollständig vergiftet bleiben muss; B mit 130 Partikeln, Boundary 0 und ohne
+Diffuse; und C mit gesetztem `eDISABLE_SELF_COLLISION`, **aktiv und voll
+bestückt**, damit ein Mutant, der den Per-System-Early-out streicht, echte Werte
+in C schreibt und stirbt.  Zwei Runden über `shouldComputePotentials`.
+Acht benannte Per-Partikel-Fälle in A (null Kontakte, genau ein Kontakt, ein
+deckungsgleicher Nachbar, ein Nachbar auf **exakt** der Kontaktdistanz, nicht-fluid,
+eine Gruppe ohne Oberflächenspannung, `invMass == 0`, und keiner in Reichweite).
+
+**Suite 704/704 in beiden Speichermodi**, `ctest` **782**.  Manifest **325 → 326**.
+**Szene:** Refused **176 → 175** mit `ps_calculateDensityAndPotentialLaunch` als
+dem einen, der geht; **600** Launches OK (120 Frames × 5 Positionsiterationen).
+Die Partikelszene bleibt bitidentisch — die Szenenpartikel tragen nur
+`eParticlePhaseSelfCollide`, also greift der Fluid-Early-out für jedes Partikel und
+der Kernel schreibt nichts.  Das ist der erwartete Befund und zugleich der Grund,
+warum diese Tranche keine Szenen-Neujustierung braucht: **`ps_solveDensityLaunch`
+ist der Kernel, der die Szene bewegen wird**, denn sein Else-Zweig ist der
+Festkörper-Partikel-Kollisionssolve und läuft auch ohne Fluid-Phase.
 
 ## P9.1a — ps_updateMaterials, die abgeleiteten Materialkoeffizienten (Manifest 325) — PHASE 2 BEGINNT
 

@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 325;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 326;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -238,7 +238,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_accumulateDeltaVParticleLaunch", "psContactSolveBda.spv", "ps_accumulateDeltaVParticleLaunch" },  // PS_ACCUMULATE_DELTAVEL_PARTICLE (P6.4b-2 BDA port: reduce per-contact deltaV over each particle's [start,end) range)
     { "ps_updateParticleLaunch", "particleSelfCollisionBda.spv", "ps_updateParticleLaunch" },  // PS_UPDATE_PARTICLE (P6.3 BDA port: apply accumDeltaP + recompute sorted velocity)
     { "ps_integrateLaunch", "particleSim.spv", "ps_integrateLaunch" },  // PS_INTEGRATION (P6.0 BDA port)
-    { "ps_calculateDensityAndPotentialLaunch", nullptr, nullptr },  // PS_CALCULATE_DENSITIES_AND_POTENTIALS (unmapped)
+    { "ps_calculateDensityAndPotentialLaunch", "npPsFluidDensity.spv", "ps_calculateDensityAndPotentialLaunch" },  // PS_CALCULATE_DENSITIES_AND_POTENTIALS
     { "ps_solveDensityLaunch", nullptr, nullptr },  // PS_SOLVE_DENSITIES (unmapped)
     { "ps_applyDeltaLaunch", "particleSelfCollisionBda.spv", "ps_applyDeltaLaunch" },  // PS_APPLY_DELTAS (P6.3 BDA port: SOR-average mDelta -> accumDeltaP)
     { "ps_vorticityConfinementLaunch", nullptr, nullptr },  // PS_VORTICITY_CONFINEMENT (unmapped)
