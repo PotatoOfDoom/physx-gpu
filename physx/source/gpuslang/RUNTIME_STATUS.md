@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **785/785** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **786/786** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,163 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.3b — `ps_solveSpringsLaunch`: der XPBD-Federlöser, Partition für Partition (Manifest 332)
+
+Der dritte Kernel der Cloth-Federkette und der erste mit **echter Numerik**: das
+Gather-Paar aus P9.3a bewegt nur `float4`s, dieser hier löst die XPBD-Feder.
+Gelesen wurde `particlesystem.cu:4137-4309` vollständig, portiert als dritter
+Entry-Point von `npPsSprings.slang` (weiter in `PXG_NOCONTRACT_SHADERS`).
+
+**Launch** (`PxgPBDParticleSystemCore.cpp:994-1014`): der Host schleift
+`partitionId` über `[0, maxPartitions)` und dispatcht den Kernel **je Partition
+einmal** — so bekommt ein Jacobi-Kernel Gauß-Seidel-Konvergenz ohne
+Schreibkonflikte, denn innerhalb einer Partition berührt jede Feder ein
+disjunktes Endpunktpaar.  Grid
+`(ceil(maxSpringsPerPartition / ACCUMULATE_DELTA), maxClothBuffers, nbActive)`,
+Block **512** — eine **andere** Blockdimension als das Gather-Paar darüber, das
+mit UPDATEBOUND = 1024 läuft.  Args
+`(particleSystems*, activeParticleSystems*, PxReal invDt, PxU32 partitionId,
+bool isTGS)` → neue ABI-Zeile `{8,8,4,4,1}` = 25 Bytes, auf die 8-Ausrichtung
+gerundet → 32-Byte-Blob, Bool-Byte auf 24.
+
+**Dreizehn Fallen, jede mit einem Mutanten:**
+
+* **S1 — eine NEGATIVE Steifigkeit ist ein einseitiger Tether.**  Buchstabiert
+  als `e = PxMin(e, 0); k *= -1` — das Vorzeichen wird *konsumiert*, nicht bloß
+  geprüft.  Ein Port, der nur den Betrag nimmt, verliert das Tether-Verhalten
+  ganz.  Beide Hälften brauchen ihren eigenen Fall: bei einer **gestauchten**
+  Feder tötet die Klammer die ganze Korrektur (`errorBias` wird 0 und die
+  Zuweisung nullt `dlambda`), bei einer **gedehnten** ist die Klammer wirkungslos
+  und erst das `k *= -1` entscheidet über das Vorzeichen.  Mit nur einem der
+  beiden Fälle überlebt jeweils der andere Mutant.
+* **S2 — `dt` wird als `1.f / invDt` ZURÜCKGERECHNET.**  Der Host hat `dt` und
+  übergibt den Kehrwert; der Kernel invertiert ihn wieder.  Der Kehrwert eines
+  Kehrwerts ist auf Floats nicht die Identität.
+* **S3 — `a = dt * b + d` mit `b = dt * k`**, also `dt² · Steifigkeit` plus
+  `dt · Dämpfung`: der Nachgiebigkeitsterm ist **quadratisch** in `dt`, der
+  Dämpfungsterm linear.
+* **S4 — `velBias` trägt ein führendes Minus**, `-x * a * dcdt`.
+* **S5 — der PGS-Pfad liest UND schreibt `mSpringLambda` mit einem
+  `iMul`-Warmstart, der TGS-Pfad tut beides nicht.**  Das ist von außen nur als
+  *Unterschied zwischen beiden Läufen* sichtbar, also läuft die Fixture zwei
+  volle Runden über dieselbe Geometrie, und das Lambda-Array wird mit
+  **verschiedenen Nicht-Null-Werten** vorbelegt (nicht mit den Nullen, die
+  `ps_initializeSpringsLaunch` hinterlassen würde), damit der Warmstart-Lesezugriff
+  überhaupt beobachtbar ist.  In der TGS-Runde muss jeder dieser Werte exakt so
+  zurückkommen, wie er hochgeladen wurde — verglichen gegen das **Upload-Bild**,
+  nicht gegen den Spiegel, damit ein Spiegel, der ebenfalls schriebe, den
+  Unterschied nicht verdecken kann.
+* **S6 — der Betragsbegrenzer ist eine ZUWEISUNG, keine symmetrische Klammer.**
+  Übersteigt `|dlambda|` den Wert `|errorBias|`, wird `dlambda` zu `errorBias` —
+  mitsamt dessen **Vorzeichen**, was `dlambda` umdrehen kann.
+  `PxClamp(dlambda, -|errorBias|, |errorBias|)` ist eine andere Funktion, und die
+  Fixture enthält genau dafür eine Feder, bei der `dlambda = -0.068` auf
+  `errorBias = +0.05` trifft: die Zuweisung **kehrt die Korrektur um**, die
+  Klammer nicht.
+* **S7 — die beiden Endpunkte bewegen sich GEGENLÄUFIG** (`newPos0 +=`,
+  `newPos1 -=`), jeder gewichtet mit **seiner eigenen** inversen Masse — nicht mit
+  `wsum`.  Eine Feder mit genau einem fixierten Endpunkt macht das sichtbar.
+* **S8** — die Geschwindigkeitskorrektur ist die Positionskorrektur mal `invDt`.
+* **S9 — die Stores gehen an `writeIndices[...] = mRemapOutput`, nicht an
+  `workIndex`**, und sie passieren **auch dann**, wenn jeder Early-Out gefeuert
+  hat: die unveränderten Werte werden zurückgeschrieben.
+* **S10** — `remapPoses` behält die inverse Masse in `.w`, `remapVels` schreibt
+  dort eine literale 0.
+* **S11** — `xij / l` ist `PxVec3::operator/`, also **Kehrwert mal**, nicht
+  komponentenweise Division.  Der Mutant `xij / l` in Slang-Schreibweise (dort
+  *ist* das eine komponentenweise Division) stirbt.
+* **S12** — die Degenerationsschranke ist `dSq > 1e-8f`, eine **andere**
+  Konstante als das `1e-10f` von `ps_solveDensityLaunch`.  Die Fixture setzt je
+  ein Paar knapp darunter (`dSq ≈ 5e-9`) und knapp darüber (`dSq ≈ 4e-8`), sodass
+  sowohl ein zu kleiner als auch ein zu großer Wert stirbt.
+* **S13** — der Bereich einer Partition ist
+  `[partitions[partitionId-1] oder 0, partitions[partitionId])`, eine
+  **exklusive** Präfixsumme, und `workIndex = startInd + gti`.
+
+**Fixture (`tests/testPsSolveSprings.cpp`) — die Sequenz ist der Test.**  Sie
+spielt genau nach, was die Engine tut: ein Dispatch je `partitionId` mit Flush
+dazwischen, über dieselben Puffer, und der Spiegel läuft die Partitionen in
+derselben Reihenfolge.  Der `mRemapOutput` eines Cloth-Puffers **verkettet**
+absichtlich — der Scatter von Partition 0 landet auf den Leseplätzen von
+Partition 1 —, sodass die Reihenfolge tragend ist und ein Mutant, der die
+Partitionen verschmilzt oder umordnet, stirbt.  Der Vier-System-Pool mit
+Köder auf Index 1 und der nicht-permutierenden Aktivliste `{2, 0, 3}` steht wie
+gehabt; das Cloth-Array jedes Systems ist auf das Maximum aufgefüllt, mit echten
+Records und eigenen vergifteten Ausgaben.
+
+**Das Gift liegt auf BEIDEN Seiten jedes Index**, und diesmal ist das nicht
+Kosmetik, sondern der Grund, warum drei Guard-Mutanten überhaupt sterben können:
+
+* `mAccumulatedSpringsPerPartitions` wird dem Kernel als **versetzter Zeiger**
+  übergeben, mit vier Vorlauf-Einträgen — ein Mutant, der die Basis verschiebt,
+  liest damit einen lebendigen, falschen Startindex statt zu faulten.
+* Die vier Nachlauf-Einträge **wachsen** über `nbSprings` hinaus.  Mit einem
+  flachen Nachlauf ist jeder Bereich hinter dem Ende leer, und ein gestrichener
+  `partitionId < nbPartitions`-Guard wäre eine Identität; mit dem wachsenden
+  Nachlauf findet er Arbeit und stirbt.  Das Federn-Array trägt vier
+  Reserve-Records und die Remap-Arrays `4N+8` Plätze, genau damit dieser
+  Extrabereich in jeder Allokation bleibt.
+* Ein Record meldet `mNumSprings == 0`, hat aber **echte Unterlage für drei
+  Federn** und eine Partitionstabelle, die drei behauptet — sonst würde die
+  `nbSprings > 0`-Schranke von einem leeren Array *zufällig* mitgetestet.
+
+Weil jedes Scatter-Ziel von jedem Leseplatz derselben Partition disjunkt ist —
+in der Fixture **pro Record und pro Partition assertiert**, nicht angenommen —
+hat der Dispatch kein Lese/Schreib-Rennen und der Spiegel darf die Lesezugriffe
+schnappschussen.  Elf Deckungszähler (Tether geklammert / aktiv, `wsum == 0`,
+degeneriert, knapp über/unter der Schranke, `errorBias` getroffen / **umgedreht**,
+genau ein fixierter Endpunkt, Dämpfung null) sind als Assertions ausgeführt: jeder
+Zweig ist **gezählt**, nicht vermutet.
+
+**Beide Runden waren im ersten Lauf bitgenau.**  Es gab nichts zu debuggen — die
+Regeln aus P9.1a–d (reziproke `PxVec3`-Division, `PxMin` als Ternär, `-ffp-contract=off`
+auf beiden Seiten) reichten aus.
+
+**Sweep 69 Mutanten, 68 getötet, 1 Überlebender — bewiesen äquivalent:**
+
+* **Der Überlebende:** `(gSs.isTGSWord & 0xFFu) != 0u` → `gSs.isTGSWord != 0u`.
+  Der Marshaller in `PxgVulkanCudaContext.cpp:418-425` baut den Blob mit
+  `std::vector<uint8_t>::resize`, das neue Elemente **wertinitialisiert**; die
+  Ausrichtungs- und Endauffüllung ist also konstruktionsbedingt null, und das Wort
+  bei 24 ist das Bool-Byte nullerweitert.  Die Maske ist defensiv, nicht
+  semantisch.  Das ist ein Beweis aus dem Bridge-Kontrakt, keine Ausrede.
+* **Eine Fixture-Schwäche, gefunden und behoben statt entschuldigt:**
+  `ss-grid-y-z-swapped` überlebte zuerst.  Mit drei Cloth-Puffer-Plätzen und drei
+  aktiven Systemen war das Grid **quadratisch**, ein Tausch von `gridDim.Y` und
+  `gridDim.Z` überdeckte also exakt dieselbe Menge von (System, Puffer)-Paaren —
+  eine echte Äquivalenz der *Fixture*, nicht des Kernels.  Der Köder trägt jetzt
+  **vier** Cloth-Puffer (Y = 4) gegen drei aktive Systeme (Z = 3), und die
+  Aktivliste ist acht Einträge tief allokiert, damit der getauschte Mutant einen
+  lebendigen Köder-Index liest statt aus der Allokation zu laufen.  Danach tot.
+* Getötet wurden unter anderem: beide Tether-Hälften einzeln, `dt` durchgereicht,
+  `a` linear statt quadratisch, `bias`/`velBias` mit vertauschten Koeffizienten,
+  der PGS/TGS-Tausch, der weggelassene `- lambda`, die **symmetrische Klammer**
+  statt der Zuweisung, `deltaV0` mit `wsum` statt der eigenen Masse, die
+  vertauschten Massen, beide Schwellen-Verschiebungen (1e-10 und 1e-6), die
+  komponentenweise Division, der Scatter auf `workIndex`, die vertauschten
+  Scatter-Ziele, die verschobene Partitionsbasis, `endInd` eins zu weit, der
+  gestrichene `nbSprings > 0`-Guard, der gestrichene Cloth-Puffer-Guard, die
+  weggelassene Aktivliste-Indirektion, die 1024er Blockdimension und der
+  relativ statt absolut indizierte Lambda-Zugriff.
+* Eine Beobachtung nebenbei: `ss-l-from-rsqrt` (`dSq * rsqrt(dSq)` statt
+  `sqrt(dSq)`) **stirbt**.  P8.69 hatte gemessen, dass `rsqrt(x)` und `1/sqrt(x)`
+  auf llvmpipe identisch lowern; das gilt für *diesen* Ausdruck nicht, und die
+  Transkription bleibt bei `sqrt`, wie die CUDA es schreibt.
+
+**Suite 709/709 in beiden Speichermodi**, `ctest` **786**.  Binary +1 und `ctest`
++1: diese Fixture hat einen einzigen `PXG_TEST` — das Cloth-Record-Layout ist
+bereits von `psSpringsLayout` aus P9.3a gepinnt, ein zweiter Satz `offsetof`s wäre
+Rauschen gewesen.  Manifest **331 → 332**.
+
+**Szene:** Refused **170 → 169** (501 − Manifest).  Der Szenen-Durchlauf war zum
+Zeitpunkt dieses Commits noch nicht durch — 12 der 23 sind grün gemeldet (bis
+`cloth`), der Rest lief noch; das vollständige Ergebnis kommt im Folge-Commit,
+und diese Zeile wird dann durch die gemessene Zahl ersetzt statt behauptet.
+Dispatcht wird der Kernel weiterhin von keiner Szene: der Host bindet die ganze
+Federkette an `getMaxSpringsPerBuffer() > 0`, und noch legt keine Szene einen
+PBD-Cloth-Puffer an.  Das ändert sich mit P9.4, sobald `ps_averageVertsLaunch`
+dazukommt und die `particlecloth`-Szene die Kette schließt.
 
 ## P9.3a — die PBD-Cloth-ABI und das Feder-Gather-Paar (Manifest 331)
 

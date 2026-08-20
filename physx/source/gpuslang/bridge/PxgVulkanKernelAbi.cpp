@@ -337,6 +337,13 @@ static const uint8_t kPsUpdateUserBuffer[] = { 8, 8, 4 };
 //   -> three device pointers + one float = 28 bytes, rounded to the 8-alignment
 //   -> 32-byte blob.  hostPtrMask 0 (all three are plain device pointers).
 static const uint8_t kPsUpdateMaterials[] = { 8, 8, 8, 4 };
+// P9.3b:
+//   ps_solveSpringsLaunch(const PxgParticleSystem* particleSystems,
+//                         const PxU32* activeParticleSystems,
+//                         const PxReal invDt, const PxU32 partitionId, bool isTGS)
+//   -> two device pointers + PxReal (@16) + PxU32 (@20) + bool (@24) = 25 bytes,
+//   rounded to the 8-alignment -> 32-byte blob.  hostPtrMask 0.
+static const uint8_t kPsSolveSprings[] = { 8, 8, 4, 4, 1 };
 //   ps_updateUnsortedArrayLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — user-buffer -> unsorted ingest.
 //     Two device pointers -> 16-byte blob (same shape as kTwoPtr).
@@ -1429,6 +1436,10 @@ static const PxgKernelAbiRow kRows[] = {
     //   particle system on gridDim.Z and the cloth buffer on gridDim.Y.
     { "ps_initializeSpringsLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "ps_updateRemapVertsLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    // P9.3b: ps_solveSpringsLaunch(particleSystems*, activeParticleSystems*,
+    //   PxReal invDt, PxU32 partitionId, bool isTGS) -> 25 bytes, rounded to the
+    //   8-alignment -> a 32-byte blob.  The bool byte sits at 24.
+    { "ps_solveSpringsLaunch", kPsSolveSprings, uint32_t(sizeof(kPsSolveSprings)) },
     // gpusimulationcontroller FEMCloth kernels (P7.0 FEMCloth free-fall BDA)
     { "cloth_preIntegrateLaunch", kClothPreIntegrate, uint32_t(sizeof(kClothPreIntegrate)) },
     { "cloth_finalizeVelocitiesLaunch", kClothFinalizeVel, uint32_t(sizeof(kClothFinalizeVel)) },

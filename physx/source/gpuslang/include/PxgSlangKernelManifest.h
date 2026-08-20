@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 331;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 332;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -244,7 +244,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_vorticityConfinementLaunch", "npPsFluidVelocity.spv", "ps_vorticityConfinementLaunch" },  // PS_VORTICITY_CONFINEMENT
     { "ps_solveVelocityLaunch", "npPsFluidVelocity.spv", "ps_solveVelocityLaunch" },  // PS_SOLVE_VELOCITIES
     { "ps_updateRemapVertsLaunch", "npPsSprings.spv", "ps_updateRemapVertsLaunch" },  // PS_UPDATE_REMAP_VERTS
-    { "ps_solveSpringsLaunch", nullptr, nullptr },  // PS_SOLVE_SPRINGS (unmapped)
+    { "ps_solveSpringsLaunch", "npPsSprings.spv", "ps_solveSpringsLaunch" },  // PS_SOLVE_SPRINGS
     { "ps_initializeSpringsLaunch", "npPsSprings.spv", "ps_initializeSpringsLaunch" },  // PS_INITIALIZE_SPRINGS
     { "ps_averageVertsLaunch", nullptr, nullptr },  // PS_AVERAGEVERTS (unmapped)
     { "ps_solveAerodynamics1Launch", nullptr, nullptr },  // PS_AERODYNAMIC_1 (unmapped)
