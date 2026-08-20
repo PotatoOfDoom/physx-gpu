@@ -441,6 +441,34 @@ void buildArticulationScene(PxPhysics* physics, PxScene* scene, PxMaterial* mate
 // contact, the sorted buffers stay zero, ps_integrateLaunch is an inert no-op
 // (pos4.w == 0 guard), and the observable fall is produced entirely by the ingest
 // -> predict -> egress chain on the UNSORTED arrays.
+// P9.2 fluid-scene calibration.  Both numbers are MEASURED on this scene, with
+// the only change being the phase bit; see the note at the assertion.  They are
+// named rather than inlined so the control value cannot drift away from the
+// threshold it justifies.
+// Measured on this scene, the ONLY difference between the two runs being the
+// eParticlePhaseFluid bit (PXG_PARTICLE_FLUID_CONTROL=1 clears it):
+//
+//                        fluid      solid-phase control
+//   nearest neighbour    0.0851     1.4421
+//   upward excursion    +0.0000    +1.8923
+//
+// Both thresholds sit between the two, and the control run FAILS both -- which is
+// what makes them checks rather than decoration.
+//
+// What these numbers do and do not establish is worth being exact about.  They
+// establish that the fluid arms of the five P9.1 kernels RUN end to end in the
+// real engine, that the result is finite and comes to rest, and that it is
+// nothing like what the same cloud does with the fluid bit cleared.  They do NOT
+// establish that the resting microstructure is the one CUDA would produce: the
+// fluid ends as tight clumps (nn 0.085, well under the 0.200 fluid rest distance)
+// spread over an RMS radius of 4.94, which is consistent with SnippetPBF's strong
+// vorticity confinement of 10.0 but is not independently validated here.  What
+// carries bit-exactness is the four fixtures, not this scene.
+static const float FLUID_NN_MAX = 0.26f;        // below the solid rest distance of 0.333
+static const float FLUID_NN_CONTROL = 1.4421f;  // measured
+static const float FLUID_RISE_MAX = 0.20f;      // the fluid settles monotonically
+static const float FLUID_RISE_CONTROL = 1.8923f;// measured
+
 struct ParticleScene
 {
     PxPBDParticleSystem* system = nullptr;
@@ -449,8 +477,15 @@ struct ParticleScene
     PxCudaContextManager* cudaCtx = nullptr;
 };
 
+// fluidMode (PXG_SCENE=particlefluid, P9.2) switches the cloud from a SOLID
+// self-colliding granular pile to a real PBD FLUID: the phase gains
+// eParticlePhaseFluid, the material gains the four fluid coefficients, and the
+// system gains a fluid rest offset.  Those are exactly what the five kernels
+// landed in P9.1a-d consume; with the solid phase they all early-out per particle.
+// The parameters are the engine's own SnippetPBF (snippets/snippetpbf/
+// SnippetPBF.cpp:104-156), not invented here.
 ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
-                                 PxCudaContextManager* cudaCtx)
+                                 PxCudaContextManager* cudaCtx, bool fluidMode = false)
 {
     ParticleScene out;
     out.cudaCtx = cudaCtx;
@@ -467,7 +502,7 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     // null-derefs).  Free-fall: box at x=0,y=5 (never meets the y~100 cloud).  Bag
     // mode (PXG_PARTICLE_STARTY set): place it FAR ASIDE at x=20 so the settling
     // pile on the floor never touches it.
-    if (std::getenv("PXG_PARTICLE_STARTY"))
+    if (std::getenv("PXG_PARTICLE_STARTY") || fluidMode)
     {
         PxRigidDynamic* aside = physics->createRigidDynamic(PxTransform(PxVec3(20.0f, 0.5f, 0.0f)));
         PxShape* s = physics->createShape(PxBoxGeometry(0.5f, 0.5f, 0.5f), *rigidMat);
@@ -484,42 +519,101 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     }
 
     // PBD material + particle system + one phase mapping to that material.
-    PxPBDMaterial* pbdMat = physics->createPBDMaterial(/*friction*/ 0.05f, /*damping*/ 0.0f,
-        /*adhesion*/ 0.0f, /*viscosity*/ 0.0f, /*vorticityConfinement*/ 0.0f, /*surfaceTension*/ 0.0f,
-        /*cohesion*/ 0.0f, /*lift*/ 0.0f, /*drag*/ 0.0f);
+    PxPBDMaterial* pbdMat = nullptr;
+    PxPBDParticleSystem* ps = nullptr;
+    float particleSpacing = 0.5f;
+    float particleInvMass = 1.0f;
+    PxU32 phase = 0;
 
-    PxPBDParticleSystem* ps = physics->createPBDParticleSystem(*cudaCtx);
-    const float particleSpacing = 0.5f;
-    const float restOffset = 0.5f * particleSpacing;
-    ps->setRestOffset(restOffset);
-    ps->setContactOffset(restOffset + 0.05f);
-    ps->setParticleContactOffset(restOffset + 0.05f);
-    ps->setSolidRestOffset(restOffset);
-    ps->setMaxVelocity(1e6f); // do not clamp the free fall
+    // PXG_PARTICLE_FLUID_CONTROL builds the fluid scene's geometry, offsets and
+    // material but WITHOUT the eParticlePhaseFluid bit, so every fluid arm of the
+    // five P9.1 kernels early-outs while everything else is identical.  It is the
+    // control the spread threshold is calibrated against.
+    const bool fluidControl = fluidMode && std::getenv("PXG_PARTICLE_FLUID_CONTROL") != nullptr;
 
-    const PxU32 phase = ps->createPhase(pbdMat,
-        PxParticlePhaseFlags(PxParticlePhaseFlag::eParticlePhaseSelfCollide));
+    if (fluidMode)
+    {
+        // SnippetPBF.cpp:112-136 and :155, transcribed.
+        particleSpacing = 0.2f;
+        const float fluidDensity = 1000.0f;
+        const float restOffset = 0.5f * particleSpacing / 0.6f;
+        const float solidRestOffset = restOffset;
+        const float fluidRestOffset = restOffset * 0.6f;
+        const float particleMass = fluidDensity * 1.333f * 3.14159f
+                                 * particleSpacing * particleSpacing * particleSpacing;
+        particleInvMass = 1.0f / particleMass;
 
-    // 4x4x4 grid, invMass 1, zero velocity, spawned centred high above y=0.
-    const int G = 4;
-    const PxU32 N = PxU32(G * G * G);
+        pbdMat = physics->createPBDMaterial(0.05f, 0.05f, 0.f, 0.001f, 0.5f, 0.005f, 0.01f, 0.f, 0.f);
+        pbdMat->setViscosity(0.001f);
+        pbdMat->setSurfaceTension(0.00704f);
+        pbdMat->setCohesion(0.0704f);
+        pbdMat->setVorticityConfinement(10.f);
+
+        ps = physics->createPBDParticleSystem(*cudaCtx, 96);
+        ps->setRestOffset(restOffset);
+        ps->setContactOffset(restOffset + 0.01f);
+        ps->setParticleContactOffset(fluidRestOffset / 0.6f);
+        ps->setSolidRestOffset(solidRestOffset);
+        // The one call the solid scene never makes.  Without it the engine keeps
+        // ParticleSystemShapeCore's default fluid rest offset, which is derived
+        // from the DEFAULT rest offset and is not re-derived when the user changes
+        // it -- an engine trap, not a bug, but it would silently mis-scale the SPH
+        // rest density.
+        ps->setFluidRestOffset(fluidRestOffset);
+        ps->setParticleFlag(PxParticleFlag::eENABLE_SPECULATIVE_CCD, false);
+        ps->setMaxVelocity(solidRestOffset * 100.f);
+        // fluidBoundaryDensityScale stays at its 0 default, which keeps
+        // ps_accumulateStaticDensity / ps_accumulateRigidDensity (both still
+        // unmapped) switched off.
+        phase = fluidControl
+            ? ps->createPhase(pbdMat, PxParticlePhaseFlags(PxParticlePhaseFlag::eParticlePhaseSelfCollide))
+            : ps->createPhase(pbdMat, PxParticlePhaseFlags(
+                  PxParticlePhaseFlag::eParticlePhaseFluid | PxParticlePhaseFlag::eParticlePhaseSelfCollide));
+    }
+    else
+    {
+        pbdMat = physics->createPBDMaterial(/*friction*/ 0.05f, /*damping*/ 0.0f,
+            /*adhesion*/ 0.0f, /*viscosity*/ 0.0f, /*vorticityConfinement*/ 0.0f, /*surfaceTension*/ 0.0f,
+            /*cohesion*/ 0.0f, /*lift*/ 0.0f, /*drag*/ 0.0f);
+
+        ps = physics->createPBDParticleSystem(*cudaCtx);
+        const float restOffset = 0.5f * particleSpacing;
+        ps->setRestOffset(restOffset);
+        ps->setContactOffset(restOffset + 0.05f);
+        ps->setParticleContactOffset(restOffset + 0.05f);
+        ps->setSolidRestOffset(restOffset);
+        ps->setMaxVelocity(1e6f); // do not clamp the free fall
+
+        phase = ps->createPhase(pbdMat,
+            PxParticlePhaseFlags(PxParticlePhaseFlag::eParticlePhaseSelfCollide));
+    }
+
+    // Solid: a 4x4x4 grid.  Fluid: a TALL NARROW COLUMN (4 x 12 x 4), because the
+    // observable for a fluid is that the column COLLAPSES and SPREADS sideways,
+    // which a granular pile of the same shape does far less of.
+    const int GX = fluidMode ? 4 : 4;
+    const int GY = fluidMode ? 12 : 4;
+    const int GZ = fluidMode ? 4 : 4;
+    const PxU32 N = PxU32(GX * GY * GZ);
     // startY defaults to 100 (the P6.0 free-fall baseline all tranches regress
     // against); PXG_PARTICLE_STARTY lowers the cloud so it can reach the floor
     // (P6.5 settling bag).  When lowered, raise solver iterations for a stable pile.
     const char* startYEnv = std::getenv("PXG_PARTICLE_STARTY");
-    const float startY = startYEnv ? float(atof(startYEnv)) : 100.0f;
-    if (startYEnv)
+    const float startY = fluidMode ? 0.6f : (startYEnv ? float(atof(startYEnv)) : 100.0f);
+    if (startYEnv || fluidMode)
         ps->setSolverIterationCounts(/*pos*/ 8, /*vel*/ 1);
     std::vector<PxVec4> hostPos(N), hostVel(N, PxVec4(0.0f, 0.0f, 0.0f, 0.0f));
     std::vector<PxU32> hostPhase(N, phase);
+    const float cx = 0.5f * float(GX - 1) * particleSpacing;
+    const float cz = 0.5f * float(GZ - 1) * particleSpacing;
     PxU32 idx = 0;
-    for (int x = 0; x < G; ++x)
-        for (int y = 0; y < G; ++y)
-            for (int z = 0; z < G; ++z)
+    for (int x = 0; x < GX; ++x)
+        for (int y = 0; y < GY; ++y)
+            for (int z = 0; z < GZ; ++z)
             {
-                hostPos[idx++] = PxVec4(float(x) * particleSpacing - 0.75f,
+                hostPos[idx++] = PxVec4(float(x) * particleSpacing - cx,
                                         startY + float(y) * particleSpacing,
-                                        float(z) * particleSpacing - 0.75f, 1.0f);
+                                        float(z) * particleSpacing - cz, particleInvMass);
             }
 
     PxParticleBuffer* buffer = physics->createParticleBuffer(N, /*maxVolumes*/ 0, cudaCtx);
@@ -549,6 +643,64 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     out.buffer = buffer;
     out.numParticles = N;
     return out;
+}
+
+// DtoH-read the particle buffer and return the MEAN NEAREST-NEIGHBOUR distance.
+// This is the fluid observable, and it is the one the measurement supports: the
+// density constraint drives the cloud toward its FLUID rest distance
+// (2 * fluidRestOffset = 0.2 here), while the solid contact solve drives it to the
+// SOLID rest distance (2 * solidRestOffset = 0.333).  O(N^2) over 192 particles.
+//
+// The first draft of this scene used the horizontal SPREAD instead, on the
+// assumption that a fluid column collapses sideways more than a granular one.
+// Measured, that is backwards: at this spacing the solid rest distance is larger
+// than the particle spacing, so the solid control starts deeply overlapped and
+// EXPLODES -- it spreads x87.7 and its mean y rises to 3.58 before falling back,
+// against the fluid's x15.6 and a monotonic settle.  Spread therefore does not
+// separate them in the direction assumed, and the threshold was replaced rather
+// than tuned.
+float particleMeanNearestNeighbour(const ParticleScene& psc)
+{
+    std::vector<PxVec4> host(psc.numParticles);
+    PxCudaContext* ctx = psc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(psc.buffer->getPositionInvMasses()),
+                    psc.numParticles * sizeof(PxVec4));
+    double acc = 0.0;
+    for (PxU32 i = 0; i < psc.numParticles; ++i)
+    {
+        float best = 1e30f;
+        for (PxU32 j = 0; j < psc.numParticles; ++j)
+        {
+            if (i == j) continue;
+            const float dx = host[i].x - host[j].x;
+            const float dy = host[i].y - host[j].y;
+            const float dz = host[i].z - host[j].z;
+            const float d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 < best) best = d2;
+        }
+        acc += std::sqrt(double(best));
+    }
+    return float(acc / double(psc.numParticles));
+}
+
+// DtoH-read the particle buffer and return the RMS horizontal distance of the
+// cloud from its own (x,z) centroid -- reported for context, not asserted on.
+float particleSpreadXZ(const ParticleScene& psc)
+{
+    std::vector<PxVec4> host(psc.numParticles);
+    PxCudaContext* ctx = psc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(psc.buffer->getPositionInvMasses()),
+                    psc.numParticles * sizeof(PxVec4));
+    double mx = 0.0, mz = 0.0;
+    for (PxU32 i = 0; i < psc.numParticles; ++i) { mx += host[i].x; mz += host[i].z; }
+    mx /= double(psc.numParticles); mz /= double(psc.numParticles);
+    double acc = 0.0;
+    for (PxU32 i = 0; i < psc.numParticles; ++i)
+    {
+        const double dx = host[i].x - mx, dz = host[i].z - mz;
+        acc += dx * dx + dz * dz;
+    }
+    return float(std::sqrt(acc / double(psc.numParticles)));
 }
 
 // DtoH-read the particle buffer and return the mean y of the cloud.
@@ -2893,9 +3045,10 @@ int main()
     // PXG_SCENE=particle (P6.0): the deformable/particle free-fall path.  Wholly
     // separate observable from the rigid RestTarget path — a PBD cloud that falls
     // under gravity, verified by DtoH-reading its mean y across steps.
-    if (!std::strcmp(sceneName, "particle"))
+    const bool fluidScene = !std::strcmp(sceneName, "particlefluid");
+    if (!std::strcmp(sceneName, "particle") || fluidScene)
     {
-        ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx);
+        ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx, fluidScene);
         if (!psc.system || !psc.buffer)
         {
             std::printf("[ FAIL ] gpu-sdk-step: particle scene build failed\n");
@@ -2914,12 +3067,15 @@ int main()
         const float dt = 1.0f / 60.0f;
         const bool bagMode = std::getenv("PXG_PARTICLE_STARTY") != nullptr;
         const char* stepsEnv = std::getenv("PXG_PARTICLE_STEPS");
+        const float spread0 = fluidScene ? particleSpreadXZ(psc) : 0.0f;
+        const float nn0 = fluidScene ? particleMeanNearestNeighbour(psc) : 0.0f;
+        float maxYSeen = fluidScene ? particleMeanY(psc) : 0.0f;
         // P9.1c raised the bag budget from 120 to 240.  Before ps_solveDensityLaunch
         // was mapped there was no particle-particle collision at all, so the cloud
         // passed through itself and reached its (collapsed) rest in well under 120
         // steps.  With the solve live the pile has real mutual overlaps to resolve
         // and needs roughly 150; 240 leaves margin and a 60-step rest window.
-        const int steps = stepsEnv ? atoi(stepsEnv) : (bagMode ? 240 : 120);
+        const int steps = stepsEnv ? atoi(stepsEnv) : (fluidScene ? 300 : (bagMode ? 240 : 120));
         const float y0 = particleMeanY(psc);
         std::printf("  stepping the particle cloud (%d x %.4fs), initial mean y=%.4f...\n", steps, dt, y0);
 
@@ -2932,17 +3088,83 @@ int main()
             scene->simulate(dt);
             scene->fetchResults(true);
             const float y = particleMeanY(psc);
-            if (i < 5 || i == steps - 1 || (bagMode && (i % 15 == 0)))
-                std::printf("    step %3d: mean y = %.5f (dy = %+.5f)\n", i, y, y - prevY);
+            if (i < 5 || i == steps - 1 || ((bagMode || fluidScene) && (i % 30 == 0)))
+            {
+                if (fluidScene)
+                    std::printf("    step %3d: mean y = %.5f (dy = %+.5f) spread = %.4f nn = %.4f\n",
+                                i, y, y - prevY, particleSpreadXZ(psc), particleMeanNearestNeighbour(psc));
+                else
+                    std::printf("    step %3d: mean y = %.5f (dy = %+.5f)\n", i, y, y - prevY);
+            }
             // Free fall: mean y must not increase (allow a tiny float slack).
             if (y > prevY + 1e-3f) ++nonMonotonic;
             if (i >= steps - restWindow) restMaxDy = PxMax(restMaxDy, PxAbs(y - prevY));
+            if (fluidScene) maxYSeen = PxMax(maxYSeen, y);
             prevY = y;
         }
         const float yEnd = particleMeanY(psc);
         const float drop = y0 - yEnd;
 
         int failures = 0;
+        if (fluidScene)
+        {
+            // A PBD FLUID column, end to end over the five kernels P9.1a-d landed
+            // (ps_updateMaterials, ps_calculateDensityAndPotentialLaunch,
+            // ps_solveDensityLaunch, ps_vorticityConfinementLaunch,
+            // ps_solveVelocityLaunch).  With a SOLID phase every fluid arm of those
+            // early-outs per particle, so this scene is the only place they run
+            // against the real engine rather than against a fixture.
+            //
+            // Two observables, both MEASURED against the solid-phase control
+            // (PXG_PARTICLE_FLUID_CONTROL=1 builds the identical geometry, offsets
+            // and material without the eParticlePhaseFluid bit):
+            //
+            //   mean nearest-neighbour distance at rest
+            //       fluid   ~= 2 * fluidRestOffset = 0.200  (the density constraint)
+            //       control ~= 2 * solidRestOffset = 0.333  (the contact solve)
+            //   upward excursion of the mean y over the run
+            //       fluid   ~= 0.00  (it settles monotonically)
+            //       control ~= +1.88 (it starts deeply overlapped and is launched)
+            //
+            // The control's numbers are what they are because at this spacing the
+            // SOLID rest distance (0.333) exceeds the particle spacing (0.2), so the
+            // solid path begins in deep penetration.  The fluid rest distance is
+            // exactly the spacing, which is why SnippetPBF chooses these offsets.
+            const float spreadEnd = particleSpreadXZ(psc);
+            const float nnEnd = particleMeanNearestNeighbour(psc);
+            const float rise = maxYSeen - y0;
+            std::printf("  particle FLUID column: mean y %.4f -> %.4f (dropped %.4f over %.2fs); "
+                        "nearest-neighbour %.4f -> %.4f; spread %.4f -> %.4f; rise %+.4f; "
+                        "rest |dy| over last %d steps = %.6f\n",
+                        y0, yEnd, drop, steps * dt, nn0, nnEnd, spread0, spreadEnd, rise,
+                        restWindow, restMaxDy);
+            if (!std::isfinite(yEnd) || !std::isfinite(nnEnd))
+            { std::printf("FAIL: fluid state is not finite\n"); ++failures; }
+            if (!(drop > 0.2f))
+            { std::printf("FAIL: the column did not settle downwards (drop=%.4f)\n", drop); ++failures; }
+            if (!(nnEnd < FLUID_NN_MAX))
+            { std::printf("FAIL: the cloud settled at the SOLID rest distance or wider -- the fluid "
+                          "density constraint is not running (nn=%.4f, need <%.4f; the "
+                          "solid-phase control measures %.4f)\n",
+                          nnEnd, FLUID_NN_MAX, FLUID_NN_CONTROL); ++failures; }
+            if (!(rise < FLUID_RISE_MAX))
+            { std::printf("FAIL: the fluid was launched upward like the overlapping solid control "
+                          "(rise=%+.4f, need <%.4f; the control measures %+.4f)\n",
+                          rise, FLUID_RISE_MAX, FLUID_RISE_CONTROL); ++failures; }
+            if (!(restMaxDy < 0.05f))
+            { std::printf("FAIL: the fluid never came to rest (rest |dy|=%.6f)\n", restMaxDy); ++failures; }
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            if (failures == 0)
+            {
+                std::printf("[  OK  ] gpu-sdk-step: the PBD FLUID column collapsed to a puddle far below "
+                            "the solid rest spacing (nn %.4f vs %.4f for the solid-phase control) and "
+                            "settled without the control's %+.2f upward excursion -- the whole fluid "
+                            "quartet runs end to end on Vulkan\n", nnEnd, FLUID_NN_CONTROL, FLUID_RISE_CONTROL);
+                return 0;
+            }
+            std::printf("[ FAIL ] gpu-sdk-step: particle fluid checks failed (%d)\n", failures);
+            return 2;
+        }
         if (bagMode)
         {
             // Settling bag (P6.5): the cloud must FALL, be CAUGHT on the floor, and

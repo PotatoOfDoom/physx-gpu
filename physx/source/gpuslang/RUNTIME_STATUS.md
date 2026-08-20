@@ -1694,6 +1694,85 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.2 — `PXG_SCENE=particlefluid`: das Fluid-Quartett läuft Ende zu Ende in der echten Engine
+
+P9.1a–d hat fünf Kernel bitgenau gegen Host-Transkriptionen gelegt.  Was das
+**nicht** zeigt, ist, ob sie im echten Motor überhaupt auf ihren Fluid-Zweigen
+laufen — die bestehende Partikelszene trägt nur `eParticlePhaseSelfCollide`, also
+greift bei jedem einzelnen Partikel der Fluid-Early-out.  Diese Tranche schließt
+die Lücke.
+
+**Kein neuer Kernel, keine Manifest-Änderung.**  Die vier Fluid-Kernel werden vom
+Host ohnehin jeden Frame gelauncht (nur an `maxParticles > 0` gebunden, kein
+Fluid-Prädikat auf der Host-Seite); die Szene entscheidet allein, ob sie **Arbeit**
+tun.  Alles, was der neue Szenenname ändert, ist die Phase, das Material und der
+Fluid-Rest-Offset.
+
+**Parameter aus dem Snippet der Engine übernommen**, nicht erfunden
+(`snippets/snippetpbf/SnippetPBF.cpp:112-156`): `restOffset = 0.5·spacing/0.6`,
+`fluidRestOffset = restOffset·0.6`, `particleContactOffset = fluidRestOffset/0.6`,
+Masse aus `fluidDensity = 1000`, Material
+`(0.05, 0.05, 0, 0.001, 0.5, 0.005, 0.01, 0, 0)` mit anschließendem
+`setViscosity(0.001)`, `setSurfaceTension(0.00704)`, `setCohesion(0.0704)`,
+`setVorticityConfinement(10)`, Phase
+`eParticlePhaseFluid | eParticlePhaseSelfCollide`.
+
+Der **eine Aufruf, den die Solid-Szene nie macht**, ist `setFluidRestOffset`.  Ohne
+ihn behält die Engine den Default aus `ParticleSystemShapeCore`, der aus dem
+**Default**-Rest-Offset abgeleitet und beim Ändern desselben **nicht** neu
+gerechnet wird — eine Falle der Engine, kein Fehler, aber sie würde die
+SPH-Ruhedichte still falsch skalieren.
+
+`fluidBoundaryDensityScale` bleibt auf 0, damit `ps_accumulateStaticDensity` und
+`ps_accumulateRigidDensity` (beide weiterhin unmapped) aus bleiben, und der Puffer
+bleibt ein einfacher `PxParticleBuffer`, damit die rund zwölf Diffuse-Kernel aus
+bleiben.  Die Szene verlangt also **nichts**, was nicht gemappt ist.
+
+### Die erste Kennzahl war falsch, und die Messung hat es gesagt
+
+Der erste Entwurf maß die horizontale **Ausbreitung**, in der Annahme, eine
+Fluidsäule falle stärker in sich zusammen als eine granulare.  Gemessen ist das
+**umgekehrt**: bei diesem Spacing ist die **Solid**-Ruhedistanz (2·0.1667 = 0.333)
+**größer** als der Partikelabstand (0.2), die Kontrolle startet also tief
+überlappt und **explodiert** — Ausbreitung ×87.7, und ihr mittleres y **steigt**
+auf 3.58, bevor es zurückfällt, gegen ×15.6 und ein monotones Setzen beim Fluid.
+Die Fluid-Ruhedistanz ist dagegen exakt der Partikelabstand; genau deshalb wählt
+SnippetPBF diese Offsets.
+
+Die Schwelle wurde deshalb **ersetzt, nicht nachjustiert**.  Die beiden Kennzahlen,
+die die Messung trägt, sind der mittlere **Nächste-Nachbar-Abstand** und die
+**Aufwärtsauslenkung**:
+
+| | Fluid | Solid-Kontrolle |
+|---|---|---|
+| Nächster Nachbar in Ruhe | **0.0851** | **1.4421** |
+| Aufwärtsauslenkung des mittleren y | **+0.0000** | **+1.8923** |
+
+Beide Schwellen liegen dazwischen, und die Kontrolle **fällt bei beiden durch** —
+das macht sie zu Prüfungen statt zu Dekoration.  Der Kontrolllauf ist als
+`PXG_PARTICLE_FLUID_CONTROL=1` fest eingebaut: identische Geometrie, identische
+Offsets, identisches Material, nur ohne das Fluid-Bit.
+
+### Was die Szene zeigt — und was nicht
+
+Sie zeigt, dass die Fluid-Zweige der fünf Kernel im echten Motor **laufen**, dass
+das Ergebnis endlich ist und **zur Ruhe kommt** (Ruhe-|dy| = 0.000000, und die
+Ausbreitung konvergiert sichtbar: Zuwächse je 30 Schritte 1.04 → 0.91 → 0.74 →
+0.60 → 0.47 → 0.35 → 0.23 → 0.11 → 0.05), und dass es sich fundamental von dem
+unterscheidet, was dieselbe Wolke ohne das Fluid-Bit tut.
+
+Sie zeigt **nicht**, dass die Ruhe-Mikrostruktur die ist, die CUDA erzeugen würde.
+Das Fluid endet als dichte Klumpen (nächster Nachbar 0.085, deutlich unter der
+Fluid-Ruhedistanz von 0.200) über einem RMS-Radius von 4.94 — vereinbar mit
+SnippetPBFs kräftiger Vorticity-Confinement von 10.0, aber hier nicht unabhängig
+validiert.  Was Bit-Exaktheit trägt, sind die vier Fixtures, nicht diese Szene.
+Das steht so auch im Kommentar an den Schwellwerten, damit ein späterer Leser die
+Aussagegrenze nicht überdehnt.
+
+**Alle 23 Szenenläufe grün** (21 bestehende + Bag-Modus + der neue Fluid-Modus),
+null Fehlschläge.  Suite unverändert **706/706** in beiden Speichermodi
+(`ctest` **784**) — diese Tranche fasst keinen Shader an.
+
 ## P9.1d — das PBD-Geschwindigkeitspaar (Manifest 329) — Fluid-Quartett komplett, und eine PRÄZISIERUNG der vierten Plattformregel
 
 Die letzten beiden Kernel des Quartetts: `ps_vorticityConfinementLaunch`
