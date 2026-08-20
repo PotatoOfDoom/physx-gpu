@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 324;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 325;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -272,7 +272,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_solvePCOutputRigidDeltaVTGSLaunch", nullptr, nullptr },  // PS_SOLVE_PC_RIGID_TGS (unmapped)
     { "ps_solveRigidAttachmentsTGSLaunch", nullptr, nullptr },  // PS_SOLVE_RIGID_ATTACHMENTS_TGS (unmapped)
     { "ps_finalizeParticlesLaunch", "psContactSolveTgsBda.spv", "ps_finalizeParticlesLaunch" },  // PS_FINALIZE_PARTICLES (P6.6 BDA port: TGS velocity-iteration finalize)
-    { "ps_updateMaterials", nullptr, nullptr },  // PS_UPDATE_MATERIALS (unmapped)
+    { "ps_updateMaterials", "npPsMaterials.spv", "ps_updateMaterials" },  // PS_UPDATE_MATERIALS
     { "femAttachmentPrepareLaunch", "softBodyFemAttachBda.spv", "femAttachmentPrepareLaunch" },  // FEM_ATTACHMENT_CONSTRAINT_PREP (unmapped)
     { "sb_gm_preIntegrateLaunch", "softBodySimBda.spv", "sb_gm_preIntegrateLaunch" },  // SB_SIM_PREINTEGRATION (P8.0 BDA port: softbody free-fall predict/integrate)
     { "sb_refitBoundLaunch", "softBodyRefitBda.spv", "sb_refitBoundLaunch" },  // SB_REFITBOUND (P8.0 tranche 2 BDA port)

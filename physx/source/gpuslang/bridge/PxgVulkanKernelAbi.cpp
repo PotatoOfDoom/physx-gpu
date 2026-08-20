@@ -329,6 +329,14 @@ static const uint8_t kPsIntegrate[] = { 8, 8, 4, 4 };
 //     the launch site (copyUnsortedArrayToUserBuffer) passes a 3rd PxU32 `count`
 //     (unused by the kernel), so the marshalled pack is {8,8,4} -> 24-byte blob.
 static const uint8_t kPsUpdateUserBuffer[] = { 8, 8, 4 };
+// P9.1a:
+//   ps_updateMaterials(const PxgParticleSystem* particleSystems,
+//                      const PxU32* activeParticleSystems,
+//                      const PxsPBDMaterialData* pbdMaterials,
+//                      const PxReal invTotalDt)   [invTotalDt is a dead param]
+//   -> three device pointers + one float = 28 bytes, rounded to the 8-alignment
+//   -> 32-byte blob.  hostPtrMask 0 (all three are plain device pointers).
+static const uint8_t kPsUpdateMaterials[] = { 8, 8, 8, 4 };
 //   ps_updateUnsortedArrayLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems) — user-buffer -> unsorted ingest.
 //     Two device pointers -> 16-byte blob (same shape as kTwoPtr).
@@ -1401,6 +1409,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_preIntegrateLaunch", kPsPreIntegrate, uint32_t(sizeof(kPsPreIntegrate)) },
     { "ps_integrateLaunch", kPsIntegrate, uint32_t(sizeof(kPsIntegrate)) },
     { "ps_updateUserBufferLaunch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
+    { "ps_updateMaterials", kPsUpdateMaterials, uint32_t(sizeof(kPsUpdateMaterials)) },
     // gpusimulationcontroller FEMCloth kernels (P7.0 FEMCloth free-fall BDA)
     { "cloth_preIntegrateLaunch", kClothPreIntegrate, uint32_t(sizeof(kClothPreIntegrate)) },
     { "cloth_finalizeVelocitiesLaunch", kClothFinalizeVel, uint32_t(sizeof(kClothFinalizeVel)) },

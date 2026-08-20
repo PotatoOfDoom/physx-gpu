@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **780/780** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **781/781** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,173 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.1a — ps_updateMaterials, die abgeleiteten Materialkoeffizienten (Manifest 325) — PHASE 2 BEGINNT
+
+Erster Tranche der Phase 2.  Das Ziel des Fensters war das PBD-**Fluid-Quartett**
+(`ps_calculateDensityAndPotentialLaunch`, `ps_solveDensityLaunch`,
+`ps_vorticityConfinementLaunch`, `ps_solveVelocityLaunch`) — die Aufklärung hat
+aber eine **stille Vorbedingung** freigelegt, die der Plan nicht kannte, und die
+kommt zuerst.
+
+**Warum dieser Kernel zuerst.**  `ps_updateMaterials` (particlesystem.cu:5780-5820)
+ist der **einzige Schreiber** von `PxgParticleSystem::mDerivedPBDMaterialData`, und
+**beide** Density-Kernel lesen dieses Array jeden Frame
+(particlesystem.cu:3271 und :3456).  Die Engine allokiert es mit dem expliziten
+Kommentar „no need to copy old data" (PxgPBDParticleSystemCore.cpp:2065), und
+`PxgCudaBuffer::allocate` nullt **nicht**.  Mit unmapped `ps_updateMaterials`
+würde der Fluid-Solve also nicht abstürzen, sondern **uninitialisierte
+Kohäsionskoeffizienten** konsumieren — der unangenehmste Fehlermodus, den es gibt.
+Der Kernel wird ohnehin schon jeden Frame gelauncht
+(PxgPBDParticleSystemCore.cpp:1332-1351, aufgerufen aus :141 **vor**
+`preIntegrateSystems`), ist also unabhängig gegen die bestehende Partikelszene
+prüfbar.
+
+**Null neue Deskriptor-ABI.**  Sämtliche 30 Felder, die das Fluid-Quartett plus
+dieser Kernel anfassen, sind im bestehenden `pxgSlangParticleDesc`-Mirror bereits
+vorhanden **und korrekt** — dreifach geprüft (Handrechnung aus den Headern,
+`g++ offsetof` gegen die echten Engine-Header, und die bereits kompilierte
+SPIR-V-Memberliste).  Neu sind nur zwei Materiallayouts, beide generiert und per
+`static_assert` gepinnt: `sizeof(PxsPBDMaterialData) = 60` (surfaceTension@32,
+cohesion@36) und `sizeof(PxgPBDParticleMaterialDerived) = 16`.
+
+**Neues Modul** `shaders/npPsMaterials.slang`, in `PXG_NOCONTRACT_SHADERS` (die
+vier abgeleiteten Koeffizienten sind dichte Float-Arithmetik, deren Bitmuster der
+Density-Solve direkt konsumiert).  ABI-Zeile `kPsUpdateMaterials {8,8,8,4}`;
+Grid `(ceil(mMaxNumPhaseToMaterials/256), nbActiveParticleSystems, 1)`,
+Block `(PS_SOLVE = 256, 1, 1)`.
+
+**Drei bewusste Abweichungen von der CUDA, jede im Modulkopf begründet:**
+
+* **Kein Staging zu streichen.**  Anders als jeder andere `ps_*`-Kernel dieser
+  Familie hat dieser **kein** `blockCopy` des `PxgParticleSystem` in
+  `__shared__` — er liest `particleSystems[particleId]` direkt aus dem globalen
+  Speicher.  Die direkten BDA-Reads des Ports haben also dieselbe Form, die die
+  CUDA schon hat; das ist keine Vereinfachung.
+* **`PxReal surfaceTension = mat.surfaceTension;` (:5803) ist TOT** — die nächste
+  Verwendung überschreibt es bei :5808, ohne es zu lesen.  Der Port lässt die tote
+  Initialisierung weg.  Genau ihre Anwesenheit lässt die lebende Zeile wie eine
+  *Verfeinerung* des Rohwerts aussehen, wo sie in Wahrheit ein *Ersatz* ist.
+* **`invTotalDt` ist ein TOTER PARAMETER** — steht in der Signatur und in den
+  `kernelParams` des Hosts und wird im Rumpf nie referenziert.  Er bleibt im
+  Push-Constant-Layout, weil der ABI-Blob passen muss, und wird nie gelesen.
+
+**Acht Fallen, jede mit eigenem Mutanten** (T1–T8 im Modulkopf): die
+Doppelindizierung (Material über `mi = phaseToMat[i]`, Record **an** `i`, der
+Phasen**gruppe**); die Schranke ist die **pro-System**-Zahl
+`mData.mNumPhaseToMaterials`, während das Grid nach dem systemübergreifenden
+Maximum dimensioniert ist; `surfaceTension` ist *multiplizieren dann dividieren*,
+von links nach rechts; `cohesion` skaliert mit der **Kontakt**distanz, nicht der
+Ruhedistanz; der Faktor zwei sitzt auf dem **Fluid**-Rest-Offset (ein anderes Feld
+als `mSolidRestOffset` und `mRestOffset`); das unäre Minus umfasst bei `cohesion1`
+den **ganzen** Zähler; `cohesion2`s Zähler ist `sqr(rest) + rest + 1`; und die vier
+Floats stehen in der Reihenfolge der Ctor-Argumente bei :5817.
+
+**Oracle, ehrlich benannt.**  `ps_updateMaterials` ist ein
+`extern "C" __global__`-Kernel; für die vier Koeffizienten existiert kein
+`PX_CUDA_CALLABLE`-Original zum Aufrufen.  Das ist also die P8.73–P8.80-Anordnung,
+**kein** Engine-Oracle: die Erwartung ist eine Host-**Transkription** der fünf
+Arithmetikzeilen.  Was sie trägt, ist (a) jeder Struct-Offset aus den echten
+Engine-Headern generiert und per `static_assert` gepinnt, womit der P8.49a-Fehler-
+modus — Shader und Fixture teilen sich *eine* falsche Zahl — konstruktiv
+geschlossen ist; (b) Ganzbereichs-Vergleich gegen ein `0xAB`-Gift, sodass ein
+**zusätzlicher** Schreibvorgang genauso laut scheitert wie ein falscher; und (c)
+der Sweep.  Der Eintrag sagt das, statt den Sweep als Oracle auszugeben.
+
+**Sweep 25/25 getötet — nach zwei Fixture-Korrekturen, beide Identitäten, keine
+Shader-Fehler:**
+
+* `psm-block-dim-128` überlebte, weil er bei 300 Gruppen eine **Identität** war:
+  Stride 128 mit `numthreads(256)` erreicht `[0, 128*(GRID_X-1)+255] = [0,383]`,
+  deckt also alle 300 Gruppen ab, und die doppelten Schreibvorgänge sind
+  idempotent.  Fixture auf **500** Gruppen angehoben: der Mutant lässt 384..499
+  vergiftet → getötet.  Die Invariante steht jetzt als Assertion in der Fixture,
+  nicht als Kommentar.
+* `psm-active-indirection-dropped` (Pool per `blockIdx.y` statt per
+  `activeParticleSystems[]` indiziert) überlebte, weil meine Aktivliste `{1,0}`
+  eine **Permutation** von `{0,1}` war — und da sonst nichts im Kernel von
+  `blockIdx.y` abhängt, rechnet der Mutant exakt dasselbe, nur in vertauschten
+  y-Scheiben.  Behoben durch einen **Köder** auf Poolindex 1 bei Aktivliste
+  `{2,0}`: der Mutant schreibt jetzt die Köder-Records (die vergiftet bleiben
+  müssen) und nie die von B (die gefüllt sein müssen) → getötet.
+
+Das ist dieselbe Lektion, die schon vier Tranchen einen Erstdurchgang gekostet
+hat, in neuer Verkleidung: **ein Mutant, der nichts ändert, ist ein Fixture-
+Befund, kein Ergebnis.**  Beide Fixture-Geometrien sind jetzt im Kopf der Fixture
+begründet, damit eine spätere Änderung sie nicht versehentlich zurückdreht.
+
+**Szene:** Refused-Liste **177 → 176**, `ps_updateMaterials` der eine, der geht;
+120 `[pxg-launch] ps_updateMaterials OK` (einmal pro Frame), null REFUSED.  Die
+Partikelszene bleibt grün mit **bitidentischen** Zahlen (mean y 100.7500 →
+80.9665, dy = -0.32700 bei Schritt 119) — genau wie erwartet, denn die abgeleiteten
+Werte, die der Kernel jetzt schreibt, werden ausschließlich von den beiden noch
+unmapped Density-Kerneln konsumiert.
+
+**Suite 703/703 in beiden Speichermodi** (Binary), **781** bei `ctest -N`.
+Die Binary zählt +2 (`psMaterialsLayout` und `psMaterials`), `ctest` +1 — die
+Suite-Liste registriert einen Namen, der per Präfix beide Tests fährt; das ist
+dieselbe Zählkonvention wie in allen bisherigen Tranchen.  Manifest **324 → 325**.
+
+### ZWEI neue Upstream-Bug-Kandidaten (12 und 13) — bestätigt, nicht bloß vermutet
+
+Beim Durchdenken der Prefetch-Schleifen der Fluid-Kernel sind mir zwei
+Index-Diskrepanzen aufgefallen.  Weil die Behauptung „NVIDIA hat hier einen Fehler"
+außergewöhnliche Belege braucht, wurden beide von **sechs unabhängigen Prüfern**
+adversarial geprüft — jeder mit dem Auftrag zu **widerlegen**, unter drei
+verschiedenen Linsen (Registertabelle Iteration für Iteration; Suche nach dem
+Lesefehler, der die Behauptung erzeugt hätte; Vergleich mit den Geschwisterschleifen
+derselben Datei).  Beide Behauptungen haben gehalten.
+
+**Kandidat 12 — `ps_vorticityConfinementLaunch` (:3857).**  Die zweistufige
+Software-Pipeline lädt die Nachbar**geschwindigkeit** vom falschen Index.  Zeile
+3857 liest `sortedNewVelocities[nextQ]`, während die beiden Zeilen darüber
+`sortedNewPositions`/`sortedPhases` aus `nextNextQ` lesen und die Zuweisung
+`nextQ = nextNextQ` erst bei :3859 folgt.  Mit `idx[k] = collisionIndex[p +
+k*numParticles]` konsumiert Iteration `c` also Position und Phase von `idx[c]`,
+aber Geschwindigkeit von `idx[c-1]` für `c >= 1`.  Zwei Korollare, die die Prüfer
+ergänzt haben: die Geschwindigkeit des **letzten** Nachbarn wird bei
+`contactCount >= 2` **nie** gelesen, und die von `idx[0]` wird **zweimal**
+konsumiert.  Von den drei strukturgleichen Pipelines der Datei (:3548, :3853,
+:3995) ist :3857 die **einzige** Nutzlast, die über `nextQ` statt `nextNextQ`
+indiziert — und :3556 zeigt die Absicht des Autors, weil es nach dem
+`nextQ`-Bump steht und trotzdem `nextNextQ` benutzt.  Kein Kommentar markiert die
+Zeile als beabsichtigt (im Gegensatz zu :4034, wo ein bekannt falsches `dtSq`
+ausdrücklich „for compatibility" erhalten bleibt).
+
+**Kandidat 13 — `calculateDensityAndPotential` (:3300-3303).**  Im Vorspann sitzt
+`offset += numParticles` **zwischen** dem Positions- und dem Geschwindigkeitsladen
+des ersten Nachbarn, also wird `xjNext` aus Slot 0 und `vjNext` aus Slot **1**
+geholt.  Iteration `i == 0` paart damit `pos[idx[0]]` mit `vel[idx[1]]`;
+`vel[idx[0]]` wird nie gelesen, `vel[idx[1]]` zweimal.  Betroffen ist nur `div` →
+`potentials[p].x` (der Diffuse-Partikel-Pfad); `rho`, `weight`, `densities[p]` und
+die Oberflächennormale konsumieren ausschließlich Positionen und sind sauber.
+Zusätzlich: bei `contactCount == 1` und aktiven Diffuse-Partikeln liest die Zeile
+einen Slot, den `ps_selfCollisionLaunch` für dieses Partikel nie beschrieben hat —
+der **ungebundene** Zugriff ist dann eine Ebene weiter unten,
+`sortedNewVelocities[dieserStaleWert]`.  Diese Funktion ist die einzige von vier
+analogen Vorspännen im Baum (:3521, :3829, :3967, plus anisotropy.cu:266), die den
+Index nicht erst in ein Register latcht.
+
+**Portregel für beide:** der Port **reproduziert** sie, er repariert sie nicht.
+Geschlossene Form für die kommenden Tranchen:
+`vj = vel[idx[max(c-1, 0)]]` bei der Vorticity und
+`vj = vel[idx[max(i, 1)]]` bei der Dichte — jeweils mit unveränderten Guards, denn
+die Phasen- und Distanztests benutzen den **richtigen** Nachbarn, und der Prefetch
+läuft **vor** dem `continue`.  Am Portort steht ein Kommentar im Stil von :4034,
+damit ein späterer Leser die Zeile nicht „repariert".
+
+Damit stehen **dreizehn** Upstream-Bug-Kandidaten dokumentiert, keiner gemeldet.
+
+**Ein Kandidat wurde ausdrücklich ENTLASTET.**  `mDerivedPBDMaterialData[group]`
+sah nach einer Index-Verwechslung aus (Material über `mi`, Record über `group`),
+ist aber **konsistent**: die Kette schließt sich an vier Gliedern — Erzeuger
+(`NpPBDParticleSystem.cpp:137-139`, ein `pushBack` pro `createPhase`), Allokation
+(`PxgPBDParticleSystemCore.cpp:2049+2065`, dimensioniert nach
+`mPhaseGroupToMaterialHandle.size()`), Füllung (dieser Kernel, Schreibindex `i`)
+und Leser (:3271/:3456).  Alle vier sind sich einig: **eine Zeile pro Phasengruppe**.
+Zwei Gruppen, die sich ein Material teilen, bekommen legitim zwei identische
+Zeilen.  Der Negativbefund steht hier, weil ein nicht aufgeschriebener
+Freispruch genauso teuer nachzuholen ist wie ein nicht aufgeschriebener Befund.
 
 ## MEILENSTEIN — PHASE 1 (ARTIKULATIONEN) ABGESCHLOSSEN: die Szene SETZT SICH
 
