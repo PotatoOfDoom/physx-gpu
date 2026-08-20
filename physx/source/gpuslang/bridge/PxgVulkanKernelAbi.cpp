@@ -1424,6 +1424,11 @@ static const PxgKernelAbiRow kRows[] = {
     //   -> {8,8,4} (20 bytes, padded to 24).
     { "ps_vorticityConfinementLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "ps_solveVelocityLaunch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
+    // P9.3a: the PBD cloth spring gather pair, both (particleSystems*,
+    //   activeParticleSystems*) -> {8,8} = kTwoPtr.  Both use a 3D grid with the
+    //   particle system on gridDim.Z and the cloth buffer on gridDim.Y.
+    { "ps_initializeSpringsLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "ps_updateRemapVertsLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     // gpusimulationcontroller FEMCloth kernels (P7.0 FEMCloth free-fall BDA)
     { "cloth_preIntegrateLaunch", kClothPreIntegrate, uint32_t(sizeof(kClothPreIntegrate)) },
     { "cloth_finalizeVelocitiesLaunch", kClothFinalizeVel, uint32_t(sizeof(kClothFinalizeVel)) },

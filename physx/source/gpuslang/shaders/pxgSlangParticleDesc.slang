@@ -85,6 +85,57 @@ public struct PxgParticleSimBufferGpu
     public uint _pad84;                   // @84 -> 88
 }
 
+// P9.3a -- the PBD CLOTH records.  All three layouts generated from the engine
+// headers and pinned by static_assert in testPsSprings.cpp.
+//
+// Byte-exact mirror of PxgParticleClothSimBuffer (PxgParticleSystem.h:158-181):
+// 11 device pointers (88) + 5 PxU32 (20) = 108, rounded to the pointer alignment
+// -> 112, which is the stride mClothSimBuffers is indexed at.
+public struct PxgParticleClothSimBufferGpu
+{
+    public uint64_t mAccumulatedSpringsPerPartitions;  // @0   PxU32*  numPartitions
+    public uint64_t mAccumulatedCopiesPerParticles;    // @8   PxU32*
+    public uint64_t mRemapOutput;                      // @16  PxU32*  numSprings*2
+    public uint64_t mOrderedSprings;                   // @24  PxParticleSpring*
+    public uint64_t mTriangles;                        // @32  PxU32*  numTriangles*3
+    public uint64_t mSortedClothStartIndices;          // @40  PxU32*  numCloths
+    public uint64_t mCloths;                           // @48  PxParticleCloth*
+    public uint64_t mRemapPositions;                   // @56  float4*
+    public uint64_t mRemapVelocities;                  // @64  float4*
+    public uint64_t mSpringLambda;                     // @72  PxReal*
+    public uint64_t mInflatableLambda;                 // @80  PxReal*
+    public uint mParticleBufferIndex;                  // @88
+    public uint mNumSprings;                           // @92
+    public uint mNumPartitions;                        // @96
+    public uint mNumCloths;                            // @100
+    public uint mNumTriangles;                         // @104
+    public uint _pad108;                               // @108 -> 112
+}
+
+// PxParticleBuffer.h:344-352, PX_ALIGN(8), sizeof 24.
+public struct PxParticleSpringGpu
+{
+    public uint ind0;        // @0
+    public uint ind1;        // @4
+    public float length;     // @8
+    public float stiffness;  // @12  NEGATIVE means a one-sided (tether) constraint
+    public float damping;    // @16
+    public float pad;        // @20 -> 24
+}
+
+// PxParticleBuffer.h:359-374, sizeof 28, align 4 (no trailing pad -- seven
+// 4-byte members, so the array stride is 28 and NOT rounded to 32).
+public struct PxParticleClothGpu
+{
+    public uint startVertexIndex;    // @0
+    public uint numVertices;         // @4
+    public float clothBlendScale;    // @8
+    public float restVolume;         // @12
+    public float pressure;           // @16
+    public uint startTriangleIndex;  // @20
+    public uint numTriangles;        // @24 -> 28
+}
+
 // Byte-exact mirror of PxgParticleSystem (PxgParticleSystem.h:405-488) with the
 // base PxGpuParticleSystem members inlined first (offsets 0..135) then the
 // derived members (136..655).  sizeof = 656.

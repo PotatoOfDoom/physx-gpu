@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **784/784** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **785/785** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,87 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.3a — die PBD-Cloth-ABI und das Feder-Gather-Paar (Manifest 331)
+
+Nach dem Fluid-Quartett der nächste zusammenhängende Block der Partikelfamilie:
+die **Feder-Kette** der PBD-Cloth.  Diese Tranche legt ihre ABI und die beiden
+Kernel, die keine Arithmetik enthalten — `ps_initializeSpringsLaunch`
+(particlesystem.cu:4111) nullt den XPBD-Lagrange-Multiplikator jeder Feder, und
+`ps_updateRemapVertsLaunch` (:4043) **sammelt** die beiden Endpunkte jeder Feder
+aus den sortierten Partikelarrays in den Scratch des Cloth-Puffers, in dem
+`ps_solveSpringsLaunch` dann an Ort und Stelle löst.
+
+### Eine neue Grid-Form für diesen Port
+
+Jeder bisher gemappte Partikelkernel legt das Partikelsystem auf `gridDim.y`.  Die
+Cloth-Kette ist **dreidimensional**:
+
+```
+blockIdx.z -> activeParticleSystems[.]   (das Partikelsystem)
+blockIdx.y -> der CLOTH-PUFFER innerhalb dieses Systems
+blockIdx.x -> die Arbeitsscheibe
+```
+
+bei Block `(UPDATEBOUND = 1024, 1, 1)`.  Ein Port, der die 2D-Konvention behält,
+liest das falsche System **und** bearbeitet nur Cloth-Puffer 0 — beides still.  Die
+Fixture setzt deshalb ein echtes 3D-Grid ab und gibt den beiden aktiven Systemen
+**verschiedene** Cloth-Puffer-Zahlen; die zugehörigen Mutanten (`sp-init-system-on-y`,
+`sp-remap-system-on-y`) sterben.
+
+### Drei neue ABI-Schichten, alle generiert und gepinnt
+
+`PxgParticleClothSimBuffer` (112 Byte: 11 Zeiger + 5 `PxU32` + 4 Byte
+Ausrichtungs-Padding), `PxParticleSpring` (24, `PX_ALIGN(8)`) und
+`PxParticleCloth` (28).  Die letzte ist die Falle: **sieben** 4-Byte-Member bei
+Ausrichtung 4, der Array-Schritt ist also **28 und nicht auf 32 aufgerundet** —
+genau die Stelle, an der eine plausible Annahme falsch ist.  Alle drei kommen aus
+einem Generator gegen die echten Header und stehen als `static_assert` in
+`psSpringsLayout`.
+
+**Sechs Fallen, jede mit Mutanten** (K1–K6).  Zwei Fäden pro Feder
+(`workIndex = gti/2`, `index = gti & 1`, Schranke gegen `nbSprings * 2`); das
+Ziel ist **spaltenweise** bei Schritt `nbSprings`, nicht zeilenweise; die
+Federindizes sind **lokal zum Partikelpuffer**, brauchen also erst
+`+ mParticleBufferRunsum[clothBuffer.mParticleBufferIndex]` und dann
+`mUnsortedToSortedMapping` — zwei Indirektionen, die nicht zu einer kollabieren
+dürfen (die Fixture benutzt eine echte Permutation, damit sie es nicht können);
+`mRemapVelocities` kommt aus `mSortedVelocities`, mit der auskommentierten
+`mSortedDeltaP`-Alternative direkt darüber; und die beiden Kernel buchstabieren
+ihre Schranke unterschiedlich (`>= nbSprings -> return` gegen
+`< totalSprings -> arbeite`), was so transkribiert und nicht vereinheitlicht wird.
+
+**Sweep 24/24 getötet** — nach zwei Fixture-Korrekturen, beide wieder Identitäten:
+
+* Mit nur kleinen Cloth-Puffern (7 und 5 Federn) ist die X-Ausdehnung des Grids
+  **ein** Block, und jeder Grid-Zerlegungsmutant ist eine Identität.  Ein dritter
+  Puffer mit **1100** Federn gibt `ceil(2200/1024) = 3` Blöcke; die Invariante
+  steht als Assertion in der Fixture.
+* `sp-init-cloth-guard-dropped` (die Per-System-Schranke durch die Grid-Ausdehnung
+  ersetzt) überlebte, weil hinter der Schranke **nichts Vergiftetes** lag: der
+  Mutant las über ein Ein-Element-Array hinaus, landete auf dem, was zufällig
+  folgte, und stieg früh aus.  Jetzt ist das Cloth-**Array** jedes Systems auf das
+  systemübergreifende Maximum allokiert, während `mNumClothBuffers` nur die
+  lebende Zahl meldet, und die Auffüll-Einträge sind **echte** Records mit echten
+  Federn und eigenen vergifteten Ausgaben.  Beide Guard-Mutanten sterben jetzt.
+
+Das ist dieselbe Regel wie in P9.1b und P9.1c, jetzt zum dritten Mal: **eine
+Schranke ist nur dann getestet, wenn auf ihrer falschen Seite etwas Vergiftetes
+zu treffen ist.**  Sie steht als Kommentar in allen drei Fixtures.
+
+**Oracle:** beide Kernel sind reine Datenbewegung, es gibt also keine Arithmetik
+für ein numerisches Oracle.  Was trägt, ist der **Layout-Test** — jeder Offset aus
+den Engine-Headern generiert und per `static_assert` gepinnt — plus der
+Gift-Vergleich über ganze Regionen und der Sweep.  Der Eintrag sagt das, statt den
+Sweep als Oracle auszugeben.
+
+**Suite 708/708 in beiden Speichermodi**, `ctest` **785**.  Die Binary zählt +2
+(`psSpringsLayout` und `psSprings`), `ctest` +1 — ein Suite-Name, der per Präfix
+beide Tests fährt, wie in allen bisherigen Tranchen.  Manifest **329 → 331**.
+**Szene:** Refused **172 → 170** mit genau diesen beiden als denen, die gehen.  Die
+Kernel werden host-seitig an `getMaxSpringsPerBuffer() > 0` gebunden, also
+dispatcht sie noch keine Szene — das ändert sich mit P9.4, der Cloth-Szene, sobald
+`ps_solveSpringsLaunch` und `ps_averageVertsLaunch` dazukommen.
 
 ## P9.2 — `PXG_SCENE=particlefluid`: das Fluid-Quartett läuft Ende zu Ende in der echten Engine
 
