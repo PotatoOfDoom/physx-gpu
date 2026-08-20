@@ -1851,10 +1851,8 @@ Upstream-Kandidaten dokumentiert, keiner gemeldet (Aufgabe #90).
 Fixture hat zwei `PXG_TEST`s: der Layout-Test pinnt `sizeof(PxParticleCloth) == 28`
 samt Alignment, `sizeof(PxgParticleSimBuffer) == 88` und die beiden benachbarten
 Mapping-Slots), `ctest` +1.  Manifest **332 → 333**, Refused **169 → 168**.
-Der Szenen-Durchlauf war beim Commit noch nicht durch (7 der 23 grün gemeldet);
-das vollständige Ergebnis kommt im Folge-Commit und ersetzt diese Zeile durch die
-gemessene Zahl, statt sie zu behaupten.  Dispatcht wird die Federkette weiterhin
-von keiner Szene —
+Alle **23 Szenen grün**, null fehlende Verdikte.  Dispatcht wird die Federkette
+weiterhin von keiner Szene —
 der Host bindet sie an `getMaxSpringsPerBuffer() > 0`, und noch legt keine Szene
 einen PBD-Cloth-Puffer an.  **Die Kette ist damit aber vollständig**: Init,
 Gather, Löser und Averaging sind alle vier gemappt, und P9.4 kann die
