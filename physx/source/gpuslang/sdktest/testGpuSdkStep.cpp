@@ -2912,9 +2912,14 @@ int main()
         }
 
         const float dt = 1.0f / 60.0f;
-        const char* stepsEnv = std::getenv("PXG_PARTICLE_STEPS");
-        const int steps = stepsEnv ? atoi(stepsEnv) : 120;
         const bool bagMode = std::getenv("PXG_PARTICLE_STARTY") != nullptr;
+        const char* stepsEnv = std::getenv("PXG_PARTICLE_STEPS");
+        // P9.1c raised the bag budget from 120 to 240.  Before ps_solveDensityLaunch
+        // was mapped there was no particle-particle collision at all, so the cloud
+        // passed through itself and reached its (collapsed) rest in well under 120
+        // steps.  With the solve live the pile has real mutual overlaps to resolve
+        // and needs roughly 150; 240 leaves margin and a 60-step rest window.
+        const int steps = stepsEnv ? atoi(stepsEnv) : (bagMode ? 240 : 120);
         const float y0 = particleMeanY(psc);
         std::printf("  stepping the particle cloud (%d x %.4fs), initial mean y=%.4f...\n", steps, dt, y0);
 
@@ -2942,13 +2947,27 @@ int main()
         {
             // Settling bag (P6.5): the cloud must FALL, be CAUGHT on the floor, and
             // come to REST.  restMaxDy over the final quarter must decay to ~0, yEnd
-            // must sit just above the floor (top y=0, particles rest near solidRest
-            // offset), and everything must stay finite.
+            // must sit just above the floor, and everything must stay finite.
+            //
+            // P9.1c added the PILE HEIGHT check, and it is the one that carries real
+            // information.  Measured A/B on this exact scene, with the ONLY change
+            // being whether ps_solveDensityLaunch is mapped:
+            //     unmapped -> the 64 particles pass through one another and collapse
+            //                 into a single layer, mean y = 0.25000 (the floor rest
+            //                 offset), reached in well under 120 steps;
+            //     mapped   -> they resolve their mutual overlaps and form a real 3D
+            //                 pile, mean y = 0.99919.
+            // A resting height above 0.6 is therefore only reachable with particle-
+            // particle collision actually running, which the other three checks
+            // cannot distinguish -- the collapsed layer falls, rests and is finite
+            // too.
             std::printf("  particle SETTLING BAG: mean y %.4f -> %.4f (dropped %.4f over %.2fs); "
                         "rest |dy| over last %d steps = %.6f\n", y0, yEnd, drop, steps * dt, restWindow, restMaxDy);
             if (!(drop > 0.5f))          { std::printf("FAIL: cloud did not fall (drop=%.4f)\n", drop); ++failures; }
             if (!(restMaxDy < 0.01f))    { std::printf("FAIL: cloud did not come to rest (rest |dy|=%.6f)\n", restMaxDy); ++failures; }
             if (!(yEnd > -0.5f && yEnd < 1.5f)) { std::printf("FAIL: cloud did not settle near the floor (yEnd=%.4f)\n", yEnd); ++failures; }
+            if (!(yEnd > 0.6f))          { std::printf("FAIL: the pile collapsed into one layer -- particle-particle "
+                                                       "collision is not running (yEnd=%.4f, collapsed is 0.2500)\n", yEnd); ++failures; }
             if (!std::isfinite(yEnd))    { std::printf("FAIL: mean y is not finite (%.4f)\n", yEnd); ++failures; }
             scene->release(); physics->release(); cudaCtx->release(); foundation->release();
             if (failures == 0)

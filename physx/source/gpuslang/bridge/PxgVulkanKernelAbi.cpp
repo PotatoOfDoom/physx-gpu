@@ -1414,6 +1414,10 @@ static const PxgKernelAbiRow kRows[] = {
     //   activeParticleSystems*, bool shouldComputePotentials) -> {8,8,1}, the
     //   existing kTwoPtrBool shape (bool byte at 16, blob padded to 24).
     { "ps_calculateDensityAndPotentialLaunch", kTwoPtrBool, uint32_t(sizeof(kTwoPtrBool)) },
+    // P9.1c: ps_solveDensityLaunch(particleSystems*, activeParticleSystems*,
+    //   PxReal coefficient, PxReal dt) -- coefficient BEFORE dt -> {8,8,4,4},
+    //   the existing kPsIntegrate shape (24-byte blob).
+    { "ps_solveDensityLaunch", kPsIntegrate, uint32_t(sizeof(kPsIntegrate)) },
     // gpusimulationcontroller FEMCloth kernels (P7.0 FEMCloth free-fall BDA)
     { "cloth_preIntegrateLaunch", kClothPreIntegrate, uint32_t(sizeof(kClothPreIntegrate)) },
     { "cloth_finalizeVelocitiesLaunch", kClothFinalizeVel, uint32_t(sizeof(kClothFinalizeVel)) },

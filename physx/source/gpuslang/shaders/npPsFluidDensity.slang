@@ -331,3 +331,346 @@ void ps_calculateDensityAndPotentialLaunch(uint3 groupThreadId : SV_GroupThreadI
         }
     }
 }
+
+// ============================================================================
+// P9.1c -- ps_solveDensityLaunch (particlesystem.cu:3404-3687)
+// ============================================================================
+// The PBD position-delta solve.  Despite the name it is NOT a fluid-only kernel:
+// its ELSE branch is the SOLID particle-particle collision, adhesion and friction
+// solve, taken whenever either particle of a pair is non-fluid.  That is why
+// mapping it is what finally gives the existing particle scene real
+// particle-particle collision response -- ps_applyDeltaLaunch zeroes mDelta after
+// consuming it, so with this kernel refused the Jacobi delta was identically zero
+// every iteration.
+//
+// LAUNCH.  args (particleSystems*, activeParticleSystems*, PxReal coefficient,
+// PxReal dt) -- coefficient BEFORE dt -> {8,8,4,4}; grid
+// (ceil(getMaxParticles()/256), nbActiveParticleSystems, 1), block (256,1,1),
+// mStream, once per solver iteration.
+//
+// Four DEAD locals dropped, each verified by reading every use in the body:
+//   - `xiVel = PxLoad3(sortedVel[p])` (:3472) is never referenced.  It is a real
+//     global load of mSortedVelocities[p] that nothing consumes.
+//   - the INNER `const PxVec3 xij = xjDelta - xiDelta;` (:3625) SHADOWS the outer
+//     xij and is never referenced either; the friction block below it recomputes
+//     the negation as `j = xiDelta - xjDelta`.
+//   - `ni4.w` is dead: both of its uses are commented out in the CUDA (:3480 and
+//     the tail of :3503), so only the xyz of normals[p] is live.
+//   - `invRadius` (:3502) is a second read of the same
+//     mParticleContactDistanceInv that `particleContactDistanceInv` (:3495)
+//     already holds; one load serves both.
+//
+// The `__syncwarp()` at :3683 is NOT load-bearing and is dropped.  Unlike the
+// P8.124 case, there is no cross-lane hazard to preserve here: nothing in the
+// loop reads mDelta, and every collisionForces slot the loop writes is
+// writeOffset = p + i*numParticles, which is unique per particle.  No lane ever
+// reads another lane's write, so the barrier orders nothing.
+//
+// The material and derived-material loads are moved BELOW the fixed-particle
+// early-out.  In the CUDA they sit above it and are therefore executed even for a
+// particle that immediately returns; deferring them is observationally identical
+// (they are pure reads) and avoids dereferencing mDerivedPBDMaterialData on a
+// path whose result is discarded.
+//
+// Traps, each with a mutant:
+//  S1. A FIXED particle (xi4.w == 0) clears its delta and returns (:3461-3466) --
+//      it writes deltas[p] = 0 rather than leaving it, and writes nothing else.
+//  S2. `d` here is sqrtf(dSq) -- a REAL square root, unlike
+//      ps_calculateDensityAndPotentialLaunch's 1/rsqrt double reciprocal.
+//  S3. The outer guard is dSq >= 1e-10f (:3566); the fluid branch then ALSO
+//      requires dSq < cellSizeSq && dSq > 0.
+//  S4. The fluid branch needs BOTH particles fluid (:3571); everything else,
+//      including fluid-vs-solid, takes the solid branch.
+//  S5. Same-phase vs different-phase split INSIDE the fluid branch: different
+//      phases get the bilateral density term ONLY (no cohesion, no viscosity, no
+//      CFL, no surface tension) -- the engine's multiphase behaviour.
+//  S6. lambda is the AVERAGE (density + density2) * 0.5f, not a sum.
+//  S7. The CFL projection fires only when relDeltaProj < -cflRadius, and the
+//      correction is scaled by 0.5f.
+//  S8. Surface tension uses the RAW mat.surfaceTension as its gate (:3609), not
+//      the derivedMaterial.surfaceTensionDerived that the density kernel uses.
+//  S9. `w` is the invMass ratio xi4.w / (xi4.w + xj4.w) -- the pair's mass split.
+// S10. adhesionClamp is computed only when d < cohesionRadius, and is
+//      PxMax(0, adhesion * oct(1 - e*invAura) * e) -- oct is the EIGHTH power.
+// S11. mtd = PxClamp(PxMin(e, PxMax(-force.x, adhesionClamp)), +-solidRestDistance)
+//      -- a min of the penetration against a max of the warm-started force and
+//      the adhesion, then symmetrically clamped.
+// S12. The delta and the friction update happen only when newForce.x != 0, but
+//      newForce.x = PxMin(newForce.x, 0) and the STORE happen unconditionally.
+// S13. Friction reads the ACCUMULATED newForce.y as its warm start and clamps
+//      against length + newForce.y, not against length alone.
+// S14. `delta -= jt * deltaForce * w / length` goes through PxVec3::operator/,
+//      which is a RECIPROCAL-then-multiply (PxVec3.h:219-223), NOT a
+//      per-component divide.  Slang's `/` on a float3 IS per-component, so the
+//      port must spell the reciprocal explicitly.
+// S15. weight is incremented in BOTH branches but at different depths: in the
+//      fluid branch once per in-range pair regardless of the phase split, in the
+//      solid branch only inside the newForce.x != 0 guard.
+// S16. delta is scaled by `coefficient` once, after the loop.
+
+float cube(float x) { return x * x * x; }
+float oct(float x) { float x2 = x * x; float x4 = x2 * x2; return x4 * x4; }
+
+// particlesystem.cu:3397-3401
+float WCohesion(float x, float kCohesion1, float kCohesion2, float kInvRadius)
+{
+    float w = x * kInvRadius;
+    return kCohesion1 * cube(w) + kCohesion2 * sqr(w) - 1.0f;
+}
+
+// PxClamp (PxMath.h:142-146) is PxMin(hi, PxMax(lo, v)) -- that spelling exactly.
+float pxClamp(float v, float lo, float hi) { return pxMin(hi, pxMax(lo, v)); }
+
+// PxsPBDMaterialData float indices (offsets / 4): friction@0, adhesion@2,
+// adhesionRadiusScale@4, viscosity@6, surfaceTension@8, cflCoefficient@12,
+// particleFrictionScale@13, particleAdhesionScale@14.
+static const uint PXG_PBD_MAT_F_FRICTION = 0u;
+static const uint PXG_PBD_MAT_F_ADHESION = 2u;
+static const uint PXG_PBD_MAT_F_ADHESION_RADIUS_SCALE = 4u;
+static const uint PXG_PBD_MAT_F_VISCOSITY = 6u;
+static const uint PXG_PBD_MAT_F_SURFACE_TENSION_RAW = 8u;
+static const uint PXG_PBD_MAT_F_CFL_COEFFICIENT = 12u;
+static const uint PXG_PBD_MAT_F_PARTICLE_FRICTION_SCALE = 13u;
+static const uint PXG_PBD_MAT_F_PARTICLE_ADHESION_SCALE = 14u;
+
+// NOTE: unlike ps_updateMaterials, this kernel reaches the material through
+// getParticleMaterial with the RUNTIME mParticleMaterialStride from the
+// descriptor (particlesystem.cu:3453), not a compile-time sizeof.  The two are
+// equal at runtime, but the port spells what this kernel does.
+static const uint PXG_PBD_DERIVED_F_COHESION = 1u;
+static const uint PXG_PBD_DERIVED_F_COHESION1 = 2u;
+static const uint PXG_PBD_DERIVED_F_COHESION2 = 3u;
+
+// phaseToMat[group]: a PxU16 array read as a 32-bit word plus shift/mask, so the
+// software Vulkan target needs no 16-bit storage capability.
+uint sdLoadPhaseToMaterial(uint64_t handleBase, uint group)
+{
+    let word = (Ptr<uint>(handleBase))[group >> 1];
+    return (word >> ((group & 1u) * 16u)) & 0xffffu;
+}
+
+// argSizes (launch site PxgPBDParticleSystemCore.cpp:743-749):
+// { particleSystems*, activeParticleSystems*, PxReal coefficient, PxReal dt }
+// -> {8,8,4,4} = 24-byte blob.  coefficient comes BEFORE dt.
+struct PsSolveDensityParams
+{
+    uint64_t particleSystems;         // @0
+    uint64_t activeParticleSystems;   // @8
+    float coefficient;                // @16
+    float dt;                         // @20 -> 24
+}
+[[vk::push_constant]]
+ConstantBuffer<PsSolveDensityParams> gSd;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void ps_solveDensityLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gSd.particleSystems);
+    const uint particleId = (Ptr<uint>(gSd.activeParticleSystems))[groupId.y];
+
+    if ((systems[particleId].mData_Flags & PS_FLAG_DISABLE_SELF_COLLISION) != 0u)
+        return;
+
+    const uint numParticles = systems[particleId].mCommonData_NumParticles;
+
+    const uint p = groupId.x * PS_FLUID_BLOCK + groupThreadId.x;
+    if (p >= numParticles)
+        return;
+
+    Ptr<float4> sortedNewPositions = Ptr<float4>(systems[particleId].mSortedPositions_InvMass);
+    Ptr<float4> sortedDeltaP = Ptr<float4>(systems[particleId].mSortedDeltaP);
+    Ptr<float> densities = Ptr<float>(systems[particleId].mDensity);
+    Ptr<float4> normals = Ptr<float4>(systems[particleId].mSurfaceNormal);
+    Ptr<uint> phases = Ptr<uint>(systems[particleId].mSortedPhaseArray);
+    Ptr<uint> collisionIndex = Ptr<uint>(systems[particleId].mCollisionIndex);
+    Ptr<float2> collisionForces = Ptr<float2>(systems[particleId].mDensityCollisionImpulses);
+    Ptr<float4> deltas = Ptr<float4>(systems[particleId].mDelta);
+
+    const uint phase = phases[p];
+    const bool isFluid = psGetFluid(phase);
+    const uint group = psGetGroup(phase);
+
+    const float4 xi4 = sortedNewPositions[p];
+
+    // S1: a fixed particle clears its delta and returns.
+    if (xi4.w == 0.0f)
+    {
+        deltas[p] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+
+    // The material loads sit BELOW the early-out here; see the header.
+    const uint mi = sdLoadPhaseToMaterial(systems[particleId].mPhaseGroupToMaterialHandle, group);
+    const uint64_t matBase = systems[particleId].mParticleMaterials
+                           + uint64_t(mi) * uint64_t(systems[particleId].mParticleMaterialStride);
+    Ptr<float> mat = Ptr<float>(matBase);
+    const uint64_t derivedBase = systems[particleId].mDerivedPBDMaterialData
+                               + uint64_t(group) * uint64_t(PXG_PBD_DERIVED_STRIDE);
+    Ptr<float> derived = Ptr<float>(derivedBase);
+
+    const float3 xi = float3(xi4.x, xi4.y, xi4.z);
+    const float4 xiDelta4 = sortedDeltaP[p];
+    const float3 xiDelta = float3(xiDelta4.x, xiDelta4.y, xiDelta4.z);
+
+    // Only the xyz of normals[p] is live; ni4.w's two uses are commented out.
+    const float4 ni4 = normals[p];
+    const float3 ni = float3(ni4.x, ni4.y, ni4.z);
+
+    const float scale = gSd.dt;          // the CUDA's `const PxReal scale = dt;`
+    const float density = densities[p];
+    const uint contactCount = (Ptr<uint>(systems[particleId].mParticleSelfCollisionCount))[p];
+
+    float3 delta = float3(0.0f, 0.0f, 0.0f);
+
+    const float cellSizeSq = systems[particleId].mCommonData_ParticleContactDistanceSq;
+    const float cflRadius = systems[particleId].mCommonData_ParticleContactDistance
+                          * mat[PXG_PBD_MAT_F_CFL_COEFFICIENT];
+    const float solidRestDistance = 2.0f * systems[particleId].mData_SolidRestOffset;
+
+    const float spiky2 = systems[particleId].mData_Spiky2;
+    const float spiky1 = systems[particleId].mData_Spiky1;
+    // one load serves both the CUDA's particleContactDistanceInv and invRadius
+    const float particleContactDistanceInv =
+        systems[particleId].mCommonData_ParticleContactDistanceInv;
+
+    const float friction = mat[PXG_PBD_MAT_F_FRICTION] * mat[PXG_PBD_MAT_F_PARTICLE_FRICTION_SCALE];
+    const float cohesion = derived[PXG_PBD_DERIVED_F_COHESION] * scale;
+    const float cohesion1 = derived[PXG_PBD_DERIVED_F_COHESION1];
+    const float cohesion2 = derived[PXG_PBD_DERIVED_F_COHESION2];
+    const float viscosity = mat[PXG_PBD_MAT_F_VISCOSITY] * scale
+                          * systems[particleId].mData_InvRestDensity;
+    const float adhesion = mat[PXG_PBD_MAT_F_ADHESION] * mat[PXG_PBD_MAT_F_PARTICLE_ADHESION_SCALE];
+    const float matSurfaceTension = mat[PXG_PBD_MAT_F_SURFACE_TENSION_RAW];
+
+    const float cohesionRadius = solidRestDistance * mat[PXG_PBD_MAT_F_ADHESION_RADIUS_SCALE];
+    const float invAura = 1.0f / (cohesionRadius - solidRestDistance);
+
+    float weight = 0.0f;
+
+    // The CUDA's two-deep prefetch pipeline, un-rolled.  Unlike the density
+    // kernel's, this one is CORRECT: all five payloads (position, phase, density,
+    // deltaP and the q used for normals) come from the same index at every
+    // iteration, so the closed form is simply idx[i].
+    for (uint i = 0u; i < contactCount; ++i)
+    {
+        const uint q = collisionIndex[p + i * numParticles];
+        const float4 xj4 = sortedNewPositions[q];
+        const uint phase2 = phases[q];
+        const float density2 = isFluid ? densities[q] : 0.0f;
+        const float4 xjDelta4 = sortedDeltaP[q];
+        const float3 xjDelta = float3(xjDelta4.x, xjDelta4.y, xjDelta4.z);
+
+        const float3 xij = xi - float3(xj4.x, xj4.y, xj4.z);
+        const float dSq = xij.x * xij.x + xij.y * xij.y + xij.z * xij.z;
+
+        const uint writeOffset = p + i * numParticles;
+
+        if (dSq >= 1e-10f)                                   // S3
+        {
+            const float d = sqrt(dSq);                       // S2: a REAL sqrt
+            const float3 nij = (1.0f / d) * xij;
+
+            if (psGetFluid(phase2) && isFluid)               // S4
+            {
+                if (dSq < cellSizeSq && dSq > 0.0f)
+                {
+                    const float lambda = (density + density2) * 0.5f;    // S6
+                    const float s = lambda * dWdx(d, spiky2, particleContactDistanceInv);
+
+                    if (phase2 != phase)                     // S5
+                    {
+                        delta -= s * nij;
+                    }
+                    else
+                    {
+                        const float c = cohesion * WCohesion(d, cohesion1, cohesion2,
+                                                             particleContactDistanceInv);
+                        const float3 relDelta_ij = xiDelta - xjDelta;
+
+                        delta -= nij * (s + c);
+
+                        const float viscosityScale =
+                            1.0f - (1.0f / (1.0f + viscosity * W(d, spiky1,
+                                                                 particleContactDistanceInv)));
+                        delta -= viscosityScale * relDelta_ij;
+
+                        const float relDeltaProj = nij.x * relDelta_ij.x
+                                                 + nij.y * relDelta_ij.y
+                                                 + nij.z * relDelta_ij.z;
+                        if (relDeltaProj < -cflRadius)       // S7
+                            delta -= nij * (relDeltaProj + cflRadius) * 0.5f;
+
+                        if (matSurfaceTension > 0.0f)        // S8: the RAW field
+                        {
+                            const float4 nq4 = normals[q];
+                            delta = delta - (ni - float3(nq4.x, nq4.y, nq4.z)) * scale;
+                        }
+                    }
+
+                    weight += 1.0f;                          // S15
+                }
+            }
+            else
+            {
+                const float2 force = collisionForces[writeOffset];
+                float2 newForce;
+
+                const float w = xi4.w / (xi4.w + xj4.w);     // S9
+                const float e = (d - solidRestDistance);
+                // the CUDA's shadowing `xij = xjDelta - xiDelta` here is dead
+
+                float adhesionClamp = 0.0f;
+                if (d < cohesionRadius)                      // S10
+                    adhesionClamp = pxMax(0.0f, adhesion * oct(1.0f - e * invAura) * e);
+
+                const float mtd = pxClamp(pxMin(e, pxMax(-force.x, adhesionClamp)),
+                                          -solidRestDistance, solidRestDistance);   // S11
+
+                newForce.x = force.x + mtd;
+                newForce.y = force.y;
+
+                if (newForce.x != 0.0f)                      // S12
+                {
+                    const float deltaF = w * mtd;
+                    delta -= nij * deltaF;
+
+                    if (friction > 0.0f)
+                    {
+                        const float3 j = xiDelta - xjDelta;
+                        const float jn = j.x * nij.x + j.y * nij.y + j.z * nij.z;
+                        const float3 jt = j - jn * nij;
+                        const float jtSq = jt.x * jt.x + jt.y * jt.y + jt.z * jt.z;
+
+                        if (jtSq > 0.0f)
+                        {
+                            const float len = sqrt(jtSq);
+                            const float maxForce = pxMax(-newForce.x, 0.0f) * friction;
+                            // the CUDA spells this one as the raw CUDA min(); on
+                            // well-formed inputs (both operands non-negative) it
+                            // agrees with the PxMin ternary.
+                            const float clampedForce = pxMin(maxForce, len + newForce.y);
+                            const float deltaForce = clampedForce - newForce.y;   // S13
+
+                            newForce.y += deltaForce;
+
+                            // S14: PxVec3::operator/ is reciprocal-then-multiply,
+                            // NOT Slang's per-component divide.
+                            delta -= ((jt * deltaForce) * w) * (1.0f / len);
+                        }
+                    }
+
+                    weight += 1.0f;                          // S15
+                }
+
+                newForce.x = pxMin(newForce.x, 0.0f);        // S12: unconditional
+                collisionForces[writeOffset] = newForce;
+            }
+        }
+    }
+
+    delta *= gSd.coefficient;                                // S16
+    // the CUDA's __syncwarp() here orders nothing; see the header.
+
+    deltas[p] = float4(delta.x, delta.y, delta.z, weight);
+}

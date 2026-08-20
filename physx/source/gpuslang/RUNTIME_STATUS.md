@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **782/782** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **783/783** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,114 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.1c — ps_solveDensityLaunch (Manifest 327) — die Partikel kollidieren zum ersten Mal miteinander
+
+Der zweite Density-Kernel, und der erste dieser Phase, der die **Szene physikalisch
+verändert**.  Trotz des Namens ist er kein Fluid-Kernel: sein **Else-Zweig ist der
+Festkörper-Partikel-Kollisionssolve** (Adhäsion, Reibung, Warmstart-Impulse) und
+wird genommen, sobald **eines** der beiden Partikel eines Paares nicht-fluid ist.
+Da `ps_applyDeltaLaunch` `mDelta` nach dem Konsumieren nullt, war das Jacobi-Delta
+mit diesem Kernel refused in **jeder** Iteration identisch null — es gab bislang
+überhaupt keine Partikel-Partikel-Kollisionsantwort.
+
+**Die Messung, A/B auf derselben Szene, einzige Änderung ist das Mapping:**
+
+| | Ruhelage (mean y) | Ruhe-\|dy\| |
+|---|---|---|
+| `ps_solveDensityLaunch` **unmapped** | **0.25000** — die 64 Partikel durchdringen einander und kollabieren in **eine** Schicht auf dem Boden-Rest-Offset | 0.000000, erreicht in deutlich unter 120 Schritten |
+| **mapped** | **0.99919** — sie lösen ihre gegenseitigen Überlappungen auf und bilden einen echten 3D-Haufen | 0.000000, erreicht nach rund 150 Schritten |
+
+Das ist die Signatur echter Partikel-Partikel-Kollision, und sie ist der Grund, aus
+dem der Bag-Modus beim ersten Lauf **fehlschlug** (`rest |dy| = 0.030436` gegen eine
+Schwelle von 0.01): der Haufen war nach 120 Schritten schlicht noch nicht fertig.
+Er wurde **nicht** durch Aufweichen der Schwelle repariert.  Stattdessen:
+
+* das Schrittbudget des Bag-Modus steigt von 120 auf **240** (der Haufen braucht
+  jetzt echte Arbeit, um Überlappungen aufzulösen; 240 lässt Reserve und ein
+  60-Schritt-Ruhefenster), und
+* die Szene bekommt eine **neue, schärfere Assertion**: `yEnd > 0.6`.  Die drei
+  alten Prüfungen — gefallen, zur Ruhe gekommen, endlich — bestehen die kollabierte
+  Einzelschicht **ebenfalls**; nur die Haufenhöhe unterscheidet Kollision-an von
+  Kollision-aus.  Die 0.25-vs-0.999-Messung oben steht als Kommentar an der
+  Assertion, damit ein späterer Leser weiß, wogegen der Schwellwert kalibriert ist.
+
+Der Freifall-Modus bleibt **bitidentisch** (mean y 100.7500 → 80.9665): dort ist die
+Wolke zu weit auseinander, um Selbstkontakte zu erzeugen.
+
+**Vier tote Lokale gestrichen**, jedes durch Nachlesen **aller** Verwendungen im
+Rumpf belegt: `xiVel` (:3472) ist ein echter globaler Load von
+`mSortedVelocities[p]`, den nichts konsumiert; das **innere** `xij` (:3625)
+**beschattet** das äußere und wird nie referenziert (der Reibungsblock darunter
+rechnet die Negation als `j = xiDelta - xjDelta` neu); `ni4.w` ist tot, weil beide
+Verwendungen in der CUDA auskommentiert sind; und `invRadius` (:3502) ist ein
+zweiter Load desselben `mParticleContactDistanceInv`, das `particleContactDistanceInv`
+(:3495) schon hält.
+
+**Das `__syncwarp()` bei :3683 ist nicht tragend und entfällt.**  Anders als im
+P8.124-Fall gibt es hier **keine** Cross-Lane-Gefahr zu erhalten: nichts in der
+Schleife liest `mDelta`, und jeder Kraft-Slot, den die Schleife schreibt, ist
+`writeOffset = p + i*numParticles` — pro Partikel eindeutig.  Keine Lane liest je
+den Schreibvorgang einer anderen, die Barriere ordnet also nichts an.  Das steht
+hier ausdrücklich, weil P8.124 zeigt, dass die *umgekehrte* Annahme teuer ist.
+
+**Sechzehn Fallen, jede mit Mutanten** (S1–S16 im Modulkopf).  Die schärfste ist
+**S14**: `delta -= jt * deltaForce * w / length` geht durch
+`PxVec3::operator/`, und das ist ein **Reziprok-dann-Multiplizieren**
+(PxVec3.h:219-223), kein komponentenweises Teilen.  Slangs `/` auf einem `float3`
+**ist** komponentenweise, also muss der Port den Kehrwert ausschreiben.  Ebenfalls
+bemerkenswert: `d` ist hier ein **echtes** `sqrtf(dSq)`, während der Nachbarkernel
+`1.f/rsqrtf(dSq)` benutzt; und das Gate der Oberflächenspannung ist das **rohe**
+`mat.surfaceTension` (:3609), nicht das `derivedMaterial.surfaceTensionDerived`,
+das der Dichtekernel verwendet.
+
+**Sweep 55/55 getötet** — nach fünf Fixture-Korrekturen.  Alle fünf waren
+**Identitäten**, keine Shader-Fehler, und jede hat eine eigene Lehre:
+
+1. `sd-fixed-particle-no-early-out` überlebte, weil Partikel 0 nur einen Fluid-
+   Nachbarn **außer Reichweite** hatte.  Ein Nachbar in Reichweite genügt nicht
+   allein: bei `invMass == 0` ist der Massenanteil `w` null, der Solid-Zweig trägt
+   also **kein** Delta bei — er schreibt aber die Kollisionskraft und erhöht
+   `weight`, und **das** macht den Mutanten sichtbar.  Der Zeuge ist deshalb ein
+   *fester* Nachbar, kein Fluid-Nachbar.
+2. `sd-inner-range-guard-le` überlebte, weil kein Fluid-Paar **exakt** auf
+   `cellSizeSq` lag.  Zeuge ergänzt mit exakt darstellbaren Koordinaten
+   (0.75 − 0.25 = 0.5, 0.5·0.5 = 0.25 = `contactDistSq`).
+3. `sd-phase-split-on-group` überlebte, weil in der Fixture `phase == group|FLUID`
+   galt — „Phase ungleich" und „Gruppe ungleich" waren damit **äquivalent**.  Zeuge:
+   zwei Fluid-Partikel derselben Gruppe, von denen eines zusätzlich
+   `eParticlePhaseSelfCollide` (Bit 20, außerhalb der Gruppenmaske) trägt.  Die
+   Engine splittet auf dem **ganzen** Phasenwort.
+4. `sd-cfl-no-half` überlebte, weil ich das **Vorzeichen** der Relativverschiebung
+   falsch gesetzt hatte: `nij` zeigt von j nach i, die Verschiebung muss also nach
+   `+x` zeigen, damit `relDeltaProj` **negativ** wird und der Zweig überhaupt feuert.
+5. `sd-adhesion-no-scale` überlebte gleich doppelt: überall dominierte `-force.x`
+   (Größenordnung 1e-2) den `adhesionClamp` (1e-4), **und** der Adhäsionsskalar von
+   Material 2 lag zufällig auf exakt **1.0**, was den Mutanten für dieses Material
+   ohnehin zur Identität machte.  Behoben durch eine Skalarreihe, die 1.0 meidet,
+   plus ein Paar mit Warmstart 1e-5, bei dem die Adhäsion das `pxMax` gewinnt.
+
+Punkt 5 ist die allgemeinere Lehre und steht jetzt als Kommentar an der
+Materialtabelle: **ein Skalierungsfaktor von exakt 1.0 macht jeden Mutanten, der
+ihn streicht, zur Identität.**  Dieselbe Familie wie die „verschiedene Grenzen
+müssen verschiedene Zahlen sein"-Regel, nur für Faktoren statt für Schranken.
+
+**Fixture:** dieselbe Vier-System-Geometrie wie P9.1b (Pool von vier, drei aktiv,
+Aktivliste `{2,0,3}`, Köder auf Index 1, `eDISABLE_SELF_COLLISION` auf einem
+**voll bestückten** aktiven System, vergifteter Puffer-Schwanz `PAD = 544`), drei
+Phasengruppen (0 und 1 fluid, 2 solid) für alle vier Paararten, drei Materialien
+mit je einem Nullwert bei Reibung und Oberflächenspannung.  Zwei Ausgaben werden
+byte-exakt geprüft: `mDelta` gegen Gift und
+`mDensityCollisionImpulses` gegen seine **Saat** — letzteres ist die schärfere
+Prüfung, weil der Solid-Zweig es bedingungslos schreibt und der Fluid-Zweig nie, das
+Muster aus gesäten und überschriebenen Slots also exakt kodiert, welches Paar welchen
+Zweig genommen hat.  Abdeckung im Lauf: 134 Fluid-Paare (72 gleichphasig / 62
+verschiedenphasig), 828 Solid-Paare, 5 unter der 1e-10-Schranke.
+
+**Suite 705/705 in beiden Speichermodi**, `ctest` **783**.  Manifest **326 → 327**.
+**Szene:** Refused **175 → 174**, 600 Launches OK, und **alle 21 Szenen plus der
+Bag-Modus grün** (22 Läufe, null Fehlschläge) — die Verhaltensänderung bleibt auf
+die Partikelszene beschränkt, wo sie hingehört.
 
 ## P9.1b — ps_calculateDensityAndPotentialLaunch, die SPH-Dichte (Manifest 326) — der erste reproduzierte Upstream-Bug
 
