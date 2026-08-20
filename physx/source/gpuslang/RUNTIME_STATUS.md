@@ -1842,14 +1842,26 @@ auf beiden Seiten) reichten aus.
 bereits von `psSpringsLayout` aus P9.3a gepinnt, ein zweiter Satz `offsetof`s wäre
 Rauschen gewesen.  Manifest **331 → 332**.
 
-**Szene:** Refused **170 → 169** (501 − Manifest).  Der Szenen-Durchlauf war zum
-Zeitpunkt dieses Commits noch nicht durch — 12 der 23 sind grün gemeldet (bis
-`cloth`), der Rest lief noch; das vollständige Ergebnis kommt im Folge-Commit,
-und diese Zeile wird dann durch die gemessene Zahl ersetzt statt behauptet.
-Dispatcht wird der Kernel weiterhin von keiner Szene: der Host bindet die ganze
-Federkette an `getMaxSpringsPerBuffer() > 0`, und noch legt keine Szene einen
+**Szene:** alle **23 grün**, Refused **170 → 169** (501 − Manifest).  Dispatcht
+wird der Kernel weiterhin von keiner Szene: der Host bindet die ganze Federkette
+an `getMaxSpringsPerBuffer() > 0`, und noch legt keine Szene einen
 PBD-Cloth-Puffer an.  Das ändert sich mit P9.4, sobald `ps_averageVertsLaunch`
 dazukommt und die `particlecloth`-Szene die Kette schließt.
+
+**Und eine Lektion über den Szenen-Durchlauf selbst, die diese Tranche gekostet
+hat.**  Der erste Durchlauf meldete `particlebag` mit einer **leeren** Zeile —
+weder OK noch FAIL — und ein Skript, das nur nach `[ FAIL ]` greppt, hätte das
+als grün durchgewunken.  Die Ursache: **`particlebag` ist gar kein Szenenname.**
+Der Sack ist `PXG_SCENE=particle` **plus** gesetztes `PXG_PARTICLE_STARTY`
+(`testGpuSdkStep.cpp:3068`); als Szenenname übergeben landet er im
+`unknown PXG_SCENE`-Zweig (`:4389`), der eine Zeile ohne die Marker `[  OK  ]`
+oder `[ FAIL ]` druckt und mit 1 endet.  Richtig aufgerufen ist die Szene grün:
+mean y 4.7500 → 0.9992, rest |dy| = 0.000002 — exakt die 0.99919, die P9.1c als
+den Wert mit lebendigem `ps_solveDensityLaunch` gemessen hat.  Der Runner
+prüft jetzt auf **fehlende Verdikte** und zählt sie getrennt, statt Schweigen für
+Erfolg zu halten.  (Die `unknown PXG_SCENE`-Liste in `:4389` ist ihrerseits
+veraltet — sie nennt weder `particle`-Untermodi noch `particlefluid`; das ist
+kosmetisch, wurde hier aber gesehen und nicht stillschweigend übergangen.)
 
 ## P9.3a — die PBD-Cloth-ABI und das Feder-Gather-Paar (Manifest 331)
 

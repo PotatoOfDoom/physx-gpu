@@ -4386,7 +4386,18 @@ int main()
     else if (!std::strcmp(sceneName, "joint"))     buildJointScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "meshfloor")) buildMeshFloorScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "articulation")) buildArticulationScene(physics, scene, material, targets);
-    else { std::printf("FAIL: unknown PXG_SCENE='%s' (box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|articulation|particle|cloth|clothhang|clothdrape|clothselfcollide|clothcloth|softbody|softbodyselfcollide|softbodycloth|softbodystack|softbodyattach)\n", sceneName);
+    // The list is spelled out in full deliberately: an out-of-date usage string is
+    // what turned a mistyped scene into a silent non-result once already.  This
+    // branch prints NEITHER [  OK  ] nor [ FAIL ], so a sweep that greps only for
+    // [ FAIL ] reads the miss as a pass -- hence the [ FAIL ] marker below.
+    // Note there is no 'particlebag' scene: the settling bag is PXG_SCENE=particle
+    // with PXG_PARTICLE_STARTY set (see bagMode above).
+    else { std::printf("[ FAIL ] gpu-sdk-step: unknown PXG_SCENE='%s'\n"
+                       "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|articulation\n"
+                       "          particle|particlefluid|cloth|clothhang|clothdrape|clothselfcollide|clothcloth\n"
+                       "          softbody|softbodyselfcollide|softbodycloth|softbodystack|softbodyattach\n"
+                       "  modes:  PXG_SCENE=particle + PXG_PARTICLE_STARTY=<y>  (the settling bag)\n",
+                       sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
     if (targets.empty())
     {
