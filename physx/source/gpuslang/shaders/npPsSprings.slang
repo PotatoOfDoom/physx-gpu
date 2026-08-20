@@ -381,3 +381,235 @@ void ps_solveSpringsLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId
         }
     }
 }
+
+// ============================================================================
+// P9.3c -- ps_averageVertsLaunch (particlesystem.cu:4312-4435)
+// ============================================================================
+// The GATHER that closes the cloth triple.  ps_updateRemapVertsLaunch scattered
+// every spring endpoint into mRemapPositions; the per-partition
+// ps_solveSpringsLaunch loop moved those duplicates; this kernel folds each
+// particle's scattered copies back into ONE per-particle correction and ADDS it
+// into mAccumDeltaP.  One thread per BUFFER-LOCAL particle of one cloth buffer
+// of one active system.
+//
+// LAUNCH (PxgPBDParticleSystemCore.cpp:1031-1052): grid
+// (ceil(mMaxParticlesPerBuffer / UPDATEBOUND), mMaxClothBuffersPerSystem,
+// nbActive), block (UPDATEBOUND = 1024, 1, 1) -- a THIRD block dim in this
+// module, after the gather pair's 1024 and the solve's 512.  Args
+// (particleSystems*, activeParticleSystems*, PxReal invDt) -> {8,8,4} = 20
+// bytes, rounded to the 8-alignment -> 24.  Dispatched ONCE per solver
+// iteration, not once per partition, and gated host-side by
+// getMaxSpringsPerBuffer() > 0 (:958).
+//
+// ZERO new ABI: every field is already mapped by P9.3a/P9.3b.  This is the first
+// consumer of PxParticleClothGpu, which P9.3a defined and nothing used.
+//
+// Traps, each with a mutant:
+//  A1. THREE index spaces in eight lines.  `index = groupThreadIdx + offset` is
+//      GLOBAL; `sortedInd = reverseLookup[index]` is the sorted slot; but the
+//      copy run is indexed by the BUFFER-LOCAL `groupThreadIdx`, and its
+//      zero-sentinel tests `groupThreadIdx == 0`, not `index == 0`.  The runsum
+//      array is exactly mNumActiveParticles long, so a global subscript is out
+//      of range by construction.
+//  A2. The store is a read-modify-write ACCUMULATE, and ALL FOUR lanes take
+//      part.  cutil_math.h's float4 operator-, operator+= and operator*(float4,
+//      float) each touch .w (:451-470), and the CUDA -- unlike its softbody twin
+//      (softBodyGM.cu:1574) -- never zeroes diff.w.  A float3 port is
+//      ACCIDENTALLY correct in the live pipeline, because ps_solveSpringsLaunch
+//      writes pos_im.w into every copy so diff.w cancels to exactly 0.
+//  A3. The binarySearch KEY is global while the searched array is BUFFER-LOCAL:
+//      `sortedClothStartIndices[i] = cloths[i].startVertexIndex` is written
+//      host-side with NO offset (NpParticleBuffer.cpp:587), yet the key is
+//      `index`, and the very next line re-adds the offset to the same record's
+//      startVertexIndex.  Transcribed as written -- see the RUNTIME_STATUS entry
+//      for why this is an upstream defect the port must reproduce, not fix.
+//  A4. binarySearch (reduction.cuh:726-752) is `largest i with data[i] <= value`
+//      CLAMPED TO 0 -- an upper-bound-minus-one, not a lower_bound, and it has
+//      no not-found sentinel: it returns 0 both for a genuine hit at 0 and for
+//      data[0] > value.  The range test below is what disambiguates them.
+//  A5. `springOffset = nbSprings * 2` -- the copy region starts AFTER both
+//      endpoint planes.  The name invites reading it as "offset of the springs".
+//  A6. Everything positional is addressed by `sortedInd`, and the line above the
+//      live one names the OPPOSITE mapping in a comment.  mUnsortedToSortedMapping
+//      (@48) and mSortedToUnsortedMapping (@56) are adjacent descriptor slots.
+//  A7. Block dim is 1024 (the stale comment above the kernel says 256), the grid
+//      is 3D with the system on Z, and `invDt` is a live push-constant field the
+//      body must NEVER read -- the softbody twin does read its own.
+//  A8. mAccumulatedCopiesPerParticles is an INCLUSIVE runsum (NpParticleBuffer.cpp
+//      :494-495): entry i is the END of particle i's run.  The header's own
+//      `//numSprings` annotation on the field is wrong; the array is
+//      mNumActiveParticles long.
+//  A9. The reduction PEELS the first element and the range is half-open:
+//      `diff = poses[startInd] - pos` then `for j = startInd+1; j < endInd`.
+//      Because the peel is a real load and not a literal zero, the P8.84
+//      signed-zero fold does NOT apply here.
+// A10. The cloth range test is STRICT `>`, offset-lifted, and has NO lower
+//      bound -- it leans entirely on binarySearch's `<=` contract.  "Completing"
+//      the interval changes behaviour exactly where the clamp-to-0 fired.
+// A11. `if (numCopies)` is the divide-by-zero gate AND the empty-run gate: a
+//      particle of a non-cloth type in the same buffer never went through the
+//      partition table and has a flat run.  `deltaP` is loaded OUTSIDE it.
+// A12. Two-level buffer indirection: only the CLOTH record is indexed by
+//      blockIdx.y; the particle buffer and the runsum both go through
+//      clothBuffer.mParticleBufferIndex, so nbParticles comes from the PARTICLE
+//      buffer.  Several cloth buffers may share one particle buffer.
+// A13. The `&&` short-circuit is the only thing that stops cloths[0] being
+//      dereferenced against a ZERO-LENGTH allocation when mNumCloths == 0 (which
+//      is also the only case where `clothIndex < mNumCloths` can be false, since
+//      binarySearch can never return >= numElements).  Reproduced here as a real
+//      BRANCH rather than a `&&`: per the P8.96c rule llvmpipe turns a guarded
+//      uniform BDA load into an unconditional load plus a select, and only
+//      branch-guarded loads were observed not to speculate.
+// A14. PxParticleCloth's stride is 28, NOT 32 -- seven 4-byte members, align 4,
+//      no trailing pad.  Loaded here by explicit byte address rather than
+//      through Ptr<PxParticleClothGpu>, so the stride is spelled once and no
+//      assumption is made about how Slang lays out a 4-aligned struct.
+// A15. mNumCloths is re-read from the record twice and the array is exactly that
+//      long.
+
+// argSizes (PxgPBDParticleSystemCore.cpp:1038-1043):
+// { particleSystems*, activeParticleSystems*, PxReal invDt } -> {8,8,4} = 20,
+// rounded to the 8-alignment -> 24.
+struct PsAverageVertsParams
+{
+    uint64_t particleSystems;         // @0
+    uint64_t activeParticleSystems;   // @8
+    float invDt;                      // @16  DEAD: the body must never read it
+    uint _pad20;                      // @20 -> 24
+}
+[[vk::push_constant]]
+ConstantBuffer<PsAverageVertsParams> gAv;
+
+// sizeof(PxgParticleSimBuffer), generated and pinned by the fixture.
+static const uint PXG_PARTICLE_SIM_BUFFER_STRIDE = 88u;
+// A14: sizeof(PxParticleCloth) -- 28, not 32.
+static const uint PXG_PARTICLE_CLOTH_STRIDE = 28u;
+
+// A14: the three fields this kernel reads, by explicit byte address.
+uint64_t avClothRecAddr(uint64_t base, uint i)
+{
+    return base + uint64_t(i) * uint64_t(PXG_PARTICLE_CLOTH_STRIDE);
+}
+uint avClothStartVertexIndex(uint64_t base, uint i) { return (Ptr<uint>(avClothRecAddr(base, i)))[0]; }
+uint avClothNumVertices(uint64_t base, uint i)      { return (Ptr<uint>(avClothRecAddr(base, i)))[1]; }
+float avClothBlendScale(uint64_t base, uint i)      { return (Ptr<float>(avClothRecAddr(base, i)))[2]; }
+
+// A4: binarySearch, gpucommon/src/CUDA/reduction.cuh:726-752.  "The largest
+// index into the (sorted!) data array s.t. data[index] <= value; if there is no
+// such index (i.e. data[0] > value) returns 0."  Note the dead
+// `//while((right - left) > 1)` directly above the live loop in the original --
+// it is NOT equivalent and is not what runs.
+uint avBinarySearch(Ptr<uint> data, uint numElements, uint value)
+{
+    uint left = 0u;
+    uint right = numElements;
+    while (left < right)
+    {
+        const uint pos = (left + right) / 2u;
+        const uint element = data[pos];
+        if (element <= value)
+            left = pos + 1u;
+        else
+            right = pos;
+    }
+    return (left != 0u) ? (left - 1u) : 0u;
+}
+
+[shader("compute")]
+[numthreads(1024, 1, 1)]
+void ps_averageVertsLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gAv.particleSystems);
+    const uint particleId = (Ptr<uint>(gAv.activeParticleSystems))[groupId.z];   // A7
+
+    const uint bufferIndex = groupId.y;
+
+    if (bufferIndex < systems[particleId].mNumClothBuffers)
+    {
+        Ptr<PxgParticleClothSimBufferGpu> cloth =
+            Ptr<PxgParticleClothSimBufferGpu>(psClothBufferAddr(systems, particleId, bufferIndex));
+
+        // A12: the particle buffer is NOT bufferIndex.
+        const uint particleBufferIndex = cloth[0].mParticleBufferIndex;
+        Ptr<PxgParticleSimBufferGpu> particleBuffers =
+            Ptr<PxgParticleSimBufferGpu>(systems[particleId].mParticleSimBuffers);
+        const uint offset =
+            (Ptr<uint>(systems[particleId].mParticleBufferRunsum))[particleBufferIndex];
+
+        const uint groupThreadIdx = groupThreadId.x + groupId.x * PS_UPDATEBOUND_BLOCK;
+
+        const uint nbParticles = particleBuffers[particleBufferIndex].mNumActiveParticles;
+        const uint nbSprings = cloth[0].mNumSprings;
+
+        // A6: mUnsortedToSortedMapping (@48), not its neighbour at @56.
+        Ptr<uint> reverseLookup = Ptr<uint>(systems[particleId].mUnsortedToSortedMapping);
+
+        if (groupThreadIdx < nbParticles && nbSprings > 0u)
+        {
+            Ptr<float4> positions = Ptr<float4>(systems[particleId].mSortedPositions_InvMass);
+            Ptr<uint> startIndices = Ptr<uint>(cloth[0].mSortedClothStartIndices);
+            Ptr<uint> accumulatedCopies = Ptr<uint>(cloth[0].mAccumulatedCopiesPerParticles);
+            const uint64_t cloths = cloth[0].mCloths;
+
+            // A5: the copy region starts after BOTH endpoint planes.
+            const uint springOffset = nbSprings * 2u;
+            Ptr<float4> accumulatedPoses =
+                Ptr<float4>(cloth[0].mRemapPositions + uint64_t(springOffset) * 16ull);
+
+            Ptr<float4> accumDeltaP = Ptr<float4>(systems[particleId].mAccumDeltaP);
+
+            const uint index = groupThreadIdx + offset;
+            const uint sortedInd = reverseLookup[index];
+
+            const float4 pos_invMass = positions[sortedInd];
+
+            if (pos_invMass.w > 0.0f)
+            {
+                // A2: loaded BEFORE the numCopies test, and all four lanes.
+                const float4 deltaP = accumDeltaP[sortedInd];
+
+                // A1 + A8: buffer-local subscript, buffer-local sentinel,
+                // INCLUSIVE runsum.
+                const uint startInd = (groupThreadIdx == 0u) ? 0u
+                                                             : accumulatedCopies[groupThreadIdx - 1u];
+                const uint endInd = accumulatedCopies[groupThreadIdx];
+
+                const uint numCopies = endInd - startInd;
+
+                if (numCopies != 0u)                                        // A11
+                {
+                    // A9: peel the first, then a half-open ascending loop.
+                    float4 diff = accumulatedPoses[startInd] - pos_invMass;
+
+                    for (uint j = startInd + 1u; j < endInd; ++j)
+                        diff += accumulatedPoses[j] - pos_invMass;
+
+                    const uint numCloths = cloth[0].mNumCloths;             // A15
+
+                    // A3: the GLOBAL key against the BUFFER-LOCAL array.
+                    const uint clothIndex = avBinarySearch(startIndices, numCloths, index);
+
+                    // A13: a real branch, not a `&&` -- see the header.
+                    bool useBlend = false;
+                    if (clothIndex < numCloths)
+                    {
+                        const uint startVertexIndex = avClothStartVertexIndex(cloths, clothIndex);
+                        const uint numVertices = avClothNumVertices(cloths, clothIndex);
+                        // A10: strict >, offset-lifted, no lower bound.
+                        useBlend = ((startVertexIndex + offset) + numVertices) > index;
+                    }
+
+                    float scale;
+                    if (useBlend)
+                        scale = avClothBlendScale(cloths, clothIndex);
+                    else
+                        scale = 1.0f / float(numCopies);
+
+                    const float4 averageDeltaP = diff * scale;
+
+                    accumDeltaP[sortedInd] = deltaP + averageDeltaP;        // A2
+                }
+            }
+        }
+    }
+}

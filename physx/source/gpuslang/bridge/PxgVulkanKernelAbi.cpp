@@ -1440,6 +1440,12 @@ static const PxgKernelAbiRow kRows[] = {
     //   PxReal invDt, PxU32 partitionId, bool isTGS) -> 25 bytes, rounded to the
     //   8-alignment -> a 32-byte blob.  The bool byte sits at 24.
     { "ps_solveSpringsLaunch", kPsSolveSprings, uint32_t(sizeof(kPsSolveSprings)) },
+    // P9.3c: ps_averageVertsLaunch(particleSystems*, activeParticleSystems*,
+    //   PxReal invDt) -> the same {8,8,4} = 24-byte shape as kPsUpdateUserBuffer.
+    //   invDt is a DEAD argument the kernel never reads.  The live launch site
+    //   uses the sized PX_CUDA_KERNEL_PARAM form, which takes its sizes from the
+    //   params themselves, so this row is for parity and for hostPtrMask 0.
+    { "ps_averageVertsLaunch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
     // gpusimulationcontroller FEMCloth kernels (P7.0 FEMCloth free-fall BDA)
     { "cloth_preIntegrateLaunch", kClothPreIntegrate, uint32_t(sizeof(kClothPreIntegrate)) },
     { "cloth_finalizeVelocitiesLaunch", kClothFinalizeVel, uint32_t(sizeof(kClothFinalizeVel)) },

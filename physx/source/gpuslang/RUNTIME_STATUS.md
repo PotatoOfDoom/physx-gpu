@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **786/786** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **787/787** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,172 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.3c — `ps_averageVertsLaunch`: der Gather, der die Cloth-Kette schließt (Manifest 333) — und ein VIERZEHNTER Upstream-Verdacht
+
+Der vierte und letzte Kernel der PBD-Cloth-Federkette, `particlesystem.cu:4312-4435`
+vollständig gelesen und als vierter Entry-Point von `npPsSprings.slang` portiert.
+`ps_updateRemapVertsLaunch` hat jeden Feder-Endpunkt dupliziert, die
+Partitionsschleife von `ps_solveSpringsLaunch` hat die Duplikate bewegt — dieser
+Kernel faltet die verstreuten Kopien jedes Partikels zu **einer** Korrektur
+zusammen und **addiert** sie in `mAccumDeltaP`.  Ein Thread je
+**pufferlokalem** Partikel eines Cloth-Puffers eines aktiven Systems.
+
+**Launch** (`PxgPBDParticleSystemCore.cpp:1031-1052`): Grid
+`(ceil(mMaxParticlesPerBuffer / UPDATEBOUND), mMaxClothBuffersPerSystem, nbActive)`,
+Block **1024** — die *dritte* Blockdimension in diesem Modul, nach der 1024 des
+Gather-Paars und der 512 des Lösers.  Args `{8,8,4}` = 20 Bytes, auf 8 gerundet →
+24-Byte-Blob.  Dispatcht **einmal je Solver-Iteration**, nicht je Partition.
+
+**Das ABI-Delta ist NULL.**  Zum ersten Mal in dieser Kette braucht eine Tranche
+weder eine neue Konstante noch ein neues Feld: alles, was der Kernel anfasst, hat
+P9.3a/P9.3b schon gelegt.  Diese Tranche ist der **erste Konsument** von
+`PxParticleClothGpu` — P9.3a hat den Record definiert, benutzt hat ihn bisher
+niemand.
+
+**Fünfzehn Fallen.**  Die tragenden, mit ihren Mutanten:
+
+* **A1 — DREI Indexräume in acht Zeilen.**  `index = groupThreadIdx + offset` ist
+  global; `sortedInd = reverseLookup[index]` ist der sortierte Platz; der
+  Kopien-Lauf aber wird mit dem **pufferlokalen** `groupThreadIdx` indiziert, und
+  seine Null-Sentinel prüft `groupThreadIdx == 0`, nicht `index == 0`.  Das
+  Runsum-Array ist exakt `mNumActiveParticles` lang — ein globaler Index liegt
+  konstruktionsbedingt daneben.
+* **A2 — der Store ist ein Read-Modify-Write, und ALLE VIER Lanes machen mit.**
+  `cutil_math.h`s `operator-`, `operator+=` und `operator*(float4, float)` fassen
+  jeweils `.w` an (:451-470), und anders als sein Softbody-Zwilling
+  (`softBodyGM.cu:1574`) nullt dieser Kernel `diff.w` **nicht**.  In der lebenden
+  Pipeline ist ein `float3`-Port **zufällig richtig**, weil
+  `ps_solveSpringsLaunch` die inverse Masse in jede Kopie schreibt und `diff.w`
+  exakt zu 0 kürzt — die Fixture bricht diese Invariante deshalb bewusst auf
+  einem Teil der Kopien auf.
+* **A4 — `binarySearch` ist „größter Index mit `data[i] <= value`", auf 0
+  GEKLAMMERT** (`reduction.cuh:726-752`), also ein Upper-Bound-minus-eins und
+  kein `lower_bound`, und es hat **keine Nicht-gefunden-Sentinel**: es liefert 0
+  sowohl für einen echten Treffer bei 0 als auch für `data[0] > value`.  Erst der
+  Bereichstest darunter trennt die beiden.  Nebenbei: direkt über der lebenden
+  Schleife steht ein auskommentiertes `//while((right - left) > 1)`, das **nicht**
+  äquivalent ist.
+* **A10 — der Bereichstest ist ein striktes `>`, offset-angehoben, und hat KEINE
+  untere Schranke.**
+* **A13 — der `&&`-Kurzschluss ist das Einzige, was `cloths[0]` davor bewahrt,
+  gegen eine NULL-LANGE Allokation dereferenziert zu werden**, wenn
+  `mNumCloths == 0` — und das ist zugleich der einzige Fall, in dem
+  `clothIndex < mNumCloths` überhaupt falsch werden kann, weil `binarySearch`
+  niemals `>= numElements` liefern kann.  Der Port buchstabiert das als **echten
+  Branch** statt als `&&`: nach der Regel aus P8.96c macht llvmpipe aus einem
+  bewachten uniformen BDA-Load einen unbedingten Load plus Select, und nur
+  *branch*-bewachte Loads wurden dabei nicht spekulierend beobachtet.
+* **A14 — der Stride von `PxParticleCloth` ist 28, nicht 32.**  Sieben 4-Byte-
+  Member, Align 4, kein Schluss-Padding.  Hier per **expliziter Byte-Adresse**
+  geladen statt über `Ptr<PxParticleClothGpu>`, damit der Stride genau einmal
+  buchstabiert wird und keine Annahme darüber nötig ist, wie Slang einen
+  4-ausgerichteten Struct auslegt.
+* **A7 — `invDt` ist ein TOTES Argument**, das der Body nie liest (der
+  Softbody-Zwilling liest sein eigenes sehr wohl).  Die Fixture dispatcht deshalb
+  **zweimal mit `60.0f` und `-1.0e30f`** und verlangt bitidentische Ausgabe: jede
+  Benutzung stirbt daran.
+
+**Fixture (`tests/testPsAverageVerts.cpp`).**  Der stehende Pool mit Köder auf
+Index 1 und nicht-permutierender Aktivliste `{2, 0}`; Grid **nicht quadratisch**
+(Y = 4 gegen Z = 2), die Lektion aus P9.3b als Assertion.  System A hat drei
+Partikelpuffer und eine **nicht-identische** Cloth→Partikel-Puffer-Abbildung;
+System B einen Cloth-Puffer mit `mNumCloths == 0` über echter Null-Länge, hinter
+der ein Gift-Record liegt, der den Bereichstest **bestehen** würde.  Sechzehn
+Deckungszähler sind als Assertions ausgeführt.
+
+**Der wichtigste Fixture-Satz steht ganz oben in der Datei:** weil der Kernel
+akkumuliert, ist ein genulltes `mAccumDeltaP` der sicherste Weg, einen grünen
+Test zu liefern, der nichts beweist — `deltaP + averageDeltaP` und
+`averageDeltaP` wären dieselbe Zahl.  Es ist deshalb in **allen vier Lanes**
+pro Platz verschieden vorbelegt.
+
+**Zwei Gift-POLARITÄTEN, die das Haus-`0xABABABAB` verletzt, und beide sind
+tragend:**
+
+1. Die Pads von `mAccumulatedCopiesPerParticles` müssen **terminierend** sein.
+   `numCopies = endInd - startInd` ist vorzeichenlos: ein `0xABABABAB`-Vorlauf
+   ergibt ~4·10⁹ Kopien, und die Schleife **hängt die GPU auf**, statt den Test
+   scheitern zu lassen.
+2. Der Nachlauf-Pad von `mSortedClothStartIndices` muss **klein** sein.
+   `binarySearch` schrumpft `right`, sobald `data[pos] > value` — ein großer Pad
+   macht einen `numElements + 1`-Mutanten **identisch** zur korrekten Suche.
+
+**Und eine Verfeinerung der Gift-Regel selbst, die diese Tranche gefunden hat:
+nicht nur die Größe des Nachlaufs zählt, sondern seine FORM.**  Ein *flacher*
+Nachlauf im Runsum gibt `start == end`, die `numCopies`-Schranke steigt aus, und
+ein Mutant, der `groupThreadIdx < nbParticles` streicht, ist eine **Identität**.
+Der Nachlauf **steigt** deshalb acht Einträge lang (sodass die ersten acht
+Threads jenseits der Schranke je einen Ein-Element-Lauf auf die acht Giftplätze
+hinter der Kopienregion finden und dorthin schreiben, wo die Referenz nicht
+schreibt) und wird erst danach flach, damit alles Weitere gefahrlos untätig
+bleibt.  Dieselbe Überlegung gilt für die Abbildung: hinter der Permutation liegt
+ein Schwanz, der auf einen **lebenden** Platz zeigt, damit eine gestrichene
+Schranke beobachtbar wird statt tödlich.
+
+**Beide Runden waren im ersten Lauf bitgenau** — es gab nichts zu debuggen.
+
+**Sweep 50 Mutanten, 50 getötet, KEIN Überlebender.**  Der erste Sweep dieser
+Phase ohne einen einzigen.  Getötet wurden unter anderem: der global indizierte
+Kopien-Lauf und die auf `index` verschobene Sentinel, das exklusive statt
+inklusive Runsum, der nicht-akkumulierende Store, die weggelassene `.w`-Lane, der
+lokale Suchschlüssel, der Bereichstest ohne `offset`, `lower_bound` statt
+Upper-Bound-minus-eins, das fehlende `-1`, die ungeklammerte Version,
+`springOffset = nbSprings`, beide Abbildungen vertauscht, die Schleife ab
+`startInd` und die inklusive Schleife, der weggelassene Peel, `>=` statt `>`, die
+hinzugefügte untere Schranke, der hochgezogene Cloth-Load, die Stride-32-Variante,
+alle drei Feld-Offsets einzeln, beide Skalen-Zweige einzeln, die
+Puffer-Indirektion, alle vier Guards, beide Grid-Achsen, die Blockdimension 512,
+der 512er Stride und — der Beweis, dass `invDt` wirklich tot ist — jede Benutzung
+davon.
+
+### Upstream-Kandidat #14: der Suchschlüssel ist global, das durchsuchte Array ist pufferlokal
+
+Beim Lesen fiel eine echte Inkonsistenz in der CUDA auf, und sie ist mechanisch
+vollständig belegt:
+
+* `output.sortedClothStartIndices[i] = cloths[i].startVertexIndex;`
+  (`NpParticleBuffer.cpp:587`) schreibt die Starts **ohne** Offset — sie sind
+  pufferlokal;
+* der Kernel sucht darin aber mit `binarySearch(startIndices, mNumCloths, index)`
+  (`:4408`), wobei `index = groupThreadIdx + offset` **global** ist (`:4372`);
+* und die unmittelbar folgende Zeile addiert den Offset auf denselben Record
+  wieder drauf: `(cloths[clothIndex].startVertexIndex + offset) + numVertices > index`
+  (`:4413`).  Die beiden Hälften leben in verschiedenen Indexräumen.
+
+Die Folge: sobald `offset > 0` ist, vergleicht **jeder** lokale Start `<=` mit dem
+Schlüssel, `binarySearch` liefert also immer den **letzten** Cloth, und jedes
+Partikel des Puffers bekommt dessen `clothBlendScale`.  Da
+`clothBlendScale = 1/(maxPartitions + 1)` je Cloth aus dessen *eigenen* maximalen
+Kopienzahlen gebildet wird (`:565-579`), sind die Skalen verschiedener Cloths im
+Normalfall verschieden.  `offset` ist der exklusive Runsum über die Partikelpuffer
+des Systems, also nur für den **ersten** Puffer null.
+
+Was **nicht** belegt ist: dass eine ausgelieferte Szene zugleich `offset > 0` und
+`mNumCloths > 1` in demselben Cloth-Puffer hat — das wäre nötig, damit der falsche
+Cloth beobachtbar wird.  Der Eintrag sagt das, statt es zu behaupten.
+Bemerkenswert ist immerhin, dass die Upstream-Quelle die *benachbarte* Rechnung
+selbst als unverstanden markiert: `// AD Todo: figure out why blendScale is
+computed like this.` (`:563`).
+
+**Der Port reproduziert den Defekt bitgenau**, wie die Doktrin es verlangt: ein
+„korrigierter" Port lieferte andere Zahlen als die Engine, und die Fixture ist so
+gebaut, dass genau dieser Effekt sichtbar ist — in A.cb0 landen alle Partikel auf
+Cloth 2, obwohl sie zu dreien gehören.  Damit stehen **vierzehn**
+Upstream-Kandidaten dokumentiert, keiner gemeldet (Aufgabe #90).
+
+**Suite 711/711 in beiden Speichermodi**, `ctest` **787**.  Binary +2 (die
+Fixture hat zwei `PXG_TEST`s: der Layout-Test pinnt `sizeof(PxParticleCloth) == 28`
+samt Alignment, `sizeof(PxgParticleSimBuffer) == 88` und die beiden benachbarten
+Mapping-Slots), `ctest` +1.  Manifest **332 → 333**, Refused **169 → 168**.
+Der Szenen-Durchlauf war beim Commit noch nicht durch (7 der 23 grün gemeldet);
+das vollständige Ergebnis kommt im Folge-Commit und ersetzt diese Zeile durch die
+gemessene Zahl, statt sie zu behaupten.  Dispatcht wird die Federkette weiterhin
+von keiner Szene —
+der Host bindet sie an `getMaxSpringsPerBuffer() > 0`, und noch legt keine Szene
+einen PBD-Cloth-Puffer an.  **Die Kette ist damit aber vollständig**: Init,
+Gather, Löser und Averaging sind alle vier gemappt, und P9.4 kann die
+`particlecloth`-Szene bauen, die sie in der echten Engine schließt.
 
 ## P9.3b — `ps_solveSpringsLaunch`: der XPBD-Federlöser, Partition für Partition (Manifest 332)
 
