@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **783/783** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **784/784** green in both modes (`ctest -N` in `build-gpuslang`).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1693,132 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.1d — das PBD-Geschwindigkeitspaar (Manifest 329) — Fluid-Quartett komplett, und eine PRÄZISIERUNG der vierten Plattformregel
+
+Die letzten beiden Kernel des Quartetts: `ps_vorticityConfinementLaunch`
+(particlesystem.cu:3757-3888) berechnet die Rotation des Geschwindigkeitsfeldes
+je Fluid-Partikel nach `mCurl`, und `ps_solveVelocityLaunch` (:3891-4041) macht
+daraus einen Vorticity-Confinement-Impuls in `mDelta`.  Sie laufen Rücken an
+Rücken auf `mFinalizeStream`, **einmal pro Frame**, und der zweite konsumiert das
+`mCurl` des ersten — deshalb ein Modul und eine Tranche.  Beide haben, anders als
+das Density-Paar, **keinen** `eDISABLE_SELF_COLLISION`-Guard.
+
+**Die Fixture testet sie VERKETTET**, in der Reihenfolge der Engine, und die
+Host-Erwartung ist genauso verkettet: `refSolveVelocity` konsumiert das
+Curl-Array, das `refVorticity` erzeugt hat.  Die Übergabe zwischen den beiden
+Kerneln ist damit Teil dessen, was geprüft wird, nicht Annahme.
+
+**Upstream-Kandidat 12 wird reproduziert.**  particlesystem.cu:3857 liest die
+Nachbar**geschwindigkeit** aus `nextQ`, während Position und Phase daneben aus
+`nextNextQ` lesen und der Bump `nextQ = nextNextQ` erst die nächste Anweisung ist.
+Geschlossene Form: `vel[idx[max(c-1, 0)]]`.  Entscheidend für den Port: der Index
+ist der **rohe Schleifenzähler**, nicht ein Zähler akzeptierter Paare — der
+Prefetch der CUDA läuft **vor** dem `continue` bei :3866, ein übersprungener
+Nicht-Fluid-Nachbar verschiebt den Geschwindigkeitsstrom also nicht.  Die Fixture
+beweist die Reproduktion strukturell wie in P9.1b (Erwartung ein zweites Mal mit
+korrigiertem Index, und kein GPU-Wort darf mit der korrigierten Fassung
+übereinstimmen).
+
+### Die vierte Plattformregel greift hier NICHT — gemessen, nicht vermutet
+
+Der erste Lauf der Fixture scheiterte an **56 Wörtern, die sich in nichts als dem
+Vorzeichen der Null unterschieden**: Referenz `+0`, GPU `−0`.  Das ist der
+P8.84-Fehlermodus (slangc faltet `x + 0.0` weg, sodass ein erster Term `−0` als
+`−0` überlebt, wo die Engine `0 + (−0) = +0` rechnet), und er ist hier nicht
+exotisch: `cross(nGrad, curl)` mit genulltem `nGrad` erzeugt exakte
+Vorzeichen-Nullen.
+
+**P8.84s Gegenmittel — den Akkumulator aus einer RUNTIME-Null zu seeden — wurde
+angewandt und hat NICHT geholfen.**  Statt das hinzunehmen oder umzudeuten,
+wurden die Zwischenwerte aus dem Kernel herausgeschrieben, für drei fehlschlagende
+Partikel:
+
+```
+rz                       = 0x00000000   (die Runtime-Null ist wirklich +0)
+der Term VOR dem +=      = 0x80000000   (ist wirklich −0)
+der Akkumulator DANACH   = 0x80000000   (die Addition normalisiert nicht)
+```
+
+und das erzeugte SPIR-V enthält über genau diesen beiden Operanden einen echten
+`OpFAdd %v3float` — die Faltung findet also nicht statt.  Eine eigens gebaute
+Sonde auf **demselben Gerät** zeigt zudem, dass der **Treiber korrekt** ist:
+
+```
+pz = +0, nz = −0
+pz + nz = 0x00000000   (+0)   ← IEEE, skalar
+nz + pz = 0x00000000   (+0)
+nz + nz = 0x80000000   (−0)
+(float3)pz3 + nz3 = (+0, +0, +0)   ← IEEE, vektoriell
+```
+
+Damit ist der Verlust **lokalisiert**: nicht in llvmpipe, sondern in slangcs
+Codegen für diese Akkumulatorform, und kein Seeding-Trick erreicht ihn.
+
+**Der Port schreibt die Identität deshalb direkt aus.**  `+0 + x` ist in
+IEEE-754 gleich `x` für jedes `x` **außer** `−0`, das zu `+0` wird — und genau
+das ist `(x == 0) ? +0 : x`, denn `x == 0` ist für beide Nullen wahr.  Ein
+Vergleich und eine Auswahl bieten keiner Optimierungsstufe eine arithmetische
+Identität zum Ausnutzen, und das Ergebnis ist Bit für Bit die Addition der
+Engine.  Anwendbar überall dort, wo ein bei null startender Akkumulator **genau
+einmal** geschrieben wird; eine laufende Schleifensumme ist ein anderer Fall und
+behält den Runtime-Zero-Seed (der Curl-Akkumulator unten wurde so bitgenau
+gemessen).  Der Sweep-Mutant `pv-plus-positive-zero-is-identity` (die Auswahl
+durch `return x` ersetzt) wird getötet.
+
+Die Regel im Modulkopf lautet jetzt: **P8.84s Runtime-Null ist notwendig, aber
+nicht hinreichend.**  Wo sie nicht reicht, ist die Vergleich-und-Auswahl-Form die
+Schreibweise, die hält.
+
+**Elf Fallen, jede mit Mutanten** (V1–V11).  Die feinste ist V1: die
+Early-out-Prädikate der beiden Kernel sind **verschieden** — Vorticity prüft
+`vorticityConfinement == 0` (strikte Gleichheit), SolveVelocity `<= 0`.  Ein
+**negativer** Vorticity-Wert lässt Vorticity also durchlaufen, während
+SolveVelocity abbricht.  Ohne ein Material mit negativem Wert sind die beiden
+Prädikate ununterscheidbar, deshalb trägt die Fixture genau eines.  Ebenfalls:
+beide Distanz-Guards sind **inklusiv** (`<=`), wo die beiden Density-Kernel ein
+striktes `<` benutzen, und `xij / d` ist wieder `PxVec3::operator/`, also ein
+Reziprok-Multiply.
+
+**Sweep 40/43 getötet, drei nicht — und alle drei sind diagnostiziert, nicht
+entschuldigt:**
+
+* `pv-solvevel-guard-adds-fluid` (dem Early-out `|| !fluid` hinzufügen) ist
+  **beweisbar äquivalent**: ein Nicht-Fluid-Partikel mit positivem Vorticity-Wert
+  fällt ohne den Zusatz bis zum Store durch und schreibt dort
+  `float4(impulse=+0, weight=0)` — bitgleich mit dem `float4(0,0,0,0)` des
+  Early-outs.
+* `pv-vorticity-dist-strict` (`<=` durch `<` ersetzen) ist **beweisbar
+  äquivalent** *für diesen Kernel*: bei `dSq == dist2` ist `d` exakt die
+  Kontaktdistanz, also `1 − d·distanceInv == 0` exakt, also `dWdx == −0` und
+  `dw` ein Vorzeichen-Null-Vektor; das Kreuzprodukt trägt nur Nullen bei und die
+  Summe ändert sich nicht.  Der SPH-Kern hat kompakten Träger mit einer Nullstelle
+  genau am Rand.  Im **SolveVelocity**-Kernel ist derselbe Mutant getötet worden —
+  dort liegt `weight += 1` innerhalb des Guards und ist die Beobachtungsgröße.
+* `pv-safenormalize-guard-on-magnitude` (`gradMagSq > 0` gegen
+  `sqrt(gradMagSq) > 1e-20`) unterscheidet sich **ausschließlich** für
+  `gradMagSq` im denormalen Band `(0, 1e-40]`, das diese Fixture nicht erreicht.
+  Die Schreibweise bleibt trotzdem die der Engine — sie ist Verteidigung gegen
+  eine andere Schwelle, nicht gegen diese Fixture.  Dasselbe Muster wie der
+  `rsqrt`-Überlebende aus P8.69.
+
+Zwei Fixture-Korrekturen waren nötig: der Mutant, der den Fluid-Gate um
+SolveVelocitys Schleife streicht, überlebte, bis Partikel 5 einen Nachbarn mit
+**identischem Phasenwort** bekam — ohne ihn weist die Schleife jedes Paar ohnehin
+über `phase == phasej` ab, und der Gradient allein könnte es nicht zeigen (die
+Curl eines Nicht-Fluid-Partikels ist genullt, `0 · dw` trägt nichts bei); es ist
+das gespeicherte `weight`, das die beiden trennt.  Und der `p < numParticles`-
+Mutant brauchte einen eindeutigen Anker je Entry-Point, weil beide Kernel dieselbe
+Zeile enthalten.
+
+**Suite 706/706 in beiden Speichermodi**, `ctest` **784**.  Manifest **327 → 329**.
+**Szene:** Refused **174 → 172** mit genau diesen beiden als denen, die gehen; je
+**120** Launches OK (einmal pro Frame).  Beide Partikelszenen — Freifall und
+Bag — bleiben bitidentisch, denn beide Kernel sind fluid-only und die
+Szenenpartikel tragen keine Fluid-Phase.
+
+**Damit ist das PBD-Fluid-Quartett komplett** (plus seine stille Vorbedingung
+`ps_updateMaterials`): fünf Kernel, Manifest **324 → 329**, Refused **177 → 172**.
 
 ## P9.1c — ps_solveDensityLaunch (Manifest 327) — die Partikel kollidieren zum ersten Mal miteinander
 

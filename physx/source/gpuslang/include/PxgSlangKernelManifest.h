@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 327;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 329;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -241,8 +241,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_calculateDensityAndPotentialLaunch", "npPsFluidDensity.spv", "ps_calculateDensityAndPotentialLaunch" },  // PS_CALCULATE_DENSITIES_AND_POTENTIALS
     { "ps_solveDensityLaunch", "npPsFluidDensity.spv", "ps_solveDensityLaunch" },  // PS_SOLVE_DENSITIES
     { "ps_applyDeltaLaunch", "particleSelfCollisionBda.spv", "ps_applyDeltaLaunch" },  // PS_APPLY_DELTAS (P6.3 BDA port: SOR-average mDelta -> accumDeltaP)
-    { "ps_vorticityConfinementLaunch", nullptr, nullptr },  // PS_VORTICITY_CONFINEMENT (unmapped)
-    { "ps_solveVelocityLaunch", nullptr, nullptr },  // PS_SOLVE_VELOCITIES (unmapped)
+    { "ps_vorticityConfinementLaunch", "npPsFluidVelocity.spv", "ps_vorticityConfinementLaunch" },  // PS_VORTICITY_CONFINEMENT
+    { "ps_solveVelocityLaunch", "npPsFluidVelocity.spv", "ps_solveVelocityLaunch" },  // PS_SOLVE_VELOCITIES
     { "ps_updateRemapVertsLaunch", nullptr, nullptr },  // PS_UPDATE_REMAP_VERTS (unmapped)
     { "ps_solveSpringsLaunch", nullptr, nullptr },  // PS_SOLVE_SPRINGS (unmapped)
     { "ps_initializeSpringsLaunch", nullptr, nullptr },  // PS_INITIALIZE_SPRINGS (unmapped)

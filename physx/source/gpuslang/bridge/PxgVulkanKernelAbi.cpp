@@ -1418,6 +1418,12 @@ static const PxgKernelAbiRow kRows[] = {
     //   PxReal coefficient, PxReal dt) -- coefficient BEFORE dt -> {8,8,4,4},
     //   the existing kPsIntegrate shape (24-byte blob).
     { "ps_solveDensityLaunch", kPsIntegrate, uint32_t(sizeof(kPsIntegrate)) },
+    // P9.1d: ps_vorticityConfinementLaunch(particleSystems*, activeParticleSystems*)
+    //   -> {8,8}, the existing kTwoPtr shape (16-byte blob); and
+    //   ps_solveVelocityLaunch(particleSystems*, activeParticleSystems*, PxReal dt)
+    //   -> {8,8,4} (20 bytes, padded to 24).
+    { "ps_vorticityConfinementLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "ps_solveVelocityLaunch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
     // gpusimulationcontroller FEMCloth kernels (P7.0 FEMCloth free-fall BDA)
     { "cloth_preIntegrateLaunch", kClothPreIntegrate, uint32_t(sizeof(kClothPreIntegrate)) },
     { "cloth_finalizeVelocitiesLaunch", kClothFinalizeVel, uint32_t(sizeof(kClothFinalizeVel)) },
