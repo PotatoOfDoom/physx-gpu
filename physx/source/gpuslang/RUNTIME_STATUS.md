@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **787/787** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **788/788** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **24/24** grün (P9.4 fügte `particlecloth` hinzu).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
@@ -1694,6 +1694,130 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.5 — die PBD-Aerodynamik (Manifest 335) und ein FÜNFZEHNTER Upstream-Verdacht
+
+`ps_solveAerodynamics1Launch` (particlesystem.cu:4437-4562) und
+`ps_solveAerodynamics2Launch` (:4564-4646) — ein Scatter/Gather-Paar: Kernel 1
+läuft mit EINEM THREAD PRO DREIECK und akkumuliert für jede der drei Ecken
+reihum eine Flächennormale und einen Luftkraft-Impuls ATOMAR in `mNormalArray`
+und `mDelta`; Kernel 2 läuft pro Partikel, teilt durch den in `mDelta.w`
+mitgeführten Fan-in-ZÄHLER, faltet das Ergebnis in `mSortedVelocities`, löscht
+`mDelta` und normalisiert `mNormalArray`.
+
+**ABI-Delta null**, zum zweiten Mal in Folge — inklusive `mData_WindX/Y/Z`
+(@328/332/336), die P9.1 bereits gemappt hatte.  ABI-Zeile ist das vorhandene
+`kPsUpdateUserBuffer` ({8,8,4} → 24 Byte).
+
+**Das Atomik-Problem, und wie die Fixture es löst.**  Ein von k Dreiecken
+geteilter Vertex bekommt k Additionen in einer Reihenfolge, die der Host nicht
+vorhersagen kann, und Float-Addition ist nicht assoziativ.  Statt jede Prüfung
+auf eine Toleranz zu verwässern, TEILT die Fixture die Geometrie: ein Cloth-Puffer
+mit DISJUNKTEN Dreiecken (genau eine Addition pro Akkumulator → bit-exakt, und
+dort müssen alle Mutanten sterben) und einer mit einem FÄCHER um einen geteilten
+Mittelpunkt (dort wird der ZÄHLER weiter bit-exakt verglichen — wiederholtes
++1.0f auf kleine Ganzzahlen ist in jeder Reihenfolge exakt — und nur xyz gegen
+ein relatives Epsilon).  Das ist die einzige Toleranz in der Datei, und sie
+existiert wegen Float-Atomics, nicht weil der Port ungenau wäre.
+
+**Sweep 45/45, kein Überlebender — aber erst im vierten Anlauf.**  Der erste
+Durchlauf ergab 31/38 mit sieben Überlebenden.  Diagnostiziert, nicht entschuldigt:
+
+* `y8d-liftdir-cross-order` war **ÄQUIVALENT**, kein Überlebender.  Wegen
+  `cross(a,b) = -cross(b,a)` ist `cross(vrel, cross(n,vrel))` algebraisch das
+  Original.  Ein Sweep-Fehler, ersetzt durch eine echte Negation.
+* Drei Überlebende hatten **eine gemeinsame Ursache**: Kernel 2 LÖSCHT `mDelta`,
+  und damit war jeder Mutant unsichtbar, dessen einzige Wirkung der Zähler war —
+  der weggelassene invMass-Term im Gate, das weggelassene Dreiecks-Guard, die
+  zusätzliche `.w`-Addition auf die Normale.  Bei allen dreien ist der Impuls
+  ohnehin exakt null (`p14.w` multipliziert BEIDE Terme), nur der Zähler
+  unterschied sich.  Behoben durch eine **zweite Runde, die Kernel 1 ALLEIN
+  fährt** und die rohen Akkumulatoren vor dem Löschen vergleicht — plus einen
+  Vergleich von `normals.w`, den die Fixture schlicht vergessen hatte.
+* `y8b-drag-clamp-bounds`: der Drag-Faktor erreichte höchstens ~0.035, die
+  Klammer bei ±0.75 band nie.  Behoben durch ein Material mit drag = 900.
+* `y11b-vel-w-preserved`: jedes `vel.w` war bereits 0, der Store einer 0 also
+  unsichtbar.  Behoben durch nicht-null Poison in `.w`.
+* `block-dim-128`: gridX war 1, also deckt ein Stride von 128 bei numthreads 256
+  weiterhin alles ab — **dieselbe Lektion wie P9.1a**, zum zweiten Mal.  Behoben
+  durch 300 Dreiecke und ~290 Partikel, so dass beide Grids > 1 Block sind.
+
+**Und dann fand ein unabhängiges Audit drei weitere Löcher, für die der Sweep
+überhaupt keinen Mutanten hatte** — der wertvollste Teil dieser Tranche, weil es
+Lücken waren, die kein bestehender Mutant je berührt hätte:
+
+* **`mParticleBufferIndex` war die Identität.**  Die Fixture setzte
+  `particleBufferIndex = b`, also den eigenen Cloth-Slot.  Damit war die ganze
+  Indirektion — die den Runsum-Offset UND `mParticleSimBuffers` ansteuert —
+  ungetestet.  Behoben durch eine echte Bijektion (Cloth-Slot b → Partikelpuffer
+  (b+1)%N); als Bijektion, damit keine zwei Cloth-Slots denselben Partikelpuffer
+  teilen und über `mSortedVelocities` rennen, was die Engine nie tut.
+* **Die Dreiecks-Polsterung war entartet.**  Der Schwanz war mit drei Kopien
+  DESSELBEN Vertex gefüllt, also hatte jedes Polster-Dreieck Fläche null: ein
+  weggelassenes Dreiecks-Guard bewegte nur den Zähler.  Jetzt drei DISTINKTE,
+  nicht-kollineare Vertices.
+* **Die Phasenmaske `0x000fffff` war die Identität.**  Die Fixture baute Phasen
+  als `% 8`, also waren die Bits 20+ (die Verhaltens-Flags) nie gesetzt.  Jetzt
+  tragen die Phasen echte `eParticlePhaseSelfCollide`-Flags, und die
+  Handle-Tabelle ist bis über den UNMASKIERTEN Index hinaus dimensioniert, damit
+  ein maskenloser Zugriff auf ein reales, ANDERES Material trifft (lift = drag = 0,
+  Gate zu) statt zu faulten.
+* Ein vierter, im letzten Durchgang: **die Material-Schrittweite war 60**, also
+  genau die Konstante, die der Mutant fest verdrahtet.  Die Engine läuft mit einer
+  Laufzeit-Bytelänge; die Fixture benutzt jetzt 64.
+
+**Upstream-Verdacht 15: bestätigt als LATENTER Defekt, Wirkungsbehauptung
+ausdrücklich zurückgezogen.**  Kernel 1 akkumuliert die Normale am SORTIERTEN
+Index `a` (:4528); Kernel 2 liest und schreibt `mNormalArray` am UNSORTIERTEN
+Index (:4638/:4642) — und benutzt in denselben Zeilen den SORTIERTEN für `mDelta`
+und `mSortedVelocities`.  Sechser-Panel: **5 bestätigen, 1 widerlegt**.
+
+Die Prämisse ist einhellig: alle sechs, auch der Widerleger, finden dieselbe
+Asymmetrie.  Es gibt genau eine Allokation, eine Bindung, einen Zeiger, keine
+Umbasierung; `mUnsortedToSortedMapping` wird von acht Radix-Pässen über einen rein
+positionsbasierten Gitter-Hash permutiert, ohne Cloth-Ausnahme.  Ein Prüfer hat
+den Befund sogar **verstärkt**: jeder andere lebende Zugriff auf `mNormalArray` in
+der Datei ist unsortiert — Zeile :4528 ist der Ausreißer, nicht Kernel 2.
+
+**Was der Widerleger zu Recht gekippt hat, und was hier übernommen wird:** meine
+erste Formulierung („Kernel 2 normalisiert Müll") ist FALSCH.  Kernel 2s
+Normalen-Operation ist ein In-Place-Endomorphismus pro Slot — lesen, normalisieren,
+in denselben Slot zurückschreiben — also zählt nur die MENGE der besuchten Slots.
+Wenn jeder Partikelpuffer ein Cloth-Puffer ist (der einzige Fall, in dem diese
+Kernel überhaupt etwas tun), sind beide Mengen der volle Bereich, und jede
+akkumulierte Normale wird genau einmal normalisiert — nur vom „falschen" Thread.
+Divergenz braucht ein GEMISCHTES System.  Und es gibt **keine beobachtbare Folge**:
+`mNormalArray` hat auf dem Aero-Pfad keinen Konsumenten (der Impuls benutzt die
+frisch berechnete lokale Normale), der Puffer wird nie zurückkopiert und ist nicht
+Teil des öffentlichen `PxGpuParticleSystem`.  Beide Indizes liegen unter
+`mNumParticles` — stilles Aliasing, nie ein OOB.
+
+Der Port bildet die CUDA trotzdem exakt nach; drei Mutanten, die es „reparieren",
+sterben.  Die Regel bleibt Bit-Exaktheit mit der Engine, Fehler eingeschlossen.
+
+**Szene: `PXG_SCENE=particlecloth` bekommt Luftwiderstand.**  Die Snippet-Vorlage
+setzt lift = drag = 0, womit das Paar rechnerisch ein No-op ist.  Mit
+lift 0.6 / drag 1.2 gemessen, einziger Unterschied ist das Materialpaar
+(`PXG_PARTICLE_CLOTH_NOAERO=1` nullt beide):
+
+|                        | Aero an  | Kontrolle ohne Aero | Schwelle |
+|---|---|---|---|
+| freies mittleres y (Ende) | 3.8840 | 4.2009 | |
+| freies mittleres y (Min)  | 3.8840 | 3.7693 | |
+| Ruhe \|dy\|             | **0.002460** | **0.021391** | < 0.010 |
+
+Mit Aero ist das Minimum GLEICH dem Endwert: das Tuch sinkt in seine Hängelage
+und bleibt dort, während die ungedämpfte Kontrolle bei Schritt 240 noch durch ein
+Band von 0.43 schwingt.  Damit ist die **Ruhe-Prüfung, die P9.4 bewusst
+weggelassen hat, zum ersten Mal sinnvoll** — sie ist genau das
+Aerodynamik-Observable.  Die Marge ist 4x nach unten und 2.1x nach oben, also
+enger als die P9.4-Prüfungen; das steht so da, statt beschönigt zu werden.
+
+Launch-Trace: beide Aero-Kernel 3x pro Lauf (einmal pro Frame, außerhalb der
+Solver-Iterationsschleife — wie der Host sie ruft), beide OK, keiner REFUSED.
+
+Suite **788/788** in beiden Modi, **24 Szenen** grün, null fehlende Verdikte.
+Manifest **335**, Refused 168 → **166**.
 
 ## P9.4 — `PXG_SCENE=particlecloth`: das PBD-Tuch HÄNGT, und der Blocker war die Bridge
 

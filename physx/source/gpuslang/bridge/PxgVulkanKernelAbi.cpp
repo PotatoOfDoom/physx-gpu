@@ -1431,6 +1431,10 @@ static const PxgKernelAbiRow kRows[] = {
     //   -> {8,8,4} (20 bytes, padded to 24).
     { "ps_vorticityConfinementLaunch", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "ps_solveVelocityLaunch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
+    // P9.5: the aerodynamics pair -- (particleSystems*, activeParticleSystems*,
+    // PxReal dt), the same {8,8,4} shape, hostPtrMask 0.
+    { "ps_solveAerodynamics1Launch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
+    { "ps_solveAerodynamics2Launch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
     // P9.3a: the PBD cloth spring gather pair, both (particleSystems*,
     //   activeParticleSystems*) -> {8,8} = kTwoPtr.  Both use a 3D grid with the
     //   particle system on gridDim.Z and the cloth buffer on gridDim.Y.

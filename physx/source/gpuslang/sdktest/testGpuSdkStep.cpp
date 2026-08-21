@@ -792,6 +792,29 @@ static const float CLOTH_DIAG_CONTROL = 5.8059f; // measured, no-spring control
 // diagonals of every cell, and the two boundary runs -- 4*(nX-1)*(nZ-1) + (nX-1)
 // + (nZ-1) = 506 springs, enough that the partitioner produces several partitions
 // and ps_solveSpringsLaunch is dispatched more than once per iteration.
+// P9.5 aerodynamics.  Values are not from the snippet (which uses 0/0); they were
+// chosen to be large enough to damp the pendulum within the step budget and then
+// MEASURED, like every other threshold in this file.
+static const float CLOTH_LIFT = 0.6f;
+static const float CLOTH_DRAG = 1.2f;
+// MEASURED on this scene, the only difference between the two runs being whether
+// the material carries lift and drag (PXG_PARTICLE_CLOTH_NOAERO=1 zeroes both):
+//
+//                          aero on      no-aero control
+//   free mean y (end)      3.8840       4.2009
+//   free mean y (min)      3.8840       3.7693
+//   rest |dy|              0.002460     0.021391      threshold < 0.010
+//
+// The aero run's minimum EQUALS its final value: with air resistance the sheet
+// descends to its hanging position and stays, where the undamped control is still
+// swinging through a 0.43 band at step 240.  The rest check is therefore the
+// aerodynamics observable, and the no-spring control fails it too (it lands on the
+// floor and reads 0.000000 only because it is dead, which the hang check catches
+// first).  Margin is 4x below and 2.1x above -- narrower than the P9.4 checks, and
+// stated rather than dressed up.
+static const float CLOTH_REST_MAX = 0.010f;
+static const float CLOTH_REST_NOAERO = 0.021391f;   // measured
+
 static const PxU32 CLOTH_NX = 12;
 static const PxU32 CLOTH_NZ = 12;
 static const float CLOTH_SPACING = 0.2f;
@@ -834,8 +857,18 @@ ParticleScene buildParticleClothScene(PxPhysics* physics, PxScene* scene, PxMate
     const float shearStiffness = 100.0f;
     const float springDamping = 0.001f;
 
+    // P9.5: the last two arguments are LIFT and DRAG (PxPhysics.h:980).  The
+    // snippet leaves both at 0, which makes ps_solveAerodynamics1/2Launch compute a
+    // zero impulse and the whole aero path a no-op.  Turning them on is what makes
+    // the pair observable -- and it is also what finally gives the hanging sheet
+    // some air resistance, which P9.4 explicitly did not have.
+    // PXG_PARTICLE_CLOTH_NOAERO=1 restores the snippet's 0/0 and is the control the
+    // rest threshold is calibrated against.
+    const bool noAero = std::getenv("PXG_PARTICLE_CLOTH_NOAERO") != nullptr;
+    const float clothLift = noAero ? 0.0f : CLOTH_LIFT;
+    const float clothDrag = noAero ? 0.0f : CLOTH_DRAG;
     PxPBDMaterial* pbdMat = physics->createPBDMaterial(0.8f, 0.05f, 1e+6f, 0.001f, 0.5f,
-                                                       0.005f, 0.05f, 0.0f, 0.0f);
+                                                       0.005f, 0.05f, clothLift, clothDrag);
     PxPBDParticleSystem* ps = physics->createPBDParticleSystem(*cudaCtx);
     ps->setRestOffset(restOffset);
     ps->setContactOffset(restOffset + 0.02f);
@@ -3379,6 +3412,10 @@ int main()
     if (!std::strcmp(sceneName, "particlecloth"))
     {
         const bool control = std::getenv("PXG_PARTICLE_CLOTH_CONTROL") != nullptr;
+        // The no-aero arm is a CALIBRATION run, not a pass/fail one: it exists to
+        // measure the number the rest threshold is set against, so it must not be
+        // held to that threshold itself.
+        const bool noAeroScene = std::getenv("PXG_PARTICLE_CLOTH_NOAERO") != nullptr;
         ParticleScene psc = buildParticleClothScene(physics, scene, material, cudaCtx, !control);
         if (!psc.system)
         {
@@ -3416,7 +3453,8 @@ int main()
         // inside the measured swing period and far short of the 60 steps the
         // control needs to reach the floor.
         const int settleIn = 20;
-        float prevY = y0, diagMax = diag0, yMin = 1e30f;
+        const int restWindow = steps / 4;
+        float prevY = y0, diagMax = diag0, yMin = 1e30f, restMaxDy = 0.0f;
         for (int i = 0; i < steps; ++i)
         {
             scene->simulate(dt);
@@ -3425,6 +3463,10 @@ int main()
             const float dg = clothBBoxDiag(psc);
             if (dg > diagMax) diagMax = dg;
             if (i >= settleIn) yMin = PxMin(yMin, y);
+            // P9.5: with aerodynamics mapped the sheet finally has air resistance,
+            // so a REST check is meaningful for the first time.  P9.4 deliberately
+            // omitted it because the undamped pendulum never settled.
+            if (i >= steps - restWindow) restMaxDy = PxMax(restMaxDy, PxAbs(y - prevY));
             if (i < 5 || i == steps - 1 || (i % 30 == 0))
                 std::printf("    step %3d: free mean y=%.4f (dy %+.5f), bbox diag=%.4f\n",
                             i, y, y - prevY, dg);
@@ -3433,8 +3475,8 @@ int main()
         const float yEnd = clothFreeMeanY(psc);
         const float diagEnd = clothBBoxDiag(psc);
         std::printf("  particle CLOTH: free mean y %.4f -> %.4f (min after step %d: %.4f), "
-                    "bbox diag %.4f -> %.4f (max %.4f)\n",
-                    y0, yEnd, settleIn, yMin, diag0, diagEnd, diagMax);
+                    "bbox diag %.4f -> %.4f (max %.4f), rest |dy| over last %d steps = %.6f\n",
+                    y0, yEnd, settleIn, yMin, diag0, diagEnd, diagMax, restWindow, restMaxDy);
 
         int failures = 0;
         if (control)
@@ -3443,8 +3485,8 @@ int main()
             // what justifies the threshold the real run is held to.  Printing it
             // in the same format keeps the two comparable by eye.
             std::printf("[  OK  ] gpu-sdk-step: particlecloth CONTROL run (no springs) "
-                        "measured: free mean y %.4f (min %.4f), bbox diag %.4f (max %.4f)\n",
-                        yEnd, yMin, diagEnd, diagMax);
+                        "measured: free mean y %.4f (min %.4f), bbox diag %.4f (max %.4f), "
+                        "rest |dy| %.6f\n", yEnd, yMin, diagEnd, diagMax, restMaxDy);
             scene->release(); physics->release(); cudaCtx->release(); foundation->release();
             return 0;
         }
@@ -3462,6 +3504,13 @@ int main()
                         "%.4f)\n", diagMax, CLOTH_DIAG_MAX, CLOTH_DIAG_REST, CLOTH_DIAG_CONTROL);
             ++failures;
         }
+        if (!noAeroScene && !(restMaxDy < CLOTH_REST_MAX))
+        {
+            std::printf("FAIL: the sheet did not come to REST -- aerodynamic drag is not "
+                        "damping the swing (rest |dy|=%.6f, threshold %.4f, no-aero "
+                        "control %.6f)\n", restMaxDy, CLOTH_REST_MAX, CLOTH_REST_NOAERO);
+            ++failures;
+        }
         if (!std::isfinite(yEnd) || !std::isfinite(diagEnd))
         {
             std::printf("FAIL: cloth state is not finite (y=%.4f, diag=%.4f)\n", yEnd, diagEnd);
@@ -3472,8 +3521,11 @@ int main()
         {
             std::printf("[  OK  ] gpu-sdk-step: the PBD cloth sheet HANGS from its pinned row on "
                         "Vulkan (free mean y never below %.4f vs %.4f for the no-spring control, "
-                        "bbox diag max %.4f vs %.4f) -- the whole spring chain runs end to end\n",
-                        yMin, CLOTH_HANG_CONTROL, diagMax, CLOTH_DIAG_CONTROL);
+                        "bbox diag max %.4f vs %.4f, rest |dy| %.6f vs %.6f without "
+                        "aerodynamics) -- the spring chain AND the aerodynamics pair run "
+                        "end to end\n",
+                        yMin, CLOTH_HANG_CONTROL, diagMax, CLOTH_DIAG_CONTROL,
+                        restMaxDy, CLOTH_REST_NOAERO);
             return 0;
         }
         std::printf("[ FAIL ] gpu-sdk-step: particlecloth checks failed (%d)\n", failures);

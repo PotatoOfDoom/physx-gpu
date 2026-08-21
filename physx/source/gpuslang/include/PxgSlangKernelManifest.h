@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 333;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 335;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -247,8 +247,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_solveSpringsLaunch", "npPsSprings.spv", "ps_solveSpringsLaunch" },  // PS_SOLVE_SPRINGS
     { "ps_initializeSpringsLaunch", "npPsSprings.spv", "ps_initializeSpringsLaunch" },  // PS_INITIALIZE_SPRINGS
     { "ps_averageVertsLaunch", "npPsSprings.spv", "ps_averageVertsLaunch" },  // PS_AVERAGEVERTS
-    { "ps_solveAerodynamics1Launch", nullptr, nullptr },  // PS_AERODYNAMIC_1 (unmapped)
-    { "ps_solveAerodynamics2Launch", nullptr, nullptr },  // PS_AERODYNAMIC_2 (unmapped)
+    { "ps_solveAerodynamics1Launch", "npPsAerodynamics.spv", "ps_solveAerodynamics1Launch" },
+    { "ps_solveAerodynamics2Launch", "npPsAerodynamics.spv", "ps_solveAerodynamics2Launch" },
     { "ps_calculateInflatableVolume", nullptr, nullptr },  // PS_CALCULATE_INFLATABLE_VOLUME (unmapped)
     { "ps_solveInflatableVolume", nullptr, nullptr },  // PS_SOLVE_INFLATABLE_VOLUME (unmapped)
     { "ps_solveShapes", nullptr, nullptr },  // PS_SOLVE_SHAPES (unmapped)
