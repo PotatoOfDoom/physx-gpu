@@ -255,7 +255,14 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_rigidAttachmentPrepareLaunch", nullptr, nullptr },  // PS_PREP_RIGID_ATTACHMENTS (unmapped)
     { "ps_solveRigidAttachmentsLaunch", nullptr, nullptr },  // PS_SOLVE_RIGID_ATTACHMENTS (unmapped)
     { "ps_update_volume_bound", nullptr, nullptr },  // PS_UPDATE_VOLUME_BOUND (unmapped)
-    { "ps_updateSprings", nullptr, nullptr },  // PS_UPDATE_SPRING (unmapped)
+    // DEAD IN 5.6.1 (found in P9.4): the kernel body exists
+    // (particlesystem.cu:782) and the name is registered
+    // (PxgKernelNames.h:314), but PS_UPDATE_SPRING is never handed to
+    // getCuFunction anywhere in physx/source -- there is no launch site at
+    // all.  No scene can reach it, so it can never be validated end to end and
+    // a port of it would be unverifiable by construction.  Left unmapped
+    // deliberately; do not go looking for a scene that dispatches it.
+    { "ps_updateSprings", nullptr, nullptr },  // PS_UPDATE_SPRING (unmapped, dead)
     { "ps_accumulateStaticDensity", nullptr, nullptr },  // PS_ACCUMULATE_STATIC_DENSITY (unmapped)
     { "ps_accumulateRigidDensity", nullptr, nullptr },  // PS_ACCUMULATE_RIGID_DENSITY (unmapped)
     { "ps_diffuseParticleOneWayCollision", nullptr, nullptr },  // PS_DIFFUSE_PARTICLES_ONE_WAY_COLLISION (unmapped)

@@ -8,6 +8,7 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **787/787** green in both modes (`ctest -N` in `build-gpuslang`).
+Szenen: **24/24** grün (P9.4 fügte `particlecloth` hinzu).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1693,6 +1694,88 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.4 — `PXG_SCENE=particlecloth`: das PBD-Tuch HÄNGT, und der Blocker war die Bridge
+
+Die Federkette war seit P9.3c vollständig gemappt (`ps_initializeSpringsLaunch`,
+`ps_updateRemapVertsLaunch`, `ps_solveSpringsLaunch`, `ps_averageVertsLaunch`) und
+wurde von **keiner** Szene dispatcht.  Diese Tranche schließt das — und der Grund,
+warum es nicht schon vorher ging, war ein anderer als erwartet.
+
+**Nicht ein fehlender Kernel hat blockiert, sondern ein Bridge-Stub.**
+`PhysXGpuVulkan::createParticleClothBuffer` war ein `warnNotImplemented`-Stub und
+gab `NULL` zurück.  Das ist hier *nicht* überlebbar: `NpPhysics` reicht das
+Ergebnis direkt an den Konstruktor von `NpParticleClothBuffer` weiter, der es
+dereferenziert — der Warn-und-NULL-Vertrag der übrigen Stubs **segfaultet** also,
+statt sauber zu degradieren.  Der Fix ist dieselbe Zeile wie bei
+`createParticleBuffer` direkt darüber (`PX_NEW(PxgParticleClothBuffer)`, Spiegel von
+`physxgpu/src/PxgPhysXGpu.cpp:110-114`); `PxgParticleClothBuffer` allokiert nur
+Device-Speicher und startet keine Kernel.  Für die zwei verbleibenden Stubs
+(`createParticleAndDiffuseBuffer`, `createParticleRigidBuffer`) ist im Code
+vermerkt, dass sie dieselbe Falle tragen.
+
+**Kein Cooking auf der GPU.**  `partitionSprings` ist reines Host-CPU
+(`NpParticleBuffer.cpp:543-596`: `PX_ALLOC`, `partitions()`, `combinePartitions()`,
+`PxSort`); der einzige CUDA-Kontakt sind sechs `memHostAlloc`, die die Bridge
+echt implementiert.  Das war das Go/No-Go der Tranche und es ging aus.  Die zwei
+`physxextensions`-Helfer der Snippet-Vorlage (`PxParticleClothBufferHelper`,
+`PxCreateAndPopulateParticleClothBuffer`) sind inline nachgebaut statt verlinkt —
+der erste ist reine Buchhaltung über `PxParticleClothDesc`, der zweite ein
+transparenter Wrapper über `createParticleClothBuffer` + Memcpys + `setCloths`
+(`ExtParticleExt.cpp:92-126`).
+
+**Das Observable ist ein hängender Vorhang, und es fällt laut aus.**  Ein 12×12-Blatt
+(144 Partikel, 506 Federn, 242 Dreiecke) liegt flach bei y=5.0, die erste Reihe ist
+mit `invMass = 0` fixiert.  Die Federn sind das Einzige, was ein freies Partikel mit
+der fixierten Reihe verbindet.  Gemessen, einziger Unterschied ist, ob der Puffer
+Federn trägt:
+
+|                         | mit Federn | Kontrolle ohne Federn | Schwelle |
+|---|---|---|---|
+| freies mittleres y (Ende) | 4.2009 | 0.2000 | |
+| freies mittleres y (Min)  | 3.7693 | 0.0981 | > 2.5 |
+| BBox-Diagonale (Max)      | 3.1551 | 5.8059 | < 4.0 |
+
+Die 0.2000 der Kontrolle sind exakt der Rest-Offset: jedes freie Partikel liegt flach
+auf dem Boden.  **Die Kontrolle fällt durch BEIDE Prüfungen** (0.0981 ist nicht > 2.5;
+5.8059 ist nicht < 4.0), und die beiden sind unabhängig: die Hänge-Prüfung fängt einen
+Solve, der GAR KEINE Kraft aufbringt, die Diagonale einen, der die FALSCHE aufbringt.
+
+Zwei Entscheidungen, die bewusst gegen das Hausmuster gehen:
+* **Das Minimum über alle Schritte** wird geprüft, nicht der Endwert.  Das Blatt
+  schwingt; eine Prüfung nur auf dem letzten Schritt wäre von einem Lauf zu
+  befriedigen, der transient ausgebrochen und zufällig gerade auf dem Rückweg ist.
+  Die ersten 20 Schritte sind ausgenommen — das Blatt muss erst herunterschwingen.
+* **Keine Ruhe-Prüfung.**  Ohne Aerodynamik (beide `ps_solveAerodynamics`-Kernel
+  unmapped, und mit `lift = drag = 0` ohnehin wirkungslos) und mit
+  `springDamping = 0.001` ist das Blatt ein schwach gedämpftes Pendel und kommt in
+  240 Schritten nicht zur Ruhe (freies mittleres y oszilliert in [3.77, 4.58]).
+  Ein `restMaxDy`-Check würde eine Dämpfung behaupten, die die Szene bewusst nicht
+  hat.
+
+**Launch-Trace, in sich stimmig:** `ps_initializeSpringsLaunch` 3× (einmal pro Frame),
+`ps_updateRemapVertsLaunch` und `ps_averageVertsLaunch` je 27× (9 Solver-Iterationen ×
+3 Frames), `ps_solveSpringsLaunch` 216× = 27 × **8 Partitionen** — genau die
+`nbPartitions`, die der Partitionierer für 506 Federn meldet (maxSpringsPerPartition
+78, remapOutputSize 1168, clothBlendScale 0.333333 = 1/3, also maxCopies 2).  Alle
+vier OK, keiner REFUSED.
+
+**Was diese Szene NICHT zeigt**, ausdrücklich: sie prüft die Ruhe-FORM nicht gegen
+CUDA — was Bit-Exaktheit trägt, sind die drei P9.3-Fixtures, nicht diese Szene.  Und
+sie erreicht den Mehr-Puffer-Pfad nicht: ein Cloth-Puffer mit einem Cloth heißt
+`mParticleBufferRunsum[0] == 0`, und das ist die einzige Konfiguration, in der die
+`binarySearch` in `ps_averageVertsLaunch` (über BUFFER-LOKALE Startindizes, mit einem
+GLOBALEN Index als Schlüssel — Upstream-Verdacht 14) mit ihrem eigenen Guard
+übereinstimmt.  Das steht als Kommentar neben der Szene, damit eine spätere Tranche
+nicht einen zweiten Puffer hinzufügt und das Ergebnis als Bestätigung liest.
+
+Nebenbefund fürs Manifest: `ps_updateSprings` hat in 5.6.1 **keine einzige
+Aufrufstelle** in `physx/source` — der Kernel ist tot und kann von keiner Szene
+erreicht werden.
+
+Suite **787/787** in beiden Modi, **24 Szenen** grün (particlecloth ist die neue),
+null fehlende Verdikte.  Manifest unverändert 333 — diese Tranche mappt keinen
+Kernel, sie macht vier bereits gemappte zum ersten Mal erreichbar.
 
 ## P9.3c — `ps_averageVertsLaunch`: der Gather, der die Cloth-Kette schließt (Manifest 333) — und ein VIERZEHNTER Upstream-Verdacht
 

@@ -475,6 +475,13 @@ struct ParticleScene
     PxParticleBuffer* buffer = nullptr;
     PxU32 numParticles = 0;
     PxCudaContextManager* cudaCtx = nullptr;
+    // P9.4: the PINNED prefix of the particle array.  buildParticleClothScene
+    // orders the sheet row-major with the pinned row FIRST, so indices
+    // [0, numPinned) are the invMass == 0 particles and [numPinned, numParticles)
+    // are the free ones.  Every cloth assertion is over the FREE range only --
+    // the pinned particles never move, so including them would dilute exactly the
+    // signal the scene exists to measure.
+    PxU32 numPinned = 0;
 };
 
 // fluidMode (PXG_SCENE=particlefluid, P9.2) switches the cloud from a SOLID
@@ -713,6 +720,328 @@ float particleMeanY(const ParticleScene& psc)
     double sum = 0.0;
     for (PxU32 i = 0; i < psc.numParticles; ++i) sum += double(host[i].y);
     return float(sum / double(psc.numParticles));
+}
+
+// ---------------------------------------------------------------------------
+// P9.4 -- PXG_SCENE=particlecloth: the PBD CLOTH sheet.
+//
+// This is the scene that makes the spring chain observable.  Four kernels were
+// mapped for it across P9.3a-c -- ps_initializeSpringsLaunch (zero the XPBD
+// multipliers), ps_updateRemapVertsLaunch (gather each spring's endpoints out of
+// the sorted arrays), ps_solveSpringsLaunch (the per-partition XPBD solve) and
+// ps_averageVertsLaunch (fold the scattered copies back into one delta per
+// particle) -- and until now NOTHING dispatched them: the host gates the entire
+// chain on getMaxSpringsPerBuffer() > 0 (PxgPBDParticleSystemCore.cpp:958) and no
+// scene built a PxParticleClothBuffer.
+//
+// THE OBSERVABLE IS A HANGING CURTAIN, and it was chosen because it fails loudly.
+// The sheet is built horizontally in the XZ plane with its FIRST ROW pinned
+// (invMass = 0).  Gravity then rotates the free part down about that edge until
+// it hangs as a vertical curtain.  The springs are the ONLY thing connecting a
+// free particle to the pinned row -- there is no other constraint in the scene
+// that could hold it up -- so:
+//
+//     springs working  -> the sheet hangs, free particles stay near the pins
+//     springs absent   -> every free particle free-falls to the floor
+//
+// The control (PXG_PARTICLE_CLOTH_CONTROL=1) builds the IDENTICAL geometry,
+// material, phase, pinning and step count, but as a plain PxParticleBuffer with no
+// springs at all.  That is exactly the host's own gate, so the control isolates
+// the chain under test rather than some proxy for it.
+//
+// Two things this scene does NOT establish, stated up front.  It does not check
+// the resting SHAPE against CUDA -- what carries bit-exactness is the three P9.3
+// fixtures, not this scene.  And it does not exercise the multi-cloth path: one
+// cloth buffer with one cloth means mParticleBufferRunsum[0] == 0, which is the
+// only configuration in which ps_averageVertsLaunch's binarySearch (over
+// BUFFER-LOCAL start indices, keyed by a GLOBAL index -- upstream candidate 14)
+// agrees with its own guard.  A second particle buffer would be needed to reach
+// that, and it is left to a later tranche rather than smuggled in here.
+//
+// CALIBRATION.  Both numbers are MEASURED on this scene, the only difference
+// between the two runs being whether the buffer carries springs:
+//
+//                              springs      no-spring control    threshold
+//   free mean y (final)        4.2009       0.2000
+//   free mean y (min)          3.7693       0.0981               > 2.5
+//   bbox diagonal (max)        3.1551       5.8059               < 4.0
+//
+// The control's 0.2000 is exactly the rest offset: every free particle ends flat
+// on the floor, which is what "the springs did nothing" looks like.  Both
+// thresholds sit between the two columns, and the control run FAILS BOTH of them
+// (0.0981 is not > 2.5; 5.8059 is not < 4.0) -- that is what makes them checks
+// rather than decoration.  The two are also independent: the hang check catches a
+// solve that applies NO force, the diagonal catches one that applies the WRONG
+// force, and neither implies the other.
+//
+// The sheet does NOT come to rest, and no rest check is asserted.  It is a
+// pendulum with springDamping 0.001 and no aerodynamic drag (ps_solveAerodynamics
+// 1/2Launch are both still unmapped, PxgSlangKernelManifest.h:250-251, and are
+// switched off anyway because this material's lift and drag are 0), so the free
+// mean y oscillates in [3.78, 4.58] for as long as it is stepped.  Asserting a
+// rest here would be asserting damping the scene deliberately does not have.
+static const float CLOTH_HANG_MIN = 2.5f;        // free-particle mean y must stay above this
+static const float CLOTH_HANG_CONTROL = 0.2000f; // measured, no-spring control
+static const float CLOTH_DIAG_MAX = 4.0f;        // bbox diagonal: catches an EXPLODING solve
+static const float CLOTH_DIAG_REST = 3.11f;      // sqrt(2.2^2 + 2.2^2), the flat sheet's diagonal
+static const float CLOTH_DIAG_CONTROL = 5.8059f; // measured, no-spring control
+
+// The sheet: 12 x 12 at 0.2 spacing, so it spans 2.2 x 2.2 and drops 2.2 when it
+// hangs.  144 particles, 12 pinned.  Spring topology is SnippetPBDCloth's
+// (SnippetPBDCloth.cpp:145-175): structural springs along both axes plus both
+// diagonals of every cell, and the two boundary runs -- 4*(nX-1)*(nZ-1) + (nX-1)
+// + (nZ-1) = 506 springs, enough that the partitioner produces several partitions
+// and ps_solveSpringsLaunch is dispatched more than once per iteration.
+static const PxU32 CLOTH_NX = 12;
+static const PxU32 CLOTH_NZ = 12;
+static const float CLOTH_SPACING = 0.2f;
+static const float CLOTH_PIN_Y = 5.0f;
+
+static PX_FORCE_INLINE PxU32 clothId(PxU32 x, PxU32 y, PxU32 numY) { return x * numY + y; }
+
+// springsMode == false builds the CONTROL: same everything, no springs, plain
+// particle buffer.  Returns an empty ParticleScene on failure.
+ParticleScene buildParticleClothScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
+                                      PxCudaContextManager* cudaCtx, bool springsMode)
+{
+    ParticleScene out;
+    out.cudaCtx = cudaCtx;
+
+    // A floor for the control run to land on, and one live dynamic rigid body --
+    // with zero dynamic rigids the rigid batch-sum kernel null-derefs on the
+    // particle island's solver descriptors (see buildParticleScene's note).  The
+    // box sits far aside at x=20 so it never touches the sheet.
+    addGroundBox(physics, scene, rigidMat);
+    {
+        PxRigidDynamic* aside = physics->createRigidDynamic(PxTransform(PxVec3(20.0f, 0.5f, 0.0f)));
+        PxShape* s = physics->createShape(PxBoxGeometry(0.5f, 0.5f, 0.5f), *rigidMat);
+        aside->attachShape(*s);
+        aside->setMass(1000.0f);
+        aside->setMassSpaceInertiaTensor(boxInertia(PxVec3(0.5f), 1000.0f));
+        s->release();
+        scene->addActor(*aside);
+    }
+
+    const PxU32 numParticles = CLOTH_NX * CLOTH_NZ;
+    const PxU32 numSprings = (CLOTH_NX - 1) * (CLOTH_NZ - 1) * 4 + (CLOTH_NX - 1) + (CLOTH_NZ - 1);
+    const PxU32 numTriangles = (CLOTH_NX - 1) * (CLOTH_NZ - 1) * 2;
+    const float restOffset = CLOTH_SPACING;
+    const float totalClothMass = 10.0f;
+    const float particleMass = totalClothMass / float(numParticles);
+
+    // SnippetPBDCloth.cpp:107-112 -- the snippet's own stiffnesses and material.
+    const float stretchStiffness = 10000.0f;
+    const float shearStiffness = 100.0f;
+    const float springDamping = 0.001f;
+
+    PxPBDMaterial* pbdMat = physics->createPBDMaterial(0.8f, 0.05f, 1e+6f, 0.001f, 0.5f,
+                                                       0.005f, 0.05f, 0.0f, 0.0f);
+    PxPBDParticleSystem* ps = physics->createPBDParticleSystem(*cudaCtx);
+    ps->setRestOffset(restOffset);
+    ps->setContactOffset(restOffset + 0.02f);
+    ps->setParticleContactOffset(restOffset + 0.02f);
+    ps->setSolidRestOffset(restOffset);
+    ps->setFluidRestOffset(0.0f);
+    // A hanging sheet needs a converged solve; the snippet leaves the default, but
+    // the default is tuned for a sheet resting ON something, not one suspended
+    // from a single row.  Both runs use the same count so the control is fair.
+    ps->setSolverIterationCounts(/*pos*/ 8, /*vel*/ 1);
+    scene->addActor(*ps);
+
+    const PxU32 phase = ps->createPhase(pbdMat, PxParticlePhaseFlags(
+        PxParticlePhaseFlag::eParticlePhaseSelfCollideFilter |
+        PxParticlePhaseFlag::eParticlePhaseSelfCollide));
+
+    // Lay the sheet out row-major in i (the hang direction) so that row i == 0 --
+    // the pinned row -- occupies indices [0, CLOTH_NZ).
+    std::vector<PxVec4> hostPos(numParticles), hostVel(numParticles, PxVec4(0.0f));
+    std::vector<PxU32> hostPhase(numParticles, phase);
+    std::vector<PxParticleSpring> springs;
+    std::vector<PxU32> triangles;
+    springs.reserve(numSprings);
+    triangles.reserve(size_t(numTriangles) * 3u);
+
+    const float z0 = -0.5f * float(CLOTH_NZ - 1) * CLOTH_SPACING;
+    for (PxU32 i = 0; i < CLOTH_NX; ++i)
+    {
+        for (PxU32 j = 0; j < CLOTH_NZ; ++j)
+        {
+            const PxU32 index = clothId(i, j, CLOTH_NZ);
+            // The pinned row has invMass 0, which makes it immovable in the
+            // integrator (particlesystem.cu:3143 guards on pos4.w > 0) and
+            // weightless in the spring solve (wsum is the sum of the two inverse
+            // masses).  ps_averageVertsLaunch skips it outright
+            // (particlesystem.cu:4379), which is why the assertions read the FREE
+            // range only.
+            const float invMass = (i == 0) ? 0.0f : (1.0f / particleMass);
+            hostPos[index] = PxVec4(float(i) * CLOTH_SPACING, CLOTH_PIN_Y,
+                                    z0 + float(j) * CLOTH_SPACING, invMass);
+
+            if (i > 0)
+                springs.push_back({ clothId(i - 1, j, CLOTH_NZ), clothId(i, j, CLOTH_NZ),
+                                    CLOTH_SPACING, stretchStiffness, springDamping, 0.0f });
+            if (j > 0)
+                springs.push_back({ clothId(i, j - 1, CLOTH_NZ), clothId(i, j, CLOTH_NZ),
+                                    CLOTH_SPACING, stretchStiffness, springDamping, 0.0f });
+            if (i > 0 && j > 0)
+            {
+                const float diag = PxSqrt(2.0f) * CLOTH_SPACING;
+                springs.push_back({ clothId(i - 1, j - 1, CLOTH_NZ), clothId(i, j, CLOTH_NZ),
+                                    diag, shearStiffness, springDamping, 0.0f });
+                springs.push_back({ clothId(i - 1, j, CLOTH_NZ), clothId(i, j - 1, CLOTH_NZ),
+                                    diag, shearStiffness, springDamping, 0.0f });
+                triangles.push_back(clothId(i - 1, j - 1, CLOTH_NZ));
+                triangles.push_back(clothId(i - 1, j, CLOTH_NZ));
+                triangles.push_back(clothId(i, j - 1, CLOTH_NZ));
+                triangles.push_back(clothId(i - 1, j, CLOTH_NZ));
+                triangles.push_back(clothId(i, j - 1, CLOTH_NZ));
+                triangles.push_back(clothId(i, j, CLOTH_NZ));
+            }
+        }
+    }
+    if (springs.size() != numSprings || triangles.size() != size_t(numTriangles) * 3u)
+    {
+        std::printf("FAIL: cloth topology count mismatch (springs %zu vs %u, tris %zu vs %u)\n",
+                    springs.size(), numSprings, triangles.size() / 3u, numTriangles);
+        return out;
+    }
+
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+
+    if (!springsMode)
+    {
+        // The CONTROL: identical particles, no springs, plain buffer.  This is the
+        // host's own gate (getMaxSpringsPerBuffer() > 0) expressed as a scene.
+        PxParticleBuffer* buffer = physics->createParticleBuffer(numParticles, 0, cudaCtx);
+        if (!buffer) { std::printf("FAIL: createParticleBuffer returned null\n"); return out; }
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPositionInvMasses()),
+                        hostPos.data(), numParticles * sizeof(PxVec4));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getVelocities()),
+                        hostVel.data(), numParticles * sizeof(PxVec4));
+        ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPhases()),
+                        hostPhase.data(), numParticles * sizeof(PxU32));
+        buffer->setNbActiveParticles(numParticles);
+        buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_POSITION);
+        buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_VELOCITY);
+        buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_PHASE);
+        ps->addParticleBuffer(buffer);
+        out.system = ps;
+        out.buffer = buffer;
+        out.numParticles = numParticles;
+        out.numPinned = CLOTH_NZ;
+        return out;
+    }
+
+    // --- the real cloth path ---
+    //
+    // SnippetPBDCloth routes this through two physxextensions helpers
+    // (PxParticleClothBufferHelper and PxCreateAndPopulateParticleClothBuffer).
+    // Neither is available here -- the sdktest links the CPU SDK core only, not
+    // physxextensions -- and neither needs to be: the first is pure bookkeeping
+    // that fills a PxParticleClothDesc, and the second is a transparent wrapper
+    // over createParticleClothBuffer + six memcpys + setCloths
+    // (ExtParticleExt.cpp:92-126).  Both are inlined below rather than dragging in
+    // the extensions library for twenty lines of struct filling.
+    PxParticleCloth cloth;
+    cloth.startVertexIndex = 0;
+    cloth.numVertices = numParticles;
+    cloth.clothBlendScale = 0.0f;   // filled in by partitionSprings
+    cloth.restVolume = 0.0f;        // inflatable only, and this sheet is not one
+    cloth.pressure = 0.0f;
+    cloth.startTriangleIndex = 0;
+    cloth.numTriangles = numTriangles;
+
+    std::vector<PxVec4> restPositions = hostPos;
+
+    PxParticleClothDesc clothDesc;
+    clothDesc.cloths = &cloth;
+    clothDesc.triangles = triangles.data();
+    clothDesc.springs = springs.data();
+    clothDesc.restPositions = restPositions.data();
+    clothDesc.nbCloths = 1;
+    clothDesc.nbSprings = numSprings;
+    clothDesc.nbTriangles = numTriangles;
+    clothDesc.nbParticles = numParticles;
+
+    // partitionSprings is PURE CPU -- PX_ALLOC, partitions(), combinePartitions(),
+    // PxSort (NpParticleBuffer.cpp:543-596).  It launches no CUDA kernels, which is
+    // what makes this scene buildable on the port at all.  It is also where
+    // clothBlendScale comes from: 1 / (maxCopiesOverThisCloth + 1), with the
+    // engine's own "AD Todo: figure out why blendScale is computed like this"
+    // sitting above it (:562).
+    PxParticleClothPreProcessor* pre = PxCreateParticleClothPreProcessor(cudaCtx);
+    if (!pre) { std::printf("FAIL: PxCreateParticleClothPreProcessor returned null\n"); return out; }
+    PxPartitionedParticleCloth partitioned;
+    pre->partitionSprings(clothDesc, partitioned);
+    pre->release();
+
+    std::printf("  cloth partitioning: %u springs -> %u partitions, maxSpringsPerPartition %u, "
+                "remapOutputSize %u, clothBlendScale %.6f\n",
+                partitioned.nbSprings, partitioned.nbPartitions,
+                partitioned.maxSpringsPerPartition, partitioned.remapOutputSize,
+                cloth.clothBlendScale);
+
+    PxParticleClothBuffer* buffer = physics->createParticleClothBuffer(
+        numParticles, /*maxVolumes*/ 0, clothDesc.nbCloths, clothDesc.nbTriangles,
+        clothDesc.nbSprings, cudaCtx);
+    if (!buffer) { std::printf("FAIL: createParticleClothBuffer returned null\n"); return out; }
+
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPositionInvMasses()),
+                    hostPos.data(), numParticles * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getVelocities()),
+                    hostVel.data(), numParticles * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPhases()),
+                    hostPhase.data(), numParticles * sizeof(PxU32));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getTriangles()),
+                    triangles.data(), size_t(numTriangles) * 3u * sizeof(PxU32));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getRestPositions()),
+                    restPositions.data(), numParticles * sizeof(PxVec4));
+    buffer->setNbActiveParticles(numParticles);
+    buffer->setNbTriangles(numTriangles);
+    buffer->setCloths(partitioned);
+    ps->addParticleBuffer(buffer);
+
+    out.system = ps;
+    out.buffer = buffer;
+    out.numParticles = numParticles;
+    out.numPinned = CLOTH_NZ;
+    return out;
+}
+
+// DtoH-read the particle buffer and return the mean y over the FREE particles
+// (indices [numPinned, numParticles)).  The pinned row never moves, so averaging
+// it in would blunt the very signal being measured.
+float clothFreeMeanY(const ParticleScene& psc)
+{
+    std::vector<PxVec4> host(psc.numParticles);
+    PxCudaContext* ctx = psc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(psc.buffer->getPositionInvMasses()),
+                    psc.numParticles * sizeof(PxVec4));
+    double sum = 0.0;
+    PxU32 n = 0;
+    for (PxU32 i = psc.numPinned; i < psc.numParticles; ++i) { sum += double(host[i].y); ++n; }
+    return n ? float(sum / double(n)) : 0.0f;
+}
+
+// The diagonal of the axis-aligned bounding box over ALL particles.  This is the
+// EXPLOSION check and it is independent of the hang check: a spring solve with the
+// wrong sign or the wrong scale blows the sheet apart, which raises the diagonal
+// without necessarily lowering the mean y.  A flat 2.2 x 2.2 sheet has a diagonal
+// of 3.11; hanging it folds the sheet, which can only shrink the bound.
+float clothBBoxDiag(const ParticleScene& psc)
+{
+    std::vector<PxVec4> host(psc.numParticles);
+    PxCudaContext* ctx = psc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(psc.buffer->getPositionInvMasses()),
+                    psc.numParticles * sizeof(PxVec4));
+    PxVec3 lo(1e30f), hi(-1e30f);
+    for (PxU32 i = 0; i < psc.numParticles; ++i)
+    {
+        lo.x = PxMin(lo.x, host[i].x); hi.x = PxMax(hi.x, host[i].x);
+        lo.y = PxMin(lo.y, host[i].y); hi.y = PxMax(hi.y, host[i].y);
+        lo.z = PxMin(lo.z, host[i].z); hi.z = PxMax(hi.z, host[i].z);
+    }
+    return (hi - lo).magnitude();
 }
 
 // PXG_SCENE=cloth (P7.0): the first FEMCloth/deformable-surface scene — the exact
@@ -3045,6 +3374,112 @@ int main()
     // PXG_SCENE=particle (P6.0): the deformable/particle free-fall path.  Wholly
     // separate observable from the rigid RestTarget path — a PBD cloud that falls
     // under gravity, verified by DtoH-reading its mean y across steps.
+    // P9.4 -- PXG_SCENE=particlecloth: the PBD cloth sheet hanging from a pinned
+    // row.  See buildParticleClothScene for why this observable and this control.
+    if (!std::strcmp(sceneName, "particlecloth"))
+    {
+        const bool control = std::getenv("PXG_PARTICLE_CLOTH_CONTROL") != nullptr;
+        ParticleScene psc = buildParticleClothScene(physics, scene, material, cudaCtx, !control);
+        if (!psc.system)
+        {
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'particlecloth' built: %u PBD particles (%u pinned), "
+                    "springs %s\n", psc.numParticles, psc.numPinned,
+                    control ? "ABSENT (control run)" : "present");
+
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: particle cloth GPU pipeline CONSTRUCTED + live "
+                        "over Vulkan (set PXG_GPU_STEP=1 to step the drape)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_PARTICLE_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 240;
+        const float y0 = clothFreeMeanY(psc);
+        const float diag0 = clothBBoxDiag(psc);
+        std::printf("  stepping the cloth sheet (%d x %.4fs), initial free mean y=%.4f, "
+                    "bbox diagonal=%.4f\n", steps, dt, y0, diag0);
+
+        // The hang is tracked as a MINIMUM OVER EVERY STEP, not just the final
+        // value.  The sheet swings, so a check on the last step alone could be
+        // satisfied by a run that blew out transiently and happened to be on the
+        // way back up when the loop ended.  Settling for the weaker check would be
+        // settling for a test that passes for the wrong reason.
+        //
+        // The first 20 steps are excluded from the minimum: the sheet starts flat
+        // at y = 5.0 and has to swing DOWN to its hanging position, and during that
+        // swing it legitimately passes through low mean-y values that say nothing
+        // about whether the springs hold.  20 steps is a third of a second, well
+        // inside the measured swing period and far short of the 60 steps the
+        // control needs to reach the floor.
+        const int settleIn = 20;
+        float prevY = y0, diagMax = diag0, yMin = 1e30f;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            const float y = clothFreeMeanY(psc);
+            const float dg = clothBBoxDiag(psc);
+            if (dg > diagMax) diagMax = dg;
+            if (i >= settleIn) yMin = PxMin(yMin, y);
+            if (i < 5 || i == steps - 1 || (i % 30 == 0))
+                std::printf("    step %3d: free mean y=%.4f (dy %+.5f), bbox diag=%.4f\n",
+                            i, y, y - prevY, dg);
+            prevY = y;
+        }
+        const float yEnd = clothFreeMeanY(psc);
+        const float diagEnd = clothBBoxDiag(psc);
+        std::printf("  particle CLOTH: free mean y %.4f -> %.4f (min after step %d: %.4f), "
+                    "bbox diag %.4f -> %.4f (max %.4f)\n",
+                    y0, yEnd, settleIn, yMin, diag0, diagEnd, diagMax);
+
+        int failures = 0;
+        if (control)
+        {
+            // The control is not asserted on -- it is MEASURED, and its number is
+            // what justifies the threshold the real run is held to.  Printing it
+            // in the same format keeps the two comparable by eye.
+            std::printf("[  OK  ] gpu-sdk-step: particlecloth CONTROL run (no springs) "
+                        "measured: free mean y %.4f (min %.4f), bbox diag %.4f (max %.4f)\n",
+                        yEnd, yMin, diagEnd, diagMax);
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 0;
+        }
+
+        if (!(yMin > CLOTH_HANG_MIN))
+        {
+            std::printf("FAIL: the sheet did not HANG -- the free particles fell away from the "
+                        "pinned row (free mean y dropped to %.4f, threshold %.2f, no-spring "
+                        "control %.4f)\n", yMin, CLOTH_HANG_MIN, CLOTH_HANG_CONTROL); ++failures;
+        }
+        if (!(diagMax < CLOTH_DIAG_MAX))
+        {
+            std::printf("FAIL: the sheet EXPLODED -- max bbox diagonal %.4f exceeds %.2f "
+                        "(the flat sheet's own diagonal is %.2f, the no-spring control reaches "
+                        "%.4f)\n", diagMax, CLOTH_DIAG_MAX, CLOTH_DIAG_REST, CLOTH_DIAG_CONTROL);
+            ++failures;
+        }
+        if (!std::isfinite(yEnd) || !std::isfinite(diagEnd))
+        {
+            std::printf("FAIL: cloth state is not finite (y=%.4f, diag=%.4f)\n", yEnd, diagEnd);
+            ++failures;
+        }
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: the PBD cloth sheet HANGS from its pinned row on "
+                        "Vulkan (free mean y never below %.4f vs %.4f for the no-spring control, "
+                        "bbox diag max %.4f vs %.4f) -- the whole spring chain runs end to end\n",
+                        yMin, CLOTH_HANG_CONTROL, diagMax, CLOTH_DIAG_CONTROL);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: particlecloth checks failed (%d)\n", failures);
+        return 2;
+    }
+
     const bool fluidScene = !std::strcmp(sceneName, "particlefluid");
     if (!std::strcmp(sceneName, "particle") || fluidScene)
     {
@@ -4394,9 +4829,12 @@ int main()
     // with PXG_PARTICLE_STARTY set (see bagMode above).
     else { std::printf("[ FAIL ] gpu-sdk-step: unknown PXG_SCENE='%s'\n"
                        "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|articulation\n"
-                       "          particle|particlefluid|cloth|clothhang|clothdrape|clothselfcollide|clothcloth\n"
+                       "          particle|particlefluid|particlecloth|cloth|clothhang|clothdrape\n"
+                       "          clothselfcollide|clothcloth\n"
                        "          softbody|softbodyselfcollide|softbodycloth|softbodystack|softbodyattach\n"
-                       "  modes:  PXG_SCENE=particle + PXG_PARTICLE_STARTY=<y>  (the settling bag)\n",
+                       "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
+                       "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
+                       "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n",
                        sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
     if (targets.empty())

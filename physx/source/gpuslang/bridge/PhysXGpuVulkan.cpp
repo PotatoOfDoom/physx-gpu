@@ -261,7 +261,24 @@ public:
         return static_cast<PxsParticleBuffer*>(PX_NEW(PxgParticleBuffer)(maxNumParticles, maxVolumes, cudaContextManager));
     }
     PxsParticleAndDiffuseBuffer* createParticleAndDiffuseBuffer(PxU32, PxU32, PxU32, PxCudaContextManager&) PX_OVERRIDE { warnNotImplemented("createParticleAndDiffuseBuffer"); return NULL; }
-    PxsParticleClothBuffer* createParticleClothBuffer(PxU32, PxU32, PxU32, PxU32, PxU32, PxCudaContextManager&) PX_OVERRIDE { warnNotImplemented("createParticleClothBuffer"); return NULL; }
+    // P9.4: the PBD CLOTH buffer, the same shape as createParticleBuffer above and
+    // for the same reason -- PxgParticleClothBuffer allocates its device arrays
+    // through the Vulkan shim and launches no kernels, so it constructs as soon as
+    // the stub is replaced (mirrors physxgpu/src/PxgPhysXGpu.cpp:110-114).
+    //
+    // This stub, not any missing kernel, was what blocked PXG_SCENE=particlecloth:
+    // the whole spring chain had been mapped in P9.3a-c and nothing could reach it,
+    // because the engine could not even allocate a cloth buffer to hang springs on.
+    // Note also that returning NULL here is not survivable upstream -- NpPhysics
+    // hands the result straight to NpParticleClothBuffer's constructor, which
+    // dereferences it (NpParticleBuffer.cpp), so the warn-and-null contract of the
+    // other stubs SEGFAULTS rather than degrading.  That is worth knowing for the
+    // two that remain.
+    PxsParticleClothBuffer* createParticleClothBuffer(PxU32 maxNumParticles, PxU32 maxVolumes, PxU32 maxNumCloths, PxU32 maxNumTriangles, PxU32 maxNumSprings, PxCudaContextManager& cudaContextManager) PX_OVERRIDE
+    {
+        return static_cast<PxsParticleClothBuffer*>(PX_NEW(PxgParticleClothBuffer)(
+            maxNumParticles, maxVolumes, maxNumCloths, maxNumTriangles, maxNumSprings, cudaContextManager));
+    }
     PxsParticleRigidBuffer* createParticleRigidBuffer(PxU32, PxU32, PxU32, PxCudaContextManager&) PX_OVERRIDE { warnNotImplemented("createParticleRigidBuffer"); return NULL; }
 
     // P4 memory seam (real): the Vulkan PxsMemoryManager (device->shim,
