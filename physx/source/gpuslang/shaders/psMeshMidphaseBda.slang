@@ -166,8 +166,11 @@ static const float PARTICLE_FORWARD_PROJECTION_STEP_SCALE_PGS = 1.0f;
 static const float PARTICLE_FORWARD_PROJECTION_STEP_SCALE_TGS = 0.5f;
 static const float PARTICLE_FORWARD_PROJECTION_STEP_SCALE_DIFFUSE = 1.0f;
 
-// PxParticleFlag::eENABLE_SPECULATIVE_CCD
-static const uint PX_PARTICLE_FLAG_SPECULATIVE_CCD = 1u << 2;
+// PxParticleFlag::eENABLE_SPECULATIVE_CCD (PxPBDParticleSystem.h:185).  It is
+// 1 << 3, NOT 1 << 2 -- 1 << 2 is eFULL_DIFFUSE_ADVECTION.  The draft of this
+// file had 1 << 2 and psMeshMidphaseLayout caught it; psBoundsBda and
+// psContactGenBda both already spell 8.
+static const uint PX_PARTICLE_FLAG_SPECULATIVE_CCD = 8u;
 
 // ---------------------------------------------------------------------------
 // Push constants -- the ten CUDA arguments, writer inlined by value.
@@ -434,6 +437,26 @@ void loadTrimeshParticlePair(uint cmIdx,
     psShape = shapes[sRefPs]; psCacheRef = cRefPs;
 }
 
+// ---------------------------------------------------------------------------
+// The work-loop index arithmetic, as FUNCTIONS so the kernel and the coverage
+// entry point below share one copy.  P9.9's review found a fixture that could
+// not pin the very constant it existed to pin, because the constant only became
+// observable at a size the fixture never reached; here the arithmetic is at
+// least guaranteed to be the same arithmetic in both places, so the coverage
+// test's kills are kills on the kernel.
+// ---------------------------------------------------------------------------
+uint psMeshNbWarpsRequired(uint numParticles) { return (numParticles + WARP - 1u) / WARP; }
+
+uint psMeshNbIterations(uint numParticles)
+{
+    return (psMeshNbWarpsRequired(numParticles) + TOTAL_NUM_WARPS - 1u) / TOTAL_NUM_WARPS;
+}
+
+uint psMeshWorkIndex(uint it, uint warpIdx, uint blockIdxX, uint nbIterationsPerWarps)
+{
+    return it + (warpIdx + MIDPHASE_WARPS_PER_BLOCK * blockIdxX) * nbIterationsPerWarps;
+}
+
 // ===========================================================================
 // ps_meshCollisonLaunch -- the kernel.  grid (16384, numTests, 2), block (32,1,1).
 //
@@ -523,8 +546,8 @@ void ps_meshCollisonLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
         oneWayCountsAddr = systems[psId].mOneWayContactCount;
     }
 
-    const uint nbWarpsRequired = (numParticles + WARP - 1u) / WARP;
-    const uint nbIterationsPerWarps = (nbWarpsRequired + TOTAL_NUM_WARPS - 1u) / TOTAL_NUM_WARPS;
+    const uint nbWarpsRequired = psMeshNbWarpsRequired(numParticles);
+    const uint nbIterationsPerWarps = psMeshNbIterations(numParticles);
     const uint64_t gridParticleIndexAddr = systems[psId].mSortedToUnsortedMapping;
 
     // D2: sticky, per lane, for ALL remaining iterations -- the CUDA's `return`.
@@ -532,7 +555,7 @@ void ps_meshCollisonLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
 
     for (uint it = 0u; it < nbIterationsPerWarps; ++it)
     {
-        const uint workIndex = it + (warpIdx + MIDPHASE_WARPS_PER_BLOCK * gid.x) * nbIterationsPerWarps;
+        const uint workIndex = psMeshWorkIndex(it, warpIdx, gid.x, nbIterationsPerWarps);
 
         // Block-uniform: every lane of the group agrees, so the barriers below are
         // reached by all 32 lanes or by none.
@@ -852,6 +875,50 @@ void ps_meshCollisonLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// psMeshMidphaseWorkIndex -- TEST-ONLY, absent from the manifest.
+//
+// The kernel's work loop can only be exercised at nbIterationsPerWarps > 1 by a
+// particle count above TOTAL_NUM_WARPS * 32 = 524288, and a fixture cannot afford
+// the positions, the mesh and the twelve one-way columns for a million particles.
+// So this entry point drives the SAME three functions with nothing else attached
+// and records which work indices the loop covers, and how many times.
+//
+// At nbIterationsPerWarps == 1 the `* nbIterationsPerWarps` factor is an identity
+// and pins nothing -- exactly the hole P9.9's review found in the boundary-density
+// fixture -- which is why the test drives it at 1, 2 AND 3.
+// ===========================================================================
+struct PsMeshWorkPush
+{
+    uint64_t coverage;    // @0  uint* , one slot per work index
+    uint numParticles;    // @8
+    uint _pad;            // @12 -> 16
+}
+[[vk::push_constant]]
+ConstantBuffer<PsMeshWorkPush> gMw;
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void psMeshMidphaseWorkIndex(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    const uint numParticles = gMw.numParticles;
+    const uint nbWarpsRequired = psMeshNbWarpsRequired(numParticles);
+    const uint nbIterationsPerWarps = psMeshNbIterations(numParticles);
+
+    for (uint it = 0u; it < nbIterationsPerWarps; ++it)
+    {
+        const uint workIndex = psMeshWorkIndex(it, gtid.y, gid.x, nbIterationsPerWarps);
+        if (workIndex < nbWarpsRequired)
+        {
+            if (gtid.x == 0u)
+            {
+                uint prev;
+                InterlockedAdd(Ptr<uint>(gMw.coverage)[workIndex], 1u, prev);
             }
         }
     }
