@@ -37,10 +37,11 @@ if [ -z "${PXG_SHADER_DIR:-}" ]; then
     exit 2
 fi
 
-# The 25 named scenes.  The settling bag below makes 26 -- the figure
+# The 26 named scenes.  The settling bag below makes 27 -- the figure
 # RUNTIME_STATUS.md's header carries.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor articulation
-        particle particlefluid particlefluidboundary particlecloth particleinflatable
+        particle particlefluid particlefluidboundary particlemeshfloor
+        particlecloth particleinflatable
         cloth clothhang clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach"
 
@@ -81,7 +82,8 @@ if [ "${1:-}" = "--diagnostics" ]; then
     for spec in "particlefluid PXG_PARTICLE_FLUID_CONTROL" \
                 "particlecloth PXG_PARTICLE_CLOTH_CONTROL" \
                 "particleinflatable PXG_PARTICLE_INFL_CONTROL" \
-                "particlefluidboundary PXG_PARTICLE_BOUNDARY_CONTROL"; do
+                "particlefluidboundary PXG_PARTICLE_BOUNDARY_CONTROL" \
+                "particlemeshfloor PXG_PARTICLE_BOUNDARY_CONTROL"; do
         sc=${spec%% *}; var=${spec##* }
         echo "--- $sc + $var=1"
         env PXG_SCENE=$sc $var=1 PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \

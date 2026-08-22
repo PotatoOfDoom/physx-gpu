@@ -8,10 +8,11 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **797/797** green in both modes (`ctest -N` in `build-gpuslang`).
-Szenen: **26/26** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
-Inventar (25 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
-trägt, ein FEHLENDES Verdikt getrennt zählt und die vier Diagnose-Kontrollen
-ausdrücklich NICHT wertet.  P9.9 fügte `particlefluidboundary` hinzu.
+Szenen: **27/27** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
+Inventar (26 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
+trägt, ein FEHLENDES Verdikt getrennt zählt und die fünf Diagnose-Kontrollen
+ausdrücklich NICHT wertet.  P9.9 fügte `particlefluidboundary` hinzu, P9.10c
+`particlemeshfloor`.
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1697,6 +1698,70 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.10c — Manifest **340**, und `ps_accumulateStaticDensity` bekommt zum ersten Mal etwas zu lesen
+
+Die ABI-Zeile, der Manifest-Eintrag und die Szene. Das Modul IST der Kernel — es gibt
+keinen separaten Wrapper, der Einstiegspunkt heißt schon `ps_meshCollisonLaunch` —, also
+ist diese Tranche klein und besteht aus drei Dingen.
+
+**Die ABI-Zeile** `kPsMeshCollide[] = { 1, 4, 8, 8, 8, 8, 8, 8, 8, 72 }` = 136 Byte.
+Derselbe 72-Byte-Writer am Ende wie `kPsPrimCollide`, aber ein KÜRZERER Kopf: dieser
+Kernel nimmt weder den Bounds/Materials/StartIndices-Block noch eine Paarzahl, weil sein
+Paarindex `blockIdx.y` ist statt eines abgeflachten Arbeitsindex. `tolerenceLength` bleibt
+in der Zeile, obwohl der Kernelrumpf es NIE liest (der SDF-Zwilling liest es) — es zu
+streichen verschöbe jeden späteren Offset um vier Byte.
+
+**Das Manifest** von Hand editiert, 339 → **340** (67,9 % von 501). `p4Manifest` grün.
+
+**Die Szene `PXG_SCENE=particlemeshfloor`**, und sie ist ein Experiment mit genau einer
+Variablen. Sie ist die Randdichte-Szene, bei der der statische Boden-QUADER gegen ein
+gekochtes DREIECKSNETZ auf derselben Höhe getauscht ist; der Quader sinkt auf y = −40, wo
+ihn nichts erreicht. Der Tausch ist der ganze Punkt:
+
+* Ein Quaderboden erzeugt Partikel-gegen-Rigid-Kontakte über
+  `ps_primitivesCollisionLaunch`, und die landen im PRIMITIV-Kontaktstrom — dem Strom, den
+  `ps_accumulateRigidDensity` liest und den P9.9 als 100 % des Randdichte-Effekts gemessen
+  hat.
+* Ein Dreiecksnetzboden erzeugt sie über `ps_meshCollisonLaunch`, und für einen STATISCHEN
+  Rigid gehen die in `mOneWayContactInfos`, nicht zum Writer (der sieht nur den Überlauf
+  über `MaxStaticContactsPerParticle` = 12, und dieser Boden hat zwei Dreiecke — kein
+  Partikel kommt in die Nähe). Genau dieses Array liest `ps_accumulateStaticDensity`, und
+  es war bisher in jeder Szene leer.
+
+Auf dieser Szene kann die Randdichte also nur durch die STATISCHE Hälfte des P9.8-Paars
+ankommen. Gemessen, 240 Schritte, beide Läufe auf demselben 60 × 60 großen Netz:
+
+| Skala | ruhende Ausdehnung | ruhender NN |
+|---|---|---|
+| 0 (`PXG_PARTICLE_BOUNDARY_CONTROL=1`) | 5,2148 | 0,0918 |
+| 1,0 | **9,6288** | 0,2010 |
+
+Eine Trennung um Faktor 1,85 — weiter als die 1,63 des Quaderbodens. Das Gate ist ein
+einseitiges Minimum bei 7,0, frei von beiden Enden, dieselbe Form wie beim Quader und aus
+demselben Grund: behauptet wird, dass der Effekt ANKOMMT, nicht dass er eine bestimmte
+Größe hat. `PXG_LAUNCH_TRACE=1` zählt **577** Starts von `ps_meshCollisonLaunch` über die
+240 Schritte.
+
+### Zwei Dinge, die wie Portfehler aussahen und Szenenfehler waren
+
+1. **Das Fluid fiel vom Netz.** Erster Lauf: mittleres y −2,98, Ausdehnung 10,0018 — und
+   10,0018 ist exakt die halbe Kantenlänge des Netzes. Das sah nach einem Kontaktausfall
+   aus. Es war ein Dimensionierungsfehler: mit eingeschalteter Randdichte breitet sich
+   diese Pfütze auf ~10 aus, ein 20 × 20 großes Netz legt den Rand also genau dorthin, wo
+   das Fluid endet. **Derselbe Boden hielt die Partikel bei Skala 0 bei y = 0,167.** Das
+   Netz ist jetzt 60 × 60.
+2. **Der Beistell-Quader** (den die Partikelszene braucht, damit
+   `rigidSumInternalContactAndJointBatches2` nicht auf null dereferenziert) parkt bei
+   x = 20 — INNERHALB einer Pfütze mit RMS-Radius 9,6. Er hätte primitive Kontakte
+   beisteuern und damit genau das verwischen können, was diese Szene isoliert. Auf dem
+   Netzboden steht er jetzt bei x = 45, außerhalb des Netzes. **Die Zahlen änderten sich
+   dadurch nicht** — er war also tatsächlich nie in Kontakt; das ist gemessen und nicht
+   angenommen, und der Umzug bleibt, weil die Aussage sonst von einer Zufälligkeit abhinge.
+
+Szenen: **27/27** grün, null Fehlschläge, null fehlende Verdikte. `run_scenes.sh` trägt
+`particlemeshfloor` jetzt im Inventar und seine Kontrolle in der Diagnoseliste, die
+NICHT gewertet wird.
 
 ## P9.10a/b — `ps_meshCollisonLaunch` auf der Engine-BDA-ABI: ein LIFT, gegen sein eigenes Vorbild differentiell geprüft
 

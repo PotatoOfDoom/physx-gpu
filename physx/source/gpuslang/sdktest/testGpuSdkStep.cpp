@@ -112,9 +112,10 @@ PxVec3 boxInertia(const PxVec3& h, float mass)
                   k * (h.x * h.x + h.y * h.y));
 }
 
-PxRigidStatic* addGroundBox(PxPhysics* physics, PxScene* scene, PxMaterial* material)
+PxRigidStatic* addGroundBox(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                            float centreY = -0.5f)
 {
-    PxRigidStatic* ground = physics->createRigidStatic(PxTransform(PxVec3(0.0f, -0.5f, 0.0f)));
+    PxRigidStatic* ground = physics->createRigidStatic(PxTransform(PxVec3(0.0f, centreY, 0.0f)));
     PxShape* gs = physics->createShape(PxBoxGeometry(50.0f, 0.5f, 50.0f), *material);
     ground->attachShape(*gs);
     scene->addActor(*ground);
@@ -205,6 +206,34 @@ void buildMeshFloorScene(PxPhysics* physics, PxScene* scene, PxMaterial* materia
     PxRigidDynamic* b = addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f),
                                    boxInertia(PxVec3(0.5f), 1000.0f), 5.0f);
     targets.push_back({ b, 5.0f, 0.5f, "boxOnMesh" });
+}
+
+// A cooked TRIANGLE MESH floor at y = 0: two triangles wound so the normals point
+// up, with buildGPUData so the mesh carries a BV32 tree.  Used by the particle
+// mesh-floor scene (P9.10c), which is the first scene in this port to put
+// PARTICLES on a triangle mesh and therefore the first that launches
+// ps_meshCollisonLaunch.
+PxRigidStatic* addMeshFloor(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                            float halfExtent)
+{
+    const float E = halfExtent;
+    const PxVec3 mverts[4] = { PxVec3(-E, 0.0f, -E), PxVec3(-E, 0.0f, E),
+                               PxVec3( E, 0.0f, -E), PxVec3( E, 0.0f, E) };
+    const PxU32 mtris[6] = { 0u, 1u, 2u,   2u, 1u, 3u };
+    PxTriangleMeshDesc md;
+    md.points.count = 4; md.points.stride = sizeof(PxVec3); md.points.data = mverts;
+    md.triangles.count = 2; md.triangles.stride = 3 * sizeof(PxU32); md.triangles.data = mtris;
+    PxCookingParams ck(physics->getTolerancesScale());
+    ck.buildGPUData = true;   // without this the mesh has no BV32 tree and the GPU pair is inert
+    PxTriangleMesh* meshGeom =
+        immediateCooking::createTriangleMesh(ck, md, physics->getPhysicsInsertionCallback());
+    if (!meshGeom) { std::printf("FAIL: createTriangleMesh (mesh floor) returned null\n"); return nullptr; }
+    PxRigidStatic* floor = physics->createRigidStatic(PxTransform(PxVec3(0.0f, 0.0f, 0.0f)));
+    PxShape* fs = physics->createShape(PxTriangleMeshGeometry(meshGeom), *material);
+    floor->attachShape(*fs);
+    scene->addActor(*floor);
+    fs->release();
+    return floor;
 }
 
 // PXG_SCENE=plane: one dynamic box resting on a static infinite PxPlaneGeometry
@@ -477,6 +506,36 @@ static const float FLUID_RISE_CONTROL = 1.8923f;// measured
 // A scale of 1 makes mRestDensityBoundary equal the fluid's own rest density
 // (PxgParticleSystemCore.cpp:2640: mRestDensityBoundary = mRestDensity * scale).
 static const float FLUID_BOUNDARY_SCALE = 1.0f;
+
+// P9.10c -- PXG_SCENE=particlemeshfloor.  The boundary scene with the ground BOX
+// swapped for a cooked TRIANGLE MESH at the same height, and the box sunk to -40
+// where nothing can reach it.  That swap is the whole experiment:
+//
+//   * a box floor produces particle-vs-rigid contacts through
+//     ps_primitivesCollisionLaunch, which land in the PRIMITIVE contact stream --
+//     the stream ps_accumulateRigidDensity reads, which P9.9 measured as 100% of
+//     the boundary observable;
+//   * a triangle-mesh floor produces them through ps_meshCollisonLaunch, and for a
+//     STATIC rigid those go into mOneWayContactInfos, not into the writer (the
+//     writer only ever sees the overflow past MaxStaticContactsPerParticle = 12,
+//     and this floor is two triangles, so no particle comes close).  That array is
+//     what ps_accumulateStaticDensity reads and had always found empty.
+//
+// So on this scene the boundary density can only arrive through the STATIC half of
+// the P9.8 pair, and the separation below is the first evidence that half does
+// anything at all.  Measured, 240 steps, both runs on the identical 60 x 60 mesh:
+//
+//     scale     resting spread     resting nn
+//       0            5.2148          0.0918      (PXG_PARTICLE_BOUNDARY_CONTROL=1)
+//       1.0          9.6288          0.2010
+//
+// a 1.85x separation, wider than the box floor's 1.63x.  The gate is a one-sided
+// minimum at 7.0, clear of both ends -- the same shape as the box scene's, and for
+// the same reason: what is being asserted is that the effect ARRIVES, not that it
+// has a particular magnitude.
+static const float MESHFLOOR_SPREAD_MIN = 7.0f;
+static const float MESHFLOOR_SPREAD_CONTROL = 5.2148f;
+static const float MESHFLOOR_SPREAD_LIVE = 9.6288f;
 // The observable -- read the long note at the boundary assertion block before
 // touching these.  MEASURED on this exact scene, A/B against
 // PXG_PARTICLE_BOUNDARY_CONTROL=1 (identical scene, scale left at 0 so neither
@@ -535,7 +594,7 @@ struct ParticleScene
 // the two scenes are each other's control.
 ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
                                  PxCudaContextManager* cudaCtx, bool fluidMode = false,
-                                 bool boundaryMode = false)
+                                 bool boundaryMode = false, bool meshFloorMode = false)
 {
     ParticleScene out;
     out.cudaCtx = cudaCtx;
@@ -546,7 +605,27 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     // Batches2) dereferences null solver descriptors and faults, so the scene needs
     // one live rigid body to keep that proven path valid.  It rests at y=0.5, ~100
     // below the particle cloud, so there is never any particle/rigid interaction.
-    addGroundBox(physics, scene, rigidMat);
+    // meshFloorMode swaps the static ground BOX for a cooked TRIANGLE MESH at the
+    // same height and drops the box far below, where it cannot contribute a
+    // contact.  That is the whole point of the scene: with a box floor the
+    // particle-vs-rigid contacts go through ps_primitivesCollisionLaunch into the
+    // PRIMITIVE contact stream, which is what P9.9 measured feeding the boundary
+    // density; a triangle-mesh floor routes them through ps_meshCollisonLaunch
+    // instead, which is the only producer of mOneWayContactInfos this port has.
+    if (meshFloorMode)
+    {
+        addGroundBox(physics, scene, rigidMat, -40.0f);
+        // 60 x 60, not the 20 x 20 the meshfloor box scene uses.  Measured: with the
+        // boundary density ON this puddle spreads to ~10, so a half-extent of 10 put
+        // the rim exactly where the fluid ends up and the particles fell off the edge
+        // (mean y -2.98).  That looked like a contact failure and was a floor-sizing
+        // failure -- with the scale at 0 the SAME floor held them at y 0.167.
+        addMeshFloor(physics, scene, rigidMat, 30.0f);
+    }
+    else
+    {
+        addGroundBox(physics, scene, rigidMat);
+    }
     // The engine drives the rigid solver core for the particle island, so one live
     // dynamic rigid body is required (else rigidSumInternalContactAndJointBatches2
     // null-derefs).  Free-fall: box at x=0,y=5 (never meets the y~100 cloud).  Bag
@@ -554,7 +633,13 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     // pile on the floor never touches it.
     if (std::getenv("PXG_PARTICLE_STARTY") || fluidMode)
     {
-        PxRigidDynamic* aside = physics->createRigidDynamic(PxTransform(PxVec3(20.0f, 0.5f, 0.0f)));
+        // On the mesh floor the puddle spreads to an RMS radius near 10, so the usual
+        // x=20 parking spot is INSIDE the puddle and the aside box would start
+        // contributing PRIMITIVE contacts -- the other half of the boundary density,
+        // which would blur exactly what this scene is built to isolate.  On that floor
+        // it goes to x=45, outside the 60 x 60 mesh, and falls to the sunken ground box.
+        const float asideX = meshFloorMode ? 45.0f : 20.0f;
+        PxRigidDynamic* aside = physics->createRigidDynamic(PxTransform(PxVec3(asideX, 0.5f, 0.0f)));
         PxShape* s = physics->createShape(PxBoxGeometry(0.5f, 0.5f, 0.5f), *rigidMat);
         aside->attachShape(*s);
         aside->setMass(1000.0f);
@@ -3989,11 +4074,18 @@ int main()
     // P9.9: particlefluidboundary IS the fluid scene, with one extra call.  It takes
     // the same code path and the same assertions, plus the boundary-specific pair.
     const bool boundaryScene = !std::strcmp(sceneName, "particlefluidboundary");
-    const bool fluidScene = !std::strcmp(sceneName, "particlefluid") || boundaryScene;
+    // P9.10c: particlemeshfloor is the BOUNDARY scene with the ground box swapped
+    // for a cooked TRIANGLE MESH.  It is the first scene in this port that puts
+    // particles on a triangle mesh, so it is the first that launches
+    // ps_meshCollisonLaunch -- the only producer of mOneWayContactInfos, which P9.9
+    // proved ps_accumulateStaticDensity reads and had always found empty.
+    const bool meshFloorScene = !std::strcmp(sceneName, "particlemeshfloor");
+    const bool fluidScene = !std::strcmp(sceneName, "particlefluid") || boundaryScene
+                            || meshFloorScene;
     if (!std::strcmp(sceneName, "particle") || fluidScene)
     {
         ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx, fluidScene,
-                                               boundaryScene);
+                                               boundaryScene || meshFloorScene, meshFloorScene);
         if (!psc.system || !psc.buffer)
         {
             std::printf("[ FAIL ] gpu-sdk-step: particle scene build failed\n");
@@ -4165,7 +4257,46 @@ int main()
                               FLUID_BOUNDARY_SCALE_SPREAD);
                   ++failures; }
             }
+            // P9.10c -- the MESH FLOOR.  Two things must hold, and both are
+            // a-priori justifiable rather than tuned: the puddle must be ON the mesh
+            // (no tunnelling through two triangles, which is what a midphase that
+            // finds no contacts looks like), and it must have collapsed from the
+            // column's start height.  The spread numbers are printed for the record;
+            // the boundary threshold below is the box-floor scene's job, because the
+            // two floors do not produce the same contact stream and sharing a
+            // threshold between them would be comparing different measurements.
+            if (meshFloorScene)
+            {
+                std::printf("  particle MESH FLOOR: mean y %.4f -> %.4f; spread %.4f -> %.4f; nn %.4f\n",
+                            y0, yEnd, spread0, spreadEnd, nnEnd);
+                if (!(yEnd > 0.0f))
+                { std::printf("FAIL: the puddle sank to or through the triangle-mesh floor "
+                              "(mean y = %.4f, floor at 0) -- ps_meshCollisonLaunch produced no "
+                              "usable contacts\n", yEnd);
+                  ++failures; }
+                if (!(yEnd < y0))
+                { std::printf("FAIL: the column never collapsed (mean y %.4f -> %.4f)\n", y0, yEnd);
+                  ++failures; }
+                if (!std::getenv("PXG_PARTICLE_BOUNDARY_CONTROL")
+                    && !(spreadEnd > MESHFLOOR_SPREAD_MIN))
+                { std::printf("FAIL: the boundary density is not reaching the fluid through the "
+                              "STATIC path -- the puddle did not spread past the boundary-off "
+                              "control (spread=%.4f, need >%.4f; the control measures %.4f and the "
+                              "live run measured %.4f)\n",
+                              spreadEnd, MESHFLOOR_SPREAD_MIN, MESHFLOOR_SPREAD_CONTROL,
+                              MESHFLOOR_SPREAD_LIVE);
+                  ++failures; }
+            }
             scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            if (failures == 0 && meshFloorScene)
+            {
+                std::printf("[  OK  ] gpu-sdk-step: the PBD fluid rests on a COOKED TRIANGLE MESH "
+                            "(mean y %.4f, spread %.4f vs %.4f for the boundary-off control, "
+                            "nn %.4f) -- ps_meshCollisonLaunch fills mOneWayContactInfos and "
+                            "ps_accumulateStaticDensity finally has something to read\n",
+                            yEnd, spreadEnd, MESHFLOOR_SPREAD_CONTROL, nnEnd);
+                return 0;
+            }
             if (failures == 0 && boundaryScene && !std::getenv("PXG_PARTICLE_BOUNDARY_CONTROL"))
             {
                 std::printf("[  OK  ] gpu-sdk-step: the PBD fluid FEELS ITS BOUNDARY -- "
@@ -5415,7 +5546,7 @@ int main()
     // with PXG_PARTICLE_STARTY set (see bagMode above).
     else { std::printf("[ FAIL ] gpu-sdk-step: unknown PXG_SCENE='%s'\n"
                        "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|articulation\n"
-                       "          particle|particlefluid|particlefluidboundary|particlecloth|particleinflatable\n"
+                       "          particle|particlefluid|particlefluidboundary|particlemeshfloor|particlecloth|particleinflatable\n"
                        "          cloth|clothhang|clothdrape\n"
                        "          clothselfcollide|clothcloth\n"
                        "          softbody|softbodyselfcollide|softbodycloth|softbodystack|softbodyattach\n"

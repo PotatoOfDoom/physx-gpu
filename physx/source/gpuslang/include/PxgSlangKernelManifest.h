@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 339;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 340;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -225,7 +225,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_convexCollisionLaunch", nullptr, nullptr },  // PS_CONVEX_COLLISION (unmapped)
     { "ps_primitivesDiffuseCollisionLaunch", nullptr, nullptr },  // PS_PRIMITIVES_DIFFUSE_COLLISION (unmapped)
     { "ps_convexDiffuseCollisionLaunch", nullptr, nullptr },  // PS_CONVEX_DIFFUSE_COLLISION (unmapped)
-    { "ps_meshCollisonLaunch", nullptr, nullptr },  // PS_TRIMESH_COLLISION (unmapped)
+    { "ps_meshCollisonLaunch", "psMeshMidphaseBda.spv", "ps_meshCollisonLaunch" },  // PS_TRIMESH_COLLISION (P9.10)
     { "ps_sdfMeshCollisonLaunch", nullptr, nullptr },  // PS_SDF_TRIMESH_COLLISION (unmapped)
     { "ps_heightfieldCollisonLaunch", nullptr, nullptr },  // PS_HEIGHTFIELD_COLLISION (unmapped)
     { "ps_reorderPrimitiveContactsLaunch", "psContactSortBda.spv", "ps_reorderPrimitiveContactsLaunch" },  // PS_REORDER_PRIMITIVE_CONTACTS (P6.4b-1 BDA port: gather sorted contact arrays)

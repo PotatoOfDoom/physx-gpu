@@ -921,6 +921,25 @@ static const uint8_t kPsPrimBound2[] = { 4, 8, 8, 8 };
 //   -> {1,4,4,8x11,72} = 176-byte blob.
 static const uint8_t kPsPrimCollide[] = { 1, 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 72 };
 
+// gpunarrowphase particleSystemMeshMidphase.cu:775 (P9.10) — the particle-vs-
+// TRIANGLE-MESH midphase and contact generation:
+//   ps_meshCollisonLaunch(const bool isTGS, const PxReal tolerenceLength,
+//     const PxgContactManagerInput*, const PxsCachedTransform*,
+//     const PxReal* contactDistance, const PxReal* restDistances,
+//     const PxgShape*, PxgParticleSystem*, const PxNodeIndex* shapeToRigidRemapTable,
+//     PxgParticleContactWriter writer)
+//   Same by-value 72-byte writer tail as kPsPrimCollide, but a SHORTER head: this
+//   kernel takes neither the bounds/materials/startIndices block nor a pair count,
+//   because its pair index is blockIdx.y rather than a flattened work index.
+//   Natural-alignment blob: bool @0, PxReal @4, seven pointers @8..@56, writer @64
+//   -> {1,4,8x7,72} = 136 bytes.
+//   NOTE `tolerenceLength` is in the signature and NEVER READ by this kernel body
+//   (the SDF twin reads it).  It stays in the row because dropping it would shift
+//   every later offset by four bytes.
+//   Launch site PxgNarrowphaseCore.cpp:3966: grid (PS_MESH_COLLISION = 16384,
+//   numTests, 2) x block (WARP_SIZE, PS_MIDPHASE_COLLISION_WAPRS_PER_BLOCK = 1, 1).
+static const uint8_t kPsMeshCollide[] = { 1, 4, 8, 8, 8, 8, 8, 8, 8, 72 };
+
 // gpucommon/src/CUDA/radixSortImpl.cu (P6.2 grid radix sort):
 //   radixSortMultiBlockLaunchWithoutCount(PxgRadixSortDesc* desc, PxU32 startBit)
 //   / radixSortMultiCalculateRanksLaunchWithoutCount(same ABI) — the numKeys
@@ -1589,6 +1608,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_primitivesBoundSecondPassLaunch", kPsPrimBound2, uint32_t(sizeof(kPsPrimBound2)) },
     // gpunarrowphase (P6.4a-2 PBD particle-vs-primitive contact generator)
     { "ps_primitivesCollisionLaunch", kPsPrimCollide, uint32_t(sizeof(kPsPrimCollide)) },
+    { "ps_meshCollisonLaunch", kPsMeshCollide, uint32_t(sizeof(kPsMeshCollide)) },
     // gpucommon radixSortImpl.cu:39 / :53 — the PLAIN radix twins (P6.4b-1 BDA);
     // same {8,4} pack as the WithoutCount twins (numKeys deref'd on-device).
     { "radixSortMultiBlockLaunch", kRadixDescPlain, uint32_t(sizeof(kRadixDescPlain)) },
