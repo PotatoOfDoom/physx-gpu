@@ -217,6 +217,13 @@ static AABB mergeAabb(const AABB& a, const AABB& b)
     }
     return r;
 }
+// The root's shape.  ROOT_LEAF_CHUNK must stay at or below the leaf threshold in
+// buildNode and ROOT_NODE_CHUNK comfortably above it, or the root stops producing
+// one of the two kinds of child.
+static const uint32_t ROOT_FANOUT = 26u;
+static const uint32_t ROOT_LEAF_CHUNK = 8u;
+static const uint32_t ROOT_NODE_CHUNK = 40u;
+
 static uint32_t buildNode(std::vector<Bv32NodeHost>& nodes, const std::vector<AABB>& prims,
                           uint32_t begin, uint32_t end, std::mt19937& rng, int depth)
 {
@@ -227,14 +234,29 @@ static uint32_t buildNode(std::vector<Bv32NodeHost>& nodes, const std::vector<AA
     std::vector<uint32_t> cuts = { begin, end };
     if (depth == 0)
     {
-        // The ROOT is deliberately WIDE -- evenly spaced so the slot count is
-        // guaranteed, not merely likely.  A BV32 node holds up to 32 children and
-        // the leaf offset is `(nodeIndex >> 1) & 31`; with the 2..6 children a
-        // random split gives, slot indices never exceed 5 and a mutant that masks
-        // with 15 instead of 31 is an identity.  It is not, here.
-        const uint32_t wide = std::min<uint32_t>(26u, count);
-        for (uint32_t i = 1; i < wide; ++i)
-            cuts.push_back(begin + uint32_t(uint64_t(count) * i / wide));
+        // The ROOT is deliberately WIDE, and deliberately UNEVEN, and both halves of
+        // that matter -- the first draft got only the first half and traded away
+        // three kills for it.
+        //
+        //  * WIDE, because a BV32 node holds up to 32 children and a leaf's offset
+        //    is `(nodeIndex >> 1) & 31`.  With the 2..6 children a random split
+        //    gives, slot indices never exceed 5 and a mutant that masks with 15
+        //    instead of 31 is an identity.
+        //  * UNEVEN, because a wide root of EVENLY sized chunks put every chunk
+        //    under the leaf threshold, so every root child became a leaf, the tree
+        //    became one level deep, and the child-offset shift and the node-index
+        //    mask stopped being reachable at all.  t3 and t5 went from KILLED to
+        //    SURVIVED on exactly that.
+        //
+        // So: alternating small chunks (leaves, at slots 0, 2, ... 24 -- including
+        // slots past 15) and large ones (internal nodes, so the descent is real).
+        uint32_t cursor = begin;
+        for (uint32_t i = 0; i < ROOT_FANOUT - 1u && cursor < end; ++i)
+        {
+            const uint32_t sz = (i % 2u == 0u) ? ROOT_LEAF_CHUNK : ROOT_NODE_CHUNK;
+            cursor = std::min(end, cursor + sz);
+            cuts.push_back(cursor);
+        }
     }
     else
     {
@@ -266,7 +288,7 @@ static uint32_t buildNode(std::vector<Bv32NodeHost>& nodes, const std::vector<AA
 // ---------------------------------------------------------------------------
 struct Scene
 {
-    static const uint32_t NR = 250u;   // triangles
+    static const uint32_t NR = 624u;   // = 13 * ROOT_LEAF_CHUNK + 13 * ROOT_NODE_CHUNK
     static const uint32_t NP = 97u;    // particles -- NOT a multiple of 32
     static const uint32_t SYS = 5u;    // particle system id, distinct from every index
     static const uint32_t CAP = 4096u; // writer capacity
