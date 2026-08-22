@@ -8,10 +8,10 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **792/792** green in both modes (`ctest -N` in `build-gpuslang`).
-Szenen: **25/25** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
-Inventar (24 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
-trägt, ein FEHLENDES Verdikt getrennt zählt und die drei Diagnose-Kontrollen
-ausdrücklich NICHT wertet.
+Szenen: **26/26** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
+Inventar (25 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
+trägt, ein FEHLENDES Verdikt getrennt zählt und die vier Diagnose-Kontrollen
+ausdrücklich NICHT wertet.  P9.9 fügte `particlefluidboundary` hinzu.
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1697,6 +1697,250 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.9 — `PXG_SCENE=particlefluidboundary`: das Fluid spürt seine Wand, und nur die HÄLFTE des Paars arbeitet daran
+
+P9.8 hat beide Randdichte-Kernel gelandet und dabei ausdrücklich festgehalten, dass sie
+in keiner Szene STARTEN. Diese Tranche ändert das mit einer einzigen Zeile — und die
+Untersuchung, die dazu nötig war, hat mehr zutage gefördert als die Szene selbst.
+
+**Die Szene.** `particlefluidboundary` ist byteweise die Fluidszene plus
+`setFluidBoundaryDensityScale(1.0)`. Das ist die ganze Differenz, und genau das macht
+die beiden zu einem sauberen A/B. `PXG_PARTICLE_BOUNDARY_CONTROL=1` baut dieselbe Szene
+mit der Skala auf 0, unterscheidet sich also in nichts außer daran, ob die zwei Kernel
+überhaupt laufen. Szenen 25 → **26**.
+
+Der Wert ist nicht beliebig: `PxgParticleSystemCore.cpp:2640` rechnet
+`mRestDensityBoundary = mRestDensity * fluidBoundaryDensityScale`, eine Skala von 1
+deckelt den Randbeitrag also bei der Ruhedichte des Fluids. Das ist eine natürliche
+EINHEIT, kein hergeleitetes Optimum — eine frühere Fassung dieses Absatzes nannte es „der
+größte Wert, bei dem ein Partikel an der Wand nicht dichter erscheinen kann als eines
+mitten im Fluid", und das ist **falsch**: kein positiver Wert hat diese Eigenschaft. Der
+Konsument SÄT `rho` mit dem Randterm (particlesystem.cu:3277-3281) und addiert die
+Nachbarsumme OBENDRAUF (:3338), ein Wandpartikel mit voller Nachbarschaft liest also
+etwa Rand + Nachbarn — rund das Doppelte eines eingebetteten Partikels — und genau
+darauf wirkt die Bedingung `c = PxMax(rho - mRestDensity, …)` (:3361). Dass ein
+Wandpartikel dichter liest, als es ist, IST der gemessene Mechanismus, kein Artefakt.
+
+**Die Messung, A/B über den Launch-Trace:**
+
+| | Starts | Spread | nn |
+|---|---|---|---|
+| live (Skala 1.0) | **600** (300 + 300) | **8.0641** | 0.0975 |
+| Kontrolle (Skala 0) | **0** | **4.9381** | 0.0851 |
+
+Der Spread reproduzierte über zwei unabhängige Läufe **bitgleich** 8.0641; die Messung
+ist deterministisch, nicht bloß stabil.
+
+**Warum Spread das Tor ist und nn nur berichtet wird.** Spread trennt an/aus um ~60% des
+Kontrollwerts, eine Schwelle bei 6.0 liegt also ~21% über der Kontrolle und ~24% unter
+dem Livelauf. nn trennt um ~11% — jede Schwelle dazwischen läge innerhalb von ~6% beider
+Seiten. Das ist ein flatterndes Tor, keine Messung, und es würde irgendwann aus Gründen
+fehlschlagen, die mit der Randdichte nichts zu tun haben. nn wird gedruckt, damit ein
+Mensch es wandern sieht, und nicht geprüft. Der Kommentar im Code sagt das so. (Er sagte
+es zwischenzeitlich NICHT: nachdem ich nn vom Tor zur bloßen Ausgabe herabgestuft hatte,
+behauptete der Kommentar weiter „beides sind einseitige Mindestprüfungen". Von der
+adversariellen Prüfung gefunden und korrigiert.)
+
+**Der Effekt SÄTTIGT**, was ebenfalls gemessen und nicht vermutet ist: eine Skala von
+0.25 kauft bereits 98% der Spread-Änderung (7.9165 gegen 8.0641), weil der rohe
+Beitrag pro Kontakt meist schon unter dem Viertel-Deckel liegt und `min(rho,
+mRestDensityBoundary)` selten greift. Das Tor ist damit ein An/Aus-Diskriminator und
+ausdrücklich KEINE Aussage über die Größe der Skala.
+
+### Der eigentliche Fund: die Namensgebung der Engine ist irreführend, und nur ein Kernel arbeitet
+
+`ps_accumulateSTATICDensity` liest `mOneWayContactInfos` / `mOneWayContactCount`. Diese
+Arrays werden von genau drei Kerneln geschrieben — `ps_meshCollisonLaunch`,
+`ps_sdfMeshCollisonLaunch` (particleSystemMeshMidphase.cu:463 und :698) und
+`ps_heightfieldCollisonLaunch` (particleSystemHFMidPhaseCG.cu:332) — also nur vom MESH-
+und HEIGHTFIELD-Pfad, und **alle drei sind unabgebildet**. `ps_preIntegrateLaunch`
+(particlesystem.cu:317) nullt den Zähler außerdem jeden Frame. In dieser Szene hat also
+jedes Partikel `contactCount == 0`, und der Kernel schreibt beweisbar `min(0, boundary)
+== 0`.
+
+`ps_accumulateRIGIDDensity` liest den Partikel-gegen-PRIMITIV-Kontaktstrom
+(`PxgParticlePrimitiveContact`), den die abgebildete Narrowphase längst erzeugt. Der
+Boden der Szene ist ein `PxRigidStatic` mit `PxBoxGeometry` — ein Primitiv. **Dieser**
+Kernel sieht also den Boden, und er ist es, den die Assertion misst.
+
+Die Namen legen das Gegenteil nahe: „static" klingt nach statischer Geometrie wie einem
+unbeweglichen Boden, meint hier aber den One-Way-Mesh-Pfad, während „rigid" den
+Primitivstrom meint — der einen STATISCHEN Starrkörper einschließt. Wer das verwechselt,
+baut eine Szene, die den falschen Kernel testet.
+
+**Der statische Kernel ist trotzdem nicht totes Gewicht, und das ist der Grund für die
+Verkettung aus P9.8.** Sein Null-Schreiben ist der FRAME-RESET von `mStaticDensity`.
+Der Rigid-Kernel sät aus genau diesem Array und schreibt in dasselbe zurück; ohne den
+Reset rastet die Randdichte ein — der Store klemmt mit `min(rho, restDensityBoundary)`,
+es wächst also nichts unbegrenzt, aber jedes je berührte Partikel nagelt sich am Deckel
+fest und folgt nicht mehr seinem aktuellen Kontaktsatz (unten gemessen). Der statische
+Kernel ist der
+Initialisierer des Paars, auch wenn er null Kontakte summiert.
+
+Diese Szene beweist damit die Rigid-Hälfte Ende zu Ende und die statische Hälfte als
+startend und zurücksetzend. Die statische Hälfte mit echten Kontakten zu füttern
+braucht zuerst einen der drei Mesh-/Heightfield-Kernel — das ist die nächste Abhängigkeit
+und sie steht als solche in der Aufgabenliste, statt dass die Tranche so tut, als sei
+das Paar vollständig ausgeübt.
+
+**Und das ist gemessen, nicht geschlossen.** Die obige Zuordnung ruht auf einer
+Argumentationskette (wer schreibt `mOneWayContactInfos`, ist das abgebildet, was ist der
+Boden der Szene), und eine solche Kette ist genau die Sorte Behauptung, die dieser Port
+nicht ungeprüft stehen lässt. Also das A/B: den Rigid-Kernel EINZELN aus dem Manifest
+nehmen, `build-sdk` neu bauen, dieselbe Szene laufen lassen. Der statische Kernel läuft
+dabei weiter und setzt weiter jeden Frame auf null zurück, der Konsument liest also eine
+saubere 0.
+
+    Rigid-Kernel unabgebildet -> spread 4.9381, nn 0.0851
+
+Das sind **exakt** die Kontrollwerte, bitgleich. Der Rigid-Kernel ist damit 100% des
+Effekts und der statische Kernel beweisbar 0% — die Argumentationskette ist bestätigt,
+und zwar durch eine Messung, die sie hätte widerlegen können.
+
+**Und die Gegenprobe hat mich korrigiert.** Den statischen Kernel einzeln zu entfernen
+sollte laut der ersten Fassung meiner Notiz „unbegrenzt akkumulieren" lassen. Gemessen:
+
+    statischer Kernel unabgebildet -> spread 35.7671, nn 3.5856, rest |dy| 0.000895
+
+Die Pfütze fliegt auseinander — Spread mal 7, Nachbarabstand mal 42, und die Szene kommt
+nicht mehr sauber zur Ruhe. Der Effekt ist also real und groß, aber **mein Mechanismus
+war falsch**: der Store klemmt mit `min(rho, restDensityBoundary)`, es kann gar nichts
+unbegrenzt wachsen. Was tatsächlich passiert, ist **Einrasten**: jedes Partikel, das
+jemals einen Starrkörper berührt hat, nagelt sich am Deckel fest und kommt nie wieder
+herunter, statt seinem AKTUELLEN Kontaktsatz zu folgen — und Partikel, die nie einen
+Kontakt hatten, lesen einen Puffer, den niemand je beschrieben hat. Der Kommentar im
+Szenencode sagt das jetzt so und benennt die frühere Formulierung ausdrücklich als
+falsch. Der Defekt ist Einrasten, nicht Divergenz.
+
+Damit ist die Rolle des statischen Kernels als Frame-Reset nicht mehr Schlussfolgerung,
+sondern die zweite Hälfte einer Messung — und ich hätte sie ohne die Gegenprobe falsch
+aufgeschrieben stehen lassen.
+
+### Der Konsument war seit P9.1b bereit
+
+Was den Effekt überhaupt sichtbar macht, ist `calculateDensityAndPotential`
+(particlesystem.cu:3253), der Rumpf hinter `ps_calculateDensityAndPotentialLaunch` —
+abgebildet seit P9.1b. Dessen Falle T3 lautete schon damals „rho wird aus
+`staticDensities[p]` gesät, aber NUR wenn `mRestDensityBoundary > 0`", und der Port
+hat das transkribiert. Bis heute hat er dort ausnahmslos Nullen gelesen. Die Kette
+schließt sich erst mit dieser Tranche — eine Falle, die zwei Tranchen vor ihrer
+Beobachtbarkeit korrekt portiert wurde.
+
+Die Richtung des Effekts wurde vorhergesagt, bevor sie gemessen wurde: mit
+eingeschaltetem Rand bekommen Partikel am Boden ein von null verschiedenes `rho`
+vorgeladen, die Dichtebedingung liest sie als dichter, als sie sind, und drückt sie
+auseinander. Die Pfütze läuft also BREITER. So kam es.
+
+### Die adversarielle Prüfung hat die Tranche an fünf Stellen korrigiert — vier davon meine eigenen Behauptungen
+
+Nachdem P9.9 committet war, habe ich das Gelandete von vier unabhängigen Prüfern
+gegenlesen lassen (Transkription gegen das CUDA-Original, Zähne der Fixture,
+Szenenbehauptungen, Verdrahtung). Ergebnis: die **Transkription selbst ist sauber** — der
+Prüfer fand keine Stelle, an der Slang und CUDA verschiedene Werte rechnen. Alles andere
+waren Aussagen von mir, die nicht hielten.
+
+**Ein MAJOR in der Fixture, und es ist die Sorte, die zählt.** Bei `nbIter == 2` fällt die
+Blockschrittweite (`nbIter*256 = 512`) zufällig mit der Iterationsschrittweite
+(`ACCUMULATE_DELTA = 512`) zusammen — und genau diese Koinzidenz macht die
+Iterationsschrittweite UNBESTIMMT. Ersetzt man im Shader `it * 512` durch `it * 1024`, ist
+die ABGEDECKTE MENGE bitgleich; verschieden ist nur die VIELFACHHEIT eines einzigen
+512er-Bandes (Indizes 512..767 fallen von doppelt auf einfach). Da der Test auf doppelt
+abgedeckten Indizes beide Rennausgänge akzeptiert, produzierte dieser Mutant **null
+Fehlschläge**. Die Konstante, die dieser Test zu fixieren existiert, war zwischen 512 und
+1024 frei.
+
+Nachgerechnet und bestätigt, bevor ich sie repariert habe:
+
+    numTests=262145 (nbIter=2): abgedeckte Menge identisch, Vielfachheit differiert an 256 Indizes [512,767]
+
+Die Reparatur ist kein weicheres Kriterium, sondern eine **zweite Größe**: bei
+`numTests = 524289` ist `nbIter == 3`, Blockschrittweite 768 gegen Iterationsschrittweite
+512 — die Koinzidenz ist weg und die abgedeckten MENGEN trennen sich (`it*1024` lässt 512
+Indizes ungedeckt, die der treue Lauf deckt; `it*256` deckt 256, die er überspringt).
+Beide sterben an der Übersprungen-Assertion, die deterministisch ist und nicht davon
+abhängt, wie das Rennen ausgeht. Gemessen: `it*1024`, `it*256` und `it*768` sterben jetzt
+alle drei; der volle Sweep bleibt bei **52 Mutanten, 50 tot, 2 bewiesene Äquivalenzen**,
+es ist also kein bestehender Kill verlorengegangen.
+
+Nebenbei kam heraus, dass die alte Abdeckungs-Assertion die geschlossene Form „Rest mod
+512 unter 256" prüfte — die nbIter==2-Spezialisierung, bei nbIter==3 schlicht falsch. Sie
+vergleicht jetzt gegen eine zweite, unabhängig geschriebene Aufzählung derselben Schleife.
+Und der Stolperdraht wird nicht mehr fest verdrahtet, sondern aus der Abdeckung
+ABGELEITET, weil „welcher Index wird übersprungen" von `nbIter` abhängt.
+
+**Drei MAJORs in meinen Kommentaren, alle bestätigt:**
+
+1. Die Begründung für `FLUID_BOUNDARY_SCALE = 1.0` war **sachlich falsch**. Ich hatte
+   geschrieben, es sei „der größte Wert, bei dem ein Wandpartikel nicht dichter erscheinen
+   kann als ein eingebettetes". Kein positiver Wert hat diese Eigenschaft: der Konsument
+   SÄT `rho` mit dem Randterm und addiert die Nachbarsumme obendrauf, ein Wandpartikel
+   liest also rund das Doppelte. Dass es dichter liest, als es ist, IST der Mechanismus,
+   den die Szene misst. 1.0 ist eine natürliche Einheit, mehr nicht — so steht es jetzt da.
+2. „Beides sind einseitige Mindestprüfungen gegen die Kontrolle" — nachdem ich nn vom Tor
+   zur bloßen Ausgabe herabgestuft hatte, blieb dieser Satz stehen und widersprach dem
+   Code sieben Zeilen darunter UND diesem Dokument.
+3. Die „unbegrenzt akkumulieren"-Formulierung stand noch an einer zweiten Stelle in diesem
+   Eintrag, während ein späterer Abschnitt sie bereits für falsch erklärte. Ein Dokument,
+   das sich selbst widerspricht, ist schlimmer als eines, das schweigt.
+
+Dass die Transkription hielt und die Prosa nicht, ist die Lehre dieses Abschnitts: der
+Sweep prüft den Code, aber **nichts prüft die Behauptungen außer jemandem, der sie gegen
+die Quellen liest.**
+
+### Ein Beinahe-Fehlalarm — und meine erste Diagnose davon war auch falsch
+
+Nach dem A/B lief `psBoundaryDensity` mit **146 Abweichungen** rot, deterministisch,
+zwölfmal hintereinander derselbe Wert, und die betroffenen Zellen waren genau die vom
+Rigid-Kernel berührten Partikel. Quelltext und Fixture waren nachweislich identisch mit
+dem grünen, committeten Stand. Das sah nach einem Portfehler aus, den der Sweep
+durchgelassen hatte.
+
+**Erste Diagnose: „veraltetes Testbinary".** Ein Neubau machte es grün, und ich habe das
+so aufgeschrieben. **Diese Diagnose war falsch**, und sie ist hier stehen geblieben, bis
+derselbe Fehler ein zweites Mal auftrat.
+
+Die wirkliche Ursache: eine **veraltete MUTANTEN-`.spv`**. Mein Sweep-Skript stellt nach
+jedem Mutanten die QUELLE wieder her (`cp $BK $SHA`), baut aber die SPIR-V nie neu — nach
+dem letzten Mutanten liegt also dessen `.spv` auf der Platte, gegen eine saubere Quelle.
+Der letzte Mutant des vollen Laufs ist `r26-system-from-gridY`, der die System-Id aus
+`groupId.y` liest (immer 0), also **alle Kontakte auf System 0 kippt** — exakt das
+Fehlerbild. Nachgewiesen über die Prüfsummen: auf der Platte lag `f1885ed6…`, sauber
+gebaut ist es `f4a22008…`, und mit letzterem ist der Test grün.
+
+Das ist wörtlich die Lektion, die P8.83 nach dem SIGPIPE-Vorfall aufgeschrieben hat —
+„eine mutierte `.spv` auf der Platte gegen eine wiederhergestellte Quelle" — und sie hat
+diese Tranche zweimal getroffen, weil das Skript improvisiert war und die Regel nur im
+Kopf stand.
+
+**Die dauerhafte Konsequenz** ist deshalb kein weiterer Merksatz, sondern
+`tools/run_mutation_sweep.sh`: ein Runner, der die Quelle sichert, nach JEDEM Mutanten
+UND am Ende Quelle *und* `.spv` wiederherstellt, das per `trap` auch bei Abbruch tut, und
+zum Abschluss den Basislauf grün nachweist, bevor er ein Ergebnis meldet. Denselben Weg
+ist `tools/run_scenes.sh` in P9.8 gegangen, aus demselben Grund: was zweimal improvisiert
+schiefgeht, gehört in den Baum.
+
+Zwei weitere Regeln, die diese Tranche verletzt hat: **nie bauen, während eine Messung
+läuft**, und **nie breit `pkill`en** (ein `pkill -f` mit Exitcode 144 hat mehr getroffen
+als gemeint).
+
+Der Stand nach sauberem Neubau: Suite **792/792** in beiden Speichermodi.
+
+### Ein gescheiterter Werkzeugversuch, der hierher gehört
+
+Die Recherche zu dieser Tranche habe ich zuerst an einen Multi-Agenten-Workflow
+delegiert: fünf Leser über die Datenflüsse, dann eine adversarielle Prüfung, dann eine
+Synthese. **Alle fünf Leser sind gestorben**, bevor sie eine Datei geöffnet hatten — die
+Subagenten-Umgebung wies jeden Werkzeugaufruf mit einem Schemafehler zurück
+(`updatedInput ... required parameter is missing`), für Bash, Glob, Grep und Read
+gleichermaßen. Der Syntheseagent hat daraufhin korrekt VERWEIGERT, einen Plan zu
+schreiben, statt Dateinamen und Schwellen zu erfinden, die er nie gesehen hatte — das
+war das richtige Verhalten und wird hier vermerkt, weil es die einzige nützliche Ausgabe
+dieses Laufs war.
+
+Die Untersuchung habe ich danach selbst gemacht, und sie hat die entscheidenden Fragen
+empirisch statt argumentativ beantwortet: ein Launch-Trace für „starten sie überhaupt"
+und ein A/B für „ändert sich etwas". Beides zusammen kostete weniger als der Workflow.
 
 ## P9.8 — das Randdichte-Paar (Manifest 339), und Upstream-Kandidat 16 wird MESSBAR — samt einer Korrektur an meiner eigenen Analyse
 

@@ -39,7 +39,10 @@
 // (PxgPBDParticleSystemCore.cpp:1118, :1141), and mHasNonZeroFluidBoundaryScale is
 // set only when some PARTICLE SYSTEM carries fluidBoundaryDensityScale > 0 (:2167) --
 // a per-system value off PxPBDParticleSystem::setFluidBoundaryDensityScale, NOT a
-// material coefficient.  Its default is 0, so no scene launches this pair today.
+// material coefficient.  Its default is 0 (ScParticleSystemShapeCore.cpp:77), so a
+// scene must ask for this pair explicitly: PXG_SCENE=particlefluidboundary (P9.9) is
+// the one that does, and PXG_PARTICLE_BOUNDARY_CONTROL=1 is the same scene with the
+// scale left at 0 so neither kernel runs.
 //
 // THE TWO ARE CHAINED, and that is the first thing to get right: the rigid kernel
 // starts from `rho = mStaticDensity[tParticleId]` rather than from zero, so it must
@@ -73,8 +76,10 @@
 //      word is the particle index and whose high word is the system id (the same
 //      packing psContactSolveBda.slang:633-635 already reads as a uint2).
 //  B9. The rigid kernel's inner loop SHADOWS the outer loop's `i` in the CUDA.  C++
-//      scoping makes that harmless, but it is transcribed with distinct names
-//      because Slang does not allow the shadowing.
+//      scoping makes that harmless, and the port spells the two counters distinctly
+//      (`it` and `c`) purely for readability -- Slang accepts the shadowed spelling
+//      too, checked with slangc rather than assumed.  Nothing behavioural rests on
+//      this; an earlier draft of this note claimed Slang rejected it, which is wrong.
 // B10. The guard inside the rigid kernel's outer loop is a `return`, not a
 //      `continue` -- once a thread's workIndex passes the end it leaves entirely.
 //      That is transcribed for fidelity, but it is PROVABLY EQUIVALENT to a
@@ -91,11 +96,21 @@
 //      nbIterationsPerBlock == 1 -- the `i * 512` term is multiplied by zero -- which
 //      holds for every scene with at most 256 * 1024 = 262144 particle-rigid contact
 //      pairs.  Above that, block bx iteration i covers
-//          [512*bx + 512*i, 512*bx + 512*i + 256)
-//      so every work index whose remainder mod 512 is at least 256 is covered by NO
-//      block at all, while [512*(bx+1), 512*(bx+1) + 256) is covered by BOTH block
-//      bx's second iteration and block bx+1's first.  BOTH halves are wrong, and
-//      the second one is the part that is easy to get wrong on paper:
+//          [N*256*bx + 512*i, N*256*bx + 512*i + 256)   with N = nbIterationsPerBlock
+//      i.e. the block STRIDE is N*256 while the iteration STRIDE is 512, and the two
+//      only agree when N == 2.  Spell N out rather than folding it away: at N == 2
+//      the block stride happens to be 512 too, which is the case the fixture pins and
+//      the case every reachable scene would hit first -- but the formula above is the
+//      general one, and at N == 3 the coverage pattern is different again (768*bx +
+//      {0,512,1024}), so a claim like "every index with remainder >= 256 mod 512 is
+//      skipped" is TRUE AT N == 2 AND FALSE AT N == 3.  An earlier draft of this note
+//      stated it unconditionally; that over-generalised what the fixture measures.
+//
+//      AT N == 2, concretely: coverage is the union of 512-wide bands
+//      [512k, 512k + 256), so every work index whose remainder mod 512 is at least
+//      256 is covered by NO block at all, while band k = bx+1 is covered by BOTH
+//      block bx's second iteration and block bx+1's first.  BOTH halves are wrong,
+//      and the second one is the part that is easy to get wrong on paper:
 //        * the skipped half keeps only its static boundary density and never
 //          receives the rigid contribution;
 //        * the doubly-covered half is a genuine READ-MODIFY-WRITE RACE, because

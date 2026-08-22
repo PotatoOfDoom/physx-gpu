@@ -82,6 +82,7 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <algorithm>
 
 namespace
 {
@@ -751,15 +752,13 @@ PXG_TEST(psBoundaryDensity)
 //
 // Candidate 16 is documented and NOT reported upstream.
 // ---------------------------------------------------------------------------
-PXG_TEST(psBoundaryDensityWorkIndex)
+static void runWorkIndexCase(PxgSlangComputeDevice* dev, uint32_t NUM_TESTS, uint32_t expectNbIter,
+                             bool expectDoubleCover)
 {
-    PxgSlangComputeDevice* dev = testDevice();
-
-    // The smallest size with a second iteration.
-    const uint32_t NUM_TESTS = BLOCK * RIGID_GRID + 1u;    // 262145
     const uint32_t nbBlocksRequired = (NUM_TESTS + BLOCK - 1u) / BLOCK;
     const uint32_t nbIter = (nbBlocksRequired + RIGID_GRID - 1u) / RIGID_GRID;
-    PXG_CHECK_MSG(nbIter == 2u, "this test needs exactly two iterations per block (got %u)", nbIter);
+    PXG_CHECK_MSG(nbIter == expectNbIter, "this case needs exactly %u iterations per block (got %u)",
+                  expectNbIter, nbIter);
 
     // One system, one contact per work index, one particle per work index.  The
     // inner loop and the material scalars are the previous test's job; this one is
@@ -771,9 +770,28 @@ PXG_TEST(psBoundaryDensityWorkIndex)
     // reachable here too (262145 = 512*512 + 1), and the range arrays carry extra
     // entries naming a particle in the SKIPPED half, so a loosened guard trips the
     // skipped-half assertion below rather than reading zeroed slack.
+    // The tripwire particle must be one this size actually SKIPS, and which index that
+    // is depends on nbIter -- at 2 the skipped set is "remainder mod 512 >= 256", at 3
+    // it is a different band pattern entirely.  So it is DERIVED from the coverage the
+    // mirror computes below rather than hard-coded, and asserted to be skipped.
     const uint32_t RANGE_PAD = 8u;
-    const uint32_t TRIPWIRE_PARTICLE = 300u;   // 300 % 512 >= 256 -> in the skipped half
-    PXG_CHECK((TRIPWIRE_PARTICLE % ACCUM_DELTA) >= BLOCK);
+
+    // The coverage the faithful loop produces, computed FIRST so the tripwire can be
+    // placed on an index this size genuinely skips.
+    std::vector<uint8_t> covered(NUM_TESTS, 0u);
+    for (uint32_t bx = 0; bx < RIGID_GRID; ++bx)
+        for (uint32_t idx = 0; idx < BLOCK; ++idx)
+            for (uint32_t it = 0; it < nbIter; ++it)
+            {
+                const uint32_t w = it * ACCUM_DELTA + idx + nbIter * bx * BLOCK;
+                if (w >= NUM_TESTS) break;
+                covered[w] = covered[w] < 255u ? uint8_t(covered[w] + 1u) : covered[w];
+            }
+    uint32_t TRIPWIRE_PARTICLE = 0xFFFFFFFFu;
+    for (uint32_t w = 0; w < NUM_TESTS; ++w)
+        if (!covered[w]) { TRIPWIRE_PARTICLE = w; break; }
+    PXG_CHECK_MSG(TRIPWIRE_PARTICLE != 0xFFFFFFFFu,
+                  "no skipped index at numTests=%u -- the tripwire has nowhere to live", NUM_TESTS);
 
     std::vector<uint32_t> rangeStart(NUM_TESTS + RANGE_PAD), rangeEnd(NUM_TESTS + RANGE_PAD);
     std::vector<uint8_t> contactBytes(size_t(NUM_TESTS + 1u) * 32u, 0);
@@ -843,7 +861,7 @@ PXG_TEST(psBoundaryDensityWorkIndex)
     // second thread's read sees the first thread's write.  Both are computed for
     // every index; which one is admissible depends on the coverage count.
     std::vector<float> once(NUM_TESTS), twice(NUM_TESTS);
-    std::vector<uint8_t> covered(NUM_TESTS, 0u);
+    std::fill(covered.begin(), covered.end(), uint8_t(0));   // recounted alongside the values
     for (uint32_t i = 0; i < NUM_TESTS; ++i) { once[i] = densitySentinel(i); twice[i] = once[i]; }
     for (uint32_t bx = 0; bx < RIGID_GRID; ++bx)
     {
@@ -864,22 +882,47 @@ PXG_TEST(psBoundaryDensityWorkIndex)
         }
     }
 
-    // The coverage pattern itself is an assertion: exactly the indices whose
-    // remainder mod 512 is below 256 are reached, and the overlap region is reached
-    // twice.  If a future engine version changes either constant this fires before
-    // the value comparison does.
+    // The coverage pattern is itself an assertion.  It used to be spelled as the
+    // closed form "remainder mod 512 below 256", which is the nbIter == 2
+    // SPECIALISATION -- the general block stride is nbIter*256, not 512, and at
+    // nbIter == 3 that closed form is simply false.  It is now compared against a
+    // second, independently written enumeration of the same loop, so the check still
+    // fires if a constant changes but no longer encodes a formula that only holds at
+    // one size.
     size_t nCovered = 0, nSkipped = 0, nDouble = 0;
+    {
+        std::vector<uint8_t> expect(NUM_TESTS, 0u);
+        for (uint32_t bx = 0; bx < RIGID_GRID; ++bx)
+            for (uint32_t it = 0; it < nbIter; ++it)
+            {
+                const uint32_t base = it * ACCUM_DELTA + nbIter * bx * BLOCK;
+                for (uint32_t idx = 0; idx < BLOCK; ++idx)
+                {
+                    const uint32_t w = base + idx;
+                    if (w >= NUM_TESTS) break;
+                    expect[w] = expect[w] < 255u ? uint8_t(expect[w] + 1u) : expect[w];
+                }
+            }
+        for (uint32_t w = 0; w < NUM_TESTS; ++w)
+            PXG_CHECK_MSG(covered[w] == expect[w],
+                          "work index %u: mirror counted %u, enumeration counted %u",
+                          w, unsigned(covered[w]), unsigned(expect[w]));
+    }
     for (uint32_t w = 0; w < NUM_TESTS; ++w)
     {
-        const bool expectCovered = (w % ACCUM_DELTA) < BLOCK;
-        PXG_CHECK_MSG((covered[w] != 0u) == expectCovered,
-                      "work index %u: covered %u, expected %s", w, unsigned(covered[w]),
-                      expectCovered ? "covered" : "SKIPPED");
         if (covered[w]) ++nCovered; else ++nSkipped;
         if (covered[w] > 1u) ++nDouble;
     }
-    PXG_CHECK_MSG(nSkipped > 0, "candidate 16 must skip something at this size");
-    PXG_CHECK_MSG(nDouble > 0, "candidate 16 must double-cover something at this size");
+    // Every size must SKIP something -- that is candidate 16's first half and the
+    // deterministic discriminator.  Double cover is the second half and is a property
+    // of nbIter == 2 specifically (there the block and iteration strides coincide);
+    // at nbIter == 3 the faithful loop double-covers nothing at all.  So the caller
+    // states which of the two this size is here to demonstrate, rather than the
+    // helper assuming one shape fits both.
+    PXG_CHECK_MSG(nSkipped > 0, "candidate 16 must skip something at numTests=%u", NUM_TESTS);
+    PXG_CHECK_MSG((nDouble > 0) == expectDoubleCover,
+                  "numTests=%u: double-covered %zu, expected %s", NUM_TESTS, nDouble,
+                  expectDoubleCover ? "some" : "none");
 
     const auto got = downloadBuffer<uint32_t>(dev, bDensity.h, NUM_TESTS + PAD);
     size_t mm = 0, mmSkipped = 0, nRaceOnce = 0, nRaceTwice = 0;
@@ -920,14 +963,39 @@ PXG_TEST(psBoundaryDensityWorkIndex)
     for (uint32_t i = 0; i < PAD; ++i)
         if (got[NUM_TESTS + i] != POISON_U32) { ++mm; std::printf("  PAD %u overwritten\n", i); }
 
-    std::printf("psBoundaryDensityWorkIndex: %u work indices, %u iterations/block; "
-                "covered %zu, SKIPPED %zu (candidate 16), double-covered %zu "
-                "(race resolved once %zu / twice %zu)\n",
+    std::printf("  workIndex[%u tests, %u iter/block]: covered %zu, SKIPPED %zu (candidate 16), "
+                "double-covered %zu (race resolved once %zu / twice %zu)\n",
                 NUM_TESTS, nbIter, nCovered, nSkipped, nDouble, nRaceOnce, nRaceTwice);
     if (mmSkipped)
         std::printf("  NOTE: %zu mismatches are on SKIPPED indices -- that is exactly what a "
                     "port which 'fixes' the 512 stride looks like\n", mmSkipped);
-    PXG_CHECK_MSG(mm == 0, "%zu work-index mismatches", mm);
+    PXG_CHECK_MSG(mm == 0, "%zu work-index mismatches at numTests=%u", mm, NUM_TESTS);
+}
+
+PXG_TEST(psBoundaryDensityWorkIndex)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // TWO sizes, and the second one is not padding -- it closes a hole the first
+    // cannot see.
+    //
+    // At nbIter == 2 the block stride (nbIter*256 = 512) coincides with the iteration
+    // stride (ACCUMULATE_DELTA = 512), and that coincidence makes the iteration stride
+    // UNDER-DETERMINED: replacing `it * 512` with `it * 1024` in the shader yields a
+    // byte-identical COVERED SET at this size and differs only in the MULTIPLICITY of
+    // one 512-band (indices 512..767 drop from doubly to singly covered).  Since the
+    // doubly-covered branch below accepts either race outcome, that mutant produced
+    // zero failures -- the stride constant this test exists to pin was unconstrained
+    // anywhere between 512 and 1024.  Found by adversarial review of the landed
+    // fixture, then reproduced by enumeration before being fixed.
+    //
+    // At nbIter == 3 the two strides no longer coincide (block stride 768, iteration
+    // stride 512), so the covered SET itself separates: `it*1024` leaves 512 indices
+    // uncovered that the faithful loop covers, and `it*256` covers 256 the faithful
+    // loop skips.  Both die on the skipped-half assertion, which is deterministic and
+    // does not lean on how the race resolves.
+    runWorkIndexCase(dev, BLOCK * RIGID_GRID + 1u, 2u, /*doubleCover*/ true);       // 262145
+    runWorkIndexCase(dev, 2u * BLOCK * RIGID_GRID + 1u, 3u, /*doubleCover*/ false); // 524289
 }
 
 } // namespace

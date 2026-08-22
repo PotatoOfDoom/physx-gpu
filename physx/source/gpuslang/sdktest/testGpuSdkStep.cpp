@@ -616,13 +616,25 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         // whole difference between PXG_SCENE=particlefluid and
         // PXG_SCENE=particlefluidboundary, which is what makes them a clean A/B.
         //
-        // The value is not arbitrary: PxgParticleSystemCore.cpp:2640 computes
+        // Where the value comes from: PxgParticleSystemCore.cpp:2640 computes
         //     mData.mRestDensityBoundary = mData.mRestDensity * fluidBoundaryDensityScale
-        // so a scale of 1 caps the boundary contribution at exactly the fluid's own
-        // rest density -- the largest value that cannot make a particle at a wall
-        // read as denser than a particle buried inside the fluid.  Both kernels then
-        // early-out on `mRestDensityBoundary > 0`, so 0 (the default) is off and any
-        // positive value is on.
+        // so a scale of 1 caps the boundary contribution at the fluid's own rest
+        // density.  That is a natural UNIT, not a derived optimum.  An earlier draft
+        // of this comment called it "the largest value that cannot make a particle at
+        // a wall read as denser than a particle buried inside the fluid"; that is
+        // false, and no positive value has that property.  The consumer SEEDS rho
+        // with the boundary term (particlesystem.cu:3277-3281) and then adds the
+        // neighbour sum ON TOP (:3338), so a wall particle with a full neighbourhood
+        // reads roughly boundary + neighbours -- about twice a buried particle -- and
+        // the constraint c = PxMax(rho - mRestDensity, ...) (:3361) acts on exactly
+        // that.  Reading denser than it really is IS the mechanism this scene
+        // measures, not an artefact to be tuned away.
+        //
+        // 1.0 is used because it is the obvious unit and because it MEASURED a large,
+        // stable, saturating effect.  The assertion below is an on/off discriminator
+        // and makes no claim about the magnitude.  Both kernels early-out on
+        // `mRestDensityBoundary > 0`, so 0 (the default) is off and any positive
+        // value is on.
         //
         // BOUNDARY_CONTROL builds the identical scene with the scale left at 0, so
         // the control differs from the live run in nothing but whether the two
@@ -4104,9 +4116,16 @@ int main()
             //     every frame, so in this scene every particle has contactCount == 0
             //     and the kernel provably writes min(0, boundary) == 0.  It is NOT
             //     dead weight, though: that zero-write is the PER-FRAME RESET of
-            //     mStaticDensity, without which the rigid kernel below -- which
-            //     seeds from that array and stores back into it -- would accumulate
-            //     without bound across frames.  It is the initialiser of the pair.
+            //     mStaticDensity, and the rigid kernel below both SEEDS from that
+            //     array and STORES BACK into it.  Remove the reset and the boundary
+            //     density LATCHES: the store's min(rho, boundary) bounds the value,
+            //     so it does not run away, but every particle that has ever touched
+            //     a rigid body pins itself at the cap and never comes back down,
+            //     instead of tracking its CURRENT contact set -- and particles that
+            //     never had a contact read a buffer nothing ever wrote.
+            //     (An earlier draft of this comment said "accumulates without
+            //     bound".  That was wrong; the store clamp bounds it.  The defect is
+            //     latching, not divergence.)
             //
             //   ps_accumulateRIGIDDensity reads the particle-vs-PRIMITIVE contact
             //     stream (PxgParticlePrimitiveContact), which the mapped narrowphase
@@ -4125,8 +4144,13 @@ int main()
             // (calculateDensityAndPotential, particlesystem.cu:3253, mapped since
             // P9.1b), so the density constraint reads them as denser than they are
             // and pushes them apart.  The puddle therefore spreads WIDER and its
-            // nearest-neighbour distance grows.  Both are one-sided minimum checks
-            // against the control, which is the same scene with the scale at 0.
+            // nearest-neighbour distance grows.  Only SPREAD is gated, as a one-sided
+            // minimum against the boundary-off control (the same scene with the scale
+            // at 0); nn is printed and NOT checked, because its on/off separation is
+            // only ~11% and no threshold in that gap would be worth regressing
+            // against.  (The nn check further up in the fluid assertions is a
+            // different thing: a MAXIMUM against the solid-phase control, testing that
+            // the fluid density constraint runs at all -- not a boundary check.)
             if (boundaryScene && !std::getenv("PXG_PARTICLE_BOUNDARY_CONTROL"))
             {
                 std::printf("  particle BOUNDARY density: spread %.4f (control %.4f, live reference "
