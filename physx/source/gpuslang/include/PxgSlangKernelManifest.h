@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 337;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 339;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -263,8 +263,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     // a port of it would be unverifiable by construction.  Left unmapped
     // deliberately; do not go looking for a scene that dispatches it.
     { "ps_updateSprings", nullptr, nullptr },  // PS_UPDATE_SPRING (unmapped, dead)
-    { "ps_accumulateStaticDensity", nullptr, nullptr },  // PS_ACCUMULATE_STATIC_DENSITY (unmapped)
-    { "ps_accumulateRigidDensity", nullptr, nullptr },  // PS_ACCUMULATE_RIGID_DENSITY (unmapped)
+    { "ps_accumulateStaticDensity", "npPsBoundaryDensity.spv", "ps_accumulateStaticDensity" },
+    { "ps_accumulateRigidDensity", "npPsBoundaryDensity.spv", "ps_accumulateRigidDensity" },
     { "ps_diffuseParticleOneWayCollision", nullptr, nullptr },  // PS_DIFFUSE_PARTICLES_ONE_WAY_COLLISION (unmapped)
     { "ps_diffuseParticleUpdatePBF", nullptr, nullptr },  // PS_DIFFUSE_PARTICLES_UPDATE_PBF (unmapped)
     { "ps_diffuseParticleCompact", nullptr, nullptr },  // PS_DIFFUSE_PARTICLES_COMPACT (unmapped)

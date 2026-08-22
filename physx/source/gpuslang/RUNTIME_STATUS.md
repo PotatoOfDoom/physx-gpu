@@ -7,8 +7,11 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **789/789** green in both modes (`ctest -N` in `build-gpuslang`).
-Szenen: **25/25** grün (P9.7 fügte `particleinflatable` hinzu).
+Test count: **792/792** green in both modes (`ctest -N` in `build-gpuslang`).
+Szenen: **25/25** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
+Inventar (24 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
+trägt, ein FEHLENDES Verdikt getrennt zählt und die drei Diagnose-Kontrollen
+ausdrücklich NICHT wertet.
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1694,6 +1697,208 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.8 — das Randdichte-Paar (Manifest 339), und Upstream-Kandidat 16 wird MESSBAR — samt einer Korrektur an meiner eigenen Analyse
+
+`ps_accumulateStaticDensity` und `ps_accumulateRigidDensity`
+(particlesystem.cu:2894 und :2944, beide vollständig gelesen) sind das, was eine
+Flüssigkeit eine Wand spüren lässt: sie summieren pro Partikel den SPH-Dichtebeitrag
+seiner Kontakte mit statischer Geometrie beziehungsweise mit Starrkörpern in
+`mStaticDensity`. Ohne sie hat eine Fluidsäule an ihrer Berandung keinen Dichtebeitrag
+und verhält sich dort, als wäre die Wand offen. `PXG_SLANG_KERNEL_MAPPED` 337 → **339**,
+neues Modul `npPsBoundaryDensity.slang` (in `PXG_NOCONTRACT_SHADERS`, `W()` ist dichte
+Float-Arithmetik), ABI-Zeilen `kTwoPtr` `{8,8}` für den statischen und die bestehende
+`kPsFindStartEnd1`-Form `{8,8,8,8,8}` für den Starrkörper-Zwilling.
+
+**Die beiden sind VERKETTET**, und das ist das Erste, was stimmen muss: der
+Starrkörper-Kernel startet mit `rho = mStaticDensity[tParticleId]` statt mit null. Er
+muss also nach dem statischen laufen, und eine Fixture muss beide in dieser Reihenfolge
+ausführen. Der Mutant, der stattdessen mit null startet, stirbt genau daran.
+
+Elf dokumentierte Fallen (B1–B11 im Modulkopf), die bemerkenswertesten:
+
+* **B1** — das System hängt hier an `gridDim.Y`, nicht an `Z`. Jeder Cloth-Kernel
+  dieses Ports benutzt `Z`; dieser nicht.
+* **B2** — die Kontaktschleife ist SPALTENWEISE mit Schrittweite `numParticles`
+  (`index = gti; index += numParticles`), nicht zeilenweise.
+* **B3** — die gespeicherte Kontaktanzahl wird auf
+  `PxgParticleContactInfo::MaxStaticContactsPerParticle = 12` geklemmt; der gespeicherte
+  Wert darf größer sein.
+* **B4** — `W(x) = kSpiky1 * (1 - x*kInvRadius)²` ist NICHT am Radius abgeschnitten.
+  Jenseits des Radius wird die Klammer negativ und das Quadrat macht den Beitrag wieder
+  POSITIV. Das ist Absicht der Engine und wird so übernommen.
+* **B8** — der Starrkörper-Kernel benutzt die Aktivliste ÜBERHAUPT NICHT: er holt sich
+  das System aus dem Kontakt, aus dem gepackten `PxU64 particleId` (unteres Wort =
+  Partikelindex, oberes = System-Id). Die Fixture hat deshalb ein Ködersystem, das die
+  Aktivliste nie nennt, das aber von genau einem Starrkörper-Arbeitsindex getroffen
+  werden MUSS.
+
+### Kandidat 16, und was ich daran falsch aufgeschrieben hatte
+
+Der Arbeitsindex des Starrkörper-Kernels lautet
+
+```
+workIndex = i * ACCUMULATE_DELTA + idx + nbIterationsPerBlock * blockIdx.x * blockDim.x
+```
+
+wobei `ACCUMULATE_DELTA` 512 ist, der Kernel aber mit `blockDim.x = PS_COLLISION = 256`
+gestartet wird. Solange `nbIterationsPerBlock == 1` ist, wird der `i * 512`-Term mit null
+multipliziert und der Widerspruch ist unsichtbar — das gilt für jede Szene mit höchstens
+`1024 * 256 = 262144` Partikel-Starrkörper-Paaren. Darüber deckt Block `bx`, Iteration
+`i` das Intervall `[512*bx + 512*i, 512*bx + 512*i + 256)` ab.
+
+Was ich beim Schreiben des Moduls notiert hatte: „die Doppelabdeckung ist harmlos, weil
+jeder Arbeitsindex denselben Wert neu berechnet und der Store eine Zuweisung ist, kein
+Akkumulieren". **Das war falsch, und die Fixture hat es widerlegt, nicht ein Argument.**
+`rho` wird aus `mStaticDensity[tParticleId]` gesät — aus genau dem Array, in das der
+Kernel danach schreibt. Zwei Threads in verschiedenen Blöcken ohne Ordnung zwischen sich
+bilden damit ein READ-MODIFY-WRITE-RENNEN. Zulässige Ergebnisse sind `static + summe`
+(beide lasen vor dem ersten Schreiben) und `static + 2*summe` (das zweite Lesen sah das
+erste Schreiben). Auf llvmpipe misst die Fixture den verdoppelten Wert bei allen 130817
+doppelt abgedeckten Indizes, mit Verhältnis exakt 2.0. (Bei 550 davon fallen beide
+zulässigen Werte zusammen, weil der Beitrag unter der ULP des Akkumulators liegt — für
+diese 550 unterscheidet der Test die beiden Ausgänge nicht, und er behauptet es auch
+nicht.)
+
+Kandidat 16 ist also in BEIDEN Hälften falsch: die übersprungene Hälfte bekommt ihren
+Starrkörperbeitrag nie, die doppelt abgedeckte bekommt ihn nichtdeterministisch zweimal.
+Der Port bildet die Arithmetik exakt nach, einschließlich der 512, und erbt damit auch
+das Rennen. Der Kandidat ist dokumentiert und **nicht gemeldet** — wie die fünfzehn davor.
+
+### Die Fixture, und wo sie ihre Zähne herbekommt
+
+`tests/testPsBoundaryDensity.cpp`, drei Tests. Kein `PX_CUDA_CALLABLE`-Original für
+einen der beiden Kernelrümpfe, also die P8.73–P8.80-Anordnung — generierte und per
+`static_assert` festgenagelte Offsets, Vergleich ganzer Regionen gegen ein Sentinel-/
+Poison-Bild, plus der Sweep. Das steht so im Dateikopf, statt den Sweep als Orakel
+auszugeben. Was diese Fixture den meisten jener Tranchen voraushat: beide Kernel sind
+reines Sammeln-und-Zuweisen, ohne Float-Atomics, also ist JEDER Vergleich bitgenau —
+mit genau einer Ausnahme, und die ist das oben gemessene Rennen.
+
+* `psBoundaryDensityLayout` — jede Konstante, die der Shader fest verdrahtet, gegen die
+  echten Engine-Header, einschließlich der `PxU64`-Packung (geprüft, indem der Test den
+  Encoder der Engine selbst aufruft, statt die Schiebeoperation zu wiederholen) und
+  einschließlich der Aussage `ACCUMULATE_DELTA != PS_COLLISION`, auf der Kandidat 16 ruht.
+* `psBoundaryDensity` — das Paar über vier Systeme mit Köder, einer Aktivliste, die keine
+  Permutation ist, und einem System mit geschlossenem Gate.
+* `psBoundaryDensityWorkIndex` — 262145 Arbeitsindizes, die kleinste Größe mit zwei
+  Iterationen pro Block. Er prüft, dass die ÜBERSPRUNGENE HÄLFTE übersprungen ist: ein
+  Port, der die 512 „repariert", deckt alles ab und fällt hier durch.
+
+### Fixture-Löcher, die der Sweep gefunden hat — beide Male dieselbe Ursache
+
+Beide sind genau die Sorte, die dieses Protokoll wiederholt zutage fördert — keine
+Shader-Fehler, sondern Fixturen, die eine Entscheidung nicht beobachtbar machen.
+
+1. **Die Zwölf-Kontakte-Klemme war unsichtbar.** Mit kleiner Randdichte in jedem aktiven
+   System sättigte das `min()` beim Store 912 von 1220 Partikeln — und ein gesättigtes
+   Partikel kann keinen Unterschied darin zeigen, wie viele Kontakte summiert wurden.
+   `s8` (Klemme ganz weg), `s9` (Klemme auf 11) und `s10` (Klemme auf 13) überlebten alle
+   drei aus diesem einen Grund. System D bekommt jetzt eine Randdichte oberhalb jeder
+   erreichbaren `rho`, und die Fixture BEHAUPTET, dass die Klemme irgendwo beobachtbar
+   ist (140 Partikel), statt es zu hoffen. Alle drei sterben.
+2. **Der Off-by-one im Guard hatte nichts zu treffen — und die erste Reparatur reichte
+   nicht.** `workIndex == numTests` ist erreichbar, und mit den Bereichsarrays exakt auf
+   `numTests` dimensioniert landete das Lesen in genullter Allokationsreserve: System 0,
+   Partikel 0, LEERER Kontaktbereich — der Store schrieb den gerade gelesenen Wert
+   zurück, und `r9` überlebte. Beide Tests bekamen daraufhin einen STOLPERDRAHT hinter
+   dem Ende: echte Bereichseinträge, die auf ein Partikel zeigen, das kein legitimer
+   Arbeitsindex anfasst.
+
+   Der Stolperdraht des Haupttests lag danach aber in System 0 — auf einem Partikel, das
+   nach dem statischen Kernel bereits auf seiner Randdichte 3.5 saß. Ein Schreiben dort
+   rechnet `min(3.5 + irgendetwas, 3.5) = 3.5` und ändert NICHTS: derselbe
+   Sättigungsmechanismus wie in Loch 1, nur an anderer Stelle, und `r9` starb weiterhin
+   ausschließlich im Arbeitsindex-Test. Der Draht liegt jetzt in System 3, wo das `min()`
+   nie greift, und der Test BEHAUPTET vorher, dass der Draht sein Partikel überhaupt
+   verändern kann. Danach stirbt `r9` in beiden Tests unabhängig voneinander.
+
+   Dass diese Sättigungsfalle in einer einzigen Tranche ZWEIMAL zugeschlagen hat, ist die
+   eigentliche Lehre: eine einseitige Klemme am Store macht jede Entscheidung davor
+   unbeobachtbar, sobald sie bindet. Die Standardregel „jede Grenze, Breite und
+   Feldgröße in einer Fixture muss verschieden und jeder Nachbar vergiftet sein"
+   bekommt hier einen Zusatz — **jede Zelle, an der eine Fixture etwas nachweisen will,
+   muss ihren Wert auch ändern KÖNNEN**, und das gehört behauptet, nicht gehofft.
+
+### Sweep
+
+**52 Mutanten, 50 tot** (47 durch Abweichung, 3 durch Fault — `r10`, `r11`, `r12`
+dekodieren eine unsinnige System-Id und der BDA-Zugriff segfaultet; ein Fault ist ein
+Kill und wird getrennt gezählt), **2 Überlebende, beide BEWIESEN äquivalent**:
+
+* `h4` — `bdSqr(x*k - 1)` statt `bdSqr(1 - x*k)`. In IEEE-754 sind `a-b` und `b-a` exakte
+  Negationen voneinander, also sind ihre Quadrate bitgleich. Keine Fixture-Lücke.
+* `r8` — `continue` statt `return` im Guard. `workIndex` wächst streng monoton im
+  Schleifenzähler (der einzige variierende Term ist `i * 512`), also ist nach der ersten
+  Überschreitung jede spätere Iteration ebenfalls außerhalb. Der Port behält `return` aus
+  Treue zum Original; der Modulkopf sagt das jetzt so, statt eine Falle zu behaupten.
+
+### Ein Nebenbefund: zwei Tests, die noch nie gelaufen sind
+
+Beim Registrieren der neuen Suite habe ich nachgesehen, wie `ctest` überhaupt an die
+Testnamen kommt: über eine EXPLIZITE Suite-Liste im `foreach(suite …)`, während der
+Testbinary Namen per PRÄFIX auflöst. `psBoundaryDensity` nimmt also alle drei Tests
+dieser Tranche mit, und ebenso liefen `psAerodynamicsLayout` und `psInflatableLayout`
+seit P9.5 bzw. P9.6 unter ihren kürzeren Suitennamen mit — mein erster Verdacht, sie
+seien nie ausgeführt worden, war falsch.
+
+Die vollständige Gegenprobe (426 registrierte Suiten gegen 713 in den Quellen
+definierte `PXG_TEST`-Namen) fördert aber zwei zutage, die unter KEIN registriertes
+Präfix fallen und damit tatsächlich nie ausgeführt wurden:
+
+* `bpDescLayout` (testBpDescLayout.cpp:59) — es gibt keine Suite dieses Namens;
+* `npTetCollide_driver` (testNpGjk.cpp:476) — es gibt keine Suite `npTetCollide`.
+
+Beide laufen von Hand aufgerufen grün. Sie sind in dieser Tranche registriert, damit sie
+das auch weiterhin unter Beweis stellen müssen; ein Layoutbeweis, den niemand ausführt,
+ist kein Beweis. Danach fällt jeder der 713 Tests unter genau ein Präfix.
+
+### Der Szenen-Durchlauf bekommt endlich einen Runner — weil ich denselben Fehler nochmal gemacht habe
+
+P9.3a hat notiert, dass ein improvisierter Szenen-Runner `particlebag` als Szenennamen
+übergab, im `unknown PXG_SCENE`-Zweig landete und das Schweigen für Erfolg hielt. Bis
+heute lag im Baum trotzdem **kein** Runner für die Szenen — `tools/run_suite.sh` deckt
+nur `ctest` ab — also hat auch diese Tranche wieder einen improvisiert, und der hat
+prompt zwei neue Varianten desselben Fehlers produziert:
+
+* `PXG_PARTICLE_STARTY=5.0` für den Setzsack statt der kanonischen `4.0`. Der
+  Endwert stimmte exakt (`mean y → 0.9992`, derselbe Wert wie seit P9.1c), aber aus
+  einem Meter mehr Fallhöhe verdichtet sich der Haufen noch, wenn das Ruhefenster
+  aufgeht: `rest |dy| = 0.010897` gegen eine Schranke von `0.01`. Mit `4.0`:
+  `rest |dy| = 0.000002`, grün.
+* Die drei DIAGNOSE-Kontrollen als Pass/Fail-Szenen gewertet.
+  `PXG_PARTICLE_FLUID_CONTROL=1` ist dazu da, die Fluidprüfungen zu REISSEN — die
+  Fluidszene druckt seine Messwerte als die Referenz, die der echte Lauf schlagen
+  muss. Seine Fehlermeldung sagt das sogar wörtlich („the control measures 1.4421"),
+  und ich habe sie erst gelesen, nachdem der Runner sie als Regression gemeldet hatte.
+  Beide „Fehlschläge" waren meine, keiner war einer im Port.
+
+`tools/run_scenes.sh` trägt jetzt das Inventar (24 benannte Szenen plus den Sack mit
+seiner kanonischen Fallhöhe — das sind die 25 aus der Kopfzeile), behandelt ein
+FEHLENDES Verdikt als eigenes Ergebnis statt als Erfolg, und führt die Diagnosen in
+einer getrennten Liste, die berichtet und nie gewertet wird.
+
+### Stand
+
+Suite **792/792** in beiden Speichermodi: 789 → 790 durch die neue Suite-Zeile
+`psBoundaryDensity` (die drei Tests dieser Tranche), 790 → 792 durch die beiden oben
+nachgetragenen Suiten. Szenen **25/25** grün nach dem Pflicht-Neubau von `build-sdk`
+(Manifest geändert) — gemessen in drei Läufen statt einem, weil der erste improvisierte
+Runner unterwegs ersetzt wurde: 14 Szenen im ersten Batch, 10 im zweiten, plus der
+Setzsack mit seiner kanonischen Fallhöhe. Der Bestätigungslauf über
+`tools/run_scenes.sh` lief zum Commit-Zeitpunkt noch.
+Die „Could not find registered CUDA function"-Liste der Fluidszene steht auf **162** und
+enthält keinen der beiden Namen mehr. Der Wrangler löst beim Aufbau die GESAMTE
+Kerneltabelle auf, diese Zahl ist also die Gesamtzahl unabgebildeter Manifestzeilen —
+501 − 339 = 162, vorher 164.
+
+**Was diese Tranche NICHT tut, und das gehört hierher statt in eine Fußnote:** beide
+Kernel sind registriert und werden in keiner Szene GESTARTET. Der Host gated sie mit
+`mMaxParticles > 0 && mHasNonZeroFluidBoundaryScale` (PxgPBDParticleSystemCore.cpp:1118,
+:1141), und `mHasNonZeroFluidBoundaryScale` wird nur gesetzt, wenn ein Partikelsystem
+`fluidBoundaryDensityScale > 0` trägt (:2167). Keine Szene tut das — `particlefluid`
+lässt den Wert ausdrücklich auf seinem 0-Default. Der Launch-Trace bestätigt es: null
+Starts. Die Szene, die das ändert, ist P9.9, genau wie P9.7 die Szene zu P9.6 war.
 
 ## P9.7 — `PXG_SCENE=particleinflatable`: der Druckkörper trifft sein Zielvolumen
 

@@ -1441,6 +1441,16 @@ static const PxgKernelAbiRow kRows[] = {
     // PxReal coefficient) -> {8,8,4,4} = 24 bytes.  hostPtrMask 0 for both.
     { "ps_calculateInflatableVolume", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
     { "ps_solveInflatableVolume", kPsInflatableSolve, uint32_t(sizeof(kPsInflatableSolve)) },
+    // P9.8: the boundary-density pair, and their shapes do NOT match.
+    //   ps_accumulateStaticDensity(particleSystems*, activeParticleSystems*)
+    //     -> {8,8} = kTwoPtr (16 bytes).
+    //   ps_accumulateRigidDensity(particleSystems*, sortedContacts*,
+    //     totalNumPairs*, rangeStart*, rangeEnd*) -> five device pointers,
+    //     {8,8,8,8,8} = 40 bytes, the existing kPsFindStartEnd1 shape.  There is
+    //     no active-system list here: the rigid kernel recovers the system from
+    //     the contact's packed PxU64 particleId.  hostPtrMask 0 for both.
+    { "ps_accumulateStaticDensity", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "ps_accumulateRigidDensity", kPsFindStartEnd1, uint32_t(sizeof(kPsFindStartEnd1)) },
     // P9.3a: the PBD cloth spring gather pair, both (particleSystems*,
     //   activeParticleSystems*) -> {8,8} = kTwoPtr.  Both use a 3D grid with the
     //   particle system on gridDim.Z and the cloth buffer on gridDim.Y.
