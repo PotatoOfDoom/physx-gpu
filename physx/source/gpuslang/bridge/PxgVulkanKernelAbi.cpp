@@ -329,6 +329,7 @@ static const uint8_t kPsIntegrate[] = { 8, 8, 4, 4 };
 //     the launch site (copyUnsortedArrayToUserBuffer) passes a 3rd PxU32 `count`
 //     (unused by the kernel), so the marshalled pack is {8,8,4} -> 24-byte blob.
 static const uint8_t kPsUpdateUserBuffer[] = { 8, 8, 4 };
+static const uint8_t kPsInflatableSolve[] = { 8, 8, 4, 4 };
 // P9.1a:
 //   ps_updateMaterials(const PxgParticleSystem* particleSystems,
 //                      const PxU32* activeParticleSystems,
@@ -1435,6 +1436,11 @@ static const PxgKernelAbiRow kRows[] = {
     // PxReal dt), the same {8,8,4} shape, hostPtrMask 0.
     { "ps_solveAerodynamics1Launch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
     { "ps_solveAerodynamics2Launch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
+    // P9.6: the inflatable pair.  calculate takes (particleSystems*,
+    // activeParticleSystems*) -> the existing kTwoPtr; solve adds (PxReal dt,
+    // PxReal coefficient) -> {8,8,4,4} = 24 bytes.  hostPtrMask 0 for both.
+    { "ps_calculateInflatableVolume", kTwoPtr, uint32_t(sizeof(kTwoPtr)) },
+    { "ps_solveInflatableVolume", kPsInflatableSolve, uint32_t(sizeof(kPsInflatableSolve)) },
     // P9.3a: the PBD cloth spring gather pair, both (particleSystems*,
     //   activeParticleSystems*) -> {8,8} = kTwoPtr.  Both use a 3D grid with the
     //   particle system on gridDim.Z and the cloth buffer on gridDim.Y.

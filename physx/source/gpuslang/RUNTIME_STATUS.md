@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **788/788** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **789/789** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **24/24** grün (P9.4 fügte `particlecloth` hinzu).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
@@ -1694,6 +1694,89 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.6 — das Inflatable-Paar (Manifest 337): eine Blockreduktion und die erste libm-Lücke
+
+`ps_calculateInflatableVolume` und `ps_solveInflatableVolume` — Druck-Cloth.  Kernel 1
+berechnet pro Inflatable Schwerpunkt und eingeschlossenes Volumen per
+BLOCK-KOOPERATIVER Reduktion über die Dreiecke, akkumuliert eine Vertex-Normale und
+macht aus dem Volumenfehler ein XPBD-Lambda; Kernel 2 schiebt jeden Vertex entlang
+seiner Normalen.
+
+**Ein neuer Grid-Zuschnitt, und der schärfste Unterschied zu allem bisherigen in
+dieser Familie: gridDim.X läuft über INFLATABLES, nicht über Arbeitseinheiten.**  Ein
+Block pro Inflatable — genau das macht die blockweite Reduktion überhaupt sinnvoll.
+
+**ABI-Delta null**, zum dritten Mal in Folge.
+
+**Vier Fallen, die vor dem ersten Tastendruck gefunden wurden**, und drei davon hätte
+ein Von-oben-nach-unten-Lesen nicht überlebt:
+
+1. **Die Datei enthält ZWEI Definitionen von `ps_calculateInflatableVolume`**, in einem
+   `#if 0 / #else / #endif`-Paar: die abgeschaltete bei :4649, die LEBENDE bei :4822.
+   Wer von oben liest, portiert den falschen Kernel — vollständig.
+2. **`startTriangleIndex` ist ein INDEX-ARRAY-Offset, bereits mal drei.**  Der Erzeuger
+   setzt `nbTriangles * 3` (ExtParticleExt.cpp:571), beide Verbraucher schreiben
+   `startTriangleIndex + tid*3`.  Der Header-Kommentar sagt „index of the first
+   triangle" (PxParticleBuffer.h:366) und **widerspricht damit dem Code**; wer dem
+   Kommentar traut, multipliziert zweimal.
+3. **`signedVolume = va.dot(nor)` ohne Division durch 6** — das Ergebnis ist das
+   sechsfache Tetraedervolumen, und `restVolume` ist in denselben Einheiten.
+4. **Die Normale, die addiert wird, ist normalisiert; das Volumen benutzt die
+   UN-normalisierte** — die Reihenfolge trägt.
+
+**Die erste libm-Lücke im Port, und sie wird benannt statt geglättet.**  Die CUDA ruft
+`cbrtf`.  SPIR-V hat keine Kubikwurzel, und es gibt auch nichts, worauf man sich
+zurückziehen könnte: CUDAs `cbrtf`, glibcs `cbrtf` und `pow(x,1/3)` sind drei
+Implementierungen, die sich auf wenige ULP einig sind und nicht aufs Bit.  Jede
+transzendente Funktion vorher war reproduzierbar, weil die ENGINE SELBST eine
+Polynom-Näherung benutzte (npClothAtan ist der Präzedenzfall) — das hier ist ein echter
+libm-Aufruf, und Bit-Exaktheit gegen CUDA ist ohne Referenz-GPU nicht einmal
+wohldefiniert.  Das Modul schreibt `pow(x, 1/3)` (zulässig, weil das Argument durch
+`PxMax(0,..)` nie negativ ist), und die Fixture vergleicht `lambda` **bit-exakt nur
+dort, wo das Argument exakt null ist** — da liefert jede Implementierung 0 — und sonst
+gegen ein relatives Epsilon.
+
+**Die Blockreduktion, und eine Umstellung, die die Plattform erzwingt.**  Der Port
+hatte den Warp-Schmetterling schon (`pxgWarpReduceAddF`, CUDA-identische
+Shuffle-Reihenfolge); es fehlte die Blockebene.  Aber auf dem Emulationspfad ist
+dieses Primitiv aus **gruppenweiten Barrieren** gebaut, wo CUDAs `__shfl_xor_sync`
+warp-lokal ist.  Die CUDA-Zeile `if (warpIndex == 0) return warpReduction(...)` lässt
+sich deshalb **nicht wörtlich übertragen** — nur Warp 0 erreichte die Barriere, die
+Workgroup hinge.  Der Port ruft die zweite Reduktion aus JEDEM Thread und wählt danach
+aus; Warp 0s Eingaben und damit sein Ergebnis sind unverändert.  Dass das überhaupt
+legal ist, hängt daran, dass **jeder Early-Out in beiden Kernels block-uniform ist**
+(aus blockIdx abgeleitet oder nach einer Barriere aus Shared Memory gelesen).
+
+**Sweep 39/39, kein Überlebender — im zweiten Anlauf.**  Der erste ergab 36/38 mit zwei
+Überlebenden, und beide hatten dieselbe Ursache, die bei mir lag: ich hatte `restVolume`
+so gewählt, dass `restVolume*pressure` **vier Größenordnungen** über dem tatsächlichen
+Volumen lag (640000 gegen 155).  Damit verschwand der Volumenterm im Rundungsfehler
+einer viel größeren Zahl, und jeder Mutant, der ihn stört — die Division durch 6, das
+Vorziehen der Normalisierung — blieb innerhalb der Toleranz.  Behoben durch MESSEN
+statt Raten: ein `PXG_INFL_DUMP=1`-Pfad in der Fixture gibt die echten Volumina aus,
+und `restVolume` ist jetzt auf dieselbe Größenordnung kalibriert.  Der Dump bleibt
+drin, denn so kalibriert man das nächste Mal wieder.
+
+Eine zweite Falle beim Kalibrieren, die es wert ist, notiert zu werden: **wenn die
+`maxDelta`-Klammer überall bindet, ist die Volumenabhängigkeit ebenfalls
+weggeklemmt** und dieselben Mutanten überleben erneut.  Die Kontaktabstände der vier
+Systeme sind deshalb so gesetzt, dass die Klammer irgendwo bindet und woanders nicht.
+
+Nebenbefund, der P9.5 stützt: **beide Kernel indizieren `mNormalArray` über den
+GLOBALEN UNSORTIERTEN Index** — und `mAccumDeltaP` über den sortierten.  Das ist
+konsistent, und es ist zugleich der Beleg, dass die SORTIERTE Normalen-Schreibung in
+`ps_solveAerodynamics1Launch` (Upstream-Verdacht 15) der Ausreißer ist und nicht die
+Regel.
+
+Launch-Trace: beide Kernel starten in `PXG_SCENE=particlecloth` 27x (9
+Solver-Iterationen x 3 Frames), keiner REFUSED — physikalisch folgenlos, weil das
+Tuch `pressure = 0` hat und beide sauber am Early-Out zurückkehren.  **Eine Szene mit
+echtem Druck fehlt noch** und ist als eigene Tranche notiert; diese hier landet die
+Kernel und ihre Fixture, nicht ihre Szenen-Beobachtbarkeit.
+
+Suite **789/789** in beiden Modi, **24 Szenen** grün, null fehlende Verdikte.
+Manifest **337**, Refused 166 → **164**.
 
 ## P9.5 — die PBD-Aerodynamik (Manifest 335) und ein FÜNFZEHNTER Upstream-Verdacht
 
