@@ -1698,6 +1698,73 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.10 Vorarbeit — `ps_meshCollisonLaunch` vermessen, und es ist ein LIFT, keine Neuschreibung
+
+P9.9 hat gemessen, dass `ps_accumulateStaticDensity` in jeder heute baubaren Szene NULL
+Kontakte summiert, weil seine Eingabe `mOneWayContactInfos` nur von drei unabgebildeten
+Kerneln geschrieben wird. Diese Vorarbeit klärt, was der erste davon —
+`ps_meshCollisonLaunch` — wirklich kostet. Antwort: **weniger als es aussieht**, und das
+ist gelesen, nicht geschätzt.
+
+**Der Traverser ist seit Phase 1 portiert.** `shaders/psMeshMid.slang` (586 Zeilen, Test
+`psMeshMid_traverser`) enthält `PsTreeContactGenTraverser` vollständig: Konstruktor,
+`intersectBoxFullWarp`, `intersectPrimitiveFullWarp` samt der serialisierten
+Worst-Contact-Ersetzung beim Überlauf, `finalizeFullWarp` und `writeContact`. Sein
+Dateikopf listet ausdrücklich auf, was fehlt — und es fehlt ausschließlich der
+ENGINE-GLUE, nichts von der Geometrie.
+
+**Zu ergänzender Glue** (particleSystemMeshMidphase.cu:613-760):
+`LoadShapePair<eTRIANGLEMESH, ePARTICLESYSTEM>` über `cmInputs` an `blockIdx.y`; die
+Mesh-Pose aus dem Transform-Cache; `contactDistance[trimesh] + contactDistance[particle]`;
+`restDistances[cmIdx]`; `shapeToRigidRemapTable[trimeshTransformId]` → `rigidId`;
+`shape.particleOrSoftbodyId` → Deskriptor; `readTriangleMesh` → BV32-Knoten, Vertices,
+Indizes; die Grid-Stride-Arbeitsschleife; der Pro-Partikel-Filter
+`find(particleSystem, rigidId.getInd(), particleMask)`; die Diffuse-/Normal-Auswahl.
+
+**Jedes Stück hat ein abgebildetes Vorbild.** `softBodyMeshMidphaseBda.slang` macht genau
+diese Form für Softbodies — inklusive Paar-Laden, `PxsCachedTransform` mit 32-Byte-Stride
+(q@0, p@16) und dem Blob-Walk über den Header `uint4{nbVerts, nbTris, nbBv32Nodes,
+nbPackedNodes}` mit Baum bei +16. `PxgContactManagerInput`, `PxsCachedTransform` und
+`PxgShape` sind gespiegelt; `PxgParticleContactWriter` liegt bereits inline in
+`psContactGenBda.slang` ab Offset 104.
+
+**Der Launch, vermessen** (PxgNarrowphaseCore.cpp:3948-3968):
+
+    grid  (PxgParticleSystemKernelGridDim::PS_MESH_COLLISION = 16384, numTests, 2)
+    block (WARP_SIZE = 32, PS_MIDPHASE_COLLISION_WAPRS_PER_BLOCK = 1, 1)
+
+Zwei Dinge, die man hier falsch machen kann. **gridDim.Z = 2 ist der Diffuse-Split** —
+`blockIdx.z == 1` ist der Diffuse-Durchlauf, der auf andere Arrays schreibt und beim
+Writer unterdrückt wird. Und `PxgParticleSystemKernelBlockDim::PS_MESH_COLLISION = 512`
+wird von diesem Launch **gar nicht benutzt** (er übergibt 32×1×1 explizit); anders als bei
+Kandidat 16 rechnet der Kernel aber auch nicht mit `blockDim`, sondern mit dem
+Template-Parameter `WarpsPerBlock`, also ist das hier folgenlos — geprüft, nicht vermutet.
+
+**ABI-Zeile:** `(bool isTGS, PxReal toleranceLength, cmInputs*, transformCache*,
+contactDistance*, restDistances*, gpuShapes*, particleSystems*, shapeToRigidRemapTable*,
+PxgParticleContactWriter BY VALUE)` → `{1, 4, 8, 8, 8, 8, 8, 8, 8, 72}`; der Writer sind
+acht Zeiger plus `PxU32 maxContacts`, auf 72 Byte gepolstert.
+
+**Eine Querbestätigung zwischen den beiden Enden der Kette:** `finalizeFullWarp`
+(:329) schreibt nach `globalParticleIndex + i * numParticles` — exakt die spaltenweise
+Schrittweite mit `numParticles`-Stride, die `ps_accumulateStaticDensity` liest und die
+P9.8 als Falle B2 dokumentiert hat. Die beiden Tranchen sind unabhängig voneinander
+entstanden und passen zusammen.
+
+**Eine Beobachtung zum Korpus, die eine eigene Entscheidung erzwungen hat.** Die
+Geometriehelfer sind vielfach dupliziert — `shape2Vertex` in 22 Shadern,
+`closestPtPointTriangle2` in 14, `particleTriangleTest` in 3. Das ist Konvention, nicht
+Versehen: BDA-Module müssen mit `Ptr<>` eigenständig übersetzbar sein, während die
+Phase-1-Module gebundene Puffer benutzen, weshalb ein gemeinsames Modul die beiden nicht
+bedienen kann, ohne über Accessor-Interfaces generisch zu werden. P9.10 folgt der
+Konvention, statt mitten in der Tranche einen korpusweiten Refactor zu beginnen — und
+sichert die Äquivalenz stattdessen über die GPU-DIFFERENTIELLE Anordnung aus P8.97d:
+dieselbe Arena, beide Einstiegspunkte, byteweiser Vergleich, keine vierte Transkription.
+
+Aufteilung: **P9.10a** BDA-Modul + Fixture + Sweep, **P9.10b** Wrapper → Manifest 340,
+**P9.10c** eine Fluid-auf-Mesh-Boden-Szene, damit der statische Kernel endlich Kontakte
+bekommt.
+
 ## P9.9 — `PXG_SCENE=particlefluidboundary`: das Fluid spürt seine Wand, und nur die HÄLFTE des Paars arbeitet daran
 
 P9.8 hat beide Randdichte-Kernel gelandet und dabei ausdrücklich festgehalten, dass sie
