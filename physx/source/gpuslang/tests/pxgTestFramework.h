@@ -146,9 +146,30 @@ public:
                                                  pushConstantSize);
     }
 
+    // P9.12a: a kernel that samples through the device-wide bindless texture
+    // set (pxgSlangTex3d.slang).  Separate constructor rather than a flag so a
+    // kernel that does not sample cannot accidentally pay for the extra set
+    // bind, and so `bindless` reads as a property of the SHADER at the call
+    // site.  Returns a null pipeline when the device has no descriptor
+    // indexing; callers must check isValid() and skip.
+    struct Bindless {};
+    Kernel(Bindless, const char* shaderFile, const char* entryName, std::vector<uint32_t> bufferStrides,
+           uint32_t pushConstantSize)
+        : mStrides(std::move(bufferStrides))
+    {
+        std::vector<uint8_t> blob = loadShaderBlob(shaderFile);
+        mPipeline = testDevice()->createPipelineBindless(blob.data(), blob.size(), entryName,
+                                                         uint32_t(mStrides.size()),
+                                                         mStrides.empty() ? nullptr : mStrides.data(),
+                                                         pushConstantSize);
+    }
+
+    bool isValid() const { return mPipeline != 0; }
+
     ~Kernel()
     {
-        testDevice()->destroyPipeline(mPipeline);
+        if (mPipeline)
+            testDevice()->destroyPipeline(mPipeline);
     }
 
     template <typename Params>

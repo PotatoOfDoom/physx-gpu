@@ -345,5 +345,103 @@ PxgResult PxgCudaShim::streamWaitEvent(PxgStreamId stream, uint32_t event)
     return PxgResult::Success;
 }
 
+// ---- 3D textures (P9.12b) ----
+//
+// The split between "the array" and "the texture object" is CUDA's, and it is
+// kept rather than collapsed because the ENGINE's call sequence has that shape:
+// PxgGeometryManager.cpp:733-769 creates the array, copies into it, and only
+// then builds the object.  Collapsing the three into one entry point would
+// force the driver shim to guess which of them the engine is in the middle of.
+
+PxgResult PxgCudaShim::arrayCreate3D(uint32_t* outArray, uint32_t width, uint32_t height,
+                                     uint32_t depth, PxgSlangComputeDevice::TextureFormat format)
+{
+    if (!outArray || width == 0 || height == 0 || depth == 0)
+        return PxgResult::InvalidValue;
+    if (!mDevice->supportsBindlessTextures())
+        return PxgResult::Unsupported;
+
+    size_t texel = 4;
+    switch (format)
+    {
+    case PxgSlangComputeDevice::TextureFormat::R8Unorm:  texel = 1; break;
+    case PxgSlangComputeDevice::TextureFormat::R16Unorm: texel = 2; break;
+    default: break;
+    }
+
+    const uint32_t id = mNextArrayId++;
+    CudaArray a;
+    a.width = width;
+    a.height = height;
+    a.depth = depth;
+    a.format = format;
+    // Zero-filled: CUDA leaves a fresh array undefined, but a texture object
+    // built over an array nobody copied into would otherwise sample whatever
+    // the heap held.  Zero is a value the caller can recognise; garbage is not.
+    a.host.assign(size_t(width) * height * depth * texel, 0u);
+    mArrays[id] = std::move(a);
+    *outArray = id;
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::arrayUpload(uint32_t arrayId, const void* src, size_t bytes)
+{
+    auto it = mArrays.find(arrayId);
+    if (it == mArrays.end())
+        return PxgResult::NotFound;
+    if (!src || bytes != it->second.host.size())
+        return PxgResult::InvalidValue;
+    // A copy after the image exists would never reach the GPU.  Refusing is the
+    // only honest answer: the alternative is a texture that silently holds the
+    // previous contents.
+    if (it->second.consumed)
+        return PxgResult::InvalidValue;
+    std::memcpy(it->second.host.data(), src, bytes);
+    it->second.uploaded = true;
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::textureObjectCreate(PxgTextureHandle* out, uint32_t arrayId)
+{
+    if (!out)
+        return PxgResult::InvalidValue;
+    auto it = mArrays.find(arrayId);
+    if (it == mArrays.end())
+        return PxgResult::NotFound;
+    CudaArray& a = it->second;
+    const PxgTextureHandle h = mDevice->createTexture3DFmt(a.width, a.height, a.depth, a.format,
+                                                           a.host.data());
+    if (h == 0)
+        return PxgResult::Unsupported;
+    a.consumed = true;
+    // The bytes are on the GPU now; the staging copy is dead weight.  The record
+    // itself stays so a later cuArrayDestroy still resolves.
+    a.host.clear();
+    a.host.shrink_to_fit();
+    *out = h;
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::arrayDestroy(uint32_t arrayId)
+{
+    auto it = mArrays.find(arrayId);
+    if (it == mArrays.end())
+        return PxgResult::NotFound;
+    // Destroying the array does NOT destroy the texture: in CUDA the texture
+    // object keeps the array alive, and the engine relies on that -- it drops
+    // the CUarray and goes on sampling.  Here the image is owned by the device
+    // and outlives this record by construction.
+    mArrays.erase(it);
+    return PxgResult::Success;
+}
+
+PxgResult PxgCudaShim::textureObjectDestroy(PxgTextureHandle handle)
+{
+    if (handle == 0)
+        return PxgResult::Success;   // the null texture, as CUDA treats it
+    mDevice->destroyTexture3D(handle);
+    return PxgResult::Success;
+}
+
 } // namespace gpuslang
 } // namespace physx

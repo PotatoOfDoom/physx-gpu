@@ -230,6 +230,55 @@ public:
                                              const float* /*texels*/) { return 0; }
     virtual void destroyTexture3D(PxgTextureHandle) {}
 
+    // ---- bindless 3D textures (P9.12a: the CUtexObject replacement) ----
+    //
+    // The engine stores a CUtexObject INSIDE a device-side struct
+    // (PxgTriangleMesh::mTexObject) and dereferences it in the kernel:
+    // `tex3D<float>(mesh.mTexObject, ...)`.  SPIR-V has no such thing as a
+    // texture handle in a buffer, so the equivalent is descriptor indexing --
+    // one unbounded array of sampled 3D images, with the handle as the INDEX.
+    // A texture handle is therefore its slot in that array, and handle 0 is
+    // reserved as the null texture exactly as CUDA leaves mTexObject at 0 for
+    // a mesh with no SDF (PxgGeometryManager.cpp:725-731).
+    //
+    // Formats are the three the engine's SDF upload actually asks for
+    // (PxgGeometryManager.cpp:642/663/669/675): the dense grid is FLOAT, and
+    // the sparse subgrid texture is UNSIGNED_INT8, UNSIGNED_INT16 or FLOAT.
+    // CUDA promotes the integer formats to normalized [0,1] floats because
+    // cuTexObjectCreate is called WITHOUT CU_TRSF_READ_AS_INTEGER, which is
+    // what SparseSDFTexture::applySubgridSdfScale then rescales -- so the
+    // Vulkan equivalents are the UNORM formats, not the UINT ones.
+    enum class TextureFormat
+    {
+        R32Float = 0,
+        R8Unorm = 1,
+        R16Unorm = 2,
+    };
+
+    // True when the device can back the bindless path (descriptor indexing
+    // with a runtime array of sampled images).  When false every call below
+    // is a no-op returning 0, and the SDF kernels stay unmapped.
+    virtual bool supportsBindlessTextures() const { return false; }
+
+    // Uploads a single-channel volume and returns its bindless slot (never 0
+    // on success).  `texels` is width*height*depth elements of the format's
+    // element type (float / uint8_t / uint16_t).
+    virtual PxgTextureHandle createTexture3DFmt(uint32_t /*width*/, uint32_t /*height*/, uint32_t /*depth*/,
+                                                TextureFormat /*format*/, const void* /*texels*/)
+    { return 0; }
+
+    // Like createPipeline, but the kernel additionally declares the bindless
+    // set at descriptor set 1 (`Texture3D<float> gPxgTex3D[]` at binding 0 and
+    // `SamplerState gPxgTex3DSampler` at binding 1 -- see
+    // shaders/pxgSlangTex3d.slang).  Kernels that do not sample must keep
+    // using createPipeline: a pipeline layout that declares a set it never
+    // reads costs a bind per dispatch for nothing.
+    virtual PxgPipelineHandle createPipelineBindless(const void* /*code*/, size_t /*codeSize*/,
+                                                     const char* /*entryName*/, uint32_t /*numBuffers*/,
+                                                     const uint32_t* /*bufferStrides*/,
+                                                     uint32_t /*pushConstantSize*/)
+    { return 0; }
+
     // Like createPipeline/dispatch, but the kernel additionally declares
     // numTextures Texture3D+SamplerState pairs AFTER its storage buffers
     // (descriptor bindings numBuffers+2t and numBuffers+2t+1).

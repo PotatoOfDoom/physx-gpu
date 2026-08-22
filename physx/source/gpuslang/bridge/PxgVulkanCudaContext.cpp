@@ -42,6 +42,9 @@ namespace gpuslang
 // Defined in bridge/PxgVulkanDriverShim.cpp: registers the live context so the raw
 // (context-less) CUDA-driver shim entry points can route memcpys through the bridge.
 void pxgSetVulkanDriverContext(physx::PxCudaContext* ctx);
+// P9.12b: the 3D-texture driver entry points need the SHIM, not the context --
+// cuArray3DCreate and friends have no PxCudaContext counterpart at all.
+void pxgSetVulkanDriverShim(PxgCudaShim* shim);
 
 namespace
 {
@@ -107,9 +110,10 @@ public:
         // Register as the live context so the raw (context-less) CUDA-driver shim
         // entry points (bridge/PxgVulkanDriverShim.cpp) route memcpys through us.
         pxgSetVulkanDriverContext(this);
+        pxgSetVulkanDriverShim(shim);
     }
 
-    void release() override { pxgSetVulkanDriverContext(nullptr); delete this; }
+    void release() override { pxgSetVulkanDriverContext(nullptr); pxgSetVulkanDriverShim(nullptr); delete this; }
 
     // The backing shim (bridge-internal): the ccm's getMappedDevicePtr resolves
     // pinned host pointers through it.

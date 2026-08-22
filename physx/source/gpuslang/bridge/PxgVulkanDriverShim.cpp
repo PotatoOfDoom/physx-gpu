@@ -35,6 +35,7 @@
 #if PX_SUPPORT_GPU_PHYSX
 
 #include "PxgCudaToolkitShim.h"
+#include "PxgCudaShim.h"
 #include "cudamanager/PxCudaContext.h"
 #include <cstdio>
 
@@ -43,6 +44,10 @@
 namespace physx { namespace gpuslang {
 static physx::PxCudaContext* gDriverShimContext = nullptr;
 void pxgSetVulkanDriverContext(physx::PxCudaContext* ctx) { gDriverShimContext = ctx; }
+// The 3D-texture entry points have no PxCudaContext counterpart, so they need the
+// shim itself (P9.12b).
+static PxgCudaShim* gDriverShimShim = nullptr;
+void pxgSetVulkanDriverShim(PxgCudaShim* shim) { gDriverShimShim = shim; }
 } }
 
 // cuCtxGetStreamPriorityRange: the engine calls this to pick a priority for
@@ -84,32 +89,162 @@ extern "C" CUresult cuMemcpyDtoD(CUdeviceptr dstDevice, CUdeviceptr srcDevice, s
     return CUresult(physx::gpuslang::gDriverShimContext->memcpyDtoD(dstDevice, srcDevice, ByteCount));
 }
 
-// --- Texture-object / CUDA-array API: SDF + heightfield 3D textures only.  These
-// are NOT on the rigid-body pipeline.  Backing them with real Vulkan sampled images
-// (via the gpuslang tex3D layer) is the SDF/heightfield bring-up; until then they
-// error clearly if a scene actually registers such geometry, rather than silently
-// returning bad handles. ---
-static CUresult pxgTextureNotWired(const char* what)
+// --- Texture-object / CUDA-array API: the SDF 3D-texture upload path (P9.12b).
+//
+// The engine's sequence is cuArray3DCreate -> cuMemcpy3DAsync -> cuTexObjectCreate
+// (PxgGeometryManager.cpp:733-769), and it is translated onto the shim's bindless
+// texture layer rather than being reimplemented here: a CUarray is a host staging
+// record and the Vulkan image is created at cuTexObjectCreate, the first moment
+// dimensions, format AND contents are all known.
+//
+// A CUarray is an opaque pointer in the CUDA API but an integer id here, so the id
+// is carried IN the pointer.  Ids start at 1 (PxgCudaShim::mNextArrayId), so a live
+// array is never the null pointer -- which matters because the engine writes
+// `cuArray = 0` to mean "no array" (PxgGeometryManager.cpp:727-731).
+static CUarray pxgArrayToHandle(uint32_t id) { return reinterpret_cast<CUarray>(uintptr_t(id)); }
+static uint32_t pxgHandleToArray(CUarray h) { return uint32_t(reinterpret_cast<uintptr_t>(h)); }
+
+static CUresult pxgTextureNoShim(const char* what)
 {
-    std::fprintf(stderr,
-        "[PxgVulkan] %s is not yet wired (SDF/heightfield GPU textures); "
-        "rigid/convex geometry does not use this path.\n", what);
+    std::fprintf(stderr, "[PxgVulkan] %s called with no live bridge shim\n", what);
     return CUDA_ERROR_NOT_READY;
 }
-extern "C" CUresult cuArray3DCreate(CUarray* pHandle, const CUDA_ARRAY3D_DESCRIPTOR*)
+
+// CUDA promotes an integer texture format to a normalized float UNLESS
+// CU_TRSF_READ_AS_INTEGER is set, which is why the UNORM Vulkan formats are the
+// right equivalents.  Formats the SDF path never asks for are refused rather than
+// approximated: silently substituting a format would change sampled values.
+static bool pxgMapArrayFormat(CUarray_format f, unsigned int numChannels,
+                              physx::gpuslang::PxgSlangComputeDevice::TextureFormat* out)
+{
+    using TF = physx::gpuslang::PxgSlangComputeDevice::TextureFormat;
+    if (numChannels != 1)
+        return false;
+    switch (f)
+    {
+    case CU_AD_FORMAT_FLOAT:          *out = TF::R32Float;  return true;
+    case CU_AD_FORMAT_UNSIGNED_INT8:  *out = TF::R8Unorm;   return true;
+    case CU_AD_FORMAT_UNSIGNED_INT16: *out = TF::R16Unorm;  return true;
+    default:                          return false;
+    }
+}
+
+extern "C" CUresult cuArray3DCreate(CUarray* pHandle, const CUDA_ARRAY3D_DESCRIPTOR* pAllocateArray)
 {
     if (pHandle) *pHandle = nullptr;
-    return pxgTextureNotWired("cuArray3DCreate");
+    if (!pHandle || !pAllocateArray)
+        return CUDA_ERROR_INVALID_VALUE;
+    if (!physx::gpuslang::gDriverShimShim)
+        return pxgTextureNoShim("cuArray3DCreate");
+
+    physx::gpuslang::PxgSlangComputeDevice::TextureFormat fmt;
+    if (!pxgMapArrayFormat(pAllocateArray->Format, pAllocateArray->NumChannels, &fmt))
+    {
+        std::fprintf(stderr, "[PxgVulkan] cuArray3DCreate: unsupported format 0x%x x %u channels\n",
+                     unsigned(pAllocateArray->Format), pAllocateArray->NumChannels);
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    uint32_t id = 0;
+    const physx::gpuslang::PxgResult r = physx::gpuslang::gDriverShimShim->arrayCreate3D(
+        &id, uint32_t(pAllocateArray->Width), uint32_t(pAllocateArray->Height),
+        uint32_t(pAllocateArray->Depth), fmt);
+    if (r != physx::gpuslang::PxgResult::Success)
+        return r == physx::gpuslang::PxgResult::Unsupported ? CUDA_ERROR_NOT_READY
+                                                            : CUDA_ERROR_INVALID_VALUE;
+    *pHandle = pxgArrayToHandle(id);
+    return CUDA_SUCCESS;
 }
-extern "C" CUresult cuArrayDestroy(CUarray) { return CUDA_SUCCESS; }
-extern "C" CUresult cuTexObjectCreate(CUtexObject* pTexObject, const CUDA_RESOURCE_DESC*,
-                                      const CUDA_TEXTURE_DESC*, const CUDA_RESOURCE_VIEW_DESC*)
+
+extern "C" CUresult cuArrayDestroy(CUarray hArray)
+{
+    if (!hArray || !physx::gpuslang::gDriverShimShim)
+        return CUDA_SUCCESS;
+    physx::gpuslang::gDriverShimShim->arrayDestroy(pxgHandleToArray(hArray));
+    return CUDA_SUCCESS;
+}
+
+extern "C" CUresult cuTexObjectCreate(CUtexObject* pTexObject, const CUDA_RESOURCE_DESC* pResDesc,
+                                      const CUDA_TEXTURE_DESC* pTexDesc, const CUDA_RESOURCE_VIEW_DESC*)
 {
     if (pTexObject) *pTexObject = 0;
-    return pxgTextureNotWired("cuTexObjectCreate");
+    if (!pTexObject || !pResDesc || !pTexDesc)
+        return CUDA_ERROR_INVALID_VALUE;
+    if (!physx::gpuslang::gDriverShimShim)
+        return pxgTextureNoShim("cuTexObjectCreate");
+    if (pResDesc->resType != CU_RESOURCE_TYPE_ARRAY || !pResDesc->res.array.hArray)
+        return CUDA_ERROR_INVALID_VALUE;
+
+    // THE SAMPLER IS SHARED, so a descriptor that asks for anything else would be
+    // silently sampled with the wrong addressing or filter.  The bindless set
+    // carries exactly one sampler -- clamp on all three axes, linear, normalized
+    // element reads -- because that is what the engine builds every SDF texture
+    // with.  Anything else is refused here rather than quietly mis-sampled, and
+    // the remedy is stated: the sampler binding becomes an array too.
+    const bool clamped = pTexDesc->addressMode[0] == CU_TR_ADDRESS_MODE_CLAMP &&
+                         pTexDesc->addressMode[1] == CU_TR_ADDRESS_MODE_CLAMP &&
+                         pTexDesc->addressMode[2] == CU_TR_ADDRESS_MODE_CLAMP;
+    const bool linear = pTexDesc->filterMode == CU_TR_FILTER_MODE_LINEAR;
+    const bool elementRead = (pTexDesc->flags & CU_TRSF_READ_AS_INTEGER) == 0;
+    if (!clamped || !linear || !elementRead)
+    {
+        std::fprintf(stderr,
+            "[PxgVulkan] cuTexObjectCreate: this bridge binds ONE shared sampler "
+            "(clamp/clamp/clamp, linear, normalized reads); asked for %d/%d/%d, filter %d, "
+            "flags 0x%x.  Turn binding 1 of the bindless set into an array to support it.\n",
+            int(pTexDesc->addressMode[0]), int(pTexDesc->addressMode[1]),
+            int(pTexDesc->addressMode[2]), int(pTexDesc->filterMode), pTexDesc->flags);
+        return CUDA_ERROR_INVALID_VALUE;
+    }
+
+    physx::gpuslang::PxgTextureHandle h = 0;
+    const physx::gpuslang::PxgResult r = physx::gpuslang::gDriverShimShim->textureObjectCreate(
+        &h, pxgHandleToArray(pResDesc->res.array.hArray));
+    if (r != physx::gpuslang::PxgResult::Success)
+        return r == physx::gpuslang::PxgResult::Unsupported ? CUDA_ERROR_NOT_READY
+                                                            : CUDA_ERROR_INVALID_VALUE;
+    *pTexObject = CUtexObject(h);
+    return CUDA_SUCCESS;
 }
-extern "C" CUresult cuTexObjectDestroy(CUtexObject) { return CUDA_SUCCESS; }
-extern "C" CUresult cuMemcpy3D(const CUDA_MEMCPY3D*) { return pxgTextureNotWired("cuMemcpy3D"); }
-extern "C" CUresult cuMemcpy3DAsync(const CUDA_MEMCPY3D*, CUstream) { return pxgTextureNotWired("cuMemcpy3DAsync"); }
+
+extern "C" CUresult cuTexObjectDestroy(CUtexObject texObject)
+{
+    if (!physx::gpuslang::gDriverShimShim)
+        return CUDA_SUCCESS;
+    physx::gpuslang::gDriverShimShim->textureObjectDestroy(
+        physx::gpuslang::PxgTextureHandle(texObject));
+    return CUDA_SUCCESS;
+}
+
+// Only the one shape the SDF upload uses is accepted: a tightly packed HOST source
+// into a whole ARRAY destination, no sub-region.  An offset or a pitch that is not
+// the row length would silently land the data somewhere else, so both are checked.
+static CUresult pxgMemcpy3D(const CUDA_MEMCPY3D* p, const char* what)
+{
+    if (!p)
+        return CUDA_ERROR_INVALID_VALUE;
+    if (!physx::gpuslang::gDriverShimShim)
+        return pxgTextureNoShim(what);
+    if (p->srcMemoryType != CU_MEMORYTYPE_HOST || p->dstMemoryType != CU_MEMORYTYPE_ARRAY ||
+        !p->srcHost || !p->dstArray)
+        return CUDA_ERROR_INVALID_VALUE;
+    if (p->srcXInBytes || p->srcY || p->srcZ || p->dstXInBytes || p->dstY || p->dstZ)
+        return CUDA_ERROR_INVALID_VALUE;
+    if (p->srcPitch != p->WidthInBytes || (p->srcHeight != 0 && p->srcHeight != p->Height))
+        return CUDA_ERROR_INVALID_VALUE;
+
+    const size_t bytes = p->WidthInBytes * p->Height * p->Depth;
+    const physx::gpuslang::PxgResult r =
+        physx::gpuslang::gDriverShimShim->arrayUpload(pxgHandleToArray(p->dstArray), p->srcHost, bytes);
+    return r == physx::gpuslang::PxgResult::Success ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
+}
+
+extern "C" CUresult cuMemcpy3D(const CUDA_MEMCPY3D* pCopy) { return pxgMemcpy3D(pCopy, "cuMemcpy3D"); }
+extern "C" CUresult cuMemcpy3DAsync(const CUDA_MEMCPY3D* pCopy, CUstream)
+{
+    // The upload is a host-side memcpy into a staging record, so there is nothing
+    // to order against the stream; the bytes reach the GPU at cuTexObjectCreate.
+    return pxgMemcpy3D(pCopy, "cuMemcpy3DAsync");
+}
 
 #endif // PX_SUPPORT_GPU_PHYSX

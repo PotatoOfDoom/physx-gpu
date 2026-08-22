@@ -107,6 +107,12 @@ public:
                     vkFreeMemory(mDevice, frame.stagingMemory, nullptr);
                 }
             }
+            if (mBindlessSampler)
+                vkDestroySampler(mDevice, mBindlessSampler, nullptr);
+            if (mBindlessPool)
+                vkDestroyDescriptorPool(mDevice, mBindlessPool, nullptr);
+            if (mBindlessSetLayout)
+                vkDestroyDescriptorSetLayout(mDevice, mBindlessSetLayout, nullptr);
             if (mQueryPool)
                 vkDestroyQueryPool(mDevice, mQueryPool, nullptr);
             if (mPipelineCache)
@@ -267,6 +273,27 @@ public:
         enabled12.timelineSemaphore = supported12.timelineSemaphore;
         mHasBufferDeviceAddress = supported12.bufferDeviceAddress == VK_TRUE;
 
+        // Descriptor indexing (P9.12a): what makes a texture handle stored in a
+        // device buffer sampleable, which is the CUtexObject model the SDF path
+        // is written against.  All five are Vulkan 1.2 CORE features, so there
+        // is no extension to add -- only features to turn on, and only if the
+        // device has them.  updateAfterBind is required because textures are
+        // created while earlier dispatches may still reference the set.
+        mHasBindlessTextures =
+            supported12.descriptorIndexing == VK_TRUE &&
+            supported12.runtimeDescriptorArray == VK_TRUE &&
+            supported12.shaderSampledImageArrayNonUniformIndexing == VK_TRUE &&
+            supported12.descriptorBindingPartiallyBound == VK_TRUE &&
+            supported12.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE;
+        if (mHasBindlessTextures)
+        {
+            enabled12.descriptorIndexing = VK_TRUE;
+            enabled12.runtimeDescriptorArray = VK_TRUE;
+            enabled12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+            enabled12.descriptorBindingPartiallyBound = VK_TRUE;
+            enabled12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+        }
+
         // Subgroup size control: the warp-32 primitive library requires an
         // exact subgroup size on hardware targets (llvmpipe emulates instead).
         VkPhysicalDeviceSubgroupSizeControlFeatures enabledSgSize = {
@@ -318,6 +345,17 @@ public:
             return false;
 
         vkGetDeviceQueue(mDevice, mQueueFamily, 0, &mQueue);
+
+        if (mHasBindlessTextures && !initBindlessTextures())
+        {
+            // Losing the bindless path is not fatal -- everything that does not
+            // sample keeps working -- but it must be REPORTED rather than
+            // silently degraded, because the only symptom downstream would be
+            // an SDF kernel reading zeros.
+            std::fprintf(stderr, "[PxgVulkan] bindless texture set could not be created; "
+                                 "SDF sampling is unavailable on this device\n");
+            mHasBindlessTextures = false;
+        }
 
         // ---- command pool / buffer / fence ----
         VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
@@ -703,17 +741,55 @@ public:
 
     // ---- textures ----
 
+    bool supportsBindlessTextures() const override { return mHasBindlessTextures; }
+
     PxgTextureHandle createTexture3D(uint32_t width, uint32_t height, uint32_t depth,
                                      const float* texels) override
+    {
+        return createTexture3DInternal(width, height, depth, TextureFormat::R32Float, texels, false);
+    }
+
+    PxgTextureHandle createTexture3DFmt(uint32_t width, uint32_t height, uint32_t depth,
+                                        TextureFormat format, const void* texels) override
+    {
+        if (!mHasBindlessTextures)
+            return 0;
+        return createTexture3DInternal(width, height, depth, format, texels, true);
+    }
+
+    static VkFormat vkFormatOf(TextureFormat f)
+    {
+        switch (f)
+        {
+        case TextureFormat::R8Unorm:  return VK_FORMAT_R8_UNORM;
+        case TextureFormat::R16Unorm: return VK_FORMAT_R16_UNORM;
+        default:                      return VK_FORMAT_R32_SFLOAT;
+        }
+    }
+
+    static size_t texelSizeOf(TextureFormat f)
+    {
+        switch (f)
+        {
+        case TextureFormat::R8Unorm:  return 1;
+        case TextureFormat::R16Unorm: return 2;
+        default:                      return 4;
+        }
+    }
+
+    PxgTextureHandle createTexture3DInternal(uint32_t width, uint32_t height, uint32_t depth,
+                                             TextureFormat format, const void* texels, bool bindless)
     {
         Texture tex;
         tex.width = width;
         tex.height = height;
         tex.depth = depth;
+        tex.bindless = bindless;
+        const VkFormat vkFormat = vkFormatOf(format);
 
         VkImageCreateInfo imageInfo = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
         imageInfo.imageType = VK_IMAGE_TYPE_3D;
-        imageInfo.format = VK_FORMAT_R32_SFLOAT;
+        imageInfo.format = vkFormat;
         imageInfo.extent = { width, height, depth };
         imageInfo.mipLevels = 1;
         imageInfo.arrayLayers = 1;
@@ -733,7 +809,7 @@ public:
         PXG_VK_CHECK(vkBindImageMemory(mDevice, tex.image, tex.memory, 0));
 
         // One-shot staging upload with the required layout transitions.
-        const size_t bytes = size_t(width) * height * depth * sizeof(float);
+        const size_t bytes = size_t(width) * height * depth * texelSizeOf(format);
         VkBuffer staging = VK_NULL_HANDLE;
         VkDeviceMemory stagingMem = VK_NULL_HANDLE;
         {
@@ -775,7 +851,7 @@ public:
         VkImageViewCreateInfo viewInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
         viewInfo.image = tex.image;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_3D;
-        viewInfo.format = VK_FORMAT_R32_SFLOAT;
+        viewInfo.format = vkFormat;
         viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
         PXG_VK_CHECK(vkCreateImageView(mDevice, &viewInfo, nullptr, &tex.view));
 
@@ -788,11 +864,123 @@ public:
         samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        PXG_VK_CHECK(vkCreateSampler(mDevice, &samplerInfo, nullptr, &tex.sampler));
+        if (!bindless)
+            PXG_VK_CHECK(vkCreateSampler(mDevice, &samplerInfo, nullptr, &tex.sampler));
 
         const PxgTextureHandle handle = mNextTextureHandle++;
+        if (bindless)
+        {
+            // The handle IS the descriptor-array slot, which is what makes it
+            // storable in a device buffer.  Overflowing the array would alias
+            // one texture onto another silently, so it is refused instead.
+            if (handle >= kBindlessTextureCapacity)
+            {
+                std::fprintf(stderr, "[PxgVulkan] bindless texture capacity (%u) exhausted\n",
+                             kBindlessTextureCapacity);
+                vkDestroyImageView(mDevice, tex.view, nullptr);
+                vkDestroyImage(mDevice, tex.image, nullptr);
+                vkFreeMemory(mDevice, tex.memory, nullptr);
+                return 0;
+            }
+            writeBindlessSlot(uint32_t(handle), tex.view);
+        }
         mTextures[handle] = tex;
         return handle;
+    }
+
+    // ---- the bindless set ----
+
+    bool initBindlessTextures()
+    {
+        VkDescriptorSetLayoutBinding bindings[2] = {};
+        bindings[0].binding = 0;
+        bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        bindings[0].descriptorCount = kBindlessTextureCapacity;
+        bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[1].binding = 1;
+        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        bindings[1].descriptorCount = 1;
+        bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        // PARTIALLY_BOUND: slots for textures that do not exist yet (and slot 0,
+        // the reserved null handle) are never written and never read.
+        // UPDATE_AFTER_BIND: createTexture3DFmt may run while a previously
+        // recorded dispatch still references the set.
+        const VkDescriptorBindingFlags flags[2] = {
+            VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT,
+            0
+        };
+        VkDescriptorSetLayoutBindingFlagsCreateInfo flagsInfo = {
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO
+        };
+        flagsInfo.bindingCount = 2;
+        flagsInfo.pBindingFlags = flags;
+
+        VkDescriptorSetLayoutCreateInfo layoutInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+        layoutInfo.bindingCount = 2;
+        layoutInfo.pBindings = bindings;
+        layoutInfo.pNext = &flagsInfo;
+        layoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+        if (vkCreateDescriptorSetLayout(mDevice, &layoutInfo, nullptr, &mBindlessSetLayout) != VK_SUCCESS)
+            return false;
+
+        VkDescriptorPoolSize poolSizes[2] = {};
+        poolSizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        poolSizes[0].descriptorCount = kBindlessTextureCapacity;
+        poolSizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+        poolSizes[1].descriptorCount = 1;
+        VkDescriptorPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+        poolInfo.maxSets = 1;
+        poolInfo.poolSizeCount = 2;
+        poolInfo.pPoolSizes = poolSizes;
+        poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+        if (vkCreateDescriptorPool(mDevice, &poolInfo, nullptr, &mBindlessPool) != VK_SUCCESS)
+            return false;
+
+        VkDescriptorSetAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        allocInfo.descriptorPool = mBindlessPool;
+        allocInfo.descriptorSetCount = 1;
+        allocInfo.pSetLayouts = &mBindlessSetLayout;
+        if (vkAllocateDescriptorSets(mDevice, &allocInfo, &mBindlessSet) != VK_SUCCESS)
+            return false;
+
+        // The engine's SDF sampler, verbatim: clamp on all three axes, linear
+        // filter, no mips (PxgGeometryManager.cpp:761-769).
+        VkSamplerCreateInfo samplerInfo = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        if (vkCreateSampler(mDevice, &samplerInfo, nullptr, &mBindlessSampler) != VK_SUCCESS)
+            return false;
+
+        VkDescriptorImageInfo smpInfo = {};
+        smpInfo.sampler = mBindlessSampler;
+        VkWriteDescriptorSet write = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        write.dstSet = mBindlessSet;
+        write.dstBinding = 1;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        write.pImageInfo = &smpInfo;
+        vkUpdateDescriptorSets(mDevice, 1, &write, 0, nullptr);
+        return true;
+    }
+
+    void writeBindlessSlot(uint32_t slot, VkImageView view)
+    {
+        VkDescriptorImageInfo imgInfo = {};
+        imgInfo.imageView = view;
+        imgInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkWriteDescriptorSet write = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+        write.dstSet = mBindlessSet;
+        write.dstBinding = 0;
+        write.dstArrayElement = slot;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        write.pImageInfo = &imgInfo;
+        vkUpdateDescriptorSets(mDevice, 1, &write, 0, nullptr);
     }
 
     void destroyTexture3D(PxgTextureHandle handle) override
@@ -812,7 +1000,8 @@ public:
                                      uint32_t numBuffers, const uint32_t* bufferStrides,
                                      uint32_t pushConstantSize) override
     {
-        return createPipelineInternal(code, codeSize, entryName, numBuffers, bufferStrides, pushConstantSize, 0, 0);
+        return createPipelineInternal(code, codeSize, entryName, numBuffers, bufferStrides, pushConstantSize,
+                                      0, 0, false);
     }
 
     PxgPipelineHandle createPipelineEx(const void* code, size_t codeSize, const char* entryName,
@@ -824,7 +1013,7 @@ public:
              requiredSubgroupSize > mSubgroupCaps.maxSize))
             return 0;
         return createPipelineInternal(code, codeSize, entryName, numBuffers, bufferStrides, pushConstantSize,
-                                      requiredSubgroupSize, 0);
+                                      requiredSubgroupSize, 0, false);
     }
 
     PxgPipelineHandle createPipelineTex(const void* code, size_t codeSize, const char* entryName,
@@ -832,7 +1021,17 @@ public:
                                         uint32_t pushConstantSize, uint32_t numTextures) override
     {
         return createPipelineInternal(code, codeSize, entryName, numBuffers, bufferStrides, pushConstantSize,
-                                      0, numTextures);
+                                      0, numTextures, false);
+    }
+
+    PxgPipelineHandle createPipelineBindless(const void* code, size_t codeSize, const char* entryName,
+                                             uint32_t numBuffers, const uint32_t* bufferStrides,
+                                             uint32_t pushConstantSize) override
+    {
+        if (!mHasBindlessTextures)
+            return 0;
+        return createPipelineInternal(code, codeSize, entryName, numBuffers, bufferStrides, pushConstantSize,
+                                      0, 0, true);
     }
 
     SubgroupCaps getSubgroupCaps() const override { return mSubgroupCaps; }
@@ -846,7 +1045,7 @@ public:
     PxgPipelineHandle createPipelineInternal(const void* code, size_t codeSize, const char* entryName,
                                              uint32_t numBuffers, const uint32_t* bufferStrides,
                                              uint32_t pushConstantSize, uint32_t requiredSubgroupSize,
-                                             uint32_t numTextures)
+                                             uint32_t numTextures, bool bindless)
     {
         (void)bufferStrides; // SPIR-V carries the layout; strides are for D3D12
 
@@ -854,6 +1053,7 @@ public:
         pipe.numBuffers = numBuffers;
         pipe.numTextures = numTextures;
         pipe.pushConstantSize = pushConstantSize;
+        pipe.bindless = bindless;
 
         VkShaderModuleCreateInfo moduleInfo = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
         moduleInfo.codeSize = codeSize;
@@ -896,9 +1096,12 @@ public:
         pushRange.offset = 0;
         pushRange.size = pushConstantSize;
 
+        // Set 0 is the pipeline's own bindings; set 1, when declared, is the
+        // device-wide bindless texture set.
+        const VkDescriptorSetLayout setLayouts[2] = { pipe.setLayout, mBindlessSetLayout };
         VkPipelineLayoutCreateInfo layoutInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-        layoutInfo.setLayoutCount = 1;
-        layoutInfo.pSetLayouts = &pipe.setLayout;
+        layoutInfo.setLayoutCount = bindless ? 2u : 1u;
+        layoutInfo.pSetLayouts = setLayouts;
         layoutInfo.pushConstantRangeCount = pushConstantSize > 0 ? 1 : 0;
         layoutInfo.pPushConstantRanges = pushConstantSize > 0 ? &pushRange : nullptr;
         PXG_VK_CHECK(vkCreatePipelineLayout(mDevice, &layoutInfo, nullptr, &pipe.layout));
@@ -1026,6 +1229,9 @@ public:
         vkCmdBindPipeline(mCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline);
         if (numBindings > 0)
             vkCmdBindDescriptorSets(mCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.layout, 0, 1, &set, 0, nullptr);
+        if (pipe.bindless)
+            vkCmdBindDescriptorSets(mCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.layout, 1, 1,
+                                    &mBindlessSet, 0, nullptr);
         if (pushConstantSize > 0)
             vkCmdPushConstants(mCommandBuffer, pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantSize, pushConstants);
 
@@ -1114,6 +1320,9 @@ public:
         vkCmdBindPipeline(mCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline);
         if (numBuffers > 0)
             vkCmdBindDescriptorSets(mCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.layout, 0, 1, &set, 0, nullptr);
+        if (pipe.bindless)
+            vkCmdBindDescriptorSets(mCommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.layout, 1, 1,
+                                    &mBindlessSet, 0, nullptr);
         if (pushConstantSize > 0)
             vkCmdPushConstants(mCommandBuffer, pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushConstantSize, pushConstants);
 
@@ -1231,8 +1440,11 @@ private:
         VkImage image = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
         VkImageView view = VK_NULL_HANDLE;
+        // Owned only by the bound path; the bindless path shares
+        // mBindlessSampler and leaves this null.
         VkSampler sampler = VK_NULL_HANDLE;
         uint32_t width = 0, height = 0, depth = 0;
+        bool bindless = false;
     };
 
     static const uint32_t kFramesInFlight = 4;
@@ -1261,6 +1473,7 @@ private:
         uint32_t numBuffers;
         uint32_t numTextures;
         uint32_t pushConstantSize;
+        bool bindless = false;   // declares the device-wide texture set at index 1
     };
 
     uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags properties) const
@@ -1482,6 +1695,21 @@ private:
     // transcribe CUDA's atomicAdd(float*) emit OpAtomicFAddEXT and require it.
     bool mHasShaderBufferFloat32AtomicAdd = false;
     SubgroupCaps mSubgroupCaps;
+
+    // ---- the bindless texture set (P9.12a) ----
+    // One device-wide descriptor set at index 1: an unbounded array of sampled
+    // 3D images at binding 0 and ONE shared sampler at binding 1.  One sampler
+    // is enough because the engine builds every SDF texture with the identical
+    // descriptor -- clamp on all three axes, linear filter, unnormalized
+    // element reads (PxgGeometryManager.cpp:761-769).  A future texture that
+    // wants different addressing turns binding 1 into an array too; until then
+    // sharing it is a statement about the engine, not a shortcut.
+    static const uint32_t kBindlessTextureCapacity = 4096;
+    bool mHasBindlessTextures = false;
+    VkDescriptorSetLayout mBindlessSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool mBindlessPool = VK_NULL_HANDLE;
+    VkDescriptorSet mBindlessSet = VK_NULL_HANDLE;
+    VkSampler mBindlessSampler = VK_NULL_HANDLE;
 
     std::string mDeviceName;
 };

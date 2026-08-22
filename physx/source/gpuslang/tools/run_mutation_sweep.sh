@@ -29,7 +29,15 @@
 #      end -- a sweep whose baseline is red is measuring nothing.
 #
 # Usage:
-#   sh run_mutation_sweep.sh <shader-stem> <test-suite> <mutants-file>
+#   sh run_mutation_sweep.sh <shader-stem> <test-suite> <mutants-file> [source-stem]
+#
+# <source-stem> defaults to <shader-stem> and exists for SHARED MODULES: a file
+# like pxgSlangTex3d.slang has no entry point and therefore no .spv of its own,
+# so the thing to mutate and the thing to check for a successful rebuild are two
+# different files.  Pass the module as <source-stem> and one of its importers as
+# <shader-stem>.  This was added in P9.12a; before it, sweeping a shared module
+# meant duplicating its code into the importer, which is exactly the duplication
+# this port exists to avoid.
 #
 # <mutants-file> is one mutant per line, three TAB-separated fields:
 #   name <TAB> old-text <TAB> new-text
@@ -45,14 +53,14 @@
 
 set -u
 
-if [ $# -ne 3 ]; then
-    echo "usage: sh run_mutation_sweep.sh <shader-stem> <test-suite> <mutants-file>" >&2
+if [ $# -lt 3 ] || [ $# -gt 4 ]; then
+    echo "usage: sh run_mutation_sweep.sh <shader-stem> <test-suite> <mutants-file> [source-stem]" >&2
     exit 2
 fi
 
-STEM="$1"; SUITE="$2"; MUTANTS="$3"
+STEM="$1"; SUITE="$2"; MUTANTS="$3"; SRCSTEM="${4:-$1}"
 ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
-SRC="$ROOT/physx/source/gpuslang/shaders/$STEM.slang"
+SRC="$ROOT/physx/source/gpuslang/shaders/$SRCSTEM.slang"
 BUILD="$ROOT/build-gpuslang"
 SPV="$BUILD/shaders/$STEM.spv"
 BAK="$(mktemp)"
@@ -99,7 +107,7 @@ if ! baseline_ok; then
     run_suite | tail -5
     rm -f "$BAK"; exit 1
 fi
-echo "baseline green; sweeping $STEM against suite '$SUITE'"
+echo "baseline green; sweeping $SRCSTEM (via $STEM.spv) against suite '$SUITE'"
 
 killed=0; faulted=0; hung=0; survived=0; nocompile=0; anchorfail=0
 

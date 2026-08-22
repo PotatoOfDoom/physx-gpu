@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **802/802** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **804/804** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **28/28** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (27 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die fünf Diagnose-Kontrollen
@@ -1698,6 +1698,266 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.12a/b — der CUtexObject-Ersatz: bindlose 3D-Texturen und der SDF-Upload-Pfad, und warum P9.12 nicht mit dem Kernel anfängt
+
+Der Plan für diese Tranche war `ps_sdfMeshCollisonLaunch`, der dritte und letzte
+Erzeuger von `mOneWayContactInfos`. Das Lesen des Kernels hat die Tranche umgestellt,
+und der Befund ist wichtiger als der Kernel.
+
+### Der Befund: der ganze Texturpfad ist ein Stub
+
+`PxgVulkanDriverShim.cpp:99-113` — `cuArray3DCreate`, `cuTexObjectCreate`,
+`cuMemcpy3D` und `cuMemcpy3DAsync` geben allesamt `CUDA_ERROR_NOT_READY` zurück und
+schreiben eine Zeile nach stderr. Die Engine lädt eine SDF aber genau darüber hoch
+(`PxgGeometryManager.cpp:723-771`: `cuArray3DCreate` → `cuMemcpy3DAsync` →
+`cuTexObjectCreate`). Daraus folgt dreierlei, und keines davon war vorher
+aufgeschrieben:
+
+1. **Kein SDF-Mesh kann durch diese Brücke überhaupt auf die GPU.**
+2. `ps_sdfMeshCollisonLaunch` ist deshalb von keiner Szene erreichbar — `mTexObject`
+   wäre 0. Ihn zu mappen hieße, einen Kernel zu registrieren, der beim ersten
+   Kontakt mit einer echten Szene ins Leere greift; das ist **schlechter** als ihn
+   abgelehnt zu lassen, weil die Ablehnungsliste die einzige ehrliche Buchführung
+   über nicht Gemapptes ist.
+3. Es betrifft nicht diesen einen Kernel: der ganze SDF-Kollisionsblock (9 Kernel),
+   die SDF-Pfade von Softbody und Cloth (`softbodySoftbodyMidPhase.cu:1141`,
+   `femClothPrimitives.cu:2328`) und später der Isosurface-/Sparse-Grid-Block hängen
+   an derselben Stelle.
+
+Die Reihenfolge stimmte also nicht. P9.12a ist die Voraussetzung, nicht der Kernel.
+
+### Die Architekturfrage, und warum sie überhaupt eine ist
+
+Die Engine legt ein `CUtexObject` **in einen Device-Struct** und dereferenziert es im
+Kernel:
+
+```c
+struct PxgTriangleMesh { ...; CUtexObject mTexObject; ... };   // triangleMesh.cuh:61
+tex3D<float>(mesh.mTexObject, f.x + 0.5f, f.y + 0.5f, f.z + 0.5f);  // sdfCollision.cuh:113
+```
+
+SPIR-V kennt kein Texturhandle, das in einem Puffer liegen kann. Es gibt genau zwei
+Auswege, und die Wahl entscheidet über den gesamten Block:
+
+* **(a) gebundene Deskriptoren pro Dispatch.** Der Shim kann das schon
+  (`createPipelineTex` / `dispatchTex`, `numTextures` pro Kernel im Manifest). Es
+  scheitert hier trotzdem: der Kernel läuft mit Grid `(numTests, 2, 1)` und liest
+  `cmIdx = blockIdx.x`, also braucht **ein** Dispatch die Texturen **aller** Paare,
+  und welche das sind, steht in `cmInputs` und `gpuShapes` — Device-Puffern. Die
+  Brücke müsste sie auf dem Host dekodieren, um zu wissen, was sie binden soll.
+* **(b) Descriptor Indexing.** Ein unbegrenztes Array von gesampelten 3D-Bildern,
+  das Handle ist der **Index**. Das ist nicht eine Nachbildung des CUDA-Modells,
+  sondern dasselbe Modell: ein Zahlenwert, speicherbar, ladbar, pro Lane
+  verschieden.
+
+**(b)**, und zwar nicht nur weil (a) hier nicht geht, sondern weil (b) den ganzen
+Block freischaltet statt nur diesen Kernel.
+
+### Erst gemessen, dann gebaut
+
+Bevor eine Zeile Backend entstand, zwei Sondierungen — die P0-Disziplin (dort war es
+das Subgroup-Fenster), hier auf die beiden Hälften angewandt, die unabhängig
+scheitern können:
+
+**Die Geräte-Hälfte.** llvmpipe (LLVM 20.1.2, Vulkan 1.4.318), gemessen mit einer
+30-Zeilen-Sonde:
+
+| | |
+|---|---|
+| `VK_EXT_descriptor_indexing` | vorhanden |
+| `runtimeDescriptorArray` | 1 |
+| `shaderSampledImageArrayNonUniformIndexing` | 1 |
+| `descriptorBindingPartiallyBound` | 1 |
+| `descriptorBindingVariableDescriptorCount` | 1 |
+| `maxPerStageDescriptorSampledImages` | 1 000 000 |
+| `maxComputeWorkGroupInvocations` | **1024** |
+| `maxComputeSharedMemorySize` | 32768 |
+| R32_SFLOAT / R8_UNORM / R16_UNORM, 3D, SAMPLED + LINEAR_FILTER | alle 1 |
+
+Die 1024 ist kein Nebenbefund: `ps_sdfMeshCollisonLaunch` startet mit Block
+`(1024, 1, 1)` und liegt damit **exakt** auf dem Limit. Der Shared-Bedarf des Kernels
+(`triangleIndicesS[1024]` = 4 KB plus `PxgTriangleMesh` und `SparseSDFTexture`, beide
+~100 Byte) bleibt weit unter 32 KB.
+
+**Die Compiler-Hälfte**, die wahrscheinlichere Fehlerquelle. Ein Spike-Shader,
+übersetzt mit demselben `slangc` und denselben Flags wie der Rest des Korpus, liefert
+genau das Gebrauchte:
+
+```
+OpCapability RuntimeDescriptorArray
+OpCapability ShaderNonUniform
+OpCapability SampledImageArrayNonUniformIndexing
+OpCapability ImageQuery
+OpCapability PhysicalStorageBufferAddresses      <-- neben BDA, nicht statt
+%_runtimearr_55 = OpTypeRuntimeArray %55         (%55 = OpTypeImage %float 3D … Sampled=1)
+OpDecorate %h NonUniform
+```
+
+Dass `PhysicalStorageBufferAddresses` und `RuntimeDescriptorArray` **nebeneinander**
+stehen, ist die Bedingung, an der es hätte scheitern können: die SDF-Kernel brauchen
+beides gleichzeitig — jeder Puffer als Geräteadresse, die Textur als Deskriptor.
+
+### Was gebaut wurde
+
+**Backend** (`src/vulkan/PxgVulkanComputeDevice.cpp`): ein gerätweiter Deskriptorsatz
+an Index **1** — ein unbegrenztes Array gesampelter 3D-Bilder an Binding 0, **ein**
+geteilter Sampler an Binding 1. Ein Sampler genügt, weil die Engine jede SDF-Textur
+mit demselben Deskriptor baut (Clamp auf allen drei Achsen, Linear, keine Mips,
+`PxgGeometryManager.cpp:761-769`); das ist eine Aussage über die Engine und keine
+Abkürzung, und der Kommentar sagt, was zu tun ist, wenn sie einmal nicht mehr
+stimmt. `PARTIALLY_BOUND`, weil Slot 0 nie beschrieben wird — er ist das
+reservierte Null-Handle, genau der Zustand, in dem `mTexObject` für ein Mesh ohne SDF
+bleibt. `UPDATE_AFTER_BIND`, weil eine Textur entstehen kann, während ein früher
+aufgezeichneter Dispatch den Satz noch referenziert. Alle fünf Features sind
+**Vulkan-1.2-Kern**, es kommt also keine Extension dazu, nur Feature-Bits — und nur,
+wenn das Gerät sie hat; sonst bleibt `supportsBindlessTextures()` falsch, es wird
+gemeldet und der Rest läuft unverändert weiter.
+
+Die drei Formate der Engine sind da: `R32Float`, `R8Unorm`, `R16Unorm`. Dass die
+Ganzzahlformate **UNORM** und nicht UINT sind, ist keine Geschmacksfrage:
+`cuTexObjectCreate` wird ohne `CU_TRSF_READ_AS_INTEGER` gerufen, CUDA liefert also
+normalisierte [0,1]-Floats, und genau die skaliert
+`SparseSDFTexture::applySubgridSdfScale` zurück.
+
+Der Satz ist **opt-in**: `createPipelineBindless` hängt ihn an, `createPipeline`
+nicht. Ein Kernel, der nicht sampelt, zahlt kein Binding für nichts.
+
+**Shader** (`shaders/pxgSlangTex3d.slang`): `pxgTex3D(handle, xyz)` und
+`pxgTex3DSize(handle)`. Drei Dinge stehen dort ausdrücklich, weil eine
+Transkription sie still falsch machen würde:
+
+* CUDAs `tex3D` nimmt **unnormalisierte** Koordinaten. Vulkans
+  `unnormalizedCoordinates` ist auf 3D-Bildern **verboten**, also muss der Shader
+  durch die Ausdehnung teilen — und die **abfragen**, weil die Ausdehnung der
+  Subgrid-Textur in `PxgGeometryManager` berechnet und **nirgends** abgelegt wird,
+  wo der Kernel sie sähe (`PxgTriangleMesh::sdfDims` ist das DICHTE Gitter).
+* `NonUniformResourceIndex` ist tragend, nicht dekorativ: das Handle kommt aus dem
+  Speicher, zwei Kontaktmanager-Paare gegen zwei verschiedene Meshes landen in
+  derselben Wave.
+* Filterung ist **nicht** bitgenau gegen CUDA (9-Bit-Festkommagewichte dort,
+  implementierungsdefiniert hier).
+
+### Das Fixture, und was es dem Sweep beweist
+
+`testNpTex3dBindless.cpp`. `npTex3d` (P2) zeigt bereits, dass ein Volumen mit CUDAs
+Filterung gesampelt werden kann; was es **nicht** zeigen kann, ist die Eigenschaft,
+an der der SDF-Pfad hängt — dass ein Handle ein **Wert** ist. Seine Textur ist ein
+gebundener Deskriptor, vom Host beim Dispatch gewählt.
+
+Drei Volumina, drei verschiedene Ausdehnungen (12×9×7, 6×11×5, 10×3×13 — keine
+Zweierpotenz, keine zwei gleich), drei verschiedene Formate, und die Handles sind
+**pro Sample verschränkt**, sodass benachbarte Lanes verschiedene Texturen treffen.
+Die abgefragte Ausdehnung wird pro Sample zurückgelesen: das ist der Beweis, dass
+das Handle den **richtigen** Slot traf und nicht bloß irgendeinen.
+
+**Die Verschränkung war die entscheidende Fixture-Entscheidung.** Der Sweep zeigt
+warum: `n1-drop-nonuniform-sample` und `n2-drop-nonuniform-size` — beide löschen
+nur `NonUniformResourceIndex` — sind **KILLED**. Ohne Verschränkung hätten beide
+überlebt, und die Dekoration wäre im Korpus gestanden, ohne dass irgendetwas sie
+prüft.
+
+**Sweep: 16 Mutanten — 12 KILLED, 3 KILLED-FAULT, 1 SURVIVED, 0 nocompile,
+0 anchor-fail.** Der Überlebende `s1-lod-1` ist eine vorhergesagte Äquivalenz: die
+Bilder haben genau eine Mip-Stufe, `SampleLevel(..., 1.0)` klemmt also auf die
+einzige vorhandene.
+
+Dabei fiel eine echte Lücke im Sweep-Runner auf und wurde geschlossen: ein
+**geteiltes Modul** hat keinen eigenen Einstiegspunkt und damit kein eigenes `.spv`,
+Mutationsziel und Rebuild-Prüfziel sind also zwei verschiedene Dateien. Der Runner
+nimmt jetzt ein optionales viertes Argument `[source-stem]`. Vorher hieß ein Modul zu
+sweepen, seinen Code in den Importeur zu kopieren — genau die Duplikation, gegen die
+dieser Port gebaut ist.
+
+### Zwei gemessene Plattformeigenschaften, die das Fixture geschärft haben
+
+1. **Die UNORM-Konvertierung ist nicht bitgenau gegen ein Host-`raw / max`.** 230/255
+   kommt als `0x3f66e6e8` zurück, wo der Host `0x3f66e6e7` rechnet — die Signatur
+   einer Multiplikation mit dem Kehrwert statt einer Division. Vulkan schreibt
+   keines von beidem vor.
+   **ULP ist hier die falsche Metrik**, und das zu sagen ist der Punkt: derselbe
+   absolute Fehler ist 1 ULP bei 0,9 und 29 ULP bei 0,07, eine ULP-Schranke wäre
+   also eine Aussage über die Größe des Samples statt über die Konvertierung. Exakt
+   wahr — und genau das, worauf der SDF-Pfad angewiesen ist — ist, dass das Sample
+   **sein Texel identifiziert**: `round(got * max)` muss die gespeicherte Ganzzahl
+   sein. Darin steckt kein Fudge-Faktor. Für R32F bleibt es bitgenau.
+2. **Die Filtergenauigkeit hängt am Format.** Gemessen, schlechtester Fehler über
+   2100 Innenpunkte: R32F 3,25e-06, **R8 0,00427** (≈ 1,09 Quantisierungsschritte),
+   R16 3,75e-07. Die Schranken sind deshalb pro Format und **prinzipiell** statt
+   angepasst: für ein UNORM-Volumen ist die Arbeitsgenauigkeit des Filters bestenfalls
+   der Quantisierungsschritt selbst (llvmpipe filtert diese in Festkomma), also zwei
+   Schritte; für ein Float-Volumen bleibt nur die Gewichtsgenauigkeit, also 1e-4 des
+   Wertebereichs. Die gemessenen Zahlen werden gedruckt, damit eine Regression, die
+   den Fehler verdoppelt, sichtbar ist, obwohl sie noch bestünde.
+
+Für den SDF-Pfad ist die zweite Zahl die interessante: die Subgrid-Textur ist
+quantisiert, ihr Beitrag zur Distanz ist also auf `subgridsSdfValueRange / 255`
+genau — und das ist dieselbe Größenordnung, die CUDA auf derselben Textur hat.
+
+### P9.12b — die CUDA-Einstiegspunkte, und fünf Ablehnungen statt fünf Näherungen
+
+Die vier Stubs sind ersetzt. CUDA verteilt einen Upload auf **drei** Aufrufe, das
+Backend erledigt Bild, Upload und View in **einem** — also ist ein `CUarray` hier ein
+**Host-Staging-Datensatz** (Maße, Format, Bytes), und das Vulkan-Bild entsteht erst
+bei `cuTexObjectCreate`, dem ersten Moment, in dem alle drei bekannt sind. Die
+Aufteilung wird beibehalten und nicht zusammengefaltet, weil die Aufrufsequenz der
+Engine genau diese Form hat (`PxgGeometryManager.cpp:733-769`); ein einziger
+Einstiegspunkt zwänge die Brücke zu raten, in welchem Schritt die Engine gerade ist.
+
+Die Buchführung liegt in `PxgCudaShim` (das ohnehin Lebensdauern besitzt und über
+`p3Shim` geprüft wird), der Treiber-Shim ist reine Übersetzung. `PxgResult` bekommt
+`Unsupported` — verschieden von `InvalidValue`, weil das Heilmittel verschieden ist:
+"hier nicht verfügbar" heißt Feature überspringen, "falsch aufgerufen" heißt Aufruf
+reparieren.
+
+**Fünf Dinge werden ABGELEHNT statt genähert**, und das ist der Kern dieser
+Halbtranche. Jedes einzelne würde, wenn angenommen, **gesampelte Werte** verändern
+statt einen Fehler zu erzeugen — und falsche gesampelte Werte in einer SDF sind
+falsche Kontakte:
+
+| abgelehnt | was eine stille Näherung angerichtet hätte |
+|---|---|
+| Array mit ≠ 1 Kanal | halbierte Ausdehnung, jeder Sample daneben |
+| Format außerhalb {FLOAT, UINT8, UINT16} | anderes Zahlenformat, andere Werte |
+| Adressmodus ≠ Clamp | Lookups außerhalb der SDF falten zurück ins Innere des Meshes |
+| Filter = POINT | die Interpolation, auf der die SDF beruht, fällt weg |
+| `CU_TRSF_READ_AS_INTEGER` | die [0,1]-Promotion entfällt, die `applySubgridSdfScale` voraussetzt |
+
+Dazu zwei Formen von `cuMemcpy3D`, die abgelehnt werden, weil sie die Daten
+woanders hinlegen würden als der Sample sie sucht: eine **Teilregion** (Offset ≠ 0)
+und ein **gepolsterter Quell-Pitch**. Und eine Kopie, die **nach** dem
+Texturobjekt eintrifft, erreicht die GPU nie mehr — sie wird abgelehnt statt
+verschluckt, denn die Alternative ist eine Textur, die stillschweigend den vorigen
+Inhalt trägt.
+
+Die Ablehnung des Samplers sagt außerdem, was zu tun ist, wenn sie einmal im Weg
+steht: Binding 1 des bindlosen Satzes wird auch ein Array. Der Satz teilt sich
+heute **einen** Sampler, weil die Engine jede SDF-Textur mit demselben Deskriptor
+baut — eine Aussage über die Engine, die mit dieser Prüfung überwacht wird statt
+angenommen zu werden.
+
+**Das Fixture `p3ShimTexture3d` fährt bewusst die ÄUSSERE Fläche**: es
+transkribiert die Upload-Sequenz aus `PxgGeometryManager` und ruft die echten
+`cuArray3DCreate` / `cuMemcpy3DAsync` / `cuTexObjectCreate` auf, nicht die
+Shim-Methoden darunter. Zwei Volumina — ein dichtes FLOAT und ein quantisiertes
+8-Bit, genau das Paar, das eine sparse SDF trägt — und **`cuArrayDestroy` wird
+gefahren, bevor gesampelt wird**: die Engine wirft das `CUarray` weg und sampelt
+weiter, also muss das Bild es überleben; das wird hier getan und nicht behauptet.
+Dazu jede der sieben Ablehnungen als eigener Fall, jeweils mit einer
+wohlgeformten Kontrolle daneben, damit eine Ablehnung, die ALLES ablehnt, auffällt.
+
+Suite **804/804** grün in beiden Speichermodi, Szenen **28/28** — die
+Deskriptorsatz-Änderung fasst jeden Dispatch-Pfad an, deshalb sind beide
+Regressionen gefahren worden und nicht nur die Suite. Manifest unverändert bei
+**341**: diese Tranche mappt keinen Kernel, sie macht einen ganzen Block überhaupt
+erst erreichbar.
+
+**Als Nächstes** P9.12c: die `SparseSDFTexture`-Schicht (`initialize`, `Sample`
+dicht und sparse, `PxSdfDistance`, `PxVolumeGrad`, `PxSdfSampleWithGrad`,
+`doVertexSDFCollision`); dann P9.12d `findInterestingVertices` und der blockweite
+Scan, P9.12e der Kernel selbst → Manifest 342. Erst wenn eine echte SDF-Geometrie
+durch die Brücke kommt, kann eine Szene den Kernel überhaupt erreichen — das war
+der Befund, mit dem diese Tranche angefangen hat.
 
 ## P9.11 — `ps_heightfieldCollisonLaunch` auf der Engine-BDA-ABI → Manifest **341**, und eine Zusicherung, die selbst ein Münzwurf war
 

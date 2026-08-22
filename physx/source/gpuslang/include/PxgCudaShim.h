@@ -86,7 +86,13 @@ enum class PxgResult
     Success = 0,
     InvalidValue,
     NotFound,
-    OutOfMemory
+    OutOfMemory,
+    // The device cannot back this operation at all -- distinct from
+    // InvalidValue, which means the ARGUMENTS were wrong.  Added in P9.12b for
+    // the 3D-texture path: a device without descriptor indexing must report
+    // "not available here" rather than "you asked wrongly", because the caller's
+    // remedy is different (skip the feature, not fix the call).
+    Unsupported
 };
 
 // Loads a compiled SPIR-V blob by manifest file name.  In the engine this is
@@ -151,6 +157,29 @@ public:
     // Address resolution helper (exposed for the geometry/SDF manager).
     bool resolve(PxgDevicePtr ptr, PxgBufferHandle* buffer, size_t* offset) const;
 
+    // ---- 3D textures: cuArray3DCreate / cuMemcpy3D / cuTexObjectCreate parity
+    // (P9.12b, the SDF upload path) ----
+    //
+    // CUDA splits one upload across THREE calls -- allocate the array, copy into
+    // it, then build a texture object over it -- while the backend creates the
+    // image, uploads it and makes its view in one.  So a CUDA array is a HOST
+    // staging record here: dimensions, format, and the bytes copied into it.
+    // The Vulkan image is not created until textureObjectCreate, which is the
+    // first moment all three are known.
+    //
+    // The engine's own sequence (PxgGeometryManager.cpp:733-769) does exactly
+    // this and in exactly this order, so nothing is being anticipated.  A copy
+    // that arrives AFTER the texture object was built would be silently lost,
+    // and is refused rather than ignored.
+    PxgResult arrayCreate3D(uint32_t* outArray, uint32_t width, uint32_t height, uint32_t depth,
+                            PxgSlangComputeDevice::TextureFormat format);
+    PxgResult arrayUpload(uint32_t arrayId, const void* src, size_t bytes);
+    PxgResult arrayDestroy(uint32_t arrayId);
+    PxgResult textureObjectCreate(PxgTextureHandle* out, uint32_t arrayId);
+    PxgResult textureObjectDestroy(PxgTextureHandle handle);
+
+    PxgSlangComputeDevice* device() const { return mDevice; }
+
 private:
     PxgPipelineHandle pipelineFor(PxgKernelId id);
 
@@ -179,6 +208,18 @@ private:
     };
     std::map<uintptr_t, HostAlloc> mHostAllocs;
     std::unordered_map<PxgKernelId, PxgPipelineHandle> mPipelines;
+
+    // CUDA arrays: host staging records, keyed by the id handed back as CUarray.
+    struct CudaArray
+    {
+        uint32_t width = 0, height = 0, depth = 0;
+        PxgSlangComputeDevice::TextureFormat format = PxgSlangComputeDevice::TextureFormat::R32Float;
+        std::vector<uint8_t> host;
+        bool uploaded = false;   // a copy has arrived
+        bool consumed = false;   // a texture object has been built over it
+    };
+    std::unordered_map<uint32_t, CudaArray> mArrays;
+    uint32_t mNextArrayId = 1;
 
     // Stream/event bookkeeping.  Streams are logical handles (all serialize
     // on the one queue); an event stores the submission ticket at record time.
