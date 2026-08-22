@@ -254,10 +254,13 @@ static const uint HOLE = 127u;                 // PxHeightFieldMaterial::eHOLE
 // PxGeometryType (PxGeometry.h:48-62) is a plain 0-based enum:
 //   eSPHERE 0, ePLANE 1, eCAPSULE 2, eBOX 3, eCONVEXCORE 4, eCONVEXMESH 5,
 //   ePARTICLESYSTEM 6, eTETRAHEDRONMESH 7, eTRIANGLEMESH 8, eHEIGHTFIELD 9.
-// The draft of this file had eHEIGHTFIELD at 5, which is eCONVEXMESH; the layout
-// test pins both of these so that miscount cannot survive.
+// The draft of this file had eHEIGHTFIELD at 5, which is eCONVEXMESH.
+// Only the PARTICLE type is needed: LoadShapePairWarp<ePARTICLESYSTEM, eHEIGHTFIELD>
+// tests the FIRST template argument against slot 0 (H4), so eHEIGHTFIELD itself is
+// never compared here.  It is deliberately NOT declared -- an unreferenced constant
+// is dead code no mutant can reach, and the sweep says so.  Its value is pinned in
+// psHfMidphaseLayout instead, next to eCONVEXMESH which is what 5 actually is.
 static const uint GEOM_PARTICLESYSTEM = 6u;    // PxGeometryType::ePARTICLESYSTEM
-static const uint GEOM_HEIGHTFIELD = 9u;       // PxGeometryType::eHEIGHTFIELD
 
 static const float PX_MAX_F32 = 3.4028235e38f;
 static const float PARTICLE_FORWARD_PROJECTION_STEP_SCALE_PGS = 1.0f;

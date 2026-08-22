@@ -7,12 +7,12 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **797/797** green in both modes (`ctest -N` in `build-gpuslang`).
-Szenen: **27/27** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
-Inventar (26 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
+Test count: **802/802** green in both modes (`ctest -N` in `build-gpuslang`).
+Szenen: **28/28** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
+Inventar (27 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die fünf Diagnose-Kontrollen
 ausdrücklich NICHT wertet.  P9.9 fügte `particlefluidboundary` hinzu, P9.10c
-`particlemeshfloor`.
+`particlemeshfloor`, P9.11c `particlehffloor`.
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1698,6 +1698,176 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.11 — `ps_heightfieldCollisonLaunch` auf der Engine-BDA-ABI → Manifest **341**, und eine Zusicherung, die selbst ein Münzwurf war
+
+Der zweite der drei Erzeuger von `mOneWayContactInfos`. P9.10 hat den ersten
+(`ps_meshCollisonLaunch`) gemappt, `ps_sdfMeshCollisonLaunch` bleibt offen. Struktur wie
+dort: das Modul IST der Kernel, es gibt keinen separaten Wrapper, und geprüft wird
+DIFFERENTIELL gegen den Phase-1-Zwilling `psHfCollide.slang` — eine Arena, zweimal
+hochgeladen (einmal als die fünfzehn gebundenen Puffer des Phase-1-Moduls, einmal als
+Heightfield-Blob plus Deskriptorkette), byteweise verglichen, **ohne eine einzige
+Toleranz**.
+
+DIE REGEL, die P9.10 zweimal gelernt hat, wurde hier VOR dem Differential angewandt:
+`psHfCollide` ist in derselben Tranche in `PXG_NOCONTRACT_SHADERS` eingetragen worden.
+Bei P9.10 fehlte `psMeshMid` in der Liste und das Differential wich auf 14 von 97
+Partikeln in der letzten Stelle ab, bei überall gleichen Zählern. Wer ein Phase-1-Modul
+für ein Differential auf BDA hebt, trägt es in derselben Tranche in die Liste ein.
+
+### Der Fund, der diese Tranche geprägt hat: eine Zusicherung über den Ausgang eines RENNENS
+
+`psHfMidphaseClobber` fährt zwei Kontaktmanager-Paare in einem Dispatch, von denen das
+zweite nichts findet, und behauptete zweierlei: dass der Zähler jedes Partikels einen von
+genau zwei zulässigen Werten trägt (**das gilt immer**), und dass der Wert Null
+mindestens einmal tatsächlich beobachtet wird (**das ist ein Münzwurf**). Der zweite
+Wurf fiel bei **6 von 115 Läufen des UNMUTIERTEN Shaders** falsch aus, jedes Mal mit
+derselben Signatur: 174 behalten, 0 genullt.
+
+Bemerkt wurde das nicht durch einen roten Testlauf, sondern durch einen **Widerspruch
+zwischen Zwillingen im Mutations-Sweep**: `x6-reclamp-removed` wurde als KILLED gemeldet,
+`a5-drop-reclamp` als SURVIVED — und die beiden sind zeichenweise dieselbe
+Programmänderung, nur anders buchstabiert. Eines der beiden Urteile musste Rauschen sein.
+
+Zwei Dinge folgen daraus, und beide bleiben:
+
+1. **Ein Rennen bekommt nur die Zusicherung, die unter JEDER Verschränkung hält.** Die
+   Zählung wird jetzt gedruckt, nicht gewertet (`[ note ] candidate 20 race this run:
+   164 kept, 10 zeroed`).
+2. **Derselbe Anspruch wird stattdessen SEQUENZIERT erhoben**, ohne Rennen: ein Rig,
+   dessen einziges Paar auf das versenkte Heightfield zeigt — es findet nichts —, gefahren
+   über einem Zähler, der mit den Zählern des vorigen Laufs VORBELEGT ist. Genau die
+   Anordnung, die die Engine selbst herstellt (Kandidat 20(b): `ps_meshCollisonLaunch`
+   akkumuliert in dasselbe Array). Ergebnis exakt: jeder Zähler null, kein einziger
+   Kontaktschlitz angefasst. Ein Zähler von null über Schlitzen, die andere Erzeuger
+   geschrieben haben, von einem Kernel, der selbst nichts geschrieben hat.
+
+**Die Zwillingsprüfung im Sweep bleibt.** Zwei Schreibweisen derselben Änderung, die
+verschieden urteilen, sind ein Detektor für flackernde Fixtures, und der hat hier
+funktioniert, wo 40 grüne Läufe hintereinander nichts gefunden hätten.
+
+### Der Akkumulationstest, und warum ein Zähler bei null jahrelang nichts beweist
+
+`psHfMidphaseAccum` ist neu und schließt das letzte der vier Fixture-Löcher aus dem ersten
+Sweep. Jeder andere Test dieser Datei startet `mOneWayContactCount` bei NULL, und bei
+einem einzigen statischen Paar heißt das: die Basis, die `InterlockedAdd` zurückgibt, ist
+immer 0. Damit sind zwei Dinge unerreichbar — die Zwölf-Kontakt-Klemme in `endIndex` kann
+nie greifen, und die Basis kann nie schon AUF der Klemme liegen.
+`a9-drop-endindex-cap` hat den ersten Sweep genau daran überlebt, und das ist kein
+kleiner Mutant: er ist der Unterschied zwischen einem Schreibzugriff innerhalb des Arrays
+und einem dahinter.
+
+Der Test belegt den Zähler pro Partikel vor (Saaten 0, 7, 8, 10, 11, 12, 15) und fährt EIN
+Paar. Ein Schreiber pro Zähler heißt kein Rennen, also ist der Ausgang exakt:
+
+    Basis v, c gefundene Kontakte  ->  Schlitze [v, min(v + c, 12)) geschrieben,
+                                       Zähler gespeichert als min(c, 12) = c
+
+Für v ≥ 12 schreibt die Schleife NICHTS, während der gespeicherte Zähler weiterhin c
+Kontakte behauptet; für v + c > 12 schreibt sie nur die ersten 12 − v davon. Beides ist
+**Kandidat 20(d)** wörtlich: der gespeicherte Wert wird aus `contactCounts` abgeleitet,
+nie aus dem, was tatsächlich geschrieben wurde. Das Orakel für c und für die Kontaktwerte
+ist ein zweites Rig, identisch bis auf die Saat — hier wird nichts ein zweites Mal
+transkribiert. Die Einweg-Arrays bekommen ZWÖLF ZUSATZSPALTEN, vergiftet; kein legaler
+Lauf berührt sie, ein Port ohne Klemme schreibt geradewegs hinein.
+
+**Jede Saat außer der Null ist größer als `MaxStaticContactsPerMesh` = 6, und das ist
+tragend.** Ein Partikel, dessen AABB auf eine leere Zeilen- oder Spaltenspanne klemmt,
+nimmt den Null-Spannen-Ausstieg VOR dem Abschlussblock — sein Zähler wird nie gespeichert
+und behält die Saat. Mit einer Saat ab 7 ist das eindeutig, weil kein legaler Zähler so
+weit reicht. Der Test kann damit "hat nichts gefunden" von "war nie dort" unterscheiden,
+**ohne die Zeilen-/Spaltengrenzenmathematik ein zweites Mal auf den Host zu schreiben** —
+und das war nicht die Absicht, sondern ein Befund: die erste Fassung behauptete
+`bC[p] == c` für alle Partikel und wurde von 21 Partikeln widerlegt, die genau so
+aussteigen.
+
+Die drei anderen Löcher: die tote Konstante `GEOM_HEIGHTFIELD` gelöscht (sie war nur noch
+Mutantenfutter — dafür musste `g16` von der Konstanten auf die Literal-9 umgestellt
+werden, sonst kompiliert er nicht mehr); die Randpartikel VERTEILT statt am Ende geparkt
+(am Ende sind sie immer die letzte Iteration der Grid-Stride-Schleife, und
+`e4-earlyout-return` verliert dann nichts); die Geschwisterarrays des Writers mit
+Invarianten belegt (`w11`, `w12`).
+
+### Sweep
+
+**137 Mutanten — 104 KILLED, 5 KILLED-FAULT (zusammen 109 Kills), 28 SURVIVED, 0
+NOCOMPILE, 0 ANCHOR-FAIL.** Gegen den ersten Sweep (135 Mutanten, 33 Überlebende) sind
+sechs Überlebende gefallen — `a9`, `e4`, `w11`, `w12`, `g17`, `x6` — und **kein einziger
+vorher toter Mutant ist zurückgekommen**; die P9.10-Lektion (der breite Wurzelknoten, der
+drei Kills weggehandelt hat) wurde diesmal geprüft und nicht angenommen.
+
+Die 28 Überlebenden, in Familien mit Beweis statt mit Entschuldigung:
+
+| Familie | Mutanten | Beweis |
+|---|---|---|
+| toter Pfad bei negativer Skalierung (H6, Kandidaten 22–23) | `b3`, `b4`, `b6`, `b7`, `t7` | `PxHeightFieldGeometry::isValid()` lehnt nicht-positive Skalen ab; eine negative Skala schickte das REFERENZmodul in Kandidat 22s 4,29e9-Iterationen-Schleife |
+| Wächter, den die Schleifengrenze schon durchsetzt | `d9`, `d10`, `x3`, `x4` | der Diffuse-Frühausstieg ist eine Optimierung; die Grid-Stride-Schleife hat bei `numParticles == 0` null Durchläufe |
+| konservative Ablehnung nur gelockert | `e2`, `e3`, `e5`, `e8`, `e10`, `e12`, `k5` | Lockern FÜGT nur Zellen HINZU, die der exakte Test danach verwirft; die Auswahl der ersten sechs in Reihenfolge ändert sich nicht |
+| Maß-Null-Grenzfall | `e1`, `k1`, `k2`, `p1`, `p2`, `p3` | Gleichheit auf Floats, in dieser Szene nicht erreichbar |
+| vorzeichenlose No-Ops | `a7`, `w3` | `>= 0u` ist immer wahr → derselbe Nulldurchlauf bzw. `InterlockedAdd(counter, 0)` |
+| vorhergesagte Äquivalenz | `a5`, `x6`, `x1` | die Nachklemmung ist schon durch den Schleifenwächter erledigt (`a5` und `x6` sind DASSELBE Programm, zweimal buchstabiert — siehe oben); `x1` ist der D4-Wächter, der legal nie feuert |
+| toter Zwischenwert | `a8` | **neu bewiesen**, siehe unten |
+
+**Der Beweis für `a8-atomic-adds-1`** (der Kernel addiert 1 statt `contactCounts`): der
+addierte Betrag wird NIRGENDS gelesen. `endIndex` hängt an `contactIndex` (dem Wert VOR
+der Addition) und an `contactCounts`, und der einfache Store direkt darunter überschreibt
+den Zähler ohnehin mit `min(contactCounts, 12)`. Innerhalb eines Paares ist der Wert also
+tot. Sichtbar wird er ausschließlich für einen NEBENLÄUFIGEN zweiten Erzeuger — und das
+ist kein Fixture-Loch, sondern **Kandidat 20(c) selbst**: ein atomares
+Read-Modify-Write und ein einfacher Store auf dieselbe Adresse aus verschiedenen Blöcken,
+ungeordnet. Das Überleben dieses Mutanten IST das Symptom des Upstream-Defekts, und eine
+Zusicherung darüber wäre wieder ein Münzwurf gewesen — genau der, den diese Tranche
+gerade abgeschafft hat.
+
+### P9.11c — die ABI-Zeile, das Manifest und die Szene
+
+**Die ABI-Zeile** `kPsHfCollide[] = { 1, 4, 8, 8, 8, 8, 8, 8, 8, 72 }` = 136 Byte. Die
+Argumentliste ist BYTEGLEICH mit `kPsMeshCollide` — gleicher Kopf, gleicher 72-Byte-Writer
+am Ende, und `toleranceLength` steht auch hier in der Signatur und wird auch hier nie
+gelesen. Sie bekommt trotzdem ein eigenes Symbol, nach dem Vorbild von
+`kRadixDescPlain`/`kRadixDescNoCount`: eine spätere Abweichung in einem der beiden Kernel
+darf den anderen nicht über eine geteilte Zeile beschädigen. Startform
+(PxgNarrowphaseCore.cpp:4065): Grid (4096, numTests, 2) × Block (**64**, 1, 1) — 64
+Threads, KEINE Warp-Form, anders als der Netz-Zwilling.
+
+**Das Manifest** von Hand editiert, 340 → **341** (68,1 % von 501).
+
+**Die Szene `PXG_SCENE=particlehffloor`**: `particlemeshfloor` mit dem gekochten
+Dreiecksnetz gegen ein gekochtes HEIGHTFIELD getauscht (64 × 64 Stützstellen, alle Höhen
+0, Boden bei y = 0, Aktor bei (−30, 0, −30), weil der Ursprung eines Heightfields seine
+(0,0)-ECKE ist und nicht seine Mitte).
+
+**Sie ist ausdrücklich KEINE Randdichte-Szene, und das ist gemessen und nicht
+weggelassen.** Mit `fluidBoundaryDensityScale` auf 1 — der Einstellung, die
+`particlemeshfloor` benutzt — kommt diese Szene überhaupt nicht zur Ruhe: Ausdehnung
+19,2006 und bei Schritt 299 immer noch wachsend, NN 2,7488 gegen einen Fluid-Ruheabstand
+um 0,09, mittleres y auf −0,4065, weil die äußersten Partikel über den Rand laufen. Die
+Ursache ist die KONTAKTZAHL, nicht der Heightfield-Kernel: ein Partikel auf einem
+64 × 64-Feld liegt innerhalb von `contactDist` zu BEIDEN Dreiecken der Zelle unter sich,
+während der Zwei-Dreieck-Netzboden es in genau einem Dreieck hat und der nächste Punkt des
+anderen draußen auf der geteilten Diagonale liegt. Doppelt so viele Einweg-Kontakte sind
+doppelt so viel statische Dichte, und die Dichtekorrektur überschießt. Darauf ein Gate zu
+setzen hieße, die Antwort von `ps_accumulateStaticDensity` auf einen dichteren
+Kontaktstrom zu prüfen — das ist die Aufgabe der Netzboden-Szene und dort bereits
+zugesichert.
+
+Zugesichert wird stattdessen etwas, das für den Kernel dieser Tranche schärfer ist: **das
+Fluid muss AUF dem Heightfield zur Ruhe kommen, und zwar auf derselben Höhe, auf die der
+Dreiecksnetzboden es legt.** Gemessen, 300 Schritte:
+
+| Boden | ruhendes mittleres y | Ausdehnung | NN |
+|---|---|---|---|
+| Heightfield (64 × 64) | **0,16667** | 3,7346 | 0,0907 |
+| Dreiecksnetz, Randdichte an | **0,16667** | 9,6288 | 0,2010 |
+| kein Kontakt (versenkter Boden-Quader) | ≈ −39,5 | — | — |
+
+Zwei verschiedene Narrowphase-Kernel, zwei verschiedene Kontakterzeuger, eine Ruhehöhe,
+Toleranz 0,02. Ein Heightfield, dessen Kontakte bloß VORHANDEN, aber falsch platziert
+wären, erfüllte `yEnd > 0` immer noch; nur die Übereinstimmung mit dem Netzboden sagt,
+dass die Fläche dort liegt, wo die Geometrie sie hinlegt. `ps_heightfieldCollisonLaunch`
+steht nicht mehr auf der Ablehnungsliste der Szene (160 Kernel bleiben dort).
+
+Suite **802/802** grün in beiden Speichermodi. Szenen **28/28** grün.
 
 ## P9.10c — Manifest **340**, und `ps_accumulateStaticDensity` bekommt zum ersten Mal etwas zu lesen
 

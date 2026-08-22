@@ -236,6 +236,59 @@ PxRigidStatic* addMeshFloor(PxPhysics* physics, PxScene* scene, PxMaterial* mate
     return floor;
 }
 
+// A cooked HEIGHTFIELD floor at y = 0: a flat grid of zero-height samples spanning
+// [-halfExtent, halfExtent] in x and z.  Used by the particle heightfield-floor
+// scene (P9.11c), which is the first scene in this port to put PARTICLES on a
+// heightfield and therefore the first that launches ps_heightfieldCollisonLaunch.
+//
+// Three things about the geometry that are easy to get wrong and are spelled here:
+//
+//  * the local x axis is ROWS and the local z axis is COLUMNS
+//    (PxHeightFieldDesc.h:55/:66), and a sample's local position is
+//    (row * rowScale, height * heightScale, column * columnScale) -- so the field's
+//    origin is its (0,0) CORNER, not its centre.  The actor therefore sits at
+//    (-E, 0, -E) to put the span symmetrically about the origin;
+//  * every height is 0, which puts the surface at exactly y = 0 whatever heightScale
+//    is -- but heightScale must still be positive, because
+//    PxHeightFieldGeometry::isValid rejects a non-positive scale.  (That rejection
+//    is also what makes upstream candidates 22 and 23 unreachable through the public
+//    API, so this floor cannot exercise them and the tranche note says so.)
+//  * materialIndex0 and materialIndex1 are 0, NOT eHOLE = 127.  A hole in either
+//    triangle makes that cell inert, and the whole point of this floor is that every
+//    cell collides.
+PxRigidStatic* addHeightFieldFloor(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                                   float halfExtent)
+{
+    const PxU32 nbRows = 64u, nbCols = 64u;
+    std::vector<PxHeightFieldSample> samples(size_t(nbRows) * size_t(nbCols));
+    for (size_t i = 0; i < samples.size(); ++i)
+    {
+        samples[i].height = 0;
+        samples[i].materialIndex0 = PxBitAndByte(0);
+        samples[i].materialIndex1 = PxBitAndByte(0);
+    }
+    PxHeightFieldDesc hd;
+    hd.format = PxHeightFieldFormat::eS16_TM;
+    hd.nbRows = nbRows;
+    hd.nbColumns = nbCols;
+    hd.samples.data = samples.data();
+    hd.samples.stride = sizeof(PxHeightFieldSample);
+    PxHeightField* hf =
+        immediateCooking::createHeightField(hd, physics->getPhysicsInsertionCallback());
+    if (!hf) { std::printf("FAIL: createHeightField (hf floor) returned null\n"); return nullptr; }
+
+    const float E = halfExtent;
+    const float rowScale = (2.0f * E) / float(nbRows - 1u);
+    const float colScale = (2.0f * E) / float(nbCols - 1u);
+    PxRigidStatic* floor = physics->createRigidStatic(PxTransform(PxVec3(-E, 0.0f, -E)));
+    PxShape* fs = physics->createShape(
+        PxHeightFieldGeometry(hf, PxMeshGeometryFlags(), 1.0f, rowScale, colScale), *material);
+    floor->attachShape(*fs);
+    scene->addActor(*floor);
+    fs->release();
+    return floor;
+}
+
 // PXG_SCENE=plane: one dynamic box resting on a static infinite PxPlaneGeometry
 // (y=0).  Exercises the convex/box-plane narrowphase path.
 void buildPlaneScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
@@ -536,6 +589,36 @@ static const float FLUID_BOUNDARY_SCALE = 1.0f;
 static const float MESHFLOOR_SPREAD_MIN = 7.0f;
 static const float MESHFLOOR_SPREAD_CONTROL = 5.2148f;
 static const float MESHFLOOR_SPREAD_LIVE = 9.6288f;
+
+// P9.11c -- PXG_SCENE=particlehffloor.  particlemeshfloor again with the cooked
+// triangle mesh swapped for a cooked HEIGHTFIELD, so the particle-vs-static contacts
+// arrive through ps_heightfieldCollisonLaunch instead of ps_meshCollisonLaunch.  It is
+// the first scene in this port that puts particles on a heightfield.
+//
+// IT IS NOT A BOUNDARY-DENSITY SCENE, and that is a measured decision rather than an
+// omission.  With fluidBoundaryDensityScale at 1 -- the setting particlemeshfloor
+// uses -- this scene does not settle at all: spread 19.2006 and still growing at step
+// 299, nn 2.7488 against a fluid rest spacing near 0.09, mean y drifting to -0.4065 as
+// the outermost particles run off the rim.  The cause is the CONTACT COUNT, not the
+// heightfield kernel: a particle resting on a 64 x 64 field is within contactDist of
+// BOTH triangles of the cell beneath it, where the two-triangle mesh floor puts it
+// inside exactly one triangle and the other's closest point is out on the shared
+// diagonal.  Twice the one-way contacts is twice the static density, and the density
+// constraint over-corrects.  Gating on that would be gating on
+// ps_accumulateStaticDensity's response to a denser contact stream, which is the mesh
+// floor scene's job and is already asserted there.
+//
+// What this scene asserts instead is stronger for the kernel it exists to exercise:
+// the fluid must REST ON the heightfield, and at the same height the triangle-mesh
+// floor puts it.  Two different narrowphase kernels, two different contact producers,
+// one rest height.  MEASURED, 300 steps: mean y 0.16667, spread 3.7346, nn 0.0907 --
+// against 0.16667 / 9.6288 / 0.2010 for the mesh floor with its boundary density on,
+// and against a fall to the sunken ground box at -40 if the heightfield pair produced
+// nothing at all.
+static const float HFFLOOR_REST_Y = 0.16667f;       // measured; identical to the mesh floor's
+static const float HFFLOOR_REST_Y_TOL = 0.02f;
+static const float HFFLOOR_SPREAD_REF = 3.7346f;    // measured, reported not gated
+static const float HFFLOOR_NN_REF = 0.0907f;        // measured, reported not gated
 // The observable -- read the long note at the boundary assertion block before
 // touching these.  MEASURED on this exact scene, A/B against
 // PXG_PARTICLE_BOUNDARY_CONTROL=1 (identical scene, scale left at 0 so neither
@@ -594,7 +677,8 @@ struct ParticleScene
 // the two scenes are each other's control.
 ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
                                  PxCudaContextManager* cudaCtx, bool fluidMode = false,
-                                 bool boundaryMode = false, bool meshFloorMode = false)
+                                 bool boundaryMode = false, bool meshFloorMode = false,
+                                 bool hfFloorMode = false)
 {
     ParticleScene out;
     out.cudaCtx = cudaCtx;
@@ -612,7 +696,12 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     // PRIMITIVE contact stream, which is what P9.9 measured feeding the boundary
     // density; a triangle-mesh floor routes them through ps_meshCollisonLaunch
     // instead, which is the only producer of mOneWayContactInfos this port has.
-    if (meshFloorMode)
+    // hfFloorMode is the same swap again, one shape type further along: a cooked
+    // HEIGHTFIELD instead of a triangle mesh.  That routes the particle-vs-static
+    // contacts through ps_heightfieldCollisonLaunch, the SECOND producer of
+    // mOneWayContactInfos this port has, and the third and last one
+    // (ps_sdfMeshCollisonLaunch) is still unmapped.
+    if (meshFloorMode || hfFloorMode)
     {
         addGroundBox(physics, scene, rigidMat, -40.0f);
         // 60 x 60, not the 20 x 20 the meshfloor box scene uses.  Measured: with the
@@ -620,7 +709,8 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         // the rim exactly where the fluid ends up and the particles fell off the edge
         // (mean y -2.98).  That looked like a contact failure and was a floor-sizing
         // failure -- with the scale at 0 the SAME floor held them at y 0.167.
-        addMeshFloor(physics, scene, rigidMat, 30.0f);
+        if (meshFloorMode) addMeshFloor(physics, scene, rigidMat, 30.0f);
+        else               addHeightFieldFloor(physics, scene, rigidMat, 30.0f);
     }
     else
     {
@@ -638,7 +728,7 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         // contributing PRIMITIVE contacts -- the other half of the boundary density,
         // which would blur exactly what this scene is built to isolate.  On that floor
         // it goes to x=45, outside the 60 x 60 mesh, and falls to the sunken ground box.
-        const float asideX = meshFloorMode ? 45.0f : 20.0f;
+        const float asideX = (meshFloorMode || hfFloorMode) ? 45.0f : 20.0f;
         PxRigidDynamic* aside = physics->createRigidDynamic(PxTransform(PxVec3(asideX, 0.5f, 0.0f)));
         PxShape* s = physics->createShape(PxBoxGeometry(0.5f, 0.5f, 0.5f), *rigidMat);
         aside->attachShape(*s);
@@ -4080,12 +4170,19 @@ int main()
     // ps_meshCollisonLaunch -- the only producer of mOneWayContactInfos, which P9.9
     // proved ps_accumulateStaticDensity reads and had always found empty.
     const bool meshFloorScene = !std::strcmp(sceneName, "particlemeshfloor");
+    // P9.11c: particlehffloor is particlemeshfloor with the cooked triangle mesh
+    // swapped for a cooked HEIGHTFIELD.  Same experiment, one shape type further on:
+    // it is the first scene in this port that launches ps_heightfieldCollisonLaunch,
+    // the second producer of mOneWayContactInfos.
+    const bool hfFloorScene = !std::strcmp(sceneName, "particlehffloor");
+    const bool staticFloorScene = meshFloorScene || hfFloorScene;
     const bool fluidScene = !std::strcmp(sceneName, "particlefluid") || boundaryScene
-                            || meshFloorScene;
+                            || staticFloorScene;
     if (!std::strcmp(sceneName, "particle") || fluidScene)
     {
         ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx, fluidScene,
-                                               boundaryScene || meshFloorScene, meshFloorScene);
+                                               boundaryScene || meshFloorScene, meshFloorScene,
+                                               hfFloorScene);
         if (!psc.system || !psc.buffer)
         {
             std::printf("[ FAIL ] gpu-sdk-step: particle scene build failed\n");
@@ -4287,7 +4384,44 @@ int main()
                               MESHFLOOR_SPREAD_LIVE);
                   ++failures; }
             }
+            // P9.11c -- the HEIGHTFIELD FLOOR.  Identical in shape to the mesh
+            // floor's block above and for identical reasons; only the producer of
+            // mOneWayContactInfos differs.
+            if (hfFloorScene)
+            {
+                std::printf("  particle HF FLOOR: mean y %.4f -> %.4f; spread %.4f -> %.4f; nn %.4f\n",
+                            y0, yEnd, spread0, spreadEnd, nnEnd);
+                if (!(yEnd > 0.0f))
+                { std::printf("FAIL: the puddle sank to or through the heightfield floor "
+                              "(mean y = %.4f, floor at 0) -- ps_heightfieldCollisonLaunch "
+                              "produced no usable contacts\n", yEnd);
+                  ++failures; }
+                if (!(yEnd < y0))
+                { std::printf("FAIL: the column never collapsed (mean y %.4f -> %.4f)\n", y0, yEnd);
+                  ++failures; }
+                // The sharp one: the same fluid on two different static narrowphase
+                // kernels must come to rest at the same height.  A heightfield whose
+                // contacts were merely PRESENT but placed wrong would still satisfy
+                // `yEnd > 0`; only agreeing with the mesh floor to within 0.02 says
+                // the surface is where the geometry says it is.
+                if (!(std::fabs(yEnd - HFFLOOR_REST_Y) < HFFLOOR_REST_Y_TOL))
+                { std::printf("FAIL: the fluid rests at y=%.5f on the heightfield but at %.5f on "
+                              "the triangle-mesh floor at the same height (tolerance %.3f) -- the "
+                              "heightfield surface is not where the geometry puts it\n",
+                              yEnd, HFFLOOR_REST_Y, HFFLOOR_REST_Y_TOL);
+                  ++failures; }
+            }
             scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            if (failures == 0 && hfFloorScene)
+            {
+                std::printf("[  OK  ] gpu-sdk-step: the PBD fluid rests on a COOKED HEIGHTFIELD "
+                            "at y %.5f -- the same height the triangle-mesh floor gives it "
+                            "(spread %.4f vs %.4f measured, nn %.4f vs %.4f) -- so "
+                            "ps_heightfieldCollisonLaunch is the second producer of "
+                            "mOneWayContactInfos this port has mapped\n",
+                            yEnd, spreadEnd, HFFLOOR_SPREAD_REF, nnEnd, HFFLOOR_NN_REF);
+                return 0;
+            }
             if (failures == 0 && meshFloorScene)
             {
                 std::printf("[  OK  ] gpu-sdk-step: the PBD fluid rests on a COOKED TRIANGLE MESH "

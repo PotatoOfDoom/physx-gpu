@@ -37,10 +37,10 @@ if [ -z "${PXG_SHADER_DIR:-}" ]; then
     exit 2
 fi
 
-# The 26 named scenes.  The settling bag below makes 27 -- the figure
+# The 27 named scenes.  The settling bag below makes 28 -- the figure
 # RUNTIME_STATUS.md's header carries.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor articulation
-        particle particlefluid particlefluidboundary particlemeshfloor
+        particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
         particlecloth particleinflatable
         cloth clothhang clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach"
