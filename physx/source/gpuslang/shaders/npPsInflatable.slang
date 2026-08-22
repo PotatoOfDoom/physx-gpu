@@ -113,8 +113,9 @@
 // against CUDA is not even well defined without a reference GPU.  The module
 // spells `pow(x, 1/3)` -- legal because the argument is `PxMax(0, ...)` and so
 // never negative -- and the fixture handles the gap by driving the argument to
-// PERFECT CUBES, where every correctly-rounded implementation agrees exactly,
-// plus one non-cube case carried by a stated tolerance.
+// EXACTLY ZERO in one case (a negative restVolume makes the PxMax arm fire, and
+// every implementation returns 0 for 0, so lambda is compared bit-exactly there),
+// with a stated relative tolerance on the cases where it is positive.
 //
 // THE BLOCK REDUCTION, and one restructuring the platform forces.  reduction.cuh's
 // blockReduction (:226-247) is a warp butterfly, one shared slot per warp, then
