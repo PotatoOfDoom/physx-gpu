@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **792/792** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **797/797** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **26/26** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (25 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die vier Diagnose-Kontrollen
@@ -1697,6 +1697,197 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.10a/b — `ps_meshCollisonLaunch` auf der Engine-BDA-ABI: ein LIFT, gegen sein eigenes Vorbild differentiell geprüft
+
+Das ist der Kernel, der `mOneWayContactInfos` / `mOneWayContactCount` füllt — genau die
+Arrays, von denen P9.9 gemessen hat, dass `ps_accumulateStaticDensity` sie liest und in
+jeder Szene, die dieser Port bauen kann, LEER vorfindet, weil alle drei Erzeuger
+unabgebildet sind. Dies ist der erste davon. `shaders/psMeshMidphaseBda.slang`, zwei
+Einstiegspunkte (der Kernel und ein reiner Test-Einstieg für die Schleifenarithmetik),
+`tests/testPsMeshMidphase.cpp` mit fünf Tests.
+
+**Kein zweites Transkript.** `shaders/psMeshMid.slang` ist ein Phase-1-Port desselben
+Traversers mit eigenem Fixture (`psMeshMid_traverser`, das einen vollen Host-Orakel
+mitbringt), und sein Kopf listet auf, was ihm fehlt — die Engine-Verklebung. Dieses Modul
+hebt jenen Rumpf und fügt ausschließlich Verklebung hinzu: LoadShapePair, den
+Transform-Cache-Lesevorgang, den Lauf durch den gekochten Mesh-Blob, die Auswahl
+diffus/fest, den Rigid-Filter und die Grid-Stride-Arbeitsschleife. Das Fixture ist deshalb
+die GPU-DIFFERENTIELLE Anordnung aus P8.97d: eine Arena, zweimal hochgeladen (einmal als
+die siebzehn gebundenen Puffer des Phase-1-Moduls, einmal als Blob und Deskriptorkette des
+BDA-Moduls), beide gefahren, byteweise verglichen. **In der ganzen Datei steht nicht eine
+einzige Toleranz** — zwei Programme, ohne FMA-Kontraktion aus derselben Arithmetik
+übersetzt, müssen auf demselben Eingang Bit für Bit übereinstimmen, und ein Beinahe-Treffer
+wäre ein Befund über den Lift, kein Rundungsrauschen.
+
+### Zwei echte Defekte, beide vom Fixture gefunden, bevor der Sweep lief
+
+1. **Das CCD-Flag war das falsche Bit.** Das Modul hatte
+   `PX_PARTICLE_FLAG_SPECULATIVE_CCD = 1 << 2`. Es ist `1 << 3`
+   (PxPBDParticleSystem.h:185); `1 << 2` ist `eFULL_DIFFUSE_ADVECTION`, also ein echtes
+   Nachbarflag und kein ungenutztes Bit — das macht es zur Falle statt zum Tippfehler.
+   `psBoundsBda` und `psContactGenBda` schreiben beide bereits 8; dieses Modul war das
+   einzige falsche. Der Layouttest fixiert jetzt auch den Nachbarn, damit die Falle
+   benannt und nicht bloß umgangen ist.
+2. **`psMeshMid` stand nie in `PXG_NOCONTRACT_SHADERS`.** Jede andere Mesh-Midphase im
+   Korpus steht darin, und das Kriterium — dichte Float-Dreiecksarbeit, deren Ergebnisse
+   sich unter FMA-Kontraktion verschieben — gilt wörtlich auch für sie. Das Differential
+   hat es aufgedeckt: mit kontrahiertem Phase-1-Modul und unkontrahiertem BDA-Modul
+   wichen die beiden bei 14 von 97 Partikeln um ein ULP ab, **während die Zählwerte
+   überall übereinstimmten** — die Signatur eines Rundungsunterschieds, nicht eines
+   Logikfehlers. Gemessen vor der Korrektur, Partikel 2, Slot 3:
+   `A = 0.0124539286 −0.198251307 0.9800722 0.189100429`,
+   `B = 0.0124539137 −0.198251337 0.9800722 0.189100444`.
+   Mit `psMeshMid` in der Liste ist jeder Vergleich der Datei exakt, und
+   `psMeshMid_traverser` bleibt grün (seine eigenen Prüfungen laufen gegen einen
+   Host-Spiegel, der ebenfalls kein FMA benutzt).
+
+Eine dritte Sache, die ich behauptet und korrigiert habe, meine und nicht die des Ports:
+der Test verlangte ein Partikel mit MEHR als `MaxStaticContactsPerMesh` Kontakten. Das ist
+konstruktiv unerreichbar — M6 lässt den Zähler der besitzenden Lane bei sechs SÄTTIGEN —
+also verlangte die Zusicherung Unmögliches.
+
+### Ein DRITTER Upstream-Verdacht in diesem Kernel: Kandidat 19
+
+`finalizeFullWarp` reserviert, bevor es unterdrückt:
+
+```
+if (idxInWarp == 31)
+    startIndex = atomicAdd(writer.numTotalContacts, count);   // :345
+...
+if (remaining && !isDiffuseParticlesThread)                   // :356
+    ... writer.writeContact(...)
+```
+
+Die RESERVIERUNG hat keinen `isDiffuseParticlesThread`-Wächter, nur das Schreiben. Der
+Diffus-Durchgang erhöht also den globalen Primitivkontakt-Zähler um alles, was er
+gefunden hat, und schreibt davon nichts — er hinterlässt LÖCHER in `particleContacts` und
+allen sechs Geschwisterarrays, unterhalb eines Zählers, der behauptet, es seien Kontakte.
+Erreichbar, sobald eine Szene Diffus-Partikel UND ein Dreiecksnetz auf einem nicht-statischen
+Aktor hat: bei einem statischen Netz werden die meisten Kontakte vorher in die
+One-Way-Arrays verbraucht, `remaining` ist meist null und die Reservierung klein; bei einem
+dynamischen bleibt `id` bei 0 und die volle Kontaktzahl wird reserviert. Gemessen in
+`psMeshMidphaseDiffuse` (c): mit den Diffus-Positionen auf die festen gelegt landet der
+Zähler auf exakt dem Doppelten des reinen Festwertes, und exakt die Hälfte der reservierten
+Plätze bleibt ungeschrieben. **Bug-für-Bug transkribiert**, und das Fixture fixiert die
+treuen Zahlen — ein Port, der das „repariert“, indem er den atomicAdd bewacht, fällt durch.
+Damit stehen **neunzehn** Upstream-Verdachtsfälle dokumentiert und **keiner** gemeldet.
+
+### Zwei bewusste Abweichungen, dokumentiert statt still korrigiert
+
+* **D1 (Kandidat 17).** `gridParticleIndex[particleIndex]` wird ohne Schranke gelesen. Zwei
+  Wege nach draußen: der feste Durchgang, wenn `ceil(numParticles/32)*32 > maxParticles`,
+  und — schlimmer — der diffuse, der den Lesevorgang mit der DIFFUSEN Anzahl gegen das
+  FESTE `mSortedToUnsortedMapping` begrenzt. P8.96c' fünfte Plattformregel sagt, dass ein
+  ungeschützter BDA-Load auf llvmpipe wirklich faultet, also ist der Load
+  ZWEIGGESCHÜTZT. **Der Wächter kann keine Ausgabe ändern**, und das ist der Grund, warum
+  es ein Wächter und keine Klemme ist: im festen Durchgang gilt
+  `numParticles <= maxParticles`, jeder Index außerhalb erfüllt also auch
+  `idx >= numParticles`, und eine solche Lane steht weder im Aktiv-Ballot des Konstruktors
+  noch innerhalb des Wächters von `finalizeFullWarp`. Im diffusen Durchgang wird der Wert
+  überhaupt nie konsumiert.
+* **D2 (Kandidat 18).** Der CUDA-Filter macht ein DIVERGENTES `return` vor
+  warp-kooperativem Code, der `__ballot_sync(FULL_MASK, …)` ruft. Hier wird der Warp über
+  gruppenweite Barrieren emuliert, wo ein früher Ausstieg nicht bloß fehlmaskiert, sondern
+  verklemmt. Der Port trägt deshalb ein KLEBRIGES `laneDone` pro Lane: die Lane bleibt in
+  jeder Barriere und jedem Ballot, ist aber aus der Aktivmaske ausgeschlossen, liefert
+  keine Kontakte und bleibt — wie das `return` — für ALLE verbleibenden Iterationen
+  draußen.
+
+### Der Sweep, und was er über das Fixture gesagt hat
+
+Erster Durchlauf: **83 Mutanten, 51 tot, 13 durch Fault tot, 18 ÜBERLEBT**, ein
+ANCHOR-FAIL. Achtzehn Überlebende sind kein Ergebnis, sondern eine Liste von Fragen, und
+dreizehn davon waren das Fixture. Geschlossen wurden unter anderem: das isTGS-Byte (die
+drei Füllbytes hinter einem CUDA-`bool` sind jetzt VERGIFTET und es gibt einen
+PGS-Dispatch); die diffuse Seite, die ihre Positionen und ihre Anzahl mit der festen
+TEILTE, wodurch „lies diffus“ und „lies fest“ dieselbe Instruktion waren; der
+Nicht-CCD-Zweig, in dem M3 wohnt und den jeder Dispatch mit eingeschaltetem CCD
+übersprang; die positive Skalendeterminante (die Determinante war immer negativ, also war
+`flipNormal` immer wahr); der Baum, dessen Knoten nur 2..6 Kinder hatten, sodass
+Slot-Indizes nie über 5 kamen und eine Maske mit 15 statt 31 eine Identität war;
+`maxContacts` = 4096, an das nichts herankam; `(n+31)/32` gegen `(n+32)/32`, die sich NUR
+bei exakten Vielfachen von 32 unterscheiden; der Filter, der nie mit einer diffusen Seite
+kombiniert wurde; und die Runsum-Subtraktion, die bei einem einzigen Puffer bei Runsum 0
+eine Identität ist — es gibt jetzt ZWEI Partikelpuffer und jedes Filterpaar liegt in
+Puffer 1 bei Runsum 40.
+
+**Und dann hat die Reparatur drei Kills verkauft.** Der volle Nachlauf zeigte 62 + 12 tot,
+9 überlebt — aber `t1-box-shape-skip`, `t3-child-shift-12` und `t5-node-index-mask`, die im
+ersten Sweep gestorben waren, lebten wieder. Genau der Fehler, über den P9.9 die Regel
+geschrieben hat, und sichtbar nur, weil der GANZE Sweep neu lief statt bloß der
+Überlebenden. Ursache war die für l4 eingeführte breite Wurzel: 26 GLEICH große Stücke
+über 250 Dreiecke ergaben je ~9 Primitive, unter der Blattschwelle von 12 — also wurde
+jedes Wurzelkind ein BLATT, der Baum war eine Ebene tief, und Kind-Offset-Shift wie
+Knotenindex-Maske waren unerreichbarer Code. Die Wurzel ist jetzt breit UND ungleich:
+abwechselnd kleine Stücke (8, unter der Schwelle → Blätter, und sie sitzen auf den Slots
+0, 2, … 24, was l4 braucht) und große (40, deutlich darüber → innere Knoten, also ein
+echter Abstieg). `NR` ist 624, damit die Teilung exakt aufgeht.
+
+Zwei weitere Deckungslücken fielen beim Diagnostizieren der letzten sechs auf, beide echt
+und unabhängig von irgendeinem Mutanten: jeder Dispatch dimensionierte das Grid EXAKT auf
+die Partikelzahl, sodass der Wächter, den der echte Start auf fast jedem Block jedes
+Frames überschreitet (Grid ist fest 16384), nie erreicht wurde; und zufällige
+Float-Geometrie erzeugt nie zwei exakt gleiche Kontakttiefen, sodass der Tie-Break des
+argmax in der Ersetzungsschleife nichts zu brechen hatte — jedes 37. Dreieck ist jetzt ein
+exaktes Duplikat seines Vorgängers.
+
+Einen Fehler musste ich zweimal korrigieren: das dichte Cluster wurde nach Nähe im
+VERTEX-Raum gegen einen festen Radius gewählt. Das war schon fragil und die anisotrope
+Skalierung hat es zerbrochen — bei Skala 2,4 spreizt ein Vertex-Raum-Cluster mit Radius
+0,35 auf 0,84 im Shape-Raum, vorbei an einer Kontaktdistanz von 0,22, und kein Partikel
+sättigte die Sechserliste mehr. Die Dichte wird jetzt im SHAPE-Raum gegen die
+Kontaktdistanz gemessen, also in dem Raum und mit der Skala, die der Kontakttest wirklich
+benutzt.
+
+### Der Sweep-Runner konnte verklemmen — jetzt nicht mehr
+
+`t3-child-shift-12` STIRBT auf einem flachen Baum durch Segfault. Auf dem tiefen Baum
+zeigt derselbe Mutant sein wahres Gesicht: ein Kind-Offset zeigt zurück auf einen
+Vorfahren, die Traversierung wird zyklisch, und der Test dreht sich. Er lief **37 Minuten**,
+bevor ich hingesehen habe, und der Sweep dahinter hatte in dieser Zeit nichts gemessen.
+`tools/run_mutation_sweep.sh` begrenzt jeden Suite-Lauf jetzt mit
+`MUTATION_SWEEP_TIMEOUT` (Vorgabe 300 s) und meldet einen Mutanten, der das erreicht, als
+**KILLED-HANG**, getrennt gezählt. Ein Hang IST ein Kill, aber er muss KLASSIFIZIERT
+werden statt den Lauf zu schlucken. Der Baseline-Lauf ist an dieselbe Schranke gebunden
+und verweigert vorab, wenn die saubere Suite nicht hineinpasst — sonst wäre jeder Mutant
+ein Hang und der Sweep läse sich als sauberer Sweep. Am echten Fall abgeraucht:
+`MUTATION_SWEEP_TIMEOUT=90` meldet KILLED-HANG und lässt den Baum sauber zurück.
+
+### Endstand des Sweeps
+
+**83 Mutanten — 65 tot, 12 durch Fault tot, 1 durch Hang tot (78 Kills), 5 ÜBERLEBT**,
+kein NOCOMPILE, kein ANCHOR-FAIL. Gegen den ersten Sweep verglichen: **kein einziger Kill
+verloren**, 14 dazugewonnen. Die fünf Überlebenden, jeder mit Beweis statt Ausrede:
+
+* `a3-mask-all-lanes` — ÄQUIVALENT, und zwar streng. Eine Lane mit `laneLive == false`
+  behält `particlePos = cVolumePos = 0` und `cVolumeRadius = 0`. `particleTriangleTest`
+  betritt seinen Rumpf nur, wenn `cVolumePosPlaneDist < cVolumeRadius`, hier also
+  `dot(−triV0, n) < 0`, und liefert nur dann `true`, wenn `particlePosPlaneDist > 0` —
+  dieselbe Zahl. `x < 0` und `x > 0` schließen einander aus, die Lane kann also
+  überhaupt keinen Kontakt erzeugen, unabhängig von der Geometrie.
+* `t7-hasbox-le` — ÄQUIVALENT. Der Mutant erweitert nur die Berechnung von `intersect`
+  auf `lane == nbChildren`; konsumiert wird `intersect` ausschließlich innerhalb des
+  darunter stehenden, UNVERÄNDERTEN `if (lane < nbChildren)`. Der Wert ist tot.
+* `z11-atomic-lane0` — ÄQUIVALENT. Anders als das CUDA (wo Lane 31 ihren inklusiven Scan
+  benutzt) berechnet dieser Port `total` in JEDER Lane als volle Summe. Der addierte Wert
+  ist damit lane-unabhängig, und genau eine Lane führt den atomicAdd so oder so aus.
+* `w5-guard-le` — ÄQUIVALENT. Bei `workIndex == nbWarpsRequired` ist
+  `globalParticleIndex = lane + nbWarpsRequired*32 >= numParticles` für JEDE Lane, also
+  ist `laneLive` überall falsch: leere Aktivmaske, kein Knoten auf dem Stack, nichts
+  geschrieben. (Die zusätzliche Grid-Deckung dafür ist trotzdem eingezogen, weil der echte
+  Start diesen Wächter dauernd überschreitet — das ist eine echte Eigenschaft, nicht bloß
+  eine Mutantenantwort.)
+* `t2-box-radius-le` — `distSq < sR*sR` gegen `<=`. Unterscheidet sich AUSSCHLIESSLICH bei
+  exakter Gleichheit zweier berechneter Float-Größen. Das ist eine Nullmenge, und anders
+  als beim argmax-Tie (den die duplizierten Dreiecke jetzt erzeugen) gibt es keine
+  Konstruktion, die sie herstellt, ohne die Geometrie zu verbiegen. Als unerreichbare
+  Grenzfalläquivalenz notiert — die schwächste der fünf, und sie steht hier als das, was
+  sie ist.
+
+Suite **797/797** in beiden Speichermodi (792 → 797 durch die fünf neuen Suite-Zeilen
+dieser Tranche). Manifest unverändert bei **339** — P9.10c ist die ABI-Zeile, der
+Manifest-Eintrag und die Szene.
 
 ## P9.10 Vorarbeit — `ps_meshCollisonLaunch` vermessen, und es ist ein LIFT, keine Neuschreibung
 
