@@ -1761,6 +1761,49 @@ Konvention, statt mitten in der Tranche einen korpusweiten Refactor zu beginnen 
 sichert die Äquivalenz stattdessen über die GPU-DIFFERENTIELLE Anordnung aus P8.97d:
 dieselbe Arena, beide Einstiegspunkte, byteweiser Vergleich, keine vierte Transkription.
 
+### Beim Lesen der Arbeitsschleife: zwei neue Upstream-Kandidaten, 17 und 18
+
+Die Schleife lautet (particleSystemMeshMidphase.cu:708-719):
+
+    for (i = 0; i < nbIterationsPerWarps; ++i) {
+      workIndex = i + (warpIdx + WarpsPerBlock * blockIdx.x) * nbIterationsPerWarps;
+      if (workIndex < nbWarpsRequired) {
+        particleIndex = idxInWarp + workIndex * WARP_SIZE;
+        particleMask  = PxEncodeParticleIndex(particleSystemId, gridParticleIndex[particleIndex]);
+        if (!isDiffuseParticlesThread && find(particleSystem, rigidId.getInd(), particleMask))
+          return;
+        ...traverser...
+
+**Kandidat 17 — `gridParticleIndex[particleIndex]` wird UNGEPRÜFT gelesen.** Es gibt hier
+keine `particleIndex < numParticles`-Schranke; die hat erst der Traverser intern. Das Array
+ist `grid_particle_index`, alloziert mit `maxParticles * sizeof(PxU32)`
+(PxgPBDParticleSystemCore.cpp:1830), und der letzte Warp liest bis
+`ceil(numParticles/32)*32 - 1`. Der Zugriff geht also genau dann über die Allokation
+hinaus, wenn **`ceil(numParticles/32)*32 > maxParticles`** — praktisch: wenn das
+Partikelsystem VOLL ist und seine Kapazität kein Vielfaches von 32 ist. Kein Randfall,
+sondern eine präzise benennbare Bedingung.
+
+**Kandidat 18 — der Filter macht ein DIVERGENTES `return` vor warp-kooperativem Code.**
+`find(...)` ist pro Lane verschieden, und `return` (nicht `continue`) nimmt diese Lane aus
+dem Rest der Iteration. Was danach kommt, ist der Traverser mit
+`__ballot_sync(FULL_MASK, …)` und `bv32TreeTraversal`. Nach CUDA-Semantik müssen alle in
+der Maske genannten Threads teilnehmen; ausgestiegene Lanes verletzen das. Ein
+gefiltertes Partikel kann damit die Ballots der ÜBRIGEN Partikel desselben Warps
+verfälschen — und nebenbei überspringt das `return` auch alle weiteren Iterationen dieser
+Lane, nicht nur die aktuelle.
+
+**Beide ändern eine Portierungsentscheidung, und das ist der eigentliche Grund, sie hier
+zu notieren.** Kandidat 17 lässt sich auf llvmpipe NICHT treu transkribieren: die fünfte
+Plattformregel aus P8.96c besagt, dass ein ungeklemmter BDA-Zugriff dort real segfaultet.
+P9.10a muss also den INDEX klemmen — nicht den Wert — wie schon bei den CountAt-Helfern,
+und die Abweichung im Modulkopf ausweisen, statt sie stillschweigend zu „reparieren".
+Bei Kandidat 18 muss der Port ohnehin abweichen, weil die Warp-Emulation über
+gruppenweite Barrieren läuft: ein früher Rücksprung einzelner Lanes würde dort in einem
+Deadlock enden, nicht in einer falschen Maske. Die Umsetzung wird ein Masken-Flag statt
+eines Rücksprungs, und der Kopf sagt, warum.
+
+Damit stehen **achtzehn** Upstream-Kandidaten, dokumentiert und **keiner gemeldet**.
+
 Aufteilung: **P9.10a** BDA-Modul + Fixture + Sweep, **P9.10b** Wrapper → Manifest 340,
 **P9.10c** eine Fluid-auf-Mesh-Boden-Szene, damit der statische Kernel endlich Kontakte
 bekommt.
