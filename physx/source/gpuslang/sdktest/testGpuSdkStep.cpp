@@ -30,6 +30,9 @@
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#include <set>
+#include <map>
+#include <utility>
 
 using namespace physx;
 
@@ -1039,6 +1042,297 @@ ParticleScene buildParticleClothScene(PxPhysics* physics, PxScene* scene, PxMate
     out.numParticles = numParticles;
     out.numPinned = CLOTH_NZ;
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// P9.7 -- PXG_SCENE=particleinflatable: the PRESSURISED closed mesh.
+//
+// P9.6 landed ps_calculateInflatableVolume and ps_solveInflatableVolume with a 39/39
+// sweep, and both were physically inert in every scene: particlecloth has
+// pressure = 0, which is exactly the engine's marker for "solve this as ordinary
+// cloth", so both kernels launch and return at their early-out.  This scene gives
+// them something to do.
+//
+// AN INFLATABLE NEEDS A CLOSED MESH.  A flat sheet encloses no volume, so the
+// P9.4 geometry cannot be reused at all.  SnippetPBDInflatable builds a sphere by
+// projecting a cube onto it and then calling PxRemeshingExt::limitMaxEdgeLength --
+// which lives in physxextensions, not linked here.  This builds the same shape by
+// SUBDIVIDING instead: the snippet's 8-vertex / 12-triangle cube, each triangle
+// split into four at its edge midpoints, every new vertex projected back onto the
+// sphere, twice.  That gives 12*4*4 = 192 triangles over 98 vertices, closed and
+// watertight by construction.
+//
+// THE REST VOLUME IS SIX TIMES THE GEOMETRIC VOLUME, and this is not a guess: the
+// cooker computes `Gu::computeTriangleMeshVolume(...) * 6.0f` with the engine's own
+// comment "the physx api takes volume*6 now"
+// (ExtParticleClothCooker.cpp:449-453), and Gu's formula is
+// `sum (v0 x v1) . v2 / 6` (GuInternal.h:204-221).  The two sixes cancel, so
+// restVolume is simply the sum of (v0 x v1) . v2 -- which is also exactly the
+// quantity ps_calculateInflatableVolume accumulates without dividing (P9.6's trap
+// I3).  The producer side therefore confirms the port's spelling.
+//
+// Springs are the mesh's unique EDGES; there is no cooker here to generate
+// bending constraints, and none is needed to make the pair observable.
+
+struct InflMesh
+{
+    std::vector<PxVec3> verts;
+    std::vector<PxU32> tris;      // 3 per triangle
+};
+
+// One level of 4-to-1 subdivision with midpoint sharing, then re-projection.
+static void inflSubdivide(InflMesh& m, const PxVec3& centre, float radius)
+{
+    std::map<std::pair<PxU32, PxU32>, PxU32> midCache;
+    auto midpoint = [&](PxU32 a, PxU32 b) -> PxU32
+    {
+        const std::pair<PxU32, PxU32> key = (a < b) ? std::make_pair(a, b) : std::make_pair(b, a);
+        auto it = midCache.find(key);
+        if (it != midCache.end()) return it->second;
+        PxVec3 p = (m.verts[a] + m.verts[b]) * 0.5f;
+        PxVec3 dir = p - centre;
+        dir.normalize();
+        p = centre + dir * radius;
+        const PxU32 idx = PxU32(m.verts.size());
+        m.verts.push_back(p);
+        midCache[key] = idx;
+        return idx;
+    };
+
+    std::vector<PxU32> out;
+    out.reserve(m.tris.size() * 4u);
+    for (size_t t = 0; t + 2 < m.tris.size(); t += 3)
+    {
+        const PxU32 a = m.tris[t + 0], b = m.tris[t + 1], c = m.tris[t + 2];
+        const PxU32 ab = midpoint(a, b), bc = midpoint(b, c), ca = midpoint(c, a);
+        const PxU32 f[4][3] = { { a, ab, ca }, { ab, b, bc }, { ca, bc, c }, { ab, bc, ca } };
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 3; ++j) out.push_back(f[i][j]);
+    }
+    m.tris.swap(out);
+}
+
+static InflMesh buildInflSphere(const PxVec3& centre, float radius, int levels)
+{
+    // SnippetPBDInflatable.cpp:96-99 -- the same cube and the same winding.
+    static const float CV[8][3] = {
+        { 0.5f, -0.5f, -0.5f }, { 0.5f, -0.5f, 0.5f }, { -0.5f, -0.5f, 0.5f }, { -0.5f, -0.5f, -0.5f },
+        { 0.5f,  0.5f, -0.5f }, { 0.5f,  0.5f, 0.5f }, { -0.5f,  0.5f, 0.5f }, { -0.5f,  0.5f, -0.5f }
+    };
+    static const PxU32 CI[36] = { 1,2,3, 7,6,5, 4,5,1, 5,6,2, 2,6,7, 0,3,7,
+                                  0,1,3, 4,7,5, 0,4,1, 1,5,2, 3,2,7, 4,0,7 };
+    InflMesh m;
+    for (int i = 0; i < 8; ++i)
+    {
+        PxVec3 dir(CV[i][0], CV[i][1], CV[i][2]);
+        dir.normalize();
+        m.verts.push_back(centre + dir * radius);
+    }
+    for (int i = 0; i < 36; ++i) m.tris.push_back(CI[i]);
+    for (int l = 0; l < levels; ++l) inflSubdivide(m, centre, radius);
+    return m;
+}
+
+// sum (v0 x v1) . v2 over the triangles -- six times the enclosed volume, which is
+// the unit both PxParticleCloth::restVolume and the kernel use.
+static float inflMeshVolume6(const std::vector<PxVec3>& v, const std::vector<PxU32>& tris)
+{
+    float acc = 0.0f;
+    for (size_t t = 0; t + 2 < tris.size(); t += 3)
+        acc += v[tris[t]].cross(v[tris[t + 1]]).dot(v[tris[t + 2]]);
+    return acc;
+}
+
+static const float INFL_RADIUS = 0.8f;
+static const PxVec3 INFL_CENTRE = PxVec3(0.0f, 5.0f, 0.0f);
+// The mesh is spawned SQUASHED along y; pressure has to puff it back out.
+static const float INFL_SQUASH = 0.35f;
+static const float INFL_PRESSURE = 1.0f;   // target volume = rest volume
+// CALIBRATION.  Measured on this scene, the only difference between the two runs
+// being the cloth's `pressure` field (PXG_PARTICLE_INFL_CONTROL=1 zeroes it):
+//
+//                                pressure 1.0    pressure 0 (control)
+//   volume at the end             100.0% of rest    28.9% of rest
+//   volume at its peak            283.5%            80.4%
+//
+// The pressurised mesh does not merely get bigger -- it CONVERGES ON ITS TARGET.
+// The constraint drives the enclosed volume to restVolume * pressure, and with
+// pressure 1.0 that is the rest volume exactly: 12.0252 against a rest of 12.0235.
+// So the check is target convergence, not growth, which discriminates by a factor
+// of about seven thousand rather than by a ratio.  The control run misses the
+// target by 0.711 and fails it outright.
+//
+// The overshoot to 283% is real and is stated rather than hidden: the mesh is
+// spawned at 35% of its volume with deliberately soft springs, so the volume
+// constraint's first correction is large.  It converges within about thirty steps
+// and stays.  The second check bounds that transient, so a wrong-signed or
+// wrong-scaled constraint that diverges is caught even if it happened to pass
+// through the target on its way out.
+static const float INFL_VOL_TARGET_TOL = 0.05f;   // |end/rest - pressure|
+static const float INFL_VOL_CONTROL = 0.289f;     // measured, pressure 0
+static const float INFL_VOL_MAX = 5.0f;           // measured peak 2.835
+
+ParticleScene buildParticleInflatableScene(PxPhysics* physics, PxScene* scene,
+                                           PxMaterial* rigidMat, PxCudaContextManager* cudaCtx,
+                                           bool pressurised)
+{
+    ParticleScene out;
+    out.cudaCtx = cudaCtx;
+
+    addGroundBox(physics, scene, rigidMat);
+    {
+        PxRigidDynamic* aside = physics->createRigidDynamic(PxTransform(PxVec3(20.0f, 0.5f, 0.0f)));
+        PxShape* sh = physics->createShape(PxBoxGeometry(0.5f, 0.5f, 0.5f), *rigidMat);
+        aside->attachShape(*sh);
+        aside->setMass(1000.0f);
+        aside->setMassSpaceInertiaTensor(boxInertia(PxVec3(0.5f), 1000.0f));
+        sh->release();
+        scene->addActor(*aside);
+    }
+
+    const InflMesh mesh = buildInflSphere(INFL_CENTRE, INFL_RADIUS, 2);
+    const PxU32 numParticles = PxU32(mesh.verts.size());
+    const PxU32 numTriangles = PxU32(mesh.tris.size() / 3u);
+
+    // The REST volume is the un-squashed sphere's.
+    const float restVolume6 = inflMeshVolume6(mesh.verts, mesh.tris);
+
+    // Springs = the unique edges of the closed mesh.
+    std::vector<PxParticleSpring> springs;
+    {
+        std::set<std::pair<PxU32, PxU32>> edges;
+        for (size_t t = 0; t + 2 < mesh.tris.size(); t += 3)
+        {
+            const PxU32 idx[3] = { mesh.tris[t], mesh.tris[t + 1], mesh.tris[t + 2] };
+            for (int e = 0; e < 3; ++e)
+            {
+                PxU32 a = idx[e], b = idx[(e + 1) % 3];
+                if (a > b) { const PxU32 tmp = a; a = b; b = tmp; }
+                edges.insert(std::make_pair(a, b));
+            }
+        }
+        for (auto& e : edges)
+        {
+            PxParticleSpring sp;
+            std::memset(&sp, 0, sizeof(sp));
+            sp.ind0 = e.first;
+            sp.ind1 = e.second;
+            sp.length = (mesh.verts[e.first] - mesh.verts[e.second]).magnitude();
+            // DELIBERATELY SOFT.  Stiff springs would restore the squashed sphere on
+            // their own and the pressure's contribution would be invisible -- the
+            // scene would pass for the wrong reason.
+            sp.stiffness = 200.0f;
+            sp.damping = 0.05f;
+            springs.push_back(sp);
+        }
+    }
+    const PxU32 numSprings = PxU32(springs.size());
+
+    const float restOffset = 0.10f;
+    const float totalMass = 4.0f;
+    const float particleMass = totalMass / float(numParticles);
+
+    PxPBDMaterial* pbdMat = physics->createPBDMaterial(0.8f, 0.05f, 1e+6f, 0.001f, 0.5f,
+                                                       0.005f, 0.05f, 0.0f, 0.0f);
+    PxPBDParticleSystem* ps = physics->createPBDParticleSystem(*cudaCtx);
+    ps->setRestOffset(restOffset);
+    ps->setContactOffset(restOffset + 0.02f);
+    ps->setParticleContactOffset(restOffset + 0.02f);
+    ps->setSolidRestOffset(restOffset);
+    ps->setFluidRestOffset(0.0f);
+    ps->setSolverIterationCounts(8, 1);
+    scene->addActor(*ps);
+
+    const PxU32 phase = ps->createPhase(pbdMat, PxParticlePhaseFlags(
+        PxParticlePhaseFlag::eParticlePhaseSelfCollideFilter |
+        PxParticlePhaseFlag::eParticlePhaseSelfCollide));
+
+    // Spawn SQUASHED along y.  With pressure the volume constraint has to push it
+    // back out; without it, only the soft springs pull.
+    std::vector<PxVec4> hostPos(numParticles);
+    std::vector<PxVec4> hostVel(numParticles, PxVec4(0.0f));
+    std::vector<PxU32> hostPhase(numParticles, phase);
+    for (PxU32 i = 0; i < numParticles; ++i)
+    {
+        PxVec3 p = mesh.verts[i];
+        p.y = INFL_CENTRE.y + (p.y - INFL_CENTRE.y) * INFL_SQUASH;
+        hostPos[i] = PxVec4(p.x, p.y, p.z, 1.0f / particleMass);
+    }
+
+    PxParticleCloth cloth;
+    cloth.startVertexIndex = 0;
+    cloth.numVertices = numParticles;
+    cloth.clothBlendScale = 0.0f;              // filled in by partitionSprings
+    cloth.restVolume = restVolume6;            // SIX TIMES the geometric volume
+    cloth.pressure = pressurised ? INFL_PRESSURE : 0.0f;
+    cloth.startTriangleIndex = 0;              // an INDEX-ARRAY offset (P9.6, I2)
+    cloth.numTriangles = numTriangles;
+
+    std::vector<PxVec4> restPositions(numParticles);
+    for (PxU32 i = 0; i < numParticles; ++i)
+        restPositions[i] = PxVec4(mesh.verts[i].x, mesh.verts[i].y, mesh.verts[i].z,
+                                  1.0f / particleMass);
+
+    PxParticleClothDesc clothDesc;
+    clothDesc.cloths = &cloth;
+    clothDesc.triangles = const_cast<PxU32*>(mesh.tris.data());
+    clothDesc.springs = springs.data();
+    clothDesc.restPositions = restPositions.data();
+    clothDesc.nbCloths = 1;
+    clothDesc.nbSprings = numSprings;
+    clothDesc.nbTriangles = numTriangles;
+    clothDesc.nbParticles = numParticles;
+
+    PxParticleClothPreProcessor* pre = PxCreateParticleClothPreProcessor(cudaCtx);
+    if (!pre) { std::printf("FAIL: PxCreateParticleClothPreProcessor returned null\n"); return out; }
+    PxPartitionedParticleCloth partitioned;
+    pre->partitionSprings(clothDesc, partitioned);
+    pre->release();
+
+    std::printf("  inflatable: %u verts, %u tris, %u springs, restVolume(x6)=%.6g, "
+                "pressure=%.2f, %u partitions\n",
+                numParticles, numTriangles, numSprings, restVolume6, cloth.pressure,
+                partitioned.nbPartitions);
+
+    PxParticleClothBuffer* buffer = physics->createParticleClothBuffer(
+        numParticles, 0, clothDesc.nbCloths, clothDesc.nbTriangles, clothDesc.nbSprings, cudaCtx);
+    if (!buffer) { std::printf("FAIL: createParticleClothBuffer returned null\n"); return out; }
+
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPositionInvMasses()),
+                    hostPos.data(), numParticles * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getVelocities()),
+                    hostVel.data(), numParticles * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPhases()),
+                    hostPhase.data(), numParticles * sizeof(PxU32));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getTriangles()),
+                    mesh.tris.data(), size_t(numTriangles) * 3u * sizeof(PxU32));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getRestPositions()),
+                    restPositions.data(), numParticles * sizeof(PxVec4));
+    buffer->setNbActiveParticles(numParticles);
+    buffer->setNbTriangles(numTriangles);
+    buffer->setCloths(partitioned);
+    ps->addParticleBuffer(buffer);
+
+    out.system = ps;
+    out.buffer = buffer;
+    out.numParticles = numParticles;
+    out.numPinned = 0;
+    return out;
+}
+
+// The scene's observable: the enclosed volume of the live mesh, in the same
+// six-times unit as restVolume.  Read the positions back and re-run the mesh
+// formula over the SAME triangle list.
+float inflLiveVolume6(const ParticleScene& psc, const std::vector<PxU32>& tris)
+{
+    std::vector<PxVec4> host(psc.numParticles);
+    PxCudaContext* ctx = psc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(psc.buffer->getPositionInvMasses()),
+                    psc.numParticles * sizeof(PxVec4));
+    std::vector<PxVec3> v(psc.numParticles);
+    for (PxU32 i = 0; i < psc.numParticles; ++i) v[i] = PxVec3(host[i].x, host[i].y, host[i].z);
+    return inflMeshVolume6(v, tris);
 }
 
 // DtoH-read the particle buffer and return the mean y over the FREE particles
@@ -3407,6 +3701,100 @@ int main()
     // PXG_SCENE=particle (P6.0): the deformable/particle free-fall path.  Wholly
     // separate observable from the rigid RestTarget path — a PBD cloud that falls
     // under gravity, verified by DtoH-reading its mean y across steps.
+    // P9.7 -- PXG_SCENE=particleinflatable: a pressurised closed mesh.
+    if (!std::strcmp(sceneName, "particleinflatable"))
+    {
+        // The control zeroes the PRESSURE, which is the engine's own marker for
+        // "solve as ordinary cloth" and makes both P9.6 kernels return at their
+        // early-out.  Everything else -- mesh, springs, masses, iterations -- is
+        // identical, so the difference is the inflatable pair and nothing else.
+        const bool noPressure = std::getenv("PXG_PARTICLE_INFL_CONTROL") != nullptr;
+        const InflMesh mesh = buildInflSphere(INFL_CENTRE, INFL_RADIUS, 2);
+        ParticleScene psc = buildParticleInflatableScene(physics, scene, material, cudaCtx,
+                                                         !noPressure);
+        if (!psc.system)
+        {
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        const float restVol6 = inflMeshVolume6(mesh.verts, mesh.tris);
+        std::printf("  [  OK  ] scene 'particleinflatable' built: %u particles, pressure %s\n",
+                    psc.numParticles, noPressure ? "ZERO (control run)" : "on");
+
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: particle inflatable GPU pipeline CONSTRUCTED + "
+                        "live over Vulkan (set PXG_GPU_STEP=1 to step the inflation)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_PARTICLE_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 180;
+        const float v0 = inflLiveVolume6(psc, mesh.tris);
+        std::printf("  stepping the inflatable (%d x %.4fs): rest volume(x6) %.6g, "
+                    "squashed start %.6g (%.1f%% of rest)\n",
+                    steps, dt, restVol6, v0, 100.0f * v0 / restVol6);
+
+        float volMax = v0, volEnd = v0;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            const float v = inflLiveVolume6(psc, mesh.tris);
+            if (v > volMax) volMax = v;
+            volEnd = v;
+            if (i < 5 || i == steps - 1 || (i % 30 == 0))
+                std::printf("    step %3d: volume(x6)=%.6g (%.1f%% of rest)\n",
+                            i, v, 100.0f * v / restVol6);
+        }
+        const float fracEnd = volEnd / restVol6;
+        const float fracMax = volMax / restVol6;
+        std::printf("  particle INFLATABLE: volume(x6) %.6g -> %.6g (max %.6g); "
+                    "%.1f%% -> %.1f%% of rest (max %.1f%%)\n",
+                    v0, volEnd, volMax, 100.0f * v0 / restVol6, 100.0f * fracEnd,
+                    100.0f * fracMax);
+
+        int failures = 0;
+        if (noPressure)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: particleinflatable CONTROL run (pressure 0) "
+                        "measured: %.1f%% of rest volume at the end, %.1f%% at most\n",
+                        100.0f * fracEnd, 100.0f * fracMax);
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            return 0;
+        }
+
+        if (!(PxAbs(fracEnd - INFL_PRESSURE) < INFL_VOL_TARGET_TOL))
+        {
+            std::printf("FAIL: the mesh did not reach its TARGET volume -- the volume "
+                        "constraint is not converging (%.4f of rest, target %.2f +/- %.2f, "
+                        "pressure-0 control %.4f)\n",
+                        fracEnd, INFL_PRESSURE, INFL_VOL_TARGET_TOL, INFL_VOL_CONTROL);
+            ++failures;
+        }
+        if (!(fracMax < INFL_VOL_MAX))
+        {
+            std::printf("FAIL: the inflatable DIVERGED -- peak volume %.4f of rest exceeds "
+                        "%.2f\n", fracMax, INFL_VOL_MAX); ++failures;
+        }
+        if (!std::isfinite(volEnd))
+        {
+            std::printf("FAIL: the inflatable volume is not finite (%.6g)\n", volEnd);
+            ++failures;
+        }
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: the PRESSURISED mesh INFLATED to its TARGET "
+                        "volume on Vulkan (%.1f%% of rest vs %.1f%% for the pressure-0 "
+                        "control, peak %.1f%%) -- the inflatable pair runs end to end\n",
+                        100.0f * fracEnd, 100.0f * INFL_VOL_CONTROL, 100.0f * fracMax);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: particleinflatable checks failed (%d)\n", failures);
+        return 2;
+    }
+
     // P9.4 -- PXG_SCENE=particlecloth: the PBD cloth sheet hanging from a pinned
     // row.  See buildParticleClothScene for why this observable and this control.
     if (!std::strcmp(sceneName, "particlecloth"))
@@ -4881,12 +5269,14 @@ int main()
     // with PXG_PARTICLE_STARTY set (see bagMode above).
     else { std::printf("[ FAIL ] gpu-sdk-step: unknown PXG_SCENE='%s'\n"
                        "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|articulation\n"
-                       "          particle|particlefluid|particlecloth|cloth|clothhang|clothdrape\n"
+                       "          particle|particlefluid|particlecloth|particleinflatable\n"
+                       "          cloth|clothhang|clothdrape\n"
                        "          clothselfcollide|clothcloth\n"
                        "          softbody|softbodyselfcollide|softbodycloth|softbodystack|softbodyattach\n"
                        "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
                        "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
-                       "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n",
+                       "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n"
+                       "          PXG_SCENE=particleinflatable + PXG_PARTICLE_INFL_CONTROL=1 (pressure-0 control)\n",
                        sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
     if (targets.empty())

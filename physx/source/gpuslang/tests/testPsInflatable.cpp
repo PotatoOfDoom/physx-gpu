@@ -670,7 +670,7 @@ PXG_TEST(psInflatable)
             cmpF(refAcc[i].x, gAcc[i * 4u + 0u], at, "accum.x", i);
             cmpF(refAcc[i].y, gAcc[i * 4u + 1u], at, "accum.y", i);
             cmpF(refAcc[i].z, gAcc[i * 4u + 2u], at, "accum.z", i);
-            cmpF(refAcc[i].w, gAcc[i * 4u + 3u], false, "accum.w(count)", i);
+            cmpF(refAcc[i].w, gAcc[i * 4u + 3u], false, "accum.w", i);
         }
 
         for (uint32_t b = 0; b < uint32_t(s->cloths.size()); ++b)

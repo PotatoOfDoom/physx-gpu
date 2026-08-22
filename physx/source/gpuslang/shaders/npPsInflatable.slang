@@ -89,8 +89,17 @@
 //      candidate 15) is the outlier rather than the rule.
 // I12. `accumDeltaP[ind] += float4(delta, 1.f)` (:5079) is a PLAIN read-modify-
 //      write, not an atomic -- and it does not need to be, because the vertex loop
-//      is a bijection.  The `.w` gets +1, which is the count a later averaging
-//      pass divides by.
+//      is a bijection.  The `.w` gets +1.
+//      A CORRECTION to what this comment first claimed: that `+1` is NOT a count
+//      anything divides by.  The averaging divisor is `mDelta`'s `.w`
+//      (ps_applyDeltaLaunch :3740 computes `1 / (j.w * relaxation)` from
+//      `deltas[p]`), and that same kernel then writes `mAccumDeltaP`'s `.w` back as
+//      a literal 0 (:3750), as does ps_updateParticleLaunch (:3055).  So the value
+//      written here is consumed only in the sense that
+//      ps_updateParticleLaunch folds the whole float4 -- `.w` included -- into
+//      `mSortedDeltaP` (:3058) and into the velocity via `aDeltaP * invDt` (:3045).
+//      The port transcribes the `1.f` because the CUDA writes it, not because a
+//      divisor depends on it.
 // I13. `dt` is a DEAD PARAMETER of the solve kernel: it is passed
 //      (PxgPBDParticleSystemCore.cpp:808) and never read.  Kept in the push layout.
 //

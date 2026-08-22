@@ -8,7 +8,7 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **789/789** green in both modes (`ctest -N` in `build-gpuslang`).
-Szenen: **24/24** grün (P9.4 fügte `particlecloth` hinzu).
+Szenen: **25/25** grün (P9.7 fügte `particleinflatable` hinzu).
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
 figure.  It is now the number `ctest` prints.)*
@@ -1694,6 +1694,60 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.7 — `PXG_SCENE=particleinflatable`: der Druckkörper trifft sein Zielvolumen
+
+P9.6 hat beide Inflatable-Kernel mit 39/39 gelandet, und beide waren in jeder Szene
+physikalisch folgenlos: `particlecloth` hat `pressure = 0`, was genau die Markierung
+der Engine für „als gewöhnliches Tuch lösen" ist.  Diese Szene gibt ihnen Arbeit.
+
+**Ein Inflatable braucht ein GESCHLOSSENES Netz** — ein flaches Blatt schließt kein
+Volumen ein, die P9.4-Geometrie ist also unbrauchbar.  SnippetPBDInflatable baut die
+Kugel über `PxRemeshingExt::limitMaxEdgeLength`, das in den Extensions liegt.  Hier
+entsteht dieselbe Form durch **Subdivision**: der Würfel des Snippets, jedes Dreieck
+an den Kantenmitten geviertelt, jeder neue Vertex zurück auf die Kugel projiziert,
+zweimal — 192 Dreiecke über 98 Vertices, geschlossen per Konstruktion.  Federn sind
+die eindeutigen KANTEN.
+
+**Das Rest-Volumen ist sechs Mal das geometrische, und das ist kein Ratschluss:** der
+Cooker rechnet `Gu::computeTriangleMeshVolume(...) * 6.0f` mit dem Kommentar der
+Engine „the physx api takes volume*6 now" (ExtParticleClothCooker.cpp:449-453), und
+Gus Formel ist `sum (v0 x v1) . v2 / 6`.  Die beiden Sechsen kürzen sich, `restVolume`
+ist schlicht die Summe von `(v0 x v1) . v2` — **genau die Größe, die
+`ps_calculateInflatableVolume` ohne Division akkumuliert**.  Damit ist P9.6s Falle I3
+(keine Division durch 6) von der Erzeugerseite belegt, nicht nur aus dem Kernel
+gelesen.
+
+**Gemessen, einziger Unterschied ist das `pressure`-Feld:**
+
+|                          | Druck 1.0 | Kontrolle Druck 0 |
+|---|---|---|
+| Volumen am Ende          | **100.0 %** vom Rest | 28.9 % |
+| Volumen im Maximum       | 283.5 % | 80.4 % |
+
+Das Netz startet auf 35 % zusammengedrückt.  Mit Druck **konvergiert es auf sein
+ZIEL**: 12.0252 gegen ein Rest-Volumen von 12.0235.  Die Prüfung ist deshalb
+Ziel-Konvergenz, nicht Wachstum — `|Ende/Rest − pressure| < 0.05`, was um etwa den
+Faktor siebentausend diskriminiert statt um ein Verhältnis.  Die Kontrolle verfehlt
+das Ziel um 0.711.
+
+Zwei Dinge, die bewusst so stehen: die Federn sind **absichtlich weich** (Steifigkeit
+200), denn steife Federn würden die gedrückte Kugel allein zurückholen und der Beitrag
+des Drucks wäre unsichtbar — die Szene bestünde aus dem falschen Grund.  Und das
+Überschwingen auf 283 % ist echt und wird genannt statt versteckt; eine zweite Prüfung
+begrenzt es, damit eine falsch vorzeichenbehaftete Bedingung, die durch das Ziel
+hindurch divergiert, trotzdem auffällt.
+
+**Eine Korrektur an P9.6.**  Der dortige Modulkommentar behauptete, das `+1.f` in
+`accumDeltaP.w` sei „die Zahl, durch die eine spätere Mittelung teilt".  Das ist
+falsch: der Divisor ist `mDelta`s `.w` (`ps_applyDeltaLaunch` :3740 rechnet
+`1/(j.w * relaxation)` aus `deltas[p]`), und derselbe Kernel schreibt
+`mAccumDeltaP.w` anschließend als literale 0 zurück (:3750), ebenso
+`ps_updateParticleLaunch` (:3055).  Der Port schreibt die `1.f`, weil die CUDA sie
+schreibt — nicht, weil ein Divisor daran hängt.  Kommentar korrigiert, Code
+unverändert.
+
+**25 Szenen** grün.
 
 ## P9.6 — das Inflatable-Paar (Manifest 337): eine Blockreduktion und die erste libm-Lücke
 
