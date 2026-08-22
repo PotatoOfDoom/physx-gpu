@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **804/804** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **805/805** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **28/28** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (27 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die fünf Diagnose-Kontrollen
@@ -1698,6 +1698,182 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.12c — die `SparseSDFTexture`-Schicht, ein echtes Orakel, und eine sechste Plattformregel
+
+Portiert `sdfCollision.cuh:43-152` (`SparseSDFTexture` mit `initialize()` und
+`Sample()`) plus den SDF-Schwanz von `readTriangleMesh` (`triangleMesh.cuh:120-196`)
+auf die bindlose Texturschicht aus P9.12a. Neues Modul
+`shaders/pxgSlangSdfTexture.slang`, Fixture `tests/testSdfTexture.cpp`,
+Einstiegspunkte in `npSdfTexture.slang`.
+
+### Das Orakel, und diesmal ist es eines
+
+Eine PhysX-SDF wird **doppelt** gespeichert: ein grobes Hintergrundgitter über der
+ganzen Box, und dort, wo die Oberfläche wirklich liegt, ein schmales Band von
+**Subgrids** in einer zweiten 3D-Textur, adressiert über einen Startslot pro
+grober Zelle. `Sample()` ist die Entscheidung, welche der beiden gelesen wird —
+und praktisch das gesamte Risiko dieser Tranche steckt in dieser **Adressierung**,
+nicht im Filtern (das hat P9.12a schon vermessen).
+
+Genau dafür gibt es einen Wirt-seitigen Gegenpart: **`Gu::SDF::decodeSparse`**
+(`GuSDF.cpp:1340-1412`, exportiert `PX_PHYSX_COMMON_API`) wertet dieselbe sparse
+SDF auf dem Host an einer ganzzahligen Feingitter-Koordinate aus und trifft
+**jede** Entscheidung, die `Sample()` trifft: die grobe Zelle per
+Ganzzahldivision, die Randkorrektur `xBase == nbX → --xBase; x = subgridSize`,
+`decodeTriple`s 10-Bit-Entpackung, den `(subgridSize+1)`-Blockschritt und den
+groben Rückfall über ein `(nbX+1, nbY+1, nbZ+1)`-Gitter. An einem Texelzentrum
+sind die trilinearen Gewichte 0 und 1, der GPU-Wert muss also gleich sein.
+
+Es ist **nicht** in dieses Binary gelinkt — es lebt in PhysXCommon, und
+`gpuslang-tests` linkt bewusst nur Backend und Foundation; `GuSDF.cpp` zöge
+AABB-Bäume, Winding Numbers und Mesh-Analyse mit sich. Das Fixture nimmt deshalb
+die P8.73–P8.80-Anordnung: **Kontrollfluss transkribiert, jede Primitive
+GERUFEN** — `Gu::SDF::decodeTriple`, `Gu::SDF::decodeSample`, `Gu::idx3D` und
+`Gu::DenseSDF::sampleSDFDirect` sind alle `PX_FORCE_INLINE` im Header.
+
+**Und der Spiegel wurde gegen das Original geprüft.** Ein Wegwerfprogramm, gegen
+`libphysx-sdk.a` gelinkt, hat genau diesen Spiegel gegen das echte
+`Gu::SDF::decodeSparse` laufen lassen, über dieselbe handgebaute SDF: **2457
+Feingitter-Samples, 6 residente und 24 grobe Zellen, 537 davon auf einem fernen
+Rand — null Abweichungen, schlechteste Differenz exakt 0.** Was hier transkribiert
+ist, ist einmal offline am Original gemessen worden statt behauptet. Das ist der
+Unterschied zwischen „wir haben es abgeschrieben" und „wir haben es abgeschrieben
+und dann nachgerechnet".
+
+Gemessen auf der GPU, gegen dieses Orakel:
+
+| Pfad | Samples | schlechteste Differenz |
+|---|---|---|
+| resident (8-Bit-Subgrid) | 468 | **exakt 0** |
+| grober Rückfall (FLOAT, interpoliert) | 1989 | 1,19e-07 |
+| dicht, Texelzentren | 315 | **bitgenau** |
+
+Die Adressierung stimmt also auf beiden Zweigen exakt.
+
+### DIE SECHSTE PLATTFORMREGEL: `~<n>UL` ist keine 64-Bit-Komplementierung
+
+Der Blob-Lauf endet mit einer 16-Byte-Ausrichtung, geschrieben als
+`p = (p + 15UL) & ~15UL`. Das **fehlkompiliert**: slangc wertet die
+Komplementierung in **32 Bit** aus und erweitert mit Nullen, die Konstante ist
+also `OpConstant %ulong 4294967280` = `0x00000000FFFFFFF0` — und das UND
+**löscht die obere Hälfte jeder Geräteadresse**. Symptom: Segfault auf einem
+llvmpipe-Arbeitsthread, Rückverfolgung nur `?? ()`, und **keinerlei Ausgabe**,
+weil stdout blockgepuffert ist und beim Fault verlorengeht.
+
+Gemessen, alle drei Schreibweisen:
+
+| Schreibweise | kompilierte Konstante | |
+|---|---|---|
+| `& ~15UL` | `0x00000000FFFFFFF0` | **kaputt** |
+| `& ~uint64_t(15)` | `0xFFFFFFFFFFFFFFF0` | richtig |
+| `& ~15ull` | `0xFFFFFFFFFFFFFFF0` | richtig |
+
+**Der Port ist da schon einmal hineingelaufen**: `femClothStepBda.slang:144-150`
+trägt die Regel als lokalen Kommentar. Sie stand aber nur dort — in einem
+Shader-Kommentar, den niemand ein zweites Mal findet. Der Korpus wurde jetzt
+geprüft: `npCvxPlaneNphase.slang:159` (`~3ull`) und `femClothStepBda.slang:150`
+(`~uint64_t(3)`) kompilieren beide korrekt; **kein weiterer Treffer**. Die Regel
+steht jetzt im neuen Modul UND hier.
+
+### Eine Build-Lücke, die P9.12a eingebaut hat, geschlossen
+
+Beim Verfolgen des Segfaults kam heraus, dass die Korrektur gar nicht wirksam
+wurde: **`pxgSlangTex3d.slang` und `pxgSlangSdfTexture.slang` fehlten in
+`SHADER_COMMON_DEPS`**, also löst eine Änderung am Modul keinen Neubau seiner
+Importeure aus. Ein inkrementeller Build hätte still gegen ein altes `.spv`
+gemessen. (Der Sweep war nie betroffen — sein `rm -f $SPV` plus Vollneubau
+erzwingt das ohnehin; genau dafür existiert er.) Beide sind jetzt eingetragen.
+Preis: jeder Shader hängt nun an ihnen, ein Sweep über ein solches Modul baut
+also den ganzen Shader-Korpus pro Mutant neu — dieselbe Kostenstruktur wie bei
+jedem anderen gemeinsamen Modul.
+
+### Zwei Fixture-Löcher, beide numerisch nachgewiesen statt geraten
+
+Der erste Sweep meldete 34/38 mit drei Überlebenden. Zwei davon waren
+Fixture-Schwächen und ihre Diagnose ist lehrreicher als die Behebung:
+
+1. **`b4-accum-no-plus-1` (`accumulatedTrianglesRef[numVerts+1]` → `[numVerts]`,
+   ein VIER-Byte-Fehler) überlebte, weil die 16-Byte-Ausrichtung ihn schluckte.**
+   Aufrunden absorbiert jeden Schrittfehler, der keine 16er-Grenze nach unten
+   überschreitet. Die Blobgröße vor der Ausrichtung ist
+   `20 + 1168·N + 20·V + 48·T`; da 1168 und 48 durch 16 teilbar sind, ist sie
+   `≡ 4·(1+V) mod 16`. Nachgerechnet: mit V=13 (3624→3632) **und ebenso mit
+   V=15** (3664→3664) bleibt der Fehler verborgen — die naheliegende „mach die
+   Größe exakt ausgerichtet"-Korrektur hätte **nicht** geholfen. Sichtbar wird er
+   nur, wenn die echte Größe 1–4 Byte **hinter** einer Grenze liegt, also
+   `V ≡ 0 mod 4`. Jetzt V=16, T=21, N=3 → 4852, das sind 4 über der Grenze: der
+   Vier-Byte-Fehler landet auf 4848 statt 4864 und stirbt (KILLED-FAULT), während
+   12 Byte Füllung die Ausrichtung selbst weiter prüfen.
+2. **`t12c-idx-wh-swapped` überlebte, weil ALLE residenten Zellen `y == 0` hatten.**
+   Der Startslot-Index ist `z·w·h + y·w + x`; ein Vertauschen von `w` und `h`
+   lässt den z-Term unberührt (`w·h = h·w`) und ändert nur `y·w` zu `y·h` — bei
+   `y == 0` ist beides null. Die fünf residenten Zellen 1, 7, 12, 19, 25 haben
+   alle y=0. Jetzt sind es sechs Zellen, **drei davon mit y == 1**.
+
+Die dritte Nicht-Tötung war ein **Anchor-Fail** (`t6`): der Ankertext kam zweimal
+vor, weil dichter Zweig und grober Rückfall dieselbe Zeile schreiben. Neu
+verankert, nicht als Kill gezählt — die Sweep-Hygiene aus P8.73.
+
+**Sweep nach den Korrekturen: 38 Mutanten — 29 KILLED, 8 KILLED-FAULT (zusammen
+37 Kills), 1 SURVIVED, 0 nocompile, 0 anchor-fail.** Kein vorher toter Mutant ist
+zurückgekommen.
+
+**Der eine Überlebende, `t9-local-clamp-to-sg`, ist eine bewiesene Äquivalenz.**
+Die lokale Koordinate ist `v = f.x − xBase·sg` mit
+`xBase = clamp(⌊f.x/sg⌋, 0, nbx−1)`. Für jedes legale `f.x ≤ dx = nbx·sg` gilt
+`v ≤ dx − (nbx−1)·sg = sg`. Die Klemme der CUDA auf `sg+1` liegt also **eine
+Stufe über dem Erreichbaren**, und `clamp(v, 0, sg)` und `clamp(v, 0, sg+1)`
+unterscheiden sich nur für `v > sg`. Das ist keine Nachlässigkeit der CUDA,
+sondern die Blockhöhe (`sg+1` Samples pro Achse) als Schranke geschrieben; der
+Port übernimmt sie wörtlich, und der Mutant bleibt eine Äquivalenz.
+
+### Was das Fixture sonst noch festnagelt
+
+* **Der Blob-Lauf** geht drei Abschnitte weiter, als dieser Port je gelesen hat —
+  `faceRemap`, `accumulatedTrianglesRef` (`numVerts+1` Einträge, nicht `numVerts`)
+  und `trianglesReferences` (`3·numTris`). Jede vorherige Zählung muss stimmen,
+  damit die SDF überhaupt gefunden wird; die übersprungenen Abschnitte sind mit
+  einem erkennbaren Muster gefüllt statt mit Nullen, damit ein falscher Schritt
+  auf Müll landet und nicht auf etwas Plausiblem. Die schärfste Einzelprüfung ist
+  `subgridStarts[0]`, gelesen durch den dekodierten Zeiger.
+* **`sdfDims.w` ist keine Dimension**, sondern
+  `getPreferSDFProjection() ? 1 : 0` (`PxgGeometryManager.cpp:611`). Wer sie in
+  `numSdfs = x·y·z` einmultipliziert, meldet für jedes Mesh mit Flag 0 „keine
+  SDF" — `b9` stirbt daran.
+* **Der Rand `margin` ist asymmetrisch**: 0,5 für dicht, 0,0 für sparse
+  (`sdfCollision.cuh:70`), und er verschiebt **beide** Enden der Box. Drei
+  Mutanten (`t1`, `t1b`, `t1c`) decken das ab.
+* **`fineToCoarse = 1/subgridSize` ist NICHT durch `PxMax` geschützt** (anders als
+  `coarseSize`), ist auf dem dichten Pfad also `+inf`. Harmlos, weil der dichte
+  Zweig sie nie liest — das Fixture nagelt das `+inf` trotzdem fest, denn ein
+  Port, der es „repariert", ist von der CUDA abgewichen, auch wenn nichts es liest.
+* **Die beiden `CUtexObject` liegen IM Geräte-Blob** (`triangleMesh.cuh:184-187`),
+  weshalb P9.12a das Handle zu einer kleinen ganzen Zahl machen musste. Auf dem
+  dichten Pfad schreibt die Engine das Subgrid-Wort **nie** — das Fixture legt
+  dort einen erkennbaren Wert ab und verlangt ihn zurück, statt so zu tun, als
+  würde die Engine ihn nullen.
+
+**UPSTREAM-KANDIDAT 25 — LATENT, dokumentiert und NICHT gemeldet.**
+`coarseSize.x - 1u` als obere Klemmschranke ist eine **vorzeichenlose**
+Dekrementierung von `sdfDims.x / subgridSize`. Eine gekochte SDF, deren
+Feindimension kleiner als ihre Subgridgröße ist, ergibt `coarseSize = 0`, die
+Schranke läuft auf `0xFFFFFFFF` über, und `xBase` indexiert `subgridStartSlots`
+außerhalb. Über die öffentliche Koch-API soweit erkennbar nicht erreichbar. Wie
+die vierundzwanzig davor: aufgeschrieben, nicht gemeldet.
+
+Suite **805/805** grün in beiden Speichermodi. Manifest unverändert bei **341**:
+auch diese Tranche mappt keinen Kernel, sie legt die Schicht darunter.
+
+**Als Nächstes** P9.12d: `PxSdfDistance`, `PxVolumeGrad`, `PxSdfSampleWithGrad`
+und `doVertexSDFCollision` — die vier Funktionen über dieser Schicht. Eine Falle
+ist dort schon gelesen: `doVertexSDFCollision` prüft
+`sdfGradient.normalize() == 0.0f` — `PxVec3::normalize()` normalisiert **an Ort
+und Stelle** und gibt die **Länge** zurück, und im Nullfall wird ein
+**fest verdrahteter** Einheitsvektor `(0,5448762, 0,672269, 0,398825)` eingesetzt
+(nach `getNormalized()`, denn er ist selbst nur ~0,95 lang). Ein Port, der daraus
+`normalize(g)` macht, liefert an genau den Konfigurationen NaN, die der Kommentar
+der CUDA nennt: dem exakten Mittelpunkt eines Würfels.
 
 ## P9.12a/b — der CUtexObject-Ersatz: bindlose 3D-Texturen und der SDF-Upload-Pfad, und warum P9.12 nicht mit dem Kernel anfängt
 
