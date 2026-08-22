@@ -13,6 +13,14 @@
 #     the rule lived in a note and not in a tool.  The signature was 146 deterministic
 #     mismatches from `r26-system-from-gridY`, whose .spv was still on disk.
 #
+# A SECOND way a sweep stops measuring, added in P9.10: a mutant can HANG rather than
+# fail or crash.  `t3-child-shift-12` on the particle mesh midphase makes a BV32 child
+# offset point back at an ancestor, so the traversal becomes cyclic and the test spins
+# forever -- it sat there 37 minutes before anyone looked.  A hang is a kill (the
+# mutant plainly changed behaviour) but it has to be CLASSIFIED, not allowed to wedge
+# the run, so every suite invocation is now bounded by MUTATION_SWEEP_TIMEOUT seconds
+# and a mutant that reaches it is reported as KILLED-HANG.
+#
 # So this runner guarantees the invariant instead of relying on discipline:
 #   1. it snapshots the pristine source once;
 #   2. it restores source AND rebuilds the .spv after every mutant;
@@ -28,8 +36,12 @@
 # Use \n in old/new for newlines.  Anchors must be UNIQUE in the source; a non-unique
 # or missing anchor is reported as ANCHOR-FAIL and counted as untested, never as a kill.
 #
-# Reported per mutant: KILLED (test failed), KILLED-FAULT (test crashed -- also a kill,
-# counted separately), SURVIVED, NOCOMPILE (not a kill), ANCHOR-FAIL (not a kill).
+# Reported per mutant: KILLED (test failed), KILLED-FAULT (test crashed), KILLED-HANG
+# (test exceeded MUTATION_SWEEP_TIMEOUT, default 300s) -- all three are kills, counted
+# separately -- plus SURVIVED, NOCOMPILE (not a kill) and ANCHOR-FAIL (not a kill).
+#
+# The BASELINE run is bounded by the same timeout: if the clean suite cannot finish
+# inside it, every mutant would be reported as a hang, so that is refused up front.
 
 set -u
 
@@ -61,10 +73,23 @@ restore() { cp "$BAK" "$SRC"; rebuild; }
 # is left with the pristine source AND a .spv built from it.
 trap 'echo; echo "!! interrupted -- restoring pristine source and .spv"; restore; rm -f "$BAK"; exit 130' INT TERM
 
-run_suite() { ( cd "$BUILD" && PXG_SHADER_DIR="$BUILD/shaders" ./gpuslang-tests "$SUITE" 2>&1 ); }
+# Seconds any single suite run may take.  Generous by default -- it is a backstop
+# against a mutant that never terminates, not a performance budget.
+: "${MUTATION_SWEEP_TIMEOUT:=300}"
+TIMEOUT_RC=124   # what GNU coreutils `timeout` exits with when it fires
+
+run_suite() {
+    ( cd "$BUILD" && PXG_SHADER_DIR="$BUILD/shaders" \
+        timeout -k 10 "$MUTATION_SWEEP_TIMEOUT" ./gpuslang-tests "$SUITE" 2>&1 )
+}
 
 baseline_ok() {
-    out=$(run_suite)
+    out=$(run_suite); brc=$?
+    if [ $brc -eq $TIMEOUT_RC ]; then
+        echo "!! the CLEAN suite exceeded MUTATION_SWEEP_TIMEOUT=${MUTATION_SWEEP_TIMEOUT}s;" >&2
+        echo "   raise it or every mutant will be reported as a hang" >&2
+        return 1
+    fi
     echo "$out" | grep -q "0 failed" && echo "$out" | grep -q "test(s) ran"
 }
 
@@ -76,7 +101,7 @@ if ! baseline_ok; then
 fi
 echo "baseline green; sweeping $STEM against suite '$SUITE'"
 
-killed=0; faulted=0; survived=0; nocompile=0; anchorfail=0
+killed=0; faulted=0; hung=0; survived=0; nocompile=0; anchorfail=0
 
 while IFS='	' read -r name old new; do
     [ -z "${name:-}" ] && continue
@@ -102,7 +127,9 @@ PY
     fi
 
     out=$(run_suite); rc=$?
-    if [ $rc -ge 128 ] || ! echo "$out" | grep -q "test(s) ran"; then
+    if [ $rc -eq $TIMEOUT_RC ]; then
+        echo "KILLED-HANG   $name   (exceeded ${MUTATION_SWEEP_TIMEOUT}s)"; hung=$((hung+1))
+    elif [ $rc -ge 128 ] || ! echo "$out" | grep -q "test(s) ran"; then
         echo "KILLED-FAULT  $name   (crashed: rc=$rc)"; faulted=$((faulted+1))
     elif echo "$out" | grep -q "0 failed"; then
         echo "SURVIVED      $name"; survived=$((survived+1))
@@ -112,8 +139,8 @@ PY
 done < "$MUTANTS"
 
 restore
-total=$((killed+faulted+survived+nocompile+anchorfail))
-echo "=== sweep: $total mutants -- $killed killed, $faulted killed-by-fault, $survived SURVIVED, $nocompile nocompile, $anchorfail anchor-fail ==="
+total=$((killed+faulted+hung+survived+nocompile+anchorfail))
+echo "=== sweep: $total mutants -- $killed killed, $faulted killed-by-fault, $hung killed-by-hang, $survived SURVIVED, $nocompile nocompile, $anchorfail anchor-fail ==="
 
 if ! baseline_ok; then
     echo "!! BASELINE IS RED after the restore -- the tree is NOT clean, do not trust the run"
