@@ -224,10 +224,24 @@ static uint32_t buildNode(std::vector<Bv32NodeHost>& nodes, const std::vector<AA
     nodes.push_back(Bv32NodeHost());
     std::memset(&nodes.back(), 0, sizeof(Bv32NodeHost));
     const uint32_t count = end - begin;
-    const uint32_t nbChunks = std::min<uint32_t>(2 + rng() % 5, count);
     std::vector<uint32_t> cuts = { begin, end };
-    while (cuts.size() < nbChunks + 1)
-        cuts.push_back(begin + 1 + rng() % (count - 1));
+    if (depth == 0)
+    {
+        // The ROOT is deliberately WIDE -- evenly spaced so the slot count is
+        // guaranteed, not merely likely.  A BV32 node holds up to 32 children and
+        // the leaf offset is `(nodeIndex >> 1) & 31`; with the 2..6 children a
+        // random split gives, slot indices never exceed 5 and a mutant that masks
+        // with 15 instead of 31 is an identity.  It is not, here.
+        const uint32_t wide = std::min<uint32_t>(26u, count);
+        for (uint32_t i = 1; i < wide; ++i)
+            cuts.push_back(begin + uint32_t(uint64_t(count) * i / wide));
+    }
+    else
+    {
+        const uint32_t nbChunks = std::min<uint32_t>(2 + rng() % 5, count);
+        while (cuts.size() < nbChunks + 1)
+            cuts.push_back(begin + 1 + rng() % (count - 1));
+    }
     std::sort(cuts.begin(), cuts.end());
     cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
     uint32_t slot = 0;
@@ -288,6 +302,12 @@ static void buildScene(Scene& S)
             const V3 cn = cross3(e0, e1);
             if (std::sqrt(dot3(cn, cn)) > l1n(e0) * l1n(e1) / 3.0f) break;
         }
+        // Every 37th triangle is an EXACT DUPLICATE of its predecessor.  Duplicates
+        // give a particle two bit-identical contact depths, which is the only way a
+        // fixture can reach the tie the worst-contact replacement's argmax breaks --
+        // random float geometry never produces one.
+        if (t > 0 && (t % 37u) == 5u)
+            for (int k = 0; k < 3; ++k) S.verts[t * 3 + k] = S.verts[(t - 1) * 3 + k];
         S.tris[t] = { t * 3, t * 3 + 1, t * 3 + 2, 0 };
         AABB bb = { { 1e30f, 1e30f, 1e30f }, { -1e30f, -1e30f, -1e30f } };
         for (int k = 0; k < 3; ++k)
@@ -343,29 +363,47 @@ static void buildScene(Scene& S)
     S.cdTri = 0.13f;
     S.cdPs = 0.09f;
     const float cd = S.cdTri + S.cdPs;
-    S.mesh.scale = { 1.1f, -0.9f, 1.05f, cd };
-    S.mesh.scaleRot = { 0, 0, 0, 1 };
+    // STRONGLY anisotropic, and in a ROTATED scale frame.  With a near-uniform
+    // scale, shape space and vertex space are nearly the same place and a mutant
+    // that swaps shape2Vertex for vertex2Shape in the box-culling setup culls the
+    // same nodes; at 2.4 / 0.55 / 1.35 in a tilted frame it does not.
+    S.mesh.scale = { 2.4f, -0.55f, 1.35f, cd };
+    {
+        F4 q = { 0.31f, 0.17f, -0.24f, 1.0f };
+        const float m = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+        S.mesh.scaleRot = { q.x / m, q.y / m, q.z / m, q.w / m };
+    }
     S.mesh.misc = { 0.03f, 0, 0, 0 };            // restDist
     S.mesh.rigid = { PX_INVALID_NODE, 0u, 0, 0 };  // STATIC by default
 
     // The densest spot, so some particles overflow the six-slot list and drive the
     // serialized worst-contact replacement (M6).
+    //
+    // Density is measured in SHAPE space and against the CONTACT DISTANCE, not in
+    // vertex space against a fixed radius.  With a strongly anisotropic scale the
+    // two are not the same question: a vertex-space cluster of radius 0.35 spreads
+    // to 0.84 in shape space at scale 2.4, so triangles that look clustered are far
+    // apart where the contact test actually happens -- and no particle saturates.
+    // The first version of this fixture measured it in vertex space and stopped
+    // producing overflow the moment the scale was made anisotropic.
+    std::vector<V3> shapeCentroid(Scene::NR);
+    for (uint32_t t = 0; t < Scene::NR; ++t)
+    {
+        V3 tc = { 0, 0, 0 };
+        for (int k = 0; k < 3; ++k) tc = add(tc, v3(S.verts[S.tris[t].x + k]));
+        shapeCentroid[t] = hVertex2Shape(muls(tc, 1.0f / 3.0f), v3(S.mesh.scale), S.mesh.scaleRot);
+    }
     uint32_t denseTri = 0;
     {
+        const float r = 1.5f * cd;
         size_t bestCnt = 0;
         for (uint32_t t = 0; t < Scene::NR; ++t)
         {
-            V3 tc = { 0, 0, 0 };
-            for (int k = 0; k < 3; ++k) tc = add(tc, v3(S.verts[S.tris[t].x + k]));
-            tc = muls(tc, 1.0f / 3.0f);
             size_t cnt = 0;
             for (uint32_t u = 0; u < Scene::NR; ++u)
             {
-                V3 uc = { 0, 0, 0 };
-                for (int k = 0; k < 3; ++k) uc = add(uc, v3(S.verts[S.tris[u].x + k]));
-                uc = muls(uc, 1.0f / 3.0f);
-                const V3 d = sub(uc, tc);
-                if (dot3(d, d) < 0.35f * 0.35f) ++cnt;
+                const V3 d = sub(shapeCentroid[u], shapeCentroid[t]);
+                if (dot3(d, d) < r * r) ++cnt;
             }
             if (cnt > bestCnt) { bestCnt = cnt; denseTri = t; }
         }
@@ -376,16 +414,22 @@ static void buildScene(Scene& S)
     S.predPos.assign(S.nppad, { 100, 100, 100, 1 });
     for (uint32_t p = 0; p < Scene::NP; ++p)
     {
-        const uint32_t t = (p % 5 == 2) ? denseTri : (p * 29) % Scene::NR;
-        V3 tc = { 0, 0, 0 };
-        for (int k = 0; k < 3; ++k) tc = add(tc, v3(S.verts[S.tris[t].x + k]));
-        tc = muls(tc, 1.0f / 3.0f);
-        const V3 sp = hVertex2Shape(tc, v3(S.mesh.scale), S.mesh.scaleRot);
+        // Every third particle sits in the densest cluster, so more of them
+        // overflow the six-slot list and the replacement pass sees candidates at
+        // widely different depths -- including candidates WORSE than all six
+        // already stored, which is the only case where the swap's comparison
+        // direction is observable.
+        const uint32_t t = (p % 3 == 2) ? denseTri : (p * 29) % Scene::NR;
+        const V3 sp = shapeCentroid[t];
         const V3 wp = add(hQuatRotate(S.mesh.meshQ, sp), v3(S.mesh.meshP));
         V3 dir = { uv(rng), uv(rng), uv(rng) };
         const float m = std::sqrt(std::max(dot3(dir, dir), 1e-3f));
         dir = muls(dir, 1.0f / m);
-        const float off = (p % 5 == 2) ? 0.02f + 0.13f * u01(rng)
+        // The dense particles sit INSIDE the contact band (offsets are world units
+        // and the band is contactDist), so many of the clustered triangles qualify
+        // at once and the six-slot list overflows; the rest are spread so that most
+        // particles find a handful and some find none.
+        const float off = (p % 3 == 2) ? cd * (0.05f + 0.85f * u01(rng))
                           : (p % 4 == 0) ? 0.9f * u01(rng) : 0.25f * u01(rng);
         const V3 c = add(wp, muls(dir, off));
         S.curPos[p] = { c.x, c.y, c.z, 1 };
@@ -403,6 +447,7 @@ struct BdaRig
     DevBuf bBlob, bCin, bShapes, bTc, bCd, bRd, bRemap, bDesc;
     DevBuf bCur, bPred, bS2U, bRunsum, bSimBuf;
     DevBuf bInfos, bNodeIdx, bCounts;
+    DevBuf bDiffInfos, bDiffNodeIdx, bDiffCounts, bNumDiffuse, bDiffCur, bDiffPred;
     DevBuf bContacts, bCount, bSbP, bTbP, bIbP, bBr, bTbr, bIbr;
     PsMeshMidBlob blob{};
 
@@ -428,6 +473,10 @@ static const uint32_t TRI_SHAPE = 2u, PS_SHAPE = 4u;
 static const uint32_t TRI_CACHE = 3u, PS_CACHE = 6u;
 static const uint32_t NB_SHAPES = 7u, NB_CACHE = 9u, NB_CM = 3u;
 static const uint32_t CM_IDX = 0u;
+// The runsum boundary between the two particle buffers.  Filter pairs live in
+// buffer 1, so a query that forgets to subtract the runsum looks in the wrong
+// place -- see the note in buildBda.
+static const uint32_t FILTER_BUFFER_BASE = 40u;
 
 struct BdaOptions
 {
@@ -437,7 +486,35 @@ struct BdaOptions
     bool isTgs = true;
     uint32_t nbFilterPairs = 0u;
     std::vector<PxgRigidFilterPair> filterPairs;
+    // M1: when non-zero the descriptor gets a full diffuse side, so a gridDim.z of
+    // 2 runs a real second pass instead of returning early.
+    uint32_t maxDiffuse = 0u;
+    // The diffuse pass's own positions and count.  They must NOT be the solid ones:
+    // aliasing them makes "read the diffuse array" and "read the solid array"
+    // indistinguishable, which is exactly how m1d and m1e survived the first sweep.
+    const std::vector<F4>* diffuseCur = nullptr;
+    const std::vector<F4>* diffusePred = nullptr;
+    uint32_t numDiffuse = 0u;
+    // A positive scale determinant, so MeshScaling::flipNormal is FALSE and the
+    // V1/V2 swap is under test in both directions.
+    bool positiveDet = false;
+    // The writer's capacity.  Small enough and writeContact's own bound binds.
+    uint32_t maxContacts = Scene::CAP;
+    // Override the solid particle count and positions (used to build the PGS
+    // reference the diffuse pass is compared against).
+    const std::vector<F4>* solidCur = nullptr;
+    const std::vector<F4>* solidPred = nullptr;
+    uint32_t numSolid = Scene::NP;
 };
+
+// The mesh scale for a given variant.  ONE definition, used by both builders, so
+// the two rigs cannot drift apart.
+static F4 sceneScale(const Scene& S, bool positiveDet)
+{
+    F4 sc = S.mesh.scale;
+    if (positiveDet) sc.y = -sc.y;   // flips the determinant, keeps the magnitudes
+    return sc;
+}
 
 static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOptions& opt, BdaRig& R)
 {
@@ -466,8 +543,8 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     R.bBlob = R.mk(dev, blob);
 
     // ---- particle system ----
-    R.bCur = R.mk(dev, S.curPos);
-    R.bPred = R.mk(dev, S.predPos);
+    R.bCur = R.mk(dev, opt.solidCur ? *opt.solidCur : S.curPos);
+    R.bPred = R.mk(dev, opt.solidPred ? *opt.solidPred : S.predPos);
 
     // mSortedToUnsortedMapping: a real permutation-like map, distinct from identity
     // so a filter query built from the wrong array is visible.
@@ -475,15 +552,22 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     for (uint32_t i = 0; i < S.nppad; ++i) s2u[i] = (i * 37u + 11u) % Scene::NP;
     R.bS2U = R.mk(dev, s2u);
 
-    std::vector<uint32_t> runsum = { 0u };
+    // TWO particle buffers with a NON-ZERO runsum.  find() resolves the buffer by
+    // runsum and then queries with the LOCAL id (particleId - runsum[buffer]); with
+    // one buffer at runsum 0 that subtraction is an identity and a port that drops
+    // it cannot be caught -- which is how d2h survived the first sweep.  Every
+    // filter pair lives in buffer ONE.
+    std::vector<uint32_t> runsum = { 0u, FILTER_BUFFER_BASE };
     R.bRunsum = R.mk(dev, runsum);
 
     DevBuf bPairs;
     if (!opt.filterPairs.empty()) bPairs = R.mk(dev, opt.filterPairs);
-    std::vector<PxgParticleSimBuffer> simBuffers(1);
-    std::memset(simBuffers.data(), 0, sizeof(PxgParticleSimBuffer));
-    simBuffers[0].mNumFilterPairs = opt.nbFilterPairs;
-    simBuffers[0].mFilterPairs =
+    std::vector<PxgParticleSimBuffer> simBuffers(2);
+    std::memset(simBuffers.data(), 0, simBuffers.size() * sizeof(PxgParticleSimBuffer));
+    simBuffers[0].mNumFilterPairs = 0u;
+    simBuffers[0].mFilterPairs = nullptr;
+    simBuffers[1].mNumFilterPairs = opt.nbFilterPairs;
+    simBuffers[1].mFilterPairs =
         reinterpret_cast<PxParticleRigidFilterPair*>(size_t(bPairs.addr));
     R.bSimBuf = R.mk(dev, simBuffers);
 
@@ -501,9 +585,9 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     std::vector<PxgParticleSystem> descArr(Scene::SYS + 2u);
     std::memset(descArr.data(), 0xEE, descArr.size() * sizeof(PxgParticleSystem));
     PxgParticleSystem ps = makeZeroPs();
-    ps.mCommonData.mNumParticles = Scene::NP;
+    ps.mCommonData.mNumParticles = opt.numSolid;
     ps.mCommonData.mMaxParticles = S.nppad;
-    ps.mCommonData.mNumParticleBuffers = 1u;
+    ps.mCommonData.mNumParticleBuffers = 2u;
     ps.mCommonData.mMaxDiffuseParticles = 0u;   // M1: the diffuse pass returns early
     ps.mData.mFlags = opt.enableCcd ? PxU32(PxParticleFlag::eENABLE_SPECULATIVE_CCD) : 0u;
     ps.mSortedOriginPos_InvMass = reinterpret_cast<float4*>(size_t(R.bCur.addr));
@@ -514,6 +598,34 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     ps.mOneWayContactInfos = reinterpret_cast<PxgParticleContactInfo*>(size_t(R.bInfos.addr));
     ps.mOneWayNodeIndex = reinterpret_cast<PxNodeIndex*>(size_t(R.bNodeIdx.addr));
     ps.mOneWayContactCount = reinterpret_cast<PxU32*>(size_t(R.bCounts.addr));
+    // M1's other half.  The diffuse pass reads its OWN position arrays, its own
+    // particle count (through a pointer, not a field) and its own six one-way
+    // pointers.  Here the diffuse positions ALIAS the solid ones and the count is
+    // the same, so with CCD off the two passes must compute identical geometry and
+    // the diffuse output can be compared against the solid output byte for byte --
+    // which pins all eight selections at once without a second reference.
+    if (opt.maxDiffuse != 0u)
+    {
+        std::vector<F4> dInfos(size_t(S.nppad) * MAXPART, { -9, -9, -9, -9 });
+        std::vector<uint32_t> dNodeIdx(size_t(S.nppad) * MAXPART * 2u, 0xCCCCCCCCu);
+        std::vector<uint32_t> dCounts(S.nppad, 0u);
+        std::vector<uint32_t> nDiff = { opt.numDiffuse };
+        R.bDiffInfos = R.mk(dev, dInfos);
+        R.bDiffNodeIdx = R.mk(dev, dNodeIdx);
+        R.bDiffCounts = R.mk(dev, dCounts);
+        R.bNumDiffuse = R.mk(dev, nDiff);
+        ps.mCommonData.mMaxDiffuseParticles = opt.maxDiffuse;
+        // The engine declares this one as int*, not PxU32*; the shader reads the
+        // same bits as a uint, which is correct for any non-negative count.
+        ps.mNumDiffuseParticles = reinterpret_cast<int*>(size_t(R.bNumDiffuse.addr));
+        R.bDiffCur = R.mk(dev, opt.diffuseCur ? *opt.diffuseCur : S.curPos);
+        R.bDiffPred = R.mk(dev, opt.diffusePred ? *opt.diffusePred : S.predPos);
+        ps.mDiffuseSortedOriginPos_LifeTime = reinterpret_cast<float4*>(size_t(R.bDiffCur.addr));
+        ps.mDiffuseSortedPos_LifeTime = reinterpret_cast<float4*>(size_t(R.bDiffPred.addr));
+        ps.mDiffuseOneWayContactInfos = reinterpret_cast<PxgParticleContactInfo*>(size_t(R.bDiffInfos.addr));
+        ps.mDiffuseOneWayNodeIndex = reinterpret_cast<PxNodeIndex*>(size_t(R.bDiffNodeIdx.addr));
+        ps.mDiffuseOneWayContactCount = reinterpret_cast<PxU32*>(size_t(R.bDiffCounts.addr));
+    }
     descArr[Scene::SYS] = ps;
     R.bDesc = R.mk(dev, descArr);
 
@@ -547,9 +659,12 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
         shapes[i].scale = PxMeshScale(PxVec3(2.5f, 2.5f, 2.5f), PxQuat(PxIdentity));
     }
     shapes[TRI_SHAPE].type = PxU32(PxGeometryType::eTRIANGLEMESH);
-    shapes[TRI_SHAPE].scale = PxMeshScale(PxVec3(S.mesh.scale.x, S.mesh.scale.y, S.mesh.scale.z),
-                                          PxQuat(S.mesh.scaleRot.x, S.mesh.scaleRot.y,
-                                                 S.mesh.scaleRot.z, S.mesh.scaleRot.w));
+    {
+        const F4 sc = sceneScale(S, opt.positiveDet);
+        shapes[TRI_SHAPE].scale = PxMeshScale(PxVec3(sc.x, sc.y, sc.z),
+                                              PxQuat(S.mesh.scaleRot.x, S.mesh.scaleRot.y,
+                                                     S.mesh.scaleRot.z, S.mesh.scaleRot.w));
+    }
     shapes[TRI_SHAPE].hullOrMeshPtr = size_t(R.bBlob.addr);
     shapes[PS_SHAPE].type = PxU32(PxGeometryType::ePARTICLESYSTEM);
     shapes[PS_SHAPE].particleOrSoftbodyId = Scene::SYS;
@@ -607,7 +722,11 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     R.bTbr = R.mk(dev, tempByRigid);
     R.bIbr = R.mk(dev, idxByRigid);
 
-    R.blob.isTGS = opt.isTgs ? 1u : 0u;
+    // The CUDA bool occupies ONE BYTE at offset 0; the three bytes behind it are
+    // launch-blob padding holding whatever the launcher left.  Poisoning them is
+    // what makes the masked read observable -- a port that tests the whole word
+    // reads TRUE even when the byte says false.
+    R.blob.isTGS = 0xABABAB00u | (opt.isTgs ? 1u : 0u);
     // M2: never read.  A distinctive value, so a port that DOES read it is wrong
     // by a large margin rather than by a plausible one.
     R.blob.toleranceLength = -1234.5f;
@@ -626,7 +745,7 @@ static void buildBda(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     R.blob.w_contactByRigid = R.bBr.addr;
     R.blob.w_tempContactByRigid = R.bTbr.addr;
     R.blob.w_contactIndexSortedByRigid = R.bIbr.addr;
-    R.blob.w_maxContacts = Scene::CAP;
+    R.blob.w_maxContacts = opt.maxContacts;
 }
 
 // ---------------------------------------------------------------------------
@@ -661,6 +780,10 @@ struct RefRig
 static void buildRef(PxgSlangComputeDevice* dev, const Scene& S, const BdaOptions& opt, RefRig& R)
 {
     PmMesh mesh = S.mesh;
+    {
+        const F4 sc = sceneScale(S, opt.positiveDet);
+        mesh.scale.x = sc.x; mesh.scale.y = sc.y; mesh.scale.z = sc.z;
+    }
     if (!opt.staticRigid)
     {
         const PxNodeIndex ni(0x77u, 4u);
@@ -677,8 +800,8 @@ static void buildRef(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     R.bN = R.mk(dev, S.nodes);
     R.bT = R.mk(dev, S.tris);
     R.bV = R.mk(dev, S.verts);
-    R.bCur = R.mk(dev, S.curPos);
-    R.bPred = R.mk(dev, S.predPos);
+    R.bCur = R.mk(dev, opt.solidCur ? *opt.solidCur : S.curPos);
+    R.bPred = R.mk(dev, opt.solidPred ? *opt.solidPred : S.predPos);
 
     std::vector<F4> infos(size_t(S.nppad) * MAXPART, { -9, -9, -9, -9 });
     std::vector<uint32_t> nodeIdx(size_t(S.nppad) * MAXPART * 2u, 0xCCCCCCCCu);
@@ -701,8 +824,8 @@ static void buildRef(PxgSlangComputeDevice* dev, const Scene& S, const BdaOption
     R.bIBP = R.mk(dev, u32Poison);
     R.bWc = R.mk(dev, count);
 
-    R.prm.numParticles = Scene::NP;
-    R.prm.maxContacts = Scene::CAP;
+    R.prm.numParticles = opt.numSolid;
+    R.prm.maxContacts = opt.maxContacts;
     R.prm.flags = (opt.enableCcd ? 1u : 0u) | (opt.isTgs ? 2u : 0u) | (opt.staticRigid ? 8u : 0u);
     R.prm.particleSystemId = Scene::SYS;
 }
@@ -1074,6 +1197,118 @@ PXG_TEST(psMeshMidphase)
     }
 
     // ---------------------------------------------------------------
+    // Shape 3b: CCD OFF.  The non-CCD branch sets cVolumeRadius = contactDist
+    // DIRECTLY -- M3's point: no division by the smallest scale component, which
+    // is what the softbody twin does and what copying it would introduce.  Every
+    // other shape runs with CCD on, where that branch is dead.
+    // Shape 3c: PGS.  isTGS reaches the shader as ONE BYTE with three poisoned
+    // padding bytes behind it, so a full-word read sees TRUE where the byte says
+    // false, and the TGS/PGS projection scales differ (0.5 vs 1.0).
+    // Shape 3d: a POSITIVE scale determinant, so flipNormal is false and the
+    // V1/V2 swap is tested in its other direction.
+    // Shape 3e: a SMALL writer capacity, so writeContact's own bound binds.
+    // ---------------------------------------------------------------
+    {
+        struct Variant { const char* name; BdaOptions opt; };
+        std::vector<Variant> variants;
+        { BdaOptions o; o.enableCcd = false;  variants.push_back({ "ccd-off", o }); }
+        { BdaOptions o; o.isTgs = false;      variants.push_back({ "pgs", o }); }
+        { BdaOptions o; o.positiveDet = true; variants.push_back({ "positive-det", o }); }
+        { BdaOptions o; o.staticRigid = false; o.maxContacts = 24u;
+          variants.push_back({ "small-writer-cap", o }); }
+
+        for (const Variant& v : variants)
+        {
+            BdaRig A;
+            RefRig B;
+            buildBda(dev, S, v.opt, A);
+            buildRef(dev, S, v.opt, B);
+            {
+                Kernel k("psMeshMidphaseBda.spv", "ps_meshCollisonLaunch", {}, sizeof(PsMeshMidBlob));
+                k.dispatch(nbWarps, {}, A.blob, 1u, 1u);
+            }
+            {
+                Kernel k("psMeshMid.spv", "ctPsMeshMid", refStrides(), sizeof(PmParams));
+                k.dispatch(nbWarps, B.bindings(), B.prm);
+            }
+            dev->flush();
+
+            const auto aI = downloadBuffer<F4>(dev, A.bInfos.h, size_t(S.nppad) * MAXPART);
+            const auto bI = downloadBuffer<F4>(dev, B.bI, size_t(S.nppad) * MAXPART);
+            const auto aC = downloadBuffer<uint32_t>(dev, A.bCounts.h, S.nppad);
+            const auto bC = downloadBuffer<uint32_t>(dev, B.bC, S.nppad);
+            PXG_CHECK_MSG(std::memcmp(aC.data(), bC.data(), aC.size() * 4) == 0,
+                          "%s: the one-way COUNTS differ", v.name);
+            PXG_CHECK_MSG(std::memcmp(aI.data(), bI.data(), aI.size() * sizeof(F4)) == 0,
+                          "%s: the one-way CONTACT INFOS differ", v.name);
+
+            const uint32_t aW = downloadBuffer<uint32_t>(dev, A.bCount.h, 1)[0];
+            const uint32_t bW = downloadBuffer<uint32_t>(dev, B.bWc, 1)[0];
+            PXG_CHECK_MSG(aW == bW, "%s: writer counters differ (%u vs %u)", v.name, aW, bW);
+
+            if (!v.opt.staticRigid)
+            {
+                // The small-cap variant: the counter runs past the capacity while
+                // only the first maxContacts records may be written.  Everything
+                // beyond must still be poison in BOTH programs.
+                PXG_CHECK_MSG(aW > v.opt.maxContacts,
+                              "%s: the writer counter (%u) did not pass the capacity (%u), so "
+                              "writeContact's bound is not under test",
+                              v.name, aW, v.opt.maxContacts);
+                const auto aIdx = downloadBuffer<uint32_t>(dev, A.bIbP.h, Scene::CAP);
+                size_t past = 0;
+                for (uint32_t i = v.opt.maxContacts; i < Scene::CAP; ++i)
+                    if (aIdx[i] != POISON_U32) ++past;
+                PXG_CHECK_MSG(past == 0,
+                              "%s: %zu writer slots beyond maxContacts were written",
+                              v.name, past);
+            }
+            else
+            {
+                size_t live = 0;
+                for (uint32_t p = 0; p < Scene::NP; ++p) if (aC[p] != 0u) ++live;
+                PXG_CHECK_MSG(live >= 20, "%s: ran on an almost empty result (%zu)", v.name, live);
+            }
+            A.destroy(dev);
+            B.destroy(dev);
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Shape 3f: an OVER-SIZED grid.  The real launch is a FIXED 16384 blocks
+    // regardless of the particle count, so `workIndex < nbWarpsRequired` is crossed
+    // on almost every block of almost every frame -- while every other dispatch in
+    // this file sizes the grid exactly and never reaches the guard at all.  The
+    // result must be identical to the exactly-sized run.
+    // ---------------------------------------------------------------
+    {
+        BdaOptions o;
+        BdaRig A0, A1;
+        buildBda(dev, S, o, A0);
+        buildBda(dev, S, o, A1);
+        {
+            Kernel k("psMeshMidphaseBda.spv", "ps_meshCollisonLaunch", {}, sizeof(PsMeshMidBlob));
+            k.dispatch(nbWarps, {}, A0.blob, 1u, 1u);
+            k.dispatch(nbWarps + 37u, {}, A1.blob, 1u, 1u);
+        }
+        dev->flush();
+        const auto c0 = downloadBuffer<uint32_t>(dev, A0.bCounts.h, S.nppad);
+        const auto c1 = downloadBuffer<uint32_t>(dev, A1.bCounts.h, S.nppad);
+        const auto i0 = downloadBuffer<F4>(dev, A0.bInfos.h, size_t(S.nppad) * MAXPART);
+        const auto i1 = downloadBuffer<F4>(dev, A1.bInfos.h, size_t(S.nppad) * MAXPART);
+        PXG_CHECK_MSG(std::memcmp(c0.data(), c1.data(), c0.size() * 4) == 0,
+                      "an over-sized grid changed the one-way counts; blocks past "
+                      "nbWarpsRequired must do nothing");
+        PXG_CHECK_MSG(std::memcmp(i0.data(), i1.data(), i0.size() * sizeof(F4)) == 0,
+                      "an over-sized grid changed the one-way infos");
+        const uint32_t w0 = downloadBuffer<uint32_t>(dev, A0.bCount.h, 1)[0];
+        const uint32_t w1 = downloadBuffer<uint32_t>(dev, A1.bCount.h, 1)[0];
+        PXG_CHECK_MSG(w0 == w1, "an over-sized grid moved the writer counter (%u vs %u)", w0, w1);
+        A0.destroy(dev);
+        A1.destroy(dev);
+    }
+
+    // ---------------------------------------------------------------
     // Shape 4: LoadShapePair the other way round.  The trimesh moves to
     // shapeRef1, so the swap branch runs, and the result must be IDENTICAL.
     // ---------------------------------------------------------------
@@ -1103,6 +1338,203 @@ PXG_TEST(psMeshMidphase)
         A0.destroy(dev);
         A1.destroy(dev);
     }
+}
+
+// ===========================================================================
+// M1 -- the diffuse split.  gridDim.z == 2 is not a redundant dimension: z == 1 is
+// a SECOND, differently-sourced pass.  psMeshMid.slang has no diffuse side at all,
+// so the differential is blind to this and it needs its own test.
+// ===========================================================================
+PXG_TEST(psMeshMidphaseDiffuse)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    Scene S;
+    buildScene(S);
+    const uint32_t nbWarps = (Scene::NP + 31u) / 32u;
+
+    // CCD OFF for the whole test.  With CCD on the two passes would legitimately
+    // differ: getParticleSpeculativeContactVolume divides by
+    // PARTICLE_FORWARD_PROJECTION_STEP_SCALE_DIFFUSE (1.0) instead of the TGS scale
+    // (0.5), so the volume radius is not the same number.  With CCD off the radius
+    // is contactDist in both and the passes are comparable BIT FOR BIT.
+    BdaOptions opt;
+    opt.enableCcd = false;
+
+    // --- (a) mMaxDiffuseParticles == 0: the diffuse pass must return immediately,
+    //         and the solid pass must be unaffected by z having two slices.
+    BdaRig Z1, Z2;
+    opt.maxDiffuse = 0u;
+    buildBda(dev, S, opt, Z1);
+    buildBda(dev, S, opt, Z2);
+    {
+        Kernel k("psMeshMidphaseBda.spv", "ps_meshCollisonLaunch", {}, sizeof(PsMeshMidBlob));
+        k.dispatch(nbWarps, {}, Z1.blob, 1u, 1u);   // solid only
+        k.dispatch(nbWarps, {}, Z2.blob, 1u, 2u);   // solid + diffuse
+    }
+    dev->flush();
+    {
+        const auto c1 = downloadBuffer<uint32_t>(dev, Z1.bCounts.h, S.nppad);
+        const auto c2 = downloadBuffer<uint32_t>(dev, Z2.bCounts.h, S.nppad);
+        const auto i1 = downloadBuffer<F4>(dev, Z1.bInfos.h, size_t(S.nppad) * MAXPART);
+        const auto i2 = downloadBuffer<F4>(dev, Z2.bInfos.h, size_t(S.nppad) * MAXPART);
+        // This is the assertion that kills a port which ignores gridDim.z: it would
+        // run the SOLID pass twice and every count would double.
+        PXG_CHECK_MSG(std::memcmp(c1.data(), c2.data(), c1.size() * 4) == 0,
+                      "gridDim.z == 2 changed the solid one-way counts; the second z slice "
+                      "must be the diffuse pass, and with no diffuse particles it must "
+                      "return before touching anything");
+        PXG_CHECK_MSG(std::memcmp(i1.data(), i2.data(), i1.size() * sizeof(F4)) == 0,
+                      "gridDim.z == 2 changed the solid one-way infos");
+        size_t live = 0;
+        for (uint32_t p = 0; p < Scene::NP; ++p) if (c1[p] != 0u) ++live;
+        PXG_CHECK_MSG(live >= 20, "the diffuse test ran on an empty solid result");
+    }
+    Z1.destroy(dev);
+    Z2.destroy(dev);
+
+    // --- (b) a REAL diffuse side, with its OWN positions and its OWN count.
+    //
+    // Aliasing them onto the solid ones (which the first draft did) makes "read the
+    // diffuse array" and "read the solid array" indistinguishable, and the sweep
+    // said so: three mutants survived on it.  So the diffuse particles are a
+    // DIFFERENT set here and the count is DIFFERENT from the solid one, and the
+    // reference is a second BDA rig whose SOLID side carries exactly that set.
+    //
+    // That reference is dispatched as PGS, and the reason is M1's last unexercised
+    // clause: getParticleSpeculativeContactVolume takes the DIFFUSE projection
+    // scale for a diffuse thread whatever isTGS says, and the diffuse scale (1.0)
+    // is numerically the PGS scale.  So "diffuse under TGS" and "solid under PGS"
+    // must agree exactly -- and a port that hands the function `false` instead of
+    // `isDiffuse` picks the TGS scale and disagrees.  CCD is ON here, which is what
+    // makes any of that reachable.
+    const uint32_t ND = Scene::NP - 13u;   // distinct from NP, and not a multiple of 32
+    std::vector<F4> diffCur(S.nppad, { 100, 100, 100, 1 });
+    std::vector<F4> diffPred(S.nppad, { 100, 100, 100, 1 });
+    for (uint32_t i = 0; i < ND; ++i)
+    {
+        // A rotation of the solid set, so the two are genuinely different arrays
+        // with genuinely different contents at every index.
+        const uint32_t src = (i + 29u) % Scene::NP;
+        diffCur[i] = S.curPos[src];
+        diffPred[i] = S.predPos[src];
+    }
+
+    BdaOptions dOpt;                    // CCD ON, TGS, static
+    dOpt.maxDiffuse = Scene::NP;
+    dOpt.numDiffuse = ND;
+    dOpt.diffuseCur = &diffCur;
+    dOpt.diffusePred = &diffPred;
+
+    BdaOptions rOpt;                    // the reference: solid, PGS, same particles
+    rOpt.isTgs = false;
+    rOpt.solidCur = &diffCur;
+    rOpt.solidPred = &diffPred;
+    rOpt.numSolid = ND;
+
+    BdaRig D, Rf;
+    buildBda(dev, S, dOpt, D);
+    buildBda(dev, S, rOpt, Rf);
+    {
+        Kernel k("psMeshMidphaseBda.spv", "ps_meshCollisonLaunch", {}, sizeof(PsMeshMidBlob));
+        k.dispatch(nbWarps, {}, D.blob, 1u, 2u);
+        k.dispatch((ND + 31u) / 32u, {}, Rf.blob, 1u, 1u);
+    }
+    dev->flush();
+    {
+        const auto dc = downloadBuffer<uint32_t>(dev, D.bDiffCounts.h, S.nppad);
+        const auto rc = downloadBuffer<uint32_t>(dev, Rf.bCounts.h, S.nppad);
+        const auto di = downloadBuffer<F4>(dev, D.bDiffInfos.h, size_t(S.nppad) * MAXPART);
+        const auto ri = downloadBuffer<F4>(dev, Rf.bInfos.h, size_t(S.nppad) * MAXPART);
+        const auto dn = downloadBuffer<uint32_t>(dev, D.bDiffNodeIdx.h, size_t(S.nppad) * MAXPART * 2u);
+        const auto rn = downloadBuffer<uint32_t>(dev, Rf.bNodeIdx.h, size_t(S.nppad) * MAXPART * 2u);
+        size_t live = 0;
+        for (uint32_t p = 0; p < ND; ++p) if (dc[p] != 0u) ++live;
+        PXG_CHECK_MSG(live >= 20,
+                      "the diffuse pass produced almost nothing (%zu particles); it is not "
+                      "reading the diffuse positions or the diffuse count", live);
+        PXG_CHECK_MSG(std::memcmp(dc.data(), rc.data(), dc.size() * 4) == 0,
+                      "the diffuse pass's one-way COUNTS differ from the PGS solid reference");
+        PXG_CHECK_MSG(std::memcmp(di.data(), ri.data(), di.size() * sizeof(F4)) == 0,
+                      "the diffuse pass's one-way INFOS differ from the PGS solid reference");
+        PXG_CHECK_MSG(std::memcmp(dn.data(), rn.data(), dn.size() * 4) == 0,
+                      "the diffuse pass's one-way NODE INDICES differ from the PGS solid reference");
+        // The diffuse count really must be the one in use: everything from ND on
+        // stays untouched.
+        size_t pastEnd = 0;
+        for (uint32_t p = ND; p < S.nppad; ++p) if (dc[p] != 0u) ++pastEnd;
+        PXG_CHECK_MSG(pastEnd == 0,
+                      "%zu diffuse particles past *mNumDiffuseParticles were processed", pastEnd);
+        // M1's writer clause: both passes are static here, so nothing reaches it.
+        const uint32_t wc = downloadBuffer<uint32_t>(dev, D.bCount.h, 1)[0];
+        PXG_CHECK_MSG(wc == 0u, "the static diffuse run reached the writer (%u contacts)", wc);
+    }
+    D.destroy(dev);
+    Rf.destroy(dev);
+
+    // --- (c) a DYNAMIC rigid with a real diffuse side -- UPSTREAM CANDIDATE 19.
+    //
+    // M1 says the diffuse pass is suppressed AT THE WRITER, and it is: the
+    // writeContact loop is behind `!isDiffuseParticlesThread`
+    // (particleSystemMeshMidphase.cu:356).  But the RESERVATION above it is not:
+    //     if (idxInWarp == 31) startIndex = atomicAdd(writer.numTotalContacts, count);
+    // (:345) runs for the diffuse pass too.  So the diffuse pass advances the
+    // global contact counter by everything it found and then writes none of it,
+    // leaving HOLES in the primitive-contact array below a count that says they are
+    // contacts.  Downstream reads numTotalContacts records.
+    //
+    // This test asserts the FAITHFUL behaviour, not the sensible one -- which is
+    // what makes it a test rather than a fix.  Because the diffuse positions alias
+    // the solid ones here, the reservation is exactly as large as the solid pass's,
+    // so the counter must land on TWICE the solid-only figure while only the solid
+    // half of the slots is written.  A port that suppressed the atomicAdd as well
+    // dies on the count; a port that forgot to suppress writeContact dies on the
+    // hole count.
+    BdaRig Ds, Dd;
+    BdaOptions dyn;
+    dyn.enableCcd = false;
+    dyn.staticRigid = false;
+    dyn.maxDiffuse = 0u;
+    dyn.numDiffuse = Scene::NP;
+    buildBda(dev, S, dyn, Ds);          // solid only, no diffuse side
+    dyn.maxDiffuse = Scene::NP;
+    buildBda(dev, S, dyn, Dd);          // solid + a full diffuse side
+    {
+        Kernel k("psMeshMidphaseBda.spv", "ps_meshCollisonLaunch", {}, sizeof(PsMeshMidBlob));
+        k.dispatch(nbWarps, {}, Ds.blob, 1u, 1u);
+        k.dispatch(nbWarps, {}, Dd.blob, 1u, 2u);
+    }
+    dev->flush();
+    {
+        const uint32_t wSolid = downloadBuffer<uint32_t>(dev, Ds.bCount.h, 1)[0];
+        const uint32_t wBoth = downloadBuffer<uint32_t>(dev, Dd.bCount.h, 1)[0];
+        PXG_CHECK_MSG(wSolid > 0u, "the dynamic solid pass wrote nothing");
+        PXG_CHECK_MSG(wBoth == 2u * wSolid,
+                      "candidate 19: the counter should have reached 2 * %u (the diffuse pass "
+                      "reserves what it then declines to write), and reached %u",
+                      wSolid, wBoth);
+
+        // ...and exactly half the reserved slots must be untouched poison.
+        const auto idx = downloadBuffer<uint32_t>(dev, Dd.bIbP.h, Scene::CAP);
+        size_t holes = 0;
+        for (uint32_t i = 0; i < wBoth && i < Scene::CAP; ++i)
+            if (idx[i] == POISON_U32) ++holes;
+        PXG_CHECK_MSG(holes == wSolid,
+                      "candidate 19: %zu of the %u reserved writer slots are holes, expected %u",
+                      holes, wBoth, wSolid);
+
+        // The diffuse pass's own one-way arrays must stay empty under a dynamic
+        // rigid, or "suppressed at the writer" would be indistinguishable from
+        // "did not run at all".
+        const auto dc = downloadBuffer<uint32_t>(dev, Dd.bDiffCounts.h, S.nppad);
+        size_t live = 0;
+        for (uint32_t p = 0; p < Scene::NP; ++p) if (dc[p] != 0u) ++live;
+        PXG_CHECK_MSG(live == 0u,
+                      "%zu diffuse one-way counters were written under a DYNAMIC rigid; "
+                      "the one-way path is static-only for the diffuse pass too", live);
+    }
+    Ds.destroy(dev);
+    Dd.destroy(dev);
 }
 
 // ===========================================================================
@@ -1140,9 +1572,14 @@ PXG_TEST(psMeshMidphaseFilter)
 
     // Filter every third CONTACTING particle, so the filtered set is interesting
     // rather than a suffix, and so filtered and unfiltered lanes share warps.
+    // Only particles whose UNSORTED index lands in buffer ONE can be filtered, and
+    // that is deliberate: the filter list lives in buffer 1 at runsum
+    // FILTER_BUFFER_BASE, so the query has to resolve the buffer AND subtract the
+    // runsum to find them.
     std::vector<uint32_t> filteredSorted;
     for (uint32_t i = 0; i < Scene::NP; ++i)
-        if (baseCnt[i] != 0u && (i % 3u) == 1u) filteredSorted.push_back(i);
+        if (baseCnt[i] != 0u && (i % 3u) == 1u && s2u[i] >= FILTER_BUFFER_BASE)
+            filteredSorted.push_back(i);
     PXG_CHECK_MSG(filteredSorted.size() >= 5,
                   "only %zu particles to filter -- too few to say anything",
                   filteredSorted.size());
@@ -1167,7 +1604,9 @@ PXG_TEST(psMeshMidphaseFilter)
         PxgRigidFilterPair pr;
         std::memset(&pr, 0, sizeof(pr));
         pr.index0 = staticNode.getInd();
-        pr.index1 = s2u[i];      // the UNSORTED index, which is what find() compares
+        // The LOCAL id inside buffer 1: the unsorted index minus that buffer's
+        // runsum.  A port that queries with the unsorted index itself finds nothing.
+        pr.index1 = s2u[i] - FILTER_BUFFER_BASE;
         pr.index2 = 0u;
         filt.filterPairs.push_back(pr);
     }
@@ -1226,6 +1665,47 @@ PXG_TEST(psMeshMidphaseFilter)
     PXG_CHECK_MSG(removed >= 5, "the filter removed only %zu particles' contacts", removed);
 
     Bf.destroy(dev);
+
+    // The filter is guarded by `!isDiffuse` (particleSystemMeshMidphase.cu:717), so
+    // the DIFFUSE pass ignores the list entirely.  Run the same filter list with a
+    // real diffuse side aliased onto the solid particles and require the diffuse
+    // one-way output to match the UNFILTERED baseline, not the filtered one.
+    {
+        BdaOptions df = filt;
+        df.enableCcd = false;          // the diffuse projection scale is then irrelevant
+        df.maxDiffuse = Scene::NP;
+        df.numDiffuse = Scene::NP;     // aliased positions: the same particles, undiffused
+        BdaRig Dg, Bg;
+        BdaOptions bg;                 // the unfiltered, CCD-off solid baseline
+        bg.enableCcd = false;
+        buildBda(dev, S, df, Dg);
+        buildBda(dev, S, bg, Bg);
+        {
+            Kernel k("psMeshMidphaseBda.spv", "ps_meshCollisonLaunch", {}, sizeof(PsMeshMidBlob));
+            k.dispatch(nbWarps, {}, Dg.blob, 1u, 2u);
+            k.dispatch(nbWarps, {}, Bg.blob, 1u, 1u);
+        }
+        dev->flush();
+        const auto dgc = downloadBuffer<uint32_t>(dev, Dg.bDiffCounts.h, S.nppad);
+        const auto bgc = downloadBuffer<uint32_t>(dev, Bg.bCounts.h, S.nppad);
+        const auto dgi = downloadBuffer<F4>(dev, Dg.bDiffInfos.h, size_t(S.nppad) * MAXPART);
+        const auto bgi = downloadBuffer<F4>(dev, Bg.bInfos.h, size_t(S.nppad) * MAXPART);
+        PXG_CHECK_MSG(std::memcmp(dgc.data(), bgc.data(), dgc.size() * 4) == 0,
+                      "the DIFFUSE pass honoured the rigid filter; the CUDA guards find() "
+                      "with !isDiffuseParticlesThread");
+        PXG_CHECK_MSG(std::memcmp(dgi.data(), bgi.data(), dgi.size() * sizeof(F4)) == 0,
+                      "the DIFFUSE pass's one-way infos differ from the unfiltered baseline");
+        // ...and the SOLID half of the very same dispatch must still be filtered,
+        // or "ignored the list" would be indistinguishable from "there was no list".
+        const auto dgs = downloadBuffer<uint32_t>(dev, Dg.bCounts.h, S.nppad);
+        size_t stillFiltered = 0;
+        for (uint32_t i : filteredSorted) if (dgs[i] == 0u) ++stillFiltered;
+        PXG_CHECK_MSG(stillFiltered == filteredSorted.size(),
+                      "only %zu of %zu particles are filtered on the SOLID half of the "
+                      "diffuse dispatch", stillFiltered, filteredSorted.size());
+        Dg.destroy(dev);
+        Bg.destroy(dev);
+    }
 }
 
 // ===========================================================================
@@ -1309,6 +1789,10 @@ PXG_TEST(psMeshMidphaseWorkIndex)
     // nbIterationsPerWarps == 1: every real scene's shape, and the size at which
     // the `* nbIterationsPerWarps` factor is an IDENTITY and pins nothing.
     runCoverageCase(dev, 32u * 1000u + 7u, 1u);
+    // EXACTLY a multiple of 32.  `(n + 31) / 32` and `(n + 32) / 32` differ ONLY
+    // here, so without this size an off-by-one in the warp count is an identity --
+    // which is how w1 survived the first sweep.
+    runCoverageCase(dev, 32u * 1000u, 1u);
     // == 2 and == 3: the block stride is 2 and then 3 against a fixed iteration
     // stride of 1, so the factor is under test and an off-by-one in either the
     // warp count or the iteration count separates the covered SETS.

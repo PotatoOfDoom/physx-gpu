@@ -64,6 +64,8 @@
 //      *mNumDiffuseParticles, and is SUPPRESSED at the writer.  It also returns
 //      early when mMaxDiffuseParticles == 0.  A port that ignores gridDim.Z runs
 //      the solid pass twice and doubles every contact.
+//      NOTE that "suppressed at the writer" means the writeContact LOOP only --
+//      see CANDIDATE 19 below, which is where the suppression stops.
 //  M2. `toleranceLength` is an ARGUMENT AND IS NEVER USED by this kernel body.
 //      It is in the signature (and therefore in the ABI blob) and read by the SDF
 //      twin only.  Transcribed as an unused field rather than dropped, because
@@ -136,6 +138,32 @@
 //      return -- it stays out for ALL REMAINING iterations, not just the current
 //      one.  That reproduces the return's effect on the lane's own coverage while
 //      leaving the collective operations well-formed.
+//
+// ---------------------------------------------------------------------------
+// A THIRD UPSTREAM CANDIDATE, TRANSCRIBED AND NOT FIXED.
+// ---------------------------------------------------------------------------
+//  CANDIDATE 19.  finalizeFullWarp's writer tail reserves before it suppresses:
+//          if (idxInWarp == 31)
+//              startIndex = atomicAdd(writer.numTotalContacts, count);   // :345
+//          ...
+//          if (remaining && !isDiffuseParticlesThread)                   // :356
+//              ... writer.writeContact(...)
+//      The RESERVATION has no isDiffuseParticlesThread guard; only the write does.
+//      So the diffuse pass advances the global primitive-contact counter by
+//      everything it found and then writes none of it, leaving HOLES in
+//      particleContacts (and in all six sibling arrays) beneath a count that
+//      claims they are contacts.  Whatever those slots held is what downstream
+//      sorts and solves.
+//      Reachable whenever a scene has diffuse particles AND a triangle mesh on a
+//      non-static actor -- for a STATIC mesh most contacts are consumed into the
+//      one-way arrays first, so `remaining` is usually zero and the reservation is
+//      small; for a dynamic one `id` stays 0 and the whole contact count is
+//      reserved.  Measured in psMeshMidphaseDiffuse (c): with the diffuse
+//      positions aliased onto the solid ones the counter lands on exactly twice the
+//      solid-only figure and exactly half the reserved slots are never written.
+//      TRANSCRIBED AS IS.  The port reproduces the reservation bug-for-bug and the
+//      fixture asserts the faithful numbers, so a port that "fixed" it by guarding
+//      the atomicAdd fails.
 //
 // The module is in PXG_NOCONTRACT_SHADERS: the triangle tests are dense float
 // work and FMA contraction moves the results off the Phase-1 module's bit
