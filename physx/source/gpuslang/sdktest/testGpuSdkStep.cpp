@@ -472,6 +472,38 @@ static const float FLUID_NN_CONTROL = 1.4421f;  // measured
 static const float FLUID_RISE_MAX = 0.20f;      // the fluid settles monotonically
 static const float FLUID_RISE_CONTROL = 1.8923f;// measured
 
+// P9.9 -- PXG_SCENE=particlefluidboundary.
+//
+// A scale of 1 makes mRestDensityBoundary equal the fluid's own rest density
+// (PxgParticleSystemCore.cpp:2640: mRestDensityBoundary = mRestDensity * scale).
+static const float FLUID_BOUNDARY_SCALE = 1.0f;
+// The observable -- read the long note at the boundary assertion block before
+// touching these.  MEASURED on this exact scene, A/B against
+// PXG_PARTICLE_BOUNDARY_CONTROL=1 (identical scene, scale left at 0 so neither
+// kernel runs), over four boundary scales:
+//
+//     scale     resting spread     resting nn
+//     0 (off)          4.9381         0.0851
+//     0.25             7.9165         0.0949
+//     1.0              8.0641         0.0975
+//
+// SPREAD is the gate and NN is only reported, which is a deliberate choice rather
+// than an oversight.  Spread separates on/off by ~60% of the control value, so a
+// threshold at 6.0 sits ~21% above the control and ~24% below the live run -- a
+// margin worth regressing against.  NN separates by only ~11%, so any threshold
+// between them would sit within ~6% of both sides; that is a flaky gate, not a
+// measurement, and it would eventually fail for reasons having nothing to do with
+// the boundary density.  It is printed so a human can see it move.
+//
+// Note the effect SATURATES: a quarter of the scale already buys 98% of the spread
+// change, because the raw per-contact contribution mostly sits below even the
+// quarter-scale cap, so min(rho, mRestDensityBoundary) rarely binds.  The gate is
+// therefore an on/off discriminator and NOT a claim about the scale's magnitude.
+static const float FLUID_BOUNDARY_SCALE_SPREAD = 8.0641f;   // measured, scale 1.0
+static const float FLUID_BOUNDARY_SPREAD_MIN = 6.0f;        // between the two, wide both ways
+static const float FLUID_BOUNDARY_SPREAD_CONTROL = 4.9381f; // measured, scale 0
+static const float FLUID_BOUNDARY_NN_CONTROL = 0.0851f;     // measured, scale 0 (reported only)
+
 struct ParticleScene
 {
     PxPBDParticleSystem* system = nullptr;
@@ -494,8 +526,16 @@ struct ParticleScene
 // landed in P9.1a-d consume; with the solid phase they all early-out per particle.
 // The parameters are the engine's own SnippetPBF (snippets/snippetpbf/
 // SnippetPBF.cpp:104-156), not invented here.
+// boundaryMode (PXG_SCENE=particlefluidboundary, P9.9) is fluidMode plus one call:
+// setFluidBoundaryDensityScale.  That single call is what switches the P9.8 pair
+// (ps_accumulateStaticDensity / ps_accumulateRigidDensity) on -- the host gates both
+// on mHasNonZeroFluidBoundaryScale (PxgPBDParticleSystemCore.cpp:1118, :1141), which
+// is set only when some particle system carries fluidBoundaryDensityScale > 0
+// (:2167).  Everything else about the scene is byte-identical to particlefluid, so
+// the two scenes are each other's control.
 ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
-                                 PxCudaContextManager* cudaCtx, bool fluidMode = false)
+                                 PxCudaContextManager* cudaCtx, bool fluidMode = false,
+                                 bool boundaryMode = false)
 {
     ParticleScene out;
     out.cudaCtx = cudaCtx;
@@ -572,9 +612,23 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         ps->setFluidRestOffset(fluidRestOffset);
         ps->setParticleFlag(PxParticleFlag::eENABLE_SPECULATIVE_CCD, false);
         ps->setMaxVelocity(solidRestOffset * 100.f);
-        // fluidBoundaryDensityScale stays at its 0 default, which keeps
-        // ps_accumulateStaticDensity / ps_accumulateRigidDensity (both still
-        // unmapped) switched off.
+        // P9.9: the ONE call that switches the boundary-density pair on.  It is the
+        // whole difference between PXG_SCENE=particlefluid and
+        // PXG_SCENE=particlefluidboundary, which is what makes them a clean A/B.
+        //
+        // The value is not arbitrary: PxgParticleSystemCore.cpp:2640 computes
+        //     mData.mRestDensityBoundary = mData.mRestDensity * fluidBoundaryDensityScale
+        // so a scale of 1 caps the boundary contribution at exactly the fluid's own
+        // rest density -- the largest value that cannot make a particle at a wall
+        // read as denser than a particle buried inside the fluid.  Both kernels then
+        // early-out on `mRestDensityBoundary > 0`, so 0 (the default) is off and any
+        // positive value is on.
+        //
+        // BOUNDARY_CONTROL builds the identical scene with the scale left at 0, so
+        // the control differs from the live run in nothing but whether the two
+        // kernels run at all.
+        if (boundaryMode && !std::getenv("PXG_PARTICLE_BOUNDARY_CONTROL"))
+            ps->setFluidBoundaryDensityScale(FLUID_BOUNDARY_SCALE);
         phase = fluidControl
             ? ps->createPhase(pbdMat, PxParticlePhaseFlags(PxParticlePhaseFlag::eParticlePhaseSelfCollide))
             : ps->createPhase(pbdMat, PxParticlePhaseFlags(
@@ -3920,10 +3974,14 @@ int main()
         return 2;
     }
 
-    const bool fluidScene = !std::strcmp(sceneName, "particlefluid");
+    // P9.9: particlefluidboundary IS the fluid scene, with one extra call.  It takes
+    // the same code path and the same assertions, plus the boundary-specific pair.
+    const bool boundaryScene = !std::strcmp(sceneName, "particlefluidboundary");
+    const bool fluidScene = !std::strcmp(sceneName, "particlefluid") || boundaryScene;
     if (!std::strcmp(sceneName, "particle") || fluidScene)
     {
-        ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx, fluidScene);
+        ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx, fluidScene,
+                                               boundaryScene);
         if (!psc.system || !psc.buffer)
         {
             std::printf("[ FAIL ] gpu-sdk-step: particle scene build failed\n");
@@ -4028,7 +4086,71 @@ int main()
                           rise, FLUID_RISE_MAX, FLUID_RISE_CONTROL); ++failures; }
             if (!(restMaxDy < 0.05f))
             { std::printf("FAIL: the fluid never came to rest (rest |dy|=%.6f)\n", restMaxDy); ++failures; }
+
+            // ---------------------------------------------------------------
+            // P9.9: the BOUNDARY-DENSITY observable.
+            //
+            // WHICH KERNEL IS ACTUALLY DOING THE WORK, because the engine's naming
+            // is the opposite of what it sounds like and this is the trap of the
+            // tranche:
+            //
+            //   ps_accumulateSTATICDensity reads mOneWayContactInfos /
+            //     mOneWayContactCount.  Those are written by exactly three kernels
+            //     -- ps_meshCollisonLaunch, ps_sdfMeshCollisonLaunch and
+            //     ps_heightfieldCollisonLaunch (particleSystemMeshMidphase.cu:463,
+            //     :698 and particleSystemHFMidPhaseCG.cu:332) -- i.e. only the MESH
+            //     and HEIGHTFIELD paths, and ALL THREE ARE UNMAPPED in this port.
+            //     ps_preIntegrateLaunch (particlesystem.cu:317) zeroes the count
+            //     every frame, so in this scene every particle has contactCount == 0
+            //     and the kernel provably writes min(0, boundary) == 0.  It is NOT
+            //     dead weight, though: that zero-write is the PER-FRAME RESET of
+            //     mStaticDensity, without which the rigid kernel below -- which
+            //     seeds from that array and stores back into it -- would accumulate
+            //     without bound across frames.  It is the initialiser of the pair.
+            //
+            //   ps_accumulateRIGIDDensity reads the particle-vs-PRIMITIVE contact
+            //     stream (PxgParticlePrimitiveContact), which the mapped narrowphase
+            //     already produces.  The ground here is a PxRigidStatic carrying a
+            //     PxBoxGeometry -- a primitive -- so THIS is the kernel that sees
+            //     the floor, and this is the kernel the assertions below measure.
+            //
+            // So: the scene proves the rigid half end to end, and proves the static
+            // half launches and resets.  Feeding the static half real contacts needs
+            // one of the three mesh/heightfield kernels mapped first, and the tranche
+            // note says so rather than implying the pair is fully exercised.
+            //
+            // The DIRECTION of the observable, predicted before it was measured and
+            // then confirmed: with the boundary on, particles near the floor are
+            // seeded with a non-zero rho by the consumer
+            // (calculateDensityAndPotential, particlesystem.cu:3253, mapped since
+            // P9.1b), so the density constraint reads them as denser than they are
+            // and pushes them apart.  The puddle therefore spreads WIDER and its
+            // nearest-neighbour distance grows.  Both are one-sided minimum checks
+            // against the control, which is the same scene with the scale at 0.
+            if (boundaryScene && !std::getenv("PXG_PARTICLE_BOUNDARY_CONTROL"))
+            {
+                std::printf("  particle BOUNDARY density: spread %.4f (control %.4f, live reference "
+                            "%.4f); nn %.4f (control %.4f, reported only -- see the note)\n",
+                            spreadEnd, FLUID_BOUNDARY_SPREAD_CONTROL, FLUID_BOUNDARY_SCALE_SPREAD,
+                            nnEnd, FLUID_BOUNDARY_NN_CONTROL);
+                if (!(spreadEnd > FLUID_BOUNDARY_SPREAD_MIN))
+                { std::printf("FAIL: the boundary density is not reaching the fluid -- the puddle did "
+                              "not spread past the boundary-off control (spread=%.4f, need >%.4f; the "
+                              "control measures %.4f and the live run measured %.4f)\n",
+                              spreadEnd, FLUID_BOUNDARY_SPREAD_MIN, FLUID_BOUNDARY_SPREAD_CONTROL,
+                              FLUID_BOUNDARY_SCALE_SPREAD);
+                  ++failures; }
+            }
             scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            if (failures == 0 && boundaryScene && !std::getenv("PXG_PARTICLE_BOUNDARY_CONTROL"))
+            {
+                std::printf("[  OK  ] gpu-sdk-step: the PBD fluid FEELS ITS BOUNDARY -- "
+                            "ps_accumulateRigidDensity's contribution to mStaticDensity widened the "
+                            "resting puddle to spread %.4f / nn %.4f, against %.4f / %.4f for the "
+                            "identical scene with fluidBoundaryDensityScale left at 0\n",
+                            spreadEnd, nnEnd, FLUID_BOUNDARY_SPREAD_CONTROL, FLUID_BOUNDARY_NN_CONTROL);
+                return 0;
+            }
             if (failures == 0)
             {
                 std::printf("[  OK  ] gpu-sdk-step: the PBD FLUID column collapsed to a puddle far below "
@@ -5269,14 +5391,15 @@ int main()
     // with PXG_PARTICLE_STARTY set (see bagMode above).
     else { std::printf("[ FAIL ] gpu-sdk-step: unknown PXG_SCENE='%s'\n"
                        "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|articulation\n"
-                       "          particle|particlefluid|particlecloth|particleinflatable\n"
+                       "          particle|particlefluid|particlefluidboundary|particlecloth|particleinflatable\n"
                        "          cloth|clothhang|clothdrape\n"
                        "          clothselfcollide|clothcloth\n"
                        "          softbody|softbodyselfcollide|softbodycloth|softbodystack|softbodyattach\n"
                        "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
                        "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
                        "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n"
-                       "          PXG_SCENE=particleinflatable + PXG_PARTICLE_INFL_CONTROL=1 (pressure-0 control)\n",
+                       "          PXG_SCENE=particleinflatable + PXG_PARTICLE_INFL_CONTROL=1 (pressure-0 control)\n"
+                       "          PXG_SCENE=particlefluidboundary + PXG_PARTICLE_BOUNDARY_CONTROL=1 (scale-0 control)\n",
                        sceneName);
            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
     if (targets.empty())

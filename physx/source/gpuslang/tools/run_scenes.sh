@@ -37,10 +37,10 @@ if [ -z "${PXG_SHADER_DIR:-}" ]; then
     exit 2
 fi
 
-# The 24 named scenes.  The settling bag below makes 25 -- the figure
+# The 25 named scenes.  The settling bag below makes 26 -- the figure
 # RUNTIME_STATUS.md's header carries.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor articulation
-        particle particlefluid particlecloth particleinflatable
+        particle particlefluid particlefluidboundary particlecloth particleinflatable
         cloth clothhang clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach"
 
@@ -65,7 +65,7 @@ for s in $SCENES; do
     run_one "$s" PXG_SCENE=$s
 done
 
-# Scene 25.  STARTY=4.0 is CANONICAL: it puts the cloud's mean at 4.75, which is
+# Scene 26.  STARTY=4.0 is CANONICAL: it puts the cloud's mean at 4.75, which is
 # the height every bag measurement since P6.5 has been taken from.  Dropping it
 # from higher leaves the pile still compacting when the rest window opens, and
 # the rest check (|dy| over the last 60 steps < 0.01) then fails on a scene that
@@ -80,7 +80,8 @@ if [ "${1:-}" = "--diagnostics" ]; then
     echo "    are the reference for -- read their numbers, not their verdicts) ==="
     for spec in "particlefluid PXG_PARTICLE_FLUID_CONTROL" \
                 "particlecloth PXG_PARTICLE_CLOTH_CONTROL" \
-                "particleinflatable PXG_PARTICLE_INFL_CONTROL"; do
+                "particleinflatable PXG_PARTICLE_INFL_CONTROL" \
+                "particlefluidboundary PXG_PARTICLE_BOUNDARY_CONTROL"; do
         sc=${spec%% *}; var=${spec##* }
         echo "--- $sc + $var=1"
         env PXG_SCENE=$sc $var=1 PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
