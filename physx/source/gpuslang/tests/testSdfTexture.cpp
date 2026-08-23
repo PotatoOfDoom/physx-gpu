@@ -43,7 +43,7 @@
 //
 // AND IT HAS BEEN CHECKED AGAINST THE REAL FUNCTION.  A one-off program linked
 // against libphysx-sdk.a ran this exact mirror against Gu::SDF::decodeSparse over
-// the identical hand-built SDF: 2457 fine-grid samples, 5 resident cells and 25
+// the identical hand-built SDF: 2457 fine-grid samples, 6 resident cells and 24
 // coarse-fall-back cells, 537 of them on a far edge -- ZERO mismatches, worst
 // |diff| exactly 0.  So the expectation below is the engine's behaviour and not
 // this file's reading of it; what is transcribed has been measured against the
