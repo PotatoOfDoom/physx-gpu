@@ -10,8 +10,11 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 Test count: **810/810** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **28/28** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (27 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
-trägt, ein FEHLENDES Verdikt getrennt zählt und die fünf Diagnose-Kontrollen
-ausdrücklich NICHT wertet.  P9.9 fügte `particlefluidboundary` hinzu, P9.10c
+trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
+wertet.  Die Diagnoseliste enthält seit P9.13a **zweierlei**: die sechs
+Kontrollen, die durchfallen SOLLEN, weil sie die Referenz der echten Prüfung
+sind, und `particlediffuse`, das durchfällt, weil seine Kette noch nicht
+abgebildet ist.  P9.9 fügte `particlefluidboundary` hinzu, P9.10c
 `particlemeshfloor`, P9.11c `particlehffloor`.
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
@@ -1698,6 +1701,102 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.13a — die letzten zwei Puffer-Fabriken, eine Szene für die Diffus-Kette, und ein Messinstrument, das hier schweigt
+
+Kein Kernel, Manifest unverändert bei **342**. Diese Tranche räumt ein Tor weg und
+stellt die Szene auf, die die nächsten elf Kernel benennt.
+
+### Die zwei Brücken-Stummel, und warum sie kein Randfall waren
+
+`PhysXGpuVulkan.cpp` hatte noch zwei von vier Partikelpuffer-Fabriken als
+warn-and-null:
+
+```
+createParticleAndDiffuseBuffer  -> NULL
+createParticleRigidBuffer       -> NULL
+```
+
+Beide sind jetzt das, was ihre zwei Geschwister seit P6.0 und P9.4 sind: eine
+Zeile, die den konkreten `PxgParticleAndDiffuseBuffer` bzw.
+`PxgParticleRigidBuffer` anlegt. Diese Klassen allozieren über die Vulkan-Shim
+und starten keinen Kernel, konstruieren also in dem Moment, in dem der Stummel
+verschwindet — genau der Befund, den P9.4 für den Cloth-Puffer notiert hat.
+
+Der Vertrag „warnen und NULL zurückgeben" ist auf diesem Pfad **nie überlebbar**
+gewesen: `NpPhysics` reicht das Ergebnis direkt an den Np-Konstruktor weiter, der
+es dereferenziert. Ein NULL ist also ein **Segfault**, keine Degradierung. Damit
+gibt keine der vier Fabriken dieser Klasse mehr NULL zurück.
+
+Was dahinter lag:
+
+* **elf Kernel** der Diffus-Kette — `ps_preDiffuseIntegrateLaunch`,
+  `ps_calculateHashForDiffuseParticlesLaunch`, `ps_diffuseParticleCreate`,
+  `…Sum`, `…Compact`, `…Copy`, `…UpdatePBF`, `…OneWayCollision`,
+  `ps_primitivesDiffuseCollisionLaunch`, `ps_convexDiffuseCollisionLaunch`,
+  `ps_updateUnsortedDiffuseArrayLaunch`;
+* **fünf Kernel** der Partikel-Starrkörper-Anhängung —
+  `ps_rigidAttachmentPrepareLaunch`, `ps_solveRigidAttachments{,TGS}Launch`,
+  `ps_solvePCOutputRigidDeltaV{,TGS}Launch`.
+
+Nebenbei: der diffuse Durchgang von `ps_meshCollisonLaunch` (P9.10) und
+`ps_sdfMeshCollisonLaunch` (P9.12h) ist seit jeher abgebildet und **gesweept** —
+und ist aus demselben Grund noch nie in einer lebenden Szene gelaufen.
+
+### `PXG_SCENE=particlediffuse`
+
+Die Flüssigkeitsszene mit einem `PxParticleAndDiffuseBuffer` statt des einfachen.
+Erreichbarer Spawn-Schwellwert, 4096 Diffus-Plätze, und die Zahl wird in **jedem**
+Schritt gelesen: Diffuspartikel entstehen, während die Säule zusammenfällt, und
+sterben beim Setzen wieder ab, ein Endwert wäre also auch bei funktionierender
+Kette null. Geprüft wird das **Maximum**.
+
+Die Szene **fällt heute absichtlich durch** und steht deshalb in der
+Diagnoseliste von `run_scenes.sh`, nicht in der gewerteten. Sie zieht dort um,
+wenn die Kette landet. `PXG_DIFFUSE_CONTROL=1` hebt den Schwellwert auf 1e12 und
+ändert sonst nichts.
+
+### DAS MESSINSTRUMENT WAR DAS FALSCHE, und das ist der Merksatz der Tranche
+
+Der erste Durchlauf sah aus wie ein Fehlschlag der Diagnose selbst:
+**60378 Starts, davon 0 verweigert**, kein einziger Diffus-Kernel im
+`PXG_LAUNCH_TRACE`. Gelesen als „die Engine treibt die Kette gar nicht an".
+
+Das ist falsch, und zwar aus einem Grund, der schon in P8.97a stand und den ich
+hier trotzdem wieder ausprobieren musste: **ein unabgebildeter Kernel hat keine
+`CUfunction`, sein Start erreicht unsere Shim also nie und kann folglich nie als
+REFUSED erscheinen.** Der Trace zeigt ausschließlich, was der Shim tatsächlich
+gereicht wurde. Er ist das Instrument für falsche ABI-Zeilen und nicht
+auflösbare Zeiger, nicht für fehlende Kernel.
+
+Die zwei Signale, die diese Kette wirklich benennen:
+
+1. die Startliste des Wranglers — `Could not find registered CUDA function
+   'ps_diffuse…'`, elf Zeilen, genau die Liste oben;
+2. pro Bild die Engine selbst: **288 ×
+   `GPU particlePrimitivesDiffuseCollisionLaunch fail to launch!!`**.
+
+Das zweite ist der Beweis, auf den es ankommt: der Host *treibt* die Kette, er
+überspringt sie nicht. Ohne die Puffer-Fabrik gab es diese Zeile nicht, mit ihr
+gibt es sie 288-mal — die Tranche hat also messbar ein Tor geöffnet und nicht
+bloß eine Zeile Code ersetzt.
+
+Der Szenenkommentar sagt das jetzt an der Stelle, an der der nächste Leser sonst
+denselben Trace anwerfen würde.
+
+### Eine Erfolgsmeldung, die zu viel behauptet hätte
+
+Der Kontrolllauf bestand zuerst mit dem Satz „SPAWNED 0 DIFFUSE PARTICLES — die
+Diffus-Kette läuft von Anfang bis Ende auf Vulkan". Er belegt aber nur, dass
+nichts entstand, wo nichts verlangt wurde. Die Meldung ist getrennt: die
+End-zu-End-Behauptung gibt es nur ohne `PXG_DIFFUSE_CONTROL`.
+
+### Verifikation
+
+* Szenen **28 ok, 0 fail, 0 missing (von 28)** — die gewertete Liste unverändert;
+* Diagnose `particlediffuse`: FAIL wie vorgesehen, Kontrolle grün;
+* volle Suite **810/810** in **beiden** Speichermodi;
+* Manifest unverändert bei **342**.
 
 ## P9.12h — `ps_sdfMeshCollisonLaunch` (Manifest **342**), und ein Fixture, das einen Portierungsfehler aus P9.10 aufdeckte
 
