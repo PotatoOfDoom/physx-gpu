@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **805/805** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **806/806** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **28/28** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (27 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die fünf Diagnose-Kontrollen
@@ -1698,6 +1698,212 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.12d — die vier Funktionen über `SparseSDFTexture`, und ein Fixture ganz ohne Toleranz
+
+Portiert `sdfCollision.cuh:156-240` — `PxSdfDistance`, `PxVolumeGrad`,
+`PxSdfSampleWithGrad` und `doVertexSDFCollision` — auf die P9.12c-Texturschicht.
+Neues Modul `shaders/pxgSlangSdfCollision.slang`, Einstiegspunkte in
+`npSdfCollision.slang`, Fixture `tests/testSdfCollision.cpp`. Damit ist die
+gesamte **Numerik** von `ps_sdfMeshCollisonLaunch` portiert: was dieser Kernel
+pro Partikel tut, ist ein Aufruf von `doVertexSDFCollision` plus der
+Kontaktschreibvorgang; was danach bleibt, sind Indexketten und Pufferschreiben.
+
+### Das Problem: `Sample()` läuft nicht auf dem Host
+
+Die vier Funktionen sind `__device__`-Templates, also gibt es kein Original zum
+Rufen. Das wäre die P8.87-Anordnung — Kontrollfluss transkribiert, Primitiven
+gerufen — nur ist der Anteil diesmal viel günstiger: `PxVec3::maximum`,
+`minimum`, `magnitude`, `getNormalized`, `normalize`, `dot` und `PxAbs` sind
+**alle** `PX_CUDA_CALLABLE`, das Fixture ruft jede einzelne auf dem Host, und
+transkribiert ist nur noch die **Reihenfolge**.
+
+Das eine, was das Fixture nicht rufen kann, ist `Sample()`. Die Antwort darauf
+ist die eigentliche Idee dieser Tranche: **das Fixture sagt keinen einzigen
+Sample-Wert voraus.** Stattdessen berichtet jede Funktion die Werte, die sie
+gelesen hat (die `*Ex`-Varianten im Modul, jede einfache Funktion ein
+Einzeiler-Weiterreicher darüber), und geprüft wird die **Komposition gegen
+diese** Werte. `grad.x` muss `value[0] - value[1]` sein — bitgenau, egal welche
+Zahlen das sind.
+
+Deshalb steht in der ganzen Kompositionsprüfung **keine einzige Toleranz**.
+
+### Das Loch darin, und wie es geschlossen wird statt wegargumentiert
+
+Ein Shader könnte Werte berichten, die er nie gelesen hat. Also wird **jeder**
+der sechs Gradienten-Taps gegen eine **unabhängige Auswertung** gegengeprüft:
+
+* die Taps des Innenzweigs gegen `npSdfTexture`s `sdfTexSampleAt` — ein
+  **anderes Modul** (das aus P9.12c), über denselben Blob und dieselben Texturen;
+* die Taps des Rückfallzweigs gegen `sdfCollDistance` an genau denselben
+  Weltpunkten.
+
+Ein Mutant, der die falschen zwei Taps differenziert oder an einer anderen
+Koordinate abtastet als er berichtet, stirbt daran. `c6-interior-y-from-z` und
+`c5-interior-y-steps-x` sind genau dafür da.
+
+`Sample()` selbst ist **nicht** die Behauptung dieser Tranche — das war P9.12c,
+gemessen gegen `Gu::SDF::decodeSparse`. Nachgeprüft wird hier nur billig, dass
+die zurückkommenden Zahlen wirklich die dieser Funktion sind: auf der
+gitterausgerichteten dichten Szene muss der berichtete Sample an einer
+ganzzahligen Texelkoordinate **bitgenau** das gespeicherte Texel sein (10 von 15
+Punkten, schlechteste Differenz **exakt 0**), auf der sparse Szene innerhalb der
+in P9.12a gemessenen Filterschranken (8 Punkte, schlechteste Differenz 1,34e-07).
+
+### Die zweite Szene, und warum sie sein muss
+
+Die sparse Szene aus P9.12c bleibt — sie ist die einzige, die die beiden Zweige
+von `Sample()` fährt. Dazu kommt eine **gitterausgerichtete dichte** Szene:
+9 × 6 × 13, Abstand **0,25**, `meshLower` auf Achteln. Der Abstand ist eine
+Zweierpotenz, also ist `(lower + n*0,25 - lower) * 4,0` **exakt** — die
+Texelkoordinate `f` ist eine echte ganze Zahl. Drei Dinge brauchen das:
+
+1. **Die Wächterbedingung von `PxVolumeGrad` ist `f >= 1 && f <= dims - 2`, und
+   sie ist INKLUSIV.** Nur ein exaktes `f` kann auf einer der beiden Schranken
+   sitzen, und nur dann unterscheiden sich `>` und `<` von `>=` und `<=`. Die
+   Punkte `guard-lo-exact` und `guard-hi-exact` sind genau das, und
+   `c7-x-lo-strict` / `c7-x-hi-strict` sterben nur an ihnen.
+2. Der Sample-Gegencheck wird bitgenau statt gefiltert.
+3. **Die Diskontinuität.** `doVertexSDFCollision` ersetzt den Gradienten durch
+   eine willkürliche Richtung, wenn dessen Betrag **exakt null** ist — der „exact
+   center of a cube" des CUDA-Kommentars. Das entsteht nur, wenn drei Paare von
+   Taps identische Werte liefern, und dafür müssen die Taps auf Texelzentren
+   landen. Die Textur der neuen Szene hat die **sechs Flächennachbarn** von Texel
+   (3,2,4) als drei gleiche PAARE geschrieben; das Zentrumstexel selbst bleibt
+   unangetastet, weil der Gradient es nie liest.
+
+Deckung, ausgedruckt und zugesichert: sparse 12 Punkte — 5 Innen- / 7
+Rückfallgradienten, 3 außerhalb der Box, 10 angenommen / 2 abgelehnt;
+gitterausgerichtet 15 Punkte — 6 / 9, 3 außerhalb, 13 / 2, **1 ersetzter
+Gradient**.
+
+### Vierzehn Fallen, jede mit einem Mutanten
+
+Die Modul-Kopfzeile führt sie als C1–C14. Die, die nicht offensichtlich sind:
+
+* **C3 vs. C8 — dieselbe Größe, zwei verschiedene Zahlen.** `PxSdfDistance`
+  gibt `Sample(f) + diffMag` zurück; `PxSdfSampleWithGrad`s `dist` ist
+  `Sample(f)` **roh**, ohne `diffMag`. Die Außendistanz kommt dort erst am Ende
+  über `dir.dot(diff)` herein. Ein Port, der hier `PxSdfDistance` wiederverwendet,
+  ist für **jeden** Punkt außerhalb der Box falsch — weshalb die Punktliste zu
+  einem Fünftel draußen liegt und das Fixture `dist` gegen den vom
+  Distanz-Einstiegspunkt berichteten *rohen* Sample vergleicht, nicht gegen
+  dessen Rückgabewert.
+* **C5 — die beiden Gradientenzweige rechnen nicht dasselbe.** Der Innenzweig
+  differenziert `Sample()` bei `f ± 1` im **Texelraum**, der Rückfall
+  differenziert `PxSdfDistance` bei `localPos ± sdfDx` im **Weltraum** — der
+  klemmt und holt sich damit C3s `diffMag`. Tief in der Box stimmen beide exakt
+  überein; genau am Rand nicht mehr, und dafür gibt es den Wächter. Weil die
+  beiden Zweige ihre Taps in **verschiedenen Räumen** angeben, ist ein
+  Wächter-Mutant auch dann sichtbar, wenn die Gradienten selbst gleich wären.
+* **C6 — keiner der beiden Zweige teilt durch die Schrittweite.** Zurück kommt
+  `2*dx` mal der Gradient. Das ist kein Schönheitsfehler: der Nulltest in
+  `doVertexSDFCollision` ist **exakt**, und eine „korrigierende" Division macht
+  ihn zu einem Näherungstest.
+* **C9 — `dir` ist eine Referenz, die der Ablehnungspfad NICHT anfasst.** Die
+  CUDA kehrt zurück, ohne zuzuweisen; der Wert des Aufrufers überlebt. Portiert
+  als `inout`, und das Fixture setzt pro Punkt ein eigenes Kennzeichen hinein und
+  fordert es zurück.
+* **C10 — der Gradient wird INNEN nochmal normiert**, obwohl
+  `doVertexSDFCollision` ihn schon normiert hat. Idempotent bis auf ein ULP, nicht
+  bis aufs Bit — transkribiert statt wegoptimiert.
+* **C11 vs. C12 — zwei verschiedene Normierungen.** `getNormalized()` prüft
+  `magnitudeSquared() > 0` und multipliziert mit `PxRecipSqrt`; `normalize()`
+  normiert **an Ort und Stelle** und gibt den **Betrag** zurück, und teilt nur,
+  wenn der positiv ist. `if (sdfGradient.normalize() == 0.0f)` tut also zwei
+  Dinge gleichzeitig, und die Ersetzung feuert auf dem Wert, durch den gerade
+  nicht geteilt wurde. `PxRecipSqrt` ist auf dieser Plattform
+  `1.0f / sqrtf(a)` (`PxUnixMathIntrinsics.h:92`), **keine** rsqrt-Näherung —
+  deshalb steht der Kehrwert ausgeschrieben da, aus dem Grund, den P8.69
+  aufgeschrieben hat.
+* **C13 — das `.getNormalized()` auf der Ersatzrichtung ist tragend.**
+  `PxVec3(0.5448762f, 0.672269f, 0.398825f)` ist **0,95284** lang. Und hier liegt
+  der Grund, warum das Fixture den **ersetzten Vektor selbst** ausliest statt nur
+  das Endergebnis: C10 normiert innen nochmal, also ist der Mutant
+  `c13-no-getnormalized` über `dir` allein **unsichtbar**. Über den berichteten
+  Gradienten stirbt er sofort.
+* **C14 — `mag > 0` und `mag == 0` sind nicht komplementär.** Ein NaN-Gradient
+  erfüllt keines von beiden, wird also weder geteilt noch ersetzt und läuft
+  unverändert durch. Das ist das Verhalten der CUDA und es ist transkribiert,
+  nicht zu einem `else` aufgeräumt.
+
+### Eine bewusste Abweichung, aufgeschrieben statt versteckt
+
+Die CUDA schreibt `localPos.maximum(lower).minimum(higher)` und
+`(clamped - lower) * invSdfDx` **dreimal** hin, einmal in jeder der ersten drei
+Funktionen. Hier sind es zwei gemeinsame Helfer. Die Ausdrücke sind identisch;
+das Herausziehen ist genau das, was dem Fixture erlaubt, sie **einmal** gegen
+`PxVec3`s eigene Operatoren zu prüfen und diese Prüfung für alle drei Stellen
+gelten zu lassen.
+
+### Drei Mutanten, die bewusst NICHT in der Liste stehen
+
+Ein Mutant, der das Verhalten nicht ändert, ist ein Fehler im Sweep und kein
+Ergebnis — die Regel steht seit P8.73. Diese drei wurden geprüft und weggelassen,
+statt sie als Überlebende zu buchen:
+
+* **Klemmreihenfolge vertauscht** (`minimum` vor `maximum`): für eine
+  wohlgeformte Box (`lower <= higher`) identisch. Nur eine invertierte Box
+  unterscheidet sie, und die Engine erzeugt keine.
+* **`sdfcMax` als `a > b ? a : b`**: identisch außer bei NaN, das an dieser
+  Stelle nicht erreichbar ist.
+* **`if (gradMag > 0.0f)` → `>= 0.0f`**: für `gradMag == 0` entsteht
+  `0 * inf = NaN`, aber genau dann überschreibt die Ersetzung den Vektor sowieso.
+  Beweisbar äquivalent.
+
+### Sweep
+
+**71 Mutanten, 70 getötet, 1 Überlebender, 0 NOCOMPILE, 0 ANCHOR-FAIL**, forced-fresh
+über `tools/run_mutation_sweep.sh npSdfCollision sdfCollision <liste>
+pxgSlangSdfCollision` (das vierte Argument ist die P9.12a-Erweiterung für gemeinsame
+Module — die Datei, die mutiert wird, und die, deren `.spv` neu gebaut werden muss,
+sind zwei verschiedene).
+
+#### Der Überlebende: `c11-rsqrt`, diagnostiziert statt entschuldigt
+
+`v * (1.0f / sqrt(m))` → `v * rsqrt(m)`. Zwei Messungen dazu:
+
+1. **Es ist ein echter Mutant, kein Sweep-Fehler.** Disassembliert:
+   die pristine Fassung hat **0 × `InverseSqrt` und 5 × `OpFDiv`**, der Mutant
+   **1 × `InverseSqrt` und 4 × `OpFDiv`**. slangc faltet `1.0f/sqrt(x)` also
+   *nicht* selbst zu `InverseSqrt` — der erzeugte Code ist verschieden.
+2. **Auf llvmpipe liefern beide dasselbe Bitmuster.** Das Fixture vergleicht
+   **93** Normierungen bitgenau gegen den Wirt (23 angenommene Punkte × 2
+   `getNormalized`-Aufrufe in Durchgang 3, ebenso viele in Durchgang 4, plus die
+   eine Ersatzrichtung) — und unter dem Mutanten stimmen sie **alle**. Für jede
+   Eingabe, die dieses Fixture erzeugt, ist llvmpipes `InverseSqrt` exakt
+   `1.0f / sqrtf(m)`.
+
+Es gibt also **keine Punktliste, die diesen Mutanten auf diesem Treiber tötet** —
+der Unterschied ist dort null. Die Schreibweise bleibt trotzdem stehen, und zwar
+nicht aus Vorsicht, sondern weil sie eine andere Zusicherung hat:
+`GLSL.std.450 InverseSqrt` ist eine **eigene Instruktion mit eigener,
+implementierungsdefinierter Genauigkeit** — Vulkan verlangt nirgends, dass sie
+gleich `1/sqrt` ist —, während der Engine-Gegenpart `PxRecipSqrt` wörtlich
+`1.0f / ::sqrtf(a)` ist (`PxUnixMathIntrinsics.h:92`). Ein Treiber, dessen
+`InverseSqrt` eine Näherung ist, bricht die Bitgleichheit gegen die Engine; das
+ist genau der Treiber, gegen den die Schreibweise schützt, und es ist derselbe
+Grund, den P8.69 für `rotateAndNormalize` aufgeschrieben hat.
+
+Damit ist der Überlebende eine **bewiesene Äquivalenz auf llvmpipe** und
+ausdrücklich **keine** Äquivalenz per Spezifikation.
+
+### Verifikation
+
+* `ctest -R gpuslang.sdfCollision` grün, forced-fresh;
+* volle Suite **806/806** in **beiden** Speichermodi;
+* Manifest **unverändert bei 341** — diese Tranche fügt keinen Engine-Kernel
+  hinzu, sondern die Schicht, auf der der eine noch fehlende steht. Deshalb auch
+  kein Szenenlauf: es gibt nichts, was eine Szene anders machen würde.
+
+### Nebenbei: eine Szene, ein Blob-Schreiber, ein Orakel
+
+Mit dem zweiten Fixture über derselben Schicht sind die Szenendefinition, der
+Cooked-Mesh-Blob und der `decodeSparse`-Spiegel aus `testSdfTexture.cpp` nach
+`tests/pxgSdfSceneRef.h` gewandert. Eine zweite Kopie von irgendeinem der drei
+wäre eine zweite Sache, die mit der Engine im Gleichschritt gehalten werden muss
+— und der ganze Punkt des Spiegels ist, dass er **einmal** offline am Original
+gemessen wurde.
 
 ## P9.12c — die `SparseSDFTexture`-Schicht, ein echtes Orakel, und eine sechste Plattformregel
 
