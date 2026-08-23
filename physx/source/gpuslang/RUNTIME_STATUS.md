@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **807/807** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **808/808** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **28/28** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (27 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die fünf Diagnose-Kontrollen
@@ -1698,6 +1698,155 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.12f — der Kontaktentscheid pro Partikel, und ein Sweep, der vier Fixture-Löcher fand
+
+Portiert `particleSystemMeshMidphase.cu:493-570`, den Rumpf von
+`psSdfMeshMidphaseCollision`, der für jeden Kandidaten aus der P9.12e-Sammlung
+läuft. Neues Modul `shaders/pxgSlangSdfParticle.slang`, Einstiegspunkt
+`npSdfParticle.slang`, Fixture `tests/testSdfParticle.cpp`. Manifest
+**unverändert bei 341** — was danach noch fehlt, ist die Indexkette, der
+Elementfilter und die zwei Kontaktschreibvorgänge (P9.12g).
+
+Ein Thread pro Kandidat, kein Datenverkehr zwischen Spuren. Das ist das letzte
+Stück dieses Kernels, das sich als reine Arithmetik prüfen lässt.
+
+### Zwölf Fallen
+
+Die Modulkopfzeile führt sie als B1–B12. Die, die nicht offensichtlich sind:
+
+* **B1 — `positions` ist der VORHERGESAGTE Puffer und `positionsPrev` der
+  Ursprungspuffer**, also genau umgekehrt zur Benennung in
+  `psMeshMidphaseCollision` (:433-439 gegen :663-671). Dieselben zwei Puffer,
+  entgegengesetzte Namen, in **einer** Übersetzungseinheit.
+* **B4/B5 — `m` kommt allein aus `dir` und skaliert VIER Werte**: `distance`,
+  `startDist`, `dir` **und** `dirPrev`. Die Richtungslänge des aktuellen Bildes
+  normiert also auch die Zahlen des vorherigen; `dirPrev` wird nie für sich
+  normiert. Und `m` entsteht **nach** beiden `vertex2ShapeNormalVector`-Aufrufen,
+  ist also eine Länge im SHAPE-Raum, nicht im Vertex-Raum.
+* **B6 — die drei Entscheidungen sind geordnet und die erste gewinnt.**
+  `startDist < contactDist` läuft ungeschützt; der Distanzzweig ist durch
+  `!candidateContact && distance > 0` bewacht, der CCD-Zweig durch
+  `enableCCD && !candidateContact` und dann `distance < 0`. Zwischen `> 0` und
+  `< 0` bleibt ein **Loch bei genau null**.
+* **B7 — `finalSep` ist dreimal verschieden geschrieben**: `startDist - restDist`
+  ganz ohne Projektionsterm, `(distance - restDist) + normal.dot(posPrev - pos)`
+  und auf dem CCD-Pfad `... + normal.dot(posPrev - pt)`.
+* **B9 — der CCD-Pfad benutzt `m` weiter, ohne es aus dem neuen `dir` neu zu
+  berechnen**, und testet `if (m > 0)` auf einem Wert, der zu dem Zeitpunkt
+  schon der **Kehrwert** `1/sqrt(magSq)` ist.
+
+### UPSTREAM-KANDIDAT 27 — `dir` wird UNINITIALISIERT gelesen, sobald ein Partikel den Kontakt verlässt
+
+Die CUDA deklariert beide Richtungsvektoren uninitialisiert (`:499`, `:501`), und
+`PxSdfSampleWithGrad`s Ablehnungsroute (`sdfCollision.cuh:224`) gibt
+`PX_MAX_F32` zurück, **ohne `dir` je zuzuweisen**. Weil der äußere Wächter bei
+`:504` ein **ODER** ist, betritt ein Partikel, das an seiner *vorherigen*
+Position in Reichweite war und an der aktuellen nicht mehr, den Block trotzdem —
+und dann kommt `m = dir.magnitudeSquared()` aus einem uninitialisierten
+Stack-Slot, und `m` skaliert anschließend `startDist` und `dirPrev`, also
+Abstand und Normale des Kontakts, der **tatsächlich gefunden wurde**.
+
+Ein Partikel, das den Kontakt verlässt, ist kein Randfall; das passiert in jedem
+bewegten System jedes Bild irgendwo. Schwerwiegender als Kandidat 26: kein CCD,
+keine gedrehte Mesh-Pose, keine besondere Geometrie nötig.
+
+**Die eine bewusste Abweichung dieser Datei:** Slang hat keine uninitialisierte
+lokale Variable. Der Port **nullt beide Richtungen** vor den Aufrufen, wodurch
+`m == 0` wird, der `if (m > 0)`-Wächter jede Skalierung überspringt und die
+Zahlen des angenommenen Zweigs **unskaliert** bei der Entscheidung ankommen. Das
+ist die einzige Wahl, die deterministisch ist, kein inf/NaN erzeugen kann und
+den tatsächlich gefundenen Kontakt nicht verfälscht — aber es **ist** eine
+Abweichung, und sie steht im Modulkopf statt hinter einem „macht die CUDA auch".
+
+Das Fixture zählt mit, wie oft dieser Pfad erreicht wird (**49 von 512** Paaren
+in der posierten Konfiguration), und **fordert**, dass er vorkommt. Die
+Abweichung ist damit ausgeführt, nicht bloß beschrieben.
+
+### KANDIDAT 26, jetzt GEMESSEN statt gelesen
+
+P9.12e hatte notiert, dass der CCD-Nachtest
+`particleToTrimeshTransform.transform(pt)` anwendet, obwohl `pt` bereits im
+Zielraum dieser Transformation liegt. Dieses Fixture misst die Folge:
+
+| Konfiguration | erreicht den Nachtest | erzeugt Kontakte |
+|---|---|---|
+| posierte Mesh-Pose | 23× | **0** |
+| Identitätspose | 22× | **2** |
+
+Bei nicht-identischer Pose sampelt der doppelt transformierte Punkt so weit
+daneben, dass der Nachtest praktisch **nie** einen Kontakt liefert. Deshalb
+existiert die Identitäts-Konfiguration überhaupt: sie ist die einzige, in der
+sich die Arithmetik dieses Zweigs prüfen lässt — und das ist genau die
+Konfiguration, in der der Fehler unsichtbar ist. **Dokumentiert, nicht
+gemeldet.**
+
+### Das Fixture: Deckung wird GEFORDERT, nicht entworfen
+
+Welchen Zweig ein Paar nimmt, hängt von SDF-Werten ab, die der Host nicht
+vorhersagen kann. Von Hand ein Paar pro Zweig auszusuchen wäre Raten. Stattdessen
+werden 512 Paare gestreut — vorherige Positionen über und um die Box,
+Verschiebungen von Sub-Voxel bis mehrere Boxlängen —, **jedes einzelne** wird
+bitgenau geprüft, und danach wird verlangt, dass das Histogramm jeden Zweig,
+jeden Wächterausgang und die beiden Pfade enthält, die es nur wegen der
+Engine-Defekte gibt.
+
+Fünf Konfigurationen, und **vier davon existieren nur, weil der erste Sweep sie
+verlangt hat** (siehe unten): posierte Pose mit und ohne CCD, Identitätspose mit
+und ohne CCD, und Identitätspose mit `restDist > contactDist`.
+
+### DER SWEEP FAND VIER FIXTURE-LÖCHER — und das ist das Ergebnis der Tranche
+
+**Erster Durchlauf: 53 Mutanten, 49 getötet, 4 Überlebende.** Keiner der vier war
+eine Äquivalenz. Alle vier waren **blinde Stellen des Fixtures**, und drei davon
+zeigen dieselbe strukturelle Schwäche der „berichte, was du gelesen hast"-
+Anordnung, die diese ganze Kette benutzt:
+
+> **Ein Eingabewert, der AUSSCHLIESSLICH in eine berichtete Ausgabe fließt, ist
+> unbeobachtbar.** Der Host-Spiegel folgt dem berichteten Wert, also folgt er
+> auch dem Mutanten.
+
+| Überlebender | warum er überlebte | Schließung |
+|---|---|---|
+| `b2-cullscale-is-contactdist` | die Toleranz, die an `doVertexSDFCollision` geht, wirkt nur auf den berichteten Rückgabewert | **unabhängige Neuauswertung** |
+| `c27-dirprev-seed-nonzero` | `dirPrev`s Startwert fließt nur in eine berichtete Ausgabe, und `dirPrev` wird nur in Zweig 1 benutzt, der bei abgelehntem Vorher-Sample nie feuert | **dieselbe Neuauswertung** |
+| `b6-ccd-ignores-flag` | bei posierter Pose erzeugt der Nachtest ohnehin nie einen Kontakt (Kandidat 26!), und die CCD-Spurfelder wurden bei ausgeschaltetem Flag gar nicht geprüft | **Spurfelder müssen bei Flag=aus exakt null sein**, plus eine Identitäts-Konfiguration mit Flag=aus |
+| `b10-displacement-no-clamp` | `PxMax(0, startDist - restDist)` ist **tot**, solange `restDist < contactDist`: der Zweig wird nur bei `startDist >= contactDist` erreicht, die Differenz ist dann schon positiv | eine Konfiguration mit `restDist > contactDist` |
+
+**Die unabhängige Neuauswertung** ist die interessanteste der drei Schließungen.
+Jeder Punkt, den das Modul angibt abgetastet zu haben, wird ein zweites Mal
+ausgewertet — durch `npSdfCollision`s eigenen `sdfCollVertex`-Einstiegspunkt aus
+P9.12d, mit derselben Toleranz und demselben `dir`-Startwert — und das Ergebnis
+muss bitgleich sein. Ein Mutant, der eine andere Toleranz übergibt oder `dir`
+anders initialisiert, ändert damit, was **dieses** Modul berichtet, aber nicht,
+was die Referenz zurückgibt. **5187 Samples** werden so gegengeprüft.
+
+Dabei ist noch etwas herausgekommen, das erst als Fehlschlag aussah: der
+CCD-Aufruf wird **nicht** mit einem frischen `dir` gemacht. Er benutzt den weiter,
+den der Hauptblock hinterlassen hat, und die Ablehnungsroute fasst ihn nicht an
+(C9 aus P9.12d) — wird der Nachtest also verworfen, **überlebt die frühere
+Richtung**. Die Referenz mit Null zu starten machte daraus einen falschen
+Fehlschlag; sie richtig zu starten macht daraus die einzige Stelle, an der C9
+von außen beobachtet wird.
+
+**Zweiter Durchlauf gegen das verschärfte Fixture: **53 Mutanten, 53 getötet, null Überlebende**, 0 NOCOMPILE, 0 ANCHOR-FAIL.**
+
+Bemerkenswert: `b11-double-transform-removed` — der Mutant, der Kandidat 26
+**behebt** — wird getötet. Das ist die Zusicherung, dass der Port den Fehler
+wirklich reproduziert und nicht stillschweigend repariert hat.
+
+### Nebenbei: zwei Helfer sind umgezogen
+
+`sdfShape2Vertex` und `sdfTransformPoint` sind von `pxgSlangSdfFind` nach
+`pxgSlangSdfCollision` gewandert, weil sie in dieser Tranche einen zweiten
+Benutzer bekommen haben. Beide bestehenden Suiten (`sdfCollision`, `sdfFind`)
+prüfen den Umzug in dem Moment, in dem er landet.
+
+### Verifikation
+
+* `ctest -R gpuslang.sdfParticle` grün, forced-fresh;
+* volle Suite **808/808** in **beiden** Speichermodi;
+* Manifest **unverändert bei 341**, also kein Szenenlauf.
 
 ## P9.12e — die blockweite Kandidatensuche, 32 emulierte Warps in EINER Workgroup
 

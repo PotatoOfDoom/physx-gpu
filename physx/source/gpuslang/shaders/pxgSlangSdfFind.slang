@@ -203,19 +203,6 @@ uint sdfAddIndexToBuffer(uint tid, bool threadEmitsElement, uint index, uint nbE
     return min(total + nbElementsInBuffer, SDFF_TARGET_COUNT);
 }
 
-// shape2Vertex, cudaNpCommon.h:284-296.  Per-component DIVIDE by the scale
-// between rotate and rotateInv (S10) -- not a multiply by a reciprocal.
-float3 sdfShape2Vertex(float3 v, float3 scale, float4 rotation)
-{
-    return quatRotateInv(rotation, quatRotate(rotation, v) / scale);
-}
-
-// PxTransform::transform(p) = q.rotate(p) + t.p.
-float3 sdfTransformPoint(float3 tp, float4 tq, float3 v)
-{
-    return quatRotate(tq, v) + tp;
-}
-
 // The per-vertex test, factored out so the *Ex trace and the live path cannot
 // disagree about it.
 float sdfVertexCullDistance(uint64_t positions, uint ind, float3 aToBp, float4 aToBq,

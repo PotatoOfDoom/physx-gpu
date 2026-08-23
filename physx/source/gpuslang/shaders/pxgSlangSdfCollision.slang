@@ -131,6 +131,7 @@
 // that check cover all three call sites.
 
 import pxgSlangSdfTexture;
+import pxgSlangCommon;   // quatRotate / quatRotateInv for the two helpers below
 
 // PX_MAX_F32, PxSimpleTypes.h:94.
 static const float SDFC_MAX_F32 = 3.4028234663852885981170418348452e+38f;
@@ -172,6 +173,30 @@ float3 sdfcClampToBox(SparseSdfTexture t, float3 localPos)
 float3 sdfcTexCoord(SparseSdfTexture t, float3 clampedGridPt)
 {
     return (clampedGridPt - t.sdfBoxLower) * t.invSdfDx;
+}
+
+// ---------------------------------------------------------------------------
+// The two shape-space helpers every caller of this layer needs.  They live here
+// rather than beside their first user because P9.12f gave them a second one:
+// pxgSlangSdfFind (the block gather) and pxgSlangSdfParticle (the contact body)
+// both transform a world point into the SDF's vertex space, and a second copy
+// would be a second thing to keep in step with cudaNpCommon.h.
+// ---------------------------------------------------------------------------
+
+// shape2Vertex, cudaNpCommon.h:284-296.  A per-component DIVIDE by the scale
+// between rotate and rotateInv -- not a multiply by a reciprocal, and the two
+// round differently.  vertex2ShapeNormalVector (:299) is THE SAME FUNCTION:
+// a covariant vector transforms with the inverse scale, so the engine defines
+// it as a call to this one.
+float3 sdfShape2Vertex(float3 v, float3 scale, float4 rotation)
+{
+    return quatRotateInv(rotation, quatRotate(rotation, v) / scale);
+}
+
+// PxTransform::transform(p) = q.rotate(p) + t.p.
+float3 sdfTransformPoint(float3 tp, float4 tq, float3 v)
+{
+    return quatRotate(tq, v) + tp;
 }
 
 // ---------------------------------------------------------------------------
