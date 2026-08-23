@@ -559,6 +559,12 @@ static const float FLUID_RISE_CONTROL = 1.8923f;// measured
 // A scale of 1 makes mRestDensityBoundary equal the fluid's own rest density
 // (PxgParticleSystemCore.cpp:2640: mRestDensityBoundary = mRestDensity * scale).
 static const float FLUID_BOUNDARY_SCALE = 1.0f;
+// P9.13a, PXG_SCENE=particlediffuse.  MAX_DIFFUSE bounds the buffer's diffuse
+// arrays; DIFFUSE_THRESHOLD is the potential a fluid particle must exceed to
+// spawn one.  Both are overridable (PXG_DIFFUSE_THRESHOLD), and the CONTROL mode
+// raises the threshold out of reach rather than changing anything else.
+static const PxU32 MAX_DIFFUSE = 4096;
+static const float DIFFUSE_THRESHOLD = 1.0f;
 
 // P9.10c -- PXG_SCENE=particlemeshfloor.  The boundary scene with the ground BOX
 // swapped for a cooked TRIANGLE MESH at the same height, and the box sunk to -40
@@ -659,6 +665,9 @@ struct ParticleScene
     // the pinned particles never move, so including them would dilute exactly the
     // signal the scene exists to measure.
     PxU32 numPinned = 0;
+    // P9.13a: non-null only for PXG_SCENE=particlediffuse.  Aliases `buffer`; kept
+    // separately because the diffuse accessors are on the derived type.
+    PxParticleAndDiffuseBuffer* diffuse = nullptr;
 };
 
 // fluidMode (PXG_SCENE=particlefluid, P9.2) switches the cloud from a SOLID
@@ -678,7 +687,7 @@ struct ParticleScene
 ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
                                  PxCudaContextManager* cudaCtx, bool fluidMode = false,
                                  bool boundaryMode = false, bool meshFloorMode = false,
-                                 bool hfFloorMode = false)
+                                 bool hfFloorMode = false, bool diffuseMode = false)
 {
     ParticleScene out;
     out.cudaCtx = cudaCtx;
@@ -867,11 +876,51 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
                                         float(z) * particleSpacing - cz, particleInvMass);
             }
 
-    PxParticleBuffer* buffer = physics->createParticleBuffer(N, /*maxVolumes*/ 0, cudaCtx);
-    if (!buffer)
+    // P9.13a: the DIFFUSE variant allocates a different buffer type -- one that
+    // carries the diffuse position/velocity/lifetime arrays and the spawn
+    // parameters alongside the ordinary particle arrays.  Until this tranche
+    // `createParticleAndDiffuseBuffer` was a warn-and-null bridge stub, and
+    // NpParticleBuffer dereferences the result, so asking for one SEGFAULTED.
+    PxParticleBuffer* buffer = nullptr;
+    if (diffuseMode)
     {
-        std::printf("FAIL: createParticleBuffer returned null (bridge stub not replaced?)\n");
-        return out;
+        PxParticleAndDiffuseBuffer* db =
+            physics->createParticleAndDiffuseBuffer(N, /*maxVolumes*/ 0, MAX_DIFFUSE, cudaCtx);
+        if (!db)
+        {
+            std::printf("FAIL: createParticleAndDiffuseBuffer returned null "
+                        "(bridge stub not replaced?)\n");
+            return out;
+        }
+        // The spawn rule, PxDiffuseParticleParams (PxParticleBuffer.h:235-273):
+        // a particle spawns diffuse particles when its POTENTIAL -- a weighted sum
+        // of kinetic energy, pressure and velocity divergence -- exceeds
+        // `threshold`.  The default threshold of 100 is tuned for a large, violent
+        // splash; a 4x12x4 column collapsing under gravity never reaches it, so the
+        // scene would measure nothing and read as "the kernels do not work".
+        //
+        // PXG_DIFFUSE_THRESHOLD overrides it, and the CONTROL below sets it
+        // deliberately out of reach -- which is what makes this an A/B rather than
+        // a single number with a hopeful bound.
+        PxDiffuseParticleParams dp;
+        const char* thrEnv = std::getenv("PXG_DIFFUSE_THRESHOLD");
+        dp.threshold = std::getenv("PXG_DIFFUSE_CONTROL") ? 1.0e12f
+                     : (thrEnv ? float(atof(thrEnv)) : DIFFUSE_THRESHOLD);
+        dp.lifetime = 4.0f;            // long enough to survive the whole run
+        dp.useAccurateVelocity = true;
+        db->setDiffuseParticleParams(dp);
+        db->setMaxActiveDiffuseParticles(MAX_DIFFUSE);
+        out.diffuse = db;
+        buffer = db;
+    }
+    else
+    {
+        buffer = physics->createParticleBuffer(N, /*maxVolumes*/ 0, cudaCtx);
+        if (!buffer)
+        {
+            std::printf("FAIL: createParticleBuffer returned null (bridge stub not replaced?)\n");
+            return out;
+        }
     }
 
     // Fill the buffer's DEVICE arrays (getPositionInvMasses() et al. are device
@@ -4176,13 +4225,27 @@ int main()
     // the second producer of mOneWayContactInfos.
     const bool hfFloorScene = !std::strcmp(sceneName, "particlehffloor");
     const bool staticFloorScene = meshFloorScene || hfFloorScene;
+    // P9.13a: particlediffuse is the FLUID scene with a PxParticleAndDiffuseBuffer
+    // in place of the plain one.  It is the first scene in this port that asks the
+    // engine for diffuse particles at all -- which was impossible until this
+    // tranche replaced the createParticleAndDiffuseBuffer bridge stub, because the
+    // stub returned NULL and NpParticleBuffer dereferences it.
+    //
+    // ITS PURPOSE TODAY IS TO NAME WORK, NOT TO PASS.  Every kernel that creates,
+    // integrates, sorts, collides or compacts a diffuse particle is still
+    // unmapped, so the count stays at 0 and the check below fails.  That failure
+    // IS the deliverable: run it with PXG_LAUNCH_TRACE=1 and the REFUSED lines are
+    // the work list, in the engine's own launch order.  It lives in
+    // run_scenes.sh's DIAGNOSTIC list until the chain lands, and moves to the
+    // scored list in the tranche that makes it pass.
+    const bool diffuseScene = !std::strcmp(sceneName, "particlediffuse");
     const bool fluidScene = !std::strcmp(sceneName, "particlefluid") || boundaryScene
-                            || staticFloorScene;
+                            || staticFloorScene || diffuseScene;
     if (!std::strcmp(sceneName, "particle") || fluidScene)
     {
         ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx, fluidScene,
                                                boundaryScene || meshFloorScene, meshFloorScene,
-                                               hfFloorScene);
+                                               hfFloorScene, diffuseScene);
         if (!psc.system || !psc.buffer)
         {
             std::printf("[ FAIL ] gpu-sdk-step: particle scene build failed\n");
@@ -4215,6 +4278,11 @@ int main()
 
         float prevY = y0;
         int nonMonotonic = 0;
+        // P9.13a: the diffuse observable is a PEAK, not an end state -- diffuse
+        // particles are spawned while the fluid is agitated and expire as it
+        // settles, so a count read only at the end would be zero even on a working
+        // chain.
+        PxU32 maxDiffuseSeen = 0;
         float restMaxDy = 0.0f;   // max |dy| over the final quarter (rest convergence)
         const int restWindow = steps / 4;
         for (int i = 0; i < steps; ++i)
@@ -4234,6 +4302,8 @@ int main()
             if (y > prevY + 1e-3f) ++nonMonotonic;
             if (i >= steps - restWindow) restMaxDy = PxMax(restMaxDy, PxAbs(y - prevY));
             if (fluidScene) maxYSeen = PxMax(maxYSeen, y);
+            if (psc.diffuse)
+                maxDiffuseSeen = PxMax(maxDiffuseSeen, psc.diffuse->getNbActiveDiffuseParticles());
             prevY = y;
         }
         const float yEnd = particleMeanY(psc);
@@ -4411,7 +4481,77 @@ int main()
                               yEnd, HFFLOOR_REST_Y, HFFLOOR_REST_Y_TOL);
                   ++failures; }
             }
+            // P9.13a -- DIFFUSE PARTICLES.  The scene that names the diffuse chain.
+            //
+            // What is asked of the engine: a PxParticleAndDiffuseBuffer is attached
+            // to the fluid, given a reachable spawn threshold, and stepped.  A
+            // working chain spawns diffuse particles while the column collapses and
+            // lets them expire as it settles, so the count is read EVERY step and
+            // the peak is what is checked.
+            //
+            // What happens today: the count stays 0, because every kernel in the
+            // chain is unmapped --
+            //     ps_preDiffuseIntegrateLaunch          integrate + age
+            //     ps_calculateHashForDiffuseParticlesLaunch
+            //     ps_diffuseParticleCreate              the spawn itself
+            //     ps_diffuseParticleSum / Compact / Copy
+            //     ps_diffuseParticleUpdatePBF
+            //     ps_diffuseParticleOneWayCollision
+            //     ps_primitivesDiffuseCollisionLaunch / ps_convexDiffuseCollisionLaunch
+            //     ps_updateUnsortedDiffuseArrayLaunch
+            // -- so this scene FAILS on purpose and is listed as a DIAGNOSTIC.
+            //
+            // WHERE TO READ THE WORK LIST, and where NOT to.  PXG_LAUNCH_TRACE=1 is
+            // the wrong instrument here and says so by staying silent: an unmapped
+            // kernel has no CUfunction, so the engine's launch never reaches our
+            // shim and no REFUSED line is ever printed.  The trace shows only what
+            // the shim was actually handed.  The two signals that DO name this
+            // chain are the wrangler's startup list ("Could not find registered
+            // CUDA function 'ps_diffuse...'") and, per frame, the engine's own
+            // "GPU <kernel> fail to launch!!" -- which this scene emits 288 times
+            // for particlePrimitivesDiffuseCollisionLaunch, i.e. proof that the
+            // host really is driving the chain and not skipping it.
+            //
+            // The CONTROL (PXG_DIFFUSE_CONTROL=1) raises the threshold to 1e12 and
+            // changes nothing else, so when the chain lands the pair separates
+            // "spawning happened" from "spawning was never asked for".
+            if (diffuseScene)
+            {
+                const bool control = std::getenv("PXG_DIFFUSE_CONTROL") != nullptr;
+                std::printf("  particle DIFFUSE: peak active diffuse particles = %u of %u "
+                            "(threshold %s); mean y %.4f -> %.4f, nn %.4f\n",
+                            maxDiffuseSeen, MAX_DIFFUSE, control ? "1e12 (CONTROL)" : "reachable",
+                            y0, yEnd, nnEnd);
+                if (control)
+                {
+                    if (maxDiffuseSeen != 0u)
+                    { std::printf("FAIL: the control spawned %u diffuse particles at an "
+                                  "unreachable threshold\n", maxDiffuseSeen);
+                      ++failures; }
+                }
+                else if (maxDiffuseSeen == 0u)
+                { std::printf("FAIL: no diffuse particle was ever created -- the diffuse chain is "
+                              "unmapped (the work list is the wrangler's startup 'Could not find "
+                              "registered CUDA function ps_diffuse*' lines plus the per-frame "
+                              "'fail to launch' errors, NOT the launch trace -- see the note)\n");
+                  ++failures; }
+            }
             scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            if (failures == 0 && diffuseScene)
+            {
+                // The CONTROL passing means ONLY that nothing spawned when nothing
+                // was asked for.  It must never print the end-to-end claim -- that
+                // sentence is exactly the kind of thing a later reader would quote.
+                if (std::getenv("PXG_DIFFUSE_CONTROL"))
+                    std::printf("[  OK  ] gpu-sdk-step: the diffuse CONTROL spawned nothing at an "
+                                "unreachable threshold, as it must -- this says nothing about "
+                                "whether the diffuse chain works\n");
+                else
+                    std::printf("[  OK  ] gpu-sdk-step: the PBD fluid SPAWNED %u DIFFUSE PARTICLES "
+                                "(of %u) -- the diffuse chain runs end to end on Vulkan\n",
+                                maxDiffuseSeen, MAX_DIFFUSE);
+                return 0;
+            }
             if (failures == 0 && hfFloorScene)
             {
                 std::printf("[  OK  ] gpu-sdk-step: the PBD fluid rests on a COOKED HEIGHTFIELD "

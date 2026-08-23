@@ -260,7 +260,25 @@ public:
     {
         return static_cast<PxsParticleBuffer*>(PX_NEW(PxgParticleBuffer)(maxNumParticles, maxVolumes, cudaContextManager));
     }
-    PxsParticleAndDiffuseBuffer* createParticleAndDiffuseBuffer(PxU32, PxU32, PxU32, PxCudaContextManager&) PX_OVERRIDE { warnNotImplemented("createParticleAndDiffuseBuffer"); return NULL; }
+    // P9.13a: the DIFFUSE buffer, third of the four and the same shape as the two
+    // above -- PxgParticleAndDiffuseBuffer allocates its device arrays through the
+    // Vulkan shim and launches no kernels (mirrors physxgpu/src/PxgPhysXGpu.cpp:104-108).
+    //
+    // This stub was the gate in front of an ELEVEN-kernel sub-chain: every
+    // ps_diffuseParticle* kernel, ps_calculateHashForDiffuseParticlesLaunch,
+    // ps_preDiffuseIntegrateLaunch, ps_updateUnsortedDiffuseArrayLaunch and the
+    // two diffuse collision launches are unreachable while the engine cannot
+    // allocate a buffer to put diffuse particles in -- exactly the situation P9.4
+    // found for cloth.  Note the diffuse pass of ps_sdfMeshCollisonLaunch and
+    // ps_meshCollisonLaunch (P9.10/P9.12h) has been mapped and swept all along and
+    // has never once run in a live scene for the same reason.
+    PxsParticleAndDiffuseBuffer* createParticleAndDiffuseBuffer(PxU32 maxNumParticles, PxU32 maxVolumes,
+                                                               PxU32 maxNumDiffuseParticles,
+                                                               PxCudaContextManager& cudaContextManager) PX_OVERRIDE
+    {
+        return static_cast<PxsParticleAndDiffuseBuffer*>(PX_NEW(PxgParticleAndDiffuseBuffer)(
+            maxNumParticles, maxVolumes, maxNumDiffuseParticles, cudaContextManager));
+    }
     // P9.4: the PBD CLOTH buffer, the same shape as createParticleBuffer above and
     // for the same reason -- PxgParticleClothBuffer allocates its device arrays
     // through the Vulkan shim and launches no kernels, so it constructs as soon as
@@ -279,7 +297,23 @@ public:
         return static_cast<PxsParticleClothBuffer*>(PX_NEW(PxgParticleClothBuffer)(
             maxNumParticles, maxVolumes, maxNumCloths, maxNumTriangles, maxNumSprings, cudaContextManager));
     }
-    PxsParticleRigidBuffer* createParticleRigidBuffer(PxU32, PxU32, PxU32, PxCudaContextManager&) PX_OVERRIDE { warnNotImplemented("createParticleRigidBuffer"); return NULL; }
+    // P9.13a: the RIGID buffer, the last of the four (physxgpu/src/PxgPhysXGpu.cpp:116-120).
+    // Gate in front of the particle-vs-rigid ATTACHMENT sub-chain --
+    // ps_rigidAttachmentPrepareLaunch, ps_solveRigidAttachments{,TGS}Launch and
+    // ps_solvePCOutputRigidDeltaV{,TGS}Launch.
+    //
+    // With this, none of PxPhysXGpu's four particle-buffer factories returns NULL
+    // any more, and the warn-and-null contract the other stubs use is gone from
+    // this class entirely.  That contract was never survivable here: NpPhysics
+    // hands the result straight to the Np wrapper's constructor, which
+    // dereferences it, so a NULL SEGFAULTS rather than degrading.
+    PxsParticleRigidBuffer* createParticleRigidBuffer(PxU32 maxNumParticles, PxU32 maxVolumes,
+                                                     PxU32 maxNumRigids,
+                                                     PxCudaContextManager& cudaContextManager) PX_OVERRIDE
+    {
+        return static_cast<PxsParticleRigidBuffer*>(PX_NEW(PxgParticleRigidBuffer)(
+            maxNumParticles, maxVolumes, maxNumRigids, cudaContextManager));
+    }
 
     // P4 memory seam (real): the Vulkan PxsMemoryManager (device->shim,
     // host->malloc) feeding the REAL gpucommon buddy allocator manager, verbatim
