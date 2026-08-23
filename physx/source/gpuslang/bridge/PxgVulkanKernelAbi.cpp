@@ -957,6 +957,23 @@ static const uint8_t kPsMeshCollide[] = { 1, 4, 8, 8, 8, 8, 8, 8, 8, 72 };
 //   warp shape, unlike the mesh twin.
 static const uint8_t kPsHfCollide[] = { 1, 4, 8, 8, 8, 8, 8, 8, 8, 72 };
 
+// gpunarrowphase/src/CUDA/particleSystemMeshMidphase.cu:746 (P9.12h, the SDF
+// particle midphase + contact gen):
+//   ps_sdfMeshCollisonLaunch(const PxReal tolerenceLength,
+//     const PxgContactManagerInput*, const PxsCachedTransform*, const PxReal*
+//     contactDistance, const PxReal* restDistances, const PxgShape*,
+//     PxgParticleSystem*, PxNodeIndex* shapeToRigidRemapTable,
+//     PxgParticleContactWriter writer)
+//   The two siblings above start with a `bool isTGS`; THIS ONE DOES NOT.  Its
+//   list is otherwise theirs -- the dead PxReal, the same seven pointers and the
+//   same 72-byte by-value writer -- so the blob is 136 bytes there and 132 (padded
+//   to 136) here, with every field one slot earlier.  Reusing kPsHfCollide would
+//   shift every pointer by four bytes and hand the kernel a wild address.
+//   Launch site PxgNarrowphaseCore.cpp:3903: grid (numTests, 2, 1) x block
+//   (1024, 1, 1).  Note the grid shape is ALSO different from the two siblings',
+//   which put the pair on Y and the diffuse pass on Z; here the pair is on X.
+static const uint8_t kPsSdfCollide[] = { 4, 8, 8, 8, 8, 8, 8, 8, 72 };
+
 // gpucommon/src/CUDA/radixSortImpl.cu (P6.2 grid radix sort):
 //   radixSortMultiBlockLaunchWithoutCount(PxgRadixSortDesc* desc, PxU32 startBit)
 //   / radixSortMultiCalculateRanksLaunchWithoutCount(same ABI) — the numKeys
@@ -1628,6 +1645,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_meshCollisonLaunch", kPsMeshCollide, uint32_t(sizeof(kPsMeshCollide)) },
     // gpunarrowphase particleSystemHFMidPhaseCG.cu:262 (P9.11 particle-vs-heightfield)
     { "ps_heightfieldCollisonLaunch", kPsHfCollide, uint32_t(sizeof(kPsHfCollide)) },
+    { "ps_sdfMeshCollisonLaunch", kPsSdfCollide, uint32_t(sizeof(kPsSdfCollide)) },
     // gpucommon radixSortImpl.cu:39 / :53 — the PLAIN radix twins (P6.4b-1 BDA);
     // same {8,4} pack as the WithoutCount twins (numKeys deref'd on-device).
     { "radixSortMultiBlockLaunch", kRadixDescPlain, uint32_t(sizeof(kRadixDescPlain)) },

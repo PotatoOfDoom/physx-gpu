@@ -121,10 +121,27 @@ public void psWriteContact(PsContactWriter w, uint index, float4 normalPen,
 
 // ---------------------------------------------------------------------------
 // The rigid filter list, deformableElementFilter.cuh:118.
-// PxgRigidFilterPair (PxgSimulationCoreDesc.h, 32 B): index0 u64, index1 u64,
-// index2 u32, padding[3].
+//
+// THE STRUCT IS **PxParticleRigidFilterPair** (PxFiltering.h:740, 16 BYTES):
+// two PxU64 and nothing else.  NOT PxgRigidFilterPair (PxgSimulationCoreDesc.h,
+// 32 B with an index2 and three padding words) -- that one belongs to the
+// softbody/cloth attachment paths.
+//
+// deformableElementFilter.cuh carries BOTH families and an overload for each,
+// and `find(PxgParticleSystem&, PxU64, PxU64)` (:118) hands
+// `PxgParticleSimBuffer::mFilterPairs` -- a `PxParticleRigidFilterPair*` -- to
+// the 16-byte overload at :39, which compares with the struct's own
+// `operator==` / `operator<`, i.e. over (mID0, mID1) ONLY.  There is no index2
+// on this path and no `ignoreIndex2` argument.
+//
+// P9.10 got this wrong in both directions at once: the shader read a 32-byte
+// stride and its fixture WROTE one, so the two agreed and the sweep had nothing
+// to find -- the P8.49a failure mode exactly.  P9.12h's fixture builds the
+// filter list out of the engine's own `PxParticleRigidFilterPair`, which is
+// what exposed it.  A 32-byte reader over a 16-byte list picks up every other
+// entry and runs off the end of the allocation.
 // ---------------------------------------------------------------------------
-public struct PsPairR { public uint2 index0; public uint2 index1; public uint index2; public uint pad0, pad1, pad2; }
+public struct PsPairR { public uint2 mID0; public uint2 mID1; }
 
 public bool psU64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
 public bool psU64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
@@ -141,6 +158,14 @@ public uint psFindRange(Ptr<uint> values, uint length, uint value)
     return r - 1u;
 }
 
+// deformableElementFilter.cuh:39.  `pair == p` first, then `pair < p` -- and
+// `operator<` (PxFiltering.h:749) is NOT a total order's strict less-than
+// spelled the usual way: it is
+//     mID0 < o.mID0 || (mID0 == o.mID0 && mID1 < o.mID1)
+// which for an equal-mID0 pair falls through to the mID1 test.  Transcribed as
+// written rather than as `psU64Lt(q0,p.mID0) || (eq && psU64Lt(q1,p.mID1))`
+// collapsed into a comparator, because the equality test above it already
+// consumed the `==` case.
 public bool psFindRigid(uint64_t pairsAddr, uint nbPairs, uint2 q0, uint2 q1)
 {
     Ptr<PsPairR> pairs = Ptr<PsPairR>(pairsAddr);
@@ -149,15 +174,10 @@ public bool psFindRigid(uint64_t pairsAddr, uint nbPairs, uint2 q0, uint2 q1)
     {
         const uint mid = (l + r) / 2u;
         const PsPairR p = pairs[mid];
-        int cmp = 0;
-        if (psU64Lt(q0, p.index0)) cmp = -1;
-        else if (psU64Lt(p.index0, q0)) cmp = 1;
-        else if (psU64Lt(q1, p.index1)) cmp = -1;
-        else if (psU64Lt(p.index1, q1)) cmp = 1;
-        else if (0u < p.index2) cmp = -1;
-        if (cmp == 0 || (psU64Eq(q0, p.index0) && psU64Eq(q1, p.index1)))
+        if (psU64Eq(q0, p.mID0) && psU64Eq(q1, p.mID1))
             return true;
-        if (cmp < 0) r = mid; else l = mid + 1u;
+        const bool lt = psU64Lt(q0, p.mID0) || (psU64Eq(q0, p.mID0) && psU64Lt(q1, p.mID1));
+        if (lt) r = mid; else l = mid + 1u;
     }
     return false;
 }

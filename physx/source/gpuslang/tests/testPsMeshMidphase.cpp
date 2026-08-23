@@ -66,7 +66,7 @@
 #include "PxgParticleSystem.h"     // PxgParticleSystem, PxgParticleSimBuffer, PxgParticleContactWriter
 #include "PxgContactManager.h"     // PxgContactManagerInput
 #include "PxgConvexConvexShape.h"  // PxgShape
-#include "PxgSimulationCoreDesc.h" // PxgRigidFilterPair
+#include "PxFiltering.h"          // PxParticleRigidFilterPair (16 B, the particle path)
 #include "PxgNpKernelIndices.h"    // PS_MIDPHASE_COLLISION_WAPRS_PER_BLOCK
 #include "PxgParticleSystemCoreKernelIndices.h"
 #include "PxsTransformCache.h"     // PxsCachedTransform
@@ -507,7 +507,12 @@ struct BdaOptions
     bool enableCcd = true;
     bool isTgs = true;
     uint32_t nbFilterPairs = 0u;
-    std::vector<PxgRigidFilterPair> filterPairs;
+    // PxParticleRigidFilterPair, NOT PxgRigidFilterPair: the particle path's
+    // find() overload (deformableElementFilter.cuh:39) is over the 16-byte
+    // PxFiltering.h struct.  See the note in pxgSlangParticleContact.slang --
+    // this fixture used to mirror the 32-byte one and so agreed with a shader
+    // that read the wrong stride.
+    std::vector<PxParticleRigidFilterPair> filterPairs;
     // M1: when non-zero the descriptor gets a full diffuse side, so a gridDim.z of
     // 2 runs a real second pass instead of returning early.
     uint32_t maxDiffuse = 0u;
@@ -961,9 +966,11 @@ PXG_TEST(psMeshMidphaseLayout)
     PXG_CHECK_MSG(PxU32(PxParticleFlag::eFULL_DIFFUSE_ADVECTION) == 4u,
                   "1<<2 is eFULL_DIFFUSE_ADVECTION, which is what makes 1<<2 a trap");
 
-    // The filter list the port walks (a third copy of find(), see the shader header).
-    PXG_CHECK_MSG(sizeof(PxgRigidFilterPair) == 32, "PxgRigidFilterPair stride (got %zu)",
-                  sizeof(PxgRigidFilterPair));
+    // The filter list the port walks.  16 bytes, two PxU64 -- the struct the
+    // particle overload of find() actually indexes.
+    PXG_CHECK_MSG(sizeof(PxParticleRigidFilterPair) == 16,
+                  "PxParticleRigidFilterPair stride (got %zu)",
+                  sizeof(PxParticleRigidFilterPair));
     PXG_CHECK(offsetof(PxgParticleSimBuffer, mFilterPairs) == 40);
     PXG_CHECK(offsetof(PxgParticleSimBuffer, mNumFilterPairs) == 64);
     PXG_CHECK_MSG(sizeof(PxgParticleSimBuffer) == 88,
@@ -1637,22 +1644,67 @@ PXG_TEST(psMeshMidphaseFilter)
 
     BdaOptions filt;
     const PxNodeIndex staticNode(PX_INVALID_NODE, 0u);
+    auto isFilteredSorted = [](const std::vector<uint32_t>& v, uint32_t i) {
+        return std::find(v.begin(), v.end(), i) != v.end();
+    };
     for (uint32_t i : filteredSorted)
     {
-        PxgRigidFilterPair pr;
+        PxParticleRigidFilterPair pr;
         std::memset(&pr, 0, sizeof(pr));
-        pr.index0 = staticNode.getInd();
+        pr.mID0 = staticNode.getInd();
         // The LOCAL id inside buffer 1: the unsorted index minus that buffer's
         // runsum.  A port that queries with the unsorted index itself finds nothing.
-        pr.index1 = s2u[i] - FILTER_BUFFER_BASE;
-        pr.index2 = 0u;
+        pr.mID1 = s2u[i] - FILTER_BUFFER_BASE;
         filt.filterPairs.push_back(pr);
     }
-    // The binary search requires the list sorted by (index0, index1).
+    // DECOYS FOR TWO OTHER RIGIDS.  Without them the list carries exactly one
+    // mID0 value and every mID1 fits in 32 bits, and three distinct wrong
+    // comparators are indistinguishable from the right one (P9.12h's module
+    // sweep measured this: `f-eq-mid1-only`, `f-lt-mid1-only` and
+    // `f-u64lt-words-swapped` all survived).
+    //
+    //   * each decoy's mID1 is the local id of a particle that must be KEPT, so
+    //     a comparator that ignores mID0 filters it and the bit-identical
+    //     baseline comparison below fails;
+    //   * the two decoy node indices are chosen so the true 64-bit order and a
+    //     low-word-first order DISAGREE.  PxNodeIndex packs mID in the low word
+    //     and mLinkID in the high one, so
+    //         real  = 0x00000000'FFFFFFFF
+    //         decoy0= 0x00000001'FFFFFFF0
+    //         decoy1= 0x00000002'00000010
+    //     sorts real < decoy0 < decoy1 by value and decoy1 < decoy0 < real by
+    //     low word.  A binary search with the words swapped walks the wrong way
+    //     and stops finding the real entries.
+    {
+        std::vector<uint32_t> keptLocal;
+        for (uint32_t i = 0; i < Scene::NP && keptLocal.size() < 6; ++i)
+            if (baseCnt[i] != 0u && !isFilteredSorted(filteredSorted, i) &&
+                s2u[i] >= FILTER_BUFFER_BASE)
+                keptLocal.push_back(s2u[i] - FILTER_BUFFER_BASE);
+        PXG_CHECK_MSG(keptLocal.size() >= 4, "only %zu kept particles to decoy with",
+                      keptLocal.size());
+        const PxNodeIndex decoy0(0xFFFFFFF0u, 1u), decoy1(0x00000010u, 2u);
+        for (size_t k = 0; k < keptLocal.size(); ++k)
+        {
+            PxParticleRigidFilterPair pr;
+            std::memset(&pr, 0, sizeof(pr));
+            pr.mID0 = (k & 1u) ? decoy1.getInd() : decoy0.getInd();
+            pr.mID1 = keptLocal[k];
+            filt.filterPairs.push_back(pr);
+        }
+        PXG_CHECK_MSG(staticNode.getInd() < decoy0.getInd() &&
+                      decoy0.getInd() < decoy1.getInd(),
+                      "the decoy node indices must bracket the real one by VALUE");
+        PXG_CHECK_MSG(uint32_t(decoy1.getInd()) < uint32_t(decoy0.getInd()) &&
+                      uint32_t(decoy0.getInd()) < uint32_t(staticNode.getInd()),
+                      "...and reverse it by LOW WORD, or the swapped comparator is invisible");
+    }
+
+    // The binary search requires the list sorted by (mID0, mID1).
     std::sort(filt.filterPairs.begin(), filt.filterPairs.end(),
-              [](const PxgRigidFilterPair& a, const PxgRigidFilterPair& b) {
-                  if (a.index0 != b.index0) return a.index0 < b.index0;
-                  return a.index1 < b.index1;
+              [](const PxParticleRigidFilterPair& a, const PxParticleRigidFilterPair& b) {
+                  if (a.mID0 != b.mID0) return a.mID0 < b.mID0;
+                  return a.mID1 < b.mID1;
               });
     filt.nbFilterPairs = uint32_t(filt.filterPairs.size());
 
@@ -1701,6 +1753,45 @@ PXG_TEST(psMeshMidphaseFilter)
     size_t removed = 0;
     for (uint32_t i : filteredSorted) if (baseCnt[i] != 0u) ++removed;
     PXG_CHECK_MSG(removed >= 5, "the filter removed only %zu particles' contacts", removed);
+
+    // A ONE-ENTRY LIST NAMING A DIFFERENT RIGID.  The binary search probes index
+    // 0 and nothing else, so this is the only construction in which "the entry the
+    // search lands on carries the query's mID1 but another rigid's mID0" is
+    // guaranteed rather than hoped for -- and it is what a comparator that tests
+    // only mID1 needs to be seen at all (`f-eq-mid1-only` survived the decoys
+    // above because they all sort past the real block and are never probed).
+    // Nothing may be filtered: this list is about a rigid this pair is not.
+    {
+        uint32_t keptLocal = 0u; bool have = false;
+        for (uint32_t i = 0; i < Scene::NP && !have; ++i)
+            if (baseCnt[i] != 0u && !isFilteredSorted(filteredSorted, i) &&
+                s2u[i] >= FILTER_BUFFER_BASE)
+            { keptLocal = s2u[i] - FILTER_BUFFER_BASE; have = true; }
+        PXG_CHECK_MSG(have, "no kept particle in buffer 1 to build the one-entry list from");
+
+        BdaOptions one;
+        PxParticleRigidFilterPair pr;
+        std::memset(&pr, 0, sizeof(pr));
+        pr.mID0 = PxNodeIndex(0x00000010u, 2u).getInd();   // NOT this pair's rigid
+        pr.mID1 = keptLocal;
+        one.filterPairs.push_back(pr);
+        one.nbFilterPairs = 1u;
+
+        BdaRig O;
+        buildBda(dev, S, one, O);
+        {
+            Kernel k("psMeshMidphaseBda.spv", "ps_meshCollisonLaunch", {}, sizeof(PsMeshMidBlob));
+            k.dispatch(nbWarps, {}, O.blob, 1u, 1u);
+        }
+        dev->flush();
+        const auto oc = downloadBuffer<uint32_t>(dev, O.bCounts.h, S.nppad);
+        const auto oi = downloadBuffer<F4>(dev, O.bInfos.h, size_t(S.nppad) * MAXPART);
+        PXG_CHECK_MSG(std::memcmp(oc.data(), baseCnt.data(), oc.size() * 4) == 0,
+                      "a filter list naming ANOTHER rigid changed the contact counts");
+        PXG_CHECK_MSG(std::memcmp(oi.data(), baseInfos.data(), oi.size() * sizeof(F4)) == 0,
+                      "a filter list naming ANOTHER rigid changed the one-way infos");
+        O.destroy(dev);
+    }
 
     Bf.destroy(dev);
 

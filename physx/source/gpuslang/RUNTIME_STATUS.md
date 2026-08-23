@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **808/808** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **810/810** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **28/28** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (27 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die fünf Diagnose-Kontrollen
@@ -1698,6 +1698,136 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.12h — `ps_sdfMeshCollisonLaunch` (Manifest **342**), und ein Fixture, das einen Portierungsfehler aus P9.10 aufdeckte
+
+Der Kernel selbst: `particleSystemMeshMidphase.cu:375-570` plus der Startpunkt
+`:746`. Neuer Shader `shaders/psSdfMidphaseBda.slang`, ABI-Zeile
+`{4,8,8,8,8,8,8,8,72}`, Manifest **341 → 342**. Damit ist der letzte Erzeuger
+von `mOneWayContactInfos` abgebildet und P9.12 geschlossen.
+
+Zusammensetzung, keine vierte Transkription: die Kandidatensuche kommt aus
+P9.12e, der Kontaktentscheid aus P9.12f, Schreiber und Elementfilter aus
+P9.12g. Was diese Tranche hinzufügt, ist der Kitt — Shape-Paar-Auflösung,
+Cull-Toleranz, invertierte Mesh-Pose, die zwei verschiedenen Partikelindizes,
+die Statisch/Dynamisch-Weiche und die blockweite Reservierung.
+
+### DER BEFUND: `PxParticleRigidFilterPair` ist 16 Byte, nicht 32
+
+`deformableElementFilter.cuh` trägt **zwei** Filterfamilien und für jede eine
+eigene Überladung. Der Partikelpfad — `find(PxgParticleSystem&, PxU64, PxU64)`
+bei `:118` — reicht `PxgParticleSimBuffer::mFilterPairs` weiter, und das ist ein
+`PxParticleRigidFilterPair*`: **16 Byte, zwei `PxU64`, kein `index2`**
+(`PxFiltering.h:740`). Die 32-Byte-Struktur `PxgRigidFilterPair` mit `index2`
+und drei Füllwörtern gehört den Softbody-/Cloth-Anhängepfaden.
+
+**P9.10 hat das in beide Richtungen zugleich falsch gemacht**: der Shader las
+32 Byte Schrittweite, und sein Fixture *schrieb* 32 Byte. Beide waren sich einig,
+also hatte der Sweep nichts zu finden — genau die Fehlerform aus P8.49a, gegen
+die dieser Port sonst generiert und mit `static_assert` festnagelt. Ein
+32-Byte-Leser über einer 16-Byte-Liste greift jeden zweiten Eintrag ab und läuft
+über das Ende der Allokation hinaus; in der echten Engine hätte der Filter
+schlicht nicht funktioniert.
+
+Aufgefallen ist es, weil dieses Fixture die Filterliste aus der **Engine-eigenen**
+`PxParticleRigidFilterPair` baut statt aus der Struktur, die der Port zu lesen
+glaubte. Der erste Lauf meldete zwei Partikel mit einem Kontakt, wo die Vorhersage
+null erwartete — beide standen auf der Filterliste.
+
+Behoben in `pxgSlangParticleContact.slang` (Struktur, Vergleich und
+`operator<`-Reihenfolge nach `PxFiltering.h:749` statt nach
+`PxgRigidFilterPair::compare`) und in `testPsMeshMidphase.cpp`, dessen
+Spiegelstruktur mit umgestellt wurde. **Kein Engine-Fehler, ein Portierungsfehler
+— und der einzige der ganzen P9.12-Kette, der ein falsches Ergebnis auf echten
+Daten erzeugt hätte.**
+
+### DAS RASTER IST IMMER `(numTests, 2, 1)`
+
+`PxgNarrowphaseCore.cpp:3904` startet den Kernel ohne Ausnahme mit
+`gridDim.y == 2`: Block y=0 macht den festen Durchgang, Block y=1 den diffusen,
+im **selben** Start und über **denselben** Kontaktstrom. Es gibt keinen
+Nur-Fest-Start. Das erste Fixture modellierte die beiden Durchgänge als
+getrennte Konfigurationen und lag damit falsch; jede Konfiguration fährt jetzt
+beide, und `mMaxDiffuseParticles == 0` ist nicht „kein Diffustest", sondern der
+frühe Rücksprung, den y=1 dann nimmt.
+
+Der diffuse Durchgang bekam dabei eine **eigene** Partikelwolke mit **eigener**
+Anzahl (700 gegen 4001). Beides absichtlich verschieden: unter 1024 nimmt die
+Sammlung dort genau eine Runde, wo die feste zwei braucht, und „lies das diffuse
+Feld" ist nicht mehr dieselbe Antwort wie „lies das feste".
+
+### Das Rennen, das NICHT behauptet wird
+
+Beide Blöcke reservieren über **einen** Atomar-Zähler, einmal je Sammelrunde.
+Welche Indizes der feste Durchgang bekommt, ist damit ein Rennen, und die
+P9.11-Regel gilt: nie den Ausgang eines Rennens behaupten. Bestimmt ist
+stattdessen dreierlei, und genau das wird geprüft:
+
+* die Summe ist feste + diffuse Überlebende (W11 — der diffuse Durchgang
+  reserviert Plätze, die er nie beschreibt);
+* die **Menge** der beschriebenen Plätze hat genau die Größe der festen
+  Überlebendenzahl;
+* in aufsteigender Platzreihenfolge sind die geschriebenen Kontakte die des
+  festen Durchgangs, in dessen eigener Runden-dann-Thread-Ordnung.
+
+### Deckung wird GEFORDERT, nicht angenommen
+
+Drei Dinge, die der erste Entwurf zu haben glaubte und nicht hatte:
+
+1. **Die Wiederaufnahmeschleife hängt an der TREFFERZAHL, nicht an der
+   Partikelzahl.** `findInterestingVertices` sammelt, bis der 1024-Platz-Puffer
+   **voll** ist. 1500 Partikel mit 449 Treffern sind *eine* Runde. NP ist jetzt
+   4001, und `runOne` **verlangt** ≥ 2 Runden.
+2. **Die Kapazitätsgrenze wurde nie überschritten.** Mit Vorbelegung 11 landet
+   der Kontakt noch in Spalte 11. Erst Vorbelegung 12 zeigt das Zusammenspiel
+   von W7 (der Zähler wächst bedingungslos) und W9 (die Kandidatur wird nur
+   gelöscht, wenn wirklich gespeichert wurde): ein übervolles Partikel behält
+   seine Kandidatur und erreicht den Kontaktstrom, **obwohl der Körper statisch
+   ist**. Das ist jetzt eine eigene Konfiguration.
+3. **Der diffuse Durchgang berührte keinen gefilterten Index.** Er fragt nur
+   Indizes unter 700 ab; die fünf ursprünglichen Filtereinträge landeten alle
+   darüber. Die Liste enthält jetzt zusätzlich Einträge, die von dort erreichbar
+   sind, und das Fixture verlangt, dass der diffuse Durchgang Kandidaten trägt,
+   die der Filter entfernen *würde* — sonst ist „der Filter läuft auch diffus"
+   unbeobachtbar.
+
+Dazu eine **negative Skalenkomponente** (1.17, **-0.74**, 1.86). Die CUDA teilt
+durch `scale.abs().minElement()`; bei durchweg positiver Skala ist ein Port, der
+das `abs()` vergisst, aus Versehen richtig. |-0.74| bleibt das Minimum, die
+beiden Schreibweisen unterscheiden sich also nur im Vorzeichen — was der ganze
+Punkt ist.
+
+### Sweeps
+
+**Kernel, erster Durchlauf: 48 Mutanten, 43 getötet, 5 Überlebende.** Zwei davon
+waren die Fixture-Löcher 3 und 2 oben (`w3-cullscale-unsigned-min`,
+`w6-filter-runs-for-diffuse`); nach dem Schließen **45 von 48**.
+
+Die drei verbleibenden Überlebenden, diagnostiziert:
+
+| Überlebender | Diagnose |
+|---|---|
+| `w-diffuse-is-gidy0` | **äquivalent, bewiesen.** Bei `gridDim.y == 2` benennt `blockIdx.y == 1` nur, *welcher* der beiden Blöcke welche Rolle übernimmt. Beide laufen, keine andere Stelle liest `gid.y`, die Rollen werden also lediglich getauscht. Der einzige Unterschied wäre, wer das Atomar-Rennen gewinnt — und das wird nach der P9.11-Regel ohnehin nicht behauptet. |
+| `sd-scan-no-leading-barrier` | **äquivalent auf dem Emulationspfad, nicht per Vertrag** — dieselbe Mechanik wie `find-loop-barrier-dropped` in P9.12e: `sdfBlockScanExclusive` beginnt mit `pxgBallotSync`, und das setzt auf dem Emulationspfad selbst zwei Workgroup-Barrieren, bevor es irgendetwas liest. |
+| `sd-scan-no-trailing-barrier` | **auf llvmpipe nicht beobachtbar, per Vertrag ein Rennen.** llvmpipe fährt die Subgroups einer Workgroup zwischen zwei Barrieren nacheinander und aufsteigend durch; `gSdGlobalOffset` wird von tid 0 in Subgroup 0 geschrieben und von allen späteren Subgroups nach deren Abschluss gelesen, innerhalb von Subgroup 0 ordnet die Programmreihenfolge. Auf einem Backend mit echter Nebenläufigkeit ist das Streichen ein echtes Rennen. Die Barriere bleibt. |
+
+Dass die beiden Barrieren-Mutanten hier **nicht** als „äquivalent" durchgehen,
+ist der Unterschied zwischen einer Diagnose und einer Ausrede: der Mutant ist
+falsch, CI kann es bloß nicht zeigen — `PXG_WARP_NATIVE=1` ist auf llvmpipe
+(Subgroup 8) für diesen Shader nicht baubar.
+
+**Filtermodul, gegen `psMeshMidphase` (zwei Puffer, Runsum ≠ 0): 15 Mutanten, **15 getötet** (11 durch Fehlschlag, 4 durch Absturz).**
+Die geänderte Struktur wird damit erneut geprüft, und zwar an der Suite, die den
+Runsum-Abzug und die Puffer-Auswahl überhaupt unterscheiden kann.
+
+### Verifikation
+
+* `ctest -R gpuslang.psSdfMidphase` grün, forced-fresh, beide Tests;
+* volle Suite **810/810** in **beiden** Speichermodi;
+* Manifest **341 → 342**, also `build-sdk` neu gebaut und `tools/run_scenes.sh`
+  gefahren: **28 ok, 0 fail, 0 missing (von 28)**;
+* dazu der Modul-Sweep über `pxgSlangParticleContact` gegen `psMeshMidphase`,
+  weil die Filterstruktur sich geändert hat.
 
 ## P9.12g — die Partikel-Kontakt-Infrastruktur wird ein Modul, und der Sweep findet zwei alte Lücken
 
