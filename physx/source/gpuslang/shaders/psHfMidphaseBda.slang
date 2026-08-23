@@ -240,6 +240,8 @@
 
 import pxgSlangCommon;
 import pxgSlangParticleDesc;
+// P9.12g: the contact writer, LoadShapePair and the two records they move.
+import pxgSlangParticleContact;
 
 // ---------------------------------------------------------------------------
 // Constants, all pinned by the fixture's layout test.
@@ -300,16 +302,6 @@ struct PsHfMidPush
 }
 [[vk::push_constant]]
 ConstantBuffer<PsHfMidPush> gHf;
-
-struct PxgContactManagerInput { uint shapeRef0, shapeRef1, transformCacheRef0, transformCacheRef1; }
-
-// PxgParticlePrimitiveContact (32 bytes) -- the record P9.8 and P9.10 also use.
-struct PsContact
-{
-    float4 normal_pen;
-    uint2 rigidId;
-    uint2 particleId;
-}
 
 // ---------------------------------------------------------------------------
 // The heightfield sample block, read over BDA.
@@ -503,23 +495,26 @@ bool particleTriangleTest(inout float3 normal, inout float distance,
     return false;
 }
 
-// PxgParticleContactWriter::writeContact (PxgParticleSystem.h:615)
+// The eight writer pointers and the capacity, out of this shader's push block
+// and into the shared record pxgSlangParticleContact defines.
+PsContactWriter hfWriter()
+{
+    PsContactWriter w;
+    w.particleContacts = gHf.w_particleContacts;
+    w.numTotalContacts = gHf.w_numTotalContacts;
+    w.contactSortedByParticle = gHf.w_contactSortedByParticle;
+    w.tempContactByParticle = gHf.w_tempContactByParticle;
+    w.contactIndexSortedByParticle = gHf.w_contactIndexSortedByParticle;
+    w.contactByRigid = gHf.w_contactByRigid;
+    w.tempContactByRigid = gHf.w_tempContactByRigid;
+    w.contactIndexSortedByRigid = gHf.w_contactIndexSortedByRigid;
+    w.maxContacts = gHf.w_maxContacts;
+    return w;
+}
+
 void writeContact(uint index, float4 normalPen, uint2 compressedParticleIndex, uint2 rigidId)
 {
-    if (index < gHf.w_maxContacts)
-    {
-        (Ptr<uint2>(gHf.w_contactByRigid))[index] = rigidId;
-        (Ptr<uint>(gHf.w_tempContactByRigid))[index] = rigidId.x;
-        (Ptr<uint>(gHf.w_contactIndexSortedByRigid))[index] = index;
-        (Ptr<uint2>(gHf.w_contactSortedByParticle))[index] = compressedParticleIndex;
-        (Ptr<uint>(gHf.w_tempContactByParticle))[index] = compressedParticleIndex.x;
-        (Ptr<uint>(gHf.w_contactIndexSortedByParticle))[index] = index;
-        PsContact ct;
-        ct.normal_pen = normalPen;
-        ct.rigidId = rigidId;
-        ct.particleId = compressedParticleIndex;
-        (Ptr<PsContact>(gHf.w_particleContacts))[index] = ct;
-    }
+    psWriteContact(hfWriter(), index, normalPen, compressedParticleIndex, rigidId);
 }
 
 // LoadShapePairWarp<ePARTICLESYSTEM, eHEIGHTFIELD> (particleSystemHFMidPhaseCG.cu:293).
@@ -530,17 +525,8 @@ void loadParticleHeightfieldPair(uint cmIdx,
                                  out PxgShape psShape, out uint psCacheRef,
                                  out PxgShape hfShape, out uint hfCacheRef)
 {
-    const PxgContactManagerInput cin = Ptr<PxgContactManagerInput>(gHf.cmInputs)[cmIdx];
-    Ptr<PxgShape> shapes = Ptr<PxgShape>(gHf.gpuShapes);
-    uint sRefPs = cin.shapeRef0, cRefPs = cin.transformCacheRef0;
-    uint sRefHf = cin.shapeRef1, cRefHf = cin.transformCacheRef1;
-    if (shapes[cin.shapeRef0].type != GEOM_PARTICLESYSTEM)
-    {
-        sRefPs = cin.shapeRef1; cRefPs = cin.transformCacheRef1;
-        sRefHf = cin.shapeRef0; cRefHf = cin.transformCacheRef0;
-    }
-    psShape = shapes[sRefPs]; psCacheRef = cRefPs;
-    hfShape = shapes[sRefHf]; hfCacheRef = cRefHf;
+    psLoadShapePair(gHf.cmInputs, gHf.gpuShapes, cmIdx, GEOM_PARTICLESYSTEM,
+                    psShape, psCacheRef, hfShape, hfCacheRef);
 }
 
 // ===========================================================================

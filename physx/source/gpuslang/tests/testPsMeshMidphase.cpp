@@ -1191,12 +1191,22 @@ PXG_TEST(psMeshMidphase)
         }
         PXG_CHECK_MSG(mism == 0, "dynamic rigid: %zu particles' writer contacts differ", mism);
 
-        // The three sibling arrays the writer fills beside the contact record.
+        // ALL SIX sibling arrays the writer fills beside the contact record.
+        //
+        // It used to be four.  P9.12g lifted writeContact into
+        // pxgSlangParticleContact and swept it against THIS suite, and two
+        // mutants survived -- one that offset contactIndexSortedByRigid and one
+        // that wrote the rigid id into contactSortedByParticle.  Neither was
+        // caused by the lift: those two arrays were bound here and then never
+        // read back, so half the writer's stores had no assertion behind them at
+        // all.  Giving the code a single home is what made the gap visible.
         {
             const auto aIdx = downloadBuffer<uint32_t>(dev, A.bIbP.h, Scene::CAP);
             const auto aTbP = downloadBuffer<uint32_t>(dev, A.bTbP.h, Scene::CAP);
             const auto aBr = downloadBuffer<uint64_t>(dev, A.bBr.h, Scene::CAP);
             const auto aTbr = downloadBuffer<uint32_t>(dev, A.bTbr.h, Scene::CAP);
+            const auto aIbr = downloadBuffer<uint32_t>(dev, A.bIbr.h, Scene::CAP);
+            const auto aSbP = downloadBuffer<uint64_t>(dev, A.bSbP.h, Scene::CAP);
             const PxNodeIndex dyn(0x77u, 4u);
             size_t bad = 0;
             for (uint32_t i = 0; i < aWc; ++i)
@@ -1205,6 +1215,12 @@ PXG_TEST(psMeshMidphase)
                 if (aTbP[i] != aCt[i].pLo) ++bad;
                 if (aBr[i] != dyn.getInd()) ++bad;
                 if (aTbr[i] != uint32_t(dyn.getInd() & 0xFFFFFFFFull)) ++bad;
+                // The two that were never checked.  Both are plain identities:
+                // the rigid-sorted index is the slot itself, and the
+                // particle-sorted key is the compressed particle index the
+                // contact record carries.
+                if (aIbr[i] != i) ++bad;
+                if (aSbP[i] != (uint64_t(aCt[i].pHi) << 32) + uint64_t(aCt[i].pLo)) ++bad;
             }
             PXG_CHECK_MSG(bad == 0, "%zu writer sibling-array entries are wrong", bad);
             // Past the live count everything must still be poison.

@@ -1699,6 +1699,92 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.12g — die Partikel-Kontakt-Infrastruktur wird ein Modul, und der Sweep findet zwei alte Lücken
+
+Kein neuer Kernel, keine neue Numerik. Diese Tranche zieht heraus, was drei
+Midphase-Shader sich jeweils selbst hingeschrieben hatten, und stellt zwei davon
+darauf um. Manifest **unverändert bei 341**, Suite **808/808**.
+
+### Warum jetzt
+
+Der Kommentar in `psMeshMidphaseBda` (P9.10) hat es selbst angekündigt:
+
+> „This is a THIRD copy in the corpus … Extracting all three is its own tranche;
+> duplicating a fourth time would not be."
+
+`ps_sdfMeshCollisonLaunch` ist der vierte Aufrufer, und er braucht **beides** —
+den Kontaktschreiber und den Rigid-Elementfilter. Ohne diesen Schritt wäre er
+Kopie vier des Schreibers und Kopie zwei des Filters geworden.
+
+### Was gewandert ist
+
+Neues Modul `shaders/pxgSlangParticleContact.slang`:
+
+| was | woher |
+|---|---|
+| `PxgParticleContactWriter::writeContact` | psMeshMidphaseBda, psHfMidphaseBda |
+| der Rigid-Elementfilter (`find`/`findRange`/`findRigid`) | psMeshMidphaseBda |
+| `LoadShapePair<A, B>` | psMeshMidphaseBda, psHfMidphaseBda |
+| `PxgParticlePrimitiveContact`, `PxgContactManagerInput` | beide |
+
+**Was bewusst NICHT gewandert ist:** `psContactGenBda` und
+`femClothContactGenBda` tragen eigene Filtervarianten über **privaten**
+Abfragestrukturen, und keiner der beiden ist ein Modul. Die einzufalten wäre
+eine Änderung an zwei Shadern, für die diese Tranche kein Fixture hat. Sie
+bleiben unangetastet und stehen im Modulkopf benannt, damit der Nächste weiß,
+dass die Extraktion noch **unvollständig** ist.
+
+### Die eine Verallgemeinerung, und warum sie ein Parameter ist
+
+`LoadShapePair` ist in der CUDA ein Template auf **zwei** Geometrietypen, und die
+beiden Aufrufer sind sich nicht einig, welchen davon es prüft: die Mesh-Midphase
+prüft das **Dreiecksnetz** (`particleSystemMeshMidphase.cu:403`), die
+Heightfield-Midphase das **Partikelsystem** (`particleSystemHFMidPhaseCG.cu:293`).
+Statt eine der beiden Lesarten zu wählen und den Unterschied zu begraben, nimmt
+`psLoadShapePair` den geprüften Typ als Argument und gibt die passende Hälfte
+zuerst zurück. Die Wahl bleibt damit an **jeder Aufrufstelle sichtbar** — dort,
+wo sie eine Falle ist.
+
+Der Schreiber konnte nicht unverändert wandern: die drei privaten Kopien griffen
+direkt in den Push-Constant-Block ihres eigenen Shaders. Ein Modul kann das
+nicht, also gibt es jetzt einen `PsContactWriter`-Datensatz, den jeder Shader
+aus seinem Block zusammensetzt — was ohnehin die ehrlichere Form ist, denn die
+Engine übergibt die Struktur ebenfalls **als Wert**.
+
+### Der Sweep, und was er über das ALTE Fixture herausfand
+
+Ein Lift hat keine neue Behauptung; seine Verifikation ist „das Ausgezogene ist
+weiterhin von den Tests gedeckt, die es vorher deckten". Also: 20 Mutanten gegen
+das Modul, gefahren gegen die **bestehende** `psMeshMidphase`-Suite (fünf Tests
+aus P9.10).
+
+**Erster Durchlauf: 20 Mutanten, 18 getötet, 2 Überlebende** —
+`w-rigid-sortindex-off` (verschiebt `contactIndexSortedByRigid`) und
+`w-byparticle-gets-rigid` (schreibt die Rigid-ID in
+`contactSortedByParticle`).
+
+**Beide waren vorbestehende Lücken, nicht vom Lift verursacht.** Das P9.10-Fixture
+band diese zwei Puffer und las sie **nie zurück** — die Hälfte der Speicherstellen
+des Schreibers hatte gar keine Zusicherung hinter sich. Der Lift hat das
+sichtbar gemacht: erst als der Code **eine** Heimat bekam, die einen eigenen
+Sweep verdient, fiel die Lücke auf.
+
+Geschlossen, statt bloß diagnostiziert: das Fixture liest jetzt **alle sechs**
+Geschwisterarrays zurück. Beide fehlenden Prüfungen sind schlichte Identitäten —
+der rigid-sortierte Index ist der Slot selbst, und der partikel-sortierte
+Schlüssel ist der komprimierte Partikelindex, den der Kontaktdatensatz ohnehin
+trägt.
+
+**Zweiter Durchlauf gegen das ergänzte Fixture: 20 Mutanten, 20 getötet, null
+Überlebende**, 0 NOCOMPILE, 0 ANCHOR-FAIL.
+
+### Verifikation
+
+* die zwölf Tests, die den Umzug prüfen (`psMeshMidphase*`, `psHfMidphase*`),
+  grün in dem Moment, in dem er landet — das ist die Verifikation eines Lifts;
+* volle Suite **808/808** in **beiden** Speichermodi, forced-fresh;
+* Manifest unverändert, also kein Szenenlauf.
+
 ## P9.12f — der Kontaktentscheid pro Partikel, und ein Sweep, der vier Fixture-Löcher fand
 
 Portiert `particleSystemMeshMidphase.cu:493-570`, den Rumpf von

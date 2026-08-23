@@ -172,6 +172,10 @@
 import pxgSlangCommon;
 import pxgSlangParticleDesc;
 import pxgSlangBv32;   // P8.25: the Gu::BV32DataPacked reader, shared
+// P9.12g: the contact writer, the rigid element filter, LoadShapePair and the
+// two records they move -- extracted here when ps_sdfMeshCollisonLaunch became
+// the fourth caller.  What used to sit in this file is now one import.
+import pxgSlangParticleContact;
 
 // ---------------------------------------------------------------------------
 // Constants, all pinned by the fixture's layout test.
@@ -228,18 +232,8 @@ struct PsMeshMidPush
 [[vk::push_constant]]
 ConstantBuffer<PsMeshMidPush> gMm;
 
-struct PxgContactManagerInput { uint shapeRef0, shapeRef1, transformCacheRef0, transformCacheRef1; }
-
 // PxgShape (PxgConvexConvexShape.h, 48 B) comes from pxgSlangCommon.  Three of
 // the older BDA midphases carry private copies; this one does not need to.
-
-// PxgParticlePrimitiveContact (32 bytes) -- the same record P9.8 reads.
-struct PsContact
-{
-    float4 normal_pen;
-    uint2 rigidId;
-    uint2 particleId;
-}
 
 // ---------------------------------------------------------------------------
 // Groupshared: ONE warp per block, so one slot each.
@@ -365,104 +359,37 @@ bool particleTriangleTest(inout float3 normal, inout float distance,
 // bvNbNodes / GU_BV4_CHILD_OFFSET_SHIFT_COUNT / BV32_STRIDE) -- the same one the
 // four other midphases use.  Nothing about the node format is repeated here.
 
-// ---------------------------------------------------------------------------
-// The rigid filter list.  find(particleSystem, rigidId, compressedParticleId)
-// (deformableElementFilter.cuh:118) via findRange over mParticleBufferRunsum and
-// the per-buffer binary search.  This is a THIRD copy in the corpus
-// (psContactGenBda, femClothContactGenBda are the others) for the reason the
-// geometry helpers are duplicated: those two carry their own private query
-// structs and neither is an importable module.  Extracting all three is its own
-// tranche; duplicating a fourth time would not be.
-// ---------------------------------------------------------------------------
-// PxgRigidFilterPair (PxgSimulationCoreDesc.h, 32 B): index0 u64, index1 u64,
-// index2 u32, padding[3].
-struct PsPairR { uint2 index0; uint2 index1; uint index2; uint pad0, pad1, pad2; }
-
-bool psU64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
-bool psU64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
-
-uint psFindRange(Ptr<uint> values, uint length, uint value)
+// The eight writer pointers and the capacity, out of this shader's push block
+// and into the shared record pxgSlangParticleContact defines.
+PsContactWriter mmWriter()
 {
-    if (length == 0u) return 0u;
-    uint l = 0u, r = length;
-    while (l < r)
-    {
-        const uint m = (l + r) / 2u;
-        if (values[m] > value) r = m; else l = m + 1u;
-    }
-    return r - 1u;
+    PsContactWriter w;
+    w.particleContacts = gMm.w_particleContacts;
+    w.numTotalContacts = gMm.w_numTotalContacts;
+    w.contactSortedByParticle = gMm.w_contactSortedByParticle;
+    w.tempContactByParticle = gMm.w_tempContactByParticle;
+    w.contactIndexSortedByParticle = gMm.w_contactIndexSortedByParticle;
+    w.contactByRigid = gMm.w_contactByRigid;
+    w.tempContactByRigid = gMm.w_tempContactByRigid;
+    w.contactIndexSortedByRigid = gMm.w_contactIndexSortedByRigid;
+    w.maxContacts = gMm.w_maxContacts;
+    return w;
 }
 
-bool psFindRigid(uint64_t pairsAddr, uint nbPairs, uint2 q0, uint2 q1)
-{
-    Ptr<PsPairR> pairs = Ptr<PsPairR>(pairsAddr);
-    uint l = 0u, r = nbPairs;
-    while (l < r)
-    {
-        const uint mid = (l + r) / 2u;
-        const PsPairR p = pairs[mid];
-        int cmp = 0;
-        if (psU64Lt(q0, p.index0)) cmp = -1;
-        else if (psU64Lt(p.index0, q0)) cmp = 1;
-        else if (psU64Lt(q1, p.index1)) cmp = -1;
-        else if (psU64Lt(p.index1, q1)) cmp = 1;
-        else if (0u < p.index2) cmp = -1;
-        if (cmp == 0 || (psU64Eq(q0, p.index0) && psU64Eq(q1, p.index1)))
-            return true;
-        if (cmp < 0) r = mid; else l = mid + 1u;
-    }
-    return false;
-}
-
-bool psFindFilter(Ptr<PxgParticleSystemGpu> systems, uint psId, uint2 rigidId, uint2 particleMask)
-{
-    const uint particleId = particleMask.x;   // PxGetParticleIndex = the low word
-    const uint numBuffers = systems[psId].mCommonData_NumParticleBuffers;
-    Ptr<uint> runsum = Ptr<uint>(systems[psId].mParticleBufferRunsum);
-    const uint id = psFindRange(runsum, numBuffers, particleId);
-    Ptr<PxgParticleSimBufferGpu> simBufs = Ptr<PxgParticleSimBufferGpu>(systems[psId].mParticleSimBuffers);
-    const uint64_t pairsAddr = simBufs[id].mFilterPairs;
-    const uint nbPairs = simBufs[id].mNumFilterPairs;
-    const uint localId = particleId - runsum[id];
-    return psFindRigid(pairsAddr, nbPairs, rigidId, uint2(localId, 0u));
-}
-
-// PxgParticleContactWriter::writeContact (PxgParticleSystem.h:615)
 void writeContact(uint index, float4 normalPen, uint2 compressedParticleIndex, uint2 rigidId)
 {
-    if (index < gMm.w_maxContacts)
-    {
-        (Ptr<uint2>(gMm.w_contactByRigid))[index] = rigidId;
-        (Ptr<uint>(gMm.w_tempContactByRigid))[index] = rigidId.x;
-        (Ptr<uint>(gMm.w_contactIndexSortedByRigid))[index] = index;
-        (Ptr<uint2>(gMm.w_contactSortedByParticle))[index] = compressedParticleIndex;
-        (Ptr<uint>(gMm.w_tempContactByParticle))[index] = compressedParticleIndex.x;
-        (Ptr<uint>(gMm.w_contactIndexSortedByParticle))[index] = index;
-        PsContact ct;
-        ct.normal_pen = normalPen;
-        ct.rigidId = rigidId;
-        ct.particleId = compressedParticleIndex;
-        (Ptr<PsContact>(gMm.w_particleContacts))[index] = ct;
-    }
+    psWriteContact(mmWriter(), index, normalPen, compressedParticleIndex, rigidId);
 }
 
-// LoadShapePair<eTRIANGLEMESH, ePARTICLESYSTEM>: the trimesh is whichever half of
-// the pair IS the triangle mesh; the particle system is the other.
+// LoadShapePair<eTRIANGLEMESH, ePARTICLESYSTEM>: the TRIANGLE MESH is the tested
+// type here, so the trimesh half comes back first.  The heightfield twin tests
+// the PARTICLE SYSTEM instead -- see pxgSlangParticleContact's header.
 void loadTrimeshParticlePair(uint cmIdx,
                              out PxgShape triShape, out uint triCacheRef,
                              out PxgShape psShape, out uint psCacheRef)
 {
-    const PxgContactManagerInput cin = Ptr<PxgContactManagerInput>(gMm.cmInputs)[cmIdx];
-    Ptr<PxgShape> shapes = Ptr<PxgShape>(gMm.gpuShapes);
-    uint sRefTri = cin.shapeRef0, cRefTri = cin.transformCacheRef0;
-    uint sRefPs = cin.shapeRef1, cRefPs = cin.transformCacheRef1;
-    if (shapes[cin.shapeRef0].type != GEOM_TRIANGLEMESH)
-    {
-        sRefTri = cin.shapeRef1; cRefTri = cin.transformCacheRef1;
-        sRefPs = cin.shapeRef0; cRefPs = cin.transformCacheRef0;
-    }
-    triShape = shapes[sRefTri]; triCacheRef = cRefTri;
-    psShape = shapes[sRefPs]; psCacheRef = cRefPs;
+    psLoadShapePair(gMm.cmInputs, gMm.gpuShapes, cmIdx, GEOM_TRIANGLEMESH,
+                    triShape, triCacheRef, psShape, psCacheRef);
 }
 
 // ---------------------------------------------------------------------------
