@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **806/806** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **807/807** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **28/28** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (27 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die fünf Diagnose-Kontrollen
@@ -1698,6 +1698,190 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.12e — die blockweite Kandidatensuche, 32 emulierte Warps in EINER Workgroup
+
+Portiert drei aufeinander stehende Stücke:
+
+| CUDA | Zeilen |
+|---|---|
+| `threadBlockScanExclusive<NbWarps>` | `reduction.cuh:597-623` |
+| `addIndexToBuffer<PxU32, ...>` | `sdfCollision.cuh:496-520` |
+| `findInterestingVertices<32, 1024>` | `sdfCollision.cuh:690-726` |
+
+Neuer Header `shaders/pxgSlangSdfFind.slang`, Einstiegspunkt `npSdfFind.slang`,
+Fixture `tests/testSdfFind.cpp`. Manifest **unverändert bei 341**.
+
+### Was diese Schicht ist: ein FORTSETZBARER Strom, kein Filter
+
+Bevor `ps_sdfMeshCollisonLaunch` irgendeine Kontaktarbeit tut, streicht es das
+ganze Partikelfeld durch, behält die Partikel, deren `PxSdfDistance` unter der
+Cull-Toleranz liegt, und übergibt dem Kollisionsrumpf eine dichte Liste von
+höchstens 1024 davon. Passen mehr, merkt es sich, **wo es weitermachen muss**,
+und der Kernel ruft erneut. Die Substanz dieser Tranche ist deshalb nicht der
+Scan, sondern das **Protokoll zwischen den Aufrufen**.
+
+### Eine neue Form für diesen Port: 1024 Threads
+
+Jeder bisherige Partikelkernel war ein oder zwei Warps pro Workgroup (32 oder
+64 Threads). Dieser ist **32 emulierte Warps in einer einzigen 1024-Thread-
+Workgroup** — das Maximum, das llvmpipe erlaubt
+(`maxComputeWorkGroupInvocations = 1024`, von `pxg-caps` gemessen) — und
+braucht einen **zweistufigen** Scan: ein Ballot je Warp, dann ein Scan über die
+32 Warp-Summen.
+
+Auf dem Emulationspfad ist **jede** Warp-Primitive eine Workgroup-Barriere,
+also muss **jede Aufrufstelle workgroup-uniform** sein — schärfer als CUDAs
+Warp-Konvergenz. Das gilt hier konstruktiv, und der Grund ist erwähnenswert:
+die Schleifenbedingung ist `i < nbVertices` mit `i += blockDim.x`, also läuft
+jeder Thread gleich oft, unabhängig davon, was er gefunden hat.
+
+Geteilter Speicher: 1024 + 1024 + 32 + 1 `uint` = **8324 Bytes** von 32 KiB.
+
+### Zwölf Fallen, jede mit einem Mutanten
+
+Die Header-Kopfzeile führt sie als S1–S12. Die, die nicht offensichtlich sind:
+
+* **S1 — dasselbe Array, zwei verschiedene Indizes, in einem Ausdruck.** Die
+  Warp-Zähler werden einmal per **LANE** gelesen (`perWarpCountS[threadIndexInWarp]`,
+  der Wert, den jede Spur scannt) und einmal per **WARP**
+  (`perWarpCountS[warpIndex]`, der eigene Beitrag, der abgezogen wird). Die
+  beiden zu vertauschen kompiliert und ist für jeden Thread außerhalb Warp 0
+  falsch.
+* **S2 — inklusiv minus eigener Wert = exklusiv.** Ein exklusiver Scan an
+  derselben Stelle und trotzdem abziehen zählt doppelt; der inklusive Wert ohne
+  Abzug verschiebt jeden Warp um seinen eigenen Zähler.
+* **S4 — der Fortsetzungspunkt wird vom Thread mit `writeOffset ==
+  TargetCount-1` geschrieben, also vom LETZTEN SLOT, nicht vom ersten
+  Überlauf** — und er ist `index + 1`, einer **hinter** dem Vertex, der den
+  Puffer vollgemacht hat. `((PxU32*)(&index))[0] + 1` in der CUDA ist die
+  generische-T-Schreibweise davon.
+* **S5 — der Rückgabewert sättigt** (`min(total + nbElementsInBuffer,
+  TargetCount)`). Genau das lässt S4 **exakt einmal** feuern: sobald der Puffer
+  voll ist, ist jeder `writeOffset >= TargetCount`, also kann kein späterer
+  Thread `TargetCount-1` treffen und den Fortsetzungspunkt überschreiben.
+* **S6 — die Schleife hat KEINE Zählerabbruchbedingung.** Die Schwesterfunktion
+  `findInterestingTrianglesA` (`sdfCollision.cuh:631`) hat
+  `&& sharedIndicesCount < TargetCount`; diese hier nicht. Sie läuft also bei
+  jedem Aufruf über **jeden** verbleibenden Vertex und wirft weg, was nicht mehr
+  passt. Unverändert transkribiert — und das ist der Grund, warum S5 tragend ist
+  und nicht bloß ordentlich. (Siehe die Leistungsnotiz beim dritten
+  Überlebenden.)
+* **S8 — „hat es übergelaufen?" wird über `startIndex != offset` entschieden**,
+  also durch Vergleich des gemeinsamen Slots mit dem Wert, mit dem er
+  **initialisiert** wurde. Kein Flag, kein Zählervergleich. Lief nichts über,
+  ist `offset` noch der ursprüngliche `startIndex`, die Funktion meldet
+  `nbVertices`, und das beendet die Schleife des Aufrufers.
+* **S12 — die Pufferreihenfolge ist deterministisch und AUFSTEIGEND.**
+  `writeOffset` ist der Basiszähler plus der blockexklusive Rang, und der Rang
+  läuft in Thread-Reihenfolge. Das ist keine Eigenschaft, die man per Zufall
+  behalten sollte — sie ist es, die dem Fixture erlaubt, den **exakten Inhalt**
+  vorherzusagen statt nur einer Menge.
+
+### Das Fixture: fünf Konfigurationen, jede für eine Grenze
+
+Die Distanzen hängen nicht von der Toleranz ab. Also erzeugt **ein** Durchlauf
+mit unendlicher Toleranz die ganze Tabelle, und die anderen vier Toleranzen
+werden **aus dieser Tabelle** so gewählt, dass sie genau auf den Grenzen landen:
+
+| | Toleranz | qualifizierend | Runden |
+|---|---|---|---|
+| A | `PX_MAX_F32` | alle 4000 | 4, drei davon voll |
+| B | die kleinste Distanz | **0** (der Test ist strikt `<`) | 1, Zähler 0 |
+| C | die 1024.-kleinste | **1023** | 1, Puffer einen zu kurz |
+| D | die 1025.-kleinste | **1024** | **2**, die zweite leer |
+| E | die 2600.-kleinste | **2599** | 3, zwei gesättigt |
+
+Jede dieser Anzahlen wird **gegen die Tabelle zugesichert**, nicht angenommen —
+ein Gleichstand in den Distanzen würde gemeldet, statt den Fall still zu
+schwächen.
+
+**Konfiguration D ist der Fall, für den das Fixture existiert**, und der erste
+Entwurf hat ihn verloren. Sie trennt „hat den Fortsetzungspunkt geschrieben"
+von „brauchte ihn nicht" nur, wenn wirklich eine **zweite** Runde läuft — dafür
+muss der höchste qualifizierende Index unter N-1 liegen. Bei einer
+gleichverteilten Punktwolke sind die 1024 nächstgelegenen Vertices über das
+ganze Feld gestreut, und der letzte davon landet in etwa einem Viertel der
+Fälle auf N-1; die erste Fassung zog genau das, D fiel auf eine einzige Runde
+zusammen, und dort hätte ein **nicht** geschriebener Fortsetzungspunkt die
+Schleife genauso beendet. Die Abhilfe sind 200 Vertices am Ende, weit außerhalb
+platziert, die bei keiner der vier endlichen Toleranzen qualifizieren können:
+sie begrenzen die qualifizierende Menge weg vom Feldende und machen die zweite
+Runde zwingend.
+
+Wie in P9.12d sagt das Fixture **keinen Sample-Wert voraus** — `Sample()` läuft
+nicht auf dem Host. Der Shader berichtet die Cull-Distanz je Vertex, und die
+erwartete Sammlung wird aus **diesen** Zahlen gebaut. Was bitgenau gegen die
+Engine verglichen wird, ist der Teil, der wirtsberechenbar ist: der
+Vertex-Raum-Punkt, durch `PxTransform::transform` und das
+`PxQuat::rotate`/`rotateInv`-Paar, aus dem `shape2Vertex` besteht. Alle 4000
+stimmen bitgenau.
+
+### Sweep: 49 Mutanten, 44 getötet, 1 durch Hang getötet, 4 Überlebende
+
+0 NOCOMPILE, 0 ANCHOR-FAIL. `s7-no-advance` (die Schleife rückt nicht vor) ist
+der Hang — er belegt nebenbei, dass die Timeout-Klassifikation des Runners
+funktioniert, statt den Lauf festzufahren.
+
+**Alle vier Überlebenden sind mit Belegen aus der Quelle diagnostiziert, keiner
+ist entschuldigt.**
+
+**1. `scan-write-lane-1` — bewiesen äquivalent.** `if (threadIndexInWarp == 0u)`
+→ `== 1u` für den Warp-Zähler-Store. `nbInteresting = popc(ballotMask)`, und der
+Ballot ist **warp-uniform**: `pxgBallotSync` liest in jeder Spur dieselben 32
+Scratch-Slots (`base = tid & ~31`) und baut dieselbe Maske. Jede Spur rechnet
+also denselben Wert aus, und es ist egal, welche einzelne ihn schreibt. Gilt für
+**jeden** Spurindex, der im Warp existiert — bei fester 1024-Thread-Startform
+sind das 32 volle Warps, also existiert Spur 1 immer. Bei einem TEILWEISEN Warp
+wäre es nicht äquivalent; diese Startform kann keinen erzeugen.
+
+**2. `s4-write-guard-le` — ausgabegleich, und eine ehrliche Grenze des
+Fixtures.** `writeOffset < TargetCount` → `<=` schreibt `gSdfIndices[1024]`,
+einen hinter ein 1024-Element-Groupshared-Array. Jeder Slot in `[0, count)` und
+jeder Giftslot in `[count, 1024)` bleibt unverändert, also ist die Ausgabe
+identisch. Der Defekt ist ein **Überlauf im geteilten Speicher ohne
+beobachtbare Signatur** — und das ist in diesem Stack konstruktiv so:
+`robustBufferAccess` und `robustness2` decken Puffer und Bilder ab, **nicht**
+Workgroup-Speicher, und `spirv-val` prüft Typen, keine dynamischen Indizes
+(nachgemessen: der Mutant validiert sauber). Kein Punktesatz kann ihn hier
+töten. Was bleibt, ist Inspektion — die Schranke ist die der CUDA, und das
+Modul hat genau **eine** solche Schreibstelle.
+
+**3. `s6-early-out-added` — bewiesen äquivalent, und die informative unter den
+vieren.** `&& sharedIndicesCount < SDFF_TARGET_COUNT` an die Schleife zu hängen
+ändert nichts: nach der Iteration, die den Puffer füllt, ist
+`sharedIndicesCount` durch S5 **dauerhaft** `TargetCount`, also hat jede spätere
+Iteration `writeOffset >= TargetCount` und damit **keinen** `gSdfIndices`-Store
+(Schranke `< TargetCount`), **keinen** `gSdfOffset`-Store (braucht
+`== TargetCount-1`) und einen unveränderten Zähler. Die restlichen Iterationen
+sind reine No-Ops auf jeder Ausgabe.
+
+Das heißt aber auch: **die Engine hat hier einen verpassten Frühabbruch.**
+`findInterestingVertices` scannt das ganze verbleibende Feld weiter, nachdem der
+Puffer voll ist; ihre eigene Schwester `findInterestingTrianglesA` tut das
+nicht. Bei 100 000 Partikeln, deren Puffer früh volläuft, ist das ein Vielfaches
+der nötigen Arbeit. Kein Fehler — das Ergebnis stimmt —, sondern eine
+**Leistungsbeobachtung**, und sie wird als solche notiert und nicht unter die
+Fehlerkandidaten gezählt.
+
+**4. `find-loop-barrier-dropped` — äquivalent AUF DEM PFAD, DEN CI FÄHRT, und
+ausdrücklich nicht per Vertrag.** Die `GroupMemoryBarrierWithGroupSync()` vor
+`sdfAddIndexToBuffer` zu streichen ändert auf dem Emulationspfad nichts, weil
+`pxgBallotSync` als **erstes** selbst `gPxgWarpScratch[tid]` schreibt und zwei
+Workgroup-Barrieren setzt — die ordnen die Schreibzugriffe von Iteration i+1
+hinter die Lesezugriffe von Iteration i. Auf dem **nativen** Pfad
+(`PXG_WARP_NATIVE=1`) ist derselbe Ballot ein blankes
+`WaveActiveBallot(pred).x & mask` **ohne jede Workgroup-Barriere**
+(`pxgSlangWarpInc.slang:227`), und dann ist das Streichen ein echtes Rennen. Die
+Barriere bleibt also stehen, weil sie für den Pfad tragend ist, den CI heute
+nicht ausführen kann — dieselbe Form von Diagnose wie `c11-rsqrt` in P9.12d.
+
+### Verifikation
+
+* `ctest -R gpuslang.sdfFind` grün, forced-fresh;
+* volle Suite **807/807** in **beiden** Speichermodi;
+* Manifest **unverändert bei 341**, also kein Szenenlauf — diese Tranche fügt
+  die vorletzte Schicht unter `ps_sdfMeshCollisonLaunch` hinzu, keinen Kernel.
 
 ## P9.12d — die vier Funktionen über `SparseSDFTexture`, und ein Fixture ganz ohne Toleranz
 
