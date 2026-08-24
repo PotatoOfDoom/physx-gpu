@@ -1649,6 +1649,10 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_diffuseParticleCopy", kPsDiffCount, uint32_t(sizeof(kPsDiffCount)) },
     { "ps_diffuseParticleSum", kPsDiffCount, uint32_t(sizeof(kPsDiffCount)) },
     { "ps_diffuseParticleCreate", kPsDiffCreate, uint32_t(sizeof(kPsDiffCreate)) },
+    // P9.13e: both take (particleSystems, activeParticleSystems, PxVec3 gravity,
+    // PxReal dt) -- the same shape as ps_preDiffuseIntegrateLaunch.
+    { "ps_diffuseParticleUpdatePBF", kPsPreDiffuseIntegrate, uint32_t(sizeof(kPsPreDiffuseIntegrate)) },
+    { "ps_diffuseParticleCompact", kPsPreDiffuseIntegrate, uint32_t(sizeof(kPsPreDiffuseIntegrate)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },
     // gpusimulationcontroller PBD particle self-collision + solve (P6.3 BDA)
     // ps_selfCollisionLaunch(const PxgParticleSystem*, PxU32 id) -> {8,4}

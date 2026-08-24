@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 348;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 350;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -266,8 +266,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_accumulateStaticDensity", "npPsBoundaryDensity.spv", "ps_accumulateStaticDensity" },
     { "ps_accumulateRigidDensity", "npPsBoundaryDensity.spv", "ps_accumulateRigidDensity" },
     { "ps_diffuseParticleOneWayCollision", nullptr, nullptr },  // PS_DIFFUSE_PARTICLES_ONE_WAY_COLLISION (unmapped)
-    { "ps_diffuseParticleUpdatePBF", nullptr, nullptr },  // PS_DIFFUSE_PARTICLES_UPDATE_PBF (unmapped)
-    { "ps_diffuseParticleCompact", nullptr, nullptr },  // PS_DIFFUSE_PARTICLES_COMPACT (unmapped)
+    { "ps_diffuseParticleUpdatePBF", "psDiffuseAdvect.spv", "ps_diffuseParticleUpdatePBF" },  // PS_DIFFUSE_PARTICLES_UPDATE_PBF (P9.13e: the fluid velocity average)
+    { "ps_diffuseParticleCompact", "psDiffuseAdvect.spv", "ps_diffuseParticleCompact" },  // PS_DIFFUSE_PARTICLES_COMPACT (P9.13e: integrate, age, compact)
     { "ps_diffuseParticleCreate", "psDiffuseCreate.spv", "ps_diffuseParticleCreate" },  // PS_DIFFUSE_PARTICLES_CREATE (P9.13d: the spawn itself)
     { "ps_diffuseParticleCopy", "psDiffuseBuffers.spv", "ps_diffuseParticleCopy" },  // PS_DIFFUSE_PARTICLES_COPY (P9.13c: publish the staged count, clear the staging slot)
     { "ps_diffuseParticleSum", "psDiffuseBuffers.spv", "ps_diffuseParticleSum" },  // PS_DIFFUSE_PARTICLES_SUM (P9.13c: sum the per-buffer counts into the system count)
