@@ -7,14 +7,13 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **811/811** green in both modes (`ctest -N` in `build-gpuslang`).
-Szenen: **28/28** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
-Inventar (27 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
+Test count: **812/812** green in both modes (`ctest -N` in `build-gpuslang`).
+Szenen: **29/29** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
+Inventar (28 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
-wertet.  Die Diagnoseliste enthält seit P9.13a **zweierlei**: die sechs
-Kontrollen, die durchfallen SOLLEN, weil sie die Referenz der echten Prüfung
-sind, und `particlediffuse`, das durchfällt, weil seine Kette noch nicht
-abgebildet ist.  P9.9 fügte `particlefluidboundary` hinzu, P9.10c
+wertet.  `particlediffuse` kam in P9.13a als Diagnose hinzu und ist seit P9.13d
+gewertet; die Diagnoseliste trägt jetzt wieder nur die sechs Kontrollen, die
+durchfallen SOLLEN, weil sie die Referenz der echten Prüfung sind.  P9.9 fügte `particlefluidboundary` hinzu, P9.10c
 `particlemeshfloor`, P9.11c `particlehffloor`.
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
@@ -1701,6 +1700,113 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.13d — MEILENSTEIN: die erste Gischt. `ps_diffuseParticleCreate` (Manifest **348**), und zweimal dasselbe Fixture-Loch
+
+Portiert `diffuseParticles.cu:386-500`, vollständig gelesen. **Der** Kernel der
+Diffus-Kette: jeder andere bewegt, altert, sortiert oder kollidiert
+Diffuspartikel — dieser ist der einzige, der welche macht. Neuer Shader
+`shaders/psDiffuseCreate.slang`, Fixture `tests/testPsDiffuseCreate.cpp`,
+Manifest **347 → 348**. **Keine neue ABI**: P9.13c's
+`PxgParticleDiffuseSimBufferGpu` und die längst abgebildeten Sortierfelder
+decken ihn ab.
+
+### Und die Szene ist grün geworden — früher als angekündigt
+
+`PXG_SCENE=particlediffuse` meldet **191 Diffuspartikel** und wandert damit aus
+der Diagnoseliste in die gewertete: **29 Szenen** statt 28.
+
+Die P9.13a-Notiz sagte voraus, die Szene bleibe rot, bis die ganze Kette liegt.
+**Das war falsch**, und der Grund ist lehrreich: die Beobachtung ist der
+**veröffentlichte Zähler**, nicht die Bewegung. Erzeugen und Veröffentlichen
+braucht genau `ps_diffuseParticleCreate` (P9.13d), `ps_diffuseParticleCopy` und
+`ps_diffuseParticleSum` (beide P9.13c) — die fünf fehlenden bewegen, altern,
+verdichten und kollidieren nur. Der Szenenkommentar und die Erfolgsmeldung sagen
+das jetzt beide: **„create/copy/sum sind live; die Kernel, die sie BEWEGEN, sind
+es nicht"** — und nicht mehr „die Kette läuft von Anfang bis Ende".
+
+### Er läuft über die PARTIKEL-Puffer, nicht über die diffusen
+
+`blockIdx.y` indiziert `mParticleSimBuffers`, gebunden an
+`mNumParticleBuffers`. Der Diffuspuffer wird **indirekt** erreicht, über
+`buffer.mDiffuseParticleBufferIndex` — und der ist **0xffffffff für einen
+Partikelpuffer ohne diffuse Seite**, also für jeden gewöhnlichen
+`PxParticleBuffer` in einer Szene, die auch diffuse hat. Der Wächter ist kein
+Schutz, er ist der Normalfall. Alles andere in der Kette läuft direkt über
+`mDiffuseSimBuffers`. Zwei Indexräume, verschiedene Größen, verschiedene
+Reihenfolge.
+
+### Dreizehn Fallen
+
+Die Modulkopfzeile führt sie als C1–C13. Die, die nicht offensichtlich sind:
+
+* **C3 — die Zufallstabelle wird über den SORTIERTEN Index gelesen**, nicht über
+  den Thread: `randomTable[(sortedInd + k) % randomTableSize]`. Der Zufall folgt
+  der Partikelidentität; ein Port mit Thread-Index sprüht trotzdem plausibel.
+* **C4 — die Divergenz wird ABGEZOGEN**: `pressure - divergence + kineticEnergy`,
+  und die kinetische Energie ist `dot3(v,v)` — die *quadrierte* Geschwindigkeit,
+  ungehalbiert und ohne Masse.
+* **C5 — der Zufall MULTIPLIZIERT die Intensität**, statt gegen eine
+  Wahrscheinlichkeit verglichen zu werden: `r0 * intensity > threshold`.
+* **C6 — der `atomicAdd` läuft IMMER**, nur der Schreibvorgang ist
+  kapazitätsbewacht. Der Staging-Zähler überschießt also, und P9.13c's Copy
+  klemmt ihn zurück. Hier greifen die beiden Tranchen ineinander.
+* **C9 — `r2` kommt ZWEIMAL vor**: einmal als Rückschrittfaktor auf der
+  Geschwindigkeit und einmal als y-Komponente des Zitterns.
+
+### Nebenbei: ein Helfer statt einer dritten Kopie
+
+`PS_PHASE_FLUID` / `psGetFluid` sind nach `pxgSlangParticleDesc` gewandert.
+`npPsFluidDensity` und `npPsFluidVelocity` trugen je eine eigene Kopie, beide
+importieren das Modul ohnehin, und ihre eigenen Suiten haben den Umzug in dem
+Moment geprüft, in dem er landete.
+
+### DAS FIXTURE-LOCH, ZWEIMAL DIESELBE URSACHE
+
+Welchen Platz ein Partikel bekommt, ist ein Rennen; das wird nach der
+P9.11-Regel nicht behauptet. Geprüft wird: **welche** Partikel qualifizieren,
+der Endstand des Staging-Zählers, die Zahl der geschriebenen Sätze und die
+**Menge** der Sätze — als Multimenge über Bitmuster, nie Index für Index.
+
+Der erste Sweep ließ vier Mutanten am Leben, und zwei davon hatten **dieselbe
+Ursache**:
+
+> **Hinter einer Grenze, die ein Kernel respektieren muss, lag kein vergifteter
+> Platz.**
+
+* Jedes Diffus-Feld war **genau kapazitätsgroß**. Ein Kernel ohne
+  Kapazitätswächter schreibt dann hinter das Ende — und dort schaut die Prüfung
+  nicht hin, llvmpipe meldet nichts. Jetzt läuft jedes Feld **137 Plätze** über
+  die Kapazität hinaus und die Reserve muss vergiftet zurückkommen. Das tötete
+  beide `c7`-Mutanten.
+* Das Sim-Puffer-Feld war **auf die lebende Anzahl bemessen und nullgefüllt**.
+  Wer über `mNumParticleBuffers` hinausliest, bekam Nullen und kehrte still
+  zurück. Die Reserve trägt jetzt eine große Partikelzahl und einen **gültigen**
+  Diffus-Index — zu weit lesen erzeugt sichtbaren Müll.
+
+Dazu ein **konstruierter Gleichstand**: `>` und `>=` unterscheiden sich nur an
+einem Partikel, dessen Produkt bitgenau dem Schwellwert entspricht. Float-Daten
+treffen das nie zufällig, also wird es gebaut — ein Partikel wird ausgewählt,
+sein `r0 * intensity` unter den Gewichten seines eigenen Puffers berechnet und
+als dessen Schwellwert eingesetzt. Das Fixture **verlangt**, dass mindestens ein
+solcher Gleichstand existiert.
+
+**Drei Durchläufe, am Ende 50 von 51.**
+
+Der eine Überlebende, `g-nodiffuse-guard-dropped`, streicht den
+Sentinel-Vergleich und liest damit `dbufs[0xffffffff]` — rund 377 GB hinter der
+Basis. Das ist **undefiniertes Verhalten, kein Verhaltensunterschied**: kein
+Fixture kann festnageln, was ein Out-of-bounds-BDA-Lesevorgang zurückgibt. Die
+**erreichbare** Hälfte derselben Klasse — über die Pufferzahl hinauslesen — wird
+seit der Reserve getötet, und das ist die Grenze dessen, was hier messbar ist.
+
+### Verifikation
+
+* `ctest -R gpuslang.psDiffuseCreate` grün, forced-fresh;
+* volle Suite **812/812** in **beiden** Speichermodi;
+* Manifest **347 → 348**, `build-sdk` neu gebaut, Szenen: **29 ok, 0 fail, 0 missing (von 29)**;
+* `particlediffuse` ist **gewertet**, nicht mehr Diagnose; seine Kontrolle
+  (`PXG_DIFFUSE_CONTROL=1`, Schwellwert 1e12) bleibt in der Diagnoseliste.
 
 ## P9.13c — die drei Buchhaltungskernel der Diffus-Kette (Manifest **347**), und die einzige Eingabe, die vorzeichenbehaftet von vorzeichenlos trennt
 
