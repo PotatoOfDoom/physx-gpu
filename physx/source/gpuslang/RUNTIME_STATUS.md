@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **810/810** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **811/811** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **28/28** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (27 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
@@ -1701,6 +1701,190 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.13c — die drei Buchhaltungskernel der Diffus-Kette (Manifest **347**), und die einzige Eingabe, die vorzeichenbehaftet von vorzeichenlos trennt
+
+Portiert `diffuseParticles.cu:63`, `:503` und `:528` — die drei Kernel, die
+`mDiffuseSimBuffers` durchlaufen. Neuer Shader `shaders/psDiffuseBuffers.slang`
+mit drei Einstiegspunkten, Fixture `tests/testPsDiffuseBuffers.cpp`, Manifest
+**344 → 347**.
+
+Sie gehören zusammen, weil sie die einzigen drei der Kette sind, die die
+Nutzerpuffer anfassen — und weil sie zwischen sich festlegen, was der Zähler
+eines Puffers überhaupt **bedeutet**.
+
+### Der Zähler hat ZWEI Fächer
+
+`PxgParticleDiffuseSimBuffer::mNumDiffuseParticles` zeigt auf **zwei** ints:
+
+* `[0]` — der **veröffentlichte** Stand, den jeder Verbraucher dieses Bild liest;
+* `[1]` — der **Staging**-Stand, in den `ps_diffuseParticleCreate` beim Erzeugen
+  atomar anhängt.
+
+`ps_diffuseParticleCopy` ist die Bildgrenze dazwischen: es klemmt `[1]` auf die
+Kapazität, schreibt das nach `[0]` **und** in den angehefteten Host-Spiegel, und
+nullt `[1]`. Sonst bewegt nichts einen Wert zwischen den beiden Fächern. Ein
+Port, der den Zeiger für einen einzelnen int hält, übersetzt, läuft — und macht
+den Zähler still monoton.
+
+### Neue ABI: eine Struktur, erzeugt und festgenagelt
+
+`PxgParticleDiffuseSimBufferGpu`, 88 Byte, aus den Engine-Headern erzeugt und in
+`testPsDiffuseBuffers.cpp` per `static_assert` gegen `offsetof` gepinnt. Die
+SPIR-V-Ausgabe bestätigt Schrittweite 88 und jeden Offset einzeln.
+
+Zwei Dinge, die schon das Layout stellt: **`mParams` ist EINGEBETTET**, nicht
+verzeigert — 40 Byte `PxDiffuseParticleParams` liegen vor dem ersten Zeiger, also
+sitzt jeder Zeiger 40 Byte weiter, als ein Leser mit Zeiger-Annahme ihn
+vermutet. Und der Zwei-Fächer-Zähler von oben.
+
+Die fünf Systemfelder, die die drei laufen (`mDiffuseSimBuffers` @448,
+`mNumDiffuseBuffers` @472, `mNumDiffuseParticles` @488,
+`mDiffusePosition_LifeTime` @496, `mDiffuseVelocity` @504), waren schon
+abgebildet; der Generator hat sie als Gegenprobe mit ausgegeben und sie stimmen.
+
+### Sieben Fallen
+
+Die Modulkopfzeile führt sie als U1–U7. Die, die nicht offensichtlich sind:
+
+* **U1 — die Rasterachsen sind in den drei NICHT dieselben.** Copy und
+  UpdateUnsorted holen das System aus `blockIdx.z` und den Puffer aus `.y`; Sum
+  holt das System aus `blockIdx.x` und hat gar keine Pufferachse. Ein Port, der
+  sich für eine Konvention entscheidet, hat bei zwei von dreien recht.
+* **U3 — der laufende Versatz ist eine warp-kooperative Präfixsumme** über die
+  **vorhergehenden** Puffer, `for (i = lane; i < bufferIndex; i += 32)`, über den
+  Warp reduziert. Jede Spur braucht die volle Summe, es ist also eine
+  Broadcast-Reduktion und kein Scan.
+* **U4 — `mStartIndex` wird NACH dem frühen Rücksprung geschrieben.** Ein Puffer
+  mit null Diffuspartikeln bekommt seinen Startindex daher gar nicht und behält
+  den des vorigen Bildes. Übertragen, nicht aufgeräumt.
+* **U5 — Copys Klemme ist VORZEICHENBEHAFTET**: `PxMin(PxI32(cap), staged)`, mit
+  der vorzeichenlosen Kapazität in int gecastet.
+* **U7 — geschrieben wird in die UNSORTIERTEN Systemfelder.** Die sortierten
+  Zwillinge unterscheiden sich um ein Wort im Namen.
+
+### Der Sweep, und das Loch, das er fand
+
+**Erster Durchlauf: 37 Mutanten, 34 getötet, 3 Überlebende.** Einer davon war ein
+echtes Fixture-Loch:
+
+> **`u5-clamp-unsigned` — kein Puffer hatte je einen NEGATIVEN Staging-Zähler.**
+> Ohne einen solchen liefern vorzeichenbehaftetes und vorzeichenloses `min`
+> dasselbe, und die einzige Stelle, an der die CUDA-Schreibweise überhaupt eine
+> Rolle spielt, ist unbeobachtbar.
+
+Ein negativer Staging-Stand ist von der Engine aus **nicht erreichbar** — das
+Fach wird nur per `atomicAdd` von null hochgezählt und von Copy zurückgesetzt.
+Das Fixture setzt ihn trotzdem direkt (es besitzt die Arena), denn ein Port, der
+nur für die Eingaben stimmt, die die Engine gerade produziert, stimmt aus
+Zufall. Der fünfte Puffer von System A trägt jetzt `staged = -5`, die Vorhersage
+folgt der vorzeichenbehafteten Schreibweise, und der negative Zähler pflanzt sich
+in die vorzeichenlose Summe genau so fort wie auf dem Gerät.
+
+**Zweiter Durchlauf: 35 von 37.** Die zwei verbleibenden Überlebenden sind
+**bewiesene Äquivalenzen**, beide dieselbe Form:
+
+| Überlebender | Beweis |
+|---|---|
+| `u4-startindex-every-thread` | `bufferOffset` entsteht aus einer Warp-Reduktion über `lane = tid & 31`; jeder Warp des Blocks rechnet dieselbe Schleife und bekommt denselben Wert. Alle Threads, die die Zeile erreichen, schreiben also **denselben Wert an dieselbe Adresse**. |
+| `u6-sum-every-thread-stores` | Nach der Reduktion hält **jede** der 32 Spuren die volle Summe; alle 32 schreiben denselben Wert an dieselbe Adresse. |
+
+Beide sind Schreib-Stürme ohne Wertunterschied — die `if (tid == 0)`-Wächter
+bleiben stehen, weil sie die CUDA sind und weil sie auf einem Backend mit echter
+Nebenläufigkeit die Bandbreite sparen, die sie hier nur nicht messbar spart.
+
+### Verifikation
+
+* `ctest -R gpuslang.psDiffuseBuffers` grün, forced-fresh;
+* volle Suite **811/811** in **beiden** Speichermodi;
+* Manifest **344 → 347**, also `build-sdk` neu gebaut und Szenen gefahren:
+  **28 ok, 0 fail, 0 missing (von 28)**;
+* die Diagnose `particlediffuse` bleibt FAIL — sechs Kernel der Kette fehlen
+  noch, darunter `ps_diffuseParticleCreate`, das überhaupt erst etwas erzeugt.
+
+## P9.13b — die ersten zwei Kernel der Diffus-Kette (Manifest **344**), und zwei Äquivalenzen, die die Fixture-Geometrie erzwang
+
+*(Nachgetragen in P9.13c: die Tranche landete als `951f9ea`, ihr Eintrag fehlte.)*
+
+Portiert `ps_preDiffuseIntegrateLaunch` (`particlesystem.cu:403-448`) und
+`ps_calculateHashForDiffuseParticlesLaunch` (`:847-892`) — die beiden, die vor
+allem anderen in der Kette laufen: der Schwerkraft-Vorgriff und der Gitteraufbau.
+
+**Keine neue ABI, kein neues Modul.** Die diffuse Hälfte des Deskriptors ist seit
+der Massen-Erzeugung abgebildet (`mDiffusePosition_LifeTime` @496 bis
+`mDiffuseOneWayContactCount` @616), und beide Kernel gehören neben ihren festen
+Zwilling: der Vorgriff nach `particleSim.slang`, der Gitteraufbau nach
+`particleGridBda.slang`. Die einzige Brückenänderung ist eine ABI-Zeile.
+
+### Die ABI-Falle
+
+`ps_preDiffuseIntegrateLaunch` hat **dieselben ersten vier Argumente** wie
+`ps_preIntegrateLaunch` und **keines** der zwei nachgestellten bools — 32 Byte,
+nicht 40. `kPsPreIntegrate` wiederzuverwenden liest zwei Byte Nichts als `isTGS`
+und `externalForcesEveryTgsIterationEnabled`. Eigene Zeile, mit dem Grund dabei.
+
+### Was der diffuse Vorgriff NICHT tut
+
+Sein fester Zwilling steht zwanzig Zeilen darüber, und die Unterschiede sind der
+Punkt:
+
+* die Anzahl ist eine **Zeiger-Dereferenzierung** (die lebende Zahl), nicht
+  `mMaxDiffuseParticles` (die Allokation — an der sich der Gitteraufbau bindet);
+* **kein `tPos.w != 0`-Wächter**, denn `w` ist hier die verbleibende
+  **Lebensdauer** und keine inverse Masse. Den festen Wächter herüberzutragen
+  würde genau die Partikel einfrieren, die in ihrem letzten Bild noch leben;
+* keine Dämpfung, kein Material, **rohe** Schwerkraft; keine
+  TGS-Vorwärtsprojektion;
+* das `w` der Geschwindigkeit wird **aus dem `w` der Position** geschrieben;
+* der Kontaktzähler-Reset hängt am **Zeiger** — der CUDA-Kommentar dort liest
+  sich umgekehrt zu dem, was der Code tut, also übertragen und nicht hergeleitet.
+
+### Der Gitteraufbau
+
+Gebunden an die **Allokation**, gesteuert von der **lebenden Anzahl** — das ist
+der strukturelle Unterschied, der die diffuse Sortierung überhaupt trägt. Die
+Identitätsabbildung wird für **jeden** Platz unterhalb der Allokation
+geschrieben, **bevor** der Lebendtest läuft, und ein toter Platz bekommt
+`EMPTY_CELL` und kehrt zurück. `0xffffffff` ist der größtmögliche Schlüssel, die
+Radix-Sortierung trägt also jeden toten Platz hinter jeden lebenden und das
+lebende Präfix kommt zusammenhängend heraus. Eine 0 zu schreiben oder den
+Schreibvorgang zu überspringen mischt tote Plätze still in den lebenden Bereich.
+
+### Die zwei Äquivalenzen, und warum sie Fixture-Geometrie waren
+
+**Erster Durchlauf: Vorgriff 16/18, Gitteraufbau 14/17.** Alle vier Überlebenden
+hatten **eine** Ursache: *ein System und ein Block machen die Indexarithmetik
+unbeobachtbar.* Bei Raster (1,1,1) ist `groupId.x == groupId.y == 0`, und
+`groupId.x * blockDim` ist toter Code. Geschlossen mit zwei Systemen und zwei
+Blöcken in beiden Fixtures: Allokation über 1024, lebende Anzahl über die
+Blockgrenze hinweg, andere Daten und andere Anzahl je System, und eine Aktivliste,
+die nicht die Identität ist.
+
+Dabei kam eine **dritte** Äquivalenz heraus, die nur der Gitteraufbau hat. Nach
+der Verbreiterung überlebte `h-blockdim-512` weiter, während `d-blockdim-512`
+starb — und der Grund ist eine echte Eigenschaft der beiden Kernel: **die
+Schreibvorgänge des Gitteraufbaus sind idempotent** (Hash und Identität, beide
+allein aus der Position), ein falscher Blockschritt kann sich also nur als *Loch*
+zeigen, nie als Doppelschreibung. Bei Allokation 1200 deckt [0,1024) ∪ [512,1536)
+alles ab und der Mutant **ist** äquivalent; bei 2000 lässt er [1536,2000)
+vergiftet. Der Vorgriff braucht diese Sorgfalt nicht — er liest-ändert-schreibt
+die Position, ein doppelter Schritt integriert also zweimal und ist schon falsch.
+
+Dazu ein **Köder-Deskriptor**: drei Deskriptoren für zwei aktive Systeme mit der
+Aktivliste `{ 2, 0 }`, absichtlich keine Permutation von [0, gridDim.y). Bei
+`{ 1, 0 }` besucht ein Kernel, der `groupId.y` direkt als Deskriptorindex nimmt,
+immer noch beide lebenden Deskriptoren, nur in der anderen Reihenfolge — und ist
+äquivalent. Mit einem Köder auf Index 1 besucht er den Köder und verfehlt
+Deskriptor 2, dessen Felder unberührt zurückkommen müssen.
+
+**Zweiter Durchlauf: Vorgriff 18/18, Gitteraufbau 17/17, keine Überlebenden.**
+
+### Verifikation
+
+* volle Suite **810/810** in **beiden** Speichermodi;
+* Manifest **342 → 344**;
+* `PXG_SCENE=particlediffuse` bleibt in der Diagnoseliste — neun Kernel der Kette
+  fehlen noch, `ps_diffuseParticleCreate` darunter.
 
 ## P9.13a — die letzten zwei Puffer-Fabriken, eine Szene für die Diffus-Kette, und ein Messinstrument, das hier schweigt
 
