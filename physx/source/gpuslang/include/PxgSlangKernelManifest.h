@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 342;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 344;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -212,11 +212,11 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_updateUserBufferLaunch", "particleSim.spv", "ps_updateUserBufferLaunch" },  // PS_UPDATE_BUFFER_DATA (P6.0 BDA port)
     { "ps_updateUnsortedDiffuseArrayLaunch", nullptr, nullptr },  // PS_UPDATE_DIFFUSE_UNSORTED_ARRAY (unmapped)
     { "ps_preIntegrateLaunch", "particleSim.spv", "ps_preIntegrateLaunch" },  // PS_PREINTEGRATION (P6.0 BDA port)
-    { "ps_preDiffuseIntegrateLaunch", nullptr, nullptr },  // PS_PRE_DIFFUSE_INTEGRATION (unmapped)
+    { "ps_preDiffuseIntegrateLaunch", "particleSim.spv", "ps_preDiffuseIntegrateLaunch" },  // PS_PRE_DIFFUSE_INTEGRATION (P9.13b: the diffuse gravity predict)
     { "ps_updateBoundFirstPassLaunch", "psBoundsBda.spv", "ps_updateBoundFirstPassLaunch" },  // PS_UPDATE_BOUND_FRIST (P6.4a-1 BDA port: per-block world AABB reduce)
     { "ps_updateBoundSecondPassLaunch", "psBoundsBda.spv", "ps_updateBoundSecondPassLaunch" },  // PS_UPDATE_BOUND_SECOND (P6.4a-1 BDA port: global AABB + fatten + centre)
     { "ps_calculateHashLaunch", "particleGridBda.spv", "ps_calculateHashLaunch" },  // PS_CALCULATE_HASH (P6.2 BDA port: grid-cell hash + identity seed)
-    { "ps_calculateHashForDiffuseParticlesLaunch", nullptr, nullptr },  // PS_CALCULATE_HASH_FOR_DIFFUSE_PARTICLES (unmapped)
+    { "ps_calculateHashForDiffuseParticlesLaunch", "particleGridBda.spv", "ps_calculateHashForDiffuseParticlesLaunch" },  // PS_CALCULATE_HASH_FOR_DIFFUSE_PARTICLES (P9.13b: the diffuse grid build)
     { "ps_reorderDataAndFindCellStartLaunch", "particleGridBda.spv", "ps_reorderDataAndFindCellStartLaunch" },  // PS_REORDER_PARTICLE_FIND_CELLSTARTEND (P6.2 BDA port: gather + cell start/end)
     { "ps_selfCollisionLaunch", "particleSelfCollisionBda.spv", "ps_selfCollisionLaunch" },  // PS_PARTICLE_SELF_COLLISION (P6.3 BDA port: 3x3x3 grid neighbour search)
     { "ps_primitivesBoundFirstPassLaunch", "psBoundsBda.spv", "ps_primitivesBoundFirstPassLaunch" },  // PS_PRIMITIVES_BOUND_FIRST (P6.4a-1 BDA port: per-pair cell-range count + scan)

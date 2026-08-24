@@ -320,6 +320,14 @@ static const uint8_t kPreIntegrateTGS[] = { 4, 4, 4, 12, 8, 8, 8, 8, 8, 8, 8, 8,
 //     bool isTGS, bool externalForcesEveryTgsIterationEnabled)
 //   PxVec3 by value = 12 bytes -> 40-byte blob (two 1-byte bools at 32/33).
 static const uint8_t kPsPreIntegrate[] = { 8, 8, 12, 4, 1, 1 };
+
+// P9.13b: the DIFFUSE twin, PxgParticleSystemCore.cpp:2716-2722.  The SAME first
+// four arguments and NEITHER of the two trailing bools -- 32 bytes, not 40.  A
+// port that reuses kPsPreIntegrate here reads two bytes of nothing as isTGS and
+// externalForcesEveryTgsIterationEnabled, which the diffuse kernel does not have.
+//   ps_preDiffuseIntegrateLaunch(const PxgParticleSystem* particleSystems,
+//     const PxU32* activeParticleSystems, PxVec3 gravity, PxReal dt)
+static const uint8_t kPsPreDiffuseIntegrate[] = { 8, 8, 12, 4 };
 //   ps_integrateLaunch(PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems, PxReal dt, PxReal epsilonSq)
 //     -> 24-byte blob.
@@ -1468,6 +1476,7 @@ static const PxgKernelAbiRow kRows[] = {
     // gpusimulationcontroller PBD particle kernels (P6.0 BDA)
     { "ps_updateUnsortedArrayLaunch", kPsUpdateUnsorted, uint32_t(sizeof(kPsUpdateUnsorted)) },
     { "ps_preIntegrateLaunch", kPsPreIntegrate, uint32_t(sizeof(kPsPreIntegrate)) },
+    { "ps_preDiffuseIntegrateLaunch", kPsPreDiffuseIntegrate, uint32_t(sizeof(kPsPreDiffuseIntegrate)) },
     { "ps_integrateLaunch", kPsIntegrate, uint32_t(sizeof(kPsIntegrate)) },
     { "ps_updateUserBufferLaunch", kPsUpdateUserBuffer, uint32_t(sizeof(kPsUpdateUserBuffer)) },
     { "ps_updateMaterials", kPsUpdateMaterials, uint32_t(sizeof(kPsUpdateMaterials)) },
@@ -1623,6 +1632,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_calculateStressLaunch", kSbCalculateStress, uint32_t(sizeof(kSbCalculateStress)) },
     // gpusimulationcontroller PBD particle grid build + reorder (P6.2 BDA)
     { "ps_calculateHashLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
+    // P9.13b: the diffuse grid build takes the identical two pointers.
+    { "ps_calculateHashForDiffuseParticlesLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },
     // gpusimulationcontroller PBD particle self-collision + solve (P6.3 BDA)
     // ps_selfCollisionLaunch(const PxgParticleSystem*, PxU32 id) -> {8,4}

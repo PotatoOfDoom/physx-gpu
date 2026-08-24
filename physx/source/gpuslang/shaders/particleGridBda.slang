@@ -65,6 +65,9 @@ import pxgSlangParticleDesc;
 // PxgParticleSystemKernelBlockDim::UPDATEGRID (PxgParticleSystemCoreKernelIndices.h)
 static const uint PS_UPDATEGRID = 1024u;
 
+// PxgParticleSystem.h:52 -- #define EMPTY_CELL 0xffffffff.
+static const uint PS_GRID_EMPTY_CELL = 0xffffffffu;
+
 // gridCal.cuh:34 calcGridPos — floor(pos / cellWidth) per axis, cast to int.
 int3 calcGridPos(float4 particlePos, float cellWidth)
 {
@@ -131,6 +134,84 @@ void ps_calculateHashLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupI
 
     hashArray[index] = hashValue;
     particleIndex[index] = index;
+}
+
+// ---------------------------------------------------------------------------
+// ps_calculateHashForDiffuseParticlesLaunch — the DIFFUSE grid build
+// (particlesystem.cu:847-892), P9.13b
+// ---------------------------------------------------------------------------
+// The diffuse twin of ps_calculateHashLaunch above.  Same two-pointer ABI row,
+// same block dim, and one structural difference that is the whole reason the
+// diffuse sort works at all.
+//
+// FIVE TRAPS.
+//
+// H1 -- THE BOUND IS THE ALLOCATION, NOT THE LIVE COUNT.  The solid kernel
+//     returns for `index >= mCommonData_NumParticles`; this one returns for
+//     `index >= mCommonData_MaxDiffuseParticles` and then treats the live count
+//     as a second, INNER test.  Bounding by the live count instead leaves the
+//     tail of the mapping array holding whatever the previous frame left there.
+//
+// H2 -- `particleIndex[index] = index` is written for EVERY slot below the
+//     allocation, BEFORE the live-count test.  The identity seed covers dead
+//     slots too, because the radix sort permutes the whole array.
+//
+// H3 -- a dead slot gets `EMPTY_CELL` and RETURNS.  0xffffffff is the largest
+//     possible key, so the sort carries every dead slot past every live one and
+//     the live prefix comes out contiguous.  That is the mechanism; writing 0, or
+//     skipping the write, silently mixes dead slots into the live range.
+//
+// H4 -- `pos.w` is the LIFETIME here, not an inverse mass, and calcGridPos must
+//     not let it in.  It does not -- the helper reads xyz -- but the float4 load
+//     makes it look like it might.
+//
+// H5 -- the CUDA reads its arrays from a blockCopy'd SHARED copy of the
+//     descriptor while reading `mDiffusePosition_LifeTime`, the grid size and
+//     `mCommonData` from the GLOBAL one, mixing the two within the same function.
+//     Every value is identical, so the port loads all of them directly and this
+//     note records that the asymmetry was deliberate to drop, not overlooked.
+[shader("compute")]
+[numthreads(1024, 1, 1)]
+void ps_calculateHashForDiffuseParticlesLaunch(uint3 groupThreadId : SV_GroupThreadID,
+                                               uint3 groupId : SV_GroupID)
+{
+    Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gHash.particleSystems);
+    const uint particleId = (Ptr<uint>(gHash.activeParticleSystems))[groupId.y];
+
+    // H1: the allocation bounds the kernel; the live count is the inner test.
+    const uint maxParticles = systems[particleId].mCommonData_MaxDiffuseParticles;
+    const uint numParticles = (Ptr<uint>(systems[particleId].mNumDiffuseParticles))[0];
+    const float cellWidth = systems[particleId].mCommonData_GridCellWidth;
+
+    const uint index = groupThreadId.x + groupId.x * PS_UPDATEGRID;
+
+    if (index >= maxParticles)
+        return;
+
+    Ptr<uint> hashArray = Ptr<uint>(systems[particleId].mDiffuseGridParticleHash);
+    Ptr<uint> particleIndex = Ptr<uint>(systems[particleId].mDiffuseSortedToUnsortedMapping);
+
+    // H2: every slot below the allocation, dead ones included.
+    particleIndex[index] = index;
+
+    if (index >= numParticles)
+    {
+        // H3: the largest key, so the sort pushes dead slots past every live one.
+        hashArray[index] = PS_GRID_EMPTY_CELL;
+        return;
+    }
+
+    Ptr<float4> posLife = Ptr<float4>(systems[particleId].mDiffusePosition_LifeTime);
+
+    const uint gridSizeX = systems[particleId].mCommonData_GridSizeX;
+    const uint gridSizeY = systems[particleId].mCommonData_GridSizeY;
+    const uint gridSizeZ = systems[particleId].mCommonData_GridSizeZ;
+
+    // H4: w is the lifetime; calcGridPos reads xyz only.
+    const float4 pos = posLife[index];
+
+    const int3 gridPos = calcGridPos(pos, cellWidth);
+    hashArray[index] = calcGridHash(gridPos, gridSizeX, gridSizeY, gridSizeZ);
 }
 
 // ---------------------------------------------------------------------------

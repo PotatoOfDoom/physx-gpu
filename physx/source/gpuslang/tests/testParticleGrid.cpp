@@ -338,6 +338,206 @@ PXG_TEST(particleGridCalculateHash)
 }
 
 // ---------------------------------------------------------------------------
+// (3b) ps_calculateHashForDiffuseParticlesLaunch — the DIFFUSE grid build (P9.13b)
+// ---------------------------------------------------------------------------
+// The one thing this must separate from its solid twin: the kernel is bounded by
+// the ALLOCATION and gated by the LIVE COUNT, and the two are different numbers.
+// So MAXD > LIVE, the arrays are sized by MAXD, and three regions are checked:
+//
+//   [0, LIVE)     real hashes, identity mapping
+//   [LIVE, MAXD)  EMPTY_CELL hashes, identity mapping STILL WRITTEN (trap H2)
+//   [MAXD, ...)   a poison tail past the allocation that must be untouched
+//
+// A port that bounds by the live count fails on the middle region; one that skips
+// the mapping write for dead slots fails on it too, but differently; one that
+// bounds by the solid particle count runs off into the poison tail.
+//
+// The geometry mirrors testParticleSim's diffuse predict, and for the same reason
+// (the first sweep there lost two mutants to a one-system, one-block fixture):
+// MAXD > 1024 so the launch is TWO blocks and the `groupId.x * blockDim` term is
+// live, LIVE crosses that block boundary, there are TWO systems with different
+// data and different live counts, and the active list is a PERMUTATION so the
+// active index and the descriptor index cannot be confused.
+PXG_TEST(particleGridCalculateHashDiffuse)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    // 2000, not 1200.  ceil(2000/1024) == 2 blocks either way, but the choice
+    // matters: this kernel's writes are IDEMPOTENT (hash and identity, both
+    // derived from the position), so a wrong block stride can only be caught by
+    // leaving a HOLE, never by writing twice.  A `groupId.x * 512` mutant covers
+    // [0,1024) u [512,1536); at MAXD 1200 that still covers everything and the
+    // mutant is equivalent, at MAXD 2000 it leaves [1536,2000) as poison.
+    // (The diffuse PREDICT in testParticleSim needs no such care -- it
+    // read-modify-writes the position, so a double write is already wrong.)
+    const uint32_t MAXD = 2000u;
+    const uint32_t PAD  = 23u;
+    const uint32_t TOT  = MAXD + PAD;
+    const uint32_t LIVE[2] = { 1500u, 900u };             // 1500 crosses 1024
+    const float cellWidth[2] = { 0.35f, 0.62f };          // per system, distinct
+    const uint32_t gsx = 32, gsy = 64, gsz = 16;         // three DISTINCT pow2 sizes
+
+    std::vector<F4> positions[2];
+    for (uint32_t sysi = 0; sysi < 2; ++sysi)
+    {
+        positions[sysi].resize(TOT);
+        for (uint32_t i = 0; i < TOT; ++i)
+        {
+            // The w channel is a LIFETIME, not an inverse mass.  Two are 0 and one
+            // negative, none of which may reach the hash (trap H4).
+            const float life = (i == 1u) ? 0.0f : (i == 4u ? -2.5f : 0.003f * float(i) + 0.1f);
+            positions[sysi][i] = { 0.019f * float(i) - 2.6f + 7.0f * float(sysi),
+                                   -1.4f + 0.0055f * float(i),
+                                   0.0021f * float(i) - 1.1f - 3.0f * float(sysi), life };
+        }
+        // A negative coordinate in the live range, to keep the two's-complement
+        // wrap exercised as it is in the solid test.
+        positions[sysi][0] = { -0.26f, -3.10f, -0.05f, 0.75f };
+    }
+
+    const std::vector<uint32_t> hashInit(TOT, 0xdeadbeefu);
+    const std::vector<uint32_t> mapInit(TOT, 0xabadcafeu);
+
+    DevBuf bPos[2], bHash[2], bMap[2], bLive[2];
+    for (uint32_t sysi = 0; sysi < 2; ++sysi)
+    {
+        bPos[sysi] = makeDev(dev, positions[sysi]);
+        bHash[sysi] = makeDev(dev, hashInit);
+        bMap[sysi] = makeDev(dev, mapInit);
+        const std::vector<uint32_t> liveCount = { LIVE[sysi], 0xEEEEEEEEu };  // int[2]
+        bLive[sysi] = makeDev(dev, liveCount);
+    }
+
+    // THREE descriptors for TWO active systems, and the active list is
+    // { 2, 0 } -- deliberately NOT a permutation of [0, gridDim.y).  With
+    // { 1, 0 } a kernel that used `groupId.y` directly still visits both live
+    // descriptors, just in the other order, and is EQUIVALENT; with a decoy at
+    // index 1 that never appears in the active list, it visits the decoy and
+    // misses descriptor 2.  Descriptor 1's arrays are the shared decoy buffers
+    // below and must come back untouched.
+    DevBuf bDecoyPos = makeDev(dev, positions[0]);
+    DevBuf bDecoyHash = makeDev(dev, hashInit);
+    DevBuf bDecoyMap = makeDev(dev, mapInit);
+    const std::vector<uint32_t> decoyLive = { MAXD, 0xEEEEEEEEu };
+    DevBuf bDecoyLive = makeDev(dev, decoyLive);
+
+    std::vector<PxgParticleSystem> descArr(3);
+    {
+        PxgParticleSystem ps = makeZeroDesc();
+        ps.mDiffusePosition_LifeTime = reinterpret_cast<float4*>(size_t(bDecoyPos.addr));
+        ps.mDiffuseGridParticleHash = reinterpret_cast<PxU32*>(size_t(bDecoyHash.addr));
+        ps.mDiffuseSortedToUnsortedMapping = reinterpret_cast<PxU32*>(size_t(bDecoyMap.addr));
+        ps.mNumDiffuseParticles = reinterpret_cast<int*>(size_t(bDecoyLive.addr));
+        ps.mCommonData.mMaxDiffuseParticles = MAXD;
+        ps.mCommonData.mGridCellWidth = 1.0f;
+        ps.mCommonData.mGridSizeX = gsx;
+        ps.mCommonData.mGridSizeY = gsy;
+        ps.mCommonData.mGridSizeZ = gsz;
+        descArr[1] = ps;
+    }
+    for (uint32_t sysi = 0; sysi < 2; ++sysi)
+    {
+        PxgParticleSystem ps = makeZeroDesc();
+        ps.mDiffusePosition_LifeTime = reinterpret_cast<float4*>(size_t(bPos[sysi].addr));
+        ps.mDiffuseGridParticleHash = reinterpret_cast<PxU32*>(size_t(bHash[sysi].addr));
+        ps.mDiffuseSortedToUnsortedMapping = reinterpret_cast<PxU32*>(size_t(bMap[sysi].addr));
+        ps.mNumDiffuseParticles = reinterpret_cast<int*>(size_t(bLive[sysi].addr));
+        ps.mCommonData.mMaxDiffuseParticles = MAXD;
+        ps.mCommonData.mGridCellWidth = cellWidth[sysi];
+        ps.mCommonData.mGridSizeX = gsx;
+        ps.mCommonData.mGridSizeY = gsy;
+        ps.mCommonData.mGridSizeZ = gsz;
+        // The SOLID arrays stay NULL and the solid count is larger than the
+        // allocation: a port that reads the solid fields either faults or walks
+        // into the poison tail.
+        ps.mCommonData.mNumParticles = TOT + 7u;
+        descArr[sysi == 0u ? 0u : 2u] = ps;   // 0 and 2; 1 is the decoy
+    }
+    DevBuf bDesc = makeDev(dev, descArr);
+    const std::vector<uint32_t> active = { 2u, 0u };   // NOT a permutation of [0,2)
+    DevBuf bActive = makeDev(dev, active);
+
+    struct HashPush { uint64_t particleSystems, activeParticleSystems; };
+    HashPush push = { bDesc.addr, bActive.addr };
+
+    {
+        Kernel k("particleGridBda.spv", "ps_calculateHashForDiffuseParticlesLaunch", {},
+                 sizeof(HashPush));
+        PXG_CHECK_MSG(k.isValid(), "the diffuse hash pipeline must build");
+        if (!k.isValid()) { return; }
+        // grid = (ceil(MAXD/1024), nbActiveSystems, 1) = (2, 2, 1)
+        k.dispatch((MAXD + 1023u) / 1024u, {}, push, /*gridY*/ 2u, /*gridZ*/ 1u);
+    }
+    dev->flush();
+
+    size_t mm = 0;
+    for (uint32_t sysi = 0; sysi < 2; ++sysi)
+    {
+        const auto gHash = downloadBuffer<uint32_t>(dev, bHash[sysi].h, TOT);
+        const auto gMap = downloadBuffer<uint32_t>(dev, bMap[sysi].h, TOT);
+        for (uint32_t i = 0; i < TOT; ++i)
+        {
+            uint32_t wantHash, wantMap;
+            if (i >= MAXD)
+            {
+                wantHash = 0xdeadbeefu; wantMap = 0xabadcafeu;   // past the allocation
+            }
+            else if (i >= LIVE[sysi])
+            {
+                wantHash = 0xffffffffu;                          // H3: EMPTY_CELL
+                wantMap = i;                                     // H2: still written
+            }
+            else
+            {
+                int32_t gx, gy, gz;
+                cpuGridPos(positions[sysi][i], cellWidth[sysi], gx, gy, gz);
+                wantHash = cpuGridHash(gx, gy, gz, gsx, gsy, gsz);
+                wantMap = i;
+            }
+            if (gHash[i] != wantHash)
+            {
+                if (mm < 6)
+                    std::printf("  diffuse sys%u hash MM %u: got %u want %u\n",
+                                sysi, i, gHash[i], wantHash);
+                ++mm;
+            }
+            if (gMap[i] != wantMap)
+            {
+                if (mm < 6)
+                    std::printf("  diffuse sys%u map MM %u: got %u want %u\n",
+                                sysi, i, gMap[i], wantMap);
+                ++mm;
+            }
+        }
+    }
+    // The decoy descriptor is never active and must never be written.
+    {
+        const auto dHash = downloadBuffer<uint32_t>(dev, bDecoyHash.h, TOT);
+        const auto dMap = downloadBuffer<uint32_t>(dev, bDecoyMap.h, TOT);
+        size_t touched = 0;
+        for (uint32_t i = 0; i < TOT; ++i)
+        {
+            if (dHash[i] != 0xdeadbeefu) ++touched;
+            if (dMap[i] != 0xabadcafeu) ++touched;
+        }
+        PXG_CHECK_MSG(touched == 0, "%zu words of the INACTIVE decoy descriptor were written -- "
+                      "the kernel indexed the descriptor array directly instead of through "
+                      "activeParticleSystems", touched);
+    }
+
+    PXG_CHECK_MSG(mm == 0,
+                  "ps_calculateHashForDiffuseParticlesLaunch bit-exact vs CPU (%zu mismatches)", mm);
+
+    for (uint32_t sysi = 0; sysi < 2; ++sysi)
+    {
+        dev->destroyBuffer(bPos[sysi].h); dev->destroyBuffer(bHash[sysi].h);
+        dev->destroyBuffer(bMap[sysi].h); dev->destroyBuffer(bLive[sysi].h);
+    }
+    dev->destroyBuffer(bDecoyPos.h); dev->destroyBuffer(bDecoyHash.h);
+    dev->destroyBuffer(bDecoyMap.h); dev->destroyBuffer(bDecoyLive.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+// ---------------------------------------------------------------------------
 // (4) ps_reorderDataAndFindCellStartLaunch — gather + cell start/end.
 // ---------------------------------------------------------------------------
 PXG_TEST(particleGridReorder)

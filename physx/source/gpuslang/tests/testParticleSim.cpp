@@ -279,6 +279,204 @@ PXG_TEST(particleSimPreIntegrate)
 }
 
 // ---------------------------------------------------------------------------
+// ps_preDiffuseIntegrateLaunch — the DIFFUSE gravity predict (P9.13b)
+// ---------------------------------------------------------------------------
+// Two dispatches, because the CUDA's reset of mDiffuseOneWayContactCount is
+// guarded on the POINTER being non-null (trap D6) and a single dispatch can only
+// be on one side of that.
+//
+// Everything the solid twin has and this one does not is checked by CONSTRUCTION
+// rather than by inspection: the descriptor's material, phase and damping fields
+// are left at zero and the arrays for them are NOT BOUND AT ALL.  A port that
+// copied the solid body across would dereference a null material pointer and
+// fault, which is a louder failure than a wrong number.
+//
+// THE GEOMETRY, and every part of it is load-bearing -- the first sweep lost two
+// mutants to a fixture that had one system and one block:
+//
+//   * MAXD = 1300 > 1024, so the launch is TWO blocks and the
+//     `groupId.x * blockDim` term is live.  LIVE = 1100 crosses the block
+//     boundary, so both blocks carry a mix of live and dead slots.
+//   * TWO particle systems, with DIFFERENT arrays and DIFFERENT live counts, and
+//     an active list that is a PERMUTATION ({1, 0}).  That separates three
+//     things a single system cannot: groupId.y from groupId.x, and the ACTIVE
+//     index from the DESCRIPTOR index.
+//   * a poison tail past the allocation in every array.
+static void runPreDiffuseIntegrate(PxgSlangComputeDevice* dev, const char* label, bool bindCounts)
+{
+    const uint32_t MAXD = 1300u;   // > 1024: two blocks
+    const uint32_t PAD  = 37u;     // poison past the allocation
+    const uint32_t TOT  = MAXD + PAD;
+    // Per system, and DIFFERENT: 1100 crosses the 1024 block boundary, 700 does
+    // not, so a kernel that took the wrong system's count is wrong in both
+    // directions at once.
+    const uint32_t LIVE[2] = { 1100u, 700u };
+
+    // sys 0 and sys 1 get different data as well as different counts.
+    std::vector<F4> positions[2], vels[2];
+    for (uint32_t sysi = 0; sysi < 2; ++sysi)
+    {
+        positions[sysi].resize(TOT);
+        vels[sysi].resize(TOT);
+        const float bias = sysi == 0 ? 0.0f : 100.0f;
+        for (uint32_t i = 0; i < TOT; ++i)
+        {
+            // w is the LIFETIME.  Slot 2 is exactly 0 and slot 4 negative: a
+            // diffuse particle on (or past) its last frame must STILL be
+            // integrated -- trap D2, there is no `w != 0` guard.
+            const float life = (i == 2u) ? 0.0f
+                             : (i == 4u) ? -1.5f
+                             : (0.5f + 0.001f * float(i) + 0.03f * float(sysi));
+            positions[sysi][i] = { bias + float(i) * 0.017f - 3.0f,
+                                   bias + 2.0f + float(i) * 0.005f,
+                                   bias - 0.75f + 0.011f * float(i), life };
+            // A w nothing may ever read (trap D5: the velocity's w is written
+            // FROM the position's w).
+            vels[sysi][i] = { 0.002f * float(i) + 0.1f * float(sysi),
+                              -0.0035f * float(i) + 0.1f,
+                              0.0007f * float(i) - 0.05f,
+                              -99.0f - float(i) - 1000.0f * float(sysi) };
+        }
+    }
+    std::vector<F4> oriPos(TOT, { -1.f, -1.f, -1.f, -1.f });
+    std::vector<uint32_t> counts(TOT, 7u);
+
+    DevBuf bPos[2], bVel[2], bOri[2], bCounts[2], bLive[2];
+    for (uint32_t sysi = 0; sysi < 2; ++sysi)
+    {
+        bPos[sysi] = makeDev(dev, positions[sysi]);
+        bVel[sysi] = makeDev(dev, vels[sysi]);
+        bOri[sysi] = makeDev(dev, oriPos);
+        bCounts[sysi] = makeDev(dev, counts);
+        const std::vector<uint32_t> liveCount = { LIVE[sysi], 0xEEEEEEEEu }; // int[2]
+        bLive[sysi] = makeDev(dev, liveCount);
+    }
+
+    std::vector<PxgParticleSystem> descArr(2);
+    for (uint32_t sysi = 0; sysi < 2; ++sysi)
+    {
+        PxgParticleSystem ps = makeZeroDesc();
+        ps.mDiffusePosition_LifeTime = reinterpret_cast<float4*>(size_t(bPos[sysi].addr));
+        ps.mDiffuseVelocity = reinterpret_cast<float4*>(size_t(bVel[sysi].addr));
+        ps.mDiffuseOriginPos_LifeTime = reinterpret_cast<float4*>(size_t(bOri[sysi].addr));
+        ps.mNumDiffuseParticles = reinterpret_cast<int*>(size_t(bLive[sysi].addr));
+        ps.mDiffuseOneWayContactCount = bindCounts
+            ? reinterpret_cast<PxU32*>(size_t(bCounts[sysi].addr)) : nullptr;
+        // D1: this is the ALLOCATION and the kernel must NOT read it as the count.
+        ps.mCommonData.mMaxDiffuseParticles = MAXD;
+        // ...and the SOLID count, which is not this kernel's business either.
+        ps.mCommonData.mNumParticles = TOT + 11u;
+        descArr[sysi] = ps;
+    }
+    DevBuf bDesc = makeDev(dev, descArr);
+    // A PERMUTATION: block y=0 works on descriptor 1, y=1 on descriptor 0.
+    const std::vector<uint32_t> active = { 1u, 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    struct PreDPush
+    {
+        uint64_t particleSystems, activeParticleSystems;
+        float gx, gy, gz, dt;
+    };
+    static_assert(sizeof(PreDPush) == 32, "the diffuse predict's blob is 32 bytes, not 40");
+    const float dt = 1.0f / 90.0f;                       // not 1/60, and not 1
+    const float gx = 0.7f, gy = -9.81f, gz = -0.35f;     // three distinct, none 0
+    PreDPush push = { bDesc.addr, bActive.addr, gx, gy, gz, dt };
+
+    {
+        Kernel k("particleSim.spv", "ps_preDiffuseIntegrateLaunch", {}, sizeof(PreDPush));
+        PXG_CHECK_MSG(k.isValid(), "%s: the pipeline must build", label);
+        if (!k.isValid()) { return; }
+        // grid = (ceil(MAXD/1024), nbActiveSystems, 1) = (2, 2, 1)
+        k.dispatch((MAXD + 1023u) / 1024u, {}, push, /*gridY*/ 2u, /*gridZ*/ 1u);
+    }
+    dev->flush();
+
+    size_t mm = 0;
+    for (uint32_t sysi = 0; sysi < 2; ++sysi)
+    {
+        const auto gPos = downloadBuffer<F4>(dev, bPos[sysi].h, TOT);
+        const auto gVel = downloadBuffer<F4>(dev, bVel[sysi].h, TOT);
+        const auto gOri = downloadBuffer<F4>(dev, bOri[sysi].h, TOT);
+        const auto gCnt = downloadBuffer<uint32_t>(dev, bCounts[sysi].h, TOT);
+        const uint32_t live = LIVE[sysi];
+
+        for (uint32_t i = 0; i < TOT; ++i)
+        {
+            const bool alive = i < live;
+            // The host mirror: raw gravity, no damping, no forward-projection scale.
+            const float vxr = alive ? vels[sysi][i].x + gx * dt : vels[sysi][i].x;
+            const float vyr = alive ? vels[sysi][i].y + gy * dt : vels[sysi][i].y;
+            const float vzr = alive ? vels[sysi][i].z + gz * dt : vels[sysi][i].z;
+            const float pxr = alive ? positions[sysi][i].x + vxr * dt : positions[sysi][i].x;
+            const float pyr = alive ? positions[sysi][i].y + vyr * dt : positions[sysi][i].y;
+            const float pzr = alive ? positions[sysi][i].z + vzr * dt : positions[sysi][i].z;
+            // D5: the velocity's w becomes the POSITION's w.
+            const float vwr = alive ? positions[sysi][i].w : vels[sysi][i].w;
+
+            if (f2u(gPos[i].x) != f2u(pxr) || f2u(gPos[i].y) != f2u(pyr) ||
+                f2u(gPos[i].z) != f2u(pzr) || f2u(gPos[i].w) != f2u(positions[sysi][i].w))
+            {
+                if (mm < 4)
+                    std::printf("  %s sys%u pos MM %u: got (%.9g,%.9g,%.9g,%.9g) want "
+                                "(%.9g,%.9g,%.9g,%.9g)\n", label, sysi, i, gPos[i].x, gPos[i].y,
+                                gPos[i].z, gPos[i].w, pxr, pyr, pzr, positions[sysi][i].w);
+                ++mm;
+            }
+            if (f2u(gVel[i].x) != f2u(vxr) || f2u(gVel[i].y) != f2u(vyr) ||
+                f2u(gVel[i].z) != f2u(vzr) || f2u(gVel[i].w) != f2u(vwr))
+            {
+                if (mm < 4)
+                    std::printf("  %s sys%u vel MM %u: got (%.9g,%.9g,%.9g,%.9g) want "
+                                "(%.9g,%.9g,%.9g,%.9g)\n", label, sysi, i, gVel[i].x, gVel[i].y,
+                                gVel[i].z, gVel[i].w, vxr, vyr, vzr, vwr);
+                ++mm;
+            }
+            // The ORIGIN buffer takes the PRE-integration position, lifetime
+            // included; past the live count it must still be poison.
+            const F4 oriWant = alive ? positions[sysi][i] : F4{ -1.f, -1.f, -1.f, -1.f };
+            if (f2u(gOri[i].x) != f2u(oriWant.x) || f2u(gOri[i].y) != f2u(oriWant.y) ||
+                f2u(gOri[i].z) != f2u(oriWant.z) || f2u(gOri[i].w) != f2u(oriWant.w))
+            {
+                if (mm < 4)
+                    std::printf("  %s sys%u ori MM %u: got (%.9g,%.9g,%.9g,%.9g) want "
+                                "(%.9g,%.9g,%.9g,%.9g)\n", label, sysi, i, gOri[i].x, gOri[i].y,
+                                gOri[i].z, gOri[i].w, oriWant.x, oriWant.y, oriWant.z, oriWant.w);
+                ++mm;
+            }
+            const uint32_t cntWant = (bindCounts && alive) ? 0u : 7u;
+            if (gCnt[i] != cntWant)
+            {
+                if (mm < 4)
+                    std::printf("  %s sys%u cnt MM %u: got %u want %u\n",
+                                label, sysi, i, gCnt[i], cntWant);
+                ++mm;
+            }
+        }
+    }
+    PXG_CHECK_MSG(mm == 0, "%s: ps_preDiffuseIntegrateLaunch bit-exact (%zu mismatches)",
+                  label, mm);
+
+    for (uint32_t sysi = 0; sysi < 2; ++sysi)
+    {
+        dev->destroyBuffer(bPos[sysi].h); dev->destroyBuffer(bVel[sysi].h);
+        dev->destroyBuffer(bOri[sysi].h); dev->destroyBuffer(bCounts[sysi].h);
+        dev->destroyBuffer(bLive[sysi].h);
+    }
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+PXG_TEST(particleSimPreDiffuseIntegrate)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    runPreDiffuseIntegrate(dev, "counts-bound", true);
+    // D6: with the pointer null the kernel must NOT write, and must not fault.
+    // The array is still uploaded and read back, so "did not write" is checked
+    // rather than assumed.
+    runPreDiffuseIntegrate(dev, "counts-null", false);
+}
+
+// ---------------------------------------------------------------------------
 // ps_integrateLaunch — post-solve writeback (populated sorted arrays)
 // ---------------------------------------------------------------------------
 PXG_TEST(particleSimIntegrate)

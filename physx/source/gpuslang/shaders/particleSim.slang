@@ -187,6 +187,111 @@ void ps_preIntegrateLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId
 }
 
 // ---------------------------------------------------------------------------
+// ps_preDiffuseIntegrateLaunch — the DIFFUSE gravity predict
+// (particlesystem.cu:403-448), P9.13b
+// ---------------------------------------------------------------------------
+// Sits here rather than in a module of its own because it is the diffuse twin of
+// ps_preIntegrateLaunch above, and the two are only legible next to each other:
+// the differences are the point.
+//
+// SIX TRAPS, each a mutant.
+//
+// D1 -- the count is a POINTER DEREFERENCE, not a descriptor field.
+//     `*particleSystem.mNumDiffuseParticles` is the LIVE number of diffuse
+//     particles, which changes every frame as they spawn and expire.  The
+//     descriptor also carries `mCommonData_MaxDiffuseParticles`, which is the
+//     ALLOCATION and is what the grid-hash kernel bounds itself by instead.
+//     Reading the wrong one here integrates dead slots.
+//
+// D2 -- there is NO `tPos.w != 0` guard.  The solid kernel skips a particle whose
+//     inverse mass is zero (an infinitely heavy, pinned particle); for a diffuse
+//     particle the w channel is its remaining LIFETIME, not an inverse mass, so a
+//     w of zero means "about to expire", not "immovable".  Copying the solid
+//     guard across would freeze exactly the particles that are still alive on
+//     their last frame.
+//
+// D3 -- no damping and no material lookup at all.  Diffuse particles have no
+//     phase and no PBD material: `vel = tVel + gravity * dt` with the RAW
+//     gravity, not `* matGravityScale`, and no `(1 - min(1, damping*dt))` factor.
+//
+// D4 -- no TGS forward-projection scale.  The solid kernel steps by
+//     `vel * dt * (isTGS ? 0.5 : 1.0)`; this one always steps by `vel * dt`, and
+//     it takes no isTGS argument to do otherwise.
+//
+// D5 -- THE VELOCITY'S w COMES FROM THE POSITION.  `vels[i] = (vel, tPos.w)` --
+//     the lifetime is copied into the velocity array's fourth channel, not the
+//     velocity's own previous w.  (The solid kernel does the same thing with the
+//     inverse mass, so this is the engine's convention rather than a slip; it is
+//     still a trap for a port that "tidies" it to `vels[i].w`.)
+//
+// D6 -- `mDiffuseOneWayContactCount` MAY BE NULL and the reset is guarded on it.
+//     The CUDA's comment reads "If contactCounts is null, this means solver is
+//     pbd", which is the opposite way round from what the code does -- the PBD
+//     path is the one that HAS the array.  Transcribed as written: guard on the
+//     pointer, do not reason from the comment.
+//
+// And the ordering that is load-bearing: `oriPositions[i] = tPos` stores the
+// PRE-integration position (with its lifetime in w), and only then is `positions`
+// overwritten.  ps_updateBoundFirstPassLaunch reads exactly that pair as the CCD
+// sweep's endpoints.
+//
+// argSizes (launch site PxgParticleSystemCore.cpp:2716-2722): { particleSystems*,
+// activeParticleSystems*, PxVec3 gravity(12), PxReal dt(4) } -> 32-byte blob.
+// NOTE the two trailing bools the solid kernel has are ABSENT here.
+struct PsPreDiffuseIntegrateParams
+{
+    uint64_t particleSystems;       // @0
+    uint64_t activeParticleSystems; // @8
+    float gravityX;                 // @16
+    float gravityY;                 // @20
+    float gravityZ;                 // @24
+    float dt;                       // @28 -> 32
+}
+[[vk::push_constant]]
+ConstantBuffer<PsPreDiffuseIntegrateParams> gPreD;
+
+[shader("compute")]
+[numthreads(1024, 1, 1)]
+void ps_preDiffuseIntegrateLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_GroupID)
+{
+    Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gPreD.particleSystems);
+    const uint particleId = (Ptr<uint>(gPreD.activeParticleSystems))[groupId.y];
+
+    // D1: the LIVE count, dereferenced.
+    const uint numParticles = (Ptr<uint>(systems[particleId].mNumDiffuseParticles))[0];
+
+    const uint globalThreadIndex = groupThreadId.x + groupId.x * PS_BLOCK_DIM;
+
+    Ptr<float4> positions = Ptr<float4>(systems[particleId].mDiffusePosition_LifeTime);
+    Ptr<float4> vels = Ptr<float4>(systems[particleId].mDiffuseVelocity);
+    Ptr<float4> oriPositions = Ptr<float4>(systems[particleId].mDiffuseOriginPos_LifeTime);
+    const uint64_t contactCountsAddr = systems[particleId].mDiffuseOneWayContactCount;
+
+    if (globalThreadIndex >= numParticles)
+        return;
+
+    const float4 tPos = positions[globalThreadIndex];
+
+    oriPositions[globalThreadIndex] = tPos;
+
+    const float3 tVel = vels[globalThreadIndex].xyz;
+    const float3 oldPos = float3(tPos.x, tPos.y, tPos.z);
+
+    // D3: raw gravity, no damping, no material.  D2: unconditional.
+    const float3 vel = tVel + float3(gPreD.gravityX, gPreD.gravityY, gPreD.gravityZ) * gPreD.dt;
+    // D4: no forward-projection scale.
+    const float3 pos = oldPos + vel * gPreD.dt;
+
+    positions[globalThreadIndex] = float4(pos.x, pos.y, pos.z, tPos.w);
+    // D5: the LIFETIME, from the position.
+    vels[globalThreadIndex] = float4(vel.x, vel.y, vel.z, tPos.w);
+
+    // D6: guarded on the pointer, not on a solver mode.
+    if (contactCountsAddr != 0UL)
+        (Ptr<uint>(contactCountsAddr))[globalThreadIndex] = 0u;
+}
+
+// ---------------------------------------------------------------------------
 // ps_integrateLaunch — post-solve vel/pos writeback (particlesystem.cu:3087-3218)
 // ---------------------------------------------------------------------------
 // argSizes: { particleSystems*, activeParticleSystems*, PxReal dt(4),

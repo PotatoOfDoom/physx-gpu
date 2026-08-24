@@ -379,7 +379,7 @@ pxg_compile_shader(gridCal ctGridCal)
 # kernels on the engine ABI (BDA).  Vulkan-only (BDA reads the PxgParticleSystem
 # descriptor array through Ptr<>, which does not lower to HLSL cs_6_0), so
 # deliberately absent from PXG_HLSL_ENTRIES (same precedent as solveBlockUnified).
-pxg_compile_shader(particleSim ps_updateUnsortedArrayLaunch ps_preIntegrateLaunch ps_integrateLaunch ps_updateUserBufferLaunch)
+pxg_compile_shader(particleSim ps_updateUnsortedArrayLaunch ps_preIntegrateLaunch ps_integrateLaunch ps_updateUserBufferLaunch ps_preDiffuseIntegrateLaunch)
 # P6.1: particle contact-sort bring-up — the three contact-sort orchestration
 # kernels on the engine ABI (BDA), re-pointed off the Phase-1 harness
 # (radixSortGather / clampValues).  The radix double-copies grid-stride via
@@ -596,7 +596,7 @@ pxg_compile_shader(npPairMgmtBda removeContactManagers_Stage1 removeContactManag
 # grid-stride, which has no HLSL cs_6_0 lowering, so this shader is deliberately
 # absent from PXG_HLSL_ENTRIES (same precedent as particleSim /
 # particleContactSortBda / solveBlockUnified).
-pxg_compile_shader(particleGridBda ps_calculateHashLaunch ps_reorderDataAndFindCellStartLaunch)
+pxg_compile_shader(particleGridBda ps_calculateHashLaunch ps_reorderDataAndFindCellStartLaunch ps_calculateHashForDiffuseParticlesLaunch)
 # P6.3: PBD particle self-collision neighbour search + one-way contact solve +
 # delta-apply + velocity recompute on the engine ABI (BDA).  All four kernels read
 # the PxgParticleSystem descriptor array through Ptr<>, which has no HLSL cs_6_0
