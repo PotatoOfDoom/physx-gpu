@@ -85,6 +85,47 @@ public struct PxgParticleSimBufferGpu
     public uint _pad84;                   // @84 -> 88
 }
 
+// P9.13c -- the DIFFUSE per-buffer record, PxgParticleDiffuseSimBuffer
+// (PxgParticleSystem.h:196-210).  Generated from the engine headers and pinned
+// by static_assert in testPsDiffuseBuffers.cpp.
+//
+// 88 bytes: a 40-byte PxDiffuseParticleParams by VALUE at offset 0, then two
+// device pointers, the capacity, two more pointers and two PxU32.
+//
+// TWO THINGS THE LAYOUT ITSELF TRAPS.
+//
+//   * mParams is EMBEDDED, not a pointer.  PxDiffuseParticleParams is nine
+//     PxReal and a bool -- 36 bytes of float plus one byte, padded to 40 -- so
+//     every pointer in this struct sits 40 bytes further along than a reader
+//     that expected a pointer would put it.
+//   * mNumDiffuseParticles is an `int*` to TWO ints, not one.  Slot [0] is the
+//     published count and slot [1] is the staging counter the create kernel
+//     atomically appends to; ps_diffuseParticleCopy is what moves [1] into [0]
+//     and zeroes [1] again.  A reader that treats it as a single int silently
+//     works until it needs the staging half.
+public struct PxgParticleDiffuseSimBufferGpu
+{
+    // PxDiffuseParticleParams, PxFiltering-adjacent (PxParticleBuffer.h:235-273).
+    public float mParams_threshold;             // @0
+    public float mParams_lifetime;              // @4
+    public float mParams_airDrag;               // @8
+    public float mParams_bubbleDrag;            // @12
+    public float mParams_buoyancy;              // @16
+    public float mParams_kineticEnergyWeight;   // @20
+    public float mParams_pressureWeight;        // @24
+    public float mParams_divergenceWeight;      // @28
+    public float mParams_collisionDecay;        // @32
+    public uint  mParams_useAccurateVelocity;   // @36  a BYTE bool + 3 pad
+    public uint64_t mDiffusePositions_LifeTime; // @40  float4*
+    public uint64_t mDiffuseVelocities;         // @48  float4*
+    public uint  mMaxNumParticles;              // @56
+    public uint  _pad60;                        // @60
+    public uint64_t mNumDiffuseParticles;       // @64  int*  -- TWO ints, see above
+    public uint64_t mNumActiveDiffuseParticles; // @72  int*  (pinned host memory)
+    public uint  mStartIndex;                   // @80
+    public uint  mFlags;                        // @84 -> 88
+}
+
 // P9.3a -- the PBD CLOTH records.  All three layouts generated from the engine
 // headers and pinned by static_assert in testPsSprings.cpp.
 //

@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 344;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 347;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -210,7 +210,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "solveWholeIslandTGS", "solverTGS.spv", "solveWholeIslandTGS" },  // RIGID_SOLVE_WHOLE_ISLAND_TGS
     { "ps_updateUnsortedArrayLaunch", "particleSim.spv", "ps_updateUnsortedArrayLaunch" },  // PS_UPDATE_UNSORTED_ARRAY (P6.0 BDA port: user-buffer ingest)
     { "ps_updateUserBufferLaunch", "particleSim.spv", "ps_updateUserBufferLaunch" },  // PS_UPDATE_BUFFER_DATA (P6.0 BDA port)
-    { "ps_updateUnsortedDiffuseArrayLaunch", nullptr, nullptr },  // PS_UPDATE_DIFFUSE_UNSORTED_ARRAY (unmapped)
+    { "ps_updateUnsortedDiffuseArrayLaunch", "psDiffuseBuffers.spv", "ps_updateUnsortedDiffuseArrayLaunch" },  // PS_UPDATE_DIFFUSE_UNSORTED_ARRAY (P9.13c: the per-buffer gather into the flat unsorted arrays)
     { "ps_preIntegrateLaunch", "particleSim.spv", "ps_preIntegrateLaunch" },  // PS_PREINTEGRATION (P6.0 BDA port)
     { "ps_preDiffuseIntegrateLaunch", "particleSim.spv", "ps_preDiffuseIntegrateLaunch" },  // PS_PRE_DIFFUSE_INTEGRATION (P9.13b: the diffuse gravity predict)
     { "ps_updateBoundFirstPassLaunch", "psBoundsBda.spv", "ps_updateBoundFirstPassLaunch" },  // PS_UPDATE_BOUND_FRIST (P6.4a-1 BDA port: per-block world AABB reduce)
@@ -269,8 +269,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_diffuseParticleUpdatePBF", nullptr, nullptr },  // PS_DIFFUSE_PARTICLES_UPDATE_PBF (unmapped)
     { "ps_diffuseParticleCompact", nullptr, nullptr },  // PS_DIFFUSE_PARTICLES_COMPACT (unmapped)
     { "ps_diffuseParticleCreate", nullptr, nullptr },  // PS_DIFFUSE_PARTICLES_CREATE (unmapped)
-    { "ps_diffuseParticleCopy", nullptr, nullptr },  // PS_DIFFUSE_PARTICLES_COPY (unmapped)
-    { "ps_diffuseParticleSum", nullptr, nullptr },  // PS_DIFFUSE_PARTICLES_SUM (unmapped)
+    { "ps_diffuseParticleCopy", "psDiffuseBuffers.spv", "ps_diffuseParticleCopy" },  // PS_DIFFUSE_PARTICLES_COPY (P9.13c: publish the staged count, clear the staging slot)
+    { "ps_diffuseParticleSum", "psDiffuseBuffers.spv", "ps_diffuseParticleSum" },  // PS_DIFFUSE_PARTICLES_SUM (P9.13c: sum the per-buffer counts into the system count)
     { "ps_findStartEndFEMFirstLaunch", nullptr, nullptr },  // PS_FIND_RANGESTARTEND_FEM_FIRST (unmapped)
     { "ps_findStartEndFEMSecondLaunch", nullptr, nullptr },  // PS_RANGESTARTEND_FEM_SECONE (unmapped)
     { "ps_accumulateFEMParticleDeltaVLaunch", nullptr, nullptr },  // PS_ACCUMULATE_FEM_PARTICLE_DELTA (unmapped)
