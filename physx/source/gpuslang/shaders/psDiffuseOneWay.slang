@@ -32,11 +32,12 @@
 // Per diffuse particle it walks that particle's static-contact list and pushes
 // the particle's PREDICTED position out along each contact normal by that
 // contact's penetration.  It is the only reader of mDiffuseOneWayContactInfos /
-// mDiffuseOneWayContactCount; the two producers
-// (ps_primitivesDiffuseCollisionLaunch, ps_convexDiffuseCollisionLaunch) are
-// still unmapped, so until they land this kernel runs over a contact list that
-// is always empty.  That is stated here rather than left for a reader to
-// discover from a scene that does not move.
+// mDiffuseOneWayContactCount.  When this landed both producers were unmapped and
+// the list was always empty; P9.13g mapped
+// ps_primitivesDiffuseCollisionLaunch, and the particlediffuse scene measured
+// the difference the moment it did -- the lowest diffuse y over the run went
+// from -55.54 (falling straight through the floor) to -0.1886.
+// ps_convexDiffuseCollisionLaunch is still unmapped; that scene never calls it.
 //
 // ---------------------------------------------------------------------------
 // TRAPS

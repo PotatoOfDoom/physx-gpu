@@ -1701,6 +1701,91 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.13h — MEILENSTEIN: die Gischt bleibt auf dem Boden liegen. Die Diffus-Kette misst endlich die KOLLISION (kein neuer Kernel)
+
+Kein Manifest-Zuwachs: **352** bleibt **352**. Diese Tranche schreibt keinen
+Kernel, sie **beweist** die beiden, die P9.13f und P9.13g gelandet haben — und
+schließt damit die Anforderung, die seit P9.13e offen im Raum stand:
+
+> Die nächste Tranche muss eine Beobachtung mitbringen, die **nur die BEWEGUNG**
+> erfüllen kann, sonst bleibt die Szene grün, ob die Kernel liegen oder nicht.
+
+### Zuerst gefragt, dann gebaut
+
+Vor dem Angriff auf `ps_convexDiffuseCollisionLaunch` — den letzten Kernel der
+Kette, der über GJK/EPA geht und mehrere Tranchen kostet — wurde die **Szene
+gefragt**, was ihr überhaupt noch fehlt. Die Antwort war lehrreich:
+
+* `ps_diffuseParticleOneWayCollision` und `ps_primitivesDiffuseCollisionLaunch`
+  stehen **nicht mehr** auf der Verweigerungsliste des Wranglers;
+* die per-Frame-Meldung `GPU particlePrimitivesDiffuseCollisionLaunch fail to
+  launch!!`, die diese Szene 288-mal pro Lauf ausgab, ist **verschwunden**;
+* übrig bleibt genau **ein** Diffus-Name, `ps_convexDiffuseCollisionLaunch` —
+  und den ruft diese Szene **nie** auf, weil sie keine konvexe Form enthält.
+
+Die Kette ist für `particlediffuse` also **geschlossen**. Die Beobachtung gehört
+deshalb hierhin, nicht hinter den Konvex-Kernel.
+
+### Die Beobachtung: der tiefste Punkt der Gischt
+
+Die Szene liest jetzt `getDiffusePositionLifeTime()` per DtoH aus — über genau
+die Zahl von Partikeln, die der Puffer selbst veröffentlicht — und führt das
+**Minimum von y über den ganzen Lauf** mit. Die Flüssigkeitssäule ruht bei
+y ≈ 0.17; ein Diffuspartikel, das nie aus dem Boden geschoben wird, fällt den
+Rest des Laufs weiter.
+
+**Gemessen, nicht behauptet:**
+
+| Aufbau | tiefstes Diffus-y |
+|---|---|
+| Kette vollständig | **−0.1886** |
+| `deltaP = 0` im Einweg-Kernel (ein mutiertes `.spv`, sonst derselbe Bau) | **−55.5425** |
+
+Ein Faktor von knapp **300**. Die Schranke steht bei **−2.0**: das Zehnfache der
+korrigierten Zahl und ein Siebenundzwanzigstel der unkorrigierten.
+
+Damit hat `particlediffuse` **drei** Prüfungen, und jede fällt bei einem anderen
+Stück der Kette um:
+
+1. **Übertrag** (Peak ≥ 2048) — braucht `ps_diffuseParticleCompact`;
+2. **Alterung** (Endstand ≥ 5 % unter dem Peak) — braucht dessen
+   Lebensdauer-Abbau;
+3. **Kollision** (tiefstes y > −2.0) — braucht
+   `ps_primitivesDiffuseCollisionLaunch` **und**
+   `ps_diffuseParticleOneWayCollision`.
+
+Spawn, Veröffentlichung, Alterung und Kollision laufen damit **von Anfang bis
+Ende auf Vulkan** — und das ist zum ersten Mal in dieser Kette eine Aussage, die
+die Szene trägt statt sie nur nicht zu widerlegen.
+
+### Zwei Kommentare, die falsch geworden waren
+
+Die Kopfzeile von `psDiffuseOneWay.slang` sagte, beide Erzeuger seien
+unabgebildet und der Kernel laufe über eine immer leere Liste. Seit P9.13g
+stimmt das für den Primitiven-Erzeuger nicht mehr; die Zeile trägt jetzt die
+gemessenen −55.54 → −0.1886 statt der alten Vorhersage. Der Szenenkommentar und
+die Erfolgsmeldung sagten „die drei Diffus-Kollisionskernel sind noch nicht
+abgebildet" — zwei von dreien sind es, und der dritte wird von dieser Szene nie
+gerufen. Beide sagen das jetzt.
+
+### Verifikation
+
+* Szene und Kontrolle (`PXG_DIFFUSE_CONTROL=1`) beide grün;
+* die neue Prüfung **einzeln falsifiziert** gegen einen mutierten Shader;
+* Szenen: **29 ok, 0 fail, 0 missing (of 29)**;
+* Suite unverändert **815/815** in beiden Speichermodi — diese Tranche fasst
+  keinen Shader an, nur die Szene und zwei Kommentare.
+
+### Was offen bleibt
+
+`ps_convexDiffuseCollisionLaunch` (`cudaParticleSystem.cu:1586`) ist der letzte
+Kernel der Diffus-Kette und die einzige Diffus-Zeile, die im Manifest noch
+`nullptr` trägt. Er geht über `squawk::EpaScratch` und
+`ParticleConvexCollideScratch`, also über warp-kooperatives GJK/EPA gegen eine
+konvexe Hülle — die Module `pxgSlangGjk` und `pxgSlangEpa` liegen bereits, sein
+Flüssigkeits-Zwilling `ps_convexCollisionLaunch` aber **nicht**. Das ist eine
+eigene, mehrteilige Tranche, und keine Szene verlangt sie bislang.
+
 ## P9.13g — `ps_primitivesDiffuseCollisionLaunch` (Manifest **352**): der Erzeuger, ein Fixture, das CCD nicht sehen konnte, und ein Mutant, den erst dreißig Ebenen töten
 
 Portiert `cudaParticleSystem.cu:1324` (Wrapper) und `:505-635`

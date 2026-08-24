@@ -26,6 +26,7 @@
 
 #include <cstdio>
 #include <cmath>
+#include <cfloat>
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
@@ -1013,6 +1014,25 @@ float particleMeanY(const ParticleScene& psc)
     double sum = 0.0;
     for (PxU32 i = 0; i < psc.numParticles; ++i) sum += double(host[i].y);
     return float(sum / double(psc.numParticles));
+}
+
+// DtoH-read the DIFFUSE buffer and return the lowest y among the live diffuse
+// particles (P9.13h).  The count is the buffer's own published figure, so this
+// reads exactly the particles the engine says exist.  Returns +inf when there
+// are none, which the caller folds into a running minimum without disturbing it.
+float diffuseMinY(const ParticleScene& psc)
+{
+    if (!psc.diffuse) return FLT_MAX;
+    const PxU32 n = psc.diffuse->getNbActiveDiffuseParticles();
+    if (n == 0u) return FLT_MAX;
+    std::vector<PxVec4> host(n);
+    PxCudaContext* ctx = psc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(),
+                    reinterpret_cast<CUdeviceptr>(psc.diffuse->getDiffusePositionLifeTime()),
+                    n * sizeof(PxVec4));
+    float lo = FLT_MAX;
+    for (PxU32 i = 0; i < n; ++i) lo = PxMin(lo, host[i].y);
+    return lo;
 }
 
 // ---------------------------------------------------------------------------
@@ -4290,6 +4310,10 @@ int main()
         // of the previous published set, so the population accumulates.  The
         // last-step count is the aging half of the same observable.
         PxU32 endDiffuseSeen = 0;
+        // P9.13h: the observable that ONLY a collision can satisfy.  A diffuse
+        // particle that is never pushed out of the floor keeps falling for the
+        // whole run; one the one-way contact path corrects stays above it.
+        float minDiffuseY = FLT_MAX;
         float restMaxDy = 0.0f;   // max |dy| over the final quarter (rest convergence)
         const int restWindow = steps / 4;
         for (int i = 0; i < steps; ++i)
@@ -4313,6 +4337,7 @@ int main()
             {
                 endDiffuseSeen = psc.diffuse->getNbActiveDiffuseParticles();
                 maxDiffuseSeen = PxMax(maxDiffuseSeen, endDiffuseSeen);
+                minDiffuseY = PxMin(minDiffuseY, diffuseMinY(psc));
             }
             prevY = y;
         }
@@ -4515,10 +4540,20 @@ int main()
             // now) and it must FALL BACK from that peak (a saturated buffer whose
             // particles never expire stays saturated -- 4096 -> 3197 now).
             //
-            // Still unmapped, and therefore still unexercised by this scene --
-            //     ps_diffuseParticleOneWayCollision
-            //     ps_primitivesDiffuseCollisionLaunch / ps_convexDiffuseCollisionLaunch
-            // -- so a spawned particle ages and moves, but collides with nothing.
+            // P9.13h added the third and last check, and it is the one no amount
+            // of spawning or aging can pass: the LOWEST y any live diffuse
+            // particle reached.  The fluid column rests at y ~ 0.17, so a
+            // diffuse particle that is never pushed out of the floor keeps
+            // falling for the rest of the run.  Measured -0.1886 with the chain
+            // whole and -55.54 with the one-way correction neutralised in the
+            // shader -- same build, one mutated .spv.
+            //
+            // What this scene STILL does not reach is
+            // ps_convexDiffuseCollisionLaunch, which is unmapped -- and which
+            // this scene never calls, because it contains no convex shape.  Its
+            // name is in the wrangler's startup list and nowhere else; the
+            // per-frame "fail to launch" errors this scene used to emit are
+            // gone.
             //
             // WHERE TO READ THE WORK LIST, and where NOT to.  PXG_LAUNCH_TRACE=1 is
             // the wrong instrument here and says so by staying silent: an unmapped
@@ -4538,10 +4573,11 @@ int main()
             {
                 const bool control = std::getenv("PXG_DIFFUSE_CONTROL") != nullptr;
                 std::printf("  particle DIFFUSE: peak active diffuse particles = %u of %u, last "
-                            "step %u (threshold %s); mean y %.4f -> %.4f, nn %.4f\n",
+                            "step %u (threshold %s); lowest diffuse y %.4f; mean y %.4f -> %.4f, "
+                            "nn %.4f\n",
                             maxDiffuseSeen, MAX_DIFFUSE, endDiffuseSeen,
                             control ? "1e12 (CONTROL)" : "reachable",
-                            y0, yEnd, nnEnd);
+                            minDiffuseY == FLT_MAX ? 0.0f : minDiffuseY, y0, yEnd, nnEnd);
                 if (control)
                 {
                     if (maxDiffuseSeen != 0u)
@@ -4583,6 +4619,21 @@ int main()
                                   "so the lifetime is not being decayed\n",
                                   endDiffuseSeen, maxDiffuseSeen);
                       ++failures; }
+                    // COLLISION (P9.13h).  Carry-over and aging both happen with no
+                    // contact at all -- neither needs the floor.  This one does: a
+                    // diffuse particle that is never pushed out keeps falling for the
+                    // rest of the run, and the fluid column sits at y ~ 0.17, so the
+                    // lowest y any live diffuse particle reached is the whole chain's
+                    // end-to-end observable.  Measured -0.1886 with the one-way
+                    // correction and -55.54 with it neutralised (same build, one
+                    // mutated shader), so the bar sits at -2.0: ten times the
+                    // corrected figure and a twenty-seventh of the uncorrected one.
+                    else if (minDiffuseY < -2.0f)
+                    { std::printf("FAIL: a diffuse particle reached y = %.4f -- the spray is "
+                                  "falling through the floor, so the one-way contact path is "
+                                  "not correcting it (need > -2.0; the fluid rests at %.4f)\n",
+                                  minDiffuseY, yEnd);
+                      ++failures; }
                 }
             }
             scene->release(); physics->release(); cudaCtx->release(); foundation->release();
@@ -4596,20 +4647,21 @@ int main()
                                 "unreachable threshold, as it must -- this says nothing about "
                                 "whether the diffuse chain works\n");
                 else
-                    // Say exactly what this proves and no more.  The peak needs
-                    // create/copy/sum; the CARRY-OVER to that peak and the fall
-                    // back from it need ps_diffuseParticleCompact, which ages the
-                    // particles and drops the ones whose lifetime ran out.  What
-                    // this still does NOT reach is the three collision kernels
-                    // (ps_diffuseParticleOneWayCollision,
-                    // ps_primitivesDiffuseCollisionLaunch,
-                    // ps_convexDiffuseCollisionLaunch), which are unmapped -- so
-                    // "end to end" remains a claim this scene cannot support.
+                    // Say exactly what this proves.  The peak needs create/copy/sum;
+                    // the CARRY-OVER to it and the fall back from it need
+                    // ps_diffuseParticleCompact's aging; and the floor needs
+                    // ps_primitivesDiffuseCollisionLaunch to find the contact and
+                    // ps_diffuseParticleOneWayCollision to apply it.  That is the
+                    // whole chain this scene reaches.  It does NOT reach
+                    // ps_convexDiffuseCollisionLaunch, which is still unmapped and
+                    // which this scene never calls -- there is no convex shape in it.
                     std::printf("[  OK  ] gpu-sdk-step: the PBD fluid carried a DIFFUSE population "
-                                "up to %u of %u and back down to %u -- create/copy/sum publish it, "
-                                "and only compact's aging can make it accumulate and then decay; "
-                                "the three diffuse COLLISION kernels are still unmapped\n",
-                                maxDiffuseSeen, MAX_DIFFUSE, endDiffuseSeen);
+                                "up to %u of %u and back down to %u, and the spray STOPPED AT THE "
+                                "FLOOR (lowest y %.4f, vs -55.54 measured with the one-way "
+                                "correction neutralised) -- spawn, publish, age and collide all "
+                                "run on Vulkan; only ps_convexDiffuseCollisionLaunch is unmapped, "
+                                "and this scene never calls it\n",
+                                maxDiffuseSeen, MAX_DIFFUSE, endDiffuseSeen, minDiffuseY);
                 return 0;
             }
             if (failures == 0 && hfFloorScene)
