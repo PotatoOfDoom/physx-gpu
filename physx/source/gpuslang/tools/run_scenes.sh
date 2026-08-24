@@ -40,6 +40,9 @@ fi
 # The 28 named scenes.  The settling bag below makes 29 -- the figure
 # RUNTIME_STATUS.md's header carries.  particlediffuse joined in P9.13d, when
 # ps_diffuseParticleCreate made it pass; it had been a diagnostic since P9.13a.
+# particleconvex (P9.14a) is deliberately NOT here: both convex particle kernels
+# are unmapped, so it exists to name them and lives in the pending-work list at
+# the bottom until they land.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor articulation
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
         particlecloth particleinflatable particlediffuse
@@ -90,6 +93,24 @@ if [ "${1:-}" = "--diagnostics" ]; then
         echo "--- $sc + $var=1"
         env PXG_SCENE=$sc $var=1 PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
             | grep -E '^  particle |^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step' | sed 's/^/    /'
+    done
+
+    # A SECOND diagnostic list, and a different kind.  The controls above are
+    # references that exist to fail; these are scenes that exist to NAME KERNELS
+    # THAT ARE NOT MAPPED YET.  They fail because the work is not done, not
+    # because failing is their job, and each moves into SCENES above in the
+    # tranche that makes it pass -- as particlediffuse did in P9.13d.
+    echo
+    echo "=== pending work (NOT scored: these name kernels that are not mapped yet;"
+    echo "    each moves into the scored list when its chain lands) ==="
+    for sc in particleconvex; do
+        echo "--- $sc"
+        env PXG_SCENE=$sc PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
+            | grep -E '^  particle |^  cooked |^  \[ diag \]|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step' \
+            | sed 's/^/    /'
+        env PXG_SCENE=$sc PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
+            | grep -E '\] GPU .*fail to launch' | sed 's/.*GPU //' | sort | uniq -c \
+            | sed 's/^/    /'
     done
 fi
 

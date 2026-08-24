@@ -237,6 +237,60 @@ PxRigidStatic* addMeshFloor(PxPhysics* physics, PxScene* scene, PxMaterial* mate
     return floor;
 }
 
+// A cooked CONVEX floor whose TOP FACE sits at y = 0 (P9.14a): a flat slab of
+// half-extents (halfExtent, 0.5, halfExtent), cooked as a convex hull and
+// attached to a static actor at y = -0.5.
+//
+// Why a slab and not a plane or a box PRIMITIVE: the narrowphase's pair table
+// (PxgNphaseImplementationContext.cpp:1489) routes eCONVEXMESH x ePARTICLESYSTEM
+// to caseConvexParticle -> GPU_BUCKET_ID::eConvexParticle ->
+// testSDKConvexParticle, which is the ONLY caller of ps_convexCollisionLaunch and
+// ps_convexDiffuseCollisionLaunch.  A PxBoxGeometry floor is eBOX and goes to the
+// primitives path instead; a PxPlaneGeometry likewise.  So the shape TYPE is the
+// whole point of this floor, not its silhouette.
+//
+// cndCaseConvexParticle refuses a hull that is not GPU-compatible and falls back
+// to the CPU bucket with an error, so buildGPUData must be set and the result is
+// checked and printed rather than assumed.
+PxRigidStatic* addConvexFloor(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                              float halfExtent)
+{
+    const float E = halfExtent;
+    const PxVec3 slabVerts[8] = {
+        PxVec3(-E, -0.5f, -E), PxVec3(-E, -0.5f, E),
+        PxVec3(-E,  0.5f, -E), PxVec3(-E,  0.5f, E),
+        PxVec3( E, -0.5f, -E), PxVec3( E, -0.5f, E),
+        PxVec3( E,  0.5f, -E), PxVec3( E,  0.5f, E),
+    };
+    PxCookingParams cp(physics->getTolerancesScale());
+    cp.buildGPUData = true;
+    PxConvexMeshDesc desc;
+    desc.points.count = 8;
+    desc.points.stride = sizeof(PxVec3);
+    desc.points.data = slabVerts;
+    desc.flags = PxConvexFlag::eCOMPUTE_CONVEX;
+    PxConvexMeshCookingResult::Enum cond = PxConvexMeshCookingResult::eSUCCESS;
+    PxConvexMesh* hull = immediateCooking::createConvexMesh(
+        cp, desc, physics->getPhysicsInsertionCallback(), &cond);
+    if (!hull)
+    { std::printf("FAIL: convex floor cooking failed (result %d)\n", int(cond)); return nullptr; }
+    std::printf("  cooked convex FLOOR: %u verts, %u polygons, half-extent %.1f "
+                "(GPU-compatible: %s)\n", hull->getNbVertices(), hull->getNbPolygons(),
+                E, hull->isGpuCompatible() ? "yes" : "NO");
+    if (!hull->isGpuCompatible())
+        std::printf("FAIL: the convex floor is not GPU-compatible -- the pair would fall back "
+                    "to the CPU bucket and no convex particle kernel would ever run\n");
+
+    // Top face at y = 0, matching the mesh and heightfield floors exactly, so the
+    // three scenes' settle heights are directly comparable.
+    PxRigidStatic* floor = physics->createRigidStatic(PxTransform(PxVec3(0.0f, -0.5f, 0.0f)));
+    PxShape* fs = physics->createShape(PxConvexMeshGeometry(hull), *material);
+    floor->attachShape(*fs);
+    scene->addActor(*floor);
+    fs->release();
+    return floor;
+}
+
 // A cooked HEIGHTFIELD floor at y = 0: a flat grid of zero-height samples spanning
 // [-halfExtent, halfExtent] in x and z.  Used by the particle heightfield-floor
 // scene (P9.11c), which is the first scene in this port to put PARTICLES on a
@@ -688,7 +742,8 @@ struct ParticleScene
 ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
                                  PxCudaContextManager* cudaCtx, bool fluidMode = false,
                                  bool boundaryMode = false, bool meshFloorMode = false,
-                                 bool hfFloorMode = false, bool diffuseMode = false)
+                                 bool hfFloorMode = false, bool diffuseMode = false,
+                                 bool convexFloorMode = false)
 {
     ParticleScene out;
     out.cudaCtx = cudaCtx;
@@ -711,7 +766,7 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     // contacts through ps_heightfieldCollisonLaunch, the SECOND producer of
     // mOneWayContactInfos this port has, and the third and last one
     // (ps_sdfMeshCollisonLaunch) is still unmapped.
-    if (meshFloorMode || hfFloorMode)
+    if (meshFloorMode || hfFloorMode || convexFloorMode)
     {
         addGroundBox(physics, scene, rigidMat, -40.0f);
         // 60 x 60, not the 20 x 20 the meshfloor box scene uses.  Measured: with the
@@ -719,8 +774,13 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         // the rim exactly where the fluid ends up and the particles fell off the edge
         // (mean y -2.98).  That looked like a contact failure and was a floor-sizing
         // failure -- with the scale at 0 the SAME floor held them at y 0.167.
-        if (meshFloorMode) addMeshFloor(physics, scene, rigidMat, 30.0f);
-        else               addHeightFieldFloor(physics, scene, rigidMat, 30.0f);
+        if (meshFloorMode)        addMeshFloor(physics, scene, rigidMat, 30.0f);
+        else if (hfFloorMode)     addHeightFieldFloor(physics, scene, rigidMat, 30.0f);
+        // P9.14a: the same floor again, one shape type further along -- a cooked
+        // CONVEX HULL.  That is the only floor type whose particle pair reaches
+        // testSDKConvexParticle, and therefore the only one that can ever launch
+        // ps_convexCollisionLaunch or ps_convexDiffuseCollisionLaunch.
+        else                      addConvexFloor(physics, scene, rigidMat, 30.0f);
     }
     else
     {
@@ -738,7 +798,7 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         // contributing PRIMITIVE contacts -- the other half of the boundary density,
         // which would blur exactly what this scene is built to isolate.  On that floor
         // it goes to x=45, outside the 60 x 60 mesh, and falls to the sunken ground box.
-        const float asideX = (meshFloorMode || hfFloorMode) ? 45.0f : 20.0f;
+        const float asideX = (meshFloorMode || hfFloorMode || convexFloorMode) ? 45.0f : 20.0f;
         PxRigidDynamic* aside = physics->createRigidDynamic(PxTransform(PxVec3(asideX, 0.5f, 0.0f)));
         PxShape* s = physics->createShape(PxBoxGeometry(0.5f, 0.5f, 0.5f), *rigidMat);
         aside->attachShape(*s);
@@ -4259,13 +4319,26 @@ int main()
     // run_scenes.sh's DIAGNOSTIC list until the chain lands, and moves to the
     // scored list in the tranche that makes it pass.
     const bool diffuseScene = !std::strcmp(sceneName, "particlediffuse");
+    // P9.14a: particleconvex is particlediffuse with the floor swapped for a cooked
+    // CONVEX HULL.  Same experiment as particlemeshfloor and particlehffloor, one
+    // shape type further along -- and the only one that reaches the convex pair
+    // bucket.  It carries a DIFFUSE buffer as well, because testSDKConvexParticle
+    // launches BOTH convex particle kernels from the same entry
+    // (PxgNarrowphaseCore.cpp:3775 and :3822), so one scene names both.
+    //
+    // ITS PURPOSE TODAY IS TO NAME WORK, NOT TO PASS: ps_convexCollisionLaunch and
+    // ps_convexDiffuseCollisionLaunch are both unmapped, so the fluid falls through
+    // the floor and the spray with it.  It lives in run_scenes.sh's DIAGNOSTIC list
+    // until they land, exactly as particlediffuse did between P9.13a and P9.13d.
+    const bool convexFloorScene = !std::strcmp(sceneName, "particleconvex");
     const bool fluidScene = !std::strcmp(sceneName, "particlefluid") || boundaryScene
-                            || staticFloorScene || diffuseScene;
+                            || staticFloorScene || diffuseScene || convexFloorScene;
     if (!std::strcmp(sceneName, "particle") || fluidScene)
     {
         ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx, fluidScene,
                                                boundaryScene || meshFloorScene, meshFloorScene,
-                                               hfFloorScene, diffuseScene);
+                                               hfFloorScene, diffuseScene || convexFloorScene,
+                                               convexFloorScene);
         if (!psc.system || !psc.buffer)
         {
             std::printf("[ FAIL ] gpu-sdk-step: particle scene build failed\n");
@@ -4569,7 +4642,7 @@ int main()
             // The CONTROL (PXG_DIFFUSE_CONTROL=1) raises the threshold to 1e12 and
             // changes nothing else, so when the chain lands the pair separates
             // "spawning happened" from "spawning was never asked for".
-            if (diffuseScene)
+            if (diffuseScene || convexFloorScene)
             {
                 const bool control = std::getenv("PXG_DIFFUSE_CONTROL") != nullptr;
                 std::printf("  particle DIFFUSE: peak active diffuse particles = %u of %u, last "
@@ -4578,7 +4651,15 @@ int main()
                             maxDiffuseSeen, MAX_DIFFUSE, endDiffuseSeen,
                             control ? "1e12 (CONTROL)" : "reachable",
                             minDiffuseY == FLT_MAX ? 0.0f : minDiffuseY, y0, yEnd, nnEnd);
-                if (control)
+                if (convexFloorScene)
+                {
+                    // P9.14a: numbers only.  Both convex particle kernels are
+                    // unmapped, so nothing here can pass yet and asserting would
+                    // turn a work list into a red scene.  When they land, the
+                    // checks this scene must grow are the same three
+                    // particlediffuse carries -- carry-over, aging and the floor.
+                }
+                else if (control)
                 {
                     if (maxDiffuseSeen != 0u)
                     { std::printf("FAIL: the control spawned %u diffuse particles at an "
@@ -4637,6 +4718,21 @@ int main()
                 }
             }
             scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            // P9.14a: printed UNCONDITIONALLY, because the fluid checks above are
+            // supposed to fail here -- the column falls through a floor that is not
+            // being collided against, and that failure is the measurement.  Same
+            // shape as the fluid CONTROL: read the numbers, not the verdict.
+            if (convexFloorScene)
+                std::printf("  [ diag ] particleconvex over a cooked CONVEX floor: fluid mean y "
+                            "%.4f, nn %.4f, peak diffuse %u of %u, lowest diffuse y %.4f.  This "
+                            "says NOTHING about correctness -- ps_convexCollisionLaunch and "
+                            "ps_convexDiffuseCollisionLaunch are BOTH unmapped, so there is no "
+                            "floor to fall on.  The work list is the wrangler's startup 'Could "
+                            "not find registered CUDA function' lines plus the per-frame 'GPU "
+                            "ps_convex*CollisionLaunch fail to launch!!' errors, which this run "
+                            "emits 45 times each\n",
+                            yEnd, nnEnd, maxDiffuseSeen, MAX_DIFFUSE,
+                            minDiffuseY == FLT_MAX ? 0.0f : minDiffuseY);
             if (failures == 0 && diffuseScene)
             {
                 // The CONTROL passing means ONLY that nothing spawned when nothing

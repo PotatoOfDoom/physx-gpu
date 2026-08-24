@@ -1701,6 +1701,104 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.14a — `particleconvex`: die Szene, die die beiden letzten Partikel-Konvex-Kernel benennt (kein neuer Kernel)
+
+Kein Manifest-Zuwachs: **352** bleibt **352**. Diese Tranche baut die Szene, bevor
+der Kernel gebaut wird — die Doktrin, die diesen Port seit P8.55 trägt: *die
+Szene benennt die Arbeit.*
+
+### Die Frage, die zuerst gestellt wurde
+
+Nach P9.13h blieb `ps_convexDiffuseCollisionLaunch` als einzige `nullptr`-Zeile
+der Diffus-Kette. Der naheliegende Schritt wäre gewesen, ihn zu portieren. Zwei
+Messungen haben das verhindert:
+
+1. **Sein Flüssigkeits-Zwilling `ps_convexCollisionLaunch` ist ebenfalls
+   unabgebildet.** Beim Primitiven-Paar war der Zwilling seit P6.4a-2 abgebildet
+   und gefegt, und deshalb kostete der Diffus-Kernel in P9.13g **eine** Tranche.
+   Hier gibt es nichts zu erben: `prepareVertices`, die per-Warp-Vertex-Ablage
+   und der `GjkCachedData`-Warmstart sind alle neu.
+2. **Keine Szene erreichte einen der beiden.** Weder `particlefluid` noch
+   `particlemeshfloor` noch `particlediffuse` emittiert eine einzige
+   `fail to launch`-Meldung. Ein Port ohne Szene wäre nur fixture-verifiziert
+   gewesen — und hätte das sagen müssen.
+
+### Warum es die FORM ist, nicht die Silhouette
+
+Die Paar-Tabelle der Narrowphase
+(`PxgNphaseImplementationContext.cpp:1489`) leitet `eCONVEXMESH` ×
+`ePARTICLESYSTEM` über `caseConvexParticle` →
+`GPU_BUCKET_ID::eConvexParticle` → `testSDKConvexParticle`, und **nur** dort
+werden `ps_convexCollisionLaunch` (:3775) und
+`ps_convexDiffuseCollisionLaunch` (:3822) gestartet. Ein `PxBoxGeometry`-Boden
+ist `eBOX` und geht auf den Primitiven-Pfad, eine `PxPlaneGeometry` ebenso. Der
+neue Boden ist deshalb eine **gekochte konvexe Hülle** — eine flache Platte mit
+Halbmaßen (30, 0.5, 30), deren Oberseite exakt bei y = 0 liegt, also auf
+derselben Höhe wie der Dreiecksnetz- und der Heightfield-Boden. Die drei Szenen
+sind damit direkt vergleichbar.
+
+`cndCaseConvexParticle` verweigert eine Hülle, die nicht GPU-tauglich ist, und
+fällt mit einer Fehlermeldung auf den CPU-Eimer zurück — deshalb setzt der Bau
+`buildGPUData` und **prüft und druckt** das Ergebnis, statt es anzunehmen:
+`8 verts, 6 polygons, GPU-compatible: yes`.
+
+### Was die Szene misst — und was sie ausdrücklich nicht behauptet
+
+`particleconvex` ist `particlediffuse` mit getauschtem Boden, und sie trägt
+**auch** einen Diffuspuffer, weil `testSDKConvexParticle` beide Kernel aus
+demselben Einsprung startet. **Eine** Szene benennt also beide:
+
+```
+45 ps_convexCollisionLaunch fail to launch!!
+45 ps_convexDiffuseCollisionLaunch fail to launch!!
+```
+
+Und die Zahlen, die dabei herauskommen, sind der Referenzwert für die Tranche,
+die die Kernel landet:
+
+| | ohne die beiden Kernel |
+|---|---|
+| Flüssigkeit, mittleres y | **−39.3227** (statt 0.1667 auf Netz- und Heightfield-Boden) |
+| tiefstes Diffus-y | **−39.9191** |
+| Nachbarabstand | 0.3993 |
+
+Die Säule fällt durch den Boden, die Gischt mit ihr. Die Szene läuft deshalb in
+einer **zweiten Diagnoseliste** von `run_scenes.sh` — und die ist bewusst von
+der ersten getrennt:
+
+> Die Kontrollen der ersten Liste sind **Referenzen, die durchfallen sollen**.
+> `particleconvex` fällt durch, weil **die Arbeit nicht getan ist**. Das ist
+> nicht dasselbe, und eine gemeinsame Liste hätte es verwischt.
+
+Sie wandert in die gewertete Liste in der Tranche, die sie bestehen lässt — genau
+wie `particlediffuse` zwischen P9.13a und P9.13d.
+
+### Ein Grep, der sich selbst gezählt hat
+
+Der erste Lauf der neuen Liste meldete **46** statt 45 Fehlstarts: die
+Diagnosezeile der Szene zitiert die Wendung „fail to launch", und ein nackter
+Grep zählt sie mit. Verankert an der Engine-Zeile (`\] GPU .*fail to launch`).
+Klein, aber es ist genau die Art Zahl, die später als Messwert gelesen worden
+wäre.
+
+### Verifikation
+
+* gewertete Szenen unverändert **29 ok, 0 fail, 0 missing (of 29)**;
+* die sechs Kontrollen unverändert;
+* `particleconvex` läuft alle Schritte durch, faultet nicht und benennt beide
+  Kernel 45-mal je Lauf;
+* Suite unverändert **815/815** in beiden Speichermodi — diese Tranche fasst
+  keinen Shader an.
+
+### Was als Nächstes zu tun ist
+
+`ps_convexCollisionLaunch` zuerst, dann sein Diffus-Zwilling. Beide gehen über
+warp-kooperatives GJK/EPA gegen eine konvexe Hülle, Block **(32, 8, 1)** mit
+`warpIndex = threadIdx.y`, und je 176-Byte-Blob — beim Flüssigkeits-Kernel aus
+23 Einzelargumenten statt aus dem 72-Byte-Writer-Struct, aber **byte-identisch
+angeordnet**. `pxgSlangGjk` und `pxgSlangEpa` liegen bereits; neu sind
+`prepareVertices`, die Scratch-Ablage und der `GjkCachedData`-Warmstart.
+
 ## P9.13h — MEILENSTEIN: die Gischt bleibt auf dem Boden liegen. Die Diffus-Kette misst endlich die KOLLISION (kein neuer Kernel)
 
 Kein Manifest-Zuwachs: **352** bleibt **352**. Diese Tranche schreibt keinen
