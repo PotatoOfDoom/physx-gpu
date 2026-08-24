@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **813/813** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **814/814** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **29/29** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (28 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
@@ -1700,6 +1700,159 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.13f — `ps_diffuseParticleOneWayCollision` (Manifest **351**), und ein Sweep, der 28 Überlebende meldete, ohne einen einzigen Kernel gestartet zu haben
+
+Portiert `diffuseParticles.cu:111-163`, vollständig gelesen. Der **Verbraucher**
+der Diffus-Kontaktliste: pro Diffuspartikel läuft er dessen statische
+Kontaktliste ab und schiebt die **vorhergesagte** Position entlang jeder
+Kontaktnormalen aus der Form heraus. Neuer Shader
+`shaders/psDiffuseOneWay.slang`, Fixture `tests/testPsDiffuseOneWay.cpp`,
+Manifest **350 → 351**. **Keine neue ABI**: die Zeile
+`kPsDiffCount[] = {8,8,4}` ist bereits in der Tabelle und passt genau.
+
+### Warum diese Tranche allein nichts bewegt, und warum sie trotzdem zuerst kommt
+
+Die drei fehlenden Kernel der Kette sind **ein Verbraucher und zwei Erzeuger**:
+`ps_primitivesDiffuseCollisionLaunch` und `ps_convexDiffuseCollisionLaunch`
+füllen `mDiffuseOneWayContactInfos`, dieser hier liest es. Solange die Erzeuger
+fehlen, läuft er über eine Liste, die immer leer ist. Das steht so in der
+Modulkopfzeile, damit es niemand aus einer Szene erschließen muss, die sich
+nicht bewegt.
+
+Er kommt trotzdem zuerst, weil er der kleine, abgeschlossene Teil ist: 30 Zeilen
+CUDA gegen die beiden Erzeuger, die über die Arbeits-Kompaktierung mit
+`shWorkIndices`, `PxgCellData::update` und den Formen-Dispatch gehen. Die
+Beobachtung, die nur eine Kollision erfüllen kann, gehört zur Tranche, die die
+Kette schließt — nicht zu dieser.
+
+### Zehn Fallen
+
+Die Modulkopfzeile führt sie als O1–O10. Die, die nicht offensichtlich sind:
+
+* **O1 — eine dritte Gitterform in derselben Kette.** Das System kommt hier aus
+  `blockIdx.`**`y`**, Block 256 (`PS_SOLVE`). P9.13e's beiden Kernel nehmen es
+  aus `.y` bzw. `.z`. Keine davon darf vom Nachbarn abgeschrieben werden.
+* **O2 — das dritte Argument ist TOT.** `count` ist ein hostseitiges
+  `static PxU32 count; count++;` (PxgPBDParticleSystemCore.cpp:1184), das jeden
+  Frame übergeben und vom Kernel **nie gelesen** wird. Es ist nicht die
+  Partikelzahl. Seine vier Bytes bleiben trotzdem im Push-Constant-Block, also
+  trägt die ABI-Zeile es.
+* **O4 — die Kontaktliste ist SPALTENWEISE**, Schrittweite `numParticles`:
+  Kontakt `c` von Partikel `pi` liegt bei `pi + c * numParticles`, nicht bei
+  `pi * maxContacts + c`. **Beide** Formen zeigen auf ein gültiges Element der
+  Allokation — die falsche liest einen echten Kontakt eines anderen Partikels.
+* **O5 — die Klemme auf 12 ist TRAGEND, nicht defensiv.** Der `atomicAdd` des
+  Erzeugers läuft bei jedem Schnitt, gedeckelt ist nur der *Schreibvorgang*. Der
+  gespeicherte Zähler übersteigt also regelmäßig 12, während die Plätze ab 12
+  nie beschrieben wurden. Ohne Klemme liest der Kernel uninitialisierten
+  Speicher. Dieselbe Asymmetrie wie P9.13d's C6.
+* **O6 — zwei Minus.** `deltaP = -normal * pen`, und `pen` ist
+  `distance - restDistance`, also **negativ**, solange das Partikel drinsteckt.
+  Erst beide zusammen schieben nach **+normal**, also heraus. Fällt eines weg,
+  schiebt die Korrektur tiefer hinein — und sieht immer noch wie eine Korrektur
+  aus.
+* **O9 — das Ziel ist `mDiffuseSortedPos_LifeTime`**, das sortierte
+  **vorhergesagte** Feld, nicht `mDiffuseSortedOriginPos_LifeTime` — das Feld,
+  das P9.13e's UpdatePBF mit Geschwindigkeitsmittelwerten überlädt. Beide
+  `float4`, beide sortiert, im Deskriptor **acht Byte** auseinander.
+* **O10 — die Lebensdauer geht durch.** Die CUDA liest `newPos[pi].w` im
+  Speicherausdruck ein **zweites Mal**; da nichts dazwischen schreibt und ein
+  Thread `pi` besitzt, ist der eine Ladevorgang hier äquivalent — festgehalten,
+  nicht stillschweigend zusammengefasst.
+
+Bewusste Abweichung: die CUDA kopiert das ganze `PxgParticleSystem` per
+`blockCopy` in den Shared Memory und synchronisiert. Das ist ein
+CUDA-Zwischenspeicher ohne beobachtbare Wirkung — jedes Feld wird hier direkt
+über BDA gelesen —, also entfallen Kopie und Barriere. Die Barriere steht in der
+CUDA **vor** dem `pi >= numParticles`-Return, ihr Wegfall kann also nicht
+ändern, welche Threads was erreichen.
+
+### DER SWEEP, DER NICHTS GEMESSEN HAT UND DAS NICHT GEMERKT HAT
+
+Der erste Sweep meldete: **28 Mutanten, 0 getötet, 27 ÜBERLEBT.** Darunter
+`g-no-bound`, der den Bereichswächter ganz streicht, und `o6-normal-not-negated`,
+der das Vorzeichen dreht. Dass beide überleben, ist unmöglich — und von Hand
+angewandt tötet jeder von beiden das Fixture sofort.
+
+> **Die Ursache: der Sweep hat den Test nie ausgeführt.**
+> `run_mutation_sweep.sh` ruft `./gpuslang-tests <suite>` mit dem **nackten**
+> `PXG_TEST`-Namen auf; übergeben worden war der **ctest**-Name mit
+> `gpuslang.`-Präfix. Für einen Filter, der auf nichts passt, druckt das
+> Testbinary `0 test(s) ran, 0 failed` — und die Baseline-Prüfung des Skripts
+> bestand aus genau zwei Greps: `"0 failed"` und `"test(s) ran"`. **Beide
+> treffen.** Also grüne Baseline, und danach für jeden Mutanten dieselbe
+> Ausgabe, also 28-mal SURVIVED.
+
+Das ist ein Messgerät, das lügt, und zwar in die gefährliche Richtung: es
+behauptet Abdeckung, wo keine ist. Repariert im Werkzeug, nicht im Aufruf:
+
+* `ran_nothing()` erkennt `^0 test(s) ran`;
+* die Baseline **verweigert** den Lauf und nennt die Ursache samt Abhilfe;
+* ein Mutant, nach dem die Suite auf nichts mehr passt, wird **abgebrochen**,
+  nicht als Überlebender gezählt.
+
+Der Beweis, dass die Reparatur greift, ist der Fehlaufruf selbst: mit dem
+`gpuslang.`-Präfix bricht der Sweep jetzt mit der Diagnose ab, statt 28
+Überlebende zu melden.
+
+**Alle früheren Sweeps sind davon nicht betroffen** — ein Sweep mit falschem
+Namen hätte keinen einzigen Kill gemeldet, und jeder protokollierte Sweep dieses
+Zweiges hat Kills.
+
+### Der richtige Sweep: 28 Mutanten, 27 tot, 1 bewiesen äquivalent
+
+26 regulär getötet, 1 durch Fault getötet (`o1-system-index-direct`, der die
+`activeParticleSystems`-Indirektion streicht und damit einen Deskriptorplatz
+außerhalb liest). Ein ANCHOR-FAIL (`o4-stride-is-cap`, Anker zweimal vorhanden —
+einmal im Kommentar) wurde nach der Hygieneregel als **ungetestet** verbucht,
+neu verankert und nachgezogen: **getötet**.
+
+Der eine Überlebende, **`o8-store-when-empty`**, streicht den
+`contactCount == 0`-Return. Er ist für **alle** Eingaben äquivalent:
+
+> Ohne Kontakte ist `posCorr` unverändert `p0.xyz` — keine Arithmetik fasst es
+> an —, der Speichervorgang schreibt also exakt die Bits zurück, die der
+> Ladevorgang geliefert hat, in einen Platz, den ein Thread allein besitzt, in
+> einem Dispatch, in dem ihn sonst niemand liest.
+
+Ein Poison-Vergleich sieht ihn auch nicht: die vergiftete Reserve liegt hinter
+`numParticles`, und die schützt der `pi >= numParticles`-Return, nicht der
+Kontaktzähler. **Das erzwang eine Korrektur am Shader-Kommentar**, der behauptet
+hatte, ein Fixture mit Poison könne den Unterschied sehen. Es kann nicht; die
+Zeile sagt jetzt, warum, statt eine falsche Zusicherung stehen zu lassen.
+
+### Das Fixture, und sein eigener erster Fehlschlag
+
+Geprüft wird nicht nur die Position: die Ursprungspositionen, die
+Kontaktdatensätze, die Kontaktzähler, die Impuls- und Knotenfelder und das
+Zwei-Platz-Zählerpaar müssen **unverändert** zurückkommen, und hinter jedem
+lebenden Zähler liegen **137 vergiftete Plätze** (die P9.13d/e-Lehre). Sechzehn
+Kontaktebenen sind belegt, wo zwölf legal sind — die oberen vier tragen
+1e6-Fallen, damit ein Port ohne Klemme nicht Nullen liest und still zustimmt.
+
+Und ein **konstruierter Ordnungsunterschied**, weil Float-Daten den nie zufällig
+treffen: ein Partikel bekommt drei Korrekturen, deren Faltung von links nach
+rechts anders rundet als in jeder anderen Reihenfolge. Der erste Versuch war
+`+1e8, +1, -1e8` — und der ist **symmetrisch unter Umkehrung**: beide Richtungen
+ergeben 80, das Fixture verlangte den Unterschied und fiel durch. Richtig ist
+`+1e8, -1e8, +1`: vorwärts 81, rückwärts 80, weil die `+1` rückwärts zuerst
+addiert und von der 1e8-Stufe (ULP 8) weggerundet wird. Das Fixture **verlangt**
+diesen Unterschied, bevor es einen Lauf annimmt — sonst wäre der
+Umkehr-Mutant äquivalent statt tot.
+
+Abdeckung, gemessen statt entworfen: 99 Partikel ohne Kontakte, 99 mit **genau**
+12, 167 darüber; 1667 trennende und 3329 durchdringende Kontakte angewandt.
+
+### Verifikation
+
+* `ctest -R gpuslang.psDiffuseOneWay` grün, forced-fresh;
+* volle Suite **814/814** in **beiden** Speichermodi;
+* Manifest **350 → 351**, `build-sdk` neu gebaut, Szenen: **29 ok, 0 fail, 0 missing (of 29)**;
+* `particlediffuse` unverändert grün — und das ist die richtige Erwartung: seine
+  beiden Prüfungen messen Übertrag und Alterung, nicht Kollision. Die
+  Erfolgsmeldung nennt weiterhin die zwei unabgebildeten Erzeuger, und die
+  Engine meldet sie weiterhin jeden Frame als `fail to launch`.
 
 ## P9.13e — `ps_diffuseParticleUpdatePBF` + `ps_diffuseParticleCompact` (Manifest **350**): der überladene Puffer, ein Fix, der drei Kills gekostet hat, und die erste Szenenprüfung, die die BEWEGUNG misst
 

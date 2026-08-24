@@ -91,11 +91,24 @@ run_suite() {
         timeout -k 10 "$MUTATION_SWEEP_TIMEOUT" ./gpuslang-tests "$SUITE" 2>&1 )
 }
 
+# A run that executed NOTHING.  The binary prints "0 test(s) ran, 0 failed" for a
+# suite filter that matches no test -- which satisfies both a "0 failed" grep and a
+# "test(s) ran" grep.  P9.13f hit exactly that: the suite was passed as
+# "gpuslang.<name>" (the CTEST name) where the binary wants the bare PXG_TEST name,
+# and the sweep reported a green baseline and 28 SURVIVED without ever running the
+# shader.  A sweep that measures nothing must fail loudly, not report survivors.
+ran_nothing() { echo "$1" | grep -q "^0 test(s) ran"; }
+
 baseline_ok() {
     out=$(run_suite); brc=$?
     if [ $brc -eq $TIMEOUT_RC ]; then
         echo "!! the CLEAN suite exceeded MUTATION_SWEEP_TIMEOUT=${MUTATION_SWEEP_TIMEOUT}s;" >&2
         echo "   raise it or every mutant will be reported as a hang" >&2
+        return 1
+    fi
+    if ran_nothing "$out"; then
+        echo "!! the suite filter '$SUITE' matched NO test -- the binary takes the bare" >&2
+        echo "   PXG_TEST name, not the ctest name (no 'gpuslang.' prefix)." >&2
         return 1
     fi
     echo "$out" | grep -q "0 failed" && echo "$out" | grep -q "test(s) ran"
@@ -139,6 +152,11 @@ PY
         echo "KILLED-HANG   $name   (exceeded ${MUTATION_SWEEP_TIMEOUT}s)"; hung=$((hung+1))
     elif [ $rc -ge 128 ] || ! echo "$out" | grep -q "test(s) ran"; then
         echo "KILLED-FAULT  $name   (crashed: rc=$rc)"; faulted=$((faulted+1))
+    elif ran_nothing "$out"; then
+        # Not a survivor: the suite stopped matching, so nothing was measured.
+        echo "!! '$name' left the suite matching NO test -- aborting rather than" >&2
+        echo "   counting an unmeasured mutant as a survivor" >&2
+        restore; rm -f "$BAK"; exit 1
     elif echo "$out" | grep -q "0 failed"; then
         echo "SURVIVED      $name"; survived=$((survived+1))
     else

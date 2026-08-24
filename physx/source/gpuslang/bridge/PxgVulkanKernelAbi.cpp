@@ -1646,6 +1646,7 @@ static const PxgKernelAbiRow kRows[] = {
     // transcribed into the row because the host passes it and the blob layout has
     // to match, not because the kernel wants it.
     { "ps_updateUnsortedDiffuseArrayLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
+    { "ps_diffuseParticleOneWayCollision", kPsDiffCount, uint32_t(sizeof(kPsDiffCount)) },
     { "ps_diffuseParticleCopy", kPsDiffCount, uint32_t(sizeof(kPsDiffCount)) },
     { "ps_diffuseParticleSum", kPsDiffCount, uint32_t(sizeof(kPsDiffCount)) },
     { "ps_diffuseParticleCreate", kPsDiffCreate, uint32_t(sizeof(kPsDiffCreate)) },
