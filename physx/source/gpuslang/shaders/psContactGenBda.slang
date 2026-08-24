@@ -124,6 +124,7 @@ static const uint PS_FLAG_ENABLE_CCD = 8u;
 // gridCal.cuh forward-projection step scales.
 static const float FWD_PGS = 1.0f;
 static const float FWD_TGS = 0.5f;
+static const float FWD_DIFFUSE = 1.0f;   // PARTICLE_FORWARD_PROJECTION_STEP_SCALE_DIFFUSE
 
 // ---------------------------------------------------------------------------
 // Local element-struct mirrors (byte-exact vs the engine C++ layouts; pinned by
@@ -280,10 +281,25 @@ uint calcGridHashInBounds(float3 bmn, float3 bmx, float cw, uint cellOffset, uin
     return calcGridHash(gp, gridSize);
 }
 
+// isDiffuse is NOT a synonym for "PGS".  getParticleSpeculativeContactVolume
+// (gridCal.cuh:122) branches on it FIRST and only then on isTGS, and
+// PARTICLE_FORWARD_PROJECTION_STEP_SCALE_DIFFUSE is 1.0 -- so a diffuse particle
+// keeps scaleInv 1.0 even in a TGS step, where a fluid particle gets 2.0.  The
+// fluid kernel below has always passed false and could not see this; the diffuse
+// kernel is what makes the parameter load-bearing.
+//
+// One mutant survives here and its proof is worth keeping, because it depends on
+// two engine constants rather than on this code: passing `isDiffuse = isTGS` is
+// EQUIVALENT.  With isTGS true it takes the diffuse branch (1/FWD_DIFFUSE); with
+// isTGS false it takes the PGS branch (1/FWD_PGS) -- and FWD_DIFFUSE and FWD_PGS
+// are BOTH 1.0 in gridCal.cuh, so both give 1.0, which is what a diffuse caller
+// must get either way.  The spelling is still wrong and the sweep says so: if
+// NVIDIA ever gives the diffuse scale its own value, that mutant starts dying.
 float getSpecVolume(out float3 cVolumePos, float3 currentPos, float3 predictedPos,
-                    float contactDist, bool isTGS)
+                    float contactDist, bool isDiffuse, bool isTGS)
 {
-    const float scaleInv = isTGS ? (1.0f / FWD_TGS) : (1.0f / FWD_PGS);
+    const float scaleInv = isDiffuse ? (1.0f / FWD_DIFFUSE)
+                                     : (isTGS ? (1.0f / FWD_TGS) : (1.0f / FWD_PGS));
     const float3 cVolumeOffset = (predictedPos - currentPos) * scaleInv * 0.5f;
     cVolumePos = currentPos + cVolumeOffset;
     return length(cVolumeOffset) + contactDist;
@@ -676,7 +692,7 @@ void ps_primitivesCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
                     if (enableCCD)
                     {
                         const float3 predictedPos = Ptr<float4>(predPosAddr)[particleIndex].xyz;
-                        cVolumeRadius = getSpecVolume(cVolumePos, currentPos, predictedPos, cDistance, isTGS);
+                        cVolumeRadius = getSpecVolume(cVolumePos, currentPos, predictedPos, cDistance, false, isTGS);
                     }
                     else
                     {
@@ -717,6 +733,219 @@ void ps_primitivesCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
                 writeContact(contactStartIndex + contactIndex,
                              float4(normal, distance - restDistance), compressed, rigidId);
             GroupMemoryBarrierWithGroupSync();
+        }
+    }
+}
+
+// ===========================================================================
+// P9.13g -- ps_primitivesDiffuseCollisionLaunch
+// gpunarrowphase/src/CUDA/cudaParticleSystem.cu:1324 (wrapper) and :505-635
+// (psDiffusePrimitivesCollision), both read in full.
+//
+// The DIFFUSE twin of the kernel above.  It shares this translation unit
+// deliberately: the work-index binary search, calcGridHashInBounds,
+// getSpecVolume and the whole particlePrimitiveCollision family are the SAME
+// code, already swept, and duplicating them into a second module is exactly the
+// duplication this port exists to avoid.  What differs is listed below, and the
+// list is short.
+//
+// ---------------------------------------------------------------------------
+// D1 -- the GRID is the diffuse one.  mDiffuseCellStart / mDiffuseCellEnd, not
+//     mCellStart / mCellEnd.  The HASH is not: gridHash still comes from the
+//     system's common cell width and grid size, so the two grids share an index
+//     space and only their bucket arrays differ.  A port that also swaps the
+//     hash source finds nothing at all.
+//
+// D2 -- the positions are the diffuse SORTED pair:
+//     mDiffuseSortedOriginPos_LifeTime is `current` and
+//     mDiffuseSortedPos_LifeTime is `predicted`.  Note P9.13e overloads the
+//     FORMER with velocity averages between UpdatePBF and Compact -- but this
+//     kernel runs in narrowphase, before either, so it sees real origins.
+//
+// D3 -- isDiffuse = TRUE in the speculative contact volume, which is NOT the
+//     same as isTGS = false: see getSpecVolume above.
+//
+// D4 -- there is NO FILTER.  The fluid kernel calls findPs to honour
+//     particle-rigid filter pairs and rigid attachments; the diffuse path has
+//     neither and calls particlePrimitiveCollision unconditionally.
+//
+// D5 -- the whole kernel early-outs on mCommonData.mMaxDiffuseParticles == 0,
+//     BEFORE it reads the cell arrays.  For a particle system with no diffuse
+//     side those pointers are null.
+//
+// D6 -- the OUTPUT is per-particle, not a global contact list.  There is no
+//     warp aggregation and no numTotalContacts: each intersection does its own
+//     atomicAdd on counts[particleIndex] and, if the returned slot is below
+//     MaxStaticContactsPerParticle, writes the normal/penetration, a ZEROED
+//     impulse and the rigid node index at particleIndex + slot * numParticles.
+//     P9.13f's consumer reads exactly that layout.
+//
+// D7 -- the atomicAdd runs on EVERY intersection and only the write is capped,
+//     so the stored count overshoots and the consumer's clamp is what keeps the
+//     read inside what was written.  The two halves of that contract are in two
+//     different kernels and neither is complete alone.
+//
+// D8 -- numParticles is `*mNumDiffuseParticles`, slot [0] of the two-slot pair.
+//
+// DEVIATION, deliberate and observable-equivalent: the CUDA wrapper runs a
+// block-wide WORK QUEUE -- ballot the work items whose cell is non-empty,
+// warpScanExclusive them into a 256-entry __shared__ array, and flush the body
+// only once a full block has accumulated, carrying an overflow index across
+// iterations.  That is a scheduling device: every work item with a non-empty
+// cell reaches psDiffusePrimitivesCollision exactly once, items with an empty
+// cell reach it never (and the body would do nothing for them anyway), and the
+// body has no cross-lane traffic at all.  So this port runs one thread per work
+// item over the same grid-stride and calls the body directly.  What that costs
+// is occupancy on divergent blocks, not correctness -- and the atomic ORDER was
+// never determined in the first place (the P9.11 rule: the SET of contacts is
+// asserted, never which slot each landed in).
+// ===========================================================================
+
+// PxgParticleContactInfo::MaxStaticContactsPerParticle (PxgParticleSystem.h:133)
+static const uint PS_MAX_STATIC_CONTACTS = 12u;
+
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void ps_primitivesDiffuseCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    const uint tid = gtid.x;
+    const bool isTGS = (gP.isTGSWord & 0xffu) != 0u;
+
+    const uint totalComparison = Ptr<uint>(gP.totalNumPairs)[0];
+
+    Ptr<PxgContactManagerInput> cmInputs = Ptr<PxgContactManagerInput>(gP.cmInputs);
+    Ptr<PxgShape> shapes = Ptr<PxgShape>(gP.shapes);
+    Ptr<PxsCachedTransform> transformCache = Ptr<PxsCachedTransform>(gP.transformCache);
+    Ptr<float> boundsArr = Ptr<float>(gP.bounds);
+    Ptr<float> contactDistance = Ptr<float>(gP.contactDistance);
+    Ptr<float> restDistances = Ptr<float>(gP.restDistances);
+    Ptr<uint> startIndices = Ptr<uint>(gP.startIndices);
+    Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gP.particleSystems);
+    Ptr<uint2> shapeToRigidRemap = Ptr<uint2>(gP.shapeToRigidRemap);
+
+    const uint stride = PS_BLOCK * PS_GRID;
+    const uint nbIterations = (totalComparison + stride - 1u) / stride;
+
+    for (uint it = 0u; it < nbIterations; ++it)
+    {
+        const uint workIndex = it * stride + gid.x * PS_BLOCK + tid;
+        if (workIndex >= totalComparison)
+            continue;
+
+        // ---- PxgCellData::update, identical to the fluid kernel's ----
+        const uint pos = binarySearchRunSum(startIndices, gP.numTests, workIndex);
+        const uint startPairIndex = startIndices[pos];
+
+        const PxgContactManagerInput cin = cmInputs[pos];
+        uint particleShapeRef = cin.shapeRef0;
+        uint particleCacheRef = cin.transformCacheRef0;
+        uint rigidShapeRef = cin.shapeRef1;
+        uint rigidCacheRef = cin.transformCacheRef1;
+        if (shapes[cin.shapeRef0].type != GEOM_PARTICLESYSTEM)
+        {
+            particleShapeRef = cin.shapeRef1;
+            particleCacheRef = cin.transformCacheRef1;
+            rigidShapeRef = cin.shapeRef0;
+            rigidCacheRef = cin.transformCacheRef0;
+        }
+
+        const PxgShape rigidShape = shapes[rigidShapeRef];
+        const uint rigidType = rigidShape.type;
+        const float3 rigidScale = float3(rigidShape.scaleX, rigidShape.scaleY, rigidShape.scaleZ);
+        const PxsCachedTransform tc = transformCache[rigidCacheRef];
+        const float4 rigidQ = float4(tc.qx, tc.qy, tc.qz, tc.qw);
+        const float3 rigidP = float3(tc.px, tc.py, tc.pz);
+        const uint2 rigidId = shapeToRigidRemap[rigidCacheRef];
+
+        const uint psId = shapes[particleShapeRef].particleOrSoftbodyId;
+
+        const float cDistance = contactDistance[particleCacheRef] + contactDistance[rigidCacheRef];
+        const float restDistance = restDistances[pos];
+
+        const uint pb = particleCacheRef * 6u;
+        const uint rb = rigidCacheRef * 6u;
+        float3 omn = max(float3(boundsArr[pb + 0u], boundsArr[pb + 1u], boundsArr[pb + 2u]),
+                         float3(boundsArr[rb + 0u], boundsArr[rb + 1u], boundsArr[rb + 2u]));
+        float3 omx = min(float3(boundsArr[pb + 3u], boundsArr[pb + 4u], boundsArr[pb + 5u]),
+                         float3(boundsArr[rb + 3u], boundsArr[rb + 4u], boundsArr[rb + 5u]));
+        omn -= float3(cDistance, cDistance, cDistance);
+        omx += float3(cDistance, cDistance, cDistance);
+
+        // D1: the HASH still comes from the system's common grid.
+        const float cellWidth = systems[psId].mCommonData_GridCellWidth;
+        const uint3 gridSize = uint3(systems[psId].mCommonData_GridSizeX,
+                                     systems[psId].mCommonData_GridSizeY,
+                                     systems[psId].mCommonData_GridSizeZ);
+        const uint cellOffset = workIndex - startPairIndex;
+        const uint gridHash = calcGridHashInBounds(omn, omx, cellWidth, cellOffset, gridSize);
+
+        // D5: before any cell-array read.
+        if (systems[psId].mCommonData_MaxDiffuseParticles == 0u)
+            continue;
+
+        // D1: the DIFFUSE bucket arrays.
+        const uint startIndex = Ptr<uint>(systems[psId].mDiffuseCellStart)[gridHash];
+        if (startIndex == EMPTY_CELL)
+            continue;
+        const uint endIndex = Ptr<uint>(systems[psId].mDiffuseCellEnd)[gridHash];
+        const uint range = endIndex - startIndex;
+        if (range == 0u)
+            continue;
+
+        const bool enableCCD = (systems[psId].mData_Flags & PS_FLAG_ENABLE_CCD) > 0u;
+        // D2: origin = current, sorted-pos = predicted.
+        Ptr<float4> curPos = Ptr<float4>(systems[psId].mDiffuseSortedOriginPos_LifeTime);
+        Ptr<float4> predPos = Ptr<float4>(systems[psId].mDiffuseSortedPos_LifeTime);
+
+        // D6/D8: the per-particle output arrays and the published count.
+        Ptr<float4> infos = Ptr<float4>(systems[psId].mDiffuseOneWayContactInfos);
+        Ptr<float> impulses = Ptr<float>(systems[psId].mDiffuseOneWayForces);
+        Ptr<uint2> nodeIndices = Ptr<uint2>(systems[psId].mDiffuseOneWayNodeIndex);
+        Ptr<uint> counts = Ptr<uint>(systems[psId].mDiffuseOneWayContactCount);
+        const uint numParticles = uint(Ptr<int>(systems[psId].mNumDiffuseParticles)[0]);
+
+        for (uint ind = 0u; ind < range; ++ind)
+        {
+            const uint particleIndex = startIndex + ind;
+            if (particleIndex >= endIndex)
+                continue;
+
+            const float3 currentPos = curPos[particleIndex].xyz;
+
+            float3 cVolumePos;
+            float cVolumeRadius;
+            if (enableCCD)
+            {
+                const float3 predictedPos = predPos[particleIndex].xyz;
+                // D3: isDiffuse = true.
+                cVolumeRadius = getSpecVolume(cVolumePos, currentPos, predictedPos,
+                                              cDistance, true, isTGS);
+            }
+            else
+            {
+                cVolumeRadius = cDistance;
+                cVolumePos = currentPos;
+            }
+
+            float3 normal = float3(0, 0, 0);
+            float distance = 0.0f;
+            // D4: no filter lookup on this path.
+            const bool intersect = particlePrimitiveCollision(currentPos, cVolumePos, cVolumeRadius,
+                                                             rigidQ, rigidP, rigidType, rigidScale,
+                                                             enableCCD, normal, distance);
+            if (!intersect)
+                continue;
+
+            // D7: the counter always advances; only the write is capped.
+            uint slot = 0u;
+            InterlockedAdd(counts[particleIndex], 1u, slot);
+            if (slot < PS_MAX_STATIC_CONTACTS)
+            {
+                const uint outputIndex = particleIndex + slot * numParticles;
+                infos[outputIndex] = float4(normal, distance - restDistance);
+                impulses[outputIndex] = 0.0f;
+                nodeIndices[outputIndex] = rigidId;
+            }
         }
     }
 }

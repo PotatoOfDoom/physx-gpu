@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **814/814** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **815/815** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **29/29** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (28 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
@@ -1700,6 +1700,148 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.13g — `ps_primitivesDiffuseCollisionLaunch` (Manifest **352**): der Erzeuger, ein Fixture, das CCD nicht sehen konnte, und ein Mutant, den erst dreißig Ebenen töten
+
+Portiert `cudaParticleSystem.cu:1324` (Wrapper) und `:505-635`
+(`psDiffusePrimitivesCollision`), beide vollständig gelesen. Der **Erzeuger** der
+Diffus-Kontaktliste, die P9.13f verbraucht. Manifest **351 → 352**.
+
+### Kein neuer Shader: ein zweiter Einsprungpunkt in derselben Übersetzungseinheit
+
+`ps_primitivesCollisionLaunch` — der Flüssigkeits-Zwilling — liegt seit P6.4a-2 in
+`psContactGenBda.slang`, mit der Arbeitsindex-Binärsuche,
+`calcGridHashInBounds`, `getSpecVolume` und der ganzen
+`particlePrimitiveCollision`-Familie. Das ist **dieselbe** Rechnung, längst
+gefegt. Der Diffus-Kernel kommt deshalb als **zweiter Einsprungpunkt in dieselbe
+Datei** statt als zweites Modul mit einer zweiten Abschrift — die Duplikation,
+gegen die dieser Port existiert. Neue ABI-Zeile
+`kPsPrimDiffuseCollide[] = {1,4,4,8×11}` = **104 Byte**: genau der Kopf von
+`kPsPrimCollide` ohne den 72-Byte-Writer, denn der Diffus-Pfad schreibt
+per-Partikel-Felder im Partikelsystem, nicht in eine globale Kontaktliste.
+
+### Acht Unterschiede, D1–D8
+
+* **D1 — das GITTER ist das diffuse, der HASH nicht.** `mDiffuseCellStart`/
+  `mDiffuseCellEnd` statt `mCellStart`/`mCellEnd`; der `gridHash` kommt
+  unverändert aus Zellbreite und Gittergröße des Systems. Beide Gitter teilen
+  sich also den Indexraum und unterscheiden sich nur in den Eimerfeldern. Wer
+  auch die Hash-Quelle tauscht, findet gar nichts.
+* **D2** — `mDiffuseSortedOriginPos_LifeTime` ist *current*,
+  `mDiffuseSortedPos_LifeTime` ist *predicted*. (P9.13e überlädt das erste
+  zwischen UpdatePBF und Compact — dieser Kernel läuft in der Narrowphase, vor
+  beiden, und sieht echte Ursprünge.)
+* **D3 — `isDiffuse = true`, und das ist NICHT dasselbe wie `isTGS = false`.**
+  `getParticleSpeculativeContactVolume` verzweigt **zuerst** auf `isDiffuse`, und
+  `PARTICLE_FORWARD_PROJECTION_STEP_SCALE_DIFFUSE` ist 1.0 — ein Diffuspartikel
+  wird im TGS-Schritt also **nicht** halbiert, ein Flüssigkeitspartikel schon.
+* **D4 — es gibt KEINEN Filter.** Der Flüssigkeits-Kernel ruft `findPs` für
+  Partikel-Rigid-Filterpaare und Rigid-Attachments; der Diffus-Pfad hat weder
+  das eine noch das andere.
+* **D5** — der ganze Kernel steigt bei `mMaxDiffuseParticles == 0` aus, **bevor**
+  er die Zellfelder liest.
+* **D6/D7/D8** — die Ausgabe ist per Partikel: `atomicAdd` auf
+  `counts[particleIndex]`, und nur der Schreibvorgang ist bei
+  `MaxStaticContactsPerParticle` gedeckelt. Genau die Asymmetrie, für die
+  P9.13f's Klemme existiert — **die beiden Hälften des Vertrags stehen in zwei
+  verschiedenen Kerneln, und keine ist allein vollständig.** `numParticles` ist
+  Platz **[0]** des Zweier-Paars.
+
+### Die Abweichung: die Arbeitswarteschlange fällt weg
+
+Der CUDA-Wrapper führt eine blockweite **Warteschlange**: Ballot über die
+Arbeitspakete mit nichtleerer Zelle, `warpScanExclusive` in ein 256-Einträge
+`__shared__`-Feld, Ausführung erst wenn ein voller Block beisammen ist, plus ein
+Überlaufindex über Iterationen hinweg. Das ist ein **Ablaufplan**, kein Verhalten:
+jedes Paket mit nichtleerer Zelle erreicht den Rumpf genau einmal, Pakete mit
+leerer Zelle nie (und der Rumpf täte für sie ohnehin nichts), und der Rumpf hat
+**keinen** einzigen Lane-übergreifenden Zugriff. Dieser Port fährt deshalb einen
+Thread pro Paket über denselben Grid-Stride. Das kostet Belegung auf divergenten
+Blöcken, nicht Korrektheit — und die Atomic-**Reihenfolge** war ohnehin nie
+festgelegt (P9.11-Regel: geprüft wird die MENGE der Kontakte, nie welcher Platz
+welchen bekam).
+
+### DAS FIXTURE KONNTE CCD NICHT SEHEN — fünf Mutanten mit einer Ursache
+
+Der erste Sweep ließ elf Mutanten am Leben. **Fünf davon hatten dieselbe
+Ursache**, und sie ist Geometrie, nicht Code:
+
+> Der Ebenentest ist `oy + off − h <= |off| + cDist`. Für **off > 0** kürzen sich
+> die beiden `off`-Terme **exakt** weg, und die Bedingung fällt auf
+> `oy − h <= cDist` zusammen — die Bedingung **ohne** CCD.
+
+Alle Partikel des Fixtures bewegten sich nach oben. Damit war das spekulative
+Kontaktvolumen **unbeobachtbar**, und `d2-positions-swapped`, `d2-pred-is-cur`,
+`d3-isdiffuse-false`, `d3-diffuse-scale-is-tgs` und `d3-ccd-ignored` überlebten
+alle fünf. Jedes dritte Partikel bewegt sich jetzt nach **unten**, wo die Terme
+sich addieren statt zu kürzen — und das Fixture **verlangt** beide Vorzeichen,
+bevor es einen Lauf annimmt.
+
+Zwei weitere Überlebende waren dieselbe Art Konstruktionsfehler:
+
+* **`d6-rest-from-workindex`** (`restDistances[pos]` → `[workIndex]`) war
+  äquivalent, weil die Zellen-Laufsumme die **Identität** war. Paar 0 überspannt
+  jetzt **zwei** Zellen, also ist `pos != workIndex` ab Paket 1.
+* **`g-workindex-guard-strict`** (`>=` → `>`) las bei `workIndex ==
+  totalNumPairs` über das Ende — undefiniert und zufällig harmlos. Die
+  Paar-Tabelle trägt jetzt eine **gültige, ausgeschlossene** Zeile hinter der
+  Arbeitsgrenze, die Kontakte erzeugen *würde*. Der Mutant wird damit von echten
+  Daten gefangen, nicht von einem Zufall.
+
+### DER MUTANT, DEN ERST DREISSIG EBENEN TÖTEN
+
+`d7-atomic-capped-too` ersetzt den bedingungslosen `atomicAdd` durch ein
+nicht-atomares Lesen plus geklemmtes Addieren — der Zähler bliebe dann bei zwölf
+stehen, statt zu überschießen, also genau das, was D7 verbietet. Er überlebte
+zunächst, und der Grund ist **die Plattform, nicht die Logik**:
+
+> Bei vierzehn beitragenden Arbeitspaketen und llvmpipes Subgruppe von **8** lesen
+> die Lanes 0 und dann 8 — beides unter zwölf. Also erhöhte trotzdem jede Lane,
+> der Zähler erreichte 14, und der Mutant war ununterscheidbar.
+
+Das wäre als „von der Plattform verdeckt" zu Protokoll zu nehmen gewesen. Es ist
+aber **behebbar**: bei **dreißig** Ebenen liest die dritte Subgruppe 16, die
+Klemme greift, und der Zähler bleibt bei 16 statt 30. Nur 19 gleichzeitig
+lesende Lanes könnten das noch verdecken, und eine Subgruppe von 8 kann das
+nicht. Das Fixture fährt seitdem dreißig Ebenen, und der Mutant stirbt.
+
+### Der Sweep: 28 Mutanten, 24 tot, 4 bewiesen äquivalent
+
+* **`d3-isdiffuse-is-istgs`** — `isDiffuse = isTGS` statt `true`. Äquivalent, und
+  der Beweis hängt an zwei **Engine-Konstanten**: mit `isTGS` wahr nimmt er den
+  Diffus-Zweig (1/FWD_DIFFUSE), mit `isTGS` falsch den PGS-Zweig (1/FWD_PGS) —
+  und beide Konstanten sind **1.0**. Die Schreibweise bleibt trotzdem falsch; gibt
+  NVIDIA der Diffus-Skala je einen eigenen Wert, fängt der Mutant an zu sterben.
+  Steht so im Shader.
+* **`g-range-loop-off-by-one`** und **`g-endindex-guard-dropped`** sind ein
+  **Paar**: `range = endIndex − startIndex`, also ist `startIndex + ind <
+  endIndex` für jedes `ind < range` ohnehin wahr. Die CUDA trägt Gürtel **und**
+  Hosenträger; genau einer von beiden ist zu jedem Zeitpunkt tötbar, und dass
+  beide überleben, beweist die Redundanz, statt ein Loch zu zeigen. (Bei
+  `endIndex < startIndex` unterliefe `range` — dagegen steht in der CUDA ein
+  `assert`.)
+* **`g-range-zero-not-skipped`** — mit `range == 0` läuft die `for`-Schleife
+  keinen Durchgang; das `continue` erspart nur die Adressberechnungen.
+
+Was das Fixture misst: **307 Kontakte über 14 Partikel, Tiefenband 9..31 gegen
+eine Kappe von 12; 8 Fallenpartikel, die allein `mMaxDiffuseParticles == 0`
+stumm hält.**
+
+### Verifikation
+
+* `ctest -R gpuslang.psDiffuseContactGen` grün, forced-fresh;
+* der Flüssigkeits-Zwilling bleibt grün — `getSpecVolume` hat einen Parameter
+  bekommen und seine beiden Tests haben den Umzug in dem Moment geprüft, in dem
+  er landete;
+* volle Suite **815/815** in **beiden** Speichermodi;
+* Manifest **351 → 352**, `build-sdk` neu gebaut, Szenen: **29 ok, 0 fail, 0 missing (of 29)**.
+
+### Was noch fehlt
+
+`ps_convexDiffuseCollisionLaunch` ist der letzte Kernel der Kette. Erst danach
+kann die Szene eine Beobachtung tragen, die **nur** eine Kollision erfüllt — und
+bis dahin bleibt `particlediffuse` auf Übertrag und Alterung geprüft, nicht auf
+Abprall.
 
 ## P9.13f — `ps_diffuseParticleOneWayCollision` (Manifest **351**), und ein Sweep, der 28 Überlebende meldete, ohne einen einzigen Kernel gestartet zu haben
 

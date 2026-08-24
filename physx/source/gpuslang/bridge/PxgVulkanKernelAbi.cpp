@@ -935,6 +935,14 @@ static const uint8_t kPsPrimBound2[] = { 4, 8, 8, 8 };
 //   -> {1,4,4,8x11,72} = 176-byte blob.
 static const uint8_t kPsPrimCollide[] = { 1, 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 72 };
 
+// gpunarrowphase cudaParticleSystem.cu:1324 (P9.13g) -- the DIFFUSE twin of the
+// row above.  Identical 14-argument head and NO writer: the diffuse path writes
+// per-particle one-way arrays reached through the particle system itself, not a
+// global contact list, so there is nothing to pass by value.
+//   -> {1,4,4,8x11} = 104-byte blob, i.e. exactly kPsPrimCollide's head.
+//   Launch site PxgNarrowphaseCore.cpp:3300, grid (1024,1,1) block (256,1,1).
+static const uint8_t kPsPrimDiffuseCollide[] = { 1, 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
+
 // gpunarrowphase particleSystemMeshMidphase.cu:775 (P9.10) — the particle-vs-
 // TRIANGLE-MESH midphase and contact generation:
 //   ps_meshCollisonLaunch(const bool isTGS, const PxReal tolerenceLength,
@@ -1673,6 +1681,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_primitivesBoundSecondPassLaunch", kPsPrimBound2, uint32_t(sizeof(kPsPrimBound2)) },
     // gpunarrowphase (P6.4a-2 PBD particle-vs-primitive contact generator)
     { "ps_primitivesCollisionLaunch", kPsPrimCollide, uint32_t(sizeof(kPsPrimCollide)) },
+    { "ps_primitivesDiffuseCollisionLaunch", kPsPrimDiffuseCollide, uint32_t(sizeof(kPsPrimDiffuseCollide)) },
     { "ps_meshCollisonLaunch", kPsMeshCollide, uint32_t(sizeof(kPsMeshCollide)) },
     // gpunarrowphase particleSystemHFMidPhaseCG.cu:262 (P9.11 particle-vs-heightfield)
     { "ps_heightfieldCollisonLaunch", kPsHfCollide, uint32_t(sizeof(kPsHfCollide)) },
