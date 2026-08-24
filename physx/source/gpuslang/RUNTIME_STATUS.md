@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **812/812** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **813/813** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **29/29** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (28 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
@@ -1700,6 +1700,178 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.13e — `ps_diffuseParticleUpdatePBF` + `ps_diffuseParticleCompact` (Manifest **350**): der überladene Puffer, ein Fix, der drei Kills gekostet hat, und die erste Szenenprüfung, die die BEWEGUNG misst
+
+Portiert `diffuseParticles.cu:164-274` und `:275-430`, beide vollständig gelesen.
+Die beiden Kernel, die die in P9.13d erzeugte Gischt **bewegen und altern**: der
+erste tastet das Geschwindigkeitsfeld der Flüssigkeit um jedes Diffuspartikel ab,
+der zweite klassifiziert danach, integriert, altert und verdichtet die
+Überlebenden zurück in den Benutzerpuffer. Neuer Shader
+`shaders/psDiffuseAdvect.slang` mit zwei Einsprungpunkten, Fixture
+`tests/testPsDiffuseAdvect.cpp`, Manifest **348 → 350**. **Keine neue ABI**: die
+Zeile `kPsPreDiffuseIntegrate[] = {8,8,12,4}` passt auf beide.
+
+Sie sind **eine** Tranche, weil der zweite genau das verbraucht, was der erste
+produziert — und weil der Puffer, durch den sie es reichen, nicht der ist, den
+sein Name nahelegt.
+
+### DER ÜBERLADENE PUFFER
+
+> UpdatePBF schreibt seinen Geschwindigkeitsmittelwert in
+> `mDiffuseSortedOriginPos_LifeTime` — das **SORTIERTE URSPRUNGSPOSITIONS**-Feld
+> — und die CUDA sagt das in einem Einzeiler-Kommentar. Compact liest dasselbe
+> Feld dann als `velAvgs`.
+
+Zwischen diesen beiden Kernen enthält das Feld also **keine** Ursprungspositionen,
+und sein `.w` trägt eine **Nachbarzahl**, keine Lebensdauer. Ein Port, der die
+Geschwindigkeit in `mDiffuseSortedVel` schreibt — die naheliegende Wahl, und ein
+Feld, das es wirklich gibt —, übersetzt sich, läuft, und lässt Compact die
+Ursprungspositionen des letzten Frames als Geschwindigkeiten lesen. Das ist kein
+Absturz, das ist plausible falsche Bewegung.
+
+### Zwei benachbarte Kernel, zwei verschiedene Gitterachsen
+
+`ps_diffuseParticleUpdatePBF` nimmt das System aus `blockIdx.`**`y`**, Grid
+`(ceil(maxDiffuse/256), nbActiveSystems, 1)`. `ps_diffuseParticleCompact`, zwanzig
+Zeilen darunter, nimmt es aus `blockIdx.`**`z`**, Grid
+`(x, maxDiffuseBuffersPerSystem, nbActiveSystems)`. Beide Formen sind aus
+`cudaParticleSystem.cu` abgelesen, nicht geraten.
+
+### Die restlichen Fallen
+
+Die Modulkopfzeile führt sie als V1–V9 und K1–K11. Die, die nicht offensichtlich
+sind:
+
+* **V4 — die Nachbarn sind FLÜSSIGKEITSPARTIKEL, keine Diffusen.** `cellStart`/
+  `cellEnd`, `mSortedPositions_InvMass` und `mSortedVelocities` sind das
+  Flüssigkeitsgitter. Das Diffusgitter wird hier gar nicht angefasst.
+* **V6/V7 — die Versätze sind `{0, -1, +1}` IN DIESER REIHENFOLGE**, und die
+  Schleife bricht bei `maxNeighbors = 16` per `goto` ab. Die Reihenfolge
+  entscheidet also, **welche** 16 Nachbarn genommen werden — mit `{-1, 0, +1}`
+  ist die abgedeckte Menge dieselbe und das Ergebnis trotzdem ein anderes.
+* **V5 — `end = (mFlags & eFULL_DIFFUSE_ADVECTION) ? 3 : 1`**, und mit `end == 1`
+  läuft nur `x = y = z = 0`, also `offset[0] == 0`: die **eigene Zelle**. Das
+  Flag ist `1<<2`, direkt neben `eENABLE_SPECULATIVE_CCD`s `1<<3` — der Nachbar,
+  den P9.10 schon einmal als Falle festgenagelt hat.
+* **K4 — drei Felder, drei Indexräume, in vier aufeinanderfolgenden Zeilen:**
+  `diffusePositions[sortedInd]` (sortiert), `diffusePositionsOld[index]`
+  (unsortiert, `index = pi + mStartIndex`), `velAvgs[sortedInd]` (sortiert). Ein
+  Index für alle drei übersetzt sich und erzeugt plausible Bewegung.
+* **K5 — die Geschwindigkeit wird REKONSTRUIERT**, `(pos - oldPos) / dt`, nicht
+  aus einem Geschwindigkeitsfeld gelesen.
+* **K7 — der Blasenterm ist `vel - (1 + buoyancy) * gravity * dt + …`.** Die
+  `1 +` und das **Minus** sind beide tragend: die Schwerkraft zeigt nach unten,
+  also ist das Abziehen genau das, was eine Blase steigen lässt.
+* **K9 — `newPos = pos + (newVel - vel) * dt` ist eine KORREKTUR** der schon
+  vorhergesagten Position, keine frische Integration ab `oldPos`.
+* **K11 — die Verdichtung ist warp-kooperativ**: Ballot über die Überlebenden,
+  Lane 0 addiert den Popcount atomar in den Staging-Platz, der Versatz wird per
+  Shuffle verteilt, jeder Überlebende schreibt bei
+  `offset + warpScanExclusive(ballot, lane)`. Innerhalb eines Warps ist die
+  Reihenfolge damit deterministisch, der Basisversatz zwischen Warps ein Rennen —
+  und wird nach der P9.11-Regel als Multimenge geprüft, nie Index für Index.
+
+### DER FIX, DER DREI ANDERE KILLS GEKOSTET HAT
+
+`>` und `>=` an der Kontaktdistanz unterscheiden sich nur an einem bitgenauen
+Gleichstand, und Float-Daten treffen den nie zufällig — also wird er gebaut: ein
+Diffus- und ein Flüssigkeitspartikel auf Koordinaten, die exakt `CONTACT_DIST`
+auseinanderliegen. Dafür musste `CONTACT_DIST` von 0.30 auf 0.125 schrumpfen.
+
+> **Und das kostete drei Kills.** Mit dem kleineren Radius lag **jeder** Nachbar
+> in Reichweite in der eigenen Zelle des Partikels. Damit gaben das 3×3×3-Sammeln
+> und das Eigenzellen-Sammeln dieselbe Antwort, und `v5-always-full`,
+> `v5-never-full` und `v5-flag-is-ccd-bit` wurden alle drei **äquivalent** — drei
+> Mutanten, die vorher gestorben waren, überlebten plötzlich.
+
+Repariert nicht durch Zurückdrehen, sondern durch Geometrie: die
+Flüssigkeitspartikel jeder Zelle wandern zur **+x-Fläche** ihrer Zelle, jedes
+dritte Diffuspartikel sitzt knapp innerhalb der **−x-Fläche** seiner. So gibt es
+wieder eine echte zellübergreifende Nachbarschaft — der Gleichstand bleibt, und
+die drei Mutanten sterben wieder.
+
+Ein zweiter Fixture-Fehler derselben Familie: der Gleichstand für System A wurde
+gar nicht abgedeckt (0 von 1), weil das Flüssigkeitspartikel nach
+`if (n == 0u) continue;` eingesetzt wurde und As Muster der Zelle 0 die
+Bevölkerung null gibt. `if (n == 0u && c != 0u) continue;` — die Abdeckung wird
+seitdem **verlangt**, nicht gehofft.
+
+### Der Sweep: 49 Mutanten, 47 tot, 2 bewiesen äquivalent
+
+43 regulär getötet, 4 durch Fault getötet, **2 überlebt** — beide für **alle**
+Eingaben äquivalent, nicht bloß für diese:
+
+* **`v-emptycell-not-skipped`** streicht den `EMPTY_CELL`-Wächter.
+  `EMPTY_CELL` ist `0xffffffff`, das Maximum von `uint32`, also kann
+  `for (uint q = startIndex; q < endIndex; ++q)` für **kein** `uint32 endIndex`
+  auch nur einen Durchlauf machen. Der Wächter ist durch den Wertebereich des
+  Typs redundant.
+* **`k10-life-no-clamp`** ersetzt `max(life - dt, 0)` durch `life - dt`. Die
+  beiden unterscheiden sich nur, wenn das Ergebnis negativ ist — und ein
+  negativer Wert fällt beim Überlebenstest `> 0` genauso durch wie eine
+  geklemmte Null. Für einen **Überlebenden** ist die Klemme die Identität.
+
+Was das Fixture misst statt es zu behaupten:
+`sysA(voll): 400 Diffuse → 200 Überlebende; Bänder 364/4/32; 14
+nachbarschaftsgedeckelt, 9 geklemmt, 10 mit Geschwindigkeit null` und
+`sysB(eigene Zelle): 260 Diffuse → 130 Überlebende; Bänder 240/0/20; 13
+nachbarschaftsgedeckelt, 7 geklemmt, 7 mit Geschwindigkeit null`.
+
+### DIE SZENE MISST JETZT DIE BEWEGUNG — und die alte Erfolgsmeldung war falsch geworden
+
+`particlediffuse` ist seit P9.13d gewertet, und seine Erfolgsmeldung sagte „die
+Kernel, die sie BEWEGEN und altern, sind noch nicht abgebildet". Nach dieser
+Tranche stimmt das nicht mehr, und der Zähler zeigt es: **191 → 4096**.
+
+Der Grund ist der Zwei-Platz-Protokoll aus P9.13c. `ps_diffuseParticleCopy` nullt
+den Staging-Platz **jeden Frame**. Ohne Compact ist der veröffentlichte Zähler
+deshalb genau *ein* Frame Erzeugung; mit Compact hängt er die **Überlebenden des
+vorherigen veröffentlichten Satzes** wieder an, und die Bevölkerung sammelt sich
+an, bis sie die Kapazität erreicht.
+
+Zwei neue Prüfungen, und beide sind so gebaut, dass eine Create-only-Kette sie
+**nicht** bestehen kann:
+
+* **Übertrag** — der Höchststand muss `MAX_DIFFUSE/2 = 2048` erreichen, das
+  Zehnfache der Create-only-Zahl. Gemessen 4096.
+* **Alterung** — der Endstand muss mindestens 5 % unter dem Höchststand liegen.
+  Ein gesättigter Puffer, dessen Partikel nie ablaufen, bleibt gesättigt: Compact
+  hängt dann jeden Frame wieder alle an. Gemessen 4096 → 3197, also 22 %,
+  über drei Läufe bit-identisch reproduzierbar.
+
+**Beide wurden falsifiziert, nicht behauptet** — je ein mutierter Shader, ohne
+C++-Neubau:
+
+| Mutation | Höchststand | Endstand | Verdikt |
+|---|---|---|---|
+| `survives = false` (Compact hängt nie an) | **191** | 5 | Übertrag-Prüfung schlägt fehl |
+| `survives = live` (nichts läuft je ab) | 4096 | **4096** | Alterungs-Prüfung schlägt fehl |
+| unverändert | 4096 | 3197 | grün |
+
+Die 191 sind bemerkenswert: das ist **exakt** die Zahl, die P9.13d gemessen hat,
+unabhängig reproduziert, indem genau ein Kernel entschärft wurde. Damit ist die
+Zuordnung „4096 kommt von Compact" nicht mehr Auslegung, sondern gemessen.
+
+### Was die Szene weiterhin NICHT sagt
+
+Die drei Kollisionskernel (`ps_diffuseParticleOneWayCollision`,
+`ps_primitivesDiffuseCollisionLaunch`, `ps_convexDiffuseCollisionLaunch`) sind
+unverändert unabgebildet, und die Szene emittiert weiter jeden Frame ihr
+`GPU particlePrimitivesDiffuseCollisionLaunch fail to launch!!`. Ein
+Diffuspartikel altert und bewegt sich jetzt — es kollidiert mit nichts. „Von
+Anfang bis Ende" bleibt eine Behauptung, die diese Szene nicht trägt, und die
+Erfolgsmeldung sagt das ausdrücklich. Die nächste Tranche braucht deshalb wieder
+eine eigene Beobachtung: eine, die **nur** eine Kollision erfüllen kann.
+
+### Verifikation
+
+* `ctest -R gpuslang.psDiffuseAdvect` grün, forced-fresh;
+* volle Suite **813/813** in **beiden** Speichermodi;
+* Manifest **348 → 350**, `build-sdk` neu gebaut, Szenen:
+  **29 ok, 0 fail, 0 missing (of 29)**;
+* `particlediffuse` und seine Kontrolle (`PXG_DIFFUSE_CONTROL=1`) beide grün, und
+  die zwei neuen Prüfungen einzeln gegen mutierte Shader falsifiziert.
 
 ## P9.13d — MEILENSTEIN: die erste Gischt. `ps_diffuseParticleCreate` (Manifest **348**), und zweimal dasselbe Fixture-Loch
 

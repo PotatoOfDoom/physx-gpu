@@ -4283,6 +4283,13 @@ int main()
         // settles, so a count read only at the end would be zero even on a working
         // chain.
         PxU32 maxDiffuseSeen = 0;
+        // P9.13e: the peak alone cannot tell CREATE from CREATE+COMPACT.  What
+        // separates them is the CARRY-OVER: without ps_diffuseParticleCompact the
+        // staging slot is zeroed every frame by Copy, so the published count is
+        // one frame's creations and nothing more.  Compact appends the SURVIVORS
+        // of the previous published set, so the population accumulates.  The
+        // last-step count is the aging half of the same observable.
+        PxU32 endDiffuseSeen = 0;
         float restMaxDy = 0.0f;   // max |dy| over the final quarter (rest convergence)
         const int restWindow = steps / 4;
         for (int i = 0; i < steps; ++i)
@@ -4303,7 +4310,10 @@ int main()
             if (i >= steps - restWindow) restMaxDy = PxMax(restMaxDy, PxAbs(y - prevY));
             if (fluidScene) maxYSeen = PxMax(maxYSeen, y);
             if (psc.diffuse)
-                maxDiffuseSeen = PxMax(maxDiffuseSeen, psc.diffuse->getNbActiveDiffuseParticles());
+            {
+                endDiffuseSeen = psc.diffuse->getNbActiveDiffuseParticles();
+                maxDiffuseSeen = PxMax(maxDiffuseSeen, endDiffuseSeen);
+            }
             prevY = y;
         }
         const float yEnd = particleMeanY(psc);
@@ -4495,13 +4505,20 @@ int main()
             // ps_diffuseParticleSum, and those are mapped.  An earlier draft of
             // this comment predicted the scene would stay red until the whole
             // chain landed; that was wrong, because the observable is the
-            // PUBLISHED COUNT and not the motion.  Still unmapped, and therefore
-            // still unexercised by this scene --
-            //     ps_diffuseParticleCompact
-            //     ps_diffuseParticleUpdatePBF
+            // PUBLISHED COUNT and not the motion.
+            //
+            // P9.13e added the two checks that a create-only chain CANNOT pass,
+            // because a peak on its own never could: the population must
+            // ACCUMULATE far past one frame's creations (Copy zeroes the staging
+            // slot every frame, so only ps_diffuseParticleCompact's re-append of
+            // the survivors can carry it over -- 191 create-only in P9.13d, 4096
+            // now) and it must FALL BACK from that peak (a saturated buffer whose
+            // particles never expire stays saturated -- 4096 -> 3197 now).
+            //
+            // Still unmapped, and therefore still unexercised by this scene --
             //     ps_diffuseParticleOneWayCollision
             //     ps_primitivesDiffuseCollisionLaunch / ps_convexDiffuseCollisionLaunch
-            // -- so a spawned particle neither ages nor moves nor collides yet.
+            // -- so a spawned particle ages and moves, but collides with nothing.
             //
             // WHERE TO READ THE WORK LIST, and where NOT to.  PXG_LAUNCH_TRACE=1 is
             // the wrong instrument here and says so by staying silent: an unmapped
@@ -4520,9 +4537,10 @@ int main()
             if (diffuseScene)
             {
                 const bool control = std::getenv("PXG_DIFFUSE_CONTROL") != nullptr;
-                std::printf("  particle DIFFUSE: peak active diffuse particles = %u of %u "
-                            "(threshold %s); mean y %.4f -> %.4f, nn %.4f\n",
-                            maxDiffuseSeen, MAX_DIFFUSE, control ? "1e12 (CONTROL)" : "reachable",
+                std::printf("  particle DIFFUSE: peak active diffuse particles = %u of %u, last "
+                            "step %u (threshold %s); mean y %.4f -> %.4f, nn %.4f\n",
+                            maxDiffuseSeen, MAX_DIFFUSE, endDiffuseSeen,
+                            control ? "1e12 (CONTROL)" : "reachable",
                             y0, yEnd, nnEnd);
                 if (control)
                 {
@@ -4537,6 +4555,35 @@ int main()
                               "registered CUDA function ps_diffuse*' lines plus the per-frame "
                               "'fail to launch' errors, NOT the launch trace -- see the note)\n");
                   ++failures; }
+                else
+                {
+                    // P9.13e -- the two checks the CREATE-only chain could not pass.
+                    //
+                    // CARRY-OVER.  ps_diffuseParticleCopy zeroes the staging slot
+                    // every frame, so without ps_diffuseParticleCompact the
+                    // published count is ONE frame's creations: P9.13d measured
+                    // exactly 191 here.  Compact appends the survivors of the
+                    // previous published set, so the population accumulates until
+                    // it saturates.  The bar is MAX_DIFFUSE/2 = 2048, ten times
+                    // the create-only figure; measured 4096.
+                    if (maxDiffuseSeen < MAX_DIFFUSE / 2u)
+                    { std::printf("FAIL: the diffuse population peaked at %u of %u -- that is a "
+                                  "single frame's creations, not a carried-over population "
+                                  "(create-only measured 191 in P9.13d; need >= %u)\n",
+                                  maxDiffuseSeen, MAX_DIFFUSE, MAX_DIFFUSE / 2u);
+                      ++failures; }
+                    // AGING.  A saturated buffer whose particles never expire stays
+                    // saturated: Compact would re-append all of them every frame.
+                    // The count can only fall back from its peak if lifetimes decay
+                    // and the `lifeTime > 0` survivor test drops particles.  Require
+                    // a 5% fall; measured 22% (4096 -> 3197, reproducible).
+                    else if (endDiffuseSeen * 100u >= maxDiffuseSeen * 95u)
+                    { std::printf("FAIL: the diffuse population did not fall back from its peak "
+                                  "(%u at the last step vs a peak of %u) -- nothing is expiring, "
+                                  "so the lifetime is not being decayed\n",
+                                  endDiffuseSeen, maxDiffuseSeen);
+                      ++failures; }
+                }
             }
             scene->release(); physics->release(); cudaCtx->release(); foundation->release();
             if (failures == 0 && diffuseScene)
@@ -4549,16 +4596,20 @@ int main()
                                 "unreachable threshold, as it must -- this says nothing about "
                                 "whether the diffuse chain works\n");
                 else
-                    // Say exactly what this proves.  Spawning and publishing a
-                    // count needs ps_diffuseParticleCreate, ps_diffuseParticleCopy
-                    // and ps_diffuseParticleSum -- all mapped.  It does NOT need
-                    // the five that move, age, compact or collide the diffuse
-                    // particles, and those are still unmapped, so "end to end"
-                    // would be a claim this scene cannot support.
-                    std::printf("[  OK  ] gpu-sdk-step: the PBD fluid SPAWNED %u DIFFUSE PARTICLES "
-                                "(of %u) and published the count -- create/copy/sum are live; the "
-                                "kernels that MOVE and age them are not yet mapped\n",
-                                maxDiffuseSeen, MAX_DIFFUSE);
+                    // Say exactly what this proves and no more.  The peak needs
+                    // create/copy/sum; the CARRY-OVER to that peak and the fall
+                    // back from it need ps_diffuseParticleCompact, which ages the
+                    // particles and drops the ones whose lifetime ran out.  What
+                    // this still does NOT reach is the three collision kernels
+                    // (ps_diffuseParticleOneWayCollision,
+                    // ps_primitivesDiffuseCollisionLaunch,
+                    // ps_convexDiffuseCollisionLaunch), which are unmapped -- so
+                    // "end to end" remains a claim this scene cannot support.
+                    std::printf("[  OK  ] gpu-sdk-step: the PBD fluid carried a DIFFUSE population "
+                                "up to %u of %u and back down to %u -- create/copy/sum publish it, "
+                                "and only compact's aging can make it accumulate and then decay; "
+                                "the three diffuse COLLISION kernels are still unmapped\n",
+                                maxDiffuseSeen, MAX_DIFFUSE, endDiffuseSeen);
                 return 0;
             }
             if (failures == 0 && hfFloorScene)
