@@ -85,6 +85,17 @@ public struct PxgParticleSimBufferGpu
     public uint _pad84;                   // @84 -> 88
 }
 
+// The PHASE bit test, PxGetFluid (PxParticleGpu.h:65) over
+// PxParticlePhaseFlag::eParticlePhaseFluid (PxParticleSystemFlag.h:94).
+//
+// P9.13d lifted this here rather than making a THIRD copy: npPsFluidDensity and
+// npPsFluidVelocity each carried their own constant and their own one-line
+// predicate, and ps_diffuseParticleCreate needs the same test.  Both existing
+// files already import this module, so the move is verified by their own suites
+// the moment it lands.
+public static const uint PS_PHASE_FLUID = 0x00400000u;   // 1<<22
+public bool psGetFluid(uint phase) { return (phase & PS_PHASE_FLUID) != 0u; }
+
 // P9.13c -- the DIFFUSE per-buffer record, PxgParticleDiffuseSimBuffer
 // (PxgParticleSystem.h:196-210).  Generated from the engine headers and pinned
 // by static_assert in testPsDiffuseBuffers.cpp.

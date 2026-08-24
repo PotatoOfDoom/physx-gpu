@@ -120,7 +120,6 @@
 import pxgSlangParticleDesc;
 
 static const uint PS_FLUID_BLOCK = 256u;
-static const uint PS_PHASE_FLUID = 0x00400000u;   // 1<<22
 
 // PxsPBDMaterialData float index of vorticityConfinement (byte 28).
 static const uint PXG_PBD_MAT_F_VORTICITY = 7u;
@@ -129,7 +128,6 @@ float sqr(float x) { return x * x; }
 float dWdx(float x, float kSpiky2, float kInvRadius) { return -kSpiky2 * (1.0f - x * kInvRadius); }
 
 uint psGetGroup(uint phase) { return phase & PXG_PARTICLE_PHASE_GROUP_MASK; }
-bool psGetFluid(uint phase) { return (phase & PS_PHASE_FLUID) != 0u; }
 
 // phaseToMat[group]: a PxU16 array read as a word plus shift/mask.
 uint pvLoadPhaseToMaterial(uint64_t handleBase, uint group)

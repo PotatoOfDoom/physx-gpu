@@ -146,7 +146,6 @@ static const uint PS_FLUID_BLOCK = 256u;
 // PxParticleFlag::eDISABLE_SELF_COLLISION (PxPBDParticleSystem.h:182)
 static const uint PS_FLAG_DISABLE_SELF_COLLISION = 1u;
 // PxParticlePhaseFlag::eParticlePhaseFluid (PxParticleSystemFlag.h:94)
-static const uint PS_PHASE_FLUID = 0x00400000u;   // 1<<22
 
 // sizeof(PxgPBDParticleMaterialDerived); floats: surfaceTensionDerived@0,
 // cohesion@1, cohesion1@2, cohesion2@3.
@@ -169,7 +168,6 @@ float pxMin(float a, float b) { return a < b ? a : b; }
 // PxGetGroup (PxParticleGpu.h) -- bits [0,19] of the phase.
 uint psGetGroup(uint phase) { return phase & PXG_PARTICLE_PHASE_GROUP_MASK; }
 // PxGetFluid (PxParticleGpu.h:65)
-bool psGetFluid(uint phase) { return (phase & PS_PHASE_FLUID) != 0u; }
 
 // argSizes (launch site PxgPBDParticleSystemCore.cpp:727-732):
 // { particleSystems*, activeParticleSystems*, bool shouldComputePotentials }

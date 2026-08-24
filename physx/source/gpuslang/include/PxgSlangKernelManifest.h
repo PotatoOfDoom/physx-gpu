@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 347;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 348;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -268,7 +268,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_diffuseParticleOneWayCollision", nullptr, nullptr },  // PS_DIFFUSE_PARTICLES_ONE_WAY_COLLISION (unmapped)
     { "ps_diffuseParticleUpdatePBF", nullptr, nullptr },  // PS_DIFFUSE_PARTICLES_UPDATE_PBF (unmapped)
     { "ps_diffuseParticleCompact", nullptr, nullptr },  // PS_DIFFUSE_PARTICLES_COMPACT (unmapped)
-    { "ps_diffuseParticleCreate", nullptr, nullptr },  // PS_DIFFUSE_PARTICLES_CREATE (unmapped)
+    { "ps_diffuseParticleCreate", "psDiffuseCreate.spv", "ps_diffuseParticleCreate" },  // PS_DIFFUSE_PARTICLES_CREATE (P9.13d: the spawn itself)
     { "ps_diffuseParticleCopy", "psDiffuseBuffers.spv", "ps_diffuseParticleCopy" },  // PS_DIFFUSE_PARTICLES_COPY (P9.13c: publish the staged count, clear the staging slot)
     { "ps_diffuseParticleSum", "psDiffuseBuffers.spv", "ps_diffuseParticleSum" },  // PS_DIFFUSE_PARTICLES_SUM (P9.13c: sum the per-buffer counts into the system count)
     { "ps_findStartEndFEMFirstLaunch", nullptr, nullptr },  // PS_FIND_RANGESTARTEND_FEM_FIRST (unmapped)

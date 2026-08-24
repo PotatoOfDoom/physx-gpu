@@ -859,6 +859,9 @@ static const uint8_t kPsCalcHash[] = { 8, 8 };
 // P9.13c: ps_diffuseParticleCopy / ps_diffuseParticleSum -- the same two pointers
 // plus a PxU32 count that neither body reads.
 static const uint8_t kPsDiffCount[] = { 8, 8, 4 };
+// P9.13d: ps_diffuseParticleCreate(particleSystems, activeParticleSystems,
+// randomTable, randomTableSize, dt) -- diffuseParticles.cu:386.
+static const uint8_t kPsDiffCreate[] = { 8, 8, 8, 4, 4 };
 //   ps_reorderDataAndFindCellStartLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32 id) — gather + cell start/end.  Launch site
 //   PxgParticleSystemCore.cpp:681 packs { particleSystemsd, id } (pointer +
@@ -1645,6 +1648,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_updateUnsortedDiffuseArrayLaunch", kPsCalcHash, uint32_t(sizeof(kPsCalcHash)) },
     { "ps_diffuseParticleCopy", kPsDiffCount, uint32_t(sizeof(kPsDiffCount)) },
     { "ps_diffuseParticleSum", kPsDiffCount, uint32_t(sizeof(kPsDiffCount)) },
+    { "ps_diffuseParticleCreate", kPsDiffCreate, uint32_t(sizeof(kPsDiffCreate)) },
     { "ps_reorderDataAndFindCellStartLaunch", kPsReorder, uint32_t(sizeof(kPsReorder)) },
     // gpusimulationcontroller PBD particle self-collision + solve (P6.3 BDA)
     // ps_selfCollisionLaunch(const PxgParticleSystem*, PxU32 id) -> {8,4}
