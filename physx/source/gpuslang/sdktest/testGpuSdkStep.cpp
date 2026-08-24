@@ -4489,17 +4489,19 @@ int main()
             // lets them expire as it settles, so the count is read EVERY step and
             // the peak is what is checked.
             //
-            // What happens today: the count stays 0, because every kernel in the
-            // chain is unmapped --
-            //     ps_preDiffuseIntegrateLaunch          integrate + age
-            //     ps_calculateHashForDiffuseParticlesLaunch
-            //     ps_diffuseParticleCreate              the spawn itself
-            //     ps_diffuseParticleSum / Compact / Copy
+            // WHAT THIS SCENE PROVES, and what it does not.  Since P9.13d the
+            // count is NON-ZERO: spawning and publishing needs only
+            // ps_diffuseParticleCreate, ps_diffuseParticleCopy and
+            // ps_diffuseParticleSum, and those are mapped.  An earlier draft of
+            // this comment predicted the scene would stay red until the whole
+            // chain landed; that was wrong, because the observable is the
+            // PUBLISHED COUNT and not the motion.  Still unmapped, and therefore
+            // still unexercised by this scene --
+            //     ps_diffuseParticleCompact
             //     ps_diffuseParticleUpdatePBF
             //     ps_diffuseParticleOneWayCollision
             //     ps_primitivesDiffuseCollisionLaunch / ps_convexDiffuseCollisionLaunch
-            //     ps_updateUnsortedDiffuseArrayLaunch
-            // -- so this scene FAILS on purpose and is listed as a DIAGNOSTIC.
+            // -- so a spawned particle neither ages nor moves nor collides yet.
             //
             // WHERE TO READ THE WORK LIST, and where NOT to.  PXG_LAUNCH_TRACE=1 is
             // the wrong instrument here and says so by staying silent: an unmapped
@@ -4547,8 +4549,15 @@ int main()
                                 "unreachable threshold, as it must -- this says nothing about "
                                 "whether the diffuse chain works\n");
                 else
+                    // Say exactly what this proves.  Spawning and publishing a
+                    // count needs ps_diffuseParticleCreate, ps_diffuseParticleCopy
+                    // and ps_diffuseParticleSum -- all mapped.  It does NOT need
+                    // the five that move, age, compact or collide the diffuse
+                    // particles, and those are still unmapped, so "end to end"
+                    // would be a claim this scene cannot support.
                     std::printf("[  OK  ] gpu-sdk-step: the PBD fluid SPAWNED %u DIFFUSE PARTICLES "
-                                "(of %u) -- the diffuse chain runs end to end on Vulkan\n",
+                                "(of %u) and published the count -- create/copy/sum are live; the "
+                                "kernels that MOVE and age them are not yet mapped\n",
                                 maxDiffuseSeen, MAX_DIFFUSE);
                 return 0;
             }

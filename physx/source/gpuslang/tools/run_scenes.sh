@@ -37,11 +37,12 @@ if [ -z "${PXG_SHADER_DIR:-}" ]; then
     exit 2
 fi
 
-# The 27 named scenes.  The settling bag below makes 28 -- the figure
-# RUNTIME_STATUS.md's header carries.
+# The 28 named scenes.  The settling bag below makes 29 -- the figure
+# RUNTIME_STATUS.md's header carries.  particlediffuse joined in P9.13d, when
+# ps_diffuseParticleCreate made it pass; it had been a diagnostic since P9.13a.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor articulation
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
-        particlecloth particleinflatable
+        particlecloth particleinflatable particlediffuse
         cloth clothhang clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach"
 
@@ -79,13 +80,6 @@ if [ "${1:-}" = "--diagnostics" ]; then
     echo
     echo "=== diagnostics (NOT scored: these controls exist to fail the checks they"
     echo "    are the reference for -- read their numbers, not their verdicts) ==="
-    # P9.13a: particlediffuse is a diagnostic of a SECOND kind -- not a control that
-    # exists to fail, but a scene whose chain is not mapped yet.  It is run with no
-    # extra variable, and its verdict is expected to be FAIL until the diffuse
-    # kernels land; then it moves up into SCENES.
-    echo "--- particlediffuse (expected FAIL: the diffuse chain is unmapped)"
-    env PXG_SCENE=particlediffuse PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
-        | grep -E '^  particle |^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step' | sed 's/^/    /'
     for spec in "particlefluid PXG_PARTICLE_FLUID_CONTROL" \
                 "particlecloth PXG_PARTICLE_CLOTH_CONTROL" \
                 "particleinflatable PXG_PARTICLE_INFL_CONTROL" \
