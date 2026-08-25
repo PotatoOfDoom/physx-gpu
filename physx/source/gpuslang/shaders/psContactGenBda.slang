@@ -96,6 +96,14 @@
 //     (no particle cloud vs convex-core scene), matching the harness.
 
 import pxgSlangParticleDesc;
+// P9.14b: the convex particle path.  All three are already-swept modules -- the
+// cooked-hull blob reader, the GJK driver and the GJK-then-EPA policy layer that
+// the softbody-vs-rigid path goes through.  particleConvexCollision
+// (cudaParticleSystem.cu:666) is that same policy layer with a point cloud on one
+// side, so it is COMPOSED here rather than transcribed a second time.
+import pxgSlangConvexHull;
+import pxgSlangGjk;
+import pxgSlangTetCollide;
 
 // PxgParticleSystemKernelBlockDim::PS_COLLISION (256) /
 // PxgParticleSystemKernelGridDim::PS_COLLISION (1024) — the fixed CUDA launch
@@ -946,6 +954,314 @@ void ps_primitivesDiffuseCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
                 impulses[outputIndex] = 0.0f;
                 nodeIndices[outputIndex] = rigidId;
             }
+        }
+    }
+}
+
+// ===========================================================================
+// P9.14b -- ps_convexCollisionLaunch
+// gpunarrowphase/src/CUDA/cudaParticleSystem.cu:1470 (wrapper), :807
+// (psConvexCollision) and :666 (particleConvexCollision), all read in full.
+//
+// The particle-vs-CONVEX-HULL contact generator: the fourth and last of this
+// file's family, and the only one whose contact test is GJK/EPA rather than a
+// closed-form primitive query.  It shares the work-index search, the cell hash
+// and the writer with the primitives kernel above, and it shares its GJK/EPA
+// policy with the SOFTBODY path -- particleConvexCollision is
+// tetPrimitivesCollide2 with a one-point cloud on side A, so it is composed
+// from that module rather than transcribed a second time.
+//
+// ---------------------------------------------------------------------------
+// X1 -- THE ENGINE PASSES isDiffuse = TRUE HERE, IN THE FLUID KERNEL.
+//     getParticleSpeculativeContactVolume's fifth argument is `isDiffuse`, and
+//     the four particle collision bodies pass:
+//         psPrimitivesCollision        (:463)   false
+//         psDiffusePrimitivesCollision (:610)   true
+//         psConvexCollision            (:912)   TRUE     <-- the fluid path
+//         psConvexDiffuseCollision     (:1078)  true
+//     Since PARTICLE_FORWARD_PROJECTION_STEP_SCALE_DIFFUSE and _PGS are both
+//     1.0 and _TGS is 0.5, this is observable only in a TGS step: the SAME
+//     fluid particle, with the SAME CCD flag, gets a contact volume scaled by
+//     1.0 against a hull and by 2.0 against a box.  That is an ENGINE
+//     INCONSISTENCY -- upstream candidate, DOCUMENTED AND NOT REPORTED -- and
+//     it is transcribed exactly, because the job of this port is to match the
+//     engine and not to correct it.
+//
+// X2 -- `combine()` IS AN INTERSECTION.  cudaParticleSystem.cu:83 defines a
+//     FILE-LOCAL combine that takes max of the minima and min of the maxima --
+//     the overlap region.  PxBounds3::combine, whose name it borrows, is the
+//     UNION.  The primitives kernel above already does the right thing; the
+//     name is recorded here because it actively misleads.
+//
+// X3 -- ONE WARP PER WORK ITEM, AND THE WORK ASSIGNMENT IS NOT A GRID-STRIDE.
+//         workIndex = i + (warpIndex + numWarpPerBlock * blockIdx.x) * nbIter
+//     Each warp owns a CONTIGUOUS RUN of nbIter indices, where
+//     nbIter = ceil(nbWarpsRequired / (1024 * 8)).  The primitives kernel's
+//     `i * stride + blockIdx.x * PS_BLOCK + tid` covers the same SET but hands
+//     different items to different threads; the two are interchangeable only
+//     because the items are independent.  Transcribed as the engine spells it.
+//
+// X4 -- OUR GJK/EPA DRIVER IS PER-THREAD, so the CUDA's 32-lane cooperation
+//     collapses: lane 0 of each warp does the whole work item and lanes 1..31
+//     return immediately.  The block shape stays (32, 8, 1) because that is
+//     what the engine dispatches, and warpIndex is threadIdx.y exactly as in
+//     the .cu.  The per-warp shared EpaScratch, ParticleConvexCollideScratch
+//     and the warpCopy'd PxgParticleSystem all disappear with it -- they are
+//     CUDA staging for a cooperative query this port does not run
+//     cooperatively.
+//
+// X5 -- inSphereRadius1 = extents.w * minScale, and minScale is 1.0 UNLESS the
+//     shape is eBOX, where it is the smallest of the three scale components.
+//     A convex mesh bakes its scale into the blob and upstream leaves the
+//     factor at 1; a box's PxMeshScale IS its half-extent.  Same asymmetry the
+//     softbody path documents.
+//
+// X6 -- CCD RUNS GJK TWICE, AND ONLY THE SECOND ANSWER SURVIVES.  The first
+//     pass is a pure distance test at the contact-volume centre with
+//     minSep = cVolumeRadius; if it is not DISTANT the cache is thrown away and
+//     the whole query is re-run from the ACTUAL particle position with
+//     minSep = contactDistance + 2*cVolumeRadius -- "make sure to cover the
+//     larger volume that includes both the current and the whole cVolume".
+//     The anomaly test and EPA run on the SECOND result only.  Composing this
+//     as two tetPrimitivesCollide2 calls would run EPA on the first pass too.
+//
+// X7 -- THE STORED NORMAL IS NEGATED.  `outCP = threadIdx.x < 3 ? (-normal)
+//     : pen`, i.e. normal_pen.xyz = -gjkOutput.direction.  The primitives
+//     kernel stores its normal unflipped.  Two kernels, one contact stream,
+//     opposite conventions -- and both are what the solver expects.
+//
+// X8 -- the penetration is assembled from THREE LANES:
+//     `pen = (witnessB - witnessA) * normal` per component, then the three
+//     components are shuffled together and restDistance subtracted ONCE.  That
+//     is `dot(closestPointB - closestPointA, direction) - restDistance`, and
+//     the summation order is lane 0 + lane 1 + lane 2, i.e. x + y + z left to
+//     right -- which is what `dot` lowers to, so the spelling is kept.
+//
+// X9 -- the filter IS applied here, unlike the diffuse twin, and its particle
+//     key is the UNSORTED index (mSortedToUnsortedMapping), not the sorted one
+//     the contact record carries.
+//
+// X10 -- the atomicAdd on numTotalContacts ALWAYS runs and only the write is
+//     capped by maxContacts -- the same overshoot contract as the one-way
+//     count in P9.13f/g.
+// ===========================================================================
+
+// PxMeshScale::transform (PxMeshScale.h): a mesh scale is a scale along a ROTATED
+// frame, so a vertex is rotated INTO that frame with quatRotate, scaled
+// componentwise, and rotated BACK with quatRotateInv.  It is NOT `v * scale`
+// unless the scale rotation is identity -- and writing the two rotations the
+// other way round is a silent transpose that only shows on a non-identity
+// scaleRot.  Same spelling as the softbody path's cgVertex2Shape.
+float3 psVertex2Shape(float3 v, float3 scale, float4 rot)
+{
+    float3 t = quatRotate(rot, v);
+    t.x *= scale.x;
+    t.y *= scale.y;
+    t.z *= scale.z;
+    return quatRotateInv(rot, t);
+}
+
+// particleConvexCollision (cudaParticleSystem.cu:666), composed.  Returns false
+// only for DISTANT; everything else leaves its answer in `o`.
+bool particleConvexCollision(float3 particlePos, float3 cVolumePos, float cVolumeRadius,
+                             bool enableCCD, float contactDistance, float3 hullOrigin,
+                             GjkCloud b, float inSphereRadius1, out GjkOut o)
+{
+    GjkCloud a;
+    for (uint i = 0u; i < GJK_MAX_CLOUD; ++i) a.v[i] = float3(0.0f, 0.0f, 0.0f);
+    a.n = 1u;
+    a.v[0] = cVolumePos;
+
+    float3 dir0 = float3(1.0f, 0.0f, 0.0f);
+    const float3 aToB0 = cVolumePos - hullOrigin;
+    if (dot(aToB0, aToB0) > 0.0f) dir0 = aToB0;
+
+    if (!enableCCD)
+    {
+        // X6: without CCD the first pass IS the query -- cVolumeRadius equals
+        // the contact distance here, and the anomaly/EPA policy runs on it.
+        const uint r = tetPrimitivesCollide2(a, b, dir0, cVolumeRadius,
+                                             0.0f, inSphereRadius1, o);
+        return r != GJK_DISTANT;
+    }
+
+    // X6, first pass: a DISTANCE TEST ONLY.  No anomaly test, no EPA -- the
+    // CUDA discards this simplex before the second pass.
+    float cached0[32];
+    const uint r0 = gjkRun(a, b, dir0, cVolumeRadius, TETC_CONVERGENCE_RATIO, o, cached0);
+    if (r0 == GJK_DISTANT)
+        return false;
+
+    a.v[0] = particlePos;
+    float3 dir1 = float3(1.0f, 0.0f, 0.0f);
+    const float3 aToB1 = particlePos - hullOrigin;
+    if (dot(aToB1, aToB1) > 0.0f) dir1 = aToB1;
+
+    const uint r1 = tetPrimitivesCollide2(a, b, dir1,
+                                          contactDistance + cVolumeRadius * 2.0f,
+                                          0.0f, inSphereRadius1, o);
+    return r1 != GJK_DISTANT;
+}
+
+[shader("compute")]
+[numthreads(32, 8, 1)]
+void ps_convexCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    // X4: lane 0 owns the work item; the other 31 have nothing to do.
+    if (gtid.x != 0u)
+        return;
+    const uint warpIndex = gtid.y;
+    const bool isTGS = (gP.isTGSWord & 0xffu) != 0u;
+
+    Ptr<PxgContactManagerInput> cmInputs = Ptr<PxgContactManagerInput>(gP.cmInputs);
+    Ptr<PxgShape> shapes = Ptr<PxgShape>(gP.shapes);
+    Ptr<PxsCachedTransform> transformCache = Ptr<PxsCachedTransform>(gP.transformCache);
+    Ptr<float> boundsArr = Ptr<float>(gP.bounds);
+    Ptr<float> contactDistance = Ptr<float>(gP.contactDistance);
+    Ptr<float> restDistances = Ptr<float>(gP.restDistances);
+    Ptr<uint> startIndices = Ptr<uint>(gP.startIndices);
+    Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gP.particleSystems);
+    Ptr<uint2> shapeToRigidRemap = Ptr<uint2>(gP.shapeToRigidRemap);
+
+    const uint nbWarpsRequired = Ptr<uint>(gP.totalNumPairs)[0];
+    const uint totalNumWarps = PS_GRID * WARPS_PER_BLOCK;
+    const uint nbIter = (nbWarpsRequired + totalNumWarps - 1u) / totalNumWarps;
+
+    for (uint i = 0u; i < nbIter; ++i)
+    {
+        // X3: a contiguous run per warp, not a grid-stride.
+        const uint workIndex = i + (warpIndex + WARPS_PER_BLOCK * gid.x) * nbIter;
+        if (workIndex >= nbWarpsRequired)
+            continue;
+
+        const uint pos = binarySearchRunSum(startIndices, gP.numTests, workIndex);
+        const uint startPairIndex = startIndices[pos];
+
+        // LoadShapePair<ePARTICLESYSTEM>: the particle shape goes to slot 0.
+        const PxgContactManagerInput cin = cmInputs[pos];
+        uint particleShapeRef = cin.shapeRef0;
+        uint particleCacheRef = cin.transformCacheRef0;
+        uint rigidShapeRef = cin.shapeRef1;
+        uint rigidCacheRef = cin.transformCacheRef1;
+        if (shapes[cin.shapeRef0].type != GEOM_PARTICLESYSTEM)
+        {
+            particleShapeRef = cin.shapeRef1;
+            particleCacheRef = cin.transformCacheRef1;
+            rigidShapeRef = cin.shapeRef0;
+            rigidCacheRef = cin.transformCacheRef0;
+        }
+
+        const PxgShape rigidShape = shapes[rigidShapeRef];
+        const uint psId = shapes[particleShapeRef].particleOrSoftbodyId;
+
+        const PxsCachedTransform tc = transformCache[rigidCacheRef];
+        const float4 rigidQ = float4(tc.qx, tc.qy, tc.qz, tc.qw);
+        const float3 rigidP = float3(tc.px, tc.py, tc.pz);
+        const uint2 rigidId = shapeToRigidRemap[rigidCacheRef];
+
+        const float cDistance = contactDistance[particleCacheRef] + contactDistance[rigidCacheRef];
+        const float restDistance = restDistances[pos];
+
+        // X2: `combine` is the OVERLAP region, then fattenFast(cDistance).
+        const uint pb = particleCacheRef * 6u;
+        const uint rb = rigidCacheRef * 6u;
+        float3 omn = max(float3(boundsArr[pb + 0u], boundsArr[pb + 1u], boundsArr[pb + 2u]),
+                         float3(boundsArr[rb + 0u], boundsArr[rb + 1u], boundsArr[rb + 2u]));
+        float3 omx = min(float3(boundsArr[pb + 3u], boundsArr[pb + 4u], boundsArr[pb + 5u]),
+                         float3(boundsArr[rb + 3u], boundsArr[rb + 4u], boundsArr[rb + 5u]));
+        omn -= float3(cDistance, cDistance, cDistance);
+        omx += float3(cDistance, cDistance, cDistance);
+
+        const float cellWidth = systems[psId].mCommonData_GridCellWidth;
+        const uint3 gridSize = uint3(systems[psId].mCommonData_GridSizeX,
+                                     systems[psId].mCommonData_GridSizeY,
+                                     systems[psId].mCommonData_GridSizeZ);
+        const uint gridHash = calcGridHashInBounds(omn, omx, cellWidth,
+                                                   workIndex - startPairIndex, gridSize);
+
+        // ---- the hull, decoded and staged in world space once per work item ----
+        const uint64_t hullPtr = uint64_t(rigidShape.hullOrMeshOffset.x) |
+                                 (uint64_t(rigidShape.hullOrMeshOffset.y) << 32);
+        const uint hullDesc = chHullDesc(hullPtr);
+        const float4 extents = chExtents(hullPtr);
+        // Upstream asserts nbVertices1 <= CONVEX_MAX_VERTICES_POLYGONS (64), which
+        // is exactly GJK_MAX_CLOUD; clamped so a corrupt header cannot walk off
+        // the cloud, as the softbody path does.
+        const uint nbVerts = min(chNbVerts(hullDesc), GJK_MAX_CLOUD);
+
+        const float3 scale = float3(rigidShape.scaleX, rigidShape.scaleY, rigidShape.scaleZ);
+        const float4 scaleRot = float4(rigidShape.scaleRotX, rigidShape.scaleRotY,
+                                       rigidShape.scaleRotZ, rigidShape.scaleRotW);
+        // X5.
+        float minScale1 = 1.0f;
+        if (rigidShape.type == GEOM_BOX)
+            minScale1 = min(scale.z, min(scale.x, scale.y));
+        const float inSphereRadius1 = extents.w * minScale1;
+
+        GjkCloud hull;
+        for (uint v = 0u; v < GJK_MAX_CLOUD; ++v) hull.v[v] = float3(0.0f, 0.0f, 0.0f);
+        hull.n = nbVerts;
+        // prepareVertices (cudaNpCommon.h:315): vertex space -> shape space -> world.
+        for (uint v = 0u; v < nbVerts; ++v)
+        {
+            const float3 vv = chVertex(hullPtr, v).xyz;
+            hull.v[v] = quatRotate(rigidQ, psVertex2Shape(vv, scale, scaleRot)) + rigidP;
+        }
+
+        // ---- the cell ----
+        const uint startIndex = Ptr<uint>(systems[psId].mCellStart)[gridHash];
+        if (startIndex == EMPTY_CELL)
+            continue;
+        const uint endIndex = Ptr<uint>(systems[psId].mCellEnd)[gridHash];
+        const uint range = endIndex - startIndex;
+        if (range == 0u)
+            continue;
+
+        const bool enableCCD = (systems[psId].mData_Flags & PS_FLAG_ENABLE_CCD) > 0u;
+        Ptr<float4> curPos = Ptr<float4>(systems[psId].mSortedOriginPos_InvMass);
+        Ptr<float4> predPos = Ptr<float4>(systems[psId].mSortedPositions_InvMass);
+        Ptr<uint> sortedToUnsorted = Ptr<uint>(systems[psId].mSortedToUnsortedMapping);
+
+        for (uint ind = 0u; ind < range; ++ind)
+        {
+            const uint particleIndex = startIndex + ind;
+
+            // X9: the filter key is the UNSORTED index.
+            if (findPs(systems, psId, rigidId, uint2(sortedToUnsorted[particleIndex], psId)))
+                continue;
+
+            const float3 currentPos = curPos[particleIndex].xyz;
+
+            float3 cVolumePos;
+            float cVolumeRadius;
+            if (enableCCD)
+            {
+                const float3 predictedPos = predPos[particleIndex].xyz;
+                // X1: isDiffuse = TRUE, in the FLUID kernel.  The engine's own
+                // spelling; see the header.
+                cVolumeRadius = getSpecVolume(cVolumePos, currentPos, predictedPos,
+                                              cDistance, true, isTGS);
+            }
+            else
+            {
+                cVolumePos = currentPos;
+                cVolumeRadius = cDistance;
+            }
+
+            GjkOut o;
+            if (!particleConvexCollision(currentPos, cVolumePos, cVolumeRadius, enableCCD,
+                                         cDistance, rigidP, hull, inSphereRadius1, o))
+                continue;
+
+            // X8 / X7.
+            const float pen = dot(o.closestPointB.xyz - o.closestPointA.xyz,
+                                  o.direction.xyz) - restDistance;
+
+            // X10: the counter always advances; only the write is capped.
+            uint index;
+            InterlockedAdd(Ptr<uint>(gP.w_numTotalContacts)[0], 1u, index);
+            writeContact(index, float4(-o.direction.xyz, pen),
+                         uint2(particleIndex, psId), rigidId);
         }
     }
 }

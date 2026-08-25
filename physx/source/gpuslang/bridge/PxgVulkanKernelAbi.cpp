@@ -943,6 +943,18 @@ static const uint8_t kPsPrimCollide[] = { 1, 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
 //   Launch site PxgNarrowphaseCore.cpp:3300, grid (1024,1,1) block (256,1,1).
 static const uint8_t kPsPrimDiffuseCollide[] = { 1, 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
 
+// gpunarrowphase cudaParticleSystem.cu:1470 (P9.14b) -- the particle-vs-CONVEX
+// contact generator.  Same 176-byte blob as kPsPrimCollide, but the engine
+// spells the writer out as EIGHT SEPARATE POINTER ARGUMENTS plus maxContacts
+// rather than passing PxgParticleContactWriter by value
+// (PxgNarrowphaseCore.cpp:3776-3803).  The byte LAYOUT is identical -- pointers
+// at 104..160, the u32 at 168 -- so the shader reads the same push-constant
+// struct; the row is spelled out because the table's job is to record the
+// engine's actual argument list.
+//   -> {1,4,4,8x19,4}
+static const uint8_t kPsConvexCollide[] = { 1, 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+                                            8, 8, 8, 8, 8, 8, 8, 8, 4 };
+
 // gpunarrowphase particleSystemMeshMidphase.cu:775 (P9.10) — the particle-vs-
 // TRIANGLE-MESH midphase and contact generation:
 //   ps_meshCollisonLaunch(const bool isTGS, const PxReal tolerenceLength,
@@ -1682,6 +1694,7 @@ static const PxgKernelAbiRow kRows[] = {
     // gpunarrowphase (P6.4a-2 PBD particle-vs-primitive contact generator)
     { "ps_primitivesCollisionLaunch", kPsPrimCollide, uint32_t(sizeof(kPsPrimCollide)) },
     { "ps_primitivesDiffuseCollisionLaunch", kPsPrimDiffuseCollide, uint32_t(sizeof(kPsPrimDiffuseCollide)) },
+    { "ps_convexCollisionLaunch", kPsConvexCollide, uint32_t(sizeof(kPsConvexCollide)) },
     { "ps_meshCollisonLaunch", kPsMeshCollide, uint32_t(sizeof(kPsMeshCollide)) },
     // gpunarrowphase particleSystemHFMidPhaseCG.cu:262 (P9.11 particle-vs-heightfield)
     { "ps_heightfieldCollisonLaunch", kPsHfCollide, uint32_t(sizeof(kPsHfCollide)) },

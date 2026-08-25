@@ -4724,13 +4724,12 @@ int main()
             // shape as the fluid CONTROL: read the numbers, not the verdict.
             if (convexFloorScene)
                 std::printf("  [ diag ] particleconvex over a cooked CONVEX floor: fluid mean y "
-                            "%.4f, nn %.4f, peak diffuse %u of %u, lowest diffuse y %.4f.  This "
-                            "says NOTHING about correctness -- ps_convexCollisionLaunch and "
-                            "ps_convexDiffuseCollisionLaunch are BOTH unmapped, so there is no "
-                            "floor to fall on.  The work list is the wrangler's startup 'Could "
-                            "not find registered CUDA function' lines plus the per-frame 'GPU "
-                            "ps_convex*CollisionLaunch fail to launch!!' errors, which this run "
-                            "emits 45 times each\n",
+                            "%.4f, nn %.4f, peak diffuse %u of %u, lowest diffuse y %.4f.  P9.14b "
+                            "mapped ps_convexCollisionLaunch, so the FLUID now rests on the hull "
+                            "(mean y was -39.32 before it); ps_convexDiffuseCollisionLaunch is "
+                            "still unmapped, which is why the SPRAY still falls through.  This "
+                            "stays a DIAGNOSTIC until that lands and the scene can be scored on "
+                            "both\n",
                             yEnd, nnEnd, maxDiffuseSeen, MAX_DIFFUSE,
                             minDiffuseY == FLT_MAX ? 0.0f : minDiffuseY);
             if (failures == 0 && diffuseScene)

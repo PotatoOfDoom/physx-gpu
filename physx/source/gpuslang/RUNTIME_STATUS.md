@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **815/815** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **816/816** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **29/29** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (28 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
@@ -1700,6 +1700,204 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.14b — `ps_convexCollisionLaunch` (Manifest **353**): GJK/EPA gegen eine gekochte Hülle, komponiert statt abgeschrieben — und ein ENGINE-WIDERSPRUCH im Flüssigkeitspfad
+
+Portiert `cudaParticleSystem.cu:1470` (Wrapper), `:807` (`psConvexCollision`) und
+`:666` (`particleConvexCollision`), alle drei vollständig gelesen. Der vierte und
+letzte Partikel-Kontaktgenerator dieser Datei — und der einzige, dessen
+Kontakttest GJK/EPA ist statt einer geschlossenen Formel. Manifest **352 → 353**.
+Neue ABI-Zeile `kPsPrimDiffuseCollide`-Nachbar `kPsConvexCollide[] =
+{1,4,4,8×19,4}`: dieselben 176 Byte wie `kPsPrimCollide`, nur schreibt die Engine
+den Writer als **23 Einzelargumente** statt ihn by-value zu übergeben.
+
+### Fast nichts davon ist neu
+
+Der Kernel kam als **dritter Einsprungpunkt** in `psContactGenBda.slang`, weil
+dort die Arbeitsindex-Binärsuche, `calcGridHashInBounds`, `getSpecVolume`,
+`findPs` und `writeContact` schon liegen und gefegt sind. Und der Kontakttest
+selbst wurde **komponiert, nicht abgeschrieben**:
+
+* `pxgSlangConvexHull` liest den gekochten Blob (nur ein Zugriff fehlte,
+  `chExtents` bei +32 — die Kopfzeile des Moduls nannte das Feld bis eben „von
+  dieser Kette nicht gelesen");
+* `pxgSlangTetCollide::tetPrimitivesCollide2` **ist** die Politik, die
+  `particleConvexCollision` inline ausschreibt: dieselbe Anomalie-Prüfung
+  (`dot(closestPointDir, direction) < 0.999`), derselbe EPA-Aufruf, derselbe
+  Neustart aus **+y** bei `degenerate`. Der Softbody-vs-Rigid-Pfad geht seit
+  P8.x durch dieselbe Funktion.
+
+Was **neu** ist, ist die Umgebung: der Hüllen-Dekode mit
+`inSphereRadius = extents.w * minScale`, der Zellendurchlauf, der Filter, die
+Zwei-Pass-CCD-Politik und der Kontaktschreiber.
+
+### X1 — DIE ENGINE ÜBERGIBT `isDiffuse = TRUE` IM FLÜSSIGKEITS-KERNEL
+
+Das fünfte Argument von `getParticleSpeculativeContactVolume` heißt `isDiffuse`.
+Die vier Partikel-Kollisionskörper übergeben:
+
+| Körper | Zeile | `isDiffuse` |
+|---|---|---|
+| `psPrimitivesCollision` | :463 | `false` |
+| `psDiffusePrimitivesCollision` | :610 | `true` |
+| **`psConvexCollision`** | **:912** | **`true`** ← der Flüssigkeitspfad |
+| `psConvexDiffuseCollision` | :1078 | `true` |
+
+`PARTICLE_FORWARD_PROJECTION_STEP_SCALE_DIFFUSE` und `_PGS` sind beide 1.0,
+`_TGS` ist 0.5. Beobachtbar wird das also **nur im TGS-Schritt** — und dort
+bekommt **dasselbe Flüssigkeitspartikel mit demselben CCD-Flag** ein
+Kontaktvolumen mit Faktor 1.0 gegen eine Hülle und mit Faktor 2.0 gegen eine
+Box. Das ist ein **Widerspruch in der Engine**, kein Portfehler:
+Upstream-Kandidat, **dokumentiert und NICHT gemeldet**, und exakt so übernommen —
+die Aufgabe dieses Ports ist es, die Engine zu treffen, nicht sie zu korrigieren.
+
+### Weitere Fallen: X2–X10
+
+* **X2 — `combine()` ist eine SCHNITTMENGE.** `cudaParticleSystem.cu:83`
+  definiert ein **dateilokales** `combine`, das Maximum der Minima und Minimum
+  der Maxima nimmt. `PxBounds3::combine`, dessen Namen es borgt, ist die
+  Vereinigung.
+* **X3 — die Arbeitsverteilung ist KEIN Grid-Stride.**
+  `workIndex = i + (warpIndex + numWarpPerBlock * blockIdx.x) * nbIter` gibt jedem
+  Warp einen **zusammenhängenden Lauf**. Der Primitiven-Kernel nebenan verteilt
+  gestreut.
+* **X4 — unser GJK/EPA-Treiber ist per-Thread**, also fällt die 32-Lane-Kooperation
+  der CUDA weg: Lane 0 jedes Warps macht das ganze Arbeitspaket. Die drei
+  Shared-Memory-Ablagen (EpaScratch, ParticleConvexCollideScratch und eine ganze
+  Kopie des `PxgParticleSystem`) entfallen mit ihr.
+* **X5 — `minScale` ist 1.0, AUSSER bei `eBOX`.** Eine konvexe Hülle hat ihre
+  Skalierung im Blob; die `PxMeshScale` einer Box **ist** ihr Halbmaß.
+* **X6 — CCD fährt GJK ZWEIMAL, und nur die zweite Antwort zählt.** Der erste
+  Durchgang ist ein reiner Abstandstest am Volumenmittelpunkt; danach wird der
+  Cache weggeworfen und die ganze Anfrage von der **tatsächlichen**
+  Partikelposition aus wiederholt, mit
+  `minSep = contactDistance + 2*cVolumeRadius`.
+* **X7 — die gespeicherte Normale ist NEGIERT** (`-direction`). Der
+  Primitiven-Kernel speichert seine unverdreht. Zwei Kernel, ein Kontaktstrom,
+  entgegengesetzte Konventionen — und beide sind, was der Solver erwartet.
+* **X8** — die Eindringtiefe wird aus **drei Lanes** zusammengesetzt und die
+  Ruhedistanz **einmal** abgezogen.
+* **X9** — der Filter greift hier (anders als im Diffus-Zwilling), und sein
+  Partikelschlüssel ist der **UNSORTIERTE** Index.
+* **X10** — der `atomicAdd` läuft immer, gedeckelt ist nur der Schreibvorgang.
+
+### Das Fixture: ein Orakel, das GJK nicht nachbaut
+
+GJK/EPA ist iterativ; es gibt keine geschlossene Form zum bitgenauen Vergleich
+und keine host-aufrufbare Engine-Version. Festnagelbar ist aber die
+**GEOMETRIE**, nach der gefragt wird — also ist die Hülle eine Box, für die
+Punkt-gegen-Box eine geschlossene Form hat, und zwar **vorzeichenbehaftet**:
+positiv außen (GJKs Separation), negativ innen (EPAs Eindringtiefe). Geprüft
+wird pro Partikel:
+
+* **welche** Partikel einen Kontakt erzeugen — die analytische Menge, exakt;
+* die Normale ist **Einheitslänge** (gemessen: Fehler 4.9e-15);
+* die Normale zeigt **AUS der Box heraus** — bei einem eingedrungenen Partikel
+  zur **nächsten Fläche**. Das nagelt X7s Negation **physikalisch** fest, nicht
+  durch Abschreiben eines Vorzeichens aus einem Messlauf;
+* die Eindringtiefe ist die vorzeichenbehaftete Distanz minus Ruhedistanz —
+  gemessener schlimmster Fehler **2.4e-07**.
+
+Die GJK/EPA-Algebra selbst wird hier **nicht** nachgeprüft; sie ist
+`pxgSlangGjk`/`pxgSlangEpa`/`pxgSlangTetCollide` und unter dem
+Softbody-Pfad gefegt. Geprüft wird alles **darum herum**.
+
+### Der Sweep, in drei Runden: 30 Mutanten, 20 tot
+
+Die erste Runde tötete 15 und die Diagnose der Überlebenden war fast durchweg
+**„die Fixture-Geometrie ist in einer Achse entartet"**:
+
+* Einheitsrotation und Einheitsskalierung ⇒ der ganze Vertex-Transform ist die
+  Identität. Behoben mit **90°-Rotationen und nicht-uniformer Skalierung**, die
+  die Welt-Hülle achsenparallel lassen (die Halbmaße werden nur permutiert), so
+  dass das geschlossene Orakel bestehen bleibt.
+* Kappe (`maxContacts`) weit über der Kontaktzahl ⇒ das Kapazitätstor feuert nie.
+* Laufsumme = Identität ⇒ `pos` und `workIndex` sind dieselbe Zahl.
+* keine CCD ⇒ das ganze Kontaktvolumen ist toter Code. Ein zweites Partikelsystem
+  **mit** CCD kam dazu — und mit ihm **zwei konstruierte Grenzfall-Partikel**,
+  gesetzt durch Auflösen der beiden Ungleichungen, weil ein Band gewöhnlicher
+  Partikel die Randschale nie trifft. Das Fixture **verlangt**, dass jede Sonde
+  die Politik von ihrem Mutanten trennt.
+
+Und eine Lehre, die es wert ist, benannt zu werden:
+
+> **Eine Kappe, die die Hälfte der Ausgabe verbirgt, verbirgt die Hälfte der
+> Fehler.** Mit `maxContacts = 40` von 82 fingen zwei bereits getötete Mutanten
+> wieder an zu überleben — die Kontakte, die sie verdarben, verloren das
+> atomare Rennen und wurden nie verglichen. Die Kappe liegt jetzt bei 76, greift
+> also weiterhin, verbirgt aber nur sechs; und die Prüfung **verlangt**, dass die
+> geschriebene Menge **beide** Partikelsysteme abdeckt.
+
+**Endstand: 19 getötet, 1 durch Fault getötet, 10 überlebt** — jeder mit einem
+Mechanismus:
+
+* **`x1-isdiffuse-is-istgs`** — äquivalent, weil `FWD_DIFFUSE` und `FWD_PGS`
+  **beide 1.0** sind. Derselbe Beweis wie in P9.13g, und er hängt an zwei
+  Engine-Konstanten, nicht an unserem Code.
+* **`x6-first-pass-only`** — äquivalent, und der Beweis ist der interessanteste
+  dieser Tranche: `|sd(orig) − sd(mid)| ≤ |off|` (die vorzeichenbehaftete Distanz
+  ist 1-Lipschitz), also folgt aus Durchgang 1 (`sd(mid) ≤ |off| + cDist`) sofort
+  `sd(orig) ≤ 2|off| + cDist < cDist + 2(|off| + cDist)` — die
+  DISTANT-Prüfung des **zweiten** Durchgangs kann **niemals** greifen. Sie ist in
+  der Engine toter Code. Der Nachbar-Mutant, der den Faktor 2 auf 1 senkt,
+  **stirbt** — konsistent, denn dann ist die Schranke erreichbar.
+* **`x6-ccd-single-pass`** — äquivalent: die volle Politik im ersten Durchgang
+  verschwendet ein EPA, dessen Ausgabe der zweite überschreibt.
+* **`x3-workindex-gridstride`** — äquivalent (X3): beide decken
+  `[0, nbWarpsRequired)` ab, die Pakete sind unabhängig.
+* **`dir-always-x`** — äquivalent: die Startrichtung ist ein Saatwert, keine
+  Nebenbedingung; ohne Warmstart ist der konvergierte Zeuge derselbe, nur die
+  Iterationszahl ändert sich.
+* **`v2s-rotations-swapped`** — äquivalent **für diese Skalenrotation**:
+  richtig ist `R⁻¹∘S∘R`, der Mutant `R∘S∘R⁻¹`, und die beiden stimmen überein,
+  sobald `R²` mit `S` kommutiert — für `R = Rz(90°)` ist `R² = diag(−1,−1,1)`,
+  und das kommutiert mit jedem diagonalen `S`. Töten ließe er sich nur mit einer
+  allgemeinen Skalenrotation, und dann ist die Hülle ein Parallelepiped und das
+  geschlossene Orakel weg. Die Schreibweise selbst ist die des Softbody-Pfads und
+  dort gefegt.
+* **`x5-minscale-always`, `x5-insphere-unscaled`, `hull-extents-is-com`** — alle
+  drei ändern **nur** `inSphereRadius1`, und das speist **ausschließlich** EPAs
+  relatives Epsilon. Bei einer Box terminiert EPA auf einer exakten Fläche, das
+  Epsilon verschiebt die Antwort also nicht innerhalb des 2e-4-Fensters (gemessen
+  wird 2.4e-7). Töten bräuchte eine **gekrümmte** Hülle, deren Iterationszahl vom
+  Epsilon abhängt.
+* **`cell-hash-zero` und `x2-bounds-union`** — **Fixture-Grenze, als Aufgabe
+  festgehalten.** Die Zelle, die ein Arbeitspaket liest, ist der Hash der
+  **Überlappungsregion**; sobald das Gitter mehr als eine Zelle hat, müsste das
+  Fixture `calcGridHashInBounds` nachbauen, um vorherzusagen, welche Zelle
+  getroffen wird — also den Code unter Test ein zweites Mal abschreiben. Mit
+  einer Zelle stellt sich die Frage nicht, aber der Hash-Pfad ist damit **von
+  keinem Fixture festgenagelt**, auch nicht von den beiden anderen
+  Kontaktgenerator-Fixtures, die denselben Trick benutzen. Das gehört in eine
+  eigene Tranche mit einem Host-Spiegel von `gridCal.cuh` — einem
+  **Engine**-Header, also keine zweite Abschrift von uns.
+
+### Die Szene sagt es zuerst
+
+`particleconvex`, die P9.14a gebaut hat, hat den Port beim **ersten Lauf**
+bestätigt:
+
+| | vorher | jetzt |
+|---|---|---|
+| Flüssigkeit, mittleres y | −39.3227 | **0.1667** |
+| Nachbarabstand | 0.3993 | **0.0812** |
+| `ps_convexCollisionLaunch fail to launch` | 45× | **0×** |
+| tiefstes Diffus-y | −39.9191 | −39.6138 |
+
+0.1667 ist **exakt** die Höhe, auf der Netz- und Heightfield-Boden dieselbe
+Säule halten. Und die letzte Zeile ist der schärfste Teil: **im selben Bild, auf
+demselben Boden, ruht die Flüssigkeit und fällt die Gischt weiter durch** — denn
+ihr Kernel fehlt noch.
+
+### Verifikation
+
+* `ctest -R gpuslang.psConvexContactGen` grün, forced-fresh;
+* die beiden anderen Einsprungpunkte derselben Übersetzungseinheit bleiben grün;
+* volle Suite **816/816** in **beiden** Speichermodi;
+* Manifest **352 → 353**, `build-sdk` neu gebaut, gewertete Szenen: **29 ok, 0 fail, 0 missing (of 29)**;
+* `particleconvex` bleibt in der Liste der ausstehenden Arbeit, bis
+  `ps_convexDiffuseCollisionLaunch` liegt — dann kann sie auf beides geprüft und
+  gewertet werden.
 
 ## P9.14a — `particleconvex`: die Szene, die die beiden letzten Partikel-Konvex-Kernel benennt (kein neuer Kernel)
 

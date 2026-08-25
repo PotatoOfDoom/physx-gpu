@@ -41,7 +41,7 @@
 //
 //   @0                                    float4  centerOfMass
 //   @16                                   uint4   (.x = the packed hull descriptor)
-//   @32                                   float4  (not read by this chain)
+//   @32                                   float4  extents (.w = inner-sphere radius)
 //   @48                                   float4  vertices[nbVerts]
 //   +16*nbVerts                           float4  planes[nbPolygons]      (n.xyz, d)
 //   +16*nbPolygons                        uint    polyDescs[nbPolygons]   (vRef8NbVertsMinIndex)
@@ -93,6 +93,14 @@ static const uint CH_HEADER = 48u;   // float4 + uint4 + float4
 
 public float4 chCenterOfMass(uint64_t hull) { return Ptr<float4>(hull)[0]; }
 public uint chHullDesc(uint64_t hull) { return Ptr<uint>(hull + 16UL)[0]; }
+
+// The EXTENTS float4 that sits between the hull descriptor and the vertices
+// (`convexPtr + sizeof(uint4)` in the .cu, i.e. blob base + 32).  Its .w is the
+// hull's stored inner-sphere radius IN VERTEX SPACE -- the value every GJK/EPA
+// caller scales and hands to EPA as its relative epsilon.  Added in P9.14b, which
+// is the first caller in this port that needs it through this module; the
+// softbody path had open-coded the same read.
+public float4 chExtents(uint64_t hull) { return Ptr<float4>(hull + 32UL)[0]; }
 
 public uint64_t chVertices(uint64_t hull)
 {
