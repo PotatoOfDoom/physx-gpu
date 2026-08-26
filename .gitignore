@@ -10,3 +10,6 @@
 # the repo root was committed by accident in the P5 era and dirtied the tree on
 # every test run since
 Testing/
+
+# __pycache__ from importing the gpuslang tools (e.g. the barrier checker)
+__pycache__/

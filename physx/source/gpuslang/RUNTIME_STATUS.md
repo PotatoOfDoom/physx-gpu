@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **817/817** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **818/818** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **31/31** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (30 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
@@ -1704,6 +1704,155 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.16 — die Barrieren-Regel aus P9.15a wird jetzt geprüft statt geglaubt: ein Prüfer über den ganzen Korpus, der zuerst **acht eigene Fehler** fand
+
+P9.15a hat eine Plattformregel aufgestellt und zwei Verstöße repariert. Was seither
+offen stand, war die Frage, ob es **weitere** gibt — notiert als Aufgabe über drei
+Dateien (`npContactPrePrep`, `solverPGS`, `solverTGS`). Diese Tranche beantwortet
+sie über **alle 460** Shader, und sie tut es mit einem Werkzeug, das bleibt.
+Manifest unverändert **357**, Suite **817 → 818**.
+
+### Die Regel, in einem Satz
+
+Die CUDA aggregiert mit `__ballot_sync`, und das verlangt nur **warp**-uniformen
+Kontrollfluss. Unsere Emulation ist `groupshared` + `GroupMemoryBarrierWithGroupSync()`,
+also `OpControlBarrier` mit Workgroup-Scope, und das verlangt Kontrollfluss, der
+über den **ganzen Block** uniform ist. **Die Emulation verschiebt die
+Synchronisationsdomäne**, und eine Abschrift, die in CUDA richtig ist, kann hier
+undefiniert sein.
+
+### Warum das überhaupt ein statischer Prüfer sein muss
+
+Weil nichts anderes in dieser Verifikationskette den Fehler sehen kann, und das
+ist beweisbar, nicht behauptet:
+
+* **Das Fegen kann es nicht.** Die emittierte Menge ist identisch — welche Bahn
+  schreibt, entscheidet allein der Per-Bahn-Wächter, nicht die Schranke. P9.15a
+  hat genau deshalb zwei Mutanten als **ungetötet** verbucht statt einen Kill zu
+  behaupten.
+* **`spirv-val` kann es nicht.** Die Eigenschaft ist dynamisch.
+* **llvmpipe kann es nicht.** Es erzwingt die Regel nicht. Das ist keine Lizenz.
+
+### Die Risikofläche, gemessen
+
+| | |
+|---|---|
+| Shader | 460 |
+| Einsprungpunkte | 708 |
+| davon Block > 32 | 547 |
+| **davon mit einer erreichbaren Barriere** | **75** |
+
+Nur in diesen 75 reicht warp-uniform nicht mehr. Bei Block 32 **ist** der Block
+ein Warp, und dort ist nur eine bahn-variante Bedingung ein Verstoß. Diese
+Unterscheidung ist der Unterschied zwischen 187 geprüften Stellen und 187
+Fehlalarmen.
+
+### Drei Wege, die Regel zu brechen — also drei Durchgänge
+
+Der erste Durchgang allein findet die anderen beiden **überhaupt nicht**:
+
+1. **Umschließender Geltungsbereich** — die Barriere steht in einem `if`/`for`,
+   dessen Bedingung nicht blockuniform ist. Das ist der P9.15a-Fall.
+2. **Sprung davor** — ein `return`/`continue`/`break` unter einem nicht-uniformen
+   Wächter liegt **vor** der Barriere, also verlassen manche Threads sie vorher.
+   `if (tid >= n) return;` ist die häufigste Form im ganzen Korpus.
+3. **Divergente Aufrufstelle** — die Barriere steht in einer *gerufenen* Funktion,
+   und der **Aufruf** ist divergent. Braucht einen korpusweiten Aufrufgraphen; eine
+   Barriere fünf Rahmen tiefer zählt genauso.
+
+### DER EIGENTLICHE BEFUND: acht Fehler, und alle acht waren meine
+
+Der Prüfer hat den Korpus achtmal für sauber erklärt, bevor er es zu Recht tat.
+Jedes Mal lag es an ihm. Das steht hier vollständig, weil die *stillen* Fehler die
+gefährlichen sind — ein Prüfer, der zu wenig meldet, ist schlimmer als keiner:
+
+| # | Fehler | Wirkung | wie er auffiel |
+|---|---|---|---|
+| 1 | `for (a; b; c)`-Kopf endete an der Rückwärtssuche zum letzten `;` | **still** — jeder Schleifenkopf verstümmelt, alle Schranken unsichtbar | der **bekannte** P9.15a-Fall wurde nicht gefunden |
+| 2 | klammerlose `if (...) return;` sind für einen Klammerstapel unsichtbar | **still** — Durchgang 2 meldete null Treffer | null ist bei dieser Form im Korpus unmöglich |
+| 3 | Zuweisungs-Regex **verbrauchte** das trennende `;` | **still** — jede zweite Zuweisung übersprungen, Taint unterlaufen | eine Demotion, die hätte greifen müssen, griff nicht |
+| 4 | Taint pro **Datei** statt pro Funktion | laut — `i` in jeder Schleife vergiftet, weil eine andere `for (uint i = tid; …)` schreibt | Befundliste voller Rauschen |
+| 5 | `continue`-Filter ließ die Bedingung „die verlassene Schleife umschließt die Barriere" fallen | laut | ein „Treffer" in inneren e0/e1-Schleifen, die vor der Barriere enden |
+| 6 | `==` als Zuweisung geparst | laut — jede verglichene Variable erbte fremden Taint | Taint-Kette zeigte `isNew = = 0u) { …` |
+| 7 | `WorkgroupCount().x` → `.x` wurde ein eigener Bezeichner `x` | laut — Kollision mit einer lokalen Variable `x` | Taint-Kette zeigte `x = max(regionRange[…])` |
+| 8 | `gtid.y` auf `gtid` eingedampft | laut — **jeder Warp-Index im Korpus** las sich als Bahn-Index | `warpIdx = gtid.y` mit dem Kommentar „always 0" daneben |
+
+Zwei Werkzeuge haben das möglich gemacht, und beide sind eingebaut geblieben:
+der Prüfer **nennt den Bezeichner**, der sein Urteil ausgelöst hat, und auf
+Anfrage die ganze **Taint-Kette**. Ein Befund, dessen Ursache man nicht sehen
+kann, ist nicht beurteilbar — man kann ihn nur wegwinken.
+
+### Und die eingebaute Negativkontrolle
+
+Ein Prüfer, der auf dem reparierten Korpus schweigt, hat nichts bewiesen, solange
+niemand gezeigt hat, dass er auf dem kaputten laut wird. Der Prüfer setzt deshalb
+**bei jedem Lauf zuerst den P9.15a-Fehler wieder ein** — die Blockrundung im
+512er-Block zurück auf `& ~31` — und bricht ab, wenn er ihn nicht mehr sieht
+(gemessen: 4 gemeldete Stellen). Ein grüner Lauf heißt damit „wach", nicht bloß
+„still". Verliert der Anker seinen Halt, sagt das Werkzeug ausdrücklich
+*neu verankern, nicht löschen*.
+
+### Das Ergebnis
+
+**Null ungedeckte Verstöße.** Die beiden Stellen, die P9.15a gefunden hat, waren
+die einzigen im ganzen Korpus. Von 187 geprüften Stellen liegen 184 unter der
+Schwelle (warp-uniform bei Block 32), und **drei** tragen einen Waiver — eine
+einzige Stelle in drei Ausprägungen:
+
+`psPrimCollide.slang` ist der interessante Fall, weil der Prüfer dort **recht
+hat und das Urteil trotzdem falsch ist**. `range = endIndex - startIndex` ist
+tatsächlich pro Bahn verschieden — jede Bahn hat ihre eigene Zelle. Aber die
+letzte Zuweisung vor der Schleife ersetzt es durch das **Warp-Maximum**
+(`sRange[lane] = range; Barriere; range = max über 0..31`), und der Dateikopf
+nennt das seit jeher als die Invariante, die Ballot und Barrieren gruppenuniform
+hält. Der Taint des Prüfers ist **flussunabhängig** und behält deshalb das Urteil
+der früheren Zuweisung. Das steht so im Waiver, mit dem Beweis — und mit dem
+Satz, dass ein Waiver, dessen Beweis nicht mehr trägt, **gelöscht** und nicht
+aktualisiert gehört.
+
+### Eine Zeile Shader hat sich geändert
+
+Der Sphere-Zwilling schrieb `(numVerts + 31u) & (~31u)`, seine beiden Geschwister
+`& ~(BLOCK - 1u)`. Beide sind heute gleich, weil `SPHERE_BLOCK` 32 ist. Aber die
+Regel heißt „auf den **Block** runden", nicht „auf 32", und ein späteres
+`SPHERE_WARPS > 1` hätte die `31` **still** falsch gemacht — genau die Sorte
+Fehler, die kein Fegen sieht. Steht jetzt gegen den Block, mit der Begründung
+daneben. Arithmetisch identisch, Suite und Szenen unverändert.
+
+### Verifikation
+
+* Prüfer **grün, 0 ungedeckte Verstöße**, Selbsttest bestanden (4 Stellen bei
+  wieder eingesetztem Fehler);
+* als `gpuslang.barrierUniformity` in `ctest` verdrahtet — die Regel wird damit
+  **erzwungen**, nicht einmalig gemessen; Suite **817 → 818**;
+* Laufzeit 44 s → 10 s, nachdem gemessen statt geraten wurde, wo die Zeit hingeht
+  (eine Konstantentabelle pro Datei statt eines Dateiscans pro Nachschlag);
+* Suite **818/818** in **beiden** Speichermodi;
+* Szenen: **31 ok, 0 fail, 0 missing** — unverändert, wie es bei einer
+  arithmetisch identischen Zeile sein muss.
+
+### Was das über Prüfwerkzeuge sagt
+
+**Alle acht gefundenen Fehler saßen im Messgerät, keiner im Gemessenen.** Der
+Korpus selbst trug null aktive Verstöße; die eine geänderte Shader-Zeile war
+eine latente Gefahr, kein Fehler. Und drei der acht waren **still**: sie haben
+für ihren blinden Bereich zuverlässig „sauber" gemeldet. Das ist die Fehlerklasse, die ein Prüfwerkzeug gefährlich macht,
+denn sie erzeugt genau das Vertrauen, das sie nicht verdient. Der einzige Grund,
+warum sie hier auffielen, war die Eichung am **bekannten** Fall — der Prüfer
+musste erst den Fehler wiederfinden, den P9.15a schon repariert hatte, bevor
+seine Aussage über die anderen 459 Dateien irgendetwas wert war. Deshalb ist
+diese Eichung jetzt als Selbsttest fest eingebaut und läuft bei jedem `ctest`
+mit.
+
+### Was offen bleibt
+
+Der Prüfer ist statisch und heuristisch, und der Eintrag sagt lieber, wo:
+der Taint ist **flussunabhängig** (siehe den Waiver), Warp-Kollektive gelten
+pauschal als warp-uniform (Shuffles ausgenommen), und die Blockgröße eines
+Moduls kennt er nur über seine Aufrufstellen. Was er dagegen sicher leistet,
+ist die Regressionsschranke: eine **neue** divergente Barriere kann nicht mehr
+unbemerkt landen.
 
 ## P9.15e — `paramAlign(80) == 16`: der Absturz aus P9.14d war ein um acht Byte verschobener Writer. Manifest **357**, und **keine Szene verweigert mehr irgendeinen Kernel**
 

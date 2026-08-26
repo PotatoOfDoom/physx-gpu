@@ -652,7 +652,11 @@ void cloth_SphereVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
     const float restDistance = Ptr<float>(gCG.restDistance)[cmIdx];
     const float sphereRadius = rigidShape.scaleY;   // scale.scale.y
 
-    const uint numRequiredThreads = (numVerts + 31u) & (~31u);
+    // Block-rounded -- see BARRIER UNIFORMITY above.  SPHERE_BLOCK is 32 here, so
+    // this happens to equal the CUDA's `& ~31`; spelled against the BLOCK anyway,
+    // because that is the rule.  A later SPHERE_WARPS > 1 would make `31` wrong
+    // silently, and the sweep cannot see a barrier-uniformity fault.
+    const uint numRequiredThreads = (numVerts + (SPHERE_BLOCK - 1u)) & (~(SPHERE_BLOCK - 1u));
 
     for (uint i = tid; i < numRequiredThreads; i += SPHERE_BLOCK)
     {

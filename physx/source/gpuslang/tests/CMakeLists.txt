@@ -2090,3 +2090,21 @@ foreach(spec ${PXG_HLSL_ENTRIES})
         COMMAND ${PXG_SLANGC} ${SHADER_DIR}/${stem}.slang -target hlsl -profile cs_6_0
                 -entry ${entry} -o ${HLSL_CHECK_DIR}/${stem}-${entry}.hlsl)
 endforeach()
+
+# ---------------------------------------------------------------------------
+# Barrier uniformity (P9.16).
+#
+# Our warp-intrinsic emulation is groupshared + GroupMemoryBarrierWithGroupSync,
+# i.e. OpControlBarrier at Workgroup scope, which SPIR-V requires to be reached
+# in control flow uniform across the WHOLE BLOCK -- while the CUDA it replaces
+# only ever needed warp-uniform control flow.  A transcription that is correct
+# in CUDA can therefore be undefined here, and NOTHING ELSE in this suite can
+# see it: the emitted output is identical (the per-lane guard alone decides who
+# writes), spirv-val does not check it (the property is dynamic), and llvmpipe
+# does not enforce it.  So it gets a static check.
+#
+# The script runs its own negative control first -- it re-injects the original
+# P9.15a bug and fails if it can no longer see it -- so a green run means the
+# checker is awake, not merely quiet.
+add_test(NAME gpuslang.barrierUniformity
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_barrier_uniformity.py)

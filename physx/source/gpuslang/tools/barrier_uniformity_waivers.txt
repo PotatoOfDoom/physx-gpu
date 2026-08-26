@@ -1,0 +1,32 @@
+# ===========================================================================
+# Waivers for check_barrier_uniformity.py
+#
+# Format, one per line, four fields separated by `|`:
+#
+#     <shader file> | <pass> | <guard text> | <why it is block-uniform>
+#
+# `pass` is scope, escape or call -- the same word the report prints.  The
+# guard text is matched after whitespace normalisation, so copy it from the
+# report verbatim.
+#
+# A WAIVER IS A CLAIM SOMEBODY CHECKED, NOT A WAY TO SILENCE THE TOOL.  The
+# fourth field must say why the value is the same in every thread that reaches
+# the barrier, in terms someone can re-derive from the shader.  "Looks fine" is
+# not a proof; "the last write before the loop is a warp-max broadcast" is.
+#
+# If a genuinely divergent barrier ever gets a waiver, the tool goes quiet on
+# exactly the bug it exists to find -- so a waiver whose proof no longer holds
+# must be deleted, not updated.
+# ===========================================================================
+
+# --- psPrimCollide.slang ---------------------------------------------------
+# `range` really is per-lane where it is first computed (`endIndex - startIndex`
+# over that lane's own cell), and the checker's taint is FLOW-INSENSITIVE, so it
+# keeps that verdict.  But the last write before the loop replaces it with the
+# WARP MAXIMUM -- `sRange[lane] = range; barrier; range = max over sRange[0..31]`
+# -- so every lane enters the loop with the same bound and runs the same number
+# of iterations.  The file's own header (line 61) names this as the invariant
+# that keeps the per-round ballot and barriers group-uniform.  Deleting the
+# warp-max would make all three sites real.
+psPrimCollide.slang | scope | for (uint ind = 0; ind < range; ++ind) | last write before the loop is the warp-max broadcast of range (sRange[lane] -> max over 0..31), so the trip count is warp-uniform; see the file header, line 61
+psPrimCollide.slang | call  | for (uint ind = 0; ind < range; ++ind) | same warp-max broadcast: ballot32 is reached with the same trip count in every lane
