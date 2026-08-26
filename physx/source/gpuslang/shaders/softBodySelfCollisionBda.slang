@@ -103,6 +103,8 @@
 
 import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu (mTetMeshData@0, mNumVerts@364, ...)
 import pxgSlangTetClosest;     // getNormalized / isValidTet / isPointOutsideOfPlane4 /
+import pxgSlangBv32;   // P9.17b: the BV32 reader AND its index rules, replacing a
+                      // private copy of both that was verbatim identical to it.
                                // closestPtTetrahedron — extracted at P8.8 step 4, when the
                                // cloth-vertex contact generator needed the same four.
 
@@ -119,13 +121,7 @@ static const float PX_MAX_F32 = 3.4028235e38f;
 // PxEncodeSoftBodyIndex (PxgSimulationCoreDesc.h): (softBodyId << 20) | tetId.
 static const uint PXG_BITSHIFT_TET_ID = 20u;
 
-// Gu::BV32DataPacked: 1168 B — mMin[32] float4 @0, mMax[32] float4 @512, mData[32] uint
 // @1024, mNbNodes @1152.
-static const uint64_t BV32_STRIDE = 1168UL;
-static const uint64_t BV32_MMAX_OFFSET = 512UL;
-static const uint64_t BV32_MDATA_OFFSET = 1024UL;
-static const uint64_t BV32_MNBNODES_OFFSET = 1152UL;
-static const uint GU_BV4_CHILD_OFFSET_SHIFT_COUNT = 11u;
 
 // femMidphaseScratch.sBv32Nodes[192] — a 6-deep BV32 tree's worst-case pending set.
 static const uint STACK_SIZE = 192u;
@@ -158,27 +154,6 @@ struct SelfCollisionParams
 }
 
 [[vk::push_constant]] ConstantBuffer<SelfCollisionParams> gSc;
-
-// ---------------------------------------------------------------------------
-// BV32DataPacked field readers (explicit byte offset through Ptr<> — no whole-node copy).
-// ---------------------------------------------------------------------------
-uint64_t bvNodeBase(uint64_t treeAddr, uint nodeIdx) { return treeAddr + uint64_t(nodeIdx) * BV32_STRIDE; }
-float3 bvMin(uint64_t treeAddr, uint nodeIdx, uint k)
-{
-    return Ptr<float4>(bvNodeBase(treeAddr, nodeIdx) + uint64_t(k) * 16UL)[0].xyz;
-}
-float3 bvMax(uint64_t treeAddr, uint nodeIdx, uint k)
-{
-    return Ptr<float4>(bvNodeBase(treeAddr, nodeIdx) + BV32_MMAX_OFFSET + uint64_t(k) * 16UL)[0].xyz;
-}
-uint bvData(uint64_t treeAddr, uint nodeIdx, uint k)
-{
-    return Ptr<uint>(bvNodeBase(treeAddr, nodeIdx) + BV32_MDATA_OFFSET + uint64_t(k) * 4UL)[0];
-}
-uint bvNbNodes(uint64_t treeAddr, uint nodeIdx)
-{
-    return Ptr<uint>(bvNodeBase(treeAddr, nodeIdx) + BV32_MNBNODES_OFFSET)[0];
-}
 
 // A PxU8 array read through the containing 32-bit word.  See the header on `& ~uint64_t(3)`.
 uint byteAt(uint64_t base, uint idx)
@@ -364,15 +339,15 @@ void sb_selfCollisionMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, 
 
         while (hasNode)
         {
-            const uint nodeIdx = currentNodeIndex >> 6u;
+            const uint nodeIdx = bvNodeIdxOf(currentNodeIndex);
 
-            if ((currentNodeIndex & 1u) != 0u)
+            if (bvIsLeaf(currentNodeIndex))
             {
                 // Leaf: the primitive range lives in the PARENT node's mData slot.
-                const uint leafOffset = (currentNodeIndex >> 1u) & 31u;
+                const uint leafOffset = bvLeafSlotOf(currentNodeIndex);
                 const uint data = bvData(treeAddr, nodeIdx, leafOffset);
-                const uint nbPrimitives = (data >> 1u) & 63u;
-                const uint primStartIndex = data >> 7u;
+                const uint nbPrimitives = bvDataNbPrimitives(data);
+                const uint primStartIndex = bvDataPrimStart(data);
                 uint primitiveIndex = 0xffffffffu;
                 if (lane < nbPrimitives)
                     primitiveIndex = lane + primStartIndex;
@@ -489,14 +464,14 @@ void sb_selfCollisionMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, 
                     intersect = dot(dv, dv) < distance * distance;
                 }
 
-                uint currentIndex = (currentNodeIndex & 0xFFFFFFC0u) | (lane << 1u) | 1u;
+                uint currentIndex = bvChildIndex(currentNodeIndex, lane);
                 bool isValidNode = false;
                 if (lane < nbChildren)
                 {
                     const uint data = bvData(treeAddr, nodeIdx, lane);
                     isValidNode = intersect;
-                    if (isValidNode && (data & 1u) == 0u)
-                        currentIndex = (data >> GU_BV4_CHILD_OFFSET_SHIFT_COUNT) << 6u;
+                    if (isValidNode && bvDataIsInternal(data))
+                        currentIndex = bvDataChildNodeIndex(data);
                 }
 
                 const uint mask = scBallot(isValidNode, lane);

@@ -64,19 +64,14 @@ module softBodyClothVertMidphaseBda;
 
 import pxgSlangSoftBodyDesc;
 import pxgSlangFEMClothDesc;
+import pxgSlangBv32;   // P9.17b: the BV32 reader AND its index rules, replacing a
+                      // private copy of both that was verbatim identical to it.
 
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
 static const uint SB_SBMIDPHASE = 1024u;
 static const uint SC_NB_WARPS = SB_SBMIDPHASE * MIDPHASE_WARPS_PER_BLOCK;
 
 static const uint WARP = 32u;
-
-// Gu::BV32DataPacked: 1168 B — mMin[32] @0, mMax[32] @512, mData[32] @1024, mNbNodes @1152.
-static const uint64_t BV32_STRIDE = 1168UL;
-static const uint64_t BV32_MMAX_OFFSET = 512UL;
-static const uint64_t BV32_MDATA_OFFSET = 1024UL;
-static const uint64_t BV32_MNBNODES_OFFSET = 1152UL;
-static const uint GU_BV4_CHILD_OFFSET_SHIFT_COUNT = 11u;
 
 static const uint STACK_SIZE = 192u;
 static const uint GEOM_TETRAHEDRONMESH = 7u;
@@ -123,27 +118,6 @@ struct PxgShape
     uint2 hullOrMeshOffset;
     uint type;
     uint particleOrSoftbodyId;
-}
-
-// ---------------------------------------------------------------------------
-// BV32DataPacked field readers.
-// ---------------------------------------------------------------------------
-uint64_t bvNodeBase(uint64_t treeAddr, uint nodeIdx) { return treeAddr + uint64_t(nodeIdx) * BV32_STRIDE; }
-float3 bvMin(uint64_t treeAddr, uint nodeIdx, uint k)
-{
-    return Ptr<float4>(bvNodeBase(treeAddr, nodeIdx) + uint64_t(k) * 16UL)[0].xyz;
-}
-float3 bvMax(uint64_t treeAddr, uint nodeIdx, uint k)
-{
-    return Ptr<float4>(bvNodeBase(treeAddr, nodeIdx) + BV32_MMAX_OFFSET + uint64_t(k) * 16UL)[0].xyz;
-}
-uint bvData(uint64_t treeAddr, uint nodeIdx, uint k)
-{
-    return Ptr<uint>(bvNodeBase(treeAddr, nodeIdx) + BV32_MDATA_OFFSET + uint64_t(k) * 4UL)[0];
-}
-uint bvNbNodes(uint64_t treeAddr, uint nodeIdx)
-{
-    return Ptr<uint>(bvNodeBase(treeAddr, nodeIdx) + BV32_MNBNODES_OFFSET)[0];
 }
 
 // PxBounds3 (24 B): PxVec3 minimum @0, PxVec3 maximum @12.
@@ -264,14 +238,14 @@ void sb_clothVertMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint
 
         while (hasNode)
         {
-            const uint nodeIdx = currentNodeIndex >> 6u;
+            const uint nodeIdx = bvNodeIdxOf(currentNodeIndex);
 
-            if ((currentNodeIndex & 1u) != 0u)
+            if (bvIsLeaf(currentNodeIndex))
             {
-                const uint leafOffset = (currentNodeIndex >> 1u) & 31u;
+                const uint leafOffset = bvLeafSlotOf(currentNodeIndex);
                 const uint data = bvData(treeAddr, nodeIdx, leafOffset);
-                const uint nbPrimitives = (data >> 1u) & 63u;
-                const uint primStartIndex = data >> 7u;
+                const uint nbPrimitives = bvDataNbPrimitives(data);
+                const uint primStartIndex = bvDataPrimStart(data);
                 uint primitiveIndex = 0xffffffffu;
                 if (lane < nbPrimitives)
                     primitiveIndex = lane + primStartIndex;
@@ -327,14 +301,14 @@ void sb_clothVertMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint
                     intersect = boundsIntersect(qMin, qMax, mn, mx);
                 }
 
-                uint currentIndex = (currentNodeIndex & 0xFFFFFFC0u) | (lane << 1u) | 1u;
+                uint currentIndex = bvChildIndex(currentNodeIndex, lane);
                 bool isValidNode = false;
                 if (lane < nbChildren)
                 {
                     const uint data = bvData(treeAddr, nodeIdx, lane);
                     isValidNode = intersect;
-                    if (isValidNode && (data & 1u) == 0u)
-                        currentIndex = (data >> GU_BV4_CHILD_OFFSET_SHIFT_COUNT) << 6u;
+                    if (isValidNode && bvDataIsInternal(data))
+                        currentIndex = bvDataChildNodeIndex(data);
                 }
 
                 const uint mask = vmBallot(isValidNode, lane);

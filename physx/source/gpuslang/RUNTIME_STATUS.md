@@ -1705,6 +1705,109 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.17b — der Engine-Pfad ist vollständig auf dem Modul (12 von 12, SPIR-V bitgleich), und die Phase-1-Shader bleiben absichtlich draußen
+
+P9.17a hat die acht BV32-Bit-Regeln ins Modul gehoben und die sechs Dateien
+umgestellt, die es ohnehin importierten. Diese Tranche holt die restlichen
+**sechs Phase-2-Shader** — und trifft für die neun Phase-1-Shader eine
+**Entscheidung gegen** die Umstellung, mit einem gemessenen Grund. Manifest
+unverändert **357**, Suite **818/818**.
+
+### Vier von sechs trugen eine wortgleiche private Kopie
+
+Vier der sechs trugen eine **private Kopie** der fünf Konstanten und fünf
+Zugriffe — und das ist nicht ungefähr, sondern nachgerechnet: Funktionsrümpfe
+und Konstantenwerte wurden gegen das Modul verglichen, alle vier **wortgleich**.
+
+Das ist bemerkenswert, weil `pxgSlangBv32` in **P8.25 genau deswegen** angelegt
+wurde: vier Shader trugen damals byte-identische private Kopien, benannt im
+Modulkopf (`pxgSlangClothMidphase`, `softBodyMeshMidphaseBda`,
+`femClothMeshMidphaseBda`, `softBodySoftBodyMidphaseBda`). Heute tragen **vier
+ANDERE** Dateien wortgleiche Kopien. Ob sie damals übersehen wurden oder danach
+entstanden sind, lässt die hiesige Historie nicht erkennen — was sie zeigt, ist
+das Ergebnis: eine Extraktion, die niemand erzwingt, lässt die Zahl bei vier.
+
+Die anderen zwei (`femClothDifferentClothBda`, `femClothSelfCollisionBda`)
+brauchten gar nichts: `pxgSlangClothMidphase` schreibt
+`__exported import pxgSlangBv32`, also erreichen sie das Modul transitiv und
+haben die acht neuen Regeln sofort mitbekommen.
+
+### Der Beweis, noch einmal — und diesmal ohne Ausnahme
+
+| | |
+|---|---|
+| Shader mit **bitgleichem** Nicht-Debug-SPIR-V-Strom | **6 von 6** |
+
+P9.17a hatte eine Ausnahme (`psMeshMidphaseBda`, ein zusätzlicher `OpConstant`,
+weil die Datei ihre Shifts ohne `u`-Suffix schrieb). Hier gibt es keine: das
+Löschen von vier privaten Kopien, sechzehn zusätzliche Regelersetzungen in den
+beiden Cloth-Shadern (die je **zwei** Traversierungen haben, VT und EE) und vier
+neue Imports ändern **keine einzige Instruktion**.
+
+### Damit ist der Engine-Pfad fertig
+
+| | |
+|---|---|
+| Phase-2-Shader mit der BV32-Traversierung | 12 |
+| davon auf dem Modul nach P9.17a | 6 |
+| **nach dieser Tranche** | **12** |
+| private Kopien der Zugriffe im Engine-Pfad | **0** |
+
+### UND DIE PHASE-1-SHADER BLEIBEN DRAUSSEN — GEMESSEN, NICHT AUS BEQUEMLICHKEIT
+
+Neun Phase-1-Testshader tragen dieselbe Traversierung. Sie mechanisch
+hinterherzuziehen wäre der naheliegende nächste Schritt und wäre **falsch**.
+
+**Der harte Grund zuerst.** `testPsMeshMidphase.cpp` fährt `psMeshMidphaseBda.spv`
+und `psMeshMid.spv` über dieselben Eingaben und vergleicht die Ausgaben — ein
+GPU-Differential zwischen dem Phase-2-Kernel und seinem Phase-1-Vorgänger. Der
+Phase-2-Shader liegt seit P9.17a auf dem Modul. Würde `psMeshMid` ebenfalls
+umgestellt, verglichen **zwei Shader, die den geprüften Code teilen** — das
+Differential misst dann über die Bit-Regeln nichts mehr. Das ist genau die
+P9.15d-Falle in ihrer reinen Form (dort machte ein geteiltes Modul unter zwei
+FMA-Politiken aus einem Glue-Differential eine Messung des Kerns).
+
+Nachgesehen, ob das nur diesen einen betrifft: von den neun ist **`psMeshMid`
+der einzige**, den ein Test zusammen mit einem `*Bda`-Shader lädt. Die übrigen
+acht werden ausschließlich gegen **C++-Host-Referenzen** geprüft.
+
+**Der zweite Grund gilt trotzdem für alle acht.** Der Wert des Phase-1-Korpus
+ist, dass er **unabhängige Abschriften** derselben CUDA enthält. Neun
+Transkriptionen, die miteinander übereinstimmen, sind ein Beleg dafür, dass die
+Bit-Regeln richtig gelesen wurden; eine gemeinsame Kopie ist keiner. Die
+Umstellung würde neun Zeugen gegen einen eintauschen — für einen
+Wartungsvorteil an Dateien, die niemand mehr anfasst, weil Phase 1 geschlossen
+ist.
+
+**Und die Duplikation, die etwas kostet, ist beseitigt.** Sie kostete etwas im
+lebenden Engine-Pfad, wo Kernel geschrieben, geändert und gefegt werden. Dort
+steht sie jetzt auf null. Im geschlossenen Referenzkorpus ist dieselbe
+Wiederholung kein Schuldposten, sondern der Zweck.
+
+### Verifikation
+
+* SPIR-V: **6 von 6** bitgleich im Nicht-Debug-Strom;
+* Suite **818/818** in **beiden** Speichermodi;
+* Szenen: **LÄUFT NOCH** — Ergebnis im Folge-Commit, statt hier eine ungemessene
+  Zahl zu behaupten. Hier ist die Erwartung sogar schärfer als in P9.17a, weil
+  **alle sechs** Shader bitgleich sind: die Engine bekommt dieselben Binärdateien
+  wie vorher. Der Lauf steht trotzdem im Protokoll, weil er in P9.15e gefunden
+  hat, was zwei grüne Vorrichtungen nicht finden konnten;
+* Modul-Fegen **nicht wiederholt** — die neun Regel-Mutanten wurden in P9.17a
+  zwangsfrisch gegen `femClothSimTriMidphase` getötet (9 von 9), und genau
+  darum ging es beim Heben: die Regeln sind **einmal** geprüft, nicht je
+  Aufrufer;
+* Manifest unverändert **357**.
+
+### Was offen bleibt
+
+Nichts an dieser Aufgabe. Die Aufgabe „hebe die BV32-Traversierung" ist
+abgeschlossen, aber nicht so, wie sie formuliert war: die Traversierung wurde
+**nicht** gehoben (Blatt-Zweige mit 0,27 Ähnlichkeit gehören ihren Aufrufern),
+das **Format** wurde gehoben, der Engine-Pfad ist vollständig darauf, und der
+Referenzkorpus bleibt bewusst unabhängig. Die drei Sätze zusammen sind die
+Antwort; die ursprüngliche Aufgabenbeschreibung war in allen dreien falsch.
+
 ## P9.17a — die BV32-Regeln werden gehoben, die Traversierung NICHT: was 21 Abschriften wirklich teilen, gemessen statt vermutet — und ein Refactor, dessen SPIR-V bitgleich bleibt
 
 Die offene Aufgabe hieß „hebe die BV32-Traversierungsschleife in ein Modul,

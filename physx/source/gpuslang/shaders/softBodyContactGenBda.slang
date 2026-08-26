@@ -95,6 +95,8 @@
 import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu (mTetMeshData@0, mTetIndices@16, ...)
 import pxgSlangGjk;          // GjkCloud / GjkOut
 import pxgSlangTetCollide;   // tetPrimitivesCollide2, computeInnerSphere
+import pxgSlangBv32;   // P9.17b: the BV32 reader AND its index rules, replacing a
+                      // private copy of both that was verbatim identical to it.
 
 // PxgNpKernelIndices.h:32 — the engine's warps-per-block for every midphase launch.
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
@@ -103,13 +105,7 @@ static const uint WARP = 32u;
 // PxGeometryType::eTETRAHEDRONMESH (PxGeometry.h:57) — 8th enumerator, zero-based.
 static const uint GEOM_TETRAHEDRONMESH = 7u;
 
-// Gu::BV32DataPacked: 1168 B — mMin[32] float4 @0, mMax[32] float4 @512, mData[32] uint
 // @1024, mNbNodes @1152.
-static const uint64_t BV32_STRIDE = 1168UL;
-static const uint64_t BV32_MMAX_OFFSET = 512UL;
-static const uint64_t BV32_MDATA_OFFSET = 1024UL;
-static const uint64_t BV32_MNBNODES_OFFSET = 1152UL;
-static const uint GU_BV4_CHILD_OFFSET_SHIFT_COUNT = 11u;
 
 // femMidphaseScratch.sBv32Nodes[192] — a 6-deep BV32 tree's worst-case pending set.
 static const uint STACK_SIZE = 192u;
@@ -167,23 +163,6 @@ ConstantBuffer<SbMidphaseParams> gMid;
 // BV32DataPacked field readers — explicit byte offsets through Ptr<>, no whole-node copy.
 // treeAddr = mTetMeshData + sizeof(uint4).
 // ---------------------------------------------------------------------------
-uint64_t bvNodeBase(uint64_t treeAddr, uint nodeIdx) { return treeAddr + uint64_t(nodeIdx) * BV32_STRIDE; }
-float3 bvMin(uint64_t treeAddr, uint nodeIdx, uint k)
-{
-    return Ptr<float4>(bvNodeBase(treeAddr, nodeIdx) + uint64_t(k) * 16UL)[0].xyz;
-}
-float3 bvMax(uint64_t treeAddr, uint nodeIdx, uint k)
-{
-    return Ptr<float4>(bvNodeBase(treeAddr, nodeIdx) + BV32_MMAX_OFFSET + uint64_t(k) * 16UL)[0].xyz;
-}
-uint bvData(uint64_t treeAddr, uint nodeIdx, uint k)
-{
-    return Ptr<uint>(bvNodeBase(treeAddr, nodeIdx) + BV32_MDATA_OFFSET + uint64_t(k) * 4UL)[0];
-}
-uint bvNbNodes(uint64_t treeAddr, uint nodeIdx)
-{
-    return Ptr<uint>(bvNodeBase(treeAddr, nodeIdx) + BV32_MNBNODES_OFFSET)[0];
-}
 
 // isValidTet (cudaNpCommon.h): strictly positive signed volume.
 bool isValidTet(float3 v0, float3 v1, float3 v2, float3 v3)
@@ -298,15 +277,15 @@ void sb_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
 
     while (hasNode)
     {
-        const uint nodeIdx = currentNodeIndex >> 6u;
+        const uint nodeIdx = bvNodeIdxOf(currentNodeIndex);
 
-        if ((currentNodeIndex & 1u) != 0u)
+        if (bvIsLeaf(currentNodeIndex))
         {
             // Leaf: the primitive range lives in the PARENT node's mData slot.
-            const uint leafOffset = (currentNodeIndex >> 1u) & 31u;
+            const uint leafOffset = bvLeafSlotOf(currentNodeIndex);
             const uint data = bvData(treeAddr, nodeIdx, leafOffset);
-            const uint nbPrimitives = (data >> 1u) & 63u;
-            const uint primStartIndex = data >> 7u;
+            const uint nbPrimitives = bvDataNbPrimitives(data);
+            const uint primStartIndex = bvDataPrimStart(data);
             uint primitiveIndex = 0xffffffffu;
             if (lane < nbPrimitives)
                 primitiveIndex = lane + primStartIndex;
@@ -368,14 +347,14 @@ void sb_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
             if (hasBox)
                 intersect = boundsIntersect(boxMin, boxMax, mn, mx);
 
-            uint currentIndex = (currentNodeIndex & 0xFFFFFFC0u) | (lane << 1u) | 1u;
+            uint currentIndex = bvChildIndex(currentNodeIndex, lane);
             bool isValidNode = false;
             if (lane < nbChildren)
             {
                 const uint data = bvData(treeAddr, nodeIdx, lane);
                 isValidNode = intersect;
-                if (isValidNode && (data & 1u) == 0u)
-                    currentIndex = (data >> GU_BV4_CHILD_OFFSET_SHIFT_COUNT) << 6u;
+                if (isValidNode && bvDataIsInternal(data))
+                    currentIndex = bvDataChildNodeIndex(data);
             }
 
             const uint mask = ballotGroup(isValidNode, lane);
@@ -397,7 +376,6 @@ void sb_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
     }
     }
 }
-
 
 // ===========================================================================
 // P8.2 tranche b — sb_primitiveContactGenLaunch (softbodyPrimitives.cu:573, launch
