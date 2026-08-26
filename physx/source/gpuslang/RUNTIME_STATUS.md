@@ -1831,14 +1831,15 @@ Danach: **9 von 9 getötet, 0 überlebt**, aus einer einzigen Vorrichtung.
 * SPIR-V-Vergleich oben: 5 von 6 bitgleich, der sechste um eine Konstante;
 * Fegen **9 von 9**, zwangsfrisch, nach dem Nachschärfen der Vorrichtung;
 * Suite **818/818** in **beiden** Speichermodi;
-* Szenen: **LÄUFT NOCH** — das Ergebnis wird in einem Folge-Commit nachgetragen,
-  statt hier eine Zahl zu behaupten, die noch niemand gemessen hat. Erwartet wird
-  „unverändert", und der Grund steht oben: der Nicht-Debug-SPIR-V-Strom von fünf
-  der sechs Shader ist bitgleich und der sechste unterscheidet sich um einen
-  Eintrag in der Konstantentabelle. Das ist ein **stärkerer** Beleg als ein
-  Szenenlauf — aber es ersetzt ihn nicht, weil genau diese Art von Schluss in
-  P9.15e schon einmal falsch war (dort hat die Engine gefunden, was zwei
-  Vorrichtungen nicht finden konnten);
+* Szenen: **31 ok, 0 fail, 0 missing** — nachgetragen, nachdem der Lauf durch
+  war. Der Eintrag stand hier bis dahin ausdrücklich auf „läuft noch", statt eine
+  Zahl zu behaupten, die noch niemand gemessen hatte. Erwartet war „unverändert",
+  und der Grund stand oben: fünf der sechs Shader sind im Nicht-Debug-SPIR-V
+  bitgleich, der sechste unterscheidet sich um einen Eintrag in der
+  Konstantentabelle. Das ist ein **stärkerer** Beleg als ein Szenenlauf — er
+  ersetzt ihn aber nicht, weil genau diese Art von Schluss in P9.15e schon einmal
+  falsch war: dort waren ein Unit-Test UND ein GPU-Differential grün, und die
+  Engine hat den Fehler trotzdem in unter einer Minute gefunden;
 * Manifest unverändert **357** — diese Tranche schreibt keinen Kernel.
 
 ### Was das über „offensichtliche" Duplikation sagt
