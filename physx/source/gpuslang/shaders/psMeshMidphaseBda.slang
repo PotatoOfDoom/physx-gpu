@@ -568,15 +568,15 @@ void ps_meshCollisonLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
 
             while (hasNode)
             {
-                const uint nodeIdx = currentNodeIndex >> 6;
+                const uint nodeIdx = bvNodeIdxOf(currentNodeIndex);
 
-                if ((currentNodeIndex & 1u) != 0u)
+                if (bvIsLeaf(currentNodeIndex))
                 {
                     // ---- leaf: intersectPrimitiveFullWarp ----
-                    const uint leafOffset = (currentNodeIndex >> 1) & 31u;
+                    const uint leafOffset = bvLeafSlotOf(currentNodeIndex);
                     const uint data = bvData(treeAddr, nodeIdx, leafOffset);
-                    const uint nbPrimitives = (data >> 1) & 63u;
-                    const uint primStartIndex = data >> 7;
+                    const uint nbPrimitives = bvDataNbPrimitives(data);
+                    const uint primStartIndex = bvDataPrimStart(data);
                     uint primitiveIndex = 0xffffffffu;
                     // One lane per primitive: the six-bit field can say 63 and the
                     // traversal silently drops the rest.  `lane <` IS that clamp.
@@ -731,15 +731,15 @@ void ps_meshCollisonLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
                         }
                     }
 
-                    uint currentIndex = (currentNodeIndex & 0xFFFFFFC0u) | (lane << 1) | 1u;
+                    uint currentIndex = bvChildIndex(currentNodeIndex, lane);
 
                     bool isValidNode = false;
                     if (lane < nbChildren)
                     {
                         const uint data = bvData(treeAddr, nodeIdx, lane);
                         isValidNode = intersect;
-                        if (isValidNode && (data & 1u) == 0u)
-                            currentIndex = (data >> GU_BV4_CHILD_OFFSET_SHIFT_COUNT) << 6;
+                        if (isValidNode && bvDataIsInternal(data))
+                            currentIndex = bvDataChildNodeIndex(data);
                     }
 
                     const uint resultWarp = ballot32(isValidNode, lane);

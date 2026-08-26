@@ -394,14 +394,14 @@ void cloth_meshMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 
 
         while (hasNode)
         {
-            const uint nodeIdx = currentNodeIndex >> 6u;
+            const uint nodeIdx = bvNodeIdxOf(currentNodeIndex);
 
-            if ((currentNodeIndex & 1u) != 0u)
+            if (bvIsLeaf(currentNodeIndex))
             {
-                const uint leafOffset = (currentNodeIndex >> 1u) & 31u;
+                const uint leafOffset = bvLeafSlotOf(currentNodeIndex);
                 const uint data = bvData(treeAddr, nodeIdx, leafOffset);
-                const uint nbPrimitives = (data >> 1u) & 63u;
-                const uint primStartIndex = data >> 7u;
+                const uint nbPrimitives = bvDataNbPrimitives(data);
+                const uint primStartIndex = bvDataPrimStart(data);
                 uint primitiveIndex = 0xffffffffu;
                 if (lane < nbPrimitives)
                     primitiveIndex = lane + primStartIndex;
@@ -449,14 +449,14 @@ void cloth_meshMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 
                                   mn.y > tMax.y || tMin.y > mx.y ||
                                   mn.z > tMax.z || tMin.z > mx.z);
 
-                uint currentIndex = (currentNodeIndex & 0xFFFFFFC0u) | (lane << 1u) | 1u;
+                uint currentIndex = bvChildIndex(currentNodeIndex, lane);
                 bool isValidNode = false;
                 if (lane < nbChildren)
                 {
                     const uint data = bvData(treeAddr, nodeIdx, lane);
                     isValidNode = intersect;
-                    if (isValidNode && (data & 1u) == 0u)
-                        currentIndex = (data >> GU_BV4_CHILD_OFFSET_SHIFT_COUNT) << 6u;
+                    if (isValidNode && bvDataIsInternal(data))
+                        currentIndex = bvDataChildNodeIndex(data);
                 }
 
                 const uint mask = cmBallot(isValidNode, lane);

@@ -3187,10 +3187,21 @@ PXG_TEST(femClothSimTriMidphase)
     // in `(data >> 1) & 63`, and with at most four primitives per leaf bit five is
     // never set, so `& 31` was indistinguishable.  Thirty-two is the largest count
     // a leaf can carry (one lane each) and the smallest that sets bit five.
+    //
+    // Triangle 51 is the HIGH-SLOT triangle, and it exists for the CHILD SLOT, not
+    // for its geometry.  A leaf's slot lives in `(currentNodeIndex >> 1) & 31` -- five
+    // bits, because a BV32 node has thirty-two children -- and this tree's root had
+    // six, so slots never passed 5 and `& 15` was indistinguishable from `& 31`.  The
+    // P9.17a module sweep lost `bv3-leafslot-mask-15` to exactly that.  This triangle
+    // hangs off root child SEVENTEEN, and seventeen masked to four bits is ONE, which
+    // is the LYING child -- so a four-bit mask does not merely mis-index, it reads the
+    // liar's primitives (3..5, all overlapping) instead of this one.
     const uint32_t NB_STRIP = 18u;
     const uint32_t BAND_TRI = 18u;
     const uint32_t BIG_FIRST = 19u, BIG_COUNT = 32u;
-    const uint32_t NB_TRIS = BIG_FIRST + BIG_COUNT;      // 51
+    const uint32_t HIGH_TRI = BIG_FIRST + BIG_COUNT;     // 51
+    const uint32_t HIGH_SLOT = 17u;                      // >= 16, and 17 & 15 == 1
+    const uint32_t NB_TRIS = HIGH_TRI + 1u;              // 52
     std::vector<F4> cverts;
     std::vector<Tri4> ctris;
     auto addTri = [&](float x0, float x1) {
@@ -3204,6 +3215,7 @@ PXG_TEST(femClothSimTriMidphase)
     addTri(8.15f, 8.35f);                                 // 18: the band triangle
     for (uint32_t k = 0; k < BIG_COUNT; ++k)              // 19..50: the big leaf
     { const float x = 1.0f + 0.25f * float(k); addTri(x, x + 0.2f); }
+    addTri(4.6f, 4.8f);                                   // 51: the high-slot triangle
     // .w is NOT part of the triangle (M1): point it at a vertex far outside every
     // strip, so a port that folds it into the bound picks up 40 units of slack.
     cverts.push_back(F4{ 0.0f, 40.0f, 0.0f, 1.0f });
@@ -3244,6 +3256,12 @@ PXG_TEST(femClothSimTriMidphase)
                           true,  BAND_TRI,  1u,        0u },  // 4: the band triangle
         { FAR_BOX,        true,  14u,       1u,        0u },  // 5: honest miss
     };
+    // Children 6..16 pad the root out so the high-slot leaf lands at slot 17.  They
+    // are honest misses on triangle 14 (x in [14, 14.5], far right of the fattened
+    // box), so they add nothing to the expected set and cannot perturb the lie count.
+    while (root.size() < HIGH_SLOT)
+        root.push_back({ FAR_BOX, true, 14u, 1u, 0u });
+    root.push_back({ hull(HIGH_TRI, HIGH_TRI + 1u), true, HIGH_TRI, 1u, 0u });   // 17
     // node 1: 3 leaves under the internal child, covering prims 6..9.
     std::vector<Child> n1 = {
         { hull(6u, 8u),  true, 6u, 2u, 0u },
@@ -3297,6 +3315,23 @@ PXG_TEST(femClothSimTriMidphase)
                       int(inFat), int(inRaw));
         PXG_CHECK_MSG(std::find(want.begin(), want.end(), BAND_TRI) != want.end(),
                       "the band triangle is not in the expected set");
+    }
+    // The high-slot leaf must sit at a slot with bit four set AND be reached, or the
+    // five-bit slot mask is unprobed however a mutant spells it.
+    {
+        PXG_CHECK_MSG(root.size() == HIGH_SLOT + 1u && HIGH_SLOT >= 16u,
+                      "the high-slot leaf must be at a slot >= 16 (root has %u children, "
+                      "slot %u) -- below that, a four-bit mask is indistinguishable",
+                      uint32_t(root.size()), HIGH_SLOT);
+        PXG_CHECK_MSG(meets(root[HIGH_SLOT].box),
+                      "the high-slot leaf is not reached, so its slot index is never decoded");
+        PXG_CHECK_MSG(std::find(want.begin(), want.end(), HIGH_TRI) != want.end(),
+                      "the high-slot triangle is not in the expected set");
+        // and the slot it would be MISREAD as must say something different
+        PXG_CHECK_MSG(root[HIGH_SLOT & 15u].primStart != root[HIGH_SLOT].primStart,
+                      "slot %u masked to four bits is %u, and both name primStart %u -- "
+                      "the mask would be unobservable", HIGH_SLOT, HIGH_SLOT & 15u,
+                      root[HIGH_SLOT].primStart);
     }
     PXG_CHECK_MSG(BIG_COUNT == 32u,
                   "the big leaf carries %u primitives, not 32 -- bit five of `(data >> 1) & 63` "

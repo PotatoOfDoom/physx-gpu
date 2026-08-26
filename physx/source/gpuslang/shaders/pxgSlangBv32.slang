@@ -82,3 +82,73 @@ public uint bvNbNodes(uint64_t treeAddr, uint nodeIdx)
 {
     return Ptr<uint>(bvNodeBase(treeAddr, nodeIdx) + BV32_MNBNODES_OFFSET)[0];
 }
+
+// ===========================================================================
+// THE INDEX ENCODING (P9.17a) — bv32Traversal.cuh's `currentNodeIndex`.
+//
+// The accessors above read the node's MEMORY.  These eight rules decode its
+// INDICES, and they are where the format's subtlety actually lives: a packed
+// node index carries three different things in one uint, and `mData` carries
+// three more in another.  Getting one shift wrong yields a tree walk that
+// still terminates and still emits plausible pairs.
+//
+//   currentNodeIndex:  bit0     = this is a LEAF slot
+//                      bits 1-5 = which of the 32 child slots (leaves only)
+//                      bits 6+  = the node index in the packed array
+//
+//   mData:             bit0     = the child is a LEAF
+//                      bits 1-6 = nbPrimitives (6 bits, so up to 63)
+//                      bits 7+  = primStartIndex
+//                      internal child's node offset = mData >> 11, then << 6
+//                      to become a node index again
+//
+// MEASURED, NOT ASSUMED (P9.17a): all eight rules appeared, spelled the same
+// way, in all TWENTY-ONE shaders in this corpus that walk a BV32 tree.  The
+// traversal LOOP around them is not shared and should not be — the leaf
+// predicates of those twenty-one measure at 0.27 median similarity, because
+// each one asks a different question of a different primitive.  What is shared
+// is only the format decode, and that is what lives here.
+//
+// `bvDataNbPrimitives` returns the RAW six-bit field, deliberately.  The
+// traversal maps ONE LANE PER PRIMITIVE, so a consumer that guards with
+// `lane < nbPrimitives` needs no clamp at all — for lane <= 31 the guard is
+// identical with or without one.  A consumer that instead uses it as a LOOP
+// BOUND must clamp to 32 bug-for-bug, or it emits primitives CUDA never
+// emitted.  That is a property of the caller's lane mapping, not of the node
+// format, which is why the clamp is not applied here.
+// ===========================================================================
+
+// --- currentNodeIndex ---
+[ForceInline]
+public uint bvNodeIdxOf(uint nodeIndex) { return nodeIndex >> 6u; }
+[ForceInline]
+public bool bvIsLeaf(uint nodeIndex) { return (nodeIndex & 1u) != 0u; }
+[ForceInline]
+public uint bvLeafSlotOf(uint nodeIndex) { return (nodeIndex >> 1u) & 31u; }
+
+// The child's own packed index: same node, slot k, marked as a leaf.  The
+// traversal overwrites it with bvDataChildNodeIndex when mData says the child
+// is internal, so this is the LEAF spelling and the default.
+[ForceInline]
+public uint bvChildIndex(uint nodeIndex, uint k)
+{
+    return (nodeIndex & 0xFFFFFFC0u) | (k << 1u) | 1u;
+}
+
+// --- mData ---
+[ForceInline]
+// Spelled in the NEGATIVE sense on purpose: all twenty-one traversals ask "is
+// this child internal", never "is it a leaf", and `!bvDataIsLeaf(...)` compiles
+// to OpINotEqual + OpLogicalNot where this compiles to a single OpIEqual --
+// one wasted instruction in the innermost loop of a tree walk, and it costs the
+// proof that this refactor changes no code.  Bit 0 still MEANS isLeaf.
+public bool bvDataIsInternal(uint data) { return (data & 1u) == 0u; }
+[ForceInline]
+public uint bvDataNbPrimitives(uint data) { return (data >> 1u) & 63u; }
+[ForceInline]
+public uint bvDataPrimStart(uint data) { return data >> 7u; }
+[ForceInline]
+public uint bvDataChildNodeIndex(uint data)
+{
+    return (data >> GU_BV4_CHILD_OFFSET_SHIFT_COUNT) << 6u;
+}

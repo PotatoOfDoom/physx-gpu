@@ -1705,6 +1705,165 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.17a — die BV32-Regeln werden gehoben, die Traversierung NICHT: was 21 Abschriften wirklich teilen, gemessen statt vermutet — und ein Refactor, dessen SPIR-V bitgleich bleibt
+
+Die offene Aufgabe hieß „hebe die BV32-Traversierungsschleife in ein Modul,
+sieben Abschriften und es werden mehr". Diese Tranche beantwortet sie und
+**widerlegt dabei ihre eigene Prämisse**. Manifest unverändert **357**, Suite
+**818/818**.
+
+### Erstens: es sind nicht sieben
+
+| | |
+|---|---|
+| Phase-2-Engine-Shader mit der Traversierung | 12 |
+| Phase-1-Testshader mit derselben Schleife | 9 |
+| **gesamt** | **21** |
+
+### Zweitens, und das ist der Punkt: sie sind einander gar nicht ähnlich
+
+Bevor ich ein Modul entwerfe, das zwölf gelandete und gefegte Engine-Shader
+gleichzeitig anfasst, habe ich gemessen, wie identisch die Abschriften
+tatsächlich sind. Sie sind es nicht:
+
+| | |
+|---|---|
+| paarweise Ähnlichkeit der Schleifenkörper (Median) | **0,35** |
+| Zeilen, die in **allen 21** vorkommen | **7** |
+
+Das sind keine 21 Kopien einer Schleife. Es sind Cluster von Beinahe-Zwillingen
+(0,94 zwischen `softBodyClothMidphaseBda` und `softBodyMeshMidphaseBda`, 0,91
+zwischen `femClothDifferentClothBda` und `femClothSelfCollisionBda`) um ein
+dünnes gemeinsames Gerüst. **Meine eigene Vermutung — „identisch bis auf zwei
+Einschubpunkte" — war falsch**, und ein generisches Traversierungsmodul wäre die
+falsche Abstraktion gewesen.
+
+Aufgeteilt zeigt sich, warum:
+
+| Teil der Schleife | Median-Ähnlichkeit | was das heißt |
+|---|---|---|
+| **Blatt-Zweig** | **0,27** | das Per-Primitiv-Prädikat. Es SOLL verschieden sein — jede Traversierung stellt eine andere Frage an ein anderes Primitiv. |
+| Knoten-Zweig | 0,54 | gemischt: der Box-Test ist die Abfrage und gehört dem Aufrufer, der Rest nicht. |
+| Stapel-Ende | 0,88 | fast gleich, aber es hängt an einem `groupshared`-Feld, das jede Datei anders benennt. |
+
+### Was tatsächlich geteilt ist: das Format, nicht die Abfrage
+
+Was in allen 21 Dateien **wortgleich** dasteht, sind acht Bit-Regeln — und das
+ist mechanisch geprüft, nicht überflogen: jede der sieben gesuchten
+Regel-Formen kam in **21 von 21** Dateien vor.
+
+```
+currentNodeIndex:  bit0     = Blatt-Slot
+                   bits 1-5 = welches der 32 Kinder
+                   bits 6+  = Knotenindex im gepackten Feld
+mData:             bit0     = Kind ist ein Blatt
+                   bits 1-6 = nbPrimitives
+                   bits 7+  = primStartIndex
+                   internes Kind: mData >> 11, dann << 6
+```
+
+Genau das ist die subtilste Stelle des Formats: drei Dinge in einem `uint`, und
+ein falscher Shift liefert eine Traversierung, die **trotzdem terminiert und
+trotzdem plausible Paare emittiert**. Es steht jetzt einmal in
+`pxgSlangBv32.slang`, neben den Speicher-Zugriffen, die dort seit P8.25 liegen.
+Die Schleife, der Blatt-Test und die Stapel-Politik bleiben, wo sie sind.
+
+Diese Tranche stellt die **sechs Dateien um, die das Modul ohnehin schon
+importieren** — kein einziger neuer Import, also das risikoärmste mögliche
+erste Stück. Acht Ersetzungen je Datei, je genau eine, keine Reste.
+
+### DER BEWEIS: die SPIR-V ändert sich nicht
+
+Ein Refactor, dessen ganzer Anspruch „keine Verhaltensänderung" ist, kann das
+belegen statt behaupten. Alte und neue SPIR-V, Instruktion für Instruktion:
+
+| | |
+|---|---|
+| Shader mit **bitgleichem** Nicht-Debug-Code-Strom | **5 von 6** |
+| `psMeshMidphaseBda` | ein einziger zusätzlicher `OpConstant` |
+
+Bei `psMeshMidphaseBda` ist der **einzige** Opcode-Unterschied im ganzen Modul
+diese eine Konstante: die Datei schrieb ihre Shifts mit vorzeichenbehafteten
+Literalen (`>> 6` statt `>> 6u`), also entsteht ein unsigned `6u` in der
+Konstantentabelle. Jede Schiebe-, Bit- und Vergleichsoperation ist zahlengleich
+(`OpShiftRightLogical` 5→5, `OpShiftLeftLogical` 6→6, `OpIEqual` 14→14,
+`OpINotEqual` 13→13, …).
+
+**Zwei Dinge mussten dafür getan werden, und beide sind eigene kleine Befunde:**
+
+* **Slang inlinet diese Funktionen nicht von selbst.** Der erste Versuch erzeugte
+  acht echte `OpFunction` mit acht `OpFunctionCall` — in der innersten Schleife
+  einer Baumtraversierung, pro Shader. `[ForceInline]` behebt das; ohne die
+  SPIR-V-Messung wäre es unbemerkt gelandet.
+* **`!bvDataIsLeaf(data)` ist eine Instruktion teurer als `bvDataIsInternal(data)`.**
+  `¬(x≠0)` übersetzt zu `OpINotEqual` + `OpLogicalNot`, `x=0` zu einem einzelnen
+  `OpIEqual`. Alle 21 Traversierungen fragen ausschließlich die **negative** Form
+  („ist dieses Kind innen"); die positive kam im ganzen Korpus nur in meiner
+  eigenen neuen Funktion vor. Also heißt sie jetzt so, wie gefragt wird.
+
+### Das Fegen — und ein Überlebender, der eine Lücke aufdeckte
+
+Neun Mutanten, einer je Regel plus eine Variante, zwangsfrisch gegen die
+P9.15b-Vorrichtung (die mit dem lügenden Knoten und dem 32-Primitive-Blatt).
+Erster Durchgang: **8 getötet, 1 überlebt.**
+
+`bv3-leafslot-mask-15` — der Blatt-Slot auf vier statt fünf Bit maskiert.
+Diagnose, nicht Entschuldigung: **die Wurzel dieses Baums hatte sechs Kinder**,
+also erreichte kein Slot je 16, und ein Vier-Bit-Feld ist von einem Fünf-Bit-Feld
+nicht zu unterscheiden, solange der Wert unter 16 bleibt. Ein BV32-Knoten trägt
+zweiunddreißig.
+
+Erst nachgesehen, ob es der Korpus woanders abdeckt — **`psMeshMidphase` tötet
+den Mutanten**, `convexTrimeshMidphase` nicht. Die Regel war also verifiziert,
+aber von einer anderen Vorrichtung als der dafür gebauten. Die Lücke ist
+trotzdem geschlossen, weil `femClothSimTriMidphase` die bezeichnete
+Traversierungsvorrichtung ist: der Baum hat jetzt achtzehn Wurzelkinder, und das
+erreichte Blatt sitzt auf **Slot 17** — denn 17 auf vier Bit maskiert ist **1**,
+und Kind 1 ist der **lügende** Knoten. Eine Fehlmaskierung liest damit nicht
+irgendetwas, sondern die Primitive des Lügners (3..5, alle überlappend). Vier
+`PXG_CHECK`s halten das fest, darunter der, dass der fehlgelesene Slot etwas
+**anderes** sagen muss — sonst wäre die Maske unbeobachtbar.
+
+Danach: **9 von 9 getötet, 0 überlebt**, aus einer einzigen Vorrichtung.
+
+### Verifikation
+
+* SPIR-V-Vergleich oben: 5 von 6 bitgleich, der sechste um eine Konstante;
+* Fegen **9 von 9**, zwangsfrisch, nach dem Nachschärfen der Vorrichtung;
+* Suite **818/818** in **beiden** Speichermodi;
+* Szenen: **LÄUFT NOCH** — das Ergebnis wird in einem Folge-Commit nachgetragen,
+  statt hier eine Zahl zu behaupten, die noch niemand gemessen hat. Erwartet wird
+  „unverändert", und der Grund steht oben: der Nicht-Debug-SPIR-V-Strom von fünf
+  der sechs Shader ist bitgleich und der sechste unterscheidet sich um einen
+  Eintrag in der Konstantentabelle. Das ist ein **stärkerer** Beleg als ein
+  Szenenlauf — aber es ersetzt ihn nicht, weil genau diese Art von Schluss in
+  P9.15e schon einmal falsch war (dort hat die Engine gefunden, was zwei
+  Vorrichtungen nicht finden konnten);
+* Manifest unverändert **357** — diese Tranche schreibt keinen Kernel.
+
+### Was das über „offensichtliche" Duplikation sagt
+
+Die Aufgabe stand seit P9.15b in der Liste und ihre Beschreibung war zweimal
+falsch: bei der Zahl (7 statt 21) und, wichtiger, bei der **Form**. Zwanzig
+Dateien, die alle „dieselbe BV32-Traversierung" enthalten, sahen wie zwanzig
+Kopien aus. Gemessen teilen sie 7 Zeilen von 87. Wer sie in ein generisches
+Modul gezwungen hätte, hätte zwölf gefegte Engine-Shader angefasst, um eine
+Ähnlichkeit zu abstrahieren, die es nicht gibt — und den Blatt-Zweig, dessen
+Verschiedenheit der ganze Zweck ist, hinter ein Interface geschoben.
+
+Was geteilt gehört, war die eine Sache, die man beim Überfliegen für Beiwerk
+hält: das Bit-Format. Die Messung hat den Umfang nicht vergrößert, sondern
+**verkleinert** — und dabei präziser gemacht.
+
+### Was offen bleibt
+
+Die restlichen **fünfzehn** Dateien (neun Phase-1-Testshader und sechs
+Phase-2-Shader, die das Modul noch nicht importieren, darunter
+`softBodyClothMidphaseBda` mit seiner privaten Kopie auch der Zugriffe). Der
+Weg dorthin ist jetzt bewiesen und billig: umstellen, SPIR-V vergleichen,
+Suite. Der Modul-Fegedurchgang muss dabei nicht wiederholt werden — die Regeln
+sind einmal geprüft, und genau das war der Zweck.
+
 ## P9.16 — die Barrieren-Regel aus P9.15a wird jetzt geprüft statt geglaubt: ein Prüfer über den ganzen Korpus, der zuerst **acht eigene Fehler** fand
 
 P9.15a hat eine Plattformregel aufgestellt und zwei Verstöße repariert. Was seither
