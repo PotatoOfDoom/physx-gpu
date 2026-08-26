@@ -102,6 +102,7 @@
 
 import pxgSlangFEMClothDesc;   // PxgFEMClothGpu (mPosition_InvMass @16, mNbVerts @316)
 import pxgSlangSphereBox;      // P9.15a: spherebox, lifted out of fcStaticTriCloth
+import pxgSlangBv32;           // P9.15b: the BV32 node reader (P8.25), shared
 
 // PxGeometryType (PxGeometry.h): eSPHERE 0, ePLANE 1, eCAPSULE 2, ... eTRIANGLEMESH 8.
 static const uint GEOM_SPHERE = 0u;
@@ -221,8 +222,36 @@ struct ContactGenParams
     uint _pad156;                   // @156 -> 160
 }
 
+// cloth_midphaseGeneratePairsLaunch (femClothMidPhase.cu:191; launch pack
+// PxgNarrowphaseCore.cpp:1125): { PxU32 numTests, PxReal toleranceLength, cmInputs*,
+// transformCache*, bounds*, contactDistance*, gpuShapes*, femClothes*, stackPtr(PxU8*),
+// midphasePairsNum(PxU32*), PxU32 stackSizeBytes } -> 80-byte blob.
+// (ABI row {4,4,8,8,8,8,8,8,8,8,4}.)
+//
+// NOTE the difference from the SOFTBODY twin's row, kSbMidphasePrimitives
+// { 4,4,8,8,8,8,8,8,4,8,8 }: there stackSizeBytes sits BEFORE the two output
+// pointers, here it comes LAST.  Same eleven arguments, same types, different
+// order -- and reusing the softbody row would put every pointer past it at the
+// wrong offset.
+struct ClothTriMidphaseParams
+{
+    uint numTests;              // @0
+    float toleranceLength;      // @4  (unused; ABI parity)
+    uint64_t cmInputs;          // @8
+    uint64_t transformCache;    // @16 (unused; the AABB comes from bounds)
+    uint64_t bounds;            // @24
+    uint64_t contactDistance;   // @32
+    uint64_t gpuShapes;         // @40
+    uint64_t femClothes;        // @48
+    uint64_t stackPtr;          // @56 output (uint4*)
+    uint64_t midphasePairsNum;  // @64 output (PxU32*)
+    uint stackSizeBytes;        // @72
+    uint _pad76;                // @76 -> 80
+}
+
 [[vk::push_constant]] ConstantBuffer<MidphaseParams> gMid;
 [[vk::push_constant]] ConstantBuffer<ContactGenParams> gCG;
+[[vk::push_constant]] ConstantBuffer<ClothTriMidphaseParams> gTMid;
 
 // ---------------------------------------------------------------------------
 // PxQuat helpers (PxQuat.h, transcribed to keep the rigid-common module out of
@@ -784,5 +813,232 @@ void cloth_boxVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : 
             writeRigidVsDeformableContact(startIndex + threadOffset, contact, normalPen,
                                           float4(0, 0, 0, 1), rigidId, pairInd1, rigidMaterialIndex);
         GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+// ===========================================================================
+// P9.15b -- cloth_midphaseGeneratePairsLaunch
+// gpunarrowphase/src/CUDA/femClothMidPhase.cu:191 (wrapper), :110-186
+// (femClothMidphaseCore) and :64-110 (ClothTreeTraverser), all read in full.
+//
+// Walks the CLOTH's own BV32 tree against ONE rigid's world AABB and pushes the
+// (cmIdx, triangleIndex) pairs whose triangle bound overlaps it.  It is the
+// producer cloth_boxTriangleContactGenLaunch consumes, and the second of the
+// three kernels the `cloth` scene has been naming.
+//
+// ITS TWIN IS ALREADY PORTED.  sb_midphaseGeneratePairsLaunch
+// (softBodyContactGenBda.slang, P8.2) is the same traversal against the same
+// kind of AABB, and this body is composed from that shape rather than derived
+// again from bv32Traversal.cuh.  The BV32 node reader itself is the shared
+// pxgSlangBv32 module (P8.25).  What is NOT yet shared is the traversal LOOP,
+// which now exists in seven transcriptions across this corpus -- filed as its
+// own refactor rather than attempted here.
+//
+// ---------------------------------------------------------------------------
+// WHAT DIFFERS FROM THE SOFTBODY TWIN
+// ---------------------------------------------------------------------------
+// M1 -- TRIANGLES, NOT TETS.  The primitive is `mTriangleVertexIndices[i]`, a
+//     uint4 whose .xyz are the three corners and whose .w is not part of the
+//     triangle.  Three vertices bound it, not four, and reading .w into the
+//     bound is a silent enlargement that only shows when .w indexes a vertex
+//     outside the triangle's own extent.
+//
+// M2 -- NO SURFACE HINT.  The softbody twin skips interior tetrahedra through
+//     mTetMeshSurfaceHint; a cloth has no interior, so every triangle is a
+//     candidate and there is no hint array to read.
+//
+// M3 -- NO VALIDITY TEST.  The softbody twin drops degenerate tets via
+//     isValidTet; the cloth traverser has no equivalent and bounds a degenerate
+//     triangle like any other.
+//
+// M4 -- the tree lives at `mTriMeshData + sizeof(uint4)`.  The 16-byte header
+//     (nbVerts, nbTets, maxDepth, nbBv32TreeNodes) is skipped exactly as the
+//     softbody twin skips its own -- and, like it, none of those four fields is
+//     read by the traversal.
+//
+// M5 -- THE BOX IS THE RIGID'S, FATTENED BY THE PAIR'S SUMMED CONTACT DISTANCE.
+//     `contactDistance[clothCacheRef] + contactDistance[rigidCacheRef]`, then
+//     `aabb.fattenFast(contactDist)` -- min minus, max plus, on all three axes.
+//     The CLOTH's own bound is never read; the cloth side of the test is the
+//     per-triangle bound computed from live vertices.
+//
+// M6 -- `stackSizeBytes` IS THE LAST ARGUMENT, and the stack bound is
+//     `stackSizeBytes / sizeof(uint4)`.  The softbody twin takes the same eleven
+//     arguments in a DIFFERENT order (see ClothTriMidphaseParams).
+//
+// M7 -- THE COUNTER IS NOT CAPPED, THE WRITE IS.  `pushOntoStackFullWarp`
+//     (bv32Traversal.cuh:197) reserves with one atomicAdd per tile and then
+//     drops any slot at or past stackSize.  So midphasePairsNum can exceed the
+//     stack -- that overshoot is how the engine sizes the next frame's stack
+//     (`stackSizeNeededOnDevice`).  Capping the counter would silently shrink it.
+//
+// DEVIATIONS, deliberate, and the same two the softbody twin documents:
+//   - the CUDA caches meshVerts / meshVertsIndices / bv32PackedNodes into
+//     __shared__ behind `if (threadIdx.x == 0)` + __syncwarp.  Every one of them
+//     is read straight through BDA here, so the cache and its barrier are
+//     dropped; they have no observable effect;
+//   - the engine packs MIDPHASE_WARPS_PER_BLOCK warps per block and the bridge
+//     forwards only gridDim, so the block's warps are walked SERIALLY in a
+//     group-uniform loop.  `sub` and its break are group-uniform, so every
+//     barrier below is reached uniformly -- the P9.15a rule, honoured by
+//     construction rather than by luck.
+// ===========================================================================
+
+static const uint TMID_WARPS_PER_BLOCK = 2u;   // MIDPHASE_WARPS_PER_BLOCK
+static const uint TMID_STACK_SIZE = 192u;      // femMidphaseScratch.sBv32Nodes[192]
+
+bool tmidBoundsIntersect(float3 aMin, float3 aMax, float3 bMin, float3 bMax)
+{
+    return !(bMin.x > aMax.x || aMin.x > bMax.x ||
+             bMin.y > aMax.y || aMin.y > bMax.y ||
+             bMin.z > aMax.z || aMin.z > bMax.z);
+}
+
+groupshared int sTmidStack[TMID_STACK_SIZE];   // the to-be-expanded node stack
+groupshared uint sTmidBallot;                  // __ballot_sync mask
+groupshared uint sTmidStart;                   // atomicAdd result broadcast
+
+uint tmidBallot(bool pred, uint lane)
+{
+    if (lane == 0u) sTmidBallot = 0u;
+    GroupMemoryBarrierWithGroupSync();
+    if (pred) InterlockedOr(sTmidBallot, 1u << lane);
+    GroupMemoryBarrierWithGroupSync();
+    return sTmidBallot;
+}
+
+[shader("compute")]
+[numthreads(32, 1, 1)]
+void cloth_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    const uint lane = gtid.x;
+
+    for (uint sub = 0u; sub < TMID_WARPS_PER_BLOCK; ++sub)
+    {
+    GroupMemoryBarrierWithGroupSync();   // the groupshared scratch is reused per sub-warp
+    const uint cmIdx = gid.x * TMID_WARPS_PER_BLOCK + sub;
+    if (cmIdx >= gTMid.numTests)
+        break;
+
+    PxgShape clothShape, rigidShape;
+    uint clothCacheRef, rigidCacheRef;
+    loadClothRigidPair(gTMid.cmInputs, gTMid.gpuShapes, cmIdx,
+                       clothShape, clothCacheRef, rigidShape, rigidCacheRef);
+
+    const uint femClothId = clothShape.particleOrSoftbodyId;
+    Ptr<PxgFEMClothGpu> femClothes = Ptr<PxgFEMClothGpu>(gTMid.femClothes);
+
+    const uint64_t triMeshData = femClothes[femClothId].mTriMeshData;
+    const uint64_t treeAddr = triMeshData + 16UL;   // M4: skip the uint4 header
+
+    Ptr<float4> meshVerts = Ptr<float4>(femClothes[femClothId].mPosition_InvMass);
+    Ptr<uint4> meshVertsIndices = Ptr<uint4>(femClothes[femClothId].mTriangleVertexIndices);
+
+    // M5: the RIGID's world AABB, fattened by the pair's summed contact distance.
+    Ptr<float> bounds = Ptr<float>(gTMid.bounds);
+    const uint rb = rigidCacheRef * 6u;
+    Ptr<float> contactDistance = Ptr<float>(gTMid.contactDistance);
+    const float contactDist = contactDistance[clothCacheRef] + contactDistance[rigidCacheRef];
+    const float3 boxMin = float3(bounds[rb + 0u], bounds[rb + 1u], bounds[rb + 2u]) - contactDist;
+    const float3 boxMax = float3(bounds[rb + 3u], bounds[rb + 4u], bounds[rb + 5u]) + contactDist;
+
+    const uint stackSize = gTMid.stackSizeBytes / 16u;   // M6: / sizeof(uint4)
+
+    uint currentNodeIndex = 0u;   // root
+    bool hasNode = true;
+    uint nbStack = 0u;
+
+    while (hasNode)
+    {
+        const uint nodeIdx = currentNodeIndex >> 6u;
+
+        if ((currentNodeIndex & 1u) != 0u)
+        {
+            // Leaf: the primitive range lives in the PARENT node's mData slot.
+            const uint leafOffset = (currentNodeIndex >> 1u) & 31u;
+            const uint data = bvData(treeAddr, nodeIdx, leafOffset);
+            const uint nbPrimitives = (data >> 1u) & 63u;
+            const uint primStartIndex = data >> 7u;
+            uint primitiveIndex = 0xffffffffu;
+            if (lane < nbPrimitives)
+                primitiveIndex = lane + primStartIndex;
+
+            // ClothTreeTraverser::intersectPrimitiveFullWarp (femClothMidPhase.cu:87).
+            bool intersect = false;
+            if (primitiveIndex != 0xffffffffu)
+            {
+                // M1: three corners, from .xyz.  M2/M3: no hint, no validity test.
+                const uint4 triIdx = meshVertsIndices[primitiveIndex];
+                const float3 w0 = meshVerts[triIdx.x].xyz;
+                const float3 w1 = meshVerts[triIdx.y].xyz;
+                const float3 w2 = meshVerts[triIdx.z].xyz;
+                // triBoundingBox (deformableCollision.cuh) -- pairwise min/max in the
+                // same association order as the .cu.
+                const float3 tMin = min(w0, min(w1, w2));
+                const float3 tMax = max(w0, max(w1, w2));
+                intersect = tmidBoundsIntersect(tMin, tMax, boxMin, boxMax);
+            }
+
+            // M7: pushOntoStackFullWarp -- one atomicAdd per tile, scatter by the
+            // exclusive prefix, DROP anything at or past stackSize.  The counter is
+            // NOT capped; its overshoot is what sizes the next frame's stack.
+            const uint mask = tmidBallot(intersect, lane);
+            const uint offset = countbits(mask & ((1u << lane) - 1u));
+            const uint validCount = countbits(mask);
+            if (lane == 0u)
+            {
+                uint start = 0u;
+                if (validCount > 0u)
+                    InterlockedAdd(Ptr<uint>(gTMid.midphasePairsNum)[0], validCount, start);
+                sTmidStart = start;
+            }
+            GroupMemoryBarrierWithGroupSync();
+            const uint stackIndex = sTmidStart + offset;
+            if (intersect && stackIndex < stackSize)
+                Ptr<uint4>(gTMid.stackPtr)[stackIndex] = uint4(cmIdx, primitiveIndex, 0u, 0u);
+        }
+        else
+        {
+            // Internal node: test the rigid box against each child's bounds.
+            const uint nbChildren = bvNbNodes(treeAddr, nodeIdx);
+            float3 mn = float3(0, 0, 0), mx = float3(0, 0, 0);
+            const bool hasBox = lane < nbChildren;
+            if (hasBox)
+            {
+                mn = bvMin(treeAddr, nodeIdx, lane);
+                mx = bvMax(treeAddr, nodeIdx, lane);
+            }
+            // ClothTreeTraverser::intersectBoxFullWarp: false when the lane has no box.
+            bool intersect = false;
+            if (hasBox)
+                intersect = tmidBoundsIntersect(boxMin, boxMax, mn, mx);
+
+            uint currentIndex = (currentNodeIndex & 0xFFFFFFC0u) | (lane << 1u) | 1u;
+            bool isValidNode = false;
+            if (lane < nbChildren)
+            {
+                const uint data = bvData(treeAddr, nodeIdx, lane);
+                isValidNode = intersect;
+                if (isValidNode && (data & 1u) == 0u)
+                    currentIndex = (data >> GU_BV4_CHILD_OFFSET_SHIFT_COUNT) << 6u;
+            }
+
+            const uint mask = tmidBallot(isValidNode, lane);
+            const uint offset = countbits(mask & ((1u << lane) - 1u));
+            const uint validCount = countbits(mask);
+            if (isValidNode)
+                sTmidStack[nbStack + offset] = int(currentIndex);
+            nbStack += validCount;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+        if (nbStack > 0u)
+        {
+            nbStack -= 1u;
+            currentNodeIndex = uint(sTmidStack[nbStack]);
+        }
+        else
+            hasNode = false;
+    }
     }
 }

@@ -3085,6 +3085,354 @@ PXG_TEST(femClothSimBoxVertContactGenExactGate)
     dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h);
 }
 
+// ---------------------------------------------------------------------------
+// P9.15b -- cloth_midphaseGeneratePairsLaunch.
+//
+// THE ORACLE, AND WHY IT IS NOT A SECOND TRANSCRIPTION.  The traversal walks a
+// BV32 tree, and modelling that walk on the host would be exactly the duplication
+// this port avoids.  It is not needed: the tree is an INPUT, authored here, so the
+// expected pair set follows from the tree's definition applied ONCE --
+//
+//     expected = { i : i lies in a REACHED leaf and triBound(i) meets the box }
+//
+// where "reached" is a property of the node boxes this fixture wrote, evaluated
+// directly rather than by simulating a stack.
+//
+// THE LYING NODE, and why the fixture needs one.  In a real BV32 tree every node
+// box contains its primitives, which makes child culling a pure optimisation:
+// skipping a child can never change the emitted set, because the per-primitive
+// test would have rejected those primitives anyway.  A fixture built only from
+// honest nodes therefore cannot kill a single child-culling mutant.  So one child
+// here is deliberately NON-CONSERVATIVE: its box misses the rigid box while its
+// triangles overlap it.  The kernel must traverse the tree AS GIVEN and emit
+// nothing for it; a port that drops the child test emits three pairs.
+//
+// WHAT THE TREE IS BUILT TO DISCRIMINATE
+//   * TWO LEVELS: the root has an INTERNAL child pointing at node 1, so the
+//     `(data & 1) == 0` branch and the `>> 11 << 6` child-offset decode both run;
+//   * children that hit and children that miss, INTERLEAVED, so the ballot and the
+//     exclusive prefix over the child mask carry a non-trivial pattern;
+//   * leaves with DIFFERENT primitive counts and non-zero, non-contiguous
+//     primStart values, so `(data >> 1) & 63` and `data >> 7` cannot be confused;
+//   * a leaf whose primitives STRADDLE the box, so the per-primitive test is not
+//     all-or-nothing within one tile;
+//   * a stack bound that CUTS the emitted pairs, so M7's contract -- the counter
+//     overshoots, the write is dropped -- is measured in the same run.
+// ---------------------------------------------------------------------------
+struct TriMidPush
+{
+    uint32_t numTests; float toleranceLength;
+    uint64_t cmInputs, transformCache, bounds, contactDistance, gpuShapes, femClothes;
+    uint64_t stackPtr, midphasePairsNum;
+    uint32_t stackSizeBytes, pad76;
+};
+static_assert(sizeof(TriMidPush) == 80, "cloth tri-midphase blob must be 80 bytes");
+static_assert(offsetof(TriMidPush, stackPtr) == 56, "stackPtr @56");
+static_assert(offsetof(TriMidPush, stackSizeBytes) == 72, "stackSizeBytes @72");
+
+namespace tmid
+{
+static const uint32_t NODE_WORDS = 292u;      // sizeof(Gu::BV32DataPacked) / 4
+static const uint32_t HDR_WORDS = 4u;         // the uint4 the kernel skips
+
+// A four-uint triangle-index record.  Declared here rather than reusing TriIdx4,
+// which this file introduces further down, after this test.
+struct Tri4 { uint32_t x, y, z, w; };
+struct Box { float lo[3], hi[3]; };
+struct Child { Box box; bool isLeaf; uint32_t primStart, nbPrims, childNode; };
+
+// One BV32 node's worth of words, written into `w` at node index `k`.
+static void writeNode(std::vector<uint32_t>& w, uint32_t k, const std::vector<Child>& kids)
+{
+    const uint32_t base = HDR_WORDS + k * NODE_WORDS;
+    for (uint32_t j = 0; j < kids.size(); ++j)
+    {
+        for (int c = 0; c < 3; ++c)
+        {
+            w[base + j * 4u + uint32_t(c)]         = f2u(kids[j].box.lo[c]);
+            w[base + 128u + j * 4u + uint32_t(c)]  = f2u(kids[j].box.hi[c]);
+        }
+        w[base + 256u + j] = kids[j].isLeaf
+            ? ((kids[j].primStart << 7) | (kids[j].nbPrims << 1) | 1u)
+            : (kids[j].childNode << 11);          // bit 0 clear == internal
+    }
+    w[base + 288u] = uint32_t(kids.size());       // mNbNodes
+    w[base + 289u] = 1u;                          // mDepth (unread by the traversal)
+}
+} // namespace tmid
+
+PXG_TEST(femClothSimTriMidphase)
+{
+    using namespace tmid;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // The rigid AABB and the contact distances.  Distinct offsets so a port that
+    // reads only one, or the wrong cache ref, lands on a different fattened box.
+    const float contactOffsetCloth = 0.30f, contactOffsetRigid = 0.10f;
+    const float contactDist = contactOffsetCloth + contactOffsetRigid;   // 0.40
+    const float rbLo[3] = { 2.0f, -1.0f, -1.0f };
+    const float rbHi[3] = { 8.0f,  1.0f,  1.0f };
+    const float fatLo[3] = { rbLo[0] - contactDist, rbLo[1] - contactDist, rbLo[2] - contactDist };
+    const float fatHi[3] = { rbHi[0] + contactDist, rbHi[1] + contactDist, rbHi[2] + contactDist };
+
+    // Triangles 0..17: a strip along +x, triangle i spanning x in [i, i+0.5].  With
+    // the fattened box covering x in [1.6, 8.4] the strip STRADDLES both ends.
+    //
+    // Triangle 18 is the BAND triangle: x in [8.15, 8.35], INSIDE the fattened box
+    // and OUTSIDE the raw one [2, 8].  Without it the fattening is unprobed -- the
+    // first sweep lost `m5-box-not-fattened` and `m5-contactdist-rigid-only` to
+    // exactly that, because no triangle sat in the band either spelling opens.
+    //
+    // Triangles 19..50 are a THIRTY-TWO primitive leaf.  A BV32 leaf's count lives
+    // in `(data >> 1) & 63`, and with at most four primitives per leaf bit five is
+    // never set, so `& 31` was indistinguishable.  Thirty-two is the largest count
+    // a leaf can carry (one lane each) and the smallest that sets bit five.
+    const uint32_t NB_STRIP = 18u;
+    const uint32_t BAND_TRI = 18u;
+    const uint32_t BIG_FIRST = 19u, BIG_COUNT = 32u;
+    const uint32_t NB_TRIS = BIG_FIRST + BIG_COUNT;      // 51
+    std::vector<F4> cverts;
+    std::vector<Tri4> ctris;
+    auto addTri = [&](float x0, float x1) {
+        const uint32_t b = uint32_t(cverts.size());
+        cverts.push_back(F4{ x0, 0.0f, 0.0f, 1.0f });
+        cverts.push_back(F4{ x1, 0.0f, 0.0f, 1.0f });
+        cverts.push_back(F4{ 0.5f * (x0 + x1), 0.2f, 0.0f, 1.0f });
+        ctris.push_back(Tri4{ b, b + 1u, b + 2u, 0u });
+    };
+    for (uint32_t i = 0; i < NB_STRIP; ++i) addTri(float(i), float(i) + 0.5f);
+    addTri(8.15f, 8.35f);                                 // 18: the band triangle
+    for (uint32_t k = 0; k < BIG_COUNT; ++k)              // 19..50: the big leaf
+    { const float x = 1.0f + 0.25f * float(k); addTri(x, x + 0.2f); }
+    // .w is NOT part of the triangle (M1): point it at a vertex far outside every
+    // strip, so a port that folds it into the bound picks up 40 units of slack.
+    cverts.push_back(F4{ 0.0f, 40.0f, 0.0f, 1.0f });
+    const uint32_t decoyVert = uint32_t(cverts.size()) - 1u;
+    for (auto& t : ctris) t.w = decoyVert;
+
+    auto triBox = [&](uint32_t i) {
+        Box b; const Tri4& t = ctris[i];
+        const F4 v[3] = { cverts[t.x], cverts[t.y], cverts[t.z] };
+        b.lo[0] = PxMin(v[0].x, PxMin(v[1].x, v[2].x)); b.hi[0] = PxMax(v[0].x, PxMax(v[1].x, v[2].x));
+        b.lo[1] = PxMin(v[0].y, PxMin(v[1].y, v[2].y)); b.hi[1] = PxMax(v[0].y, PxMax(v[1].y, v[2].y));
+        b.lo[2] = PxMin(v[0].z, PxMin(v[1].z, v[2].z)); b.hi[2] = PxMax(v[0].z, PxMax(v[1].z, v[2].z));
+        return b;
+    };
+    auto meets = [&](const Box& b) {
+        return !(b.lo[0] > fatHi[0] || fatLo[0] > b.hi[0] ||
+                 b.lo[1] > fatHi[1] || fatLo[1] > b.hi[1] ||
+                 b.lo[2] > fatHi[2] || fatLo[2] > b.hi[2]);
+    };
+    auto hull = [&](uint32_t from, uint32_t to) {
+        Box b = triBox(from);
+        for (uint32_t i = from + 1u; i < to; ++i)
+        { const Box t = triBox(i);
+          for (int c = 0; c < 3; ++c) { b.lo[c] = PxMin(b.lo[c], t.lo[c]); b.hi[c] = PxMax(b.hi[c], t.hi[c]); } }
+        return b;
+    };
+
+    // ---- the tree ----
+    // root: 5 children, interleaved hit/miss, one INTERNAL, one LYING.
+    const Box FAR_BOX = { { 100.0f, 100.0f, 100.0f }, { 101.0f, 101.0f, 101.0f } };
+    std::vector<Child> root = {
+        { hull(0u, 3u),   true,  0u,        3u,        0u },  // 0: honest, prims 0..2
+        { FAR_BOX,        true,  3u,        3u,        0u },  // 1: LYING -- 3..5 DO overlap
+        { hull(6u, 10u),  false, 0u,        0u,        1u },  // 2: INTERNAL -> node 1
+        { hull(BIG_FIRST, BIG_FIRST + BIG_COUNT),
+                          true,  BIG_FIRST, BIG_COUNT, 0u },  // 3: the 32-primitive leaf
+        { hull(BAND_TRI, BAND_TRI + 1u),
+                          true,  BAND_TRI,  1u,        0u },  // 4: the band triangle
+        { FAR_BOX,        true,  14u,       1u,        0u },  // 5: honest miss
+    };
+    // node 1: 3 leaves under the internal child, covering prims 6..9.
+    std::vector<Child> n1 = {
+        { hull(6u, 8u),  true, 6u, 2u, 0u },
+        { FAR_BOX,       true, 16u, 2u, 0u },    // honest miss (prims 16,17 are far right)
+        { hull(8u, 10u), true, 8u, 2u, 0u },
+    };
+    // Child 4 and node1's child 1 must be honest misses, so their primitives must
+    // NOT overlap either -- checked below rather than assumed.
+
+    std::vector<uint32_t> tree(HDR_WORDS + 2u * NODE_WORDS, 0u);
+    writeNode(tree, 0u, root);
+    writeNode(tree, 1u, n1);
+    tree[0] = uint32_t(cverts.size()); tree[3] = 2u;   // the skipped header
+
+    // ---- the expected pair set, from the tree's definition ----
+    std::vector<uint32_t> want;
+    uint32_t suppressedByLie = 0, straddleHit = 0, straddleMiss = 0;
+    auto addLeaf = [&](const Child& c, bool reached) {
+        for (uint32_t i = c.primStart; i < c.primStart + c.nbPrims; ++i)
+        {
+            const bool ov = meets(triBox(i));
+            if (!reached) { if (ov) ++suppressedByLie; continue; }
+            if (ov) { want.push_back(i); ++straddleHit; } else ++straddleMiss;
+        }
+    };
+    for (const Child& c : root)
+    {
+        if (!c.isLeaf) continue;
+        addLeaf(c, meets(c.box));
+    }
+    for (const Child& c : n1) addLeaf(c, meets(root[2].box) && meets(c.box));
+
+    PXG_CHECK_MSG(suppressedByLie == 3u,
+                  "the LYING node must hide exactly 3 overlapping triangles, it hides %u -- "
+                  "without it no child-culling mutant can die", suppressedByLie);
+    PXG_CHECK_MSG(straddleHit > 0 && straddleMiss > 0,
+                  "the reached leaves are all-hit or all-miss (%u / %u) -- the per-primitive "
+                  "test is not being exercised inside a tile", straddleHit, straddleMiss);
+    PXG_CHECK_MSG(!want.empty(), "the expected pair set is EMPTY");
+    // The band triangle must be IN the fattened box and OUT of the raw one, or the
+    // fattening is unprobed whichever way a mutant spells it.
+    {
+        const Box b = triBox(BAND_TRI);
+        const bool inFat = meets(b);
+        const bool inRaw = !(b.lo[0] > rbHi[0] || rbLo[0] > b.hi[0] ||
+                             b.lo[1] > rbHi[1] || rbLo[1] > b.hi[1] ||
+                             b.lo[2] > rbHi[2] || rbLo[2] > b.hi[2]);
+        PXG_CHECK_MSG(inFat && !inRaw,
+                      "the band triangle must sit inside the FATTENED box and outside the raw "
+                      "one (fat %d, raw %d) -- otherwise contactDistance is unprobed",
+                      int(inFat), int(inRaw));
+        PXG_CHECK_MSG(std::find(want.begin(), want.end(), BAND_TRI) != want.end(),
+                      "the band triangle is not in the expected set");
+    }
+    PXG_CHECK_MSG(BIG_COUNT == 32u,
+                  "the big leaf carries %u primitives, not 32 -- bit five of `(data >> 1) & 63` "
+                  "is only set at 32 and `& 31` is otherwise indistinguishable", BIG_COUNT);
+
+    // ---- the rig ----
+    DevBuf bTree = makeDev(dev, tree);
+    DevBuf bCVerts = makeDev(dev, cverts);
+    DevBuf bCTris = makeDev(dev, ctris);
+
+    PxgFEMCloth fc; std::memset(&fc, 0, sizeof(fc));
+    fc.mTriMeshData = reinterpret_cast<void*>(size_t(bTree.addr));
+    fc.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bCVerts.addr));
+    fc.mTriangleVertexIndices = reinterpret_cast<uint4*>(size_t(bCTris.addr));
+    fc.mNbVerts = uint32_t(cverts.size());
+    fc.mNbTriangles = NB_TRIS;
+    // Cloth id 1, with a live decoy on slot 0.  The first draft made the decoy a COPY
+    // of the real descriptor with only mNbTriangles changed -- and this kernel never
+    // reads mNbTriangles, so `femClothes[0]` was an exact equivalent and the mutant
+    // survived.  The decoy now owns its OWN tree, vertices and indices, parked far
+    // from the rigid box, so reading slot 0 produces a deterministic empty set.
+    std::vector<uint32_t> decoyTree(HDR_WORDS + NODE_WORDS, 0u);
+    std::vector<Child> decoyRoot = { { FAR_BOX, true, 0u, 1u, 0u } };
+    writeNode(decoyTree, 0u, decoyRoot);
+    std::vector<F4> decoyVerts = { F4{ 100.0f, 100.0f, 100.0f, 1.0f },
+                                   F4{ 100.5f, 100.0f, 100.0f, 1.0f },
+                                   F4{ 100.2f, 100.2f, 100.0f, 1.0f } };
+    std::vector<Tri4> decoyTris = { Tri4{ 0u, 1u, 2u, 0u } };
+    DevBuf bDTree = makeDev(dev, decoyTree);
+    DevBuf bDVerts = makeDev(dev, decoyVerts);
+    DevBuf bDTris = makeDev(dev, decoyTris);
+    PxgFEMCloth decoy; std::memset(&decoy, 0, sizeof(decoy));
+    decoy.mTriMeshData = reinterpret_cast<void*>(size_t(bDTree.addr));
+    decoy.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bDVerts.addr));
+    decoy.mTriangleVertexIndices = reinterpret_cast<uint4*>(size_t(bDTris.addr));
+    decoy.mNbVerts = 3u; decoy.mNbTriangles = 1u;
+    std::vector<PxgFEMCloth> descArr = { decoy, fc };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<PxgContactManagerInput> cmInputs(1);
+    std::memset(cmInputs.data(), 0, sizeof(PxgContactManagerInput));
+    cmInputs[0].shapeRef0 = 0u; cmInputs[0].shapeRef1 = 1u;
+    cmInputs[0].transformCacheRef0 = 0u; cmInputs[0].transformCacheRef1 = 1u;
+    DevBuf bCin = makeDev(dev, cmInputs);
+
+    std::vector<PxgShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    shapes[0].type = PxU32(PxGeometryType::eTRIANGLEMESH);
+    shapes[0].particleOrSoftbodyId = 1u;
+    shapes[1].type = PxU32(PxGeometryType::eBOX);
+    DevBuf bShapes = makeDev(dev, shapes);
+
+    // bounds: slot 0 is the CLOTH's (never read by this kernel -- poisoned so a port
+    // that reads it produces nonsense), slot 1 is the rigid's.
+    std::vector<float> boundsArr = { -9e9f, -9e9f, -9e9f, 9e9f, 9e9f, 9e9f,
+                                     rbLo[0], rbLo[1], rbLo[2], rbHi[0], rbHi[1], rbHi[2] };
+    DevBuf bBounds = makeDev(dev, boundsArr);
+    std::vector<float> cdArr = { contactOffsetCloth, contactOffsetRigid };
+    DevBuf bCd = makeDev(dev, cdArr);
+    DevBuf bTc = makeDev(dev, std::vector<PxsCachedTransform>(2));
+
+    // M7: the stack is DELIBERATELY too small, so the counter must overshoot it.
+    // JUST below the expected set, not far below.  A stack of 2 against 33 pairs was
+    // tried and reverted: it fires the overshoot contract but leaves 31 of the 33
+    // pairs uncompared, and a cap that hides most of the output hides most of the
+    // errors (the P9.14b lesson).  28 keeps the drop observable and still compares
+    // the great majority.
+    const uint32_t STACK_PAIRS = 28u;
+    const uint32_t SLACK_PAIRS = 6u;
+    PXG_CHECK_MSG(want.size() > STACK_PAIRS,
+                  "the expected set (%zu) does not exceed the stack (%u) -- M7's overshoot "
+                  "contract is unprobed", want.size(), STACK_PAIRS);
+    struct U4 { uint32_t x, y, z, w; };
+    std::vector<U4> stack(STACK_PAIRS + SLACK_PAIRS, U4{ 0xEEEEEEEEu, 0xEEEEEEEEu, 0xEEEEEEEEu, 0xEEEEEEEEu });
+    DevBuf bStack = makeDev(dev, stack);
+    DevBuf bCount = makeDev(dev, std::vector<uint32_t>{ 0u });
+
+    TriMidPush push = {};
+    push.numTests = 1u; push.toleranceLength = 1.0f;
+    push.cmInputs = bCin.addr; push.transformCache = bTc.addr; push.bounds = bBounds.addr;
+    push.contactDistance = bCd.addr; push.gpuShapes = bShapes.addr; push.femClothes = bDesc.addr;
+    push.stackPtr = bStack.addr; push.midphasePairsNum = bCount.addr;
+    push.stackSizeBytes = STACK_PAIRS * 16u;
+
+    Kernel k("femClothContactGenBda.spv", "cloth_midphaseGeneratePairsLaunch", {}, sizeof(TriMidPush));
+    PXG_CHECK_MSG(k.isValid(), "the cloth tri-midphase pipeline must build");
+    if (!k.isValid()) return;
+    k.dispatch(/*gridX ceil(numTests / 2)*/ 1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+    const auto gStack = downloadBuffer<U4>(dev, bStack.h, STACK_PAIRS + SLACK_PAIRS);
+
+    size_t mm = 0;
+    // M7: the counter counts every reserved slot, INCLUDING the ones past the stack.
+    PXG_CHECK_MSG(gCount == uint32_t(want.size()),
+                  "the midphase counted %u pairs, expected %zu (the counter must NOT be capped "
+                  "by the stack -- its overshoot is what sizes the next frame's stack)",
+                  gCount, want.size());
+
+    // The slot each pair lands in is the atomicAdd's order across tiles, so the
+    // WRITTEN prefix is matched as a set against the expected triangles.
+    const uint32_t written = PxMin(gCount, STACK_PAIRS);
+    std::vector<bool> claimed(want.size(), false);
+    for (uint32_t i = 0; i < written; ++i)
+    {
+        if (gStack[i].x != 0u) { ++mm; std::printf("  tri-midphase slot %u: cmIdx %u, expected 0\n", i, gStack[i].x); continue; }
+        if (gStack[i].z != 0u || gStack[i].w != 0u) { ++mm; std::printf("  tri-midphase slot %u: .zw not zeroed\n", i); }
+        size_t at = want.size();
+        for (size_t q = 0; q < want.size(); ++q)
+            if (!claimed[q] && want[q] == gStack[i].y) { at = q; break; }
+        if (at == want.size())
+        { ++mm; std::printf("  tri-midphase slot %u names triangle %u, which is not an unclaimed "
+                            "expected pair\n", i, gStack[i].y); continue; }
+        claimed[at] = true;
+    }
+    PXG_CHECK_MSG(mm == 0, "cloth_midphaseGeneratePairs emitted %zu wrong pairs", mm);
+
+    // Nothing past the stack bound may have been written -- that is where the
+    // overshoot would have landed had the drop not held.
+    size_t badPoison = 0;
+    for (uint32_t i = written; i < STACK_PAIRS + SLACK_PAIRS; ++i)
+        if (gStack[i].x != 0xEEEEEEEEu || gStack[i].y != 0xEEEEEEEEu) ++badPoison;
+    PXG_CHECK_MSG(badPoison == 0, "%zu stack slots past stackSize were written", badPoison);
+
+    std::printf("    [ note ] %zu pairs expected over %u triangles (%u written, %zu dropped by the "
+                "stack bound, %u hidden by the lying node, %u rejected inside reached leaves)\n",
+                want.size(), NB_TRIS, written, want.size() - written, suppressedByLie, straddleMiss);
+
+    dev->destroyBuffer(bTree.h); dev->destroyBuffer(bCVerts.h); dev->destroyBuffer(bCTris.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h); dev->destroyBuffer(bShapes.h);
+    dev->destroyBuffer(bBounds.h); dev->destroyBuffer(bCd.h); dev->destroyBuffer(bTc.h);
+    dev->destroyBuffer(bStack.h); dev->destroyBuffer(bCount.h);
+    dev->destroyBuffer(bDTree.h); dev->destroyBuffer(bDVerts.h); dev->destroyBuffer(bDTris.h);
+}
+
 // ===========================================================================
 // P7.1 tranche 4b-1: cloth-vs-rigid contact SORT / REORDER.
 //   femClothContactSortBda.spv:

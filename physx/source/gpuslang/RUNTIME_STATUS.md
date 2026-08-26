@@ -1705,6 +1705,101 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.15b — `cloth_midphaseGeneratePairsLaunch` (Manifest **356**): die BV32-Traversierung des Tuchbaums, und eine Vorrichtung, die vier Mutanten erst nach dem Nachschärfen tötet
+
+Portiert `femClothMidPhase.cu:191` (Wrapper), `:110-186`
+(`femClothMidphaseCore`) und `:64-110` (`ClothTreeTraverser`), alle vollständig
+gelesen. Manifest **355 → 356**. Neue ABI-Zeile `kClothTriMidphase[] =
+{4,4,8,8,8,8,8,8,8,8,4}`.
+
+**Die ABI-Zeile ist der erste Stolperstein und wäre still gewesen.** Der
+Softbody-Zwilling nimmt **dieselben elf Argumente in denselben Typen** —
+`kSbMidphasePrimitives[] = {4,4,8,8,8,8,8,8,4,8,8}` — aber `stackSizeBytes` steht
+dort an neunter und hier an letzter Stelle. Die Zeile wiederzuverwenden hätte
+jeden Zeiger dahinter um vier Byte verschoben.
+
+### Komponiert aus dem Zwilling
+
+`sb_midphaseGeneratePairsLaunch` (P8.2) ist dieselbe Traversierung gegen dieselbe
+Art AABB. Der Körper ist aus dessen Form komponiert statt ein zweites Mal aus
+`bv32Traversal.cuh` abgeleitet, und der BV32-Knotenleser ist das gemeinsame Modul
+`pxgSlangBv32` (P8.25). Die Unterschiede sind kurz: Dreiecke statt Tetraeder (drei
+Ecken aus `.xyz`, `.w` gehört **nicht** dazu), **kein** Oberflächen-Hinweis (ein
+Tuch hat kein Inneres), **keine** Gültigkeitsprüfung, und `mTriMeshData` statt
+`mTetMeshData`.
+
+**Was NICHT geteilt ist, ist die Traversierungsschleife selbst** — sie steht jetzt
+in **sieben** Abschriften in diesem Korpus. Das ist als eigene Aufgabe vermerkt,
+nicht hier nebenbei erledigt: der Umbau fasst sechs gelandete und gefegte Shader
+gleichzeitig an.
+
+### Die Vorrichtung, und der Knoten, der lügt
+
+Das Orakel ist **keine zweite Abschrift der Traversierung**. Der Baum ist eine
+**Eingabe**, hier selbst geschrieben, also folgt die erwartete Paarmenge aus
+seiner Definition, einmal angewandt:
+
+> erwartet = { i : i liegt in einem ERREICHTEN Blatt und sein Dreiecksrahmen
+> trifft die Box }
+
+„Erreicht" ist dabei eine Eigenschaft der Knotenrahmen, die diese Vorrichtung
+geschrieben hat — direkt ausgewertet, nicht durch Nachbau eines Stapels.
+
+**Und ein Knoten lügt, mit Absicht.** In einem echten BV32-Baum umschließt jeder
+Knotenrahmen seine Primitive, und damit ist das Verwerfen eines Kindes eine reine
+Optimierung: es kann die emittierte Menge nie ändern, weil der Per-Primitiv-Test
+dieselben Primitive ohnehin verwirft. Eine Vorrichtung aus lauter ehrlichen
+Knoten kann deshalb **keinen einzigen** Kind-Verwerfungs-Mutanten töten. Also
+bekommt ein Kind hier einen Rahmen, der die Box **verfehlt**, während seine
+Dreiecke sie **treffen**. Der Kernel muss den Baum nehmen, wie er ist, und nichts
+emittieren; ein Port ohne Kind-Test emittiert drei Paare.
+
+### Vier Mutanten, die erst der zweite Durchgang getötet hat
+
+Der erste Fegedurchgang meldete 13 Tote und **vier Überlebende**, und **keiner
+davon war eine Äquivalenz** — alle vier waren Löcher in der Vorrichtung:
+
+| Überlebender | warum er überlebte | was ihn tötet |
+|---|---|---|
+| `m5-box-not-fattened` | kein Dreieck lag im Aufblähband | ein **Bandreieck** bei x ∈ [8.15, 8.35] — im aufgeblähten Rahmen, außerhalb des rohen |
+| `m5-contactdist-rigid-only` | dasselbe Band, dieselbe Ursache | dasselbe Dreieck |
+| `leaf-nbprims-mask-31` | kein Blatt trug ≥ 32 Primitive, also war Bit 5 von `(data >> 1) & 63` nie gesetzt | ein Blatt mit **genau 32** — dem Größten, das ein BV32-Blatt tragen kann, und dem Kleinsten, das Bit 5 setzt |
+| `cloth-desc-index-zero-mid` | der Köder auf Platz 0 war eine **Kopie** des echten Deskriptors, in der nur `mNbTriangles` anders war — und das liest dieser Kernel nie | ein Köder mit **eigenem** Baum, eigenen Vertices und eigenen Indizes |
+
+Nach dem Nachschärfen: **17 von 17 getötet, 0 überlebt.**
+
+Der Deckel wurde dabei zweimal justiert und beide Male aus demselben Grund. Ein
+Stapel von 2 gegen 33 Paare feuert zwar den Überlaufvertrag, lässt aber 31 der 33
+Paare unverglichen — und ein Deckel, der den Großteil der Ausgabe verbirgt,
+verbirgt den Großteil der Fehler (die P9.14b-Lehre). Er steht jetzt auf 28.
+
+### M7: der Zähler läuft über, der Schreibvorgang nicht
+
+`pushOntoStackFullWarp` reserviert mit **einem** atomaren Add pro Kachel und
+verwirft dann jeden Platz ab `stackSize`. `midphasePairsNum` **darf** den Stapel
+also übersteigen — genau dieser Überlauf ist, wie die Engine den Stapel des
+nächsten Frames bemisst (`stackSizeNeededOnDevice`). Ein Port, der den Zähler
+mitdeckelt, schrumpft ihn still. Beide Hälften des Vertrags werden im selben Lauf
+gemessen: 33 gezählt, 28 geschrieben, 5 verworfen, und die Plätze dahinter kommen
+vergiftet zurück.
+
+### Verifikation
+
+* Fegen **17 von 17 getötet, 0 überlebt**, zwangsfrisch, in zwei Durchgängen;
+* Suite **817/817** in **beiden** Speichermodi;
+* Szenen: **31 ok, 0 fail, 0 missing (of 31)**;
+* `cloth` verweigert jetzt **einen** Kernel statt dreien: **3 → 2 → 1**.
+
+### Was offen bleibt
+
+`cloth_boxTriangleContactGenLaunch` (`femClothPrimitives.cu:3359`) ist der letzte
+Name auf der Liste und der Verbraucher der Paare, die diese Tranche erzeugt.
+Solange er fehlt, laufen die Paare ins Leere — die Szene `clothbox` steht
+unverändert auf dem Vertex-Pfad, den P9.15a gelandet hat. Was der Dreieckspfad
+hinzufügt, ist der Fall, den der Vertex-Pfad nicht sehen kann: eine Kistenecke,
+die durch ein Dreieck stößt, ohne eine Ecke zu berühren. Die Szene wird dafür
+eine Geometrie brauchen, in der genau das passiert.
+
 ## P9.15a — `cloth_boxVertexContactGenLaunch` (Manifest **355**): das Tuch bleibt auf der Kiste liegen — und eine Barriere, die seit P7.1 im falschen Kontrollfluss stand
 
 Portiert `femClothPrimitives.cu:3078` (Kernel) und `sphereCollision.cuh:371`
