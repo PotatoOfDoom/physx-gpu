@@ -456,6 +456,8 @@ static const uint8_t kClothMidphaseVertPairs[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 8 
 //   4B tail pad = 80 bytes, sizeof(PxgFEMContactWriter)).  Eight device pointers +
 //   PxU32 nbFilterPairs (@72) + the 80-byte writer (@80) -> 160-byte blob.
 static const uint8_t kClothTriMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 8, 4 };
+// P9.15d: fifteen arguments, the last of them PxgFEMContactWriter by value (80 B).
+static const uint8_t kClothBoxTriCg[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 8, 80 };
 static const uint8_t kClothVertContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80 };
 
 // gpunarrowphase softbodyPrimitives.cu:1655 (P7.1 tranche 4b-1 cloth-vs-rigid
@@ -1585,6 +1587,7 @@ static const PxgKernelAbiRow kRows[] = {
     // twin takes -- but stackSizeBytes comes LAST here and third-from-last there, so
     // kSbMidphasePrimitives { 4,4,8,8,8,8,8,8,4,8,8 } must NOT be reused.
     { "cloth_midphaseGeneratePairsLaunch", kClothTriMidphase, uint32_t(sizeof(kClothTriMidphase)) },
+    { "cloth_boxTriangleContactGenLaunch", kClothBoxTriCg, uint32_t(sizeof(kClothBoxTriCg)) },
     // gpunarrowphase FEMCloth-vs-rigid contact SORT / reorder (P7.1 tranche 4b-1 BDA)
     { "fem_reorderRigidContactsLaunch", kFemReorderRSContacts, uint32_t(sizeof(kFemReorderRSContacts)) },
     // gpusimulationcontroller FEMCloth-vs-rigid contact PREPARE + query/solve (P7.1 tranche 4b-2/3 BDA)

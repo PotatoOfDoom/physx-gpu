@@ -60,6 +60,18 @@
 
 #include "pxgTestFramework.h"
 
+// P9.15d drives the engine-ABI kernel beside the Phase-1 core, so it needs the
+// real narrowphase structs.
+#include "host_defines.h"
+#include "PxgFEMCloth.h"
+#include "PxgContactManager.h"
+#include "PxgConvexConvexShape.h"
+#include "PxgSimulationCoreDesc.h"
+#include "PxsTransformCache.h"
+#include "PxNodeIndex.h"
+#include "geometry/PxGeometry.h"
+#include <cstring>
+
 #include <algorithm>
 #include <cstdio>
 #include <cmath>
@@ -70,6 +82,7 @@
 namespace
 {
 using namespace pxgtest;
+using namespace physx;   // P9.15d drives the engine-ABI kernel beside the Phase-1 core
 
 struct F4 { float x, y, z, w; };
 struct U4 { uint32_t x, y, z, w; };
@@ -470,6 +483,435 @@ static uint32_t refPolyClip(const std::vector<V3>& v0, uint32_t nbVerts0, V3 axi
 // appear on one side only (phase-3 points sit ~1e-4 from the boundary and
 // their bary drifts with the 2D intersection conditioning)
 struct RefContact { V3 p, n; float sep; F4 bary; bool firm; };
+
+// ---------------------------------------------------------------------------
+// P9.15d -- cloth_boxTriangleContactGenLaunch, verified as a GPU DIFFERENTIAL.
+//
+// THE ORACLE.  This kernel's contact machine -- SAT, feature selection, polygon
+// clipping, contact reduction, the writer -- is not its own: P9.15c lifted it into
+// pxgSlangConvexTriCloth, where fcConvexTri's Phase-1 battery verifies it against a
+// full CPU transcription.  Re-transcribing it here would be a third copy of the
+// thing that is already checked.
+//
+// What P9.15d actually adds is the CALLER GLUE, and glue is exactly what a
+// differential can pin: seed one arena, run the REAL kernel on it, then run the
+// ALREADY-SWEPT core entry point (ctFcConvexTri) over FctCases a host mirror of the
+// glue built, and compare the two contact streams.  The core is identical on both
+// sides by construction, so any difference is the glue -- and the mirror is fifty
+// lines of transforms rather than a second SAT.  Same arrangement as P8.97d.
+//
+// The comparison is a MULTISET: both sides reserve their slots with an atomicAdd
+// whose order across pairs is a race (the P9.11 rule), so contacts are matched by
+// content and claimed by index.
+//
+// WHAT THE RIG IS BUILT TO DISCRIMINATE
+//   * a cloth transform that is NOT the identity and NOT the rigid's, so B5's
+//     composition (conj(rigidQ) * clothQ) cannot collapse into either factor;
+//   * a rigid box with a non-uniform scale AND a non-identity scale rotation, so
+//     B2's "the cloth is not scaled" is separable from "nothing is scaled";
+//   * TWO contact-manager pairs with DIFFERENT rest distances, so B6's cmIdx index
+//     is separable from a cache ref;
+//   * a filter list that names TWO of one triangle's three corners and ALL THREE
+//     of another's -- B1's AND: the first triangle must still produce contacts,
+//     the second must not;
+//   * a midphase counter that OVERSHOOTS the stack, so B3's clamp and B4's
+//     unclamped atomicMax are measured in the same run and pull opposite ways.
+// ---------------------------------------------------------------------------
+namespace btri
+{
+// FctCase / FctParams are this file's own -- one definition, two users.
+struct V3c { float x, y, z; };
+struct Tri4 { uint32_t x, y, z, w; };
+struct FemInfoHost { uint64_t pairInd0; uint32_t pairInd1, rigidMatInd; };
+static_assert(sizeof(FemInfoHost) == 16, "PxgFemOtherContactInfo mirror");
+
+static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+struct DevBuf { PxgBufferHandle h = 0; uint64_t addr = 0; };
+template <typename T>
+static DevBuf mkBuf(PxgSlangComputeDevice* dev, const std::vector<T>& d)
+{
+    DevBuf b; b.h = createBufferFrom(dev, d); b.addr = dev->getBufferDeviceAddress(b.h);
+    return b;
+}
+struct WBufs { DevBuf point, normalPen, bary, info, count, byX, tempByX, idxByX, sortedByX; };
+static WBufs mkWriter(PxgSlangComputeDevice* dev, uint32_t cap)
+{
+    WBufs w;
+    w.point = mkBuf(dev, std::vector<F4>(cap, F4{ -9, -9, -9, -9 }));
+    w.normalPen = mkBuf(dev, std::vector<F4>(cap, F4{ -9, -9, -9, -9 }));
+    w.bary = mkBuf(dev, std::vector<F4>(cap, F4{ -9, -9, -9, -9 }));
+    w.info = mkBuf(dev, std::vector<FemInfoHost>(cap, FemInfoHost{ 0xdeadbeefull, 0xdeadbeefu, 0xdeadbeefu }));
+    w.count = mkBuf(dev, std::vector<uint32_t>{ 0u });
+    w.byX = mkBuf(dev, std::vector<uint64_t>(cap, 0xffffffffffffffffull));
+    w.tempByX = mkBuf(dev, std::vector<uint32_t>(cap, 0xeeeeeeeeu));
+    w.idxByX = mkBuf(dev, std::vector<uint32_t>(cap, 0xeeeeeeeeu));
+    w.sortedByX = mkBuf(dev, std::vector<uint32_t>(cap, 0xeeeeeeeeu));
+    return w;
+}
+static void killWriter(PxgSlangComputeDevice* dev, const WBufs& w)
+{
+    for (PxgBufferHandle h : { w.point.h, w.normalPen.h, w.bary.h, w.info.h, w.count.h,
+                               w.byX.h, w.tempByX.h, w.idxByX.h, w.sortedByX.h })
+        dev->destroyBuffer(h);
+}
+
+struct BTriPush
+{
+    float toleranceLength; uint32_t pad4;
+    uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes, femClothes;
+    uint64_t shapeToRigidRemap, stackPtr, midphasePairsNum, filterPairs;
+    uint32_t nbFilterPairs, stackSizeBytes;
+    uint64_t stackSizeNeeded;
+    uint64_t bPoint, bNormalPen, bBary, bInfo, bCount, bByX, bTempByX, bIdxByX, bSortedByX;
+    uint32_t bMaxNumContacts, pad180;
+};
+static_assert(sizeof(BTriPush) == 184, "cloth box-triangle blob must be 184 bytes");
+static_assert(offsetof(BTriPush, stackSizeNeeded) == 96, "stackSizeNeeded @96");
+static_assert(offsetof(BTriPush, bPoint) == 104, "writer @104");
+
+struct Q { float x, y, z, w; };
+static Q qmul(Q a, Q b)
+{
+    return Q{ a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+              a.w * b.y + a.y * b.w + a.z * b.x - a.x * b.z,
+              a.w * b.z + a.z * b.w + a.x * b.y - a.y * b.x,
+              a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+}
+static Q qconj(Q q) { return Q{ -q.x, -q.y, -q.z, q.w }; }
+static V3c qrot(Q q, V3c v)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q.w * q.w - 0.5f;
+    const float d2 = (q.x * vx + q.y * vy + q.z * vz);
+    return V3c{ vx * w2 + (q.y * vz - q.z * vy) * q.w + q.x * d2,
+                vy * w2 + (q.z * vx - q.x * vz) * q.w + q.y * d2,
+                vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * d2 };
+}
+static V3c qrotInv(Q q, V3c v)
+{
+    const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
+    const float w2 = q.w * q.w - 0.5f;
+    const float d2 = (q.x * vx + q.y * vy + q.z * vz);
+    return V3c{ vx * w2 - (q.y * vz - q.z * vy) * q.w + q.x * d2,
+                vy * w2 - (q.z * vx - q.x * vz) * q.w + q.y * d2,
+                vz * w2 - (q.x * vy - q.y * vx) * q.w + q.z * d2 };
+}
+} // namespace btri
+
+PXG_TEST(femClothSimBoxTriangleContactGen)
+{
+    using namespace btri;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // ---- geometry ----
+    const V3c boxExt = { 1.1f, 0.6f, 1.7f };
+    const V3c boxP = { 0.3f, -0.4f, 0.2f };
+    const float bh = std::sin(0.2f), bc = std::cos(0.2f);
+    const Q boxQ = { 0.0f, bh, 0.0f, bc };                  // 0.4 rad about +y
+    // The CLOTH's own transform: neither identity nor the rigid's (B5).
+    // A SMALL cloth rotation: enough that conj(rigidQ)*clothQ is neither factor, and
+    // small enough that the triangles stay near-parallel to the face they rest on.
+    const float ch = std::sin(0.05f), cc = std::cos(0.05f);
+    const Q clothQ = { ch * 0.6f, ch * 0.8f, 0.0f, cc };
+    // Placed so the triangles STRADDLE the box's top face: the box centre is at
+    // y = -0.4 with a half-extent of 0.6, so the face sits near y = 0.2, and the
+    // cloth's own local y runs +-0.05 about clothP.y.
+    // The offset from the box to the cloth must NOT lie along the box's rotation
+    // axis.  It did: boxP and clothP shared x and z while boxQ turns about +y, so
+    // rotating (0, dy, 0) by that quaternion or by its inverse gives the same vector
+    // and `b5-toconv-rotate-forward` was indistinguishable.  Now it has x and z too.
+    const V3c clothP = { 0.55f, 0.26f, 0.45f };
+
+    // The RIGID's contribution is the LARGER half on purpose.  With 0.22 + 0.08 the
+    // band a mutant closes by dropping it was only 0.08 wide and no triangle sat in
+    // it; at 0.22 + 0.50 the band is 0.50 wide and triangle 5 lives squarely inside.
+    const float cdCloth = 0.22f, cdRigid = 0.50f;
+    const float rest0 = 0.017f, rest1 = 0.041f;             // B6: per contact-manager pair
+    const uint32_t materialIndex = 12u;
+    const uint64_t rigidNodeInd = 0x0000000700000031ull;
+    const uint32_t CLOTH_ID = 1u;
+
+    // A cloth of six triangles straddling the box, plus two the filter will act on.
+    std::vector<F4> cverts;
+    std::vector<Tri4> ctris;
+    auto addTri = [&](V3c a, V3c b, V3c c) {
+        const uint32_t base = uint32_t(cverts.size());
+        cverts.push_back(F4{ a.x, a.y, a.z, 1.0f });
+        cverts.push_back(F4{ b.x, b.y, b.z, 1.0f });
+        cverts.push_back(F4{ c.x, c.y, c.z, 1.0f });
+        ctris.push_back(Tri4{ base, base + 1u, base + 2u, 0u });
+    };
+    // The cloth's LOCAL frame; the kernel moves it by clothTransform then into box space.
+    // Six triangles laid flat, each LARGER than the box face they rest on.
+    //
+    // Size matters here and the first draft had it backwards.  The contact stage
+    // clips the reference FACE polygon against the triangle, so a triangle that
+    // fits inside the face leaves the clipper nothing to cut and emits nothing --
+    // measured, three times, before reading how the Phase-1 battery builds its own
+    // cases: its triangles run 4.5 to 7 units against a box of half-extent ~1.
+    // These span about 6 against a 2.2 x 3.4 face, and each is shifted in z so the
+    // six are not the same case six times.
+    for (int i = 0; i < 6; ++i)
+    {
+        const float z = -0.5f + 0.2f * float(i);
+        // Triangle 5 is lifted into the band that only the SUMMED contact distance
+        // opens: the others sit ~0.06 above the face, this one ~0.26 -- inside
+        // 0.22 + 0.08 = 0.30 and outside the cloth's 0.22 alone.  Without it,
+        // dropping the rigid's contribution changed nothing.
+        const float y = (i == 5) ? 0.34f : 0.0f;   // separation ~0.40: inside 0.72, outside 0.22
+        addTri(V3c{ -3.0f, y, z - 3.0f }, V3c{ 3.0f, y, z - 3.0f }, V3c{ 0.0f, y, z + 3.0f });
+    }
+    const uint32_t NB_TRIS = uint32_t(ctris.size());
+
+    DevBuf bCVerts = mkBuf(dev, cverts);
+    DevBuf bCTris = mkBuf(dev, ctris);
+
+    // ---- the hull: a unit box, cooked by hand (the layout pxgSlangConvexHull reads) ----
+    // The hull blob comes from THIS file's Hull/makeBox -- the same authored
+    // ConvexScratch layout the Phase-1 battery drives, not a second one.  makeBox
+    // takes half-extents of 1: the box's real size arrives through the SHAPE SCALE,
+    // which is what B2 is about.
+    std::vector<uint32_t> blob;
+    uint32_t hullOffset = 0;
+    makeBox(1.0f, 1.0f, 1.0f).serialize(blob, hullOffset);
+    PXG_CHECK_MSG(hullOffset == 0u, "the hull must start at offset 0 for this rig");
+    DevBuf bHull = mkBuf(dev, blob);
+
+    PxgFEMCloth fc; std::memset(&fc, 0, sizeof(fc));
+    fc.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bCVerts.addr));
+    fc.mTriangleVertexIndices = reinterpret_cast<uint4*>(size_t(bCTris.addr));
+    fc.mNbVerts = uint32_t(cverts.size());
+    fc.mNbTriangles = NB_TRIS;
+    PxgFEMCloth decoy; std::memset(&decoy, 0, sizeof(decoy));
+    std::vector<PxgFEMCloth> descArr = { decoy, fc };
+    DevBuf bDesc = mkBuf(dev, descArr);
+
+    // Two contact-manager pairs over the same cloth and box, differing only in rest
+    // distance -- so restDistance[cmIdx] is separable from restDistance[cacheRef].
+    std::vector<PxgContactManagerInput> cmInputs(2);
+    std::memset(cmInputs.data(), 0, cmInputs.size() * sizeof(PxgContactManagerInput));
+    for (uint32_t p = 0; p < 2u; ++p)
+    { cmInputs[p].shapeRef0 = 0u; cmInputs[p].shapeRef1 = 1u;
+      cmInputs[p].transformCacheRef0 = 0u; cmInputs[p].transformCacheRef1 = 1u; }
+    DevBuf bCin = mkBuf(dev, cmInputs);
+
+    std::vector<PxgShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    shapes[0].type = PxU32(PxGeometryType::eTRIANGLEMESH);
+    shapes[0].particleOrSoftbodyId = CLOTH_ID;
+    shapes[1].type = PxU32(PxGeometryType::eBOX);
+    shapes[1].materialIndex = materialIndex;
+    // B2: a non-uniform scale in a ROTATED frame on the RIGID only.
+    // A non-uniform scale on the RIGID only -- that is what B2 separates.  The scale
+    // ROTATION is left identity here: the hull decode it exercises is already pinned
+    // by the Phase-1 battery, and tilting the solid only moves the contact band.
+    shapes[1].scale = PxMeshScale(PxVec3(boxExt.x, boxExt.y, boxExt.z), PxQuat(PxIdentity));
+    shapes[1].hullOrMeshPtr = size_t(bHull.addr);
+    DevBuf bShapes = mkBuf(dev, shapes);
+
+    std::vector<PxsCachedTransform> tcache(2);
+    std::memset(tcache.data(), 0, tcache.size() * sizeof(PxsCachedTransform));
+    tcache[0].transform = PxTransform(PxVec3(clothP.x, clothP.y, clothP.z),
+                                      PxQuat(clothQ.x, clothQ.y, clothQ.z, clothQ.w));
+    tcache[1].transform = PxTransform(PxVec3(boxP.x, boxP.y, boxP.z),
+                                      PxQuat(boxQ.x, boxQ.y, boxQ.z, boxQ.w));
+    DevBuf bTc = mkBuf(dev, tcache);
+
+    DevBuf bCd = mkBuf(dev, std::vector<float>{ cdCloth, cdRigid });
+    DevBuf bRd = mkBuf(dev, std::vector<float>{ rest0, rest1 });
+    DevBuf bRemap = mkBuf(dev, std::vector<uint64_t>{ 0ull, rigidNodeInd });
+
+    // B1: triangle 1 has TWO filtered corners (must still contact); triangle 4 has
+    // all THREE (must be skipped).
+    const uint32_t TRI_PARTIAL = 1u, TRI_FULL = 4u;
+    std::vector<PxgRigidFilterPair> fpairs;
+    auto addFilter = [&](uint32_t vert) {
+        PxgRigidFilterPair fp; std::memset(&fp, 0, sizeof(fp));
+        fp.index0 = rigidNodeInd;
+        fp.index1 = uint64_t((CLOTH_ID << 20) | vert);
+        fpairs.push_back(fp);
+    };
+    addFilter(ctris[TRI_PARTIAL].x); addFilter(ctris[TRI_PARTIAL].y);
+    addFilter(ctris[TRI_FULL].x); addFilter(ctris[TRI_FULL].y); addFilter(ctris[TRI_FULL].z);
+    // find() expects the pair list SORTED by (index0, index1).
+    std::sort(fpairs.begin(), fpairs.end(), [](const PxgRigidFilterPair& a, const PxgRigidFilterPair& b) {
+        return a.index0 != b.index0 ? a.index0 < b.index0 : a.index1 < b.index1; });
+    DevBuf bFilters = mkBuf(dev, fpairs);
+
+    // ---- the midphase pair stack: every triangle, alternating cm pair ----
+    std::vector<U4> stack;
+    for (uint32_t t = 0; t < NB_TRIS; ++t) stack.push_back(U4{ t & 1u, t, 0u, 0u });
+    // B3/B4: the counter OVERSHOOTS the stack.
+    const uint32_t OVERSHOOT = 3u;
+    const uint32_t stackPairs = uint32_t(stack.size());
+    // The buffer is PADDED past stackSizeBytes with valid-but-extra pairs, so a port
+    // that consumes the counter unclamped reads real work rather than running off the
+    // allocation -- a wrong ANSWER instead of a crash, which is the stronger kill.
+    for (uint32_t k = 0; k < OVERSHOOT; ++k) stack.push_back(U4{ 0u, k, 0u, 0u });
+    DevBuf bStack = mkBuf(dev, stack);
+    DevBuf bPairsNum = mkBuf(dev, std::vector<uint32_t>{ stackPairs + OVERSHOOT });
+    DevBuf bNeeded = mkBuf(dev, std::vector<uint32_t>{ 0u });
+
+    const uint32_t CAP = 256u;
+    WBufs wa = mkWriter(dev, CAP);
+
+    BTriPush push = {};
+    push.toleranceLength = 1.0f;
+    push.cmInputs = bCin.addr; push.transformCache = bTc.addr;
+    push.contactDistance = bCd.addr; push.restDistance = bRd.addr;
+    push.gpuShapes = bShapes.addr; push.femClothes = bDesc.addr;
+    push.shapeToRigidRemap = bRemap.addr; push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairsNum.addr; push.filterPairs = bFilters.addr;
+    push.nbFilterPairs = uint32_t(fpairs.size());
+    push.stackSizeBytes = stackPairs * 16u;
+    push.stackSizeNeeded = bNeeded.addr;
+    push.bPoint = wa.point.addr; push.bNormalPen = wa.normalPen.addr;
+    push.bBary = wa.bary.addr; push.bInfo = wa.info.addr;
+    push.bCount = wa.count.addr; push.bByX = wa.byX.addr;
+    push.bTempByX = wa.tempByX.addr; push.bIdxByX = wa.idxByX.addr;
+    push.bSortedByX = wa.sortedByX.addr; push.bMaxNumContacts = CAP;
+
+    Kernel ka("femClothContactGenBda.spv", "cloth_boxTriangleContactGenLaunch", {}, sizeof(BTriPush));
+    PXG_CHECK_MSG(ka.isValid(), "the cloth box-triangle pipeline must build");
+    if (!ka.isValid()) { killWriter(dev, wa); return; }
+    ka.dispatch(/*gridX*/ 4096u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // ---- the host mirror of the GLUE, and the differential dispatch ----
+    std::vector<FctCase> cases;
+    uint32_t skipped = 0, partialKept = 0;
+    for (uint32_t i = 0; i < stackPairs; ++i)
+    {
+        const uint32_t cmIdx = stack[i].x, triangleIdx = stack[i].y;
+        const Tri4& t = ctris[triangleIdx];
+        auto filtered = [&](uint32_t v) {
+            const uint64_t key = uint64_t((CLOTH_ID << 20) | v);
+            for (const auto& fp : fpairs) if (fp.index0 == rigidNodeInd && fp.index1 == key) return true;
+            return false;
+        };
+        if (filtered(t.x) && filtered(t.y) && filtered(t.z)) { ++skipped; continue; }   // B1
+        if (triangleIdx == TRI_PARTIAL) ++partialKept;
+
+        const Q toConvQ = qmul(qconj(boxQ), clothQ);                                   // B5
+        const V3c toConvP = qrotInv(boxQ, V3c{ clothP.x - boxP.x, clothP.y - boxP.y, clothP.z - boxP.z });
+        auto toConv = [&](const F4& v) {
+            const V3c r = qrot(toConvQ, V3c{ v.x, v.y, v.z });
+            return V3c{ r.x + toConvP.x, r.y + toConvP.y, r.z + toConvP.z };
+        };
+        const V3c a = toConv(cverts[t.x]), b = toConv(cverts[t.y]), c = toConv(cverts[t.z]);
+        const V3c e0 = { b.x - a.x, b.y - a.y, b.z - a.z };
+        const V3c e1 = { c.x - a.x, c.y - a.y, c.z - a.z };
+        V3c n = { e0.y * e1.z - e0.z * e1.y, e0.z * e1.x - e0.x * e1.z, e0.x * e1.y - e0.y * e1.x };
+        const float nl = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
+        n = V3c{ n.x / nl, n.y / nl, n.z / nl };
+
+        FctCase cs{};
+        cs.convexScale = F4{ boxExt.x, boxExt.y, boxExt.z, cdCloth + cdRigid };
+        const PxQuat sr = shapes[1].scale.rotation;
+        cs.convexScaleRot = F4{ sr.x, sr.y, sr.z, sr.w };
+        cs.t0 = F4{ a.x, a.y, a.z, (cmIdx == 0u) ? rest0 : rest1 };                     // B6
+        cs.t1 = F4{ b.x, b.y, b.z, 0.0f };
+        cs.t2 = F4{ c.x, c.y, c.z, 0.0f };
+        cs.triNormal = F4{ n.x, n.y, n.z, 0.0f };
+        cs.convexP = F4{ boxP.x, boxP.y, boxP.z, 0.0f };
+        cs.convexQ = F4{ boxQ.x, boxQ.y, boxQ.z, boxQ.w };
+        cs.ids.x = uint32_t(rigidNodeInd & 0xffffffffu);
+        cs.ids.y = uint32_t(rigidNodeInd >> 32);
+        cs.ids.z = CLOTH_ID; cs.ids.w = triangleIdx;
+        cs.ids2.x = materialIndex; cs.ids2.y = 0u;
+        cases.push_back(cs);
+    }
+    PXG_CHECK_MSG(skipped == 1u, "B1: exactly one triangle must be skipped by the AND filter, "
+                  "%u were", skipped);
+    PXG_CHECK_MSG(partialKept == 1u, "B1: the two-corner-filtered triangle must be KEPT, or an "
+                  "`||` spelling is invisible");
+
+    DevBuf bCases = mkBuf(dev, cases);
+    WBufs wb = mkWriter(dev, CAP);
+    FctParams fp2 = {};
+    fp2.numCases = uint32_t(cases.size()); fp2.maxContacts = CAP;
+    fp2.hullAddr = bHull.addr;
+    fp2.wPoint = wb.point.addr; fp2.wNormalPen = wb.normalPen.addr; fp2.wBary = wb.bary.addr;
+    fp2.wInfo = wb.info.addr; fp2.wCount = wb.count.addr; fp2.wByX = wb.byX.addr;
+    fp2.wTempByX = wb.tempByX.addr; fp2.wIdxByX = wb.idxByX.addr;
+    std::vector<U4> dbg(cases.size(), U4{ 7, 7, 7, 7 });
+    DevBuf bDbg = mkBuf(dev, dbg);
+    Kernel kb("fcConvexTri.spv", "ctFcConvexTri",
+              { (uint32_t)sizeof(FctCase), 16 }, sizeof(FctParams));
+    PXG_CHECK_MSG(kb.isValid(), "the reference core pipeline must build");
+    if (kb.isValid())
+    {
+        kb.dispatch((uint32_t(cases.size()) + 63u) / 64u, { bCases.h, bDbg.h }, fp2);
+        dev->flush();
+    }
+
+    // ---- compare the two contact streams as multisets ----
+    const uint32_t cntA = downloadBuffer<uint32_t>(dev, wa.count.h, 1)[0];
+    const uint32_t cntB = downloadBuffer<uint32_t>(dev, wb.count.h, 1)[0];
+    PXG_CHECK_MSG(cntA == cntB,
+                  "the kernel emitted %u contacts, the reference core over the mirrored glue "
+                  "emitted %u", cntA, cntB);
+    PXG_CHECK_MSG(cntA > 0u, "no contacts at all -- the rig measures nothing");
+
+    if (cntA == cntB && cntA > 0u)
+    {
+        const uint32_t n = std::min(cntA, CAP);
+        const auto pA = downloadBuffer<F4>(dev, wa.point.h, n);
+        const auto nA = downloadBuffer<F4>(dev, wa.normalPen.h, n);
+        const auto yA = downloadBuffer<F4>(dev, wa.bary.h, n);
+        const auto iA = downloadBuffer<FemInfoHost>(dev, wa.info.h, n);
+        const auto pB = downloadBuffer<F4>(dev, wb.point.h, n);
+        const auto nB = downloadBuffer<F4>(dev, wb.normalPen.h, n);
+        const auto yB = downloadBuffer<F4>(dev, wb.bary.h, n);
+        const auto iB = downloadBuffer<FemInfoHost>(dev, wb.info.h, n);
+        std::vector<bool> used(n, false);
+        size_t mm = 0;
+        for (uint32_t a = 0; a < n; ++a)
+        {
+            bool found = false;
+            for (uint32_t b = 0; b < n && !found; ++b)
+            {
+                if (used[b]) continue;
+                if (f2u(pA[a].x) != f2u(pB[b].x) || f2u(pA[a].y) != f2u(pB[b].y) ||
+                    f2u(pA[a].z) != f2u(pB[b].z) || f2u(pA[a].w) != f2u(pB[b].w)) continue;
+                if (f2u(nA[a].x) != f2u(nB[b].x) || f2u(nA[a].y) != f2u(nB[b].y) ||
+                    f2u(nA[a].z) != f2u(nB[b].z) || f2u(nA[a].w) != f2u(nB[b].w)) continue;
+                if (f2u(yA[a].x) != f2u(yB[b].x) || f2u(yA[a].y) != f2u(yB[b].y) ||
+                    f2u(yA[a].z) != f2u(yB[b].z)) continue;
+                if (iA[a].pairInd0 != iB[b].pairInd0 || iA[a].pairInd1 != iB[b].pairInd1 ||
+                    iA[a].rigidMatInd != iB[b].rigidMatInd) continue;
+                used[b] = true; found = true;
+            }
+            if (!found)
+            { if (mm < 4) std::printf("  btri contact %u (pt %g,%g,%g w %g / np %g,%g,%g,%g / "
+                                      "pair1 %u) has no match in the reference stream\n",
+                                      a, pA[a].x, pA[a].y, pA[a].z, pA[a].w,
+                                      nA[a].x, nA[a].y, nA[a].z, nA[a].w, iA[a].pairInd1);
+              ++mm; }
+        }
+        PXG_CHECK_MSG(mm == 0, "cloth_boxTriangleContactGen differs from the reference core over "
+                      "the mirrored glue in %zu contacts", mm);
+    }
+
+    // B4: the atomicMax carries the UNCLAMPED count, in bytes.
+    const uint32_t needed = downloadBuffer<uint32_t>(dev, bNeeded.h, 1)[0];
+    PXG_CHECK_MSG(needed == (stackPairs + OVERSHOOT) * 16u,
+                  "stackSizeNeeded reads %u, expected %u -- it must carry the UNCLAMPED pair "
+                  "count times 16, which is how the engine grows next frame's stack",
+                  needed, (stackPairs + OVERSHOOT) * 16u);
+
+    std::printf("    [ note ] %u contacts over %u triangles / %u pairs (1 skipped by the AND "
+                "filter, 1 kept with two corners filtered); stackNeeded %u vs stack %u\n",
+                cntA, NB_TRIS, stackPairs, needed, stackPairs * 16u);
+
+    killWriter(dev, wa); killWriter(dev, wb);
+    dev->destroyBuffer(bCVerts.h); dev->destroyBuffer(bCTris.h); dev->destroyBuffer(bHull.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h); dev->destroyBuffer(bShapes.h);
+    dev->destroyBuffer(bTc.h); dev->destroyBuffer(bCd.h); dev->destroyBuffer(bRd.h);
+    dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h); dev->destroyBuffer(bStack.h);
+    dev->destroyBuffer(bPairsNum.h); dev->destroyBuffer(bNeeded.h);
+    dev->destroyBuffer(bCases.h); dev->destroyBuffer(bDbg.h);
+}
 
 PXG_TEST(fcConvexTri_contactGen)
 {

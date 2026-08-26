@@ -1705,6 +1705,138 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.15d — `cloth_boxTriangleContactGenLaunch`: geschrieben, gefegt, und **bewusst NICHT abgebildet** — er stürzt auf echten Engine-Daten ab
+
+Portiert `femClothPrimitives.cu:3357` (Wrapper) und `:3216-3355`
+(`clothBoxTriangleCollision`), beide vollständig gelesen. Manifest bleibt
+**356**. Neue ABI-Zeile `kClothBoxTriCg[] = {4,8,8,8,8,8,8,8,8,8,8,4,4,8,80}` —
+fünfzehn Argumente, das letzte der Writer by value.
+
+### DAS ERGEBNIS ZUERST, WEIL ES EIN TEILERGEBNIS IST
+
+Der Kernel ist geschrieben, seine Vorrichtung ist grün, das Fegen ist **13 von
+13**. Und er ist **trotzdem nicht abgebildet**, weil er auf echten Engine-Daten
+**segfaultet**.
+
+Gemessen, nicht vermutet:
+
+| Manifest-Zeile | `PXG_SCENE=cloth` |
+|---|---|
+| abgebildet | **Segfault** nach ~50 Schritten (`segfault at 0`, Schreibzugriff in einem AVX-512-Scatter) |
+| `nullptr` | grün |
+
+Ein Kernel, der die Szenen zum Absturz bringt, ist kein Fortschritt, auch wenn
+seine Vorrichtung grün ist. Die Manifest-Zeile trägt den Grund im Klartext, damit
+niemand sie versehentlich anschaltet.
+
+**Was das über die Vorrichtung sagt, ist der eigentliche Befund:** eine
+Unit-Vorrichtung UND ein Differential gegen den bereits gefegten Kern waren beide
+grün, und die Engine hat den Fehler in unter einer Minute gefunden. Die
+Vorrichtung fährt einen von Hand geschriebenen Hüllen-Blob; die Engine liefert
+den, den *sie* für eine `PxBoxGeometry` baut. Der nächste Schritt ist deshalb
+nicht, den Kernel zu reparieren, sondern **zu messen, was in
+`rigidShape.hullOrMeshPtr` einer Engine-Box tatsächlich steht** — und die
+Vorrichtung mit genau diesem Blob zu füttern, statt mit einem selbst gebauten.
+
+Ein erster Versuch, das mit einem Wächter auf die dekodierten Zählwerte zu
+prüfen, hat **nichts** gesagt: er kompilierte nicht (`import` ist in Slang nicht
+transitiv, `pxgSlangConvexHull` war in dieser Übersetzungseinheit nicht
+sichtbar), und der Lauf benutzte die alte `.spv`. Das ist hier notiert, weil ein
+Diagnoseversuch, der still die alte Binärdatei misst, genau die Sorte Fehler ist,
+die diese Tranche sonst bei anderen findet.
+
+### Die Zahl, die dadurch NICHT erreicht wurde
+
+| | verweigerte Kernel der Szene `cloth` |
+|---|---|
+| vor P9.15a | 3 |
+| nach P9.15a | 2 |
+| nach P9.15b | 1 |
+| jetzt | **1** — unverändert |
+
+### Nur die Glue — die Maschine lag schon
+
+Der Kontaktapparat dieses Kernels ist nicht seiner: P9.15c hat ihn nach
+`pxgSlangConvexTriCloth` gehoben, wo eine Phase-1-Batterie ihn gegen eine
+vollständige CPU-Abschrift prüft. Diese Tranche ist **genau das**, was der
+Kopfkommentar jenes Moduls seit jeher als „caller glue not ported" aufführt:
+Paar laden, die zwei Transformationen bauen, filtern, das Dreieck in den
+Konvexraum bewegen, eine `FctCase` füllen, aufrufen.
+
+Sieben Fallen, jede mit einem Mutanten:
+
+* **B1 — der Filter ist ein UND über alle drei Ecken.** Ein Dreieck wird nur
+  übersprungen, wenn **jede** seiner Ecken gefiltert ist. Der Vertex-Kernel
+  nebenan springt bei **einer** Übereinstimmung. Zwei Kernel, eine Filterliste,
+  entgegengesetzte Quantoren — und ein `||` hier verwirft still jedes Dreieck,
+  das eine angeheftete Ecke teilt, also den Normalfall eines an wenigen Punkten
+  fixierten Tuchs.
+* **B2 — das Tuch wird NICHT skaliert.** Die drei `vertex2Shape`-Aufrufe stehen
+  in der CUDA **auskommentiert** da; nur der Starrkörper trägt eine Formskala.
+* **B3/B4 — der Zähler läuft über, der Verbrauch ist gedeckelt.** `numPairs =
+  min(*midphasePairsNum, stackSize)`, aber `stackSizeNeeded` bekommt den
+  **ungedeckelten** Wert — genau daran wächst der Stapel des nächsten Frames.
+* **B5 — zwei Transformationen, eine davon eine Komposition.**
+  `trimeshToConvex = rigidTransform.transformInv(clothTransform)` bewegt das
+  Dreieck, während `convexTransform` — die, mit der das Modul den Kontakt zurück
+  in den Weltraum legt — die **eigene** des Starrkörpers ist.
+* **B6 — `restDistance` über `cmIdx`, `contactDistance` über die Cache-Refs.**
+
+### Die Vorrichtung: ein GPU-Differential, weil die Maschine schon geprüft ist
+
+Den SAT-, Clipping- und Reduktionsapparat hier ein drittes Mal abzuschreiben wäre
+genau die Duplikation, die dieser Port vermeidet. Stattdessen die P8.97d-Anordnung:
+**derselbe Arena, zwei Wege.** Der echte Kernel läuft darauf; dann läuft der
+bereits gefegte Kern (`ctFcConvexTri`) über `FctCase`s, die ein **Host-Spiegel der
+Glue** gebaut hat; die beiden Kontaktströme werden als Multimenge bit-genau
+verglichen. Der Kern ist auf beiden Seiten konstruktionsgemäß identisch — jeder
+Unterschied ist die Glue, und der Spiegel sind fünfzig Zeilen Transformationen
+statt eines zweiten SAT.
+
+### Was die Vorrichtung mich gelehrt hat, bevor sie grün war
+
+**Dreiecksgröße.** Drei Läufe lieferten null Kontakte bei bestandenem SAT. Die
+Ursache stand in der Phase-1-Batterie: ihre Dreiecke laufen von 4,5 bis 7
+Einheiten gegen eine Kiste mit Halbmaß ~1. Die Kontaktstufe schneidet die
+**Referenzfläche gegen das Dreieck** — ein Dreieck, das in die Fläche passt, gibt
+dem Clipper nichts zu schneiden. Meine waren 0,9 × 0,22 gegen eine Fläche von
+2,2 × 3,4. Jetzt sind sie größer als die Fläche.
+
+**Und ein echter Befund: dasselbe Modul wurde unter ZWEI FMA-Politiken
+übersetzt.** Mit passender Geometrie stimmten die Zählerstände (35 = 35), aber 28
+von 35 Kontakten wichen ab. `femClothContactGenBda` steht in
+`PXG_NOCONTRACT_SHADERS`, `fcConvexTri` stand nicht darin — also wurde der
+**gemeinsame** Körper in jedem der beiden Shader anders kontrahiert. Der P9.15a-
+Modulkopf hatte diese Möglichkeit notiert und für `spherebox` als harmlos
+eingeordnet; über einer SAT-/Clipping-Kette ist sie es nicht. `fcConvexTri` trägt
+jetzt denselben Stempel — was es zusätzlich **näher** an seine eigene
+CPU-Referenz rückt, die mit `-ffp-contract=off` gebaut ist. Batterie unverändert
+grün, Differential bit-genau.
+
+### Zwei Überlebende, beide zufällige Symmetrien
+
+* `b5-toconv-rotate-forward` (Rotation statt inverser Rotation) überlebte, weil
+  der Versatz zwischen Tuch und Kiste **genau auf der Drehachse der Kiste** lag:
+  `(0, dy, 0)` um +y gedreht ist `(0, dy, 0)`, vorwärts wie rückwärts. Der
+  Versatz hat jetzt x- und z-Anteile.
+* `contactdist-cloth-only` überlebte, weil das Band, das der Anteil des
+  Starrkörpers öffnet, 0,08 breit war und kein Dreieck darin lag. Der Anteil des
+  Starrkörpers ist jetzt die **größere** Hälfte (0,50 gegen 0,22) und ein
+  Dreieck liegt mittendrin.
+
+Danach: **13 von 13 getötet, 0 überlebt.**
+
+### Verifikation
+
+* Fegen **13 von 13**, zwangsfrisch;
+* Phase-1-Batterie unverändert grün nach dem NoContraction-Stempel;
+* Suite **817/817** in **beiden** Speichermodi;
+* Szenen: `cloth` und `clothbox` einzeln geprüft und grün, mit der Zeile auf
+  `nullptr`; die übrigen 29 sind von dieser Tranche unberührt, weil außer der
+  Manifest-Zeile nichts Engine-Sichtbares angefasst wurde (`fcConvexTri` ist ein
+  reiner Test-Shader);
+* `cloth` verweigert weiterhin **einen** Kernel — diesen.
+
 ## P9.15c — der Konvex-Dreieck-Kern wird gehoben: BDA statt Bindungen, Modul statt Einsprungpunkt (kein Manifest-Zuwachs)
 
 Kein neuer Kernel: **356** bleibt **356**. Diese Tranche räumt das Hindernis
