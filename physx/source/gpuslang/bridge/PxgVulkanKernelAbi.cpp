@@ -1695,6 +1695,10 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_primitivesCollisionLaunch", kPsPrimCollide, uint32_t(sizeof(kPsPrimCollide)) },
     { "ps_primitivesDiffuseCollisionLaunch", kPsPrimDiffuseCollide, uint32_t(sizeof(kPsPrimDiffuseCollide)) },
     { "ps_convexCollisionLaunch", kPsConvexCollide, uint32_t(sizeof(kPsConvexCollide)) },
+    // P9.14c: the diffuse twin takes the SAME 14-argument pack as the diffuse
+    // primitives kernel -- no writer struct, since its output is the per-particle
+    // one-way list reached through the particle system itself.
+    { "ps_convexDiffuseCollisionLaunch", kPsPrimDiffuseCollide, uint32_t(sizeof(kPsPrimDiffuseCollide)) },
     { "ps_meshCollisonLaunch", kPsMeshCollide, uint32_t(sizeof(kPsMeshCollide)) },
     // gpunarrowphase particleSystemHFMidPhaseCG.cu:262 (P9.11 particle-vs-heightfield)
     { "ps_heightfieldCollisonLaunch", kPsHfCollide, uint32_t(sizeof(kPsHfCollide)) },

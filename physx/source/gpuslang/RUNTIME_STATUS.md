@@ -7,13 +7,15 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **816/816** green in both modes (`ctest -N` in `build-gpuslang`).
-Szenen: **29/29** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
-Inventar (28 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
+Test count: **817/817** green in both modes (`ctest -N` in `build-gpuslang`).
+Szenen: **30/30** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
+Inventar (29 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
 wertet.  `particlediffuse` kam in P9.13a als Diagnose hinzu und ist seit P9.13d
-gewertet; die Diagnoseliste trägt jetzt wieder nur die sechs Kontrollen, die
-durchfallen SOLLEN, weil sie die Referenz der echten Prüfung sind.  P9.9 fügte `particlefluidboundary` hinzu, P9.10c
+gewertet; `particleconvex` kam in P9.14a als ausstehende Arbeit hinzu und ist
+seit P9.14c gewertet — womit die Liste der ausstehenden Arbeit **leer** ist.  Die
+Diagnoseliste trägt jetzt wieder nur die sechs Kontrollen, die durchfallen
+SOLLEN, weil sie die Referenz der echten Prüfung sind.  P9.9 fügte `particlefluidboundary` hinzu, P9.10c
 `particlemeshfloor`, P9.11c `particlehffloor`.
 *(This line read 696/696 before P8.20 and had drifted: `run_suite.sh` has been
 reporting 673/674/675 for several tranches while the header kept an older
@@ -1700,6 +1702,166 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.14c — `ps_convexDiffuseCollisionLaunch` (Manifest **354**): die Diffus-Kette ist geschlossen — und der zweite Engine-Fehlerkandidat dieser Woche ist ein `return`, wo ein `continue` stehen müsste
+
+Portiert `cudaParticleSystem.cu:1586` (Wrapper) und `:986-1130`
+(`psConvexDiffuseCollision`), beide vollständig gelesen. Manifest **353 → 354**.
+Das ist der **letzte Kernel der Diffus-Kette** und die letzte Diffus-Zeile, die
+im Manifest noch `nullptr` trug. ABI-Zeile: die vorhandene
+`kPsPrimDiffuseCollide[] = {1,4,4,8×11}` (104 B) — dieser Kernel hat **keine**
+Writer-Struktur, weil seine Ausgabe die Ein-Weg-Liste im Partikelsystem selbst
+ist.
+
+### Komponiert, nicht abgeschrieben
+
+Der Kernel steht zu `ps_convexCollisionLaunch` genau so, wie
+`ps_primitivesDiffuseCollisionLaunch` zu `ps_primitivesCollisionLaunch` steht.
+Er bekommt deshalb **keinen einzigen neuen Baustein**: `psStageHull` (in P9.14c
+aus dem Flüssigkeitszwilling herausgezogen, damit beide Konvex-Einsprungpunkte
+eine Schreibweise teilen), `particleConvexCollision`, `getSpecVolume`,
+`binarySearchRunSum`, `calcGridHashInBounds` — alles liegt schon und ist
+gefegt. Die Tranche ist die **Differenzliste**, und die ist kurz:
+
+| | Flüssigkeit (X…) | Diffus (XD…) |
+|---|---|---|
+| Gitter | `mCellStart/End` | `mDiffuseCellStart/End` |
+| Positionen | `mSortedOriginPos_InvMass` / `mSortedPositions_InvMass` | `mDiffuseSortedOriginPos_LifeTime` / `mDiffuseSortedPos_LifeTime` |
+| Filter | `findPs` auf dem **unsortierten** Index | **keiner** |
+| Ausgabe | globaler Kontaktstrom über `writeContact` | pro Partikel, `particleIndex + slot * numParticles` |
+| Deckel | `maxContacts`, Zähler läuft über | `MaxStaticContactsPerParticle` = 12, Zähler läuft über |
+| Frühausstieg | — | `mMaxDiffuseParticles == 0` **im Wrapper** |
+
+`isDiffuse = true` ist hier die **konsistente** Wahl; es ist der
+Flüssigkeitszwilling, der aus der Reihe tanzt (X1, P9.14b).
+
+### ENGINE-FEHLERKANDIDAT: `return` statt `continue` (dokumentiert, NICHT gemeldet)
+
+`cudaParticleSystem.cu:1653`, innerhalb von
+`for (i = 0; i < nbIterationsPerWarps; ++i)`:
+
+```c
+// If there is no diffuse particles or is not using PBD, skip this function
+if (ss_particleSystem.mCommonData.mMaxDiffuseParticles == 0)
+    return;
+```
+
+Der Kommentar sagt „skip this function"; die Anweisung wirft **den ganzen
+restlichen Lauf des Warps** weg. Und weil jeder Warp einen **zusammenhängenden
+Block** von `nbIterationsPerWarps` Arbeitsindizes besitzt (X3) und aufeinander
+folgende Indizes zu dem Paar gehören, in das die Laufsumme sie legt, verliert
+ein Warp, der auf **ein** Partikelsystem ohne Diffusseite trifft, jedes spätere
+Arbeitspaket seines Laufs — **auch solche, die zu Systemen gehören, die sehr
+wohl Diffuspartikel haben.**
+
+Unerreichbar, solange eine Iteration für das ganze Gitter reicht
+(`nbWarpsRequired <= 1024*8 = 8192` Zellen); darüber verliert er still Kontakte.
+Der Diffus-Primitiven-Zwilling hat diese Form **nicht**: dessen Wächter sitzt im
+**Rumpf** (D5), und seine Wrapper-Schleife läuft einfach weiter.
+
+Abgeschrieben wie er dasteht. Der Auftrag dieses Ports ist, die Engine zu
+treffen — auch dort, wo sie falsch liegt. Der Mutant, der ihn zu `continue`
+„repariert", **muss sterben**, und die Vorrichtung ist eigens so gebaut, dass er
+es tut. Das ist der **zweite** Kandidat dieser Woche und der **dreißigste**
+insgesamt; keiner ist gemeldet, weil dafür keine Freigabe vorliegt (#90).
+
+### Die Vorrichtung: 8193 Arbeitspakete, damit `return` und `continue` überhaupt zu unterscheiden sind
+
+Das ist die einzige teure Entscheidung der Tranche, und sie ist erzwungen.
+`nbIterationsPerWarps = ceil(nbWarpsRequired / (1024*8))`. Für **jede** Zahl
+unter 8193 ist das **1** — und bei genau einer Iteration pro Warp sind `return`
+und `continue` **buchstäblich dieselbe Anweisung**. Ein Fegen, das den Kandidaten
+oben nicht prüfen kann, misst an der interessantesten Stelle nichts.
+
+Also 8193 Arbeitspakete, `nbIter = 2`, und jeder Warp besitzt ein
+**zusammenhängendes Paar** `{2w, 2w+1}`:
+
+* Paar 0 → System A, Pakete 0..13 — **vierzehn** über derselben Zelle, also
+  Zählerstand 14 gegen einen Deckel von 12;
+* Paar 1 → System B (CCD), Pakete 14..16 — drei, ganz unter dem Deckel;
+* Paar 2 → das **Fallensystem** (`mMaxDiffuseParticles == 0`, alles andere
+  lebendig), Pakete 17..**8190** — und 8190 ist **gerade**;
+* Paar 3 → System C, Pakete **8191**..8192.
+
+Warp 4095 besitzt `{8190, 8191}`: er trifft zuerst die Falle, **kehrt zurück**
+und wirft 8191 weg. Warp 4096 besitzt `{8192, 8193}`; 8193 liegt hinter dem
+Ende. **System C wird also genau EINMAL erreicht, und sein Zähler muss 1
+lesen.** Zwei ist der Mutant.
+
+Die 8174 Fallenpakete kosten fast nichts — Binärsuche, ein Feldzugriff,
+`return`, alles noch vor der Hüllenaufbereitung. Der Lauf dauert **63 s**
+allein und **21 s** in der Suite (warme Pipeline-Cache) — was die Tranche
+bewusst bezahlt, weil ohne ihn an der interessantesten Stelle nichts gemessen
+würde.
+
+### Was die Vorrichtung sonst verlangt (statt zu hoffen)
+
+* **Ein Orakel, zwei Nutzer.** Der neue `PXG_TEST` liegt in **derselben
+  Übersetzungseinheit** wie der von P9.14b und benutzt dessen
+  Kasten-Vorzeichenabstand, dessen Hüllenblob, dessen Partikelband und dessen
+  `ccdAccepted()`. Eine zweite Datei wäre eine zweite Abschrift genau der Sache,
+  die stimmen muss.
+* **Die Flüssigkeitsfelder sind mitverdrahtet** — auf eine andere, harmlose
+  Konfiguration — die Zellspanne [0, 6), Partikel weit weg von der Hülle. Der
+  erste Entwurf ließ
+  sie NULL, damit ein falscher Zugriff kracht; ein Absturz ist zwar ein Kill,
+  aber der schwächste: er hängt am Allokator, er kann unter llvmpipe flattern,
+  und er sagt nicht, welches Feld gelesen wurde. Jetzt stirbt ein
+  Flüssigkeitsfeld an einer **deterministisch leeren** Kontaktmenge.
+* **Vier verschiedene Schrittweiten** (47 / 53 / 41 / 59), keine gleich einer
+  Partikelzahl, Zellgrenze, Paketzahl oder dem Deckel — die stehende Regel, die
+  fünf frühere Tranchen einen ersten Fegedurchgang gekostet hat.
+* **Der Filter ist vollständig verdrahtet** und benennt weiterhin
+  `FILTERED_SORTED` — und dieser Kernel muss trotzdem einen Kontakt dafür
+  liefern (XD3). Die Deckungsprüfung **verlangt** das, statt es zu hoffen.
+* **Die Falle hat lebendige Ausgabefelder**, die vergiftet zurückkommen müssen:
+  der Wächter ist damit an seiner Wirkung festgenagelt, nicht an einem
+  Nullzeiger.
+* Jeder nicht beschriebene Platz im spaltenweisen Ausgabefeld — und das sind
+  `12 * numParticles + 64` minus der erwarteten Menge — wird auf Gift geprüft.
+  Dort landen die Versuche jenseits des Deckels, und dort landet eine falsche
+  Schrittweite.
+
+### Verifikation
+
+* Vorrichtung **beim ersten Lauf grün**: 27 angenommene Partikel (×14, bei 12
+  gedeckelt) / 31 mit CCD (×3) / 27 hinter dem `return` der Falle (×1);
+  schlechtester `|normal|-1` **4,88e-15**, schlechtester Eindringfehler
+  **2,42e-07**;
+* Fegen: **24 von 24 getötet, 0 ÜBERLEBT**, zwangsfrisch — in zwei Durchgängen,
+  und der zweite ist Teil des Ergebnisses, nicht eine Nachbesserung: der erste
+  meldete 17 Tote, einen Absturz-Toten und **sechs ANCHOR-FAIL**. Die sechs sind
+  nach der stehenden Regel **ungetestet**, kein Kill — ihre Ankertexte stehen im
+  Diffus-Primitiven-Kernel derselben Übersetzungseinheit **wortgleich** ein
+  zweites Mal. Neu verankert (über die `XD`-Kommentare bzw. die
+  `infos[outputIndex]`-Zeile, die sich zwischen den beiden Kerneln unterscheidet)
+  und erneut gefegt: alle sechs tot. Der Absturz-Tote (`xd1-cellend-is-fluid`)
+  wurde ebenfalls neu gemessen: er las das Flüssigkeits-`cellEnd` (3) gegen den
+  Diffus-`cellStart` (4), was **unterläuft** und über das Feld hinausläuft. Das
+  Flüssigkeitsintervall steht jetzt auf [0, 6) und umschließt `CELL_START`, also
+  ist jede Mischung der beiden Gitter eine kleine, gültige, **falsche**
+  Partikelspanne — ein sauberer Kill statt eines Absturzes;
+* Suite **817/817** in **beiden** Speichermodi;
+* Szenen: **30 ok, 0 fail, 0 missing (of 30)** — `particleconvex` ist von der
+  Liste der ausstehenden Arbeit in die **gewertete** Liste gewandert und trägt
+  jetzt ein eigenes Verdikt.
+
+### Die Szene, zum zweiten Mal auf demselben Boden
+
+| | P9.14a (beide unabgebildet) | P9.14b (Flüssigkeit) | jetzt |
+|---|---|---|---|
+| Flüssigkeit, mittleres y | −39.3227 | **0.1667** | **0.1667** |
+| tiefstes Diffus-y | −39.9191 | −39.6138 | **−0.1886** |
+| `fail to launch` | 45× + 45× | 45× | **0×** |
+
+**−0.1886 ist exakt die Zahl, die `particlediffuse` über einem
+PRIMITIVEN Boden misst** — dieselbe Gischt, dieselbe Ruhelage, ein anderer
+Formtyp und ein anderer Kernel-Pfad. Und die Szene sagt beides in einem Bild:
+die Flüssigkeit ruht auf der Hülle, die Gischt ruht auf der Flüssigkeit.
+
+Damit ist die **Liste der ausstehenden Arbeit in `run_scenes.sh` leer** — zum
+ersten Mal, seit sie in P9.14a angelegt wurde. Sie bleibt im Skript stehen, für
+die nächste Szene, die sie braucht.
 
 ## P9.14b — `ps_convexCollisionLaunch` (Manifest **353**): GJK/EPA gegen eine gekochte Hülle, komponiert statt abgeschrieben — und ein ENGINE-WIDERSPRUCH im Flüssigkeitspfad
 

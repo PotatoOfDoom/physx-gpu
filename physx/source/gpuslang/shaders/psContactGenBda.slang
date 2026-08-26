@@ -1061,6 +1061,42 @@ float3 psVertex2Shape(float3 v, float3 scale, float4 rot)
     return quatRotateInv(rot, t);
 }
 
+// The cooked-hull decode and world-space staging, shared by BOTH convex entry
+// points (psConvexCollision :807 and psConvexDiffuseCollision :1000 spell it out
+// identically, down to the eBOX-only scale factor).  One spelling, two callers.
+GjkCloud psStageHull(PxgShape rigidShape, float4 rigidQ, float3 rigidP,
+                     out float inSphereRadius1)
+{
+    const uint64_t hullPtr = uint64_t(rigidShape.hullOrMeshOffset.x) |
+                             (uint64_t(rigidShape.hullOrMeshOffset.y) << 32);
+    const uint hullDesc = chHullDesc(hullPtr);
+    const float4 extents = chExtents(hullPtr);
+    // Upstream asserts nbVertices1 <= CONVEX_MAX_VERTICES_POLYGONS (64), which is
+    // exactly GJK_MAX_CLOUD; clamped so a corrupt header cannot walk off the
+    // cloud, as the softbody path does.
+    const uint nbVerts = min(chNbVerts(hullDesc), GJK_MAX_CLOUD);
+
+    const float3 scale = float3(rigidShape.scaleX, rigidShape.scaleY, rigidShape.scaleZ);
+    const float4 scaleRot = float4(rigidShape.scaleRotX, rigidShape.scaleRotY,
+                                   rigidShape.scaleRotZ, rigidShape.scaleRotW);
+    // X5: 1.0 unless the shape is a BOX, whose PxMeshScale IS its half-extent.
+    float minScale1 = 1.0f;
+    if (rigidShape.type == GEOM_BOX)
+        minScale1 = min(scale.z, min(scale.x, scale.y));
+    inSphereRadius1 = extents.w * minScale1;
+
+    GjkCloud hull;
+    for (uint v = 0u; v < GJK_MAX_CLOUD; ++v) hull.v[v] = float3(0.0f, 0.0f, 0.0f);
+    hull.n = nbVerts;
+    // prepareVertices (cudaNpCommon.h:315): vertex space -> shape space -> world.
+    for (uint v = 0u; v < nbVerts; ++v)
+    {
+        const float3 vv = chVertex(hullPtr, v).xyz;
+        hull.v[v] = quatRotate(rigidQ, psVertex2Shape(vv, scale, scaleRot)) + rigidP;
+    }
+    return hull;
+}
+
 // particleConvexCollision (cudaParticleSystem.cu:666), composed.  Returns false
 // only for DISTANT; everything else leaves its answer in `o`.
 bool particleConvexCollision(float3 particlePos, float3 cVolumePos, float cVolumeRadius,
@@ -1180,33 +1216,8 @@ void ps_convexCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
                                                    workIndex - startPairIndex, gridSize);
 
         // ---- the hull, decoded and staged in world space once per work item ----
-        const uint64_t hullPtr = uint64_t(rigidShape.hullOrMeshOffset.x) |
-                                 (uint64_t(rigidShape.hullOrMeshOffset.y) << 32);
-        const uint hullDesc = chHullDesc(hullPtr);
-        const float4 extents = chExtents(hullPtr);
-        // Upstream asserts nbVertices1 <= CONVEX_MAX_VERTICES_POLYGONS (64), which
-        // is exactly GJK_MAX_CLOUD; clamped so a corrupt header cannot walk off
-        // the cloud, as the softbody path does.
-        const uint nbVerts = min(chNbVerts(hullDesc), GJK_MAX_CLOUD);
-
-        const float3 scale = float3(rigidShape.scaleX, rigidShape.scaleY, rigidShape.scaleZ);
-        const float4 scaleRot = float4(rigidShape.scaleRotX, rigidShape.scaleRotY,
-                                       rigidShape.scaleRotZ, rigidShape.scaleRotW);
-        // X5.
-        float minScale1 = 1.0f;
-        if (rigidShape.type == GEOM_BOX)
-            minScale1 = min(scale.z, min(scale.x, scale.y));
-        const float inSphereRadius1 = extents.w * minScale1;
-
-        GjkCloud hull;
-        for (uint v = 0u; v < GJK_MAX_CLOUD; ++v) hull.v[v] = float3(0.0f, 0.0f, 0.0f);
-        hull.n = nbVerts;
-        // prepareVertices (cudaNpCommon.h:315): vertex space -> shape space -> world.
-        for (uint v = 0u; v < nbVerts; ++v)
-        {
-            const float3 vv = chVertex(hullPtr, v).xyz;
-            hull.v[v] = quatRotate(rigidQ, psVertex2Shape(vv, scale, scaleRot)) + rigidP;
-        }
+        float inSphereRadius1;
+        const GjkCloud hull = psStageHull(rigidShape, rigidQ, rigidP, inSphereRadius1);
 
         // ---- the cell ----
         const uint startIndex = Ptr<uint>(systems[psId].mCellStart)[gridHash];
@@ -1262,6 +1273,247 @@ void ps_convexCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
             InterlockedAdd(Ptr<uint>(gP.w_numTotalContacts)[0], 1u, index);
             writeContact(index, float4(-o.direction.xyz, pen),
                          uint2(particleIndex, psId), rigidId);
+        }
+    }
+}
+
+// ===========================================================================
+// P9.14c -- ps_convexDiffuseCollisionLaunch
+// gpunarrowphase/src/CUDA/cudaParticleSystem.cu:1586 (wrapper) and :986-1130
+// (psConvexDiffuseCollision), both read in full.
+//
+// The DIFFUSE twin of the kernel above, and the LAST kernel of the diffuse
+// chain -- the last diffuse row in the manifest that still carried nullptr.
+// It stands to ps_convexCollisionLaunch exactly as
+// ps_primitivesDiffuseCollisionLaunch stands to ps_primitivesCollisionLaunch:
+// same work-index run, same hull staging, same GJK/EPA policy, different grid,
+// different positions, no filter, and a per-particle output instead of a
+// global contact stream.  So it composes psStageHull and
+// particleConvexCollision rather than transcribing either a third time, and
+// the delta list below is the whole tranche.
+//
+// ---------------------------------------------------------------------------
+// XD1 -- the GRID is the diffuse one: mDiffuseCellStart / mDiffuseCellEnd.  The
+//     HASH is not -- it still comes from the system's common cell width and
+//     grid size, so both grids share one index space.  Identical to D1.
+//
+// XD2 -- the positions are mDiffuseSortedOriginPos_LifeTime (current) and
+//     mDiffuseSortedPos_LifeTime (predicted).  P9.13e overloads the FORMER with
+//     velocity averages between UpdatePBF and Compact, but this kernel runs in
+//     narrowphase, before either.  Identical to D2.
+//
+// XD3 -- there is NO FILTER.  The fluid twin calls findPs on the UNSORTED index
+//     (X9); this path calls particleConvexCollision unconditionally.  Identical
+//     to D4, and it is the difference that makes the two bodies diverge right
+//     where they look most alike.
+//
+// XD4 -- the OUTPUT is the per-particle one-way list, not the global contact
+//     stream: atomicAdd on counts[particleIndex], and if the returned slot is
+//     below MaxStaticContactsPerParticle write the normal/penetration, a ZEROED
+//     impulse and the rigid node index at particleIndex + slot * numParticles.
+//     Column-major with a stride of numParticles -- P9.13f's consumer reads
+//     exactly that, and P9.13g's producer writes exactly that.  The counter
+//     always advances and only the write is capped (D7 / X10, the same
+//     overshoot contract in a third kernel).
+//
+// XD5 -- numParticles is `*mNumDiffuseParticles`, slot [0] of the two-slot pair
+//     P9.13c documented: the PUBLISHED count, not the staging count.
+//
+// XD6 -- THE EARLY-OUT IS A `return`, NOT A `continue`, AND IT IS IN THE
+//     WRAPPER.  cudaParticleSystem.cu:1653, inside
+//     `for (i = 0; i < nbIterationsPerWarps; ++i)`:
+//
+//         // If there is no diffuse particles or is not using PBD, skip this function
+//         if (ss_particleSystem.mCommonData.mMaxDiffuseParticles == 0)
+//             return;
+//
+//     The comment says "skip this function"; the statement abandons the WARP'S
+//     WHOLE REMAINING RUN.  Because each warp owns a CONTIGUOUS run of
+//     nbIterationsPerWarps work indices (X3) and consecutive indices belong to
+//     whichever pair the run-sum puts them in, a warp that meets one
+//     diffuse-less particle system drops every later work item in its run --
+//     including items belonging to particle systems that DO have diffuse
+//     particles.  It is unreachable while one iteration is enough for the whole
+//     grid (nbWarpsRequired <= 1024*8 = 8192 cells), which is why no scene has
+//     ever hit it; past that it silently loses contacts.
+//
+//     The diffuse PRIMITIVES twin does not have this shape: its guard sits in
+//     the BODY (D5) and its wrapper's loop simply moves on.
+//
+//     ENGINE BUG CANDIDATE -- DOCUMENTED, NOT REPORTED.  Transcribed exactly:
+//     this port matches the engine, including where the engine is wrong, and a
+//     mutant that "fixes" it to `continue` must die.
+//
+// XD7 -- isDiffuse = TRUE in the speculative contact volume.  Here that is the
+//     CONSISTENT choice; it is the FLUID twin that is odd (X1).
+//
+// XD8 -- the wrapper's early-out runs BEFORE the bounds and the grid hash are
+//     computed, unlike D5 which sits after them in the body.  Both orders reach
+//     the same set of cells; the placement is kept because the `return` above
+//     makes it observable -- moving it later would change which work items in
+//     the run are abandoned.
+//
+// X4 applies unchanged: our GJK/EPA driver is per-thread, so lane 0 of each
+// warp does the whole work item and the per-warp shared EpaScratch,
+// ParticleConvexCollideScratch and warpCopy'd PxgParticleSystem all disappear.
+// The block shape stays (32, 8, 1) because that is what the engine dispatches.
+// X2 (combine is the OVERLAP), X5 (the eBOX-only scale factor), X6 (CCD runs
+// GJK twice and only the second answer survives), X7 (the stored normal is
+// NEGATED) and X8 (the three-lane penetration is a dot product) are all
+// identical here and live in psStageHull / particleConvexCollision.
+// ===========================================================================
+
+[shader("compute")]
+[numthreads(32, 8, 1)]
+void ps_convexDiffuseCollisionLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    // X4: lane 0 owns the work item; the other 31 have nothing to do.
+    if (gtid.x != 0u)
+        return;
+    const uint warpIndex = gtid.y;
+    const bool isTGS = (gP.isTGSWord & 0xffu) != 0u;
+
+    Ptr<PxgContactManagerInput> cmInputs = Ptr<PxgContactManagerInput>(gP.cmInputs);
+    Ptr<PxgShape> shapes = Ptr<PxgShape>(gP.shapes);
+    Ptr<PxsCachedTransform> transformCache = Ptr<PxsCachedTransform>(gP.transformCache);
+    Ptr<float> boundsArr = Ptr<float>(gP.bounds);
+    Ptr<float> contactDistance = Ptr<float>(gP.contactDistance);
+    Ptr<float> restDistances = Ptr<float>(gP.restDistances);
+    Ptr<uint> startIndices = Ptr<uint>(gP.startIndices);
+    Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gP.particleSystems);
+    Ptr<uint2> shapeToRigidRemap = Ptr<uint2>(gP.shapeToRigidRemap);
+
+    const uint nbWarpsRequired = Ptr<uint>(gP.totalNumPairs)[0];
+    const uint totalNumWarps = PS_GRID * WARPS_PER_BLOCK;
+    const uint nbIter = (nbWarpsRequired + totalNumWarps - 1u) / totalNumWarps;
+
+    for (uint i = 0u; i < nbIter; ++i)
+    {
+        // X3 again -- and here the CONTIGUITY is load-bearing, not merely the
+        // engine's spelling: XD6's `return` throws away the rest of THIS warp's
+        // run, so which items share a warp decides which ones are lost.
+        const uint workIndex = i + (warpIndex + WARPS_PER_BLOCK * gid.x) * nbIter;
+        if (workIndex >= nbWarpsRequired)
+            continue;
+
+        const uint pos = binarySearchRunSum(startIndices, gP.numTests, workIndex);
+        const uint startPairIndex = startIndices[pos];
+
+        // LoadShapePair<ePARTICLESYSTEM>: the particle shape goes to slot 0.
+        const PxgContactManagerInput cin = cmInputs[pos];
+        uint particleShapeRef = cin.shapeRef0;
+        uint particleCacheRef = cin.transformCacheRef0;
+        uint rigidShapeRef = cin.shapeRef1;
+        uint rigidCacheRef = cin.transformCacheRef1;
+        if (shapes[cin.shapeRef0].type != GEOM_PARTICLESYSTEM)
+        {
+            particleShapeRef = cin.shapeRef1;
+            particleCacheRef = cin.transformCacheRef1;
+            rigidShapeRef = cin.shapeRef0;
+            rigidCacheRef = cin.transformCacheRef0;
+        }
+
+        const uint psId = shapes[particleShapeRef].particleOrSoftbodyId;
+
+        // XD6/XD8: the wrapper's early-out, before the bounds and the hash, and
+        // spelled `return` exactly as the engine spells it.  NOT a `continue`.
+        if (systems[psId].mCommonData_MaxDiffuseParticles == 0u)
+            return;
+
+        const PxgShape rigidShape = shapes[rigidShapeRef];
+
+        const PxsCachedTransform tc = transformCache[rigidCacheRef];
+        const float4 rigidQ = float4(tc.qx, tc.qy, tc.qz, tc.qw);
+        const float3 rigidP = float3(tc.px, tc.py, tc.pz);
+        const uint2 rigidId = shapeToRigidRemap[rigidCacheRef];
+
+        const float cDistance = contactDistance[particleCacheRef] + contactDistance[rigidCacheRef];
+        const float restDistance = restDistances[pos];
+
+        // X2 again: `combine` is the OVERLAP region, then fattenFast(cDistance).
+        const uint pb = particleCacheRef * 6u;
+        const uint rb = rigidCacheRef * 6u;
+        float3 omn = max(float3(boundsArr[pb + 0u], boundsArr[pb + 1u], boundsArr[pb + 2u]),
+                         float3(boundsArr[rb + 0u], boundsArr[rb + 1u], boundsArr[rb + 2u]));
+        float3 omx = min(float3(boundsArr[pb + 3u], boundsArr[pb + 4u], boundsArr[pb + 5u]),
+                         float3(boundsArr[rb + 3u], boundsArr[rb + 4u], boundsArr[rb + 5u]));
+        omn -= float3(cDistance, cDistance, cDistance);
+        omx += float3(cDistance, cDistance, cDistance);
+
+        // XD1, first half: the HASH still comes from the system's common grid.
+        const float cellWidth = systems[psId].mCommonData_GridCellWidth;
+        const uint3 gridSize = uint3(systems[psId].mCommonData_GridSizeX,
+                                     systems[psId].mCommonData_GridSizeY,
+                                     systems[psId].mCommonData_GridSizeZ);
+        const uint gridHash = calcGridHashInBounds(omn, omx, cellWidth,
+                                                   workIndex - startPairIndex, gridSize);
+
+        // ---- the hull, decoded and staged in world space once per work item ----
+        float inSphereRadius1;
+        const GjkCloud hull = psStageHull(rigidShape, rigidQ, rigidP, inSphereRadius1);
+
+        // ---- XD1: the DIFFUSE bucket arrays ----
+        const uint startIndex = Ptr<uint>(systems[psId].mDiffuseCellStart)[gridHash];
+        if (startIndex == EMPTY_CELL)
+            continue;
+        const uint endIndex = Ptr<uint>(systems[psId].mDiffuseCellEnd)[gridHash];
+        const uint range = endIndex - startIndex;
+        if (range == 0u)
+            continue;
+
+        const bool enableCCD = (systems[psId].mData_Flags & PS_FLAG_ENABLE_CCD) > 0u;
+        // XD2: origin = current, sorted-pos = predicted.
+        Ptr<float4> curPos = Ptr<float4>(systems[psId].mDiffuseSortedOriginPos_LifeTime);
+        Ptr<float4> predPos = Ptr<float4>(systems[psId].mDiffuseSortedPos_LifeTime);
+
+        // XD4/XD5: the per-particle output arrays and the published count.
+        Ptr<float4> infos = Ptr<float4>(systems[psId].mDiffuseOneWayContactInfos);
+        Ptr<float> impulses = Ptr<float>(systems[psId].mDiffuseOneWayForces);
+        Ptr<uint2> nodeIndices = Ptr<uint2>(systems[psId].mDiffuseOneWayNodeIndex);
+        Ptr<uint> counts = Ptr<uint>(systems[psId].mDiffuseOneWayContactCount);
+        const uint numParticles = uint(Ptr<int>(systems[psId].mNumDiffuseParticles)[0]);
+
+        for (uint ind = 0u; ind < range; ++ind)
+        {
+            const uint particleIndex = startIndex + ind;
+
+            // XD3: no filter lookup on this path.
+            const float3 currentPos = curPos[particleIndex].xyz;
+
+            float3 cVolumePos;
+            float cVolumeRadius;
+            if (enableCCD)
+            {
+                const float3 predictedPos = predPos[particleIndex].xyz;
+                // XD7: isDiffuse = true.
+                cVolumeRadius = getSpecVolume(cVolumePos, currentPos, predictedPos,
+                                              cDistance, true, isTGS);
+            }
+            else
+            {
+                cVolumePos = currentPos;
+                cVolumeRadius = cDistance;
+            }
+
+            GjkOut o;
+            if (!particleConvexCollision(currentPos, cVolumePos, cVolumeRadius, enableCCD,
+                                         cDistance, rigidP, hull, inSphereRadius1, o))
+                continue;
+
+            // X8 / X7: the dot product, and the NEGATED normal.
+            const float pen = dot(o.closestPointB.xyz - o.closestPointA.xyz,
+                                  o.direction.xyz) - restDistance;
+
+            // XD4: the counter always advances; only the write is capped.
+            uint slot = 0u;
+            InterlockedAdd(counts[particleIndex], 1u, slot);
+            if (slot < PS_MAX_STATIC_CONTACTS)
+            {
+                const uint outputIndex = particleIndex + slot * numParticles;
+                infos[outputIndex] = float4(-o.direction.xyz, pen);
+                impulses[outputIndex] = 0.0f;
+                nodeIndices[outputIndex] = rigidId;
+            }
         }
     }
 }

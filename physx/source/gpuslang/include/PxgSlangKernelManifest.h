@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 353;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 354;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -224,7 +224,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_primitivesCollisionLaunch", "psContactGenBda.spv", "ps_primitivesCollisionLaunch" },  // PS_PRIMITIVES_COLLISION (P6.4a-2 BDA port: particle-vs-primitive contact generator)
     { "ps_convexCollisionLaunch", "psContactGenBda.spv", "ps_convexCollisionLaunch" },  // PS_CONVEX_COLLISION (P9.14b: particle vs cooked convex hull, GJK/EPA)
     { "ps_primitivesDiffuseCollisionLaunch", "psContactGenBda.spv", "ps_primitivesDiffuseCollisionLaunch" },  // PS_PRIMITIVES_DIFFUSE_COLLISION (P9.13g: the diffuse one-way contact producer)
-    { "ps_convexDiffuseCollisionLaunch", nullptr, nullptr },  // PS_CONVEX_DIFFUSE_COLLISION (unmapped)
+    { "ps_convexDiffuseCollisionLaunch", "psContactGenBda.spv", "ps_convexDiffuseCollisionLaunch" },  // PS_CONVEX_DIFFUSE_COLLISION (P9.14c: diffuse particles vs cooked convex hull, GJK/EPA)
     { "ps_meshCollisonLaunch", "psMeshMidphaseBda.spv", "ps_meshCollisonLaunch" },  // PS_TRIMESH_COLLISION (P9.10)
     { "ps_sdfMeshCollisonLaunch", "psSdfMidphaseBda.spv", "ps_sdfMeshCollisonLaunch" },
     { "ps_heightfieldCollisonLaunch", "psHfMidphaseBda.spv", "ps_heightfieldCollisonLaunch" },  // PS_HEIGHTFIELD_COLLISION (P9.11)

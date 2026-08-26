@@ -37,15 +37,17 @@ if [ -z "${PXG_SHADER_DIR:-}" ]; then
     exit 2
 fi
 
-# The 28 named scenes.  The settling bag below makes 29 -- the figure
+# The 29 named scenes.  The settling bag below makes 30 -- the figure
 # RUNTIME_STATUS.md's header carries.  particlediffuse joined in P9.13d, when
 # ps_diffuseParticleCreate made it pass; it had been a diagnostic since P9.13a.
-# particleconvex (P9.14a) is deliberately NOT here: both convex particle kernels
-# are unmapped, so it exists to name them and lives in the pending-work list at
-# the bottom until they land.
+# particleconvex joined in P9.14c and had been a pending-work entry since P9.14a:
+# it named the two convex particle kernels, P9.14b landed the fluid one and
+# P9.14c the diffuse one, and it is scored on BOTH.  The pending-work list at the
+# bottom is empty as a result, and stays in the script for the next scene that
+# needs it.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor articulation
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
-        particlecloth particleinflatable particlediffuse
+        particlecloth particleinflatable particlediffuse particleconvex
         cloth clothhang clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach"
 
@@ -103,7 +105,9 @@ if [ "${1:-}" = "--diagnostics" ]; then
     echo
     echo "=== pending work (NOT scored: these name kernels that are not mapped yet;"
     echo "    each moves into the scored list when its chain lands) ==="
-    for sc in particleconvex; do
+    echo "    (empty since P9.14c -- particleconvex, the only entry this list has"
+    echo "     ever held, is scored above)"
+    for sc in ; do
         echo "--- $sc"
         env PXG_SCENE=$sc PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
             | grep -E '^  particle |^  cooked |^  \[ diag \]|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step' \

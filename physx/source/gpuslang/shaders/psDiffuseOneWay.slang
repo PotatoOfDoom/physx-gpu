@@ -37,7 +37,10 @@
 // ps_primitivesDiffuseCollisionLaunch, and the particlediffuse scene measured
 // the difference the moment it did -- the lowest diffuse y over the run went
 // from -55.54 (falling straight through the floor) to -0.1886.
-// ps_convexDiffuseCollisionLaunch is still unmapped; that scene never calls it.
+// The other producer, ps_convexDiffuseCollisionLaunch, landed in P9.14c and is
+// measured by the particleconvex scene instead -- particlediffuse never calls it,
+// because it has no convex shape in it.  Both producers are now mapped, so this
+// consumer is fed on every floor type the engine routes to the diffuse path.
 //
 // ---------------------------------------------------------------------------
 // TRAPS

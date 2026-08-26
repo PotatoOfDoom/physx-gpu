@@ -4326,10 +4326,12 @@ int main()
     // launches BOTH convex particle kernels from the same entry
     // (PxgNarrowphaseCore.cpp:3775 and :3822), so one scene names both.
     //
-    // ITS PURPOSE TODAY IS TO NAME WORK, NOT TO PASS: ps_convexCollisionLaunch and
-    // ps_convexDiffuseCollisionLaunch are both unmapped, so the fluid falls through
-    // the floor and the spray with it.  It lives in run_scenes.sh's DIAGNOSTIC list
-    // until they land, exactly as particlediffuse did between P9.13a and P9.13d.
+    // IT NAMED TWO KERNELS AND NOW MEASURES BOTH.  P9.14b landed
+    // ps_convexCollisionLaunch and the FLUID came to rest on the hull (mean y
+    // -39.32 -> 0.1667); P9.14c landed ps_convexDiffuseCollisionLaunch and the
+    // SPRAY stopped with it (lowest diffuse y -39.6138 -> -0.1886).  It was a
+    // diagnostic between P9.14a and P9.14c and is SCORED from P9.14c, exactly as
+    // particlediffuse was between P9.13a and P9.13d.
     const bool convexFloorScene = !std::strcmp(sceneName, "particleconvex");
     const bool fluidScene = !std::strcmp(sceneName, "particlefluid") || boundaryScene
                             || staticFloorScene || diffuseScene || convexFloorScene;
@@ -4718,18 +4720,17 @@ int main()
                 }
             }
             scene->release(); physics->release(); cudaCtx->release(); foundation->release();
-            // P9.14a: printed UNCONDITIONALLY, because the fluid checks above are
-            // supposed to fail here -- the column falls through a floor that is not
-            // being collided against, and that failure is the measurement.  Same
-            // shape as the fluid CONTROL: read the numbers, not the verdict.
+            // P9.14a printed this UNCONDITIONALLY as a diagnostic, because the
+            // checks above were supposed to FAIL here: nothing was colliding
+            // against the convex floor, and that failure was the measurement.
+            // P9.14b and P9.14c landed the two kernels, so the numbers are now a
+            // RESULT rather than a bill of work -- kept, and printed beside a real
+            // verdict, so the two figures stay readable in the scene log.
             if (convexFloorScene)
-                std::printf("  [ diag ] particleconvex over a cooked CONVEX floor: fluid mean y "
-                            "%.4f, nn %.4f, peak diffuse %u of %u, lowest diffuse y %.4f.  P9.14b "
-                            "mapped ps_convexCollisionLaunch, so the FLUID now rests on the hull "
-                            "(mean y was -39.32 before it); ps_convexDiffuseCollisionLaunch is "
-                            "still unmapped, which is why the SPRAY still falls through.  This "
-                            "stays a DIAGNOSTIC until that lands and the scene can be scored on "
-                            "both\n",
+                std::printf("  particleconvex over a cooked CONVEX floor: fluid mean y %.4f "
+                            "(was -39.3227 with ps_convexCollisionLaunch unmapped), nn %.4f, "
+                            "peak diffuse %u of %u, lowest diffuse y %.4f (was -39.6138 with "
+                            "ps_convexDiffuseCollisionLaunch unmapped)\n",
                             yEnd, nnEnd, maxDiffuseSeen, MAX_DIFFUSE,
                             minDiffuseY == FLT_MAX ? 0.0f : minDiffuseY);
             if (failures == 0 && diffuseScene)
@@ -4747,16 +4748,37 @@ int main()
                     // ps_diffuseParticleCompact's aging; and the floor needs
                     // ps_primitivesDiffuseCollisionLaunch to find the contact and
                     // ps_diffuseParticleOneWayCollision to apply it.  That is the
-                    // whole chain this scene reaches.  It does NOT reach
-                    // ps_convexDiffuseCollisionLaunch, which is still unmapped and
-                    // which this scene never calls -- there is no convex shape in it.
+                    // whole chain this scene reaches: it never calls
+                    // ps_convexDiffuseCollisionLaunch, because it contains no convex
+                    // shape.  particleconvex is the scene that does, and since P9.14c
+                    // that kernel is mapped too -- so no part of the diffuse chain is
+                    // unmapped any more.
                     std::printf("[  OK  ] gpu-sdk-step: the PBD fluid carried a DIFFUSE population "
                                 "up to %u of %u and back down to %u, and the spray STOPPED AT THE "
                                 "FLOOR (lowest y %.4f, vs -55.54 measured with the one-way "
                                 "correction neutralised) -- spawn, publish, age and collide all "
-                                "run on Vulkan; only ps_convexDiffuseCollisionLaunch is unmapped, "
-                                "and this scene never calls it\n",
+                                "run on Vulkan over a PRIMITIVE floor; the convex floor is "
+                                "particleconvex's job\n",
                                 maxDiffuseSeen, MAX_DIFFUSE, endDiffuseSeen, minDiffuseY);
+                return 0;
+            }
+            // P9.14c: particleconvex is SCORED from here on.  It is the only scene
+            // that reaches testSDKConvexParticle, so it is the only one that can say
+            // anything about either convex particle kernel -- and it now says it
+            // about BOTH, on the same floor in the same frame: the fluid rests
+            // (ps_convexCollisionLaunch, P9.14b) and the spray rests on top of it
+            // (ps_convexDiffuseCollisionLaunch, P9.14c).  The two figures it prints
+            // are each a factor of ~200 away from the same scene with its kernel
+            // unmapped, which is what makes the verdict worth having.
+            if (failures == 0 && convexFloorScene)
+            {
+                std::printf("[  OK  ] gpu-sdk-step: over a cooked CONVEX HULL floor the PBD fluid "
+                            "RESTS at mean y %.4f (was -39.3227 before ps_convexCollisionLaunch) "
+                            "and the DIFFUSE spray rests with it at lowest y %.4f (was -39.6138 "
+                            "before ps_convexDiffuseCollisionLaunch) -- the convex particle pair "
+                            "bucket runs end to end on Vulkan, and with it the whole diffuse "
+                            "chain\n",
+                            yEnd, minDiffuseY);
                 return 0;
             }
             if (failures == 0 && hfFloorScene)

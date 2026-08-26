@@ -846,10 +846,550 @@ static void runAll(PxgSlangComputeDevice* dev)
     R.destroy(dev);
 }
 
+// ===========================================================================
+// P9.14c -- ps_convexDiffuseCollisionLaunch, the DIFFUSE twin.
+//
+// A second PXG_TEST in the SAME translation unit, and deliberately so: the
+// geometry, the hull blob, the closed-form box oracle and the CCD acceptance
+// predicate above are EXACTLY the ones this kernel needs, and a second file
+// would mean a second transcription of the thing that has to be right.  One
+// oracle, two users -- the P8.85 arrangement.
+//
+// What the diffuse rig adds, and what each addition is there to kill:
+//
+//   * the DIFFUSE arrays (XD1/XD2) -- cell start/end, sorted origin/predicted --
+//     wired to buffers the FLUID fields do not point at, so swapping a field for
+//     its fluid neighbour reads a different solid entirely;
+//   * the per-particle OUTPUT (XD4) with a COLUMN-MAJOR stride of
+//     *mNumDiffuseParticles, DISTINCT per system (47 / 53 / 41 / 59) and
+//     distinct from every particle count, cell bound and work-item count in the
+//     fixture, so a wrong stride lands on a poisoned slot;
+//   * pair 0 owning FOURTEEN work items over the same cell, so every accepted
+//     particle's counter reads 14 against a cap of 12 -- the overshoot contract
+//     (D7 / X10 / XD4) measured directly, with slots 12 and 13 required back at
+//     poison.  All fourteen contacts for a particle are IDENTICAL, so unlike
+//     P9.14b's global writer the cap here hides nothing;
+//   * pair 1 the CCD system, THREE work items, entirely below the cap, so the
+//     uncapped path is measured in the same run;
+//   * NO FILTER (XD3): the rigid filter pair, the sorted-to-unsorted map and the
+//     sim-buffer chain are all wired up and the pair still names
+//     particle FILTERED_SORTED -- and this kernel must produce a contact for it
+//     anyway.  A port that copies the fluid twin's findPs call suppresses it and
+//     dies;
+//   * a TRAP system with mMaxDiffuseParticles == 0 and everything else live --
+//     live cell arrays, live positions, live output arrays -- so the guard is
+//     pinned by its OUTPUT staying poison rather than by a null dereference;
+//   * and the shape that makes XD6 measurable at all: 8193 work items, so
+//     nbIterationsPerWarps is 2 and each warp owns a CONTIGUOUS PAIR.  The trap
+//     pair's run ends on an EVEN index and the last system's begins on the odd
+//     one directly after it, so warp 4095 meets the trap first.  The engine's
+//     `return` abandons its partner; a `continue` would process it.  System C is
+//     therefore reached exactly ONCE, by warp 4096, and its counter must read 1.
+//     Two is the mutant.  Without nbIter > 1 the two spellings are literally
+//     indistinguishable, which is why the fixture pays for the extra work items.
+// ===========================================================================
+namespace diffuse
+{
+static_assert(offsetof(PxgParticleSystem, mDiffuseCellStart) == 520, "@520");
+static_assert(offsetof(PxgParticleSystem, mDiffuseCellEnd) == 528, "@528");
+static_assert(offsetof(PxgParticleSystem, mDiffuseSortedPos_LifeTime) == 552, "@552");
+static_assert(offsetof(PxgParticleSystem, mDiffuseSortedOriginPos_LifeTime) == 560, "@560");
+static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayContactInfos) == 592, "@592");
+static_assert(offsetof(PxgParticleSystem, mDiffuseOneWayContactCount) == 616, "@616");
+
+// PxgParticleContactInfo::MaxStaticContactsPerParticle
+static const uint32_t MAX_STATIC = 12u;
+
+// The work-item layout.  PS_COLLISION's grid x warps-per-block is 1024 * 8 =
+// 8192, so 8193 items is the SMALLEST total for which nbIterationsPerWarps is 2
+// -- and two is all XD6 needs.
+static const uint32_t TOTAL_WORK = 8193u;
+static const uint32_t RUN_A = 0u;        // pair 0: system A, items 0..13   (14)
+static const uint32_t RUN_B = 14u;       // pair 1: system B, items 14..16  (3)
+static const uint32_t RUN_Z = 17u;       // pair 2: the trap, items 17..8190
+static const uint32_t RUN_C = 8191u;     // pair 3: system C, items 8191..8192
+static const uint32_t WORK_A = RUN_B - RUN_A;   // 14, ABOVE the cap of 12
+static const uint32_t WORK_B = RUN_Z - RUN_B;   // 3,  below it
+// XD6: item 8190 is the trap's LAST and it is even, so warp 4095 owns
+// { 8190, 8191 } and the engine's `return` throws 8191 away.  Warp 4096 owns
+// { 8192, 8193 }; 8193 is past the end.  So C is reached exactly once.
+static const uint32_t WORK_C = 1u;
+static_assert((RUN_C - 1u) % 2u == 0u, "the trap's last item must be even");
+
+// The published diffuse counts -- the output STRIDE.  Four distinct values, none
+// equal to any particle count, cell bound, work-item count or slot cap above.
+static const uint32_t NUM_A = 47u;
+static const uint32_t NUM_B = 53u;
+static const uint32_t NUM_Z = 41u;
+static const uint32_t NUM_C = 59u;
+
+static const float REST_C = 0.061f;      // pair 3, a third distinct rest distance
+static const float REST_Z = 0.05f;
+
+static inline uint32_t infoSlots(uint32_t num) { return MAX_STATIC * num + SLACK; }
+
+struct Sys
+{
+    const char* name;
+    uint32_t id;          // psId
+    uint32_t num;         // *mNumDiffuseParticles
+    uint32_t work;        // how many work items reach it
+    float rest;
+    bool ccd;
+    bool trap;
+    DevBuf bInfos, bForces, bNodes, bCounts, bNum, bPred;
+};
+
+struct DRig
+{
+    std::vector<PxgBufferHandle> owned;
+    DevBuf bHull, bCin, bShapes, bTc, bBounds, bCd, bRd, bMat, bStart, bTotal, bRemap;
+    DevBuf bCellStart, bCellEnd, bOrigin, bS2U, bRunsum, bSimBuf, bFilterPairs, bDesc;
+    DevBuf bFluidCellStart, bFluidCellEnd, bFluidPos;
+    Sys sys[4];
+    PsCollideBlob blob{};
+
+    template <typename T>
+    DevBuf mk(PxgSlangComputeDevice* dev, const std::vector<T>& d)
+    {
+        DevBuf b;
+        b.h = createBufferFrom(dev, d);
+        b.addr = dev->getBufferDeviceAddress(b.h);
+        owned.push_back(b.h);
+        return b;
+    }
+    void destroy(PxgSlangComputeDevice* dev)
+    {
+        for (PxgBufferHandle h : owned) dev->destroyBuffer(h);
+        owned.clear();
+    }
+};
+
+static void makeOutputs(PxgSlangComputeDevice* dev, DRig& R, Sys& s)
+{
+    s.bInfos = R.mk(dev, std::vector<F4>(infoSlots(s.num),
+                                         F4{ POISON_F, POISON_F, POISON_F, POISON_F }));
+    s.bForces = R.mk(dev, std::vector<float>(infoSlots(s.num), POISON_F));
+    s.bNodes = R.mk(dev, std::vector<uint64_t>(infoSlots(s.num), POISON_U64));
+    // The counters START at zero -- they are atomicAdd targets, and a poisoned
+    // one would return a slot past the cap and hide every write.  What stands in
+    // for poison here is that the set of NON-ZERO counters must be exactly the
+    // accepted particles: a wrong index lands on a zero that must have stayed
+    // zero.
+    s.bCounts = R.mk(dev, std::vector<uint32_t>(s.num + SLACK, 0u));
+    s.bNum = R.mk(dev, std::vector<int32_t>{ int32_t(s.num), int32_t(s.num) * 3 });
+}
+
+static void resetOutputs(PxgSlangComputeDevice* dev, DRig& R)
+{
+    for (Sys& s : R.sys)
+    {
+        std::vector<F4> infos(infoSlots(s.num), F4{ POISON_F, POISON_F, POISON_F, POISON_F });
+        std::vector<float> forces(infoSlots(s.num), POISON_F);
+        std::vector<uint64_t> nodes(infoSlots(s.num), POISON_U64);
+        std::vector<uint32_t> counts(s.num + SLACK, 0u);
+        dev->upload(s.bInfos.h, infos.data(), infos.size() * sizeof(F4));
+        dev->upload(s.bForces.h, forces.data(), forces.size() * sizeof(float));
+        dev->upload(s.bNodes.h, nodes.data(), nodes.size() * sizeof(uint64_t));
+        dev->upload(s.bCounts.h, counts.data(), counts.size() * sizeof(uint32_t));
+    }
+}
+
+static void buildRig(PxgSlangComputeDevice* dev, DRig& R)
+{
+    R.bHull = R.mk(dev, makeHullBlob());
+
+    R.sys[0] = Sys{ "A",     0u, NUM_A, WORK_A, REST_DISTANCE,   false, false, {}, {}, {}, {}, {}, {} };
+    R.sys[1] = Sys{ "B/CCD", 1u, NUM_B, WORK_B, REST_DISTANCE_B, true,  false, {}, {}, {}, {}, {}, {} };
+    R.sys[2] = Sys{ "trap",  2u, NUM_Z, 0u,     REST_Z,          false, true,  {}, {}, {}, {}, {}, {} };
+    R.sys[3] = Sys{ "C",     3u, NUM_C, WORK_C, REST_C,          false, false, {}, {}, {}, {}, {}, {} };
+
+    // ---- the DIFFUSE position arrays, shared by every system ----
+    std::vector<F4> origin(NB_PARTICLES + SLACK, F4{ POISON_F, POISON_F, POISON_F, POISON_F });
+    std::vector<F4> flat = origin, ccd = origin;
+    for (uint32_t i = 0; i < NB_PARTICLES; ++i)
+    {
+        float p[3]; particlePos(i, p);
+        origin[i] = F4{ p[0], p[1], p[2], 3.5f };   // .w is the LIFETIME here
+        flat[i] = origin[i];                        // CCD off -> predicted == origin
+        float q[3]; particlePredicted(i, q);
+        ccd[i] = F4{ q[0], q[1], q[2], 3.5f };
+    }
+    R.bOrigin = R.mk(dev, origin);
+    const DevBuf bFlat = R.mk(dev, flat);
+    const DevBuf bCcd = R.mk(dev, ccd);
+    for (Sys& s : R.sys) s.bPred = s.ccd ? bCcd : bFlat;
+
+    // The same 1x1x1 single-cell grid P9.14b uses, and for the same reason (see
+    // bCellStart there): with more than one cell the fixture cannot say which
+    // cell a work item reads without reimplementing calcGridHashInBounds.
+    R.bCellStart = R.mk(dev, std::vector<uint32_t>{ CELL_START });
+    R.bCellEnd = R.mk(dev, std::vector<uint32_t>{ CELL_END });
+
+    // THE FLUID FIELDS ARE WIRED TOO, TO A DIFFERENT AND HARMLESS CONFIGURATION.
+    //
+    // The first draft left mCellStart / mSortedOriginPos_InvMass NULL so a port
+    // that read them would fault.  A fault IS a kill, but it is the weakest kind:
+    // it depends on the allocator, it can be flaky under llvmpipe, and it says
+    // nothing about which field was read.  These arrays are live instead -- a
+    // three-particle cell of particles parked far from the hull -- so a port that
+    // reads the fluid grid or the fluid positions produces a DETERMINISTIC
+    // DIFFERENT contact set and dies cleanly.
+    //
+    // The fluid cell's bounds matter: the first draft used [0, 3), and a port
+    // that read the fluid END against the diffuse START got range = 3 - 4, which
+    // UNDERFLOWS to 4294967295 and walks off the array -- a crash, i.e. the weak
+    // kind of kill again.  [0, 6) straddles CELL_START instead, so every mix of
+    // the two grids is a small, valid, WRONG particle span.
+    R.bFluidCellStart = R.mk(dev, std::vector<uint32_t>{ 0u });
+    R.bFluidCellEnd = R.mk(dev, std::vector<uint32_t>{ 6u });
+    R.bFluidPos = R.mk(dev, std::vector<F4>(NB_PARTICLES + SLACK,
+                                            F4{ 100.0f, 100.0f, 100.0f, 1.0f }));
+
+    std::vector<uint32_t> s2u(NB_PARTICLES + SLACK, POISON_U32);
+    for (uint32_t i = 0; i < NB_PARTICLES; ++i) s2u[i] = unsortedIdOf(i);
+    R.bS2U = R.mk(dev, s2u);
+
+    // XD3: the whole filter chain is wired and the pair still names
+    // FILTERED_SORTED's unsorted id -- and this kernel must IGNORE it.
+    R.bRunsum = R.mk(dev, std::vector<uint32_t>{ 0u });
+    std::vector<PxgRigidFilterPair> pairs(1);
+    std::memset(pairs.data(), 0, sizeof(PxgRigidFilterPair));
+    pairs[0].index0 = uint64_t(NODE_INDEX);
+    pairs[0].index1 = uint64_t(FILTERED_UNSORTED);
+    pairs[0].index2 = 0u;
+    R.bFilterPairs = R.mk(dev, pairs);
+    std::vector<PxgParticleSimBuffer> simBufs(1);
+    std::memset(simBufs.data(), 0, sizeof(PxgParticleSimBuffer));
+    simBufs[0].mFilterPairs = reinterpret_cast<PxParticleRigidFilterPair*>(size_t(R.bFilterPairs.addr));
+    simBufs[0].mNumFilterPairs = 1u;
+    R.bSimBuf = R.mk(dev, simBufs);
+
+    for (Sys& s : R.sys) makeOutputs(dev, R, s);
+
+    std::vector<PxgParticleSystem> descArr(4);
+    std::memset(descArr.data(), 0, descArr.size() * sizeof(PxgParticleSystem));
+    for (uint32_t k = 0; k < 4u; ++k)
+    {
+        PxgParticleSystem& m = descArr[k];
+        Sys& s = R.sys[k];
+        m.mCommonData.mGridCellWidth = 1.0f;
+        m.mCommonData.mGridSizeX = 1u;
+        m.mCommonData.mGridSizeY = 1u;
+        m.mCommonData.mGridSizeZ = 1u;
+        m.mCommonData.mNumParticles = NB_PARTICLES;
+        m.mCommonData.mNumParticleBuffers = 1u;
+        // XD6: the trap's ONE difference.  Everything below it is live.
+        m.mCommonData.mMaxDiffuseParticles = s.trap ? 0u : 4096u;
+        m.mData.mFlags = s.ccd ? 8u : 0u;   // eENABLE_SPECULATIVE_CCD
+        // XD1/XD2: the DIFFUSE fields, beside live FLUID ones that point somewhere
+        // else entirely (see bFluidCellStart) -- so reading a field's fluid twin
+        // is a clean empty result rather than a fault or a lucky coincidence.
+        m.mCellStart = reinterpret_cast<PxU32*>(size_t(R.bFluidCellStart.addr));
+        m.mCellEnd = reinterpret_cast<PxU32*>(size_t(R.bFluidCellEnd.addr));
+        m.mSortedOriginPos_InvMass = reinterpret_cast<float4*>(size_t(R.bFluidPos.addr));
+        m.mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(R.bFluidPos.addr));
+        m.mDiffuseCellStart = reinterpret_cast<PxU32*>(size_t(R.bCellStart.addr));
+        m.mDiffuseCellEnd = reinterpret_cast<PxU32*>(size_t(R.bCellEnd.addr));
+        m.mDiffuseSortedOriginPos_LifeTime = reinterpret_cast<float4*>(size_t(R.bOrigin.addr));
+        m.mDiffuseSortedPos_LifeTime = reinterpret_cast<float4*>(size_t(s.bPred.addr));
+        m.mNumDiffuseParticles = reinterpret_cast<int*>(size_t(s.bNum.addr));
+        m.mDiffuseOneWayContactInfos =
+            reinterpret_cast<PxgParticleContactInfo*>(size_t(s.bInfos.addr));
+        m.mDiffuseOneWayForces = reinterpret_cast<float*>(size_t(s.bForces.addr));
+        m.mDiffuseOneWayNodeIndex = reinterpret_cast<PxNodeIndex*>(size_t(s.bNodes.addr));
+        m.mDiffuseOneWayContactCount = reinterpret_cast<PxU32*>(size_t(s.bCounts.addr));
+        m.mSortedToUnsortedMapping = reinterpret_cast<PxU32*>(size_t(R.bS2U.addr));
+        m.mParticleBufferRunsum = reinterpret_cast<PxU32*>(size_t(R.bRunsum.addr));
+        m.mParticleSimBuffers = reinterpret_cast<PxgParticleSimBuffer*>(size_t(R.bSimBuf.addr));
+    }
+    R.bDesc = R.mk(dev, descArr);
+
+    // ---- shapes: four particle systems and one hull, all with distinct cache
+    //      refs so contactDistance / transformCache / the remap cannot be
+    //      confused ----
+    std::vector<PxgShape> shapes(5);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    const uint32_t psShape[4] = { 0u, 2u, 3u, 4u };
+    for (uint32_t k = 0; k < 4u; ++k)
+    {
+        shapes[psShape[k]].type = PxU32(PxGeometryType::ePARTICLESYSTEM);
+        shapes[psShape[k]].particleOrSoftbodyId = R.sys[k].id;
+    }
+    shapes[1].type = PxU32(PxGeometryType::eCONVEXMESH);
+    shapes[1].scale = PxMeshScale(PxVec3(SCALE_X, SCALE_Y, SCALE_Z),
+                                  PxQuat(PxPi * 0.5f, PxVec3(0.0f, 0.0f, 1.0f)));
+    shapes[1].hullOrMeshPtr = size_t(R.bHull.addr);
+    R.bShapes = R.mk(dev, shapes);
+
+    std::vector<PxsCachedTransform> tcache(5);
+    std::memset(tcache.data(), 0, tcache.size() * sizeof(PxsCachedTransform));
+    tcache[1].transform = PxTransform(PxVec3(0.0f, BOX_CY, 0.0f),
+                                      PxQuat(PxPi * 0.5f, PxVec3(0.0f, 0.0f, 1.0f)));
+    R.bTc = R.mk(dev, tcache);
+
+    // Pairs 0 and 2 put the particle shape in slot 0; pairs 1 and 3 put it in
+    // slot 1, so the LoadShapePair swap runs on both halves of the fixture.
+    std::vector<PxgContactManagerInput> cin(4);
+    std::memset(cin.data(), 0, cin.size() * sizeof(PxgContactManagerInput));
+    cin[0].shapeRef0 = 0u; cin[0].transformCacheRef0 = 0u;
+    cin[0].shapeRef1 = 1u; cin[0].transformCacheRef1 = 1u;
+    cin[1].shapeRef0 = 1u; cin[1].transformCacheRef0 = 1u;
+    cin[1].shapeRef1 = 2u; cin[1].transformCacheRef1 = 2u;
+    cin[2].shapeRef0 = 3u; cin[2].transformCacheRef0 = 3u;
+    cin[2].shapeRef1 = 1u; cin[2].transformCacheRef1 = 1u;
+    cin[3].shapeRef0 = 1u; cin[3].transformCacheRef0 = 1u;
+    cin[3].shapeRef1 = 4u; cin[3].transformCacheRef1 = 4u;
+    R.bCin = R.mk(dev, cin);
+
+    std::vector<float> boundsF(5 * 6, 0.0f);
+    const float bmn[3] = { -9.0f, -3.0f, -7.0f };
+    const float bmx[3] = { 6.0f, 9.0f, 4.0f };
+    const float hmn[3] = { -4.0f, -8.0f, -5.0f };
+    const float hmx[3] = { 8.0f, 5.0f, 9.0f };
+    for (uint32_t sh = 0; sh < 5u; ++sh)
+        for (int k = 0; k < 3; ++k)
+        {
+            const bool hull = (sh == 1u);
+            boundsF[size_t(sh) * 6 + k] = hull ? hmn[k] : bmn[k];
+            boundsF[size_t(sh) * 6 + 3 + k] = hull ? hmx[k] : bmx[k];
+        }
+    R.bBounds = R.mk(dev, boundsF);
+
+    std::vector<float> cdist(5, CONTACT_OFFSET);
+    cdist[1] = 0.0f;                       // the hull contributes nothing
+    R.bCd = R.mk(dev, cdist);
+    R.bRd = R.mk(dev, std::vector<float>{ REST_DISTANCE, REST_DISTANCE_B, REST_Z, REST_C });
+    R.bMat = R.mk(dev, std::vector<uint32_t>(4u, POISON_U32));
+    R.bStart = R.mk(dev, std::vector<uint32_t>{ RUN_A, RUN_B, RUN_Z, RUN_C });
+    R.bTotal = R.mk(dev, std::vector<uint32_t>{ TOTAL_WORK });
+    R.bRemap = R.mk(dev, std::vector<uint64_t>{ 0ull, uint64_t(NODE_INDEX), 0ull, 0ull, 0ull });
+
+    std::memset(&R.blob, 0, sizeof(R.blob));
+    R.blob.numTests = 4u;
+    R.blob.toleranceLength = 1.0f;
+    R.blob.cmInputs = R.bCin.addr;
+    R.blob.shapes = R.bShapes.addr;
+    R.blob.transformCache = R.bTc.addr;
+    R.blob.bounds = R.bBounds.addr;
+    R.blob.contactDistance = R.bCd.addr;
+    R.blob.restDistances = R.bRd.addr;
+    R.blob.materials = R.bMat.addr;
+    R.blob.startIndices = R.bStart.addr;
+    R.blob.totalNumPairs = R.bTotal.addr;
+    R.blob.particleSystems = R.bDesc.addr;
+    R.blob.shapeToRigidRemap = R.bRemap.addr;
+    // The writer half of the blob stays NULL: this kernel has no global contact
+    // stream, and a port that reaches for one faults rather than scribbling.
+}
+
+// Which particles system `s` must accept, analytically.  Identical to the fluid
+// oracle EXCEPT that the filtered particle is NOT removed (XD3).
+static std::vector<uint32_t> acceptedFor(const Sys& s)
+{
+    std::vector<uint32_t> out;
+    if (s.trap) return out;
+    for (uint32_t i = CELL_START; i < CELL_END; ++i)
+    {
+        if (s.ccd) { if (ccdAccepted(i, 1.0f, 2.0f)) out.push_back(i); continue; }
+        float p[3], dir[3]; particlePos(i, p);
+        if (boxSignedDistance(p, dir) <= CONTACT_OFFSET) out.push_back(i);
+    }
+    return out;
+}
+
+static void checkSys(PxgSlangComputeDevice* dev, const Sys& s, const char* label,
+                     double& worstPenErr, double& worstNormErr)
+{
+    const std::vector<uint32_t> accept = acceptedFor(s);
+    const auto counts = downloadBuffer<uint32_t>(dev, s.bCounts.h, s.num + SLACK);
+    const auto infos = downloadBuffer<F4>(dev, s.bInfos.h, infoSlots(s.num));
+    const auto forces = downloadBuffer<float>(dev, s.bForces.h, infoSlots(s.num));
+    const auto nodes = downloadBuffer<uint64_t>(dev, s.bNodes.h, infoSlots(s.num));
+
+    // ---- 1. the counters.  Every accepted particle's counter must read the
+    //         number of work items that reached its system -- INCLUDING the
+    //         attempts past the cap (XD4) -- and every other counter must be
+    //         untouched at zero.
+    std::vector<uint32_t> wantCount(s.num + SLACK, 0u);
+    for (uint32_t pi : accept) wantCount[pi] = s.work;
+    size_t badCount = 0;
+    for (uint32_t pi = 0; pi < s.num + SLACK; ++pi)
+        if (counts[pi] != wantCount[pi])
+        {
+            if (badCount < 4)
+                std::printf("    %s/%s: counts[%u] = %u, expected %u\n",
+                            label, s.name, pi, counts[pi], wantCount[pi]);
+            ++badCount;
+        }
+    PXG_CHECK_MSG(badCount == 0, "%s/%s: %zu contact counters are wrong",
+                  label, s.name, badCount);
+
+    // ---- 2. the written slots, column-major with a stride of s.num.
+    const uint32_t written = std::min(s.work, MAX_STATIC);
+    std::vector<bool> live(infoSlots(s.num), false);
+    size_t bad = 0;
+    for (uint32_t pi : accept)
+    {
+        float p[3], outDir[3]; particlePos(pi, p);
+        const float sd = boxSignedDistance(p, outDir);
+        for (uint32_t slot = 0; slot < written; ++slot)
+        {
+            const uint32_t oi = pi + slot * s.num;
+            live[oi] = true;
+            const F4 np = infos[oi];
+            const double nlen = std::sqrt(double(np.x) * np.x + double(np.y) * np.y +
+                                          double(np.z) * np.z);
+            worstNormErr = std::max(worstNormErr, std::fabs(nlen - 1.0));
+            if (std::fabs(nlen - 1.0) > 1e-4)
+            { if (bad < 4) std::printf("    %s/%s particle %u slot %u: |normal| = %g\n",
+                                       label, s.name, pi, slot, nlen);
+              ++bad; continue; }
+            // X7's negation, pinned PHYSICALLY: the stored normal is the one the
+            // one-way consumer (P9.13f) pushes ALONG, so it has to point out.
+            const double dotOut = double(np.x) * outDir[0] + double(np.y) * outDir[1] +
+                                  double(np.z) * outDir[2];
+            if (dotOut < 0.9)
+            { if (bad < 4) std::printf("    %s/%s particle %u (signed dist %g): normal "
+                                       "(%g,%g,%g) is not the OUTWARD direction "
+                                       "(%g,%g,%g), cos = %g\n", label, s.name, pi, sd,
+                                       np.x, np.y, np.z, outDir[0], outDir[1], outDir[2],
+                                       dotOut);
+              ++bad; continue; }
+            const double err = std::fabs(double(np.w) - (double(sd) - s.rest));
+            worstPenErr = std::max(worstPenErr, err);
+            if (err > 2e-4)
+            { if (bad < 4) std::printf("    %s/%s particle %u slot %u: pen %g, expected %g "
+                                       "(signed dist %g, rest %g)\n", label, s.name, pi,
+                                       slot, np.w, sd - s.rest, sd, s.rest);
+              ++bad; continue; }
+            if (forces[oi] != 0.0f)
+            { if (bad < 4) std::printf("    %s/%s particle %u slot %u: impulse %g, must be "
+                                       "zeroed\n", label, s.name, pi, slot, forces[oi]);
+              ++bad; continue; }
+            if (nodes[oi] != uint64_t(NODE_INDEX))
+            { if (bad < 4) std::printf("    %s/%s particle %u slot %u: node %llu, expected "
+                                       "%u\n", label, s.name, pi, slot,
+                                       (unsigned long long)nodes[oi], NODE_INDEX);
+              ++bad; }
+        }
+    }
+    PXG_CHECK_MSG(bad == 0, "%s/%s: %zu written contacts failed the geometric or identity "
+                  "checks", label, s.name, bad);
+
+    // ---- 3. EVERY other slot must still be poison -- which is where the
+    //         attempts past the cap would have landed, and where a wrong stride
+    //         lands.
+    size_t badPoison = 0;
+    for (uint32_t oi = 0; oi < infoSlots(s.num); ++oi)
+    {
+        if (live[oi]) continue;
+        if (infos[oi].x != POISON_F || infos[oi].y != POISON_F ||
+            infos[oi].z != POISON_F || infos[oi].w != POISON_F ||
+            forces[oi] != POISON_F || nodes[oi] != POISON_U64)
+        {
+            if (badPoison < 4)
+                std::printf("    %s/%s: slot %u (particle %u, contact %u) was written and "
+                            "must not have been\n", label, s.name, oi, oi % s.num,
+                            oi / s.num);
+            ++badPoison;
+        }
+    }
+    PXG_CHECK_MSG(badPoison == 0, "%s/%s: %zu slots outside the expected column-major set "
+                  "were written", label, s.name, badPoison);
+}
+
+static void runAll(PxgSlangComputeDevice* dev)
+{
+    DRig R;
+    buildRig(dev, R);
+
+    Kernel k("psContactGenBda.spv", "ps_convexDiffuseCollisionLaunch", {}, sizeof(PsCollideBlob));
+    PXG_CHECK_MSG(k.isValid(), "the convex diffuse contact-gen pipeline must build");
+    if (!k.isValid()) { R.destroy(dev); return; }
+
+    double worstPenErr = 0.0, worstNormErr = 0.0;
+    // XD7: isDiffuse = TRUE, so the TGS halving never applies and the two runs
+    // must produce IDENTICAL sets.
+    for (int mode = 0; mode < 2; ++mode)
+    {
+        const char* label = mode ? "TGS" : "PGS";
+        resetOutputs(dev, R);
+        dev->flush();
+        R.blob.isTGSWord = mode ? 1u : 0u;
+        k.dispatch(1024u, {}, R.blob, 1u, 1u);   // grid (1024,1,1), block (32,8,1)
+        dev->flush();
+        for (const Sys& s : R.sys) checkSys(dev, s, label, worstPenErr, worstNormErr);
+    }
+
+    // ---- coverage, demanded rather than designed ----
+    {
+        const std::vector<uint32_t> accA = acceptedFor(R.sys[0]);
+        const std::vector<uint32_t> accB = acceptedFor(R.sys[1]);
+        PXG_CHECK_MSG(!accA.empty() && !accB.empty(),
+                      "one of the analytic contact sets is EMPTY (%zu, %zu) -- the fixture "
+                      "measures nothing", accA.size(), accB.size());
+        PXG_CHECK_MSG(accA.size() != accB.size(),
+                      "the plain and the CCD system accept the same number of particles "
+                      "(%zu) -- the contact-volume policy is not exercised", accA.size());
+        PXG_CHECK_MSG(WORK_A > MAX_STATIC,
+                      "pair 0 owns %u work items against a cap of %u -- the capacity gate "
+                      "never fires and a port that caps the COUNTER too is invisible",
+                      WORK_A, MAX_STATIC);
+        PXG_CHECK_MSG(WORK_B > 0u && WORK_B < MAX_STATIC,
+                      "pair 1 owns %u work items -- the UNCAPPED path is not measured",
+                      WORK_B);
+        // XD3, stated as a demand: the filter pair names this particle and the
+        // kernel must produce a contact for it anyway.
+        const bool filteredAccepted =
+            std::find(accA.begin(), accA.end(), FILTERED_SORTED) != accA.end();
+        PXG_CHECK_MSG(filteredAccepted,
+                      "particle %u, the one the rigid filter pair names, is not in the "
+                      "analytic set -- XD3 (there is NO filter on this path) is unprobed",
+                      FILTERED_SORTED);
+        // XD6, stated as a demand: without nbIter > 1 the `return` and a
+        // `continue` are the same statement.
+        const uint32_t nbIter = (TOTAL_WORK + 8191u) / 8192u;
+        PXG_CHECK_MSG(nbIter == 2u,
+                      "nbIterationsPerWarps is %u, not 2 -- with one iteration per warp the "
+                      "engine's `return` and a `continue` are indistinguishable and XD6 is "
+                      "untested", nbIter);
+        PXG_CHECK_MSG(WORK_C == 1u,
+                      "system C is reached %u times -- the whole point of the 8193-item run "
+                      "is that the trap's `return` costs it exactly one of its two", WORK_C);
+        const bool a1 = ccdAccepted(MARGINAL_ISDIFFUSE, 1.0f, 2.0f);
+        const bool a2 = ccdAccepted(MARGINAL_ISDIFFUSE, 2.0f, 2.0f);
+        PXG_CHECK_MSG(a1 != a2, "particle %u does not separate isDiffuse=true (accepted: %d) "
+                      "from isDiffuse=false in a TGS step (accepted: %d)",
+                      MARGINAL_ISDIFFUSE, int(a1), int(a2));
+        const bool b1 = ccdAccepted(MARGINAL_MINSEP, 1.0f, 2.0f);
+        const bool b2 = ccdAccepted(MARGINAL_MINSEP, 1.0f, 1.0f);
+        PXG_CHECK_MSG(b1 != b2, "particle %u does not separate the second pass's "
+                      "cDistance + 2*cVolumeRadius (accepted: %d) from cDistance + "
+                      "cVolumeRadius (accepted: %d)", MARGINAL_MINSEP, int(b1), int(b2));
+        std::printf("    [ note ] %u work items, nbIter %u; accepted %zu (x%u, capped at %u) "
+                    "/ %zu CCD (x%u) / %zu after the trap's return (x%u); strides %u/%u/%u; "
+                    "worst |normal|-1 %.3g, worst penetration error %.3g\n",
+                    TOTAL_WORK, nbIter, accA.size(), WORK_A, MAX_STATIC, accB.size(), WORK_B,
+                    acceptedFor(R.sys[3]).size(), WORK_C, NUM_A, NUM_B, NUM_C,
+                    worstNormErr, worstPenErr);
+    }
+
+    R.destroy(dev);
+}
+
+} // namespace diffuse
+
 } // namespace
 
 PXG_TEST(psConvexContactGen)
 {
     PxgSlangComputeDevice* dev = testDevice();
     runAll(dev);
+}
+
+PXG_TEST(psConvexDiffuseContactGen)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    diffuse::runAll(dev);
 }
