@@ -716,7 +716,8 @@ pxg_compile_shader(femClothRigidAttachBda cloth_rigidAttachmentPrepareLaunch
 # absent from PXG_HLSL_ENTRIES (same precedent as psContactGenBda / femClothSolveBda).
 pxg_compile_shader(femClothContactGenBda cloth_midphaseGenerateVertexPairsLaunch
                    cloth_planeVertContactGenLaunch
-                   cloth_SphereVertexContactGenLaunch)
+                   cloth_SphereVertexContactGenLaunch
+                   cloth_boxVertexContactGenLaunch)
 # P7.1 tranche 4b-1: cloth-vs-rigid contact SORT / reorder on the engine ABI (BDA)
 # — the second half of the cloth-drape-on-a-floor arc.  The single reorder kernel
 # gathers the 4a-generated cloth-vs-rigid contacts into the sorted buffers through

@@ -145,6 +145,7 @@
 // WORLD-space direction.)
 
 import pxgSlangCommon;
+import pxgSlangSphereBox;   // P9.15a: sphereboxNormalPen, lifted out of this file
 
 static const uint PXG_BITSHIFT_ELEMENT_ID = 20; // PxgSimulationCoreDesc.h
 static const uint COLLISION_FLAG_MASK = 1u << 31;
@@ -448,65 +449,12 @@ bool staticTriangleVsClothCollision(float3 localA0, float3 localB0, float3 local
     return hasContact;
 }
 
-// ---- spherebox (sphereCollision.cuh, PxVec3-origin variant), radius 0 -------
-uint sphereboxNormalPen(float3 sphereOrigin, float4 boxQ, float3 boxP, float sphereRadius,
-                        float3 boxExtents, float contactDist, out float4 outNormalPen)
-{
-    outNormalPen = float4(0, 0, 0, 0);
-    const float3 sphereCenter = quatRotateInv(boxQ, sphereOrigin - boxP);
-    const float3 nBoxExtents = -boxExtents;
-
-    const float inflatedSum = sphereRadius + contactDist;
-    const float sqInflatedSum = inflatedSum * inflatedSum;
-
-    const float x = clamp(sphereCenter.x, nBoxExtents.x, boxExtents.x);
-    const float y = clamp(sphereCenter.y, nBoxExtents.y, boxExtents.y);
-    const float z = clamp(sphereCenter.z, nBoxExtents.z, boxExtents.z);
-    const float3 p = float3(x, y, z);
-    const float3 v = sphereCenter - p;
-    const float lengthSq = dot(v, v);
-
-    if (sqInflatedSum > lengthSq)
-    {
-        const bool bX = boxExtents.x >= abs(sphereCenter.x);
-        const bool bY = boxExtents.y >= abs(sphereCenter.y);
-        const bool bZ = boxExtents.z >= abs(sphereCenter.z);
-        const bool bInsideBox = bX && bY && bZ;
-        if (bInsideBox)
-        {
-            const float3 absP = float3(abs(p.x), abs(p.y), abs(p.z));
-            const float3 distToSurface = boxExtents - absP;
-
-            float3 localNorm = p.z >= 0.0f ? float3(0, 0, 1) : float3(0, 0, -1);
-            float dist = -distToSurface.z;
-            if (distToSurface.x <= distToSurface.y && distToSurface.x <= distToSurface.z)
-            {
-                localNorm = p.x >= 0.0f ? float3(1, 0, 0) : float3(-1, 0, 0);
-                dist = -distToSurface.x;
-            }
-            else if (distToSurface.y <= distToSurface.z)
-            {
-                localNorm = p.y >= 0.0f ? float3(0, 1, 0) : float3(0, -1, 0);
-                dist = -distToSurface.y;
-            }
-
-            const float3 normal = quatRotate(boxQ, localNorm);
-            const float penetration = dist - sphereRadius;
-            outNormalPen = float4(normal, penetration);
-        }
-        else
-        {
-            const float recipLength = rsqrt(lengthSq);
-            const float len = 1.0f / recipLength;
-            const float3 locNorm = v * recipLength;
-            const float penetration = len - sphereRadius;
-            const float3 normal = quatRotate(boxQ, locNorm);
-            outNormalPen = float4(normal, penetration);
-        }
-        return 1;
-    }
-    return 0;
-}
+// ---- spherebox: LIFTED to pxgSlangSphereBox.slang in P9.15a ----------------
+// The body moved out verbatim so cloth_boxVertexContactGenLaunch (the engine-ABI
+// kernel) can call the SAME query instead of a second transcription.  This
+// shader's battery keeps verifying it -- that is the point of lifting rather
+// than copying: the mode-1 cases below still drive sphereboxNormalPen, now
+// through the module.
 
 // ---- PxgFEMContactWriter variants (PxgFEMCore.h) ----------------------------
 // writeRigidVsDeformableContact32: 32-bit sort lane, no u64 key

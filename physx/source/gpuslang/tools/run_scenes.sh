@@ -37,8 +37,10 @@ if [ -z "${PXG_SHADER_DIR:-}" ]; then
     exit 2
 fi
 
-# The 29 named scenes.  The settling bag below makes 30 -- the figure
-# RUNTIME_STATUS.md's header carries.  particlediffuse joined in P9.13d, when
+# The 30 named scenes.  The settling bag below makes 31 -- the figure
+# RUNTIME_STATUS.md's header carries.  clothbox joined in P9.15a: `cloth` is a
+# free fall and stays green whether or not the cloth lands, so the landing needed
+# a scene of its own.  particlediffuse joined in P9.13d, when
 # ps_diffuseParticleCreate made it pass; it had been a diagnostic since P9.13a.
 # particleconvex joined in P9.14c and had been a pending-work entry since P9.14a:
 # it named the two convex particle kernels, P9.14b landed the fluid one and
@@ -48,7 +50,7 @@ fi
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor articulation
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
         particlecloth particleinflatable particlediffuse particleconvex
-        cloth clothhang clothdrape clothselfcollide clothcloth
+        cloth clothbox clothhang clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach"
 
 pass=0; fail=0; missing=0

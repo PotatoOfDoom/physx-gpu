@@ -101,6 +101,7 @@
 // otherwise, breaking bitwise parity with the -ffp-contract=off CPU reference.
 
 import pxgSlangFEMClothDesc;   // PxgFEMClothGpu (mPosition_InvMass @16, mNbVerts @316)
+import pxgSlangSphereBox;      // P9.15a: spherebox, lifted out of fcStaticTriCloth
 
 // PxGeometryType (PxGeometry.h): eSPHERE 0, ePLANE 1, eCAPSULE 2, ... eTRIANGLEMESH 8.
 static const uint GEOM_SPHERE = 0u;
@@ -124,6 +125,8 @@ static const uint PLANE_WARPS = 16u;
 static const uint PLANE_BLOCK = WARP * PLANE_WARPS;            // 512
 static const uint SPHERE_WARPS = 1u;
 static const uint SPHERE_BLOCK = WARP * SPHERE_WARPS;          // 32
+static const uint BOX_WARPS = 16u;                             // (32, 16, 1)
+static const uint BOX_BLOCK = WARP * BOX_WARPS;                // 512
 
 // ---------------------------------------------------------------------------
 // Local element-struct mirrors (byte-exact vs the engine C++ layouts; pinned by
@@ -444,7 +447,14 @@ void cloth_planeVertContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : 
     const uint rigidMaterialIndex = rigidShape.materialIndex;
     const float restDistance = Ptr<float>(gCG.restDistance)[cmIdx];
 
-    const uint numRequiredThreads = (numVerts + 31u) & (~31u);
+    // THE BOUND IS ROUNDED TO THE **BLOCK**, NOT TO THE WARP -- see BARRIER
+    // UNIFORMITY in the header.  The CUDA rounds to 32 because its warp
+    // intrinsics only need warp-uniform control flow; our emulation is
+    // groupshared + a BLOCK barrier, which needs block-uniform control flow, and
+    // a 32-rounded bound gives threads in the same block different trip counts.
+    // Rounding to the block only adds all-false iterations: a tile with no
+    // contact does no atomicAdd and no store, so the emitted set is unchanged.
+    const uint numRequiredThreads = (numVerts + (PLANE_BLOCK - 1u)) & (~(PLANE_BLOCK - 1u));
 
     for (uint i = tid; i < numRequiredThreads; i += PLANE_BLOCK)
     {
@@ -605,6 +615,171 @@ void cloth_SphereVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
         }
         GroupMemoryBarrierWithGroupSync();
         const uint startIndex = sSphStart[warpId];
+        if (hasContact)
+            writeRigidVsDeformableContact(startIndex + threadOffset, contact, normalPen,
+                                          float4(0, 0, 0, 1), rigidId, pairInd1, rigidMaterialIndex);
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
+// ===========================================================================
+// P9.15a -- cloth_boxVertexContactGenLaunch
+// gpunarrowphase/src/CUDA/femClothPrimitives.cu:3078, read in full, with the
+// query itself at sphereCollision.cuh:371 (lifted into pxgSlangSphereBox).
+//
+// The third vertex-vs-primitive contact generator of this file and the closest
+// sibling of the two above: same 11-argument pack, same ContactGenParams blob,
+// same filter, same writer, same warp-aggregation tail.  It is the ONLY kernel
+// of the three that an existing SCENE already asks for -- `cloth` emits
+// "GPU cloth_boxVertexContactGenLaunch fail to launch" every frame -- so this
+// is the one place in the port where the work list came from the engine rather
+// than from us.
+//
+// ---------------------------------------------------------------------------
+// WHAT DIFFERS FROM THE PLANE / SPHERE SIBLINGS
+// ---------------------------------------------------------------------------
+// V1 -- THE CONTACT POINT IS THE POINT ON THE **RIGID**, NOT THE CLOTH VERTEX.
+//     `rigidP = clothP - normalPen.w * normalPen.xyz`, then
+//     `contact = float4(rigidP, restDistance)`.  The SPHERE sibling stores the
+//     cloth vertex itself (`verts[i]`); the PLANE sibling stores the projected
+//     point, like this one.  Three neighbouring kernels, two conventions, and
+//     the difference is invisible until the vertex is actually penetrating --
+//     at pen == 0 the two points coincide.  The fixture therefore needs a
+//     vertex strictly INSIDE the box, not merely within the contact distance.
+//
+// V2 -- the block is (32, **16**, 1) = 512 threads, one BLOCK per contact-manager
+//     pair (`cmIdx = blockIdx.x`), so it shares the plane sibling's shape and NOT
+//     the sphere's single warp.
+//
+// V3 -- the filter test runs BEFORE the query, unlike the plane sibling which
+//     queries first and filters after.  Both suppress the same contacts, so this
+//     is transcription rather than semantics -- recorded because a reader
+//     comparing the two bodies will notice and wonder.
+//
+// V4 -- the box half-extents are `rigidShape.scale.scale`, read as
+//     (scaleX, scaleY, scaleZ).  There is no halving anywhere in the chain: a
+//     PxBoxGeometry's half-extents ARE the shape scale (SB7).
+//
+// V5 -- the sphere radius handed to the query is 0.  A cloth VERTEX is a point;
+//     the radius exists only because the query is shared with the real
+//     sphere-vs-box path.
+//
+// V6 -- `restDistance` is indexed by **cmIdx**, the contact-manager pair, while
+//     `contactDistance` is indexed by the two CACHE REFS and summed.  Two
+//     different index spaces, one line apart.
+//
+// ---------------------------------------------------------------------------
+// BARRIER UNIFORMITY -- a platform rule this tranche had to learn
+// ---------------------------------------------------------------------------
+// The CUDA loops to `numRequiredThreads = (numVerts + 31) & ~31` -- rounded up to
+// a WARP -- and aggregates with `__ballot_sync` / `warpScanExclusive`, which
+// require only WARP-uniform control flow.  Every thread of a warp shares a trip
+// count there, so the CUDA is correct.
+//
+// Our port has no warp intrinsics: it emulates them with groupshared slots and
+// `GroupMemoryBarrierWithGroupSync()`, which is `OpControlBarrier` and requires
+// control flow uniform over the **whole block**.  With a 512-thread block and a
+// 32-rounded bound, `numVerts = 3` gives threads 0..31 one iteration and threads
+// 32..511 none -- so the barrier sits in non-uniform control flow, which is
+// undefined in SPIR-V and Vulkan.  llvmpipe tolerates it; that is not a licence.
+//
+// So the bound is rounded to the BLOCK here, and the plane sibling above was
+// corrected to match in the same tranche -- it had the hazard from P7.1 and its
+// own fixture (3 verts, 512 threads) was reaching it on every run.  The sphere
+// sibling needs no change: its block IS one warp, so a 32-rounded bound is
+// already block-uniform.
+//
+// The fix cannot change what is emitted.  The extra iterations are all-false for
+// every lane, and an all-false tile takes neither the atomicAdd nor the store.
+// ===========================================================================
+groupshared uint sBoxMask[BOX_WARPS];
+groupshared uint sBoxStart[BOX_WARPS];
+
+[shader("compute")]
+[numthreads(512, 1, 1)] // (32, 16, 1) flattened -- V2
+void cloth_boxVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    const uint tid = gtid.x;
+    const uint warpId = tid >> 5;
+    const uint lane = tid & (WARP - 1u);
+    const uint cmIdx = gid.x;
+
+    if (cmIdx >= gCG.numTests)
+        return;
+
+    PxgShape clothShape, rigidShape;
+    uint clothCacheRef, rigidCacheRef;
+    loadClothRigidPair(gCG.cmInputs, gCG.gpuShapes, cmIdx,
+                       clothShape, clothCacheRef, rigidShape, rigidCacheRef);
+
+    // V4: the shape scale IS the box's half-extents.
+    const float3 boxHalfExtents = float3(rigidShape.scaleX, rigidShape.scaleY, rigidShape.scaleZ);
+
+    const uint2 rigidId = Ptr<uint2>(gCG.shapeToRigidRemap)[rigidCacheRef];
+    const uint femClothId = clothShape.particleOrSoftbodyId;
+    Ptr<PxgFEMClothGpu> femClothes = Ptr<PxgFEMClothGpu>(gCG.femClothes);
+    Ptr<float4> verts = Ptr<float4>(femClothes[femClothId].mPosition_InvMass);
+    const uint numVerts = femClothes[femClothId].mNbVerts;
+
+    const PxsCachedTransform rtc = Ptr<PxsCachedTransform>(gCG.transformCache)[rigidCacheRef];
+    const float4 boxQ = float4(rtc.qx, rtc.qy, rtc.qz, rtc.qw);
+    const float3 boxP = float3(rtc.px, rtc.py, rtc.pz);
+
+    Ptr<float> contactDistance = Ptr<float>(gCG.contactDistance);
+    const float contactDist = contactDistance[clothCacheRef] + contactDistance[rigidCacheRef];
+    const uint rigidMaterialIndex = rigidShape.materialIndex;
+    const float restDistance = Ptr<float>(gCG.restDistance)[cmIdx];   // V6
+    const float sphereRadius = 0.0f;                                  // V5
+
+    // Block-rounded -- see BARRIER UNIFORMITY above.
+    const uint numRequiredThreads = (numVerts + (BOX_BLOCK - 1u)) & (~(BOX_BLOCK - 1u));
+
+    for (uint i = tid; i < numRequiredThreads; i += BOX_BLOCK)
+    {
+        bool hasContact = false;
+        float4 contact = float4(0, 0, 0, 0);
+        float4 normalPen = float4(0, 0, 0, 0);
+        uint pairInd1 = 0u;
+
+        if (i < numVerts)
+        {
+            const uint clothMask = (femClothId << PXG_CLOTH_ID_SHIFT) | i;
+            // V3: the filter runs FIRST on this path.
+            const bool skipVertex = findRigid(gCG.filterPairs, gCG.nbFilterPairs, rigidId, uint2(clothMask, 0u));
+            if (!skipVertex)
+            {
+                const float4 pf = verts[i];
+                const float3 clothP = float3(pf.x, pf.y, pf.z);
+
+                if (sphereboxNormalPen(clothP, boxQ, boxP, sphereRadius,
+                                       boxHalfExtents, contactDist, normalPen) != 0u)
+                {
+                    hasContact = true;
+                    pairInd1 = clothMask;
+                    // V1: the point on the RIGID, not the cloth vertex.
+                    const float3 rP = clothP - normalPen.w * float3(normalPen.x, normalPen.y, normalPen.z);
+                    contact = float4(rP.x, rP.y, rP.z, restDistance);
+                }
+            }
+        }
+
+        // per-tile ballot -> lane-0 atomicAdd -> exclusive-prefix write.
+        if (lane == 0u) sBoxMask[warpId] = 0u;
+        GroupMemoryBarrierWithGroupSync();
+        if (hasContact) InterlockedOr(sBoxMask[warpId], 1u << lane);
+        GroupMemoryBarrierWithGroupSync();
+        const uint mask = sBoxMask[warpId];
+        const uint totalCount = countbits(mask);
+        const uint threadOffset = countbits(mask & ((1u << lane) - 1u));
+        if (lane == 0u)
+        {
+            uint s = 0u;
+            if (totalCount != 0u)
+                InterlockedAdd(Ptr<uint>(gCG.w_totalContactCount)[0], totalCount, s);
+            sBoxStart[warpId] = s;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        const uint startIndex = sBoxStart[warpId];
         if (hasContact)
             writeRigidVsDeformableContact(startIndex + threadOffset, contact, normalPen,
                                           float4(0, 0, 0, 1), rigidId, pairInd1, rigidMaterialIndex);

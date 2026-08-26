@@ -1577,6 +1577,9 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_midphaseGenerateVertexPairsLaunch", kClothMidphaseVertPairs, uint32_t(sizeof(kClothMidphaseVertPairs)) },
     { "cloth_planeVertContactGenLaunch", kClothVertContactGen, uint32_t(sizeof(kClothVertContactGen)) },
     { "cloth_SphereVertexContactGenLaunch", kClothVertContactGen, uint32_t(sizeof(kClothVertContactGen)) },
+    // P9.15a: the box vertex path takes the SAME 11-argument pack as its plane and
+    // sphere siblings -- same blob, same writer by value.
+    { "cloth_boxVertexContactGenLaunch", kClothVertContactGen, uint32_t(sizeof(kClothVertContactGen)) },
     // gpunarrowphase FEMCloth-vs-rigid contact SORT / reorder (P7.1 tranche 4b-1 BDA)
     { "fem_reorderRigidContactsLaunch", kFemReorderRSContacts, uint32_t(sizeof(kFemReorderRSContacts)) },
     // gpusimulationcontroller FEMCloth-vs-rigid contact PREPARE + query/solve (P7.1 tranche 4b-2/3 BDA)

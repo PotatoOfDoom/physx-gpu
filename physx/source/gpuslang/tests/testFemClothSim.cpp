@@ -2567,6 +2567,524 @@ PXG_TEST(femClothSimSphereVertContactGen)
     dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h);
 }
 
+// ---------------------------------------------------------------------------
+// P9.15a -- cloth_boxVertexContactGenLaunch.
+//
+// THE ORACLE, STATED HONESTLY.  `spherebox` is __device__-only
+// (sphereCollision.cuh:371), so there is no engine function to call: the mirror
+// below is a CPU TRANSCRIPTION, compared bit for bit.  What carries it is the
+// same arrangement P8.73-P8.80 used -- every offset generated and static_asserted,
+// the whole writer region compared, and a heavy sweep -- plus one thing those had
+// not: the SAME body is already swept in Phase 1 as fcStaticTriCloth's mode 1,
+// and P9.15a LIFTED it into pxgSlangSphereBox rather than transcribing it again,
+// so that battery keeps verifying the shader half of this comparison.
+//
+// WHAT THE GEOMETRY IS BUILT TO DISCRIMINATE
+//   * a vertex strictly INSIDE the box, so the emitted point is the point on the
+//     RIGID and not the cloth vertex (V1).  At pen == 0 the two coincide, so a
+//     merely-touching vertex cannot tell the box kernel from its sphere sibling;
+//   * a vertex on the box's DIAGONAL, where all three faces tie at once -- the
+//     only place the `<=` chain and its Z seed are separable (SB1);
+//   * a vertex OUTSIDE but within the contact distance, for the 1/rsqrt branch
+//     (SB4), and one PAST it, which must not contact at all.  The gate's
+//     STRICTNESS (SB5, `>` vs `>=`) is separable only at exact equality, which a
+//     rotated round trip cannot hold -- that probe lives in the companion test
+//     femClothSimBoxVertContactGenExactGate, on an axis-aligned box;
+//   * a NON-IDENTITY box rotation, so quatRotate and quatRotateInv cannot be
+//     swapped (SB6), and three DISTINCT half-extents so an axis mix-up shows (V4);
+//   * a FILTER PAIR naming a vertex that would otherwise contact (V3);
+//   * 700 vertices -- more than one 512-thread tile, and deliberately not a
+//     multiple of either 32 or 512 -- with contacts in BOTH tiles, so the loop
+//     bound is exercised past its first iteration.
+// ---------------------------------------------------------------------------
+struct BoxNP { float nx, ny, nz, pen; bool hit; };
+
+// CPU mirror of spherebox (sphereCollision.cuh:371), radius 0.
+static BoxNP cpuSphereBox(V3c sphereOrigin, const float q[4], V3c boxP,
+                          float sphereRadius, V3c ext, float contactDist)
+{
+    BoxNP r = { 0, 0, 0, 0, false };
+    const V3c c = cpuQuatRotateInv(q, V3c{ sphereOrigin.x - boxP.x, sphereOrigin.y - boxP.y,
+                                           sphereOrigin.z - boxP.z });
+    const float inflatedSum = sphereRadius + contactDist;
+    const float sqInflatedSum = inflatedSum * inflatedSum;
+    auto cl = [](float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); };
+    const V3c p = { cl(c.x, -ext.x, ext.x), cl(c.y, -ext.y, ext.y), cl(c.z, -ext.z, ext.z) };
+    const V3c v = { c.x - p.x, c.y - p.y, c.z - p.z };
+    const float lengthSq = v.x * v.x + v.y * v.y + v.z * v.z;
+    if (!(sqInflatedSum > lengthSq)) return r;      // SB5: strictly greater
+
+    V3c localNorm; float dist;
+    const bool inside = (ext.x >= std::fabs(c.x)) && (ext.y >= std::fabs(c.y)) && (ext.z >= std::fabs(c.z));
+    if (inside)
+    {
+        const V3c absP = { std::fabs(p.x), std::fabs(p.y), std::fabs(p.z) };
+        const V3c d = { ext.x - absP.x, ext.y - absP.y, ext.z - absP.z };
+        localNorm = (p.z >= 0.0f) ? V3c{ 0, 0, 1 } : V3c{ 0, 0, -1 };
+        dist = -d.z;                                 // SB3
+        if (d.x <= d.y && d.x <= d.z)                // SB1
+        { localNorm = (p.x >= 0.0f) ? V3c{ 1, 0, 0 } : V3c{ -1, 0, 0 }; dist = -d.x; }
+        else if (d.y <= d.z)
+        { localNorm = (p.y >= 0.0f) ? V3c{ 0, 1, 0 } : V3c{ 0, -1, 0 }; dist = -d.y; }
+    }
+    else
+    {
+        const float recipLength = 1.0f / std::sqrt(lengthSq);   // SB4: 1/rsqrt round trip
+        const float len = 1.0f / recipLength;
+        localNorm = V3c{ v.x * recipLength, v.y * recipLength, v.z * recipLength };
+        dist = len;
+    }
+    // quatRotate (forward) -- pxgSlangCommon's spelling, operation for operation.
+    const float vx = 2.0f * localNorm.x, vy = 2.0f * localNorm.y, vz = 2.0f * localNorm.z;
+    const float w2 = q[3] * q[3] - 0.5f;
+    const float dot2 = (q[0] * vx + q[1] * vy + q[2] * vz);
+    r.nx = vx * w2 + (q[1] * vz - q[2] * vy) * q[3] + q[0] * dot2;
+    r.ny = vy * w2 + (q[2] * vx - q[0] * vz) * q[3] + q[1] * dot2;
+    r.nz = vz * w2 + (q[0] * vy - q[1] * vx) * q[3] + q[2] * dot2;
+    r.pen = dist - sphereRadius;
+    r.hit = true;
+    return r;
+}
+
+PXG_TEST(femClothSimBoxVertContactGen)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // V4: three DISTINCT half-extents, none equal to any index, count or bound.
+    const V3c ext = { 1.3f, 0.7f, 2.1f };
+    const V3c boxP = { 0.4f, -0.25f, 0.6f };
+    // SB6: a non-identity rotation (30 degrees about a non-axis direction).
+    const float ax = 0.4082482905f, ay = 0.8164965809f, az = 0.4082482905f; // normalized (1,2,1)
+    const float half = 0.2617993878f; // 15 deg -> 30 deg rotation
+    const float sh = std::sin(half), ch = std::cos(half);
+    const float boxQ[4] = { ax * sh, ay * sh, az * sh, ch };
+
+    const float contactOffsetCloth = 0.18f, contactOffsetRigid = 0.07f;   // total 0.25
+    const float contactDist = contactOffsetCloth + contactOffsetRigid;
+    const float restDistance = 0.031f;         // V6: distinct from every contact offset
+    const uint32_t materialIndex = 9u;
+    const uint64_t rigidNodeInd = 0x0000000500000013ull;   // low32 = 19
+
+    // Box-space anchor points, mapped into world so the oracle stays exact.
+    auto toWorld = [&](V3c local) {
+        // world = quatRotate(q, local) + boxP  (forward rotation, spelled as above)
+        const float vx = 2.0f * local.x, vy = 2.0f * local.y, vz = 2.0f * local.z;
+        const float w2 = boxQ[3] * boxQ[3] - 0.5f;
+        const float dot2 = (boxQ[0] * vx + boxQ[1] * vy + boxQ[2] * vz);
+        return V3c{ vx * w2 + (boxQ[1] * vz - boxQ[2] * vy) * boxQ[3] + boxQ[0] * dot2 + boxP.x,
+                    vy * w2 + (boxQ[2] * vx - boxQ[0] * vz) * boxQ[3] + boxQ[1] * dot2 + boxP.y,
+                    vz * w2 + (boxQ[0] * vy - boxQ[1] * vx) * boxQ[3] + boxQ[2] * dot2 + boxP.z };
+    };
+
+    const uint32_t NB_VERTS = 700u;            // > one 512-tile, multiple of neither 32 nor 512
+    const uint32_t V_INSIDE_DEEP   = 3u;       // V1/SB3: strictly inside, nearest face +y
+    const uint32_t V_DIAGONAL      = 11u;      // SB1: all three faces tie
+    const uint32_t V_OUTSIDE_NEAR  = 40u;      // SB4: outside, within contactDist
+    const uint32_t V_OUTSIDE_FAR   = 57u;      // just PAST the contact distance -> NO contact
+    const uint32_t V_FILTERED      = 90u;      // V3: would contact, filter suppresses it
+    const uint32_t V_SECOND_TILE   = 613u;     // in the SECOND 512-thread tile
+    // SB4 needs more than one sample.  With a single outside vertex the mutant that
+    // replaces `1.0f / rsqrt(lengthSq)` with `sqrt(lengthSq)` SURVIVED: the two
+    // spellings round-trip to the same float for that one input.  They are not the
+    // same function -- one rounds twice -- so the fix is more samples, at varied
+    // distances and off corners and edges where lengthSq has two or three non-zero
+    // components rather than one.
+    static const uint32_t V_OUT_EXTRA[6] = { 101u, 137u, 208u, 259u, 331u, 404u };
+    const V3c FAR_AWAY = { 900.0f, 900.0f, 900.0f };
+
+    std::vector<F4> verts(NB_VERTS, F4{ FAR_AWAY.x, FAR_AWAY.y, FAR_AWAY.z, 1.0f });
+    auto place = [&](uint32_t i, V3c local) {
+        const V3c w = toWorld(local);
+        verts[i] = F4{ w.x, w.y, w.z, 1.0f };
+    };
+    // strictly inside: nearest face is +y (dist to +y = 0.7-0.5 = 0.2; to x = 1.3-0.2 = 1.1;
+    // to z = 2.1-0.3 = 1.8) -> localNorm (0,1,0), pen = -0.2
+    place(V_INSIDE_DEEP,  V3c{ 0.2f, 0.5f, 0.3f });
+    // on the diagonal of the INSCRIBED cube: distToSurface equal on all three axes
+    // (ext - t = same) -> ext.x-t = ext.y-t = ext.z-t is impossible for distinct
+    // extents, so tie the two SMALLEST by construction instead: pick t so that
+    // ext.x-|x| == ext.y-|y| == ext.z-|z|.
+    place(V_DIAGONAL,     V3c{ 1.3f - 0.4f, 0.7f - 0.4f, 2.1f - 0.4f });
+    // outside the +x face by 0.15 (< 0.25), inside the other two spans
+    place(V_OUTSIDE_NEAR, V3c{ ext.x + 0.15f, 0.1f, -0.2f });
+    // outside the +x face by MORE than contactDist -> rejected.
+    //
+    // The first draft put this vertex EXACTLY at the inflated distance, to separate
+    // the gate's strict `>` from `>=`.  It does not survive: the vertex is authored
+    // in box space and pushed through a rotation to world, and the shader rotates it
+    // back, so the round trip lands a few ulps inside and the mirror accepts it.
+    // Same knife edge P9.14b hit with GJK.  The strictness probe therefore moved to
+    // femClothSimBoxVertContactGenExactGate below, which uses an axis-aligned box at
+    // the origin and binary-exact numbers so equality is reachable.
+    place(V_OUTSIDE_FAR, V3c{ ext.x + contactDist + 0.05f, 0.0f, 0.0f });
+    // would contact (inside), but the filter names it
+    place(V_FILTERED,     V3c{ -0.3f, -0.2f, 0.4f });
+    // second tile, strictly inside, nearest face -z
+    place(V_SECOND_TILE,  V3c{ 0.1f, 0.05f, -1.9f });
+    // SB4's extra samples: faces, edges and corners at varied separations.
+    place(V_OUT_EXTRA[0], V3c{ ext.x + 0.07f,  0.30f,          -0.50f });          // +x face
+    place(V_OUT_EXTRA[1], V3c{ -0.20f,         -ext.y - 0.11f,  0.80f });          // -y face
+    place(V_OUT_EXTRA[2], V3c{ 0.60f,           0.10f,          ext.z + 0.19f });  // +z face
+    place(V_OUT_EXTRA[3], V3c{ ext.x + 0.09f,   ext.y + 0.13f, -0.40f });          // xy edge
+    place(V_OUT_EXTRA[4], V3c{ -ext.x - 0.06f,  0.20f,          ext.z + 0.08f });  // xz edge
+    place(V_OUT_EXTRA[5], V3c{ ext.x + 0.05f,  -ext.y - 0.06f,  ext.z + 0.07f });  // corner
+
+    DevBuf bVerts = makeDev(dev, verts);
+
+    // THE CLOTH ID IS 1, NOT 0, AND SLOT 0 IS A DECOY.  With id 0 the index encode
+    // `(femClothId << 20) | i` is the identity on i, so a wrong shift is invisible
+    // and so is a wrong femClothes[] subscript.  Slot 0 therefore holds a real,
+    // live descriptor over a DIFFERENT vertex buffer parked far from the box: a
+    // port that reads it produces a deterministic empty set rather than a fault.
+    std::vector<F4> decoyVerts(9u, F4{ -800.0f, -800.0f, -800.0f, 1.0f });
+    DevBuf bDecoy = makeDev(dev, decoyVerts);
+    const uint32_t CLOTH_ID = 1u;
+    std::vector<PxgFEMCloth> descArr = { makeClothDesc(bDecoy.addr, uint32_t(decoyVerts.size())),
+                                         makeClothDesc(bVerts.addr, NB_VERTS) };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<PxgContactManagerInput> cmInputs(1);
+    std::memset(cmInputs.data(), 0, sizeof(PxgContactManagerInput));
+    cmInputs[0].shapeRef0 = 0u; cmInputs[0].shapeRef1 = 1u;
+    cmInputs[0].transformCacheRef0 = 0u; cmInputs[0].transformCacheRef1 = 1u;
+    DevBuf bCin = makeDev(dev, cmInputs);
+
+    std::vector<PxgShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    shapes[0].type = PxU32(PxGeometryType::eTRIANGLEMESH);
+    shapes[0].particleOrSoftbodyId = CLOTH_ID;
+    shapes[1].type = PxU32(PxGeometryType::eBOX);
+    shapes[1].materialIndex = materialIndex;
+    shapes[1].scale = PxMeshScale(PxVec3(ext.x, ext.y, ext.z), PxQuat(PxIdentity));
+    DevBuf bShapes = makeDev(dev, shapes);
+
+    std::vector<PxsCachedTransform> tcache(2);
+    std::memset(tcache.data(), 0, tcache.size() * sizeof(PxsCachedTransform));
+    tcache[1].transform = PxTransform(PxVec3(boxP.x, boxP.y, boxP.z),
+                                      PxQuat(boxQ[0], boxQ[1], boxQ[2], boxQ[3]));
+    DevBuf bTc = makeDev(dev, tcache);
+
+    std::vector<float> contactDistArr = { contactOffsetCloth, contactOffsetRigid };
+    DevBuf bCd = makeDev(dev, contactDistArr);
+    std::vector<float> restArr = { restDistance };
+    DevBuf bRd = makeDev(dev, restArr);
+    std::vector<uint64_t> remap = { 0ull, rigidNodeInd };
+    DevBuf bRemap = makeDev(dev, remap);
+
+    // V3: one filter pair, keyed (rigidNodeInd, clothMask(V_FILTERED)).
+    const uint32_t filteredMask = (CLOTH_ID << 20) | V_FILTERED;
+    std::vector<PxgRigidFilterPair> fpairs(1);
+    std::memset(fpairs.data(), 0, sizeof(PxgRigidFilterPair));
+    fpairs[0].index0 = rigidNodeInd;
+    fpairs[0].index1 = uint64_t(filteredMask);
+    DevBuf bFilters = makeDev(dev, fpairs);
+
+    WriterBufs w = makeWriter(dev, 64u);
+
+    ContactGenPush push = {};
+    push.numTests = 1u;
+    push.cmInputs = bCin.addr; push.transformCache = bTc.addr; push.contactDistance = bCd.addr;
+    push.restDistance = bRd.addr; push.gpuShapes = bShapes.addr; push.femClothes = bDesc.addr;
+    push.shapeToRigidRemap = bRemap.addr; push.filterPairs = bFilters.addr; push.nbFilterPairs = 1u;
+    fillWriter(push, w);
+
+    Kernel k("femClothContactGenBda.spv", "cloth_boxVertexContactGenLaunch", {}, sizeof(ContactGenPush));
+    PXG_CHECK_MSG(k.isValid(), "the box vertex contact-gen pipeline must build");
+    if (!k.isValid()) { destroyWriter(dev, w); return; }
+    k.dispatch(/*gridX numTests*/ 1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // ---- the analytic expectation ----
+    struct Want { uint32_t vert; BoxNP np; };
+    std::vector<Want> want;
+    uint32_t coveredInside = 0, coveredOutside = 0, coveredTile1 = 0, wouldFilter = 0;
+    for (uint32_t i = 0; i < NB_VERTS; ++i)
+    {
+        const BoxNP r = cpuSphereBox(V3c{ verts[i].x, verts[i].y, verts[i].z }, boxQ, boxP,
+                                     0.0f, ext, contactDist);
+        if (!r.hit) continue;
+        if (i == V_FILTERED) { ++wouldFilter; continue; }
+        if (r.pen < 0.0f) ++coveredInside; else ++coveredOutside;
+        if (i >= 512u) ++coveredTile1;
+        want.push_back(Want{ i, r });
+    }
+
+    // Coverage, demanded rather than designed.
+    PXG_CHECK_MSG(wouldFilter == 1u,
+                  "the filtered vertex %u does not otherwise produce a contact -- V3 is unprobed",
+                  V_FILTERED);
+    PXG_CHECK_MSG(coveredInside > 0 && coveredOutside >= 6,
+                  "the contact set has %u inside and %u outside -- SB4's 1/rsqrt round trip "
+                  "needs SEVERAL outside samples before it separates from a plain sqrt",
+                  coveredInside, coveredOutside);
+    PXG_CHECK_MSG(coveredTile1 > 0,
+                  "no contact comes from a vertex past index 511 -- the loop never runs a second "
+                  "512-thread tile and the block-rounded bound is unprobed");
+    {
+        const BoxNP e = cpuSphereBox(V3c{ verts[V_OUTSIDE_FAR].x, verts[V_OUTSIDE_FAR].y,
+                                          verts[V_OUTSIDE_FAR].z }, boxQ, boxP, 0.0f, ext, contactDist);
+        PXG_CHECK_MSG(!e.hit, "vertex %u was meant to sit past the contact distance and be "
+                      "rejected, but the mirror accepts it", V_OUTSIDE_FAR);
+    }
+    {
+        const V3c cl = cpuQuatRotateInv(boxQ, V3c{ verts[V_DIAGONAL].x - boxP.x,
+                                                   verts[V_DIAGONAL].y - boxP.y,
+                                                   verts[V_DIAGONAL].z - boxP.z });
+        const float dx = ext.x - std::fabs(cl.x), dy = ext.y - std::fabs(cl.y), dz = ext.z - std::fabs(cl.z);
+        PXG_CHECK_MSG(std::fabs(dx - dy) < 1e-5f && std::fabs(dy - dz) < 1e-5f,
+                      "vertex %u was meant to tie all three faces (%g, %g, %g) -- SB1's `<=` chain "
+                      "is unprobed", V_DIAGONAL, dx, dy, dz);
+    }
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, w.count.h, 1)[0];
+    PXG_CHECK_MSG(gCount == uint32_t(want.size()),
+                  "box contact-gen emitted %u contacts, expected %zu", gCount, want.size());
+    if (gCount != uint32_t(want.size()))
+    {
+        destroyWriter(dev, w);
+        dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h);
+        dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bTc.h); dev->destroyBuffer(bCd.h);
+        dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h);
+        dev->destroyBuffer(bDecoy.h);
+        return;
+    }
+
+    const auto gPoint = downloadBuffer<F4>(dev, w.point.h, w.maxContacts);
+    const auto gNP = downloadBuffer<F4>(dev, w.normalPen.h, w.maxContacts);
+    const auto gBary = downloadBuffer<F4>(dev, w.barycentric.h, w.maxContacts);
+    const auto gInfo = downloadBuffer<FemOtherContactInfoHost>(dev, w.info.h, w.maxContacts);
+    const auto gByRigid = downloadBuffer<uint64_t>(dev, w.byRigid.h, w.maxContacts);
+    const auto gTempByRigid = downloadBuffer<uint32_t>(dev, w.tempByRigid.h, w.maxContacts);
+    const auto gIdxByRigid = downloadBuffer<uint32_t>(dev, w.idxByRigid.h, w.maxContacts);
+
+    // The slot a contact lands in is the atomicAdd's order across tiles, i.e. a
+    // race (the P9.11 rule), so the emitted contacts are matched as a SET by the
+    // cloth vertex the contact-info names, and claimed BY INDEX so duplicates
+    // would not cancel out.
+    std::vector<bool> claimed(want.size(), false);
+    size_t mm = 0;
+    for (uint32_t sidx = 0; sidx < gCount; ++sidx)
+    {
+        const uint32_t pid = gInfo[sidx].pairInd1;
+        size_t at = want.size();
+        for (size_t q = 0; q < want.size(); ++q)
+            if (!claimed[q] && ((CLOTH_ID << 20) | want[q].vert) == pid) { at = q; break; }
+        if (at == want.size())
+        { if (mm < 4) std::printf("  box slot %u names cloth vertex mask %u, which is not an "
+                                  "unclaimed expected contact\n", sidx, pid);
+          ++mm; continue; }
+        claimed[at] = true;
+        const Want& e = want[at];
+
+        const F4 refNP = { e.np.nx, e.np.ny, e.np.nz, e.np.pen };
+        // V1: the point on the RIGID -- clothP - pen * n -- NOT the cloth vertex.
+        const F4 refPoint = { verts[e.vert].x - e.np.pen * e.np.nx,
+                              verts[e.vert].y - e.np.pen * e.np.ny,
+                              verts[e.vert].z - e.np.pen * e.np.nz,
+                              restDistance };
+        auto cmpF4 = [&](const char* nm, const F4& r, const F4& g) {
+            if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) ||
+                f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+            { ++mm; if (mm < 6) std::printf("  box vert %u %s MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n",
+                                            e.vert, nm, r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
+        };
+        cmpF4("outNormalPen", refNP, gNP[sidx]);
+        cmpF4("outPoint", refPoint, gPoint[sidx]);
+        cmpF4("outBarycentric", F4{ 0, 0, 0, 1 }, gBary[sidx]);
+        if (gByRigid[sidx] != rigidNodeInd) { ++mm; std::printf("  box vert %u contactByRigid MM\n", e.vert); }
+        if (gTempByRigid[sidx] != uint32_t(rigidNodeInd & 0xffffffffu)) { ++mm; std::printf("  box vert %u tempByRigid MM\n", e.vert); }
+        if (gIdxByRigid[sidx] != sidx) { ++mm; std::printf("  box vert %u idxByRigid MM got %u want %u\n", e.vert, gIdxByRigid[sidx], sidx); }
+        if (gInfo[sidx].pairInd0 != rigidNodeInd) { ++mm; std::printf("  box vert %u info.pairInd0 MM\n", e.vert); }
+        if (gInfo[sidx].rigidMatInd_isInCollision != (materialIndex & 0x7fffffffu)) { ++mm; std::printf("  box vert %u info.rigidMatInd MM\n", e.vert); }
+    }
+    PXG_CHECK_MSG(mm == 0, "cloth_boxVertexContactGen bit-exact vs the CPU mirror (%zu mismatches)", mm);
+
+    // Nothing past the emitted contacts may have been touched.
+    size_t badPoison = 0;
+    for (uint32_t sidx = gCount; sidx < w.maxContacts; ++sidx)
+    {
+        if (gByRigid[sidx] != 0xffffffffffffffffull) ++badPoison;
+        if (gTempByRigid[sidx] != 0xffffffffu || gIdxByRigid[sidx] != 0xffffffffu) ++badPoison;
+    }
+    PXG_CHECK_MSG(badPoison == 0, "%zu writer slots past the emitted contacts were written", badPoison);
+
+    // The V1 teeth: for the deep-inside vertex the emitted point must differ from
+    // the cloth vertex by a measurable amount, or the sphere sibling's convention
+    // would pass this fixture too.
+    {
+        size_t at = want.size();
+        for (size_t q = 0; q < want.size(); ++q) if (want[q].vert == V_INSIDE_DEEP) { at = q; break; }
+        PXG_CHECK_MSG(at != want.size(), "the deep-inside vertex produced no contact");
+        if (at != want.size())
+            PXG_CHECK_MSG(std::fabs(want[at].np.pen) > 0.05f,
+                          "the deep-inside vertex's penetration is only %g -- the emitted point and "
+                          "the cloth vertex are too close for V1 to be separable", want[at].np.pen);
+    }
+
+    std::printf("    [ note ] %zu contacts over %u verts (%u inside, %u outside, %u past index 511, "
+                "1 filtered); box extents (%g, %g, %g)\n",
+                want.size(), NB_VERTS, coveredInside, coveredOutside, coveredTile1,
+                ext.x, ext.y, ext.z);
+
+    destroyWriter(dev, w);
+    dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h);
+    dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bTc.h); dev->destroyBuffer(bCd.h);
+    dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h);
+    dev->destroyBuffer(bDecoy.h);
+}
+
+// ---------------------------------------------------------------------------
+// P9.15a companion -- SB5, the gate's STRICTNESS, on numbers that can hold it.
+//
+// `spherebox` accepts on `sqInflatedSum > lengthSq`, strictly.  `>` and `>=`
+// differ at EXACTLY one input: equality.  The rotated fixture above cannot reach
+// it -- a vertex authored in box space, rotated to world and rotated back lands a
+// few ulps off -- so this companion removes every source of rounding:
+//
+//   * the box sits at the ORIGIN with an IDENTITY rotation, so quatRotateInv is
+//     the identity map (with q = (0,0,0,1): w2 = 0.5, dot2 = 0, result = v);
+//   * every extent and offset is a negative power of two or a sum of them, so the
+//     clamp, the subtraction and the square are all exact in binary32.
+//
+// ext.x = 1.0, contactDist = 0.125 + 0.125 = 0.25, vertex at x = 1.25:
+//     clamp -> 1.0, v.x = 0.25, lengthSq = 0.0625
+//     inflatedSum = 0 + 0.25,   sqInflatedSum = 0.0625
+// so the test is `0.0625 > 0.0625` -> FALSE -> no contact.  A `>=` mutant emits
+// one.  Its neighbour one ulp closer must contact under both, which is what makes
+// this a knife edge rather than a coarse rejection.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimBoxVertContactGenExactGate)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const V3c ext = { 1.0f, 0.5f, 2.0f };            // exact
+    const float contactOffsetCloth = 0.125f, contactOffsetRigid = 0.125f;
+    const float contactDist = contactOffsetCloth + contactOffsetRigid;   // 0.25, exact
+    const float restDistance = 0.0625f;
+    const uint32_t materialIndex = 3u;
+    const uint64_t rigidNodeInd = 0x0000000100000029ull;
+
+    // vert0: EXACTLY at the inflated distance -> rejected by `>`.
+    // vert1: one ulp closer -> accepted under both spellings, so the pair brackets
+    //        the boundary instead of merely sitting on one side of it.
+    // vert2: comfortably inside, so the dispatch emits something either way and a
+    //        zero count cannot be mistaken for "the gate worked".
+    // vert3: SB1's SECOND tie.  The rotated fixture's diagonal vertex ties all three
+    //        faces at once, so the FIRST test (`dx <= dy && dx <= dz`) fires and the
+    //        `else if (dy <= dz)` is never reached -- the mutant that makes that one
+    //        strict SURVIVED the first sweep.  This vertex ties only Y and Z, with X
+    //        strictly further, so the second test alone decides:
+    //            |x| = 0.5   -> dx = 1.0 - 0.5  = 0.5
+    //            |y| = 0.25  -> dy = 0.5 - 0.25 = 0.25
+    //            |z| = 1.75  -> dz = 2.0 - 1.75 = 0.25
+    //        `dy <= dz` takes +Y; `dy < dz` falls through to the Z seed and reports
+    //        +Z instead.  Same depth, different normal.  Every value is exact.
+    const float atGate = ext.x + contactDist;                       // 1.25
+    const float justInside = std::nextafter(atGate, 0.0f);
+    std::vector<F4> verts = {
+        { atGate,     0.0f,  0.0f,  1.0f },
+        { justInside, 0.0f,  0.0f,  1.0f },
+        { 0.25f,      0.0f,  0.0f,  1.0f },
+        { 0.5f,       0.25f, 1.75f, 1.0f },
+    };
+    const uint32_t NB = uint32_t(verts.size());
+
+    DevBuf bVerts = makeDev(dev, verts);
+    PxgFEMCloth c = makeClothDesc(bVerts.addr, NB);
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<PxgContactManagerInput> cmInputs(1);
+    std::memset(cmInputs.data(), 0, sizeof(PxgContactManagerInput));
+    cmInputs[0].shapeRef0 = 0u; cmInputs[0].shapeRef1 = 1u;
+    cmInputs[0].transformCacheRef0 = 0u; cmInputs[0].transformCacheRef1 = 1u;
+    DevBuf bCin = makeDev(dev, cmInputs);
+
+    std::vector<PxgShape> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShape));
+    shapes[0].type = PxU32(PxGeometryType::eTRIANGLEMESH);
+    shapes[0].particleOrSoftbodyId = 0u;
+    shapes[1].type = PxU32(PxGeometryType::eBOX);
+    shapes[1].materialIndex = materialIndex;
+    shapes[1].scale = PxMeshScale(PxVec3(ext.x, ext.y, ext.z), PxQuat(PxIdentity));
+    DevBuf bShapes = makeDev(dev, shapes);
+
+    std::vector<PxsCachedTransform> tcache(2);
+    std::memset(tcache.data(), 0, tcache.size() * sizeof(PxsCachedTransform));
+    tcache[1].transform = PxTransform(PxVec3(0.0f, 0.0f, 0.0f), PxQuat(PxIdentity));
+    DevBuf bTc = makeDev(dev, tcache);
+
+    std::vector<float> contactDistArr = { contactOffsetCloth, contactOffsetRigid };
+    DevBuf bCd = makeDev(dev, contactDistArr);
+    std::vector<float> restArr = { restDistance };
+    DevBuf bRd = makeDev(dev, restArr);
+    std::vector<uint64_t> remap = { 0ull, rigidNodeInd };
+    DevBuf bRemap = makeDev(dev, remap);
+    DevBuf bFilters = makeDev(dev, std::vector<uint32_t>{ 0u });
+
+    WriterBufs w = makeWriter(dev, 16u);
+
+    ContactGenPush push = {};
+    push.numTests = 1u;
+    push.cmInputs = bCin.addr; push.transformCache = bTc.addr; push.contactDistance = bCd.addr;
+    push.restDistance = bRd.addr; push.gpuShapes = bShapes.addr; push.femClothes = bDesc.addr;
+    push.shapeToRigidRemap = bRemap.addr; push.filterPairs = bFilters.addr; push.nbFilterPairs = 0u;
+    fillWriter(push, w);
+
+    Kernel k("femClothContactGenBda.spv", "cloth_boxVertexContactGenLaunch", {}, sizeof(ContactGenPush));
+    PXG_CHECK_MSG(k.isValid(), "the box vertex contact-gen pipeline must build");
+    if (!k.isValid()) { destroyWriter(dev, w); return; }
+    k.dispatch(1u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // The arithmetic must actually be exact, or this test proves nothing.
+    const float identQ[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    const BoxNP g0 = cpuSphereBox(V3c{ verts[0].x, 0.0f, 0.0f }, identQ, V3c{ 0, 0, 0 }, 0.0f, ext, contactDist);
+    const BoxNP g1 = cpuSphereBox(V3c{ verts[1].x, 0.0f, 0.0f }, identQ, V3c{ 0, 0, 0 }, 0.0f, ext, contactDist);
+    PXG_CHECK_MSG(!g0.hit, "vertex 0 must sit EXACTLY on the gate and be rejected by `>` -- the "
+                  "mirror accepts it, so the numbers are not exact after all");
+    PXG_CHECK_MSG(g1.hit, "vertex 1 (one ulp closer) must be accepted, or the pair does not "
+                  "bracket the boundary");
+
+    // SB1's second tie must actually be a tie, and X must not be in the running.
+    {
+        const float dx = ext.x - 0.5f, dy = ext.y - 0.25f, dz = ext.z - 1.75f;
+        PXG_CHECK_MSG(dy == dz && dx > dy,
+                      "vertex 3 was meant to tie Y against Z with X strictly further "
+                      "(dx %g, dy %g, dz %g) -- SB1's SECOND `<=` is unprobed", dx, dy, dz);
+    }
+
+    const uint32_t gCount = downloadBuffer<uint32_t>(dev, w.count.h, 1)[0];
+    PXG_CHECK_MSG(gCount == 3u,
+                  "the exact-gate dispatch emitted %u contacts, expected 3 (vertex 0 sits exactly "
+                  "on the gate and the test is strictly greater; a `>=` spelling emits 4)", gCount);
+
+    if (gCount == 3u)
+    {
+        const auto gInfo = downloadBuffer<FemOtherContactInfoHost>(dev, w.info.h, 3);
+        const auto gNP = downloadBuffer<F4>(dev, w.normalPen.h, 3);
+        bool sawVert0 = false; int at3 = -1;
+        for (uint32_t i = 0; i < 3u; ++i)
+        {
+            if (gInfo[i].pairInd1 == 0u) sawVert0 = true;
+            if (gInfo[i].pairInd1 == 3u) at3 = int(i);
+        }
+        PXG_CHECK_MSG(!sawVert0, "the vertex sitting exactly on the gate produced a contact");
+        PXG_CHECK_MSG(at3 >= 0, "the Y/Z tie vertex produced no contact");
+        if (at3 >= 0)
+            PXG_CHECK_MSG(f2u(gNP[at3].x) == f2u(0.0f) && f2u(gNP[at3].y) == f2u(1.0f) &&
+                          f2u(gNP[at3].z) == f2u(0.0f) && f2u(gNP[at3].w) == f2u(-0.25f),
+                          "the Y/Z tie must resolve to +Y at depth -0.25 (the `<=` chain), got "
+                          "(%g, %g, %g) pen %g -- +Z means the second test went strict",
+                          gNP[at3].x, gNP[at3].y, gNP[at3].z, gNP[at3].w);
+    }
+
+    destroyWriter(dev, w);
+    dev->destroyBuffer(bVerts.h); dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bCin.h);
+    dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bTc.h); dev->destroyBuffer(bCd.h);
+    dev->destroyBuffer(bRd.h); dev->destroyBuffer(bRemap.h); dev->destroyBuffer(bFilters.h);
+}
+
 // ===========================================================================
 // P7.1 tranche 4b-1: cloth-vs-rigid contact SORT / REORDER.
 //   femClothContactSortBda.spv:

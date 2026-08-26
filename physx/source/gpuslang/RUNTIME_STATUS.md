@@ -8,12 +8,14 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **817/817** green in both modes (`ctest -N` in `build-gpuslang`).
-Szenen: **30/30** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
-Inventar (29 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
+Szenen: **31/31** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
+Inventar (30 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
 wertet.  `particlediffuse` kam in P9.13a als Diagnose hinzu und ist seit P9.13d
 gewertet; `particleconvex` kam in P9.14a als ausstehende Arbeit hinzu und ist
-seit P9.14c gewertet — womit die Liste der ausstehenden Arbeit **leer** ist.  Die
+seit P9.14c gewertet; `clothbox` kam in P9.15a hinzu, weil `cloth` ein Freifall
+ist und grün bleibt, ob das Tuch landet oder nicht.  Die Liste der ausstehenden
+Arbeit ist **leer**.  Die
 Diagnoseliste trägt jetzt wieder nur die sechs Kontrollen, die durchfallen
 SOLLEN, weil sie die Referenz der echten Prüfung sind.  P9.9 fügte `particlefluidboundary` hinzu, P9.10c
 `particlemeshfloor`, P9.11c `particlehffloor`.
@@ -1702,6 +1704,137 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.15a — `cloth_boxVertexContactGenLaunch` (Manifest **355**): das Tuch bleibt auf der Kiste liegen — und eine Barriere, die seit P7.1 im falschen Kontrollfluss stand
+
+Portiert `femClothPrimitives.cu:3078` (Kernel) und `sphereCollision.cuh:371`
+(die Abfrage), beide vollständig gelesen. Manifest **354 → 355**. ABI-Zeile: die
+vorhandene `kClothVertContactGen` — derselbe 11-Argument-Pack wie bei den beiden
+Geschwistern.
+
+### Die Arbeit kam zum ersten Mal von der Engine, nicht von uns
+
+Die Messung über alle 30 Szenen am Vortag ergab: **genau eine** Szene verweigert
+noch Kernel, und `cloth` verweigert genau drei —
+`cloth_midphaseGeneratePairsLaunch`, `cloth_boxTriangleContactGenLaunch` und den
+hier gelandeten. Das ist das erste Mal in Phase 2, dass eine **vorhandene** Szene
+die nächste Arbeit benennt, statt dass erst eine Szene dafür gebaut werden muss.
+Der Vertex-Erzeuger war der billigste der drei: sein Produzent
+(`cloth_midphaseGenerateVertexPairsLaunch`) liegt seit P7.1, und der Rechenkern
+lag seit **Phase 1**.
+
+### Gehoben, nicht abgeschrieben
+
+`spherebox` war bereits portiert und gefegt — als `sphereboxNormalPen` in
+`fcStaticTriCloth.slang`, dessen Batterie Modus 1 genau diesen Körper prüft.
+Nach der P8.90-Regel wandert er in ein Modul (`pxgSlangSphereBox.slang`), und
+**beide** Aufrufer importieren ihn. Die Phase-1-Batterie verifiziert damit
+weiterhin den gehobenen Körper — sie lief unmittelbar nach dem Hub grün, GPU-
+und DX12-Kreuzübersetzung.
+
+Die Quaternionen-Helfer im Modul sind **privat**, damit
+`femClothContactGenBda` nicht plötzlich ein zweites `quatRotate` im Gültigkeits-
+bereich hat; ihre Schreibweise ist Operation für Operation aus `pxgSlangCommon`
+kopiert, damit die Arithmetik die bleibt, die die Batterie geprüft hat.
+
+### PLATTFORMREGEL: die Emulation verschiebt die Synchronisationsdomäne
+
+Beim Schreiben des Einsprungpunkts fiel ein Fehler in **bereits gelandetem Code**
+auf, und er ist lehrreich genug für eine eigene Regel.
+
+Die CUDA läuft bis `numRequiredThreads = (numVerts + 31) & ~31` — auf den
+**Warp** aufgerundet — und aggregiert mit `__ballot_sync` und
+`warpScanExclusive`. Die verlangen nur **warp**-uniformen Kontrollfluss, und den
+haben sie: alle 32 Bahnen eines Warps teilen sich die Schleifenzahl. Die CUDA ist
+korrekt.
+
+Unser Port hat keine Warp-Intrinsics. Er emuliert sie mit `groupshared` und
+`GroupMemoryBarrierWithGroupSync()` — also `OpControlBarrier`, und das verlangt
+Kontrollfluss, der über den **ganzen Block** uniform ist. Bei 512 Threads und
+einer auf 32 gerundeten Schranke bekommt `numVerts = 3` die Threads 0..31 in
+eine Iteration und die Threads 32..511 in keine. **Die Barriere steht damit in
+nicht-uniformem Kontrollfluss — in SPIR-V und Vulkan undefiniert.**
+
+Das ist nicht hypothetisch:
+
+* der Plane-Zwilling (P7.1) hat diese Form, und seine **eigene Vorrichtung** —
+  drei Vertices, 512 Threads — erreicht die Bedingung bei **jedem Lauf**;
+* die zwölf `OpControlBarrier` überleben nachweislich in
+  `femClothContactGenBda.spv`, werden also nicht wegoptimiert;
+* llvmpipe erzwingt die Regel nicht. Das ist keine Lizenz.
+
+Beide Einsprungpunkte runden jetzt auf den **Block**. Der Sphere-Zwilling
+braucht nichts: sein Block **ist** ein Warp, eine 32er-Rundung ist dort schon
+blockuniform. Die anderen drei Dateien mit derselben Konjunktion
+(`npContactPrePrep`, `solverPGS`, `solverTGS`) stehen als eigene Aufgabe an.
+
+### Die Szene, die es messen kann
+
+`cloth` ist ein **Freifall über 60 Schritte**, und das ist ihr ganzer Vertrag:
+sie prüft, dass das Tuch fällt, monoton, auf ein endliches y. Ein Tuch, das
+glatt durch die Bodenkiste segelt, erfüllt jede dieser drei Prüfungen. Die Szene
+blieb deshalb die ganze Zeit grün, in der der Kernel fehlte — sie hat ihn
+**benannt** (neun Meldungen pro Lauf) und konnte ihn **nicht messen**. Genau die
+P9.13h-Lehre.
+
+Also `clothbox`: dieselbe Vorrichtung, viermal so lang gefahren, mit der einen
+Frage, die der Freifall nicht stellen kann — **bleibt es liegen?**
+
+**Gemessen, nicht behauptet** (derselbe Bau, eine Manifest-Zeile):
+
+| | mittleres y am Ende | Bewegung pro Schritt zum Schluss |
+|---|---|---|
+| Kernel abgebildet | **+0.4933** | 0.000098 |
+| Kernel unabgebildet | **−73.8070** | −0.65, noch beschleunigend |
+
+Ein Unterschied von knapp **74 Metern**. Die Schranke steht bei **−2.0**.
+
+### Verifikation
+
+* Vorrichtung: zwei `PXG_TEST` in derselben Übersetzungseinheit wie die
+  Geschwister — die gedrehte Hauptvorrichtung (700 Vertices, Kiste mit
+  nicht-uniformer Skalierung und 30°-Drehung, Cloth-ID **1** mit einem lebenden
+  Köder auf Platz 0) und `…ExactGate`, eine achsparallele Kiste im Ursprung mit
+  binär-exakten Zahlen;
+* Fegen **26 Mutanten, 23 getötet**, zwangsfrisch, in zwei Dateien
+  (Einsprungpunkt 12/14, Modul 11/12). Zwei Anker waren dreifach — der
+  Writer-Schwanz ist in allen drei Einsprungpunkten wortgleich — und wurden nach
+  der stehenden Regel als **ungetestet** verbucht, neu verankert und getötet;
+* die drei Überlebenden sind **diagnostiziert, nicht entschuldigt** (unten);
+* Suite **817/817** in **beiden** Speichermodi;
+* Szenen: **31 ok, 0 fail, 0 missing (of 31)**.
+
+### Die drei Überlebenden
+
+**`sb2-sign-from-center`** — beweisbar äquivalent, für **jede** Eingabe, nicht
+nur für die der Vorrichtung. Der Zweig läuft ausschließlich unter
+`bInsideBox`, und das heißt `ext >= |sphereCenter|` auf allen drei Achsen — also
+hat die Klemmung nichts getan und `p == sphereCenter` gilt exakt. Die CUDA
+schreibt `p`, dieser Port schreibt `p`; dass `sphereCenter` dasselbe liefert, ist
+kein Loch.
+
+**`bound-warp-rounded-not-block`** und **`bound-not-rounded-at-all`** — beide
+sind die Barrieren-Uniformität, und **keine ausgabevergleichende Vorrichtung
+kann sie sehen**. Der Beweis ist kurz: welche Bahn einen Kontakt setzen darf,
+entscheidet allein der Wächter `i < numVerts`, und der ist unter allen drei
+Schranken derselbe. Die Schranke entscheidet nur, wie viele *durchweg falsche*
+Iterationen hinten anhängen — und eine Kachel ohne Treffer macht weder den
+atomaren Zähler noch einen Store. Die emittierte Kontaktmenge ist also
+identisch; verschieden ist nur, ob `OpControlBarrier` uniform erreicht wird, und
+das ist eine Gültigkeits- und keine Ausgabeeigenschaft. llvmpipe erzwingt sie
+nicht, `spirv-val` prüft sie nicht (sie ist dynamisch). Der Fix bleibt richtig —
+er wird hier nur nicht von der Vorrichtung getragen, sondern von der Spezifikation,
+und dieser Eintrag sagt das, statt einen Kill zu behaupten.
+
+### Was offen bleibt
+
+`cloth` verweigert weiterhin **zwei** Kernel:
+`cloth_midphaseGeneratePairsLaunch` (die BV32-Traversierung, deren Zwilling
+`cloth_meshMidphaseGeneratePairsLaunch` seit P8.17 liegt) und
+`cloth_boxTriangleContactGenLaunch`. Die beiden hängen zusammen — der zweite
+verzehrt die Paare des ersten — und sind die nächste Tranche. Was sie
+hinzufügen, ist der Fall, den der Vertex-Pfad nicht abdeckt: eine Kistenecke,
+die durch ein Dreieck stößt, ohne einen Vertex zu berühren.
 
 ## P9.14c — `ps_convexDiffuseCollisionLaunch` (Manifest **354**): die Diffus-Kette ist geschlossen — und der zweite Engine-Fehlerkandidat dieser Woche ist ein `return`, wo ein `continue` stehen müsste
 

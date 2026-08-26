@@ -4934,6 +4934,92 @@ int main()
         return 2;
     }
 
+    // PXG_SCENE=clothbox (P9.15a): the cloth LANDS instead of falling through.
+    //
+    // WHY THIS SCENE EXISTS.  `cloth` above is a 60-step FREE FALL and that is its
+    // whole contract: it asserts the cloth descends, monotonically, to a finite y.
+    // A cloth that sails straight through the ground box satisfies every one of
+    // those, so the scene stayed green for the entire time cloth_boxVertexContactGenLaunch
+    // was unmapped -- it named the kernel (nine "fail to launch" lines per run) and
+    // could not measure it.  That is the P9.13h lesson: a scene that only fails to
+    // be contradicted is not evidence.
+    //
+    // This scene is the same rig stepped four times as long, and it asks the one
+    // question the free fall cannot: DOES IT STOP?
+    //
+    // MEASURED, not asserted -- same build, one manifest row:
+    //     kernel mapped    mean y ->  +0.4933, |dy| < 1e-5 over the last steps
+    //     kernel unmapped  mean y ->  -73.8070, still accelerating at -0.65/step
+    // The bar therefore sits at -2.0: four times the resting height and a
+    // thirty-seventh of the free-fall figure.
+    if (!std::strcmp(sceneName, "clothbox"))
+    {
+        ClothScene csc = buildClothScene(physics, scene, material, cudaCtx);
+        if (!csc.surface || csc.numVerts == 0)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: clothbox scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'clothbox' built: %u-vertex FEMCloth dropped onto the ground box\n",
+                    csc.numVerts);
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: clothbox pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_CLOTH_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 240;
+        const float y0 = clothMeanY(csc);
+        std::printf("  stepping clothbox (%d x %.4fs), initial mean y=%.4f...\n", steps, dt, y0);
+
+        // The last quarter of the run is the settling window: over it the cloth must
+        // move less than a millimetre per step.  A cloth still falling moves ~0.65.
+        const int settleFrom = (steps * 3) / 4;
+        float prevY = y0, maxSettleStep = 0.0f, minY = y0;
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            const float y = clothMeanY(csc);
+            if (y < minY) minY = y;
+            if (i >= settleFrom) maxSettleStep = PxMax(maxSettleStep, PxAbs(y - prevY));
+            if (i < 3 || i == steps - 1 || (i % 40 == 0))
+                std::printf("    step %3d: mean y = %.5f (dy = %+.5f)\n", i, y, y - prevY);
+            prevY = y;
+        }
+        const float yEnd = clothMeanY(csc);
+
+        int failures = 0;
+        std::printf("  clothbox: mean y %.4f -> %.4f (lowest %.4f); largest |dy| over the last "
+                    "%d steps = %.6f\n", y0, yEnd, minY, steps - settleFrom, maxSettleStep);
+        // 1. IT STOPPED.  Only a contact can stop it; gravity never does.
+        if (!(maxSettleStep < 1e-3f))
+        { std::printf("FAIL: the cloth is still moving %.6f per step at the end of the run -- "
+                      "it never came to rest\n", maxSettleStep); ++failures; }
+        // 2. IT STOPPED ON THE BOX, not somewhere below it.  -73.81 was measured with
+        //    cloth_boxVertexContactGenLaunch unmapped, in this same scene.
+        if (!(yEnd > -2.0f))
+        { std::printf("FAIL: the cloth came to rest at y = %.4f -- it fell through the box "
+                      "(need > -2.0; -73.81 measured with the box vertex kernel unmapped)\n",
+                      yEnd); ++failures; }
+        if (!std::isfinite(yEnd))
+        { std::printf("FAIL: mean y is not finite (%.4f)\n", yEnd); ++failures; }
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: the FEMCloth LANDED ON THE BOX and stayed there "
+                        "(mean y %.4f, |dy| < %.6f per step, vs -73.8070 measured with "
+                        "cloth_boxVertexContactGenLaunch unmapped) -- the cloth-vertex-vs-box "
+                        "contact path runs on Vulkan\n", yEnd, maxSettleStep);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: clothbox checks failed (%d)\n", failures);
+        return 2;
+    }
+
     // PXG_SCENE=clothhang (P7.1 tranche 3b): the HANGING / draping cloth money shot.
     // A vertical FEMCloth curtain pinned along its top edge to fixed world anchors; it
     // must DRAPE below the pins and SETTLE (fall-then-stabilize), mirroring the P6.5
