@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 356;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 357;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -392,12 +392,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_refitBoundLaunch", "femClothRefitBda.spv", "cloth_refitBoundLaunch" },  // CLOTH_REFIT_BOUND (P7.2 tranche 3a BDA port)
     { "cloth_midphaseGeneratePairsLaunch", "femClothContactGenBda.spv", "cloth_midphaseGeneratePairsLaunch" },  // CLOTH_MIDPHASE_PRIMITIVES (P9.15b: cloth BV32 tree vs one rigid AABB)
     { "cloth_SphereContactGenLaunch", nullptr, nullptr },  // CLOTH_SPHERE_CG (unmapped)
-    // P9.15d WROTE this kernel and its fixture, and both are green -- but it is
-    // deliberately NOT mapped: on live engine data it segfaults (a write to address
-    // 0 inside the lifted contact core), while the unit fixture and the GPU
-    // differential against that same core both pass.  Mapping a kernel that crashes
-    // the scenes is not a step forward.  See the P9.15d entry in RUNTIME_STATUS.md.
-    { "cloth_boxTriangleContactGenLaunch", nullptr, nullptr },  // CLOTH_BOX_TRIANGLE_CG (written, swept, NOT mapped -- faults on engine data)
+    { "cloth_boxTriangleContactGenLaunch", "femClothContactGenBda.spv", "cloth_boxTriangleContactGenLaunch" },  // CLOTH_BOX_TRIANGLE_CG (P9.15e: cloth triangle vs box, over the lifted convex-triangle core)
     { "cloth_convexContactGenLaunch", nullptr, nullptr },  // CLOTH_CONVEX_CG (unmapped)
     { "cloth_SphereVertexContactGenLaunch", "femClothContactGenBda.spv", "cloth_SphereVertexContactGenLaunch" },  // CLOTH_VERT_SPHERE_CG (P7.1 tranche 4a BDA port: cloth-vertex-vs-sphere contact gen)
     { "cloth_planeVertContactGenLaunch", "femClothContactGenBda.spv", "cloth_planeVertContactGenLaunch" },  // CLOTH_PLANE_VERTEX_CG (P7.1 tranche 4a BDA port: cloth-vertex-vs-plane contact gen)

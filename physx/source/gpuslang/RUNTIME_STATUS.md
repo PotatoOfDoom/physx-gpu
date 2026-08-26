@@ -1705,6 +1705,112 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.15e — `paramAlign(80) == 16`: der Absturz aus P9.14d war ein um acht Byte verschobener Writer. Manifest **357**, und **keine Szene verweigert mehr irgendeinen Kernel**
+
+P9.15d hat den Kernel geschrieben, gefegt und bewusst **nicht** abgebildet, weil
+er auf Engine-Daten segfaultete. Diese Tranche findet die Ursache, behebt sie und
+bildet ihn ab. Manifest **356 → 357**.
+
+### Halbieren statt raten
+
+Der Fehler war ein **Schreibzugriff auf Adresse 0** (`error 6`, in einem
+AVX-512-Scatter). Geschrieben wird nur an zwei Stellen, also drei Läufe:
+
+| Probe | was abgeschaltet war | Ergebnis |
+|---|---|---|
+| B | **jeder** Kontakt-Store (`maxContacts = 0`) | **kein Absturz** → der Fehler sitzt im Writer |
+| C | der `info`-Store (das einzige Read-Modify-Write) | Absturz → nicht der |
+| D | die drei Sortierschlüssel-Stores | Absturz → einer von `point`/`normalPen`/`bary` |
+
+Und genau diese drei schreiben die Vertex-Geschwister nebenan **auch**, im selben
+Writer, ohne Probleme. Also konnte es nicht der Writer sein, sondern nur, **wo er
+im Blob liegt**.
+
+### Die Regel, die die Geschwister durch Zufall verdeckt haben
+
+`PxgVulkanCudaContext.cpp:93` legt jedes Argument auf `paramAlign(size)`:
+
+```c
+if (size % 16 == 0) return 16;
+if (size % 8  == 0) return 8;
+```
+
+`PxgFEMContactWriter` ist **80 Byte**, und 80 ist durch 16 teilbar — die Brücke
+richtet ihn also auf **16** aus, nicht auf 8.
+
+In diesem Kernel enden die Argumente vor dem Writer bei **104**. Das ist
+8-ausgerichtet, aber nicht 16-ausgerichtet, also polstert die Brücke auf **112**.
+Meine Slang-Struktur legte ihn auf 104: `b_outPoint` las die acht Polsterbytes,
+und der erste Kontakt-Store ging an das, was dort stand — null.
+
+**Warum das nirgends vorher aufgefallen ist:** bei den Plane- und
+Sphere-Geschwistern landet derselbe Writer auf **80**, und 80 *ist* bereits
+16-ausgerichtet. Dort stimmen 8er- und 16er-Ausrichtung überein, und die Regel
+bleibt unsichtbar. Sie wird erst sichtbar, wenn die Argumente davor auf einer
+Adresse enden, die durch 8, aber nicht durch 16 teilbar ist — hier zum ersten
+Mal.
+
+Der Blob ist damit **192** Byte, nicht 184. Die Vorrichtung trägt beide Zahlen
+jetzt als `static_assert`, mit der Begründung daneben.
+
+### Was der Kernel an der Szene ändert
+
+Er ändert etwas, und zwar genau das, was der Vertex-Pfad nicht kann:
+
+| | Ruhehöhe von `clothbox` |
+|---|---|
+| beide Box-Kernel unabgebildet | −73.8070 |
+| nur der VERTEX-Pfad (P9.15a) | 0.4933 |
+| **auch der DREIECKS-Pfad** | **0.6871** |
+
+Das Tuch ruht **höher**, weil Flächenkontakte es tragen, wo vorher nur seine
+Ecken getragen haben — die Ecke einer Kiste, die durch ein Dreieck stößt, ohne
+eine Ecke zu berühren, war der Fall, den P9.15a ausdrücklich offen gelassen hat.
+
+**Und eine Schranke musste neu geeicht werden, was hier steht statt versteckt zu
+werden.** `clothbox` verlangte „Bewegung pro Schritt < 1e-3", geeicht auf den
+Vertex-Pfad allein (gemessen 0.000098). Mit beiden Pfaden setzt sich das Tuch in
+einen kleinen Grenzzyklus statt zur Ruhe: **0.0020** pro Schritt, mittleres y
+schwankt über die letzten 120 Schritte in einem 0.002-Band **ohne Trend**. Das
+sind mehr Zwangsbedingungen, die gegeneinander arbeiten, kein Fall — ein
+fallendes Tuch bewegt sich 0.65 pro Schritt, dreihundertmal so viel. Die
+Schranke steht jetzt auf 0.01: fünfundsechzigmal unter einem Fall und fünfmal
+über dem gemessenen Zittern.
+
+### Die Zahl, um die es ging
+
+| | verweigerte Kernel der Szene `cloth` |
+|---|---|
+| vor P9.15a | 3 |
+| nach P9.15a | 2 |
+| nach P9.15b | 1 |
+| **jetzt** | **0** |
+
+Und damit verweigert **keine der 31 Szenen mehr irgendeinen Kernel**. Zum ersten
+Mal seit dem Beginn von Phase 2 ist die Liste dessen, was eine lebende Szene
+anfordert und nicht bekommt, leer.
+
+### Verifikation
+
+* die drei Halbierungsproben oben, jede ein eigener Lauf gegen die echte Engine;
+* Vorrichtung und Fegen unverändert aus P9.15d (**13 von 13**) — der Fehler lag
+  im Blob-Offset, den die Vorrichtung mit ihrer eigenen (ebenfalls falschen)
+  Host-Struktur gespiegelt hat, weshalb er dort nicht auffallen **konnte**;
+  beide tragen jetzt die richtige Zahl als `static_assert`;
+* Suite **817/817** in **beiden** Speichermodi;
+* Szenen: **31 ok, 0 fail, 0 missing (of 31)**.
+
+### Was das über Vorrichtungen sagt
+
+Ein Unit-Test und ein GPU-Differential waren grün, und der Fehler war trotzdem
+da. Der Grund ist strukturell und lohnt das Festhalten: **die Vorrichtung hat
+denselben Blob-Offset angenommen wie der Shader.** Eine Host-Struktur, die den
+Fehler des Shaders spiegelt, kann ihn nicht finden — sie kann nur prüfen, dass
+beide dasselbe *meinen*. Was den Offset wirklich festnagelt, ist die Brücke, und
+die sieht nur die Engine. Deshalb hat der Szenenlauf gefunden, was zwei
+Vorrichtungen nicht finden konnten, und deshalb bleibt der Szenenlauf im
+Protokoll, auch wenn er langsam ist.
+
 ## P9.15d — `cloth_boxTriangleContactGenLaunch`: geschrieben, gefegt, und **bewusst NICHT abgebildet** — er stürzt auf echten Engine-Daten ab
 
 Portiert `femClothPrimitives.cu:3357` (Wrapper) und `:3216-3355`

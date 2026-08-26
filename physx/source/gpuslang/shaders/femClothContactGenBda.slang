@@ -272,18 +272,30 @@ struct ClothBoxTriParams
     uint nbFilterPairs;            // @88
     uint stackSizeBytes;           // @92
     uint64_t stackSizeNeeded;      // @96  atomicMax output
-    // ---- PxgFEMContactWriter (by value, 80B) @104 ----
-    uint64_t b_outPoint;           // @104
-    uint64_t b_outNormalPen;       // @112
-    uint64_t b_outBarycentric;     // @120
-    uint64_t b_outContactInfo;     // @128
-    uint64_t b_totalContactCount;  // @136
-    uint64_t b_contactByX;         // @144
-    uint64_t b_tempContactByX;     // @152
-    uint64_t b_contactIndexSortedByX; // @160
-    uint64_t b_contactSortedByX;   // @168 (unused by this writer; ABI parity)
-    uint b_maxNumContacts;         // @176
-    uint _pad180;                  // @180 -> 184
+    uint64_t _pad104;              // @104
+    // ---- PxgFEMContactWriter (by value, 80B) @112 ----
+    //
+    // @112, NOT @104, and that cost this tranche a segfault.  The bridge places
+    // each argument at paramAlign(size) (PxgVulkanCudaContext.cpp:93), and
+    // paramAlign(80) is **16**, not 8 -- 80 is a multiple of 16.  The arguments
+    // before the writer end at 104, which is 8-aligned but not 16-aligned, so the
+    // bridge pads to 112.  A struct that puts the writer at 104 reads the padding
+    // as its first pointer and stores through it: `segfault at 0`.
+    //
+    // The plane/sphere siblings above hide the rule by luck: their writer lands at
+    // 80, which is already 16-aligned, so 8- and 16-alignment agree there.  Any
+    // future kernel whose by-value tail is a multiple of 16 must check this.
+    uint64_t b_outPoint;           // @112
+    uint64_t b_outNormalPen;       // @120
+    uint64_t b_outBarycentric;     // @128
+    uint64_t b_outContactInfo;     // @136
+    uint64_t b_totalContactCount;  // @144
+    uint64_t b_contactByX;         // @152
+    uint64_t b_tempContactByX;     // @160
+    uint64_t b_contactIndexSortedByX; // @168
+    uint64_t b_contactSortedByX;   // @176 (unused by this writer; ABI parity)
+    uint b_maxNumContacts;         // @184
+    uint _pad188;                  // @188 -> 192
 }
 
 [[vk::push_constant]] ConstantBuffer<ClothTriMidphaseParams> gTMid;

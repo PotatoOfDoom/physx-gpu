@@ -562,12 +562,13 @@ struct BTriPush
     uint64_t shapeToRigidRemap, stackPtr, midphasePairsNum, filterPairs;
     uint32_t nbFilterPairs, stackSizeBytes;
     uint64_t stackSizeNeeded;
+    uint64_t pad104;   // paramAlign(80) == 16, so the writer lands at 112, not 104
     uint64_t bPoint, bNormalPen, bBary, bInfo, bCount, bByX, bTempByX, bIdxByX, bSortedByX;
-    uint32_t bMaxNumContacts, pad180;
+    uint32_t bMaxNumContacts, pad188;
 };
-static_assert(sizeof(BTriPush) == 184, "cloth box-triangle blob must be 184 bytes");
+static_assert(sizeof(BTriPush) == 192, "cloth box-triangle blob must be 192 bytes");
 static_assert(offsetof(BTriPush, stackSizeNeeded) == 96, "stackSizeNeeded @96");
-static_assert(offsetof(BTriPush, bPoint) == 104, "writer @104");
+static_assert(offsetof(BTriPush, bPoint) == 112, "writer @112 -- paramAlign(80) is 16");
 
 struct Q { float x, y, z, w; };
 static Q qmul(Q a, Q b)
