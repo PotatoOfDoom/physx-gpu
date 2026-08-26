@@ -1705,6 +1705,98 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.15c — der Konvex-Dreieck-Kern wird gehoben: BDA statt Bindungen, Modul statt Einsprungpunkt (kein Manifest-Zuwachs)
+
+Kein neuer Kernel: **356** bleibt **356**. Diese Tranche räumt das Hindernis
+weg, das der Vortag benannt hat — und sie tut es so, dass eine gelandete
+Phase-1-Batterie die ganze Zeit die Verifikation trägt.
+
+### Das Hindernis, noch einmal in einem Satz
+
+`cloth_boxTriangleContactGenLaunch` — der letzte Kernel, den die `cloth`-Szene
+noch verweigert — endet in `convexTriangleContactGen`. Dessen Algebra lag in
+diesem Korpus **zweimal**, und **keine der beiden Kopien war aufrufbar**:
+`fcConvexTri.slang` (Phase 1) las die Hülle aus einem **gebundenen
+StructuredBuffer** und exportierte nichts; die Rigid-BDA-Kette liest zwar richtig,
+ist aber ebenfalls nur Einsprungpunkte ohne ein einziges `public`.
+
+### Zwei Halbschritte, jeder für sich grün
+
+**Erstens die Adressierung.** Hülle **und** der komplette Kontakt-Writer sind von
+Bindungen auf BDA umgestellt. Die Hülle geht dabei nicht über neue Zugriffe,
+sondern über das **vorhandene** Modul `pxgSlangConvexHull`, das denselben Blob
+schon für den Partikel-Pfad (P9.14b) dekodiert. Dass beide Sätze dasselbe Layout
+beschreiben, wurde vorher nachgerechnet, nicht angenommen:
+
+| Abschnitt | Phase-1 (uint-Offsets ×4) | `pxgSlangConvexHull` |
+|---|---|---|
+| verticesByEdges | 48 + 16·nbVerts + 20·nbPolys | 48 + 16·nbVerts + 16·nbPolys + 4·nbPolys |
+| facesByEdges | + 4·nbEdges | + 4·nbEdges |
+| vertexData8 | + 2·nbEdges + 3·nbVerts | + 2·nbEdges + 3·nbVerts |
+
+Identisch. Damit verschwindet die zweite Schreibweise.
+
+**Zweitens die Extraktion.** Der Kern lag **im Einsprungpunkt** — das war der
+eigentliche Grund, warum er nicht wiederverwendbar war. Er ist jetzt
+`pxgSlangConvexTriCloth.slang` mit einer öffentlichen Funktion:
+
+```slang
+public uint4 fcClothConvexTriContactGen(FctCase cs, uint64_t hull, FcCtWriter w)
+```
+
+`fcConvexTri.slang` behält seinen Einsprungpunkt und seine Batterie und ruft nun
+**diesen** Code — von 894 Zeilen auf 148 geschrumpft. Die Algebra wurde dabei
+nicht angefasst; das ist der ganze Sinn des Hebens statt Kopierens.
+
+Und was der Phase-1-Kopfkommentar seit jeher als „caller glue not ported"
+aufführt — `LoadShapePairWarp`, die Transform-Caches, der Filter-Sprung über alle
+drei Vertices und die Dreiecks-Transformation in den Konvexraum — ist **genau und
+nur** das, was der Engine-Kernel noch hinzufügen muss. Er füllt eine `FctCase`
+und ruft auf.
+
+### Die Batterie fand etwas, das ihr eigener Kopf behauptet hatte
+
+Der Fegedurchgang auf die geänderte Adressierung meldete zuerst **zwei
+Überlebende**, und beide waren dieselbe Sache: die **Kapazitätsschranke**. Zwei
+verschiedene Mutanten, die `index >= maxContacts` löschen, überlebten.
+
+Der Kopfkommentar von `testFcConvexTri.cpp` sagt seit Phase 1:
+
+> „A small-capacity re-dispatch checks the capacity gate (reservation ungated,
+> stores dropped)."
+
+**Den gab es nicht.** `CAP` steht auf 8192, der Lauf emittiert weit weniger, also
+hat die Schranke nie ausgelöst. Der versprochene zweite Aufruf ist jetzt da, und
+er prüft die beiden Hälften des Vertrags, die in entgegengesetzte Richtungen
+ziehen: die **Reservierung** ist ungedeckelt, also muss der Zähler dieselbe Summe
+erreichen wie der Lauf mit voller Kapazität — während **jeder** Store ab der
+Grenze verworfen sein muss.
+
+Danach: **6 von 6 getötet, 0 überlebt.**
+
+### Verifikation
+
+* die Phase-1-Batterie **zwangsfrisch grün** nach beiden Halbschritten — sie ist
+  die Verifikation des Hubs, genau wie beim `spherebox`-Hub in P9.15a;
+* Fegen **6 von 6** auf das, was sich tatsächlich geändert hat: die
+  Hülladressierung, die Writer-Adressen und die Kapazitätsschranke;
+* Suite **817/817** in **beiden** Speichermodi.  Der erste Standardlauf meldete
+  zwei Fehlschläge, `gpuslang.scan` und `gpuslang.npRigidSumBatches`; beide
+  bestanden einzeln sofort und der wiederholte volle Lauf war 817/817.  Das ist
+  die seit Aufgabe **#29** offene sporadische `-j`-Flakiness, und
+  `npRigidSumBatches` ist ein **neuer** Datenpunkt dafür — keiner der beiden
+  Tests berührt irgendetwas aus dieser Tranche;
+* Manifest unverändert **356** — diese Tranche schreibt keinen Kernel, sie macht
+  den nächsten möglich.
+
+### Was offen bleibt
+
+`cloth_boxTriangleContactGenLaunch` selbst. Was jetzt noch fehlt, ist die
+Aufrufer-Glue: Paar laden, die beiden Transform-Caches, der Filtersprung über
+alle drei Vertices, die Dreiecks-Transformation in den Konvexraum — und der
+Wrapper über die Paare, die P9.15b erzeugt. Das ist eine überschaubare Tranche
+und keine Maschine mehr.
+
 ## P9.15b — `cloth_midphaseGeneratePairsLaunch` (Manifest **356**): die BV32-Traversierung des Tuchbaums, und eine Vorrichtung, die vier Mutanten erst nach dem Nachschärfen tötet
 
 Portiert `femClothMidPhase.cu:191` (Wrapper), `:110-186`

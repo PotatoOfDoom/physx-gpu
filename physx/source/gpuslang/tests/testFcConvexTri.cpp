@@ -74,7 +74,17 @@ using namespace pxgtest;
 struct F4 { float x, y, z, w; };
 struct U4 { uint32_t x, y, z, w; };
 struct FctCase { F4 convexScale, convexScaleRot, t0, t1, t2, triNormal, convexP, convexQ; U4 ids, ids2; };
-struct FctParams { uint32_t numCases, maxContacts, pad0, pad1; };
+// P9.15c: the hull blob and the whole contact writer moved from bindings to BDA
+// addresses, so the shader body can be called by a kernel that has no descriptor
+// set to bind them into.  Only gCase and gDebug -- both test scaffolding, neither
+// part of the engine ABI -- are still bound.
+struct FctParams
+{
+    uint32_t numCases, maxContacts, pad0, pad1;
+    uint64_t hullAddr;
+    uint64_t wPoint, wNormalPen, wBary, wInfo, wCount, wByX, wTempByX, wIdxByX;
+};
+static_assert(sizeof(FctParams) == 88, "FctParams must match the shader blob");
 
 struct V3 { float x, y, z; };
 static V3 sub(V3 a, V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
@@ -945,10 +955,20 @@ PXG_TEST(fcConvexTri_contactGen)
     PxgBufferHandle bTb = createBufferFrom(dev, u1Init);
     PxgBufferHandle bIx = createBufferFrom(dev, u1Init);
     PxgBufferHandle bDb = createBufferFrom(dev, dbgInit);
-    FctParams prm = { NC, CAP, 0, 0 };
+    FctParams prm = {};
+    prm.numCases = NC; prm.maxContacts = CAP;
+    prm.hullAddr = dev->getBufferDeviceAddress(bH);
+    prm.wPoint = dev->getBufferDeviceAddress(bPt);
+    prm.wNormalPen = dev->getBufferDeviceAddress(bNp);
+    prm.wBary = dev->getBufferDeviceAddress(bBc);
+    prm.wInfo = dev->getBufferDeviceAddress(bIn);
+    prm.wCount = dev->getBufferDeviceAddress(bWc);
+    prm.wByX = dev->getBufferDeviceAddress(bBy);
+    prm.wTempByX = dev->getBufferDeviceAddress(bTb);
+    prm.wIdxByX = dev->getBufferDeviceAddress(bIx);
     Kernel k("fcConvexTri.spv", "ctFcConvexTri",
-             { (uint32_t)sizeof(FctCase), 4, 16, 16, 16, 16, 4, 8, 4, 4, 16 }, sizeof(FctParams));
-    k.dispatch((NC + 63) / 64, { bC, bH, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bDb }, prm);
+             { (uint32_t)sizeof(FctCase), 16 }, sizeof(FctParams));
+    k.dispatch((NC + 63) / 64, { bC, bDb }, prm);
     dev->flush();
     const auto gDbg = downloadBuffer<U4>(dev, bDb, NC);
     const auto gPt = downloadBuffer<F4>(dev, bPt, CAP);
@@ -1038,6 +1058,55 @@ PXG_TEST(fcConvexTri_contactGen)
                   "fcConvexTri: reduce/bary coverage thin (rc=%zu of %zu, b=%zu)", reducedClean, reduced, baryRej);
     PXG_CHECK_MSG(edgeBranchClean > 20 && poly2Clean > 8,
                   "fcConvexTri: feature-select coverage thin (e=%zu p2=%zu)", edgeBranchClean, poly2Clean);
+
+    // ---- P9.15c: THE CAPACITY GATE, which nothing here was probing -------------
+    //
+    // This file's header has always claimed "a small-capacity re-dispatch checks
+    // the capacity gate (reservation ungated, stores dropped)".  It was not here:
+    // CAP is 8192 and the run emits far fewer, so `index >= maxContacts` never
+    // fired.  The P9.15c sweep found it -- two different mutants that delete the
+    // gate both SURVIVED -- so the re-dispatch the comment promises is added now.
+    //
+    // The contract has two halves and they pull opposite ways: the RESERVATION is
+    // ungated, so the counter must reach the same total as the full-capacity run,
+    // while every store at or past the cap must be dropped.
+    {
+        const uint32_t SMALL = 5u;
+        dev->upload(bPt, femF4Init.data(), femF4Init.size() * sizeof(F4));
+        dev->upload(bNp, femF4Init.data(), femF4Init.size() * sizeof(F4));
+        dev->upload(bBc, femF4Init.data(), femF4Init.size() * sizeof(F4));
+        dev->upload(bIn, infoInit.data(), infoInit.size() * sizeof(U4));
+        dev->upload(bTb, u1Init.data(), u1Init.size() * sizeof(uint32_t));
+        dev->upload(bIx, u1Init.data(), u1Init.size() * sizeof(uint32_t));
+        dev->upload(bBy, u2Init.data(), u2Init.size() * sizeof(uint32_t));
+        const uint32_t zero = 0u;
+        dev->upload(bWc, &zero, sizeof(uint32_t));
+
+        FctParams small = prm;
+        small.maxContacts = SMALL;
+        k.dispatch((NC + 63) / 64, { bC, bDb }, small);
+        dev->flush();
+
+        const uint32_t sWc = downloadBuffer<uint32_t>(dev, bWc, 1)[0];
+        PXG_CHECK_MSG(sWc == gWc,
+                      "the small-capacity run reserved %u contacts, the full-capacity run %u -- "
+                      "the reservation must be UNGATED, only the stores are capped", sWc, gWc);
+        PXG_CHECK_MSG(gWc > SMALL,
+                      "the run emits only %u contacts against a cap of %u -- the gate never "
+                      "fires and deleting it is invisible", gWc, SMALL);
+
+        const auto sPt = downloadBuffer<F4>(dev, bPt, CAP);
+        const auto sIx = downloadBuffer<uint32_t>(dev, bIx, CAP);
+        const auto sTb = downloadBuffer<uint32_t>(dev, bTb, CAP);
+        size_t leaked = 0;
+        for (uint32_t i = SMALL; i < CAP; ++i)
+        {
+            if (sPt[i].x != -9.0f || sPt[i].y != -9.0f) ++leaked;
+            if (sIx[i] != POISON || sTb[i] != POISON) ++leaked;
+        }
+        PXG_CHECK_MSG(leaked == 0,
+                      "%zu writer slots at or past the %u-contact cap were written", leaked, SMALL);
+    }
 
     for (PxgBufferHandle h : { bC, bH, bPt, bNp, bBc, bIn, bWc, bBy, bTb, bIx, bDb })
         dev->destroyBuffer(h);
