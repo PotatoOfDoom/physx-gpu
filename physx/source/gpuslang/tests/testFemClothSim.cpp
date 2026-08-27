@@ -8369,4 +8369,759 @@ PXG_TEST(femClothSimBendingDamping)
     dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
 }
 
+// ===========================================================================
+// P9.26 -- cloth_midphaseVertexMeshLaunch, the cloth-VERTEX-vs-COOKED-TRIANGLE-MESH
+// midphase.  The other half of the block whose TRIANGLE half femClothSimMeshMidphase
+// above pins: the engine runs both, one after the other, off the same bounds and the
+// same intermediate stack (PxgNarrowphaseCore.cpp:6581/:6671 then :6724/:6814).
+//
+// The two kernels share a cooked blob, a BV32 walk and an argument shape, and differ
+// in four ways that are each a plausible copy-paste from the file next door.  Every
+// one of them gets a query in this fixture whose verdict FLIPS if the sibling's rule
+// is used instead:
+//
+//   * V1/V3 THERE IS NO FRONT-FACE GATE and no SAT.  The leaf test is the triangle's
+//     own AABB against a sphere bound, and that is all it is.  Vertex 0's leaf holds a
+//     BACK-FACING triangle that the sibling's `dot(nB, centre) + dB >= 0` throws away;
+//     here it must be KEPT, so vertex 0 expects TWO pairs and not one.
+//   * V2 EVERY HIT IS PUSHED.  The sibling keeps the four closest by separation;
+//     `pushOntoStackFullWarp` has no reduction at all.  Vertex 1's leaf holds SIX
+//     qualifying triangles and all six must come out -- a borrowed top-4 gives four.
+//   * V5 THE RADIUS IS NOT DIVIDED BY THE SCALE.  min|scale| is 0.5, so the softbody
+//     reading gives a 0.40 band against the correct 0.20, and vertex 2 sits at 0.28 --
+//     inside the wrong band, outside the right one.
+//   * the query is built from ONE VERTEX, so the mesh-space round trip is the whole
+//     of the geometry.  The rigid rotation is NINETY degrees about y, not a hundred
+//     and eighty, because 180 is its own inverse and would let `rotate` stand in for
+//     `rotateInv` unnoticed -- the same measurement the sibling records.
+//
+// The expected pair set is computed by a CPU transcription of the walk rather than
+// written down, so a mutant anywhere in the traversal fails without the fixture
+// having to anticipate which node it broke.  What IS written down, separately, is
+// what each vertex's count has to be and why -- a reference that drifts with the
+// shader would otherwise agree with it.
+// ===========================================================================
+namespace p926vm
+{
+struct ClothVertMidPush
+{
+    uint32_t numWorkItems; float toleranceLength;
+    uint64_t cmInputs, transformCache, bounds, contactDistance, gpuShapes, femClothes;
+    uint32_t stackSizeBytes, pad60;
+    uint64_t stackPtr, midphasePairsNum;
+};
+static_assert(sizeof(ClothVertMidPush) == 80, "cloth vertex midphase blob must be 80 bytes");
+static_assert(offsetof(ClothVertMidPush, cmInputs) == 8, "cmInputs @8");
+static_assert(offsetof(ClothVertMidPush, femClothes) == 48, "femClothes @48");
+static_assert(offsetof(ClothVertMidPush, stackSizeBytes) == 56, "stackSizeBytes @56");
+static_assert(offsetof(ClothVertMidPush, stackPtr) == 64, "stackPtr @64");
+static_assert(offsetof(ClothVertMidPush, midphasePairsNum) == 72, "midphasePairsNum @72");
+
+using p817mesh::V3;
+
+// One BV32 child: either a leaf over [start, start+count) or an internal pointer.
+struct ChildSpec
+{
+    bool internal; uint32_t a, b;    // leaf: (start, count).  internal: (childNodeIdx, 0)
+    float mn[3], mx[3];
+};
+} // namespace p926vm
+
+PXG_TEST(femClothSimMeshVertMidphase)
+{
+    using namespace p816dc;        // PxgShapeHost, CmInputHost
+    using namespace p926vm;
+    using p817mesh::V3;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // The mesh's placement -- the sibling's, deliberately, so a difference between the
+    // two fixtures' results is a difference between the two KERNELS.
+    const float SX = 2.0f, SY = 1.0f, SZ = 0.5f;
+    const float TX = 10.0f, TY = 20.0f, TZ = 30.0f;
+    const float QS = 0.70710678f;
+    const float QX = 0.0f, QY = QS, QZ = 0.0f, QW = QS;   // 90 degrees about y
+    auto quatRot = [&](float x, float y, float z) {
+        const float vx = 2.0f * x, vy = 2.0f * y, vz = 2.0f * z;
+        const float w2 = QW * QW - 0.5f;
+        const float d2 = QX * vx + QY * vy + QZ * vz;
+        return V3{ vx * w2 + (QY * vz - QZ * vy) * QW + QX * d2,
+                   vy * w2 + (QZ * vx - QX * vz) * QW + QY * d2,
+                   vz * w2 + (QX * vy - QY * vx) * QW + QZ * d2 };
+    };
+    auto toWorld = [&](V3 v) {
+        const V3 r = quatRot(v.x * SX, v.y * SY, v.z * SZ);
+        return F4{ r.x + TX, r.y + TY, r.z + TZ, 1.0f };
+    };
+
+    // The contact distance is summed over BOTH cache refs and NOT divided by the scale
+    // (V5).  It is declared here, before the mesh, because one triangle's height is
+    // defined AS it -- see TOUCH_PRIM below.
+    const float CD_CLOTH = 0.05f, CD_MESH = 0.15f;
+    const float contactDist = CD_CLOTH + CD_MESH;
+
+    // ---- the cooked mesh, in VERTEX space --------------------------------------------
+    std::vector<F4> mv;
+    std::vector<TriIdx4> mi;
+    auto pushTri = [&](F4 p0, F4 p1, F4 p2) {
+        const uint32_t b = uint32_t(mv.size());
+        mv.push_back(p0); mv.push_back(p1); mv.push_back(p2);
+        mi.push_back(TriIdx4{ b, b + 1u, b + 2u, 0u });
+    };
+    // front-facing (n = +y) unit right triangle at x in [ox, ox+1], height y
+    auto pushSlab = [&](float ox, float y) {
+        pushTri(F4{ ox, y, 0, 0 }, F4{ ox, y, 1.0f, 0 }, F4{ ox + 1.0f, y, 0, 0 });
+    };
+    // prim 0: a DUMMY parked 1000 away and in NO leaf, so every primStartIndex is
+    // NONZERO -- with a zero start `data >> 7` and `data >> 8` agree and a shift
+    // mutant in the leaf decode is invisible.
+    pushTri(F4{ 1000.0f, 0, 0, 0 }, F4{ 1000.0f, 0, 1.0f, 0 }, F4{ 1001.0f, 0, 0, 0 });
+    // The slab family starts at x = 1, not x = 0: the origin has to stay clear for the
+    // EXACTLY-TOUCHING query below, whose whole point is that its bound reaches 0.20 and
+    // no further.
+    const uint32_t V0_PRIM = uint32_t(mi.size());          // prim 1
+    pushSlab(1.0f, 0.0f);
+    // prim 2: BACK-FACING (n = -y) and CLOSER than prim 1.  The triangle sibling's
+    // front-face gate drops it; this kernel has no such gate and must keep it.
+    const uint32_t V0_BACK_PRIM = uint32_t(mi.size());     // prim 2
+    pushTri(F4{ 1.0f, 0.06f, 0, 0 }, F4{ 2.0f, 0.06f, 0, 0 }, F4{ 1.0f, 0.06f, 1.0f, 0 });
+    // The THIRD member of vertex 0's leaf, separated from its query in Z ALONE, so a leaf
+    // overlap test that drops the z terms accepts it.  It goes here and not further down
+    // because a leaf is a CONSECUTIVE run [start, start + count): pushing it after the next
+    // leaf's stack put a foreign triangle inside this leaf's range, which is precisely what
+    // the containment invariant below caught on its first run.
+    const uint32_t V0_Z_PRIM = uint32_t(mi.size());
+    pushTri(F4{ 1.0f, 0, 2.0f, 0 }, F4{ 1.0f, 0, 3.0f, 0 }, F4{ 2.0f, 0, 2.0f, 0 });
+    const uint32_t V1_PRIM = uint32_t(mi.size());          // prims 3..8 -- SIX of them
+    pushSlab(2.0f, 0.0f);
+    for (uint32_t k = 0; k < 5u; ++k)
+        pushSlab(2.0f, -0.02f * float(k + 1u));
+    const uint32_t V2_PRIM = uint32_t(mi.size());  pushSlab(4.0f, 0.0f);
+    const uint32_t V3_PRIM = uint32_t(mi.size());  pushSlab(6.0f, 0.0f);
+    const uint32_t V4_PRIM = uint32_t(mi.size());  pushSlab(8.0f, 0.0f);
+    // The prim IMMEDIATELY AFTER vertex 4's single-primitive leaf, in NO leaf of its own
+    // and placed right on top of that leaf's query.  `if (lane < nbPrimitives)` is the only
+    // thing that keeps lane 1 from reading it -- without the guard it becomes a pair.
+    // prims 12..14 hang off an INTERNAL child, so the walk has to decode
+    // bvDataChildNodeIndex and carry a node across two rounds of the stack.
+    const uint32_t V5_PRIM = uint32_t(mi.size());                          // prims 12..14
+    pushSlab(12.0f, 0.0f);
+    pushSlab(12.0f, -0.03f);
+    pushSlab(12.0f, 0.03f);
+    // prim 15 sits in the internal node's OTHER leaf, far away: the second-level box
+    // test has to reject it, or descending is indistinguishable from taking everything.
+    pushSlab(8.0f, 0.01f);
+    const uint32_t FAR_PRIM = uint32_t(mi.size());  pushSlab(40.0f, 0.0f);
+    // prim 16 sits at EXACTLY the contact distance above the vertex-space ORIGIN, and its
+    // query vertex is the origin itself.  That vertex is the one point whose world round
+    // trip is bit-exact -- toWorld(0) is the translation and nothing else, so the kernel
+    // recovers (0,0,0) with no rounding at all -- which is what makes `>` and `>=` in the
+    // leaf overlap test distinguishable.  Anywhere else the round trip through a
+    // translation of 20 loses the last bits and the two spellings agree.
+    const uint32_t TOUCH_PRIM = uint32_t(mi.size());
+    pushTri(F4{ -0.5f, contactDist, -0.5f, 0 }, F4{ -0.5f, contactDist, 0.5f, 0 },
+            F4{ 0.5f, contactDist, -0.5f, 0 });
+    // A SECOND leaf over vertex 5's query, beside the internal child, so that ONE query
+    // puts two entries on the node stack.  Without it every query in this fixture hits
+    // exactly one child, and then popping the stack in the wrong order -- or resetting
+    // `nbStack` instead of accumulating it -- changes nothing.
+    const uint32_t V5B_PRIM = uint32_t(mi.size());  pushSlab(12.0f, 0.02f);
+    // Two triangles whose THIRD vertex carries the extreme, one for each end.  Every
+    // triangle above is wound so that b0 and b1 already bracket b2, which makes
+    // `min(b0, b1)` and `min(min(b0, b1), b2)` agree -- the winding, not the arithmetic,
+    // was hiding the mutant.
+    const uint32_t MINB2_PRIM = uint32_t(mi.size());                       // b2 has min x
+    pushTri(F4{ 17.0f, 0, 0, 0 }, F4{ 17.0f, 0, 0.5f, 0 }, F4{ 16.0f, 0, 0, 0 });
+    const uint32_t MAXB2_PRIM = uint32_t(mi.size());                       // b2 has max x
+    pushTri(F4{ 20.0f, 0, 0, 0 }, F4{ 20.0f, 0, 0.5f, 0 }, F4{ 21.0f, 0, 0, 0 });
+
+    const uint32_t NPRIM = uint32_t(mi.size());
+    const uint32_t NVERT = uint32_t(mv.size());
+
+    // ---- the tree: root with SIX children, one of them internal ----------------------
+    // Six, not eight, so lanes 6..31 have `hasBox` false and mNbNodes is load-bearing.
+    // Every leaf box is TIGHT IN Y around its own triangles, which is what isolates the
+    // queries from one another -- and what makes the 0.28 vertex depend on the band.
+    // The INTERNAL child is child 6 and the leaf that shares vertex 5's query is child 5,
+    // deliberately in that order: children are pushed in lane order, so the internal one
+    // lands ON TOP of the stack and is expanded while another entry is still pending.
+    // That is what makes `nbStack = validCount` differ from `nbStack += validCount`.
+    const ChildSpec root[10] = {
+        { false, V0_PRIM,     3u, { 1.0f,  0.00f, 0.0f }, { 2.0f,  0.06f, 3.0f } },
+        { false, V1_PRIM,     6u, { 2.0f, -0.10f, 0.0f }, { 3.0f,  0.00f, 1.0f } },
+        { false, V2_PRIM,     1u, { 4.0f,  0.00f, 0.0f }, { 5.0f,  0.00f, 1.0f } },
+        { false, V3_PRIM,     1u, { 6.0f,  0.00f, 0.0f }, { 7.0f,  0.00f, 1.0f } },
+        { false, V4_PRIM,     1u, { 8.0f,  0.00f, 0.0f }, { 9.0f,  0.00f, 1.0f } },
+        { false, V5B_PRIM,    1u, { 12.0f, 0.02f, 0.0f }, { 13.0f, 0.02f, 1.0f } },
+        { true,  1u,          0u, { 12.0f, -0.03f, 0.0f }, { 41.0f, 0.03f, 1.0f } },
+        // deliberately LOOSE in y, so the NODE box test is a clear accept and the exactly
+        // touching comparison lives only in the leaf predicate this mutant class targets
+        { false, TOUCH_PRIM,  1u, { -0.5f, -0.10f, -0.5f }, { 0.5f, contactDist + 0.1f, 0.5f } },
+        { false, MINB2_PRIM,  1u, { 16.0f, 0.00f, 0.0f }, { 17.0f, 0.00f, 0.5f } },
+        { false, MAXB2_PRIM,  1u, { 20.0f, 0.00f, 0.0f }, { 21.0f, 0.00f, 0.5f } },
+    };
+    const ChildSpec node1[2] = {
+        { false, V5_PRIM,  3u, { 12.0f, -0.03f, 0.0f }, { 13.0f, 0.03f, 1.0f } },
+        { false, FAR_PRIM, 1u, { 40.0f,  0.00f, 0.0f }, { 41.0f, 0.00f, 1.0f } },
+    };
+
+    const uint32_t NODE_WORDS = 292u;   // 1168 bytes
+    std::vector<uint32_t> blob(4u + 2u * NODE_WORDS, 0u);
+    auto writeNode = [&](uint32_t nodeIdx, const ChildSpec* cs, uint32_t n) {
+        const uint32_t base = 4u + nodeIdx * NODE_WORDS;
+        for (uint32_t c = 0; c < n; ++c)
+        {
+            for (uint32_t a = 0; a < 3u; ++a)
+            {
+                blob[base + c * 4u + a] = f2u(cs[c].mn[a]);
+                blob[base + 128u + c * 4u + a] = f2u(cs[c].mx[a]);
+            }
+            // leaf:     isLeaf(1) | nbPrimitives<<1 | primStartIndex<<7
+            // internal: isLeaf(0) | childNodeIndex<<GU_BV4_CHILD_OFFSET_SHIFT_COUNT(11)
+            blob[base + 256u + c] = cs[c].internal ? (cs[c].a << 11)
+                                                   : (1u | (cs[c].b << 1) | (cs[c].a << 7));
+        }
+        blob[base + 288u] = n;    // mNbNodes
+        blob[base + 289u] = 1u;   // mDepth
+    };
+    writeNode(0u, root, 10u);
+    writeNode(1u, node1, 2u);
+
+    // THE TREE INVARIANT, checked rather than assumed.
+    //
+    // Every child box must CONTAIN its subtree.  A cooked BV32 always does, and the whole
+    // node-box test rests on it: given containment, dropping an axis from that test can
+    // only cause extra DESCENTS -- a primitive whose own bound clears the query cannot be
+    // hiding inside a box that clears it too.  That is why a mutant which LOOSENS the node
+    // test (say, deleting its y terms) is genuinely equivalent here, while one that
+    // TIGHTENS it (comparing against the box's min twice) is killed by this fixture.
+    //
+    // The equivalence is therefore an equivalence UNDER THIS INVARIANT, and an invariant
+    // that is only believed is not one.  If a later edit makes a box too small, the node
+    // test starts deciding outcomes, the "loosening is invisible" reasoning stops holding,
+    // and this check is what says so.
+    {
+        auto contains = [&](const ChildSpec& box, const ChildSpec& inner) {
+            for (uint32_t a = 0; a < 3u; ++a)
+                if (inner.mn[a] < box.mn[a] || inner.mx[a] > box.mx[a]) return false;
+            return true;
+        };
+        auto primBox = [&](uint32_t start, uint32_t count) {
+            ChildSpec b = {}; 
+            for (uint32_t a = 0; a < 3u; ++a) { b.mn[a] = 3.4e38f; b.mx[a] = -3.4e38f; }
+            for (uint32_t k = 0; k < count; ++k)
+            {
+                const uint32_t idx[3] = { mi[start + k].x, mi[start + k].y, mi[start + k].z };
+                for (uint32_t t = 0; t < 3u; ++t)
+                {
+                    const float c[3] = { mv[idx[t]].x, mv[idx[t]].y, mv[idx[t]].z };
+                    for (uint32_t a = 0; a < 3u; ++a)
+                    { b.mn[a] = std::fmin(b.mn[a], c[a]); b.mx[a] = std::fmax(b.mx[a], c[a]); }
+                }
+            }
+            return b;
+        };
+        for (uint32_t k = 0; k < 10u; ++k)
+        {
+            if (!root[k].internal)
+            {
+                PXG_CHECK_MSG(contains(root[k], primBox(root[k].a, root[k].b)),
+                              "root child %u does not contain its own primitives", k);
+                continue;
+            }
+            for (uint32_t j = 0; j < 2u; ++j)
+            {
+                PXG_CHECK_MSG(contains(root[k], node1[j]),
+                              "root child %u does not contain node 1's child %u", k, j);
+                PXG_CHECK_MSG(contains(node1[j], primBox(node1[j].a, node1[j].b)),
+                              "node 1 child %u does not contain its own primitives", j);
+            }
+        }
+    }
+
+    const size_t vBase = blob.size();
+    blob.resize(vBase + NVERT * 4u, 0u);
+    std::memcpy(blob.data() + vBase, mv.data(), NVERT * sizeof(F4));
+    const size_t iBase = blob.size();
+    blob.resize(iBase + NPRIM * 4u, 0u);
+    std::memcpy(blob.data() + iBase, mi.data(), NPRIM * sizeof(TriIdx4));
+    blob[0] = NVERT;
+    blob[1] = NPRIM;
+    // header.z is nbBv32TreeNodes, header.w is nbPackedNodes.  Only .w sizes the node
+    // array, so .z is a deliberately wrong 9: a port that sizes with it walks the vertex
+    // pointer seven nodes too far and reads garbage.  The sibling makes the same point.
+    blob[2] = 9u;
+    blob[3] = 2u;
+
+    DevBuf bBlob = makeDev(dev, blob);
+    if (!bBlob.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    // ---- the cloth: ONE VERTEX per case, and no triangles at all ---------------------
+    // This kernel reads mPosition_InvMass and mNbVerts and nothing else -- the triangle
+    // indices the sibling needs are not even bound.
+    std::vector<V3> vs = {
+        { 1.5f,  0.12f, 0.5f },   // 0: one leaf, THREE triangles -- one back-facing, one
+                                  //    separated in Z ALONE
+        { 2.5f,  0.00f, 0.5f },   // 1: SIX qualifying triangles in one leaf
+        { 4.5f,  0.28f, 0.5f },   // 2: outside 0.20, inside the scale-divided 0.40
+        { 6.5f,  0.45f, 0.5f },   // 3: outside either reading
+        { 8.5f,  0.02f, 0.5f },   // 4: just inside, and its leaf's NEXT primitive is a
+                                  //    decoy only the lane guard keeps out
+        { 12.5f, 0.05f, 0.5f },   // 5: TWO children -- a leaf and the internal one
+        { 0.0f,  0.00f, 0.0f },   // 6: the ORIGIN -- a triangle sits at EXACTLY 0.20 above
+        { 15.85f, 0.00f, 0.1f },  // 7: reaches a triangle only via its THIRD vertex's min x
+        { 21.15f, 0.00f, 0.1f },  // 8: reaches a triangle only via its THIRD vertex's max x
+    };
+    // The vertex loop strides by blockDim.y * gridDim.x = 2048.  With a handful of
+    // vertices no index ever advances, so a stride of 1024 -- the grid width alone, and the
+    // obvious wrong reading -- is indistinguishable from the right one.  The cloth is
+    // therefore padded past 1024: everything from PAD_START up sits on vertex 4's query and
+    // would be visited TWICE by the halved stride, and the rest is parked where nothing
+    // overlaps.
+    const uint32_t NB_CASES = uint32_t(vs.size());
+    const uint32_t PAD_START = 1024u, NB_VERTS = 1100u;
+    for (uint32_t i = NB_CASES; i < NB_VERTS; ++i)
+        vs.push_back(i < PAD_START ? V3{ 500.0f, 0.0f, 0.0f } : V3{ 8.5f, 0.02f, 0.5f });
+    std::vector<F4> cv;
+    for (const V3& v : vs) cv.push_back(toWorld(v));
+    DevBuf bCv = makeDev(dev, cv);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bCv.addr));
+    c.mNbVerts = NB_VERTS;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // The TRIMESH is shapeRef0 and the CLOTH shapeRef1 -- the SWAPPED order, so the
+    // cloth can only be found by its body id (both shapes are eTRIANGLEMESH).
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_TRIANGLEMESH_H; shapes[0].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[0].sx = SX; shapes[0].sy = SY; shapes[0].sz = SZ; shapes[0].srw = 1.0f;
+    shapes[0].hullLo = uint32_t(bBlob.addr & 0xFFFFFFFFull);
+    shapes[0].hullHi = uint32_t(bBlob.addr >> 32);
+    shapes[1].type = GEOM_TRIANGLEMESH_H; shapes[1].particleOrSoftbodyId = 0u;
+    shapes[1].sx = 1.0f; shapes[1].sy = 1.0f; shapes[1].sz = 1.0f; shapes[1].srw = 1.0f;
+    DevBuf bShapes = makeDev(dev, shapes);
+    std::vector<CmInputHost> cms = { { 0u, 1u, /*trimesh cache*/ 1u, /*cloth cache*/ 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    std::vector<float> xf(2 * 8, 0.0f);
+    xf[3] = 1.0f;                                                    // slot 0 identity
+    xf[8 + 0] = QX; xf[8 + 1] = QY; xf[8 + 2] = QZ; xf[8 + 3] = QW;
+    xf[8 + 4] = TX; xf[8 + 5] = TY; xf[8 + 6] = TZ;
+    DevBuf bXf = makeDev(dev, xf);
+
+    std::vector<float> cd = { CD_CLOTH, CD_MESH };
+    DevBuf bCd = makeDev(dev, cd);
+
+    // ---- CPU reference: the SAME walk, node by node ----------------------------------
+    auto meshVert = [&](uint32_t i) { return V3{ mv[i].x, mv[i].y, mv[i].z }; };
+    auto boxHit = [&](const float* mn, const float* mx, V3 qn, V3 qx) {
+        return !(mn[0] > qx.x || qn.x > mx[0] || mn[1] > qx.y || qn.y > mx[1] ||
+                 mn[2] > qx.z || qn.z > mx[2]);
+    };
+    // `dropNodeY` runs the walk with the y terms removed from the NODE box test, and
+    // nothing else changed -- see the note under the results for what it is for.
+    auto walk = [&](bool dropNodeY) {
+        std::vector<std::pair<uint32_t, uint32_t>> out;   // (vertexIdx, prim)
+        for (uint32_t v = 0; v < NB_VERTS; ++v)
+        {
+            const V3 ctr = vs[v];                              // the round trip is identity
+            const V3 qn{ ctr.x - contactDist, ctr.y - contactDist, ctr.z - contactDist };
+            const V3 qx{ ctr.x + contactDist, ctr.y + contactDist, ctr.z + contactDist };
+            auto nodeHit = [&](const ChildSpec& c) {
+                if (!dropNodeY) return boxHit(c.mn, c.mx, qn, qx);
+                return !(c.mn[0] > qx.x || qn.x > c.mx[0] || c.mn[2] > qx.z || qn.z > c.mx[2]);
+            };
+            auto visit = [&](const ChildSpec* cs, uint32_t n, auto&& self) -> void {
+                for (uint32_t k = 0; k < n; ++k)
+                {
+                    if (!nodeHit(cs[k])) continue;
+                    if (cs[k].internal) { self(node1, 2u, self); continue; }
+                    for (uint32_t lane = 0; lane < cs[k].b && lane < 32u; ++lane)
+                    {
+                        const uint32_t p = cs[k].a + lane;
+                        const V3 b0 = meshVert(mi[p].x), b1 = meshVert(mi[p].y),
+                                 b2 = meshVert(mi[p].z);
+                        const float tn[3] = { std::fmin(std::fmin(b0.x, b1.x), b2.x),
+                                              std::fmin(std::fmin(b0.y, b1.y), b2.y),
+                                              std::fmin(std::fmin(b0.z, b1.z), b2.z) };
+                        const float tx[3] = { std::fmax(std::fmax(b0.x, b1.x), b2.x),
+                                              std::fmax(std::fmax(b0.y, b1.y), b2.y),
+                                              std::fmax(std::fmax(b0.z, b1.z), b2.z) };
+                        if (boxHit(tn, tx, qn, qx)) out.push_back({ v, p });
+                    }
+                }
+            };
+            visit(root, 10u, visit);
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    const std::vector<std::pair<uint32_t, uint32_t>> ref = walk(false);
+
+    // THE ONE SURVIVOR OF THE SWEEP, EXECUTED RATHER THAN ARGUED.
+    //
+    // Deleting the y terms from the NODE box test survives, and the reason is real: a
+    // cooked BV32 child box CONTAINS its subtree, so loosening the node test can only add
+    // DESCENTS, never emissions -- a primitive whose own bound clears the query cannot hide
+    // inside a box that clears it too.  Tightening it is a different matter and IS killed
+    // (comparing against the box's min twice).
+    //
+    // But that is an argument, and P9.24 paid four sweeps to learn that an argument about a
+    // mutant can be wrong where running it cannot.  So the walk above runs the mutant and
+    // this asserts the two agree.  It is not a tautology: it holds because the boxes
+    // contain their subtrees, and the moment an edit breaks that -- which the containment
+    // check above would also report -- these two sets diverge and the verdict "equivalent"
+    // is withdrawn by the fixture rather than by anyone remembering to re-derive it.
+    PXG_CHECK_MSG(walk(true) == ref,
+                  "dropping the y terms from the NODE box test changes the emitted pair set, "
+                  "so it is NOT the equivalent this fixture records it as.  Some child box no "
+                  "longer contains its subtree; add the mutant back to the sweep list");
+
+    // ---- run 1: a capacity that cannot bind -----------------------------------------
+    const uint32_t CAP = 256u;
+    const uint32_t SENTINEL = 0xFFFFFFFFu;
+    std::vector<uint32_t> stack(CAP * 4u, SENTINEL);
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> pairNum = { 0u };
+    DevBuf bPairNum = makeDev(dev, pairNum);
+
+    ClothVertMidPush push = {};
+    push.numWorkItems = 1u;
+    push.toleranceLength = 1.0f;
+    push.cmInputs = bCms.addr;
+    push.transformCache = bXf.addr;
+    push.bounds = 0ull;                 // ABI parity only -- the kernel never reads it
+    push.contactDistance = bCd.addr;
+    push.gpuShapes = bShapes.addr;
+    push.femClothes = bDesc.addr;
+    push.stackSizeBytes = CAP * 16u;
+    push.stackPtr = bStack.addr;
+    push.midphasePairsNum = bPairNum.addr;
+
+    Kernel k("femClothMeshVertMidphaseBda.spv", "cloth_midphaseVertexMeshLaunch",
+             {}, sizeof(ClothVertMidPush));
+    // The engine's grid (PxgNarrowphaseCore.cpp:6742): x = SB_SBMIDPHASE = 1024,
+    // y = numTests.  One dispatched group is ONE warp; the block's two are serial.
+    k.dispatch(/*gridX*/ 1024u, {}, push, /*gridY*/ 1u, 1u);
+    dev->flush();
+
+    const uint32_t gNum = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];
+    const auto gStack = downloadBuffer<uint32_t>(dev, bStack.h, CAP * 4u);
+    std::vector<std::pair<uint32_t, uint32_t>> got;
+    for (uint32_t i = 0; i < gNum && i < CAP; ++i)
+    {
+        PXG_CHECK_MSG(gStack[i * 4u + 0u] == 0u,
+                      "pair %u carries cmIdx %u; blockIdx.y is the ONLY contact-manager "
+                      "index here", i, gStack[i * 4u + 0u]);
+        PXG_CHECK_MSG(gStack[i * 4u + 3u] == 0u,
+                      "pair %u has a non-zero fourth word; the CUDA writes make_uint4(..., 0)", i);
+        got.push_back({ gStack[i * 4u + 1u], gStack[i * 4u + 2u] });
+    }
+    std::sort(got.begin(), got.end());
+
+    auto countFor = [&](uint32_t v) {
+        uint32_t n = 0; for (auto& e : got) if (e.first == v) ++n; return n;
+    };
+    auto has = [&](uint32_t v, uint32_t p) {
+        return std::find(got.begin(), got.end(), std::make_pair(v, p)) != got.end();
+    };
+
+    const uint32_t PAD_PAIRS = NB_VERTS - PAD_START;      // one each, on vertex 4's query
+    PXG_CHECK_MSG(ref.size() == 16u + PAD_PAIRS,
+                  "reference: expected %u pairs -- vertex 0 two, vertex 1 six, vertex 4 one, "
+                  "vertex 5 four, vertices 6, 7 and 8 one each, none for 2 and 3, plus %u from "
+                  "the padding -- got %zu", 16u + PAD_PAIRS, PAD_PAIRS, ref.size());
+    PXG_CHECK_MSG(gNum == uint32_t(ref.size()),
+                  "emitted %u pairs, reference says %zu.  0 usually means the blob walk or "
+                  "the vertex-space transform is wrong; 10 means a borrowed top-4 cap; "
+                  "more means the contact distance picked up the softbody path's scale "
+                  "division (vertex 2 comes inside a 0.40 band)", gNum, ref.size());
+    PXG_CHECK_MSG(got == ref, "the emitted pair SET does not match the CPU reference");
+
+    // Pin what the twelve ARE, so a reference that drifts with the shader is caught too.
+    PXG_CHECK_MSG(countFor(0u) == 2u && has(0u, V0_PRIM) && has(0u, V0_BACK_PRIM),
+                  "vertex 0 must keep BOTH triangles in its leaf, including the BACK-FACING "
+                  "one -- the triangle sibling's front-face gate would drop it and this "
+                  "kernel has no gate at all (got %u)", countFor(0u));
+    PXG_CHECK_MSG(countFor(1u) == 6u,
+                  "vertex 1 must keep ALL SIX qualifying triangles: pushOntoStackFullWarp has "
+                  "no reduction, and a borrowed MaxNumPairs = 4 gives four (got %u)",
+                  countFor(1u));
+    PXG_CHECK_MSG(countFor(2u) == 0u,
+                  "vertex 2 sits 0.28 away: outside the correct 0.20 band and inside the 0.40 "
+                  "the softbody path's scale division would give");
+    PXG_CHECK_MSG(countFor(3u) == 0u, "vertex 3 sits 0.45 away, outside either reading");
+    PXG_CHECK_MSG(countFor(4u) == 1u && has(4u, V4_PRIM),
+                  "vertex 4 sits 0.02 away and must match its own leaf's triangle");
+    PXG_CHECK_MSG(countFor(5u) == 4u && has(5u, V5_PRIM) && has(5u, V5_PRIM + 1u) &&
+                  has(5u, V5_PRIM + 2u) && has(5u, V5B_PRIM),
+                  "vertex 5 must reach BOTH of its children: the leaf beside the internal one "
+                  "AND the three triangles behind it.  Two entries on the node stack at once is "
+                  "what makes the pop order and the `nbStack +=` accumulation observable; three "
+                  "means the internal child was never expanded, one means the stack was reset "
+                  "(got %u)", countFor(5u));
+    PXG_CHECK_MSG(countFor(6u) == 1u && has(6u, TOUCH_PRIM),
+                  "vertex 6 sits at the vertex-space ORIGIN and prim 16 at EXACTLY the contact "
+                  "distance above it, so the leaf bound TOUCHES: `tMin.y > qMax.y` is false and "
+                  "the pair is kept, where `>=` would drop it.  This is the only query in the "
+                  "fixture whose world round trip is bit-exact, and therefore the only one that "
+                  "can tell the two spellings apart (got %u)", countFor(6u));
+    PXG_CHECK_MSG(!has(5u, FAR_PRIM),
+                  "the internal child's OTHER leaf sits at x = 40 and its box must reject the "
+                  "query -- descending is otherwise indistinguishable from taking everything");
+    PXG_CHECK_MSG(!has(0u, V0_Z_PRIM),
+                  "vertex 0's leaf holds a triangle separated from its query in Z ALONE; if it "
+                  "comes out, the leaf overlap test is not testing all three axes");
+    PXG_CHECK_MSG(countFor(4u) == 1u && !has(4u, V4_PRIM + 1u),
+                  "the primitive after vertex 4's single-primitive leaf sits right on that "
+                  "leaf's query and belongs to no leaf.  Only `lane < nbPrimitives` keeps it "
+                  "out -- a raw `lane + primStartIndex` for all 32 lanes emits it");
+    PXG_CHECK_MSG(countFor(7u) == 1u && has(7u, MINB2_PRIM),
+                  "vertex 7 reaches its triangle only through that triangle's THIRD vertex, "
+                  "which carries the minimum x: `min(b0, b1)` alone puts the bound 1.0 too far "
+                  "right and the pair disappears (got %u)", countFor(7u));
+    PXG_CHECK_MSG(countFor(8u) == 1u && has(8u, MAXB2_PRIM),
+                  "vertex 8 reaches its triangle only through that triangle's THIRD vertex, "
+                  "which carries the maximum x: `max(b0, b1)` alone puts the bound 1.0 too far "
+                  "left and the pair disappears (got %u)", countFor(8u));
+    uint32_t padSeen = 0;
+    for (uint32_t v = PAD_START; v < NB_VERTS; ++v)
+    {
+        PXG_CHECK_MSG(countFor(v) == 1u,
+                      "padding vertex %u produced %u pairs, expected exactly one.  Two means "
+                      "the vertex loop strides by the grid width instead of "
+                      "blockDim.y * gridDim.x and visits it twice", v, countFor(v));
+        ++padSeen;
+    }
+    PXG_CHECK_MSG(padSeen == PAD_PAIRS && PAD_START >= 1024u,
+                  "the padding must start at or past 1024, or a halved vertex stride is "
+                  "unobservable");
+    for (uint32_t i = gNum; i < CAP; ++i)
+        PXG_CHECK_MSG(gStack[i * 4u + 0u] == SENTINEL,
+                      "slot %u past the emitted count was written", i);
+
+    // ---- run 2: a capacity that DOES bind -------------------------------------------
+    // "If we run out of stacksize, drop contacts" -- but the COUNTER still advances past
+    // the capacity, because the engine reads it back to size next frame's stack.  The
+    // buffer keeps its 64 slots and only the kernel's bound moves, so a mutant that drops
+    // the `stackIndex < stackCapacity` guard writes into slack and is caught here rather
+    // than corrupting the heap.
+    // FOUR, not six: the largest single ballot in this fixture pushes SIX (vertex 1's
+    // leaf), so a capacity of four is the only setting under which clamping the atomicAdd
+    // to the room left -- rather than counting what was actually wanted -- shows up.
+    const uint32_t TIGHT = 4u;
+    std::vector<uint32_t> stack2(CAP * 4u, SENTINEL);
+    DevBuf bStack2 = makeDev(dev, stack2);
+    std::vector<uint32_t> pairNum2 = { 0u };
+    DevBuf bPairNum2 = makeDev(dev, pairNum2);
+    push.stackSizeBytes = TIGHT * 16u;
+    push.stackPtr = bStack2.addr;
+    push.midphasePairsNum = bPairNum2.addr;
+    k.dispatch(/*gridX*/ 1024u, {}, push, /*gridY*/ 1u, 1u);
+    dev->flush();
+
+    const uint32_t gNum2 = downloadBuffer<uint32_t>(dev, bPairNum2.h, 1)[0];
+    const auto gStack2 = downloadBuffer<uint32_t>(dev, bStack2.h, CAP * 4u);
+    PXG_CHECK_MSG(gNum2 == uint32_t(ref.size()),
+                  "with a capacity of %u the counter must still reach %zu -- the engine reads "
+                  "it back to size next frame's stack, so clamping it there loses the growth "
+                  "signal (got %u)", TIGHT, ref.size(), gNum2);
+    uint32_t written = 0;
+    for (uint32_t i = 0; i < CAP; ++i)
+        if (gStack2[i * 4u + 0u] != SENTINEL) ++written;
+    PXG_CHECK_MSG(written == TIGHT,
+                  "with a capacity of %u exactly %u slots may be written; %u were.  More means "
+                  "the `stackIndex < stackCapacity` guard is gone", TIGHT, TIGHT, written);
+    for (uint32_t i = TIGHT; i < CAP; ++i)
+        PXG_CHECK_MSG(gStack2[i * 4u + 0u] == SENTINEL,
+                      "slot %u is past the capacity and was written anyway", i);
+
+    std::printf("    [ note ] %u verts (%u cases + %u padding past 1024), %u prims over "
+                "2 nodes (10 + 2 children, one internal); %u pairs: v0 %u (one back-facing, "
+                "one z-only reject), v1 %u (no top-4), v4 %u, v5 %u (leaf + internal), "
+                "v6 %u (exactly touching), v7/v8 %u/%u (third-vertex extremes); capacity %u "
+                "writes %u and still counts %u\n",
+                NB_VERTS, NB_CASES, PAD_PAIRS, NPRIM, gNum, countFor(0u), countFor(1u),
+                countFor(4u), countFor(5u), countFor(6u), countFor(7u), countFor(8u),
+                TIGHT, written, gNum2);
+
+    dev->destroyBuffer(bBlob.h); dev->destroyBuffer(bCv.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bShapes.h); dev->destroyBuffer(bCms.h); dev->destroyBuffer(bXf.h);
+    dev->destroyBuffer(bCd.h); dev->destroyBuffer(bStack.h); dev->destroyBuffer(bPairNum.h);
+    dev->destroyBuffer(bStack2.h); dev->destroyBuffer(bPairNum2.h);
+}
+
+// ===========================================================================
+// P9.26 -- cloth_meshVertexContactGenLaunch, the consumer of the midphase above.
+//
+// THIS KERNEL EMITS NO CONTACTS, AND THAT IS THE ENGINE'S DOING.  The CUDA computes
+// a closest point, a normal, a penetration and a barycentric for every pair the
+// midphase produced and then throws all of it away: the write is gated on
+// `hasContacts`, and the only assignment to `hasContacts` in the kernel is commented
+// out (femClothPrimitives.cu:3056).  PxgOutputIndex (:79) skips its atomicAdd on an
+// empty ballot, so the contact COUNTER does not move either.  The kernel's entire
+// observable output is one atomicMax that sizes next frame's intermediate stack.
+//
+// So this fixture cannot check a contact, and pretending otherwise would be the whole
+// mistake.  What it CAN check is every property of the one live output, and each of
+// the four below is a mutant that a "just call atomicMax somewhere" port would pass:
+//
+//   * the count is UNCLAMPED.  `numPairs` is min(found, stackSize) and drives the
+//     loop; the atomicMax takes `numMidphasePairsFound`, the raw value.  Run 1 asks
+//     for 37 pairs into a 16-deep stack -- the clamped reading gives 256 where the
+//     right one gives 592.  This is the whole point of the output: the engine reads
+//     it back to grow a stack that was too small, so a clamped value can never ask
+//     for more than it already has.
+//   * it is a MAX, not a store.  Run 2 pre-seeds a larger value and it must survive.
+//   * the unit is BYTES.  sizeof(uint4) = 16, not 1 and not 4.
+//   * ONE thread of the grid does it (`globalThreadIdx == 0`), across 512 blocks.
+//
+// and, negatively, that nothing else moves: the contact counter is pre-seeded with a
+// value the kernel must not touch, and every writer buffer carries a sentinel.
+// ===========================================================================
+namespace p926cg
+{
+struct ClothVertCgPush
+{
+    float toleranceLength; uint32_t pad4;
+    uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes, femClothes;
+    uint64_t shapeToRigidRemap;
+    uint32_t stackSizeBytes, pad68;
+    uint64_t stackPtr, midphasePairsNum, stackSizeNeeded;
+    uint64_t w_outPoint, w_outNormalPen, w_outBarycentric, w_outContactInfo, w_totalContactCount;
+    uint64_t w_contactByX, w_tempContactByX, w_contactIndexSortedByX, w_contactSortedByX;
+    uint32_t w_maxNumContacts, pad172;
+};
+static_assert(sizeof(ClothVertCgPush) == 176, "cloth vertex CG blob must be 176 bytes");
+static_assert(offsetof(ClothVertCgPush, stackSizeBytes) == 64, "stackSizeBytes @64");
+static_assert(offsetof(ClothVertCgPush, stackPtr) == 72, "stackPtr @72");
+static_assert(offsetof(ClothVertCgPush, midphasePairsNum) == 80, "midphasePairsNum @80");
+static_assert(offsetof(ClothVertCgPush, stackSizeNeeded) == 88, "stackSizeNeeded @88");
+// The writer is passed BY VALUE and its paramAlign is 16 (P9.15e).  @96 is already
+// 16-aligned, so nothing moves -- asserted rather than assumed, because the next
+// kernel with a by-value tail will not be so lucky.
+static_assert(offsetof(ClothVertCgPush, w_outPoint) == 96, "writer @96, 16-aligned");
+static_assert(offsetof(ClothVertCgPush, w_maxNumContacts) == 168, "maxNumContacts @168");
+} // namespace p926cg
+
+PXG_TEST(femClothSimMeshVertContactGen)
+{
+    using namespace p926cg;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t SENTINEL32 = 0xFEEDFACEu;
+    const uint32_t SEED_COUNT = 7u;            // the contact counter must not move
+    const uint32_t NB_FOUND = 37u;             // what the midphase says it produced
+    const uint32_t STACK_PAIRS = 16u;          // ... into a stack that holds sixteen
+
+    WriterBufs w = makeWriter(dev, 64u);
+    std::vector<uint32_t> seedCount = { SEED_COUNT };
+    DevBuf bCount = makeDev(dev, seedCount);
+    if (!bCount.addr) { std::printf("  NOTE: no BDA -> skip\n"); destroyWriter(dev, w); return; }
+
+    // The pair stack the kernel would read.  Its contents are irrelevant -- nothing
+    // this kernel computes can reach an output -- but it is bound and sentinel-filled
+    // so a port that WRITES to the pair stack (the midphase's buffer, not its own) is
+    // caught rather than silently corrupting it.
+    std::vector<uint32_t> pairs(STACK_PAIRS * 4u, SENTINEL32);
+    DevBuf bPairs = makeDev(dev, pairs);
+    std::vector<uint32_t> found = { NB_FOUND };
+    DevBuf bFound = makeDev(dev, found);
+    std::vector<uint32_t> needed = { 0u };
+    DevBuf bNeeded = makeDev(dev, needed);
+
+    ClothVertCgPush p = {};
+    p.toleranceLength = 1.0f;
+    p.stackSizeBytes = STACK_PAIRS * 16u;
+    p.stackPtr = bPairs.addr;
+    p.midphasePairsNum = bFound.addr;
+    p.stackSizeNeeded = bNeeded.addr;
+    p.w_outPoint = w.point.addr; p.w_outNormalPen = w.normalPen.addr;
+    p.w_outBarycentric = w.barycentric.addr; p.w_outContactInfo = w.info.addr;
+    p.w_totalContactCount = bCount.addr;
+    p.w_contactByX = w.byRigid.addr; p.w_tempContactByX = w.tempByRigid.addr;
+    p.w_contactIndexSortedByX = w.idxByRigid.addr; p.w_contactSortedByX = w.sortedByRigid.addr;
+    p.w_maxNumContacts = w.maxContacts;
+    // cmInputs, transformCache, contactDistance, restDistance, gpuShapes, femClothes and
+    // shapeToRigidRemap stay null.  They are in the pack for ABI parity and the kernel
+    // reads none of them -- which is itself a claim, and a null address is how it gets
+    // tested: a port that transcribes the dead geometry faults here instead of passing.
+
+    Kernel k("femClothMeshVertContactGenBda.spv", "cloth_meshVertexContactGenLaunch",
+             {}, sizeof(ClothVertCgPush));
+    k.dispatch(/*gridX*/ 512u, {}, p, 1u, 1u);   // PxgNarrowphaseCore.cpp:6831
+    dev->flush();
+
+    const uint32_t need1 = downloadBuffer<uint32_t>(dev, bNeeded.h, 1)[0];
+    PXG_CHECK_MSG(need1 == NB_FOUND * 16u,
+                  "stackSizeNeeded is %u, expected %u = %u found * 16 bytes.  %u would mean the "
+                  "count was clamped to the stack depth first -- and a value that cannot exceed "
+                  "the stack it is meant to grow is useless; %u would mean the unit is pairs, "
+                  "not bytes", need1, NB_FOUND * 16u, NB_FOUND, STACK_PAIRS * 16u, NB_FOUND);
+
+    const uint32_t cnt1 = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+    PXG_CHECK_MSG(cnt1 == SEED_COUNT,
+                  "the contact counter moved from %u to %u.  It must not: every lane's "
+                  "`hasContacts` is false, so the ballot is empty and PxgOutputIndex performs "
+                  "no atomicAdd at all (femClothPrimitives.cu:89 gates it on popcount > 0)",
+                  SEED_COUNT, cnt1);
+
+    const auto gPoint = downloadBuffer<F4>(dev, w.point.h, w.maxContacts);
+    const auto gNp = downloadBuffer<F4>(dev, w.normalPen.h, w.maxContacts);
+    const auto gBary = downloadBuffer<F4>(dev, w.barycentric.h, w.maxContacts);
+    for (uint32_t i = 0; i < w.maxContacts; ++i)
+        PXG_CHECK_MSG(gPoint[i].x == 0.0f && gPoint[i].w == 0.0f &&
+                      gNp[i].x == 0.0f && gNp[i].w == 0.0f &&
+                      gBary[i].x == 0.0f && gBary[i].w == 0.0f,
+                      "contact slot %u was written.  This kernel emits NO contacts upstream; if "
+                      "that has changed, tools/check_disabled_kernels.py will say so and the "
+                      "geometry has to be ported for real", i);
+    const auto gPairs = downloadBuffer<uint32_t>(dev, bPairs.h, STACK_PAIRS * 4u);
+    for (uint32_t i = 0; i < STACK_PAIRS * 4u; ++i)
+        PXG_CHECK_MSG(gPairs[i] == SENTINEL32,
+                      "word %u of the midphase pair stack was overwritten; this kernel only "
+                      "READS it", i);
+
+    // ---- run 2: it is a MAX ----------------------------------------------------------
+    const uint32_t BIGGER = NB_FOUND * 16u + 1000u;
+    std::vector<uint32_t> needed2 = { BIGGER };
+    DevBuf bNeeded2 = makeDev(dev, needed2);
+    p.stackSizeNeeded = bNeeded2.addr;
+    k.dispatch(512u, {}, p, 1u, 1u);
+    dev->flush();
+    const uint32_t need2 = downloadBuffer<uint32_t>(dev, bNeeded2.h, 1)[0];
+    PXG_CHECK_MSG(need2 == BIGGER,
+                  "stackSizeNeeded was %u before the launch and is %u after.  atomicMax must "
+                  "leave a larger value alone -- a plain store would drop another contact "
+                  "manager's larger request in the same frame", BIGGER, need2);
+
+    // ---- run 3: nothing found, nothing asked for --------------------------------------
+    std::vector<uint32_t> none = { 0u };
+    DevBuf bNone = makeDev(dev, none);
+    std::vector<uint32_t> needed3 = { 0u };
+    DevBuf bNeeded3 = makeDev(dev, needed3);
+    p.midphasePairsNum = bNone.addr;
+    p.stackSizeNeeded = bNeeded3.addr;
+    k.dispatch(512u, {}, p, 1u, 1u);
+    dev->flush();
+    const uint32_t need3 = downloadBuffer<uint32_t>(dev, bNeeded3.h, 1)[0];
+    PXG_CHECK_MSG(need3 == 0u,
+                  "with no pairs found, stackSizeNeeded must stay 0, got %u", need3);
+    const uint32_t cnt3 = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+    PXG_CHECK_MSG(cnt3 == SEED_COUNT,
+                  "the contact counter moved to %u across three launches", cnt3);
+
+    std::printf("    [ note ] %u found into a %u-pair stack -> stackSizeNeeded %u bytes "
+                "(unclamped); max keeps %u; empty keeps 0; contact count %u untouched over "
+                "three launches; no contact slot and no pair-stack word written\n",
+                NB_FOUND, STACK_PAIRS, need1, need2, cnt3);
+
+    dev->destroyBuffer(bPairs.h); dev->destroyBuffer(bFound.h); dev->destroyBuffer(bNeeded.h);
+    dev->destroyBuffer(bNeeded2.h); dev->destroyBuffer(bNone.h); dev->destroyBuffer(bNeeded3.h);
+    dev->destroyBuffer(bCount.h);
+    destroyWriter(dev, w);
+}
+
 } // namespace

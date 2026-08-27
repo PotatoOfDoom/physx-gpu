@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 362;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 364;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -409,8 +409,8 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_meshMidphaseGeneratePairsLaunch", "femClothMeshMidphaseBda.spv", "cloth_meshMidphaseGeneratePairsLaunch" },  // CLOTH_MESH_MIDPHASE (P8.17 step 1 BDA port: cloth-vs-cooked-trimesh midphase pair gen)
     { "cloth_meshContactGenLaunch", "femClothMeshContactGenBda.spv", "cloth_meshContactGenLaunch" },  // CLOTH_MESH_CG (P8.17 step 2 BDA port: cloth-vs-cooked-trimesh contact gen)
     { "cloth_sdfMeshContactGenLaunch", nullptr, nullptr },  // CLOTH_SDF_MESH_CG (unmapped)
-    { "cloth_midphaseVertexMeshLaunch", nullptr, nullptr },  // CLOTH_MIDPHASE_VERTEX_MESH (unmapped)
-    { "cloth_meshVertexContactGenLaunch", nullptr, nullptr },  // CLOTH_MESH_VERTEX_CG (unmapped)
+    { "cloth_midphaseVertexMeshLaunch", "femClothMeshVertMidphaseBda.spv", "cloth_midphaseVertexMeshLaunch" },  // CLOTH_MIDPHASE_VERTEX_MESH (P9.26: cloth-VERTEX-vs-cooked-trimesh midphase)
+    { "cloth_meshVertexContactGenLaunch", "femClothMeshVertContactGenBda.spv", "cloth_meshVertexContactGenLaunch" },  // CLOTH_MESH_VERTEX_CG (P9.26: emits no contacts upstream -- see tools/check_disabled_kernels.py)
     { "cloth_heightfieldMidphaseGeneratePairsLaunch", nullptr, nullptr },  // CLOTH_HF_MIDPHASE (unmapped)
     { "cloth_heightfieldContactGenLaunch", nullptr, nullptr },  // CLOTH_HF_CG (unmapped)
     { "cloth_midphaseVertexHeightfieldLaunch", nullptr, nullptr },  // CLOTH_MIDPHASE_VERTEX_HF (unmapped)

@@ -750,6 +750,34 @@ static const uint8_t kClothMeshMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
 //   kernel a byte count where a device pointer belongs.
 static const uint8_t kClothMeshContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 4, 8, 80 };
 
+// gpunarrowphase cloth-VERTEX-vs-COOKED-TRIANGLE-MESH midphase (P9.26):
+//   cloth_midphaseVertexMeshLaunch(PxU32 numWorkItems, PxReal tolerenceLength, cmInputs*,
+//   transformCache*, bounds*, contactDistance*, gpuShapes*, femClothes*,
+//   PxU32 stackSizeBytes, stackPtr*, midphasePairsNum*) -- launch site
+//   PxgNarrowphaseCore.cpp:6724, the vertex half of the same block whose triangle half
+//   launches cloth_meshMidphaseGeneratePairsLaunch at :6581.  Two 4-byte scalars @0/@4, six
+//   pointers @8..@48, PxU32 @56, two pointers realigned to @64/@72 -> 80-byte blob.
+//   Byte-identical to kSbMidphasePrimitives, and kept as its OWN row anyway -- the same
+//   reason kClothMeshMidphase is not aliased onto kSbMeshMidphase: an upstream divergence
+//   in one of two packs that happen to agree today has to show up HERE, in a row, not as a
+//   silent reinterpretation of the other kernel's arguments.  P9.15b is the cautionary
+//   case: the cloth TRIANGLE midphase takes the same eleven TYPES as the softbody twin with
+//   stackSizeBytes moved to the end.
+static const uint8_t kClothVertMeshMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
+
+// gpunarrowphase cloth-VERTEX-vs-COOKED-TRIANGLE-MESH contact gen (P9.26):
+//   cloth_meshVertexContactGenLaunch(PxReal tolerenceLength, cmInputs*, transformCache*,
+//   contactDistance*, restDistance*, gpuShapes*, femClothes*, shapeToRigidRemapTable*,
+//   PxU32 stackSizeBytes, stackPtr*, midphasePairsNum*, stackSizeNeededOnDevice*,
+//   PxgFEMContactWriter writer) -- launch site PxgNarrowphaseCore.cpp:6814.  NOT
+//   kClothMeshContactGen: the triangle sibling carries a filter pair buffer and its count
+//   (@96/@104) that this one does not, so the writer lands at @96 here and @112 there.
+//   4 @0, seven pointers @8..@56, PxU32 @64, three pointers @72/@80/@88, then the 80-byte
+//   writer by value.  Its paramAlign is 16 (P9.15e), and @96 is already 16-aligned, so
+//   nothing moves -- recorded because the next by-value tail will have to check it again.
+//   -> 176-byte blob, over Vulkan's guaranteed 128 and inside llvmpipe's 256.
+static const uint8_t kClothMeshVertContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 80 };
+
 // gpusimulationcontroller FEM-vs-FEM ATTACHMENT pair (P8.19):
 //   femAttachmentPrepareLaunch(PxgFEMFEMAttachment* femAttachments, PxU32* activeFemAttachments,
 //   PxU32 numFemAttachments, PxgFEMFEMAttachmentConstraint* attachmentConstraints) -- launch
@@ -1684,6 +1712,12 @@ static const PxgKernelAbiRow kRows[] = {
     // gpunarrowphase cloth-vs-COOKED-TRIANGLE-MESH midphase (P8.17 step 1)
     { "cloth_meshMidphaseGeneratePairsLaunch", kClothMeshMidphase, uint32_t(sizeof(kClothMeshMidphase)) },
     { "cloth_meshContactGenLaunch", kClothMeshContactGen, uint32_t(sizeof(kClothMeshContactGen)) },
+    // P9.26: the VERTEX half of the same cloth-vs-cooked-mesh block.  The contact-gen
+    // kernel emits nothing upstream (its `hasContacts` assignment is commented out), but
+    // its argument pack is live and read every step, so the row is not optional -- see
+    // tools/check_disabled_kernels.py, which keeps that reading true.
+    { "cloth_midphaseVertexMeshLaunch", kClothVertMeshMidphase, uint32_t(sizeof(kClothVertMeshMidphase)) },
+    { "cloth_meshVertexContactGenLaunch", kClothMeshVertContactGen, uint32_t(sizeof(kClothMeshVertContactGen)) },
     // gpusimulationcontroller FEM-vs-FEM attachments (P8.19)
     { "femAttachmentPrepareLaunch", kFemAttachPrep, uint32_t(sizeof(kFemAttachPrep)) },
     { "sb_solveOutputSoftBodyAttachmentDeltaVLaunch", kFemAttachSolve, uint32_t(sizeof(kFemAttachSolve)) },

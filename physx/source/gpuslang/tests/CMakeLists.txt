@@ -91,7 +91,7 @@ set(SHADER_COMMON_DEPS
 # to contract undecorated expressions: llvmpipe fuses npCvxCoreEpa's
 # makePlane triple-cross sums into fma chains (1-ulp vs strict IEEE), which
 # breaks the bitwise CPU-vs-GPU doctrine.  The decoration forbids that.
-set(PXG_NOCONTRACT_SHADERS npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npD6JointPrep npArtiExtBody npArti1DPrep npArtiJointHeader npArtiSolve1D npArtiSolveContact npArtiSolve1DTGS npArtiSolveContactTGS npArtiCheckActive npArtiPropagate npArtiPropagateAccel npArtiPropagateAccelJV npArtiSpatialMatVec npArtiSpatialMatMat npArtiTranslateInertia npArtiTranslateSInertia npArtiPropagateZA npArtiPropagateZASph npArtiTranslateInertiaMass npArtiInvertInertia npArtiPropagateImpDof npArtiAccumLinkImp npArtiDriveParams npArtiClampDriveImp npClothDefGrad2D npSbDefGrad npDefMaterial npJacobiRotate npClothAtan npAnisoHelpers npClothDeltaLambda npClothExtractRot2D npClothVelClamp npClothArap2D npClothArea2D npClothWind npSbBaryInvMass npSbVolumeSolve npIsoConcaveCorner npSphSpikyKernel npIsoAcosDecode npSparseGridDomain npDenseGridCell npSbBaryProject npIsoVecNormalize npSbCompliance npSbDeltaLambdaGradC npSbTetConstraint npPsSpecVolume npSbComputeLambda npGridLocation npAnisoOutput npSmoothPos npIsoAvgVerts npPsSolvePC npPsSolvePCTGS npPsWeightKernels npPsDiffuseUpdate npPsDiffuseSpawn npPsDiffuseAvg npPsDiffuseOneWay npSdfBoxDist npSparseGridCellFromPos npIsoGridFilter npSbExtractRotAPD npSbSolveNeoHookean npSbSolveCorot npSbSolveGM npClothMembrane npClothBending npClothSharedEnergy npSbCollisionConstraint npClothCollisionConstraint npSdfBvhMorton npSbStress npSdfHoles npClothTriContact particleSim particleSelfCollisionBda psContactSolveTgsBda femClothSimBda femClothSolveBda femClothSolvePairBda femClothDampingBda femClothRigidAttachBda femClothContactGenBda femClothRigidContactBda femClothSelfCollisionBda femClothClothContactBda femClothRefitBda softBodySimBda softBodyRefitBda softBodySolveBda softBodyContactGenBda softBodyContactRemapBda softBodyRigidContactBda softBodyRigidAttachBda softBodySelfCollisionBda softBodySelfSolveBda softBodyClothMidphaseBda softBodyClothContactGenBda softBodyClothVertMidphaseBda softBodyClothVertContactGenBda softBodyClothPrepareBda softBodyClothSolveBda softBodySoftBodyMidphaseBda softBodyMeshMidphaseBda softBodyMeshContactGenBda softBodyHfMidphaseBda femClothStepBda femClothDifferentClothBda femClothMeshMidphaseBda femClothMeshContactGenBda softBodyFemAttachBda pcmManifoldBda convexTrimeshMidphaseBda triFeatureBda deferContactBda polyClipBda convexSatBda contactReduceWarpBda cvxTriEmitBda cvxTriSetupBda convexTrimeshCoreBda cvxTriPostProcessBda cvxTriCorrelateBda cvxTriFinishBda npArtiJointFrame npArtiSpatialInertia npArtiSpatialMatrix npArtiPropagateInertia npArtiDynamic npArtiMassMatrix npArtiLinkAccel npArtiStep npArtiFlushVel npArtiAvgImpulse npArtiStepKernel npArtiSleep npArtiUpdateBodies npArtiSumBatches npArtiSumBatches2 npArtiSumSelfBatches npArtiSetupInternal npArtiSetupTendons npArtiSetupMimic npArtiSetupICKernel npArtiSolveTendons npArtiSolveTMKernel npArtiSolveExtTGS npArtiSolveExtPGS npArtiSolveSelf npArtiSolveInternal npArtiPropagate2 npArtiConstraintPrep npArtiJointPrep updateArticulationsBda solverTGS npArtiInverseDyn npArtiUpdateKin npArtiGetSet npPsMaterials npPsFluidDensity npPsFluidVelocity npPsSprings npPsAerodynamics npPsInflatable npPsBoundaryDensity psMeshMid psMeshMidphaseBda psHfCollide psHfMidphaseBda psSdfMidphaseBda npSdfTexture npSdfCollision npSdfFind npSdfParticle psDiffuseBuffers psDiffuseCreate psDiffuseAdvect psDiffuseOneWay
+set(PXG_NOCONTRACT_SHADERS npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npD6JointPrep npArtiExtBody npArti1DPrep npArtiJointHeader npArtiSolve1D npArtiSolveContact npArtiSolve1DTGS npArtiSolveContactTGS npArtiCheckActive npArtiPropagate npArtiPropagateAccel npArtiPropagateAccelJV npArtiSpatialMatVec npArtiSpatialMatMat npArtiTranslateInertia npArtiTranslateSInertia npArtiPropagateZA npArtiPropagateZASph npArtiTranslateInertiaMass npArtiInvertInertia npArtiPropagateImpDof npArtiAccumLinkImp npArtiDriveParams npArtiClampDriveImp npClothDefGrad2D npSbDefGrad npDefMaterial npJacobiRotate npClothAtan npAnisoHelpers npClothDeltaLambda npClothExtractRot2D npClothVelClamp npClothArap2D npClothArea2D npClothWind npSbBaryInvMass npSbVolumeSolve npIsoConcaveCorner npSphSpikyKernel npIsoAcosDecode npSparseGridDomain npDenseGridCell npSbBaryProject npIsoVecNormalize npSbCompliance npSbDeltaLambdaGradC npSbTetConstraint npPsSpecVolume npSbComputeLambda npGridLocation npAnisoOutput npSmoothPos npIsoAvgVerts npPsSolvePC npPsSolvePCTGS npPsWeightKernels npPsDiffuseUpdate npPsDiffuseSpawn npPsDiffuseAvg npPsDiffuseOneWay npSdfBoxDist npSparseGridCellFromPos npIsoGridFilter npSbExtractRotAPD npSbSolveNeoHookean npSbSolveCorot npSbSolveGM npClothMembrane npClothBending npClothSharedEnergy npSbCollisionConstraint npClothCollisionConstraint npSdfBvhMorton npSbStress npSdfHoles npClothTriContact particleSim particleSelfCollisionBda psContactSolveTgsBda femClothSimBda femClothSolveBda femClothSolvePairBda femClothDampingBda femClothRigidAttachBda femClothContactGenBda femClothRigidContactBda femClothSelfCollisionBda femClothClothContactBda femClothRefitBda softBodySimBda softBodyRefitBda softBodySolveBda softBodyContactGenBda softBodyContactRemapBda softBodyRigidContactBda softBodyRigidAttachBda softBodySelfCollisionBda softBodySelfSolveBda softBodyClothMidphaseBda softBodyClothContactGenBda softBodyClothVertMidphaseBda softBodyClothVertContactGenBda softBodyClothPrepareBda softBodyClothSolveBda softBodySoftBodyMidphaseBda softBodyMeshMidphaseBda softBodyMeshContactGenBda softBodyHfMidphaseBda femClothStepBda femClothDifferentClothBda femClothMeshMidphaseBda femClothMeshContactGenBda femClothMeshVertMidphaseBda softBodyFemAttachBda pcmManifoldBda convexTrimeshMidphaseBda triFeatureBda deferContactBda polyClipBda convexSatBda contactReduceWarpBda cvxTriEmitBda cvxTriSetupBda convexTrimeshCoreBda cvxTriPostProcessBda cvxTriCorrelateBda cvxTriFinishBda npArtiJointFrame npArtiSpatialInertia npArtiSpatialMatrix npArtiPropagateInertia npArtiDynamic npArtiMassMatrix npArtiLinkAccel npArtiStep npArtiFlushVel npArtiAvgImpulse npArtiStepKernel npArtiSleep npArtiUpdateBodies npArtiSumBatches npArtiSumBatches2 npArtiSumSelfBatches npArtiSetupInternal npArtiSetupTendons npArtiSetupMimic npArtiSetupICKernel npArtiSolveTendons npArtiSolveTMKernel npArtiSolveExtTGS npArtiSolveExtPGS npArtiSolveSelf npArtiSolveInternal npArtiPropagate2 npArtiConstraintPrep npArtiJointPrep updateArticulationsBda solverTGS npArtiInverseDyn npArtiUpdateKin npArtiGetSet npPsMaterials npPsFluidDensity npPsFluidVelocity npPsSprings npPsAerodynamics npPsInflatable npPsBoundaryDensity psMeshMid psMeshMidphaseBda psHfCollide psHfMidphaseBda psSdfMidphaseBda npSdfTexture npSdfCollision npSdfFind npSdfParticle psDiffuseBuffers psDiffuseCreate psDiffuseAdvect psDiffuseOneWay
     # P9.15d: fcConvexTri joins the list because it and femClothContactGenBda now
     # compile the SAME lifted module (pxgSlangConvexTriCloth).  With only one of the
     # two stamped NoContraction the shared body was contracted differently in each,
@@ -918,6 +918,28 @@ pxg_compile_shader(femClothMeshMidphaseBda cloth_meshMidphaseGeneratePairsLaunch
 # absent from PXG_HLSL_ENTRIES.  IS in PXG_NOCONTRACT_SHADERS: the plane distances, the trim
 # lerps and the barycentric solve are mul-feeding-add chains.
 pxg_compile_shader(femClothMeshContactGenBda cloth_meshContactGenLaunch)
+# P9.26: the VERTEX half of the same cloth-vs-cooked-mesh block.  Steps 1 and 2 above are the
+# TRIANGLE half; the engine runs both, one after the other, off the same bounds and the same
+# intermediate stack (PxgNarrowphaseCore.cpp:6581/:6671 then :6724/:6814).
+#
+# The midphase is softBodyClothVertMidphaseBda's mirror image -- there a cloth VERTEX queries a
+# softbody tet tree, here it queries a cooked TRIANGLE tree -- and it reuses the shared BV32
+# reader (P8.25) rather than a fourth copy of the walk.  Reads the blob and the PxgFEMCloth
+# descriptor through Ptr<> and lowers the warp ballot to a groupshared collective, so it is
+# deliberately absent from PXG_HLSL_ENTRIES.  IS in PXG_NOCONTRACT_SHADERS: the vertex-space
+# round trip and the sphere bound are mul-feeding-add chains that a fixture compares bit-exactly.
+pxg_compile_shader(femClothMeshVertMidphaseBda cloth_midphaseVertexMeshLaunch)
+# The contact gen this midphase feeds emits NOTHING, and that is upstream's doing: the only
+# assignment to its `hasContacts` flag is commented out (femClothPrimitives.cu:3056), and
+# PxgOutputIndex skips its atomicAdd on an empty ballot, so neither a contact nor the count
+# moves.  Its one observable output is an atomicMax that sizes next frame's stack, and that is
+# what this shader implements; the dead closest-point geometry is deliberately NOT transcribed,
+# because no fixture here could tell a right transcription from a wrong one.
+#
+# NOT in PXG_NOCONTRACT_SHADERS, and not by oversight: the shader contains no floating-point
+# arithmetic at all, so there is no mul-feeding-add for -ffp-contract to fuse.  Add it the day
+# the geometry arrives.  gpuslang.disabledKernels is what will tell you that day has come.
+pxg_compile_shader(femClothMeshVertContactGenBda cloth_meshVertexContactGenLaunch)
 # P8.19: the FEM-vs-FEM ATTACHMENT pair -- the prepare that scatters each attachment into the
 # warp-strided PxgFEMFEMAttachmentConstraint block, and the solve that projects the two anchors
 # together with a barycentric-weighted inverse-mass split.  Simpler than its P8.3 rigid sibling:
@@ -2132,3 +2154,25 @@ add_test(NAME gpuslang.cudaTwinKernels
 # the driver's back end).  This check is the only thing in the build that can.
 add_test(NAME gpuslang.speculatedLoads
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_speculated_loads.py)
+
+# ---------------------------------------------------------------------------
+# Disabled engine kernels (P9.26).
+#
+# cloth_meshVertexContactGenLaunch computes a full contact and discards it: the
+# only assignment to its `hasContacts` flag is commented out upstream, and
+# PxgOutputIndex skips its atomicAdd on an empty ballot, so the kernel emits
+# neither contacts nor a count.  femClothMeshVertContactGenBda.slang therefore
+# implements the observable behaviour -- an empty walk and one atomicMax -- and
+# deliberately does NOT transcribe two hundred lines of dead closest-point
+# geometry that no fixture here could distinguish from a wrong transcription.
+#
+# That decision is correct only while the line stays commented, and NOTHING else
+# in this build would notice if it stopped being: the ABI row, the launch site
+# and the fixture all stay green while the engine starts emitting contacts the
+# port does not produce.  Same device as the twin-kernel check -- a fact about
+# someone else's source that this port depends on gets a check, not a comment.
+#
+# Its controls are drawn from real source: the live triangle siblings in the
+# same file must read as live, or a green run proves nothing.
+add_test(NAME gpuslang.disabledKernels
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_disabled_kernels.py)

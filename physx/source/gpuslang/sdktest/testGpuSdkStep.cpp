@@ -1779,7 +1779,8 @@ struct ClothScene
 // both -- see femClothContactGenBda.slang -- so what this scene proves is the
 // WIRING, which is the part no fixture can reach.
 ClothScene buildClothScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
-                           PxCudaContextManager* cudaCtx, bool convexFloor = false)
+                           PxCudaContextManager* cudaCtx, bool convexFloor = false,
+                           bool meshFloor = false)
 {
     ClothScene out;
     out.cudaCtx = cudaCtx;
@@ -1789,7 +1790,17 @@ ClothScene buildClothScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigid
     // rigidSumInternalContactAndJointBatches2 null-derefs the solver descriptors
     // with zero dynamic rigids, so one live dynamic body is required to keep that
     // proven path valid.  It rests at y=0.5, well below the cloth (spawned y~5).
-    if (convexFloor)
+    if (meshFloor)
+    {
+        // P9.26: a cooked TRIANGLE MESH floor.  The narrowphase routes
+        // eTRIANGLEMESH x the cloth to the cloth-vs-mesh chain, of which only the
+        // TRIANGLE half is mapped -- cloth_meshMidphaseGeneratePairsLaunch and
+        // cloth_meshContactGenLaunch, both P8.17.  Half-extent 8, not 30: the
+        // 2 x 2 cloth spawns above the origin and only needs to land well inside.
+        if (!addMeshFloor(physics, scene, rigidMat, 8.0f))
+        { std::printf("FAIL: addMeshFloor returned null\n"); return out; }
+    }
+    else if (convexFloor)
     {
         // Half-extent FOUR, not fifty.  A 50 x 0.5 x 50 slab is 100:1 and the
         // cooker refuses to build a GPU-compatible hull for it ("oblong shape"),
@@ -1807,8 +1818,13 @@ ClothScene buildClothScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigid
     // clear of the 2 x 2 cloth: it is a BOX, and a box under the cloth is served
     // by the already-mapped box path, which would carry the cloth and hide
     // whatever the convex path does or does not do.
+    // The live dynamic body is moved aside for BOTH non-box floors, for the
+    // reason P9.20 measured: it is a PxBoxGeometry, so a box under the cloth is
+    // served by the already-mapped box path and would carry the cloth whatever
+    // the floor does.
     addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
-               boxInertia(PxVec3(0.5f), 1000.0f), 1.5f, convexFloor ? 3.0f : 0.0f);
+               boxInertia(PxVec3(0.5f), 1000.0f), 1.5f,
+               (convexFloor || meshFloor) ? 3.0f : 0.0f);
 
     // Cook a small triangle GRID mesh.  buildGPUData + eENABLE_VERT_MAPPING are
     // MANDATORY: attachShape rejects a mesh whose getNbTriangleReferences()==0
@@ -5017,21 +5033,25 @@ int main()
     //     kernel unmapped  mean y ->  -73.8070, still accelerating at -0.65/step
     // The bar therefore sits at -2.0: four times the resting height and a
     // thirty-seventh of the free-fall figure.
-    if (!std::strcmp(sceneName, "clothbox") || !std::strcmp(sceneName, "clothconvex"))
+    if (!std::strcmp(sceneName, "clothbox") || !std::strcmp(sceneName, "clothconvex") ||
+        !std::strcmp(sceneName, "clothmesh"))
     {
         // `clothconvex` is `clothbox` with the ground BOX replaced by a cooked
         // CONVEX slab at the same height -- see buildClothScene.  It shares every
         // check below, because the two paths run the SAME body behind two engine
         // names, so anything that differs would be the routing or the manifest.
         const bool convexFloor = !std::strcmp(sceneName, "clothconvex");
-        ClothScene csc = buildClothScene(physics, scene, material, cudaCtx, convexFloor);
+        const bool meshFloor = !std::strcmp(sceneName, "clothmesh");
+        ClothScene csc = buildClothScene(physics, scene, material, cudaCtx, convexFloor,
+                                         meshFloor);
         if (!csc.surface || csc.numVerts == 0)
         {
             std::printf("[ FAIL ] gpu-sdk-step: %s scene build failed\n", sceneName);
             scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
         }
         std::printf("  [  OK  ] scene '%s' built: %u-vertex FEMCloth dropped onto the ground %s\n",
-                    sceneName, csc.numVerts, convexFloor ? "convex slab" : "box");
+                    sceneName, csc.numVerts,
+                    meshFloor ? "cooked triangle mesh" : (convexFloor ? "convex slab" : "box"));
         if (!std::getenv("PXG_GPU_STEP"))
         {
             std::printf("[  OK  ] gpu-sdk-step: clothbox pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
