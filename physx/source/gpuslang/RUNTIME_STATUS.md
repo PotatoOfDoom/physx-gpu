@@ -1713,6 +1713,164 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.24 — der Gitter-Hash im Diffus-Pfad: **vier** Fege-Durchgänge, und eine Prüfung, die grün war, während die Eigenschaft fehlte
+
+P9.18 hat `calcGridHashInBounds` an der ersten seiner **vier** lebenden
+Aufrufstellen festgenagelt und dabei aufgeschrieben, was offen bleibt: zwei
+Vorrichtungen fuhren weiter ein 1×1×1-Gitter, und der Engine-Spiegel „sollte
+GETEILT und nicht noch einmal abgeschrieben werden". Diese Tranche tut beides.
+Manifest unverändert **362**, Suite unverändert **820** (die Vorrichtung
+existierte schon), Szenen nicht gefahren — kein Shader, kein Manifest, keine
+ABI-Zeile angefasst.
+
+### Der geteilte Spiegel
+
+`tests/pxgGridCalRef.h` trägt jetzt die Engine-Abschrift — `calcGridPos`
+(`gridCal.cuh:34`), `calcGridHash` (`:46`, die Maske **vorzeichenbehaftet**, wie
+die CUDA sie schreibt), `calcWrappedGridRangeSize` (`:86`),
+`calcGridOffsetInRange` (`:97`), `calcGridHashInBounds`
+(`cudaParticleSystem.cu:96`) und `overlapBound` (`:84-93` + `PxBounds3.h:442`) —
+mit Zeilenangabe an jeder. `testPsConvexContactGen.cpp` liegt darauf und ist
+unverändert grün; die drei rig-spezifischen Umhüllungen bleiben dort, weil sie
+über die Gittergröße, Zellbreite und Zellgrenzen **jener** Vorrichtung schließen.
+
+### Was abgeschaltet war
+
+`testPsDiffuseContactGen` fuhr `mGridSizeX/Y/Z = 1` und sagte es dazu:
+„1x1x1 -> gridHash is always 0". Das ist keine Vereinfachung, das ist eine
+Abschaltung — mit einer Zelle klemmt `calcWrappedGridRangeSize` auf (1,1,1),
+`calcGridOffsetInRange` liefert (0,0,0) für **jeden** Versatz, und
+`calcGridHash` maskiert jede Komponente mit `(1-1) == 0`.
+
+**Nur die Grenzen mussten sich bewegen.** Die Grenzen eines Shapes speisen den
+Gitter-Hash und sonst nichts — die Ebenen-Kontaktrechnung nimmt die
+**Transformation** —, also ließ sich die Zellstruktur umbauen, ohne eine einzige
+der dreißig Ebenen-Erwartungen anzufassen.
+
+### Vier Durchgänge, und jeder Überlebende nannte eine Eigenschaft
+
+| Durchgang | Aufbau | Ergebnis |
+|---|---|---|
+| 1 | 2×2×1, drei Profile, vier Zellen | **6 getötet, 5 überlebt** |
+| 2 | 4×2×1, fünf Profile, abgeleitete Zellen | **9 getötet, 2 überlebt** |
+| 3 | + Profil F, x-Ausdehnung 17 | **9 getötet, 2 überlebt** |
+| 4 | Ebenen-Grenzen ±8 → ±40 | **10 getötet, 1 überlebt** |
+
+Die fünf Überlebenden des ersten Durchgangs waren keine fünf Zufälle. **Drei
+sind bei Gittergröße 2 strukturell unsichtbar**, und das auszurechnen ist, was
+die Vorrichtung repariert hat:
+
+* **`g3-hash-from-max-corner`** braucht eine Achse mit `1 < rs < S`. Bei `S = 2`
+  ist dieses Fenster **leer**: `rs == 1` erzwingt `gpMin == gpMax` (Min- und
+  Max-Ecke sind dieselbe Zelle), und `rs == 2` lässt die Versätze **beide**
+  Reste der Maske abdecken, also fallen die Zellmengen zusammen. Bei `S = 4` mit
+  `rs = 2` sind sie `{p, p+1}` gegen `{p+2, p+3}`.
+* **`g8-gridpos-trunc-not-floor`** braucht ein **negatives** `gpMin`, dessen
+  maskierter Wert sich bewegt. Bei `S = 2` gibt Abrunden −1 → 1 und Abschneiden
+  0 → 0, aber jedes Paar mit `rs == 2` deckt ohnehin beide Reste ab. Bei `S = 4`
+  wird daraus 3 gegen 0.
+* **`g11-cellwidth-one`** braucht eine Achse mit `rs == 1`, auf der
+  `floor(v/4)` und `floor(v/1)` auf **verschiedenen Resten** landen. Nahe null
+  tun sie das nicht (0,2 gibt beide Male 0); bei 4,2 geben sie 1 und 4. Daher
+  Profil **D**, das die ganze x-Ausdehnung eines Paars in Zelle 1 legt.
+* **`g7-offset-xy-swapped`** ist für **jedes** Paar unsichtbar, das seinen
+  vollen `rs.x · rs.y`-Block liest — das Vertauschen permutiert dann nur Zellen,
+  die das Paar ohnehin liest. Es braucht ein Paar, das eine **nicht-symmetrische
+  Teilmenge** liest: Profil **E** hat dieselbe Überlappung wie A, aber die
+  Vorrichtung meldet nur **zwei** Arbeitsindizes an, sodass der Kernel die
+  Versätze 0 und 1 besucht — (0,0) und (1,0), die das Vertauschen zu (0,0) und
+  (0,1) macht.
+* **`g5-mask-unsigned`** ist der eine **echt äquivalente**: `g.x & int(s.x - 1u)`
+  und `int(uint(g.x) & (s.x - 1u))` sind dieselben Bits. Ein bitweises UND kennt
+  kein Vorzeichen, und die Maske ist nicht negativ. Er bleibt als **verbuchter
+  Äquivalent** im Fegen stehen, nicht als offener Überlebender.
+
+### Der Durchgang, der eine Regression gefangen hat
+
+Durchgang 3 hat nichts getötet — und war trotzdem nötig. Das Verbreitern der
+x-Ausdehnung (für `g6`) hatte die Eigenschaft `1 < rs < gridSize` **zerstört**,
+von der `g3`s Sichtbarkeit abhängt. Gemerkt hat das nicht das Fegen, sondern die
+Invariantenprüfung Nummer 5, die genau dafür da ist:
+
+> „no pair has 1 < rs < gridSize on any axis -- the min and max corner then hash
+> to the same set and reading the wrong one is invisible"
+
+Profil **F** existiert, um sie wieder zu erfüllen. Ohne diese Prüfung hätte ich
+eine Vorrichtung ausgeliefert, die `g3` erneut durchlässt, und das Fegen hätte
+es nicht gezeigt, weil `g3` zu dem Zeitpunkt schon tot **aussah**.
+
+### Die Prüfung, die grün war, während die Eigenschaft fehlte
+
+Für `g6-range-not-clamped` hatte ich eine Prüfung geschrieben, die *überlegt*:
+gibt es ein Paar, dessen roher Bereich die Gittergröße übersteigt, und meldet es
+mehr Versätze an als die geklemmte x-Größe? Sie war **grün**, und `g6` überlebte
+trotzdem.
+
+Der Grund ist der Ertrag dieses Abschnitts: die Überlappung ist ein
+**Schnitt**. Eine Ebenen-Grenze von 8 kappt das Gebiet bei 8, ganz gleich wie
+weit das Partikelsystem reicht — der rohe x-Bereich war also exakt 4, die
+Klemmung griff nie, und die y-Klemmung (3 → 2) war unerreichbar, weil
+`off / rs.x` innerhalb einer Spanne von 8 nie bis 2 kommt. Meine Prüfung las die
+Ausdehnung des **Partikelsystems** statt die der Überlappung.
+
+Die Prüfung tut das jetzt nicht mehr. Sie **führt den Mutanten aus**: für jedes
+Paar und jeden angemeldeten Versatz rechnet sie den Hash mit und ohne Klemmung
+und verlangt, dass sich irgendwo eine Zelle unterscheidet.
+
+> Eine Prüfung, die über einen Mutanten **nachdenkt**, kann sich irren. Eine
+> Prüfung, die ihn **ausführt**, kann es nicht.
+
+Und sie trägt ihre eigene Negativkontrolle: mit den Ebenen-Grenzen zurück auf ±8
+fällt sie durch, mit der Meldung „dropping the clamp in
+calcWrappedGridRangeSize changes NO cell any pair reads".
+
+### Die Zellen werden ABGELEITET, nicht aufgeschrieben
+
+Jede Zelle, die irgendein Paar liest, bekommt eine **verschiedene**
+Partikelzahl (1, 2, … 8 in aufsteigender Zellnummer); ungelesene bleiben leer.
+Zwei Zellen mit gleicher Zahl sind austauschbar, und ein Tausch zwischen ihnen
+ist unsichtbar — P9.18 lief mit gleichmäßigen Achteln genau da hinein und musste
+seine Grenzen von Hand nachschneiden. Aus dem Orakel abzuleiten hält die
+Eigenschaft wahr, wenn sich die Profile ändern, und ist zulässig, weil der
+**Kernel** seine Hashes unabhängig rechnet: sind die beiden uneins, liest er
+andere Zellen und die Kontakte laufen auseinander.
+
+Diese Ableitung hat sofort etwas gefangen: die abgeleiteten Spannen brauchen
+**36** Partikel, der veröffentlichte Diffus-Bereich hatte **14**. Die Prüfung hat
+das in genau diesen Worten gemeldet — und in einer zweiten Runde, dass der
+Bereich **exakt** passen muss und nicht nur reichen darf, weil ein Partikel
+innerhalb des Bereichs und außerhalb jeder Zelle nichts berührt und ein Partikel
+ohne Kontakt keine falsche Zahl zeigen kann.
+
+### Verifikation
+
+* Fegen **10 von 11 getötet**, zwangsfrisch; der eine Überlebende ist
+  nachgewiesen äquivalent;
+* Vorrichtung grün mit **zehn** Invarianten, deren jede von einem Überlebenden
+  erzwungen wurde; die Zahlen: Gitter **4×2×1**, alle **8** Zellen gelesen,
+  Spannen 1…8 über **36** lebende Partikel, **108** Arbeitsindizes über 31 Paare,
+  **6** verschiedene Zellmengen, **5** Teilmengen-Paare, 289 Kontakte, Tiefenband
+  2…20 gegen eine Kappe von 12;
+* `testPsConvexContactGen` über den geteilten Header **unverändert** grün;
+* Suite **820/820** in **beiden** Speichermodi;
+* Szenen nicht gefahren — diese Tranche fasst nur Testdateien an, dieselbe
+  Begründung wie P9.18.
+
+### Was offen bleibt, mit Zahl
+
+Von den **vier** lebenden Aufrufstellen von `calcGridHashInBounds` in
+`psContactGenBda.slang` sind jetzt **drei** festgenagelt: `:1215` und `:1448`
+seit P9.18, `:888` seit dieser Tranche. Offen ist `:656`
+(`ps_primitivesCollisionLaunch`), gefahren nur von `testPsContactGen` — und
+diese Vorrichtung treibt **ein einziges** Partikel gegen **eine** Ebene, braucht
+also erst einen echten Partikelsatz. Das ist eine eigene Tranche und keine
+Fußnote; die Maschinerie dafür steht jetzt allerdings im geteilten Header.
+
+Die **Funktionen** selbst sind davon unberührt: sie sind gemeinsam, und dieses
+Fegen hat sie zehnfach getötet. Was an `:656` unbelegt bleibt, ist der Weg vom
+Rückgabewert zu `mCellStart[gridHash]` — dieselbe Unterscheidung, die P9.18 für
+die damals zwei offenen Stellen aufgeschrieben hat.
+
 ## P9.23 — der Korpus-Audit zu P9.22: 330 Stellen mit dem Muster, **fünf** davon ohne Schrankenweite, alle fünf erledigt — und ein Prüfer, der dreimal sich selbst widerlegt hat
 
 P9.22 fand die erste Stelle, an der eine korrekte Schranke die **Adressbildung**

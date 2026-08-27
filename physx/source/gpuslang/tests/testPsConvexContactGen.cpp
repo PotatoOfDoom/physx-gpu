@@ -77,6 +77,7 @@
 //   * output arrays with a poisoned margin past the contact capacity.
 
 #include "pxgTestFramework.h"
+#include "pxgGridCalRef.h"
 
 #include "host_defines.h"
 #include "PxgParticleSystem.h"
@@ -219,76 +220,26 @@ static constexpr uint32_t CELL_BOUNDS[5] = { 4u, 12u, 20u, 29u, 36u };
 static constexpr uint32_t NB_CELLS = 4u;
 
 // ---------------------------------------------------------------------------
-// THE GRID-HASH ORACLE, TRANSCRIBED FROM THE ENGINE -- NOT FROM OUR PORT.
+// THE GRID-HASH ORACLE lives in pxgGridCalRef.h (P9.24).
 //
-// Every line below comes from the CUDA in this repository, cited per function.
-// That distinction is the reason this oracle is admissible at all: a host mirror
-// of our own Slang would only prove the two agree with each other, which is what
-// a differential between two copies of the same mistake also proves.  gridCal.cuh
-// is an ENGINE header and cudaParticleSystem.cu an ENGINE kernel file, so this is
-// the same relationship every Phase-1 battery has to its reference.
-//
-// Integer arithmetic throughout except the initial floor, and the floors here sit
-// far from a cell boundary by construction (see the CHECK in checkRun), so this
-// is an exact oracle and not a tolerance.
+// P9.18 wrote it here, and wrote down at the same time that the other two
+// particle contact-gen fixtures still ran a 1x1x1 grid and that the mirror
+// "should be SHARED rather than transcribed again".  P9.24 is that: the engine
+// transcription -- calcGridPos, calcGridHash, calcWrappedGridRangeSize,
+// calcGridOffsetInRange, calcGridHashInBounds, overlapBound -- moved to the
+// header unchanged, and the three fixture-specific wrappers stayed here because
+// they close over THIS rig's grid size, cell width and cell boundaries.
 // ---------------------------------------------------------------------------
-struct I3 { int32_t x, y, z; };
-struct U3 { uint32_t x, y, z; };
+using pxgtest::gridcal::I3;
+using pxgtest::gridcal::U3;
 
-// gridCal.cuh:34
-static I3 gcCalcGridPos(const float p[3], float cellWidth)
-{
-    return I3{ int32_t(std::floor(p[0] / cellWidth)),
-               int32_t(std::floor(p[1] / cellWidth)),
-               int32_t(std::floor(p[2] / cellWidth)) };
-}
-
-// gridCal.cuh:46 -- the mask is signed, exactly as the CUDA writes it.
-static uint32_t gcCalcGridHash(I3 g, U3 s)
-{
-    g.x = g.x & int32_t(s.x - 1u);
-    g.y = g.y & int32_t(s.y - 1u);
-    g.z = g.z & int32_t(s.z - 1u);
-    return uint32_t((g.z * int32_t(s.y)) * int32_t(s.x) + g.y * int32_t(s.x) + g.x);
-}
-
-// gridCal.cuh:86
-static U3 gcCalcWrappedGridRangeSize(I3 mn, I3 mx, U3 s)
-{
-    auto cl = [](int32_t v, int32_t hi) { return uint32_t(v < 0 ? 0 : (v > hi ? hi : v)); };
-    return U3{ cl(mx.x - mn.x + 1, int32_t(s.x)),
-               cl(mx.y - mn.y + 1, int32_t(s.y)),
-               cl(mx.z - mn.z + 1, int32_t(s.z)) };
-}
-
-// gridCal.cuh:97
-static U3 gcCalcGridOffsetInRange(U3 rs, uint32_t off)
-{
-    return U3{ off % rs.x, (off / rs.x) % rs.y, off / (rs.x * rs.y) };
-}
-
-// cudaParticleSystem.cu:96 -- the composition, which is the thing P9.18 pins.
-static uint32_t gcCalcGridHashInBounds(const float bmn[3], const float bmx[3],
-                                       float cellWidth, uint32_t cellOffset, U3 gridSize)
-{
-    const I3 gpMin = gcCalcGridPos(bmn, cellWidth);          // calcGridRange, gridCal.cuh:105
-    const I3 gpMax = gcCalcGridPos(bmx, cellWidth);
-    const U3 rs = gcCalcWrappedGridRangeSize(gpMin, gpMax, gridSize);
-    const U3 off = gcCalcGridOffsetInRange(rs, cellOffset);
-    const I3 gp = I3{ gpMin.x + int32_t(off.x), gpMin.y + int32_t(off.y), gpMin.z + int32_t(off.z) };
-    return gcCalcGridHash(gp, gridSize);
-}
-
-// combine() + fattenFast(): cudaParticleSystem.cu:84-93 and PxBounds3.h:442.
-// The OVERLAP region of the two shapes, then grown by the pair's contact distance.
+// The overlap bound of two of THIS rig's shapes.
 static void gcOverlapBound(uint32_t shapeA, uint32_t shapeB, float cDistance,
                            float omn[3], float omx[3])
 {
-    for (int k = 0; k < 3; ++k)
-    {
-        omn[k] = std::max(SHAPE_BMN[shapeA][k], SHAPE_BMN[shapeB][k]) - cDistance;
-        omx[k] = std::min(SHAPE_BMX[shapeA][k], SHAPE_BMX[shapeB][k]) + cDistance;
-    }
+    pxgtest::gridcal::overlapBound(SHAPE_BMN[shapeA], SHAPE_BMX[shapeA],
+                                   SHAPE_BMN[shapeB], SHAPE_BMX[shapeB],
+                                   cDistance, omn, omx);
 }
 
 // The cell a given work item of a given pair reads.  `cellOffset` is
@@ -298,8 +249,9 @@ static uint32_t gcCellOfWorkItem(uint32_t shapeA, uint32_t shapeB, float cDistan
 {
     float omn[3], omx[3];
     gcOverlapBound(shapeA, shapeB, cDistance, omn, omx);
-    return gcCalcGridHashInBounds(omn, omx, GRID_CELL_WIDTH, cellOffset,
-                                  U3{ GRID_SIZE[0], GRID_SIZE[1], GRID_SIZE[2] });
+    return pxgtest::gridcal::calcGridHashInBounds(
+        omn, omx, GRID_CELL_WIDTH, cellOffset,
+        U3{ GRID_SIZE[0], GRID_SIZE[1], GRID_SIZE[2] });
 }
 
 // The particle span of cell h, as uploaded to mCellStart / mCellEnd.
