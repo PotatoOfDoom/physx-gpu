@@ -108,11 +108,46 @@ uint iterationsPerBlock(uint nbBodies)
     return (totalBlockRequired + (NB_BLOCKS - 1u)) / NB_BLOCKS;
 }
 
+// P9.22 -- THE INDEX IS CLAMPED BEFORE THE READ, AND THE GUARD IS APPLIED TO THE
+// VALUE AFTERWARDS.  This is not a style preference; the obvious spelling
+//
+//     if (workIndex >= nbBodies) return 0u;
+//     return counts[workIndex];
+//
+// is value-identical and CRASHES.  llvmpipe runs eight lanes per AVX register, so
+// a per-lane condition cannot be a real branch -- it has to become a mask.  The
+// generated code was measured (gdb, the faulting instruction itself):
+//
+//     cmp  %r8d,%r9d                       ; index vs bound
+//     sbb  %r10d,%r10d                     ; -> predicate
+//     kmovd %r10d,%k5
+//     vbroadcastss (%rax,%r9,4),%ymm2      ; THE LOAD, UNPREDICATED
+//     vblendvps %ymm15,%ymm2,%ymm9,%ymm2   ; the mask, applied AFTER
+//
+// The address is formed and dereferenced for lanes the guard excludes.  Under the
+// engine geometry (32 blocks x 512 threads x iterationsPerBlock) the work index
+// runs to 32768 while nbBodies is 20000, so the speculated read goes ~51 KB past
+// the end of the counts array.  Whether that lands on a mapped page is decided by
+// the process layout: with ASLR on it faulted 9 times in 200 runs, with
+// `setarch -R` 0 times in 120.  That is the whole of the "sporadic failure under
+// -j" this port carried as an open task since P8.13 -- it was never about -j, and
+// never about a race.
+//
+// Clamping the index makes the speculated load read a VALID element; the returned
+// value is unchanged because the select still discards it.  The nbBodies == 0
+// early-out is separate because it is UNIFORM across lanes, so it stays a real
+// branch and keeps the clamp from reading element 0 of an empty array.
+//
+// Upstream candidate 32 (llvmpipe speculating a buffer load for inactive lanes
+// rather than issuing a masked load).  Documented, NOT reported.
 uint countAt(Ptr<uint> counts, uint workIndex, uint nbBodies)
 {
-    if (workIndex >= nbBodies)
+    if (nbBodies == 0u)
         return 0u;
-    return counts[workIndex];
+    const bool inRange = workIndex < nbBodies;
+    const uint safeIndex = inRange ? workIndex : 0u;
+    const uint value = counts[safeIndex];
+    return inRange ? value : 0u;
 }
 
 // ---- kernel 1: per-block sums / sums-of-warp-maxes ----
