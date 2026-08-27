@@ -107,9 +107,14 @@ if [ "${1:-}" = "--diagnostics" ]; then
     echo
     echo "=== pending work (NOT scored: these name kernels that are not mapped yet;"
     echo "    each moves into the scored list when its chain lands) ==="
-    echo "    (empty since P9.14c -- particleconvex, the only entry this list has"
-    echo "     ever held, is scored above)"
-    for sc in ; do
+    echo "    clothconvex (P9.20) -- the cloth-vs-CONVEX chain needs TWO kernels and"
+    echo "    only one is mapped.  cloth_convexContactGenLaunch (the TRIANGLE path)"
+    echo "    landed in P9.20 as a proven CUDA twin of the box kernel; the VERTEX"
+    echo "    path, cloth_convexVertexContactGenLaunch, is NOT a twin (0.056 body"
+    echo "    similarity to its box counterpart) and is a port of its own.  Measured:"
+    echo "    with only the triangle path the cloth still falls through to -73.81,"
+    echo "    exactly as clothbox did before P9.15a landed ITS vertex kernel."
+    for sc in clothconvex; do
         echo "--- $sc"
         env PXG_SCENE=$sc PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
             | grep -E '^  particle |^  cooked |^  \[ diag \]|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step' \

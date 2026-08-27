@@ -733,7 +733,8 @@ pxg_compile_shader(femClothContactGenBda cloth_midphaseGenerateVertexPairsLaunch
                    cloth_SphereVertexContactGenLaunch
                    cloth_boxVertexContactGenLaunch
                    cloth_midphaseGeneratePairsLaunch
-                   cloth_boxTriangleContactGenLaunch)
+                   cloth_boxTriangleContactGenLaunch
+                   cloth_convexContactGenLaunch)
 # P7.1 tranche 4b-1: cloth-vs-rigid contact SORT / reorder on the engine ABI (BDA)
 # — the second half of the cloth-drape-on-a-floor arc.  The single reorder kernel
 # gathers the 4a-generated cloth-vs-rigid contacts into the sorted buffers through
@@ -2114,3 +2115,18 @@ endforeach()
 # checker is awake, not merely quiet.
 add_test(NAME gpuslang.barrierUniformity
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_barrier_uniformity.py)
+
+# ---------------------------------------------------------------------------
+# CUDA twin-kernel equivalence (P9.20).
+#
+# femClothContactGenBda.slang gives ONE body two entry points --
+# cloth_boxTriangleContactGenLaunch and cloth_convexContactGenLaunch -- because
+# the two engine kernels are the same kernel written twice.  Nothing else in
+# this build would notice if that stopped being true: their SIGNATURES are
+# checked (shared ABI row), their BODIES are not.  This is that signal.
+#
+# Like the barrier checker, it runs its own negative control first: a single
+# changed operand in one body must make the pair diverge, or the normalisation
+# has grown too generous to discriminate.
+add_test(NAME gpuslang.cudaTwinKernels
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_cuda_twin_kernels.py)

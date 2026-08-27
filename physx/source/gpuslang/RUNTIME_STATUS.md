@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **818/818** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **819/819** green in both modes (`ctest -N` in `build-gpuslang`).
 Szenen: **32/32** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (31 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
@@ -1706,6 +1706,116 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.20 — `cloth_convexContactGenLaunch` (Manifest **361**) ist derselbe Kernel wie der Box-Zwilling, mechanisch nachgewiesen — und die Szene dazu ist gebaut, aber **nicht** gewertet
+
+Manifest **360 → 361** ohne eine Zeile neuer Kontaktlogik: `cloth_convexContactGenLaunch`
+(`femClothPrimitives.cu:1898`) ist `cloth_boxTriangleContactGenLaunch` (`:3359`)
+**zweimal geschrieben**. Suite **818 → 819**, neuer Prüfer
+`tools/check_cuda_twin_kernels.py`, neue Szene `clothconvex` — in der Liste
+**ausstehender Arbeit**, nicht in der gewerteten.
+
+### Der Nachweis, und warum er mechanisch sein muss
+
+Mit entfernten Kommentaren und **einer** aufgeschriebenen Umbenennung
+unterscheiden sich die Kerne `clothBoxTriangleCollision` (`:3216`) und
+`clothConvexCollision` (`:1773`) an genau drei Stellen, von denen keine einen
+Wert ändert:
+
+* ein `const` an einem Zeiger;
+* eine **zweite Deklaration desselben** `triVertInds` aus demselben Feld, die die
+  Konvex-Kopie einfach weglässt;
+* `PxLoad3` über drei benannte Zwischenvariablen, die dann nach `v0/v1/v2`
+  kopiert werden, gegen `PxLoad3` direkt nach `v0/v1/v2`.
+
+Die Argument-Packs sind identisch, und **beide Startstellen**
+(`PxgNarrowphaseCore.cpp:5991` Box, `:6262` Konvex) übergeben denselben
+Filterpuffer — `simulationCore->getRigidClothFilters()` — obwohl der Parameter
+einmal `clothAttachmentPairs` und einmal `clothRigidPairs` heißt.
+
+Der Port schreibt den Rumpf deshalb **einmal** (`clothConvexTriCgBody`) und gibt
+ihm zwei Einsprungpunkte. Die Alternative — beide Manifest-Zeilen auf einen
+Einsprungpunkt zeigen zu lassen — wäre kleiner, würde aber **still weiter beide
+Namen bedienen**, falls NVIDIA die zwei CUDA-Rümpfe je auseinanderlaufen lässt.
+Die Signaturen sind gedeckt (gemeinsame ABI-Zeile); die **Rümpfe** wären es
+nicht.
+
+`check_cuda_twin_kernels.py` ist dieses fehlende Signal. Er leitet die
+Gleichheit bei jedem `ctest`-Lauf neu aus der CUDA her und sagt beim
+Auseinanderlaufen, welches Paar und welcher Unterschied übrig bleibt. Die
+Normalisierungsregeln stehen einzeln im Kopf, denn **je großzügiger die
+Normalisierung, desto weniger bedeutet der Prüfer** — und er trägt, wie der
+Barrieren-Prüfer aus P9.16, seine eigene Negativkontrolle: ein einziger
+geänderter Operand muss das Paar auseinanderfallen lassen.
+
+Upstream-Kandidat **31**: derselbe Kernel zweimal im Quelltext. Dokumentiert,
+**nicht** gemeldet.
+
+### Die Szene, und was sie mich vier Messungen gekostet hat
+
+`clothconvex` ist `clothbox` mit einem gekochten **Konvex**-Quader statt der
+Bodenbox. Der Weg dorthin ist der eigentliche Ertrag dieses Abschnitts, weil
+jede Zwischenmessung eine Annahme widerlegt hat:
+
+| Messung | Ergebnis | was falsch war |
+|---|---|---|
+| 1. Konvex-Boden, Halbmaß 50 | Ruhehöhe **identisch** mit und ohne Manifest-Zeile | der Kocher lehnt eine GPU-taugliche Hülle für 100:1 ab („oblong shape"), das Paar fällt in den CPU-Eimer — **die Vorrichtung hat es selbst gemeldet** („GPU-compatible: **NO**") |
+| 2. Halbmaß 4 (8:1) | Hülle GPU-tauglich, Ruhehöhe **weiter identisch** | — |
+| 3. Kontrolle: Box-Dreiecks-Zeile abschalten | `clothbox` fällt von 0.6871 auf **0.4933** | die Messmethode stimmt, also liegt es an der Szene |
+| 4. den dynamischen Würfel zur Seite | ohne die Zeile fällt das Tuch auf **−73.81** durch | der Würfel ist eine `PxBoxGeometry` **unter dem Tuch**, läuft also über den bereits abgebildeten **Box**-Pfad und trug das Tuch die ganze Zeit |
+
+Messung 3 ist die, ohne die ich die falsche Erklärung geglaubt hätte. „Zeile
+abschalten ändert nichts" hat zwei Ursachen — der Kernel läuft nicht, oder die
+Szene misst ihn nicht — und nur eine Kontrolle an einem Kernel, von dem man
+weiß, dass er trägt, trennt sie.
+
+### Und warum die Szene trotzdem nicht gewertet wird
+
+Auch **mit** abgebildeter Zeile fällt das Tuch durch. Der Grund ist gemessen und
+nicht vermutet: die Tuch-gegen-Konvex-Kette braucht **zwei** Kernel, und der
+zweite fehlt. `cloth_convexVertexContactGenLaunch` (`:2243`) ist **kein**
+Zwilling — Ähnlichkeit **0,056** zu seinem Box-Gegenstück, weil der Box-Pfad die
+geschlossene `sphereboxNormalPen`-Form nimmt und der Konvex-Pfad über GJK gegen
+die Hülle geht. Das ist ein eigener Port.
+
+Das ist exakt die Reihenfolge, die der Box-Pfad hatte: P9.15a landete den
+**Vertex**-Kernel und das Tuch blieb bei 0.4933 liegen; P9.15d/e landete den
+**Dreiecks**-Kernel und hob es auf 0.6871. Der Vertex-Pfad fängt das Tuch, der
+Dreieckspfad verfeinert.
+
+`clothconvex` steht deshalb in der Liste **ausstehender Arbeit** des
+Szenen-Läufers — der Liste, die seit P9.14c leer war und genau dafür existiert.
+Sie meldet pro Lauf, welche Kernel die Szene anfordert und nicht bekommt, und
+`clothconvex` wandert in die gewertete Liste, sobald der Vertex-Kernel landet.
+
+### Verifikation
+
+* `check_cuda_twin_kernels.py` **grün** über beide erklärten Paare, Selbsttest
+  bestanden; als `gpuslang.cudaTwinKernels` in `ctest` verdrahtet, Suite
+  **818 → 819**;
+* Suite **819/819** in **beiden** Speichermodi;
+* **kein neues Fegen**, und der Grund ist der Zwilling: der Rumpf ist derselbe,
+  den P9.15d mit 13 von 13 gefegt hat. Ein zweiter Durchgang über denselben Code
+  unter einem zweiten Namen misst nichts Neues — was er messen müsste, ist die
+  **Gleichheit der CUDA-Rümpfe**, und genau das tut der neue Prüfer;
+* Szenen: **LÄUFT NOCH** — Ergebnis im Folge-Commit statt einer ungemessenen
+  Zahl. Erwartet werden die 32 gewerteten unverändert plus `clothconvex` in der
+  Liste ausstehender Arbeit, wo es die zwei Kernel meldet, die es anfordert;
+* **ein Standardlauf der Suite fiel einmal durch**, vier unmittelbar folgende
+  Läufe (einer davon `PXG_DEVICE_V2=1`) waren 819/819. **Ich habe den Namen des
+  fehlgeschlagenen Tests nicht gefasst** — das Protokoll wurde vom
+  Wiederholungslauf überschrieben. Als weiterer Datenpunkt zur offenen Aufgabe
+  „sporadische Ausfälle unter `-j`" notiert, ohne so zu tun, als wüsste ich
+  mehr.
+
+### Was das über „identische Kernel" sagt
+
+Zwei Kernel, deren Rümpfe identisch sind, sehen wie eine Einladung aus, sie zu
+einem zusammenzufassen. Der Punkt ist nicht, ob man das darf — man darf —,
+sondern dass die Erlaubnis **an eine Tatsache über fremden Quelltext gebunden
+ist, die sich ändern kann, ohne dass hier irgendetwas rot wird**. Deshalb kostet
+diese Tranche mehr Zeilen im Prüfer als im Shader: das Ersparte war eine Kopie,
+das Riskierte war eine stille Divergenz, und nur das Zweite braucht Werkzeug.
 
 ## P9.19 — die Tuch-Dämpfung (Manifest **360**): drei Kernel, ein Feature, und eine Szene, deren Vorzeichen ich falsch erwartet hatte
 

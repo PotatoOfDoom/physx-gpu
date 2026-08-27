@@ -123,10 +123,17 @@ PxRigidStatic* addGroundBox(PxPhysics* physics, PxScene* scene, PxMaterial* mate
     return ground;
 }
 
+// `x` exists for P9.20's clothconvex: the live dynamic body every cloth scene
+// needs (see buildClothScene) is a BOX, and a box under the cloth is routed to
+// the eFemClothBox bucket and carries the cloth through the ALREADY-mapped box
+// path.  With it at the origin, turning the convex contact-gen off changed the
+// resting height by nothing and the scene proved nothing.  Moved aside, the only
+// thing the cloth can rest on is the convex slab.
 PxRigidDynamic* addDynamic(PxPhysics* physics, PxScene* scene, PxMaterial* material,
-                           const PxGeometry& geom, const PxVec3& inertia, float y)
+                           const PxGeometry& geom, const PxVec3& inertia, float y,
+                           float x = 0.0f)
 {
-    PxRigidDynamic* b = physics->createRigidDynamic(PxTransform(PxVec3(0.0f, y, 0.0f)));
+    PxRigidDynamic* b = physics->createRigidDynamic(PxTransform(PxVec3(x, y, 0.0f)));
     PxShape* s = physics->createShape(geom, *material);
     b->attachShape(*s);
     b->setMass(1000.0f);
@@ -1764,8 +1771,15 @@ struct ClothScene
     PxCudaContextManager* cudaCtx = nullptr;
 };
 
+// P9.20: `convexFloor` swaps the ground BOX for a cooked CONVEX slab whose top
+// face is at the same y = 0.  That one substitution is the whole `clothconvex`
+// scene, and it is a SHAPE-TYPE change, not a silhouette change: the
+// narrowphase routes eBOX x the cloth to CLOTH_BOX_TRIANGLE_CG and eCONVEXMESH
+// to CLOTH_CONVEX_CG, which is the manifest row P9.20 adds.  Same body behind
+// both -- see femClothContactGenBda.slang -- so what this scene proves is the
+// WIRING, which is the part no fixture can reach.
 ClothScene buildClothScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
-                           PxCudaContextManager* cudaCtx)
+                           PxCudaContextManager* cudaCtx, bool convexFloor = false)
 {
     ClothScene out;
     out.cudaCtx = cudaCtx;
@@ -1775,9 +1789,26 @@ ClothScene buildClothScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigid
     // rigidSumInternalContactAndJointBatches2 null-derefs the solver descriptors
     // with zero dynamic rigids, so one live dynamic body is required to keep that
     // proven path valid.  It rests at y=0.5, well below the cloth (spawned y~5).
-    addGroundBox(physics, scene, rigidMat);
+    if (convexFloor)
+    {
+        // Half-extent FOUR, not fifty.  A 50 x 0.5 x 50 slab is 100:1 and the
+        // cooker refuses to build a GPU-compatible hull for it ("oblong shape"),
+        // which drops the pair into the CPU bucket -- and then the cloth still
+        // lands, on the CPU, and the scene is green while proving nothing.  The
+        // fixture said so out loud ("GPU-compatible: NO") the first time; this is
+        // that message acted on.  Four is 8:1 and cooks GPU-compatible, and the
+        // 2 x 2 cloth spawns above the origin so it lands well inside.
+        if (!addConvexFloor(physics, scene, rigidMat, 4.0f))
+        { std::printf("FAIL: addConvexFloor returned null\n"); return out; }
+    }
+    else
+        addGroundBox(physics, scene, rigidMat);
+    // The live dynamic body.  In the CONVEX variant it is moved off to x = 3,
+    // clear of the 2 x 2 cloth: it is a BOX, and a box under the cloth is served
+    // by the already-mapped box path, which would carry the cloth and hide
+    // whatever the convex path does or does not do.
     addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
-               boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+               boxInertia(PxVec3(0.5f), 1000.0f), 1.5f, convexFloor ? 3.0f : 0.0f);
 
     // Cook a small triangle GRID mesh.  buildGPUData + eENABLE_VERT_MAPPING are
     // MANDATORY: attachShape rejects a mesh whose getNbTriangleReferences()==0
@@ -4986,16 +5017,21 @@ int main()
     //     kernel unmapped  mean y ->  -73.8070, still accelerating at -0.65/step
     // The bar therefore sits at -2.0: four times the resting height and a
     // thirty-seventh of the free-fall figure.
-    if (!std::strcmp(sceneName, "clothbox"))
+    if (!std::strcmp(sceneName, "clothbox") || !std::strcmp(sceneName, "clothconvex"))
     {
-        ClothScene csc = buildClothScene(physics, scene, material, cudaCtx);
+        // `clothconvex` is `clothbox` with the ground BOX replaced by a cooked
+        // CONVEX slab at the same height -- see buildClothScene.  It shares every
+        // check below, because the two paths run the SAME body behind two engine
+        // names, so anything that differs would be the routing or the manifest.
+        const bool convexFloor = !std::strcmp(sceneName, "clothconvex");
+        ClothScene csc = buildClothScene(physics, scene, material, cudaCtx, convexFloor);
         if (!csc.surface || csc.numVerts == 0)
         {
-            std::printf("[ FAIL ] gpu-sdk-step: clothbox scene build failed\n");
+            std::printf("[ FAIL ] gpu-sdk-step: %s scene build failed\n", sceneName);
             scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
         }
-        std::printf("  [  OK  ] scene 'clothbox' built: %u-vertex FEMCloth dropped onto the ground box\n",
-                    csc.numVerts);
+        std::printf("  [  OK  ] scene '%s' built: %u-vertex FEMCloth dropped onto the ground %s\n",
+                    sceneName, csc.numVerts, convexFloor ? "convex slab" : "box");
         if (!std::getenv("PXG_GPU_STEP"))
         {
             std::printf("[  OK  ] gpu-sdk-step: clothbox pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
@@ -5060,7 +5096,7 @@ int main()
                         "the vertex path cannot see\n", yEnd, maxSettleStep, yEnd);
             return 0;
         }
-        std::printf("[ FAIL ] gpu-sdk-step: clothbox checks failed (%d)\n", failures);
+        std::printf("[ FAIL ] gpu-sdk-step: %s checks failed (%d)\n", sceneName, failures);
         return 2;
     }
 

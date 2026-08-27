@@ -1607,6 +1607,12 @@ static const PxgKernelAbiRow kRows[] = {
     // kSbMidphasePrimitives { 4,4,8,8,8,8,8,8,4,8,8 } must NOT be reused.
     { "cloth_midphaseGeneratePairsLaunch", kClothTriMidphase, uint32_t(sizeof(kClothTriMidphase)) },
     { "cloth_boxTriangleContactGenLaunch", kClothBoxTriCg, uint32_t(sizeof(kClothBoxTriCg)) },
+    // P9.20: the SAME row, deliberately.  cloth_convexContactGenLaunch takes a
+    // byte-identical 15-argument pack (femClothPrimitives.cu:1898 vs :3359) --
+    // including the PxgFEMContactWriter by value whose paramAlign is 16, not 8
+    // (P9.15e).  Sharing the row is what keeps that correction from having to be
+    // rediscovered on the second name.
+    { "cloth_convexContactGenLaunch", kClothBoxTriCg, uint32_t(sizeof(kClothBoxTriCg)) },
     // gpunarrowphase FEMCloth-vs-rigid contact SORT / reorder (P7.1 tranche 4b-1 BDA)
     { "fem_reorderRigidContactsLaunch", kFemReorderRSContacts, uint32_t(sizeof(kFemReorderRSContacts)) },
     // gpusimulationcontroller FEMCloth-vs-rigid contact PREPARE + query/solve (P7.1 tranche 4b-2/3 BDA)

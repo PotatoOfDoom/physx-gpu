@@ -1178,9 +1178,33 @@ void cloth_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
 static const uint BTRI_GRID = 4096u;
 static const uint BTRI_WARPS_PER_BLOCK = 2u;
 
-[shader("compute")]
-[numthreads(32, 2, 1)]
-void cloth_boxTriangleContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+// P9.20 -- THE BODY IS SHARED BY TWO ENGINE KERNELS, and that is a MEASURED
+// claim about the CUDA rather than a convenience.
+//
+// cloth_boxTriangleContactGenLaunch (femClothPrimitives.cu:3359) and
+// cloth_convexContactGenLaunch (:1898) are the same kernel written twice.  With
+// comments stripped and one variable rename applied, their cores --
+// clothBoxTriangleCollision (:3216) and clothConvexCollision (:1773) -- differ in
+// exactly three places, none of which changes a value:
+//
+//   * one `const` qualifier on a pointer;
+//   * a redundant SECOND declaration of the same `triVertInds` pointer, reading
+//     the same field, which the convex copy simply omits;
+//   * `PxLoad3` into three named temporaries that are then copied into v0/v1/v2,
+//     versus `PxLoad3` straight into v0/v1/v2.
+//
+// Their argument packs are identical, and both launch sites in
+// PxgNarrowphaseCore.cpp (:5991 box, :6262 convex) pass the SAME filter buffer --
+// simulationCore->getRigidClothFilters() -- despite naming the parameter
+// `clothAttachmentPairs` in one and `clothRigidPairs` in the other.
+//
+// So this port writes the body ONCE and gives it two entry points.  The
+// alternative -- pointing both manifest rows at a single entry -- would be
+// smaller still, but it would silently keep serving both names if NVIDIA ever
+// diverges the two CUDA bodies.  tools/check_cuda_twin_kernels.py is the guard:
+// it re-derives the equivalence from the CUDA on every ctest run and fails when
+// it stops holding.  Documented as upstream candidate 31; NOT reported.
+void clothConvexTriCgBody(uint3 gtid, uint3 gid)
 {
     // The module's driver is per-thread; lane 0 owns the pair.
     if (gtid.x != 0u)
@@ -1277,4 +1301,20 @@ void cloth_boxTriangleContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
     // B4: the UNCLAMPED count, in bytes, by one thread of the grid.
     if (globalWarpIdx == 0u)
         InterlockedMax(Ptr<uint>(gBTri.stackSizeNeeded)[0], numFound * 16u);
+}
+
+// The two engine names.  Same block shape, same push-constant blob, same ABI row
+// (kClothBoxTriCg) -- see the note above for why they are two and not one.
+[shader("compute")]
+[numthreads(32, 2, 1)]
+void cloth_boxTriangleContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    clothConvexTriCgBody(gtid, gid);
+}
+
+[shader("compute")]
+[numthreads(32, 2, 1)]
+void cloth_convexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    clothConvexTriCgBody(gtid, gid);
 }
