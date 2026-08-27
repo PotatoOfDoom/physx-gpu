@@ -1848,10 +1848,11 @@ unter dem gedämpften.
 * `PXG_SLANG_KERNEL_MAPPED` von 357 auf **360** nachgezogen — die drei
   Buchführungstests (`p3KernelWrangler`, `p4Manifest`, `p4Wrangler`) haben die
   Abweichung sofort gemeldet, was genau ihr Zweck ist;
-* Szenen: **LÄUFT NOCH** — Ergebnis im Folge-Commit, statt hier eine ungemessene
-  Zahl zu behaupten. Die beiden Zahlen, um die es geht (0.006395 / 0.074761),
-  stehen oben und sind einzeln gemessen; offen ist nur, ob die anderen 31 Szenen
-  vom neuen Manifest-Eintrag unberührt bleiben.
+* Szenen: **32 ok, 0 fail, 0 missing** — nachgetragen, nachdem der Lauf durch
+  war; bis dahin stand hier ausdrücklich „läuft noch". `clothdamp` ist die
+  zweiunddreißigste und grün; die anderen einunddreißig sind vom neuen
+  Manifest-Eintrag unberührt, was die offene Frage war (die beiden Zahlen
+  0.006395 / 0.074761 standen schon vorher, weil sie einzeln gemessen waren).
 
 ### Was das über „das Vorzeichen ist doch klar" sagt
 
