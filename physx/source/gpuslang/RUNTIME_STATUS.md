@@ -7,11 +7,14 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **820/820** green in both modes (`ctest -N` in `build-gpuslang`).
-P9.23 added `gpuslang.speculatedLoads`, the third static checker in the suite
-after `gpuslang.barrierUniformity` (P9.16) and `gpuslang.cudaTwinKernels`
-(P9.20) — all three exist because no fixture and no mutant can see what they
-check.
+Test count: **821/821** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.26 added `gpuslang.disabledKernels`, the fourth static checker in the suite
+after `gpuslang.barrierUniformity` (P9.16), `gpuslang.cudaTwinKernels` (P9.20)
+and `gpuslang.speculatedLoads` (P9.23) — all four exist because no fixture and
+no mutant can see what they check.  The newest one keeps a fact about SOMEONE
+ELSE'S source true: `cloth_meshVertexContactGenLaunch` emits nothing because its
+only `hasContacts` assignment is commented out upstream, and this port
+implements it that way.
 Szenen: **33/33** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (32 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
@@ -23,7 +26,10 @@ hinzu, weil keine Tuch-Szene ein Flächenmaterial mit Dämpfung setzte und der
 senkrechte Vorhang aus `clothhang` von Anfang an ruht; `clothconvex` kam in P9.20
 als ausstehende Arbeit hinzu und ist seit P9.21 gewertet, weil erst der
 VERTEX-Kernel das Tuch auf der Konvex-Platte fängt.  Die Liste der ausstehenden
-Arbeit ist **leer**.  Die
+Arbeit trägt seit P9.26 wieder einen Eintrag: `clothmesh`, und der wartet
+ausnahmsweise **nicht** auf diesen Port — die Kette ist vollständig abgebildet,
+aber ihr Vertex-Erzeuger ist upstream abgeschaltet, und das Tuch fällt mit
+beiden neuen Kerneln auf **exakt** dieselbe Zahl wie ohne sie.  Die
 Diagnoseliste trägt jetzt wieder nur die sechs Kontrollen, die durchfallen
 SOLLEN, weil sie die Referenz der echten Prüfung sind.  P9.9 fügte `particlefluidboundary` hinzu, P9.10c
 `particlemeshfloor`, P9.11c `particlehffloor`.
@@ -1712,6 +1718,208 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.26 — die VERTEX-Hälfte der Tuch-gegen-Netz-Kette, und ein Kernel, den die Engine selbst abgeschaltet hat
+
+P8.17 hat die **Dreiecks**-Hälfte von Tuch gegen gekochtes Dreiecksnetz abgebildet
+(`cloth_meshMidphaseGeneratePairsLaunch`, `cloth_meshContactGenLaunch`). Diese
+Tranche bildet die **Vertex**-Hälfte ab (`cloth_midphaseVertexMeshLaunch`,
+`cloth_meshVertexContactGenLaunch`). Die Engine fährt beide nacheinander, aus
+denselben Grenzen und über denselben Zwischenstapel. Manifest **362 → 364**,
+Suite **820 → 821**.
+
+### Die Mittelphase ist eine vollständige Abschrift
+
+Ein BV32-Lauf je Tuch-Vertex mit einer **Kugel**-Anfrage, der **jeden** Treffer
+über Ballot + ein `atomicAdd` + ausschließenden Präfix auf den Stapel schiebt.
+Sie unterscheidet sich vom Dreiecks-Geschwister in vier Punkten, deren jeder eine
+plausible Verwechslung mit der Datei nebenan ist — und jeder bekommt eine
+Anfrage, deren Urteil unter der Regel des Geschwisters **kippt**:
+
+* **kein Vorderseiten-Gatter und kein SAT.** Der Blatt-Test ist die eigene
+  Hüllbox des Dreiecks gegen die Kugelgrenze, mehr nicht. Im Blatt von Vertex 0
+  liegt ein **rückseitiges** Dreieck, das das Geschwister wegwirft; hier muss es
+  **bleiben** — Vertex 0 erwartet also **zwei** Paare, nicht eines.
+* **keine Vierer-Auswahl.** `pushOntoStackFullWarp` hat gar keine Reduktion. Im
+  Blatt von Vertex 1 liegen **sechs** qualifizierende Dreiecke, und alle sechs
+  müssen heraus.
+* **der Radius wird NICHT durch die Skalierung geteilt.** min|scale| ist 0,5, die
+  Softbody-Lesart gäbe also ein Band von 0,40 statt 0,20 — und Vertex 2 sitzt bei
+  **0,28**, innerhalb des falschen und außerhalb des richtigen.
+* **die Anfrage ist EIN Vertex.** Die Drehung ist **neunzig** Grad um y und nicht
+  hundertachtzig, weil 180 seine eigene Umkehrung ist und `rotate` dann
+  unbemerkt für `rotateInv` einspringen könnte — dieselbe Messung, die das
+  Geschwister aufgeschrieben hat.
+
+### Die Kontakterzeugung ist absichtlich **keine** vollständige Abschrift
+
+`cloth_meshVertexContactGenLaunch` rechnet für jedes Paar einen nächsten Punkt,
+eine Normale, eine Durchdringung und eine Baryzentrik — und wirft alles weg. Der
+Schreibvorgang hängt an `hasContacts`, und die **einzige** Zuweisung an
+`hasContacts` im ganzen Kernel ist **auskommentiert** (`femClothPrimitives.cu:3056`):
+
+```
+bool hasContacts = false;                       // :2940
+...
+        contact = make_float4(...);
+        //hasContacts = true;                   // :3056  <-- AUSKOMMENTIERT
+```
+
+`PxgOutputIndex` (`:79`) führt sein `atomicAdd` nur bei einer Bevölkerungszahl
+größer null aus, also bewegt sich auch der **Kontaktzähler** nicht. Die gesamte
+beobachtbare Ausgabe des Kernels ist ein `atomicMax`, das den Zwischenstapel des
+nächsten Bildes bemisst. Aufrufstelle, Argumentpaket und die erzeugende
+Mittelphase laufen dabei **jeden Schritt**. Das ist Upstream-Kandidat 33;
+dokumentiert, **nicht gemeldet**.
+
+Die tote Geometrie abzuschreiben hieße zweihundert Zeilen hinzuzufügen, die
+**keine** Vorrichtung hier prüfen könnte: das einzige Beobachtbare ist „keine
+Kontakte", und das erfüllt jede Implementierung von totem Code gleich gut.
+
+> Ungeprüfter Code, der geprüft **aussieht**, ist schlimmer als fehlender Code,
+> der sagt, dass er fehlt.
+
+### Also bekommt die Tatsache eine Prüfung und keinen Kommentar
+
+`tools/check_disabled_kernels.py` leitet den abgeschalteten Zustand bei **jedem**
+ctest-Lauf neu aus der eingelagerten CUDA ab. Es fällt durch, wenn die Zeile
+wieder **aktiviert** wird, wenn sie **gelöscht** wird (dann wurde der Kernel
+umgeschrieben, und die Lesart dieses Ports ist so oder so veraltet), wenn der
+Schreibvorgang nicht mehr am Merker hängt, und wenn `PxgOutputIndex` sein
+`atomicAdd` nicht mehr an einer Bevölkerungszahl größer null festmacht.
+
+Seine **Kontrollen stammen aus echter Quelle**: die lebenden Dreiecks-Geschwister
+in derselben Datei müssen als *lebend* gelesen werden, sonst bedeutet ein grüner
+Lauf nichts. Der Selbsttest geht **beide** Richtungen an den echten Rümpfen — die
+tote Zeile einkommentieren muss LIVE ergeben, die lebende auskommentieren
+DISABLED. Fünf Mutationen der eingelagerten CUDA wurden dagegen gefahren; alle
+fünf fallen mit der **richtigen** Diagnose durch.
+
+`cloth_heightfieldVertexContactGenLaunch` (`:2581`) ist auf dieselbe Weise
+abgeschaltet und wird als **Hinweis** gemeldet, nicht als Sperre: dieser Port
+deckt ihn nicht ab, und eine Prüfung, die für eine Änderung durchfällt, die nichts
+bricht, erzieht dazu, Prüfungen zu ignorieren.
+
+### Dasselbe Prinzip hat Code aus dem Port entfernt, nicht nur aus der Abschrift
+
+Die Hülle trug zuerst die Gitterschleife der CUDA als **leeren Lauf**, „damit die
+Form stimmt". Das Fegen fand `stackSizeBytes / 16` → `/ 4` als **Überlebenden** —
+natürlich: die Klemmung speist nur die Schranke einer Schleife ohne Rumpf. Das
+ist derselbe Einwand im Kleinen. Die Schleife steht jetzt in Prosa, und im Code
+steht, was Ausgabe erzeugt.
+
+### Zwei Fegen, und der erste Durchgang nannte neun Eigenschaften
+
+| Fegen | Ergebnis |
+|---|---|
+| Mittelphase, Durchgang 1 | 28 von 37 getötet, **9 überlebt** |
+| Mittelphase, Durchgang 2 | **37 von 38 getötet** |
+| Kontakterzeugung | **9 von 12 getötet**, 3 = eine Äquivalenz |
+
+Die neun Überlebenden waren keine neun Zufälle — jeder nannte eine Eigenschaft,
+die der Vorrichtung fehlte:
+
+* **die Wicklung** verbarg `min(b0, b1)`: jedes Dreieck war so gewickelt, dass b0
+  und b1 den dritten Punkt bereits einklammerten. Zwei neue Dreiecke tragen ihr
+  Extrem im **dritten** Punkt, eines je Richtung;
+* **keine Trennung allein in z** — eine Achse konnte ersatzlos entfallen;
+* **keine exakt berührende Grenze**: `>` und `>=` sind nur an einem Punkt
+  unterscheidbar, dessen Welt-Rundreise **bitgenau** ist, und das ist der
+  Vertex-Ursprung, weil `toWorld(0)` die Verschiebung und sonst nichts ist;
+* **kein Nachbar außerhalb des Blattes**: nur `lane < nbPrimitives` hält Bahn 1
+  von der nächsten Primitive ab, und die lag nirgends im Weg;
+* **ein Kind je Anfrage** — damit waren die Stapel-Reihenfolge (LIFO) und das
+  **Aufsummieren** von `nbStack` beide unsichtbar. Vertex 5 sieht jetzt ein Blatt
+  **und** das innere Kind, und das innere ist absichtlich das **spätere**, damit
+  es expandiert wird, während noch ein Eintrag aussteht;
+* **ein Ballot nie größer als die Kapazität**: die enge Kapazität steht jetzt auf
+  **4**, unter der größten Einzelanmeldung von 6;
+* **weniger als 1024 Vertices** — die Schleife schreitet um `blockDim.y *
+  gridDim.x` = 2048, und mit einer Handvoll Vertices ist die Gitterbreite allein
+  (1024, die naheliegende falsche Lesart) ununterscheidbar. Das Tuch hat jetzt
+  **1100** Vertices, davon **76** jenseits von 1024 auf der Anfrage von Vertex 4,
+  die eine halbierte Schrittweite **doppelt** besuchen würde.
+
+### Der eine Überlebende wird AUSGEFÜHRT, nicht bestritten
+
+Die y-Terme aus dem **Knoten**-Boxtest zu streichen überlebt, und der Grund ist
+echt: eine gekochte BV32-Kinderbox **enthält** ihren Teilbaum, ein Lockern kann
+also nur zusätzliche **Abstiege** erzeugen, nie zusätzliche Ausgaben. Das
+**Verschärfen** ist etwas anderes und wird getötet.
+
+Aber das ist ein Argument, und P9.24 hat vier Fegen dafür bezahlt zu lernen, dass
+ein Argument über einen Mutanten falsch sein kann, wo sein **Ausführen** es nicht
+kann. Die Referenz läuft daher **mit und ohne** diese Terme, und die Vorrichtung
+verlangt, dass beide Paarmengen übereinstimmen. Das ist keine Tautologie: es gilt,
+**weil** die Boxen ihre Teilbäume enthalten — und eine Negativkontrolle (eine Box
+unter ihren Inhalt geschrumpft) lässt sowohl diese Prüfung als auch die
+Enthaltungs-Invariante durchfallen.
+
+Die Enthaltungs-Invariante hat sofort einen echten Fehler gefangen: ein Blatt ist
+ein **zusammenhängender** Lauf `[start, start+count)`, und eine Attrappe, die
+hinter dem Stapel des nächsten Blattes angehängt war, hatte ein fremdes Dreieck in
+den Bereich von Blatt 0 gelegt.
+
+### Die drei Überlebenden der Hülle sind EINE Äquivalenz
+
+Das Wächter-Gatter `globalThreadIdx == 0` zu verbreitern — auf alle Bahnen, auf
+alle Blöcke, oder ganz zu streichen — ändert nichts: das Argument von
+`InterlockedMax` hängt weder vom Block noch von der Bahn ab, und `atomicMax` mit
+einem einheitlichen Wert ist **idempotent**. Es ist eine Maßnahme gegen Konkurrenz,
+keine semantische. Verbucht als eine Äquivalenz, nicht als drei Überlebende.
+
+Dass ein Mutant, der **irgendeinen** der ABI-Paritäts-Zeiger liest, mit einem
+Speicherfehler stirbt, ist das, was „dieser Kernel liest keinen davon" zu einer
+**Messung** macht statt zu einer Behauptung.
+
+### Verifikation
+
+* Fegen Mittelphase **37 von 38** und Kontakterzeugung **9 von 12**, beide
+  zwangsfrisch; alle vier Überlebenden sind nachgewiesene Äquivalente, einer davon
+  durch **Ausführen** in der Vorrichtung;
+* fünf Mutationen der eingelagerten CUDA gegen `check_disabled_kernels.py`, jede
+  mit der richtigen Diagnose, plus eine Negativkontrolle für die Vorrichtung;
+* Suite **821/821** in **beiden** Speichermodi;
+* Szenen **33/33** grün, nach Neubau von `build-sdk` (das Manifest hat sich
+  geändert);
+* `clothmesh` steht als **ausstehende Arbeit** in `run_scenes.sh`, ungewertet.
+
+### Die Vorhersage, und ihre Messung
+
+Vor dieser Tranche habe ich aufgeschrieben: *„der Dreiecks-Zweig schreibt, der
+Vertex-Zweig nicht. Damit wird der Port zum **Experiment** — ich sage voraus,
+dass die Szene sich nicht ändert, und messe das."*
+
+Mit **beiden** Kerneln abgebildet fällt das Tuch auf **−39,3333** bei
+|dy| = **0,452011**. Das ist die Zahl von vorher, **auf die Stelle genau**. Zwei
+neu abgebildete Kernel, ein Manifest um zwei gewachsen, und die Bahn des Tuchs
+ist bitgleich.
+
+Das ist der Beweis, den die Quelle allein nicht liefern kann: nicht *gelesen*,
+dass die Zuweisung auskommentiert ist, sondern **gemessen**, dass der Kernel in
+der laufenden Engine nichts schreibt.
+
+`clothmesh` wandert deshalb **nicht** in die gewertete Liste, und es steht auch
+nicht aus derselben Sorte Grund wie `clothconvex` in P9.20 dort stand. Damals
+fehlte ein Kernel; jetzt fehlt **keiner** — die Kette ist vollständig abgebildet.
+Was fehlt, ist eine Zuweisung in fremdem Quelltext. Nach dem Ordnungsgesetz aus
+P9.15a/P9.21 — *der VERTEX-Pfad fängt das Tuch, der DREIECKS-Pfad verfeinert* —
+kann eine Kette ohne Vertex-Erzeuger kein Tuch fangen. Die Dreiecks-Hälfte
+schreibt durchaus (Freifall wäre etwa 0,65 je Schritt, gemessen sind 0,45), sie
+hält es nur nicht allein.
+
+Diese Szene zu werten hieße, eine auskommentierte Zeile eines anderen zu werten.
+Sie wird stattdessen **gefahren und gemessen**, und
+`tools/check_disabled_kernels.py` lässt den Bau an dem Tag durchfallen, an dem
+sich die Zeile ändert.
+
+### Was offen bleibt
+
+Das Manifest steht bei **364 von 501** (72,7 %); **137** bleiben unabgebildet. Die
+Upstream-Kandidaten stehen bei **34** — dokumentiert, **nicht gemeldet**;
+Kandidat 33 ist der abgeschaltete Kernel selbst, Kandidat 34 der `isMesh`-Zweig
+der Mittelphase, dessen beide Arme dieselbe Ausdrucksform tragen, weil der
+Ebenentest dazwischen auskommentiert ist (`femClothMidPhase.cu:366-378`).
 
 ## P9.25 — die vierte und letzte Aufrufstelle: `calcGridHashInBounds` ist vollständig festgenagelt, und der Entwurf aus P9.24 trug beim ersten Durchgang
 

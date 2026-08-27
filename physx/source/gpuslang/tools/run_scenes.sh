@@ -110,10 +110,23 @@ if [ "${1:-}" = "--diagnostics" ]; then
     echo
     echo "=== pending work (NOT scored: these name kernels that are not mapped yet;"
     echo "    each moves into the scored list when its chain lands) ==="
-    echo "    (empty -- clothconvex moved into the scored list in P9.21, when"
-    echo "     cloth_convexVertexContactGenLaunch landed and the cloth stopped"
-    echo "     falling through the slab.  The block stays for the next scene that"
-    echo "     names a kernel before the port has one.)"
+    echo "    clothmesh -- and it is NOT waiting on this port.  P9.26 mapped the last"
+    echo "     two kernels of the cloth-vs-cooked-mesh chain, and the cloth still falls"
+    echo "     to -39.3333 with |dy| = 0.452011: EXACTLY the figure measured before they"
+    echo "     were mapped, to the digit.  That is the tranche's experiment and its"
+    echo "     result.  cloth_meshVertexContactGenLaunch emits no contacts because its"
+    echo "     only \`hasContacts\` assignment is commented out upstream, and by the"
+    echo "     ordering law P9.15a/P9.21 measured -- the VERTEX path catches the cloth,"
+    echo "     the TRIANGLE path refines -- a chain with no vertex producer cannot catch"
+    echo "     one.  The triangle half does write (free fall is ~0.65 per step, this is"
+    echo "     0.45), it just cannot hold it alone.  Scoring the scene would mean scoring"
+    echo "     someone else's commented-out line, so it stays here and is measured."
+    echo "     tools/check_disabled_kernels.py fails the build the day that line changes."
+    echo "--- clothmesh"
+    # NOT run_one: that increments the pass/fail counters this script exits on, and a
+    # pending scene must never decide the sweep's verdict.  Printed, like the controls.
+    env PXG_SCENE=clothmesh PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
+        | grep -E '^  clothmesh:|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step' | sed 's/^/    /'
 fi
 
 [ "$fail" -eq 0 ] && [ "$missing" -eq 0 ]
