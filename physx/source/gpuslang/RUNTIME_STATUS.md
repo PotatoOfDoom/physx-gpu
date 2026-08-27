@@ -1846,10 +1846,12 @@ der Platte liegt bei y = 0, und in `clothconvex` steht der einzige dynamische
 Körper bei x = 3 (P9.20 hat ihn dorthin verschoben) — das Tuch ruht also auf
 einem **statischen** Konvex, und der Positions-Projektionsschritt setzt jeden
 Vertex exakt auf die Ebene, weshalb der Mittelwert exakt darauf liegt und sich
-nicht mehr bewegt. `clothbox` ruht dagegen bei 0,6871 mit \|dy\| ≈ 0,0020 auf
-einem **dynamischen** Kasten, der selbst zappelt. Der Aufbau-Unterschied ist im
-Szenenbauer nachlesbar; dass er die Ursache der ruhigen Null ist, ist daraus
-**geschlossen** und nicht durch ein eigenes Experiment isoliert.
+nicht mehr bewegt. `clothbox` ruht dagegen bei **0,6871** mit \|dy\| =
+**0,001962** auf einem **dynamischen** Kasten, der selbst zappelt — in dieser
+Tranche nachgemessen und nicht aus dem Quelltextkommentar abgeschrieben. Der
+Aufbau-Unterschied ist im Szenenbauer nachlesbar; dass er die Ursache der ruhigen
+Null ist, ist daraus **geschlossen** und nicht durch ein eigenes Experiment
+isoliert.
 
 ### Nebenbei: die Modul-Abhängigkeitsliste war um zwanzig Einträge veraltet
 
@@ -1875,9 +1877,13 @@ Kleber-Fehler genannt. Die Liste ist jetzt ein `file(GLOB ... CONFIGURE_DEPENDS)
   grün — das ist es, was die Hebung verifiziert;
 * Suite **819/819** in **beiden** Speichermodi;
 * `PXG_SLANG_KERNEL_MAPPED` von Hand 361 → **362**;
-* Szenen: **LÄUFT NOCH** — Ergebnis im Folge-Commit, statt hier eine ungemessene
-  Zahl zu behaupten. `clothconvex` selbst ist einzeln gemessen (die Tabelle oben,
-  mitsamt Kontrolle); offen ist der vollständige Durchlauf über alle 33.
+* Szenen: **33 ok, 0 fail, 0 missing** (von 33);
+* **ein Standardlauf der Suite fiel einmal durch** (`gpuslang.npRigidSumBatches`,
+  SIGSEGV) — und diesmal hat `run_suite.sh` das Protokoll gesichert, statt es vom
+  Wiederholungslauf überschreiben zu lassen. Der daraus folgende Befund hat einen
+  eigenen Eintrag, **P9.22**, weil er die Diagnose der seit P8.13 offenen Aufgabe
+  widerlegt: der Ausfall hat mit `-j` nichts zu tun. Der unmittelbar folgende
+  Doppellauf war wieder **819/819** in beiden Modi.
 
 ### Was das über „gleiche Ausgabe heißt geprüft" sagt
 
