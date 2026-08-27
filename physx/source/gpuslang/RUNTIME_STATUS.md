@@ -8,13 +8,15 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **818/818** green in both modes (`ctest -N` in `build-gpuslang`).
-Szenen: **31/31** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
-Inventar (30 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
+Szenen: **32/32** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
+Inventar (31 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
 wertet.  `particlediffuse` kam in P9.13a als Diagnose hinzu und ist seit P9.13d
 gewertet; `particleconvex` kam in P9.14a als ausstehende Arbeit hinzu und ist
 seit P9.14c gewertet; `clothbox` kam in P9.15a hinzu, weil `cloth` ein Freifall
-ist und grün bleibt, ob das Tuch landet oder nicht.  Die Liste der ausstehenden
+ist und grün bleibt, ob das Tuch landet oder nicht; `clothdamp` kam in P9.19
+hinzu, weil keine Tuch-Szene ein Flächenmaterial mit Dämpfung setzte und der
+senkrechte Vorhang aus `clothhang` von Anfang an ruht.  Die Liste der ausstehenden
 Arbeit ist **leer**.  Die
 Diagnoseliste trägt jetzt wieder nur die sechs Kontrollen, die durchfallen
 SOLLEN, weil sie die Referenz der echten Prüfung sind.  P9.9 fügte `particlefluidboundary` hinzu, P9.10c
@@ -1704,6 +1706,162 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.19 — die Tuch-Dämpfung (Manifest **360**): drei Kernel, ein Feature, und eine Szene, deren Vorzeichen ich falsch erwartet hatte
+
+Portiert `FEMCloth.cu:947` (`cloth_accumulateInPlaneDampingDeltaVelocity`),
+`:1046` (`cloth_accumulateBendingDampingDeltaVelocity`) und `:918`
+(`cloth_applyAccumulatedDeltaVelocity`), alle drei vollständig gelesen. Manifest
+**357 → 360**. Drei neue ABI-Zeilen, neuer Shader `femClothDampingBda.slang`,
+neue Szene `clothdamp` (Inventar **31 → 32**).
+
+### Warum die drei zusammen landen
+
+`PxgFEMClothCore::applyDamping` (`:2023`) startet sie unmittelbar nacheinander,
+und der dritte ergibt ohne die ersten beiden nichts: die Akkumulatoren addieren
+atomar in `mAccumulatedDeltaVel`, der Anwender faltet den Puffer in die
+Geschwindigkeiten und löscht ihn. Getrennt zu landen hieße einen Erzeuger ohne
+Verbraucher abzubilden.
+
+### Die Physik, damit die Fallen als Folgen lesbar sind
+
+Beide Akkumulatoren entfernen den Teil der Relativbewegung, der **keine starre
+Bewegung des Elements** ist:
+
+* **in der Ebene, je DREIECK**: mittlere Geschwindigkeit abziehen, den Rest in
+  die Dreiecksebene projizieren, die eine starre **Rotationsrate** um den
+  Schwerpunkt herausrechnen, die zu den drei projizierten Geschwindigkeiten am
+  besten passt — und alles andere dämpfen.
+* **Biegung, je DREIECKSPAAR**: die beiden Vertices der gemeinsamen Kante sind
+  die Scharnierachse; gedämpft wird die **Differenz** der beiden Spitzen-
+  Rotationsraten um sie, also genau die Öffnungsgeschwindigkeit der Falte.
+
+### Fünfzehn Fallen, und zwei, die man beim Lesen überspringt
+
+* **D9 — DIE KOMPONENTEN STEHEN NICHT IN DER GELESENEN REIHENFOLGE.** Das
+  `uint4` eines Biegepaars bindet `A = .z`, `B = .w` (die **Kante**) und
+  `C = .x`, `C2 = .y` (die **Spitzen**). Jeder andere Tuch-Kernel in diesem
+  Korpus nimmt `.xyz` als „das Dreieck". Ein Port, der das hier tut, scharniert
+  um das falsche Paar und dämpft die falsche Rotation — und läuft weiter und
+  liefert plausible Zahlen.
+* **D8 — DIE REIHENFOLGE TRÄGT.** Der Mittelwert wird **vor** der
+  Massengewichtung abgezogen, damit die Korrektur in den **rohen** Deltas kein
+  Nettoimpuls trägt. Die CUDA führt einen auskommentierten Block mit, der
+  umgekehrt gewichtet; in jener Reihenfolge bleibt eine Restkraft.
+* **D15 — der Biege-Zwilling multipliziert am Ende NICHT noch einmal mit
+  `dampingFactor`**; er steckt schon in `deltaRotVelDamp`. Der In-Plane-Kernel
+  tut es an genau dieser Stelle doch, was die Asymmetrie zum „Aufräumen"
+  einlädt.
+* **D2** — der Früh-Ausstieg prüft den **geklemmten** Faktor gegen exakt null,
+  also steigt auch ein **negativer** `elasticityDamping` aus. Ein Port, der das
+  rohe Produkt prüft, liefe mit verstärkendem Vorzeichen weiter.
+* **D6/D7 — UPSTREAM-KANDIDATEN, buchstabengetreu übernommen.** Ein Vertex
+  genau im Schwerpunkt teilt durch null; ein Dreieck mit drei gepinnten Vertices
+  gibt `weightFactor = 1/0`. Kein Wächter in der CUDA, keiner hier.
+
+### Die Vorrichtung: bit-genau, und eine Begründung, die korrigiert werden musste
+
+Drei `PXG_TEST` gegen einen **Host-Spiegel der CUDA** (nicht unseres Slang),
+Zeile für Zeile mit Herkunftsangabe. Alle drei vergleichen **bit-genau**.
+
+Der erste Entwurf begründete das falsch: „zwei Beitragende kommutieren, also ist
+die Summe reihenfolgeunabhängig". Das stimmt nicht. Mit einem Startwert `s`
+liefern die beiden Reihenfolgen `(s+a)+b` und `(s+b)+a`, und die sind
+verschieden, weil Addition **nicht assoziativ** ist — Kommutativität sagt nur
+`a+b == b+a`. Die Vorrichtung hat es gemessen: ein Vertex, der konkurrierende,
+um ein ULP daneben.
+
+Der Startwert entscheidet also die Regel, und die Vorrichtung nutzt beide:
+
+| Vertex | Startwert | warum das gilt |
+|---|---|---|
+| **zwei** Beitragende | exakt **0** | `(0+a)+b == a+b == b+a` — reihenfolgeunabhängig |
+| **ein** Beitragender | **nicht null** | `s+a` ist deterministisch, und ein Port, der **zuweist statt addiert**, wird sichtbar |
+
+Beide Pfade bit-genau, und kein Rennen-Ausgang wird behauptet. Prüfungen halten
+fest, dass kein Vertex **drei** Beitragende hat (dann rettet kein Startwert mehr)
+und dass ein konkurrierender Vertex nicht versehentlich gesät wird.
+
+### Das Fegen, und der Überlebende, der einen echten Wächter erklärt hat
+
+Fünfzehn Mutanten. Erster Durchgang: **14 getötet, 1 überlebt** —
+`d16-inplane-atomic-gate-off`, das Löschen von `if (invMassA != 0.0f)` vor dem
+Atomic.
+
+Diagnose: `deltaVelA` ist bereits mit `invMassA` skaliert, ein gepinnter Vertex
+addiert also null. Der Wächter sieht wie eine reine **Sparmaßnahme** aus.
+
+**Ist er nicht.** Bei einem Dreieck, dessen **drei** Vertices gepinnt sind, ist
+`weightFactor = 1/0 = +inf` und `0 * inf = NaN`. Mit Wächter wird nichts
+geschrieben; ohne ihn werden drei NaN in den Puffer addiert. Der Wächter ist
+das, was D7 unschädlich hält. Meine Vorrichtung hatte kein voll gepinntes
+Dreieck — mit einem: **15 von 15 getötet, 0 überlebt.**
+
+### Die Szene, und warum ihr Vorzeichen anders ist als erwartet
+
+Zuerst das Ergebnis der Messung, denn es hat meine Erwartung widerlegt.
+
+**Keine vorhandene Tuch-Szene konnte das messen**, und zwar aus zwei Gründen
+gleichzeitig: keine setzt ein Flächen-Material mit Dämpfung (die beiden Stellen
+im Korpus, die `elasticityDamping` setzen, sind **Volumen**-Materialien für
+Softbodies), und der senkrechte Vorhang aus `clothhang` hängt von Anfang an
+ruhig — er fällt 0.02 über 120 Schritte und seine Bewegung im Ruhefenster ist
+**exakt null**. Es gibt dort nichts zu dämpfen.
+
+`clothdamp` teilt deshalb `clothhang`s Vorrichtung, spannt das Tuch aber
+**flach** auf: an einer Kante gepinnt klappt es unter Schwerkraft durch neunzig
+Grad herunter — eine große, anhaltende Scharnierfalte.
+
+Und dann die Richtung. Ich hatte erwartet, dass Dämpfung **glättet**. Gemessen,
+gleicher Aufbau, 120 × 1/60 s, einziger Unterschied das Material:
+
+| | Streuung der y-Werte der Unterkante am Ende |
+|---|---|
+| ungedämpft | **0.006395** |
+| gedämpft (beide Werte 120, Faktor gesättigt bei 1.0) | **0.074761** |
+
+Ein Faktor **elf — in die andere Richtung**. Und das ist richtig: beide
+Akkumulatoren entfernen den nicht-starren Anteil der Bewegung *jedes Elements*,
+ein gesättigter Faktor macht das Tuch also einer **starren Schale** ähnlicher.
+Die Krümmung, die es beim Herunterklappen bekommt, **bleibt** — während das
+ungedämpfte Tuch sich wieder flachziehen darf. Der Mittelwert der Unterkante
+sieht davon nichts, weil er dem nahezu starren Schwung folgt, auf den diese
+Dämpfung nicht wirkt und nicht wirken soll.
+
+Dass der Unterschied den drei Kerneln gehört, ist nachgesehen und nicht
+angenommen: im **Tuch**-Pfad liest genau eine Stelle `elasticityDamping`
+(`FEMCloth.cu:967`, der In-Plane-Kernel), und `bendingDamping` erreicht das Tuch
+nur über die Paar-Koeffizienten bei `:1081`. Die übrigen Leser im Korpus sind
+Softbody-Kernel mit einer **anderen** Materialstruktur.
+
+Die Schranke steht auf 0.03: fünfmal über dem ungedämpften Wert und zweieinhalbmal
+unter dem gedämpften.
+
+### Verifikation
+
+* Fegen **15 von 15 getötet, 0 überlebt**, zwangsfrisch, nach dem Nachschärfen
+  um ein voll gepinntes Dreieck;
+* drei `PXG_TEST` **bit-genau** gegen den CUDA-Spiegel, beide Startwert-Regeln
+  belegt;
+* Suite **818/818** in **beiden** Speichermodi (die drei Tests treten der
+  bestehenden `femClothSim`-Suite bei, die ctest-Zahl bleibt);
+* `PXG_SLANG_KERNEL_MAPPED` von 357 auf **360** nachgezogen — die drei
+  Buchführungstests (`p3KernelWrangler`, `p4Manifest`, `p4Wrangler`) haben die
+  Abweichung sofort gemeldet, was genau ihr Zweck ist;
+* Szenen: **LÄUFT NOCH** — Ergebnis im Folge-Commit, statt hier eine ungemessene
+  Zahl zu behaupten. Die beiden Zahlen, um die es geht (0.006395 / 0.074761),
+  stehen oben und sind einzeln gemessen; offen ist nur, ob die anderen 31 Szenen
+  vom neuen Manifest-Eintrag unberührt bleiben.
+
+### Was das über „das Vorzeichen ist doch klar" sagt
+
+Ich habe die Szene gebaut, um zu zeigen, dass Dämpfung die Restbewegung
+**verkleinert**, und die erste Messung zeigte das Gegenteil — erst gar keinen
+Unterschied (ruhender Vorhang), dann einen großen mit umgekehrtem Vorzeichen.
+Beide Male war die Erwartung falsch und die Messung richtig, und der Eintrag
+trägt deshalb die Erklärung statt der Erwartung. Eine Szene, die ich auf mein
+vermutetes Vorzeichen kalibriert hätte, wäre entweder rot gewesen oder — schlimmer —
+mit einer Schranke grün, die das Gegenteil dessen prüft, was sie behauptet.
 
 ## P9.18 — `calcGridHashInBounds` war in Phase 2 vollständig ungeprüft: vier lebende Aufrufstellen, und jede Implementierung, die 0 zurückgab, hätte bestanden
 

@@ -37,7 +37,7 @@ if [ -z "${PXG_SHADER_DIR:-}" ]; then
     exit 2
 fi
 
-# The 30 named scenes.  The settling bag below makes 31 -- the figure
+# The 31 named scenes.  The settling bag below makes 32 -- the figure
 # RUNTIME_STATUS.md's header carries.  clothbox joined in P9.15a: `cloth` is a
 # free fall and stays green whether or not the cloth lands, so the landing needed
 # a scene of its own.  particlediffuse joined in P9.13d, when
@@ -50,7 +50,7 @@ fi
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor articulation
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
         particlecloth particleinflatable particlediffuse particleconvex
-        cloth clothbox clothhang clothdrape clothselfcollide clothcloth
+        cloth clothbox clothhang clothdamp clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach"
 
 pass=0; fail=0; missing=0

@@ -2126,8 +2126,13 @@ struct ClothHangScene
     std::vector<PxU32> bottomRow;   // FREE vertices tracked for the drape/settle
 };
 
+// P9.19: `damped` is what the `clothdamp` scene turns on.  It is the ONLY
+// difference between that scene and `clothhang` -- same mesh, same pins, same
+// step count -- so any difference in the measured settling is the damping trio
+// and nothing else.
 ClothHangScene buildClothHangScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
-                                   PxCudaContextManager* cudaCtx)
+                                   PxCudaContextManager* cudaCtx, bool damped = false,
+                                   bool horizontal = false)
 {
     ClothHangScene out;
     out.cudaCtx = cudaCtx;
@@ -2153,7 +2158,17 @@ ClothHangScene buildClothHangScene(PxPhysics* physics, PxScene* scene, PxMateria
     for (PxU32 c = 0; c < numCol; ++c)
         for (PxU32 r = 0; r < numRow; ++r)
             // row 0 = top edge (y = topY); increasing r hangs DOWNWARD; planar z = 0.
-            verts.push_back(PxVec3(float(c) * sx - 0.5f * sizeX, topY - float(r) * sy, 0.0f));
+            // `horizontal` is what makes the damping MEASURABLE.  The vertical
+            // curtain is already at rest the moment it spawns -- it drops 0.02 over
+            // 120 steps and its per-step motion in the rest window is exactly zero,
+            // so there is no non-rigid motion for either accumulator to remove and
+            // the damped and undamped runs agree to four decimals.  Spawned FLAT,
+            // pinned along one edge, the sheet swings down through ninety degrees:
+            // a large, sustained hinge fold, which is precisely what bending
+            // damping acts on.
+            verts.push_back(horizontal
+                ? PxVec3(float(c) * sx - 0.5f * sizeX, topY, float(r) * sy)
+                : PxVec3(float(c) * sx - 0.5f * sizeX, topY - float(r) * sy, 0.0f));
 
     std::vector<PxU32> tris;
     tris.reserve(3 * 2 * (numCol - 1) * (numRow - 1));
@@ -2184,9 +2199,15 @@ ClothHangScene buildClothHangScene(PxPhysics* physics, PxScene* scene, PxMateria
         immediateCooking::createTriangleMesh(ckParams, meshDesc, physics->getPhysicsInsertionCallback());
     if (!triMesh) { std::printf("FAIL: immediateCooking::createTriangleMesh returned null\n"); return out; }
 
+    // The damping values are LARGE on purpose.  Both kernels form
+    // clamp(damping * dt, 0, 1) with dt = 1/60, so 120 saturates the factor at
+    // 1.0 -- the strongest damping the engine can express.  A small value would
+    // produce a difference inside the settle bar and measure nothing.
     PxDeformableSurfaceMaterial* clothMat =
         physics->createDeformableSurfaceMaterial(/*youngs*/ 1.e6f, /*poissons*/ 0.3f,
-            /*dynamicFriction*/ 0.5f, /*thickness*/ 0.01f, /*bendingStiffness*/ 1.e-4f);
+            /*dynamicFriction*/ 0.5f, /*thickness*/ 0.01f, /*bendingStiffness*/ 1.e-4f,
+            /*elasticityDamping*/ damped ? 120.0f : 0.0f,
+            /*bendingDamping*/ damped ? 120.0f : 0.0f);
     PxDeformableSurfaceMaterial* mats[1] = { clothMat };
 
     PxShapeFlags shapeFlags = PxShapeFlag::eSIMULATION_SHAPE | PxShapeFlag::eSCENE_QUERY_SHAPE;
@@ -2257,7 +2278,13 @@ ClothHangScene buildClothHangScene(PxPhysics* physics, PxScene* scene, PxMateria
 
 // DtoH-read the cloth vertex buffer once; fill the mean y of the pinned top row and the
 // free bottom row (the two observables of the drape).  Returns false on non-finite y.
-bool clothHangRowMeans(const ClothHangScene& csc, float& topMeanY, float& bottomMeanY)
+// P9.19 adds `bottomSpreadY`: the standard deviation of the bottom row's y.  The
+// MEANS cannot see internal damping -- they follow the sheet's near-rigid swing,
+// which this damping does not act on and should not.  The SPREAD is the row's
+// departure from flat, i.e. exactly the non-rigid shape change the two
+// accumulators work on.
+bool clothHangRowMeans(const ClothHangScene& csc, float& topMeanY, float& bottomMeanY,
+                       float* bottomSpreadY = nullptr)
 {
     std::vector<PxVec4> host(csc.numVerts);
     PxCudaContext* ctx = csc.cudaCtx->getCudaContext();
@@ -2269,6 +2296,13 @@ bool clothHangRowMeans(const ClothHangScene& csc, float& topMeanY, float& bottom
     for (PxU32 id : csc.bottomRow) { botSum += double(host[id].y); if (!std::isfinite(host[id].y)) finite = false; }
     topMeanY = float(topSum / double(csc.topRow.size()));
     bottomMeanY = float(botSum / double(csc.bottomRow.size()));
+    if (bottomSpreadY)
+    {
+        double s2 = 0.0;
+        for (PxU32 id : csc.bottomRow)
+        { const double d = double(host[id].y) - double(bottomMeanY); s2 += d * d; }
+        *bottomSpreadY = float(std::sqrt(s2 / double(csc.bottomRow.size())));
+    }
     return finite;
 }
 
@@ -5035,9 +5069,38 @@ int main()
     // must DRAPE below the pins and SETTLE (fall-then-stabilize), mirroring the P6.5
     // particle settling-bag pass criterion but per-row: pinned top row ~constant y, free
     // bottom row drops a bounded amount then converges.
-    if (!std::strcmp(sceneName, "clothhang"))
+    // PXG_SCENE=clothdamp (P9.19) shares this whole block with `clothhang`, and
+    // that sharing is the measurement: same mesh, same pins, same step count, one
+    // material difference.  Anything that differs in the settling is the damping
+    // trio (cloth_accumulateInPlaneDampingDeltaVelocity,
+    // cloth_accumulateBendingDampingDeltaVelocity, cloth_applyAccumulatedDeltaVelocity).
+    // P9.19: both numbers are MEASURED, not chosen.  `clothhang` (no damping) and
+    // `clothdamp` (elasticityDamping = bendingDamping = 120, which saturates
+    // clamp(d*dt,0,1) at dt=1/60) differ only in the material; these are what the
+    // two runs report, and the bar sits between them.
+    // MEASURED on this rig, both runs 120 x 1/60 s, identical in every respect but
+    // the material: the flat-spawned sheet's bottom-row y spread at the end is
+    //     0.006395  undamped   (elasticityDamping = bendingDamping = 0)
+    //     0.074761  damped     (both 120, which saturates clamp(d*dt,0,1) at 1.0)
+    // -- a factor of ELEVEN.  The direction is the interesting part and it is not
+    // the naive one: full internal damping does not smooth the sheet, it makes it
+    // hold its shape.  Both accumulators remove the non-rigid part of each
+    // element's motion, so a saturated factor turns the sheet into something much
+    // closer to a rigid shell, and the curl it acquires while swinging stays.  The
+    // undamped sheet is free to flatten out again.
+    //
+    // The bar sits between them, five times the undamped figure and two and a half
+    // times below the damped one.
+    static const float CLOTHDAMP_UNDAMPED_REF = 0.006395f;
+    static const float CLOTHDAMP_SPREAD_BAR = 0.030f;
+    if (!std::strcmp(sceneName, "clothhang") || !std::strcmp(sceneName, "clothdamp"))
     {
-        ClothHangScene csc = buildClothHangScene(physics, scene, material, cudaCtx);
+        const bool damped = !std::strcmp(sceneName, "clothdamp");
+        // `clothdamp` also spawns the sheet FLAT (see the builder): the vertical
+        // curtain has no internal motion to damp, so it cannot measure this.
+        const char* undampedEnv = std::getenv("PXG_CLOTHDAMP_UNDAMPED");
+        ClothHangScene csc = buildClothHangScene(physics, scene, material, cudaCtx,
+                                                 damped && !undampedEnv, damped);
         if (!csc.surface || csc.numVerts == 0 || !csc.attachment)
         {
             std::printf("[ FAIL ] gpu-sdk-step: clothhang scene build failed "
@@ -5058,8 +5121,8 @@ int main()
         const float dt = 1.0f / 60.0f;
         const char* stepsEnv = std::getenv("PXG_CLOTH_STEPS");
         const int steps = stepsEnv ? atoi(stepsEnv) : 120;
-        float top0 = 0.0f, bot0 = 0.0f;
-        bool finite0 = clothHangRowMeans(csc, top0, bot0);
+        float top0 = 0.0f, bot0 = 0.0f, botSpread = 0.0f;
+        bool finite0 = clothHangRowMeans(csc, top0, bot0, &botSpread);
         std::printf("  stepping the curtain (%d x %.4fs): top row y0=%.4f, bottom row y0=%.4f\n",
                     steps, dt, top0, bot0);
 
@@ -5082,7 +5145,7 @@ int main()
             prevBot = bot;
         }
         float topEnd = 0.0f, botEnd = 0.0f;
-        clothHangRowMeans(csc, topEnd, botEnd);
+        clothHangRowMeans(csc, topEnd, botEnd, &botSpread);
         const float botDrop = bot0 - botEnd;
 
         std::printf("  clothhang: top row y %.4f -> %.4f (max |dev|=%.5f) | bottom row y %.4f -> %.4f "
@@ -5095,8 +5158,27 @@ int main()
         // (2) the free bottom row must DRAPE below by a BOUNDED amount (not free-fall).
         if (!(botDrop > 0.0f))    { std::printf("FAIL: bottom row did not drape down (drop=%.5f)\n", botDrop); ++failures; }
         if (!(botDrop < 2.0f))    { std::printf("FAIL: bottom row fell unbounded (drop=%.5f) — not hanging\n", botDrop); ++failures; }
-        // (3) the drape must CONVERGE (bottom row stops moving over the final quarter).
-        if (!(botRestMaxDy < 0.01f)) { std::printf("FAIL: drape did not settle (rest |dy|=%.6f)\n", botRestMaxDy); ++failures; }
+        // (3) the VERTICAL curtain must CONVERGE (bottom row stops moving over the
+        // final quarter).  The flat-spawned `clothdamp` sheet is still mid-swing at
+        // 120 steps by design -- a settled sheet has no internal motion left to
+        // damp, which is exactly why `clothhang` cannot measure this -- so the
+        // settle check belongs to `clothhang` alone.
+        if (!damped && !(botRestMaxDy < 0.01f))
+        { std::printf("FAIL: drape did not settle (rest |dy|=%.6f)\n", botRestMaxDy); ++failures; }
+        // (3b) P9.19: the DAMPED sheet must hold its curl -- the bottom row's y
+        // spread stays far above the undamped reference.  See the constants above
+        // for both measured numbers and why the direction is what it is.
+        if (damped)
+        {
+            if (!(botSpread > CLOTHDAMP_SPREAD_BAR))
+            { std::printf("FAIL: damped bottom-row spread %.6f, expected above %.6f "
+                          "(undamped reference %.6f)\n", botSpread, CLOTHDAMP_SPREAD_BAR,
+                          CLOTHDAMP_UNDAMPED_REF); ++failures; }
+            // and it must actually have swung, or the spread means nothing.
+            if (!(botDrop > 1.0f))
+            { std::printf("FAIL: damped sheet only swung %.5f -- with no swing there is no "
+                          "internal motion to damp\n", botDrop); ++failures; }
+        }
         // (4) nothing NaN/inf.
         if (!allFinite || !std::isfinite(topEnd) || !std::isfinite(botEnd))
         { std::printf("FAIL: cloth y went non-finite\n"); ++failures; }
@@ -5104,10 +5186,18 @@ int main()
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
         if (failures == 0)
         {
-            std::printf("[  OK  ] gpu-sdk-step: FEMCloth HANGS from its pinned edge and drapes under gravity\n");
+            if (damped)
+                std::printf("[  OK  ] gpu-sdk-step: the DAMPED sheet HOLDS ITS CURL and the undamped "
+                            "one flattens: bottom-row y spread %.6f vs %.6f measured with the "
+                            "SAME rig and damping 0 (bar %.4f), after swinging down %.4f -- "
+                            "the P9.19 damping trio is live on Vulkan, and within the cloth "
+                            "path nothing but those three kernels reads either damping field\n",
+                            botSpread, CLOTHDAMP_UNDAMPED_REF, CLOTHDAMP_SPREAD_BAR, botDrop);
+            else
+                std::printf("[  OK  ] gpu-sdk-step: FEMCloth HANGS from its pinned edge and drapes under gravity\n");
             return 0;
         }
-        std::printf("[ FAIL ] gpu-sdk-step: clothhang drape checks failed (%d)\n", failures);
+        std::printf("[ FAIL ] gpu-sdk-step: %s drape checks failed (%d)\n", sceneName, failures);
         return 2;
     }
 

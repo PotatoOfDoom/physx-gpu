@@ -372,6 +372,20 @@ static const uint8_t kClothFinalizeVel[] = { 8, 8, 4, 4, 1 };
 //     activeId, PxReal dt, PxReal resetCounter, PxReal* wakeCounters,
 //     PxU32* stateChangedMask) -> 48-byte blob (activeId 8-aligned after the PxU32).
 static const uint8_t kClothSleeping[] = { 8, 4, 8, 4, 4, 8, 8 };
+// P9.19, the damping trio (PxgFEMClothCore::applyDamping, :2023).  Three rows and
+// NOT one: the three kernels take three different packs, and the two accumulators
+// differ only by the materials pointer -- exactly the shape that invites reusing
+// one row and shifting dt by eight bytes.
+//   cloth_accumulateInPlaneDampingDeltaVelocity(PxgFEMCloth* femCloths,
+//     const PxU32* activeId, const PxsDeformableSurfaceMaterialData* clothMaterials,
+//     PxReal dt) -> 32-byte blob.
+static const uint8_t kClothInPlaneDamp[] = { 8, 8, 8, 4 };
+//   cloth_accumulateBendingDampingDeltaVelocity(PxgFEMCloth* femCloths,
+//     const PxU32* activeId, PxReal dt) -> 24-byte blob.
+static const uint8_t kClothBendingDamp[] = { 8, 8, 4 };
+//   cloth_applyAccumulatedDeltaVelocity(PxgFEMCloth* femCloths,
+//     const PxU32* activeId) -> 16-byte blob.
+static const uint8_t kClothApplyDamp[] = { 8, 8 };
 
 // gpusimulationcontroller FEMCloth.cu (P7.1 FEMCloth in-plane membrane energy solve):
 //   cloth_solveNonSharedTriangleEnergyLaunch(PxgFEMCloth* femCloths, const PxU32*
@@ -1561,6 +1575,11 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_preIntegrateLaunch", kClothPreIntegrate, uint32_t(sizeof(kClothPreIntegrate)) },
     { "cloth_finalizeVelocitiesLaunch", kClothFinalizeVel, uint32_t(sizeof(kClothFinalizeVel)) },
     { "cloth_sleeping", kClothSleeping, uint32_t(sizeof(kClothSleeping)) },
+    { "cloth_accumulateInPlaneDampingDeltaVelocity", kClothInPlaneDamp,
+      uint32_t(sizeof(kClothInPlaneDamp)) },
+    { "cloth_accumulateBendingDampingDeltaVelocity", kClothBendingDamp,
+      uint32_t(sizeof(kClothBendingDamp)) },
+    { "cloth_applyAccumulatedDeltaVelocity", kClothApplyDamp, uint32_t(sizeof(kClothApplyDamp)) },
     // gpusimulationcontroller FEMCloth in-plane membrane energy solve (P7.1 BDA)
     { "cloth_solveNonSharedTriangleEnergyLaunch", kClothSolveTriEnergy, uint32_t(sizeof(kClothSolveTriEnergy)) },
     { "cloth_solveNonSharedTriangleEnergyClusterLaunch", kClothSolveTriEnergy, uint32_t(sizeof(kClothSolveTriEnergy)) },

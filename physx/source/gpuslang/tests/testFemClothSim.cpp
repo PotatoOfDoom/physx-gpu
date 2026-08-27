@@ -7743,4 +7743,630 @@ PXG_TEST(femClothSimMeshContactGen)
         dev->destroyBuffer(h);
 }
 
+
+// ===========================================================================
+// P9.19 -- the cloth DAMPING trio.
+//
+// Three kernels, one feature, and they are tested in the order the engine runs
+// them (PxgFEMClothCore::applyDamping, :2023): the two accumulators atomically
+// add into mAccumulatedDeltaVel, the applier folds that buffer into the
+// velocities and clears it.
+//
+// THE ORACLE IS A HOST TRANSCRIPTION OF THE CUDA, not of our Slang -- the same
+// relationship every Phase-1 battery has to its reference, and the reason it is
+// admissible.  Line numbers are cited at each function.
+//
+// BIT-EXACT DESPITE THE ATOMICS, and the reasoning took a correction worth
+// keeping.  The first draft said "two contributors commute, so the sum is
+// order-independent" and seeded the buffer with a non-zero value.  That is
+// WRONG: with a seed s the two orders give (s+a)+b and (s+b)+a, which differ
+// because addition is not ASSOCIATIVE -- commutativity only says a+b == b+a.
+// The fixture measured it: one vertex, the contended one, off by one ULP.
+//
+// So the seed decides the rule, and this fixture uses both:
+//   * a vertex with TWO contributors is seeded with exactly ZERO, which makes
+//     the sum (0+a)+b == a+b == b+a and therefore order-independent;
+//   * a vertex with ONE contributor keeps a NON-ZERO seed, where seed+a is
+//     deterministic and a port that ASSIGNS instead of adding is visible.
+// Both paths are compared bit-exactly, and no race outcome is asserted.
+// ===========================================================================
+namespace dmp
+{
+struct V3 { float x, y, z; };
+static V3 v3(float a, float b, float c) { return V3{ a, b, c }; }
+static V3 add(V3 a, V3 b) { return V3{ a.x + b.x, a.y + b.y, a.z + b.z }; }
+static V3 sub(V3 a, V3 b) { return V3{ a.x - b.x, a.y - b.y, a.z - b.z }; }
+static V3 mul(float s, V3 a) { return V3{ s * a.x, s * a.y, s * a.z }; }
+static float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static V3 cross3(V3 a, V3 b)
+{ return V3{ a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
+
+// PxVec3::normalize (PxVec3.h:295): returns the magnitude BEFORE scaling and
+// divides only when it is strictly positive.
+static float normalize3(V3& v)
+{
+    const float m = std::sqrt(dot3(v, v));
+    if (m > 0.0f) { v.x /= m; v.y /= m; v.z /= m; }
+    return m;
+}
+// deformableUtils.cuh:118 -- divides by magnitudeSquared even for a unit normal.
+static V3 projectOntoPlane(V3 v, V3 n) { return sub(v, mul(dot3(n, v) / dot3(n, n), n)); }
+static float clamp01(float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); }
+
+// ---- the scene -------------------------------------------------------------
+// Eight vertices and four triangles.  Vertices 1, 2, 4 and 6 are each shared by
+// exactly TWO triangles (contended, still bit-exact); vertex 3 is PINNED
+// (invMass 0) so the per-vertex atomic gate and the weightFactor's use of a zero
+// term are both live.
+// Triangle 4 is ENTIRELY PINNED, and it is not decoration.  Both accumulators
+// guard each atomic with `if (invMass != 0)`, which reads like a pure saving --
+// the delta is already scaled by invMass, so a pinned vertex would add zero.  It
+// is not a saving: with all three masses zero, weightFactor is 1/0 == +inf and
+// the delta becomes 0 * inf == NaN.  The guard is what stops three NaNs from
+// being atomically added into the buffer.  Without a fully pinned element in the
+// fixture, deleting the guard is invisible.
+static const uint32_t NB_V = 11u;
+static const uint32_t NB_T = 5u;
+static const uint32_t TRIS[NB_T][3] = { { 0u, 1u, 2u }, { 2u, 3u, 4u },
+                                        { 5u, 6u, 7u }, { 1u, 4u, 6u },
+                                        { 8u, 9u, 10u } };
+// Off-axis and non-degenerate: an axis-aligned triangle makes the plane normal a
+// basis vector and projectVectorOntoPlane a component drop, which hides a wrong
+// normal entirely.
+static const float POS[NB_V][3] = {
+    { 0.00f, 0.00f, 0.00f }, { 1.30f, 0.20f, 0.10f }, { 0.40f, 1.10f, 0.30f },
+    { 1.70f, 1.40f, 0.90f }, { 0.10f, 2.20f, 0.50f }, { 2.30f, 0.70f, 1.60f },
+    { 1.10f, 2.60f, 0.80f }, { 2.90f, 1.90f, 0.20f },
+    { 4.10f, 0.30f, 2.10f }, { 3.40f, 1.20f, 2.80f }, { 4.60f, 1.70f, 1.90f },
+};
+static const float INV_MASS[NB_V] = { 1.0f, 0.5f, 2.0f, 0.0f, 1.5f, 0.25f, 0.75f, 1.25f,
+                                      0.0f, 0.0f, 0.0f };
+// Distinct per vertex and NOT a rigid motion of any triangle -- a velocity field
+// that is already a rigid rotation has nothing to damp and every mutant lives.
+static const float VEL[NB_V][3] = {
+    {  0.30f, -0.70f,  0.20f }, { -0.40f,  0.90f, -0.10f }, {  0.60f,  0.10f, -0.50f },
+    { -0.20f, -0.30f,  0.80f }, {  0.90f,  0.40f,  0.15f }, { -0.60f,  0.25f, -0.35f },
+    {  0.15f, -0.85f,  0.45f }, {  0.70f,  0.55f, -0.25f },
+    { -0.35f,  0.65f,  0.05f }, {  0.45f, -0.15f, -0.75f }, {  0.20f,  0.80f,  0.35f },
+};
+// Four materials: one live, one ZERO damping (the D2 early-out), one NEGATIVE
+// (which clamp pulls to zero -- the same early-out by a different route, and the
+// one a port testing the RAW product would run with an amplifying factor), and a
+// second live one so two triangles with different factors both contribute.
+static const uint32_t NB_MAT = 4u;
+static const float MAT_DAMP[NB_MAT] = { 3.0f, 0.0f, -5.0f, 7.0f };
+// Triangle 4 (the all-pinned one) takes material 0, so it is LIVE and actually
+// reaches the atomic gates.
+static const uint16_t TRI_MAT[NB_T] = { 0u, 1u, 2u, 3u, 0u };
+
+// --- cloth_accumulateInPlaneDampingDeltaVelocity (FEMCloth.cu:947) ----------
+static void inPlaneRef(float dt, std::vector<float>& delta /* NB_V*4 */)
+{
+    for (uint32_t t = 0; t < NB_T; ++t)
+    {
+        const float dampingFactor = clamp01(MAT_DAMP[TRI_MAT[t]] * dt);
+        if (dampingFactor == 0.0f) continue;
+
+        const uint32_t ia = TRIS[t][0], ib = TRIS[t][1], ic = TRIS[t][2];
+        const float invMassA = INV_MASS[ia], invMassB = INV_MASS[ib], invMassC = INV_MASS[ic];
+        const V3 pA = v3(POS[ia][0], POS[ia][1], POS[ia][2]);
+        const V3 pB = v3(POS[ib][0], POS[ib][1], POS[ib][2]);
+        const V3 pC = v3(POS[ic][0], POS[ic][1], POS[ic][2]);
+        const V3 vA = v3(VEL[ia][0], VEL[ia][1], VEL[ia][2]);
+        const V3 vB = v3(VEL[ib][0], VEL[ib][1], VEL[ib][2]);
+        const V3 vC = v3(VEL[ic][0], VEL[ic][1], VEL[ic][2]);
+
+        const V3 linearVelocity = mul(1.0f / 3.0f, add(add(vA, vB), vC));
+        const V3 centroid = mul(1.0f / 3.0f, add(add(pA, pB), pC));
+
+        V3 normal = cross3(sub(pB, pA), sub(pC, pA));
+        if (normalize3(normal) < 1e-6f) continue;
+
+        const V3 vAProj = projectOntoPlane(sub(vA, linearVelocity), normal);
+        const V3 vBProj = projectOntoPlane(sub(vB, linearVelocity), normal);
+        const V3 vCProj = projectOntoPlane(sub(vC, linearVelocity), normal);
+
+        V3 rdA = cross3(normal, sub(pA, centroid));
+        V3 rdB = cross3(normal, sub(pB, centroid));
+        V3 rdC = cross3(normal, sub(pC, centroid));
+        const float dA = normalize3(rdA), dB = normalize3(rdB), dC = normalize3(rdC);
+
+        const float rotVel = (1.0f / 3.0f) * (dot3(rdA, vAProj) / dA + dot3(rdB, vBProj) / dB
+                                              + dot3(rdC, vCProj) / dC);
+
+        V3 dvA = sub(mul(rotVel * dA, rdA), vAProj);
+        V3 dvB = sub(mul(rotVel * dB, rdB), vBProj);
+        V3 dvC = sub(mul(rotVel * dC, rdC), vCProj);
+
+        const float weightFactor = 1.0f / (invMassA + invMassB + invMassC);
+        // The mean is removed BEFORE the mass weighting (D8).
+        const V3 avg = mul(1.0f / 3.0f, add(add(dvA, dvB), dvC));
+        dvA = sub(dvA, avg); dvB = sub(dvB, avg); dvC = sub(dvC, avg);
+        dvA = mul(invMassA * weightFactor * dampingFactor, dvA);
+        dvB = mul(invMassB * weightFactor * dampingFactor, dvB);
+        dvC = mul(invMassC * weightFactor * dampingFactor, dvC);
+
+        const uint32_t idx[3] = { ia, ib, ic };
+        const V3 dv[3] = { dvA, dvB, dvC };
+        const float im[3] = { invMassA, invMassB, invMassC };
+        for (int k = 0; k < 3; ++k)
+            if (im[k] != 0.0f)
+            { delta[idx[k] * 4 + 0] += dv[k].x;
+              delta[idx[k] * 4 + 1] += dv[k].y;
+              delta[idx[k] * 4 + 2] += dv[k].z; }
+    }
+}
+} // namespace dmp
+
+
+// The three push-constant blobs, byte-identical to femClothDampingBda.slang's.
+struct ApplyDampPush { uint64_t femCloths; uint64_t activeIds; };
+struct InPlaneDampPush { uint64_t femCloths; uint64_t activeIds; uint64_t materials;
+                         float dt; uint32_t pad; };
+struct BendingDampPush { uint64_t femCloths; uint64_t activeIds; float dt; uint32_t pad; };
+static_assert(sizeof(ApplyDampPush) == 16, "engine ABI blob size");
+static_assert(sizeof(InPlaneDampPush) == 32, "engine ABI blob size");
+static_assert(sizeof(BendingDampPush) == 24, "engine ABI blob size");
+
+// ---------------------------------------------------------------------------
+// cloth_applyAccumulatedDeltaVelocity -- the applier, on its own.
+//
+// It is three lines of arithmetic and one of them is a trap: the CUDA assigns
+// .x, .y and .z INDIVIDUALLY and never touches .w, which carries the inverse
+// mass.  A port that stores the whole float4 zeroes every vertex's mass, and the
+// scene would then behave like a cloth of infinitely heavy particles -- plausible
+// enough to survive a "does it fall" check.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimApplyDampingDelta)
+{
+    using namespace dmp;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t N = NB_V;
+    const uint32_t SLACK = 5u;   // vertices past mNbVerts: must be untouched
+    std::vector<F4> vels(N + SLACK), deltas(N + SLACK);
+    for (uint32_t i = 0; i < N + SLACK; ++i)
+    {
+        // .w is the inverse mass and is NOT part of the sum.
+        vels[i] = F4{ VEL[i % NB_V][0], VEL[i % NB_V][1], VEL[i % NB_V][2], INV_MASS[i % NB_V] };
+        // A distinctive delta including a NON-ZERO w, so a four-component add is
+        // visible in the mass rather than only in the velocity.
+        deltas[i] = F4{ 0.125f * float(i + 1), -0.25f * float(i + 1), 0.5f * float(i + 1),
+                        7.0f + float(i) };
+    }
+    const std::vector<F4> velsIn = vels, deltasIn = deltas;
+
+    DevBuf bVel = makeDev(dev, vels);
+    DevBuf bDelta = makeDev(dev, deltas);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVel.addr));
+    c.mAccumulatedDeltaVel = reinterpret_cast<float4*>(size_t(bDelta.addr));
+    c.mNbVerts = N;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    ApplyDampPush push = {};
+    push.femCloths = bDesc.addr;
+    push.activeIds = bActive.addr;
+
+    Kernel k("femClothDampingBda.spv", "cloth_applyAccumulatedDeltaVelocity", {},
+             sizeof(ApplyDampPush));
+    k.dispatch(1u, {}, push, /*gridY*/ 1u, /*gridZ*/ 1u);
+    dev->flush();
+
+    const auto gotVel = downloadBuffer<F4>(dev, bVel.h, N + SLACK);
+    const auto gotDelta = downloadBuffer<F4>(dev, bDelta.h, N + SLACK);
+
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        PXG_CHECK_MSG(f2u(gotVel[i].x) == f2u(velsIn[i].x + deltasIn[i].x) &&
+                      f2u(gotVel[i].y) == f2u(velsIn[i].y + deltasIn[i].y) &&
+                      f2u(gotVel[i].z) == f2u(velsIn[i].z + deltasIn[i].z),
+                      "vertex %u velocity is (%g %g %g), expected (%g %g %g)", i,
+                      double(gotVel[i].x), double(gotVel[i].y), double(gotVel[i].z),
+                      double(velsIn[i].x + deltasIn[i].x), double(velsIn[i].y + deltasIn[i].y),
+                      double(velsIn[i].z + deltasIn[i].z));
+        PXG_CHECK_MSG(f2u(gotVel[i].w) == f2u(velsIn[i].w),
+                      "vertex %u lost its inverse mass: %g became %g -- the CUDA writes x, y "
+                      "and z one at a time and never touches w", i,
+                      double(velsIn[i].w), double(gotVel[i].w));
+        PXG_CHECK_MSG(gotDelta[i].x == 0.0f && gotDelta[i].y == 0.0f &&
+                      gotDelta[i].z == 0.0f && gotDelta[i].w == 0.0f,
+                      "vertex %u delta not cleared: (%g %g %g %g) -- the delta buffer IS "
+                      "zeroed in full, all four components", i, double(gotDelta[i].x),
+                      double(gotDelta[i].y), double(gotDelta[i].z), double(gotDelta[i].w));
+    }
+    for (uint32_t i = N; i < N + SLACK; ++i)
+    {
+        PXG_CHECK_MSG(f2u(gotVel[i].x) == f2u(velsIn[i].x) && f2u(gotVel[i].w) == f2u(velsIn[i].w),
+                      "vertex %u is past mNbVerts (%u) and was written anyway", i, N);
+        PXG_CHECK_MSG(f2u(gotDelta[i].w) == f2u(deltasIn[i].w),
+                      "delta %u is past mNbVerts and was cleared anyway", i);
+    }
+
+    std::printf("    [ note ] %u vertices summed and cleared, %u past the count untouched; "
+                "inverse masses preserved\n", N, SLACK);
+    dev->destroyBuffer(bVel.h); dev->destroyBuffer(bDelta.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+
+// ---------------------------------------------------------------------------
+// cloth_accumulateInPlaneDampingDeltaVelocity, against a host transcription of
+// FEMCloth.cu:947.
+//
+// BIT-EXACT, and the fixture earns that: no vertex is touched more than twice,
+// so the two atomic adds commute and the sum is order-independent.  Four of the
+// eight vertices ARE touched twice, so the contention is real.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimInPlaneDamping)
+{
+    using namespace dmp;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const float dt = 0.1f;   // MAT_DAMP 3 -> 0.3, 7 -> 0.7; both strictly inside [0,1]
+    const uint32_t SLACK = 4u;
+
+    std::vector<F4> positions(NB_V), vels(NB_V), deltas(NB_V + SLACK);
+    for (uint32_t i = 0; i < NB_V; ++i)
+    {
+        positions[i] = F4{ POS[i][0], POS[i][1], POS[i][2], INV_MASS[i] };
+        vels[i] = F4{ VEL[i][0], VEL[i][1], VEL[i][2], INV_MASS[i] };
+    }
+    // How many triangles will actually write to each vertex -- needed BEFORE the
+    // seeding, because the seed is what makes the comparison legitimate (see the
+    // header): zero where two atomics contend, non-zero where only one writes.
+    uint32_t hits[NB_V] = { 0 };
+    for (uint32_t t = 0; t < NB_T; ++t)
+    {
+        if (clamp01(MAT_DAMP[TRI_MAT[t]] * dt) == 0.0f) continue;
+        for (int k2 = 0; k2 < 3; ++k2) if (INV_MASS[TRIS[t][k2]] != 0.0f) hits[TRIS[t][k2]]++;
+    }
+    for (uint32_t i = 0; i < NB_V + SLACK; ++i)
+    {
+        const bool contended = (i < NB_V) && (hits[i] > 1u);
+        deltas[i] = contended
+            ? F4{ 0.0f, 0.0f, 0.0f, 9.5f + float(i) }
+            : F4{ 0.03f * float(i), -0.02f * float(i), 0.05f * float(i), 9.5f + float(i) };
+    }
+    const std::vector<F4> deltasIn = deltas;
+
+    std::vector<uint32_t> triIdx(NB_T * 4u, 0u);
+    for (uint32_t t = 0; t < NB_T; ++t)
+    { triIdx[t * 4 + 0] = TRIS[t][0]; triIdx[t * 4 + 1] = TRIS[t][1];
+      triIdx[t * 4 + 2] = TRIS[t][2];
+      // .w is NOT part of the triangle here -- point it at a vertex that would
+      // change the answer if a port folded it in.
+      triIdx[t * 4 + 3] = (t + 5u) % NB_V; }
+
+    // mMaterialIndices is a PxU16 array; pack two per word.
+    std::vector<uint32_t> matIdxWords((NB_T + 1u) / 2u, 0u);
+    for (uint32_t t = 0; t < NB_T; ++t)
+        matIdxWords[t >> 1] |= uint32_t(TRI_MAT[t]) << (16u * (t & 1u));
+
+    std::vector<PxsDeformableSurfaceMaterialData> mats(NB_MAT);
+    for (uint32_t m = 0; m < NB_MAT; ++m)
+    {
+        std::memset(&mats[m], 0, sizeof(mats[m]));
+        mats[m].elasticityDamping = MAT_DAMP[m];
+        // Poison the neighbouring fields: a port reading thickness (@12) or
+        // bendingStiffness (@16) instead of elasticityDamping (@20) lands here.
+        mats[m].youngs = 1.0e6f; mats[m].poissons = 0.45f;
+        mats[m].dynamicFriction = 0.31f; mats[m].thickness = 0.41f;
+        mats[m].bendingStiffness = 0.51f; mats[m].bendingDamping = 0.61f;
+    }
+
+    DevBuf bPos = makeDev(dev, positions), bVel = makeDev(dev, vels);
+    DevBuf bDelta = makeDev(dev, deltas), bTri = makeDev(dev, triIdx);
+    DevBuf bMatIdx = makeDev(dev, matIdxWords), bMat = makeDev(dev, mats);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    c.mVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVel.addr));
+    c.mAccumulatedDeltaVel = reinterpret_cast<float4*>(size_t(bDelta.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<uint4*>(size_t(bTri.addr));
+    c.mMaterialIndices = reinterpret_cast<PxU16*>(size_t(bMatIdx.addr));
+    c.mNbVerts = NB_V;
+    c.mNbTriangles = NB_T;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    InPlaneDampPush push = {};
+    push.femCloths = bDesc.addr;
+    push.activeIds = bActive.addr;
+    push.materials = bMat.addr;
+    push.dt = dt;
+
+    Kernel k("femClothDampingBda.spv", "cloth_accumulateInPlaneDampingDeltaVelocity", {},
+             sizeof(InPlaneDampPush));
+    k.dispatch(1u, {}, push, /*gridY*/ 1u, /*gridZ*/ 1u);
+    dev->flush();
+
+    std::vector<float> want(size_t(NB_V + SLACK) * 4u);
+    for (uint32_t i = 0; i < NB_V + SLACK; ++i)
+    { want[i * 4 + 0] = deltasIn[i].x; want[i * 4 + 1] = deltasIn[i].y;
+      want[i * 4 + 2] = deltasIn[i].z; want[i * 4 + 3] = deltasIn[i].w; }
+    inPlaneRef(dt, want);
+
+    const auto got = downloadBuffer<F4>(dev, bDelta.h, NB_V + SLACK);
+    uint32_t touched = 0, contended = 0, seeded = 0;
+    for (uint32_t i = 0; i < NB_V; ++i)
+    {
+        if (hits[i]) ++touched;
+        if (hits[i] > 1u) ++contended;
+        if (hits[i] == 1u &&
+            (deltasIn[i].x != 0.0f || deltasIn[i].y != 0.0f || deltasIn[i].z != 0.0f)) ++seeded;
+        PXG_CHECK_MSG(hits[i] <= 2u,
+                      "vertex %u has %u contributors -- with three the sum is (s+a)+b+c in "
+                      "SOME order and no seed makes that order-independent", i, hits[i]);
+        PXG_CHECK_MSG(hits[i] <= 1u || (deltasIn[i].x == 0.0f && deltasIn[i].y == 0.0f &&
+                                        deltasIn[i].z == 0.0f),
+                      "vertex %u is contended and was seeded non-zero -- (s+a)+b != (s+b)+a "
+                      "and this comparison would be asserting a race", i);
+    }
+    PXG_CHECK_MSG(touched > 0 && contended > 0 && seeded > 0,
+                  "%u vertices touched, %u contended, %u single-writer-and-seeded -- the "
+                  "fixture must exercise the contended path AND the add-not-assign path",
+                  touched, contended, seeded);
+
+    for (uint32_t i = 0; i < NB_V + SLACK; ++i)
+    {
+        PXG_CHECK_MSG(f2u(got[i].x) == f2u(want[i * 4 + 0]) &&
+                      f2u(got[i].y) == f2u(want[i * 4 + 1]) &&
+                      f2u(got[i].z) == f2u(want[i * 4 + 2]),
+                      "vertex %u delta is (%.9g %.9g %.9g), expected (%.9g %.9g %.9g)", i,
+                      double(got[i].x), double(got[i].y), double(got[i].z),
+                      double(want[i * 4 + 0]), double(want[i * 4 + 1]), double(want[i * 4 + 2]));
+        PXG_CHECK_MSG(f2u(got[i].w) == f2u(deltasIn[i].w),
+                      "vertex %u delta .w changed (%g -> %g) -- AtomicAdd(float4*, i, PxVec3) "
+                      "touches x, y and z only", i, double(deltasIn[i].w), double(got[i].w));
+    }
+
+    uint32_t live = 0, pinnedTris = 0;
+    for (uint32_t t = 0; t < NB_T; ++t)
+    {
+        if (clamp01(MAT_DAMP[TRI_MAT[t]] * dt) == 0.0f) continue;
+        ++live;
+        if (INV_MASS[TRIS[t][0]] == 0.0f && INV_MASS[TRIS[t][1]] == 0.0f &&
+            INV_MASS[TRIS[t][2]] == 0.0f) ++pinnedTris;
+    }
+    PXG_CHECK_MSG(pinnedTris > 0,
+                  "no LIVE triangle has all three vertices pinned -- weightFactor never goes "
+                  "infinite, the deltas never go NaN, and deleting the per-vertex atomic "
+                  "guard is invisible");
+    std::printf("    [ note ] %u triangles (%u live, %u gated by clamp, %u of the live ones "
+                "fully pinned), %u vertices touched: %u contended (zero-seeded), %u "
+                "single-writer with a live seed; bit-exact\n", NB_T, live, NB_T - live,
+                pinnedTris, touched, contended, seeded);
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bDelta.h);
+    dev->destroyBuffer(bTri.h); dev->destroyBuffer(bMatIdx.h); dev->destroyBuffer(bMat.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
+
+namespace dmp
+{
+// ---- the bending scene -----------------------------------------------------
+// Four triangle pairs over the same eight vertices, split shared/non-shared at
+// NB_SHARED.  The uint4 order is the CUDA's and NOT the obvious one:
+//     .x, .y = the two TIPS      .z, .w = the shared EDGE (the hinge axis)
+static const uint32_t NB_TP = 4u;
+static const uint32_t NB_SHARED_TP = 2u;
+static const uint32_t PAIRS[NB_TP][4] = {
+    { 0u, 3u, 1u, 2u },   // shared 0   -- vertex 3 is PINNED, so its atomic is gated
+    { 4u, 5u, 6u, 7u },   // shared 1   -- gated out by zero flexural stiffness
+    { 2u, 6u, 0u, 4u },   // non-shared 0
+    { 1u, 7u, 3u, 5u },   // non-shared 1 -- gated out by zero damping
+};
+// .x rest angle (unread here), .y flexural stiffness, .z bending damping.
+static const float PAIR_COEFF[NB_TP][3] = {
+    { 0.21f, 1.5f, 3.0f },   // live, factor 0.3
+    { 0.31f, 0.0f, 4.0f },   // stiffness 0 -> gated
+    { 0.41f, 2.5f, 6.0f },   // live, factor 0.6
+    { 0.51f, 1.0f, 0.0f },   // damping 0 -> gated
+};
+
+// --- cloth_accumulateBendingDampingDeltaVelocity (FEMCloth.cu:1046) ---------
+static void bendingRef(float dt, std::vector<float>& delta /* (NB_V+slack)*4 */)
+{
+    for (uint32_t t = 0; t < NB_TP; ++t)
+    {
+        const float dampingFactor = clamp01(PAIR_COEFF[t][2] * dt);
+        if (dampingFactor == 0.0f || PAIR_COEFF[t][1] == 0.0f) continue;
+
+        // D9: A and B are the EDGE (.z, .w); C and C2 are the TIPS (.x, .y).
+        const uint32_t iA = PAIRS[t][2], iB = PAIRS[t][3];
+        const uint32_t iC = PAIRS[t][0], iC2 = PAIRS[t][1];
+        const float imA = INV_MASS[iA], imB = INV_MASS[iB];
+        const float imC = INV_MASS[iC], imC2 = INV_MASS[iC2];
+
+        const V3 velA = v3(VEL[iA][0], VEL[iA][1], VEL[iA][2]);
+        const V3 velB = v3(VEL[iB][0], VEL[iB][1], VEL[iB][2]);
+        const V3 velC = v3(VEL[iC][0], VEL[iC][1], VEL[iC][2]);
+        const V3 velC2 = v3(VEL[iC2][0], VEL[iC2][1], VEL[iC2][2]);
+        const V3 posA = v3(POS[iA][0], POS[iA][1], POS[iA][2]);
+        const V3 posB = v3(POS[iB][0], POS[iB][1], POS[iB][2]);
+        const V3 posC = v3(POS[iC][0], POS[iC][1], POS[iC][2]);
+        const V3 posC2 = v3(POS[iC2][0], POS[iC2][1], POS[iC2][2]);
+
+        // D13: the mean of the TWO EDGE velocities, not of all four.
+        const V3 linearVelocity = mul(0.5f, add(velA, velB));
+
+        V3 edgeDir = sub(posB, posA);
+        if (normalize3(edgeDir) < 1e-6f) continue;
+
+        const V3 relVelTip1 = sub(velC, linearVelocity);
+        const V3 relVelTip2 = sub(velC2, linearVelocity);
+
+        V3 tip1Dir = cross3(edgeDir, sub(posC, posA));
+        const float d1 = normalize3(tip1Dir);
+        V3 tip2Dir = cross3(edgeDir, sub(posC2, posA));
+        const float d2 = normalize3(tip2Dir);
+
+        const float rot1 = dot3(tip1Dir, relVelTip1) / d1;
+        const float rot2 = dot3(tip2Dir, relVelTip2) / d2;
+        const float deltaRotVelDamp = (rot2 - rot1) * dampingFactor;
+
+        // D14: opposite signs on the two tips.
+        V3 dT1 = mul(deltaRotVelDamp * d1, tip1Dir);
+        V3 dT2 = mul(-deltaRotVelDamp * d2, tip2Dir);
+        V3 dA = v3(0.0f, 0.0f, 0.0f), dB = v3(0.0f, 0.0f, 0.0f);
+
+        const float weightFactor = 1.0f / (imA + imB + imC + imC2);
+        const V3 avg = mul(0.25f, add(add(dA, dB), add(dT1, dT2)));
+        dA = sub(dA, avg); dB = sub(dB, avg); dT1 = sub(dT1, avg); dT2 = sub(dT2, avg);
+        // D15: NO second dampingFactor -- it is already inside deltaRotVelDamp.
+        dT1 = mul(imC * weightFactor, dT1);
+        dT2 = mul(imC2 * weightFactor, dT2);
+        dA = mul(imA * weightFactor, dA);
+        dB = mul(imB * weightFactor, dB);
+
+        const uint32_t idx[4] = { iA, iB, iC, iC2 };
+        const V3 dv[4] = { dA, dB, dT1, dT2 };
+        const float im[4] = { imA, imB, imC, imC2 };
+        for (int k = 0; k < 4; ++k)
+            if (im[k] != 0.0f)
+            { delta[idx[k] * 4 + 0] += dv[k].x;
+              delta[idx[k] * 4 + 1] += dv[k].y;
+              delta[idx[k] * 4 + 2] += dv[k].z; }
+    }
+}
+} // namespace dmp
+
+// ---------------------------------------------------------------------------
+// cloth_accumulateBendingDampingDeltaVelocity, against FEMCloth.cu:1046.
+//
+// Same seeding rule as the in-plane twin: zero at contended vertices, live seed
+// at single-writer ones, both compared bit-exactly.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimBendingDamping)
+{
+    using namespace dmp;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const float dt = 0.1f;   // 3.0 -> 0.3, 6.0 -> 0.6; both strictly inside [0,1]
+    const uint32_t SLACK = 4u;
+
+    std::vector<F4> positions(NB_V), vels(NB_V), deltas(NB_V + SLACK);
+    for (uint32_t i = 0; i < NB_V; ++i)
+    {
+        positions[i] = F4{ POS[i][0], POS[i][1], POS[i][2], INV_MASS[i] };
+        vels[i] = F4{ VEL[i][0], VEL[i][1], VEL[i][2], INV_MASS[i] };
+    }
+
+    uint32_t hits[NB_V] = { 0 };
+    for (uint32_t t = 0; t < NB_TP; ++t)
+    {
+        if (clamp01(PAIR_COEFF[t][2] * dt) == 0.0f || PAIR_COEFF[t][1] == 0.0f) continue;
+        for (int k2 = 0; k2 < 4; ++k2) if (INV_MASS[PAIRS[t][k2]] != 0.0f) hits[PAIRS[t][k2]]++;
+    }
+    for (uint32_t i = 0; i < NB_V + SLACK; ++i)
+    {
+        const bool contended = (i < NB_V) && (hits[i] > 1u);
+        deltas[i] = contended
+            ? F4{ 0.0f, 0.0f, 0.0f, 4.25f + float(i) }
+            : F4{ -0.04f * float(i), 0.06f * float(i), -0.01f * float(i), 4.25f + float(i) };
+    }
+    const std::vector<F4> deltasIn = deltas;
+
+    // Two ordered arrays, and the non-shared one is indexed from ZERO.
+    std::vector<uint32_t> sharedIdx(NB_SHARED_TP * 4u), nonSharedIdx((NB_TP - NB_SHARED_TP) * 4u);
+    std::vector<F4> sharedCoeff(NB_SHARED_TP), nonSharedCoeff(NB_TP - NB_SHARED_TP);
+    for (uint32_t t = 0; t < NB_TP; ++t)
+    {
+        const bool shared = t < NB_SHARED_TP;
+        const uint32_t k = shared ? t : t - NB_SHARED_TP;
+        uint32_t* dst = shared ? &sharedIdx[k * 4] : &nonSharedIdx[k * 4];
+        for (int c = 0; c < 4; ++c) dst[c] = PAIRS[t][c];
+        const F4 co{ PAIR_COEFF[t][0], PAIR_COEFF[t][1], PAIR_COEFF[t][2], 0.0f };
+        (shared ? sharedCoeff[k] : nonSharedCoeff[k]) = co;
+    }
+
+    DevBuf bPos = makeDev(dev, positions), bVel = makeDev(dev, vels);
+    DevBuf bDelta = makeDev(dev, deltas);
+    DevBuf bSi = makeDev(dev, sharedIdx), bNsi = makeDev(dev, nonSharedIdx);
+    DevBuf bSc = makeDev(dev, sharedCoeff), bNsc = makeDev(dev, nonSharedCoeff);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bPos.addr));
+    c.mVelocity_InvMass = reinterpret_cast<float4*>(size_t(bVel.addr));
+    c.mAccumulatedDeltaVel = reinterpret_cast<float4*>(size_t(bDelta.addr));
+    c.mOrderedSharedTrianglePairVertexIndices = reinterpret_cast<uint4*>(size_t(bSi.addr));
+    c.mOrderedNonSharedTrianglePairVertexIndices = reinterpret_cast<uint4*>(size_t(bNsi.addr));
+    c.mOrderedSharedRestBendingAngle_flexuralStiffness_damping =
+        reinterpret_cast<float4*>(size_t(bSc.addr));
+    c.mOrderedNonSharedRestBendingAngle_flexuralStiffness_damping =
+        reinterpret_cast<float4*>(size_t(bNsc.addr));
+    c.mNbVerts = NB_V;
+    c.mNbTrianglePairs = NB_TP;
+    c.mNbSharedTrianglePairs = NB_SHARED_TP;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+    std::vector<uint32_t> active = { 0u };
+    DevBuf bActive = makeDev(dev, active);
+
+    BendingDampPush push = {};
+    push.femCloths = bDesc.addr;
+    push.activeIds = bActive.addr;
+    push.dt = dt;
+
+    Kernel k("femClothDampingBda.spv", "cloth_accumulateBendingDampingDeltaVelocity", {},
+             sizeof(BendingDampPush));
+    k.dispatch(1u, {}, push, /*gridY*/ 1u, /*gridZ*/ 1u);
+    dev->flush();
+
+    std::vector<float> want(size_t(NB_V + SLACK) * 4u);
+    for (uint32_t i = 0; i < NB_V + SLACK; ++i)
+    { want[i * 4 + 0] = deltasIn[i].x; want[i * 4 + 1] = deltasIn[i].y;
+      want[i * 4 + 2] = deltasIn[i].z; want[i * 4 + 3] = deltasIn[i].w; }
+    bendingRef(dt, want);
+
+    uint32_t touched = 0, contended = 0, seeded = 0, sharedLive = 0, nonSharedLive = 0;
+    for (uint32_t t = 0; t < NB_TP; ++t)
+        if (clamp01(PAIR_COEFF[t][2] * dt) != 0.0f && PAIR_COEFF[t][1] != 0.0f)
+            (t < NB_SHARED_TP ? sharedLive : nonSharedLive)++;
+    for (uint32_t i = 0; i < NB_V; ++i)
+    {
+        if (hits[i]) ++touched;
+        if (hits[i] > 1u) ++contended;
+        if (hits[i] == 1u && (deltasIn[i].x != 0.0f || deltasIn[i].y != 0.0f)) ++seeded;
+        PXG_CHECK_MSG(hits[i] <= 2u, "vertex %u has %u contributors -- no seed makes three "
+                      "atomic adds order-independent", i, hits[i]);
+    }
+    PXG_CHECK_MSG(sharedLive > 0 && nonSharedLive > 0,
+                  "%u shared and %u non-shared pairs survive the gates -- BOTH ordered arrays "
+                  "must be read, or the index split at mNbSharedTrianglePairs is untested",
+                  sharedLive, nonSharedLive);
+    PXG_CHECK_MSG(touched > 0 && contended > 0 && seeded > 0,
+                  "%u touched, %u contended, %u seeded single-writer -- the fixture must "
+                  "exercise all three", touched, contended, seeded);
+
+    const auto got = downloadBuffer<F4>(dev, bDelta.h, NB_V + SLACK);
+    for (uint32_t i = 0; i < NB_V + SLACK; ++i)
+    {
+        PXG_CHECK_MSG(f2u(got[i].x) == f2u(want[i * 4 + 0]) &&
+                      f2u(got[i].y) == f2u(want[i * 4 + 1]) &&
+                      f2u(got[i].z) == f2u(want[i * 4 + 2]),
+                      "vertex %u delta is (%.9g %.9g %.9g), expected (%.9g %.9g %.9g)", i,
+                      double(got[i].x), double(got[i].y), double(got[i].z),
+                      double(want[i * 4 + 0]), double(want[i * 4 + 1]), double(want[i * 4 + 2]));
+        PXG_CHECK_MSG(f2u(got[i].w) == f2u(deltasIn[i].w),
+                      "vertex %u delta .w changed -- the atomic touches x, y and z only", i);
+    }
+
+    std::printf("    [ note ] %u pairs (%u shared live, %u non-shared live, %u gated), "
+                "%u vertices touched: %u contended, %u single-writer seeded; bit-exact\n",
+                NB_TP, sharedLive, nonSharedLive, NB_TP - sharedLive - nonSharedLive,
+                touched, contended, seeded);
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bDelta.h);
+    dev->destroyBuffer(bSi.h); dev->destroyBuffer(bNsi.h);
+    dev->destroyBuffer(bSc.h); dev->destroyBuffer(bNsc.h);
+    dev->destroyBuffer(bDesc.h); dev->destroyBuffer(bActive.h);
+}
+
 } // namespace

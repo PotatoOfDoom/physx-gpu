@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 357;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 360;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -442,9 +442,9 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_queryRigidClothContactReferenceCountTGSLaunch", "femClothRigidContactBda.spv", "cloth_queryRigidClothContactReferenceCountTGSLaunch" },  // CLOTH_QUERY_RIGID_CLOTH_REFERENCE_COUNT_TGS (P7.1 tranche 4b-3 BDA port: TGS cloth-vs-rigid contact reference-count query)
     { "cloth_solveRigidClothAttachmentTGSLaunch", "femClothRigidAttachBda.spv", "cloth_solveRigidClothAttachmentTGSLaunch" },  // CLOTH_SOLVE_RIGID_CLOTH_ATTACHMENT_TGS (P7.1 tranche 3a BDA port: TGS rigid/world attachment solve)
     { "cloth_sleeping", "femClothSimBda.spv", "cloth_sleeping" },  // CLOTH_SLEEPING (P7.0 BDA port: wake-counter bookkeeping)
-    { "cloth_accumulateInPlaneDampingDeltaVelocity", nullptr, nullptr },  // CLOTH_IN_PLANE_DAMPING (unmapped)
-    { "cloth_accumulateBendingDampingDeltaVelocity", nullptr, nullptr },  // CLOTH_BENDING_DAMPING (unmapped)
-    { "cloth_applyAccumulatedDeltaVelocity", nullptr, nullptr },  // CLOTH_APPLY_ACCUMULATED_DAMPING (unmapped)
+    { "cloth_accumulateInPlaneDampingDeltaVelocity", "femClothDampingBda.spv", "cloth_accumulateInPlaneDampingDeltaVelocity" },  // CLOTH_IN_PLANE_DAMPING (P9.19)
+    { "cloth_accumulateBendingDampingDeltaVelocity", "femClothDampingBda.spv", "cloth_accumulateBendingDampingDeltaVelocity" },  // CLOTH_BENDING_DAMPING (P9.19)
+    { "cloth_applyAccumulatedDeltaVelocity", "femClothDampingBda.spv", "cloth_applyAccumulatedDeltaVelocity" },  // CLOTH_APPLY_ACCUMULATED_DAMPING (P9.19)
     { "fem_reorderRigidContactsLaunch", "femClothContactSortBda.spv", "fem_reorderRigidContactsLaunch" },  // FEM_REORDER_RS_CONTACTS (P7.1 tranche 4b-1 BDA port)
     { "clampMaxValue", "particleContactSortBda.spv", "clampMaxValue" },  // CLAMP_MAX_VALUE (P6.1 BDA re-point)
     { "clampMaxValues", "femContactSortBda.spv", "clampMaxValues" },  // CLAMP_MAX_VALUES (P8.20 BDA re-point)
