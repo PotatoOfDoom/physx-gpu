@@ -1,0 +1,23 @@
+# Waivers for check_speculated_loads.py (P9.23).
+#
+# FORMAT
+#   <shader>|<function>|<ptr>[<index expr>] | why the index cannot leave the allocation
+#
+# The key is exactly the string the checker prints for the finding.
+#
+# WHAT BELONGS HERE, and what does not.
+#
+# A waiver is a claim that the SPECULATED address -- the one the platform forms
+# for lanes the guard excludes -- still lands inside the allocation.  It is not a
+# claim that the guard is correct; the guard is always correct, that is the whole
+# point of P9.22.  So a waiver has to name the OTHER thing that bounds the index,
+# and if there is no other thing, the site needs a clamp instead:
+#
+#     const uint safeIndex = min(rawIndex, count - 1u);
+#
+# See countAt in npRigidSumBatches.slang (P9.22) and the six clamped loops in
+# femClothRigidContactBda.slang / softBodyRigidContactBda.slang (P9.23).
+#
+# The file is EMPTY on purpose.  Every HIGH finding this audit produced was
+# either fixed or reclassified by a rule that applies to all sites rather than to
+# one, and a waiver that could have been a rule is a rule nobody else gets.

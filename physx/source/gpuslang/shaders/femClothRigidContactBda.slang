@@ -234,9 +234,20 @@ void cloth_rigidContactPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uin
 
     for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
-        const uint workIndex = i * RC_BLOCK + idx + nbIterationsPerBlock * groupId.x * RC_BLOCK;
-        if (workIndex >= tNumContacts)
+        const uint rawWorkIndex = i * RC_BLOCK + idx + nbIterationsPerBlock * groupId.x * RC_BLOCK;
+        if (rawWorkIndex >= tNumContacts)
             return;
+
+        // P9.23: THE GUARD ABOVE IS PER-LANE, so this platform turns it into a
+        // mask -- every read below is still ISSUED for the lanes it excludes,
+        // with an address built from the unclamped index.  That is the defect
+        // P9.22 measured as a crash (see countAt in npRigidSumBatches.slang).
+        // Clamping once here keeps those speculated addresses inside the
+        // allocation; for any lane the guard admits, workIndex == rawWorkIndex,
+        // so nothing computed changes.  tNumContacts is at least 1 wherever this
+        // line runs -- nbIterationsPerBlock is 0 otherwise, and that condition is
+        // uniform, so the loop is not entered at all.
+        const uint workIndex = min(rawWorkIndex, tNumContacts - 1u);
 
         rigidLambdaNs[workIndex] = 0.0f;
 
@@ -352,9 +363,20 @@ void queryRigidClothContactReferenceCount(bool isTGS, uint idx, uint blockX)
 
     for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
-        const uint workIndex = i * RC_BLOCK + idx + nbIterationsPerBlock * blockX * RC_BLOCK;
-        if (workIndex >= tNumContacts)
+        const uint rawWorkIndex = i * RC_BLOCK + idx + nbIterationsPerBlock * blockX * RC_BLOCK;
+        if (rawWorkIndex >= tNumContacts)
             return;
+
+        // P9.23: THE GUARD ABOVE IS PER-LANE, so this platform turns it into a
+        // mask -- every read below is still ISSUED for the lanes it excludes,
+        // with an address built from the unclamped index.  That is the defect
+        // P9.22 measured as a crash (see countAt in npRigidSumBatches.slang).
+        // Clamping once here keeps those speculated addresses inside the
+        // allocation; for any lane the guard admits, workIndex == rawWorkIndex,
+        // so nothing computed changes.  tNumContacts is at least 1 wherever this
+        // line runs -- nbIterationsPerBlock is 0 otherwise, and that condition is
+        // uniform, so the loop is not entered at all.
+        const uint workIndex = min(rawWorkIndex, tNumContacts - 1u);
 
         const uint64_t ciBase = gQuery.contactInfos + uint64_t(workIndex) * CI_STRIDE;
         const uint rigidMatInd = Ptr<uint>(ciBase + CI_rigidMatInd)[0];
@@ -473,9 +495,20 @@ void solveRigidClothContact(bool isTGS, uint idx, uint blockX)
 
     for (uint i = 0; i < nbIterationsPerBlock; ++i)
     {
-        const uint workIndex = i * RC_BLOCK + idx + nbIterationsPerBlock * blockX * RC_BLOCK;
-        if (workIndex >= tNumContacts)
+        const uint rawWorkIndex = i * RC_BLOCK + idx + nbIterationsPerBlock * blockX * RC_BLOCK;
+        if (rawWorkIndex >= tNumContacts)
             return;
+
+        // P9.23: THE GUARD ABOVE IS PER-LANE, so this platform turns it into a
+        // mask -- every read below is still ISSUED for the lanes it excludes,
+        // with an address built from the unclamped index.  That is the defect
+        // P9.22 measured as a crash (see countAt in npRigidSumBatches.slang).
+        // Clamping once here keeps those speculated addresses inside the
+        // allocation; for any lane the guard admits, workIndex == rawWorkIndex,
+        // so nothing computed changes.  tNumContacts is at least 1 wherever this
+        // line runs -- nbIterationsPerBlock is 0 otherwise, and that condition is
+        // uniform, so the loop is not entered at all.
+        const uint workIndex = min(rawWorkIndex, tNumContacts - 1u);
 
         const uint64_t ciBase = gSolve.contactInfos + uint64_t(workIndex) * CI_STRIDE;
         const uint rigidMatInd = Ptr<uint>(ciBase + CI_rigidMatInd)[0];

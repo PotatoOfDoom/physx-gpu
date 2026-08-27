@@ -2123,3 +2123,12 @@ add_test(NAME gpuslang.barrierUniformity
 # has grown too generous to discriminate.
 add_test(NAME gpuslang.cudaTwinKernels
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_cuda_twin_kernels.py)
+
+# P9.23: BDA reads whose only protection is a per-lane guard.  This platform
+# turns such a guard into a mask and issues the load anyway, so the out-of-range
+# address is still formed and dereferenced -- which is what P9.22 measured as a
+# crash.  No fixture can see it (the value is discarded), no mutant can (same
+# reason), and spirv-val cannot (the SPIR-V is valid; the speculation happens in
+# the driver's back end).  This check is the only thing in the build that can.
+add_test(NAME gpuslang.speculatedLoads
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_speculated_loads.py)

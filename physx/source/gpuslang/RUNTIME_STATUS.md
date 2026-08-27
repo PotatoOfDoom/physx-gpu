@@ -7,7 +7,11 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **819/819** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **820/820** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.23 added `gpuslang.speculatedLoads`, the third static checker in the suite
+after `gpuslang.barrierUniformity` (P9.16) and `gpuslang.cudaTwinKernels`
+(P9.20) — all three exist because no fixture and no mutant can see what they
+check.
 Szenen: **33/33** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (32 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
@@ -1708,6 +1712,155 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.23 — der Korpus-Audit zu P9.22: 330 Stellen mit dem Muster, **fünf** davon ohne Schrankenweite, alle fünf erledigt — und ein Prüfer, der dreimal sich selbst widerlegt hat
+
+P9.22 fand die erste Stelle, an der eine korrekte Schranke die **Adressbildung**
+nicht verhindert. Diese Tranche fragt, wie viele es sind. Neuer Prüfer
+`tools/check_speculated_loads.py`, als `gpuslang.speculatedLoads` verdrahtet,
+Suite **819 → 820**. Kein Manifest, kein Shader-Verhalten geändert — sechs
+Schleifen geklemmt, alle wertgleich.
+
+### Warum das ein Prüfer sein muss und keine Vorrichtung
+
+Diesen Defekt kann **nichts** im bestehenden Verifikationsweg sehen:
+
+* die Vorrichtungen nicht — der spekulierte Wert wird von der Auswahl verworfen,
+  also stimmt jede Ausgabe;
+* das Fegen nicht — aus demselben Grund;
+* `spirv-val` nicht — das SPIR-V ist gültig, die Spekulation entsteht erst im
+  LLVM-Rücken des Treibers;
+* `robustBufferAccess` auch nicht, und zwar doppelt: es ist in
+  `PxgVulkanComputeDevice.cpp` gar nicht aktiviert, **und** es gälte für
+  `PhysicalStorageBuffer` ohnehin nicht — BDA kennt keine Robustheit.
+
+### Die Einteilung ist über die DISTANZ, nicht über die Form
+
+Jede gefundene Stelle hat denselben Defekt. Was sich unterscheidet — und was
+allein entscheidet, ob sie je einen Fehler auslösen kann statt nur Unsinn zu
+lesen, den die Auswahl wegwirft — ist, **wie weit** hinter das Ende die
+spekulierte Adresse reichen kann. Jede Stufe ist deshalb eine Aussage, die der
+Prüfer aus der betrachteten Funktion tatsächlich herleiten kann:
+
+| Stufe | Behauptung | Zahl |
+|---|---|---|
+| `LOW-loop` | der Index ist die Laufvariable einer Schleife, deren Bedingung die Grenze ist → Überschritt ≤ eine Schrittweite | **70** |
+| `LOW-launch` | der Index wird **in dieser Funktion** aus einer Thread-ID zugewiesen; der Start ist auf die Datengröße aufgerundet → Überschritt < eine Arbeitsgruppe | **259** |
+| `LOW-const` | der Index ist durch eine Konstante zur Übersetzungszeit begrenzt | **1** |
+| **`HIGH`** | der Index ist ein **Parameter** oder kommt aus dem Speicher — die Beziehung zur Puffergröße liegt in einem Aufrufer, hier begrenzt nichts die Distanz | **5 → 0** |
+
+Die LOW-Stufen sind **nicht** „sicher". Sie sind undefiniertes Verhalten mit
+begrenzter Reichweite, was auf dieser Plattform heißt: sie landen in
+abgebildetem Speicher und sind unsichtbar. Sie stehen getrennt, damit die
+HIGH-Liste etwas bleibt, das ein Mensch abarbeiten kann.
+
+### Der Prüfer hat sich dreimal selbst widerlegt, und das ist der Ertrag
+
+Der erste Entwurf meldete **349 HIGH**. Das ist kein Tor, das ist Lärm — und die
+Ursache war jedes Mal ein Fehler im Prüfer, nicht im Korpus:
+
+1. **Die Einteilung maß die Form statt der Distanz.** „Schleifengrenze ja/nein"
+   sagt nichts darüber, wie weit der Index über die Grenze hinausgehen kann. Mit
+   den vier Distanz-Stufen oben: 349 → **22**.
+2. **Die RICHTUNG des Vergleichs fehlte.**
+   `bodyVelocities[outputBody + totalBodyCount + bodyOffset]` unter
+   `if (bodyId < totalBodyCount)` traf auf `totalBodyCount` — die **Grenze**, die
+   im Indexausdruck vorkommt — und wurde gemeldet, als schränke der Wächter den
+   Index ein. Vier der 22. Jetzt werden Seite und Operator gelesen und mit der
+   Wächterart verrechnet: 22 → **18**.
+3. **Der Speicherfilter sah nur direkt hinter `]`.**
+   `dbg[globalWarpIndex].rotOut0 = rot0;` ist ein **Schreib**zugriff, aber das
+   `=` steht nicht neben der Klammer. **Dreizehn** der 18 waren dasselbe
+   Versehen. 18 → **5**.
+
+Dass am Ende 5 statt 349 stehen, ist also nicht Nachjustieren bis die Zahl
+gefällt, sondern dreimal ein nachweisbarer Fehler im Werkzeug. Der Selbsttest ist
+das, was diese Behauptung trägt: er spielt die P9.22-Fassung von `countAt`
+zurück und verlangt, dass sie **HIGH** wird — nach jeder dieser drei
+Verschärfungen erneut. Ein Prüfer, der auf reparierten Code schweigt, beweist
+nichts, bis er auf kaputtem laut ist.
+
+### Die fünf, und was aus ihnen wurde
+
+| Stelle | Befund |
+|---|---|
+| `femClothRigidContactBda.slang` ×2, `softBodyRigidContactBda.slang` ×2 | **dieselbe Form wie der bewiesene Absturz**: `workIndex = i*RC_BLOCK + idx + nbIterationsPerBlock*blockX*RC_BLOCK`, Wächter `if (workIndex >= tNumContacts) return;`, danach jeder Zugriff über `workIndex` adressiert |
+| `npArtiAvgImpulse.slang:808` | `jfSlice[ind]` unter `if (ind < dofCount)`, wobei `ind` die Laufvariable von `for (ind = 0u; ind < 3u; ++ind)` ist — der Überschritt ist höchstens **zwei** Elemente |
+
+Die vier ersten sind behoben, und zwar an **sechs** Schleifen (je drei pro
+Datei: prepare, query, solve — der Prüfer sah nur vier davon, weil die übrigen
+Lesezugriffe über die Inline-Form `Ptr<float4>(...)[i]` oder über
+Adressarithmetik laufen, die er nicht erfasst). Der Eingriff ist der kleinste
+wertgleiche:
+
+```slang
+const uint rawWorkIndex = i * RC_BLOCK + idx + nbIterationsPerBlock * blockX * RC_BLOCK;
+if (rawWorkIndex >= tNumContacts)
+    return;
+const uint workIndex = min(rawWorkIndex, tNumContacts - 1u);
+```
+
+Die Umbenennung an **einer** Stelle lässt jede Verwendung darunter die geklemmte
+Fassung erben — kein weiterer Eingriff, und für jede Lane, die der Wächter
+zulässt, ist `workIndex == rawWorkIndex`.
+
+Der fünfte ist **nicht** freigestellt worden, sondern durch eine Regel neu
+eingeordnet, die für alle Stellen gilt: ist der Index die Laufvariable einer
+umschließenden Schleife über eine Konstante, begrenzt diese Schleife die
+Distanz, ganz gleich wie der Wächter aussieht. Eine Ausnahme, die eine Regel
+hätte sein können, ist eine Regel, die niemand sonst bekommt — die
+Ausnahmeliste ist deshalb **leer** und sagt das in ihrem Kopf.
+
+### Ein Eingriff mit einer Annahme, und die Messung, die sie prüft
+
+Klemmen ist nur dann harmlos, wenn **Schreib**zugriffe für ausgeschlossene Lanes
+tatsächlich maskiert sind. Wären sie es nicht, schriebe eine ausgeschlossene
+Lane nach der Klemmung nicht mehr irgendwohin, sondern auf das **gültige**
+Element `tNumContacts - 1` — schlimmer als vorher. Diese Annahme wird nicht
+behauptet, sondern gemessen: die betroffenen Vorrichtungen prüfen die
+Schreibmenge sentinel-genau, und die Suite ist nach der Klemmung in **beiden**
+Speichermodi grün. Wären Schreibzugriffe unmaskiert, hätte genau das es gemeldet.
+
+### Was der Prüfer NICHT sieht, benannt statt verschwiegen
+
+* **Adressarithmetik**: `Ptr<uint>(base + i * STRIDE)[0]` hat den Index 0 und
+  fällt durch. Die eigentliche Grenzüberschreitung steckt in `base`. Genau
+  deshalb wurden oben sechs Schleifen geklemmt, wo der Prüfer nur vier Stellen
+  meldete.
+* **die Inline-Form** `Ptr<T>(addr)[i]` — nur benannte `Ptr<>`-Werte werden
+  verfolgt.
+* **`else`-Zweige**: die Bedingung eines `else`-Blocks wird nicht invertiert
+  ausgewertet.
+* **flussunempfindlich** bei Ausstiegs-Wächtern: ein `if (...) return;` weiter
+  oben in derselben Funktion zählt, auch wenn es den Lesezugriff nicht
+  dominiert. Absichtlich — die P9.22-Stelle hatte genau diese Form, und
+  Flussempfindlichkeit hätte sie übersehen.
+
+Diese vier stehen im Kopf des Prüfers, weil eine Liste ohne ihre Lücken als
+Vollständigkeit gelesen wird.
+
+### Verifikation
+
+* Prüfer **grün**, Selbsttest bestanden, als `gpuslang.speculatedLoads`
+  verdrahtet, Suite **819 → 820**;
+* Suite **820/820** in **beiden** Speichermodi;
+* **kein Fegen**: die sechs Klemmungen ändern keine berechnete Größe, sondern nur
+  die Adresse, die ein verworfenes Laden bildet. Ein Mutant, der eine Klemmung
+  entfernt, ist ausgabegleich — das ist ja der ganze Befund. Was sie belegt, ist
+  der Prüfer, und der trägt seine eigene Negativkontrolle;
+* Manifest unverändert **362**;
+* Szenen **nicht** gefahren: diese Tranche fasst kein Manifest, keine ABI-Zeile
+  und keine berechnete Größe an. Dieselbe Begründung wie P9.18.
+
+### Was das über „der Prüfer meldet 349 Stellen" sagt
+
+Die erste Zahl war nicht die Wahrheit über den Korpus, sondern über mein
+Werkzeug. Es ist verführerisch, eine große Zahl als „so schlimm ist es eben"
+stehen zu lassen und eine Grundlinie daraus zu machen; das hätte 344 Fehlalarme
+für alle Zeit festgeschrieben und die fünf echten darin begraben. Die Zahl fiel
+jedes Mal, weil ich eine Stichprobe **gelesen** habe, statt sie zu zählen — und
+jede der drei Verschärfungen musste danach am Selbsttest erneut beweisen, dass
+sie den bekannten Fehler noch sieht.
 
 ## P9.22 — der „sporadische Ausfall unter `-j`" war nie sporadisch und nie unter `-j`: ein **spekulierter** Lesezugriff außerhalb der Grenzen, gefunden, erklärt, behoben
 
