@@ -104,6 +104,7 @@ import pxgSlangFEMClothDesc;   // PxgFEMClothGpu (mPosition_InvMass @16, mNbVert
 import pxgSlangSphereBox;      // P9.15a: spherebox, lifted out of fcStaticTriCloth
 import pxgSlangBv32;           // P9.15b: the BV32 node reader (P8.25), shared
 import pxgSlangConvexTriCloth; // P9.15c: the lifted convex-vs-triangle core
+import pxgSlangVertexConvexCloth; // P9.21: the lifted vertex-vs-convex core
 
 // PxGeometryType (PxGeometry.h): eSPHERE 0, ePLANE 1, eCAPSULE 2, ... eTRIANGLEMESH 8.
 static const uint GEOM_SPHERE = 0u;
@@ -1317,4 +1318,144 @@ void cloth_boxTriangleContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid 
 void cloth_convexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     clothConvexTriCgBody(gtid, gid);
+}
+
+// ===========================================================================
+// P9.21 -- cloth_convexVertexContactGenLaunch
+// gpunarrowphase/src/CUDA/femClothPrimitives.cu:2243 (wrapper), :2148-2241
+// (clothVertexConvexCollision), :2027 (closestVertToConvex), :1975
+// (computeClosestPolygon), :1961 (distancePointSegment), all read in full.
+//
+// The SECOND half of the cloth-vs-convex chain and the last kernel the
+// `clothconvex` scene was still asking for.  P9.20 landed the triangle half and
+// the cloth went on falling through the hull; the box path had the same shape --
+// P9.15a landed the VERTEX kernel and the cloth caught at 0.4933, P9.15d/e
+// landed the TRIANGLE kernel and refined it to 0.6871.  The vertex path is what
+// catches; the triangle path refines.
+//
+// The closest-point algebra is the shared pxgSlangVertexConvexCloth module,
+// which fcVertexConvex's Phase-1 battery verifies against a C++ host mirror of
+// the CUDA.  What is below is only the glue that battery deliberately does not
+// carry, and the traps are all in the glue.
+//
+// ---------------------------------------------------------------------------
+// TRAPS
+// ---------------------------------------------------------------------------
+// W1 -- THE ARGUMENT PACK IS THE BOX-TRIANGLE PACK.  Fifteen arguments, same
+//     order, same types, same 184-byte blob and the same ABI row
+//     (kClothBoxTriCg); the only textual difference in the two CUDA signatures
+//     is that `femClothes` loses its `const` here.  So this kernel reuses
+//     ClothBoxTriParams / gBTri rather than declaring a fourth blob.  It is NOT
+//     a twin of them -- the BODIES are unrelated (see W5) -- and
+//     check_cuda_twin_kernels.py is deliberately not extended to claim it is.
+//
+// W2 -- THE PAIR STACK IS A DIFFERENT STACK.  These uint4s are
+//     (cmIdx, VERTEX index), written by cloth_midphaseGenerateVertexPairsLaunch
+//     (CLOTH_MIDPHASE_VERTEX_PRIMS, the top of this file), while the triangle
+//     kernel above consumes (cmIdx, TRIANGLE index) from
+//     cloth_midphaseGeneratePairsLaunch.  Same buffer, same counter, same push
+//     field -- the engine simply refills it between the two dispatches.  A port
+//     that pairs the wrong producer with the wrong consumer indexes the vertex
+//     array with triangle ids and still runs.
+//
+// W3 -- THE FILTER IS A SINGLE MATCH, the OPPOSITE quantifier from the triangle
+//     kernel's B1 three-corner AND.  One filtered vertex generates nothing:
+//         if (find(rigidId, PxEncodeClothIndex(clothId, vertexIdx))) return;
+//     Two kernels in one file, one filter list, opposite quantifiers.
+//
+// W4 -- restDistance by **cmIdx**, contactDistance by the two CACHE REFS and
+//     summed.  Same split as V6 and B6.
+//
+// W5 -- THE CONTACT POINT IS THE POINT ON THE CONVEX, and it is not computed the
+//     way the box sibling computes its own.  V1's box path takes
+//     `clothP - pen * normal`; here the closest point comes straight out of the
+//     query in the hull's VERTEX space, goes back to shape space through
+//     vertex2Shape and only then to world.  With a non-uniform scale those two
+//     constructions do not agree, because the normal is a COVARIANT vector and
+//     the point is not.
+//
+// W6 -- the grid-stride is `gridDim.x * blockDim.y` = 4096 * 2, reproduced as a
+//     constant because the bridge forwards only gridDim.  Same as B7, and the
+//     launch really is the same geometry (PxgNarrowphaseCore.cpp:6437: 4096
+//     blocks of (32, MIDPHASE_WARPS_PER_BLOCK, 1)).
+//
+// W7 -- `stackSizeNeededOnDevice` is an atomicMax of the UNCLAMPED count times
+//     16, by one thread of the grid.  Same as B4.
+//
+// DEVIATION: the CUDA runs one WARP per pair over a shared ConvexScratch; the
+// module is per-thread (its own header records why that is output-identical --
+// every reduction is order-fixed and the only atomic is the single output
+// reservation, and the CUDA already gates the write on lane 0).  So lane 0 owns
+// the pair and lanes 1..31 return.
+// ===========================================================================
+[shader("compute")]
+[numthreads(32, 2, 1)]
+void cloth_convexVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    if (gtid.x != 0u)
+        return;
+    const uint globalWarpIdx = gtid.y + gid.x * BTRI_WARPS_PER_BLOCK;
+
+    const uint stackSize = gBTri.stackSizeBytes / 16u;
+    const uint numFound = Ptr<uint>(gBTri.midphasePairsNum)[0];
+    const uint numPairs = min(numFound, stackSize);
+
+    Ptr<uint4> pairs = Ptr<uint4>(gBTri.stackPtr);
+    Ptr<PxgFEMClothGpu> femClothes = Ptr<PxgFEMClothGpu>(gBTri.femClothes);
+    Ptr<PxsCachedTransform> transformCache = Ptr<PxsCachedTransform>(gBTri.transformCache);
+    Ptr<float> contactDistance = Ptr<float>(gBTri.contactDistance);
+
+    FvcWriter w;
+    w.point = gBTri.b_outPoint;  w.normalPen = gBTri.b_outNormalPen;
+    w.bary = gBTri.b_outBarycentric; w.info = gBTri.b_outContactInfo;
+    w.count = gBTri.b_totalContactCount; w.byX = gBTri.b_contactByX;
+    w.tempByX = gBTri.b_tempContactByX;  w.idxByX = gBTri.b_contactIndexSortedByX;
+    w.maxContacts = gBTri.b_maxNumContacts;
+
+    for (uint i = globalWarpIdx; i < numPairs; i += BTRI_GRID * BTRI_WARPS_PER_BLOCK)  // W6
+    {
+        const uint4 curPair = pairs[i];
+        const uint cmIdx = curPair.x;
+        const uint vertexIdx = curPair.y;                                  // W2
+
+        PxgShape clothShape, rigidShape;
+        uint clothCacheRef, rigidCacheRef;
+        loadClothRigidPair(gBTri.cmInputs, gBTri.gpuShapes, cmIdx,
+                           clothShape, clothCacheRef, rigidShape, rigidCacheRef);
+
+        const uint2 rigidId = Ptr<uint2>(gBTri.shapeToRigidRemap)[rigidCacheRef];
+        const uint clothId = clothShape.particleOrSoftbodyId;
+        const uint clothMask = (clothId << PXG_CLOTH_ID_SHIFT) | vertexIdx;
+
+        // W3: a SINGLE match suppresses this vertex entirely.
+        if (findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, uint2(clothMask, 0u)))
+            continue;
+
+        const PxsCachedTransform rtc = transformCache[rigidCacheRef];
+        const float4 rigidQ = float4(rtc.qx, rtc.qy, rtc.qz, rtc.qw);
+        const float3 rigidP = float3(rtc.px, rtc.py, rtc.pz);
+
+        Ptr<float4> verts = Ptr<float4>(femClothes[clothId].mPosition_InvMass);
+        const float3 clothP = verts[vertexIdx].xyz;
+
+        FvcCase cs;
+        // W4: contactDistance by the two cache refs, restDistance by cmIdx.
+        cs.clothP = float4(clothP, contactDistance[clothCacheRef] + contactDistance[rigidCacheRef]);
+        cs.rigidP = float4(rigidP, Ptr<float>(gBTri.restDistance)[cmIdx]);
+        cs.rigidQ = rigidQ;
+        cs.convexScale = float4(rigidShape.scaleX, rigidShape.scaleY, rigidShape.scaleZ, 0.0f);
+        cs.convexScaleRot = float4(rigidShape.scaleRotX, rigidShape.scaleRotY,
+                                   rigidShape.scaleRotZ, rigidShape.scaleRotW);
+        cs.ids = uint4(rigidId.x, rigidId.y, clothId, vertexIdx);
+        cs.ids2 = uint4(rigidShape.materialIndex, 0u, 0u, 0u);
+
+        const uint64_t hullAddr = uint64_t(rigidShape.hullOrMeshOffset.x) |
+                                  (uint64_t(rigidShape.hullOrMeshOffset.y) << 32);
+
+        fcClothVertexConvexContactGen(cs, hullAddr, w);                    // W5
+    }
+
+    // W7: the UNCLAMPED count, in bytes, by one thread of the grid.
+    if (globalWarpIdx == 0u)
+        InterlockedMax(Ptr<uint>(gBTri.stackSizeNeeded)[0], numFound * 16u);
 }

@@ -1613,6 +1613,15 @@ static const PxgKernelAbiRow kRows[] = {
     // (P9.15e).  Sharing the row is what keeps that correction from having to be
     // rediscovered on the second name.
     { "cloth_convexContactGenLaunch", kClothBoxTriCg, uint32_t(sizeof(kClothBoxTriCg)) },
+    // P9.21: a THIRD name on the row, and this one is NOT a twin of the other two.
+    // cloth_convexVertexContactGenLaunch (femClothPrimitives.cu:2243) takes the same
+    // fifteen arguments in the same order -- the only textual difference in the
+    // three signatures is that this one's femClothes* is non-const -- but its BODY
+    // is unrelated: it walks the hull for a closest point to a cloth VERTEX where
+    // the other two run convex-vs-TRIANGLE SAT.  Sharing an ABI row is a claim
+    // about the ARGUMENT PACK only; check_cuda_twin_kernels.py is what claims two
+    // bodies are one, and it is deliberately not extended to this name.
+    { "cloth_convexVertexContactGenLaunch", kClothBoxTriCg, uint32_t(sizeof(kClothBoxTriCg)) },
     // gpunarrowphase FEMCloth-vs-rigid contact SORT / reorder (P7.1 tranche 4b-1 BDA)
     { "fem_reorderRigidContactsLaunch", kFemReorderRSContacts, uint32_t(sizeof(kFemReorderRSContacts)) },
     // gpusimulationcontroller FEMCloth-vs-rigid contact PREPARE + query/solve (P7.1 tranche 4b-2/3 BDA)

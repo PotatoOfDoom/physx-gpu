@@ -62,37 +62,25 @@ set(SHADER_DIR ${GPUSLANG_ROOT}/shaders)
 set(SHADER_OUT_DIR ${CMAKE_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
 
+# Every shader depends on every module: slangc resolves `import` by file name out
+# of SHADER_DIR, so a module edit must rebuild each .spv that imports it.
+#
+# P9.21 GLOBS the pxgSlang* modules instead of naming them.  The hand-written
+# list had drifted to TWENTY missing entries -- pxgSlangBv32, pxgSlangSphereBox,
+# pxgSlangConvexTriCloth, pxgSlangGjk, pxgSlangEpa, the articulation trio and the
+# rest -- so editing any of them left every importing .spv stale until something
+# else forced a recompile.  That is not a cosmetic gap for this tranche in
+# particular: P9.21 adds a differential that compares two shaders which compile
+# the SAME lifted module, and a stale half would make it compare an old core
+# against a new one and call the difference a glue bug.
+#
+# CONFIGURE_DEPENDS re-globs on build, so a NEW module is picked up without a
+# manual cmake run.  The three non-module files below are named individually
+# because they are shaders that other shaders import, which no naming
+# convention marks.
+file(GLOB SHADER_MODULE_DEPS CONFIGURE_DEPENDS ${SHADER_DIR}/pxgSlang*.slang)
 set(SHADER_COMMON_DEPS
-    ${SHADER_DIR}/pxgSlangCommon.slang
-    ${SHADER_DIR}/pxgSlangScan.slang
-    ${SHADER_DIR}/pxgSlangPrepCommon.slang
-    ${SHADER_DIR}/pxgSlangWarpInc.slang
-    ${SHADER_DIR}/pxgSlangBpDesc.slang
-    ${SHADER_DIR}/pxgSlangSolverDesc.slang
-    ${SHADER_DIR}/pxgSlangSolverBlocks.slang
-    ${SHADER_DIR}/pxgSlangSimCoreDesc.slang
-    ${SHADER_DIR}/pxgSlangCacheBound.slang
-    ${SHADER_DIR}/pxgSlangPrepDesc.slang
-    ${SHADER_DIR}/pxgSlangParticleDesc.slang
-    ${SHADER_DIR}/pxgSlangParticleContact.slang
-    ${SHADER_DIR}/pxgSlangFEMClothDesc.slang
-    ${SHADER_DIR}/pxgSlangSoftBodyDesc.slang
-    ${SHADER_DIR}/pxgSlangClothMembrane.slang
-    ${SHADER_DIR}/pxgSlangClothBending.slang
-    ${SHADER_DIR}/pxgSlangNpAbi.slang
-    ${SHADER_DIR}/pxgSlangPolyClip.slang
-    ${SHADER_DIR}/pxgSlangConvexHull.slang
-    ${SHADER_DIR}/pxgSlangConvexSat.slang
-    ${SHADER_DIR}/pxgSlangContactReduce.slang
-    ${SHADER_DIR}/pxgSlangCvxTriEmit.slang
-    ${SHADER_DIR}/pxgSlangCvxTriSetup.slang
-    ${SHADER_DIR}/pxgSlangMidphaseAlloc.slang
-    ${SHADER_DIR}/pxgSlangRadixWarp.slang
-    ${SHADER_DIR}/pxgSlangTex3d.slang
-    ${SHADER_DIR}/pxgSlangSdfTexture.slang
-    ${SHADER_DIR}/pxgSlangSdfCollision.slang
-    ${SHADER_DIR}/pxgSlangSdfFind.slang
-    ${SHADER_DIR}/pxgSlangSdfParticle.slang
+    ${SHADER_MODULE_DEPS}
     ${SHADER_DIR}/npCvxCollide.slang
     ${SHADER_DIR}/npCvxStage2Core.slang
     ${SHADER_DIR}/npSpherePrimitives.slang)
@@ -111,7 +99,11 @@ set(PXG_NOCONTRACT_SHADERS npCvxCoreEpa npCvxCorePlaneGen npCvxCoreCvxGen npD6Jo
     # measured that instead of the glue it is meant to measure.  The Phase-1 battery
     # compares against a CPU reference built with -ffp-contract=off, so stamping this
     # shader moves it TOWARD that reference, not away.
-    fcConvexTri)
+    fcConvexTri
+    # P9.21: fcVertexConvex joins for exactly the same reason -- it and
+    # femClothContactGenBda now compile the SAME pxgSlangVertexConvexCloth, and
+    # the P9.21 differential compares their contact streams bit for bit.
+    fcVertexConvex)
 
 # pxg_compile_shader(<file-stem> <entry> [<entry> ...])
 function(pxg_compile_shader stem)
@@ -734,7 +726,8 @@ pxg_compile_shader(femClothContactGenBda cloth_midphaseGenerateVertexPairsLaunch
                    cloth_boxVertexContactGenLaunch
                    cloth_midphaseGeneratePairsLaunch
                    cloth_boxTriangleContactGenLaunch
-                   cloth_convexContactGenLaunch)
+                   cloth_convexContactGenLaunch
+                   cloth_convexVertexContactGenLaunch)
 # P7.1 tranche 4b-1: cloth-vs-rigid contact SORT / reorder on the engine ABI (BDA)
 # — the second half of the cloth-drape-on-a-floor arc.  The single reorder kernel
 # gathers the 4a-generated cloth-vs-rigid contacts into the sorted buffers through
