@@ -1788,11 +1788,12 @@ Wiederholung kein Schuldposten, sondern der Zweck.
 
 * SPIR-V: **6 von 6** bitgleich im Nicht-Debug-Strom;
 * Suite **818/818** in **beiden** Speichermodi;
-* Szenen: **LÄUFT NOCH** — Ergebnis im Folge-Commit, statt hier eine ungemessene
-  Zahl zu behaupten. Hier ist die Erwartung sogar schärfer als in P9.17a, weil
-  **alle sechs** Shader bitgleich sind: die Engine bekommt dieselben Binärdateien
-  wie vorher. Der Lauf steht trotzdem im Protokoll, weil er in P9.15e gefunden
-  hat, was zwei grüne Vorrichtungen nicht finden konnten;
+* Szenen: **31 ok, 0 fail, 0 missing** — nachgetragen, nachdem der Lauf durch
+  war; bis dahin stand hier ausdrücklich „läuft noch" statt einer ungemessenen
+  Zahl. Die Erwartung war hier schärfer als in P9.17a, weil **alle sechs** Shader
+  bitgleich sind: die Engine bekommt dieselben Binärdateien wie vorher. Der Lauf
+  steht trotzdem im Protokoll, weil er in P9.15e gefunden hat, was zwei grüne
+  Vorrichtungen nicht finden konnten;
 * Modul-Fegen **nicht wiederholt** — die neun Regel-Mutanten wurden in P9.17a
   zwangsfrisch gegen `femClothSimTriMidphase` getötet (9 von 9), und genau
   darum ging es beim Heben: die Regeln sind **einmal** geprüft, nicht je
