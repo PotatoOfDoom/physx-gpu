@@ -1798,9 +1798,13 @@ Sie meldet pro Lauf, welche Kernel die Szene anfordert und nicht bekommt, und
   den P9.15d mit 13 von 13 gefegt hat. Ein zweiter Durchgang über denselben Code
   unter einem zweiten Namen misst nichts Neues — was er messen müsste, ist die
   **Gleichheit der CUDA-Rümpfe**, und genau das tut der neue Prüfer;
-* Szenen: **LÄUFT NOCH** — Ergebnis im Folge-Commit statt einer ungemessenen
-  Zahl. Erwartet werden die 32 gewerteten unverändert plus `clothconvex` in der
-  Liste ausstehender Arbeit, wo es die zwei Kernel meldet, die es anfordert;
+* Szenen: **32 ok, 0 fail, 0 missing** — die gewertete Liste ist von dieser
+  Tranche unberührt. `clothconvex` steht in der Liste ausstehender Arbeit und
+  meldet dort **genau einen** fehlenden Kernel, zehnmal pro Lauf:
+  `cloth_convexVertexContactGenLaunch`. (Vor dem Abbilden der Dreiecks-Zeile
+  waren es zwei; dass jetzt nur noch einer übrig ist, ist der messbare Ertrag
+  dieser Tranche — die Szene ist von zwei fehlenden Gliedern auf eines
+  gekommen.);
 * **ein Standardlauf der Suite fiel einmal durch**, vier unmittelbar folgende
   Läufe (einer davon `PXG_DEVICE_V2=1`) waren 819/819. **Ich habe den Namen des
   fehlgeschlagenen Tests nicht gefasst** — das Protokoll wurde vom
