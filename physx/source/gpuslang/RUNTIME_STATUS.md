@@ -1705,6 +1705,115 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.18 — `calcGridHashInBounds` war in Phase 2 vollständig ungeprüft: vier lebende Aufrufstellen, und jede Implementierung, die 0 zurückgab, hätte bestanden
+
+Kein neuer Kernel, kein Shader angefasst: **nur eine Vorrichtung**, und sie
+schließt eine Lücke, die sie selbst seit P9.14b im Klartext notiert hatte.
+Manifest unverändert **357**, Suite **818/818**.
+
+### Die Lücke, in der Schreibweise der Vorrichtung selbst
+
+Alle drei Partikel-Kontakterzeugungs-Vorrichtungen fuhren ein **1×1×1**-Gitter
+und sagten es dazu:
+
+```
+m.mCommonData.mGridSizeX = 1u;   // 1x1x1 -> gridHash is always 0
+```
+
+Das ist keine Vereinfachung, das ist eine Abschaltung. Mit einer Zelle klemmt
+`calcWrappedGridRangeSize` den Bereich auf (1,1,1), `calcGridOffsetInRange`
+liefert (0,0,0) für **jeden** Zellversatz, und `calcGridHash` maskiert jede
+Komponente mit `(1-1) == 0`. Der Rückgabewert ist konstant null, egal was
+darüber steht. `calcGridHashInBounds` hat in `psContactGenBda` **vier lebende
+Aufrufstellen** — und war von keiner davon geprüft.
+
+Die Vorrichtung wusste das und hatte den Weg schon aufgeschrieben:
+
+> „The cost is stated rather than hidden: `cell-hash-zero` (reading cell 0
+> instead of cell gridHash) is EQUIVALENT here … Pinning it wants its own
+> tranche with a host mirror of gridCal.cuh — an ENGINE header, so not a second
+> transcription of ours."
+
+Diese Tranche ist genau die.
+
+### Das Orakel stammt aus der ENGINE, und das ist der Grund, warum es zulässig ist
+
+Der Host-Spiegel ist Funktion für Funktion aus der CUDA dieses Repositoriums
+abgeschrieben, mit Zeilenangabe an jeder:
+
+| Funktion | Quelle |
+|---|---|
+| `gcCalcGridPos` | `gridCal.cuh:34` |
+| `gcCalcGridHash` | `gridCal.cuh:46` (die Maske ist **vorzeichenbehaftet**, wie die CUDA sie schreibt) |
+| `gcCalcWrappedGridRangeSize` | `gridCal.cuh:86` |
+| `gcCalcGridOffsetInRange` | `gridCal.cuh:97` |
+| `gcCalcGridHashInBounds` | `cudaParticleSystem.cu:96` — die Komposition, um die es geht |
+| `gcOverlapBound` | `cudaParticleSystem.cu:84-93` + `PxBounds3.h:442` |
+
+Ein Host-Spiegel **unseres Slang** würde nur beweisen, dass zwei Kopien
+übereinstimmen — was ein Differential zwischen zwei Kopien desselben Fehlers
+ebenfalls beweist. Ein Spiegel der Engine ist dieselbe Beziehung, die jede
+Phase-1-Batterie zu ihrer Referenz hat.
+
+### Die Vorrichtung, und was jede ihrer Zahlen erzwungen hat
+
+Nichts an der neuen Form ist Geschmack. **Jede** Zahl wurde von einem Mutanten
+erzwungen, der ohne sie überlebte:
+
+| Eigenschaft | der Mutant, der sie erzwungen hat |
+|---|---|
+| Gitter **2×2**×1, nicht 2×1×1 | `g6-range-not-clamped` und `g7-offset-xy-swapped`. Bei `gridSize.y == 1` ist `rs.y` immer 1 — die ganze y-Arithmetik **und** die Klemmung sind tot. |
+| **vier** Zellen mit **verschiedenen** Zählwerten (3, 8, 9, 6) | die Prüfung selbst: gleichmäßige Achtel gaben Zellen 1 und 2 je 8 Kontakte, und zwei Zellen mit gleicher Annahme sind austauschbar. |
+| Paar 1 liest **drei** von vier Zellen | `g3-hash-from-max-corner`, `g8-gridpos-trunc-not-floor`. Beide **etikettieren die Zellen nur um**; liest ein Paar alle, bleibt seine Vereinigung gleich und die Umetikettierung unsichtbar. |
+| Paar 2 liest **zwei** | `g7` allein. Es vertauscht die Versätze 1 und 2, und ein Paar, das das Präfix {0,1,2} liest, ist unter dieser Vertauschung **abgeschlossen** — gleiche Menge, andere Reihenfolge, unsichtbar. {0,1} ist es nicht. |
+
+Die Kontrollen halten das fest, statt es dem Zufall zu überlassen: jede Zelle
+muss **erreicht** werden, keine zwei Zellen dürfen gleich viele Kontakte
+annehmen, die drei Paare müssen **drei verschiedene** Zellmengen lesen, und die
+Überlappungsgrenzen dürfen nicht auf einer Zellgrenze liegen (sonst ist die
+Abrundung eine Messerschneide und das Orakel nicht mehr exakt).
+
+**Eine dieser Kontrollen hat sofort etwas gefunden**, das ich sonst übersehen
+hätte: bei gleichmäßiger Aufteilung nahmen Zellen 1 und 2 beide acht Kontakte
+an. Die Vorrichtung wäre grün gewesen und ein Zelltausch trotzdem unsichtbar.
+
+### Das Fegen, in drei Durchgängen
+
+| Durchgang | Ergebnis |
+|---|---|
+| 1 (Gitter 2×1×1, zwei Zellen, zwei Paare) | 4 getötet, **4 überlebt** |
+| 2 (Gitter 2×2×1, vier Zellen, Paare 4+3) | 7 getötet, **1 überlebt** |
+| 3 (drittes Paar mit zwei Arbeitsindizes) | **8 getötet, 0 überlebt** |
+
+`g1-hash-always-zero` — der Mutant, den die Vorrichtung selbst als „EQUIVALENT
+here" verbucht hatte — stirbt schon im ersten Durchgang. Die drei weiteren
+Durchgänge gingen nicht um ihn, sondern um die Frage, wie **viel** von der
+Kodierung eine Vorrichtung sehen kann, die nur die Vereinigung vergleicht.
+
+### Verifikation
+
+* Fegen **8 von 8 getötet, 0 überlebt**, zwangsfrisch;
+* Vorrichtung grün, und ihre Notiz nennt die Zahlen: Gitter 2×2×1, Arbeitsindizes
+  lesen die Zellen `1 0 3 2 | 1 0 3 | 1 0`, Zellen nehmen 3 8 9 6 an;
+* Suite **818/818** in **beiden** Speichermodi;
+* **Szenen NICHT gefahren, und das ist hier kein Auslassen.** Diese Tranche
+  ändert genau eine Datei, und die ist eine Testdatei: kein Shader, kein
+  Manifest, keine ABI-Zeile, kein Byte, das die Engine sieht. Der Szenenlauf
+  bleibt für die Tranchen, die Engine-sichtbares anfassen — dort hat er in
+  P9.15e gefunden, was zwei grüne Vorrichtungen nicht finden konnten.
+
+### Was noch offen ist, und ehrlich benannt
+
+Die beiden **anderen** Vorrichtungen — `testPsContactGen` (Primitive) und
+`testPsDiffuseContactGen` (diffuse Primitive) — fahren weiterhin ein
+1×1×1-Gitter. Ihre beiden Aufrufstellen von `calcGridHashInBounds` sind damit
+weiterhin nur mittelbar gedeckt: es ist **dieselbe Funktion in derselben
+Übersetzungseinheit**, und sie ist jetzt achtfach gefegt — aber der Weg von
+ihrem Rückgabewert zu `mCellStart[gridHash]` ist in jenen beiden Kernen nicht
+gepinnt. `testPsContactGen` fährt genau **ein** Partikel, was dort einen
+größeren Umbau bedeutet als hier; das ist eine eigene Tranche und keine
+Fußnote.
+
 ## P9.17b — der Engine-Pfad ist vollständig auf dem Modul (12 von 12, SPIR-V bitgleich), und die Phase-1-Shader bleiben absichtlich draußen
 
 P9.17a hat die acht BV32-Bit-Regeln ins Modul gehoben und die sechs Dateien

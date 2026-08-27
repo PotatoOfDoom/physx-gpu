@@ -150,9 +150,164 @@ struct HostContact { F4 normal_pen; uint64_t rigidId; uint64_t particleId; };
 // ---------------------------------------------------------------------------
 // The scene.
 // ---------------------------------------------------------------------------
-static const uint32_t NB_PARTICLES = 40u;     // in the live cell
-static const uint32_t CELL_START = 4u;        // the live cell's span ...
-static const uint32_t CELL_END = 36u;         // ... 32 particles
+// Shape bounds, at file scope because the ORACLE needs them too: the cell a work
+// item reads is calcGridHashInBounds of the pair's fattened OVERLAP region, so
+// the expected set cannot be written without them.
+static const float SHAPE_BMN[3][3] = { { -9.0f, -3.0f, -7.0f },   // shape 0, the particles
+                                       { -4.0f, -8.0f, -5.0f },   // shape 1, the hull
+                                       { -9.0f, -3.0f, -7.0f } }; // shape 2, the CCD particles
+static const float SHAPE_BMX[3][3] = { {  6.0f,  9.0f,  4.0f },
+                                       {  8.0f,  5.0f,  9.0f },
+                                       {  6.0f,  9.0f,  4.0f } };
+static const float GRID_CELL_WIDTH = 1.0f;
+// 2x2x1.  The Y AXIS IS NOT DECORATION: with gridSize.y == 1 the wrapped range
+// size is 1 in y whatever the bounds, so calcGridOffsetInRange's y term is always
+// zero and both its y arithmetic AND the clamp in calcWrappedGridRangeSize are
+// unobservable.  Two mutants survived the first P9.18 sweep on exactly that.
+static constexpr uint32_t GRID_SIZE[3] = { 2u, 2u, 1u };   // power of two per axis
+// THE PAIR TABLE, AND IT IS DELIBERATELY LOPSIDED -- 4, 3 and 2 work items.
+//
+// Every count in that list was forced by a mutant that survived without it:
+//
+//   * FOUR (pair 0) -- full coverage, so every cell is reached and the contact
+//     set is the same one the fixture always compared.
+//   * THREE (pair 1) -- symmetric coverage cannot see a PERMUTATION of the cell
+//     mapping: when a pair reads every cell, relabelling which work item gets
+//     which leaves its union, and therefore the compared multiset, identical.
+//     Two mutants lived on that (hashing from the max corner, and truncating
+//     instead of flooring; both merely relabel).  Missing one cell makes the
+//     relabelling visible because the MISSED cell changes.
+//   * TWO (pair 2) -- three is still not enough for one of them.  Swapping the
+//     x and y terms of calcGridOffsetInRange exchanges offsets 1 and 2, and a
+//     pair reading the prefix {0,1,2} is CLOSED under that swap -- same set,
+//     different order, invisible.  A pair reading {0,1} is not.
+//
+// Pair 2 runs system A against the hull again, with its own rest distance, so it
+// also gives restDistances[pos] a third value to be wrong about.
+static constexpr uint32_t CVX_NB_PAIRS = 3u;
+static constexpr uint32_t CVX_WORK_COUNT[CVX_NB_PAIRS] = { 4u, 3u, 2u };
+static constexpr uint32_t CVX_WORK_OFFSETS[CVX_NB_PAIRS] = { 0u, 4u, 7u };
+static constexpr uint32_t CVX_TOTAL_WORK = 9u;
+// Which particle system each pair drives, and which two shapes bound it.
+static constexpr uint32_t CVX_PAIR_SYS[CVX_NB_PAIRS] = { 0u, 1u, 0u };
+static constexpr uint32_t CVX_PAIR_SHAPE_A[CVX_NB_PAIRS] = { 0u, 1u, 0u };
+static constexpr uint32_t CVX_PAIR_SHAPE_B[CVX_NB_PAIRS] = { 1u, 2u, 1u };
+
+static const uint32_t NB_PARTICLES = 40u;
+// TWO CELLS, and that is the whole point of P9.18.
+//
+// Until this tranche every particle contact-gen fixture ran a 1x1x1 grid, and
+// said so: "gridHash is always 0".  With one cell calcWrappedGridRangeSize
+// clamps the range to (1,1,1), calcGridOffsetInRange returns (0,0,0) whatever
+// the cell offset, and calcGridHash masks every component with (1-1) == 0 --
+// so ANY implementation that returns zero passes.  The helper has FOUR live
+// call sites in psContactGenBda and was pinned by none of them.
+//
+// The cells are laid out in CELL_BOUNDS below.
+static const uint32_t CELL_START = 4u;
+static const uint32_t CELL_END = 36u;
+// Four cells of eight, and slots 0..3 and 36..39 outside all of them as the
+// decoys they always were.  CELL_START stays 4 so particlePos/particlePredicted
+// are untouched: this tranche changes which particles a work item READS, not
+// where any of them is.
+// UNEVEN ON PURPOSE.  Even eighths gave cells 1 and 2 the same accepted count,
+// and two cells that accept the same number are interchangeable -- swapping them
+// is then unobservable and the check below says so.  These four accept 3, 8, 9
+// and 6.  The split also keeps both marginal CCD particles (slots 5 and 9) in
+// cell 0 and the filtered slot (30) in cell 3, the two cells BOTH pairs read.
+static constexpr uint32_t CELL_BOUNDS[5] = { 4u, 12u, 20u, 29u, 36u };
+static constexpr uint32_t NB_CELLS = 4u;
+
+// ---------------------------------------------------------------------------
+// THE GRID-HASH ORACLE, TRANSCRIBED FROM THE ENGINE -- NOT FROM OUR PORT.
+//
+// Every line below comes from the CUDA in this repository, cited per function.
+// That distinction is the reason this oracle is admissible at all: a host mirror
+// of our own Slang would only prove the two agree with each other, which is what
+// a differential between two copies of the same mistake also proves.  gridCal.cuh
+// is an ENGINE header and cudaParticleSystem.cu an ENGINE kernel file, so this is
+// the same relationship every Phase-1 battery has to its reference.
+//
+// Integer arithmetic throughout except the initial floor, and the floors here sit
+// far from a cell boundary by construction (see the CHECK in checkRun), so this
+// is an exact oracle and not a tolerance.
+// ---------------------------------------------------------------------------
+struct I3 { int32_t x, y, z; };
+struct U3 { uint32_t x, y, z; };
+
+// gridCal.cuh:34
+static I3 gcCalcGridPos(const float p[3], float cellWidth)
+{
+    return I3{ int32_t(std::floor(p[0] / cellWidth)),
+               int32_t(std::floor(p[1] / cellWidth)),
+               int32_t(std::floor(p[2] / cellWidth)) };
+}
+
+// gridCal.cuh:46 -- the mask is signed, exactly as the CUDA writes it.
+static uint32_t gcCalcGridHash(I3 g, U3 s)
+{
+    g.x = g.x & int32_t(s.x - 1u);
+    g.y = g.y & int32_t(s.y - 1u);
+    g.z = g.z & int32_t(s.z - 1u);
+    return uint32_t((g.z * int32_t(s.y)) * int32_t(s.x) + g.y * int32_t(s.x) + g.x);
+}
+
+// gridCal.cuh:86
+static U3 gcCalcWrappedGridRangeSize(I3 mn, I3 mx, U3 s)
+{
+    auto cl = [](int32_t v, int32_t hi) { return uint32_t(v < 0 ? 0 : (v > hi ? hi : v)); };
+    return U3{ cl(mx.x - mn.x + 1, int32_t(s.x)),
+               cl(mx.y - mn.y + 1, int32_t(s.y)),
+               cl(mx.z - mn.z + 1, int32_t(s.z)) };
+}
+
+// gridCal.cuh:97
+static U3 gcCalcGridOffsetInRange(U3 rs, uint32_t off)
+{
+    return U3{ off % rs.x, (off / rs.x) % rs.y, off / (rs.x * rs.y) };
+}
+
+// cudaParticleSystem.cu:96 -- the composition, which is the thing P9.18 pins.
+static uint32_t gcCalcGridHashInBounds(const float bmn[3], const float bmx[3],
+                                       float cellWidth, uint32_t cellOffset, U3 gridSize)
+{
+    const I3 gpMin = gcCalcGridPos(bmn, cellWidth);          // calcGridRange, gridCal.cuh:105
+    const I3 gpMax = gcCalcGridPos(bmx, cellWidth);
+    const U3 rs = gcCalcWrappedGridRangeSize(gpMin, gpMax, gridSize);
+    const U3 off = gcCalcGridOffsetInRange(rs, cellOffset);
+    const I3 gp = I3{ gpMin.x + int32_t(off.x), gpMin.y + int32_t(off.y), gpMin.z + int32_t(off.z) };
+    return gcCalcGridHash(gp, gridSize);
+}
+
+// combine() + fattenFast(): cudaParticleSystem.cu:84-93 and PxBounds3.h:442.
+// The OVERLAP region of the two shapes, then grown by the pair's contact distance.
+static void gcOverlapBound(uint32_t shapeA, uint32_t shapeB, float cDistance,
+                           float omn[3], float omx[3])
+{
+    for (int k = 0; k < 3; ++k)
+    {
+        omn[k] = std::max(SHAPE_BMN[shapeA][k], SHAPE_BMN[shapeB][k]) - cDistance;
+        omx[k] = std::min(SHAPE_BMX[shapeA][k], SHAPE_BMX[shapeB][k]) + cDistance;
+    }
+}
+
+// The cell a given work item of a given pair reads.  `cellOffset` is
+// workIndex - offsets[pair], exactly as the kernel spells it.
+static uint32_t gcCellOfWorkItem(uint32_t shapeA, uint32_t shapeB, float cDistance,
+                                 uint32_t cellOffset)
+{
+    float omn[3], omx[3];
+    gcOverlapBound(shapeA, shapeB, cDistance, omn, omx);
+    return gcCalcGridHashInBounds(omn, omx, GRID_CELL_WIDTH, cellOffset,
+                                  U3{ GRID_SIZE[0], GRID_SIZE[1], GRID_SIZE[2] });
+}
+
+// The particle span of cell h, as uploaded to mCellStart / mCellEnd.
+static void gcCellSpan(uint32_t h, uint32_t& lo, uint32_t& hi)
+{
+    lo = CELL_BOUNDS[h];
+    hi = CELL_BOUNDS[h + 1u];
+}
 // Just BELOW the number of contacts the three work items produce, so the writer's
 // capacity gate fires -- and the COUNTER must still overshoot it, the same
 // contract as the diffuse one-way count in P9.13f/g.
@@ -162,7 +317,13 @@ static const uint32_t CELL_END = 36u;         // ... 32 particles
 // started surviving because the contacts they corrupted lost that race and were
 // never compared.  A cap that hides half the output hides half the errors.  The
 // check below also demands that the written set covers BOTH particle systems.
-static const uint32_t MAX_CONTACTS = 76u;
+// P9.18 re-cut this from 76.  The work items of a pair used to read the SAME cell
+// and produce every contact twice (82 total); now they read four DIFFERENT cells
+// and each particle is produced once per pair that reaches it (48).  The margin is
+// what matters, not the number: 54 of 58 leaves the gate firing on four contacts,
+// the same ~7% it hid before.  A cap that hides half the output hides half the
+// errors.
+static const uint32_t MAX_CONTACTS = 54u;
 static const uint32_t SLACK = 64u;
 // THE HULL IS NOT AXIS-IDENTITY, AND THAT IS THE POINT.
 //
@@ -192,11 +353,16 @@ static const float BOX_HY = 1.2f;
 static const float BOX_HZ = 2.8f;
 static const float BOX_CY = -1.2f;            // centre y -> top face at y = 0
 static const float CONTACT_OFFSET = 0.35f;
-static const float REST_DISTANCE = 0.02f;
-static const float REST_DISTANCE_B = 0.037f;   // pair 1, deliberately different
+static constexpr float REST_DISTANCE = 0.02f;
+static constexpr float REST_DISTANCE_B = 0.037f;   // pair 1, deliberately different
+static constexpr float REST_DISTANCE_C = 0.061f;   // pair 2, different again
+// Per pair, so a port that indexes restDistances by workIndex instead of by the
+// pair the binary search found lands on a value no pair owns.
+static constexpr float CVX_PAIR_REST[3] = { REST_DISTANCE, REST_DISTANCE_B, REST_DISTANCE_C };
 static const uint32_t NODE_INDEX = 77u;
 static const uint32_t FILTERED_UNSORTED = 903u;   // the unsorted id the pair matches
-static const uint32_t FILTERED_SORTED = 20u;      // which sorted slot carries it
+static const uint32_t FILTERED_SORTED = 30u;      // which sorted slot carries it
+                                                 // (cell 3, which BOTH pairs read)
 static const uint32_t MARGINAL_ISDIFFUSE = 5u;    // see particlePos
 static const uint32_t MARGINAL_MINSEP = 9u;
 static const float POISON_F = -8.25e3f;
@@ -428,13 +594,17 @@ static void buildRig(PxgSlangComputeDevice* dev, Rig& R)
     // reimplementing that helper -- an oracle that transcribes the code under
     // test a second time.  With one cell the question does not arise.
     //
-    // The cost is stated rather than hidden: `cell-hash-zero` (reading cell 0
-    // instead of cell gridHash) is EQUIVALENT here, and the grid-hash path is not
-    // pinned by this fixture or by the primitives one, which uses the same
-    // single-cell trick.  Pinning it wants its own tranche with a host mirror of
-    // gridCal.cuh -- an ENGINE header, so not a second transcription of ours.
-    R.bCellStart = R.mk(dev, std::vector<uint32_t>{ CELL_START });
-    R.bCellEnd = R.mk(dev, std::vector<uint32_t>{ CELL_END });
+    // P9.18 IS that tranche, and this is what it changed.  The paragraph above
+    // used to end "the grid-hash path is not pinned by this fixture", and the fix
+    // it named -- a host mirror of gridCal.cuh, an ENGINE header rather than a
+    // second transcription of ours -- is now in place above.  So the grid is TWO
+    // cells wide and the two work items of a pair land on DIFFERENT ones: the
+    // oracle no longer needs to assume which cell a work item reads, it computes
+    // it the way the engine does.
+    R.bCellStart = R.mk(dev, std::vector<uint32_t>{ CELL_BOUNDS[0], CELL_BOUNDS[1],
+                                                    CELL_BOUNDS[2], CELL_BOUNDS[3] });
+    R.bCellEnd = R.mk(dev, std::vector<uint32_t>{ CELL_BOUNDS[1], CELL_BOUNDS[2],
+                                                  CELL_BOUNDS[3], CELL_BOUNDS[4] });
 
     // The filter machinery: one pair naming (node, UNSORTED id).
     R.bRunsum = R.mk(dev, std::vector<uint32_t>{ 0u });
@@ -453,10 +623,10 @@ static void buildRig(PxgSlangComputeDevice* dev, Rig& R)
     std::vector<PxgParticleSystem> descArr(2);
     std::memset(descArr.data(), 0, descArr.size() * sizeof(PxgParticleSystem));
     PxgParticleSystem& m = descArr[0];
-    m.mCommonData.mGridCellWidth = 1.0f;
-    m.mCommonData.mGridSizeX = 1u;   // 1x1x1 -> gridHash is always 0; see bCellStart
-    m.mCommonData.mGridSizeY = 1u;
-    m.mCommonData.mGridSizeZ = 1u;
+    m.mCommonData.mGridCellWidth = GRID_CELL_WIDTH;
+    m.mCommonData.mGridSizeX = GRID_SIZE[0];   // 2x1x1 -- see the two-cell note above
+    m.mCommonData.mGridSizeY = GRID_SIZE[1];
+    m.mCommonData.mGridSizeZ = GRID_SIZE[2];
     m.mCommonData.mNumParticles = NB_PARTICLES;
     m.mCommonData.mNumParticleBuffers = 1u;
     m.mData.mFlags = 0u;             // no eENABLE_SPECULATIVE_CCD
@@ -499,28 +669,26 @@ static void buildRig(PxgSlangComputeDevice* dev, Rig& R)
 
     // Pair 0: system A (no CCD) vs the hull.  Pair 1: system B (CCD) vs the same
     // hull, with the particle shape in slot 1 so the LoadShapePair swap runs too.
-    std::vector<PxgContactManagerInput> cin(2);
+    std::vector<PxgContactManagerInput> cin(CVX_NB_PAIRS);
     std::memset(cin.data(), 0, cin.size() * sizeof(PxgContactManagerInput));
     cin[0].shapeRef0 = 0u;  cin[0].transformCacheRef0 = 0u;
     cin[0].shapeRef1 = 1u;  cin[0].transformCacheRef1 = 1u;
     cin[1].shapeRef0 = 1u;  cin[1].transformCacheRef0 = 1u;
     cin[1].shapeRef1 = 2u;  cin[1].transformCacheRef1 = 2u;
+    // Pair 2: system A against the hull again, so the only thing that separates
+    // it from pair 0 is its work-item count and its rest distance.
+    cin[2].shapeRef0 = 0u;  cin[2].transformCacheRef0 = 0u;
+    cin[2].shapeRef1 = 1u;  cin[2].transformCacheRef1 = 1u;
     R.bCin = R.mk(dev, cin);
 
     // DIFFERENT bounds per shape.  With one box for everything the overlap region
     // and the union are the same solid and X2's `combine` mutant is the identity;
     // these two overlap in a strictly smaller box than either.
     std::vector<float> boundsF(3 * 6, 0.0f);
-    const float bmn[3][3] = { { -9.0f, -3.0f, -7.0f },     // shape 0, the particles
-                              { -4.0f, -8.0f, -5.0f },     // shape 1, the hull
-                              { -9.0f, -3.0f, -7.0f } };   // shape 2, the CCD particles
-    const float bmx[3][3] = { {  6.0f,  9.0f,  4.0f },
-                              {  8.0f,  5.0f,  9.0f },
-                              {  6.0f,  9.0f,  4.0f } };
     for (uint32_t sh = 0; sh < 3; ++sh)
         for (int k = 0; k < 3; ++k)
-        { boundsF[size_t(sh) * 6 + k] = bmn[sh][k];
-          boundsF[size_t(sh) * 6 + 3 + k] = bmx[sh][k]; }
+        { boundsF[size_t(sh) * 6 + k] = SHAPE_BMN[sh][k];
+          boundsF[size_t(sh) * 6 + 3 + k] = SHAPE_BMX[sh][k]; }
     R.bBounds = R.mk(dev, boundsF);
 
     std::vector<float> cdist(3, 0.0f);
@@ -529,14 +697,22 @@ static void buildRig(PxgSlangComputeDevice* dev, Rig& R)
     R.bCd = R.mk(dev, cdist);
     // DIFFERENT rest distances, so a port that reads the wrong pair index lands
     // on a different penetration.
-    R.bRd = R.mk(dev, std::vector<float>{ REST_DISTANCE, REST_DISTANCE_B });
+    R.bRd = R.mk(dev, std::vector<float>{ CVX_PAIR_REST[0], CVX_PAIR_REST[1], CVX_PAIR_REST[2] });
     R.bMat = R.mk(dev, std::vector<uint32_t>(4u, POISON_U32));
-    // Pair 0 owns TWO cells, so `pos` and `workIndex` part company from work item
-    // 1 onward -- without that, restDistances[pos] and restDistances[workIndex]
-    // are the same expression.  Both of pair 0's work items resolve to a live
-    // cell, so its contacts are produced TWICE and the oracle follows.
-    R.bStart = R.mk(dev, std::vector<uint32_t>{ 0u, 2u });
-    R.bTotal = R.mk(dev, std::vector<uint32_t>{ 3u });
+    // BOTH pairs own TWO cells, so `pos` and `workIndex` still part company from
+    // work item 1 onward -- without that, restDistances[pos] and
+    // restDistances[workIndex] are the same expression.  What changed in P9.18 is
+    // that the two work items of a pair no longer resolve to the SAME cell: they
+    // resolve to cells 1 and 0 respectively (the oracle computes which), so each
+    // particle is produced ONCE and reading the wrong cell reads different
+    // particles instead of the same ones.
+    R.bStart = R.mk(dev, std::vector<uint32_t>{ CVX_WORK_OFFSETS[0], CVX_WORK_OFFSETS[1],
+                                                CVX_WORK_OFFSETS[2] });
+    R.bTotal = R.mk(dev, std::vector<uint32_t>{ CVX_TOTAL_WORK });
+    static_assert(CVX_WORK_OFFSETS[1] == CVX_WORK_COUNT[0], "pair 1 starts where pair 0 ends");
+    static_assert(CVX_WORK_OFFSETS[2] == CVX_WORK_COUNT[0] + CVX_WORK_COUNT[1], "pair 2 likewise");
+    static_assert(CVX_TOTAL_WORK == CVX_WORK_COUNT[0] + CVX_WORK_COUNT[1] + CVX_WORK_COUNT[2],
+                  "the dispatched total must be the sum of the per-pair counts");
     R.bRemap = R.mk(dev, std::vector<uint64_t>{ 0ull, uint64_t(NODE_INDEX), 0ull });
 
     // ---- writer outputs, poisoned past the live contacts ----
@@ -554,7 +730,7 @@ static void buildRig(PxgSlangComputeDevice* dev, Rig& R)
     R.bIbr = R.mk(dev, std::vector<uint32_t>(MAX_CONTACTS + SLACK, POISON_U32));
 
     std::memset(&R.blob, 0, sizeof(R.blob));
-    R.blob.numTests = 2u;
+    R.blob.numTests = CVX_NB_PAIRS;
     R.blob.toleranceLength = 1.0f;
     R.blob.cmInputs = R.bCin.addr;
     R.blob.shapes = R.bShapes.addr;
@@ -623,16 +799,43 @@ static bool ccdAccepted(uint32_t i, float scaleInv, float minSepFactor)
     return true;
 }
 
+// Which pair owns work item `w` -- the binary search the kernel does over the
+// per-pair offsets, spelled as a linear scan because three is three.
+static uint32_t cvxPairOfWork(uint32_t w)
+{
+    uint32_t pair = 0u;
+    for (uint32_t k = 0; k < CVX_NB_PAIRS; ++k) if (w >= CVX_WORK_OFFSETS[k]) pair = k;
+    return pair;
+}
+
+// Which cell work item `w` reads, computed the way the ENGINE computes it.
+static uint32_t cvxCellOfWork(uint32_t w)
+{
+    const uint32_t pair = cvxPairOfWork(w);
+    return gcCellOfWorkItem(CVX_PAIR_SHAPE_A[pair], CVX_PAIR_SHAPE_B[pair],
+                            CONTACT_OFFSET, w - CVX_WORK_OFFSETS[pair]);
+}
+
 // Which (system, particle) pairs must produce a contact, analytically.
 //   system 0: no CCD -> accepted when signedDistance(origin) <= cDistance.
 //   system 1: CCD    -> the two-pass test spelled out at particlePredicted.
+//
+// P9.18 REWROTE THIS TO ITERATE WORK ITEMS, not systems.  A work item reads ONE
+// cell -- the one calcGridHashInBounds names -- and the old version could ignore
+// that only because every work item read cell 0.  Now the cell is derived, so a
+// port that mis-decodes the hash lands on the other cell's particles and the
+// multiset stops matching.
 static std::vector<Want> expectedSet()
 {
     std::vector<Want> out;
-    for (uint32_t sys = 0; sys < 2u; ++sys)
+    for (uint32_t w = 0; w < CVX_TOTAL_WORK; ++w)
     {
-        const float rest = sys ? REST_DISTANCE_B : REST_DISTANCE;
-        for (uint32_t i = CELL_START; i < CELL_END; ++i)
+        const uint32_t pair = cvxPairOfWork(w);
+        const uint32_t sys = CVX_PAIR_SYS[pair];
+        const float rest = CVX_PAIR_REST[pair];
+        uint32_t lo = 0u, hi = 0u;
+        gcCellSpan(cvxCellOfWork(w), lo, hi);
+        for (uint32_t i = lo; i < hi; ++i)
         {
             if (i == FILTERED_SORTED) continue;              // X9, on BOTH systems
             float p[3], dir[3]; particlePos(i, p);
@@ -645,14 +848,6 @@ static std::vector<Want> expectedSet()
             // isDiffuse = TRUE -> scaleInv 1; the engine's second-pass factor is 2.
             if (!ccdAccepted(i, 1.0f, 2.0f)) continue;
             out.push_back(Want{ sys, i, rest });
-        }
-        // Pair 0 owns TWO work items over the same cell, so system A's contacts
-        // are produced twice.  Emitting the duplicate here is what keeps the
-        // multiset match honest.
-        if (sys == 0u)
-        {
-            const size_t n = out.size();
-            for (size_t w = 0; w < n; ++w) out.push_back(out[w]);
         }
     }
     return out;
@@ -836,6 +1031,86 @@ static void runAll(PxgSlangComputeDevice* dev)
                       "against the top face and a wrong closest-feature is invisible");
         PXG_CHECK_MSG(filtered == 1u, "the seeded filter pair suppresses %u contacts, not 1 "
                       "-- X9's unsorted-index key is untested", filtered);
+
+        // ---- P9.18: the grid hash has to be OBSERVABLE, not merely computed ----
+        {
+            const uint32_t h0 = cvxCellOfWork(0u), h1 = cvxCellOfWork(1u);
+            PXG_CHECK_MSG(h0 < 2u && h1 < 2u,
+                          "a work item resolves to cell %u/%u, outside the two this fixture "
+                          "uploads -- the oracle would be reading past mCellStart", h0, h1);
+            PXG_CHECK_MSG(h0 != h1,
+                          "both of pair 0's work items land on cell %u -- with one cell for "
+                          "the whole pair, returning a constant hash is indistinguishable "
+                          "and calcGridHashInBounds is unprobed (this is exactly the state "
+                          "P9.18 found)", h0);
+            // Every cell must be REACHED, and no two may look alike -- a cell no
+            // work item reads is dead weight, and two cells with the same accepted
+            // count make swapping them invisible.
+            bool reached[NB_CELLS] = { false, false, false, false };
+            for (uint32_t w = 0; w < CVX_TOTAL_WORK; ++w) reached[cvxCellOfWork(w)] = true;
+            uint32_t acc[NB_CELLS] = { 0u, 0u, 0u, 0u };
+            for (uint32_t h = 0; h < NB_CELLS; ++h)
+            {
+                PXG_CHECK_MSG(reached[h], "cell %u is read by no work item -- it cannot "
+                              "discriminate anything", h);
+                uint32_t lo, hi; gcCellSpan(h, lo, hi);
+                for (uint32_t i = lo; i < hi; ++i)
+                {
+                    if (i == FILTERED_SORTED) continue;
+                    float p[3], dir[3]; particlePos(i, p);
+                    if (boxSignedDistance(p, dir) <= CONTACT_OFFSET) acc[h]++;
+                }
+            }
+            for (uint32_t h = 0; h < NB_CELLS; ++h)
+                for (uint32_t k = h + 1u; k < NB_CELLS; ++k)
+                    PXG_CHECK_MSG(acc[h] != acc[k],
+                                  "cells %u and %u both accept %u contacts -- exchanging them "
+                                  "would be unobservable", h, k, acc[h]);
+            // The three pairs must read three DIFFERENT cell sets.  If any two
+            // agree, the asymmetry that makes a relabelling of the mapping
+            // visible is gone for that pair, and a permuting mutant lives.
+            {
+                uint32_t mask[CVX_NB_PAIRS] = { 0u, 0u, 0u };
+                for (uint32_t w = 0; w < CVX_TOTAL_WORK; ++w)
+                    mask[cvxPairOfWork(w)] |= (1u << cvxCellOfWork(w));
+                for (uint32_t a = 0; a < CVX_NB_PAIRS; ++a)
+                {
+                    PXG_CHECK_MSG(mask[a] != 0xFu || a == 0u,
+                                  "pair %u reads every cell -- a pure relabelling of the cell "
+                                  "mapping leaves its union unchanged and cannot be seen", a);
+                    for (uint32_t b = a + 1u; b < CVX_NB_PAIRS; ++b)
+                        PXG_CHECK_MSG(mask[a] != mask[b],
+                                      "pairs %u and %u read the same cell set (0x%x) -- one of "
+                                      "them is not adding discrimination", a, b, mask[a]);
+                }
+            }
+            // The oracle floors positions to cells; if any bound sits on a cell
+            // boundary the floor is a knife edge and the oracle stops being exact.
+            float omn[3], omx[3];
+            gcOverlapBound(0u, 1u, CONTACT_OFFSET, omn, omx);
+            for (int k = 0; k < 3; ++k)
+            {
+                const float fr[2] = { omn[k] / GRID_CELL_WIDTH, omx[k] / GRID_CELL_WIDTH };
+                for (int e = 0; e < 2; ++e)
+                {
+                    const float d = std::fabs(fr[e] - std::floor(fr[e]));
+                    PXG_CHECK_MSG(d > 0.05f && d < 0.95f,
+                                  "overlap bound component %d edge %d sits %.3g of a cell from "
+                                  "a boundary -- the floor is a knife edge and this oracle is "
+                                  "no longer exact", k, e, double(d));
+                }
+            }
+            std::printf("    [ note ] grid %ux%ux%u, cell width %.2f, %u cells; work items "
+                        "read cells", GRID_SIZE[0], GRID_SIZE[1], GRID_SIZE[2],
+                        double(GRID_CELL_WIDTH), NB_CELLS);
+            for (uint32_t w = 0; w < CVX_TOTAL_WORK; ++w)
+            {
+                bool brk = false;
+                for (uint32_t k = 1; k < CVX_NB_PAIRS; ++k) brk |= (w == CVX_WORK_OFFSETS[k]);
+                std::printf("%s%u", brk ? " | " : " ", cvxCellOfWork(w));
+            }
+            std::printf("; cells accept %u %u %u %u\n", acc[0], acc[1], acc[2], acc[3]);
+        }
         std::printf("    [ note ] %zu contacts (%u no-CCD, %u CCD) over %u cell particles; "
                     "%u separated, %u penetrating, %u off the side, 1 filtered per system; "
                     "worst |normal|-1 %.3g, worst penetration error %.3g\n",
