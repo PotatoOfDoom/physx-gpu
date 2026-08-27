@@ -114,6 +114,17 @@
 //   filtered vertex generates nothing), which is the OPPOSITE quantifier from
 //   the triangle sibling's all-three-corners AND -- so it stays visible in the
 //   caller rather than buried behind a call.
+//
+// ---------------------------------------------------------------------------
+// ONE DEVIATION, and it is a DEFINITION where the CUDA has none
+// ---------------------------------------------------------------------------
+// The OUTSIDE branch is entered on the SCALED distances and then walks the
+// UNSCALED ones.  The two sets agree whenever `scaleCoef` is non-zero, which it
+// is for any hull whose scale has no zero component -- so the walk normally
+// visits at least one polygon.  If it visited none, the CUDA would fall through
+// with `closestP` still UNINITIALISED and use it; this port initialises it to
+// (0, 0, 0) instead.  That is the only spelling available -- there is nothing to
+// be faithful TO -- and it is written down rather than left to be rediscovered.
 // ---------------------------------------------------------------------------
 
 import pxgSlangCommon;

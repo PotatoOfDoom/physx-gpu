@@ -5042,7 +5042,7 @@ int main()
         const char* stepsEnv = std::getenv("PXG_CLOTH_STEPS");
         const int steps = stepsEnv ? atoi(stepsEnv) : 240;
         const float y0 = clothMeanY(csc);
-        std::printf("  stepping clothbox (%d x %.4fs), initial mean y=%.4f...\n", steps, dt, y0);
+        std::printf("  stepping %s (%d x %.4fs), initial mean y=%.4f...\n", sceneName, steps, dt, y0);
 
         // The last quarter of the run is the settling window: over it the cloth must
         // move less than a millimetre per step.  A cloth still falling moves ~0.65.
@@ -5062,8 +5062,8 @@ int main()
         const float yEnd = clothMeanY(csc);
 
         int failures = 0;
-        std::printf("  clothbox: mean y %.4f -> %.4f (lowest %.4f); largest |dy| over the last "
-                    "%d steps = %.6f\n", y0, yEnd, minY, steps - settleFrom, maxSettleStep);
+        std::printf("  %s: mean y %.4f -> %.4f (lowest %.4f); largest |dy| over the last "
+                    "%d steps = %.6f\n", sceneName, y0, yEnd, minY, steps - settleFrom, maxSettleStep);
         // 1. IT STOPPED.  Only a contact can stop it; gravity never does.
         //
         // The bar was 1e-3 when only the VERTEX path was mapped (|dy| measured
@@ -5088,12 +5088,28 @@ int main()
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
         if (failures == 0)
         {
-            std::printf("[  OK  ] gpu-sdk-step: the FEMCloth LANDED ON THE BOX and stayed there "
-                        "(mean y %.4f, |dy| < %.6f per step, vs -73.8070 measured with the box "
-                        "contact kernels unmapped) -- BOTH cloth-vs-box paths run on Vulkan: the "
-                        "VERTEX one (P9.15a) and, since P9.15d, the TRIANGLE one, which is what "
-                        "raised the resting height from 0.4933 to %.4f by adding face contacts "
-                        "the vertex path cannot see\n", yEnd, maxSettleStep, yEnd);
+            if (convexFloor)
+                // P9.21.  The number after "vs" is a CONTROL, re-measured in this
+                // tranche rather than carried over: with the manifest row for
+                // cloth_convexVertexContactGenLaunch set back to nullptr, this same
+                // scene falls to -73.8070 and the log carries ten
+                // "fail to launch kernel" lines naming that kernel.  So the landing
+                // below is that kernel's doing and not the triangle path's, which
+                // was already mapped in P9.20 and did NOT stop the fall.
+                std::printf("[  OK  ] gpu-sdk-step: the FEMCloth LANDED ON THE CONVEX SLAB and "
+                            "stayed there (mean y %.4f, |dy| < %.6f per step, vs -73.8070 measured "
+                            "with cloth_convexVertexContactGenLaunch unmapped and the TRIANGLE row "
+                            "already live) -- both cloth-vs-convex paths run on Vulkan: the "
+                            "TRIANGLE one (P9.20, the proven CUDA twin of the box kernel) and the "
+                            "VERTEX one (P9.21), and it is the vertex one that catches\n",
+                            yEnd, maxSettleStep);
+            else
+                std::printf("[  OK  ] gpu-sdk-step: the FEMCloth LANDED ON THE BOX and stayed there "
+                            "(mean y %.4f, |dy| < %.6f per step, vs -73.8070 measured with the box "
+                            "contact kernels unmapped) -- BOTH cloth-vs-box paths run on Vulkan: the "
+                            "VERTEX one (P9.15a) and, since P9.15d, the TRIANGLE one, which is what "
+                            "raised the resting height from 0.4933 to %.4f by adding face contacts "
+                            "the vertex path cannot see\n", yEnd, maxSettleStep, yEnd);
             return 0;
         }
         std::printf("[ FAIL ] gpu-sdk-step: %s checks failed (%d)\n", sceneName, failures);

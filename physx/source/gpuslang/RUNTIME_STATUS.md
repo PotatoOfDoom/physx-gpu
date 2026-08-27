@@ -8,15 +8,17 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **819/819** green in both modes (`ctest -N` in `build-gpuslang`).
-Szenen: **32/32** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
-Inventar (31 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
+Szenen: **33/33** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
+Inventar (32 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
 wertet.  `particlediffuse` kam in P9.13a als Diagnose hinzu und ist seit P9.13d
 gewertet; `particleconvex` kam in P9.14a als ausstehende Arbeit hinzu und ist
 seit P9.14c gewertet; `clothbox` kam in P9.15a hinzu, weil `cloth` ein Freifall
 ist und grün bleibt, ob das Tuch landet oder nicht; `clothdamp` kam in P9.19
 hinzu, weil keine Tuch-Szene ein Flächenmaterial mit Dämpfung setzte und der
-senkrechte Vorhang aus `clothhang` von Anfang an ruht.  Die Liste der ausstehenden
+senkrechte Vorhang aus `clothhang` von Anfang an ruht; `clothconvex` kam in P9.20
+als ausstehende Arbeit hinzu und ist seit P9.21 gewertet, weil erst der
+VERTEX-Kernel das Tuch auf der Konvex-Platte fängt.  Die Liste der ausstehenden
 Arbeit ist **leer**.  Die
 Diagnoseliste trägt jetzt wieder nur die sechs Kontrollen, die durchfallen
 SOLLEN, weil sie die Referenz der echten Prüfung sind.  P9.9 fügte `particlefluidboundary` hinzu, P9.10c
@@ -1706,6 +1708,186 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.21 — der Tuch-gegen-Konvex-**Vertex**-Pfad (Manifest **362**): der Kern gehoben, und ein Überlebender, der ein Loch in der VORRICHTUNG war, nicht im Kernel
+
+Portiert `cloth_convexVertexContactGenLaunch` (`femClothPrimitives.cu:2243`) samt
+`clothVertexConvexCollision` (`:2148`), `closestVertToConvex` (`:2027`),
+`computeClosestPolygon` (`:1975`) und `distancePointSegment` (`:1961`), alle
+vollständig gelesen. Manifest **361 → 362**, Szenen **32 → 33**
+(`clothconvex` wandert aus der Liste ausstehender Arbeit in die gewertete),
+Suite bleibt **819** — der neue Test tritt der bestehenden `femClothSim`-Suite
+bei.
+
+### Der fehlende Kernel, von P9.20 benannt
+
+P9.20 bildete den **Dreiecks**-Pfad ab und maß, dass das Tuch trotzdem
+durchfällt: **−73,81**, genau wie `clothbox` vor P9.15a. Die Tuch-gegen-Konvex-
+Kette braucht zwei Kernel, der Vertex-Pfad fängt und der Dreieckspfad
+verfeinert. Dieser hier ist der fangende.
+
+### Der Kern wird GEHOBEN, nicht abgeschrieben
+
+`fcVertexConvex.slang` trug diese Algebra seit Phase 1 als eigenständige
+Abschrift mit einer C++-Host-Spiegel-Batterie. Der Port schreibt sie deshalb
+nicht ein zweites Mal, sondern hebt sie nach P9.15c-Vorbild in das Modul
+`pxgSlangVertexConvexCloth` und lässt **beide** Seiten es benutzen.
+
+Was die Hebung verifiziert, ist die Batterie selbst: sie vergleicht gegen einen
+**Host**-Spiegel der CUDA, nicht gegen eine zweite GPU-Kopie, und sie ist über
+die Umstellung unverändert grün geblieben. Der Hüllen-Blob wird jetzt über
+`pxgSlangConvexHull`s BDA-Zugriffe gelesen; die Abschnittsversätze wurden gegen
+die alten uint-Zugriffe dieser Datei Byte für Byte geprüft, bevor die alten
+gelöscht wurden (`hullDesc = hull+16`, `vertices = hull+48`,
+`planes = vertices+16·nbVerts`, `polyDescs = planes+16·nbPolys`,
+`verticesByEdges = polyDescs+4·nbPolys`, `facesByEdges = +4·nbEdges`,
+`vertexData8 = +2·nbEdges+3·nbVerts`, dazu die Feld-Dekodierungen).
+
+### Drei Schreibweisen, die nicht austauschbar sind
+
+Beim Heben wurden drei Stellen **korrigiert**, jede gegen `PxVec3`:
+
+* **S1 — `sqrt(dot(v,v))`, nicht `length(v)`.** `PxVec3::magnitude()` ist
+  `PxSqrt(magnitudeSquared())`. Genau diese Ersetzung hat in P9.19 fünf von fünf
+  Vertices um ein ULP verschoben. Beide `magnitude()`-Aufrufe im Kern — der
+  `scaleCoef` und die Außen-Durchdringung — stehen jetzt lang.
+* **S2 — `normalizeSafe` skaliert mit dem KEHRWERT**: eine Division und eine
+  Vektor-mal-Skalar-Multiplikation, nicht drei Divisionen. Und der Wächter heißt
+  `mag < eps`, nicht `mag >= eps` — die beiden unterscheiden sich bei NaN, und
+  die CUDA abzuschreiben kostet eine Instruktion und kein Argument.
+* **S3 — `getNormalized()`** ist `m > 0 ? v * rsqrt(m) : 0` über die
+  **quadrierte** Länge.
+
+Die Batterie hat das **nicht** erzwungen: sie vergleicht mit `2e-3`, ein ULP
+liegt weit darunter. Die Änderungen sind mit der Treue zur CUDA begründet, nicht
+mit einer Vorrichtung, und das steht hier so, statt sie als Fund auszugeben.
+
+### Dieselbe ABI-Zeile, ein DRITTER Name — und trotzdem kein Zwilling
+
+Die drei CUDA-Signaturen `cloth_boxTriangleContactGenLaunch`,
+`cloth_convexContactGenLaunch` und `cloth_convexVertexContactGenLaunch` sind
+dieselben fünfzehn Argumente in derselben Reihenfolge; der einzige textliche
+Unterschied ist, dass `femClothes*` hier sein `const` verliert. Also teilt der
+Kernel `kClothBoxTriCg` und den 184-Byte-Block — mitsamt der P9.15e-Korrektur,
+dass `paramAlign(80)` **16** ist und der Writer bei 112 liegt, nicht bei 104.
+
+Eine geteilte ABI-Zeile ist aber eine Aussage über das **Argument-Paket**, nicht
+über die Rümpfe. `check_cuda_twin_kernels.py` ist das, was Rumpf-Gleichheit
+behauptet, und es wird ausdrücklich **nicht** um diesen Namen erweitert: die
+Rümpfe sind unverwandt (Ähnlichkeit 0,056 — der Box-Pfad nimmt die geschlossene
+`sphereboxNormalPen`-Form, dieser geht über die Hülle).
+
+### Die Vorrichtung misst den KLEBER, und sagt das
+
+Ein Differential zwischen dem Engine-Kernel und dem Phase-1-Einsprungpunkt über
+denselben geteilten Kern misst über den Kern **nichts** — beide Seiten sind
+dieselben Instruktionen. Es misst den Kleber, und nur den:
+
+* den `(cmIdx, VERTEX-Index)`-Stapel und seine `min(count, stackSize)`-Klemmung;
+* `LoadShapePair<eTRIANGLEMESH>` **einschließlich** des Zweigs, der feuert, wenn
+  das Tuch shape1 statt shape0 ist (das Paar 1 der Vorrichtung ist getauscht);
+* den Filter mit dem **EINZEL**-Treffer (W3) — der umgekehrte Quantor zum
+  Dreiecks-Nachbarn, der nur bei allen drei Ecken auslässt;
+* `restDistance[cmIdx]` gegen
+  `contactDistance[cacheRef0] + contactDistance[cacheRef1]`;
+* den Vertex-Ladepfad, die Starrkörper-Pose, die Hüllen-Adresse;
+* den ungeklemmten `stackSizeNeeded`-atomicMax.
+
+Verglichen wird als Multimenge und **bitweise**. Beide Shader tragen jetzt
+`NoContraction`, aus dem Grund, den P9.15d gefunden hat: mit nur einem von
+beiden gestempelt wird der GETEILTE Rumpf in jedem anders kontrahiert, und das
+Differential misst die Fließkomma-Politik statt des Klebers.
+
+### Das Fegen: 23 von 23 — nach einem Überlebenden, der die Vorrichtung entlarvte
+
+Erster Durchgang, 22 Mutanten: **21 getötet** (einer davon durch Absturz — die
+vertauschten Hälften der Hüllen-Adresse), **1 überlebt** —
+`w4-contactdist-by-cmidx`, also
+`contactDistance[cmIdx] + contactDistance[cmIdx]` statt der Summe der beiden
+Cache-Referenzen.
+
+Diagnose, und sie gehört der Vorrichtung, nicht dem Kernel: **die
+Kontaktdistanz wird nirgends gespeichert.** Sie entscheidet allein das Tor
+`pen < contactDist`. Beide Kontaktmanager-Paare der Vorrichtung lösen auf
+dieselben zwei Cache-Referenzen auf, die richtige Summe ist also für jeden Fall
+0,52; der Mutant liefert `2·cd0 = 0,36` für die cm-0-Fälle und `2·cd1 = 0,68`
+für die cm-1-Fälle. Das sind **andere Zahlen** — aber kein Fall hatte eine
+Durchdringung in einem der beiden Bänder, also blieb jedes Tor-Verdikt gleich
+und der Mutant war ausgabegleich.
+
+Zwei Vertices wurden deshalb in die Bänder **gemessen** (nicht geraten: 0,4324
+in (0,36; 0,52) auf cm 0 und 0,5950 in (0,52; 0,68) auf cm 1), und eine Prüfung
+hält sie dort — denn eine spätere Bearbeitung, die sie herausschiebt, öffnet das
+Loch wieder still, und genau so ist es entstanden. Zweiter Durchgang, um einen
+dreiundzwanzigsten Mutanten erweitert (`contactDistance[rigidCacheRef]` allein):
+**23 von 23 getötet, 0 überlebt**, zwangsfrisch.
+
+### Die Szene, mit Kontrolle
+
+`clothconvex` ist grün und **gewertet**:
+
+| | Ruhe-Mittelwert y | größtes \|dy\| im Setzfenster |
+|---|---|---|
+| ohne die Manifest-Zeile (Kontrolle, in dieser Tranche neu gemessen) | **−73,8070** | 0,653992 |
+| mit der Zeile | **0,0000** | **0,000000** |
+
+Die Kontrolle ist der Punkt: die Dreiecks-Zeile war in **beiden** Läufen
+abgebildet, das Protokoll des ersten trägt zehnmal
+„GPU cloth_convexVertexContactGenLaunch fail to launch kernel" — der Fang gehört
+also dem Vertex-Kernel und nicht dem Dreieckspfad. Das ist dieselbe Reihenfolge
+wie beim Box-Pfad: P9.15a fing das Tuch, P9.15d/e verfeinerte.
+
+Die Verdikt-Zeile war bis hierher szenenblind — sie sagte „LANDED ON THE BOX"
+und schrieb die Ruhehöhe P9.15a/d zu, auch wenn `clothconvex` lief. Sie ist
+jetzt getrennt.
+
+**Die exakte Null ist nicht gerundet und auch nicht verdächtig.** Die Oberseite
+der Platte liegt bei y = 0, und in `clothconvex` steht der einzige dynamische
+Körper bei x = 3 (P9.20 hat ihn dorthin verschoben) — das Tuch ruht also auf
+einem **statischen** Konvex, und der Positions-Projektionsschritt setzt jeden
+Vertex exakt auf die Ebene, weshalb der Mittelwert exakt darauf liegt und sich
+nicht mehr bewegt. `clothbox` ruht dagegen bei 0,6871 mit \|dy\| ≈ 0,0020 auf
+einem **dynamischen** Kasten, der selbst zappelt. Der Aufbau-Unterschied ist im
+Szenenbauer nachlesbar; dass er die Ursache der ruhigen Null ist, ist daraus
+**geschlossen** und nicht durch ein eigenes Experiment isoliert.
+
+### Nebenbei: die Modul-Abhängigkeitsliste war um zwanzig Einträge veraltet
+
+`SHADER_COMMON_DEPS` wurde von Hand gepflegt und hatte **zwanzig** fehlende
+Module angesammelt — `pxgSlangBv32`, `pxgSlangSphereBox`,
+`pxgSlangConvexTriCloth`, `pxgSlangGjk`, `pxgSlangEpa`, das Artikulations-Trio
+und weitere. Wer eines davon änderte, ließ jede importierende `.spv` **veraltet**
+zurück, bis irgendetwas anderes eine Neuübersetzung erzwang.
+
+Für diese Tranche ist das nicht kosmetisch: das neue Differential vergleicht zwei
+Shader, die **denselben** gehobenen Kern übersetzen. Eine veraltete Hälfte hätte
+einen alten Kern gegen einen neuen verglichen und den Unterschied einen
+Kleber-Fehler genannt. Die Liste ist jetzt ein `file(GLOB ... CONFIGURE_DEPENDS)`
+über `pxgSlang*.slang`.
+
+### Verifikation
+
+* Fegen **23 von 23 getötet, 0 überlebt**, zwangsfrisch, nach dem Nachschärfen
+  um die zwei Tor-Bänder;
+* neues Differential `femClothSimConvexVertexContactGen`, **bitweise** als
+  Multimenge, plus die Prüfung des `(0,0,0,1)`-Vertex-Markers;
+* die Phase-1-Batterie `fcVertexConvex_closest` über die Hebung **unverändert**
+  grün — das ist es, was die Hebung verifiziert;
+* Suite **819/819** in **beiden** Speichermodi;
+* `PXG_SLANG_KERNEL_MAPPED` von Hand 361 → **362**;
+* Szenen: **LÄUFT NOCH** — Ergebnis im Folge-Commit, statt hier eine ungemessene
+  Zahl zu behaupten. `clothconvex` selbst ist einzeln gemessen (die Tabelle oben,
+  mitsamt Kontrolle); offen ist der vollständige Durchlauf über alle 33.
+
+### Was das über „gleiche Ausgabe heißt geprüft" sagt
+
+Der überlebende Mutant hat andere Zahlen gerechnet als der Kernel und trotzdem
+dieselben Kontakte geschrieben. Er war nicht äquivalent — er war **unbeobachtbar**,
+weil der Wert, den er verfälscht, nie gespeichert wird, sondern nur einen
+Vergleich entscheidet, und weil kein Eingabefall in der Nähe dieses Vergleichs
+lag. Ein Feld, das nur ein Tor speist, ist erst geprüft, wenn ein Fall **im
+Torband** liegt; sonst prüft die Vorrichtung, dass das Tor existiert, und nicht,
+womit es gefüttert wird.
 
 ## P9.20 — `cloth_convexContactGenLaunch` (Manifest **361**) ist derselbe Kernel wie der Box-Zwilling, mechanisch nachgewiesen — und die Szene dazu ist gebaut, aber **nicht** gewertet
 

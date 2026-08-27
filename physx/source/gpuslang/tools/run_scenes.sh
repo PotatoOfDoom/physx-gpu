@@ -37,20 +37,23 @@ if [ -z "${PXG_SHADER_DIR:-}" ]; then
     exit 2
 fi
 
-# The 31 named scenes.  The settling bag below makes 32 -- the figure
+# The 32 named scenes.  The settling bag below makes 33 -- the figure
 # RUNTIME_STATUS.md's header carries.  clothbox joined in P9.15a: `cloth` is a
 # free fall and stays green whether or not the cloth lands, so the landing needed
 # a scene of its own.  particlediffuse joined in P9.13d, when
 # ps_diffuseParticleCreate made it pass; it had been a diagnostic since P9.13a.
 # particleconvex joined in P9.14c and had been a pending-work entry since P9.14a:
 # it named the two convex particle kernels, P9.14b landed the fluid one and
-# P9.14c the diffuse one, and it is scored on BOTH.  The pending-work list at the
-# bottom is empty as a result, and stays in the script for the next scene that
-# needs it.
+# P9.14c the diffuse one, and it is scored on BOTH.  clothconvex joined in P9.21
+# the same way: it was a pending-work entry from P9.20, which mapped the TRIANGLE
+# half of the cloth-vs-convex chain and measured the cloth still falling through
+# to -73.81, and P9.21's VERTEX half is what catches it.  The pending-work list
+# at the bottom is empty again as a result, and stays in the script for the next
+# scene that needs it.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor articulation
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
         particlecloth particleinflatable particlediffuse particleconvex
-        cloth clothbox clothhang clothdamp clothdrape clothselfcollide clothcloth
+        cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach"
 
 pass=0; fail=0; missing=0
@@ -107,22 +110,10 @@ if [ "${1:-}" = "--diagnostics" ]; then
     echo
     echo "=== pending work (NOT scored: these name kernels that are not mapped yet;"
     echo "    each moves into the scored list when its chain lands) ==="
-    echo "    clothconvex (P9.20) -- the cloth-vs-CONVEX chain needs TWO kernels and"
-    echo "    only one is mapped.  cloth_convexContactGenLaunch (the TRIANGLE path)"
-    echo "    landed in P9.20 as a proven CUDA twin of the box kernel; the VERTEX"
-    echo "    path, cloth_convexVertexContactGenLaunch, is NOT a twin (0.056 body"
-    echo "    similarity to its box counterpart) and is a port of its own.  Measured:"
-    echo "    with only the triangle path the cloth still falls through to -73.81,"
-    echo "    exactly as clothbox did before P9.15a landed ITS vertex kernel."
-    for sc in clothconvex; do
-        echo "--- $sc"
-        env PXG_SCENE=$sc PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
-            | grep -E '^  particle |^  cooked |^  \[ diag \]|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step' \
-            | sed 's/^/    /'
-        env PXG_SCENE=$sc PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
-            | grep -E '\] GPU .*fail to launch' | sed 's/.*GPU //' | sort | uniq -c \
-            | sed 's/^/    /'
-    done
+    echo "    (empty -- clothconvex moved into the scored list in P9.21, when"
+    echo "     cloth_convexVertexContactGenLaunch landed and the cloth stopped"
+    echo "     falling through the slab.  The block stays for the next scene that"
+    echo "     names a kernel before the port has one.)"
 fi
 
 [ "$fail" -eq 0 ] && [ "$missing" -eq 0 ]
