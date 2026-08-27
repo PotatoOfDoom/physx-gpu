@@ -1713,6 +1713,81 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.25 — die vierte und letzte Aufrufstelle: `calcGridHashInBounds` ist vollständig festgenagelt, und der Entwurf aus P9.24 trug beim ersten Durchgang
+
+`ps_primitivesCollisionLaunch` (`psContactGenBda.slang:656`) war die letzte der
+**vier** lebenden Aufrufstellen ohne Deckung. Sie ist es nicht mehr. Manifest
+unverändert **362**, Suite unverändert **820** (die beiden neuen `PXG_TEST`
+treten der bestehenden `psContactGen`-Suite bei), Szenen nicht gefahren — nur
+eine Testdatei angefasst.
+
+### Die bestehende Prüfung wurde NICHT umgebaut
+
+`psContactGen_planeContactPGS/TGS` treibt **ein** Partikel gegen **eine** Ebene
+auf einem 1×1×1-Gitter und vergleicht Normale und Durchdringung **bit-genau**
+gegen eine C++-Abschrift des `ePLANE`-Zweigs. Das ist die richtige Form für das,
+was sie beweist, und sie steht unverändert.
+
+Was sie **nicht** beweisen kann, ist das Gitter — mit einer Zelle klemmt
+`calcWrappedGridRangeSize` auf (1,1,1), `calcGridOffsetInRange` liefert (0,0,0)
+für jeden Versatz, und `calcGridHash` maskiert jede Komponente mit `(1-1) == 0`.
+Die naheliegende Antwort wäre gewesen, sie auf ein echtes Gitter umzubauen; das
+hätte den bit-genauen Einzelnachweis zerstört, um einen zweiten hineinzuzwängen.
+Stattdessen steht jetzt eine **zweite** Batterie daneben.
+
+### Der Entwurf ist P9.24s, unverändert übernommen
+
+Jede Zahl darin ist dort begründet, und dass sie hier ohne Nachschärfen trägt,
+ist der eigentliche Befund: **10 von 11 Mutanten im ERSTEN Durchgang**, gegen
+vier Durchgänge bei P9.24. Die Eigenschaften, die dort vier Runden gekostet
+haben, sind übertragbar:
+
+* Gitter **4×2×1**, weil drei Mutanten bei Gittergröße 2 strukturell unsichtbar
+  sind;
+* ein Profil, dessen ganze x-Ausdehnung in **Zelle 1** liegt, sonst ist die
+  Zellbreite nicht geprüft;
+* ein Profil, das **weniger** Arbeitsindizes anmeldet als seine Spanne, sonst ist
+  das Vertauschen der Versatzkomponenten für jedes Paar unsichtbar, das seinen
+  ganzen Block liest;
+* Ebenen-Grenzen **±40** statt ±8, weil die Überlappung ein **Schnitt** ist und
+  eine Grenze von 8 das Gebiet kappt, bevor die Klemmung greifen kann;
+* Zellinhalte **abgeleitet**, mit paarweise verschiedenen Partikelzahlen.
+
+Der einzige Überlebende ist wieder `g5-mask-unsigned`, und er ist wieder
+nachgewiesen **äquivalent**: `g.x & int(s.x - 1u)` und
+`int(uint(g.x) & (s.x - 1u))` sind dieselben Bits.
+
+### Was diese Stelle von den drei anderen unterscheidet
+
+Sie ist die einzige, die die **Fluid**-Zellfelder liest (`mCellStart` /
+`mCellEnd`) statt der diffusen. Die Hash-Funktionen sind gemeinsam, der Weg vom
+Rückgabewert in ein Zellfeld ist es nicht — und genau diese Unterscheidung hat
+P9.18 aufgeschrieben, als es die damals zwei offenen Stellen benannt hat.
+
+### Verifikation
+
+* Fegen **10 von 11 getötet**, zwangsfrisch, im ersten Durchgang; der eine
+  Überlebende ist der verbuchte Äquivalent;
+* die neue Batterie vergleicht als **Multimenge** und je Kontakt **bit-genau**
+  (Normale und Durchdringung), weil die Reihenfolge im Schreiber ein Rennen ist;
+  Zahlen: 4×2×1, **40** Arbeitsindizes über 12 Paare, alle **8** Zellen gelesen,
+  36 Partikel, **6** verschiedene Zellmengen, **2** Teilmengen-Paare, 76 Kontakte;
+* die bestehende bit-genaue Einzelprüfung **unverändert** grün, in beiden
+  Solver-Modi;
+* Suite **820/820** in **beiden** Speichermodi.
+
+### Der Stand nach vier Tranchen
+
+| Aufrufstelle | Kernel | festgenagelt in |
+|---|---|---|
+| `:656` | `ps_primitivesCollisionLaunch` | **P9.25** |
+| `:888` | `ps_primitivesDiffuseCollisionLaunch` | P9.24 |
+| `:1215` | `ps_convexCollisionLaunch` | P9.18 |
+| `:1448` | `ps_convexDiffuseCollisionLaunch` | P9.18 |
+
+Die Aufgabe, die P9.18 als „eigene Tranche und keine Fußnote" hinterlassen hat,
+ist damit erledigt — und sie hat zwei gebraucht, nicht eine.
+
 ## P9.24 — der Gitter-Hash im Diffus-Pfad: **vier** Fege-Durchgänge, und eine Prüfung, die grün war, während die Eigenschaft fehlte
 
 P9.18 hat `calcGridHashInBounds` an der ersten seiner **vier** lebenden
