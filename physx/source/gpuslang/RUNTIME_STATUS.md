@@ -1709,6 +1709,160 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.22 — der „sporadische Ausfall unter `-j`" war nie sporadisch und nie unter `-j`: ein **spekulierter** Lesezugriff außerhalb der Grenzen, gefunden, erklärt, behoben
+
+Seit P8.13 trug dieser Port eine offene Aufgabe: `gpuslang.scan` oder
+`gpuslang.npRigidSumBatches` fällt alle paar Tranchen genau einmal durch, immer
+im ersten parallelen Lauf, nie im Wiederholungslauf; zehn absichtliche
+Reproduktionsversuche haben sie nie ausgelöst. Sie ist erledigt, und **keine**
+der drei Annahmen im Namen der Aufgabe stimmte.
+
+### Der Auslöser, der die Beweise rettete
+
+`run_suite.sh` existiert genau für diesen Fall: es archiviert Protokoll,
+`ctest`-Ausgabe und Umgebung **bevor** der nächste Lauf sie überschreiben kann.
+In dieser Tranche hat es zum ersten Mal gefeuert. Ohne das Archiv wäre der
+Befund wieder von seiner eigenen Bestätigung zerstört worden.
+
+### Eine Fehlleitung, die ich unterwegs fallen lassen musste
+
+Der abgestürzte Prozess hatte **null Bytes** geschrieben — nicht einmal die
+Startzeile, die `testDevice()` unmittelbar nach `PxgCreateVulkanComputeDevice`
+druckt und die die erste Ausgabe des Binärs überhaupt ist. Daraus folgte
+scheinbar zwingend: der Absturz liegt in der Geräteerzeugung.
+
+**Falsch.** `stdout` in eine Datei ist blockgepuffert, und SIGSEGV verwirft den
+Puffer. Die fehlende Startzeile sagt über den Zeitpunkt gar nichts. Mit
+`stdbuf -oL` neu gefahren druckt der abstürzende Prozess die Startzeile **und**
+den ersten Unterfall und stirbt im zweiten (`nbBodies 20000`).
+
+### Vier Messungen, in dieser Reihenfolge
+
+| Messung | Ergebnis | was sie widerlegt |
+|---|---|---|
+| 8-fach nebenläufig | 20 von 480 (4,2 %) | — |
+| **seriell**, ein Prozess | **9 von 200 (4,5 %)** | Nebenläufigkeit ist **nicht** der Auslöser — das `-j` im Aufgabennamen |
+| `LP_NUM_THREADS=1` | 4 von 120 (3,3 %) | auch nicht der llvmpipe-Threadpool |
+| **ASLR aus** (`setarch -R`) | **0 von 120** | eine Adresse, die je nach Prozesslayout abgebildet ist oder nicht, ist ein **Grenzüberschritt**, kein Wettlauf |
+
+Die ASLR-Zeile erklärt nebenbei, warum der erste gdb-Versuch in 80 Anläufen
+nichts fing: **gdb schaltet ASLR standardmäßig ab** und fuhr damit genau die
+Konfiguration, die nie abstürzt. Mit `set disable-randomization off` fiel er im
+28. Anlauf.
+
+### Die fehlerhafte Instruktion, und damit der ganze Befund
+
+```
+cmp   %r8d,%r9d                       ; Index gegen Grenze
+sbb   %r10d,%r10d                     ; -> Prädikat
+kmovd %r10d,%k5
+vbroadcastss (%rax,%r9,4),%ymm2       ; DAS LADEN, UNBEDINGT
+vblendvps %ymm15,%ymm2,%ymm9,%ymm2    ; die Maske, DANACH
+```
+
+Die Quelle ist eine korrekte Schranke:
+
+```slang
+uint countAt(Ptr<uint> counts, uint workIndex, uint nbBodies)
+{
+    if (workIndex >= nbBodies) return 0u;
+    return counts[workIndex];
+}
+```
+
+llvmpipe rechnet **acht Lanes pro AVX-Register**. Eine Bedingung, die je Lane
+verschieden ausfällt, kann deshalb kein echter Sprung sein — sie wird zur Maske,
+und das Laden wird für Lanes ausgeführt, die die Schranke ausschließt. Die
+Schranke ist semantisch richtig und verhindert die **Adressbildung nicht**.
+
+Unter der Engine-Geometrie (32 Blöcke × 512 Threads × `iterationsPerBlock`) läuft
+der Arbeitsindex bis 32768, `nbBodies` ist 20000 — der spekulierte Lesezugriff
+geht **rund 51 KB** hinter das Ende. `si_addr` war seitenausgerichtet, also genau
+der erste Byte einer nicht abgebildeten Seite.
+
+### Ein Zwischenversuch, der wie eine Widerlegung aussah
+
+16-KiB-**Wächterregionen** hinter jeder Allokation fanden **kein** verändertes
+Wächterwort — und ließen den Absturz zugleich **verschwinden** (0 von 200). Das
+sah nach „kein Überlauf" aus. Es ist beides erklärt:
+
+* nichts wurde berührt, weil der Lesezugriff die 16 KiB **überspringt**;
+* der Absturz verschwand, weil neunzehn Zusatzallokationen das Layout
+  verschieben — und das Layout ist laut der ASLR-Messung genau die Variable.
+
+Ein Wächter, der weit genug hinter dem Ende liegt, hätte den Befund verpasst und
+als „nichts gefunden" verbucht.
+
+### Der Fix
+
+Der Index wird **vor** dem Lesezugriff geklemmt, die Schranke danach auf den
+**Wert** angewandt:
+
+```slang
+if (nbBodies == 0u) return 0u;          // UNIFORM -> bleibt ein echter Sprung
+const bool inRange = workIndex < nbBodies;
+const uint safeIndex = inRange ? workIndex : 0u;
+const uint value = counts[safeIndex];
+return inRange ? value : 0u;
+```
+
+Das spekulierte Laden trifft damit ein **gültiges** Element; der Rückgabewert ist
+unverändert, weil die Auswahl ihn ohnehin verwirft. Der Null-Körper-Ausstieg
+bleibt getrennt, weil seine Bedingung **uniform** ist — die bleibt ein echter
+Sprung und bewahrt die Klemmung davor, Element 0 eines leeren Feldes zu lesen.
+
+| | Abstürze |
+|---|---|
+| vorher | **9 von 200** |
+| nachher | **0 von 300** |
+
+Upstream-Kandidat **32**: llvmpipe spekuliert ein Puffer-Laden für inaktive Lanes,
+statt ein maskiertes Laden auszugeben. Dokumentiert, **nicht** gemeldet.
+
+### Und die beiden Testnamen waren immer derselbe Test
+
+Die Aufgabe nannte zwei Ausfälle, `gpuslang.scan` und
+`gpuslang.npRigidSumBatches`, und hat sie als zwei Symptome geführt. Der
+Suite-Name ist ein **Teilstring-Filter**, und `gpuslang.scan` fährt deshalb
+`npRigidSumBatches_scan` mit — nachgesehen, nicht vermutet. Es war immer
+dieselbe Testfunktion und damit immer derselbe Fehler.
+
+### Was NICHT erledigt ist, mit Zahl
+
+Dies ist die **erste** gefundene Stelle, nicht die einzige, die es geben kann.
+Eine erste Bestandsaufnahme über die 460 Shader zählt **6020** Lesezugriffe über
+BDA-Zeiger, davon **786 kontrollabhängig** von einer Schranke auf den eigenen
+Index; **297** davon sind Schleifengrenzen (der Überschritt ist dort höchstens
+eine Schrittweite und bleibt meist in derselben Seite), **489** sind es nicht.
+
+Diese Zahlen sind ein **Prototyp**, kein Prüfer: sie unterscheiden noch nicht
+zwischen uniformen und je-Lane-Bedingungen, und nur die zweiten sind gefährlich.
+Ein Prüfer, der 489 Stellen meldet, ist kein Tor, sondern Lärm — die Lehre aus
+P9.20 („je großzügiger die Normalisierung, desto weniger bedeutet der Prüfer")
+gilt hier in die andere Richtung. Der Audit bekommt eine eigene Tranche mit
+Uniformitätsanalyse, Ausnahmeliste und Selbsttest, so wie der Barrieren-Prüfer
+aus P9.16.
+
+`robustBufferAccess` ist übrigens **nicht** aktiviert (nachgesehen in
+`PxgVulkanComputeDevice.cpp`), und für BDA-Zeiger würde es ohnehin nicht gelten:
+`PhysicalStorageBuffer` kennt keine Robustheit.
+
+### Verifikation
+
+* Absturzrate **9/200 → 0/300**, seriell gemessen;
+* Suite **819/819** in **beiden** Speichermodi;
+* der Fix ist wertgleich und deshalb ohne Fegen: er ändert keine berechnete
+  Größe, sondern nur die Adresse, die ein verworfenes Laden bildet. Was ihn
+  belegt, ist die Absturzrate, und die ist gemessen.
+
+### Was das über „nicht reproduzierbar" sagt
+
+Diese Aufgabe hieß fünf Tranchen lang „kann nicht per Bisektion verfolgt werden".
+Sie war die ganze Zeit in zwanzig Sekunden reproduzierbar — man musste nur
+aufhören, das `-j` zu glauben, das im Namen stand. Die zehn früheren
+Reproduktionsversuche haben nichts gefunden, weil sie alle die Bedingung
+variierten, die nicht die Variable war.
+
 ## P9.21 — der Tuch-gegen-Konvex-**Vertex**-Pfad (Manifest **362**): der Kern gehoben, und ein Überlebender, der ein Loch in der VORRICHTUNG war, nicht im Kernel
 
 Portiert `cloth_convexVertexContactGenLaunch` (`femClothPrimitives.cu:2243`) samt
