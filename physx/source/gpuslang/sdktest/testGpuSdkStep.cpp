@@ -5096,12 +5096,32 @@ int main()
         if (!(maxSettleStep < 1e-2f))
         { std::printf("FAIL: the cloth is still moving %.6f per step at the end of the run -- "
                       "it never came to rest\n", maxSettleStep); ++failures; }
-        // 2. IT STOPPED ON THE BOX, not somewhere below it.  -73.81 was measured with
-        //    cloth_boxVertexContactGenLaunch unmapped, in this same scene.
+        // 2. IT STOPPED ON THE GROUND, not somewhere below it.  -73.81 was measured
+        //    with cloth_boxVertexContactGenLaunch unmapped, in this same scene.
+        //
+        //    The message names the actual ground and, for clothmesh, the actual
+        //    reason.  It used to say "the box" for all three, which read as a wrong
+        //    diagnosis in the one scene that fails: clothmesh's chain is FULLY mapped,
+        //    and it falls anyway because cloth_meshVertexContactGenLaunch is switched
+        //    off upstream -- a message pointing at an unmapped box kernel would send
+        //    the next reader looking for work that is already done.
         if (!(yEnd > -2.0f))
-        { std::printf("FAIL: the cloth came to rest at y = %.4f -- it fell through the box "
-                      "(need > -2.0; -73.81 measured with the box vertex kernel unmapped)\n",
-                      yEnd); ++failures; }
+        {
+            if (meshFloor)
+                std::printf("FAIL: the cloth came to rest at y = %.4f -- it fell through the "
+                            "cooked triangle mesh (need > -2.0).  EXPECTED, and not this "
+                            "port's doing: the chain is fully mapped, but "
+                            "cloth_meshVertexContactGenLaunch emits no contacts upstream "
+                            "(its only `hasContacts` assignment is commented out at "
+                            "femClothPrimitives.cu:3056), and the VERTEX path is what "
+                            "catches a cloth.  Measured -39.3333 both before and after the "
+                            "kernel was mapped.  See tools/check_disabled_kernels.py\n", yEnd);
+            else
+                std::printf("FAIL: the cloth came to rest at y = %.4f -- it fell through the %s "
+                            "(need > -2.0; -73.81 measured with the box vertex kernel "
+                            "unmapped)\n", yEnd, convexFloor ? "convex slab" : "box");
+            ++failures;
+        }
         if (!std::isfinite(yEnd))
         { std::printf("FAIL: mean y is not finite (%.4f)\n", yEnd); ++failures; }
 
