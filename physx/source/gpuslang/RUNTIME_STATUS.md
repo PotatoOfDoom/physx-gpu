@@ -14,7 +14,12 @@ and `gpuslang.speculatedLoads` (P9.23) — all four exist because no fixture and
 no mutant can see what they check.  The newest one keeps a fact about SOMEONE
 ELSE'S source true: `cloth_meshVertexContactGenLaunch` emits nothing because its
 only `hasContacts` assignment is commented out upstream, and this port
-implements it that way.
+implements it that way.  P9.29 gave it a THIRD kind of claim to keep — the
+HOST-side gate: `cloth_SphereVertexContactGenLaunch` is a live device kernel
+whose LAUNCH sits inside `if (0)`, which no reading of the `.cu` can find.  That
+table is checked exhaustively (every `if (0)` in the host corpus, and the set of
+kernels launched inside them must be exactly the table), so a new one fails the
+build and gets read.
 Szenen: **33/33** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (32 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
@@ -1718,6 +1723,290 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.29 — der letzte Primitiv-Kontakterzeuger auf der Dreiecksseite, eine dritte Art, einen Kernel abzuschalten, und ein Absturz, der jetzt eine Adresse hat
+
+Manifest **368 → 369**. `cloth_SphereContactGenLaunch` (femClothPrimitives.cu:520)
+ist der letzte unabgebildete **Primitiv**-Kontakterzeuger auf der **Dreiecks**-Seite
+der Tuchkette — und trotz des Namens bedient er **zwei** Starrkörpertypen: Kugel
+und Kapsel.
+
+### Der Port
+
+Er sitzt auf `femClothContactGenBda.slang`, neben seinen Geschwistern Box und
+Konvex, und teilt sich mit ihnen das Argumentpaket (ABI-Zeile `kClothBoxTriCg`,
+vierter Name darauf — **gegen die Startstelle gelesen**, nicht aus dem Namen
+geschlossen). Neu transkribiert sind: der lebende Pfad von `triSphereCollide`,
+der `if (1)`-Block von `fcCapsuleCollision` und darunter
+`distanceSegmentTriangleSquared` samt `distanceSegmentSegmentSquared`.
+
+`npCvxMeshNp.slang` trägt von derselben Kette eine eigene Abschrift. Sie wird
+**bewusst nicht geteilt**: jene Datei ist ein Phase-1-Deskriptorsatz-Shader, und
+die festgehaltene Regel lautet, dass der Engine-BDA-Pfad die Module bekommt,
+während Phase 1 seine Kopien behält.
+
+`closestPtPointTriangle` kommt aus `pxgSlangClothMidphase`. Dasselbe Modul führt
+`WARP` und `PXG_CLOTH_ID_SHIFT`, die diese Datei bisher mit identischen Werten
+selbst deklarierte — die lokalen Kopien sind **entfernt** statt überdeckt, damit
+es eine Definition gibt und der Übersetzer sie hält, nicht ein Leser.
+
+**Neun Fallen** stehen am Kernel; zwei davon verdienen die Erwähnung hier:
+
+* **Er läuft pro FADEN, nicht pro Warp.** Der Kommentar an der Startstelle sagt
+  „each warp deal with one test", der Rumpf indiziert
+  `threadIdx.x + blockIdx.x * blockDim.x` und schreitet um
+  `gridDim.x * blockDim.x`. Das Box-Geschwister nebenan ist wirklich pro Warp —
+  wer dessen Treiber kopiert, verarbeitet **ein Paar von zweiunddreißig**.
+* **Der Typtest ist ein nacktes `else`** mit einem `assert` darin. Alles, was
+  keine Kugel ist, nimmt den Kapselpfad und liest `scale.x`/`scale.y` als
+  Halbhöhe und Radius. So portiert.
+
+### Eine dritte Art, einen Kernel abzuschalten
+
+Der **Vertex**-Zwilling `cloth_SphereVertexContactGenLaunch` ist ein
+vollständiger, lebendiger Gerätekernel — jeder Prüfer, der die `.cu` liest, sagt
+zu Recht „lebt". Er läuft trotzdem nie, weil der Host seinen Start in `if (0)`
+einpackt (PxgNarrowphaseCore.cpp:5774), drei Zeilen unter dem `if (1)` dieser
+Tranche.
+
+Das ist eine **dritte** Klasse neben den beiden, die `check_disabled_kernels.py`
+bisher hielt (auskommentierte gerätesseitige Zuweisungen an ein Kontakt-Flag).
+Die beiden Mechanismen liegen in **verschiedenen Dateien**, und keiner der beiden
+Prüfer sah den anderen.
+
+Der Prüfer trägt jetzt eine `HOST_GATED`-Tabelle — und zwar **erschöpfend** statt
+eintragsweise: er klammert jeden `if (0)` im Host-Korpus und verlangt, dass die
+Menge der darin gestarteten Kernel **exakt** der Tabelle entspricht. Ein neuer
+fällt damit auf und wird gelesen; genau so ist dieser aufgetaucht.
+
+> **Gemessen:** sieben `if (0)`-Blöcke, **einer** startet einen Kernel. Die
+> anderen sechs sind Debug- und DMA-Rückholblöcke.
+
+Der Selbsttest fährt drei Mutationen an der echten Quelle — nicht an einer
+konstruierten:
+
+| Mutation | Erwartung |
+|---|---|
+| Gatter auf `if (1)` | Befund muss **verschwinden** |
+| Live-Geschwister auf `if (0)` | Befund muss **erscheinen** |
+| `if (0)` auskommentieren | darf **nichts** erzeugen |
+
+Die dritte trennt „liest Struktur" von „grept zwei Zeichen". Alle drei greifen.
+
+Nebenbei erklärt das im Nachhinein, warum der Vertex-Zwilling in P7.1 mit
+**zurückgestelltem** eCAPSULE-Zweig ausgeliefert werden konnte, ohne dass je eine
+Szene es bemerkte.
+
+### Zwei Fehler in meiner eigenen Vorrichtung, beide gemessen statt erschlossen
+
+**Erstens: die falsche 192-Byte-Struktur.** Ich griff zur Netz-Anordnung
+(`ClothMeshCgPush`) statt zur Box-Dreieck-Anordnung. Beide sind 192 Byte, und
+**beide** legen den Writer auf @112 — also stimmten `sizeof` und genau die eine
+Zusicherung, die jeder schreibt:
+
+```
+              Netz                          Box-Dreieck (richtig)
+  @64      stackSizeBytes                stackPtr
+  @72      stackPtr                      midphasePairsNum
+  @80      midphasePairsNum              filterPairs
+  @88      filterPairs                   nbFilterPairs
+  @96      nbFilterPairs                 stackSizeNeeded
+  @104     stackSizeNeeded               (Polsterung)
+```
+
+Ergebnis: **deterministischer** Segfault, 12 von 12. Ich hielt ihn zunächst für
+den bekannten llvmpipe-Defekt — die **Rate** hat das widerlegt, bevor die
+Vermutung Schaden anrichten konnte. Jeder zugesicherte Offset in der Struktur ist
+jetzt tragend, nicht dekorativ.
+
+**Zweitens: ein ULP aus der Klammerung.** Mein Spiegel rechnete
+`a + (ab·v + ac·w)`, der Shader `(a + ab·v) + ac·w`. Betroffen: **15 von 28**
+Kontakten, jeweils im letzten Bit von `point.x` — 28 war der damalige Stand der
+Vorrichtung, bevor die zweiten Fächer sie auf 56 brachten.
+
+### Der Absturz aus P9.28a hat jetzt eine Adresse — und es ist eine feste
+
+Zwei Kernabzüge, aus verschiedenen Sitzungen und verschiedenen Prozessen:
+
+| | P9.28a | P9.29 |
+|---|---|---|
+| RIP im JIT-Objekt | Basis **+ 0x767** | Basis **+ 0x767** |
+| Fehleradresse | Basis **− 0x1000** | Basis **− 0x1000** |
+| RSP | 162 MiB entfernt | 358 MiB entfernt |
+
+Der Zugriff liegt **eine Seite unter der Basis des eigenen Codeobjekts**, und die
+fehlerhafte Instruktion sitzt an derselben Stelle darin. Ein datenabhängiger
+Index außerhalb der Grenzen träfe nicht zweimal denselben festen Abstand; ein
+konstanter Zeiger aus dem Datenteil erst recht nicht. Das ist ein **Layout-Defekt
+im Speicherverwalter von llvmpipe**, kein Zugriff eines portierten Shaders.
+
+Was diese Tranche hinzufügt, ist die **Rate**, und sie ist unangenehm:
+
+| Zustand | Abstürze |
+|---|---|
+| ohne diese Vorrichtung (der neue Kernel wird nie gestartet) | **1 von 84** |
+| mit ihr | **7 von 72** |
+
+Der Shader lag in **beiden** Fällen im Baum — der Unterschied ist, ob er
+**gestartet** wird. Ein weiteres JIT-Objekt zur Laufzeit verschiebt den
+Verwalter in den Zustand, in dem er das Loch lässt, und der Fehler trifft dann
+einen **späteren** Test (`femClothSimMeshVertMidphase`). `LP_NUM_THREADS=1`
+senkt die Rate, beseitigt sie nicht.
+
+**Und die Folge, unbeschönigt:** `ctest` fällt seitdem etwa bei jedem zehnten
+Lauf an `gpuslang.femClothSim` mit SEGFAULT durch. Genau das ist während der
+Verifikation dieser Tranche passiert — ein Durchgang in Modus 1 endete so,
+während Modus 2 daneben 821/821 lieferte; der serielle Wiederholungslauf gab
+dann beide Modi grün. Bei einer Rate um 1 zu 10 sind **beide** Ausgänge zu
+erwarten, und deshalb steht unten die Zahl aus dem sauberen Lauf **und** hier
+die Rate — die eine ersetzt die andere nicht.
+
+Zwei Dinge tue ich dagegen **nicht**, und beide Verzichte gehören hierher:
+
+* **kein pauschales `ctest --repeat until-pass`** — das verdeckt echte
+  Regressionen über alle 821 Tests hinweg, um einen fremden Defekt zu kaschieren;
+* **keine Entschärfung der Vorrichtung** — sie ist berechtigte Arbeit, und sie zu
+  verkleinern hieße, einen sichtbaren Plattformfehler gegen eine unsichtbare
+  Prüflücke zu tauschen.
+
+Was ich stattdessen getan habe, steht im nächsten Abschnitt: das eine Werkzeug
+immunisieren, bei dem der Fehler die **Zahl verfälscht** statt sie nur zu
+verzögern.
+
+### Ein Fege-Durchgang, der eine falsche Zahl gemeldet hätte
+
+`run_mutation_sweep.sh` las **jeden** abstürzenden Lauf als `KILLED-FAULT`. Das
+war richtig, solange die Plattform nicht von selbst abstürzt. Bei rund einem Lauf
+von zehn hätte ein Durchgang über dreißig Mutanten sich etwa **drei Tötungen
+gutgeschrieben, die er nicht verdient hat** — verteilt auf die Mutanten, die
+zufällig zur falschen Zeit liefen, unsichtbar in der Bilanz und bei jedem Lauf
+andere. Das ist schlimmer als eine verpasste Tötung: es meldet
+Unterscheidungskraft, die die Vorrichtungen nicht haben.
+
+> **Ein Absturz, der sich nicht reproduziert, ist kein Beleg.**
+
+Ein Absturz wird jetzt wiederholt. Schließt **irgendein** Versuch ab, ist dieser
+Versuch das Ergebnis — ein Mutant, der den Shader wirklich bricht, bricht ihn
+jedes Mal. Nur wenn alle Versuche abstürzen, wird `KILLED-FAULT` gemeldet, mit
+der Zahl in der Zeile, und die Bilanz sagt, wie viele Mutanten überhaupt
+wiederholt werden mussten — die Toleranz ist **sichtbar** statt still. Eine
+Zeitüberschreitung wird bewusst **nicht** wiederholt: ein Hänger ist eine
+Verhaltensänderung.
+
+Der Nutzen zeigte sich im ersten Lauf danach sofort: ein Mutant traf den
+Plattformfehler, wurde neu gefahren und als echter `KILLED` eingestuft.
+
+### Der Barrieren-Prüfer hatte recht, also hat die Schleife die Form gewechselt
+
+`gpuslang.barrierUniformity` fiel in **beiden** Speichermodi durch und meldete
+**alle drei** Barrieren dieses Kernels. Zu Recht: die Schleife lief über den
+eigenen Fadenindex (`for (i = globalThreadIdx; i < numRequiredThreads; i += STRIDE)`),
+und eine bahnverwurzelte Laufvariable ist genau das, wodurch dieser Prüfer nicht
+hindurchsieht.
+
+Der Kontrollfluss **war** gleichförmig, und der Beweis ist eine Zeile: mit einer
+auf `SPHTRI_BLOCK` aufgerundeten Schranke und einer Schrittweite, die ein
+Vielfaches davon ist, hängt `128g + t + kS < B` nicht von `t` ab. Ein Waiver
+hätte diese Zeile in eine Textdatei geparkt.
+
+Stattdessen läuft die Schleife jetzt über den **Blockindex** — `base = gid.x *
+BLOCK`, `i = base + tid`. Sie besucht dieselbe Menge, aber die Gleichförmigkeit
+ist **syntaktisch**: `base` hängt allein an `gid.x`.
+
+Und dann hatte die Warp-Rundung der CUDA nichts mehr zu tun, also ist sie
+**weg** statt abgeschrieben. Bei einer blockindizierten Schleife ist jede
+Schranke ab `numPairs` richtig; Blöcke jenseits des letzten Paares steuern Fäden
+mit `i >= numPairs` bei, was der bestehende Wächter ohnehin abfängt. Sie
+stehenzulassen wäre ein Leerlauf gewesen, den keine Vorrichtung prüfen kann —
+**und der Fege-Durchgang hat genau das gesagt**, indem er `s4-warp-rounded-bound`
+in dem Moment als Überlebenden meldete, in dem die Schleife sich änderte.
+
+Zwei Mutanten wurden durch den Umbau schal und sind **neu ausgerichtet** statt
+gestrichen: `s1-per-warp-driver` mutiert die neue Schleife in eine
+warpweise (`base` schreitet um `SPHTRI_WARPS`, `i = base + (tid >> 5)`), und an
+die Stelle der Rundung tritt `s4-i-uses-lane` (`base + tid` → `base + lane`), was
+die Warps 1..3 jedes Blocks bricht. Beide fallen.
+
+### Das Fegen: 29 von 33, und vier Überlebende mit Gründen
+
+Der erste vollständige Durchgang tötete **24**. Jeder Überlebende wurde
+diagnostiziert; **fünf** waren Löcher in der Vorrichtung und sind geschlossen.
+
+**Geschlossen, durch Geometrie, die dem Prüfstand fehlte:**
+
+* `sph-degenerate-always` — `triSphereCollide` weicht unterhalb von 1e-8 auf die
+  Flächennormale des Dreiecks aus. Alle gefegten Fälle lagen Millimeter daneben,
+  also entschied die Schranke nie etwas. Dreieck 40 legt den Kugelmittelpunkt
+  jetzt **1e-5 unter** eine Ebene, deren Wicklung die Flächennormale nach **oben**
+  zeigen lässt — die beiden Zweige widersprechen sich damit im **Vorzeichen**,
+  nicht in den letzten Bits.
+* `segtri-edge-pick-ge`, `segtri-validbary-nosum`, `segseg-s-unclamped` — der
+  erste Fächer hat **große** Dreiecke, die Kapsel landete auf deren Innerem, und
+  die ganze Kantenmaschinerie darunter wurde erreicht, ohne je etwas zu
+  entscheiden. Ein zweiter Fächer aus **24 kleinen** Dreiecken rings um die Achse
+  legt das nächste Merkmal auf eine **Kante** oder eine **Ecke**.
+* `segseg-parallel-zero` — der Parallelfall wählt die Segmentmitte (0,5), wo das
+  System singulär ist. Kein gefegtes Dreieck hatte eine Kante parallel zur
+  Kapselachse; ein handgesetztes hat sie jetzt, exakt.
+
+**Überlebend, mit dem Grund, warum sie nicht zu töten sind:**
+
+* `segtri-plane-cross-ge` (`dMul <= 0` → `< 0`) — die beiden unterscheiden sich
+  nur bei `dMul == 0`, wofür genau ein Endpunkt in der Dreiecksebene liegen muss.
+  Dort liefern **beide Wege dasselbe** `t/u/v`: der frühe Ausstieg rechnet
+  `t0 = 0` und die Projektionsbarycentrik, der Durchfall rechnet aus
+  `closestP31 = p` dieselbe Barycentrik und gibt `sqDist3 = 0` damit zurück.
+* `segtri-bdenom-zero` (`PX_MAX_F32` → `0`) — der Rückfall greift nur bei
+  `tDenom <= 0`, was für ein Dreieck heißt, dass `ab` und `ac` parallel sind, und
+  dann sind **alle vier Zähler** vor `bdenom` algebraisch null: `0·MAX_F32` und
+  `0·0` stimmen überein. Trennbar nur auf einer Rundungsschneide, die keine
+  Vorrichtung absichtlich herstellt.
+* `scan-ballot-not-sum` (`+= cnt` → `+= min(cnt, 1)`) — **äquivalent aus
+  Konstruktion**: beide lebenden Kerne liefern höchstens einen Kontakt. Trennen
+  könnte sie nur, dass upstream einen der toten `if (0)`-Auftakte wieder
+  einschaltet. Das ist genau die Abhängigkeit, von der die Notiz S3 sagt, der
+  Aggregator **kodiere** sie nicht — und er tut es nicht: der Code ist eine
+  allgemeine Präfixsumme, die **Eingabe** überschreitet nur nie die Eins.
+* `s5-unclamped-pair-index` — beobachtungsneutral, wie P9.28s achtzehn.
+
+### Und eine Rücknahme, beim Prüfen des letzten Überlebenden
+
+Die Notiz S5 behauptete, die Klemmung verhindere einen Zugriff über die Grenzen
+**in der Klasse P9.22/P9.28**. Das stimmt nicht. `i` hängt an der
+Startgeometrie, und die Schranke aus S4 rundet auf 128 auf — der Überschuss ist
+höchstens **127 Paare**, also rund **zwei Kilobyte**, und nicht die
+vierundsechzig Gigabyte eines Sentinels.
+
+Ich hatte außerdem angenommen, `check_speculated_loads.py` würde die ungeklemmte
+Form als HIGH führen und damit die Eigenschaft halten, die keine Vorrichtung
+sehen kann. **Geprüft, statt geglaubt:** Klemmung entfernt, Prüfer neu gefahren —
+er sagt `LOW-launch`, und das ist richtig. Die Klemmung bleibt (sie kostet ein
+`min()`), steht aber jetzt als Gürtel-und-Hosenträger im Kommentar, und nichts
+behauptet mehr, ein Prüfer halte sie.
+
+### Verifikation
+
+* Fegen **29 von 33**, zwangsfrisch — 0 durch Absturz, 0 durch Hänger, 0
+  Anker-Fehler; die vier Überlebenden sind oben begründet;
+* Vorrichtung: **56 Kontakte** (18 Kugel, 38 Kapsel), **bitgleich** gegen einen
+  vollständigen C++-Spiegel beider Kerne und der Anschlussschicht;
+* **alle fünf** Ausgänge von `distanceSegmentTriangleSquared` erreicht — gemessen
+  und als Gatter geprüft, nicht im Kommentar behauptet;
+* die Gitterschrittweite eigens festgenagelt: 131080 Paare gegen 131072 Fäden,
+  acht Kontakte aus dem Schwanz — eine zu kleine Schrittweite **vervielfacht** sie,
+  statt sie zu verschieben;
+* Suite **821/821** im Vorgabemodus und **821/821** mit `PXG_DEVICE_V2=1` —
+  seriell gemessen, ohne einen zweiten Lauf daneben und ohne dazwischenliegenden
+  Bau;
+* Szenen **33 ok, 0 fail, 0 missing (von 33)**, nach dem Neubau von `build-sdk`
+  wegen der Manifeständerung — ebenfalls seriell.
+
+> **Ein Wort zu diesen vier Zahlen.** Ein erster Messlauf lieferte sie nicht: ich
+> hatte einen Hintergrundauftrag angekündigt zu stoppen und es dann nicht getan,
+> also schrieben zwei Läufe in dieselben Protokolldateien und ihre Szenen liefen
+> nebeneinander. Was ich daraus zuerst abgelesen hatte, war eine Mischung. Die
+> Zahlen oben stammen aus einem einzigen, seriellen Durchgang danach, bei dem
+> nichts anderes lief und zwischendurch nichts gebaut wurde.
 
 ## P9.28a — Nachtrag: die zweite Zahl, die Szenen, und der Absturz gehört mir doch nicht
 
