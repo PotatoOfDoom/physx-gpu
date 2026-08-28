@@ -1840,12 +1840,24 @@ Index außerhalb der Grenzen träfe nicht zweimal denselben festen Abstand; ein
 konstanter Zeiger aus dem Datenteil erst recht nicht. Das ist ein **Layout-Defekt
 im Speicherverwalter von llvmpipe**, kein Zugriff eines portierten Shaders.
 
-Was diese Tranche hinzufügt, ist die **Rate**, und sie ist unangenehm:
+Was diese Tranche hinzufügt, ist die **Rate** — und die musste ich zweimal
+messen, weil die erste Zahl allein sie überzeichnet hat:
 
-| Zustand | Abstürze |
-|---|---|
-| ohne diese Vorrichtung (der neue Kernel wird nie gestartet) | **1 von 84** |
-| mit ihr | **7 von 72** |
+| Zustand | Abstürze | |
+|---|---|---|
+| ohne diese Vorrichtung (der neue Kernel wird nie gestartet) | **1 von 84** | 1,2 % |
+| mit ihr, vor dem Schleifenumbau | **7 von 72** | 9,7 % |
+| mit ihr, nach dem Schleifenumbau | **5 von 150** | 3,3 % |
+
+Die **Erhöhung** gegenüber dem Grundzustand ist deutlich und in zwei Blöcken
+dicht beieinander gemessen. Die **absolute** Rate ist es nicht: ein Block gab 0
+von 30, ein anderer 5 von 120. Sie schwankt, vermutlich mit dem Zustand des
+Wirtsspeichers und der Adressverwürfelung, und wer sie als „etwa jeder zehnte
+Lauf" liest, liest die erste Zeile für alle drei. Ein paar Prozent trifft es.
+
+*(Ob der Schleifenumbau die Rate wirklich senkt, sagt diese Stichprobe nicht:
+7/72 gegen 5/150 ist nahe an der Zufallsgrenze. Es steht hier als Beobachtung,
+nicht als Wirkung.)*
 
 Der Shader lag in **beiden** Fällen im Baum — der Unterschied ist, ob er
 **gestartet** wird. Ein weiteres JIT-Objekt zur Laufzeit verschiebt den
@@ -1853,9 +1865,9 @@ Verwalter in den Zustand, in dem er das Loch lässt, und der Fehler trifft dann
 einen **späteren** Test (`femClothSimMeshVertMidphase`). `LP_NUM_THREADS=1`
 senkt die Rate, beseitigt sie nicht.
 
-**Und die Folge, unbeschönigt:** `ctest` fällt seitdem etwa bei jedem zehnten
-Lauf an `gpuslang.femClothSim` mit SEGFAULT durch. Genau das ist während der
-Verifikation dieser Tranche passiert — ein Durchgang in Modus 1 endete so,
+**Und die Folge, unbeschönigt:** `ctest` fällt seitdem gelegentlich — ein paar
+Prozent der Läufe, siehe die Tabelle oben — an `gpuslang.femClothSim` mit
+SEGFAULT durch. Genau das ist während der Verifikation dieser Tranche passiert — ein Durchgang in Modus 1 endete so,
 während Modus 2 daneben 821/821 lieferte; der serielle Wiederholungslauf gab
 dann beide Modi grün. Bei einer Rate um 1 zu 10 sind **beide** Ausgänge zu
 erwarten, und deshalb steht unten die Zahl aus dem sauberen Lauf **und** hier
