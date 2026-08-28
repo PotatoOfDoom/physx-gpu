@@ -1854,10 +1854,27 @@ void cloth_SphereContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
     w.tempByX = gBTri.b_tempContactByX;  w.idxByX = gBTri.b_contactIndexSortedByX;
     w.maxContacts = gBTri.b_maxNumContacts;
 
-    const uint numRequiredThreads = (numPairs + (SPHTRI_BLOCK - 1u)) & (~(SPHTRI_BLOCK - 1u)); // S4
-
-    for (uint i = globalThreadIdx; i < numRequiredThreads; i += SPHTRI_STRIDE)
+    // S4: the loop runs over the BLOCK's base index, not over the thread's, and the
+    // CUDA's warp-rounded bound is GONE rather than transcribed.  Both decisions are
+    // the same decision, so both reasons belong here.
+    //
+    // The CUDA rounds numPairs up to 32 because its aggregation is warp intrinsics,
+    // which need warp-uniform control flow.  Ours is groupshared plus a BLOCK barrier,
+    // which needs BLOCK-uniform control flow -- and with `base` a function of gid.x
+    // alone, every thread in a block plainly runs the same number of iterations, for
+    // any bound whatsoever.  The rounding then has nothing left to do: blocks past the
+    // last pair contribute threads whose `i >= numPairs`, which is exactly what the
+    // guard below already handles.  Keeping it would be a no-op no fixture could test.
+    //
+    // The thread-indexed form this replaced was uniform too, but only by an argument:
+    // with the bound rounded to SPHTRI_BLOCK and the stride a multiple of it,
+    // `128g + t + kS < B` does not depend on t.  gpuslang.barrierUniformity reported
+    // all three barriers here and was RIGHT to -- it cannot see through a lane-rooted
+    // induction variable, and the alternative was to park that proof in a waiver file
+    // instead of in the code.
+    for (uint base = gid.x * SPHTRI_BLOCK; base < numPairs; base += SPHTRI_STRIDE)
     {
+        const uint i = base + tid;
         uint numContacts = 0u;
         float4 contact = float4(0, 0, 0, 0);
         float4 normalPen = float4(0, 0, 0, 0);
