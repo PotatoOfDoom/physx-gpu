@@ -1719,6 +1719,131 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.27b — die beiden Kontakterzeuger, zwei Hebungen, und ein sporadischer Absturz, der mir gehört
+
+Manifest **366 → 368**. Die Tuch-gegen-Höhenfeld-Kette ist damit **vollständig**:
+zwei Mittelphasen (P9.27), zwei Kontakterzeuger (hier).
+
+> **Szenenlauf noch offen.** Das Manifest hat sich geändert, also muss `build-sdk`
+> neu gebaut und der Szenensatz neu gefahren werden. Der Lauf war beim Committen
+> unterwegs; die Zahl wird **nicht** hier behauptet, bevor sie gemessen ist —
+> dieselbe Regel wie in P9.27.
+
+### Zwei Hebungen, und warum keine davon eine Messung brauchte
+
+`pxgSlangHeightfield` brauchte in P9.27 eine Ähnlichkeitsmessung, weil **zwei
+unabhängige Abschriften** bereits existierten und erst als gleich nachgewiesen
+werden mussten (0,90/0,83 — und sie waren sich über eine Umwandlung uneins,
+P9.27a). Diese beiden sind der umgekehrte Fall: **eine** `__device__`-Funktion
+upstream, ein zweiter Aufrufer im Begriff geschrieben zu werden. Die Frage ist
+nicht „sind die gleich", sondern „soll es überhaupt eine zweite Kopie geben".
+
+* `psHfMidphaseBda` zieht auf das Modul. P9.27 hatte diesen Shader ausdrücklich
+  als „nicht umgezogen" benannt und den Umzug als eigene Aufgabe stehen lassen —
+  das ist sie. Seine **eigenen** Vorrichtungen sind die Validierung.
+* `staticTriangleVsClothCollision` samt Zuschneidepipeline zieht aus
+  `femClothMeshContactGenBda` in das neue `pxgSlangClothTriContact`. Die
+  bestehende Vorrichtung des Netz-Erzeugers ist die Validierung.
+
+Beim Heben wurde eines sichtbar, das zwei getrennte Kopien verdeckt hatten: **das
+Tessellations-Bit, das die Diagonale einer Zelle wählt, ist Bit 23 — dasselbe Bit
+wie das hohe Bit von `materialIndex0`.** Deshalb muss der eHOLE-Vergleich das Byte
+maskieren, und deshalb verzweigt `hfTriVertexIndices` darauf. Zwei Tatsachen, ein
+Bit, zwei Seiten.
+
+### Der lebende Erzeuger: vier Unterschiede, differenziell geprüft
+
+Beide Kernel rufen denselben Kern. Eine zweite CPU-Abschrift zu schreiben hieße,
+die Abschrift zu prüfen statt den Kernel. Ungeprüft ist der **Klebstoff**, und
+ein **Differenzial** isoliert genau den:
+
+> dem Höhenfeld-Kernel ein Höhenfeld geben, dessen Dreieck T irgendwo liegt; dem
+> Netz-Kernel ein gekochtes Netz, dessen Dreieck **genau diese drei Punkte** sind,
+> mit Skalierung (1,1,1) und Einheits-`scaleRot`, damit sein `vertex2Shape` die
+> Identität ist; beiden dieselben Transformationen, dasselbe Tuch, dieselben
+> Abstände. Jeder Kontakt muss dann **bitgleich** sein.
+
+Er ist es. Die vier Unterschiede, die der Kopf benennt:
+
+* **C1** — die Formen werden **positionell** gelesen, nicht über die Körper-ID
+  geroutet. Der Netz-Zwilling hat auf beiden Seiten `eTRIANGLEMESH` und kann nur
+  über die ID unterscheiden; dieser nimmt `shapeRef0` als Tuch, Punkt.
+* **C2** — das Dreieck kommt **bereits skaliert** aus den Proben, also **kein**
+  `vertex2Shape`. Die Skalierung zweimal anzuwenden ist der naheliegende Fehler
+  und er ist still: er verschiebt das Gelände, statt zu scheitern.
+* **C3** — **keine** Filterpaare (auch deshalb unterscheiden sich die ABI-Zeilen).
+* **C4** — die Transformation ist `hfToCloth`, angewandt auf ein Dreieck, das
+  schon im Formraum liegt.
+
+### Der tote Erzeuger, und eine Zeile, die ihre Aufgabe erfüllt hat
+
+`cloth_heightfieldVertexContactGenLaunch` ist auf dieselbe Weise abgeschaltet wie
+sein Netz-Gegenstück aus P9.26 — die einzige Zuweisung an `hasContacts` ist
+auskommentiert (`:2737`). `check_disabled_kernels.py` trug ihn seit P9.26 als
+**HINWEIS**, mit der Anweisung „in die gesperrte Tabelle verschieben, sobald ein
+Slang-Port davon landet". P9.27b ist dieses Landen, und er ist jetzt **gesperrt**.
+Die HINWEIS-Liste ist leer — und bleibt stehen, für den nächsten.
+
+> **Beide ABI-Zeilen sind 176 Byte groß und haben verschiedene Layouts**: beim
+> lebenden liegt der Schreiber bei @96, beim toten bei @80. Das ist die schärfste
+> Ausprägung der Gefahr, für die es diese Zeilen überhaupt gibt — die Größen
+> stimmen überein, also fiele es sonst nirgends auf.
+
+### Das Fegen: 24 von 28, und vier nachgewiesene Äquivalente
+
+Zehn Überlebende im ersten Durchgang, sechs davon echte Lücken der Vorrichtung:
+Tuch-ID **null** (jede Schiebeweite ergibt dasselbe Wort), **ein** Kontaktmanager
+(`cmIdx` immer 0, wie das vierte Paarwort), ein Stapel, in dem `gefunden ==
+Kapazität` (also klemmt nichts), eine Schreibgrenze, die nie greift, und ein
+Höchststand, der bei 0 startet (also `atomicMax` == Zuweisung).
+
+Die vier verbliebenen sind Äquivalente **mit Begründung**, nicht Reste: C1 (bei
+der Reihenfolge der Engine stimmen beide Regeln überein), das Aufrunden von `l`
+(die überzähligen Bahnen wählen falsch und schreiben nichts), die
+Warp-Basis-Permutation (beide Formen zählen dieselben Vielfachen von 32 genau
+einmal auf), und `InterlockedAdd` von null.
+
+### Und ein sporadischer Absturz, der mir gehört
+
+Beim Vollauf unter `ctest -j4` stürzte `gpuslang.femClothSim` ab — nicht immer.
+Ich habe **gemessen** statt gemutmaßt:
+
+| | Abstürze |
+|---|---|
+| Basis **ohne** P9.27b (Commit 9679c9e) | **8 von 48** |
+| mit P9.27b | 4 von 48 |
+
+Der Unterschied ist bei dieser Stichprobe bedeutungslos; die Rate ist dieselbe.
+**Nicht von dieser Tranche** — aber die Vorrichtung kam mit **P9.26**, also von
+mir. Dass P9.26 und P9.27 mit 821/821 durchgingen, ist bei ~1 zu 6 pro Lauf keine
+Überraschung.
+
+Gefangen unter gdb im vierten Versuch, mit `set disable-randomization off` (auch
+das die Lehre aus P9.22, das ASLR sonst abschaltet und den Fehler damit
+verschwinden lässt) und mit `stdbuf -oL`, weil ein SIGSEGV einen blockgepufferten
+stdout verwirft. Der Fehler steht in **JIT-Code von llvmpipe** — `?? ()` ohne
+Symbole, auf einem Arbeiter-Thread. Genau die Signatur, die P9.22 verfolgt hat.
+
+Was **nicht** bekannt ist: welcher Puffer. Dafür muss die Fehleradresse gegen die
+Belegungskarte gehalten werden, und das ist die Arbeit, die P9.22 gekostet hat.
+Der Reproduzierer ist als eigene Aufgabe festgehalten — bei einem
+sporadischen Fehler ist er der wertvolle Teil.
+
+> Die Suite steht bei 821/821 in beiden Modi. Diese Zahl steht hier **mit** der
+> Fußnote, dass ein Lauf von etwa sechs an dieser Stelle abstürzt, und nicht ohne.
+
+### Verifikation
+
+* Fegen **24 von 28**, zwangsfrisch, über zwei Durchgänge; die vier Überlebenden
+  sind begründete Äquivalente;
+* das Differenzial: **bitgleiche** Kontakte zwischen Höhenfeld- und Netz-Kernel
+  über dasselbe statische Dreieck, verglichen als Multimenge, weil die Warps um
+  den Schreibindex rennen;
+* `psHfMidphaseBda` und `femClothMeshContactGenBda` nach ihren Umzügen aufs Modul
+  **unverändert** grün — das ist, was die Hebungen validiert;
+* Suite **821/821** in **beiden** Speichermodi, mit der Fußnote oben;
+* Szenen beim Committen noch unterwegs — Zahl im Nachtrag.
+
 ## P9.27 — die Tuch-gegen-Höhenfeld-Mittelphase, ein geteiltes Modul, und zwei Ports, die derselben Umwandlung widersprochen haben
 
 Manifest **364 → 366**, Suite unverändert **821**. Die beiden Mittelphasen der

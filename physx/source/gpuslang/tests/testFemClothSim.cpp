@@ -9600,4 +9600,534 @@ PXG_TEST(femClothSimHeightfieldMidphase)
         dev->destroyBuffer(h);
 }
 
+// ===========================================================================
+// P9.27b -- cloth_heightfieldContactGenLaunch, checked DIFFERENTIALLY against the
+// cloth-vs-cooked-mesh contact gen it shares a core with.
+//
+// The two kernels call the same upstream __device__ function, and since P9.27b the
+// same Slang one (pxgSlangClothTriContact).  femClothSimMeshContactGen already
+// pins that core against a CPU transcription, so writing a second CPU mirror here
+// would test the mirror, not the kernel.  What is UNPINNED is the heightfield
+// GLUE, and a differential isolates exactly that:
+//
+//   * feed the heightfield kernel a heightfield whose triangle T is at some place;
+//   * feed the mesh kernel a cooked mesh whose triangle IS those three vertices,
+//     with scale (1,1,1) and identity scaleRot so its vertex2Shape is the identity;
+//   * give both the same rigid transforms, the same cloth and the same distances.
+//
+// Every contact must then be BIT-IDENTICAL.  A wrong sample decode, a doubled
+// scale (C2), a wrong hfToCloth composition (C4) or a mis-read triangle index all
+// break the equality while leaving each kernel internally plausible.
+//
+// FOUR SWEEP SURVIVORS, all four verified equivalents rather than gaps:
+//
+//   * C1, the positional shape read.  The mesh sibling routes cloth-vs-rigid by
+//     body id; this kernel takes shapeRef0 as the cloth outright.  With the
+//     engine's own ordering the two rules AGREE, so no input this fixture can
+//     build separates them -- the difference appears only for a pair the
+//     broadphase emitted the other way round, and feeding one deliberately would
+//     have the kernel read `clothes[0xffffffff]`.  Stated rather than papered
+//     over: this is the one difference between the two kernels that is documented
+//     and not measured.
+//   * rounding `l` up to a whole warp.  The trailing lanes have `i >= numPairs`,
+//     so they ballot false and write nothing; the rounding exists so the CUDA's
+//     __ballot_sync is reached by a full warp, which the groupshared emulation
+//     does not need.
+//   * `gid.x * (4 * WARP) + sub * WARP` against `gid.x * WARP + sub * (4 * WARP)`.
+//     Both enumerate exactly the multiples of 32, each once -- a permutation of
+//     the same work, not a different set of it.
+//   * reserving without the `validCount > 0` guard.  InterlockedAdd of zero
+//     cannot move a counter, and no lane writes when the ballot is empty.
+// ===========================================================================
+namespace p927cg
+{
+struct ClothHfCgPush
+{
+    float toleranceLength; uint32_t pad4;
+    uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes, femClothes,
+             shapeToRigidRemapTable, stackPtr, midphasePairsNum;
+    uint32_t stackSizeBytes, pad84;
+    uint64_t stackSizeNeededOnDevice;
+    uint64_t wPoint, wNormalPen, wBary, wInfo, wCount, wByX, wTempByX, wIdxByX, wSorted32;
+    uint32_t wMaxContacts, pad172;
+};
+static_assert(sizeof(ClothHfCgPush) == 176, "cloth hf CG blob must be 176 bytes");
+static_assert(offsetof(ClothHfCgPush, stackPtr) == 64, "stackPtr @64");
+static_assert(offsetof(ClothHfCgPush, midphasePairsNum) == 72, "midphasePairsNum @72");
+static_assert(offsetof(ClothHfCgPush, stackSizeBytes) == 80, "stackSizeBytes @80");
+static_assert(offsetof(ClothHfCgPush, wPoint) == 96, "writer @96");
+
+// The DISABLED sibling's pack: the same thirteen arguments, writer BEFORE the two
+// tail scalars.  Both are 176 bytes and the layouts differ -- see the ABI note.
+struct ClothHfVertCgPush
+{
+    float toleranceLength; uint32_t pad4;
+    uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes, femClothes,
+             shapeToRigidRemapTable, stackPtr, midphasePairsNum;
+    uint64_t wPoint, wNormalPen, wBary, wInfo, wCount, wByX, wTempByX, wIdxByX, wSorted32;
+    uint32_t wMaxContacts, pad156;
+    uint32_t stackSizeBytes, pad164;
+    uint64_t stackSizeNeededOnDevice;
+};
+static_assert(sizeof(ClothHfVertCgPush) == 176, "cloth hf VERTEX CG blob must be 176 bytes");
+static_assert(offsetof(ClothHfVertCgPush, wPoint) == 80, "writer @80 -- NOT @96");
+static_assert(offsetof(ClothHfVertCgPush, stackSizeBytes) == 160, "stackSizeBytes @160");
+static_assert(offsetof(ClothHfVertCgPush, stackSizeNeededOnDevice) == 168, "needed @168");
+
+using p817cg::V3;
+static uint32_t hfSample(int16_t h, uint8_t m0, uint8_t m1)
+{
+    return (uint32_t(uint16_t(h))) | (uint32_t(m0) << 16) | (uint32_t(m1) << 24);
+}
+} // namespace p927cg
+
+PXG_TEST(femClothSimHeightfieldContactGen)
+{
+    using namespace p816dc;
+    using namespace p927cg;
+    using p817cg::V3;
+    using p817cg::qRot; using p817cg::qRotInv; using p817cg::qMul;
+    using p817cg::norm; using p817cg::crs; using p817cg::sub; using p817cg::add;
+    using p817cg::scl; using p817cg::dot;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // ---- the heightfield: 2 rows x 3 columns, one row of quads -----------------------
+    // Column 1's sample carries the TESSELLATION bit and column 0's does not, so the two
+    // quads are cut along DIFFERENT diagonals -- which is what makes hfTriVertexIndices'
+    // branch observable rather than a coin flip that happens to agree.
+    const uint32_t NB_ROWS = 2u, NB_COLS = 3u;
+    const uint8_t MAT = 3u;
+    std::vector<uint32_t> blob(2u + NB_ROWS * NB_COLS, 0u);
+    blob[0] = NB_ROWS; blob[1] = NB_COLS;
+    auto setS = [&](uint32_t r, uint32_t c, int16_t h, uint8_t m0, uint8_t m1) {
+        blob[2u + r * NB_COLS + c] = hfSample(h, m0, m1);
+    };
+    setS(0u, 0u, 0,  MAT, MAT);
+    setS(0u, 1u, 0,  uint8_t(MAT | 0x80u), MAT);   // tessellation bit set
+    setS(0u, 2u, 0,  MAT, MAT);
+    setS(1u, 0u, 10, MAT, MAT);                    // a NON-ZERO height, so the decode matters
+    setS(1u, 1u, 10, MAT, MAT);
+    setS(1u, 2u, 10, MAT, MAT);
+    DevBuf bHfBlob = makeDev(dev, blob);
+    if (!bHfBlob.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    // Non-unit scales on all three axes, so a dropped or doubled scale moves the terrain.
+    const V3 hfScale{ 2.0f, 0.05f, 0.5f };
+
+    // ---- hfGetTriangle, transcribed ---------------------------------------------------
+    auto heightAt = [&](uint32_t vi) { return float(int16_t(uint16_t(blob[2u + vi] & 0xffffu))); };
+    auto tessAt = [&](uint32_t vi) { return (blob[2u + vi] & 0x800000u) != 0u; };
+    auto hfVertex = [&](uint32_t vi) {
+        return V3{ float(vi / NB_COLS), heightAt(vi), float(vi % NB_COLS) };
+    };
+    auto hfTriangle = [&](uint32_t triIdx, V3& a, V3& b, V3& c) {
+        const uint32_t cell = triIdx >> 1;
+        const bool first = (triIdx & 1u) == 0u;
+        uint32_t t0, t1, t2;
+        if (tessAt(cell))
+        {
+            if (first) { t0 = cell + NB_COLS; t1 = cell; t2 = cell + NB_COLS + 1u; }
+            else       { t0 = cell + 1u; t1 = cell + NB_COLS + 1u; t2 = cell; }
+        }
+        else
+        {
+            if (first) { t0 = cell; t1 = cell + 1u; t2 = cell + NB_COLS; }
+            else       { t0 = cell + NB_COLS + 1u; t1 = cell + NB_COLS; t2 = cell + 1u; }
+        }
+        auto sc = [&](V3 v) { return V3{ v.x * hfScale.x, v.y * hfScale.y, v.z * hfScale.z }; };
+        a = sc(hfVertex(t0)); b = sc(hfVertex(t1)); c = sc(hfVertex(t2));
+    };
+
+    // Triangle 3 = cell 1's SECOND triangle: cell 1 carries the tessellation bit, so it
+    // takes the other diagonal, and it is the second slot, so it takes the other winding.
+    const uint32_t HF_TRI = 3u;
+    V3 hfA, hfB, hfC;
+    hfTriangle(HF_TRI, hfA, hfB, hfC);
+
+    // ---- the cooked mesh: the SAME triangle, scale (1,1,1), identity scaleRot ---------
+    // With those two, the mesh kernel's vertex2Shape is the identity, so both kernels
+    // must produce byte-identical static triangles in cloth space.
+    std::vector<F4> mv = {
+        { -50.0f, 1000.0f, -50.0f, 0 }, { -50.0f, 1000.0f, 50.0f, 0 }, { 50.0f, 1000.0f, -50.0f, 0 },
+        { hfA.x, hfA.y, hfA.z, 0 }, { hfB.x, hfB.y, hfB.z, 0 }, { hfC.x, hfC.y, hfC.z, 0 },
+    };
+    std::vector<TriIdx4> mi = { { 0u, 1u, 2u, 0u }, { 3u, 4u, 5u, 0u } };
+    const uint32_t MESH_TRI = 1u;
+    std::vector<uint32_t> mblob(4u + 292u, 0u);
+    const size_t vBase = mblob.size();
+    mblob.resize(vBase + mv.size() * 4u, 0u);
+    std::memcpy(mblob.data() + vBase, mv.data(), mv.size() * sizeof(F4));
+    const size_t iBase = mblob.size();
+    mblob.resize(iBase + mi.size() * 4u, 0u);
+    std::memcpy(mblob.data() + iBase, mi.data(), mi.size() * sizeof(TriIdx4));
+    mblob[0] = uint32_t(mv.size()); mblob[1] = uint32_t(mi.size());
+    mblob[2] = 7u; mblob[3] = 1u;
+    DevBuf bMeshBlob = makeDev(dev, mblob);
+
+    // ---- the two rigid transforms, both non-trivial -----------------------------------
+    const float QS = 0.70710678f;
+    const float clothQ[4] = { 0.0f, 0.0f, QS, QS };   // 90 about z
+    const V3 clothP{ 7.0f, 8.0f, 9.0f };
+    const float rigidQ[4] = { 0.0f, QS, 0.0f, QS };   // 90 about y
+    const V3 rigidP{ 1.0f, 2.0f, 3.0f };
+
+    // The static triangle in CLOTH-local space, for placing the cloth on top of it.
+    float clothQConj[4] = { -clothQ[0], -clothQ[1], -clothQ[2], clothQ[3] };
+    float r2cQ[4]; qMul(clothQConj, rigidQ, r2cQ);
+    const V3 r2cP = qRotInv(clothQ, sub(rigidP, clothP));
+    auto toClothLocal = [&](V3 v) { return add(qRot(r2cQ, v), r2cP); };
+    const V3 A0 = toClothLocal(hfA), B0 = toClothLocal(hfB), C0 = toClothLocal(hfC);
+    const V3 fixNormal = norm(crs(sub(B0, A0), sub(C0, A0)));
+    const V3 centre{ (A0.x + B0.x + C0.x) / 3.0f, (A0.y + B0.y + C0.y) / 3.0f,
+                     (A0.z + B0.z + C0.z) / 3.0f };
+    const V3 t1 = norm(sub(B0, A0));
+    const V3 t2 = crs(fixNormal, t1);
+
+    // ---- the cloth: enough triangles to straddle a warp boundary ----------------------
+    const float CD_CLOTH = 0.05f, CD_RIGID = 0.15f;
+    const uint32_t NB_PAIRS = 40u;
+    auto gapFor = [&](uint32_t i) -> float {
+        if (i == 0u) return 0.10f;
+        if (i == 2u) return -0.05f;     // penetrating
+        if (i == 4u) return 0.10f;
+        if (i == 35u) return 0.02f;     // the only contact in warp 1
+        return 0.25f;                   // outside the slab
+    };
+    std::vector<F4> cv; std::vector<TriIdx4> ci;
+    for (uint32_t i = 0; i < NB_PAIRS; ++i)
+    {
+        const V3 base = add(centre, scl(fixNormal, gapFor(i)));
+        const V3 c0 = add(base, scl(t1, 0.20f));
+        const V3 c1 = add(base, scl(t2, 0.20f));
+        const V3 c2 = add(base, scl(t1, -0.20f));
+        const uint32_t b = uint32_t(cv.size());
+        cv.push_back(F4{ c0.x, c0.y, c0.z, 1.0f });
+        cv.push_back(F4{ c1.x, c1.y, c1.z, 1.0f });
+        cv.push_back(F4{ c2.x, c2.y, c2.z, 1.0f });
+        ci.push_back(TriIdx4{ b, b + 1u, b + 2u, 0u });
+    }
+    DevBuf bCv = makeDev(dev, cv), bCi = makeDev(dev, ci);
+
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bCv.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bCi.addr));
+    c.mNbTriangles = NB_PAIRS;
+    c.mNbVerts = uint32_t(cv.size());
+    // Cloth id ONE, not zero.  `pairInd1` is `(clothId << 20) | triangleIdx`, and with
+    // id 0 every shift produces the same word -- a mutant moving the shift to 16 lived.
+    const uint32_t CLOTH_ID = 1u;
+    std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
+    descArr[CLOTH_ID] = c;
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- shapes.  HF run: cloth is shapeRef0 (positional, C1).  Mesh run: SWAPPED,
+    // because that kernel routes by body id and the existing fixture proves it.
+    const uint32_t GEOM_HEIGHTFIELD_H = 9u;
+    std::vector<PxgShapeHost> hfShapes(2), meshShapes(2);
+    std::memset(hfShapes.data(), 0, hfShapes.size() * sizeof(PxgShapeHost));
+    std::memset(meshShapes.data(), 0, meshShapes.size() * sizeof(PxgShapeHost));
+    hfShapes[0].type = GEOM_TRIANGLEMESH_H; hfShapes[0].particleOrSoftbodyId = CLOTH_ID;
+    hfShapes[0].sx = hfShapes[0].sy = hfShapes[0].sz = 1.0f; hfShapes[0].srw = 1.0f;
+    hfShapes[1].type = GEOM_HEIGHTFIELD_H;  hfShapes[1].particleOrSoftbodyId = 0xFFFFFFFFu;
+    hfShapes[1].sx = hfScale.x; hfShapes[1].sy = hfScale.y; hfShapes[1].sz = hfScale.z;
+    hfShapes[1].srw = 1.0f; hfShapes[1].materialIndex = 0x2Au;
+    hfShapes[1].hullLo = uint32_t(bHfBlob.addr & 0xFFFFFFFFull);
+    hfShapes[1].hullHi = uint32_t(bHfBlob.addr >> 32);
+
+    meshShapes[0].type = GEOM_TRIANGLEMESH_H; meshShapes[0].particleOrSoftbodyId = 0xFFFFFFFFu;
+    meshShapes[0].sx = meshShapes[0].sy = meshShapes[0].sz = 1.0f; meshShapes[0].srw = 1.0f;
+    meshShapes[0].materialIndex = 0x2Au;
+    meshShapes[0].hullLo = uint32_t(bMeshBlob.addr & 0xFFFFFFFFull);
+    meshShapes[0].hullHi = uint32_t(bMeshBlob.addr >> 32);
+    meshShapes[1].type = GEOM_TRIANGLEMESH_H; meshShapes[1].particleOrSoftbodyId = CLOTH_ID;
+    meshShapes[1].sx = meshShapes[1].sy = meshShapes[1].sz = 1.0f; meshShapes[1].srw = 1.0f;
+    DevBuf bHfShapes = makeDev(dev, hfShapes), bMeshShapes = makeDev(dev, meshShapes);
+
+    // cache ref 0 = cloth, 1 = rigid, in both runs.
+    // TWO contact managers, identical in content.  With one, cmIdx is always 0 and so is
+    // the pair's fourth word, so a kernel reading cmIdx out of the WRONG word produced the
+    // same answer -- measured, as a survivor.
+    std::vector<CmInputHost> hfCms = { { 0u, 1u, 0u, 1u }, { 0u, 1u, 0u, 1u } };
+    std::vector<CmInputHost> meshCms = { { 0u, 1u, 1u, 0u }, { 0u, 1u, 1u, 0u } };
+    DevBuf bHfCms = makeDev(dev, hfCms), bMeshCms = makeDev(dev, meshCms);
+
+    std::vector<float> xf(2 * 8, 0.0f);
+    xf[0] = clothQ[0]; xf[1] = clothQ[1]; xf[2] = clothQ[2]; xf[3] = clothQ[3];
+    xf[4] = clothP.x; xf[5] = clothP.y; xf[6] = clothP.z;
+    xf[8 + 0] = rigidQ[0]; xf[8 + 1] = rigidQ[1]; xf[8 + 2] = rigidQ[2]; xf[8 + 3] = rigidQ[3];
+    xf[8 + 4] = rigidP.x; xf[8 + 5] = rigidP.y; xf[8 + 6] = rigidP.z;
+    DevBuf bXf = makeDev(dev, xf);
+
+    std::vector<float> cd = { CD_CLOTH, CD_RIGID };
+    std::vector<float> rd = { 0.125f, 0.0f };
+    DevBuf bCd = makeDev(dev, cd), bRd = makeDev(dev, rd);
+    std::vector<uint64_t> remap = { 0ull, 0x00000007ull };      // PxNodeIndex for cache ref 1
+    DevBuf bRemap = makeDev(dev, remap);
+
+    // ---- the pair stack, shared in shape by both runs ----------------------------------
+    // The BUFFER holds more than the kernel is told, and the midphase reports MORE FOUND
+    // than the stack holds.  Both matter: `numPairs = min(found, stackSize)` bounds the
+    // walk, while the high-water mark takes the RAW count -- and with found == stackSize
+    // neither clamp was observable.  The surplus entries are addressable (so an unclamped
+    // walk lands in slack rather than the heap) and carry triangle 0, which makes contact,
+    // so reading them shows up as extra contacts rather than as silence.
+    const uint32_t NB_STACK = NB_PAIRS;            // what the kernel is told
+    const uint32_t NB_FOUND = NB_PAIRS + 20u;      // what the midphase claims
+    const uint32_t NB_ALLOC = NB_FOUND;            // what is actually addressable
+    std::vector<uint32_t> hfStack(NB_ALLOC * 4u, 0u), meshStack(NB_ALLOC * 4u, 0u);
+    for (uint32_t i = 0; i < NB_ALLOC; ++i)
+    {
+        // The SECOND contact manager owns the odd pairs.
+        const uint32_t cm = (i & 1u);
+        const uint32_t tri = (i < NB_PAIRS) ? i : 0u;
+        hfStack[i * 4 + 0] = cm; hfStack[i * 4 + 1] = tri; hfStack[i * 4 + 2] = HF_TRI;
+        meshStack[i * 4 + 0] = cm; meshStack[i * 4 + 1] = tri; meshStack[i * 4 + 2] = MESH_TRI;
+    }
+    DevBuf bHfStack = makeDev(dev, hfStack), bMeshStack = makeDev(dev, meshStack);
+    std::vector<uint32_t> nFound = { NB_FOUND };
+    DevBuf bHfNum = makeDev(dev, nFound), bMeshNum = makeDev(dev, nFound);
+
+    const uint32_t MAXC = 64u;
+    WriterBufs wHf = makeWriter(dev, MAXC), wMesh = makeWriter(dev, MAXC);
+    std::vector<uint32_t> zeroNeeded = { 0u };
+    DevBuf bHfNeeded = makeDev(dev, zeroNeeded), bMeshNeeded = makeDev(dev, zeroNeeded);
+
+    // ---- run the HEIGHTFIELD kernel ----------------------------------------------------
+    ClothHfCgPush hp = {};
+    hp.toleranceLength = 1.0f;
+    hp.cmInputs = bHfCms.addr; hp.transformCache = bXf.addr;
+    hp.contactDistance = bCd.addr; hp.restDistance = bRd.addr;
+    hp.gpuShapes = bHfShapes.addr; hp.femClothes = bDesc.addr;
+    hp.shapeToRigidRemapTable = bRemap.addr;
+    hp.stackPtr = bHfStack.addr; hp.midphasePairsNum = bHfNum.addr;
+    hp.stackSizeBytes = NB_STACK * 16u;
+    hp.stackSizeNeededOnDevice = bHfNeeded.addr;
+    hp.wPoint = wHf.point.addr; hp.wNormalPen = wHf.normalPen.addr;
+    hp.wBary = wHf.barycentric.addr; hp.wInfo = wHf.info.addr; hp.wCount = wHf.count.addr;
+    hp.wByX = wHf.byRigid.addr; hp.wTempByX = wHf.tempByRigid.addr;
+    hp.wIdxByX = wHf.idxByRigid.addr; hp.wSorted32 = wHf.sortedByRigid.addr;
+    hp.wMaxContacts = MAXC;
+    Kernel kh("femClothHfContactGenBda.spv", "cloth_heightfieldContactGenLaunch",
+              {}, sizeof(ClothHfCgPush));
+    kh.dispatch(2048u, {}, hp, 1u, 1u);      // PxgNarrowphaseCore.cpp:7024
+    dev->flush();
+
+    // ---- run the MESH kernel over the identical geometry --------------------------------
+    p817cg::ClothMeshCgPush mp = {};
+    mp.toleranceLength = 1.0f;
+    mp.cmInputs = bMeshCms.addr; mp.transformCache = bXf.addr;
+    mp.contactDistance = bCd.addr; mp.restDistance = bRd.addr;
+    mp.gpuShapes = bMeshShapes.addr; mp.femClothes = bDesc.addr;
+    mp.shapeToRigidRemapTable = bRemap.addr;
+    mp.stackSizeBytes = NB_STACK * 16u;
+    mp.stackPtr = bMeshStack.addr; mp.midphasePairsNum = bMeshNum.addr;
+    mp.filterPairs = 0ull; mp.nbFilterPairs = 0u;
+    mp.stackSizeNeededOnDevice = bMeshNeeded.addr;
+    mp.wPoint = wMesh.point.addr; mp.wNormalPen = wMesh.normalPen.addr;
+    mp.wBary = wMesh.barycentric.addr; mp.wInfo = wMesh.info.addr; mp.wCount = wMesh.count.addr;
+    mp.wByX = wMesh.byRigid.addr; mp.wTempByX = wMesh.tempByRigid.addr;
+    mp.wIdxByX = wMesh.idxByRigid.addr; mp.wSorted32 = wMesh.sortedByRigid.addr;
+    mp.wMaxContacts = MAXC;
+    Kernel km("femClothMeshContactGenBda.spv", "cloth_meshContactGenLaunch",
+              {}, sizeof(p817cg::ClothMeshCgPush));
+    km.dispatch(2048u, {}, mp, 1u, 1u);
+    dev->flush();
+
+    // ---- compare ------------------------------------------------------------------------
+    const uint32_t nHf = downloadBuffer<uint32_t>(dev, wHf.count.h, 1)[0];
+    const uint32_t nMesh = downloadBuffer<uint32_t>(dev, wMesh.count.h, 1)[0];
+    PXG_CHECK_MSG(nHf > 0u,
+                  "the heightfield contact gen produced NO contacts; the differential below "
+                  "is meaningless without at least one");
+    PXG_CHECK_MSG(nHf == nMesh,
+                  "the two kernels disagree on the contact COUNT (%u against %u) over the "
+                  "identical static triangle.  They share staticTriangleVsClothCollision, so a "
+                  "difference is in the heightfield glue: the sample decode, the missing "
+                  "vertex2Shape (C2) or the hfToCloth composition (C4)", nHf, nMesh);
+
+    // Contacts are written at a warp-scan index, and the warps race, so compare as a
+    // MULTISET keyed on the cloth triangle rather than slot by slot.
+    const auto pHf = downloadBuffer<F4>(dev, wHf.point.h, MAXC);
+    const auto pMesh = downloadBuffer<F4>(dev, wMesh.point.h, MAXC);
+    const auto nHfBuf = downloadBuffer<F4>(dev, wHf.normalPen.h, MAXC);
+    const auto nMeshBuf = downloadBuffer<F4>(dev, wMesh.normalPen.h, MAXC);
+    const auto bHfBuf = downloadBuffer<F4>(dev, wHf.barycentric.h, MAXC);
+    const auto bMeshBuf = downloadBuffer<F4>(dev, wMesh.barycentric.h, MAXC);
+    const auto iHf = downloadBuffer<uint32_t>(dev, wHf.info.h, MAXC * 4u);
+    const auto iMesh = downloadBuffer<uint32_t>(dev, wMesh.info.h, MAXC * 4u);
+
+    struct Rec { uint32_t tri; uint32_t w[12]; };
+    auto gather = [&](uint32_t n, const std::vector<F4>& pt, const std::vector<F4>& np,
+                      const std::vector<F4>& ba, const std::vector<uint32_t>& info) {
+        std::vector<Rec> out;
+        for (uint32_t i = 0; i < n && i < MAXC; ++i)
+        {
+            Rec r{};
+            r.tri = info[i * 4 + 2] & ((1u << 20) - 1u);
+            const float src[12] = { pt[i].x, pt[i].y, pt[i].z, pt[i].w,
+                                    np[i].x, np[i].y, np[i].z, np[i].w,
+                                    ba[i].x, ba[i].y, ba[i].z, ba[i].w };
+            for (int k = 0; k < 12; ++k) r.w[k] = f2u(src[k]);
+            out.push_back(r);
+        }
+        std::sort(out.begin(), out.end(), [](const Rec& a, const Rec& b) {
+            if (a.tri != b.tri) return a.tri < b.tri;
+            for (int k = 0; k < 12; ++k) if (a.w[k] != b.w[k]) return a.w[k] < b.w[k];
+            return false;
+        });
+        return out;
+    };
+    const auto recHf = gather(nHf, pHf, nHfBuf, bHfBuf, iHf);
+    const auto recMesh = gather(nMesh, pMesh, nMeshBuf, bMeshBuf, iMesh);
+
+    uint32_t mismatches = 0;
+    for (size_t i = 0; i < recHf.size() && i < recMesh.size(); ++i)
+    {
+        if (recHf[i].tri != recMesh[i].tri) { ++mismatches; continue; }
+        for (int k = 0; k < 12; ++k)
+            if (recHf[i].w[k] != recMesh[i].w[k]) { ++mismatches; break; }
+    }
+    PXG_CHECK_MSG(mismatches == 0u,
+                  "%u of %zu contacts differ BIT-EXACTLY between the heightfield and mesh "
+                  "kernels over the identical static triangle.  Both call the same core, so "
+                  "the difference is the heightfield glue", mismatches, recHf.size());
+
+    // The contact INFO words must agree too -- the rigid id, the encoded cloth index and
+    // the material all come from the glue, not from the shared core.
+    for (uint32_t i = 0; i < nHf && i < MAXC; ++i)
+        PXG_CHECK_MSG(iHf[i * 4 + 3] == 0x2Au,
+                      "contact %u carries material 0x%X, expected the HEIGHTFIELD shape's "
+                      "0x2A -- a port reading the CLOTH's materialIndex would get 0", i,
+                      iHf[i * 4 + 3]);
+
+    // The stack high-water mark: UNCLAMPED, in bytes.
+    const uint32_t needHf = downloadBuffer<uint32_t>(dev, bHfNeeded.h, 1)[0];
+    PXG_CHECK_MSG(needHf == NB_FOUND * 16u,
+                  "stackSizeNeededOnDevice is %u, expected %u = %u FOUND pairs * 16 bytes.  "
+                  "%u would mean the count was clamped to the %u-pair stack first, and a "
+                  "value that cannot exceed the stack it is meant to grow could never ask "
+                  "for a bigger one", needHf, NB_FOUND * 16u, NB_FOUND,
+                  NB_STACK * 16u, NB_STACK);
+
+    // ---- a writer bound that actually BINDS -------------------------------------------
+    // The writer drops a contact whose index reaches maxNumContacts.  With room for
+    // sixty-four and four contacts the guard never fired, so deleting it survived.
+    {
+        const uint32_t TIGHT = 2u;
+        WriterBufs wt = makeWriter(dev, MAXC);      // the BUFFERS stay full size ...
+        ClothHfCgPush tp = hp;
+        tp.wPoint = wt.point.addr; tp.wNormalPen = wt.normalPen.addr;
+        tp.wBary = wt.barycentric.addr; tp.wInfo = wt.info.addr; tp.wCount = wt.count.addr;
+        tp.wByX = wt.byRigid.addr; tp.wTempByX = wt.tempByRigid.addr;
+        tp.wIdxByX = wt.idxByRigid.addr; tp.wSorted32 = wt.sortedByRigid.addr;
+        tp.wMaxContacts = TIGHT;                    // ... only the kernel's bound moves
+        std::vector<uint32_t> nd2 = { 0u };
+        DevBuf bNd2 = makeDev(dev, nd2);
+        tp.stackSizeNeededOnDevice = bNd2.addr;
+        kh.dispatch(2048u, {}, tp, 1u, 1u);
+        dev->flush();
+        const auto tp4 = downloadBuffer<F4>(dev, wt.point.h, MAXC);
+        uint32_t written = 0;
+        for (uint32_t i = 0; i < MAXC; ++i)
+            if (!(tp4[i].x == 0.0f && tp4[i].y == 0.0f && tp4[i].z == 0.0f && tp4[i].w == 0.0f))
+                ++written;
+        PXG_CHECK_MSG(written <= TIGHT,
+                      "with maxNumContacts = %u the writer may fill at most %u slots; %u "
+                      "carry data.  More means the `index >= maxNumContacts` guard is gone",
+                      TIGHT, TIGHT, written);
+        const uint32_t cnt2 = downloadBuffer<uint32_t>(dev, wt.count.h, 1)[0];
+        PXG_CHECK_MSG(cnt2 == nHf,
+                      "the contact COUNTER must still reach %u even when the writer drops "
+                      "contacts past %u -- the count is reserved before the bound is "
+                      "checked (got %u)", nHf, TIGHT, cnt2);
+        destroyWriter(dev, wt);
+        dev->destroyBuffer(bNd2.h);
+    }
+
+    std::printf("    [ note ] hf %ux%u, triangle %u (tessellated cell, second slot); "
+                "%u contacts over 2 contact managers, bit-identical to the mesh kernel "
+                "over the same triangle; %u found into a %u-pair stack -> stackSizeNeeded "
+                "%u (unclamped)\n", NB_ROWS, NB_COLS, HF_TRI, nHf, NB_FOUND, NB_STACK,
+                needHf);
+
+    // ---- the DISABLED sibling ------------------------------------------------------------
+    {
+        const uint32_t SEED = 11u, FOUND = 29u, STACK_PAIRS = 8u;
+        std::vector<uint32_t> seedCount = { SEED };
+        DevBuf bCount = makeDev(dev, seedCount);
+        std::vector<uint32_t> found = { FOUND };
+        DevBuf bFound = makeDev(dev, found);
+        // PRE-SEEDED above what the kernel will ask for, so `atomicMax` and a plain
+        // store are distinguishable.  With a seed of zero they agree and the mutant lived.
+        const uint32_t SEED_NEEDED = FOUND * 16u + 1000u;
+        std::vector<uint32_t> needed = { SEED_NEEDED };
+        DevBuf bNeeded = makeDev(dev, needed);
+        WriterBufs w2 = makeWriter(dev, MAXC);
+
+        ClothHfVertCgPush vp = {};
+        vp.toleranceLength = 1.0f;
+        vp.stackPtr = bHfStack.addr;
+        vp.midphasePairsNum = bFound.addr;
+        vp.stackSizeBytes = STACK_PAIRS * 16u;
+        vp.stackSizeNeededOnDevice = bNeeded.addr;
+        vp.wPoint = w2.point.addr; vp.wNormalPen = w2.normalPen.addr;
+        vp.wBary = w2.barycentric.addr; vp.wInfo = w2.info.addr;
+        vp.wCount = bCount.addr;
+        vp.wByX = w2.byRigid.addr; vp.wTempByX = w2.tempByRigid.addr;
+        vp.wIdxByX = w2.idxByRigid.addr; vp.wSorted32 = w2.sortedByRigid.addr;
+        vp.wMaxContacts = MAXC;
+        // cmInputs, transformCache, contactDistance, restDistance, gpuShapes, femClothes and
+        // shapeToRigidRemapTable stay NULL.  They are in the pack for ABI parity and the
+        // kernel reads none of them -- which a null address is how to test, not assert.
+        Kernel kv("femClothHfContactGenBda.spv", "cloth_heightfieldVertexContactGenLaunch",
+                  {}, sizeof(ClothHfVertCgPush));
+        kv.dispatch(512u, {}, vp, 1u, 1u);       // PxgNarrowphaseCore.cpp:7176
+        dev->flush();
+
+        const uint32_t nd = downloadBuffer<uint32_t>(dev, bNeeded.h, 1)[0];
+        PXG_CHECK_MSG(nd == SEED_NEEDED,
+                      "stackSizeNeeded was seeded at %u and the kernel asks for %u, so an "
+                      "atomicMax must leave it alone; got %u.  A plain store would drop "
+                      "another contact manager's larger request in the same frame",
+                      SEED_NEEDED, FOUND * 16u, nd);
+        // ... and now with a seed BELOW the request, so the clamp is observable too.
+        std::vector<uint32_t> needed2 = { 0u };
+        DevBuf bNeeded2 = makeDev(dev, needed2);
+        vp.stackSizeNeededOnDevice = bNeeded2.addr;
+        kv.dispatch(512u, {}, vp, 1u, 1u);
+        dev->flush();
+        const uint32_t nd2 = downloadBuffer<uint32_t>(dev, bNeeded2.h, 1)[0];
+        PXG_CHECK_MSG(nd2 == FOUND * 16u,
+                      "stackSizeNeeded is %u, expected %u = %u found * 16 bytes.  %u would "
+                      "mean the count was clamped to the %u-pair stack first -- a value that "
+                      "cannot exceed the stack it is meant to grow is useless",
+                      nd2, FOUND * 16u, FOUND, STACK_PAIRS * 16u, STACK_PAIRS);
+        dev->destroyBuffer(bNeeded2.h);
+        const uint32_t cnt = downloadBuffer<uint32_t>(dev, bCount.h, 1)[0];
+        PXG_CHECK_MSG(cnt == SEED,
+                      "the contact counter moved from %u to %u.  It must not: every lane's "
+                      "`hasContacts` is false upstream, so the ballot is empty and "
+                      "PxgOutputIndex performs no atomicAdd at all", SEED, cnt);
+        const auto gp = downloadBuffer<F4>(dev, w2.point.h, MAXC);
+        for (uint32_t i = 0; i < MAXC; ++i)
+            PXG_CHECK_MSG(gp[i].x == 0.0f && gp[i].w == 0.0f,
+                          "contact slot %u was written.  This kernel emits NO contacts "
+                          "upstream; if that has changed, gpuslang.disabledKernels says so "
+                          "and the geometry has to be ported for real", i);
+        std::printf("    [ note ] disabled sibling: %u found into an %u-pair stack -> "
+                    "stackSizeNeeded %u (unclamped); a larger seed survives the max; "
+                    "contact count %u untouched; no slot written\n",
+                    FOUND, STACK_PAIRS, nd2, cnt);
+        destroyWriter(dev, w2);
+        for (PxgBufferHandle h : { bCount.h, bFound.h, bNeeded.h }) dev->destroyBuffer(h);
+    }
+
+    destroyWriter(dev, wHf); destroyWriter(dev, wMesh);
+    for (PxgBufferHandle h : { bHfBlob.h, bMeshBlob.h, bCv.h, bCi.h, bDesc.h, bHfShapes.h,
+                               bMeshShapes.h, bHfCms.h, bMeshCms.h, bXf.h, bCd.h, bRd.h,
+                               bRemap.h, bHfStack.h, bMeshStack.h, bHfNum.h, bMeshNum.h,
+                               bHfNeeded.h, bMeshNeeded.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace

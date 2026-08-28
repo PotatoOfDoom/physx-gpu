@@ -71,12 +71,12 @@
 #
 # NOTES ARE NOT GATES
 #
-# cloth_heightfieldVertexContactGenLaunch (:2581) is disabled the same way, by
-# the same commented line, and is launched live too -- upstream candidate 34's
-# sibling.  This port does not cover it, so nothing here depends on it and it is
-# reported as a NOTE, not a gate: a check that fails for a change that breaks
-# nothing teaches people to ignore checks.  Move it to the gated table on the
-# day a Slang port of it lands.
+# A kernel disabled the same way that this port does NOT cover belongs in NOTED
+# rather than GATED: a check that fails for a change breaking nothing teaches
+# people to ignore checks.  cloth_heightfieldVertexContactGenLaunch (:2581) sat
+# there from P9.26 with the instruction "move it to the gated table on the day a
+# Slang port of it lands".  P9.27b is that day, so it has moved, and NOTED is
+# empty -- kept for the next one rather than deleted.
 #
 # USAGE
 #   check_disabled_kernels.py           check; exit 1 when a claim stops holding
@@ -106,19 +106,20 @@ GATED = [
             'empty walk plus one atomicMax, and deliberately omits the '
             'closest-point geometry as unverifiable dead code.',
     },
-]
-
-# Same defect, nothing in this port depends on it yet.  Reported, not gated.
-NOTED = [
     {
         'rel': CU,
         'kernel': 'cloth_heightfieldVertexContactGenLaunch',
         'flag': 'hasContacts',
         'depends':
-            'Not ported.  Recorded because it is the same upstream defect; '
-            'gate it when a Slang port of it lands.',
+            'femClothHfContactGenBda.slang implements this kernel the same way, for '
+            'the same reason.  It was a NOTE here from P9.26, with the instruction '
+            '"gate it when a Slang port of it lands" -- P9.27b is that landing.',
     },
 ]
+
+# Same defect, but NOT covered by this port: reported, never gated.  Empty since
+# P9.27b moved its one entry into GATED.  See "NOTES ARE NOT GATES" above.
+NOTED = []
 
 # Kernels that ARE live, analysed by the same code so that a green run proves
 # this checker can still tell the two states apart.

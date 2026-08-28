@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 366;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 368;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -412,9 +412,9 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_midphaseVertexMeshLaunch", "femClothMeshVertMidphaseBda.spv", "cloth_midphaseVertexMeshLaunch" },  // CLOTH_MIDPHASE_VERTEX_MESH (P9.26: cloth-VERTEX-vs-cooked-trimesh midphase)
     { "cloth_meshVertexContactGenLaunch", "femClothMeshVertContactGenBda.spv", "cloth_meshVertexContactGenLaunch" },  // CLOTH_MESH_VERTEX_CG (P9.26: emits no contacts upstream -- see tools/check_disabled_kernels.py)
     { "cloth_heightfieldMidphaseGeneratePairsLaunch", "femClothHfMidphaseBda.spv", "cloth_heightfieldMidphaseGeneratePairsLaunch" },  // CLOTH_HF_MIDPHASE (P9.27)
-    { "cloth_heightfieldContactGenLaunch", nullptr, nullptr },  // CLOTH_HF_CG (unmapped)
+    { "cloth_heightfieldContactGenLaunch", "femClothHfContactGenBda.spv", "cloth_heightfieldContactGenLaunch" },  // CLOTH_HF_CG (P9.27b)
     { "cloth_midphaseVertexHeightfieldLaunch", "femClothHfMidphaseBda.spv", "cloth_midphaseVertexHeightfieldLaunch" },  // CLOTH_MIDPHASE_VERTEX_HF (P9.27)
-    { "cloth_heightfieldVertexContactGenLaunch", nullptr, nullptr },  // CLOTH_HF_VERTEX_CG (unmapped)
+    { "cloth_heightfieldVertexContactGenLaunch", "femClothHfContactGenBda.spv", "cloth_heightfieldVertexContactGenLaunch" },  // CLOTH_HF_VERTEX_CG (P9.27b: emits no contacts upstream -- gated by tools/check_disabled_kernels.py)
     { "cloth_rigidAttachmentPrepareLaunch", "femClothRigidAttachBda.spv", "cloth_rigidAttachmentPrepareLaunch" },  // CLOTH_RIGID_ATTACHMENT_CONSTRAINT_PREP (P7.1 tranche 3a BDA port: cloth rigid/world attachment constraint prep)
     { "cloth_rigidContactPrepareLaunch", "femClothRigidContactBda.spv", "cloth_rigidContactPrepareLaunch" },  // CLOTH_RIGID_CONTACTPREPARE (P7.1 tranche 4b-2 BDA port: cloth-vs-rigid contact constraint prep)
     { "cloth_clothContactPrepareLaunch", "femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch" },  // CLOTH_CLOTH_CONTACTPREPARE (P7.2 tranche 2 BDA port: cloth-vs-cloth self-contact prepare + rest-pose filter)

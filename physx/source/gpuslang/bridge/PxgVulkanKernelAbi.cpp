@@ -796,6 +796,32 @@ static const uint8_t kClothMeshVertContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 4, 8
 //   byte count where a device pointer belongs.
 static const uint8_t kClothHfMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 4 };
 
+// gpunarrowphase cloth-vs-HEIGHTFIELD contact gen, the LIVE one (P9.27b):
+//   cloth_heightfieldContactGenLaunch(PxReal tolerenceLength, cmInputs*, transformCache*,
+//   contactDistance*, restDistance*, gpuShapes*, clothes*, shapeToRigidRemapTable*,
+//   stackPtr*, midphasePairsNum*, PxU32 stackSizeBytes, stackSizeNeededOnDevice*,
+//   PxgFEMContactWriter writer) -- launch site PxgNarrowphaseCore.cpp:7006.
+//   4 @0, nine pointers @8..@72, PxU32 @80, a pointer @88, then the 80-byte writer at
+//   @96 (already 16-aligned, so paramAlign moves nothing) -> 176-byte blob.
+//
+//   NOT kClothMeshContactGen, though both end in a writer: that pack carries
+//   filterPairs and nbFilterPairs which this one does not, so its writer lands at @112.
+static const uint8_t kClothHfContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 8, 80 };
+
+// gpunarrowphase cloth-VERTEX-vs-HEIGHTFIELD contact gen, the DISABLED one (P9.27b):
+//   cloth_heightfieldVertexContactGenLaunch(... the SAME thirteen arguments as above,
+//   in a DIFFERENT ORDER: the writer comes BEFORE stackSizeBytes and
+//   stackSizeNeededOnDevice) -- launch site PxgNarrowphaseCore.cpp:7157.
+//   4 @0, nine pointers @8..@72, the 80-byte writer at @80, PxU32 @160, a pointer @168
+//   -> 176-byte blob.
+//
+//   BOTH ARE 176 BYTES AND THE LAYOUTS DIFFER.  That is the sharpest instance in this
+//   file of the hazard these rows exist for: reading one with the other's layout hands
+//   the kernel a byte count where a device pointer belongs, and the sizes match so
+//   nothing else would catch it.  Two names, two rows, deliberately adjacent so the
+//   difference is read rather than diffed.
+static const uint8_t kClothHfVertContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 80, 4, 8 };
+
 // gpusimulationcontroller FEM-vs-FEM ATTACHMENT pair (P8.19):
 //   femAttachmentPrepareLaunch(PxgFEMFEMAttachment* femAttachments, PxU32* activeFemAttachments,
 //   PxU32 numFemAttachments, PxgFEMFEMAttachmentConstraint* attachmentConstraints) -- launch
@@ -1739,6 +1765,8 @@ static const PxgKernelAbiRow kRows[] = {
     // P9.27: the cloth-vs-HEIGHTFIELD midphase pair, one row for two names.
     { "cloth_heightfieldMidphaseGeneratePairsLaunch", kClothHfMidphase, uint32_t(sizeof(kClothHfMidphase)) },
     { "cloth_midphaseVertexHeightfieldLaunch", kClothHfMidphase, uint32_t(sizeof(kClothHfMidphase)) },
+    { "cloth_heightfieldContactGenLaunch", kClothHfContactGen, uint32_t(sizeof(kClothHfContactGen)) },
+    { "cloth_heightfieldVertexContactGenLaunch", kClothHfVertContactGen, uint32_t(sizeof(kClothHfVertContactGen)) },
     // gpusimulationcontroller FEM-vs-FEM attachments (P8.19)
     { "femAttachmentPrepareLaunch", kFemAttachPrep, uint32_t(sizeof(kFemAttachPrep)) },
     { "sb_solveOutputSoftBodyAttachmentDeltaVLaunch", kFemAttachSolve, uint32_t(sizeof(kFemAttachSolve)) },
