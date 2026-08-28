@@ -10619,6 +10619,21 @@ PXG_TEST(softBodySimHeightfieldMidphase)
     const uint32_t T_ABOVE   = addTet(0.0f, 2.0f, 200.0f, 1u); // far ABOVE a quad at height 0
     const uint32_t T_SIGN    = addTet(1.0f, 1.0f, 1.0f, 1u);  // over the MIXED-sign quad (1,1)
     const uint32_t T_INNER   = addTet(1.0f, 1.0f, 1.0f, 0u);  // interior tet, hint 0
+    // *** THE ONLY TETRAHEDRON WHOSE LOCAL BOUND GOES NEGATIVE IN Y. ***
+    //
+    // The y range reaches `heightfieldComputePairs` as PxU32 (heightfieldUtil.cuh:334), so the
+    // caller performs an implicit float->unsigned conversion, and CUDA compiles that to
+    // cvt.rzi.u32.f32, which SATURATES: a negative becomes 0, not a huge number.  Every other
+    // tetrahedron here sits at h = 1.0, and the world-space fattening of 0.002 is 0.2 in
+    // height units, so their lMin.y is +0.8 and the negative branch is never reached -- which
+    // is why this fixture passed identically with and without the saturation (measured).
+    //
+    // At h = 0.1 the same arithmetic gives lMin.y = -0.1.  Under the CORRECT reading minY is
+    // 0, exactly as it is for the h = 1.0 tetrahedra (truncation), and quad (0,2) -- corners
+    // 0, 0, -1, 0 -- survives con1 because `0 > 0` is false.  Under the C++ HOST reading, where
+    // a negative float becomes a huge unsigned, minY exceeds every corner, con1 fires and the
+    // quad is dropped.  Two pairs against zero: the two readings cannot both pass.
+    const uint32_t T_NEGY    = addTet(0.0f, 2.0f, 0.1f, 1u);
     (void)T_BELOW; (void)T_ABOVE; (void)T_INNER;
     std::vector<uint32_t> hintWords((hints.size() + 3u) / 4u + 1u, 0u);
     for (size_t i = 0; i < hints.size(); ++i)
@@ -10758,9 +10773,17 @@ PXG_TEST(softBodySimHeightfieldMidphase)
     // tetrahedron into its neighbours' quads and dissolve the rest of the fixture.  Recorded
     // rather than papered over; step 2's fixture is where the contact distance has teeth.
 
-    PXG_CHECK_MSG(gNum == 5u,
-                  "five pairs in total -- one from quad (0,0), two from quad (1,0) and two "
-                  "from quad (1,1); got "
+    PXG_CHECK_MSG(countFor(T_NEGY) == 2u,
+                  "this tetrahedron's local bound reaches y = -0.1, and the y range is passed "
+                  "to heightfieldComputePairs as PxU32.  CUDA's cvt.rzi.u32.f32 SATURATES a "
+                  "negative to 0, so minY is 0, `0 > 0` is false for quad (0,2)'s corner at "
+                  "height 0, and both its triangles survive.  Got %u -- 0 means the conversion "
+                  "was transcribed with C++ host semantics, where a negative float becomes a "
+                  "huge unsigned and con1 rejects every quad", countFor(T_NEGY));
+
+    PXG_CHECK_MSG(gNum == 7u,
+                  "seven pairs in total -- one from quad (0,0), two from quad (1,0), two from "
+                  "quad (1,1) and two from quad (0,2) via the negative-y tetrahedron; got "
                   "%u.  0 usually means the blob walk or the inverse transform is wrong; a "
                   "large number means the row/column rectangle is not being clamped and the "
                   "whole field is being scanned", gNum);

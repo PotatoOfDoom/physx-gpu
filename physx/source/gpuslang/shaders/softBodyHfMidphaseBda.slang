@@ -65,10 +65,28 @@
 //   6. the surviving triangle index is `(vertexIndex << 1) | isMaterial1`.
 //
 // THE Y COMPARISON IS DONE IN INTEGERS UPSTREAM, and that is transcribed rather than corrected:
-// `heightfieldComputePairs` takes `miny`/`maxy` as `PxU32` and the caller passes the local
-// bound's float y through that conversion, so a bound at y = -0.4 arrives as a huge unsigned
-// number.  The port keeps the conversion so the emitted pair SET matches; the comment is here
-// so the next reader does not "fix" it into a divergence.
+// `heightfieldComputePairs` takes `miny`/`maxy` as `PxU32` (heightfieldUtil.cuh:334) and the
+// caller passes the local bound's float y through that conversion, which the predicates then
+// compare back as floats.
+//
+// THE CONVERSION SATURATES.  CUDA compiles it to `cvt.rzi.u32.f32`, which clamps out-of-range
+// results, so a bound at y = -0.4 arrives as **0** -- NOT as a huge unsigned number, which is
+// what the C++ HOST would produce and what an earlier version of this comment claimed.  The
+// difference is not academic: minY = 0 makes `con1 = minY > every corner` false for any quad
+// with a non-negative corner and the quad is KEPT, while a huge minY makes it true and the
+// quad is DROPPED.  Anything resting on terrain has a bound reaching below local y = 0.
+//
+// This was measured, not read: the fixture's T_NEGY tetrahedron reaches lMin.y = -0.1 and
+// emits two pairs, which only the saturating reading produces.  Before that case existed every
+// tetrahedron in the fixture sat at lMin.y = +0.8 and the branch was unreachable, so the
+// fixture passed identically with and without saturation -- also measured.
+//
+// The conversion is spelled explicitly (`hfF2uSat`) rather than as a bare `uint(x)`.  A bare
+// cast is `OpConvertFToU`, which SPIR-V leaves UNDEFINED for an out-of-range operand: llvmpipe
+// happens to give 0 and therefore happens to agree, but agreement by accident is not the same
+// as agreement, and the next driver need not repeat it.  fcMidphase.slang made this call
+// correctly in Phase 1 (`f2uSat`, with a CPU mirror in its fixture); this file did not, and
+// the two disagreeing about the same upstream conversion is what found it.
 //
 // *** THE WORK PARTITION IS NOT THE USUAL ONE. ***  Sixty-four warps are assigned per contact
 // manager (`nbWarpsPerCm = 64`, i.e. 2048 threads), and inside one, EACH LANE owns a different
@@ -180,6 +198,16 @@ uint hfMaterial0(uint64_t samples, uint vertexIndex)
 uint hfMaterial1(uint64_t samples, uint vertexIndex)
 {
     return (hfSampleWord(samples, vertexIndex) >> 24) & 0x7fu;
+}
+
+// CUDA's implicit float -> PxU32 at the heightfieldComputePairs call: cvt.rzi.u32.f32
+// truncates toward zero and SATURATES, negatives to 0 and overflow to 0xffffffff.  See the
+// header; a bare `uint(x)` is undefined for those operands and only accidentally agrees.
+uint hfF2uSat(float x)
+{
+    if (!(x > 0.0f)) return 0u;
+    if (x >= 4294967296.0f) return 0xffffffffu;
+    return uint(x);
 }
 
 // heightfieldUtil.cuh:37-58.  NOTE the two different upper clamps.
@@ -351,9 +379,10 @@ void sb_heightfieldMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, ui
 
                     if ((2u * (maxCol - minCol) * (maxRow - minRow)) > 0u)
                     {
-                        // The integer conversion is upstream's; see the header.
-                        minY = uint(lMin.y);
-                        maxY = uint(lMax.y);
+                        // The integer conversion is upstream's, and it SATURATES; see the
+                        // header for the measurement that settled it.
+                        minY = hfF2uSat(lMin.y);
+                        maxY = hfF2uSat(lMax.y);
                         live = true;
                     }
                 }
