@@ -778,6 +778,24 @@ static const uint8_t kClothVertMeshMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 4, 8, 
 //   -> 176-byte blob, over Vulkan's guaranteed 128 and inside llvmpipe's 256.
 static const uint8_t kClothMeshVertContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 80 };
 
+// gpunarrowphase cloth-vs-HEIGHTFIELD midphase, BOTH kernels (P9.27):
+//   cloth_heightfieldMidphaseGeneratePairsLaunch(PxU32 numNPWorkItems,
+//   PxReal toleranceLength, cmInputs*, transformCache*, contactDistance*, gpuShapes*,
+//   clothes*, stackPtr*, midphasePairsNum*, PxU32 stackSizeBytes) -- launch site
+//   PxgNarrowphaseCore.cpp:6909, and cloth_midphaseVertexHeightfieldLaunch at :7060
+//   with the SAME ten arguments in the same order.  Two 4-byte scalars @0/@4, seven
+//   pointers @8..@56, PxU32 @64 -> 72-byte blob.
+//
+//   ONE row for both names, and here that is not a claim about two bodies being alike:
+//   the CUDA declares ONE __device__ clothHeightfieldMidphaseCore and calls it from
+//   both kernels, so the argument packs are the same pack by construction.
+//
+//   NOT kSbHfMidphase { 4,4,8,8,8,8,8,4,8,8 }, though both are 72 bytes over the same
+//   ten types: there stackSizeBytes sits at @48 BEFORE the two output pointers, here it
+//   sits at @64 AFTER them.  Reading one with the other's layout hands the kernel a
+//   byte count where a device pointer belongs.
+static const uint8_t kClothHfMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 4 };
+
 // gpusimulationcontroller FEM-vs-FEM ATTACHMENT pair (P8.19):
 //   femAttachmentPrepareLaunch(PxgFEMFEMAttachment* femAttachments, PxU32* activeFemAttachments,
 //   PxU32 numFemAttachments, PxgFEMFEMAttachmentConstraint* attachmentConstraints) -- launch
@@ -1718,6 +1736,9 @@ static const PxgKernelAbiRow kRows[] = {
     // tools/check_disabled_kernels.py, which keeps that reading true.
     { "cloth_midphaseVertexMeshLaunch", kClothVertMeshMidphase, uint32_t(sizeof(kClothVertMeshMidphase)) },
     { "cloth_meshVertexContactGenLaunch", kClothMeshVertContactGen, uint32_t(sizeof(kClothMeshVertContactGen)) },
+    // P9.27: the cloth-vs-HEIGHTFIELD midphase pair, one row for two names.
+    { "cloth_heightfieldMidphaseGeneratePairsLaunch", kClothHfMidphase, uint32_t(sizeof(kClothHfMidphase)) },
+    { "cloth_midphaseVertexHeightfieldLaunch", kClothHfMidphase, uint32_t(sizeof(kClothHfMidphase)) },
     // gpusimulationcontroller FEM-vs-FEM attachments (P8.19)
     { "femAttachmentPrepareLaunch", kFemAttachPrep, uint32_t(sizeof(kFemAttachPrep)) },
     { "sb_solveOutputSoftBodyAttachmentDeltaVLaunch", kFemAttachSolve, uint32_t(sizeof(kFemAttachSolve)) },

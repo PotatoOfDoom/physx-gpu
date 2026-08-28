@@ -114,6 +114,7 @@
 module softBodyHfMidphaseBda;
 
 import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu
+import pxgSlangHeightfield;   // P9.27: the sample format, the rectangle, the quad walk
 
 // PxgNpKernelIndices.h:32 / PxgSoftBodyCoreKernelIndices.h:55.
 static const uint MIDPHASE_WARPS_PER_BLOCK = 2u;
@@ -125,9 +126,6 @@ static const uint NB_WARPS_PER_CM = 64u;                 // softbodyHFMidPhase.c
 static const uint NB_THREADS_PER_CM = NB_WARPS_PER_CM * WARP;   // 2048
 
 static const uint GEOM_TETRAHEDRONMESH = 7u;
-
-// PxHeightFieldMaterial::eHOLE (PxHeightFieldSample.h:49).
-static const uint HF_HOLE = 127u;
 
 // ---------------------------------------------------------------------------
 // Push-constant blob — BYTE-IDENTICAL to the CUDA pack (PxgNarrowphaseCore.cpp:5343):
@@ -175,46 +173,10 @@ uint byteAt(uint64_t base, uint idx)
     return (word >> shift) & 0xffu;
 }
 
-// ---------------------------------------------------------------------------
-// PxHeightFieldSample, 4 bytes: PxI16 height @0, PxBitAndByte materialIndex0 @2,
-// materialIndex1 @3.  One 32-bit load gives the whole sample.
-// ---------------------------------------------------------------------------
-uint hfSampleWord(uint64_t samples, uint vertexIndex)
-{
-    return Ptr<uint>(samples + uint64_t(vertexIndex) * 4UL)[0];
-}
-// The height is SIGNED 16-bit; a raw mask would read -1 as 65535.
-float hfHeight(uint64_t samples, uint vertexIndex)
-{
-    const uint w = hfSampleWord(samples, vertexIndex) & 0xffffu;
-    return float(int(w << 16) >> 16);
-}
-// `PxBitAndDataT::operator T()` returns `mData & ~bitMask`, i.e. bit 7 (the tessFlag) masked
-// off.  See the header on why comparing the raw byte against eHOLE is wrong.
-uint hfMaterial0(uint64_t samples, uint vertexIndex)
-{
-    return (hfSampleWord(samples, vertexIndex) >> 16) & 0x7fu;
-}
-uint hfMaterial1(uint64_t samples, uint vertexIndex)
-{
-    return (hfSampleWord(samples, vertexIndex) >> 24) & 0x7fu;
-}
-
-// CUDA's implicit float -> PxU32 at the heightfieldComputePairs call: cvt.rzi.u32.f32
-// truncates toward zero and SATURATES, negatives to 0 and overflow to 0xffffffff.  See the
-// header; a bare `uint(x)` is undefined for those operands and only accidentally agrees.
-uint hfF2uSat(float x)
-{
-    if (!(x > 0.0f)) return 0u;
-    if (x >= 4294967296.0f) return 0xffffffffu;
-    return uint(x);
-}
-
-// heightfieldUtil.cuh:37-58.  NOTE the two different upper clamps.
-uint getMinRow(float x, uint rows)    { return uint(clamp(int(floor(x)), 0, int(rows) - 2)); }
-uint getMaxRow(float x, uint rows)    { return uint(clamp(int(ceil(x)),  0, int(rows) - 1)); }
-uint getMinColumn(float z, uint cols) { return uint(clamp(int(floor(z)), 0, int(cols) - 2)); }
-uint getMaxColumn(float z, uint cols) { return uint(clamp(int(ceil(z)),  0, int(cols) - 1)); }
+// The sample format, the row/column clamps, the saturating y conversion, the admit
+// gate and the quad walk all live in pxgSlangHeightfield now (P9.27).  They used to
+// live here AND in fcMidphase.slang, and the two copies disagreed about the
+// conversion for several tranches -- see P9.27a.
 
 // PxQuat::rotate / rotateInv (PxQuat.h:286, :324), literal.
 float3 hfQuatRotate(float4 q, float3 v)
@@ -328,9 +290,10 @@ void sb_heightfieldMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, ui
 
             // --- the per-lane rectangle -----------------------------------------
             uint nbPairs = 0u;
-            uint minRow = 0u, maxRow = 0u, minCol = 0u, maxCol = 0u;
-            uint minY = 0u, maxY = 0u;
-            bool live = false;
+            HfRect rect;
+            rect.live = false;
+            rect.minRow = 0u; rect.maxRow = 0u; rect.minColumn = 0u; rect.maxColumn = 0u;
+            rect.nbCols = nbCols; rect.minyF = 0.0f; rect.maxyF = 0.0f;
 
             if (tetrahedronIdx < nbTets && byteAt(surfaceHintBase, tetrahedronIdx) != 0u)
             {
@@ -344,76 +307,21 @@ void sb_heightfieldMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, ui
                 float3 bMin = min(min(w0, w1), min(w2, w3)) - contactDist;
                 float3 bMax = max(max(w0, w1), max(w2, w3)) + contactDist;
 
-                // PxBounds3::transformFast(inv, bounds) =
-                //     basisExtent(inv.transform(centre), PxMat33(inv.q), extents)
-                // with inv.q = conj(hfQ), so inv.transform(c) = hfQ.rotateInv(c - hfP) and the
-                // basis columns are hfQ.rotateInv(e_i).
-                const float3 centre = (bMin + bMax) * 0.5f;
-                const float3 extents = (bMax - bMin) * 0.5f;
-                const float3 lc = hfQuatRotateInv(hfQ, centre - hfP);
-                const float3 c0 = hfQuatRotateInv(hfQ, float3(1, 0, 0)) * extents.x;
-                const float3 c1 = hfQuatRotateInv(hfQ, float3(0, 1, 0)) * extents.y;
-                const float3 c2 = hfQuatRotateInv(hfQ, float3(0, 0, 1)) * extents.z;
-                const float3 w = abs(c0) + abs(c1) + abs(c2);
-                float3 lMin = lc - w;
-                float3 lMax = lc + w;
-
-                lMin.x *= oneOverRowScale; lMin.y *= oneOverHeightScale; lMin.z *= oneOverColScale;
-                lMax.x *= oneOverRowScale; lMax.y *= oneOverHeightScale; lMax.z *= oneOverColScale;
-
-                // A NEGATIVE row or column scale mirrors the axis, so the min and max swap.
-                if (hfShape.scaleX < 0.0f) { const float t = lMin.x; lMin.x = lMax.x; lMax.x = t; }
-                if (hfShape.scaleZ < 0.0f) { const float t = lMin.z; lMin.z = lMax.z; lMax.z = t; }
-
-                // Upstream's condition, transcribed with its own bracketing: the `!( ... )`
-                // covers only the FIRST term, so the three that follow are ORed in unnegated.
-                // That is what the .cu says (softbodyHFMidPhase.cu:236) and changing it would
-                // change which tetrahedra are considered at all.
-                if (!(lMin.x > float(nbRows) - 1.0f) || (lMin.z > float(nbCols) - 1.0f)
-                    || (lMax.x < 0.0f) || (lMax.z < 0.0f))
-                {
-                    minRow = getMinRow(lMin.x, nbRows);
-                    maxRow = getMaxRow(lMax.x, nbRows);
-                    minCol = getMinColumn(lMin.z, nbCols);
-                    maxCol = getMaxColumn(lMax.z, nbCols);
-
-                    if ((2u * (maxCol - minCol) * (maxRow - minRow)) > 0u)
-                    {
-                        // The integer conversion is upstream's, and it SATURATES; see the
-                        // header for the measurement that settled it.
-                        minY = hfF2uSat(lMin.y);
-                        maxY = hfF2uSat(lMax.y);
-                        live = true;
-                    }
-                }
+                // transformFast + the per-axis divisions + the negative-scale swaps:
+                // pxgSlangHeightfield::hfLocalBound.  Then the admit gate, the clamps
+                // and the saturating y conversion: hfMakeRect.
+                float3 lMin, lMax;
+                hfLocalBound(hfQ, hfP, float3(hfShape.scaleX, hfShape.scaleY, hfShape.scaleZ),
+                             bMin, bMax, lMin, lMax);
+                rect = hfMakeRect(lMin, lMax, nbRows, nbCols);
             }
 
             // --- heightfieldComputePairs (heightfieldUtil.cuh:334) ----------------
-            if (live)
             {
-                const uint columnSpan = maxCol - minCol;
-                const uint total = (maxRow - minRow) * columnSpan * 2u;
+                const uint total = hfQuadSpan(rect);
                 for (uint t = 0u; t < total; ++t)
-                {
-                    const uint index = t / 2u;
-                    const uint vertexIndex = (minRow + index / columnSpan) * nbCols +
-                                             (minCol + index % columnSpan);
-                    const float h0 = hfHeight(samples, vertexIndex);
-                    const float h1 = hfHeight(samples, vertexIndex + 1u);
-                    const float h2 = hfHeight(samples, vertexIndex + nbCols);
-                    const float h3 = hfHeight(samples, vertexIndex + nbCols + 1u);
-                    const bool con0 = float(maxY) < h0 && float(maxY) < h1 &&
-                                      float(maxY) < h2 && float(maxY) < h3;
-                    const bool con1 = float(minY) > h0 && float(minY) > h1 &&
-                                      float(minY) > h2 && float(minY) > h3;
-                    if (!(con0 || con1))
-                    {
-                        const uint material = ((t & 1u) != 0u) ? hfMaterial1(samples, vertexIndex)
-                                                               : hfMaterial0(samples, vertexIndex);
-                        if (material != HF_HOLE)
-                            ++nbPairs;
-                    }
-                }
+                    if (hfQuadAt(samples, rect, t).survives)
+                        ++nbPairs;
             }
 
             // --- the warp scan: one atomicAdd, each lane writes at its own offset ---
@@ -441,35 +349,16 @@ void sb_heightfieldMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, ui
             // The SAME walk again, emitting this time.  The `writeIndex < size` guard is in
             // the loop condition upstream, so a full stack stops the WRITES but the count
             // above was already committed -- which is how the host learns it needs more.
-            if (live)
             {
-                const uint columnSpan = maxCol - minCol;
-                const uint total = (maxRow - minRow) * columnSpan * 2u;
+                const uint total = hfQuadSpan(rect);
                 for (uint t = 0u; t < total && writeIndex < stackSize; ++t)
                 {
-                    const uint index = t / 2u;
-                    const uint vertexIndex = (minRow + index / columnSpan) * nbCols +
-                                             (minCol + index % columnSpan);
-                    const float h0 = hfHeight(samples, vertexIndex);
-                    const float h1 = hfHeight(samples, vertexIndex + 1u);
-                    const float h2 = hfHeight(samples, vertexIndex + nbCols);
-                    const float h3 = hfHeight(samples, vertexIndex + nbCols + 1u);
-                    const bool con0 = float(maxY) < h0 && float(maxY) < h1 &&
-                                      float(maxY) < h2 && float(maxY) < h3;
-                    const bool con1 = float(minY) > h0 && float(minY) > h1 &&
-                                      float(minY) > h2 && float(minY) > h3;
-                    if (!(con0 || con1))
+                    const HfQuad q = hfQuadAt(samples, rect, t);
+                    if (q.survives)
                     {
-                        const bool isMaterial1 = (t & 1u) != 0u;
-                        const uint material = isMaterial1 ? hfMaterial1(samples, vertexIndex)
-                                                          : hfMaterial0(samples, vertexIndex);
-                        if (material != HF_HOLE)
-                        {
-                            const uint triangleIdx = (vertexIndex << 1) | (isMaterial1 ? 1u : 0u);
-                            Ptr<uint4>(gHf.stackPtr)[writeIndex] =
-                                uint4(cmIdx, tetrahedronIdx, triangleIdx, 0u);
-                            ++writeIndex;
-                        }
+                        Ptr<uint4>(gHf.stackPtr)[writeIndex] =
+                            uint4(cmIdx, tetrahedronIdx, q.triangleIdx, 0u);
+                        ++writeIndex;
                     }
                 }
             }

@@ -9124,4 +9124,480 @@ PXG_TEST(femClothSimMeshVertContactGen)
     destroyWriter(dev, w);
 }
 
+// ===========================================================================
+// P9.27 -- the cloth-vs-HEIGHTFIELD midphase pair, both entry points.
+//
+// The CUDA shares one __device__ core between them (femClothHFMidPhase.cu:76) and
+// this port shares one Slang body, so the fixture drives BOTH names over the SAME
+// heightfield and asserts each against its own CPU reference.  If the shared body
+// were wrong in a way that happened to suit one element type, the other would show
+// it.
+//
+// WHAT IT PINS, and each of these is a mutant that would otherwise live:
+//
+//   * the ELEMENT bound differs and nothing else does.  The triangle path takes
+//     triBoundingBox fattened by the contact distance; the vertex path takes a
+//     SPHERE bound of that distance around one position.  A vertex whose sphere
+//     reaches a quad its triangle's bound does not, and a triangle whose bound
+//     reaches one no single vertex does, separate the two;
+//   * the y range reaches the quad cull through a SATURATING float->PxU32
+//     conversion.  One element sits with its local bound below zero, which is the
+//     case P9.27a showed nothing in the port could previously tell apart;
+//   * eHOLE is compared against the material byte with the tessellation flag
+//     MASKED OFF, and the two material slots of one quad are independent;
+//   * the payload is uint4(cmIdx, elementIdx, triangleIdx, 0) with
+//     triangleIdx = (vertexIndex << 1) + isMaterial1;
+//   * *** THE DUPLICATION. ***  The engine launches gridDim.y = numTests and
+//     neither kernel reads blockIdx.y, so every pair is emitted numTests times.
+//     The second dispatch drives numTests = 2 with gridDim.y = 2 and requires
+//     EXACTLY two copies of every pair.  That is upstream candidate 37, measured
+//     rather than described -- and a port that "fixed" it would fail here, which
+//     is the point.
+// ===========================================================================
+namespace p927hf
+{
+struct ClothHfMidPush
+{
+    uint32_t numNPWorkItems; float toleranceLength;
+    uint64_t cmInputs, transformCache, contactDistance, gpuShapes, femClothes;
+    uint64_t stackPtr, midphasePairsNum;
+    uint32_t stackSizeBytes, pad68;
+};
+static_assert(sizeof(ClothHfMidPush) == 72, "cloth hf midphase blob must be 72 bytes");
+static_assert(offsetof(ClothHfMidPush, femClothes) == 40, "femClothes @40");
+static_assert(offsetof(ClothHfMidPush, stackPtr) == 48, "stackPtr @48");
+static_assert(offsetof(ClothHfMidPush, midphasePairsNum) == 56, "midphasePairsNum @56");
+static_assert(offsetof(ClothHfMidPush, stackSizeBytes) == 64, "stackSizeBytes @64 -- AFTER "
+              "the output pointers, unlike the softbody pack where it precedes them");
+
+static uint32_t hfSample(int16_t height, uint8_t mat0, uint8_t mat1)
+{
+    return (uint32_t(uint16_t(height))) | (uint32_t(mat0) << 16) | (uint32_t(mat1) << 24);
+}
+// cvt.rzi.u32.f32 -- see pxgSlangHeightfield and P9.27a.
+static uint32_t f2uSatRef(float x)
+{
+    if (!(x > 0.0f)) return 0u;
+    if (x >= 4294967296.0f) return 0xffffffffu;
+    return uint32_t(x);
+}
+} // namespace p927hf
+
+PXG_TEST(femClothSimHeightfieldMidphase)
+{
+    using namespace p816dc;        // PxgShapeHost, CmInputHost
+    using namespace p927hf;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t MAT_SOLID = 3u, MAT_HOLE = 127u;
+    const uint32_t MAT_HOLE_TESS = 127u | 0x80u;   // eHOLE with the tessellation flag set
+    // FOUR rows and FIVE columns.  A square field cannot tell nbRows from nbCols, and a
+    // port that swapped them would index the samples identically -- measured, as a survivor.
+    const uint32_t NB_ROWS = 4u, NB_COLS = 5u;
+
+    // blob: nbRows @0, nbCols @4, then NB_ROWS * NB_COLS samples.
+    std::vector<uint32_t> blob(2u + NB_ROWS * NB_COLS, 0u);
+    blob[0] = NB_ROWS; blob[1] = NB_COLS;
+    auto setSample = [&](uint32_t r, uint32_t c, int16_t h, uint8_t m0, uint8_t m1) {
+        blob[2u + r * NB_COLS + c] = hfSample(h, m0, m1);
+    };
+    for (uint32_t r = 0; r < NB_ROWS; ++r)
+        for (uint32_t c = 0; c < NB_COLS; ++c)
+            setSample(r, c, 0, uint8_t(MAT_SOLID), uint8_t(MAT_SOLID));
+    // quad (0,0): one slot a HOLE, the other solid -- the two slots are independent.
+    setSample(0u, 0u, 0, uint8_t(MAT_HOLE), uint8_t(MAT_SOLID));
+    // quad (0,1): a hole in BOTH slots, with the TESSELLATION flag set.  Comparing the
+    // raw byte against eHOLE would miss it and emit two pairs.
+    setSample(0u, 1u, 0, uint8_t(MAT_HOLE_TESS), uint8_t(MAT_HOLE_TESS));
+    // rows 2 and 3 raised well above everything, so quads there are culled by con0.
+    for (uint32_t c = 0; c < NB_COLS; ++c) { setSample(2u, c, 400, uint8_t(MAT_SOLID), uint8_t(MAT_SOLID)); }
+    for (uint32_t c = 0; c < NB_COLS; ++c) { setSample(3u, c, 400, uint8_t(MAT_SOLID), uint8_t(MAT_SOLID)); }
+    // quad (1,2)'s far corner is NEGATIVE, so the signed height read matters here.
+    setSample(1u, 2u, -1, uint8_t(MAT_SOLID), uint8_t(MAT_SOLID));
+    DevBuf bBlob = makeDev(dev, blob);
+    if (!bBlob.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    // ---- the heightfield's placement -------------------------------------------------
+    // Non-unit scales on all three axes and a 180-degree rotation about y, which is exact
+    // in floating point:  world = R * (hf * scale) + T,  R(x, y, z) = (-x, y, -z).
+    const float ROW_SCALE = 2.0f, HEIGHT_SCALE = 0.01f, COL_SCALE = 0.5f;
+    const float TX = 5.0f, TY = 7.0f, TZ = 9.0f;
+    auto toWorld = [&](float hr, float hh, float hc) {
+        return F4{ -(hr * ROW_SCALE) + TX, (hh * HEIGHT_SCALE) + TY, -(hc * COL_SCALE) + TZ, 1.0f };
+    };
+
+    // ---- the cloth ------------------------------------------------------------------
+    // Vertices are placed in HEIGHTFIELD units and converted; triangles index them.
+    // The vertex count is 9 -- deliberately NOT a multiple of 2048, so lanes past the end
+    // of the array are exercised on every launch.  That is trap H1: the CUDA loads
+    // positions[vertIndex] before its own bounds check, and on this platform an
+    // unclamped index is a fault rather than a wasted load.
+    struct HV { float r, h, c; };
+    // The heights are in HEIGHTFIELD units and the contact distance of 0.1 world units
+    // is 10 of them (heightScale 0.01), so a vertex at h = 0 carries a y band of
+    // -10..+10 around the surface.  It has to STRADDLE the surface: `con1` culls an
+    // element lying entirely above every corner, so a vertex parked at h = 30 over a
+    // quad at height 0 generates nothing -- measured, on the first version of this
+    // fixture, where "over quad (0,0)" produced no pair at all.
+    std::vector<HV> vs = {
+        { 0.5f,    0.0f, 0.5f },   // 0: on quad (0,0) -- one slot is a hole
+        { 0.5f,    0.0f, 1.5f },   // 1: on quad (0,1) -- both slots tessellated holes
+        { 1.5f,    0.0f, 0.5f },   // 2: on quad (1,0) -- both solid
+        { 1.5f,  -10.0f, 2.5f },   // 3: on quad (1,2), LOCAL BOUND BELOW ZERO
+        { 2.5f,    0.0f, 0.5f },   // 4: under a quad raised to +400 -- con0 culls it
+        { 0.5f,  900.0f, 2.5f },   // 5: far above a quad at height 0 -- con1 culls it
+        { 0.5f,    0.0f, 2.5f },   // 6: on quad (0,2) -- both solid, the plain case
+        { 1.5f,    0.0f, 1.5f },   // 7: on quad (1,1) -- both solid
+        { 1.2f,    0.0f, 0.9f },   // 8: the TRIANGLE partner -- see the triangles below
+        // *** THE TWO VERTICES WHOSE RADIUS DECIDES THE RECTANGLE. ***  Every vertex above
+        // sits in the middle of a quad, so its bound covers that quad whatever the radius
+        // is -- which left "drop the radius", "halve it" and "read only one of the two
+        // contact distances" all alive.  The contact distance is 0.10 world units, i.e.
+        // 0.20 of a COLUMN at colScale 0.5.
+        //   9  at column 0.85: the correct radius reaches 1.05 and covers TWO quads; half
+        //      of it reaches 0.95 and covers one, and so does the cloth's 0.02 alone.
+        //   10 at column 1.25: the correct radius reaches 1.05..1.45 and covers ONE quad,
+        //      while doubling the heightfield's 0.08 reaches 0.93..1.57 and covers two.
+        // The two together pin the sum from both sides.
+        { 1.5f,    0.0f, 0.85f },  // 9
+        { 1.5f,    0.0f, 1.25f },  // 10
+        // 11: the TRIANGLE fattening's own case.  Every triangle above spans enough columns
+        // that fattening the bound by 0.2 of one crosses no integer, so dropping
+        // fattenFast entirely changed nothing -- measured, as a survivor.  A degenerate
+        // triangle sitting EXACTLY on column 1.0 has an unfattened column span of zero,
+        // which the area gate rejects outright; fattened it spans 0.8..1.2 and covers two
+        // quads.  Some pairs against none.
+        { 1.5f,    0.0f, 1.0f }    // 11
+    };
+    // *** THE CLOTH IS PADDED PAST 2048. ***  The work partition assigns 64 warps (2048
+    // threads) per contact manager and each lane owns one element, so with a handful of
+    // vertices `nbIter` is 1, the outer element stride is never taken, and half the warps
+    // do nothing.  That left the element stride and the two-warps-per-block loop both
+    // unobservable -- measured, as survivors.  Three of the padding vertices are LIVE and
+    // placed to force both:
+    //   * index 40 and index 100 fall in the 32-element blocks that only the SECOND warp
+    //     of each block reaches, so dropping the `sub` loop loses them;
+    //   * index 2050 is past 2048, so it is reached only on the second `j` iteration --
+    //     and only if the element stride is 2048 and not 32.
+    const uint32_t NB_VERTS = 2100u;
+    const uint32_t LIVE_LATE[3] = { 40u, 100u, 2050u };
+    const HV FAR_AWAY{ 100.0f, 0.0f, 100.0f };
+    const HV LATE_SPOT{ 1.5f, 0.0f, 0.5f };          // quad (1,0), both slots solid
+    while (vs.size() < NB_VERTS) vs.push_back(FAR_AWAY);
+    for (uint32_t i : LIVE_LATE) vs[i] = LATE_SPOT;
+    std::vector<F4> cv;
+    for (const HV& v : vs) cv.push_back(toWorld(v.r, v.h, v.c));
+
+    // Triangles.  Triangle 0 spans vertices 0, 6 and 8, so its bound covers quads (0,0),
+    // (0,1) and (0,2) at once -- a footprint NO single vertex sphere reaches, which is
+    // what separates the two entry points.  Triangle 1 is the degenerate-in-footprint
+    // case: all three corners inside quad (1,0).
+    // Triangle 0's THIRD vertex (8) carries the maximum ROW, and it decides the rectangle:
+    // rows 0.5, 0.5, 1.2 fattened by 0.05 give maxRow = ceil(1.25) = 2, while a bound taken
+    // from the first two only gives ceil(0.55) = 1.
+    // Triangle 2's third vertex (9) carries the minimum COLUMN the same way: columns 2.5,
+    // 2.5 and 0.85 give minCol = floor(0.65) = 0 against floor(2.3) = 2.
+    // Without them, `min(w0, w1)` and `max(w0, w1)` are indistinguishable from the real
+    // three-way bound -- measured, as two survivors.
+    std::vector<TriIdx4> ci = {
+        { 0u, 6u, 8u, 0u },
+        { 2u, 2u, 2u, 0u },
+        { 6u, 6u, 9u, 0u },
+        { 11u, 11u, 11u, 0u },
+    };
+    const uint32_t NB_TRIS = uint32_t(ci.size());
+    DevBuf bCv = makeDev(dev, cv), bCi = makeDev(dev, ci);
+
+    const uint32_t CLOTH_ID = 1u;
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bCv.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bCi.addr));
+    c.mNbVerts = NB_VERTS;
+    c.mNbTriangles = NB_TRIS;
+    std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
+    descArr[CLOTH_ID] = c;
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- the pair.  HEIGHTFIELD is shapeRef0 and CLOTH shapeRef1 -- the SWAPPED order,
+    // so LoadShapePair has to route by TYPE.
+    const uint32_t GEOM_HEIGHTFIELD_H = 9u;
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_HEIGHTFIELD_H;  shapes[0].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[0].sx = ROW_SCALE; shapes[0].sy = HEIGHT_SCALE; shapes[0].sz = COL_SCALE;
+    shapes[0].srw = 1.0f;
+    shapes[0].hullLo = uint32_t(bBlob.addr & 0xFFFFFFFFull);
+    shapes[0].hullHi = uint32_t(bBlob.addr >> 32);
+    shapes[1].type = GEOM_TRIANGLEMESH_H; shapes[1].particleOrSoftbodyId = CLOTH_ID;
+    shapes[1].sx = 1.0f; shapes[1].sy = 1.0f; shapes[1].sz = 1.0f; shapes[1].srw = 1.0f;
+    DevBuf bShapes = makeDev(dev, shapes);
+    // TWO contact managers over the same shapes, for the duplication run below.
+    std::vector<CmInputHost> cms = { { 0u, 1u, /*hf cache*/ 1u, /*cloth cache*/ 0u },
+                                     { 0u, 1u, 1u, 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    std::vector<float> xf(2 * 8, 0.0f);
+    xf[3] = 1.0f;                                             // slot 0 (cloth) identity
+    xf[8 + 0] = 0.0f; xf[8 + 1] = 1.0f; xf[8 + 2] = 0.0f; xf[8 + 3] = 0.0f;  // 180 about y
+    xf[8 + 4] = TX; xf[8 + 5] = TY; xf[8 + 6] = TZ;
+    DevBuf bXf = makeDev(dev, xf);
+
+    // ASYMMETRIC on purpose: with 0.05 and 0.05 a port that reads only the cloth's, or
+    // doubles the heightfield's, produces the same sum and both mutants live.
+    const float CD_CLOTH = 0.02f, CD_HF = 0.08f;
+    const float contactDist = CD_CLOTH + CD_HF;
+    std::vector<float> cd = { CD_CLOTH, CD_HF };
+    DevBuf bCd = makeDev(dev, cd);
+
+    // ---- CPU reference: the same chain, in the same order ----------------------------
+    auto heightAt = [&](uint32_t vi) {
+        return float(int16_t(uint16_t(blob[2u + vi] & 0xffffu)));
+    };
+    auto matAt = [&](uint32_t vi, bool slot1) {
+        return (blob[2u + vi] >> (slot1 ? 24 : 16)) & 0x7fu;
+    };
+    // world -> heightfield row/height/column units, the hfLocalBound chain
+    auto localBound = [&](F4 wMin, F4 wMax, float out_mn[3], float out_mx[3]) {
+        const float cen[3] = { (wMin.x + wMax.x) * 0.5f, (wMin.y + wMax.y) * 0.5f,
+                               (wMin.z + wMax.z) * 0.5f };
+        const float ext[3] = { (wMax.x - wMin.x) * 0.5f, (wMax.y - wMin.y) * 0.5f,
+                               (wMax.z - wMin.z) * 0.5f };
+        // rotateInv by 180 about y is its own inverse: (x, y, z) -> (-x, y, -z)
+        const float lc[3] = { -(cen[0] - TX), cen[1] - TY, -(cen[2] - TZ) };
+        const float w[3] = { ext[0], ext[1], ext[2] };   // abs-sum of the mirrored basis
+        out_mn[0] = (lc[0] - w[0]) / std::fabs(ROW_SCALE);
+        out_mn[1] = (lc[1] - w[1]) / HEIGHT_SCALE;
+        out_mn[2] = (lc[2] - w[2]) / std::fabs(COL_SCALE);
+        out_mx[0] = (lc[0] + w[0]) / std::fabs(ROW_SCALE);
+        out_mx[1] = (lc[1] + w[1]) / HEIGHT_SCALE;
+        out_mx[2] = (lc[2] + w[2]) / std::fabs(COL_SCALE);
+    };
+    auto clampMinRow = [&](float x, uint32_t n) {
+        return uint32_t(std::max(0, std::min(int(std::floor(x)), int(n) - 2))); };
+    auto clampMaxRow = [&](float x, uint32_t n) {
+        return uint32_t(std::max(0, std::min(int(std::ceil(x)), int(n) - 1))); };
+
+    // pairs of (elementIdx, triangleIdx) for one element's bound
+    auto pairsFor = [&](F4 wMin, F4 wMax, std::vector<uint32_t>& out) {
+        float mn[3], mx[3];
+        localBound(wMin, wMax, mn, mx);
+        if (!(!(mn[0] > float(NB_ROWS) - 1.0f) || (mn[2] > float(NB_COLS) - 1.0f)
+              || (mx[0] < 0.0f) || (mx[2] < 0.0f)))
+            return;
+        const uint32_t minRow = clampMinRow(mn[0], NB_ROWS), maxRow = clampMaxRow(mx[0], NB_ROWS);
+        const uint32_t minCol = clampMinRow(mn[2], NB_COLS), maxCol = clampMaxRow(mx[2], NB_COLS);
+        if ((2u * (maxCol - minCol) * (maxRow - minRow)) == 0u) return;
+        const float minyF = float(f2uSatRef(mn[1])), maxyF = float(f2uSatRef(mx[1]));
+        const uint32_t columnSpan = maxCol - minCol;
+        const uint32_t total = (maxRow - minRow) * columnSpan * 2u;
+        for (uint32_t i = 0; i < total; ++i)
+        {
+            const uint32_t index = i / 2u;
+            const uint32_t vi = (minRow + index / columnSpan) * NB_COLS + (minCol + index % columnSpan);
+            const float h0 = heightAt(vi), h1 = heightAt(vi + 1u);
+            const float h2 = heightAt(vi + NB_COLS), h3 = heightAt(vi + NB_COLS + 1u);
+            const bool con0 = maxyF < h0 && maxyF < h1 && maxyF < h2 && maxyF < h3;
+            const bool con1 = minyF > h0 && minyF > h1 && minyF > h2 && minyF > h3;
+            if (con0 || con1) continue;
+            const bool slot1 = (i & 1u) != 0u;
+            if (matAt(vi, slot1) == MAT_HOLE) continue;
+            out.push_back((vi << 1) + (slot1 ? 1u : 0u));
+        }
+    };
+
+    std::vector<std::pair<uint32_t, uint32_t>> refVert, refTri;   // (elementIdx, triangleIdx)
+    for (uint32_t v = 0; v < NB_VERTS; ++v)
+    {
+        const F4 p = cv[v];
+        const F4 mn{ p.x - contactDist, p.y - contactDist, p.z - contactDist, 0 };
+        const F4 mx{ p.x + contactDist, p.y + contactDist, p.z + contactDist, 0 };
+        std::vector<uint32_t> got; pairsFor(mn, mx, got);
+        for (uint32_t t : got) refVert.push_back({ v, t });
+    }
+    for (uint32_t t = 0; t < NB_TRIS; ++t)
+    {
+        const F4 a = cv[ci[t].x], b = cv[ci[t].y], d = cv[ci[t].z];
+        const F4 mn{ std::fmin(std::fmin(a.x, b.x), d.x) - contactDist,
+                     std::fmin(std::fmin(a.y, b.y), d.y) - contactDist,
+                     std::fmin(std::fmin(a.z, b.z), d.z) - contactDist, 0 };
+        const F4 mx{ std::fmax(std::fmax(a.x, b.x), d.x) + contactDist,
+                     std::fmax(std::fmax(a.y, b.y), d.y) + contactDist,
+                     std::fmax(std::fmax(a.z, b.z), d.z) + contactDist, 0 };
+        std::vector<uint32_t> got; pairsFor(mn, mx, got);
+        for (uint32_t g : got) refTri.push_back({ t, g });
+    }
+    std::sort(refVert.begin(), refVert.end());
+    std::sort(refTri.begin(), refTri.end());
+
+    // ---- run both entry points -------------------------------------------------------
+    const uint32_t CAP = 512u;
+    const uint32_t SENTINEL = 0xFFFFFFFFu;
+
+    uint32_t lastWritten = 0u;
+    auto runOne = [&](const char* entry, uint32_t numTests, uint32_t gridY,
+                      std::vector<std::pair<uint32_t, uint32_t>>& emitted,
+                      std::vector<uint32_t>& cmSeen, uint32_t stackPairs) {
+        // The BUFFER always holds CAP entries; only the size the KERNEL is told changes,
+        // so a mutant that drops the write cap lands in slack instead of the heap.
+        std::vector<uint32_t> stack(CAP * 4u, SENTINEL);
+        DevBuf bStack = makeDev(dev, stack);
+        std::vector<uint32_t> pairNum = { 0u };
+        DevBuf bPairNum = makeDev(dev, pairNum);
+
+        ClothHfMidPush p = {};
+        p.numNPWorkItems = numTests;
+        p.toleranceLength = 1.0f;
+        p.cmInputs = bCms.addr;
+        p.transformCache = bXf.addr;
+        p.contactDistance = bCd.addr;
+        p.gpuShapes = bShapes.addr;
+        p.femClothes = bDesc.addr;
+        p.stackPtr = bStack.addr;
+        p.midphasePairsNum = bPairNum.addr;
+        p.stackSizeBytes = stackPairs * 16u;
+
+        Kernel k("femClothHfMidphaseBda.spv", entry, {}, sizeof(ClothHfMidPush));
+        // The engine's grid (PxgNarrowphaseCore.cpp:6927 and :7078):
+        // x = SB_SBMIDPHASE = 1024, y = numTests.
+        k.dispatch(/*gridX*/ 1024u, {}, p, gridY, 1u);
+        dev->flush();
+
+        const uint32_t n = downloadBuffer<uint32_t>(dev, bPairNum.h, 1)[0];
+        const auto s = downloadBuffer<uint32_t>(dev, bStack.h, CAP * 4u);
+        emitted.clear(); cmSeen.clear();
+        lastWritten = 0u;
+        for (uint32_t i = 0; i < CAP; ++i)
+            if (s[i * 4u + 0u] != SENTINEL) ++lastWritten;
+        for (uint32_t i = 0; i < n && i < stackPairs; ++i)
+        {
+            cmSeen.push_back(s[i * 4u + 0u]);
+            emitted.push_back({ s[i * 4u + 1u], s[i * 4u + 2u] });
+            PXG_CHECK_MSG(s[i * 4u + 3u] == 0u,
+                          "pair %u has a non-zero fourth word; the CUDA writes "
+                          "make_uint4(..., 0)", i);
+        }
+        std::sort(emitted.begin(), emitted.end());
+        return n;
+    };
+
+    std::vector<std::pair<uint32_t, uint32_t>> gotTri, gotVert;
+    std::vector<uint32_t> cmTri, cmVert;
+    const uint32_t nTri = runOne("cloth_heightfieldMidphaseGeneratePairsLaunch", 1u, 1u,
+                                 gotTri, cmTri, CAP);
+    const uint32_t nVert = runOne("cloth_midphaseVertexHeightfieldLaunch", 1u, 1u,
+                                  gotVert, cmVert, CAP);
+
+    for (uint32_t x : cmTri) PXG_CHECK_MSG(x == 0u, "triangle pass: cmIdx %u, expected 0", x);
+    for (uint32_t x : cmVert) PXG_CHECK_MSG(x == 0u, "vertex pass: cmIdx %u, expected 0", x);
+
+    PXG_CHECK_MSG(nTri == uint32_t(refTri.size()),
+                  "triangle pass emitted %u pairs, reference says %zu", nTri, refTri.size());
+    PXG_CHECK_MSG(gotTri == refTri, "the triangle pass's pair SET does not match the reference");
+    PXG_CHECK_MSG(nVert == uint32_t(refVert.size()),
+                  "vertex pass emitted %u pairs, reference says %zu", nVert, refVert.size());
+    PXG_CHECK_MSG(gotVert == refVert, "the vertex pass's pair SET does not match the reference");
+
+    auto countFor = [&](const std::vector<std::pair<uint32_t, uint32_t>>& v, uint32_t e) {
+        uint32_t n = 0; for (auto& x : v) if (x.first == e) ++n; return n;
+    };
+
+    // The two entry points must DIFFER, or one body serving both proves nothing.
+    PXG_CHECK_MSG(gotTri != gotVert,
+                  "the triangle and vertex passes emitted the same set; the fixture cannot "
+                  "tell the two element bounds apart and the shared body is untested");
+    PXG_CHECK_MSG(countFor(gotTri, 0u) > countFor(gotVert, 0u),
+                  "triangle 0 spans three quads that no single vertex sphere reaches, so the "
+                  "triangle pass must emit MORE for it than the vertex pass does for vertex 0 "
+                  "(%u against %u)", countFor(gotTri, 0u), countFor(gotVert, 0u));
+    PXG_CHECK_MSG(countFor(gotVert, 0u) == 1u,
+                  "vertex 0 sits over quad (0,0), whose FIRST material slot is a hole, so "
+                  "exactly one of its two triangles survives; got %u", countFor(gotVert, 0u));
+    PXG_CHECK_MSG(countFor(gotVert, 1u) == 0u,
+                  "vertex 1's quad is a hole in BOTH slots, and its material byte carries the "
+                  "TESSELLATION flag.  Getting %u instead of 0 means the flag was not masked "
+                  "off before the eHOLE comparison", countFor(gotVert, 1u));
+    PXG_CHECK_MSG(countFor(gotVert, 2u) == 2u,
+                  "vertex 2's quad is solid in both slots; got %u", countFor(gotVert, 2u));
+    PXG_CHECK_MSG(countFor(gotVert, 3u) == 2u,
+                  "vertex 3's LOCAL BOUND GOES BELOW ZERO in y, and the y range reaches the "
+                  "quad cull through a float->PxU32 conversion that SATURATES.  Two pairs "
+                  "under the correct reading; 0 means the conversion was transcribed with C++ "
+                  "host semantics, where a negative becomes a huge unsigned and con1 rejects "
+                  "everything (P9.27a).  Got %u", countFor(gotVert, 3u));
+    PXG_CHECK_MSG(countFor(gotVert, 4u) == 0u,
+                  "vertex 4 sits far BELOW a quad raised to +400, so con0 culls it; got %u",
+                  countFor(gotVert, 4u));
+    PXG_CHECK_MSG(countFor(gotVert, 5u) == 0u,
+                  "vertex 5 sits far ABOVE a quad at height 0, so con1 culls it; got %u",
+                  countFor(gotVert, 5u));
+
+    // ---- TWO CONTACT MANAGERS, ONE y-BLOCK --------------------------------------------
+    // cmIdx is `workIndex / 64`, and with gridDim.y = numTests the two happen to agree --
+    // block 0 handles cm 0 and block 1 cm 1 -- so a port that read cmIdx from blockIdx.y
+    // passes the duplication run below and fails here.  Measured, as a survivor.
+    std::vector<std::pair<uint32_t, uint32_t>> twoCm;
+    std::vector<uint32_t> cmTwo;
+    const uint32_t nTwo = runOne("cloth_heightfieldMidphaseGeneratePairsLaunch", 2u, 1u,
+                                 twoCm, cmTwo, CAP);
+    {
+        uint32_t a = 0, b = 0;
+        for (uint32_t x : cmTwo) { if (x == 0u) ++a; else if (x == 1u) ++b; }
+        PXG_CHECK_MSG(nTwo == 2u * nTri && a == nTri && b == nTri,
+                      "with numTests = 2 and ONE y-block each contact manager must contribute "
+                      "its own %u pairs: cmIdx comes from workIndex / 64, not from the block "
+                      "index.  Got %u total, %u on cm 0 and %u on cm 1", nTri, nTwo, a, b);
+    }
+
+    // ---- A STACK THAT ACTUALLY BINDS ---------------------------------------------------
+    // "If we run out of stacksize, drop pairs" -- the writes stop at the capacity while the
+    // COUNTER has already been committed, which is how the host learns it needs a bigger
+    // one.  With a 512-entry stack and twenty pairs neither the cap nor the byte-to-entry
+    // division was ever exercised; both mutants lived.
+    {
+        const uint32_t TIGHT = 6u;
+        std::vector<std::pair<uint32_t, uint32_t>> tightSet;
+        std::vector<uint32_t> tightCm;
+        const uint32_t nTight = runOne("cloth_midphaseVertexHeightfieldLaunch", 1u, 1u,
+                                       tightSet, tightCm, TIGHT);
+        PXG_CHECK_MSG(nTight == nVert,
+                      "with a capacity of %u the counter must still reach %u -- the engine "
+                      "reads it back to size next frame's stack, so clamping it there loses "
+                      "the growth signal (got %u)", TIGHT, nVert, nTight);
+        PXG_CHECK_MSG(lastWritten == TIGHT,
+                      "with a capacity of %u exactly %u entries may be written; %u were.  "
+                      "More means the `writeIndex < stackSize` cap is gone, or that "
+                      "stackSizeBytes was divided by something other than sizeof(uint4)",
+                      TIGHT, TIGHT, lastWritten);
+    }
+
+    // ---- THE DUPLICATION, measured ---------------------------------------------------
+    std::vector<std::pair<uint32_t, uint32_t>> dupTri;
+    std::vector<uint32_t> cmDup;
+    const uint32_t nDup = runOne("cloth_heightfieldMidphaseGeneratePairsLaunch", 2u, 2u,
+                                 dupTri, cmDup, CAP);
+    PXG_CHECK_MSG(nDup == 4u * nTri,
+                  "with numTests = 2 the engine launches gridDim.y = 2 and NEITHER kernel "
+                  "reads blockIdx.y, so each y-block repeats the whole work partition: two "
+                  "contact managers times two y-blocks is FOUR copies of every pair.  Expected "
+                  "%u, got %u.  Half that means the duplication was 'fixed' -- which would put "
+                  "this port out of step with the engine it replaces (upstream candidate 37)",
+                  4u * nTri, nDup);
+    uint32_t cm0 = 0, cm1 = 0;
+    for (uint32_t x : cmDup) { if (x == 0u) ++cm0; else if (x == 1u) ++cm1; }
+    PXG_CHECK_MSG(cm0 == 2u * nTri && cm1 == 2u * nTri,
+                  "both contact managers must appear, %u times each: cmIdx comes from "
+                  "workIndex / 64 and a port that read it from the block index would put every "
+                  "pair on cm 0 (got %u and %u)", 2u * nTri, cm0, cm1);
+
+    std::printf("    [ note ] hf %ux%u, %u verts (not a multiple of 2048 -- trap H1), %u tris; "
+                "triangle pass %u pairs, vertex pass %u pairs, sets differ; v3 below zero in y "
+                "gives %u; numTests=2 x gridY=2 gives %u = 4x%u, split %u/%u over the two "
+                "contact managers\n",
+                NB_ROWS, NB_COLS, NB_VERTS, NB_TRIS, nTri, nVert, countFor(gotVert, 3u),
+                nDup, nTri, cm0, cm1);
+
+    for (PxgBufferHandle h : { bBlob.h, bCv.h, bCi.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace

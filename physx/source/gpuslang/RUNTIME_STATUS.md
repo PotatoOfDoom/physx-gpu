@@ -1719,6 +1719,165 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.27 — die Tuch-gegen-Höhenfeld-Mittelphase, ein geteiltes Modul, und zwei Ports, die derselben Umwandlung widersprochen haben
+
+Manifest **364 → 366**, Suite unverändert **821**. Die beiden Mittelphasen der
+Tuch-gegen-Höhenfeld-Kette sind abgebildet; die beiden Kontakterzeuger folgen als
+eigene Tranche.
+
+> **Szenenlauf noch offen.** Das Manifest hat sich geändert, also muss `build-sdk`
+> neu gebaut und der Szenensatz neu gefahren werden. Der Lauf war beim Committen
+> noch unterwegs; die Zahl steht im Nachtrag und wird **nicht** hier behauptet,
+> bevor sie gemessen ist.
+
+### Ein Rumpf, zwei Einstiegspunkte — und diesmal ist das Upstreams eigene Form
+
+P9.20 hat zwei Engine-Namen **einen** Slang-Rumpf gegeben und musste dafür einen
+Zwillingsprüfer bauen, der die gemessene Gleichheit wahr hält. Hier braucht es
+den nicht: die CUDA erklärt **eine** `__device__`-Funktion
+(`clothHeightfieldMidphaseCore`) und ruft sie aus beiden Kerneln. Die beiden
+unterscheiden sich in genau zwei Dingen, und der Shader parametrisiert genau
+diese zwei — die **Elementgrenze** (gefettete Dreiecksbox gegen Kugelbox um einen
+Vertex) und die **Zahl**, gegen die der Elementindex geprüft wird.
+
+### Vor dem Heben wurde gemessen, und die erste Zahl war falsch
+
+P9.17a hat die Regel gesetzt: **erst messen, dann teilen**. Einundzwanzig
+BV32-Läufe lagen bei 0,27 Median, also wurde nur der Formatdekoder gehoben.
+
+Dieselbe Messung über die **zwei** bereits vorhandenen Abschriften von
+`heightfieldComputePairs`/`heightfieldOutputPairs`:
+
+| | Ähnlichkeit |
+|---|---|
+| Zähl-Lauf, `fcMidphase` (Phase 1) gegen `softBodyHfMidphaseBda` (BDA) | **0,90** |
+| Ausgabe-Lauf | **0,83** |
+
+und jeder verbleibende Unterschied ist eine **Schreibweise** derselben Operation.
+Das ist ein anderer Befund als BV32s 0,27 und rechtfertigt, den **Lauf** zu
+teilen und nicht nur den Dekoder.
+
+Der erste Durchgang sagte **0,40**. Drei Fehler in meinem Messskript: umgebrochene
+Zeilen als Unterschied gezählt, eine Umbenennung, die `(, x)` hinterließ, und ein
+Startanker, dessen `.` keine Zeilenumbrüche überquert — wodurch die halbe Messung
+**stumm ausfiel** und als „konnte nicht extrahieren" auftauchte statt als
+kaputtes Werkzeug.
+
+> Eine Zahl aus einem Werkzeug, das niemand gelesen hat, ist keine Messung.
+
+### Und die Messung fand, wovon sie nicht gesucht hat: P9.27a
+
+`heightfieldComputePairs` nimmt seine y-Spanne als `PxU32`, also wandelt jeder
+Aufrufer implizit float→unsigned. **Zwei** Shader dieses Ports taten das, und sie
+widersprachen sich: `fcMidphase` sättigend (mit benanntem PTX-Befehl und
+CPU-Spiegel), `softBodyHfMidphaseBda` als roher Cast, mit einem Kommentar, der
+das Verhalten des **Hosts** beschrieb.
+
+CUDA übersetzt das zu `cvt.rzi.u32.f32`, das **klemmt**: negativ → 0. Der
+Unterschied entscheidet, ob ein Quad behalten oder verworfen wird — für alles,
+was auf Gelände liegt. Wer den Code nach jenem Kommentar „repariert" hätte, hätte
+genau die Abweichung eingebaut, die er verhindern sollte.
+
+**Gemessen, warum es niemand fand:** jedes Tetraeder der Vorrichtung saß bei
+lMin.y = +0,8; der negative Zweig war arithmetisch unerreichbar. Und **was
+llvmpipe wirklich tut**, mit dem neuen Fall gegen den unreparierten Shader
+gemessen: es liefert 0 — der Cast stimmte **zufällig**. `OpConvertFToU` ist für
+so einen Operanden in SPIR-V **undefiniert**; der Shader hing an einem Zufall.
+
+Eine Umwandlung, die an **einer** Stelle lebt, kann sich nicht mit sich selbst
+uneins sein. Das ist das stärkste Argument für das Modul.
+
+### Was das Modul trägt, und was ausdrücklich nicht
+
+`pxgSlangHeightfield.slang` trägt: das Probenformat, die
+Welt-nach-Höhenfeldeinheiten-Transformation, das Zulassungsgatter (mit Upstreams
+eigener **falscher Klammerung**, unverändert), die Zeilen-/Spaltenklemmen, die
+sättigende Umwandlung und die Quad-Aufzählung bis einschließlich des
+überlebenden Dreiecksindex.
+
+Nicht getragen wird die **Weltgrenze des Elements** und was der Aufrufer mit
+einem lebenden Quad tut. `psHfMidphaseBda` zieht diese Linie: es teilt die
+Aufzählung exakt und holt dann das Dreieck, um einen Partikeltest zu fahren. Es
+zieht in P9.27 **nicht** um — eine Bereichsentscheidung, benannt statt
+verschwiegen.
+
+`softBodyHfMidphaseBda` zieht um, und das ist die **Validierung** des Moduls:
+seine bestehende Vorrichtung liefert danach dieselbe Paarmenge, Eintrag für
+Eintrag.
+
+### Drei Fallen, zwei davon Fehler der Engine
+
+* **H1** — die **Vertex**-Mittelphase liest `positions[vertIndex]` **ungeschützt**
+  (`:376`), wo das Dreiecks-Geschwister mit `if (triangleIdx < nbTriangles)`
+  schützt; die Prüfung im geteilten Kern kommt **nach** dem Laden. Auf dieser
+  Plattform ist das die Fehlerklasse aus P9.22. Der Port **klemmt den Index**;
+  der Wert wird ohnehin verworfen, die Ausgabe ändert sich nicht, der
+  Speicherfehler ist weg. Upstream-Kandidat 36.
+* **H2** — beide Kernel werden mit `gridDim.y = numTests` gestartet und **lesen
+  `blockIdx.y` nie** (über die ganze Datei verifiziert: nur `blockIdx.x` kommt
+  vor). Jeder y-Block wiederholt die **ganze** Arbeitsaufteilung, also wird jedes
+  Paar `numTests`-mal ausgegeben. Der Softbody-Zwilling mit demselben
+  64-Warp-Schema wird mit `gridDim.y = 1` gestartet — das ist der Beleg, dass es
+  ein Fehler ist. **Fehlertreu portiert**, weil der Verbraucher die verdoppelten
+  Paare liest; die Vorrichtung fährt `numTests = 2` und **misst** die
+  Verdopplung. Upstream-Kandidat 37.
+* **H3** — die Arbeitsaufteilung ist nicht die übliche: **64 Warps je
+  Kontaktmanager**, und **jede Bahn** besitzt ein anderes Element.
+
+### Das Fegen, und ein Prüfer mit einem blinden Fleck
+
+| Durchgang | Ergebnis |
+|---|---|
+| 1 | 14 von 29 getötet, **15 überlebt** |
+| 2 | 26 von 29, **3 überlebt** |
+| 3 | **27 von 29**, 2 überlebt |
+
+Die fünfzehn Überlebenden waren keine fünfzehn Zufälle:
+
+* **quadratisches Feld** — 4×4 kann `nbRows` nicht von `nbCols` unterscheiden;
+  jetzt **4×5**;
+* **symmetrische Kontaktabstände** — 0,05 + 0,05 überlebt jede Verwechslung der
+  beiden Quellen; jetzt **0,02 und 0,08**, und zwei Vertices, deren Radius die
+  Zellspanne von **beiden Seiten** festnagelt;
+* **jedes Element mitten in einer Zelle** — dann ist das Fetten unsichtbar; jetzt
+  ein entartetes Dreieck **exakt auf Spalte 1,0**, dessen ungefettete Spanne null
+  ist und vom Flächengatter verworfen wird;
+* **das dritte Dreiecksende nie extrem** — jetzt eines für das Zeilenmaximum und
+  eines für das Spaltenminimum;
+* **weniger als 2048 Vertices** — dann ist die Elementschrittweite unbeobachtbar
+  und die halbe Warp-Aufteilung läuft leer; jetzt **2100**, mit lebenden Vertices
+  an den Indizes 40, 100 und **2050**;
+* **`cmIdx` und `blockIdx.y` stimmten zufällig überein** — jetzt ein Lauf mit
+  `numTests = 2` und **einem** y-Block, der die beiden trennt;
+* **ein Stapel, der nie klemmt** — jetzt ein Lauf mit Kapazität 6.
+
+Die zwei Überlebenden sind nachgewiesene Äquivalente. Und der eine davon hat
+etwas Größeres gefunden:
+
+> Ich hatte in den Shader geschrieben, `check_speculated_loads.py` finde die
+> ungeklemmte Fassung. **Gemessen: findet es nicht.** Es stuft die Stelle als
+> NIEDRIG ein mit der Begründung „der Index stammt von einer Thread-Kennung:
+> Überschuss < eine Arbeitsgruppe". Das gilt für ein blankes `globalThreadIdx` —
+> hier ist der Index `wrappedThreadIndex + 2048 * j`, der Überschuss also eine
+> **ganze Schrittweite**, bis zu **32 KiB**. Das ist dieselbe Größenordnung wie
+> der Sprung, den P9.22 als **Absturz** gemessen hat.
+
+Der Kommentar im Shader sagt das jetzt, statt eine Deckung zu behaupten, die es
+nicht gibt. Den blinden Fleck zu schließen ist eine eigene Aufgabe — mit der
+Regel aus P9.23: Einstufung ändern, Selbsttest neu, ganzer Korpus neu, und
+**jede** neue Meldung lesen, statt die Zahl herunterzudrehen.
+
+### Verifikation
+
+* Fegen **27 von 29**, zwangsfrisch, über drei Durchgänge; beide Überlebenden
+  nachgewiesen äquivalent;
+* beide Einstiegspunkte gegen **eigene** CPU-Referenzen, und die Vorrichtung
+  verlangt ausdrücklich, dass ihre Paarmengen sich **unterscheiden** — sonst
+  bewiese ein geteilter Rumpf nichts;
+* `softBodyHfMidphaseBda` nach dem Umzug aufs Modul **eintragsgleich**;
+* Suite **821/821** in **beiden** Speichermodi; der Szenensatz nach Neubau von
+  `build-sdk` war beim Committen noch unterwegs — Zahl im Nachtrag.
+
 ## P9.26 — die VERTEX-Hälfte der Tuch-gegen-Netz-Kette, und ein Kernel, den die Engine selbst abgeschaltet hat
 
 P8.17 hat die **Dreiecks**-Hälfte von Tuch gegen gekochtes Dreiecksnetz abgebildet
