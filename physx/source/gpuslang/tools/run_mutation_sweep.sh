@@ -91,6 +91,39 @@ run_suite() {
         timeout -k 10 "$MUTATION_SWEEP_TIMEOUT" ./gpuslang-tests "$SUITE" 2>&1 )
 }
 
+# A CRASH THAT DOES NOT REPRODUCE IS NOT EVIDENCE.  Added in P9.29.
+#
+# This platform faults on its own: llvmpipe sometimes places a JIT code object
+# with its preceding page unmapped and the code reads into it (P9.28a has the
+# core dumps -- fault at object_base - 0x1000, rip at object_base + 0x767, twice,
+# to the byte).  The rate depends on how many shaders a suite dispatches; on
+# femClothSim it is around one run in ten.
+#
+# A sweep that reads one crash as KILLED-FAULT therefore credits itself with
+# roughly three kills per thirty mutants that it did not earn -- and those false
+# kills land on whichever mutants happen to run when the allocator misbehaves,
+# so they are invisible in the summary and unrepeatable between runs.  That is
+# worse than a missed kill: it reports discrimination the fixtures do not have.
+#
+# So a crash is retried.  If ANY attempt completes, that attempt is the result --
+# a mutant that really breaks the shader breaks it every time, so a run that
+# finishes is proof the crash was the platform.  Only an all-attempts-crash is
+# reported as KILLED-FAULT, and the count is printed so the tolerance is visible
+# rather than silent.
+: "${MUTATION_SWEEP_FAULT_RETRIES:=3}"
+
+# Sets SUITE_OUT / SUITE_RC / SUITE_TRIES.  A timeout is NOT retried: a hang is a
+# behaviour change, and re-running it only costs another MUTATION_SWEEP_TIMEOUT.
+run_suite_tolerant() {
+    SUITE_TRIES=1
+    SUITE_OUT=$(run_suite); SUITE_RC=$?
+    while [ $SUITE_RC -ge 128 ] && [ $SUITE_RC -ne $TIMEOUT_RC ] \
+          && [ $SUITE_TRIES -le $MUTATION_SWEEP_FAULT_RETRIES ]; do
+        SUITE_TRIES=$((SUITE_TRIES+1))
+        SUITE_OUT=$(run_suite); SUITE_RC=$?
+    done
+}
+
 # A run that executed NOTHING.  The binary prints "0 test(s) ran, 0 failed" for a
 # suite filter that matches no test -- which satisfies both a "0 failed" grep and a
 # "test(s) ran" grep.  P9.13f hit exactly that: the suite was passed as
@@ -100,7 +133,13 @@ run_suite() {
 ran_nothing() { echo "$1" | grep -q "^0 test(s) ran"; }
 
 baseline_ok() {
-    out=$(run_suite); brc=$?
+    run_suite_tolerant; out="$SUITE_OUT"; brc=$SUITE_RC
+    if [ $brc -ge 128 ] && [ $brc -ne $TIMEOUT_RC ]; then
+        echo "!! the CLEAN suite crashed $SUITE_TRIES time(s) in a row (rc=$brc)." >&2
+        echo "   That is past what the platform fault explains -- fix it before" >&2
+        echo "   measuring mutants against it." >&2
+        return 1
+    fi
     if [ $brc -eq $TIMEOUT_RC ]; then
         echo "!! the CLEAN suite exceeded MUTATION_SWEEP_TIMEOUT=${MUTATION_SWEEP_TIMEOUT}s;" >&2
         echo "   raise it or every mutant will be reported as a hang" >&2
@@ -122,7 +161,7 @@ if ! baseline_ok; then
 fi
 echo "baseline green; sweeping $SRCSTEM (via $STEM.spv) against suite '$SUITE'"
 
-killed=0; faulted=0; hung=0; survived=0; nocompile=0; anchorfail=0
+killed=0; faulted=0; hung=0; survived=0; nocompile=0; anchorfail=0; retried=0
 
 while IFS='	' read -r name old new; do
     [ -z "${name:-}" ] && continue
@@ -147,11 +186,13 @@ PY
         echo "NOCOMPILE     $name"; nocompile=$((nocompile+1)); continue
     fi
 
-    out=$(run_suite); rc=$?
+    run_suite_tolerant; out="$SUITE_OUT"; rc=$SUITE_RC
+    [ "$SUITE_TRIES" -gt 1 ] && retried=$((retried+1))
     if [ $rc -eq $TIMEOUT_RC ]; then
         echo "KILLED-HANG   $name   (exceeded ${MUTATION_SWEEP_TIMEOUT}s)"; hung=$((hung+1))
     elif [ $rc -ge 128 ] || ! echo "$out" | grep -q "test(s) ran"; then
-        echo "KILLED-FAULT  $name   (crashed: rc=$rc)"; faulted=$((faulted+1))
+        echo "KILLED-FAULT  $name   (crashed $SUITE_TRIES/$((MUTATION_SWEEP_FAULT_RETRIES+1)) times: rc=$rc)"
+        faulted=$((faulted+1))
     elif ran_nothing "$out"; then
         # Not a survivor: the suite stopped matching, so nothing was measured.
         echo "!! '$name' left the suite matching NO test -- aborting rather than" >&2
@@ -167,6 +208,7 @@ done < "$MUTANTS"
 restore
 total=$((killed+faulted+hung+survived+nocompile+anchorfail))
 echo "=== sweep: $total mutants -- $killed killed, $faulted killed-by-fault, $hung killed-by-hang, $survived SURVIVED, $nocompile nocompile, $anchorfail anchor-fail ==="
+[ "$retried" -gt 0 ] && echo "    ($retried mutant(s) hit a platform fault and were re-run; see the note at run_suite_tolerant)"
 
 if ! baseline_ok; then
     echo "!! BASELINE IS RED after the restore -- the tree is NOT clean, do not trust the run"
