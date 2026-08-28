@@ -47,6 +47,7 @@
 // descriptor header decorates its inline members with; must precede PxgFEMCloth.h.
 #include "host_defines.h"
 #include "PxgFEMCloth.h"                     // real engine per-cloth descriptor
+#include "PxgParticleSystem.h"               // real engine per-particle-system descriptor (P9.30)
 #include "PxsDeformableSurfaceMaterialCore.h" // real engine surface material data
 #include "PxNodeIndex.h"                     // PxNodeIndex (rigid/world anchor node index)
 #include "PxgSimulationCoreDesc.h"           // PxgFEMRigidAttachment (P7.1 tranche 3a) / PxgRigidFilterPair (4a)
@@ -4207,7 +4208,14 @@ static V3 closestPtPointTriangle(V3 p, V3 a, V3 b, V3 c, float& s, float& t)
     const float denom = 1.0f / (va + vb + vc);
     const float v = vb * denom, wv = vc * denom;
     s = v; t = wv;
-    return add(a, add(mul(ab, v), mul(ac, wv)));
+    // LEFT TO RIGHT, like the shader's `a + ab * v + ac * w`.  This mirror used to
+    // group the two scaled edges first, which differs in the last bit of the
+    // returned POINT.  No check here reads that point bit-exactly -- all three
+    // callers take only s/t or a distance predicate -- so nothing was wrong, and
+    // that is exactly why it could sit here: a mirror that is only ever half-read
+    // drifts from the thing it mirrors without anything going red.  Found while
+    // writing P9.30's mirror, after P9.29 lost a measurement to the same slip.
+    return add(add(a, mul(ab, v)), mul(ac, wv));
 }
 
 // closestPtLineLine (deformableCollision.cuh:244) — matches npEdgeEdge.slang:57.  The
@@ -10924,6 +10932,586 @@ PXG_TEST(femClothSimSphereTriContactGen)
     destroyWriter(dev, w);
     for (PxgBufferHandle h : { bCv.h, bCi.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h,
                                bRd.h, bRemap.h, bFilters.h, bStack.h, bNum.h, bNeeded.h })
+        dev->destroyBuffer(h);
+}
+
+
+// ===========================================================================
+// P9.30 -- the cloth-vs-PARTICLE chain, both halves.
+//
+// The midphase is checked as a SET against a host mirror of the traversal's
+// PREDICATE rather than of the traversal: with a single-leaf tree the walk
+// visits every triangle, so what the kernel decides is exactly
+// "triangle bound intersects the particle's cube", and a mirror of the walk
+// itself would be the duplication the sweep exists to avoid.  The contact gen
+// is checked BIT-EXACTLY against a full transcription, because there the
+// arithmetic is the thing.
+// ===========================================================================
+namespace p930ps
+{
+using p817cg::V3;
+using p817cg::sub;
+using p817cg::add;
+using p817cg::dot;
+using p817cg::scl;
+
+// cloth_psMidphaseGeneratePairsLaunch: twelve arguments -> 88 bytes.
+struct ClothPsMidphasePush
+{
+    uint32_t numWorkItems; float toleranceLength;
+    uint64_t cmInputs, gpuShapes, transformCache, bounds, contactDistance, femClothes,
+             particleSystems;
+    uint32_t stackSizeBytes, pad68;
+    uint64_t stackPtr, midphasePairsNum;
+};
+static_assert(sizeof(ClothPsMidphasePush) == 88, "cloth ps midphase blob must be 88 bytes");
+static_assert(offsetof(ClothPsMidphasePush, gpuShapes) == 16, "gpuShapes @16 -- THIRD, not after bounds");
+static_assert(offsetof(ClothPsMidphasePush, particleSystems) == 56, "particleSystems @56");
+static_assert(offsetof(ClothPsMidphasePush, stackSizeBytes) == 64, "stackSizeBytes @64");
+static_assert(offsetof(ClothPsMidphasePush, stackPtr) == 72, "stackPtr @72");
+static_assert(offsetof(ClothPsMidphasePush, midphasePairsNum) == 80, "midphasePairsNum @80");
+
+// cloth_psContactGenLaunch: thirteen arguments, writer by value -> 176 bytes.
+// The cloth-vs-heightfield contact gen's blob is ALSO 176 with its writer ALSO
+// at 96 and a different middle, so every offset here is asserted.
+struct ClothPsCgPush
+{
+    float toleranceLength; uint32_t pad4;
+    uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes,
+             particleSystems, femClothes;
+    uint32_t stackSizeBytes, pad68;
+    uint64_t stackPtr, midphasePairsNum, stackSizeNeeded;
+    uint64_t wPoint, wNormalPen, wBary, wInfo, wCount, wByX, wTempByX, wIdxByX, wSorted32;
+    uint32_t wMaxContacts, pad172;
+};
+static_assert(sizeof(ClothPsCgPush) == 176, "cloth ps CG blob must be 176 bytes");
+static_assert(offsetof(ClothPsCgPush, particleSystems) == 48, "particleSystems @48");
+static_assert(offsetof(ClothPsCgPush, femClothes) == 56, "femClothes @56 -- AFTER particleSystems");
+static_assert(offsetof(ClothPsCgPush, stackSizeBytes) == 64, "stackSizeBytes @64");
+static_assert(offsetof(ClothPsCgPush, stackPtr) == 72, "stackPtr @72");
+static_assert(offsetof(ClothPsCgPush, midphasePairsNum) == 80, "midphasePairsNum @80");
+static_assert(offsetof(ClothPsCgPush, stackSizeNeeded) == 88, "stackSizeNeeded @88");
+static_assert(offsetof(ClothPsCgPush, wPoint) == 96, "the writer starts @96 -- paramAlign(80) is 16");
+static_assert(offsetof(ClothPsCgPush, wMaxContacts) == 168, "maxNumContacts @168");
+
+static const uint32_t GEOM_PARTICLESYSTEM_H = 6u;   // PxGeometryType::ePARTICLESYSTEM
+
+// ---- the contact gen's host mirror ----------------------------------------
+// Gu::closestPtPointTriangle2 (GuDistancePointTriangle.h:44), the ab/ac form.
+static V3 cpTri2(V3 p, V3 a, V3 b, V3 c, V3 ab, V3 ac)
+{
+    const V3 ap = sub(p, a);
+    const float d1 = dot(ab, ap), d2 = dot(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) return a;
+    const V3 bp = sub(p, b);
+    const float d3 = dot(ab, bp), d4 = dot(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3) return b;
+    const float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) { const float v = d1 / (d1 - d3); return add(a, scl(ab, v)); }
+    const V3 cp = sub(p, c);
+    const float d5 = dot(ab, cp), d6 = dot(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6) return c;
+    const float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) { const float w = d2 / (d2 - d6); return add(a, scl(ac, w)); }
+    const float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f)
+    { const float w = (d4 - d3) / ((d4 - d3) + (d5 - d6)); return add(b, scl(sub(c, b), w)); }
+    const float denom = 1.0f / (va + vb + vc);
+    const float v = vb * denom, w = vc * denom;
+    return add(add(a, scl(ab, v)), scl(ac, w));   // left to right, like the shader
+}
+
+// computeBarycentric (femClothPrimitives.cu:114); the bool is not mirrored (C7).
+static F4 computeBary(V3 a, V3 b, V3 c, V3 p)
+{
+    const V3 v0 = sub(b, a), v1 = sub(c, a), v2 = sub(p, a);
+    const float d00 = dot(v0, v0), d01 = dot(v0, v1), d11 = dot(v1, v1);
+    const float d20 = dot(v2, v0), d21 = dot(v2, v1);
+    const float denom = d00 * d11 - d01 * d01;
+    const float v = (d11 * d20 - d01 * d21) / denom;
+    const float w = (d00 * d21 - d01 * d20) / denom;
+    return F4{ 1.0f - v - w, v, w, 0.0f };
+}
+} // namespace p930ps
+
+PXG_TEST(femClothSimPsMidphase)
+{
+    using namespace p816dc;
+    using namespace p930ps;
+    using p817cg::V3;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t CLOTH_ID = 1u, PS_ID = 2u;
+    const float CD_PARTICLE = 0.30f, CD_CLOTH = 0.10f;   // the SUM is what the query uses
+    const float R = CD_PARTICLE + CD_CLOTH;
+
+    // ---- a cloth of 12 triangles laid along x, each a small fixed-size patch -------
+    const uint32_t NB_TRIS = 12u;
+    std::vector<F4> cv; std::vector<TriIdx4> ci;
+    for (uint32_t t = 0; t < NB_TRIS; ++t)
+    {
+        const float x = float(t) * 1.0f;
+        const uint32_t base = uint32_t(cv.size());
+        cv.push_back(F4{ x - 0.2f, 0.0f, -0.2f, 1.0f });
+        cv.push_back(F4{ x + 0.2f, 0.0f, -0.2f, 1.0f });
+        cv.push_back(F4{ x + 0.0f, 0.0f,  0.3f, 1.0f });
+        ci.push_back(TriIdx4{ base, base + 1u, base + 2u, 0u });
+    }
+    DevBuf bCv = makeDev(dev, cv);
+    if (!bCv.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bCv.h); return; }
+    DevBuf bCi = makeDev(dev, ci);
+
+    // A single-leaf tree over all 12 triangles: the walk then reaches every one, so
+    // what the kernel decides IS the per-triangle predicate the mirror computes.
+    std::vector<uint32_t> tree = makeBv32TreeWords(NB_TRIS, -1000.0f, 1000.0f);
+    DevBuf bTree = makeDev(dev, tree);
+
+    PxgFEMCloth cloth = makeZeroDesc();
+    cloth.mTriMeshData = reinterpret_cast<decltype(cloth.mTriMeshData)>(size_t(bTree.addr));
+    cloth.mPosition_InvMass = reinterpret_cast<decltype(cloth.mPosition_InvMass)>(size_t(bCv.addr));
+    cloth.mTriangleVertexIndices = reinterpret_cast<decltype(cloth.mTriangleVertexIndices)>(size_t(bCi.addr));
+    cloth.mNbTriangles = NB_TRIS;
+    cloth.mNbVerts = uint32_t(cv.size());
+    std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
+    descArr[CLOTH_ID] = cloth;
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- particles: some straddling triangles, some clear of every one -------------
+    std::vector<F4> parts = {
+        { 0.00f, 0.20f, 0.00f, 1.0f },   // over triangle 0, inside R
+        { 1.00f, 0.80f, 0.00f, 1.0f },   // over triangle 1, OUTSIDE R in y
+        { 2.45f, 0.10f, 0.00f, 1.0f },   // between triangles 2 and 3: reaches BOTH
+        { 5.00f, 0.00f, 0.00f, 1.0f },   // exactly on triangle 5's plane
+        { 50.0f, 50.0f, 50.0f, 1.0f },   // nowhere near anything
+        { 11.0f, -0.35f, 0.0f, 1.0f },   // under the LAST triangle, inside R
+    };
+    const uint32_t NB_PARTICLES = uint32_t(parts.size());
+    DevBuf bParts = makeDev(dev, parts);
+
+    std::vector<PxgParticleSystem> psArr(PS_ID + 1u);
+    std::memset(psArr.data(), 0, psArr.size() * sizeof(PxgParticleSystem));
+    psArr[PS_ID].mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bParts.addr));
+    psArr[PS_ID].mCommonData.mNumParticles = NB_PARTICLES;
+    DevBuf bPs = makeDev(dev, psArr);
+
+    // ---- shapes.  TWO managers, and the particle system sits in the OTHER slot in
+    // the second one, so M6's routing by TYPE is separable from slot order.
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_PARTICLESYSTEM_H; shapes[0].particleOrSoftbodyId = PS_ID;
+    shapes[0].sx = shapes[0].sy = shapes[0].sz = 1.0f; shapes[0].srw = 1.0f;
+    shapes[1] = makeClothShape(CLOTH_ID);
+    DevBuf bShapes = makeDev(dev, shapes);
+
+    // cache ref 0 = particle system (CD 0.30), 1 = cloth (CD 0.10).
+    std::vector<CmInputHost> cms = { { 0u, 1u, 0u, 1u }, { 1u, 0u, 1u, 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+    std::vector<float> cd = { CD_PARTICLE, CD_CLOTH };
+    DevBuf bCd = makeDev(dev, cd);
+    std::vector<float> xf(2 * 8, 0.0f); xf[3] = 1.0f; xf[8 + 3] = 1.0f;
+    DevBuf bXf = makeDev(dev, xf);
+    std::vector<float> dummyBounds(2 * 6, 0.0f);
+    DevBuf bBounds = makeDev(dev, dummyBounds);
+
+    // The stack deliberately holds FEWER pairs than the query will find, so the
+    // "drop the pair, keep counting" behaviour is measured rather than assumed.
+    const uint32_t NB_ALLOC = 128u;
+    const uint32_t STACK_PAIRS = 6u;
+    std::vector<uint32_t> stack(NB_ALLOC * 4u, 0xEEEEEEEEu);
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> zero = { 0u };
+    DevBuf bNum = makeDev(dev, zero);
+
+    ClothPsMidphasePush p = {};
+    p.numWorkItems = uint32_t(cms.size());
+    p.toleranceLength = 1.0f;
+    p.cmInputs = bCms.addr; p.gpuShapes = bShapes.addr; p.transformCache = bXf.addr;
+    p.bounds = bBounds.addr; p.contactDistance = bCd.addr;
+    p.femClothes = bDesc.addr; p.particleSystems = bPs.addr;
+    p.stackSizeBytes = STACK_PAIRS * 16u;
+    p.stackPtr = bStack.addr; p.midphasePairsNum = bNum.addr;
+
+    Kernel k("femClothPsMidphaseBda.spv", "cloth_psMidphaseGeneratePairsLaunch",
+             {}, sizeof(ClothPsMidphasePush));
+    k.dispatch(1024u, {}, p, uint32_t(cms.size()), 1u);   // grid (1024, numTests, 1)
+    dev->flush();
+
+    // ---- the expected set ----------------------------------------------------------
+    struct Pair { uint32_t cm, particle, tri; };
+    std::vector<Pair> expected;
+    for (uint32_t cm = 0; cm < uint32_t(cms.size()); ++cm)
+        for (uint32_t pi = 0; pi < NB_PARTICLES; ++pi)
+        {
+            const V3 c{ parts[pi].x, parts[pi].y, parts[pi].z };
+            for (uint32_t t = 0; t < NB_TRIS; ++t)
+            {
+                const F4& a = cv[t * 3 + 0]; const F4& b = cv[t * 3 + 1]; const F4& d = cv[t * 3 + 2];
+                const V3 tMin{ std::min(std::min(a.x, b.x), d.x), std::min(std::min(a.y, b.y), d.y),
+                               std::min(std::min(a.z, b.z), d.z) };
+                const V3 tMax{ std::max(std::max(a.x, b.x), d.x), std::max(std::max(a.y, b.y), d.y),
+                               std::max(std::max(a.z, b.z), d.z) };
+                const bool hit = !(tMin.x > c.x + R || c.x - R > tMax.x ||
+                                   tMin.y > c.y + R || c.y - R > tMax.y ||
+                                   tMin.z > c.z + R || c.z - R > tMax.z);
+                if (hit) expected.push_back(Pair{ cm, pi, t });
+            }
+        }
+
+    const uint32_t found = downloadBuffer<uint32_t>(dev, bNum.h, 1)[0];
+    PXG_CHECK_MSG(expected.size() > STACK_PAIRS,
+                  "the rig found %zu pairs against a %u-pair stack; it must OVERFLOW or the "
+                  "drop-but-keep-counting behaviour is not measured", expected.size(), STACK_PAIRS);
+    PXG_CHECK_MSG(found == uint32_t(expected.size()),
+                  "the midphase COUNTER reads %u, the mirror says %zu.  The counter takes every "
+                  "hit even when the stack cannot hold it", found, expected.size());
+
+    // Only the first STACK_PAIRS slots may have been written, and each must be a
+    // member of the expected set with the fields in the right places (M1).
+    const auto st = downloadBuffer<uint32_t>(dev, bStack.h, NB_ALLOC * 4u);
+    uint32_t written = 0u, bad = 0u;
+    for (uint32_t i = 0; i < NB_ALLOC; ++i)
+    {
+        if (st[i * 4] == 0xEEEEEEEEu) continue;
+        ++written;
+        if (i >= STACK_PAIRS) { ++bad; continue; }
+        const uint32_t cm = st[i * 4 + 0], pi = st[i * 4 + 1], tri = st[i * 4 + 2];
+        bool member = false;
+        for (const Pair& e : expected)
+            if (e.cm == cm && e.particle == pi && e.tri == tri) { member = true; break; }
+        if (!member)
+        {
+            ++bad;
+            std::printf("  slot %u holds (cm %u, particle %u, tri %u), which is not an expected "
+                        "pair -- M1 puts the PARTICLE in .y and the triangle in .z\n", i, cm, pi, tri);
+        }
+    }
+    PXG_CHECK_MSG(bad == 0u, "%u written pairs are wrong or past the stack bound", bad);
+    PXG_CHECK_MSG(written == STACK_PAIRS,
+                  "%u slots written, expected exactly the %u the stack holds", written, STACK_PAIRS);
+
+    std::printf("    [ note ] %zu pairs found over %u particles x %u triangles x %zu managers; "
+                "%u written into a %u-pair stack, counter %u\n",
+                expected.size(), NB_PARTICLES, NB_TRIS, cms.size(), written, STACK_PAIRS, found);
+
+    for (PxgBufferHandle h : { bCv.h, bCi.h, bTree.h, bDesc.h, bParts.h, bPs.h, bShapes.h,
+                               bCms.h, bCd.h, bXf.h, bBounds.h, bStack.h, bNum.h })
+        dev->destroyBuffer(h);
+}
+
+
+PXG_TEST(femClothSimPsContactGen)
+{
+    using namespace p816dc;
+    using namespace p930ps;
+    using p817cg::V3;
+    using p817cg::sub; using p817cg::add; using p817cg::dot; using p817cg::scl;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t CLOTH_ID = 1u, PS_ID = 2u;
+    // DIFFERENT contact distances per cache ref, so the SUM (C5) is separable from
+    // either one, and a rest distance that is neither (C4).
+    const float CD_PARTICLE = 0.30f, CD_CLOTH = 0.10f;
+    const float REST_0 = 0.07f, REST_1 = 0.19f;      // per contact manager (C4)
+
+    // ---- one cloth triangle per pair, tilted so no axis is special ----------------
+    const uint32_t NB_TRIS = 8u;
+    std::vector<F4> cv; std::vector<TriIdx4> ci;
+    for (uint32_t t = 0; t < NB_TRIS; ++t)
+    {
+        const float x = float(t) * 2.0f;
+        const uint32_t base = uint32_t(cv.size());
+        cv.push_back(F4{ x - 0.5f, 0.05f * float(t), -0.4f, 1.0f });
+        cv.push_back(F4{ x + 0.6f, -0.03f * float(t), -0.2f, 1.0f });
+        cv.push_back(F4{ x + 0.1f, 0.02f * float(t),  0.5f, 1.0f });
+        ci.push_back(TriIdx4{ base, base + 1u, base + 2u, 0u });
+    }
+    DevBuf bCv = makeDev(dev, cv);
+    if (!bCv.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bCv.h); return; }
+    DevBuf bCi = makeDev(dev, ci);
+
+    PxgFEMCloth cloth = makeZeroDesc();
+    cloth.mPosition_InvMass = reinterpret_cast<decltype(cloth.mPosition_InvMass)>(size_t(bCv.addr));
+    cloth.mTriangleVertexIndices = reinterpret_cast<decltype(cloth.mTriangleVertexIndices)>(size_t(bCi.addr));
+    cloth.mNbTriangles = NB_TRIS; cloth.mNbVerts = uint32_t(cv.size());
+    std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
+    descArr[CLOTH_ID] = cloth;
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- particles: chosen to reach several exits of closestPtPointTriangle2 ------
+    // face interior, each of the three vertex regions, and two edge regions -- the
+    // returned point differs structurally between them, and a transcription slip in
+    // one branch is invisible from the others.
+    std::vector<F4> parts;
+    auto triCentroid = [&](uint32_t t) {
+        const F4& a = cv[t * 3 + 0]; const F4& b = cv[t * 3 + 1]; const F4& c = cv[t * 3 + 2];
+        return V3{ (a.x + b.x + c.x) / 3.0f, (a.y + b.y + c.y) / 3.0f, (a.z + b.z + c.z) / 3.0f };
+    };
+    auto vtx = [&](uint32_t t, uint32_t k) {
+        const F4& v = cv[t * 3 + k]; return V3{ v.x, v.y, v.z };
+    };
+    parts.push_back(F4{ triCentroid(0).x, triCentroid(0).y + 0.20f, triCentroid(0).z, 1.0f }); // face
+    parts.push_back(F4{ vtx(1, 0).x - 0.15f, vtx(1, 0).y + 0.10f, vtx(1, 0).z - 0.15f, 1.0f }); // vertex a
+    parts.push_back(F4{ vtx(2, 1).x + 0.18f, vtx(2, 1).y + 0.08f, vtx(2, 1).z - 0.12f, 1.0f }); // vertex b
+    parts.push_back(F4{ vtx(3, 2).x + 0.05f, vtx(3, 2).y + 0.09f, vtx(3, 2).z + 0.20f, 1.0f }); // vertex c
+    {   // edge ab
+        const V3 a = vtx(4, 0), b = vtx(4, 1);
+        const V3 mid{ (a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f };
+        parts.push_back(F4{ mid.x, mid.y + 0.05f, mid.z - 0.22f, 1.0f });
+    }
+    {   // edge ac
+        const V3 a = vtx(5, 0), c = vtx(5, 2);
+        const V3 mid{ (a.x + c.x) * 0.5f, (a.y + c.y) * 0.5f, (a.z + c.z) * 0.5f };
+        parts.push_back(F4{ mid.x - 0.20f, mid.y + 0.05f, mid.z, 1.0f });
+    }
+    parts.push_back(F4{ triCentroid(6).x + 9.0f, 9.0f, 9.0f, 1.0f });   // far: no contact (C5)
+    const uint32_t NB_PARTICLES = uint32_t(parts.size());
+    DevBuf bParts = makeDev(dev, parts);
+
+    std::vector<PxgParticleSystem> psArr(PS_ID + 1u);
+    std::memset(psArr.data(), 0, psArr.size() * sizeof(PxgParticleSystem));
+    psArr[PS_ID].mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bParts.addr));
+    psArr[PS_ID].mCommonData.mNumParticles = NB_PARTICLES;
+    DevBuf bPs = makeDev(dev, psArr);
+
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_PARTICLESYSTEM_H; shapes[0].particleOrSoftbodyId = PS_ID;
+    shapes[0].sx = shapes[0].sy = shapes[0].sz = 1.0f; shapes[0].srw = 1.0f;
+    shapes[1] = makeClothShape(CLOTH_ID);
+    DevBuf bShapes = makeDev(dev, shapes);
+    // Manager 1 puts the particle system in the OTHER slot: routing is by TYPE.
+    std::vector<CmInputHost> cms = { { 0u, 1u, 0u, 1u }, { 1u, 0u, 1u, 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+    std::vector<float> cd = { CD_PARTICLE, CD_CLOTH };
+    std::vector<float> rd = { REST_0, REST_1 };
+    DevBuf bCd = makeDev(dev, cd), bRd = makeDev(dev, rd);
+    std::vector<float> xf(2 * 8, 0.0f); xf[3] = 1.0f; xf[8 + 3] = 1.0f;
+    DevBuf bXf = makeDev(dev, xf);
+
+    // ---- the pair stack.  The midphase CLAIMS more than the stack holds (C8). -----
+    const uint32_t NB_STACK = NB_PARTICLES;
+    const uint32_t NB_FOUND = NB_PARTICLES + 13u;
+    std::vector<uint32_t> stack(NB_FOUND * 4u, 0u);
+    for (uint32_t i = 0; i < NB_FOUND; ++i)
+    {
+        stack[i * 4 + 0] = (i & 1u);                               // alternate managers
+        stack[i * 4 + 1] = (i < NB_PARTICLES) ? i : 0u;            // C1: particle in .y
+        stack[i * 4 + 2] = (i < NB_PARTICLES) ? i : 0u;            //     triangle in .z
+    }
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> nFound = { NB_FOUND };
+    DevBuf bNum = makeDev(dev, nFound);
+    std::vector<uint32_t> zero = { 0u };
+    DevBuf bNeeded = makeDev(dev, zero);
+
+    const uint32_t MAXC = 32u;
+    WriterBufs w = makeWriter(dev, MAXC);
+
+    ClothPsCgPush p = {};
+    p.toleranceLength = 1.0f;
+    p.cmInputs = bCms.addr; p.transformCache = bXf.addr;
+    p.contactDistance = bCd.addr; p.restDistance = bRd.addr;
+    p.gpuShapes = bShapes.addr; p.particleSystems = bPs.addr; p.femClothes = bDesc.addr;
+    p.stackSizeBytes = NB_STACK * 16u;
+    p.stackPtr = bStack.addr; p.midphasePairsNum = bNum.addr;
+    p.stackSizeNeeded = bNeeded.addr;
+    p.wPoint = w.point.addr; p.wNormalPen = w.normalPen.addr; p.wBary = w.barycentric.addr;
+    p.wInfo = w.info.addr; p.wCount = w.count.addr;
+    p.wByX = w.byRigid.addr; p.wTempByX = w.tempByRigid.addr; p.wIdxByX = w.idxByRigid.addr;
+    p.wSorted32 = 0ull;                 // C2: NULL for the particle writer, and never written
+    p.wMaxContacts = MAXC;
+
+    Kernel k("femClothPsContactGenBda.spv", "cloth_psContactGenLaunch",
+             {}, sizeof(ClothPsCgPush));
+    k.dispatch(512u, {}, p, 1u, 1u);
+    dev->flush();
+
+    // ---- the mirror ----------------------------------------------------------------
+    struct Exp { F4 point, normalPen, bary; uint64_t pairInd0; uint32_t pairInd1; };
+    std::vector<Exp> expected;
+    uint32_t faceHits = 0u;
+    for (uint32_t i = 0; i < NB_STACK; ++i)          // C8: the CLAMPED walk
+    {
+        const uint32_t cm = stack[i * 4 + 0], pi = stack[i * 4 + 1], tri = stack[i * 4 + 2];
+        const float cDistance = CD_PARTICLE + CD_CLOTH;
+        const float rest = (cm == 0u) ? REST_0 : REST_1;
+        const V3 a{ cv[tri * 3 + 0].x, cv[tri * 3 + 0].y, cv[tri * 3 + 0].z };
+        const V3 b{ cv[tri * 3 + 1].x, cv[tri * 3 + 1].y, cv[tri * 3 + 1].z };
+        const V3 c{ cv[tri * 3 + 2].x, cv[tri * 3 + 2].y, cv[tri * 3 + 2].z };
+        const V3 pp{ parts[pi].x, parts[pi].y, parts[pi].z };
+        const V3 ab = sub(b, a), ac = sub(c, a);
+        const V3 closest = cpTri2(pp, a, b, c, ab, ac);
+        const V3 v = sub(pp, closest);
+        const float sqDist = dot(v, v);
+        if (!(sqDist <= cDistance * cDistance)) continue;       // C5
+        ++faceHits;
+        const float m = std::sqrt(sqDist);
+        const V3 n{ v.x / m, v.y / m, v.z / m };                // C6: unguarded
+        const float pen = m - rest;                             // C4
+        const V3 contact = sub(pp, scl(n, rest));               // C4
+        Exp e{};
+        e.point = F4{ contact.x, contact.y, contact.z, 0.0f };
+        e.normalPen = F4{ -n.x, -n.y, -n.z, pen };              // C4: NEGATED
+        e.bary = computeBary(a, b, c, closest);
+        e.pairInd0 = (uint64_t(PS_ID) << 32) | pi;              // C3
+        e.pairInd1 = (CLOTH_ID << 20) | tri;
+        expected.push_back(e);
+    }
+
+    const uint32_t got = downloadBuffer<uint32_t>(dev, w.count.h, 1)[0];
+    PXG_CHECK_MSG(faceHits >= 6u,
+                  "only %u of the %u seeded pairs made contact; the rig must reach the face, "
+                  "the three vertex regions and two edge regions or the bit-exact comparison "
+                  "below is testing one branch of closestPtPointTriangle2", faceHits, NB_STACK);
+    PXG_CHECK_MSG(got == uint32_t(expected.size()),
+                  "contact COUNT %u, the mirror says %zu over %u clamped pairs of %u claimed",
+                  got, expected.size(), NB_STACK, NB_FOUND);
+
+    const auto pt = downloadBuffer<F4>(dev, w.point.h, MAXC);
+    const auto np = downloadBuffer<F4>(dev, w.normalPen.h, MAXC);
+    const auto ba = downloadBuffer<F4>(dev, w.barycentric.h, MAXC);
+    const auto info = downloadBuffer<uint32_t>(dev, w.info.h, MAXC * 4u);
+    const auto byX = downloadBuffer<uint64_t>(dev, w.byRigid.h, MAXC);
+    const auto tmpX = downloadBuffer<uint32_t>(dev, w.tempByRigid.h, MAXC);
+
+    struct Rec { uint32_t key[15]; };
+    auto less = [](const Rec& x, const Rec& y) {
+        for (int i = 0; i < 15; ++i) if (x.key[i] != y.key[i]) return x.key[i] < y.key[i];
+        return false;
+    };
+    std::vector<Rec> gpu, ref;
+    for (uint32_t i = 0; i < got && i < MAXC; ++i)
+    {
+        Rec r{};
+        r.key[0] = info[i * 4 + 0]; r.key[1] = info[i * 4 + 1];   // pairInd0 (u64)
+        r.key[2] = info[i * 4 + 2];                               // pairInd1
+        const float src[12] = { pt[i].x, pt[i].y, pt[i].z, pt[i].w,
+                                np[i].x, np[i].y, np[i].z, np[i].w,
+                                ba[i].x, ba[i].y, ba[i].z, ba[i].w };
+        for (int j = 0; j < 12; ++j) r.key[3 + j] = f2u(src[j]);
+        gpu.push_back(r);
+    }
+    for (const Exp& e : expected)
+    {
+        Rec r{};
+        r.key[0] = uint32_t(e.pairInd0 & 0xffffffffull);
+        r.key[1] = uint32_t(e.pairInd0 >> 32);
+        r.key[2] = e.pairInd1;
+        const float src[12] = { e.point.x, e.point.y, e.point.z, e.point.w,
+                                e.normalPen.x, e.normalPen.y, e.normalPen.z, e.normalPen.w,
+                                e.bary.x, e.bary.y, e.bary.z, e.bary.w };
+        for (int j = 0; j < 12; ++j) r.key[3 + j] = f2u(src[j]);
+        ref.push_back(r);
+    }
+    std::sort(gpu.begin(), gpu.end(), less);
+    std::sort(ref.begin(), ref.end(), less);
+
+    static const char* const KEY_NAME[15] = {
+        "pairInd0.lo", "pairInd0.hi", "pairInd1",
+        "point.x", "point.y", "point.z", "point.w",
+        "normal.x", "normal.y", "normal.z", "penetration",
+        "bary.x", "bary.y", "bary.z", "bary.w"
+    };
+    uint32_t mismatches = 0u; int firstField = -1; size_t firstAt = 0;
+    for (size_t i = 0; i < gpu.size() && i < ref.size(); ++i)
+        for (int j = 0; j < 15; ++j)
+            if (gpu[i].key[j] != ref[i].key[j])
+            { ++mismatches; if (firstField < 0) { firstField = j; firstAt = i; } break; }
+    if (mismatches != 0u && firstField >= 0)
+    {
+        const uint32_t gw = gpu[firstAt].key[firstField], rw = ref[firstAt].key[firstField];
+        float gf, rf; std::memcpy(&gf, &gw, 4); std::memcpy(&rf, &rw, 4);
+        std::printf("    first difference at sorted slot %zu, field %s: gpu 0x%08X (%.9g) vs "
+                    "mirror 0x%08X (%.9g)\n", firstAt, KEY_NAME[firstField], gw, gf, rw, rf);
+    }
+    PXG_CHECK_MSG(mismatches == 0u,
+                  "%u of %zu contacts differ BIT-EXACTLY from the host mirror of "
+                  "clothParticleCollision", mismatches, gpu.size());
+
+    // C3: the sort key is the ENCODED PARTICLE, not a rigid node index -- and the
+    // 32-bit companion is its LOW half.
+    uint32_t keyBad = 0u;
+    for (uint32_t i = 0; i < got && i < MAXC; ++i)
+    {
+        const uint64_t pair0 = (uint64_t(info[i * 4 + 1]) << 32) | info[i * 4 + 0];
+        if (byX[i] != pair0 || tmpX[i] != uint32_t(pair0 & 0xffffffffull)) ++keyBad;
+    }
+    PXG_CHECK_MSG(keyBad == 0u,
+                  "%u contacts sort by something other than their own encoded particle index "
+                  "(C3); the rigid callers pass a node index here and this one must not", keyBad);
+
+    // C8: the high-water mark is the UNCLAMPED count.
+    const uint32_t needed = downloadBuffer<uint32_t>(dev, bNeeded.h, 1)[0];
+    PXG_CHECK_MSG(needed == NB_FOUND * 16u,
+                  "stackSizeNeeded is %u, expected the UNCLAMPED %u * 16 = %u (the clamped "
+                  "count would give %u)", needed, NB_FOUND, NB_FOUND * 16u, NB_STACK * 16u);
+
+    std::printf("    [ note ] %zu contacts over %u clamped pairs of %u claimed; %u reached the "
+                "closest-point branches\n", expected.size(), NB_STACK, NB_FOUND, faceHits);
+
+    // ---- C6, on its own: a particle EXACTLY on the triangle ------------------------
+    // `n = v / m` has no zero guard upstream, so m == 0 gives a non-finite normal.
+    // Compared as "both sides are non-finite" rather than bit-for-bit: NaN payloads
+    // are not something this port controls, and pinning one would be a claim about
+    // the driver rather than about the kernel.
+    //
+    // The particle sits on VERTEX a, not on the centroid.  The centroid was the first
+    // attempt and it does not work: closestPtPointTriangle2's face branch recomputes
+    // the point through barycentric weights, so the result differs from the centroid
+    // in the last bits and `m` comes out around 1e-8 rather than 0 -- the check then
+    // failed on a FINITE normal and was right to.  On a vertex the function returns
+    // `a` verbatim from its first branch, so `v` is exactly zero by construction.
+    {
+        const V3 ctr = vtx(0, 0);
+        std::vector<F4> one = { F4{ ctr.x, ctr.y, ctr.z, 1.0f } };
+        DevBuf bOnePart = makeDev(dev, one);
+        std::vector<PxgParticleSystem> psOne(PS_ID + 1u);
+        std::memset(psOne.data(), 0, psOne.size() * sizeof(PxgParticleSystem));
+        psOne[PS_ID].mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bOnePart.addr));
+        psOne[PS_ID].mCommonData.mNumParticles = 1u;
+        DevBuf bPsOne = makeDev(dev, psOne);
+        std::vector<uint32_t> oneStack = { 0u, 0u, 0u, 0u };
+        DevBuf bOneStack = makeDev(dev, oneStack);
+        std::vector<uint32_t> oneFound = { 1u };
+        DevBuf bOneNum = makeDev(dev, oneFound);
+        DevBuf bOneNeeded = makeDev(dev, zero);
+        WriterBufs w2 = makeWriter(dev, 4u);
+
+        ClothPsCgPush q = p;
+        q.particleSystems = bPsOne.addr;
+        q.stackPtr = bOneStack.addr; q.midphasePairsNum = bOneNum.addr;
+        q.stackSizeBytes = 16u; q.stackSizeNeeded = bOneNeeded.addr;
+        q.wPoint = w2.point.addr; q.wNormalPen = w2.normalPen.addr; q.wBary = w2.barycentric.addr;
+        q.wInfo = w2.info.addr; q.wCount = w2.count.addr;
+        q.wByX = w2.byRigid.addr; q.wTempByX = w2.tempByRigid.addr; q.wIdxByX = w2.idxByRigid.addr;
+        q.wMaxContacts = 4u;
+        k.dispatch(512u, {}, q, 1u, 1u);
+        dev->flush();
+
+        const uint32_t n2 = downloadBuffer<uint32_t>(dev, w2.count.h, 1)[0];
+        PXG_CHECK_MSG(n2 == 1u,
+                      "a particle exactly ON the triangle produced %u contacts, expected 1: the "
+                      "gate is `sqDist <= cDistance^2` (C5) and 0 passes it", n2);
+        const F4 gotNp = downloadBuffer<F4>(dev, w2.normalPen.h, 4)[0];
+        const bool nonFinite = !std::isfinite(gotNp.x) || !std::isfinite(gotNp.y) ||
+                               !std::isfinite(gotNp.z);
+        PXG_CHECK_MSG(nonFinite,
+                      "the degenerate contact's normal is (%g, %g, %g), which is finite.  "
+                      "Upstream divides by the distance with no zero guard (C6, upstream "
+                      "candidate 39); a port that added one would pass every other check here "
+                      "and silently stop matching the engine",
+                      gotNp.x, gotNp.y, gotNp.z);
+        std::printf("    [ note ] degenerate case: normal (%g, %g, %g), penetration %g -- "
+                    "unguarded divide, as upstream\n", gotNp.x, gotNp.y, gotNp.z, gotNp.w);
+
+        destroyWriter(dev, w2);
+        for (PxgBufferHandle h : { bOnePart.h, bPsOne.h, bOneStack.h, bOneNum.h, bOneNeeded.h })
+            dev->destroyBuffer(h);
+    }
+
+    destroyWriter(dev, w);
+    for (PxgBufferHandle h : { bCv.h, bCi.h, bDesc.h, bParts.h, bPs.h, bShapes.h, bCms.h,
+                               bCd.h, bRd.h, bXf.h, bStack.h, bNum.h, bNeeded.h })
         dev->destroyBuffer(h);
 }
 
