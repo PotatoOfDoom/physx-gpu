@@ -1724,6 +1724,130 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.30 — die Tuch-gegen-Partikel-Kette, vier Löcher in meinen eigenen Vorrichtungen, und eine Rate, die ich im falschen Regime gemessen hatte
+
+Manifest **369 → 371**. `cloth_psMidphaseGeneratePairsLaunch` und
+`cloth_psContactGenLaunch` sind die beiden Hälften der **einen** lebendigen
+Tuch-gegen-Partikel-Aufrufstelle (PxgNarrowphaseCore.cpp:3577 und :3628) — eine
+Mittelphase, die einen Zwischenstapel füllt, und ein Erzeuger, der ihn liest.
+
+### Der Port
+
+Die Mittelphase ist der dritte BV32-**Punkt**-Query dieses Ports. Der
+Abfragepunkt ist ein Partikel, der Baum gehört dem **Tuch**, und beide liegen
+bereits in **Weltkoordinaten** — das ist der eine strukturelle Unterschied zum
+Netz-Geschwister nebenan, das einen vollständigen Umweg in den Vertex-Raum des
+Netzes macht. Wer dessen Treiber kopiert, verschiebt das Tuch.
+
+Der Erzeuger ist der einfachste der Tuch-Familie: ein Partikel gegen ein
+Dreieck, höchstens ein Kontakt, **keine** Warp-Aggregation — jeder Kontakt nimmt
+seinen eigenen `atomicAdd(…, 1)`.
+
+**Sechzehn Fallen.** Die vier, die einen kopierten Geschwister-Port sofort
+brechen:
+
+* **Das Paar ist `(cmIdx, PARTIKEL, DREIECK)`.** Jede andere Tuch-Mittelphase
+  hier legt das Tuch-Element in `.y`; diese den Partikel.
+* **Ein anderer Writer.** `writeContact` statt `writeRigidVsDeformableContact`:
+  `pairInd0` als **u64**, kein Materialwort, und `contactSortedByX` bleibt
+  unangetastet — für Partikel ist der Zeiger **NULL** (PxgFEMCore.h:393). Der
+  Sortierschlüssel ist der **kodierte Partikel**, kein Starrkörperindex; der Host
+  baut diesen Writer mit `useParticleForSorting = true`, was ihn überhaupt erst
+  auf die Partikelströme zeigen lässt.
+* **Die gespeicherte Normale ist negiert**, die Durchdringung misst gegen die
+  **Ruhe**distanz, während das Tor die **Kontakt**distanz nimmt.
+* **`n = v / m` ohne Nullprüfung.** Ein Partikel exakt auf dem Dreieck ergibt eine
+  NaN-Normale, die in den Löser läuft. So portiert; **Upstream-Kandidat 39**.
+
+Dazu ein toter Parameter: `isMesh` wird mit `false` übergeben, und **beide**
+Zweige rechnen denselben Ausdruck — die unterscheidende Zeile ist upstream
+auskommentiert.
+
+`closestPtPointTriangle2` ist jetzt **öffentlich** im Modul `pxgSlangTetClosest`
+statt ein fünftes Mal kopiert. Die Klammerung des Schlusses — `(a + ab·v) + ac·w`
+— wurde **vor** der Wiederverwendung gegen `GuDistancePointTriangle.h:96`
+geprüft, weil P9.29 an genau dieser Stelle eine Messung verloren hat.
+
+### Ein Spiegel, der nur halb gelesen wurde
+
+Beim Schreiben der Vorrichtung fiel `p72ref::closestPtPointTriangle` auf: er
+klammerte `a + (ab·v + ac·w)`, der Shader `(a + ab·v) + ac·w`.
+
+**Nichts war rot** — alle drei Aufrufer nehmen nur `s`/`t` oder ein
+Distanzprädikat, der zurückgegebene **Punkt** wird nirgends bitgleich verglichen.
+
+> Genau deshalb konnte es dort sitzen. Ein Spiegel, der immer nur **halb**
+> gelesen wird, driftet von dem weg, was er spiegelt, ohne dass etwas anschlägt.
+
+Repariert, mit dem Grund daneben.
+
+### Vier Löcher, die der Fege-Durchgang gefunden hat — alle in den Vorrichtungen
+
+Der erste Durchgang ließ **fünf** Überlebende. Einer ist ein begründetes
+Äquivalent, vier waren Lücken in meinen Prüfständen:
+
+| Überlebender | Befund |
+|---|---|
+| `c1-pair-swap` | **Der peinlichste.** Mein Stapel setzte Partikel- *und* Dreiecksindex auf `i`, also war der Tausch von `.y` und `.z` ein **No-op** — ausgerechnet gegen die Kopffalle des Kernels. Jetzt ist Partikel `p` mit Dreieck `p+1` gepaart. |
+| `c5-gate-unsquared` | `cDistance` ist 0,40, sein Quadrat 0,16 — **kein** Partikel lag im Band dazwischen. Jetzt liegt einer 0,50 über seinem Dreieck: `sqDist` 0,25, korrekt verworfen, von der ungequadrateten Fassung akzeptiert. |
+| `maxcontacts-ungated` | Sechs Kontakte gegen zweiunddreißig Plätze erreichen das Kapazitätstor nie. Ein zweiter Lauf kappt den Writer bei **drei**: der Zähler muss trotzdem auf sechs steigen — der `atomicAdd` steht **vor** dem Tor, und die Engine bemisst daraus den nächsten Frame — und hinter der Kappe darf nichts angefasst sein. |
+| `numworkitems-ungated` | Der Versand hatte genau so viele y-Gruppen wie Arbeitsgegenstände, also feuerte der Wächter nie. Jetzt **vier** Gruppen für **einen** Gegenstand; die drei überzähligen müssen am Wächter umkehren, statt einen Kontaktverwalter zu lesen, den es nicht gibt. |
+| `m2-unclamped-prim` | **Begründetes Äquivalent, und geprüft statt behauptet.** Die Adressklemmung ist per Konstruktion beobachtungsneutral — der Sentinel-Wächter verwirft den Wert ohnehin. Gemessen: ohne die Klemmung meldet `check_speculated_loads.py` **genau eine** HIGH-Stelle, mit ihr **keine**. Die Eigenschaft wird gehalten, nur nicht von einer Vorrichtung — die Anordnung, die P9.28 absichtlich so gebaut hat. |
+
+Beide **Streifenprüfstände** standen diesmal **vorher**, nicht als Reaktion auf
+einen Überlebenden: 2056 Partikel gegen 2048 Warps und 131080 Paare gegen 131072
+Fäden, je acht Treffer aus dem Schwanz. Gezählt statt zugeordnet, weil eine zu
+kleine Schrittweite das Fenster nicht verschiebt, sondern jeden Index mehrfach
+besucht.
+
+Und eine Folgekorrektur, die zeigt, wie eng die beiden Läufe verzahnt sind: der
+Streifenprüfstand des Erzeugers säte das Paar `(0, 0)` — das war **zufällig** ein
+treffendes Paar und hörte in dem Moment auf, eines zu sein, als die Indexräume
+versetzt wurden.
+
+### Die Rate war richtig gemessen und falsch angewandt
+
+P9.29a schrieb, `ctest` falle „gelegentlich — ein paar Prozent der Läufe" an
+`gpuslang.femClothSim` durch. Die Zahl stammt aus einer **seriellen** Schleife,
+ein Prozess nach dem anderen. `ctest -j4` ist etwas anderes: jeder der 821 Tests
+ist ein eigener Aufruf **desselben** Binärprogramms, also laufen vier davon
+gleichzeitig — genau die Bedingung, die P9.28a als ratensteigernd gemessen hat.
+
+Am Stand dieser Tranche, beide Regime hintereinander gemessen:
+
+| Regime | Abstürze | |
+|---|---|---|
+| seriell, ein Prozess nach dem anderen | **3 von 48** | 6,3 % |
+| **vier gleichzeitige Prozesse** | **11 von 48** | **22,9 %** |
+
+Die Nebenläufigkeit vervierfacht sie ungefähr. Damit ist auch erklärt, warum
+Modus 1 in den letzten drei Verifikationsläufen **dreimal** ausgefallen ist: bei
+rund einem Lauf von vier ist das erwartbar und kein Signal.
+
+> Die Zahl in P9.29a war für ihr Regime richtig. Sie stand dort aber als Aussage
+> darüber, was `ctest` sieht — und dafür war sie das falsche Regime. Beide stehen
+> jetzt getrennt da.
+
+Die beiden Verzichte von P9.29a gelten unverändert: **kein** pauschales
+`ctest --repeat until-pass`, und **keine** Entschärfung der Vorrichtungen.
+
+### Verifikation
+
+* Fegen **15 von 16** auf der Mittelphase (ein begründetes Äquivalent, oben
+  benannt) und **21 von 21** auf dem Erzeuger — zwangsfrisch, 0 Anker-Fehler,
+  0 Hänger, alle 37 Anker **vorab** auf Eindeutigkeit geprüft;
+* Kontakte des Erzeugers **bitgleich** gegen einen vollständigen C++-Spiegel,
+  mit einem Tor, das mindestens sechs Treffer über die Flächen-, Eckpunkt- und
+  Kantenzweige von `closestPtPointTriangle2` verlangt;
+* der entartete Fall eigens: Normale `(nan, nan, nan)`, Durchdringung `-0,07` —
+  ein Port, der die fehlende Nullprüfung „repariert", besteht jede andere
+  Prüfung hier;
+* Suite **821/821** in beiden Speichermodi — Modus 1 im **zweiten** Anlauf, der
+  erste traf den Plattformfehler oben, und das steht hier mit der Versuchszahl
+  statt ohne;
+* Szenen **33 ok, 0 fail, 0 missing (von 33)** nach dem Neubau von `build-sdk`
+  wegen der Manifeständerung.
+
 ## P9.29 — der letzte Primitiv-Kontakterzeuger auf der Dreiecksseite, eine dritte Art, einen Kernel abzuschalten, und ein Absturz, der jetzt eine Adresse hat
 
 Manifest **368 → 369**. `cloth_SphereContactGenLaunch` (femClothPrimitives.cu:520)
@@ -1865,9 +1989,11 @@ Verwalter in den Zustand, in dem er das Loch lässt, und der Fehler trifft dann
 einen **späteren** Test (`femClothSimMeshVertMidphase`). `LP_NUM_THREADS=1`
 senkt die Rate, beseitigt sie nicht.
 
-**Und die Folge, unbeschönigt:** `ctest` fällt seitdem gelegentlich — ein paar
-Prozent der Läufe, siehe die Tabelle oben — an `gpuslang.femClothSim` mit
-SEGFAULT durch. Genau das ist während der Verifikation dieser Tranche passiert — ein Durchgang in Modus 1 endete so,
+**Und die Folge, unbeschönigt:** `ctest` fällt seitdem an
+`gpuslang.femClothSim` mit SEGFAULT durch. *(Wie oft, sagt diese Tranche
+falsch: die Tabelle oben ist **seriell** gemessen, `ctest -j4` fährt vier
+gleichzeitige Prozesse desselben Binärprogramms und liegt bei rund einem Lauf
+von vier. P9.30 misst beide Regime und trennt sie.)* Genau das ist während der Verifikation dieser Tranche passiert — ein Durchgang in Modus 1 endete so,
 während Modus 2 daneben 821/821 lieferte; der serielle Wiederholungslauf gab
 dann beide Modi grün. Bei einer Rate um 1 zu 10 sind **beide** Ausgänge zu
 erwarten, und deshalb steht unten die Zahl aus dem sauberen Lauf **und** hier
