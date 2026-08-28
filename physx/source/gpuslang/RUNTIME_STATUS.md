@@ -1725,10 +1725,9 @@ Manifest **364 → 366**, Suite unverändert **821**. Die beiden Mittelphasen de
 Tuch-gegen-Höhenfeld-Kette sind abgebildet; die beiden Kontakterzeuger folgen als
 eigene Tranche.
 
-> **Szenenlauf noch offen.** Das Manifest hat sich geändert, also muss `build-sdk`
-> neu gebaut und der Szenensatz neu gefahren werden. Der Lauf war beim Committen
-> noch unterwegs; die Zahl steht im Nachtrag und wird **nicht** hier behauptet,
-> bevor sie gemessen ist.
+Szenen **33/33** nach Neubau von `build-sdk` (das Manifest hat sich geändert).
+Diese Zahl stand beim Commit der Tranche noch nicht fest und wurde deshalb dort
+**nicht** behauptet, sondern nachgetragen, als sie gemessen war.
 
 ### Ein Rumpf, zwei Einstiegspunkte — und diesmal ist das Upstreams eigene Form
 
@@ -1916,8 +1915,8 @@ Mutant können sie sehen — weshalb sie im Shader-Kopf steht.
   verlangt ausdrücklich, dass ihre Paarmengen sich **unterscheiden** — sonst
   bewiese ein geteilter Rumpf nichts;
 * `softBodyHfMidphaseBda` nach dem Umzug aufs Modul **eintragsgleich**;
-* Suite **821/821** in **beiden** Speichermodi; der Szenensatz nach Neubau von
-  `build-sdk` war beim Committen noch unterwegs — Zahl im Nachtrag.
+* Suite **821/821** in **beiden** Speichermodi; Szenen **33/33** nach Neubau von
+  `build-sdk`.
 
 ## P9.26 — die VERTEX-Hälfte der Tuch-gegen-Netz-Kette, und ein Kernel, den die Engine selbst abgeschaltet hat
 

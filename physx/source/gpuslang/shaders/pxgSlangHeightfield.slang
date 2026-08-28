@@ -151,6 +151,74 @@ public uint hfMinColumn(float z, uint cols) { return uint(clamp(int(floor(z)), 0
 public uint hfMaxColumn(float z, uint cols) { return uint(clamp(int(ceil(z)),  0, int(cols) - 1)); }
 
 // ---------------------------------------------------------------------------
+// THE TRIANGLE, extracted from the samples (heightfieldUtil.cuh getTriangle).
+//
+// A quad's two triangles are cut along one of its diagonals, and WHICH diagonal
+// is a per-sample flag -- bit 23, the tessellation bit that also happens to be
+// materialIndex0's high bit.  That is why the material comparison has to mask it
+// off and why reading the raw byte against eHOLE is wrong; the two facts are the
+// same bit seen from two sides.
+// ---------------------------------------------------------------------------
+[ForceInline]
+public bool hfZerothVertexShared(uint64_t samples, uint vertexIndex)
+{
+    return (hfSampleWord(samples, vertexIndex) & 0x800000u) != 0u;
+}
+
+public void hfTriVertexIndices(uint64_t samples, uint triangleIndex, uint columns,
+                               out uint i0, out uint i1, out uint i2)
+{
+    const uint cell = triangleIndex >> 1;
+    const bool firstTri = (triangleIndex & 0x1u) == 0u;
+    if (hfZerothVertexShared(samples, cell))
+    {
+        if (firstTri) { i0 = cell + columns; i1 = cell; i2 = cell + columns + 1u; }
+        else          { i0 = cell + 1u; i1 = cell + columns + 1u; i2 = cell; }
+    }
+    else
+    {
+        if (firstTri) { i0 = cell; i1 = cell + 1u; i2 = cell + columns; }
+        else          { i0 = cell + columns + 1u; i1 = cell + columns; i2 = cell + 1u; }
+    }
+}
+
+// A vertex in heightfield units: (row, height, column).
+[ForceInline]
+public float3 hfGetVertex(uint64_t samples, uint vertexIndex, uint columns)
+{
+    const uint row = vertexIndex / columns;
+    const uint col = vertexIndex % columns;
+    return float3(float(row), hfHeight(samples, vertexIndex), float(col));
+}
+
+[ForceInline]
+public float3 hf2shapep(float3 v, float3 scale)
+{
+    return float3(v.x * scale.x, v.y * scale.y, v.z * scale.z);
+}
+
+// getTriangle, in the heightfield's SHAPE space (units multiplied by the scale).
+//
+// The handedness swap is DEAD UPSTREAM: PxHeightFieldGeometry::isValid rejects a
+// non-positive row or column scale, so `wrongHanded` is always false in any scene
+// the SDK will accept.  Transcribed anyway, because "unreachable today" is not
+// the same as "not there", and the branch is one xor.
+public void hfGetTriangle(uint64_t samples, uint triangleIndex, float3 scale, uint columns,
+                          out float3 v0, out float3 v1, out float3 v2)
+{
+    bool wrongHanded = false;
+    if (scale.z < 0.0f) wrongHanded = !wrongHanded;
+    if (scale.x < 0.0f) wrongHanded = !wrongHanded;
+
+    uint t0, t1, t2;
+    hfTriVertexIndices(samples, triangleIndex, columns, t0, t1, t2);
+
+    v0 = hf2shapep(hfGetVertex(samples, t0, columns), scale);
+    v1 = hf2shapep(hfGetVertex(samples, wrongHanded ? t2 : t1, columns), scale);
+    v2 = hf2shapep(hfGetVertex(samples, wrongHanded ? t1 : t2, columns), scale);
+}
+
+// ---------------------------------------------------------------------------
 // hfLocalBound -- a WORLD bound into heightfield ROW/HEIGHT/COLUMN units.
 //
 // Upstream is `PxBounds3::transformFast(hfTransform.getInverse(), bound)` followed
