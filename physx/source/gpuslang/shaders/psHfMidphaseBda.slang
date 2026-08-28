@@ -242,6 +242,7 @@ import pxgSlangCommon;
 import pxgSlangParticleDesc;
 // P9.12g: the contact writer, LoadShapePair and the two records they move.
 import pxgSlangParticleContact;
+import pxgSlangHeightfield;   // P9.27b: sample format, vertex decode, getTriangle
 
 // ---------------------------------------------------------------------------
 // Constants, all pinned by the fixture's layout test.
@@ -251,7 +252,6 @@ static const uint HF_COLLISION_GRID = 4096u;   // PxgParticleSystemKernelGridDim
 
 static const uint MAX_MESH_CONTACTS = 6u;      // MaxStaticContactsPerMesh
 static const uint MAX_PARTICLE_CONTACTS = 12u; // MaxStaticContactsPerParticle
-static const uint HOLE = 127u;                 // PxHeightFieldMaterial::eHOLE
 
 // PxGeometryType (PxGeometry.h:48-62) is a plain 0-based enum:
 //   eSPHERE 0, ePLANE 1, eCAPSULE 2, eBOX 3, eCONVEXCORE 4, eCONVEXMESH 5,
@@ -318,89 +318,15 @@ ConstantBuffer<PsHfMidPush> gHf;
 //   bits 24..30 : materialIndex1, seven bits
 //   bit  31     : materialIndex1's own high bit, unused by the format
 // ---------------------------------------------------------------------------
-uint hfSample(uint64_t samples, uint vertexIndex)
-{
-    return Ptr<uint>(samples)[vertexIndex];
-}
-
-float hfGetHeight(uint64_t samples, uint vertexIndex)
-{
-    // Sign-extend the low half: shift up then arithmetic-shift down.
-    const int h = int(hfSample(samples, vertexIndex) << 16) >> 16;
-    return float(h);
-}
-
-bool hfZerothVertexShared(uint64_t samples, uint vertexIndex)
-{
-    return (hfSample(samples, vertexIndex) & 0x800000u) != 0u;
-}
-
-// Both material bytes are PxBitAndByte, whose conversion strips the high bit, so
-// both masks are seven bits wide (H7).
-uint hfMaterialIndex0(uint64_t samples, uint vertexIndex)
-{
-    return (hfSample(samples, vertexIndex) >> 16) & 0x7Fu;
-}
-uint hfMaterialIndex1(uint64_t samples, uint vertexIndex)
-{
-    return (hfSample(samples, vertexIndex) >> 24) & 0x7Fu;
-}
-
-float3 hfGetVertex(uint64_t samples, uint vertexIndex, uint columns)
-{
-    const uint row = vertexIndex / columns;
-    const uint col = vertexIndex % columns;
-    return float3(float(row), hfGetHeight(samples, vertexIndex), float(col));
-}
-
-float3 hf2shapep(float3 v, float rowScale, float heightScale, float columnScale)
-{
-    return float3(v.x * rowScale, v.y * heightScale, v.z * columnScale);
-}
+// The sample format, the vertex decode and the shape-space scaling now live in
+// pxgSlangHeightfield (P9.27b).  They used to live here AND in
+// softBodyHfMidphaseBda AND in fcMidphase, and the copies disagreed -- see P9.27a
+// for the one that mattered.  This shader keeps its OWN walk, because what it does
+// with a surviving quad (fetch the triangle and run a particle test) is not what
+// the midphases do with one; only the format and the decode are shared.
 
 // getTriangleVertexIndices (heightfieldUtil.cuh:115-165): the tessellation flag
 // picks which diagonal splits the quad.
-void hfTriVertexIndices(uint64_t samples, uint triangleIndex, uint columns,
-                        out uint i0, out uint i1, out uint i2)
-{
-    const uint cell = triangleIndex >> 1;
-    const bool firstTri = (triangleIndex & 0x1u) == 0u;
-    if (hfZerothVertexShared(samples, cell))
-    {
-        if (firstTri) { i0 = cell + columns; i1 = cell; i2 = cell + columns + 1u; }
-        else          { i0 = cell + 1u; i1 = cell + columns + 1u; i2 = cell; }
-    }
-    else
-    {
-        if (firstTri) { i0 = cell; i1 = cell + 1u; i2 = cell + columns; }
-        else          { i0 = cell + columns + 1u; i1 = cell + columns; i2 = cell + 1u; }
-    }
-}
-
-// getTriangle (heightfieldUtil.cuh:262-310).  The CUDA also builds a `handedness`
-// vector there; it is assigned and never read (the swap uses `wrongHanded`), so
-// it is dead code and the port drops it -- as psHfCollide already does.
-void hfGetTriangle(uint64_t samples, uint triangleIndex, float3 scale, uint columns,
-                   out float3 v0, out float3 v1, out float3 v2)
-{
-    const float rowScale = scale.x;
-    const float heightScale = scale.y;
-    const float columnScale = scale.z;
-    bool wrongHanded = false;
-    if (columnScale < 0.0f) wrongHanded = !wrongHanded;   // H6: dead upstream
-    if (rowScale < 0.0f) wrongHanded = !wrongHanded;
-
-    uint t0, t1, t2;
-    hfTriVertexIndices(samples, triangleIndex, columns, t0, t1, t2);
-
-    const float3 vertex0 = hfGetVertex(samples, t0, columns);
-    const float3 vertex1 = hfGetVertex(samples, wrongHanded ? t2 : t1, columns);
-    const float3 vertex2 = hfGetVertex(samples, wrongHanded ? t1 : t2, columns);
-
-    v0 = hf2shapep(vertex0, rowScale, heightScale, columnScale);
-    v1 = hf2shapep(vertex1, rowScale, heightScale, columnScale);
-    v2 = hf2shapep(vertex2, rowScale, heightScale, columnScale);
-}
 
 // H9: the min helpers clamp to n-2, the max helpers to n-1.
 uint hfGetMinRow(float x, uint rows)    { return uint(clamp(int(floor(x)), 0, int(rows) - 2)); }
@@ -698,19 +624,19 @@ void ps_heightfieldCollisonLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
             const uint index = i / 2u;
             const uint vertexIndex = (minRow + index / columnSpan) * nbCols
                                    + (minColumn + index % columnSpan);
-            const float h0 = hfGetHeight(samples, vertexIndex);
-            const float h1 = hfGetHeight(samples, vertexIndex + 1u);
-            const float h2 = hfGetHeight(samples, vertexIndex + nbCols);
-            const float h3 = hfGetHeight(samples, vertexIndex + nbCols + 1u);
+            const float h0 = hfHeight(samples, vertexIndex);
+            const float h1 = hfHeight(samples, vertexIndex + 1u);
+            const float h2 = hfHeight(samples, vertexIndex + nbCols);
+            const float h3 = hfHeight(samples, vertexIndex + nbCols + 1u);
             const bool con0 = maxy < h0 && maxy < h1 && maxy < h2 && maxy < h3;
             const bool con1 = miny > h0 && miny > h1 && miny > h2 && miny > h3;
 
             if (!(con0 || con1))
             {
                 const bool isMaterial1 = (i & 1u) != 0u;
-                const uint material = isMaterial1 ? hfMaterialIndex1(samples, vertexIndex)
-                                                  : hfMaterialIndex0(samples, vertexIndex);
-                if (material != HOLE)   // H7
+                const uint material = isMaterial1 ? hfMaterial1(samples, vertexIndex)
+                                                  : hfMaterial0(samples, vertexIndex);
+                if (material != HF_HOLE)   // H7
                 {
                     const uint triangleIdx = isMaterial1 ? ((vertexIndex << 1) + 1u)
                                                          : (vertexIndex << 1);

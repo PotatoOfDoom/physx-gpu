@@ -99,6 +99,7 @@ module femClothMeshContactGenBda;
 
 import pxgSlangCommon;         // quatRotate / quatRotateInv / PxgTransform28
 import pxgSlangFEMClothDesc;   // PxgFEMClothGpu
+import pxgSlangClothTriContact;  // P9.27b: staticTriangleVsClothCollision + its clipping
 
 // PxgSimulationCoreDesc.h:41 — PxEncodeClothIndex(clothId, elem) = (clothId << 20) | elem.
 static const uint PXG_BITSHIFT_ELEMENT_ID = 20u;
@@ -169,43 +170,13 @@ struct PxgContactManagerInput { uint shapeRef0, shapeRef1, transformCacheRef0, t
 struct PairR { uint2 index0; uint2 index1; uint index2; uint pad0, pad1, pad2; }
 
 // ---------------------------------------------------------------------------
-// Small geometry helpers (fcStaticTriCloth.slang, verbatim).
+// The plane/barycentric helpers, the clipping pipeline and
+// staticTriangleVsClothCollision now live in pxgSlangClothTriContact (P9.27b),
+// because the HEIGHTFIELD contact gen calls the same upstream __device__ function
+// and a second copy is how two ports start disagreeing -- see P9.27a for the one
+// that did.  What stays here is this kernel's own glue: the pair-stack walk, the
+// shape routing, the filter and the writer.
 // ---------------------------------------------------------------------------
-float3 cgGetNormalized(float3 v)
-{
-    const float m = dot(v, v);
-    return m > 0.0f ? v * rsqrt(m) : float3(0, 0, 0);
-}
-// PxPlane(point, normal): n, d = -p.n ; distance(p) = n.p + d
-float4 makePlane(float3 p, float3 n) { return float4(n, -dot(p, n)); }
-float planeDistance(float4 pl, float3 p) { return dot(pl.xyz, p) + pl.w; }
-
-// vertex2Shape(v, scale, rot) = rot.rotateInv(rot.rotate(v) * scale)  (cudaNpCommon.h:270).
-// MULTIPLIES by the scale — the inverse of step 1's shape2Vertex, which divides.
-float3 vertex2Shape(float3 v, float3 scale, float4 rot)
-{
-    return quatRotateInv(rot, quatRotate(rot, v) * scale);
-}
-float3 transformPt(float4 q, float3 p, float3 v) { return quatRotate(q, v) + p; }
-
-// femClothPrimitives.cu computeBarycentric (the bool result is unused at this call site).
-void computeBarycentric(float3 a, float3 b, float3 c, float3 p, out float4 barycentric)
-{
-    const float3 v0 = b - a;
-    const float3 v1 = c - a;
-    const float3 v2 = p - a;
-    const float d00 = dot(v0, v0);
-    const float d01 = dot(v0, v1);
-    const float d11 = dot(v1, v1);
-    const float d20 = dot(v2, v0);
-    const float d21 = dot(v2, v1);
-    const float denom = d00 * d11 - d01 * d01;
-    const float v = (d11 * d20 - d01 * d21) / denom;
-    const float w = (d00 * d21 - d01 * d20) / denom;
-    const float u = 1.0f - v - w;
-    barycentric = float4(u, v, w, 0.0f);
-}
-
 // ---------------------------------------------------------------------------
 // find(PxgRigidFilterPair*) (deformableElementFilter.cuh:67) — the binary search with the
 // ignoreIndex2 early accept, as softBodyMeshContactGenBda carries it.
@@ -241,207 +212,7 @@ bool findRigidPair(uint2 q0, uint2 q1)
     return false;
 }
 
-// ---------------------------------------------------------------------------
-// The polygon trim pipeline (femClothPrimitives.cu:3436-3641), lifted from
-// fcStaticTriCloth.slang where it is already fixture-verified against a CPU transcription.
-// ---------------------------------------------------------------------------
 
-// Only correct when a and b straddle the plane (one may lie exactly on it).
-float3 intersectionPoint(float4 plane, float3 a, float3 b)
-{
-    const float distA = abs(planeDistance(plane, a));
-    const float distB = abs(planeDistance(plane, b));
-    const float f = distA / (distA + distB);
-    return (1.0f - f) * a + f * b;
-}
-
-void insertPt(inout float3 arr[8], int arrCount, int index, float3 element)
-{
-    for (int i = arrCount; i > index; --i)
-        arr[i] = arr[i - 1];
-    arr[index] = element;
-}
-
-// In-place convex-loop clip: points with distance > 0 (STRICT) are removed.
-int trimLoop(float4 plane, inout float3 loop[8], int loopCount)
-{
-    if (loopCount < 3)
-        return loopCount;
-
-    float3 intersectionA = float3(0, 0, 0);
-    int changeA = -1;
-    float3 intersectionB = float3(0, 0, 0);
-    int changeB = -1;
-
-    bool keep = false;
-
-    bool prevOutside = planeDistance(plane, loop[0]) > 0.0f;
-    for (int i = 0; i < loopCount; ++i)
-    {
-        const bool outside = planeDistance(plane, loop[(i + 1) % loopCount]) > 0.0f;
-        if (outside != prevOutside)
-        {
-            const float3 inter = intersectionPoint(plane, loop[i], loop[(i + 1) % loopCount]);
-            if (changeA < 0)
-            {
-                changeA = i;
-                keep = !prevOutside;
-                intersectionA = inter;
-            }
-            else
-            {
-                changeB = i;
-                intersectionB = inter;
-            }
-        }
-        prevOutside = outside;
-    }
-
-    if (changeA >= 0 && changeB >= 0)
-    {
-        int loopIndexer = -1;
-        for (int i = 0; i < loopCount; ++i)
-        {
-            if (keep)
-            {
-                ++loopIndexer;
-                loop[loopIndexer] = loop[i];
-            }
-            if (i == changeA || i == changeB)
-            {
-                const float3 pt = (i == changeA) ? intersectionA : intersectionB;
-                if (loopIndexer == i && !keep)
-                {
-                    ++loopIndexer;
-                    insertPt(loop, loopCount, loopIndexer, pt);
-                    ++loopCount;
-                    ++i;
-                    ++changeB;
-                }
-                else
-                {
-                    ++loopIndexer;
-                    loop[loopIndexer] = pt;
-                }
-                keep = !keep;
-            }
-        }
-        loopCount = loopIndexer + 1;
-    }
-    else if (prevOutside)
-        loopCount = 0;   // no crossing and every point outside
-
-    return loopCount;
-}
-
-float4 createEdgePlane(float3 triNormal, float3 edgeStart, float3 edgeEnd)
-{
-    const float3 n = cgGetNormalized(cross(edgeEnd - edgeStart, triNormal));
-    return makePlane(edgeStart, n);
-}
-
-// The 5-plane, 8-element variant: three edge planes plus the two +-distance slabs.
-int trimTriangleByTriangle(inout float3 poly[8], int polyLength, float3 triA, float3 triB, float3 triC,
-                           float maxDistanceLimitPosNormalDir, float maxDistanceLimitNegNormalDir)
-{
-    float3 n = cross(triB - triA, triC - triA);
-    // PxVec3::normalizeSafe: n is left UNCHANGED below the epsilon, unlike getNormalized which
-    // returns zero.  Only distinguishable for 0 < |cross| < 1e-20, a subnormal window that
-    // cannot survive the vertex transform chain — kept because it is what the .cu writes.
-    const float mag = sqrt(dot(n, n));
-    if (mag >= PX_NORMALIZATION_EPSILON)
-        n = n * (1.0f / mag);
-
-    polyLength = trimLoop(createEdgePlane(n, triA, triB), poly, polyLength);
-    polyLength = trimLoop(createEdgePlane(n, triB, triC), poly, polyLength);
-    polyLength = trimLoop(createEdgePlane(n, triC, triA), poly, polyLength);
-
-    polyLength = trimLoop(makePlane(triA + maxDistanceLimitPosNormalDir * n, n), poly, polyLength);
-    polyLength = trimLoop(makePlane(triA - maxDistanceLimitNegNormalDir * n, -n), poly, polyLength);
-
-    return polyLength;
-}
-
-// Running min with a +-tolerance averaging band: a strictly deeper point RESTARTS the average,
-// a near-tie ACCUMULATES into it without moving minDist.  A fully clipped-away polygon leaves
-// minDist at 1e9, which fails the `sep < cDistance` gate (the 0/0 in the average is unused).
-float3 getDeepestPointSimplified(float3 poly[8], int polyLength, float4 plane, float tolerance,
-                                 out float minDist)
-{
-    minDist = 1000000000.0f;
-    float3 deepestPoint = float3(0, 0, 0);
-    int count = 0;
-    for (int i = 0; i < polyLength; ++i)
-    {
-        const float d = planeDistance(plane, poly[i]);
-        if (d < minDist - tolerance)
-        {
-            minDist = d;
-            deepestPoint = poly[i];
-            count = 1;
-        }
-        else if (d < minDist + tolerance)
-        {
-            deepestPoint += poly[i];
-            count++;
-        }
-    }
-    deepestPoint /= float(count);
-    return deepestPoint;
-}
-
-struct FemContact
-{
-    float3 position;
-    float3 normal;
-    float separation;
-    float4 barycentric;
-}
-
-// staticTriangleVsClothCollision (femClothPrimitives.cu:3605).
-bool staticTriangleVsClothCollision(float3 localA0, float3 localB0, float3 localC0,
-                                    float3 a1, float3 b1, float3 c1,
-                                    float4 clothQ, float3 clothP, float cDistance,
-                                    out FemContact contact)
-{
-    float3 convexPoly[8];
-    convexPoly[0] = a1;
-    convexPoly[1] = b1;
-    convexPoly[2] = c1;
-    for (int k = 3; k < 8; ++k)
-        convexPoly[k] = float3(0, 0, 0);
-
-    const float3 fixNormal = cgGetNormalized(cross(localB0 - localA0, localC0 - localA0));
-    const float4 staticTrianglePlane = makePlane(localA0, fixNormal);
-
-    const int numPolyCorners =
-        trimTriangleByTriangle(convexPoly, 3, localA0, localB0, localC0, cDistance, cDistance);
-
-    float sep;
-    const float3 deepestPoint = getDeepestPointSimplified(convexPoly, numPolyCorners,
-                                                          staticTrianglePlane, 0.01f * cDistance, sep);
-
-    const bool hasContact = sep < cDistance;
-
-    contact.position = float3(0, 0, 0);
-    contact.normal = float3(0, 0, 0);
-    contact.separation = 0.0f;
-    contact.barycentric = float4(0, 0, 0, 0);
-    if (hasContact)
-    {
-        computeBarycentric(a1, b1, c1, deepestPoint, contact.barycentric);
-        contact.position = transformPt(clothQ, clothP, deepestPoint);
-        contact.normal = quatRotate(clothQ, fixNormal);
-        contact.separation = sep;
-    }
-    return hasContact;
-}
-
-// PxgFEMContactWriter::writeRigidVsDeformableContact32 (PxgFEMCore.h:501).  The 32-bit sort
-// lane only: `contactSortedByX` takes the LOW WORD of the rigid node index and the u64
-// `contactByX` / `tempContactByX` keys are deliberately left alone — this path's radix sort
-// does not read them.  setRigidMaterialIndex(mat) followed by markInCollision(false) collapses
-// to a single store of (mat & 0x7fffffff).
 void writeRigidVsDeformableContact32(uint index, float4 contact, float4 normalPen, float4 bary,
                                      uint2 pairInd0, uint pairInd1, uint rigidMaterialIndex,
                                      uint contactSortedByRigid)
