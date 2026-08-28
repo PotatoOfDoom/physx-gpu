@@ -291,15 +291,23 @@ void cloth_selfCollisionMidphaseVTLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
             const uint data = bvData(treeAddr, nodeIdx, leafOffset);
             const uint nbPrimitives = bvDataNbPrimitives(data);
             const uint primStartIndex = bvDataPrimStart(data);
+            // P9.28: the `!= 0xffffffff` guard below is PER-LANE, so this platform turns it
+            // into a mask and issues the reads under it for the EXCLUDED lanes too -- at
+            // primStartIndex + 0xffffffff, sixty-four gigabytes out for a uint4 array.
+            // `safePrim` is the ADDRESS those reads use; the sentinel still decides the
+            // VALUE, so nothing observable changes.  Traced from a reproducible sporadic
+            // SIGSEGV, not from reading.
             uint primitiveIndex = 0xffffffffu;
             if (lane < nbPrimitives)
                 primitiveIndex = lane + primStartIndex;
+            const uint safePrim = min(primitiveIndex,
+                                      primStartIndex + max(nbPrimitives, 1u) - 1u);
 
             // ClothTreeVertexTraverser::intersectPrimitiveFullWarp (self path).
             bool intersect = false;
             if (primitiveIndex != 0xffffffffu)
             {
-                const uint4 triIdx1 = triIndices[primitiveIndex];
+                const uint4 triIdx1 = triIndices[safePrim];
                 const bool vtInTri = (vertexIdx == triIdx1.x) || (vertexIdx == triIdx1.y) || (vertexIdx == triIdx1.z);
                 if (!vtInTri)
                 {
@@ -482,9 +490,17 @@ void cloth_selfCollisionMidphaseEELaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
             const uint data = bvData(treeAddr, nodeIdx, leafOffset);
             const uint nbPrimitives = bvDataNbPrimitives(data);
             const uint primStartIndex = bvDataPrimStart(data);
+            // P9.28: the `!= 0xffffffff` guard below is PER-LANE, so this platform turns it
+            // into a mask and issues the reads under it for the EXCLUDED lanes too -- at
+            // primStartIndex + 0xffffffff, sixty-four gigabytes out for a uint4 array.
+            // `safePrim` is the ADDRESS those reads use; the sentinel still decides the
+            // VALUE, so nothing observable changes.  Traced from a reproducible sporadic
+            // SIGSEGV, not from reading.
             uint primitiveIndex = 0xffffffffu;
             if (lane < nbPrimitives)
                 primitiveIndex = lane + primStartIndex;
+            const uint safePrim = min(primitiveIndex,
+                                      primStartIndex + max(nbPrimitives, 1u) - 1u);
 
             // ClothTreeEdgeTraverser::intersectPrimitiveFullWarp (self path).
             uint2 localEdgeIndices[9];   // up to 3x3 edge pairs
@@ -492,7 +508,7 @@ void cloth_selfCollisionMidphaseEELaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
 
             if (primitiveIndex != 0xffffffffu && (t0_index > primitiveIndex))
             {
-                const uint4 triVertexIdx1 = triIndices[primitiveIndex];
+                const uint4 triVertexIdx1 = triIndices[safePrim];
                 const uint edgeAuthorship1 = triVertexIdx1.w;
                 const uint vIndices1[3] = { triVertexIdx1.x, triVertexIdx1.y, triVertexIdx1.z };
                 const float3 t1_points[3] = { meshVerts[vIndices1[0]].xyz, meshVerts[vIndices1[1]].xyz,

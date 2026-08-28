@@ -147,6 +147,30 @@ def bounds(kind, cond, var):
         op = m.group(1)
         if (op in ('<=', '<')) == (kind == 'escape'):
             return True
+
+    # A SENTINEL guard.  `if (primitiveIndex != 0xffffffffu) { indices[primitiveIndex] }`
+    # is a per-lane guard on a BDA read exactly like a range check, and it is WORSE:
+    # the excluded lanes do not merely run past the end, they carry 0xffffffff, so
+    # the speculated address is base + 0xffffffff * stride -- SIXTY-FOUR GIGABYTES
+    # out for a uint4 array.  Whether that faults depends on the process layout,
+    # which is why it shows up as a sporadic crash under concurrency and not as a
+    # deterministic one.
+    #
+    # This was missed for a simple reason: the loop above asks whether the guard
+    # BOUNDS the index, and `!=` against a constant does not bound anything, so
+    # every such site was skipped rather than tiered.  Found in P9.28 by tracing an
+    # actual reproducible SIGSEGV back to femClothMeshVertMidphaseBda, then
+    # grepping the corpus and finding ELEVEN shaders with the same shape.
+    #
+    # Deliberately narrow: only a comparison against a large constant sentinel
+    # counts.  `!= 0` is the null-pointer idiom this port uses everywhere and is
+    # not this bug.
+    for m in re.finditer(r'(?<![.\w])' + v + r'\s*(==|!=)\s*(0x[fF]{6,8}u?|4294967295u?)', cond):
+        if (m.group(1) == '==') == (kind == 'escape'):
+            return True
+    for m in re.finditer(r'(0x[fF]{6,8}u?|4294967295u?)\s*(==|!=)\s*' + v + r'(?![\w])', cond):
+        if (m.group(2) == '==') == (kind == 'escape'):
+            return True
     return False
 
 
@@ -261,22 +285,45 @@ def params_of(header):
 
 
 def launch_rooted(body, var, depth=0):
-    """Is `var` assigned, in this body, from something rooted in a thread id?"""
+    """Is EVERY assignment of `var` in this body rooted in a thread id?
+
+    EVERY, not any -- and that distinction is the whole point.  The first version
+    asked "any", and it let this through:
+
+        uint primitiveIndex = 0xffffffffu;          // <- a SENTINEL
+        if (lane < nbPrimitives)
+            primitiveIndex = lane + primStartIndex; // <- launch-rooted
+        if (primitiveIndex != 0xffffffffu)
+            const uint4 mTri = meshIndices[primitiveIndex];
+
+    One assignment IS a thread id, so the site was tiered LOW-launch with the
+    reason "overshoot < one workgroup".  The excluded lanes do not carry a thread
+    id at all: they carry 0xffffffff, and llvmpipe's mask issues the load for them
+    anyway, at base + 0xffffffff * 16 -- SIXTY-FOUR GIGABYTES out.  Whether that
+    faults depends on the process layout, which is why P9.28 found it as a
+    sporadic SIGSEGV under concurrency rather than as a deterministic one.
+
+    Requiring every assignment is what an "overshoot" claim actually needs: it is
+    a statement about the WORST value the index can take, and a single well-behaved
+    assignment says nothing about that.
+    """
     if depth > 6:
         return False
+    seen = False
     for m in re.finditer(r'(?:(?<=[;{}()])|^)\s*(?:const\s+)?(?:[A-Za-z_][\w<>:]*\s+)?' +
                          re.escape(var) + r'\s*(?<![=!<>+\-*/&|^])=(?!=)\s*([^;]{1,200});', body):
         rhs = m.group(1)
+        seen = True
         if SV_SEED.search(rhs):
-            return True
-        for r in index_roots(rhs):
-            if r != var and launch_rooted(body, r, depth + 1):
-                return True
+            continue
+        if any(r != var and launch_rooted(body, r, depth + 1) for r in index_roots(rhs)):
+            continue
+        return False        # an assignment nothing bounds -- e.g. a sentinel
     # `for (var = tid; ...)`
     for m in re.finditer(r'\bfor\s*\([^;]*\b' + re.escape(var) + r'\s*=\s*([^;]{1,120});', body):
         if SV_SEED.search(m.group(1)):
-            return True
-    return False
+            seen = True
+    return seen
 
 
 CONSTBOUND = re.compile(r'(?:<=|<|>=|>|==|!=)\s*(\d+u?|[A-Z][A-Z0-9_]{2,})\s*\)?\s*$')

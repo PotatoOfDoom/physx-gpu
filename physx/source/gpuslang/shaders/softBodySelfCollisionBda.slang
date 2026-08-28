@@ -351,6 +351,14 @@ void sb_selfCollisionMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, 
                 uint primitiveIndex = 0xffffffffu;
                 if (lane < nbPrimitives)
                     primitiveIndex = lane + primStartIndex;
+                // P9.28: the `!= 0xffffffff` guard below is PER-LANE, so this platform turns it
+                // into a mask and issues the reads under it for the EXCLUDED lanes too -- at
+                // primStartIndex + 0xffffffff, sixty-four gigabytes out for a uint4 array.
+                // `safePrim` is the ADDRESS those reads use; the sentinel still decides the
+                // VALUE, so nothing observable changes.  Traced from a reproducible sporadic
+                // SIGSEGV, not from reading.
+                const uint safePrim = min(primitiveIndex,
+                                          primStartIndex + max(nbPrimitives, 1u) - 1u);
 
                 // SbMeshTreeTraverser::intersectPrimitiveFullWarp
                 // (softbodySoftbodyMidPhase.cu:359).
@@ -362,7 +370,7 @@ void sb_selfCollisionMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, 
                     float3 closestP = float3(0, 0, 0);
                     float3 normal = float3(0, 0, 0);
 
-                    const uint4 tetIdx1 = tetIndices[primitiveIndex];
+                    const uint4 tetIdx1 = tetIndices[safePrim];
                     const uint hint = byteAt(surfaceHintBase, primitiveIndex);
 
                     // Don't generate contacts with a tet the query vertex belongs to.
@@ -423,7 +431,7 @@ void sb_selfCollisionMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, 
 
                                     if (bHasCollision)
                                     {
-                                        const float stress = tetraStresses[primitiveIndex];
+                                        const float stress = tetraStresses[safePrim];
                                         if (stress > selfCollisionStressTolerance)
                                             bHasCollision = false;
                                     }

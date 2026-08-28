@@ -410,10 +410,18 @@ void sb_meshMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
                 uint primitiveIndex = 0xffffffffu;
                 if (lane < nbPrimitives)
                     primitiveIndex = lane + primStartIndex;
+                // P9.28: the `!= 0xffffffff` guard below is PER-LANE, so this platform turns it
+                // into a mask and issues the reads under it for the EXCLUDED lanes too -- at
+                // primStartIndex + 0xffffffff, sixty-four gigabytes out for a uint4 array.
+                // `safePrim` is the ADDRESS those reads use; the sentinel still decides the
+                // VALUE, so nothing observable changes.  Traced from a reproducible sporadic
+                // SIGSEGV, not from reading.
+                const uint safePrim = min(primitiveIndex,
+                                          primStartIndex + max(nbPrimitives, 1u) - 1u);
 
                 if (primitiveIndex != 0xffffffffu)
                 {
-                    const uint4 triIdx = triIndices[primitiveIndex];
+                    const uint4 triIdx = triIndices[safePrim];
                     const float3 v0 = triVerts[triIdx.x].xyz;
                     const float3 v1 = triVerts[triIdx.y].xyz;
                     const float3 v2 = triVerts[triIdx.z].xyz;

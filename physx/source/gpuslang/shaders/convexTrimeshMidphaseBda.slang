@@ -392,14 +392,22 @@ void midphaseGeneratePairs(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
                     // so does this.  See pxgSlangBv32's header.
                     const uint nbPrimitives = min(bvDataNbPrimitives(data), WARP);
                     const uint primStartIndex = bvDataPrimStart(data);
+                    // P9.28: the `!= 0xffffffff` guard below is PER-LANE, so this platform turns it
+                    // into a mask and issues the reads under it for the EXCLUDED lanes too -- at
+                    // primStartIndex + 0xffffffff, sixty-four gigabytes out for a uint4 array.
+                    // `safePrim` is the ADDRESS those reads use; the sentinel still decides the
+                    // VALUE, so nothing observable changes.  Traced from a reproducible sporadic
+                    // SIGSEGV, not from reading.
                     uint primitiveIndex = 0xffffffffu;
                     if (lane < nbPrimitives)
                         primitiveIndex = lane + primStartIndex;
+                    const uint safePrim = min(primitiveIndex,
+                                              primStartIndex + max(nbPrimitives, 1u) - 1u);
 
                     bool primitiveIntersects = false;
                     if (primitiveIndex != 0xffffffffu)
                     {
-                        const uint4 triIdx = triIndices[primitiveIndex];
+                        const uint4 triIdx = triIndices[safePrim];
                         const float3 triV0 = triVerts[triIdx.x].xyz;
                         const float3 triV1 = triVerts[triIdx.y].xyz;
                         const float3 triV2 = triVerts[triIdx.z].xyz;

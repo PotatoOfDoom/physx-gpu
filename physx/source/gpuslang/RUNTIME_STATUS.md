@@ -1719,6 +1719,109 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.28 — achtzehn Wächter, die keine sind: ein Sentinel vor einem BDA-Zugriff, und eine Hypothese, die sich nicht bestätigt hat
+
+Manifest unverändert **368**. Kein neuer Kernel — diese Tranche repariert eine
+Klasse **undefinierten Verhaltens**, die durch den ganzen Korpus läuft, und
+verbessert den Prüfer, der sie übersehen hat.
+
+### Das Muster
+
+```slang
+uint primitiveIndex = 0xffffffffu;              // ein SENTINEL
+if (lane < nbPrimitives)
+    primitiveIndex = lane + primStartIndex;
+if (primitiveIndex != 0xffffffffu)
+    const uint4 mTri = meshIndices[primitiveIndex];   // BDA
+```
+
+Der Wächter ist **pro Bahn**. Diese Plattform macht daraus eine **Maske** und
+führt das Laden auch für die ausgeschlossenen Bahnen aus — bei
+`base + 0xffffffff * 16`, also **vierundsechzig Gigabyte** daneben. Ob das kracht,
+hängt vom Prozess-Layout ab.
+
+**Achtzehn Stellen in fünfzehn Shadern.** Sechzehn davon sind exakt dieses
+BV32-Blattmuster; zwei sitzen in der Artikulation, wo eine davon **in der
+`while`-Bedingung selbst** steht — und `&&` über einen bahnabhängigen Operanden
+ist eine Maske, kein Kurzschluss, also wird die rechte Seite für genau die
+Bahnen ausgewertet, die die linke ausgeschlossen hat.
+
+### Warum der Prüfer sie nicht fand — ein benennbarer Defekt
+
+`launch_rooted` fragte, ob **irgendeine** Zuweisung an einer Thread-Kennung hängt.
+Eine tut es. Die andere setzt den Sentinel.
+
+> Eine Aussage über den **Überschuss** ist eine Aussage über den **schlimmsten**
+> Wert. Eine einzige wohlerzogene Zuweisung sagt darüber nichts.
+
+Die Regel heißt jetzt **„jede"** statt „irgendeine". Mehr war nicht nötig: keine
+neue Heuristik, keine neue Einstufung, keine Schwelle zum Drehen.
+
+Und der Kontrast, der zeigt, dass die Regel scharf ist statt breit:
+`femClothRefitBda` hat denselben Wächter **ohne** Sentinel
+(`primitiveIndex = idx + startIndex`), also einen Überschuss von höchstens 31
+Primitiven — und wird zu Recht **nicht** gemeldet. **Der Sentinel macht es
+katastrophal, nicht der Wächter.**
+
+### Die Reparatur
+
+Das Muster aus P9.22: die **Adresse** klemmen, den Sentinel weiter den **Wert**
+entscheiden lassen. Damit ändert sich nichts Beobachtbares — und genau deshalb
+kann weder eine Vorrichtung noch ein Mutant den Unterschied sehen, weshalb der
+Prüfer die einzige Stelle ist, an der das gehalten wird.
+
+Wo eine Zahl greifbar war, wird auf sie geklemmt; wo keine war (`shapeSimPool`
+führt keinen Zähler im Paket), auf **Index 0** — gültig, solange der Pool nicht
+leer ist, was die umgebende Phase garantiert. Das ist eine schwächere Klemmung,
+und sie steht als solche im Kommentar.
+
+### Die Hypothese, die sich NICHT bestätigt hat
+
+Ich bin auf dieses Muster gekommen, weil ich den sporadischen Absturz aus P9.27b
+verfolgt habe, und ich hielt es für dessen Ursache. **Gemessen:**
+
+| | Abstürze |
+|---|---|
+| vor der Reparatur | **8 / 48** |
+| nach der Reparatur | **8 / 48** |
+
+Unverändert. Die Reparatur ist echt und richtig — undefiniertes Verhalten ist
+weg, und der Prüfer hält es jetzt —, aber sie ist **nicht** die Ursache des
+Absturzes. Das steht hier, weil die Reparatur unter dieser Annahme gemacht wurde.
+
+### Was der Absturz stattdessen ist, so weit die Belege reichen
+
+* **Fehleradresse `0x7f6cdebf4000`, rip `0x7f6cdebf6767`** — die Adresse ist
+  **seitenausgerichtet** und liegt **9,6 KiB unter** dem Befehlszeiger. Das ist
+  eine **Stapelschutzseiten**-Signatur, kein wilder Datenzugriff: ein falscher
+  BDA-Index landet Megabyte oder Gigabyte entfernt, nicht eine Seite unter dem
+  laufenden Code.
+* **Der abstürzende Test wandert** — erst `femClothSimMeshVertMidphase`, dann
+  `femClothSimTriMidphase`. Ein einzelner falscher Zugriff in einem Shader
+  wandert nicht.
+* **Er skaliert mit der Zahl der llvmpipe-Arbeiter:** 2/24 bei einem oder zwei
+  Threads, 5/24 voreingestellt.
+
+Zusammen deutet das auf eine **erschöpfte Ressource pro Thread** — am ehesten der
+Stapel eines llvmpipe-Arbeiters — unter vierfacher Prozess-Nebenläufigkeit, und
+nicht auf einen Zugriff außerhalb der Grenzen in irgendeinem portierten Shader.
+
+Damit ist auch meine frühere Einordnung „P9.22s Signatur" **falsch**: in beiden
+Fällen liegt der Rahmen in JIT-Code, aber die Fehleradresse erzählt eine andere
+Geschichte. Die nächsten Schritte stehen in der Aufgabe, nach Aufwand sortiert —
+und der erste ist `ulimit -s` und die Stapelgröße der Arbeiter, nicht noch mehr
+Shader-Lesen.
+
+### Verifikation
+
+* Prüfer meldet nach der Reparatur **null**, Selbsttest weiterhin grün (der
+  P9.22-Zugriff bleibt HIGH);
+* Suite **821/821** im Vorgabemodus; der zweite Speichermodus lief beim Committen
+  noch — Zahl im Nachtrag, nicht vorweg behauptet;
+* die achtzehn Änderungen sind **beobachtungsneutral** — geklemmt wird die
+  Adresse, nicht der Wert — und die bestehenden Vorrichtungen der fünfzehn Shader
+  bleiben unverändert grün, was genau das prüft.
+
 ## P9.27b — die beiden Kontakterzeuger, zwei Hebungen, und ein sporadischer Absturz, der mir gehört
 
 Manifest **366 → 368**. Die Tuch-gegen-Höhenfeld-Kette ist damit **vollständig**:

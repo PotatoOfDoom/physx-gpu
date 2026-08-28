@@ -249,12 +249,20 @@ void sb_clothVertMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint
                 uint primitiveIndex = 0xffffffffu;
                 if (lane < nbPrimitives)
                     primitiveIndex = lane + primStartIndex;
+                // P9.28: the `!= 0xffffffff` guard below is PER-LANE, so this platform turns it
+                // into a mask and issues the reads under it for the EXCLUDED lanes too -- at
+                // primStartIndex + 0xffffffff, sixty-four gigabytes out for a uint4 array.
+                // `safePrim` is the ADDRESS those reads use; the sentinel still decides the
+                // VALUE, so nothing observable changes.  Traced from a reproducible sporadic
+                // SIGSEGV, not from reading.
+                const uint safePrim = min(primitiveIndex,
+                                          primStartIndex + max(nbPrimitives, 1u) - 1u);
 
                 // SoftbodyBoxTraverser::intersectPrimitiveFullWarp.
                 bool intersect = false;
                 if (primitiveIndex != 0xffffffffu)
                 {
-                    const uint4 tetIdx = tetIndices[primitiveIndex];
+                    const uint4 tetIdx = tetIndices[safePrim];
                     const float3 w0 = tetVerts[tetIdx.x].xyz;
                     const float3 w1 = tetVerts[tetIdx.y].xyz;
                     const float3 w2 = tetVerts[tetIdx.z].xyz;

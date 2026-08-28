@@ -289,6 +289,14 @@ void sb_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
             uint primitiveIndex = 0xffffffffu;
             if (lane < nbPrimitives)
                 primitiveIndex = lane + primStartIndex;
+            // P9.28: the `!= 0xffffffff` guard below is PER-LANE, so this platform turns it
+            // into a mask and issues the reads under it for the EXCLUDED lanes too -- at
+            // primStartIndex + 0xffffffff, sixty-four gigabytes out for a uint4 array.
+            // `safePrim` is the ADDRESS those reads use; the sentinel still decides the
+            // VALUE, so nothing observable changes.  Traced from a reproducible sporadic
+            // SIGSEGV, not from reading.
+            const uint safePrim = min(primitiveIndex,
+                                      primStartIndex + max(nbPrimitives, 1u) - 1u);
 
             // SoftbodyTreeTraverser::intersectPrimitiveFullWarp (softbodyMidPhase.cu:82).
             bool intersect = false;
@@ -297,7 +305,7 @@ void sb_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
                 // Only SURFACE tetrahedra can touch a rigid; the interior is skipped.
                 if (surfaceHint(hintBase, primitiveIndex) != 0u)
                 {
-                    const uint4 tetIdx = tetmeshTetIndices[primitiveIndex];
+                    const uint4 tetIdx = tetmeshTetIndices[safePrim];
                     const float3 w0 = tetmeshVerts[tetIdx.x].xyz;
                     const float3 w1 = tetmeshVerts[tetIdx.y].xyz;
                     const float3 w2 = tetmeshVerts[tetIdx.z].xyz;

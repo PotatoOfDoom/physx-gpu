@@ -423,14 +423,31 @@ void artiUpdateKinematic(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId :
                 const PxgTransform28 body2Actor =
                     makeTransform28(float4(ba[0], ba[1], ba[2], ba[3]), float3(ba[4], ba[5], ba[6]));
 
+                // P9.28: THREE sentinel-guarded BDA reads, all clamped at the ADDRESS while
+                // the sentinels still decide the VALUE.
+                //
+                // `pos` is 0xFFFFFFFF both when the search misses and when `pos--` wraps
+                // from zero, and this platform turns a per-lane guard into a mask -- so
+                // nodeIndices[0xFFFFFFFF] and shapeIdx[0xFFFFFFFF] are issued anyway, at
+                // thirty-two and sixty-four gigabytes out.  The read inside the WHILE
+                // CONDITION is the worse of the two: `&&` over a per-lane operand is a
+                // mask and not a short circuit, so the right-hand side is evaluated for
+                // lanes the left-hand side excluded.
+                //
+                // shapeSimPool has no count in this pack, so its clamp is to index 0
+                // rather than to a bound -- valid whenever the pool is non-empty, which
+                // phase D's `numShapes != 0` guarantees.
+                const uint lastShape = gUk.numShapes - 1u;   // numShapes != 0 here
                 uint pos = binarySearchNodeIndexBda(nodeIndices, gUk.numShapes, linkNodeIndex);
 
-                while (pos != 0xFFFFFFFFu && all(nodeIndices[pos] == linkNodeIndex))
+                while (pos != 0xFFFFFFFFu &&
+                       all(nodeIndices[min(pos, lastShape)] == linkNodeIndex))
                 {
-                    const uint shapeIndex = shapeIdx[pos];
+                    const uint shapeIndex = shapeIdx[min(pos, lastShape)];
                     if (shapeIndex != 0xFFFFFFFFu)
                     {
-                        const PxgShapeSim shapeSim = shapeSimPool[shapeIndex];
+                        const PxgShapeSim shapeSim =
+                            shapeSimPool[shapeIndex != 0xFFFFFFFFu ? shapeIndex : 0u];
                         const PxgTransform28 absPos =
                             getAbsPose(body2World, shapeSim.mTransform, body2Actor);
                         updateCacheAndBoundBda(absPos, shapeSim, shapeIndex, cacheArray,

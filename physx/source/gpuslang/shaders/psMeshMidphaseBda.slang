@@ -582,11 +582,19 @@ void ps_meshCollisonLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
                     // traversal silently drops the rest.  `lane <` IS that clamp.
                     if (lane < nbPrimitives)
                         primitiveIndex = lane + primStartIndex;
+                    // P9.28: the `!= 0xffffffff` guard below is PER-LANE, so this platform turns it
+                    // into a mask and issues the reads under it for the EXCLUDED lanes too -- at
+                    // primStartIndex + 0xffffffff, sixty-four gigabytes out for a uint4 array.
+                    // `safePrim` is the ADDRESS those reads use; the sentinel still decides the
+                    // VALUE, so nothing observable changes.  Traced from a reproducible sporadic
+                    // SIGSEGV, not from reading.
+                    const uint safePrim = min(primitiveIndex,
+                                              primStartIndex + max(nbPrimitives, 1u) - 1u);
 
                     float3 tv0 = float3(0, 0, 0), tv1 = float3(0, 0, 0), tv2 = float3(0, 0, 0);
                     if (primitiveIndex != 0xffffffffu)
                     {
-                        const uint4 triIdx = triIndices[primitiveIndex];
+                        const uint4 triIdx = triIndices[safePrim];
                         tv0 = vertex2Shape(triVerts[triIdx.x].xyz, triScale, triScaleRot);
                         tv1 = vertex2Shape(triVerts[triIdx.y].xyz, triScale, triScaleRot);
                         tv2 = vertex2Shape(triVerts[triIdx.z].xyz, triScale, triScaleRot);
