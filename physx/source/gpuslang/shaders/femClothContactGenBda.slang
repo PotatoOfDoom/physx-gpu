@@ -1559,11 +1559,20 @@ void cloth_convexVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
 //     store -- so the emitted set is unchanged.  Same rule, and same reason, as
 //     the plane kernel's numRequiredThreads above.
 //
-// S5 -- SPECULATED PAIR LOAD (the P9.22 / P9.28 class).  `pairs[i]` sits under
-//     `i < numPairs`, which on this platform is a MASK and not a branch, so the
-//     load is issued for the excluded lanes too.  The address is clamped and
-//     the guard is left to decide the VALUE -- clamping the index, not the
-//     result.  Without it the tail iterations of S4 read past the stack.
+// S5 -- the speculated pair load, and an honest bound on it.  `pairs[i]` sits
+//     under `i < numPairs`, which on this platform is a MASK and not a branch,
+//     so the load is issued for the excluded lanes too.  The address is clamped
+//     and the guard is left to decide the VALUE.
+//
+//     But this is the LOW class, not P9.28's.  `i` is launch-rooted and the S4
+//     bound rounds up to SPHTRI_BLOCK, so the overshoot is at most 127 pairs --
+//     about 2 KB past the stack -- and not a sentinel's 64 GiB.
+//     tools/check_speculated_loads.py rates the unclamped form LOW-launch, which
+//     was CHECKED by removing the clamp and re-running it, not assumed; and the
+//     mutation sweep reports the unclamped form as a survivor because nothing
+//     observable changes.  The clamp stays because it costs one min() and the
+//     class boundary is a property of the launch geometry rather than of the
+//     kernel -- but it is documented as belt-and-braces, not as a fix.
 //
 // S6 -- restDistance is indexed by cmIdx (from the pair's .x), contactDistance
 //     by the two cache refs and summed.  Same split as B6 / V6 above.

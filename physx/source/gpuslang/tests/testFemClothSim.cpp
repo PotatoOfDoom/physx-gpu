@@ -10486,7 +10486,19 @@ PXG_TEST(femClothSimSphereTriContactGen)
     // that matter; 40 and 42 are their sphere-side partners and are placed out of the
     // sphere's reach so they add nothing but the parity.
     const float PLANE_Z = -0.05f;                 // 0.30 below the segment: inside 0.40
-    addTri(V3{ 9.0f, 9.0f, 9.0f }, V3{ 9.5f, 9.0f, 9.0f }, V3{ 9.0f, 9.5f, 9.0f });   // 40, far away
+    // 40 -- the SPHERE's near-tangent case, and the only reason it is hand-placed:
+    // triSphereCollide guards its normal with `dist > 1e-8`, falling back to the
+    // triangle's own surface normal below that.  Every swept case has the sphere centre
+    // millimetres from the surface, so the guard was reached and never decided anything
+    // -- a mutant moving the threshold to 1e-4 survived.  Here the centre sits 1e-5
+    // BELOW a plane whose winding makes the surface normal point UP, so the two
+    // branches disagree in SIGN and not merely in the last bits.
+    {
+        const float Y = spP.y - 1.0e-5f;
+        addTri(V3{ spP.x - 1.0f, Y, spP.z - 1.0f },
+               V3{ spP.x,        Y, spP.z + 1.0f },
+               V3{ spP.x + 1.0f, Y, spP.z - 1.0f });
+    }
     // 41 -- BOTH projections interior: a slab wide enough to contain both endpoints,
     // parallel to the segment so the plane is never crossed (dMul > 0).
     addTri(V3{ -2.0f, -2.0f, PLANE_Z }, V3{ 2.0f, -2.0f, PLANE_Z }, V3{ 0.0f, 2.5f, PLANE_Z });
@@ -10494,7 +10506,55 @@ PXG_TEST(femClothSimSphereTriContactGen)
     // 43 -- only q's projection interior: the same plane, but a triangle that covers the
     // q end of the segment and not the p end.
     addTri(V3{ -1.2f, -0.3f, PLANE_Z }, V3{ -0.2f, -0.3f, PLANE_Z }, V3{ -0.7f, 0.7f, PLANE_Z });
+    // A SECOND fan, aimed at the capsule from many directions with SMALL triangles.
+    // The first fan's triangles are large enough that the capsule almost always lands
+    // on their interior, so the edge machinery under distanceSegmentTriangleSquared --
+    // the three segment-segment calls, their clamps, and the edge pick -- was reached
+    // but never decided anything.  Six mutants survived on exactly that.  Small
+    // triangles ringing the axis put the closest feature on an EDGE or a VERTEX.
+    {
+        const V3 dir{ std::cos(0.35f) * std::cos(0.35f) - std::sin(0.35f) * std::sin(0.35f),
+                      2.0f * std::sin(0.35f) * std::cos(0.35f), 0.0f };   // basis0(capQ)
+        const V3 up{ 0.0f, 0.0f, 1.0f };
+        const V3 side = crs(dir, up);
+        for (uint32_t j = 0; j < 24u; ++j)
+        {
+            const float along = (float(j) / 23.0f * 2.0f - 1.0f) * CAP_HALF * 1.15f;
+            const float ang = float(j) * 0.5236f;                 // 30 degrees apart
+            const float rad = 0.30f + 0.04f * float(j % 3u);
+            const V3 centre = add(add(capP, scl(dir, along)),
+                                  add(scl(side, std::cos(ang) * rad), scl(up, std::sin(ang) * rad)));
+            const float sz = 0.11f + 0.01f * float(j % 4u);
+            const V3 e0 = add(scl(side, std::cos(ang + 1.1f)), scl(up, std::sin(ang + 1.1f)));
+            const V3 e1 = add(scl(dir, 0.7f), scl(up, 0.3f));
+            addTri(add(centre, scl(e0, sz)),
+                   add(centre, scl(e1, sz)),
+                   add(centre, scl(add(e0, e1), -sz * 0.6f)));
+        }
+    }
+    // One more, for the last branch a swept triangle cannot reach:
+    // distanceSegmentSegmentSquared's PARALLEL case, where the closest-point system is
+    // singular and the CUDA picks the segment midpoint (0.5) rather than an endpoint.
+    // Edge ab below runs exactly along the capsule's own axis, so denom cancels to
+    // zero and `eps > denom` fires.  A mutant replacing that 0.5 with 0.0 survived
+    // every swept triangle, because none of them had an edge parallel to the axis.
+    {
+        const V3 dir{ std::cos(0.35f) * std::cos(0.35f) - std::sin(0.35f) * std::sin(0.35f),
+                      2.0f * std::sin(0.35f) * std::cos(0.35f), 0.0f };
+        const V3 up{ 0.0f, 0.0f, 1.0f };
+        const V3 side = crs(dir, up);
+        const V3 base = add(capP, scl(side, 0.30f));
+        addTri(sub(base, scl(dir, 0.25f)), add(base, scl(dir, 0.25f)), add(base, scl(up, 0.55f)));
+    }
     const uint32_t NB_TRIS = uint32_t(ci.size());
+
+    // Which contact manager each triangle is tested against.  The fan alternates, as
+    // before; every hand-placed triangle from index NB_FAN on is aimed at the CAPSULE,
+    // because they exist for the capsule core's branches.  Index parity used to decide
+    // this, which meant a case could only be aimed by choosing its position in the list.
+    std::vector<uint32_t> triCm(NB_TRIS, 1u);
+    for (uint32_t i = 0; i < NB_FAN; ++i) triCm[i] = (i & 1u);
+    triCm[40u] = 0u;                     // the near-tangent SPHERE case, below
     DevBuf bCv = makeDev(dev, cv);
     if (!bCv.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bCv.h); return; }
     DevBuf bCi = makeDev(dev, ci);
@@ -10581,8 +10641,9 @@ PXG_TEST(femClothSimSphereTriContactGen)
     std::vector<uint32_t> stack(NB_FOUND * 4u, 0u);
     for (uint32_t i = 0; i < NB_FOUND; ++i)
     {
-        stack[i * 4 + 0] = (i & 1u);                        // alternate the two managers
-        stack[i * 4 + 1] = (i < NB_TRIS) ? i : 0u;
+        const uint32_t tri = (i < NB_TRIS) ? i : 0u;
+        stack[i * 4 + 0] = triCm[tri];
+        stack[i * 4 + 1] = tri;
     }
     DevBuf bStack = makeDev(dev, stack);
     std::vector<uint32_t> nFound = { NB_FOUND };
@@ -10750,7 +10811,7 @@ PXG_TEST(femClothSimSphereTriContactGen)
         const V3 fb{ cv[FILTERED_TRI * 3 + 1].x, cv[FILTERED_TRI * 3 + 1].y, cv[FILTERED_TRI * 3 + 1].z };
         const V3 fc{ cv[FILTERED_TRI * 3 + 2].x, cv[FILTERED_TRI * 3 + 2].y, cv[FILTERED_TRI * 3 + 2].z };
         Hit fh{};
-        const bool wouldHit = ((FILTERED_TRI & 1u) == 0u)
+        const bool wouldHit = (triCm[FILTERED_TRI] == 0u)
             ? triSphere(fa, fb, fc, spP, SP_RADIUS, CD_CLOTH + CD_SPHERE, fh)
             : triCapsule(capQ, capP, CAP_HALF, CAP_RADIUS, fa, fb, fc, CD_CLOTH + CD_CAPSULE, fh);
         PXG_CHECK_MSG(wouldHit,
@@ -10819,7 +10880,7 @@ PXG_TEST(femClothSimSphereTriContactGen)
         const uint32_t GRID = 1024u, BLOCK = 128u;
         const uint32_t STRIDE = GRID * BLOCK;             // 131072, the shader's constant
         const uint32_t TAIL = 8u;
-        const uint32_t FAR_TRI = 40u;                     // placed at (9,9,9): no contact
+        const uint32_t FAR_TRI = 0u;                      // measured below as contact-free
         const uint32_t HIT_TRI = 4u;                      // measured above as contacting
 
         std::vector<uint32_t> big(size_t(STRIDE + TAIL) * 4u, 0u);
