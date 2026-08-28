@@ -89,7 +89,15 @@ public bool isPointOutsideOfPlane4(float3 p, float3 a, float3 b, float3 c, float
            (signa2 * signd2 >= 0.0f) && (signa3 * signd3 >= 0.0f);
 }
 
-float3 closestPtPointTriangle2(float3 p, float3 a, float3 b, float3 c, float3 ab, float3 ac)
+// P9.30 made this PUBLIC.  It is Gu::closestPtPointTriangle2
+// (GuDistancePointTriangle.h:44) verbatim, including the final association
+// `(a + ab*v) + ac*w`, and femClothPsContactGenBda needs exactly it.  Four
+// copies of this function already exist in the corpus; three are in Phase-1
+// descriptor-set shaders and stay there by the recorded rule, and the fourth is
+// in psMeshMidphaseBda, a BDA shader that should move onto this one the next
+// time it is touched -- noted rather than changed inside a tranche about
+// cloth-vs-particle.
+public float3 closestPtPointTriangle2(float3 p, float3 a, float3 b, float3 c, float3 ab, float3 ac)
 {
     const float3 ap = p - a;
     const float d1 = dot(ab, ap);
