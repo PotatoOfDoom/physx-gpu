@@ -121,6 +121,50 @@ GATED = [
 # P9.27b moved its one entry into GATED.  See "NOTES ARE NOT GATES" above.
 NOTED = []
 
+# ---------------------------------------------------------------------------
+# A THIRD KIND OF DISABLEMENT, found in P9.29: the HOST LAUNCH SITE.
+#
+# cloth_SphereVertexContactGenLaunch is a complete, live device function -- its
+# `hasContacts` equivalent is assigned on a live line, so everything above reads
+# it as LIVE and says so correctly.  It still never runs, because the host wraps
+# its launch in `if (0)`:
+#
+#     if (1)  // contact gen                      PxgNarrowphaseCore.cpp:5735
+#     { ... getCuFunction(PxgKernelIds::CLOTH_SPHERE_CG) ... }
+#
+#     if (0)  // cloth vertex vs. sphere contact gen.          :5774
+#     { ... getCuFunction(PxgKernelIds::CLOTH_VERT_SPHERE_CG) ... }
+#
+# No amount of reading the .cu finds that, which is exactly why it needs its own
+# table: the two mechanisms live in different files and neither checker sees the
+# other's.  What the port depends on here is weaker than for GATED -- the vertex
+# kernel IS ported, and its eCAPSULE branch is deliberately incomplete -- so the
+# claim being kept true is "nothing in the engine can reach that gap".
+#
+# The check is deliberately EXHAUSTIVE rather than per-entry: it brace-matches
+# every `if (0)` in the host file and demands that the set of kernels launched
+# inside them is exactly this table.  A new one appearing anywhere fails the
+# build and gets read, which is how this one was found in the first place.
+CPP = 'physx/source/gpunarrowphase/src/PxgNarrowphaseCore.cpp'
+
+HOST_GATED = [
+    {
+        'rel': CPP,
+        'enum': 'CLOTH_VERT_SPHERE_CG',
+        'kernel': 'cloth_SphereVertexContactGenLaunch',
+        'depends':
+            'femClothContactGenBda.slang ports this kernel with its eCAPSULE branch '
+            'DEFERRED (a sphere-only body).  That gap is unreachable only while the '
+            'host launch stays inside `if (0)`; the day it does not, the capsule '
+            'branch has to be written and given a fixture.',
+    },
+]
+
+# The host-side LIVE control: the sibling launched from `if (1)` in the same
+# function, three lines up.  If the scanner ever reports THIS one as gated it is
+# matching text rather than structure, and its findings mean nothing.
+HOST_LIVE_CONTROLS = ['CLOTH_SPHERE_CG']
+
 # Kernels that ARE live, analysed by the same code so that a green run proves
 # this checker can still tell the two states apart.
 LIVE_CONTROLS = [
@@ -292,6 +336,139 @@ def output_index_still_gated(src, verbose):
     return ok
 
 
+def host_gated_launches(cpp_src):
+    """Every kernel launched inside an `if (0)` block, brace-matched.
+
+    Returns (gated_enums, n_zero_blocks).  Comments are stripped first, so a
+    commented-out `if (0)` cannot manufacture a finding; the block is then
+    matched on braces rather than indentation, because several of these blocks
+    nest further `if`s.
+    """
+    live = strip_comments(cpp_src)
+    gated, blocks = set(), 0
+    for m in re.finditer(r'\bif\s*\(\s*0\s*\)', live):
+        blocks += 1
+        j = m.end()
+        while j < len(live) and live[j].isspace():
+            j += 1
+        if j >= len(live) or live[j] != '{':
+            continue                     # a braceless `if (0) stmt;` -- no launch
+        depth, k = 0, j
+        while k < len(live):
+            if live[k] == '{':
+                depth += 1
+            elif live[k] == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        body = live[j:k]
+        for f in re.finditer(r'getCuFunction\s*\(\s*PxgKernelIds::(\w+)\s*\)', body):
+            gated.add(f.group(1))
+    return gated, blocks
+
+
+def check_host_gates(verbose):
+    """The `if (0)` launch sites, checked as a SET rather than one by one."""
+    path = os.path.join(ROOT, CPP)
+    if not os.path.exists(path):
+        print('  MISSING  %s -- the host launch gates cannot be checked.' % CPP)
+        return False
+    cpp_src = open(path).read()
+    gated, blocks = host_gated_launches(cpp_src)
+    expected = {e['enum'] for e in HOST_GATED}
+
+    ok = True
+    for e in HOST_GATED:
+        if e['enum'] not in gated:
+            ok = False
+            print('  RE-ENABLED %s (%s) is no longer launched from an `if (0)` '
+                  'block.' % (e['enum'], e['kernel']))
+            print('           %s' % e['depends'])
+    for extra in sorted(gated - expected):
+        ok = False
+        print('  NEW-GATE %s is launched inside an `if (0)` block and is not in '
+              'HOST_GATED.  Read it: a kernel the engine never runs is a kernel '
+              'whose port cannot be validated by any scene.' % extra)
+
+    # the control, from the same scan rather than a separate one
+    for live_enum in HOST_LIVE_CONTROLS:
+        if live_enum in gated:
+            ok = False
+            print('  CONTROL  %s reads as host-gated, and it is launched from '
+                  '`if (1)` three lines from the gated one.  This scanner is '
+                  'matching text, not structure.' % live_enum)
+        elif not re.search(r'PxgKernelIds::' + re.escape(live_enum) + r'\b', cpp_src):
+            ok = False
+            print('  CONTROL  %s is not launched anywhere in %s any more, so it '
+                  'cannot serve as the live control.' % (live_enum, CPP))
+
+    if ok:
+        if verbose:
+            print('  OK       host gates: %d `if (0)` block(s), %d of them launch a '
+                  'kernel: %s (control %s is live)'
+                  % (blocks, len(gated), ', '.join(sorted(gated)) or '-none-',
+                     ', '.join(HOST_LIVE_CONTROLS)))
+        else:
+            print('  OK       %d `if (0)` host block(s), %d launching: exactly the '
+                  'expected set' % (blocks, len(gated)))
+    return ok
+
+
+def host_selftest():
+    """Calibrate the host-gate scanner on the REAL file, in three directions.
+
+    Same doctrine as the selftest below: a check that REASONS about a mutant can
+    be wrong, one that RUNS it cannot.  All three mutations are applied to the
+    source STRING -- the file on disk is never touched.
+
+      1. re-enable the gated launch  -> it must stop being reported;
+      2. gate the live control       -> it must start being reported;
+      3. comment the `if (0)` out    -> it must NOT be reported, which is what
+                                        separates reading structure from
+                                        grepping for two characters.
+    """
+    path = os.path.join(ROOT, CPP)
+    if not os.path.exists(path):
+        return 0                       # check_host_gates already said so
+    src = open(path).read()
+    gate_re = re.compile(r'if\s*\(\s*0\s*\)(\s*//\s*cloth vertex vs\. sphere)')
+    if not gate_re.search(src):
+        print('host selftest: cannot calibrate -- the `if (0)` before the cloth '
+              'vertex-sphere launch is gone.  See the finding above.')
+        return 2
+
+    revived = gate_re.sub(r'if (1)\1', src)
+    if 'CLOTH_VERT_SPHERE_CG' in host_gated_launches(revived)[0]:
+        print('HOST SELFTEST FAILED: turning the `if (0)` into `if (1)` did not '
+              'clear the finding -- this scanner cannot see a re-enabled launch, '
+              'which is the only thing it exists to see.')
+        return 2
+
+    live_re = re.compile(r'if\s*\(\s*1\s*\)(\s*//\s*contact gen)')
+    if not live_re.search(src):
+        print('host selftest: cannot calibrate -- the `if (1)` before the live '
+              'control launch is gone.')
+        return 2
+    killed = live_re.sub(r'if (0)\1', src)
+    if 'CLOTH_SPHERE_CG' not in host_gated_launches(killed)[0]:
+        print('HOST SELFTEST FAILED: gating the live control did not produce a '
+              'finding -- the scanner cannot see a newly disabled launch either.')
+        return 2
+
+    hidden = gate_re.sub(r'/* if (0) */ if (1)\1', src)
+    if 'CLOTH_VERT_SPHERE_CG' in host_gated_launches(hidden)[0]:
+        print('HOST SELFTEST FAILED: a COMMENTED-OUT `if (0)` still produced a '
+              'finding -- the scanner is grepping for two characters rather than '
+              'reading the code that runs.')
+        return 2
+
+    print('host selftest: re-enabling the gate clears it, gating the control '
+          'raises it, and a commented-out `if (0)` raises nothing.  All three '
+          'directions work.')
+    return 0
+
+
 def report(entry, src, verbose, gated):
     kernel, flag = entry['kernel'], entry['flag']
     state, why, ev = classify(src, kernel, flag)
@@ -405,7 +582,8 @@ def main():
     src = open(path).read()
 
     print('disabled-kernel check over %d gated claim(s), %d note(s), '
-          '%d live control(s)' % (len(GATED), len(NOTED), len(LIVE_CONTROLS)))
+          '%d live control(s), %d host gate(s)'
+          % (len(GATED), len(NOTED), len(LIVE_CONTROLS), len(HOST_GATED)))
     failures = 0
 
     for entry in GATED:
@@ -431,7 +609,12 @@ def main():
     if not output_index_still_gated(src, verbose):
         failures += 1
 
+    if not check_host_gates(verbose):
+        failures += 1
+
     if selftest():
+        failures += 1
+    if host_selftest():
         failures += 1
 
     if failures:

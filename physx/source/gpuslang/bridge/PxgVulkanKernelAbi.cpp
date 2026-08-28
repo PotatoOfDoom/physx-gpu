@@ -1694,6 +1694,13 @@ static const PxgKernelAbiRow kRows[] = {
     // about the ARGUMENT PACK only; check_cuda_twin_kernels.py is what claims two
     // bodies are one, and it is deliberately not extended to this name.
     { "cloth_convexVertexContactGenLaunch", kClothBoxTriCg, uint32_t(sizeof(kClothBoxTriCg)) },
+    // P9.29: a FOURTH name on the row.  cloth_SphereContactGenLaunch
+    // (femClothPrimitives.cu:520) takes the same fifteen arguments in the same
+    // order -- read against the launch pack at PxgNarrowphaseCore.cpp:5739, not
+    // inferred from the name.  Like the vertex-convex row above this is a claim
+    // about the ARGUMENT PACK only: the body runs sphere/capsule-vs-triangle and
+    // is unrelated to the other three.
+    { "cloth_SphereContactGenLaunch", kClothBoxTriCg, uint32_t(sizeof(kClothBoxTriCg)) },
     // gpunarrowphase FEMCloth-vs-rigid contact SORT / reorder (P7.1 tranche 4b-1 BDA)
     { "fem_reorderRigidContactsLaunch", kFemReorderRSContacts, uint32_t(sizeof(kFemReorderRSContacts)) },
     // gpusimulationcontroller FEMCloth-vs-rigid contact PREPARE + query/solve (P7.1 tranche 4b-2/3 BDA)

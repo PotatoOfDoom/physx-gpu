@@ -105,6 +105,12 @@ import pxgSlangSphereBox;      // P9.15a: spherebox, lifted out of fcStaticTriCl
 import pxgSlangBv32;           // P9.15b: the BV32 node reader (P8.25), shared
 import pxgSlangConvexTriCloth; // P9.15c: the lifted convex-vs-triangle core
 import pxgSlangVertexConvexCloth; // P9.21: the lifted vertex-vs-convex core
+// P9.29: for closestPtPointTriangle (deformableCollision.cuh:146, s/t out) --
+// the exact function triSphereCollide calls.  The module ALSO owns WARP and
+// PXG_CLOTH_ID_SHIFT, which this file used to declare for itself with the same
+// values; the local copies are gone rather than shadowed, so there is one
+// definition of each and the compiler, not a reader, enforces it.
+import pxgSlangClothMidphase;
 
 // PxGeometryType (PxGeometry.h): eSPHERE 0, ePLANE 1, eCAPSULE 2, ... eTRIANGLEMESH 8.
 static const uint GEOM_SPHERE = 0u;
@@ -113,14 +119,14 @@ static const uint GEOM_CAPSULE = 2u;
 static const uint GEOM_TRIANGLEMESH = 8u;
 
 // PXG_BITSHIFT_ELEMENT_ID (PxgSimulationCoreDesc.h:41) — the cloth-id / element
-// packing used by PxEncodeClothIndex(clothId, elem) = (clothId << 20) | elem.
-static const uint PXG_CLOTH_ID_SHIFT = 20u;
+// packing used by PxEncodeClothIndex(clothId, elem) = (clothId << 20) | elem —
+// and WARP below both come from pxgSlangClothMidphase now (P9.29); they used to
+// be declared here with identical values.
 
 // Launch geometry.
 //   midphase: grid (32, numTests, 1), block (WARP_SIZE=32, MIDPHASE_WARPS=2, 1).
 //   plane:    grid (numTests, 1, 1),  block (32, 16, 1) = 512.
 //   sphere:   grid (numTests, 1, 1),  block (32,  1, 1) = 32.
-static const uint WARP = 32u;
 static const uint MIDPHASE_WARPS = 2u;
 static const uint MIDPHASE_BLOCK = WARP * MIDPHASE_WARPS;      // 64
 static const uint MIDPHASE_GRID_X = 32u;
@@ -486,27 +492,47 @@ void cloth_midphaseGenerateVertexPairsLaunch(uint3 gtid : SV_GroupThreadID, uint
 // capacity-gated writeContactCore staging + the FEM-rigid contact-info tail.
 // pairInd0 == rigidId.getInd() (the plane/sphere callers pass them equal).
 // ---------------------------------------------------------------------------
-void writeRigidVsDeformableContact(uint index, float4 contact, float4 normalPen, float4 barycentric,
-                                   uint2 rigidId, uint pairInd1, uint rigidMaterialIndex)
+// P9.29 addressed the writer through an FcCtWriter (the public struct
+// pxgSlangConvexTriCloth already exports) rather than reading gCG directly, so
+// the SAME body serves the three vertex kernels below -- which live on the
+// ContactGenParams blob -- and cloth_SphereContactGenLaunch, which lives on the
+// ClothBoxTriParams blob.  The alternative was a second copy of these ten
+// stores differing only in which push-constant it names, which is the kind of
+// duplication that drifts silently.
+void cgWriteContact(FcCtWriter w, uint index, float4 contact, float4 normalPen, float4 barycentric,
+                    uint2 rigidId, uint pairInd1, uint rigidMaterialIndex)
 {
-    if (index >= gCG.w_maxNumContacts)
+    if (index >= w.maxContacts)
         return;
 
     // writeContactCore
-    Ptr<uint2>(gCG.w_contactByX)[index] = rigidId;                 // contactByX[index] = rigidId (PxU64)
-    Ptr<uint>(gCG.w_tempContactByX)[index] = rigidId.x;            // PxU32(rigidId & 0xffffffff)
-    Ptr<uint>(gCG.w_contactIndexSortedByX)[index] = index;
-    Ptr<float4>(gCG.w_outPoint)[index] = contact;
-    Ptr<float4>(gCG.w_outNormalPen)[index] = normalPen;
+    Ptr<uint2>(w.byX)[index] = rigidId;                            // contactByX[index] = rigidId (PxU64)
+    Ptr<uint>(w.tempByX)[index] = rigidId.x;                       // PxU32(rigidId & 0xffffffff)
+    Ptr<uint>(w.idxByX)[index] = index;
+    Ptr<float4>(w.point)[index] = contact;
+    Ptr<float4>(w.normalPen)[index] = normalPen;
 
     // result == true branch
-    Ptr<float4>(gCG.w_outBarycentric)[index] = barycentric;
+    Ptr<float4>(w.bary)[index] = barycentric;
     // PxgFemOtherContactInfo (16B): pairInd0 u64 @0, pairInd1 u32 @8, rigidMatInd @12
-    const uint64_t infoBase = gCG.w_outContactInfo + uint64_t(index) * 16UL;
+    const uint64_t infoBase = w.info + uint64_t(index) * 16UL;
     Ptr<uint2>(infoBase + 0UL)[0] = rigidId;                      // pairInd0 == rigidId.getInd()
     Ptr<uint>(infoBase + 8UL)[0] = pairInd1;
     // setRigidMaterialIndex(mat) + markInCollision(false) == (mat & 0x7fffffff)
     Ptr<uint>(infoBase + 12UL)[0] = rigidMaterialIndex & 0x7fffffffu;
+}
+
+// The ContactGenParams-blob face of the same writer (plane / sphere / box vertex).
+void writeRigidVsDeformableContact(uint index, float4 contact, float4 normalPen, float4 barycentric,
+                                   uint2 rigidId, uint pairInd1, uint rigidMaterialIndex)
+{
+    FcCtWriter w;
+    w.point = gCG.w_outPoint;        w.normalPen = gCG.w_outNormalPen;
+    w.bary = gCG.w_outBarycentric;   w.info = gCG.w_outContactInfo;
+    w.count = gCG.w_totalContactCount; w.byX = gCG.w_contactByX;
+    w.tempByX = gCG.w_tempContactByX;  w.idxByX = gCG.w_contactIndexSortedByX;
+    w.maxContacts = gCG.w_maxNumContacts;
+    cgWriteContact(w, index, contact, normalPen, barycentric, rigidId, pairInd1, rigidMaterialIndex);
 }
 
 // ===========================================================================
@@ -1465,5 +1491,468 @@ void cloth_convexVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
 
     // W7: the UNCLAMPED count, in bytes, by one thread of the grid.
     if (globalWarpIdx == 0u)
+        InterlockedMax(Ptr<uint>(gBTri.stackSizeNeeded)[0], numFound * 16u);
+}
+
+// ===========================================================================
+// P9.29 -- cloth_SphereContactGenLaunch
+// gpunarrowphase/src/CUDA/femClothPrimitives.cu:520 (wrapper), :258
+// (fcSphereCollision), :165 (triSphereCollide), :297 (fcCapsuleCollision),
+// capsuleTriangle.cuh:117 (distanceSegmentTriangleSquared), :102
+// (isValidTriangleBarycentricCoord), distanceSegmentSegment.cuh:33
+// (distanceSegmentSegmentSquared) -- all read in full.
+//
+// The LAST unmapped primitive contact generator on the TRIANGLE side of the
+// cloth chain, and the sibling of cloth_boxTriangleContactGenLaunch /
+// cloth_convexContactGenLaunch above: it consumes the same midphase stack of
+// (cmIdx, triangleIdx) pairs, takes the same fifteen-argument pack, and writes
+// through the same PxgFEMContactWriter.  Despite the name it serves TWO rigid
+// types -- eSPHERE and eCAPSULE -- against cloth triangles.
+//
+// ---------------------------------------------------------------------------
+// A FACT ABOUT THE ENGINE THAT BELONGS NEXT TO THIS KERNEL
+// ---------------------------------------------------------------------------
+// Its VERTEX twin, cloth_SphereVertexContactGenLaunch (:700, ported above), is
+// launched by the host inside `if (0)` -- PxgNarrowphaseCore.cpp:5774, the
+// block immediately after this kernel's own `if (1)`.  It therefore never runs
+// in the engine, whatever this port does with it.  That is a THIRD kind of
+// upstream disablement, distinct from the two tools/check_disabled_kernels.py
+// already gates (a commented-out device-side `hasContacts` assignment): those
+// are device-side, this one is host-side, and no amount of reading the .cu
+// finds it.  P9.29 extends the checker with a HOST_GATED table so the fact
+// stays true; the measurement behind it is that a brace-matched sweep of every
+// `if (0)` in the GPU host corpus finds SEVEN, of which exactly ONE contains a
+// getCuFunction launch -- this one.  The other six are debug / DMA-back blocks.
+//
+// It also explains, after the fact, why the vertex twin could be shipped in
+// P7.1 with its eCAPSULE branch DEFERRED and no scene ever noticed.
+//
+// ---------------------------------------------------------------------------
+// TRAPS
+// ---------------------------------------------------------------------------
+// S1 -- IT IS PER-THREAD, NOT PER-WARP.  The host comment at the launch site
+//     says "each warp deal with one test", and the launch is (1024, 128).  The
+//     BODY disagrees: it indexes `globalThreadIdx = threadIdx.x + blockIdx.x *
+//     blockDim.x` and strides by `gridDim.x * blockDim.x`.  Every one of the
+//     131072 threads owns a pair.  The box/convex sibling above really is
+//     per-warp, so copying its driver here would process 1/32 of the pairs.
+//
+// S2 -- THE `else` IS NOT `else if (eCAPSULE)`.  It is a bare `else` with an
+//     `assert` inside, so ANY rigid type that is not eSPHERE takes the capsule
+//     path and reads scale.x/scale.y as halfHeight/radius.  Ported as written.
+//
+// S3 -- BOTH LIVE CORES EMIT AT MOST ONE CONTACT.  triSphereCollide's
+//     three-vertex prelude and fcCapsuleCollision's two `if (0)` blocks are
+//     dead upstream, and the float4[5] arrays are sized for them.  The
+//     PRODUCER below is faithful to the live code and yields 0 or 1.  The
+//     AGGREGATOR is deliberately NOT: it is a real per-lane prefix sum over the
+//     counts, exactly like the CUDA's warpScan, so nothing here silently
+//     depends on that bound being 1.  A ballot+popcount would be observably
+//     identical today and wrong the day a prelude is re-enabled.
+//
+// S4 -- THE LOOP BOUND IS BLOCK-ROUNDED, NOT WARP-ROUNDED.  The CUDA rounds
+//     numPairs up to 32 because its warp intrinsics only need warp-uniform
+//     control flow.  The aggregation here is groupshared + a BLOCK barrier, so
+//     the trip count must be block-uniform: with a bound that is a multiple of
+//     SPHTRI_BLOCK, a block's 128 threads are either all in or all out of a
+//     given iteration.  The extra iterations are all-false -- no atomicAdd, no
+//     store -- so the emitted set is unchanged.  Same rule, and same reason, as
+//     the plane kernel's numRequiredThreads above.
+//
+// S5 -- SPECULATED PAIR LOAD (the P9.22 / P9.28 class).  `pairs[i]` sits under
+//     `i < numPairs`, which on this platform is a MASK and not a branch, so the
+//     load is issued for the excluded lanes too.  The address is clamped and
+//     the guard is left to decide the VALUE -- clamping the index, not the
+//     result.  Without it the tail iterations of S4 read past the stack.
+//
+// S6 -- restDistance is indexed by cmIdx (from the pair's .x), contactDistance
+//     by the two cache refs and summed.  Same split as B6 / V6 above.
+//
+// S7 -- the filter is an AND over all three corners, like the box/convex
+//     triangle sibling (B1) and unlike the vertex kernels.
+//
+// S8 -- `stackSizeNeededOnDevice` gets the UNCLAMPED count times 16, from one
+//     thread of the whole grid, OUTSIDE the loop.  Same as B4.
+//
+// S9 -- when a warp's total is zero the CUDA broadcasts startIndex =
+//     0xFFFFFFFF; this port broadcasts 0.  Nothing reads it in that case (a
+//     lane can only write when its own count is non-zero, which forces the
+//     total non-zero), so the two are observationally identical -- and 0 is not
+//     an address here, so S5's class does not apply.
+// ===========================================================================
+
+static const uint SPHTRI_GRID = 1024u;                              // numBlocks
+static const uint SPHTRI_WARPS = 4u;
+static const uint SPHTRI_BLOCK = WARP * SPHTRI_WARPS;               // 128 threads
+static const uint SPHTRI_STRIDE = SPHTRI_GRID * SPHTRI_BLOCK;       // S1: 131072
+
+// PX_MAX_F32 (PxMath.h) -- the bdenom fallback when the triangle is degenerate.
+static const float ST_MAX_F32 = 3.4028234663852886e+38f;
+
+// PxVec3::getNormalized, spelled as an explicit 1/sqrt DIVISION rather than
+// rsqrt: llvmpipe's OpInverseSqrt is not correctly rounded on all inputs, while
+// OpSqrt and OpFDiv are IEEE-correct on both sides.  Same decision, and same
+// reason, as npCvxMeshNp.slang's copy.
+float3 stNormalized(float3 v)
+{
+    const float m = dot(v, v);
+    return m > 0.0f ? v * (1.0f / sqrt(m)) : float3(0, 0, 0);
+}
+
+// isValidTriangleBarycentricCoord (capsuleTriangle.cuh:102)
+bool stIsValidBary(float v, float w)
+{
+    const float eps = 1e-6f;
+    const float zero = -eps;
+    const float one = 1.0f + eps;
+    return (v >= zero && v <= one) && (w >= zero && w <= one) && ((v + w) <= one);
+}
+
+// distanceSegmentSegmentSquared (distanceSegmentSegment.cuh:33) -- closest
+// parameters only; the caller reconstructs the points.
+void stSegSeg(float3 p1, float3 d1, float3 p2, float3 d2, out float s, out float t)
+{
+    const float eps = 1e-6f;
+    const float3 r = p1 - p2;
+    const float a = dot(d1, d1);
+    const float e = dot(d2, d2);
+    const float b = dot(d1, d2);
+    const float c = dot(d1, r);
+    const float aRecip = a > eps ? (1.0f / a) : 0.0f;
+    const float eRecip = e > eps ? (1.0f / e) : 0.0f;
+    const float f = dot(d2, r);
+
+    const float denom = a * e - b * b;
+    const float temp = b * f - c * e;
+    const float s0 = clamp(temp / denom, 0.0f, 1.0f);
+    const float sTmp = eps > denom ? 0.5f : s0;
+    const float tTmp = (b * sTmp + f) * eRecip;
+    const float t2 = clamp(tTmp, 0.0f, 1.0f);
+    const float comp = (b * t2 - c) * aRecip;
+    s = clamp(comp, 0.0f, 1.0f);
+    t = t2;
+}
+
+// distanceSegmentTriangleSquared (capsuleTriangle.cuh:117).  t is the segment's
+// barycentric coordinate, (u, v) the triangle's.
+//
+// npCvxMeshNp.slang carries its own transcription of this same function.  It is
+// NOT shared: that file is a Phase-1 DESCRIPTOR-SET shader and this is the
+// engine BDA path, and the recorded rule is that the BDA path gets the modules
+// while Phase-1 keeps its copies.  Both were transcribed from the CUDA and read
+// against each other line by line while writing this one.
+float stSegTriSq(float3 p, float3 q, float3 a, float3 b, float3 c,
+                 out float outT, out float outU, out float outV)
+{
+    outT = 0.0f; outU = 0.0f; outV = 0.0f;
+
+    const float3 pq = q - p;
+    const float3 ab = b - a;
+    const float3 ac = c - a;
+    const float3 bc = c - b;
+    const float3 ap = p - a;
+    const float3 aq = q - a;
+
+    const float d00 = dot(ab, ab);
+    const float d01 = dot(ab, ac);
+    const float d11 = dot(ac, ac);
+    const float tDenom = d00 * d11 - d01 * d01;
+    const float bdenom = tDenom > 0.0f ? 1.0f / tDenom : ST_MAX_F32;
+
+    const float3 n = stNormalized(cross(ab, ac));
+
+    const float dist3 = dot(ap, n);
+    const float sqDist3 = dist3 * dist3;
+    const float dist4 = dot(aq, n);
+    const float sqDist4 = dist4 * dist4;
+    const float dMul = dist3 * dist4;
+
+    if (dMul <= 0.0f)   // the segment crosses the triangle's plane
+    {
+        const float nom = -dot(n, ap);
+        const float denom = 1.0f / dot(n, pq);
+        const float t0 = nom * denom;
+        const float3 ip = p + pq * t0;
+        const float3 v2 = ip - a;
+        const float d20 = dot(v2, ab);
+        const float d21 = dot(v2, ac);
+        const float v00 = (d11 * d20 - d01 * d21) * bdenom;
+        const float w00 = (d00 * d21 - d01 * d20) * bdenom;
+        if (stIsValidBary(v00, w00))
+        {
+            outT = t0; outU = v00; outV = w00;
+            return 0.0f;
+        }
+    }
+
+    const float3 closestP31 = p - n * dist3;
+    const float3 pV20 = closestP31 - a;
+    const float pD20 = dot(pV20, ab);
+    const float pD21 = dot(pV20, ac);
+    const float v0 = (d11 * pD20 - d01 * pD21) * bdenom;
+    const float w0 = (d00 * pD21 - d01 * pD20) * bdenom;
+    const bool con0 = stIsValidBary(v0, w0);
+
+    const float3 closestP41 = q - n * dist4;
+    const float3 qV20 = closestP41 - a;
+    const float qD20 = dot(qV20, ab);
+    const float qD21 = dot(qV20, ac);
+    const float v1 = (d11 * qD20 - d01 * qD21) * bdenom;
+    const float w1 = (d00 * qD21 - d01 * qD20) * bdenom;
+    const bool con1 = stIsValidBary(v1, w1);
+
+    if (con0 && con1)
+    {
+        if (sqDist4 > sqDist3) { outT = 0.0f; outU = v0; outV = w0; return sqDist3; }
+        else                   { outT = 1.0f; outU = v1; outV = w1; return sqDist4; }
+    }
+
+    float t00, t10, t01, t11, t02, t12;
+    stSegSeg(p, pq, a, ab, t00, t10);
+    stSegSeg(p, pq, b, bc, t01, t11);
+    stSegSeg(p, pq, a, ac, t02, t12);
+
+    const float3 cp00 = p + pq * t00;  const float3 cp01 = a + ab * t10;
+    float3 tv = cp00 - cp01;           const float sqDist0 = dot(tv, tv);
+    const float3 cp10 = p + pq * t01;  const float3 cp11 = b + bc * t11;
+    tv = cp10 - cp11;                  const float sqDist1 = dot(tv, tv);
+    const float3 cp20 = p + pq * t02;  const float3 cp21 = a + ac * t12;
+    tv = cp20 - cp21;                  const float sqDist2 = dot(tv, tv);
+
+    const float u10 = t10,        v10 = 0.0f;   // edge ab
+    const float u11 = 1.0f - t11, v11 = t11;    // edge bc
+    const float u12 = 0.0f,       v12 = t12;    // edge ac
+
+    float sqDistPE, uEdge, vEdge, tSeg;
+    if (sqDist1 > sqDist0 && sqDist2 > sqDist0) { sqDistPE = sqDist0; uEdge = u10; vEdge = v10; tSeg = t00; }
+    else if (sqDist2 > sqDist1)                 { sqDistPE = sqDist1; uEdge = u11; vEdge = v11; tSeg = t01; }
+    else                                        { sqDistPE = sqDist2; uEdge = u12; vEdge = v12; tSeg = t02; }
+
+    if (con0)
+    {
+        if (sqDistPE > sqDist3) { outT = 0.0f; outU = v0; outV = w0; return sqDist3; }
+        outT = tSeg; outU = uEdge; outV = vEdge; return sqDistPE;
+    }
+    else if (con1)
+    {
+        if (sqDistPE > sqDist4) { outT = 1.0f; outU = v1; outV = w1; return sqDist4; }
+        outT = tSeg; outU = uEdge; outV = vEdge; return sqDistPE;
+    }
+
+    outT = tSeg; outU = uEdge; outV = vEdge; return sqDistPE;
+}
+
+// triSphereCollide (femClothPrimitives.cu:165), live path only -- see S3.
+bool stTriSphere(float3 a, float3 b, float3 c, float3 sphereCenter, float radius, float contactDist,
+                 out float4 outContact, out float4 outNormalPen, out float4 outBary)
+{
+    outContact = float4(0, 0, 0, 0);
+    outNormalPen = float4(0, 0, 0, 0);
+    outBary = float4(0, 0, 0, 0);
+
+    const float inflatedRadius = radius + contactDist;
+    const float sqInflatedRadius = inflatedRadius * inflatedRadius;
+
+    float s, t;
+    const float3 closestPt = closestPtPointTriangle(sphereCenter, a, b, c, s, t);
+    const float3 v = closestPt - sphereCenter;
+    const float sqDist = dot(v, v);
+
+    if (sqInflatedRadius > sqDist)
+    {
+        const float dist = sqrt(sqDist);
+        // the 1e-8 guard: below it the direction is taken from the triangle's
+        // own surface normal instead of the (numerically meaningless) offset.
+        const float3 n = (dist > 1e-8f) ? (v * (1.0f / dist))
+                                        : stNormalized(cross(b - a, c - a));
+        const float3 contact = sphereCenter + n * radius;
+        outContact = float4(contact, 0.0f);
+        outNormalPen = float4(n, dist - radius);
+        outBary = float4(1.0f - s - t, s, t, 0.0f);
+        return true;
+    }
+    return false;
+}
+
+// fcCapsuleCollision (femClothPrimitives.cu:297), the `if (1)` block only.
+bool stTriCapsule(float4 rigidQ, float3 rigidP, float halfHeight, float capsuleRadius,
+                  float3 a, float3 b, float3 c, float cDistance,
+                  out float4 outContact, out float4 outNormalPen, out float4 outBary)
+{
+    outContact = float4(0, 0, 0, 0);
+    outNormalPen = float4(0, 0, 0, 0);
+    outBary = float4(0, 0, 0, 0);
+
+    const float inflatedRadius = capsuleRadius + cDistance;
+    const float sqInflatedRadius = inflatedRadius * inflatedRadius;
+
+    // The capsule axis is basis vector 0 of its pose, and the segment is built
+    // around the pose POSITION -- the CUDA's commented-out cloth-space
+    // conversions are not applied, so everything stays in world space.
+    const float3 dir = getBasisVector0(rigidQ);
+    const float3 tmp = dir * halfHeight;
+    const float3 p = rigidP + tmp;
+    const float3 q = rigidP - tmp;
+
+    float t, u, v;
+    const float sqDist = stSegTriSq(p, q, a, b, c, t, u, v);
+
+    if (sqInflatedRadius > sqDist)
+    {
+        const float3 pq = q - p;
+        const float3 pointOnSegment = p + pq * t;
+        const float w = 1.0f - u - v;
+        const float3 pointOnTriangle = a * w + b * u + c * v;
+        const float3 normal = stNormalized(pointOnTriangle - pointOnSegment);
+
+        const float dist = sqrt(sqDist);
+        const float pen = dist - capsuleRadius;
+        const float3 pointOnCapsule = pointOnSegment + capsuleRadius * normal;
+
+        outContact = float4(pointOnCapsule, 0.0f);
+        outNormalPen = float4(normal, pen);
+        outBary = float4(w, u, v, 0.0f);
+        return true;
+    }
+    return false;
+}
+
+groupshared uint sStCnt[SPHTRI_BLOCK];
+groupshared uint sStStart[SPHTRI_WARPS];
+
+[shader("compute")]
+[numthreads(128, 1, 1)]
+void cloth_SphereContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
+{
+    const uint tid = gtid.x;
+    const uint warpId = tid >> 5;
+    const uint lane = tid & (WARP - 1u);
+    const uint globalThreadIdx = tid + gid.x * SPHTRI_BLOCK;        // S1
+
+    const uint stackSize = gBTri.stackSizeBytes / 16u;
+    const uint numFound = Ptr<uint>(gBTri.midphasePairsNum)[0];
+    const uint numPairs = min(numFound, stackSize);
+
+    Ptr<uint4> pairs = Ptr<uint4>(gBTri.stackPtr);
+    Ptr<PxgFEMClothGpu> femClothes = Ptr<PxgFEMClothGpu>(gBTri.femClothes);
+    Ptr<PxsCachedTransform> transformCache = Ptr<PxsCachedTransform>(gBTri.transformCache);
+    Ptr<float> contactDistance = Ptr<float>(gBTri.contactDistance);
+
+    FcCtWriter w;
+    w.point = gBTri.b_outPoint;  w.normalPen = gBTri.b_outNormalPen;
+    w.bary = gBTri.b_outBarycentric; w.info = gBTri.b_outContactInfo;
+    w.count = gBTri.b_totalContactCount; w.byX = gBTri.b_contactByX;
+    w.tempByX = gBTri.b_tempContactByX;  w.idxByX = gBTri.b_contactIndexSortedByX;
+    w.maxContacts = gBTri.b_maxNumContacts;
+
+    const uint numRequiredThreads = (numPairs + (SPHTRI_BLOCK - 1u)) & (~(SPHTRI_BLOCK - 1u)); // S4
+
+    for (uint i = globalThreadIdx; i < numRequiredThreads; i += SPHTRI_STRIDE)
+    {
+        uint numContacts = 0u;
+        float4 contact = float4(0, 0, 0, 0);
+        float4 normalPen = float4(0, 0, 0, 0);
+        float4 bary = float4(0, 0, 0, 0);
+        uint2 rigidId = uint2(0u, 0u);
+        uint pairInd1 = 0u;
+        uint rigidMaterialIndex = 0xFFFFFFFFu;
+
+        // S5: clamp the ADDRESS; `i < numPairs` still decides the VALUE.
+        const uint safeI = min(i, max(numPairs, 1u) - 1u);
+        if (i < numPairs)
+        {
+            const uint4 curPair = pairs[safeI];
+            const uint cmIdx = curPair.x;
+            const uint triangleId = curPair.y;
+
+            PxgShape clothShape, rigidShape;
+            uint clothCacheRef, rigidCacheRef;
+            loadClothRigidPair(gBTri.cmInputs, gBTri.gpuShapes, cmIdx,
+                               clothShape, clothCacheRef, rigidShape, rigidCacheRef);
+
+            const uint rigidType = rigidShape.type;
+            rigidId = Ptr<uint2>(gBTri.shapeToRigidRemap)[rigidCacheRef];
+            const uint clothId = clothShape.particleOrSoftbodyId;
+            rigidMaterialIndex = rigidShape.materialIndex;
+
+            Ptr<uint4> vertIndices = Ptr<uint4>(femClothes[clothId].mTriangleVertexIndices);
+            const uint4 triIdx = vertIndices[triangleId];
+
+            // S7: skip ONLY when all three corners are filtered.
+            const uint m0 = (clothId << PXG_CLOTH_ID_SHIFT) | triIdx.x;
+            const uint m1 = (clothId << PXG_CLOTH_ID_SHIFT) | triIdx.y;
+            const uint m2 = (clothId << PXG_CLOTH_ID_SHIFT) | triIdx.z;
+            const bool skipTriangle =
+                findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, uint2(m0, 0u)) &&
+                findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, uint2(m1, 0u)) &&
+                findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, uint2(m2, 0u));
+
+            if (!skipTriangle)
+            {
+                const PxsCachedTransform rtc = transformCache[rigidCacheRef];
+                const float4 rigidQ = float4(rtc.qx, rtc.qy, rtc.qz, rtc.qw);
+                const float3 rigidP = float3(rtc.px, rtc.py, rtc.pz);
+
+                // S6
+                const float cDistance = contactDistance[clothCacheRef] + contactDistance[rigidCacheRef];
+
+                Ptr<float4> verts = Ptr<float4>(femClothes[clothId].mPosition_InvMass);
+                const float3 va = verts[triIdx.x].xyz;
+                const float3 vb = verts[triIdx.y].xyz;
+                const float3 vc = verts[triIdx.z].xyz;
+
+                bool hit;
+                if (rigidType == GEOM_SPHERE)
+                {
+                    hit = stTriSphere(va, vb, vc, rigidP, rigidShape.scaleY, cDistance,
+                                      contact, normalPen, bary);
+                }
+                else                                                    // S2
+                {
+                    hit = stTriCapsule(rigidQ, rigidP, rigidShape.scaleX, rigidShape.scaleY,
+                                       va, vb, vc, cDistance, contact, normalPen, bary);
+                }
+
+                if (hit)
+                {
+                    numContacts = 1u;
+                    pairInd1 = (clothId << PXG_CLOTH_ID_SHIFT) | triangleId;
+                    contact.w = Ptr<float>(gBTri.restDistance)[cmIdx];   // S6
+                }
+            }
+        }
+
+        // S3: a real prefix sum over the counts, not a ballot.
+        sStCnt[tid] = numContacts;
+        GroupMemoryBarrierWithGroupSync();
+        uint exclusiveSum = 0u;
+        uint totalCount = 0u;
+        const uint warpBase = warpId << 5;
+        for (uint k = 0u; k < WARP; ++k)
+        {
+            const uint cnt = sStCnt[warpBase + k];
+            if (k < lane)
+                exclusiveSum += cnt;
+            totalCount += cnt;
+        }
+        if (lane == 0u)
+        {
+            uint s = 0u;                                              // S9
+            if (totalCount > 0u)
+                InterlockedAdd(Ptr<uint>(gBTri.b_totalContactCount)[0], totalCount, s);
+            sStStart[warpId] = s;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        const uint startIndex = sStStart[warpId];
+
+        for (uint j = 0u; j < numContacts; ++j)
+            cgWriteContact(w, startIndex + exclusiveSum + j, contact, normalPen, bary,
+                           rigidId, pairInd1, rigidMaterialIndex);
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // S8: the UNCLAMPED count, in bytes, by one thread of the grid.
+    if (globalThreadIdx == 0u)
         InterlockedMax(Ptr<uint>(gBTri.stackSizeNeeded)[0], numFound * 16u);
 }

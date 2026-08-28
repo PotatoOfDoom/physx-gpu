@@ -10130,4 +10130,679 @@ PXG_TEST(femClothSimHeightfieldContactGen)
         dev->destroyBuffer(h);
 }
 
+
+// ===========================================================================
+// P9.29 -- cloth_SphereContactGenLaunch, against a full HOST MIRROR.
+//
+// Unlike P9.15d/P9.20/P9.21, this kernel's collision cores are NOT already
+// covered by a Phase-1 battery on the engine path: triSphereCollide exists in
+// fcPrim.slang, but fcCapsuleCollision (and the whole
+// distanceSegmentTriangleSquared / distanceSegmentSegmentSquared chain under
+// it) had no engine-side port before this tranche.  So the reference here is a
+// C++ transcription of BOTH cores plus the glue, and the comparison is
+// BIT-EXACT -- not a differential against a sibling kernel.
+//
+// WHAT THE RIG IS BUILT TO DISCRIMINATE
+//   * TWO contact managers with DIFFERENT rigid TYPES -- a sphere and a capsule
+//     -- so S2's bare `else` is exercised on both sides of the branch, and a
+//     port that wrote `else if (type == eCAPSULE)` would still pass while one
+//     that routed both to the sphere core would not;
+//   * DIFFERENT rest distances per manager (S6), so `restDistance[cmIdx]` is
+//     separable from a cache ref;
+//   * 40 pairs, well past one warp: a per-WARP driver -- which is what the box
+//     and convex siblings in the same file use, and what the host's stale
+//     comment at the launch site claims -- would see 1 pair in 32 (S1);
+//   * a midphase count that OVERSHOOTS the stack bound, so S4's clamp and S8's
+//     UNCLAMPED high-water mark pull opposite ways in one run;
+//   * a filter list naming ALL THREE corners of one triangle and TWO of
+//     another: the first must vanish, the second must survive (S7);
+//   * capsule-vs-triangle cases that reach THREE different exits of
+//     distanceSegmentTriangleSquared -- the plane-crossing early out, the
+//     both-projections-interior branch, and the edge fallback -- because the
+//     three are 60 lines apart and a transcription slip in one is invisible in
+//     the others.
+// ===========================================================================
+namespace p929st
+{
+using p817cg::V3;
+using p817cg::qRot;
+using p817cg::norm;
+using p817cg::crs;
+using p817cg::sub;
+using p817cg::add;
+using p817cg::scl;
+using p817cg::dot;
+
+using p817cg::RigidFilterPairHost;
+
+// The kernel shares cloth_boxTriangleContactGenLaunch's fifteen-argument pack --
+// and NOT cloth_meshContactGenLaunch's, which this fixture reached for first and
+// paid for with a deterministic segfault.  Both are 192 bytes AND both put the
+// writer at @112, so sizeof and the one static_assert everybody checks agree.
+// The MIDDLE does not:
+//
+//              mesh (ClothMeshCgPush)        box-triangle (this one)
+//     @64      stackSizeBytes                stackPtr
+//     @72      stackPtr                      midphasePairsNum
+//     @80      midphasePairsNum              filterPairs
+//     @88      filterPairs                   nbFilterPairs
+//     @96      nbFilterPairs                 stackSizeNeeded
+//     @104     stackSizeNeeded               (pad -- paramAlign(80) is 16)
+//
+// Every asserted offset below is therefore load-bearing, not decoration.
+struct ClothSphereTriPush
+{
+    float toleranceLength; uint32_t pad4;
+    uint64_t cmInputs, transformCache, contactDistance, restDistance, gpuShapes, femClothes,
+             shapeToRigidRemapTable, stackPtr, midphasePairsNum, filterPairs;
+    uint32_t nbFilterPairs, stackSizeBytes;
+    uint64_t stackSizeNeededOnDevice;
+    uint64_t pad104;                 // paramAlign(80) == 16, so the writer lands at 112
+    uint64_t wPoint, wNormalPen, wBary, wInfo, wCount, wByX, wTempByX, wIdxByX, wSorted32;
+    uint32_t wMaxContacts, pad188;
+};
+static_assert(sizeof(ClothSphereTriPush) == 192, "cloth sphere/capsule TRIANGLE blob must be 192 bytes");
+static_assert(offsetof(ClothSphereTriPush, stackPtr) == 64, "stackPtr @64 -- NOT stackSizeBytes");
+static_assert(offsetof(ClothSphereTriPush, midphasePairsNum) == 72, "midphasePairsNum @72");
+static_assert(offsetof(ClothSphereTriPush, filterPairs) == 80, "filterPairs @80");
+static_assert(offsetof(ClothSphereTriPush, nbFilterPairs) == 88, "nbFilterPairs @88");
+static_assert(offsetof(ClothSphereTriPush, stackSizeBytes) == 92, "stackSizeBytes @92");
+static_assert(offsetof(ClothSphereTriPush, stackSizeNeededOnDevice) == 96, "stackSizeNeeded @96");
+static_assert(offsetof(ClothSphereTriPush, wPoint) == 112, "the writer starts @112");
+static_assert(offsetof(ClothSphereTriPush, wMaxContacts) == 184, "maxNumContacts @184");
+
+static const uint32_t GEOM_SPHERE_H = 0u;    // PxGeometryType::eSPHERE
+static const uint32_t GEOM_CAPSULE_H = 2u;   // PxGeometryType::eCAPSULE
+
+// ---- the host mirror -------------------------------------------------------
+// PxQuat::getBasisVector0.
+static V3 basis0(const float q[4])
+{
+    const float x2 = q[0] * 2.0f, w2 = q[3] * 2.0f;
+    return V3{ (q[3] * w2) - 1.0f + q[0] * x2,
+               (q[2] * w2) + q[1] * x2,
+               (-q[1] * w2) + q[2] * x2 };
+}
+
+// closestPtPointTriangle (deformableCollision.cuh:146) with the s/t out params.
+static V3 cpTri(V3 p, V3 a, V3 b, V3 c, float& s, float& t)
+{
+    const V3 ab = sub(b, a), ac = sub(c, a), ap = sub(p, a);
+    const float d1 = dot(ab, ap), d2 = dot(ac, ap);
+    if (d1 <= 0.0f && d2 <= 0.0f) { s = 0.0f; t = 0.0f; return a; }
+    const V3 bp = sub(p, b);
+    const float d3 = dot(ab, bp), d4 = dot(ac, bp);
+    if (d3 >= 0.0f && d4 <= d3) { s = 1.0f; t = 0.0f; return b; }
+    const float vc = d1 * d4 - d3 * d2;
+    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f)
+    {
+        const float v = d1 / (d1 - d3);
+        s = v; t = 0.0f; return add(a, scl(ab, v));
+    }
+    const V3 cp = sub(p, c);
+    const float d5 = dot(ab, cp), d6 = dot(ac, cp);
+    if (d6 >= 0.0f && d5 <= d6) { s = 0.0f; t = 1.0f; return c; }
+    const float vb = d5 * d2 - d1 * d6;
+    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f)
+    {
+        const float w = d2 / (d2 - d6);
+        s = 0.0f; t = w; return add(a, scl(ac, w));
+    }
+    const float va = d3 * d6 - d5 * d4;
+    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f)
+    {
+        const float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        s = 1.0f - w; t = w; return add(b, scl(sub(c, b), w));
+    }
+    const float denom = 1.0f / (va + vb + vc);
+    const float v = vb * denom, w = vc * denom;
+    s = v; t = w;
+    // LEFT TO RIGHT: the shader writes `a + ab * v + ac * w`, which is
+    // (a + ab*v) + ac*w.  Grouping the two scaled edges first instead costs one
+    // ULP on the interior-face case and nothing anywhere else -- 15 of 28
+    // contacts, measured, before this line read the way it does now.
+    return add(add(a, scl(ab, v)), scl(ac, w));
+}
+
+static bool validBary(float v, float w)
+{
+    const float eps = 1e-6f, zero = -eps, one = 1.0f + eps;
+    return (v >= zero && v <= one) && (w >= zero && w <= one) && ((v + w) <= one);
+}
+
+static void segSeg(V3 p1, V3 d1, V3 p2, V3 d2, float& s, float& t)
+{
+    const float eps = 1e-6f;
+    const V3 r = sub(p1, p2);
+    const float a = dot(d1, d1), e = dot(d2, d2), b = dot(d1, d2), c = dot(d1, r);
+    const float aRecip = a > eps ? (1.0f / a) : 0.0f;
+    const float eRecip = e > eps ? (1.0f / e) : 0.0f;
+    const float f = dot(d2, r);
+    const float denom = a * e - b * b;
+    const float temp = b * f - c * e;
+    const float s0 = std::min(std::max(temp / denom, 0.0f), 1.0f);
+    const float sTmp = eps > denom ? 0.5f : s0;
+    const float tTmp = (b * sTmp + f) * eRecip;
+    const float t2 = std::min(std::max(tTmp, 0.0f), 1.0f);
+    const float comp = (b * t2 - c) * aRecip;
+    s = std::min(std::max(comp, 0.0f), 1.0f);
+    t = t2;
+}
+
+static const float MAX_F32_H = 3.4028234663852886e+38f;
+
+// Which of distanceSegmentTriangleSquared's five exits the last call took.  The
+// mirror is line-for-line the shader, so counting exits HERE is evidence about the
+// shader's coverage -- and it turns "the rig reaches three exits" from a claim in a
+// comment into a number the fixture prints and checks.
+enum SegTriExit { EXIT_PLANE_CROSS = 0, EXIT_BOTH_INTERIOR, EXIT_CON0_EDGE, EXIT_CON1_EDGE, EXIT_NEITHER };
+static int gSegTriExit = -1;
+
+static float segTriSq(V3 p, V3 q, V3 a, V3 b, V3 c, float& outT, float& outU, float& outV)
+{
+    outT = 0.0f; outU = 0.0f; outV = 0.0f;
+    gSegTriExit = -1;
+    const V3 pq = sub(q, p), ab = sub(b, a), ac = sub(c, a), bc = sub(c, b);
+    const V3 ap = sub(p, a), aq = sub(q, a);
+    const float d00 = dot(ab, ab), d01 = dot(ab, ac), d11 = dot(ac, ac);
+    const float tDenom = d00 * d11 - d01 * d01;
+    const float bdenom = tDenom > 0.0f ? 1.0f / tDenom : MAX_F32_H;
+    const V3 n = norm(crs(ab, ac));
+    const float dist3 = dot(ap, n), sqDist3 = dist3 * dist3;
+    const float dist4 = dot(aq, n), sqDist4 = dist4 * dist4;
+    const float dMul = dist3 * dist4;
+
+    if (dMul <= 0.0f)
+    {
+        const float nom = -dot(n, ap);
+        const float denom = 1.0f / dot(n, pq);
+        const float t0 = nom * denom;
+        const V3 ip = add(p, scl(pq, t0));
+        const V3 v2 = sub(ip, a);
+        const float d20 = dot(v2, ab), d21 = dot(v2, ac);
+        const float v00 = (d11 * d20 - d01 * d21) * bdenom;
+        const float w00 = (d00 * d21 - d01 * d20) * bdenom;
+        if (validBary(v00, w00))
+        {
+            gSegTriExit = EXIT_PLANE_CROSS;
+            outT = t0; outU = v00; outV = w00; return 0.0f;
+        }
+    }
+
+    const V3 pV20 = sub(sub(p, scl(n, dist3)), a);
+    const float v0 = (d11 * dot(pV20, ab) - d01 * dot(pV20, ac)) * bdenom;
+    const float w0 = (d00 * dot(pV20, ac) - d01 * dot(pV20, ab)) * bdenom;
+    const bool con0 = validBary(v0, w0);
+
+    const V3 qV20 = sub(sub(q, scl(n, dist4)), a);
+    const float v1 = (d11 * dot(qV20, ab) - d01 * dot(qV20, ac)) * bdenom;
+    const float w1 = (d00 * dot(qV20, ac) - d01 * dot(qV20, ab)) * bdenom;
+    const bool con1 = validBary(v1, w1);
+
+    if (con0 && con1)
+    {
+        gSegTriExit = EXIT_BOTH_INTERIOR;
+        if (sqDist4 > sqDist3) { outT = 0.0f; outU = v0; outV = w0; return sqDist3; }
+        outT = 1.0f; outU = v1; outV = w1; return sqDist4;
+    }
+
+    float t00, t10, t01, t11, t02, t12;
+    segSeg(p, pq, a, ab, t00, t10);
+    segSeg(p, pq, b, bc, t01, t11);
+    segSeg(p, pq, a, ac, t02, t12);
+    V3 tv = sub(add(p, scl(pq, t00)), add(a, scl(ab, t10)));
+    const float sqDist0 = dot(tv, tv);
+    tv = sub(add(p, scl(pq, t01)), add(b, scl(bc, t11)));
+    const float sqDist1 = dot(tv, tv);
+    tv = sub(add(p, scl(pq, t02)), add(a, scl(ac, t12)));
+    const float sqDist2 = dot(tv, tv);
+
+    const float u10 = t10, v10 = 0.0f;
+    const float u11 = 1.0f - t11, v11 = t11;
+    const float u12 = 0.0f, v12 = t12;
+
+    float sqDistPE, uEdge, vEdge, tSeg;
+    if (sqDist1 > sqDist0 && sqDist2 > sqDist0) { sqDistPE = sqDist0; uEdge = u10; vEdge = v10; tSeg = t00; }
+    else if (sqDist2 > sqDist1)                 { sqDistPE = sqDist1; uEdge = u11; vEdge = v11; tSeg = t01; }
+    else                                        { sqDistPE = sqDist2; uEdge = u12; vEdge = v12; tSeg = t02; }
+
+    if (con0)
+    {
+        gSegTriExit = EXIT_CON0_EDGE;
+        if (sqDistPE > sqDist3) { outT = 0.0f; outU = v0; outV = w0; return sqDist3; }
+        outT = tSeg; outU = uEdge; outV = vEdge; return sqDistPE;
+    }
+    if (con1)
+    {
+        gSegTriExit = EXIT_CON1_EDGE;
+        if (sqDistPE > sqDist4) { outT = 1.0f; outU = v1; outV = w1; return sqDist4; }
+        outT = tSeg; outU = uEdge; outV = vEdge; return sqDistPE;
+    }
+    gSegTriExit = EXIT_NEITHER;
+    outT = tSeg; outU = uEdge; outV = vEdge; return sqDistPE;
+}
+
+struct Hit { F4 point, normalPen, bary; };
+
+static bool triSphere(V3 a, V3 b, V3 c, V3 centre, float radius, float cDist, Hit& out)
+{
+    const float inflated = radius + cDist;
+    const float sqInflated = inflated * inflated;
+    float s, t;
+    const V3 closest = cpTri(centre, a, b, c, s, t);
+    const V3 v = sub(closest, centre);
+    const float sqDist = dot(v, v);
+    if (!(sqInflated > sqDist)) return false;
+    const float dist = std::sqrt(sqDist);
+    const V3 n = (dist > 1e-8f) ? scl(v, 1.0f / dist) : norm(crs(sub(b, a), sub(c, a)));
+    const V3 p = add(centre, scl(n, radius));
+    out.point = F4{ p.x, p.y, p.z, 0.0f };
+    out.normalPen = F4{ n.x, n.y, n.z, dist - radius };
+    out.bary = F4{ 1.0f - s - t, s, t, 0.0f };
+    return true;
+}
+
+static bool triCapsule(const float rq[4], V3 rp, float halfHeight, float radius,
+                       V3 a, V3 b, V3 c, float cDist, Hit& out)
+{
+    const float inflated = radius + cDist;
+    const float sqInflated = inflated * inflated;
+    const V3 dir = basis0(rq);
+    const V3 tmp = scl(dir, halfHeight);
+    const V3 p = add(rp, tmp), q = sub(rp, tmp);
+    float t, u, v;
+    const float sqDist = segTriSq(p, q, a, b, c, t, u, v);
+    if (!(sqInflated > sqDist)) return false;
+    const V3 pq = sub(q, p);
+    const V3 pointOnSegment = add(p, scl(pq, t));
+    const float w = 1.0f - u - v;
+    const V3 pointOnTriangle = add(add(scl(a, w), scl(b, u)), scl(c, v));
+    const V3 normal = norm(sub(pointOnTriangle, pointOnSegment));
+    const float dist = std::sqrt(sqDist);
+    const V3 pOnCap = add(pointOnSegment, scl(normal, radius));
+    out.point = F4{ pOnCap.x, pOnCap.y, pOnCap.z, 0.0f };
+    out.normalPen = F4{ normal.x, normal.y, normal.z, dist - radius };
+    out.bary = F4{ w, u, v, 0.0f };
+    return true;
+}
+} // namespace p929st
+
+PXG_TEST(femClothSimSphereTriContactGen)
+{
+    using namespace p816dc;
+    using namespace p929st;
+    using p817cg::V3;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t CLOTH_ID = 1u;
+    const float CD_CLOTH = 0.05f, CD_SPHERE = 0.15f, CD_CAPSULE = 0.10f;
+    const float REST_SPHERE = 0.031f, REST_CAPSULE = 0.077f;   // S6: per manager
+    const uint32_t MAT_SPHERE = 0x2Au, MAT_CAPSULE = 0x35u;
+
+    // ---- the two rigids --------------------------------------------------------------
+    // The sphere: radius comes from scale.y, and scale.x/scale.z are DIFFERENT so a port
+    // reading the wrong component moves the surface.
+    const V3 spP{ 0.30f, 0.20f, -0.10f };
+    const float spQ[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    const float SP_RADIUS = 0.40f;
+
+    // The capsule: halfHeight from scale.x, radius from scale.y, axis = basis vector 0 of
+    // its pose -- rotated so the axis is NOT a coordinate axis and a dropped rotation is
+    // visible in every contact.
+    const float ch = std::sin(0.35f), cc = std::cos(0.35f);
+    const float capQ[4] = { 0.0f, 0.0f, ch, cc };              // 0.7 rad about +z
+    const V3 capP{ -0.20f, 0.55f, 0.25f };
+    const float CAP_HALF = 0.60f, CAP_RADIUS = 0.25f;
+
+    // ---- the cloth: a fan plus four hand-placed triangles ------------------------------
+    // S1: well past one warp, so a per-warp driver processes 1 in 32 of them.
+    const uint32_t NB_FAN = 40u;
+    std::vector<F4> cv;
+    std::vector<TriIdx4> ci;
+    auto addTri = [&](V3 a, V3 b, V3 c) {
+        const uint32_t base = uint32_t(cv.size());
+        cv.push_back(F4{ a.x, a.y, a.z, 1.0f });
+        cv.push_back(F4{ b.x, b.y, b.z, 1.0f });
+        cv.push_back(F4{ c.x, c.y, c.z, 1.0f });
+        ci.push_back(TriIdx4{ base, base + 1u, base + 2u, 0u });
+    };
+    for (uint32_t i = 0; i < NB_FAN; ++i)
+    {
+        // A fan of small triangles swept through both rigids: the offset walks in y so
+        // some triangles cut the capsule's axis plane and some hang off an edge.
+        const float u = float(i) * 0.055f - 1.0f;
+        const V3 a{ -0.35f + u * 0.10f, 0.10f + u * 0.55f, -0.30f + u * 0.05f };
+        const V3 b{ 0.45f + u * 0.10f,  0.05f + u * 0.55f, -0.20f + u * 0.05f };
+        const V3 c{ 0.05f + u * 0.10f,  0.15f + u * 0.55f,  0.50f + u * 0.05f };
+        addTri(a, b, c);
+    }
+    // Four more, placed by hand rather than swept, because the fan alone reached only
+    // three of distanceSegmentTriangleSquared's five exits (measured: plane-crossing,
+    // con0-edge and neither).  The capsule's axis is basis vector 0 of a 0.7 rad turn
+    // about +z, so its segment runs from about (0.259, 0.937, 0.25) to (-0.659, 0.164,
+    // 0.25) with radius 0.25 and a 0.40 inflated reach.
+    //
+    // ODD indices belong to the capsule manager -- 41 and 43 -- so those are the two
+    // that matter; 40 and 42 are their sphere-side partners and are placed out of the
+    // sphere's reach so they add nothing but the parity.
+    const float PLANE_Z = -0.05f;                 // 0.30 below the segment: inside 0.40
+    addTri(V3{ 9.0f, 9.0f, 9.0f }, V3{ 9.5f, 9.0f, 9.0f }, V3{ 9.0f, 9.5f, 9.0f });   // 40, far away
+    // 41 -- BOTH projections interior: a slab wide enough to contain both endpoints,
+    // parallel to the segment so the plane is never crossed (dMul > 0).
+    addTri(V3{ -2.0f, -2.0f, PLANE_Z }, V3{ 2.0f, -2.0f, PLANE_Z }, V3{ 0.0f, 2.5f, PLANE_Z });
+    addTri(V3{ 9.0f, 9.0f, 9.2f }, V3{ 9.5f, 9.0f, 9.2f }, V3{ 9.0f, 9.5f, 9.2f });   // 42, far away
+    // 43 -- only q's projection interior: the same plane, but a triangle that covers the
+    // q end of the segment and not the p end.
+    addTri(V3{ -1.2f, -0.3f, PLANE_Z }, V3{ -0.2f, -0.3f, PLANE_Z }, V3{ -0.7f, 0.7f, PLANE_Z });
+    const uint32_t NB_TRIS = uint32_t(ci.size());
+    DevBuf bCv = makeDev(dev, cv);
+    if (!bCv.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bCv.h); return; }
+    DevBuf bCi = makeDev(dev, ci);
+
+    PxgFEMCloth cloth = makeZeroDesc();
+    cloth.mPosition_InvMass = reinterpret_cast<decltype(cloth.mPosition_InvMass)>(size_t(bCv.addr));
+    cloth.mTriangleVertexIndices = reinterpret_cast<decltype(cloth.mTriangleVertexIndices)>(size_t(bCi.addr));
+    cloth.mNbTriangles = NB_TRIS;
+    cloth.mNbVerts = uint32_t(cv.size());
+    std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
+    descArr[CLOTH_ID] = cloth;
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- shapes: 0 = cloth, 1 = sphere, 2 = capsule -----------------------------------
+    std::vector<PxgShapeHost> shapes(3);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0] = makeClothShape(CLOTH_ID);
+    shapes[1].type = GEOM_SPHERE_H;  shapes[1].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[1].sx = 0.77f; shapes[1].sy = SP_RADIUS; shapes[1].sz = 0.11f;   // only .y is the radius
+    shapes[1].srw = 1.0f; shapes[1].materialIndex = MAT_SPHERE;
+    shapes[2].type = GEOM_CAPSULE_H; shapes[2].particleOrSoftbodyId = 0xFFFFFFFFu;
+    shapes[2].sx = CAP_HALF; shapes[2].sy = CAP_RADIUS; shapes[2].sz = 0.13f;
+    shapes[2].srw = 1.0f; shapes[2].materialIndex = MAT_CAPSULE;
+    DevBuf bShapes = makeDev(dev, shapes);
+
+    // cache refs: 0 = cloth, 1 = sphere, 2 = capsule.  Manager 0 puts the cloth FIRST,
+    // manager 1 puts it SECOND -- loadClothRigidPair routes by TYPE, and a port that
+    // trusted slot order would fail exactly one of the two.
+    std::vector<CmInputHost> cms = { { 0u, 1u, 0u, 1u }, { 2u, 0u, 2u, 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+
+    std::vector<float> xf(3 * 8, 0.0f);
+    xf[3] = 1.0f;                                     // cloth pose: identity, at the origin
+    xf[8 + 0] = spQ[0]; xf[8 + 1] = spQ[1]; xf[8 + 2] = spQ[2]; xf[8 + 3] = spQ[3];
+    xf[8 + 4] = spP.x; xf[8 + 5] = spP.y; xf[8 + 6] = spP.z;
+    xf[16 + 0] = capQ[0]; xf[16 + 1] = capQ[1]; xf[16 + 2] = capQ[2]; xf[16 + 3] = capQ[3];
+    xf[16 + 4] = capP.x; xf[16 + 5] = capP.y; xf[16 + 6] = capP.z;
+    DevBuf bXf = makeDev(dev, xf);
+
+    std::vector<float> cd = { CD_CLOTH, CD_SPHERE, CD_CAPSULE };
+    std::vector<float> rd = { REST_SPHERE, REST_CAPSULE };
+    DevBuf bCd = makeDev(dev, cd), bRd = makeDev(dev, rd);
+
+    const uint64_t NODE_SPHERE = 0x0000000700000031ull, NODE_CAPSULE = 0x0000000200000019ull;
+    std::vector<uint64_t> remap = { 0ull, NODE_SPHERE, NODE_CAPSULE };
+    DevBuf bRemap = makeDev(dev, remap);
+
+    // ---- the filter list (S7) ---------------------------------------------------------
+    // Triangle 6: ALL THREE corners against BOTH rigids -> must vanish from both runs.
+    // Triangle 9: TWO corners only -> must survive, and its absence would mean the port
+    // used `||`.
+    // Both are triangles this rig MEASURED as contacting: triangle 12 is even, so
+    // it belongs to manager 0 (the SPHERE), and 21 is odd, so it belongs to
+    // manager 1 (the CAPSULE).  Picking them by eye is what the first version did,
+    // and it drew a filtered triangle that never touched anything -- a check that
+    // cannot fail is not a check, so the non-vacuity of BOTH is asserted below.
+    const uint32_t FILTERED_TRI = 12u, PARTIAL_TRI = 21u;
+    std::vector<RigidFilterPairHost> filters;
+    auto pushFilter = [&](uint64_t node, uint32_t vert) {
+        RigidFilterPairHost f{};
+        f.index0 = node;
+        f.index1 = uint64_t((CLOTH_ID << 20) | vert);
+        filters.push_back(f);
+    };
+    for (uint64_t node : { NODE_SPHERE, NODE_CAPSULE })
+    {
+        for (uint32_t k = 0; k < 3u; ++k) pushFilter(node, FILTERED_TRI * 3u + k);
+        for (uint32_t k = 0; k < 2u; ++k) pushFilter(node, PARTIAL_TRI * 3u + k);
+    }
+    // findRigid does a BINARY search: the list must be sorted by (index0, index1).
+    std::sort(filters.begin(), filters.end(),
+              [](const RigidFilterPairHost& a, const RigidFilterPairHost& b) {
+                  if (a.index0 != b.index0) return a.index0 < b.index0;
+                  return a.index1 < b.index1;
+              });
+    DevBuf bFilters = makeDev(dev, filters);
+
+    // ---- the pair stack ----------------------------------------------------------------
+    // S4/S8: the midphase claims MORE than the stack holds.  The surplus entries are
+    // addressable and carry triangle 0, which makes contact, so an unclamped walk shows up
+    // as EXTRA contacts rather than as a crash.
+    const uint32_t NB_STACK = NB_TRIS;
+    const uint32_t NB_FOUND = NB_TRIS + 24u;
+    std::vector<uint32_t> stack(NB_FOUND * 4u, 0u);
+    for (uint32_t i = 0; i < NB_FOUND; ++i)
+    {
+        stack[i * 4 + 0] = (i & 1u);                        // alternate the two managers
+        stack[i * 4 + 1] = (i < NB_TRIS) ? i : 0u;
+    }
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> nFound = { NB_FOUND };
+    DevBuf bNum = makeDev(dev, nFound);
+
+    const uint32_t MAXC = 96u;
+    WriterBufs w = makeWriter(dev, MAXC);
+    std::vector<uint32_t> zeroNeeded = { 0u };
+    DevBuf bNeeded = makeDev(dev, zeroNeeded);
+
+    ClothSphereTriPush p = {};
+    p.toleranceLength = 1.0f;
+    p.cmInputs = bCms.addr; p.transformCache = bXf.addr;
+    p.contactDistance = bCd.addr; p.restDistance = bRd.addr;
+    p.gpuShapes = bShapes.addr; p.femClothes = bDesc.addr;
+    p.shapeToRigidRemapTable = bRemap.addr;
+    p.stackSizeBytes = NB_STACK * 16u;
+    p.stackPtr = bStack.addr; p.midphasePairsNum = bNum.addr;
+    p.filterPairs = bFilters.addr; p.nbFilterPairs = uint32_t(filters.size());
+    p.stackSizeNeededOnDevice = bNeeded.addr;
+    p.wPoint = w.point.addr; p.wNormalPen = w.normalPen.addr;
+    p.wBary = w.barycentric.addr; p.wInfo = w.info.addr; p.wCount = w.count.addr;
+    p.wByX = w.byRigid.addr; p.wTempByX = w.tempByRigid.addr;
+    p.wIdxByX = w.idxByRigid.addr; p.wSorted32 = w.sortedByRigid.addr;
+    p.wMaxContacts = MAXC;
+
+    Kernel k("femClothContactGenBda.spv", "cloth_SphereContactGenLaunch",
+             {}, sizeof(ClothSphereTriPush));
+    k.dispatch(1024u, {}, p, 1u, 1u);      // PxgNarrowphaseCore.cpp:5760
+    dev->flush();
+
+    // ---- the expected set, from the mirror ---------------------------------------------
+    struct Exp { uint32_t tri, cm; uint64_t node; uint32_t mat; Hit h; float rest; };
+    std::vector<Exp> expected;
+    uint32_t nSphere = 0u, nCapsule = 0u;
+    uint32_t exitHits[5] = { 0u, 0u, 0u, 0u, 0u };   // segTriSq coverage, measured
+    for (uint32_t i = 0; i < NB_STACK; ++i)   // S4: the CLAMPED walk
+    {
+        const uint32_t cm = stack[i * 4 + 0], tri = stack[i * 4 + 1];
+        const bool isSphere = (cm == 0u);
+        const uint64_t node = isSphere ? NODE_SPHERE : NODE_CAPSULE;
+
+        uint32_t nFiltered = 0u;
+        for (uint32_t kk = 0; kk < 3u; ++kk)
+        {
+            const uint64_t key = uint64_t((CLOTH_ID << 20) | (tri * 3u + kk));
+            for (const auto& f : filters)
+                if (f.index0 == node && f.index1 == key) { ++nFiltered; break; }
+        }
+        if (nFiltered == 3u) continue;        // S7: AND over all three
+
+        const V3 a{ cv[tri * 3 + 0].x, cv[tri * 3 + 0].y, cv[tri * 3 + 0].z };
+        const V3 b{ cv[tri * 3 + 1].x, cv[tri * 3 + 1].y, cv[tri * 3 + 1].z };
+        const V3 c{ cv[tri * 3 + 2].x, cv[tri * 3 + 2].y, cv[tri * 3 + 2].z };
+
+        Hit h{};
+        bool hit;
+        if (isSphere)
+            hit = triSphere(a, b, c, spP, SP_RADIUS, CD_CLOTH + CD_SPHERE, h);
+        else
+        {
+            hit = triCapsule(capQ, capP, CAP_HALF, CAP_RADIUS, a, b, c, CD_CLOTH + CD_CAPSULE, h);
+            if (gSegTriExit >= 0 && gSegTriExit < 5) ++exitHits[gSegTriExit];
+        }
+        if (!hit) continue;
+
+        h.point.w = isSphere ? REST_SPHERE : REST_CAPSULE;
+        expected.push_back(Exp{ tri, cm, node, isSphere ? MAT_SPHERE : MAT_CAPSULE, h,
+                                h.point.w });
+        if (isSphere) ++nSphere; else ++nCapsule;
+    }
+
+    const uint32_t got = downloadBuffer<uint32_t>(dev, w.count.h, 1)[0];
+    PXG_CHECK_MSG(nSphere > 0u && nCapsule > 0u,
+                  "the rig produced %u sphere and %u capsule contacts; BOTH must be "
+                  "non-zero or S2's bare `else` is not exercised", nSphere, nCapsule);
+    PXG_CHECK_MSG(got == uint32_t(expected.size()),
+                  "contact COUNT %u, host mirror says %zu (%u sphere + %u capsule over %u "
+                  "clamped pairs of %u claimed)",
+                  got, expected.size(), nSphere, nCapsule, NB_STACK, NB_FOUND);
+
+    // Contacts are reserved with a racing atomicAdd, so compare as a MULTISET.
+    const auto pt = downloadBuffer<F4>(dev, w.point.h, MAXC);
+    const auto np = downloadBuffer<F4>(dev, w.normalPen.h, MAXC);
+    const auto ba = downloadBuffer<F4>(dev, w.barycentric.h, MAXC);
+    const auto info = downloadBuffer<uint32_t>(dev, w.info.h, MAXC * 4u);
+
+    struct Rec { uint32_t key[16]; };
+    auto less = [](const Rec& x, const Rec& y) {
+        for (int i = 0; i < 16; ++i) if (x.key[i] != y.key[i]) return x.key[i] < y.key[i];
+        return false;
+    };
+    std::vector<Rec> gpu, ref;
+    for (uint32_t i = 0; i < got && i < MAXC; ++i)
+    {
+        Rec r{};
+        r.key[0] = info[i * 4 + 2];                     // pairInd1 = (clothId<<20)|tri
+        r.key[1] = info[i * 4 + 0]; r.key[2] = info[i * 4 + 1];   // pairInd0 (u64)
+        r.key[3] = info[i * 4 + 3];                     // material
+        const float src[12] = { pt[i].x, pt[i].y, pt[i].z, pt[i].w,
+                                np[i].x, np[i].y, np[i].z, np[i].w,
+                                ba[i].x, ba[i].y, ba[i].z, ba[i].w };
+        for (int j = 0; j < 12; ++j) r.key[4 + j] = f2u(src[j]);
+        gpu.push_back(r);
+    }
+    for (const Exp& e : expected)
+    {
+        Rec r{};
+        r.key[0] = (CLOTH_ID << 20) | e.tri;
+        r.key[1] = uint32_t(e.node & 0xffffffffull); r.key[2] = uint32_t(e.node >> 32);
+        r.key[3] = e.mat & 0x7fffffffu;
+        const float src[12] = { e.h.point.x, e.h.point.y, e.h.point.z, e.h.point.w,
+                                e.h.normalPen.x, e.h.normalPen.y, e.h.normalPen.z, e.h.normalPen.w,
+                                e.h.bary.x, e.h.bary.y, e.h.bary.z, e.h.bary.w };
+        for (int j = 0; j < 12; ++j) r.key[4 + j] = f2u(src[j]);
+        ref.push_back(r);
+    }
+    std::sort(gpu.begin(), gpu.end(), less);
+    std::sort(ref.begin(), ref.end(), less);
+
+    static const char* const KEY_NAME[16] = {
+        "pairInd1", "pairInd0.lo", "pairInd0.hi", "material",
+        "point.x", "point.y", "point.z", "point.w(rest)",
+        "normal.x", "normal.y", "normal.z", "penetration",
+        "bary.x", "bary.y", "bary.z", "bary.w"
+    };
+    uint32_t mismatches = 0u;
+    int firstField = -1; size_t firstAt = 0;
+    for (size_t i = 0; i < gpu.size() && i < ref.size(); ++i)
+        for (int j = 0; j < 16; ++j)
+            if (gpu[i].key[j] != ref[i].key[j])
+            {
+                ++mismatches;
+                if (firstField < 0) { firstField = j; firstAt = i; }
+                break;
+            }
+    if (mismatches != 0u && firstField >= 0)
+    {
+        const uint32_t gw = gpu[firstAt].key[firstField], rw = ref[firstAt].key[firstField];
+        float gf, rf; std::memcpy(&gf, &gw, 4); std::memcpy(&rf, &rw, 4);
+        std::printf("    first difference at sorted slot %zu, field %s: gpu 0x%08X (%.9g) "
+                    "vs mirror 0x%08X (%.9g); tri %u\n",
+                    firstAt, KEY_NAME[firstField], gw, gf, rw, rf,
+                    gpu[firstAt].key[0] & ((1u << 20) - 1u));
+    }
+    PXG_CHECK_MSG(mismatches == 0u,
+                  "%u of %zu contacts differ BIT-EXACTLY from the host mirror of "
+                  "triSphereCollide / fcCapsuleCollision and the caller glue",
+                  mismatches, gpu.size());
+
+    // S7 both ways, read off the emitted set rather than argued.
+    uint32_t sawFiltered = 0u, sawPartial = 0u;
+    for (const Rec& r : gpu)
+    {
+        const uint32_t tri = r.key[0] & ((1u << 20) - 1u);
+        if (tri == FILTERED_TRI) ++sawFiltered;
+        if (tri == PARTIAL_TRI) ++sawPartial;
+    }
+    // NON-VACUITY: the filtered triangle must be one that WOULD have produced a
+    // contact.  Run the mirror over it with the filter ignored and demand a hit --
+    // otherwise `sawFiltered == 0` passes for a triangle that simply misses, which
+    // is exactly what the first version of this rig did.
+    {
+        const V3 fa{ cv[FILTERED_TRI * 3 + 0].x, cv[FILTERED_TRI * 3 + 0].y, cv[FILTERED_TRI * 3 + 0].z };
+        const V3 fb{ cv[FILTERED_TRI * 3 + 1].x, cv[FILTERED_TRI * 3 + 1].y, cv[FILTERED_TRI * 3 + 1].z };
+        const V3 fc{ cv[FILTERED_TRI * 3 + 2].x, cv[FILTERED_TRI * 3 + 2].y, cv[FILTERED_TRI * 3 + 2].z };
+        Hit fh{};
+        const bool wouldHit = ((FILTERED_TRI & 1u) == 0u)
+            ? triSphere(fa, fb, fc, spP, SP_RADIUS, CD_CLOTH + CD_SPHERE, fh)
+            : triCapsule(capQ, capP, CAP_HALF, CAP_RADIUS, fa, fb, fc, CD_CLOTH + CD_CAPSULE, fh);
+        PXG_CHECK_MSG(wouldHit,
+                      "triangle %u produces no contact even UNFILTERED, so the filter check "
+                      "below cannot fail and proves nothing", FILTERED_TRI);
+    }
+    PXG_CHECK_MSG(sawFiltered == 0u,
+                  "triangle %u has ALL THREE corners filtered against both rigids and still "
+                  "produced %u contacts", FILTERED_TRI, sawFiltered);
+    PXG_CHECK_MSG(sawPartial > 0u,
+                  "triangle %u has only TWO of three corners filtered and produced nothing: "
+                  "the filter is an AND (S7), and this is what an `||` port loses", PARTIAL_TRI);
+
+    // The capsule core's branch coverage, measured rather than asserted in a comment.
+    // distanceSegmentTriangleSquared has five exits and they are sixty lines apart; a
+    // transcription slip in one is invisible from the others, so the rig has to reach
+    // more than one or the bit-exact comparison above is only testing a single path.
+    {
+        static const char* const EXIT_NAME[5] = { "plane-crossing", "both-interior",
+                                                  "con0-edge", "con1-edge", "neither" };
+        uint32_t distinct = 0u;
+        std::printf("    segTriSq exits:");
+        for (int e = 0; e < 5; ++e)
+        {
+            std::printf(" %s=%u", EXIT_NAME[e], exitHits[e]);
+            if (exitHits[e] != 0u) ++distinct;
+        }
+        std::printf("\n");
+        // ALL FIVE, not "at least a few".  The fan alone reached three; triangles 41
+        // and 43 were added by hand for the two it missed, so the honest gate is the
+        // number the rig actually achieves.
+        PXG_CHECK_MSG(distinct == 5u,
+                      "the capsule cases reached %u of distanceSegmentTriangleSquared's five "
+                      "exits, not all five; the bit-exact comparison above would then be "
+                      "checking a subset of the branches and calling it the function", distinct);
+    }
+
+    // S8: the high-water mark takes the UNCLAMPED count.
+    const uint32_t needed = downloadBuffer<uint32_t>(dev, bNeeded.h, 1)[0];
+    PXG_CHECK_MSG(needed == NB_FOUND * 16u,
+                  "stackSizeNeeded is %u, expected the UNCLAMPED %u * 16 = %u; the clamped "
+                  "count would give %u and the stack would never grow",
+                  needed, NB_FOUND, NB_FOUND * 16u, NB_STACK * 16u);
+
+    std::printf("    [ note ] %zu contacts (%u sphere, %u capsule) over %u clamped pairs of "
+                "%u claimed; triangle %u filtered out, %u survived on a partial filter\n",
+                expected.size(), nSphere, nCapsule, NB_STACK, NB_FOUND, FILTERED_TRI, PARTIAL_TRI);
+
+    destroyWriter(dev, w);
+    for (PxgBufferHandle h : { bCv.h, bCi.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h,
+                               bRd.h, bRemap.h, bFilters.h, bStack.h, bNum.h, bNeeded.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace

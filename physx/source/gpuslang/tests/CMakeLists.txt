@@ -727,7 +727,10 @@ pxg_compile_shader(femClothContactGenBda cloth_midphaseGenerateVertexPairsLaunch
                    cloth_midphaseGeneratePairsLaunch
                    cloth_boxTriangleContactGenLaunch
                    cloth_convexContactGenLaunch
-                   cloth_convexVertexContactGenLaunch)
+                   cloth_convexVertexContactGenLaunch
+                   # P9.29: the sphere/capsule TRIANGLE path -- the last unmapped
+                   # primitive contact generator on the triangle side.
+                   cloth_SphereContactGenLaunch)
 # P7.1 tranche 4b-1: cloth-vs-rigid contact SORT / reorder on the engine ABI (BDA)
 # — the second half of the cloth-drape-on-a-floor arc.  The single reorder kernel
 # gathers the 4a-generated cloth-vs-rigid contacts into the sorted buffers through

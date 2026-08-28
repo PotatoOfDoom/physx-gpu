@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 368;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 369;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -391,7 +391,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_preIntegrateLaunch", "femClothSimBda.spv", "cloth_preIntegrateLaunch" },  // CLOTH_SIM_PREINTEGRATION (P7.0 BDA port: FEMCloth free-fall predict + integrate)
     { "cloth_refitBoundLaunch", "femClothRefitBda.spv", "cloth_refitBoundLaunch" },  // CLOTH_REFIT_BOUND (P7.2 tranche 3a BDA port)
     { "cloth_midphaseGeneratePairsLaunch", "femClothContactGenBda.spv", "cloth_midphaseGeneratePairsLaunch" },  // CLOTH_MIDPHASE_PRIMITIVES (P9.15b: cloth BV32 tree vs one rigid AABB)
-    { "cloth_SphereContactGenLaunch", nullptr, nullptr },  // CLOTH_SPHERE_CG (unmapped)
+    { "cloth_SphereContactGenLaunch", "femClothContactGenBda.spv", "cloth_SphereContactGenLaunch" },  // CLOTH_SPHERE_CG (P9.29 BDA)
     { "cloth_boxTriangleContactGenLaunch", "femClothContactGenBda.spv", "cloth_boxTriangleContactGenLaunch" },  // CLOTH_BOX_TRIANGLE_CG (P9.15e: cloth triangle vs box, over the lifted convex-triangle core)
     { "cloth_convexContactGenLaunch", "femClothContactGenBda.spv", "cloth_convexContactGenLaunch" },  // CLOTH_CONVEX_CG (P9.20; the CUDA twin of CLOTH_BOX_TRIANGLE_CG)
     { "cloth_SphereVertexContactGenLaunch", "femClothContactGenBda.spv", "cloth_SphereVertexContactGenLaunch" },  // CLOTH_VERT_SPHERE_CG (P7.1 tranche 4a BDA port: cloth-vertex-vs-sphere contact gen)
