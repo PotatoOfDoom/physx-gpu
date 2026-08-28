@@ -773,6 +773,13 @@ static const uint8_t kClothPsMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 }
 // PxgFEMContactWriter by value (80 B) -> the writer lands at 96, not 88, because
 // paramAlign(80) is 16 (P9.15e).
 static const uint8_t kClothPsCg[] = { 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 80 };
+// P9.31: the three SOLVE-side kernels of the same chain.  All pointers, so the
+// rows are plain -- but they are three DIFFERENT lengths and are not aliased:
+// the prepare takes ten, the cloth-side solve seven, and the particle-side solve
+// eight (deltaP is inserted before appliedForces).
+static const uint8_t kClothPsPrepare[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
+static const uint8_t kClothPsSolveCloth[] = { 8, 8, 8, 8, 8, 8, 8 };
+static const uint8_t kClothPsSolveParticle[] = { 8, 8, 8, 8, 8, 8, 8, 8 };
 
 // gpunarrowphase cloth-VERTEX-vs-COOKED-TRIANGLE-MESH contact gen (P9.26):
 //   cloth_meshVertexContactGenLaunch(PxReal tolerenceLength, cmInputs*, transformCache*,
@@ -1780,6 +1787,10 @@ static const PxgKernelAbiRow kRows[] = {
     // gpunarrowphase FEMCloth-vs-PARTICLE midphase + contact gen (P9.30 BDA)
     { "cloth_psMidphaseGeneratePairsLaunch", kClothPsMidphase, uint32_t(sizeof(kClothPsMidphase)) },
     { "cloth_psContactGenLaunch", kClothPsCg, uint32_t(sizeof(kClothPsCg)) },
+    // gpusimulationcontroller FEMCloth-vs-PARTICLE constraint prep + solve (P9.31 BDA)
+    { "cloth_particleContactPrepareLaunch", kClothPsPrepare, uint32_t(sizeof(kClothPsPrepare)) },
+    { "cloth_solveCPOutputClothDeltaVLaunch", kClothPsSolveCloth, uint32_t(sizeof(kClothPsSolveCloth)) },
+    { "cloth_solveCPOutputParticleDeltaVLaunch", kClothPsSolveParticle, uint32_t(sizeof(kClothPsSolveParticle)) },
     { "cloth_meshVertexContactGenLaunch", kClothMeshVertContactGen, uint32_t(sizeof(kClothMeshVertContactGen)) },
     // P9.27: the cloth-vs-HEIGHTFIELD midphase pair, one row for two names.
     { "cloth_heightfieldMidphaseGeneratePairsLaunch", kClothHfMidphase, uint32_t(sizeof(kClothHfMidphase)) },

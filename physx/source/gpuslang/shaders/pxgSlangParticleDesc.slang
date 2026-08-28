@@ -302,3 +302,29 @@ public struct PxgParticleSystemGpu
     public uint64_t mPhaseGroupToMaterialHandle;  // @640 PxU16*
     public uint64_t _pad648;                      // @648 tail pad to align-16 -> 656
 }
+
+// ---------------------------------------------------------------------------
+// P9.31: two accessors that were file-local in psContactSolveBda and are needed
+// again by the cloth-vs-particle solve.  They are moved here rather than copied,
+// by the recorded rule that the engine BDA path gets the modules; the copy in
+// psContactSolveBda should move onto these the next time that file is touched,
+// which is noted rather than done inside a tranche about the cloth chain.
+// ---------------------------------------------------------------------------
+
+// phaseToMat[group], where mPhaseGroupToMaterialHandle is a PxU16 array read
+// through a 32-bit load and a shift/mask.
+public uint pxgLoadPhaseToMaterial(uint64_t handleBase, uint group)
+{
+    let word = (Ptr<uint>(handleBase))[group >> 1];
+    return (word >> ((group & 1u) * 16u)) & 0xffffu;
+}
+
+// getParticleMaterial (PxgParticleSystem.h:64) -- a raw byte-offset dereference
+// with the RUNTIME material stride, then a float by index.  Float layout
+// (PxParticleGpu.h:47): friction@0, damping@1, adhesion@2, gravityScale@3,
+// adhesionRadiusScale@4.
+public float pxgLoadParticleMaterialFloat(uint64_t materialsBase, uint mi, uint stride, uint floatIndex)
+{
+    let elem = materialsBase + uint64_t(mi) * uint64_t(stride);
+    return (Ptr<float>(elem))[floatIndex];
+}
