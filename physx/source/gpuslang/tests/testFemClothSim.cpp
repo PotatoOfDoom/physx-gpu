@@ -11193,6 +11193,53 @@ PXG_TEST(femClothSimPsMidphase)
                 "%u written into a %u-pair stack, counter %u\n",
                 expected.size(), NB_PARTICLES, NB_TRIS, cms.size(), written, STACK_PAIRS, found);
 
+    // ---- M8, the WARP STRIDE, which the run above cannot reach --------------------
+    // The loop strides by gridDim.x * blockDim.y = 1024 * 2 warps.  With six
+    // particles every warp runs at most one iteration and the stride is never taken,
+    // so a mutant that replaces it with gridDim.x alone survives -- a survivor the
+    // rig cannot reach is a hole in the rig, which is what P9.29 measured the hard
+    // way.  So: more particles than the grid has warps, with the only contacting
+    // ones in the tail that a second iteration reaches.
+    {
+        const uint32_t NB_WARPS = 1024u * 2u;          // the shader's PS_NB_WARPS
+        const uint32_t TAIL = 8u;
+        const uint32_t BIG = NB_WARPS + TAIL;
+        std::vector<F4> big(BIG, F4{ 500.0f, 500.0f, 500.0f, 1.0f });   // far from everything
+        for (uint32_t i = NB_WARPS; i < BIG; ++i)
+            big[i] = F4{ 0.0f, 0.15f, 0.0f, 1.0f };    // over triangle 0, inside R
+        DevBuf bBigPart = makeDev(dev, big);
+        std::vector<PxgParticleSystem> psBig(PS_ID + 1u);
+        std::memset(psBig.data(), 0, psBig.size() * sizeof(PxgParticleSystem));
+        psBig[PS_ID].mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bBigPart.addr));
+        psBig[PS_ID].mCommonData.mNumParticles = BIG;
+        DevBuf bPsBig = makeDev(dev, psBig);
+        std::vector<uint32_t> bigStack(BIG * 4u, 0xEEEEEEEEu);
+        DevBuf bBigStack = makeDev(dev, bigStack);
+        std::vector<uint32_t> z2 = { 0u };
+        DevBuf bBigNum = makeDev(dev, z2);
+
+        ClothPsMidphasePush q = p;
+        q.numWorkItems = 1u;                            // one manager keeps the count clean
+        q.particleSystems = bPsBig.addr;
+        q.stackPtr = bBigStack.addr; q.midphasePairsNum = bBigNum.addr;
+        q.stackSizeBytes = BIG * 16u;
+        k.dispatch(1024u, {}, q, 1u, 1u);
+        dev->flush();
+
+        const uint32_t n2 = downloadBuffer<uint32_t>(dev, bBigNum.h, 1)[0];
+        PXG_CHECK_MSG(n2 == TAIL,
+                      "the stride run found %u pairs, expected exactly %u.  %u particles were "
+                      "given to a grid of %u warps and only the last %u touch a triangle, so "
+                      "only a second iteration at the right stride finds them -- more means "
+                      "particles are being visited by several warps, fewer means the second "
+                      "iteration never happened", n2, TAIL, BIG, NB_WARPS, TAIL);
+        std::printf("    [ note ] stride run: %u particles over %u warps -> %u pairs from the "
+                    "%u-particle tail\n", BIG, NB_WARPS, n2, TAIL);
+
+        for (PxgBufferHandle h : { bBigPart.h, bPsBig.h, bBigStack.h, bBigNum.h })
+            dev->destroyBuffer(h);
+    }
+
     for (PxgBufferHandle h : { bCv.h, bCi.h, bTree.h, bDesc.h, bParts.h, bPs.h, bShapes.h,
                                bCms.h, bCd.h, bXf.h, bBounds.h, bStack.h, bNum.h })
         dev->destroyBuffer(h);
@@ -11507,6 +11554,53 @@ PXG_TEST(femClothSimPsContactGen)
         destroyWriter(dev, w2);
         for (PxgBufferHandle h : { bOnePart.h, bPsOne.h, bOneStack.h, bOneNum.h, bOneNeeded.h })
             dev->destroyBuffer(h);
+    }
+
+    // ---- the THREAD STRIDE, which the run above cannot reach ----------------------
+    // 512 blocks x 256 threads = 131072, and seven pairs never reach it.  Hand the
+    // kernel more pairs than the grid has threads, with the only contacting ones in
+    // the tail: a smaller stride does not shift the window, it visits every index
+    // several times over, so the count -- not the membership -- is what separates
+    // them.  Same rig, and same reasoning, as P9.29's.
+    {
+        const uint32_t STRIDE = 512u * 256u;
+        const uint32_t TAIL = 8u;
+        const uint32_t FAR_PAIR_TRI = 6u;      // particle 6 is the one placed far away
+        std::vector<uint32_t> big(size_t(STRIDE + TAIL) * 4u, 0u);
+        for (uint32_t i = 0; i < STRIDE + TAIL; ++i)
+        {
+            const bool tail = (i >= STRIDE);
+            big[size_t(i) * 4 + 1] = tail ? 0u : FAR_PAIR_TRI;   // particle
+            big[size_t(i) * 4 + 2] = tail ? 0u : FAR_PAIR_TRI;   // triangle
+        }
+        DevBuf bBig = makeDev(dev, big);
+        std::vector<uint32_t> bigFound = { STRIDE + TAIL };
+        DevBuf bBigNum = makeDev(dev, bigFound);
+        DevBuf bBigNeeded = makeDev(dev, zero);
+        WriterBufs w2 = makeWriter(dev, 64u);
+
+        ClothPsCgPush q = p;
+        q.stackPtr = bBig.addr; q.midphasePairsNum = bBigNum.addr;
+        q.stackSizeBytes = (STRIDE + TAIL) * 16u;
+        q.stackSizeNeeded = bBigNeeded.addr;
+        q.wPoint = w2.point.addr; q.wNormalPen = w2.normalPen.addr; q.wBary = w2.barycentric.addr;
+        q.wInfo = w2.info.addr; q.wCount = w2.count.addr;
+        q.wByX = w2.byRigid.addr; q.wTempByX = w2.tempByRigid.addr; q.wIdxByX = w2.idxByRigid.addr;
+        q.wMaxContacts = 64u;
+        k.dispatch(512u, {}, q, 1u, 1u);
+        dev->flush();
+
+        const uint32_t n2 = downloadBuffer<uint32_t>(dev, w2.count.h, 1)[0];
+        PXG_CHECK_MSG(n2 == TAIL,
+                      "the stride run produced %u contacts, expected exactly %u over %u pairs "
+                      "against %u threads; more means the stride is too small and pairs are "
+                      "visited several times, fewer means the second iteration never happened",
+                      n2, TAIL, STRIDE + TAIL, STRIDE);
+        std::printf("    [ note ] stride run: %u pairs over %u threads -> %u contacts from the "
+                    "%u-pair tail\n", STRIDE + TAIL, STRIDE, n2, TAIL);
+
+        destroyWriter(dev, w2);
+        for (PxgBufferHandle h : { bBig.h, bBigNum.h, bBigNeeded.h }) dev->destroyBuffer(h);
     }
 
     destroyWriter(dev, w);
