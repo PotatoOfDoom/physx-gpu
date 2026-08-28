@@ -1719,6 +1719,140 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.28a — Nachtrag: die zweite Zahl, die Szenen, und der Absturz gehört mir doch nicht
+
+Manifest unverändert **368**, keine Quelldatei geändert. Dieser Eintrag trägt
+die beiden Messungen nach, die P9.27b und P9.28 ausdrücklich offen gelassen
+haben — und nimmt **drei** eigene Behauptungen zurück, eine davon aus der
+Überschrift von P9.27b, eine aus dem Entwurf dieses Eintrags.
+
+### 1. Der zweite Speichermodus
+
+**821/821** mit `PXG_DEVICE_V2=1`, und **821/821** im Vorgabemodus daneben.
+P9.28 hat die zweite Zahl offen gelassen, statt sie vorwegzunehmen; hier ist
+sie. Beide sind in **dieser** Runde gemessen, hinter P9.28, nicht aus einem
+älteren Protokoll übernommen — einem Protokoll sieht man die gesetzte
+Umgebungsvariable nicht an, und das ist Grund genug, neu zu messen.
+
+### 2. Die Szenen
+
+**33 ok, 0 fail, 0 missing (von 33).** P9.27b hat das Manifest von 366 auf 368
+gehoben und den Szenenlauf deshalb schuldig geblieben; P9.28 hat danach fünfzehn
+Shader angefasst. Beide Schulden deckt **ein** Lauf, weil er hinter beiden
+Tranchen liegt. `clothmesh` steht weiter in der ausstehenden Arbeit und misst
+weiter dieselbe Zahl wie vor P9.26 — genau das ist dort die Aussage, und sie
+hält.
+
+Ein Container-Neustart hat den ersten Anlauf bei 29 von 33 abgeschnitten (alle
+29 grün). Ein halber Lauf plus ein halber Lauf ist kein Lauf: der Satz wurde
+vollständig neu gefahren, und die 33 oben stammen aus diesem einen Durchgang.
+
+### 3. Der Absturz: ein Kernabzug, und was er widerlegt
+
+**Die Werkzeuge, bevor die Messung.** Ein sporadischer Fehler bestraft jedes
+Werkzeug, das den Prozess anfasst:
+
+* `gdb` **stört ihn** — P9.27b hat ihn dort erst im vierten Versuch erwischt, in
+  dieser Runde in keinem einzigen. Und es schaltet **ASLR ab**, sofern man nicht
+  `set disable-randomization off` sagt, also genau die Abbildung, um die es hier
+  geht.
+* Ausgabe in eine Datei ist **blockgepuffert**, und `SIGSEGV` verwirft den
+  Puffer: die letzte Zeile vor dem Absturz fehlt dann systematisch, und der
+  abstürzende Test sieht anders aus, als er ist. `stdbuf -oL` bringt sie zurück.
+* Der **Kernabzug** (`ulimit -c unlimited`) ist das einzige der drei, das misst,
+  ohne den Prozess zu verändern. Er kam im **ersten** Stapel.
+
+**Was er sagt:**
+
+```
+Fehleradresse   0x7f2e6a413000
+RSP             0x7f2e601fcb00     ->  162 MiB UNTER der Fehleradresse
+RIP             0x7f2e6a414767     ->  5991 Bytes ÜBER der Fehleradresse
+
+  0x00007f2e6a40d000 - 0x00007f2e6a412000   load96
+  [ 0x7f2e6a412000   - 0x7f2e6a414000    in der Abbildungsliste NICHT vorhanden ]
+  0x00007f2e6a414000 - 0x00007f2e6a418000   load97   <- RIP liegt hier
+```
+
+Der Befehlszeiger steht in `load97`, also in **JIT-erzeugtem Code von llvmpipe**,
+und der Zugriff geht **unter das eigene Segment**, in ein **zwei Seiten großes
+Loch** zwischen zwei geladenen Objekten — eine Seite tiefer als der eigene
+Segmentanfang, knapp sechs Kilobyte unter dem laufenden Befehl.
+
+**Zurückgenommen, Nummer eins.** P9.28 nannte das eine
+„**Stapelschutzseiten**-Signatur". Das war aus der **Nähe zum Befehlszeiger**
+*geschlossen*, nicht gemessen — und der Stapel liegt **162 MiB** entfernt. Nähe
+zu RIP sagt über den Stapel nichts. (Die noch frühere Einordnung „P9.22s
+Signatur" hatte P9.28 bereits zurückgenommen: dort war es ein Shader-**Index**,
+hier ist es überhaupt keine Shader-Adresse.)
+
+**Zurückgenommen, Nummer zwei — sie steht in einer Überschrift.** P9.27b heißt
+„… und ein sporadischer Absturz, **der mir gehört**", und begründet das damit,
+dass die auslösende Vorrichtung aus P9.26 stammt. Die Vorrichtung ist der
+**Auslöser**, nicht der **Eigentümer**: sie lässt llvmpipe JIT-Code erzeugen und
+ausführen, und der greift unter sich selbst. Eine Vorrichtung, die einen fremden
+Übersetzer zum Fehler bringt, hat den Fehler nicht.
+
+**Was eine Portierungsursache zusätzlich ausschließt:**
+
+| Beobachtung | Was sie ausschließt |
+|---|---|
+| 8/48 vor **und** nach P9.28s Sentinel-Reparatur | einen Zugriff außerhalb der Grenzen an einer der achtzehn Stellen |
+| 8/48 schon **ohne** P9.27bs Änderungen (Commit 9679c9e) | P9.27b als Ursache |
+| der abstürzende Test **wandert** (`femClothSimMeshVertMidphase`, dann `femClothSimTriMidphase`) | einen einzelnen falschen Zugriff in einem festen Shader |
+| skaliert mit `LP_NUM_THREADS` (2/24 bei ein bis zwei, 5/24 voreingestellt) | eine vom Shader-**Inhalt** bestimmte Ursache |
+| Fehleradresse in einem Loch **zwischen zwei llvmpipe-Objekten**, RIP im oberen davon | einen Zugriff über einen BDA-Zeiger: der landet im Heap, nicht sechs Kilobyte unter dem eigenen Code |
+
+**Verdikt: ein Defekt in llvmpipe/Mesa, kein Portierungsfehler.** Er ist
+dokumentiert und wird **nicht** gemeldet — dieselbe stehende Regel wie für die
+Kandidaten am Ursprungscode.
+
+**Was unsicher bleibt, ausdrücklich:** ein Kernabzug darf Seiten auslassen.
+„In der Abbildungsliste des Abzugs nicht vorhanden" ist ein starkes Indiz, aber
+nicht dasselbe wie „zum Zeitpunkt des Fehlers nicht abgebildet". Diese Lücke
+schließt nur ein Werkzeug, das den Prozess beobachtet, ohne ihn zu stören — und
+`gdb` ist aus dem oben genannten Grund keines. Die Schlussfolgerung hängt aber
+nicht allein daran: die Beobachtungen der Tabelle stehen unabhängig davon.
+
+**Reproduktion** (aus `build-gpuslang`, `PXG_SHADER_DIR` gesetzt):
+
+```sh
+for i in $(seq 1 12); do
+  for j in 1 2 3 4; do (ulimit -c unlimited; ./gpuslang-tests femClothSim >/dev/null 2>&1) & done
+  wait
+done
+```
+
+**Nicht** unter `gdb` laufen lassen — das schiebt ihn weg.
+
+**Zurückgenommen, Nummer drei — im Entwurf dieses Eintrags, und die Prüfung hat
+sie erwischt.** Der Entwurf schrieb: „Folge für die Suite: keine, denn `ctest`
+fährt dasselbe Binärprogramm nicht vierfach parallel gegen sich selbst." Das ist
+**falsch**, und `ctest --show-only=json-v1` sagt es in einer Zeile:
+
+```
+gpuslang.scan  ->  ['…/build-gpuslang/gpuslang-tests', 'scan']
+```
+
+Jeder der 821 Tests ist ein eigener Aufruf **desselben** Binärprogramms, also ist
+`ctest -j4` **genau** die Bedingung des Reproduzierers und nicht ihr Gegenteil —
+was auch dazu passt, dass P9.27b den Absturz dort gesehen hat.
+
+Also, was tatsächlich gilt: **beide Modi liefen in dieser Runde sauber durch**,
+`M1_EXIT=0`, `M2_EXIT=0`, je 821/821. Bei einer Rate um 1 zu 6 pro
+Reproduzierer-Stapel sind zwei saubere Vollläufe **kein** Beleg dafür, dass er
+weg ist — sie sind genau das, was man bei dieser Rate häufig sieht. Die Suite
+**kann** flackern; das ist hiermit benannt statt wegerklärt, und der Grund liegt
+nicht im Port.
+
+### Verifikation
+
+* Suite **821/821** in **beiden** Speichermodi, beide in dieser Runde gemessen;
+* Szenen **33/33** über `tools/run_scenes.sh`, hinter P9.27bs Manifest-Änderung
+  **und** P9.28s fünfzehn Shader-Änderungen — ein Lauf für beide Schulden, und
+  nach dem Container-Neustart vollständig neu gefahren statt zusammengesetzt;
+* keine Quelldatei geändert: dieser Eintrag ist Messung und Rücknahme, kein Port.
+
 ## P9.28 — achtzehn Wächter, die keine sind: ein Sentinel vor einem BDA-Zugriff, und eine Hypothese, die sich nicht bestätigt hat
 
 Manifest unverändert **368**. Kein neuer Kernel — diese Tranche repariert eine
