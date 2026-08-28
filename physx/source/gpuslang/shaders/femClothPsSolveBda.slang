@@ -56,9 +56,10 @@
 // ---------------------------------------------------------------------------
 // TRAPS
 // ---------------------------------------------------------------------------
-// S1 -- THE WORK INDEX IS NOT A GRID STRIDE.  Same formula as the prepare
-//     kernel: each block owns a contiguous range whose base depends on the
-//     iteration count.
+// S1 -- THE WORK INDEX.  Same formula as the prepare kernel, and the same
+//     correction: a grid-stride substitution is observation-equivalent (same
+//     set, same lane), while dropping the `nbIterationsPerBlock *` factor is
+//     not.  See P1 in femClothPsPrepareBda.slang for the argument.
 //
 // S2 -- THE CONSTRAINT BLOCK IS WARP-BLOCKED: constraints[workIndex / 32]
 //     indexed by threadIdx.x & 31.

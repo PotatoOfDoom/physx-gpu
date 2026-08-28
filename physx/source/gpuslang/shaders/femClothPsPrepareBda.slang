@@ -39,13 +39,25 @@
 // ---------------------------------------------------------------------------
 // TRAPS
 // ---------------------------------------------------------------------------
-// P1 -- THE WORK INDEX IS NOT A GRID STRIDE.  It is
+// P1 -- THE WORK INDEX IS NOT A GRID STRIDE -- and the first version of this note
+//     said that made a grid stride WRONG.  It does not, and the correction
+//     belongs here because the claim was load-bearing.  The formula is
 //         workIndex = i * blockDim.x + threadIdx.x
 //                   + nbIterationsPerBlock * blockIdx.x * blockDim.x
 //     so each BLOCK owns a CONTIGUOUS range of nbIterationsPerBlock * 256
-//     indices, and the per-block base depends on the ITERATION COUNT, which
-//     itself depends on the contact count.  A grid-stride loop visits a
-//     different set for every count that is not an exact multiple.
+//     indices.  A grid-stride loop visits the SAME set -- both cover [0, N)
+//     exactly once -- and gives the SAME lane, because every term other than
+//     threadIdx.x is a multiple of 256 and hence of 32, so `workIndex % 32 ==
+//     threadIdx.x % 32` under both.  The substitution is therefore
+//     OBSERVATION-EQUIVALENT, and the sweep says so by reporting that mutant as
+//     a survivor; what the upstream formula buys is memory locality, not
+//     correctness.
+//
+//     What IS observable is dropping the `nbIterationsPerBlock *` factor: the
+//     per-block ranges then OVERLAP and the tail is never visited at all.  That
+//     only shows up once nbIterationsPerBlock exceeds 1, i.e. past
+//     gridDim * blockDim = 262144 contacts, which is why the fixture carries a
+//     deliberately huge coverage run alongside its small exact one.
 //
 // P2 -- THE CONSTRAINT BLOCK IS WARP-BLOCKED.  `constraints[workIndex / 32]`
 //     indexed by `threadIdx.x & 31` -- a struct of three lane-arrays
