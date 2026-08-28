@@ -10799,6 +10799,67 @@ PXG_TEST(femClothSimSphereTriContactGen)
                 "%u claimed; triangle %u filtered out, %u survived on a partial filter\n",
                 expected.size(), nSphere, nCapsule, NB_STACK, NB_FOUND, FILTERED_TRI, PARTIAL_TRI);
 
+    // ---- S1, second half: the GRID STRIDE ------------------------------------------
+    // The first dispatch cannot see the stride at all.  With 44 pairs every thread runs
+    // one iteration and stops, so `i += SPHTRI_STRIDE` is never taken and a mutant that
+    // replaces 1024*128 with 1024*4 survives -- measured, as a survivor, before this
+    // block existed.  A survivor that the rig cannot reach is a hole in the rig.
+    //
+    // So: hand the kernel MORE pairs than the grid has threads.  With
+    // numPairs = SPHTRI_STRIDE + 8, threads 0..7 -- and only they -- come back for a
+    // second iteration, and the eight contacting pairs are put exactly there.  Every
+    // pair below the stride names a triangle that is far from both rigids, so the whole
+    // first pass is silent and the count is the second pass alone.
+    //
+    // A SMALLER stride does not merely shift the window: with stride S' < S every index
+    // is visited by S/S' different threads, so the eight tail hits come back S/S' times.
+    // The check is therefore on the exact count, which separates "wrong window" from
+    // "right window, wrong multiplicity" without needing to know which mutant it is.
+    {
+        const uint32_t GRID = 1024u, BLOCK = 128u;
+        const uint32_t STRIDE = GRID * BLOCK;             // 131072, the shader's constant
+        const uint32_t TAIL = 8u;
+        const uint32_t FAR_TRI = 40u;                     // placed at (9,9,9): no contact
+        const uint32_t HIT_TRI = 4u;                      // measured above as contacting
+
+        std::vector<uint32_t> big(size_t(STRIDE + TAIL) * 4u, 0u);
+        for (uint32_t i = 0; i < STRIDE + TAIL; ++i)
+            big[size_t(i) * 4 + 1] = (i < STRIDE) ? FAR_TRI : HIT_TRI;   // cm 0 = the sphere
+        DevBuf bBig = makeDev(dev, big);
+        std::vector<uint32_t> bigFound = { STRIDE + TAIL };
+        DevBuf bBigNum = makeDev(dev, bigFound);
+        DevBuf bBigNeeded = makeDev(dev, zeroNeeded);
+        WriterBufs w2 = makeWriter(dev, 64u);
+
+        ClothSphereTriPush q = p;
+        q.stackPtr = bBig.addr; q.midphasePairsNum = bBigNum.addr;
+        q.stackSizeBytes = (STRIDE + TAIL) * 16u;
+        q.stackSizeNeededOnDevice = bBigNeeded.addr;
+        q.filterPairs = 0ull; q.nbFilterPairs = 0u;
+        q.wPoint = w2.point.addr; q.wNormalPen = w2.normalPen.addr;
+        q.wBary = w2.barycentric.addr; q.wInfo = w2.info.addr; q.wCount = w2.count.addr;
+        q.wByX = w2.byRigid.addr; q.wTempByX = w2.tempByRigid.addr;
+        q.wIdxByX = w2.idxByRigid.addr; q.wSorted32 = w2.sortedByRigid.addr;
+        q.wMaxContacts = 64u;
+        k.dispatch(GRID, {}, q, 1u, 1u);
+        dev->flush();
+
+        const uint32_t n2 = downloadBuffer<uint32_t>(dev, w2.count.h, 1)[0];
+        PXG_CHECK_MSG(n2 == TAIL,
+                      "the stride run produced %u contacts, expected exactly %u.  The "
+                      "kernel was given %u pairs against a grid of %u threads, so only "
+                      "threads 0..%u come back for a second iteration -- more than %u "
+                      "means the stride is too small and pairs are being visited by "
+                      "several threads, fewer means the second iteration never happened",
+                      n2, TAIL, STRIDE + TAIL, STRIDE, TAIL - 1u, TAIL);
+
+        std::printf("    [ note ] stride run: %u pairs over %u threads -> %u contacts "
+                    "from the %u-pair tail\n", STRIDE + TAIL, STRIDE, n2, TAIL);
+
+        destroyWriter(dev, w2);
+        for (PxgBufferHandle h : { bBig.h, bBigNum.h, bBigNeeded.h }) dev->destroyBuffer(h);
+    }
+
     destroyWriter(dev, w);
     for (PxgBufferHandle h : { bCv.h, bCi.h, bDesc.h, bShapes.h, bCms.h, bXf.h, bCd.h,
                                bRd.h, bRemap.h, bFilters.h, bStack.h, bNum.h, bNeeded.h })
