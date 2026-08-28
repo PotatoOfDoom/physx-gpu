@@ -11193,6 +11193,38 @@ PXG_TEST(femClothSimPsMidphase)
                 "%u written into a %u-pair stack, counter %u\n",
                 expected.size(), NB_PARTICLES, NB_TRIS, cms.size(), written, STACK_PAIRS, found);
 
+    // ---- the numWorkItems GUARD --------------------------------------------------
+    // `if (cmIdx >= numWorkItems) return;` never fires when the dispatch has exactly
+    // numWorkItems y-groups, which is what the engine launches and what the run above
+    // does -- so a port that dropped the guard passed, and the sweep said so.  Here
+    // the dispatch is deliberately WIDER than the work: the extra y-groups must
+    // contribute nothing, and without the guard they read a contact manager that is
+    // not there.
+    {
+        std::vector<uint32_t> z3 = { 0u };
+        DevBuf bWideNum = makeDev(dev, z3);
+        std::vector<uint32_t> wideStack(NB_ALLOC * 4u, 0xEEEEEEEEu);
+        DevBuf bWideStack = makeDev(dev, wideStack);
+        ClothPsMidphasePush q = p;
+        q.numWorkItems = 1u;                       // only manager 0 is real work
+        q.stackPtr = bWideStack.addr; q.midphasePairsNum = bWideNum.addr;
+        q.stackSizeBytes = NB_ALLOC * 16u;
+        k.dispatch(1024u, {}, q, 4u, 1u);          // FOUR y-groups for ONE work item
+        dev->flush();
+
+        uint32_t oneMgr = 0u;
+        for (const Pair& e : expected) if (e.cm == 0u) ++oneMgr;
+        const uint32_t nWide = downloadBuffer<uint32_t>(dev, bWideNum.h, 1)[0];
+        PXG_CHECK_MSG(nWide == oneMgr,
+                      "a dispatch of 4 y-groups against numWorkItems=1 found %u pairs, expected "
+                      "the %u of manager 0 alone.  The three extra groups must return at the "
+                      "guard; without it they index a contact manager past the end of the array",
+                      nWide, oneMgr);
+        std::printf("    [ note ] guard run: 4 y-groups, numWorkItems 1 -> %u pairs (manager 0 "
+                    "only)\n", nWide);
+        for (PxgBufferHandle h : { bWideNum.h, bWideStack.h }) dev->destroyBuffer(h);
+    }
+
     // ---- M8, the WARP STRIDE, which the run above cannot reach --------------------
     // The loop strides by gridDim.x * blockDim.y = 1024 * 2 warps.  With six
     // particles every warp runs at most one iteration and the stride is never taken,
@@ -11296,22 +11328,33 @@ PXG_TEST(femClothSimPsContactGen)
     auto vtx = [&](uint32_t t, uint32_t k) {
         const F4& v = cv[t * 3 + k]; return V3{ v.x, v.y, v.z };
     };
-    parts.push_back(F4{ triCentroid(0).x, triCentroid(0).y + 0.20f, triCentroid(0).z, 1.0f }); // face
-    parts.push_back(F4{ vtx(1, 0).x - 0.15f, vtx(1, 0).y + 0.10f, vtx(1, 0).z - 0.15f, 1.0f }); // vertex a
-    parts.push_back(F4{ vtx(2, 1).x + 0.18f, vtx(2, 1).y + 0.08f, vtx(2, 1).z - 0.12f, 1.0f }); // vertex b
-    parts.push_back(F4{ vtx(3, 2).x + 0.05f, vtx(3, 2).y + 0.09f, vtx(3, 2).z + 0.20f, 1.0f }); // vertex c
-    {   // edge ab
-        const V3 a = vtx(4, 0), b = vtx(4, 1);
+    // PARTICLE p IS PAIRED WITH TRIANGLE p+1, never with triangle p.  The first
+    // version of this rig paired p with p, which made C1's `.y`/`.z` swap a NO-OP --
+    // the sweep said so, by reporting `c1-pair-swap` as a survivor against the very
+    // trap the kernel's headline note is about.  With the two index spaces offset,
+    // a swap points at a different triangle and the contact set changes.
+    parts.push_back(F4{ triCentroid(1).x, triCentroid(1).y + 0.20f, triCentroid(1).z, 1.0f }); // face
+    parts.push_back(F4{ vtx(2, 0).x - 0.15f, vtx(2, 0).y + 0.10f, vtx(2, 0).z - 0.15f, 1.0f }); // vertex a
+    parts.push_back(F4{ vtx(3, 1).x + 0.18f, vtx(3, 1).y + 0.08f, vtx(3, 1).z - 0.12f, 1.0f }); // vertex b
+    parts.push_back(F4{ vtx(4, 2).x + 0.05f, vtx(4, 2).y + 0.09f, vtx(4, 2).z + 0.20f, 1.0f }); // vertex c
+    {   // edge ab of triangle 5
+        const V3 a = vtx(5, 0), b = vtx(5, 1);
         const V3 mid{ (a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f, (a.z + b.z) * 0.5f };
         parts.push_back(F4{ mid.x, mid.y + 0.05f, mid.z - 0.22f, 1.0f });
     }
-    {   // edge ac
-        const V3 a = vtx(5, 0), c = vtx(5, 2);
+    {   // edge ac of triangle 6
+        const V3 a = vtx(6, 0), c = vtx(6, 2);
         const V3 mid{ (a.x + c.x) * 0.5f, (a.y + c.y) * 0.5f, (a.z + c.z) * 0.5f };
         parts.push_back(F4{ mid.x - 0.20f, mid.y + 0.05f, mid.z, 1.0f });
     }
-    parts.push_back(F4{ triCentroid(6).x + 9.0f, 9.0f, 9.0f, 1.0f });   // far: no contact (C5)
+    parts.push_back(F4{ triCentroid(7).x + 9.0f, 9.0f, 9.0f, 1.0f });   // far: no contact
+    // THE BAND, for C5.  cDistance is 0.40 and cDistance^2 is 0.16, so a particle
+    // 0.50 above its triangle has sqDist 0.25: rejected by `sqDist <= cDistance^2`
+    // and ACCEPTED by a port that forgot to square.  Without it that mutant lives --
+    // measured, as a survivor.
+    parts.push_back(F4{ triCentroid(0).x, triCentroid(0).y + 0.50f, triCentroid(0).z, 1.0f });
     const uint32_t NB_PARTICLES = uint32_t(parts.size());
+    auto triFor = [&](uint32_t particle) { return (particle + 1u) % NB_TRIS; };
     DevBuf bParts = makeDev(dev, parts);
 
     std::vector<PxgParticleSystem> psArr(PS_ID + 1u);
@@ -11342,8 +11385,8 @@ PXG_TEST(femClothSimPsContactGen)
     for (uint32_t i = 0; i < NB_FOUND; ++i)
     {
         stack[i * 4 + 0] = (i & 1u);                               // alternate managers
-        stack[i * 4 + 1] = (i < NB_PARTICLES) ? i : 0u;            // C1: particle in .y
-        stack[i * 4 + 2] = (i < NB_PARTICLES) ? i : 0u;            //     triangle in .z
+        stack[i * 4 + 1] = (i < NB_PARTICLES) ? i : 0u;                  // C1: particle in .y
+        stack[i * 4 + 2] = (i < NB_PARTICLES) ? triFor(i) : triFor(0u);  //     triangle in .z
     }
     DevBuf bStack = makeDev(dev, stack);
     std::vector<uint32_t> nFound = { NB_FOUND };
@@ -11556,6 +11599,44 @@ PXG_TEST(femClothSimPsContactGen)
             dev->destroyBuffer(h);
     }
 
+    // ---- the WRITER'S CAPACITY GATE ----------------------------------------------
+    // `if (index >= maxNumContacts) return;` never fires above -- 6 contacts against
+    // a 32-slot writer -- so a port that dropped it passed, and the sweep said so.
+    // Here the same pairs run against a writer that holds fewer contacts than they
+    // make: the COUNTER must still climb past the cap (the atomicAdd happens before
+    // the gate), and the buffers past the cap must keep their seeded values.
+    {
+        const uint32_t CAP = 3u;
+        WriterBufs wc = makeWriter(dev, 8u);   // allocate 8, TELL the kernel 3
+        DevBuf bCapNeeded = makeDev(dev, zero);
+        ClothPsCgPush q = p;
+        q.stackSizeNeeded = bCapNeeded.addr;
+        q.wPoint = wc.point.addr; q.wNormalPen = wc.normalPen.addr; q.wBary = wc.barycentric.addr;
+        q.wInfo = wc.info.addr; q.wCount = wc.count.addr;
+        q.wByX = wc.byRigid.addr; q.wTempByX = wc.tempByRigid.addr; q.wIdxByX = wc.idxByRigid.addr;
+        q.wMaxContacts = CAP;
+        k.dispatch(512u, {}, q, 1u, 1u);
+        dev->flush();
+
+        const uint32_t nc = downloadBuffer<uint32_t>(dev, wc.count.h, 1)[0];
+        PXG_CHECK_MSG(nc == uint32_t(expected.size()),
+                      "with a %u-slot cap the counter reads %u; it must still reach %zu, because "
+                      "the atomicAdd happens BEFORE the capacity gate and the engine sizes the "
+                      "next frame from it", CAP, nc, expected.size());
+        const auto capIdx = downloadBuffer<uint32_t>(dev, wc.idxByRigid.h, 8u);
+        uint32_t past = 0u;
+        for (uint32_t i = CAP; i < 8u; ++i)
+            if (capIdx[i] != 0xffffffffu) ++past;
+        PXG_CHECK_MSG(past == 0u,
+                      "%u slots past the %u-slot cap were written; the writer's gate is what "
+                      "stops a contact stream from running off its buffer", past, CAP);
+        std::printf("    [ note ] capacity run: cap %u, counter %u, %u slots past the cap "
+                    "written\n", CAP, nc, past);
+
+        destroyWriter(dev, wc);
+        dev->destroyBuffer(bCapNeeded.h);
+    }
+
     // ---- the THREAD STRIDE, which the run above cannot reach ----------------------
     // 512 blocks x 256 threads = 131072, and seven pairs never reach it.  Hand the
     // kernel more pairs than the grid has threads, with the only contacting ones in
@@ -11565,13 +11646,19 @@ PXG_TEST(femClothSimPsContactGen)
     {
         const uint32_t STRIDE = 512u * 256u;
         const uint32_t TAIL = 8u;
-        const uint32_t FAR_PAIR_TRI = 6u;      // particle 6 is the one placed far away
+        const uint32_t FAR_PARTICLE = 6u;      // the one placed far from everything
         std::vector<uint32_t> big(size_t(STRIDE + TAIL) * 4u, 0u);
         for (uint32_t i = 0; i < STRIDE + TAIL; ++i)
         {
+            // Every pair uses the SAME (particle, triangle) mapping the run above
+            // does -- particle p against triangle triFor(p) -- so the tail contacts
+            // and the body does not.  Writing (0, 0) here instead was silent until
+            // the index spaces were offset: it had been a contacting pair by
+            // accident, and became a non-contacting one for the same reason.
             const bool tail = (i >= STRIDE);
-            big[size_t(i) * 4 + 1] = tail ? 0u : FAR_PAIR_TRI;   // particle
-            big[size_t(i) * 4 + 2] = tail ? 0u : FAR_PAIR_TRI;   // triangle
+            const uint32_t particle = tail ? 0u : FAR_PARTICLE;
+            big[size_t(i) * 4 + 1] = particle;
+            big[size_t(i) * 4 + 2] = triFor(particle);
         }
         DevBuf bBig = makeDev(dev, big);
         std::vector<uint32_t> bigFound = { STRIDE + TAIL };
