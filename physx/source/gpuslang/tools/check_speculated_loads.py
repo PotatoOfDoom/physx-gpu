@@ -228,8 +228,21 @@ def loop_induction(header):
 # one of these IN THIS FUNCTION is bounded by the launch: the dispatch is the
 # data size rounded up to a workgroup, so the index cannot exceed the bound by
 # more than one workgroup.
+# The names actually bound to an SV_ semantic in this corpus, MEASURED not guessed:
+#   dtid 327, groupThreadId 200, groupId 177, gtid 154, gid 147,
+#   dispatchThreadId 65, tid 14, groupID 5, gdim 1.
+# The pattern used to cover dtid/gtid/tid/gid plus a `thread` stem that needs a word
+# boundary before it -- so it matched neither `groupId` nor `globalThreadIdx`, and an
+# index built by hand as `groupThreadId.x + groupId.x * 64u` looked unrooted while the
+# guard on it looked UNIFORM.  Both mistakes point the same way: such a site was
+# skipped entirely rather than tiered.  Adding the names changes no verdict today
+# (the corpus still reports zero un-waived HIGH), so this is a latent gap closed
+# before it bites, not a fix with a finding behind it -- said plainly because a
+# checker's credibility is exactly its record of not overstating.
 SV_SEED = re.compile(r'(?i)\b(?:SV_)?(?:dispatch|group)?thread(?:id|idx|index)?\b|'
-                     r'\b(?:dtid|gtid|tid|gid|globalIdx|globalIndex|groupIndex)\b')
+                     r'\b(?:dtid|gtid|tid|gid|gdim|groupID|groupId|groupIdx|'
+                     r'groupThreadId|dispatchThreadId|globalThreadIdx|globalThreadIndex|'
+                     r'globalIdx|globalIndex|groupIndex)\b')
 PARAM_SPLIT = re.compile(r',(?![^<]*>)')
 
 

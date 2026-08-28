@@ -1855,17 +1855,58 @@ Die zwei Überlebenden sind nachgewiesene Äquivalente. Und der eine davon hat
 etwas Größeres gefunden:
 
 > Ich hatte in den Shader geschrieben, `check_speculated_loads.py` finde die
-> ungeklemmte Fassung. **Gemessen: findet es nicht.** Es stuft die Stelle als
-> NIEDRIG ein mit der Begründung „der Index stammt von einer Thread-Kennung:
-> Überschuss < eine Arbeitsgruppe". Das gilt für ein blankes `globalThreadIdx` —
-> hier ist der Index `wrappedThreadIndex + 2048 * j`, der Überschuss also eine
-> **ganze Schrittweite**, bis zu **32 KiB**. Das ist dieselbe Größenordnung wie
-> der Sprung, den P9.22 als **Absturz** gemessen hat.
+> ungeklemmte Fassung. **Gemessen: findet es nicht.**
 
-Der Kommentar im Shader sagt das jetzt, statt eine Deckung zu behaupten, die es
-nicht gibt. Den blinden Fleck zu schließen ist eine eigene Aufgabe — mit der
-Regel aus P9.23: Einstufung ändern, Selbsttest neu, ganzer Korpus neu, und
-**jede** neue Meldung lesen, statt die Zahl herunterzudrehen.
+Meine erste Erklärung dafür war ein blinder Fleck des Prüfers — und die habe ich
+geprüft statt sie zu glauben. Sie hielt nicht. Der Nachtrag unten sagt, was
+stattdessen der Fall ist.
+
+### Nachtrag: eine Behauptung, die ich zurückgezogen habe
+
+Im Shader stand zuerst, `check_speculated_loads.py` finde die ungeklemmte Fassung
+von H1. **Gemessen: findet es nicht.** Meine erste Erklärung dafür war, der
+Prüfer habe einen blinden Fleck für **Schrittweiten** — der Index sei
+`wrappedThreadIndex + 2048 * j`, der Überschuss also eine ganze Schrittweite von
+32 KiB und keine Arbeitsgruppe.
+
+Dann habe ich die Regel **gebaut**, die das fangen würde, und über den Korpus
+gefahren. Sie schlägt an **sechsunddreißig** Stellen an — und die sind die ganz
+gewöhnliche Gitterschritt-Schleife, aus der dieser Port besteht:
+
+```
+workIndex = it * BLOCK + tid + numIterationPerBlock * blockIdx * BLOCK
+```
+
+überschreitet um genau ein BLOCK, auf dieselbe Weise. **Die Höhenfeld-Stelle ist
+keine besondere Gefahr; sie hat dieselbe Form wie jede Schrittweiten-Schleife
+hier**, und der Prüfer benennt diese Form längst als `LOW-loop` mit der
+Begründung „Überschuss ≤ eine Schrittweite".
+
+> Eine Regel, die ein etabliertes Muster an sechsunddreißig Stellen neu meldet,
+> ist Rauschen und kein Tor. Also wurde nichts davon ausgeliefert.
+
+Eine frühere, breitere Fassung meldete **158** — auch das war ein Fehler meines
+Werkzeugs: der Startmuster-Ausdruck erkannte weder `groupId` noch
+`globalThreadIdx`, also sahen von Hand gebaute Thread-Kennungen unverwurzelt aus
+**und ihre Wächter uniform**, wodurch solche Stellen gar nicht erst geprüft
+wurden. Diese Lücke ist echt und **ist behoben** — mit einer aus dem Korpus
+**gemessenen** Namensliste (dtid 327, groupThreadId 200, groupId 177, gtid 154,
+gid 147, dispatchThreadId 65, tid 14, groupID 5, gdim 1). Sie ändert heute **kein
+einziges Urteil**, und genau das steht auch so in der Datei: eine latente Lücke,
+geschlossen bevor sie beißt, keine Behebung mit einem Fund dahinter.
+
+Was **offen** bleibt, ist die größere Frage, die ich nicht gestellt hatte: ist ein
+Überschuss von einer Schrittweite überhaupt zulässig? Er wird heute korpusweit
+akzeptiert. Sie zu beantworten braucht Belege darüber, was llvmpipe mit einem
+Laden tut, dessen Wächter für einen **ganzen** SIMD-Vektor falsch ist — nimmt es
+den Sprung, wird nichts spekuliert und `LOW-loop` hat recht; hebt der Backend das
+Laden trotzdem heraus, hat es korpusweit unrecht. P9.22 entscheidet das nicht:
+jener Index war nur durch einen **Parameter** begrenzt, was der Prüfer weiterhin
+als HIGH meldet.
+
+Die Klemmung bleibt trotzdem: sie kostet ein `min()`, entfernt einen Über-Lesezugriff,
+den die CUDA macht und diese Plattform nicht braucht, und weder Vorrichtung noch
+Mutant können sie sehen — weshalb sie im Shader-Kopf steht.
 
 ### Verifikation
 

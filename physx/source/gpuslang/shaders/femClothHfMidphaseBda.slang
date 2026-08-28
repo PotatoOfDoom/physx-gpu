@@ -69,18 +69,30 @@
 //     changes no output and removes the fault.  That is the fix pattern P9.22
 //     established.
 //
-//     NO CHECK CURRENTLY COVERS IT, and that was measured rather than assumed.
+//     NO CHECK COVERS IT, and the reason is more interesting than a gap.
 //     Removing the clamp and running tools/check_speculated_loads.py reports
-//     NOTHING: it tiers the site LOW with the reason "the index is assigned here
-//     from a thread id: overshoot < one workgroup".  That heuristic holds for a
-//     bare globalThreadIdx, where the read runs at most a workgroup past the end.
-//     It does not hold HERE: the index is `wrappedThreadIndex + 2048 * j`, so the
-//     overshoot is a full STRIDE -- up to 2047 float4s, 32 KiB -- which is the
-//     same order as the jump P9.22 measured as a crash.  The checker has a blind
-//     spot for strided indices and closing it is its own task, filed rather than
-//     asserted away.  A mutation sweep cannot see this site either (the value is
-//     discarded), so for now the clamp is held only by this comment and by the
-//     sweep entry that records it as a deliberate equivalent.
+//     NOTHING, and the first reading of that was mine being wrong: I took it for
+//     a blind spot, on the grounds that the index is `wrappedThreadIndex +
+//     2048 * j` and so overshoots by a full STRIDE -- 2047 float4s, 32 KiB --
+//     rather than by the workgroup the LOW-launch tier assumes.
+//
+//     Then I built the rule that would catch it and ran it over the corpus.  It
+//     fires on THIRTY-SIX sites, and they are the ordinary grid-stride loop that
+//     this port is made of: `workIndex = it * BLOCK + tid + ...` overshoots by
+//     one BLOCK in exactly the same way.  This site is not a special hazard; it
+//     is the same shape as every strided loop here, and the checker already
+//     names that shape LOW-loop with the reason "overshoot <= one stride".
+//
+//     So the claim was withdrawn rather than shipped.  Whether a one-stride
+//     overshoot is acceptable AT ALL is a real question, but it is a question
+//     about the whole corpus and about what llvmpipe actually does with a fully
+//     masked vector -- not about this shader.  P9.22's crash was a different
+//     tier: an index bounded only by a PARAMETER, with nothing in the function
+//     relating it to the buffer, which the checker still reports HIGH.
+//
+//     The clamp stays regardless.  It costs one min(), it removes an over-read
+//     the CUDA performs and this platform need not, and no fixture or mutant can
+//     see it either way -- which is why it is written down here.
 //
 //     Upstream candidate 36; documented, NOT reported.
 //
