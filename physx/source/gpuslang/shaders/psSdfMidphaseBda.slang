@@ -154,23 +154,12 @@ PsContactWriter sdWriter()
     return w;
 }
 
-// W11: globalScanExclusive<NbWarps>, reduction.cuh:673-689.  The block scan is
-// P9.12e's; what this adds is the single atomic and the two barriers around it.
-groupshared uint gSdGlobalOffset;
-
+// W11: globalScanExclusive<NbWarps>, reduction.cuh:669-687.  This lived here as a
+// private copy from P9.12h until P9.34c gave it a second consumer; it is now
+// `sdfGlobalScanExclusive` in pxgSlangSdfFind, beside the block scan it is built on.
 uint sdGlobalScanExclusive(uint tid, bool threadContributesElement)
 {
-    GroupMemoryBarrierWithGroupSync();
-
-    uint threadBlockTotalSum;
-    const uint indexInThreadBlock = sdfBlockScanExclusive(tid, threadContributesElement,
-                                                          threadBlockTotalSum);
-    // Only ONE thread per block performs an atomic add.
-    if (tid == 0u)
-        InterlockedAdd(Ptr<uint>(gSd.w_numTotalContacts)[0], threadBlockTotalSum, gSdGlobalOffset);
-
-    GroupMemoryBarrierWithGroupSync();
-    return indexInThreadBlock + gSdGlobalOffset;
+    return sdfGlobalScanExclusive(tid, threadContributesElement, gSd.w_numTotalContacts);
 }
 
 // ===========================================================================

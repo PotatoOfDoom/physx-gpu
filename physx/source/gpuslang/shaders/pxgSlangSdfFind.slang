@@ -437,4 +437,29 @@ uint sdfFindInterestingTriangles(uint tid, uint nbPrimitives, uint64_t meshInd, 
                                          startIndex, 0UL);
 }
 
+// ---------------------------------------------------------------------------
+// globalScanExclusive<NbWarps>, reduction.cuh:669-687 -- P9.34c.
+//
+// The block scan above plus ONE atomic add by thread 0 and the two barriers
+// around it.  psSdfMidphaseBda carried a private copy of this from P9.12h; it
+// became the second consumer's problem at P9.34c, so it lives here now and takes
+// the counter's address as a parameter rather than reaching for a push constant.
+// ---------------------------------------------------------------------------
+groupshared uint gSdfGlobalOffset;
+
+uint sdfGlobalScanExclusive(uint tid, bool threadContributesElement, uint64_t counterAddr)
+{
+    GroupMemoryBarrierWithGroupSync();
+
+    uint threadBlockTotalSum;
+    const uint indexInThreadBlock = sdfBlockScanExclusive(tid, threadContributesElement,
+                                                          threadBlockTotalSum);
+    // Only ONE thread per block performs an atomic add.
+    if (tid == 0u)
+        InterlockedAdd(Ptr<uint>(counterAddr)[0], threadBlockTotalSum, gSdfGlobalOffset);
+
+    GroupMemoryBarrierWithGroupSync();
+    return indexInThreadBlock + gSdfGlobalOffset;
+}
+
 #endif // PXG_SLANG_SDF_FIND

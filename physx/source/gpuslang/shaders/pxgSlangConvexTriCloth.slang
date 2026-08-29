@@ -575,7 +575,7 @@ uint contactReduce5(float3 ptRaw[32], float sep[32], float3 normal, uint allMask
 }
 
 // ---- writeRigidVsDeformableContact (PxgFEMCore.h) ---------------------------
-void writeRigidVsDeformableContact(FcCtWriter w, uint index, float4 contact, float4 normalPen, float4 bary,
+public void writeRigidVsDeformableContact(FcCtWriter w, uint index, float4 contact, float4 normalPen, float4 bary,
                                    uint2 pairInd0, uint pairInd1, uint rigidMaterialIndex, uint2 rigidId)
 {
     if (index >= w.maxContacts) return;

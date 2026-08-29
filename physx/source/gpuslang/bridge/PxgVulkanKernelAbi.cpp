@@ -1123,6 +1123,22 @@ static const uint8_t kPsHfCollide[] = { 1, 4, 8, 8, 8, 8, 8, 8, 8, 72 };
 //   which put the pair on Y and the diffuse pass on Z; here the pair is on X.
 static const uint8_t kPsSdfCollide[] = { 4, 8, 8, 8, 8, 8, 8, 8, 72 };
 
+// gpunarrowphase/src/CUDA/femClothPrimitives.cu:2310 (P9.34c, the SDF CLOTH contact gen):
+//   cloth_sdfMeshContactGenLaunch(const PxU32 numWorkItems, const PxgContactManagerInput*,
+//     const PxsCachedTransform*, const PxReal* contactDistances, const PxReal* restDistances,
+//     const PxgShape*, const PxgFEMCloth*, const PxNodeIndex* shapeToRigidRemapTable,
+//     PxgRigidFilterPair* filterPairs, const PxU32 nbFilterPairs,
+//     PxgFEMContactWriter writer)
+//   The particle sibling above is the closest relative and STILL cannot share a row: it
+//   leads with a PxReal the kernel never reads where this one leads with a real PxU32
+//   count, it has no filter-pair pair, and its by-value writer is the PARTICLE writer at
+//   72 bytes rather than the FEM one at 80.  Two 4-byte scalars in different places and a
+//   writer of a different size -- reusing kPsSdfCollide would hand this kernel the filter
+//   list where the writer's first pointer belongs.
+//   Launch site PxgNarrowphaseCore.cpp:6507: grid (numTests, 1, 1) x block (1024, 1, 1) --
+//   ONE BLOCK per test, whatever the "each warp deal with one test" comment above it says.
+static const uint8_t kClothSdfContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80 };
+
 // gpucommon/src/CUDA/radixSortImpl.cu (P6.2 grid radix sort):
 //   radixSortMultiBlockLaunchWithoutCount(PxgRadixSortDesc* desc, PxU32 startBit)
 //   / radixSortMultiCalculateRanksLaunchWithoutCount(same ABI) — the numKeys
@@ -1874,6 +1890,8 @@ static const PxgKernelAbiRow kRows[] = {
     // gpunarrowphase particleSystemHFMidPhaseCG.cu:262 (P9.11 particle-vs-heightfield)
     { "ps_heightfieldCollisonLaunch", kPsHfCollide, uint32_t(sizeof(kPsHfCollide)) },
     { "ps_sdfMeshCollisonLaunch", kPsSdfCollide, uint32_t(sizeof(kPsSdfCollide)) },
+    // gpunarrowphase femClothPrimitives.cu:2310 (P9.34c, the SDF CLOTH contact gen)
+    { "cloth_sdfMeshContactGenLaunch", kClothSdfContactGen, uint32_t(sizeof(kClothSdfContactGen)) },
     // gpucommon radixSortImpl.cu:39 / :53 — the PLAIN radix twins (P6.4b-1 BDA);
     // same {8,4} pack as the WithoutCount twins (numKeys deref'd on-device).
     { "radixSortMultiBlockLaunch", kRadixDescPlain, uint32_t(sizeof(kRadixDescPlain)) },
