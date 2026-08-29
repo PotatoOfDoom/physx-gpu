@@ -1066,6 +1066,96 @@ PXG_TEST(sdfTriangleCollision)
                      1.0f, "d0-eq-d1" });
     tris.push_back({ posOfF(box, 6, 4, 6),  posOfF(box, 6, 8, 6),  posOfF(box, 11, 6, 6),
                      1.0f, "d0-eq-d1-b" });
+    // D1's cascade is straddled only by a triple that satisfies THREE conditions at
+    // once: d0 == d1 bitwise, and both strictly less than d2 AND than the centroid's
+    // distance.  P9.34a added mirror-symmetric triangles which met the equality and
+    // failed the centroid condition, so both cascade mutants survived.  Guessing
+    // coordinates is the wrong tool -- the distances are GPU-only, so the fixture
+    // SEARCHES for the triple instead, in two sampling passes.
+    {
+        // Pass A: a grid of candidates across and around the box.
+        std::vector<PxVec4> cand;
+        for (int gx = -2; gx <= 16; gx += 2)
+            for (int gy = -2; gy <= 16; gy += 2)
+                for (int gz = -2; gz <= 16; gz += 2)
+                {
+                    const PxVec3 q = posOfF(box, float(gx), float(gy), float(gz));
+                    cand.push_back(PxVec4(q.x, q.y, q.z, 1.0f));
+                }
+        const uint32_t NC = uint32_t(cand.size());
+        std::vector<float> outC(size_t(NC) * STRIDE_GRAD, 0.0f);
+        PxgBufferHandle bCand = mkBuf(asBytes(cand.data(), cand.size() * sizeof(PxVec4)));
+        PxgBufferHandle bOutC = mkBuf(asBytes(outC.data(), outC.size() * sizeof(float)));
+        auto sampleDist = [&](PxgBufferHandle pts, PxgBufferHandle out, uint32_t n) {
+            P_Coll pc = {};
+            pc.meshPtr = blobAddr;
+            pc.points = dev->getBufferDeviceAddress(pts);
+            pc.gradIn = dev->getBufferDeviceAddress(bZero);
+            pc.dirSeed = dev->getBufferDeviceAddress(bZero);
+            pc.outBuf = dev->getBufferDeviceAddress(out);
+            pc.numPoints = n;
+            Kernel k(Kernel::Bindless{}, "npSdfCollision.spv", "sdfCollDistance", {}, sizeof(P_Coll));
+            if (!k.isValid()) return false;
+            k.dispatch((n + 63) / 64, {}, pc);
+            dev->flush();
+            return true;
+        };
+        bool found = false;
+        if (sampleDist(bCand, bOutC, NC))
+        {
+            const auto C = downloadBuffer<float>(dev, bOutC, size_t(NC) * STRIDE_GRAD);
+            auto dOf = [&](uint32_t i) { return C[size_t(i) * STRIDE_DIST + 8]; };
+
+            // Pass B: for the equal-distance pairs, sample the centroids they would form.
+            struct Cand { uint32_t i, j, k; };
+            std::vector<Cand> triples;
+            std::vector<PxVec4> cents;
+            for (uint32_t i = 0; i < NC && cents.size() < 2000u; ++i)
+                for (uint32_t j = i + 1; j < NC && cents.size() < 2000u; ++j)
+                {
+                    if (f2u(dOf(i)) != f2u(dOf(j))) continue;
+                    for (uint32_t k = 0; k < NC && cents.size() < 2000u; ++k)
+                    {
+                        if (k == i || k == j || !(dOf(i) < dOf(k))) continue;
+                        const PxVec3 pi(cand[i].x, cand[i].y, cand[i].z);
+                        const PxVec3 pj(cand[j].x, cand[j].y, cand[j].z);
+                        const PxVec3 pk(cand[k].x, cand[k].y, cand[k].z);
+                        const PxVec3 ct = (pi + pj + pk) * (1.0f / 3.0f);
+                        cents.push_back(PxVec4(ct.x, ct.y, ct.z, 1.0f));
+                        triples.push_back({ i, j, k });
+                    }
+                }
+            if (!cents.empty())
+            {
+                const uint32_t NCC = uint32_t(cents.size());
+                std::vector<float> outCC(size_t(NCC) * STRIDE_GRAD, 0.0f);
+                PxgBufferHandle bCent = mkBuf(asBytes(cents.data(), cents.size() * sizeof(PxVec4)));
+                PxgBufferHandle bOutCC = mkBuf(asBytes(outCC.data(), outCC.size() * sizeof(float)));
+                if (sampleDist(bCent, bOutCC, NCC))
+                {
+                    const auto CC = downloadBuffer<float>(dev, bOutCC, size_t(NCC) * STRIDE_GRAD);
+                    for (uint32_t t = 0; t < NCC && !found; ++t)
+                    {
+                        const float dc = CC[size_t(t) * STRIDE_DIST + 8];
+                        const Cand& c = triples[t];
+                        if (!(dOf(c.i) < dc)) continue;     // the centroid must be SHALLOWER
+                        tris.push_back({ PxVec3(cand[c.i].x, cand[c.i].y, cand[c.i].z),
+                                         PxVec3(cand[c.j].x, cand[c.j].y, cand[c.j].z),
+                                         PxVec3(cand[c.k].x, cand[c.k].y, cand[c.k].z),
+                                         1.0f, "cascade-straddle" });
+                        found = true;
+                        std::printf("    [ note ] cascade straddle found: d0 = d1 = %.9g, "
+                                    "d2 = %.9g, centroid %.9g\n", dOf(c.i), dOf(c.k), dc);
+                    }
+                }
+            }
+        }
+        PXG_CHECK_MSG(found,
+                      "no triple in the search grid satisfies d0 == d1 < min(d2, d_centroid), so "
+                      "D1's asymmetric cascade -- whose second arm does not compare against d0 -- "
+                      "is still indistinguishable from a three-way minimum");
+    }
+
     const uint32_t NT = uint32_t(tris.size());
 
     std::vector<PxVec4> tv(size_t(NT) * 3u);

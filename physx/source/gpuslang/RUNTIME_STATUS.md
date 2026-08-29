@@ -1796,7 +1796,7 @@ Und der Unterschied ist der Punkt:
 * **Der Gradient wird nach der Schleife neu abgetastet**, und die
   Schwerpunkt-Distanz von ganz oben wird **verworfen**.
 
-### Drei Fege-Durchgänge: 17 → 19 → **20 von 30**, und was die Überlebenden lehrten
+### Vier Fege-Durchgänge: 17 → 19 → 20 → **22 von 30**, und was die Überlebenden lehrten
 
 Der erste Durchgang ließ **dreizehn** Überlebende — der erste Fegedurchgang in
 einem neuen Gebiet. Die Diagnose zerfällt in zwei saubere Hälften:
@@ -1842,23 +1842,40 @@ sind dasselbe Bitmuster, gleichgültig welchen der Port erzeugt hat. Die Prüfun
 gilt jetzt nur, wo die Arithmetik endlich ist, und der Lauf verlangt, dass
 mindestens ein Dreieck dafür in Frage kam.
 
-### Was noch aussteht
+### Die letzte Lücke, und warum sie nicht durch Raten zu schließen war
 
-`d1-cascade-symmetrised` und `d1-cascade-le` leben weiter. Die Bedingung ist
-präzise bekannt und noch nicht getroffen: es braucht `d0 == d1`, **beide echt
-kleiner** als `d2` **und** als die Schwerpunkt-Distanz. Meine gebundenen
-Dreiecke erzeugen die Gleichheit, aber der Schwerpunkt liegt dort jeweils tiefer,
-also nimmt auch das Original den `else`-Arm. Das ist eine benannte, verstandene
-Lücke für P9.34b, keine Nachsicht — die Bedingung steht hier, damit der nächste
-Durchgang sie gezielt bauen kann.
+`d1-cascade-symmetrised` und `d1-cascade-le` überlebten die ersten drei
+Durchgänge. Die Bedingung ist präzise: es braucht `d0 == d1`, **beide echt
+kleiner** als `d2` **und** als die Schwerpunkt-Distanz. Die spiegelsymmetrischen
+Dreiecke erzeugen die Gleichheit, aber ihr Schwerpunkt liegt jeweils **tiefer**
+als die beiden Ecken, also nimmt auch das Original den `else`-Arm.
+
+Koordinaten zu raten ist hier das falsche Werkzeug: die Distanzen sind
+**GPU-only**, auf dem Host lässt sich nichts vorausrechnen. Die Vorrichtung
+**sucht** das Tripel deshalb selbst, in zwei Abtast-Durchgängen — erst ein Raster
+von Kandidatenpunkten durch `sdfCollDistance`, dann die Schwerpunkte der Paare
+mit **bitgleicher** Distanz — und nimmt das erste, das alle drei Bedingungen
+erfüllt. Gefunden:
+
+```
+d0 = d1 = 0,880421877   d2 = 1,19797802   Schwerpunkt 0,886628032
+```
+
+Beide gebundenen Werte liegen unter `d2` **und** unter dem Schwerpunkt, genau wie
+verlangt. Damit fallen **beide** Mutanten, und der Stand ist **22 von 30** — die
+acht verbleibenden Überlebenden sind sämtlich die oben bewiesenen Äquivalente.
+
+Und der Prüfstand besteht jetzt darauf, dass die Suche etwas findet: schlägt sie
+fehl, sagt die Meldung, dass die Asymmetrie der Kaskade wieder ununterscheidbar
+von einem Drei-Wege-Minimum ist.
 
 ### Verifikation
 
 * Klemmung **4015 Eingaben bitgleich gegen die Engine selbst**, alle sieben Arme
   erreicht;
-* Abstieg über acht Dreiecke plus das entartete auf der dichten Szene:
-  Startarme 2/2/1/3, sechs konvergiert, zwei bis zur Schranke, einmal `d0 == d1`,
-  einmal die Unstetigkeit;
+* Abstieg über **neun** Dreiecke plus das entartete auf der dichten Szene:
+  Startarme 2/3/1/3, sieben konvergiert, zwei bis zur Schranke, **zweimal**
+  `d0 == d1` (davon einmal das gesuchte Straddle), einmal die Unstetigkeit;
 * jede Iteration **bitgleich nachgespielt** — Schrittplan, Klemmung über die
   Engine-Funktion, Konvergenztest und Abbruchpunkt;
 * Suite **823/823** in beiden Speichermodi;
