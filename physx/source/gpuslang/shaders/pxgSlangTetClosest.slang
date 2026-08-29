@@ -267,3 +267,89 @@ public float3 closestPtPointBaryTriangle(float3 c)
     }
     return c;                                            // B5
 }
+
+// ---------------------------------------------------------------------------
+// Gu::closestPtPointTetrahedron, the FIVE-ARGUMENT overload
+// (GuDistancePointTetrahedron.h:77) — P9.35a.
+//
+// Like closestPtPointBaryTriangle above, this one is PX_INLINE PX_CUDA_CALLABLE
+// and takes no texture, so the fixture calls THE ENGINE'S OWN COPY and compares
+// bit for bit.  A second oracle in the same module.
+//
+// IT IS NOT `closestPtTetrahedron` ABOVE, and collapsing the two is the failure
+// mode this header exists to prevent.  Every one of these differs:
+//
+//   G1. THE FACES ARE DIFFERENT, in order AND in winding:
+//         this one    (a,b,c)  (a,c,d)  (a,d,b)  (b,d,c)
+//         the other   (a,b,c)  (a,b,d)  (a,c,d)  (b,c,d)
+//       Only the first face agrees.  The third here is (a,d,b) — b and d
+//       swapped relative to any ascending spelling — and the fourth is (b,d,c).
+//       Since closestPtPointTriangle2 takes its two edge vectors as separate
+//       arguments, a wrong winding is not a sign flip that cancels: the edges
+//       passed are ab/ac, ac/ad, ad/ab and bd/bc, each paired with ITS OWN face.
+//
+//   G2. THERE IS NO HINT MASK.  All four faces are always evaluated.
+//
+//   G3. IT SEEDS FROM FACE 0 rather than from PX_MAX_F32 and an empty point.
+//       The other one takes `sqDist` in as an inout and may leave it untouched;
+//       this one always returns one of the four faces' points.
+//
+//   G4. THE DISTANCE IS TO `p`, not the point's own norm.  `diff = closestPt - p`
+//       and `sqDist = diff.dot(diff)` — the six-argument overload in the .cpp
+//       spells the same idea as `bestClosestPt.dot(bestClosestPt)`, which is only
+//       equal when p is the origin.  This overload is the one the SDF descent
+//       calls, and it is called with a NON-origin p.
+//
+//   G5. TIES GO TO THE EARLIER FACE: the comparison is a strict `<`, so a point
+//       equidistant from two faces keeps the first one evaluated.
+//
+// The SDF descent calls it with the canonical simplex — a = (1,0,0), b = (0,1,0),
+// c = (0,0,1), d = (0,0,0) — so it clamps a barycentric triple back into the
+// standard 3-simplex.  Nothing here assumes that; the fixture feeds it general
+// tetrahedra as well, because the engine copy it is checked against does too.
+// ---------------------------------------------------------------------------
+public float3 guClosestPtPointTetrahedron(float3 p, float3 a, float3 b, float3 c, float3 d)
+{
+    const float3 ab = b - a;
+    const float3 ac = c - a;
+    const float3 ad = d - a;
+    const float3 bc = c - b;
+    const float3 bd = d - b;
+
+    // G3: face 0 is the seed, not a candidate.
+    float3 bestClosestPt = closestPtPointTriangle2(p, a, b, c, ab, ac);
+    float3 diff = bestClosestPt - p;                       // G4
+    float bestSqDist = dot(diff, diff);
+
+    // G1: (a,c,d) with ac/ad.
+    float3 closestPt = closestPtPointTriangle2(p, a, c, d, ac, ad);
+    diff = closestPt - p;
+    float sqDist = dot(diff, diff);
+    if (sqDist < bestSqDist)                               // G5
+    {
+        bestClosestPt = closestPt;
+        bestSqDist = sqDist;
+    }
+
+    // G1: (a,d,b) with ad/ab — NOT (a,b,d).
+    closestPt = closestPtPointTriangle2(p, a, d, b, ad, ab);
+    diff = closestPt - p;
+    sqDist = dot(diff, diff);
+    if (sqDist < bestSqDist)
+    {
+        bestClosestPt = closestPt;
+        bestSqDist = sqDist;
+    }
+
+    // G1: (b,d,c) with bd/bc — NOT (b,c,d).
+    closestPt = closestPtPointTriangle2(p, b, d, c, bd, bc);
+    diff = closestPt - p;
+    sqDist = dot(diff, diff);
+    if (sqDist < bestSqDist)
+    {
+        bestClosestPt = closestPt;
+        bestSqDist = sqDist;
+    }
+
+    return bestClosestPt;
+}

@@ -574,3 +574,213 @@ float sdfDoTriangleCollision(SparseSdfTexture t, float3 v0, float3 v1, float3 v2
     SdfTriTrace tr;
     return sdfDoTriangleCollisionEx(t, v0, v1, v2, point, dir, tolerance, tr);
 }
+
+// ---------------------------------------------------------------------------
+// doTetrahedronSDFCollision, sdfCollision.cuh:286-393 -- P9.35a.
+//
+// The four-vertex sibling of doTriangleSDFCollision above, and the two are close
+// enough that the DIFFERENCES are the whole content of this header.  Same trace
+// arrangement, same reason: the descent samples a texture, so there is nothing on
+// the host to call; the shader logs each iteration and the fixture replays it.
+//
+// WHAT MATCHES the triangle version: the asymmetric start cascade, `difference` as
+// a nested max of SQUARES with one sqrt, `step = 1/(2*difference)` decaying by 0.8
+// BETWEEN the uvw update and the clamp, the convergence test on the post-clamp
+// value with the break before the assignment, and the gradient resampled after the
+// loop and passed RAW to PxSdfSampleWithGrad.
+//
+// WHAT DIFFERS, and every one of these is a way to get it wrong:
+//
+//  E1. THE CASCADE IS FOUR-WAY and asymmetric in the same style: arm 2 compares
+//      `d1` against d2, d3 and dist but NOT against d0; arm 3 compares d2 against
+//      d3 and dist only; arm 4 compares d3 against dist only.  A port that turns
+//      this into a four-way minimum starts somewhere else.
+//
+//  E2. THE ELSE ARM SETS uvw EXPLICITLY to PxVec4(0.25f).  The triangle version
+//      leaves `p` at the centroid and fills uvw with thirds; here the assignment is
+//      written out, and `p` is likewise left at the centroid.
+//
+//  E3. THE CLAMP IS CONDITIONAL.  The triangle version calls its projection every
+//      iteration; this one only calls closestPtPointTetrahedron when some component
+//      escapes [-eps, 1+eps] -- and the escape test is `<= -eps || >= 1+eps`, a
+//      four-way disjunction with NON-STRICT comparisons on both sides.  Making it
+//      unconditional is a different kernel, and so is making either end strict.
+//
+//  E4. `newUVW.w` IS RECOVERED, not clamped.  closestPtPointTetrahedron returns a
+//      three-vector; the fourth barycentric is rebuilt as `1 - cp.x - cp.y - cp.z`,
+//      in that association.  Upstream even flags it: "TODO: Veryfy this logic".
+//
+//  E5. `p` IS REBUILT FROM newUVW WHETHER OR NOT THE CLAMP RAN, so on an iteration
+//      that stays inside the simplex the point comes from the raw gradient step.
+//
+//  E6. THE CONVERGENCE TEST IS A FOUR-COMPONENT MAGNITUDE.  `(uvw - newUVW)` is a
+//      PxVec4 and its magnitudeSquared includes w; dropping w makes the loop stop
+//      earlier on inputs whose w is the only thing still moving.
+//
+//  E7. THE DISCONTINUITY VECTOR IS THE **VERTEX** PATH'S, AND IT IS NORMALISED.
+//      doTriangleSDFCollision uses SDFC_TRI_DISCONTINUITY_DIR raw, because that
+//      constant is exactly unit in float32; this one uses SDFC_DISCONTINUITY_DIR
+//      through getNormalized, and there the normalise is load-bearing -- P9.34a
+//      measured that constant at 0.90790 squared, i.e. 0.95284 long.  Two
+//      constants, two roles, and now both roles appear in the same module.
+//
+//  E8. THE CLAMP IS THE FIVE-ARGUMENT Gu::closestPtPointTetrahedron, applied to
+//      the CANONICAL SIMPLEX (1,0,0), (0,1,0), (0,0,1), (0,0,0) -- not the actual
+//      tetrahedron.  It projects the barycentric triple, not the point.
+// ---------------------------------------------------------------------------
+static const uint SDF_TET_MAX_ITERS = 16u;
+
+struct SdfTetIterTrace
+{
+    float3 gradRaw;     // PxVolumeGrad before normalise
+    float gradMag;      // what normalize() returned
+    float3 gradUsed;    // after normalise / discontinuity substitution
+    float4 newUvw;      // after the CONDITIONAL clamp
+    float stepIn;       // the step this iteration multiplied by
+    uint clamped;       // 1 == the escape test fired and the projection ran
+}
+
+struct SdfTetTrace
+{
+    float d0, d1, d2, d3, dCenter;
+    uint startArm;      // 0..3 = that vertex, 4 = the centroid
+    float4 uvw0;
+    float3 p0;
+    float difference;
+    uint iters;         // iterations actually run (1..16)
+    uint converged;     // 1 == the loop broke on the tolerance
+    SdfTetIterTrace it[16];
+    float3 pFinal;
+    float3 gradFinal;   // the RECOMPUTED gradient
+}
+
+float sdfDoTetrahedronCollisionEx(SparseSdfTexture t, float3 v0, float3 v1, float3 v2, float3 v3,
+                                  out float3 point, inout float3 dir, float tolerance,
+                                  out SdfTetTrace tr)
+{
+    const float3 center = (v0 + v1 + v2 + v3) * 0.25f;
+    float3 p = center;
+
+    const float distC = sdfDistance(t, p);
+    const float d0 = sdfDistance(t, v0);
+    const float d1 = sdfDistance(t, v1);
+    const float d2 = sdfDistance(t, v2);
+    const float d3 = sdfDistance(t, v3);
+    tr.d0 = d0; tr.d1 = d1; tr.d2 = d2; tr.d3 = d3; tr.dCenter = distC;
+
+    float4 uvw = float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    // E1 / E2.  `dist` is shadowed upstream by the winning value; nothing after the
+    // cascade reads it, so only `p` and `uvw` are carried.
+    if (d0 < d1 && d0 < d2 && d0 < d3 && d0 < distC) { p = v0; uvw.x = 1.0f; tr.startArm = 0u; }
+    else if (d1 < d2 && d1 < d3 && d1 < distC)       { p = v1; uvw.y = 1.0f; tr.startArm = 1u; }
+    else if (d2 < d3 && d2 < distC)                  { p = v2; uvw.z = 1.0f; tr.startArm = 2u; }
+    else if (d3 < distC)                             { p = v3; uvw.w = 1.0f; tr.startArm = 3u; }
+    else                                             { uvw = float4(0.25f, 0.25f, 0.25f, 0.25f);
+                                                       tr.startArm = 4u; }
+    tr.uvw0 = uvw;
+    tr.p0 = p;
+
+    // Nested max of SQUARED lengths, one sqrt -- and the nesting is
+    // max(max(e0,e1), max(e2,e3)), not a left fold.
+    const float3 e0 = v0 - p, e1 = v1 - p, e2 = v2 - p, e3 = v3 - p;
+    const float difference = sqrt(max(max(dot(e0, e0), dot(e1, e1)),
+                                      max(dot(e2, e2), dot(e3, e3))));
+    tr.difference = difference;
+
+    const float eps = 1e-4f;
+    const float toleranceSq = 1e-3f * 1e-3f;
+
+    float3 sdfGradient = float3(0.0f, 0.0f, 0.0f);
+    float step = 1.0f / (2.0f * difference);
+
+    uint iters = 0u, converged = 0u;
+    for (uint iter = 0u; iter < SDF_TET_MAX_ITERS; ++iter)
+    {
+        SdfTetIterTrace itr;
+        itr.stepIn = step;
+
+        sdfGradient = sdfVolumeGrad(t, p);
+        itr.gradRaw = sdfGradient;
+
+        // PxVec3::normalize() -- returns the magnitude, divides only when positive.
+        const float gm = sdfcMagnitude(sdfGradient);
+        itr.gradMag = gm;
+        if (gm > 0.0f)
+            sdfGradient = sdfGradient * (1.0f / gm);
+        if (gm == 0.0f)
+            sdfGradient = sdfcGetNormalized(SDFC_DISCONTINUITY_DIR);   // E7
+        itr.gradUsed = sdfGradient;
+
+        const float dfdu = sdfcDot(sdfGradient, v0 - p);
+        const float dfdv = sdfcDot(sdfGradient, v1 - p);
+        const float dfdw = sdfcDot(sdfGradient, v2 - p);
+        const float dfd4 = sdfcDot(sdfGradient, v3 - p);
+
+        float4 newUVW = uvw;
+        newUVW.x -= step * dfdu;
+        newUVW.y -= step * dfdv;
+        newUVW.z -= step * dfdw;
+        newUVW.w -= step * dfd4;
+
+        step = step * 0.8f;                              // between the update and the clamp
+
+        // E3: CONDITIONAL, and non-strict at both ends.
+        uint clamped = 0u;
+        if ((newUVW.x <= -eps || newUVW.x >= 1.0f + eps) ||
+            (newUVW.y <= -eps || newUVW.y >= 1.0f + eps) ||
+            (newUVW.z <= -eps || newUVW.z >= 1.0f + eps) ||
+            (newUVW.w <= -eps || newUVW.w >= 1.0f + eps))
+        {
+            // E8: the CANONICAL simplex, not the real tetrahedron.
+            const float3 cp = guClosestPtPointTetrahedron(newUVW.xyz,
+                                                          float3(1.0f, 0.0f, 0.0f),
+                                                          float3(0.0f, 1.0f, 0.0f),
+                                                          float3(0.0f, 0.0f, 1.0f),
+                                                          float3(0.0f, 0.0f, 0.0f));
+            newUVW.x = cp.x;
+            newUVW.y = cp.y;
+            newUVW.z = cp.z;
+            newUVW.w = 1.0f - cp.x - cp.y - cp.z;         // E4, in that association
+            clamped = 1u;
+        }
+        itr.newUvw = newUVW;
+        itr.clamped = clamped;
+
+        // E5: rebuilt either way.
+        p = v0 * newUVW.x + v1 * newUVW.y + v2 * newUVW.z + v3 * newUVW.w;
+
+        tr.it[iter] = itr;
+        ++iters;
+
+        // E6: FOUR components, and the break precedes the assignment.
+        const float4 duvw = uvw - newUVW;
+        const float dsq = duvw.x * duvw.x + duvw.y * duvw.y +
+                          duvw.z * duvw.z + duvw.w * duvw.w;
+        if (dsq < toleranceSq)
+        {
+            converged = 1u;
+            break;
+        }
+
+        uvw = newUVW;
+    }
+    tr.iters = iters;
+    tr.converged = converged;
+
+    // Recomputed, and passed RAW.
+    sdfGradient = sdfVolumeGrad(t, p);
+    tr.gradFinal = sdfGradient;
+
+    point = p;
+    tr.pFinal = p;
+
+    return sdfSampleWithGrad(t, p, sdfGradient, dir, tolerance);
+}
+
+float sdfDoTetrahedronCollision(SparseSdfTexture t, float3 v0, float3 v1, float3 v2, float3 v3,
+                                out float3 point, inout float3 dir, float tolerance)
+{
+    SdfTetTrace tr;
+    return sdfDoTetrahedronCollisionEx(t, v0, v1, v2, v3, point, dir, tolerance, tr);
+}

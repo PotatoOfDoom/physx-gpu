@@ -95,6 +95,7 @@
 #include "PxgCudaToolkitShim.h"
 #include "pxgSdfSceneRef.h"
 #include "GuDistancePointTriangle.h"   // the ENGINE'S OWN closestPtPointBaryTriangle (P9.34a)
+#include "GuDistancePointTetrahedron.h" // the ENGINE'S OWN closestPtPointTetrahedron (P9.35a)
 
 #include <cmath>
 #include <cstdint>
@@ -1427,6 +1428,578 @@ PXG_TEST(sdfTriangleCollision)
                 "start arms %u/%u/%u/%u, %u with d0 == d1, %u discontinuity substitutions\n",
                 NB, NT, nConverged, nRanOut, armSeen[0], armSeen[1], armSeen[2], armSeen[3],
                 nTied, nSubstituted);
+
+    for (auto h : owned) dev->destroyBuffer(h);
+}
+
+// ===========================================================================
+// P9.35a -- the TETRAHEDRON pair, arranged exactly like the triangle pair above
+// and for the same two reasons.
+//
+//   part 1  Gu::closestPtPointTetrahedron against THE ENGINE'S OWN COPY.  A second
+//           oracle: PX_CUDA_CALLABLE, texture-free, so there is no mirror to be
+//           wrong.  What it has to discriminate is the FACE SET -- the module
+//           already contains a different four-face routine (closestPtTetrahedron,
+//           hint-gated, normal-returning, faces (a,b,c)(a,b,d)(a,c,d)(b,c,d)), and
+//           this one's faces are (a,b,c)(a,c,d)(a,d,b)(b,d,c).  Only the first
+//           agrees.  Random tetrahedra are fed alongside the canonical simplex the
+//           descent actually uses, because the engine copy handles both.
+//
+//   part 2  doTetrahedronSDFCollision, replayed from its own trace.  Same design as
+//           the triangle descent: the shader logs the gradient it USED and the step
+//           it went in with, the host rebuilds everything else and must land on the
+//           logged newUvw bit for bit -- through the ENGINE's clamp, not a mirror.
+//           One field is new, and it is the point of E3: `clamped`.  The projection
+//           here is CONDITIONAL, and on an iteration that stays inside the simplex
+//           it is the identity, so a port that clamps unconditionally is invisible
+//           unless whether-it-ran is compared too.
+// ===========================================================================
+PXG_TEST(sdfTetrahedronCollision)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    if (!dev->supportsBindlessTextures())
+    {
+        std::printf("  NOTE: backend has no descriptor indexing -> skip\n");
+        return;
+    }
+
+    const PxgKernelDef manifest[] = { { "npSdfCollision.spv", "sdfCollTetClamp", 0u, 0u } };
+    static auto loader3 = [](const char* f) { return loadShaderBlob(f); };
+    PxgCudaShim shim(dev, manifest, 1, +loader3);
+    physx::gpuslang::pxgSetVulkanDriverShim(&shim);
+
+    std::vector<PxgBufferHandle> owned;
+    auto mkBuf = [&](const std::vector<uint8_t>& v) {
+        PxgBufferHandle h = createBufferFrom(dev, v);
+        owned.push_back(h);
+        return h;
+    };
+    auto asBytes = [](const void* p, size_t n) {
+        std::vector<uint8_t> v(n);
+        std::memcpy(v.data(), p, n);
+        return v;
+    };
+
+    // ---- part 1: the tetrahedron clamp, against the engine's own copy ---------
+    struct TetCase { PxVec4 p; PxVec4 a, b, c, d; };
+    std::vector<TetCase> tc;
+    const PxVec4 SA(1.0f, 0.0f, 0.0f, 0.0f), SB(0.0f, 1.0f, 0.0f, 0.0f);
+    const PxVec4 SC(0.0f, 0.0f, 1.0f, 0.0f), SD(0.0f, 0.0f, 0.0f, 0.0f);
+    auto addSimplex = [&](float x, float y, float z) {
+        tc.push_back({ PxVec4(x, y, z, 0.0f), SA, SB, SC, SD });
+    };
+    // The canonical simplex, which is what the descent calls it with.  Interior,
+    // each face's outside, each vertex's corner, each edge, and far away.
+    addSimplex(0.25f, 0.25f, 0.25f);
+    addSimplex(0.1f, 0.1f, 0.1f);
+    addSimplex(2.0f, 0.0f, 0.0f);
+    addSimplex(0.0f, 2.0f, 0.0f);
+    addSimplex(0.0f, 0.0f, 2.0f);
+    addSimplex(-1.0f, -1.0f, -1.0f);
+    addSimplex(0.5f, 0.5f, 0.5f);
+    addSimplex(-0.5f, 0.5f, 0.5f);
+    addSimplex(0.5f, -0.5f, 0.5f);
+    addSimplex(0.5f, 0.5f, -0.5f);
+    addSimplex(1.0f, 1.0f, 1.0f);
+    addSimplex(0.0f, 0.0f, 0.0f);
+    addSimplex(1.0f / 3, 1.0f / 3, 1.0f / 3);
+    // A point EQUIDISTANT from two faces of the canonical simplex, so G5's
+    // tie-break (strict `<`, the earlier face wins) is exercised rather than
+    // assumed.  On the canonical simplex the (a,c,d) and (a,d,b) faces are the
+    // y = 0 and z = 0 planes; a point with y == z outside both is equidistant.
+    addSimplex(0.3f, -0.4f, -0.4f);
+    addSimplex(-0.4f, 0.3f, -0.4f);
+    addSimplex(-0.4f, -0.4f, 0.3f);
+    // General tetrahedra, so the face ORDER and WINDING are discriminated on
+    // shapes where the four faces are genuinely different planes.  A degenerate
+    // (all four corners equal) and a flat one (four coplanar corners) are in the
+    // set on purpose: closestPtPointTriangle2's own denominators vanish there and
+    // the engine's answer is whatever it is -- which is exactly what has to match.
+    std::mt19937 rngT(0x7E7A1u);
+    auto rr = [&]() { return (float(rngT() % 400001u) / 100000.0f) - 2.0f; };
+    for (uint32_t i = 0; i < 3000u; ++i)
+        tc.push_back({ PxVec4(rr(), rr(), rr(), 0.0f), PxVec4(rr(), rr(), rr(), 0.0f),
+                       PxVec4(rr(), rr(), rr(), 0.0f), PxVec4(rr(), rr(), rr(), 0.0f),
+                       PxVec4(rr(), rr(), rr(), 0.0f) });
+    {
+        const PxVec4 q(0.3f, 0.4f, 0.5f, 0.0f);
+        tc.push_back({ q, q, q, q, q });                                   // degenerate
+        tc.push_back({ PxVec4(0.5f, 0.5f, 1.0f, 0.0f), PxVec4(0.0f, 0.0f, 0.0f, 0.0f),
+                       PxVec4(1.0f, 0.0f, 0.0f, 0.0f), PxVec4(0.0f, 1.0f, 0.0f, 0.0f),
+                       PxVec4(1.0f, 1.0f, 0.0f, 0.0f) });                  // coplanar
+    }
+    const uint32_t NC = uint32_t(tc.size());
+
+    std::vector<PxVec4> pts(NC), corners(size_t(NC) * 4u);
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        pts[i] = tc[i].p;
+        corners[size_t(i) * 4u + 0] = tc[i].a;
+        corners[size_t(i) * 4u + 1] = tc[i].b;
+        corners[size_t(i) * 4u + 2] = tc[i].c;
+        corners[size_t(i) * 4u + 3] = tc[i].d;
+    }
+    const std::vector<PxVec4> zero4(NC, PxVec4(0.0f));
+    const std::vector<float> outInit(size_t(NC) * 4u, -1234.0f);
+    PxgBufferHandle bPts = mkBuf(asBytes(pts.data(), pts.size() * sizeof(PxVec4)));
+    PxgBufferHandle bCorners = mkBuf(asBytes(corners.data(), corners.size() * sizeof(PxVec4)));
+    PxgBufferHandle bZero = mkBuf(asBytes(zero4.data(), zero4.size() * sizeof(PxVec4)));
+    PxgBufferHandle bOut = mkBuf(asBytes(outInit.data(), outInit.size() * sizeof(float)));
+
+    P_Coll pc = {};
+    pc.points = dev->getBufferDeviceAddress(bPts);
+    pc.gradIn = dev->getBufferDeviceAddress(bZero);
+    pc.dirSeed = dev->getBufferDeviceAddress(bZero);
+    pc.outBuf = dev->getBufferDeviceAddress(bOut);
+    pc.numPoints = NC;
+    pc.triVerts = dev->getBufferDeviceAddress(bCorners);
+    {
+        Kernel k(Kernel::Bindless{}, "npSdfCollision.spv", "sdfCollTetClamp", {}, sizeof(P_Coll));
+        PXG_CHECK_MSG(k.isValid(), "bindless pipeline creation succeeds for sdfCollTetClamp");
+        if (!k.isValid()) { for (auto h : owned) dev->destroyBuffer(h); return; }
+        k.dispatch((NC + 63) / 64, {}, pc);
+    }
+    dev->flush();
+    const auto C = downloadBuffer<float>(dev, bOut, size_t(NC) * 4u);
+
+    size_t badC = 0;
+    uint32_t faceWin[4] = { 0, 0, 0, 0 };
+    uint32_t nTiedFace = 0;
+    for (uint32_t i = 0; i < NC; ++i)
+    {
+        const PxVec3 p(tc[i].p.x, tc[i].p.y, tc[i].p.z);
+        const PxVec3 a(tc[i].a.x, tc[i].a.y, tc[i].a.z);
+        const PxVec3 b(tc[i].b.x, tc[i].b.y, tc[i].b.z);
+        const PxVec3 c(tc[i].c.x, tc[i].c.y, tc[i].c.z);
+        const PxVec3 d(tc[i].d.x, tc[i].d.y, tc[i].d.z);
+        const PxVec3 want = physx::Gu::closestPtPointTetrahedron(p, a, b, c, d);   // THE ENGINE
+        const float* o = &C[size_t(i) * 4u];
+        // Non-finite inputs produce non-finite answers on both sides; a bit compare
+        // of a NaN never matches, so those are compared as bit patterns only when
+        // both are finite and skipped otherwise -- which is a real skip, so the run
+        // insists below that the finite cases dominate.
+        const bool finite = std::isfinite(want.x) && std::isfinite(want.y) &&
+                            std::isfinite(want.z);
+        if (finite && (f2u(o[0]) != f2u(want.x) || f2u(o[1]) != f2u(want.y) ||
+                       f2u(o[2]) != f2u(want.z)))
+        {
+            if (badC < 4)
+                std::printf("    tet[%u] p (%.9g %.9g %.9g) -> (%.9g %.9g %.9g), engine says "
+                            "(%.9g %.9g %.9g)\n", i, p.x, p.y, p.z, o[0], o[1], o[2],
+                            want.x, want.y, want.z);
+            ++badC;
+        }
+
+        // Which FACE won, re-derived the way the function branches, so the run can
+        // insist all four were the winner somewhere.  Without this a port that drops
+        // a face entirely passes whenever that face never wins.
+        const PxVec3 ab = b - a, ac = c - a, ad = d - a, bc = c - b, bd = d - b;
+        const PxVec3 f0 = physx::Gu::closestPtPointTriangle2(p, a, b, c, ab, ac);
+        const PxVec3 f1 = physx::Gu::closestPtPointTriangle2(p, a, c, d, ac, ad);
+        const PxVec3 f2 = physx::Gu::closestPtPointTriangle2(p, a, d, b, ad, ab);
+        const PxVec3 f3 = physx::Gu::closestPtPointTriangle2(p, b, d, c, bd, bc);
+        const PxVec3 fs[4] = { f0, f1, f2, f3 };
+        float best = (f0 - p).magnitudeSquared();
+        uint32_t win = 0;
+        for (uint32_t k = 1; k < 4u; ++k)
+        {
+            const float sq = (fs[k] - p).magnitudeSquared();
+            if (sq < best) { best = sq; win = k; }
+        }
+        if (finite) ++faceWin[win];
+        // A tie between two faces at DIFFERENT points is what G5 decides; count them.
+        for (uint32_t k = 0; k < 4u; ++k)
+            if (k != win && (fs[k] - p).magnitudeSquared() == best &&
+                (f2u(fs[k].x) != f2u(fs[win].x) || f2u(fs[k].y) != f2u(fs[win].y) ||
+                 f2u(fs[k].z) != f2u(fs[win].z)))
+            { ++nTiedFace; break; }
+    }
+    PXG_CHECK_MSG(badC == 0, "%zu of %u tetrahedron clamps differ from the engine's own "
+                  "Gu::closestPtPointTetrahedron", badC, NC);
+    for (uint32_t k = 0; k < 4u; ++k)
+        PXG_CHECK_MSG(faceWin[k] > 0,
+                      "face %u of the tetrahedron clamp never won (%u inputs); a face that never "
+                      "wins is a face the comparison cannot see", k, NC);
+    PXG_CHECK_MSG(nTiedFace > 0,
+                  "no input made two faces tie at DIFFERENT points, so G5 -- the strict `<` that "
+                  "keeps the EARLIER face -- is indistinguishable from `<=`");
+
+    std::printf("    [ note ] tet clamp: %u inputs bit-exact against the engine's own copy; "
+                "face wins %u/%u/%u/%u, %u cross-face ties at different points\n",
+                NC, faceWin[0], faceWin[1], faceWin[2], faceWin[3], nTiedFace);
+
+    // ---- part 2: the tetrahedron descent, replayed from its own trace ---------
+    SdfScene sp;
+    buildSparse(sp);
+    BlobLayout blobSp = layOutBlob(sp, 16u, 21u, 3u, 1u, 0u);
+    const uint64_t hCoarse = sdfUploadTex(CU_AD_FORMAT_FLOAT, sp.nbx + 1, sp.nby + 1, sp.nbz + 1,
+                                          sp.coarse.data(), sizeof(float));
+    const uint64_t hSub = sdfUploadTex(CU_AD_FORMAT_UNSIGNED_INT8, sp.blkx * (sp.sg + 1),
+                                       sp.blky * (sp.sg + 1), sp.blkz * (sp.sg + 1),
+                                       sp.sub.data(), 1);
+    if (hCoarse == 0 || hSub == 0)
+    { std::printf("  NOTE: texture upload failed -> skip part 2\n");
+      for (auto h : owned) dev->destroyBuffer(h); return; }
+    std::memcpy(&blobSp.bytes[blobSp.texObjOffset], &hCoarse, 8);
+    std::memcpy(&blobSp.bytes[blobSp.texObjSparseOffset], &hSub, 8);
+    const uint64_t blobAddr = dev->getBufferDeviceAddress(mkBuf(blobSp.bytes));
+    const HostSdfBox box = hostSdfBox(sp);
+
+    struct Tet { PxVec3 a, b, c, d; float tol; const char* name; };
+    std::vector<Tet> tets;
+    tets.push_back({ posOfF(box, 3, 3, 3), posOfF(box, 9, 3, 3), posOfF(box, 3, 9, 3),
+                     posOfF(box, 3, 3, 9), 1.0f, "straddling" });
+    tets.push_back({ posOfF(box, 5, 5, 5), posOfF(box, 6, 5, 5), posOfF(box, 5, 6, 5),
+                     posOfF(box, 5, 5, 6), 1.0f, "interior" });
+    tets.push_back({ posOfF(box, -6, -6, -6), posOfF(box, -5, -6, -6), posOfF(box, -6, -5, -6),
+                     posOfF(box, -6, -6, -5), 1.0f, "outside" });
+    // difference == 0, so the initial step is +inf and everything after it is NaN.
+    tets.push_back({ posOfF(box, 4, 4, 4), posOfF(box, 4, 4, 4), posOfF(box, 4, 4, 4),
+                     posOfF(box, 4, 4, 4), 1.0f, "degenerate" });
+    // Wide enough that the gradient step leaves the simplex, so E3's projection runs.
+    tets.push_back({ posOfF(box, 1, 8, 4), posOfF(box, 14, 8, 4), posOfF(box, 7, 1, 12),
+                     posOfF(box, 7, 14, 12), 1.0f, "wide" });
+    // Small enough that it does not, so the CONDITIONAL half of E3 is reached too --
+    // and the run below insists both happened rather than hoping.
+    tets.push_back({ posOfF(box, 7, 7, 7), posOfF(box, 7.2f, 7, 7), posOfF(box, 7, 7.2f, 7),
+                     posOfF(box, 7, 7, 7.2f), 1.0f, "tiny" });
+    tets.push_back({ posOfF(box, 1, 1, 1), posOfF(box, 14, 14, 1), posOfF(box, 1, 14, 14),
+                     posOfF(box, 14, 1, 14), 0.001f, "tight-tolerance" });
+    // E1's cascade never compares d1 against d0, so the arms are straddled only by a
+    // tie.  Mirror-symmetric corners about the grid centre make d0 == d1 bitwise.
+    tets.push_back({ posOfF(box, 4, 6, 6), posOfF(box, 8, 6, 6), posOfF(box, 6, 11, 6),
+                     posOfF(box, 6, 6, 11), 1.0f, "d0-eq-d1" });
+    tets.push_back({ posOfF(box, 6, 4, 6), posOfF(box, 6, 8, 6), posOfF(box, 11, 6, 6),
+                     posOfF(box, 6, 6, 11), 1.0f, "d1-eq-d2" });
+    // A tet collapsed onto the point where the dense scene's gradient vanishes, so
+    // E7's discontinuity substitution is reached in iteration 0.
+    {
+        const PxVec3 ctr = posOfF(box, 6, 6, 6);
+        tets.push_back({ ctr, ctr, ctr, ctr, 1.0f, "discontinuity" });
+    }
+    const uint32_t NT = uint32_t(tets.size());
+
+    const uint32_t TET_STRIDE = 208u;
+    std::vector<PxVec4> tv(size_t(NT) * 4u);
+    for (uint32_t i = 0; i < NT; ++i)
+    {
+        tv[size_t(i) * 4u + 0] = PxVec4(tets[i].a.x, tets[i].a.y, tets[i].a.z, tets[i].tol);
+        tv[size_t(i) * 4u + 1] = PxVec4(tets[i].b.x, tets[i].b.y, tets[i].b.z, 0.0f);
+        tv[size_t(i) * 4u + 2] = PxVec4(tets[i].c.x, tets[i].c.y, tets[i].c.z, 0.0f);
+        tv[size_t(i) * 4u + 3] = PxVec4(tets[i].d.x, tets[i].d.y, tets[i].d.z, 0.0f);
+    }
+    const std::vector<PxVec4> dirSeed(NT, PxVec4(0.0f));
+    const std::vector<float> outTInit(size_t(NT) * TET_STRIDE, -1.0f);
+    PxgBufferHandle bTv = mkBuf(asBytes(tv.data(), tv.size() * sizeof(PxVec4)));
+    PxgBufferHandle bDir = mkBuf(asBytes(dirSeed.data(), dirSeed.size() * sizeof(PxVec4)));
+    PxgBufferHandle bOutT = mkBuf(asBytes(outTInit.data(), outTInit.size() * sizeof(float)));
+
+    P_Coll pt = {};
+    pt.meshPtr = blobAddr;
+    pt.points = dev->getBufferDeviceAddress(bPts);
+    pt.gradIn = dev->getBufferDeviceAddress(bZero);
+    pt.dirSeed = dev->getBufferDeviceAddress(bDir);
+    pt.outBuf = dev->getBufferDeviceAddress(bOut);
+    pt.numPoints = NT;
+    pt.triVerts = dev->getBufferDeviceAddress(bTv);
+    pt.triOut = dev->getBufferDeviceAddress(bOutT);
+    {
+        Kernel k(Kernel::Bindless{}, "npSdfCollision.spv", "sdfCollTetrahedron", {}, sizeof(P_Coll));
+        PXG_CHECK_MSG(k.isValid(), "bindless pipeline creation succeeds for sdfCollTetrahedron");
+        if (!k.isValid()) { for (auto h : owned) dev->destroyBuffer(h); return; }
+        k.dispatch((NT + 63) / 64, {}, pt);
+    }
+    dev->flush();
+    const auto T = downloadBuffer<float>(dev, bOutT, size_t(NT) * TET_STRIDE);
+
+    size_t badStart = 0, badDiff = 0, badStep = 0, badUvw = 0, badBreak = 0, badGradN = 0;
+    size_t badIters = 0, badFinalG = 0, badClamp = 0;
+    uint32_t armSeen[5] = { 0, 0, 0, 0, 0 };
+    uint32_t nConverged = 0, nRanOut = 0, nSubstituted = 0, nTied = 0;
+    uint32_t nClampRan = 0, nClampSkipped = 0, nFinalGChecked = 0;
+    for (uint32_t i = 0; i < NT; ++i)
+    {
+        const float* o = &T[size_t(i) * TET_STRIDE];
+        const PxVec3 v0 = tets[i].a, v1 = tets[i].b, v2 = tets[i].c, v3 = tets[i].d;
+        const float d0 = o[0], d1 = o[1], d2 = o[2], d3 = o[3], dC = o[4];
+        const uint32_t arm = uint32_t(o[5]);
+        armSeen[arm < 5u ? arm : 4u]++;
+        if (f2u(d0) == f2u(d1) || f2u(d1) == f2u(d2) || f2u(d2) == f2u(d3)) ++nTied;
+
+        // E1 / E2: the cascade, re-derived from the five traced distances.
+        PxVec3 wantP = (v0 + v1 + v2 + v3) * 0.25f;
+        PxVec4 wantUvw(0.0f);
+        uint32_t wantArm;
+        if (d0 < d1 && d0 < d2 && d0 < d3 && d0 < dC) { wantP = v0; wantUvw.x = 1.0f; wantArm = 0; }
+        else if (d1 < d2 && d1 < d3 && d1 < dC)       { wantP = v1; wantUvw.y = 1.0f; wantArm = 1; }
+        else if (d2 < d3 && d2 < dC)                  { wantP = v2; wantUvw.z = 1.0f; wantArm = 2; }
+        else if (d3 < dC)                             { wantP = v3; wantUvw.w = 1.0f; wantArm = 3; }
+        else { wantUvw = PxVec4(0.25f); wantArm = 4; }
+        if (arm != wantArm || !bitEq(o[7], wantUvw.x) || !bitEq(o[8], wantUvw.y) ||
+            !bitEq(o[9], wantUvw.z) || !bitEq(o[10], wantUvw.w) || !bitEq3(o + 11, wantP))
+        {
+            if (badStart < 4)
+                std::printf("    tet %s: start arm %u want %u, uvw (%.9g %.9g %.9g %.9g)\n",
+                            tets[i].name, arm, wantArm, o[7], o[8], o[9], o[10]);
+            ++badStart;
+        }
+
+        // Nested max of SQUARED lengths, one sqrt, and the nesting is
+        // max(max(e0,e1), max(e2,e3)) -- a left fold rounds the same here but the
+        // shape is transcribed, so the mirror uses the shape too.
+        const float wantDifference = std::sqrt(
+            PxMax(PxMax((v0 - wantP).magnitudeSquared(), (v1 - wantP).magnitudeSquared()),
+                  PxMax((v2 - wantP).magnitudeSquared(), (v3 - wantP).magnitudeSquared())));
+        if (f2u(o[6]) != f2u(wantDifference))
+        { if (badDiff < 4) std::printf("    tet %s: difference %.9g want %.9g\n",
+                                       tets[i].name, o[6], wantDifference); ++badDiff; }
+
+        const uint32_t iters = uint32_t(o[14]);
+        const uint32_t conv = uint32_t(o[15]);
+        if (conv) ++nConverged; else ++nRanOut;
+        if (iters < 1u || iters > 16u || (conv == 0u && iters != 16u))
+        { if (badIters < 4)
+              std::printf("    tet %s: %u iterations, converged %u\n", tets[i].name, iters, conv);
+          ++badIters; }
+
+        // The gradient is RECOMPUTED at the final p.  Exempt where the arithmetic is
+        // not finite, for the same reason as the triangle version: with a degenerate
+        // tet every value downstream is NaN and the two are the same bit pattern
+        // whichever the port produced.
+        const PxVec3 gFinal(o[19], o[20], o[21]);
+        const bool gfinite = std::isfinite(gFinal.x) && std::isfinite(gFinal.y) &&
+                             std::isfinite(gFinal.z);
+        if (gfinite)
+        {
+            ++nFinalGChecked;
+            const float* le = o + 32 + (iters - 1u) * 11;
+            if (bitEq3(o + 19, PxVec3(le[6], le[7], le[8])))
+            { if (badFinalG < 4)
+                  std::printf("    tet %s: gradFinal is bit-identical to the loop's last USED "
+                              "gradient; it must be a fresh sample\n", tets[i].name);
+              ++badFinalG; }
+        }
+
+        // The replay.
+        PxVec4 uvw = wantUvw;
+        float step = 1.0f / (2.0f * wantDifference);
+        for (uint32_t k = 0; k < iters; ++k)
+        {
+            const float* e = o + 32 + k * 11;
+            const float stepIn = e[0], gradMag = e[1];
+            const PxVec3 gradUsed(e[6], e[7], e[8]);
+            const uint32_t clamped = uint32_t(e[9]);
+            if (gradMag == 0.0f) ++nSubstituted;
+            else
+            {
+                const float m = gradUsed.magnitude();
+                if (std::fabs(m - 1.0f) > 1e-5f)
+                { if (badGradN < 4)
+                      std::printf("    tet %s iter %u: |gradUsed| = %.9g\n", tets[i].name, k, m);
+                  ++badGradN; }
+            }
+            if (f2u(stepIn) != f2u(step))
+            { if (badStep < 4)
+                  std::printf("    tet %s iter %u: step %.9g want %.9g\n",
+                              tets[i].name, k, stepIn, step); ++badStep; }
+
+            // Iteration 0 descends from the point the cascade chose -- the CENTROID in
+            // the else arm, not the barycentric blend, which would differ by a rounding.
+            const PxVec3 p = (k == 0) ? wantP
+                                      : (v0 * uvw.x + v1 * uvw.y + v2 * uvw.z + v3 * uvw.w);
+            const float du = gradUsed.dot(v0 - p);
+            const float dv = gradUsed.dot(v1 - p);
+            const float dw = gradUsed.dot(v2 - p);
+            const float d4 = gradUsed.dot(v3 - p);
+            PxVec4 newUVW = uvw;
+            newUVW.x -= step * du;
+            newUVW.y -= step * dv;
+            newUVW.z -= step * dw;
+            newUVW.w -= step * d4;
+            step = step * 0.8f;
+
+            // E3: the escape test, non-strict at both ends, four-way.
+            const float eps = 1e-4f;
+            const bool wantClamp =
+                ((newUVW.x <= -eps || newUVW.x >= 1.0f + eps) ||
+                 (newUVW.y <= -eps || newUVW.y >= 1.0f + eps) ||
+                 (newUVW.z <= -eps || newUVW.z >= 1.0f + eps) ||
+                 (newUVW.w <= -eps || newUVW.w >= 1.0f + eps));
+            if (wantClamp)
+            {
+                // E8: THE ENGINE's clamp, on the CANONICAL simplex.
+                const PxVec3 cp = physx::Gu::closestPtPointTetrahedron(
+                    PxVec3(newUVW.x, newUVW.y, newUVW.z),
+                    PxVec3(1.0f, 0.0f, 0.0f), PxVec3(0.0f, 1.0f, 0.0f),
+                    PxVec3(0.0f, 0.0f, 1.0f), PxVec3(0.0f));
+                newUVW.x = cp.x; newUVW.y = cp.y; newUVW.z = cp.z;
+                newUVW.w = 1.0f - cp.x - cp.y - cp.z;      // E4
+                ++nClampRan;
+            }
+            else
+            {
+                ++nClampSkipped;
+            }
+            // E3 is only observable if WHETHER the clamp ran is compared: on an
+            // iteration that stays inside the simplex the projection is the identity,
+            // so an unconditional port produces the same newUvw.
+            if ((clamped != 0u) != wantClamp)
+            { if (badClamp < 4)
+                  std::printf("    tet %s iter %u: clamped %u want %d\n",
+                              tets[i].name, k, clamped, int(wantClamp)); ++badClamp; }
+
+            if (!bitEq(e[2], newUVW.x) || !bitEq(e[3], newUVW.y) ||
+                !bitEq(e[4], newUVW.z) || !bitEq(e[5], newUVW.w))
+            {
+                if (badUvw < 4)
+                    std::printf("    tet %s iter %u: newUvw (%.9g %.9g %.9g %.9g) want "
+                                "(%.9g %.9g %.9g %.9g)\n", tets[i].name, k, e[2], e[3], e[4], e[5],
+                                newUVW.x, newUVW.y, newUVW.z, newUVW.w);
+                ++badUvw;
+            }
+
+            // E6: FOUR components, and the break precedes the assignment.
+            const PxVec4 duvw = uvw - newUVW;
+            const float dsq = duvw.x * duvw.x + duvw.y * duvw.y +
+                              duvw.z * duvw.z + duvw.w * duvw.w;
+            const bool wantBreak = dsq < 1e-3f * 1e-3f;
+            const bool didBreak = (k + 1u == iters) && conv != 0u;
+            if (wantBreak != didBreak && !(k + 1u == iters && conv == 0u && !wantBreak))
+            { if (badBreak < 4)
+                  std::printf("    tet %s iter %u: break %d want %d (iters %u conv %u)\n",
+                              tets[i].name, k, int(didBreak), int(wantBreak), iters, conv);
+              ++badBreak; }
+            if (wantBreak) break;
+            uvw = newUVW;
+        }
+    }
+    PXG_CHECK_MSG(badStart == 0, "%zu tetrahedra chose a different starting iterate", badStart);
+    PXG_CHECK_MSG(badDiff == 0, "%zu tetrahedra computed a different `difference`", badDiff);
+    PXG_CHECK_MSG(badStep == 0, "%zu step values differ from the 1/(2d) * 0.8^k schedule", badStep);
+    PXG_CHECK_MSG(badClamp == 0, "%zu iterations disagreed about WHETHER the projection ran -- "
+                  "E3's gate is what makes an unconditional clamp visible", badClamp);
+    PXG_CHECK_MSG(badUvw == 0, "%zu iterations landed on a different newUvw than the engine's "
+                  "own closestPtPointTetrahedron produces", badUvw);
+    PXG_CHECK_MSG(badBreak == 0, "%zu iterations broke at the wrong point", badBreak);
+    PXG_CHECK_MSG(badGradN == 0, "%zu used gradients were not unit length", badGradN);
+    PXG_CHECK_MSG(badIters == 0, "%zu tetrahedra ran a number of iterations the loop bound "
+                  "forbids", badIters);
+    PXG_CHECK_MSG(badFinalG == 0, "%zu tetrahedra reused the loop's gradient instead of "
+                  "resampling", badFinalG);
+
+    for (uint32_t a = 0; a < 5u; ++a)
+        if (a == 0u || a == 4u)
+            PXG_CHECK_MSG(armSeen[a] > 0,
+                          "cascade arm %u was never taken; an unreached arm is an unchecked arm",
+                          a);
+    PXG_CHECK_MSG(nConverged > 0, "no tetrahedron converged, so the tolerance break is unchecked");
+    PXG_CHECK_MSG(nRanOut > 0, "no tetrahedron ran to the 16-iteration cap, so the bound is "
+                  "unchecked");
+    PXG_CHECK_MSG(nClampRan > 0 && nClampSkipped > 0,
+                  "the projection ran on %u iterations and was skipped on %u -- both must be > 0, "
+                  "or E3's condition is indistinguishable from an unconditional clamp",
+                  nClampRan, nClampSkipped);
+    // ---- part 3: the discontinuity substitution -------------------------------
+    // gm == 0 is unreachable in the sparse scene, exactly as it was for the triangle
+    // descent.  The DENSE scene has a point whose trilinear gradient is exactly zero,
+    // so a tetrahedron collapsed onto it hits the branch on its first iteration.
+    //
+    // And this is where E7 earns its own check rather than borrowing the triangle's:
+    // the two descents substitute DIFFERENT constants and treat them differently.
+    // The triangle path uses sdfCollision.cuh:455's vector RAW, because that one is
+    // exactly unit in float32; this one uses doVertexSDFCollision's vector through
+    // getNormalized, and there the normalise MOVES the value -- P9.34a measured the
+    // constant at 0.90790 squared.  So the expected bits here are the NORMALISED form
+    // of the OTHER constant, and a port that copies either half from the triangle
+    // sibling lands somewhere else.
+    {
+        SdfScene dn;
+        buildDenseAligned(dn);
+        BlobLayout blobDn = layOutBlob(dn, 5u, 9u, 1u, 0u, 0x0BADF00Du);
+        const uint64_t hDense = sdfUploadTex(CU_AD_FORMAT_FLOAT, dn.dx, dn.dy, dn.dz,
+                                             dn.coarse.data(), sizeof(float));
+        if (hDense == 0)
+            std::printf("  NOTE: dense texture upload failed -> the discontinuity is unchecked\n");
+        else
+        {
+            std::memcpy(&blobDn.bytes[blobDn.texObjOffset], &hDense, 8);
+            const uint64_t dnAddr = dev->getBufferDeviceAddress(mkBuf(blobDn.bytes));
+            const HostSdfBox dbox = hostSdfBox(dn);
+            const PxVec3 flat = posOfF(dbox, float(FLAT_X), float(FLAT_Y), float(FLAT_Z));
+
+            std::vector<PxVec4> dtv(4), ddir(1);
+            dtv[0] = PxVec4(flat.x, flat.y, flat.z, 1.0f);
+            dtv[1] = PxVec4(flat.x, flat.y, flat.z, 0.0f);
+            dtv[2] = PxVec4(flat.x, flat.y, flat.z, 0.0f);
+            dtv[3] = PxVec4(flat.x, flat.y, flat.z, 0.0f);
+            ddir[0] = PxVec4(-3.0f, -4.0f, -5.0f, 0.0f);
+            std::vector<float> outD(TET_STRIDE, -1.0f);
+            PxgBufferHandle bDtv = mkBuf(asBytes(dtv.data(), dtv.size() * sizeof(PxVec4)));
+            PxgBufferHandle bDdir = mkBuf(asBytes(ddir.data(), ddir.size() * sizeof(PxVec4)));
+            PxgBufferHandle bDout = mkBuf(asBytes(outD.data(), outD.size() * sizeof(float)));
+
+            P_Coll pd = pt;
+            pd.meshPtr = dnAddr;
+            pd.numPoints = 1u;
+            pd.dirSeed = dev->getBufferDeviceAddress(bDdir);
+            pd.triVerts = dev->getBufferDeviceAddress(bDtv);
+            pd.triOut = dev->getBufferDeviceAddress(bDout);
+            Kernel k(Kernel::Bindless{}, "npSdfCollision.spv", "sdfCollTetrahedron", {},
+                     sizeof(P_Coll));
+            if (k.isValid())
+            {
+                k.dispatch(1u, {}, pd);
+                dev->flush();
+                const auto D2 = downloadBuffer<float>(dev, bDout, TET_STRIDE);
+                const float gm0 = D2[32 + 1];
+                const PxVec3 used(D2[32 + 6], D2[32 + 7], D2[32 + 8]);
+                // The engine's own getNormalized of the engine's own constant.
+                const PxVec3 want =
+                    PxVec3(0.5448762f, 0.672269f, 0.398825f).getNormalized();
+                // The two vectors a wrong port would reach for, so the failure message
+                // can say WHICH mistake was made rather than just "not equal".
+                const PxVec3 rawSame(0.5448762f, 0.672269f, 0.398825f);
+                const PxVec3 triConst(0.571846586f, 0.705545099f, 0.418566116f);
+                PXG_CHECK_MSG(gm0 == 0.0f,
+                              "the collapsed tetrahedron on the dense scene's flat point must give "
+                              "a ZERO gradient magnitude on iteration 0, got %.9g", gm0);
+                if (gm0 == 0.0f)
+                {
+                    ++nSubstituted;
+                    const bool ok = f2u(used.x) == f2u(want.x) && f2u(used.y) == f2u(want.y) &&
+                                    f2u(used.z) == f2u(want.z);
+                    const bool isRaw = f2u(used.x) == f2u(rawSame.x);
+                    const bool isTri = f2u(used.x) == f2u(triConst.x);
+                    PXG_CHECK_MSG(ok,
+                                  "the discontinuity substitute is (%.9g %.9g %.9g); it must be "
+                                  "doVertexSDFCollision's constant NORMALISED (%.9g %.9g %.9g)%s",
+                                  used.x, used.y, used.z, want.x, want.y, want.z,
+                                  isRaw ? " -- this is that constant used RAW, which is the "
+                                          "TRIANGLE path's treatment, not this one's"
+                                        : (isTri ? " -- this is the TRIANGLE path's constant"
+                                                 : ""));
+                    // And the normalise is load-bearing here, which is asserted rather
+                    // than recalled: the raw and normalised forms must differ.
+                    PXG_CHECK_MSG(f2u(want.x) != f2u(rawSame.x),
+                                  "this constant is already unit, so the getNormalized is a no-op "
+                                  "and E7's normalise half is unobservable");
+                }
+            }
+        }
+    }
+
+    PXG_CHECK_MSG(nSubstituted > 0,
+                  "the discontinuity substitution was never reached, so E7 -- the VERTEX path's "
+                  "constant, normalised -- is unchecked");
+    PXG_CHECK_MSG(nFinalGChecked > 0,
+                  "no tetrahedron had finite arithmetic at the final gradient, so the resample "
+                  "check never applied to anything");
+
+    std::printf("    [ note ] tet descent: %u tetrahedra, %u converged / %u ran to 16, start "
+                "arms %u/%u/%u/%u/%u, clamp ran %u / skipped %u, %u discontinuity substitutions, "
+                "%u with a tied pair\n",
+                NT, nConverged, nRanOut, armSeen[0], armSeen[1], armSeen[2], armSeen[3],
+                armSeen[4], nClampRan, nClampSkipped, nSubstituted, nTied);
 
     for (auto h : owned) dev->destroyBuffer(h);
 }
