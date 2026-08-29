@@ -1677,9 +1677,173 @@ PXG_TEST(sdfTetrahedronCollision)
         const PxVec3 ctr = posOfF(box, 6, 6, 6);
         tets.push_back({ ctr, ctr, ctr, ctr, 1.0f, "discontinuity" });
     }
+    // ---- the eps-BAND candidates, constructed rather than hoped for ----------
+    // The gate `x <= -eps || x >= 1+eps` is a four-way disjunction, so a port that
+    // gets the SIGN of eps wrong clamps on strictly more iterations -- and every
+    // extra clamp it makes is the IDENTITY (the point is already in the simplex),
+    // so the only trace of it is the flag.  The first sweep found no iteration that
+    // distinguishes them, because in every tet above at least one component escapes
+    // far enough that both spellings clamp.
+    //
+    // What distinguishes them is an iteration where NOTHING escapes the real gate
+    // but something sits inside the narrow band a negated eps would catch: a
+    // component within 1e-4 of 0, or within 1e-4 of 1.  That is CONSTRUCTIBLE.
+    // Take a tet whose last three vertices COINCIDE; then, starting from vertex 0,
+    //     dfdu = grad . (v0 - p) = 0 exactly     (p IS v0)
+    //     dfdv = dfdw = dfd4 = grad . (v1 - v0)
+    // so x stays exactly 1.0 and the other three move by the same
+    //     s = step * dfdv = cos(grad, v1 - v0) / 2
+    // because step is 1/(2*|v1 - v0|) and |v1 - v0| IS the difference.  Choose
+    // v1 - v0 PERPENDICULAR to the gradient and s collapses to a rounding, well
+    // under 1e-4 -- so no component escapes, the real gate stays quiet, and the
+    // negated one fires on x == 1.0.
+    //
+    // The gradient is GPU-only, so it is measured rather than assumed: sample it at
+    // each base point, build the perpendicular from what comes back, and offer both
+    // signs and several lengths because arm 0 also needs d0 to be the strict
+    // minimum, which the SDF's curvature along the perpendicular decides.
+    {
+        std::vector<PxVec4> basePts;
+        for (int gx = 2; gx <= 12; gx += 2)
+            for (int gy = 2; gy <= 12; gy += 5)
+                for (int gz = 2; gz <= 12; gz += 5)
+                {
+                    const PxVec3 q = posOfF(box, float(gx), float(gy), float(gz));
+                    basePts.push_back(PxVec4(q.x, q.y, q.z, 0.0f));
+                }
+        const uint32_t NBP = uint32_t(basePts.size());
+        std::vector<float> gOut(size_t(NBP) * STRIDE_GRAD, 0.0f);
+        PxgBufferHandle bBase = mkBuf(asBytes(basePts.data(), basePts.size() * sizeof(PxVec4)));
+        PxgBufferHandle bGOut = mkBuf(asBytes(gOut.data(), gOut.size() * sizeof(float)));
+        P_Coll pg = {};
+        pg.meshPtr = blobAddr;
+        pg.points = dev->getBufferDeviceAddress(bBase);
+        pg.gradIn = dev->getBufferDeviceAddress(bZero);
+        pg.dirSeed = dev->getBufferDeviceAddress(bZero);
+        pg.outBuf = dev->getBufferDeviceAddress(bGOut);
+        pg.numPoints = NBP;
+        Kernel kg(Kernel::Bindless{}, "npSdfCollision.spv", "sdfCollGrad", {}, sizeof(P_Coll));
+        if (kg.isValid())
+        {
+            kg.dispatch((NBP + 63) / 64, {}, pg);
+            dev->flush();
+            const auto G = downloadBuffer<float>(dev, bGOut, size_t(NBP) * STRIDE_GRAD);
+            const float ext = (box.higher - box.lower).magnitude();
+            for (uint32_t i = 0; i < NBP; ++i)
+            {
+                const PxVec3 g(G[size_t(i) * STRIDE_GRAD + 1], G[size_t(i) * STRIDE_GRAD + 2],
+                               G[size_t(i) * STRIDE_GRAD + 3]);
+                if (g.magnitudeSquared() <= 0.0f) continue;
+                const PxVec3 gn = g.getNormalized();
+                const PxVec3 aux = (PxAbs(gn.x) < 0.9f) ? PxVec3(1.0f, 0.0f, 0.0f)
+                                                        : PxVec3(0.0f, 1.0f, 0.0f);
+                const PxVec3 perp = gn.cross(aux).getNormalized();
+                const PxVec3 v0 = PxVec3(basePts[i].x, basePts[i].y, basePts[i].z);
+                for (int sgn = -1; sgn <= 1; sgn += 2)
+                    for (int lk = 0; lk < 3; ++lk)
+                    {
+                        const float L = (0.02f + 0.03f * float(lk)) * ext * float(sgn);
+                        const PxVec3 v1 = v0 + perp * L;
+                        tets.push_back({ v0, v1, v1, v1, 1.0f, "eps-band" });
+                    }
+            }
+        }
+    }
+
+    // ---- the CASCADE straddle, searched for rather than guessed ---------------
+    // E1's second arm never compares d1 against d0, so it parts company with a
+    // four-way minimum on exactly one configuration: d0 == d1 BITWISE, and both
+    // strictly below d2, d3 and the centroid's distance.  Then the first arm's
+    // `d0 < d1` is false, the second arm fires, and a "fixed" cascade would have
+    // started at v0 instead.  The distances are GPU-only, so guessing coordinates
+    // is the wrong tool -- P9.34b established the right one, and this is it applied
+    // to four corners instead of three.
+    {
+        std::vector<PxVec4> cand;
+        for (int gx = -2; gx <= 16; gx += 2)
+            for (int gy = -2; gy <= 16; gy += 2)
+                for (int gz = -2; gz <= 16; gz += 2)
+                {
+                    const PxVec3 q = posOfF(box, float(gx), float(gy), float(gz));
+                    cand.push_back(PxVec4(q.x, q.y, q.z, 1.0f));
+                }
+        const uint32_t NCa = uint32_t(cand.size());
+        std::vector<float> outC(size_t(NCa) * STRIDE_GRAD, 0.0f);
+        PxgBufferHandle bCand = mkBuf(asBytes(cand.data(), cand.size() * sizeof(PxVec4)));
+        PxgBufferHandle bOutC = mkBuf(asBytes(outC.data(), outC.size() * sizeof(float)));
+        auto sampleDist = [&](PxgBufferHandle pts, PxgBufferHandle out, uint32_t n) {
+            P_Coll pcd = {};
+            pcd.meshPtr = blobAddr;
+            pcd.points = dev->getBufferDeviceAddress(pts);
+            pcd.gradIn = dev->getBufferDeviceAddress(bZero);
+            pcd.dirSeed = dev->getBufferDeviceAddress(bZero);
+            pcd.outBuf = dev->getBufferDeviceAddress(out);
+            pcd.numPoints = n;
+            Kernel k(Kernel::Bindless{}, "npSdfCollision.spv", "sdfCollDistance", {},
+                     sizeof(P_Coll));
+            if (!k.isValid()) return false;
+            k.dispatch((n + 63) / 64, {}, pcd);
+            dev->flush();
+            return true;
+        };
+        if (sampleDist(bCand, bOutC, NCa))
+        {
+            const auto C2 = downloadBuffer<float>(dev, bOutC, size_t(NCa) * STRIDE_GRAD);
+            auto dOf = [&](uint32_t i) { return C2[size_t(i) * STRIDE_DIST + 8]; };
+            auto pOf = [&](uint32_t i) { return PxVec3(cand[i].x, cand[i].y, cand[i].z); };
+
+            struct Quad { uint32_t a, b, c, d; };
+            std::vector<Quad> quads;
+            for (uint32_t i = 0; i < NCa && quads.size() < 24u; ++i)
+                for (uint32_t j = i + 1; j < NCa && quads.size() < 24u; ++j)
+                {
+                    if (f2u(dOf(i)) != f2u(dOf(j))) continue;
+                    if (!std::isfinite(dOf(i))) continue;
+                    const float V = dOf(i);
+                    uint32_t c1 = NCa, c2 = NCa;
+                    for (uint32_t k = 0; k < NCa; ++k)
+                    {
+                        if (k == i || k == j || !(dOf(k) > V)) continue;
+                        if (c1 == NCa) c1 = k;
+                        else if (c2 == NCa) { c2 = k; break; }
+                    }
+                    if (c1 != NCa && c2 != NCa) quads.push_back({ i, j, c1, c2 });
+                }
+
+            // Pass B: the centroid each quad would form, sampled, so the last
+            // condition -- d0 below the CENTROID's distance -- is measured too.
+            if (!quads.empty())
+            {
+                std::vector<PxVec4> ctr;
+                for (const Quad& q : quads)
+                {
+                    const PxVec3 m = (pOf(q.a) + pOf(q.b) + pOf(q.c) + pOf(q.d)) * 0.25f;
+                    ctr.push_back(PxVec4(m.x, m.y, m.z, 1.0f));
+                }
+                const uint32_t NQ = uint32_t(ctr.size());
+                std::vector<float> outQ(size_t(NQ) * STRIDE_GRAD, 0.0f);
+                PxgBufferHandle bCtr = mkBuf(asBytes(ctr.data(), ctr.size() * sizeof(PxVec4)));
+                PxgBufferHandle bOutQ = mkBuf(asBytes(outQ.data(), outQ.size() * sizeof(float)));
+                if (sampleDist(bCtr, bOutQ, NQ))
+                {
+                    const auto Q = downloadBuffer<float>(dev, bOutQ, size_t(NQ) * STRIDE_GRAD);
+                    uint32_t added = 0;
+                    for (uint32_t k = 0; k < NQ && added < 3u; ++k)
+                    {
+                        const float V = dOf(quads[k].a);
+                        if (!(Q[size_t(k) * STRIDE_DIST + 8] > V)) continue;
+                        tets.push_back({ pOf(quads[k].a), pOf(quads[k].b), pOf(quads[k].c),
+                                         pOf(quads[k].d), 1.0f, "cascade-straddle" });
+                        ++added;
+                    }
+                }
+            }
+        }
+    }
+
     const uint32_t NT = uint32_t(tets.size());
 
-    const uint32_t TET_STRIDE = 208u;
+    const uint32_t TET_STRIDE = 256u;
     std::vector<PxVec4> tv(size_t(NT) * 4u);
     for (uint32_t i = 0; i < NT; ++i)
     {
@@ -1713,10 +1877,11 @@ PXG_TEST(sdfTetrahedronCollision)
     const auto T = downloadBuffer<float>(dev, bOutT, size_t(NT) * TET_STRIDE);
 
     size_t badStart = 0, badDiff = 0, badStep = 0, badUvw = 0, badBreak = 0, badGradN = 0;
-    size_t badIters = 0, badFinalG = 0, badClamp = 0;
+    size_t badIters = 0, badFinalG = 0, badClamp = 0, badFinalP = 0;
     uint32_t armSeen[5] = { 0, 0, 0, 0, 0 };
     uint32_t nConverged = 0, nRanOut = 0, nSubstituted = 0, nTied = 0;
-    uint32_t nClampRan = 0, nClampSkipped = 0, nFinalGChecked = 0;
+    uint32_t nClampRan = 0, nClampSkipped = 0, nFinalGChecked = 0, nNanMag = 0;
+    uint32_t nFinalPChecked = 0, nEpsBand = 0, nStraddle = 0;
     for (uint32_t i = 0; i < NT; ++i)
     {
         const float* o = &T[size_t(i) * TET_STRIDE];
@@ -1725,6 +1890,10 @@ PXG_TEST(sdfTetrahedronCollision)
         const uint32_t arm = uint32_t(o[5]);
         armSeen[arm < 5u ? arm : 4u]++;
         if (f2u(d0) == f2u(d1) || f2u(d1) == f2u(d2) || f2u(d2) == f2u(d3)) ++nTied;
+        // The one configuration that separates E1's asymmetric cascade from a
+        // four-way minimum: d0 == d1 bitwise, and both strictly below everything
+        // else, so the FIRST arm's `d0 < d1` fails and the SECOND fires.
+        if (f2u(d0) == f2u(d1) && d0 < d2 && d0 < d3 && d0 < dC) ++nStraddle;
 
         // E1 / E2: the cascade, re-derived from the five traced distances.
         PxVec3 wantP = (v0 + v1 + v2 + v3) * 0.25f;
@@ -1772,7 +1941,7 @@ PXG_TEST(sdfTetrahedronCollision)
         if (gfinite)
         {
             ++nFinalGChecked;
-            const float* le = o + 32 + (iters - 1u) * 11;
+            const float* le = o + 32 + (iters - 1u) * 14;
             if (bitEq3(o + 19, PxVec3(le[6], le[7], le[8])))
             { if (badFinalG < 4)
                   std::printf("    tet %s: gradFinal is bit-identical to the loop's last USED "
@@ -1780,22 +1949,82 @@ PXG_TEST(sdfTetrahedronCollision)
               ++badFinalG; }
         }
 
+        // E5: the returned point is the blend of the LAST newUvw, and it is rebuilt
+        // on every iteration whether or not the projection ran.  Without comparing
+        // it, an iteration that skips the clamp can leave p stale and nothing sees
+        // it -- the replay derives p from uvw and never looks at what came back.
+        {
+            const float* le = o + 32 + (iters - 1u) * 14;
+            const PxVec4 lastUvw(le[2], le[3], le[4], le[5]);
+            const PxVec3 wantPFinal = v0 * lastUvw.x + v1 * lastUvw.y +
+                                      v2 * lastUvw.z + v3 * lastUvw.w;
+            const bool pfinite = std::isfinite(wantPFinal.x) && std::isfinite(wantPFinal.y) &&
+                                 std::isfinite(wantPFinal.z);
+            if (pfinite)
+            {
+                ++nFinalPChecked;
+                if (!bitEq3(o + 16, wantPFinal) || !bitEq3(o + 22, wantPFinal))
+                {
+                    if (badFinalP < 4)
+                        std::printf("    tet %s: pFinal (%.9g %.9g %.9g) / point (%.9g %.9g %.9g) "
+                                    "want (%.9g %.9g %.9g)\n", tets[i].name, o[16], o[17], o[18],
+                                    o[22], o[23], o[24], wantPFinal.x, wantPFinal.y, wantPFinal.z);
+                    ++badFinalP;
+                }
+            }
+        }
+
         // The replay.
         PxVec4 uvw = wantUvw;
         float step = 1.0f / (2.0f * wantDifference);
         for (uint32_t k = 0; k < iters; ++k)
         {
-            const float* e = o + 32 + k * 11;
+            const float* e = o + 32 + k * 14;
             const float stepIn = e[0], gradMag = e[1];
             const PxVec3 gradUsed(e[6], e[7], e[8]);
             const uint32_t clamped = uint32_t(e[9]);
-            if (gradMag == 0.0f) ++nSubstituted;
+            const PxVec3 gradRaw(e[10], e[11], e[12]);
+            // THE RELATION, not just the magnitude.  PxVec3::normalize() is two
+            // separate `if`s upstream -- `if (m > 0) divide` and then `if (m == 0)
+            // substitute`, with no else -- so a NaN magnitude satisfies NEITHER and
+            // the raw vector must survive untouched.  Turning the pair into an
+            // if/else is invisible to a replay that takes gradUsed from the shader,
+            // which is exactly what the first sweep caught.
+            if (gradMag > 0.0f)
+            {
+                const PxVec3 want = gradRaw * (1.0f / gradMag);
+                if (f2u(gradUsed.x) != f2u(want.x) || f2u(gradUsed.y) != f2u(want.y) ||
+                    f2u(gradUsed.z) != f2u(want.z))
+                { if (badGradN < 4)
+                      std::printf("    tet %s iter %u: gradUsed (%.9g %.9g %.9g) is not the raw "
+                                  "gradient over its magnitude (%.9g %.9g %.9g)\n", tets[i].name,
+                                  k, gradUsed.x, gradUsed.y, gradUsed.z, want.x, want.y, want.z);
+                  ++badGradN; }
+            }
+            else if (gradMag == 0.0f)
+            {
+                ++nSubstituted;
+                const PxVec3 want =
+                    PxVec3(0.5448762f, 0.672269f, 0.398825f).getNormalized();
+                if (f2u(gradUsed.x) != f2u(want.x) || f2u(gradUsed.y) != f2u(want.y) ||
+                    f2u(gradUsed.z) != f2u(want.z))
+                { if (badGradN < 4)
+                      std::printf("    tet %s iter %u: substitute (%.9g %.9g %.9g) is not the "
+                                  "normalised constant\n", tets[i].name, k,
+                                  gradUsed.x, gradUsed.y, gradUsed.z); ++badGradN; }
+            }
             else
             {
-                const float m = gradUsed.magnitude();
-                if (std::fabs(m - 1.0f) > 1e-5f)
+                // A NaN magnitude: neither `if` fires, so gradUsed IS gradRaw, bit
+                // for bit -- including the NaN payload.
+                ++nNanMag;
+                if (f2u(gradUsed.x) != f2u(gradRaw.x) || f2u(gradUsed.y) != f2u(gradRaw.y) ||
+                    f2u(gradUsed.z) != f2u(gradRaw.z))
                 { if (badGradN < 4)
-                      std::printf("    tet %s iter %u: |gradUsed| = %.9g\n", tets[i].name, k, m);
+                      std::printf("    tet %s iter %u: gradMag is NaN, so gradUsed must be the "
+                                  "RAW gradient untouched -- got (%.9g %.9g %.9g) against "
+                                  "(%.9g %.9g %.9g)\n", tets[i].name, k, gradUsed.x, gradUsed.y,
+                                  gradUsed.z, gradRaw.x, gradRaw.y, gradRaw.z);
                   ++badGradN; }
             }
             if (f2u(stepIn) != f2u(step))
@@ -1843,6 +2072,17 @@ PXG_TEST(sdfTetrahedronCollision)
             // E3 is only observable if WHETHER the clamp ran is compared: on an
             // iteration that stays inside the simplex the projection is the identity,
             // so an unconditional port produces the same newUvw.
+            // The iterations that tell a POSITIVE eps from a negative one: the real
+            // gate stays quiet while a negated one would fire.
+            if (!wantClamp)
+            {
+                const float band = 1e-4f;
+                if (newUVW.x <= band || newUVW.x >= 1.0f - band ||
+                    newUVW.y <= band || newUVW.y >= 1.0f - band ||
+                    newUVW.z <= band || newUVW.z >= 1.0f - band ||
+                    newUVW.w <= band || newUVW.w >= 1.0f - band)
+                    ++nEpsBand;
+            }
             if ((clamped != 0u) != wantClamp)
             { if (badClamp < 4)
                   std::printf("    tet %s iter %u: clamped %u want %d\n",
@@ -1874,6 +2114,10 @@ PXG_TEST(sdfTetrahedronCollision)
         }
     }
     PXG_CHECK_MSG(badStart == 0, "%zu tetrahedra chose a different starting iterate", badStart);
+    PXG_CHECK_MSG(badFinalP == 0, "%zu tetrahedra returned a `point` that is not the barycentric "
+                  "blend of their last newUvw -- E5 rebuilds p on EVERY iteration, clamped or "
+                  "not, and without this check a port that rebuilds it only when the projection "
+                  "ran is invisible", badFinalP);
     PXG_CHECK_MSG(badDiff == 0, "%zu tetrahedra computed a different `difference`", badDiff);
     PXG_CHECK_MSG(badStep == 0, "%zu step values differ from the 1/(2d) * 0.8^k schedule", badStep);
     PXG_CHECK_MSG(badClamp == 0, "%zu iterations disagreed about WHETHER the projection ran -- "
@@ -1994,12 +2238,28 @@ PXG_TEST(sdfTetrahedronCollision)
     PXG_CHECK_MSG(nFinalGChecked > 0,
                   "no tetrahedron had finite arithmetic at the final gradient, so the resample "
                   "check never applied to anything");
+    PXG_CHECK_MSG(nFinalPChecked > 0,
+                  "no tetrahedron had a finite final point, so the E5 check never applied");
+    PXG_CHECK_MSG(nStraddle > 0,
+                  "no tetrahedron produced d0 == d1 with both strictly below d2, d3 and the "
+                  "centroid, so E1's asymmetric cascade -- whose second arm never compares "
+                  "against d0 -- is indistinguishable from a four-way minimum");
+    PXG_CHECK_MSG(nEpsBand > 0,
+                  "no iteration left the real gate quiet while sitting inside the band a NEGATED "
+                  "eps would catch, so the SIGN of eps is unobservable -- the constructed "
+                  "perpendicular tets are meant to produce exactly that");
+    PXG_CHECK_MSG(nNanMag > 0,
+                  "no iteration produced a NaN gradient magnitude, so the two-if / if-else "
+                  "difference in PxVec3::normalize -- where neither branch fires and the raw "
+                  "vector must survive -- is unchecked");
 
     std::printf("    [ note ] tet descent: %u tetrahedra, %u converged / %u ran to 16, start "
-                "arms %u/%u/%u/%u/%u, clamp ran %u / skipped %u, %u discontinuity substitutions, "
-                "%u with a tied pair\n",
+                "arms %u/%u/%u/%u/%u, clamp ran %u / skipped %u, %u discontinuity "
+                "substitutions, %u NaN magnitudes, %u eps-band iterations, %u tied pairs, "
+                "%u cascade straddles\n",
                 NT, nConverged, nRanOut, armSeen[0], armSeen[1], armSeen[2], armSeen[3],
-                armSeen[4], nClampRan, nClampSkipped, nSubstituted, nTied);
+                armSeen[4], nClampRan, nClampSkipped, nSubstituted, nNanMag, nEpsBand, nTied,
+                nStraddle);
 
     for (auto h : owned) dev->destroyBuffer(h);
 }

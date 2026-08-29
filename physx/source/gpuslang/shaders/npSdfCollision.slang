@@ -317,7 +317,7 @@ void sdfCollTetClamp(uint3 dtid : SV_DispatchThreadID)
     o[0] = r.x; o[1] = r.y; o[2] = r.z; o[3] = 0.0f;
 }
 
-// ---- doTetrahedronSDFCollision.  Stride 208 words (P9.35a). ----------------
+// ---- doTetrahedronSDFCollision.  Stride 256 words (P9.35a). ----------------
 //    0..4   d0 d1 d2 d3 dCenter
 //    5      startArm            6      difference
 //    7..10  uvw0               11..13  p0
@@ -326,9 +326,9 @@ void sdfCollTetClamp(uint3 dtid : SV_DispatchThreadID)
 //   22..24  point (out)        25..27  dir (inout, on the way out)
 //   28      the returned distance
 //   29..31  unused
-//   32 + 11k .. : per-iteration, eleven words each for k = 0..15:
+//   32 + 14k .. : per-iteration, fourteen words each for k = 0..15:
 //              +0 stepIn  +1 gradMag  +2..5 newUvw  +6..8 gradUsed
-//              +9 clamped  +10 unused
+//              +9 clamped  +10..12 gradRaw  +13 unused
 //
 // Same arrangement as the triangle trace, plus ONE extra field that the triangle
 // version has no use for: `clamped`.  E3 makes the projection conditional here, so
@@ -357,7 +357,7 @@ void sdfCollTetrahedron(uint3 dtid : SV_DispatchThreadID)
     SdfTetTrace tr;
     const float d = sdfDoTetrahedronCollisionEx(t, v0, v1, v2, v3, point, dir, tolerance, tr);
 
-    Ptr<float> o = Ptr<float>(gP.triOut) + i * 208;
+    Ptr<float> o = Ptr<float>(gP.triOut) + i * 256;
     o[0] = tr.d0; o[1] = tr.d1; o[2] = tr.d2; o[3] = tr.d3; o[4] = tr.dCenter;
     o[5] = float(tr.startArm);
     o[6] = tr.difference;
@@ -373,13 +373,19 @@ void sdfCollTetrahedron(uint3 dtid : SV_DispatchThreadID)
     o[29] = 0.0f; o[30] = 0.0f; o[31] = 0.0f;
     for (uint k = 0u; k < SDF_TET_MAX_ITERS; ++k)
     {
-        Ptr<float> e = o + 32 + k * 11;
+        Ptr<float> e = o + 32 + k * 14;
         e[0] = tr.it[k].stepIn;
         e[1] = tr.it[k].gradMag;
         e[2] = tr.it[k].newUvw.x; e[3] = tr.it[k].newUvw.y;
         e[4] = tr.it[k].newUvw.z; e[5] = tr.it[k].newUvw.w;
         e[6] = tr.it[k].gradUsed.x; e[7] = tr.it[k].gradUsed.y; e[8] = tr.it[k].gradUsed.z;
         e[9] = float(tr.it[k].clamped);
-        e[10] = 0.0f;
+        // The RAW gradient, which the triangle trace deliberately omits.  Here it is
+        // load-bearing: without it the replay takes gradUsed FROM the shader and is
+        // self-consistent about it, so the two-if / if-else difference at a NaN
+        // magnitude -- where neither `> 0` nor `== 0` holds and the raw value must
+        // survive untouched -- is invisible.  P9.34a's lesson, applied.
+        e[10] = tr.it[k].gradRaw.x; e[11] = tr.it[k].gradRaw.y; e[12] = tr.it[k].gradRaw.z;
+        e[13] = 0.0f;
     }
 }

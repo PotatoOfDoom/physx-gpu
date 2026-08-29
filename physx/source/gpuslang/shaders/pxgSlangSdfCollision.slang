@@ -627,6 +627,35 @@ float sdfDoTriangleCollision(SparseSdfTexture t, float3 v0, float3 v1, float3 v2
 //  E8. THE CLAMP IS THE FIVE-ARGUMENT Gu::closestPtPointTetrahedron, applied to
 //      the CANONICAL SIMPLEX (1,0,0), (0,1,0), (0,0,1), (0,0,0) -- not the actual
 //      tetrahedron.  It projects the barycentric triple, not the point.
+//
+// ---------------------------------------------------------------------------
+// TWO THINGS THE SWEEP LEFT STANDING, and what each of them turned out to be.
+//
+//  * `max(max(a,b), max(c,d))` against a left fold is an EQUIVALENT, not a gap.
+//    `max` on floats is a SELECTION -- it returns one of its arguments unchanged,
+//    so no rounding enters -- and it is associative and commutative on non-NaN
+//    inputs.  Both spellings therefore return the same element, bit for bit.  NaN
+//    cannot arise here: the four arguments are `dot(e, e)` of finite differences,
+//    and the degenerate tetrahedron (all four corners equal) gives four exact
+//    zeros rather than NaN.  Transcribed in upstream's shape anyway.
+//
+//  * `<=` / `>=` against `<` / `>` IN E3's ESCAPE TEST is a NAMED GAP, and the
+//    condition is written out here so the next pass can build it rather than
+//    rediscover it.  The two differ only when a component is EXACTLY -1e-4f or
+//    EXACTLY 1.0f + 1e-4f, and the fixture cannot manufacture that.
+//    It manufactures the neighbouring boundary and does so on purpose -- the
+//    perpendicular tetrahedra put a component at exactly 1.0, which is what makes
+//    the SIGN of eps observable -- but exactly ±eps is out of reach, and the
+//    reason is specific rather than general.  The two boundaries that P9.34b and
+//    P9.34c DID manufacture were each reachable because a free host-side
+//    parameter mapped monotonically onto the compared value: a gather tolerance
+//    there, a contact distance here.  This comparison has no such handle.  The
+//    compared value is `uvw - step * (grad . (v_i - p))`, in which `grad` is a
+//    GPU-only texture sample; the only host-controllable factors are the
+//    vertices, and they move `step` and the dot product together.  A bisection
+//    over the direction converges to where the product crosses 1e-4f but is not
+//    guaranteed to LAND on that float.  So: a real difference, on a measure-zero
+//    input, unreached -- recorded, not excused.
 // ---------------------------------------------------------------------------
 static const uint SDF_TET_MAX_ITERS = 16u;
 
