@@ -1724,6 +1724,118 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.31 — die Löser-Hälfte der Tuch-gegen-Partikel-Kette, zwei falsche Lesarten von mir, und ein Prüfstand für eine Formel, die man nur im Großen sieht
+
+Manifest **371 → 374**. `cloth_particleContactPrepareLaunch` und die beiden
+`cloth_solveCPOutput*DeltaVLaunch` schließen die Kette, die P9.30 geöffnet hat:
+Mittelphase → Kontakterzeuger → **Prepare → Löser**.
+
+### Zwei Lesarten, die ich vor dem Schreiben geprüft habe — und zwei davon waren falsch
+
+* **`dynamicFriction` ist Float-Index 2, nicht 1.** Der Datensatz
+  (`PxsDeformableSurfaceMaterialCore.h:38`) ist `youngs, poissons,
+  dynamicFriction, thickness, …` über 32 Byte. Mein erster Entwurf las Index 1 —
+  er hätte die **Poissonzahl als Reibungskoeffizienten** benutzt, hätte
+  anstandslos übersetzt und wäre in jeder Szene plausibel gelaufen. Die
+  Vorrichtung setzt deshalb einen **unterscheidbaren** Poissons-Wert genau in
+  dieses Feld: ein Index-1-Port liefert jetzt eine falsche Reibung statt einer
+  glaubhaften.
+* **Die `computeTriangleContact`-Überladung.** Wer `FEMClothExternalSolve.cu` von
+  oben liest, findet zuerst eine `float2`-Fassung, die mit
+  `(1-b.x-b.y, b.x, b.y)` wichtet — einer **Rotation** der richtigen Gewichte.
+  Dreißig Zeilen tiefer steht die `float4`-Fassung mit `(b.x, b.y, b.z)`, und der
+  Aufruf übergibt ein `float4`, also wählt die Überladungsauflösung sie. **Kein
+  Defekt; die alarmierende Lesart war meine.**
+* **Der Accessor-Unterschied ist folgenlos.** Die Tuch-Seite dekodiert `pairInd1`
+  mit `PxGetClothElementIndex`, die Partikel-Seite mit
+  `PxGetSoftBodyElementIndex`. Nachgeprüft: `PX_MAX_NB_DEFORMABLE_SURFACE_TRI`
+  und `PX_MAX_NB_DEFORMABLE_VOLUME_TET` sind **beide** `0x000fffff`, beide
+  Verschiebungen 20. Ein Lesbarkeitsdefekt, der still bricht, sobald eine der
+  Konstanten wandert — **Kandidat 40**, dokumentiert und nicht gemeldet.
+
+### Eine Fallennotiz, die ich selbst widerlegt habe
+
+Der erste Entwurf schrieb, die Arbeitsindex-Formel
+
+```
+workIndex = i*blockDim.x + threadIdx.x + nbIterationsPerBlock*blockIdx.x*blockDim.x
+```
+
+mache einen gewöhnlichen Grid-Stride **falsch**. Das stimmt nicht, und weil die
+Behauptung tragend war, steht die Korrektur im Shader:
+
+> Beide Formeln decken `[0, N)` **genau einmal** ab, und beide liefern **dieselbe
+> Bahn** — denn außer `threadIdx.x` ist jeder Term ein Vielfaches von 256 und
+> damit von 32, also gilt `workIndex % 32 == threadIdx.x % 32` in beiden Fällen.
+
+Die Ersetzung ist also **beobachtungsäquivalent**; was die Upstream-Formel kauft,
+ist Speicherlokalität, nicht Korrektheit. Der entsprechende Mutant überlebt
+beide Fege-Durchgänge, und **das ist der Beleg**, nicht das Zugeständnis.
+
+Beobachtbar ist etwas anderes: den Faktor `nbIterationsPerBlock *` wegzulassen.
+Dann **überlappen** die Blockbereiche und der Schwanz wird nie besucht — aber
+erst jenseits von `gridDim · blockDim = 262144` Kontakten, weil
+`nbIterationsPerBlock` darunter immer 1 ist und die Formel zu einem flachen Index
+zusammenfällt.
+
+Deshalb trägt die Prepare-Vorrichtung neben ihrem kleinen exakten Lauf einen
+**300000-Kontakt-Abdeckungslauf**. Und der ist **gefahren** worden, nicht
+begründet: mit weggelassenem Faktor bleiben **37600 von 300000** Bahnen
+ungeschrieben, die erste bei **262400** — exakt die Zahl `1024·256 + 256`, die
+die Prüfmeldung aus der Formel herleitet. Vorhersage und Messung stimmen auf den
+Index.
+
+### Fünf Überlebende, vier Lücken, ein falscher Mutant
+
+Der erste Durchgang ließ fünf Überlebende. **Kein einziger war ein
+Portierungsfehler** — aber das wusste ich erst nach der Diagnose, nicht vorher:
+
+| Überlebender | Befund |
+|---|---|
+| `p1-grid-stride`, `s1-grid-stride` | **Begründetes Äquivalent, vorhergesagt.** Siehe oben. |
+| `velmult-no-guard` | **Lücke.** Kein Kontakt hatte `unitResponse == 0`, also stimmten `(x>0)?1/x:0` und `1/x` überall überein. Dreieck 23 ist jetzt vollständig angeheftet und trifft auf einen unbeweglichen Partikel; die Vorrichtung **zählt** die Nullantworten und verweigert den Dienst bei null. |
+| `p8-force-stride-f4` | **Lücke, und die unangenehmste.** Die Kraftfelder sind `float2`. Ein `float4`-Schreibzugriff nullt `[16i, 16i+16)` statt `[8i, 8i+8)` — und **jedes Wort, das die Vorrichtung prüfte, kam trotzdem als Null zurück**, weil der breitere Zugriff den schmaleren überdeckt. Die Puffer sind jetzt doppelt so groß mit gesätem Schwanz; über genau diesen Schwanz liefe ein `float4`-Zugriff in der Engine hinaus. |
+| `psmat-group-mask` | **Lücke.** Die Phasen waren 0 und 1, die Maske ist `0x000fffff` — also die Identität. Jetzt tragen sie die Nicht-Gruppen-Bits. |
+| `s8-skip-eps` | **Ein Fehler in meinem Mutanten, nicht in der Vorrichtung.** Er ließ die Epsilon-Prüfung im **ersten** der drei Zweige weg, während die einzige Null-Baryzentrik im **dritten** lag. Die Vorrichtung hat jetzt in jedem der drei Schlitze eine Null (Kontakte 5, 6, 8) und der Mutant ist dreigeteilt. |
+
+Nach dem Schließen:
+
+| | Mutanten | getötet | überlebt |
+|---|---|---|---|
+| Prepare | 17 | **16** | 1 (das Äquivalent) |
+| Löser | 24 | **23** | 1 (dasselbe) |
+
+### Der Löser: ein Rumpf, zwei Ausgänge — und ausdrücklich **keine** Zwillinge
+
+Alles vom Arbeitsindex bis `appliedForce.y += deltaFr` ist in beiden Kerneln
+derselbe Text und steht deshalb **einmal** da. Sie unterscheiden sich in drei
+Dingen, und die Notiz sagt das, statt sie wie das Box/Konvex-Paar aus P9.20 zu
+Zwillingen zu erklären:
+
+* das Vorzeichen des Impulses,
+* ein zusätzlicher Faktor `invMass0` auf der Partikelseite,
+* und wohin das Ergebnis geht — Positionsdelta auf drei Tuch-Vertices per
+  Atomic gegen ein Geschwindigkeitsdelta pro Kontakt.
+
+Die Vorrichtung fährt beide über **dieselben** Constraints und verlangt, dass
+ihre angewandten Kräfte nicht nur mit dem Spiegel, sondern auch **miteinander**
+übereinstimmen — eine Abweichung dort hieße, die Trennlinie hat sich verschoben.
+
+### Verifikation
+
+* Fegen **16 von 17** (Prepare) und **23 von 24** (Löser) — zwangsfrisch, 0
+  Anker-Fehler, 0 Hänger, alle 41 Anker vorab auf Eindeutigkeit geprüft; die
+  beiden Überlebenden sind dasselbe begründete Äquivalent;
+* Prepare **bitgleich** gegen einen Host-Spiegel über 40 Kontakte, plus der
+  300000-Kontakt-Abdeckungslauf;
+* Löser **bitgleich** über zwölf Kontakte: 30 Vertices mit genau einem Schreiber
+  bitweise, 3 umkämpfte über ihre ordnungsinvariante Zählung;
+* Suite **821/821** in beiden Speichermodi, **beide im ersten Anlauf** — was bei
+  rund 23 % Flackerrate unter `ctest -j4` (P9.30) Glück ist und deshalb mit der
+  Versuchszahl dasteht;
+* Szenen **33 ok, 0 fail, 0 missing (von 33)** nach dem Neubau von `build-sdk` wegen der
+  Manifeständerung.
+
 ## P9.30 — die Tuch-gegen-Partikel-Kette, vier Löcher in meinen eigenen Vorrichtungen, und eine Rate, die ich im falschen Regime gemessen hatte
 
 Manifest **369 → 371**. `cloth_psMidphaseGeneratePairsLaunch` und
