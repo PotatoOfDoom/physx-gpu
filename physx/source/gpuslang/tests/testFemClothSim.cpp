@@ -12436,4 +12436,483 @@ PXG_TEST(femClothSimPsSolveCP)
         dev->destroyBuffer(h);
 }
 
+
+// ---------------------------------------------------------------------------
+// P9.32: cloth_solveOutputAttachmentClothClothDeltaVLaunch — the cloth-vs-cloth
+// ATTACHMENT solve (FEMClothExternalSolve.cu:1493, launch PxgFEMClothCore.cpp:1915).
+// ---------------------------------------------------------------------------
+namespace p932att
+{
+struct ClothAttachSolvePush
+{
+    uint64_t clothes, attachments;
+    uint32_t numAttachments, pad20;
+};
+static_assert(sizeof(ClothAttachSolvePush) == 24, "cloth attach solve blob must be 24 bytes");
+static_assert(offsetof(ClothAttachSolvePush, attachments) == 8, "attachments @8");
+static_assert(offsetof(ClothAttachSolvePush, numAttachments) == 16, "numAttachments @16");
+
+// PxgFEMFEMAttachmentConstraint (PxgFEMCore.h:204) — the warp-strided block.  This TU
+// cannot offsetof against the real struct (PxgFEMCore.h pulls the CUDA buffer stack), and
+// the layout already exists twice — in the pxgSlangFemFemAttach module and in
+// testSoftBodySim.cpp's p819att.  What this copy can do that those cannot is refuse to let
+// the offsets be TYPED: they are ACCUMULATED from the field declarations
+//
+//   union { float4 low_high_limits[32];  float4 low_high_angles[32];       }
+//   union { float4 axis_angle[32];       float4 attachmentBarycentric[32]; }
+//   float4 barycentric0[32];   float4 barycentric1[32];
+//   PxU64  elemId0[32];        PxU64  elemId1[32];
+//   float  constraintOffset[32];
+//
+// and only then compared against the numbers the SHADER carries.  A field whose size or
+// position is misread here therefore fails to agree with the shader instead of quietly
+// agreeing with a second wrong copy.
+static const size_t FAC_LANES = 32;
+static const size_t FAC_F4_ARR  = 16 * FAC_LANES;   // float4[32]
+static const size_t FAC_U64_ARR =  8 * FAC_LANES;   // PxU64[32]
+static const size_t FAC_F32_ARR =  4 * FAC_LANES;   // float[32]
+static const size_t FAC_LOW_HIGH_ANGLES = 0;
+static const size_t FAC_ATT_BARYCENTRIC = FAC_LOW_HIGH_ANGLES + FAC_F4_ARR;
+static const size_t FAC_BARYCENTRIC0    = FAC_ATT_BARYCENTRIC + FAC_F4_ARR;
+static const size_t FAC_BARYCENTRIC1    = FAC_BARYCENTRIC0 + FAC_F4_ARR;
+static const size_t FAC_ELEMID0         = FAC_BARYCENTRIC1 + FAC_F4_ARR;
+static const size_t FAC_ELEMID1         = FAC_ELEMID0 + FAC_U64_ARR;
+static const size_t FAC_CONSTR_OFFSET   = FAC_ELEMID1 + FAC_U64_ARR;
+static const size_t FAC_STRIDE          = FAC_CONSTR_OFFSET + FAC_F32_ARR;
+// The literals in pxgSlangFemFemAttach.slang, restated so a change to either side breaks.
+static_assert(FAC_ATT_BARYCENTRIC == 512, "attachmentBarycentric @512");
+static_assert(FAC_BARYCENTRIC0 == 1024, "barycentric0 @1024");
+static_assert(FAC_BARYCENTRIC1 == 1536, "barycentric1 @1536");
+static_assert(FAC_ELEMID0 == 2048, "elemId0 @2048");
+static_assert(FAC_ELEMID1 == 2304, "elemId1 @2304");
+static_assert(FAC_CONSTR_OFFSET == 2560, "constraintOffset @2560");
+static_assert(FAC_STRIDE == 2688, "the block is 2688 bytes");
+
+// PxgSimulationCoreDesc.h:41 / PxDeformableSurface.h:56 — the encoding BOTH sides of the
+// kernel decode, one through the accessors and one open-coded (trap A4).
+static const uint32_t CLOTH_ID_SHIFT = 20u;
+static const uint32_t CLOTH_ELEM_MASK = 0x000fffffu;
+static uint64_t encodeCloth(uint32_t clothId, uint32_t elem)
+{
+    return uint64_t((clothId << CLOTH_ID_SHIFT) | elem);
+}
+
+// PxgSoftBodyKernelGridDim/BlockDim::SB_UPDATEROTATION.
+static const uint32_t FCA_GRID = 1024u, FCA_BLOCK = 256u;
+} // namespace p932att
+
+PXG_TEST(femClothSimClothClothAttachment)
+{
+    using namespace p932att;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // Three clothes at ids 1, 2 and 5 — never 0.  A port that forgets the >> 20 reads
+    // descriptor 0, which stays all-zero here, so the mistake is a null dereference rather
+    // than a plausible number.
+    const uint32_t CLOTH_A = 1u, CLOTH_B = 2u, CLOTH_C = 5u;
+
+    // 70 attachments = three warp blocks of 32/32/6.  Fewer than 33 and trap A2 is
+    // invisible: `attachments[workIndex]` and `attachments[workIndex/32]` agree exactly on
+    // the first block.
+    const uint32_t NB_ATT = 70u;
+    const uint32_t NB_BLOCKS = (NB_ATT + 31u) / 32u;
+
+    // Attachment 9 has BOTH sides fully pinned -> the invMass guard fires (trap A6).
+    // Attachments 33 and 58 are SELF-attachments inside cloth C and share vertices, so
+    // their scatters contend (trap A10).
+    const uint32_t PINNED_ATT = 9u;
+    auto isSelf = [&](uint32_t a) { return a == 33u || a == 58u; };
+
+    // ---- the three clothes ----------------------------------------------------------
+    // Every attachment owns its own triangle on each side, except the self ones, which
+    // share cloth C's vertex 0..5 pool.  Positions and inverse masses are all distinct so
+    // the interpolated inverse mass (trap A5) equals no single vertex's.
+    std::vector<F4> vA, vB, vC;
+    std::vector<TriIdx4> tA, tB, tC;
+    auto pushTri = [](std::vector<F4>& v, std::vector<TriIdx4>& t, float ox, float oy,
+                      const float m[3]) {
+        const uint32_t b = uint32_t(v.size());
+        v.push_back(F4{ ox,         oy,         0.10f, m[0] });
+        v.push_back(F4{ ox + 1.3f,  oy + 0.2f,  0.30f, m[1] });
+        v.push_back(F4{ ox + 0.4f,  oy + 1.7f, -0.20f, m[2] });
+        t.push_back(TriIdx4{ b, b + 1u, b + 2u, 0u });
+    };
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        const bool pinned = (a == PINNED_ATT);
+        // Corner 1 of every eighth triangle is PINNED while its barycentric stays
+        // non-zero, and corner 2 always carries a non-zero inverse mass while attachment
+        // 12's barycentric zeroes it.  Trap A7 needs both: an unguarded scatter must still
+        // bump the .w counter of a corner that contributes nothing.
+        const float mA[3] = { pinned ? 0.0f : 0.40f + 0.011f * float(a),
+                              pinned || (a % 8u == 3u) ? 0.0f : 0.62f + 0.007f * float(a),
+                              pinned ? 0.0f : 0.85f - 0.006f * float(a % 30u) };
+        const float mB[3] = { pinned ? 0.0f : 0.55f - 0.004f * float(a % 25u),
+                              pinned ? 0.0f : 0.31f + 0.009f * float(a),
+                              pinned ? 0.0f : 0.73f + 0.005f * float(a % 17u) };
+        if (isSelf(a))
+        {
+            // Both sides land in cloth C on triangles that SHARE vertices.
+            continue;
+        }
+        pushTri(vA, tA, 2.0f * float(a), 0.0f, mA);
+        pushTri(vB, tB, 2.0f * float(a), 5.0f, mB);
+    }
+    // Cloth C: six vertices, three triangles over them, so the two self-attachments write
+    // the same vertices twice from opposite sides.
+    {
+        const float mC[6] = { 0.37f, 0.0f, 0.91f, 0.48f, 0.66f, 0.24f };
+        for (uint32_t i = 0; i < 6u; ++i)
+            vC.push_back(F4{ 0.7f * float(i), 1.1f * float(i % 3u), -0.4f * float(i % 2u), mC[i] });
+        tC.push_back(TriIdx4{ 0u, 1u, 2u, 0u });
+        tC.push_back(TriIdx4{ 2u, 3u, 4u, 0u });
+        tC.push_back(TriIdx4{ 4u, 5u, 0u, 0u });
+    }
+
+    DevBuf bVA = makeDev(dev, vA);
+    if (!bVA.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bVA.h); return; }
+    DevBuf bVB = makeDev(dev, vB), bVC = makeDev(dev, vC);
+    DevBuf bTA = makeDev(dev, tA), bTB = makeDev(dev, tB), bTC = makeDev(dev, tC);
+    std::vector<F4> dA(vA.size(), F4{ 0, 0, 0, 0 }), dB(vB.size(), F4{ 0, 0, 0, 0 }),
+                    dC(vC.size(), F4{ 0, 0, 0, 0 });
+    DevBuf bDA = makeDev(dev, dA), bDB = makeDev(dev, dB), bDC = makeDev(dev, dC);
+
+    std::vector<PxgFEMCloth> descArr(CLOTH_C + 1u, makeZeroDesc());
+    auto wire = [](PxgFEMCloth& c, DevBuf& pos, DevBuf& tri, DevBuf& delta,
+                   size_t nbVerts, size_t nbTris) {
+        c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(pos.addr));
+        c.mTriangleVertexIndices =
+            reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(tri.addr));
+        c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(delta.addr));
+        c.mNbVerts = uint32_t(nbVerts);
+        c.mNbTriangles = uint32_t(nbTris);
+    };
+    wire(descArr[CLOTH_A], bVA, bTA, bDA, vA.size(), tA.size());
+    wire(descArr[CLOTH_B], bVB, bTB, bDB, vB.size(), tB.size());
+    wire(descArr[CLOTH_C], bVC, bTC, bDC, vC.size(), tC.size());
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- the constraint block ---------------------------------------------------------
+    // Seeded with a recognisable pattern so a read that misses its slot lands on garbage
+    // rather than on a zero that could pass for an answer.
+    std::vector<uint32_t> con(NB_BLOCKS * FAC_STRIDE / 4, 0xCDCDCDCDu);
+    auto putF4 = [&](size_t byteOff, F4 v) {
+        const size_t w = byteOff / 4;
+        con[w] = f2u(v.x); con[w + 1] = f2u(v.y); con[w + 2] = f2u(v.z); con[w + 3] = f2u(v.w);
+    };
+    struct Side { uint32_t clothId, elem; F4 bary; };
+    std::vector<Side> s0(NB_ATT), s1(NB_ATT);
+    uint32_t triA = 0u, triB = 0u;
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        // Barycentrics that sum to one but are never equal between the two sides — with
+        // equal weights the swap of barycentric0/barycentric1 is invisible.  Attachment 12
+        // zeroes corner 2 on side 0: trap A7's second half.
+        F4 b0{ 0.5f - 0.004f * float(a % 20u), 0.2f + 0.003f * float(a % 13u), 0.0f, 0.0f };
+        b0.z = 1.0f - b0.x - b0.y;
+        if (a == 12u) { b0 = F4{ 0.45f, 0.55f, 0.0f, 0.0f }; }
+        F4 b1{ 0.15f + 0.005f * float(a % 11u), 0.55f - 0.006f * float(a % 9u), 0.0f, 0.0f };
+        b1.z = 1.0f - b1.x - b1.y;
+
+        if (isSelf(a))
+        {
+            s0[a] = Side{ CLOTH_C, (a == 33u) ? 0u : 1u, b0 };
+            s1[a] = Side{ CLOTH_C, (a == 33u) ? 1u : 2u, b1 };
+        }
+        else
+        {
+            s0[a] = Side{ CLOTH_A, triA++, b0 };
+            s1[a] = Side{ CLOTH_B, triB++, b1 };
+        }
+
+        const size_t base = size_t(a / 32u) * FAC_STRIDE, off = a & 31u;
+        // Trap A3: the slots are PxU64 and the kernel takes the LOW word.  The upper word
+        // carries a non-zero pattern, so a port that reads a uint2, or that steps by 4
+        // bytes, produces a cloth id far outside the descriptor array.
+        const size_t w0 = (base + FAC_ELEMID0 + off * 8) / 4;
+        con[w0] = uint32_t(encodeCloth(s0[a].clothId, s0[a].elem));
+        con[w0 + 1] = 0xA5A50000u | a;
+        const size_t w1 = (base + FAC_ELEMID1 + off * 8) / 4;
+        con[w1] = uint32_t(encodeCloth(s1[a].clothId, s1[a].elem));
+        con[w1 + 1] = 0x5A5A0000u | a;
+        putF4(base + FAC_BARYCENTRIC0 + off * 16, s0[a].bary);
+        putF4(base + FAC_BARYCENTRIC1 + off * 16, s1[a].bary);
+        // The three fields this kernel must NOT read (the cone-limit trio) keep the 0xCD
+        // fill, so a body copied from the softbody solve reads NaNs rather than zeros.
+    }
+    DevBuf bCon = makeDev(dev, con);
+
+    ClothAttachSolvePush push = {};
+    push.clothes = bDesc.addr;
+    push.attachments = bCon.addr;
+    push.numAttachments = NB_ATT;
+    Kernel k("femClothAttachBda.spv", "cloth_solveOutputAttachmentClothClothDeltaVLaunch",
+             {}, sizeof(ClothAttachSolvePush));
+    k.dispatch(FCA_GRID, {}, push, 1u, 1u);
+    dev->flush();
+
+    // ---- the mirror, transcribed from the .cu ------------------------------------------
+    std::vector<F4> rA(vA.size(), F4{ 0, 0, 0, 0 }), rB(vB.size(), F4{ 0, 0, 0, 0 }),
+                    rC(vC.size(), F4{ 0, 0, 0, 0 });
+    auto vertsOf = [&](uint32_t clothId) -> const std::vector<F4>& {
+        return clothId == CLOTH_A ? vA : (clothId == CLOTH_B ? vB : vC);
+    };
+    auto trisOf = [&](uint32_t clothId) -> const std::vector<TriIdx4>& {
+        return clothId == CLOTH_A ? tA : (clothId == CLOTH_B ? tB : tC);
+    };
+    auto refOf = [&](uint32_t clothId) -> std::vector<F4>& {
+        return clothId == CLOTH_A ? rA : (clothId == CLOTH_B ? rB : rC);
+    };
+    uint32_t skippedByMass = 0u, contendedWrites = 0u;
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        const TriIdx4& t0 = trisOf(s0[a].clothId)[s0[a].elem];
+        const TriIdx4& t1 = trisOf(s1[a].clothId)[s1[a].elem];
+        const std::vector<F4>& v0 = vertsOf(s0[a].clothId);
+        const std::vector<F4>& v1 = vertsOf(s1[a].clothId);
+        const F4 p00 = v0[t0.x], p01 = v0[t0.y], p02 = v0[t0.z];
+        const F4 p10 = v1[t1.x], p11 = v1[t1.y], p12 = v1[t1.z];
+        const F4& b0 = s0[a].bary; const F4& b1 = s1[a].bary;
+        // The float4 blend — .w included, and .w is what divides (trap A5).
+        const F4 pos0{ p00.x * b0.x + p01.x * b0.y + p02.x * b0.z,
+                       p00.y * b0.x + p01.y * b0.y + p02.y * b0.z,
+                       p00.z * b0.x + p01.z * b0.y + p02.z * b0.z,
+                       p00.w * b0.x + p01.w * b0.y + p02.w * b0.z };
+        const F4 pos1{ p10.x * b1.x + p11.x * b1.y + p12.x * b1.z,
+                       p10.y * b1.x + p11.y * b1.y + p12.y * b1.z,
+                       p10.z * b1.x + p11.z * b1.y + p12.z * b1.z,
+                       p10.w * b1.x + p11.w * b1.y + p12.w * b1.z };
+        if (pos1.w == 0.0f && pos0.w == 0.0f) { ++skippedByMass; continue; }   // trap A6
+
+        // The shape of the arithmetic is the observable, not just its value: the CUDA
+        // writes `diff * coefficient / (invMass0 + invMass1)`, so the scale is a
+        // multiplication FOLLOWED BY a division, not a multiplication by a reciprocal.
+        const float coefficient = 0.5f;                                        // trap A9
+        const float denom = pos0.w + pos1.w;
+        const float dix = (pos1.x - pos0.x) * coefficient / denom;
+        const float diy = (pos1.y - pos0.y) * coefficient / denom;
+        const float diz = (pos1.z - pos0.z) * coefficient / denom;
+
+        // Trap A7: NO skip.  Trap A8: cloth0 gets +, cloth1 gets -.
+        auto scatter = [&](uint32_t clothId, const TriIdx4& t, const F4& b,
+                           float sx, float sy, float sz) {
+            std::vector<F4>& r = refOf(clothId);
+            const std::vector<F4>& v = vertsOf(clothId);
+            const uint32_t iv[3] = { t.x, t.y, t.z };
+            const float bw[3] = { b.x, b.y, b.z };
+            for (int c = 0; c < 3; ++c)
+            {
+                const float im = v[iv[c]].w;                                   // trap A5
+                r[iv[c]].x += sx * bw[c] * im;
+                r[iv[c]].y += sy * bw[c] * im;
+                r[iv[c]].z += sz * bw[c] * im;
+                r[iv[c]].w += 1.0f;
+            }
+        };
+        scatter(s0[a].clothId, t0, b0, dix, diy, diz);
+        scatter(s1[a].clothId, t1, b1, -dix, -diy, -diz);
+        if (isSelf(a)) ++contendedWrites;
+    }
+
+    const auto gA = downloadBuffer<F4>(dev, bDA.h, uint32_t(dA.size()));
+    const auto gB = downloadBuffer<F4>(dev, bDB.h, uint32_t(dB.size()));
+    const auto gC = downloadBuffer<F4>(dev, bDC.h, uint32_t(dC.size()));
+
+    // Cloth A and B: every vertex has exactly ONE writer, so the comparison is bitwise.
+    uint32_t mm = 0u;
+    auto cmpExact = [&](const std::vector<F4>& got, const std::vector<F4>& ref, const char* tag) {
+        for (uint32_t v = 0; v < uint32_t(ref.size()); ++v)
+            if (f2u(got[v].x) != f2u(ref[v].x) || f2u(got[v].y) != f2u(ref[v].y) ||
+                f2u(got[v].z) != f2u(ref[v].z) || f2u(got[v].w) != f2u(ref[v].w))
+            {
+                if (mm == 0u)
+                    std::printf("    first %s difference at vertex %u: gpu (%.9g %.9g %.9g | %.9g)"
+                                " vs (%.9g %.9g %.9g | %.9g)\n", tag, v,
+                                got[v].x, got[v].y, got[v].z, got[v].w,
+                                ref[v].x, ref[v].y, ref[v].z, ref[v].w);
+                ++mm;
+            }
+    };
+    cmpExact(gA, rA, "cloth A");
+    cmpExact(gB, rB, "cloth B");
+    PXG_CHECK_MSG(mm == 0u, "%u single-writer vertex deltas differ from the mirror", mm);
+
+    // Cloth C carries the two SELF-attachments, whose six scatters overlap; the atomics make
+    // the order free, so the totals are compared with a tolerance and the counters exactly.
+    uint32_t mc = 0u;
+    for (uint32_t v = 0; v < uint32_t(rC.size()); ++v)
+    {
+        if (f2u(gC[v].w) != f2u(rC[v].w))
+        { ++mc; std::printf("    cloth C vertex %u writer count %g, expected %g\n",
+                            v, gC[v].w, rC[v].w); }
+        if (std::fabs(gC[v].x - rC[v].x) > 1e-6f || std::fabs(gC[v].y - rC[v].y) > 1e-6f ||
+            std::fabs(gC[v].z - rC[v].z) > 1e-6f)
+        { ++mc; std::printf("    cloth C vertex %u delta (%.9g %.9g %.9g) expected (%.9g %.9g %.9g)\n",
+                            v, gC[v].x, gC[v].y, gC[v].z, rC[v].x, rC[v].y, rC[v].z); }
+    }
+    PXG_CHECK_MSG(mc == 0u, "%u contended cloth-C vertices disagree with the mirror", mc);
+
+    // The structural facts the mirror alone would not pin, because the mirror shares the
+    // port's reading of them.
+    PXG_CHECK_MSG(skippedByMass == 1u,
+                  "exactly one attachment must be skipped for zero inverse mass, not %u",
+                  skippedByMass);
+    const TriIdx4& tp = tA[s0[PINNED_ATT].elem];
+    PXG_CHECK_MSG(gA[tp.x].w == 0.0f && gA[tp.y].w == 0.0f && gA[tp.z].w == 0.0f,
+                  "the fully pinned attachment must leave its triangle untouched");
+    // Trap A7 in the affirmative: corner 2 of attachment 12 has barycentric ZERO and corner
+    // 1 of attachment 3 has inverse mass ZERO, and BOTH must still have been counted once.
+    const TriIdx4& t12 = tA[s0[12u].elem];
+    PXG_CHECK_MSG(gA[t12.z].w == 1.0f && gA[t12.z].x == 0.0f,
+                  "a zero-barycentric corner still takes a writer count and a zero delta "
+                  "(got count %g, x %g)", gA[t12.z].w, gA[t12.z].x);
+    const TriIdx4& t3 = tA[s0[3u].elem];
+    PXG_CHECK_MSG(gA[t3.y].w == 1.0f && gA[t3.y].x == 0.0f,
+                  "a zero-inverse-mass corner still takes a writer count and a zero delta "
+                  "(got count %g, x %g)", gA[t3.y].w, gA[t3.y].x);
+    // Trap A8: the two sides moved in OPPOSITE directions.  Attachment 0's side-0 anchor is
+    // below its side-1 anchor in y, so cloth A's corner moves +y and cloth B's -y.
+    const TriIdx4& t0a = tA[s0[0u].elem];
+    const TriIdx4& t0b = tB[s1[0u].elem];
+    PXG_CHECK_MSG(gA[t0a.x].y > 0.0f && gB[t0b.x].y < 0.0f,
+                  "cloth0 must move toward cloth1 and cloth1 toward cloth0 (got %g and %g)",
+                  gA[t0a.x].y, gB[t0b.x].y);
+
+    std::printf("    [ note ] %u attachments over %u warp blocks, %u skipped for zero inverse "
+                "mass, %u self-attachments contending in cloth C; %zu single-writer vertices "
+                "bit-exact\n", NB_ATT, NB_BLOCKS, skippedByMass, contendedWrites,
+                vA.size() + vB.size());
+
+    for (PxgBufferHandle h : { bVA.h, bVB.h, bVC.h, bTA.h, bTB.h, bTC.h, bDA.h, bDB.h, bDC.h,
+                               bDesc.h, bCon.h })
+        dev->destroyBuffer(h);
+}
+
+
+// ---------------------------------------------------------------------------
+// P9.32 coverage rig.  Two properties of the work-index formula are invisible below
+// gridDim*blockDim = 1024*256 = 262144 attachments, because `nbIterationsPerBlock` is 1
+// there and the formula collapses to a flat index:
+//   - dropping the `nbIterationsPerBlock *` factor makes the per-block ranges OVERLAP,
+//     so the tail is never visited and everything else is visited twice (trap A1);
+//   - the zero-mass guard being a `return` rather than a `continue` abandons every LATER
+//     iteration of a thread that meets one fully pinned attachment (trap A6).
+// Both need nbIterationsPerBlock >= 2, so this rig runs 262400 attachments: 1025 blocks
+// required over a 1024-wide grid -> exactly two iterations per thread.
+//
+// Every attachment uses the SAME triangle on both sides with the SAME barycentric, so the
+// position delta is exactly zero and the only observable is the .w WRITER COUNT — which is
+// precisely what a coverage question asks.  Attachments 0..255 are fully pinned, which is
+// block 0's first iteration; their threads' second iteration is attachments 256..511.
+// ---------------------------------------------------------------------------
+PXG_TEST(femClothSimClothClothAttachmentCoverage)
+{
+    using namespace p932att;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t CLOTH_ID = 3u;
+    const uint32_t NB_ATT = 262400u;                 // 1025 blocks over a 1024 grid
+    const uint32_t NB_PINNED = FCA_BLOCK;            // the whole of block 0's iteration 0
+    const uint32_t NB_BLOCKS = NB_ATT / 32u;
+    // Derived, not assumed: the dispatch this rig needs must really take two iterations.
+    const uint32_t nbBlocksRequired = (NB_ATT + FCA_BLOCK - 1u) / FCA_BLOCK;
+    const uint32_t nbIterationsPerBlock = (nbBlocksRequired + FCA_GRID - 1u) / FCA_GRID;
+    PXG_CHECK_MSG(nbIterationsPerBlock == 2u,
+                  "the rig must reach two iterations per thread, got %u", nbIterationsPerBlock);
+
+    std::vector<F4> verts(size_t(NB_ATT) * 3u);
+    std::vector<TriIdx4> tris(NB_ATT);
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        const uint32_t b = a * 3u;
+        const float im = (a < NB_PINNED) ? 0.0f : 0.5f;
+        verts[b + 0] = F4{ float(a), 0.0f, 0.0f, im };
+        verts[b + 1] = F4{ float(a) + 1.0f, 0.0f, 0.0f, im };
+        verts[b + 2] = F4{ float(a), 1.0f, 0.0f, im };
+        tris[a] = TriIdx4{ b, b + 1u, b + 2u, 0u };
+    }
+    DevBuf bV = makeDev(dev, verts);
+    if (!bV.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bV.h); return; }
+    DevBuf bT = makeDev(dev, tris);
+    std::vector<F4> delta(verts.size(), F4{ 0, 0, 0, 0 });
+    DevBuf bD = makeDev(dev, delta);
+
+    std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
+    descArr[CLOTH_ID].mPosition_InvMass =
+        reinterpret_cast<decltype(descArr[0].mPosition_InvMass)>(size_t(bV.addr));
+    descArr[CLOTH_ID].mTriangleVertexIndices =
+        reinterpret_cast<decltype(descArr[0].mTriangleVertexIndices)>(size_t(bT.addr));
+    descArr[CLOTH_ID].mDeltaPos =
+        reinterpret_cast<decltype(descArr[0].mDeltaPos)>(size_t(bD.addr));
+    descArr[CLOTH_ID].mNbVerts = uint32_t(verts.size());
+    descArr[CLOTH_ID].mNbTriangles = NB_ATT;
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    std::vector<uint32_t> con(size_t(NB_BLOCKS) * FAC_STRIDE / 4, 0u);
+    const F4 BARY{ 0.25f, 0.35f, 0.40f, 0.0f };
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        const size_t base = size_t(a / 32u) * FAC_STRIDE, off = a & 31u;
+        const uint32_t code = uint32_t(encodeCloth(CLOTH_ID, a));
+        con[(base + FAC_ELEMID0 + off * 8) / 4] = code;
+        con[(base + FAC_ELEMID1 + off * 8) / 4] = code;
+        for (int c = 0; c < 3; ++c)
+        {
+            const float w = (c == 0) ? BARY.x : (c == 1 ? BARY.y : BARY.z);
+            con[(base + FAC_BARYCENTRIC0 + off * 16) / 4 + c] = f2u(w);
+            con[(base + FAC_BARYCENTRIC1 + off * 16) / 4 + c] = f2u(w);
+        }
+    }
+    DevBuf bCon = makeDev(dev, con);
+
+    ClothAttachSolvePush push = {};
+    push.clothes = bDesc.addr;
+    push.attachments = bCon.addr;
+    push.numAttachments = NB_ATT;
+    Kernel k("femClothAttachBda.spv", "cloth_solveOutputAttachmentClothClothDeltaVLaunch",
+             {}, sizeof(ClothAttachSolvePush));
+    k.dispatch(FCA_GRID, {}, push, 1u, 1u);
+    dev->flush();
+
+    const auto got = downloadBuffer<F4>(dev, bD.h, uint32_t(verts.size()));
+
+    // Both sides scatter into the SAME triangle, so a visited attachment leaves 2.0 on each
+    // of its three corners; a skipped or unvisited one leaves 0.0.
+    uint32_t badCount = 0u, unvisited = 0u, firstUnvisited = NB_ATT, nonZeroDelta = 0u;
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        const float expect = (a < NB_PINNED) ? 0.0f : 2.0f;
+        for (uint32_t c = 0; c < 3u; ++c)
+        {
+            const F4& g = got[size_t(a) * 3u + c];
+            if (g.w != expect)
+            {
+                if (a >= NB_PINNED && g.w == 0.0f)
+                { if (firstUnvisited == NB_ATT) firstUnvisited = a; ++unvisited; }
+                else ++badCount;
+            }
+            if (g.x != 0.0f || g.y != 0.0f || g.z != 0.0f) ++nonZeroDelta;
+        }
+    }
+    PXG_CHECK_MSG(unvisited == 0u,
+                  "%u corners were never written; the first belongs to attachment %u "
+                  "(the formula's first uncovered index would be %u)",
+                  unvisited, firstUnvisited, FCA_GRID * FCA_BLOCK);
+    PXG_CHECK_MSG(badCount == 0u,
+                  "%u corners carry a writer count that is neither the expected 2 nor 0 — a "
+                  "count above 2 means a work index was visited more than once", badCount);
+    PXG_CHECK_MSG(nonZeroDelta == 0u,
+                  "%u corners moved, but both sides of every attachment interpolate the same "
+                  "anchor, so every delta must be exactly zero", nonZeroDelta);
+
+    std::printf("    [ note ] %u attachments, %u iterations per thread; %u pinned (block 0's "
+                "first iteration, whose SECOND iteration is attachments %u..%u), all %zu "
+                "remaining corners written exactly twice\n",
+                NB_ATT, nbIterationsPerBlock, NB_PINNED, NB_PINNED, NB_PINNED * 2u - 1u,
+                (size_t(NB_ATT) - NB_PINNED) * 3u);
+
+    for (PxgBufferHandle h : { bV.h, bT.h, bD.h, bDesc.h, bCon.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace

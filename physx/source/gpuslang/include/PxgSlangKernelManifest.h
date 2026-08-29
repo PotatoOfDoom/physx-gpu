@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 374;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 375;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -436,7 +436,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "cloth_solveCPOutputClothDeltaVLaunch", "femClothPsSolveBda.spv", "cloth_solveCPOutputClothDeltaVLaunch" },  // CLOTH_PARTICLE_CLOTH_DELTA (P9.31 BDA)
     { "cloth_solveCPOutputParticleDeltaVLaunch", "femClothPsSolveBda.spv", "cloth_solveCPOutputParticleDeltaVLaunch" },  // CLOTH_PARTICLE_PARTICLE_DELTA (P9.31 BDA)
     { "cloth_solveRigidClothAttachmentLaunch", "femClothRigidAttachBda.spv", "cloth_solveRigidClothAttachmentLaunch" },  // CLOTH_SOLVE_RIGID_CLOTH_ATTACHMENT (P7.1 tranche 3a BDA port: PGS rigid/world attachment solve)
-    { "cloth_solveOutputAttachmentClothClothDeltaVLaunch", nullptr, nullptr },  // CLOTH_SOLVE_ATTACHMENT_CLOTH_CLOTH_DELTA (unmapped)
+    { "cloth_solveOutputAttachmentClothClothDeltaVLaunch", "femClothAttachBda.spv", "cloth_solveOutputAttachmentClothClothDeltaVLaunch" },  // CLOTH_SOLVE_ATTACHMENT_CLOTH_CLOTH_DELTA (P9.32 BDA)
     { "cloth_finalizeVelocitiesLaunch", "femClothSimBda.spv", "cloth_finalizeVelocitiesLaunch" },  // CLOTH_FINALIZE_VELOCITIES (P7.0 BDA port)
     { "cloth_solveRigidClothCollisionTGSLaunch", "femClothRigidContactBda.spv", "cloth_solveRigidClothCollisionTGSLaunch" },  // CLOTH_SOLVE_RIGID_CLOTH_COLLISION_TGS (P7.1 tranche 4b-3 BDA port: TGS cloth-vs-rigid contact solve)
     { "cloth_queryRigidClothContactReferenceCountTGSLaunch", "femClothRigidContactBda.spv", "cloth_queryRigidClothContactReferenceCountTGSLaunch" },  // CLOTH_QUERY_RIGID_CLOTH_REFERENCE_COUNT_TGS (P7.1 tranche 4b-3 BDA port: TGS cloth-vs-rigid contact reference-count query)

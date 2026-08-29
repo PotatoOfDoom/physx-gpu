@@ -847,6 +847,10 @@ static const uint8_t kFemAttachPrep[] = { 8, 8, 4, 8 };
 //   sb_solveOutputSoftBodyAttachmentDeltaVLaunch(PxgSoftBody* softbodies,
 //   PxgFEMFEMAttachmentConstraint* attachments, PxU32 numAttachments) -- launch site
 //   PxgSoftBodyCore.cpp:1921.  8 @0, 8 @8, PxU32 @16 -> 24-byte blob.
+//   P9.32: cloth_solveOutputAttachmentClothClothDeltaVLaunch(PxgFEMCloth* clothes,
+//   PxgFEMFEMAttachmentConstraint* attachments, const PxU32 numAttachments) -- launch site
+//   PxgFEMClothCore.cpp:1915 -- has the SAME three-argument signature down to the types'
+//   sizes, so it shares this row rather than duplicating it.
 static const uint8_t kFemAttachSolve[] = { 8, 8, 4 };
 
 // gpunarrowphase softbody-vs-CLOTH midphase (P8.8):
@@ -1800,6 +1804,8 @@ static const PxgKernelAbiRow kRows[] = {
     // gpusimulationcontroller FEM-vs-FEM attachments (P8.19)
     { "femAttachmentPrepareLaunch", kFemAttachPrep, uint32_t(sizeof(kFemAttachPrep)) },
     { "sb_solveOutputSoftBodyAttachmentDeltaVLaunch", kFemAttachSolve, uint32_t(sizeof(kFemAttachSolve)) },
+    // gpusimulationcontroller FEMCloth-vs-FEMCloth attachment solve (P9.32 BDA), on the row above
+    { "cloth_solveOutputAttachmentClothClothDeltaVLaunch", kFemAttachSolve, uint32_t(sizeof(kFemAttachSolve)) },
     // gpunarrowphase softbody-vs-CLOTH midphase (P8.8)
     { "sb_clothMidphaseGeneratePairsLaunch", kSbClothMidphase, uint32_t(sizeof(kSbClothMidphase)) },
     { "sb_clothContactGenLaunch", kSbClothContactGen, uint32_t(sizeof(kSbClothContactGen)) },

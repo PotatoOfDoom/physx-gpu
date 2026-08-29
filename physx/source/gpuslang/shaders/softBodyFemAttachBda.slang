@@ -95,6 +95,7 @@ module softBodyFemAttachBda;
 
 import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu (mSimTetIndices@80, mSimPosition_InvMass@96, mSimDelta@272)
 import pxgSlangAtomicFloat;    // pxgAtomicAddF4XYZ / pxgAtomicAddF4W
+import pxgSlangFemFemAttach;   // FAC_* layout of PxgFEMFEMAttachmentConstraint + facSlot
 
 // PxgSoftBodyKernelBlockDim/GridDim::SB_UPDATEROTATION (PxgSoftBodyCoreKernelIndices.h:42/59).
 static const uint SB_BLOCK = 256u;
@@ -127,24 +128,10 @@ static const uint64_t FA_INDEX1          = 72UL;
 static const uint64_t FA_CONSTR_OFFSET   = 76UL;
 
 // ---------------------------------------------------------------------------
-// PxgFEMFEMAttachmentConstraint (PxgFEMCore.h:204) — a WARP-STRIDED block of 32-element
-// arrays.  Every access is `base + block * FAC_STRIDE + field + offset * elemSize`.
-//   low_high_angles[32]        float4 @0      (union: low_high_limits)
-//   attachmentBarycentric[32]  float4 @512    (union: axis_angle)
-//   barycentric0[32]           float4 @1024
-//   barycentric1[32]           float4 @1536
-//   elemId0[32]                PxU64  @2048
-//   elemId1[32]                PxU64  @2304
-//   constraintOffset[32]       float  @2560 -> 2688
-// ---------------------------------------------------------------------------
-static const uint64_t FAC_STRIDE          = 2688UL;
-static const uint64_t FAC_LOW_HIGH_ANGLES = 0UL;
-static const uint64_t FAC_ATT_BARYCENTRIC = 512UL;
-static const uint64_t FAC_BARYCENTRIC0    = 1024UL;
-static const uint64_t FAC_BARYCENTRIC1    = 1536UL;
-static const uint64_t FAC_ELEMID0         = 2048UL;
-static const uint64_t FAC_ELEMID1         = 2304UL;
-static const uint64_t FAC_CONSTR_OFFSET   = 2560UL;
+// PxgFEMFEMAttachmentConstraint (PxgFEMCore.h:204) — the warp-strided block of 32-element
+// arrays.  P9.32 moved the FAC_* layout into `pxgSlangFemFemAttach` when the cloth-cloth
+// solve became its third consumer; `facSlot(base, workIndex, field, elemSize)` is the
+// address formula that used to be spelled out at every access below.
 
 // ---------------------------------------------------------------------------
 // Push-constant blobs.
@@ -269,35 +256,31 @@ void femAttachmentPrepareLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Gr
         if (workIndex >= numFemAttachments)
             break;   // CUDA `return`; nothing follows the loop here either
 
-        const uint blockIdx32 = workIndex / 32u;
-        const uint offset = workIndex & 31u;
-
         const uint attachmentIndex = Ptr<uint>(gAp.activeFemAttachments)[workIndex];
         const uint64_t att = gAp.femAttachments + uint64_t(attachmentIndex) * FA_STRIDE;
-        const uint64_t con = gAp.attachmentConstraints + uint64_t(blockIdx32) * FAC_STRIDE;
 
         const float4 lowHighAngle = Ptr<float4>(att + FA_LOW_HIGH_ANGLE)[0];
         const float4 barycentric = Ptr<float4>(att + FA_BARYCENTRIC)[0];
 
-        Ptr<float4>(con + FAC_BARYCENTRIC0 + uint64_t(offset) * 16UL)[0] =
+        Ptr<float4>(facSlot(gAp.attachmentConstraints, workIndex, FAC_BARYCENTRIC0, 16UL))[0] =
             Ptr<float4>(att + FA_BARY0)[0];
-        Ptr<float4>(con + FAC_BARYCENTRIC1 + uint64_t(offset) * 16UL)[0] =
+        Ptr<float4>(facSlot(gAp.attachmentConstraints, workIndex, FAC_BARYCENTRIC1, 16UL))[0] =
             Ptr<float4>(att + FA_BARY1)[0];
 
         // elemId0 is a PxU64 copied whole; elemId1 is a PxU32 WIDENED into a PxU64 slot, so the
         // upper word must be cleared rather than left as whatever was there.
-        Ptr<uint2>(con + FAC_ELEMID0 + uint64_t(offset) * 8UL)[0] =
+        Ptr<uint2>(facSlot(gAp.attachmentConstraints, workIndex, FAC_ELEMID0, 8UL))[0] =
             Ptr<uint2>(att + FA_INDEX0)[0];
-        Ptr<uint2>(con + FAC_ELEMID1 + uint64_t(offset) * 8UL)[0] =
+        Ptr<uint2>(facSlot(gAp.attachmentConstraints, workIndex, FAC_ELEMID1, 8UL))[0] =
             uint2(Ptr<uint>(att + FA_INDEX1)[0], 0u);
 
-        Ptr<float>(con + FAC_CONSTR_OFFSET + uint64_t(offset) * 4UL)[0] =
+        Ptr<float>(facSlot(gAp.attachmentConstraints, workIndex, FAC_CONSTR_OFFSET, 4UL))[0] =
             Ptr<float>(att + FA_CONSTR_OFFSET)[0];
 
         // make_float4(low.x, low.y, low.z, 0.f) — the .w of the source is DROPPED.
-        Ptr<float4>(con + FAC_LOW_HIGH_ANGLES + uint64_t(offset) * 16UL)[0] =
+        Ptr<float4>(facSlot(gAp.attachmentConstraints, workIndex, FAC_LOW_HIGH_ANGLES, 16UL))[0] =
             float4(lowHighAngle.x, lowHighAngle.y, lowHighAngle.z, 0.0f);
-        Ptr<float4>(con + FAC_ATT_BARYCENTRIC + uint64_t(offset) * 16UL)[0] = barycentric;
+        Ptr<float4>(facSlot(gAp.attachmentConstraints, workIndex, FAC_ATT_BARYCENTRIC, 16UL))[0] = barycentric;
     }
 }
 
@@ -323,18 +306,15 @@ void sb_solveOutputSoftBodyAttachmentDeltaVLaunch(uint3 gtid : SV_GroupThreadID,
         if (workIndex >= numAttachments)
             break;
 
-        const uint blockIdx32 = workIndex / 32u;
-        const uint offset = workIndex & 31u;
-        const uint64_t con = gAs.attachments + uint64_t(blockIdx32) * FAC_STRIDE;
 
         // ---- softbody 1: the anchor interpolated in its simulation tetrahedron -------------
         // The CUDA reads a PxU64 slot into a PxU32, so only the low word is meaningful.
-        const uint elemId1 = Ptr<uint>(con + FAC_ELEMID1 + uint64_t(offset) * 8UL)[0];
+        const uint elemId1 = Ptr<uint>(facSlot(gAs.attachments, workIndex, FAC_ELEMID1, 8UL))[0];
         const uint softBodyId1 = elemId1 >> PXG_SB_ID_SHIFT;
         const uint tetrahedronIdx1 = elemId1 & PXG_SB_ELEM_MASK;
         Ptr<float4> simPos1 = Ptr<float4>(softbodies[softBodyId1].mSimPosition_InvMass);
         const uint4 tetInd1 = Ptr<uint4>(softbodies[softBodyId1].mSimTetIndices)[tetrahedronIdx1];
-        const float4 bary1 = Ptr<float4>(con + FAC_BARYCENTRIC1 + uint64_t(offset) * 16UL)[0];
+        const float4 bary1 = Ptr<float4>(facSlot(gAs.attachments, workIndex, FAC_BARYCENTRIC1, 16UL))[0];
 
         const float4 p10 = simPos1[tetInd1.x];
         const float4 p11 = simPos1[tetInd1.y];
@@ -343,10 +323,10 @@ void sb_solveOutputSoftBodyAttachmentDeltaVLaunch(uint3 gtid : SV_GroupThreadID,
         const float4 pos1 = p10 * bary1.x + p11 * bary1.y + p12 * bary1.z + p13 * bary1.w;
 
         // ---- softbody 0 -------------------------------------------------------------------
-        const uint elemInd0 = Ptr<uint>(con + FAC_ELEMID0 + uint64_t(offset) * 8UL)[0];
+        const uint elemInd0 = Ptr<uint>(facSlot(gAs.attachments, workIndex, FAC_ELEMID0, 8UL))[0];
         const uint softBodyId0 = elemInd0 >> PXG_SB_ID_SHIFT;
         const uint tetrahedronIdx0 = elemInd0 & PXG_SB_ELEM_MASK;
-        const float4 bary0 = Ptr<float4>(con + FAC_BARYCENTRIC0 + uint64_t(offset) * 16UL)[0];
+        const float4 bary0 = Ptr<float4>(facSlot(gAs.attachments, workIndex, FAC_BARYCENTRIC0, 16UL))[0];
         Ptr<float4> simPos0 = Ptr<float4>(softbodies[softBodyId0].mSimPosition_InvMass);
         const uint4 tetInd0 = Ptr<uint4>(softbodies[softBodyId0].mSimTetIndices)[tetrahedronIdx0];
 
@@ -361,15 +341,15 @@ void sb_solveOutputSoftBodyAttachmentDeltaVLaunch(uint3 gtid : SV_GroupThreadID,
 
         const float4 relPos1 = pos1 - pos0;
 
-        const float4 lowHighAngle = Ptr<float4>(con + FAC_LOW_HIGH_ANGLES + uint64_t(offset) * 16UL)[0];
+        const float4 lowHighAngle = Ptr<float4>(facSlot(gAs.attachments, workIndex, FAC_LOW_HIGH_ANGLES, 16UL))[0];
 
         float3 error;
         if (isConeLimitedEnabled(lowHighAngle.z, lowHighAngle.x, lowHighAngle.y))
         {
             const float4 attachmentBary =
-                Ptr<float4>(con + FAC_ATT_BARYCENTRIC + uint64_t(offset) * 16UL)[0];
+                Ptr<float4>(facSlot(gAs.attachments, workIndex, FAC_ATT_BARYCENTRIC, 16UL))[0];
             const float constraintOffset =
-                Ptr<float>(con + FAC_CONSTR_OFFSET + uint64_t(offset) * 4UL)[0];
+                Ptr<float>(facSlot(gAs.attachments, workIndex, FAC_CONSTR_OFFSET, 4UL))[0];
             const float4 projectP = p00 * attachmentBary.x + p01 * attachmentBary.y +
                                     p02 * attachmentBary.z + p03 * attachmentBary.w;
             const float4 axis = projectP - pos0;
