@@ -19,7 +19,14 @@ HOST-side gate: `cloth_SphereVertexContactGenLaunch` is a live device kernel
 whose LAUNCH sits inside `if (0)`, which no reading of the `.cu` can find.  That
 table is checked exhaustively (every `if (0)` in the host corpus, and the set of
 kernels launched inside them must be exactly the table), so a new one fails the
-build and gets read.
+build and gets read.  P9.32 gave it a FOURTH: the ORPHANED kernel —
+`cloth_clothMidphaseGeneratePairsLaunch` is compiled, named in the registry, and
+fetched by nothing, which neither the `.cu` analysis nor the host-gate scanner
+can see because there is no launch site at all.  That table is exhaustive too,
+and it earned its keep on the first run: it found a twelfth orphan
+(`bvh_CalculateKeyDeltas`) whose one launch site sits inside a block comment,
+which a grep for the enum reports as reachable.  12 of the 501 registry entries
+cannot be reached, so 489 is the number a running engine can actually ask for.
 Szenen: **33/33** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
 Inventar (32 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
@@ -1723,6 +1730,146 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.32 — die Tuch-gegen-Tuch-Anheftung, eine ABI mit drei Verbrauchern, und eine vierte Art, auf die ein Kernel tot sein kann
+
+Manifest **374 → 375**. `cloth_solveOutputAttachmentClothClothDeltaVLaunch`
+(FEMClothExternalSolve.cu:1493, Aufruf PxgFEMClothCore.cpp:1915) heftet einen
+Punkt in einem Dreieck des einen Tuchs an einen Punkt in einem Dreieck des
+anderen. Kein Kontakt in der Schleife, nur eine Massenaufteilung.
+
+### Die Bytes wandern ins Modul, die Rümpfe nicht
+
+`PxgFEMFEMAttachmentConstraint` (PxgFEMCore.h:204) hat mit diesem Kernel **drei**
+Verbraucher: ein Prepare und **zwei** Löser. Bis P9.31 stand die Anordnung
+dateilokal in `softBodyFemAttachBda.slang`; der Tuch-Löser wäre die zweite Kopie
+geworden. `pxgSlangFemRigidAttach` sagt in seinem eigenen Kopf, warum das nicht
+geht — „zwei Kopien einer ABI driften still auseinander" —, also bekommt die
+FEM-FEM-Anordnung ihr Modul, und der Softbody-Löser wird mit umgestellt,
+**einschließlich der Adressformel**: `facSlot(base, workIndex, field, elemSize)`
+steht jetzt einmal da statt an jeder der vierzehn Zugriffsstellen ausgeschrieben.
+
+Die beiden Löser-**Rümpfe** bleiben getrennt, und der Modulkopf sagt warum — sie
+sind ausdrücklich **keine** Zwillinge:
+
+* vier Tetraeder-Ecken gegen drei Dreiecks-Ecken;
+* der Softbody-Löser trägt den Kegelgrenzen-Zweig und liest dafür
+  `low_high_angles`, `attachmentBarycentric` und `constraintOffset`. Der
+  Tuch-Löser liest **keines** der drei;
+* geteilt wird durch die baryzentrisch gewichtete Massensumme dort, durch
+  `invMass0 + invMass1` mit festem Faktor 0,5 hier;
+* die Streuung überspringt dort Ecken ohne Gewicht, hier **nicht**.
+
+Zusammenzulegen hieße, jede dieser vier Differenzen als Verzweigung wieder
+einzuführen — eine Struktur, die upstream nicht hat.
+
+### Zehn Fallen, und die drei, die ein abgeleiteter Port still falsch macht
+
+* **Der Constraint ist warp-blockiert.** `attachments[workIndex/32]` wählt den
+  2688-Byte-Block, `workIndex & 31` den Schlitz. Ein flacher Index ist für die
+  **ersten 32** Anheftungen exakt richtig und danach falsch — eine Vorrichtung
+  mit 32 Anheftungen kann die beiden nicht unterscheiden. Deshalb sind es 70.
+* **`elemId0`/`elemId1` sind `PxU64`-Schlitze, die als `PxU32` gelesen werden.**
+  Acht Byte Schrittweite, nur das untere Wort. Die Vorrichtung legt ein
+  Nicht-Null-Muster ins obere Wort, damit ein `uint2`-Lesen keine plausible Zahl
+  liefert.
+* **`pos.w` ist die INTERPOLIERTE inverse Masse**, die Streuung dreizehn Zeilen
+  weiter benutzt die **je Vertex**. Zwei verschiedene Massen im selben Kernel.
+* Dazu die Kleinigkeit, dass die eine Seite mit den Zugriffsfunktionen dekodiert
+  und die andere `>> 20` / `& 0x000fffff` ausschreibt. Nachgeprüft: beide
+  Konstanten stimmen heute überein — derselbe still brechende Lesbarkeitsdefekt
+  wie Kandidat 40.
+
+### Eine vierte Art von Totsein — und beim ersten Lauf gleich eine fünfte Gestalt
+
+`check_disabled_kernels.py` kannte drei Arten, auf die ein Engine-Kernel tot sein
+kann. P9.32 fügt die vierte hinzu: den **verwaisten** Kernel.
+
+`cloth_clothMidphaseGeneratePairsLaunch` ist eine vollständige, lebendige
+Gerätefunktion mit einem lebendigen Registrierungseintrag — und **niemand holt
+sie ab**. `PxgKernelIds::CLOTH_CLOTH_MIDPHASE` kommt im ganzen Motor genau
+einmal vor: in ihrem eigenen `KERNEL_DEF`. Der Eimer, der sie fahren würde
+(`PxgGpuNarrowphaseCore::testSDKFemClothCloth`), **wird** aufgerufen, aber sein
+Rumpf ist ein leerer Stumpf mit einem Kommentar darin.
+
+Keine der drei bestehenden Prüfungen sieht das. Die `.cu` liest LEBENDIG, weil
+sie es ist. Der Host-Scanner findet nichts, weil es kein `if (0)` gibt — es gibt
+**gar keine Aufrufstelle**.
+
+Die neue Tabelle ist **erschöpfend** wie HOST_GATED: die Menge der Verwaisten
+wird bei jedem Lauf neu hergeleitet und muss der Tabelle **gleichen**. Und genau
+das hat sich beim ersten Lauf ausgezahlt — er meldete einen **zwölften**, den
+meine eigene Vorabmessung übersehen hatte:
+
+> `bvh_CalculateKeyDeltas` hat eine Aufrufstelle, aber sie steht in einem
+> `/* … */`-Blockkommentar (PxgSDFBuilder.cpp:306), mit dem lebendigen Aufruf
+> ihres Geschwisters in der Zeile darunter. Mein `grep` fand diese Zeile und
+> hielt den Kernel für erreichbar; erst das Strippen der Kommentare sagt die
+> Wahrheit. **Kandidat 41.**
+
+Deshalb prüft die dritte Richtung des Selbsttests genau das: ein
+auskommentiertes Abholen darf **nichts** aufheben. Und weil dieser eine über
+`launchKernelPtr` statt `getCuFunction` läuft, zählt der Scan jede Erwähnung des
+Enums — es gibt mehr als einen Weg, nach einem Kernel zu fragen. Der
+Host-Scanner nebenan wurde aus demselben Grund verbreitert, obwohl das heute
+nichts ändert.
+
+Alle zwölf sind im Manifest **unabgebildet**, und das ist die Behauptung, die
+gehalten wird: sie brauchen keinen Port, weil kein Abholen nach einem fragen
+kann. Nebenbei fällt eine Zahl ab, die die Abdeckungsquote nicht trennt: **12 der
+501** Registrierungseinträge sind unerreichbar, **489** ist also die Zahl der
+Kernel, die ein laufender Motor überhaupt verlangen kann.
+
+### Zwei Überlebende, eine Lücke und ein falscher Mutant
+
+Der erste Durchgang ließ drei Überlebende. **Keiner war ein Portierungsfehler** —
+aber das stand erst nach der Diagnose fest:
+
+| Überlebender | Befund |
+|---|---|
+| `a1-grid-stride` | **Begründetes Äquivalent, vorhergesagt.** Dieselbe Sache wie in P9.31: beide Formeln decken `[0, N)` einmal ab und liefern dieselbe Bahn. |
+| `a6-guard-or` | **Lücke.** Das Tor überspringt, wenn **beide** inversen Massen null sind; mit `\|\|` schon, wenn **eine** es ist. Meine Vorrichtung hatte nur eine **beidseitig** festgenagelte Anheftung, also stimmten die beiden Fassungen überall überein. Jetzt gibt es zwei **halb** festgenagelte (44 und 45), und der Mutant fällt. |
+| `a7-skip-zero-weight` | **Ein Fehler in meinem Mutanten, gleich doppelt.** Er klammerte nur den xyz-Zusatz — und der ist bei Gewicht null ohnehin eine Null-Addition, also beobachtungsneutral. Und die einzigen Null-Gewichte der Vorrichtung lagen in Ecke y und z, während der Mutant Ecke x traf. Beobachtbar an Falle A7 ist der **Schreiberzähler**; der Mutant klammert jetzt die ganze Ecke, dreigeteilt, und die Vorrichtung trägt in **jeder** der drei Ecken eine Null, aus **beiden** Gründen: sechs Anheftungen mit einer inversen Masse von null (zwei je Ecke, über zwei Warp-Blöcke verteilt) und drei mit einer Baryzentrik von null — neun geprüfte Ecken, und die Vorrichtung besteht darauf, dass es neun sind. |
+
+Neun der Tötungen sind **Abstürze** (4 von 4 Versuchen). Bei rund 23 %
+Plattform-Flackerrate ist viermal hintereinander 0,3 % — das sind echte
+Zugriffsfehler der Mutanten, keine Verwechslung mit dem llvmpipe-Defekt.
+
+### Der Abdeckungslauf, weil zwei Eigenschaften erst im Großen sichtbar werden
+
+Unterhalb von `gridDim · blockDim = 1024 · 256 = 262144` ist
+`nbIterationsPerBlock` immer 1 und die Arbeitsindex-Formel fällt zu einem flachen
+Index zusammen. Zwei Dinge sind dann **unbeobachtbar**: den Faktor
+`nbIterationsPerBlock *` wegzulassen, und das Null-Massen-Tor als `return` statt
+`continue` zu schreiben.
+
+Also fährt die zweite Vorrichtung **262400** Anheftungen — 1025 nötige Blöcke
+über ein 1024er Gitter, also genau zwei Durchläufe je Faden, und die Vorrichtung
+**rechnet das nach**, statt es anzunehmen. Beide Seiten jeder Anheftung nehmen
+dasselbe Dreieck mit derselben Baryzentrik, das Positionsdelta ist damit exakt
+null, und das einzige Beobachtbare ist der **Schreiberzähler** — genau das, wonach
+eine Abdeckungsfrage fragt. Die ersten 256 Anheftungen sind festgenagelt; das ist
+der **erste** Durchlauf von Block 0, dessen **zweiter** die Anheftungen 256…511
+sind. Ein `return` verlöre sie.
+
+### Verifikation
+
+* Fegen **31 von 32** — zwangsfrisch, 0 Anker-Fehler, 0 Hänger, alle 32 Anker
+  vorab auf Eindeutigkeit geprüft; der eine Überlebende ist das begründete
+  Äquivalent;
+* die genaue Vorrichtung **bitgleich** gegen einen Host-Spiegel über 70
+  Anheftungen in drei Warp-Blöcken: 408 Vertices mit genau einem Schreiber
+  bitweise, die umkämpften in Tuch C über ihre ordnungsinvarianten Summen;
+* der Abdeckungslauf über 262400 Anheftungen: 786432 Ecken genau zweimal
+  geschrieben, keine ungeschrieben, keine bewegt;
+* `gpuslang.disabledKernels` grün mit **vier** Arten von Behauptung und drei
+  Selbsttests, jeder in drei Richtungen auf der echten Quelle;
+* Suite **821/821** in beiden Speichermodi — Modus 1 im **zweiten** Anlauf, der
+  erste traf den llvmpipe-Plattformfehler aus P9.28a, und das steht hier mit der
+  Versuchszahl statt ohne;
+* Szenen **33 ok, 0 fail, 0 missing (von 33)** nach dem Neubau von `build-sdk`
+  wegen der Manifeständerung.
+
 
 ## P9.31 — die Löser-Hälfte der Tuch-gegen-Partikel-Kette, zwei falsche Lesarten von mir, und ein Prüfstand für eine Formel, die man nur im Großen sieht
 

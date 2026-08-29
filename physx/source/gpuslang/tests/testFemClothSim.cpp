@@ -12518,10 +12518,32 @@ PXG_TEST(femClothSimClothClothAttachment)
     const uint32_t NB_BLOCKS = (NB_ATT + 31u) / 32u;
 
     // Attachment 9 has BOTH sides fully pinned -> the invMass guard fires (trap A6).
+    // Attachments 44 and 45 have exactly ONE side pinned, which is what separates the
+    // guard's `&&` from an `||`: with `&&` they are solved against the free side's mass,
+    // with `||` they would be dropped.  The first sweep had neither, and the `||` mutant
+    // survived — a survivor that says nothing about the code and everything about which
+    // states the rig reached.
     // Attachments 33 and 58 are SELF-attachments inside cloth C and share vertices, so
     // their scatters contend (trap A10).
-    const uint32_t PINNED_ATT = 9u;
+    const uint32_t PINNED_ATT = 9u, PINNED_A_ONLY = 44u, PINNED_B_ONLY = 45u;
     auto isSelf = [&](uint32_t a) { return a == 33u || a == 58u; };
+
+    // Trap A7 needs a corner whose weight is zero in EVERY slot, for BOTH reasons — the
+    // first sweep put its zeros in corners y and z only, so a mutant that guards corner x
+    // was a no-op against this rig and survived.  Six explicit attachments now, spread over
+    // two warp blocks so a slot cannot be reached by accident.
+    auto zeroMassCorner = [](uint32_t a) -> int {   // -1 = none
+        if (a == 5u || a == 40u) return 0;
+        if (a == 3u || a == 41u) return 1;
+        if (a == 7u || a == 42u) return 2;
+        return -1;
+    };
+    auto zeroBaryCorner = [](uint32_t a) -> int {
+        if (a == 20u) return 0;
+        if (a == 21u) return 1;
+        if (a == 12u) return 2;
+        return -1;
+    };
 
     // ---- the three clothes ----------------------------------------------------------
     // Every attachment owns its own triangle on each side, except the self ones, which
@@ -12539,17 +12561,17 @@ PXG_TEST(femClothSimClothClothAttachment)
     };
     for (uint32_t a = 0; a < NB_ATT; ++a)
     {
-        const bool pinned = (a == PINNED_ATT);
-        // Corner 1 of every eighth triangle is PINNED while its barycentric stays
-        // non-zero, and corner 2 always carries a non-zero inverse mass while attachment
-        // 12's barycentric zeroes it.  Trap A7 needs both: an unguarded scatter must still
-        // bump the .w counter of a corner that contributes nothing.
-        const float mA[3] = { pinned ? 0.0f : 0.40f + 0.011f * float(a),
-                              pinned || (a % 8u == 3u) ? 0.0f : 0.62f + 0.007f * float(a),
-                              pinned ? 0.0f : 0.85f - 0.006f * float(a % 30u) };
-        const float mB[3] = { pinned ? 0.0f : 0.55f - 0.004f * float(a % 25u),
-                              pinned ? 0.0f : 0.31f + 0.009f * float(a),
-                              pinned ? 0.0f : 0.73f + 0.005f * float(a % 17u) };
+        const bool pinA = (a == PINNED_ATT || a == PINNED_A_ONLY);
+        const bool pinB = (a == PINNED_ATT || a == PINNED_B_ONLY);
+        float mA[3] = { 0.40f + 0.011f * float(a),
+                        0.62f + 0.007f * float(a),
+                        0.85f - 0.006f * float(a % 30u) };
+        float mB[3] = { 0.55f - 0.004f * float(a % 25u),
+                        0.31f + 0.009f * float(a),
+                        0.73f + 0.005f * float(a % 17u) };
+        const int zm = zeroMassCorner(a);
+        if (zm >= 0) mA[zm] = 0.0f;
+        for (int c = 0; c < 3; ++c) { if (pinA) mA[c] = 0.0f; if (pinB) mB[c] = 0.0f; }
         if (isSelf(a))
         {
             // Both sides land in cloth C on triangles that SHARE vertices.
@@ -12610,7 +12632,13 @@ PXG_TEST(femClothSimClothClothAttachment)
         // zeroes corner 2 on side 0: trap A7's second half.
         F4 b0{ 0.5f - 0.004f * float(a % 20u), 0.2f + 0.003f * float(a % 13u), 0.0f, 0.0f };
         b0.z = 1.0f - b0.x - b0.y;
-        if (a == 12u) { b0 = F4{ 0.45f, 0.55f, 0.0f, 0.0f }; }
+        switch (zeroBaryCorner(a))
+        {
+        case 0:  b0 = F4{ 0.0f, 0.45f, 0.55f, 0.0f }; break;
+        case 1:  b0 = F4{ 0.45f, 0.0f, 0.55f, 0.0f }; break;
+        case 2:  b0 = F4{ 0.45f, 0.55f, 0.0f, 0.0f }; break;
+        default: break;
+        }
         F4 b1{ 0.15f + 0.005f * float(a % 11u), 0.55f - 0.006f * float(a % 9u), 0.0f, 0.0f };
         b1.z = 1.0f - b1.x - b1.y;
 
@@ -12760,16 +12788,41 @@ PXG_TEST(femClothSimClothClothAttachment)
     const TriIdx4& tp = tA[s0[PINNED_ATT].elem];
     PXG_CHECK_MSG(gA[tp.x].w == 0.0f && gA[tp.y].w == 0.0f && gA[tp.z].w == 0.0f,
                   "the fully pinned attachment must leave its triangle untouched");
-    // Trap A7 in the affirmative: corner 2 of attachment 12 has barycentric ZERO and corner
-    // 1 of attachment 3 has inverse mass ZERO, and BOTH must still have been counted once.
-    const TriIdx4& t12 = tA[s0[12u].elem];
-    PXG_CHECK_MSG(gA[t12.z].w == 1.0f && gA[t12.z].x == 0.0f,
-                  "a zero-barycentric corner still takes a writer count and a zero delta "
-                  "(got count %g, x %g)", gA[t12.z].w, gA[t12.z].x);
-    const TriIdx4& t3 = tA[s0[3u].elem];
-    PXG_CHECK_MSG(gA[t3.y].w == 1.0f && gA[t3.y].x == 0.0f,
-                  "a zero-inverse-mass corner still takes a writer count and a zero delta "
-                  "(got count %g, x %g)", gA[t3.y].w, gA[t3.y].x);
+    // Trap A6's `&&`: a HALF-pinned attachment is solved, not skipped.  Both of its
+    // triangles take writer counts, and the free side actually moves.
+    for (uint32_t a : { PINNED_A_ONLY, PINNED_B_ONLY })
+    {
+        const TriIdx4& ha = tA[s0[a].elem];
+        const TriIdx4& hb = tB[s1[a].elem];
+        PXG_CHECK_MSG(gA[ha.x].w == 1.0f && gB[hb.x].w == 1.0f,
+                      "attachment %u has exactly one pinned side and must still be solved "
+                      "(counts %g and %g)", a, gA[ha.x].w, gB[hb.x].w);
+    }
+    // Trap A7 in the affirmative: a corner whose weight is zero — for EITHER reason, in
+    // EACH of the three slots — still takes a writer count and a zero delta.
+    uint32_t zeroWeightChecked = 0u;
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        if (isSelf(a) || a == PINNED_ATT || a == PINNED_A_ONLY) continue;
+        const int slots[2] = { zeroMassCorner(a), zeroBaryCorner(a) };
+        for (int which = 0; which < 2; ++which)
+        {
+            const int c = slots[which];
+            if (c < 0) continue;
+            const TriIdx4& t = tA[s0[a].elem];
+            const uint32_t v = (c == 0) ? t.x : (c == 1 ? t.y : t.z);
+            PXG_CHECK_MSG(gA[v].w == 1.0f && gA[v].x == 0.0f && gA[v].y == 0.0f &&
+                          gA[v].z == 0.0f,
+                          "attachment %u corner %d carries zero weight (%s) and must still "
+                          "take a writer count and a zero delta (got count %g, xyz %g %g %g)",
+                          a, c, which == 0 ? "inverse mass" : "barycentric",
+                          gA[v].w, gA[v].x, gA[v].y, gA[v].z);
+            ++zeroWeightChecked;
+        }
+    }
+    PXG_CHECK_MSG(zeroWeightChecked == 9u,
+                  "the rig must place a zero weight in each of the three corner slots for "
+                  "both reasons; %u were found", zeroWeightChecked);
     // Trap A8: the two sides moved in OPPOSITE directions.  Attachment 0's side-0 anchor is
     // below its side-1 anchor in y, so cloth A's corner moves +y and cloth B's -y.
     const TriIdx4& t0a = tA[s0[0u].elem];
@@ -12779,8 +12832,9 @@ PXG_TEST(femClothSimClothClothAttachment)
                   gA[t0a.x].y, gB[t0b.x].y);
 
     std::printf("    [ note ] %u attachments over %u warp blocks, %u skipped for zero inverse "
-                "mass, %u self-attachments contending in cloth C; %zu single-writer vertices "
-                "bit-exact\n", NB_ATT, NB_BLOCKS, skippedByMass, contendedWrites,
+                "mass, 2 half-pinned, %u zero-weight corners checked, %u self-attachments "
+                "contending in cloth C; %zu single-writer vertices bit-exact\n",
+                NB_ATT, NB_BLOCKS, skippedByMass, zeroWeightChecked, contendedWrites,
                 vA.size() + vB.size());
 
     for (PxgBufferHandle h : { bVA.h, bVB.h, bVC.h, bTA.h, bTB.h, bTC.h, bDA.h, bDB.h, bDC.h,

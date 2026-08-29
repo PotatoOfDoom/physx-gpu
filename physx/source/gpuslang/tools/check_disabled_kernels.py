@@ -69,6 +69,16 @@
 # the live one and it must read as DISABLED.  A comment-stripper that got either
 # direction wrong would otherwise pass quietly.
 #
+# FOUR KINDS OF DEADNESS
+#
+# By P9.32 this file knows four ways an engine kernel can be dead, and they are
+# genuinely independent -- each is invisible to the checks for the other three:
+#   1. a commented-out DEVICE-SIDE flag assignment  (GATED, below);
+#   2. a HOST-SIDE `if (0)` around the launch       (HOST_GATED);
+#   3. an `if(0)` block inside a device helper      (covered by 1's analysis);
+#   4. an ORPHANED kernel -- compiled, named in the registry, fetched by nothing
+#      (ORPHANED).
+#
 # NOTES ARE NOT GATES
 #
 # A kernel disabled the same way that this port does NOT cover belongs in NOTED
@@ -164,6 +174,89 @@ HOST_GATED = [
 # function, three lines up.  If the scanner ever reports THIS one as gated it is
 # matching text rather than structure, and its findings mean nothing.
 HOST_LIVE_CONTROLS = ['CLOTH_SPHERE_CG']
+
+# ---------------------------------------------------------------------------
+# A FOURTH KIND OF DISABLEMENT, found in P9.32: the ORPHANED KERNEL.
+#
+# Two shapes reach it.  The first:
+#
+# cloth_clothMidphaseGeneratePairsLaunch (femClothClothMidPhase.cu:624) is a
+# complete, live device function with a live registry entry --
+#
+#     KERNEL_DEF(CLOTH_CLOTH_MIDPHASE, "cloth_clothMidphaseGeneratePairsLaunch")
+#
+# -- and NOTHING FETCHES IT.  `PxgKernelIds::CLOTH_CLOTH_MIDPHASE` occurs exactly
+# once in the whole engine: in that KERNEL_DEF.  The bucket that would have run
+# it, PxgGpuNarrowphaseCore::testSDKFemClothCloth (PxgNarrowphaseCore.cpp:6466),
+# IS called -- from PxgNphaseImplementationContext.cpp:310 -- but its body is an
+# empty stub whose only content is the comment "FEMCloth-FEMCloth collision
+# handled in PxgFEMClothCore.cpp".
+#
+# Neither of the three checks above can see this.  The .cu reads LIVE, because
+# it is.  The host-gate scanner reads nothing, because there is no `if (0)` --
+# there is no launch site AT ALL.  The kernel is compiled into the fatbinary,
+# named in the registry, and unreachable.
+#
+# The second shape is bvh_CalculateKeyDeltas, and this scan found it on its first
+# run: its one launch site EXISTS but sits inside a `/* ... */` block comment
+# (PxgSDFBuilder.cpp:306), with the live launch of its sibling on the next line.
+# A grep for the enum reports that line and concludes the kernel is reachable.
+# That is why every reference is comment-stripped before it counts, and why the
+# selftest's third direction checks precisely this: a commented-out fetch must
+# clear nothing.  Note also that this one is launched through `launchKernelPtr`,
+# not `getCuFunction` -- the scan counts any mention of the enum for exactly that
+# reason, because there is more than one way to ask for a kernel.
+#
+# WHAT THE PORT DEPENDS ON.  All eleven orphans are UNMAPPED in
+# PxgSlangKernelManifest.h, and that is the claim being kept true: they need no
+# Slang port because no `getCuFunction` can ask for one.  The day any of them
+# gains a fetch, it becomes a kernel the engine will call and this port will not
+# answer -- so it must be read and ported, and this checker is the thing that
+# says so.  It also puts a number on something p4Manifest's coverage figure does
+# not distinguish: 12 of the 501 registry entries cannot be reached at all, so
+# 489 is the count of kernels a running engine can actually ask for.  That is
+# recorded HERE rather than folded into the percentage, because the list lives in
+# this file and a second copy in C++ would be exactly the drift this port keeps
+# refusing to introduce.
+#
+# EXHAUSTIVE, like HOST_GATED and for the same reason: the set of orphans is
+# re-derived on every run and must EQUAL this table.  A newly orphaned kernel
+# fails the build and gets read; a newly reachable one fails the build and gets
+# ported.
+#
+# The scan deliberately EXCLUDES this port's own tree.  If gpuslang could count
+# as a reference, the port would be able to un-orphan an upstream kernel by
+# mentioning its enum -- which would turn a fact about NVIDIA's code into a fact
+# about ours.
+KERNEL_NAMES_H = 'physx/source/gpucommon/include/PxgKernelNames.h'
+KERNEL_REF_ROOT = 'physx/source'
+KERNEL_REF_EXCLUDE = 'physx/source/gpuslang'
+
+ORPHANED = [
+    ('PS_UPDATE_SPRING', 'ps_updateSprings'),
+    ('SB_INIT_PLASTIC_DEFORM', 'sb_initPlasticDeformLaunch'),
+    ('CLOTH_CLOTH_MIDPHASE', 'cloth_clothMidphaseGeneratePairsLaunch'),
+    # Orphaned by a COMMENTED-OUT launch, which is a fifth shape and the one this scan
+    # found on its first run.  PxgSDFBuilder.cpp:306 wraps the only
+    # `launchKernelPtr(PxgKernelIds::bvh_CalculateKeyDeltas, ...)` in a block comment, with
+    # the live launch of its sibling bvh_CalculateKeyDeltasSquaredDistance immediately
+    # below it.  A grep for the enum finds that line and calls the kernel reachable; only
+    # stripping comments first tells the truth.  Upstream candidate 41.
+    ('bvh_CalculateKeyDeltas', 'bvhCalculateKeyDeltas'),
+    ('iso_CountCellVertsDC', 'iso_CountCellVertsDC'),
+    ('iso_CountCellVertsDCSparse', 'iso_CountCellVertsDCSparse'),
+    ('iso_CreateVertsDC', 'iso_CreateVertsDC'),
+    ('iso_CreateVertsDCSparse', 'iso_CreateVertsDCSparse'),
+    ('iso_CountTriIdsDC', 'iso_CountTriIdsDC'),
+    ('iso_CountTriIdsDCSparse', 'iso_CountTriIdsDCSparse'),
+    ('iso_CreateTriIdsDC', 'iso_CreateTriIdsDC'),
+    ('iso_CreateTriIdsDCSparse', 'iso_CreateTriIdsDCSparse'),
+]
+
+# The live control for the orphan scan: an enum fetched from an ordinary launch
+# site.  If the scanner ever calls THIS one orphaned it is not finding
+# references, and every name in ORPHANED above is meaningless.
+ORPHAN_LIVE_CONTROLS = ['CLOTH_SOLVE_ATTACHMENT_CLOTH_CLOTH_DELTA', 'CLOTH_SPHERE_CG']
 
 # Kernels that ARE live, analysed by the same code so that a green run proves
 # this checker can still tell the two states apart.
@@ -363,7 +456,11 @@ def host_gated_launches(cpp_src):
                     break
             k += 1
         body = live[j:k]
-        for f in re.finditer(r'getCuFunction\s*\(\s*PxgKernelIds::(\w+)\s*\)', body):
+        # Both fetch mechanisms.  PxgNarrowphaseCore.cpp uses only getCuFunction today,
+        # but PxgSDFBuilder.cpp launches through launchKernelPtr -- matching one and not
+        # the other is a blind spot waiting for the first `if (0)` in the other style.
+        for f in re.finditer(
+                r'(?:getCuFunction|launchKernelPtr)\s*\(\s*PxgKernelIds::(\w+)\b', body):
             gated.add(f.group(1))
     return gated, blocks
 
@@ -413,6 +510,179 @@ def check_host_gates(verbose):
             print('  OK       %d `if (0)` host block(s), %d launching: exactly the '
                   'expected set' % (blocks, len(gated)))
     return ok
+
+
+def registry_kernels(names_src):
+    """Every (enum, kernel name) pair the registry declares."""
+    return re.findall(r'KERNEL_DEF\(\s*(\w+)\s*,\s*"([^"]+)"', strip_comments(names_src))
+
+
+def referenced_enums(extra_sources=()):
+    """Every PxgKernelIds:: enum mentioned by engine code outside this port.
+
+    Comments are stripped first: a commented-out launch is not a launch, and a
+    checker that counted one would hide the very state it exists to find.
+    `extra_sources` lets the selftest substitute a mutated copy of one file
+    without touching the disk.
+    """
+    root = os.path.join(ROOT, KERNEL_REF_ROOT)
+    exclude = os.path.join(ROOT, KERNEL_REF_EXCLUDE)
+    names_h = os.path.join(ROOT, KERNEL_NAMES_H)
+    overrides = dict(extra_sources)
+    refs, scanned = set(), 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        if dirpath == exclude or dirpath.startswith(exclude + os.sep):
+            dirnames[:] = []
+            continue
+        for fn in filenames:
+            if not fn.endswith(('.cpp', '.h', '.cu', '.cuh')):
+                continue
+            path = os.path.join(dirpath, fn)
+            if path == names_h:
+                continue             # the declarations are not references
+            if path in overrides:
+                text = overrides.pop(path)
+            else:
+                try:
+                    text = open(path, errors='ignore').read()
+                except OSError:
+                    continue
+            scanned += 1
+            if 'PxgKernelIds' not in text:
+                continue             # cheap gate; strip_comments is the slow part
+            refs.update(re.findall(r'PxgKernelIds::(\w+)', strip_comments(text)))
+    return refs, scanned
+
+
+def check_orphans(verbose):
+    """The unreachable kernels, checked as a SET rather than one by one."""
+    names_path = os.path.join(ROOT, KERNEL_NAMES_H)
+    if not os.path.exists(names_path):
+        print('  MISSING  %s -- the orphan scan cannot run.' % KERNEL_NAMES_H)
+        return False
+    declared = registry_kernels(open(names_path).read())
+    if not declared:
+        print('  MISSING  %s declares no KERNEL_DEF entries; the orphan scan is '
+              'reading the wrong file.' % KERNEL_NAMES_H)
+        return False
+    refs, scanned = referenced_enums()
+    found = {e for e, _k in declared if e not in refs}
+    expected = {e for e, _k in ORPHANED}
+    by_enum = dict(declared)
+
+    ok = True
+    for enum, kernel in ORPHANED:
+        if enum not in by_enum:
+            ok = False
+            print('  GONE     %s (%s) is no longer declared in the registry, so '
+                  'the ORPHANED table is stale.' % (enum, kernel))
+        elif by_enum[enum] != kernel:
+            ok = False
+            print('  RENAMED  %s now names "%s", not "%s".'
+                  % (enum, by_enum[enum], kernel))
+        elif enum not in found:
+            ok = False
+            print('  REACHABLE %s (%s) is now fetched somewhere in the engine.  It '
+                  'is UNMAPPED in PxgSlangKernelManifest.h, which was only safe '
+                  'while nothing could ask for it -- read it and port it.'
+                  % (enum, kernel))
+    for extra in sorted(found - expected):
+        ok = False
+        print('  NEW-ORPHAN %s (%s) is declared in the registry and fetched '
+              'nowhere.  Read it: a kernel the engine cannot reach is a kernel '
+              'no scene can validate, and its slot still counts against the '
+              'manifest.' % (extra, by_enum.get(extra, '?')))
+
+    for ctrl in ORPHAN_LIVE_CONTROLS:
+        if ctrl not in by_enum:
+            ok = False
+            print('  CONTROL  %s is not in the registry any more, so it cannot '
+                  'serve as the reachable control.' % ctrl)
+        elif ctrl in found:
+            ok = False
+            print('  CONTROL  %s reads as orphaned, and it is fetched from an '
+                  'ordinary launch site.  This scanner is not finding '
+                  'references, so every name it did report means nothing.' % ctrl)
+
+    if ok:
+        if verbose:
+            print('  OK       orphans: %d of %d registry kernels are fetched '
+                  'nowhere (%d files scanned): %s'
+                  % (len(found), len(declared), scanned,
+                     ', '.join(sorted(found))))
+        else:
+            print('  OK       %d of %d registry kernels fetched nowhere: exactly '
+                  'the expected set' % (len(found), len(declared)))
+    return ok
+
+
+def orphan_selftest():
+    """Calibrate the orphan scan on the REAL source, in three directions.
+
+    Same doctrine as the two selftests around it -- a check that REASONS about a
+    mutant can be wrong, one that RUNS it cannot.  Every mutation is applied to a
+    source STRING; the files on disk are never touched.
+
+      1. delete the live control's only fetch -> it must start being reported;
+      2. add a fetch for an orphan             -> it must stop being reported;
+      3. put that fetch inside a COMMENT       -> it must stay reported, which is
+                                                  what separates reading the code
+                                                  that runs from grepping.
+    """
+    names_path = os.path.join(ROOT, KERNEL_NAMES_H)
+    if not os.path.exists(names_path):
+        return 0                       # check_orphans already said so
+    control = ORPHAN_LIVE_CONTROLS[0]
+    orphan = ORPHANED[2][0]            # CLOTH_CLOTH_MIDPHASE
+
+    # find the one file that fetches the control
+    root = os.path.join(ROOT, KERNEL_REF_ROOT)
+    exclude = os.path.join(ROOT, KERNEL_REF_EXCLUDE)
+    host = None
+    for dirpath, dirnames, filenames in os.walk(root):
+        if dirpath == exclude or dirpath.startswith(exclude + os.sep):
+            dirnames[:] = []
+            continue
+        for fn in filenames:
+            if not fn.endswith('.cpp'):
+                continue
+            path = os.path.join(dirpath, fn)
+            text = open(path, errors='ignore').read()
+            if 'PxgKernelIds::' + control in text:
+                host = (path, text)
+                break
+        if host:
+            break
+    if not host:
+        print('orphan selftest: cannot calibrate -- no .cpp fetches %s.' % control)
+        return 2
+    path, text = host
+
+    stripped = text.replace('PxgKernelIds::' + control, 'PxgKernelIds::PXG_NOT_A_KERNEL')
+    if control in referenced_enums({path: stripped})[0]:
+        print('ORPHAN SELFTEST FAILED: removing the only fetch of %s did not make '
+              'it read as unreferenced -- this scan cannot see a kernel losing '
+              'its last launch site, which is half of what it exists for.' % control)
+        return 2
+
+    revived = text + '\n// selftest\nstatic void pxgOrphanSelftest() { getCuFunction(PxgKernelIds::%s); }\n' % orphan
+    if orphan not in referenced_enums({path: revived})[0]:
+        print('ORPHAN SELFTEST FAILED: adding a fetch for %s did not clear it -- '
+              'the scan cannot see a kernel becoming reachable, which is the '
+              'other half.' % orphan)
+        return 2
+
+    hidden = text + '\n// getCuFunction(PxgKernelIds::%s);\n' % orphan
+    if orphan in referenced_enums({path: hidden})[0]:
+        print('ORPHAN SELFTEST FAILED: a COMMENTED-OUT fetch of %s counted as a '
+              'reference -- the scan is grepping text rather than reading the '
+              'code that runs.' % orphan)
+        return 2
+
+    print('orphan selftest: removing the control\'s only fetch reports it, adding '
+          'a fetch clears an orphan, and a commented-out fetch clears nothing.  '
+          'All three directions work.')
+    return 0
 
 
 def host_selftest():
@@ -582,8 +852,9 @@ def main():
     src = open(path).read()
 
     print('disabled-kernel check over %d gated claim(s), %d note(s), '
-          '%d live control(s), %d host gate(s)'
-          % (len(GATED), len(NOTED), len(LIVE_CONTROLS), len(HOST_GATED)))
+          '%d live control(s), %d host gate(s), %d orphan(s)'
+          % (len(GATED), len(NOTED), len(LIVE_CONTROLS), len(HOST_GATED),
+             len(ORPHANED)))
     failures = 0
 
     for entry in GATED:
@@ -612,9 +883,14 @@ def main():
     if not check_host_gates(verbose):
         failures += 1
 
+    if not check_orphans(verbose):
+        failures += 1
+
     if selftest():
         failures += 1
     if host_selftest():
+        failures += 1
+    if orphan_selftest():
         failures += 1
 
     if failures:
