@@ -64,6 +64,19 @@ struct SdfFindParams
     float3 scale;            //  96
     uint numVertices;        // 108
     uint maxRounds;          // 112
+    // P9.34b: the TRIANGLE gather needs the index buffer and the mesh's own scale,
+    // which the vertex form has no use for.
+    // The padding is written out rather than inferred: Slang aligns a uint64_t to 8
+    // and a float4 to 16, C++ aligns neither the same way, and the first draft of
+    // this block had the two disagree by eight bytes.
+    uint _pad116;            // 116
+    uint _pad120;            // 120
+    uint _pad124;            // 124
+    uint64_t meshInd;        // 128  uint4 per triangle
+    uint64_t _pad136;        // 136
+    float4 scale0Rot;        // 144
+    float3 scale0;           // 160
+    uint _pad172;            // 172 -> 176
     uint pad0;               // 116
     uint pad1;               // 120
     uint pad2;               // 124
@@ -120,6 +133,65 @@ void sdfFindRounds(uint3 gtid : SV_GroupThreadID)
         // Before the next round overwrites gSdfIndices.
         GroupMemoryBarrierWithGroupSync();
         ++round;
+    }
+
+    if (tid == 0u)
+        Ptr<uint>(gP.numRoundsOut)[0] = round;
+}
+
+
+// ---------------------------------------------------------------------------
+// The TRIANGLE gather, driven exactly like the vertex one above so the two can be
+// compared round for round.  `bufOut` here holds uint2 pairs, so its per-round
+// stride is 2 * SDFF_TARGET_COUNT words.
+// ---------------------------------------------------------------------------
+[shader("compute")]
+[numthreads(1024, 1, 1)]
+void sdfFindTriangleRounds(uint3 gtid : SV_GroupThreadID)
+{
+    const uint tid = gtid.x;
+
+    PxgSdfMesh m;
+    const bool hasSdf = sdfReadMesh(gP.meshPtr, m);
+    const SparseSdfTexture t = sdfTexInitialize(m);
+
+    if (!hasSdf)
+    {
+        if (tid == 0u)
+            Ptr<uint>(gP.numRoundsOut)[0] = 0xFFFFFFFFu;
+        return;
+    }
+
+    uint startIndex = 0u;
+    uint round = 0u;
+
+    while (startIndex < gP.numVertices && round < gP.maxRounds)
+    {
+        const uint before = startIndex;
+        const uint count = sdfFindInterestingTrianglesEx(tid, gP.numVertices, gP.meshInd,
+                                                         gP.positions, gP.scale0, gP.scale0Rot,
+                                                         gP.scale, gP.scaleRot, gP.tolerance,
+                                                         t, gP.aToBp, gP.aToBq,
+                                                         startIndex, gP.echoOut);
+
+        if (tid == 0u)
+        {
+            Ptr<uint> r = Ptr<uint>(gP.roundsOut) + round * 4u;
+            r[0] = count;
+            r[1] = before;
+            r[2] = startIndex;
+            r[3] = 0xC0FFEEu;
+        }
+
+        if (tid < count)
+        {
+            Ptr<uint> b = Ptr<uint>(gP.bufOut) + (round * SDFF_TARGET_COUNT + tid) * 2u;
+            b[0] = gSdfIndices2[tid].x;
+            b[1] = gSdfIndices2[tid].y;
+        }
+
+        ++round;
+        GroupMemoryBarrierWithGroupSync();
     }
 
     if (tid == 0u)

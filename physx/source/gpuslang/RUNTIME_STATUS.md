@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **823/823** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **824/824** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.33a added `gpuslang.npFloatIntrinRecipSqrt`, which is not a kernel port but a
 PLATFORM measurement: about forty shaders here spell `PxVec3::getNormalized` as
 `v * rsqrt(m)`, while the engine computes `PxRecipSqrt` = `1.0f/sqrtf` — two exactly
@@ -1736,6 +1736,92 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.34b Schritt 2 — der Dreiecks-Sammler, und eine Toleranz, die genau das ertränkt hat, was sie prüfen sollte
+
+`findInterestingTrianglesA<32, 1024>` (sdfCollision.cuh:620) — die äußere Schleife
+von `cloth_sdfMeshContactGenLaunch`. P9.12e hatte das **Vertex**-Geschwister
+bereits portiert, samt `threadBlockScanExclusive` und dem
+Wiederaufnahme-Protokoll; das hier ist dieselbe Maschine mit drei Unterschieden.
+
+### Drei Unterschiede, und einer davon ist nicht das, wonach er aussieht
+
+* **Das Pufferelement ist ein `uint2`** — Index plus Unterteilungsstufe. Bei
+  `SUPPORT_SUBDIVISION 0` ist die Stufe immer null, aber die CUDA speichert und
+  liest **beide** Hälften, also tut der Port das auch. Und der
+  Wiederaufnahmepunkt kommt aus `index.x + 1` — dem **ersten** Wort des Paares,
+  was die CUDA als `((PxU32*)(&index))[0] + 1` schreibt.
+* **Der Kull-Test ist eine Hüllkugel**, keine Punktprüfung:
+  `Distanz(Schwerpunkt) < Radius/min(scale) + Toleranz`, wobei der Radius
+  dieselbe Form hat wie `difference` in P9.34a — geschachteltes Maximum von
+  **Quadraten**, **eine** Wurzel — und die Division durch die **kleinste**
+  Skalenkomponente den Radius allein trifft, vor der Addition.
+* **Die Schleife hat eine Zählschranke, die das Vertex-Geschwister nicht hat.**
+
+Und über die dritte muss man genau sein, denn sie sieht aus wie eine
+Korrektheitsfalle und ist keine:
+
+> Sobald der Puffer voll ist, ist `nbElementsInBuffer` bei `TargetCount`
+> gesättigt, also liegt **jeder** spätere Schreib-Offset ≥ `TargetCount`: kein
+> Platz wird beschrieben, der `writeOffset == TargetCount - 1`-Handschlag kann
+> nicht mehr feuern, und der Rückgabewert sättigt erneut. Die gesammelte Menge,
+> der Wiederaufnahmepunkt und die Rundenstruktur sind **identisch**, mit oder
+> ohne Schranke.
+
+Was sich unterscheidet, ist **Arbeit**: ohne die Schranke tastet der Block den
+Rest des Netzes weiter ab und wirft die Ergebnisse weg, jede Runde. Beobachtbar
+ist das nur daran, **welche Dreiecke berührt wurden** — und genau das hält der
+Echo-Puffer der Vorrichtung fest. Gemessen: **2976 von 4000** Dreiecken werden in
+der puffer-füllenden Runde nie abgetastet.
+
+### Die Lücke, die ich mir selbst gebaut hatte
+
+Der erste Durchgang ließ sechs Überlebende, **fünf davon mit einer Ursache**: ich
+hatte die Toleranz auf `1e30` gesetzt, damit mehrere Runden zustande kommen. Damit
+war `Distanz < Radius/min(scale) + Toleranz` **trivial wahr** — und der ganze
+Hüllkugel-Term, den der Test prüfen sollte, war unsichtbar. Ein Maximum von
+Längen statt einer Wurzel eines Maximums, keine Skalendivision, die falsche
+Skalen-Extremale, der Radius ganz weggelassen, ein nicht-strikter Vergleich:
+alle fünf überlebten gegen diese Toleranz.
+
+Dieselbe Wahl zerstörte noch etwas Zweites. Wenn **jedes** Dreieck qualifiziert,
+füllt die erste innere Iteration den Puffer exakt und die Schranke bricht ab —
+also übersteigt **nie** ein Schreib-Offset den Puffer, und ein Port, der den Index
+**klemmt** statt ihn zu überspringen, ist ununterscheidbar.
+
+Mit einer endlichen Toleranz (0,35; **1158 von 4000** qualifizieren) kehren beide
+Beobachtbarkeiten zurück, und die Vorrichtung besteht jetzt darauf, dass die
+qualifizierende Menge **größer als ein Puffer und kleiner als alles** ist — sonst
+ist der Kull-Term wieder unsichtbar.
+
+### Die Striktheit, hergestellt statt erhofft
+
+`<` gegen `<=` unterscheidet sich nur, wenn beide Seiten **exakt** gleich sind,
+und zufällige Geometrie liefert das nie. Die Toleranz ist aber ein freier
+Parameter: also wird die Grenze **hergestellt** — Dreieck nehmen, die vom Gerät
+gemeldete Distanz und den auf dem Host exakt berechneten Radius nehmen, und die
+wenigen Float-Werte um `d - r` herum absuchen, bis `fl(r + Toleranz) == d`
+bitgleich gilt. `fl(r + t)` ist monoton in `t`, also liegt so ein Wert, wenn es
+ihn gibt, ein bis zwei ULP neben der Differenz.
+
+Gefunden: **Dreieck 1**, Toleranz **0,232149363** — exakt auf der Grenze, und
+korrekt **verworfen**. Der `<=`-Mutant fällt.
+
+### Verifikation
+
+* Fegen **14 von 15**; der eine Überlebende ist derselbe bewiesene
+  Monotonie-Äquivalent wie in P9.34a: `sqrt(max(a²,b²,c²))` gleicht
+  `max(sqrt(a²),…)`, weil die Wurzel monoton und korrekt gerundet ist;
+* Schwerpunkte **bitgleich** gegen die Transformationskette des Hosts —
+  `vertex2Shape` mit der Tuch-Skala, `aToB`, dann `shape2Vertex` mit der
+  SDF-Skala, alle über die Engine-Quaternionen;
+* die gesammelten Indizes rundenweise **exakt** die qualifizierenden in
+  Reihenfolge, über zwei Runden mit Wiederaufnahme;
+* die Unterteilungsstufe durchgehend literal null;
+* Suite **824/824** in beiden Speichermodi — Modus 2 im **vierten** Anlauf, alle
+  drei Ausfälle davor `gpuslang.femClothSim` mit dem llvmpipe-Plattformfehler aus
+  P9.28a, und das steht hier mit der Versuchszahl statt ohne.
+
 
 ## P9.34a — der Kern der SDF-Tuch-Kontakterzeugung, und eine Funktion, für die es ein echtes Orakel gibt
 

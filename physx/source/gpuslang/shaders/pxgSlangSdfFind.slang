@@ -144,6 +144,10 @@ static const uint SDFF_BLOCK_DIM = 1024u;
 // resume slot (sdfCollision.cuh:695).
 groupshared uint gSdfPerWarpCount[SDFF_NB_WARPS];
 groupshared uint gSdfIndices[SDFF_TARGET_COUNT];
+// P9.34b: the TRIANGLE gather's buffer element is a uint2 -- the primitive index
+// and its subdivision level.  With SUPPORT_SUBDIVISION 0 the level is always 0,
+// but the CUDA still stores and reads both halves, so both are carried here.
+groupshared uint2 gSdfIndices2[SDFF_TARGET_COUNT];
 groupshared uint gSdfOffset;
 
 // ---------------------------------------------------------------------------
@@ -277,6 +281,160 @@ uint sdfFindInterestingVertices(uint tid, uint nbVertices, uint64_t positions,
 {
     return sdfFindInterestingVerticesEx(tid, nbVertices, positions, scale1, scale1Rot, tolerance,
                                         sdfMesh1, aToBp, aToBq, startIndex, 0UL);
+}
+
+// ===========================================================================
+// findInterestingTrianglesA<32, 1024>, sdfCollision.cuh:620-686 -- P9.34b.
+//
+// The TRIANGLE sibling of findInterestingVertices above, and the outer loop of
+// cloth_sdfMeshContactGenLaunch.  Same resumable-stream protocol, same block scan,
+// same offset handshake -- and three differences that matter.
+//
+// ---------------------------------------------------------------------------
+//  T1. THE LOOP HAS A COUNT GUARD AND THE VERTEX ONE DOES NOT.  Thirty lines
+//      apart in the same header:
+//          vertices   for (i = startIndex; (i < nbVertices); )
+//          triangles  for (i = startIndex; (i < nbPrimitives || ...) &&
+//                          sharedIndicesCount < TargetCount; )
+//      The vertex sweep visits every remaining primitive on every call and lets
+//      addIndexToBuffer saturate; the triangle sweep STOPS as soon as the buffer
+//      is full.
+//
+//      BE PRECISE ABOUT WHAT THAT CHANGES, because it is tempting to call it a
+//      correctness trap and it is not.  Once the buffer is full,
+//      `nbElementsInBuffer` is saturated at TargetCount, so every later
+//      writeOffset is >= TargetCount: no slot is written, the
+//      `writeOffset == TargetCount - 1` handshake cannot fire, and the return
+//      saturates again.  The gathered set, the resume point and the round
+//      structure are therefore IDENTICAL with and without the guard.  What
+//      differs is WORK: without it the block keeps sampling the SDF for the whole
+//      remainder of the mesh and throwing the results away, every round.
+//
+//      So the guard is an efficiency property, and the only thing that can
+//      observe it is which primitives the function TOUCHED -- which is exactly
+//      what the fixture's echo buffer records, and how it is checked.
+//
+//  T2. THE CULL TEST IS A BOUNDING SPHERE, NOT A POINT.  The vertex form asks
+//      `distance(v) < tolerance`; this one asks
+//          distance(centroid) < boundingSphereRadius / min(scale) + tolerance
+//      where the radius is `sqrt(max(|v0-c|^2, max(|v1-c|^2, |v2-c|^2)))` -- the
+//      same nested-max-then-one-sqrt shape as doTriangleSDFCollision's
+//      `difference`, and wrong if spelled as a max of three lengths.  The DIVISION
+//      by the smallest scale component happens to the radius alone, before the
+//      tolerance is added.
+//
+//  T3. THE SUBDIVISION MACHINERY IS DEAD.  `SUPPORT_SUBDIVISION` is 0 at the one
+//      call site (femClothPrimitives.cu:2306), so nbSubdivisionIndices is always
+//      0, `PxMin(TargetCount, 4 * 0)` is 0, and the index reduces to
+//      `i + threadIdx.x` with a stride of blockDim.x -- identical to the vertex
+//      form.  The subdivision level is stored as a literal 0 rather than dropped,
+//      because the consumer reads `.y` and passes it to getTriangleVertices.
+// ===========================================================================
+
+uint sdfAddIndexToBuffer2(uint tid, bool threadEmitsElement, uint2 index, uint nbElementsInBuffer)
+{
+    uint total;
+    const uint exclusiveSum = sdfBlockScanExclusive(tid, threadEmitsElement, total);
+
+    if (threadEmitsElement)
+    {
+        const uint writeOffset = nbElementsInBuffer + exclusiveSum;
+
+        if (writeOffset < SDFF_TARGET_COUNT)
+            gSdfIndices2[writeOffset] = index;
+
+        // S4, and note the resume point is `index.x + 1` -- the FIRST word of the
+        // pair, which the CUDA spells `((PxU32*)(&index))[0] + 1`.
+        if (writeOffset == (SDFF_TARGET_COUNT - 1u))
+            gSdfOffset = index.x + 1u;
+    }
+
+    return min(total + nbElementsInBuffer, SDFF_TARGET_COUNT);
+}
+
+// T2, factored out so the *Ex trace and the live path cannot disagree about it.
+float sdfTriangleCullDistance(uint64_t meshInd, uint64_t meshVerts, uint ind,
+                              float3 scale0, float4 scale0Rot, float3 aToBp, float4 aToBq,
+                              float3 scale1, float4 scale1Rot, SparseSdfTexture sdfMesh1,
+                              out float radiusOverScale, out float3 centroidVertexSpace)
+{
+    // getTriangleVertices (sdfCollision.cuh:521): vertex2Shape by scale0, then the
+    // a-to-b transform.  The P8.96c CLAMP RULE applies to the index, not the load.
+    const uint4 tri = Ptr<uint4>(meshInd)[ind];
+    Ptr<float4> vp = Ptr<float4>(meshVerts);
+    const float3 v0 = sdfTransformPoint(aToBp, aToBq, sdfVertex2Shape(vp[tri.x].xyz, scale0, scale0Rot));
+    const float3 v1 = sdfTransformPoint(aToBp, aToBq, sdfVertex2Shape(vp[tri.y].xyz, scale0, scale0Rot));
+    const float3 v2 = sdfTransformPoint(aToBp, aToBq, sdfVertex2Shape(vp[tri.z].xyz, scale0, scale0Rot));
+
+    const float third = 1.0f / 3.0f;
+    const float3 centroid = (v0 + v1 + v2) * third;
+
+    centroidVertexSpace = sdfShape2Vertex(centroid, scale1, scale1Rot);
+    const float distInSDFSpace1 = sdfDistance(sdfMesh1, centroidVertexSpace);
+
+    const float3 e0 = v0 - centroid, e1 = v1 - centroid, e2 = v2 - centroid;
+    float r = sqrt(max(dot(e0, e0), max(dot(e1, e1), dot(e2, e2))));
+    r = r / min(scale1.x, min(scale1.y, scale1.z));
+    radiusOverScale = r;
+
+    return distInSDFSpace1;
+}
+
+uint sdfFindInterestingTrianglesEx(uint tid, uint nbPrimitives, uint64_t meshInd, uint64_t meshVerts,
+                                   float3 scale0, float4 scale0Rot, float3 scale1, float4 scale1Rot,
+                                   float tolerance, SparseSdfTexture sdfMesh1,
+                                   float3 aToBp, float4 aToBq, inout uint startIndex,
+                                   uint64_t echoOut)
+{
+    if (tid == 0u)
+        gSdfOffset = startIndex;
+
+    uint sharedIndicesCount = 0u;
+
+    // T1: the count guard, which the vertex sibling does not have.
+    for (uint i = startIndex; i < nbPrimitives && sharedIndicesCount < SDFF_TARGET_COUNT; )
+    {
+        // T3: with the subdivision machinery dead this is `i + tid`, stride blockDim.
+        const uint ind = i + tid;
+        i += SDFF_BLOCK_DIM;
+
+        const uint safeInd = ind < nbPrimitives ? ind : 0u;
+        float radiusOverScale;
+        float3 centroidVtx;
+        const float distInSDFSpace1 =
+            sdfTriangleCullDistance(meshInd, meshVerts, safeInd, scale0, scale0Rot, aToBp, aToBq,
+                                    scale1, scale1Rot, sdfMesh1, radiusOverScale, centroidVtx);
+
+        // T2, and strict, exactly as the vertex form's tolerance test is.
+        const bool addToBuffer = (ind < nbPrimitives) &&
+                                 (distInSDFSpace1 < (radiusOverScale + tolerance));
+
+        if (echoOut != 0UL && ind < nbPrimitives)
+            Ptr<float4>(echoOut)[ind] = float4(centroidVtx, distInSDFSpace1);
+
+        GroupMemoryBarrierWithGroupSync();
+        sharedIndicesCount = sdfAddIndexToBuffer2(tid, addToBuffer, uint2(ind, 0u),
+                                                  sharedIndicesCount);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (startIndex != gSdfOffset)
+        startIndex = gSdfOffset;
+    else
+        startIndex = nbPrimitives;
+
+    return sharedIndicesCount;
+}
+
+uint sdfFindInterestingTriangles(uint tid, uint nbPrimitives, uint64_t meshInd, uint64_t meshVerts,
+                                 float3 scale0, float4 scale0Rot, float3 scale1, float4 scale1Rot,
+                                 float tolerance, SparseSdfTexture sdfMesh1,
+                                 float3 aToBp, float4 aToBq, inout uint startIndex)
+{
+    return sdfFindInterestingTrianglesEx(tid, nbPrimitives, meshInd, meshVerts, scale0, scale0Rot,
+                                         scale1, scale1Rot, tolerance, sdfMesh1, aToBp, aToBq,
+                                         startIndex, 0UL);
 }
 
 #endif // PXG_SLANG_SDF_FIND

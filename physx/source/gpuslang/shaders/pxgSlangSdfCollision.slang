@@ -194,6 +194,17 @@ float3 sdfShape2Vertex(float3 v, float3 scale, float4 rotation)
     return quatRotateInv(rotation, quatRotate(rotation, v) / scale);
 }
 
+// vertex2Shape (cudaNpCommon.h:270) -- the INVERSE of the above, and P9.34b's
+// triangle gather needs it because the cloth's vertices arrive in vertex space and
+// have to reach shape space before the a-to-b transform.  Note it is a component-wise
+// MULTIPLY between rotate and rotateInv where shape2Vertex divides; the two are not
+// each other's spelling with a reciprocal, and they do not round alike.
+float3 sdfVertex2Shape(float3 v, float3 scale, float4 rotation)
+{
+    const float3 t = quatRotate(rotation, v);
+    return quatRotateInv(rotation, float3(t.x * scale.x, t.y * scale.y, t.z * scale.z));
+}
+
 // PxTransform::transform(p) = q.rotate(p) + t.p.
 float3 sdfTransformPoint(float3 tp, float4 tq, float3 v)
 {

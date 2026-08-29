@@ -113,7 +113,15 @@ struct P_Find
     float aToBp[3];  float tolerance;                                        // 80
     float scale[3];  uint32_t numVertices;                                   // 96
     uint32_t maxRounds, pad0, pad1, pad2;                                    // 112
+    uint64_t meshInd;                                                        // 128  P9.34b
+    uint64_t pad136;                                                         // 136
+    float scale0Rot[4];                                                      // 144
+    float scale0[3]; uint32_t pad172;                                        // 160 -> 176
 };
+static_assert(sizeof(P_Find) == 176, "the find blob must be 176 bytes");
+static_assert(offsetof(P_Find, meshInd) == 128, "meshInd @128");
+static_assert(offsetof(P_Find, scale0Rot) == 144, "scale0Rot @144");
+static_assert(offsetof(P_Find, scale0) == 160, "scale0 @160");
 
 static const uint32_t TARGET_COUNT = 1024u;    // SDFF_TARGET_COUNT
 static const uint32_t BLOCK_DIM = 1024u;       // SDFF_BLOCK_DIM
@@ -513,6 +521,344 @@ PXG_TEST(sdfFind)
 
     for (PxgBufferHandle h : owned)
         dev->destroyBuffer(h);
+    physx::gpuslang::pxgSetVulkanDriverShim(nullptr);
+}
+
+
+// ===========================================================================
+// P9.34b: findInterestingTrianglesA<32, 1024>, the TRIANGLE sibling of the gather
+// above and the outer loop of cloth_sdfMeshContactGenLaunch.
+//
+// Same resumable-stream protocol, checked the same way -- the expectation is built
+// from the distances the function ITSELF reports through the echo, because Sample()
+// is GPU-only, so what is under test is the gathering and the cull predicate rather
+// than the distance (P9.12d's claim, measured there).
+//
+// Three things are new against the vertex form and each has its own check:
+//   * the buffer element is a uint2, whose second half must be a literal 0;
+//   * the cull test is a BOUNDING SPHERE -- centroid distance against
+//     radius/min(scale) + tolerance -- and the radius is host-computable exactly,
+//     so it is compared bit for bit rather than taken from the shader;
+//   * the loop carries a count guard the vertex form lacks.  That guard cannot
+//     change the gathered set (once the buffer saturates, no later write can
+//     land and the resume handshake cannot fire), so the ONLY thing that can
+//     observe it is which triangles were touched -- which the echo records.
+// ===========================================================================
+PXG_TEST(sdfFindTriangles)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    if (!dev->supportsBindlessTextures())
+    {
+        std::printf("  NOTE: backend has no descriptor indexing -> skip\n");
+        return;
+    }
+
+    const PxgKernelDef manifest[] = { { "npSdfFind.spv", "sdfFindTriangleRounds", 0u, 0u } };
+    static auto loaderT = [](const char* f) { return loadShaderBlob(f); };
+    PxgCudaShim shim(dev, manifest, 1, +loaderT);
+    physx::gpuslang::pxgSetVulkanDriverShim(&shim);
+
+    std::vector<PxgBufferHandle> owned;
+    auto keep = [&](PxgBufferHandle h) { owned.push_back(h); return h; };
+
+    SdfScene sp;
+    buildSparse(sp);
+    BlobLayout blob = layOutBlob(sp, 16u, 21u, 3u, 1u, 0u);
+    const uint64_t hCoarse = sdfUploadTex(CU_AD_FORMAT_FLOAT, sp.nbx + 1, sp.nby + 1, sp.nbz + 1,
+                                          sp.coarse.data(), sizeof(float));
+    const uint64_t hSub = sdfUploadTex(CU_AD_FORMAT_UNSIGNED_INT8, sp.blkx * (sp.sg + 1),
+                                       sp.blky * (sp.sg + 1), sp.blkz * (sp.sg + 1),
+                                       sp.sub.data(), 1);
+    PXG_CHECK_MSG(hCoarse != 0 && hSub != 0, "the SDF textures must upload");
+    if (hCoarse == 0 || hSub == 0) return;
+    std::memcpy(&blob.bytes[blob.texObjOffset], &hCoarse, 8);
+    std::memcpy(&blob.bytes[blob.texObjSparseOffset], &hSub, 8);
+    const uint64_t blobAddr = dev->getBufferDeviceAddress(keep(createBufferFrom(dev, blob.bytes)));
+
+    // Nothing identity or axis-aligned, on EITHER scale: the cloth's own scale0 and
+    // the SDF mesh's scale1 are different non-uniform frames, so swapping them, or
+    // using shape2Vertex where vertex2Shape belongs, moves the centroid.
+    const PxQuat aToBq = PxQuat(0.37f, PxVec3(0.4f, -0.8f, 0.44721f).getNormalized());
+    const PxVec3 aToBp(0.21f, -0.63f, 1.07f);
+    const PxTransform aToB(aToBp, aToBq);
+    const PxVec3 scale1(1.35f, 0.72f, 2.10f);
+    const PxQuat scale1Rot = PxQuat(-0.58f, PxVec3(-0.6f, 0.48f, 0.64031f).getNormalized());
+    const PxVec3 scale0(0.83f, 1.44f, 0.61f);
+    const PxQuat scale0Rot = PxQuat(0.29f, PxVec3(0.31235f, 0.6247f, -0.71651f).getNormalized());
+
+    const uint32_t NUM_TRIS = 4000u;
+    const uint32_t NUM_V = NUM_TRIS * 3u;
+    const HostSdfBox box = hostSdfBox(sp);
+    const PxVec3 ext = box.higher - box.lower;
+    const uint32_t TAIL_FAR = 200u;   // the same device as the vertex fixture, same reason
+
+    std::vector<F4> verts(NUM_V);
+    std::vector<uint32_t> inds(NUM_TRIS * 4u);
+    {
+        std::mt19937 rng(0x71A9C3u);
+        auto u01 = [&]() { return float(rng() % 1000000u) / 1000000.f; };
+        const PxTransform bToA = aToB.getInverse();
+        for (uint32_t t = 0; t < NUM_TRIS; ++t)
+        {
+            // The triangles vary in SIZE as well as position, because the cull test
+            // divides the bounding-sphere radius by the smallest scale component and
+            // adds it to the tolerance -- a rig of uniform triangles cannot tell that
+            // term from a constant.
+            const float sz = (t % 7u == 0u) ? 0.9f * ext.x : 0.02f * ext.x * (1.0f + float(t % 5));
+            PxVec3 c;
+            if (t < NUM_TRIS - TAIL_FAR)
+                c = PxVec3(box.lower.x - 0.4f * ext.x + 1.8f * ext.x * u01(),
+                           box.lower.y - 0.4f * ext.y + 1.8f * ext.y * u01(),
+                           box.lower.z - 0.4f * ext.z + 1.8f * ext.z * u01());
+            else
+                c = PxVec3(box.lower.x - (8.0f + 3.0f * u01()) * ext.x,
+                           box.lower.y - (8.0f + 3.0f * u01()) * ext.y,
+                           box.lower.z - (8.0f + 3.0f * u01()) * ext.z);
+            const PxVec3 corner[3] = { c + PxVec3(sz, 0.0f, 0.0f),
+                                       c + PxVec3(-0.3f * sz, 0.9f * sz, 0.2f * sz),
+                                       c + PxVec3(0.1f * sz, -0.4f * sz, -0.8f * sz) };
+            for (uint32_t k = 0; k < 3u; ++k)
+            {
+                // Generated in VERTEX space and mapped back through the inverse chain,
+                // exactly as the vertex fixture does.
+                const PxVec3 shapeSpace = hVertex2Shape(corner[k], scale0, scale0Rot);
+                const PxVec3 world = bToA.transform(shapeSpace);
+                verts[t * 3u + k] = F4{ world.x, world.y, world.z, 0.0f };
+            }
+            inds[t * 4u + 0] = t * 3u; inds[t * 4u + 1] = t * 3u + 1u;
+            inds[t * 4u + 2] = t * 3u + 2u; inds[t * 4u + 3] = 0u;
+        }
+    }
+    const uint64_t vAddr = dev->getBufferDeviceAddress(keep(createBufferFrom(dev, verts)));
+    const uint64_t iAddr = dev->getBufferDeviceAddress(keep(createBufferFrom(dev, inds)));
+
+    std::vector<F4> echoInit(NUM_TRIS, F4{ -777.f, -777.f, -777.f, -777.f });
+    std::vector<uint32_t> roundsInit(MAX_ROUNDS * 4u, 0xEEEEEEEEu);
+    std::vector<uint32_t> bufInit(size_t(MAX_ROUNDS) * TARGET_COUNT * 2u, 0xEEEEEEEEu);
+    std::vector<uint32_t> nrInit(1u, 0xEEEEEEEEu);
+
+    P_Find base = {};
+    base.meshPtr = blobAddr;
+    base.positions = vAddr;
+    base.meshInd = iAddr;
+    base.aToBq[0] = aToBq.x; base.aToBq[1] = aToBq.y; base.aToBq[2] = aToBq.z; base.aToBq[3] = aToBq.w;
+    base.scaleRot[0] = scale1Rot.x; base.scaleRot[1] = scale1Rot.y;
+    base.scaleRot[2] = scale1Rot.z; base.scaleRot[3] = scale1Rot.w;
+    base.scale0Rot[0] = scale0Rot.x; base.scale0Rot[1] = scale0Rot.y;
+    base.scale0Rot[2] = scale0Rot.z; base.scale0Rot[3] = scale0Rot.w;
+    base.aToBp[0] = aToBp.x; base.aToBp[1] = aToBp.y; base.aToBp[2] = aToBp.z;
+    base.scale[0] = scale1.x; base.scale[1] = scale1.y; base.scale[2] = scale1.z;
+    base.scale0[0] = scale0.x; base.scale0[1] = scale0.y; base.scale0[2] = scale0.z;
+    base.numVertices = NUM_TRIS;
+    base.maxRounds = MAX_ROUNDS;
+
+    struct Result
+    {
+        uint32_t numRounds = 0;
+        std::vector<uint32_t> rounds, buf;
+        std::vector<F4> echo;
+    };
+    auto run = [&](float tol, uint32_t maxRounds) -> Result {
+        Result out;
+        const PxgBufferHandle bE = keep(createBufferFrom(dev, echoInit));
+        const PxgBufferHandle bR = keep(createBufferFrom(dev, roundsInit));
+        const PxgBufferHandle bB = keep(createBufferFrom(dev, bufInit));
+        const PxgBufferHandle bN = keep(createBufferFrom(dev, nrInit));
+        P_Find p = base;
+        p.echoOut = dev->getBufferDeviceAddress(bE);
+        p.roundsOut = dev->getBufferDeviceAddress(bR);
+        p.bufOut = dev->getBufferDeviceAddress(bB);
+        p.numRoundsOut = dev->getBufferDeviceAddress(bN);
+        p.tolerance = tol;
+        p.maxRounds = maxRounds;
+        Kernel k(Kernel::Bindless{}, "npSdfFind.spv", "sdfFindTriangleRounds", {}, sizeof(P_Find));
+        PXG_CHECK_MSG(k.isValid(), "bindless pipeline creation succeeds for sdfFindTriangleRounds");
+        if (!k.isValid()) return out;
+        k.dispatch(1u, {}, p);
+        dev->flush();
+        out.numRounds = downloadBuffer<uint32_t>(dev, bN, 1)[0];
+        out.rounds = downloadBuffer<uint32_t>(dev, bR, MAX_ROUNDS * 4u);
+        out.buf = downloadBuffer<uint32_t>(dev, bB, size_t(MAX_ROUNDS) * TARGET_COUNT * 2u);
+        out.echo = downloadBuffer<F4>(dev, bE, NUM_TRIS);
+        return out;
+    };
+
+    // The host's own bounding-sphere radius, from the ENGINE's transforms.  Only the
+    // SDF distance comes from the device.
+    auto hostRadiusOverScale = [&](uint32_t t, PxVec3& centroidVertexSpace) {
+        PxVec3 v[3];
+        for (uint32_t k = 0; k < 3u; ++k)
+        {
+            const F4& w = verts[t * 3u + k];
+            v[k] = aToB.transform(hVertex2Shape(PxVec3(w.x, w.y, w.z), scale0, scale0Rot));
+        }
+        const float third = 1.0f / 3.0f;
+        const PxVec3 c = (v[0] + v[1] + v[2]) * third;
+        centroidVertexSpace = hShape2Vertex(c, scale1, scale1Rot);
+        float r = std::sqrt(PxMax((v[0] - c).magnitudeSquared(),
+                             PxMax((v[1] - c).magnitudeSquared(), (v[2] - c).magnitudeSquared())));
+        return r / PxMin(scale1.x, PxMin(scale1.y, scale1.z));
+    };
+
+    // ---- the main run ---------------------------------------------------------
+    // A FINITE tolerance, and that is the whole point.  The first version of this
+    // fixture used 1e30 to guarantee several rounds, which made
+    // `distance < radius/min(scale) + tolerance` trivially true and erased the very
+    // term under test: five mutants on the cull predicate -- a max of lengths instead
+    // of a sqrt of a max, no scale division, the wrong scale extremum, the radius
+    // dropped entirely, and a non-strict compare -- all survived against it.
+    //
+    // A finite tolerance also restores the second thing 1e30 destroyed.  With every
+    // triangle qualifying, the first inner iteration fills the buffer exactly and the
+    // guard exits, so no write offset ever exceeds the buffer and a port that CLAMPS
+    // the write index instead of skipping it is indistinguishable.  With a partial
+    // fill, a later iteration overflows and the difference lands in the last slot.
+    const float TOL = 0.35f;
+    const Result R = run(TOL, MAX_ROUNDS);
+    if (R.numRounds == 0u || R.numRounds == 0xFFFFFFFFu)
+    { PXG_CHECK_MSG(false, "the triangle gather produced no rounds (%u)", R.numRounds);
+      for (auto h : owned) dev->destroyBuffer(h);
+      physx::gpuslang::pxgSetVulkanDriverShim(nullptr); return; }
+
+    size_t badCentroid = 0, badPred = 0, badSub = 0, badSet = 0;
+    std::vector<uint8_t> want(NUM_TRIS, 0u);
+    for (uint32_t t = 0; t < NUM_TRIS; ++t)
+    {
+        PxVec3 cv;
+        const float r = hostRadiusOverScale(t, cv);
+        const F4& e = R.echo[t];
+        if (!bitEq(e.x, cv.x) || !bitEq(e.y, cv.y) || !bitEq(e.z, cv.z))
+        {
+            if (badCentroid < 4)
+                std::printf("    tri %u centroid (%.9g %.9g %.9g) want (%.9g %.9g %.9g)\n",
+                            t, e.x, e.y, e.z, cv.x, cv.y, cv.z);
+            ++badCentroid;
+        }
+        // The predicate, from the distance the function itself reported.
+        want[t] = (e.w < (r + TOL)) ? 1u : 0u;
+    }
+    PXG_CHECK_MSG(badCentroid == 0, "%zu centroids differ from the host's own transform chain "
+                  "(vertex2Shape by scale0, aToB, then shape2Vertex by scale1)", badCentroid);
+
+    // Round by round: the gathered indices must be the qualifying ones in order, and
+    // every second half of the uint2 must be a literal zero.
+    uint32_t cursor = 0u, gathered = 0u;
+    for (uint32_t rr = 0; rr < R.numRounds; ++rr)
+    {
+        const uint32_t count = R.rounds[rr * 4u + 0];
+        const uint32_t before = R.rounds[rr * 4u + 1];
+        PXG_CHECK_MSG(R.rounds[rr * 4u + 3] == 0xC0FFEEu, "round %u wrote no canary", rr);
+        if (rr == 0u) cursor = before;
+        for (uint32_t sIdx = 0; sIdx < count; ++sIdx)
+        {
+            while (cursor < NUM_TRIS && !want[cursor]) ++cursor;
+            const uint32_t gotIdx = R.buf[(size_t(rr) * TARGET_COUNT + sIdx) * 2u + 0];
+            const uint32_t gotSub = R.buf[(size_t(rr) * TARGET_COUNT + sIdx) * 2u + 1];
+            if (gotIdx != cursor)
+            { if (badSet < 4)
+                  std::printf("    round %u slot %u: index %u, expected %u\n", rr, sIdx, gotIdx, cursor);
+              ++badSet; }
+            if (gotSub != 0u) ++badSub;
+            ++cursor; ++gathered;
+        }
+    }
+    PXG_CHECK_MSG(badSet == 0, "%zu gathered indices are not the qualifying triangles in order",
+                  badSet);
+    PXG_CHECK_MSG(badSub == 0, "%zu buffer entries carry a non-zero subdivision level; with "
+                  "SUPPORT_SUBDIVISION 0 upstream it is a literal 0", badSub);
+    PXG_CHECK_MSG(R.numRounds > 1u,
+                  "the gather must need more than one round, or the resume protocol is unchecked "
+                  "(got %u)", R.numRounds);
+    uint32_t nWant = 0u;
+    for (uint32_t t = 0; t < NUM_TRIS; ++t) nWant += want[t];
+    PXG_CHECK_MSG(nWant > TARGET_COUNT && nWant < NUM_TRIS - 200u,
+                  "the tolerance must leave the cull predicate DECIDING something: %u of %u "
+                  "triangles qualify, and the run needs more than one buffer's worth but not "
+                  "all of them, or the bounding-sphere term is invisible", nWant, NUM_TRIS);
+    // A partial fill is what makes an overflowing write offset possible at all.
+    PXG_CHECK_MSG(R.rounds[0] == TARGET_COUNT,
+                  "round 0 must fill the buffer (%u)", R.rounds[0]);
+
+    // ---- the gate's strictness, found by SEARCH rather than by luck -----------
+    // `distance < radius + tolerance` differs from `<=` only when the two sides are
+    // exactly equal, which random geometry never produces.  The tolerance is a free
+    // parameter, though, so the boundary can be MANUFACTURED: pick a triangle, take
+    // the distance the device reported for it and the radius the host computes
+    // exactly, and search the few float values of `tolerance` around `d - r` for one
+    // where fl(r + tolerance) == d bitwise.  fl(r + t) is monotone in t, so if such a
+    // value exists it is within an ULP or two of the difference.
+    {
+        uint32_t chosen = 0xFFFFFFFFu;
+        float chosenTol = 0.0f;
+        for (uint32_t t = 0; t < NUM_TRIS && chosen == 0xFFFFFFFFu; ++t)
+        {
+            PxVec3 cv;
+            const float r = hostRadiusOverScale(t, cv);
+            const float d = R.echo[t].w;
+            if (!(d > 0.0f) || !std::isfinite(d) || !std::isfinite(r)) continue;
+            const float base = d - r;
+            for (int k = -3; k <= 3 && chosen == 0xFFFFFFFFu; ++k)
+            {
+                const float cand = (k == 0) ? base
+                                            : u2f(uint32_t(int32_t(f2u(base)) + k));
+                if (!(cand > 0.0f) || !std::isfinite(cand)) continue;
+                if (f2u(r + cand) == f2u(d)) { chosen = t; chosenTol = cand; }
+            }
+        }
+        PXG_CHECK_MSG(chosen != 0xFFFFFFFFu,
+                      "no tolerance puts any triangle exactly on the gate's boundary, so `<` and "
+                      "`<=` are indistinguishable and the strictness is unchecked");
+        if (chosen != 0xFFFFFFFFu)
+        {
+            const Result RB = run(chosenTol, MAX_ROUNDS);
+            // The boundary triangle must be EXCLUDED: the gate is strict.
+            uint32_t seen = 0u, total = 0u;
+            for (uint32_t rr = 0; rr < RB.numRounds; ++rr)
+            {
+                const uint32_t cnt = RB.rounds[rr * 4u + 0];
+                total += cnt;
+                for (uint32_t sIdx = 0; sIdx < cnt; ++sIdx)
+                    if (RB.buf[(size_t(rr) * TARGET_COUNT + sIdx) * 2u + 0] == chosen) ++seen;
+            }
+            PxVec3 cvv;
+            const float rr0 = hostRadiusOverScale(chosen, cvv);
+            PXG_CHECK_MSG(f2u(rr0 + chosenTol) == f2u(RB.echo[chosen].w),
+                          "the manufactured boundary did not hold at the chosen tolerance");
+            PXG_CHECK_MSG(seen == 0u,
+                          "triangle %u sits EXACTLY on the gate (distance == radius + tolerance) "
+                          "and was gathered anyway; the comparison is strict", chosen);
+            std::printf("    [ note ] gate strictness: triangle %u placed exactly on the boundary "
+                        "at tolerance %.9g and correctly excluded (%u gathered)\n",
+                        chosen, chosenTol, total);
+        }
+    }
+
+    // ---- the count guard's ONLY observable ------------------------------------
+    // One round, a tolerance that fills the buffer early.  With the guard the block
+    // stops as soon as the buffer is full, so triangles in later blocks are never
+    // sampled and their echo slots keep the poison.  Without it the sweep runs to the
+    // end of the mesh and every slot is written.
+    {
+        const Result R1 = run(1.0e30f, 1u);
+        const uint32_t count = R1.rounds[0];
+        PXG_CHECK_MSG(count == TARGET_COUNT,
+                      "the single-round configuration must fill the buffer exactly (%u)", count);
+        size_t untouched = 0;
+        for (uint32_t t = 0; t < NUM_TRIS; ++t)
+            if (R1.echo[t].w == -777.f) ++untouched;
+        PXG_CHECK_MSG(untouched > 0,
+                      "every triangle was sampled in a single round that filled the buffer after "
+                      "%u of %u; the loop's `sharedIndicesCount < TargetCount` guard -- which the "
+                      "vertex sibling does not have -- is doing nothing", count, NUM_TRIS);
+        std::printf("    [ note ] count guard: %u of %u triangles never sampled in the "
+                    "buffer-filling round\n", uint32_t(untouched), NUM_TRIS);
+    }
+
+    std::printf("    [ note ] %u triangles, %u qualifying at tolerance %g, %u rounds, %u "
+                "gathered; centroids bit-exact against the host transform chain, subdivision "
+                "level 0 throughout\n", NUM_TRIS, nWant, TOL, R.numRounds, gathered);
+
+    for (auto h : owned) dev->destroyBuffer(h);
     physx::gpuslang::pxgSetVulkanDriverShim(nullptr);
 }
 
