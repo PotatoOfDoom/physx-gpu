@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 375;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 376;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -306,7 +306,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_particleContactPrepareLaunch", nullptr, nullptr },  // SB_SP_CONTACTPREPARE (unmapped)
     { "sb_solveRigidSoftAttachmentLaunch", "softBodyRigidAttachBda.spv", "sb_solveRigidSoftAttachmentLaunch" },  // SB_SOLVE_RIGID_SOFT_ATTACHMENT (P8.3 attachment port)
     { "sb_solveOutputSoftBodyAttachmentDeltaVLaunch", "softBodyFemAttachBda.spv", "sb_solveOutputSoftBodyAttachmentDeltaVLaunch" },  // SB_SOLVE_SOFTBODY_ATTACHMENT_DELTA (unmapped)
-    { "sb_solveOutputClothAttachmentDeltaVLaunch", nullptr, nullptr },  // SB_SOLVE_CLOTH_ATTACHMENT_DELTA (unmapped)
+    { "sb_solveOutputClothAttachmentDeltaVLaunch", "softBodyClothAttachBda.spv", "sb_solveOutputClothAttachmentDeltaVLaunch" },  // SB_SOLVE_CLOTH_ATTACHMENT_DELTA (P9.33c BDA)
     { "sb_solveOutputParticleAttachmentDeltaVLaunch", nullptr, nullptr },  // SB_SOLVE_PARTICLE_ATTACHMENT_DELTA (unmapped)
     { "sb_queryRigidSoftContactReferenceCountLaunch", "softBodyRigidContactBda.spv", "sb_queryRigidSoftContactReferenceCountLaunch" },  // SB_QUERY_RIGID_SOFT_REFERENCE_COUNT (P8.2 tranche e BDA port; chain kernels 6 and 7)
     { "sb_solveRigidSoftCollisionLaunch", "softBodyRigidContactBda.spv", "sb_solveRigidSoftCollisionLaunch" },  // SB_SOLVE_RIGID_SOFT_COLLISION (P8.2 tranche e BDA port; chain kernels 6 and 7)

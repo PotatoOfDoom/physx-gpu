@@ -72,12 +72,20 @@
 // softbody-softbody pair, :3859 for softbody-cloth), so minDist is 0, `0 >= 0` holds, and
 // the branch is ENTERED for every attachment in every scene.
 //
-// It does not collapse to the identity there either.  With maxAngle = -1 the angle branch is
-// skipped, and `len` clamps into [minDist, maxDist] = [0, 0] = 0, so the return is
-// `relPos - 0*dir` = relPos — but `relPos` is the argument, which the CALLER already built as
-// `relPos1 - worldAxis * constraintOffset`.  The offset still bites, and `worldAxis` still
-// costs a normalise.  What the default DOES switch off is the transcendental: PxSinCos runs
-// only when maxAngle > 0, i.e. only for a real cone.
+// WHAT IT COMPUTES THERE, stated carefully, because the first version of this correction
+// over-claimed.  With maxAngle = -1 the angle arm is skipped and `len` clamps into
+// [minDist, maxDist] = [0, 0] = 0, so the return is `relPos - 0*dir` = relPos — and `relPos`
+// is the argument, which the CALLER built as `relPos1 - worldAxis * constraintOffset`.  So
+// whether the branch changes any number comes down to `constraintOffset`, and through the
+// PUBLIC API it is hard-coded to zero: NpDeformableAttachment.cpp:349 (volume-volume) and
+// :353 (volume-surface) both pass `NULL, 0.0f`.  With that, `error == relPos1` exactly, and
+// the branch is numerically the identity.
+//
+// So P8.19's practical conclusion — nothing observable happens here in a scene — was right
+// for the wrong reason, and the reason is what a port has to get right: the branch is ENTERED,
+// the normalise IS evaluated, and a caller reaching the core API directly can pass a non-zero
+// offset or a real PxConeLimitedConstraint and make all of it observable.  It is transcribed
+// exactly and the fixture drives every arm, rather than being written off as unreachable.
 //
 // That transcendental is worth naming precisely, because it is the one seam here that is not
 // bit-determined: on CUDA `PxSinCos` (PxMath.h:205) is `__sincosf` for __CUDA_ARCH__ >= 350 —

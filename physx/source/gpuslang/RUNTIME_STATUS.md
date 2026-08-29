@@ -1737,6 +1737,139 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.33c — die Softbody-gegen-Tuch-Anheftung, und ein `.w`, das auf der einen Seite geklemmt wird und auf der anderen nicht
+
+Manifest **375 → 376**. `sb_solveOutputClothAttachmentDeltaVLaunch`
+(softBodyGM.cu:2424, Aufruf PxgSoftBodyCore.cpp:2005) heftet ein **Tetraeder**
+eines Softbodys an ein **Dreieck** eines Tuchs. Damit hat
+`PxgFEMFEMAttachmentConstraint` alle **drei** Verbraucher portiert: P8.19
+Softbody-Softbody, P9.32 Tuch-Tuch, und jetzt der gemischte.
+
+### Was gleich bleibt, und warum das gesagt werden muss
+
+`elemId1` bekommt weiter `-delta`, `elemId0` weiter `+delta`, die Relativlage ist
+weiter `pos1 - pos0`, der Maßstab weiter `error * (1.0f/wTot)`, das
+Constraint-Gewicht weiter 1. Nichts davon dreht sich um, nur weil die Körpertypen
+wechseln — und genau das ist die Sorte Änderung, die ein abgeleiteter Port
+„korrigiert".
+
+### Fünf echte Unterschiede
+
+* **Zwei Deskriptor-Felder statt einem.** Seite 1 läuft über `PxgSoftBody`, Seite
+  0 über `PxgFEMCloth` — andere Schrittweite, also ist das falsche Feld mit dem
+  richtigen Index kein Absturz, sondern eine plausible falsche Zahl. Der
+  Tuch-Ausgang ist `mDeltaPos`, **einen Zeigerplatz vor**
+  `mAccumulatedDeltaPos`, einem float4-Feld gleicher Länge.
+* **Die Tuchseite ist überall dreieckig.** `pos0` mischt drei Ecken, `b0w.w` ist
+  eine geschriebene **Null-Literale**, und `wTot0` summiert **drei** Terme gegen
+  `wTot1`s vier.
+* **Die Tuch-Streuung ist `updateTriPositionDelta`.** Drei Ecken, jede **ganz**
+  übersprungen — xyz-Atomic und `.w += 1` gleichermaßen —, wenn
+  `bary0.k · cp_k.w` nicht echt positiv ist. Wichtig, weil das nächstgelegene
+  Vorbild im Korpus das Gegenteil tut: der Tuch-Tuch-Löser aus P9.32 schreibt
+  alle drei Ecken bedingungslos.
+* **Die Kegelachse kommt vom anderen Körper und wird andersherum subtrahiert:**
+  `pos1 - projectP` über die Ecken des **Softbodys**, gegen `projectP - pos0` über
+  die Ecken von Körper 0 beim Geschwister. Die Negation derselben Form.
+* **Die Tuch-Kennung ist eine andere Konstantenfamilie** —
+  `PXG_BITSHIFT_ELEMENT_ID` mit `PX_MAX_NB_DEFORMABLE_SURFACE_TRI` gegen
+  `PXG_BITSHIFT_TET_ID` mit `PX_MAX_NB_DEFORMABLE_VOLUME_TET`. Heute beide 20 und
+  `0x000fffff`, also numerisch einig; getrennt gehalten, weil sie getrennt sind.
+
+### Das `.w` ist der Divisor — und die beiden Seiten behandeln es nicht gleich
+
+Das ist der Fund, den ein unabhängiger Lesedurchgang bestätigt hat und den ich
+selbst nicht gesehen hatte:
+
+| | Was der Anwender daraus macht |
+|---|---|
+| Tuch | `if(delta.w != 0.f) { scale = 1.0f / delta.w; … }` (FEMClothExternalSolve.cu:1086, :1093) |
+| Softbody | `scale = 1.0f / PxMax(delta.w, 1.f)` (softBodyGM.cu:2644) |
+
+Der Softbody-Anwender **klemmt**. Der Tuch-Anwender nicht. Ein zusätzliches
+`+1.0f` teilt dort also einen richtigen Zähler durch eine zu große Zahl — das Tuch
+bewegt sich, nur weniger, jeden Frame, ohne NaN und ohne Assertion. Ein fehlendes
+lässt `delta.w == 0`, und der Anwender überspringt den Vertex vollständig.
+
+> Derselbe Fehler ist auf der Tetraeder-Seite unsichtbar und auf der
+> Dreiecks-Seite zerstörerisch. Deshalb wird das Tor Ecke für Ecke übertragen
+> statt als harmlos angenommen.
+
+### Eine Behauptung von mir aus P9.33b, präzisiert
+
+P9.33b schrieb: „Der Versatz beißt weiter." Das gilt für den **Code**, nicht für
+eine Szene. `NpDeformableAttachment.cpp:349` und `:353` übergeben beide
+`NULL, 0.0f` — über die öffentliche Schnittstelle ist `constraintOffset` fest
+null, also ist `error == relPos1` exakt und der Kegelzweig **numerisch die
+Identität**.
+
+Die *praktische* Schlussfolgerung von P8.19 war damit richtig, die *Begründung*
+falsch — und die Begründung ist das, was ein Port braucht: der Zweig **wird
+betreten**, die Normalisierung **wird gerechnet**, und ein direkter
+Kern-Schnittstellen-Aufruf kann beides sichtbar machen. Beide Texte sind
+korrigiert.
+
+### Drei Fege-Durchgänge, und zweimal war der Mutant der Fehler
+
+| Durchgang | | Was der Rest lehrte |
+|---|---|---|
+| 1 | 24/34 | Zehn Überlebende. Vier echte Vorrichtungslücken, zwei falsch gezielte Mutanten, vier begründete Äquivalente. |
+| 2 | 29/34 | Die vier Lücken geschlossen. Zwei Überlebende waren **immer noch meine Mutanten**. |
+| 3 | **32/36** | Die beiden repariert; die vier Äquivalente stehen. |
+
+Die vier Lücken, alle in der Vorrichtung:
+
+* `bary0.w` war null, also war jeder Mutant, der es liest, ein No-op. Die Engine
+  schreibt dort **immer** null (PxgSimulationController.cpp:3840) — die
+  Vorrichtung schreibt jetzt trotzdem **Müll**, und zwar genau deshalb: die CUDA
+  ist dagegen immun (Literal-Null in `b0w.w`, drei Terme in `wTot0`,
+  `updateTriPositionDelta` liest `.w` nie), ein Port, der die vierte Ecke
+  „wiederherstellt", ist es nicht.
+* Kein Kontakt hatte eine Null-Gewichtung in Ecke **0**, also überlebte der
+  Mutant, der deren Tor entfernt. Jetzt liegt in **jeder** der drei Ecken eine
+  Null, je einmal aus inverser Masse und einmal aus Baryzentrik.
+* Die Elementindizes lagen unter 65536, also war die **Maskenbreite** unsichtbar.
+  Der Abdeckungslauf sitzt jetzt bei den Indizes **66000…67023**.
+* Keine Anheftung erreichte den `len > 1e-6`-Wächter. Jetzt gibt es zwei
+  entartete — der Wächter steht **zweimal** im Quelltext, einmal im
+  `maxAngle > 0`-Arm und einmal im `else`-Arm, und der erste Durchgang traf nur
+  einen davon.
+
+Und die zwei falschen Mutanten:
+
+* Der „Tet-Streuung auf der Tuchseite"-Mutant ließ `b0w.w` unangetastet — und
+  dessen Literal-Null entwaffnet die vierte Ecke. Er musste ein **Verbund** sein:
+  vierte Gewichtung scharf **und** Vier-Ecken-Streuung. Ein **Zeugen-Vertex** im
+  ungenutzten `.w`-Indexplatz jedes Dreiecks sieht ihn jetzt.
+* Der Epsilon-Mutant traf den `maxAngle > 0`-Arm, während die entartete Anheftung
+  im `else`-Arm lag.
+
+### Die vier Überlebenden, mit Begründung statt Nachsicht
+
+| Überlebender | Befund |
+|---|---|
+| `wi-grid-stride` | **Begründetes Äquivalent**, seit P9.31 dokumentiert. |
+| `cone-normalize-rsqrt` | **Gemessenes Äquivalent** — P9.33a, 258442 Eingaben, bitgleich. Dass der Fegedurchgang es bestätigt, ist die Messung von der anderen Seite. |
+| `wtot-gate-ge` | **Beweisbar äquivalent.** `wTot = Σ bary_k² · invMass_k ≥ 0`; wird es null, ist **jedes** `b0w_k` und `b1w_k` null, also überspringt die Streuung ohnehin jede Ecke. Der Unterschied ist eine Division durch null in einem Wert, den niemand liest. |
+| `d3-cloth-tet-scatter-armed` | **Beweisbar äquivalent, allein.** `b0w.w` wird von nichts gelesen: `wTot0` hat drei Terme, `updateTriPositionDelta` fasst `.w` nicht an. Der zugehörige `…-call`-Mutant, der die Streuung wirklich tauscht, **fällt**. |
+
+### Verifikation
+
+* Fegen **32 von 36** — zwangsfrisch, 0 Anker-Fehler, alle 36 Anker vorab auf
+  Eindeutigkeit geprüft; jeder Modul-Mutant zusätzlich gegen die
+  **Geschwister**-Vorrichtung gefahren, damit eine Änderung am gemeinsamen Modul
+  nicht durchkommt, indem sie nur den Kernel dieser Tranche bricht;
+* zehn Anheftungen **bitweise** gegen den Host-Spiegel, mit je einem Zustand für
+  jeden Kegelarm, zwei entarteten, sechs geprüften Null-Gewichts-Ecken, dem
+  Zeugen-Vertex und dem Wächter auf `mAccumulatedDeltaPos`;
+* Abdeckungslauf über **262400** Anheftungen bei Elementindizes jenseits von
+  65536: Schreiberzahlen exakt 257 auf den ersten 256 Elementen und 256 auf dem
+  Rest, hergeleitet statt angenommen;
+* Suite **822/822** in beiden Speichermodi — Modus 2 im **zweiten** Anlauf;
+* Szenen **33 ok, 0 fail, 0 missing (von 33)** nach dem Neubau von `build-sdk`
+  wegen der Manifeständerung.
+
+
 ## P9.33b — der Kegelzweig ist nicht schlafend, und meine eigene Kopfnotiz behauptete es fünf Tranchen lang
 
 Diese Tranche portiert ebenfalls nichts. Sie korrigiert eine **falsche Behauptung
@@ -1758,12 +1891,24 @@ Softbody-Tuch. Also `minDist = 0`, und `isConeLimitedEnabled` ist ein **ODER**
 dreier `>= 0`-Tests. `0 >= 0` hält. Der Zweig läuft für **jede** Anheftung in
 **jeder** Szene.
 
-Er fällt dort auch nicht auf die Identität zusammen: `len` klemmt in
-`[0, 0] = 0`, das Ergebnis ist also `relPos - 0·dir = relPos` — aber `relPos` ist
-das Argument, und der Aufrufer hat es bereits als
-`relPos1 - worldAxis · constraintOffset` gebaut. Der Versatz beißt weiter, und
-`worldAxis` kostet weiter eine Normalisierung. Was der Vorgabefall **wirklich**
-abschaltet, ist nur die Transzendente.
+**Nachtrag, weil ich hier zu viel behauptet habe.** Der erste Text dieser Tranche
+schrieb: „Der Versatz beißt weiter." Das stimmt für den **Code**, nicht für eine
+Szene. `len` klemmt in `[0, 0] = 0`, das Ergebnis ist also `relPos - 0·dir =
+relPos` — und `relPos` ist das Argument, das der Aufrufer als
+`relPos1 - worldAxis · constraintOffset` gebaut hat. Ob der Zweig also **irgendeine
+Zahl** ändert, hängt allein an `constraintOffset`, und der ist über die
+öffentliche Schnittstelle fest null: `NpDeformableAttachment.cpp:349`
+(Volumen-Volumen) und `:353` (Volumen-Fläche) übergeben beide `NULL, 0.0f`. Damit
+ist `error == relPos1` exakt, und der Zweig ist numerisch die Identität.
+
+Die **praktische** Schlussfolgerung von P8.19 — in einer Szene passiert hier
+nichts Beobachtbares — war also richtig, nur die Begründung war falsch. Und die
+Begründung ist das, was ein Port richtig haben muss: der Zweig **wird betreten**,
+die Normalisierung **wird gerechnet**, und wer die Kern-Schnittstelle direkt
+aufruft, kann einen Versatz ungleich null oder eine echte
+`PxConeLimitedConstraint` übergeben und alles davon sichtbar machen. Deshalb wird
+er wörtlich übertragen und die Vorrichtung fährt jeden Arm an, statt ihn als
+unerreichbar abzuschreiben.
 
 ### Zwei Löcher in der Vorrichtung, die daraus folgten
 

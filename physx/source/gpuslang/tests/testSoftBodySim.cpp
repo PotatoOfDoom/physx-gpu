@@ -11272,4 +11272,591 @@ PXG_TEST(softBodySimFemAttachmentSolve)
         dev->destroyBuffer(h);
 }
 
+
+// ---------------------------------------------------------------------------
+// P9.33c: sb_solveOutputClothAttachmentDeltaVLaunch (softBodyGM.cu:2424, launch
+// PxgSoftBodyCore.cpp:2005) -- a softbody TETRAHEDRON pinned to a cloth TRIANGLE, the third
+// and last consumer of PxgFEMFEMAttachmentConstraint.
+// ---------------------------------------------------------------------------
+namespace p933att
+{
+struct ClothSbAttachSolvePush
+{
+    uint64_t softbodies, clothes, attachments;
+    uint32_t numAttachments, pad28;
+};
+static_assert(sizeof(ClothSbAttachSolvePush) == 32, "cloth-sb attach solve blob must be 32 bytes");
+static_assert(offsetof(ClothSbAttachSolvePush, clothes) == 8, "clothes @8");
+static_assert(offsetof(ClothSbAttachSolvePush, attachments) == 16, "attachments @16");
+static_assert(offsetof(ClothSbAttachSolvePush, numAttachments) == 24, "numAttachments @24");
+// The sibling's blob is 24 bytes with attachments @8.  Stated as a compile-time fact so the
+// two cannot quietly become interchangeable.
+static_assert(sizeof(ClothSbAttachSolvePush) != sizeof(p819att::FemAttachSolvePush),
+              "the three- and four-argument attachment solves must not share a blob");
+
+static const uint32_t CLOTH_ID_SHIFT = 20u;
+static const uint32_t CLOTH_ELEM_MASK = 0x000fffffu;
+static uint32_t encodeCloth(uint32_t clothId, uint32_t elem)
+{
+    return (clothId << CLOTH_ID_SHIFT) | elem;
+}
+} // namespace p933att
+
+PXG_TEST(softBodySimClothAttachmentSolve)
+{
+    using namespace p819att;
+    using namespace p933att;
+    using p80refit::TetIdx4;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // Softbody id 2 and cloth id 3 -- never 0 on either side, so a port that forgets a shift
+    // lands on a zeroed descriptor rather than on a plausible one.
+    const uint32_t SB_ID = 2u, CLOTH_ID = 3u;
+
+    // NINE attachments, each with its own tetrahedron and its own triangle, all vertices
+    // disjoint, so every expected delta can be read on its own.  The table below is what the
+    // first sweep forced: with six attachments and one fixed barycentric, four mutants were
+    // no-ops against the rig rather than against the code.
+    //
+    //   idx  cone state        cloth weights
+    //    0   engine default    corner 0 has inverse mass 0
+    //    1   maxDist-enabled   corner 1 has inverse mass 0
+    //    2   DISABLED          corner 2 has inverse mass 0
+    //    3   real cone, out    corner 0 has barycentric 0
+    //    4   real cone, in     corner 1 has barycentric 0
+    //    5   engine default    corner 2 has barycentric 0
+    //    6   real cone         DEGENERATE: the cloth anchor coincides with the softbody one
+    //                          and the constraint offset is 0, so relPos is exactly zero and
+    //                          `(len > 1e-6f) ? relPos/len : coneAxis` takes its GUARDED arm.
+    //                          Dropping the guard is a 0/0 that only shows up here.
+    //    7   engine default    DEGENERATE again -- the guard is written TWICE, once in the
+    //                          maxAngle > 0 arm and once in the else arm, and the first sweep
+    //                          reached only one of them.  One degenerate attachment per arm.
+    //    8   engine default    all three corners weighted (the positive control)
+    //    9   engine default    fully pinned on both sides -> wTot == 0
+    static const F4 CONE_STATE[10] = {
+        F4{ 0.0f, 0.0f, -1.0f, 0.0f },     // engine default: enabled via minDist
+        F4{ -1.0f, 0.5f, -1.0f, 0.0f },    // enabled via maxDist
+        F4{ -1.0f, -1.0f, -1.0f, 0.0f },   // disabled -- the only state reaching the else arm
+        F4{ -1.0f, -1.0f, 0.30f, 0.0f },   // real cone, relPos outside -> the sin/cos arm
+        F4{ -1.0f, -1.0f, 3.00f, 0.0f },   // real cone, relPos inside  -> deviation skipped
+        F4{ 0.0f, 0.0f, -1.0f, 0.0f },     // 5: zero-barycentric corner 2
+        F4{ -1.0f, -1.0f, 0.30f, 0.0f },   // 6: real cone AND degenerate -> the angle arm's guard
+        F4{ 0.0f, 0.0f, -1.0f, 0.0f },     // 7: engine default AND degenerate -> the else arm's
+        F4{ 0.0f, 0.0f, -1.0f, 0.0f },     // 8: the all-weighted positive control
+        F4{ 0.0f, 0.0f, -1.0f, 0.0f },     // 9: fully pinned
+    };
+    static const float PX_MAX_REAL_HOST = 3.4028235e38f;
+    const uint32_t NB_ATT = 10u;
+    const uint32_t PINNED_ATT = 9u;
+    auto isDegenerate = [](uint32_t a) { return a == 6u || a == 7u; };
+    auto zeroMassCorner = [](uint32_t a) -> int { return (a < 3u) ? int(a) : -1; };
+    auto zeroBaryCorner = [](uint32_t a) -> int { return (a >= 3u && a < 6u) ? int(a - 3u) : -1; };
+
+    // The softbody barycentric is fixed; tet corner 1 always carries inverse mass 0.
+    const F4 BARY_SB{ 0.1f, 0.2f, 0.3f, 0.4f };
+    // `barycentric0.w` is a JUNK NON-ZERO value on every attachment.  The engine always writes
+    // 0 there (PxgSimulationController.cpp:3840, copied whole by the prepare at
+    // softBodyGM.cu:2073), and the CUDA is immune to it anyway -- b0w.w is a written literal
+    // 0.0f, wTot0 sums three terms and updateTriPositionDelta never reads .w.  The rig writes
+    // junk precisely BECAUSE the code is supposed to be immune: a port that restores the
+    // fourth term is not, and with a zero there nothing could tell them apart.
+    const float BARY0_W_JUNK = 0.37f;
+
+    std::vector<F4> sbVerts, clothVerts;
+    std::vector<TetIdx4> tets, tris;
+    std::vector<F4> baryCloth(NB_ATT);
+    std::vector<float> constrOffset(NB_ATT, 0.4f);
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        const bool pinned = (a == PINNED_ATT);
+        const bool degenerate = isDegenerate(a);
+        const float ox = 10.0f * float(a);
+        const uint32_t sb = uint32_t(sbVerts.size());
+        const float sbM[4] = { pinned ? 0.0f : 0.5f, 0.0f,
+                               pinned ? 0.0f : 1.5f, pinned ? 0.0f : 2.0f };
+        sbVerts.push_back(F4{ ox,        2.0f, 0.0f, sbM[0] });
+        sbVerts.push_back(F4{ ox + 1.0f, 2.0f, 0.0f, sbM[1] });
+        sbVerts.push_back(F4{ ox,        3.0f, 0.0f, sbM[2] });
+        sbVerts.push_back(F4{ ox,        2.0f, 1.0f, sbM[3] });
+        tets.push_back(TetIdx4{ sb, sb + 1u, sb + 2u, sb + 3u });
+
+        // The cloth barycentric: one corner zeroed on attachments 3..5, and the degenerate
+        // one puts all the weight on corner 0 so its anchor can be placed EXACTLY.
+        F4 bc{ 0.55f, 0.45f, 0.0f, BARY0_W_JUNK };
+        const int zb = zeroBaryCorner(a);
+        if (zb == 0) bc = F4{ 0.0f, 0.6f, 0.4f, BARY0_W_JUNK };
+        else if (zb == 1) bc = F4{ 0.6f, 0.0f, 0.4f, BARY0_W_JUNK };
+        else if (zb == 2) bc = F4{ 0.55f, 0.45f, 0.0f, BARY0_W_JUNK };
+        else if (a >= 6u) bc = F4{ 0.3f, 0.45f, 0.25f, BARY0_W_JUNK };   // all three weighted
+        // (the degenerate pair overrides this two lines down)
+        if (degenerate) { bc = F4{ 1.0f, 0.0f, 0.0f, BARY0_W_JUNK }; constrOffset[a] = 0.0f; }
+        baryCloth[a] = bc;
+
+        const uint32_t cv = uint32_t(clothVerts.size());
+        float cM[3] = { pinned ? 0.0f : 1.0f, pinned ? 0.0f : 3.0f, pinned ? 0.0f : 4.0f };
+        const int zm = zeroMassCorner(a);
+        if (zm >= 0) cM[zm] = 0.0f;
+        if (degenerate)
+        {
+            // pos0 = 1.0 * c0 exactly, so placing c0 on the softbody anchor makes relPos1
+            // exactly zero.  pos1 = sum sbVerts[sb+k] * BARY_SB[k], computed here.
+            const float px = ox * (BARY_SB.x + BARY_SB.z + BARY_SB.w) + (ox + 1.0f) * BARY_SB.y;
+            const float py = 2.0f * BARY_SB.x + 2.0f * BARY_SB.y + 3.0f * BARY_SB.z + 2.0f * BARY_SB.w;
+            const float pz = 1.0f * BARY_SB.w;
+            clothVerts.push_back(F4{ px, py, pz, cM[0] });
+        }
+        else
+        {
+            clothVerts.push_back(F4{ ox, 0.0f, 0.0f, cM[0] });
+        }
+        clothVerts.push_back(F4{ ox + 1.3f, 0.2f, 0.0f, cM[1] });
+        clothVerts.push_back(F4{ ox + 0.4f, 1.1f, 0.0f, cM[2] });
+        tris.push_back(TetIdx4{ cv, cv + 1u, cv + 2u, 0u });   // .w patched below
+    }
+    // A WITNESS vertex, weighted and in bounds, sitting in every triangle's unused .w slot.
+    // The engine puts 0 there (PxgFEMCloth.cpp:152); a port that kept the tetrahedron's
+    // four-corner scatter would write this vertex, and the check below says it must not.
+    const uint32_t WITNESS = uint32_t(clothVerts.size());
+    clothVerts.push_back(F4{ -100.0f, -100.0f, -100.0f, 9.0f });
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+        tris[a].w = WITNESS;
+
+    DevBuf bSbV = makeDev(dev, sbVerts);
+    if (!bSbV.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bSbV.h); return; }
+    DevBuf bClV = makeDev(dev, clothVerts), bTets = makeDev(dev, tets), bTris = makeDev(dev, tris);
+    std::vector<F4> sbDelta(sbVerts.size(), F4{ 0, 0, 0, 0 });
+    std::vector<F4> clDelta(clothVerts.size(), F4{ 0, 0, 0, 0 });
+    // The slot AFTER mDeltaPos in the cloth descriptor, seeded with a sentinel: if the port
+    // writes mAccumulatedDeltaPos instead, this buffer moves and mDeltaPos stays at zero.
+    std::vector<F4> clAccum(clothVerts.size(), F4{ -7.0f, -7.0f, -7.0f, -7.0f });
+    DevBuf bSbD = makeDev(dev, sbDelta), bClD = makeDev(dev, clDelta), bClA = makeDev(dev, clAccum);
+
+    std::vector<PxgSoftBody> sbArr(SB_ID + 1u, makeZeroDesc());
+    sbArr[SB_ID].mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bSbV.addr));
+    sbArr[SB_ID].mSimTetIndices = reinterpret_cast<uint4*>(size_t(bTets.addr));
+    sbArr[SB_ID].mSimDelta = reinterpret_cast<float4*>(size_t(bSbD.addr));
+    DevBuf bSbDesc = makeDev(dev, sbArr);
+
+    std::vector<PxgFEMCloth> clArr(CLOTH_ID + 1u);
+    std::memset(clArr.data(), 0, clArr.size() * sizeof(PxgFEMCloth));
+    clArr[CLOTH_ID].mPosition_InvMass = reinterpret_cast<float4*>(size_t(bClV.addr));
+    clArr[CLOTH_ID].mTriangleVertexIndices = reinterpret_cast<uint4*>(size_t(bTris.addr));
+    clArr[CLOTH_ID].mDeltaPos = reinterpret_cast<float4*>(size_t(bClD.addr));
+    clArr[CLOTH_ID].mAccumulatedDeltaPos = reinterpret_cast<float4*>(size_t(bClA.addr));
+    clArr[CLOTH_ID].mNbVerts = uint32_t(clothVerts.size());
+    clArr[CLOTH_ID].mNbTriangles = NB_ATT;
+    DevBuf bClDesc = makeDev(dev, clArr);
+
+    // ---- the constraint block ---------------------------------------------------------
+    std::vector<uint32_t> con(((NB_ATT + 31u) / 32u) * FAC_STRIDE / 4, 0u);
+    auto putF4 = [&](size_t byteOff, F4 v) {
+        const size_t w = byteOff / 4;
+        con[w] = f2u(v.x); con[w + 1] = f2u(v.y); con[w + 2] = f2u(v.z); con[w + 3] = f2u(v.w);
+    };
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        // Both slots are PxU64 read as PxU32.  The upper words carry a pattern so a uint2
+        // read produces an id far outside either descriptor array.
+        const size_t w0 = (FAC_ELEMID0 + a * 8) / 4;
+        con[w0] = encodeCloth(CLOTH_ID, a);          // elemId0 is the CLOTH
+        con[w0 + 1] = 0xC1C10000u | a;
+        const size_t w1 = (FAC_ELEMID1 + a * 8) / 4;
+        con[w1] = encodeSb(SB_ID, a);                // elemId1 is the SOFTBODY
+        con[w1 + 1] = 0x5B5B0000u | a;
+        putF4(FAC_BARYCENTRIC0 + a * 16, baryCloth[a]);
+        putF4(FAC_BARYCENTRIC1 + a * 16, BARY_SB);
+        putF4(FAC_LOW_HIGH_ANGLES + a * 16, CONE_STATE[a]);
+        // The cone axis comes from `pos1 - projectP` over the SOFTBODY's four corners.
+        putF4(FAC_ATT_BARYCENTRIC + a * 16, F4{ 0.0f, 1.0f, 0.0f, 0.0f });
+        con[(FAC_CONSTR_OFFSET + a * 4) / 4] = f2u(constrOffset[a]);
+    }
+    DevBuf bCon = makeDev(dev, con);
+
+    ClothSbAttachSolvePush push = {};
+    push.softbodies = bSbDesc.addr;
+    push.clothes = bClDesc.addr;
+    push.attachments = bCon.addr;
+    push.numAttachments = NB_ATT;
+    Kernel k("softBodyClothAttachBda.spv", "sb_solveOutputClothAttachmentDeltaVLaunch",
+             {}, sizeof(ClothSbAttachSolvePush));
+    k.dispatch(1024u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // ---- the mirror, transcribed from softBodyGM.cu:2424 --------------------------------
+    std::vector<F4> refSb(sbVerts.size(), F4{ 0, 0, 0, 0 });
+    std::vector<F4> refCl(clothVerts.size(), F4{ 0, 0, 0, 0 });
+    uint32_t skippedByMass = 0u, coneBranchTaken = 0u, sincosTaken = 0u, epsGuardTaken = 0u;
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        const uint32_t sb = a * 4u, cv = a * 3u;
+        const F4 BARY_CLOTH = baryCloth[a];
+        const float OFFSET = constrOffset[a];
+        // Four terms on the softbody side, THREE on the cloth side.
+        auto blend4 = [&](const std::vector<F4>& v, uint32_t b, F4 w) {
+            return F4{ v[b].x * w.x + v[b+1].x * w.y + v[b+2].x * w.z + v[b+3].x * w.w,
+                       v[b].y * w.x + v[b+1].y * w.y + v[b+2].y * w.z + v[b+3].y * w.w,
+                       v[b].z * w.x + v[b+1].z * w.y + v[b+2].z * w.z + v[b+3].z * w.w, 0.0f };
+        };
+        auto blend3 = [&](const std::vector<F4>& v, uint32_t b, F4 w) {
+            return F4{ v[b].x * w.x + v[b+1].x * w.y + v[b+2].x * w.z,
+                       v[b].y * w.x + v[b+1].y * w.y + v[b+2].y * w.z,
+                       v[b].z * w.x + v[b+1].z * w.y + v[b+2].z * w.z, 0.0f };
+        };
+        const F4 pos1 = blend4(sbVerts, sb, BARY_SB);
+        const F4 pos0 = blend3(clothVerts, cv, BARY_CLOTH);
+        float ex = pos1.x - pos0.x, ey = pos1.y - pos0.y, ez = pos1.z - pos0.z;
+
+        const F4 lha = CONE_STATE[a];
+        const float minDist = lha.x, maxDist = lha.y, maxAngle = lha.z;
+        if (maxAngle >= 0.0f || minDist >= 0.0f || maxDist >= 0.0f)
+        {
+            ++coneBranchTaken;
+            // D4: projectP over the SOFTBODY's corners, and `pos1 - projectP` -- the sibling
+            // is `projectP - pos0` over the other body's corners, i.e. the negation.
+            const F4 proj = blend4(sbVerts, sb, F4{ 0.0f, 1.0f, 0.0f, 0.0f });
+            float ax = pos1.x - proj.x, ay = pos1.y - proj.y, az = pos1.z - proj.z;
+            const float am2 = ax * ax + ay * ay + az * az;
+            if (am2 > 0.0f)
+            { const float rs = 1.0f / std::sqrt(am2); ax *= rs; ay *= rs; az *= rs; }
+            else { ax = ay = az = 0.0f; }
+            const float rx = ex - ax * OFFSET, ry = ey - ay * OFFSET, rz = ez - az * OFFSET;
+            float len = std::sqrt(rx * rx + ry * ry + rz * rz);
+            if (!(len > 1e-6f)) ++epsGuardTaken;
+
+            float dirx, diry, dirz;
+            if (maxAngle == 0.0f) { dirx = ax; diry = ay; dirz = az; }
+            else if (maxAngle > 0.0f)
+            {
+                dirx = (len > 1e-6f) ? rx / len : ax;
+                diry = (len > 1e-6f) ? ry / len : ay;
+                dirz = (len > 1e-6f) ? rz / len : az;
+                const float cosAngle = dirx * ax + diry * ay + dirz * az;
+                const float sinMax = std::sin(maxAngle), cosMax = std::cos(maxAngle);
+                if (cosAngle < cosMax)
+                {
+                    ++sincosTaken;
+                    const float t1x = diry * az - dirz * ay;
+                    const float t1y = dirz * ax - dirx * az;
+                    const float t1z = dirx * ay - diry * ax;
+                    float b1x = ay * t1z - az * t1y;
+                    float b1y = az * t1x - ax * t1z;
+                    float b1z = ax * t1y - ay * t1x;
+                    const float bm2 = b1x * b1x + b1y * b1y + b1z * b1z;
+                    if (bm2 > 0.0f)
+                    { const float rs = 1.0f / std::sqrt(bm2); b1x *= rs; b1y *= rs; b1z *= rs; }
+                    else { b1x = b1y = b1z = 0.0f; }
+                    dirx = cosMax * ax + sinMax * b1x;
+                    diry = cosMax * ay + sinMax * b1y;
+                    dirz = cosMax * az + sinMax * b1z;
+                }
+            }
+            else
+            {
+                dirx = (len > 1e-6f) ? rx / len : ax;
+                diry = (len > 1e-6f) ? ry / len : ay;
+                dirz = (len > 1e-6f) ? rz / len : az;
+            }
+            len = std::fmin(std::fmax(len, minDist), maxDist >= 0.0f ? maxDist : PX_MAX_REAL_HOST);
+            ex = rx - len * dirx; ey = ry - len * diry; ez = rz - len * dirz;
+        }
+
+        // D2: b0w.w is a literal zero and wTot0 has THREE terms.
+        const float b0w[4] = { BARY_CLOTH.x * clothVerts[cv].w, BARY_CLOTH.y * clothVerts[cv+1].w,
+                               BARY_CLOTH.z * clothVerts[cv+2].w, 0.0f };
+        const float b1w[4] = { BARY_SB.x * sbVerts[sb].w, BARY_SB.y * sbVerts[sb+1].w,
+                               BARY_SB.z * sbVerts[sb+2].w, BARY_SB.w * sbVerts[sb+3].w };
+        const float bb0[4] = { BARY_CLOTH.x, BARY_CLOTH.y, BARY_CLOTH.z, BARY_CLOTH.w };
+        const float bb1[4] = { BARY_SB.x, BARY_SB.y, BARY_SB.z, BARY_SB.w };
+        float wTot0 = 0.0f, wTot1 = 0.0f;
+        for (int c = 0; c < 3; ++c) wTot0 += b0w[c] * bb0[c];     // THREE
+        for (int c = 0; c < 4; ++c) wTot1 += b1w[c] * bb1[c];     // four
+        const float wTot = wTot0 + wTot1;
+        if (!(wTot > 0.0f)) { ++skippedByMass; continue; }
+
+        const float inv = 1.0f / wTot;
+        const float dx = ex * inv, dy = ey * inv, dz = ez * inv;
+        for (int c = 0; c < 4; ++c)
+            if (b1w[c] > 0.0f)
+            {
+                refSb[sb + c].x += -dx * b1w[c]; refSb[sb + c].y += -dy * b1w[c];
+                refSb[sb + c].z += -dz * b1w[c]; refSb[sb + c].w += 1.0f;
+            }
+        for (int c = 0; c < 3; ++c)               // D3: three corners, each skippable
+            if (b0w[c] > 0.0f)
+            {
+                refCl[cv + c].x += dx * b0w[c]; refCl[cv + c].y += dy * b0w[c];
+                refCl[cv + c].z += dz * b0w[c]; refCl[cv + c].w += 1.0f;
+            }
+    }
+
+    const auto gSb = downloadBuffer<F4>(dev, bSbD.h, uint32_t(sbVerts.size()));
+    const auto gCl = downloadBuffer<F4>(dev, bClD.h, uint32_t(clothVerts.size()));
+    const auto gAcc = downloadBuffer<F4>(dev, bClA.h, uint32_t(clothVerts.size()));
+
+    // BITWISE.  Every vertex has exactly one writer, and P9.33b removed the tolerance that
+    // hid three association defects in the sibling's mirror.
+    uint32_t mm = 0u;
+    auto cmp = [&](const std::vector<F4>& got, const std::vector<F4>& ref, const char* tag) {
+        for (uint32_t v = 0; v < uint32_t(ref.size()); ++v)
+            if (f2u(got[v].x) != f2u(ref[v].x) || f2u(got[v].y) != f2u(ref[v].y) ||
+                f2u(got[v].z) != f2u(ref[v].z) || f2u(got[v].w) != f2u(ref[v].w))
+            {
+                if (mm == 0u)
+                    std::printf("    first %s difference at vertex %u: gpu (%.9g %.9g %.9g | %.9g)"
+                                " vs (%.9g %.9g %.9g | %.9g)\n", tag, v,
+                                got[v].x, got[v].y, got[v].z, got[v].w,
+                                ref[v].x, ref[v].y, ref[v].z, ref[v].w);
+                ++mm;
+            }
+    };
+    cmp(gSb, refSb, "softbody");
+    cmp(gCl, refCl, "cloth");
+    PXG_CHECK_MSG(mm == 0u, "%u vertex deltas differ from the mirror", mm);
+
+    // D1: mDeltaPos, not the slot next to it.
+    uint32_t accTouched = 0u;
+    for (uint32_t v = 0; v < uint32_t(clothVerts.size()); ++v)
+        if (gAcc[v].x != -7.0f || gAcc[v].y != -7.0f || gAcc[v].z != -7.0f || gAcc[v].w != -7.0f)
+            ++accTouched;
+    PXG_CHECK_MSG(accTouched == 0u,
+                  "%u words of mAccumulatedDeltaPos moved; the cloth output is mDeltaPos, which "
+                  "sits one pointer slot earlier in the descriptor", accTouched);
+
+    auto isZero = [&](F4 g) { return g.x == 0.0f && g.y == 0.0f && g.z == 0.0f && g.w == 0.0f; };
+    // D2/D3: the triangle has THREE corners, and the fourth index slot is not one of them.
+    PXG_CHECK_MSG(isZero(gCl[WITNESS]),
+                  "the witness vertex sits in every triangle's unused .w index slot and must "
+                  "never be written; a port that kept the tetrahedron's four-corner scatter "
+                  "would have moved it (got %g %g %g | %g)",
+                  gCl[WITNESS].x, gCl[WITNESS].y, gCl[WITNESS].z, gCl[WITNESS].w);
+
+    // The structural facts the mirror shares the port's reading of, so it cannot pin them.
+    PXG_CHECK_MSG(skippedByMass == 1u,
+                  "exactly one attachment must be skipped for wTot == 0, not %u", skippedByMass);
+    PXG_CHECK_MSG(coneBranchTaken == NB_ATT - 1u,
+                  "the cone gate must fire on every state but the disabled one (%u of %u)",
+                  coneBranchTaken, NB_ATT);
+    PXG_CHECK_MSG(sincosTaken == 1u,
+                  "exactly one cone state must reach the sin/cos arm; %u did.  Two real cones "
+                  "are seeded on purpose, one outside and one inside, so that "
+                  "`cosAngle < cosMaxAngle` is straddled rather than only ever true",
+                  sincosTaken);
+    PXG_CHECK_MSG(epsGuardTaken == 2u,
+                  "exactly two attachments must reach the `len > 1e-6f` guard's FALSE arm -- one "
+                  "in the maxAngle > 0 arm and one in the else arm, because the guard is written "
+                  "twice; %u did.  Without both, dropping one of them is a division that never "
+                  "divides by zero and the mutant survives", epsGuardTaken);
+
+    // D3's two skip reasons, in EACH of the three cloth corner slots.  The first sweep put
+    // its zeros in corners 1 and 2 only, so the mutant that drops corner 0's guard was a
+    // no-op against the rig rather than against the code.
+    uint32_t zeroWeightChecked = 0u;
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        if (a == PINNED_ATT) continue;
+        const int slots[2] = { zeroMassCorner(a), zeroBaryCorner(a) };
+        for (int which = 0; which < 2; ++which)
+        {
+            const int c = slots[which];
+            if (c < 0) continue;
+            PXG_CHECK_MSG(isZero(gCl[a * 3u + uint32_t(c)]),
+                          "cloth corner %d of attachment %u carries zero weight (%s) and must "
+                          "take no write at all -- not even the .w counter", c, a,
+                          which == 0 ? "inverse mass" : "barycentric");
+            ++zeroWeightChecked;
+        }
+    }
+    PXG_CHECK_MSG(zeroWeightChecked == 6u,
+                  "the rig must place a zero cloth weight in each of the three corner slots for "
+                  "both reasons; %u were found", zeroWeightChecked);
+    // The positive control: attachment 8 weights all three corners, so all three must move.
+    for (uint32_t c = 0; c < 3u; ++c)
+        PXG_CHECK_MSG(!isZero(gCl[8u * 3u + c]),
+                      "attachment 8 weights all three cloth corners; corner %u was not written", c);
+    for (uint32_t a = 0; a + 1u < NB_ATT; ++a)
+        PXG_CHECK_MSG(isZero(gSb[a * 4u + 1u]),
+                      "softbody corner 1 of attachment %u has inverse mass 0", a);
+    for (uint32_t c = PINNED_ATT * 4u; c < PINNED_ATT * 4u + 4u; ++c)
+        PXG_CHECK_MSG(isZero(gSb[c]), "the fully pinned attachment must leave the softbody alone");
+    for (uint32_t c = PINNED_ATT * 3u; c < PINNED_ATT * 3u + 3u; ++c)
+        PXG_CHECK_MSG(isZero(gCl[c]), "the fully pinned attachment must leave the cloth alone");
+
+    // States 3 and 4 straddle `cosAngle < cosMaxAngle`; identical corrections would mean the
+    // rig is on one side of the test and a port that dropped it would pass.
+    PXG_CHECK_MSG(f2u(gCl[3u * 3u + 1u].x) != f2u(gCl[4u * 3u + 0u].x) ||
+                  f2u(gCl[3u * 3u + 1u].y) != f2u(gCl[4u * 3u + 0u].y),
+                  "cone states 3 (outside) and 4 (inside) produced identical corrections");
+
+    std::printf("    [ note ] %u attachments (%u through the cone gate, %u reaching sin/cos, "
+                "%u on the near-zero guard, %u skipped for wTot == 0); %u zero-weight cloth "
+                "corners checked, %zu vertex deltas bit-exact, witness and "
+                "mAccumulatedDeltaPos untouched\n",
+                NB_ATT, coneBranchTaken, sincosTaken, epsGuardTaken, skippedByMass,
+                zeroWeightChecked, sbVerts.size() + clothVerts.size());
+
+    for (PxgBufferHandle h : { bSbV.h, bClV.h, bTets.h, bTris.h, bSbD.h, bClD.h, bClA.h,
+                               bSbDesc.h, bClDesc.h, bCon.h })
+        dev->destroyBuffer(h);
+}
+
+
+// ---------------------------------------------------------------------------
+// P9.33c coverage rig.  Dropping the `nbIterationsPerBlock *` factor from the work index
+// makes the per-block ranges OVERLAP, so the tail is never visited and everything else is
+// visited twice -- but only past gridDim*blockDim = 1024*256 = 262144 attachments, below
+// which nbIterationsPerBlock is 1 and the formula collapses to a flat index.
+//
+// The small fixture above cannot see that, so this one runs 262400 attachments.  It does NOT
+// give each its own vertices: 262400 tetrahedra and triangles would be ~90 MB of buffers to
+// answer a question about visit counts.  Instead the attachments cycle over 1024 elements, and
+// the `.w` lane of each vertex is an exact integer count of how many attachments reached it --
+// 257 for the first 256 elements and 256 for the rest, which is a number the rig derives
+// rather than assumes.  A dropped factor changes both the totals and their distribution.
+// ---------------------------------------------------------------------------
+PXG_TEST(softBodySimClothAttachmentCoverage)
+{
+    using namespace p819att;
+    using namespace p933att;
+    using p80refit::TetIdx4;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t SB_ID = 1u, CLOTH_ID = 1u;
+    const uint32_t GRID = 1024u, BLOCK = 256u;
+    const uint32_t NB_ATT = 262400u;          // 1025 blocks required over a 1024-wide grid
+    const uint32_t NB_ELEM = 1024u;           // the element ring the attachments cycle over
+    // The ring sits ABOVE 65536 so the ELEMENT MASK's width is observable.  The engine's mask
+    // is 0x000fffff (20 bits); a port that narrowed it to 0x0000ffff would fold index
+    // ELEM_BASE+e down to ELEM_BASE+e-65536, which is a different, still in-bounds element --
+    // so the counts land on the wrong tetrahedra rather than faulting, and only a rig that
+    // crosses the boundary can tell.  Indices below it were the last gap the first sweep left.
+    const uint32_t ELEM_BASE = 66000u;
+    const uint32_t NB_SLOTS = ELEM_BASE + NB_ELEM;   // index arrays only; vertices stay small
+
+    const uint32_t nbBlocksRequired = (NB_ATT + BLOCK - 1u) / BLOCK;
+    const uint32_t nbIterationsPerBlock = (nbBlocksRequired + GRID - 1u) / GRID;
+    PXG_CHECK_MSG(nbIterationsPerBlock == 2u,
+                  "the rig must reach two iterations per thread, got %u", nbIterationsPerBlock);
+
+    // The index arrays span the whole slot range; only the last NB_ELEM entries are ever
+    // referenced, and the rest point at vertex 0 so a folded index is in bounds and WRONG
+    // rather than out of bounds and fatal.
+    std::vector<F4> sbVerts, clothVerts;
+    std::vector<TetIdx4> tets(NB_SLOTS, TetIdx4{ 0u, 0u, 0u, 0u });
+    std::vector<TetIdx4> tris(NB_SLOTS, TetIdx4{ 0u, 0u, 0u, 0u });
+    for (uint32_t e = 0; e < NB_ELEM; ++e)
+    {
+        const float ox = 4.0f * float(e);
+        const uint32_t sb = uint32_t(sbVerts.size());
+        sbVerts.push_back(F4{ ox,        2.0f, 0.0f, 0.5f });
+        sbVerts.push_back(F4{ ox + 1.0f, 2.0f, 0.0f, 0.5f });
+        sbVerts.push_back(F4{ ox,        3.0f, 0.0f, 0.5f });
+        sbVerts.push_back(F4{ ox,        2.0f, 1.0f, 0.5f });
+        tets[ELEM_BASE + e] = TetIdx4{ sb, sb + 1u, sb + 2u, sb + 3u };
+        const uint32_t cv = uint32_t(clothVerts.size());
+        clothVerts.push_back(F4{ ox,        0.0f, 0.0f, 1.0f });
+        clothVerts.push_back(F4{ ox + 1.0f, 0.0f, 0.0f, 1.0f });
+        clothVerts.push_back(F4{ ox,        1.0f, 0.0f, 1.0f });
+        tris[ELEM_BASE + e] = TetIdx4{ cv, cv + 1u, cv + 2u, 0u };
+    }
+
+    DevBuf bSbV = makeDev(dev, sbVerts);
+    if (!bSbV.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bSbV.h); return; }
+    DevBuf bClV = makeDev(dev, clothVerts), bTets = makeDev(dev, tets), bTris = makeDev(dev, tris);
+    std::vector<F4> sbDelta(sbVerts.size(), F4{ 0, 0, 0, 0 });
+    std::vector<F4> clDelta(clothVerts.size(), F4{ 0, 0, 0, 0 });
+    DevBuf bSbD = makeDev(dev, sbDelta), bClD = makeDev(dev, clDelta);
+
+    std::vector<PxgSoftBody> sbArr(SB_ID + 1u, makeZeroDesc());
+    sbArr[SB_ID].mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bSbV.addr));
+    sbArr[SB_ID].mSimTetIndices = reinterpret_cast<uint4*>(size_t(bTets.addr));
+    sbArr[SB_ID].mSimDelta = reinterpret_cast<float4*>(size_t(bSbD.addr));
+    DevBuf bSbDesc = makeDev(dev, sbArr);
+
+    std::vector<PxgFEMCloth> clArr(CLOTH_ID + 1u);
+    std::memset(clArr.data(), 0, clArr.size() * sizeof(PxgFEMCloth));
+    clArr[CLOTH_ID].mPosition_InvMass = reinterpret_cast<float4*>(size_t(bClV.addr));
+    clArr[CLOTH_ID].mTriangleVertexIndices = reinterpret_cast<uint4*>(size_t(bTris.addr));
+    clArr[CLOTH_ID].mDeltaPos = reinterpret_cast<float4*>(size_t(bClD.addr));
+    clArr[CLOTH_ID].mNbVerts = uint32_t(clothVerts.size());
+    clArr[CLOTH_ID].mNbTriangles = NB_SLOTS;
+    DevBuf bClDesc = makeDev(dev, clArr);
+
+    const uint32_t NB_BLOCKS = (NB_ATT + 31u) / 32u;
+    std::vector<uint32_t> con(size_t(NB_BLOCKS) * FAC_STRIDE / 4, 0u);
+    const F4 BARY_SB{ 0.25f, 0.25f, 0.25f, 0.25f };
+    const F4 BARY_CLOTH{ 0.25f, 0.35f, 0.40f, 0.0f };
+    std::vector<uint32_t> expect(NB_ELEM, 0u);
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        const uint32_t e = a % NB_ELEM;
+        ++expect[e];
+        const size_t base = size_t(a / 32u) * FAC_STRIDE, off = a & 31u;
+        con[(base + FAC_ELEMID0 + off * 8) / 4] = encodeCloth(CLOTH_ID, ELEM_BASE + e);
+        con[(base + FAC_ELEMID1 + off * 8) / 4] = encodeSb(SB_ID, ELEM_BASE + e);
+        const size_t b0 = (base + FAC_BARYCENTRIC0 + off * 16) / 4;
+        con[b0] = f2u(BARY_CLOTH.x); con[b0+1] = f2u(BARY_CLOTH.y); con[b0+2] = f2u(BARY_CLOTH.z);
+        const size_t b1 = (base + FAC_BARYCENTRIC1 + off * 16) / 4;
+        con[b1] = f2u(BARY_SB.x); con[b1+1] = f2u(BARY_SB.y);
+        con[b1+2] = f2u(BARY_SB.z); con[b1+3] = f2u(BARY_SB.w);
+        // The DISABLED cone state, so this rig measures the work index and nothing else.
+        const size_t lh = (base + FAC_LOW_HIGH_ANGLES + off * 16) / 4;
+        con[lh] = f2u(-1.0f); con[lh+1] = f2u(-1.0f); con[lh+2] = f2u(-1.0f);
+    }
+    DevBuf bCon = makeDev(dev, con);
+
+    ClothSbAttachSolvePush push = {};
+    push.softbodies = bSbDesc.addr;
+    push.clothes = bClDesc.addr;
+    push.attachments = bCon.addr;
+    push.numAttachments = NB_ATT;
+    Kernel k("softBodyClothAttachBda.spv", "sb_solveOutputClothAttachmentDeltaVLaunch",
+             {}, sizeof(ClothSbAttachSolvePush));
+    k.dispatch(GRID, {}, push, 1u, 1u);
+    dev->flush();
+
+    const auto gSb = downloadBuffer<F4>(dev, bSbD.h, uint32_t(sbVerts.size()));
+    const auto gCl = downloadBuffer<F4>(dev, bClD.h, uint32_t(clothVerts.size()));
+
+    // Every corner of element e must carry exactly `expect[e]` writers -- all four tet corners
+    // and all three triangle corners, since every weight here is strictly positive.
+    uint32_t wrong = 0u, unvisited = 0u, firstWrong = NB_ELEM;
+    for (uint32_t e = 0; e < NB_ELEM; ++e)
+    {
+        const float want = float(expect[e]);
+        for (uint32_t c = 0; c < 4u; ++c)
+            if (gSb[e * 4u + c].w != want)
+            {
+                if (gSb[e * 4u + c].w == 0.0f) ++unvisited; else ++wrong;
+                if (firstWrong == NB_ELEM) firstWrong = e;
+            }
+        for (uint32_t c = 0; c < 3u; ++c)
+            if (gCl[e * 3u + c].w != want)
+            {
+                if (gCl[e * 3u + c].w == 0.0f) ++unvisited; else ++wrong;
+                if (firstWrong == NB_ELEM) firstWrong = e;
+            }
+    }
+    PXG_CHECK_MSG(unvisited == 0u,
+                  "%u corners were never written (first at element %u); with the strided formula "
+                  "every one of the %u attachments is visited exactly once",
+                  unvisited, firstWrong, NB_ATT);
+    PXG_CHECK_MSG(wrong == 0u,
+                  "%u corners carry a writer count other than the derived one (first at element "
+                  "%u, expected %u, got %g); a count above it means a work index was visited "
+                  "more than once", wrong, firstWrong,
+                  firstWrong < NB_ELEM ? expect[firstWrong] : 0u,
+                  firstWrong < NB_ELEM ? gSb[firstWrong * 4u].w : 0.0f);
+
+    std::printf("    [ note ] %u attachments over %u elements at indices %u..%u (past the "
+                "16-bit boundary on purpose), %u iterations per thread; writer counts exactly "
+                "%u on the first %u elements and %u on the rest\n",
+                NB_ATT, NB_ELEM, ELEM_BASE, ELEM_BASE + NB_ELEM - 1u, nbIterationsPerBlock,
+                expect[0], NB_ATT % NB_ELEM, expect[NB_ELEM - 1u]);
+
+    for (PxgBufferHandle h : { bSbV.h, bClV.h, bTets.h, bTris.h, bSbD.h, bClD.h,
+                               bSbDesc.h, bClDesc.h, bCon.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace

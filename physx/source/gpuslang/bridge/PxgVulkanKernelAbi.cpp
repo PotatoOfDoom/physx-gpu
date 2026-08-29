@@ -852,6 +852,12 @@ static const uint8_t kFemAttachPrep[] = { 8, 8, 4, 8 };
 //   PxgFEMClothCore.cpp:1915 -- has the SAME three-argument signature down to the types'
 //   sizes, so it shares this row rather than duplicating it.
 static const uint8_t kFemAttachSolve[] = { 8, 8, 4 };
+//   P9.33c: sb_solveOutputClothAttachmentDeltaVLaunch(PxgSoftBody* softbodies,
+//   PxgFEMCloth* clothes, PxgFEMFEMAttachmentConstraint* attachments, PxU32 numAttachments)
+//   -- launch site PxgSoftBodyCore.cpp:2005.  FOUR arguments: 8 @0, 8 @8, 8 @16, PxU32 @24
+//   -> 32-byte blob.  It canNOT share kFemAttachSolve above: `clothes` occupies the slot that
+//   row keeps `attachments` in, so reusing it yields a plausible pointer rather than a fault.
+static const uint8_t kClothSbAttachSolve[] = { 8, 8, 8, 4 };
 
 // gpunarrowphase softbody-vs-CLOTH midphase (P8.8):
 //   sb_clothMidphaseGeneratePairsLaunch(PxReal toleranceLength, cmInputs*, transformCache*,
@@ -1806,6 +1812,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_solveOutputSoftBodyAttachmentDeltaVLaunch", kFemAttachSolve, uint32_t(sizeof(kFemAttachSolve)) },
     // gpusimulationcontroller FEMCloth-vs-FEMCloth attachment solve (P9.32 BDA), on the row above
     { "cloth_solveOutputAttachmentClothClothDeltaVLaunch", kFemAttachSolve, uint32_t(sizeof(kFemAttachSolve)) },
+    { "sb_solveOutputClothAttachmentDeltaVLaunch", kClothSbAttachSolve, uint32_t(sizeof(kClothSbAttachSolve)) },
     // gpunarrowphase softbody-vs-CLOTH midphase (P8.8)
     { "sb_clothMidphaseGeneratePairsLaunch", kSbClothMidphase, uint32_t(sizeof(kSbClothMidphase)) },
     { "sb_clothContactGenLaunch", kSbClothContactGen, uint32_t(sizeof(kSbClothContactGen)) },
