@@ -132,6 +132,7 @@
 
 import pxgSlangSdfTexture;
 import pxgSlangCommon;   // quatRotate / quatRotateInv for the two helpers below
+import pxgSlangTetClosest;   // Gu::closestPtPointBaryTriangle (P9.34a)
 
 // PX_MAX_F32, PxSimpleTypes.h:94.
 static const float SDFC_MAX_F32 = 3.4028234663852885981170418348452e+38f;
@@ -361,4 +362,204 @@ float sdfDoVertexCollision(SparseSdfTexture t, float3 v, inout float3 dir, float
     float3 rawGrad, usedGrad, diff;
     float gradMag, dist;
     return sdfDoVertexCollisionEx(t, v, dir, tolerance, tr, rawGrad, gradMag, usedGrad, dist, diff);
+}
+
+
+// ===========================================================================
+// doTriangleSDFCollision, sdfCollision.cuh:402-494 — P9.34a.
+//
+// The whole numeric content of cloth_sdfMeshContactGenLaunch's per-triangle work:
+// a 16-iteration PROJECTED GRADIENT DESCENT over a triangle's barycentric
+// coordinates, looking for the point of the triangle that is deepest inside the
+// SDF.  Everything it calls underneath — PxSdfDistance, PxVolumeGrad,
+// PxSdfSampleWithGrad — is already here from P9.12d, and
+// Gu::closestPtPointBaryTriangle came with P9.34a into pxgSlangTetClosest.
+//
+// THE ORACLE, and its limit.  Same arrangement as doVertexSDFCollision above: the
+// primitives are GPU-only because they Sample() a texture, so no host mirror can
+// predict them.  The Ex variant therefore TRACES the descent — every gradient it
+// received, every uvw it produced, every step it used — and the fixture REPLAYS
+// the iteration on the host from those traced gradients.  What that checks is the
+// composition: the branch cascade, the step schedule, the clamp, the convergence
+// test and where the loop stops.  What it does not check is the gradient values
+// themselves, and it does not have to: those are P9.12c/d's claim, measured there.
+//
+// ---------------------------------------------------------------------------
+// THE TRAPS
+// ---------------------------------------------------------------------------
+//  D1. THE STARTING ITERATE IS AN ASYMMETRIC CASCADE, and it is not "pick the
+//      smallest".  Written out (:420-433):
+//          d0 < d1 && d0 < d2 && d0 < dist -> v0
+//          else if d1 < d2 && d1 < dist    -> v1
+//          else if d2 < dist               -> v2
+//          else                            -> the centroid, uvw = (1/3,1/3,1/3)
+//      The second test does NOT compare against d0.  So with d0 < d1 but
+//      d0 >= d2, the first arm fails and the second can still choose v1 even
+//      though v0 is nearer.  Transcribed as written; a port that "fixes" it into a
+//      three-way minimum changes the starting point and therefore the answer.
+//
+//  D2. `p` IS NOT ASSIGNED IN THE else ARM.  It keeps the centroid it was given
+//      before the cascade, and only `uvw` is set there.  The three vertex arms set
+//      both.
+//
+//  D3. `difference` IS A NESTED MAX OF SQUARED LENGTHS WITH ONE sqrt AT THE END
+//      (:437) — not three lengths maximised.  `step = 1/(2*difference)`.
+//
+//  D4. `step` DECAYS EVERY ITERATION, and the decay happens BETWEEN the uvw update
+//      and the clamp (:470).  A port that decays at the top of the loop, or after
+//      the clamp, runs a different schedule from iteration two onwards.
+//
+//  D5. THE CONVERGENCE TEST USES THE CLAMPED newUVW, and `break` happens BEFORE
+//      `uvw = newUVW` (:476-483).  So on the iteration that converges, `uvw` stays
+//      stale — but `p` has already been recomputed from the clamped value, and `p`
+//      is what leaves the function.  Copying the assignment above the test changes
+//      nothing observable; moving the `p` update below it changes everything.
+//
+//  D6. THE DISCONTINUITY VECTOR IS A DIFFERENT ONE from doVertexSDFCollision's.
+//      Here it is (0.571846586, 0.705545099, 0.418566116) (:455), a truncation of
+//      the full-precision constant in GuContactMeshMesh.h:138; the vertex path uses
+//      (0.5448762, 0.672269, 0.398825).  And unlike that one it is NOT normalised
+//      before use — it is already unit to within a float, and the CUDA assigns it
+//      raw.  Normalising it here would be a port-introduced change.
+//
+//  D7. THE GRADIENT IS RECOMPUTED AFTER THE LOOP (:487) rather than reusing the
+//      last one the loop produced, and the `dist` computed from the centroid at the
+//      top (:409) is DISCARDED — the returned distance comes only from the final
+//      PxSdfSampleWithGrad.
+//
+//  D8. `normalize()` here is PxVec3::normalize (PxVec3.h:295), which returns the
+//      MAGNITUDE and divides in place through operator/= — and operator/=
+//      (PxVec3.h:260) is itself `f = 1.0/f; x *= f;`, a reciprocal multiply.  So it
+//      is the same expression as getNormalized, and the guard is the only
+//      difference: `m > 0` on the magnitude rather than on its square.
+// ===========================================================================
+
+static const float3 SDFC_TRI_DISCONTINUITY_DIR =
+    float3(0.571846586f, 0.705545099f, 0.418566116f);   // D6
+
+static const uint SDF_TRI_MAX_ITERS = 16u;
+
+// One iteration of the descent, as the shader ran it.
+struct SdfTriIterTrace
+{
+    float3 gradRaw;     // PxVolumeGrad before normalise
+    float gradMag;      // what normalize() returned
+    float3 gradUsed;    // after normalise / discontinuity substitution
+    float3 newUvw;      // after closestPtPointBaryTriangle
+    float stepIn;       // the step this iteration multiplied by
+}
+
+struct SdfTriTrace
+{
+    float d0, d1, d2, dCenter;
+    uint startArm;      // 0..2 = that vertex, 3 = the centroid
+    float3 uvw0;
+    float3 p0;
+    float difference;
+    uint iters;         // iterations actually run (1..16)
+    uint converged;     // 1 == the loop broke on the tolerance
+    SdfTriIterTrace it[16];
+    float3 pFinal;
+    float3 gradFinal;   // the RECOMPUTED gradient of D7
+}
+
+float sdfDoTriangleCollisionEx(SparseSdfTexture t, float3 v0, float3 v1, float3 v2,
+                                      out float3 point, inout float3 dir, float tolerance,
+                                      out SdfTriTrace tr)
+{
+    const float third = 1.0f / 3.0f;
+    const float3 center = (v0 + v1 + v2) * third;
+    float3 p = center;
+
+    const float dist = sdfDistance(t, p);
+    const float d0 = sdfDistance(t, v0);
+    const float d1 = sdfDistance(t, v1);
+    const float d2 = sdfDistance(t, v2);
+    tr.d0 = d0; tr.d1 = d1; tr.d2 = d2; tr.dCenter = dist;
+
+    float3 uvw = float3(0.0f, 0.0f, 0.0f);
+
+    // D1: the cascade, exactly as written.  D2: `p` keeps the centroid in the else.
+    if (d0 < d1 && d0 < d2 && d0 < dist)      { p = v0; uvw.x = 1.0f; tr.startArm = 0u; }
+    else if (d1 < d2 && d1 < dist)            { p = v1; uvw.y = 1.0f; tr.startArm = 1u; }
+    else if (d2 < dist)                       { p = v2; uvw.z = 1.0f; tr.startArm = 2u; }
+    else                                      { uvw = float3(third, third, third); tr.startArm = 3u; }
+    tr.uvw0 = uvw;
+    tr.p0 = p;
+
+    // D3: nested max of SQUARED lengths, one sqrt.
+    const float3 e0 = v0 - p, e1 = v1 - p, e2 = v2 - p;
+    const float difference = sqrt(max(dot(e0, e0), max(dot(e1, e1), dot(e2, e2))));
+    tr.difference = difference;
+
+    const float toleranceSq = 1e-3f * 1e-3f;
+
+    float3 sdfGradient = float3(0.0f, 0.0f, 0.0f);
+    float step = 1.0f / (2.0f * difference);
+
+    uint iters = 0u, converged = 0u;
+    for (uint iter = 0u; iter < SDF_TRI_MAX_ITERS; ++iter)
+    {
+        SdfTriIterTrace itr;
+        itr.stepIn = step;
+
+        sdfGradient = sdfVolumeGrad(t, p);
+        itr.gradRaw = sdfGradient;
+
+        // D8: PxVec3::normalize() -- returns the magnitude, divides only when positive.
+        const float gm = sdfcMagnitude(sdfGradient);
+        itr.gradMag = gm;
+        if (gm > 0.0f)
+            sdfGradient = sdfGradient * (1.0f / gm);
+        if (gm == 0.0f)
+            sdfGradient = SDFC_TRI_DISCONTINUITY_DIR;   // D6: used RAW, not normalised
+        itr.gradUsed = sdfGradient;
+
+        const float dfdu = sdfcDot(sdfGradient, v0 - p);
+        const float dfdv = sdfcDot(sdfGradient, v1 - p);
+        const float dfdw = sdfcDot(sdfGradient, v2 - p);
+
+        float3 newUVW = uvw;
+        newUVW.x -= step * dfdu;
+        newUVW.y -= step * dfdv;
+        newUVW.z -= step * dfdw;
+
+        step = step * 0.8f;                              // D4: between the update and the clamp
+
+        newUVW = closestPtPointBaryTriangle(newUVW);
+        itr.newUvw = newUVW;
+
+        p = v0 * newUVW.x + v1 * newUVW.y + v2 * newUVW.z;
+
+        tr.it[iter] = itr;
+        ++iters;
+
+        // D5: the test uses the CLAMPED newUVW, and the break precedes the assignment.
+        const float3 duvw = uvw - newUVW;
+        if (sdfcDot(duvw, duvw) < toleranceSq)
+        {
+            converged = 1u;
+            break;
+        }
+
+        uvw = newUVW;
+    }
+    tr.iters = iters;
+    tr.converged = converged;
+
+    // D7: recomputed, and the centroid distance from the top is discarded.
+    sdfGradient = sdfVolumeGrad(t, p);
+    tr.gradFinal = sdfGradient;
+
+    point = p;
+    tr.pFinal = p;
+
+    return sdfSampleWithGrad(t, p, sdfGradient, dir, tolerance);
+}
+
+float sdfDoTriangleCollision(SparseSdfTexture t, float3 v0, float3 v1, float3 v2,
+                                    out float3 point, inout float3 dir, float tolerance)
+{
+    SdfTriTrace tr;
+    return sdfDoTriangleCollisionEx(t, v0, v1, v2, point, dir, tolerance, tr);
 }

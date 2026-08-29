@@ -94,6 +94,7 @@
 #include "PxgCudaShim.h"
 #include "PxgCudaToolkitShim.h"
 #include "pxgSdfSceneRef.h"
+#include "GuDistancePointTriangle.h"   // the ENGINE'S OWN closestPtPointBaryTriangle (P9.34a)
 
 #include <cmath>
 #include <cstdint>
@@ -119,6 +120,7 @@ struct P_Coll
 {
     uint64_t meshPtr, points, gradIn, dirSeed, outBuf;
     uint32_t numPoints, pad;
+    uint64_t triVerts, triOut;      // P9.34a
 };
 
 // npSdfTexture.slang's, used for the independent tap cross-check.
@@ -890,6 +892,453 @@ PXG_TEST(sdfCollision)
     for (PxgBufferHandle h : owned)
         dev->destroyBuffer(h);
     physx::gpuslang::pxgSetVulkanDriverShim(nullptr);
+}
+
+
+
+// ===========================================================================
+// P9.34a: Gu::closestPtPointBaryTriangle and doTriangleSDFCollision.
+//
+// The two pieces cloth_sdfMeshContactGenLaunch needs that P9.12d did not port.
+// They are checked in two DIFFERENT ways, and the difference is the point:
+//
+//   * closestPtPointBaryTriangle is PX_CUDA_CALLABLE and texture-free, so this
+//     file includes the engine's header and calls THE ENGINE'S OWN COPY.  That is
+//     a real oracle -- there is no transcription on the host side to be wrong.
+//
+//   * doTriangleSDFCollision cannot be: it samples a texture from the GPU.  So
+//     the shader TRACES its descent and the host REPLAYS it, forming
+//     dfdu/dfdv/dfdw from the traced gradient, applying the traced step, and
+//     calling the engine's clamp -- which must land on the traced newUvw bit for
+//     bit.  What that checks is the composition; the gradient values themselves
+//     are P9.12c/d's claim, measured there and not re-litigated here.
+// ===========================================================================
+PXG_TEST(sdfTriangleCollision)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    if (!dev->supportsBindlessTextures())
+    {
+        std::printf("  NOTE: backend has no descriptor indexing -> skip\n");
+        return;
+    }
+
+    const PxgKernelDef manifest[] = { { "npSdfCollision.spv", "sdfCollBaryClamp", 0u, 0u } };
+    static auto loader2 = [](const char* f) { return loadShaderBlob(f); };
+    PxgCudaShim shim(dev, manifest, 1, +loader2);
+    physx::gpuslang::pxgSetVulkanDriverShim(&shim);
+
+    std::vector<PxgBufferHandle> owned;
+    auto mkBuf = [&](const std::vector<uint8_t>& v) {
+        PxgBufferHandle h = createBufferFrom(dev, v);
+        owned.push_back(h);
+        return h;
+    };
+    auto asBytes = [](const void* p, size_t n) {
+        std::vector<uint8_t> v(n);
+        std::memcpy(v.data(), p, n);
+        return v;
+    };
+
+    // ---- part 1: the barycentric clamp, against the engine's own copy ---------
+    // Every branch of the cascade, and both escapes inside each one-negative arm.
+    std::vector<PxVec4> bary;
+    auto addB = [&](float x, float y, float z) { bary.push_back(PxVec4(x, y, z, 0.0f)); };
+    addB(1.0f/3, 1.0f/3, 1.0f/3);      // already interior
+    addB(0.5f, 0.3f, 0.2f);
+    addB(0.7f, -0.2f, 0.5f);           // one negative (y)
+    addB(-0.2f, 0.7f, 0.5f);           // one negative (x)
+    addB(0.5f, 0.7f, -0.2f);           // one negative (z)
+    addB(-0.4f, -0.3f, 1.7f);          // two negative -> the Z vertex
+    addB(-0.4f, 1.7f, -0.3f);          // two negative -> the Y vertex
+    addB(1.7f, -0.4f, -0.3f);          // two negative -> the X vertex
+    addB(-0.05f, 1.6f, -0.55f);        // one-negative arm whose escape fires
+    addB(-0.55f, -0.05f, 1.6f);
+    addB(0.0f, 0.0f, 1.0f);            // exactly on a vertex
+    addB(0.0f, 0.5f, 0.5f);            // exactly on an edge
+    addB(2.0f, 2.0f, 2.0f);            // far outside, sum 6 -> the projection matters
+    addB(-1.0f, -1.0f, -1.0f);
+    addB(0.0f, 0.0f, 0.0f);            // sum 0 -> projects to the centroid
+    std::mt19937 rngB(9341u);
+    for (uint32_t i = 0; i < 4000u; ++i)
+    {
+        auto r = [&]() { return (float(rngB() % 400001u) / 100000.0f) - 2.0f; };   // [-2, 2]
+        addB(r(), r(), r());
+    }
+    const uint32_t NB = uint32_t(bary.size());
+
+    std::vector<PxVec4> zero4(NB, PxVec4(0.0f));
+    PxgBufferHandle bPts = mkBuf(asBytes(bary.data(), bary.size() * sizeof(PxVec4)));
+    PxgBufferHandle bZero = mkBuf(asBytes(zero4.data(), zero4.size() * sizeof(PxVec4)));
+    std::vector<float> outB(size_t(NB) * 4u, -1.0f);
+    PxgBufferHandle bOutB = mkBuf(asBytes(outB.data(), outB.size() * sizeof(float)));
+
+    P_Coll pb = {};
+    pb.points = dev->getBufferDeviceAddress(bPts);
+    pb.gradIn = dev->getBufferDeviceAddress(bZero);
+    pb.dirSeed = dev->getBufferDeviceAddress(bZero);
+    pb.outBuf = dev->getBufferDeviceAddress(bOutB);
+    pb.numPoints = NB;
+    {
+        Kernel k(Kernel::Bindless{}, "npSdfCollision.spv", "sdfCollBaryClamp", {}, sizeof(P_Coll));
+        PXG_CHECK_MSG(k.isValid(), "bindless pipeline creation succeeds for sdfCollBaryClamp");
+        if (!k.isValid()) { for (auto h : owned) dev->destroyBuffer(h); return; }
+        k.dispatch((NB + 63) / 64, {}, pb);
+    }
+    dev->flush();
+    const auto B = downloadBuffer<float>(dev, bOutB, size_t(NB) * 4u);
+
+    size_t badB = 0;
+    uint32_t armCount[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    for (uint32_t i = 0; i < NB; ++i)
+    {
+        const PxVec3 c(bary[i].x, bary[i].y, bary[i].z);
+        const PxVec3 want = physx::Gu::closestPtPointBaryTriangle(c);   // THE ENGINE
+        const float* o = &B[size_t(i) * 4u];
+        if (f2u(o[0]) != f2u(want.x) || f2u(o[1]) != f2u(want.y) || f2u(o[2]) != f2u(want.z))
+        {
+            if (badB < 4)
+                std::printf("    bary[%u] (%.9g %.9g %.9g) -> (%.9g %.9g %.9g), engine says "
+                            "(%.9g %.9g %.9g)\n", i, c.x, c.y, c.z, o[0], o[1], o[2],
+                            want.x, want.y, want.z);
+            ++badB;
+        }
+        // Which arm the engine took, classified the same way the shader branches, so
+        // the run can assert every arm was actually reached.
+        const float third = 1.0f / 3.0f;
+        const PxVec3 q = c - PxVec3(third * (c.x + c.y + c.z - 1.0f));
+        uint32_t arm;
+        if (q.y < 0.0f && q.z < 0.0f) arm = 0;
+        else if (q.x < 0.0f && q.z < 0.0f) arm = 1;
+        else if (q.x < 0.0f && q.y < 0.0f) arm = 2;
+        else if (q.x < 0.0f) arm = 3;
+        else if (q.y < 0.0f) arm = 4;
+        else if (q.z < 0.0f) arm = 5;
+        else arm = 6;
+        ++armCount[arm];
+    }
+    PXG_CHECK_MSG(badB == 0, "%zu of %u barycentric clamps differ from the engine's own "
+                  "Gu::closestPtPointBaryTriangle", badB, NB);
+    for (uint32_t a = 0; a < 7u; ++a)
+        PXG_CHECK_MSG(armCount[a] > 0,
+                      "arm %u of the clamp cascade was never reached (%u inputs); an unreached "
+                      "branch is an unchecked branch", a, NB);
+
+    // ---- part 2: the triangle descent, replayed from its own trace ------------
+    SdfScene sp;
+    buildSparse(sp);
+    BlobLayout blobSp = layOutBlob(sp, 16u, 21u, 3u, 1u, 0u);
+    const uint64_t hCoarse = sdfUploadTex(CU_AD_FORMAT_FLOAT, sp.nbx + 1, sp.nby + 1, sp.nbz + 1,
+                                          sp.coarse.data(), sizeof(float));
+    const uint64_t hSub = sdfUploadTex(CU_AD_FORMAT_UNSIGNED_INT8, sp.blkx * (sp.sg + 1),
+                                       sp.blky * (sp.sg + 1), sp.blkz * (sp.sg + 1),
+                                       sp.sub.data(), 1);
+    if (hCoarse == 0 || hSub == 0)
+    { std::printf("  NOTE: texture upload failed -> skip part 2\n");
+      for (auto h : owned) dev->destroyBuffer(h); return; }
+    std::memcpy(&blobSp.bytes[blobSp.texObjOffset], &hCoarse, 8);
+    std::memcpy(&blobSp.bytes[blobSp.texObjSparseOffset], &hSub, 8);
+    const uint64_t blobAddr = dev->getBufferDeviceAddress(mkBuf(blobSp.bytes));
+    const HostSdfBox box = hostSdfBox(sp);
+
+    // Triangles spanning the box in different ways: one straddling the surface, one
+    // wholly inside, one wholly outside, one degenerate (all three vertices equal,
+    // so `difference` is 0 and the initial step is an infinity), and one whose
+    // centroid is nearer than every vertex so the cascade takes its else arm.
+    struct Tri { PxVec3 a, b, c; float tol; const char* name; };
+    std::vector<Tri> tris;
+    tris.push_back({ posOfF(box, 3, 3, 3),  posOfF(box, 9, 3, 3),  posOfF(box, 3, 9, 3),
+                     1.0f, "straddling" });
+    tris.push_back({ posOfF(box, 5, 5, 5),  posOfF(box, 6, 5, 5),  posOfF(box, 5, 6, 5),
+                     1.0f, "interior" });
+    tris.push_back({ posOfF(box, -6, -6, -6), posOfF(box, -5, -6, -6), posOfF(box, -6, -5, -6),
+                     1.0f, "outside" });
+    tris.push_back({ posOfF(box, 4, 4, 4),  posOfF(box, 4, 4, 4),  posOfF(box, 4, 4, 4),
+                     1.0f, "degenerate" });
+    tris.push_back({ posOfF(box, 2, 8, 4),  posOfF(box, 12, 8, 4), posOfF(box, 7, 2, 12),
+                     1.0f, "wide" });
+    tris.push_back({ posOfF(box, 1, 1, 1),  posOfF(box, 14, 14, 1), posOfF(box, 1, 14, 14),
+                     0.001f, "tight-tolerance" });
+    // D1's cascade does NOT compare d1 against d0 in its second arm, so a port that
+    // "fixes" it into a three-way minimum differs exactly when d0 and d1 tie.  These
+    // two put v0 and v1 at mirror positions about the grid centre, which makes their
+    // sampled distances equal, and the first sweep had nothing that did.
+    tris.push_back({ posOfF(box, 4, 6, 6),  posOfF(box, 8, 6, 6),  posOfF(box, 6, 11, 6),
+                     1.0f, "d0-eq-d1" });
+    tris.push_back({ posOfF(box, 6, 4, 6),  posOfF(box, 6, 8, 6),  posOfF(box, 11, 6, 6),
+                     1.0f, "d0-eq-d1-b" });
+    const uint32_t NT = uint32_t(tris.size());
+
+    std::vector<PxVec4> tv(size_t(NT) * 3u);
+    std::vector<PxVec4> dirSeed(NT);
+    for (uint32_t i = 0; i < NT; ++i)
+    {
+        tv[i * 3 + 0] = PxVec4(tris[i].a.x, tris[i].a.y, tris[i].a.z, tris[i].tol);
+        tv[i * 3 + 1] = PxVec4(tris[i].b.x, tris[i].b.y, tris[i].b.z, 0.0f);
+        tv[i * 3 + 2] = PxVec4(tris[i].c.x, tris[i].c.y, tris[i].c.z, 0.0f);
+        dirSeed[i] = PxVec4(-3.0f, -4.0f, -5.0f, 0.0f);
+    }
+    const uint32_t TRI_STRIDE = 176u;
+    std::vector<float> outT(size_t(NT) * TRI_STRIDE, -1.0f);
+    PxgBufferHandle bTv = mkBuf(asBytes(tv.data(), tv.size() * sizeof(PxVec4)));
+    PxgBufferHandle bDir = mkBuf(asBytes(dirSeed.data(), dirSeed.size() * sizeof(PxVec4)));
+    PxgBufferHandle bOutT = mkBuf(asBytes(outT.data(), outT.size() * sizeof(float)));
+
+    P_Coll pt = {};
+    pt.meshPtr = blobAddr;
+    pt.points = dev->getBufferDeviceAddress(bPts);
+    pt.gradIn = dev->getBufferDeviceAddress(bZero);
+    pt.dirSeed = dev->getBufferDeviceAddress(bDir);
+    pt.outBuf = dev->getBufferDeviceAddress(bOutB);
+    pt.numPoints = NT;
+    pt.triVerts = dev->getBufferDeviceAddress(bTv);
+    pt.triOut = dev->getBufferDeviceAddress(bOutT);
+    {
+        Kernel k(Kernel::Bindless{}, "npSdfCollision.spv", "sdfCollTriangle", {}, sizeof(P_Coll));
+        PXG_CHECK_MSG(k.isValid(), "bindless pipeline creation succeeds for sdfCollTriangle");
+        if (!k.isValid()) { for (auto h : owned) dev->destroyBuffer(h); return; }
+        k.dispatch((NT + 63) / 64, {}, pt);
+    }
+    dev->flush();
+    const auto T = downloadBuffer<float>(dev, bOutT, size_t(NT) * TRI_STRIDE);
+
+    size_t badStart = 0, badDiff2 = 0, badStep = 0, badUvw = 0, badBreak = 0, badGradN = 0;
+    size_t badIters = 0, badFinalG = 0;
+    uint32_t armSeen[4] = { 0, 0, 0, 0 };
+    uint32_t nConverged = 0, nRanOut = 0, nSubstituted = 0, nTied = 0, nFinalGChecked = 0;
+    for (uint32_t i = 0; i < NT; ++i)
+    {
+        const float* o = &T[size_t(i) * TRI_STRIDE];
+        const PxVec3 v0 = tris[i].a, v1 = tris[i].b, v2 = tris[i].c;
+        const float d0 = o[0], d1 = o[1], d2 = o[2], dC = o[3];
+        const uint32_t arm = uint32_t(o[4]);
+        armSeen[arm < 4u ? arm : 3u]++;
+        if (f2u(d0) == f2u(d1)) ++nTied;
+
+        // D1/D2: the cascade, re-derived from the four traced distances.
+        const float third = 1.0f / 3.0f;
+        PxVec3 wantP = (v0 + v1 + v2) * third;
+        PxVec3 wantUvw(0.0f);
+        uint32_t wantArm;
+        if (d0 < d1 && d0 < d2 && d0 < dC) { wantP = v0; wantUvw.x = 1.0f; wantArm = 0; }
+        else if (d1 < d2 && d1 < dC)       { wantP = v1; wantUvw.y = 1.0f; wantArm = 1; }
+        else if (d2 < dC)                  { wantP = v2; wantUvw.z = 1.0f; wantArm = 2; }
+        else { wantUvw = PxVec3(third); wantArm = 3; }
+        if (arm != wantArm || !bitEq3(o + 6, wantUvw) || !bitEq3(o + 9, wantP))
+        {
+            if (badStart < 4)
+                std::printf("    tri %s: start arm %u want %u, uvw (%.9g %.9g %.9g)\n",
+                            tris[i].name, arm, wantArm, o[6], o[7], o[8]);
+            ++badStart;
+        }
+
+        // D3: nested max of SQUARED lengths, one sqrt.
+        const float wantDifference = std::sqrt(PxMax((v0 - wantP).magnitudeSquared(),
+                                      PxMax((v1 - wantP).magnitudeSquared(),
+                                            (v2 - wantP).magnitudeSquared())));
+        if (f2u(o[5]) != f2u(wantDifference))
+        { if (badDiff2 < 4) std::printf("    tri %s: difference %.9g want %.9g\n",
+                                        tris[i].name, o[5], wantDifference); ++badDiff2; }
+
+        const uint32_t iters = uint32_t(o[12]);
+        const uint32_t conv = uint32_t(o[13]);
+        if (conv) ++nConverged; else ++nRanOut;
+
+        // The CAP.  The replay below takes `iters` FROM the shader, so it is
+        // self-consistent by construction and cannot see the loop bound at all --
+        // which is why a 15-iteration mutant survived the first sweep.  A run that
+        // did not converge must have used exactly 16.
+        if (iters < 1u || iters > 16u || (conv == 0u && iters != 16u))
+        { if (badIters < 4)
+              std::printf("    tri %s: %u iterations, converged %u\n",
+                          tris[i].name, iters, conv);
+          ++badIters; }
+
+        // D7: the gradient is RECOMPUTED at the final p.  If the port reused the
+        // loop's last one instead, gradFinal would be that iteration's USED gradient
+        // -- which is normalised, and a freshly sampled one is not.
+        // The degenerate triangle is exempt, and not as a convenience: with all three
+        // vertices equal, `difference` is 0, the initial step is +inf and every
+        // gradient downstream is NaN, so the two values are identical bit patterns no
+        // matter which one the port produced.  There is nothing to distinguish there,
+        // so the check is applied only where the arithmetic is finite -- and the run
+        // insists that some triangle qualified.
+        const PxVec3 gFinal(o[17], o[18], o[19]);
+        const bool finite = std::isfinite(gFinal.x) && std::isfinite(gFinal.y) &&
+                            std::isfinite(gFinal.z);
+        if (finite)
+        {
+            ++nFinalGChecked;
+            if (bitEq3(o + 17, PxVec3(o[28 + (iters - 1u) * 9 + 5], o[28 + (iters - 1u) * 9 + 6],
+                                      o[28 + (iters - 1u) * 9 + 7])))
+            { if (badFinalG < 4)
+                  std::printf("    tri %s: gradFinal is bit-identical to the loop's last USED "
+                              "gradient (%.9g %.9g %.9g); it must be a fresh sample at the "
+                              "final p\n", tris[i].name, gFinal.x, gFinal.y, gFinal.z);
+              ++badFinalG; }
+        }
+
+        // The replay.  Everything below is derived on the host from the traced
+        // gradient and step; only those two are taken from the shader.
+        PxVec3 uvw = wantUvw;
+        float step = 1.0f / (2.0f * wantDifference);
+        for (uint32_t k = 0; k < iters; ++k)
+        {
+            const float* e = o + 28 + k * 9;
+            const float stepIn = e[0], gradMag = e[1];
+            const PxVec3 gradUsed(e[5], e[6], e[7]);
+            if (gradMag == 0.0f) ++nSubstituted;
+            else
+            {
+                // D8: gradUsed must be the raw gradient scaled by 1/gradMag, and the
+                // result unit to within a float.
+                const float m = gradUsed.magnitude();
+                if (std::fabs(m - 1.0f) > 1e-5f)
+                { if (badGradN < 4)
+                      std::printf("    tri %s iter %u: |gradUsed| = %.9g\n", tris[i].name, k, m);
+                  ++badGradN; }
+            }
+            if (f2u(stepIn) != f2u(step))
+            { if (badStep < 4)
+                  std::printf("    tri %s iter %u: step %.9g want %.9g\n",
+                              tris[i].name, k, stepIn, step); ++badStep; }
+
+            // D2: iteration 0 descends from the point the cascade chose, which is the
+            // CENTROID in the else arm -- not from the barycentric blend of uvw, which
+            // would differ there by a rounding.  Later iterations use the blend the
+            // previous iteration produced.
+            const PxVec3 p = (k == 0) ? wantP : (v0 * uvw.x + v1 * uvw.y + v2 * uvw.z);
+            const float du = gradUsed.dot(v0 - p);
+            const float dv = gradUsed.dot(v1 - p);
+            const float dw = gradUsed.dot(v2 - p);
+            PxVec3 newUVW = uvw;
+            newUVW.x -= step * du;
+            newUVW.y -= step * dv;
+            newUVW.z -= step * dw;
+            step = step * 0.8f;                                   // D4
+            newUVW = physx::Gu::closestPtPointBaryTriangle(newUVW);   // THE ENGINE
+            if (!bitEq3(e + 2, newUVW))
+            {
+                if (badUvw < 4)
+                    std::printf("    tri %s iter %u: newUvw (%.9g %.9g %.9g) want "
+                                "(%.9g %.9g %.9g)\n", tris[i].name, k, e[2], e[3], e[4],
+                                newUVW.x, newUVW.y, newUVW.z);
+                ++badUvw;
+            }
+            // D5: the loop stops exactly when the CLAMPED delta is under tolerance.
+            const bool wantBreak = (uvw - newUVW).magnitudeSquared() < 1e-3f * 1e-3f;
+            const bool didBreak = (k + 1u == iters) && conv != 0u;
+            if (wantBreak != didBreak && !(k + 1u == iters && conv == 0u && !wantBreak))
+            { if (badBreak < 4)
+                  std::printf("    tri %s iter %u: break %d want %d (iters %u conv %u)\n",
+                              tris[i].name, k, int(didBreak), int(wantBreak), iters, conv);
+              ++badBreak; }
+            if (wantBreak) break;
+            uvw = newUVW;
+        }
+    }
+    PXG_CHECK_MSG(badStart == 0, "%zu triangles chose a different starting iterate", badStart);
+    PXG_CHECK_MSG(badDiff2 == 0, "%zu triangles computed a different `difference`", badDiff2);
+    PXG_CHECK_MSG(badStep == 0, "%zu iterations used a step off the 1/(2d) * 0.8^k schedule",
+                  badStep);
+    PXG_CHECK_MSG(badUvw == 0, "%zu iterations landed on a different clamped barycentric than "
+                  "the engine's own closestPtPointBaryTriangle applied to the replayed update",
+                  badUvw);
+    PXG_CHECK_MSG(badBreak == 0, "%zu iterations disagreed about where the loop stops", badBreak);
+    PXG_CHECK_MSG(badGradN == 0, "%zu used gradients were not unit length", badGradN);
+    PXG_CHECK_MSG(badIters == 0, "%zu triangles ran an iteration count the 16-step "
+                  "bound does not allow", badIters);
+    PXG_CHECK_MSG(badFinalG == 0, "%zu triangles reused the loop's last gradient "
+                  "instead of resampling at the final p", badFinalG);
+    PXG_CHECK_MSG(nFinalGChecked > 0,
+                  "every triangle produced a non-finite final gradient, so the recompute of D7 "
+                  "was never actually observed");
+    PXG_CHECK_MSG(armSeen[3] > 0, "no triangle took the cascade's else arm (the centroid start), "
+                  "so D1's fall-through is unchecked");
+    PXG_CHECK_MSG(armSeen[0] + armSeen[1] + armSeen[2] > 0,
+                  "no triangle started from a VERTEX, so the cascade's three arms are unchecked");
+    // ---- part 3: the discontinuity substitution -------------------------------
+    // gm == 0 is unreachable in the sparse scene above, so nSubstituted stayed 0 and
+    // the whole substitution branch went unobserved -- which the first sweep caught by
+    // leaving both of its mutants alive.  The DENSE scene has a point whose trilinear
+    // gradient is exactly zero (FLAT_X/Y/Z, the same one the sdfCollision fixture uses
+    // for its own substitution check), so a triangle collapsed onto it hits the branch
+    // on its first iteration.
+    {
+        SdfScene dn;
+        buildDenseAligned(dn);
+        BlobLayout blobDn = layOutBlob(dn, 5u, 9u, 1u, 0u, 0x0BADF00Du);
+        const uint64_t hDense = sdfUploadTex(CU_AD_FORMAT_FLOAT, dn.dx, dn.dy, dn.dz,
+                                             dn.coarse.data(), sizeof(float));
+        if (hDense == 0)
+            std::printf("  NOTE: dense texture upload failed -> the discontinuity is unchecked\n");
+        else
+        {
+            std::memcpy(&blobDn.bytes[blobDn.texObjOffset], &hDense, 8);
+            const uint64_t dnAddr = dev->getBufferDeviceAddress(mkBuf(blobDn.bytes));
+            const HostSdfBox dbox = hostSdfBox(dn);
+            const PxVec3 flat = posOfF(dbox, float(FLAT_X), float(FLAT_Y), float(FLAT_Z));
+
+            std::vector<PxVec4> dtv(3), ddir(1);
+            dtv[0] = PxVec4(flat.x, flat.y, flat.z, 1.0f);
+            dtv[1] = PxVec4(flat.x, flat.y, flat.z, 0.0f);
+            dtv[2] = PxVec4(flat.x, flat.y, flat.z, 0.0f);
+            ddir[0] = PxVec4(-3.0f, -4.0f, -5.0f, 0.0f);
+            std::vector<float> outD(TRI_STRIDE, -1.0f);
+            PxgBufferHandle bDtv = mkBuf(asBytes(dtv.data(), dtv.size() * sizeof(PxVec4)));
+            PxgBufferHandle bDdir = mkBuf(asBytes(ddir.data(), ddir.size() * sizeof(PxVec4)));
+            PxgBufferHandle bDout = mkBuf(asBytes(outD.data(), outD.size() * sizeof(float)));
+
+            P_Coll pd = pt;
+            pd.meshPtr = dnAddr;
+            pd.numPoints = 1u;
+            pd.dirSeed = dev->getBufferDeviceAddress(bDdir);
+            pd.triVerts = dev->getBufferDeviceAddress(bDtv);
+            pd.triOut = dev->getBufferDeviceAddress(bDout);
+            Kernel k(Kernel::Bindless{}, "npSdfCollision.spv", "sdfCollTriangle", {}, sizeof(P_Coll));
+            if (k.isValid())
+            {
+                k.dispatch(1u, {}, pd);
+                dev->flush();
+                const auto D2 = downloadBuffer<float>(dev, bDout, TRI_STRIDE);
+                // Iteration 0's gradient must have had magnitude exactly zero, and the
+                // substituted vector must be the RAW constant -- not normalised, and not
+                // doVertexSDFCollision's different one.
+                const float gm0 = D2[28 + 1];
+                const PxVec3 used(D2[28 + 5], D2[28 + 6], D2[28 + 7]);
+                const PxVec3 want(0.571846586f, 0.705545099f, 0.418566116f);
+                PXG_CHECK_MSG(gm0 == 0.0f,
+                              "the collapsed triangle on the dense scene's flat point must give a "
+                              "ZERO gradient magnitude on iteration 0, got %.9g", gm0);
+                if (gm0 == 0.0f)
+                {
+                    ++nSubstituted;
+                    PXG_CHECK_MSG(f2u(used.x) == f2u(want.x) && f2u(used.y) == f2u(want.y) &&
+                                  f2u(used.z) == f2u(want.z),
+                                  "the discontinuity substitute is (%.9g %.9g %.9g); it must be "
+                                  "sdfCollision.cuh:455's constant (%.9g %.9g %.9g) used RAW -- "
+                                  "not normalised, and not doVertexSDFCollision's different one",
+                                  used.x, used.y, used.z, want.x, want.y, want.z);
+                }
+            }
+        }
+    }
+
+    PXG_CHECK_MSG(nSubstituted > 0,
+                  "the discontinuity substitution was never reached, so both of its mutants -- a "
+                  "normalised constant and the wrong constant -- are unchecked");
+    PXG_CHECK_MSG(nConverged > 0, "no triangle converged, so the tolerance break is unchecked");
+    PXG_CHECK_MSG(nRanOut > 0, "no triangle ran to the 16-iteration cap, so the bound is unchecked");
+    PXG_CHECK_MSG(nTied > 0,
+                  "no triangle produced d0 == d1, so D1's asymmetric cascade -- whose second arm "
+                  "does not compare against d0 -- is indistinguishable from a three-way minimum");
+
+    std::printf("    [ note ] bary clamp: %u inputs bit-exact against the engine's own copy, "
+                "all 7 arms reached; triangle descent: %u triangles, %u converged / %u ran to 16, "
+                "start arms %u/%u/%u/%u, %u with d0 == d1, %u discontinuity substitutions\n",
+                NB, NT, nConverged, nRanOut, armSeen[0], armSeen[1], armSeen[2], armSeen[3],
+                nTied, nSubstituted);
+
+    for (auto h : owned) dev->destroyBuffer(h);
 }
 
 } // namespace

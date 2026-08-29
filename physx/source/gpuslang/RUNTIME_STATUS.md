@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **822/822** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **823/823** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.33a added `gpuslang.npFloatIntrinRecipSqrt`, which is not a kernel port but a
 PLATFORM measurement: about forty shaders here spell `PxVec3::getNormalized` as
 `v * rsqrt(m)`, while the engine computes `PxRecipSqrt` = `1.0f/sqrtf` — two exactly
@@ -1736,6 +1736,135 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.34a — der Kern der SDF-Tuch-Kontakterzeugung, und eine Funktion, für die es ein echtes Orakel gibt
+
+Kein Manifest-Eintrag. `cloth_sdfMeshContactGenLaunch` ist der letzte
+unabgebildete Tuch-Kontakterzeuger, seit P9.27 als „groß" zurückgestellt, und
+diese Tranche portiert die **zwei Bausteine**, an denen es hing:
+
+* `Gu::closestPtPointBaryTriangle` (GuDistancePointTriangle.h:123) →
+  `pxgSlangTetClosest`;
+* `doTriangleSDFCollision` (sdfCollision.cuh:402) → `pxgSlangSdfCollision`.
+
+Vorher geprüft, wie es die Verwaisten-Tabelle aus P9.32 verlangt: die
+Aufrufstelle **lebt** (PxgNarrowphaseCore.cpp:6507, echtes `getCuFunction`, kein
+`if (0)`, kein Kommentar). Und `#define SUPPORT_SUBDIVISION 0` steht direkt über
+dem Kernel — der gesamte Verfeinerungsapparat ist wegkompiliert, was den Rumpf
+erheblich verkleinert.
+
+### Zwei Funktionen, zwei völlig verschiedene Prüfarten
+
+Und der Unterschied ist der Punkt:
+
+* `closestPtPointBaryTriangle` ist `PX_CUDA_CALLABLE` und **texturfrei**. Der
+  Prüfstand bindet also den Engine-Header ein und ruft **die Engine selbst**.
+  Das ist ein **Orakel**, kein handgeschriebener Spiegel, der falsch sein könnte
+  — die seltenste und stärkste Prüfform in diesem Port. **4015 Eingaben,
+  bitgleich**, und der Lauf besteht darauf, dass **alle sieben** Arme der Kaskade
+  erreicht wurden.
+* `doTriangleSDFCollision` kann das nicht: es tastet eine Textur ab, also gibt es
+  auf dem Host nichts zu rufen. Der Shader **protokolliert** deshalb seinen
+  Abstieg — jeden Gradienten, jede Schrittweite, jedes geklemmte `uvw` — und der
+  Prüfstand **spielt die Iteration auf dem Host nach**: er bildet
+  `dfdu/dfdv/dfdw` aus dem protokollierten Gradienten, wendet die protokollierte
+  Schrittweite an, ruft **die Engine-Klemmung**, und muss bitgleich auf dem
+  protokollierten `newUvw` landen.
+
+> Was das prüft, ist die **Komposition**: die Kaskade, der Schrittplan, die
+> Klemmung, der Konvergenztest und wo die Schleife stehenbleibt. Was es nicht
+> prüft, sind die Abtastwerte — und das muss es auch nicht: die sind die
+> Behauptung von P9.12c/d und dort gemessen worden.
+
+### Acht Fallen, und die drei, die man leicht „verbessert"
+
+* **Die Startauswahl ist eine asymmetrische Kaskade** (:420). Der zweite Arm
+  vergleicht `d1` **nicht** gegen `d0`. Bei `d0 < d1`, aber `d0 >= d2` fällt der
+  erste Arm durch, und der zweite kann `v1` wählen, obwohl `v0` näher liegt. So
+  übertragen; ein Port, der daraus ein Drei-Wege-Minimum macht, startet woanders.
+* **`p` wird im `else`-Arm nicht gesetzt** — es behält den Schwerpunkt.
+* **`difference` ist ein geschachteltes Maximum von QUADRATEN mit **einer** Wurzel
+  am Ende**, und `step = 1/(2·difference)`.
+* **`step` zerfällt zwischen der uvw-Aktualisierung und der Klemmung** (:470).
+  Oben oder unten in der Schleife ergibt ab Iteration zwei einen anderen Plan.
+* **Der Konvergenztest nimmt das GEKLEMMTE `newUVW`, und das `break` steht vor
+  `uvw = newUVW`.**
+* **Der Unstetigkeitsvektor ist ein anderer** als der von
+  `doVertexSDFCollision`: `(0,571846586, 0,705545099, 0,418566116)` gegen
+  `(0,5448762, 0,672269, 0,398825)` — und er wird **roh** eingesetzt, nicht
+  normalisiert.
+* **Der Gradient wird nach der Schleife neu abgetastet**, und die
+  Schwerpunkt-Distanz von ganz oben wird **verworfen**.
+
+### Drei Fege-Durchgänge: 17 → 19 → **20 von 30**, und was die Überlebenden lehrten
+
+Der erste Durchgang ließ **dreizehn** Überlebende — der erste Fegedurchgang in
+einem neuen Gebiet. Die Diagnose zerfällt in zwei saubere Hälften:
+
+**Beweisbar äquivalent (8).** Fast alle gehen auf **eine** Invariante zurück:
+Falle B1 projiziert `c` auf die Ebene `x+y+z = 1`, **bevor** irgendein Test
+läuft. Danach gilt in exakter Arithmetik:
+
+* die **Zwei-Negativ-Tests sind redundant** — der Ein-Negativ-Arm liefert
+  dieselbe Ecke, weil aus `q.x < 0` und `q.z < 0` immer `y > 1` folgt;
+* die beiden `> 1`-Ausgänge **können nicht beide** feuern, weil `y + z = 1`;
+* `>` gegen `>=` unterscheidet sich nur bei genau 1, und dort stimmen beide Wege
+  überein.
+
+Dazu drei unabhängige Beweise:
+
+* `sqrt(max(a²,b²,c²)) == max(sqrt(a²),…)`, weil die Wurzel monoton und korrekt
+  gerundet ist;
+* `gm > 0` gegen `gm >= 0` ist folgenlos, weil das **zweite** `if (gm == 0)` —
+  kein `else` — den Wert ohnehin überschreibt. Genau dafür stehen dort zwei `if`s;
+* den Unstetigkeitsvektor dieser Funktion durch `getNormalized` zu schicken ist
+  **wirkungslos**, und das ist ausgerechnet worden statt behauptet: sein
+  `magnitudeSquared` ist in float32 **exakt 1,0**, die Normalisierung liefert also
+  dasselbe Bitmuster. Der Vektor des **Vertex**-Pfads ist dagegen **0,90790** lang
+  im Quadrat, also 0,95284 — dort ist dieselbe Normalisierung tragend. Zwei
+  Konstanten, zwei verschiedene Rollen, und der Mutant, der die **falsche**
+  einsetzt, fällt sofort.
+
+**Echte Lücken (4), und alle vier hat der zweite und dritte Durchgang
+geschlossen:**
+
+| Lücke | Was fehlte |
+|---|---|
+| Die **Iterationsschranke** war überhaupt nicht prüfbar. Der Prüfstand nimmt `iters` **vom Shader** und spielt genau so viele nach — also ist er per Konstruktion selbstkonsistent und sieht die Schleifengrenze nie. Jetzt gilt: wer nicht konvergiert, muss **genau 16** gebraucht haben. |
+| Der **neu abgetastete Schlussgradient** wurde protokolliert und **nie verglichen**. Jetzt muss er sich vom letzten benutzten Gradienten der Schleife unterscheiden — der ist normalisiert, ein frischer nicht. |
+| Die **Unstetigkeit** wurde nie erreicht (`nSubstituted == 0`), also gingen beide zugehörigen Mutanten durch. Die dichte Szene hat einen Punkt mit exakt verschwindendem Gradienten; ein darauf kollabiertes Dreieck trifft den Zweig in Iteration 0, und die Konstante wird jetzt **bitgleich** geprüft. |
+| Kein Dreieck erzeugte `d0 == d1`, also war die Asymmetrie der Kaskade nicht straddelbar. Zwei spiegelsymmetrische Dreiecke kamen dazu. |
+
+Und eine Prüfung von mir, die zu scharf war: der Schlussgradient-Vergleich schlug
+beim **entarteten** Dreieck an. Dort sind alle drei Ecken gleich, `difference` ist
+null, die Anfangsschrittweite ist `+inf` und alles danach NaN — die beiden Werte
+sind dasselbe Bitmuster, gleichgültig welchen der Port erzeugt hat. Die Prüfung
+gilt jetzt nur, wo die Arithmetik endlich ist, und der Lauf verlangt, dass
+mindestens ein Dreieck dafür in Frage kam.
+
+### Was noch aussteht
+
+`d1-cascade-symmetrised` und `d1-cascade-le` leben weiter. Die Bedingung ist
+präzise bekannt und noch nicht getroffen: es braucht `d0 == d1`, **beide echt
+kleiner** als `d2` **und** als die Schwerpunkt-Distanz. Meine gebundenen
+Dreiecke erzeugen die Gleichheit, aber der Schwerpunkt liegt dort jeweils tiefer,
+also nimmt auch das Original den `else`-Arm. Das ist eine benannte, verstandene
+Lücke für P9.34b, keine Nachsicht — die Bedingung steht hier, damit der nächste
+Durchgang sie gezielt bauen kann.
+
+### Verifikation
+
+* Klemmung **4015 Eingaben bitgleich gegen die Engine selbst**, alle sieben Arme
+  erreicht;
+* Abstieg über acht Dreiecke plus das entartete auf der dichten Szene:
+  Startarme 2/2/1/3, sechs konvergiert, zwei bis zur Schranke, einmal `d0 == d1`,
+  einmal die Unstetigkeit;
+* jede Iteration **bitgleich nachgespielt** — Schrittplan, Klemmung über die
+  Engine-Funktion, Konvergenztest und Abbruchpunkt;
+* Suite **823/823** in beiden Speichermodi;
+* Manifest unverändert (dies ist der Unterbau, nicht der Kernel), also
+  `build-sdk` und die Szenen unberührt.
+
 
 ## P9.33c — die Softbody-gegen-Tuch-Anheftung, und ein `.w`, das auf der einen Seite geklemmt wird und auf der anderen nicht
 

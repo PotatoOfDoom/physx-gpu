@@ -43,6 +43,7 @@
 
 import pxgSlangSdfCollision;
 import pxgSlangSdfTexture;
+import pxgSlangTetClosest;   // closestPtPointBaryTriangle (P9.34a)
 
 struct SdfCollParams
 {
@@ -53,6 +54,10 @@ struct SdfCollParams
     uint64_t outBuf;       // per-entry stride, documented at each entry
     uint numPoints;
     uint pad0;
+    // P9.34a: the triangle descent needs three vertices per entry rather than one
+    // point, so it reads them from here instead of `points`.
+    uint64_t triVerts;     // 3 float4 per entry: v0, v1, v2
+    uint64_t triOut;       // the trace, stride documented at the entry
 }
 
 [[vk::push_constant]]
@@ -196,4 +201,93 @@ void sdfCollVertex(uint3 dtid : SV_DispatchThreadID)
     o[8] = dir.x; o[9] = dir.y; o[10] = dir.z;
     o[11] = r;
     o[12] = asfloat(tr.interior);
+}
+
+
+// ---- Gu::closestPtPointBaryTriangle.  Stride 4 words (P9.34a). -------------
+//   0..2 the returned barycentric   3 unused
+//
+// The one function on this page with a REAL oracle: it is PX_CUDA_CALLABLE and
+// texture-free, so the fixture calls the engine's own copy on the host and
+// compares bit for bit rather than against a transcription.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void sdfCollBaryClamp(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint i = dtid.x;
+    if (i >= gP.numPoints)
+        return;
+
+    const float3 c = Ptr<float4>(gP.points)[i].xyz;
+    const float3 r = closestPtPointBaryTriangle(c);
+
+    Ptr<float> o = Ptr<float>(gP.outBuf) + i * 4;
+    o[0] = r.x; o[1] = r.y; o[2] = r.z; o[3] = 0.0f;
+}
+
+// ---- doTriangleSDFCollision.  Stride 176 words (P9.34a). -------------------
+//    0..3   d0 d1 d2 dCenter
+//    4      startArm            5      difference
+//    6..8   uvw0                9..11  p0
+//   12      iters              13      converged
+//   14..16  pFinal             17..19  gradFinal
+//   20..22  point (out)        23..25  dir (inout, on the way out)
+//   26      the returned distance
+//   27      unused
+//   28 + 9k .. : per-iteration, nine words each for k = 0..15:
+//              +0 stepIn   +1 gradMag   +2..4 newUvw   +5..7 gradUsed   +8 unused
+//
+// The USED gradient is in the trace and the RAW one is not, and that split is the
+// whole design.  The fixture REPLAYS each iteration on the host from (uvw, stepIn,
+// gradUsed, v0, v1, v2): it forms dfdu/dfdv/dfdw, applies the step, calls THE
+// ENGINE'S OWN closestPtPointBaryTriangle, and must land on `newUvw` bit for bit.
+// That checks the composition -- the cascade, the step schedule, the clamp, the
+// convergence test and where the loop stops.  It does not check the gradient
+// values, and must not: those are GPU-only samples and are P9.12c/d's claim,
+// measured there.  `gradMag` is carried too, so the replay can also verify that
+// gradUsed is the raw one normalised or the discontinuity substitute.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void sdfCollTriangle(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint i = dtid.x;
+    if (i >= gP.numPoints)
+        return;
+
+    SparseSdfTexture t;
+    if (!loadTexture(t))
+        return;
+
+    Ptr<float4> tv = Ptr<float4>(gP.triVerts) + i * 3;
+    const float3 v0 = tv[0].xyz, v1 = tv[1].xyz, v2 = tv[2].xyz;
+    const float tolerance = tv[0].w;
+
+    float3 point;
+    float3 dir = Ptr<float4>(gP.dirSeed)[i].xyz;
+    SdfTriTrace tr;
+    const float d = sdfDoTriangleCollisionEx(t, v0, v1, v2, point, dir, tolerance, tr);
+
+    Ptr<float> o = Ptr<float>(gP.triOut) + i * 176;
+    o[0] = tr.d0; o[1] = tr.d1; o[2] = tr.d2; o[3] = tr.dCenter;
+    o[4] = float(tr.startArm);
+    o[5] = tr.difference;
+    o[6] = tr.uvw0.x; o[7] = tr.uvw0.y; o[8] = tr.uvw0.z;
+    o[9] = tr.p0.x;  o[10] = tr.p0.y;  o[11] = tr.p0.z;
+    o[12] = float(tr.iters);
+    o[13] = float(tr.converged);
+    o[14] = tr.pFinal.x;   o[15] = tr.pFinal.y;   o[16] = tr.pFinal.z;
+    o[17] = tr.gradFinal.x; o[18] = tr.gradFinal.y; o[19] = tr.gradFinal.z;
+    o[20] = point.x; o[21] = point.y; o[22] = point.z;
+    o[23] = dir.x;   o[24] = dir.y;   o[25] = dir.z;
+    o[26] = d;
+    o[27] = 0.0f;
+    for (uint k = 0u; k < SDF_TRI_MAX_ITERS; ++k)
+    {
+        Ptr<float> e = o + 28 + k * 9;
+        e[0] = tr.it[k].stepIn;
+        e[1] = tr.it[k].gradMag;
+        e[2] = tr.it[k].newUvw.x;   e[3] = tr.it[k].newUvw.y;   e[4] = tr.it[k].newUvw.z;
+        e[5] = tr.it[k].gradUsed.x; e[6] = tr.it[k].gradUsed.y; e[7] = tr.it[k].gradUsed.z;
+        e[8] = 0.0f;
+    }
 }

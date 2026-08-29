@@ -184,3 +184,86 @@ public void closestPtTetrahedron(float3 point, uint hint, float3 a, float3 b, fl
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Gu::closestPtPointBaryTriangle (GuDistancePointTriangle.h:123) — P9.34a.
+//
+// The closest point on the triangle (1,0,0), (0,1,0), (0,0,1) to `c`, i.e. the
+// projection of an arbitrary barycentric triple back onto the valid simplex.  The
+// header calls it "a specialization of Gu::closestPtPointTriangle2 for this
+// specific triangle", which is why it belongs beside that function rather than in
+// the SDF module that happens to be its only caller today
+// (doTriangleSDFCollision, sdfCollision.cuh:473).
+//
+// UNLIKE almost everything else in this corpus, this function is PX_CUDA_CALLABLE
+// and takes no texture, so a fixture can call THE ENGINE'S OWN COPY on the host
+// and compare bit for bit.  It is an oracle, not a transcription checked against a
+// hand-written mirror, and the fixture uses it as one.
+//
+// THE TRAPS, all of them about which branch is taken rather than about arithmetic:
+//
+//  B1. The projection onto the plane x+y+z=1 comes FIRST and is subtracted as a
+//      SCALAR broadcast: `c -= PxVec3(third * (c.x + c.y + c.z - 1.0f))`.  The sum
+//      is formed, then 1 subtracted, then scaled by 1/3 — not `(sum - 1) / 3`, and
+//      not a per-component adjustment.
+//
+//  B2. The three two-negative tests come BEFORE the three one-negative ones, and
+//      they test the OTHER two components: `c.y < 0 && c.z < 0` returns the X
+//      vertex.  Reordering them changes the answer on a doubly-negative input,
+//      because the one-negative branches below would fire on the first negative
+//      they find and project onto an edge instead of snapping to a vertex.
+//
+//  B3. Each one-negative branch spreads HALF the negative component into the other
+//      two (`d = c.x * 0.5f`, then `y = c.y + d`), and the result keeps the
+//      ZEROED component, not the original.  `d` is negative, so this SUBTRACTS.
+//
+//  B4. The `> 1.0f` escapes inside each one-negative branch snap to a vertex, and
+//      they are checked in the branch's own order — y before z, x before z, x
+//      before y.  Both can be true only for a badly out-of-simplex input, and then
+//      the first one wins.
+//
+//  B5. The fall-through returns the PROJECTED c, not the original argument.
+// ---------------------------------------------------------------------------
+public float3 closestPtPointBaryTriangle(float3 c)
+{
+    const float third = 1.0f / 3.0f;
+    c -= float3(third * (c.x + c.y + c.z - 1.0f));      // B1
+
+    // B2: two negative -> the positive vertex.
+    if (c.y < 0.0f && c.z < 0.0f)
+        return float3(1.0f, 0.0f, 0.0f);
+    if (c.x < 0.0f && c.z < 0.0f)
+        return float3(0.0f, 1.0f, 0.0f);
+    if (c.x < 0.0f && c.y < 0.0f)
+        return float3(0.0f, 0.0f, 1.0f);
+
+    // B3/B4: one negative -> the edge projection, or the larger vertex.
+    if (c.x < 0.0f)
+    {
+        const float d = c.x * 0.5f;
+        const float y = c.y + d;
+        const float z = c.z + d;
+        if (y > 1.0f) return float3(0.0f, 1.0f, 0.0f);
+        if (z > 1.0f) return float3(0.0f, 0.0f, 1.0f);
+        return float3(0.0f, y, z);
+    }
+    if (c.y < 0.0f)
+    {
+        const float d = c.y * 0.5f;
+        const float x = c.x + d;
+        const float z = c.z + d;
+        if (x > 1.0f) return float3(1.0f, 0.0f, 0.0f);
+        if (z > 1.0f) return float3(0.0f, 0.0f, 1.0f);
+        return float3(x, 0.0f, z);
+    }
+    if (c.z < 0.0f)
+    {
+        const float d = c.z * 0.5f;
+        const float x = c.x + d;
+        const float y = c.y + d;
+        if (x > 1.0f) return float3(1.0f, 0.0f, 0.0f);
+        if (y > 1.0f) return float3(0.0f, 1.0f, 0.0f);
+        return float3(x, y, 0.0f);
+    }
+    return c;                                            // B5
+}
