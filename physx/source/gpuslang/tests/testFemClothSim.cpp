@@ -11696,4 +11696,311 @@ PXG_TEST(femClothSimPsContactGen)
         dev->destroyBuffer(h);
 }
 
+
+// ===========================================================================
+// P9.31 -- cloth_particleContactPrepareLaunch, bit-exact against a host mirror,
+// plus a COVERAGE run large enough to make the work-index formula observable.
+//
+// The small run pins the arithmetic.  The large one exists because of what the
+// shader's P1 note says: a grid-stride substitution is observation-equivalent,
+// but dropping the `nbIterationsPerBlock *` factor is not -- and neither can be
+// told apart below 262144 contacts, because that is gridDim * blockDim and
+// nbIterationsPerBlock is 1 for anything smaller.
+// ===========================================================================
+namespace p931prep
+{
+using p817cg::V3;
+
+// Ten pointers -> 80 bytes.
+struct ClothPsPreparePush
+{
+    uint64_t clothes, particleSystems, contacts, normalPens, barycentrics,
+             contactInfos, numContacts, constraints, clothAppliedForces,
+             particleAppliedForces;
+};
+static_assert(sizeof(ClothPsPreparePush) == 80, "cloth ps prepare blob must be 80 bytes");
+static_assert(offsetof(ClothPsPreparePush, contactInfos) == 40, "contactInfos @40");
+static_assert(offsetof(ClothPsPreparePush, constraints) == 56, "constraints @56");
+
+// PxgFEMParticleConstraintBlock (PxgFEMCore.h:184): float4[32], float4[32],
+// float[32] = 1152 bytes, and it is a struct of LANE ARRAYS, not an array of
+// per-contact records.
+static const uint32_t CB_STRIDE = 1152u;
+static const uint32_t CB_WORDS = CB_STRIDE / 4u;
+static const uint32_t CB_OFF_NORMAL_PEN = 0u;
+static const uint32_t CB_OFF_BARY = 128u;      // 512 bytes / 4
+static const uint32_t CB_OFF_VELMULT = 256u;   // 1024 bytes / 4
+// PxgFEMCore.h is not in this TU's include set, so the layout is pinned by
+// arithmetic against the header's declaration rather than by sizeof:
+//   float4[32] + float4[32] + float[32] = 512 + 512 + 128 = 1152.
+static_assert(CB_OFF_BARY * 4u == 512u, "barycentric lane array starts at byte 512");
+static_assert(CB_OFF_VELMULT * 4u == 1024u, "velMultiplier lane array starts at byte 1024");
+static_assert(CB_STRIDE == 512u + 512u + 128u, "the block is three lane arrays, 1152 bytes");
+} // namespace p931prep
+
+PXG_TEST(femClothSimPsContactPrepare)
+{
+    using namespace p816dc;
+    using namespace p931prep;
+    using p817cg::V3;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t CLOTH_ID = 1u, PS_ID = 2u;
+    const float REST_DISTANCE = 0.037f;
+
+    // ---- the cloth: 24 triangles, each with its own accumulated delta ---------------
+    const uint32_t NB_TRIS = 24u;
+    std::vector<F4> accum;      // mAccumulatedDeltaPos, .w = inverse mass per vertex
+    std::vector<TriIdx4> ci;
+    for (uint32_t t = 0; t < NB_TRIS; ++t)
+    {
+        const uint32_t base = uint32_t(accum.size());
+        // Distinct per-vertex deltas AND distinct inverse masses, so P6's float4
+        // interpolation of .w is separable from any single vertex's mass.
+        accum.push_back(F4{ 0.01f * float(t), 0.02f * float(t), -0.03f * float(t), 0.5f + 0.1f * float(t % 3) });
+        accum.push_back(F4{ -0.04f * float(t), 0.015f * float(t), 0.02f * float(t), 0.7f + 0.1f * float(t % 5) });
+        accum.push_back(F4{ 0.025f * float(t), -0.01f * float(t), 0.035f * float(t), 0.9f + 0.1f * float(t % 7) });
+        ci.push_back(TriIdx4{ base, base + 1u, base + 2u, 0u });
+    }
+    DevBuf bAccum = makeDev(dev, accum);
+    if (!bAccum.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bAccum.h); return; }
+    DevBuf bCi = makeDev(dev, ci);
+
+    PxgFEMCloth cloth = makeZeroDesc();
+    cloth.mAccumulatedDeltaPos = reinterpret_cast<decltype(cloth.mAccumulatedDeltaPos)>(size_t(bAccum.addr));
+    cloth.mTriangleVertexIndices = reinterpret_cast<decltype(cloth.mTriangleVertexIndices)>(size_t(bCi.addr));
+    cloth.mNbTriangles = NB_TRIS;
+    cloth.mNbVerts = uint32_t(accum.size());
+    cloth.mRestDistance = REST_DISTANCE;
+    std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
+    descArr[CLOTH_ID] = cloth;
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- the particle system: sorted deltas with distinct inverse masses ------------
+    const uint32_t NB_PARTICLES = 48u;
+    std::vector<F4> sortedDeltaP(NB_PARTICLES);
+    for (uint32_t i = 0; i < NB_PARTICLES; ++i)
+        sortedDeltaP[i] = F4{ 0.005f * float(i), -0.007f * float(i), 0.009f * float(i),
+                              // every fourth particle is IMMOVABLE, so unitResponse
+                              // is separable from invMass1 alone
+                              (i % 4u == 0u) ? 0.0f : (0.3f + 0.05f * float(i % 6)) };
+    DevBuf bDeltaP = makeDev(dev, sortedDeltaP);
+    std::vector<PxgParticleSystem> psArr(PS_ID + 1u);
+    std::memset(psArr.data(), 0, psArr.size() * sizeof(PxgParticleSystem));
+    psArr[PS_ID].mSortedDeltaP = reinterpret_cast<float4*>(size_t(bDeltaP.addr));
+    psArr[PS_ID].mCommonData.mNumParticles = NB_PARTICLES;
+    DevBuf bPs = makeDev(dev, psArr);
+
+    // ---- the contacts.  40 of them, so P2's constraint blocks are 0 and 1 and the
+    // lane index wraps.
+    const uint32_t NB_CONTACTS = 40u;
+    std::vector<FemOtherContactInfoHost> infos(NB_CONTACTS);
+    std::vector<F4> contacts(NB_CONTACTS), normalPens(NB_CONTACTS), barys(NB_CONTACTS);
+    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
+    {
+        const uint32_t particle = (i * 7u) % NB_PARTICLES;   // NOT i: P-index vs work index
+        const uint32_t tri = (i * 5u + 3u) % NB_TRIS;        // and NOT the particle either
+        infos[i].pairInd0 = (uint64_t(PS_ID) << 32) | particle;
+        infos[i].pairInd1 = (CLOTH_ID << 20) | tri;
+        infos[i].rigidMatInd_isInCollision = 0xABCDEF01u;    // must be left alone
+        // P3: read and discarded -- seeded with something recognisable so a port
+        // that used it produces garbage rather than something plausible.
+        contacts[i] = F4{ 1e9f, -1e9f, 1e9f, -1e9f };
+        normalPens[i] = F4{ 0.6f - 0.02f * float(i), -0.8f + 0.01f * float(i),
+                            0.1f + 0.005f * float(i), -0.05f + 0.004f * float(i) };
+        const float v = 0.15f + 0.01f * float(i % 5);
+        const float w = 0.25f + 0.01f * float(i % 7);
+        barys[i] = F4{ 1.0f - v - w, v, w, 0.0f };
+    }
+    DevBuf bInfos = makeDev(dev, infos), bContacts = makeDev(dev, contacts);
+    DevBuf bNormalPens = makeDev(dev, normalPens), bBarys = makeDev(dev, barys);
+    std::vector<uint32_t> nc = { NB_CONTACTS };
+    DevBuf bNum = makeDev(dev, nc);
+
+    const uint32_t NB_BLOCKS = (NB_CONTACTS + 31u) / 32u;
+    std::vector<uint32_t> constraintWords(size_t(NB_BLOCKS) * CB_WORDS, 0xEEEEEEEEu);
+    DevBuf bConstraints = makeDev(dev, constraintWords);
+    std::vector<float> forcesSeed(NB_CONTACTS * 2u, -12345.0f);
+    DevBuf bClothForces = makeDev(dev, forcesSeed), bPartForces = makeDev(dev, forcesSeed);
+
+    ClothPsPreparePush p = {};
+    p.clothes = bDesc.addr; p.particleSystems = bPs.addr;
+    p.contacts = bContacts.addr; p.normalPens = bNormalPens.addr; p.barycentrics = bBarys.addr;
+    p.contactInfos = bInfos.addr; p.numContacts = bNum.addr;
+    p.constraints = bConstraints.addr;
+    p.clothAppliedForces = bClothForces.addr; p.particleAppliedForces = bPartForces.addr;
+
+    Kernel k("femClothPsPrepareBda.spv", "cloth_particleContactPrepareLaunch",
+             {}, sizeof(ClothPsPreparePush));
+    k.dispatch(1024u, {}, p, 1u, 1u);
+    dev->flush();
+
+    // ---- the mirror ------------------------------------------------------------------
+    const auto gotC = downloadBuffer<uint32_t>(dev, bConstraints.h, uint32_t(constraintWords.size()));
+    const auto gotClothF = downloadBuffer<float>(dev, bClothForces.h, NB_CONTACTS * 2u);
+    const auto gotPartF = downloadBuffer<float>(dev, bPartForces.h, NB_CONTACTS * 2u);
+
+    uint32_t mismatches = 0u;
+    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
+    {
+        const uint32_t particle = uint32_t(infos[i].pairInd0 & 0xffffffffull);
+        const uint32_t tri = infos[i].pairInd1 & 0xfffffu;
+        const TriIdx4& tv = ci[tri];
+        const F4& b = barys[i];
+        // P6: the whole float4, so .w is the interpolated inverse mass.
+        const F4 v0 = accum[tv.x], v1 = accum[tv.y], v2 = accum[tv.z];
+        const F4 delta1 = F4{ v0.x * b.x + v1.x * b.y + v2.x * b.z,
+                              v0.y * b.x + v1.y * b.y + v2.y * b.z,
+                              v0.z * b.x + v1.z * b.y + v2.z * b.z,
+                              v0.w * b.x + v1.w * b.y + v2.w * b.z };
+        const float invMass1 = delta1.w;
+        const F4& np = normalPens[i];
+        const V3 normal{ -np.x, -np.y, -np.z };                        // P4
+        const F4& dp = sortedDeltaP[particle];
+        const float invMass0 = dp.w;
+        const V3 delta{ delta1.x - dp.x, delta1.y - dp.y, delta1.z - dp.z };  // P5 order
+        const float pen = np.w + (normal.x * delta.x + normal.y * delta.y + normal.z * delta.z)
+                          - REST_DISTANCE;
+        const float unitResponse = invMass0 + invMass1;
+        const float velMultiplier = (unitResponse > 0.0f) ? (1.0f / unitResponse) : 0.0f;
+
+        const size_t blk = size_t(i / 32u) * CB_WORDS;
+        const uint32_t lane = i & 31u;                                  // P2
+        const uint32_t* gn = &gotC[blk + CB_OFF_NORMAL_PEN + lane * 4u];
+        const uint32_t* gb = &gotC[blk + CB_OFF_BARY + lane * 4u];
+        const uint32_t gv = gotC[blk + CB_OFF_VELMULT + lane];
+        const uint32_t refN[4] = { f2u(normal.x), f2u(normal.y), f2u(normal.z), f2u(pen) };
+        const uint32_t refB[4] = { f2u(b.x), f2u(b.y), f2u(b.z), f2u(b.w) };
+        bool bad = (gv != f2u(velMultiplier));
+        for (int j = 0; j < 4; ++j) { if (gn[j] != refN[j] || gb[j] != refB[j]) bad = true; }
+        if (bad)
+        {
+            if (mismatches == 0u)
+            {
+                float gnp; std::memcpy(&gnp, &gn[3], 4);
+                float gvm; std::memcpy(&gvm, &gv, 4);
+                std::printf("    first difference at contact %u (block %u lane %u): "
+                            "pen gpu %.9g vs %.9g, velMult gpu %.9g vs %.9g\n",
+                            i, i / 32u, lane, gnp, pen, gvm, velMultiplier);
+            }
+            ++mismatches;
+        }
+        // P8: both force arrays zeroed, as float2 (stride 8, not 16).
+        if (gotClothF[i * 2] != 0.0f || gotClothF[i * 2 + 1] != 0.0f ||
+            gotPartF[i * 2] != 0.0f || gotPartF[i * 2 + 1] != 0.0f)
+        {
+            std::printf("    applied forces at %u not zeroed: cloth (%g, %g) particle (%g, %g)\n",
+                        i, gotClothF[i * 2], gotClothF[i * 2 + 1],
+                        gotPartF[i * 2], gotPartF[i * 2 + 1]);
+            ++mismatches;
+        }
+    }
+    PXG_CHECK_MSG(mismatches == 0u,
+                  "%u of %u prepared constraints differ BIT-EXACTLY from the host mirror",
+                  mismatches, NB_CONTACTS);
+
+    // Nothing past the contact count may have been touched.
+    uint32_t past = 0u;
+    for (uint32_t i = NB_CONTACTS; i < NB_BLOCKS * 32u; ++i)
+    {
+        const size_t blk = size_t(i / 32u) * CB_WORDS;
+        if (gotC[blk + CB_OFF_VELMULT + (i & 31u)] != 0xEEEEEEEEu) ++past;
+    }
+    PXG_CHECK_MSG(past == 0u, "%u constraint lanes past the contact count were written", past);
+
+    // The info records must come back untouched -- this kernel reads them only.
+    const auto gotInfos = downloadBuffer<FemOtherContactInfoHost>(dev, bInfos.h, NB_CONTACTS);
+    uint32_t infoTouched = 0u;
+    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
+        if (gotInfos[i].rigidMatInd_isInCollision != 0xABCDEF01u) ++infoTouched;
+    PXG_CHECK_MSG(infoTouched == 0u, "%u contact infos were modified by a read-only kernel",
+                  infoTouched);
+
+    std::printf("    [ note ] %u constraints over %u blocks, %u lanes past the count untouched\n",
+                NB_CONTACTS, NB_BLOCKS, NB_BLOCKS * 32u - NB_CONTACTS);
+
+    // ---- COVERAGE, past the point where the work-index formula matters -------------
+    // gridDim * blockDim is 1024 * 256 = 262144.  Below that nbIterationsPerBlock is 1
+    // and the formula collapses to a flat index, so NOTHING about it is observable --
+    // which is why the small run above cannot see it and why the shader's P1 note now
+    // says a grid-stride substitution is equivalent rather than wrong.
+    //
+    // Above it the factor starts to matter.  With 300000 contacts
+    // nbIterationsPerBlock is 2, so each block owns 512 contiguous indices and the
+    // grid covers 524288.  Drop the `nbIterationsPerBlock *` factor and the per-block
+    // ranges overlap instead: the grid then reaches only 1024*256 + 256 = 262400, and
+    // everything from there to 299999 is never written.  That is what this run sees.
+    {
+        const uint32_t BIG = 300000u;
+        const uint32_t BIG_BLOCKS = (BIG + 31u) / 32u;
+        std::vector<FemOtherContactInfoHost> bigInfos(BIG);
+        for (uint32_t i = 0; i < BIG; ++i)
+        {
+            bigInfos[i].pairInd0 = (uint64_t(PS_ID) << 32) | 1u;   // particle 1 is movable
+            bigInfos[i].pairInd1 = (CLOTH_ID << 20) | 0u;
+            bigInfos[i].rigidMatInd_isInCollision = 0u;
+        }
+        DevBuf bBigInfos = makeDev(dev, bigInfos);
+        std::vector<F4> bigF4(BIG, F4{ 0.1f, 0.2f, 0.3f, 0.4f });
+        DevBuf bBigContacts = makeDev(dev, bigF4);
+        DevBuf bBigNormals = makeDev(dev, bigF4);
+        std::vector<F4> bigBary(BIG, F4{ 0.5f, 0.25f, 0.25f, 0.0f });
+        DevBuf bBigBary = makeDev(dev, bigBary);
+        std::vector<uint32_t> bigNum = { BIG };
+        DevBuf bBigNum = makeDev(dev, bigNum);
+        std::vector<uint32_t> bigConstraints(size_t(BIG_BLOCKS) * CB_WORDS, 0xEEEEEEEEu);
+        DevBuf bBigConstraints = makeDev(dev, bigConstraints);
+        std::vector<float> bigForces(size_t(BIG) * 2u, -1.0f);
+        DevBuf bBigCF = makeDev(dev, bigForces), bBigPF = makeDev(dev, bigForces);
+
+        if (!bBigConstraints.addr)
+        {
+            std::printf("    NOTE: the %u-contact coverage run could not allocate; skipped\n", BIG);
+        }
+        else
+        {
+            ClothPsPreparePush q = p;
+            q.contacts = bBigContacts.addr; q.normalPens = bBigNormals.addr;
+            q.barycentrics = bBigBary.addr; q.contactInfos = bBigInfos.addr;
+            q.numContacts = bBigNum.addr; q.constraints = bBigConstraints.addr;
+            q.clothAppliedForces = bBigCF.addr; q.particleAppliedForces = bBigPF.addr;
+            k.dispatch(1024u, {}, q, 1u, 1u);
+            dev->flush();
+
+            const auto bigGot = downloadBuffer<uint32_t>(dev, bBigConstraints.h,
+                                                         uint32_t(bigConstraints.size()));
+            uint32_t unwritten = 0u, firstUnwritten = 0xffffffffu;
+            for (uint32_t i = 0; i < BIG; ++i)
+            {
+                const size_t blk = size_t(i / 32u) * CB_WORDS;
+                if (bigGot[blk + CB_OFF_VELMULT + (i & 31u)] == 0xEEEEEEEEu)
+                {
+                    if (firstUnwritten == 0xffffffffu) firstUnwritten = i;
+                    ++unwritten;
+                }
+            }
+            PXG_CHECK_MSG(unwritten == 0u,
+                          "%u of %u constraint lanes were never written, first at %u.  The grid "
+                          "reaches %u threads, so with %u contacts nbIterationsPerBlock is 2 and "
+                          "each block must own 512 contiguous indices; dropping that factor "
+                          "leaves everything past %u untouched",
+                          unwritten, BIG, firstUnwritten, 1024u * 256u, BIG, 1024u * 256u + 256u);
+            // Report the MEASURED count, not the hoped-for one: PXG_CHECK_MSG records a
+            // failure and carries on, so a note that says "all lanes written"
+            // unconditionally contradicts the check three lines above it.
+            std::printf("    [ note ] coverage run: %u contacts over %u threads, %u lanes "
+                        "unwritten\n", BIG, 1024u * 256u, unwritten);
+        }
+
+        for (PxgBufferHandle h : { bBigInfos.h, bBigContacts.h, bBigNormals.h, bBigBary.h,
+                                   bBigNum.h, bBigConstraints.h, bBigCF.h, bBigPF.h })
+            dev->destroyBuffer(h);
+    }
+
+    for (PxgBufferHandle h : { bAccum.h, bCi.h, bDesc.h, bDeltaP.h, bPs.h, bInfos.h, bContacts.h,
+                               bNormalPens.h, bBarys.h, bNum.h, bConstraints.h, bClothForces.h,
+                               bPartForces.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace
