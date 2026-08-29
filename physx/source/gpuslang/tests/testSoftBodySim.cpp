@@ -10985,10 +10985,47 @@ PXG_TEST(softBodySimFemAttachmentSolve)
     // ever weighted, dropping the per-corner `invMassBary > 0` gate and dropping the barycentric
     // factor from b0w both change nothing.  Two corners now carry weight ZERO for two DIFFERENT
     // reasons -- one has invMass 0, the other has barycentric 0 -- and each kills one of those.
-    const uint32_t NB_TETS = 3u;
-    const float invM0[3][4] = { { 1.0f, 2.0f, 0.0f, 4.0f }, { 1.0f, 2.0f, 0.0f, 4.0f }, { 0, 0, 0, 0 } };
-    const float invM1[3][4] = { { 0.5f, 0.0f, 1.5f, 2.0f }, { 0.5f, 0.0f, 1.5f, 2.0f }, { 0, 0, 0, 0 } };
-    auto makeVerts = [&](float oy, const float invM[3][4]) {
+    //
+    // SIX tetrahedra since P9.33b, one per cone state -- see CONE_STATE below.  Tet 5 is the
+    // fully pinned pair (wTot == 0); it used to be tet 2, which collided with the one state
+    // that reaches the gate's `else` arm and would have left that arm unobserved.
+    const uint32_t NB_TETS = 6u;
+    const float invM0[6][4] = { { 1.0f, 2.0f, 0.0f, 4.0f }, { 1.0f, 2.0f, 0.0f, 4.0f },
+                                { 1.0f, 2.0f, 0.0f, 4.0f }, { 1.0f, 2.0f, 0.0f, 4.0f },
+                                { 1.0f, 2.0f, 0.0f, 4.0f }, { 0, 0, 0, 0 } };
+    const float invM1[6][4] = { { 0.5f, 0.0f, 1.5f, 2.0f }, { 0.5f, 0.0f, 1.5f, 2.0f },
+                                { 0.5f, 0.0f, 1.5f, 2.0f }, { 0.5f, 0.0f, 1.5f, 2.0f },
+                                { 0.5f, 0.0f, 1.5f, 2.0f }, { 0, 0, 0, 0 } };
+
+    // Every cone state the engine can present, one per attachment.  Until P9.33b this rig had
+    // two, and NEITHER was the one the engine actually writes:
+    //   0  THE ENGINE DEFAULT (0, 0, -1, 0), set for every attachment created without a
+    //      PxConeLimitedConstraint (PxgSimulationController.cpp:3696, and :3859 for the
+    //      softbody-cloth pair).  `minDist >= 0` makes isConeLimitedEnabled TRUE, so the
+    //      branch runs on EVERY attachment in EVERY scene -- the opposite of what this
+    //      shader's header claimed until P9.33b.  len clamps into [0,0], so the error is the
+    //      caller's relPos, which already carries `- worldAxis * constraintOffset`.
+    //   1  enabled through maxDist alone; the angle arm stays on its maxAngle < 0 path.
+    //   2  DISABLED.  The engine never writes this, but it is the only state that reaches the
+    //      gate's `else` arm, so it stays as the negative control.
+    //   3  A REAL CONE with the relative position FAR outside it -> cosAngle < cosMaxAngle and
+    //      the sin/cos arm runs.  Nothing here reached that arm before, though the header
+    //      said the fixture drove it directly.
+    //   4  A real cone with the relative position INSIDE it -> the deviation is skipped.
+    //      Without this one `if (cosAngle < cosMaxAngle)` is only ever true, and a port that
+    //      dropped the test entirely would pass.
+    //   5  the fully pinned pair, on the engine default, so wTot == 0 and nothing is written.
+    static const F4 CONE_STATE[6] = {
+        F4{ 0.0f, 0.0f, -1.0f, 0.0f },     // engine default: enabled via minDist
+        F4{ -1.0f, 0.5f, -1.0f, 0.0f },    // enabled via maxDist
+        F4{ -1.0f, -1.0f, -1.0f, 0.0f },   // disabled
+        F4{ -1.0f, -1.0f, 0.30f, 0.0f },   // real cone, relPos outside
+        F4{ -1.0f, -1.0f, 3.00f, 0.0f },   // real cone, relPos inside
+        F4{ 0.0f, 0.0f, -1.0f, 0.0f },     // engine default, fully pinned
+    };
+    static const float PX_MAX_REAL_HOST = 3.4028235e38f;
+
+    auto makeVerts = [&](float oy, const float invM[6][4]) {
         std::vector<F4> v;
         for (uint32_t t = 0; t < NB_TETS; ++t)
         {
@@ -11024,11 +11061,11 @@ PXG_TEST(softBodySimFemAttachmentSolve)
     DevBuf bDesc = makeDev(dev, descArr);
 
     // The constraint block, written by the HOST -- see the section header on why.
-    const uint32_t NB_ATT = 3u;
+    const uint32_t NB_ATT = NB_TETS;              // one attachment per cone state
     const F4 BARY0{ 0.5f, 0.25f, 0.25f, 0.0f };   // corner 3 carries NO weight despite invMass 4
     const F4 BARY1{ 0.1f, 0.2f, 0.3f, 0.4f };     // corner 1 carries none because invMass is 0
     const float CONSTR_OFFSET = 0.4f;
-    std::vector<uint32_t> con(FAC_STRIDE / 4, 0u);
+    std::vector<uint32_t> con(((NB_ATT + 31u) / 32u) * FAC_STRIDE / 4, 0u);
     auto putF4 = [&](size_t byteOff, F4 v) {
         const size_t w = byteOff / 4;
         con[w] = f2u(v.x); con[w + 1] = f2u(v.y); con[w + 2] = f2u(v.z); con[w + 3] = f2u(v.w);
@@ -11043,11 +11080,7 @@ PXG_TEST(softBodySimFemAttachmentSolve)
         putU64(FAC_ELEMID1 + a * 8, encodeSb(1u, a));   // softbody 1, tet a
         putF4(FAC_BARYCENTRIC0 + a * 16, BARY0);
         putF4(FAC_BARYCENTRIC1 + a * 16, BARY1);
-        // attachment 1 is the CONE case: (minDist, maxDist, maxAngle, _) = (-1, 0.5, -1, _)
-        // -> enabled through maxDist alone, and the angle branch stays on its maxAngle < 0 path.
-        const bool cone = (a == 1u);
-        putF4(FAC_LOW_HIGH_ANGLES + a * 16, cone ? F4{ -1.0f, 0.5f, -1.0f, 0.0f }
-                                                 : F4{ -1.0f, -1.0f, -1.0f, 0.0f });
+        putF4(FAC_LOW_HIGH_ANGLES + a * 16, CONE_STATE[a]);
         // The cone axis comes from projectP - pos0 with this barycentric.
         putF4(FAC_ATT_BARYCENTRIC + a * 16, F4{ 0.0f, 1.0f, 0.0f, 0.0f });
         con[(FAC_CONSTR_OFFSET + a * 4) / 4] = f2u(CONSTR_OFFSET);
@@ -11078,19 +11111,63 @@ PXG_TEST(softBodySimFemAttachmentSolve)
         const F4 pos0 = interp(v0, BARY0), pos1 = interp(v1, BARY1);
         float ex = pos1.x - pos0.x, ey = pos1.y - pos0.y, ez = pos1.z - pos0.z;
 
-        if (a == 1u)   // the cone case: maxDist 0.5 clamps the length; maxAngle < 0 -> dir = rel/len
+        // The cone gate, transcribed rather than special-cased: an OR of three `>= 0`
+        // tests (attachments.cuh:36), evaluated per attachment from its own state.
+        const F4 lha = CONE_STATE[a];
+        const float minDist = lha.x, maxDist = lha.y, maxAngle = lha.z;
+        if (maxAngle >= 0.0f || minDist >= 0.0f || maxDist >= 0.0f)
         {
             const F4 proj = interp(v0, F4{ 0.0f, 1.0f, 0.0f, 0.0f });
             float ax = proj.x - pos0.x, ay = proj.y - pos0.y, az = proj.z - pos0.z;
-            const float am = std::sqrt(ax * ax + ay * ay + az * az);
-            if (am > 0.0f) { ax /= am; ay /= am; az /= am; }
+            // PxVec3::getNormalized is a RECIPROCAL and three multiplies, not three
+            // divides: `1/sqrt(m)` rounds once and each multiply rounds again, while
+            // `ax/am` rounds once per component, and the two disagree in the last bit.
+            // This mirror divided until P9.33a, which is part of why the comparison
+            // below carried a 2e-5 tolerance and could not have caught the difference.
+            const float am2 = ax * ax + ay * ay + az * az;
+            if (am2 > 0.0f)
+            { const float rs = 1.0f / std::sqrt(am2); ax *= rs; ay *= rs; az *= rs; }
             float rx = ex - ax * CONSTR_OFFSET, ry = ey - ay * CONSTR_OFFSET, rz = ez - az * CONSTR_OFFSET;
-            const float len = std::sqrt(rx * rx + ry * ry + rz * rz);
-            const float dirx = (len > 1e-6f) ? rx / len : ax;
-            const float diry = (len > 1e-6f) ? ry / len : ay;
-            const float dirz = (len > 1e-6f) ? rz / len : az;
-            const float cl = std::fmin(std::fmax(len, -1.0f), 0.5f);
-            ex = rx - cl * dirx; ey = ry - cl * diry; ez = rz - cl * dirz;
+            float len = std::sqrt(rx * rx + ry * ry + rz * rz);
+
+            float dirx, diry, dirz;
+            if (maxAngle == 0.0f)
+            {
+                dirx = ax; diry = ay; dirz = az;
+            }
+            else if (maxAngle > 0.0f)
+            {
+                dirx = (len > 1e-6f) ? rx / len : ax;
+                diry = (len > 1e-6f) ? ry / len : ay;
+                dirz = (len > 1e-6f) ? rz / len : az;
+                const float cosAngle = dirx * ax + diry * ay + dirz * az;
+                const float sinMax = std::sin(maxAngle), cosMax = std::cos(maxAngle);
+                if (cosAngle < cosMax)
+                {
+                    const float t1x = diry * az - dirz * ay;
+                    const float t1y = dirz * ax - dirx * az;
+                    const float t1z = dirx * ay - diry * ax;
+                    float b1x = ay * t1z - az * t1y;
+                    float b1y = az * t1x - ax * t1z;
+                    float b1z = ax * t1y - ay * t1x;
+                    const float bm2 = b1x * b1x + b1y * b1y + b1z * b1z;
+                    if (bm2 > 0.0f)
+                    { const float rs = 1.0f / std::sqrt(bm2); b1x *= rs; b1y *= rs; b1z *= rs; }
+                    else { b1x = b1y = b1z = 0.0f; }
+                    dirx = cosMax * ax + sinMax * b1x;
+                    diry = cosMax * ay + sinMax * b1y;
+                    dirz = cosMax * az + sinMax * b1z;
+                }
+            }
+            else
+            {
+                dirx = (len > 1e-6f) ? rx / len : ax;
+                diry = (len > 1e-6f) ? ry / len : ay;
+                dirz = (len > 1e-6f) ? rz / len : az;
+            }
+
+            len = std::fmin(std::fmax(len, minDist), maxDist >= 0.0f ? maxDist : PX_MAX_REAL_HOST);
+            ex = rx - len * dirx; ey = ry - len * diry; ez = rz - len * dirz;
         }
 
         const float b0w[4] = { BARY0.x * v0[base].w, BARY0.y * v0[base+1].w,
@@ -11099,10 +11176,20 @@ PXG_TEST(softBodySimFemAttachmentSolve)
                                BARY1.z * v1[base+2].w, BARY1.w * v1[base+3].w };
         const float bb0[4] = { BARY0.x, BARY0.y, BARY0.z, BARY0.w };
         const float bb1[4] = { BARY1.x, BARY1.y, BARY1.z, BARY1.w };
-        float wTot = 0.0f;
-        for (int c = 0; c < 4; ++c) wTot += b0w[c] * bb0[c] + b1w[c] * bb1[c];
+        // TWO SUMS, THEN ONE ADD -- not one interleaved accumulation.  The CUDA
+        // (softBodyGM.cu:2408-2410) computes wTot0 over body 0 and wTot1 over body 1 and
+        // adds them once; accumulating `b0w[c]*bb0[c] + b1w[c]*bb1[c]` into a running total
+        // visits the same eight products in a different order and lands on a different last
+        // bit.  This mirror did that until P9.33a, and the 2e-5 tolerance above hid it.
+        float wTot0 = 0.0f, wTot1 = 0.0f;
+        for (int c = 0; c < 4; ++c) wTot0 += b0w[c] * bb0[c];
+        for (int c = 0; c < 4; ++c) wTot1 += b1w[c] * bb1[c];
+        const float wTot = wTot0 + wTot1;
         if (!(wTot > 0.0f)) continue;
-        const float dx = ex / wTot, dy = ey / wTot, dz = ez / wTot;
+        // `error * (1.0f/wTot)` (softBodyGM.cu:2414): a reciprocal and three multiplies,
+        // which is not `ex / wTot` three times.
+        const float inv = 1.0f / wTot;
+        const float dx = ex * inv, dy = ey * inv, dz = ez * inv;
         for (int c = 0; c < 4; ++c)
         {
             if (b1w[c] > 0.0f)
@@ -11120,9 +11207,14 @@ PXG_TEST(softBodySimFemAttachmentSolve)
 
     const auto g0 = downloadBuffer<F4>(dev, bD0.h, uint32_t(delta0.size()));
     const auto g1 = downloadBuffer<F4>(dev, bD1.h, uint32_t(delta1.size()));
+    // BITWISE since P9.33a.  This comparison carried a 2e-5 tolerance, which is what
+    // let the shader's `rsqrt` and this mirror's component-wise divide sit side by side
+    // for five tranches without anyone learning whether they agreed.  Both are now the
+    // reciprocal form the engine computes, so the tolerance has nothing left to hide and
+    // is gone; a divergence in the cone branch is a failure again.
     auto nearV = [](F4 g, F4 r) {
-        return std::fabs(g.x - r.x) < 2e-5f && std::fabs(g.y - r.y) < 2e-5f &&
-               std::fabs(g.z - r.z) < 2e-5f && std::fabs(g.w - r.w) < 2e-5f;
+        return f2u(g.x) == f2u(r.x) && f2u(g.y) == f2u(r.y) &&
+               f2u(g.z) == f2u(r.z) && f2u(g.w) == f2u(r.w);
     };
     size_t mm = 0;
     for (uint32_t c = 0; c < uint32_t(v0.size()); ++c)
@@ -11137,17 +11229,41 @@ PXG_TEST(softBodySimFemAttachmentSolve)
     PXG_CHECK_MSG(mm == 0, "sb_solveOutputSoftBodyAttachmentDeltaV (%zu mismatches)", mm);
 
     // Pin the structural facts the reference alone would not: the two zero-weight corners are
-    // untouched for two DIFFERENT reasons, and attachment 2 writes nothing at all.
+    // untouched for two DIFFERENT reasons, and the fully pinned attachment writes nothing.
     auto isZero = [&](F4 g) { return g.x == 0.0f && g.y == 0.0f && g.z == 0.0f && g.w == 0.0f; };
     PXG_CHECK_MSG(isZero(g0[2]), "sb0 corner 2 has invMass 0 and must be untouched");
     PXG_CHECK_MSG(isZero(g0[3]), "sb0 corner 3 has barycentric 0 and must be untouched even though "
                                  "its invMass is 4 -- only the PRODUCT gates the write");
     PXG_CHECK_MSG(isZero(g1[1]), "sb1 corner 1 has invMass 0 and must be untouched");
-    for (uint32_t c = 8; c < 12u; ++c)
+    const uint32_t PINNED_ATT = NB_ATT - 1u;      // the last cone state carries the pinned pair
+    for (uint32_t c = PINNED_ATT * 4u; c < PINNED_ATT * 4u + 4u; ++c)
         PXG_CHECK_MSG(isZero(g0[c]) && isZero(g1[c]),
-                      "attachment 2's tetrahedra are fully pinned (wTot == 0) and must be untouched");
+                      "attachment %u's tetrahedra are fully pinned (wTot == 0) and must be "
+                      "untouched", PINNED_ATT);
     PXG_CHECK_MSG(!isZero(g0[0]) && !isZero(g0[1]) && !isZero(g1[0]) && !isZero(g1[2]) && !isZero(g1[3]),
                   "the weighted corners must all have been written");
+
+    // Every cone state must actually have moved something, or a state is in the table without
+    // being exercised -- which is how this rig came to claim it drove the sin/cos arm while
+    // reaching only the maxAngle < 0 one.  The four unpinned corners of each of the first
+    // NB_ATT-1 attachments are checked as a group, since which corners carry weight is fixed
+    // by BARY0/BARY1 above.
+    for (uint32_t a = 0; a + 1u < NB_ATT; ++a)
+    {
+        const uint32_t b = a * 4u;
+        PXG_CHECK_MSG(!isZero(g0[b]) || !isZero(g0[b + 1u]),
+                      "cone state %u left softbody 0 untouched; it is in the table without "
+                      "being observed", a);
+        PXG_CHECK_MSG(!isZero(g1[b]) || !isZero(g1[b + 2u]),
+                      "cone state %u left softbody 1 untouched", a);
+    }
+    // States 3 and 4 are the same real cone from opposite sides of `cosAngle < cosMaxAngle`.
+    // If they produced the SAME correction the rig is not straddling the test, and a port
+    // that deleted the deviation entirely would pass.
+    PXG_CHECK_MSG(f2u(g0[12].x) != f2u(g0[16].x) || f2u(g0[12].y) != f2u(g0[16].y) ||
+                  f2u(g0[12].z) != f2u(g0[16].z),
+                  "cone states 3 (relPos outside the cone) and 4 (inside) produced identical "
+                  "corrections, so `cosAngle < cosMaxAngle` is not being straddled");
 
     std::printf("  att0 sb0=(%.5f %.5f %.5f|%.1f) sb1=(%.5f %.5f %.5f|%.1f)\n",
                 g0[0].x, g0[0].y, g0[0].z, g0[0].w, g1[0].x, g1[0].y, g1[0].z, g1[0].w);

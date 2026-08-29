@@ -1737,6 +1737,92 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.33b — der Kegelzweig ist nicht schlafend, und meine eigene Kopfnotiz behauptete es fünf Tranchen lang
+
+Diese Tranche portiert ebenfalls nichts. Sie korrigiert eine **falsche Behauptung
+von mir** und schließt die Lücke, die sie offengelassen hat.
+
+### Was der Kopf von `softBodyFemAttachBda.slang` seit P8.19 sagte
+
+> „KEGELGRENZEN SIND PORTIERT, ABER AUF JEDER SZENE HIER SCHLAFEND. […] eine
+> Anheftung ohne `PxConeLimitedConstraint` trägt **-1 in allen dreien**."
+
+Das stimmt nicht. Die Engine schreibt
+
+```cpp
+attachment.coneLimitParams.low_high_angle = make_float4(0.f, 0.f, -1.f, 0.f);
+```
+
+— PxgSimulationController.cpp:3696 für das Softbody-Softbody-Paar, :3859 für
+Softbody-Tuch. Also `minDist = 0`, und `isConeLimitedEnabled` ist ein **ODER**
+dreier `>= 0`-Tests. `0 >= 0` hält. Der Zweig läuft für **jede** Anheftung in
+**jeder** Szene.
+
+Er fällt dort auch nicht auf die Identität zusammen: `len` klemmt in
+`[0, 0] = 0`, das Ergebnis ist also `relPos - 0·dir = relPos` — aber `relPos` ist
+das Argument, und der Aufrufer hat es bereits als
+`relPos1 - worldAxis · constraintOffset` gebaut. Der Versatz beißt weiter, und
+`worldAxis` kostet weiter eine Normalisierung. Was der Vorgabefall **wirklich**
+abschaltet, ist nur die Transzendente.
+
+### Zwei Löcher in der Vorrichtung, die daraus folgten
+
+| | Befund |
+|---|---|
+| Der **Vorgabezustand der Engine** `(0, 0, -1, 0)` kam im Prüfstand **nicht vor**. | Er säte `(-1,-1,-1,0)` — einen Zustand, den die Engine nie erzeugt — und `(-1, 0.5, -1, 0)`. Der eine Zustand, der in jeder echten Szene vorkommt, war der einzige, der fehlte. |
+| Der `maxAngle > 0`-Arm — die **einzige** Stelle mit sin/cos — wurde **nie erreicht**, obwohl der Kopf schrieb „und die Vorrichtung fährt ihn direkt an". | Beide gesäten Zustände hatten `maxAngle = -1`. |
+
+Jetzt trägt der Prüfstand **sechs** Anheftungen, eine je Zustand: Vorgabe der
+Engine, über `maxDist` freigeschaltet, abgeschaltet (als Negativkontrolle für den
+`else`-Arm, den die Engine nie erreicht), echter Kegel mit `relPos` **außerhalb**,
+echter Kegel mit `relPos` **innerhalb**, und das vollständig festgenagelte Paar.
+
+Die beiden Kegelzustände sind ein **Paar**: ohne den inneren ist
+`if (cosAngle < cosMaxAngle)` eine Zeile, die immer wahr ist, und ein Port, der
+den Test wegließe, bestünde. Die Vorrichtung verlangt deshalb ausdrücklich, dass
+die beiden **verschiedene** Korrekturen liefern.
+
+### Der Spiegel war an zwei Stellen falsch assoziiert — und die Toleranz verbarg es
+
+Beim Verschärfen des Vergleichs von 2e-5 auf **bitweise** fielen sofort zehn
+Vertices durch. Beide Ursachen lagen im Spiegel, nicht im Port:
+
+* **`wTot` war eine verschränkte Summe.** Der Spiegel akkumulierte
+  `b0w[c]·bb0[c] + b1w[c]·bb1[c]` in **einen** Laufwert; die CUDA rechnet `wTot0`
+  über Körper 0, `wTot1` über Körper 1 und addiert **einmal**. Dieselben acht
+  Produkte, andere Reihenfolge, anderes letztes Bit.
+* **`ex / wTot` statt `ex · (1/wTot)`.** Die CUDA schreibt
+  `error * (1.0f/wTot)` — ein Kehrwert und drei Multiplikationen, nicht drei
+  Divisionen.
+
+Dazu die Normalisierung aus P9.33a: der Spiegel dividierte komponentenweise, wo
+`getNormalized` einen Kehrwert bildet und dreimal multipliziert.
+
+> Drei Assoziationsfehler in einem Spiegel, fünf Tranchen lang unentdeckt, weil
+> eine Toleranz von 2e-5 darüberlag. Die Toleranz ist jetzt weg.
+
+### Die eine Naht, die bitweise nicht zu haben ist
+
+`PxSinCos` (PxMath.h:205) ist auf CUDA ab `__CUDA_ARCH__ >= 350` **`__sincosf`** —
+die Fast-Math-Näherung, nicht `sinf`/`cosf`. Der Shader ruft Slangs `sin`/`cos`,
+der Spiegel die Host-libm. Für die beiden Winkel dieses Prüfstands stimmen Shader
+und Spiegel **bitweise** überein, und der Vergleich bleibt deshalb bitweise
+stehen — aber das ist eine Beobachtung an zwei Werten, keine Zusage. Gegenüber
+der echten CUDA-Engine ist dieser Arm eine **Toleranznaht**, und das steht jetzt
+im Kopf des Shaders statt nur „PxSinCos ist die einzige Transzendente".
+
+### Verifikation
+
+* Vergleich der Anheftungslösung **bitweise** statt auf 2e-5, über alle sechs
+  Kegelzustände;
+* jeder Zustand muss nachweislich etwas bewegt haben, und die beiden echten
+  Kegel müssen sich **unterscheiden** — sonst steht ein Zustand in der Tabelle,
+  ohne beobachtet zu werden;
+* Suite **822/822** in beiden Speichermodi — Modus 2 im zweiten Anlauf, der erste
+  traf den llvmpipe-Plattformfehler;
+* Manifest unverändert, also `build-sdk` und die Szenen unberührt.
+
+
 ## P9.33a — vierzig Shader hingen an einer Eigenschaft des Treibers, die niemand gemessen hatte
 
 Diese Tranche portiert nichts. Sie misst etwa, worauf der halbe Korpus bereits

@@ -63,11 +63,26 @@
 //     what the CUDA narrowing conversion does; reading the full 64 bits would be wrong the
 //     moment the upper half held anything.
 //
-// CONE LIMITS ARE PORTED BUT DORMANT ON EVERY SCENE HERE.  `isConeLimitedEnabled(maxAngle,
-// minDist, maxDist)` is `maxAngle >= 0 || minDist >= 0 || maxDist >= 0` (attachments.cuh:36),
-// and an attachment created without a PxConeLimitedConstraint carries -1 in all three.  The
-// branch is transcribed anyway — including its PxSinCos, the ONLY transcendental in this
-// shader and therefore the only tolerance seam — and the fixture drives it directly.
+// CONE LIMITS ARE ON THE HOT PATH, NOT DORMANT.  This header said the opposite until P9.33b,
+// and the correction matters because it changes which states a fixture has to reach.
+// `isConeLimitedEnabled(maxAngle, minDist, maxDist)` is `maxAngle >= 0 || minDist >= 0 ||
+// maxDist >= 0` (attachments.cuh:36) — an OR of three `>= 0` tests, not an AND.  An
+// attachment created WITHOUT a PxConeLimitedConstraint does not carry -1 in all three: the
+// engine writes `low_high_angle = (0, 0, -1, 0)` (PxgSimulationController.cpp:3696 for the
+// softbody-softbody pair, :3859 for softbody-cloth), so minDist is 0, `0 >= 0` holds, and
+// the branch is ENTERED for every attachment in every scene.
+//
+// It does not collapse to the identity there either.  With maxAngle = -1 the angle branch is
+// skipped, and `len` clamps into [minDist, maxDist] = [0, 0] = 0, so the return is
+// `relPos - 0*dir` = relPos — but `relPos` is the argument, which the CALLER already built as
+// `relPos1 - worldAxis * constraintOffset`.  The offset still bites, and `worldAxis` still
+// costs a normalise.  What the default DOES switch off is the transcendental: PxSinCos runs
+// only when maxAngle > 0, i.e. only for a real cone.
+//
+// That transcendental is worth naming precisely, because it is the one seam here that is not
+// bit-determined: on CUDA `PxSinCos` (PxMath.h:205) is `__sincosf` for __CUDA_ARCH__ >= 350 —
+// the FAST-math intrinsic, not sinf/cosf — while this shader calls Slang's sin/cos.  Two
+// approximations of the same function, agreeing to a tolerance rather than to the bit.
 //
 // *** THE GRID. ***  Both kernels launch grid (SB_UPDATEROTATION = 1024, 1, 1) with block
 // (SB_UPDATEROTATION = 256, 1, 1) and use the engine's standard strided form:
@@ -95,7 +110,7 @@ module softBodyFemAttachBda;
 
 import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu (mSimTetIndices@80, mSimPosition_InvMass@96, mSimDelta@272)
 import pxgSlangAtomicFloat;    // pxgAtomicAddF4XYZ / pxgAtomicAddF4W
-import pxgSlangFemFemAttach;   // FAC_* layout of PxgFEMFEMAttachmentConstraint + facSlot
+import pxgSlangFemFemAttach;   // FAC_* layout + facSlot + the cone/scatter helpers
 
 // PxgSoftBodyKernelBlockDim/GridDim::SB_UPDATEROTATION (PxgSoftBodyCoreKernelIndices.h:42/59).
 static const uint SB_BLOCK = 256u;
@@ -106,7 +121,6 @@ static const uint SB_GRID = 1024u;
 static const uint PXG_SB_ID_SHIFT = 20u;
 static const uint PXG_SB_ELEM_MASK = 0x000fffffu;
 
-static const float PX_MAX_F32 = 3.4028235e38f;
 
 // ---------------------------------------------------------------------------
 // PxgFEMFEMAttachment (PxgSimulationCoreDesc.h:265, PX_ALIGN(16), sizeof 80).
@@ -163,80 +177,13 @@ struct FemAttachSolveParams
 [[vk::push_constant]] ConstantBuffer<FemAttachPrepParams> gAp;
 
 // ---------------------------------------------------------------------------
-// Cone-limit helpers (attachments.cuh:36 / :48), transcribed literally.
-// ---------------------------------------------------------------------------
-bool isConeLimitedEnabled(float maxAngle, float minDist, float maxDist)
-{
-    return maxAngle >= 0.0f || minDist >= 0.0f || maxDist >= 0.0f;
-}
-
-float3 faGetNormalized(float3 v)
-{
-    const float m = dot(v, v);
-    return m > 0.0f ? v * rsqrt(m) : float3(0, 0, 0);
-}
-
-// The minimum translation from relPos into the allowed cone volume.  PxSinCos is the only
-// transcendental in this shader.
-float3 computeConeLimitedError(float maxAngle, float minDist, float maxDist,
-                               float3 coneAxis, float3 relPos)
-{
-    float len = length(relPos);
-
-    float3 dir;
-    if (maxAngle == 0.0f)
-    {
-        dir = coneAxis;
-    }
-    else if (maxAngle > 0.0f)
-    {
-        dir = (len > 1.0e-6f) ? (relPos / len) : coneAxis;
-        const float cosAngle = dot(dir, coneAxis);
-        const float sinMaxAngle = sin(maxAngle);
-        const float cosMaxAngle = cos(maxAngle);
-        if (cosAngle < cosMaxAngle)   // theta > maxAngle
-        {
-            const float3 t1 = cross(dir, coneAxis);
-            const float3 b1 = faGetNormalized(cross(coneAxis, t1));
-            dir = cosMaxAngle * coneAxis + sinMaxAngle * b1;
-        }
-    }
-    else
-    {
-        dir = (len > 1.0e-6f) ? (relPos / len) : coneAxis;
-    }
-
-    len = clamp(len, minDist, maxDist >= 0.0f ? maxDist : PX_MAX_F32);
-
-    return relPos - len * dir;   // the ideal relPos is len * dir
-}
-
-// updateTetPositionDelta (softBody.cuh:105): AtomicAdd(dst, delta * invMassBary_k, 1.f) for
-// each corner whose weight is strictly positive — xyz takes the scaled delta, .w takes ONE.
-void updateTetPositionDelta(uint64_t out, uint4 tetVertIndices, float3 deltaPosition,
-                            float4 invMassBary)
-{
-    if (invMassBary.x > 0.0f)
-    {
-        pxgAtomicAddF4XYZ(out, tetVertIndices.x, deltaPosition * invMassBary.x);
-        pxgAtomicAddF4W(out, tetVertIndices.x, 1.0f);
-    }
-    if (invMassBary.y > 0.0f)
-    {
-        pxgAtomicAddF4XYZ(out, tetVertIndices.y, deltaPosition * invMassBary.y);
-        pxgAtomicAddF4W(out, tetVertIndices.y, 1.0f);
-    }
-    if (invMassBary.z > 0.0f)
-    {
-        pxgAtomicAddF4XYZ(out, tetVertIndices.z, deltaPosition * invMassBary.z);
-        pxgAtomicAddF4W(out, tetVertIndices.z, 1.0f);
-    }
-    if (invMassBary.w > 0.0f)
-    {
-        pxgAtomicAddF4XYZ(out, tetVertIndices.w, deltaPosition * invMassBary.w);
-        pxgAtomicAddF4W(out, tetVertIndices.w, 1.0f);
-    }
-}
+// The cone-limit helpers and the tet scatter used to live here.  P9.33 moved them into
+// `pxgSlangFemFemAttach` when the softbody-vs-CLOTH solve became their second consumer:
+// they are ONE CUDA definition each (attachments.cuh:36/:48, softBody.cuh:105), and a
+// second copy of a shared definition is the thing pxgSlangFemRigidAttach's header warns
+// about.  The normalise also changed spelling in the move, from `rsqrt(m)` to the literal
+// `1.0f / sqrt(m)` the engine computes -- see P9.33a and gpuslang.npFloatIntrinRecipSqrt,
+// which measures the two to be bit-identical on this device over 258442 inputs.
 
 // ===========================================================================
 // femAttachmentPrepareLaunch — scatter the descriptor into the warp-strided block.
@@ -353,7 +300,7 @@ void sb_solveOutputSoftBodyAttachmentDeltaVLaunch(uint3 gtid : SV_GroupThreadID,
             const float4 projectP = p00 * attachmentBary.x + p01 * attachmentBary.y +
                                     p02 * attachmentBary.z + p03 * attachmentBary.w;
             const float4 axis = projectP - pos0;
-            const float3 worldAxis = faGetNormalized(axis.xyz);
+            const float3 worldAxis = facGetNormalized(axis.xyz);
 
             error = computeConeLimitedError(lowHighAngle.z, lowHighAngle.x, lowHighAngle.y,
                                             worldAxis, relPos1.xyz - worldAxis * constraintOffset);
@@ -375,8 +322,8 @@ void sb_solveOutputSoftBodyAttachmentDeltaVLaunch(uint3 gtid : SV_GroupThreadID,
         if (wTot > 0.0f)
         {
             const float3 delta = error * (1.0f / wTot);
-            updateTetPositionDelta(accumDeltaV1, tetInd1, -delta, b1w);
-            updateTetPositionDelta(accumDeltaV0, tetInd0, delta, b0w);
+            updateTetPositionDelta(accumDeltaV1, tetInd1, -delta, b1w, 1.0f);
+            updateTetPositionDelta(accumDeltaV0, tetInd0, delta, b0w, 1.0f);
         }
     }
 }
