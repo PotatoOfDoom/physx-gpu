@@ -11757,9 +11757,18 @@ PXG_TEST(femClothSimPsContactPrepare)
         const uint32_t base = uint32_t(accum.size());
         // Distinct per-vertex deltas AND distinct inverse masses, so P6's float4
         // interpolation of .w is separable from any single vertex's mass.
-        accum.push_back(F4{ 0.01f * float(t), 0.02f * float(t), -0.03f * float(t), 0.5f + 0.1f * float(t % 3) });
-        accum.push_back(F4{ -0.04f * float(t), 0.015f * float(t), 0.02f * float(t), 0.7f + 0.1f * float(t % 5) });
-        accum.push_back(F4{ 0.025f * float(t), -0.01f * float(t), 0.035f * float(t), 0.9f + 0.1f * float(t % 7) });
+        // TRIANGLE 23 IS ENTIRELY PINNED.  Contact 4 pairs it with particle 28,
+        // whose inverse mass is also zero, so that contact -- and only that one --
+        // has unitResponse == 0 and takes the velMultiplier guard's else branch.
+        // Without it `(unitResponse > 0) ? 1/unitResponse : 0` and a bare
+        // reciprocal agree everywhere and the guard is untested; the sweep said so.
+        const bool pinnedTri = (t == NB_TRIS - 1u);
+        const float w0 = pinnedTri ? 0.0f : (0.5f + 0.1f * float(t % 3));
+        const float w1 = pinnedTri ? 0.0f : (0.7f + 0.1f * float(t % 5));
+        const float w2 = pinnedTri ? 0.0f : (0.9f + 0.1f * float(t % 7));
+        accum.push_back(F4{ 0.01f * float(t), 0.02f * float(t), -0.03f * float(t), w0 });
+        accum.push_back(F4{ -0.04f * float(t), 0.015f * float(t), 0.02f * float(t), w1 });
+        accum.push_back(F4{ 0.025f * float(t), -0.01f * float(t), 0.035f * float(t), w2 });
         ci.push_back(TriIdx4{ base, base + 1u, base + 2u, 0u });
     }
     DevBuf bAccum = makeDev(dev, accum);
@@ -11820,7 +11829,13 @@ PXG_TEST(femClothSimPsContactPrepare)
     const uint32_t NB_BLOCKS = (NB_CONTACTS + 31u) / 32u;
     std::vector<uint32_t> constraintWords(size_t(NB_BLOCKS) * CB_WORDS, 0xEEEEEEEEu);
     DevBuf bConstraints = makeDev(dev, constraintWords);
-    std::vector<float> forcesSeed(NB_CONTACTS * 2u, -12345.0f);
+    // The applied-force arrays are float2, so 2 floats per contact -- but they are
+    // allocated with FOUR and the tail seeded, because a port that wrote them as
+    // float4 zeroes bytes [16i, 16i+16) instead of [8i, 8i+8) and every word this
+    // fixture checks still comes back zero.  The sweep survived exactly that; the
+    // tail is what tells the two apart (and what a float4 write runs off the end
+    // of in the engine's own allocation).
+    std::vector<float> forcesSeed(NB_CONTACTS * 4u, -12345.0f);
     DevBuf bClothForces = makeDev(dev, forcesSeed), bPartForces = makeDev(dev, forcesSeed);
 
     ClothPsPreparePush p = {};
@@ -11837,8 +11852,8 @@ PXG_TEST(femClothSimPsContactPrepare)
 
     // ---- the mirror ------------------------------------------------------------------
     const auto gotC = downloadBuffer<uint32_t>(dev, bConstraints.h, uint32_t(constraintWords.size()));
-    const auto gotClothF = downloadBuffer<float>(dev, bClothForces.h, NB_CONTACTS * 2u);
-    const auto gotPartF = downloadBuffer<float>(dev, bPartForces.h, NB_CONTACTS * 2u);
+    const auto gotClothF = downloadBuffer<float>(dev, bClothForces.h, NB_CONTACTS * 4u);
+    const auto gotPartF = downloadBuffer<float>(dev, bPartForces.h, NB_CONTACTS * 4u);
 
     uint32_t mismatches = 0u;
     for (uint32_t i = 0; i < NB_CONTACTS; ++i)
@@ -11916,8 +11931,37 @@ PXG_TEST(femClothSimPsContactPrepare)
     PXG_CHECK_MSG(infoTouched == 0u, "%u contact infos were modified by a read-only kernel",
                   infoTouched);
 
-    std::printf("    [ note ] %u constraints over %u blocks, %u lanes past the count untouched\n",
-                NB_CONTACTS, NB_BLOCKS, NB_BLOCKS * 32u - NB_CONTACTS);
+    // The float2 stride, measured: everything from 2*NB_CONTACTS on must still hold
+    // the seed.
+    uint32_t tailTouched = 0u;
+    for (uint32_t i = NB_CONTACTS * 2u; i < NB_CONTACTS * 4u; ++i)
+    {
+        if (gotClothF[i] != -12345.0f) ++tailTouched;
+        if (gotPartF[i] != -12345.0f) ++tailTouched;
+    }
+    PXG_CHECK_MSG(tailTouched == 0u,
+                  "%u words past the float2 region were written; the applied-force arrays are "
+                  "float2 (stride 8), and a float4 store covers twice the ground and runs off "
+                  "the end of the engine's allocation", tailTouched);
+
+    // The velMultiplier guard, measured rather than assumed to be reachable.
+    uint32_t zeroResponse = 0u;
+    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
+    {
+        const uint32_t particle = uint32_t(infos[i].pairInd0 & 0xffffffffull);
+        const uint32_t tri = infos[i].pairInd1 & 0xfffffu;
+        const TriIdx4& tv = ci[tri];
+        const F4& b = barys[i];
+        const float im1 = accum[tv.x].w * b.x + accum[tv.y].w * b.y + accum[tv.z].w * b.z;
+        if (sortedDeltaP[particle].w + im1 <= 0.0f) ++zeroResponse;
+    }
+    PXG_CHECK_MSG(zeroResponse >= 1u,
+                  "no contact has unitResponse == 0, so the velMultiplier guard's else branch "
+                  "is unreachable and a bare reciprocal would pass");
+
+    std::printf("    [ note ] %u constraints over %u blocks, %u lanes past the count untouched, "
+                "%u with zero unit response\n",
+                NB_CONTACTS, NB_BLOCKS, NB_BLOCKS * 32u - NB_CONTACTS, zeroResponse);
 
     // ---- COVERAGE, past the point where the work-index formula matters -------------
     // gridDim * blockDim is 1024 * 256 = 262144.  Below that nbIterationsPerBlock is 1
@@ -12135,7 +12179,10 @@ PXG_TEST(femClothSimPsSolveCP)
         // write at all and must leave its applied force exactly as seeded.
         const float im = (i == 7u) ? 0.0f : (0.25f + 0.04f * float(i % 5));
         sortedDeltaP[i] = F4{ 0.006f * float(i), -0.004f * float(i), 0.008f * float(i), im };
-        phases[i] = (i % 2u);                    // two groups -> two particle materials
+        // Two groups -- but with the NON-GROUP bits set, so `phase & GROUP_MASK` is
+        // not the identity.  With bare 0/1 phases the mask is a no-op and the mutant
+        // that drops it survives, which is what the sweep reported.
+        phases[i] = (i % 2u) | 0x40000000u | 0x00100000u;
     }
     DevBuf bDeltaP = makeDev(dev, sortedDeltaP), bPhases = makeDev(dev, phases);
     std::vector<uint32_t> phaseToMat = { (1u << 16) | 0u };     // group 0 -> mat 0, group 1 -> mat 1
@@ -12178,9 +12225,18 @@ PXG_TEST(femClothSimPsSolveCP)
         V3 n{ 0.3f + 0.05f * float(i), 0.8f - 0.03f * float(i), -0.5f + 0.02f * float(i) };
         pxNormalize(n);
         const float pen = 0.02f - 0.008f * float(i);
-        // S8's second skip: triangle 5's third barycentric is exactly zero.
-        const float w = (i == 5u) ? 0.0f : (0.20f + 0.01f * float(i % 4));
-        const float v = 0.30f + 0.02f * float(i % 3);
+        // S8's second skip condition, once in EACH of the three slots.  The first
+        // version zeroed only the third, and the mutant that drops the epsilon test
+        // from the FIRST branch then survived -- a survivor that says nothing about
+        // the code and everything about which branch the rig happened to reach.
+        //   contact 5 -> bary.z == 0   (w = 0)
+        //   contact 6 -> bary.y == 0   (v = 0)
+        //   contact 8 -> bary.x == 0   (v + w = 1)
+        float v, w;
+        if (i == 5u)      { v = 0.30f; w = 0.0f; }
+        else if (i == 6u) { v = 0.0f;  w = 0.25f; }
+        else if (i == 8u) { v = 0.40f; w = 0.60f; }
+        else              { w = 0.20f + 0.01f * float(i % 4); v = 0.30f + 0.02f * float(i % 3); }
         refNormalPen[i] = F4{ n.x, n.y, n.z, pen };
         refBary[i] = F4{ 1.0f - v - w, v, w, 0.0f };
         refVelMult[i] = 0.7f + 0.05f * float(i % 6);
