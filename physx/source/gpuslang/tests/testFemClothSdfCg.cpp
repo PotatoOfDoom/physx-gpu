@@ -375,7 +375,8 @@ static void buildScene(Scene& S, bool negScale)
 enum Coverage
 {
     COV_FULL,       // the resume loop, the three-way filter and both gates
-    COV_NEGSCALE    // the sign of cullScale, and that the sign changes the answer
+    COV_NEGSCALE,   // the sign of cullScale, and that the sign changes the answer
+    COV_EXACTGATE   // a triangle whose sep is BIT-IDENTICAL to cullScale
 };
 
 struct Options
@@ -728,6 +729,9 @@ struct Expect
     std::vector<Contact> contacts;      // in the kernel's own round-then-thread order
     uint32_t gathered = 0, skipped = 0, partialKept = 0;
     uint32_t culled = 0, gated = 0, zeroDir = 0;
+    // Triangles sitting EXACTLY on the cull gate, and how many of those an `<=`
+    // spelling would carry all the way to a written contact.
+    uint32_t exactGate = 0, exactGateWouldWrite = 0;
     size_t rounds = 0;
 };
 
@@ -779,6 +783,21 @@ static Expect predictPair(const Scene& S, const ClothDef& c, const Rig& R,
             hComputeBarycentric(v0a[at], v1a[at], v2a[at], pointV, bary);
             const PxVec3 posShape = hVertex2Shape(pointV, S.scale, S.scaleRot);
 
+            // The one place `<` and `<=` can part company, counted so the fixture can
+            // insist the rig reaches it -- and counted TWICE, because a triangle that
+            // slips past a `<=` gate and is then stopped by the second one leaves no
+            // trace either way.
+            if (f2u(sep) == f2u(cull))
+            {
+                ++E.exactGate;
+                PxVec3 d2 = hShape2Vertex(PxVec3(desc[at].dir.x, desc[at].dir.y, desc[at].dir.z),
+                                          S.scale, S.scaleRot);
+                float m2 = d2.dot(d2);
+                float s2 = sep;
+                if (m2 > 0.0f) { m2 = 1.0f / std::sqrt(m2); s2 = s2 * m2; }
+                if (s2 < contactDistance) ++E.exactGateWouldWrite;
+            }
+
             if (!(sep < cull)) { ++E.culled; continue; }
 
             // vertex2ShapeNormalVector IS shape2Vertex.
@@ -812,12 +831,9 @@ static Expect predictPair(const Scene& S, const ClothDef& c, const Rig& R,
 }
 
 // ---------------------------------------------------------------------------
-static void runOne(PxgSlangComputeDevice* dev, const char* label, const Options& opt,
-                   bool negScale)
+static void runOneScene(PxgSlangComputeDevice* dev, const char* label, const Options& opt,
+                        Scene& S)
 {
-    Scene S;
-    buildScene(S, negScale);
-
     Rig R;
     if (!buildRig(dev, S, opt, R))
     {
@@ -891,6 +907,39 @@ static void runOne(PxgSlangComputeDevice* dev, const char* label, const Options&
                       "%s: %u triangles failed the cull gate and %u the contact-distance gate "
                       "(both must be > 0, or the two gates are one)",
                       label, exp[0].culled, exp[0].gated);
+    }
+    else if (opt.coverage == COV_EXACTGATE)
+    {
+        // THIS IS A PROOF MADE EXECUTABLE, and it did not start out as one.
+        //
+        // `<` and `<=` on the cull gate part company at exactly one point, and the
+        // search above manufactures it: a contact distance whose derived cullScale is
+        // bit-identical to some gathered triangle's separation.  The first half of
+        // the check is that the rig REACHES that point.
+        //
+        // The second half is the surprise.  Reaching it is not enough, because the
+        // triangle an `<=` gate would let through is then stopped by the SECOND gate,
+        // always, in exact arithmetic:
+        //
+        //   at the boundary   sep == cullScale == contactDistance / min(scale)
+        //   `dir` comes back NORMALISED, so |dir| == 1
+        //   shape2Vertex divides each rotated component by its scale, and a rotation
+        //   preserves length, so |shape2Vertex(dir)| <= 1 / min(scale)
+        //   the rescale is m = 1 / |shape2Vertex(dir)| >= min(scale)
+        //   hence sep * m >= contactDistance, and `sep * m < contactDistance` is FALSE
+        //
+        // So `<` and `<=` write identical bytes for every positive-scale input, and
+        // the mutant that swapped them is an EQUIVALENT rather than a gap.  The check
+        // below is the claim, not a hope: if a triangle on the gate ever does reach a
+        // write, the proof is wrong and this fires.
+        PXG_CHECK_MSG(exp[0].exactGate > 0u,
+                      "%s: no triangle sits exactly on the cull gate -- the search that was "
+                      "supposed to manufacture one did not survive the rebuild", label);
+        PXG_CHECK_MSG(exp[0].exactGateWouldWrite == 0u,
+                      "%s: %u of %u triangles on the cull gate would reach a write under an "
+                      "`<=` spelling -- the min(scale) argument above is WRONG and the two "
+                      "gates are observably different; this needs a mutant, not a proof",
+                      label, exp[0].exactGateWouldWrite, exp[0].exactGate);
     }
     else
     {
@@ -1002,11 +1051,143 @@ static void runOne(PxgSlangComputeDevice* dev, const char* label, const Options&
     PXG_CHECK_MSG(spill == 0, "%s: %zu slots beyond the reservation were written", label, spill);
 
     std::printf("    [ note ] %s: %zu round(s), %u gathered, %u filtered out (%u partial kept), "
-                "%u culled, %u gated, %u zero-dir -> %zu contacts; total %u (cap %u)\n",
+                "%u culled (%u exactly on the gate, %u of those writable), %u gated, %u zero-dir "
+                "-> %zu contacts; total %u (cap %u)\n",
                 label, exp[0].rounds, exp[0].gathered, exp[0].skipped, exp[0].partialKept,
-                exp[0].culled, exp[0].gated, exp[0].zeroDir, exp[0].contacts.size(), total,
-                opt.capacity);
+                exp[0].culled, exp[0].exactGate, exp[0].exactGateWouldWrite, exp[0].gated,
+                exp[0].zeroDir, exp[0].contacts.size(), total, opt.capacity);
     R.destroy(dev);
+}
+
+static void runOne(PxgSlangComputeDevice* dev, const char* label, const Options& opt,
+                   bool negScale)
+{
+    Scene S;
+    buildScene(S, negScale);
+    runOneScene(dev, label, opt, S);
+}
+
+// ---------------------------------------------------------------------------
+// The exact-gate SEARCH.
+//
+// `sep < cullScale` and `sep <= cullScale` differ at exactly one point, and no
+// amount of random geometry lands on it.  So the boundary is MANUFACTURED, the
+// same way P9.34b manufactured the gather's, and the search is possible because
+// of one fact about the descent:
+//
+//   doTriangleSDFCollision's return is INDEPENDENT of the tolerance it is given,
+//   except that the tolerance decides whether the value is returned at all.  The
+//   last line is PxSdfSampleWithGrad, which returns `dist + dir.dot(diff)` when
+//   `dist < tolerance` and PX_MAX_F32 otherwise; nothing inside the descent's
+//   iteration reads the tolerance.
+//
+// So a triangle's separation is a constant V, and the job is to find a contact
+// distance whose derived cullScale IS that constant, bit for bit:
+//
+//   cullScale = fl( fl(contactDistTri + c) / min(scale) )   ==   V
+//
+// which is monotone in `c`, so the answer -- if it exists -- is within an ULP or
+// two of `V * min(scale) - contactDistTri`.  The equality is then CONFIRMED by
+// re-running the references, not assumed: moving `c` moves the tolerance, which
+// moves both the gathered set and which triangles clear the descent's own gate,
+// and a candidate that drops out is simply the wrong candidate.
+//
+// One more condition, and leaving it out would have made the whole exercise
+// decorative: `dist < tolerance` must still hold at V == tolerance, i.e.
+// dir.dot(diff) must be strictly positive.  That is only true where the descent's
+// point lies OUTSIDE the SDF box, so the candidates are ranked by that dot
+// product, computed on the host from the trace's own `point` and `dir`.
+// ---------------------------------------------------------------------------
+static bool probePair0(PxgSlangComputeDevice* dev, Scene& S, std::vector<uint32_t>& tris,
+                       std::vector<Descent>& desc)
+{
+    Options o;
+    Rig R;
+    bool ok = false;
+    if (buildRig(dev, S, o, R))
+    {
+        std::vector<std::vector<uint32_t>> rounds;
+        if (refGather(dev, S, S.cloth[0], R, 0u, rounds))
+        {
+            tris.clear();
+            for (const auto& r : rounds) tris.insert(tris.end(), r.begin(), r.end());
+            std::sort(tris.begin(), tris.end());
+            tris.erase(std::unique(tris.begin(), tris.end()), tris.end());
+            std::vector<PxVec3> a, b, c2;
+            ok = !tris.empty() && refDescent(dev, S, S.cloth[0], R, tris, desc, a, b, c2);
+        }
+    }
+    R.destroy(dev);
+    return ok;
+}
+
+static bool searchExactGate(PxgSlangComputeDevice* dev, Scene& S, float& foundC, uint32_t& foundTri)
+{
+    const float minScale = PxMin(S.scale.x, PxMin(S.scale.y, S.scale.z));
+    const HostSdfBox box = hostSdfBox(S.sdf);
+
+    std::vector<uint32_t> tris;
+    std::vector<Descent> desc;
+    if (!probePair0(dev, S, tris, desc)) return false;
+
+    // Rank the gathered triangles by dir.dot(diff), which is what keeps
+    // `dist < tolerance` true once the tolerance is pushed down onto V.
+    struct Cand { uint32_t tri; float V; float dot; };
+    std::vector<Cand> cand;
+    for (size_t i = 0; i < tris.size(); ++i)
+    {
+        const float V = desc[i].sep;
+        if (!std::isfinite(V) || V > 1e30f) continue;
+        const PxVec3 p(desc[i].point.x, desc[i].point.y, desc[i].point.z);
+        const PxVec3 cl(PxMax(box.lower.x, PxMin(box.higher.x, p.x)),
+                        PxMax(box.lower.y, PxMin(box.higher.y, p.y)),
+                        PxMax(box.lower.z, PxMin(box.higher.z, p.z)));
+        const PxVec3 d(desc[i].dir.x, desc[i].dir.y, desc[i].dir.z);
+        const float dt = d.dot(p - cl);
+        if (dt <= 0.0f) continue;
+        cand.push_back(Cand{ tris[i], V, dt });
+    }
+    std::sort(cand.begin(), cand.end(),
+              [](const Cand& a, const Cand& b) { return a.dot > b.dot; });
+
+    const float saved = S.cloth[0].contactDist;
+    uint32_t tried = 0;
+    for (const Cand& k : cand)
+    {
+        if (tried >= 8u) break;
+        // The ULP walk around the ideal contact distance.
+        const float ideal = k.V * minScale - S.contactDistTri;
+        float hit = 0.0f;
+        bool haveHit = false;
+        for (int step = -96; step <= 96 && !haveHit; ++step)
+        {
+            uint32_t u = f2u(ideal);
+            u = uint32_t(int32_t(u) + step);
+            float c; std::memcpy(&c, &u, 4);
+            if (!(c > 0.0f)) continue;
+            const float cd = S.contactDistTri + c;
+            if (f2u(cd / minScale) == f2u(k.V)) { hit = c; haveHit = true; }
+        }
+        if (!haveHit) continue;
+
+        ++tried;
+        S.cloth[0].contactDist = hit;
+        std::vector<uint32_t> t2;
+        std::vector<Descent> d2;
+        if (probePair0(dev, S, t2, d2))
+        {
+            const float cull = cullScaleOf(S, S.cloth[0]);
+            for (size_t i = 0; i < t2.size(); ++i)
+                if (t2[i] == k.tri && f2u(d2[i].sep) == f2u(cull))
+                {
+                    foundC = hit; foundTri = k.tri;
+                    return true;                    // S keeps the winning distance
+                }
+        }
+        S.cloth[0].contactDist = saved;
+    }
+    S.cloth[0].contactDist = saved;
+    return false;
 }
 
 static bool beginShim(PxgSlangComputeDevice* dev, PxgCudaShim*& shim)
@@ -1048,6 +1229,40 @@ PXG_TEST(femClothSdfContactGen)
     // TWO contact managers in one launch: pairIdx reaches cmInputs, restDistances
     // and a different cloth id, and each block gathers with its own cull scale.
     { Options o; o.numPairs = 2u; runOne(dev, "two-pairs", o, false); }
+
+    endShim(shim);
+}
+
+PXG_TEST(femClothSdfContactGenExactGate)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    if (!dev->supportsBindlessTextures())
+    {
+        std::printf("  NOTE: backend has no descriptor indexing -> skip\n");
+        return;
+    }
+    PxgCudaShim* shim = nullptr;
+    beginShim(dev, shim);
+
+    Scene S;
+    buildScene(S, false);
+    float c = 0.0f;
+    uint32_t tri = 0u;
+    if (!searchExactGate(dev, S, c, tri))
+    {
+        // Not a soft failure: without the boundary this test asserts nothing, and
+        // saying so is the point.  The search is deterministic, so this cannot be
+        // a flake -- it would mean the scene changed under it.
+        PXG_CHECK_MSG(false, "no contact distance puts a gathered triangle's separation "
+                             "exactly on the cull gate -- the `<` / `<=` boundary is untested");
+    }
+    else
+    {
+        std::printf("    [ note ] exact-gate: triangle %u, contact distance %.9g -> cullScale "
+                    "%.9g, bit-identical to its separation\n", tri, c, cullScaleOf(S, S.cloth[0]));
+        Options o; o.coverage = COV_EXACTGATE;
+        runOneScene(dev, "exact-gate", o, S);
+    }
 
     endShim(shim);
 }

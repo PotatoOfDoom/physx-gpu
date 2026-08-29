@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **824/824** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **827/827** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.33a added `gpuslang.npFloatIntrinRecipSqrt`, which is not a kernel port but a
 PLATFORM measurement: about forty shaders here spell `PxVec3::getNormalized` as
 `v * rsqrt(m)`, while the engine computes `PxRecipSqrt` = `1.0f/sqrtf` — two exactly
@@ -1736,6 +1736,167 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.34c — der SDF-Tuch-Kontakterzeuger selbst, und sechs Überlebende, von denen fünf ein Beweis sind
+
+Manifest **376 → 377**. `cloth_sdfMeshContactGenLaunch` (femClothPrimitives.cu:2310)
+war seit P9.27 als „groß" zurückgestellt und ist damit der **letzte** abbildbare
+Tuch-Kontakterzeuger. Auf der Tuchseite bleiben genau zwei Einträge unabgebildet:
+`convexCoreClothmeshNphase_Kernel32` und `cloth_clothMidphaseGeneratePairsLaunch`
+— und der zweite ist **VERWAIST** (P9.32), wird also von nichts geholt und braucht
+keinen Port.
+
+Die beiden Hälften, die die Arbeit tragen, sind in den zwei Tranchen davor
+gelandet und dort **einzeln** gefegt worden — P9.34a der Abstieg, P9.34b der
+Sammler. Neu ist hier der **Kitt**, und im Kitt sitzen die Fallen.
+
+### Geteilt statt kopiert, und einmal ausdrücklich nicht
+
+* `globalScanExclusive<32>` ist aus `psSdfMidphaseBda` in das Modul
+  `pxgSlangSdfFind` gewandert (`sdfGlobalScanExclusive`, mit der Adresse des
+  Zählers als Parameter statt eines Griffs in eine Push-Konstante); die private
+  Kopie von P9.12h ist jetzt ein einzeiliger Weiterleiter, und beide Verbraucher
+  teilen sich eine Fassung.
+* `writeRigidVsDeformableContact` in `pxgSlangConvexTriCloth` ist `public`
+  geworden.
+* **Und `find` über `PxgRigidFilterPair` steht jetzt zum neunten Mal da.** Das ist
+  eine Umfangsentscheidung, keine Verteidigung: acht lebende Aufrufstellen
+  zusammenzulegen ist eine eigene Änderung mit eigenem Fegedurchgang, und sie
+  unter die Verifikation eines Kernel-Ports zu schieben hieße, beides schlechter
+  zu prüfen. Getrennt vermerkt.
+
+### Die Vorrichtung: ein Umschlag, geprüft gegen seine eigenen Teile
+
+Dieselbe Anordnung wie bei `psSdfMidphase`. Die Erwartung entsteht aus **zwei
+unabhängigen Dispatches** der Einstiegspunkte der beiden Module —
+`sdfFindTriangleRounds` und `sdfCollTriangle` —, und beide bekommen die
+Kull-Toleranz, die inverse Pose und **beide** Skalenrahmen so, wie der **Host**
+sie ausgerechnet hat. Leitet der Kernel irgendeinen davon anders her, sammelt er
+eine andere Menge oder steigt von einem anderen Dreieck ab, und der Vergleich
+fällt. Es gibt keinen Weg, auf dem eine falsche `cullScale` hier ein richtiges
+Ergebnis erzeugt.
+
+Alles außerhalb dieser beiden gerätegebundenen Stücke ist entweder ein
+**Engine-Aufruf** oder vier Zeilen darüber: `vertex2Shape`/`shape2Vertex` sind
+`rotate`, drei Multiplikationen bzw. **Divisionen**, `rotateInv` — und
+`PxQuat::rotate`/`rotateInv` sowie `PxTransform::transform`/`rotate` werden
+**gerufen**, nicht abgeschrieben. Einzig `computeBarycentric` ist eine echte
+Transkription, und die ist neun Skalarprodukte und zwei Divisionen ohne
+Verzweigung.
+
+Fünf Konfigurationen, alle **bitgleich**: beide Steckplatz-Reihenfolgen, ein
+**vorbelegter** Zähler, die Kapazitätsgrenze (die Reservierung läuft über
+`maxNumContacts` hinaus weiter, während der Schreiber nichts ablegt) und **zwei**
+Kontaktmanager in einem Start. Bei **einem** Manager gibt es genau einen Block,
+also ist der Steckplatz jedes Kontakts **bestimmt** und wird Platz für Platz
+geprüft; bei zweien laufen die Blöcke auf denselben Zähler, also gilt die
+P9.11-Regel und geprüft wird die **Menge**, nicht die Verschränkung.
+
+### S3 bekommt einen eigenen Test, und der prüft Unterscheidbarkeit
+
+`cullScale` teilt durch `min(x, y, z)` und **nicht** durch das Minimum der
+Beträge. Das Teilchen-Geschwister (`psSdfMidphaseBda`, W3) nimmt aus derselben
+Ausdrucksform den Absolutbetrag, dieses hier nicht. Mit `scale.y = -2,9` — und der
+negativen Komponente **nicht** an der betragskleinsten Stelle — unterscheiden sich
+die beiden Schreibweisen in **Wert und Vorzeichen**.
+
+Und der Lauf **beweist** das, statt es anzunehmen: er verlangt, dass die
+Engine-Toleranz negativ und die abs-Schreibweise positiv ist, und lässt den
+Sammler ein **zweites Mal** mit der abs-Toleranz laufen, um zu belegen, dass die
+beiden Mengen sich um mehr als 200 Dreiecke unterscheiden. Ohne das wäre der
+Mutant ein Äquivalent und der Test eine Behauptung.
+
+### Fegen 40 von 46, und die sechs Überlebenden sind die eigentliche Ausbeute
+
+Fünf davon sind **beweisbare Äquivalente**, und keiner der Beweise stand vor dem
+Durchgang schon da — sie sind alle beim Diagnostizieren entstanden.
+
+**1. Die binäre Suche darf linear werden.** `l = l + 1` statt `l = mid + 1`
+liefert **dasselbe Ergebnis**. Die Invariante `l ≤ k < r` (k = Index des Ziels)
+überlebt beide Varianten: `cmp > 0` heißt `pairs[mid] < Anfrage`, also `k > mid ≥ l`
+und damit `k ≥ l + 1`. Die Schleife endet nur bei `l ≥ r`, was der Invariante
+widerspricht — ein vorhandener Schlüssel wird also immer gefunden, und `cmp == 0`
+ist ein echter Treffer, ein fehlender wird also nie behauptet. Unterschied:
+**Arbeit**, O(n) gegen O(log n), sonst nichts.
+
+**2. Die `ignoreIndex2`-Klausel ist für dieses Feld redundant.** Die
+Tuch-Starrkörper-Filterliste entsteht in PxgSimulationController.cpp:4094 aus
+einem standardkonstruierten `PxgRigidFilterPair`, dessen Konstruktor `index2(0)`
+setzt (PxgSimulationCoreDesc.h:164), und nichts sonst schreibt `index2` in
+`mClothRigidFilterPairs`. Die Anfrage trägt ebenfalls null, `compare` erreicht
+seinen `index2`-Zweig also nie mit einem Unterschied. Übertragen wird sie
+trotzdem — die CUDA hat sie, und **dieselbe** Überladung wird anderswo mit
+Anheftungs-Handles in `index2` gerufen, wo sie trägt.
+
+**3. Auf der Tuchseite sind `vertex2Shape` und `shape2Vertex` dieselbe Funktion.**
+Das identische Quaternion dreht einen Vektor exakt auf sich selbst
+(`w*w - 0,5 == 0,5`, die Kreuzterme verschwinden), und `x * 1,0f` wie `x / 1,0f`
+sind exakt `x`. Das gilt **nur wegen S4** und hört in dem Moment auf zu gelten, in
+dem jemand die echte Tuch-Skala durchreicht.
+
+**4. `m > 0` gegen `m >= 0` ist unerreichbar.** `m == 0` verlangt ein exakt
+verschwindendes `dir` nach `shape2Vertex`. `dir` bleibt nur dann auf seinem
+eingehenden Null stehen, wenn `PxSdfSampleWithGrad` `PX_MAX_F32` zurückgegeben hat
+— und dann hat das **vorherige** Tor `sep < cullScale` schon abgewiesen. Sonst ist
+`dir` das Ergebnis von `getNormalized()`, das exakt null nur für exakt null wird,
+und dort ist `PxRecipSqrt(0) = +inf`, das Ergebnis also **NaN**, nicht null; für
+NaN sind beide Wachen falsch.
+
+**5. Und der interessanteste: die Striktheit des Kull-Tors ist geschenkt.**
+Der erste Versuch war, die Grenze **herzustellen** — wie in P9.34b —, und das ging
+auch: der Abstieg gibt einen von der Toleranz **unabhängigen** Wert zurück (die
+Toleranz entscheidet nur, ob er überhaupt zurückkommt), also lässt sich eine
+Kontaktdistanz suchen, deren `cullScale` **bitgleich** der Separation eines
+gesammelten Dreiecks ist. Gefunden: **Dreieck 1309**, Kontaktdistanz
+**0,952615738**, `cullScale` **1,39529967** — exakt auf dem Tor.
+
+Und dort kam die Überraschung: das Dreieck wird vom **zweiten** Tor abgewiesen,
+und zwar zwangsläufig.
+
+> Auf der Grenze gilt `sep == cullScale == contactDistance / min(scale)`. `dir`
+> kommt **normalisiert** zurück, also `|dir| == 1`; `shape2Vertex` teilt jede
+> gedrehte Komponente durch ihre Skala und eine Drehung erhält die Länge, also
+> `|shape2Vertex(dir)| ≤ 1/min(scale)` und damit `m = 1/|…| ≥ min(scale)`. Dann
+> ist `sep * m ≥ contactDistance`, und das zweite Tor ist **strikt**.
+
+Ein `<=` würde also genau die Dreiecke durchlassen, die die nächste Zeile
+verwirft: für positive Skalen schreiben beide Schreibweisen dieselben Bytes. Der
+Test stellt die Grenze trotzdem her und prüft die **Folgerung** — er verlangt,
+dass ein Dreieck auf dem Tor sitzt **und** dass keines davon zu einem Schreibvorgang
+käme. Wäre der Beweis falsch, sagt er es.
+
+**Und der sechste ist kein Beweis, sondern eine Plattformgrenze.** Ersetzt man den
+blockweiten Scan durch ein `InterlockedAdd` pro Faden, sieht die Vorrichtung
+**nichts** — llvmpipe führt die Aufrufe eines Workgroups in Fadenreihenfolge aus,
+also vergeben Einzel-Atomics genau die Indizes, die der Scan berechnet. Auf
+Hardware mit echter Nebenläufigkeit nicht. Der **Wert** des Scans ist geprüft (ein
+inklusiver Scan und ein in den Kandidatentest verschobener Scan fallen beide);
+ungeprüft bleibt hier nur der Unterschied zwischen einem Atomic pro Block und
+einem pro Kontakt. Das steht so im Shader-Kopf, statt als Deckung zu dienen.
+
+### Eine „Falle", die beim Nachrechnen keine war
+
+Die erste Fassung der Kopfnotiz nannte unter S2 drei Indexkonventionen in vier
+Zeilen und behauptete, die **rohen** Cache-Referenzen gegen die eben erst
+sortierten seien eine davon. Nachgerechnet: die sortierte Fassung ist die rohe
+**vertauscht**, und Float-Addition ist kommutativ — dieselben Bits. Beobachtbar
+ist nur die andere Hälfte, `restDistances[pairIdx]` gegen einen Cache-Index, und
+die ist es wirklich (die Vorrichtung gibt jedem Platz beider Felder einen eigenen
+Wert). Die Notiz sagt das jetzt so, und es steht **kein** Mutant dafür da, weil er
+ein beweisbares Äquivalent wäre.
+
+### Verifikation
+
+* Fegen **40 von 46**; die sechs Überlebenden oben — fünf bewiesene Äquivalente,
+  einer auf dieser Plattform unbeobachtbar. Nachgefahren gegen die **erweiterte**
+  Vorrichtung: alle sechs überleben weiterhin, was für Nummer 5 die empirische
+  Bestätigung des Beweises ist, denn die Grenze wird jetzt erreicht;
+* Suite **827/827** in **beiden** Speichermodi, jeweils im **ersten** Anlauf
+  (drei neue Tests: `femClothSdfContactGen`, `femClothSdfContactGenExactGate`,
+  `femClothSdfContactGenNegScale`);
+* Manifest geändert, also `build-sdk` neu gebaut und die Szenen gelaufen:
+  **33/33**.
+
 
 ## P9.34b Schritt 2 — der Dreiecks-Sammler, und eine Toleranz, die genau das ertränkt hat, was sie prüfen sollte
 

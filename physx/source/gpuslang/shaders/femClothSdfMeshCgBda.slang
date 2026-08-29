@@ -72,6 +72,12 @@
 //      passed for the cloth in both the gather and the vertex fetch, so the cloth's
 //      own shape scale is never applied -- its vertices are already in the right
 //      frame.  The TRIMESH's scale is applied to everything.
+//      A consequence, found by the sweep: on the CLOTH side vertex2Shape and
+//      shape2Vertex are the same function.  The identity quaternion rotates a vector
+//      to itself exactly (w*w - 0.5 == 0.5, the cross terms vanish), and `x * 1.0f`
+//      and `x / 1.0f` are both exactly x -- so swapping the two there is an
+//      equivalent.  Which is only true BECAUSE of S4, and stops being true the
+//      moment someone passes the cloth's real scale.
 //
 //  S5. THE FILTER NEEDS ALL THREE VERTICES.  `skipTriangle` is a conjunction of
 //      three finds, so a triangle survives if even one of its vertices is not
@@ -82,6 +88,17 @@
 //      it AND SCALE `sep` BY THE SAME 1/|dir|, and only then test
 //      `sep < contactDistance`.  Testing the unscaled sep against contactDistance
 //      is a different kernel.
+//      AND THE FIRST GATE'S STRICTNESS IS FREE, which is worth writing down because
+//      the fixture went looking for a way to observe it and found a proof instead.
+//      A triangle sitting EXACTLY on the cull gate has
+//          sep == cullScale == contactDistance / min(scale)
+//      and `dir` comes back NORMALISED, so |dir| == 1; shape2Vertex divides each
+//      rotated component by its scale and a rotation preserves length, so
+//      |shape2Vertex(dir)| <= 1/min(scale) and therefore m = 1/|...| >= min(scale).
+//      Then sep * m >= contactDistance, and the SECOND gate is strict -- so a `<=`
+//      here would admit exactly the triangles the next line rejects.  For positive
+//      scale the two spellings are indistinguishable, and the fixture manufactures
+//      the boundary and asserts that consequence rather than assuming it.
 //
 //  S7. `sep = sep;` (:2516) is a real self-assignment upstream.  It is not
 //      transcribed, because there is nothing to transcribe; it is named here so the
@@ -91,6 +108,14 @@
 //      over all 1024 threads, one atomicAdd by thread 0 -- so the call sits outside
 //      the `candidateContact` test, and threads past the gathered count take part
 //      with `false`.  Skipping it for them strands the block at a barrier.
+//      AND ONE HALF OF THIS IS INVISIBLE ON THIS PLATFORM, which is recorded here
+//      rather than papered over: replacing the scan with a per-thread atomicAdd is
+//      caught by nothing in the fixture, because llvmpipe runs a workgroup's
+//      invocations in thread order, so per-thread atomics hand out exactly the
+//      indices the scan computes.  On hardware with real concurrency they do not.
+//      The value the scan produces IS tested (an inclusive scan and a scan moved
+//      inside the candidate test both fail); what is not testable here is the
+//      difference between one atomic per block and one per contact.
 //
 //  S9. THE CONTACT IS WRITTEN IN WORLD SPACE, but the point comes back from the
 //      descent in the trimesh's VERTEX space: it is pushed through vertex2Shape
@@ -167,6 +192,24 @@ struct PairR { uint2 index0; uint2 index1; uint index2; uint pad0, pad1, pad2; }
 // `find` (PxgSimulationCoreDesc.h) -- a BINARY search, not a linear one, with the
 // ignoreIndex2 early accept.  A cloth vertex's compressed id folds into
 // q1 = uint2(clothMask, 0).
+//
+// TWO THINGS HERE ARE UNTESTABLE, and both were established by proof after the
+// mutation sweep left them standing rather than by widening the rig:
+//
+//   * `l = mid + 1` vs `l = l + 1` -- the second still RETURNS the same answer.  The
+//     invariant `l <= k < r` (k = the target's index) survives both updates: cmp > 0
+//     means pairs[mid] < query, so k > mid >= l and therefore k >= l + 1.  The loop
+//     only exits at l >= r, which contradicts the invariant, so a present key is
+//     always found; and cmp == 0 is a real match, so an absent one is never claimed.
+//     The two differ in WORK -- O(n) against O(log n) -- and in nothing else.
+//   * the `ignoreIndex2` disjunct is redundant FOR THIS ARRAY.  The cloth-rigid
+//     filter list is built at PxgSimulationController.cpp:4094 from a default-
+//     constructed PxgRigidFilterPair, whose constructor is `index2(0)`
+//     (PxgSimulationCoreDesc.h:164), and nothing else writes index2 into
+//     mClothRigidFilterPairs.  The query carries index2 = 0 too, so `compare` never
+//     reaches its index2 branch with a difference and `cmp == 0` already holds.  The
+//     clause is transcribed because the CUDA has it and because the SAME overload is
+//     called elsewhere with attachment handles in index2, where it is load-bearing.
 //
 // THE NINTH COPY, and that is a scope decision rather than a defence: this corpus
 // already carries eight spellings of `find` (femClothContactGenBda,
