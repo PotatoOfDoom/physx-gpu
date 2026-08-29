@@ -12003,4 +12003,381 @@ PXG_TEST(femClothSimPsContactPrepare)
         dev->destroyBuffer(h);
 }
 
+
+// ===========================================================================
+// P9.31 -- the two cloth_solveCPOutput*DeltaVLaunch kernels, bit-exact.
+//
+// One rig, two dispatches over the SAME constraints: the cloth side accumulates
+// a position delta onto the triangle's vertices, the particle side writes a
+// velocity delta per contact.  They share everything up to the force update, so
+// running both over identical inputs is also a check that the shared half stayed
+// shared.
+//
+// The cloth side writes through ATOMICS, so contacts are laid out one per
+// triangle with no shared vertices: every vertex has exactly one writer and the
+// comparison can be bit-exact.  One deliberately CONTENDED pair sits at the end
+// and is checked on its .w count alone, which is order-invariant.
+// ===========================================================================
+namespace p931solve
+{
+using p817cg::V3;
+
+struct ClothPsSolveClothPush
+{
+    uint64_t clothes, particleSystems, contactInfos, constraints, numContacts,
+             appliedForces, materials;
+};
+static_assert(sizeof(ClothPsSolveClothPush) == 56, "cloth-side solve blob must be 56 bytes");
+
+struct ClothPsSolveParticlePush
+{
+    uint64_t clothes, particleSystems, contactInfos, constraints, numContacts,
+             deltaP, appliedForces, materials;
+};
+static_assert(sizeof(ClothPsSolveParticlePush) == 64, "particle-side solve blob must be 64 bytes");
+static_assert(offsetof(ClothPsSolveParticlePush, deltaP) == 40,
+              "deltaP @40 -- inserted BEFORE appliedForces, which is what makes the two "
+              "packs different lengths");
+
+static const float BIAS = 0.7f;                  // FEMCLOTH_BIAS_COEFFICIENT
+static const uint32_t CLOTH_MAT_STRIDE = 32u;    // PxsDeformableSurfaceMaterialData
+static const uint32_t CLOTH_MAT_DYNFRICTION_F = 2u;   // youngs, poissons, dynamicFriction
+static const uint32_t PS_MAT_STRIDE = 32u;
+static const uint32_t PS_MAT_FRICTION_F = 0u;
+
+using p931prep::CB_STRIDE;
+using p931prep::CB_WORDS;
+using p931prep::CB_OFF_NORMAL_PEN;
+using p931prep::CB_OFF_BARY;
+using p931prep::CB_OFF_VELMULT;
+
+// PxVec3::normalize -- returns the magnitude, normalises in place if m > 0.
+static float pxNormalize(V3& v)
+{
+    const float m = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    if (m > 0.0f) { v.x = v.x / m; v.y = v.y / m; v.z = v.z / m; }
+    return m;
+}
+} // namespace p931solve
+
+PXG_TEST(femClothSimPsSolveCP)
+{
+    using namespace p816dc;
+    using namespace p931prep;
+    using namespace p931solve;
+    using p817cg::V3;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t CLOTH_ID = 1u, PS_ID = 2u;
+
+    // ---- contacts: one per triangle, no shared vertices, plus a contended pair -----
+    const uint32_t NB_SINGLE = 10u;      // contacts 0..9, one triangle each
+    const uint32_t NB_CONTENDED = 2u;    // contacts 10,11 share triangle NB_SINGLE
+    const uint32_t NB_CONTACTS = NB_SINGLE + NB_CONTENDED;
+    const uint32_t NB_TRIS = NB_SINGLE + 1u;
+
+    std::vector<F4> accum; std::vector<TriIdx4> ci;
+    std::vector<uint16_t> matIdx(NB_TRIS);
+    for (uint32_t t = 0; t < NB_TRIS; ++t)
+    {
+        const uint32_t base = uint32_t(accum.size());
+        // Vertex 1 of triangle 3 is PINNED (inverse mass 0) and vertex 2 of
+        // triangle 5 gets a barycentric of zero below -- S8's two skip conditions,
+        // one each.
+        const float m0 = 0.4f + 0.05f * float(t);
+        const float m1 = (t == 3u) ? 0.0f : (0.6f + 0.03f * float(t));
+        const float m2 = 0.8f - 0.02f * float(t);
+        accum.push_back(F4{ 0.011f * float(t), -0.021f * float(t), 0.031f * float(t), m0 });
+        accum.push_back(F4{ -0.013f * float(t), 0.023f * float(t), -0.033f * float(t), m1 });
+        accum.push_back(F4{ 0.017f * float(t), 0.027f * float(t), 0.037f * float(t), m2 });
+        ci.push_back(TriIdx4{ base, base + 1u, base + 2u, 0u });
+        matIdx[t] = uint16_t(t % 3u);          // three distinct cloth materials
+    }
+    DevBuf bAccum = makeDev(dev, accum);
+    if (!bAccum.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bAccum.h); return; }
+    DevBuf bCi = makeDev(dev, ci);
+    std::vector<uint32_t> matIdxWords((NB_TRIS + 1u) / 2u, 0u);
+    for (uint32_t t = 0; t < NB_TRIS; ++t)
+        matIdxWords[t >> 1] |= uint32_t(matIdx[t]) << ((t & 1u) * 16u);
+    DevBuf bMatIdx = makeDev(dev, matIdxWords);
+
+    // Cloth materials: three records, dynamicFriction the THIRD float of 32 bytes.
+    std::vector<float> clothMats(3u * (CLOTH_MAT_STRIDE / 4u), 0.0f);
+    const float CLOTH_FRICTION[3] = { 0.20f, 0.55f, 0.00f };
+    for (uint32_t m = 0; m < 3u; ++m)
+    {
+        clothMats[m * 8u + 0u] = 1.0e6f;                    // youngs
+        clothMats[m * 8u + 1u] = 0.45f;                     // poissons -- the field the
+                                                            // first draft of the shader read
+        clothMats[m * 8u + CLOTH_MAT_DYNFRICTION_F] = CLOTH_FRICTION[m];
+    }
+    DevBuf bClothMats = makeDev(dev, clothMats);
+
+    PxgFEMCloth cloth = makeZeroDesc();
+    cloth.mAccumulatedDeltaPos = reinterpret_cast<decltype(cloth.mAccumulatedDeltaPos)>(size_t(bAccum.addr));
+    cloth.mTriangleVertexIndices = reinterpret_cast<decltype(cloth.mTriangleVertexIndices)>(size_t(bCi.addr));
+    cloth.mMaterialIndices = reinterpret_cast<decltype(cloth.mMaterialIndices)>(size_t(bMatIdx.addr));
+    cloth.mNbTriangles = NB_TRIS; cloth.mNbVerts = uint32_t(accum.size());
+    std::vector<F4> deltaPosSeed(accum.size(), F4{ 0, 0, 0, 0 });
+    DevBuf bDeltaPos = makeDev(dev, deltaPosSeed);
+    cloth.mDeltaPos = reinterpret_cast<decltype(cloth.mDeltaPos)>(size_t(bDeltaPos.addr));
+    std::vector<PxgFEMCloth> descArr(CLOTH_ID + 1u, makeZeroDesc());
+    descArr[CLOTH_ID] = cloth;
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- the particle system -------------------------------------------------------
+    const uint32_t NB_PARTICLES = NB_CONTACTS;
+    std::vector<F4> sortedDeltaP(NB_PARTICLES);
+    std::vector<uint32_t> phases(NB_PARTICLES);
+    for (uint32_t i = 0; i < NB_PARTICLES; ++i)
+    {
+        // S3: contact 7's particle is IMMOVABLE, so that contact must produce no
+        // write at all and must leave its applied force exactly as seeded.
+        const float im = (i == 7u) ? 0.0f : (0.25f + 0.04f * float(i % 5));
+        sortedDeltaP[i] = F4{ 0.006f * float(i), -0.004f * float(i), 0.008f * float(i), im };
+        phases[i] = (i % 2u);                    // two groups -> two particle materials
+    }
+    DevBuf bDeltaP = makeDev(dev, sortedDeltaP), bPhases = makeDev(dev, phases);
+    std::vector<uint32_t> phaseToMat = { (1u << 16) | 0u };     // group 0 -> mat 0, group 1 -> mat 1
+    DevBuf bPhaseToMat = makeDev(dev, phaseToMat);
+    std::vector<float> psMats(2u * (PS_MAT_STRIDE / 4u), 0.0f);
+    const float PS_FRICTION[2] = { 0.30f, 0.90f };
+    psMats[0u * 8u + PS_MAT_FRICTION_F] = PS_FRICTION[0];
+    psMats[1u * 8u + PS_MAT_FRICTION_F] = PS_FRICTION[1];
+    DevBuf bPsMats = makeDev(dev, psMats);
+
+    std::vector<PxgParticleSystem> psArr(PS_ID + 1u);
+    std::memset(psArr.data(), 0, psArr.size() * sizeof(PxgParticleSystem));
+    psArr[PS_ID].mSortedDeltaP = reinterpret_cast<float4*>(size_t(bDeltaP.addr));
+    psArr[PS_ID].mSortedPhaseArray = reinterpret_cast<PxU32*>(size_t(bPhases.addr));
+    psArr[PS_ID].mPhaseGroupToMaterialHandle = reinterpret_cast<PxU16*>(size_t(bPhaseToMat.addr));
+    psArr[PS_ID].mParticleMaterials = reinterpret_cast<PxsParticleMaterialData*>(size_t(bPsMats.addr));
+    psArr[PS_ID].mParticleMaterialStride = PS_MAT_STRIDE;
+    psArr[PS_ID].mCommonData.mNumParticles = NB_PARTICLES;
+    DevBuf bPs = makeDev(dev, psArr);
+
+    // ---- contact infos and constraints (as the prepare would have left them) --------
+    std::vector<FemOtherContactInfoHost> infos(NB_CONTACTS);
+    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
+    {
+        const uint32_t tri = (i < NB_SINGLE) ? i : NB_SINGLE;      // the last two share one
+        infos[i].pairInd0 = (uint64_t(PS_ID) << 32) | i;
+        infos[i].pairInd1 = (CLOTH_ID << 20) | tri;
+        infos[i].rigidMatInd_isInCollision = 0u;
+    }
+    DevBuf bInfos = makeDev(dev, infos);
+
+    const uint32_t NB_BLOCKS = (NB_CONTACTS + 31u) / 32u;
+    std::vector<uint32_t> cw(size_t(NB_BLOCKS) * CB_WORDS, 0u);
+    std::vector<F4> refNormalPen(NB_CONTACTS), refBary(NB_CONTACTS);
+    std::vector<float> refVelMult(NB_CONTACTS);
+    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
+    {
+        // A tilted normal so no component is zero, and a penetration that changes
+        // sign across the set so S7's clamp bites on some contacts and not others.
+        V3 n{ 0.3f + 0.05f * float(i), 0.8f - 0.03f * float(i), -0.5f + 0.02f * float(i) };
+        pxNormalize(n);
+        const float pen = 0.02f - 0.008f * float(i);
+        // S8's second skip: triangle 5's third barycentric is exactly zero.
+        const float w = (i == 5u) ? 0.0f : (0.20f + 0.01f * float(i % 4));
+        const float v = 0.30f + 0.02f * float(i % 3);
+        refNormalPen[i] = F4{ n.x, n.y, n.z, pen };
+        refBary[i] = F4{ 1.0f - v - w, v, w, 0.0f };
+        refVelMult[i] = 0.7f + 0.05f * float(i % 6);
+        const size_t blk = size_t(i / 32u) * CB_WORDS;
+        const uint32_t lane = i & 31u;
+        cw[blk + CB_OFF_NORMAL_PEN + lane * 4u + 0] = f2u(n.x);
+        cw[blk + CB_OFF_NORMAL_PEN + lane * 4u + 1] = f2u(n.y);
+        cw[blk + CB_OFF_NORMAL_PEN + lane * 4u + 2] = f2u(n.z);
+        cw[blk + CB_OFF_NORMAL_PEN + lane * 4u + 3] = f2u(pen);
+        cw[blk + CB_OFF_BARY + lane * 4u + 0] = f2u(refBary[i].x);
+        cw[blk + CB_OFF_BARY + lane * 4u + 1] = f2u(refBary[i].y);
+        cw[blk + CB_OFF_BARY + lane * 4u + 2] = f2u(refBary[i].z);
+        cw[blk + CB_OFF_BARY + lane * 4u + 3] = f2u(refBary[i].w);
+        cw[blk + CB_OFF_VELMULT + lane] = f2u(refVelMult[i]);
+    }
+    DevBuf bConstraints = makeDev(dev, cw);
+
+    // S7: NON-ZERO seeds, so the two clamps are exercised rather than trivially
+    // satisfied.  A zero seed makes deltaF = max(0, ...) and the friction step
+    // degenerate, and the whole clamp structure becomes invisible.
+    std::vector<float> forceSeed(NB_CONTACTS * 2u);
+    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
+    { forceSeed[i * 2] = 0.004f * float(i % 5); forceSeed[i * 2 + 1] = 0.002f * float(i % 3); }
+    DevBuf bForcesA = makeDev(dev, forceSeed), bForcesB = makeDev(dev, forceSeed);
+    std::vector<uint32_t> ncv = { NB_CONTACTS };
+    DevBuf bNum = makeDev(dev, ncv);
+    std::vector<F4> deltaPOut(NB_CONTACTS, F4{ -9, -9, -9, -9 });
+    DevBuf bDeltaPOut = makeDev(dev, deltaPOut);
+
+    // ---- run the CLOTH side ---------------------------------------------------------
+    ClothPsSolveClothPush pc = {};
+    pc.clothes = bDesc.addr; pc.particleSystems = bPs.addr; pc.contactInfos = bInfos.addr;
+    pc.constraints = bConstraints.addr; pc.numContacts = bNum.addr;
+    pc.appliedForces = bForcesA.addr; pc.materials = bClothMats.addr;
+    Kernel kc("femClothPsSolveBda.spv", "cloth_solveCPOutputClothDeltaVLaunch",
+              {}, sizeof(ClothPsSolveClothPush));
+    kc.dispatch(1024u, {}, pc, 1u, 1u);
+    dev->flush();
+
+    // ---- run the PARTICLE side over the same constraints -----------------------------
+    ClothPsSolveParticlePush pp = {};
+    pp.clothes = bDesc.addr; pp.particleSystems = bPs.addr; pp.contactInfos = bInfos.addr;
+    pp.constraints = bConstraints.addr; pp.numContacts = bNum.addr;
+    pp.deltaP = bDeltaPOut.addr; pp.appliedForces = bForcesB.addr; pp.materials = bClothMats.addr;
+    Kernel kp("femClothPsSolveBda.spv", "cloth_solveCPOutputParticleDeltaVLaunch",
+              {}, sizeof(ClothPsSolveParticlePush));
+    kp.dispatch(1024u, {}, pp, 1u, 1u);
+    dev->flush();
+
+    // ---- the mirror ------------------------------------------------------------------
+    std::vector<F4> refDeltaPos(accum.size(), F4{ 0, 0, 0, 0 });
+    std::vector<F4> refDeltaP(NB_CONTACTS, F4{ -9, -9, -9, -9 });
+    std::vector<float> refForce = forceSeed;
+    uint32_t clamped = 0u, skippedByMass = 0u;
+    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
+    {
+        const uint32_t particle = uint32_t(infos[i].pairInd0 & 0xffffffffull);
+        const uint32_t tri = infos[i].pairInd1 & 0xfffffu;
+        const F4& dp = sortedDeltaP[particle];
+        const float invMass0 = dp.w;
+        if (invMass0 == 0.0f) { ++skippedByMass; continue; }        // S3
+
+        const uint32_t group = phases[particle] & 0x000fffffu;
+        const float friction0 = PS_FRICTION[group];
+        const float friction1 = CLOTH_FRICTION[matIdx[tri]];
+        const float frictionCoefficient = (friction0 + friction1) * 0.5f;
+
+        const TriIdx4& tv = ci[tri];
+        const F4& b = refBary[i];
+        const F4 v0 = accum[tv.x], v1 = accum[tv.y], v2 = accum[tv.z];
+        const F4 invMasses1 = F4{ v0.w, v1.w, v2.w, 0.0f };          // S5
+        const F4 delta1 = F4{ v0.x * b.x + v1.x * b.y + v2.x * b.z,
+                              v0.y * b.x + v1.y * b.y + v2.y * b.z,
+                              v0.z * b.x + v1.z * b.y + v2.z * b.z,
+                              v0.w * b.x + v1.w * b.y + v2.w * b.z };
+        const V3 delta{ delta1.x - dp.x, delta1.y - dp.y, delta1.z - dp.z };
+        const F4& np = refNormalPen[i];
+        const V3 normal{ -np.x, -np.y, -np.z };                      // S4
+
+        float afx = refForce[i * 2], afy = refForce[i * 2 + 1];
+        const float normalDelta = delta.x * normal.x + delta.y * normal.y + delta.z * normal.z;
+        V3 tanDir{ delta.x - normal.x * normalDelta,
+                   delta.y - normal.y * normalDelta,
+                   delta.z - normal.z * normalDelta };
+        const float fricDelta = pxNormalize(tanDir);                 // S6
+        const float error = np.w + normalDelta;
+        const float cand = -error * refVelMult[i];
+        const float deltaF = (-afx > cand) ? -afx : cand;            // S7
+        if (deltaF == -afx && cand < -afx) ++clamped;
+        afx += deltaF;
+        const float frictionMax = afx * frictionCoefficient;
+        const float requiredForce = fricDelta * refVelMult[i];
+        const float sum = requiredForce + afy;
+        const float deltaFr = ((sum < frictionMax) ? sum : frictionMax) - afy;
+        afy += deltaFr;
+        refForce[i * 2] = afx; refForce[i * 2 + 1] = afy;
+
+        // cloth side
+        const V3 deltaPos{ (normal.x * deltaF - tanDir.x * deltaFr) * BIAS,
+                           (normal.y * deltaF - tanDir.y * deltaFr) * BIAS,
+                           (normal.z * deltaF - tanDir.z * deltaFr) * BIAS };
+        const uint32_t vi[3] = { tv.x, tv.y, tv.z };
+        const float im[3] = { invMasses1.x, invMasses1.y, invMasses1.z };
+        const float bw[3] = { b.x, b.y, b.z };
+        for (int j = 0; j < 3; ++j)
+            if (im[j] > 0.0f && std::fabs(bw[j]) > 1e-6f)             // S8
+            {
+                refDeltaPos[vi[j]].x += deltaPos.x * im[j] * bw[j];
+                refDeltaPos[vi[j]].y += deltaPos.y * im[j] * bw[j];
+                refDeltaPos[vi[j]].z += deltaPos.z * im[j] * bw[j];
+                refDeltaPos[vi[j]].w += 1.0f;
+            }
+
+        // particle side: opposite signs AND an extra invMass0 factor
+        const V3 deltaV{ (-normal.x * deltaF + tanDir.x * deltaFr) * invMass0 * BIAS,
+                         (-normal.y * deltaF + tanDir.y * deltaFr) * invMass0 * BIAS,
+                         (-normal.z * deltaF + tanDir.z * deltaFr) * invMass0 * BIAS };
+        const float wflag = (deltaF != 0.0f || deltaFr != 0.0f) ? 1.0f : 0.0f;
+        refDeltaP[i] = F4{ deltaV.x, deltaV.y, deltaV.z, wflag };
+    }
+
+    PXG_CHECK_MSG(skippedByMass == 1u,
+                  "%u contacts were skipped for zero inverse mass, expected exactly 1 -- S3 is "
+                  "not exercised otherwise", skippedByMass);
+    PXG_CHECK_MSG(clamped > 0u,
+                  "the normal-force clamp never bit; S7 is then untested and the rig's "
+                  "penetrations need re-choosing");
+
+    // Compare: the single-writer vertices bit-exactly, the contended triangle on .w.
+    const auto gotDeltaPos = downloadBuffer<F4>(dev, bDeltaPos.h, uint32_t(accum.size()));
+    const auto gotDeltaP = downloadBuffer<F4>(dev, bDeltaPOut.h, NB_CONTACTS);
+    const auto gotForceA = downloadBuffer<float>(dev, bForcesA.h, NB_CONTACTS * 2u);
+    const auto gotForceB = downloadBuffer<float>(dev, bForcesB.h, NB_CONTACTS * 2u);
+
+    uint32_t mm = 0u;
+    const uint32_t contendedBase = NB_SINGLE * 3u;    // the shared triangle's vertices
+    for (uint32_t v = 0; v < uint32_t(accum.size()); ++v)
+    {
+        const bool contended = (v >= contendedBase);
+        if (contended)
+        {
+            // Order-invariant: the count is an integer sum of 1.0f.
+            if (f2u(gotDeltaPos[v].w) != f2u(refDeltaPos[v].w))
+            { ++mm; std::printf("    contended vertex %u count %g, expected %g\n",
+                                v, gotDeltaPos[v].w, refDeltaPos[v].w); }
+            continue;
+        }
+        if (f2u(gotDeltaPos[v].x) != f2u(refDeltaPos[v].x) ||
+            f2u(gotDeltaPos[v].y) != f2u(refDeltaPos[v].y) ||
+            f2u(gotDeltaPos[v].z) != f2u(refDeltaPos[v].z) ||
+            f2u(gotDeltaPos[v].w) != f2u(refDeltaPos[v].w))
+        {
+            if (mm == 0u)
+                std::printf("    first cloth delta difference at vertex %u: gpu (%.9g %.9g %.9g | "
+                            "%.9g) vs (%.9g %.9g %.9g | %.9g)\n", v,
+                            gotDeltaPos[v].x, gotDeltaPos[v].y, gotDeltaPos[v].z, gotDeltaPos[v].w,
+                            refDeltaPos[v].x, refDeltaPos[v].y, refDeltaPos[v].z, refDeltaPos[v].w);
+            ++mm;
+        }
+    }
+    PXG_CHECK_MSG(mm == 0u, "%u cloth-side vertex deltas differ from the mirror", mm);
+
+    uint32_t mp = 0u;
+    for (uint32_t i = 0; i < NB_CONTACTS; ++i)
+        if (f2u(gotDeltaP[i].x) != f2u(refDeltaP[i].x) || f2u(gotDeltaP[i].y) != f2u(refDeltaP[i].y) ||
+            f2u(gotDeltaP[i].z) != f2u(refDeltaP[i].z) || f2u(gotDeltaP[i].w) != f2u(refDeltaP[i].w))
+        {
+            if (mp == 0u)
+                std::printf("    first particle delta difference at contact %u: gpu (%.9g %.9g "
+                            "%.9g | %.9g) vs (%.9g %.9g %.9g | %.9g)\n", i,
+                            gotDeltaP[i].x, gotDeltaP[i].y, gotDeltaP[i].z, gotDeltaP[i].w,
+                            refDeltaP[i].x, refDeltaP[i].y, refDeltaP[i].z, refDeltaP[i].w);
+            ++mp;
+        }
+    PXG_CHECK_MSG(mp == 0u, "%u particle-side deltas differ from the mirror", mp);
+
+    // Both runs must leave the SAME applied forces: the force update is the shared
+    // half of the two kernels, and a divergence there means the split moved.
+    uint32_t mf = 0u;
+    for (uint32_t i = 0; i < NB_CONTACTS * 2u; ++i)
+    {
+        if (f2u(gotForceA[i]) != f2u(refForce[i])) ++mf;
+        if (f2u(gotForceA[i]) != f2u(gotForceB[i])) ++mf;
+    }
+    PXG_CHECK_MSG(mf == 0u,
+                  "%u applied-force words disagree with the mirror or between the two kernels; "
+                  "everything up to the force update is one shared body", mf);
+
+    std::printf("    [ note ] %u contacts (%u skipped for zero inverse mass, %u normal-force "
+                "clamps bit); %u single-writer vertices bit-exact, %u contended checked on count\n",
+                NB_CONTACTS, skippedByMass, clamped, contendedBase,
+                uint32_t(accum.size()) - contendedBase);
+
+    for (PxgBufferHandle h : { bAccum.h, bCi.h, bMatIdx.h, bClothMats.h, bDeltaPos.h, bDesc.h,
+                               bDeltaP.h, bPhases.h, bPhaseToMat.h, bPsMats.h, bPs.h, bInfos.h,
+                               bConstraints.h, bForcesA.h, bForcesB.h, bNum.h, bDeltaPOut.h })
+        dev->destroyBuffer(h);
+}
+
 } // namespace
