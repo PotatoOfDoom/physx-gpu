@@ -7,7 +7,13 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **821/821** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **822/822** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.33a added `gpuslang.npFloatIntrinRecipSqrt`, which is not a kernel port but a
+PLATFORM measurement: about forty shaders here spell `PxVec3::getNormalized` as
+`v * rsqrt(m)`, while the engine computes `PxRecipSqrt` = `1.0f/sqrtf` — two exactly
+specified IEEE operations — and SPIR-V's `InverseSqrt` is allowed 2 ULP of slack.  The
+two agree bit for bit on llvmpipe over 258442 inputs, and that is now measured rather
+than inferred from a green suite.
 P9.26 added `gpuslang.disabledKernels`, the fourth static checker in the suite
 after `gpuslang.barrierUniformity` (P9.16), `gpuslang.cudaTwinKernels` (P9.20)
 and `gpuslang.speculatedLoads` (P9.23) — all four exist because no fixture and
@@ -1730,6 +1736,116 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.33a — vierzig Shader hingen an einer Eigenschaft des Treibers, die niemand gemessen hatte
+
+Diese Tranche portiert nichts. Sie misst etwa, worauf der halbe Korpus bereits
+stand.
+
+### Wie es auffiel
+
+P9.33 sollte die Softbody-gegen-Tuch-Anheftung portieren, und dafür wandern die
+Kegelgrenzen-Helfer ins gemeinsame Modul — eine CUDA-Definition, zwei
+Verbraucher, dieselbe Regel wie in P9.32. Beim Zusammenlegen standen plötzlich
+**zwei Schreibweisen derselben PhysX-Funktion** nebeneinander:
+
+```slang
+// softBodyFemAttachBda.slang
+float3 faGetNormalized(float3 v) { const float m = dot(v, v);
+                                   return m > 0.0f ? v * rsqrt(m) : float3(0,0,0); }
+
+// pxgSlangFemRigidAttach.slang — mit der Begründung im Kopf:
+//   „PxVec3::getNormalized (PxVec3.h:286) mit recipSqrt = 1.0/sqrt (Unix-Intrinsic)"
+public float3 vecGetNormalized(float3 v) { ... const float rs = 1.0f / sqrt(m); ... }
+```
+
+Beide behaupten, `PxVec3::getNormalized` zu sein. Nur eine davon ist es.
+
+### Warum das kein Schönheitsfehler ist
+
+`getNormalized()` ist `m > 0 ? v * PxRecipSqrt(m) : 0` (PxVec3.h:286),
+`PxRecipSqrt(float)` ist `intrinsics::recipSqrt` (PxMath.h:161), und das ist auf
+Unix **`1.0f / ::sqrtf(a)`** (PxUnixMathIntrinsics.h:93). Wurzel und Division
+sind beide von IEEE 754 **exakt** festgelegt — der Wert, den die CPU-Spiegel
+dieses Ports ausrechnen, ist eindeutig bestimmt.
+
+`rsqrt` in Slang wird zu SPIR-V `GLSL.std.450 InverseSqrt`. Vulkan erlaubt dafür
+**2 ULP**. Ein Treiber darf mit einer schnellen Näherung antworten.
+
+Im Korpus stehen **rund vierzig** Stellen mit `v * rsqrt(m)`. Jede bitgleiche
+Vorrichtung, die durch eine davon läuft, ruhte also auf einer Annahme über den
+**Treiber**, die in diesem Verzeichnis nie jemand nachgemessen hat. Nichts war
+rot. Es hatte nur nie jemand gefragt.
+
+### Zwei Messungen, keine Herleitung
+
+**Erste, breit und billig.** In `pxgSlangTetClosest.slang` — dem Modul, durch das
+die Tuch- und Softbody-Vorrichtungen ihre Punktprojektionen schicken — `rsqrt(m)`
+durch `1.0f / sqrt(m)` ersetzt und die **ganze** Suite gefahren:
+**821/821 grün**. Das ist ein echter Beleg, aber ein eingeschränkter: er deckt
+genau die Eingaben ab, die die Vorrichtungen erzeugen.
+
+> „Genau die Eingaben, die die Vorrichtungen erzeugen" ist das ganze Problem.
+
+**Zweite, direkt und bleibend.** `npFloatIntrin.slang` rechnet beide
+Schreibweisen auf dem Gerät **nebeneinander** aus, und
+`gpuslang.npFloatIntrinRecipSqrt` vergleicht sie bitweise über **258442**
+Eingaben:
+
+* jede Binade von 2⁻⁶⁰ bis 2⁶⁰, je 64 Mantissen — eine Näherung über
+  Seed-Tabelle plus Newton-Schritt hat ihren Fehler als Funktion der Lage in der
+  Binade, also ist das der Sweep, der sie fände;
+* jede Viererpotenz und ihre beiden ULP-Nachbarn;
+* 200000 gleichverteilte **Bitmuster** — eine viel dichtere Abtastung des
+  Mantissenraums als jede geometrische Eingabe;
+* Denormale, `FLT_MIN`, der größte Denormal, `FLT_MAX`;
+* 50000 quadrierte Längen in Kollisionsgröße.
+
+Ergebnis: `rsqrt(x)` **==** `1.0f/sqrt(x)` **==** Host-`1.0f/sqrtf(x)`, bitweise,
+auf **jeder einzelnen**.
+
+Die zweite Gleichheit ist eine eigene Frage und steht deshalb als eigene
+Prüfung: Die CPU-Spiegel rechnen die Host-Form. Wären Gerät und Host dort
+uneins, könnte in diesem Port **überhaupt keine** Normalisierung bitgleich
+verglichen werden — gleichgültig, welche Schreibweise ein Shader wählt.
+
+### Die Kontrolle, denn eine Gleichheitszählung über ungeschriebene Puffer ist perfekt
+
+Zwei Dinge halten die Null oben ehrlich:
+
+* Die Wurzelprüfung ist zugleich ein **Lebendigkeitsbeweis** — sie vergleicht
+  jede Bahn gegen eine Host-Wurzel einer echt positiven Eingabe, also fällt eine
+  ungeschriebene Bahn (0.0f) durch;
+* der Vergleicher wird gegen eine **absichtlich um ein ULP verschobene** Kopie
+  gefahren und muss **genau einen** Unterschied von **genau einem** ULP melden.
+
+Ein Vergleicher, der auf Verlangen nicht durchfallen kann, ist kein Beleg, wenn
+er besteht.
+
+### Die Entscheidung: die vierzig Stellen bleiben
+
+Sie sind auf diesem Gerät **nicht falsch** — und das steht jetzt als Messung da
+statt als Schluss aus einer grünen Suite. Vierzig Stellen umzuschreiben wäre
+eine große Änderung ohne beobachtbaren Gewinn.
+
+Was sich geändert hat, ist die **Sichtbarkeit**: die Abhängigkeit ist kein
+stiller Zufall mehr, sondern eine Prüfung, die auf jedem Gerät anschlägt, auf
+dem sie aufhört zu gelten — und die Fehlermeldung sagt dann, welche Eingabe sie
+gebrochen hat und was daraus folgt.
+
+Der **neue** gemeinsame Helfer in `pxgSlangFemFemAttach` schreibt trotzdem
+`1.0f / sqrt(m)`, weil das die wörtliche Übertragung ist und weil das
+Schwestermodul es seit P8.3 so hält. Die Messung ist das, was die anderen
+vierzig stehen lässt, nicht Bequemlichkeit.
+
+### Verifikation
+
+* `gpuslang.npFloatIntrinRecipSqrt` grün über 258442 Eingaben, alle Bahnen als
+  geschrieben nachgewiesen, gepflanzte 1-ULP-Störung gefangen;
+* die Ersetzungsmessung in `pxgSlangTetClosest`: Suite **821/821** grün mit
+  `1.0f/sqrt` statt `rsqrt` — danach zurückgesetzt, der Korpus bleibt wie er war;
+* Suite jetzt **822** Tests.
+
 
 ## P9.32 — die Tuch-gegen-Tuch-Anheftung, eine ABI mit drei Verbrauchern, und eine vierte Art, auf die ein Kernel tot sein kann
 
