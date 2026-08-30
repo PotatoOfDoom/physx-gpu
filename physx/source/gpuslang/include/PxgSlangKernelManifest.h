@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 377;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 378;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -293,7 +293,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_clothVertMidphaseGeneratePairsLaunch", "softBodyClothVertMidphaseBda.spv", "sb_clothVertMidphaseGeneratePairsLaunch" },  // SB_CLOTH_VERT_MIDPHASE (P8.8 step 3 BDA port — a cloth vertex queries the softbody tet tree)
     { "sb_clothVertContactGenLaunch", "softBodyClothVertContactGenBda.spv", "sb_clothVertContactGenLaunch" },  // SB_CLOTH_VERT_CG (P8.8 step 4 BDA port — point-vs-tet closest point)
     { "sb_meshMidphaseGeneratePairsLaunch", "softBodyMeshMidphaseBda.spv", "sb_meshMidphaseGeneratePairsLaunch" },  // SB_MESH_MIDPHASE (P8.10 step 1 BDA port)
-    { "sb_sdfMeshMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_SDF_MESH_MIDPHASE (unmapped)
+    { "sb_sdfMeshMidphaseGeneratePairsLaunch", "softBodySdfMidphaseBda.spv", "sb_sdfMeshMidphaseGeneratePairsLaunch" },  // SB_SDF_MESH_MIDPHASE (P9.35c BDA)
     { "sb_meshContactGenLaunch", "softBodyMeshContactGenBda.spv", "sb_meshContactGenLaunch" },  // SB_MESH_CG (P8.10 step 2 BDA port)
     { "sb_heightfieldMidphaseGeneratePairsLaunch", "softBodyHfMidphaseBda.spv", "sb_heightfieldMidphaseGeneratePairsLaunch" },  // SB_HF_MIDPHASE (P8.11 step 1 BDA port)
     { "sb_heightfieldContactGenLaunch", nullptr, nullptr },  // SB_HF_CG (unmapped)

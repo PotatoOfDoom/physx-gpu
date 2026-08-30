@@ -1139,6 +1139,23 @@ static const uint8_t kPsSdfCollide[] = { 4, 8, 8, 8, 8, 8, 8, 8, 72 };
 //   ONE BLOCK per test, whatever the "each warp deal with one test" comment above it says.
 static const uint8_t kClothSdfContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80 };
 
+// gpunarrowphase/src/CUDA/softbodySoftbodyMidPhase.cu:1121 (P9.35c, the SDF
+// SOFTBODY midphase):
+//   sb_sdfMeshMidphaseGeneratePairsLaunch(const PxReal tolerenceLength,
+//     const PxgContactManagerInput*, const PxsCachedTransform*, const PxBounds3*,
+//     const PxReal* contactDistance, const PxReal* restDistance, const PxgShape*,
+//     const PxgSoftBody*, const PxNodeIndex* shapeToRigidRemapTable,
+//     PxgRigidFilterPair* filterPairs, const PxU32 nbFilterPairs,
+//     PxgFEMContactWriter writer)
+//   The cloth sibling above is the nearest relative and cannot share a row: this
+//   one LEADS with a PxReal the kernel never reads where that one leads with a
+//   real PxU32 count, and it carries an extra `bounds` pointer -- also never read
+//   -- which shifts every later argument by eight bytes.  Two dead parameters, and
+//   both of them still occupy their slots.
+//   Launch site PxgNarrowphaseCore.cpp:4886: grid (numTests, 1, 1) x block
+//   (1024, 1, 1) -- one block per test, and no count argument to guard against.
+static const uint8_t kSbSdfMidphase[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 80 };
+
 // gpucommon/src/CUDA/radixSortImpl.cu (P6.2 grid radix sort):
 //   radixSortMultiBlockLaunchWithoutCount(PxgRadixSortDesc* desc, PxU32 startBit)
 //   / radixSortMultiCalculateRanksLaunchWithoutCount(same ABI) — the numKeys
@@ -1892,6 +1909,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_sdfMeshCollisonLaunch", kPsSdfCollide, uint32_t(sizeof(kPsSdfCollide)) },
     // gpunarrowphase femClothPrimitives.cu:2310 (P9.34c, the SDF CLOTH contact gen)
     { "cloth_sdfMeshContactGenLaunch", kClothSdfContactGen, uint32_t(sizeof(kClothSdfContactGen)) },
+    // gpunarrowphase softbodySoftbodyMidPhase.cu:1121 (P9.35c, the SDF softbody midphase)
+    { "sb_sdfMeshMidphaseGeneratePairsLaunch", kSbSdfMidphase, uint32_t(sizeof(kSbSdfMidphase)) },
     // gpucommon radixSortImpl.cu:39 / :53 — the PLAIN radix twins (P6.4b-1 BDA);
     // same {8,4} pack as the WithoutCount twins (numKeys deref'd on-device).
     { "radixSortMultiBlockLaunch", kRadixDescPlain, uint32_t(sizeof(kRadixDescPlain)) },
