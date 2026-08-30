@@ -1942,11 +1942,21 @@ liefert `a/s` statt `s/a`. Upstream-Kandidat **43**; keine Portstelle hängt dar
 * die vier Vorrichtungen, die beim Korrigieren rot wurden, sind alle wieder grün —
   diesmal mit **beiden** Seiten richtig;
 * Manifest unverändert, die Numerik aber in **33** Shader-Dateien: `build-sdk` neu
-  gebaut, der Szenendurchlauf war zum Zeitpunkt dieses Commits **noch unterwegs**;
-  sein Ergebnis wird nachgetragen. Ebenso noch offen: die Vorrichtungsläufe für die
-  zwei zuletzt korrigierten Host-Spiegel (`testConvexTrimeshMidphase`,
-  `computeBasis` in `testFemClothSim`) — beide sind gegen die zitierte Engine-Zeile
-  entschieden, aber noch nicht gefahren, weil währenddessen nicht gebaut wird.
+  gebaut und die Szenen gelaufen: **33 ok, 0 fail, 0 missing (von 33)**;
+* zuletzt zwei Host-Spiegel, die der SPIR-V-Prüfer bauartbedingt **nicht** erreicht,
+  weil sie auf der CPU-Seite liegen: `testConvexTrimeshMidphase.cpp:415` teilte, wo
+  sein Shader `nRaw * rsqrt(nl)` multipliziert (`PxPlane` normalisiert über
+  `getNormalized`, PxVec3.h:286), und `computeBasis` in `testFemClothSim.cpp`
+  spiegelt `PxComputeBasisVectors` (PxMathUtils.h:297), dessen beide Zweige
+  `.normalize()` rufen — der Spiegel teilte, und sein eigener Kommentar behauptete
+  „right/up .normalize() is v / sqrt(magSq)", dieselbe Fehllesart noch einmal.
+  **Zwei nicht zusammenpassende Paare, die auf den gefahrenen Fällen nur zufällig
+  übereinstimmten.** Alles Übrige, was der Handdurchgang fand, ist Szenen-AUFBAU
+  (ein Wert einmal gebaut und beiden Seiten identisch übergeben, es wird also gar
+  keine Arithmetik verglichen) oder eine echte Vektor-durch-VEKTOR-Division und
+  damit treu;
+* nach diesen beiden noch einmal die volle Suite: **833/833 in beiden Modi, beide im
+  ERSTEN Anlauf**.
 
 ## P9.35 — der SDF-Softbody-Zwischenlauf, und was passiert, wenn man zwei Geschwister nebeneinanderlegt
 
