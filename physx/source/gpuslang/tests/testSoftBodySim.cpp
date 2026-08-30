@@ -1338,7 +1338,9 @@ static Q4 extractRotation(const M3& A, Q4 q, int maxIter)
         omega[0] *= s; omega[1] *= s; omega[2] *= s;
 
         const float w = std::sqrt(omega[0]*omega[0] + omega[1]*omega[1] + omega[2]*omega[2]);
-        if (w > 0.0f) { omega[0] /= w; omega[1] /= w; omega[2] /= w; }
+        // P9.36: extractRotation (deformableUtils.cuh:58) gets here through
+        // omega.normalize(), i.e. operator/= -- ONE reciprocal, three multiplies.
+        if (w > 0.0f) { const float r = 1.0f / w; omega[0] *= r; omega[1] *= r; omega[2] *= r; }
 
         const float a = w * 0.5f;
         const float sa = std::sin(a), ca = std::cos(a);
@@ -9325,8 +9327,14 @@ PXG_TEST(softBodySimClothContactSolve)
         const float tsq = t.x * t.x + t.y * t.y + t.z * t.z;
         if (fric != 0.0f && tsq > 1.0e-14f)
         {
+            // P9.36: FEMClothExternalSolve.cu:268-269 is `PxRecipSqrt(tanMagSq)` then
+            // `tanDir *= invTanMag` -- one reciprocal, three multiplies.  Three of the
+            // four ports of this block in this corpus already spelled it that way
+            // (femClothClothContactBda:430, npClothCollisionConstraint:182,
+            // npSbCollisionConstraint); this pair was the fourth.
             const float tm = std::sqrt(tsq);
-            t.x /= tm; t.y /= tm; t.z /= tm;
+            const float invTm = 1.0f / tm;
+            t.x *= invTm; t.y *= invTm; t.z *= invTm;
             const float CT = relDelta.x * t.x + relDelta.y * t.y + relDelta.z * t.z;
             float dLT = std::max(0.0f, CT * denomInv);
             dLT = -std::min(dLT, fric * std::fabs(dLN));

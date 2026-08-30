@@ -258,7 +258,9 @@ void ps_diffuseParticleUpdatePBF(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_G
 
     float3 velAvg = float3(0.0f, 0.0f, 0.0f);
     if (weightSum > 0.0f)
-        velAvg = velocitySum / weightSum;
+        // P9.36: diffuseParticles.cu:269 divides a PxVec3 by a PxReal, i.e.
+        // PxVec3::operator/ (PxVec3.h:219) -- one reciprocal, three multiplies.
+        velAvg = velocitySum * (1.0f / weightSum);
 
     newVel[pi] = float4(velAvg.x, velAvg.y, velAvg.z, float(numNeighbors));  // V9
 }

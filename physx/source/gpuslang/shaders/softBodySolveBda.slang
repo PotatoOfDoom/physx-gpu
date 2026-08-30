@@ -282,9 +282,14 @@ float4 sbExtractRotation(float3 a0, float3 a1, float3 a2, float4 q, int maxIter)
 
         // PxVec3::normalize(): m = PxSqrt(magnitudeSquared()); if (m > 0) *this /= m;
         // returns m.  PxSqrt is IEEE-754 correctly rounded -> bit-exact.
+        //
+        // P9.36: `*this /= m` is operator/= (PxVec3.h:260), which forms the RECIPROCAL
+        // ONCE and multiplies three times.  The comment above already said so and the
+        // line below divided three times anyway.  extractRotation
+        // (deformableUtils.cuh:58) reaches this through `omega.normalize()`.
         const float w = sqrt(sbDot3(omega, omega));
         if (w > 0.0f)
-            omega = omega / w;
+            omega = omega * (1.0f / w);
 
         // PxQuat(angleRadians, unitAxis) (PxQuat.h:86): a = angle*0.5; PxSinCos(a, s, w).
         // *** THE TOLERANCE SEAM *** — sin/cos are not bitwise portable.

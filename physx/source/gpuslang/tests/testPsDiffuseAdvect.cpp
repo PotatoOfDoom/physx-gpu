@@ -429,8 +429,11 @@ static Expect predict(const SysSpec& S, const SideArrays& A)
                     }
                 }
         F4 avg{ 0, 0, 0, float(numNeighbors) };
+        // P9.36: diffuseParticles.cu:269 is `velAvg = velocitySum / weightSum` on a
+        // PxVec3 -- PxVec3::operator/ (PxVec3.h:219), one reciprocal then three
+        // multiplies, not three divides.
         if (weightSum > 0.0f)
-        { avg.x = vsx / weightSum; avg.y = vsy / weightSum; avg.z = vsz / weightSum; }
+        { const float r = 1.0f / weightSum; avg.x = vsx * r; avg.y = vsy * r; avg.z = vsz * r; }
         E.velAvg[pi] = avg;
     }
 

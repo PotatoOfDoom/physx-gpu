@@ -135,7 +135,12 @@ void solveContact(float3 relDelta, float4 normalPen, float denomInv, float frict
 
     if (frictionCoefficient != 0.0f && tanMagSq > TAN_THRESHOLD)
     {
-        tanDir = tanDir / sqrt(tanMagSq);
+        // P9.36: FEMClothExternalSolve.cu:268-269 is `invTanMag = PxRecipSqrt(tanMagSq);
+        // tanDir *= invTanMag;` -- ONE reciprocal-sqrt and three multiplies, never three
+        // divides.  femClothClothContactBda.slang:430 ports the SAME engine line and
+        // already spells it this way; this copy did not.
+        const float invTanMag = 1.0f / sqrt(tanMagSq);   // PxRecipSqrt (documented seam)
+        tanDir = tanDir * invTanMag;
         const float CT = dot(relDelta, tanDir);
 
         float deltaLambdaT = max(0.0f, CT * denomInv);

@@ -255,7 +255,9 @@ void cloth_finalizeVelocitiesLaunch(uint3 groupThreadId : SV_GroupThreadID, uint
 
         const float4 delta = posDelta[globalThreadIndex];
         const float3 tDelta = float3(delta.x, delta.y, delta.z);
-        const float3 deltaVel = tDelta / dt;
+        // P9.36: FEMCloth.cu:1258 is `PxVec3 deltaVel = tDelta / dt;` on a PxVec3, i.e.
+        // PxVec3::operator/ (PxVec3.h:219) -- ONE reciprocal, three multiplies.
+        const float3 deltaVel = tDelta * (1.0f / dt);
         const float4 pos = positions[globalThreadIndex];
 
         if (pos.w != 0.0f) // skip kinematic / infinite-mass vertices

@@ -780,7 +780,10 @@ static void runFinalize(bool alwaysAvg)
 
         const F4 delta = posDelta[i];
         const float tdx = delta.x, tdy = delta.y, tdz = delta.z;
-        const float dvx = tdx / dt, dvy = tdy / dt, dvz = tdz / dt;
+        // P9.36: FEMCloth.cu:1258 is `PxVec3 deltaVel = tDelta / dt;` -- PxVec3's
+        // operator/ (PxVec3.h:219), one reciprocal and three multiplies.
+        const float invDt = 1.0f / dt;
+        const float dvx = tdx * invDt, dvy = tdy * invDt, dvz = tdz * invDt;
         const F4 pos = positions[i];
 
         if (pos.w != 0.0f)
