@@ -164,7 +164,15 @@ void triPointDistance(uint3 dtid : SV_DispatchThreadID)
         generateContact = true;
         faceContact = true;
         mask = 0u;
-        closestP = a + (ab * vb + ac * vc) / (va + vb + vc);
+        // P9.36: BOTH halves were wrong here.  GuDistancePointTriangle.h:94-97 is
+        //     const float denom = 1.0f / (va + vb + vc);
+        //     const float v = vb * denom;  const float w = vc * denom;
+        //     return a + ab*v + ac*w;
+        // -- a reciprocal, not three divides, AND the two scalars scaled before the
+        // vector sum, not after.  The eighteen other copies of this tail in the
+        // corpus already spell it this way; this one and the two convex ones did not.
+        const float denom = 1.0f / (va + vb + vc);
+        closestP = a + ab * (vb * denom) + ac * (vc * denom);
         distSq = dot(closestP - p, closestP - p);
     }
 

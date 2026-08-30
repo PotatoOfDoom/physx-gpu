@@ -284,10 +284,11 @@ float distancePointTriangleSquared(float3 p, float3 a, float3 b, float3 c, uint4
     generateContact = true;
     faceContact = true;
     mask = 0u;
-    // reciprocal-then-multiply to match PxVec3::operator/ (f = 1.0f/f; x*f,...)
-    // exactly, NOT a per-component divide (they differ by up to 1 ULP for a
-    // non-power-of-two denominator, and the CPU reference uses 1.0f/den)
-    closestP = a + (ab * vb + ac * vc) * (1.0f / (va + vb + vc));
+    // P9.36: the reciprocal was right and the ASSOCIATION was not -- see the twin
+    // note in npCvxHfNp.slang.  GuDistancePointTriangle.h:94-97 scales the two
+    // SCALARS (v = vb*denom, w = vc*denom) and only then forms a + ab*v + ac*w.
+    const float denom = 1.0f / (va + vb + vc);
+    closestP = a + ab * (vb * denom) + ac * (vc * denom);
     return dot(closestP - p, closestP - p);
 }
 

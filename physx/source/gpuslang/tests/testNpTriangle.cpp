@@ -108,8 +108,15 @@ float refTri(const V3& p, const V3& a, const V3& b, const V3& c, const U4& adj,
         const float w = (d4 - d3) / ((d4 - d3) + (d5 - d6)); closestP = madd(b, sub(c, b), w); const V3 d = sub(closestP, p); return dot3(d, d);
     }
     gen = true; face = true; mask = 0u;
-    const float denom = va + vb + vc;
-    closestP = V3{ a.x + (ab.x * vb + ac.x * vc) / denom, a.y + (ab.y * vb + ac.y * vc) / denom, a.z + (ab.z * vb + ac.z * vc) / denom };
+    // P9.36: GuDistancePointTriangle.h:94-97 is a RECIPROCAL and the two scalars scaled
+    // BEFORE the vector sum -- `denom = 1/(va+vb+vc); v = vb*denom; w = vc*denom;
+    // a + ab*v + ac*w`.  This mirror had three divides and the wrong association, and
+    // the shader had both too, so the pair agreed.  Note that this fixture compares
+    // closestP with almostEqual(1e-4f, 1e-5f) (see below), so it could not have caught
+    // the difference even with a correct mirror -- gpuslang.vectorDivide is what does.
+    const float denom = 1.0f / (va + vb + vc);
+    const float bv = vb * denom, bw = vc * denom;
+    closestP = V3{ a.x + ab.x * bv + ac.x * bw, a.y + ab.y * bv + ac.y * bw, a.z + ab.z * bv + ac.z * bw };
     const V3 d = sub(closestP, p); return dot3(d, d);
 }
 

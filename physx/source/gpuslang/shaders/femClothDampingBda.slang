@@ -88,8 +88,10 @@ float dmpNormalize(inout float3 v)
     // by one ULP on two of five vertices -- close enough to look like noise and
     // far enough to be a different number.
     const float m = sqrt(dot(v, v));
+    // RECIPROCAL-MULTIPLY, not a componentwise divide: normalize() delegates to
+    // operator/= (PxVec3.h:260-267), which forms 1.0/m once and multiplies.  P9.36.
     if (m > 0.0f)
-        v /= m;
+        v = v * (1.0f / m);
     return m;
 }
 

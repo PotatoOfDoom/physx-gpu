@@ -72,10 +72,19 @@ module pxgSlangFemFemAttach;
 // The two leading fields are UNIONS.  Both prepare/solve families use the SECOND name of
 // each pair; the first names belong to the RIGID attachment path and never appear here.
 //
-// elemId0/elemId1 are declared PxU64 but every reader in the engine narrows them to PxU32
-// on load ("can be triangleId(cloth) or tetrahedron index").  The port narrows the same
-// way — reading the LOW word at the PxU64 stride — because widening it would change which
-// bits reach the id/element split.
+// elemId0/elemId1 are declared PxU64.  THE READERS THIS MODULE SERVES -- the FEM-vs-FEM
+// families -- narrow them to PxU32 on load ("can be triangleId(cloth) or tetrahedron
+// index"): softBodyGM.cu:2351/:2366/:2446/:2462/:2549 all take `const PxU32 elemId =
+// constraint.elemIdN[offset]` and split with PxGetSoftBodyId / PxGetClothId, which work on
+// 32 bits.  The port narrows the same way -- reading the LOW word at the PxU64 stride.
+//
+// That is NOT a property of every reader of this field, and the earlier form of this
+// comment claimed it was.  softBodyGM.cu:2570 reads the SAME slot at full width --
+// `const PxU64 elemId0 = constraint.elemId0[offset];` -- and hands it to
+// PxGetParticleSystemId, which is `compressedId >> 32` (PxgSimulationCoreDesc.h:155), i.e.
+// the HIGH word, with PxGetParticleIndex (:150) taking the low one.  That is the
+// PARTICLE-attachment path, which this module does not implement.  The narrowing here is
+// correct for the callers it has; it is not a licence to narrow at a particle site.
 // ---------------------------------------------------------------------------
 public static const uint64_t FAC_STRIDE          = 2688UL;
 public static const uint64_t FAC_LOW_HIGH_ANGLES = 0UL;

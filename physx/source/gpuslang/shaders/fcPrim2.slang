@@ -417,7 +417,10 @@ void ctFcPrim2(uint3 tid : SV_DispatchThreadID)
         if (sqDist <= sqContactDistance)
         {
             const float m = sqrt(sqDist);
-            const float3 n = v / m; // faithful: no zero guard
+            // femClothPrimitives.cu:2837 `const PxVec3 n = v / m` -- and PxVec3's
+            // operator/(Type) (PxVec3.h:219-223) is `f = 1.0/f; return (x*f,y*f,z*f)`,
+            // so this is a reciprocal-multiply.  No zero guard, faithfully.  P9.36.
+            const float3 n = v * (1.0f / m);
             const float pen = m - restDistance;
             const float3 contact = p - n * restDistance;
 

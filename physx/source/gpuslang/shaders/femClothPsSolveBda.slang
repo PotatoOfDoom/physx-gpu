@@ -173,12 +173,21 @@ float4 pssTriangleContact(uint64_t velsAddr, uint4 triVertId, float4 barycentric
     return v0 * barycentric.x + v1 * barycentric.y + v2 * barycentric.z;
 }
 
-// PxVec3::normalize -- returns the magnitude, normalises in place if m > 0.  S6.
+// PxVec3::normalize (PxVec3.h:295-301) -- returns the magnitude and normalises in
+// place when m > 0.  S6.
+//
+// THE SCALING IS A RECIPROCAL-MULTIPLY, NOT THREE DIVIDES, and that is not a
+// stylistic choice.  normalize() delegates to operator/= (PxVec3.h:260-267),
+// which is `f = 1.0/f; x *= f; y *= f; z *= f` -- ONE reciprocal and three
+// multiplies.  Slang's `v / m` for scalar m is a genuine componentwise vector
+// divide (verified: a single vec3-typed OpFDiv whose divisor is an
+// OpCompositeConstruct splat), and the two forms differ in at least one
+// component for 53.5% of random vectors.  P9.36.
 float pssNormalize(inout float3 v)
 {
     const float m = sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
     if (m > 0.0f)
-        v = v / m;
+        v = v * (1.0f / m);
     return m;
 }
 

@@ -392,11 +392,14 @@ PcResult solvePCOutputDeltaVTGS(
 float3 normalize3(float3 v)
 {
     const float m = sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+    // PxComputeBasisVectors calls PxVec3::normalize() (PxMathUtils.h:303, :313),
+    // which is operator/= -- 1.0/m formed ONCE, then three multiplies.  P9.36.
     if (m > 0.0f)
     {
-        v.x = v.x / m;
-        v.y = v.y / m;
-        v.z = v.z / m;
+        const float inv = 1.0f / m;
+        v.x = v.x * inv;
+        v.y = v.y * inv;
+        v.z = v.z * inv;
     }
     return v;
 }

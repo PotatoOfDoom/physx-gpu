@@ -203,12 +203,15 @@ float3 getNormalized(float3 v)
     const float m = dot(v, v);
     return m > 0.0f ? v * rsqrt(m) : float3(0, 0, 0);
 }
-// PxVec3::normalize(): guarded in-place divide, returns the magnitude
+// PxVec3::normalize() (PxVec3.h:295-301): returns the magnitude and normalises in
+// place when m > 0.  The scaling is a RECIPROCAL-MULTIPLY -- normalize() goes
+// through operator/= (PxVec3.h:260-267), which forms 1.0/m ONCE and multiplies.
+// A componentwise `v / m` differs from it for 53.5% of vectors.  P9.36.
 float pxNormalize(inout float3 v)
 {
     const float m = sqrt(dot(v, v));
     if (m > 0.0f)
-        v = v / m;
+        v = v * (1.0f / m);
     return m;
 }
 // PxQuat::getBasisVector0 closed form

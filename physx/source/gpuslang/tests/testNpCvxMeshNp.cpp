@@ -190,6 +190,13 @@ static bool isValidBaryRef(float v, float w)
     return (v >= -eps && v <= 1.0f + eps) && (w >= -eps && w <= 1.0f + eps) && ((v + w) <= 1.0f + eps);
 }
 
+// P9.36: how many FACE-region cases would actually separate the engine's association
+// (scalars scaled first) from the sum-then-scale spelling this mirror used to carry.
+// Reset by the caller before each sweep; asserted afterwards.
+static size_t gFaceDistinguish = 0;
+static size_t gFaceMixedComponent = 0;
+static uint32_t bitsOf(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
+
 static float distPointTriRef(V3 p, V3 a, V3 b, V3 c, U4 adj, V3& closestP,
                              bool& generateContact, bool& faceContact, uint32_t& mask)
 {
@@ -255,7 +262,33 @@ static float distPointTriRef(V3 p, V3 a, V3 b, V3 c, U4 adj, V3& closestP,
     generateContact = true;
     faceContact = true;
     mask = 0u;
-    closestP = add(a, mul(add(mul(ab, vb), mul(ac, vc)), 1.0f / (va + vb + vc)));
+    // P9.36: GuDistancePointTriangle.h:94-97 scales the two SCALARS by the reciprocal
+    // and only then forms the vector sum.  This mirror used to sum first and scale
+    // after -- `(ab*vb + ac*vc) * (1/denom)` -- which rounds in a different place.
+    const float denom = 1.0f / (va + vb + vc);
+    // left-to-right, as the engine's `a + ab*v + ac*w` associates in C++.
+    closestP = add(add(a, mul(ab, vb * denom)), mul(ac, vc * denom));
+    // ...and this counts how many of those cases the OLD spelling would actually have
+    // got wrong, i.e. how much of this branch the fixture is able to police at all.
+    // See gFaceDistinguish's use below: on this fixture's exact dyadic geometry the
+    // answer can be zero, and that is a fact worth asserting rather than assuming.
+    {
+        const V3 oldForm = add(a, mul(add(mul(ab, vb), mul(ac, vc)), denom));  // pre-P9.36
+        // diagnosis probe: the two spellings coincide IDENTICALLY when, in every
+        // component, at most one of ab/ac is non-zero -- then ab.x*vb + ac.x*vc has a
+        // single term and (t)*denom == ab.x*(vb*denom) trivially.  Axis-aligned grid
+        // triangles are exactly that shape.
+        {
+            int mixed = 0;
+            if (ab.x != 0.0f && ac.x != 0.0f) ++mixed;
+            if (ab.y != 0.0f && ac.y != 0.0f) ++mixed;
+            if (ab.z != 0.0f && ac.z != 0.0f) ++mixed;
+            if (mixed > 0) ++gFaceMixedComponent;
+        }
+        if (bitsOf(oldForm.x) != bitsOf(closestP.x) || bitsOf(oldForm.y) != bitsOf(closestP.y) ||
+            bitsOf(oldForm.z) != bitsOf(closestP.z))
+            ++gFaceDistinguish;
+    }
     const V3 d = sub(closestP, p);
     return dot3(d, d);
 }
@@ -449,6 +482,12 @@ struct CmRef
     V3 niNormal{};
     uint32_t niIndex = 0, ordered = 0, pairOffset = 0, padOffset = 0;
     bool delay = false, edge = false;
+    // P9.36: does this case land in the FACE region of distPointTriRef?  That is the
+    // one branch whose arithmetic (the barycentric tail of
+    // GuDistancePointTriangle.h:94-97) this fixture was silently not policing --
+    // correcting the shader's association there left the suite green.  Counted so a
+    // coverage assertion can say whether the branch is reached at all.
+    bool faceRegion = false;
 };
 
 static void getShapeSpaceVertsRef(const CmCase& cs, const CmMesh& mesh, uint32_t triangleIdx,
@@ -505,6 +544,7 @@ static CmRef refSphere(const CmCase& cs, const CmMesh& mesh, const std::vector<U
         const float sqInflated = inflated * inflated;
         if (sqInflated > sqDist && gen)
         {
+            ro.faceRegion = face;                                     // P9.36
             patchNormal = n;
             if (!face) patchNormal = getNormalizedRef(sub(center, closestP));
             const float cosTheta = dot3(patchNormal, n);
@@ -895,7 +935,7 @@ static void checkKind(const char* entry, bool capsule, uint32_t seed)
     }
 
     size_t nHit = 0, nDelay = 0, nEdgeD = 0, nVertD = 0, nZero = 0, nFlip = 0, nOmZeroNb = 0,
-           nBoundaryEx = 0, nBoundaryIn = 0, nTwoCts = 0;
+           nBoundaryEx = 0, nBoundaryIn = 0, nTwoCts = 0, nFaceRegion = 0;
     for (uint32_t i = 0; i < NC; ++i)
     {
         const CmRef& ro = fx.ref[i];
@@ -908,6 +948,7 @@ static void checkKind(const char* entry, bool capsule, uint32_t seed)
         if (i % 16 == 6 && ro.nb == 0) ++nBoundaryEx;
         if (i % 16 == 14 && ro.nb != 0) ++nBoundaryIn;
         if (ro.nb == 2) ++nTwoCts;
+        if (ro.faceRegion) ++nFaceRegion;                             // P9.36
     }
     if (capsule)
         PXG_CHECK_MSG(nOmZeroNb > 20 && droppedMasks > 10 && nTwoCts > 100,
@@ -915,6 +956,37 @@ static void checkKind(const char* entry, bool capsule, uint32_t seed)
     else
         PXG_CHECK_MSG(nBoundaryEx == 64 && nBoundaryIn == 64,
                       "%s boundary probes: ex=%zu in=%zu (want 64/64)", entry, nBoundaryEx, nBoundaryIn);
+    // P9.36: the face region must actually be entered, or the barycentric tail of
+    // distPointTriRef is dead weight and the fixture proves nothing about it.
+    // P9.36 -- A NAMED LIMITATION, measured rather than assumed.
+    //
+    // The face region of distPointTriRef is entered often on the sphere path (256 of
+    // 1024) and NEVER on the capsule path.  Yet correcting the barycentric tail of
+    // npCvxMeshNp.slang from `(ab*vb + ac*vc) * denom` to the engine's
+    // `ab*(vb*denom) + ac*(vc*denom)` (GuDistancePointTriangle.h:94-97) left this
+    // fixture green, and the counters say why: in ZERO of those 256 cases does any
+    // component have BOTH ab and ac non-zero.  This mesh's triangles are axis-aligned,
+    // so every component of `ab.c*vb + ac.c*vc` has at most one live term, and the two
+    // associations are then IDENTICAL as expressions -- not close, identical.  No
+    // tolerance and no sample count could change that; it follows from the geometry.
+    //
+    // This is a fourth way a fixture goes blind, distinct from a wrong mirror, a loose
+    // tolerance and an uncovered path: the exact-arithmetic doctrine that makes
+    // bit-exact comparison possible here is the same thing that puts rounding-order
+    // defects out of reach.  Killing this mutant needs a triangle whose two edge
+    // vectors share a non-zero component, which means reshaping the shared mesh that
+    // every other expectation in this file is pinned against.  gpuslang.vectorDivide
+    // covers the divide half; the association half is carried by this note and by the
+    // audit that found it.
+    PXG_CHECK_MSG(!capsule || nFaceRegion == 0,
+                  "%s: the capsule path now reaches the face region (%zu cases) -- the "
+                  "limitation note above is stale, re-measure it", entry, nFaceRegion);
+    PXG_CHECK_MSG(capsule || nFaceRegion > 0,
+                  "%s: the sphere path no longer reaches the face region", entry);
+    std::printf("    [ note ] %s: face region reached in %zu of %zu cases; %zu separate the "
+                "engine's association from sum-then-scale (%zu have a component where both "
+                "edge vectors are non-zero)\n",
+                entry, nFaceRegion, fx.cases.size(), gFaceDistinguish, gFaceMixedComponent);
     PXG_CHECK_MSG(nHit > 300 && nDelay > 100 && nEdgeD > 30 && nVertD > 30 && nZero > 100 && nFlip > 50,
                   "%s coverage thin (hit=%zu delay=%zu edgeD=%zu vertD=%zu zero=%zu flip=%zu)",
                   entry, nHit, nDelay, nEdgeD, nVertD, nZero, nFlip);

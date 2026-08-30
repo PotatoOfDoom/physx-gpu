@@ -7791,10 +7791,16 @@ static V3 cross3(V3 a, V3 b)
 
 // PxVec3::normalize (PxVec3.h:295): returns the magnitude BEFORE scaling and
 // divides only when it is strictly positive.
+//
+// P9.36: `*this /= m` is operator/=(Type) (PxVec3.h:260), which forms the
+// RECIPROCAL ONCE and multiplies three times.  Three componentwise divides are a
+// different function -- they disagree with it in at least one component for 53.5%
+// of vectors.  This mirror used to divide, and so did the shader, so the fixture
+// was comparing two equally wrong things and stayed green.
 static float normalize3(V3& v)
 {
     const float m = std::sqrt(dot3(v, v));
-    if (m > 0.0f) { v.x /= m; v.y /= m; v.z /= m; }
+    if (m > 0.0f) { const float r = 1.0f / m; v.x *= r; v.y *= r; v.z *= r; }
     return m;
 }
 // deformableUtils.cuh:118 -- divides by magnitudeSquared even for a unit normal.
@@ -11436,7 +11442,9 @@ PXG_TEST(femClothSimPsContactGen)
         if (!(sqDist <= cDistance * cDistance)) continue;       // C5
         ++faceHits;
         const float m = std::sqrt(sqDist);
-        const V3 n{ v.x / m, v.y / m, v.z / m };                // C6: unguarded
+        // C6: unguarded.  P9.36: `v / m` on a PxVec3 is PxVec3.h:219 -- one
+        // reciprocal, three multiplies -- not three divides.
+        const V3 n = scl(v, 1.0f / m);
         const float pen = m - rest;                             // C4
         const V3 contact = sub(pp, scl(n, rest));               // C4
         Exp e{};
@@ -12096,10 +12104,11 @@ using p931prep::CB_OFF_BARY;
 using p931prep::CB_OFF_VELMULT;
 
 // PxVec3::normalize -- returns the magnitude, normalises in place if m > 0.
+// P9.36: reciprocal-then-multiply, per PxVec3.h:260.  See normalize3 above.
 static float pxNormalize(V3& v)
 {
     const float m = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-    if (m > 0.0f) { v.x = v.x / m; v.y = v.y / m; v.z = v.z / m; }
+    if (m > 0.0f) { const float r = 1.0f / m; v.x *= r; v.y *= r; v.z *= r; }
     return m;
 }
 } // namespace p931solve

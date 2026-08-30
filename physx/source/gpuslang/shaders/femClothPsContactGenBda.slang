@@ -266,7 +266,10 @@ void cloth_psContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
         if (sqDist <= sqContactDistance)                 // C5
         {
             const float m = sqrt(sqDist);
-            const float3 n = v / m;                      // C6: unguarded
+            // C6: unguarded, and a RECIPROCAL-MULTIPLY -- femClothPrimitives.cu:2837
+            // writes `PxVec3 n = v / m`, which is PxVec3::operator/(Type)
+            // (PxVec3.h:219-223): 1.0/m formed once, then three multiplies.  P9.36.
+            const float3 n = v * (1.0f / m);
             const float pen = m - restDistance;          // C4
             const float3 contact = p - n * restDistance; // C4
 
