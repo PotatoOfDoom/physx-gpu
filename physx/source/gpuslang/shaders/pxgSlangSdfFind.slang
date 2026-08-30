@@ -462,4 +462,146 @@ uint sdfGlobalScanExclusive(uint tid, bool threadContributesElement, uint64_t co
     return indexInThreadBlock + gSdfGlobalOffset;
 }
 
+
+// ---------------------------------------------------------------------------
+// findInterestingTets<32, 1024>, sdfCollision.cuh:565-616 -- P9.35b.
+//
+// The TET gather, and the third member of this family after the vertex form
+// (P9.12e) and the triangle form (P9.34b).  It is closest to the VERTEX one --
+// same plain-uint buffer, same addIndexToBuffer, same resume protocol -- and its
+// cull test is the TRIANGLE one's, widened to four corners.  What is worth
+// writing down is where it differs from BOTH:
+//
+//  U1. THERE IS NO COUNT GUARD.  The loop condition is `i < nbTets` alone, where
+//      the triangle form carries `&& sharedIndicesCount < TargetCount`.  This is
+//      the exact inverse of P9.34b's T1, and it is upstream's asymmetry, not a
+//      transcription slip -- the two functions sit forty lines apart in the same
+//      header.  P9.34b established that the guard is output-neutral and costs
+//      only work (once the buffer saturates, every later write offset is >=
+//      TargetCount and the resume handshake cannot fire again), so the same
+//      argument says its ABSENCE here is output-neutral too.  Transcribed as
+//      written; the fixture measures the difference in triangles TOUCHED, which
+//      is the only place it shows.
+//
+//  U2. THE SOFTBODY SIDE HAS NO SCALE AT ALL.  The triangle form applies
+//      vertex2Shape with scale0 before the a-to-b transform; here the tet
+//      vertices go straight through `aToB.transform(...)`.  Not a unit scale that
+//      happens to be the identity -- there is no call.
+//
+//  U3. THE RADIUS DIVIDE TAKES NO ABSOLUTE VALUE: `PxMin(scale1.scale.x, ...)`.
+//      And the KERNEL that calls this divides its own contact distance by
+//      `scale.abs().minElement()` -- WITH the absolute value.  Two spellings of
+//      the same idea, forty lines apart, inside one call chain, disagreeing on
+//      sign.  The mirror image of P9.34c's S3, where the cloth kernel omits the
+//      abs and its particle sibling takes it.
+//
+//  U4. THE SURFACE HINT IS DEAD BY CALLER.  `surfaceHint` defaults to NULL and
+//      the only call site (softbodySoftbodyMidPhase.cu:1202) passes nothing --
+//      the argument is commented out there.  So `!surfaceHint || surfaceHint[ind]`
+//      is always true.  Not transcribed, and named here so the next reader does
+//      not go looking for the parameter.
+//
+// TWO THINGS THE SWEEP LEFT STANDING, and both are proofs rather than gaps:
+//
+//  * `sqrt(max(a2, b2, ...))` against `max(sqrt(a2), ...)` is an EQUIVALENT.
+//    sqrt is monotone and correctly rounded, so it commutes with a maximum --
+//    P9.34a established this for the triangle form and it carries over unchanged.
+//
+//  * SWAPPING TWO CORNERS is an equivalent HERE and only here.  This function
+//    reads the four vertices through exactly two symmetric aggregates: the
+//    centroid `((a + b) + c) + d`, where float addition is commutative so
+//    `(a + b)` and `(b + a)` are the same bits, and the radius, a nest of
+//    `max` over the four squared offsets, where max is commutative too.  The
+//    DESCENT is a different matter -- there the cascade tests the corners in
+//    order and the barycentric blend weights them individually, and its
+//    corresponding mutants both fall.  Two functions over the same four points,
+//    one order-blind and one not.
+// ---------------------------------------------------------------------------
+
+// U3, factored out so the *Ex trace and the live path cannot disagree about it.
+float sdfTetCullDistance(uint64_t tetInd, uint64_t tetVerts, uint ind,
+                         float3 aToBp, float4 aToBq,
+                         float3 scale1, float4 scale1Rot, SparseSdfTexture sdfMesh1,
+                         out float radiusOverScale, out float3 centroidVertexSpace)
+{
+    const uint4 tet = Ptr<uint4>(tetInd)[ind];
+    Ptr<float4> vp = Ptr<float4>(tetVerts);
+    // U2: no vertex2Shape on this side.
+    const float3 a = sdfTransformPoint(aToBp, aToBq, vp[tet.x].xyz);
+    const float3 b = sdfTransformPoint(aToBp, aToBq, vp[tet.y].xyz);
+    const float3 c = sdfTransformPoint(aToBp, aToBq, vp[tet.z].xyz);
+    const float3 d = sdfTransformPoint(aToBp, aToBq, vp[tet.w].xyz);
+
+    const float3 centroid = (a + b + c + d) * 0.25f;
+
+    centroidVertexSpace = sdfShape2Vertex(centroid, scale1, scale1Rot);
+    const float distInSDFSpace1 = sdfDistance(sdfMesh1, centroidVertexSpace);
+
+    const float3 e0 = a - centroid, e1 = b - centroid, e2 = c - centroid, e3 = d - centroid;
+    // Nested max of SQUARES, one sqrt, and the nesting is max(max, max).
+    float r = sqrt(max(max(dot(e0, e0), dot(e1, e1)), max(dot(e2, e2), dot(e3, e3))));
+    r = r / min(scale1.x, min(scale1.y, scale1.z));     // U3: NO abs
+    radiusOverScale = r;
+
+    return distInSDFSpace1;
+}
+
+uint sdfFindInterestingTetsEx(uint tid, uint nbTets, uint64_t tetInd, uint64_t tetVerts,
+                              float3 scale1, float4 scale1Rot,
+                              float tolerance, SparseSdfTexture sdfMesh1,
+                              float3 aToBp, float4 aToBq, inout uint startIndex,
+                              uint64_t echoOut, uint64_t touchedOut)
+{
+    if (tid == 0u)
+        gSdfOffset = startIndex;
+
+    uint sharedIndicesCount = 0u;
+
+    // U1: `i < nbTets` ALONE -- no count guard.
+    for (uint i = startIndex; i < nbTets; )
+    {
+        const uint ind = i + tid;
+        i += SDFF_BLOCK_DIM;
+
+        const uint safeInd = ind < nbTets ? ind : 0u;
+        float radiusOverScale;
+        float3 centroidVtx;
+        const float distInSDFSpace1 =
+            sdfTetCullDistance(tetInd, tetVerts, safeInd, aToBp, aToBq,
+                               scale1, scale1Rot, sdfMesh1, radiusOverScale, centroidVtx);
+
+        const bool addToBuffer = (ind < nbTets) &&
+                                 (distInSDFSpace1 < (radiusOverScale + tolerance));
+
+        if (echoOut != 0UL && ind < nbTets)
+            Ptr<float4>(echoOut)[ind] = float4(centroidVtx, distInSDFSpace1);
+        // U1 is observable ONLY as work: which tets were sampled at all.  Without
+        // this the missing count guard is invisible, because the gathered set, the
+        // resume point and the round structure are all identical with or without it.
+        if (touchedOut != 0UL && ind < nbTets)
+            Ptr<uint>(touchedOut)[ind] = 1u;
+
+        GroupMemoryBarrierWithGroupSync();
+        sharedIndicesCount = sdfAddIndexToBuffer(tid, addToBuffer, ind, sharedIndicesCount);
+    }
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (startIndex != gSdfOffset)
+        startIndex = gSdfOffset;
+    else
+        startIndex = nbTets;
+
+    return sharedIndicesCount;
+}
+
+uint sdfFindInterestingTets(uint tid, uint nbTets, uint64_t tetInd, uint64_t tetVerts,
+                            float3 scale1, float4 scale1Rot,
+                            float tolerance, SparseSdfTexture sdfMesh1,
+                            float3 aToBp, float4 aToBq, inout uint startIndex)
+{
+    return sdfFindInterestingTetsEx(tid, nbTets, tetInd, tetVerts, scale1, scale1Rot,
+                                    tolerance, sdfMesh1, aToBp, aToBq, startIndex, 0UL, 0UL);
+}
+
 #endif // PXG_SLANG_SDF_FIND

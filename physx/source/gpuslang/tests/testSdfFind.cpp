@@ -114,7 +114,7 @@ struct P_Find
     float scale[3];  uint32_t numVertices;                                   // 96
     uint32_t maxRounds, pad0, pad1, pad2;                                    // 112
     uint64_t meshInd;                                                        // 128  P9.34b
-    uint64_t pad136;                                                         // 136
+    uint64_t touchedOut;                                                     // 136  P9.35b
     float scale0Rot[4];                                                      // 144
     float scale0[3]; uint32_t pad172;                                        // 160 -> 176
 };
@@ -857,6 +857,394 @@ PXG_TEST(sdfFindTriangles)
     std::printf("    [ note ] %u triangles, %u qualifying at tolerance %g, %u rounds, %u "
                 "gathered; centroids bit-exact against the host transform chain, subdivision "
                 "level 0 throughout\n", NUM_TRIS, nWant, TOL, R.numRounds, gathered);
+
+    for (auto h : owned) dev->destroyBuffer(h);
+    physx::gpuslang::pxgSetVulkanDriverShim(nullptr);
+}
+
+// ===========================================================================
+// P9.35b -- findInterestingTets, the third member of the family.
+//
+// It is the VERTEX form's buffer (plain uints, not the triangle form's uint2)
+// carrying the TRIANGLE form's cull test (a bounding sphere, not a point), and
+// three things are its own:
+//
+//   U1  NO COUNT GUARD.  `i < nbTets` alone, where the triangle form carries
+//       `&& sharedIndicesCount < TargetCount`.  P9.34b proved the guard is
+//       output-neutral -- once the buffer saturates every later write offset is
+//       past it and the resume handshake cannot fire again -- so its ABSENCE is
+//       output-neutral too, and the only observable is which tets were sampled.
+//       That test is the exact INVERSE of the triangle fixture's: there, some
+//       triangles must go untouched in a buffer-filling round; here, NONE may.
+//   U2  no vertex2Shape on the softbody side at all -- not a unit scale, no call.
+//   U3  the radius divides by min(scale) with NO absolute value, while the KERNEL
+//       that calls this divides its contact distance by scale.abs().minElement().
+// ===========================================================================
+PXG_TEST(sdfFindTets)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    if (!dev->supportsBindlessTextures())
+    {
+        std::printf("  NOTE: backend has no descriptor indexing -> skip\n");
+        return;
+    }
+
+    const PxgKernelDef manifest[] = { { "npSdfFind.spv", "sdfFindTetRounds", 0u, 0u } };
+    static auto loaderT2 = [](const char* f) { return loadShaderBlob(f); };
+    PxgCudaShim shim(dev, manifest, 1, +loaderT2);
+    physx::gpuslang::pxgSetVulkanDriverShim(&shim);
+
+    std::vector<PxgBufferHandle> owned;
+    auto keep = [&](PxgBufferHandle h) { owned.push_back(h); return h; };
+
+    SdfScene sp;
+    buildSparse(sp);
+    BlobLayout blob = layOutBlob(sp, 16u, 21u, 3u, 1u, 0u);
+    const uint64_t hCoarse = sdfUploadTex(CU_AD_FORMAT_FLOAT, sp.nbx + 1, sp.nby + 1, sp.nbz + 1,
+                                          sp.coarse.data(), sizeof(float));
+    const uint64_t hSub = sdfUploadTex(CU_AD_FORMAT_UNSIGNED_INT8, sp.blkx * (sp.sg + 1),
+                                       sp.blky * (sp.sg + 1), sp.blkz * (sp.sg + 1),
+                                       sp.sub.data(), 1);
+    PXG_CHECK_MSG(hCoarse != 0 && hSub != 0, "the SDF textures must upload");
+    if (hCoarse == 0 || hSub == 0) return;
+    std::memcpy(&blob.bytes[blob.texObjOffset], &hCoarse, 8);
+    std::memcpy(&blob.bytes[blob.texObjSparseOffset], &hSub, 8);
+    const uint64_t blobAddr = dev->getBufferDeviceAddress(keep(createBufferFrom(dev, blob.bytes)));
+
+    // Nothing identity or axis-aligned.  There is only ONE scale here -- U2 says
+    // the softbody side has none -- so scale0 is not sent at all.
+    const PxQuat aToBq = PxQuat(0.41f, PxVec3(-0.48f, 0.6f, 0.64031f).getNormalized());
+    const PxVec3 aToBp(-0.33f, 0.74f, 0.52f);
+    const PxTransform aToB(aToBp, aToBq);
+    // U3 needs a NEGATIVE component to be observable at all, so the scale is a
+    // variable here and the run below happens twice.  The negative one is not the
+    // smallest in magnitude, so min(x,y,z) and min(|x|,|y|,|z|) differ in BOTH
+    // value and sign -- the same device P9.34c used for the kernel's own cullScale,
+    // pointed at the opposite spelling.
+    PxVec3 scale1(1.35f, 0.72f, 2.10f);
+    const PxQuat scale1Rot = PxQuat(-0.58f, PxVec3(-0.6f, 0.48f, 0.64031f).getNormalized());
+
+    const uint32_t NUM_TETS = 4000u;
+    const uint32_t NUM_V = NUM_TETS * 4u;
+    const HostSdfBox box = hostSdfBox(sp);
+    const PxVec3 ext = box.higher - box.lower;
+    const uint32_t TAIL_FAR = 200u;
+
+    std::vector<F4> verts(NUM_V);
+    std::vector<uint32_t> inds(NUM_TETS * 4u);
+    {
+        std::mt19937 rng(0x5EC70A2u);
+        auto u01 = [&]() { return float(rng() % 1000000u) / 1000000.f; };
+        const PxTransform bToA = aToB.getInverse();
+        for (uint32_t t = 0; t < NUM_TETS; ++t)
+        {
+            // Sizes vary, because the cull test divides the bounding-sphere radius by
+            // the smallest scale component and adds it to the tolerance -- uniform
+            // tets cannot tell that term from a constant.
+            const float sz = (t % 7u == 0u) ? 0.9f * ext.x
+                                            : 0.02f * ext.x * (1.0f + float(t % 5));
+            PxVec3 c;
+            if (t < NUM_TETS - TAIL_FAR)
+                c = PxVec3(box.lower.x - 0.4f * ext.x + 1.8f * ext.x * u01(),
+                           box.lower.y - 0.4f * ext.y + 1.8f * ext.y * u01(),
+                           box.lower.z - 0.4f * ext.z + 1.8f * ext.z * u01());
+            else
+                c = PxVec3(box.lower.x - (8.0f + 3.0f * u01()) * ext.x,
+                           box.lower.y - (8.0f + 3.0f * u01()) * ext.y,
+                           box.lower.z - (8.0f + 3.0f * u01()) * ext.z);
+            const PxVec3 corner[4] = { c + PxVec3(sz, 0.0f, 0.0f),
+                                       c + PxVec3(-0.3f * sz, 0.9f * sz, 0.2f * sz),
+                                       c + PxVec3(0.1f * sz, -0.4f * sz, -0.8f * sz),
+                                       c + PxVec3(-0.2f * sz, -0.35f * sz, 0.75f * sz) };
+            for (uint32_t k = 0; k < 4u; ++k)
+            {
+                // U2: generated in SHAPE space and mapped back through the inverse of
+                // the a-to-b transform ALONE -- no scale on this side, which is what
+                // makes the forward chain the kernel's.
+                const PxVec3 world = bToA.transform(corner[k]);
+                verts[t * 4u + k] = F4{ world.x, world.y, world.z, 0.0f };
+            }
+            // The four indices are ROTATED by t, so a port that reads .y where .x
+            // belongs picks a different corner.
+            const uint32_t r = t % 4u;
+            for (uint32_t k = 0; k < 4u; ++k)
+                inds[t * 4u + k] = t * 4u + (r + k) % 4u;
+        }
+    }
+    const uint64_t vAddr = dev->getBufferDeviceAddress(keep(createBufferFrom(dev, verts)));
+    const uint64_t iAddr = dev->getBufferDeviceAddress(keep(createBufferFrom(dev, inds)));
+
+    const std::vector<F4> echoInit(NUM_TETS, F4{ -777.f, -777.f, -777.f, -777.f });
+    const std::vector<uint32_t> touchInit(NUM_TETS, 0u);
+    const std::vector<uint32_t> roundsInit(MAX_ROUNDS * 4u, 0xEEEEEEEEu);
+    const std::vector<uint32_t> bufInit(size_t(MAX_ROUNDS) * TARGET_COUNT, 0xEEEEEEEEu);
+    const std::vector<uint32_t> nrInit(1u, 0xEEEEEEEEu);
+
+    P_Find base = {};
+    base.meshPtr = blobAddr;
+    base.positions = vAddr;
+    base.meshInd = iAddr;
+    base.aToBq[0] = aToBq.x; base.aToBq[1] = aToBq.y; base.aToBq[2] = aToBq.z; base.aToBq[3] = aToBq.w;
+    base.scaleRot[0] = scale1Rot.x; base.scaleRot[1] = scale1Rot.y;
+    base.scaleRot[2] = scale1Rot.z; base.scaleRot[3] = scale1Rot.w;
+    base.aToBp[0] = aToBp.x; base.aToBp[1] = aToBp.y; base.aToBp[2] = aToBp.z;
+    base.scale[0] = scale1.x; base.scale[1] = scale1.y; base.scale[2] = scale1.z;
+    base.numVertices = NUM_TETS;
+    base.maxRounds = MAX_ROUNDS;
+
+    struct Result
+    {
+        uint32_t numRounds = 0;
+        std::vector<uint32_t> rounds, buf, touched;
+        std::vector<F4> echo;
+    };
+    auto run = [&](float tol, uint32_t maxRounds) -> Result {
+        Result out;
+        const PxgBufferHandle bE = keep(createBufferFrom(dev, echoInit));
+        const PxgBufferHandle bT = keep(createBufferFrom(dev, touchInit));
+        const PxgBufferHandle bR = keep(createBufferFrom(dev, roundsInit));
+        const PxgBufferHandle bB = keep(createBufferFrom(dev, bufInit));
+        const PxgBufferHandle bN = keep(createBufferFrom(dev, nrInit));
+        P_Find p = base;
+        p.scale[0] = scale1.x; p.scale[1] = scale1.y; p.scale[2] = scale1.z;
+        p.echoOut = dev->getBufferDeviceAddress(bE);
+        p.touchedOut = dev->getBufferDeviceAddress(bT);
+        p.roundsOut = dev->getBufferDeviceAddress(bR);
+        p.bufOut = dev->getBufferDeviceAddress(bB);
+        p.numRoundsOut = dev->getBufferDeviceAddress(bN);
+        p.tolerance = tol;
+        p.maxRounds = maxRounds;
+        Kernel k(Kernel::Bindless{}, "npSdfFind.spv", "sdfFindTetRounds", {}, sizeof(P_Find));
+        PXG_CHECK_MSG(k.isValid(), "bindless pipeline creation succeeds for sdfFindTetRounds");
+        if (!k.isValid()) return out;
+        k.dispatch(1u, {}, p);
+        dev->flush();
+        out.numRounds = downloadBuffer<uint32_t>(dev, bN, 1)[0];
+        out.rounds = downloadBuffer<uint32_t>(dev, bR, MAX_ROUNDS * 4u);
+        out.buf = downloadBuffer<uint32_t>(dev, bB, size_t(MAX_ROUNDS) * TARGET_COUNT);
+        out.echo = downloadBuffer<F4>(dev, bE, NUM_TETS);
+        out.touched = downloadBuffer<uint32_t>(dev, bT, NUM_TETS);
+        return out;
+    };
+
+    // The host's own centroid and radius, through the ENGINE's transform.  Only the
+    // SDF distance comes from the device.
+    auto hostRadiusOverScale = [&](uint32_t t, PxVec3& centroidVertexSpace) {
+        PxVec3 v[4];
+        for (uint32_t k = 0; k < 4u; ++k)
+        {
+            const F4& w = verts[inds[t * 4u + k]];
+            v[k] = aToB.transform(PxVec3(w.x, w.y, w.z));            // U2: no scale
+        }
+        const PxVec3 c = (v[0] + v[1] + v[2] + v[3]) * 0.25f;
+        centroidVertexSpace = hShape2Vertex(c, scale1, scale1Rot);
+        const float r = std::sqrt(
+            PxMax(PxMax((v[0] - c).magnitudeSquared(), (v[1] - c).magnitudeSquared()),
+                  PxMax((v[2] - c).magnitudeSquared(), (v[3] - c).magnitudeSquared())));
+        return r / PxMin(scale1.x, PxMin(scale1.y, scale1.z));       // U3: NO abs
+    };
+
+    const float TOL = 0.35f;
+    const Result R = run(TOL, MAX_ROUNDS);
+    if (R.numRounds == 0u || R.numRounds == 0xFFFFFFFFu)
+    { PXG_CHECK_MSG(false, "the tet gather produced no rounds (%u)", R.numRounds);
+      for (auto h : owned) dev->destroyBuffer(h);
+      physx::gpuslang::pxgSetVulkanDriverShim(nullptr); return; }
+
+    size_t badCentroid = 0, badSet = 0;
+    std::vector<uint8_t> want(NUM_TETS, 0u);
+    for (uint32_t t = 0; t < NUM_TETS; ++t)
+    {
+        PxVec3 cv;
+        const float r = hostRadiusOverScale(t, cv);
+        const F4& e = R.echo[t];
+        if (!bitEq(e.x, cv.x) || !bitEq(e.y, cv.y) || !bitEq(e.z, cv.z))
+        {
+            if (badCentroid < 4)
+                std::printf("    tet %u centroid (%.9g %.9g %.9g) want (%.9g %.9g %.9g)\n",
+                            t, e.x, e.y, e.z, cv.x, cv.y, cv.z);
+            ++badCentroid;
+        }
+        want[t] = (e.w < (r + TOL)) ? 1u : 0u;
+    }
+    PXG_CHECK_MSG(badCentroid == 0, "%zu centroids differ from the host's own chain (aToB alone, "
+                  "then shape2Vertex by the MESH scale)", badCentroid);
+
+    uint32_t cursor = 0u, gathered = 0u;
+    for (uint32_t rr = 0; rr < R.numRounds; ++rr)
+    {
+        const uint32_t count = R.rounds[rr * 4u + 0];
+        const uint32_t before = R.rounds[rr * 4u + 1];
+        PXG_CHECK_MSG(R.rounds[rr * 4u + 3] == 0xC0FFEEu, "round %u wrote no canary", rr);
+        if (rr == 0u) cursor = before;
+        for (uint32_t sIdx = 0; sIdx < count; ++sIdx)
+        {
+            while (cursor < NUM_TETS && !want[cursor]) ++cursor;
+            const uint32_t gotIdx = R.buf[size_t(rr) * TARGET_COUNT + sIdx];
+            if (gotIdx != cursor)
+            { if (badSet < 4)
+                  std::printf("    round %u slot %u: index %u, expected %u\n",
+                              rr, sIdx, gotIdx, cursor);
+              ++badSet; }
+            ++cursor; ++gathered;
+        }
+    }
+    PXG_CHECK_MSG(badSet == 0, "%zu gathered indices are not the qualifying tets in order", badSet);
+    PXG_CHECK_MSG(R.numRounds > 1u,
+                  "the gather must need more than one round, or the resume protocol is unchecked "
+                  "(got %u)", R.numRounds);
+    uint32_t nWant = 0u;
+    for (uint32_t t = 0; t < NUM_TETS; ++t) nWant += want[t];
+    PXG_CHECK_MSG(nWant > TARGET_COUNT && nWant < NUM_TETS - 200u,
+                  "the tolerance must leave the cull predicate DECIDING something: %u of %u tets "
+                  "qualify, and the run needs more than one buffer's worth but not all of them, "
+                  "or the bounding-sphere term is invisible", nWant, NUM_TETS);
+    PXG_CHECK_MSG(R.rounds[0] == TARGET_COUNT,
+                  "round 0 must fill the buffer (%u)", R.rounds[0]);
+
+    // ---- U1: the MISSING count guard, and the assertion is INVERTED ------------
+    // The triangle fixture requires that a buffer-filling round leave some triangles
+    // untouched, because its loop stops when the buffer is full.  This loop does not,
+    // so the same configuration must touch EVERY tet.  Same probe, opposite verdict:
+    // that is what makes the two functions' asymmetry a checked fact rather than a
+    // remark in a header.
+    {
+        const Result R1 = run(1.0e30f, 1u);
+        const uint32_t count = R1.rounds[0];
+        PXG_CHECK_MSG(count == TARGET_COUNT,
+                      "the single-round configuration must fill the buffer exactly (%u)", count);
+        size_t untouched = 0;
+        for (uint32_t t = 0; t < NUM_TETS; ++t)
+            if (R1.touched[t] == 0u) ++untouched;
+        PXG_CHECK_MSG(untouched == 0,
+                      "%zu of %u tets went unsampled in a round that filled the buffer after %u; "
+                      "findInterestingTets has NO `sharedIndicesCount < TargetCount` guard, so it "
+                      "must scan to the end of the mesh -- this is the exact inverse of the "
+                      "triangle gather's contract", untouched, NUM_TETS, count);
+        std::printf("    [ note ] no count guard: all %u tets sampled in the buffer-filling "
+                    "round (the triangle form leaves 2976 of 4000 untouched)\n", NUM_TETS);
+    }
+
+    // ---- the gate's strictness, manufactured exactly as P9.34b did -------------
+    {
+        uint32_t chosen = 0xFFFFFFFFu;
+        float chosenTol = 0.0f;
+        for (uint32_t t = 0; t < NUM_TETS && chosen == 0xFFFFFFFFu; ++t)
+        {
+            PxVec3 cv;
+            const float r = hostRadiusOverScale(t, cv);
+            const float d = R.echo[t].w;
+            if (!(d > 0.0f) || !std::isfinite(d) || !std::isfinite(r)) continue;
+            const float baseT = d - r;
+            for (int k = -3; k <= 3 && chosen == 0xFFFFFFFFu; ++k)
+            {
+                const float cand = (k == 0) ? baseT
+                                            : u2f(uint32_t(int32_t(f2u(baseT)) + k));
+                if (!(cand > 0.0f) || !std::isfinite(cand)) continue;
+                if (f2u(r + cand) == f2u(d)) { chosen = t; chosenTol = cand; }
+            }
+        }
+        PXG_CHECK_MSG(chosen != 0xFFFFFFFFu,
+                      "no tolerance puts any tet exactly on the gate's boundary, so `<` and `<=` "
+                      "are indistinguishable and the strictness is unchecked");
+        if (chosen != 0xFFFFFFFFu)
+        {
+            const Result RB = run(chosenTol, MAX_ROUNDS);
+            uint32_t seen = 0u, total = 0u;
+            for (uint32_t rr = 0; rr < RB.numRounds; ++rr)
+            {
+                const uint32_t cnt = RB.rounds[rr * 4u + 0];
+                total += cnt;
+                for (uint32_t sIdx = 0; sIdx < cnt; ++sIdx)
+                    if (RB.buf[size_t(rr) * TARGET_COUNT + sIdx] == chosen) ++seen;
+            }
+            PxVec3 cvv;
+            const float rr0 = hostRadiusOverScale(chosen, cvv);
+            PXG_CHECK_MSG(f2u(rr0 + chosenTol) == f2u(RB.echo[chosen].w),
+                          "the manufactured boundary did not hold at the chosen tolerance");
+            PXG_CHECK_MSG(seen == 0u,
+                          "tet %u sits EXACTLY on the gate and was gathered anyway; the "
+                          "comparison is strict", chosen);
+            std::printf("    [ note ] gate strictness: tet %u placed exactly on the boundary at "
+                        "tolerance %.9g and correctly excluded (%u gathered)\n",
+                        chosen, chosenTol, total);
+        }
+    }
+
+    // ---- U3: the radius divide takes NO absolute value ------------------------
+    // With an all-positive scale `min(x,y,z)` and `min(|x|,|y|,|z|)` are the same
+    // expression, so the first sweep left that mutant alive -- the rig could not
+    // tell the two apart.  A NEGATIVE component that is not the smallest in
+    // MAGNITUDE separates them in both value and sign, and the whole comparison
+    // above is repeated against it: the host formula has no abs either, so if the
+    // shader grew one the centroids would still match but the qualifying SET would
+    // not.
+    //
+    // And this is the trap's other half, worth stating where it is checked: the
+    // KERNEL that calls this function divides its own contact distance by
+    // `scale.abs().minElement()` -- WITH the absolute value.  Two spellings of one
+    // idea, forty lines apart, inside a single call chain.
+    {
+        scale1 = PxVec3(1.17f, -2.90f, 0.86f);
+        const float minSigned = PxMin(scale1.x, PxMin(scale1.y, scale1.z));
+        const float minAbs = PxMin(PxAbs(scale1.x), PxMin(PxAbs(scale1.y), PxAbs(scale1.z)));
+        PXG_CHECK_MSG(minSigned < 0.0f && minAbs > 0.0f && f2u(minSigned) != f2u(-minAbs),
+                      "the negative-scale run must make min(x,y,z) = %.9g and min of the "
+                      "magnitudes = %.9g differ in sign AND in value", minSigned, minAbs);
+
+        const float TOLN = 0.9f;
+        const Result RN = run(TOLN, MAX_ROUNDS);
+        PXG_CHECK_MSG(RN.numRounds > 0u && RN.numRounds != 0xFFFFFFFFu,
+                      "the negative-scale gather produced no rounds (%u)", RN.numRounds);
+
+        size_t badCN = 0, badSetN = 0;
+        std::vector<uint8_t> wantN(NUM_TETS, 0u);
+        uint32_t nWantN = 0u, nWantAbs = 0u;
+        for (uint32_t t = 0; t < NUM_TETS; ++t)
+        {
+            PxVec3 cv;
+            const float r = hostRadiusOverScale(t, cv);       // no abs, like the shader
+            const F4& e = RN.echo[t];
+            if (!bitEq(e.x, cv.x) || !bitEq(e.y, cv.y) || !bitEq(e.z, cv.z)) ++badCN;
+            wantN[t] = (e.w < (r + TOLN)) ? 1u : 0u;
+            nWantN += wantN[t];
+            // What an abs()-taking port would have gathered, so the run can insist
+            // the two sets genuinely differ rather than assuming they do.
+            const float rAbs = (r * minSigned) / minAbs;
+            if (e.w < (rAbs + TOLN)) ++nWantAbs;
+        }
+        PXG_CHECK_MSG(badCN == 0, "%zu centroids differ under the negative scale", badCN);
+
+        uint32_t curN = 0u, gotN = 0u;
+        for (uint32_t rr = 0; rr < RN.numRounds; ++rr)
+        {
+            const uint32_t count = RN.rounds[rr * 4u + 0];
+            const uint32_t before = RN.rounds[rr * 4u + 1];
+            if (rr == 0u) curN = before;
+            for (uint32_t sIdx = 0; sIdx < count; ++sIdx)
+            {
+                while (curN < NUM_TETS && !wantN[curN]) ++curN;
+                if (RN.buf[size_t(rr) * TARGET_COUNT + sIdx] != curN) ++badSetN;
+                ++curN; ++gotN;
+            }
+        }
+        PXG_CHECK_MSG(badSetN == 0,
+                      "%zu gathered indices under the negative scale are not the qualifying tets "
+                      "in order -- the radius divide must NOT take an absolute value", badSetN);
+        PXG_CHECK_MSG(nWantN > 0u,
+                      "the negative-scale run gathered nothing, so it discriminates nothing");
+        const uint32_t diff = (nWantN > nWantAbs) ? (nWantN - nWantAbs) : (nWantAbs - nWantN);
+        PXG_CHECK_MSG(diff > 100u,
+                      "an abs()-taking port would gather %u tets against the engine's %u -- too "
+                      "close for the missing absolute value to be observable", nWantAbs, nWantN);
+        std::printf("    [ note ] no abs on the radius divide: min(x,y,z) %.9g against min of the "
+                    "magnitudes %.9g; %u tets qualify, %u would under an abs() spelling\n",
+                    minSigned, minAbs, nWantN, nWantAbs);
+    }
+
+    std::printf("    [ note ] %u tets, %u qualifying at tolerance %g, %u rounds, %u gathered; "
+                "centroids bit-exact against the host chain\n",
+                NUM_TETS, nWant, TOL, R.numRounds, gathered);
 
     for (auto h : owned) dev->destroyBuffer(h);
     physx::gpuslang::pxgSetVulkanDriverShim(nullptr);

@@ -73,7 +73,10 @@ struct SdfFindParams
     uint _pad120;            // 120
     uint _pad124;            // 124
     uint64_t meshInd;        // 128  uint4 per triangle
-    uint64_t _pad136;        // 136
+    // P9.35b: the TET gather has no count guard, and the only trace of that is
+    // WHICH tets were sampled at all.  This slot was padding; it is now that
+    // echo, so the layout above is unchanged.
+    uint64_t touchedOut;     // 136  one uint per tet, 1 = sampled
     float4 scale0Rot;        // 144
     float3 scale0;           // 160
     uint _pad172;            // 172 -> 176
@@ -192,6 +195,67 @@ void sdfFindTriangleRounds(uint3 gtid : SV_GroupThreadID)
 
         ++round;
         GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (tid == 0u)
+        Ptr<uint>(gP.numRoundsOut)[0] = round;
+}
+
+// ---------------------------------------------------------------------------
+// The TET gather (P9.35b), driven exactly like the vertex and triangle ones so
+// all three can be compared round for round.  `bufOut` holds plain uints here,
+// like the vertex form -- the tet buffer is uint, not uint2.
+//
+// The extra output is `touchedOut`, and it is the whole reason this entry is not
+// a copy of sdfFindRounds: findInterestingTets has NO count guard, so once the
+// buffer saturates it keeps scanning and throwing the results away.  The
+// gathered set, the resume point and the round structure are all IDENTICAL with
+// or without the guard -- P9.34b proved that for the triangle form -- so the
+// only observable is which tets were sampled, and that is what this echoes.
+// ---------------------------------------------------------------------------
+[shader("compute")]
+[numthreads(1024, 1, 1)]
+void sdfFindTetRounds(uint3 gtid : SV_GroupThreadID)
+{
+    const uint tid = gtid.x;
+
+    PxgSdfMesh m;
+    const bool hasSdf = sdfReadMesh(gP.meshPtr, m);
+    const SparseSdfTexture t = sdfTexInitialize(m);
+
+    if (!hasSdf)
+    {
+        if (tid == 0u)
+            Ptr<uint>(gP.numRoundsOut)[0] = 0xFFFFFFFFu;
+        return;
+    }
+
+    uint startIndex = 0u;
+    uint round = 0u;
+
+    while (startIndex < gP.numVertices && round < gP.maxRounds)
+    {
+        const uint before = startIndex;
+        const uint count = sdfFindInterestingTetsEx(tid, gP.numVertices, gP.meshInd,
+                                                    gP.positions, gP.scale, gP.scaleRot,
+                                                    gP.tolerance, t, gP.aToBp, gP.aToBq,
+                                                    startIndex, gP.echoOut, gP.touchedOut);
+
+        if (tid == 0u)
+        {
+            Ptr<uint> r = Ptr<uint>(gP.roundsOut) + round * 4u;
+            r[0] = count;
+            r[1] = before;
+            r[2] = startIndex;
+            r[3] = 0xC0FFEEu;
+        }
+
+        if (tid < count)
+            Ptr<uint>(gP.bufOut)[round * SDFF_TARGET_COUNT + tid] = gSdfIndices[tid];
+
+        // Before the next round overwrites gSdfIndices.
+        GroupMemoryBarrierWithGroupSync();
+        ++round;
     }
 
     if (tid == 0u)
