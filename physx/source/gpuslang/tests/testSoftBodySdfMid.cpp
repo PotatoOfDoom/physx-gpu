@@ -272,6 +272,7 @@ struct Options
     uint32_t capacity = Scene::CAP;
     uint32_t seedCount = 0u;
     bool negScale = false;
+    bool exactGate = false;   // the manufactured cull-gate boundary
 };
 
 struct Rig
@@ -389,7 +390,25 @@ static bool buildRig(PxgSlangComputeDevice* dev, Scene& S, const Options& opt, R
     remap[Scene::TRI_CACHE] = R.rigidId.getInd();
     R.bRemap = R.mk(dev, remap);
 
+    // The filter array carries FOUR distinct rigid ids, not just the one this
+    // kernel queries with, and that is what makes the comparison itself testable.
+    //
+    // With a single id, index0 is constant across the array, so the search reduces
+    // to index1 alone -- and index1's high word is always zero, because it is a
+    // PxU32 element handle widened to PxU64.  Under those conditions comparing
+    // index1 BEFORE index0, or comparing the two 32-bit halves low-word-first,
+    // both give the same order and the same answer.  The first sweep left exactly
+    // those two mutants alive.
+    //
+    // The decoys are chosen so neither shortcut survives: they share low words
+    // across different high words (0x51 appears with link 0 and with link 3) and
+    // share high words across different low words, so the ENGINE's ordering --
+    // index0 first, as an unsigned 64-bit value, high word significant -- is the
+    // only one under which the array is sorted and the binary search lands.
     R.pairs.clear();
+    const PxNodeIndex decoys[3] = { PxNodeIndex(0x51u, 0u),      // same low word, link 0
+                                    PxNodeIndex(0x99u, 1u),
+                                    PxNodeIndex(0x10u, 7u) };    // sorts LAST only high-word-first
     for (uint32_t t : S.filteredTets)
     {
         PxgRigidFilterPair p;
@@ -398,6 +417,15 @@ static bool buildRig(PxgSlangComputeDevice* dev, Scene& S, const Options& opt, R
         p.index2 = 0u;
         R.pairs.push_back(p);
     }
+    for (uint32_t d = 0; d < 3u; ++d)
+        for (uint32_t t = 1u; t < Scene::NB_TETS; t += 17u)
+        {
+            PxgRigidFilterPair p;
+            p.index0 = decoys[d].getInd();
+            p.index1 = encodeSb(Scene::SB_ID, t);
+            p.index2 = 0u;
+            R.pairs.push_back(p);
+        }
     std::sort(R.pairs.begin(), R.pairs.end(),
               [](const PxgRigidFilterPair& a, const PxgRigidFilterPair& b) {
                   if (a.index0 != b.index0) return a.index0 < b.index0;
@@ -565,6 +593,7 @@ struct Expect
 {
     std::vector<Contact> contacts;
     uint32_t gathered = 0, culled = 0, gated = 0, filtered = 0, zeroDir = 0;
+    uint32_t exactGate = 0, exactGateWouldWrite = 0;
     size_t rounds = 0;
 };
 
@@ -600,6 +629,21 @@ static Expect predictPair(const Scene& S, const Rig& R,
             const size_t at = size_t(std::lower_bound(tets.begin(), tets.end(), t) - tets.begin());
 
             float sep = desc[at].sep;
+
+            // The one point where `<` and `<=` on the cull gate can part company,
+            // counted twice: sitting on the gate, and would an `<=` spelling carry
+            // the tet all the way to a written contact.
+            if (f2u(sep) == f2u(cull))
+            {
+                ++E.exactGate;
+                PxVec3 d2 = hShape2Vertex(PxVec3(desc[at].dir.x, desc[at].dir.y, desc[at].dir.z),
+                                          S.scale, S.scaleRot);
+                float m2 = d2.dot(d2);
+                float s2 = sep;
+                if (m2 > 0.0f) { m2 = 1.0f / std::sqrt(m2); s2 = s2 * m2; }
+                if (s2 < wcd) ++E.exactGateWouldWrite;
+            }
+
             if (!(sep < cull)) { ++E.culled; continue; }
 
             PxVec3 dir = hShape2Vertex(PxVec3(desc[at].dir.x, desc[at].dir.y, desc[at].dir.z),
@@ -638,11 +682,9 @@ static Expect predictPair(const Scene& S, const Rig& R,
 }
 
 // ---------------------------------------------------------------------------
-static void runOne(PxgSlangComputeDevice* dev, const char* label, const Options& opt)
+static void runOneScene(PxgSlangComputeDevice* dev, const char* label, const Options& opt,
+                        Scene& S)
 {
-    Scene S;
-    buildScene(S, opt.negScale);
-
     Rig R;
     if (!buildRig(dev, S, opt, R))
     {
@@ -703,7 +745,32 @@ static void runOne(PxgSlangComputeDevice* dev, const char* label, const Options&
                   "be > 0, or the two gates are one)", label, exp[0].culled, exp[0].gated);
     PXG_CHECK_MSG(exp[0].filtered > 0u,
                   "%s: the filter removed nothing, so T5 is unobservable", label);
-    if (!opt.negScale)
+    if (opt.exactGate)
+    {
+        // THE PROOF, MADE EXECUTABLE -- and here it is STRONGER than the cloth
+        // sibling's, because this kernel takes the absolute value.
+        //
+        // At the boundary  sep == cullScale == worldContactDist / min(|scale|).
+        // `dir` comes back NORMALISED, so |dir| == 1; shape2Vertex divides each
+        // rotated component by its scale and a rotation preserves length, so
+        // |shape2Vertex(dir)| <= 1 / min(|scale|) and therefore m >= min(|scale|).
+        // Then sep * m >= worldContactDist, and the SECOND gate is strict -- so an
+        // `<=` here would admit exactly the tets the next line rejects.
+        //
+        // The cloth version of this argument needed "positive scale" as a
+        // hypothesis, because its cullScale divides by the SIGNED minimum.  This
+        // one does not: the bound |t_i / scale_i| <= |t_i| / min(|scale|) holds
+        // whatever the signs are, which is T2 paying for itself.
+        PXG_CHECK_MSG(exp[0].exactGate > 0u,
+                      "%s: no tet sits exactly on the cull gate -- the search that was supposed "
+                      "to manufacture one did not survive the rebuild", label);
+        PXG_CHECK_MSG(exp[0].exactGateWouldWrite == 0u,
+                      "%s: %u of %u tets on the cull gate would reach a write under an `<=` "
+                      "spelling -- the min(|scale|) argument is WRONG and the two gates are "
+                      "observably different; this needs a mutant, not a proof",
+                      label, exp[0].exactGateWouldWrite, exp[0].exactGate);
+    }
+    else if (!opt.negScale)
     {
         PXG_CHECK_MSG(exp[0].rounds >= 2,
                       "%s: the gather took %zu round(s) -- the resume path is untested",
@@ -809,11 +876,20 @@ static void runOne(PxgSlangComputeDevice* dev, const char* label, const Options&
         if (idxByX[at] != POISON_U32 || byX[at] != ~0ull || !bitEq(point[at].x, -7.f)) ++spill;
     PXG_CHECK_MSG(spill == 0, "%s: %zu slots beyond the reservation were written", label, spill);
 
-    std::printf("    [ note ] %s: %zu round(s), %u gathered, %u culled, %u gated, %u filtered, "
-                "%u zero-dir -> %zu contacts; total %u (cap %u)\n",
-                label, exp[0].rounds, exp[0].gathered, exp[0].culled, exp[0].gated,
-                exp[0].filtered, exp[0].zeroDir, exp[0].contacts.size(), total, opt.capacity);
+    std::printf("    [ note ] %s: %zu round(s), %u gathered, %u culled (%u exactly on the gate, "
+                "%u of those writable), %u gated, %u filtered, %u zero-dir -> %zu contacts; "
+                "total %u (cap %u)\n",
+                label, exp[0].rounds, exp[0].gathered, exp[0].culled, exp[0].exactGate,
+                exp[0].exactGateWouldWrite, exp[0].gated, exp[0].filtered, exp[0].zeroDir,
+                exp[0].contacts.size(), total, opt.capacity);
     R.destroy(dev);
+}
+
+static void runOne(PxgSlangComputeDevice* dev, const char* label, const Options& opt)
+{
+    Scene S;
+    buildScene(S, opt.negScale);
+    runOneScene(dev, label, opt, S);
 }
 
 static bool beginShim(PxgSlangComputeDevice* dev, PxgCudaShim*& shim)
@@ -851,6 +927,141 @@ PXG_TEST(softBodySdfMidphase)
     // TWO contact managers: cmIdx reaches restDistances, and nothing else differs
     // between them, so point.w is the whole discriminator.
     { Options o; o.numPairs = 2u;   runOne(dev, "two-pairs", o); }
+
+    endShim(shim);
+}
+
+// ---------------------------------------------------------------------------
+// The exact-gate SEARCH, the same device P9.34c established.
+//
+// doTetrahedronSDFCollision's return is INDEPENDENT of the tolerance it is given
+// except that the tolerance decides whether the value is returned at all -- its
+// last line is PxSdfSampleWithGrad, and nothing inside the iteration reads the
+// tolerance.  So a tet's separation is a constant V, and the job is to find a
+// softbody contact distance whose derived cullScale IS that constant, bit for
+// bit.  cullScale = fl(fl(cdTri + c) / min(|scale|)) is monotone in c, so the
+// answer is within an ULP or two of V * min(|scale|) - cdTri.
+//
+// The equality is CONFIRMED by re-running the references, not assumed: moving c
+// moves the tolerance, which moves both the gathered set and which tets clear the
+// descent's own gate.
+// ---------------------------------------------------------------------------
+static bool probeSb(PxgSlangComputeDevice* dev, Scene& S, std::vector<uint32_t>& tets,
+                    std::vector<Descent>& desc)
+{
+    Options o;
+    Rig R;
+    bool ok = false;
+    if (buildRig(dev, S, o, R))
+    {
+        std::vector<std::vector<uint32_t>> rounds;
+        if (refGather(dev, S, R, rounds))
+        {
+            tets.clear();
+            for (const auto& r : rounds) tets.insert(tets.end(), r.begin(), r.end());
+            std::sort(tets.begin(), tets.end());
+            tets.erase(std::unique(tets.begin(), tets.end()), tets.end());
+            ok = !tets.empty() && refDescent(dev, S, R, tets, desc);
+        }
+    }
+    R.destroy(dev);
+    return ok;
+}
+
+static bool searchExactGate(PxgSlangComputeDevice* dev, Scene& S, float& foundC, uint32_t& foundTet)
+{
+    const float minAbs = PxMin(PxAbs(S.scale.x), PxMin(PxAbs(S.scale.y), PxAbs(S.scale.z)));
+    const HostSdfBox box = hostSdfBox(S.sdf);
+
+    std::vector<uint32_t> tets;
+    std::vector<Descent> desc;
+    if (!probeSb(dev, S, tets, desc)) return false;
+
+    // dir . diff must be strictly positive, or `dist < tolerance` fails once the
+    // tolerance is pushed down onto V and the tet drops out of the descent.
+    struct Cand { uint32_t tet; float V; float dot; };
+    std::vector<Cand> cand;
+    for (size_t i = 0; i < tets.size(); ++i)
+    {
+        const float V = desc[i].sep;
+        if (!std::isfinite(V) || V > 1e30f) continue;
+        const PxVec3 p(desc[i].point.x, desc[i].point.y, desc[i].point.z);
+        const PxVec3 cl(PxMax(box.lower.x, PxMin(box.higher.x, p.x)),
+                        PxMax(box.lower.y, PxMin(box.higher.y, p.y)),
+                        PxMax(box.lower.z, PxMin(box.higher.z, p.z)));
+        const PxVec3 d(desc[i].dir.x, desc[i].dir.y, desc[i].dir.z);
+        const float dt = d.dot(p - cl);
+        if (dt <= 0.0f) continue;
+        cand.push_back(Cand{ tets[i], V, dt });
+    }
+    std::sort(cand.begin(), cand.end(),
+              [](const Cand& a, const Cand& b) { return a.dot > b.dot; });
+
+    const float saved = S.contactDistSb;
+    uint32_t tried = 0;
+    for (const Cand& k : cand)
+    {
+        if (tried >= 8u) break;
+        const float ideal = k.V * minAbs - S.contactDistTri;
+        float hit = 0.0f;
+        bool haveHit = false;
+        for (int step = -96; step <= 96 && !haveHit; ++step)
+        {
+            uint32_t u = f2u(ideal);
+            u = uint32_t(int32_t(u) + step);
+            float c; std::memcpy(&c, &u, 4);
+            if (!(c > 0.0f)) continue;
+            if (f2u((S.contactDistTri + c) / minAbs) == f2u(k.V)) { hit = c; haveHit = true; }
+        }
+        if (!haveHit) continue;
+
+        ++tried;
+        S.contactDistSb = hit;
+        std::vector<uint32_t> t2;
+        std::vector<Descent> d2;
+        if (probeSb(dev, S, t2, d2))
+        {
+            const float cull = S.cullScale();
+            for (size_t i = 0; i < t2.size(); ++i)
+                if (t2[i] == k.tet && f2u(d2[i].sep) == f2u(cull))
+                {
+                    foundC = hit; foundTet = k.tet;
+                    return true;
+                }
+        }
+        S.contactDistSb = saved;
+    }
+    S.contactDistSb = saved;
+    return false;
+}
+
+PXG_TEST(softBodySdfMidphaseExactGate)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    if (!dev->supportsBindlessTextures())
+    {
+        std::printf("  NOTE: backend has no descriptor indexing -> skip\n");
+        return;
+    }
+    PxgCudaShim* shim = nullptr;
+    beginShim(dev, shim);
+
+    Scene S;
+    buildScene(S, false);
+    float c = 0.0f;
+    uint32_t tet = 0u;
+    if (!searchExactGate(dev, S, c, tet))
+    {
+        PXG_CHECK_MSG(false, "no contact distance puts a gathered tet's separation exactly on "
+                             "the cull gate -- the `<` / `<=` boundary is untested");
+    }
+    else
+    {
+        std::printf("    [ note ] exact-gate: tet %u, softbody contact distance %.9g -> cullScale "
+                    "%.9g, bit-identical to its separation\n", tet, c, S.cullScale());
+        Options o; o.exactGate = true;
+        runOneScene(dev, "exact-gate", o, S);
+    }
 
     endShim(shim);
 }

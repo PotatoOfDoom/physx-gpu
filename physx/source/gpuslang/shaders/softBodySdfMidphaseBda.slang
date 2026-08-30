@@ -84,6 +84,32 @@
 //  T8. THE SCAN IS BLOCK-WIDE AND EVERY THREAD CALLS IT, exactly as in the cloth
 //      sibling: globalScanExclusive<32> over all 1024 threads with one atomicAdd
 //      by thread 0, outside the candidate test.
+//
+// ---------------------------------------------------------------------------
+// TWO THINGS THE SWEEP LEFT STANDING, and both are the cloth sibling's proofs
+// again -- one of them in a STRONGER form.
+//
+//  * THE CULL GATE'S STRICTNESS IS FREE, and here the argument needs no
+//    hypothesis about the sign of the scale.  At the boundary
+//        sep == cullScale == worldContactDist / min(|scale|)
+//    and `dir` comes back NORMALISED, so |dir| == 1; shape2Vertex divides each
+//    rotated component by its scale and a rotation preserves length, so
+//        |shape2Vertex(dir)| <= 1 / min(|scale|)  and  m = 1/|...| >= min(|scale|)
+//    hence sep * m >= worldContactDist, which the STRICT second gate rejects.
+//    An `<=` on the first gate therefore admits exactly what the next line
+//    throws away.  The cloth sibling's version of this needed a positive scale,
+//    because its cullScale divides by the SIGNED minimum; T2 pays for itself
+//    here -- the bound |t_i / scale_i| <= |t_i| / min(|scale|) holds whatever
+//    the signs are.  The fixture manufactures the boundary and asserts the
+//    consequence rather than assuming it.
+//
+//  * `m > 0` against `m >= 0` is UNREACHABLE, for the same reason as in the
+//    cloth sibling.  `contactDir` keeps its incoming zero only when the descent
+//    returned PX_MAX_F32 without writing it, and then the preceding gate
+//    `sep < cullScale` has already rejected; otherwise it is getNormalized()
+//    output, which is exactly zero only for an exactly-zero input, and there
+//    PxRecipSqrt(0) is +inf so the result is NaN rather than zero -- and both
+//    guards are false for NaN.
 // ===========================================================================
 
 #define PXG_WARP_BLOCK 1024

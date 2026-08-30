@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **827/827** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **832/832** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.33a added `gpuslang.npFloatIntrinRecipSqrt`, which is not a kernel port but a
 PLATFORM measurement: about forty shaders here spell `PxVec3::getNormalized` as
 `v * rsqrt(m)`, while the engine computes `PxRecipSqrt` = `1.0f/sqrtf` — two exactly
@@ -1736,6 +1736,163 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.35 — der SDF-Softbody-Zwischenlauf, und was passiert, wenn man zwei Geschwister nebeneinanderlegt
+
+Manifest **377 → 378**. `sb_sdfMeshMidphaseGeneratePairsLaunch`
+(softbodySoftbodyMidPhase.cu:1121) ist das direkte Geschwister von P9.34c, und
+der Wert dieser Tranche liegt weniger im Kernel als darin, dass die beiden jetzt
+**nebeneinander lesbar** sind. Drei Schritte, dieselbe Struktur wie P9.34: erst
+die zwei Bausteine, einzeln gefegt, dann der Kernel.
+
+### P9.35a — ein zweites echtes Orakel
+
+`Gu::closestPtPointTetrahedron` (Fünf-Argument-Form,
+GuDistancePointTetrahedron.h:77) ist `PX_CUDA_CALLABLE` und texturfrei, also ruft
+der Prüfstand **die Engine selbst**: **3018 Eingaben bitgleich**.
+
+Und es ist **nicht** das `closestPtTetrahedron`, das schon im Modul stand — das
+zu verwechseln ist der Fehlermodus, gegen den der Kopf ausführlich schreibt. Jenes
+ist hinweis-gesteuert, gibt eine Normale zurück, nimmt `sqDist` als `inout` und
+benutzt die Flächen (a,b,c)(a,b,d)(a,c,d)(b,c,d). Dieses ist ungesteuert, gibt nur
+den Punkt, **saatet aus Fläche 0**, misst den Abstand zu `p` statt zum Ursprung,
+und seine Flächen sind (a,b,c)(a,c,d)(a,d,b)(b,d,c). **Nur die erste stimmt
+überein.** Da `closestPtPointTriangle2` seine zwei Kantenvektoren als eigene
+Argumente nimmt, ist eine falsche Umlaufrichtung kein Vorzeichen, das sich
+weghebt.
+
+Dazu `doTetrahedronSDFCollision`, das Vier-Ecken-Geschwister des Dreiecks-
+Abstiegs, mit sechs benannten Unterschieden — vor allem: die Projektion ist hier
+**bedingt**, wo die andere jede Iteration klemmt, und die vierte Baryzentrische
+wird als `1-x-y-z` **zurückgerechnet** statt geklemmt.
+
+### P9.35b — dieselbe Sonde, umgekehrtes Urteil
+
+`findInterestingTets` hat **keine Zählschranke** — `i < nbTets` allein, wo die
+Dreiecksform `&& sharedIndicesCount < TargetCount` trägt. Vierzig Zeilen
+auseinander im selben Header, und upstreams Asymmetrie, kein Versehen.
+
+P9.34b hatte bewiesen, dass die Schranke **ergebnisneutral** ist (sobald der
+Puffer gesättigt ist, liegt jeder spätere Schreib-Offset dahinter und der
+Wiederaufnahme-Handschlag kann nicht mehr feuern) — also ist ihr **Fehlen** hier
+genauso ergebnisneutral, und das einzig Beobachtbare ist, **welche Tets überhaupt
+abgetastet wurden**.
+
+> Damit ist die Prüfung dieselbe Sonde wie in der Dreiecks-Vorrichtung, mit
+> **umgekehrtem Urteil**: dort müssen in einer puffer-füllenden Runde Dreiecke
+> unberührt bleiben (2976 von 4000), hier müssen **alle 4000** berührt werden.
+> Gleiche Konfiguration, gegenteiliger Vertrag — das macht aus der Asymmetrie
+> eine geprüfte Tatsache statt einer Randnotiz.
+
+### P9.35c — der Kernel, und eine Falle, die ihr eigenes Geschwister widerlegt
+
+`cullScale` teilt hier durch das **Minimum der Beträge**. Das Tuch-Geschwister
+(P9.34c, S3) teilt aus derselben Ausdrucksform durch das **vorzeichenbehaftete**
+Minimum. Und innerhalb **einer** Aufrufkette widerspricht es dem Sammler, den es
+selbst ruft: `findInterestingTets` teilt seinen Hüllkugelradius ohne Betrag.
+**Zwei Schreibweisen, vierzig Zeilen auseinander, beide lebendig.** Ein einziger
+Lauf mit `scale.y = -2,9` entscheidet alle drei: **603 Tets** gesammelt gegen
+**169** unter der vorzeichenbehafteten Schreibweise.
+
+Dazu: die a-nach-b-Transformation ist der **blanke** Inverse der Netz-Pose — der
+Transform-Cache des Softbodys wird **nie gelesen**, weil dessen Vertizes schon in
+Weltkoordinaten liegen. Die Vorrichtung vergiftet diesen Platz deshalb. Der
+Filter läuft **zuletzt**, fragt **einen** Index (den Tet), und steht **innerhalb**
+des Kandidatentests. Und der Schreiber ist `writeContactNoBarycentric`: kein
+Baryzentrum, **kein Materialindex** — das vierte Info-Wort bleibt unberührt, wo
+das Tuch-Geschwister es beschreibt.
+
+### Statt einer zehnten Kopie: ein Modul
+
+P9.34c hatte `find` über `PxgRigidFilterPair` zum **neunten** Mal geschrieben und
+das ausdrücklich vermerkt. Diese Tranche schreibt es **nicht zum zehnten Mal**,
+sondern legt `pxgSlangDefFilter` an und importiert es. Das ist bewusst **kein**
+Refactoring der anderen neun — acht lebende Aufrufstellen umzuhängen ist eine
+eigene Änderung mit eigenem Fegedurchgang, zumal einige davon
+`PxParticleRigidFilterPair` durchsuchen, einen **anderen** 16-Byte-Satz. Das
+Modul ist das **Ziel** dieser Arbeit, nicht die Arbeit.
+
+### Fegen: 37+15+39 von 39+17+41, und eine Lektion, die sich wiederholt hat
+
+**P9.35a: 37 von 39.** Der erste Durchgang ließ sechs; **vier davon waren
+Stellen, an denen die Vorrichtung nichts behauptet hat**, und alle vier sind
+geschlossen:
+
+* `gradUsed` kam **vom Shader** und wurde selbstkonsistent nachgespielt — genau
+  P9.34a's Lektion, noch einmal. Die Spur trägt jetzt den **rohen** Gradienten,
+  und geprüft wird die **Beziehung**: bei NaN-Betrag feuert keiner der beiden
+  `if`s und der Rohwert muss unberührt bleiben.
+* `point` wurde nie verglichen.
+* Das **Vorzeichen von eps** ließ sich **konstruieren**: ein Tetraeder mit drei
+  zusammenfallenden Ecken macht `dfdu` exakt null, `x` bleibt exakt 1,0, und eine
+  zum **gemessenen** Gradienten senkrechte Richtung lässt die anderen drei nur um
+  eine Rundung wandern. **222** solcher Iterationen, vorher null.
+* Die Kaskaden-Straddle wurde **gesucht** (P9.34b's Verfahren, auf vier Ecken):
+  drei gefunden, Arm 1 von 1 auf 4 Treffer.
+
+**P9.35b: 15 von 17.** Ein echter Mangel: meine Skala war durchweg positiv, also
+war `abs` ein No-Op. Ein negativer Lauf trennt die Schreibweisen um **233 Tets**.
+
+**P9.35c: 39 von 41.** Zwei Mutanten überlebten, weil die Filterliste **eine
+einzige** Starrkörper-ID enthielt — dann ist `index0` konstant, die Suche
+reduziert sich auf `index1`, dessen hohes Wort immer null ist, und sowohl eine
+vertauschte Vergleichsreihenfolge als auch ein u64-Vergleich mit niedrigem Wort
+zuerst liefern dieselbe Ordnung. Mit **vier** IDs — die ein niedriges Wort über
+verschiedene hohe Wörter teilen und umgekehrt — fallen beide.
+
+### Die Beweise, die stehen blieben
+
+* **`max`-Verschachtelung gegen Links-Fold** (zweimal): `max` ist eine
+  **Auswahl**, keine Arithmetik — assoziativ und kommutativ, und NaN kann hier
+  nicht entstehen.
+* **`sqrt(max(...))` gegen `max(sqrt(...))`**: P9.34a's Monotonie-Argument.
+* **Zwei Ecken vertauschen ist im SAMMLER äquivalent und nur dort.** Er liest die
+  vier Vertizes durch zwei symmetrische Aggregate — einen Schwerpunkt, wo
+  Float-Addition kommutativ ist, und eine `max`-Verschachtelung. Der **Abstieg**
+  ist etwas anderes: dort testet die Kaskade der Reihe nach und die Mischung
+  gewichtet einzeln, und **beide** entsprechenden Mutanten fallen. Zwei
+  Funktionen über denselben vier Punkten, eine ordnungsblind.
+* **`m > 0` gegen `m >= 0`** ist unerreichbar (dieselbe Herleitung wie beim
+  Tuch-Geschwister).
+* **Die Striktheit des Kull-Tors ist geschenkt — und hier STÄRKER als beim
+  Geschwister.** Auf der Grenze ist `sep == worldContactDist / min(|scale|)`,
+  `dir` kommt normalisiert zurück, `|shape2Vertex(dir)| ≤ 1/min(|scale|)`, also
+  `m ≥ min(|scale|)` und `sep·m ≥ worldContactDist` — das strikte **zweite** Tor
+  verwirft genau das, was ein `<=` durchgelassen hätte. Beim Tuch brauchte
+  dasselbe Argument die Voraussetzung „positive Skala", weil dort durch das
+  vorzeichenbehaftete Minimum geteilt wird; **hier zahlt sich T2 aus**. Die
+  Grenze wird trotzdem hergestellt (Tet 304, `cullScale` 1,81541085, bitgleich
+  seiner Separation) und die Folgerung geprüft.
+* **`<=` gegen `<` im Fluchttest des Abstiegs** bleibt eine **benannte Lücke**,
+  mit dem Grund dabei: die Grenzen, die P9.34b/c und diese Tranche herstellen
+  konnten, waren erreichbar, weil ein freier Host-Parameter monoton auf den
+  verglichenen Wert abbildete. Diese hat keinen solchen Griff — der verglichene
+  Wert ist `uvw - step·(grad·(v_i - p))`, `grad` ist eine reine GPU-Abtastung,
+  und die Vertizes bewegen `step` und das Skalarprodukt gemeinsam.
+
+### Ein Fehlalarm, den ich beinahe zum Befund gemacht hätte
+
+Mitten in P9.35a sah ich `femClothSim` in der Suite abstürzen und danach **1 von
+3** isoliert — und war drauf und dran, das meiner Modul-Änderung zuzuschreiben
+(SPIR-V-Layout, wozu der llvmpipe-Fehler aus P9.28a nachweislich empfindlich
+ist). Gemessen statt geschlossen: **0 von 40 auf beiden Seiten**, mit und ohne die
+Änderung. Der isolierte Lauf ist schlicht die falsche Sonde, und „1 von 3" war
+Kleinstichprobe. Danach lief die Suite in beiden Modi im **ersten** Anlauf durch.
+
+### Verifikation
+
+* Fegen **37/39**, **15/17**, **39/41**; jeder Überlebende diagnostiziert, keiner
+  entschuldigt;
+* Tetraeder-Klemmung **3018 Eingaben bitgleich gegen die Engine**, alle vier
+  Flächen gewinnen irgendwo, 266 Flächen-Gleichstände an **verschiedenen**
+  Punkten für die Vorrang-Regel;
+* Abstieg über 337 Tetraeder iterationsweise **bitgleich** nachgespielt, durch
+  die **Engine-Klemmung**;
+* Kernel **bitgleich** in fünf Konfigurationen plus zwei Skalen-Varianten;
+* Suite **832/832** in **beiden** Speichermodi, jeweils im **ersten** Anlauf;
+* Manifest geändert, also `build-sdk` neu gebaut und die Szenen gelaufen:
+  **33/33**.
+
 
 ## P9.34c — der SDF-Tuch-Kontakterzeuger selbst, und sechs Überlebende, von denen fünf ein Beweis sind
 
