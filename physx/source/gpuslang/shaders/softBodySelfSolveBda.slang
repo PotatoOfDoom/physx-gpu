@@ -218,8 +218,10 @@ float vecNormalizeInPlace(inout float3 v)
     const float m = v.x * v.x + v.y * v.y + v.z * v.z;
     if (m > 0.0f)
     {
+        // P9.36: normalize() scales through operator/= (PxVec3.h:260) -- ONE reciprocal,
+        // three multiplies.  The header two lines up already named the right function.
         const float len = sqrt(m);
-        v = v / len;
+        v = v * (1.0f / len);
         return len;
     }
     return 0.0f;

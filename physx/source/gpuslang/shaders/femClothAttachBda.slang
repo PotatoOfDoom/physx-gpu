@@ -224,7 +224,10 @@ void cloth_solveOutputAttachmentClothClothDeltaVLaunch(uint3 gtid : SV_GroupThre
 
         const float coefficient = 0.5f;                               // trap A9
         const float4 diff = a1.pos - a0.pos;
-        const float4 deltaImpulse = diff * coefficient / (invMass0 + invMass1);
+        // P9.36: FEMClothExternalSolve.cu:1554 divides a CUDA float4 by a scalar, and
+        // cutil_math.h:485 `float4 operator/(float4 a, float s)` is
+        // `float inv = 1.0f/s; return a * inv;` -- ONE reciprocal, four multiplies.
+        const float4 deltaImpulse = diff * coefficient * (1.0f / (invMass0 + invMass1));
         const float3 deltaImp = deltaImpulse.xyz;                     // PxLoad3
 
         fcaScatter(a0, deltaImp);                                     // trap A8

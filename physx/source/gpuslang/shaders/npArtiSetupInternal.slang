@@ -272,11 +272,14 @@ public void siSetupInternalConstraints(uint64_t artiBlock, uint64_t linkBase, ui
 
                     if (hasAngularDrives)
                     {
-                        // trap 3: PxVec3::normalize -- divide only when m > 0
+                        // trap 3: PxVec3::normalize -- scale only when m > 0.  P9.36:
+                        // internalConstraints2.cu:200 is `driveAxis.normalize()`, which
+                        // reaches operator/= (PxVec3.h:260) -- ONE reciprocal, three
+                        // multiplies, not three divides.
                         float angle = sqrt(driveAxis.x * driveAxis.x + driveAxis.y * driveAxis.y
                                          + driveAxis.z * driveAxis.z);
                         if (angle > 0.0f)
-                            driveAxis /= angle;
+                            driveAxis = driveAxis * (1.0f / angle);
 
                         if (angle < 1e-12f)
                         {

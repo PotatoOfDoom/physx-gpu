@@ -90,10 +90,13 @@ V3 shape2Vertex(V3 v, V3 s, const float q[4])
     return quatRotateInv(q, mk(r.x / s.x, r.y / s.y, r.z / s.z));
 }
 // PxVec3::normalize(): returns the magnitude, divides in place only when positive.
+// P9.36: PxVec3::normalize scales through operator/= (PxVec3.h:260) -- ONE reciprocal
+// then three multiplies.  convexTriangle.cuh:246 reaches it via
+// `shapeSpacePlaneNormal.normalize()`.
 float normalizeInPlace(V3& v)
 {
     const float m = std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
-    if (m > 0.0f) { v.x /= m; v.y /= m; v.z /= m; }
+    if (m > 0.0f) { const float r = 1.0f / m; v.x *= r; v.y *= r; v.z *= r; }
     return m;
 }
 
@@ -261,8 +264,11 @@ SatResult refSat(const SatCase& c)
                 const V3 triEdge = sub(c.t[vEnd], c.t[vStart]);
                 const V3 v = cross3(convexEdge, triEdge);
                 if (!(dot3(v, v) > 1e-10f)) continue;
+                // P9.36: convexTriangle.cuh:639 is `v.getNormalized()` --
+                // `v * PxRecipSqrt(magnitudeSquared())`, a multiply (PxVec3.h:286).
                 const float m = std::sqrt(dot3(v, v));
-                const V3 sv3 = mk(v.x / m, v.y / m, v.z / m);
+                const float rm = 1.0f / m;
+                const V3 sv3 = mk(v.x * rm, v.y * rm, v.z * rm);
                 float minTri = MAXF, maxTri = -MAXF, minConv = MAXF, maxConv = -MAXF;
                 for (uint32_t k = 0; k < 3; ++k)
                 { const float d = dot3(c.t[k], sv3); minTri = std::fmin(d, minTri); maxTri = std::fmax(d, maxTri); }

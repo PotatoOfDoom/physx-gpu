@@ -74,8 +74,11 @@ bool closestPtLineLine(float3 e0v0, float3 e0v1, float3 e1v0, float3 e1v1, out f
     const float r0Len = sqrt(r0Len2);
     const float r1Len = sqrt(r1Len2);
 
-    const float3 u0 = r0 / r0Len;
-    const float3 u1 = r1 / r1Len;
+    // P9.36: deformableCollision.cuh:265-266 are `const PxVec3 u0 = r0 / r0Len;` --
+    // PxVec3::operator/ (PxVec3.h:219) is ONE reciprocal and three multiplies.  The two
+    // scalar divides further down (b0, b1) are scalar/scalar and stay divides.
+    const float3 u0 = r0 * (1.0f / r0Len);
+    const float3 u1 = r1 * (1.0f / r1Len);
 
     const float cosTheta = abs(dot(u0, u1));
 

@@ -653,7 +653,13 @@ public uint4 fcClothConvexTriContactGen(FctCase cs, uint64_t hull, FcCtWriter w)
                     vertex2ShapeNormalVector(polygonf4.xyz, convexScale, convexScaleRot);
                 const float mag = length(shapeSpacePlaneNormal);
                 const float invMagnitude = 1.0f / mag;
-                shapeSpacePlaneNormal /= mag; // PxVec3::normalize
+                // P9.36: convexTriangle.cuh:246 is
+                // `const PxReal invMagnitude = 1.0f / shapeSpacePlaneNormal.normalize();`
+                // -- normalize() scales through operator/= (PxVec3.h:260), ONE reciprocal
+                // and three multiplies, and the reciprocal it needs is already on the line
+                // above.  The m > 0 guard is normalize()'s and was missing here.
+                if (mag > 0.0f)
+                    shapeSpacePlaneNormal = shapeSpacePlaneNormal * invMagnitude;
 
                 const float min0 = dot(shapeSpacePlaneNormal, minVertConv);
                 const float max0 = -planeDist * invMagnitude;

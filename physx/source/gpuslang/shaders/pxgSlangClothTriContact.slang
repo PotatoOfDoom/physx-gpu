@@ -242,7 +242,9 @@ public float3 getDeepestPointSimplified(float3 poly[8], int polyLength, float4 p
             count++;
         }
     }
-    deepestPoint /= float(count);
+    // P9.36: femClothPrimitives.cu:3591 is `deepestPoint /= count;` on a PxVec3, i.e.
+    // PxVec3::operator/= (PxVec3.h:260) -- ONE reciprocal, three multiplies.
+    deepestPoint = deepestPoint * (1.0f / float(count));
     return deepestPoint;
 }
 

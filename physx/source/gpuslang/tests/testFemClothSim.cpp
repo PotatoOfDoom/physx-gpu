@@ -4221,10 +4221,22 @@ static V3 closestPtPointTriangle(V3 p, V3 a, V3 b, V3 c, float& s, float& t)
     return add(add(a, mul(ab, v)), mul(ac, wv));
 }
 
-// closestPtLineLine (deformableCollision.cuh:244) — matches npEdgeEdge.slang:57.  The
-// vector/scalar `r0 / r0Len` is transcribed as PER-COMPONENT division (divv), matching
-// the shader's `float3 / float` (3x OpFDiv at -O0), NOT a reciprocal-multiply.
-static V3 divv(V3 a, float s) { return V3{ a.x / s, a.y / s, a.z / s }; }
+// closestPtLineLine (deformableCollision.cuh:244) — matches npEdgeEdge.slang:57.
+//
+// P9.36 CORRECTED THIS HELPER, and the old comment is worth keeping because it is the
+// clearest statement of why the defect was corpus-wide.  It read:
+//
+//     "The vector/scalar `r0 / r0Len` is transcribed as PER-COMPONENT division (divv),
+//      matching the shader's `float3 / float` (3x OpFDiv at -O0), NOT a
+//      reciprocal-multiply."
+//
+// "matching the shader" is the whole problem: the mirror was written to agree with the
+// port rather than with PhysX.  deformableCollision.cuh:265 is
+// `const PxVec3 u0 = r0 / r0Len;`, and PxVec3::operator/ (PxVec3.h:219) is
+// `f = Type(1.0)/f; return PxVec3T(x*f, y*f, z*f);` -- ONE reciprocal, three multiplies.
+// Three componentwise divides are a different function, disagreeing in at least one
+// component for 53.4595% of random vectors.  Both sides now do what the engine does.
+static V3 divv(V3 a, float s) { const float r = 1.0f / s; return V3{ a.x * r, a.y * r, a.z * r }; }
 static void closestPtLineLine(V3 e0v0, V3 e0v1, V3 e1v0, V3 e1v1, float& s, float& t, float& distSq)
 {
     const V3 r0 = sub(e0v1, e0v0), r1 = sub(e1v1, e1v0), d = sub(e1v0, e0v0);
@@ -4614,7 +4626,7 @@ using p72ref::sub;
 using p72ref::add;
 using p72ref::mul;    // mul(v, s) = { v.x*s, v.y*s, v.z*s }
 using p72ref::dot;
-using p72ref::divv;   // divv(v, s) = { v.x/s, v.y/s, v.z/s } (per-component)
+using p72ref::divv;   // P9.36: divv(v, s) = v * (1/s), as PxVec3::operator/ is
 static const float THR = 1.0e-14f;
 
 // weights-weighted displacement (cloth0 - cloth1), left-associative like the shader.
@@ -12724,14 +12736,24 @@ PXG_TEST(femClothSimClothClothAttachment)
                        p10.w * b1.x + p11.w * b1.y + p12.w * b1.z };
         if (pos1.w == 0.0f && pos0.w == 0.0f) { ++skippedByMass; continue; }   // trap A6
 
-        // The shape of the arithmetic is the observable, not just its value: the CUDA
-        // writes `diff * coefficient / (invMass0 + invMass1)`, so the scale is a
-        // multiplication FOLLOWED BY a division, not a multiplication by a reciprocal.
+        // The shape of the arithmetic is the observable, not just its value -- and P9.36
+        // corrected which shape.  This comment used to read:
+        //
+        //     "the CUDA writes `diff * coefficient / (invMass0 + invMass1)`, so the scale
+        //      is a multiplication FOLLOWED BY a division, not a multiplication by a
+        //      reciprocal."
+        //
+        // It is the reverse.  `diff` is a CUDA float4 (FEMClothExternalSolve.cu:1553) and
+        // `float4 operator/(float4 a, float s)` (cutil_math.h:485) is
+        // `float inv = 1.0f/s; return a * inv;` -- a multiplication BY A RECIPROCAL, which
+        // is precisely what the old text ruled out.  The trap was pointed the wrong way and
+        // pinned the port's mistake in place.
         const float coefficient = 0.5f;                                        // trap A9
         const float denom = pos0.w + pos1.w;
-        const float dix = (pos1.x - pos0.x) * coefficient / denom;
-        const float diy = (pos1.y - pos0.y) * coefficient / denom;
-        const float diz = (pos1.z - pos0.z) * coefficient / denom;
+        const float invDenom = 1.0f / denom;
+        const float dix = (pos1.x - pos0.x) * coefficient * invDenom;
+        const float diy = (pos1.y - pos0.y) * coefficient * invDenom;
+        const float diz = (pos1.z - pos0.z) * coefficient * invDenom;
 
         // Trap A7: NO skip.  Trap A8: cloth0 gets +, cloth1 gets -.
         auto scatter = [&](uint32_t clothId, const TriIdx4& t, const F4& b,

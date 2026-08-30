@@ -92,10 +92,14 @@ static V4 quatMul(V4 a, V4 b)
 static V4 quatConj(V4 q) { return { -q.x, -q.y, -q.z, q.w }; }
 static V3 vertex2Shape(V3 v, V3 scale, V4 rot)
 { return quatRotateInv(rot, mul(quatRotate(rot, v), scale)); }
+// P9.36: PxVec3::getNormalized (PxVec3.h:286) is `v * PxRecipSqrt(magnitudeSquared())`,
+// and PxRecipSqrt is 1.0f/sqrtf (PxMath.h:161) -- a reciprocal and three multiplies.
 static V3 normalized(V3 v)
 {
     const float m = std::sqrt(dot3(v, v));
-    return m > 0.0f ? V3{ v.x / m, v.y / m, v.z / m } : V3{ 0, 0, 0 };
+    if (!(m > 0.0f)) return V3{ 0, 0, 0 };
+    const float r = 1.0f / m;
+    return V3{ v.x * r, v.y * r, v.z * r };
 }
 
 static const uint32_t BV32_STRIDE = uint32_t(sizeof(physx::Gu::BV32DataPacked)); // 1168

@@ -133,8 +133,11 @@ public float3 ctVertex2Shape(float3 v, float3 scale, float4 rot)
 // PxVec3::getNormalized() — the ZERO VECTOR for a zero-magnitude input, not NaN.
 public float3 ctNormalized(float3 v)
 {
+    // P9.36: getNormalized is `v * PxRecipSqrt(magnitudeSquared())` (PxVec3.h:286)
+    // with PxRecipSqrt == 1.0f/sqrtf (PxMath.h:161) -- ONE reciprocal, three
+    // multiplies.  Never a per-component divide.
     const float m = sqrt(dot(v, v));
-    return m > 0.0f ? v / m : float3(0.0f, 0.0f, 0.0f);
+    return m > 0.0f ? v * (1.0f / m) : float3(0.0f, 0.0f, 0.0f);
 }
 
 // ---------------------------------------------------------------------------

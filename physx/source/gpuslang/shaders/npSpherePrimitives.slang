@@ -399,7 +399,10 @@ public PrimContact capsuleCapsuleContact(float4 q0, float3 p0, float radius0, fl
                 const float3 projS1 = s0 + d0 * tV0;
                 const float3 vc = projS1 - s1;
                 const float dist = sqrt(dot(vc, vc));
-                const float3 normal = vc / dist;
+                // P9.36: sphereCollision.cuh:733/755/778/799 are `const PxVec3 normal =
+                // v / dist;`, annotated `V3ScaleInv(v, dist)` -- PxVec3::operator/
+                // (PxVec3.h:219) is ONE reciprocal and three multiplies.
+                const float3 normal = vc * (1.0f / dist);
                 const float3 pt = (projS1 - normal * radius0) + positionOffset;
                 if (numContacts == 0u) c.pointPen0 = float4(pt, dist - sumRadius);
                 else                   c.pointPen1 = float4(pt, dist - sumRadius);
@@ -411,7 +414,10 @@ public PrimContact capsuleCapsuleContact(float4 q0, float3 p0, float radius0, fl
                 const float3 projE1 = s0 + d0 * tV1;
                 const float3 vc = projE1 - e1;
                 const float dist = sqrt(dot(vc, vc));
-                const float3 normal = vc / dist;
+                // P9.36: sphereCollision.cuh:733/755/778/799 are `const PxVec3 normal =
+                // v / dist;`, annotated `V3ScaleInv(v, dist)` -- PxVec3::operator/
+                // (PxVec3.h:219) is ONE reciprocal and three multiplies.
+                const float3 normal = vc * (1.0f / dist);
                 const float3 pt = (projE1 - normal * radius0) + positionOffset;
                 if (numContacts == 0u) c.pointPen0 = float4(pt, dist - sumRadius);
                 else                   c.pointPen1 = float4(pt, dist - sumRadius);
@@ -423,7 +429,10 @@ public PrimContact capsuleCapsuleContact(float4 q0, float3 p0, float radius0, fl
                 const float3 projS0 = s1 + d1 * tV2;
                 const float3 vc = s0 - projS0;
                 const float dist = sqrt(dot(vc, vc));
-                const float3 normal = vc / dist;
+                // P9.36: sphereCollision.cuh:733/755/778/799 are `const PxVec3 normal =
+                // v / dist;`, annotated `V3ScaleInv(v, dist)` -- PxVec3::operator/
+                // (PxVec3.h:219) is ONE reciprocal and three multiplies.
+                const float3 normal = vc * (1.0f / dist);
                 const float3 pt = (s0 - normal * radius0) + positionOffset;
                 if (numContacts == 0u) c.pointPen0 = float4(pt, dist - sumRadius);
                 else                   c.pointPen1 = float4(pt, dist - sumRadius);
@@ -435,7 +444,10 @@ public PrimContact capsuleCapsuleContact(float4 q0, float3 p0, float radius0, fl
                 const float3 projE0 = s1 + d1 * tV3;
                 const float3 vc = e0 - projE0;
                 const float dist = sqrt(dot(vc, vc));
-                const float3 normal = vc / dist;
+                // P9.36: sphereCollision.cuh:733/755/778/799 are `const PxVec3 normal =
+                // v / dist;`, annotated `V3ScaleInv(v, dist)` -- PxVec3::operator/
+                // (PxVec3.h:219) is ONE reciprocal and three multiplies.
+                const float3 normal = vc * (1.0f / dist);
                 const float3 pt = (e0 - normal * radius0) + positionOffset;
                 if (numContacts == 0u) c.pointPen0 = float4(pt, dist - sumRadius);
                 else                   c.pointPen1 = float4(pt, dist - sumRadius);

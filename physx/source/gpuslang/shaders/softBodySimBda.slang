@@ -156,7 +156,9 @@ void sb_gm_preIntegrateLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 grou
 
             const float4 tVel = velocities[globalThreadIndex];
             float3 vel = float3(tVel.x, tVel.y, tVel.z);
-            vel += delta / gPre.dt;
+            // P9.36: softBodyGM.cu:126 is `vel += delta / dt;` on a PxVec3 --
+            // PxVec3::operator/ (PxVec3.h:219), ONE reciprocal and three multiplies.
+            vel += delta * (1.0f / gPre.dt);
 
             velocities[globalThreadIndex] = float4(vel.x, vel.y, vel.z, 0.0f);
 
@@ -182,7 +184,8 @@ void sb_gm_preIntegrateLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 grou
                     if (tKinematicPos.w == 0.0f)
                     {
                         const float3 kinematicPos = float3(tKinematicPos.x, tKinematicPos.y, tKinematicPos.z);
-                        vel = (kinematicPos - oldPos) / gPre.dt;
+                        // P9.36: softBodyGM.cu:154, PxVec3::operator/ again.
+                        vel = (kinematicPos - oldPos) * (1.0f / gPre.dt);
                         kinematic = true;
                         tPos.w = 0.0f;
                     }

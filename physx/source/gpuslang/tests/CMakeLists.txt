@@ -2294,3 +2294,38 @@ add_test(NAME gpuslang.speculatedLoads
 # same file must read as live, or a green run proves nothing.
 add_test(NAME gpuslang.disabledKernels
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_disabled_kernels.py)
+
+# ---------------------------------------------------------------------------
+# Vector divided by a splat scalar (P9.36).
+#
+# PxVec3 has no three-divide form.  operator/ (PxVec3.h:219), operator/= (:260)
+# and normalize() (:295) all form the reciprocal ONCE and multiply, and so do the
+# CUDA float3/float4 operators the GPU kernels actually use (cutil_math.h:342,
+# :352, :485, :495).  Written in Slang, `v / m` is instead three correctly-rounded
+# componentwise divides -- a different function, disagreeing with the engine in at
+# least one component for 53.4595% of random vectors (measured, 3e6 samples).
+#
+# No fixture here can see that, and the reason is the same one that put ~60 of
+# these in the corpus: the host mirrors are written from the Slang, by the same
+# hand at the same time, so they divide too.  A green bit-exact suite then proves
+# only that shader and mirror agree with each other.  Four fixtures went red the
+# moment the first six shaders were corrected while their mirrors still divided --
+# that is what this check is standing in for.  A mutant cannot see it either: a
+# fixture blind to the original is blind to the mutant.
+#
+# It was not a scattering of slips.  femClothClothContactBda.slang's header stated
+# the WRONG rule as deliberate policy ("a PxVec3/float scalar divide is transcribed
+# as Slang `float3 / float` (per-component OpFDiv) ... mirrored bit-for-bit by the
+# CPU reference"), and testFemClothSim.cpp carried a `divv` helper written to match
+# it.  Meanwhile five other files carried the CORRECT rule in their comments.  Two
+# doctrines coexisted for tranches; comments could not adjudicate between them and
+# a check can.
+#
+# Its controls are its own: a selftest synthesises a splat divisor, a genuine
+# vector divisor and a scalar-result divide, and fails the run if the rule cannot
+# separate them -- a checker that flagged everything or nothing would otherwise
+# pass silently.  A vector divided by a real VECTOR is faithful and common
+# (shape2Vertex divides each rotated component by its own scale component, and
+# cutil_math.h:337 float3/float3 is componentwise), so only the splat is flagged.
+add_test(NAME gpuslang.vectorDivide
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_vector_divide.py)

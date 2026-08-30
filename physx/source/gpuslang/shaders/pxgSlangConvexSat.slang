@@ -112,9 +112,12 @@ float3 csShape2Vertex(float3 v, float3 scale, float4 rot)
 // positive, and leaves the vector untouched otherwise.
 float csNormalizeInPlace(inout float3 v)
 {
+    // P9.36: convexTriangle.cuh:246 reaches this through
+    // `shapeSpacePlaneNormal.normalize()`, i.e. operator/= (PxVec3.h:260) -- ONE
+    // reciprocal and three multiplies.
     const float m = sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
     if (m > 0.0f)
-        v = v / m;
+        v = v * (1.0f / m);
     return m;
 }
 
@@ -377,8 +380,11 @@ public bool csSatEdgeCrossDirection2(uint lane, uint64_t vbeBase, uint64_t fbeBa
 
                     if (dot(v, v) > 1e-10f)
                     {
+                        // P9.36: convexTriangle.cuh:639 is `v.getNormalized()`, which is
+                        // `v * PxRecipSqrt(magnitudeSquared())` (PxVec3.h:286) and
+                        // PxRecipSqrt is 1.0f/sqrtf -- a multiply, never a divide.
                         const float m = sqrt(dot(v, v));
-                        const float3 shapeSpaceV = (m > 0.0f) ? (v / m) : v;
+                        const float3 shapeSpaceV = (m > 0.0f) ? (v * (1.0f / m)) : v;
 
                         float minTri, maxTri, minConv, maxConv;
                         csSupportTriangle(t0, t1, t2, shapeSpaceV, minTri, maxTri);

@@ -11145,9 +11145,13 @@ PXG_TEST(softBodySimFemAttachmentSolve)
             }
             else if (maxAngle > 0.0f)
             {
-                dirx = (len > 1e-6f) ? rx / len : ax;
-                diry = (len > 1e-6f) ? ry / len : ay;
-                dirz = (len > 1e-6f) ? rz / len : az;
+                // P9.36: attachments.cuh:60 is `dir = (len > 1.0e-6f) ? (relPos / len)
+                // : coneAxis;` on a PxVec3 -- PxVec3::operator/ (PxVec3.h:219) is ONE
+                // reciprocal and three multiplies.
+                const float invLen = 1.0f / len;
+                dirx = (len > 1e-6f) ? rx * invLen : ax;
+                diry = (len > 1e-6f) ? ry * invLen : ay;
+                dirz = (len > 1e-6f) ? rz * invLen : az;
                 const float cosAngle = dirx * ax + diry * ay + dirz * az;
                 const float sinMax = std::sin(maxAngle), cosMax = std::cos(maxAngle);
                 if (cosAngle < cosMax)
@@ -11169,9 +11173,13 @@ PXG_TEST(softBodySimFemAttachmentSolve)
             }
             else
             {
-                dirx = (len > 1e-6f) ? rx / len : ax;
-                diry = (len > 1e-6f) ? ry / len : ay;
-                dirz = (len > 1e-6f) ? rz / len : az;
+                // P9.36: attachments.cuh:60 is `dir = (len > 1.0e-6f) ? (relPos / len)
+                // : coneAxis;` on a PxVec3 -- PxVec3::operator/ (PxVec3.h:219) is ONE
+                // reciprocal and three multiplies.
+                const float invLen = 1.0f / len;
+                dirx = (len > 1e-6f) ? rx * invLen : ax;
+                diry = (len > 1e-6f) ? ry * invLen : ay;
+                dirz = (len > 1e-6f) ? rz * invLen : az;
             }
 
             len = std::fmin(std::fmax(len, minDist), maxDist >= 0.0f ? maxDist : PX_MAX_REAL_HOST);
@@ -11536,9 +11544,13 @@ PXG_TEST(softBodySimClothAttachmentSolve)
             if (maxAngle == 0.0f) { dirx = ax; diry = ay; dirz = az; }
             else if (maxAngle > 0.0f)
             {
-                dirx = (len > 1e-6f) ? rx / len : ax;
-                diry = (len > 1e-6f) ? ry / len : ay;
-                dirz = (len > 1e-6f) ? rz / len : az;
+                // P9.36: attachments.cuh:60 is `dir = (len > 1.0e-6f) ? (relPos / len)
+                // : coneAxis;` on a PxVec3 -- PxVec3::operator/ (PxVec3.h:219) is ONE
+                // reciprocal and three multiplies.
+                const float invLen = 1.0f / len;
+                dirx = (len > 1e-6f) ? rx * invLen : ax;
+                diry = (len > 1e-6f) ? ry * invLen : ay;
+                dirz = (len > 1e-6f) ? rz * invLen : az;
                 const float cosAngle = dirx * ax + diry * ay + dirz * az;
                 const float sinMax = std::sin(maxAngle), cosMax = std::cos(maxAngle);
                 if (cosAngle < cosMax)
@@ -11561,9 +11573,13 @@ PXG_TEST(softBodySimClothAttachmentSolve)
             }
             else
             {
-                dirx = (len > 1e-6f) ? rx / len : ax;
-                diry = (len > 1e-6f) ? ry / len : ay;
-                dirz = (len > 1e-6f) ? rz / len : az;
+                // P9.36: attachments.cuh:60 is `dir = (len > 1.0e-6f) ? (relPos / len)
+                // : coneAxis;` on a PxVec3 -- PxVec3::operator/ (PxVec3.h:219) is ONE
+                // reciprocal and three multiplies.
+                const float invLen = 1.0f / len;
+                dirx = (len > 1e-6f) ? rx * invLen : ax;
+                diry = (len > 1e-6f) ? ry * invLen : ay;
+                dirz = (len > 1e-6f) ? rz * invLen : az;
             }
             len = std::fmin(std::fmax(len, minDist), maxDist >= 0.0f ? maxDist : PX_MAX_REAL_HOST);
             ex = rx - len * dirx; ey = ry - len * diry; ez = rz - len * dirz;

@@ -104,10 +104,31 @@
 //     forceUpdateClothContactPairs + dt args (updateContactValidity) are carried in the
 //     push blob for ABI parity but NOT read: the CUDA kernel bodies never reference them.
 //
-// FLOAT LOWERING (self-consistent with the tranche-1 sibling femClothSelfCollisionBda and
-// its p72ref CPU transcription): a PxVec3/float scalar divide is transcribed as Slang
-// `float3 / float` (per-component OpFDiv), and an explicit PxVec3 * (1/x) as reciprocal-
-// multiply — each is mirrored bit-for-bit by the CPU reference.  All float arithmetic is
+// FLOAT LOWERING.  P9.36 CORRECTED THIS, AND THE OLD RULE IS WORTH RECORDING BECAUSE IT
+// IS WHY THE DEFECT WAS EVERYWHERE.  This header used to say:
+//
+//     "a PxVec3/float scalar divide is transcribed as Slang `float3 / float`
+//      (per-component OpFDiv), and an explicit PxVec3 * (1/x) as reciprocal-multiply —
+//      each is mirrored bit-for-bit by the CPU reference."
+//
+// Both halves lower to the SAME thing in the engine.  PxVec3::operator/ (PxVec3.h:219) is
+// `f = Type(1.0)/f; return PxVec3T(x*f, y*f, z*f);` -- a reciprocal and three multiplies --
+// and so are operator/= (:260), normalize() (:295) and the CUDA float3/float4 operators the
+// GPU kernels use (cutil_math.h:342/352/485/495).  There is no per-component form to
+// transcribe.  This very kernel's own source shows it: FEMClothExternalSolve.cu:748 writes
+// `normal = disp / dist;` and :846 writes `normal = disp * (1.0f / dist);`, on the same
+// type for the same purpose, because they ARE the same operation.  The port read them as
+// two lowerings and made the difference a rule.
+//
+// "each is mirrored bit-for-bit by the CPU reference" was the justification, and it is the
+// failure mode rather than the proof: the mirror was written from this convention, so
+// shader and mirror agreed with each other while both diverged from PhysX by >=1 component
+// on 53.4595% of vectors (measured, 3e6 samples).  gpuslang.vectorDivide now checks the
+// SPIR-V directly, which is the only thing here that can.
+//
+// The rule is: a vector divided by a SCALAR is one reciprocal and three multiplies.  A
+// vector divided by a VECTOR is genuinely componentwise (cutil_math.h:337) and stays a
+// divide.  All float arithmetic is
 // NoContraction-stamped (PXG_NOCONTRACT_SHADERS): the dot/cross/normalize-heavy closest-
 // point + constraint math (disp.dot(normal), the response denominator, the bias CN, the
 // deltaLambda scatter) feeds the compared mDeltaPos and would fuse to FMAs otherwise,
@@ -283,8 +304,10 @@ float3 closestPtPointTriangle2(float3 p, float3 a, float3 b, float3 c, float3 ab
 }
 
 // closestPtLineLine (deformableCollision.cuh:244) — infinite-line closest points; returns
-// false for a parallel / degenerate pair.  `r0 / r0Len` is Slang per-component division
-// (matching the p72ref transcription).
+// false for a parallel / degenerate pair.  P9.36: `const PxVec3 u0 = r0 / r0Len;` (:265) is
+// PxVec3::operator/, i.e. a reciprocal and three multiplies; this comment used to claim it
+// was per-component division "matching the p72ref transcription", which is the convention
+// corrected in the FLOAT LOWERING note above.
 bool closestPtLineLine(float3 e0v0, float3 e0v1, float3 e1v0, float3 e1v1, out float s, out float t, out float distSq)
 {
     const float3 r0 = e0v1 - e0v0;
@@ -304,8 +327,11 @@ bool closestPtLineLine(float3 e0v0, float3 e0v1, float3 e1v0, float3 e1v1, out f
     const float r0Len = sqrt(r0Len2);
     const float r1Len = sqrt(r1Len2);
 
-    const float3 u0 = r0 / r0Len;
-    const float3 u1 = r1 / r1Len;
+    // P9.36: deformableCollision.cuh:265-266 are `const PxVec3 u0 = r0 / r0Len;` --
+    // PxVec3::operator/ (PxVec3.h:219) is ONE reciprocal and three multiplies.  The two
+    // scalar divides further down (b0, b1) are scalar/scalar and stay divides.
+    const float3 u0 = r0 * (1.0f / r0Len);
+    const float3 u1 = r1 * (1.0f / r1Len);
 
     const float cosTheta = abs(dot(u0, u1));
 
@@ -880,7 +906,10 @@ void cloth_solveClothClothDeltaVTLaunch(uint3 groupThreadId : SV_GroupThreadID, 
         else
         {
             const float dist = sqrt(dispSq);
-            normal = disp / dist;   // PxVec3::operator/ ; per-component (see header)
+            // P9.36: FEMClothExternalSolve.cu:748 -- PxVec3::operator/, which is ONE
+            // reciprocal and three multiplies.  The sibling branch at :846 spells the very
+            // same operation `disp * (1.0f / dist)`; they are not two lowerings.
+            normal = disp * (1.0f / dist);
         }
 
         const float4 relDelta4 = weights.x * (x0 - prevX0) + weights.y * (x1 - prevX1) +

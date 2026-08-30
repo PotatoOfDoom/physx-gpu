@@ -157,7 +157,9 @@ public float3 computeConeLimitedError(float maxAngle, float minDist, float maxDi
     }
     else if (maxAngle > 0.0f)
     {
-        dir = (len > 1.0e-6f) ? (relPos / len) : coneAxis;
+        // P9.36: attachments.cuh:60/:74 divide a PxVec3 by a PxReal --
+        // PxVec3::operator/ (PxVec3.h:219), ONE reciprocal and three multiplies.
+        dir = (len > 1.0e-6f) ? (relPos * (1.0f / len)) : coneAxis;
         const float cosAngle = dot(dir, coneAxis);
         const float sinMaxAngle = sin(maxAngle);
         const float cosMaxAngle = cos(maxAngle);
@@ -170,7 +172,9 @@ public float3 computeConeLimitedError(float maxAngle, float minDist, float maxDi
     }
     else
     {
-        dir = (len > 1.0e-6f) ? (relPos / len) : coneAxis;
+        // P9.36: attachments.cuh:60/:74 divide a PxVec3 by a PxReal --
+        // PxVec3::operator/ (PxVec3.h:219), ONE reciprocal and three multiplies.
+        dir = (len > 1.0e-6f) ? (relPos * (1.0f / len)) : coneAxis;
     }
 
     len = clamp(len, minDist, maxDist >= 0.0f ? maxDist : FAC_MAX_F32);

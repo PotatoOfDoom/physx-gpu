@@ -52,13 +52,51 @@
 # Only a SPLAT -- the signature of `v / m` for scalar m -- is.
 #
 # ---------------------------------------------------------------------------
+# IT WAS NOT A SCATTERING OF SLIPS -- IT WAS WRITTEN DOWN
+# ---------------------------------------------------------------------------
+# femClothClothContactBda.slang's header stated the WRONG rule as deliberate
+# policy: "a PxVec3/float scalar divide is transcribed as Slang `float3 / float`
+# (per-component OpFDiv), and an explicit PxVec3 * (1/x) as reciprocal-multiply --
+# each is mirrored bit-for-bit by the CPU reference."  Both halves are the same
+# operation in the engine, and that kernel's own source proves it:
+# FEMClothExternalSolve.cu:748 writes `normal = disp / dist;` and :846 writes
+# `normal = disp * (1.0f / dist);`, same type, same purpose.
+#
+# testFemClothSim.cpp carried a helper built to match -- `p72ref::divv`, commented
+# "matching the shader's `float3 / float` ... NOT a reciprocal-multiply" -- and its
+# trap A9 asserted the REVERSE of the truth as a checked property ("a multiplication
+# FOLLOWED BY a division, not a multiplication by a reciprocal") for an expression
+# whose operator is literally `float inv = 1.0f/s; return a * inv;`.
+#
+# Meanwhile five other files stated the CORRECT rule in their comments
+# (npCvxCoreFace.slang:106 "NOT per-component division (review 165)",
+# npIsoVecNormalize, npPsDiffuseAvg, npPsFluidDensity, npPsFluidVelocity), and
+# pxgSlangFemFemAttach.slang:121 explains it exactly while a function thirty lines
+# below it divided.  Two doctrines lived side by side across tranches.  Comments
+# could not adjudicate between them; this check can.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS CHECK CANNOT SEE
+# ---------------------------------------------------------------------------
+# Same operators, different association.  GuDistancePointTriangle.h:94-97 scales
+# the two SCALARS by the reciprocal and only then forms the vector sum; three of
+# the twenty-one copies of that tail in this corpus summed first and scaled after,
+# and two of those had the reciprocal right.  That is invisible here and was found
+# by reading the engine's statement order.  Do not read a green run as "the
+# arithmetic matches" -- it means "no vector is divided by a splat".
+#
+# ---------------------------------------------------------------------------
 # ALLOWLIST
 # ---------------------------------------------------------------------------
 # An entry is permitted only when the ENGINE at that site genuinely performs
 # three separate divisions by the same scalar -- i.e. it is NOT going through
-# PxVec3, but dividing raw floats it wrote out by hand.  Each entry must say
-# which engine line does that.  The list is empty today, and that is the point:
-# every site found so far was a defect.
+# PxVec3 or the cutil_math operators, but dividing raw floats it wrote out by
+# hand.  Each entry must say which engine line does that.
+#
+# The list is EMPTY, and that is the finding rather than an accident of where the
+# sweep stopped: the first run reported about sixty sites across 37 shaders, every
+# one was resolved against the engine line it ports, and not a single one turned
+# out to be a legitimate three-divide.
 
 import os
 import struct

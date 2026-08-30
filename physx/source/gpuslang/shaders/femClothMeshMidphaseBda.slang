@@ -382,7 +382,12 @@ void cloth_meshMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 
         // Triangle triangle: verts, triPlane = PxPlane(v0,v1,v2), centroid = (v0+v1+v2)/3.
         float3 nA; float dA;
         makePlane(a0, a1, a2, nA, dA);
-        const float3 centroid = (a0 + a1 + a2) / 3.0f;
+        // P9.36: femClothClothMidPhase.cu:417/:578 write `(v0 + v1 + v2) / 3.f` into a
+        // PxVec3 centroid (triangletriangle.cuh:39), i.e. PxVec3::operator/ -- ONE
+        // reciprocal and three multiplies.  1.0f/3.0f is inexact, so this is not a
+        // no-op rewrite; the engine spells the same thing `* third` at
+        // sdfCollision.cuh:665.
+        const float3 centroid = (a0 + a1 + a2) * (1.0f / 3.0f);
 
         // --- TriangleLeafBoundMinMaxTraverser per-lane state ---
         float bestDist = PX_MAX_F32;
