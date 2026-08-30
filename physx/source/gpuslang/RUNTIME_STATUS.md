@@ -7,17 +7,28 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **832/832** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **833/833** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.33a added `gpuslang.npFloatIntrinRecipSqrt`, which is not a kernel port but a
 PLATFORM measurement: about forty shaders here spell `PxVec3::getNormalized` as
 `v * rsqrt(m)`, while the engine computes `PxRecipSqrt` = `1.0f/sqrtf` — two exactly
 specified IEEE operations — and SPIR-V's `InverseSqrt` is allowed 2 ULP of slack.  The
 two agree bit for bit on llvmpipe over 258442 inputs, and that is now measured rather
 than inferred from a green suite.
-P9.26 added `gpuslang.disabledKernels`, the fourth static checker in the suite
-after `gpuslang.barrierUniformity` (P9.16), `gpuslang.cudaTwinKernels` (P9.20)
-and `gpuslang.speculatedLoads` (P9.23) — all four exist because no fixture and
-no mutant can see what they check.  The newest one keeps a fact about SOMEONE
+P9.36 added `gpuslang.vectorDivide`, the FIFTH static checker, after
+`gpuslang.barrierUniformity` (P9.16), `gpuslang.cudaTwinKernels` (P9.20),
+`gpuslang.speculatedLoads` (P9.23) and `gpuslang.disabledKernels` (P9.26) — all
+five exist because no fixture and no mutant can see what they check.  The newest
+one flags an `OpFDiv` whose result type is a vector and whose divisor is a splat
+of one scalar: PxVec3 has no three-divide form (`PxVec3.h:219/:260/:295`) and
+neither does the CUDA type the kernels actually use (`cutil_math.h:342/:352/:485/
+:495`), so in the engine that expression is always ONE reciprocal and three
+multiplies, differing from three componentwise divides in at least one component
+for 53.4595% of random vectors (measured, 3e6 samples).  About sixty such sites
+existed; every one was a defect and the allowlist is empty.  A fixture cannot see
+this because its host mirror is written from the Slang and divides too — four
+bit-exact fixtures went red the moment the first six shaders were corrected while
+their mirrors still divided.
+P9.26 added `gpuslang.disabledKernels`, which keeps a fact about SOMEONE
 ELSE'S source true: `cloth_meshVertexContactGenLaunch` emits nothing because its
 only `hasContacts` assignment is commented out upstream, and this port
 implements it that way.  P9.29 gave it a THIRD kind of claim to keep — the
@@ -1736,6 +1747,206 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.36 — eine Division, die es in der Engine gar nicht gibt, und die Hausregel, die sie vorgeschrieben hat
+
+Kein Kernel-Port. Manifest **unverändert bei 378**. Suite **832 → 833**: dazu kam
+`gpuslang.vectorDivide`, der **fünfte** statische Prüfer. Was ihn nötig machte,
+war nicht eine Streuung von Flüchtigkeitsfehlern, sondern eine **aufgeschriebene,
+falsche Hausregel** — und ein Korpus, der gleichzeitig die richtige aufgeschrieben
+hatte.
+
+### Die Regel, und dass sie für BEIDE Vektortypen gilt
+
+`PxVec3` hat **keine** Drei-Divisionen-Form. Alle drei Schreibweisen einer
+Skalardivision münden in Kehrwert-dann-Multiplikation:
+
+* `PxVec3.h:219` `operator/(Type f)` → `f = Type(1.0)/f; return PxVec3T(x*f, y*f, z*f);`
+* `PxVec3.h:260` `operator/=(Type f)` → `f = Type(1.0)/f; x *= f; y *= f; z *= f;`
+* `PxVec3.h:295` `normalize()` → `m = magnitude(); if (m > 0) *this /= m; return m;`
+
+Der entscheidende Fund war aber, dass das **nicht** an `PxVec3` hängt. Die
+GPU-Kernel rechnen streckenweise mit dem CUDA-`float3`, und PhysX' eigener
+Operator dafür tut dasselbe:
+
+* `cutil_math.h:342` `float3 operator/(float3 a, float s)` → `float inv = 1.0f/s; return a * inv;`
+* `:352` `operator/=`, `:485`/`:495` die `float4`-Zwillinge — identisch.
+
+Damit gibt es **keinen** Engine-Ausdruck, der einen Vektor komponentenweise durch
+denselben Skalar teilt. In Slang geschrieben wird aus **demselben Text** aber
+genau das: drei korrekt gerundete Divisionen. Über **3 000 000** Zufallsvektoren
+weichen die beiden Formen in **53,4595 %** der Fälle in mindestens einer
+Komponente voneinander ab. Keine Haaresbreite — ein Münzwurf.
+
+Und `cutil_math.h:337` `float3 operator/(float3, float3)` **ist** komponentenweise.
+Das ist die Trennlinie, auf der der Prüfer steht.
+
+### Warum keine Vorrichtung das sehen kann
+
+Dieselbe Begründung wie bei den vier älteren Prüfern, nur schärfer: die
+Host-Spiegel sind **aus dem Slang** geschrieben, von derselben Hand, zur selben
+Zeit — also teilen sie mit. Eine bitgleiche grüne Suite beweist dann nur, dass
+Shader und Spiegel **einander** entsprechen. Der Beweis dafür liegt vor: als die
+ersten sechs Shader korrigiert waren und die Spiegel noch teilten, gingen
+**vier** bitgleiche Vorrichtungen sofort rot. Sie waren grün, während sie zwei
+**gleich falsche** Dinge verglichen.
+
+Ein Mutant sieht es genauso wenig: Mutationstesten stört den Shader und fragt, ob
+die Vorrichtung es merkt — und eine Vorrichtung, die für das Original blind ist,
+ist es für den Mutanten auch.
+
+### Die Hausregel — der eigentliche Befund
+
+Der Kopf von `femClothClothContactBda.slang` schrieb die **falsche** Regel als
+Politik fest:
+
+> „a PxVec3/float scalar divide is transcribed as Slang `float3 / float`
+> (per-component OpFDiv), and an explicit PxVec3 * (1/x) as reciprocal-multiply —
+> **each is mirrored bit-for-bit by the CPU reference**."
+
+Beide Hälften münden in der Engine in **dasselbe**. Und dieser Kernel widerlegt
+die Regel in seiner eigenen Quelle: `FEMClothExternalSolve.cu:748` schreibt
+`normal = disp / dist;`, `:846` schreibt `normal = disp * (1.0f / dist);` — auf
+demselben Typ, zum selben Zweck, weil es **dieselbe Operation** ist. Der Port las
+zwei Umwandlungen und machte den Unterschied zur Regel.
+
+Der Nachsatz „mirrored bit-for-bit by the CPU reference" war die Rechtfertigung —
+und ist in Wahrheit die Fehlerbeschreibung. Der Spiegel trug dazu passend einen
+eigens gebauten Helfer, `p72ref::divv`, mit der Notiz „**matching the shader's**
+`float3 / float` … NOT a reciprocal-multiply". „Matching the shader" ist das ganze
+Problem in drei Wörtern.
+
+Am schärfsten aber: **Falle A9** in `testFemClothSim.cpp` behauptete die
+Umkehrung der Wahrheit als geprüfte Eigenschaft —
+
+> „die Skalierung ist eine Multiplikation **gefolgt von einer Division**, nicht
+> eine Multiplikation mit einem Kehrwert."
+
+`diff` ist dort ein CUDA-`float4`, und `cutil_math.h:485` ist wörtlich
+`float inv = 1.0f/s; return a * inv;` — also genau das, was die Falle
+ausgeschlossen hat. Eine Falle, die in die falsche Richtung zeigte und den Fehler
+festnagelte.
+
+Dabei stand die **richtige** Regel längst im selben Korpus, in fünf Dateien
+ausformuliert — `npCvxCoreFace.slang:106` („ONE division then three multiplies …
+**NOT per-component** division (review 165)"), `npIsoVecNormalize`, `npPsDiffuseAvg`,
+`npPsFluidDensity`, `npPsFluidVelocity` — und `pxgSlangFemFemAttach.slang:121`
+erklärt sie sogar mustergültig, während `computeConeLimitedError` dreißig Zeilen
+tiefer teilte. **Zwei Doktrinen lebten über Tranchen hinweg nebeneinander.**
+Kommentare konnten das nicht entscheiden; eine Prüfung kann es.
+
+### Der Prüfer
+
+`tools/check_vector_divide.py` liest das gebaute SPIR-V und meldet ein `OpFDiv`,
+dessen **Ergebnistyp ein Vektor** ist und dessen **Divisor ein
+`OpCompositeConstruct` aus einer einzigen wiederholten Id** ist — die Signatur von
+`v / m`. Ein echter Vektor-Divisor bleibt unbehelligt: `shape2Vertex`
+(`cudaNpCommon.h:284`) teilt jede gedrehte Komponente durch **ihre eigene**
+Skalenkomponente, und das ist treu.
+
+Er trägt eigene Kontrollen: ein Selbsttest baut die drei Formen (Splat, echter
+Vektor, Skalarergebnis) und lässt den Lauf scheitern, wenn die Regel sie nicht
+trennt — ein Prüfer, der alles oder nichts meldet, käme sonst still durch.
+
+**Ergebnis: 421 Shader, null Treffer, ALLOWLIST leer.** Der erste Lauf meldete
+rund **sechzig** Stellen in **37** Shadern. Jede wurde gegen die Engine-Zeile
+entschieden, die sie portiert, und **keine einzige** war eine berechtigte
+Drei-Divisionen-Stelle. Betroffen waren am Ende **33** Shader-Dateien.
+
+### Ein ZWEITER Fehler an denselben Stellen, den der Prüfer strukturell nicht sehen kann
+
+Beim Beheben fiel der baryzentrische Schwanz von `closestPtPointTriangle` auf.
+`GuDistancePointTriangle.h:94-97` skaliert die beiden **Skalare** und bildet erst
+danach die Vektorsumme, links nach rechts assoziiert:
+
+```
+const float denom = 1.0f / (va + vb + vc);
+const float v = vb * denom;  const float w = vc * denom;
+return a + ab*v + ac*w;
+```
+
+**Achtzehn** der einundzwanzig Kopien im Korpus buchstabieren das bereits so.
+**Drei** nicht: `npTriangle.slang:167` teilte *und* summierte zuerst,
+`npCvxHfNp.slang:305` und `npCvxMeshNp.slang:290` hatten den Kehrwert richtig und
+die **Assoziation** falsch — und beide trugen einen Kommentar, der die
+Kehrwert-Regel korrekt nannte. **Die Regel war zur Hälfte angewandt.**
+
+Das ist eine Fehlerklasse, die derselbe Prüfer nicht fassen kann: gleiche
+Operatoren, andere Klammerung. Sie ist als eigene Tranche vorgemerkt.
+
+### Drei Vorrichtungen, drei verschiedene Antworten — und eine VIERTE Art der Blindheit
+
+* **`npCvxHfNp` sieht es.** Bitgleich, und seine Geometrie trennt die
+  Schreibweisen: **123 Fälle** rot für den Shader-Fehler — und noch einmal
+  dieselben 123, als *mein eigener* korrigierter Spiegel die **Additionen** als
+  `a + (X + Y)` statt `(a + X) + Y` assoziierte. Die Vorrichtung hat ihren Autor
+  zweimal erwischt.
+* **`npTriangle` kann es nicht.** Es vergleicht `closestP` mit
+  `almostEqual(1e-4f, 1e-5f)`; ein ULP liegt bauartbedingt unter seiner Schwelle.
+* **`npCvxMeshNp` ist bitgleich und sieht es trotzdem nicht** — und hier wurde
+  gemessen statt vermutet. Der Kugelpfad betritt den Flächenbereich in **256 von
+  1024** Fällen, und **null** davon trennen die beiden Assoziationen, weil in
+  **null** von ihnen irgendeine Komponente **beide** Kantenvektoren ungleich null
+  hat. Die Dreiecke dieses Netzes sind achsenparallel, also hat jede Komponente
+  von `ab.c*vb + ac.c*vc` höchstens einen lebenden Term, und die beiden
+  Schreibweisen sind **als Ausdrücke identisch** — nicht nahe beieinander,
+  identisch. Der Kapselpfad betritt den Flächenbereich **nie**.
+
+Das ist eine **vierte** Art, auf die eine Vorrichtung blind wird, neben dem
+falschen Spiegel, der zu weiten Toleranz und dem nicht abgedeckten Pfad: **die
+Exakt-Arithmetik-Doktrin, die den bitgleichen Vergleich überhaupt erst möglich
+macht, stellt Rundungs-Reihenfolge-Fehler außer Reichweite.** Beide Tatsachen sind
+jetzt geprüfte Verträge, die scheitern, wenn sie veralten, mit der Notiz, was ein
+trennender Fall bräuchte: ein Dreieck, dessen zwei Kantenvektoren sich eine
+Komponente ungleich null teilen.
+
+Von der anderen Seite dasselbe Bild: bei `npSbSb` und `npSbSelf` war der
+**Spiegel schon richtig** (`muls(v, 1.0f / dist)`, der eine sogar mit dem
+Kommentar „PxVec3::normalize guard") und der **Shader falsch** — und beide
+Vorrichtungen waren **vorher grün und nachher grün**. Bei unverändertem Spiegel
+heißt das: auf jeder Eingabe, die sie fahren, stimmen die beiden Formen bitweise
+überein. Das ist eine Messung, keine Vermutung.
+
+### Eine Schranke, die keine Zierde ist
+
+Drei der vier Softbody-Mittelphasen-Stellen hatten die `m > 0`-Schranke von
+`normalize()` fallen lassen. Sie ist **erreichbar**: der umgebende Zweig prüft
+`dot(v, normal)` gegen null, und das bleibt positiv für ein `v`, das weit unter
+der Stelle liegt, an der `dot(v, v)` unterläuft. Dort lässt die Engine `v`
+unberührt und gibt 0 zurück, während eine ungeschützte Division NaN liefert.
+Wiederhergestellt.
+
+### Ein Block, viermal geschrieben, einmal falsch
+
+`FEMClothExternalSolve.cu:268-269` (`invTanMag = PxRecipSqrt(tanMagSq); tanDir *= invTanMag;`)
+ist im Korpus **viermal** portiert. Drei Kopien waren richtig —
+`femClothClothContactBda.slang:430`, `npClothCollisionConstraint.slang:182`,
+`npSbCollisionConstraint` —, die vierte teilte, und ihr Spiegel teilte mit. Vier
+handgeschriebene Kopien eines Engine-Blocks sind vier Gelegenheiten, ihn aus dem
+Gedächtnis neu herzuleiten; das ist die Form dieser ganzen Fehlerklasse.
+
+### Nebenbefund (dokumentiert, nicht gemeldet)
+
+`cutil_math.h:347` `float3 operator/(float s, float3 a)` berechnet
+`float inv = 1.0f/s; return a * inv;` — es ignoriert die Operandenreihenfolge und
+liefert `a/s` statt `s/a`. Upstream-Kandidat **43**; keine Portstelle hängt daran.
+
+### Verifikation
+
+* Prüfer **421 Shader, 0 Treffer, ALLOWLIST leer**, Selbsttest grün;
+* jede Stelle gegen die **zitierte Engine-Zeile** entschieden, nicht gegen ein
+  Muster im Slang;
+* Suite **833/833 in BEIDEN Speichermodi** — Standard im **zweiten** Anlauf (der
+  erste traf den bekannten llvmpipe-Absturz in `femClothSim`, Aufgabe 16, der
+  isoliert 66/66 grün läuft), `PXG_DEVICE_V2=1` im **ersten**;
+* die vier Vorrichtungen, die beim Korrigieren rot wurden, sind alle wieder grün —
+  diesmal mit **beiden** Seiten richtig;
+* Manifest unverändert, die Numerik aber in **33** Shader-Dateien: `build-sdk` neu
+  gebaut, der Szenendurchlauf war zum Zeitpunkt dieses Commits **noch unterwegs**;
+  sein Ergebnis wird nachgetragen. Ebenso noch offen: die Vorrichtungsläufe für die
+  zwei zuletzt korrigierten Host-Spiegel (`testConvexTrimeshMidphase`,
+  `computeBasis` in `testFemClothSim`) — beide sind gegen die zitierte Engine-Zeile
+  entschieden, aber noch nicht gefahren, weil währenddessen nicht gebaut wird.
 
 ## P9.35 — der SDF-Softbody-Zwischenlauf, und was passiert, wenn man zwei Geschwister nebeneinanderlegt
 

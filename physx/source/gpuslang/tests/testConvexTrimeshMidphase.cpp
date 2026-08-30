@@ -412,7 +412,13 @@ static std::vector<uint32_t> expectedTriangles(const Scene& sc, float boxY)
         const V3 a = sc.verts[sc.tri[3*t]], b2 = sc.verts[sc.tri[3*t+1]], c = sc.verts[sc.tri[3*t+2]];
         const V3 raw = cross3(sub3(b2, a), sub3(c, a));
         const float m = dot3(raw, raw);
-        const V3 n = m > 0.0f ? V3{ raw.x / std::sqrt(m), raw.y / std::sqrt(m), raw.z / std::sqrt(m) }
+        // P9.36: PxPlane(v0,v1,v2) normalizes through getNormalized (PxVec3.h:286) =
+        // `v * PxRecipSqrt(magnitudeSquared())` -- a reciprocal and three MULTIPLIES.
+        // The shader spells it `nRaw * rsqrt(nl)`; this mirror divided three times, so
+        // the pair was mismatched and merely happened to agree on the cases run.  Found
+        // by sweeping the host mirrors, which gpuslang.vectorDivide cannot reach.
+        const float rm = 1.0f / std::sqrt(m);
+        const V3 n = m > 0.0f ? V3{ raw.x * rm, raw.y * rm, raw.z * rm }
                               : V3{ 0, 0, 0 };
         const float d = -dot3(n, a);
         if (dot3(n, com) + d < 0.0f) continue;            // the front-face gate

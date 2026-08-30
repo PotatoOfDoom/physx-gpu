@@ -3637,14 +3637,16 @@ static V3 mat33Mul(const float m[9], V3 v)
                m[2] * v.x + m[5] * v.y + m[8] * v.z };
 }
 
-// PxComputeBasisVectors (PxMathUtils.h:297); right/up .normalize() is v / sqrt(magSq).
+// PxComputeBasisVectors (PxMathUtils.h:297).  P9.36: this comment used to say
+// "right/up .normalize() is v / sqrt(magSq)" -- it is not.  PxVec3::normalize scales
+// through operator/= (PxVec3.h:260): ONE reciprocal, three multiplies.
 static void computeBasis(V3 dir, V3& right, V3& up)
 {
     if (rabs(dir.y) <= 0.9999f)
     {
         right = V3{ dir.z, 0.0f, -dir.x };
         const float m = std::sqrt(right.x * right.x + right.y * right.y + right.z * right.z);
-        if (m > 0.0f) right = V3{ right.x / m, right.y / m, right.z / m };
+        if (m > 0.0f) { const float r = 1.0f / m; right = V3{ right.x * r, right.y * r, right.z * r }; }
         up = V3{ dir.y * right.z, dir.z * right.x - dir.x * right.z, -dir.y * right.x };
     }
     else
@@ -3652,7 +3654,7 @@ static void computeBasis(V3 dir, V3& right, V3& up)
         right = V3{ 1.0f, 0.0f, 0.0f };
         up = V3{ 0.0f, dir.z, -dir.y };
         const float m = std::sqrt(up.x * up.x + up.y * up.y + up.z * up.z);
-        if (m > 0.0f) up = V3{ up.x / m, up.y / m, up.z / m };
+        if (m > 0.0f) { const float r = 1.0f / m; up = V3{ up.x * r, up.y * r, up.z * r }; }
     }
 }
 
