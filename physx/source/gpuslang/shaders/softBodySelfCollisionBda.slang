@@ -404,8 +404,13 @@ void sb_selfCollisionMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, 
                                 else if (dot(v, normal) > 0.0f)
                                 {
                                     // PxVec3::normalize returns the LENGTH and leaves v unit.
+                                    // P9.36: through operator/= -- ONE reciprocal, three multiplies
+                                    // (PxVec3.h:260) -- and with the m > 0 guard, which is reachable
+                                    // for denormal-scale v (dot(v, normal) > 0 while dot(v, v)
+                                    // underflows to 0).
                                     dist = length(v);
-                                    v = v / dist;
+                                    if (dist > 0.0f)
+                                        v = v * (1.0f / dist);
                                     if (dot(normal, v) > 0.707f)
                                         normal = v;
                                     bHasCollision = dist < distance;

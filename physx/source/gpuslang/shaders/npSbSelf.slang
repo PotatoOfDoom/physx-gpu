@@ -366,8 +366,14 @@ void ctSbSelfQuery(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
                             }
                             else if (dot(v, normal) > 0.0f)
                             {
+                                // P9.36: `dist = v.normalize();` -- ONE reciprocal then three
+                                // multiplies (PxVec3.h:260), and the m > 0 guard restored.  It is
+                                // reachable: for denormal-scale v, dot(v, normal) can be positive
+                                // while dot(v, v) underflows to zero, and the engine then leaves v
+                                // untouched and returns 0 where an unguarded divide gives NaN.
                                 dist = length(v);
-                                v = v / dist; // PxVec3::normalize returns the length, leaves v normalized
+                                if (dist > 0.0f)
+                                    v = v * (1.0f / dist);
                                 if (dot(normal, v) > 0.707f)
                                     normal = v;
                                 bHasCollision = dist < distance;
