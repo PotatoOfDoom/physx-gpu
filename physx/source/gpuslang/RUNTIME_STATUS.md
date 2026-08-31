@@ -1748,6 +1748,134 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.38 — fünfzehn Abschriften derselben Suche, elf davon zusammengelegt, und zwei Algorithmen, wo die Engine einen hat
+
+Kein Kernel-Port, kein neuer Prüfer. Manifest **unverändert bei 378**, Suite
+**834/834**. Diese Tranche löst die Aufgabe ein, die P9.34c aufgeschrieben und
+P9.35c vorbereitet hat: `find` über `PxgRigidFilterPair` stand **neunmal** im
+Korpus, P9.35c legte dafür `pxgSlangDefFilter` an und hängte ausdrücklich **nicht**
+die anderen um — „das Modul ist das Ziel dieser Arbeit, nicht die Arbeit".
+
+### Erst zählen, dann prüfen, dann zusammenlegen
+
+Die vollständige Aufnahme ergab **fünfzehn** Suchen, nicht neun — meine erste
+Zählung war an einem `head` abgeschnitten, und zwei Kopien
+(`softBodyContactGenBda`, `softBodyMeshContactGenBda`) tauchten erst auf, als das
+DAG-Werkzeug aus P9.37 sie unter demselben Namen mit verschiedenen Graphen meldete.
+
+Vor dem Umhängen wurde **jede einzelne** gegen `deformableElementFilter.cuh:67` und
+`PxgRigidFilterPair::compare` gelesen. Alle fünfzehn stimmen: dieselbe
+Vergleichsreihenfolge (index0, index1 als **64 Bit**, dann index2), dieselbe
+`ignoreIndex2`-Disjunktion, dieselbe Schleifenform. Ein paar Schreibweisen sind
+verschieden und dennoch gleichwertig — `npSbPrim:233` schreibt `cmp = -1`, wo andere
+`(0u < p.index2) ? -1 : 1` schreiben, und weil die Anfrage index2 = 0 trägt, ist der
+zweite Zweig unerreichbar.
+
+**Dass alle stimmen, ist der Grund zusammenzulegen, nicht der Grund es zu lassen.**
+Fünfzehn identische Abschriften sind fünfzehn künftige Gelegenheiten, eine davon aus
+dem Gedächtnis falsch neu herzuleiten — und genau darauf sind die beiden
+vorangegangenen Tranchen geendet: P9.36 auf einem viermal portierten Block mit einer
+falschen Kopie, P9.37 auf `rotateInv` mit einer von 63.
+
+### Der eine Unterschied: zwei Algorithmen
+
+Unter den vier BDA-adressierten **NonRigid**-Suchen fanden sich **zwei verschiedene
+Verfahren**:
+
+* `softBodySelfCollisionBda` und `softBodySoftBodyMidphaseBda` schreiben die
+  Engine-Schleife ab — bei jedem Test prüfen und bei Treffer sofort `true`;
+* `softBodyClothContactGenBda` und `softBodyClothVertContactGenBda` schreiben eine
+  **untere Schranke** — auf das erste Element ≥ (index0, index1) einengen und dann
+  genau dieses eine prüfen.
+
+Beide liefern dasselbe, und der Grund gehört aufgeschrieben statt geglaubt: Einträge
+mit gleichem (index0, index1) bilden einen **zusammenhängenden Lauf**, weil index2
+der letzte Sortierschlüssel ist; die Engine-Schleife hält diesen Lauf in jedem
+Schritt innerhalb von [l, r); und eine Schleife, die erst bei l == r endet, muss
+deshalb **in ihn hineintasten** — wo die `ignoreIndex2`-Disjunktion feuert.
+
+Gleichwertig also — aber zwei Verfahren, wo die Engine eines hat, ist genau die Art
+Zustand, die diese Tranche beseitigen soll. Beide sind weg.
+
+### Was bewusst NICHT umgezogen ist
+
+Sieben Suchen lesen ihre Paare über eine **StructuredBuffer-Bindung** statt über eine
+Geräteadresse — `npSbSb`, `npSbSelf`, `npSbPrim`, `npClothCloth`,
+`fcStaticTriCloth`, `fcVertexConvex`, `psPrimCollide`. Einer Modulfunktion mit
+`uint64_t`-Adresse lässt sich keine Bindung übergeben; sie umzuhängen hieße, die
+Bindungsweise dieser Kernel zu ändern — eine Vorrichtungs- und ABI-Änderung ohne
+Verhaltensgewinn. Dazu `npDefFilter.slang`, das **die Prüfvorrichtung** dieser
+Suchen ist, und die beiden Suchen mit anderer Semantik: `findParticleRigid` über
+`PxParticleRigidFilterPair` (ein anderer 16-Byte-Satz mit eigener Navigation) und
+`npSbPrim`s `findParticleFilter`, das `ignoreIndex2 = **false**` mit der `mUniqueId`
+des Puffers als drittem Schlüssel übergibt. Diese zusammenzuwerfen wäre der
+Fehlermodus, den die Arbeit zu vermeiden hatte — sie stehen jetzt **mit Begründung**
+im Modulkopf, damit die Auslassung als Entscheidung lesbar ist und nicht als
+Versehen.
+
+### Die Null-Schranke bleibt an der Aufrufstelle
+
+`mFilteringPairs` ist null, sobald ein Körper keine Filterpaare angemeldet hat — der
+**Normalfall**. Auf llvmpipe genügt eine null-durchlaufene `while (l < r)` nicht: sie
+spekuliert den Ladebefehl der ersten Iteration, greift auf Adresse 0 zu, und der
+Müll, den sie einsetzt, **unterscheidet sich zwischen den Lanes** — die Suche ist
+dann nicht mehr warp-uniform, das `continue` des Aufrufers nicht mehr
+gruppen-uniform, und die nachfolgende Workgroup-Barriere wird nur von einem Teil der
+Gruppe erreicht. Der Ausweg ist, **den Zeiger auszuwählen, nicht den geladenen
+Wert** — und welcher der eigenen Puffer dafür sicher ist, weiß nur der Aufrufer.
+Also behält jeder Aufrufer diese Wahl und übergibt dem Modul eine bereits sichere
+Adresse zusammen mit `r = 0`. Die Herleitung steht ungekürzt in
+`softBodySelfCollisionBda.slang`.
+
+
+### Was mitgewandert ist, und ein Fehler von mir dabei
+
+Beim Auflösen der Kopien wären zwei **Beweise** fast im Papierkorb gelandet, die in
+`femClothSdfMeshCgBda` über der dortigen Abschrift standen. Sie gehören jetzt in den
+Modulkopf, weil sie die Suche selbst beschreiben und nicht ihren Aufrufer:
+
+* **`l = mid + 1` gegen `l = l + 1`** liefert dieselbe Antwort. Die Invariante
+  `l <= k < r` überlebt beide: `cmp > 0` heißt `pairs[mid] < query`, also `k > mid >= l`
+  und damit `k >= l + 1`; die Schleife endet nur bei `l >= r`, was der Invariante
+  widerspricht. Die beiden unterscheiden sich in der **Arbeit** — O(n) gegen O(log n) —
+  und in nichts sonst. Keine Vorrichtung trennt sie; nur dieses Argument.
+* **Die `ignoreIndex2`-Disjunktion ist für das Tuch-Starrkörper-Feld überflüssig** (es
+  wird aus default-konstruierten Paaren mit `index2(0)` gebaut), aber **nicht** für
+  dieselbe Überladung anderswo, wo Anheftungs-Handles in index2 stehen. Genau deshalb
+  darf sie aus einer geteilten Implementierung nicht verschwinden, obwohl sie bei
+  einem Aufrufer toter Code ist.
+
+Ebenso bleibt die **kanonische llvmpipe-Diagnose** dort, wo der Korpus sie zitiert:
+in `softBodySelfCollisionBda.slang`, bei der Schranke, die sie erklärt.
+
+Und ein Fehler, der hierher gehört: Mein Skript zum Aufräumen verwaister
+Kommentarblöcke war zu grob und hat in `psContactGenBda` **fünfundsechzig** Zeilen
+gelöscht, darunter den vollständigen Kopf von `ps_primitivesDiffuseCollisionLaunch` —
+nur weil darin das Wort „binary search" vorkam. Aufgefallen beim Durchsehen des
+Diffs, nicht beim Bauen: der Shader übersetzt ohne Kommentare genauso gut. Beide
+betroffenen Dateien wurden aus `git` zurückgeholt und von Hand präzise umgestellt.
+Ein Suchmuster, das Dokumentation nach einem Stichwort löscht, ist kein Werkzeug,
+sondern ein Risiko.
+
+Ausserdem, weil es die Messung entwertet hätte: Der erste Szenenlauf lief noch,
+während ich mehrfach neu gebaut habe — er las also `.spv`-Dateien, die sich unter ihm
+änderten. Abgebrochen und nach dem endgültigen Bau sauber wiederholt.
+
+### Verifikation
+
+* **`dfFindRigidPair` 7 Kopien, `dfFindNonRigidPair` 4 Kopien — je genau ein
+  Arithmetikgraph**, gemessen mit dem SPIR-V-Sieb aus P9.37, das damit sofort seinen
+  zweiten Nutzen hat;
+* in den sechs umgehängten Dateien sind die verwaisten Helfer entfernt (`u64Lt`,
+  `u64Eq`, `PairR`, `NRPAIR_STRIDE`) — ein liegengebliebenes `u64Lt` ist eine
+  Einladung, die zwölfte Suche zu schreiben;
+* Suite auf dem **endgültigen** Bau **834/834 in beiden Speichermodi, jeweils im
+  ersten Anlauf**. Ein Zwischenlauf davor traf einmal den bekannten
+  llvmpipe-Absturz in `femClothSim` (Aufgabe 16, isoliert 66/66 grün) — ein Kernel,
+  den diese Tranche nicht anfasst;
+* Manifest unverändert, aber elf Kernel haben ihren Filtercode gewechselt, also
+  `build-sdk` neu gebaut und die Szenen gelaufen: **33 ok, 0 fail, 0 missing (von 33)**.
+
 ## P9.37 — 340 handgeschriebene Kopien, eine davon anders, und ein Sieb, das dreimal sich selbst widerlegt hat
 
 Kein Kernel-Port. Manifest **unverändert bei 378**. Suite **833 → 834**:
