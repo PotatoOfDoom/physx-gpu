@@ -115,6 +115,7 @@
 // ===========================================================================
 
 import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu
+import pxgSlangDefFilter;   // P9.38
 import pxgSlangTetClosest;     // getNormalized / isValidTet / isPointOutsideOfPlane4 /
                                // closestPtTetrahedron
 
@@ -143,9 +144,6 @@ import pxgSlangBv32;   // P8.25: the BV32 reader, shared
 // femMidphaseScratch.sBv32Nodes[192] — a 6-deep BV32 tree's worst-case pending set.
 static const uint STACK_SIZE = 192u;
 
-// PxgNonRigidFilterPair (PxgSimulationCoreDesc.h:235), 16 B: index0 PxU64 @0, index1 @8,
-// index2 @12.
-static const uint64_t NRPAIR_STRIDE = 16UL;
 
 // ---------------------------------------------------------------------------
 // Byte-exact narrowphase ABI mirrors (identical to softBodyContactGenBda's).
@@ -218,49 +216,6 @@ uint pxEncodeSoftBodyIndex(uint softBodyId, uint tetId)
     return (softBodyId << PXG_BITSHIFT_TET_ID) | tetId;
 }
 
-// ---------------------------------------------------------------------------
-// PxgNonRigidFilterPair binary search — find(pairs, nbPairs, id0, id1) with
-// ignoreIndex2 = true (deformableElementFilter.cuh:130).
-// ---------------------------------------------------------------------------
-bool u64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
-bool u64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
-
-bool findFilter(uint64_t pairsAddr, uint nbPairs, uint id0, uint id1)
-{
-    // *** mFilteringPairs IS NULL WHEN THE BODY HAS NO FILTER PAIRS, WHICH IS THE COMMON CASE. ***
-    // A zero-trip `while (l < r)` is NOT enough on llvmpipe: it speculates the first
-    // iteration's load, faults at address 0, and the garbage it substitutes DIFFERS BETWEEN
-    // LANES -- so findFilter stops being warp-uniform, the caller's `continue` stops being
-    // group-uniform, and the workgroup barrier after it is reached by only part of the group.
-    // The fix is SELECT THE POINTER, NOT THE LOADED VALUE: gSs.softbodies is dereferenced
-    // unconditionally by every invocation, so it is never null and a speculated read at its
-    // offset 0 is harmless, while `r = 0` keeps the RESULT exactly CUDA's for an empty list.
-    // Diagnosed in full in softBodySelfCollisionBda.slang.
-    const bool havePairs = (pairsAddr != 0UL) && (nbPairs != 0u);
-    const uint64_t base = havePairs ? pairsAddr : gSs.softbodies;
-    const uint2 q0 = uint2(id0, 0u);
-    uint l = 0u, r = havePairs ? nbPairs : 0u;
-    while (l < r)
-    {
-        const uint mid = (l + r) / 2u;
-        const uint64_t pAddr = base + uint64_t(mid) * NRPAIR_STRIDE;
-        const uint2 pIndex0 = uint2(Ptr<uint>(pAddr)[0], Ptr<uint>(pAddr + 4UL)[0]);
-        const uint pIndex1 = Ptr<uint>(pAddr + 8UL)[0];
-        const uint pIndex2 = Ptr<uint>(pAddr + 12UL)[0];
-
-        int cmp = 0;
-        if (u64Lt(q0, pIndex0)) cmp = -1;
-        else if (u64Lt(pIndex0, q0)) cmp = 1;
-        else if (id1 < pIndex1) cmp = -1;
-        else if (id1 > pIndex1) cmp = 1;
-        else if (0u < pIndex2) cmp = -1;
-
-        if (cmp == 0 || (u64Eq(q0, pIndex0) && id1 == pIndex1))
-            return true;
-        if (cmp < 0) r = mid; else l = mid + 1u;
-    }
-    return false;
-}
 
 // PxgSoftBodyContactWriter::writeContact (PxgSoftBodyCore.h:276).  auxInd is NOT touched by the
 // CUDA writer, so it is not written here either.
@@ -302,6 +257,16 @@ uint ssBallot(bool pred, uint lane)
 // ===========================================================================
 // sb_sbMidphaseGeneratePairsLaunch
 // ===========================================================================
+// P9.38: the search itself now lives in pxgSlangDefFilter; only this kernel's own
+// null-pointer guard stays here, because only this kernel knows which of its buffers
+// is safe to point at when the filter list is null (see the module header).
+bool findFilter(uint64_t pairsAddr, uint nbPairs, uint id0, uint id1)
+{
+    const bool havePairs = (pairsAddr != 0UL) && (nbPairs != 0u);
+    return dfFindNonRigidPair(havePairs ? pairsAddr : gSs.softbodies,
+                              havePairs ? nbPairs : 0u, id0, id1);
+}
+
 [shader("compute")]
 [numthreads(32, 1, 1)]
 void sb_sbMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)

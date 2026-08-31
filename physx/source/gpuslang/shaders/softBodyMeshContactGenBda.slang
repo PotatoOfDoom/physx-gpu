@@ -104,6 +104,7 @@
 module softBodyMeshContactGenBda;
 
 import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu
+import pxgSlangDefFilter;   // P9.38
 import pxgSlangGjk;            // GjkCloud / GjkOut / GJK_OVERLAP / GJK_CLOSE / GJK_MAX_CLOUD
 import pxgSlangTetCollide;     // tetPrimitivesCollide2 / computeInnerSphere
 
@@ -183,43 +184,9 @@ struct PxgShape                 // PxgConvexConvexShape.h, 48 B
 
 // PxgRigidFilterPair (PxgSimulationCoreDesc.h, 32 B): index0 u64 @0, index1 u64 @8,
 // index2 u32 @16, tail padding.
-struct PairR { uint2 index0; uint2 index1; uint index2; uint pad0, pad1, pad2; }
 
 uint encodeId(uint id, uint elementId) { return (id << PXG_BITSHIFT_ID) | elementId; }
 
-// ---------------------------------------------------------------------------
-// PxgRigidFilterPair binary-search find with the ignoreIndex2 early accept
-// (deformableElementFilter.cuh:67/:89) — the transcription softBodyContactGenBda uses.
-// ---------------------------------------------------------------------------
-bool u64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
-bool u64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
-
-bool findRigidPair(uint64_t pairsAddr, uint nbPairs, uint2 q0, uint2 q1)
-{
-    // A null filter list with nbPairs == 0 is the common case, and a zero-trip `while (l < r)`
-    // is NOT enough on llvmpipe: it speculates the first iteration's load and faults at address
-    // 0.  SELECT THE POINTER, not the loaded value -- gMc.softbodies is dereferenced by every
-    // invocation, so a speculated read there is harmless, and `r = 0` keeps the RESULT exactly
-    // CUDA's.  Diagnosed at length in softBodySelfCollisionBda.slang.
-    const bool havePairs = (pairsAddr != 0UL) && (nbPairs != 0u);
-    Ptr<PairR> pairs = Ptr<PairR>(havePairs ? pairsAddr : gMc.softbodies);
-    uint l = 0u, r = havePairs ? nbPairs : 0u;
-    while (l < r)
-    {
-        const uint mid = (l + r) / 2u;
-        const PairR p = pairs[mid];
-        int cmp = 0;
-        if (u64Lt(q0, p.index0)) cmp = -1;
-        else if (u64Lt(p.index0, q0)) cmp = 1;
-        else if (u64Lt(q1, p.index1)) cmp = -1;
-        else if (u64Lt(p.index1, q1)) cmp = 1;
-        else if (0u < p.index2) cmp = -1;   // q.index2 == 0
-        if (cmp == 0 || (u64Eq(q0, p.index0) && u64Eq(q1, p.index1)))
-            return true;
-        if (cmp < 0) r = mid; else l = mid + 1u;
-    }
-    return false;
-}
 
 // writeContactNoBarycentricFullWarp (softbodyPrimitives.cu:297) in the mode THIS call site
 // asks for.  The mesh path passes `alternativeWriteMode = true` (:889), which is NOT what the
@@ -308,6 +275,16 @@ void loadSoftbodyTrimeshPair(uint cmIdx, out PxgShape sbShape, out uint sbCacheR
 }
 
 // ===========================================================================
+// P9.38: the search itself now lives in pxgSlangDefFilter; only this kernel's own
+// null-pointer guard stays here, because only this kernel knows which of its buffers
+// is safe to point at when the filter list is null (see the module header).
+bool findRigidPair(uint64_t pairsAddr, uint nbPairs, uint2 q0, uint mask)
+{
+    const bool havePairs = (pairsAddr != 0UL) && (nbPairs != 0u);
+    return dfFindRigidPair(havePairs ? pairsAddr : gMc.softbodies,
+                           havePairs ? nbPairs : 0u, q0, mask);
+}
+
 [shader("compute")]
 [numthreads(32, 1, 1)]
 void sb_meshContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
@@ -348,7 +325,7 @@ void sb_meshContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Group
 
         // The single-level filter: this rigid actor against this tetrahedron.
         const uint softBodyMask = encodeId(softbodyId, tetrahedronInd);
-        if (findRigidPair(gMc.filterPairs, gMc.nbFilterPairs, rigidId, uint2(softBodyMask, 0u)))
+        if (findRigidPair(gMc.filterPairs, gMc.nbFilterPairs, rigidId, softBodyMask))
             continue;
 
         // ---- cloud A: the tetrahedron, already in WORLD space ---------------------

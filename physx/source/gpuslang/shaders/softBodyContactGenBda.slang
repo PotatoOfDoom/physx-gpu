@@ -93,6 +93,7 @@
 // anywhere, so this tranche is FULLY bit-exact with no tolerance seam.
 
 import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu (mTetMeshData@0, mTetIndices@16, ...)
+import pxgSlangDefFilter;   // P9.38
 import pxgSlangGjk;          // GjkCloud / GjkOut
 import pxgSlangTetCollide;   // tetPrimitivesCollide2, computeInnerSphere
 import pxgSlangBv32;   // P9.17b: the BV32 reader AND its index rules, replacing a
@@ -229,6 +230,14 @@ uint ballotGroup(bool pred, uint lane)
 // sb_midphaseGeneratePairsLaunch — one 32-thread group per warp, walked serially over
 // the block's MIDPHASE_WARPS_PER_BLOCK warps.
 // ===========================================================================
+// P9.38: the search itself now lives in pxgSlangDefFilter; only this kernel's own
+// null-pointer guard stays here, because only this kernel knows which of its buffers
+// is safe to point at when the filter list is null (see the module header).
+bool findRigidPair(uint64_t pairsAddr, uint nbPairs, uint2 q0, uint mask)
+{
+    return dfFindRigidPair(pairsAddr, nbPairs, q0, mask);
+}
+
 [shader("compute")]
 [numthreads(32, 1, 1)]
 void sb_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
@@ -442,7 +451,6 @@ static const uint GEOM_CONVEXMESH = 4u;
 
 // PxgRigidFilterPair (PxgSimulationCoreDesc.h, 32 B): index0 u64 @0, index1 u64 @8,
 // index2 u32 @16, tail padding.
-struct PairR { uint2 index0; uint2 index1; uint index2; uint pad0, pad1, pad2; }
 
 struct SbContactGenParams
 {
@@ -491,31 +499,6 @@ uint cgBallot(bool pred, uint lane)
     return sCgBallot;
 }
 
-// PxgRigidFilterPair binary-search find with the ignoreIndex2 early accept
-// (deformableElementFilter.cuh:67/:89) — the same transcription femClothContactGenBda uses.
-bool u64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
-bool u64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
-
-bool findRigidPair(uint64_t pairsAddr, uint nbPairs, uint2 q0, uint2 q1)
-{
-    Ptr<PairR> pairs = Ptr<PairR>(pairsAddr);
-    uint l = 0u, r = nbPairs;
-    while (l < r)
-    {
-        const uint mid = (l + r) / 2u;
-        const PairR p = pairs[mid];
-        int cmp = 0;
-        if (u64Lt(q0, p.index0)) cmp = -1;
-        else if (u64Lt(p.index0, q0)) cmp = 1;
-        else if (u64Lt(q1, p.index1)) cmp = -1;
-        else if (u64Lt(p.index1, q1)) cmp = 1;
-        else if (0u < p.index2) cmp = -1;   // q.index2 == 0
-        if (cmp == 0 || (u64Eq(q0, p.index0) && u64Eq(q1, p.index1)))
-            return true;
-        if (cmp < 0) r = mid; else l = mid + 1u;
-    }
-    return false;
-}
 
 // PxgFEMContactWriter::writeRigidVsDeformableContactNoBarycentric (PxgFEMCore.h).
 // setRigidMaterialIndex(mat) followed by markInCollision(false) collapses to a single
@@ -811,7 +794,7 @@ void sb_primitiveContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
             // backend says is not.
             if (gCG.numSoftBodyRigidPairs > 0u &&
                 findRigidPair(gCG.softBodyRigidPairs, gCG.numSoftBodyRigidPairs,
-                              rigidId, uint2(softBodyMask, 0u)))
+                              rigidId, softBodyMask))
                 continue;
 
             // *** Everything that is not a PLANE goes through GJK/EPA, exactly as in the

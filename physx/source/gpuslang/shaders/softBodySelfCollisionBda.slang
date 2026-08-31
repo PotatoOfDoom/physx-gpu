@@ -102,6 +102,7 @@
 // decisions above are all comparisons of contracted-free products.
 
 import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu (mTetMeshData@0, mNumVerts@364, ...)
+import pxgSlangDefFilter;   // P9.38
 import pxgSlangTetClosest;     // getNormalized / isValidTet / isPointOutsideOfPlane4 /
 import pxgSlangBv32;   // P9.17b: the BV32 reader AND its index rules, replacing a
                       // private copy of both that was verbatim identical to it.
@@ -126,9 +127,6 @@ static const uint PXG_BITSHIFT_TET_ID = 20u;
 // femMidphaseScratch.sBv32Nodes[192] — a 6-deep BV32 tree's worst-case pending set.
 static const uint STACK_SIZE = 192u;
 
-// PxgNonRigidFilterPair (PxgSimulationCoreDesc.h:235), 16 B: index0 PxU64 @0, index1 @8,
-// index2 @12.
-static const uint64_t NRPAIR_STRIDE = 16UL;
 
 // ---------------------------------------------------------------------------
 // Push-constant blob — BYTE-IDENTICAL to the CUDA scMidphaseKernelParams pack
@@ -169,62 +167,6 @@ uint pxEncodeSoftBodyIndex(uint softBodyId, uint tetId)
     return (softBodyId << PXG_BITSHIFT_TET_ID) | tetId;
 }
 
-// ---------------------------------------------------------------------------
-// PxgNonRigidFilterPair binary search — find(pairs, nbPairs, id0, id1) with
-// ignoreIndex2 = true (deformableElementFilter.cuh:130).  Both query keys are PxU32
-// encodings, so index0's high word is always 0.
-// ---------------------------------------------------------------------------
-bool u64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
-bool u64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
-
-bool findFilter(uint64_t pairsAddr, uint nbPairs, uint id0, uint id1)
-{
-    // *** mFilteringPairs IS NULL WHEN THE BODY HAS NO FILTER PAIRS. ***
-    // PxgSimulationCore only assigns it inside the dirty-filter branch
-    // (PxgSimulationCore.cpp:1446), so a body that never registered a filter reaches this
-    // kernel with a null pointer and nbPairs == 0 -- which is the common case, and the case
-    // the first live self-collision scene hit immediately.
-    //
-    // A zero-trip `while (l < r)` is NOT enough on llvmpipe.  It speculates the first
-    // iteration's load, faults at address 0, and the garbage it substitutes DIFFERS BETWEEN
-    // LANES -- so `findFilter` stops being warp-uniform, the caller's `continue` stops being
-    // group-uniform, and the workgroup barrier after it is reached by only part of the
-    // group.  That is why the symptom was a SIGSEGV whose location moved with the
-    // groupshared layout (STACK_SIZE 192 vs 193 changed it) and vanished under
-    // PXG_SYNC_EACH: the fault is a barrier divergence, not a bad store.
-    //
-    // The fix is the one softBodyContactRemapBda spells out for prevContactCount: SELECT
-    // THE POINTER, NOT THE LOADED VALUE.  Guarding with `if` cannot work -- the branch is
-    // already there and llvmpipe if-converts it -- so the faulting ADDRESS has to go.
-    // gSc.softbodies is dereferenced unconditionally by every invocation of this kernel, so
-    // it is never null and a speculated 16-byte read at its offset 0 is harmless; forcing
-    // `r` to 0 keeps the RESULT exactly what CUDA computes for an empty list.
-    const bool havePairs = (pairsAddr != 0UL) && (nbPairs != 0u);
-    const uint64_t base = havePairs ? pairsAddr : gSc.softbodies;
-    const uint2 q0 = uint2(id0, 0u);
-    uint l = 0u, r = havePairs ? nbPairs : 0u;
-    while (l < r)
-    {
-        const uint mid = (l + r) / 2u;
-        const uint64_t pAddr = base + uint64_t(mid) * NRPAIR_STRIDE;
-        const uint2 pIndex0 = uint2(Ptr<uint>(pAddr)[0], Ptr<uint>(pAddr + 4UL)[0]);
-        const uint pIndex1 = Ptr<uint>(pAddr + 8UL)[0];
-        const uint pIndex2 = Ptr<uint>(pAddr + 12UL)[0];
-
-        // PxgNonRigidFilterPair::compare, with the query's index2 fixed at 0.
-        int cmp = 0;
-        if (u64Lt(q0, pIndex0)) cmp = -1;
-        else if (u64Lt(pIndex0, q0)) cmp = 1;
-        else if (id1 < pIndex1) cmp = -1;
-        else if (id1 > pIndex1) cmp = 1;
-        else if (0u < pIndex2) cmp = -1;
-
-        if (cmp == 0 || (u64Eq(q0, pIndex0) && id1 == pIndex1))
-            return true;
-        if (cmp < 0) r = mid; else l = mid + 1u;
-    }
-    return false;
-}
 
 // ---------------------------------------------------------------------------
 // Geometry helpers — verbatim from npSbSelf.slang / npSbTet.slang.
@@ -269,6 +211,40 @@ uint scBallot(bool pred, uint lane)
 // ===========================================================================
 // sb_selfCollisionMidphaseGeneratePairsLaunch
 // ===========================================================================
+// P9.38: the search itself now lives in pxgSlangDefFilter; only this kernel's own
+// null-pointer guard stays here, because only this kernel knows which of its buffers
+// is safe to point at when the filter list is null (see the module header).
+bool findFilter(uint64_t pairsAddr, uint nbPairs, uint id0, uint id1)
+{
+    // *** mFilteringPairs IS NULL WHEN THE BODY HAS NO FILTER PAIRS. ***
+    // THIS IS THE CORPUS'S REFERENCE DIAGNOSIS of that fault; several other shaders
+    // point here for it, so it stays with the guard even though P9.38 moved the search
+    // itself into pxgSlangDefFilter.
+    //
+    // PxgSimulationCore only assigns it inside the dirty-filter branch
+    // (PxgSimulationCore.cpp:1446), so a body that never registered a filter reaches this
+    // kernel with a null pointer and nbPairs == 0 -- which is the common case, and the case
+    // the first live self-collision scene hit immediately.
+    //
+    // A zero-trip `while (l < r)` is NOT enough on llvmpipe.  It speculates the first
+    // iteration's load, faults at address 0, and the garbage it substitutes DIFFERS BETWEEN
+    // LANES -- so `findFilter` stops being warp-uniform, the caller's `continue` stops being
+    // group-uniform, and the workgroup barrier after it is reached by only part of the
+    // group.  That is why the symptom was a SIGSEGV whose location moved with the
+    // groupshared layout (STACK_SIZE 192 vs 193 changed it) and vanished under
+    // PXG_SYNC_EACH: the fault is a barrier divergence, not a bad store.
+    //
+    // The fix is the one softBodyContactRemapBda spells out for prevContactCount: SELECT
+    // THE POINTER, NOT THE LOADED VALUE.  Guarding with `if` cannot work -- the branch is
+    // already there and llvmpipe if-converts it -- so the faulting ADDRESS has to go.
+    // gSc.softbodies is dereferenced unconditionally by every invocation of this kernel, so
+    // it is never null and a speculated 16-byte read at its offset 0 is harmless; forcing
+    // `r` to 0 keeps the RESULT exactly what CUDA computes for an empty list.
+    const bool havePairs = (pairsAddr != 0UL) && (nbPairs != 0u);
+    return dfFindNonRigidPair(havePairs ? pairsAddr : gSc.softbodies,
+                              havePairs ? nbPairs : 0u, id0, id1);
+}
+
 [shader("compute")]
 [numthreads(32, 1, 1)]
 void sb_selfCollisionMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)

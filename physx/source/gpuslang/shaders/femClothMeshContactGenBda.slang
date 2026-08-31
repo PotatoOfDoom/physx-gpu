@@ -97,7 +97,8 @@
 // ===========================================================================
 module femClothMeshContactGenBda;
 
-import pxgSlangCommon;         // quatRotate / quatRotateInv / PxgTransform28
+import pxgSlangCommon;   // quatRotate / quatRotateInv / PxgTransform28
+import pxgSlangDefFilter;   // P9.38: dfFindRigidPair
 import pxgSlangFEMClothDesc;   // PxgFEMClothGpu
 import pxgSlangClothTriContact;  // P9.27b: staticTriangleVsClothCollision + its clipping
 
@@ -165,9 +166,6 @@ struct PxgContactManagerInput { uint shapeRef0, shapeRef1, transformCacheRef0, t
 // this shader already imports that module for quatRotate / PxgTransform28, and a second
 // declaration is an ambiguous reference rather than a shadow.
 
-// PxgRigidFilterPair (PxgSimulationCoreDesc.h:167, 32 B): index0 u64 @0, index1 u64 @8,
-// index2 u32 @16, tail padding.
-struct PairR { uint2 index0; uint2 index1; uint index2; uint pad0, pad1, pad2; }
 
 // ---------------------------------------------------------------------------
 // The plane/barycentric helpers, the clipping pipeline and
@@ -181,36 +179,6 @@ struct PairR { uint2 index0; uint2 index1; uint index2; uint pad0, pad1, pad2; }
 // find(PxgRigidFilterPair*) (deformableElementFilter.cuh:67) — the binary search with the
 // ignoreIndex2 early accept, as softBodyMeshContactGenBda carries it.
 // ---------------------------------------------------------------------------
-bool u64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
-bool u64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
-
-bool findRigidPair(uint2 q0, uint2 q1)
-{
-    // A null filter list with nbFilterPairs == 0 is the common case, and a zero-trip
-    // `while (l < r)` is NOT enough on llvmpipe: it speculates the first iteration's load and
-    // faults at address 0.  SELECT THE POINTER, not the loaded value — gCg.femClothes is
-    // dereferenced by every invocation anyway, so a speculated read there is harmless, and
-    // `r = 0` keeps the RESULT exactly CUDA's.  Diagnosed at length in
-    // softBodySelfCollisionBda.slang.
-    const bool havePairs = (gCg.filterPairs != 0UL) && (gCg.nbFilterPairs != 0u);
-    Ptr<PairR> pairs = Ptr<PairR>(havePairs ? gCg.filterPairs : gCg.femClothes);
-    uint l = 0u, r = havePairs ? gCg.nbFilterPairs : 0u;
-    while (l < r)
-    {
-        const uint mid = (l + r) / 2u;
-        const PairR p = pairs[mid];
-        int cmp = 0;
-        if (u64Lt(q0, p.index0)) cmp = -1;
-        else if (u64Lt(p.index0, q0)) cmp = 1;
-        else if (u64Lt(q1, p.index1)) cmp = -1;
-        else if (u64Lt(p.index1, q1)) cmp = 1;
-        else if (0u < p.index2) cmp = -1;   // the query's index2 is 0
-        if (cmp == 0 || (u64Eq(q0, p.index0) && u64Eq(q1, p.index1)))
-            return true;
-        if (cmp < 0) r = mid; else l = mid + 1u;
-    }
-    return false;
-}
 
 
 void writeRigidVsDeformableContact32(uint index, float4 contact, float4 normalPen, float4 bary,
@@ -248,6 +216,25 @@ uint cgBallot(bool pred, uint lane)
 }
 
 // ===========================================================================
+// P9.38: the binary search over PxgRigidFilterPair now lives in pxgSlangDefFilter.
+// It was written out by hand fifteen times across this corpus; every copy was checked
+// against deformableElementFilter.cuh:67 and agreed, and that is exactly why they were
+// worth collapsing -- fifteen identical transcriptions are fifteen future chances to
+// re-derive one of them wrong.
+bool findRigidPair(uint2 q0, uint mask)
+{
+    // The pointer SELECTION stays here, at the call site, because it is about THIS
+    // kernel's bindings rather than about the search: a null filter list with
+    // nbFilterPairs == 0 is the common case, and a zero-trip `while (l < r)` is not
+    // enough on llvmpipe -- it speculates the first iteration's load and faults at
+    // address 0.  Selecting the POINTER (gCg.femClothes is dereferenced by every
+    // invocation anyway, so a speculated read there is harmless) with r = 0 keeps the
+    // result exactly CUDA's.  Diagnosed at length in softBodySelfCollisionBda.slang.
+    const bool havePairs = (gCg.filterPairs != 0UL) && (gCg.nbFilterPairs != 0u);
+    return dfFindRigidPair(havePairs ? gCg.filterPairs : gCg.femClothes,
+                           havePairs ? gCg.nbFilterPairs : 0u, q0, mask);
+}
+
 [shader("compute")]
 [numthreads(32, 1, 1)]
 void cloth_meshContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
@@ -320,9 +307,9 @@ void cloth_meshContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Gr
             const uint clothMask0 = (clothId << PXG_BITSHIFT_ELEMENT_ID) | clothVertInd.x;
             const uint clothMask1 = (clothId << PXG_BITSHIFT_ELEMENT_ID) | clothVertInd.y;
             const uint clothMask2 = (clothId << PXG_BITSHIFT_ELEMENT_ID) | clothVertInd.z;
-            const bool skipTriangle = findRigidPair(rigidId, uint2(clothMask0, 0u)) &&
-                                      findRigidPair(rigidId, uint2(clothMask1, 0u)) &&
-                                      findRigidPair(rigidId, uint2(clothMask2, 0u));
+            const bool skipTriangle = findRigidPair(rigidId, clothMask0) &&
+                                      findRigidPair(rigidId, clothMask1) &&
+                                      findRigidPair(rigidId, clothMask2);
 
             if (!skipTriangle)
             {

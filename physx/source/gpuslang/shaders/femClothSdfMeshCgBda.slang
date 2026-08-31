@@ -127,6 +127,7 @@
 #include "pxgSlangWarpInc.slang"
 
 import pxgSlangCommon;
+import pxgSlangDefFilter;   // P9.38
 import pxgSlangFEMClothDesc;
 import pxgSlangSdfTexture;
 import pxgSlangSdfCollision;
@@ -186,67 +187,22 @@ FcCtWriter csWriter()
 // PxgShape comes from pxgSlangCommon rather than being redeclared -- the other cloth
 // contact gens predate that module and carry their own copies.
 
-// PxgRigidFilterPair (PxgSimulationCoreDesc.h, 32 B).
-struct PairR { uint2 index0; uint2 index1; uint index2; uint pad0, pad1, pad2; }
-
-// `find` (PxgSimulationCoreDesc.h) -- a BINARY search, not a linear one, with the
-// ignoreIndex2 early accept.  A cloth vertex's compressed id folds into
-// q1 = uint2(clothMask, 0).
-//
-// TWO THINGS HERE ARE UNTESTABLE, and both were established by proof after the
-// mutation sweep left them standing rather than by widening the rig:
-//
-//   * `l = mid + 1` vs `l = l + 1` -- the second still RETURNS the same answer.  The
-//     invariant `l <= k < r` (k = the target's index) survives both updates: cmp > 0
-//     means pairs[mid] < query, so k > mid >= l and therefore k >= l + 1.  The loop
-//     only exits at l >= r, which contradicts the invariant, so a present key is
-//     always found; and cmp == 0 is a real match, so an absent one is never claimed.
-//     The two differ in WORK -- O(n) against O(log n) -- and in nothing else.
-//   * the `ignoreIndex2` disjunct is redundant FOR THIS ARRAY.  The cloth-rigid
-//     filter list is built at PxgSimulationController.cpp:4094 from a default-
-//     constructed PxgRigidFilterPair, whose constructor is `index2(0)`
-//     (PxgSimulationCoreDesc.h:164), and nothing else writes index2 into
-//     mClothRigidFilterPairs.  The query carries index2 = 0 too, so `compare` never
-//     reaches its index2 branch with a difference and `cmp == 0` already holds.  The
-//     clause is transcribed because the CUDA has it and because the SAME overload is
-//     called elsewhere with attachment handles in index2, where it is load-bearing.
-//
-// THE NINTH COPY, and that is a scope decision rather than a defence: this corpus
-// already carries eight spellings of `find` (femClothContactGenBda,
-// femClothMeshContactGenBda, npDefFilter, npSbPrim, psContactGenBda, psPrimCollide,
-// softBodyContactGenBda, softBodyMeshContactGenBda), which is exactly the drift the
-// P9.32 module rule exists to stop.  Consolidating eight live call sites is its own
-// change with its own sweep; doing it inside this tranche would put an unrelated
-// refactor under a kernel port's verification.  Filed separately.
-bool u64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
-bool u64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
-
-bool csFindRigid(uint nbPairs, uint2 q0, uint2 q1)
-{
-    Ptr<PairR> pairs = Ptr<PairR>(gCs.filterPairs);
-    uint l = 0u, r = nbPairs;
-    while (l < r)
-    {
-        const uint mid = (l + r) / 2u;
-        const PairR p = pairs[mid];
-        int cmp = 0;
-        if (u64Lt(q0, p.index0)) cmp = -1;
-        else if (u64Lt(p.index0, q0)) cmp = 1;
-        else if (u64Lt(q1, p.index1)) cmp = -1;
-        else if (u64Lt(p.index1, q1)) cmp = 1;
-        else if (0u < p.index2) cmp = -1;
-        if (cmp == 0 || (u64Eq(q0, p.index0) && u64Eq(q1, p.index1)))
-            return true;
-        if (cmp < 0) r = mid; else l = mid + 1u;
-    }
-    return false;
-}
 
 // S8: globalScanExclusive<32> against the writer's counter -- P9.34c moved it into
 // pxgSlangSdfFind so this and psSdfMidphaseBda share one copy.
 uint csGlobalScan(uint tid, bool contributes)
 {
     return sdfGlobalScanExclusive(tid, contributes, gCs.w_totalContactCount);
+}
+
+// P9.38: the binary search over PxgRigidFilterPair now lives in pxgSlangDefFilter.
+// It was written out by hand fifteen times across this corpus; every copy was checked
+// against deformableElementFilter.cuh:67 and agreed, and that is exactly why they were
+// worth collapsing -- fifteen identical transcriptions are fifteen future chances to
+// re-derive one of them wrong.
+bool csFindRigid(uint nbPairs, uint2 q0, uint mask)
+{
+    return dfFindRigidPair(gCs.filterPairs, nbPairs, q0, mask);
 }
 
 [shader("compute")]
@@ -345,9 +301,9 @@ void cloth_sdfMeshContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV
             const uint m1 = (clothId << PXG_BITSHIFT_ELEMENT_ID) | triangle.y;
             const uint m2 = (clothId << PXG_BITSHIFT_ELEMENT_ID) | triangle.z;
             const bool skipTriangle =
-                csFindRigid(gCs.nbFilterPairs, rigidId, uint2(m0, 0u)) &&
-                csFindRigid(gCs.nbFilterPairs, rigidId, uint2(m1, 0u)) &&
-                csFindRigid(gCs.nbFilterPairs, rigidId, uint2(m2, 0u));
+                csFindRigid(gCs.nbFilterPairs, rigidId, m0) &&
+                csFindRigid(gCs.nbFilterPairs, rigidId, m1) &&
+                csFindRigid(gCs.nbFilterPairs, rigidId, m2);
 
             if (!skipTriangle)
             {

@@ -112,6 +112,7 @@ import pxgSlangVertexConvexCloth; // P9.21: the lifted vertex-vs-convex core
 // definition of each and the compiler, not a reader, enforces it.
 import pxgSlangClothMidphase;
 
+import pxgSlangDefFilter;   // P9.38: dfFindRigidPair
 // PxGeometryType (PxGeometry.h): eSPHERE 0, ePLANE 1, eCAPSULE 2, ... eTRIANGLEMESH 8.
 static const uint GEOM_SPHERE = 0u;
 static const uint GEOM_PLANE = 1u;
@@ -169,9 +170,6 @@ struct PxsCachedTransform
     uint flags;           // @28 -> 32
 }
 
-// PxgRigidFilterPair (PxgSimulationCoreDesc.h, 32 bytes): index0 u64, index1 u64,
-// index2 u32, padding.
-struct PairR { uint2 index0; uint2 index1; uint index2; uint pad0, pad1, pad2; }
 
 // ---------------------------------------------------------------------------
 // Push-constant blobs — BYTE-IDENTICAL to each CUDA PxCudaKernelParam pack.
@@ -354,34 +352,6 @@ float3 ctQuatRotate(float4 q, float3 v)
                   (vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * dot2));
 }
 
-// ---------------------------------------------------------------------------
-// PxgRigidFilterPair binary-search find (deformableElementFilter.cuh:67/:89) with
-// the ignoreIndex2 early accept — transcribed from psContactGenBda::findRigid.  A
-// cloth vertex's compressed id folds into q1 = uint2(clothMask, 0).
-// ---------------------------------------------------------------------------
-bool u64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
-bool u64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
-
-bool findRigid(uint64_t pairsAddr, uint nbPairs, uint2 q0, uint2 q1)
-{
-    Ptr<PairR> pairs = Ptr<PairR>(pairsAddr);
-    uint l = 0u, r = nbPairs;
-    while (l < r)
-    {
-        const uint mid = (l + r) / 2u;
-        const PairR p = pairs[mid];
-        int cmp = 0;
-        if (u64Lt(q0, p.index0)) cmp = -1;
-        else if (u64Lt(p.index0, q0)) cmp = 1;
-        else if (u64Lt(q1, p.index1)) cmp = -1;
-        else if (u64Lt(p.index1, q1)) cmp = 1;
-        else if (0u < p.index2) cmp = -1;   // q.index2 == 0
-        if (cmp == 0 || (u64Eq(q0, p.index0) && u64Eq(q1, p.index1)))
-            return true;
-        if (cmp < 0) r = mid; else l = mid + 1u;
-    }
-    return false;
-}
 
 // ---------------------------------------------------------------------------
 // LoadShapePair<eTRIANGLEMESH> (dataReadWriteHelper.cuh:292): the cloth is the
@@ -409,6 +379,16 @@ void loadClothRigidPair(uint64_t cmInputsAddr, uint64_t shapesAddr, uint cmIdx,
 // ===========================================================================
 groupshared uint sMidMask[MIDPHASE_WARPS];
 groupshared uint sMidStart[MIDPHASE_WARPS];
+
+// P9.38: the binary search over PxgRigidFilterPair now lives in pxgSlangDefFilter.
+// It was written out by hand fifteen times across this corpus; every copy was checked
+// against deformableElementFilter.cuh:67 and agreed, and that is exactly why they were
+// worth collapsing -- fifteen identical transcriptions are fifteen future chances to
+// re-derive one of them wrong.
+bool findRigid(uint64_t pairsAddr, uint nbPairs, uint2 q0, uint mask)
+{
+    return dfFindRigidPair(pairsAddr, nbPairs, q0, mask);
+}
 
 [shader("compute")]
 [numthreads(64, 1, 1)] // (WARP_SIZE, MIDPHASE_WARPS, 1) flattened
@@ -604,7 +584,7 @@ void cloth_planeVertContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : 
 
                 const uint clothMask = (femClothId << PXG_CLOTH_ID_SHIFT) | i;
                 // filter: drop the contact if (rigidId, clothMask) is filtered.
-                const bool filtered = findRigid(gCG.filterPairs, gCG.nbFilterPairs, rigidId, uint2(clothMask, 0u));
+                const bool filtered = findRigid(gCG.filterPairs, gCG.nbFilterPairs, rigidId, clothMask);
                 if (!filtered)
                 {
                     hasContact = true;
@@ -695,7 +675,7 @@ void cloth_SphereVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
         if (i < numVerts)
         {
             const uint clothMask = (femClothId << PXG_CLOTH_ID_SHIFT) | i;
-            const bool skipVertex = findRigid(gCG.filterPairs, gCG.nbFilterPairs, rigidId, uint2(clothMask, 0u));
+            const bool skipVertex = findRigid(gCG.filterPairs, gCG.nbFilterPairs, rigidId, clothMask);
             if (!skipVertex)
             {
                 const float4 cf = verts[i];
@@ -875,7 +855,7 @@ void cloth_boxVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : 
         {
             const uint clothMask = (femClothId << PXG_CLOTH_ID_SHIFT) | i;
             // V3: the filter runs FIRST on this path.
-            const bool skipVertex = findRigid(gCG.filterPairs, gCG.nbFilterPairs, rigidId, uint2(clothMask, 0u));
+            const bool skipVertex = findRigid(gCG.filterPairs, gCG.nbFilterPairs, rigidId, clothMask);
             if (!skipVertex)
             {
                 const float4 pf = verts[i];
@@ -1284,9 +1264,9 @@ void clothConvexTriCgBody(uint3 gtid, uint3 gid)
         const uint m1 = (clothId << PXG_CLOTH_ID_SHIFT) | triIdx.y;
         const uint m2 = (clothId << PXG_CLOTH_ID_SHIFT) | triIdx.z;
         const bool skipTriangle =
-            findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, uint2(m0, 0u)) &&
-            findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, uint2(m1, 0u)) &&
-            findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, uint2(m2, 0u));
+            findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, m0) &&
+            findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, m1) &&
+            findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, m2);
         if (skipTriangle)
             continue;
 
@@ -1462,7 +1442,7 @@ void cloth_convexVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
         const uint clothMask = (clothId << PXG_CLOTH_ID_SHIFT) | vertexIdx;
 
         // W3: a SINGLE match suppresses this vertex entirely.
-        if (findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, uint2(clothMask, 0u)))
+        if (findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, clothMask))
             continue;
 
         const PxsCachedTransform rtc = transformCache[rigidCacheRef];
@@ -1909,9 +1889,9 @@ void cloth_SphereContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
             const uint m1 = (clothId << PXG_CLOTH_ID_SHIFT) | triIdx.y;
             const uint m2 = (clothId << PXG_CLOTH_ID_SHIFT) | triIdx.z;
             const bool skipTriangle =
-                findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, uint2(m0, 0u)) &&
-                findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, uint2(m1, 0u)) &&
-                findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, uint2(m2, 0u));
+                findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, m0) &&
+                findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, m1) &&
+                findRigid(gBTri.filterPairs, gBTri.nbFilterPairs, rigidId, m2);
 
             if (!skipTriangle)
             {

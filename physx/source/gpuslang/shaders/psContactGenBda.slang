@@ -96,6 +96,7 @@
 //     (no particle cloud vs convex-core scene), matching the harness.
 
 import pxgSlangParticleDesc;
+import pxgSlangDefFilter;   // P9.38
 // P9.14b: the convex particle path.  All three are already-swept modules -- the
 // cooked-hull blob reader, the GJK driver and the GJK-then-EPA policy layer that
 // the softbody-vs-rigid path goes through.  particleConvexCollision
@@ -166,9 +167,6 @@ struct PxsCachedTransform
     uint flags;           // @28 -> 32
 }
 
-// PxgRigidFilterPair (PxgSimulationCoreDesc.h, 32 bytes): index0 u64, index1 u64,
-// index2 u32, padding[3].
-struct PairR { uint2 index0; uint2 index1; uint index2; uint pad0, pad1, pad2; }
 
 // ---------------------------------------------------------------------------
 // Push constant blob — BYTE-IDENTICAL to the CUDA PxCudaKernelParam pack.  Each
@@ -330,8 +328,6 @@ uint binarySearchRunSum(Ptr<uint> data, uint n, uint value)
 // (particleSystem, rigidId, compressedParticleId) rigid filter lookup
 // (deformableElementFilter.cuh:118).
 // ---------------------------------------------------------------------------
-bool u64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
-bool u64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
 
 uint findRange(Ptr<uint> values, uint length, uint value)
 {
@@ -345,28 +341,6 @@ uint findRange(Ptr<uint> values, uint length, uint value)
     return r - 1u;
 }
 
-// PxgRigidFilterPair::compare (index0 u64, index1 u64, index2 u32) with the
-// ignoreIndex2 early accept.
-bool findRigid(uint64_t pairsAddr, uint nbPairs, uint2 q0, uint2 q1)
-{
-    Ptr<PairR> pairs = Ptr<PairR>(pairsAddr);
-    uint l = 0u, r = nbPairs;
-    while (l < r)
-    {
-        const uint mid = (l + r) / 2u;
-        const PairR p = pairs[mid];
-        int cmp = 0;
-        if (u64Lt(q0, p.index0)) cmp = -1;
-        else if (u64Lt(p.index0, q0)) cmp = 1;
-        else if (u64Lt(q1, p.index1)) cmp = -1;
-        else if (u64Lt(p.index1, q1)) cmp = 1;
-        else if (0u < p.index2) cmp = -1;
-        if (cmp == 0 || (u64Eq(q0, p.index0) && u64Eq(q1, p.index1)))
-            return true;
-        if (cmp < 0) r = mid; else l = mid + 1u;
-    }
-    return false;
-}
 
 bool findPs(Ptr<PxgParticleSystemGpu> systems, uint psId, uint2 rigidId, uint2 compressedParticleId)
 {
@@ -378,7 +352,7 @@ bool findPs(Ptr<PxgParticleSystemGpu> systems, uint psId, uint2 rigidId, uint2 c
     const uint64_t pairsAddr = simBufs[id].mFilterPairs;
     const uint nbPairs = simBufs[id].mNumFilterPairs;
     const uint localId = particleId - runsum[id];
-    return findRigid(pairsAddr, nbPairs, rigidId, uint2(localId, 0u));
+    return findRigid(pairsAddr, nbPairs, rigidId, localId);
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +532,16 @@ void writeContact(uint index, float4 normalPen, uint2 compressedParticleIndex, u
 groupshared uint sRange[PS_BLOCK];    // per-thread cell population (block max)
 groupshared uint sMask[WARPS_PER_BLOCK];  // per-tile intersect ballot
 groupshared uint sStart[WARPS_PER_BLOCK]; // per-tile contact start index
+
+// P9.38: the binary search over PxgRigidFilterPair now lives in pxgSlangDefFilter.
+// It was written out by hand fifteen times across this corpus; every copy was checked
+// against deformableElementFilter.cuh:67 and agreed, and that is exactly why they were
+// worth collapsing -- fifteen identical transcriptions are fifteen future chances to
+// re-derive one of them wrong.
+bool findRigid(uint64_t pairsAddr, uint nbPairs, uint2 q0, uint mask)
+{
+    return dfFindRigidPair(pairsAddr, nbPairs, q0, mask);
+}
 
 [shader("compute")]
 [numthreads(256, 1, 1)]

@@ -63,6 +63,7 @@
 module softBodyClothVertContactGenBda;
 
 import pxgSlangSoftBodyDesc;
+import pxgSlangDefFilter;   // P9.38
 import pxgSlangFEMClothDesc;
 import pxgSlangTetClosest;   // getNormalized / isPointOutsideOfPlane4 / closestPtTetrahedron
 
@@ -74,7 +75,6 @@ static const uint PXG_BITSHIFT_ID = 20u;
 static const uint PX_MAX_NB_DEFORMABLE_VOLUME_TET = 0x000fffffu;
 static const uint PX_MAX_NB_DEFORMABLE_SURFACE_VTX = 0x000fffffu;
 
-static const uint64_t NRPAIR_STRIDE = 16UL;
 
 // The engine launches 512 blocks of 256 threads (PxgNarrowphaseCore.cpp:4805).  The bridge
 // ignores blockDim and dispatches groups of 32, so the thread-to-pair MAPPING differs from
@@ -155,32 +155,7 @@ uint byteAt(uint64_t base, uint idx)
 // PxgNonRigidFilterPair binary search.  SELECT THE POINTER, not the value -- see the長
 // discussion in softBodySelfCollisionBda; llvmpipe speculates the first load of a zero-trip
 // search and faults on a null filter address.
-bool u64Lt(uint2 a, uint2 b) { return (a.y != b.y) ? (a.y < b.y) : (a.x < b.x); }
-bool u64Eq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
 
-bool findFilter(uint64_t pairsAddr, uint nbPairs, uint id0, uint id1)
-{
-    const bool havePairs = (pairsAddr != 0UL) && (nbPairs != 0u);
-    const uint64_t base = havePairs ? pairsAddr : gVc.softbodies;
-
-    const uint2 q0 = uint2(id0, 0u);
-    uint l = 0u, r = havePairs ? nbPairs : 0u;
-    while (l < r)
-    {
-        const uint m = (l + r) >> 1u;
-        const uint64_t e = base + uint64_t(m) * NRPAIR_STRIDE;
-        const uint2 i0 = uint2(Ptr<uint>(e)[0], Ptr<uint>(e + 4UL)[0]);
-        const uint i1 = Ptr<uint>(e + 8UL)[0];
-        if (u64Lt(i0, q0) || (u64Eq(i0, q0) && i1 < id1)) l = m + 1u;
-        else r = m;
-    }
-    if (!havePairs || l >= nbPairs)
-        return false;
-    const uint64_t e = base + uint64_t(l) * NRPAIR_STRIDE;
-    const uint2 i0 = uint2(Ptr<uint>(e)[0], Ptr<uint>(e + 4UL)[0]);
-    const uint i1 = Ptr<uint>(e + 8UL)[0];
-    return u64Eq(i0, q0) && i1 == id1;
-}
 
 void loadSoftbodyClothPair(uint cmIdx, out PxgShape sbShape, out uint sbCacheRef,
                            out PxgShape clothShape, out uint clothCacheRef)
@@ -213,6 +188,19 @@ float4 computeTetBarycentric(float3 a, float3 b, float3 c, float3 d, float3 poin
 }
 
 // ===========================================================================
+// P9.38: the search itself now lives in pxgSlangDefFilter; only this kernel's own
+// null-pointer guard stays here, because only this kernel knows which of its buffers
+// is safe to point at when the filter list is null (see the module header).
+//
+// As its sibling softBodyClothContactGenBda, this was a lower-bound search rather
+// than the engine's loop.
+bool findFilter(uint64_t pairsAddr, uint nbPairs, uint id0, uint id1)
+{
+    const bool havePairs = (pairsAddr != 0UL) && (nbPairs != 0u);
+    return dfFindNonRigidPair(havePairs ? pairsAddr : gVc.softbodies,
+                              havePairs ? nbPairs : 0u, id0, id1);
+}
+
 [shader("compute")]
 [numthreads(32, 1, 1)]
 void sb_clothVertContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
