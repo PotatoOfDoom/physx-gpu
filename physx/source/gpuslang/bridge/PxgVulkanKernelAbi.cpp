@@ -769,6 +769,11 @@ static const uint8_t kClothVertMeshMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 4, 8, 
 // gpuShapes comes THIRD here (PxgNarrowphaseCore.cpp:3579), where the vertex-mesh
 // midphase has transformCache and bounds before it.  Same names, different slots.
 static const uint8_t kClothPsMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
+// P9.39a: sb_psMidphaseGeneratePairsLaunch takes the SAME twelve arguments in the
+// SAME order (PxgNarrowphaseCore.cpp params list :3369-3383) with softbodies where
+// femClothes is, so the row is identical -- 88 bytes.  Kept as its own array rather
+// than aliased: two kernels sharing one row is how a later divergence goes unnoticed.
+static const uint8_t kSbPsMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
 // P9.30: the contact gen it feeds.  Thirteen arguments, the last of them
 // PxgFEMContactWriter by value (80 B) -> the writer lands at 96, not 88, because
 // paramAlign(80) is 16 (P9.15e).
@@ -1829,6 +1834,7 @@ static const PxgKernelAbiRow kRows[] = {
     { "cloth_midphaseVertexMeshLaunch", kClothVertMeshMidphase, uint32_t(sizeof(kClothVertMeshMidphase)) },
     // gpunarrowphase FEMCloth-vs-PARTICLE midphase + contact gen (P9.30 BDA)
     { "cloth_psMidphaseGeneratePairsLaunch", kClothPsMidphase, uint32_t(sizeof(kClothPsMidphase)) },
+    { "sb_psMidphaseGeneratePairsLaunch", kSbPsMidphase, uint32_t(sizeof(kSbPsMidphase)) },
     { "cloth_psContactGenLaunch", kClothPsCg, uint32_t(sizeof(kClothPsCg)) },
     // gpusimulationcontroller FEMCloth-vs-PARTICLE constraint prep + solve (P9.31 BDA)
     { "cloth_particleContactPrepareLaunch", kClothPsPrepare, uint32_t(sizeof(kClothPsPrepare)) },

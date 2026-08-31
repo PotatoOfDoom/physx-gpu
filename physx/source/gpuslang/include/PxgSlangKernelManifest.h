@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 378;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 379;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -286,7 +286,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "sb_midphaseGeneratePairsLaunch", "softBodyContactGenBda.spv", "sb_midphaseGeneratePairsLaunch" },  // SB_MIDPHASE_PRIMITIVES (P8.2 tranche a BDA port)
     { "sb_primitiveContactGenLaunch", "softBodyContactGenBda.spv", "sb_primitiveContactGenLaunch" },  // SB_PRIMITIVES_CG (P8.2 tranche b BDA port — PLANE path only, see the shader header)
     { "sb_sbMidphaseGeneratePairsLaunch", "softBodySoftBodyMidphaseBda.spv", "sb_sbMidphaseGeneratePairsLaunch" },  // SB_SB_MIDPHASE (P8.9 BDA port -- the whole softbody-vs-softbody narrowphase)
-    { "sb_psMidphaseGeneratePairsLaunch", nullptr, nullptr },  // SB_PS_MIDPHASE (unmapped)
+    { "sb_psMidphaseGeneratePairsLaunch", "softBodyPsMidphaseBda.spv", "sb_psMidphaseGeneratePairsLaunch" },  // SB_PS_MIDPHASE (P9.39a BDA)
     { "sb_psContactGenLaunch", nullptr, nullptr },  // SB_PS_CG (unmapped)
     { "sb_clothMidphaseGeneratePairsLaunch", "softBodyClothMidphaseBda.spv", "sb_clothMidphaseGeneratePairsLaunch" },  // SB_CLOTH_MIDPHASE (P8.8 BDA port — the tet-bound BV32 walk over the cloth tree)
     { "sb_clothContactGenLaunch", "softBodyClothContactGenBda.spv", "sb_clothContactGenLaunch" },  // SB_CLOTH_CG (P8.8 step 2 BDA port — tet-vs-triangle GJK/EPA)

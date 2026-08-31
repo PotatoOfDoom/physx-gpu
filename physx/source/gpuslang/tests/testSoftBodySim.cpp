@@ -50,6 +50,7 @@
 #include "PxDeformableVolumeFlag.h"          // PxDeformableVolumeFlag::ePARTIALLY_KINEMATIC
 #include "PxgSolverBody.h"                   // PxgSolverBodyData / PxgSolverTxIData (P8.2 tranche d)
 #include "PxgFEMCloth.h"                     // real engine per-cloth descriptor (P8.8 softbody-vs-cloth)
+#include "PxgParticleSystem.h"               // real engine per-particle-system descriptor (P9.39a)
 
 #include <cstdint>
 #include <cstddef>
@@ -2215,6 +2216,274 @@ struct PxgShapeHost
 };
 static_assert(sizeof(PxgShapeHost) == 48, "PxgShape mirror must be 48 bytes");
 static const uint32_t GEOM_TETRAHEDRONMESH_H = 7u;   // PxGeometryType::eTETRAHEDRONMESH
+
+// ===========================================================================
+// P9.39a -- sb_psMidphaseGeneratePairsLaunch, the softbody-vs-PARTICLE midphase.
+//
+// The TET twin of cloth_psMidphaseGeneratePairsLaunch (P9.30) and the first of the
+// six kernels of the last unmapped softbody chain.  It shares this file rather than
+// starting a new one because the tetrahedron mesh, the BV32 TreeBlob and the shape
+// plumbing are all already here -- duplicating them is the duplication this port
+// exists to avoid.
+//
+// WHAT THIS RIG HAS THAT THE CLOTH SIBLING'S DOES NOT: a DEGENERATE tetrahedron
+// sitting exactly where a particle would otherwise hit it.  softbodyMidPhase.cu:287
+// gates the bound test on `isValidTet` (signed volume > 1e-9), and the cloth
+// traverser has no such gate, so a port that clones the cloth one emits a pair there.
+// The scene is built so that tet is INSIDE the query box: only the gate can exclude
+// it, and the expected set says it is excluded.
+// ---------------------------------------------------------------------------
+struct SbPsMidphasePush
+{
+    uint32_t numWorkItems; float toleranceLength;
+    uint64_t cmInputs, gpuShapes, transformCache, bounds, contactDistance, softbodies,
+             particleSystems;
+    uint32_t stackSizeBytes, pad68;
+    uint64_t stackPtr, midphasePairsNum;
+};
+static_assert(sizeof(SbPsMidphasePush) == 88, "sb ps midphase blob must be 88 bytes");
+static_assert(offsetof(SbPsMidphasePush, gpuShapes) == 16, "gpuShapes @16 -- THIRD");
+static_assert(offsetof(SbPsMidphasePush, softbodies) == 48, "softbodies @48");
+static_assert(offsetof(SbPsMidphasePush, particleSystems) == 56, "particleSystems @56");
+static_assert(offsetof(SbPsMidphasePush, stackSizeBytes) == 64, "stackSizeBytes @64");
+static_assert(offsetof(SbPsMidphasePush, stackPtr) == 72, "stackPtr @72");
+static_assert(offsetof(SbPsMidphasePush, midphasePairsNum) == 80, "midphasePairsNum @80");
+
+static const uint32_t GEOM_PARTICLESYSTEM_H2 = 6u;   // PxGeometryType::ePARTICLESYSTEM
+
+PXG_TEST(softBodySimPsMidphase)
+{
+    using namespace p80refit;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t SB_ID = 1u, PS_ID = 2u;
+    // ASYMMETRIC on purpose, as the sibling rig learned to be: 0.24 + 0.06 = 0.30, and
+    // one tet is placed so that NEITHER half alone reaches it.  With equal halves a
+    // port that used only one of the two contact distances still passed.
+    const float CD_PARTICLE = 0.24f, CD_SOFTBODY = 0.06f;
+    const float R = CD_PARTICLE + CD_SOFTBODY;
+
+    // ---- tets.  Each owns its four vertices so it can be moved or degenerated
+    // without disturbing its neighbours.
+    std::vector<F4> verts;
+    auto pushTet = [&](float ox, float oy, float oz, bool degenerate) {
+        verts.push_back(F4{ ox,        oy,        oz,        1.0f });
+        verts.push_back(F4{ ox + 0.4f, oy,        oz,        1.0f });
+        verts.push_back(F4{ ox,        oy + 0.4f, oz,        1.0f });
+        // a degenerate tet puts the 4th corner ON the plane of the other three, so
+        // its BOUND still overlaps but its signed volume is 0
+        verts.push_back(degenerate ? F4{ ox + 0.2f, oy + 0.1f, oz, 1.0f }
+                                   : F4{ ox,        oy,        oz + 0.4f, 1.0f });
+    };
+    pushTet(0.0f, 0.0f, 0.0f, false);    // tet 0 -- a particle sits right on it
+    pushTet(1.0f, 0.0f, 0.0f, false);    // tet 1 -- reached only together with tet 2
+    pushTet(1.5f, 0.0f, 0.0f, false);    // tet 2 -- ditto, one particle reaches BOTH
+    pushTet(3.0f, 0.0f, 0.0f, true);     // tet 3 -- DEGENERATE, inside the box (T2)
+    pushTet(5.0f, 0.0f, 0.0f, false);    // tet 4 -- only the FULL sum of CDs reaches it
+    pushTet(80.0f, 80.0f, 80.0f, false); // tet 5 -- far outside everything
+
+    const uint32_t NB_TETS = 6u;
+    std::vector<TetIdx4> tets;
+    for (uint32_t t = 0; t < NB_TETS; ++t)
+        tets.push_back(TetIdx4{ 4u * t + 0u, 4u * t + 1u, 4u * t + 2u, 4u * t + 3u });
+
+    DevBuf bVerts = makeDev(dev, verts);
+    if (!bVerts.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bVerts.h); return; }
+    DevBuf bTets = makeDev(dev, tets);
+
+    // One root node whose children are all LEAVES, one tet each, with GENEROUS child
+    // bounds: every child overlaps every query, so the node-level cull can never stand
+    // in for the primitive-level predicate the mirror computes.
+    const uint32_t nbNodes = 1u, maxDepth = 1u;
+    TreeBlob tree;
+    tree.w.assign(4u + nbNodes * BV32_WORDS + maxDepth * 2u + nbNodes + 4u, 0u);
+    tree.w[0] = uint32_t(verts.size());
+    tree.w[1] = NB_TETS;
+    tree.w[2] = maxDepth;
+    tree.w[3] = nbNodes;
+    const uint32_t nw = tree.nodeWord(0);
+    tree.w[nw + W_NBNODES] = NB_TETS;
+    for (uint32_t k = 0; k < NB_TETS; ++k)
+    {
+        const float lo = -1000.0f, hi = 1000.0f;
+        tree.w[nw + W_MMIN + k * 4 + 0] = f2u(lo);
+        tree.w[nw + W_MMIN + k * 4 + 1] = f2u(lo);
+        tree.w[nw + W_MMIN + k * 4 + 2] = f2u(lo);
+        tree.w[nw + W_MMAX + k * 4 + 0] = f2u(hi);
+        tree.w[nw + W_MMAX + k * 4 + 1] = f2u(hi);
+        tree.w[nw + W_MMAX + k * 4 + 2] = f2u(hi);
+        // leaf holding exactly tet k -- the file's own encoder, not a hand-rolled one
+        tree.w[nw + W_MDATA + k] = leafWord(k, 1u);
+    }
+    DevBuf bTree = makeDev(dev, tree.w);
+
+    PxgSoftBody sb = makeZeroDesc();
+    sb.mTetMeshData = reinterpret_cast<void*>(size_t(bTree.addr));
+    sb.mTetIndices = reinterpret_cast<decltype(sb.mTetIndices)>(size_t(bTets.addr));
+    sb.mPosition_InvMass = reinterpret_cast<float4*>(size_t(bVerts.addr));
+    sb.mNumTets = NB_TETS;
+    sb.mNumVerts = uint32_t(verts.size());
+    std::vector<PxgSoftBody> descArr(SB_ID + 1u, makeZeroDesc());
+    descArr[SB_ID] = sb;
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- particles ------------------------------------------------------------
+    std::vector<F4> parts = {
+        { 0.10f,  0.10f,  0.10f, 1.0f },   // inside tet 0's bound
+        { 1.45f,  0.00f,  0.00f, 1.0f },   // between tets 1 and 2: reaches BOTH
+        { 3.20f,  0.05f,  0.00f, 1.0f },   // inside the DEGENERATE tet 3's bound (T2)
+        { 5.00f, -0.28f,  0.00f, 1.0f },   // below tet 4: only 0.24 + 0.06 reaches it
+        { 40.0f,  40.0f,  40.0f, 1.0f },   // nowhere near anything
+    };
+    const uint32_t NB_PARTICLES = uint32_t(parts.size());
+    DevBuf bParts = makeDev(dev, parts);
+
+    std::vector<PxgParticleSystem> psArr(PS_ID + 1u);
+    std::memset(psArr.data(), 0, psArr.size() * sizeof(PxgParticleSystem));
+    psArr[PS_ID].mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bParts.addr));
+    psArr[PS_ID].mCommonData.mNumParticles = NB_PARTICLES;
+    DevBuf bPs = makeDev(dev, psArr);
+
+    // ---- shapes.  TWO managers with the particle system in OPPOSITE slots, so the
+    // routing by TYPE (T4) is separable from slot order.
+    std::vector<PxgShapeHost> shapes(2);
+    std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
+    shapes[0].type = GEOM_PARTICLESYSTEM_H2;  shapes[0].particleOrSoftbodyId = PS_ID;
+    shapes[0].sx = shapes[0].sy = shapes[0].sz = 1.0f; shapes[0].srw = 1.0f;
+    shapes[1].type = GEOM_TETRAHEDRONMESH_H;  shapes[1].particleOrSoftbodyId = SB_ID;
+    shapes[1].sx = shapes[1].sy = shapes[1].sz = 1.0f; shapes[1].srw = 1.0f;
+    DevBuf bShapes = makeDev(dev, shapes);
+
+    // cache ref 0 = particle system (CD 0.24), 1 = softbody (CD 0.06).
+    std::vector<CmInputHost> cms = { { 0u, 1u, 0u, 1u }, { 1u, 0u, 1u, 0u } };
+    DevBuf bCms = makeDev(dev, cms);
+    std::vector<float> cd = { CD_PARTICLE, CD_SOFTBODY };
+    DevBuf bCd = makeDev(dev, cd);
+    std::vector<float> xf(2 * 8, 0.0f); xf[3] = 1.0f; xf[8 + 3] = 1.0f;   // ABI parity only
+    DevBuf bXf = makeDev(dev, xf);
+    std::vector<float> dummyBounds(2 * 6, 0.0f);                          // ABI parity only
+    DevBuf bBounds = makeDev(dev, dummyBounds);
+
+    // The stack holds FEWER pairs than the query finds, so "drop the pair, keep
+    // counting" is measured rather than assumed.
+    const uint32_t NB_ALLOC = 128u;
+    const uint32_t STACK_PAIRS = 5u;
+    const uint32_t POISON2 = 0xEEEEEEEEu;
+    std::vector<uint32_t> stack(NB_ALLOC * 4u, POISON2);
+    DevBuf bStack = makeDev(dev, stack);
+    std::vector<uint32_t> zero = { 0u };
+    DevBuf bNum = makeDev(dev, zero);
+
+    SbPsMidphasePush p = {};
+    p.numWorkItems = uint32_t(cms.size());
+    p.toleranceLength = 1.0f;
+    p.cmInputs = bCms.addr; p.gpuShapes = bShapes.addr; p.transformCache = bXf.addr;
+    p.bounds = bBounds.addr; p.contactDistance = bCd.addr;
+    p.softbodies = bDesc.addr; p.particleSystems = bPs.addr;
+    p.stackSizeBytes = STACK_PAIRS * 16u;
+    p.stackPtr = bStack.addr; p.midphasePairsNum = bNum.addr;
+
+    Kernel k("softBodyPsMidphaseBda.spv", "sb_psMidphaseGeneratePairsLaunch",
+             {}, sizeof(SbPsMidphasePush));
+    k.dispatch(1024u, {}, p, uint32_t(cms.size()), 1u);   // grid (1024, numWorkItems, 1)
+    dev->flush();
+
+    // ---- the expected set -----------------------------------------------------
+    struct Pair { uint32_t cm, particle, tet; };
+    std::vector<Pair> expected;
+    uint32_t degenerateSuppressed = 0u, sumOnly = 0u;
+    for (uint32_t cm = 0; cm < uint32_t(cms.size()); ++cm)
+        for (uint32_t pi = 0; pi < NB_PARTICLES; ++pi)
+        {
+            const float cx = parts[pi].x, cy = parts[pi].y, cz = parts[pi].z;
+            for (uint32_t t = 0; t < NB_TETS; ++t)
+            {
+                const F4& a = verts[t * 4 + 0]; const F4& b = verts[t * 4 + 1];
+                const F4& c = verts[t * 4 + 2]; const F4& d = verts[t * 4 + 3];
+                // isValidTet: dot(b - a, cross(c - a, d - a)) > 1e-9  (T2)
+                const float e1x = b.x - a.x, e1y = b.y - a.y, e1z = b.z - a.z;
+                const float e2x = c.x - a.x, e2y = c.y - a.y, e2z = c.z - a.z;
+                const float e3x = d.x - a.x, e3y = d.y - a.y, e3z = d.z - a.z;
+                const float crx = e2y * e3z - e2z * e3y;
+                const float cry = e2z * e3x - e2x * e3z;
+                const float crz = e2x * e3y - e2y * e3x;
+                const bool valid = (e1x * crx + e1y * cry + e1z * crz) > 1e-9f;
+
+                const float tMinX = std::min(std::min(a.x, b.x), std::min(c.x, d.x));
+                const float tMinY = std::min(std::min(a.y, b.y), std::min(c.y, d.y));
+                const float tMinZ = std::min(std::min(a.z, b.z), std::min(c.z, d.z));
+                const float tMaxX = std::max(std::max(a.x, b.x), std::max(c.x, d.x));
+                const float tMaxY = std::max(std::max(a.y, b.y), std::max(c.y, d.y));
+                const float tMaxZ = std::max(std::max(a.z, b.z), std::max(c.z, d.z));
+                const bool overlap = !(tMinX > cx + R || cx - R > tMaxX ||
+                                       tMinY > cy + R || cy - R > tMaxY ||
+                                       tMinZ > cz + R || cz - R > tMaxZ);
+
+                if (overlap && !valid) ++degenerateSuppressed;
+                // would EITHER half alone have reached it?
+                if (overlap && valid)
+                {
+                    const float half = std::max(CD_PARTICLE, CD_SOFTBODY);
+                    const bool halfHit = !(tMinX > cx + half || cx - half > tMaxX ||
+                                           tMinY > cy + half || cy - half > tMaxY ||
+                                           tMinZ > cz + half || cz - half > tMaxZ);
+                    if (!halfHit) ++sumOnly;
+                }
+                if (overlap && valid) expected.push_back(Pair{ cm, pi, t });
+            }
+        }
+
+    // The rig only means something if it actually exercises what it claims to.
+    PXG_CHECK_MSG(degenerateSuppressed > 0u,
+                  "no particle's box overlaps the DEGENERATE tet, so the isValidTet gate "
+                  "(T2) is never the thing that excludes a pair and a port without it passes");
+    PXG_CHECK_MSG(sumOnly > 0u,
+                  "every hit is reachable with only the LARGER of the two contact distances, "
+                  "so a port that reads one instead of their sum still passes");
+    PXG_CHECK_MSG(expected.size() > STACK_PAIRS,
+                  "the rig found %zu pairs against a %u-pair stack; it must OVERFLOW or the "
+                  "drop-but-keep-counting behaviour is not measured", expected.size(), STACK_PAIRS);
+
+    const uint32_t found = downloadBuffer<uint32_t>(dev, bNum.h, 1)[0];
+    PXG_CHECK_MSG(found == uint32_t(expected.size()),
+                  "the midphase COUNTER reads %u, the mirror says %zu.  The counter takes every "
+                  "hit even when the stack cannot hold it", found, expected.size());
+
+    const auto st = downloadBuffer<uint32_t>(dev, bStack.h, NB_ALLOC * 4u);
+    uint32_t written = 0u, bad = 0u;
+    for (uint32_t i = 0; i < NB_ALLOC; ++i)
+    {
+        if (st[i * 4] == POISON2) continue;
+        ++written;
+        if (i >= STACK_PAIRS) { ++bad; continue; }
+        const uint32_t cm = st[i * 4 + 0], pi = st[i * 4 + 1], tet = st[i * 4 + 2];
+        const uint32_t w = st[i * 4 + 3];
+        if (w != 0u)
+        {
+            ++bad;
+            std::printf("  slot %u has .w = %u; the CUDA writes make_uint4(cm, query, prim, 0)\n", i, w);
+            continue;
+        }
+        bool member = false;
+        for (const Pair& e : expected)
+            if (e.cm == cm && e.particle == pi && e.tet == tet) { member = true; break; }
+        if (!member)
+        {
+            ++bad;
+            std::printf("  slot %u holds (cm %u, particle %u, tet %u), not an expected pair -- "
+                        "T1 puts the PARTICLE in .y and the TET in .z\n", i, cm, pi, tet);
+        }
+    }
+    PXG_CHECK_MSG(bad == 0u, "%u written pairs are wrong or past the stack bound", bad);
+    PXG_CHECK_MSG(written == STACK_PAIRS,
+                  "%u slots written, expected exactly the %u the stack holds", written, STACK_PAIRS);
+
+    std::printf("    [ note ] %zu pairs over %u particles x %u tets x %zu managers; %u suppressed "
+                "by isValidTet, %u reachable only with the SUM of both contact distances; "
+                "%u written into a %u-pair stack, counter %u\n",
+                expected.size(), NB_PARTICLES, NB_TETS, cms.size(), degenerateSuppressed,
+                sumOnly, written, STACK_PAIRS, found);
+}
 
 PXG_TEST(softBodySimMidphaseGeneratePairs)
 {
