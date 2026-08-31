@@ -2329,3 +2329,36 @@ add_test(NAME gpuslang.disabledKernels
 # cutil_math.h:337 float3/float3 is componentwise), so only the splat is flagged.
 add_test(NAME gpuslang.vectorDivide
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_vector_divide.py)
+
+# ---------------------------------------------------------------------------
+# Replicated engine helpers must agree (P9.37).
+#
+# This corpus writes the same engine helper out by hand over and over -- 69 copies
+# of PxQuat::rotate, 62 of rotateInv, 19 of closestPtPointTriangle2.  Copies are the
+# risk, and the two preceding tranches both ended on one: P9.36 found an engine
+# block ported FOUR times with one copy dividing where the other three multiplied,
+# and P9.37 found rotateInv written 63 times with ONE copy carrying an
+# algebraically-equivalent but bitwise-different form.  That copy fed the softbody
+# plane path, where the value both gates contact existence and is written out as the
+# penetration the solver consumes -- and the file's own comment had already said
+# that a last-bit difference matters, while handing the different form over anyway.
+#
+# No fixture saw it, for the reason P9.36 measured in detail: the fixture's geometry
+# is exact by construction (a 45-degree quaternion, an axis-aligned plane), so the
+# two forms agree there and the mutant is unreachable.  Source-level review did not
+# see it either -- clustering the 340 copies by source tokens produced 48 shapes of
+# which every one examined was a false split (statement decomposition, `1` vs `1u`,
+# helper renaming), which buries a real difference in noise.
+#
+# So the check reads what the GPU actually runs: it clusters same-named functions in
+# the built SPIR-V by the expression DAG they compute.  The compiler has already
+# inlined single-use temporaries, so naming and decomposition disappear, and hashing
+# each value's subtree rather than the instruction stream removes scheduling too.
+# What survives is association -- which is precisely the property at issue.
+#
+# Its control is its own: the selftest asserts that reordering two independent
+# instructions does NOT change the hash and that re-associating a product DOES.  A
+# screen failing either would be silently useless, and an earlier draft of this file
+# failed the first.
+add_test(NAME gpuslang.helperUniformity
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_helper_uniformity.py)

@@ -549,17 +549,27 @@ float3 cgQuatRotate(float4 q, float3 v)
                   vz * w2 + (q.x * vy - q.y * vx) * q.w + q.z * dot2);
 }
 
-float3 quatRotateInv(float4 q, float3 v)
-{
-    const float w = q.w;
-    const float3 u = float3(q.x, q.y, q.z);
-    const float vx = w * w - dot(u, u);
-    return v * vx - cross(u, v) * (w * 2.0f) + u * (dot(u, v) * 2.0f);
-}
-// PxQuat::rotateInv (PxQuat.h:324), transcribed term for term.  `quatRotateInv` above is a
-// DIFFERENT, algebraically equivalent form that the plane path has always used; the hull
-// decode gets the literal one because vertex2Shape applies it to every hull vertex and the
-// result feeds GJK, where a last-bit difference can flip a support-vertex choice.
+// P9.37 REMOVED a second, algebraically-equivalent rotateInv from this file.  It was
+//
+//     const float w = q.w; const float3 u = q.xyz;
+//     const float vx = w * w - dot(u, u);
+//     return v * vx - cross(u, v) * (w * 2.0f) + u * (dot(u, v) * 2.0f);
+//
+// and the plane path at the bottom of this file was its only caller.  Its own comment
+// said the hull decode gets the LITERAL transcription "because vertex2Shape applies it to
+// every hull vertex and the result feeds GJK, where a last-bit difference can flip a
+// support-vertex choice" -- which concedes the two forms differ in the last bit, and then
+// hands the different one to the plane path anyway.
+//
+// The plane path's engine origin is softbodyPrimitives.cu:268,
+// `pInPlaneSpace = planeTransform.transformInv(vB)`, and PxTransform::transformInv is
+// `q.rotateInv(input - p)` (PxTransform.h) -- the literal PxQuat::rotateInv, the same
+// function the hull decode gets.  The difference is observable twice over: pInPlaneSpace.x
+// gates contact existence through `cDistance >= pInPlaneSpace.x`, and it is written out as
+// the penetration the solver consumes.  Of 63 rotateInv copies in this corpus the SPIR-V
+// says 62 share one arithmetic DAG; this was the one that did not.
+//
+// PxQuat::rotateInv (PxQuat.h:324), transcribed term for term.
 float3 cgQuatRotateInv(float4 q, float3 v)
 {
     const float vx = 2.0f * v.x, vy = 2.0f * v.y, vz = 2.0f * v.z;
@@ -844,7 +854,7 @@ void sb_primitiveContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
                 const float3 wp = verts[corner].xyz;
                 // A PxPlane's surface is x == 0 in plane space, so the signed distance is
                 // the transformed point's x component.
-                const float3 pInPlaneSpace = quatRotateInv(planeQ, wp - planeP);
+                const float3 pInPlaneSpace = cgQuatRotateInv(planeQ, wp - planeP);   // P9.37
                 if (cDistance >= pInPlaneSpace.x)
                 {
                     intersect = true;

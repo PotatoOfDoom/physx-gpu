@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **833/833** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **834/834** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.33a added `gpuslang.npFloatIntrinRecipSqrt`, which is not a kernel port but a
 PLATFORM measurement: about forty shaders here spell `PxVec3::getNormalized` as
 `v * rsqrt(m)`, while the engine computes `PxRecipSqrt` = `1.0f/sqrtf` — two exactly
@@ -1747,6 +1747,135 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.37 — 340 handgeschriebene Kopien, eine davon anders, und ein Sieb, das dreimal sich selbst widerlegt hat
+
+Kein Kernel-Port. Manifest **unverändert bei 378**. Suite **833 → 834**:
+`gpuslang.helperUniformity`, der **sechste** statische Prüfer.
+
+### Die Frage
+
+P9.36 endete auf einer Fehlerklasse, die sein eigener Prüfer bauartbedingt nicht
+sieht: **gleiche Operatoren, andere Klammerung**. Drei von einundzwanzig Kopien
+eines baryzentrischen Schwanzes summierten zuerst und skalierten danach, wo die
+Engine die beiden **Skalare** zuerst skaliert. Diese Tranche fragt das
+systematisch: Wie viele Engine-Hilfsfunktionen schreibt dieser Korpus von Hand aus,
+und rechnen alle Kopien dasselbe?
+
+Die Antwort auf die erste Hälfte: **340 Definitionen** über sieben Familien —
+allein **69** Kopien von `PxQuat::rotate`, **63** von `rotateInv`, **19** von
+`closestPtPointTriangle2`.
+
+### Ein Sieb, das nicht funktioniert hat
+
+Der erste Versuch gruppierte die Kopien nach **Quelltext-Tokens**: 340 Kopien, 48
+verschiedene Formen. Klingt nach viel Arbeit und war fast nur Rauschen. Jede von
+Hand nachgeprüfte Form war ein **Fehlschnitt**:
+
+* `closestPtPointTriangle2` in `npSbSb` schreibt `a + ab * (vb * denom) + ...`,
+  in `fcPrim2` steht `v = vb * denom; ... a + ab * v + ...` — dieselbe Arithmetik,
+  zwei benannte Zwischenwerte mehr;
+* ein `1` gegen ein `1u` im Hint-Test von `closestPtTetrahedron`;
+* `extractRotation2D` einmal als Ausdruck, einmal in Einzelanweisungen zerlegt.
+
+Ein Sieb, das so viel Rauschen erzeugt, **begräbt** den echten Unterschied.
+
+### Das Sieb, das funktioniert
+
+Also nicht den Quelltext lesen, sondern das, **was die GPU ausführt**: die
+gebauten SPIR-V-Module, gruppiert nach dem **Ausdrucksgraphen**, den jede Funktion
+berechnet. Der Compiler hat die einfach benutzten Zwischenwerte da längst
+eingesetzt — Benennung und Zerlegung verschwinden von selbst.
+
+Es hat drei Anläufe gebraucht, und alle drei Fehler waren meine:
+
+1. **Emissionsreihenfolge.** Der erste Entwurf verkettete die Instruktionen in
+   Ausgabereihenfolge und meldete `closestPtPointTriangle2` als zwei Formen — der
+   einzige Unterschied war, dass ein unabhängiges `FMul` zwei Plätze früher stand.
+   Zwei unabhängige Multiplikationen runden jede ihre eigenen Operanden, egal wann
+   sie ausgegeben werden. Behoben, indem **jeder Wert als Baum** gehasht wird statt
+   der Instruktionsfolge.
+2. **Die ExtInst-Satz-Id.** `rsqrt` ist eine `ExtInst`, deren erster Operand die
+   Id des importierten Befehlssatzes ist — **modulabhängig**. Gleiche Quelle,
+   andere Prüfsumme.
+3. **Die ExtInst-Nummer als Id gelesen.** Nach Fix 2 blieb die Befehlsnummer (32 =
+   InverseSqrt) in der Operandenliste stehen und wurde als SSA-Id aufgelöst; in
+   einem Modul benannte die 32 zufällig eine Konstante, im anderen nichts.
+
+Nach allen dreien fallen `npPolyClip4` und `fcPrim` zusammen, wie sie es sollen.
+**Das Sieb trägt jetzt seine eigene Kontrolle**: der Selbsttest verlangt, dass das
+Vertauschen zweier unabhängiger Instruktionen die Prüfsumme **nicht** ändert und
+das Umklammern eines Produkts sie **doch** ändert. Eine absichtlich
+assoziationsblinde Variante fällt darin durch.
+
+### Der eine echte Fund
+
+`quatRotateInv`: **62 Kopien teilen einen Graphen, eine nicht** —
+`softBodyContactGenBda.slang`. Sie trug zwei Fassungen nebeneinander und einen
+Kommentar, der die Sache selbst entscheidet:
+
+> „`quatRotateInv` oben ist eine ANDERE, algebraisch äquivalente Form, die der
+> Ebenen-Pfad immer benutzt hat; die Hüllen-Dekodierung bekommt die wörtliche, weil
+> `vertex2Shape` sie auf jeden Hüllvertex anwendet und das Ergebnis in GJK läuft,
+> **wo ein Unterschied im letzten Bit eine Stützvertex-Wahl kippen kann**."
+
+Der Satz räumt ein, dass die beiden Formen sich im letzten Bit unterscheiden — und
+reicht die abweichende dann dem Ebenen-Pfad. Dessen Engine-Ursprung ist
+`softbodyPrimitives.cu:268`, `planeTransform.transformInv(vB)`, und
+`PxTransform::transformInv` ist `q.rotateInv(input - p)`: **dieselbe wörtliche
+`PxQuat::rotateInv`**, die die Hüllen-Dekodierung bekommt.
+
+Und es ist **zweifach beobachtbar**: `pInPlaneSpace.x` entscheidet über
+`cDistance >= pInPlaneSpace.x`, ob überhaupt ein Kontakt entsteht, und wird als
+`pen` — die Durchdringung, die der Löser verbraucht — hinausgeschrieben. Die
+algebraische Fassung ist entfernt, der Ebenen-Pfad ruft jetzt die wörtliche.
+
+Die Vorrichtung bleibt grün, und zwar aus dem Grund, den P9.36 ausgemessen hat:
+ihr Aufbau ist **exakt konstruiert** (45-Grad-Quaternion, achsenparallele Ebene),
+und dort stimmen beide Fassungen überein. Der Fund steht auf der Engine, nicht auf
+der Vorrichtung.
+
+### Was sich als treu erwiesen hat
+
+Alles Übrige — und das ist das eigentliche Ergebnis, nicht ein leeres Blatt:
+
+* **Ein Graph für alle**: `quatRotate` 69, `quatRotQ` 13, `quatRotInvQ` 10,
+  `closestPtPointTriangle2` 19, `closestPtTetrahedron` 7, `closestPtPointTriangle`
+  5, `closestPtLineLine` 4, `extractRotation2D` 5, `getNormalized3` 4.
+* `computeBarycentric` und `computeTetBarycentric` tragen zwei bzw. drei Formen —
+  **mit und ohne das eps-Akzeptanzprädikat**. Mehrere Aufrufstellen verwerfen den
+  bool der Engine (`fcStaticTriCloth.slang:214` sagt es), und dort erzeugen die
+  Kopien nur den float4. Die baryzentrische Arithmetik ist identisch.
+* Und eine hübsche Bestätigung nebenbei: **upstream selbst rechnet dasselbe
+  Baryzentrum zweimal verschieden** — `femClothPrimitives.cu:127` mit **zwei
+  Skalar-Divisionen**, `softbodyPrimitives.cu:97` mit einem **Kehrwert**. Der Port
+  spiegelt beide korrekt. Die Zersplitterung dieser Familie ist begründet.
+* `getNormalized` hat drei akzeptierte Schreibweisen: `v * rsqrt(m)`,
+  `v * (1.0f/sqrt(m))` — P9.33a hat die beiden über 258442 Eingaben bitgleich
+  **gemessen** — und `npCvxTriWorldNormal`s ausgeschriebenes `dotX(v,v)` statt der
+  `dot`-Intrinsik, was `magnitudeSquared()` wörtlich ist.
+* Die `pxgShfl*`-Ausreißer sind durchweg `npWarpNative`: der native
+  Subgroup-Pfad gegen den Emulationspfad, so gebaut seit P2.1.
+* `byteAt` und `mat33FromQuat` sind Namensgleichheit bei verschiedenen Signaturen.
+
+### Das Tor
+
+`gpuslang.helperUniformity` fixiert **200 Kopien von elf Hilfsfunktionen auf je
+genau einen Arithmetikgraphen**, mit der Mindest-Kopienzahl daneben, damit ein
+stillschweigend verschwundener Aufrufer auffällt. Die vierzehn Namen, die
+berechtigt mehrere Formen tragen, stehen mit **Begründung** in einer eigenen
+Liste — nicht damit sie ignoriert werden, sondern damit niemand sie später ins Tor
+schiebt und einen richtigen Unterschied „repariert".
+
+### Verifikation
+
+* Sieb-Selbsttest grün; eine absichtlich assoziationsblinde Variante fällt durch;
+* der Ausreißer gegen die zitierte Engine-Zeile entschieden
+  (`softbodyPrimitives.cu:268` → `PxTransform::transformInv` → `PxQuat::rotateInv`),
+  nicht gegen ein Muster im Slang;
+* Suite **833/833** vor dem neuen Prüfer, **834/834** mit ihm;
+* Ein Werkzeug, das ich zweimal falsch gebaut habe, bevor es getaugt hat — und das
+  ist der Grund, warum es jetzt eine Kontrolle trägt.
 
 ## P9.36 — eine Division, die es in der Engine gar nicht gibt, und die Hausregel, die sie vorgeschrieben hat
 
