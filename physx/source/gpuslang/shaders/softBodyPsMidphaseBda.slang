@@ -79,6 +79,16 @@
 //     clamped; the sentinel still decides the VALUE, and it is the sentinel that
 //     goes into the pair.
 //
+//     WRITING `safePrim` INTO THE PAIR INSTEAD IS AN EQUIVALENT MUTANT, and the
+//     sweep left it standing.  It is a proof rather than a gap: a pair is pushed only
+//     when `intersect` is true, `intersect` can only be true under
+//     `primitiveIndex != 0xffffffff`, and there primitiveIndex == lane + primStartIndex
+//     with lane < nbPrimitives, so primitiveIndex <= primStartIndex + nbPrimitives - 1
+//     and the min that forms safePrim is a no-op.  The two are equal on every pair that
+//     is ever written, so no fixture can separate them.  The sentinel form is kept
+//     because it is what the CUDA says, and because the equality stops holding the
+//     moment a lane past the count is allowed to push.
+//
 // T7 -- NO TRANSFORM AND NO SCALE.  Both the softbody's collision vertices and the
 //     particles are already world-space; transformCache and bounds are in the blob
 //     for ABI parity and are never read.  The softbody-vs-MESH midphase next door
