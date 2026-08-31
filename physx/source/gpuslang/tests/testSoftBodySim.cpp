@@ -2260,29 +2260,36 @@ PXG_TEST(softBodySimPsMidphase)
     // ASYMMETRIC on purpose, as the sibling rig learned to be: 0.24 + 0.06 = 0.30, and
     // one tet is placed so that NEITHER half alone reaches it.  With equal halves a
     // port that used only one of the two contact distances still passed.
-    const float CD_PARTICLE = 0.24f, CD_SOFTBODY = 0.06f;
+    // DYADIC on purpose: 0.25 + 0.0625 = 0.3125 exactly, so a particle can be placed
+    // where cx + R lands EXACTLY on a tet's tMin and the strict/loose boundary of the
+    // overlap test becomes reachable.  Still asymmetric, so reading one instead of the
+    // sum is still separable.
+    const float CD_PARTICLE = 0.25f, CD_SOFTBODY = 0.0625f;
     const float R = CD_PARTICLE + CD_SOFTBODY;
 
     // ---- tets.  Each owns its four vertices so it can be moved or degenerated
     // without disturbing its neighbours.
     std::vector<F4> verts;
+    // side 0.5 -- dyadic, so every vertex coordinate is exact
     auto pushTet = [&](float ox, float oy, float oz, bool degenerate) {
         verts.push_back(F4{ ox,        oy,        oz,        1.0f });
-        verts.push_back(F4{ ox + 0.4f, oy,        oz,        1.0f });
-        verts.push_back(F4{ ox,        oy + 0.4f, oz,        1.0f });
-        // a degenerate tet puts the 4th corner ON the plane of the other three, so
-        // its BOUND still overlaps but its signed volume is 0
-        verts.push_back(degenerate ? F4{ ox + 0.2f, oy + 0.1f, oz, 1.0f }
-                                   : F4{ ox,        oy,        oz + 0.4f, 1.0f });
+        verts.push_back(F4{ ox + 0.5f, oy,        oz,        1.0f });
+        verts.push_back(F4{ ox,        oy + 0.5f, oz,        1.0f });
+        // a degenerate tet puts the 4th corner ON the plane z == oz of the other
+        // three, so its BOUND still overlaps but its signed volume is exactly 0
+        verts.push_back(degenerate ? F4{ ox + 0.25f, oy + 0.125f, oz, 1.0f }
+                                   : F4{ ox,         oy,          oz + 0.5f, 1.0f });
     };
-    pushTet(0.0f, 0.0f, 0.0f, false);    // tet 0 -- a particle sits right on it
-    pushTet(1.0f, 0.0f, 0.0f, false);    // tet 1 -- reached only together with tet 2
-    pushTet(1.5f, 0.0f, 0.0f, false);    // tet 2 -- ditto, one particle reaches BOTH
-    pushTet(3.0f, 0.0f, 0.0f, true);     // tet 3 -- DEGENERATE, inside the box (T2)
-    pushTet(5.0f, 0.0f, 0.0f, false);    // tet 4 -- only the FULL sum of CDs reaches it
-    pushTet(80.0f, 80.0f, 80.0f, false); // tet 5 -- far outside everything
+    pushTet(0.0f,  0.0f, 0.0f, false);   // tet 0 -- a particle sits right on it
+    pushTet(1.0f,  0.0f, 0.0f, false);   // tet 1 -- reached together with tet 2
+    pushTet(2.0f,  0.0f, 0.0f, false);   // tet 2 -- ditto, one particle reaches BOTH
+    pushTet(3.0f,  0.0f, 0.0f, true);    // tet 3 -- DEGENERATE, inside the box (T2)
+    pushTet(5.0f,  0.0f, 0.0f, false);   // tet 4 -- only the FULL sum of CDs reaches it
+    pushTet(8.0f,  0.0f, 0.0f, false);   // tet 5 -- the EXACT-TOUCH boundary
+    pushTet(10.0f, 0.0f, 0.0f, false);   // tet 6 -- reached across the box's LOW side
+    pushTet(80.0f, 80.0f, 80.0f, false); // tet 7 -- far outside everything
 
-    const uint32_t NB_TETS = 6u;
+    const uint32_t NB_TETS = 8u;
     std::vector<TetIdx4> tets;
     for (uint32_t t = 0; t < NB_TETS; ++t)
         tets.push_back(TetIdx4{ 4u * t + 0u, 4u * t + 1u, 4u * t + 2u, 4u * t + 3u });
@@ -2329,11 +2336,19 @@ PXG_TEST(softBodySimPsMidphase)
 
     // ---- particles ------------------------------------------------------------
     std::vector<F4> parts = {
-        { 0.10f,  0.10f,  0.10f, 1.0f },   // inside tet 0's bound
-        { 1.45f,  0.00f,  0.00f, 1.0f },   // between tets 1 and 2: reaches BOTH
-        { 3.20f,  0.05f,  0.00f, 1.0f },   // inside the DEGENERATE tet 3's bound (T2)
-        { 5.00f, -0.28f,  0.00f, 1.0f },   // below tet 4: only 0.24 + 0.06 reaches it
-        { 40.0f,  40.0f,  40.0f, 1.0f },   // nowhere near anything
+        { 0.125f,  0.125f,   0.125f, 1.0f },  // inside tet 0's bound
+        { 1.75f,   0.0f,     0.0f,   1.0f },  // between tets 1 and 2: reaches BOTH
+        { 3.25f,   0.0625f,  0.0f,   1.0f },  // inside the DEGENERATE tet 3's bound (T2)
+        { 5.0f,   -0.28125f, 0.0f,   1.0f },  // below tet 4: 0.28125 needs the SUM
+                                              // (0.25 alone falls short, 0.3125 reaches)
+        { 7.6875f, 0.0f,     0.0f,   1.0f },  // EXACT TOUCH: cx + R == 7.6875 + 0.3125
+                                              // == 8.0 == tet 5's tMin.x, so `tMin.x >
+                                              // qMax.x` compares EQUAL values and the
+                                              // strict/loose choice decides the pair
+        { 10.25f,  0.75f,    0.0f,   1.0f },  // ABOVE tet 6: the box's LOW side is what
+                                              // reaches it, so shrinking qMin alone is
+                                              // observable
+        { 40.0f,   40.0f,    40.0f,  1.0f },  // nowhere near anything
     };
     const uint32_t NB_PARTICLES = uint32_t(parts.size());
     DevBuf bParts = makeDev(dev, parts);
@@ -2443,6 +2458,11 @@ PXG_TEST(softBodySimPsMidphase)
     PXG_CHECK_MSG(expected.size() > STACK_PAIRS,
                   "the rig found %zu pairs against a %u-pair stack; it must OVERFLOW or the "
                   "drop-but-keep-counting behaviour is not measured", expected.size(), STACK_PAIRS);
+    // The exact-touch particle must really touch: cx + R == tet 5's tMin.x to the bit.
+    PXG_CHECK_MSG(parts[4].x + R == verts[5 * 4 + 0].x,
+                  "the boundary case is not on the boundary (%.9g + %.9g != %.9g); the "
+                  "strict/loose choice in the overlap test is then unreachable",
+                  parts[4].x, R, verts[5 * 4 + 0].x);
 
     const uint32_t found = downloadBuffer<uint32_t>(dev, bNum.h, 1)[0];
     PXG_CHECK_MSG(found == uint32_t(expected.size()),
@@ -2477,6 +2497,74 @@ PXG_TEST(softBodySimPsMidphase)
     PXG_CHECK_MSG(bad == 0u, "%u written pairs are wrong or past the stack bound", bad);
     PXG_CHECK_MSG(written == STACK_PAIRS,
                   "%u slots written, expected exactly the %u the stack holds", written, STACK_PAIRS);
+
+    // ---- pass 2: a stack that holds EVERYTHING, compared as a SET ----------------
+    // The pass above can only ask whether each written pair is a MEMBER of the expected
+    // set, and membership is too weak: with two contact managers producing the same
+    // (particle, tet) pairs, a port that wrote a constant 0 for the manager index still
+    // wrote members.  The sweep found exactly that.  Here the whole set is compared,
+    // multiplicity and all, so the manager index has to be right.
+    {
+        std::vector<uint32_t> bigStack(NB_ALLOC * 4u, POISON2);
+        DevBuf bBig = makeDev(dev, bigStack);
+        std::vector<uint32_t> z2 = { 0u };
+        DevBuf bBigNum = makeDev(dev, z2);
+        SbPsMidphasePush q = p;
+        q.stackSizeBytes = NB_ALLOC * 16u;
+        q.stackPtr = bBig.addr; q.midphasePairsNum = bBigNum.addr;
+        Kernel k2("softBodyPsMidphaseBda.spv", "sb_psMidphaseGeneratePairsLaunch",
+                  {}, sizeof(SbPsMidphasePush));
+        k2.dispatch(1024u, {}, q, uint32_t(cms.size()), 1u);
+        dev->flush();
+
+        const uint32_t n2 = downloadBuffer<uint32_t>(dev, bBigNum.h, 1)[0];
+        PXG_CHECK_MSG(n2 == uint32_t(expected.size()),
+                      "with room for every pair the counter reads %u, mirror %zu", n2,
+                      expected.size());
+        const auto b2 = downloadBuffer<uint32_t>(dev, bBig.h, NB_ALLOC * 4u);
+        std::vector<Pair> got;
+        for (uint32_t i = 0; i < NB_ALLOC; ++i)
+            if (b2[i * 4] != POISON2)
+                got.push_back(Pair{ b2[i * 4 + 0], b2[i * 4 + 1], b2[i * 4 + 2] });
+        auto key = [](const Pair& x) { return (uint64_t(x.cm) << 40) | (uint64_t(x.particle) << 20) | x.tet; };
+        std::vector<uint64_t> ka, kb;
+        for (const Pair& x : got) ka.push_back(key(x));
+        for (const Pair& x : expected) kb.push_back(key(x));
+        std::sort(ka.begin(), ka.end()); std::sort(kb.begin(), kb.end());
+        PXG_CHECK_MSG(ka == kb,
+                      "the written pair SET differs from the mirror's (%zu vs %zu entries); "
+                      "membership alone would not have caught a constant manager index",
+                      ka.size(), kb.size());
+        uint32_t cm0 = 0u, cm1 = 0u;
+        for (const Pair& x : got) { if (x.cm == 0u) ++cm0; else if (x.cm == 1u) ++cm1; }
+        PXG_CHECK_MSG(cm0 > 0u && cm1 > 0u,
+                      "both managers must appear in the output (cm0 %u, cm1 %u), or the "
+                      "manager index is not load-bearing", cm0, cm1);
+    }
+
+    // ---- the numWorkItems GUARD ---------------------------------------------------
+    // `if (cmIdx >= numWorkItems) return;` never fires when the dispatch has exactly
+    // numWorkItems y-groups, which is what the engine launches -- so a port that
+    // dropped the guard passed, and the sweep said so.  Here the dispatch is
+    // deliberately WIDER than the work: the extra y-groups must contribute nothing.
+    {
+        std::vector<uint32_t> wideStack(NB_ALLOC * 4u, POISON2);
+        DevBuf bWide = makeDev(dev, wideStack);
+        std::vector<uint32_t> z3 = { 0u };
+        DevBuf bWideNum = makeDev(dev, z3);
+        SbPsMidphasePush q = p;
+        q.stackSizeBytes = NB_ALLOC * 16u;
+        q.stackPtr = bWide.addr; q.midphasePairsNum = bWideNum.addr;
+        Kernel k3("softBodyPsMidphaseBda.spv", "sb_psMidphaseGeneratePairsLaunch",
+                  {}, sizeof(SbPsMidphasePush));
+        k3.dispatch(1024u, {}, q, uint32_t(cms.size()) + 3u, 1u);   // THREE extra y-groups
+        dev->flush();
+        const uint32_t nWide = downloadBuffer<uint32_t>(dev, bWideNum.h, 1)[0];
+        PXG_CHECK_MSG(nWide == uint32_t(expected.size()),
+                      "a dispatch %u y-groups wider than numWorkItems produced %u pairs, "
+                      "expected %zu -- the guard is what makes the extra groups inert",
+                      3u, nWide, expected.size());
+    }
 
     std::printf("    [ note ] %zu pairs over %u particles x %u tets x %zu managers; %u suppressed "
                 "by isValidTet, %u reachable only with the SUM of both contact distances; "
