@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **834/834** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **835/835** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.33a added `gpuslang.npFloatIntrinRecipSqrt`, which is not a kernel port but a
 PLATFORM measurement: about forty shaders here spell `PxVec3::getNormalized` as
 `v * rsqrt(m)`, while the engine computes `PxRecipSqrt` = `1.0f/sqrtf` — two exactly
@@ -1747,6 +1747,123 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.39b — ein totgeglaubter Parameter, ein unerreichbarer Überlauf, und drei Lücken, die nur der Mutant sehen konnte
+
+Kein Kernel-Port, Manifest **unverändert bei 379**. Diese Tranche legt die drei
+Bausteine, die `sb_psContactGenLaunch` braucht, bevor er portiert werden kann — und
+dabei stellte sich heraus, dass einer davon im ganzen Korpus bisher **nur in seiner
+entschärften Form** existierte.
+
+### Der tote Parameter, der keiner ist
+
+`dfFindNonRigidPair` aus P9.38 hatte `ignoreIndex2` **fest auf `true` verdrahtet**.
+Das war zulässig, weil alle vier damaligen Aufrufer `true` übergaben — und genau das
+ist die Art Vereinfachung, die sich selbst rechtfertigt, bis der erste Aufrufer
+kommt, der sie nicht verträgt. `sbParticleCollision` (`softbodyPrimitives.cu:2011`)
+ist dieser Aufrufer: er ruft dieselbe Engine-Überladung mit einem **echten** index2 —
+der `mUniqueId` eines Partikelpuffers — und `ignoreIndex2 = false`. Der Modulkopf aus
+P9.38 hatte unter **F2** ausdrücklich notiert, dass dieser Disjunkt anderswo tragend
+ist; jetzt ist er es hier.
+
+Das Modul bekommt deshalb die allgemeine Form `dfFindNonRigidPair3`, und die
+Zwei-Schlüssel-Überladung wird zur **Hülle darüber** statt zur zweiten Schleife —
+damit die beiden nicht auseinanderdriften können, was P9.38 gerade erst bei fünfzehn
+Abschriften eingesammelt hatte. Für die vier bestehenden Aufrufer ist die
+Verallgemeinerung nachweislich wirkungslos: `dfFindNonRigidPair3` 4 Kopien,
+`dfFindRigidPair` 7 Kopien, **je genau ein Arithmetikgraph** im SPIR-V-Sieb aus P9.37.
+
+### Der Überlauf, der zum Vertrag gehört, und der Beweis, dass er unerreichbar ist
+
+`findRange` (`deformableElementFilter.cuh:99`) endet mit `return r - 1`. Liegt der
+gesuchte Wert vor dem ersten Eintrag, bleibt `r == 0` und der Rückgabewert **läuft
+über** zu 0xffffffff. Abgeschrieben statt „repariert".
+
+**Auf dem Engine-Pfad ist das unerreichbar**: der Runsum wird in
+`PxgPBDParticleSystemCore.cpp:1588-1611` mit `runSumCount = 0` angelegt und der erste
+Eintrag **vor** der ersten Erhöhung geschrieben, ist also immer 0; jede `particleId`
+ist ein PxU32 und damit >= 0, die Suche macht mindestens einen `l = m + 1`-Schritt,
+und `r >= 1` beim Austritt.
+
+Aufgeschrieben wird der Überlauf trotzdem, aus zwei Gründen: `dfFindRange` ist eine
+**Modulfunktion**, deren nächster Aufrufer diese Vorbedingung nicht mitbringen muss;
+und wer `r - 1u` ohne den Beweis liest, „repariert" es zu `r ? r - 1u : 0u` — eine
+stille Verhaltensänderung an jeder künftigen Aufrufstelle. Die Vorrichtung fragt
+deshalb über ein **eigenes** Feld mit von Null verschiedenem erstem Eintrag; die
+Partikelkette behält den engine-förmigen Runsum {0, 4, 9} über den Deskriptor.
+
+Entstanden ist dieser Beweis nicht aus Nachdenken, sondern daraus, dass die
+**Deckungszusicherung der Vorrichtung rot ging**: keine Anfrage löste den Überlauf
+aus. Die Zusicherung prüft nicht, ob der Code stimmt, sondern ob die Frage überhaupt
+gestellt wurde — und das war hier der wertvollere Befund.
+
+### Drei Lücken, alle vom Mutationslauf gemeldet, keine durch Nachdenken gefunden
+
+Der Fegedurchgang über das Modul lief **dreimal**, weil jede geschlossene Lücke die
+Vorrichtung ändert und damit alle vorherigen Ergebnisse entwertet. Die drei
+Überlebenden waren **alle** Lücken der Vorrichtung, keiner ein Portierungsfehler:
+
+* **das leere Feld.** `findRange`s erste Anweisung ist `if (length == 0) return 0;`
+  (`deformableElementFilter.cuh:101`) — ein echter Zweig, und **nicht** dasselbe, was
+  der Rest der Funktion ergäbe: bei Länge 0 läuft die Schleife nie, `r` bleibt 0, und
+  `return r - 1` gäbe 0xffffffff zurück. Alle Anfragen liefen mit `numValues == 3`,
+  also war das Ändern der 0 in 0xffffffff unsichtbar. Hier war mein erster Verdacht,
+  meine Übertragung habe eine Schranke **hinzugefügt**, die die Engine nicht hat — das
+  wäre ein echter Fehler gewesen. Sie hat sie. Der Unterschied zwischen „mein Code
+  weicht ab" und „meine Prüfung schaut nicht hin" lässt sich nur durch Lesen der
+  Engine klären, nicht durch Nachdenken über den Mutanten;
+* **das hohe Wort von index0.** `PxgNonRigidFilterPair::index0` ist ein PxU64 und wird
+  als 64 Bit verglichen, aber die Anfrage, die dieses Modul baut, ist ein
+  **verbreiterter PxU32** mit stets nullem hohem Wort. Trugen auch alle gespeicherten
+  Paare eine Null dort, war das Weglassen des hohen Ladebefehls folgenlos;
+* **index1 unterschied nichts.** Jeder index0 trug genau **einen** index1, also feuerte
+  der index1-Vergleich nur, wenn index0 schon gleich war — und dann war index1
+  ebenfalls gleich. Ein Vergleich, der nie zwischen zwei Einträgen entscheidet, hat
+  keine Richtung, die man verdrehen könnte. `index0 = 7` trägt jetzt drei index1-Werte
+  (15, 22, 30); die Anfrage nach dem niedrigsten muss am höchsten vorbei absteigen.
+  `(7, 30)` allein taugt dafür nicht — die erste Sondierung trifft ihn exakt, und dort
+  sind beide Richtungen einig.
+
+Alle drei sind **per Konstruktion** geschlossen und tragen eine Deckungszusicherung
+derselben Bauart, damit keine still wieder aufgehen kann.
+
+### Vier Fehler am Werkzeug selbst
+
+Das Mutationsskript hat die **noch nicht eingecheckte** Modulerweiterung **gelöscht**:
+es stellte die Zieldatei mit `git checkout --` wieder her, und was nicht eingecheckt
+ist, ist danach weg. Der Text kam aus dem Sitzungsprotokoll zurück; die Reihenfolge
+ist jetzt umgekehrt — **erst einchecken, dann mutieren**. Danach fielen drei weitere
+Mängel auf, jeder für sich harmlos, zusammen aber genau die Art Messung, die grün
+aussieht und nichts bedeutet:
+
+* ein Mutant, der **nicht übersetzt**, hinterlässt die alte `.spv` — die Vorrichtung
+  läuft dagegen und meldet „überlebt". Zwei Mutanten waren so falsch verbucht. Jetzt
+  muss der Bau gelingen **und** sich die `.spv` messbar geändert haben;
+* eine mutierte Binärsuche **scheitert nicht, sie dreht sich** (`l = m` statt
+  `l = m + 1`). Auf llvmpipe gibt es keinen Wachhund: der Dispatch ist eine
+  CPU-Schleife und läuft ewig — der erste Lauf stand sieben Minuten darauf, bis ich ihn
+  von Hand erlegte. Jeder Lauf steht jetzt unter `timeout`, und eine Zeitüberschreitung
+  zählt als erlegt. **Zwei** der zwanzig Mutanten enden so;
+* ein **Anker, der nicht greift**, wurde übersprungen statt abzubrechen. Alle Anker
+  sind aus der aktuellen Datei abgeschrieben — ein Fehlgriff heißt also nicht „dieser
+  Mutant passt hier nicht", sondern „die Datei ist nicht die, für die dieses Skript
+  geschrieben wurde". Der Lauf bricht jetzt ab und **weigert sich zu starten**, wenn
+  die Zieldatei von HEAD abweicht. Beides hat sofort gegriffen: `C-r-eq-mid-plus-one`
+  brach ab, weil `if (cmp < 0) r = mid; else l = mid + 1u;` **zweimal** im Modul steht
+  — in `dfFindNonRigidPair3` und in `dfFindRigidPair` — und das Skript sich weigerte zu
+  raten, statt die falsche Stelle zu mutieren.
+
+### Verifikation
+
+* Mutationslauf über das Modul: **20 erlegt, 0 Überlebende, 0 nicht ausgeführt**
+  (dritter Durchgang, gegen die vollständig verstärkte Vorrichtung);
+* Vorrichtung: 23 Anfragen über 9 Paare und 3 Partikelpuffer mit verschiedenen
+  `mUniqueId`, dazu 2 Leerfeld-Anfragen, bit-exakt gegen einen Wirtsspiegel;
+* Suite **835/835 in beiden Speichermodi, jeweils im ersten Anlauf** — die Zahl wächst
+  um `gpuslang.npDefFilterBda`;
+* Manifest unverändert, aber `pxgSlangDefFilter` wird von elf Kernkomponenten
+  eingebunden, also `build-sdk` neu gebaut und die Szenen gelaufen: **33/33 ok, 0 fail,
+  0 missing**.
 
 ## P9.39a — der erste der letzten sechs, und vier Lücken, die der Fegedurchgang aufgedeckt hat
 
