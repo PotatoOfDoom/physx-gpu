@@ -175,12 +175,23 @@ PXG_TEST(npDefFilterBda)
     // ---- the pair array, sorted by (index0, index1, index2) ----------------------
     // Entry 2 shares (index0, index1) with entry 1 but carries a DIFFERENT index2 --
     // that is the pair B2 turns on.
+    //
+    // B1c -- THE HIGH WORD OF index0.  PxgNonRigidFilterPair::index0 is a PxU64 and its
+    // compare (PxgSimulationCoreDesc.h:235) is a 64-bit one, but the query this module
+    // builds is `uint2(id0, 0u)` -- a WIDENED PxU32, high word always zero.  With every
+    // stored pair also carrying a zero high word, dropping the high-word load entirely
+    // is unobservable, and the P9.39b sweep proved that by leaving `C-hi-word-ignored`
+    // green.  The last two entries carry NON-ZERO high words so the comparison has to
+    // load and use them: both must be MISSED, and they must not disturb the ordering
+    // that the searches below rely on.
     std::vector<PairNRHost> pairs = {
         { 5u, 0u, 11u, 0u   },
         { 7u, 0u, 22u, 700u },
         { 7u, 0u, 22u, 900u },
         { 9u, 0u, 33u, 800u },
         { 12u, 0u, 44u, 0u  },
+        { 7u, 1u, 22u, 700u },   // same low word as entry 1, high word 1 -> different pair
+        { 0u, 2u, 11u, 0u   },   // low word 0, high word 2 -> sorts after everything
     };
     std::sort(pairs.begin(), pairs.end(), [](const PairNRHost& a, const PairNRHost& b) {
         if (a.i0hi != b.i0hi) return a.i0hi < b.i0hi;
@@ -213,6 +224,13 @@ PXG_TEST(npDefFilterBda)
     nr2(7u, 22u);                // the two-key wrapper: index2 = 0, ignore = true
     nr2(12u, 44u);
     nr2(12u, 45u);               // absent
+
+    // B1c: the query's index0 high word is ALWAYS zero, so these must MISS.  Entry 6 is
+    // (lo 0, hi 2, index1 11): drop the high-word load and it becomes (0, 0, 11), which
+    // matches this query exactly and turns both into hits.  This is the only place the
+    // high word changes an answer.
+    nr2(0u, 11u);
+    nr3(0u, 11u, 0u, false);
 
     // B3: the particle chain.  particle 2 -> buffer 0 (uid 700), particle 6 -> buffer
     // 1 (uid 800), particle 11 -> buffer 2 (uid 900).  The pair array was built so
@@ -282,8 +300,58 @@ PXG_TEST(npDefFilterBda)
     PXG_CHECK_MSG(ignoreSeparated > 0u,
                   "no pair of queries differs ONLY in ignoreIndex2 and in its answer, so "
                   "hardcoding the flag (B2) would still pass");
+
+    // B1c coverage: there must be a stored pair whose index0 high word is non-zero AND
+    // whose low word plus index1 match some query -- otherwise the 64-bit comparison is
+    // indistinguishable from a 32-bit one.
+    uint32_t hiWordDiscriminating = 0u;
+    for (const PairNRHost& e : pairs)
+        if (e.i0hi != 0u)
+            for (const DfbQuery& q : qs)
+                if ((q.mode == 1u || q.mode == 2u) && q.id0 == e.i0lo && q.id1 == e.i1)
+                    ++hiWordDiscriminating;
+    PXG_CHECK_MSG(hiWordDiscriminating > 0u,
+                  "no query matches a pair in (low word, index1) while differing in the "
+                  "index0 HIGH word, so ignoring the high word entirely (B1c) would still "
+                  "pass -- the compare would be 32-bit and nothing would notice");
+
+    // ---- B1b: the EMPTY array, in its own dispatch --------------------------------
+    // findRange's first statement is `if (length == 0) return 0;`
+    // (deformableElementFilter.cuh:101).  It is a real branch of the engine and NOT the
+    // same answer as the rest of the function would give: with length == 0 the loop
+    // body never runs, r stays 0, and `return r - 1` would hand back 0xffffffff.  The
+    // guard is what makes the empty case 0 instead.
+    //
+    // The P9.39b mutation sweep found this: changing that `0u` to `0xffffffffu` left
+    // the fixture GREEN, because every query above is asked with numValues == 3.  The
+    // gap is closed here rather than allowed, and it needs a SECOND DISPATCH because
+    // numValues is one push-constant shared by every query in a dispatch.
+    {
+        std::vector<DfbQuery> eq = { DfbQuery{ 0u, 0u, 0u, 0u, 0u, 7u, 0u, 0u },
+                                     DfbQuery{ 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u } };
+        DevBufB bEQ = mk(dev, eq);
+        std::vector<uint32_t> eInit(eq.size(), 0xABABABABu);
+        DevBufB bEOut = mk(dev, eInit);
+
+        DfbParams pe = p;
+        pe.numTests = uint32_t(eq.size());
+        pe.queries = bEQ.addr;
+        pe.results = bEOut.addr;
+        pe.numValues = 0u;               // the branch under test
+
+        k.dispatch(1u, {}, pe, 1u, 1u);
+        dev->flush();
+
+        const std::vector<uint32_t> eGot = downloadBuffer<uint32_t>(dev, bEOut.h, eq.size());
+        for (size_t i = 0; i < eq.size(); ++i)
+            PXG_CHECK_MSG(eGot[i] == 0u,
+                          "findRange over an EMPTY array returned %u for value %u, but the "
+                          "engine's length == 0 guard returns 0 (a port without the guard "
+                          "would return 0xffffffff here)", eGot[i], eq[i].value);
+    }
+
     std::printf("    [ note ] %u queries over %zu pairs and %zu buffers; %u findRange "
-                "wraps, %u ignoreIndex2 separations\n",
+                "wraps, %u ignoreIndex2 separations, plus 2 empty-array queries\n",
                 N, pairs.size(), runsum.size(), wrapped, ignoreSeparated);
 }
 } // namespace
