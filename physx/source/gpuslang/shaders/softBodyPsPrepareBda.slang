@@ -45,12 +45,19 @@
 // ---------------------------------------------------------------------------
 // TRAPS
 // ---------------------------------------------------------------------------
-// Q1 -- THE TET INDEX IS A SIMULATION-MESH TET.  The contact gen encoded a
-//     COLLISION-mesh tet (softbodyPrimitives.cu:2077) and the remap kernel
-//     OVERWRITES pairInd1 and the barycentric with sim-mesh values before this runs.
+// Q1 -- THE TET INDEX IS A SIMULATION-MESH TET, AND THE ARRAYS ARE THE SORTED COPIES.
+//     Two separate stages sit between the contact gen and this kernel and it is worth
+//     naming both, because a fixture author who knows only one of them will build the
+//     wrong scene:
+//       * sb_other_contact_remap_to_simLaunch (softbodyPrimitives.cu:2132, mapped since
+//         P8.2) rewrites pairInd1 and the barycentric from the COLLISION-mesh tet the
+//         contact gen encoded (softbodyPrimitives.cu:2078) onto the SIMULATION mesh;
+//       * the buffers this kernel is handed are then the PARTICLE-SORTED copies --
+//         mParticleSortedContactPointBuffer / NormalPen / Barycentric / ContactInfo
+//         (PxgSoftBodyCore.cpp:2288-2295), not the remap's output arrays.
 //     So this kernel reads mSimTetIndices (@80) and mSimDeltaPos (@128), never
-//     mTetIndices (@16) or mPosition_InvMass (@64).  Both index the same descriptor
-//     and both compile.
+//     mTetIndices (@16) or mPosition_InvMass (@64).  Both index the same descriptor and
+//     both compile.
 //
 // Q2 -- THE PARTICLE INDEX IS THE SORTED ONE.  pairInd0's low dword is the SORTED
 //     index, which is what mSortedDeltaP wants.  Its sibling contact-gen kernel uses
@@ -86,19 +93,36 @@
 //     the blob because dropping it would shift every pointer after it.
 //
 // Q8 -- NO maxContacts CLAMP AND NO WRITE-BACK, unlike the two sibling prepare
-//     kernels in the same file (sb_softbodyContactPrepareLaunch at :941 and
-//     sb_clothContactPrepareLaunch at :1018 both take maxContacts, clamp, and store
-//     the clamp back through thread (0,0)).  This one does neither; transcribed as
-//     written.
+//     kernels in the same file (sb_softbodyContactPrepareLaunch at :940 and
+//     sb_clothContactPrepareLaunch at :1026 both take maxContacts, clamp at :953 and
+//     :1041, and store the clamp back through thread (0,0)).  This one does neither;
+//     transcribed as written.
 //
-// Q9 -- NO tetInd == 0xfffff GUARD, although sb_rigidContactPrepareLaunch twenty
-//     lines above (:817) has one.  Upstream asymmetry, documented and transcribed;
-//     this port does not add a guard the engine does not have.
+// Q9 -- NO tetInd == 0xfffff GUARD, although sb_rigidContactPrepareLaunch (:773) has
+//     one at :818.  The sentinel is real -- it is what
+//     sb_other_contact_remap_to_simLaunch writes for a collision tet with no simulation
+//     counterpart -- so the unguarded mSimTetIndices[tetInd] load here is reachable in
+//     principle.  Upstream asymmetry, documented and transcribed; this port does not add
+//     a guard the engine does not have.
 //
-// Q10 -- THE APPLIED-FORCE ARRAYS ARE float2 IN float4-SIZED ALLOCATIONS.  The
-//     kernel writes at stride 8 while the host allocates maxContacts float4s
-//     (PxgFEMCore.cpp:160), so only the first half of each 16-byte slot is touched.
-//     Writing at stride 16 would compile and silently spread the state out.
+// Q10 -- THE APPLIED-FORCE ARRAYS ARE float2 IN float4-SIZED ALLOCATIONS, AND THEY ARE
+//     TWO DISTINCT BUFFERS.  The host allocates maxContacts float4s and the kernel
+//     writes maxContacts float2s, DENSELY at stride 8 -- so it fills the first HALF OF
+//     THE BUFFER, two contacts per 16-byte slot.  It is NOT "the lower half of each
+//     slot"; my first version of this note said that and the fixture written from it
+//     failed on 152 of 154 checks, which is how the note got corrected.  Writing at
+//     stride 16 would compile and spread the state over twice the memory.  The softbody
+//     side is
+//     mParticleAppliedFEMForcesBuf and the particle side mParticleAppliedParticleForcesBuf
+//     (PxgSoftBodyCore.cpp:2297-2298) -- swapping them couples the two solves without any
+//     type error.
+
+// Q11 -- THE TAIL CONSTRAINT BLOCK IS ONLY PARTIALLY WRITTEN.  When tNumContacts is not
+//     a multiple of 32, the lanes of the last warp with workIndex >= tNumContacts take
+//     the early return before any of the three stores, so those lanes keep whatever the
+//     block held before.  The solve kernels never read them, because they apply the same
+//     bound -- but a fixture that compares the whole block instead of the first
+//     tNumContacts lanes will read uninitialised memory and blame the kernel.
 
 module softBodyPsPrepareBda;
 
