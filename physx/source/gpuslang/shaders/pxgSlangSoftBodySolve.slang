@@ -56,7 +56,7 @@ import pxgSlangAtomicFloat;    // pxgAtomicAddF4XYZ / pxgAtomicAddF4W
 // The softbody id encoding (PxgSimulationCoreDesc.h:110/:127): (id << 20) | tetId.
 // ---------------------------------------------------------------------------
 public static const uint PXG_BITSHIFT_TET_ID = 20u;
-static const uint PX_MAX_NB_DEFORMABLE_VOLUME_TET = 0x000fffffu;
+public static const uint PX_MAX_NB_DEFORMABLE_VOLUME_TET = 0x000fffffu;
 
 public uint getSoftBodyId(uint compressedId) { return compressedId >> PXG_BITSHIFT_TET_ID; }
 public uint getSoftBodyElementIndex(uint compressedId) { return PX_MAX_NB_DEFORMABLE_VOLUME_TET & compressedId; }
@@ -91,14 +91,33 @@ public uint materialIndexAt(uint64_t base, uint tetIdx)
 // computeTetraContact (softBody.cuh:61) — the barycentric blend of the four tet corners,
 // with the four .w components handed back as the per-corner inverse masses.
 // ---------------------------------------------------------------------------
-public float4 computeTetraContact(Ptr<float4> vals, uint4 tetId, float4 bary, out float4 invMass)
+// barycentricProject (softBody.cu:640) -- the blend on its own.  Upstream has TWO
+// functions with this arithmetic in it: barycentricProject, and computeTetraContact
+// (softBody.cuh:61), which additionally hands back the four .w components as the
+// per-corner inverse masses.  Here there is ONE expression and the second function is a
+// wrapper over it, so the two cannot drift.
+//
+// P9.39d wrote a third copy of this blend as a file-local `sppTetProject` in
+// softBodyPsPrepareBda -- in the very tranche that created this module to stop exactly
+// that.  The module sweep found it, by reporting a mutation of computeTetraContact as
+// "not run: the .spv did not change", which was true and was the finding: the prepare
+// shader was not calling this function at all.
+//
+// Association: ((a*bx + b*by) + c*bz) + d*bw, left to right, over WHOLE float4s -- so
+// the fourth component that falls out is the barycentrically blended inverse mass.
+public float4 barycentricProject(Ptr<float4> vals, uint4 tetId, float4 bary)
 {
     const float4 v0 = vals[tetId.x];
     const float4 v1 = vals[tetId.y];
     const float4 v2 = vals[tetId.z];
     const float4 v3 = vals[tetId.w];
-    invMass = float4(v0.w, v1.w, v2.w, v3.w);
     return v0 * bary.x + v1 * bary.y + v2 * bary.z + v3 * bary.w;
+}
+
+public float4 computeTetraContact(Ptr<float4> vals, uint4 tetId, float4 bary, out float4 invMass)
+{
+    invMass = float4(vals[tetId.x].w, vals[tetId.y].w, vals[tetId.z].w, vals[tetId.w].w);
+    return barycentricProject(vals, tetId, bary);
 }
 
 // AtomicAdd(float4& out, const PxVec3& v, PxReal addition) — three component adds plus the

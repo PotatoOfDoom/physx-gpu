@@ -107,7 +107,8 @@
 import pxgSlangCommon;            // PxgSolverBodyData, PxgSolverTxIData
 import pxgSlangPrepDesc;          // PxgPrePrepDescGpu, PxgConstraintPrepareDescGpu
 import pxgSlangSolverDesc;        // PxgSolverCoreDescGpu, PxgSolverSharedDesc{PGS,TGS}Gpu
-import pxgSlangSoftBodyDesc;      // PxgSoftBodyGpu (mSimTetIndices@80, mSimDeltaPos@128, ...)
+import pxgSlangSoftBodyDesc;
+import pxgSlangSoftBodySolve;   // P9.39d: barycentricProject, one copy for the corpus
 import pxgSlangAtomicFloat;       // pxgAtomicAddF4W / pxgAtomicAddF4XYZ (P8.1)
 import pxgSlangFemRigidContact;   // prepareFEMContacts, contactInitialize, readRigidVelocity
 
@@ -120,8 +121,9 @@ static const uint RC_GRID = 1024u;
 // PX_MAX_NB_DEFORMABLE_VOLUME_TET (PxDeformableVolume.h) == the element mask AND the
 // invalid marker; PXG_BITSHIFT_TET_ID (PxgSimulationCoreDesc.h:40) — softbody id / tet
 // index packing (PxGetSoftBodyId / PxGetSoftBodyElementIndex).
-static const uint PX_MAX_NB_DEFORMABLE_VOLUME_TET = 0x000fffffu;
-static const uint PXG_BITSHIFT_TET_ID = 20u;
+// PX_MAX_NB_DEFORMABLE_VOLUME_TET and PXG_BITSHIFT_TET_ID now come from
+// pxgSlangSoftBodySolve (P9.39d) -- they were declared here as well and the
+// import made the duplicate an ambiguity error rather than a silent second copy.
 
 // PxgFemOtherContactInfo (PxgFEMCore.h:128, PX_ALIGN(16), 16 bytes):
 //   PxU64 pairInd0 @0 (rigid id), PxU32 pairInd1 @8 (softbody compressed id),
@@ -164,17 +166,6 @@ struct SbPrepContactParams
 [[vk::push_constant]]
 ConstantBuffer<SbPrepContactParams> gSbPrep;
 
-// barycentricProject (softBody.cu:640) — the FOUR-weight tetrahedron blend.  Note this is
-// the tet form, not barycentricProjectTri (:631) which drops the w term.
-float4 barycentricProject(uint4 tetrahedronIdx, Ptr<float4> position_invmass, float4 barycentric)
-{
-    const float4 a = position_invmass[tetrahedronIdx.x];
-    const float4 b = position_invmass[tetrahedronIdx.y];
-    const float4 c = position_invmass[tetrahedronIdx.z];
-    const float4 d = position_invmass[tetrahedronIdx.w];
-
-    return a * barycentric.x + b * barycentric.y + c * barycentric.z + d * barycentric.w;
-}
 
 [shader("compute")]
 [numthreads(256, 1, 1)]   // == RC_BLOCK; PxgSoftBodyKernelBlockDim::SB_UPDATEROTATION
@@ -231,7 +222,7 @@ void sb_rigidContactPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 
         const float3 p = float3(contact_restW.x, contact_restW.y, contact_restW.z);
         const float rest = contact_restW.w;
 
-        const float4 delta_invMass1 = barycentricProject(tetrahedronIdx, delta_invMass, barycentric);
+        const float4 delta_invMass1 = barycentricProject(delta_invMass, tetrahedronIdx, barycentric);
         const float3 delta = float3(delta_invMass1.x, delta_invMass1.y, delta_invMass1.z);
 
         // NEGATED normal, and the rest distance subtracted from the penetration.

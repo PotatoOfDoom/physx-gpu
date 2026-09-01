@@ -130,7 +130,7 @@ import pxgSlangSoftBodyDesc;     // PxgSoftBodyGpu (mSimTetIndices@80, mSimDelta
                                  //                 mRestDistance@420)
 import pxgSlangParticleDesc;     // PxgParticleSystemGpu (mSortedDeltaP)
 import pxgSlangSoftBodySolve;    // P9.39d: getSoftBodyId / getSoftBodyElementIndex /
-                                 //         getSoftBodyInvMass
+                                 //         getSoftBodyInvMass / barycentricProject
 
 static const uint SPP_GRID = 1024u;
 static const uint SPP_BLOCK = 256u;
@@ -157,17 +157,6 @@ struct SbPsPrepareParams
 }
 
 [[vk::push_constant]] ConstantBuffer<SbPsPrepareParams> gSp;
-
-// barycentricProject (softBody.cu:640) -- Q4: whole float4s, left to right.
-float4 sppTetProject(uint64_t valsAddr, uint4 tetId, float4 bary)
-{
-    Ptr<float4> v = Ptr<float4>(valsAddr);
-    const float4 a = v[tetId.x];
-    const float4 b = v[tetId.y];
-    const float4 c = v[tetId.z];
-    const float4 d = v[tetId.w];
-    return a * bary.x + b * bary.y + c * bary.z + d * bary.w;
-}
 
 [shader("compute")]
 [numthreads(256, 1, 1)]
@@ -216,7 +205,8 @@ void sb_particleContactPrepareLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : 
         const float4 barycentric = Ptr<float4>(gSp.barycentrics)[workIndex];
 
         const float4 tetDelta_invMass =
-            sppTetProject(softbodies[softbodyId].mSimDeltaPos, tetrahedronIdx, barycentric);  // Q1/Q4
+            barycentricProject(Ptr<float4>(softbodies[softbodyId].mSimDeltaPos),
+                               tetrahedronIdx, barycentric);   // Q1/Q4
         const float3 tetDelta = tetDelta_invMass.xyz;
 
         const float3 normal = float3(-normal_pen.x, -normal_pen.y, -normal_pen.z);

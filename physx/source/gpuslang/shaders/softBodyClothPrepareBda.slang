@@ -66,6 +66,7 @@
 module softBodyClothPrepareBda;
 
 import pxgSlangSoftBodyDesc;
+import pxgSlangSoftBodySolve;   // P9.39d: barycentricProject, one copy for the corpus
 import pxgSlangFEMClothDesc;
 
 // PxgSoftBodyKernelGridDim / BlockDim::SB_UPDATEROTATION.
@@ -134,12 +135,6 @@ float materialDynamicFriction(uint64_t materials, uint index)
     return Ptr<float>(materials + uint64_t(index) * MATERIAL_STRIDE + MATERIAL_DYNFRICTION)[0];
 }
 
-// barycentricProject(indices, values, bc).
-float4 barycentricProject(uint4 idx, Ptr<float4> values, float4 bc)
-{
-    return bc.x * values[idx.x] + bc.y * values[idx.y] +
-           bc.z * values[idx.z] + bc.w * values[idx.w];
-}
 
 // ===========================================================================
 [shader("compute")]
@@ -214,7 +209,7 @@ void sb_clothContactPrepareLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
         // NOTE mSimDeltaPos, the SIM mesh's accumulated delta -- not mSimDelta and not the
         // collision mesh's.  The three are different buffers on the same descriptor.
         Ptr<float4> sbAccumulatedDelta = Ptr<float4>(softbodies[softbodyId].mSimDeltaPos);
-        const float4 softbodyDelta = barycentricProject(tetVertInd, sbAccumulatedDelta, softBodyBC);
+        const float4 softbodyDelta = barycentricProject(sbAccumulatedDelta, tetVertInd, softBodyBC);
 
         const float sw0 = sbAccumulatedDelta[tetVertInd.x].w;
         const float sw1 = sbAccumulatedDelta[tetVertInd.y].w;
