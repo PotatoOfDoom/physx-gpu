@@ -106,6 +106,8 @@
 // ===========================================================================
 module pxgSlangDefFilter;
 
+import pxgSlangParticleDesc;   // P9.39b: PxgParticleSystemGpu / PxgParticleSimBufferGpu
+
 public struct PxgRigidFilterPairRec
 {
     public uint2 index0;
@@ -178,7 +180,14 @@ public bool dfFindRigidPair(uint64_t pairsAddr, uint nbPairs, uint2 rigidId, uin
 // diagnosis is in softBodySelfCollisionBda.slang.
 public static const uint64_t DF_NRPAIR_STRIDE = 16UL;
 
-public bool dfFindNonRigidPair(uint64_t pairsAddr, uint nbPairs, uint id0, uint id1)
+// The GENERAL form -- deformableElementFilter.cuh:128, with index2 and ignoreIndex2
+// as parameters rather than baked in.  P9.39b generalised it: the softbody-vs-particle
+// contact gen calls the SAME engine overload with a real index2 (a particle buffer's
+// mUniqueId) and ignoreIndex2 = FALSE, which is precisely the case F2 above warns is
+// load-bearing elsewhere.  Baking `true` in would have made that caller silently
+// accept pairs that differ in index2.
+public bool dfFindNonRigidPair3(uint64_t pairsAddr, uint nbPairs, uint id0, uint id1,
+                                uint id2, bool ignoreIndex2)
 {
     const uint2 q0 = uint2(id0, 0u);        // the query's index0 is a widened PxU32
     uint l = 0u, r = nbPairs;
@@ -190,19 +199,73 @@ public bool dfFindNonRigidPair(uint64_t pairsAddr, uint nbPairs, uint id0, uint 
         const uint pIndex1 = Ptr<uint>(e + 8UL)[0];
         const uint pIndex2 = Ptr<uint>(e + 12UL)[0];
 
-        // PxgNonRigidFilterPair::compare, with the query's index2 fixed at 0.
+        // PxgNonRigidFilterPair::compare.
         int cmp = 0;
         if (dfU64Lt(q0, pIndex0)) cmp = -1;
         else if (dfU64Lt(pIndex0, q0)) cmp = 1;
         else if (id1 < pIndex1) cmp = -1;
         else if (id1 > pIndex1) cmp = 1;
-        else if (0u < pIndex2) cmp = -1;
+        else if (id2 < pIndex2) cmp = -1;
+        else if (id2 > pIndex2) cmp = 1;
 
-        // F2 again: a hit on (index0, index1) alone is accepted.
-        if (cmp == 0 || (dfU64Eq(q0, pIndex0) && id1 == pIndex1))
+        if (cmp == 0 || (ignoreIndex2 && dfU64Eq(q0, pIndex0) && id1 == pIndex1))
             return true;
 
         if (cmp < 0) r = mid; else l = mid + 1u;
     }
     return false;
+}
+
+// The two-key overload (deformableElementFilter.cuh:150): index2 = 0, ignoreIndex2 =
+// true.  A wrapper rather than a second loop, so the two cannot drift apart.
+public bool dfFindNonRigidPair(uint64_t pairsAddr, uint nbPairs, uint id0, uint id1)
+{
+    return dfFindNonRigidPair3(pairsAddr, nbPairs, id0, id1, 0u, true);
+}
+
+// findRange (deformableElementFilter.cuh:99): the upper-bound search that returns
+// r - 1.
+//
+// THE UNDERFLOW IS THE CONTRACT, not an accident.  When `value` precedes the first
+// entry the loop leaves r == 0 and the return WRAPS to 0xffffffff; the engine relies
+// on the callers never asking that question, and a port that "fixes" it with a max(0)
+// would answer a question the engine does not answer.  Transcribed as written.
+public uint dfFindRange(uint64_t valuesAddr, uint length, uint value)
+{
+    if (length == 0u)
+        return 0u;
+    Ptr<uint> values = Ptr<uint>(valuesAddr);
+    uint l = 0u, r = length;
+    while (l < r)
+    {
+        const uint m = (l + r) / 2u;
+        if (values[m] > value) r = m; else l = m + 1u;
+    }
+    return r - 1u;
+}
+
+// find(const PxgParticleSystem&, pairs, nbPairs, compressedParticleId, compressedId1)
+// -- deformableElementFilter.cuh:167.  The chain: which particle BUFFER owns this
+// particle, that buffer's mUniqueId, then the three-key search with ignoreIndex2 =
+// FALSE.
+//
+// NOT THE SAME CHAIN AS THE RIGID PARTICLE FILTER, which is the trap.  The rigid one
+// (psContactGenBda.slang:344) subtracts the runsum to get a LOCAL particle id and
+// searches THAT BUFFER'S OWN mFilterPairs array.  This one keeps the GLOBAL
+// compressed id as index0, searches a SINGLE shared array handed in by the caller,
+// and uses the buffer's mUniqueId as the third key.  Same lookup of `id`, different
+// use of it in every respect that follows.
+public bool dfFindParticleNonRigid(uint64_t particleSystemAddr, uint64_t pairsAddr,
+                                   uint nbPairs, uint compressedParticleId, uint compressedId1)
+{
+    Ptr<PxgParticleSystemGpu> ps = Ptr<PxgParticleSystemGpu>(particleSystemAddr);
+    // PxGetParticleIndex on a PxU32 argument is the identity -- the engine's parameter
+    // is PxU32 while the helper takes PxU64, so the widening drops nothing.
+    const uint particleId = compressedParticleId;
+    const uint id = dfFindRange(ps[0].mParticleBufferRunsum,
+                                ps[0].mCommonData_NumParticleBuffers, particleId);
+    Ptr<PxgParticleSimBufferGpu> simBufs = Ptr<PxgParticleSimBufferGpu>(ps[0].mParticleSimBuffers);
+    const uint uniqueId = simBufs[id].mUniqueId;
+    return dfFindNonRigidPair3(pairsAddr, nbPairs, compressedParticleId, compressedId1,
+                               uniqueId, false);
 }
