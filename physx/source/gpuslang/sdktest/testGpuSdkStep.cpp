@@ -70,11 +70,20 @@ public:
     void deallocate(void* p) override { ::free(p); }
 };
 
+// P9.40 -- the bridge reports every kernel that was launched while unmapped as
+// "[pxg-unmapped] <name> ..." through this callback when the CUDA context is
+// released.  They are counted here and folded into the verdict below: always
+// printed, and a FAILURE under PXG_REQUIRE_MAPPED=1.  Before P9.40 such a launch was
+// an anonymous no-op and 33 green scenes said nothing about it.
+static unsigned gUnmappedLaunchReports = 0;
+
 class StepError : public PxErrorCallback
 {
 public:
     void reportError(PxErrorCode::Enum code, const char* message, const char* file, int line) override
     {
+        if (message && std::strncmp(message, "[pxg-unmapped]", 14) == 0)
+            ++gUnmappedLaunchReports;
         std::printf("  [PhysX %d] %s (%s:%d)\n", int(code), message, file, line);
     }
 };
@@ -6398,8 +6407,22 @@ int main()
 
     scene->release();
     physics->release();
-    cudaCtx->release();
+    cudaCtx->release();          // <- the bridge reports [pxg-unmapped] lines here
     foundation->release();
+
+    // P9.40.  A scene that drove unmapped kernels ran a DIFFERENT simulation than the
+    // one it claims to test, however green its own checks are.  Say so on every run,
+    // and fail on it when asked to.
+    if (gUnmappedLaunchReports)
+    {
+        const bool strict = std::getenv("PXG_REQUIRE_MAPPED") != nullptr;
+        std::printf("  [unmapped] %u kernel(s) were launched but are not mapped to SPIR-V and were "
+                    "silently skipped -- see the [pxg-unmapped] lines above%s\n",
+                    gUnmappedLaunchReports,
+                    strict ? "; PXG_REQUIRE_MAPPED is set, counting this as a FAILURE" : "");
+        if (strict)
+            failures += int(gUnmappedLaunchReports);
+    }
 
     if (failures == 0)
     {

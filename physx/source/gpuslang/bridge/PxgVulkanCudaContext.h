@@ -83,6 +83,14 @@ physx::PxCudaContextManager* PxgCreateVulkanCudaContextManager(PxgSlangComputeDe
 // resolves back to manifest[id] — the exact id -> launch path the engine's
 // getCuFunction(id) -> launchKernel path uses.  Unmapped (spirvFile == null)
 // or out-of-range ids return null.  Does not own the manifest.
+// P9.40 -- how often the kernel with this manifest index was LAUNCHED WHILE
+// UNMAPPED on `ctx`.  Such a launch used to be an anonymous InvalidValue through a
+// null wrangler slot; it is now a named, counted refusal (see the sentinel notes in
+// PxgVulkanCudaContext.cpp), reported through the foundation error callback as
+// "[pxg-unmapped] <cudaName> ..." when the context is released.  Returns 0 for a
+// context that is not this bridge's.
+uint32_t pxgUnmappedLaunchCount(const physx::PxCudaContext* ctx, uint32_t kernelId);
+
 class PxgVulkanKernelWrangler
 {
 public:

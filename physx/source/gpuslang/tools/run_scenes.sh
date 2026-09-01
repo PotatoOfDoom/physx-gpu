@@ -58,10 +58,18 @@ SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor articul
 
 pass=0; fail=0; missing=0
 
+# P9.40: --strict exports PXG_REQUIRE_MAPPED=1, under which a scene that launched an
+# unmapped kernel FAILS.  Without it the scene is scored as before, but the kernels
+# it silently skipped are listed under its line, so the sweep's own output says
+# which "ok" is an ok about the physics and which is an ok about the checks.
+if [ "${1:-}" = "--strict" ]; then export PXG_REQUIRE_MAPPED=1; shift; fi
+
 run_one() {
     label="$1"; shift
     out=$(env "$@" PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1)
     verdict=$(printf '%s\n' "$out" | grep -E '^\[ *(OK|FAIL) *\] gpu-sdk-step' | tail -1)
+    unmapped=$(printf '%s\n' "$out" | grep -oE '\[pxg-unmapped\] [A-Za-z0-9_]+ was launched [0-9]+' \
+               | sed -E 's/\[pxg-unmapped\] ([A-Za-z0-9_]+) was launched ([0-9]+)/\1(x\2)/' | tr '\n' ' ')
     case "$verdict" in
         "[  OK  ]"*)  echo "ok       $label"; pass=$((pass+1)) ;;
         "[ FAIL ]"*)  echo "FAIL     $label"
@@ -71,6 +79,7 @@ run_one() {
                       printf '%s\n' "$out" | tail -3 | sed 's/^/           /'
                       missing=$((missing+1)) ;;
     esac
+    [ -n "$unmapped" ] && echo "           unmapped-but-launched: $unmapped"
 }
 
 for s in $SCENES; do

@@ -33,6 +33,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <cstdlib>
+#include <cstdio>
+#include "foundation/PxFoundation.h"
+#include "foundation/PxErrorCallback.h"
 
 namespace physx
 {
@@ -54,10 +58,27 @@ inline PxgStreamId fromStream(CUstream s) { return PxgStreamId(reinterpret_cast<
 inline CUevent toEvent(uint32_t id) { return reinterpret_cast<CUevent>(uintptr_t(id)); }
 inline uint32_t fromEvent(CUevent e) { return uint32_t(reinterpret_cast<uintptr_t>(e)); }
 inline CUfunction toFunc(PxgKernelId id) { return reinterpret_cast<CUfunction>(uintptr_t(id) + 1u); }
+
+// P9.40 -- the UNMAPPED sentinel.  A kernel that is in the registry but has no
+// SPIR-V gets a NON-NULL handle with this bit set, so that a launch through it can be
+// named and counted.  fromFunc rejects it exactly as it rejects null, so nothing that
+// used to refuse a null slot behaves differently; only the early return in
+// launchKernel looks at it, through fromUnmappedFunc.
+static const uintptr_t kUnmappedFuncBit = uintptr_t(1) << 40;
+inline CUfunction toUnmappedFunc(PxgKernelId id)
+{ return reinterpret_cast<CUfunction>((uintptr_t(id) + 1u) | kUnmappedFuncBit); }
+inline bool fromUnmappedFunc(CUfunction f, PxgKernelId* id)
+{
+    const uintptr_t v = reinterpret_cast<uintptr_t>(f);
+    if ((v & kUnmappedFuncBit) == 0 || (v & ~kUnmappedFuncBit) == 0)
+        return false;
+    *id = PxgKernelId((v & ~kUnmappedFuncBit) - 1u);
+    return true;
+}
 inline bool fromFunc(CUfunction f, PxgKernelId* id)
 {
     const uintptr_t v = reinterpret_cast<uintptr_t>(f);
-    if (v == 0)
+    if (v == 0 || (v & kUnmappedFuncBit) != 0)
         return false;
     *id = PxgKernelId(v - 1u);
     return true;
@@ -104,7 +125,8 @@ class PxgVulkanCudaContext : public physx::PxCudaContext
 {
 public:
     PxgVulkanCudaContext(PxgCudaShim* shim, const PxgKernelDef* manifest, uint32_t manifestCount)
-        : mShim(shim), mManifest(manifest), mManifestCount(manifestCount)
+        : mShim(shim), mManifest(manifest), mManifestCount(manifestCount),
+          mUnmappedLaunches(manifestCount, 0u)
     {
         mAllocatorCallback = nullptr;
         // Register as the live context so the raw (context-less) CUDA-driver shim
@@ -113,7 +135,15 @@ public:
         pxgSetVulkanDriverShim(shim);
     }
 
-    void release() override { pxgSetVulkanDriverContext(nullptr); pxgSetVulkanDriverShim(nullptr); delete this; }
+    void release() override
+    {
+        reportUnmappedLaunches();
+        pxgSetVulkanDriverContext(nullptr); pxgSetVulkanDriverShim(nullptr); delete this;
+    }
+
+    // P9.40.  How often kernel `id` was launched while unmapped (0 for mapped ones).
+    uint32_t unmappedLaunchCount(PxgKernelId id) const
+    { return id < mManifestCount ? mUnmappedLaunches[id] : 0u; }
 
     // The backing shim (bridge-internal): the ccm's getMappedDevicePtr resolves
     // pinned host pointers through it.
@@ -185,6 +215,21 @@ public:
                 if (hfunc)
                     *hfunc = toFunc(i);
                 return record(PxgResult::Success);
+            }
+        }
+        // P9.40: a registry name WITHOUT SPIR-V.  Still NotFound -- the engine
+        // wrangler keeps reporting it and keeps mError -- but the slot receives the
+        // unmapped sentinel instead of staying null, so a later launch through it can
+        // say which kernel was skipped.  fromFunc refuses the sentinel, so the launch
+        // itself still fails with InvalidValue exactly as before.
+        for (uint32_t i = 0; i < mManifestCount; ++i)
+        {
+            if (!mManifest[i].spirvFile && mManifest[i].cudaName && name &&
+                std::strcmp(mManifest[i].cudaName, name) == 0)
+            {
+                if (hfunc)
+                    *hfunc = toUnmappedFunc(i);
+                return record(PxgResult::NotFound);
             }
         }
         return record(PxgResult::NotFound);
@@ -345,7 +390,10 @@ public:
         if (mAbort) return mLastResult;
         PxgKernelId id = 0;
         if (!fromFunc(f, &id))
+        {
+            noteUnmappedLaunch(f, "sized");
             return record(PxgResult::InvalidValue);
+        }
 
         // CUDA hands each argument to the driver as its own pointer; the driver
         // lays each out in the .param bank at the NATURAL alignment declared by
@@ -405,7 +453,10 @@ public:
         if (mAbort) return mLastResult;
         PxgKernelId id = 0;
         if (!fromFunc(f, &id))
+        {
+            noteUnmappedLaunch(f, "void**");
             return record(PxgResult::InvalidValue);
+        }
         const PxgKernelAbiRow* abi = id < mManifestCount ? pxgFindKernelAbi(mManifest[id].cudaName) : nullptr;
         if (!abi || !kernelParams)
         {
@@ -535,9 +586,56 @@ private:
         return mLastResult;
     }
 
+    // P9.40.  Called on the refuse path of both launch forms.  A null handle stays
+    // anonymous (that is what the sentinel exists to avoid); a sentinel handle names
+    // the kernel, bumps its counter, and under PXG_LAUNCH_TRACE prints ONE line the
+    // first time -- not one per frame, which for a per-step kernel would be hundreds.
+    void noteUnmappedLaunch(CUfunction f, const char* form)
+    {
+        PxgKernelId id = 0;
+        if (!fromUnmappedFunc(f, &id) || id >= mManifestCount)
+            return;
+        const uint32_t n = ++mUnmappedLaunches[id];
+        static const bool on = std::getenv("PXG_LAUNCH_TRACE") != nullptr;
+        if (on && n == 1u)
+            std::fprintf(stderr, "[pxg-launch] %s %s UNMAPPED -- skipped (further launches not traced)\n",
+                         form, mManifest[id].cudaName ? mManifest[id].cudaName : "?");
+    }
+
+    // P9.40.  At release, every kernel that was launched while unmapped is reported
+    // through the foundation error callback, one line each, so the host that owns the
+    // scene sees it in the same stream as the wrangler's startup list -- and so a
+    // harness can count "[pxg-unmapped]" lines and fail.  Silence here would be the
+    // exact defect this exists to end, so the report is unconditional whenever a
+    // foundation exists; only the trace line above is opt-in.
+    void reportUnmappedLaunches()
+    {
+        uint32_t distinct = 0;
+        for (uint32_t i = 0; i < mManifestCount; ++i)
+            if (mUnmappedLaunches[i]) ++distinct;
+        if (distinct == 0)
+            return;
+        physx::PxFoundation* fnd = PxIsFoundationValid();
+        for (uint32_t i = 0; i < mManifestCount; ++i)
+        {
+            if (!mUnmappedLaunches[i])
+                continue;
+            char buf[320];
+            std::snprintf(buf, sizeof(buf),
+                          "[pxg-unmapped] %s was launched %u time(s) but has no SPIR-V mapping: "
+                          "every launch was SKIPPED, the physics it computes did not happen",
+                          mManifest[i].cudaName ? mManifest[i].cudaName : "?", mUnmappedLaunches[i]);
+            if (fnd)
+                fnd->getErrorCallback().reportError(physx::PxErrorCode::eINTERNAL_ERROR, buf, PX_FL);
+            else
+                std::fprintf(stderr, "%s\n", buf);
+        }
+    }
+
     PxgCudaShim* mShim;
     const PxgKernelDef* mManifest;
     uint32_t mManifestCount;
+    std::vector<uint32_t> mUnmappedLaunches;   // P9.40: per kernel id
     PxCUresult mLastResult = okResult();
     bool mAbort = false;
 };
@@ -698,6 +796,13 @@ physx::PxCudaContextManager* PxgCreateVulkanCudaContextManager(PxgSlangComputeDe
 // getFunction uses the SAME id->CUfunction encoding as the anonymous-namespace
 // toFunc above (kernel id + 1 in the pointer bits), so a handle it returns
 // decodes back to manifest[id] inside PxgVulkanCudaContext::launchKernel.
+
+// P9.40 -- see the header.
+uint32_t pxgUnmappedLaunchCount(const physx::PxCudaContext* ctx, uint32_t kernelId)
+{
+    const PxgVulkanCudaContext* c = dynamic_cast<const PxgVulkanCudaContext*>(ctx);
+    return c ? c->unmappedLaunchCount(kernelId) : 0u;
+}
 
 CUfunction PxgVulkanKernelWrangler::getFunction(uint32_t kernelId) const
 {

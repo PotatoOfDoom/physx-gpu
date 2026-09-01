@@ -36,8 +36,19 @@
 // per MAPPED kernel (spirvFile != null).  Our PxCudaContext::moduleGetFunction
 // then matches the name in the manifest and returns toFunc(id) = id+1, so
 // mCuFunctions[id] holds our launch encoding — the exact getCuFunction(id) ->
-// launchKernel path the gpu subsystems use.  The 378 unmapped kernels are absent
-// from the table, so the wrangler leaves their slots null (never launched).
+// launchKernel path the gpu subsystems use.
+//
+// P9.40: UNMAPPED kernels are in the table too.  Until P9.40 they were absent, the
+// wrangler left their slots null, and a host launch through a null slot returned
+// InvalidValue from launchKernel BEFORE any trace line -- so an unmapped kernel on a
+// live scene path was skipped in silence: most engine call sites check the result
+// only under a per-module debug macro that a Release build compiles out.  A
+// 33-scene capture found ZERO launch-failure lines while static analysis showed
+// the FEM/particle -> rigid impulse accumulation and two articulation body-update
+// stages being launched every step.  With the name present, moduleGetFunction is
+// asked for it and hands back a distinguishable non-null SENTINEL handle (still
+// reporting NotFound, so the wrangler's error path is unchanged); launchKernel
+// still refuses it, but can now NAME and COUNT it.  See PxgVulkanCudaContext.cpp.
 //
 // This TU is shared by the PhysXGpuVulkan drop-in and the harness so the real
 // KernelWrangler links the same table in both.
@@ -75,7 +86,7 @@ void ensureFunctionTable()
     for (unsigned i = 0; i < PXG_SLANG_KERNEL_COUNT; ++i)
     {
         const PxgSlangKernelRow& row = gPxgSlangKernelManifest[i];
-        if (row.spirvFile)  // mapped -> resolvable by the engine wrangler
+        if (row.cudaName)   // every registry name, mapped or not (P9.40)
         {
             physx::PxKernelIndex entry;
             entry.moduleIndex = 0u;             // single sentinel module
