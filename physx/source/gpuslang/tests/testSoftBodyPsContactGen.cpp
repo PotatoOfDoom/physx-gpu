@@ -354,7 +354,16 @@ PXG_TEST(softBodyPsContactGen)
     pushTet(12.0f, 0.0f, 0.0f);   // 3  -- surface hint 0 (G5)
     pushTet(16.0f, 0.0f, 0.0f);   // 4
     pushTet(20.0f, 0.0f, 0.0f);   // 5
-    const uint32_t NB_TETS = 6u;
+    // 6 is FOUR UNITS on a side, not one.  The unit corner tets have an inradius well
+    // under cDistance, so no particle can be strictly inside one AND farther than
+    // cDistance from every face -- which made "add the contact-distance gate to the
+    // inside branch too" a mutation with no observable effect.  A side-4 tet has an
+    // inradius of 4/(3+sqrt(3)) ~ 0.845, comfortably past the 0.3125 shell.
+    verts.push_back(F4{ 30.0f, 0.0f, 0.0f, 1.0f });
+    verts.push_back(F4{ 34.0f, 0.0f, 0.0f, 1.0f });
+    verts.push_back(F4{ 30.0f, 4.0f, 0.0f, 1.0f });
+    verts.push_back(F4{ 30.0f, 0.0f, 4.0f, 1.0f });
+    const uint32_t NB_TETS = 7u;
 
     std::vector<U4> tets;
     for (uint32_t t = 0; t < NB_TETS; ++t)
@@ -367,7 +376,7 @@ PXG_TEST(softBodyPsContactGen)
     // ---- surface hints, one byte per tet.  Tet 3 is 0 (G5); the rest name different
     // face subsets so closestPtTetrahedron's four branches are all entered and the
     // running minimum has to choose between faces.
-    std::vector<uint8_t> hints = { 0xFu, 0xFu, 0x9u, 0x0u, 0xFu, 0x6u };
+    std::vector<uint8_t> hints = { 0xFu, 0xFu, 0x9u, 0x0u, 0xFu, 0x6u, 0xFu };
     hints.resize(((hints.size() + 3u) / 4u) * 4u, 0u);
     std::vector<uint32_t> hintWords(hints.size() / 4u, 0u);
     std::memcpy(hintWords.data(), hints.data(), hints.size());
@@ -389,6 +398,27 @@ PXG_TEST(softBodyPsContactGen)
         { 16.25f, 0.25f,   0.125f,  1.0f },  // 7: inside tet 4
         { 16.5f, -0.125f,  0.25f,   1.0f },  // 8: outside tet 4, within the shell
         { 8.5f,  -0.125f,  0.25f,   1.0f },  // 9: outside tet 2 (hint 0x9: two faces only)
+        // 10..13 exist because the P9.39c mutation sweep left four mutants green.  Each
+        // one lands in a window the first scene had no sample in.
+        //
+        // 10: sqDist == 0.25, which is GREATER than cDistance^2 (0.09765625) and LESS
+        //     than cDistance (0.3125).  Correct code drops it; a port that forgot to
+        //     square the contact distance keeps it.  Placed under the interior of tet
+        //     1's y == 0 face so exactly one face is nearest.
+        { 4.3f,  -0.5f,     0.2f,    1.0f },  // 10
+        // 11: strictly inside the BIG tet and 0.8 from its nearest face, so sqDist
+        //     (0.64) is far past cDistance^2.  The inside branch has no distance gate;
+        //     adding one would drop this contact.
+        { 30.8f,  0.8f,     0.8f,    1.0f },  // 11
+        // 12: just outside tet 1's VERTEX a along (-1,-1,-1)/sqrt(3), 0.25 away.  The
+        //     closest point is the vertex, so n points along (1,1,1)/sqrt(3) while the
+        //     winning face's normal n2 is (0,0,1): dot(n, n2) ~ 0.577, which sits
+        //     BETWEEN 0.5 and 0.8.  That is the only kind of sample that pins the 0.8
+        //     threshold -- a face-interior closest point gives dot = +-1 and cannot.
+        { 4.0f - 0.14433757f, -0.14433757f, -0.14433757f, 1.0f },  // 12
+        // 13: a second contact against the big tet, from outside, so tet 6 is not only
+        //     ever reached by the inside branch.
+        { 30.0f, -0.125f,   1.0f,    1.0f },  // 13
     };
     const uint32_t NB_PARTICLES = uint32_t(parts.size());
     DevB bParts = mk(dev, parts);
@@ -396,7 +426,8 @@ PXG_TEST(softBodyPsContactGen)
     // ---- G1: a DERANGEMENT.  No particle maps to itself, so using the sorted index
     // where the engine uses the unsorted one (or the reverse) changes every filter
     // query.  With the identity here the whole S3 trap would be untestable.
-    const std::vector<uint32_t> sortedToUnsorted = { 3u, 5u, 6u, 0u, 2u, 4u, 1u, 9u, 7u, 8u };
+    const std::vector<uint32_t> sortedToUnsorted =
+        { 3u, 5u, 6u, 0u, 2u, 4u, 1u, 9u, 7u, 8u, 13u, 12u, 11u, 10u };
     for (uint32_t i = 0; i < NB_PARTICLES; ++i)
         PXG_CHECK_MSG(sortedToUnsorted[i] != i,
                       "sortedToUnsorted[%u] == %u is a FIXED POINT; the mapping must be a "
@@ -470,19 +501,22 @@ PXG_TEST(softBodyPsContactGen)
     // the softbody mask, index2 is the owning buffer's mUniqueId, and the search runs
     // with ignoreIndex2 = FALSE.
     //
-    //  * sorted particle 6 -> unsorted 1 (uid 4242): filtered against the WHOLE BODY,
-    //    so only the tetFullMask lookup can catch it.  Deliberately NOT the particle
-    //    that exercises the inside branch: a whole-body entry filters that particle
-    //    against EVERY tet, and my first version put it on particle 0 and thereby
-    //    deleted the inside branch from the scene entirely -- the coverage assertion
-    //    below is what caught that;
+    //  * sorted particle 8 -> unsorted 7 (uid 777): filtered against the WHOLE BODY,
+    //    so only the tetFullMask lookup can catch it.  It must be a particle that WOULD
+    //    otherwise generate a contact, or dropping the whole-body lookup changes
+    //    nothing: the sweep's first run put it on a particle too far from every tet to
+    //    touch one, and both tetFullMask mutants stayed green.  Equally it must NOT be
+    //    the particle that exercises the inside branch -- a whole-body entry filters
+    //    against EVERY tet, and the version before that deleted the inside branch from
+    //    the scene entirely.  Particle 8 is outside tet 4 and within the shell, so it
+    //    satisfies both;
     //  * sorted particle 2 -> unsorted 6 (uid 777): filtered against tet 2 by its OWN
     //    tet mask, so only the tetMask lookup can catch it;
     //  * sorted particle 0 -> unsorted 3, whose real uid is 4242: an entry carrying
     //    777 instead, which must NOT match.  That is the ignoreIndex2 = false property
     //    P9.39b added and nothing else in the corpus exercises.
     std::vector<PairNR> pairs = {
-        { 1u, 0u, encSb(MAX_NB_TET), UID[0] },   // sorted 6 -> unsorted 1, uid 4242
+        { 7u, 0u, encSb(MAX_NB_TET), UID[1] },   // sorted 8 -> unsorted 7, uid 777
         { 6u, 0u, encSb(2u),         UID[1] },   // sorted 2 -> unsorted 6, uid 777
         { 3u, 0u, encSb(0u),         UID[1] },   // sorted 0 -> unsorted 3 IS uid 4242, so
                                                  // this entry must NOT match (G3)
@@ -515,8 +549,12 @@ PXG_TEST(softBodyPsContactGen)
     uint32_t skippedHint = 0u, filteredFull = 0u, filteredTet = 0u, wrongUidNotFiltered = 0u;
     uint32_t insideBranch = 0u, outsideBranch = 0u, droppedByDistance = 0u, n2Substituted = 0u;
 
-    auto mirrorFor = [&](uint32_t cmIdx) {
+    // `stackLimit` is min(numFound, stackSize) -- the kernel processes only that many
+    // stack entries, in order.  The mirror therefore walks the stack rather than the
+    // (particle, tet) product, because with a clamp the two are not the same set.
+    auto mirrorFor = [&](uint32_t cmIdx, uint32_t stackLimit) {
         std::vector<Expect> out;
+        uint32_t seen = 0u;
         const CmIn& cin = cms[cmIdx];
         uint32_t sP = cin.shapeRef0, cP = cin.cacheRef0, sS = cin.shapeRef1, cS = cin.cacheRef1;
         if (shapes[cin.shapeRef0].type != GEOM_PARTICLESYSTEM_G)
@@ -528,6 +566,7 @@ PXG_TEST(softBodyPsContactGen)
         for (uint32_t particleIndex = 0; particleIndex < NB_PARTICLES; ++particleIndex)
             for (uint32_t tetrahedronIdx = 0; tetrahedronIdx < NB_TETS; ++tetrahedronIdx)
             {
+                if (seen++ >= stackLimit) continue;      // past the clamp: never read
                 const U4& ti = tets[tetrahedronIdx];
                 const uint32_t unsorted = sortedToUnsorted[particleIndex];
                 const uint32_t tetMask = encSb(tetrahedronIdx);
@@ -589,8 +628,8 @@ PXG_TEST(softBodyPsContactGen)
 
     // One dispatch: build the stack for a single manager, run, and compare.  maxContacts
     // is a parameter so the same code covers "everything fits" and "the writer overflows".
-    auto runOne = [&](uint32_t cmIdx, uint32_t maxContacts, const std::vector<Expect>& exp,
-                      const char* what)
+    auto runOne = [&](uint32_t cmIdx, uint32_t maxContacts, uint32_t stackPairs,
+                      const std::vector<Expect>& exp, const char* what)
     {
         std::vector<U4> stack;
         for (uint32_t pi = 0; pi < NB_PARTICLES; ++pi)
@@ -617,7 +656,11 @@ PXG_TEST(softBodyPsContactGen)
         p.restDistance = bRest.addr; p.gpuShapes = bShapes.addr;
         p.particleSystems = bPs.addr; p.softbodies = bSb.addr;
         p.filterPairs = bPairs.addr; p.numFilterPairs = uint32_t(pairs.size());
-        p.stackSizeBytes = nbStack * 16u;
+        // stackPairs may be SMALLER than nbStack: numPairs = min(numFound, stackSize)
+        // clamps the loop, while stackSizeNeededOnDevice must report the UNCLAMPED
+        // count.  With the two equal, using the clamped one is unobservable, which is
+        // how S10-needed-uses-clamped survived the first sweep.
+        p.stackSizeBytes = stackPairs * 16u;
         p.stackPtr = bStack.addr; p.midphasePairsNum = bNum.addr;
         p.stackSizeNeeded = bNeeded.addr;
         p.w_outPoint = bPoint.addr; p.w_outNormalPen = bNP.addr;
@@ -702,8 +745,14 @@ PXG_TEST(softBodyPsContactGen)
         return written;
     };
 
-    const std::vector<Expect> expA = mirrorFor(0u);
-    const std::vector<Expect> expB = mirrorFor(1u);
+    const uint32_t NB_STACK = NB_PARTICLES * NB_TETS;
+    const uint32_t CLAMPED_B = NB_STACK - 7u;    // manager 1 runs with a SHORT stack
+    const std::vector<Expect> expA = mirrorFor(0u, NB_STACK);
+    const std::vector<Expect> expB = mirrorFor(1u, CLAMPED_B);
+    PXG_CHECK_MSG(CLAMPED_B < NB_STACK,
+                  "the overflow dispatch's stack must hold FEWER pairs than the midphase "
+                  "reports, or numPairs == numFound and reading the clamped count instead "
+                  "of the unclamped one is invisible");
 
     // Coverage FIRST: every mechanism the scene claims to separate must have fired.
     // These run before the comparison because a scene that never enters a branch makes
@@ -725,14 +774,14 @@ PXG_TEST(softBodyPsContactGen)
                   "wrong one is invisible");
 
     // A: everything fits, so every contact is checked bit for bit.
-    const uint32_t wroteA = runOne(0u, 64u, expA, "cm0/all-fit");
+    const uint32_t wroteA = runOne(0u, 64u, NB_STACK, expA, "cm0/all-fit");
     // B: the writer deliberately overflows (G6).
     const uint32_t MAX_B = 3u;
     PXG_CHECK_MSG(expB.size() > MAX_B,
                   "manager 1 generates %zu contacts but the overflow dispatch caps at %u; "
                   "it must OVERSHOOT for the dropped-write path (G6) to be measured",
                   expB.size(), MAX_B);
-    const uint32_t wroteB = runOne(1u, MAX_B, expB, "cm1/overflow");
+    const uint32_t wroteB = runOne(1u, MAX_B, CLAMPED_B, expB, "cm1/overflow+short-stack");
 
     std::printf("    [ note ] cm0: %zu contacts (%u written); cm1: %zu contacts (%u written, "
                 "%u dropped by the writer); skipped %u by hint, %u by whole-body mask, %u by "
