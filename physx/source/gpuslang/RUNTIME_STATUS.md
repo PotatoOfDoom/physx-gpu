@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **836/836** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **837/837** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.33a added `gpuslang.npFloatIntrinRecipSqrt`, which is not a kernel port but a
 PLATFORM measurement: about forty shaders here spell `PxVec3::getNormalized` as
 `v * rsqrt(m)`, while the engine computes `PxRecipSqrt` = `1.0f/sqrtf` — two exactly
@@ -1747,6 +1747,118 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.39d — ein Modul vor der zweiten Kopie, und eine zweite Kopie trotzdem
+
+`sb_particleContactPrepareLaunch` ist portiert. Manifest **380 → 381**, Suite
+**837/837 in beiden Speichermodi** (Modus 1 im ersten Anlauf, Modus 2 im zweiten —
+der bekannte llvmpipe-Absturz aus Aufgabe 16, isoliert 66/66 grün). Der Szenenlauf
+wurde von einem Container-Neustart abgeschnitten und läuft neu; die Zahl wird
+nachgetragen, sobald er durch ist.
+
+### Das Modul kam vor der zweiten Kopie — und ich schrieb sie trotzdem
+
+`softBodySelfSolveBda` trug seit P8.x **neun** Helfer file-lokal, die alle vier Kerne
+der Löser-Hälfte brauchen. Sie zu kopieren hätte eine zweite und dritte Abschrift von
+Arithmetik erzeugt, die über jeden Aufrufer bit-identisch bleiben muss — also wurde
+das Modul `pxgSlangSoftBodySolve` angelegt, **bevor** die zweite Kopie existierte,
+statt wie in P9.38 nach der fünfzehnten.
+
+Und dann schrieb ich im selben Atemzug eine zweite Kopie: der frische
+Vorbereitungs-Shader trug ein file-lokales `sppTetProject` mit genau der Arithmetik
+von `computeTetraContact`. Gefunden hat das nicht ich, sondern der Mutationslauf über
+das Modul — er meldete eine Mutation von `computeTetraContact` als **„nicht
+ausgeführt: die .spv hat sich nicht geändert"**. Das war wahr, und es war der Befund:
+der Shader rief die Modulfunktion gar nicht auf.
+
+Das ist der Grund, warum die Schutzvorrichtung G2 aus P9.39b Ergebnisse *auslässt*,
+statt sie zu raten. Ein Werkzeug, das einen nicht bestätigten Lauf als „überlebt" oder
+„erlegt" verbucht, hätte hier nichts gemeldet.
+
+### Wie das Sieb zweimal etwas anderes sagte, als ich hörte
+
+Beim Entfernen kamen zwei weitere Kopien zum Vorschein, und das SPIR-V-Sieb meldete
+`barycentricProject` als **„4 Kopien, 2 Arithmetikgraphen"**. Die Diagnose ging
+zweimal daneben:
+
+* **Erster Verdacht: Operandenreihenfolge.** `bc.x * v` gegen `v * bc.x` — IEEE-
+  Multiplikation ist kommutativ, das Sieb hashte die Operanden aber in
+  Emissionsreihenfolge. Die Kanonisierung für Addition und Multiplikation ist
+  eingebaut und bleibt, weil die Fehlalarmklasse real ist. **Der Riss überlebte sie.**
+  Im Werkzeug steht jetzt ausdrücklich, dass diese Änderung den Fall *nicht* gelöst
+  hat — ein Sieb, dessen Kommentare sich Verdienste anrechnen, die es nicht hat, ist
+  genau das Instrument, von dem dieser Korpus sich schon zweimal hat täuschen lassen.
+* **Die Ursache war die Signaturreihenfolge**: `(vals, tetId, bary)` gegen
+  `(idx, values, bc)`. `canon()` identifiziert Parameter nach **Position**, weil
+  Position die einzige stabile Identität für ein Blatt ist. Das Sieb meldete also
+  einen echten Unterschied, der den Leser angeht — eine dieser Varianten wird eines
+  Tages falsch aufgerufen — aber einen in der **Signatur**, nicht in der Arithmetik,
+  und es konnte nicht sagen, welchen. Diese Grenze steht jetzt im Werkzeug.
+
+Der Import machte schließlich zwei stille Doppelungen zu **Übersetzungsfehlern**:
+`softBodyRigidContactBda` deklarierte `PXG_BITSHIFT_TET_ID` und den Tet-Sentinel
+selbst. Eine Doppelung, die zur Mehrdeutigkeit wird, ist strikt besser als eine, die
+eine zweite Kopie bleibt. Endstand: `barycentricProject` **4 Kopien, 1 Graph**, und
+`computeTetraContact` ist eine Hülle darüber.
+
+### Was am Kernel selbst kein Compiler bemerkt
+
+* **Der Tet-Index ist ein Simulationsnetz-Index.** Der Kontaktgenerator kodierte einen
+  **Kollisions**netz-Tet; zwei Stufen liegen dazwischen —
+  `sb_other_contact_remap_to_simLaunch` (seit P8.2 abgebildet) schreibt `pairInd1` und
+  das Baryzentrum auf das Simulationsnetz um, und die Felder, die dieser Kern liest,
+  sind danach die **partikelsortierten Kopien**. Beide Netze hängen am selben
+  Deskriptor und beide übersetzen.
+* **`getSoftBodyInvMass` skaliert mit der L2-Norm des Baryzentrumsvektors, und der
+  Tuch-Zwilling tut das nicht** — er nimmt `.w` roh. Nichts an der Form der beiden
+  Dateien deutet darauf hin; wer den Tuch-Port als Vorlage nimmt und drei Bezeichner
+  umbenennt, verliert die Skalierung, und jeder Kontakt bekommt die falsche
+  Steifigkeit. Diese Falle hat die Fremderhebung gefunden, nicht mein eigenes Lesen.
+* Abgeschrieben statt korrigiert, jeweils mit dem Geschwisterkern benannt, der es
+  anders macht: **keine `maxContacts`-Klammerung** (beide Geschwister-Vorbereitungskerne
+  in derselben Datei haben eine, bei :940 und :1026) und **keine
+  `tetInd == 0xfffff`-Schranke** (der Starrkörper-Zwilling bei :773 hat eine bei :818).
+
+### Eine falsch aufgeschriebene Falle, die eine falsche Prüfung erzeugte
+
+Ich hatte notiert, die `float2`-Schreibvorgänge in die Kraftpuffer berührten „die
+untere Hälfte jedes 16-Byte-Steckplatzes". Falsch: der Kern schreibt **dicht** bei
+Schrittweite 8 und füllt die **erste Hälfte des Puffers**, zwei Kontakte je
+Steckplatz. Die aus der falschen Notiz gebaute Prüfung fiel bei 152 von 154 Punkten
+durch — so kam die Notiz zu ihrer Korrektur.
+
+Die Richtung ist das Bemerkenswerte: die falsche Dokumentation erzeugte die falsche
+Prüfung, und erst deren Fehlschlag heilte beide. Wäre ich der Notiz gefolgt und hätte
+die Prüfung „passend" gemacht, wären beide dauerhaft falsch geblieben.
+
+### Der Fegedurchgang, und was er über die Szene sagte
+
+**21 von 22 Kernel-Mutanten erlegt**, dazu ein eigener Modul-Durchgang. Zwei echte
+Lücken, beide geschlossen:
+
+* die Baryzentren hielten `y` und `z` bei jedem Kontakt auf demselben Wert — ein
+  Vertauschen der Tetraederecken war damit **arithmetisch** eine Nulloperation, nicht
+  bloß unauffällig. Die vier Komponenten sind jetzt konstruktiv paarweise verschieden;
+* `unitResponse` war nie 0, wodurch `(> 0) ? 1/x : 0` von `>= 0` und von einer
+  ungeschützten Division ununterscheidbar war. Ein dritter Weichkörper mit vier
+  masselosen Simulationsecken liefert sieben solche Fälle.
+
+Nicht als Lücken verbucht, mit Begründung: der Mutant auf `nbIterationsPerBlock *` im
+Arbeitsindex wird erst jenseits von 262144 Kontakten sichtbar — derselbe Überlebende,
+den der Tuch-Zwilling in P9.31 verzeichnet hat. `length(bary)` statt
+`sqrt(Summe der Quadrate)` gehört dem noch fehlenden siebten Prüfer (Aufgabe 26); eine
+treiberabhängige Ein-ULP-Differenz kann eine Vorrichtung nicht zuverlässig abtasten.
+Und ein Mutant war schlicht schlecht entworfen: `contact.x * 0.0f` ist für jeden
+endlichen Wert null und prüfte nichts.
+
+### Noch ein Fehler am Werkzeug
+
+`make` vergleicht Zeitstempel sekundengenau, und Wiederherstellen, Mutieren und Bauen
+können in dieselbe Sekunde fallen — dann wird der Bau **übersprungen** und die
+vorherige `.spv` bewertet. Das erzeugte ein falsches „nicht ausgeführt" ausgerechnet
+für `Q3-drop-l2-scale`, die Kopfzeilen-Falle dieser Tranche; von Hand geprüft ändert
+der Mutant die `.spv` sehr wohl und wird erlegt. Alle vier Fegeskripte stempeln die
+Datei jetzt vor dem Bau vor.
 
 ## P9.39c — der Kernel, für den P9.39b existierte, und fünf Extremfälle, die nicht im Feld lagen
 
