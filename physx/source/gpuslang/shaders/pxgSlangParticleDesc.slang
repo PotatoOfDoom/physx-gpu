@@ -303,6 +303,14 @@ public struct PxgParticleSystemGpu
     public uint64_t _pad648;                      // @648 tail pad to align-16 -> 656
 }
 
+// P9.39c.  Indexing `Ptr<PxgParticleSystemGpu>(base)[id]` already depends on this
+// number; the constant exists because the softbody-vs-particle contact gen needs the
+// ADDRESS of one element to hand to pxgSlangDefFilter, and an open-coded 656 at that
+// call site would be a second place for the layout to drift.  It must equal
+// sizeof(PxgParticleSystem) (PxgParticleSystem.h) -- gpuslang.npAbiLayout pins the
+// field offsets that make up the total.
+public static const uint64_t PXG_PARTICLE_SYSTEM_STRIDE = 656UL;
+
 // ---------------------------------------------------------------------------
 // P9.31: two accessors that were file-local in psContactSolveBda and are needed
 // again by the cloth-vs-particle solve.  They are moved here rather than copied,

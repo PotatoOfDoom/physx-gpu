@@ -774,6 +774,11 @@ static const uint8_t kClothPsMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 }
 // femClothes is, so the row is identical -- 88 bytes.  Kept as its own array rather
 // than aliased: two kernels sharing one row is how a later divergence goes unnoticed.
 static const uint8_t kSbPsMidphase[] = { 4, 4, 8, 8, 8, 8, 8, 8, 8, 4, 8, 8 };
+// sb_psContactGenLaunch (softbodyPrimitives.cu:2086).  Deliberately NOT aliased to any
+// existing row: the by-value PxgFEMContactWriter tail (80 B) takes alignment 16
+// (PxgVulkanCudaContext.cpp:93-101), so the blob is 192 and not the 184 a naive sum of
+// the parts gives.
+static const uint8_t kSbPsContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 8, 8, 8, 80 };
 // P9.30: the contact gen it feeds.  Thirteen arguments, the last of them
 // PxgFEMContactWriter by value (80 B) -> the writer lands at 96, not 88, because
 // paramAlign(80) is 16 (P9.15e).
@@ -1835,6 +1840,7 @@ static const PxgKernelAbiRow kRows[] = {
     // gpunarrowphase FEMCloth-vs-PARTICLE midphase + contact gen (P9.30 BDA)
     { "cloth_psMidphaseGeneratePairsLaunch", kClothPsMidphase, uint32_t(sizeof(kClothPsMidphase)) },
     { "sb_psMidphaseGeneratePairsLaunch", kSbPsMidphase, uint32_t(sizeof(kSbPsMidphase)) },
+    { "sb_psContactGenLaunch", kSbPsContactGen, uint32_t(sizeof(kSbPsContactGen)) },
     { "cloth_psContactGenLaunch", kClothPsCg, uint32_t(sizeof(kClothPsCg)) },
     // gpusimulationcontroller FEMCloth-vs-PARTICLE constraint prep + solve (P9.31 BDA)
     { "cloth_particleContactPrepareLaunch", kClothPsPrepare, uint32_t(sizeof(kClothPsPrepare)) },
