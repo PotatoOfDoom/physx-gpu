@@ -88,6 +88,22 @@ public:
     }
 };
 
+// P9.41.  Call this AFTER cudaCtx->release() -- that is where the bridge reports --
+// and fold the result into the verdict.  P9.40 wired the count into the rigid
+// dispatch only; the fourteen deformable blocks each release the context on their own
+// line and were left out, so `--strict` did not bite on the scenes that skip the most.
+// Prints whenever there is something to print; counts only under PXG_REQUIRE_MAPPED=1.
+static int unmappedPenalty()
+{
+    if (!gUnmappedLaunchReports) return 0;
+    const bool strict = std::getenv("PXG_REQUIRE_MAPPED") != nullptr;
+    std::printf("  [unmapped] %u kernel(s) were launched but are not mapped to SPIR-V and were "
+                "silently skipped -- see the [pxg-unmapped] lines above%s\n",
+                gUnmappedLaunchReports,
+                strict ? "; PXG_REQUIRE_MAPPED is set, counting this as a FAILURE" : "");
+    return strict ? int(gUnmappedLaunchReports) : 0;
+}
+
 class SyncDispatcher : public PxCpuDispatcher
 {
 public:
@@ -522,8 +538,11 @@ void buildJointScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
 // Deliberately the SMALLEST articulation that exercises the feature: one inbound
 // joint, one degree of freedom, no contacts, no self-collision.  Anything the
 // scene refuses is therefore attributable to the articulation pipeline itself.
-void buildArticulationScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
-                            std::vector<RestTarget>& targets)
+// P9.41 returns the articulation so `articulationjoint` can read its joint state
+// back and ask whether it fell asleep; the rigid dispatch below ignores the value.
+PxArticulationReducedCoordinate*
+buildArticulationScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                       std::vector<RestTarget>& targets)
 {
     const float baseY = 3.0f;
     const float baseHalf = 0.2f;
@@ -585,6 +604,7 @@ void buildArticulationScene(PxPhysics* physics, PxScene* scene, PxMaterial* mate
 
     // Hanging straight down puts the link centre one half-length below the hinge.
     targets.push_back({ link, baseY, baseY - linkHalf, "artiLink" });
+    return arti;
 }
 
 // PXG_SCENE=particle (P6.0): the first deformable/particle scene.  A PBD particle
@@ -739,6 +759,9 @@ struct ParticleScene
     // P9.13a: non-null only for PXG_SCENE=particlediffuse.  Aliases `buffer`; kept
     // separately because the diffuse accessors are on the derived type.
     PxParticleAndDiffuseBuffer* diffuse = nullptr;
+    // P9.41: non-null only for PXG_SCENE=particlepush -- the 10 kg box the cloud is
+    // fired at.  It doubles as the scene's one live dynamic rigid.
+    PxRigidDynamic* pushBox = nullptr;
 };
 
 // fluidMode (PXG_SCENE=particlefluid, P9.2) switches the cloud from a SOLID
@@ -755,11 +778,17 @@ struct ParticleScene
 // is set only when some particle system carries fluidBoundaryDensityScale > 0
 // (:2167).  Everything else about the scene is byte-identical to particlefluid, so
 // the two scenes are each other's control.
+// P9.41 -- pushMode (PXG_SCENE=particlepush): the solid 4x4x4 cloud is spawned LOW,
+// beside a 10 kg box standing on the ground, with an initial velocity of +4 m/s
+// along x, so it arrives at the box's face within a dozen steps.  Nothing else in
+// the scene touches the box.  Whether the box moves is the observable.
+static const float PUSH_SPEED = 4.0f;
+static const float PUSH_BOX_X = 2.5f;
 ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
                                  PxCudaContextManager* cudaCtx, bool fluidMode = false,
                                  bool boundaryMode = false, bool meshFloorMode = false,
                                  bool hfFloorMode = false, bool diffuseMode = false,
-                                 bool convexFloorMode = false)
+                                 bool convexFloorMode = false, bool pushMode = false)
 {
     ParticleScene out;
     out.cudaCtx = cudaCtx;
@@ -807,7 +836,23 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     // null-derefs).  Free-fall: box at x=0,y=5 (never meets the y~100 cloud).  Bag
     // mode (PXG_PARTICLE_STARTY set): place it FAR ASIDE at x=20 so the settling
     // pile on the floor never touches it.
-    if (std::getenv("PXG_PARTICLE_STARTY") || fluidMode)
+    if (pushMode)
+    {
+        // The target.  Ten kilograms (a hundred times lighter than the harness's usual
+        // box, ten times heavier than the particles' 64 kg would want it) standing on
+        // the ground, half-extents 0.5 x 1.0 x 0.5 so every row of the cloud meets its
+        // face.  Nothing but the particles can move it.
+        const PxVec3 half(0.5f, 1.0f, 0.5f);
+        PxRigidDynamic* target = physics->createRigidDynamic(PxTransform(PxVec3(PUSH_BOX_X, half.y, 0.0f)));
+        PxShape* s = physics->createShape(PxBoxGeometry(half), *rigidMat);
+        target->attachShape(*s);
+        s->release();
+        target->setMass(10.0f);
+        target->setMassSpaceInertiaTensor(boxInertia(half, 10.0f));
+        scene->addActor(*target);
+        out.pushBox = target;
+    }
+    else if (std::getenv("PXG_PARTICLE_STARTY") || fluidMode)
     {
         // On the mesh floor the puddle spreads to an RMS radius near 10, so the usual
         // x=20 parking spot is INSIDE the puddle and the aside box would start
@@ -936,10 +981,15 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
     // against); PXG_PARTICLE_STARTY lowers the cloud so it can reach the floor
     // (P6.5 settling bag).  When lowered, raise solver iterations for a stable pile.
     const char* startYEnv = std::getenv("PXG_PARTICLE_STARTY");
-    const float startY = fluidMode ? 0.6f : (startYEnv ? float(atof(startYEnv)) : 100.0f);
-    if (startYEnv || fluidMode)
+    // pushMode: the bottom row sits exactly one rest offset above the ground, so the
+    // cloud slides rather than drops, and the box face at x = 2.0 is 0.75 m from the
+    // cloud's leading row -- eleven steps at PUSH_SPEED.
+    const float startY = fluidMode ? 0.6f : pushMode ? 0.25f : (startYEnv ? float(atof(startYEnv)) : 100.0f);
+    const float cloudX = pushMode ? 0.5f : 0.0f;
+    if (startYEnv || fluidMode || pushMode)
         ps->setSolverIterationCounts(/*pos*/ 8, /*vel*/ 1);
-    std::vector<PxVec4> hostPos(N), hostVel(N, PxVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    std::vector<PxVec4> hostPos(N), hostVel(N, pushMode ? PxVec4(PUSH_SPEED, 0.0f, 0.0f, 0.0f)
+                                                          : PxVec4(0.0f, 0.0f, 0.0f, 0.0f));
     std::vector<PxU32> hostPhase(N, phase);
     const float cx = 0.5f * float(GX - 1) * particleSpacing;
     const float cz = 0.5f * float(GZ - 1) * particleSpacing;
@@ -948,7 +998,7 @@ ParticleScene buildParticleScene(PxPhysics* physics, PxScene* scene, PxMaterial*
         for (int y = 0; y < GY; ++y)
             for (int z = 0; z < GZ; ++z)
             {
-                hostPos[idx++] = PxVec4(float(x) * particleSpacing - cx,
+                hostPos[idx++] = PxVec4(float(x) * particleSpacing - cx + cloudX,
                                         startY + float(y) * particleSpacing,
                                         float(z) * particleSpacing - cz, particleInvMass);
             }
@@ -1089,6 +1139,19 @@ float particleMeanY(const ParticleScene& psc)
                     psc.numParticles * sizeof(PxVec4));
     double sum = 0.0;
     for (PxU32 i = 0; i < psc.numParticles; ++i) sum += double(host[i].y);
+    return float(sum / double(psc.numParticles));
+}
+
+// DtoH-read the particle buffer and return the mean x of the cloud (P9.41: the
+// pushed cloud's progress toward the box).
+float particleMeanX(const ParticleScene& psc)
+{
+    std::vector<PxVec4> host(psc.numParticles);
+    PxCudaContext* ctx = psc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(psc.buffer->getPositionInvMasses()),
+                    psc.numParticles * sizeof(PxVec4));
+    double sum = 0.0;
+    for (PxU32 i = 0; i < psc.numParticles; ++i) sum += double(host[i].x);
     return float(sum / double(psc.numParticles));
 }
 
@@ -2330,6 +2393,189 @@ ClothHangScene buildClothHangScene(PxPhysics* physics, PxScene* scene, PxMateria
     out.surface = surface;
     out.numVerts = nv;
     return out;
+}
+
+// P9.41 -- PXG_SCENE=clothnet: a LIGHT box dropped onto a horizontal cloth whose
+// whole border is pinned to the world.  This is the first scene in the harness in
+// which a DYNAMIC rigid body has to be HELD by a deformable, and it exists because
+// none of the 33 scored scenes asks that: `clothbox` lands the cloth on a 1000 kg
+// box that gravity holds down regardless, and every other cloth/softbody/particle
+// scene parks its one dynamic body out of reach.  P9.40's guard then showed WHY
+// they all stayed green: the impulse the cloth solve computes for the rigid side
+// goes through accumulateDeltaVRigidFirst/SecondLaunch, and both are unmapped, so
+// the box never hears about the cloth.  The cloth-side half of the contact is
+// mapped (the cloth deforms around the box), which is exactly what makes the box's
+// final height the observable and not the cloth's.
+//
+// EXPECTED, once the coupling is live: the box comes to rest ON the net, well
+// above the ground.  Until then it passes through the net to the ground.  The
+// net is spawned at y = 2 and the ground's top is at y = 0, so the two outcomes
+// are two metres apart and the bar sits between them at 1.0.
+struct ClothNetScene
+{
+    PxDeformableSurface* surface = nullptr;
+    PxU32 numVerts = 0;
+    PxCudaContextManager* cudaCtx = nullptr;
+    PxDeformableAttachment* attachment = nullptr;
+    PxRigidDynamic* box = nullptr;
+    PxU32 centreVert = 0;        // the vertex under the box, tracked for the sag
+    PxU32 numPinned = 0;
+    float netY = 0.0f;
+    float boxHalf = 0.0f;
+};
+
+ClothNetScene buildClothNetScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
+                                 PxCudaContextManager* cudaCtx)
+{
+    ClothNetScene out;
+    out.cudaCtx = cudaCtx;
+    addGroundBox(physics, scene, rigidMat);
+
+    // 7 x 7 verts over 2 x 2 m: 0.333 m spacing against a 0.5 m box, so the box
+    // always overlaps several triangles and the triangle contact path (P9.15d) can
+    // never be bypassed by a box slipping between vertices.
+    const PxU32 numCol = 7, numRow = 7;
+    const float sizeX = 2.0f, sizeZ = 2.0f;
+    const float netY = 2.0f;
+    const float sx = sizeX / float(numCol - 1);
+    const float sz = sizeZ / float(numRow - 1);
+    auto vid = [numRow](PxU32 c, PxU32 r) { return c * numRow + r; };
+    out.netY = netY;
+
+    std::vector<PxVec3> verts;
+    verts.reserve(numCol * numRow);
+    for (PxU32 c = 0; c < numCol; ++c)
+        for (PxU32 r = 0; r < numRow; ++r)
+            verts.push_back(PxVec3(float(c) * sx - 0.5f * sizeX, netY, float(r) * sz - 0.5f * sizeZ));
+    out.centreVert = vid(numCol / 2, numRow / 2);
+
+    std::vector<PxU32> tris;
+    tris.reserve(3 * 2 * (numCol - 1) * (numRow - 1));
+    for (PxU32 c = 1; c < numCol; ++c)
+        for (PxU32 r = 1; r < numRow; ++r)
+        {
+            tris.push_back(vid(c - 1, r - 1)); tris.push_back(vid(c, r - 1)); tris.push_back(vid(c - 1, r));
+            tris.push_back(vid(c - 1, r));     tris.push_back(vid(c, r - 1)); tris.push_back(vid(c, r));
+        }
+
+    // The whole border is pinned (24 of 49 verts), so the net can sag but cannot
+    // swing or slide away from under the box.
+    static std::vector<PxU32> pinIdx;    // must outlive createDeformableAttachment's copy
+    static std::vector<PxVec4> pinPos;
+    pinIdx.clear(); pinPos.clear();
+    for (PxU32 c = 0; c < numCol; ++c)
+        for (PxU32 r = 0; r < numRow; ++r)
+            if (c == 0 || r == 0 || c == numCol - 1 || r == numRow - 1)
+            {
+                pinIdx.push_back(vid(c, r));
+                const PxVec3& p = verts[vid(c, r)];
+                pinPos.push_back(PxVec4(p.x, p.y, p.z, 0.0f));
+            }
+    out.numPinned = PxU32(pinIdx.size());
+
+    PxTriangleMeshDesc meshDesc;
+    meshDesc.points.count = PxU32(verts.size());
+    meshDesc.points.stride = sizeof(PxVec3);
+    meshDesc.points.data = verts.data();
+    meshDesc.triangles.count = PxU32(tris.size() / 3);
+    meshDesc.triangles.stride = 3 * sizeof(PxU32);
+    meshDesc.triangles.data = tris.data();
+
+    PxCookingParams ckParams(physics->getTolerancesScale());
+    ckParams.buildGPUData = true;
+    ckParams.meshPreprocessParams |= PxMeshPreprocessingFlag::eENABLE_VERT_MAPPING;
+    PxTriangleMesh* triMesh =
+        immediateCooking::createTriangleMesh(ckParams, meshDesc, physics->getPhysicsInsertionCallback());
+    if (!triMesh) { std::printf("FAIL: immediateCooking::createTriangleMesh returned null\n"); return out; }
+
+    PxDeformableSurfaceMaterial* clothMat =
+        physics->createDeformableSurfaceMaterial(/*youngs*/ 1.e6f, /*poissons*/ 0.3f,
+            /*dynamicFriction*/ 0.5f, /*thickness*/ 0.01f, /*bendingStiffness*/ 1.e-4f);
+    PxDeformableSurfaceMaterial* mats[1] = { clothMat };
+    PxShapeFlags shapeFlags = PxShapeFlag::eSIMULATION_SHAPE | PxShapeFlag::eSCENE_QUERY_SHAPE;
+    PxShape* shape = physics->createShape(PxTriangleMeshGeometry(triMesh), mats, PxU16(1), true, shapeFlags);
+    if (!shape) { std::printf("FAIL: createShape (deformable surface) returned null\n"); return out; }
+
+    PxDeformableSurface* surface = physics->createDeformableSurface(*cudaCtx);
+    if (!surface) { std::printf("FAIL: createDeformableSurface returned null\n"); return out; }
+    surface->setNbCollisionPairUpdatesPerTimestep(4);
+    surface->setNbCollisionSubsteps(1);
+    // Some damping, unlike the free-fall scenes: the observable is a REST state
+    // (box held on the net), and an undamped net would ring under the box for the
+    // whole run.  The engine forms clamp(damping * dt, 0, 1), so 2.0 at dt = 1/60
+    // removes about 3% of the velocity per step.
+    surface->setLinearDamping(2.0f);
+    surface->setMaxLinearVelocity(1.0e6f);
+    surface->attachShape(*shape);
+    shape->release();
+    scene->addActor(*surface);
+
+    const PxU32 nv = PxU32(verts.size());
+    std::vector<PxVec4> posInvMass(nv), vel(nv, PxVec4(0.0f)), rest(nv);
+    for (PxU32 v = 0; v < nv; ++v)
+    {
+        posInvMass[v] = PxVec4(verts[v].x, verts[v].y, verts[v].z, 1.0f);
+        rest[v]       = posInvMass[v];
+    }
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getPositionInvMassBufferD()),
+                    posInvMass.data(), nv * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getVelocityBufferD()),
+                    vel.data(), nv * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(surface->getRestPositionBufferD()),
+                    rest.data(), nv * sizeof(PxVec4));
+
+    PxDeformableAttachmentData attData;
+    attData.actor[0] = surface;
+    attData.type[0]  = PxDeformableAttachmentTargetType::eVERTEX;
+    attData.indices[0].data = pinIdx.data();
+    attData.indices[0].count = PxU32(pinIdx.size());
+    attData.actor[1] = NULL;
+    attData.type[1]  = PxDeformableAttachmentTargetType::eWORLD;
+    attData.coords[1].data = pinPos.data();
+    attData.coords[1].count = PxU32(pinPos.size());
+    attData.pose[1] = PxTransform(PxIdentity);
+    out.attachment = physics->createDeformableAttachment(attData);
+    if (!out.attachment)
+        std::printf("FAIL: createDeformableAttachment (net border -> world) returned null\n");
+
+    // THE LIGHT BOX.  One kilogram, not the harness's usual thousand: the net has
+    // 49 unit-mass vertices, and a body a thousand times heavier than the whole
+    // net would tear straight through it on any solver and prove nothing.  It is
+    // also the scene's one live dynamic body, which every cloth scene needs.
+    const float boxHalf = 0.25f;
+    out.boxHalf = boxHalf;
+    PxRigidDynamic* box = physics->createRigidDynamic(PxTransform(PxVec3(0.0f, netY + 1.0f, 0.0f)));
+    PxShape* bs = physics->createShape(PxBoxGeometry(boxHalf, boxHalf, boxHalf), *rigidMat);
+    box->attachShape(*bs);
+    bs->release();
+    box->setMass(1.0f);
+    box->setMassSpaceInertiaTensor(boxInertia(PxVec3(boxHalf), 1.0f));
+    scene->addActor(*box);
+    out.box = box;
+
+    out.surface = surface;
+    out.numVerts = nv;
+    return out;
+}
+
+// DtoH-read the net once: the y of the vertex under the box and the lowest y of
+// any vertex.  Returns false on a non-finite coordinate.
+bool clothNetSample(const ClothNetScene& csc, float& centreY, float& minY)
+{
+    std::vector<PxVec4> host(csc.numVerts);
+    PxCudaContext* ctx = csc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(csc.surface->getPositionInvMassBufferD()),
+                    csc.numVerts * sizeof(PxVec4));
+    bool finite = true;
+    minY = 1.0e30f;
+    for (PxU32 i = 0; i < csc.numVerts; ++i)
+    {
+        if (!std::isfinite(host[i].x) || !std::isfinite(host[i].y) || !std::isfinite(host[i].z)) finite = false;
+        minY = PxMin(minY, host[i].y);
+    }
+    centreY = host[csc.centreVert].y;
+    return finite;
 }
 
 // DtoH-read the cloth vertex buffer once; fill the mean y of the pinned top row and the
@@ -4243,6 +4489,7 @@ int main()
             ++failures;
         }
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
         if (failures == 0)
         {
             std::printf("[  OK  ] gpu-sdk-step: the PRESSURISED mesh INFLATED to its TARGET "
@@ -4365,6 +4612,7 @@ int main()
             ++failures;
         }
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
         if (failures == 0)
         {
             std::printf("[  OK  ] gpu-sdk-step: the PBD cloth sheet HANGS from its pinned row on "
@@ -4425,6 +4673,172 @@ int main()
     const bool convexFloorScene = !std::strcmp(sceneName, "particleconvex");
     const bool fluidScene = !std::strcmp(sceneName, "particlefluid") || boundaryScene
                             || staticFloorScene || diffuseScene || convexFloorScene;
+    // P9.41 -- PXG_SCENE=clothnet.  See buildClothNetScene for what it asks and why none
+    // of the scored scenes asks it.  A pending-work entry in run_scenes.sh until the
+    // rigid coupling (accumulateDeltaVRigidFirst/SecondLaunch) is mapped; it is
+    // MEASURED now so the tranche that maps them has a before-number to beat.
+    if (!std::strcmp(sceneName, "clothnet"))
+    {
+        ClothNetScene csc = buildClothNetScene(physics, scene, material, cudaCtx);
+        if (!csc.surface || csc.numVerts == 0 || !csc.attachment || !csc.box)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: clothnet scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'clothnet' built: %u-vertex FEMCloth net at y=%.1f, border (%u verts) "
+                    "pinned to the world, a 1 kg box (half %.2f) dropped from y=%.1f\n",
+                    csc.numVerts, csc.netY, csc.numPinned, csc.boxHalf, csc.netY + 1.0f);
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: clothnet pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_CLOTH_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 300;
+        const int settleFrom = (steps * 3) / 4;
+        const float boxY0 = csc.box->getGlobalPose().p.y;
+        float boxY = boxY0, prevBoxY = boxY0, minBoxY = boxY0, maxSettleStep = 0.0f;
+        float centreY = csc.netY, netMinY = csc.netY;
+        bool finite = true;
+        std::printf("  stepping clothnet (%d x %.4fs): box y0=%.4f, net centre y0=%.4f\n",
+                    steps, dt, boxY0, centreY);
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            boxY = csc.box->getGlobalPose().p.y;
+            finite = clothNetSample(csc, centreY, netMinY) && finite && std::isfinite(boxY);
+            minBoxY = PxMin(minBoxY, boxY);
+            if (i >= settleFrom) maxSettleStep = PxMax(maxSettleStep, PxAbs(boxY - prevBoxY));
+            if (i < 3 || i == steps - 1 || (i % 30 == 0))
+                std::printf("    step %3d: box y = %.4f (dy %+.5f) | net centre y = %.4f, lowest %.4f\n",
+                            i, boxY, boxY - prevBoxY, centreY, netMinY);
+            prevBoxY = boxY;
+        }
+        const float speed = csc.box->getLinearVelocity().magnitude();
+        std::printf("  clothnet: box y %.4f -> %.4f (lowest %.4f, |v| %.4f); net centre y %.4f -> %.4f; "
+                    "largest box |dy| over the last %d steps = %.6f\n",
+                    boxY0, boxY, minBoxY, speed, csc.netY, centreY, steps - settleFrom, maxSettleStep);
+
+        int failures = 0;
+        // (1) THE NET HOLDS THE BOX.  Net at 2.0, ground top at 0.0: a box on the ground
+        //     has its centre at 0.25, a box on the net stays above 1.0 even with a
+        //     generous sag.  The outcomes are 1.5 m apart and the bar sits between them.
+        if (!(boxY > 1.0f))
+        { std::printf("FAIL: the box came to rest at y = %.4f -- it fell THROUGH the net to the ground "
+                      "(need > 1.0).  The cloth side of the contact ran (see the net's sag); the "
+                      "rigid side goes through accumulateDeltaVRigidFirst/SecondLaunch, and if the "
+                      "[pxg-unmapped] lines below name them, this is that\n", boxY); ++failures; }
+        // (2) and it is at REST there, neither bouncing nor sinking.
+        if (!(maxSettleStep < 1e-2f))
+        { std::printf("FAIL: the box is still moving %.6f per step at the end of the run\n",
+                      maxSettleStep); ++failures; }
+        // (3) THE NET WAS TOUCHED: the vertex under the box is below the pinned plane.
+        //     This is the cloth side of the same contact; it separates "the coupling is
+        //     missing" from "nothing collided at all".
+        if (!(centreY < csc.netY - 0.02f))
+        { std::printf("FAIL: the net centre is at y = %.4f, within 0.02 of the pinned plane -- the box "
+                      "never touched the net\n", centreY); ++failures; }
+        if (!finite) { std::printf("FAIL: a coordinate went non-finite\n"); ++failures; }
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: the 1 kg box RESTS ON THE CLOTH NET at y %.4f (net pinned at "
+                        "%.1f, sagged to %.4f under it) -- the FEM-to-rigid impulse path is live on Vulkan\n",
+                        boxY, csc.netY, centreY);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: clothnet checks failed (%d)\n", failures);
+        return 2;
+    }
+
+    // P9.41 -- PXG_SCENE=particlepush: a PBD particle cloud fired sideways into a 10 kg
+    // box standing on the ground.  The same question as clothnet, for particles: the
+    // particle side of a particle-vs-rigid contact is mapped (the cloud piles up
+    // against the box instead of passing through it); the rigid side is not --
+    // ps_solvePCOutputRigidDeltaVTGSLaunch writes the per-contact rigid delta and
+    // accumulateDeltaVRigidFirst/SecondLaunch fold it into the body, and all three are
+    // unmapped.  Observable: does the box MOVE?  64 kg of particles arrive at it at
+    // 4 m/s and nothing else touches it.
+    if (!std::strcmp(sceneName, "particlepush"))
+    {
+        ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx,
+                                               false, false, false, false, false, false, /*pushMode*/ true);
+        if (!psc.system || !psc.buffer || !psc.pushBox)
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: particlepush scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'particlepush' built: %u PBD particles at %.1f m/s toward a 10 kg box "
+                    "at x=%.1f\n", psc.numParticles, PUSH_SPEED, PUSH_BOX_X);
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: particlepush pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_PARTICLE_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 120;
+        const PxVec3 box0 = psc.pushBox->getGlobalPose().p;
+        const float cloudX0 = particleMeanX(psc);
+        PxVec3 box = box0;
+        float cloudX = cloudX0;
+        bool finite = true;
+        std::printf("  stepping particlepush (%d x %.4fs): box x0=%.4f, cloud mean x0=%.4f\n",
+                    steps, dt, box0.x, cloudX0);
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            box = psc.pushBox->getGlobalPose().p;
+            cloudX = particleMeanX(psc);
+            finite = finite && box.isFinite() && std::isfinite(cloudX);
+            if (i < 3 || i == steps - 1 || (i % 10 == 0))
+                std::printf("    step %3d: box x = %.4f (dx %+.4f) y = %.4f | cloud mean x = %.4f\n",
+                            i, box.x, box.x - box0.x, box.y, cloudX);
+        }
+        const float boxDx = box.x - box0.x;
+        const float cloudDx = cloudX - cloudX0;
+        const float speed = psc.pushBox->getLinearVelocity().magnitude();
+        std::printf("  particlepush: box x %.4f -> %.4f (moved %+.4f, y %.4f, |v| %.4f); cloud mean x "
+                    "%.4f -> %.4f (moved %+.4f)\n",
+                    box0.x, box.x, boxDx, box.y, speed, cloudX0, cloudX, cloudDx);
+
+        int failures = 0;
+        // (1) THE BOX WAS PUSHED.  Without the rigid side of the contact it has no
+        //     horizontal force on it at all and its x is the spawn x to the digit.
+        if (!(boxDx > 0.5f))
+        { std::printf("FAIL: the box did not move (dx = %+.4f, need > 0.5) with 64 kg of particles hitting "
+                      "it at %.1f m/s.  The rigid side of the contact is ps_solvePCOutputRigidDeltaVTGSLaunch "
+                      "plus accumulateDeltaVRigidFirst/SecondLaunch; if the [pxg-unmapped] lines below "
+                      "name them, this is that\n", boxDx, PUSH_SPEED); ++failures; }
+        // (2) THE CLOUD REACHED IT.  If the particles themselves never advanced, (1) says
+        //     nothing about coupling.
+        if (!(cloudDx > 0.5f))
+        { std::printf("FAIL: the cloud itself only advanced %+.4f -- nothing reached the box\n",
+                      cloudDx); ++failures; }
+        // (3) the box is still on the ground, not through it.
+        if (!(box.y > 0.0f))
+        { std::printf("FAIL: the box sank to y = %.4f\n", box.y); ++failures; }
+        if (!finite) { std::printf("FAIL: a coordinate went non-finite\n"); ++failures; }
+
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: the particle cloud PUSHED the 10 kg box %.4f m along x -- the "
+                        "particle-to-rigid impulse path is live on Vulkan\n", boxDx);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: particlepush checks failed (%d)\n", failures);
+        return 2;
+    }
+
     if (!std::strcmp(sceneName, "particle") || fluidScene)
     {
         ParticleScene psc = buildParticleScene(physics, scene, material, cudaCtx, fluidScene,
@@ -4810,6 +5224,7 @@ int main()
                 }
             }
             scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            failures += unmappedPenalty();
             // P9.14a printed this UNCONDITIONALLY as a diagnostic, because the
             // checks above were supposed to FAIL here: nothing was colliding
             // against the convex floor, and that failure was the measurement.
@@ -4937,6 +5352,7 @@ int main()
                                                        "collision is not running (yEnd=%.4f, collapsed is 0.2500)\n", yEnd); ++failures; }
             if (!std::isfinite(yEnd))    { std::printf("FAIL: mean y is not finite (%.4f)\n", yEnd); ++failures; }
             scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+            failures += unmappedPenalty();
             if (failures == 0)
             {
                 std::printf("[  OK  ] gpu-sdk-step: PBD particle bag fell, was caught by the floor, and "
@@ -4954,6 +5370,7 @@ int main()
         if (!std::isfinite(yEnd)) { std::printf("FAIL: mean y is not finite (%.4f)\n", yEnd); ++failures; }
 
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
         if (failures == 0)
         {
             std::printf("[  OK  ] gpu-sdk-step: particle cloud fell monotonically under gravity on Vulkan "
@@ -5014,6 +5431,7 @@ int main()
         if (!std::isfinite(yEnd)) { std::printf("FAIL: mean y is not finite (%.4f)\n", yEnd); ++failures; }
 
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
         if (failures == 0)
         {
             std::printf("[  OK  ] gpu-sdk-step: FEMCloth fell monotonically under gravity on Vulkan "
@@ -5135,6 +5553,7 @@ int main()
         { std::printf("FAIL: mean y is not finite (%.4f)\n", yEnd); ++failures; }
 
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
         if (failures == 0)
         {
             if (convexFloor)
@@ -5285,6 +5704,7 @@ int main()
         { std::printf("FAIL: cloth y went non-finite\n"); ++failures; }
 
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
         if (failures == 0)
         {
             if (damped)
@@ -5404,6 +5824,7 @@ int main()
         if (!allFinite || !std::isfinite(meanEnd)) { std::printf("FAIL: cloth y went non-finite\n"); ++failures; }
 
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
         if (failures == 0)
         {
             if (meshFloor)
@@ -5531,6 +5952,7 @@ int main()
         }
 
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
         if (failures == 0)
         {
             if (selfOn)
@@ -5610,6 +6032,7 @@ int main()
                       meanE, ccs.baseY); ++failures; }
 
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
         if (failures == 0)
         {
             std::printf("[  OK  ] gpu-sdk-step: cloth-vs-DIFFERENT-cloth collision CAUGHT the falling sheet "
@@ -5901,6 +6324,7 @@ int main()
         }
 
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
         if (failures == 0)
         {
             if (sbs.noGravity)
@@ -6089,6 +6513,7 @@ int main()
         { std::printf("FAIL: the upper volume sank past the pinned one (mean y=%.4f)\n", meanE); ++failures; }
 
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
         if (failures == 0)
         {
             std::printf("[  OK  ] gpu-sdk-step: FEM-FEM attachments HELD the upper volume against "
@@ -6300,6 +6725,7 @@ int main()
         }
 
         scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
         if (failures == 0)
         {
             if (ssc.selfCollision)
@@ -6314,6 +6740,114 @@ int main()
             return 0;
         }
         std::printf("[ FAIL ] gpu-sdk-step: softbodyselfcollide checks failed (%d)\n", failures);
+        return 2;
+    }
+
+    // P9.41 -- PXG_SCENE=articulationjoint: the `articulation` scene with two more
+    // questions, both of which P9.40's guard showed that scene cannot answer.  The link
+    // swings from horizontal to hanging (`articulation` scores that), and then:
+    //  (a) does PxArticulationCache report the joint angle the link visibly has?  On
+    //      the GPU path the joint positions come back through the DMA of
+    //      PxgArticulation::jointPositions, whose ONLY writer is updateBodiesLaunch1T
+    //      (forwardDynamic2.cu:3035-3040).  With it unmapped the cache says 0 while
+    //      the link hangs at -pi/2.
+    //  (b) does the articulation fall ASLEEP once it has settled?  Its wake counter is
+    //      written by updateBodiesLaunch_Part3 (forwardDynamic2.cu:3205-3249); with it
+    //      unmapped the counter never counts down and isSleeping() never turns true.
+    // Pending-work entry in run_scenes.sh until both kernels land.
+    if (!std::strcmp(sceneName, "articulationjoint"))
+    {
+        std::vector<RestTarget> artiTargets;
+        PxArticulationReducedCoordinate* arti = buildArticulationScene(physics, scene, material, artiTargets);
+        PxArticulationLink* link = nullptr;
+        PxArticulationCache* cache = arti ? arti->createCache() : nullptr;
+        if (!arti || arti->getLinks(&link, 1, 1) != 1 || !link || !cache || artiTargets.empty())
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: articulationjoint scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'articulationjoint' built: fixed-base articulation, one revolute link, "
+                    "%u dof(s), plus the companion box\n", arti->getDofs());
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: articulationjoint pipeline CONSTRUCTED (set PXG_GPU_STEP=1 to step it)\n");
+            cache->release();
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        // The joint frames carry no rotation and the base is fixed with identity
+        // rotation, so the joint angle IS the angle of the link's local x axis in the
+        // x-y plane.  That is the geometric truth the cache is checked against.
+        auto geometricAngle = [&]() {
+            const PxVec3 ax = link->getGlobalPose().q.getBasisVector0();
+            return std::atan2(ax.y, ax.x);
+        };
+        auto cachedAngle = [&]() {
+            arti->copyInternalStateToCache(*cache, PxArticulationCacheFlag::ePOSITION);
+            return cache->jointPosition[0];
+        };
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_ARTI_STEPS");
+        // 360, not `articulation`'s 240: the sleep decision needs the link to be at rest
+        // for a full wake-counter period (0.4 s by default) AFTER it has settled.
+        const int steps = stepsEnv ? atoi(stepsEnv) : 360;
+        int asleepSince = -1;
+        std::printf("  stepping articulationjoint (%d x %.4fs): cache q0=%.4f, geometric q0=%.4f\n",
+                    steps, dt, cachedAngle(), geometricAngle());
+        for (int i = 0; i < steps; ++i)
+        {
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            if (asleepSince < 0 && arti->isSleeping()) asleepSince = i;
+            if (i < 3 || i == steps - 1 || (i % 40 == 0))
+                std::printf("    step %3d: cache q = %+.4f | geometric q = %+.4f | link y = %.4f | wake counter "
+                            "%.4f%s\n", i, cachedAngle(), geometricAngle(), link->getGlobalPose().p.y,
+                            arti->getWakeCounter(), arti->isSleeping() ? " (asleep)" : "");
+        }
+        const float qCache = cachedAngle();
+        const float qGeom = geometricAngle();
+        const float linkY = link->getGlobalPose().p.y;
+        const float linkRestY = artiTargets.back().restY;
+        const bool sleeping = arti->isSleeping();
+        const float wake = arti->getWakeCounter();
+        std::printf("  articulationjoint: joint angle from the cache %+.4f vs from the link pose %+.4f "
+                    "(difference %.4f); link y %.4f (rest %.3f); asleep %s (wake counter %.4f%s)\n",
+                    qCache, qGeom, PxAbs(qCache - qGeom), linkY, linkRestY, sleeping ? "YES" : "no", wake,
+                    asleepSince >= 0 ? "" : ", never slept");
+        if (asleepSince >= 0) std::printf("  articulationjoint: asleep since step %d\n", asleepSince);
+
+        int failures = 0;
+        // (1) the link swung down -- else (3) is trivially satisfied by two zeros.
+        if (!(PxAbs(qGeom) > 1.0f))
+        { std::printf("FAIL: the link did not swing (geometric angle %+.4f, need |q| > 1.0)\n", qGeom); ++failures; }
+        // (2) and hangs in the rest band the `articulation` scene scores.
+        if (!(PxAbs(linkY - linkRestY) < 0.75f))
+        { std::printf("FAIL: link y %.4f is outside the rest band around %.3f\n", linkY, linkRestY); ++failures; }
+        // (3) THE CACHE AGREES WITH THE GEOMETRY.
+        if (!(PxAbs(qCache - qGeom) < 0.05f))
+        { std::printf("FAIL: PxArticulationCache reports joint position %+.4f but the link hangs at %+.4f rad "
+                      "-- the joint state never came back from the GPU.  updateBodiesLaunch1T is its only "
+                      "writer; if the [pxg-unmapped] lines below name it, this is that\n", qCache, qGeom); ++failures; }
+        // (4) IT FELL ASLEEP.
+        if (!sleeping)
+        { std::printf("FAIL: the articulation is still awake after %d steps (wake counter %.4f) -- the sleep "
+                      "decision is updateBodiesLaunch_Part3's; if the [pxg-unmapped] lines below name it, "
+                      "this is that\n", steps, wake); ++failures; }
+        if (!std::isfinite(qCache) || !std::isfinite(qGeom) || !std::isfinite(linkY))
+        { std::printf("FAIL: a value went non-finite\n"); ++failures; }
+
+        cache->release();
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release();
+        failures += unmappedPenalty();
+        if (failures == 0)
+        {
+            std::printf("[  OK  ] gpu-sdk-step: the articulation's JOINT STATE comes back from the GPU (%+.4f rad, "
+                        "matching the link pose) and it FELL ASLEEP at step %d -- both articulation "
+                        "body-update stages are live on Vulkan\n", qCache, asleepSince);
+            return 0;
+        }
+        std::printf("[ FAIL ] gpu-sdk-step: articulationjoint checks failed (%d)\n", failures);
         return 2;
     }
 
@@ -6340,6 +6874,7 @@ int main()
                        "          cloth|clothhang|clothdrape\n"
                        "          clothselfcollide|clothcloth\n"
                        "          softbody|softbodyselfcollide|softbodycloth|softbodystack|softbodyattach\n"
+                       "          clothnet|particlepush|articulationjoint   (P9.41: pending-work, not scored)\n"
                        "  modes:  PXG_SCENE=particle       + PXG_PARTICLE_STARTY=<y>      (the settling bag)\n"
                        "          PXG_SCENE=particlefluid  + PXG_PARTICLE_FLUID_CONTROL=1 (solid-phase control)\n"
                        "          PXG_SCENE=particlecloth  + PXG_PARTICLE_CLOTH_CONTROL=1 (no-spring control)\n"
@@ -6413,16 +6948,7 @@ int main()
     // P9.40.  A scene that drove unmapped kernels ran a DIFFERENT simulation than the
     // one it claims to test, however green its own checks are.  Say so on every run,
     // and fail on it when asked to.
-    if (gUnmappedLaunchReports)
-    {
-        const bool strict = std::getenv("PXG_REQUIRE_MAPPED") != nullptr;
-        std::printf("  [unmapped] %u kernel(s) were launched but are not mapped to SPIR-V and were "
-                    "silently skipped -- see the [pxg-unmapped] lines above%s\n",
-                    gUnmappedLaunchReports,
-                    strict ? "; PXG_REQUIRE_MAPPED is set, counting this as a FAILURE" : "");
-        if (strict)
-            failures += int(gUnmappedLaunchReports);
-    }
+    failures += unmappedPenalty();
 
     if (failures == 0)
     {

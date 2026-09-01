@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **837/837** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **841/841** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.33a added `gpuslang.npFloatIntrinRecipSqrt`, which is not a kernel port but a
 PLATFORM measurement: about forty shaders here spell `PxVec3::getNormalized` as
 `v * rsqrt(m)`, while the engine computes `PxRecipSqrt` = `1.0f/sqrtf` — two exactly
@@ -1747,6 +1747,87 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.40 — der Wächter: „grün" sagte etwas über die Prüfung, nicht über die Physik
+
+Kein Kernel-Port. Manifest unverändert bei **383**. `testP3UnmappedLaunch` kommt hinzu
+(Suite 837 → 838); gemessen wurde die Suite erst zusammen mit den drei Folge-Tranchen
+P9.42/P9.43a/P9.43b in einem Bau: **841/841 in beiden Speichermodi**, beide im ersten
+Anlauf. Szenen **33/33 ok, 0 fail, 0 missing** — mit einer neuen Spalte, die es vorher
+nicht gab.
+
+### Der Befund, der diese Tranche ausgelöst hat
+
+Ein nicht abgebildeter Kern hatte im Wrangler einen **leeren Slot**. Ein Start über
+diesen Slot kehrte in der ersten Zeile von `launchKernel` mit `InvalidValue` zurück —
+**vor** jeder Verfolgungszeile, vor jedem Namen. Und der Host prüft dieses Ergebnis an
+fast allen Stellen nur unter einem modulweisen Debug-Makro (`FEM_GPU_DEBUG`,
+`SB_GPU_DEBUG`, `PS_GPU_DEBUG`, `SC_GPU_DEBUG`), das der Release-Bau wegkompiliert.
+Der Kern wurde übersprungen, und nichts sagte es.
+
+Gemessen: eine vollständige Erfassung aller 33 Szenen enthält **null**
+Engine-Startfehlerzeilen. Statisch gelesen: die Impulsrückkopplung FEM/Partikel →
+Starrkörper und zwei Artikulations-Stufen werden **jeden Schritt** gestartet. Beides
+zugleich ist nur möglich, wenn die Starts still scheitern. Die Szenen waren grün, weil
+ihre Prüfungen etwas anderes maßen als das, was fehlte — und weil in keiner der 33
+Szenen ein **dynamischer** Starrkörper von einem Verformbaren **abhängt**: `clothbox`
+landet das Tuch auf einer 1000-kg-Kiste, die die Schwerkraft ohnehin am Boden hält; die
+Weichkörperszenen parken ihren einzigen Dynamischen absichtlich bei x = 10, die
+Partikelszenen ihren bei x = 20.
+
+### Der Mechanismus, so gebaut, dass sich nichts anders verhält
+
+* Die Funktionstabelle führt jetzt **jeden** Registriernamen, abgebildet oder nicht;
+  der Wrangler fragt `moduleGetFunction` also auch nach den unabgebildeten.
+* `moduleGetFunction` antwortet für sie weiterhin `NotFound` — Fehlerpfad und `mError`
+  des Wranglers bleiben, wie sie waren — gibt aber einen **unterscheidbaren,
+  nicht-leeren Sentinel-Handle** zurück (id + 1 mit gesetztem Bit 40).
+* `fromFunc` lehnt den Sentinel genau so ab wie den leeren Slot: jeder Verbraucher,
+  der vorher einen leeren Slot verweigerte, verweigert weiter — `InvalidValue`, kein
+  Dispatch.
+* Der Verweigerungspfad beider Startformen dekodiert den Sentinel, **zählt** je Kern
+  und druckt unter `PXG_LAUNCH_TRACE` beim ersten Mal eine Zeile — nicht bei jedem
+  Frame.
+* Bei der Kontextfreigabe wird jeder betroffene Kern über den Foundation-Fehlerkanal
+  gemeldet: `[pxg-unmapped] <Name> was launched N time(s) but has no SPIR-V mapping`.
+  **Unbedingt**, sobald eine Foundation existiert — Schweigen an dieser Stelle wäre
+  genau der Defekt, den das hier beendet.
+
+`gpu-sdk-step` zählt diese Zeilen und druckt eine Zusammenfassung unter sein
+Verdikt; mit `PXG_REQUIRE_MAPPED=1` zählen sie als Fehler. `run_scenes.sh` listet die
+übersprungenen Kerne unter jeder Szenenzeile und bekommt `--strict`.
+
+`testP3UnmappedLaunch` nagelt die drei Eigenschaften fest, die die Änderung sicher
+machen: der Sentinel-Start wird mit demselben Ergebnis verweigert wie ein leerer Slot
+und nichts wird gestartet; er wird je Kern-Id gezählt und nur für Sentinels — ein
+echter Null-Handle bleibt anonym; ein abgebildeter Kern ist unberührt. Eine Sache
+ändert sich, nur in Debug-Bauten: `getCuFunction`s `PX_ASSERT(func)` feuert für
+unabgebildete Kerne nicht mehr, weil der Slot nicht mehr leer ist — die benannte
+Meldung ersetzt den anonymen Assert.
+
+### Was der Wächter beim ersten Lauf sagte
+
+Acht Kerne, in drei Gruppen, kein weiterer:
+
+| Gruppe | Kerne | Szenen | Starts je Lauf |
+|---|---|---|---|
+| Einfrier-Trio | `computeFrozenAndUnfrozenHistogramLaunch`, `outputFrozenAndUnfrozenHistogram`, `createFrozenAndUnfrozenArray` | **alle 33** | ×25 (`joint`) bis ×300 (Fluid-Szenen) |
+| Artikulations-Update | `updateBodiesLaunch1T`, `updateBodiesLaunch_Part3` | `articulation` | ×240 (jeder Schritt) |
+| Starrkörper-Kopplung | `accumulateDeltaVRigidFirstLaunch`, `accumulateDeltaVRigidSecondLaunch` | alle 23 Verformbaren-Szenen | ×240 (`cloth`) bis ×3100 (`softbodyselfcollide`) |
+| | `ps_solvePCOutputRigidDeltaVTGSLaunch` | alle 10 Partikelszenen | ×600 bis ×2700 |
+
+Die Zahlen sind Schritte mal Löser-Iterationen: `accumulateDeltaVRigid*` läuft je
+Positionsiteration, das Trio einmal je Schritt. Nichts davon war je in einer
+Fehlerzeile zu sehen.
+
+### Was sich daraus ergibt
+
+Die Zahl „33/33" bleibt, bekommt aber einen zweiten Teil: **wie viele Szenen laufen
+eine andere Simulation als die, die sie zu prüfen behaupten.** Die drei Gruppen mit
+Physik dahinter — Einfrier-Trio (Buchhaltung der Scene-Query-Grenzen, in jeder Szene),
+Artikulations-Update (Gelenkzustände für die SDK-Rückgabe, Impulsfluss, Schlaf) und
+die Starrkörper-Kopplung — sind die nächsten Tranchen, in dieser Reihenfolge der
+Sichtbarkeit. Dazu kommen Szenen, die die fehlende Physik **messen** (P9.41).
 
 ## P9.39d — ein Modul vor der zweiten Kopie, und eine zweite Kopie trotzdem
 

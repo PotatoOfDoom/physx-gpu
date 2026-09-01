@@ -136,6 +136,23 @@ if [ "${1:-}" = "--diagnostics" ]; then
     # pending scene must never decide the sweep's verdict.  Printed, like the controls.
     env PXG_SCENE=clothmesh PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
         | grep -E '^  clothmesh:|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step' | sed 's/^/    /'
+
+    # P9.41: three scenes that MEASURE the physics P9.40's guard showed to be
+    # missing -- the ones no scored scene can see because none of them lets a
+    # dynamic rigid depend on a deformable, or reads an articulation's joint state
+    # back.  Each names the kernels it waits on and prints its number now, so the
+    # tranche that maps them has a before-figure to beat.  Each moves into SCENES
+    # the day it passes.  Not scored.
+    echo
+    echo "--- clothnet          (waits on accumulateDeltaVRigidFirst/SecondLaunch: the FEM-to-rigid impulse)"
+    env PXG_SCENE=clothnet PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
+        | grep -E '^  clothnet:|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step|\[pxg-unmapped\]' | sed 's/^/    /'
+    echo "--- particlepush      (waits on ps_solvePCOutputRigidDeltaVTGSLaunch and the same two accumulate kernels)"
+    env PXG_SCENE=particlepush PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
+        | grep -E '^  particlepush:|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step|\[pxg-unmapped\]' | sed 's/^/    /'
+    echo "--- articulationjoint (waits on updateBodiesLaunch1T for the joint state, updateBodiesLaunch_Part3 for sleep)"
+    env PXG_SCENE=articulationjoint PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
+        | grep -E '^  articulationjoint:|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step|\[pxg-unmapped\]' | sed 's/^/    /'
 fi
 
 [ "$fail" -eq 0 ] && [ "$missing" -eq 0 ]
