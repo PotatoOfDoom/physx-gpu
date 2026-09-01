@@ -783,6 +783,11 @@ static const uint8_t kSbPsContactGen[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 8, 8
 // cloth twin's blob -- deliberately its own row rather than an alias, because the two
 // kernels are free to diverge and an alias would hide it.
 static const uint8_t kSbPsPrepare[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8 };
+// sb_solveOutputSPDeltaVLaunch (softBody.cu:1149) and
+// sb_solveOutputParticleDeltaVLaunch (:1286).  Both carry a PxReal between pointers, so
+// each has a 4-byte hole the natural sum does not show: 64 and 72, not 60 and 68.
+static const uint8_t kSbPsSolveSb[] = { 8, 8, 8, 8, 8, 8, 4, 8 };
+static const uint8_t kSbPsSolvePs[] = { 8, 8, 8, 8, 8, 8, 8, 4, 8 };
 // P9.30: the contact gen it feeds.  Thirteen arguments, the last of them
 // PxgFEMContactWriter by value (80 B) -> the writer lands at 96, not 88, because
 // paramAlign(80) is 16 (P9.15e).
@@ -1846,6 +1851,8 @@ static const PxgKernelAbiRow kRows[] = {
     { "sb_psMidphaseGeneratePairsLaunch", kSbPsMidphase, uint32_t(sizeof(kSbPsMidphase)) },
     { "sb_psContactGenLaunch", kSbPsContactGen, uint32_t(sizeof(kSbPsContactGen)) },
     { "sb_particleContactPrepareLaunch", kSbPsPrepare, uint32_t(sizeof(kSbPsPrepare)) },
+    { "sb_solveOutputSPDeltaVLaunch", kSbPsSolveSb, uint32_t(sizeof(kSbPsSolveSb)) },
+    { "sb_solveOutputParticleDeltaVLaunch", kSbPsSolvePs, uint32_t(sizeof(kSbPsSolvePs)) },
     { "cloth_psContactGenLaunch", kClothPsCg, uint32_t(sizeof(kClothPsCg)) },
     // gpusimulationcontroller FEMCloth-vs-PARTICLE constraint prep + solve (P9.31 BDA)
     { "cloth_particleContactPrepareLaunch", kClothPsPrepare, uint32_t(sizeof(kClothPsPrepare)) },
