@@ -1752,9 +1752,9 @@ behind it is the six module tranches, each swept and green on its own.
 
 `sb_particleContactPrepareLaunch` ist portiert. Manifest **380 → 381**, Suite
 **837/837 in beiden Speichermodi** (Modus 1 im ersten Anlauf, Modus 2 im zweiten —
-der bekannte llvmpipe-Absturz aus Aufgabe 16, isoliert 66/66 grün). Der Szenenlauf
-wurde von einem Container-Neustart abgeschnitten und läuft neu; die Zahl wird
-nachgetragen, sobald er durch ist.
+der bekannte llvmpipe-Absturz aus Aufgabe 16, isoliert 66/66 grün), Szenen **33/33
+ok, 0 fail, 0 missing** (der erste Durchgang wurde von einem Container-Neustart
+abgeschnitten und vollständig wiederholt).
 
 ### Das Modul kam vor der zweiten Kopie — und ich schrieb sie trotzdem
 
