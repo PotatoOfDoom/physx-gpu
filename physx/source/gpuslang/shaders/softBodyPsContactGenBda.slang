@@ -353,7 +353,16 @@ void sb_psContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID
                 continue;
 
             // S6: PxVec3::normalize -- magnitude, then ONE reciprocal times three.
-            const float m = length(n);
+            //
+            // sqrt(dot(n, n)) AND NOT length(n).  PxVec3::magnitude (PxVec3.h:270) is
+            // PxSqrt(magnitudeSquared()) -- an OpDot followed by a correctly-rounded
+            // OpSqrt, both exactly specified.  Slang's `length` lowers to
+            // GLSL.std.450 Length, which the SPIR-V environment spec allows 2 ULP of
+            // error on: a DIFFERENT instruction with a slacker contract, whose
+            // agreement would have to be measured per driver the way P9.33a had to
+            // measure InverseSqrt.  Spelling it out costs nothing and needs no
+            // measurement.
+            const float m = sqrt(dot(n, n));
             if (m > 0.0f)
                 n = n * (1.0f / m);
             pen = m;
