@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 387;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 388;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -148,7 +148,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "computeMassMatrix1T", "npArtiMassMatrix.spv", "computeMassMatrix1T" },  // ARTI_COMPUTE_MASS_MATRIX (P8.91c BDA)
     { "computeUnconstrainedAccelerationsLaunch1T", "npArtiLinkAccel.spv", "computeUnconstrainedAccelerationsLaunch1T" },  // ARTI_COMPUTE_UNCONSTRAINED_ACCEL (P8.92c BDA)
     { "artiSaveVelocity1TPGS", "npArtiPropagate2.spv", "artiSaveVelocity1TPGS" },  // ARTI_SAVE_VELOCITY_PGS (unmapped)
-    { "updateBodiesLaunch1T", nullptr, nullptr },  // ARTI_UPDATE_BODIES (unmapped)
+    { "updateBodiesLaunch1T", "npArtiUpdateBodies1T.spv", "updateBodiesLaunch1T" },  // ARTI_UPDATE_BODIES (P9.43b)
     { "updateBodiesLaunch_Part2", "npArtiUpdateBodies.spv", "updateBodiesLaunch_Part2" },  // ARTI_UPDATE_BODIES2 (P8.95b)
     { "updateBodiesLaunch_Part3", "npArtiUpdateBodies.spv", "updateBodiesLaunch_Part3" },  // ARTI_UPDATE_BODIES3 (P9.43a)
     { "setupInternalConstraintLaunch1T", "npArtiSetupICKernel.spv", "setupInternalConstraintLaunch1T" },  // ARTI_SETUP_INTERNAL (P8.97d)

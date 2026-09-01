@@ -177,7 +177,8 @@ public AbMat33 asiTransformInertiaTensor(float3 invD, AbMat33 M)
 // The earlier articulation modules are green today because their fixtures never
 // produce a negative zero as an accumulator's first term — not because they are
 // immune.  Any future accumulator in this port starts from asiRuntimeZero().
-float asiRuntimeZero(float dt)
+// (public since P9.43b: updateBodiesLaunch1T's conserveMomentum has seven of them.)
+public float asiRuntimeZero(float dt)
 {
     return abs(dt) * 0.0f;
 }
