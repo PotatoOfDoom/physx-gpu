@@ -1748,6 +1748,98 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.39a — der erste der letzten sechs, und vier Lücken, die der Fegedurchgang aufgedeckt hat
+
+Manifest **378 → 379**. `sb_psMidphaseGeneratePairsLaunch`
+(softbodyMidPhase.cu:306, Rumpf :323-407, Traverser :253-304) ist der erste von
+**sechs** Kerneln der Softbody-gegen-Partikel-Kette — der letzten Softbody-Kette
+der Engine ohne Port. Suite **834/834**, Szenen **33/33**.
+
+### Ein Zwilling, und was an ihm anders ist
+
+Er ist die **Tetraeder-Fassung** von `cloth_psMidphaseGeneratePairsLaunch` (P9.30):
+dieselbe Anfrage — eine Partikelposition, zu einem Würfel aufgeblasen —, derselbe
+BV32-Lauf, derselbe Paar-Stapel, und **derselbe 88-Byte-Blob mit derselben ABI-Zeile**
+`{4,4,8,8,8,8,8,8,8,4,8,8}`. Deshalb steht der Port auf diesem Gerüst, und die
+Unterschiede sind die Fallen:
+
+* **T2 — `isValidTet` hat im Tuch-Geschwister kein Gegenstück.**
+  softbodyMidPhase.cu:287 prüft das Vorzeichen des Volumens (`> 1e-9`) **vor** dem
+  Hüllentest, ein entarteter Tetraeder erzeugt also gar kein Paar. Wer den
+  Tuch-Traverser kopiert, lässt die Schranke lautlos weg.
+* **T3 — das Kollisionsnetz, nicht das Simulationsnetz.** `mPosition_InvMass` (@64)
+  und `mTetIndices` (@16); `mSimTetIndices` (@80) ist eine andere, meist gröbere
+  Tetraedrisierung **desselben Typs**, sodass nichts als das Ergebnis die
+  Verwechslung bemerkt.
+* **T4 — `eTETRAHEDRONMESH` ist 7.** P9.35c hatte im Geschwister 9 geschrieben
+  (`eHEIGHTFIELD`), die Sortierung tauschte daraufhin immer, der Lauf bekam einen
+  Nullzeiger und das Gerät stürzte ab. Die Weiche prüft hier auf
+  **ePARTICLESYSTEM (6)** statt auf den Netztyp — das ist `LoadShapePairWarp`s eigene
+  Regel und gegen diesen Fehler immun.
+* **T5** — der Würfel hat die halbe Seitenlänge `contactDistance[particle] +
+  contactDistance[softbody]`, die **Summe** beider Formen.
+
+### Der Fegedurchgang: 13 von 18, und alle vier Überlebenden waren echte Lücken
+
+Vier Mutanten standen, und **keiner davon war ein Beweis** — alle vier haben eine
+Vorrichtung entlarvt, die weniger geprüft hat, als sie zu prüfen schien:
+
+* **Ein konstanter Manager-Index überlebte.** Beide Kontaktmanager erzeugen dieselben
+  (Partikel, Tet)-Paare, und die Prüfung fragte nur nach **Mitgliedschaft** in der
+  erwarteten Menge — wer immer 0 schrieb, schrieb Mitglieder. Jetzt läuft ein zweiter
+  Durchgang mit einem Stapel, der **alles** fasst, und vergleicht die **ganze Menge**
+  samt Vielfachheit.
+* **`>` gegen `>=` im Überlappungstest überlebte**, weil kein Fall auf der Grenze lag.
+  Die Szene steht jetzt auf **dyadischer** Geometrie (0,25 + 0,0625 = 0,3125 exakt)
+  mit einem Partikel, dessen `cx + R` **bitgenau** auf `tMin.x` eines Tetraeders
+  fällt — und die Vorrichtung **behauptet diese Gleichheit**, damit die Grenze nicht
+  unbemerkt wegdriftet.
+* **Das Halbieren der Anfragebox überlebte**, weil jeder Treffer über die **obere**
+  Seite entschied. Ein Partikel liegt jetzt **über** einem Tetraeder, sodass die
+  untere Seite tragend wird.
+* **Das Weglassen der `numWorkItems`-Schranke überlebte**, weil der Dispatch genau so
+  viele y-Gruppen hatte wie Arbeit. Ein dritter Dispatch ist jetzt absichtlich **drei
+  Gruppen breiter**.
+
+**Zweiter Durchgang: 17 von 18.** Der eine Überlebende ist ein **Beweis**: `safePrim`
+statt `primitiveIndex` ins Paar zu schreiben ist unbeobachtbar, denn ein Paar wird nur
+bei `intersect` geschrieben, das setzt `primitiveIndex != 0xffffffff` voraus, und dort
+ist `primitiveIndex = lane + primStartIndex ≤ primStartIndex + nbPrimitives - 1` — das
+`min` ist ein No-Op. Die beiden sind auf **jedem je geschriebenen Paar** gleich. Die
+Sentinel-Form bleibt, weil das CUDA sie so schreibt und weil die Gleichheit in dem
+Moment aufhört zu gelten, in dem eine Lane jenseits der Zählung schreiben darf.
+
+### Ein Fehler beim Verdrahten, den die Prüfung sofort gefangen hat
+
+Das Manifest wächst **nicht**, indem man eine Zeile hinzufügt: jede Registry-Zeile
+existiert bereits als `nullptr`-Platzhalter, und die Prüfung verlangt **exakte
+Registry-Reihenfolge** (`PxgKernelNames.h`). Mein erster Versuch fügte eine zweite
+Zeile neben dem Geschwister ein — 122 Reihenfolge-Abweichungen, sofort rot. Richtig
+ist, den Platzhalter **an Ort und Stelle** zu belegen und `PXG_SLANG_KERNEL_MAPPED`
+von Hand zu erhöhen.
+
+### Verifikation
+
+* Vorrichtung: **12 Paare** über 7 Partikel × 8 Tetraeder × 2 Manager; **2** durch
+  `isValidTet` unterdrückt, **4** nur mit der **Summe** beider Kontaktabstände
+  erreichbar, 5 in einen 5-Paar-Stapel geschrieben bei Zähler 12 — die
+  „verwerfen, aber weiterzählen"-Eigenschaft ist gemessen, nicht angenommen;
+* Fegen **17/18**, der Überlebende bewiesen, nicht entschuldigt;
+* Suite **834/834 in beiden Speichermodi** (Standard im zweiten Anlauf, der erste traf
+  den bekannten llvmpipe-Absturz in `femClothSim`, Aufgabe 16, den diese Tranche nicht
+  berührt);
+* Manifest geändert, also `build-sdk` neu gebaut und die Szenen gelaufen:
+  **33 ok, 0 fail, 0 missing (von 33)**.
+
+### Was noch aussteht
+
+Fünf Kernel der Kette, und **vor** dem Kontakterzeuger die beiden wirklich
+unportierten Abhängigkeiten: `findBufferOffset` / `findBufferIndexFromUniqueId`
+(Binärsuche über die Unique-Ids der Partikelpuffer) und ein geteiltes
+`computeTetBarycentric` — dessen Form P9.37 bereits geklärt hat: die vier
+vorhandenen Kopien stimmen überein und unterscheiden sich nur darin, ob das
+eps-Prädikat mitberechnet wird.
+
 ## P9.38 — fünfzehn Abschriften derselben Suche, elf davon zusammengelegt, und zwei Algorithmen, wo die Engine einen hat
 
 Kein Kernel-Port, kein neuer Prüfer. Manifest **unverändert bei 378**, Suite
