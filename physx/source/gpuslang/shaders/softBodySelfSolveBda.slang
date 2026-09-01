@@ -91,17 +91,13 @@
 
 import pxgSlangSoftBodyDesc;   // PxgSoftBodyGpu (mSimTetIndices@80, mSimDelta@272, ...)
 import pxgSlangAtomicFloat;    // pxgAtomicAddF4XYZ / pxgAtomicAddF4W (VK_EXT_shader_atomic_float)
+import pxgSlangSoftBodySolve;  // P9.39d: the nine solve helpers, lifted OUT of this file
 
 // PxgSoftBodyKernelGridDim / BlockDim::SB_UPDATEROTATION (PxgSoftBodyCoreKernelIndices.h).
 static const uint SS_GRID = 1024u;
 static const uint SS_BLOCK = 256u;
 
 // PxEncodeSoftBodyIndex (PxgSimulationCoreDesc.h): (softBodyId << 20) | tetId.
-static const uint PXG_BITSHIFT_TET_ID = 20u;
-static const uint PX_MAX_NB_DEFORMABLE_VOLUME_TET = 0x000fffffu;
-
-uint getSoftBodyId(uint compressedId) { return compressedId >> PXG_BITSHIFT_TET_ID; }
-uint getSoftBodyElementIndex(uint compressedId) { return PX_MAX_NB_DEFORMABLE_VOLUME_TET & compressedId; }
 
 // ---------------------------------------------------------------------------
 // PxgFemFemContactInfo (PxgFEMCore.h:51), 16 B: pairInd0 PxU64 @0, pairInd1 PxU32 @8,
@@ -127,105 +123,6 @@ uint64_t ssBlockBase(uint64_t constraints, uint workIndex)
     return constraints + uint64_t(workIndex / 32u) * SSC_STRIDE;
 }
 
-// ---------------------------------------------------------------------------
-// PxsDeformableVolumeMaterialData (PxsDeformableVolumeMaterialCore.h:50), PX_ALIGN(16):
-// youngs @0, poissons @4, dynamicFriction @8, elasticityDamping @12, dampingScale (PxU16)
-// @16, materialModel (PxU16) @18, deformThreshold @20, deformLowLimitRatio @24,
-// deformHighLimitRatio @28 -> 32 bytes, and 32 is already a multiple of 16 so the array
-// stride is 32.
-// ---------------------------------------------------------------------------
-static const uint64_t MAT_STRIDE = 32UL;
-static const uint64_t MAT_dynamicFriction = 8UL;
-
-float materialDynamicFriction(uint64_t materials, uint materialIndex)
-{
-    return Ptr<float>(materials + uint64_t(materialIndex) * MAT_STRIDE + MAT_dynamicFriction)[0];
-}
-
-// mMaterialIndices is a PxU16 array; llvmpipe has no 16-bit storage in these shaders, so the
-// containing 32-bit word is read and the half extracted.  NOTE `& ~uint64_t(3)`: writing
-// `& ~3UL` MISCOMPILES -- Slang evaluates the complement in 32 bits and clears the top half
-// of the device address (documented at length in softBodySolveBda.slang).
-uint materialIndexAt(uint64_t base, uint tetIdx)
-{
-    const uint64_t addr = base + uint64_t(tetIdx) * 2UL;
-    const uint word = Ptr<uint>(addr & ~uint64_t(3))[0];
-    return (addr & 2UL) != 0UL ? (word >> 16u) : (word & 0xffffu);
-}
-
-// ---------------------------------------------------------------------------
-// computeTetraContact (softBody.cuh:61) — the barycentric blend of the four tet corners,
-// with the four .w components handed back as the per-corner inverse masses.
-// ---------------------------------------------------------------------------
-float4 computeTetraContact(Ptr<float4> vals, uint4 tetId, float4 bary, out float4 invMass)
-{
-    const float4 v0 = vals[tetId.x];
-    const float4 v1 = vals[tetId.y];
-    const float4 v2 = vals[tetId.z];
-    const float4 v3 = vals[tetId.w];
-    invMass = float4(v0.w, v1.w, v2.w, v3.w);
-    return v0 * bary.x + v1 * bary.y + v2 * bary.z + v3 * bary.w;
-}
-
-// AtomicAdd(float4& out, const PxVec3& v, PxReal addition) — three component adds plus the
-// .w weight the later averaging pass divides by.  Dropping the .w add silently halves every
-// delta, so it is not optional bookkeeping.
-void atomicAddDelta(uint64_t base, uint vertIdx, float3 dP, float addition)
-{
-    pxgAtomicAddF4XYZ(base, vertIdx, dP);
-    pxgAtomicAddF4W(base, vertIdx, addition);
-}
-
-// updateTetraPosDelta (softBody.cuh:77).
-void updateTetraPosDelta(float4 invMasses, float4 bary, uint4 tetId, float3 deltaPos,
-                         uint64_t outDeltasAddr)
-{
-    if (invMasses.x > 0.0f && abs(bary.x) > 1e-6f)
-        atomicAddDelta(outDeltasAddr, tetId.x, deltaPos * (invMasses.x * bary.x), 1.0f);
-    if (invMasses.y > 0.0f && abs(bary.y) > 1e-6f)
-        atomicAddDelta(outDeltasAddr, tetId.y, deltaPos * (invMasses.y * bary.y), 1.0f);
-    if (invMasses.z > 0.0f && abs(bary.z) > 1e-6f)
-        atomicAddDelta(outDeltasAddr, tetId.z, deltaPos * (invMasses.z * bary.z), 1.0f);
-    if (invMasses.w > 0.0f && abs(bary.w) > 1e-6f)
-        atomicAddDelta(outDeltasAddr, tetId.w, deltaPos * (invMasses.w * bary.w), 1.0f);
-}
-
-// getSoftBodyInvMass (softBody.cuh:38) — the blended inverse mass of a TET contact is scaled
-// by the LENGTH of the barycentric vector.  Identical to the factor P8.3 found in the
-// attachment prepare, and just as load-bearing: dropping the square root gives every
-// self-contact the wrong stiffness.
-float getSoftBodyInvMass(float baryMass, float4 bary)
-{
-    const float scale = sqrt(bary.x * bary.x + bary.y * bary.y + bary.z * bary.z + bary.w * bary.w);
-    return baryMass * scale;
-}
-
-// computeInvMass (softBody.cu:608).
-float computeInvMass(uint4 tetId, Ptr<float4> position_invmass, float4 bary)
-{
-    const float4 a = position_invmass[tetId.x];
-    const float4 b = position_invmass[tetId.y];
-    const float4 c = position_invmass[tetId.z];
-    const float4 d = position_invmass[tetId.w];
-    const float invMass = a.w * bary.x + b.w * bary.y + c.w * bary.z + d.w * bary.w;
-    return getSoftBodyInvMass(invMass, bary);
-}
-
-// PxVec3::normalize (PxVec3.h:299) — returns the LENGTH and leaves the vector unit; a
-// zero-length vector is left alone and the length is 0.
-float vecNormalizeInPlace(inout float3 v)
-{
-    const float m = v.x * v.x + v.y * v.y + v.z * v.z;
-    if (m > 0.0f)
-    {
-        // P9.36: normalize() scales through operator/= (PxVec3.h:260) -- ONE reciprocal,
-        // three multiplies.  The header two lines up already named the right function.
-        const float len = sqrt(m);
-        v = v * (1.0f / len);
-        return len;
-    }
-    return 0.0f;
-}
 
 // ===========================================================================
 // sb_softbodyContactPrepareLaunch
