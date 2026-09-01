@@ -1462,6 +1462,11 @@ static const PxgKernelAbiRow kRows[] = {
     { "updateTransformCacheAndBoundArrayLaunch", kOnePtr, 1u },
     { "updateBodiesLaunch", kOnePtr, 1u },
     { "updateChangedAABBMgrHandlesLaunch", kOnePtr, 1u },
+    // P9.42: the frozen/unfrozen compaction trio, same one-pointer list
+    // (PxgSimulationCore.cpp:2656-2660, :2695-2706)
+    { "computeFrozenAndUnfrozenHistogramLaunch", kOnePtr, 1u },
+    { "outputFrozenAndUnfrozenHistogram", kOnePtr, 1u },
+    { "createFrozenAndUnfrozenArray", kOnePtr, 1u },
     { "updateShapesLaunch", kUpdateShapes, uint32_t(sizeof(kUpdateShapes)) },
     // updateBodiesAndShapes.cu: updateJointsLaunch(const PxgUpdatedJointsDesc*)
     // -> single device pointer {8} (P5 Step 5 tranche 12: the joint CPU->GPU scatter)
