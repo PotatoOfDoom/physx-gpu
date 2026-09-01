@@ -184,13 +184,23 @@ PXG_TEST(npDefFilterBda)
     // green.  The last two entries carry NON-ZERO high words so the comparison has to
     // load and use them: both must be MISSED, and they must not disturb the ordering
     // that the searches below rely on.
+    //
+    // B1d -- index1 MUST DISCRIMINATE.  In the first version every distinct index0 had
+    // exactly one index1, so the index1 comparison never chose between two entries: it
+    // fired only when index0 was already equal, and then index1 was equal too.
+    // Reversing its two branches was therefore invisible, and the sweep proved it by
+    // leaving `C-index1-order-swap` green.  index0 = 7 now carries THREE index1 values
+    // (15, 22, 30) so a search for the lowest has to step down past the highest --
+    // exactly the step a reversed comparison gets wrong.
     std::vector<PairNRHost> pairs = {
         { 5u, 0u, 11u, 0u   },
+        { 7u, 0u, 15u, 0u   },   // B1d: same index0 as the pair below, lower index1
         { 7u, 0u, 22u, 700u },
         { 7u, 0u, 22u, 900u },
+        { 7u, 0u, 30u, 0u   },   // B1d: same index0, higher index1
         { 9u, 0u, 33u, 800u },
         { 12u, 0u, 44u, 0u  },
-        { 7u, 1u, 22u, 700u },   // same low word as entry 1, high word 1 -> different pair
+        { 7u, 1u, 22u, 700u },   // same low word as (7,22,700), high word 1 -> other pair
         { 0u, 2u, 11u, 0u   },   // low word 0, high word 2 -> sorts after everything
     };
     std::sort(pairs.begin(), pairs.end(), [](const PairNRHost& a, const PairNRHost& b) {
@@ -231,6 +241,14 @@ PXG_TEST(npDefFilterBda)
     // high word changes an answer.
     nr2(0u, 11u);
     nr3(0u, 11u, 0u, false);
+
+    // B1d: (7, 15) is the LOWEST index1 under index0 = 7, and the search's first probe
+    // lands on (7, 30).  Getting there requires index1 to compare in the right
+    // direction: reverse it and the search walks away from the entry and reports a miss.
+    // (7, 30) itself is useless as a probe -- the first comparison hits it exactly, so
+    // both directions agree.
+    nr2(7u, 15u);
+    nr2(7u, 30u);
 
     // B3: the particle chain.  particle 2 -> buffer 0 (uid 700), particle 6 -> buffer
     // 1 (uid 800), particle 11 -> buffer 2 (uid 900).  The pair array was built so
@@ -310,6 +328,21 @@ PXG_TEST(npDefFilterBda)
             for (const DfbQuery& q : qs)
                 if ((q.mode == 1u || q.mode == 2u) && q.id0 == e.i0lo && q.id1 == e.i1)
                     ++hiWordDiscriminating;
+    // B1d coverage: some index0 must carry at least two DIFFERENT index1 values, and a
+    // query must ask for one of them -- otherwise index1 never chooses between entries
+    // and reversing its comparison stays invisible.
+    uint32_t idx1Discriminating = 0u;
+    for (const PairNRHost& e : pairs)
+        for (const PairNRHost& f : pairs)
+            if (e.i0lo == f.i0lo && e.i0hi == f.i0hi && e.i1 != f.i1)
+                for (const DfbQuery& q : qs)
+                    if ((q.mode == 1u || q.mode == 2u) && q.id0 == e.i0lo && q.id1 == e.i1)
+                        ++idx1Discriminating;
+    PXG_CHECK_MSG(idx1Discriminating > 0u,
+                  "no index0 carries two different index1 values with a query asking for "
+                  "one of them, so index1 never chooses between entries and reversing its "
+                  "comparison (B1d) would still pass");
+
     PXG_CHECK_MSG(hiWordDiscriminating > 0u,
                   "no query matches a pair in (low word, index1) while differing in the "
                   "index0 HIGH word, so ignoring the high word entirely (B1c) would still "
