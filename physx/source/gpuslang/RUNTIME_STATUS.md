@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **835/835** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **836/836** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.33a added `gpuslang.npFloatIntrinRecipSqrt`, which is not a kernel port but a
 PLATFORM measurement: about forty shaders here spell `PxVec3::getNormalized` as
 `v * rsqrt(m)`, while the engine computes `PxRecipSqrt` = `1.0f/sqrtf` — two exactly
@@ -1747,6 +1747,132 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.39c — der Kernel, für den P9.39b existierte, und fünf Extremfälle, die nicht im Feld lagen
+
+`sb_psContactGenLaunch` ist portiert. Manifest **379 → 380**, Suite **836/836 in
+beiden Speichermodi, jeweils im ersten Anlauf**, Szenen **33/33 ok, 0 fail, 0 missing**.
+
+Der Szenendurchgang brauchte diesmal rund **54 Minuten** statt der sonst üblichen
+Viertelstunde. Das ist erklärbar und kein Alarm: der Kontaktgenerator ist abgebildet,
+die **Löser-Hälfte der Kette aber noch nicht** (`sb_particleContactPrepareLaunch` und
+die drei Delta-V-Ausgaben stehen weiter als Platzhalter im Manifest). Es entstehen also
+Kontakte, die niemand auflöst — die Partikel trennen sich nicht, und jeder Schritt
+erzeugt sie erneut. Alle Szenen bleiben grün, aber die Zahl gehört aufgeschrieben,
+damit der nächste Durchgang nach P9.39d wieder daran gemessen werden kann.
+
+Er ist der einzige Aufrufer im ganzen Korpus, der die Filtersuche mit einem **echten**
+index2 und `ignoreIndex2 = false` braucht — genau die Eigenschaft, die P9.39b ins
+Modul gelegt hat und die vorher nirgends geübt wurde.
+
+### Zwei Dinge im Kernel, die kein Compiler bemerkt
+
+**Zwei verschiedene Partikelindizes**, dreißig Zeilen auseinander in der Engine. Der
+Filterschlüssel ist der **unsortierte** Index (`mSortedToUnsortedMapping[particleIndex]`),
+die Position und `pairInd0` des Kontakts benutzen den **sortierten** unverändert. Ein
+Port, der einen für beides nimmt, übersetzt, läuft und filtert den falschen Partikel.
+In der Prüfvorrichtung ist die Abbildung deshalb eine **fixpunktfreie Permutation** —
+mit der Identität wäre die Verwechslung unsichtbar, und eine Zusicherung erzwingt das.
+
+**Die Kontaktabstandsprüfung existiert nur im Außen-Zweig.** Ein Partikel *innerhalb*
+des Tetraeders erzeugt immer einen Kontakt, unabhängig von `cDistance`, und seine
+Eindringtiefe kommt aus `dot(n, n2)` statt aus der Länge.
+
+Dazu eine Ersetzung, die hier zulässig ist und dreißig Zeilen weiter nicht:
+`PointOutsideOfPlane4` liefert vier Vorzeichenprodukte, und **dieser** Kernel liest sie
+ausschließlich als Konjunktion — genau das, was `isPointOutsideOfPlane4` zurückgibt.
+`getClosestPtPointTetrahedron` (`softbodyPrimitives.cu:1762`) liest die Komponenten
+einzeln; dort wäre dieselbe Ersetzung falsch. Als Falle S4 im Kopf, damit der nächste
+Leser die andere Stelle nicht „mitvereinfacht".
+
+### Der Wirtsspiegel aus der Quelle, nicht aus dem Port — und was das sofort einbrachte
+
+Der Spiegel ist aus `softbodyPrimitives.cu` abgeschrieben, **nicht** aus dem Slang. Ein
+Spiegel, der aus dem Port entsteht, wiederholt dessen Fehler — so blieben in P9.36 vier
+bit-exakte Vorrichtungen über einem Defekt grün. Diese Reihenfolge zahlte sich sofort:
+
+* **Die Zweigreihenfolge von `closestPtPointTriangle2` gehört zur Funktion.** Kante AB
+  wird **vor** Ecke C geprüft, und `cp/d5/d6` werden erst danach berechnet. Meine erste
+  Abschrift gruppierte die drei Eckentests und dann die drei Kantentests; auf einer
+  gemeinsamen Gebietsgrenze gewinnt der erste passende Test, also ist das beobachtbar.
+  Die Modulfassung hatte es bereits richtig — der Fehler war meiner, im Spiegel.
+* Ein **unabhängiger Audit** des Shaders gegen die CUDA-Quelle fand `length(n)`, wo
+  `PxVec3::magnitude` ein `PxSqrt(magnitudeSquared())` ist — ein OpDot und ein korrekt
+  gerundetes OpSqrt. Slangs `length` bildet `GLSL.std.450 Length` ab, dem die
+  SPIR-V-Umgebungsspezifikation **2 ULP** zugesteht. Jetzt als `sqrt(dot(n, n))`
+  geschrieben, was keine Messung braucht.
+
+  Das ist keine spekulative Sorge: `femClothDampingBda.slang:85-89` hält aus einer
+  Messung fest, dass die erste Fassung mit `length` „um ein ULP von der Wirtsreferenz
+  abwich, bei zwei von fünf Ecken", und `npSbPrim.slang:210-216` — die Phase-1-Portierung
+  **derselben** Kollision — schreibt bereits `sqrt(dot(v, v))`. Wieder zwei Lehrmeinungen
+  nebeneinander, wieder in einem Korpus, dessen Kommentare nicht zwischen ihnen
+  entscheiden können. **30 Shader-Dateien** enthalten ein nacktes `length(`; das ist als
+  siebter statischer Prüfer aufgeschrieben, nicht hier erledigt.
+
+  Bemerkenswert: die drei Gegenprüfer des Audits haben diesen Befund **verworfen**. Die
+  Korrektur bleibt trotzdem — `sqrt(dot)` sind die Operationen der Engine ohne jede
+  Annahme über den Treiber, und der Korpus hat die Abweichung an zwei Stellen bereits
+  gemessen. Ein Mehrheitsvotum ersetzt keine Messung.
+
+### Ein mehrdeutiger Schlüssel, und wie er sich zeigte
+
+Ein Kontakt trägt als Identität `(Partikel, System, Tet-Maske)` — der **Kontaktmanager
+kommt darin nicht vor**. Mit beiden Managern in einer Ausführung sind die zwei Kontakte
+desselben Paares in der Ausgabe ununterscheidbar, unterscheiden sich aber in
+`restDistance`. Der Vergleich fand den Eintrag des anderen Managers, und die
+Eindringtiefen waren um exakt `rest[1] - rest[0]` daneben. Jetzt eine Ausführung je
+Manager — was `rest[cmIdx]` zugleich trennbar hält.
+
+### Fünf Lücken, alle mit derselben Ursache
+
+Fünfundzwanzig Mutanten, im ersten Lauf **neun** überlebend. Fünf davon waren echte
+Lücken der Szene, und jede hatte dieselbe Ursache: **der Extremfall lag nicht im Feld.**
+
+* der ganzkörpergefilterte Partikel lag zu weit von jedem Tetraeder, um überhaupt einen
+  Kontakt zu erzeugen — das Weglassen der `tetFullMask`-Suche änderte deshalb nichts.
+  Er muss ein Partikel sein, der ohne den Filter berührt, und zugleich **nicht** der,
+  der den Innen-Zweig übt: ein Ganzkörpereintrag filtert gegen **jeden** Tetraeder, und
+  eine frühere Fassung hatte damit den Innen-Zweig ganz aus der Szene gelöscht;
+* kein Partikel mit `sqDist` zwischen `cDistance²` und `cDistance`, also war das
+  vergessene Quadrat folgenlos;
+* die Einheits-Ecktetraeder haben einen Inkugelradius **unter** `cDistance`, also konnte
+  kein Partikel gleichzeitig innen und jenseits der Schale liegen — eine zusätzliche
+  Abstandsschranke im Innen-Zweig verwarf nichts. Ein Tetraeder ist jetzt vier Einheiten
+  groß (Inkugelradius ≈ 0,845);
+* kein `dot(n, n2)` zwischen 0,5 und 0,8. Ein flächeninnerer Fußpunkt liefert
+  grundsätzlich ±1 und **kann** die Schwelle nie festnageln; der neue Partikel liegt
+  knapp außerhalb einer **Ecke**, wo `n` entlang (1,1,1)/√3 zeigt und die gewinnende
+  Flächennormale (0,0,1) ist — 0,577;
+* der Stapel fasste immer genau so viele Paare wie die Midphase meldete, also
+  `numPairs == numFound`, und die geklammerte statt der ungeklammerten Zahl zu melden
+  war unbeobachtbar. Der Überlauf-Durchgang läuft jetzt mit einem um sieben Paare zu
+  kurzen Stapel, und der Spiegel läuft den **Stapel** ab statt des Produkts aus Partikeln
+  und Tetraedern — mit Klammerung sind das nicht dieselben Mengen.
+
+Nach dem Schließen: **25 erlegt, 3 überlebend**, und alle drei vorher diagnostiziert.
+
+### Die drei verbliebenen Überlebenden, und warum keiner eine Ausrede ist
+
+* `pen -= restDistance` vor die `n2`-Ersetzung zu ziehen ist **beweisbar gleichwertig**:
+  die Ersetzung schreibt nur `n` und fasst `pen` nie an;
+* `n / m` statt `n * (1/m)` wird von einem **anderen Instrument** erfasst, und das ist
+  vorgeführt statt behauptet: mit dem Mutanten bleibt die Vorrichtung grün, und
+  `gpuslang.vectorDivide` meldet `softBodyPsContactGenBda 1 splat-divide(s)`. Genau
+  dafür wurde dieser Prüfer in P9.36 gebaut — ein Wirtsspiegel von derselben Hand
+  dividiert ebenfalls, also **kann** keine Vorrichtung das sehen;
+* `length(n)` statt `sqrt(dot(n, n))` ist derselbe Fall für den Prüfer, der noch fehlt.
+  Eine treiberabhängige Ein-ULP-Differenz lässt sich von einer Vorrichtung nicht
+  zuverlässig abtasten; das ist eine Aussage über das Instrument, nicht über den Mutanten.
+
+### Ein Fehler am Werkzeug, schon wieder
+
+Mein Skriptgenerator griff für das Ende des Fegeskripts den **ersten** statt des letzten
+Vorkommens eines Ankers — die Wiederherstellungszeile fehlte, und der Shader blieb nach
+dem Lauf mutiert. Beim Reparieren schnitt derselbe Fehler die gesamte Mutantenliste
+weg; sie kam aus dem Sitzungsprotokoll zurück. Ein Anker, der mehrfach vorkommt, ist
+kein Anker — dieselbe Lehre wie in P9.39b, wo `C-r-eq-mid-plus-one` genau daran
+abgebrochen ist, nur diesmal an meinem Generator statt am Skript.
 
 ## P9.39b — ein totgeglaubter Parameter, ein unerreichbarer Überlauf, und drei Lücken, die nur der Mutant sehen konnte
 
