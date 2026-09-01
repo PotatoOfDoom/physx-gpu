@@ -141,9 +141,9 @@ PXG_TEST(softBodyPsPrepare)
 {
     PxgSlangComputeDevice* dev = testDevice();
 
-    const uint32_t NB_SB = 2u, NB_PS = 1u;
+    const uint32_t NB_SB = 3u, NB_PS = 1u;
     // H7: different per softbody, neither zero, and not equal to each other.
-    const float REST[NB_SB] = { 0.0625f, 0.1875f };
+    const float REST[NB_SB] = { 0.0625f, 0.1875f, 0.125f };
 
     // ---- two tet meshes, four sim vertices each, with DIFFERENT inverse masses in .w
     // (H2).  Positions are irrelevant here -- this kernel reads mSimDeltaPos, which is
@@ -165,10 +165,24 @@ PXG_TEST(softBodyPsPrepare)
     if (!bDelta0.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
     DevB bDelta1 = mk(dev, simDelta1);
 
+    // H9: a THIRD tet whose four vertices all have inverse mass 0.  Paired with a
+    // zero-inverse-mass particle it makes unitResponse exactly 0, which is the only
+    // input that separates `(unitResponse > 0) ? 1/unitResponse : 0` from an
+    // unguarded divide or from a `>=` guard.  Without it both mutants survived.
+    std::vector<F4> simDelta2 = {
+        { 0.5f,  -0.25f,  0.125f, 0.0f },
+        { -0.25f, 0.5f,  -0.375f, 0.0f },
+        { 0.375f, 0.125f, 0.25f,  0.0f },
+        { -0.5f,  0.625f, 0.5f,   0.0f },
+    };
+    DevB bDelta2 = mk(dev, simDelta2);
+
     std::vector<U4> tets0 = { { 0u, 1u, 2u, 3u } };
     std::vector<U4> tets1 = { { 3u, 2u, 1u, 0u } };   // deliberately a different winding
+    std::vector<U4> tets2 = { { 0u, 1u, 2u, 3u } };
     DevB bTets0 = mk(dev, tets0);
     DevB bTets1 = mk(dev, tets1);
+    DevB bTets2 = mk(dev, tets2);
 
     std::vector<PxgSoftBody> sbArr(NB_SB);
     std::memset(sbArr.data(), 0, sbArr.size() * sizeof(PxgSoftBody));
@@ -178,6 +192,9 @@ PXG_TEST(softBodyPsPrepare)
     sbArr[1].mSimTetIndices = reinterpret_cast<uint4*>(size_t(bTets1.addr));
     sbArr[1].mSimDeltaPos = reinterpret_cast<float4*>(size_t(bDelta1.addr));
     sbArr[1].mRestDistance = REST[1];
+    sbArr[2].mSimTetIndices = reinterpret_cast<uint4*>(size_t(bTets2.addr));
+    sbArr[2].mSimDeltaPos = reinterpret_cast<float4*>(size_t(bDelta2.addr));
+    sbArr[2].mRestDistance = REST[2];
     DevB bSb = mk(dev, sbArr);
 
     // ---- the particle system: mSortedDeltaP carries the accumulated delta and the
@@ -203,11 +220,14 @@ PXG_TEST(softBodyPsPrepare)
     static_assert(true, "");
     std::vector<F4> contacts(NB_CONTACTS), normalPens(NB_CONTACTS), barys(NB_CONTACTS);
     std::vector<uint32_t> infos(NB_CONTACTS * 4u, 0u);
-    uint32_t nonTrivialScale = 0u;
+    uint32_t nonTrivialScale = 0u, equalBaryComponents = 0u;
     for (uint32_t i = 0; i < NB_CONTACTS; ++i)
     {
-        const uint32_t sbId = i % NB_SB;              // H7: alternate softbodies
-        const uint32_t particleIdx = (i * 13u) % uint32_t(sortedDeltaP.size());
+        // H9: every seventh particle has inverse mass 0; pointing some of those at
+        // softbody 2 (all sim masses 0) makes unitResponse exactly 0.
+        uint32_t particleIdx = (i * 13u) % uint32_t(sortedDeltaP.size());
+        uint32_t sbId = i % 2u;                       // H7: alternate softbodies 0 and 1
+        if (i % 11u == 3u) { particleIdx = (particleIdx / 7u) * 7u; sbId = 2u; }
 
         // contacts[] is dead (Q7) but must still be a real buffer; poison it so a port
         // that USED it would produce nonsense rather than something plausible.
@@ -218,9 +238,25 @@ PXG_TEST(softBodyPsPrepare)
 
         // H1: barycentrics whose L2 norm is clearly not 1.  A vertex-like (1,0,0,0)
         // would make getSoftBodyInvMass the identity and hide it entirely.
-        F4 b{ 0.25f + float(i % 3u) * 0.0625f, 0.25f, 0.25f, 0.25f };
+        //
+        // H8: and PAIRWISE DIFFERENT components.  My first version held y and z at 0.25
+        // for every contact, so swapping which barycentric multiplies which corner was a
+        // no-op and the sweep left that mutant green.  Four distinct weights make the
+        // projection order observable.
+        // Dyadic and PAIRWISE DISTINCT by construction: the three free components walk
+        // in opposite directions in steps of 1/512 so no two can meet, and w takes the
+        // remainder.  (1/16, 3/16, 5/16, 7/16) at k = 0 has L2 norm ~0.573, comfortably
+        // away from 1.
+        const float k = float(i % 8u);
+        F4 b{ 0.0625f + k * (1.0f / 256.0f),
+              0.1875f + k * (1.0f / 512.0f),
+              0.3125f - k * (1.0f / 512.0f),
+              0.0f };
         b.w = 1.0f - b.x - b.y - b.z;
         barys[i] = b;
+        if (!(b.x != b.y && b.x != b.z && b.x != b.w && b.y != b.z &&
+              b.y != b.w && b.z != b.w))
+            ++equalBaryComponents;
         const float scale = std::sqrt(b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w);
         if (std::fabs(scale - 1.0f) > 0.05f) ++nonTrivialScale;
 
@@ -232,6 +268,11 @@ PXG_TEST(softBodyPsPrepare)
         infos[i * 4 + 2] = (sbId << BITSHIFT_TET) | 0u;
         infos[i * 4 + 3] = 0xDEADBEEFu;
     }
+    PXG_CHECK_MSG(equalBaryComponents == 0u,
+                  "%u contacts have two equal barycentric components; the projection's "
+                  "corner order (H8) is unobservable for those, and the sweep left "
+                  "Q4-swap-bary-yz green when EVERY contact was like that",
+                  equalBaryComponents);
     PXG_CHECK_MSG(nonTrivialScale > 0u,
                   "every barycentric has L2 norm ~1, so getSoftBodyInvMass's scale (H1) "
                   "is the identity and dropping it would be invisible");
@@ -276,7 +317,7 @@ PXG_TEST(softBodyPsPrepare)
     // =====================================================================
     struct Want { F4 normalPen, bary; float velMult; };
     std::vector<Want> want(NB_CONTACTS);
-    uint32_t zeroInvMass = 0u;
+    uint32_t zeroInvMass = 0u, zeroUnitResponse = 0u;
     for (uint32_t w = 0; w < NB_CONTACTS; ++w)
     {
         const uint32_t particleIdx = infos[w * 4 + 0];
@@ -284,8 +325,8 @@ PXG_TEST(softBodyPsPrepare)
         const uint32_t sbId = pairInd1 >> BITSHIFT_TET;
         const uint32_t tetId = pairInd1 & 0x000fffffu;
 
-        const std::vector<U4>& tets = (sbId == 0u) ? tets0 : tets1;
-        const std::vector<F4>& sd = (sbId == 0u) ? simDelta0 : simDelta1;
+        const std::vector<U4>& tets = (sbId == 0u) ? tets0 : (sbId == 1u ? tets1 : tets2);
+        const std::vector<F4>& sd = (sbId == 0u) ? simDelta0 : (sbId == 1u ? simDelta1 : simDelta2);
         const U4 tet = tets[tetId];
 
         const F4 bary = barys[w];
@@ -308,6 +349,7 @@ PXG_TEST(softBodyPsPrepare)
         const float sbMass = getSoftBodyInvMass(tetDelta_invMass.w, bary);
         const float unitResponse = invMass0 + sbMass;
         const float velMult = (unitResponse > 0.0f) ? (1.0f / unitResponse) : 0.0f;
+        if (unitResponse == 0.0f) ++zeroUnitResponse;
 
         want[w].normalPen = F4{ nx, ny, nz, pen };
         want[w].bary = bary;
@@ -316,6 +358,10 @@ PXG_TEST(softBodyPsPrepare)
     PXG_CHECK_MSG(zeroInvMass > 0u,
                   "no contact has a zero-inverse-mass particle, so the velMultiplier "
                   "fallback path is never taken");
+    PXG_CHECK_MSG(zeroUnitResponse > 0u,
+                  "no contact has unitResponse exactly 0 (H9), so the `> 0` guard cannot "
+                  "be told apart from `>= 0` or from an unguarded divide -- both mutants "
+                  "survived the sweep before this case existed");
 
     // =====================================================================
     // compare
@@ -415,9 +461,10 @@ PXG_TEST(softBodyPsPrepare)
                   "READS PxgFemOtherContactInfo", infoBad);
 
     std::printf("    [ note ] %u contacts over %u blocks (%u lanes of tail poison intact), "
-                "2 softbodies with rest %g/%g, %u zero-inverse-mass particles, %u "
-                "barycentrics with a non-unit L2 scale\n",
+                "3 softbodies with rest %g/%g/%g, %u zero-inverse-mass particles, %u with "
+                "unitResponse == 0, %u barycentrics with a non-unit L2 scale\n",
                 NB_CONTACTS, NB_BLOCKS, NB_BLOCKS * 32u - NB_CONTACTS,
-                double(REST[0]), double(REST[1]), zeroInvMass, nonTrivialScale);
+                double(REST[0]), double(REST[1]), double(REST[2]), zeroInvMass,
+                zeroUnitResponse, nonTrivialScale);
 }
 } // namespace
