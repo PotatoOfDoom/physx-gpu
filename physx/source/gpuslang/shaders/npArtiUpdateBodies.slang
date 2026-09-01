@@ -264,3 +264,74 @@ void updateBodiesLaunch_Part2(uint3 groupId : SV_GroupID, uint3 groupThreadId : 
 
     wcPtr[0] = lwc;
 }
+
+// ===========================================================================
+// P9.43a: `updateBodiesLaunch_Part3` (forwardDynamic2.cu:3205-3249) -- the
+// per-ARTICULATION sleep roll-up, the third and last stage of
+// PxgArticulationCore::updateBodies.  One thread per articulation, block
+// (32, 2, 1), grid ceil(nbArticulations / 64): it takes the maximum of the
+// per-link wake counters Part2 just wrote, stores it as the articulation's wake
+// counter in scDesc->articulationSleepData[articulationIndex], and rewrites the
+// two transition bits of internalFlags from the (old, new) zero / non-zero
+// transition.  Everything else in the flags word passes through untouched.
+//
+// This is the kernel the articulation's SLEEP hangs on: dmaBackArticulationData
+// copies these eight bytes to the host, PxgPostSolveArticulationTask reads
+// wakeCounter into the core and de/activates the island node from the bits
+// (PxgContext.cpp:788-799).  Unmapped, the counter never counts down and
+// isSleeping() never turns true -- P9.40's guard found it skipped x240 in the
+// articulation scene; PXG_SCENE=articulationjoint measures it.
+//
+// Same arg pack as the other two stages ({8, 4, 1}); dt and integrate are
+// declared and ignored by the .cu, so they are not read here.
+//
+//  1. PxMax(lwc, maxWc) is the TERNARY (lwc < maxWc) ? maxWc : lwc (PxMath.h:75),
+//     not max(): on a tie -- signed zeros -- the FIRST operand survives, so an
+//     articulation whose counters are all -0.0 ends with -0.0 bits.
+//  2. The transition test is on FLOATS: -0.0 counts as zero either way.
+//  3. The load of linkWakeCounters[0] sits inside the loop, never hoisted: a
+//     zero-link articulation may carry a null array.
+//  4. Three index families: globalWarpIndex for the block, lane for the slot in
+//     it, mArticulationIndex[lane] for the record AND the sleep-data entry.
+// ===========================================================================
+[shader("compute")]
+[numthreads(32, AUB_WARPS_PER_BLOCK, 1)]
+void updateBodiesLaunch_Part3(uint3 groupId : SV_GroupID, uint3 groupThreadId : SV_GroupThreadID)
+{
+    const uint64_t d = gAub.desc;
+
+    const uint nbArticulations = artiU32Field(d, PXG_ARTI_CORE_NB_ARTICULATIONS);
+    const uint warpIndex = groupThreadId.y;
+    const uint globalWarpIndex = groupId.x * AUB_WARPS_PER_BLOCK + warpIndex;
+    const uint globalThreadIndex = globalWarpIndex * 32u + groupThreadId.x;
+    if (globalThreadIndex >= nbArticulations)
+        return;
+
+    const uint64_t artiBlock = artiPtrField(d, PXG_ARTI_CORE_ARTICULATION_BLOCKS)
+                             + uint64_t(globalWarpIndex) * PXG_AB_BLOCK_SIZE;
+    const uint lane = groupThreadId.x & 31u;
+    const uint linkCount = abU32(artiBlock, PXG_AB_mNumLinks, lane);
+    const uint articulationIndex = abU32(artiBlock, PXG_AB_mArticulationIndex, lane);
+    const uint64_t a = artiPtrField(d, PXG_ARTI_CORE_ARTICULATIONS)
+                     + uint64_t(articulationIndex) * PXG_ARTI_STRIDE;
+    Ptr<float> linkWakeCounters = Ptr<float>(artiPtrField(a, PXG_ARTI_LINK_WAKE_COUNTERS));
+
+    Ptr<uint2> sleep = Ptr<uint2>(artiPtrField(d, PXG_ARTI_CORE_SLEEP_DATA)
+                                  + uint64_t(articulationIndex) * PXG_ARTI_SLEEP_DATA_SIZE);
+    const uint2 old = sleep[0];             // { wakeCounter bits, internalFlags }
+    const float oldWc = asfloat(old.x);
+    float maxWc = 0.0f;
+    for (uint linkID = 0; linkID < linkCount; ++linkID)
+    {
+        const float lwc = linkWakeCounters[linkID];
+        maxWc = (lwc < maxWc) ? maxWc : lwc; // PxMax(lwc, maxWc) (trap 1)
+    }
+
+    uint newFlags = old.y & ~(PXG_BODY_ACTIVATE_THIS_FRAME | PXG_BODY_DEACTIVATE_THIS_FRAME);
+    if (oldWc == 0.0f && maxWc != 0.0f)
+        newFlags |= PXG_BODY_ACTIVATE_THIS_FRAME;
+    else if (maxWc == 0.0f && oldWc != 0.0f)
+        newFlags |= PXG_BODY_DEACTIVATE_THIS_FRAME;
+
+    sleep[0] = uint2(asuint(maxWc), newFlags);
+}

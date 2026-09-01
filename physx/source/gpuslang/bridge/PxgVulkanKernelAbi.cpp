@@ -1548,6 +1548,9 @@ static const PxgKernelAbiRow kRows[] = {
     // articulation chain's first Z dimension (PxgArticulationCore.cpp:953-965).
     // (P8.95b)
     { "updateBodiesLaunch_Part2", kSapBoxInit, uint32_t(sizeof(kSapBoxInit)) },
+    // forwardDynamic2.cu:3205 updateBodiesLaunch_Part3: the same three arguments,
+    // block (32, 2, 1), grid ceil(nbArticulations / 64) (PxgArticulationCore.cpp:969-996). (P9.43a)
+    { "updateBodiesLaunch_Part3", kSapBoxInit, uint32_t(sizeof(kSapBoxInit)) },
     // internalConstraints2.cu:3371 artiSumInternalContactAndJointBatches1Launch(
     //     const PxgArticulationCoreDesc*, PxgPrePrepDesc*, PxU32 nbArticulations)
     // -> two pointers + a PxU32 by value = 24-byte blob, the kTwoPtrU32 shape.
