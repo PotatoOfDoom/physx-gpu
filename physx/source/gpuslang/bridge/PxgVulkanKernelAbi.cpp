@@ -1246,6 +1246,32 @@ static const uint8_t kPsSolvePCParticle[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 1
 //   PxgParticleSystemCore.cpp:2005.
 static const uint8_t kPsAccumulateDeltaVParticle[] = { 8, 8, 8, 8, 8, 8 };
 
+// gpusimulationcontroller rigidDeltaAccum.cu (P9.44: the deformable/particle -> rigid
+// impulse coupling; launched by PxgParticleSystemCore.cpp:1857-1910 and
+// PxgFEMCore.cpp:273-318 with grid 32 x block 512):
+//   accumulateDeltaVRigidFirstLaunch(const PxU64* sortedRigidIds, const PxU32* numContacts,
+//     float4* deltaV, float4* blockDeltaV, PxU64* blockRigidId)
+//   -> 5 device pointers = {8,8,8,8,8} = 40-byte blob.
+static const uint8_t kAccumRigidFirst[] = { 8, 8, 8, 8, 8 };
+//   accumulateDeltaVRigidSecondLaunch(const PxU64* sortedRigidIds, const PxU32* numContacts,
+//     const float4* deltaV, const float4* blockDeltaV, const PxU64* blockRigidId,
+//     PxgPrePrepDesc*, PxgSolverCoreDesc*, PxgArticulationCoreDesc*,
+//     PxgSolverSharedDesc<IterativeSolveData>*, const bool isTGS)
+//   -> {8x9, 1} = 73 data bytes, isTGS byte @72, rounded to the 8-align -> 80-byte blob.
+static const uint8_t kAccumRigidSecond[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 1 };
+//   clearDeltaVRigidSecondLaunchMulti(PxU64* sortedRigidIds, PxU32* numContacts,
+//     PxgPrePrepDesc*, PxgSolverCoreDesc*, PxgArticulationCoreDesc*, PxReal* tempDenom)
+//   -> 6 device pointers = {8,8,8,8,8,8} = 48-byte blob.
+static const uint8_t kClearRigidMulti[] = { 8, 8, 8, 8, 8, 8 };
+//   accumulateDeltaVRigidSecondLaunchMultiStage1 / Stage2(PxU64* sortedRigidIds,
+//     PxU32* numContacts, float4* deltaV, float4* blockDeltaV, PxU64* blockRigidId,
+//     PxgPrePrepDesc*, PxgSolverCoreDesc*, PxgArticulationCoreDesc*,
+//     PxgSolverSharedDesc<IterativeSolveData>*, PxReal* tempDenom, const bool useLocalRelax,
+//     const float globalRelaxationCoefficient, bool isTGS)
+//   -> {8x10, 1, 4, 1}: useLocalRelax byte @80, coefficient @84, isTGS byte @88 -> 89
+//   data bytes, rounded to the 8-align -> 96-byte blob.
+static const uint8_t kAccumRigidMulti[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 1, 4, 1 };
+
 // gpusimulationcontroller particlesystem.cu:120 (P6.6 TGS substep predictor):
 //   ps_stepParticlesLaunch(const PxgParticleSystem* particleSystems,
 //     const PxU32* activeParticleSystems, const PxReal dt, const PxReal invTotalDt,
@@ -1958,10 +1984,20 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_contactPrepareLaunch", kPsContactPrepare, uint32_t(sizeof(kPsContactPrepare)) },
     { "ps_solvePCOutputParticleDeltaVLaunch", kPsSolvePCParticle, uint32_t(sizeof(kPsSolvePCParticle)) },
     { "ps_accumulateDeltaVParticleLaunch", kPsAccumulateDeltaVParticle, uint32_t(sizeof(kPsAccumulateDeltaVParticle)) },
+    // gpusimulationcontroller rigidDeltaAccum.cu (P9.44 deformable/particle -> rigid coupling)
+    { "accumulateDeltaVRigidFirstLaunch", kAccumRigidFirst, uint32_t(sizeof(kAccumRigidFirst)) },
+    { "accumulateDeltaVRigidSecondLaunch", kAccumRigidSecond, uint32_t(sizeof(kAccumRigidSecond)) },
+    { "clearDeltaVRigidSecondLaunchMulti", kClearRigidMulti, uint32_t(sizeof(kClearRigidMulti)) },
+    { "accumulateDeltaVRigidSecondLaunchMultiStage1", kAccumRigidMulti, uint32_t(sizeof(kAccumRigidMulti)) },
+    { "accumulateDeltaVRigidSecondLaunchMultiStage2", kAccumRigidMulti, uint32_t(sizeof(kAccumRigidMulti)) },
     // gpusimulationcontroller (P6.6 PBD particle-side TGS contact-solve loop)
     { "ps_stepParticlesLaunch", kPsStepParticles, uint32_t(sizeof(kPsStepParticles)) },
     // ps_solvePCOutputParticleDeltaVTGSLaunch shares the non-TGS solve's 96-byte pack.
     { "ps_solvePCOutputParticleDeltaVTGSLaunch", kPsSolvePCParticle, uint32_t(sizeof(kPsSolvePCParticle)) },
+    // P9.44: the RIGID-side twins (particlesystem.cu:1943 / :2123) take the identical
+    // 96-byte pack (PxgParticleSystemCore.cpp:2074-2089; only the CUfunction differs).
+    { "ps_solvePCOutputRigidDeltaVLaunch", kPsSolvePCParticle, uint32_t(sizeof(kPsSolvePCParticle)) },
+    { "ps_solvePCOutputRigidDeltaVTGSLaunch", kPsSolvePCParticle, uint32_t(sizeof(kPsSolvePCParticle)) },
     { "ps_finalizeParticlesLaunch", kPsFinalizeParticles, uint32_t(sizeof(kPsFinalizeParticles)) },
     // gpucommon radixSortImpl.cu:69 / :81 — the WithoutCount radix twins (P6.2 BDA)
     { "radixSortMultiBlockLaunchWithoutCount", kRadixDescNoCount, uint32_t(sizeof(kRadixDescNoCount)) },

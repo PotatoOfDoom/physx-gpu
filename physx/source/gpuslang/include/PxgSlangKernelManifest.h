@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 388;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 395;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -198,11 +198,11 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "radixSortDoubleCopy", "particleContactSortBda.spv", "radixSortDoubleCopy" },  // RS_DOUBLE_COPY_VALUE (P6.1 BDA re-point)
     { "radixSortCopyBits2", "radixSortGather.spv", "radixSortCopyBits2" },  // RS_COPY_BITS2
     { "radixSortCopy2", "radixSortGather.spv", "radixSortCopy2" },  // RS_COPY_VALUE2
-    { "accumulateDeltaVRigidFirstLaunch", nullptr, nullptr },  // ACCUMULATE_DELTAVEL_RIGIDBODY_FIRST (unmapped)
-    { "accumulateDeltaVRigidSecondLaunch", nullptr, nullptr },  // ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND (unmapped)
-    { "accumulateDeltaVRigidSecondLaunchMultiStage1", nullptr, nullptr },  // ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND_MULTI1 (unmapped)
-    { "accumulateDeltaVRigidSecondLaunchMultiStage2", nullptr, nullptr },  // ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND_MULTI2 (unmapped)
-    { "clearDeltaVRigidSecondLaunchMulti", nullptr, nullptr },  // ACCUMULATE_DELTAVEL_RIGIDBODY_MULTI_CLEAR (unmapped)
+    { "accumulateDeltaVRigidFirstLaunch", "rigidDeltaAccumBda.spv", "accumulateDeltaVRigidFirstLaunch" },  // ACCUMULATE_DELTAVEL_RIGIDBODY_FIRST (P9.44)
+    { "accumulateDeltaVRigidSecondLaunch", "rigidDeltaAccumBda.spv", "accumulateDeltaVRigidSecondLaunch" },  // ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND (P9.44)
+    { "accumulateDeltaVRigidSecondLaunchMultiStage1", "rigidDeltaAccumBda.spv", "accumulateDeltaVRigidSecondLaunchMultiStage1" },  // ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND_MULTI1 (P9.44)
+    { "accumulateDeltaVRigidSecondLaunchMultiStage2", "rigidDeltaAccumBda.spv", "accumulateDeltaVRigidSecondLaunchMultiStage2" },  // ACCUMULATE_DELTAVEL_RIGIDBODY_SECOND_MULTI2 (P9.44)
+    { "clearDeltaVRigidSecondLaunchMulti", "rigidDeltaAccumBda.spv", "clearDeltaVRigidSecondLaunchMulti" },  // ACCUMULATE_DELTAVEL_RIGIDBODY_MULTI_CLEAR (P9.44)
     { "rigidSumInternalContactAndJointBatches1", "npRigidSumBatches.spv", "rigidSumInternalContactAndJointBatches1" },  // RIGID_SUM_STATIC_CONTACT1 (P5 Step 4 BDA port)
     { "rigidSumInternalContactAndJointBatches2", "npRigidSumBatches.spv", "rigidSumInternalContactAndJointBatches2" },  // RIGID_SUM_STATIC_CONTACT2 (P5 Step 4 BDA port)
     { "solveStaticBlock", "solverPGS.spv", "solveStaticBlock" },  // RIGID_SOLVE_STATIC_CONSTRAINTS (P5 Step 5 BDA port)
@@ -231,7 +231,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_reorderPrimitiveContactsLaunch", "psContactSortBda.spv", "ps_reorderPrimitiveContactsLaunch" },  // PS_REORDER_PRIMITIVE_CONTACTS (P6.4b-1 BDA port: gather sorted contact arrays)
     { "ps_contactPrepareLaunch", "psContactSolveBda.spv", "ps_contactPrepareLaunch" },  // PS_CONTACT_PREPARE (P6.4b-2 BDA port: particle-vs-primitive contact constraint prep)
     { "ps_solvePCOutputParticleDeltaVLaunch", "psContactSolveBda.spv", "ps_solvePCOutputParticleDeltaVLaunch" },  // PS_SOLVE_PC_PARTICLE (P6.4b-2 BDA port: particle-side PC solve -> per-contact deltaV)
-    { "ps_solvePCOutputRigidDeltaVLaunch", nullptr, nullptr },  // PS_SOLVE_PC_RIGID (unmapped)
+    { "ps_solvePCOutputRigidDeltaVLaunch", "psContactSolveRigidBda.spv", "ps_solvePCOutputRigidDeltaVLaunch" },  // PS_SOLVE_PC_RIGID (P9.44)
     { "ps_solveOneWayContactDeltaVLaunch", "particleSelfCollisionBda.spv", "ps_solveOneWayContactDeltaVLaunch" },  // PS_SOLVE_ONEWAY_CONTACTS (P6.3 BDA port: one-way contact solve -> accumDeltaP)
     { "ps_findStartEndParticleFirstLaunch", "psContactSortBda.spv", "ps_findStartEndParticleFirstLaunch" },  // PS_FIND_RANGESTARTEND_PARTICLE_FIRST (P6.4b-1 BDA port: per-block range-start offsets)
     { "ps_findStartEndParticleSecondLaunch", "psContactSortBda.spv", "ps_findStartEndParticleSecondLaunch" },  // PS_FIND_RANGESTARTEND_PARTICLE_SECONE (P6.4b-1 BDA port: per-particle [start,end) ranges + pair count)
@@ -276,7 +276,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_accumulateFEMParticleDeltaVLaunch", nullptr, nullptr },  // PS_ACCUMULATE_FEM_PARTICLE_DELTA (unmapped)
     { "ps_stepParticlesLaunch", "psContactSolveTgsBda.spv", "ps_stepParticlesLaunch" },  // PS_STEP_PARTICLES (P6.6 BDA port: TGS substep predictor)
     { "ps_solvePCOutputParticleDeltaVTGSLaunch", "psContactSolveTgsBda.spv", "ps_solvePCOutputParticleDeltaVTGSLaunch" },  // PS_SOLVE_PC_PARTICLE_TGS (P6.6 BDA port: TGS twin of the particle-side PC solve)
-    { "ps_solvePCOutputRigidDeltaVTGSLaunch", nullptr, nullptr },  // PS_SOLVE_PC_RIGID_TGS (unmapped)
+    { "ps_solvePCOutputRigidDeltaVTGSLaunch", "psContactSolveRigidBda.spv", "ps_solvePCOutputRigidDeltaVTGSLaunch" },  // PS_SOLVE_PC_RIGID_TGS (P9.44)
     { "ps_solveRigidAttachmentsTGSLaunch", nullptr, nullptr },  // PS_SOLVE_RIGID_ATTACHMENTS_TGS (unmapped)
     { "ps_finalizeParticlesLaunch", "psContactSolveTgsBda.spv", "ps_finalizeParticlesLaunch" },  // PS_FINALIZE_PARTICLES (P6.6 BDA port: TGS velocity-iteration finalize)
     { "ps_updateMaterials", "npPsMaterials.spv", "ps_updateMaterials" },  // PS_UPDATE_MATERIALS
