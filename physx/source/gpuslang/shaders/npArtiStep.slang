@@ -266,7 +266,16 @@ float asNormalizeInPlace(inout float3 v)
 {
     const float m = sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
     if (m > 0.0f)
-        v = float3(v.x / m, v.y / m, v.z / m);
+    {
+        // P9.45: ONE reciprocal and three multiplies, not three divides.  This mirrors
+        // `worldAngVel.normalize()` (forwardDynamic2.cu:2630), and PxVec3::normalize
+        // (PxVec3.h:293) scales through operator/= (PxVec3.h:260), which reciprocates once.
+        // The P9.36 defect class in its componentwise spelling: `gpuslang.vectorDivide`
+        // matches an OpFDiv with a VECTOR result type, and three scalar OpFDivs slip past
+        // it.  Found by the same sweep that fixed computeBasisVectors.
+        const float r = 1.0f / m;
+        v = float3(v.x * r, v.y * r, v.z * r);
+    }
     return m;
 }
 

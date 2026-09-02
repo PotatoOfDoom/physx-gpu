@@ -99,12 +99,25 @@ public float3 mat33MulVec(float m[9], float3 v)
 // right.normalize() is a true divide by the magnitude (PxVec3::normalize(), PxVec3.h:295).
 public void computeBasisVectors(float3 dir, out float3 right, out float3 up)
 {
+    // P9.45: these two normalisations used to be THREE DIVIDES by the same scalar.  The
+    // engine writes `right.normalize()`, and PxVec3::normalize (PxVec3.h:293) scales through
+    // operator/= (PxVec3.h:260), which is ONE reciprocal and three multiplies -- the P9.36
+    // defect class, in the componentwise spelling that the `gpuslang.vectorDivide` checker
+    // cannot see (it matches an OpFDiv whose RESULT TYPE is a vector; three scalar OpFDivs
+    // look like ordinary arithmetic).  Measured: the two forms differ in at least one
+    // component for most normals -- the single tilted normal in runRigidContact happened to
+    // be one where they agree, which is why the fixture was green for eight tranches.
+    // femClothSimRigidContactDynamic* now spreads six normals across the same code and
+    // caught it.
     if (abs(dir.y) <= 0.9999f)
     {
         right = float3(dir.z, 0.0f, -dir.x);
         const float m = sqrt(right.x * right.x + right.y * right.y + right.z * right.z);
         if (m > 0.0f)
-            right = float3(right.x / m, right.y / m, right.z / m);
+        {
+            const float r = 1.0f / m;
+            right = float3(right.x * r, right.y * r, right.z * r);
+        }
         up = float3(dir.y * right.z, dir.z * right.x - dir.x * right.z, -dir.y * right.x);
     }
     else
@@ -113,7 +126,10 @@ public void computeBasisVectors(float3 dir, out float3 right, out float3 up)
         up = float3(0.0f, dir.z, -dir.y);
         const float m = sqrt(up.x * up.x + up.y * up.y + up.z * up.z);
         if (m > 0.0f)
-            up = float3(up.x / m, up.y / m, up.z / m);
+        {
+            const float r = 1.0f / m;
+            up = float3(up.x * r, up.y * r, up.z * r);
+        }
     }
 }
 
@@ -274,6 +290,14 @@ public struct ContactResult
     public float deltaLambdaT;
     public float3 normal;
     public float3 tangent;
+    // P9.45: the two angular rows computeRigidChange needs.  raXn mirrors the CUDA member
+    // assigned at deformableUtils.cuh:306 -- BEFORE both early returns, so it is live even
+    // on the checkOnlyActivity path; raXt mirrors the member assigned only inside the
+    // tangent branch (:394), and stays at its zero default otherwise.  For a DYNAMIC
+    // non-kinematic body raXn_resp.xyz holds raXn * sqrtInvInertia, not raXn, exactly as
+    // prepareFEMContacts wrote it -- the downstream accumulate folds the second factor.
+    public float3 raXn;
+    public float3 raXt;
     public float accumulatedDeltaLambdaN;
 }
 
@@ -295,6 +319,8 @@ public ContactResult contactInitialize(uint64_t cBase, uint offset, uint64_t rig
     r.deltaLambdaN = 0.0f;
     r.deltaLambdaT = 0.0f;
     r.tangent = float3(0.0f, 0.0f, 0.0f);
+    r.raXn = float3(0.0f, 0.0f, 0.0f);
+    r.raXt = float3(0.0f, 0.0f, 0.0f);
     r.accumulatedDeltaLambdaN = appliedForceRef;
 
     const float invDt = 1.0f / dt;
@@ -312,6 +338,7 @@ public ContactResult contactInitialize(uint64_t cBase, uint offset, uint64_t rig
     const float3 fric1 = crossVec(normal, fric0);
     const float initPen = normal_biasW.w;
     const float3 raXn = float3(raXn_resp.x, raXn_resp.y, raXn_resp.z);
+    r.raXn = raXn;   // :306, before both early returns
 
     const RigidState st = readRigidVelocity(rigidId, isTGS, solverCoreDescPtr, sharedDescPtr, prePrepDescPtr);
     const float3 linVel = st.linVel;
@@ -374,6 +401,14 @@ public ContactResult contactInitialize(uint64_t cBase, uint offset, uint64_t rig
         const float invTanMag = 1.0f / CT;
         r.tangent = float3(relTanDelta.x * invTanMag, relTanDelta.y * invTanMag, relTanDelta.z * invTanMag);
 
+        // P9.45: raXt = frac0 * raXnF0 + frac1 * raXnF1 (:391-394).  Previously omitted
+        // because only computeRigidChange reads it and that was deferred.
+        const float frac0 = dotVec(r.tangent, fric0);
+        const float frac1 = dotVec(r.tangent, fric1);
+        r.raXt = float3(frac0 * raXnF0.x + frac1 * raXnF1.x,
+                        frac0 * raXnF0.y + frac1 * raXnF1.y,
+                        frac0 * raXnF0.z + frac1 * raXnF1.z);
+
         const float unitResponseT0 = rigidRefCount * raXnF0_resp.w + deformableInvMass_massSplitting;
         const float invTanDenom0 = (unitResponseT0 > 0.0f) ? (1.0f / unitResponseT0) : 0.0f;
         const float unitResponseT1 = rigidRefCount * raXnF1_resp.w + deformableInvMass_massSplitting;
@@ -389,6 +424,48 @@ public ContactResult contactInitialize(uint64_t cBase, uint offset, uint64_t rig
     }
 
     return r;
+}
+
+// ---------------------------------------------------------------------------
+// FEMCollision::computeRigidChange (deformableUtils.cuh:418-429) — P9.45.
+//
+//   deltaAngVel0 = isArticulation ? (raXn*dLN + raXt*dLT)
+//                                 : (raXn*dLN + raXt*dLT) * refCount;
+//   deltaLinVel0 = (normal*dLN + tangent*dLT) * rigidInvMass * refCount;
+//
+// The reference count multiplies the SUM, not each term, and the linear row multiplies
+// by rigidInvMass FIRST and the count second -- both are PxVec3 operator* chains
+// evaluated left to right, and with NoContraction on they are three separate rounds per
+// component.  Width-independent: it touches no barycentric, so one implementation serves
+// the cloth triangle (PxVec3) and the softbody tetrahedron (PxVec4) alike.
+// ---------------------------------------------------------------------------
+public struct RigidChange
+{
+    public float3 deltaLinVel0;
+    public float3 deltaAngVel0;
+}
+
+public RigidChange computeRigidChange(ContactResult r, bool isArticulation, float rigidInvMass,
+                                      uint rigidBodyReferenceCount)
+{
+    const float rigidRefCount = float(rigidBodyReferenceCount);
+
+    const float3 angBase = float3(r.raXn.x * r.deltaLambdaN + r.raXt.x * r.deltaLambdaT,
+                                  r.raXn.y * r.deltaLambdaN + r.raXt.y * r.deltaLambdaT,
+                                  r.raXn.z * r.deltaLambdaN + r.raXt.z * r.deltaLambdaT);
+
+    RigidChange o;
+    o.deltaAngVel0 = isArticulation
+                   ? angBase
+                   : float3(angBase.x * rigidRefCount, angBase.y * rigidRefCount, angBase.z * rigidRefCount);
+
+    const float3 linBase = float3(r.normal.x * r.deltaLambdaN + r.tangent.x * r.deltaLambdaT,
+                                  r.normal.y * r.deltaLambdaN + r.tangent.y * r.deltaLambdaT,
+                                  r.normal.z * r.deltaLambdaN + r.tangent.z * r.deltaLambdaT);
+    o.deltaLinVel0 = float3((linBase.x * rigidInvMass) * rigidRefCount,
+                            (linBase.y * rigidInvMass) * rigidRefCount,
+                            (linBase.z * rigidInvMass) * rigidRefCount);
+    return o;
 }
 
 public int getGlobalRigidBodyId(uint64_t rigidId, uint64_t prePrepDescPtr, uint numSolverBodies)

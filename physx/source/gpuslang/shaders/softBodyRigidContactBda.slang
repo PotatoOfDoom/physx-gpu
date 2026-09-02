@@ -274,6 +274,15 @@ void sb_rigidContactPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 
 // DEFERRED, exactly as in the cloth port: the ARTICULATION branch, and FRICTION (the
 // null-material path, so getCombinedFriction() == 0 and deltaLambdaT collapses to -0).
 // `materials` and `rigidBodyMaterials` sit in the solve blob unread for that reason.
+//
+// P9.45: the DYNAMIC-rigid REACTION is no longer deferred.  computeRigidChange
+// (deformableUtils.cuh:418, called at softBody.cu:2046-2051) runs under the .cu's own
+// guard and writes count 1 plus the two delta rows into rigidDeltaVel, which P9.44's
+// accumulateDeltaVRigidFirst/SecondLaunch reduce onto the solver body.  A static or
+// kinematic contact still writes zeros with count 0.  An ARTICULATION-link contact also
+// still writes zeros, and that is a consequence of the articulation deferral above rather
+// than a new one: without the articulation anchor rows from prepareFEMContacts and without
+// the link velocity in readRigidVelocity, a reaction would be wrong, not merely missing.
 // ===========================================================================
 
 // PxgSolverCoreDesc::numSolverBodies @268 (pxgSlangSolverDesc mirror).
@@ -570,7 +579,24 @@ void solveRigidSoftContact(bool isTGS, uint idx, uint blockX)
                 if (deformableInvMasses.w > 0.0f)
                     pxgAtomicAddF4XYZ(simDelta, tetId4.w, deltaPos * (deformableInvMasses.w * bc.w));
 
-                // computeRigidChange DEFERRED: a static body leaves count and the deltas 0.
+                // computeRigidChange (softBody.cu:2046-2051, deformableUtils.cuh:418).  P9.45.
+                // A STATIC body still leaves count and the deltas at 0 -- rigidId.isStaticBody()
+                // is the .cu's own guard, and fricTan0_invMass0.w is 0 for a kinematic one.
+                // The ARTICULATION case stays out: prepareFEMContacts defers the articulation
+                // anchor build (pxgSlangFemRigidContact.slang:143), so raXn_resp would carry
+                // the rigid response rows for a link, and readRigidVelocity defers the link
+                // velocity read -- a reaction computed from either would be wrong, not just
+                // absent.  Writing zeros for a link is what this module already did.
+                if (fricTan0_invMass0.w != 0.0f && !nodeIsStaticBody(rigidId)
+                    && !nodeIsArticulation(rigidId))
+                {
+                    count = 1.0f;
+                    const RigidChange rc = computeRigidChange(cr, /*isArticulation*/ false,
+                                                              fricTan0_invMass0.w,
+                                                              rigidBodyReferenceCount);
+                    deltaLinVel0 = rc.deltaLinVel0;
+                    deltaAngVel0 = rc.deltaAngVel0;
+                }
             }
 
             // writeRigidBody: for a static contact CUDA writes zeros with count 0.

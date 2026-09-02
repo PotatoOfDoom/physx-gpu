@@ -3707,16 +3707,20 @@ static void refPrepare(RigidContactConstraintHost& c, int slot,
     c.barycentric[slot] = barycentric;
 }
 
-// FEMCollision::initialize (deformableUtils.cuh:280) — static / null-material (frictionless)
-// path.  Rigid velocities are all zero for a static body at rest.
-struct InitResult { bool isActive; float deltaLambdaN; float deltaLambdaT; V3 normal; V3 tangent; float accum; };
+// FEMCollision::initialize (deformableUtils.cuh:280) — null-material (frictionless) path.
+// The rigid velocity state is a PARAMETER (P9.45): it defaults to all zeros, which is what a
+// static body at rest reads, and the dynamic case passes what PxgVelocityReader would return.
+struct RefRigidVel { V3 linVel{ 0, 0, 0 }, angVel{ 0, 0, 0 }, linDelta{ 0, 0, 0 }, angDelta{ 0, 0, 0 }; };
+struct InitResult { bool isActive; float deltaLambdaN; float deltaLambdaT; V3 normal; V3 tangent;
+                    V3 raXn; V3 raXt; float accum; };
 static InitResult refInitialize(const RigidContactConstraintHost& c, int slot, bool isTGS,
                                 float appliedForceRef, float dt, V3 bcVec, V3 deformableLinDelta,
-                                V3 deformableInvMasses, float rigidRefCount, bool wasActive, bool checkOnly)
+                                V3 deformableInvMasses, float rigidRefCount, bool wasActive, bool checkOnly,
+                                RefRigidVel rv = RefRigidVel{})
 {
     InitResult r;
     r.isActive = false; r.deltaLambdaN = 0.0f; r.deltaLambdaT = 0.0f;
-    r.tangent = V3{ 0, 0, 0 }; r.accum = appliedForceRef;
+    r.tangent = V3{ 0, 0, 0 }; r.raXt = V3{ 0, 0, 0 }; r.accum = appliedForceRef;
 
     const float invDt = 1.0f / dt;
     const F4 raXn_resp = c.raXn_resp[slot];
@@ -3732,10 +3736,10 @@ static InitResult refInitialize(const RigidContactConstraintHost& c, int slot, b
     const V3 fric1 = cross3(normal, fric0);
     const float initPen = normal_biasW.w;
     const V3 raXn = V3{ raXn_resp.x, raXn_resp.y, raXn_resp.z };
+    r.raXn = raXn;   // :306, live on both early-return paths
 
-    // static body at rest -> zero velocities / deltas.
-    const V3 linVel = V3{ 0, 0, 0 }, angVel = V3{ 0, 0, 0 };
-    const V3 rigidLinDelta = V3{ 0, 0, 0 }, rigidAngDelta = V3{ 0, 0, 0 };
+    const V3 linVel = rv.linVel, angVel = rv.angVel;
+    const V3 rigidLinDelta = rv.linDelta, rigidAngDelta = rv.angDelta;
 
     float CN; V3 relLinDelta; V3 angDelta;
     if (isTGS)
@@ -3784,6 +3788,12 @@ static InitResult refInitialize(const RigidContactConstraintHost& c, int slot, b
         const float CT = std::sqrt(tanMagSq);
         const float invTanMag = 1.0f / CT;
         r.tangent = V3{ relTanDelta.x * invTanMag, relTanDelta.y * invTanMag, relTanDelta.z * invTanMag };
+        // raXt = frac0*raXnF0 + frac1*raXnF1 (:391-394) -- P9.45; zero outside this branch.
+        const float frac0 = dot3(r.tangent, fric0);
+        const float frac1 = dot3(r.tangent, fric1);
+        r.raXt = V3{ frac0 * raXnF0.x + frac1 * raXnF1.x,
+                     frac0 * raXnF0.y + frac1 * raXnF1.y,
+                     frac0 * raXnF0.z + frac1 * raXnF1.z };
         const float uT0 = rigidRefCount * raXnF0_resp.w + deformableInvMass;
         const float invT0 = (uT0 > 0.0f) ? (1.0f / uT0) : 0.0f;
         const float uT1 = rigidRefCount * raXnF1_resp.w + deformableInvMass;
@@ -3795,6 +3805,26 @@ static InitResult refInitialize(const RigidContactConstraintHost& c, int slot, b
         r.deltaLambdaT = -rmin(dLT, combinedFriction * rabs(r.deltaLambdaN));
     }
     return r;
+}
+
+// FEMCollision::computeRigidChange (deformableUtils.cuh:418-429) — P9.45.  The reference
+// count multiplies the SUM; the linear row multiplies by rigidInvMass FIRST.
+static void refComputeRigidChange(const InitResult& r, bool isArticulation, float rigidInvMass,
+                                  float rigidRefCount, V3& deltaLinVel0, V3& deltaAngVel0)
+{
+    const V3 angBase = V3{ r.raXn.x * r.deltaLambdaN + r.raXt.x * r.deltaLambdaT,
+                           r.raXn.y * r.deltaLambdaN + r.raXt.y * r.deltaLambdaT,
+                           r.raXn.z * r.deltaLambdaN + r.raXt.z * r.deltaLambdaT };
+    deltaAngVel0 = isArticulation
+                 ? angBase
+                 : V3{ angBase.x * rigidRefCount, angBase.y * rigidRefCount, angBase.z * rigidRefCount };
+
+    const V3 linBase = V3{ r.normal.x * r.deltaLambdaN + r.tangent.x * r.deltaLambdaT,
+                           r.normal.y * r.deltaLambdaN + r.tangent.y * r.deltaLambdaT,
+                           r.normal.z * r.deltaLambdaN + r.tangent.z * r.deltaLambdaT };
+    deltaLinVel0 = V3{ (linBase.x * rigidInvMass) * rigidRefCount,
+                       (linBase.y * rigidInvMass) * rigidRefCount,
+                       (linBase.z * rigidInvMass) * rigidRefCount };
 }
 } // namespace p714ref
 
@@ -4101,6 +4131,475 @@ static void runRigidContact(bool isTGS)
 
 PXG_TEST(femClothSimRigidContactPGS) { runRigidContact(/*isTGS*/ false); }
 PXG_TEST(femClothSimRigidContactTGS) { runRigidContact(/*isTGS*/ true); }
+
+// ---------------------------------------------------------------------------
+// P9.45 — the DYNAMIC-rigid reaction.  runRigidContact above seeds one contact against a
+// STATIC floor, which is the only geometry the drape scenes needed and the reason
+// FEMCollision::computeRigidChange (deformableUtils.cuh:418) could be deferred: with
+// rigidId.isStaticBody() the .cu's own guard never fires.  This case seeds SIX contacts
+// that between them take every branch of that guard, plus the rigid reference-count
+// increment the query pass now performs:
+//
+//   lanes 0..2  DYNAMIC rigid body (node index 3 -> solver body 1, invMass 0.25).  Three
+//               contacts on ONE body, so the query's atomic must reach 3 and the solve must
+//               read 3 back -- a single contact would leave the count at 1, where a dropped
+//               reference-count multiply is invisible.
+//   lane 3      STATIC (node 0xFFFFFFFF): globalRigidBodyId == -1, no increment, zeros.
+//   lane 4      KINEMATIC (node index 4 -> solver body 2, invMass 0): the invMass half of
+//               the guard, which the static lane cannot test on its own.
+//   lane 5      ARTICULATION LINK (node index 5 with the articulation bit): the count IS
+//               incremented, exactly as the .cu does, but the reaction is NOT written.  That
+//               is this module's articulation deferral, and pinning it here means the day
+//               prepareFEMContacts and readRigidVelocity grow their articulation branches,
+//               this assertion goes red and forces the reaction on with them.
+//
+// Every cloth vertex is distinct, so the cloth-side mass split stays 1 per vertex and the
+// RIGID reference count is the only multi-contact quantity under test.
+// ---------------------------------------------------------------------------
+static void runRigidContactDynamic(bool isTGS)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float dt = 1.0f / 60.0f;
+
+    const uint32_t N = 6u;
+    const uint32_t numSolverBodies = 3u;
+    const uint32_t accOffset = 0u;
+    const float rigidInvMass = 0.25f;
+
+    // ---- six cloth vertices, one per contact -----------------------------
+    const float invMass = 0.5f;
+    std::vector<F4> positions(N), velocities(N), accumDelta(N), deltaPos(N);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const float f = float(i);
+        positions[i] = { 0.5f + 0.11f * f, -0.02f - 0.003f * f, 0.7f - 0.07f * f, invMass };
+        velocities[i] = { 0.0f, 0.0f, 0.0f, invMass };
+        accumDelta[i] = { 0.0010f + 0.0004f * f, -0.0020f + 0.0003f * f, 0.0015f - 0.0002f * f, invMass };
+        deltaPos[i] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    }
+    std::vector<uint32_t> triVtx(4u * N, 0u);   // unused (vertex contacts)
+
+    DevBuf bPos = makeDev(dev, positions);
+    DevBuf bVel = makeDev(dev, velocities);
+    DevBuf bAcc = makeDev(dev, accumDelta);
+    DevBuf bDelta = makeDev(dev, deltaPos);
+    DevBuf bTri = makeDev(dev, triVtx);
+
+    const float penBiasClampFEM = -1.0e10f;
+    PxgFEMCloth c = makeZeroDesc();
+    c.mPosition_InvMass = reinterpret_cast<decltype(c.mPosition_InvMass)>(size_t(bPos.addr));
+    c.mVelocity_InvMass = reinterpret_cast<decltype(c.mVelocity_InvMass)>(size_t(bVel.addr));
+    c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
+    c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
+    c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mPenBiasClamp = penBiasClampFEM;
+    c.mNbVerts = N;
+    std::vector<PxgFEMCloth> descArr = { c };
+    DevBuf bDesc = makeDev(dev, descArr);
+
+    // ---- the six rigid ids, and which solver body each resolves to -------
+    const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
+    const uint64_t dynNodeInd = 3ull;                    // articulation bit (high word bit0) clear
+    const uint64_t kinNodeInd = 4ull;
+    const uint64_t artiNodeInd = (1ull << 32) | 5ull;    // articulation bit SET
+    const uint64_t nodeInds[6] = { dynNodeInd, dynNodeInd, dynNodeInd,
+                                   staticNodeInd, kinNodeInd, artiNodeInd };
+    // solverBodyIndices[nodeIndex]: node 3 -> body 1 (dynamic), node 4 -> body 2 (kinematic),
+    // node 5 -> body 1 as well, so the articulation lane carries a NON-ZERO invMass and only
+    // the articulation test can stop its reaction.
+    std::vector<uint32_t> solverBodyIndices = { 0u, 0u, 0u, 1u, 2u, 1u };
+    const uint32_t bodyOf[6] = { 1u, 1u, 1u, 0u, 2u, 1u };   // static reads slot 0
+    // getGlobalRigidBodyId: -1 static, solverBodyIdx rigid, numSolverBodies+idx articulation.
+    const int globalIdOf[6] = { 1, 1, 1, -1, 2, int(numSolverBodies) + 1 };
+    DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
+
+    // ---- contact geometry: a distinct tilted normal per lane -------------
+    std::vector<F4> contacts(N), normalPens(N), barycentrics(N);
+    std::vector<FemOtherContactInfoHost> infos(N);
+    p714ref::V3 planeNormals[6];
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        float raw[3] = { 0.2f + 0.09f * float(i), 0.9f - 0.05f * float(i), 0.3f - 0.04f * float(i) };
+        const float m = std::sqrt(raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]);
+        planeNormals[i] = { raw[0] / m, raw[1] / m, raw[2] / m };
+        contacts[i] = { positions[i].x, positions[i].y, positions[i].z, 0.0f };   // restW = 0
+        // Deep enough that the contact stays ACTIVE in BOTH modes: TGS folds the rigid
+        // position delta into the error term at invDt, so a shallow penetration flips to
+        // inactive there while staying active under PGS.
+        normalPens[i] = { planeNormals[i].x, planeNormals[i].y, planeNormals[i].z, -0.05f - 0.004f * float(i) };
+        barycentrics[i] = { 0.0f, 0.0f, 0.0f, 1.0f };   // vertex (bc.w != 0)
+        infos[i].pairInd0 = nodeInds[i];
+        infos[i].pairInd1 = i;                       // (clothId 0 << 20) | elemIdx i
+        infos[i].rigidMatInd_isInCollision = 0u;
+    }
+
+    DevBuf bContacts = makeDev(dev, contacts);
+    DevBuf bNormalPens = makeDev(dev, normalPens);
+    DevBuf bBary = makeDev(dev, barycentrics);
+    DevBuf bInfos = makeDev(dev, infos);
+    std::vector<uint32_t> numContacts = { N };
+    DevBuf bNum = makeDev(dev, numContacts);
+
+    std::vector<uint8_t> constraintBytes(sizeof(RigidContactConstraintHost), 0xCD);
+    DevBuf bConstraint = makeDev(dev, constraintBytes);
+
+    std::vector<float> rigidLambdaNs(N, 123.0f);
+    DevBuf bLambda = makeDev(dev, rigidLambdaNs);
+    std::vector<F4> rigidDeltaVel(2u * N, F4{ 9.f, 9.f, 9.f, 9.f });
+    DevBuf bRigidDeltaVel = makeDev(dev, rigidDeltaVel);
+    // numSolverBodies + numArticulations entries, exactly as PxgFEMClothCore.cpp:320 sizes it.
+    std::vector<uint32_t> refCounts(numSolverBodies + 2u, 0u);
+    DevBuf bRefCounts = makeDev(dev, refCounts);
+
+    // ---- three solver bodies: frames, masses, sqrt inverse inertias ------
+    std::vector<F4> body2World = {
+        { 0.f, 0.f, 0.f, 1.f }, { 0.00f, 0.00f, 0.00f, 0.f },   // body 0 (static slot)
+        { 0.f, 0.f, 0.f, 1.f }, { 0.10f, -0.30f, 0.20f, 0.f },  // body 1 (dynamic)
+        { 0.f, 0.f, 0.f, 1.f }, { -0.05f, 0.40f, 0.15f, 0.f },  // body 2 (kinematic)
+    };
+    DevBuf bBody2World = makeDev(dev, body2World);
+
+    const float penBiasClampRigid = -1.0e10f;
+    const float invMassOf[3] = { 0.0f, rigidInvMass, 0.0f };
+    std::vector<uint8_t> solverBodyData(96u * numSolverBodies, 0);
+    for (uint32_t b = 0; b < numSolverBodies; ++b)
+    {
+        std::memcpy(solverBodyData.data() + 96u * b + 12, &penBiasClampRigid, 4);  // penBiasClamp @12
+        std::memcpy(solverBodyData.data() + 96u * b + 28, &invMassOf[b], 4);       // invMass @28
+    }
+    DevBuf bSolverBodyData = makeDev(dev, solverBodyData);
+
+    const float sqrtInvInertia0[9] = { 2.0f, 0.1f, 0.0f, 0.1f, 1.5f, 0.2f, 0.0f, 0.2f, 1.0f };
+    const float sqrtInvInertia1[9] = { 1.3f, -0.2f, 0.05f, -0.2f, 0.9f, 0.15f, 0.05f, 0.15f, 1.7f };
+    const float sqrtInvInertia2[9] = { 0.7f, 0.3f, -0.1f, 0.3f, 1.1f, 0.0f, -0.1f, 0.0f, 0.8f };
+    const float* sqrtInvOf[3] = { sqrtInvInertia0, sqrtInvInertia1, sqrtInvInertia2 };
+    std::vector<uint8_t> solverTxIData(64u * numSolverBodies, 0);
+    for (uint32_t b = 0; b < numSolverBodies; ++b)
+        std::memcpy(solverTxIData.data() + 64u * b + 28, sqrtInvOf[b], 9 * 4);   // sqrtInvInertia @28
+    DevBuf bSolverTxIData = makeDev(dev, solverTxIData);
+
+    // ---- velocities.  Body 0 stays at rest so the STATIC lane reads zeros,
+    //      exactly as it does in runRigidContact; bodies 1 and 2 move.
+    std::vector<F4> outSolverVelocity(2u * numSolverBodies, F4{ 0.f, 0.f, 0.f, 0.f });
+    outSolverVelocity[1] = { 0.30f, -0.70f, 0.20f, 0.f };                      // body 1 linear
+    outSolverVelocity[2] = { 0.10f, 0.20f, 0.30f, 0.f };                       // body 2 linear
+    outSolverVelocity[1 + numSolverBodies] = { 0.11f, 0.22f, -0.33f, 0.f };    // body 1 angular
+    outSolverVelocity[2 + numSolverBodies] = { 0.04f, 0.05f, 0.06f, 0.f };     // body 2 angular
+    DevBuf bOutSolverVel = makeDev(dev, outSolverVelocity);
+
+    // The TGS rows carry velocity in v0/v1.x-y and POSITION DELTA in v1.z-w / v2, and the
+    // deltas enter the error at invDt (x60 here), so they are deliberately two orders
+    // smaller than the velocities -- large ones drive every contact inactive.
+    std::vector<F4> solverBodyVelPool(3u * numSolverBodies, F4{ 0.f, 0.f, 0.f, 0.f });
+    solverBodyVelPool[1] = { 0.05f, -0.09f, 0.03f, 0.14f };
+    solverBodyVelPool[2] = { -0.02f, 0.07f, 0.01f, -0.06f };
+    solverBodyVelPool[1 + numSolverBodies] = { 0.21f, -0.12f, 0.0033f, -0.0044f };
+    solverBodyVelPool[2 + numSolverBodies] = { 0.08f, 0.09f, -0.0010f, 0.0011f };
+    solverBodyVelPool[1 + 2u * numSolverBodies] = { 0.0055f, -0.0066f, 0.0077f, -0.0088f };
+    solverBodyVelPool[2 + 2u * numSolverBodies] = { -0.0015f, 0.0016f, -0.0017f, 0.0018f };
+    DevBuf bSolverBodyVelPool = makeDev(dev, solverBodyVelPool);
+
+    // readRigidVelocity (pxgSlangFemRigidContact.slang:222) mirrored on the host.
+    auto rigidVelOf = [&](uint32_t body) {
+        p714ref::RefRigidVel rv;
+        if (isTGS)
+        {
+            const F4 v0 = solverBodyVelPool[accOffset + body];
+            const F4 v1 = solverBodyVelPool[accOffset + body + numSolverBodies];
+            const F4 v2 = solverBodyVelPool[accOffset + body + 2u * numSolverBodies];
+            rv.linVel = { v0.x, v0.y, v0.z };
+            rv.angVel = { v0.w, v1.x, v1.y };
+            rv.linDelta = { v1.z, v1.w, v2.x };
+            rv.angDelta = { v2.y, v2.z, v2.w };
+        }
+        else
+        {
+            const F4 iv0 = outSolverVelocity[body];
+            const F4 iv1 = outSolverVelocity[body + numSolverBodies];
+            const F4 dv0 = solverBodyVelPool[accOffset + body];
+            const F4 dv1 = solverBodyVelPool[accOffset + body + numSolverBodies];
+            rv.linVel = { iv0.x + dv0.x, iv0.y + dv0.y, iv0.z + dv0.z };
+            rv.angVel = { iv1.x + dv1.x, iv1.y + dv1.y, iv1.z + dv1.z };
+        }
+        return rv;
+    };
+
+    // ---- descriptors ------------------------------------------------------
+    std::vector<uint8_t> prepDesc(304, 0);
+    pokePtr(prepDesc, 64, bSolverBodyData.addr);
+    pokePtr(prepDesc, 72, bSolverTxIData.addr);
+    pokePtr(prepDesc, 168, bBody2World.addr);
+    DevBuf bPrepDesc = makeDev(dev, prepDesc);
+
+    std::vector<uint8_t> prePrepDesc(760, 0);
+    pokePtr(prePrepDesc, 272, bSolverBodyIndices.addr);
+    DevBuf bPrePrepDesc = makeDev(dev, prePrepDesc);
+
+    std::vector<uint8_t> solverCoreDesc(320, 0);
+    pokePtr(solverCoreDesc, 0, bOutSolverVel.addr);
+    pokeU32(solverCoreDesc, 268, numSolverBodies);
+    pokeU32(solverCoreDesc, 276, accOffset);
+    DevBuf bSolverCoreDesc = makeDev(dev, solverCoreDesc);
+
+    std::vector<uint8_t> sharedDesc(224, 0);
+    pokePtr(sharedDesc, 160, bSolverBodyVelPool.addr);
+    DevBuf bSharedDesc = makeDev(dev, sharedDesc);
+
+    // ======================= dispatch PREPARE ==========================
+    struct PrepPush
+    {
+        uint64_t femClothes, contacts, normalPens, barycentrics, contactInfos, numContacts;
+        uint64_t constraints, prePrepDesc, prepDesc, rigidLambdaNs;
+        float invDt; uint32_t pad84;
+        uint64_t sharedDesc;
+        uint32_t isTGS, pad100;
+    };
+    static_assert(sizeof(PrepPush) == 104, "prepare push-constant blob must be 104 bytes");
+    PrepPush pp = {};
+    pp.femClothes = bDesc.addr; pp.contacts = bContacts.addr; pp.normalPens = bNormalPens.addr;
+    pp.barycentrics = bBary.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
+    pp.constraints = bConstraint.addr; pp.prePrepDesc = bPrePrepDesc.addr; pp.prepDesc = bPrepDesc.addr;
+    pp.rigidLambdaNs = bLambda.addr; pp.invDt = 1.0f / dt; pp.sharedDesc = bSharedDesc.addr;
+    pp.isTGS = isTGS ? 1u : 0u;
+
+    Kernel kPrep("femClothRigidContactBda.spv", "cloth_rigidContactPrepareLaunch", {}, sizeof(PrepPush));
+    kPrep.dispatch(1u, {}, pp, 1u, 1u);
+    dev->flush();
+
+    RigidContactConstraintHost refC;
+    std::memset(&refC, 0xCD, sizeof(refC));
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const uint32_t b = bodyOf[i];
+        const p714ref::V3 solverNormal = { -planeNormals[i].x, -planeNormals[i].y, -planeNormals[i].z };
+        const float pen = normalPens[i].w - contacts[i].w;
+        const p714ref::V3 frameP = { body2World[2u * b + 1u].x, body2World[2u * b + 1u].y,
+                                     body2World[2u * b + 1u].z };
+        p714ref::refPrepare(refC, int(i), solverNormal,
+                            p714ref::V3{ positions[i].x, positions[i].y, positions[i].z },
+                            pen, p714ref::V3{ accumDelta[i].x, accumDelta[i].y, accumDelta[i].z },
+                            barycentrics[i], frameP, invMassOf[b], penBiasClampRigid,
+                            sqrtInvOf[b], penBiasClampFEM, /*isStatic*/ nodeInds[i] == staticNodeInd);
+    }
+
+    const auto gConstraintBytes = downloadBuffer<uint8_t>(dev, bConstraint.h, sizeof(RigidContactConstraintHost));
+    RigidContactConstraintHost gotC;
+    std::memcpy(&gotC, gConstraintBytes.data(), sizeof(gotC));
+
+    size_t mm = 0;
+    auto cmp4 = [&](const char* nm, uint32_t lane, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm; std::printf("  prep lane %u %s MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", lane, nm,
+                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
+    };
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        cmp4("raXn_resp", i, refC.raXn_resp[i], gotC.raXn_resp[i]);
+        cmp4("raXnF0_resp", i, refC.raXnF0_resp[i], gotC.raXnF0_resp[i]);
+        cmp4("raXnF1_resp", i, refC.raXnF1_resp[i], gotC.raXnF1_resp[i]);
+        cmp4("normal_errorW", i, refC.normal_errorW[i], gotC.normal_errorW[i]);
+        cmp4("fricTan0_invMass0", i, refC.fricTan0_invMass0[i], gotC.fricTan0_invMass0[i]);
+        cmp4("barycentric", i, refC.barycentric[i], gotC.barycentric[i]);
+        if (f2u(refC.maxPenBias[i]) != f2u(gotC.maxPenBias[i]))
+        { ++mm; std::printf("  prep lane %u maxPenBias MM\n", i); }
+    }
+    PXG_CHECK_MSG(f2u(gotC.fricTan0_invMass0[0].w) == f2u(rigidInvMass),
+                  "lane 0 must carry the DYNAMIC inverse mass (got %g)", gotC.fricTan0_invMass0[0].w);
+    PXG_CHECK_MSG(f2u(gotC.fricTan0_invMass0[4].w) == 0u,
+                  "lane 4 must carry the KINEMATIC zero inverse mass (got %g)", gotC.fricTan0_invMass0[4].w);
+    PXG_CHECK_MSG(mm == 0, "dynamic prepare bit-exact vs CPU (%zu mismatches)", mm);
+
+    // ======================= dispatch QUERY (refcount) =================
+    struct QueryPush
+    {
+        uint64_t femClothes, contactInfos, constraints, numContacts, prePrepDesc, solverCoreDesc;
+        uint64_t artiCoreDesc, sharedDesc;
+        float dt; uint32_t pad68;
+        uint64_t appliedForces, rigidBodyReferenceCounts;
+    };
+    static_assert(sizeof(QueryPush) == 88, "query push-constant blob must be 88 bytes");
+    QueryPush qp = {};
+    qp.femClothes = bDesc.addr; qp.contactInfos = bInfos.addr; qp.constraints = bConstraint.addr;
+    qp.numContacts = bNum.addr; qp.prePrepDesc = bPrePrepDesc.addr; qp.solverCoreDesc = bSolverCoreDesc.addr;
+    qp.artiCoreDesc = 0ull; qp.sharedDesc = bSharedDesc.addr; qp.dt = dt;
+    qp.appliedForces = bLambda.addr; qp.rigidBodyReferenceCounts = bRefCounts.addr;
+
+    const char* queryEntry = isTGS ? "cloth_queryRigidClothContactReferenceCountTGSLaunch"
+                                   : "cloth_queryRigidClothContactReferenceCountLaunch";
+    Kernel kQuery("femClothRigidContactBda.spv", queryEntry, {}, sizeof(QueryPush));
+    kQuery.dispatch(1u, {}, qp, 1u, 1u);
+    dev->flush();
+
+    // ---- CPU reference for the query ----
+    const p714ref::V3 bcVec = { 1.0f, 0.0f, 0.0f };
+    std::vector<uint32_t> refRefCounts(refCounts.size(), 0u);
+    std::vector<float> refDeltaW(N, 0.0f);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const p714ref::V3 accumV = { accumDelta[i].x, accumDelta[i].y, accumDelta[i].z };
+        const p714ref::InitResult qir =
+            p714ref::refInitialize(refC, int(i), isTGS, /*appliedForceRef*/ 0.0f, dt, bcVec, accumV,
+                                   p714ref::V3{ invMass, 0, 0 }, /*rigidRefCount*/ 1.0f,
+                                   /*wasActive*/ false, /*checkOnly*/ true, rigidVelOf(bodyOf[i]));
+        // Faithful to the .cu: everything below hangs off isActive.  The assertion is a
+        // COVERAGE claim about the seeded data, not a step of the reference -- if it ever
+        // fires, the data drifted, and the comparison stays honest either way.
+        PXG_CHECK_MSG(qir.isActive, "query CPU ref: lane %u must be active (seeded data)", i);
+        if (!qir.isActive)
+            continue;
+        refDeltaW[i] = 1.0f;                    // invMass != 0
+        if (globalIdOf[i] != -1 && invMassOf[bodyOf[i]] != 0.0f)
+            refRefCounts[size_t(globalIdOf[i])] += 1u;
+    }
+
+    const auto gDeltaQ = downloadBuffer<F4>(dev, bDelta.h, N);
+    const auto gRefCountsQ = downloadBuffer<uint32_t>(dev, bRefCounts.h, uint32_t(refCounts.size()));
+    for (uint32_t i = 0; i < N; ++i)
+        if (f2u(gDeltaQ[i].w) != f2u(refDeltaW[i]))
+        { ++mm; std::printf("  query lane %u mDeltaPos.w MM: ref %g got %g\n", i, refDeltaW[i], gDeltaQ[i].w); }
+    for (size_t k = 0; k < refRefCounts.size(); ++k)
+        if (gRefCountsQ[k] != refRefCounts[k])
+        { ++mm; std::printf("  query refCounts[%zu] MM: ref %u got %u\n", k, refRefCounts[k], gRefCountsQ[k]); }
+
+    // teeth: three contacts share solver body 1, so its count must be 3 -- with 1 a dropped
+    // reference-count multiply in computeRigidChange would be invisible.
+    PXG_CHECK_MSG(gRefCountsQ[1] == 3u, "the three dynamic contacts must bump body 1 to 3 (got %u)",
+                  gRefCountsQ[1]);
+    PXG_CHECK_MSG(gRefCountsQ[2] == 0u, "the KINEMATIC body must not be counted (got %u)", gRefCountsQ[2]);
+    PXG_CHECK_MSG(gRefCountsQ[numSolverBodies + 1u] == 1u,
+                  "the articulation link IS counted, as in the .cu (got %u)",
+                  gRefCountsQ[numSolverBodies + 1u]);
+    PXG_CHECK_MSG(mm == 0, "dynamic query bit-exact vs CPU (%zu mismatches)", mm);
+
+    // ======================= dispatch SOLVE ============================
+    struct SolvePush
+    {
+        uint64_t femClothes, contactInfos, constraints, numContacts, prePrepDesc, solverCoreDesc;
+        uint64_t artiCoreDesc, sharedDesc, rigidDeltaVel, appliedForces, rigidBodyReferenceCounts;
+        float dt; uint32_t pad92;
+        uint64_t materials, rigidBodyMaterials;
+    };
+    static_assert(sizeof(SolvePush) == 112, "solve push-constant blob must be 112 bytes");
+    SolvePush sp = {};
+    sp.femClothes = bDesc.addr; sp.contactInfos = bInfos.addr; sp.constraints = bConstraint.addr;
+    sp.numContacts = bNum.addr; sp.prePrepDesc = bPrePrepDesc.addr; sp.solverCoreDesc = bSolverCoreDesc.addr;
+    sp.artiCoreDesc = 0ull; sp.sharedDesc = bSharedDesc.addr; sp.rigidDeltaVel = bRigidDeltaVel.addr;
+    sp.appliedForces = bLambda.addr; sp.rigidBodyReferenceCounts = bRefCounts.addr; sp.dt = dt;
+    sp.materials = 0ull; sp.rigidBodyMaterials = 0ull;
+
+    const char* solveEntry = isTGS ? "cloth_solveRigidClothCollisionTGSLaunch"
+                                   : "cloth_solveRigidClothCollisionLaunch";
+    Kernel kSolve("femClothRigidContactBda.spv", solveEntry, {}, sizeof(SolvePush));
+    kSolve.dispatch(1u, {}, sp, 1u, 1u);
+    dev->flush();
+
+    // ---- CPU reference for the solve ----
+    std::vector<F4> refDeltaAfterSolve(N), refRigidDeltaVel(2u * N);
+    std::vector<float> refAccum(N);
+    uint32_t dynamicLanes = 0u, zeroLanes = 0u;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const uint32_t b = bodyOf[i];
+        // readRigidBody: the count is read back only for a non-static, finite-mass body.
+        const float rigidRefCount =
+            (globalIdOf[i] != -1 && invMassOf[b] != 0.0f) ? float(refRefCounts[size_t(globalIdOf[i])]) : 1.0f;
+        const p714ref::V3 accumV = { accumDelta[i].x, accumDelta[i].y, accumDelta[i].z };
+        const p714ref::V3 deformableInvMasses = { invMass * refDeltaW[i], 0.0f, 0.0f };
+        const p714ref::InitResult sir =
+            p714ref::refInitialize(refC, int(i), isTGS, /*appliedForceRef*/ 0.0f, dt, bcVec, accumV,
+                                   deformableInvMasses, rigidRefCount, /*wasActive*/ true,
+                                   /*checkOnly*/ false, rigidVelOf(b));
+        const p714ref::V3 deltaPosR = {
+            -(sir.deltaLambdaN * sir.normal.x + sir.deltaLambdaT * sir.tangent.x) * dt,
+            -(sir.deltaLambdaN * sir.normal.y + sir.deltaLambdaT * sir.tangent.y) * dt,
+            -(sir.deltaLambdaN * sir.normal.z + sir.deltaLambdaT * sir.tangent.z) * dt };
+        const float sScale = deformableInvMasses.x;
+        refDeltaAfterSolve[i] = { deltaPosR.x * sScale, deltaPosR.y * sScale, deltaPosR.z * sScale,
+                                  refDeltaW[i] };
+        refAccum[i] = sir.accum;
+
+        // The .cu's guard, plus this port's articulation extension.
+        const bool isArti = (nodeInds[i] >> 32) & 1ull;
+        const bool reacts = (invMassOf[b] != 0.0f) && (nodeInds[i] != staticNodeInd) && !isArti;
+        p714ref::V3 dLin = { 0, 0, 0 }, dAng = { 0, 0, 0 };
+        float count = 0.0f;
+        if (reacts)
+        {
+            count = 1.0f;
+            p714ref::refComputeRigidChange(sir, /*isArticulation*/ false, invMassOf[b], rigidRefCount,
+                                           dLin, dAng);
+            ++dynamicLanes;
+        }
+        else
+        {
+            ++zeroLanes;
+        }
+        refRigidDeltaVel[i] = { dLin.x, dLin.y, dLin.z, count };
+        refRigidDeltaVel[i + N] = { dAng.x, dAng.y, dAng.z, 0.0f };
+    }
+    PXG_CHECK_MSG(dynamicLanes == 3u && zeroLanes == 3u,
+                  "coverage: expected 3 reacting and 3 silent lanes, got %u / %u", dynamicLanes, zeroLanes);
+
+    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, N);
+    const auto gLambda2 = downloadBuffer<float>(dev, bLambda.h, N);
+    const auto gRigidDeltaVel = downloadBuffer<F4>(dev, bRigidDeltaVel.h, 2u * N);
+
+    size_t mm2 = 0;
+    auto cmpRow = [&](const char* nm, uint32_t k, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm2; std::printf("  solve %s[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm, k,
+                             r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
+    };
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        cmpRow("mDeltaPos", i, refDeltaAfterSolve[i], gDelta[i]);
+        cmpRow("rigidDeltaVel", i, refRigidDeltaVel[i], gRigidDeltaVel[i]);
+        cmpRow("rigidDeltaVel", i + N, refRigidDeltaVel[i + N], gRigidDeltaVel[i + N]);
+        if (f2u(gLambda2[i]) != f2u(refAccum[i]))
+        { ++mm2; std::printf("  solve appliedForces[%u] MM: ref %g got %g\n", i, refAccum[i], gLambda2[i]); }
+    }
+
+    // teeth 1: the three dynamic lanes must produce a REACTION, and it must point INTO the
+    // floor -- the cloth is pushed out along the plane normal, the body the other way.
+    for (uint32_t i = 0; i < 3u; ++i)
+    {
+        PXG_CHECK_MSG(f2u(gRigidDeltaVel[i].w) == f2u(1.0f),
+                      "dynamic lane %u must report count 1 (got %g)", i, gRigidDeltaVel[i].w);
+        const float lin = gRigidDeltaVel[i].x * planeNormals[i].x + gRigidDeltaVel[i].y * planeNormals[i].y
+                        + gRigidDeltaVel[i].z * planeNormals[i].z;
+        PXG_CHECK_MSG(lin < 0.0f,
+                      "dynamic lane %u reaction must oppose the cloth push (dot = %g, isTGS=%d)",
+                      i, lin, int(isTGS));
+        const F4 a = gRigidDeltaVel[i + N];
+        PXG_CHECK_MSG(f2u(a.x) != 0u || f2u(a.y) != 0u || f2u(a.z) != 0u,
+                      "dynamic lane %u angular reaction must be non-zero", i);
+    }
+    // teeth 2: the three silent lanes stay exactly zero, count included.
+    for (uint32_t i = 3u; i < N; ++i)
+        for (uint32_t half = 0; half < 2u; ++half)
+        {
+            const F4 v = gRigidDeltaVel[i + half * N];
+            PXG_CHECK_MSG(f2u(v.x) == 0u && f2u(v.y) == 0u && f2u(v.z) == 0u && f2u(v.w) == 0u,
+                          "silent lane %u half %u must stay zero (got %g,%g,%g,%g)",
+                          i, half, v.x, v.y, v.z, v.w);
+        }
+    PXG_CHECK_MSG(mm2 == 0, "dynamic cloth_solveRigidClothCollision%s bit-exact vs CPU (%zu mismatches)",
+                  isTGS ? "TGS" : "PGS", mm2);
+
+    dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h);
+    dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bTri.h); dev->destroyBuffer(bDesc.h);
+    dev->destroyBuffer(bContacts.h); dev->destroyBuffer(bNormalPens.h); dev->destroyBuffer(bBary.h);
+    dev->destroyBuffer(bInfos.h); dev->destroyBuffer(bNum.h); dev->destroyBuffer(bConstraint.h);
+    dev->destroyBuffer(bLambda.h); dev->destroyBuffer(bRigidDeltaVel.h); dev->destroyBuffer(bRefCounts.h);
+    dev->destroyBuffer(bBody2World.h); dev->destroyBuffer(bSolverBodyData.h); dev->destroyBuffer(bSolverTxIData.h);
+    dev->destroyBuffer(bOutSolverVel.h); dev->destroyBuffer(bSolverBodyVelPool.h);
+    dev->destroyBuffer(bSolverBodyIndices.h);
+    dev->destroyBuffer(bPrepDesc.h); dev->destroyBuffer(bPrePrepDesc.h);
+    dev->destroyBuffer(bSolverCoreDesc.h); dev->destroyBuffer(bSharedDesc.h);
+}
+
+PXG_TEST(femClothSimRigidContactDynamicPGS) { runRigidContactDynamic(/*isTGS*/ false); }
+PXG_TEST(femClothSimRigidContactDynamicTGS) { runRigidContactDynamic(/*isTGS*/ true); }
 
 // ===========================================================================
 // P7.2 tranche 1: cloth SELF-collision midphase + contact GENERATION.

@@ -67,13 +67,20 @@
 //     precedent as psContactSolveTgsBda / femClothRigidAttachBda, which sink the
 //     outArtiVelocity read behind the isArticulation guard so a rigid / static contact
 //     never dereferences it;
-//   - the DYNAMIC-rigid REACTION is DEFERRED.  For a static body FEMCollision::
-//     computeRigidChange is guarded behind !rigidId.isStaticBody() (never taken) and the
-//     rigid reference-count increment behind globalRigidBodyId != -1 (never taken, static
-//     -> -1), so nothing is lost; the downstream accumulateRigidDeltas fold is a follow-on
-//     tranche.  The solve's writeRigidBody still writes rigidDeltaVel[workIndex] and
-//     [workIndex + numContacts] = (0,0,0,0) with count 0 — exactly what the CUDA writes
-//     for a static contact (deltaLinVel0 == deltaAngVel0 == 0);
+//   - the DYNAMIC-rigid REACTION is PORTED as of P9.45.  FEMCollision::computeRigidChange
+//     (deformableUtils.cuh:418) runs under the .cu's own guard
+//     (fricTan0_invMass0.w != 0 && !rigidId.isStaticBody()), writing count 1 and the two
+//     delta rows into rigidDeltaVel; the query pass's rigid reference-count increment
+//     (:404-408) is ported with it, so the mass-splitting divisor the solve reads back is
+//     the real per-body contact count instead of the default 1.  P9.44's
+//     accumulateDeltaVRigidFirst/SecondLaunch reduce those rows onto the solver body, which
+//     is what makes a cloth able to HOLD a dynamic rigid (scene `clothnet`).  A static or
+//     kinematic contact still writes (0,0,0,0) with count 0, exactly as before.  The
+//     ARTICULATION-link case is the one that stays out, and it is an extension of the
+//     articulation deferral above, not a separate one: prepareFEMContacts never builds the
+//     articulation anchor rows and readRigidVelocity never reads the link velocity, so a
+//     reaction derived from either would be WRONG rather than merely absent.  A link
+//     contact therefore keeps writing zeros, as this module always did;
 //   - FRICTION is the null-material path.  prepareFEMContacts's t0/t1 (PxComputeBasis-
 //     Vectors) and the friction response rows raXnF0/raXnF1 are built verbatim, and the
 //     solve computes the full tangent kinematics (tanVel / CT0 / CT1 / relTanDelta /
@@ -388,6 +395,7 @@ void queryRigidClothContactReferenceCount(bool isTGS, uint idx, uint blockX)
         const uint offset = workIndex & 31u;
         const uint64_t cBase = gQuery.constraints + uint64_t(index) * FRC_STRIDE;
 
+        const float4 fricTan0_invMass0 = Ptr<float4>(cBase + FRC_fricTan0_invMass)[offset];
         const float4 bc = Ptr<float4>(cBase + FRC_barycentric)[offset];
 
         const uint clothId = pairInd1 >> PXG_CLOTH_ID_SHIFT;
@@ -395,6 +403,8 @@ void queryRigidClothContactReferenceCount(bool isTGS, uint idx, uint blockX)
 
         if (elementId < PX_MAX_NB_DEFORMABLE_SURFACE_TRI)
         {
+            // :349, before the wasActive branch — a static body yields -1.
+            const int globalRigidBodyId = getGlobalRigidBodyId(rigidId, gQuery.prePrepDesc, numSolverBodies);
             const float3 bcVec = (bc.w == 0.0f) ? float3(bc.x, bc.y, bc.z) : float3(1.0f, 0.0f, 0.0f);
 
             float3 deformableLinDelta;
@@ -453,8 +463,16 @@ void queryRigidClothContactReferenceCount(bool isTGS, uint idx, uint blockX)
                     }
                 }
 
-                // Rigid reference-count increment DEFERRED: globalRigidBodyId == -1 for a
-                // static body, so the CUDA skips it.
+                // Increment the reference count of the rigid body (:404-408).  P9.45.
+                // Guarded exactly as the .cu: a static body has globalRigidBodyId == -1 and a
+                // kinematic one has invMass 0, and both keep the solve's count at its
+                // default of 1.  The softbody query already carried this line; the cloth one
+                // did not, and the two modules now match.
+                if (globalRigidBodyId != -1 && fricTan0_invMass0.w != 0.0f)
+                {
+                    uint prev;
+                    InterlockedAdd((Ptr<uint>(gQuery.rigidBodyReferenceCounts))[globalRigidBodyId], 1u, prev);
+                }
             }
         }
     }
@@ -588,7 +606,23 @@ void solveRigidClothContact(bool isTGS, uint idx, uint blockX)
                     }
                 }
 
-                // computeRigidChange DEFERRED: static body -> count stays 0, deltas stay 0.
+                // computeRigidChange (FEMClothExternalSolve.cu:509-514, deformableUtils.cuh:418).
+                // P9.45.  A STATIC body still leaves count and the deltas at 0 -- that is the
+                // .cu's own guard -- and so does a kinematic one (fricTan0_invMass0.w == 0).
+                // The ARTICULATION case stays out: prepareFEMContacts defers the articulation
+                // anchor build (pxgSlangFemRigidContact.slang:143) and readRigidVelocity defers
+                // the link velocity read, so a reaction for a link would be wrong rather than
+                // merely absent.  Writing zeros for a link is what this module already did.
+                if (fricTan0_invMass0.w != 0.0f && !nodeIsStaticBody(rigidId)
+                    && !nodeIsArticulation(rigidId))
+                {
+                    count = 1.0f;
+                    const RigidChange rc = computeRigidChange(cr, /*isArticulation*/ false,
+                                                              fricTan0_invMass0.w,
+                                                              rigidBodyReferenceCount);
+                    deltaLinVel0 = rc.deltaLinVel0;
+                    deltaAngVel0 = rc.deltaAngVel0;
+                }
             }
 
             // writeRigidBody: for a static contact the CUDA writes zeros with count 0.

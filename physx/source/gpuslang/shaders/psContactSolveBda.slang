@@ -167,9 +167,15 @@ float3 normalize3(float3 v)
     const float m = sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
     if (m > 0.0f)
     {
-        v.x = v.x / m;
-        v.y = v.y / m;
-        v.z = v.z / m;
+        // P9.45: ONE reciprocal and three multiplies.  PxComputeBasisVectors calls
+        // PxVec3::normalize (PxVec3.h:293), which scales through operator/= (PxVec3.h:260)
+        // and forms 1.0/m once.  Three divides is the P9.36 defect class in the
+        // componentwise spelling `gpuslang.vectorDivide` cannot match, because that checker
+        // looks for an OpFDiv whose RESULT TYPE is a vector.
+        const float r = 1.0f / m;
+        v.x = v.x * r;
+        v.y = v.y * r;
+        v.z = v.z * r;
     }
     return v;
 }
