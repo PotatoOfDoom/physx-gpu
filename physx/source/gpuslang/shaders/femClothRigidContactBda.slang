@@ -215,8 +215,8 @@ struct SolveContactParams
     uint64_t rigidBodyReferenceCounts;  // @80
     float dt;                           // @88
     uint _pad92;                        // @92
-    uint64_t materials;                 // @96  (DEFERRED: null-material path)
-    uint64_t rigidBodyMaterials;        // @104 (DEFERRED) -> 112
+    uint64_t materials;                 // @96  PxsDeformableSurfaceMaterialData*
+    uint64_t rigidBodyMaterials;        // @104 PxsMaterialData* -> 112
 }
 
 [[vk::push_constant]] ConstantBuffer<PrepContactParams> gPrep;
@@ -307,8 +307,10 @@ void cloth_rigidContactPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uin
 
 // ---------------------------------------------------------------------------
 // FEMCollision::readCloth (deformableUtils.cuh:488) — cloth VERTEX / TRIANGLE contact.
-// Returns the mass-split inverse masses; also fills deformableLinDelta (out).  Friction
-// (mDynamicFrictions / materials) is the DEFERRED null-material path.
+// Returns the mass-split inverse masses; also fills deformableLinDelta (out).  P9.46: it
+// also fills the deformable friction, which comes from TWO different sources -- the
+// per-triangle material table for a triangle contact (:513-514), the per-vertex
+// mDynamicFrictions array for a vertex contact (:533).  Both are gated on `materials`.
 // ---------------------------------------------------------------------------
 float3 readClothVertexInvMasses(Ptr<PxgFEMClothGpu> femClothes, uint clothId, uint elementId, float4 bc,
                                 bool countReferenceOnly, out float3 deformableLinDelta,
@@ -580,7 +582,7 @@ void solveRigidClothContact(bool isTGS, uint idx, uint blockX)
                 const float3 bcVec = (bc.w == 0.0f) ? float3(bc.x, bc.y, bc.z) : float3(1.0f, 0.0f, 0.0f);
 
                 // readRigidBody: rigidBodyReferenceCount == 1 for a static body
-                // (globalRigidBodyId == -1); friction is the DEFERRED null-material path.
+                // (globalRigidBodyId == -1); the friction half follows below.
                 uint rigidBodyReferenceCount = 1u;
                 if (globalRigidBodyId != -1 && fricTan0_invMass0.w != 0.0f)
                     rigidBodyReferenceCount = Ptr<uint>(gSolve.rigidBodyReferenceCounts)[globalRigidBodyId];

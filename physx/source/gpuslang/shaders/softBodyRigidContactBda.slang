@@ -271,9 +271,13 @@ void sb_rigidContactPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 
 //     (deformableUtils.cuh:614).  By, not divided by -- that is upstream's mass-splitting
 //     convention and reproducing it is the whole point of the query pass.
 //
-// DEFERRED, exactly as in the cloth port: the ARTICULATION branch, and FRICTION (the
-// null-material path, so getCombinedFriction() == 0 and deltaLambdaT collapses to -0).
-// `materials` and `rigidBodyMaterials` sit in the solve blob unread for that reason.
+// DEFERRED, exactly as in the cloth port: the ARTICULATION branch.
+//
+// P9.46: FRICTION is no longer deferred.  `materials` and `rigidBodyMaterials` are both
+// read in the solve now -- the softbody half through the per-tet material index
+// (deformableUtils.cuh:604), the rigid half through the contact info's material index
+// (deformableUtils.cuh:469) -- and PxsCombinePxReal joins them under the RIGID material's
+// fricCombineMode.  See pxgSlangFemRigidContact.slang for the readers.
 //
 // P9.45: the DYNAMIC-rigid REACTION is no longer deferred.  computeRigidChange
 // (deformableUtils.cuh:418, called at softBody.cu:2046-2051) runs under the .cu's own
@@ -382,8 +386,8 @@ struct SbSolveContactParams
     uint64_t rigidBodyReferenceCounts;  // @80
     float dt;                           // @88
     uint _pad92;                        // @92
-    uint64_t materials;                 // @96  (DEFERRED: null-material path)
-    uint64_t rigidBodyMaterials;        // @104 (DEFERRED) -> 112
+    uint64_t materials;                 // @96  PxsDeformableVolumeMaterialData*
+    uint64_t rigidBodyMaterials;        // @104 PxsMaterialData* -> 112
 }
 [[vk::push_constant]]
 ConstantBuffer<SbSolveContactParams> gSbSolve;
@@ -555,7 +559,7 @@ void solveRigidSoftContact(bool isTGS, uint idx, uint blockX)
             if (isActive)
             {
                 // readRigidBody: the reference count is 1 for a static body
-                // (globalRigidBodyId == -1); friction is the DEFERRED null-material path.
+                // (globalRigidBodyId == -1); the friction half follows below.
                 const int globalRigidBodyId = getGlobalRigidBodyId(rigidId, gSbSolve.prePrepDesc, numSolverBodies);
                 uint rigidBodyReferenceCount = 1u;
                 if (globalRigidBodyId != -1 && fricTan0_invMass0.w != 0.0f)
