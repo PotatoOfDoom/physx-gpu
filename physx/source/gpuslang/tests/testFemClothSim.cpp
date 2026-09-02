@@ -4179,8 +4179,8 @@ static void runRigidContactDynamic(bool isTGS)
     PxgSlangComputeDevice* dev = testDevice();
     const float dt = 1.0f / 60.0f;
 
-    const uint32_t N = 10u;         // 8 VERTEX contacts + 2 TRIANGLE contacts
-    const uint32_t NV = 14u;        // 8 for the vertex lanes + 3 + 3 for the two triangles
+    const uint32_t N = 11u;         // 8 VERTEX + 2 TRIANGLE + 1 SEPARATING-but-active
+    const uint32_t NV = 15u;        // 8 vertex lanes + 3 + 3 for the triangles + 1 for lane 10
     const uint32_t numSolverBodies = 3u;
     const uint32_t accOffset = 0u;
     const float rigidInvMass = 0.25f;
@@ -4216,7 +4216,9 @@ static void runRigidContactDynamic(bool isTGS)
         clothVertFriction[i] = 0.10f + 0.07f * float(i);   // all distinct
     // The triangle lanes' vertices carry POISON: a TRIANGLE contact must take its friction
     // from the material table, never from this array.
-    for (uint32_t v = 8u; v < NV; ++v) clothVertFriction[v] = -7.5f;
+    for (uint32_t v = 8u; v < NV - 1u; ++v) clothVertFriction[v] = -7.5f;
+    // ...but vertex 14 belongs to the SEPARATING vertex lane 10, so it keeps a real value.
+    clothVertFriction[NV - 1u] = 0.22f;
 
     DevBuf bPos = makeDev(dev, positions);
     DevBuf bVel = makeDev(dev, velocities);
@@ -4244,10 +4246,15 @@ static void runRigidContactDynamic(bool isTGS)
     // flags | fricCombineMode<<16 | restCombineMode<<24, and ONLY bits 16..23 may be read --
     // the other bytes carry decoys, so a shader that took the whole word or the wrong byte
     // lands on an out-of-range mode and PxsCombinePxReal's fall-through 0.
-    const float rigidMatFriction[4] = { 0.30f, 0.80f, 0.50f, 0.20f };
-    const uint32_t rigidMatMode[4] = { 0u, 1u, 2u, 3u };   // eAVERAGE, eMIN, eMULTIPLY, eMAX
-    std::vector<uint32_t> rigidMats(4u * 6u, 0u);
-    for (uint32_t m = 0; m < 4u; ++m)
+    // Material 4 carries an OUT-OF-RANGE combine mode.  PxCombineMode has four values and
+    // the engine asserts that, so this is not a state a valid scene reaches -- but
+    // PxsCombinePxReal has a fall-through `return 0.0f` for it, and that arm is the port's
+    // answer to a corrupt or uninitialised material byte: NO friction, rather than silently
+    // one side's.  Without a lane pointing here that arm is unreachable and its mutant lives.
+    const float rigidMatFriction[5] = { 0.30f, 0.80f, 0.50f, 0.20f, 0.55f };
+    const uint32_t rigidMatMode[5] = { 0u, 1u, 2u, 3u, 7u };   // eAVERAGE, eMIN, eMULTIPLY, eMAX, invalid
+    std::vector<uint32_t> rigidMats(5u * 6u, 0u);
+    for (uint32_t m = 0; m < 5u; ++m)
     {
         uint32_t* w = &rigidMats[m * 6u];
         std::memcpy(&w[0], &rigidMatFriction[m], 4);
@@ -4288,11 +4295,20 @@ static void runRigidContactDynamic(bool isTGS)
 
     // Lanes 0..7 cover all four combine modes twice.  The two TRIANGLE lanes take MULTIPLY
     // and MIN, which keep their combined friction small enough for the clamp to bind.
-    const uint32_t rigidMatOf[10] = { 0u, 1u, 2u, 3u, 0u, 1u, 2u, 3u, 2u, 1u };
+    const uint32_t rigidMatOf[11] = { 0u, 1u, 2u, 3u, 0u, 1u, 4u, 3u, 2u, 1u, 0u };
     // Which cloth element each lane names, and whether it is a TRIANGLE contact.
-    const uint32_t elemOf[10] = { 0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 0u, 1u };
-    const bool isTriOf[10] = { false, false, false, false, false,
-                               false, false, false, true, true };
+    const uint32_t elemOf[11] = { 0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 0u, 1u, 14u };
+    const bool isTriOf[11] = { false, false, false, false, false,
+                               false, false, false, true, true, false };
+    // Lane 10 is SEPARATING and pre-marked in-collision, and carries an accumulated lambda
+    // from an earlier solver iteration.  That is the one shape in which deltaLambdaN goes
+    // NEGATIVE -- dLN = max(-CN*invDenom, -accum) with CN > 0 -- and it is the only way the
+    // abs() in the tangent clamp is observable.  It also covers the .cu's "once active, stay
+    // active" branch on the cloth side, which until now only the softbody fixture drove.
+    const bool separatingOf[11] = { false, false, false, false, false, false,
+                                    false, false, false, false, true };
+    const float seededLambda[11] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                                     0.0f, 0.0f, 0.0f, 0.0f, 0.75f };
 
     // ---- the six rigid ids, and which solver body each resolves to -------
     const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
@@ -4301,17 +4317,18 @@ static void runRigidContactDynamic(bool isTGS)
     const uint64_t artiNodeInd = (1ull << 32) | 5ull;    // articulation bit SET
     // Lanes 6 and 7 are dynamic as well; they exist for computeBasisVectors' SECOND branch
     // (see the normal table below), and being dynamic gives them reaction coverage too.
-    const uint64_t nodeInds[10] = { dynNodeInd, dynNodeInd, dynNodeInd,
+    const uint64_t nodeInds[11] = { dynNodeInd, dynNodeInd, dynNodeInd,
                                     staticNodeInd, kinNodeInd, artiNodeInd,
                                     dynNodeInd, dynNodeInd,
-                                    dynNodeInd, dynNodeInd };   // the two TRIANGLE lanes
+                                    dynNodeInd, dynNodeInd,     // the two TRIANGLE lanes
+                                    dynNodeInd };               // the separating lane
     // solverBodyIndices[nodeIndex]: node 3 -> body 1 (dynamic), node 4 -> body 2 (kinematic),
     // node 5 -> body 1 as well, so the articulation lane carries a NON-ZERO invMass and only
     // the articulation test can stop its reaction.
     std::vector<uint32_t> solverBodyIndices = { 0u, 0u, 0u, 1u, 2u, 1u };
-    const uint32_t bodyOf[10] = { 1u, 1u, 1u, 0u, 2u, 1u, 1u, 1u, 1u, 1u };  // static reads slot 0
+    const uint32_t bodyOf[11] = { 1u, 1u, 1u, 0u, 2u, 1u, 1u, 1u, 1u, 1u, 1u }; // static reads slot 0
     // getGlobalRigidBodyId: -1 static, solverBodyIdx rigid, numSolverBodies+idx articulation.
-    const int globalIdOf[10] = { 1, 1, 1, -1, 2, int(numSolverBodies) + 1, 1, 1, 1, 1 };
+    const int globalIdOf[11] = { 1, 1, 1, -1, 2, int(numSolverBodies) + 1, 1, 1, 1, 1, 1 };
     DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
 
     // ---- contact geometry: a distinct tilted normal per lane -------------
@@ -4325,7 +4342,7 @@ static void runRigidContactDynamic(bool isTGS)
     // un-renormalised so that |y| is exactly the literal.  Without 6 and 7 the second
     // normalisation and the comparison operator are both unreachable, and mutants of each
     // survived the first sweep.
-    p714ref::V3 planeNormals[10];
+    p714ref::V3 planeNormals[11];
     for (uint32_t i = 0; i < N; ++i)
     {
         // Lane 6's exact digits matter: the second branch normalises up = (0, dir.z, -dir.y),
@@ -4345,7 +4362,9 @@ static void runRigidContactDynamic(bool isTGS)
         // Deep enough that the contact stays ACTIVE in BOTH modes: TGS folds the rigid
         // position delta into the error term at invDt, so a shallow penetration flips to
         // inactive there while staying active under PGS.
-        normalPens[i] = { planeNormals[i].x, planeNormals[i].y, planeNormals[i].z, -0.05f - 0.004f * float(i) };
+        // A SEPARATING lane needs a POSITIVE penetration so CN comes out positive.
+        normalPens[i] = { planeNormals[i].x, planeNormals[i].y, planeNormals[i].z,
+                          separatingOf[i] ? 0.02f : (-0.05f - 0.004f * float(i)) };
         // A TRIANGLE contact is bc.w == 0 and carries three real weights; a VERTEX contact
         // is bc.w != 0 and only bc.x is used (as 1.0).  The two take DIFFERENT friction
         // sources, which is the whole reason lanes 8 and 9 exist.
@@ -4354,7 +4373,9 @@ static void runRigidContactDynamic(bool isTGS)
                         : F4{ 0.0f, 0.0f, 0.0f, 1.0f };
         infos[i].pairInd0 = nodeInds[i];
         infos[i].pairInd1 = elemOf[i];               // (clothId 0 << 20) | element index
-        infos[i].rigidMatInd_isInCollision = rigidMatOf[i];   // bits 0..30; bit 31 = isInCollision
+        // bits 0..30 are the rigid material index; bit 31 is isInCollision, and the
+        // separating lane is pre-marked so the query keeps it active without re-testing.
+        infos[i].rigidMatInd_isInCollision = rigidMatOf[i] | (separatingOf[i] ? 0x80000000u : 0u);
     }
 
     DevBuf bContacts = makeDev(dev, contacts);
@@ -4563,6 +4584,14 @@ static void runRigidContactDynamic(bool isTGS)
                   "lane 4 must carry the KINEMATIC zero inverse mass (got %g)", gotC.fricTan0_invMass0[4].w);
     PXG_CHECK_MSG(mm == 0, "dynamic prepare bit-exact vs CPU (%zu mismatches)", mm);
 
+    // The prepare zeroes rigidLambdaNs for every contact, so the accumulated lambda the
+    // separating lane needs has to be written back afterwards -- which is exactly the state
+    // the engine is in from the second solver iteration onward.
+    {
+        std::vector<float> seeded(seededLambda, seededLambda + N);
+        dev->upload(bLambda.h, seeded.data(), seeded.size() * sizeof(float));
+    }
+
     // ======================= dispatch QUERY (refcount) =================
     struct QueryPush
     {
@@ -4594,10 +4623,10 @@ static void runRigidContactDynamic(bool isTGS)
         const p714ref::V3 invMq = isTriOf[i] ? p714ref::V3{ invMass, invMass, invMass }
                                              : p714ref::V3{ invMass, 0.0f, 0.0f };
         const p714ref::InitResult qir =
-            p714ref::refInitialize(refC, int(i), isTGS, /*appliedForceRef*/ 0.0f, dt, laneBcVec(i),
+            p714ref::refInitialize(refC, int(i), isTGS, seededLambda[i], dt, laneBcVec(i),
                                    laneAccum(i), invMq, /*rigidRefCount*/ 1.0f,
-                                   /*wasActive*/ false, /*checkOnly*/ true, rigidVelOf(bodyOf[i]),
-                                   /*combinedFriction*/ 0.0f);
+                                   /*wasActive*/ separatingOf[i], /*checkOnly*/ true,
+                                   rigidVelOf(bodyOf[i]), /*combinedFriction*/ 0.0f);
         // Faithful to the .cu: everything below hangs off isActive.  The assertion is a
         // COVERAGE claim about the seeded data, not a step of the reference -- if it ever
         // fires, the data drifted, and the comparison stays honest either way.
@@ -4626,7 +4655,7 @@ static void runRigidContactDynamic(bool isTGS)
 
     // teeth: seven contacts share solver body 1, so its count must be 7 -- with 1 a dropped
     // reference-count multiply in computeRigidChange would be invisible.
-    PXG_CHECK_MSG(gRefCountsQ[1] == 7u, "the seven dynamic contacts must bump body 1 to 7 (got %u)",
+    PXG_CHECK_MSG(gRefCountsQ[1] == 8u, "the eight dynamic contacts must bump body 1 to 8 (got %u)",
                   gRefCountsQ[1]);
     PXG_CHECK_MSG(gRefCountsQ[2] == 0u, "the KINEMATIC body must not be counted (got %u)", gRefCountsQ[2]);
     PXG_CHECK_MSG(gRefCountsQ[numSolverBodies + 1u] == 1u,
@@ -4663,7 +4692,8 @@ static void runRigidContactDynamic(bool isTGS)
     std::vector<bool> reactsOf(N, false);
     uint32_t dynamicLanes = 0u, zeroLanes = 0u;
     uint32_t frictionLanes = 0u, boundLanes = 0u, boundTriLanes = 0u, boundVertLanes = 0u;
-    uint32_t modeSeen[4] = { 0u, 0u, 0u, 0u };
+    uint32_t negativeLambdaLanes = 0u;
+    uint32_t modeSeen[5] = { 0u, 0u, 0u, 0u, 0u };
     std::vector<float> laneFriction(N, 0.0f);
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -4687,12 +4717,15 @@ static void runRigidContactDynamic(bool isTGS)
         const float combinedFriction = p714ref::refCombineFriction(
             rigidMatFriction[rigidMatOf[i]], laneClothFriction(i), rigidMatMode[rigidMatOf[i]]);
         laneFriction[i] = combinedFriction;
-        ++modeSeen[rigidMatMode[rigidMatOf[i]]];
+        // modeSeen[4] counts the out-of-range mode, whatever its numeric value.
+        ++modeSeen[rigidMatMode[rigidMatOf[i]] < 4u ? rigidMatMode[rigidMatOf[i]] : 4u];
         const p714ref::InitResult sir =
-            p714ref::refInitialize(refC, int(i), isTGS, /*appliedForceRef*/ 0.0f, dt, laneBcVec(i),
+            p714ref::refInitialize(refC, int(i), isTGS, seededLambda[i], dt, laneBcVec(i),
                                    laneAccum(i), deformableInvMasses, rigidRefCount,
                                    /*wasActive*/ true, /*checkOnly*/ false, rigidVelOf(b),
                                    combinedFriction);
+        if (sir.deltaLambdaN < 0.0f)
+            ++negativeLambdaLanes;
         if (sir.deltaLambdaT != 0.0f)
             ++frictionLanes;
         if (sir.frictionBound)
@@ -4741,17 +4774,27 @@ static void runRigidContactDynamic(bool isTGS)
         refRigidDeltaVel[i] = { dLin.x, dLin.y, dLin.z, count };
         refRigidDeltaVel[i + N] = { dAng.x, dAng.y, dAng.z, 0.0f };
     }
-    PXG_CHECK_MSG(dynamicLanes == 7u && zeroLanes == 3u,
-                  "coverage: expected 7 reacting and 3 silent lanes, got %u / %u", dynamicLanes, zeroLanes);
+    PXG_CHECK_MSG(dynamicLanes == 8u && zeroLanes == 3u,
+                  "coverage: expected 8 reacting and 3 silent lanes, got %u / %u", dynamicLanes, zeroLanes);
 
     // P9.46 TEETH.  Without these the material path could be silently inert again:
     // deltaLambdaT is exactly -0 whenever the combined friction is 0, and a comparison
     // against a reference that ALSO produced -0 stays green either way.
-    PXG_CHECK_MSG(frictionLanes == N,
-                  "every lane must produce a non-zero tangent impulse, got %u of %u",
-                  frictionLanes, N);
+    // N - 1, not N: lane 6 carries the OUT-OF-RANGE combine mode, whose whole point is that
+    // PxsCombinePxReal returns 0 there and the tangent impulse collapses to -0.
+    PXG_CHECK_MSG(frictionLanes == N - 1u,
+                  "all but the invalid-mode lane must produce a non-zero tangent impulse, "
+                  "got %u of %u", frictionLanes, N);
+    PXG_CHECK_MSG(f2u(laneFriction[6]) == 0u,
+                  "the out-of-range combine mode must give exactly 0 friction (got %g)",
+                  laneFriction[6]);
+    // The abs() in the tangent clamp is only observable where deltaLambdaN goes negative.
+    PXG_CHECK_MSG(negativeLambdaLanes >= 1u,
+                  "at least one lane must reach a NEGATIVE deltaLambdaN (separating contact "
+                  "with an accumulated lambda), got %u", negativeLambdaLanes);
     for (uint32_t m = 0; m < 4u; ++m)
         PXG_CHECK_MSG(modeSeen[m] > 0u, "PxCombineMode %u is never exercised", m);
+    PXG_CHECK_MSG(modeSeen[4] > 0u, "the out-of-range combine mode is never exercised");
     {
         uint32_t distinct = 0u;
         for (uint32_t a = 0; a < N; ++a)
@@ -4818,9 +4861,17 @@ static void runRigidContactDynamic(bool isTGS)
                       "dynamic lane %u must report count 1 (got %g)", i, gRigidDeltaVel[i].w);
         const float lin = gRigidDeltaVel[i].x * planeNormals[i].x + gRigidDeltaVel[i].y * planeNormals[i].y
                         + gRigidDeltaVel[i].z * planeNormals[i].z;
-        PXG_CHECK_MSG(lin < 0.0f,
-                      "dynamic lane %u reaction must oppose the cloth push (dot = %g, isTGS=%d)",
-                      i, lin, int(isTGS));
+        // Lane 10 is the SEPARATING lane: it unwinds an already-accumulated lambda, so its
+        // deltaLambdaN is negative and the reaction points the OTHER way -- the sign flip is
+        // the whole reason that lane exists, so it is asserted, not exempted.
+        if (separatingOf[i])
+            PXG_CHECK_MSG(lin > 0.0f,
+                          "separating lane %u must UNWIND, i.e. react along the normal "
+                          "(dot = %g, isTGS=%d)", i, lin, int(isTGS));
+        else
+            PXG_CHECK_MSG(lin < 0.0f,
+                          "dynamic lane %u reaction must oppose the cloth push (dot = %g, isTGS=%d)",
+                          i, lin, int(isTGS));
         const F4 a = gRigidDeltaVel[i + N];
         PXG_CHECK_MSG(f2u(a.x) != 0u || f2u(a.y) != 0u || f2u(a.z) != 0u,
                       "dynamic lane %u angular reaction must be non-zero", i);
@@ -4856,6 +4907,129 @@ static void runRigidContactDynamic(bool isTGS)
     }
     PXG_CHECK_MSG(mm2 == 0, "dynamic cloth_solveRigidClothCollision%s bit-exact vs CPU (%zu mismatches)",
                   isTGS ? "TGS" : "PGS", mm2);
+
+    // ================= second solve: the NULL rigid material table ==============
+    // The .cu passes `&rigidBodyMaterials[contactInfo.getRigidMaterialIndex()]`, so the
+    // pointer readRigidBody tests is NULL only when the table is null AND the index is 0 --
+    // which is why the port guards on `base + index * stride`, not on the base.  On that
+    // path the rigid half is friction 0 with combine mode eMAX, so the combined friction is
+    // max(0, deformableFriction) = the DEFORMABLE value, unhalved.
+    //
+    // The old single-lane static fixture already ran with both tables null, but there the
+    // deformable friction was 0 too, and every combine mode returns 0 from (0, 0) -- the
+    // eMAX default was unobservable.  Here `materials` stays live and the VERTEX lanes read
+    // cloth.mDynamicFrictions, which readCloth reaches without the material table at all,
+    // so the default mode finally reaches the output.
+    // Pass 2 repeats with the DEFORMABLE table null as well.  There the .cu's
+    // `materials ? ... : 0.0f` is the only thing standing between the port and a read off
+    // address 8, and both readCloth branches carry that guard -- the vertex branch guards
+    // the mDynamicFrictions read on `materials` too, which is easy to miss because the
+    // array it reads does not come from that pointer at all.
+    for (uint32_t pass = 0; pass < 2u; ++pass)
+    {
+        const bool nullFemMats = (pass == 1u);
+        auto infosNull = downloadBuffer<FemOtherContactInfoHost>(dev, bInfos.h, N);
+        for (uint32_t i = 0; i < N; ++i)
+            infosNull[i].rigidMatInd_isInCollision &= 0x80000000u;   // index 0, activity kept
+        dev->upload(bInfos.h, infosNull.data(), infosNull.size() * sizeof(FemOtherContactInfoHost));
+
+        // Restore the exact post-QUERY state the first solve started from.
+        {
+            std::vector<F4> d(NV);
+            for (uint32_t v = 0; v < NV; ++v) d[v] = F4{ 0.0f, 0.0f, 0.0f, refVertW[v] };
+            dev->upload(bDelta.h, d.data(), d.size() * sizeof(F4));
+            std::vector<float> seeded(seededLambda, seededLambda + N);
+            dev->upload(bLambda.h, seeded.data(), seeded.size() * sizeof(float));
+            std::vector<F4> z(2u * N, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
+            dev->upload(bRigidDeltaVel.h, z.data(), z.size() * sizeof(F4));
+        }
+
+        SolvePush spn = sp;
+        spn.rigidBodyMaterials = 0ull;
+        if (nullFemMats)
+        {
+            spn.materials = 0ull;
+            // With the table null the .cu never dereferences it, so the per-triangle index
+            // is free -- and a port that dropped the guard would compute
+            // 0 + 65535 * 32 + 8 and fault.  That is the ONLY observable a dropped null
+            // guard has: with a small index the wild read lands in mapped memory and reads
+            // back 0, which is exactly what the guard would have produced.
+            const uint32_t poison = 65535u | (65535u << 16);
+            dev->upload(bClothMatIdx.h, &poison, sizeof(poison));
+        }
+        Kernel kSolveNull("femClothRigidContactBda.spv", solveEntry, {}, sizeof(SolvePush));
+        kSolveNull.dispatch(1u, {}, spn, 1u, 1u);
+        dev->flush();
+
+        std::vector<F4> refNullVel(2u * N);
+        std::vector<float> refNullAccum(N);
+        uint32_t nullBound = 0u, nullHalved = 0u;
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            const uint32_t b = bodyOf[i];
+            const float rigidRefCount =
+                (globalIdOf[i] != -1 && invMassOf[b] != 0.0f) ? float(refRefCounts[size_t(globalIdOf[i])]) : 1.0f;
+            uint32_t vs[3];
+            const uint32_t nv = laneVerts(i, vs);
+            float im[3] = { 0.0f, 0.0f, 0.0f };
+            for (uint32_t k = 0; k < nv; ++k) im[k] = invMass * refVertW[vs[k]];
+            const p714ref::V3 dim = { im[0], im[1], im[2] };
+            // rigid friction 0, mode eMAX -- the null default, spelled out.  With the
+            // deformable table null BOTH readCloth branches return 0, vertex included.
+            const float mu = p714ref::refCombineFriction(
+                0.0f, nullFemMats ? 0.0f : laneClothFriction(i), 3u);
+            const p714ref::InitResult sir =
+                p714ref::refInitialize(refC, int(i), isTGS, seededLambda[i], dt, laneBcVec(i),
+                                       laneAccum(i), dim, rigidRefCount, /*wasActive*/ true,
+                                       /*checkOnly*/ false, rigidVelOf(b), mu);
+            if (sir.frictionBound) ++nullBound;
+            // The mutant that defaults to eAVERAGE would halve mu here; count the lanes on
+            // which that is actually observable, i.e. where the clamp binds on a non-zero mu.
+            if (sir.frictionBound && mu != 0.0f) ++nullHalved;
+            const bool isArti = (nodeInds[i] >> 32) & 1ull;
+            const bool reacts = (invMassOf[b] != 0.0f) && (nodeInds[i] != staticNodeInd) && !isArti;
+            p714ref::V3 dLin = { 0, 0, 0 }, dAng = { 0, 0, 0 };
+            float count = 0.0f;
+            if (reacts)
+            {
+                count = 1.0f;
+                p714ref::refComputeRigidChange(sir, /*isArticulation*/ false, invMassOf[b],
+                                               rigidRefCount, dLin, dAng);
+            }
+            refNullVel[i] = { dLin.x, dLin.y, dLin.z, count };
+            refNullVel[i + N] = { dAng.x, dAng.y, dAng.z, 0.0f };
+            refNullAccum[i] = sir.accum;
+        }
+        // Pass 1 must bind, or eMAX and eAVERAGE are indistinguishable.  Pass 2 cannot
+        // bind at all -- every friction is 0 there, which is exactly the point.
+        if (!nullFemMats)
+            PXG_CHECK_MSG(nullHalved >= 2u,
+                          "the null-rigid-material pass must BIND the clamp on at least two "
+                          "lanes, else eMAX and eAVERAGE are indistinguishable there "
+                          "(bound %u)", nullHalved);
+        else
+            PXG_CHECK_MSG(nullHalved == 0u,
+                          "with both material tables null every friction must be 0 (%u bound)",
+                          nullHalved);
+
+        const auto gNullVel = downloadBuffer<F4>(dev, bRigidDeltaVel.h, 2u * N);
+        const auto gNullAccum = downloadBuffer<float>(dev, bLambda.h, N);
+        size_t mmn = 0;
+        for (uint32_t k = 0; k < 2u * N; ++k)
+        {
+            const F4& r = refNullVel[k]; const F4& g = gNullVel[k];
+            if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) || f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+            { ++mmn; std::printf("  null-mat pass %u rigidDeltaVel[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n",
+                                 pass, k, r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
+        }
+        for (uint32_t i = 0; i < N; ++i)
+            if (f2u(refNullAccum[i]) != f2u(gNullAccum[i]))
+            { ++mmn; std::printf("  null-mat pass %u appliedForces[%u] MM: ref %g got %g\n",
+                                 pass, i, refNullAccum[i], gNullAccum[i]); }
+        PXG_CHECK_MSG(mmn == 0, "null material pass %u bit-exact vs CPU (%zu mismatches)", pass, mmn);
+        if (nullFemMats)
+            dev->upload(bClothMatIdx.h, clothMatIdxWords.data(), clothMatIdxWords.size() * sizeof(uint32_t));
+    }
 
     dev->destroyBuffer(bPos.h); dev->destroyBuffer(bVel.h); dev->destroyBuffer(bAcc.h);
     dev->destroyBuffer(bDelta.h); dev->destroyBuffer(bTri.h); dev->destroyBuffer(bDesc.h);
