@@ -4230,7 +4230,12 @@ static void runRigidContactDynamic(bool isTGS)
     p714ref::V3 planeNormals[8];
     for (uint32_t i = 0; i < N; ++i)
     {
-        if (i == 6u) { planeNormals[i] = { 0.0010f, -0.9999995f, 0.0020f }; continue; }
+        // Lane 6's exact digits matter: the second branch normalises up = (0, dir.z, -dir.y),
+        // and for most near-vertical normals `up.k / m` and `up.k * (1/m)` happen to agree
+        // in every component, so the first near-vertical lane tried here still let the
+        // three-divide mutant through.  This one was searched for: it differs in the z
+        // component (-0.999999702 divided against -0.999999762 reciprocated).
+        if (i == 6u) { planeNormals[i] = { -0.000200001727f, -0.999999642f, -0.000800006907f }; continue; }
         if (i == 7u) { planeNormals[i] = { 0.0099999f, -0.9999f, 0.0099999f }; continue; }
         float raw[3] = { 0.2f + 0.09f * float(i), 0.9f - 0.05f * float(i), 0.3f - 0.04f * float(i) };
         const float m = std::sqrt(raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]);
