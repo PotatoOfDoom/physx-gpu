@@ -99,8 +99,12 @@ uint rdaNodeIndex(uint64_t id) { return uint(id & uint64_t(0xffffffffu)); }
 bool rdaIsArticulation(uint64_t id) { return (uint(id >> 32) & 1u) != 0u; }
 uint rdaLinkId(uint64_t id) { return uint(id >> 32) >> 1; }
 
-// PxMax (PxMath.h): a < b ? b : a -- this ORDER, so PxMax(1.0f, NaN) is 1.0f as in the .cu.
-float rdaMax(float a, float b) { return (a < b) ? b : a; }
+// PxMax on FLOAT is not the generic template (PxMath.h:75, `a < b ? b : a`): the
+// float overload (PxMath.h:82) forwards to intrinsics::selectMax, which is
+// `a > b ? a : b` (PxUnixMathIntrinsics.h:122).  The two differ for a NaN operand
+// and for PxMax(+0, -0) -- the first mutation sweep of this module caught the
+// generic order here, with the correct code as the surviving mutant.
+float rdaMax(float a, float b) { return (a > b) ? a : b; }
 
 // x + (+0.0f) in IEEE: only a negative zero changes.  See the header.
 float rdaPlusZero(float x)

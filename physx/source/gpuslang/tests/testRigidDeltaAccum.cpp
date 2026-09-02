@@ -58,7 +58,11 @@ using namespace pxgtest;
 
 struct F4 { float x, y, z, w; };
 static F4 add4(F4 a, F4 b) { return F4{ a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w }; }
-static float pxMax(float a, float b) { return (a < b) ? b : a; }   // PxMath.h PxMax, this order
+// PxMax on float forwards to intrinsics::selectMax (PxMath.h:82 ->
+// PxUnixMathIntrinsics.h:122), which is `a > b ? a : b` -- NOT the generic
+// template's `a < b ? b : a`.  The two disagree for PxMax(+0, -0), which the
+// signed-zero case below pins.
+static float pxMax(float a, float b) { return (a > b) ? a : b; }
 
 static const uint32_t AD_BLOCK = 512u;
 static const uint32_t AD_GRID = 32u;
@@ -827,6 +831,144 @@ PXG_TEST(rigidDeltaAccum_multiChain)
         G.destroy();
         std::printf("  multi[%d] local=%d tgs=%d: %u ids with two runs, all stages word-exact\n", variant, int(useLocalRelax), int(isTGS), twoRuns);
     }
+}
+
+// ===========================================================================
+// The two traps the first mutation sweep of this module left standing.
+//
+//   * PxMax's operand order.  The float overload forwards to selectMax
+//     (`a > b ? a : b`), and PxMax(+0, -0) is the only finite input that tells it
+//     apart from the generic template's `a < b ? b : a`.  Stage1's denominator is
+//     exactly such a PxMax, so a run whose weights are all -0.0 and a global
+//     relaxation coefficient of +0.0 make the difference observable -- but ONLY if
+//     the accumulator it lands in is itself -0.0, since (+0) + (-0) is (+0) and
+//     would erase the sign.  The clear kernel is therefore not run for this case
+//     and tempDenom starts at -0.0.
+//   * The atomic add's retry.  Its compare-exchange loop only matters when two
+//     lanes hit the same word at the same time, which no id list can force if the
+//     platform serialises the lanes.  An A,B,A,B list of 512 entries makes every
+//     lane of block 0 the last contact of its own run, so 256 lanes add to one
+//     rigid body and 256 to one articulation link.  All contributions are equal
+//     powers of two, so the sums are order-independent and the comparison stays
+//     word-exact whether or not the lanes actually collide.
+// ===========================================================================
+PXG_TEST(rigidDeltaAccum_pxMaxSignedZero)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    Rng rng{ 0x7f4a7c15u };
+    World W;
+    buildBodies(W, rng);
+
+    // two runs: the first carries -0.0 weights, the second +0.0 weights
+    const uint64_t idNeg = rigidNode(11u), idPos = rigidNode(12u);
+    W.ids = { idNeg, idNeg, idNeg, idPos, idPos };
+    W.n = uint32_t(W.ids.size());
+    W.deltaV.assign(2u * W.n, F4{ 0.25f, -0.5f, 0.75f, 0.0f });
+    for (uint32_t w = 0; w < 3u; ++w) W.deltaV[w].w = -0.0f;
+    for (uint32_t w = 3u; w < W.n; ++w) W.deltaV[w].w = 0.0f;
+    // no clear: the accumulator must start at -0.0 or the add erases the sign
+    W.tempDenom.assign(W.N, -0.0f);
+
+    // Stage1 is run WITHOUT First in front of it, and that is the point: First
+    // finishes every run with `deltaV[w] + accum`, and accum's .w is a positive
+    // zero for a run that crosses no warp or block boundary, so -0.0 + (+0.0)
+    // would come back out as +0.0 and the PxMax below would never see a negative
+    // zero.  Stage1 reads deltaV directly, so the weights land in it untouched.
+    Gpu G{ dev };
+    if (!G.upload(W)) return;
+    FirstOut ref;
+    ref.deltaV = W.deltaV;
+    ref.blockDeltaV.assign(2 * AD_GRID, F4{ 9.0f, 9.0f, 9.0f, 9.0f });   // as Gpu::upload seeds them
+    ref.blockRigidId.assign(AD_GRID, 0x1234ull);                          // never equal to a run's id
+    G.runMulti("accumulateDeltaVRigidSecondLaunchMultiStage1", /*useLocalRelax*/ true, /*globalRelax*/ 0.0f, false);
+    const std::vector<float> gDenom = downloadBuffer<float>(dev, G.bTempDenom, W.N);
+    G.destroy();
+
+    World R = W;
+    refStage1(R, ref, true, 0.0f);
+
+    const uint32_t sbiNeg = W.solverBodyIndices[nodeIndex(idNeg)];
+    const uint32_t sbiPos = W.solverBodyIndices[nodeIndex(idPos)];
+    uint32_t gNeg, rNeg, gPos, rPos;
+    std::memcpy(&gNeg, &gDenom[sbiNeg], 4); std::memcpy(&rNeg, &R.tempDenom[sbiNeg], 4);
+    std::memcpy(&gPos, &gDenom[sbiPos], 4); std::memcpy(&rPos, &R.tempDenom[sbiPos], 4);
+    std::printf("  PxMax(+0,-0): negative-weight run gpu 0x%08x ref 0x%08x, positive-weight run gpu 0x%08x ref 0x%08x\n",
+                gNeg, rNeg, gPos, rPos);
+    PXG_CHECK_MSG(rNeg == 0x80000000u, "the reference itself lost the negative zero (0x%08x) -- selectMax order", rNeg);
+    PXG_CHECK_MSG(gNeg == rNeg, "PxMax order: denominator of the -0.0 run is 0x%08x, expected 0x%08x", gNeg, rNeg);
+    PXG_CHECK_MSG(gPos == rPos, "denominator of the +0.0 run is 0x%08x, expected 0x%08x", gPos, rPos);
+
+    uint32_t bad = 0;
+    for (uint32_t k = 0; k < W.N; ++k)
+        if (std::memcmp(&gDenom[k], &R.tempDenom[k], 4) != 0) ++bad;
+    PXG_CHECK_MSG(bad == 0, "%u tempDenom words differ", bad);
+}
+
+PXG_TEST(rigidDeltaAccum_atomicCollision)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+    const float globalRelax = 0.5f;
+    Rng rng{ 0x1b873593u };
+    World W;
+    buildBodies(W, rng);
+
+    // 512 alternating entries -> every lane of block 0 ends its own run.
+    const uint64_t idRigid = rigidNode(3u);
+    const uint64_t idArti = artiNode(NUM_RIGID_NODES + 1u, 2u);
+    W.ids.clear();
+    for (uint32_t k = 0; k < 256u; ++k) { W.ids.push_back(idRigid); W.ids.push_back(idArti); }
+    W.n = uint32_t(W.ids.size());
+    // equal powers of two: any summation order gives the same bits
+    W.deltaV.assign(2u * W.n, F4{ 1.0f, -2.0f, 0.25f, 4.0f });
+
+    const uint32_t sbiRigid = W.solverBodyIndices[nodeIndex(idRigid)];
+    const uint32_t sbiArti = W.solverBodyIndices[nodeIndex(idArti)];
+    W.pool[W.acc + sbiRigid] = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
+    W.pool[W.acc + sbiRigid + W.N] = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
+    {
+        const uint32_t blockIndex = sbiArti / WARP, aib = sbiArti % WARP;
+        const size_t linkBase = size_t(blockIndex * W.maxLinks + nodeLink(idArti)) * AB_LINK_SIZE;
+        const float z[3] = { 0.0f, 0.0f, 0.0f };
+        writeScratchImpulse(W.linkBlocks, linkBase, aib, z, z, false);
+    }
+
+    Gpu G{ dev };
+    if (!G.upload(W)) return;
+    G.runFirst();
+    const FirstOut ref = refFirst(W);
+    G.runClear();
+    G.runMulti("accumulateDeltaVRigidSecondLaunchMultiStage1", false, globalRelax, false);
+    const std::vector<float> gDenom = downloadBuffer<float>(dev, G.bTempDenom, W.N);
+    const std::vector<uint8_t> gLinks1 = downloadBuffer<uint8_t>(dev, G.bLinkBlocks, W.linkBlocks.size());
+    G.runMulti("accumulateDeltaVRigidSecondLaunchMultiStage2", false, globalRelax, false);
+    const std::vector<F4> gPool = downloadBuffer<F4>(dev, G.bPool, W.pool.size());
+    const std::vector<uint8_t> gLinks2 = downloadBuffer<uint8_t>(dev, G.bLinkBlocks, W.linkBlocks.size());
+    G.destroy();
+
+    World R = W;
+    refClearMulti(R);
+    refStage1(R, ref, false, globalRelax);
+    const std::vector<float> refDenom = R.tempDenom;
+    const std::vector<uint8_t> refLinks1 = R.linkBlocks;
+    refStage2(R, ref, false);
+
+    const uint32_t blockIndex = sbiArti / WARP, aib = sbiArti % WARP;
+    const size_t linkBase = size_t(blockIndex * W.maxLinks + nodeLink(idArti)) * AB_LINK_SIZE;
+    std::printf("  256 concurrent adds per target: tempDenom gpu %.9g ref %.9g (256 x %.3g); link scale gpu %.9g ref %.9g\n",
+                gDenom[sbiRigid], refDenom[sbiRigid], globalRelax,
+                getF32(gLinks1, linkBase + AB_LINK_mDeltaScale + size_t(aib) * 4),
+                getF32(refLinks1, linkBase + AB_LINK_mDeltaScale + size_t(aib) * 4));
+    uint32_t printed = 0;
+    uint32_t bad = 0;
+    for (uint32_t k = 0; k < W.N; ++k)
+        if (std::memcmp(&gDenom[k], &refDenom[k], 4) != 0)
+        { ++bad; if (printed < 4) { ++printed; std::printf("    tempDenom[%u] gpu %.9g ref %.9g\n", k, gDenom[k], refDenom[k]); } }
+    bad += cmpBytes("linkBlocks(stage1)", gLinks1, refLinks1, printed);
+    PXG_CHECK_MSG(bad == 0, "Stage1 under collision: %u words differ (a lost compare-exchange)", bad);
+
+    uint32_t bad2 = cmpF4("pool", gPool, R.pool, printed);
+    bad2 += cmpBytes("linkBlocks(stage2)", gLinks2, R.linkBlocks, printed);
+    PXG_CHECK_MSG(bad2 == 0, "Stage2 under collision: %u words differ (a lost compare-exchange)", bad2);
 }
 
 } // namespace
