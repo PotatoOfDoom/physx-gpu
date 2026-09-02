@@ -391,6 +391,12 @@ PXG_TEST(frozenHistogram_chain)
     runFrozenCase("partition-8192", 4213, 8192, 25, 25, false);
     runFrozenCase("partition-8193", 4214, 8193, 25, 25, false);
     runFrozenCase("multi-iter-20000", 4215, 20000, 20, 35, false);
+    // Pass 3 is the only grid-stride loop in the trio, and its stride is invisible
+    // until the compacted list is LONGER than one full grid (64 blocks * 256 threads
+    // = 16384 entries).  Every case above stays under that -- the 20000-element case
+    // compacts to 4000 and 7000 -- so the stride was unpinned and the sweep's
+    // double-stride mutant survived.  All-flagged 20000 makes both loops run twice.
+    runFrozenCase("grid-stride-20000-all", 4217, 20000, 100, 100, false);
     // the raw-value pin: ballot counts `!= 0`, the warp total adds the value itself
     runFrozenCase("raw-values-3000", 4216, 3000, 30, 30, true);
 }

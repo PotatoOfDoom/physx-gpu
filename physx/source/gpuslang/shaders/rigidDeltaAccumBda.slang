@@ -71,9 +71,11 @@
 //     product (P9.43b, fifth platform rule), which keeps a -0 the CUDA turns into
 //     +0; the .w lane is canonicalised in integer space instead (rdaPlusZero).
 //   * Float atomics (Multi stages) are a compare-exchange loop on the raw bits, the
-//     shape skinning.slang uses; the ORDER of concurrent adds is not deterministic
-//     on either platform, so the fixture keeps every body at <= 2 contributions
-//     (a + b == b + a bit-exactly).
+//     shape skinning.slang uses.  The retry is not a formality: with 256 lanes of one
+//     block aimed at a single word, dropping it loses adds on this platform (the
+//     fixture's atomicCollision case).  The ORDER of concurrent adds is not
+//     deterministic, so every fixture case keeps the summands order-independent --
+//     at most two contributions per body, or 256 equal powers of two.
 //
 // ENGINE ABI (PxgVulkanKernelAbi.cpp): First {8x5} = 40 B; Second {8x9, 1} = 80 B
 // (isTGS byte @72); clear {8x6} = 48 B; Stage1/2 {8x10, 1, 4, 1} = 96 B
