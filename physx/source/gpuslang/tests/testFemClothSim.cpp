@@ -4161,7 +4161,7 @@ static void runRigidContactDynamic(bool isTGS)
     PxgSlangComputeDevice* dev = testDevice();
     const float dt = 1.0f / 60.0f;
 
-    const uint32_t N = 6u;
+    const uint32_t N = 8u;
     const uint32_t numSolverBodies = 3u;
     const uint32_t accOffset = 0u;
     const float rigidInvMass = 0.25f;
@@ -4202,26 +4202,42 @@ static void runRigidContactDynamic(bool isTGS)
     const uint64_t dynNodeInd = 3ull;                    // articulation bit (high word bit0) clear
     const uint64_t kinNodeInd = 4ull;
     const uint64_t artiNodeInd = (1ull << 32) | 5ull;    // articulation bit SET
-    const uint64_t nodeInds[6] = { dynNodeInd, dynNodeInd, dynNodeInd,
-                                   staticNodeInd, kinNodeInd, artiNodeInd };
+    // Lanes 6 and 7 are dynamic as well; they exist for computeBasisVectors' SECOND branch
+    // (see the normal table below), and being dynamic gives them reaction coverage too.
+    const uint64_t nodeInds[8] = { dynNodeInd, dynNodeInd, dynNodeInd,
+                                   staticNodeInd, kinNodeInd, artiNodeInd,
+                                   dynNodeInd, dynNodeInd };
     // solverBodyIndices[nodeIndex]: node 3 -> body 1 (dynamic), node 4 -> body 2 (kinematic),
     // node 5 -> body 1 as well, so the articulation lane carries a NON-ZERO invMass and only
     // the articulation test can stop its reaction.
     std::vector<uint32_t> solverBodyIndices = { 0u, 0u, 0u, 1u, 2u, 1u };
-    const uint32_t bodyOf[6] = { 1u, 1u, 1u, 0u, 2u, 1u };   // static reads slot 0
+    const uint32_t bodyOf[8] = { 1u, 1u, 1u, 0u, 2u, 1u, 1u, 1u };   // static reads slot 0
     // getGlobalRigidBodyId: -1 static, solverBodyIdx rigid, numSolverBodies+idx articulation.
-    const int globalIdOf[6] = { 1, 1, 1, -1, 2, int(numSolverBodies) + 1 };
+    const int globalIdOf[8] = { 1, 1, 1, -1, 2, int(numSolverBodies) + 1, 1, 1 };
     DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
 
     // ---- contact geometry: a distinct tilted normal per lane -------------
     std::vector<F4> contacts(N), normalPens(N), barycentrics(N);
     std::vector<FemOtherContactInfoHost> infos(N);
-    p714ref::V3 planeNormals[6];
+    // PxComputeBasisVectors branches on |dir.y| <= 0.9999f, and dir is the SOLVER normal,
+    // which prepare forms by negating the plane normal.  Lanes 0..5 spread six tilted
+    // normals across the FIRST branch (right = normalize(dir.z, 0, -dir.x)); lane 6 is
+    // near-vertical so the SECOND branch runs (right = (1,0,0), up normalised instead);
+    // lane 7 sits EXACTLY on the 0.9999 boundary, where <= and < disagree, and is left
+    // un-renormalised so that |y| is exactly the literal.  Without 6 and 7 the second
+    // normalisation and the comparison operator are both unreachable, and mutants of each
+    // survived the first sweep.
+    p714ref::V3 planeNormals[8];
     for (uint32_t i = 0; i < N; ++i)
     {
+        if (i == 6u) { planeNormals[i] = { 0.0010f, -0.9999995f, 0.0020f }; continue; }
+        if (i == 7u) { planeNormals[i] = { 0.0099999f, -0.9999f, 0.0099999f }; continue; }
         float raw[3] = { 0.2f + 0.09f * float(i), 0.9f - 0.05f * float(i), 0.3f - 0.04f * float(i) };
         const float m = std::sqrt(raw[0] * raw[0] + raw[1] * raw[1] + raw[2] * raw[2]);
         planeNormals[i] = { raw[0] / m, raw[1] / m, raw[2] / m };
+    }
+    for (uint32_t i = 0; i < N; ++i)
+    {
         contacts[i] = { positions[i].x, positions[i].y, positions[i].z, 0.0f };   // restW = 0
         // Deep enough that the contact stays ACTIVE in BOTH modes: TGS folds the rigid
         // position delta into the error term at invDt, so a shallow penetration flips to
@@ -4461,9 +4477,9 @@ static void runRigidContactDynamic(bool isTGS)
         if (gRefCountsQ[k] != refRefCounts[k])
         { ++mm; std::printf("  query refCounts[%zu] MM: ref %u got %u\n", k, refRefCounts[k], gRefCountsQ[k]); }
 
-    // teeth: three contacts share solver body 1, so its count must be 3 -- with 1 a dropped
+    // teeth: five contacts share solver body 1, so its count must be 5 -- with 1 a dropped
     // reference-count multiply in computeRigidChange would be invisible.
-    PXG_CHECK_MSG(gRefCountsQ[1] == 3u, "the three dynamic contacts must bump body 1 to 3 (got %u)",
+    PXG_CHECK_MSG(gRefCountsQ[1] == 5u, "the five dynamic contacts must bump body 1 to 5 (got %u)",
                   gRefCountsQ[1]);
     PXG_CHECK_MSG(gRefCountsQ[2] == 0u, "the KINEMATIC body must not be counted (got %u)", gRefCountsQ[2]);
     PXG_CHECK_MSG(gRefCountsQ[numSolverBodies + 1u] == 1u,
@@ -4496,6 +4512,7 @@ static void runRigidContactDynamic(bool isTGS)
     // ---- CPU reference for the solve ----
     std::vector<F4> refDeltaAfterSolve(N), refRigidDeltaVel(2u * N);
     std::vector<float> refAccum(N);
+    std::vector<bool> reactsOf(N, false);
     uint32_t dynamicLanes = 0u, zeroLanes = 0u;
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -4521,6 +4538,7 @@ static void runRigidContactDynamic(bool isTGS)
         // The .cu's guard, plus this port's articulation extension.
         const bool isArti = (nodeInds[i] >> 32) & 1ull;
         const bool reacts = (invMassOf[b] != 0.0f) && (nodeInds[i] != staticNodeInd) && !isArti;
+        reactsOf[i] = reacts;
         p714ref::V3 dLin = { 0, 0, 0 }, dAng = { 0, 0, 0 };
         float count = 0.0f;
         if (reacts)
@@ -4537,8 +4555,8 @@ static void runRigidContactDynamic(bool isTGS)
         refRigidDeltaVel[i] = { dLin.x, dLin.y, dLin.z, count };
         refRigidDeltaVel[i + N] = { dAng.x, dAng.y, dAng.z, 0.0f };
     }
-    PXG_CHECK_MSG(dynamicLanes == 3u && zeroLanes == 3u,
-                  "coverage: expected 3 reacting and 3 silent lanes, got %u / %u", dynamicLanes, zeroLanes);
+    PXG_CHECK_MSG(dynamicLanes == 5u && zeroLanes == 3u,
+                  "coverage: expected 5 reacting and 3 silent lanes, got %u / %u", dynamicLanes, zeroLanes);
 
     const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, N);
     const auto gLambda2 = downloadBuffer<float>(dev, bLambda.h, N);
@@ -4559,10 +4577,12 @@ static void runRigidContactDynamic(bool isTGS)
         { ++mm2; std::printf("  solve appliedForces[%u] MM: ref %g got %g\n", i, refAccum[i], gLambda2[i]); }
     }
 
-    // teeth 1: the three dynamic lanes must produce a REACTION, and it must point INTO the
+    // teeth 1: every reacting lane must produce a REACTION, and it must point INTO the
     // floor -- the cloth is pushed out along the plane normal, the body the other way.
-    for (uint32_t i = 0; i < 3u; ++i)
+    for (uint32_t i = 0; i < N; ++i)
     {
+        if (!reactsOf[i])
+            continue;
         PXG_CHECK_MSG(f2u(gRigidDeltaVel[i].w) == f2u(1.0f),
                       "dynamic lane %u must report count 1 (got %g)", i, gRigidDeltaVel[i].w);
         const float lin = gRigidDeltaVel[i].x * planeNormals[i].x + gRigidDeltaVel[i].y * planeNormals[i].y
@@ -4574,8 +4594,11 @@ static void runRigidContactDynamic(bool isTGS)
         PXG_CHECK_MSG(f2u(a.x) != 0u || f2u(a.y) != 0u || f2u(a.z) != 0u,
                       "dynamic lane %u angular reaction must be non-zero", i);
     }
-    // teeth 2: the three silent lanes stay exactly zero, count included.
-    for (uint32_t i = 3u; i < N; ++i)
+    // teeth 2: every silent lane stays exactly zero, count included.
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        if (reactsOf[i])
+            continue;
         for (uint32_t half = 0; half < 2u; ++half)
         {
             const F4 v = gRigidDeltaVel[i + half * N];
@@ -4583,6 +4606,23 @@ static void runRigidContactDynamic(bool isTGS)
                           "silent lane %u half %u must stay zero (got %g,%g,%g,%g)",
                           i, half, v.x, v.y, v.z, v.w);
         }
+    }
+    // teeth 3: the two basis branches are both reached, and the boundary lane sits exactly
+    // on the literal -- otherwise a mutant of either normalisation, or of <= vs <, survives.
+    {
+        uint32_t firstBranch = 0u, secondBranch = 0u;
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            const float dy = -planeNormals[i].y;   // the SOLVER normal's y
+            if (std::fabs(dy) <= 0.9999f) ++firstBranch; else ++secondBranch;
+        }
+        PXG_CHECK_MSG(firstBranch >= 6u && secondBranch >= 1u,
+                      "computeBasisVectors coverage: %u lanes on the first branch, %u on the second",
+                      firstBranch, secondBranch);
+        PXG_CHECK_MSG(f2u(std::fabs(-planeNormals[7].y)) == f2u(0.9999f),
+                      "lane 7 must sit EXACTLY on the 0.9999 boundary (got %.9g)",
+                      double(std::fabs(-planeNormals[7].y)));
+    }
     PXG_CHECK_MSG(mm2 == 0, "dynamic cloth_solveRigidClothCollision%s bit-exact vs CPU (%zu mismatches)",
                   isTGS ? "TGS" : "PGS", mm2);
 
