@@ -47,15 +47,20 @@ fi
 # P9.14c the diffuse one, and it is scored on BOTH.  clothconvex joined in P9.21
 # the same way: it was a pending-work entry from P9.20, which mapped the TRIANGLE
 # half of the cloth-vs-convex chain and measured the cloth still falling through
-# to -73.81, and P9.21's VERTEX half is what catches it.  The pending-work list
-# at the bottom is empty again as a result, and stays in the script for the next
-# scene that needs it.
+# to -73.81, and P9.21's VERTEX half is what catches it.  particlepush and
+# articulationjoint joined in P9.44 and clothnet in P9.45; all three had been
+# pending-work entries since P9.41, which added them to MEASURE physics that was
+# silently missing rather than to score it.  clothnet is the one that took two
+# tranches: P9.44 mapped the five kernels that ACCUMULATE the rigid delta, and the
+# box still fell through to 0.2500 because their producer wrote zeros; P9.45
+# ported that producer (FEMCollision::computeRigidChange) and the box now rests on
+# the net at 2.1015.  The list is 35 named scenes plus the settling bag = 36.
 SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor articulation
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
         particlecloth particleinflatable particlediffuse particleconvex
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach
-        particlepush articulationjoint"
+        particlepush articulationjoint clothnet"
 
 pass=0; fail=0; missing=0
 
@@ -138,23 +143,9 @@ if [ "${1:-}" = "--diagnostics" ]; then
     env PXG_SCENE=clothmesh PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
         | grep -E '^  clothmesh:|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step' | sed 's/^/    /'
 
-    # P9.41: three scenes that MEASURE the physics P9.40's guard showed to be
-    # missing -- the ones no scored scene can see because none of them lets a
-    # dynamic rigid depend on a deformable, or reads an articulation's joint state
-    # back.  Each names the kernels it waits on and prints its number now, so the
-    # tranche that maps them has a before-figure to beat.  Each moves into SCENES
-    # the day it passes.  Not scored.
-    echo
-    # P9.44 mapped accumulateDeltaVRigidFirst/SecondLaunch, and particlepush and
-    # articulationjoint moved into the scored list above.  clothnet did not: with the
-    # accumulation chain live and NOTHING left unmapped on its path, the box still falls
-    # through.  Its producer writes zeros -- femClothRigidContactBda.slang:591 defers
-    # FEMCollision::computeRigidChange, which the CUDA takes for a DYNAMIC rigid, so the
-    # chain now folds zeros.  That is the next tranche (P9.45); the number below is its
-    # before-figure.
-    echo "--- clothnet          (waits on the DEFERRED dynamic-rigid reaction in femClothRigidContactBda)"
-    env PXG_SCENE=clothnet PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
-        | grep -E '^  clothnet:|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step|\[pxg-unmapped\]' | sed 's/^/    /'
+    # P9.41's three observing scenes have all moved into SCENES above: particlepush and
+    # articulationjoint in P9.44, clothnet in P9.45.  The pending-work list is back to the
+    # single entry it has carried since P9.26, and that one is not waiting on this port.
 fi
 
 [ "$fail" -eq 0 ] && [ "$missing" -eq 0 ]

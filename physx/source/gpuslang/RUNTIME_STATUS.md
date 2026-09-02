@@ -7,17 +7,34 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **843/843** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **844/844** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.33a added `gpuslang.npFloatIntrinRecipSqrt`, which is not a kernel port but a
 PLATFORM measurement: about forty shaders here spell `PxVec3::getNormalized` as
 `v * rsqrt(m)`, while the engine computes `PxRecipSqrt` = `1.0f/sqrtf` — two exactly
 specified IEEE operations — and SPIR-V's `InverseSqrt` is allowed 2 ULP of slack.  The
 two agree bit for bit on llvmpipe over 258442 inputs, and that is now measured rather
 than inferred from a green suite.
+P9.45 added `gpuslang.componentDivide`, the SIXTH static checker, because the
+FIFTH could not see its own defect class written one component at a time.
+`gpuslang.vectorDivide` keys on an `OpFDiv` whose RESULT TYPE is a vector, which
+is what `v / m` lowers to; `float3(v.x / m, v.y / m, v.z / m)` and three
+assignments lower to SCALAR divides and slipped past it entirely.  Three sites
+survived P9.36 that way, all transcriptions of `PxVec3::normalize()`
+(`computeBasisVectors` in `pxgSlangFemRigidContact`, `normalize3` in
+`psContactSolveBda`, `asNormalizeInPlace` in `npArtiStep`), and a widened fixture
+found the first one by disagreeing with its host mirror by one ULP.  The new rule
+flags two or more scalar `OpFDiv`s in one function that share a divisor and take
+their dividends from `OpCompositeExtract` with DISTINCT component indices — a
+vector taken apart and divided — which leaves the faithful shared-denominator
+sites (`femClothPrimitives.cu:129`, `softBody.cu:558`) alone.  Its allowlist is
+NOT empty and that is the finding: the engine writes componentwise division out
+by hand in `calcGridPos` (`gridCal.cuh:38-40`, still transcribed in seven
+shaders) and in the cone limit's `PxTan(clamped.y/4)` pair
+(`CmConeLimitHelper.h:173`).
 P9.36 added `gpuslang.vectorDivide`, the FIFTH static checker, after
 `gpuslang.barrierUniformity` (P9.16), `gpuslang.cudaTwinKernels` (P9.20),
 `gpuslang.speculatedLoads` (P9.23) and `gpuslang.disabledKernels` (P9.26) — all
-five exist because no fixture and no mutant can see what they check.  The newest
+six exist because no fixture and no mutant can see what they check.  The fifth
 one flags an `OpFDiv` whose result type is a vector and whose divisor is a splat
 of one scalar: PxVec3 has no three-divide form (`PxVec3.h:219/:260/:295`) and
 neither does the CUDA type the kernels actually use (`cutil_math.h:342/:352/:485/
@@ -44,8 +61,8 @@ and it earned its keep on the first run: it found a twelfth orphan
 (`bvh_CalculateKeyDeltas`) whose one launch site sits inside a block comment,
 which a grep for the enum reports as reachable.  12 of the 501 registry entries
 cannot be reached, so 489 is the number a running engine can actually ask for.
-Szenen: **35/35** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
-Inventar (34 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
+Szenen: **36/36** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
+Inventar (35 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
 wertet.  `particlediffuse` kam in P9.13a als Diagnose hinzu und ist seit P9.13d
 gewertet; `particleconvex` kam in P9.14a als ausstehende Arbeit hinzu und ist
@@ -54,18 +71,20 @@ ist und grün bleibt, ob das Tuch landet oder nicht; `clothdamp` kam in P9.19
 hinzu, weil keine Tuch-Szene ein Flächenmaterial mit Dämpfung setzte und der
 senkrechte Vorhang aus `clothhang` von Anfang an ruht; `clothconvex` kam in P9.20
 als ausstehende Arbeit hinzu und ist seit P9.21 gewertet, weil erst der
-VERTEX-Kernel das Tuch auf der Konvex-Platte fängt.  `particlepush` und
-`articulationjoint` kamen in P9.41 als ausstehende Arbeit hinzu und sind seit
-P9.44 gewertet: die erste misst, ob eine Partikelwolke eine dynamische Kiste
-überhaupt schiebt (jetzt 3,7175 m statt 0,0000 m), die zweite, ob der
-Gelenkzustand aus `PxArticulationCache` mit der Gliedpose übereinstimmt und die
-Artikulation einschläft.  Die Liste der ausstehenden
-Arbeit trägt zwei Einträge: `clothmesh` seit P9.26, und der wartet
+VERTEX-Kernel das Tuch auf der Konvex-Platte fängt.  Alle **drei** Szenen, die
+P9.41 als ausstehende Arbeit hinzufügte, sind inzwischen gewertet:
+`particlepush` und `articulationjoint` seit P9.44 — die erste misst, ob eine
+Partikelwolke eine dynamische Kiste überhaupt schiebt (jetzt 3,7175 m statt
+0,0000 m), die zweite, ob der Gelenkzustand aus `PxArticulationCache` mit der
+Gliedpose übereinstimmt und die Artikulation einschläft — und `clothnet` seit
+P9.45, das zwei Tranchen brauchte: P9.44 bildete die fünf Kerne ab, die den
+Starrkörper-Delta AUFSUMMIEREN, und die Kiste fiel weiter auf 0,2500 durch, weil
+deren Erzeuger Nullen schrieb; P9.45 portierte den Erzeuger, und die Kiste liegt
+jetzt bei 2,1015 auf dem Netz.  Die Liste der ausstehenden
+Arbeit trägt wieder nur einen Eintrag: `clothmesh` seit P9.26, und der wartet
 ausnahmsweise **nicht** auf einen Port — die Kette ist vollständig abgebildet,
 aber ihr Vertex-Erzeuger ist upstream abgeschaltet, und das Tuch fällt mit
-beiden neuen Kerneln auf **exakt** dieselbe Zahl wie ohne sie; und `clothnet`
-seit P9.41, das auf die in P9.45 fällige Starrkörper-Reaktion der Tuch- und
-Weichkörper-Kontaktlöser wartet.  Die
+beiden neuen Kerneln auf **exakt** dieselbe Zahl wie ohne sie.  Die
 Diagnoseliste trägt jetzt wieder nur die sechs Kontrollen, die durchfallen
 SOLLEN, weil sie die Referenz der echten Prüfung sind.  P9.9 fügte `particlefluidboundary` hinzu, P9.10c
 `particlemeshfloor`, P9.11c `particlehffloor`.
@@ -1754,6 +1773,168 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.45 — die Reaktion, die ein Tuch einen Starrkörper halten lässt, und eine Division, die der P9.36-Prüfer nicht sehen konnte
+
+**Ergebnis:** kein neuer Manifesteintrag — die Reaktion liegt INNERHALB bereits abgebildeter
+Kerne, das Manifest bleibt bei **395/501**. Suite **844/844 in beiden Speichermodi**, beide im
+ersten Anlauf (232 s bzw. 225 s); der Zuwachs von 843 ist der neue statische Prüfer. Szenen **36/36 ok, 0 fail, 0 missing**, null `unmapped`-Zeilen — **`clothnet` besteht und rückt in die Wertung (35 → 36)**: die 1-kg-Kiste
+LIEGT jetzt bei y = 2,1015 auf dem Netz, das unter ihr auf 1,8310 einsackt, statt auf 0,2500
+durchzufallen. Vier neue Testfälle, ein sechster statischer Prüfer, und drei echte
+Portfehler, die keine Vorrichtung und kein Mutant je gesehen hätte.
+
+### Was zurückgestellt war
+
+`FEMCollision::computeRigidChange` (deformableUtils.cuh:418-429) berechnet die Reaktion, die
+ein Verformbaren-Kontakt auf den STARRKÖRPER ausübt: `deltaAngVel0 = (raXn·dλN + raXt·dλT) ·
+refCount`, `deltaLinVel0 = (n·dλN + t·dλT) · invMass · refCount`. Beide Tuch- und
+Weichkörper-Löser stellten sie zurück, und der Grund war ehrlich: der Wächter der .cu selbst
+ist `!rigidId.isStaticBody()`, und alle Drapier-Szenen des Harness haben einen STATISCHEN
+Boden. Für den fällt der Zweig nie an, und die Kerne schreiben Nullen mit Zähler 0 — genau
+das, was die CUDA dort auch schreibt.
+
+`clothnet` aus P9.41 hat gemessen, was das kostet: eine 1-kg-Kiste fällt geradewegs DURCH
+ein am Rand angeheftetes Netz auf y = 0,2500, während das Netz unter ihr auf 1,8340
+einsackt. Die Tuchseite des Kontakts rechnet, die Starrkörperseite schreibt Nullen. P9.44
+hat die fünf `accumulateDeltaVRigid*`-Kerne abgebildet, die diese Nullen einsammeln — und
+die Szene änderte sich um keine Ziffer, weil der Erzeuger schwieg.
+
+### Portierung
+
+* **`pxgSlangFemRigidContact.slang`** bekommt `raXn` und `raXt` auf `ContactResult` und ein
+  gemeinsames `computeRigidChange`. `raXn` spiegelt das CUDA-Mitglied, das :306 setzt — VOR
+  beiden Frühausstiegen, also auch auf dem `checkOnlyActivity`-Pfad lebendig. **`raXt` wurde
+  im ganzen Korpus nirgends berechnet**: `frac0·raXnF0 + frac1·raXnF1` (:391-394) hat genau
+  einen Leser, und der war zurückgestellt. Die Funktion ist breitenunabhängig — sie fasst
+  kein Barycentric an —, also bedient eine Implementierung das Tuchdreieck (PxVec3) und das
+  Weichkörper-Tetraeder (PxVec4). Der Referenzzähler multipliziert die SUMME, nicht jeden
+  Term, und die lineare Zeile multipliziert erst mit `invMass` und dann mit dem Zähler; unter
+  NoContraction sind das drei getrennte Rundungen je Komponente.
+* **Beide Löser** rufen sie unter dem Wächter der .cu und schreiben Zähler 1 plus die zwei
+  Delta-Zeilen. Ein statischer oder kinematischer Kontakt schreibt weiter Nullen mit
+  Zähler 0.
+* **Die Tuch-Abfrage** bekommt die Referenzzählung (FEMClothExternalSolve.cu:404-408), die
+  ihr fehlte; die Weichkörper-Abfrage trug sie schon. Ohne sie liest der Löser für JEDEN
+  Körper den Teiler 1, gleichgültig wie viele Kontakte ihn teilen — die Massenaufteilung ist
+  dann falsch, und zwar systematisch nach oben.
+
+### Was WEITER zurückgestellt bleibt, jetzt an genau einer bewachten Stelle je Modul
+
+Der ARTIKULATIONS-Zweig. Das ist keine neue Zurückstellung, sondern die Folge der alten:
+`prepareFEMContacts` baut die Artikulations-Ankerzeilen nicht
+(pxgSlangFemRigidContact.slang:143), und `readRigidVelocity` liest die Gliedgeschwindigkeit
+nicht. Eine daraus abgeleitete Reaktion wäre also FALSCH statt bloß abwesend, und P9.44s
+`accumulateDeltaVRigidSecondLaunch` würde sie negiert in den Scratch-Impuls des Glieds
+schieben. Ein Gliedkontakt schreibt deshalb weiter Nullen — was dieses Modul immer tat —,
+und die neuen Vorrichtungen nageln das fest: an dem Tag, an dem der Vorbereitungskern und
+der Geschwindigkeitsleser ihre Artikulationszweige bekommen, geht die Zusicherung rot.
+
+### Der Fund, den die Vorrichtung beim ersten Lauf machte
+
+Die neue Tuchvorrichtung meldete sieben Abweichungen, die bei `%g` identisch aussahen: reine
+ULP-Unterschiede in `fricTan0_invMass0` und den beiden Reibungs-Antwortzeilen. Ursache:
+`computeBasisVectors` normalisierte mit **drei Divisionen** durch denselben Skalar. Die
+Engine schreibt `right.normalize()`, und `PxVec3::normalize` (PxVec3.h:293) skaliert über
+`operator/=` (PxVec3.h:260) — **ein** Kehrwert, drei Multiplikationen. Das ist die
+P9.36-Fehlerklasse, in der komponentenweisen Schreibweise, die `gpuslang.vectorDivide` nicht
+sehen kann: dieser Prüfer sucht ein `OpFDiv`, dessen ERGEBNISTYP ein Vektor ist, und drei
+skalare `OpFDiv` sehen aus wie gewöhnliche Arithmetik.
+
+Ein Korpuslauf nach genau dieser Form fand **drei** Stellen, alle drei Abschriften von
+`PxVec3::normalize()`:
+
+| Datei | Funktion | Engine-Zeile |
+|---|---|---|
+| `pxgSlangFemRigidContact.slang` | `computeBasisVectors` (beide Zweige) | PxMathUtils.h:301/:311 |
+| `psContactSolveBda.slang` | `normalize3` | dieselbe |
+| `npArtiStep.slang` | `asNormalizeInPlace` | forwardDynamic2.cu:2630 |
+
+Alle drei sind jetzt ein Kehrwert und drei Multiplikationen. Die Barycentric-Stellen, die
+derselbe Lauf mit aufwarf, sind FAITHFUL und unangetastet: `femClothPrimitives.cu:129-130`
+dividiert im Motor ebenfalls zweimal, `softBody.cu:558-569` dreimal, und
+`softbodyPrimitives.cu:97` bildet stattdessen den Kehrwert — jeder Port folgt seiner eigenen
+Quelle.
+
+**`gpuslang.componentDivide` ist der sechste statische Prüfer** und hält das fest. Regel:
+zwei oder mehr skalare `OpFDiv` in einer Funktion, die sich einen Divisor teilen und ihre
+Zähler aus `OpCompositeExtract` mit VERSCHIEDENEN Komponentenindizes beziehen — ein Vektor,
+der auseinandergenommen und dividiert wird. Ein gemeinsamer Nenner über unabhängige Zähler
+ist kein Extract und wird nicht gemeldet. Die Regel wurde nicht angenommen, sondern geprüft:
+die Drei-Divisionen-Form wurde in zwei Shadern vorübergehend wieder eingesetzt und das
+erzeugte SPIR-V gelesen — sie feuert auf beide Schreibweisen, die
+`float3(...)`-Konstruktorform (die Quotienten fließen in ein `OpCompositeConstruct`) und die
+Drei-Zuweisungen-Form (sie fließen in `OpStore`).
+
+Seine Positivliste ist, anders als die von `vectorDivide`, **nicht leer**, und das ist der
+Befund: der Motor schreibt komponentenweise Division an zwei Stellen von Hand aus, beide auf
+rohen Floats statt über PxVec3 — `calcGridPos` (gridCal.cuh:38-40, immer noch in sieben
+Shadern abgeschrieben) und das Kegelgrenzen-Paar `PxTan(clamped.y/4)` / `PxTan(clamped.z/4)`
+(CmConeLimitHelper.h:173, wo 4 eine Zweierpotenz ist und beide Formen ohnehin bitgleich
+sind).
+
+### Die Vorrichtungen
+
+* **`femClothSimRigidContactDynamic{PGS,TGS}`** — acht Kontakte, die zwischen sich jeden
+  Zweig des neuen Wächters nehmen: **fünf** auf EINEM dynamischen Körper (die Atomarität der
+  Abfrage muss 5 erreichen und der Löser muss 5 zurücklesen — bei 1 wäre eine fallengelassene
+  Zählermultiplikation unsichtbar), einer statisch, einer kinematisch, einer ein
+  Gelenkglied. Zwei der fünf tragen ihre Normalen wegen `computeBasisVectors`: Bahn 6 ist
+  fast senkrecht, damit der ZWEITE Zweig überhaupt läuft, und Bahn 7 sitzt EXAKT auf der
+  Schranke 0,9999, wo `<=` und `<` auseinandergehen. Bahn 6s Ziffern sind gesucht, nicht
+  gewählt — die erste fast senkrechte Normale ließ den Mutanten noch stehen, weil für sie
+  `up.k / m` und `up.k · (1/m)` in jeder Komponente übereinstimmen.
+* **`softBodySimRigidContactDynamic{PGS,TGS}`** — fünf Kontakte auf EINEM Tetraeder, dieselbe
+  Zweigabdeckung, Zähler 2 auf dem dynamischen Körper. Das ist zugleich der **erste Aufruf
+  von `sb_queryRigidSoftContactReferenceCountLaunchTGS` und
+  `sb_solveRigidSoftCollisionLaunchTGS` durch irgendeinen Test** — beide waren übersetzt und
+  registriert, aber nie gefahren.
+* Die Starrkörperzeilen werden je Kontakt genau einmal geschrieben und deshalb WORTGENAU
+  verglichen; die Vertexdeltas des Weichkörpers bekommen eine relative Toleranz, weil fünf
+  Bahnen atomar auf dieselbe Adresse summieren und die Reihenfolge nicht festliegt.
+* `p82dref` bekommt `refSolveFull`, die dynamische Form von `refSolvePGS`. Die alte ist der
+  Sonderfall des ruhenden statischen Körpers: sie lässt `normalVel` und den ganzen
+  Tangentenblock weg. Die neue ist bewusst eine ZWEITE unabhängige Abschrift von
+  `FEMCollision::initialize` neben der in `testFemClothSim.cpp` — die Shaderseite ist
+  geteilt, also prüfen zwei getrennt geschriebene Referenzen eine Implementierung.
+
+### Die Fegedurchgänge
+
+**34 Mutanten in drei Läufen, 29 getötet, 5 Überlebende — jeder mit Beweis, keiner mit
+Ausrede.**
+
+Das gemeinsame Modul (14 Mutanten, 11 getötet): beide Normalisierungen des Basiszweigs, die
+Zweigschranke, das nicht aufgezeichnete `raXn`, der fallengelassene Referenzzähler in beiden
+Zeilen, die fehlende inverse Masse, linear und angular vertauscht, das Vorzeichen der
+Reaktion, und der Artikulationsversatz in `getGlobalRigidBodyId`.
+
+Die Tuch-Aufrufstelle (11 Mutanten, 10 getötet): alle drei Hälften des Wächters, der nicht
+gesetzte Zähler, vertauschte Reaktionszeilen, der nicht gelesene Zähler im Löser, die
+entfernte, die entschärfte und die **nicht-atomare** Zählung in der Abfrage — letztere stirbt,
+weil fünf Bahnen gleichzeitig auf dasselbe Wort zielen —, und beide Zählerslots der
+Ausgabe. Die Weichkörper-Aufrufstelle (9 Mutanten, 8 getötet): dieselben Fallen.
+
+Die fünf Überlebenden:
+
+* **M5 und M6** (`raXt` aus den falschen Anteilen bzw. gegen die falsche Reibungstangente).
+  `raXt` erreicht eine Ausgabe ausschließlich über `raXt · deltaLambdaT`, und `deltaLambdaT`
+  ist auf dem Null-Material-Pfad exakt **−0**: `−min(dLT, 0·|dλN|)` ist `−(+0)`. Die IEEE-
+  Addition von ±0 zum `raXn`-Term kann die beiden Schreibweisen nicht trennen, solange dieser
+  Term nicht selbst eine negative Null ist — was eine konstruierte Trägheitsmatrix bräuchte
+  und llvmpipes Vorzeichen-Null-Verhalten festnageln würde statt den Port. Beide sterben ohne
+  jede Änderung an den Vorrichtungen, sobald der Reibungs-Materialpfad landet (P9.46);
+  `sweep45a.sh` steht dafür bereit.
+* **M13** (`getGlobalRigidBodyId` gibt für einen statischen Körper `solverBodyIndices[…]`
+  statt −1 zurück). Der Zugriff läuft dann mit dem Knotenindex `0xFFFFFFFF` hinter den
+  Puffer — die Klasse aus P9.22/P9.23 —, aber der WERT ist tot: beide Verwender sind
+  zusätzlich auf `invMass != 0` bedingt, und ein statischer Körper hat inverse Masse null.
+  Auf llvmpipe fällt der Zugriff nicht aus; der Schutz bleibt, weil er auf echter Hardware
+  genau den Seitenfehler verhindert. Dieselbe Form wie T23 in P9.43b.
+* **C2 und S2** (die statische Hälfte des Reaktionswächters entfällt). Bewiesen äquivalent,
+  nicht ungetestet: ein statischer Kontakt liest Solver-Körper 0, und der ist
+  `mWorldSolverBodyData` mit `invMass = 0` (PxgDynamicsContext.cpp:47,
+  PxgTGSDynamicsContext.cpp:48), jeden Frame nach `mSolverBodyDataPool[0]` kopiert
+  (PxgContext.cpp:2322). Die `invMass != 0`-Hälfte desselben Wächters schließt ihn also
+  ohnehin aus. Die Zeile bleibt, weil die .cu sie hat.
 
 ## P9.44 — die Starrkörper-Kopplung: fünf `accumulateDeltaVRigid*`-Kerne und die beiden `ps_solvePCOutputRigidDeltaV*`-Zwillinge
 
