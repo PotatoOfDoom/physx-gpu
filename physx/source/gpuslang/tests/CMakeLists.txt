@@ -2363,6 +2363,38 @@ add_test(NAME gpuslang.vectorDivide
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_vector_divide.py)
 
 # ---------------------------------------------------------------------------
+# The same defect, written one component at a time (P9.45).  SIXTH checker.
+#
+# gpuslang.vectorDivide keys on an OpFDiv whose RESULT TYPE is a vector, which is
+# what `v / m` lowers to.  The identical defect written as
+# `float3(v.x / m, v.y / m, v.z / m)` -- or as three assignments -- lowers to
+# SCALAR divides and slipped past it entirely.  Three sites survived P9.36 that
+# way, all transcriptions of PxVec3::normalize() (which is one reciprocal and
+# three multiplies, PxVec3.h:260/:293): computeBasisVectors in
+# pxgSlangFemRigidContact, normalize3 in psContactSolveBda, and asNormalizeInPlace
+# in npArtiStep.
+#
+# Neither a fixture nor a mutant found them, and P9.45 measured why twice over: the
+# cloth rigid-contact fixture carried ONE contact normal for eight tranches, and
+# for that normal the two spellings agree in every component.  Widening it to six
+# normals exposed the first branch immediately; the SECOND branch needed a normal
+# searched for by enumeration before its mutant would die.
+#
+# The rule flags two or more scalar OpFDivs in one function that share a divisor
+# and take their dividends from OpCompositeExtract with DISTINCT component
+# indices -- a vector taken apart and divided.  A shared denominator over
+# independent dividends (femClothPrimitives.cu:129, softBody.cu:558) is not an
+# extract and is not flagged.  Its selftest synthesises all four shapes and fails
+# the run if the rule cannot separate them.
+#
+# The allowlist is NOT empty here, and that is a finding: the engine writes
+# componentwise division out by hand in two places, both on raw floats rather than
+# through PxVec3 -- calcGridPos (gridCal.cuh:38-40, transcribed in seven shaders)
+# and the cone limit's PxTan(clamped.y/4) pair (CmConeLimitHelper.h:173).
+add_test(NAME gpuslang.componentDivide
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_component_divide.py)
+
+# ---------------------------------------------------------------------------
 # Replicated engine helpers must agree (P9.37).
 #
 # This corpus writes the same engine helper out by hand over and over -- 69 copies
