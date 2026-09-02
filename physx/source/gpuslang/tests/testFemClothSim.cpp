@@ -3712,7 +3712,12 @@ static void refPrepare(RigidContactConstraintHost& c, int slot,
 // static body at rest reads, and the dynamic case passes what PxgVelocityReader would return.
 struct RefRigidVel { V3 linVel{ 0, 0, 0 }, angVel{ 0, 0, 0 }, linDelta{ 0, 0, 0 }, angDelta{ 0, 0, 0 }; };
 struct InitResult { bool isActive; float deltaLambdaN; float deltaLambdaT; V3 normal; V3 tangent;
-                    V3 raXn; V3 raXt; float accum; };
+                    V3 raXn; V3 raXt; float accum;
+                    // P9.46: did the FRICTION term bind the tangent clamp, or was the raw
+                    // tangent magnitude already the smaller of the two?  A test that only
+                    // checks deltaLambdaT != 0 cannot tell, and every mutant of the
+                    // deformable-material read survived precisely because of that.
+                    bool frictionBound; float dLTraw; float dLTlimit; };
 // PxsCombinePxReal (PxsMaterialCombiner.h:53).  PxMin/PxMax are the intrinsic selects
 // (PxUnixMathIntrinsics.h:113/:122), not the generic templates.
 static float refCombineFriction(float val0, float val1, uint32_t mode)
@@ -3732,6 +3737,7 @@ static InitResult refInitialize(const RigidContactConstraintHost& c, int slot, b
     InitResult r;
     r.isActive = false; r.deltaLambdaN = 0.0f; r.deltaLambdaT = 0.0f;
     r.tangent = V3{ 0, 0, 0 }; r.raXt = V3{ 0, 0, 0 }; r.accum = appliedForceRef;
+    r.frictionBound = false; r.dLTraw = 0.0f; r.dLTlimit = 0.0f;
 
     const float invDt = 1.0f / dt;
     const F4 raXn_resp = c.raXn_resp[slot];
@@ -3812,7 +3818,9 @@ static InitResult refInitialize(const RigidContactConstraintHost& c, int slot, b
         const float dLT0 = CT0 * invT0;
         const float dLT1 = CT1 * invT1;
         const float dLT = std::sqrt(dLT0 * dLT0 + dLT1 * dLT1);
-        r.deltaLambdaT = -rmin(dLT, combinedFriction * rabs(r.deltaLambdaN));
+        const float lim = combinedFriction * rabs(r.deltaLambdaN);
+        r.dLTraw = dLT; r.dLTlimit = lim; r.frictionBound = (lim < dLT);
+        r.deltaLambdaT = -rmin(dLT, lim);
     }
     return r;
 }
@@ -4252,7 +4260,14 @@ static void runRigidContactDynamic(bool isTGS)
     // Surface table: PxsDeformableSurfaceMaterialData, 32 B, dynamicFriction @8.  Slot 0 is
     // a DECOY with friction 0 -- an index read that ignored mMaterialIndices and took slot 0
     // would silently produce a frictionless triangle contact and nothing else would say so.
-    const float clothMatFriction[4] = { 0.00f, 0.65f, 0.25f, 0.85f };
+    // Slots 2 and 3 are the ones the two TRIANGLE lanes read, and their values are chosen
+    // so the FRICTION binds the tangent clamp there: deltaLambdaT = -min(dLT, mu*|dLN|), and
+    // with a large mu the raw tangent magnitude is the smaller term and mu never reaches the
+    // output at all.  The first version of this fixture had 0.25 and 0.85, both large enough
+    // that every mutant of the deformable-material read survived -- measured, not guessed:
+    // lane 8 had dLT 0.0484 against a limit of 0.258, lane 9 dLT 0.0437 against 1.00.
+    // They are also DIFFERENT from each other, so the PxU16 half-selection is observable.
+    const float clothMatFriction[4] = { 0.00f, 0.65f, 0.05f, 0.03f };
     std::vector<float> clothMats(4u * 8u, 0.0f);
     for (uint32_t m = 0; m < 4u; ++m)
     {
@@ -4271,7 +4286,9 @@ static void runRigidContactDynamic(bool isTGS)
     descArr[0].mMaterialIndices = reinterpret_cast<decltype(descArr[0].mMaterialIndices)>(size_t(bClothMatIdx.addr));
     dev->upload(bDesc.h, descArr.data(), descArr.size() * sizeof(PxgFEMCloth));
 
-    const uint32_t rigidMatOf[10] = { 0u, 1u, 2u, 3u, 0u, 1u, 2u, 3u, 0u, 3u }; // every mode
+    // Lanes 0..7 cover all four combine modes twice.  The two TRIANGLE lanes take MULTIPLY
+    // and MIN, which keep their combined friction small enough for the clamp to bind.
+    const uint32_t rigidMatOf[10] = { 0u, 1u, 2u, 3u, 0u, 1u, 2u, 3u, 2u, 1u };
     // Which cloth element each lane names, and whether it is a TRIANGLE contact.
     const uint32_t elemOf[10] = { 0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 0u, 1u };
     const bool isTriOf[10] = { false, false, false, false, false,
@@ -4645,7 +4662,8 @@ static void runRigidContactDynamic(bool isTGS)
     std::vector<float> refAccum(N);
     std::vector<bool> reactsOf(N, false);
     uint32_t dynamicLanes = 0u, zeroLanes = 0u;
-    uint32_t frictionLanes = 0u, modeSeen[4] = { 0u, 0u, 0u, 0u };
+    uint32_t frictionLanes = 0u, boundLanes = 0u, boundTriLanes = 0u, boundVertLanes = 0u;
+    uint32_t modeSeen[4] = { 0u, 0u, 0u, 0u };
     std::vector<float> laneFriction(N, 0.0f);
     for (uint32_t i = 0; i < N; ++i)
     {
@@ -4677,6 +4695,11 @@ static void runRigidContactDynamic(bool isTGS)
                                    combinedFriction);
         if (sir.deltaLambdaT != 0.0f)
             ++frictionLanes;
+        if (sir.frictionBound)
+        {
+            ++boundLanes;
+            if (isTriOf[i]) ++boundTriLanes; else ++boundVertLanes;
+        }
         const p714ref::V3 deltaPosR = {
             -(sir.deltaLambdaN * sir.normal.x + sir.deltaLambdaT * sir.tangent.x) * dt,
             -(sir.deltaLambdaN * sir.normal.y + sir.deltaLambdaT * sir.tangent.y) * dt,
@@ -4748,6 +4771,15 @@ static void runRigidContactDynamic(bool isTGS)
         PXG_CHECK_MSG(triLanes >= 2u && vertLanes >= 6u,
                       "coverage: %u TRIANGLE and %u VERTEX lanes -- both friction sources "
                       "must be live", triLanes, vertLanes);
+        // AND the friction must actually BIND the clamp on both kinds.  deltaLambdaT is
+        // -min(dLT, mu*|dLN|); where the raw magnitude is the smaller term the material
+        // value never reaches the output, and a mutant of the read survives.  That is not a
+        // hypothetical: the first version of this fixture bound on no triangle lane at all,
+        // and every one of the six deformable-material mutants lived through the sweep.
+        PXG_CHECK_MSG(boundTriLanes >= 2u && boundVertLanes >= 3u,
+                      "the friction must BIND the tangent clamp on both contact kinds: "
+                      "%u triangle and %u vertex lanes bound (of %u total)",
+                      boundTriLanes, boundVertLanes, boundLanes);
         std::printf("  friction per lane:");
         for (uint32_t a = 0; a < N; ++a) std::printf(" %.4g", laneFriction[a]);
         std::printf("\n");

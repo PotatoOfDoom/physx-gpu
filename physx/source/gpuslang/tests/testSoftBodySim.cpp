@@ -4115,6 +4115,10 @@ struct SolveRefFull
 {
     bool isActive; float deltaLambdaN; float deltaLambdaT;
     V3 normal, tangent, raXn, raXt; float accum;
+    // P9.46: did the FRICTION term bind the tangent clamp, or was the raw tangent magnitude
+    // already the smaller of the two?  A test that only checks deltaLambdaT != 0 cannot
+    // tell, and where it does not bind the material value never reaches the output.
+    bool frictionBound; float dLTraw; float dLTlimit;
 };
 // PxsCombinePxReal (PxsMaterialCombiner.h:53), transcribed independently of the cloth
 // fixture's copy.  PxMin/PxMax are the intrinsic selects, not the generic templates.
@@ -4135,6 +4139,7 @@ static SolveRefFull refSolveFull(const SbRigidConstraintHost& c, int slot, bool 
     SolveRefFull r;
     r.isActive = false; r.deltaLambdaN = 0.0f; r.deltaLambdaT = 0.0f;
     r.tangent = V3{ 0, 0, 0 }; r.raXt = V3{ 0, 0, 0 }; r.accum = appliedForceRef;
+    r.frictionBound = false; r.dLTraw = 0.0f; r.dLTlimit = 0.0f;
 
     const float invDt = 1.0f / dt;
     const F4 raXn_resp = c.raXn_resp[slot];
@@ -4207,6 +4212,8 @@ static SolveRefFull refSolveFull(const SbRigidConstraintHost& c, int slot, bool 
         const float dLT1 = CT1 * invT1;
         const float dLT = std::sqrt(dLT0 * dLT0 + dLT1 * dLT1);
         const float lim = combinedFriction * ((dLN < 0.f) ? -dLN : dLN);
+        r.frictionBound = (lim < dLT);
+        r.dLTraw = dLT; r.dLTlimit = lim;
         r.deltaLambdaT = -((dLT < lim) ? dLT : lim);
     }
     return r;
@@ -5039,7 +5046,12 @@ static void runSbRigidContactDynamic(bool isTGS)
     // flags | fricCombineMode<<16 | restCombineMode<<24, and ONLY bits 16..23 may be read --
     // the other three bytes carry decoys, so a shader that took the whole word or the wrong
     // byte lands on an out-of-range mode and PxsCombinePxReal's fall-through 0.
-    const float rigidMatFriction[4] = { 0.30f, 0.80f, 0.50f, 0.20f };
+    // The values are chosen so the FRICTION binds the tangent clamp on every lane:
+    // deltaLambdaT = -min(dLT, mu*|dLN|), and with a large mu the raw tangent magnitude is
+    // the smaller term and mu never reaches the output.  The first version of this fixture
+    // used 0.30/0.80/0.50/0.20 against 0.60/0.90 and bound on NONE of the five lanes --
+    // measured, not guessed (dLT 0.14 against a limit of 0.21, and worse).
+    const float rigidMatFriction[4] = { 0.05f, 0.40f, 0.30f, 0.02f };
     const uint32_t rigidMatMode[4] = { 0u, 1u, 2u, 3u };   // eAVERAGE, eMIN, eMULTIPLY, eMAX
     std::vector<uint32_t> rigidMats(4u * 6u, 0u);
     for (uint32_t m = 0; m < 4u; ++m)
@@ -5055,7 +5067,7 @@ static void runSbRigidContactDynamic(bool isTGS)
     // Volume table: four PxsDeformableVolumeMaterialData records (32 B), dynamicFriction @8.
     // Slot 0 is a DECOY with friction 0 -- an index read that ignored mMaterialIndices and
     // took slot 0 would silently produce a frictionless contact and nothing else would say so.
-    const float sbMatFriction[4] = { 0.00f, 0.60f, 0.15f, 0.90f };
+    const float sbMatFriction[4] = { 0.00f, 0.045f, 0.15f, 0.03f };
     std::vector<float> sbMats(4u * 8u, 0.0f);
     for (uint32_t m = 0; m < 4u; ++m)
     {
@@ -5283,7 +5295,7 @@ static void runSbRigidContactDynamic(bool isTGS)
     p82dref::V3 expectDelta[4] = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } };
     std::vector<F4> refRigid(2u * kN);
     uint32_t reacting = 0u, silent = 0u;
-    uint32_t frictionLanes = 0u, modeSeen[4] = { 0u, 0u, 0u, 0u };
+    uint32_t frictionLanes = 0u, boundLanes = 0u, modeSeen[4] = { 0u, 0u, 0u, 0u };
     std::vector<float> laneFriction(kN, 0.0f);
     for (uint32_t i = 0; i < kN; ++i)
     {
@@ -5328,6 +5340,9 @@ static void runSbRigidContactDynamic(bool isTGS)
         }
         if (sr.deltaLambdaT != 0.0f)
             ++frictionLanes;
+        if (sr.frictionBound)
+            ++boundLanes;
+
         refRigid[i] = { dLin.x, dLin.y, dLin.z, count };
         refRigid[i + kN] = { dAng.x, dAng.y, dAng.z, 0.0f };
     }
@@ -5352,6 +5367,14 @@ static void runSbRigidContactDynamic(bool isTGS)
         }
         PXG_CHECK_MSG(distinct >= 4u, "the seeded frictions must take at least 4 distinct "
                                       "values across the lanes, got %u", distinct);
+        // AND the friction must actually BIND the clamp somewhere.  deltaLambdaT is
+        // -min(dLT, mu*|dLN|); where the raw magnitude is the smaller term the material
+        // value never reaches the output and a mutant of the read survives -- which is
+        // exactly what happened on the cloth side before this was measured.
+        PXG_CHECK_MSG(boundLanes >= 2u,
+                      "the friction must BIND the tangent clamp on at least two lanes, "
+                      "got %u of %u", boundLanes, kN);
+        std::printf("  friction binds on %u of %u lanes\n", boundLanes, kN);
         std::printf("  friction per lane: %.4g %.4g %.4g %.4g %.4g\n",
                     laneFriction[0], laneFriction[1], laneFriction[2], laneFriction[3],
                     laneFriction[4]);
