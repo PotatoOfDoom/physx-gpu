@@ -59,8 +59,13 @@
 //   * a free-base articulation AT REST -- every velocity zero, no dirty flags --
 //     which drives conserveMomentum's aDenom == 0 guard and makes every
 //     accumulator's first term a signed zero;
-//   * per-record joint arrays at the packed stride with a canary past the last
-//     dof, so a writeback that runs past mTotalDofs is seen.
+//   * a free-base articulation NEAR rest, velocities around 1e-25, which drives the
+//     same guard with a momentum vector that is NOT zero: at rest the guard's value
+//     (0, where the acceleration kernel's twin uses 1) scales a zero and cannot be
+//     observed at all -- the mutation sweep found that blind spot;
+//   * per-record joint arrays at the packed stride with a canary past the last dof
+//     that is NOT the dof blocks' poison, so a writeback that runs past mTotalDofs is
+//     seen (it was the same bit pattern, and the extra write was therefore invisible).
 
 #include "pxgTestFramework.h"
 #include "PxgCudaShim.h"
@@ -141,7 +146,17 @@ static uint8_t a1Dofs(uint8_t jt) { return jt == J_SPHERICAL ? uint8_t(3) : (jt 
 static bool a1FixBase(uint32_t a) { return (a % 3u) == 1u; }
 // the free articulations at rest: no velocity anywhere, nothing dirty
 static bool a1AtRest(uint32_t a) { return (a % 13u) == 8u && !a1FixBase(a); }
-static uint32_t a1StateDirty(uint32_t a) { return a1AtRest(a) ? 0u : (a * 7u + 3u) % 4u; }
+// NEAR rest, which is not the same experiment.  conserveMomentum guards its angular
+// ratio on `aDenom == 0` and yields ZERO there (the CUDA's 0, not the 1 of the
+// acceleration kernel's twin).  At rest the guard fires but cannot be observed: the
+// vector it scales is exactly zero, so 0 and 1 both give zero.  These articulations
+// carry velocities around 1e-25 instead: every component is a perfectly normal float,
+// but its SQUARE (1e-50) is below the smallest denormal, so the magnitude underflows
+// to zero while the momentum vector itself is not zero -- the guard fires AND the
+// factor it produces is visible.  Nothing else in the fixture reaches denormal range.
+static const float A1_TINY = 1e-25f;
+static bool a1NearRest(uint32_t a) { return (a % 13u) == 5u && !a1FixBase(a); }
+static uint32_t a1StateDirty(uint32_t a) { return (a1AtRest(a) || a1NearRest(a)) ? 0u : (a * 7u + 3u) % 4u; }
 static uint32_t a1DirtySlabs(uint32_t a) { return a % 5u; }
 // the record index is a PERMUTATION of the fleet slot (gcd(53, 130) = 1)
 static uint32_t a1ArtiIndex(uint32_t a) { return (a * 53u + 11u) % A1_ARTS; }
@@ -166,6 +181,7 @@ static void a1Fill(physx::PxgArticulationBlockData* ab, physx::PxgArticulationBl
 {
     const uint32_t numLinks = a1NumLinks(a);
     const bool rest = a1AtRest(a);
+    const bool nearRest = a1NearRest(a);
     auto v = [&](uint32_t i, uint32_t f) { return a1V(a, i * 61u + f); };
     auto unitQ = [&](uint32_t i, uint32_t f) {
         PxQuat q(v(i, f), v(i, f + 1), v(i, f + 2), v(i, f + 3) + 2.5f);
@@ -178,6 +194,10 @@ static void a1Fill(physx::PxgArticulationBlockData* ab, physx::PxgArticulationBl
     auto sv = [&](uint32_t i, uint32_t f) {
         return UnAlignedSpatialVector(PxVec3(v(i, f), v(i, f + 1), v(i, f + 2)),
                                       PxVec3(v(i, f + 3), v(i, f + 4), v(i, f + 5)));
+    };
+    auto svScaled = [&](uint32_t i, uint32_t f, float s) {
+        return UnAlignedSpatialVector(PxVec3(v(i, f) * s, v(i, f + 1) * s, v(i, f + 2) * s),
+                                      PxVec3(v(i, f + 3) * s, v(i, f + 4) * s, v(i, f + 5) * s));
     };
     // NEGATIVE zeros, deliberately: the at-rest articulation is where every momentum
     // accumulator's first term is a signed zero, and where slangc's `x + 0.0` fold
@@ -218,8 +238,8 @@ static void a1Fill(physx::PxgArticulationBlockData* ab, physx::PxgArticulationBl
         L.mRw_x[lane] = v(i, 3);
         L.mRw_y[lane] = v(i, 4);
         L.mRw_z[lane] = v(i, 5);
-        storeSpatialVector(L.mMotionVelocity, rest ? zeroSV : sv(i, 6), lane);
-        storeSpatialVector(L.mPosMotionVelocity, rest ? zeroSV : sv(i, 12), lane);
+        storeSpatialVector(L.mMotionVelocity, rest ? zeroSV : (nearRest ? svScaled(i, 6, A1_TINY) : sv(i, 6)), lane);
+        storeSpatialVector(L.mPosMotionVelocity, rest ? zeroSV : (nearRest ? svScaled(i, 12, A1_TINY) : sv(i, 12)), lane);
         storeSpatialVector(L.mDeltaMotion, sv(i, 18), lane);
         storeSpatialVector(L.mScratchImpulse, sv(i, 24), lane);
         storeSpatialVector(L.mSolverSpatialImpulse, sv(i, 30), lane);
@@ -259,8 +279,12 @@ static void a1Fill(physx::PxgArticulationBlockData* ab, physx::PxgArticulationBl
             // revolute positions beyond +-2pi on every third such joint: the WRAP
             if (jt == J_REVOLUTE && ((a + i) % 3u) == 0u) jp += (jp < 0.f) ? -7.0f : 7.0f;
             D.mJointPositions[lane] = jp;
-            D.mJointVelocities[lane] = rest ? 0.f : v(11 + dd, u) * 2.0f;
-            D.mPosJointVelocities[lane] = rest ? 0.f : v(12 + dd, u) * 0.5f - 1.25f;
+            // near rest scales the JOINT velocities too: conserveMomentum rebuilds every
+            // link velocity by forward kinematics from the root, so a normal joint
+            // velocity would put a normal number back into the momentum sum and the
+            // magnitude would not underflow.
+            D.mJointVelocities[lane] = rest ? 0.f : (v(11 + dd, u) * 2.0f) * (nearRest ? A1_TINY : 1.0f);
+            D.mPosJointVelocities[lane] = rest ? 0.f : (v(12 + dd, u) * 0.5f - 1.25f) * (nearRest ? A1_TINY : 1.0f);
             D.mJointUnconstrainedVelocities[lane] = rest ? 0.f : v(22 + dd, u) * 1.5f;
             D.mJointAccel[lane] = v(23 + dd, u);
             D.mDeferredQstZ[lane] = v(13 + dd, u) * 0.125f;
@@ -307,7 +331,10 @@ static void a1Fill(physx::PxgArticulationBlockData* ab, physx::PxgArticulationBl
 struct A1Coverage
 {
     uint32_t revoluteWraps = 0, prismaticLow = 0, prismaticHigh = 0, prismaticInside = 0, spherical = 0;
-    uint32_t zeroDenom = 0;
+    // zeroDenom counts every lane whose angular denominator underflows; zeroDenomLive
+    // counts the ones where the vector it scales is NOT zero, which is the only case in
+    // which the guard's value (0, not 1) can be observed at all.
+    uint32_t zeroDenom = 0, zeroDenomLive = 0;
 };
 
 // forwardDynamic2.cu:2452-2512
@@ -474,7 +501,12 @@ static void refConserveMomentum(physx::PxgArticulationBlockData* ab, physx::PxgA
 
     const PxMat33 invCompoundInertia = compoundInertia.getInverse();
     const PxReal aDenom = postMomentum.bottom.magnitude();
-    if (aDenom == 0.f) ++cov.zeroDenom;
+    if (aDenom == 0.f)
+    {
+        ++cov.zeroDenom;
+        if (postMomentum.bottom.x != 0.f || postMomentum.bottom.y != 0.f || postMomentum.bottom.z != 0.f)
+            ++cov.zeroDenomLive;
+    }
     const PxReal angRatio = aDenom == 0.f ? 0.f : preMomentum.bottom.magnitude() / aDenom;
     const PxVec3 angMomDelta = postMomentum.bottom * (angRatio - 1.f);
     const PxVec3 angDelta = invCompoundInertia * angMomDelta;
@@ -588,7 +620,14 @@ static void a1Run(PxgCudaShim& shim, bool integrate)
     std::vector<physx::PxgArticulation> arts(A1_ARTS);
     std::memset(arts.data(), 0xAB, arts.size() * sizeof(physx::PxgArticulation));
     std::vector<A1Record> recs(A1_ARTS);
-    const float poisonF = []() { float f; const uint32_t u = 0xABABABABu; std::memcpy(&f, &u, 4); return f; }();
+    // The record canary must NOT be the dof blocks' 0xAB poison.  It was, and that
+    // made an out-of-range writeback invisible: the mutant that runs the dof loop one
+    // iteration too far reads dof block [totalDofs] -- inside the allocation, never
+    // seeded, so still 0xABABABAB -- and stores it into jointP/V/A[totalDofs], where
+    // the expectation held the SAME bit pattern.  (The acceleration is
+    // P + (P - P) * invDt, and P - P is +0, so it comes back as P bit for bit too.)
+    // A canary a poisoned dof block cannot produce closes that.
+    const float poisonF = -8675309.5f;
     for (uint32_t r = 0; r < A1_ARTS; ++r)
     {
         recs[r].jointP.assign(A1_MAX_DOFS + 1, poisonF);
@@ -610,9 +649,10 @@ static void a1Run(PxgCudaShim& shim, bool integrate)
                  &wantDf[size_t(a / 32u) * A1_MAX_DOFS], wantRecs[a1ArtiIndex(a)], a, A1_DT, integrate, a & 31u, cov,
                  alignedHits, unalignedHits);
     std::printf("[ info ] au1 int=%d: impulse reads 16-aligned %u, 8-aligned %u; revolute wraps %u, prismatic "
-                "clamps low %u / high %u / inside %u, spherical re-derivations %u, zero-denominator %u\n",
+                "clamps low %u / high %u / inside %u, spherical re-derivations %u, zero-denominator %u "
+                "(of which %u with a non-zero momentum vector)\n",
                 int(integrate), alignedHits, unalignedHits, cov.revoluteWraps, cov.prismaticLow, cov.prismaticHigh,
-                cov.prismaticInside, cov.spherical, cov.zeroDenom);
+                cov.prismaticInside, cov.spherical, cov.zeroDenom, cov.zeroDenomLive);
     PXG_CHECK_MSG(alignedHits > 5 && unalignedHits > 5, "both impulse alignments occur (%u / %u)", alignedHits,
                   unalignedHits);
     if (!integrate)
@@ -624,6 +664,9 @@ static void a1Run(PxgCudaShim& shim, bool integrate)
         PXG_CHECK_MSG(cov.spherical > 10, "spherical joints are re-derived (%u)", cov.spherical);
     }
     PXG_CHECK_MSG(cov.zeroDenom > 0, "the at-rest articulations reach aDenom == 0 (%u)", cov.zeroDenom);
+    PXG_CHECK_MSG(cov.zeroDenomLive > 0,
+                  "the NEAR-rest articulations reach aDenom == 0 with a non-zero momentum vector (%u) -- "
+                  "without that the guard's value is unobservable, because it scales a zero", cov.zeroDenomLive);
 
     // ---- device ----
     PxgDevicePtr dAb = 0, dLk = 0, dDf = 0, dDirty = 0, dImp = 0, dArts = 0, dDesc = 0;
@@ -714,18 +757,6 @@ static void a1Run(PxgCudaShim& shim, bool integrate)
         for (size_t k = 0; k < bytes / 4; ++k)
         {
             if (w[k] == g[k]) continue;
-            if ((w[k] == 0u && g[k] == 0x80000000u) || (w[k] == 0x80000000u && g[k] == 0u))
-            {
-                if (signedZeros < 12)
-                {
-                    const size_t structWords = kind == 1 ? linkWords : (kind == 2 ? dofWords : 0);
-                    std::printf("SZ au1 int=%d %s word %zu (struct %zu, byte %zu) ref %08x gpu %08x\n", int(integrate),
-                                what, k, structWords ? k / structWords : 0, structWords ? (k % structWords) * 4 : k * 4,
-                                w[k], g[k]);
-                }
-                ++signedZeros;
-                continue;
-            }
             bool tol = false;
             if (kind == 1 && integrate)
                 tol = inRange(k, linkWords, offsetof(physx::PxgArticulationBlockLinkData, mAccumulatedPose),
@@ -737,6 +768,26 @@ static void a1Run(PxgCudaShim& shim, bool integrate)
                               sizeof(PxReal) * 32);
             else if (kind == 3)
                 tol = true;
+            // A signed-zero mismatch is only TOLERATED where the ulp budget applies.
+            // It used to be tolerated everywhere, which made every +-0 mutation in this
+            // kernel unkillable on the integrate == true path -- including deleting the
+            // au1PlusZero canonicalisation the port depends on.  Outside the
+            // transcendental scope it is now an ordinary mismatch.
+            if ((w[k] == 0u && g[k] == 0x80000000u) || (w[k] == 0x80000000u && g[k] == 0u))
+            {
+                if (signedZeros < 12)
+                {
+                    const size_t structWords = kind == 1 ? linkWords : (kind == 2 ? dofWords : 0);
+                    std::printf("SZ au1 int=%d %s word %zu (struct %zu, byte %zu) ref %08x gpu %08x%s\n",
+                                int(integrate), what, k, structWords ? k / structWords : 0,
+                                structWords ? (k % structWords) * 4 : k * 4, w[k], g[k],
+                                tol ? "" : "  (outside the tolerance scope: counted as a mismatch)");
+                }
+                ++signedZeros;
+                if (tol) continue;
+                ++bad;
+                continue;
+            }
             if (tol)
             {
                 float x, y;
@@ -798,6 +849,382 @@ static void a1Run(PxgCudaShim& shim, bool integrate)
     for (PxgDevicePtr p : { dAb, dLk, dDf, dDirty, dImp, dArts, dDesc }) shim.memFree(p);
 }
 
+// ---------------------------------------------------------------------------
+// TWO NARROW DISPATCHES beside the main fleet.  Each closes a blind spot the
+// mutation sweep found, and each needs a geometry the fleet cannot have, because
+// maxLinks and maxDofs are properties of the DESCRIPTOR, not of one articulation.
+//
+//  a1RunSingleLink: every articulation has exactly ONE link, so maxLinks is 1 and
+//    the link-block allocation is exactly (warps * 1) blocks.  The kernel prefetches
+//    link[1]'s parent before its walk, which the CUDA does unconditionally
+//    (forwardDynamic2.cu:2821) and this port guards on linkCount > 1.  With maxLinks
+//    of 2 or more the unguarded read lands in the warp's own slice -- garbage, but
+//    mapped, and the value is dead either way, so no comparison can see it.  With
+//    maxLinks == 1 it lands 28 KB PAST the buffer, and the last warp has no slice
+//    behind it.  A scene of single-link articulations gives exactly that
+//    (PxgSimulationController.cpp:922 takes the fleet maximum).
+//
+//  a1RunWideDofs: one articulation of 88 links and 259 dofs, so a joint offset
+//    exceeds 255.  computeAndEnforceJointPositions reads that offset through a PxU8
+//    local (forwardDynamic2.cu:2463) -- the port reproduces the truncation, upstream
+//    candidate #44 -- and below 256 dofs the truncation is invisible.  Here link 87's
+//    offset is 258, so the truncated read lands on dof 2 and the untruncated one on
+//    dof 258: the two write different dofs, and both are compared.
+// ---------------------------------------------------------------------------
+static const uint32_t A1S_ARTS = 33;   // two warp slices; slice 1 is the last, so its
+static const uint32_t A1S_WARPS = 2;   // link[1] read has nothing behind it
+static const uint32_t A1S_MAX_LINKS = 1;
+static const uint32_t A1S_MAX_DOFS = 1;
+
+static void a1RunSingleLink(PxgCudaShim& shim, bool integrate)
+{
+    std::vector<physx::PxgArticulationBlockData> abImg(A1S_WARPS);
+    std::vector<physx::PxgArticulationBlockLinkData> lkImg(size_t(A1S_WARPS) * A1S_MAX_LINKS);
+    std::vector<physx::PxgArticulationBlockDofData> dfImg(size_t(A1S_WARPS) * A1S_MAX_DOFS);
+    std::memset(abImg.data(), 0xAB, abImg.size() * sizeof(physx::PxgArticulationBlockData));
+    std::memset(lkImg.data(), 0xAB, lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    std::memset(dfImg.data(), 0xAB, dfImg.size() * sizeof(physx::PxgArticulationBlockDofData));
+
+    for (uint32_t a = 0; a < A1S_ARTS; ++a)
+    {
+        const uint32_t w = a / 32u, lane = a & 31u;
+        physx::PxgArticulationBlockData& ab = abImg[w];
+        physx::PxgArticulationBlockLinkData& L = lkImg[size_t(w) * A1S_MAX_LINKS];
+        auto v = [&](uint32_t i, uint32_t f) { return a1V(a + 7u, i * 61u + f); };
+        auto unitQ = [&](uint32_t i, uint32_t f) {
+            PxQuat q(v(i, f), v(i, f + 1), v(i, f + 2), v(i, f + 3) + 2.5f);
+            return q.getNormalized();
+        };
+        auto sv = [&](uint32_t i, uint32_t f) {
+            return UnAlignedSpatialVector(PxVec3(v(i, f), v(i, f + 1), v(i, f + 2)),
+                                          PxVec3(v(i, f + 3), v(i, f + 4), v(i, f + 5)));
+        };
+        ab.mNumLinks[lane] = 1u;
+        ab.mFlags[lane] = 0u;            // FREE base: a fixed one returns before the prefetch
+        ab.mStateDirty[lane] = 0u;       // no flush, so the impulse buffers stay out of it
+        ab.mTotalDofs[lane] = 0u;
+        ab.mArticulationIndex[lane] = a;
+        storeSpatialVector(ab.mRootDeferredZ, sv(30, 0) * 0.125f, lane);
+        storeSpatialVector(ab.mCommonLinkDeltaVelocity, sv(30, 6), lane);
+
+        L.mJointType[lane] = uint8_t(J_FIX);
+        L.mDofs[lane] = 0u;
+        L.mParents[lane] = 0u;           // the root is its own parent
+        L.mJointOffset[lane] = 0u;
+        L.mRw_x[lane] = v(0, 3); L.mRw_y[lane] = v(0, 4); L.mRw_z[lane] = v(0, 5);
+        storeSpatialVector(L.mMotionVelocity, sv(0, 6), lane);
+        storeSpatialVector(L.mPosMotionVelocity, sv(0, 12), lane);
+        storeSpatialVector(L.mDeltaMotion, sv(0, 18), lane);
+        storeSpatialVector(L.mScratchImpulse, sv(0, 24), lane);
+        storeSpatialVector(L.mSolverSpatialImpulse, sv(0, 30), lane);
+        storeSpatialVector(L.mSolverSpatialDeltaVel, sv(0, 36), lane);
+        storeSpatialVector(L.mScratchDeltaV, sv(0, 42), lane);
+        storeSpatialVector(L.mConstraintForces, sv(0, 48), lane);
+        const PxTransform acc(PxVec3(v(0, 20), v(0, 21), v(0, 22)), unitQ(0, 23));
+        storeSpatialTransform(L.mPreTransform, lane, PxTransform(PxVec3(v(0, 54), v(0, 55), v(0, 56)), unitQ(0, 57)));
+        storeSpatialTransform(L.mAccumulatedPose, lane, acc);
+        storeSpatialTransform(L.mChildPose, lane, PxTransform(PxVec3(v(0, 27), v(0, 28), v(0, 29)), unitQ(0, 44)));
+        storeSpatialTransform(L.mParentPose, lane, PxTransform(PxVec3(v(0, 33), v(0, 34), v(0, 35)), unitQ(0, 48)));
+        { const PxQuat rq = unitQ(0, 39); float4 f; f.x = rq.x; f.y = rq.y; f.z = rq.z; f.w = rq.w;
+          L.mRelativeQuat[lane] = f; }
+        const float mass = 0.5f + std::fabs(v(0, 62)) * 0.75f;
+        L.mMass[lane] = mass;
+        {
+            const float d0 = 0.6f + std::fabs(v(0, 63)), d1 = 0.6f + std::fabs(v(0, 64)),
+                        d2 = 0.6f + std::fabs(v(0, 65));
+            const float o01 = v(0, 66) * 0.05f, o02 = v(0, 67) * 0.05f, o12 = v(0, 68) * 0.05f;
+            storePxMat33(L.mIsolatedInertia, lane,
+                         PxMat33(PxVec3(d0, o01, o02), PxVec3(o01, d1, o12), PxVec3(o02, o12, d2)));
+        }
+        { float4 f; f.x = 0.25f + std::fabs(v(0, 69)) * 0.5f; f.y = 0.25f + std::fabs(v(0, 70)) * 0.5f;
+          f.z = 0.25f + std::fabs(v(0, 71)) * 0.5f; f.w = 1.0f / mass; L.mInvInertiaXYZ_invMassW[lane] = f; }
+        { float4 f; const PxVec3 c = acc.p + PxVec3(v(34, 0), v(34, 1), v(34, 2)) * 0.05f;
+          f.x = c.x; f.y = c.y; f.z = c.z; f.w = 1.0f / mass; ab.mCOM_TotalInvMassW[lane] = f; }
+    }
+
+    // the mirror: stateDirty is 0 and there are no dofs, so only the pose section and
+    // conserveMomentum run, and a1Mirror's impulse/dirty arguments are never touched
+    std::vector<physx::PxgArticulationBlockData> wantAb = abImg;
+    std::vector<physx::PxgArticulationBlockLinkData> wantLk = lkImg;
+    std::vector<physx::PxgArticulationBlockDofData> wantDf = dfImg;
+    std::vector<A1Record> wantRecs(A1S_ARTS);
+    for (uint32_t r = 0; r < A1S_ARTS; ++r)
+    {
+        wantRecs[r].jointP.assign(2, -8675309.5f);
+        wantRecs[r].jointV.assign(2, -8675309.5f);
+        wantRecs[r].jointA.assign(2, -8675309.5f);
+    }
+    A1Coverage cov;
+    uint32_t alignedHits = 0, unalignedHits = 0;
+    std::vector<uint32_t> noDirty(1, AI_NONE);
+    std::vector<float> noImp(1, 0.f);
+    for (uint32_t a = 0; a < A1S_ARTS; ++a)
+        a1Mirror(noDirty.data(), noImp.data(), &wantAb[a / 32u], &wantLk[size_t(a / 32u) * A1S_MAX_LINKS],
+                 &wantDf[size_t(a / 32u) * A1S_MAX_DOFS], wantRecs[a], a, A1_DT, integrate, a & 31u, cov,
+                 alignedHits, unalignedHits);
+
+    PxgDevicePtr dAb = 0, dLk = 0, dDf = 0, dArts = 0, dDesc = 0;
+    shim.memAlloc(&dAb, abImg.size() * sizeof(physx::PxgArticulationBlockData));
+    // EXACTLY the two slices: the tight allocation is what puts the prefetch outside
+    shim.memAlloc(&dLk, lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    shim.memAlloc(&dDf, dfImg.size() * sizeof(physx::PxgArticulationBlockDofData));
+    std::vector<physx::PxgArticulation> arts(A1S_ARTS);
+    std::memset(arts.data(), 0xAB, arts.size() * sizeof(physx::PxgArticulation));
+    shim.memAlloc(&dArts, arts.size() * sizeof(physx::PxgArticulation));
+    shim.memAlloc(&dDesc, sizeof(physx::PxgArticulationCoreDesc));
+    if (!dAb || !dLk || !dDf || !dArts || !dDesc) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    struct RecPtrs { PxgDevicePtr p, v, a; };
+    std::vector<RecPtrs> rp(A1S_ARTS);
+    auto up = [&](const std::vector<float>& src) {
+        PxgDevicePtr dp = 0;
+        shim.memAlloc(&dp, src.size() * 4);
+        if (dp) shim.memcpyHtoD(dp, src.data(), src.size() * 4);
+        return dp;
+    };
+    const std::vector<float> canary(2, -8675309.5f);
+    for (uint32_t r = 0; r < A1S_ARTS; ++r)
+    {
+        rp[r].p = up(canary); rp[r].v = up(canary); rp[r].a = up(canary);
+        arts[r].jointPositions = reinterpret_cast<PxReal*>(rp[r].p);
+        arts[r].jointVelocities = reinterpret_cast<PxReal*>(rp[r].v);
+        arts[r].jointAccelerations = reinterpret_cast<PxReal*>(rp[r].a);
+    }
+    shim.memcpyHtoD(dAb, abImg.data(), abImg.size() * sizeof(physx::PxgArticulationBlockData));
+    shim.memcpyHtoD(dLk, lkImg.data(), lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    shim.memcpyHtoD(dDf, dfImg.data(), dfImg.size() * sizeof(physx::PxgArticulationBlockDofData));
+    shim.memcpyHtoD(dArts, arts.data(), arts.size() * sizeof(physx::PxgArticulation));
+
+    physx::PxgArticulationCoreDesc desc;
+    std::memset(&desc, 0xAB, sizeof(desc));
+    desc.nbArticulations = A1S_ARTS;
+    desc.mMaxLinksPerArticulation = A1S_MAX_LINKS;
+    desc.mMaxDofsPerArticulation = A1S_MAX_DOFS;
+    desc.nbSlabs = 0;
+    desc.mArticulationBlocks = reinterpret_cast<physx::PxgArticulationBlockData*>(dAb);
+    desc.mArticulationLinkBlocks = reinterpret_cast<physx::PxgArticulationBlockLinkData*>(dLk);
+    desc.mArticulationDofBlocks = reinterpret_cast<physx::PxgArticulationBlockDofData*>(dDf);
+    desc.articulations = reinterpret_cast<physx::PxgArticulation*>(dArts);
+    shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
+
+    struct Params { uint64_t desc; float dt; uint32_t integrateWord; } prm = {
+        uint64_t(dDesc), A1_DT, integrate ? 0xA7A5A301u : 0xB6B4B200u };
+    PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch updateBodiesLaunch1T single-link (integrate=%d)", int(integrate));
+    shim.streamSynchronize();
+
+    std::vector<physx::PxgArticulationBlockLinkData> gotLk(lkImg.size());
+    shim.memcpyDtoH(gotLk.data(), dLk, gotLk.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    size_t bad = 0;
+    {
+        const uint32_t* w = reinterpret_cast<const uint32_t*>(wantLk.data());
+        const uint32_t* g = reinterpret_cast<const uint32_t*>(gotLk.data());
+        const size_t n = gotLk.size() * sizeof(physx::PxgArticulationBlockLinkData) / 4;
+        for (size_t k = 0; k < n; ++k)
+        {
+            if (w[k] == g[k]) continue;
+            if (integrate) continue;   // the pose path is transcendental; this run is about the ACCESS
+            if (bad < 6) std::printf("MM au1-single %s word %zu ref %08x gpu %08x\n", "link", k, w[k], g[k]);
+            ++bad;
+        }
+    }
+    std::printf("[ info ] au1 single-link int=%d: %u articulations, maxLinks 1, link buffer %zu B -- the "
+                "prefetch of link[1] would read %u B past it\n", int(integrate), A1S_ARTS,
+                lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData),
+                uint32_t(sizeof(physx::PxgArticulationBlockLinkData)));
+    PXG_CHECK_MSG(bad == 0, "single-link integrate=%d: %zu link words differ", int(integrate), bad);
+
+    for (uint32_t r = 0; r < A1S_ARTS; ++r)
+        for (PxgDevicePtr p : { rp[r].p, rp[r].v, rp[r].a }) if (p) shim.memFree(p);
+    for (PxgDevicePtr p : { dAb, dLk, dDf, dArts, dDesc }) shim.memFree(p);
+}
+
+// 88 links: one fixed root, 86 spherical (3 dofs each) and a revolute probe, so the
+// dof cursor runs 0, 3, ... 255 and the probe's joint offset is 258.
+static const uint32_t A1W_LINKS = 88;
+static const uint32_t A1W_DOFS = 259;
+
+static void a1RunWideDofs(PxgCudaShim& shim)
+{
+    std::vector<physx::PxgArticulationBlockData> abImg(1);
+    std::vector<physx::PxgArticulationBlockLinkData> lkImg(A1W_LINKS);
+    std::vector<physx::PxgArticulationBlockDofData> dfImg(A1W_DOFS);
+    std::memset(abImg.data(), 0xAB, abImg.size() * sizeof(physx::PxgArticulationBlockData));
+    std::memset(lkImg.data(), 0xAB, lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    std::memset(dfImg.data(), 0xAB, dfImg.size() * sizeof(physx::PxgArticulationBlockDofData));
+
+    const uint32_t lane = 0;
+    physx::PxgArticulationBlockData& ab = abImg[0];
+    auto v = [&](uint32_t i, uint32_t f) { return a1V(i * 3u + 11u, i * 61u + f); };
+    auto unitQ = [&](uint32_t i, uint32_t f) {
+        PxQuat q(v(i, f), v(i, f + 1), v(i, f + 2), v(i, f + 3) + 2.5f);
+        return q.getNormalized();
+    };
+    auto unitV = [&](uint32_t i, uint32_t f) {
+        PxVec3 x(v(i, f), v(i, f + 1), v(i, f + 2) + 1.5f);
+        return x.getNormalized();
+    };
+    auto sv = [&](uint32_t i, uint32_t f) {
+        return UnAlignedSpatialVector(PxVec3(v(i, f), v(i, f + 1), v(i, f + 2)),
+                                      PxVec3(v(i, f + 3), v(i, f + 4), v(i, f + 5)));
+    };
+
+    ab.mNumLinks[lane] = A1W_LINKS;
+    ab.mFlags[lane] = 1u;          // FIXED base: conserveMomentum returns, the test is about the offset
+    ab.mStateDirty[lane] = 0u;
+    ab.mTotalDofs[lane] = A1W_DOFS;
+    ab.mArticulationIndex[lane] = 0u;
+
+    uint32_t cursor = 0;
+    for (uint32_t i = 0; i < A1W_LINKS; ++i)
+    {
+        physx::PxgArticulationBlockLinkData& L = lkImg[i];
+        const uint8_t jt = (i == 0) ? uint8_t(J_FIX)
+                                    : (i == A1W_LINKS - 1 ? uint8_t(J_REVOLUTE) : uint8_t(J_SPHERICAL));
+        const uint32_t dofs = (i == 0) ? 0u : a1Dofs(jt);
+        L.mJointType[lane] = jt;
+        L.mDofs[lane] = uint8_t(dofs);
+        L.mParents[lane] = (i == 0) ? 0u : i - 1u;
+        L.mJointOffset[lane] = cursor;
+        L.mRw_x[lane] = v(i, 3); L.mRw_y[lane] = v(i, 4); L.mRw_z[lane] = v(i, 5);
+        storeSpatialVector(L.mMotionVelocity, sv(i, 6), lane);
+        storeSpatialVector(L.mPosMotionVelocity, sv(i, 12), lane);
+        storeSpatialTransform(L.mPreTransform, lane, PxTransform(PxVec3(v(i, 54), v(i, 55), v(i, 56)), unitQ(i, 57)));
+        storeSpatialTransform(L.mAccumulatedPose, lane,
+                              PxTransform(PxVec3(v(i, 20), v(i, 21), v(i, 22)), unitQ(i, 23)));
+        storeSpatialTransform(L.mChildPose, lane, PxTransform(PxVec3(v(i, 27), v(i, 28), v(i, 29)), unitQ(i, 44)));
+        storeSpatialTransform(L.mParentPose, lane, PxTransform(PxVec3(v(i, 33), v(i, 34), v(i, 35)), unitQ(i, 48)));
+        { const PxQuat rq = unitQ(i, 39); float4 f; f.x = rq.x; f.y = rq.y; f.z = rq.z; f.w = rq.w;
+          L.mRelativeQuat[lane] = f; }
+        const float mass = 0.5f + std::fabs(v(i, 62)) * 0.75f;
+        L.mMass[lane] = mass;
+        { float4 f; f.x = 0.25f; f.y = 0.35f; f.z = 0.45f; f.w = 1.0f / mass; L.mInvInertiaXYZ_invMassW[lane] = f; }
+
+        for (uint32_t dd = 0; dd < dofs; ++dd)
+        {
+            physx::PxgArticulationBlockDofData& D = dfImg[cursor + dd];
+            const uint32_t u = (cursor + dd) * 7u;
+            // the probe: a revolute position past 2pi, so the WRAP writes it back and the
+            // written dof index is the only thing that separates truncated from not
+            float jp = (jt == J_REVOLUTE) ? 7.5f : v(10 + (dd % 3u), u);
+            D.mJointPositions[lane] = jp;
+            D.mJointVelocities[lane] = v(11 + (dd % 3u), u) * 2.0f;
+            D.mPosJointVelocities[lane] = v(12 + (dd % 3u), u) * 0.5f - 1.25f;
+            D.mJointUnconstrainedVelocities[lane] = v(22 + (dd % 3u), u) * 1.5f;
+            D.mJointAccel[lane] = v(23 + (dd % 3u), u);
+            D.mMotion[lane] = A1_MOTION_FREE;
+            storeSpatialVector(D.mLocalMotionMatrix,
+                               UnAlignedSpatialVector(unitV(17 + (dd % 3u), u),
+                                                      PxVec3(v(18, u), v(18, u + 1), v(18, u + 2))),
+                               lane);
+            storeSpatialVector(D.mWorldMotionMatrix, sv(19, u), lane);
+        }
+        cursor += dofs;
+    }
+    PXG_CHECK_MSG(cursor == A1W_DOFS, "wide fleet has %u dofs, expected %u", cursor, A1W_DOFS);
+    PXG_CHECK_MSG(lkImg[A1W_LINKS - 1].mJointOffset[lane] == 258u,
+                  "the probe link's joint offset is %u, and only an offset above 255 separates the "
+                  "truncated read from the full one", lkImg[A1W_LINKS - 1].mJointOffset[lane]);
+
+    // mirror
+    std::vector<physx::PxgArticulationBlockData> wantAb = abImg;
+    std::vector<physx::PxgArticulationBlockLinkData> wantLk = lkImg;
+    std::vector<physx::PxgArticulationBlockDofData> wantDf = dfImg;
+    std::vector<A1Record> wantRecs(1);
+    wantRecs[0].jointP.assign(A1W_DOFS + 1, -8675309.5f);
+    wantRecs[0].jointV.assign(A1W_DOFS + 1, -8675309.5f);
+    wantRecs[0].jointA.assign(A1W_DOFS + 1, -8675309.5f);
+    A1Coverage cov;
+    uint32_t alignedHits = 0, unalignedHits = 0;
+    std::vector<uint32_t> noDirty(1, AI_NONE);
+    std::vector<float> noImp(1, 0.f);
+    a1Mirror(noDirty.data(), noImp.data(), &wantAb[0], wantLk.data(), wantDf.data(), wantRecs[0], 0, A1_DT,
+             /*integrate*/ false, lane, cov, alignedHits, unalignedHits);
+
+    PxgDevicePtr dAb = 0, dLk = 0, dDf = 0, dArts = 0, dDesc = 0, dP = 0, dV = 0, dA = 0;
+    shim.memAlloc(&dAb, abImg.size() * sizeof(physx::PxgArticulationBlockData));
+    shim.memAlloc(&dLk, lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    shim.memAlloc(&dDf, dfImg.size() * sizeof(physx::PxgArticulationBlockDofData));
+    std::vector<physx::PxgArticulation> arts(1);
+    std::memset(arts.data(), 0xAB, sizeof(physx::PxgArticulation));
+    shim.memAlloc(&dArts, sizeof(physx::PxgArticulation));
+    shim.memAlloc(&dDesc, sizeof(physx::PxgArticulationCoreDesc));
+    const std::vector<float> canary(A1W_DOFS + 1, -8675309.5f);
+    shim.memAlloc(&dP, canary.size() * 4);
+    shim.memAlloc(&dV, canary.size() * 4);
+    shim.memAlloc(&dA, canary.size() * 4);
+    if (!dAb || !dLk || !dDf || !dArts || !dDesc || !dP || !dV || !dA)
+    { std::printf("  NOTE: no BDA -> skip\n"); return; }
+    shim.memcpyHtoD(dP, canary.data(), canary.size() * 4);
+    shim.memcpyHtoD(dV, canary.data(), canary.size() * 4);
+    shim.memcpyHtoD(dA, canary.data(), canary.size() * 4);
+    arts[0].jointPositions = reinterpret_cast<PxReal*>(dP);
+    arts[0].jointVelocities = reinterpret_cast<PxReal*>(dV);
+    arts[0].jointAccelerations = reinterpret_cast<PxReal*>(dA);
+    shim.memcpyHtoD(dAb, abImg.data(), abImg.size() * sizeof(physx::PxgArticulationBlockData));
+    shim.memcpyHtoD(dLk, lkImg.data(), lkImg.size() * sizeof(physx::PxgArticulationBlockLinkData));
+    shim.memcpyHtoD(dDf, dfImg.data(), dfImg.size() * sizeof(physx::PxgArticulationBlockDofData));
+    shim.memcpyHtoD(dArts, arts.data(), sizeof(physx::PxgArticulation));
+
+    physx::PxgArticulationCoreDesc desc;
+    std::memset(&desc, 0xAB, sizeof(desc));
+    desc.nbArticulations = 1;
+    desc.mMaxLinksPerArticulation = A1W_LINKS;
+    desc.mMaxDofsPerArticulation = A1W_DOFS;
+    desc.nbSlabs = 0;
+    desc.mArticulationBlocks = reinterpret_cast<physx::PxgArticulationBlockData*>(dAb);
+    desc.mArticulationLinkBlocks = reinterpret_cast<physx::PxgArticulationBlockLinkData*>(dLk);
+    desc.mArticulationDofBlocks = reinterpret_cast<physx::PxgArticulationBlockDofData*>(dDf);
+    desc.articulations = reinterpret_cast<physx::PxgArticulation*>(dArts);
+    shim.memcpyHtoD(dDesc, &desc, sizeof(desc));
+
+    struct Params { uint64_t desc; float dt; uint32_t integrateWord; } prm = {
+        uint64_t(dDesc), A1_DT, 0xB6B4B200u };
+    PXG_CHECK_MSG(shim.launchKernel(0, 1, 1, 1, &prm, sizeof(prm)) == PxgResult::Success,
+                  "launch updateBodiesLaunch1T wide-dofs");
+    shim.streamSynchronize();
+
+    std::vector<physx::PxgArticulationBlockDofData> gotDf(dfImg.size());
+    std::vector<float> gotP(canary.size()), gotV(canary.size()), gotA(canary.size());
+    shim.memcpyDtoH(gotDf.data(), dDf, gotDf.size() * sizeof(physx::PxgArticulationBlockDofData));
+    shim.memcpyDtoH(gotP.data(), dP, gotP.size() * 4);
+    shim.memcpyDtoH(gotV.data(), dV, gotV.size() * 4);
+    shim.memcpyDtoH(gotA.data(), dA, gotA.size() * 4);
+
+    size_t bad = 0;
+    float maxAbs = 0.f;
+    auto cmpW = [&](const char* what, const float* w, const float* g, size_t n) {
+        for (size_t k = 0; k < n; ++k)
+        {
+            if (a1F2u(w[k]) == a1F2u(g[k])) continue;
+            const uint32_t u = a1UlpDiff(w[k], g[k]);
+            const float e = std::fabs(w[k] - g[k]);
+            maxAbs = maxAbs > e ? maxAbs : e;
+            if (u <= 384 || e <= 4e-6f) continue;   // the atan2 budget of the main fleet
+            if (bad < 8)
+                std::printf("MM au1-wide %s [%zu] ref %.9g gpu %.9g (%u ulp)\n", what, k, double(w[k]),
+                            double(g[k]), u);
+            ++bad;
+        }
+    };
+    std::vector<float> wantJp(A1W_DOFS), gotJp(A1W_DOFS);
+    for (uint32_t d = 0; d < A1W_DOFS; ++d)
+    {
+        wantJp[d] = wantDf[d].mJointPositions[lane];
+        gotJp[d] = gotDf[d].mJointPositions[lane];
+    }
+    cmpW("dof jointPositions", wantJp.data(), gotJp.data(), A1W_DOFS);
+    cmpW("record jointPositions", wantRecs[0].jointP.data(), gotP.data(), canary.size());
+    cmpW("record jointVelocities", wantRecs[0].jointV.data(), gotV.data(), canary.size());
+    cmpW("record jointAccelerations", wantRecs[0].jointA.data(), gotA.data(), canary.size());
+    std::printf("[ info ] au1 wide-dofs: %u links, %u dofs, probe offset 258 -> truncated to %u; dof[2] %.6g, "
+                "dof[258] %.6g; max abs %.3g\n", A1W_LINKS, A1W_DOFS, 258u & 0xFFu, double(gotJp[2]),
+                double(gotJp[258]), double(maxAbs));
+    PXG_CHECK_MSG(bad == 0, "wide-dofs: %zu words differ", bad);
+
+    for (PxgDevicePtr p : { dAb, dLk, dDf, dArts, dDesc, dP, dV, dA }) shim.memFree(p);
+}
+
 PXG_TEST(artiUpdateBodies1T)
 {
     PxgSlangComputeDevice* dev = testDevice();
@@ -822,6 +1249,8 @@ PXG_TEST(artiUpdateBodies1T)
 
     a1Run(shim, /*integrate*/ false); // TGS: the path every scene runs
     a1Run(shim, /*integrate*/ true);  // PGS
+    a1RunSingleLink(shim, /*integrate*/ false);
+    a1RunWideDofs(shim);
 }
 
 } // namespace
