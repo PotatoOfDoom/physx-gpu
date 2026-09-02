@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **841/841** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **843/843** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.33a added `gpuslang.npFloatIntrinRecipSqrt`, which is not a kernel port but a
 PLATFORM measurement: about forty shaders here spell `PxVec3::getNormalized` as
 `v * rsqrt(m)`, while the engine computes `PxRecipSqrt` = `1.0f/sqrtf` — two exactly
@@ -44,8 +44,8 @@ and it earned its keep on the first run: it found a twelfth orphan
 (`bvh_CalculateKeyDeltas`) whose one launch site sits inside a block comment,
 which a grep for the enum reports as reachable.  12 of the 501 registry entries
 cannot be reached, so 489 is the number a running engine can actually ask for.
-Szenen: **33/33** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
-Inventar (32 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
+Szenen: **35/35** grün — ab P9.8 über `tools/run_scenes.sh` gefahren, das das
+Inventar (34 benannte Szenen plus den Setzsack mit seiner kanonischen Fallhöhe)
 trägt, ein FEHLENDES Verdikt getrennt zählt und die Diagnosen ausdrücklich NICHT
 wertet.  `particlediffuse` kam in P9.13a als Diagnose hinzu und ist seit P9.13d
 gewertet; `particleconvex` kam in P9.14a als ausstehende Arbeit hinzu und ist
@@ -54,11 +54,18 @@ ist und grün bleibt, ob das Tuch landet oder nicht; `clothdamp` kam in P9.19
 hinzu, weil keine Tuch-Szene ein Flächenmaterial mit Dämpfung setzte und der
 senkrechte Vorhang aus `clothhang` von Anfang an ruht; `clothconvex` kam in P9.20
 als ausstehende Arbeit hinzu und ist seit P9.21 gewertet, weil erst der
-VERTEX-Kernel das Tuch auf der Konvex-Platte fängt.  Die Liste der ausstehenden
-Arbeit trägt seit P9.26 wieder einen Eintrag: `clothmesh`, und der wartet
-ausnahmsweise **nicht** auf diesen Port — die Kette ist vollständig abgebildet,
+VERTEX-Kernel das Tuch auf der Konvex-Platte fängt.  `particlepush` und
+`articulationjoint` kamen in P9.41 als ausstehende Arbeit hinzu und sind seit
+P9.44 gewertet: die erste misst, ob eine Partikelwolke eine dynamische Kiste
+überhaupt schiebt (jetzt 3,7175 m statt 0,0000 m), die zweite, ob der
+Gelenkzustand aus `PxArticulationCache` mit der Gliedpose übereinstimmt und die
+Artikulation einschläft.  Die Liste der ausstehenden
+Arbeit trägt zwei Einträge: `clothmesh` seit P9.26, und der wartet
+ausnahmsweise **nicht** auf einen Port — die Kette ist vollständig abgebildet,
 aber ihr Vertex-Erzeuger ist upstream abgeschaltet, und das Tuch fällt mit
-beiden neuen Kerneln auf **exakt** dieselbe Zahl wie ohne sie.  Die
+beiden neuen Kerneln auf **exakt** dieselbe Zahl wie ohne sie; und `clothnet`
+seit P9.41, das auf die in P9.45 fällige Starrkörper-Reaktion der Tuch- und
+Weichkörper-Kontaktlöser wartet.  Die
 Diagnoseliste trägt jetzt wieder nur die sechs Kontrollen, die durchfallen
 SOLLEN, weil sie die Referenz der echten Prüfung sind.  P9.9 fügte `particlefluidboundary` hinzu, P9.10c
 `particlemeshfloor`, P9.11c `particlehffloor`.
@@ -1747,6 +1754,498 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.44 — die Starrkörper-Kopplung: fünf `accumulateDeltaVRigid*`-Kerne und die beiden `ps_solvePCOutputRigidDeltaV*`-Zwillinge
+
+**Ergebnis:** sieben Kerne abgebildet (Manifest 388 → **395/501**), zwei neue Module, zwei
+neue Fixtures mit fünf Tests; Suite **843/843** in beiden Speichermodi (194 s bzw. 210 s,
+je erster Versuch — und nach den P9.43b-Nachträgen ein zweites Mal gemessen: 222 s im
+ersten Anlauf, im V2-Modus 219 s im zweiten, weil der erste auf `gpuslang.femClothSim` mit
+einem SEGFAULT starb. Das ist der offene llvmpipe-JIT-Layoutfehler, kein Portfehler: der
+Test allein läuft danach in 3,39 s grün durch);
+Szenen **35/35 ok, 0 fail, 0 missing** — zwei davon, `particlepush` und
+`articulationjoint`, sind mit dieser Tranche aus der Liste der ausstehenden Arbeit in die
+Wertung gerückt (33 → 35). Die Wächterzeile `unmapped-but-launched` aus P9.40 ist damit im
+GANZEN Durchlauf leer: **null** Zeilen über alle 35 gewerteten Szenen. Vor dieser Tranche
+standen `accumulateDeltaVRigidFirstLaunch` und `accumulateDeltaVRigidSecondLaunch` in
+**23** davon — in allen dreizehn Tuch- und Weichkörperszenen (×240 in `cloth` und
+`clothdrape` bis ×3100 in `softbodyselfcollide`) und in allen zehn Partikelszenen, wo
+`ps_solvePCOutputRigidDeltaVTGSLaunch` mit derselben Zahl daneben stand (×600 bis ×2700):
+**jeder Starrkörper, den ein Tuch, ein Weichkörper oder ein Partikel berührte, wurde von
+nichts geschoben.**
+
+### Was fehlte
+
+Jeder Verformbaren- und Partikel-gegen-Starrkörper-Löser schreibt pro Kontakt einen
+Starrkörper-Delta — linear bei `deltaV[i]`, angular bei `deltaV[i+n]`, das
+Relaxationsgewicht in der `.w`-Lane des linearen Eintrags — neben eine nach Starrkörper
+SORTIERTE `PxNodeIndex`-Liste. `accumulateDeltaVRigidFirstLaunch` (rigidDeltaAccum.cu:55-220)
+macht daraus in place einen blocklokalen segmentierten Inklusiv-Scan und gibt pro Block den
+letzten Lauf aus (Id plus Teilsumme). `accumulateDeltaVRigidSecondLaunch` (:224-429) findet
+den letzten Kontakt jedes Laufs, addiert den Übertrag des Vorgängerblocks, wenn der Lauf die
+Blockgrenze überquert, und schreibt die Summe geteilt durch `max(1, Gewicht)` in die
+Delta-Geschwindigkeit des Löserkörpers — oder, für ein Gelenkglied, negiert in dessen
+`mScratchImpulse` plus `eHAS_IMPULSES` im Artikulationsblock.
+
+Das Multi-Trio (`clearDeltaVRigidSecondLaunchMulti` :433-516, `…MultiStage1` :521-668,
+`…MultiStage2` :671-874) ist dieselbe Reduktion für Partikel-Starrkörper-BEFESTIGUNGEN,
+deren Id-Liste nur pro Anwenderpuffer sortiert ist, sodass ein Körper mehrere Läufe
+anführen kann: Stage1 summiert die Relaxationsnenner atomar in einen Scratch (`tempDenom`
+für Starrkörper, `mDeltaScale` für Gelenkglieder), den der Clear-Kern vorher nullt; Stage2
+addiert die skalierten Summen atomar auf.
+
+`ps_solvePCOutputRigidDeltaVLaunch` (particlesystem.cu:1943-2121) und der TGS-Zwilling
+(:2123-2274) sind die STARRKÖRPER-Seite des Partikel/Primitiv-Kontaktlösers — die, die die
+Partikelseiten-Zwillinge aus P6.4b-2 und P6.6 als „inert für einen statischen Boden“
+zurückgestellt hatten. Derselbe `solvePCOutputDeltaV{,TGS}`-Kern, aber gegen die aktuelle
+Starrkörpergeschwindigkeit gelöst: PGS als `initialVel` plus akkumulierter Delta, TGS über
+den gepackten 3-float4-Pool, für ein Gelenkglied aus `outArtiVelocity` bei
+`solverBodyIndex * maxLinks + linkID` (plus je ein `maxLinks * nbArticulations`-Segment für
+angular und die zwei TGS-Deltas, `PxgVelocityReader`, dataReadWriteHelper.cuh:70). Die
+Reaktion ist `deltaLin = ((n·dF − f0·dFr0 − f1·dFr1) · invMass0) · relax` und
+`deltaAng = (raXn·dF − raXnF0·dFr0 − raXnF1·dFr1) · relax` mit `relax = coeff/dt`, aber nur
+wenn ein Delta ungleich null ist UND `invMass0 > 0`; das Gewicht ist
+`max(invMass0 / max(invMass0, partikelInvMass), 0.01)`. Ein statischer Körper überspringt
+die Spur, ohne zu schreiben (der Prepare-Kern hat `deltaVel` bereits genullt); `invMass0 == 0`
+(kinematisch) schreibt explizite Nullen. **Der Gelenkpfad ist hier portiert, nicht
+zurückgestellt:** die .cu hebt die `artiCoreDesc`-Zugriffe an den Kernelanfang, weil die
+Engine dort immer den echten Deskriptor übergibt, und der Port tut dasselbe.
+
+### Portierung
+
+* `rigidDeltaAccumBda.slang` (fünf Einträge, in `PXG_NOCONTRACT_SHADERS`). Die drei
+  Float-Scans — 32 Lanes eines Warps, 16 Warpsummen in Warp 0, 32 Blocküberträge — sind
+  Hillis-Steele über `shuffle(v, lane−r)`. Ihre ASSOZIATION ist Teil des Vertrags: ein
+  serialisierter Scan landet andere ulps. Sie laufen deshalb über groupshared-Arrays mit
+  einem Barrierenpaar pro Runde (P2.1: workgroup-uniforme Barrieren, kein Lockstep). Die
+  .cu schließt Firsts Kachel ohne Barriere und verlässt sich auf Warp-Konvergenz zwischen
+  den Lane-31-Schreibzugriffen der nächsten Kachel und den Lesezugriffen dieser; hier wird
+  die Kachel explizit geschlossen, wie in frozenHistogram.slang. Der Warp-0-Scan liest nur
+  die Lanes 0..15 und läuft auf `tid < 16`; die Lanes 16..31 halten den Sentinel
+  `0x8fffffffffffffff`.
+* **Fünfte Plattformregel, zweiter Fall.** Seconds PGS-Zweig addiert in
+  `linearVelocity += linVel * ratio` auf die `.w`-Lane eine BEWEISBARE Null, weil die .cu
+  `linVel.w = 0` davor setzt. llvmpipe faltet `x + 0 → x` für ein solches Produkt (P9.43b)
+  und behielte damit ein −0, das die CUDA zu +0 macht. Die Lane wird stattdessen
+  ganzzahlig kanonisiert (`rdaPlusZero`); die Fixture legt −0 in jede fünfte `.w`-Lane des
+  Pools, und der Mutant, der die Kanonisierung entfernt, stirbt.
+* `psContactSolveRigidBda.slang` (zwei Einträge, ebenfalls in `PXG_NOCONTRACT_SHADERS`):
+  `solvePCOutputDeltaV{,TGS}` byteidentisch aus den Partikelseiten-Modulen transkribiert
+  (die sind keine importierbaren Module); die Partikelseiten-Zwillinge bleiben
+  byteunverändert. Gleicher 96-Byte-Pack wie die Partikelseite
+  (PxgParticleSystemCore.cpp:2074-2089; nur die CUfunction unterscheidet sich).
+* ABI: First `{8×5}` = 40 B; Second `{8×9, 1}` = 80 B (isTGS-Byte @72); Clear `{8×6}` = 48 B;
+  Stage1/2 `{8×10, 1, 4, 1}` = 96 B (useLocalRelax @80, Koeffizient @84, isTGS @88).
+  Manifest von Hand: sieben Zeilen, `PXG_SLANG_KERNEL_MAPPED` 388 → 395.
+
+### Fixtures
+
+Host-Spiegel aus der CUDA transkribiert, Block- und Warpstruktur eingeschlossen, wortgenau
+verglichen.
+
+* `rigidDeltaAccum_firstSecond`: First und dann Second auf vier Id-Listen — leer, fünf
+  Kontakte, 700 (ein Lauf über die Grenze zwischen Block 0 und 1), 20000 (zwei Kacheln pro
+  Block, ein 3000 Einträge langer Lauf über drei Blöcke, eine teilgefüllte letzte Kachel,
+  die den Übertrag des letzten Datenblocks am Sentinel lässt) — mit Starrkörper-, statischen
+  und Gelenkglied-Ids gemischt, unter PGS und TGS. Verglichen werden Firsts gescanntes
+  `deltaV`, die 64 Blocküberträge und 32 Block-Ids sowie Seconds Löserpool, die Dirty-Bytes
+  der Artikulationsblöcke und die Scratch-Impulse der Gliedblöcke als ganze Puffer — das
+  prüft zugleich, dass nichts anderes angefasst wird.
+* `rigidDeltaAccum_multiChain`: Clear → Stage1 → Stage2 auf Firsts Ausgabe für 3000
+  Einträge, in denen Körper bis zu zwei (nie benachbarte) Läufe anführen, mit
+  `useLocalRelax` aus und an, PGS und TGS.
+* `psContactSolveRigid_lanes`: 70 Kontakte über drei Constraint-Blöcke, jede Spurart der
+  .cu — statisch (übersprungen, die Ausgabeslots behalten ihren Sentinel), kinematisch
+  (explizite Nullen), bewegte dynamische Starrkörper, Gelenkglieder — zwei Partikelsysteme,
+  zwei Materialien, Nicht-Null-`appliedForces` aus früheren Iterationen; PGS, TGS mit
+  Geschwindigkeitsiteration aus und an. Gemessen: 10 übersprungen, 10 genullt, 50 reagierend,
+  20 Gelenkspuren je Variante.
+
+### Was die Mutationsläufe gefunden haben
+
+**Erstens: `PxMax` ist für `float` nicht das generische Template.** Der erste Durchlauf
+gegen `rigidDeltaAccum` ließ genau einen echten Mutanten stehen — und dieser Mutant war der
+KORREKTE Code. `PxMax` ist generisch `a < b ? b : a` (PxMath.h:75), aber die
+`float`-Überladung (PxMath.h:82) leitet an `intrinsics::selectMax` weiter, und das ist
+`a > b ? a : b` (PxUnixMathIntrinsics.h:122). Die beiden unterscheiden sich für einen
+NaN-Operanden und für `PxMax(+0, −0)`. Der Port hatte die generische Reihenfolge; die
+Fixture konnte es nicht sehen, weil sie die unterscheidenden Eingaben nicht erzeugte.
+
+`rigidDeltaAccum_pxMaxSignedZero` schließt das und fährt Stage1 **ohne First davor** — das
+ist der Punkt: First beendet jeden Lauf mit `deltaV[w] + accum`, und `accum.w` ist für einen
+Lauf innerhalb eines Warps eine POSITIVE Null, sodass `−0 + (+0)` als `+0` herauskäme, bevor
+`PxMax` es überhaupt sieht. Aus demselben Grund startet der Akkumulator bei `−0.0`. Der
+Nenner des Laufs mit `−0.0`-Gewichten muss als `0x80000000` zurückkommen, und er tut es.
+
+**Zweitens: die Wiederholung im Float-Atomic ist messbar nötig, nicht Vorsorge.** Der zweite
+Überlebende war `atomicAddFloat` ohne die Compare-Exchange-Schleife; keine Id-Liste der
+Fixture brachte zwei Lanes gleichzeitig auf dasselbe Wort. `rigidDeltaAccum_atomicCollision`
+richtet nun 256 Lanes EINES Blocks auf denselben Starrkörper und 256 auf dasselbe
+Gelenkglied, alle Beiträge gleiche Zweierpotenzen, sodass die Summe reihenfolgeunabhängig
+exakt ist und der Vergleich wortgenau bleibt. Mit korrektem Code landen beide Ziele auf
+exakt 128; ohne die Wiederholung gehen Additionen verloren.
+
+**Drittens: der PGS-Adhäsionszweig war ungetestet.** Der Adhäsions-Clamp multipliziert mit
+`PxMax(0, separation)` und ist damit für einen durchdringenden Kontakt wirkungslos — und das
+waren alle 70 Spuren, deren Fehler überwiegend negativ sind und deren Körper sich bewegen.
+Der TGS-Zwilling starb, weil dessen Trennung die Geschwindigkeitsterme einfaltet und positiv
+werden kann; der PGS-Zweig überlebte. Spur 18 ist jetzt als Adhäsionssonde gepinnt: eine
+Trennung von +0,02 weit innerhalb des Adhäsionsradius des Materials
+(`restOffset·scale − restOffset` = 0,05), ein Partikel, dessen Phasengruppe auf das Material
+MIT Adhäsion zeigt, kein laufender `deltaP`, keine bisherige Kraft, und der Starrkörper, auf
+den die Spur zeigt, in beiden Pools in Ruhe — dann verschwinden `normalVel` und
+`normalDelta`, und der Clamp ist das Einzige, was `deltaF` von null wegbewegen kann. Der
+Test prüft, dass die Sonde überhaupt eine Reaktion erzeugt.
+
+Nach diesen drei Ergänzungen:
+
+**`rigidDeltaAccumBda.slang` gegen `rigidDeltaAccum`: 26 Mutanten, 26 getötet, kein
+Überlebender.** Die Fallen decken jede Struktur der Kette ab: die Segmentierung aller drei
+Scans (A2, A8), die Lane-Schranke der Hillis-Steele-Runde (A1), das Zurücksetzen des
+Blocküberträgers bei neuem Lauf (A3), die beiden bedingten Überträge (A4, A5), die Trennung
+linear/angular (A6), die Partitionsformel (A7), Seconds Blocküberträger (A9) und seine
+Lauf-Ende-Bedingung (A10), der Nenner (A11, A22, A25), die TGS-Packung (A13, A23), die
+Nullkanonisierung (A14), das Vorzeichen des Gelenkimpulses (A15), das Dirty-Flag (A16), die
+Blockadressierung der Gliedblöcke (A17, A18 — letzterer stürzt ab, weil ein nicht
+verschobener Gliedindex aus dem Puffer läuft; ein Absturz ist ein Kill), das Nachladen des
+Nachbarn an der Blockgrenze (A19), Stage1s lokale Relaxation (A20, A21), das Nullen im
+Clear (A24), die `PxMax`-Reihenfolge (A12) und die Wiederholung im Atomic (A26).
+
+**`psContactSolveRigidBda.slang` gegen `psContactSolveRigid`: 19 Mutanten, 19 getötet, kein
+Überlebender.** Fallen: die beiden Frühausstiege (S1 statisch, S2 kinematisch), die
+Geschwindigkeitsquellen (S3 PGS ohne Anfangsgeschwindigkeit, S4 TGS-Entpackung, S5/S6 der
+Gelenkpfad und seine vier Segmente), die Reaktionsformel (S7 Gewicht ohne inneres Maximum,
+S8 ohne `invMass0`, S9 Relaxation mal statt durch `dt`, S10 angularer Slot bekommt den
+linearen, S11 Kreuzproduktreihenfolge), die Materialindizes (S12), beide Adhäsionszweige
+(S13, S14), die Geschwindigkeitsiteration (S15), der Fehlerterm (S16), die
+Constraint-Block-Adressierung (S17), die Partikel-ID-Zerlegung (S18) und der
+TGS-Tangential-Delta (S19).
+
+### Was die drei Beobachterszenen aus P9.41 jetzt messen
+
+* **`particlepush` besteht.** Die 64 Partikel (zusammen 64 kg) bei 4 m/s schieben die
+  10-kg-Kiste **+3,7175 m** entlang x (Schranke 0,5 m; vor der Tranche +0,0000 m). Die Kiste
+  bleibt dabei auf ihrer Höhe (y 1,0000) und behält am Ende 0,4528 m/s — die Wolke überholt
+  sie mit +4,9477 m. Die Szene ist gewertet.
+* **`articulationjoint` besteht.** Cache-Winkel **−1,0792** gegen Gliedpose **−1,0792**,
+  Differenz **0,0000**, und die Artikulation schläft **ab Schritt 722** ein. Die Szene ist
+  gewertet. Die beiden Kerne dahinter kamen aus P9.43; was P9.41 fehlte, war die Lauflänge:
+  mit `setFrictionCoefficient(0.5)` KRIECHT das Glied — −0,7180 bei Schritt 40, −0,9572 bei
+  360, −1,0792 bei 800 —, sodass die Vorgabe von 360 Schritten die Ruhelage nie erreichte
+  und der Wachzähler bei 0,1009 stand. Der Standardwert steht jetzt bei 900 Schritten, mit
+  den gemessenen Kriechzahlen in der Begründung.
+* **`clothnet` fällt weiter durch, und das ist jetzt eine ANDERE Aussage.** Die Kiste
+  kommt bei y = 0,2500 zur Ruhe (tiefster Punkt 0,1796), das Netz sackt auf 1,8340 —
+  **Ziffer für Ziffer dieselben Zahlen wie vor der Tranche.** Die Guard-Zeile ist dabei
+  LEER: die fünf `accumulateDeltaVRigid*`-Kerne laufen jetzt, sie bekommen nur nichts zu
+  reduzieren. `femClothRigidContactBda.slang:591` und `softBodyRigidContactBda.slang:573`
+  stellen `FEMCollision::computeRigidChange` (deformableUtils.cuh:418-429) zurück und
+  schreiben Nullen in genau den Puffer, den diese Tranche summiert. Das ist P9.45, und die
+  Szene benennt es seit diesem Lauf mit dem richtigen Grund statt mit einer unmapped-Zeile.
+
+### Offen
+
+* Das Multi-Trio ist abgebildet, aber seine einzigen Aufrufer
+  (`ps_rigidAttachmentPrepareLaunch`, `ps_solveRigidAttachments{,TGS}Launch`) sind weiter
+  unmapped — die Partikel-Starrkörper-Befestigungskette ist damit von hinten nach vorn halb
+  geschlossen.
+* Die Zahl der dokumentierten Upstream-Kandidaten bleibt bei 44. Die .cu-Notiz „TODO — need
+  to figure out how to make this work for articulation links!“ vor dem Static-Skip ist keine
+  Fehlstelle: ein Gelenkglied ist nicht statisch und läuft durch.
+
+## P9.43b — der Kern, der den Gelenkzustand zurückbringt, und eine fünfte Plattformregel
+
+`updateBodiesLaunch1T` ist portiert. Manifest **387 → 388**, Suite **841/841 in beiden
+Speichermodi** (je erster Versuch, 203 s bzw. 220 s), Szenen **33/33 ok, 0 fail, 0 missing**. Gemessen wurde diese Tranche
+zusammen mit P9.42 und P9.43a in **einem** Bau — die drei Kerne teilen keinen Zustand, und
+ein Szenendurchlauf dauert vierzig Minuten.
+
+### Warum dieser Kern
+
+Er ist der **einzige Schreiber** der Datensatzfelder `jointPositions` /
+`jointVelocities` / `jointAccelerations` (`forwardDynamic2.cu:3035-3044`). Die DMA
+schafft sie zum Host, `PxgPostSolveArticulationTask` kopiert sie in
+`Dy::ArticulationData` (`PxgContext.cpp:826-834`), `PxArticulationCache` liest sie. Ohne
+ihn hängt das Glied sichtbar bei −π/2, und `copyInternalStateToCache` meldet 0 — genau
+das misst `articulationjoint` (P9.41). Dazu spült er die aufgeschobenen Impulse, und für
+eine freie Basis schreibt er die Gliedgeschwindigkeiten per Vorwärtskinematik neu und
+korrigiert Winkelgeschwindigkeit, Lineargeschwindigkeit **und Gliedpositionen**, damit
+Impuls und Schwerpunkt den Vor-Schritt-Werten entsprechen (`conserveMomentum`,
+:2783-2981).
+
+### Vier Abschnitte, deren Reihenfolge alles ist
+
+1. Gelenkpositionen/Posen — zwei **verschiedene** Pfade, kein Pfad mit Schalter:
+   `integrate == false` (TGS, der Szenenpfad) wickelt Drehgelenke um 4π, klammert
+   begrenzte Schubgelenke und leitet Kugelgelenke aus den bereits integrierten Posen
+   neu ab, ohne eine Pose zu schreiben; `integrate == true` (PGS) integriert die
+   Wurzel aus `mPosMotionVelocity` — **nicht** `mMotionVelocity` — und die Glieder
+   über `propagateLink<false>`.
+2. Der Impulsfluss, Zeile für Zeile aus `npArtiStepKernel`: Mitteln bei
+   `eHAS_IMPULSES`, dann die **sechs**-argumentige `PxcFsFlushVelocity` (die, die
+   `mSolverSpatialDeltaVel` für Part2 akkumuliert), dann das atomare Byte-Löschen.
+3. `conserveMomentum` — nur freie Basis.
+4. Die Dof-Rückschreibung: `a = accel + (v − vUnc) · invDt`.
+
+Der Impulsschwanz sieht aus wie Abschnitt 5 von `alaComputeLinkAcceleration` und ist es
+an vier Stellen nicht: die Winkelverhältnis-Schranke liefert hier **0** (dort 1),
+`velChange.bottom` ist hier **minus** `offset × angDelta` (dort plus), die
+Verbundträgheit kommt hier aus `transformInertiaTensor(1/invInertia, R(pose.q))` (dort
+aus der gespeicherten isolierten Trägheit), und dieser Kern schreibt zusätzlich
+Geschwindigkeiten per FK neu und verschiebt die Gliedpositionen. Die Helfer sind
+geteilt, die Konstanten und Vorzeichen gehören diesem Kern.
+
+### Die fünfte Plattformregel: eine beweisbare Null wird gefaltet
+
+Die Vorrichtung sät eine ruhende freie Artikulation mit **negativen** Nullen in allen
+Geschwindigkeiten. Auf dem TGS-Pfad war der Kern bit-exakt — bis auf 31
+Vorzeichen-Null-Abweichungen, alle auf dem oberen Drittel von `mMotionVelocity` genau
+dieser Glieder: die Engine liefert +0, der Port −0.
+
+Ursache, per Sonde gemessen (die Zwischenwerte in Giftfelder geschrieben): die Laufzeit-
+Null aus P8.87, `abs(dt) · 0.0f`, kommt als `OpFMul` an (mit `NoContraction`), und
+**trotzdem** kommt aus `(−0) + Null` eine −0. llvmpipes LLVM beweist, dass das Produkt
+eine Null ist, und faltet unter No-signed-zeros-Semantik `x + Null → x`, sobald die Null
+**direkt** in die Addition fließt. Durch ein Schleifen-Phi kann es das nicht — deshalb
+funktionieren die Akkumulator-Saaten aus P8.87 (und die dieses Kerns, verifiziert), und
+deshalb versagten hier genau die drei geradlinigen `+ 0.0f` von `addSpatialVector`
+und das `p.w + 0.f` der Pose. Die Addition ist jetzt als das geschrieben, was sie tut:
+`au1PlusZero` kanonisiert −0 zu +0 im Ganzzahlraum, wo kein Gleitkomma-Flag greift; NaN,
+Unendlich und jeder andere Wert gehen unverändert durch, wie durch die echte Addition.
+Danach: **0 Vorzeichen-Null-Abweichungen** auf dem TGS-Pfad, und die Vorrichtung fordert
+diese Null ausdrücklich.
+
+Die drei Plattformregeln davor betrafen slangc; diese betrifft den Treiber und gilt für
+jeden Shader des Korpus, der eine Laufzeit-Null ohne Phi addiert. Aufgabe: die Stellen
+zählen.
+
+### Die Vorrichtung
+
+130 Artikulationen (drei X-Blöcke, ein sechster vergifteter Warp-Streifen), 43 feste
+und 87 freie Basen, `mStateDirty` 0/1/2/3 auf 37/31/31/31 Bahnen, 7 ruhende, beide
+`integrate`-Werte, der Datensatzindex eine Permutation des Flottenplatzes,
+Datensatzfelder mit Kanarienvogel hinter dem letzten Dof. Abdeckung, gezählt: 26
+Drehgelenk-Umbrüche, Schubgelenk-Klammern 17 unten / 17 oben / 18 innerhalb, 78
+Kugelgelenk-Ableitungen, 7 Fälle mit Nenner 0.
+
+Toleranz **je Pfad**: auf `integrate == false` nur `mJointPositions` (das atan2 der
+Kugelgelenke), 460 Wörter, höchstens 256 ULP und 3,34e-6 absolut; auf `integrate ==
+true` dazu `mAccumulatedPose` und `mMotionVelocity` (alles, was der Impulsschwanz aus
+den transzendenten Posen ableitet), 1246 Wörter, höchstens 4096 ULP bei 1,53e-5
+absolut. Jedes andere Wort — gespülte Gelenkgeschwindigkeiten, Beschleunigungen,
+das Zustandslöschen, die unberührten Blöcke, das Gift — bit-exakt.
+
+Abgeschrieben, nicht korrigiert, mit Fundstelle: `computeAndEnforceJointPositions`
+liest `mJointOffset` durch eine `PxU8`-Lokale (:2463) — das `PxU32`-Feld wird dort und
+nur dort auf sein unteres Byte gekürzt (unerreichbar unter 256 Dofs je Artikulation,
+Upstream-Kandidat Nr. 44); die Kehrwerte der inversen Trägheitsdiagonale (:2882) sind
+ungeschützte echte Divisionen. Eine Abweichung mit Begründung: der Vorabruf von
+`artiLinks[1].mParents` (:2821) ist im `.cu` unbedingt und liest bei einer
+Ein-Glied-Artikulation hinter ihren Streifen; er ist hier auf `linkCount > 1`
+geschützt — schreibäquivalent, weil der Wert tot ist, wenn die Schleife nicht läuft.
+
+### Der Fegedurchgang
+
+**26 Mutanten.** Der erste Durchgang tötete 21 und ließ fünf stehen — und diese fünf
+waren der eigentliche Ertrag des Laufs, weil **drei** davon Blindstellen der Vorrichtung
+waren und die beiden anderen erst durch den Versuch, sie zu töten, zu bewiesenen
+Äquivalenzen wurden statt zu vermuteten:
+
+* **T19** (die Dof-Rückschreibung läuft ein Dof zu weit). Der zusätzliche Durchlauf liest
+  Dof-Block `[totalDofs]` — innerhalb der Allokation, nie gesät, also noch die
+  0xAB-Vergiftung — und schreibt ihn in `jointP/V/A[totalDofs]`, wo die Erwartung
+  **dasselbe Bitmuster** hielt. (Auch die Beschleunigung: `P + (P − P)·invDt`, und
+  `P − P` ist +0.) Der Kanarienvogel des Datensatzes ist jetzt ein Wert, den ein
+  vergifteter Dof-Block nicht erzeugen kann.
+* **T11** (die Winkelverhältnis-Schranke liefert 1 statt 0). Die Schranke feuert nur bei
+  Nenner 0, und dort waren die einzigen Bahnen die **ruhenden**, deren Impulsvektor exakt
+  null ist — 0 und 1 skalieren beide eine Null. Eine Klasse **nahe** der Ruhe trägt jetzt
+  Geschwindigkeiten um 1e-25: jede Komponente ist eine normale Zahl, ihr Quadrat (1e-50)
+  liegt unter dem kleinsten Denormal, also unterläuft der Betrag zu null, während der
+  Vektor lebt. Die Gelenkgeschwindigkeiten werden mitskaliert, weil `conserveMomentum`
+  die Gliedgeschwindigkeiten per Vorwärtskinematik aus der Wurzel neu aufbaut — ohne das
+  landen wieder normale Zahlen in der Summe. Gemessen: 13 Bahnen mit Nenner 0, davon 6
+  beobachtbar.
+* **T1** (die `PxU8`-Kürzung des Gelenkversatzes, Upstream-Kandidat Nr. 44). Sie ist
+  unsichtbar unter 256 Dofs, und die Flotte hat sechs Glieder und dreizehn Dofs. Ein
+  eigener Dispatch mit **einer** Artikulation aus 88 Gliedern und 259 Dofs setzt den
+  Versatz des Sondenglieds auf 258: gekürzt adressiert er Dof 2, ungekürzt Dof 258, und
+  beide werden verglichen.
+Die beiden anderen bleiben stehen, jetzt aber mit Beweis statt mit Vermutung.
+
+**T23** (der ungeschützte Vorabruf von `link[1].mParents`) hatte den Verdacht auf seiner
+Seite: bei zwei oder mehr Gliedern landet der Zugriff im eigenen Warp-Streifen, und nur
+eine Flotte mit `maxLinks == 1` legt ihn hinter den Puffer — also wurde ein dritter
+Dispatch mit 33 eingliedrigen Artikulationen und einer Link-Allokation von genau zwei
+Streifen gebaut, der den Vorabruf des letzten Warps 29184 B hinter den 58368-B-Puffer
+legt. **Der Mutant überlebt trotzdem, und das ist die Antwort, nicht die Lücke.**
+`nextParent` hat genau einen Leser, `const uint parent = nextParent` am Kopf von
+Schleife B, und die Schleife läuft bei `linkCount == 1` nicht: der Wert ist tot, bewiesen
+aus dem Kontrollfluss, nicht gemessen. Beobachtbar wäre allein der ZUGRIFF — und der
+endet auf llvmpipe im gemappten Heap des Suballokators statt auf einer ungemappten Seite,
+weil der Puffer aus einem großen Pool geschnitten wird. Der Schutz bleibt trotzdem im
+Port: auf einer Hardware-GPU mit echten Seitengrenzen ist genau er es, der den Fehler
+verhindert. Der Dispatch bleibt ebenfalls — er ist der einzige Fall des Korpus mit
+`maxLinks == 1` und wird wortgenau verglichen.
+
+**T17** (Laufzeit-Null durch literale Null ersetzt) ist ebenso äquivalent: von den sieben
+Akkumulatoren, die aus ihr gesät werden, sind zwei vor ihrem ersten Lesen überschrieben,
+vier erreichen ihre erste Addition durch ein Schleifen-Phi (das weder slangc noch llvmpipe
+faltet), und die eine geradlinige Nutzung wird von BEIDEN Schreibweisen gefaltet — slangc
+lässt die literale Null ganz weg, llvmpipe faltet die Laufzeit-Null nach Plattformregel 5.
+Kein Eingabewert trennt sie.
+
+Dabei fiel eine fünfte Lücke auf, die kein Mutant benannte: eine
+**Vorzeichen-Null-Abweichung wurde überall toleriert**, nicht nur im ULP-Bereich. Damit
+war auf dem PGS-Pfad **jede** ±0-Mutation untötbar — auch das Löschen von `au1PlusZero`,
+der Kanonisierung, auf die dieser Port sich stützt. Toleriert wird sie jetzt nur dort, wo
+auch das ULP-Budget gilt.
+
+Nach diesen Änderungen, forciert frisch wiederholt: **26 Mutanten, 24 getötet, 2
+Überlebende** — T17 und T23, die beiden bewiesenen Äquivalenzen. T1, T11 und T19 sterben
+jetzt, jeder an dem Fall, der ihn sichtbar macht, und die neuen Fälle kosten die Suite
+zwei zusätzliche Tests (841 → 843).
+
+## P9.43a — der Kern, der Artikulationen schlafen lässt
+
+`updateBodiesLaunch_Part3` ist portiert. Manifest **386 → 387**. Ein zweiter
+Einstiegspunkt in `npArtiUpdateBodies.slang`, derselbe Argumentpack wie Part2.
+
+Ein Thread je Artikulation: das Maximum der Glied-Wachzähler, die Part2 gerade
+geschrieben hat, wird der Wachzähler der Artikulation in
+`scDesc->articulationSleepData[articulationIndex]`; die beiden Übergangsbits von
+`internalFlags` werden aus dem Übergang (alt, neu) zwischen Null und Nicht-Null neu
+gesetzt, alles andere im Wort geht unverändert durch. Die DMA kopiert die acht Bytes
+zum Host, `PxgPostSolveArticulationTask` liest den Zähler in den Kern und schaltet den
+Inselknoten (`PxgContext.cpp:788-799`). Unabgebildet zählt nichts herunter, und
+`isSleeping()` wird nie wahr — P9.40 fand ihn ×240 in der Artikulationsszene
+übersprungen.
+
+Drei Dinge, die kein Compiler bemerkt: `PxMax(lwc, maxWc)` ist der **Ternär**
+`(lwc < maxWc) ? maxWc : lwc` und kein `max()` — bei Gleichstand überlebt der **erste**
+Operand, Vorzeichen-Nullen eingeschlossen, eine Artikulation mit lauter −0-Zählern
+endet bei −0-Bits; der Übergangstest läuft auf Floats (−0 zählt als Null); die Last von
+`linkWakeCounters[0]` steht in der Schleife, nie davor — eine gliedlose Artikulation
+darf ein leeres Feld tragen.
+
+Vorrichtung: 68 Artikulationen (zwei X-Blöcke, ein halbleerer Warp), Datensatzindex
+permutiert, Gliedzahlen 0..6 mit **leeren** Zählerfeldern für jede siebte, alte Zähler
+in {+0, −0, positiv} gegen neue Maxima in {+0, −0, positiv}. Wortgleich ohne
+Vorzeichen-Null-Toleranz: 26 aktivieren, 8 deaktivieren, 34 keins von beidem, 7
+Maxima sind −0, 9 gliedlos; Blöcke, Datensätze und Zähler kommen byte-identisch zurück.
+
+### Der Fegedurchgang
+
+**10 Mutanten, 10 getötet, kein Überlebender.** Die Fallen: `PxMax` als Intrinsic statt
+Ternär (P1) und die Gleichstandsrichtung (P2), das Löschen der alten Übergangsbits (P3),
+beide Übergangsbedingungen ohne ihre zweite Hälfte (P4, P5), der nicht gespeicherte
+Wachzähler (P6), die Adressierung der Schlafdaten über den Threadindex statt den
+Artikulationsindex (P7, P10), ein Glied zu viel in der Maximumsschleife (P8) und die
+Grid-Schranke um eins daneben (P9). Die letzten drei stürzen ab, weil sie über das
+Pufferende hinauslesen — ein Absturz ist ein Kill.
+
+## P9.42 — das Einfrier-Trio, das in jeder Szene übersprungen wurde
+
+`computeFrozenAndUnfrozenHistogramLaunch`, `outputFrozenAndUnfrozenHistogram` und
+`createFrozenAndUnfrozenArray` sind portiert. Manifest **383 → 386**. Neue Datei
+`frozenHistogram.slang`, Modell die strukturgleichen Broadphase-Histogramme.
+
+Die Kette macht aus den 0/1-Marken, die `updateTransformCacheAndBoundArrayLaunch` je
+Form setzt, an Ort und Stelle exklusive Präfixzähler (Durchgang 1, blocklokal über
+zusammenhängende Abschnitte von `nbIterationsPerBlock · 256`), hebt sie über die 32
+Blocksummen auf Gerätebreite und schreibt die beiden Gesamtzahlen **in den Deskriptor**
+(Bytes 144/148, den der Host als Ganzes zurückkopiert, Durchgang 2), und schreibt per
+Binärsuche die verdichteten Formindizes über **dieselben** `BlockAndRes`-Puffer, deren
+Blocksummen dann verbraucht sind (Durchgang 3). Der Host reicht die Listen an den
+Scene-Query-Baum (`ScScene.cpp:504-524`). Gestartet in jeder Starrkörperszene, in jedem
+Frame, wenn die Direct-GPU-API aus ist — P9.40 zählte ×25 bis ×300 je Lauf, in allen 33.
+
+Alles hier ist `PxU32`-Addition, also darf die Warp-Arithmetik frei umgeformt werden:
+das `popc(ballot(v) & threadMask)` je Bahn wird ein Groupshared-0/1-Feld und eine
+Summe unterhalb der Bahn; die 8- und 32-breiten exklusiven Scans, die das `.cu` nur im
+Warp 0 rechnet, laufen in Thread 0, damit keine Barriere in divergentem Fluss steht;
+das `globalThreadIndex == 31` des `.cu` wird Thread 0 von Block 0 — derselbe einzelne
+Schreiber. Zwei Dinge sind **nicht** frei: die Aufteilung (zusammenhängend je Block,
+kein Grid-Stride, in beiden Durchgängen mit derselben Formel und der Konstante 32,
+nicht `gridDim.x`) und die Kachelgrenze: das `.cu` schließt eine Kachel ohne Barriere
+und verlässt sich auf Warp-Konvergenz zwischen dem Lesen der Warp-Felder und dem
+Schreiben von Bahn 31 in der nächsten Kachel — die Emulation hat kein Gleichschrittt
+und setzt die Barriere.
+
+Vorrichtung `testFrozenHistogram`: die drei Stufen werden **einzeln** verglichen, weil
+der Vertrag der Kette zwischen ihnen liegt — nach Durchgang 1 die blocklokalen Präfixe
+und alle 32 Blocksummen (Null für leere Blöcke), nach Durchgang 2 die gerätebreiten
+Präfixe und die Gesamtzahlen im Deskriptor, nach Durchgang 3 die Indexlisten und ein
+**unberührter** Rest. 16 Fälle: n = 0 mit **Nullzeigern** (ein vorgezogenes Laden
+stürzt ab statt abzuweichen), 1, 5, 31/32/33, 255/256/257, lauter Nullen, lauter
+Einsen, 8191/8192/8193, 20000 (drei Iterationen je Block, fünf Blöcke leer), und ein
+Fall mit rohen Zweien, der die Abschrift festnagelt: das Ballot testet `!= 0`, die
+Warpsumme addiert den **rohen** Wert (:295 gegen :300) — in der Engine, die nur 0/1
+schreibt, dasselbe.
+
+### Der Fegedurchgang
+
+**19 Mutanten, 17 getötet, 2 überlebt.** Getötet: die Bahn, die die Warpsumme schreibt
+(F1), der nicht kumulative Blockakkumulator (F2), das Ballot auf dem Rohwert statt auf
+`!= 0` (F3), die auf 1 normierte Warpsumme (F4), der fallengelassene Übertrag der
+vorherigen Kacheln (F5), inklusiver statt exklusiver Warp-Scan (F6), Grid-Stride statt
+zusammenhängender Aufteilung (F7), fehlende Blocksummen für leere Blöcke (F8, Absturz),
+nie geschriebene Gesamtzahlen (F9, Absturz), inklusiver Blockscan (F10), vertauschte
+Basen zwischen eingefroren und aufgetaut (F11), Iterationszahl aus `gridDim.x` statt der
+Konstante 32 (F12), die Binärsuche in vier Spielarten (F13 hängt — ein Hänger ist ein
+Kill —, F14, F15, F17) und der doppelte Grid-Stride in Durchgang 3 (F16).
+
+F16 überlebte den ersten Durchgang: Durchgang 3 ist die einzige Grid-Stride-Schleife des
+Trios, und ihr Stride ist unsichtbar, solange die verdichtete Liste kürzer ist als ein
+volles Grid (64 Blöcke × 256 Threads = 16384 Einträge). Alle Fälle blieben darunter — der
+20000-Element-Fall verdichtet auf 4000 und 7000. Ein Fall mit 20000 **durchweg markierten**
+Formen lässt beide Schleifen zweimal laufen; damit stirbt F16.
+
+Zwei Überlebende, beide Barrieren: F18 (die Barriere zwischen dem Blocksummen-Scan und
+seinem Rücklesen in Durchgang 2) und F19 (die Barriere, die eine Kachel in Durchgang 1
+schließt). Das ist das aus früheren Tranchen bekannte Plattformmuster und keine Aussage
+über den Port: llvmpipe arbeitet die 256 Threads einer Workgroup in Achterbündeln
+nacheinander ab, sodass das Wettrennen, das die Barriere verhindert, hier nicht entsteht.
+Auf einer Hardware-GPU mit 32er-Warps entsteht es. Ein Test, der es auf dieser Plattform
+erzwingt, ist nicht konstruierbar; die Barrieren bleiben, weil die CUDA-Semantik sie
+verlangt.
+
+## P9.41 — drei Szenen, die messen, was P9.40 nur zählen konnte
+
+Kein Kernel-Port. Drei Szenen in der Liste der ausstehenden Arbeit von
+`run_scenes.sh --diagnostics`, jede mit dem Kern benannt, auf den sie wartet, jede mit
+ihrer Vorher-Zahl:
+
+* **`clothnet`** — eine **leichte** Kiste (1 kg) fällt auf ein waagerechtes Tuch, dessen
+  Rand an die Welt geheftet ist. Die erste Szene des Harness, in der ein dynamischer
+  Starrkörper von einem Verformbaren **gehalten** werden muss: `clothbox` landet das
+  Tuch auf einer 1000-kg-Kiste, die die Schwerkraft ohnehin am Boden hält. Die
+  Tuchseite des Kontakts läuft (das Netz sackt unter der Kiste ein); die Starrkörperseite
+  geht durch `accumulateDeltaVRigidFirst/SecondLaunch`. Netz bei y = 2, Bodenoberkante
+  bei 0, Schranke bei 1,0. **Gemessen: die Kiste fällt DURCH das Netz auf y = 0,2500
+  (tiefster Punkt 0,1796) und kommt dort zur Ruhe, während das Netz unter ihr auf 1,8340
+  einsackt — die Tuchseite rechnet, die Starrkörperseite nicht. Die Guard-Zeile nennt
+  `accumulateDeltaVRigidFirstLaunch` und `accumulateDeltaVRigidSecondLaunch` mit je 1464
+  übersprungenen Starts.**
+* **`particlepush`** — eine PBD-Wolke wird mit 4 m/s seitlich gegen eine 10-kg-Kiste
+  geschossen, die sonst nichts berührt. Wartet zusätzlich auf
+  `ps_solvePCOutputRigidDeltaVTGSLaunch`. Schranke: 0,5 m Weg. **Gemessen:
+  die Kiste bewegt sich um +0,0000 m, während die Wolke um +1,7655 m an ihr vorbeizieht —
+  64 kg Partikel bei 4 m/s bewirken nichts. Guard-Zeile: dieselben zwei Kerne mit je 1080
+  Starts plus `ps_solvePCOutputRigidDeltaVTGSLaunch` mit 1080.**
+* **`articulationjoint`** — die Artikulationsszene mit zwei weiteren Fragen: stimmt
+  der Gelenkwinkel aus `PxArticulationCache` mit dem der Gliedpose überein
+  (`updateBodiesLaunch1T`), und schläft sie ein (`updateBodiesLaunch_Part3`)?
+  **Gemessen: der Cache meldet 0,0000, während das Glied sichtbar bei −π/2 hängt, und der
+  Wachzähler zählt nie herunter. Guard-Zeile: `updateBodiesLaunch1T` und
+  `updateBodiesLaunch_Part3`, je ×240.** Beide Kerne sind seit P9.43 abgebildet, und die
+  Szene ist seit P9.44 gewertet — die Zahlen dort.
+
+Dazu eine Lücke in P9.40 selbst: der Zähler der übersprungenen Starts floss nur im
+Starrkörper-Dispatch ins Verdikt; die vierzehn Verformbaren-Blöcke geben den Kontext
+auf je eigener Zeile frei und blieben außen vor — `--strict` biss also genau bei den
+Szenen nicht, die am meisten überspringen. Jetzt ruft jede der 18 Verdiktstellen
+`unmappedPenalty()`.
 
 ## P9.40 — der Wächter: „grün" sagte etwas über die Prüfung, nicht über die Physik
 
