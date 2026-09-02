@@ -133,6 +133,112 @@ public void computeBasisVectors(float3 dir, out float3 right, out float3 up)
     }
 }
 
+// ===========================================================================
+// P9.46 — the FRICTION MATERIAL path.  Until this tranche getCombinedFriction() was
+// hardcoded to 0 (the CUDA's own null-material branch, which its QUERY pass really does
+// take), so deltaLambdaT collapsed to -0 and every cloth- or softbody-vs-rigid contact in
+// the corpus was frictionless.
+//
+// The three material records are read by BYTE OFFSET rather than through a struct import,
+// so this module keeps its short import list -- exactly as pxgSlangSoftBodySolve does for
+// the deformable materials.  The layouts are compiled facts, not guesses:
+//   PxsMaterialData                   (PxsMaterialCore.h:39)                sizeof 24
+//       dynamicFriction @0 ... flags(u16) | fricCombineMode<<16 | restCombineMode<<24 @16
+//       (mirrored as PxsMaterialDataGpu, pxgSlangNpAbi.slang:116, and decoded the same way
+//        by npCvxFinishContacts / cvxTriFinishBda / npCvxPlaneNphase)
+//   PxsDeformableSurfaceMaterialData  (PxsDeformableSurfaceMaterialCore.h:38)  sizeof 32
+//   PxsDeformableVolumeMaterialData   (PxsDeformableVolumeMaterialCore.h:50)   sizeof 32
+//       both put dynamicFriction at @8, which is why ONE loader serves cloth and softbody.
+// ===========================================================================
+public static const uint64_t RIGID_MAT_STRIDE = 24UL;
+public static const uint64_t RIGID_MAT_dynamicFriction = 0UL;
+public static const uint64_t RIGID_MAT_flagsModes0 = 16UL;
+
+public static const uint64_t FEM_MAT_STRIDE = 32UL;
+public static const uint64_t FEM_MAT_dynamicFriction = 8UL;
+
+// PxCombineMode (PxMaterial.h:127).
+public static const uint COMBINE_AVERAGE = 0u;
+public static const uint COMBINE_MIN = 1u;
+public static const uint COMBINE_MULTIPLY = 2u;
+public static const uint COMBINE_MAX = 3u;
+
+// PxsCombinePxReal (PxsMaterialCombiner.h:53).  The switch has NO default arm inside the
+// cases: an out-of-range mode falls through to `return 0.0f`, and that is reproduced.
+// PxMin / PxMax on float are the INTRINSIC selects (PxUnixMathIntrinsics.h:113/:122),
+// `a < b ? a : b` and `a > b ? a : b` -- not the generic templates, which order their
+// operands the other way round.  P9.44 measured that the two differ for a NaN operand and
+// for (+0, -0), so the ternaries are written out rather than lowered to min()/max().
+public float combineFriction(float val0, float val1, uint combineMode)
+{
+    if (combineMode == COMBINE_AVERAGE)
+        return 0.5f * (val0 + val1);
+    if (combineMode == COMBINE_MIN)
+        return (val0 < val1) ? val0 : val1;
+    if (combineMode == COMBINE_MULTIPLY)
+        return val0 * val1;
+    if (combineMode == COMBINE_MAX)
+        return (val0 > val1) ? val0 : val1;
+    return 0.0f;
+}
+
+public struct RigidFriction
+{
+    public float friction;
+    public uint combineMode;
+}
+
+// FEMCollision::readRigidBody's material half (deformableUtils.cuh:469-478).  The CUDA tests
+// the ELEMENT pointer `&rigidBodyMaterials[index]`, not the base, so the null branch is
+// `base + index * stride == 0` -- reproduced literally.  For the engine the table is always
+// real; for a fixture that passes 0 with material index 0 it is the null branch, which is
+// what every FEM rigid-contact fixture relied on before this tranche.
+public RigidFriction readRigidFriction(uint64_t rigidBodyMaterials, uint materialIndex)
+{
+    const uint64_t elem = rigidBodyMaterials + uint64_t(materialIndex) * RIGID_MAT_STRIDE;
+    RigidFriction r;
+    r.friction = 0.0f;
+    r.combineMode = COMBINE_MAX;      // PxCombineMode::eMAX, the .cu's null default
+    if (elem != 0UL)
+    {
+        r.friction = Ptr<float>(elem + RIGID_MAT_dynamicFriction)[0];
+        r.combineMode = (Ptr<uint>(elem + RIGID_MAT_flagsModes0)[0] >> 16u) & 0xffu;
+    }
+    return r;
+}
+
+// The deformable half: `materials ? materials[index].dynamicFriction : 0.0f`.  Here the
+// CUDA tests the BASE pointer, so this one guards on the base.
+public float femMaterialFriction(uint64_t materials, uint materialIndex)
+{
+    if (materials == 0UL)
+        return 0.0f;
+    return Ptr<float>(materials + uint64_t(materialIndex) * FEM_MAT_STRIDE
+                      + FEM_MAT_dynamicFriction)[0];
+}
+
+// `materials ? materials[indices[element]].dynamicFriction : 0.0f` as ONE call, because the
+// CUDA's ternary SHORT-CIRCUITS: with a null table the index array is never dereferenced
+// either.  Splitting it into two calls made the index read unconditional and segfaulted the
+// softbody fixture, whose mMaterialIndices is null while its material table is.
+public float femMaterialFrictionAt(uint64_t materials, uint64_t materialIndices, uint elementIdx)
+{
+    if (materials == 0UL)
+        return 0.0f;
+    return femMaterialFriction(materials, femMaterialIndexAt(materialIndices, elementIdx));
+}
+
+// mMaterialIndices is a PxU16 array and llvmpipe has no 16-bit storage in these shaders, so
+// the containing 32-bit word is read and the half extracted.  NOTE `& ~uint64_t(3)`:
+// `& ~3UL` MISCOMPILES -- Slang evaluates the complement in 32 bits and clears the top half
+// of the device address (documented at length in softBodySolveBda.slang).
+public uint femMaterialIndexAt(uint64_t base, uint elementIdx)
+{
+    const uint64_t addr = base + uint64_t(elementIdx) * 2UL;
+    const uint word = Ptr<uint>(addr & ~uint64_t(3))[0];
+    return (addr & 2UL) != 0UL ? (word >> 16u) : (word & 0xffffu);
+}
+
 // PxNodeIndex (PxNodeIndex.h:49) packed in the low/high 32 bits of a PxU64.
 public bool nodeIsStaticBody(uint64_t ind) { return uint(ind & 0xffffffffUL) == 0xffffffffu; }
 public uint nodeIndex(uint64_t ind) { return uint(ind & 0xffffffffUL); }
@@ -312,7 +418,8 @@ public ContactResult contactInitialize(uint64_t cBase, uint offset, uint64_t rig
                                 float appliedForceRef, float dt, float3 bcVec,
                                 float3 deformableLinDelta, float deformableInvMass_massSplitting,
                                 uint rigidBodyReferenceCount, bool wasActive, bool checkOnlyActivity,
-                                uint64_t solverCoreDescPtr, uint64_t sharedDescPtr, uint64_t prePrepDescPtr)
+                                uint64_t solverCoreDescPtr, uint64_t sharedDescPtr, uint64_t prePrepDescPtr,
+                                float combinedFriction)
 {
     ContactResult r;
     r.isActive = false;
@@ -418,8 +525,10 @@ public ContactResult contactInitialize(uint64_t cBase, uint offset, uint64_t rig
         const float deltaLambdaT1 = CT1 * invTanDenom1;
 
         const float dLT = sqrt(deltaLambdaT0 * deltaLambdaT0 + deltaLambdaT1 * deltaLambdaT1);
-        // getCombinedFriction() == 0 (null-material path, DEFERRED): deltaLambdaT == -0.
-        const float combinedFriction = 0.0f;
+        // getCombinedFriction() (deformableUtils.cuh:437) is now a PARAMETER -- P9.46.  The
+        // caller combines the rigid and deformable dynamic frictions under the RIGID
+        // material's combine mode, because that is where the CUDA gets both halves.  With a
+        // null material table it is 0, and then deltaLambdaT is exactly -0 as before.
         r.deltaLambdaT = -min(dLT, combinedFriction * abs(r.deltaLambdaN));
     }
 

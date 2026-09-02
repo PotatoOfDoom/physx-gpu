@@ -311,10 +311,15 @@ void cloth_rigidContactPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uin
 // (mDynamicFrictions / materials) is the DEFERRED null-material path.
 // ---------------------------------------------------------------------------
 float3 readClothVertexInvMasses(Ptr<PxgFEMClothGpu> femClothes, uint clothId, uint elementId, float4 bc,
-                                bool countReferenceOnly, out float3 deformableLinDelta)
+                                bool countReferenceOnly, out float3 deformableLinDelta,
+                                uint64_t materials, out float deformableFriction)
 {
     Ptr<float4> clothPosDeltas = Ptr<float4>(femClothes[clothId].mAccumulatedDeltaPos);
     Ptr<float4> clothDeltaPos = Ptr<float4>(femClothes[clothId].mDeltaPos);
+
+    // The CUDA's FEMCollision member default (deformableUtils.cuh:270); the
+    // countReferenceOnly path never assigns it.
+    deformableFriction = 0.0f;
 
     float3 invM;
     float4 clothDelta;
@@ -328,6 +333,13 @@ float3 readClothVertexInvMasses(Ptr<PxgFEMClothGpu> femClothes, uint clothId, ui
         invM = float3(pd0.w, pd1.w, pd2.w);
         if (!countReferenceOnly)
         {
+            // P9.46: a TRIANGLE contact takes its friction from the material table through
+            // the per-triangle index (:513-514); a VERTEX contact takes it from the
+            // per-vertex mDynamicFrictions array instead (:533).  Two different sources for
+            // the same quantity, and only the .cu says which is which.
+            deformableFriction = femMaterialFrictionAt(
+                materials, femClothes[clothId].mMaterialIndices, elementId);
+
             // Mass-splitting by the per-vertex reference counts (mDeltaPos.w).
             const float rc0 = clothDeltaPos[triVertId.x].w;
             const float rc1 = clothDeltaPos[triVertId.y].w;
@@ -341,6 +353,9 @@ float3 readClothVertexInvMasses(Ptr<PxgFEMClothGpu> femClothes, uint clothId, ui
         invM = float3(clothDelta.w, 0.0f, 0.0f);
         if (!countReferenceOnly)
         {
+            if (materials != 0UL)
+                deformableFriction = Ptr<float>(femClothes[clothId].mDynamicFrictions)[elementId];
+
             const float rc = clothDeltaPos[elementId].w;
             invM = float3(invM.x * rc, 0.0f, 0.0f);
         }
@@ -408,8 +423,10 @@ void queryRigidClothContactReferenceCount(bool isTGS, uint idx, uint blockX)
             const float3 bcVec = (bc.w == 0.0f) ? float3(bc.x, bc.y, bc.z) : float3(1.0f, 0.0f, 0.0f);
 
             float3 deformableLinDelta;
+            float queryFriction;   // unused: the query never reads a material table
             const float3 deformableInvMasses = readClothVertexInvMasses(femClothes, clothId, elementId, bc,
-                                                                        /*countReferenceOnly*/ true, deformableLinDelta);
+                                                                        /*countReferenceOnly*/ true, deformableLinDelta,
+                                                                        /*materials*/ 0UL, queryFriction);
 
             bool isActive = false;
             if (wasActive)
@@ -427,7 +444,14 @@ void queryRigidClothContactReferenceCount(bool isTGS, uint idx, uint blockX)
                                                            appliedForces[workIndex], dt, bcVec,
                                                            deformableLinDelta, massSplit,
                                                            /*rigidRefCount*/ 1u, wasActive, /*checkOnly*/ true,
-                                                           gQuery.solverCoreDesc, gQuery.sharedDesc, gQuery.prePrepDesc);
+                                                           gQuery.solverCoreDesc, gQuery.sharedDesc, gQuery.prePrepDesc,
+                                                           // The QUERY pass passes NULL for BOTH material tables
+                                                           // (FEMClothExternalSolve.cu:362 readRigidBody(...,NULL,NULL)
+                                                           // and readCloth(...,NULL,checkOnly)), so the combined
+                                                           // friction is combineFriction(0, 0, eMAX) == 0.  It could
+                                                           // not matter anyway: checkOnlyActivity returns before the
+                                                           // tangent block.
+                                                           /*combinedFriction*/ 0.0f);
                 isActive = cr.isActive;
                 if (isActive)
                 {
@@ -562,8 +586,18 @@ void solveRigidClothContact(bool isTGS, uint idx, uint blockX)
                     rigidBodyReferenceCount = Ptr<uint>(gSolve.rigidBodyReferenceCounts)[globalRigidBodyId];
 
                 float3 deformableLinDelta;
+                float clothFriction;
                 const float3 deformableInvMasses = readClothVertexInvMasses(femClothes, clothId, elementId, bc,
-                                                                            /*countReferenceOnly*/ false, deformableLinDelta);
+                                                                            /*countReferenceOnly*/ false, deformableLinDelta,
+                                                                            gSolve.materials, clothFriction);
+
+                // P9.46: getCombinedFriction() = PxsCombinePxReal(rigidFriction, clothFriction,
+                // the RIGID material's fricCombineMode).  The rigid material index is the low
+                // 31 bits of the contact info word the query ORs its in-collision flag into
+                // (PxgFEMCore.h:160), so it must be masked, not read raw.
+                const RigidFriction rf = readRigidFriction(gSolve.rigidBodyMaterials,
+                                                           rigidMatInd & ~CI_COLLISION_FLAG);
+                const float combinedFriction = combineFriction(rf.friction, clothFriction, rf.combineMode);
 
                 const float3 bcSq = float3(bcVec.x * bcVec.x, bcVec.y * bcVec.y, bcVec.z * bcVec.z);
                 const float massSplit = dotVec(bcSq, deformableInvMasses);
@@ -571,7 +605,8 @@ void solveRigidClothContact(bool isTGS, uint idx, uint blockX)
                                                            appliedForces[workIndex], dt, bcVec,
                                                            deformableLinDelta, massSplit,
                                                            rigidBodyReferenceCount, isActive, /*checkOnly*/ false,
-                                                           gSolve.solverCoreDesc, gSolve.sharedDesc, gSolve.prePrepDesc);
+                                                           gSolve.solverCoreDesc, gSolve.sharedDesc, gSolve.prePrepDesc,
+                                                           combinedFriction);
 
                 // computeFEMChange: deltaPos = -(deltaLambdaN*normal + deltaLambdaT*tangent)*dt.
                 const float3 deltaPos = float3(

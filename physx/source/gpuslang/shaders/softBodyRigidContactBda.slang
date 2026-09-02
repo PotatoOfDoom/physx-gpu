@@ -291,10 +291,14 @@ void sb_rigidContactPrepareLaunch(uint3 groupThreadId : SV_GroupThreadID, uint3 
 // linear delta.  countReferenceOnly mirrors CUDA's checkOnlyActivity: on that path the
 // reference-count multiply is SKIPPED, because the counts are still being accumulated.
 float4 readSoftBodyInvMasses(Ptr<PxgSoftBodyGpu> softbodies, uint softBodyId, uint tetId,
-                             float4 bc, bool countReferenceOnly, out float3 deformableLinDelta)
+                             float4 bc, bool countReferenceOnly, out float3 deformableLinDelta,
+                             uint64_t materials, out float deformableFriction)
 {
     Ptr<float4> posDeltas = Ptr<float4>(softbodies[softBodyId].mSimDeltaPos);
     const uint4 tetId4 = Ptr<uint4>(softbodies[softBodyId].mSimTetIndices)[tetId];
+
+    // The CUDA's FEMCollision member default (deformableUtils.cuh:270).
+    deformableFriction = 0.0f;
 
     const float4 pd0 = posDeltas[tetId4.x];
     const float4 pd1 = posDeltas[tetId4.y];
@@ -307,6 +311,12 @@ float4 readSoftBodyInvMasses(Ptr<PxgSoftBodyGpu> softbodies, uint softBodyId, ui
     float4 invM = float4(pd0.w, pd1.w, pd2.w, pd3.w);
     if (!countReferenceOnly)
     {
+        // P9.46: unlike the cloth there is ONE friction source -- the per-tet material index
+        // into the volume material table (deformableUtils.cuh:604).  The volume and surface
+        // records both put dynamicFriction at @8 with stride 32, so the same loader serves.
+        deformableFriction = femMaterialFrictionAt(
+            materials, softbodies[softBodyId].mMaterialIndices, tetId);
+
         // Mass-splitting by the per-vertex reference counts (mSimDelta.w).
         Ptr<float4> simDelta = Ptr<float4>(softbodies[softBodyId].mSimDelta);
         invM = float4(invM.x * simDelta[tetId4.x].w, invM.y * simDelta[tetId4.y].w,
@@ -426,9 +436,11 @@ void queryRigidSoftContactReferenceCount(bool isTGS, uint idx, uint blockX)
             const int globalRigidBodyId = getGlobalRigidBodyId(rigidId, gSbQuery.prePrepDesc, numSolverBodies);
 
             float3 deformableLinDelta;
+            float queryFriction;   // unused: the query never reads a material table
             const float4 deformableInvMasses =
                 readSoftBodyInvMasses(softbodies, softBodyId, tetId, bc,
-                                      /*countReferenceOnly*/ true, deformableLinDelta);
+                                      /*countReferenceOnly*/ true, deformableLinDelta,
+                                      /*materials*/ 0UL, queryFriction);
 
             bool isActive;
             if (wasActive)
@@ -445,7 +457,10 @@ void queryRigidSoftContactReferenceCount(bool isTGS, uint idx, uint blockX)
                                       gSbQuery.dt, bcVec, deformableLinDelta,
                                       tetMassSplit(bc, deformableInvMasses),
                                       /*rigidRefCount*/ 1u, wasActive, /*checkOnly*/ true,
-                                      gSbQuery.solverCoreDesc, gSbQuery.sharedDesc, gSbQuery.prePrepDesc);
+                                      gSbQuery.solverCoreDesc, gSbQuery.sharedDesc, gSbQuery.prePrepDesc,
+                                      // NULL material tables on the query path (softBody.cu:1895),
+                                      // and checkOnlyActivity returns before the tangent block.
+                                      /*combinedFriction*/ 0.0f);
                 isActive = cr.isActive;
                 if (isActive)
                     Ptr<uint>(ciBase + CI_rigidMatInd)[0] = rigidMatInd | CI_COLLISION_FLAG;
@@ -547,9 +562,19 @@ void solveRigidSoftContact(bool isTGS, uint idx, uint blockX)
                     rigidBodyReferenceCount = Ptr<uint>(gSbSolve.rigidBodyReferenceCounts)[globalRigidBodyId];
 
                 float3 deformableLinDelta;
+                float softBodyFriction;
                 const float4 deformableInvMasses =
                     readSoftBodyInvMasses(softbodies, softBodyId, tetId, bc,
-                                          /*countReferenceOnly*/ false, deformableLinDelta);
+                                          /*countReferenceOnly*/ false, deformableLinDelta,
+                                          gSbSolve.materials, softBodyFriction);
+
+                // P9.46: the same combine as the cloth side, under the RIGID material's mode.
+                // The rigid material index is the low 31 bits of the contact info word the
+                // query ORs its in-collision flag into (PxgFEMCore.h:160).
+                const RigidFriction rf = readRigidFriction(gSbSolve.rigidBodyMaterials,
+                                                           rigidMatInd & ~CI_COLLISION_FLAG);
+                const float combinedFriction = combineFriction(rf.friction, softBodyFriction,
+                                                               rf.combineMode);
 
                 const float3 bcVec = float3(bc.x, bc.y, bc.z);
                 const ContactResult cr =
@@ -557,7 +582,8 @@ void solveRigidSoftContact(bool isTGS, uint idx, uint blockX)
                                       gSbSolve.dt, bcVec, deformableLinDelta,
                                       tetMassSplit(bc, deformableInvMasses),
                                       rigidBodyReferenceCount, isActive, /*checkOnly*/ false,
-                                      gSbSolve.solverCoreDesc, gSbSolve.sharedDesc, gSbSolve.prePrepDesc);
+                                      gSbSolve.solverCoreDesc, gSbSolve.sharedDesc, gSbSolve.prePrepDesc,
+                                      combinedFriction);
 
                 // computeFEMChange: deltaPos = -(deltaLambdaN*normal + deltaLambdaT*tangent)*dt.
                 const float3 deltaPos = float3(
