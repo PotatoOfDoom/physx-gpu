@@ -1774,6 +1774,152 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.46 — die Reibung, die zurückgestellt war: zwei Materialtabellen, zwei Quellen und ein Klemmglied, das jeden Fehler verschluckt
+
+**Ergebnis:** kein neuer Manifesteintrag — die Reibung liegt INNERHALB bereits abgebildeter
+Kerne, das Manifest bleibt bei **395/501**. Suite **844/844 in beiden Speichermodi** (Modus 1
+im ersten Anlauf, 265 s; Modus 2 im zweiten, 265 s — der erste fiel auf dem bekannten
+`gpuslang.femClothSim`-Segfault der llvmpipe-JIT aus, der isoliert dreimal hintereinander
+grün lief). Szenen **36/36 ok, 0 fail, 0 missing**, null `unmapped`-Zeilen. Keine neuen
+Testfälle, sondern vier verbreiterte — und **33 Mutanten in drei Fegedurchgängen, 30
+getötet, drei Überlebende mit Beweis**. Der Ertrag ist ein neuer blinder Fleck, der nichts mit Zeigern und alles mit einem
+Minimum zu tun hat.
+
+### Was zurückgestellt war
+
+`FEMCollision::getCombinedFriction()` (deformableUtils.cuh:437-440) ist eine Zeile:
+`PxsCombinePxReal(rigidBodyFriction, deformableFriction, frictionCombineMode)`. Beide
+Löser — Tuch wie Weichkörper — trugen `materials` und `rigidBodyMaterials` ungelesen im
+Push-Block mit sich herum und setzten die kombinierte Reibung auf 0. Das Klemmglied
+`deltaLambdaT = -PxMin(deltaLambdaT, getCombinedFriction() * PxAbs(deltaLambdaN))`
+(deformableUtils.cuh:410) kollabierte damit immer auf `-0`: jeder Kontakt war reibungsfrei,
+und weil `-0` gegen eine Referenz verglichen wurde, die ebenfalls `-0` lieferte, blieb der
+Vergleich grün.
+
+### Was der Port jetzt liest
+
+Drei ABI-Tatsachen, alle aus den Kopfdateien gelesen, nicht geraten:
+
+* `PxsMaterialData` (PxsMaterialCore.h) ist **24 Byte** groß, `dynamicFriction` liegt bei
+  **@0**, und `fricCombineMode` ist ein Bitfeld: `(word@16 >> 16) & 0xFF`.
+* `PxsDeformableSurfaceMaterialData` und `PxsDeformableVolumeMaterialData` sind **beide
+  32 Byte** groß mit `dynamicFriction` bei **@8** — derselbe Lader bedient beide.
+* Der Starrkörper-Materialindex sind die unteren 31 Bit des Kontaktinfo-Worts, in dessen
+  Bit 31 der Abfragedurchgang sein `isInCollision` schreibt: `getRigidMaterialIndex()` ist
+  `rigidMatInd & 0x7fffffff` (PxgFEMCore.h:160). Ungemaskt gelesen ergibt das einen Index
+  von über zwei Milliarden — der Mutant, der die Maske wegnimmt, stürzt ab.
+
+Der Null-Fall ist feiner, als er aussieht. Die .cu übergibt
+`&rigidBodyMaterials[contactInfo.getRigidMaterialIndex()]`, also ist der Zeiger, den
+`readRigidBody` gegen NULL prüft, genau dann null, wenn die Tabelle null **und** der Index 0
+ist. Der Port wacht deshalb über `base + index * stride`, nicht über `base`. Bei NULL sind
+Reibung 0 und Modus `PxCombineMode::eMAX` — nicht `eAVERAGE`, was sich anders verhält,
+sobald die verformbare Hälfte ungleich null ist.
+
+### Das Tuch hat ZWEI Reibungsquellen
+
+`readCloth` (deformableUtils.cuh:488) holt die verformbare Reibung aus zwei verschiedenen
+Feldern, je nach Kontaktart:
+
+* DREIECK: `materials[cloth.mMaterialIndices[triangleId]].dynamicFriction` (:513-514) — über
+  ein `PxU16`-Feld, das der Port halbwortweise adressieren muss.
+* KNOTEN: `cloth.mDynamicFrictions[elementId]` (:533) — ein ganz anderes Feld, das mit der
+  Materialtabelle nichts zu tun hat.
+
+Beide Zweige hängen trotzdem am selben Wächter `materials ? ... : 0.0f`. Beim Knotenzweig
+ist das leicht zu übersehen, weil der gelesene Puffer gar nicht aus diesem Zeiger stammt —
+und genau dieser Wächter ist es, den der Mutant `G3` angreift. Der Weichkörper hat nur
+eine Quelle (den Materialindex pro Tetraeder, deformableUtils.cuh:604), aber dieselbe
+Kombination und dieselbe Maskierung.
+
+Ein Detail, das beim ersten Bauen sofort zuschlug: `materials ? materials[indices[e]] : 0`
+ist eine KURZSCHLUSS-Auswertung. Die erste Fassung des Ports zerlegte sie in zwei Aufrufe,
+womit die Indexdereferenzierung unbedingt wurde — und die Weichkörper-Vorrichtung stürzte
+mit einem Segfault ab, bevor irgendein Mutant je lief. `femMaterialFrictionAt()` hält den
+Kurzschluss jetzt in EINER Funktion zusammen.
+
+### Der neue blinde Fleck: ein Minimum, das den Fehler verschluckt
+
+`deltaLambdaT = -min(dLT, μ · |dλN|)`. Wo der rohe Tangentialbetrag `dLT` der kleinere der
+beiden Terme ist, erreicht **μ die Ausgabe überhaupt nicht** — die Materialtabelle wird
+gelesen, das Ergebnis wird berechnet, und dann wirft das Minimum es weg. Eine Vorrichtung,
+die nur `deltaLambdaT != 0` prüft, kann das nicht sehen.
+
+Das ist keine Vermutung, sondern eine Messung. Die erste Fassung der Vorrichtung setzte
+Tuchreibungen von 0,25 und 0,85 auf die beiden Dreiecksbahnen — beide groß genug, dass das
+Klemmglied nie band: Bahn 8 hatte `dLT` = 0,0484 gegen eine Schranke von 0,258, Bahn 9
+0,0437 gegen 1,00. Ergebnis: **alle zehn Mutanten der Materialpfade überlebten**, obwohl der
+Port sie ausführte. Erst nachdem die Reibungen so umgestellt wurden, dass die Schranke
+kleiner als der Rohbetrag ist (0,05 und 0,03 auf der Dreiecksseite), starben sie.
+
+Damit das nicht zurückfallen kann, tragen beide Vorrichtungen jetzt ein **dauerhaftes
+Gebiss**: `InitResult` führt `frictionBound`, `dLTraw` und `dLTlimit` mit, und die Prüfung
+verlangt, dass das Klemmglied auf beiden Kontaktarten wirklich bindet — mindestens zwei
+Dreiecks- und drei Knotenbahnen. Wer die Reibungen später umsetzt, sieht sofort rot statt
+still grün.
+
+### Vier verbreiterte Vorrichtungen
+
+`femClothSimRigidContactDynamic{PGS,TGS}` wuchs von 10 auf **11 Bahnen** und drei
+Löserdurchgänge:
+
+* Bahn 6 liest ein fünftes Starrkörpermaterial mit **`fricCombineMode = 7`** — außerhalb des
+  gültigen Bereichs. `PxsCombinePxReal` fällt dort auf `return 0.0f` durch, und die Prüfung
+  verlangt exakt 0. Der Mutant, der stattdessen `val0` zurückgibt, stirbt daran.
+* Bahn 10 ist ein **trennender** Kontakt (positive Durchdringung, Bit 31 vorgesetzt) mit
+  einem bereits aufgelaufenen Lambda von 0,75, das nach der Vorbereitung wieder in
+  `rigidLambdaNs` geschrieben wird — genau der Zustand, in dem der Löser ab seiner zweiten
+  Iteration steht. Nur dort wird `dλN` negativ, und nur dort ist das `PxAbs` im Klemmglied
+  überhaupt beobachtbar. Ihre Reaktion zeigt ENTGEGENGESETZT zu allen anderen Bahnen, und
+  dieser Vorzeichenwechsel wird geprüft statt ausgenommen.
+* Ein **zweiter Löserdurchgang** läuft mit `rigidBodyMaterials = 0` bei Materialindex 0 —
+  der einzige Zustand, in dem der eMAX-Vorgabemodus die Ausgabe erreicht, weil die
+  Tuchreibung über `mDynamicFrictions` weiterlebt.
+* Ein **dritter** nullt zusätzlich die verformbare Tabelle. Der Dreiecksindex wird für
+  diesen Durchgang auf 65535 vergiftet: bei null Tabelle liest die .cu ihn nie, ein Port
+  ohne Wächter dagegen bei `0 + 65535 · 32 + 8`.
+
+Die Weichkörperseite deckt ihre vier Kombinationsmodi über fünf Bahnen ab, und dort bindet
+das Klemmglied auf **5 von 5** — die kombinierten Reibungen sind 0,0475 / 0,03 / 0,0135 /
+0,045 / 0,04, alle klein genug, dass die Schranke der kleinere Term ist.
+
+### Fegedurchgänge
+
+| Durchgang | Ziel | Mutanten | getötet | überlebt |
+|---|---|---|---|---|
+| `sweep46a` | die Leser und die Kombination im gemeinsamen Modul | 23 | 22 | `F20` |
+| `sweep46b` | die Tuch-Anbindung (zwei Quellen, Maske, Reihenfolge) | 5 | 4 | `G5` |
+| `sweep46c` | die Weichkörper-Anbindung | 5 | 4 | `H3` |
+
+Alle drei Überlebenden sind bewiesen, nicht entschuldigt:
+
+* **`F20-fem-null-guard-dropped`** gehört zur bekannten Klasse „toter Lesezugriff, dessen
+  einzige Beobachtbarkeit ein Fault ist" (wie `T23`/`M13`). Ohne den Wächter liest der
+  Mutant bei `0 + index · 32 + 8`; llvmpipe liefert dort 0 zurück statt zu faulten, also
+  ist das Ergebnis identisch. Direkt nachgemessen, auch mit dem vergifteten Index bei rund
+  2 MB — auch der faultet nicht. Der Wächter selbst ist gegen die .cu geprüft; dass
+  `F16` mit `materials + 8` sehr wohl abstürzt, zeigt, dass die Fege den Fault sieht, wenn
+  es einen gibt.
+* **`G5`/`H3-combine-operands-swapped`** vertauschen die beiden Reibungen im Aufruf von
+  `PxsCombinePxReal`. Alle vier gültigen Arme — `eAVERAGE`, `eMIN`, `eMULTIPLY`, `eMAX` —
+  sind **symmetrische Funktionen**, und der Durchfall gibt eine Konstante zurück. Die
+  Reihenfolge ist damit nachweislich unbeobachtbar; das ist eine Eigenschaft des Operators,
+  keine Lücke der Vorrichtung.
+
+Nebenbei hat der Fegedurchgang zwei ältere Mutanten aus P9.45 mit erledigt: `M5` und `M6`
+(die Reibungsterme `raXt` in `computeRigidChange`) überlebten dort, weil die Reibung noch
+null war, und sterben jetzt, ohne dass an ihrem Fegeskript etwas geändert wurde — `sweep45a`
+steht damit bei **13 von 14** statt bei 11. `sweep45b` bleibt unverändert bei 10/11 (Tuch)
+und 8/9 (Weichkörper); die beiden Überlebenden `C2`/`S2` sind die bekannte Klasse „der
+statische Wächter ist redundant, weil `mWorldSolverBodyData.invMass` dort 0 ist".
+
+### Was zurückgestellt bleibt
+
+Nur noch der ARTIKULATIONS-Zweig. `computeRigidChange` lässt für eine Artikulation den
+Referenzzähler weg (deformableUtils.cuh:423), und der Port trägt diesen Zweig ausgeschrieben
+mit; was fehlt, ist die Ankerseite in `prepareFEMContacts`. Reibung und Reaktion sind es
+nicht mehr.
+
 ## P9.45 — die Reaktion, die ein Tuch einen Starrkörper halten lässt, und eine Division, die der P9.36-Prüfer nicht sehen konnte
 
 **Ergebnis:** kein neuer Manifesteintrag — die Reaktion liegt INNERHALB bereits abgebildeter
