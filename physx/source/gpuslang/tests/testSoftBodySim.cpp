@@ -4116,10 +4116,21 @@ struct SolveRefFull
     bool isActive; float deltaLambdaN; float deltaLambdaT;
     V3 normal, tangent, raXn, raXt; float accum;
 };
+// PxsCombinePxReal (PxsMaterialCombiner.h:53), transcribed independently of the cloth
+// fixture's copy.  PxMin/PxMax are the intrinsic selects, not the generic templates.
+static float refCombineFriction(float val0, float val1, uint32_t mode)
+{
+    if (mode == 0u) return 0.5f * (val0 + val1);            // eAVERAGE
+    if (mode == 1u) return (val0 < val1) ? val0 : val1;     // eMIN
+    if (mode == 2u) return val0 * val1;                     // eMULTIPLY
+    if (mode == 3u) return (val0 > val1) ? val0 : val1;     // eMAX
+    return 0.0f;
+}
+
 static SolveRefFull refSolveFull(const SbRigidConstraintHost& c, int slot, bool isTGS,
                                  float appliedForceRef, float dt, V3 deformableLinDelta,
                                  float massSplit, float rigidRefCount, bool wasActive,
-                                 bool checkOnly, SbRigidVel rv)
+                                 bool checkOnly, SbRigidVel rv, float combinedFriction)
 {
     SolveRefFull r;
     r.isActive = false; r.deltaLambdaN = 0.0f; r.deltaLambdaT = 0.0f;
@@ -4195,7 +4206,6 @@ static SolveRefFull refSolveFull(const SbRigidConstraintHost& c, int slot, bool 
         const float dLT0 = CT0 * invT0;
         const float dLT1 = CT1 * invT1;
         const float dLT = std::sqrt(dLT0 * dLT0 + dLT1 * dLT1);
-        const float combinedFriction = 0.0f;   // null-material path (DEFERRED)
         const float lim = combinedFriction * ((dLN < 0.f) ? -dLN : dLN);
         r.deltaLambdaT = -((dLT < lim) ? dLT : lim);
     }
@@ -4995,7 +5005,11 @@ static void runSbRigidContactDynamic(bool isTGS)
         { -0.0004f, 0.0062f, 0.0017f, invMass }, { 0.0023f, -0.0051f, 0.0088f, invMass },
     };
     std::vector<F4> simDelta(4, F4{ 0.0f, 0.0f, 0.0f, 0.0f });
-    std::vector<TetIdx4> simTets = { { 0u, 1u, 2u, 3u }, { 0u, 0u, 0u, 0u } };
+    // TWO tets over the SAME four vertices.  That keeps the mass-split and the vertex
+    // accumulation identical for every lane while letting a lane name tet 1 -- an ODD
+    // element index, so its PxU16 material index sits in the HIGH half of the containing
+    // 32-bit word and femMaterialIndexAt's halving is under test.
+    std::vector<TetIdx4> simTets = { { 0u, 1u, 2u, 3u }, { 0u, 1u, 2u, 3u } };
     DevBuf bSimDeltaPos = makeDev(dev, simDeltaPos), bSimDelta = makeDev(dev, simDelta);
     DevBuf bTets = makeDev(dev, simTets);
     if (!bSimDeltaPos.addr) { std::printf("  NOTE: no BDA -> skip\n"); return; }
@@ -5019,9 +5033,59 @@ static void runSbRigidContactDynamic(bool isTGS)
     const int globalIdOf[5] = { 1, 1, -1, 2, int(numSolverBodies) + 1 };
     const float invMassOf[3] = { 0.0f, rigidInvMass, 0.0f };
 
+    // P9.46 -- MATERIALS.
+    // Rigid table: four PxsMaterialData records (24 B), one per PxCombineMode, so every arm
+    // of PxsCombinePxReal runs.  dynamicFriction @0; the packed word @16 carries
+    // flags | fricCombineMode<<16 | restCombineMode<<24, and ONLY bits 16..23 may be read --
+    // the other three bytes carry decoys, so a shader that took the whole word or the wrong
+    // byte lands on an out-of-range mode and PxsCombinePxReal's fall-through 0.
+    const float rigidMatFriction[4] = { 0.30f, 0.80f, 0.50f, 0.20f };
+    const uint32_t rigidMatMode[4] = { 0u, 1u, 2u, 3u };   // eAVERAGE, eMIN, eMULTIPLY, eMAX
+    std::vector<uint32_t> rigidMats(4u * 6u, 0u);
+    for (uint32_t m = 0; m < 4u; ++m)
+    {
+        uint32_t* w = &rigidMats[m * 6u];
+        std::memcpy(&w[0], &rigidMatFriction[m], 4);       // dynamicFriction @0
+        w[1] = 0x7f7f7f7fu; w[2] = 0x7f7f7f7fu; w[3] = 0x7f7f7f7fu;  // static/rest/damping decoys
+        w[4] = 0xBEEFu | (rigidMatMode[m] << 16) | (0xA5u << 24);    // flags | fric<<16 | rest<<24
+        w[5] = 0x000000C3u;                                          // dampingCombineMode decoy
+    }
+    DevBuf bRigidMats = makeDev(dev, rigidMats);
+
+    // Volume table: four PxsDeformableVolumeMaterialData records (32 B), dynamicFriction @8.
+    // Slot 0 is a DECOY with friction 0 -- an index read that ignored mMaterialIndices and
+    // took slot 0 would silently produce a frictionless contact and nothing else would say so.
+    const float sbMatFriction[4] = { 0.00f, 0.60f, 0.15f, 0.90f };
+    std::vector<float> sbMats(4u * 8u, 0.0f);
+    for (uint32_t m = 0; m < 4u; ++m)
+    {
+        sbMats[m * 8u + 0u] = 1.0e6f;                 // youngs
+        sbMats[m * 8u + 1u] = 0.45f;                  // poissons  (the neighbouring field)
+        sbMats[m * 8u + 2u] = sbMatFriction[m];       // dynamicFriction @8
+    }
+    DevBuf bSbMats = makeDev(dev, sbMats);
+
+    // mMaterialIndices is a PxU16 array indexed by TET: tet 0 -> material 1 (low half of
+    // word 0), tet 1 -> material 3 (HIGH half of word 0).
+    const uint16_t sbMatIdx[2] = { 1u, 3u };
+    std::vector<uint32_t> sbMatIdxWords(1u, uint32_t(sbMatIdx[0]) | (uint32_t(sbMatIdx[1]) << 16));
+    DevBuf bSbMatIdx = makeDev(dev, sbMatIdxWords);
+    descArr[0].mMaterialIndices = reinterpret_cast<decltype(descArr[0].mMaterialIndices)>(size_t(bSbMatIdx.addr));
+    dev->upload(bDesc.h, descArr.data(), descArr.size() * sizeof(PxgSoftBody));
+
+    // Lane 1 names tet 1, so a REACTING lane exercises the odd PxU16 half; lane 4 does too,
+    // so it is not only the deferred articulation path that would.
+    const uint32_t tetOf[5] = { 0u, 1u, 0u, 0u, 1u };
+    const uint32_t rigidMatOf[5] = { 0u, 1u, 2u, 3u, 0u };   // one lane per combine mode
+
     std::vector<FemOtherContactInfoHost> infos(kN);
     std::memset(infos.data(), 0, infos.size() * sizeof(FemOtherContactInfoHost));
-    for (uint32_t i = 0; i < kN; ++i) { infos[i].pairInd0 = nodeInds[i]; infos[i].pairInd1 = 0u; }
+    for (uint32_t i = 0; i < kN; ++i)
+    {
+        infos[i].pairInd0 = nodeInds[i];
+        infos[i].pairInd1 = tetOf[i];
+        infos[i].rigidMatInd = rigidMatOf[i];   // bits 0..30; bit 31 is isInCollision
+    }
     DevBuf bInfos = makeDev(dev, infos);
     std::vector<uint32_t> numContacts = { kN };
     DevBuf bNum = makeDev(dev, numContacts);
@@ -5168,7 +5232,8 @@ static void runSbRigidContactDynamic(bool isTGS)
         const p82dref::SolveRefFull qr =
             p82dref::refSolveFull(blk, int(i), isTGS, /*appliedForceRef*/ 0.0f, dt, linDelta,
                                   massSplitQ, /*rigidRefCount*/ 1.0f, /*wasActive*/ false,
-                                  /*checkOnly*/ true, rigidVelOf(bodyOf[i]));
+                                  /*checkOnly*/ true, rigidVelOf(bodyOf[i]),
+                                  /*combinedFriction*/ 0.0f);
         PXG_CHECK_MSG(qr.isActive, "query CPU ref: lane %u must be active (seeded data)", i);
         if (!qr.isActive) continue;
         if (globalIdOf[i] != -1 && invMassOf[bodyOf[i]] != 0.0f)
@@ -5200,7 +5265,7 @@ static void runSbRigidContactDynamic(bool isTGS)
     sp.solverCoreDesc = bSolverCoreDesc.addr; sp.artiCoreDesc = 0ull;
     sp.sharedDesc = bSharedDesc.addr; sp.rigidDeltaVel = bRigidDeltaVel.addr;
     sp.appliedForces = bForces.addr; sp.rigidBodyReferenceCounts = bRefCounts.addr;
-    sp.dt = dt; sp.materials = 0ull; sp.rigidBodyMaterials = 0ull;
+    sp.dt = dt; sp.materials = bSbMats.addr; sp.rigidBodyMaterials = bRigidMats.addr;
     Kernel("softBodyRigidContactBda.spv",
            isTGS ? "sb_solveRigidSoftCollisionLaunchTGS" : "sb_solveRigidSoftCollisionLaunch",
            {}, sizeof(SbSolvePush)).dispatch(1u, {}, sp, 1u, 1u);
@@ -5218,15 +5283,24 @@ static void runSbRigidContactDynamic(bool isTGS)
     p82dref::V3 expectDelta[4] = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } };
     std::vector<F4> refRigid(2u * kN);
     uint32_t reacting = 0u, silent = 0u;
+    uint32_t frictionLanes = 0u, modeSeen[4] = { 0u, 0u, 0u, 0u };
+    std::vector<float> laneFriction(kN, 0.0f);
     for (uint32_t i = 0; i < kN; ++i)
     {
         const uint32_t b = bodyOf[i];
         const float rigidRefCount =
             (globalIdOf[i] != -1 && invMassOf[b] != 0.0f) ? float(refRefCounts[size_t(globalIdOf[i])]) : 1.0f;
+        // P9.46: getCombinedFriction() = PxsCombinePxReal(rigid, softbody, the RIGID
+        // material's mode).  The softbody friction comes from the per-TET material index.
+        const float sbFriction = sbMatFriction[sbMatIdx[tetOf[i]]];
+        const float combinedFriction = p82dref::refCombineFriction(
+            rigidMatFriction[rigidMatOf[i]], sbFriction, rigidMatMode[rigidMatOf[i]]);
+        laneFriction[i] = combinedFriction;
+        ++modeSeen[rigidMatMode[rigidMatOf[i]]];
         const p82dref::SolveRefFull sr =
             p82dref::refSolveFull(blk, int(i), isTGS, /*appliedForceRef*/ 0.0f, dt, linDelta,
                                   massSplit, rigidRefCount, /*wasActive*/ true, /*checkOnly*/ false,
-                                  rigidVelOf(b));
+                                  rigidVelOf(b), combinedFriction);
         const p82dref::V3 dPos = {
             -(sr.deltaLambdaN * sr.normal.x + sr.deltaLambdaT * sr.tangent.x) * dt,
             -(sr.deltaLambdaN * sr.normal.y + sr.deltaLambdaT * sr.tangent.y) * dt,
@@ -5252,8 +5326,35 @@ static void runSbRigidContactDynamic(bool isTGS)
         {
             ++silent;
         }
+        if (sr.deltaLambdaT != 0.0f)
+            ++frictionLanes;
         refRigid[i] = { dLin.x, dLin.y, dLin.z, count };
         refRigid[i + kN] = { dAng.x, dAng.y, dAng.z, 0.0f };
+    }
+
+    // P9.46 TEETH.  Without these the whole material path could be silently inert again:
+    // deltaLambdaT is exactly -0 whenever the combined friction is 0, and a comparison
+    // against a reference that ALSO produced -0 is green either way.
+    PXG_CHECK_MSG(frictionLanes == kN,
+                  "every lane must produce a non-zero tangent impulse, got %u of %u",
+                  frictionLanes, kN);
+    for (uint32_t m = 0; m < 4u; ++m)
+        PXG_CHECK_MSG(modeSeen[m] > 0u, "PxCombineMode %u is never exercised", m);
+    {
+        // Distinct per lane, so a combine that ignored one operand, or returned a constant,
+        // cannot match: eAVERAGE 0.45, eMIN 0.80, eMULTIPLY 0.30, eMAX 0.60, eAVERAGE 0.60.
+        uint32_t distinct = 0u;
+        for (uint32_t a = 0; a < kN; ++a)
+        {
+            bool dup = false;
+            for (uint32_t b2 = 0; b2 < a; ++b2) if (laneFriction[b2] == laneFriction[a]) dup = true;
+            if (!dup) ++distinct;
+        }
+        PXG_CHECK_MSG(distinct >= 4u, "the seeded frictions must take at least 4 distinct "
+                                      "values across the lanes, got %u", distinct);
+        std::printf("  friction per lane: %.4g %.4g %.4g %.4g %.4g\n",
+                    laneFriction[0], laneFriction[1], laneFriction[2], laneFriction[3],
+                    laneFriction[4]);
     }
     PXG_CHECK_MSG(reacting == 2u && silent == 3u,
                   "coverage: expected 2 reacting and 3 silent lanes, got %u / %u", reacting, silent);
@@ -5316,6 +5417,7 @@ static void runSbRigidContactDynamic(bool isTGS)
     dev->destroyBuffer(bVelPool.h); dev->destroyBuffer(bPrepDesc.h);
     dev->destroyBuffer(bPrePrepDesc.h); dev->destroyBuffer(bSolverCoreDesc.h);
     dev->destroyBuffer(bSharedDesc.h);
+    dev->destroyBuffer(bRigidMats.h); dev->destroyBuffer(bSbMats.h); dev->destroyBuffer(bSbMatIdx.h);
 }
 
 PXG_TEST(softBodySimRigidContactDynamicPGS) { runSbRigidContactDynamic(/*isTGS*/ false); }

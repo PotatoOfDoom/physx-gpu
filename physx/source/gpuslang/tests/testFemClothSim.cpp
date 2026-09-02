@@ -3713,10 +3713,21 @@ static void refPrepare(RigidContactConstraintHost& c, int slot,
 struct RefRigidVel { V3 linVel{ 0, 0, 0 }, angVel{ 0, 0, 0 }, linDelta{ 0, 0, 0 }, angDelta{ 0, 0, 0 }; };
 struct InitResult { bool isActive; float deltaLambdaN; float deltaLambdaT; V3 normal; V3 tangent;
                     V3 raXn; V3 raXt; float accum; };
+// PxsCombinePxReal (PxsMaterialCombiner.h:53).  PxMin/PxMax are the intrinsic selects
+// (PxUnixMathIntrinsics.h:113/:122), not the generic templates.
+static float refCombineFriction(float val0, float val1, uint32_t mode)
+{
+    if (mode == 0u) return 0.5f * (val0 + val1);            // eAVERAGE
+    if (mode == 1u) return (val0 < val1) ? val0 : val1;     // eMIN
+    if (mode == 2u) return val0 * val1;                     // eMULTIPLY
+    if (mode == 3u) return (val0 > val1) ? val0 : val1;     // eMAX
+    return 0.0f;
+}
+
 static InitResult refInitialize(const RigidContactConstraintHost& c, int slot, bool isTGS,
                                 float appliedForceRef, float dt, V3 bcVec, V3 deformableLinDelta,
                                 V3 deformableInvMasses, float rigidRefCount, bool wasActive, bool checkOnly,
-                                RefRigidVel rv = RefRigidVel{})
+                                RefRigidVel rv = RefRigidVel{}, float combinedFriction = 0.0f)
 {
     InitResult r;
     r.isActive = false; r.deltaLambdaN = 0.0f; r.deltaLambdaT = 0.0f;
@@ -3801,7 +3812,6 @@ static InitResult refInitialize(const RigidContactConstraintHost& c, int slot, b
         const float dLT0 = CT0 * invT0;
         const float dLT1 = CT1 * invT1;
         const float dLT = std::sqrt(dLT0 * dLT0 + dLT1 * dLT1);
-        const float combinedFriction = 0.0f;   // null-material path (DEFERRED)
         r.deltaLambdaT = -rmin(dLT, combinedFriction * rabs(r.deltaLambdaN));
     }
     return r;
@@ -4161,15 +4171,19 @@ static void runRigidContactDynamic(bool isTGS)
     PxgSlangComputeDevice* dev = testDevice();
     const float dt = 1.0f / 60.0f;
 
-    const uint32_t N = 8u;
+    const uint32_t N = 10u;         // 8 VERTEX contacts + 2 TRIANGLE contacts
+    const uint32_t NV = 14u;        // 8 for the vertex lanes + 3 + 3 for the two triangles
     const uint32_t numSolverBodies = 3u;
     const uint32_t accOffset = 0u;
     const float rigidInvMass = 0.25f;
 
-    // ---- six cloth vertices, one per contact -----------------------------
+    // ---- cloth vertices.  Lanes 0..7 own vertices 0..7 one-to-one; triangle lane 8 owns
+    // vertices 8,9,10 and lane 9 owns 11,12,13.  DISJOINT on purpose: every vertex then has
+    // exactly one writer, so the scattered deltas stay bit-exactly comparable instead of
+    // needing the tolerance an atomically-shared vertex would force.
     const float invMass = 0.5f;
-    std::vector<F4> positions(N), velocities(N), accumDelta(N), deltaPos(N);
-    for (uint32_t i = 0; i < N; ++i)
+    std::vector<F4> positions(NV), velocities(NV), accumDelta(NV), deltaPos(NV);
+    for (uint32_t i = 0; i < NV; ++i)
     {
         const float f = float(i);
         positions[i] = { 0.5f + 0.11f * f, -0.02f - 0.003f * f, 0.7f - 0.07f * f, invMass };
@@ -4177,13 +4191,31 @@ static void runRigidContactDynamic(bool isTGS)
         accumDelta[i] = { 0.0010f + 0.0004f * f, -0.0020f + 0.0003f * f, 0.0015f - 0.0002f * f, invMass };
         deltaPos[i] = { 0.0f, 0.0f, 0.0f, 0.0f };
     }
-    std::vector<uint32_t> triVtx(4u * N, 0u);   // unused (vertex contacts)
+    // Two triangles, as uint4 rows (the fourth component is unread).
+    const uint32_t triVerts[2][3] = { { 8u, 9u, 10u }, { 11u, 12u, 13u } };
+    std::vector<uint32_t> triVtx(8u, 0u);
+    for (uint32_t t = 0; t < 2u; ++t)
+        for (uint32_t k = 0; k < 3u; ++k) triVtx[t * 4u + k] = triVerts[t][k];
+
+    // P9.46: the per-vertex friction array a VERTEX contact reads (PxgFEMCloth.h:87).  A
+    // cloth has TWO friction sources and only the .cu says which applies: a TRIANGLE contact
+    // goes through mMaterialIndices into the surface material table, a VERTEX contact reads
+    // this array directly (deformableUtils.cuh:514 vs :533).  Every lane here is a vertex
+    // contact, so this is the live source; the table below still has to exist, because the
+    // read is gated on `materials != NULL` rather than on this pointer.
+    std::vector<float> clothVertFriction(NV);
+    for (uint32_t i = 0; i < NV; ++i)
+        clothVertFriction[i] = 0.10f + 0.07f * float(i);   // all distinct
+    // The triangle lanes' vertices carry POISON: a TRIANGLE contact must take its friction
+    // from the material table, never from this array.
+    for (uint32_t v = 8u; v < NV; ++v) clothVertFriction[v] = -7.5f;
 
     DevBuf bPos = makeDev(dev, positions);
     DevBuf bVel = makeDev(dev, velocities);
     DevBuf bAcc = makeDev(dev, accumDelta);
     DevBuf bDelta = makeDev(dev, deltaPos);
     DevBuf bTri = makeDev(dev, triVtx);
+    DevBuf bClothFric = makeDev(dev, clothVertFriction);
 
     const float penBiasClampFEM = -1.0e10f;
     PxgFEMCloth c = makeZeroDesc();
@@ -4192,10 +4224,58 @@ static void runRigidContactDynamic(bool isTGS)
     c.mAccumulatedDeltaPos = reinterpret_cast<decltype(c.mAccumulatedDeltaPos)>(size_t(bAcc.addr));
     c.mDeltaPos = reinterpret_cast<decltype(c.mDeltaPos)>(size_t(bDelta.addr));
     c.mTriangleVertexIndices = reinterpret_cast<decltype(c.mTriangleVertexIndices)>(size_t(bTri.addr));
+    c.mDynamicFrictions = reinterpret_cast<decltype(c.mDynamicFrictions)>(size_t(bClothFric.addr));
     c.mPenBiasClamp = penBiasClampFEM;
-    c.mNbVerts = N;
+    c.mNbVerts = NV;
     std::vector<PxgFEMCloth> descArr = { c };
     DevBuf bDesc = makeDev(dev, descArr);
+
+    // P9.46 -- MATERIALS.
+    // Rigid table: four PxsMaterialData records (24 B), one per PxCombineMode, so every arm
+    // of PxsCombinePxReal runs.  dynamicFriction @0; the packed word @16 is
+    // flags | fricCombineMode<<16 | restCombineMode<<24, and ONLY bits 16..23 may be read --
+    // the other bytes carry decoys, so a shader that took the whole word or the wrong byte
+    // lands on an out-of-range mode and PxsCombinePxReal's fall-through 0.
+    const float rigidMatFriction[4] = { 0.30f, 0.80f, 0.50f, 0.20f };
+    const uint32_t rigidMatMode[4] = { 0u, 1u, 2u, 3u };   // eAVERAGE, eMIN, eMULTIPLY, eMAX
+    std::vector<uint32_t> rigidMats(4u * 6u, 0u);
+    for (uint32_t m = 0; m < 4u; ++m)
+    {
+        uint32_t* w = &rigidMats[m * 6u];
+        std::memcpy(&w[0], &rigidMatFriction[m], 4);
+        w[1] = 0x7f7f7f7fu; w[2] = 0x7f7f7f7fu; w[3] = 0x7f7f7f7fu;
+        w[4] = 0xBEEFu | (rigidMatMode[m] << 16) | (0xA5u << 24);
+        w[5] = 0x000000C3u;
+    }
+    DevBuf bRigidMats = makeDev(dev, rigidMats);
+
+    // Surface table: PxsDeformableSurfaceMaterialData, 32 B, dynamicFriction @8.  Slot 0 is
+    // a DECOY with friction 0 -- an index read that ignored mMaterialIndices and took slot 0
+    // would silently produce a frictionless triangle contact and nothing else would say so.
+    const float clothMatFriction[4] = { 0.00f, 0.65f, 0.25f, 0.85f };
+    std::vector<float> clothMats(4u * 8u, 0.0f);
+    for (uint32_t m = 0; m < 4u; ++m)
+    {
+        clothMats[m * 8u + 0u] = 1.0e6f;                 // youngs
+        clothMats[m * 8u + 1u] = 0.45f;                  // poissons (the neighbouring field)
+        clothMats[m * 8u + 2u] = clothMatFriction[m];    // dynamicFriction @8
+    }
+    DevBuf bClothMats = makeDev(dev, clothMats);
+
+    // mMaterialIndices is a PxU16 array indexed by TRIANGLE: tri 0 -> material 2 (low half
+    // of word 0), tri 1 -> material 3 (HIGH half), so femMaterialIndexAt's halving is under
+    // test as well as the table read.
+    const uint16_t clothMatIdx[2] = { 2u, 3u };
+    std::vector<uint32_t> clothMatIdxWords(1u, uint32_t(clothMatIdx[0]) | (uint32_t(clothMatIdx[1]) << 16));
+    DevBuf bClothMatIdx = makeDev(dev, clothMatIdxWords);
+    descArr[0].mMaterialIndices = reinterpret_cast<decltype(descArr[0].mMaterialIndices)>(size_t(bClothMatIdx.addr));
+    dev->upload(bDesc.h, descArr.data(), descArr.size() * sizeof(PxgFEMCloth));
+
+    const uint32_t rigidMatOf[10] = { 0u, 1u, 2u, 3u, 0u, 1u, 2u, 3u, 0u, 3u }; // every mode
+    // Which cloth element each lane names, and whether it is a TRIANGLE contact.
+    const uint32_t elemOf[10] = { 0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 0u, 1u };
+    const bool isTriOf[10] = { false, false, false, false, false,
+                               false, false, false, true, true };
 
     // ---- the six rigid ids, and which solver body each resolves to -------
     const uint64_t staticNodeInd = 0x00000000FFFFFFFFull;
@@ -4204,16 +4284,17 @@ static void runRigidContactDynamic(bool isTGS)
     const uint64_t artiNodeInd = (1ull << 32) | 5ull;    // articulation bit SET
     // Lanes 6 and 7 are dynamic as well; they exist for computeBasisVectors' SECOND branch
     // (see the normal table below), and being dynamic gives them reaction coverage too.
-    const uint64_t nodeInds[8] = { dynNodeInd, dynNodeInd, dynNodeInd,
-                                   staticNodeInd, kinNodeInd, artiNodeInd,
-                                   dynNodeInd, dynNodeInd };
+    const uint64_t nodeInds[10] = { dynNodeInd, dynNodeInd, dynNodeInd,
+                                    staticNodeInd, kinNodeInd, artiNodeInd,
+                                    dynNodeInd, dynNodeInd,
+                                    dynNodeInd, dynNodeInd };   // the two TRIANGLE lanes
     // solverBodyIndices[nodeIndex]: node 3 -> body 1 (dynamic), node 4 -> body 2 (kinematic),
     // node 5 -> body 1 as well, so the articulation lane carries a NON-ZERO invMass and only
     // the articulation test can stop its reaction.
     std::vector<uint32_t> solverBodyIndices = { 0u, 0u, 0u, 1u, 2u, 1u };
-    const uint32_t bodyOf[8] = { 1u, 1u, 1u, 0u, 2u, 1u, 1u, 1u };   // static reads slot 0
+    const uint32_t bodyOf[10] = { 1u, 1u, 1u, 0u, 2u, 1u, 1u, 1u, 1u, 1u };  // static reads slot 0
     // getGlobalRigidBodyId: -1 static, solverBodyIdx rigid, numSolverBodies+idx articulation.
-    const int globalIdOf[8] = { 1, 1, 1, -1, 2, int(numSolverBodies) + 1, 1, 1 };
+    const int globalIdOf[10] = { 1, 1, 1, -1, 2, int(numSolverBodies) + 1, 1, 1, 1, 1 };
     DevBuf bSolverBodyIndices = makeDev(dev, solverBodyIndices);
 
     // ---- contact geometry: a distinct tilted normal per lane -------------
@@ -4227,7 +4308,7 @@ static void runRigidContactDynamic(bool isTGS)
     // un-renormalised so that |y| is exactly the literal.  Without 6 and 7 the second
     // normalisation and the comparison operator are both unreachable, and mutants of each
     // survived the first sweep.
-    p714ref::V3 planeNormals[8];
+    p714ref::V3 planeNormals[10];
     for (uint32_t i = 0; i < N; ++i)
     {
         // Lane 6's exact digits matter: the second branch normalises up = (0, dir.z, -dir.y),
@@ -4248,10 +4329,15 @@ static void runRigidContactDynamic(bool isTGS)
         // position delta into the error term at invDt, so a shallow penetration flips to
         // inactive there while staying active under PGS.
         normalPens[i] = { planeNormals[i].x, planeNormals[i].y, planeNormals[i].z, -0.05f - 0.004f * float(i) };
-        barycentrics[i] = { 0.0f, 0.0f, 0.0f, 1.0f };   // vertex (bc.w != 0)
+        // A TRIANGLE contact is bc.w == 0 and carries three real weights; a VERTEX contact
+        // is bc.w != 0 and only bc.x is used (as 1.0).  The two take DIFFERENT friction
+        // sources, which is the whole reason lanes 8 and 9 exist.
+        barycentrics[i] = isTriOf[i]
+                        ? (i == 8u ? F4{ 0.5f, 0.3f, 0.2f, 0.0f } : F4{ 0.25f, 0.6f, 0.15f, 0.0f })
+                        : F4{ 0.0f, 0.0f, 0.0f, 1.0f };
         infos[i].pairInd0 = nodeInds[i];
-        infos[i].pairInd1 = i;                       // (clothId 0 << 20) | elemIdx i
-        infos[i].rigidMatInd_isInCollision = 0u;
+        infos[i].pairInd1 = elemOf[i];               // (clothId 0 << 20) | element index
+        infos[i].rigidMatInd_isInCollision = rigidMatOf[i];   // bits 0..30; bit 31 = isInCollision
     }
 
     DevBuf bContacts = makeDev(dev, contacts);
@@ -4366,6 +4452,36 @@ static void runRigidContactDynamic(bool isTGS)
     pokePtr(sharedDesc, 160, bSolverBodyVelPool.addr);
     DevBuf bSharedDesc = makeDev(dev, sharedDesc);
 
+    // ---- per-lane element shape.  A VERTEX lane owns one cloth vertex and blends nothing;
+    // a TRIANGLE lane owns three and blends them by the barycentric.  readCloth and the
+    // prepare kernel both branch on bc.w, so the reference has to as well.
+    auto laneVerts = [&](uint32_t i, uint32_t out[3]) -> uint32_t {
+        if (!isTriOf[i]) { out[0] = elemOf[i]; return 1u; }
+        for (uint32_t k = 0; k < 3u; ++k) out[k] = triVerts[elemOf[i]][k];
+        return 3u;
+    };
+    auto laneBcVec = [&](uint32_t i) {
+        return isTriOf[i] ? p714ref::V3{ barycentrics[i].x, barycentrics[i].y, barycentrics[i].z }
+                          : p714ref::V3{ 1.0f, 0.0f, 0.0f };
+    };
+    // The accumulated delta the prepare and the solve both use: the blend for a triangle
+    // (femClothRigidContactBda.slang:288), the vertex's own row otherwise.
+    auto laneAccum = [&](uint32_t i) {
+        if (!isTriOf[i])
+            return p714ref::V3{ accumDelta[elemOf[i]].x, accumDelta[elemOf[i]].y, accumDelta[elemOf[i]].z };
+        const F4 bc = barycentrics[i];
+        const uint32_t* tv = triVerts[elemOf[i]];
+        return p714ref::V3{
+            accumDelta[tv[0]].x * bc.x + accumDelta[tv[1]].x * bc.y + accumDelta[tv[2]].x * bc.z,
+            accumDelta[tv[0]].y * bc.x + accumDelta[tv[1]].y * bc.y + accumDelta[tv[2]].y * bc.z,
+            accumDelta[tv[0]].z * bc.x + accumDelta[tv[1]].z * bc.y + accumDelta[tv[2]].z * bc.z };
+    };
+    // The cloth half of getCombinedFriction: the material table through mMaterialIndices for
+    // a triangle, the per-vertex array for a vertex (deformableUtils.cuh:514 vs :533).
+    auto laneClothFriction = [&](uint32_t i) {
+        return isTriOf[i] ? clothMatFriction[clothMatIdx[elemOf[i]]] : clothVertFriction[elemOf[i]];
+    };
+
     // ======================= dispatch PREPARE ==========================
     struct PrepPush
     {
@@ -4398,7 +4514,7 @@ static void runRigidContactDynamic(bool isTGS)
                                      body2World[2u * b + 1u].z };
         p714ref::refPrepare(refC, int(i), solverNormal,
                             p714ref::V3{ positions[i].x, positions[i].y, positions[i].z },
-                            pen, p714ref::V3{ accumDelta[i].x, accumDelta[i].y, accumDelta[i].z },
+                            pen, laneAccum(i),
                             barycentrics[i], frameP, invMassOf[b], penBiasClampRigid,
                             sqrtInvOf[b], penBiasClampFEM, /*isStatic*/ nodeInds[i] == staticNodeInd);
     }
@@ -4452,39 +4568,48 @@ static void runRigidContactDynamic(bool isTGS)
     dev->flush();
 
     // ---- CPU reference for the query ----
-    const p714ref::V3 bcVec = { 1.0f, 0.0f, 0.0f };
     std::vector<uint32_t> refRefCounts(refCounts.size(), 0u);
-    std::vector<float> refDeltaW(N, 0.0f);
+    std::vector<float> refVertW(NV, 0.0f);        // per-VERTEX mDeltaPos.w after the query
     for (uint32_t i = 0; i < N; ++i)
     {
-        const p714ref::V3 accumV = { accumDelta[i].x, accumDelta[i].y, accumDelta[i].z };
+        // countReferenceOnly: readCloth returns the RAW inverse masses, without the
+        // reference-count multiply the solve applies.
+        const p714ref::V3 invMq = isTriOf[i] ? p714ref::V3{ invMass, invMass, invMass }
+                                             : p714ref::V3{ invMass, 0.0f, 0.0f };
         const p714ref::InitResult qir =
-            p714ref::refInitialize(refC, int(i), isTGS, /*appliedForceRef*/ 0.0f, dt, bcVec, accumV,
-                                   p714ref::V3{ invMass, 0, 0 }, /*rigidRefCount*/ 1.0f,
-                                   /*wasActive*/ false, /*checkOnly*/ true, rigidVelOf(bodyOf[i]));
+            p714ref::refInitialize(refC, int(i), isTGS, /*appliedForceRef*/ 0.0f, dt, laneBcVec(i),
+                                   laneAccum(i), invMq, /*rigidRefCount*/ 1.0f,
+                                   /*wasActive*/ false, /*checkOnly*/ true, rigidVelOf(bodyOf[i]),
+                                   /*combinedFriction*/ 0.0f);
         // Faithful to the .cu: everything below hangs off isActive.  The assertion is a
         // COVERAGE claim about the seeded data, not a step of the reference -- if it ever
         // fires, the data drifted, and the comparison stays honest either way.
         PXG_CHECK_MSG(qir.isActive, "query CPU ref: lane %u must be active (seeded data)", i);
         if (!qir.isActive)
             continue;
-        refDeltaW[i] = 1.0f;                    // invMass != 0
+        // The vertex bumps: a triangle bumps each of its three, gated on bc.k > 1e-3.
+        uint32_t vs[3];
+        const uint32_t nv = laneVerts(i, vs);
+        const float bcArr[3] = { barycentrics[i].x, barycentrics[i].y, barycentrics[i].z };
+        for (uint32_t k = 0; k < nv; ++k)
+            if (!isTriOf[i] || bcArr[k] > 1e-3f)
+                refVertW[vs[k]] += 1.0f;
         if (globalIdOf[i] != -1 && invMassOf[bodyOf[i]] != 0.0f)
             refRefCounts[size_t(globalIdOf[i])] += 1u;
     }
 
-    const auto gDeltaQ = downloadBuffer<F4>(dev, bDelta.h, N);
+    const auto gDeltaQ = downloadBuffer<F4>(dev, bDelta.h, NV);
     const auto gRefCountsQ = downloadBuffer<uint32_t>(dev, bRefCounts.h, uint32_t(refCounts.size()));
-    for (uint32_t i = 0; i < N; ++i)
-        if (f2u(gDeltaQ[i].w) != f2u(refDeltaW[i]))
-        { ++mm; std::printf("  query lane %u mDeltaPos.w MM: ref %g got %g\n", i, refDeltaW[i], gDeltaQ[i].w); }
+    for (uint32_t v = 0; v < NV; ++v)
+        if (f2u(gDeltaQ[v].w) != f2u(refVertW[v]))
+        { ++mm; std::printf("  query vertex %u mDeltaPos.w MM: ref %g got %g\n", v, refVertW[v], gDeltaQ[v].w); }
     for (size_t k = 0; k < refRefCounts.size(); ++k)
         if (gRefCountsQ[k] != refRefCounts[k])
         { ++mm; std::printf("  query refCounts[%zu] MM: ref %u got %u\n", k, refRefCounts[k], gRefCountsQ[k]); }
 
-    // teeth: five contacts share solver body 1, so its count must be 5 -- with 1 a dropped
+    // teeth: seven contacts share solver body 1, so its count must be 7 -- with 1 a dropped
     // reference-count multiply in computeRigidChange would be invisible.
-    PXG_CHECK_MSG(gRefCountsQ[1] == 5u, "the five dynamic contacts must bump body 1 to 5 (got %u)",
+    PXG_CHECK_MSG(gRefCountsQ[1] == 7u, "the seven dynamic contacts must bump body 1 to 7 (got %u)",
                   gRefCountsQ[1]);
     PXG_CHECK_MSG(gRefCountsQ[2] == 0u, "the KINEMATIC body must not be counted (got %u)", gRefCountsQ[2]);
     PXG_CHECK_MSG(gRefCountsQ[numSolverBodies + 1u] == 1u,
@@ -4506,7 +4631,7 @@ static void runRigidContactDynamic(bool isTGS)
     sp.numContacts = bNum.addr; sp.prePrepDesc = bPrePrepDesc.addr; sp.solverCoreDesc = bSolverCoreDesc.addr;
     sp.artiCoreDesc = 0ull; sp.sharedDesc = bSharedDesc.addr; sp.rigidDeltaVel = bRigidDeltaVel.addr;
     sp.appliedForces = bLambda.addr; sp.rigidBodyReferenceCounts = bRefCounts.addr; sp.dt = dt;
-    sp.materials = 0ull; sp.rigidBodyMaterials = 0ull;
+    sp.materials = bClothMats.addr; sp.rigidBodyMaterials = bRigidMats.addr;
 
     const char* solveEntry = isTGS ? "cloth_solveRigidClothCollisionTGSLaunch"
                                    : "cloth_solveRigidClothCollisionLaunch";
@@ -4515,29 +4640,62 @@ static void runRigidContactDynamic(bool isTGS)
     dev->flush();
 
     // ---- CPU reference for the solve ----
-    std::vector<F4> refDeltaAfterSolve(N), refRigidDeltaVel(2u * N);
+    std::vector<p714ref::V3> refVertDelta(NV, p714ref::V3{ 0.0f, 0.0f, 0.0f });
+    std::vector<F4> refRigidDeltaVel(2u * N);
     std::vector<float> refAccum(N);
     std::vector<bool> reactsOf(N, false);
     uint32_t dynamicLanes = 0u, zeroLanes = 0u;
+    uint32_t frictionLanes = 0u, modeSeen[4] = { 0u, 0u, 0u, 0u };
+    std::vector<float> laneFriction(N, 0.0f);
     for (uint32_t i = 0; i < N; ++i)
     {
         const uint32_t b = bodyOf[i];
         // readRigidBody: the count is read back only for a non-static, finite-mass body.
         const float rigidRefCount =
             (globalIdOf[i] != -1 && invMassOf[b] != 0.0f) ? float(refRefCounts[size_t(globalIdOf[i])]) : 1.0f;
-        const p714ref::V3 accumV = { accumDelta[i].x, accumDelta[i].y, accumDelta[i].z };
-        const p714ref::V3 deformableInvMasses = { invMass * refDeltaW[i], 0.0f, 0.0f };
+        // readCloth's mass split: each of the lane's vertices carries invMass times ITS OWN
+        // reference count.
+        uint32_t vs[3];
+        const uint32_t nv = laneVerts(i, vs);
+        p714ref::V3 deformableInvMasses = { 0.0f, 0.0f, 0.0f };
+        {
+            float im[3] = { 0.0f, 0.0f, 0.0f };
+            for (uint32_t k = 0; k < nv; ++k) im[k] = invMass * refVertW[vs[k]];
+            deformableInvMasses = { im[0], im[1], im[2] };
+        }
+        // P9.46: getCombinedFriction() = PxsCombinePxReal(rigid, cloth, the RIGID material's
+        // mode).  The cloth half comes from a DIFFERENT source per contact kind, which is
+        // what lanes 8 and 9 are here to prove.
+        const float combinedFriction = p714ref::refCombineFriction(
+            rigidMatFriction[rigidMatOf[i]], laneClothFriction(i), rigidMatMode[rigidMatOf[i]]);
+        laneFriction[i] = combinedFriction;
+        ++modeSeen[rigidMatMode[rigidMatOf[i]]];
         const p714ref::InitResult sir =
-            p714ref::refInitialize(refC, int(i), isTGS, /*appliedForceRef*/ 0.0f, dt, bcVec, accumV,
-                                   deformableInvMasses, rigidRefCount, /*wasActive*/ true,
-                                   /*checkOnly*/ false, rigidVelOf(b));
+            p714ref::refInitialize(refC, int(i), isTGS, /*appliedForceRef*/ 0.0f, dt, laneBcVec(i),
+                                   laneAccum(i), deformableInvMasses, rigidRefCount,
+                                   /*wasActive*/ true, /*checkOnly*/ false, rigidVelOf(b),
+                                   combinedFriction);
+        if (sir.deltaLambdaT != 0.0f)
+            ++frictionLanes;
         const p714ref::V3 deltaPosR = {
             -(sir.deltaLambdaN * sir.normal.x + sir.deltaLambdaT * sir.tangent.x) * dt,
             -(sir.deltaLambdaN * sir.normal.y + sir.deltaLambdaT * sir.tangent.y) * dt,
             -(sir.deltaLambdaN * sir.normal.z + sir.deltaLambdaT * sir.tangent.z) * dt };
-        const float sScale = deformableInvMasses.x;
-        refDeltaAfterSolve[i] = { deltaPosR.x * sScale, deltaPosR.y * sScale, deltaPosR.z * sScale,
-                                  refDeltaW[i] };
+        // writeCloth: a vertex contact scales by its own inverse mass, a triangle contact by
+        // invM[k] * bc[k] per vertex, each guarded on invM[k] > 0.
+        {
+            const float imArr[3] = { deformableInvMasses.x, deformableInvMasses.y, deformableInvMasses.z };
+            const float bcArr[3] = { barycentrics[i].x, barycentrics[i].y, barycentrics[i].z };
+            for (uint32_t k = 0; k < nv; ++k)
+            {
+                if (!(imArr[k] > 0.0f))
+                    continue;
+                const float sc = isTriOf[i] ? (imArr[k] * bcArr[k]) : imArr[k];
+                refVertDelta[vs[k]].x += deltaPosR.x * sc;
+                refVertDelta[vs[k]].y += deltaPosR.y * sc;
+                refVertDelta[vs[k]].z += deltaPosR.z * sc;
+            }
+        }
         refAccum[i] = sir.accum;
 
         // The .cu's guard, plus this port's articulation extension.
@@ -4560,10 +4718,42 @@ static void runRigidContactDynamic(bool isTGS)
         refRigidDeltaVel[i] = { dLin.x, dLin.y, dLin.z, count };
         refRigidDeltaVel[i + N] = { dAng.x, dAng.y, dAng.z, 0.0f };
     }
-    PXG_CHECK_MSG(dynamicLanes == 5u && zeroLanes == 3u,
-                  "coverage: expected 5 reacting and 3 silent lanes, got %u / %u", dynamicLanes, zeroLanes);
+    PXG_CHECK_MSG(dynamicLanes == 7u && zeroLanes == 3u,
+                  "coverage: expected 7 reacting and 3 silent lanes, got %u / %u", dynamicLanes, zeroLanes);
 
-    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, N);
+    // P9.46 TEETH.  Without these the material path could be silently inert again:
+    // deltaLambdaT is exactly -0 whenever the combined friction is 0, and a comparison
+    // against a reference that ALSO produced -0 stays green either way.
+    PXG_CHECK_MSG(frictionLanes == N,
+                  "every lane must produce a non-zero tangent impulse, got %u of %u",
+                  frictionLanes, N);
+    for (uint32_t m = 0; m < 4u; ++m)
+        PXG_CHECK_MSG(modeSeen[m] > 0u, "PxCombineMode %u is never exercised", m);
+    {
+        uint32_t distinct = 0u;
+        for (uint32_t a = 0; a < N; ++a)
+        {
+            bool dup = false;
+            for (uint32_t b2 = 0; b2 < a; ++b2) if (laneFriction[b2] == laneFriction[a]) dup = true;
+            if (!dup) ++distinct;
+        }
+        PXG_CHECK_MSG(distinct >= 6u, "the seeded frictions must take at least 6 distinct "
+                                      "values across the lanes, got %u", distinct);
+        // BOTH cloth friction sources must be reached.  A triangle lane's vertices carry
+        // -7.5 in mDynamicFrictions, so a port that read the per-vertex array for a triangle
+        // contact would produce a NEGATIVE combined friction and this comparison would go
+        // red -- but only if a triangle lane exists at all, which is what this pins.
+        uint32_t triLanes = 0u, vertLanes = 0u;
+        for (uint32_t a = 0; a < N; ++a) { if (isTriOf[a]) ++triLanes; else ++vertLanes; }
+        PXG_CHECK_MSG(triLanes >= 2u && vertLanes >= 6u,
+                      "coverage: %u TRIANGLE and %u VERTEX lanes -- both friction sources "
+                      "must be live", triLanes, vertLanes);
+        std::printf("  friction per lane:");
+        for (uint32_t a = 0; a < N; ++a) std::printf(" %.4g", laneFriction[a]);
+        std::printf("\n");
+    }
+
+    const auto gDelta = downloadBuffer<F4>(dev, bDelta.h, NV);
     const auto gLambda2 = downloadBuffer<float>(dev, bLambda.h, N);
     const auto gRigidDeltaVel = downloadBuffer<F4>(dev, bRigidDeltaVel.h, 2u * N);
 
@@ -4573,9 +4763,13 @@ static void runRigidContactDynamic(bool isTGS)
         { ++mm2; std::printf("  solve %s[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm, k,
                              r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
     };
+    // Per VERTEX, because the two triangle lanes each scatter onto three of them.  Every
+    // vertex still has exactly ONE writing lane, so this stays bit-exact.
+    for (uint32_t v = 0; v < NV; ++v)
+        cmpRow("mDeltaPos", v,
+               F4{ refVertDelta[v].x, refVertDelta[v].y, refVertDelta[v].z, refVertW[v] }, gDelta[v]);
     for (uint32_t i = 0; i < N; ++i)
     {
-        cmpRow("mDeltaPos", i, refDeltaAfterSolve[i], gDelta[i]);
         cmpRow("rigidDeltaVel", i, refRigidDeltaVel[i], gRigidDeltaVel[i]);
         cmpRow("rigidDeltaVel", i + N, refRigidDeltaVel[i + N], gRigidDeltaVel[i + N]);
         if (f2u(gLambda2[i]) != f2u(refAccum[i]))
@@ -4641,6 +4835,7 @@ static void runRigidContactDynamic(bool isTGS)
     dev->destroyBuffer(bSolverBodyIndices.h);
     dev->destroyBuffer(bPrepDesc.h); dev->destroyBuffer(bPrePrepDesc.h);
     dev->destroyBuffer(bSolverCoreDesc.h); dev->destroyBuffer(bSharedDesc.h);
+    dev->destroyBuffer(bClothFric.h); dev->destroyBuffer(bRigidMats.h); dev->destroyBuffer(bClothMats.h);
 }
 
 PXG_TEST(femClothSimRigidContactDynamicPGS) { runRigidContactDynamic(/*isTGS*/ false); }
