@@ -193,6 +193,13 @@ static const uint32_t NB_ARTI = 3u, MAX_LINKS = 4u, ARTI_OFFSET = NB_ARTI * MAX_
 static const uint32_t ARTI_NODE_BASE = 100u, NUM_NODES = ARTI_NODE_BASE + NB_ARTI;
 static const float SENTINEL_F = 777.0f;
 
+// Lane 18 is the adhesion probe: 18 % 7 == 4 makes it a dynamic rigid, and node 18
+// resolves to solver body 19, which no other lane uses, so putting that body at rest
+// costs the other lanes nothing.  Particle 1 of system 0 has phase group 1, the group
+// the phase->material table points at the material carrying adhesion.
+static const uint32_t ADHESION_LANE = 18u;
+static const uint32_t ADHESION_PARTICLE = 1u;
+
 enum LaneKind { LK_STATIC, LK_KINEMATIC, LK_ARTI, LK_RIGID };
 static LaneKind laneKind(uint32_t k)
 {
@@ -287,6 +294,36 @@ static Scene buildScene(Rng& rng)
     for (F4& v : S.artiVel) { const V3 a = rng.vec(-1.5f, 1.5f); v = F4{ a.x, a.y, a.z, rng.uni(-1.0f, 1.0f) }; }
     S.appliedForces.resize(N_CONTACTS);
     for (F2& f : S.appliedForces) f = F2{ rng.uni(0.0f, 0.5f), rng.uni(0.0f, 0.1f) };
+
+    // THE ADHESION PROBE.  The adhesion clamp multiplies by PxMax(0, separation), so
+    // it is inert for a penetrating contact -- which is every contact above, since
+    // their errors are mostly negative and the rigid bodies move.  The first sweep of
+    // this module left the PGS adhesion branch standing for exactly that reason.  Lane
+    // ADHESION_LANE is therefore pinned: a separation of +0.02 (a gap well inside the
+    // material's adhesion radius of restOffset*scale - restOffset = 0.05), a particle
+    // whose phase group selects the material that HAS adhesion, zero running deltaP,
+    // no applied force yet, and a rigid body at rest -- so normalVel and normalDelta
+    // vanish and the clamp is the only thing that can move deltaF off zero.
+    {
+        const uint32_t k = ADHESION_LANE;
+        const uint32_t block = k / 32u, lane = k & 31u;
+        const size_t base = size_t(block) * CB_STRIDE;
+        F4 ne; std::memcpy(&ne, S.cb.data() + base + CB_NORMAL_ERR + lane * 16, 16);
+        ne.w = 0.02f;                                    // separation (delta is zeroed below)
+        putF4(S.cb, base + CB_NORMAL_ERR + lane * 16, ne);
+        S.particleSys[k] = 0u;
+        S.particleIdx[k] = ADHESION_PARTICLE;
+        putU64(S.cb, base + CB_PARTICLEID + lane * 8, uint64_t(ADHESION_PARTICLE));
+        S.deltaP[0][ADHESION_PARTICLE] = F4{ 0.0f, 0.0f, 0.0f, 1.5f };
+        S.appliedForces[k] = F2{ 0.0f, 0.0f };
+        // the body this lane's node resolves to is put at rest, in both pools
+        const uint32_t sbi = S.solverBodyIndices[uint32_t(S.rigidIds[k] & 0xffffffffull)];
+        S.initialVel[sbi] = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
+        S.initialVel[sbi + N_BODIES] = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
+        S.pool[ACC + sbi] = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
+        S.pool[ACC + sbi + N_BODIES] = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
+        S.pool[ACC + sbi + 2u * N_BODIES] = F4{ 0.0f, 0.0f, 0.0f, 0.0f };
+    }
     return S;
 }
 
@@ -514,6 +551,14 @@ PXG_TEST(psContactSolveRigid_lanes)
         PXG_CHECK_MSG(skipped == 10u && zeroed == 10u, "lane kinds: %u skipped, %u zeroed (expected 10/10)", skipped, zeroed);
         PXG_CHECK_MSG(reacting >= 30u, "only %u lanes react", reacting);
         PXG_CHECK_MSG(artiLanes >= 15u, "only %u articulation lanes", artiLanes);
+        // The adhesion probe must actually pull: with the clamp disabled its deltaF
+        // is zero and the whole reaction (weight included) collapses to zero.
+        const F4 probe = gDeltaVel[ADHESION_LANE];
+        std::printf("    adhesion probe lane %u: lin(%.9g,%.9g,%.9g) weight %.9g\n",
+                    ADHESION_LANE, probe.x, probe.y, probe.z, probe.w);
+        PXG_CHECK_MSG(probe.w != 0.0f && (probe.x != 0.0f || probe.y != 0.0f || probe.z != 0.0f),
+                      "the adhesion probe produced no reaction (weight %.9g) -- the clamp is inert, "
+                      "so the adhesion branch is untested", probe.w);
     }
 }
 
