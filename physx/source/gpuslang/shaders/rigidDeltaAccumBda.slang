@@ -408,19 +408,32 @@ void rdaScanBlockCarries(uint tid, Ptr<float4> blockDeltaV, Ptr<uint64_t> blockR
 // ids so that gsRigidId[tid] is the id of the NEXT contact (sentinel past the end),
 // which makes `rigidId != gsRigidId[tid]` "last contact of its run".  Returns the
 // lane's id (sentinel when the lane is past the end).
+// Both reads are CLAMPED and the guard applied to the VALUE, not the address
+// (countAt, npRigidSumBatches.slang:143, the P9.22 shape): llvmpipe turns the `if`
+// into a mask, so a guarded-but-unclamped index still forms and dereferences the
+// out-of-range address.  Here the index is a function PARAMETER, so nothing inside
+// this function bounds it even in principle -- the static checker flags exactly that.
+// The clamps are semantically free: `workIndex < tNumContacts` on the first, and on
+// the second the enclosing branch has already excluded workIndex == tNumContacts - 1.
 uint64_t rdaLoadRunEnds(uint tid, uint workIndex, uint tNumContacts, Ptr<uint64_t> sortedRigidIds)
 {
     uint64_t rigidId = RDA_SENTINEL;
-    if (workIndex < tNumContacts)
+    if (tNumContacts != 0u)
     {
-        rigidId = sortedRigidIds[workIndex];
-        if (tid > 0)
-            gsRigidId[tid - 1] = rigidId;
+        const uint last = tNumContacts - 1u;
+        const bool inRange = workIndex < tNumContacts;
+        const uint64_t raw = sortedRigidIds[inRange ? workIndex : 0u];
+        if (inRange)
+        {
+            rigidId = raw;
+            if (tid > 0)
+                gsRigidId[tid - 1] = rigidId;
 
-        if (workIndex == tNumContacts - 1u)
-            gsRigidId[tid] = RDA_SENTINEL;
-        else if (tid == AD_BLOCK - 1u)
-            gsRigidId[tid] = sortedRigidIds[workIndex + 1];   // the block's last lane loads its neighbour
+            if (workIndex == last)
+                gsRigidId[tid] = RDA_SENTINEL;
+            else if (tid == AD_BLOCK - 1u)
+                gsRigidId[tid] = sortedRigidIds[min(workIndex + 1u, last)];
+        }
     }
     GroupMemoryBarrierWithGroupSync();
     return rigidId;
