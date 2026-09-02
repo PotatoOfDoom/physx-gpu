@@ -6789,9 +6789,14 @@ int main()
 
         const float dt = 1.0f / 60.0f;
         const char* stepsEnv = std::getenv("PXG_ARTI_STEPS");
-        // 360, not `articulation`'s 240: the sleep decision needs the link to be at rest
-        // for a full wake-counter period (0.4 s by default) AFTER it has settled.
-        const int steps = stepsEnv ? atoi(stepsEnv) : 360;
+        // 900, not `articulation`'s 240.  The first guess of 360 was too short and said
+        // so by failing two checks that the physics actually passes: with the joint
+        // friction this scene sets (0.5), the link does not swing and stop, it CREEPS --
+        // measured -0.7180 rad at step 40, -0.9164 at 280, -0.9572 at 360, -1.0474 at
+        // 600, -1.0792 at 800, where it finally holds still.  The wake counter then runs
+        // out and the articulation falls asleep at step 722.  900 leaves a quarter of
+        // that again as margin.
+        const int steps = stepsEnv ? atoi(stepsEnv) : 900;
         int asleepSince = -1;
         std::printf("  stepping articulationjoint (%d x %.4fs): cache q0=%.4f, geometric q0=%.4f\n",
                     steps, dt, cachedAngle(), geometricAngle());

@@ -54,7 +54,8 @@ SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor articul
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
         particlecloth particleinflatable particlediffuse particleconvex
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth
-        softbody softbodyselfcollide softbodycloth softbodystack softbodyattach"
+        softbody softbodyselfcollide softbodycloth softbodystack softbodyattach
+        particlepush articulationjoint"
 
 pass=0; fail=0; missing=0
 
@@ -144,15 +145,16 @@ if [ "${1:-}" = "--diagnostics" ]; then
     # tranche that maps them has a before-figure to beat.  Each moves into SCENES
     # the day it passes.  Not scored.
     echo
-    echo "--- clothnet          (waits on accumulateDeltaVRigidFirst/SecondLaunch: the FEM-to-rigid impulse)"
+    # P9.44 mapped accumulateDeltaVRigidFirst/SecondLaunch, and particlepush and
+    # articulationjoint moved into the scored list above.  clothnet did not: with the
+    # accumulation chain live and NOTHING left unmapped on its path, the box still falls
+    # through.  Its producer writes zeros -- femClothRigidContactBda.slang:591 defers
+    # FEMCollision::computeRigidChange, which the CUDA takes for a DYNAMIC rigid, so the
+    # chain now folds zeros.  That is the next tranche (P9.45); the number below is its
+    # before-figure.
+    echo "--- clothnet          (waits on the DEFERRED dynamic-rigid reaction in femClothRigidContactBda)"
     env PXG_SCENE=clothnet PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
         | grep -E '^  clothnet:|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step|\[pxg-unmapped\]' | sed 's/^/    /'
-    echo "--- particlepush      (waits on ps_solvePCOutputRigidDeltaVTGSLaunch and the same two accumulate kernels)"
-    env PXG_SCENE=particlepush PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
-        | grep -E '^  particlepush:|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step|\[pxg-unmapped\]' | sed 's/^/    /'
-    echo "--- articulationjoint (waits on updateBodiesLaunch1T for the joint state, updateBodiesLaunch_Part3 for sleep)"
-    env PXG_SCENE=articulationjoint PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
-        | grep -E '^  articulationjoint:|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step|\[pxg-unmapped\]' | sed 's/^/    /'
 fi
 
 [ "$fail" -eq 0 ] && [ "$missing" -eq 0 ]
