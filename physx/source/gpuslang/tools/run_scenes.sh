@@ -32,10 +32,33 @@ if [ ! -x ./gpu-sdk-step ]; then
     echo "run_scenes.sh: ./gpu-sdk-step not found -- run this from build-sdk" >&2
     exit 2
 fi
+# PXG_SHADER_DIR, derived rather than demanded (P9.50).
+#
+# This used to be a hard "not set -> exit 2", and refusing loudly is better than
+# running on the wrong shaders.  But it is still a runner that only works when
+# its caller remembers something, and in one session that cost three runs: twice
+# in run_suite.sh, where a missing export turned into a RED SUITE that looked
+# like the tranche's fault, and once here.
+#
+# The sibling build directory is the answer in every case that has ever been run:
+# build-sdk and build-gpuslang sit next to each other, and the .spv live in the
+# latter.  An explicit value from the environment still wins, so a deliberately
+# different shader set stays testable; only the guessing is removed.
 if [ -z "${PXG_SHADER_DIR:-}" ]; then
-    echo "run_scenes.sh: PXG_SHADER_DIR is not set" >&2
+    for cand in ../build-gpuslang/shaders ./shaders; do
+        if [ -d "$cand" ]; then
+            PXG_SHADER_DIR="$(cd "$cand" && pwd)"
+            break
+        fi
+    done
+fi
+if [ -z "${PXG_SHADER_DIR:-}" ] || [ ! -d "$PXG_SHADER_DIR" ]; then
+    echo "run_scenes.sh: PXG_SHADER_DIR is not set and no shader directory was found" >&2
+    echo "  looked for ../build-gpuslang/shaders and ./shaders next to $(pwd)" >&2
     exit 2
 fi
+export PXG_SHADER_DIR
+echo "run_scenes.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR" 
 
 # The 32 named scenes.  The settling bag below makes 33 -- the figure
 # RUNTIME_STATUS.md's header carries.  clothbox joined in P9.15a: `cloth` is a

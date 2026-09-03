@@ -112,7 +112,23 @@
 #     falls straight through; the overrun lives in `base`.  P9.23 clamped SIX
 #     loops in femClothRigidContactBda / softBodyRigidContactBda where this check
 #     could only see FOUR sites, for exactly this reason.
+#     PARTLY CLOSED at P9.50: analyse_helper_calls() catches the case where the
+#     arithmetic is wrapped in a function -- `byteAt(base, i)`, whose body is
+#     `Ptr<uint>((base + i) & ~3)[0]` -- but ONLY inside a persistent-grid loop.
+#     Four such reads existed when P9.49 was investigated, in the same family that
+#     was faulting, and every one of them was found by an ad-hoc grep rather than
+#     by this file.
 #   * the INLINE form `Ptr<T>(addr)[i]` -- only named Ptr<> values are tracked.
+#   * DESCRIPTOR-BOUND buffers.  `RWStructuredBuffer<T> b; ... b[i]` is not
+#     scanned at all, and that limit is DELIBERATE AND MEASURED, not an oversight:
+#     tests/testRobustProbe.cpp reads such a buffer 1 GiB past its allocation and
+#     gets 0x00000000 back, with the process intact, so those accesses are bounds-
+#     checked here even though robustBufferAccess is not enabled.  The measurement
+#     exists because the log had asserted BOTH answers -- twice that robustness is
+#     off, once that descriptor-bound SSBOs are "robust bounds-checked" on the
+#     strength of a spirv-dis run that only showed they are not BDA.  55 findings
+#     had been refuted partly on that claim.  Re-run the probe on any driver
+#     change: PXG_PROBE_ROBUST=1 ./gpuslang-tests robustProbe.
 #   * `else` branches: the condition of an else-block is not inverted and tested.
 #   * ESCAPE guards are matched FLOW-INSENSITIVELY: an `if (...) return;` earlier
 #     in the same function counts even where it does not dominate the read.  That
@@ -291,6 +307,52 @@ GRIDWIDE_START = re.compile(r'\bglobalWarpIdx\b|\bglobalThreadIdx\b|\bgid\b'
 DATA_SIZED_STRIDE = re.compile(r'WorkgroupCount|GroupCount|gridDim|gridStride|numWarps')
 
 
+# A function that takes a uint64_t base and dereferences a Ptr<> is a BDA READ
+# WEARING A CALL.  The scan below cannot see one: there is no `namedPtr[expr]`
+# anywhere at the call site, the index reaches the pointer as an argument, and
+# inside the helper the read is an INLINE Ptr<uint>(addr)[0] with a constant
+# index.  All three of those are on this file's own list of what it does not see.
+BDA_HELPER_PARAM = re.compile(r'\buint64_t\b')
+
+
+def bda_reading_helpers(src):
+    """Names of functions in this shader that read through a BDA pointer built
+    from a uint64_t parameter.
+
+    `byteAt` is the one this corpus actually uses:
+
+        uint byteAt(uint64_t base, uint idx)
+        {
+            const uint64_t addr = base + uint64_t(idx);
+            const uint word = Ptr<uint>(addr & ~uint64_t(3))[0];
+
+    P9.49 clamped four call sites of it inside persistent-grid loops.  Every one
+    was a genuine out-of-range read of the same family that was faulting, and not
+    one of them was reported here -- they were found by an ad-hoc grep, which is
+    not a thing to rely on twice.
+    """
+    out = set()
+    for m in re.finditer(r'\b(?:uint|int|float|uint2|uint3|uint4|float2|float3'
+                         r'|float4|bool|uint64_t)\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*\{',
+                         src):
+        name, params = m.group(1), m.group(2)
+        if not BDA_HELPER_PARAM.search(params):
+            continue
+        i = src.find('{', m.end() - 1)
+        d, end = 0, len(src)
+        for j in range(i, len(src)):
+            if src[j] == '{':
+                d += 1
+            elif src[j] == '}':
+                d -= 1
+                if d == 0:
+                    end = j
+                    break
+        if 'Ptr<' in src[i:end]:
+            out.add(name)
+    return out
+
+
 def const_uint(src, name):
     m = re.search(r'static\s+const\s+uint\s+%s\s*=\s*([^;]+);' % re.escape(name), src)
     return m.group(1).strip() if m else None
@@ -443,9 +505,84 @@ class Finding(object):
                    self.expr, self.kind, self.cond, self.why))
 
 
+def _brace_range(src, pos):
+    i = src.find('{', pos)
+    if i < 0:
+        return None, None
+    d = 0
+    for j in range(i, len(src)):
+        if src[j] == '{':
+            d += 1
+        elif src[j] == '}':
+            d -= 1
+            if d == 0:
+                return i, j
+    return None, None
+
+
+def analyse_helper_calls(sh):
+    """P9.50: BDA reads that arrive as a CALL, inside a persistent-grid loop.
+
+    Deliberately narrow.  The same call anywhere else in the corpus is not
+    reported, because outside a persistent-grid loop the distance argument that
+    makes LOW-loop acceptable still holds, and a rule that fired everywhere would
+    bury the four-a-decade findings that matter under hundreds that do not.
+    """
+    src = sh.src
+    readers = bda_reading_helpers(src)
+    if not readers:
+        return []
+    findings = []
+    for m in re.finditer(r'\bfor\s*\([^;]*;[^;]*;[^)]*\)', src):
+        header = ' '.join(m.group(0).split())
+        var, _cond = loop_induction(header)
+        if not var:
+            continue
+        pg = persistent_grid_loop(src, header)
+        if not pg:
+            continue
+        i, j = _brace_range(src, m.end())
+        if i is None:
+            continue
+        body = src[i:j]
+        safe = clamped_vars(body)
+        v = re.escape(var)
+        for c in re.finditer(r'\b([A-Za-z_]\w*)\s*\(([^()]*)\)', body):
+            fname, args = c.group(1), c.group(2)
+            if fname not in readers:
+                continue
+            hit = None
+            for arg in args.split(','):
+                a = arg.strip()
+                if a == var or (re.search(r'(?<![.\w])' + v + r'(?![\w])', a)
+                                and not CLAMPED.search(a)):
+                    if a in safe:
+                        continue
+                    hit = a
+                    break
+            if hit is None:
+                continue
+            pos = i + c.start()
+            enclosing = '?'
+            for fn, occ in sh.funcs.items():
+                for (fs, fe) in occ:
+                    if fs <= pos < fe:
+                        enclosing = fn
+            findings.append(Finding(
+                sh.name, sh.lineof(pos), enclosing,
+                fname, hit, 'loop', header, 'HIGH',
+                "P9.50: %s() reads through a BDA pointer built from its uint64_t "
+                "argument, so this call IS an indexed load -- one with no `[` at the "
+                "call site, which is why the scan above cannot see it.  It sits in a "
+                "persistent-grid loop (start %s, stride %s), so the index can be past "
+                "the bound on the very first pass.  Clamp the ARGUMENT."
+                % (fname, pg[0], pg[1])))
+    return findings
+
+
 def analyse_shader(sh):
     src = sh.src
-    findings = []
+    findings = analyse_helper_calls(sh)
     for name, occ in sh.funcs.items():
         for (start, end) in occ:
             body = src[start:end]
@@ -628,8 +765,63 @@ def selftest_persistent_grid():
     return ok
 
 
+def selftest_helper_calls():
+    """Negative control for the P9.50 rule.
+
+    The rule exists because four real out-of-range reads wore a call and none of
+    them was reported; so the control re-creates that exact shape and requires a
+    finding.  The three quiet cases matter as much: a helper that takes no
+    uint64_t is not a BDA read, a clamped argument is the FIX, and the same call
+    outside a persistent-grid loop is the LOW-loop tier, where the distance
+    argument still holds.  A rule that fired on those would put the corpus's whole
+    byteAt population into the gate and mean nothing.
+    """
+    prelude = '''
+    static const uint STRIDE = 1024u * 2u;
+    uint byteAt(uint64_t base, uint idx)
+    {
+        const uint64_t addr = base + uint64_t(idx);
+        const uint word = Ptr<uint>(addr & ~uint64_t(3))[0];
+        return (word >> 8u) & 0xffu;
+    }
+    uint plainAdd(uint a, uint b) { return a + b; }
+    '''
+    cases = [
+        ('void k() { for (uint v = globalWarpIdx; v < n; v += STRIDE) {'
+         ' if (byteAt(hint, v) == 0u) continue; } }', 1,
+         'the measured shape: a BDA-reading helper called with the raw index'),
+        ('void k() { for (uint v = globalWarpIdx; v < n; v += STRIDE) {'
+         ' const uint s = min(v, max(n, 1u) - 1u);'
+         ' if (byteAt(hint, s) == 0u) continue; } }', 0,
+         'the P9.49 fix itself must not be reported back as the defect'),
+        ('void k() { for (uint v = globalWarpIdx; v < n; v += STRIDE) {'
+         ' if (byteAt(hint, min(v, n - 1u)) == 0u) continue; } }', 0,
+         'the clamp written inline at the call site counts too'),
+        ('void k() { for (uint v = globalWarpIdx; v < n; v += STRIDE) {'
+         ' const uint q = plainAdd(v, 1u); } }', 0,
+         'a helper that takes no uint64_t reads no BDA pointer'),
+        ('void k() { for (uint v = tid; v < n; v += STRIDE) {'
+         ' if (byteAt(hint, v) == 0u) continue; } }', 0,
+         'a block-local start keeps the LOW-loop distance argument intact'),
+        ('void k() { for (uint v = globalWarpIdx; v < n; v += BLK * WorkgroupCount().x) {'
+         ' if (byteAt(hint, v) == 0u) continue; } }', 0,
+         'a data-sized stride means the launch was sized to the data'),
+    ]
+    ok = True
+    for body, want, why in cases:
+        sh = Shader(os.path.join(SHADERS, '_selftest.slang'), text=prelude + body)
+        got = len(analyse_helper_calls(sh))
+        if got != want:
+            print('SELFTEST FAILED (P9.50): %d finding(s), expected %d\n  case: %s'
+                  % (got, want, why))
+            ok = False
+    return ok
+
+
 def selftest():
     if not selftest_persistent_grid():
+        return 2
+    if not selftest_helper_calls():
         return 2
     clean = load_corpus()
     base = {f.key() for f in sum((analyse_shader(s) for s in clean), [])
