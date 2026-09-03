@@ -30,6 +30,32 @@ fi
 ARCHIVE_ROOT="$BUILD_DIR/suite-failures"
 FAILURES=0
 
+# PXG_SHADER_DIR, or two tests fail for a reason that has nothing to do with the
+# tranche (P9.49).
+#
+# `gpuslang.helperUniformity` and its siblings read the COMPILED .spv files, and
+# they find them through PXG_SHADER_DIR.  ctest does not inherit an export the
+# caller forgot, so the whole suite hinges on whether whoever typed the command
+# had exported it in that shell -- which is invisible in the log afterwards.  It
+# has now cost two investigations in one session: a red suite that was really a
+# missing variable, twice, both times mid-tranche where a red suite is the one
+# signal that must be trustworthy.
+#
+# A runner that only works when its caller remembers something is not a runner,
+# so it is set here, derived from the build directory that was actually passed.
+# An explicit value from the environment still wins -- someone testing a
+# different shader set must be able to say so.
+if [ -z "${PXG_SHADER_DIR:-}" ]; then
+    PXG_SHADER_DIR="$(cd "$BUILD_DIR" && pwd)/shaders"
+fi
+if [ ! -d "$PXG_SHADER_DIR" ]; then
+    echo "run_suite.sh: PXG_SHADER_DIR='$PXG_SHADER_DIR' is not a directory;" >&2
+    echo "  the .spv-reading checks would fail for that reason alone." >&2
+    exit 2
+fi
+export PXG_SHADER_DIR
+echo "run_suite.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR"
+
 run_mode() {
     local mode_name="$1"; shift
     echo "=== $mode_name ==="

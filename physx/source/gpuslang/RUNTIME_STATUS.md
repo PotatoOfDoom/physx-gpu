@@ -1793,6 +1793,184 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.49 — der Absturz gehört mir doch: eine Distanzaussage, die ihre eigene Voraussetzung verschwiegen hat
+
+**Ergebnis:** Der sporadische `gpuslang.femClothSim`-SIGSEGV ist **weg**: **200 Läufe ohne
+Fehler**, gegen Fehler in den Läufen **9, 26 und 32** desselben Skripts unmittelbar davor.
+**Dreizehn** Klemmungen in dreizehn Schleifen, die **zwanzig** Lesezugriffe absichern; ein
+Prüferrang berichtigt, ein neues Kontrollstück im Prüfer — und **zwei Schlussfolgerungen
+dieses Protokolls zurückgenommen**, eine davon aus einer Überschrift. Manifest unverändert
+**399/501**. Suite **846/846 in beiden Speichermodi**, beide im ersten Anlauf
+(175 s bzw. 129 s), Szenen **37 ok, 0 fail, 0 missing (von 37)**.
+
+### Der Satz, der vier Tranchen lang niemandem aufgefallen ist
+
+P9.23 hat die spekulierten Lesezugriffe in Ränge geteilt, und der Rang, um den es geht,
+heißt `LOW-loop`:
+
+> der Index ist die Laufvariable einer Schleife, deren Bedingung die Schranke ist:
+> `for (i = tid; i < n; i += stride)`. **Der Überschuss ist höchstens eine Schrittweite.**
+
+Das liest sich wie eine Aussage über die Schleife. Sie ist aber eine Aussage über die
+Schleife **zusammen mit einer Annahme, die dort nicht steht**: dass der erste Index bereits
+innerhalb der Schranke liegt. Für `i = tid` stimmt das — `tid` ist blocklokal. Für die
+gesamte Mittelphasen-Familie stimmt es nicht:
+
+```slang
+const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;   // [0, 2048)
+for (uint vertexIdx = globalWarpIdx; vertexIdx < numVerts; vertexIdx += SM_NB_WARPS)
+```
+
+Das Gitter ist **dauerhaft** — 1024 Blöcke, vom Kern festgelegt, unabhängig von den Daten.
+Ein Warp, dessen Nummer `numVerts` übersteigt, **beginnt hinter dem Ende**, und schon sein
+erster Test schlägt fehl. Die Reichweite ist `(Start − Schranke) + k · Schrittweite`, bei
+2048 Warps über 1100 Vertices also Tausende von Elementen — nicht eine Schrittweite.
+
+Erreichbar macht das die **Sperre** am Kopf dieser Schleifenrümpfe. Diese Plattform muss sie
+auch für einen Warp ohne Arbeit erreichen, führt den Rumpf also mit **vollständig leerer
+Maske** aus; der Lesezugriff ist über die (leere) Menge aktiver Bahnen uniform und wird als
+**skalarer** Zugriff „an der ersten aktiven Bahn, sonst Bahn 0" ausgegeben.
+
+### Gemessen, nicht geschlossen
+
+Aus dem Kernabzug, zweimal unabhängig mit identischen Werten:
+
+```
+kmovb   %k0,%ecx
+tzcnt   %ecx,%ecx
+xor     %edx,%edx
+kortestb %k0,%k0
+cmovne  %ecx,%edx          ; edx = erste aktive Bahn, sonst 0  <-- LEERE MASKE
+movslq  0x3c0(%rdi,%rdx,4),%rcx
+shl     $0x4,%rcx          ; rcx = Index * 16
+vmovss  (%rcx,%rax,1),%xmm2
+
+rcx = 0xe000  ->  Index 3584 = 1536 + 2048  =  globalWarpIdx + 1 * SM_NB_WARPS
+```
+
+`numVerts` ist in dieser Vorrichtung **1100**. 3584 ist damit kein Zufallswert, sondern
+genau die Laufvariable, nachdem die Bedingung schon bei 1536 falsch war: **39 KB hinter dem
+Puffer**, etwa jeder zwanzigste Lauf.
+
+Zwei **verschiedene** Stellen in derselben Testbinärdatei, beide seit P9.23 in diesem Rang
+gezählt und abgehakt:
+
+| Lauf | Test | Shader |
+|---|---|---|
+| 26 | `femClothSimMeshVertMidphase` | `femClothMeshVertMidphaseBda` — `clothVerts[vertexIdx]` |
+| 9, 32 | `femClothSimPsMidphase` | `femClothPsMidphaseBda` — `sortedPose[particleIndex]` |
+
+### Drei Fehlschläge auf dem Weg dorthin, weil sie alle drei lehrreich sind
+
+* **Die Form im Kernabzug wurde der falschen Datei zugeschrieben.** Die Befehlsfolge lädt
+  einen Punkt und bildet `p − r` und `p + r` **unmittelbar** daraus. In
+  `femClothMeshVertMidphaseBda` steht zwischen Ladung und Subtraktion aber der
+  Vertexraum-Transformationsschritt — die Form passt dort **nicht**, sie passt auf
+  `femClothPsMidphaseBda` (`center = sortedPose[i].xyz; qMin = center − cDistance`), wo kein
+  Transform dazwischen liegt. Das war im Abzug ablesbar und wurde übersehen; die erste
+  Reparatur ging deshalb an die falsche Zeile.
+* **Blockgepufferte Ausgabe.** Das Protokoll des ersten Laufs war **exakt 8192 Byte** groß —
+  eine einzige Pufferleerung. Der letzte darin sichtbare Test ist damit nicht der
+  abstürzende, sondern der, bei dem der Puffer zufällig voll war. Daraus wurde
+  `femClothSimMeshVertContactGen` gelesen, ein Kern aus zwei Zeilen, der nichts dergleichen
+  tut, und daraus wiederum die Heightfield-Mittelphase geraten — 60 Läufe davon isoliert
+  blieben sauber. P9.28a hat diese Pufferfalle **schon einmal aufgeschrieben**; es half
+  nichts, weil das Reproduktionsskript sie nicht umsetzte. Jetzt tut es das (`stdbuf -o0`),
+  und der abstürzende Test steht in der letzten Zeile.
+* **Eine Reparatur, die keine war.** An der falschen Zeile wurden die *Vertexindizes*
+  geklemmt, die der Dreiecksfetch zurückgibt (`min(rawTri.x, vLast)`). Diese Klemmung ist
+  beweisbar die Identität: `safePrim` hält den Fetch schon im gültigen Bereich, also gehört
+  jedes gelieferte Tripel zu einem echten Dreieck. Toter Code mit einer falschen Begründung —
+  und ein sauberer Lauf danach sagte nichts, weil ein Fehler von 1:20 einen einzelnen Lauf
+  ohnehin überlebt. Die Messung hat ihn in Lauf 9 widerlegt; er wurde **zurückgenommen**,
+  nicht „zur Sicherheit" behalten. Die richtige Stelle stand zwölf Zeilen darüber, an
+  `clothVerts[vertexIdx]`.
+
+### Zurückgenommen, Nummer eins: „der Absturz gehört mir doch nicht"
+
+P9.28a trägt diese Aussage in der **Überschrift** und begründet sie mit einem Kernabzug: der
+Befehlszeiger stand in llvmpipes JIT-Code, die Fehleradresse in einem zwei Seiten großen Loch
+knapp **unter** dem laufenden Befehl, und daraus wurde ein **Layout-/Zuteilungsfehler des
+JIT** gefolgert.
+
+Dieselbe Nachbarschaft steht in den jetzigen Abzügen — und sie bedeutet etwas anderes. `rax`
+ist kein Codesegment, sondern der **Datenpuffer**; der greift mit einem Index von 3584 nach
+oben und landet in der unabgebildeten Lücke, die zwischen der Pufferarena und dem
+JIT-Segment liegt. Die Nähe zum Befehlszeiger ist ein **Artefakt der Zuteilung**, kein
+Hinweis auf ihre Ursache — genau der Fehlschluss, den P9.28a bei der
+„Stapelschutzseiten"-Signatur selbst benannt und dann in der nächsten Zeile wiederholt hat.
+
+Was hier steht, ist das Belegbare: der jetzt **gemessene** Mechanismus ist ein Portierungs-
+fehler, er erklärt die damals aufgeschriebenen Adressen vollständig, und die Reparatur an
+dreizehn Portierungsstellen beendet den Fehler. Der damalige Abzug lässt sich nicht mehr
+nachuntersuchen, deshalb: **die Schlussfolgerung „kein Portfehler" war nicht belegt** — nicht
+„sie war widerlegt".
+
+### Zurückgenommen, Nummer zwei: der Rang selbst
+
+`LOW-loop` zählte 76 Fundstellen und hieß „begrenzte Reichweite". Er prüft jetzt die
+Voraussetzung, statt sie anzunehmen: `persistent_grid_loop()` verlangt einen **gitterweiten
+Start** UND eine **konstante Schrittweite** und stuft eine solche Schleife auf **HIGH**.
+Eine Schrittweite aus `WorkgroupCount()` heißt, die Engine hat den Start nach den Daten
+bemessen — die Aussage hält dann; ein Start aus `lane` oder `tid` kann die Schranke um
+höchstens einen Block überschreiten. Beides bleibt still.
+
+Das hat vier weitere Stellen sichtbar gemacht, die niemand gesucht hatte — die
+Paar-Lesezugriffe in `femClothContactGenBda` (zweimal), `femClothPsContactGenBda` und
+`softBodyPsContactGenBda`, alle mit demselben dauerhaften Gitter. Auch sie sind geklemmt;
+`LOW-loop` steht danach bei **61**, `HIGH` bei **0**.
+
+Das Kontrollstück des Prüfers hat vier Fälle, und zwei davon prüfen das **Schweigen**: ein
+Test, der jede gitterschrittige Schleife hochstuft, verschöbe 61 Fundstellen in das Gatter,
+sähe gründlich aus und sagte nichts. Eine fünfte Prüfung verlangt, dass eine **nicht
+auflösbare** Schrittweite *nicht* als Konstante durchgeht — unbekannt ist nicht dasselbe wie
+bewiesen fest.
+
+### Was die Klemmung ist, und was sie nicht ist
+
+Überall dieselbe Form, die P9.28 eingeführt hat:
+
+```slang
+const uint safeVert = min(vertIdx, max(numVerts, 1u) - 1u);
+```
+
+`max(n, 1u)` statt `n`, weil `n − 1` bei `n == 0` auf `0xffffffff` überläuft und die Klemmung
+dann nichts täte. Und `n == 0` ist nicht der harmlose Fall, sondern der schlimmste: dann
+lässt die Bedingung **überhaupt keine** Bahn zu, jeder Durchlauf des Rumpfes ist ein
+Leermasken-Durchlauf, und die Klemmung ist das Einzige, was noch zwischen dem Index und dem
+Speicher steht.
+
+Nur **Adressen** bekommen sie. Wo der Index ein **Wert** ist — der Filterschlüssel, der
+geschriebene Kontakt —, bleibt er er selbst; für jede Bahn, die die Bedingung zulässt, sind
+beide ohnehin gleich. Und wo ein geklemmter Index ein *weiteres* Feld indiziert (der
+Dreiecksfetch, dessen Tripel dann `clothVerts` indiziert), braucht die zweite Stufe **keine**
+eigene Klemmung: jeder Index, den die erste jetzt liefern kann, gehört zu einem echten
+Dreieck. Genau das war der Fehler der zurückgenommenen Reparatur, hier als Regel.
+
+Die frühere Sorge, der Übersetzer könne `min(i, n−1)` innerhalb der Schleife als beweisbar
+wirkungslos wegfalten, hat die Messung erledigt: die Bedingung ist zu diesem Zeitpunkt längst
+eine Maske, es gibt keine dominierende Verzweigung mehr, aus der sich etwas folgern ließe.
+Lauf 26 wurde von der Klemmung getötet, und der Fehler wanderte zur nächsten Stelle.
+
+### Ein vierter Fehlschlag, diesmal im Läufer — und deshalb behoben
+
+Der erste Suite-Lauf dieser Tranche war in **beiden** Speichermodi rot, mit **einem**
+fehlgeschlagenen Test: `gpuslang.helperUniformity`. Direkt aufgerufen besteht der Prüfer.
+Der Unterschied ist `PXG_SHADER_DIR`: er liest die **übersetzten** `.spv`, findet sie über
+diese Variable, und `run_suite.sh` **exportiert sie nicht**. Ob die Suite grün ist, hing
+damit daran, ob die Person, die den Befehl tippte, sie in *jener* Shell exportiert hatte —
+und im Protokoll danach sieht man das nicht.
+
+Das hat in dieser Sitzung **zwei** Untersuchungen gekostet, beide mitten in einer Tranche,
+also genau dort, wo eine rote Suite das eine Signal ist, dem man trauen muss. Ein Läufer,
+der nur funktioniert, wenn sein Aufrufer sich an etwas erinnert, ist kein Läufer:
+`run_suite.sh` leitet die Variable jetzt aus dem übergebenen Bauverzeichnis ab, bricht ab,
+wenn das Ergebnis kein Verzeichnis ist, druckt den benutzten Wert — und lässt eine bereits
+gesetzte Variable gewinnen, damit ein anderer Shader-Satz weiterhin prüfbar bleibt.
+
+Die Zahl oben stammt aus dem Lauf **danach**; der rote Lauf ist nicht weggelassen, sondern
+das, was diesen Absatz erzwungen hat.
+
 ## P9.48d — der Grund, warum vier abgebildete Kerne nie liefen, und ein achter Prüfer, der zu spät kommt
 
 **Ergebnis:** Die Szene `particlesoftbody` **besteht** und rückt in die Wertung: Szenen
