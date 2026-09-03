@@ -60,7 +60,7 @@ SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor articul
         particlecloth particleinflatable particlediffuse particleconvex
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth
         softbody softbodyselfcollide softbodycloth softbodystack softbodyattach
-        particlepush articulationjoint clothnet"
+        particlepush articulationjoint clothnet particlesoftbody"
 
 pass=0; fail=0; missing=0
 
@@ -143,33 +143,11 @@ if [ "${1:-}" = "--diagnostics" ]; then
     env PXG_SCENE=clothmesh PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
         | grep -E '^  clothmesh:|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step' | sed 's/^/    /'
 
-    echo "--- particlesoftbody"
-    # P9.48c.  NOT run_one, for the same reason as clothmesh: a pending scene must not
-    # decide the sweep's verdict.  It is here because it MEASURES something, not because
-    # it is expected to pass.
-    #
-    # P9.48a mapped the consumer that finally moves a particle a softbody pushed, and the
-    # trace says the whole chain runs -- sb_psMidphaseGeneratePairs and sb_psContactGen
-    # once per step, sb_solveOutputSPDeltaV and ps_accumulateFEMParticleDeltaV once per
-    # solver iteration (360 and 361 launches over 40 steps).  The cloud still falls
-    # straight through the cube, and the reason is not a guess: the particle inverse mass
-    # was swept over a HUNDREDFOLD range (20, 200, 2000) and the trajectory did not change
-    # in a single digit.  If any contact reached the particles their mass would be in the
-    # answer.  None does.  The cloud comes to rest at 0.2247, which is exactly where the
-    # no-cube control rests.
-    #
-    # So the gap is upstream of the consumer -- in what the softbody-particle contact
-    # generator emits for this pair, or in what the scene has to configure for it to emit
-    # anything -- and that is the next thing to find out, not something to assert here.
-    env PXG_SCENE=particlesoftbody PXG_GPU_STEP=1 ./gpu-sdk-step 2>&1 \
-        | grep -E '^  particlesoftbody:|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step' | sed 's/^/    /'
-    echo "--- particlesoftbody + PXG_PSB_NOSOFTBODY=1 (control: no cube)"
-    env PXG_SCENE=particlesoftbody PXG_GPU_STEP=1 PXG_PSB_NOSOFTBODY=1 ./gpu-sdk-step 2>&1 \
-        | grep -E '^  particlesoftbody:|^FAIL:|^\[ *(OK|FAIL) *\] gpu-sdk-step' | sed 's/^/    /'
-
     # P9.41's three observing scenes have all moved into SCENES above: particlepush and
-    # articulationjoint in P9.44, clothnet in P9.45.  The pending-work list carries two
-    # entries again: clothmesh (upstream, since P9.26) and particlesoftbody (P9.48c).
+    # articulationjoint in P9.44, clothnet in P9.45, and particlesoftbody in P9.48d --
+    # it spent exactly one tranche in this block, which is how long it took to find why
+    # it failed.  The pending-work list is back to clothmesh alone, and that one is not
+    # waiting on this port.
 fi
 
 [ "$fail" -eq 0 ] && [ "$missing" -eq 0 ]

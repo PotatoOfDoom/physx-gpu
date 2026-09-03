@@ -1246,6 +1246,27 @@ static const uint8_t kPsSolvePCParticle[] = { 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 1
 //   PxgParticleSystemCore.cpp:2005.
 static const uint8_t kPsAccumulateDeltaVParticle[] = { 8, 8, 8, 8, 8, 8 };
 
+// gpusimulationcontroller particlesystem.cu:2519 / :2644 / :2761 (P9.48a: the FEM
+// twins of the three above -- the same algorithms over PxgFemOtherContactInfo instead
+// of PxgParticlePrimitiveContact, launched from BOTH PxgSoftBodyCore.cpp and
+// PxgFEMClothCore.cpp).  Byte-for-byte the same rows as their particle twins:
+//   ps_findStartEndFEMFirstLaunch  -> 5 pointers = 40 bytes  (PxgSoftBodyCore.cpp:2356,
+//                                                             PxgFEMClothCore.cpp:426)
+//   ps_findStartEndFEMSecondLaunch -> 7 pointers = 56 bytes  (:2416 / :456)
+//   ps_accumulateFEMParticleDeltaVLaunch -> 6 pointers = 48  (:1545 / :2277)
+static const uint8_t kPsFindStartEndFem1[] = { 8, 8, 8, 8, 8 };
+static const uint8_t kPsFindStartEndFem2[] = { 8, 8, 8, 8, 8, 8, 8 };
+static const uint8_t kPsAccumulateFemParticle[] = { 8, 8, 8, 8, 8, 8 };
+
+// gpusimulationcontroller softBodyGM.cu:2522 (P9.48b: a softbody tetrahedron pinned to
+// one PARTICLE -- the fourth consumer of PxgFEMFEMAttachmentConstraint):
+//   sb_solveOutputParticleAttachmentDeltaVLaunch(PxgSoftBody* softbodies,
+//     PxgParticleSystem* particleSystems, PxgFEMFEMAttachmentConstraint* attachments,
+//     const PxU32 numAttachments)
+//   -> {8,8,8,4} = 28 data bytes rounded to the 8-align -> 32-byte blob.  Launch
+//   PxgSoftBodyCore.cpp:1968.
+static const uint8_t kParticleSbAttachSolve[] = { 8, 8, 8, 4 };
+
 // gpusimulationcontroller rigidDeltaAccum.cu (P9.44: the deformable/particle -> rigid
 // impulse coupling; launched by PxgParticleSystemCore.cpp:1857-1910 and
 // PxgFEMCore.cpp:273-318 with grid 32 x block 512):
@@ -1984,6 +2005,12 @@ static const PxgKernelAbiRow kRows[] = {
     { "ps_contactPrepareLaunch", kPsContactPrepare, uint32_t(sizeof(kPsContactPrepare)) },
     { "ps_solvePCOutputParticleDeltaVLaunch", kPsSolvePCParticle, uint32_t(sizeof(kPsSolvePCParticle)) },
     { "ps_accumulateDeltaVParticleLaunch", kPsAccumulateDeltaVParticle, uint32_t(sizeof(kPsAccumulateDeltaVParticle)) },
+    // gpusimulationcontroller (P9.48a: the FEM twins of the three rows above)
+    { "ps_findStartEndFEMFirstLaunch", kPsFindStartEndFem1, uint32_t(sizeof(kPsFindStartEndFem1)) },
+    { "ps_findStartEndFEMSecondLaunch", kPsFindStartEndFem2, uint32_t(sizeof(kPsFindStartEndFem2)) },
+    { "ps_accumulateFEMParticleDeltaVLaunch", kPsAccumulateFemParticle, uint32_t(sizeof(kPsAccumulateFemParticle)) },
+    // gpusimulationcontroller softBodyGM.cu (P9.48b: the softbody-particle attachment)
+    { "sb_solveOutputParticleAttachmentDeltaVLaunch", kParticleSbAttachSolve, uint32_t(sizeof(kParticleSbAttachSolve)) },
     // gpusimulationcontroller rigidDeltaAccum.cu (P9.44 deformable/particle -> rigid coupling)
     { "accumulateDeltaVRigidFirstLaunch", kAccumRigidFirst, uint32_t(sizeof(kAccumRigidFirst)) },
     { "accumulateDeltaVRigidSecondLaunch", kAccumRigidSecond, uint32_t(sizeof(kAccumRigidSecond)) },

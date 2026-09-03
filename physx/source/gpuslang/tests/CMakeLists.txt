@@ -2433,6 +2433,30 @@ add_test(NAME gpuslang.lengthIntrinsic
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_length_intrinsic.py)
 
 # ---------------------------------------------------------------------------
+# A mapped kernel must have a launch-ABI row, or the engine cannot run it
+# (P9.48d).  The EIGHTH static checker, and the only one written because the
+# defect had already happened.
+#
+# pushConstantSizeFor() (bridge/PhysXGpuVulkan.cpp:178) derives a kernel's push-
+# constant size from bridge/PxgVulkanKernelAbi.cpp and returns 0 for a kernel
+# that is not listed there.  The shim's blob check is EXACT
+# (PxgCudaShim.cpp:232), so an unlisted kernel has every launch REFUSED and
+# never runs -- while its fixtures pass, the manifest test passes, the suite
+# passes and the scene sweep passes, because a fixture dispatches the shader
+# directly and never goes through the bridge.
+#
+# P9.48a and P9.48b mapped four kernels without their ABI rows.  All four were
+# refused on every launch for two whole tranches, and the only thing that
+# noticed was a scene whose particles fell through a softbody.
+#
+# The rule is a RATCHET: the set of mapped-but-unwired kernels may shrink, never
+# grow, and a kernel wired since the last edit must come off the list.  54 sit
+# there today, on paths the engine does not drive in this port; claiming each is
+# fine would be inventing certainty the check does not have.
+add_test(NAME gpuslang.launchAbi
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_launch_abi.py)
+
+# ---------------------------------------------------------------------------
 # Replicated engine helpers must agree (P9.37).
 #
 # This corpus writes the same engine helper out by hand over and over -- 69 copies

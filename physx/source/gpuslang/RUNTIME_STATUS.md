@@ -7,7 +7,14 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **845/845** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **846/846** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.48d added `gpuslang.launchAbi`, the EIGHTH static checker and the only one
+written because its defect had already happened: a kernel mapped in the manifest
+still needs a row in the launch-ABI table, or `pushConstantSizeFor()` yields 0,
+the shim's exact blob check refuses every launch, and the kernel never runs —
+while its fixtures, the manifest test, the suite and the scene sweep all pass.
+Four kernels sat in that state for two tranches.  The rule is a RATCHET: the set
+of mapped-but-unwired kernels (54 today) may shrink, never grow.
 P9.47 added `gpuslang.lengthIntrinsic`, the SEVENTH static checker: GLSL.std.450
 `Length`, `Distance` and `Normalize` are given a precision allowance by the Vulkan
 environment spec, while the engine computes those quantities from operations that
@@ -1786,6 +1793,91 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.48d — der Grund, warum vier abgebildete Kerne nie liefen, und ein achter Prüfer, der zu spät kommt
+
+**Ergebnis:** Die Szene `particlesoftbody` **besteht** und rückt in die Wertung: Szenen
+**36 → 37** (37/37 ok, 0 fail, 0 missing, null `unmapped`-Zeilen). Suite **846/846 in beiden
+Speichermodi** (Modus 1 im ersten Anlauf, Modus 2 im dritten — der bekannte
+`gpuslang.femClothSim`-Flackerer aus Aufgabe 16, isoliert dreimal hintereinander grün). Vier Kerne, die seit zwei Tranchen als „abgebildet" galten, laufen zum ersten
+Mal wirklich. Der Zuwachs von 845 ist der achte statische Prüfer. Und eine Korrektur an
+P9.48c, die ich lieber nicht schreiben würde.
+
+### Was tatsächlich los war
+
+Ein Kern im Manifest abzubilden reicht nicht, damit die Engine ihn startet. Die
+Push-Konstantengröße kommt aus einer **zweiten** Tabelle — `PxgVulkanKernelAbi.cpp`, die
+einzige Quelle der Wahrheit für die Argumentgrößen eines Kerns —, und
+`pushConstantSizeFor()` (PhysXGpuVulkan.cpp:178) liefert für einen dort nicht gelisteten
+Kern **0**. Die Blob-Prüfung des Shims ist **exakt** (PxgCudaShim.cpp:232). Also wird jeder
+Start abgewiesen, und der Kern läuft nie.
+
+Genau das ist den drei Kernen aus P9.48a und dem aus P9.48b passiert. Zwei volle Tranchen
+lang. Und **nichts** hat es gesagt:
+
+* die Vorrichtungen bestanden — sie starten den Shader direkt und gehen nie über die Brücke;
+* `gpuslang.p4Manifest` bestand — es prüft die Zeile, den Eintrittspunkt und den Zähler;
+* die Suite bestand in beiden Speichermodi;
+* der Szenendurchgang bestand 36/36;
+* und die Startspur sagte „361 Starts", weil sie eine Zeile pro **Versuch** druckte und
+  `OK` von `REFUSED` nicht auf einen Blick unterschied.
+
+Ich habe diese 361 Zeilen in den P9.48c-Eintrag geschrieben als „die ganze Kette läuft".
+Sie waren 361 **Ablehnungen**. Der Eintrag trägt jetzt die Korrektur an Ort und Stelle.
+
+Das Einzige, was es gemerkt hat, war die Szene: eine Partikelwolke, die durch einen
+Weichkörper fällt. Und selbst die hätte ich beinahe falsch gelesen — der Fegedurchgang über
+die inverse Partikelmasse (20/200/2000, keine Ziffer Unterschied) hat richtig gezeigt, dass
+kein Kontakt die Partikel erreicht, und mich dann zu dem falschen Schluss geführt, die
+Lücke läge **vor** dem Verbraucher. Sie lag IM Verbraucher: er lief nicht.
+
+### Zwei Werkzeuge, die es hätten sagen müssen
+
+Beide sind jetzt schärfer:
+
+* **Die Startspur trägt das Gitter.** `[pxg-launch] … OK grid(1024,1,1)` statt nur `OK`,
+  und eine Null in irgendeiner Dimension wird als `EMPTY-GRID` ausgeschrieben. „Gestartet"
+  und „über nichts gestartet" sind verschiedene Tatsachen, und die Spur konnte sie nicht
+  auseinanderhalten.
+* **Eine Ablehnung sagt, wie groß der Blob war.** `[pxg-refused] … built a 48-byte push
+  blob — the shim requires an EXACT match`. Diese eine Zeile hätte die zwei Tranchen
+  gespart: 48 war genau richtig, also konnte es nur die andere Seite sein.
+
+### Der achte Prüfer, und warum er eine Ratsche ist
+
+`gpuslang.launchAbi` (`tools/check_launch_abi.py`) verlangt für jede Manifestzeile, die
+eine `.spv` nennt, eine Zeile in der Start-ABI-Tabelle. Der ehrliche Zustand des Baums ist
+dabei nicht sauber: **54 abgebildete Kerne haben keine** — die Aggregat-Breitphase, die
+Direct-API-Zugriffe, der Schwellwertstrom, die generischen Scan-/Radix-Helfer, die
+Häutungspfade. Für jeden davon eine Rechtfertigung zu schreiben hieße, eine Sicherheit zu
+erfinden, die der Prüfer nicht hat.
+
+Also ist die Regel eine **Ratsche**: die Menge darf **schrumpfen, nie wachsen**, ein neu
+abgebildeter Kern ohne ABI-Zeile fällt namentlich durch, und ein verdrahteter muss von der
+Liste. Das fängt genau den Fehler, für den der Prüfer existiert — einen NEUEN Kern, der
+unverdrahtet ankommt — an dem Tag, an dem er passiert.
+
+### Die Szene
+
+Mit den vier ABI-Zeilen an Ort und Stelle:
+
+```
+particlesoftbody: cloud mean y 1.2750 -> 1.2154 (lowest 1.2107), |dy| last step 0.000032
+[  OK  ] die Wolke ruht bei y = 1,2154 AUF dem Weichkörperwürfel
+```
+
+vorher 0,2247 — der Wert, bei dem die Kontrolle ohne Würfel liegt, auf vier Stellen genau.
+Die Kontrolle `PXG_PSB_NOSOFTBODY=1` liegt weiterhin dort. Die Szene hat genau eine Tranche
+im Diagnoseblock verbracht, und das ist die Zeit, die es gebraucht hat, ihren Fehlschlag zu
+verstehen.
+
+### Was das über die Vorgehensweise sagt
+
+Eine Vorrichtung prüft den Shader. Ein Mutant prüft die Vorrichtung. Ein statischer Prüfer
+prüft, was beide nicht sehen. Keiner der drei prüft, ob die **Engine** den Kern überhaupt
+starten kann — dafür gab es bis heute nur die Szenen, und Szenen gibt es nicht für jeden
+Kern. Die 54 auf der Ratsche sind die Größe dieser blinden Stelle, aufgeschrieben statt
+geschätzt.
+
 ## P9.48c — die beobachtende Szene, und was sie tatsächlich gemessen hat
 
 **Ergebnis:** kein neuer Manifesteintrag; die Szene ist eine **Diagnose**, keine gewertete.
@@ -1807,12 +1899,21 @@ dem Kocher, und `PXG_PSB_PARTW` (Vorgabe 200) setzt die Partikel in denselben Be
 
 ### Was gemessen ist
 
-* **Die ganze Kette läuft.** `PXG_LAUNCH_TRACE` über 40 Schritte:
+* **Die ganze Kette wird angestoßen.** `PXG_LAUNCH_TRACE` über 40 Schritte:
   `sb_psMidphaseGeneratePairsLaunch` 40, `sb_psContactGenLaunch` 40,
   `sb_particleContactPrepareLaunch` 40, `sb_solveOutputSPDeltaVLaunch` 360,
   `sb_solveOutputParticleDeltaVLaunch` 360 — und der in P9.48a neu abgebildete Verbraucher
   `ps_accumulateFEMParticleDeltaVLaunch` **361**. Keine einzige `[pxg-unmapped]`-Zeile
   nennt irgendetwas auf diesem Pfad.
+
+  > **KORREKTUR (P9.48d).** Dieser Punkt war falsch, und zwar genau an der Stelle, an der
+  > es weh tut: die 361 Zeilen waren **361 Ablehnungen**. Die Spur druckte eine Zeile pro
+  > Start*versuch* und unterschied `OK` von `REFUSED` nicht auf einen Blick, und ich habe
+  > sie als „läuft" gelesen. Die vier in P9.48a/b abgebildeten Kerne hatten keine Zeile in
+  > der Start-ABI-Tabelle, also lieferte `pushConstantSizeFor()` 0 und die exakte
+  > Blob-Prüfung des Shims wies **jeden** Start ab. Was unten als „die Lücke liegt vor dem
+  > Verbraucher" steht, war damit ebenfalls falsch: die Lücke lag IM Verbraucher — er lief
+  > nie. Siehe P9.48d.
 * **Die Wolke fällt trotzdem hindurch**, von 1,2750 auf **0,2247** — und 0,2247 ist auf die
   vierte Stelle genau der Wert, bei dem die Kontrolle OHNE Würfel zur Ruhe kommt.
 * **Und das ist keine Vermutung.** Die inverse Partikelmasse wurde über einen

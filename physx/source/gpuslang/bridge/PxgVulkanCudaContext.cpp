@@ -312,7 +312,14 @@ public:
     // "form kernelName result" — the ground truth of what the engine actually
     // launches (and in what order) during a stepped scene.  Drives the P5
     // Step 4 bring-up work list; costs nothing when the env var is unset.
-    void traceLaunch(const char* form, PxgKernelId id, bool ok)
+    // P9.48d: a REFUSED line said WHICH kernel was refused and nothing about WHY,
+    // and the shim's blob gate is the usual reason -- its check is exact, so a
+    // launch site that passes one argument too many (or a struct whose trailing
+    // padding rounds differently) is rejected silently and the kernel simply
+    // never runs.  That is indistinguishable, in a trace, from a kernel that ran
+    // and found nothing.  The blob size the bridge actually built goes in the
+    // line so the next reader can compare it against the shader's blob at once.
+    void traceRefusal(const char* form, PxgKernelId id, uint32_t blobBytes)
     {
         static const bool on = std::getenv("PXG_LAUNCH_TRACE") != nullptr;
         if (!on)
@@ -320,7 +327,34 @@ public:
         const char* name = id < mManifestCount && mManifest[id].cudaName
             ? mManifest[id].cudaName
             : (id < mManifestCount && mManifest[id].entry ? mManifest[id].entry : "?");
-        std::fprintf(stderr, "[pxg-launch] %s %s %s\n", form, name, ok ? "OK" : "REFUSED");
+        std::fprintf(stderr, "[pxg-refused] %s %s built a %u-byte push blob -- the shim "
+                             "requires an EXACT match with the shader's\n", form, name, blobBytes);
+    }
+
+    void traceLaunch(const char* form, PxgKernelId id, bool ok,
+                     PxU32 gx = 0xffffffffu, PxU32 gy = 0, PxU32 gz = 0)
+    {
+        static const bool on = std::getenv("PXG_LAUNCH_TRACE") != nullptr;
+        if (!on)
+            return;
+        const char* name = id < mManifestCount && mManifest[id].cudaName
+            ? mManifest[id].cudaName
+            : (id < mManifestCount && mManifest[id].entry ? mManifest[id].entry : "?");
+        // P9.48d: the GRID goes in the line.  "launched" and "launched over
+        // nothing" are different facts, and the trace could not tell them apart:
+        // a dispatch whose grid has a ZERO dimension is a legal no-op, so a
+        // kernel the engine drives with numTests == 0 traced exactly like one
+        // doing work.  A whole scene's worth of "the chain runs" rested on that
+        // distinction.  When any dimension is 0 the line says so in words, so it
+        // cannot be skimmed past.
+        if (gx == 0xffffffffu)
+            std::fprintf(stderr, "[pxg-launch] %s %s %s\n", form, name, ok ? "OK" : "REFUSED");
+        else if (gx == 0u || gy == 0u || gz == 0u)
+            std::fprintf(stderr, "[pxg-launch] %s %s %s grid(%u,%u,%u) EMPTY-GRID\n",
+                         form, name, ok ? "OK" : "REFUSED", gx, gy, gz);
+        else
+            std::fprintf(stderr, "[pxg-launch] %s %s %s grid(%u,%u,%u)\n",
+                         form, name, ok ? "OK" : "REFUSED", gx, gy, gz);
     }
 
     // PXG_LAUNCH_TRACE=1: name the kernel BEFORE handing it to the shim, so the
@@ -436,7 +470,9 @@ public:
         traceDispatch("sized", id);
         const PxgResult res = mShim->launchKernel(id, gridDimX, gridDimY, gridDimZ, blob.data(),
                                                   uint32_t(blob.size()));
-        traceLaunch("sized", id, res == PxgResult::Success);
+        if (res != PxgResult::Success)
+            traceRefusal("sized", id, uint32_t(blob.size()));
+        traceLaunch("sized", id, res == PxgResult::Success, gridDimX, gridDimY, gridDimZ);
         return record(res);
     }
     PxCUresult launchKernel(CUfunction f, PxU32 gridDimX, PxU32 gridDimY, PxU32 gridDimZ,
