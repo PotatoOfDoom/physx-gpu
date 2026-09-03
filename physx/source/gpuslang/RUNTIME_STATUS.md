@@ -1786,6 +1786,59 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.48c — die beobachtende Szene, und was sie tatsächlich gemessen hat
+
+**Ergebnis:** kein neuer Manifesteintrag; die Szene ist eine **Diagnose**, keine gewertete.
+`PXG_SCENE=particlesoftbody` steht im Diagnoseblock von `run_scenes.sh`, nicht in `SCENES`,
+und die Wertung bleibt bei **36/36**. Was sie liefert, ist keine grüne Zeile, sondern eine
+Messung — und die ist eindeutiger, als eine bestandene Prüfung es gewesen wäre.
+
+### Die Szene
+
+Eine statische Ebene bei y = 0, ein FEM-Volumenwürfel der Kantenlänge 1 darauf (Deckfläche
+bei y = 1) und eine 3×3×3-Wolke aus PBD-Partikeln, knapp darüber eingesetzt. Die Wolke ist
+0,3 × 0,3 breit gegen die 1 × 1 große Deckfläche: eine Wolke, die GEHALTEN wird, bleibt
+ganz auf dem Würfel, eine, die es nicht wird, fällt eine ganze Einheit weiter auf die
+Ebene. Die Kontrolle `PXG_PSB_NOSOFTBODY=1` nimmt den Würfel weg und sonst nichts.
+
+Das Massenverhältnis ist Teil des Aufbaus, genau wie der Kopf der `softbodycloth`-Szene es
+für das Tuch festhält: die Simulationsknoten des Würfels kommen mit inverser Masse 192 aus
+dem Kocher, und `PXG_PSB_PARTW` (Vorgabe 200) setzt die Partikel in denselben Bereich.
+
+### Was gemessen ist
+
+* **Die ganze Kette läuft.** `PXG_LAUNCH_TRACE` über 40 Schritte:
+  `sb_psMidphaseGeneratePairsLaunch` 40, `sb_psContactGenLaunch` 40,
+  `sb_particleContactPrepareLaunch` 40, `sb_solveOutputSPDeltaVLaunch` 360,
+  `sb_solveOutputParticleDeltaVLaunch` 360 — und der in P9.48a neu abgebildete Verbraucher
+  `ps_accumulateFEMParticleDeltaVLaunch` **361**. Keine einzige `[pxg-unmapped]`-Zeile
+  nennt irgendetwas auf diesem Pfad.
+* **Die Wolke fällt trotzdem hindurch**, von 1,2750 auf **0,2247** — und 0,2247 ist auf die
+  vierte Stelle genau der Wert, bei dem die Kontrolle OHNE Würfel zur Ruhe kommt.
+* **Und das ist keine Vermutung.** Die inverse Partikelmasse wurde über einen
+  **hundertfachen** Bereich gefegt — 20, 200, 2000 — und die Bahn änderte sich in **keiner
+  einzigen Ziffer**: Schritt 20 bei 0,6455, Schritt 39 bei 0,2643, tiefster Punkt 0,2058,
+  dreimal identisch. Erreichte irgendein Kontakt die Partikel, stünde ihre Masse im
+  Ergebnis. Keiner tut es.
+
+Damit liegt die Lücke **vor** dem Verbraucher, nicht in ihm: entweder emittiert
+`sb_psContactGenLaunch` für dieses Paar nichts, oder die Szene muss etwas einstellen, damit
+er es tut. Welches von beidem, ist die nächste Frage — und sie hier zu beantworten hieße
+raten.
+
+### Warum die Szene trotzdem eingecheckt ist
+
+Aus demselben Grund wie `clothmesh` seit P9.26: eine Szene, die eine Lücke **misst**, ist
+mehr wert als eine Notiz, die sie behauptet. Sie steht im Diagnoseblock, sie erhöht keinen
+Zähler, sie entscheidet die Wertung nicht — und sie druckt bei jedem Durchgang die Zahl,
+an der man erkennt, wann die Lücke geschlossen ist. Zieht sie in `SCENES` um, ist das der
+Beweis.
+
+Was P9.48a und P9.48b geliefert haben, steht davon unberührt: vier Kerne abgebildet
+(395 → 399), 54 Mutanten in vier Fegedurchgängen, 50 getötet, alle Überlebenden mit Beweis.
+Was P9.48c hinzufügt, ist die ehrliche Feststellung, dass die Kette damit noch nicht von
+einem Ende zum anderen sichtbar ist.
+
 ## P9.48b — der Anheftungskern, der jede Symmetrie seiner drei Geschwister bricht, und drei Wächter, die man nicht töten kann
 
 **Ergebnis:** Manifest **398 → 399/501**. Suite **845/845 in beiden Speichermodi**, beide im

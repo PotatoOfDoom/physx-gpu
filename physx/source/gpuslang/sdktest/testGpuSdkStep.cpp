@@ -3927,6 +3927,159 @@ PxDeformableVolume* buildFemVolumeCube(PxPhysics* physics, PxScene* scene,
     return volume;
 }
 
+// ---------------------------------------------------------------------------
+// PXG_SCENE=particlesoftbody (P9.48c): the scene the FEM->PARTICLE half of the chain
+// exists for, and the one that could not exist before P9.48a.
+//
+// P9.39c..e mapped the softbody-vs-particle contact SOLVE: it writes a deltaP per
+// CONTACT.  What it could not do was move a particle, because the consumer that reduces
+// those per-contact deltas onto the particle -- ps_accumulateFEMParticleDeltaVLaunch,
+// preceded by the two ps_findStartEndFEM passes -- was unmapped.  Every kernel in the
+// chain dispatched, the softbody reacted, and the particles received nothing.  A cloud
+// dropped on a softbody fell straight through it.
+//
+// THE SETUP: a static plane at y = 0, a FEM-VOLUME cube of edge 1 resting on it (top face
+// at y = 1), and a small cloud of PBD particles spawned just above that face.  The cloud
+// is 0.3 x 0.3 wide against the cube's 1 x 1 top, so a cloud that is CAUGHT stays entirely
+// on the cube and one that is not falls a whole unit further, to the plane.  The two
+// outcomes are a unit apart, which is what makes the control decisive.
+//
+// THE CONTROL: PXG_PSB_NOSOFTBODY=1 removes the cube and nothing else.  The cloud then
+// falls to the plane and rests at one rest offset above it.  Without that half the main
+// run proves nothing -- a cloud that simply never fell would pass it too.
+//
+// THE MASS RATIO IS PART OF THE SETUP, exactly as the softbodycloth header records for the
+// sheet.  The cube's simulation vertices come out of the cooker at invMass 192; a particle
+// at invMass 1 is a thousand times heavier than the thing it lands on, and the constraint
+// splits its correction by w_particle / (w_particle + sum bc^2 w_softbody) -- so nearly all
+// of every impulse goes into shoving the CUBE aside.  PXG_PSB_PARTW (default 200) sets the
+// particle inverse mass into the cube's own range, which is what lets the cube hold it.
+// ---------------------------------------------------------------------------
+struct SoftBodyParticleScene
+{
+    PxDeformableVolume* volume = nullptr;
+    PxPBDParticleSystem* system = nullptr;
+    PxParticleBuffer* buffer = nullptr;
+    PxU32 numParticles = 0;
+    PxU32 numSimVerts = 0;
+    bool hasSoftBody = true;
+    float cubeTopY = 0.0f;
+    PxCudaContextManager* cudaCtx = nullptr;
+};
+
+// The cloud's mean y, read back from the particle buffer's device array.
+static float sbParticleMeanY(const SoftBodyParticleScene& sc)
+{
+    if (!sc.buffer || sc.numParticles == 0) return 0.0f;
+    std::vector<PxVec4> host(sc.numParticles);
+    PxCudaContext* ctx = sc.cudaCtx->getCudaContext();
+    ctx->memcpyDtoH(host.data(), reinterpret_cast<CUdeviceptr>(sc.buffer->getPositionInvMasses()),
+                    sc.numParticles * sizeof(PxVec4));
+    double sum = 0.0;
+    for (PxU32 i = 0; i < sc.numParticles; ++i) sum += double(host[i].y);
+    return float(sum / double(sc.numParticles));
+}
+
+SoftBodyParticleScene buildSoftBodyParticleScene(PxPhysics* physics, PxScene* scene,
+                                                 PxMaterial* rigidMat,
+                                                 PxCudaContextManager* cudaCtx)
+{
+    SoftBodyParticleScene out;
+    out.cudaCtx = cudaCtx;
+
+    // The ground box is sunk and the island dynamic parked, for the reason the
+    // softbodycloth scene gives: both are real obstacles now that the hull branch
+    // exists, and neither belongs in what this scene measures.  The island is also the
+    // one live dynamic rigid the particle island's solver core requires -- with none,
+    // rigidSumInternalContactAndJointBatches2 dereferences null solver descriptors.
+    PxRigidStatic* ground = addGroundBox(physics, scene, rigidMat);
+    ground->setGlobalPose(PxTransform(PxVec3(0.0f, -50.5f, 0.0f)));
+    PxRigidDynamic* island = addDynamic(physics, scene, rigidMat, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                        boxInertia(PxVec3(0.5f), 1000.0f), 1.5f);
+    island->setGlobalPose(PxTransform(PxVec3(10.0f, 1.5f, 0.0f)));
+
+    {
+        PxRigidStatic* floor = physics->createRigidStatic(
+            PxTransformFromPlaneEquation(PxPlane(0.0f, 1.0f, 0.0f, 0.0f)));
+        PxShape* fs = physics->createShape(PxPlaneGeometry(), *rigidMat);
+        floor->attachShape(*fs);
+        scene->addActor(*floor);
+        fs->release();
+    }
+
+    const bool noSoftBody = std::getenv("PXG_PSB_NOSOFTBODY") != nullptr;
+    out.hasSoftBody = !noSoftBody;
+
+    const float size = 1.0f;
+    if (!noSoftBody)
+    {
+        PxDeformableVolume* volume = buildFemVolumeCube(physics, scene, cudaCtx, /*cells*/ 2u,
+                                                        size, /*baseY*/ 0.0f);
+        if (!volume) return out;
+        out.volume = volume;
+        out.numSimVerts = volume->getSimulationMesh()->getNbVertices();
+        out.cubeTopY = size;
+    }
+
+    // ---- the particle cloud, just above the cube's top face -----------------------------
+    const float particleSpacing = 0.15f;
+    const char* partWEnv = std::getenv("PXG_PSB_PARTW");
+    const float particleInvMass = partWEnv ? float(atof(partWEnv)) : 200.0f;
+
+    PxPBDMaterial* pbdMat = physics->createPBDMaterial(
+        /*friction*/ 0.2f, /*damping*/ 0.0f, /*adhesion*/ 0.0f, /*viscosity*/ 0.0f,
+        /*vorticityConfinement*/ 0.0f, /*surfaceTension*/ 0.0f, /*cohesion*/ 0.0f,
+        /*lift*/ 0.0f, /*drag*/ 0.0f);
+    PxPBDParticleSystem* ps = physics->createPBDParticleSystem(*cudaCtx);
+    const float restOffset = 0.5f * particleSpacing;
+    ps->setRestOffset(restOffset);
+    ps->setContactOffset(restOffset + 0.02f);
+    ps->setParticleContactOffset(restOffset + 0.02f);
+    ps->setSolidRestOffset(restOffset);
+    ps->setMaxVelocity(1e6f);
+    ps->setSolverIterationCounts(/*pos*/ 8, /*vel*/ 1);
+    const PxU32 phase = ps->createPhase(
+        pbdMat, PxParticlePhaseFlags(PxParticlePhaseFlag::eParticlePhaseSelfCollide));
+
+    // 3 x 3 x 3 at 0.15 spacing = a 0.3 cube, well inside the cube's 1 x 1 top face even
+    // after it spreads.  Spawned with its bottom row one rest offset above the top face,
+    // so it is a short settle rather than a drop that could punch through in one step.
+    const int G = 3;
+    const PxU32 N = PxU32(G * G * G);
+    const float spawnBaseY = (noSoftBody ? 0.0f : size) + restOffset + 0.05f;
+    std::vector<PxVec4> hostPos(N), hostVel(N, PxVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    std::vector<PxU32> hostPhase(N, phase);
+    const float c = 0.5f * float(G - 1) * particleSpacing;
+    PxU32 idx = 0;
+    for (int x = 0; x < G; ++x)
+        for (int y = 0; y < G; ++y)
+            for (int z = 0; z < G; ++z)
+                hostPos[idx++] = PxVec4(float(x) * particleSpacing - c,
+                                        spawnBaseY + float(y) * particleSpacing,
+                                        float(z) * particleSpacing - c, particleInvMass);
+
+    PxParticleBuffer* buffer = physics->createParticleBuffer(N, /*maxVolumes*/ 0, cudaCtx);
+    if (!buffer) { std::printf("FAIL: createParticleBuffer returned null\n"); return out; }
+    PxCudaContext* ctx = cudaCtx->getCudaContext();
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPositionInvMasses()), hostPos.data(),
+                    N * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getVelocities()), hostVel.data(),
+                    N * sizeof(PxVec4));
+    ctx->memcpyHtoD(reinterpret_cast<CUdeviceptr>(buffer->getPhases()), hostPhase.data(),
+                    N * sizeof(PxU32));
+    buffer->setNbActiveParticles(N);
+    buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_POSITION);
+    buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_VELOCITY);
+    buffer->raiseFlags(PxParticleBufferFlag::eUPDATE_PHASE);
+    ps->addParticleBuffer(buffer);
+    scene->addActor(*ps);
+
+    out.system = ps;
+    out.buffer = buffer;
+    out.numParticles = N;
+    return out;
+}
+
 SoftBodyClothScene buildSoftBodyClothScene(PxPhysics* physics, PxScene* scene, PxMaterial* rigidMat,
                                            PxCudaContextManager* cudaCtx)
 {
@@ -6347,6 +6500,89 @@ int main()
     }
 
     // PXG_SCENE=softbodyselfcollide (P8.4): the FEM-VOLUME SELF-collision money shot.
+    if (!std::strcmp(sceneName, "particlesoftbody"))
+    {
+        SoftBodyParticleScene sc = buildSoftBodyParticleScene(physics, scene, material, cudaCtx);
+        if (!sc.system || !sc.buffer || (sc.hasSoftBody && !sc.volume))
+        {
+            std::printf("[ FAIL ] gpu-sdk-step: particlesoftbody scene build failed\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1;
+        }
+        std::printf("  [  OK  ] scene 'particlesoftbody' built: %u PBD particles above a "
+                    "%s (%u sim verts)\n", sc.numParticles,
+                    sc.hasSoftBody ? "FEM-volume cube with its top face at y = 1"
+                                   : "BARE PLANE (control: no softbody)", sc.numSimVerts);
+        if (!std::getenv("PXG_GPU_STEP"))
+        {
+            std::printf("[  OK  ] gpu-sdk-step: particlesoftbody pipeline CONSTRUCTED "
+                        "(set PXG_GPU_STEP=1 to step it)\n");
+            scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+        }
+
+        const float dt = 1.0f / 60.0f;
+        const char* stepsEnv = std::getenv("PXG_PSB_STEPS");
+        const int steps = stepsEnv ? atoi(stepsEnv) : 120;
+        const float y0 = sbParticleMeanY(sc);
+        float y = y0, lowest = y0, lastDy = 0.0f;
+        bool finite = true;
+        std::printf("  stepping particlesoftbody (%d x %.4fs): cloud mean y0 = %.4f\n",
+                    steps, dt, y0);
+        for (int i = 0; i < steps; ++i)
+        {
+            const float prev = y;
+            scene->simulate(dt);
+            scene->fetchResults(true);
+            y = sbParticleMeanY(sc);
+            lastDy = y - prev;
+            lowest = PxMin(lowest, y);
+            finite = finite && std::isfinite(y);
+            if (i < 3 || i == steps - 1 || (i % 20 == 0))
+                std::printf("    step %3d: cloud mean y = %.4f (dy %+.5f)\n", i, y, lastDy);
+        }
+        std::printf("  particlesoftbody: cloud mean y %.4f -> %.4f (lowest %.4f), "
+                    "|dy| last step %.6f\n", y0, y, lowest, PxAbs(lastDy));
+
+        int failures = 0;
+        if (!finite)
+        { std::printf("FAIL: the cloud went non-finite\n"); ++failures; }
+        // (1) IT CAME TO REST.  A cloud still falling says nothing about what caught it.
+        if (!(PxAbs(lastDy) < 0.002f))
+        { std::printf("FAIL: the cloud is still moving %.6f per step at the end -- it never "
+                      "came to rest\n", PxAbs(lastDy)); ++failures; }
+        if (sc.hasSoftBody)
+        {
+            // (2) IT RESTED ON THE CUBE, not on the plane a whole unit below.  This is the
+            //     observable ps_accumulateFEMParticleDeltaVLaunch exists for: without the
+            //     accumulate the softbody-vs-particle solve writes per-contact deltas that
+            //     reach no particle, and the cloud falls straight through the cube.
+            if (!(y > 0.8f))
+            { std::printf("FAIL: the cloud came to rest at y = %.4f, below the cube's top face "
+                          "at y = 1 -- it fell THROUGH the softbody.  The consumer is "
+                          "ps_accumulateFEMParticleDeltaVLaunch plus the two ps_findStartEndFEM "
+                          "passes; if the [pxg-unmapped] lines below name them, this is that\n",
+                          y); ++failures; }
+            // (3) IT DID NOT PUNCH THROUGH AND COME BACK.  A cloud that dipped below the face
+            //     and was pushed out again is a different (and worse) story than one held.
+            if (!(lowest > 0.7f))
+            { std::printf("FAIL: the cloud dipped to y = %.4f before settling -- it passed "
+                          "through the cube's top face\n", lowest); ++failures; }
+        }
+        else
+        {
+            // The control: with no cube there is nothing at y = 1 and the cloud must reach
+            // the plane.  If it stopped high anyway, the main run's number means nothing.
+            if (!(y < 0.3f))
+            { std::printf("FAIL (control): with no softbody the cloud stopped at y = %.4f -- "
+                          "it must fall to the plane\n", y); ++failures; }
+        }
+        if (failures)
+        { std::printf("[ FAIL ] gpu-sdk-step: particlesoftbody checks failed (%d)\n", failures);
+          scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 1; }
+        std::printf("[  OK  ] gpu-sdk-step: particlesoftbody -- the cloud rests at y = %.4f "
+                    "%s\n", y, sc.hasSoftBody ? "ON the softbody cube" : "on the bare plane (control)");
+        scene->release(); physics->release(); cudaCtx->release(); foundation->release(); return 0;
+    }
+
     if (!std::strcmp(sceneName, "softbodycloth"))
     {
         SoftBodyClothScene sc = buildSoftBodyClothScene(physics, scene, material, cudaCtx);
