@@ -94,9 +94,13 @@
 // except sqrt/normalize/divisions, which are IEEE-identical between
 // llvmpipe and the CPU reference (getNormalized = v * (1/sqrt(dot))
 // with zero fallback — an explicit division, since OpInverseSqrt is
-// not correctly rounded; getTriangleActiveMaskFromNormal keeps the
-// normalize() intrinsic of the tranche-68 port, whose 0.0174 margins
-// absorb its ULP behavior).
+// not correctly rounded).  P9.47: getTriangleActiveMaskFromNormal used
+// to keep the normalize() INTRINSIC on the argument that its 0.0174
+// margins absorb the ULP difference.  That was a probability, not a
+// proof — a margin makes a flipped comparison unlikely, not impossible,
+// and Normalize of a degenerate (zero-area) edge is UNDEFINED where
+// getNormalized() returns zero.  It now calls the same getNormalized()
+// the rest of this file uses.
 
 import pxgSlangCommon;
 
@@ -411,25 +415,28 @@ float distanceSegmentTriangleSquared(float3 p, float3 q, float3 a, float3 b, flo
     return sqDistPE;
 }
 
-// getTriangleActiveMaskFromNormal (convexTriangle.cuh, tranche-68 port —
-// keeps the normalize() intrinsic convention of npTriMask.slang)
+// getTriangleActiveMaskFromNormal (convexTriangle.cuh:1600, tranche-68 port;
+// P9.47 replaced its normalize() intrinsics with getNormalized(), here and in
+// npTriMask.slang, which is what the engine actually calls)
 uint getTriangleActiveMaskFromNormal(float3 v0, float3 v1, float3 v2, float3 n)
 {
-    const float3 e01 = normalize(v1 - v0);
-    const float3 e02 = normalize(v2 - v0);
-    const float3 e12 = normalize(v2 - v1);
+    // P9.47: convexTriangle.cuh:1602-1604 uses getNormalized() -- the very helper
+    // this file already defines at :163 and calls eight times elsewhere.
+    const float3 e01 = getNormalized(v1 - v0);
+    const float3 e02 = getNormalized(v2 - v0);
+    const float3 e12 = getNormalized(v2 - v1);
     const float d01 = dot(e01, n);
     const float d02 = dot(e02, n);
     const float d12 = dot(e12, n);
-    const float3 tn = normalize(cross(e01, e02));
+    const float3 tn = getNormalized(cross(e01, e02));   // :1608
     const float eps = 0.0174f; // around 89 degrees
 
     if (d01 < -eps && d02 < -eps) return eV0;
     if (d01 > eps && d12 < -eps)  return eV1;
     if (d02 > eps && d12 > eps)   return eV2;
-    if (dot(normalize(cross(tn, e01)), n) < -eps) return eE01;
-    if (dot(normalize(cross(tn, e02)), n) > eps)  return eE02;
-    if (dot(normalize(cross(tn, e12)), n) < -eps) return eE12;
+    if (dot(getNormalized(cross(tn, e01)), n) < -eps) return eE01;   // :1620
+    if (dot(getNormalized(cross(tn, e02)), n) > eps)  return eE02;   // :1623
+    if (dot(getNormalized(cross(tn, e12)), n) < -eps) return eE12;   // :1626
     return 0u;
 }
 

@@ -158,7 +158,12 @@ uint contactReduce6(float3 ptRaw[32], float sep[32], float3 normal, uint allMask
     const uint i0 = lowestArgMax(vals, allMask, v);
     uint mask = 1u << i0;
 
-    for (uint j = 0; j < 32; ++j) vals[j] = length(point[i0] - point[j]);
+    // P9.47: contactReduction.cuh:93 is `(shuffle(point, i0) - point).magnitude()`.
+    for (uint j = 0; j < 32; ++j)
+    {
+        const float3 d0 = point[i0] - point[j];
+        vals[j] = sqrt(dot(d0, d0));
+    }
     const uint i1 = lowestArgMax(vals, allMask & ~mask, v);
     mask |= 1u << i1;
 

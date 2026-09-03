@@ -50,6 +50,17 @@ import pxgSlangSolverDesc;
 static const uint BLOCK_SIZE = 128;
 
 // mirrors updateWakeCounter() in integration.cuh
+// PxVec3::getNormalized (PxVec3.h:286-290): m = magnitudeSquared(); m > 0 ?
+// v * PxRecipSqrt(m) : zero.  PxRecipSqrt is intrinsics::recipSqrt = 1.0f/sqrtf
+// (PxWindowsMathIntrinsics.h:87), a reciprocal of an exactly specified square
+// root -- NOT GLSL.std.450 Normalize, which the Vulkan environment spec leaves
+// several ULP of room and which is undefined for a zero vector.
+float3 inGetNormalized(float3 v)
+{
+    const float m = dot(v, v);
+    return m > 0.0f ? v * (1.0f / sqrt(m)) : float3(0, 0, 0);
+}
+
 void updateWakeCounter(inout bool freeze, inout float4 solverBodyLinVel, inout float4 solverBodyAngVel,
                        PxgAlignedTransform body2World, inout PxgBodySim bodySim, out PxgSolverBodySleepData sleepData,
                        float4 inverseInertia, float3 linearMotionVel, float3 angularMotionVel,
@@ -330,7 +341,9 @@ void integrateCore(float4 motionLinVelXYZW, float4 motionAngVelXYZW, float4 inve
     const float maxW = 1e+7f; // Should be about sqrt(PX_MAX_REAL/2) or smaller
     if (w > maxW)
     {
-        angularMotionVel = normalize(angularMotionVel) * maxW;
+        // P9.47: integration.cuh:347 / :419 is
+        // `angularMotionVel.getNormalized() * maxW`.
+        angularMotionVel = inGetNormalized(angularMotionVel) * maxW;
         w = maxW;
     }
 
@@ -414,7 +427,9 @@ void integrateCoreTGS(float4 motionLinVelXYZW, float4 motionAngVelXYZW, float4 i
     const float maxW = 1e+7f;
     if (w > maxW)
     {
-        angularMotionVel = normalize(angularMotionVel) * maxW;
+        // P9.47: integration.cuh:347 / :419 is
+        // `angularMotionVel.getNormalized() * maxW`.
+        angularMotionVel = inGetNormalized(angularMotionVel) * maxW;
         w = maxW;
     }
 

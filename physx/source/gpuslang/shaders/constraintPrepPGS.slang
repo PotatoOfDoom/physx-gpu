@@ -391,7 +391,15 @@ void setupFinalizeSolverConstraintsBlock(Ptr<PxgBlockContactData> gContactPrepDa
 
         float3 t0 = vrel - normal * dot(normal, vrel);
         t0 = dot(t0, t0) > p1 ? t0 : t0Fallback;
-        t0 = normalize(t0);
+        // P9.47: artiConstraintPrep2.cu:468 is `t0.normalize()` -- PxVec3::normalize
+        // (PxVec3.h:295) takes magnitude() = PxSqrt(msq), then scales through
+        // operator/= (PxVec3.h:260): ONE reciprocal and three multiplies, under an
+        // m > 0 guard.  GLSL.std.450 Normalize is neither of those things.
+        {
+            const float m = sqrt(dot(t0, t0));
+            if (m > 0.0f)
+                t0 = t0 * (1.0f / m);
+        }
 
         const float3 t1 = cross(normal, t0);
 

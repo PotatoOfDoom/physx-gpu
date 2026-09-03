@@ -803,8 +803,27 @@ PXG_TEST(femClothSimBoxTriangleContactGen)
         const V3c e0 = { b.x - a.x, b.y - a.y, b.z - a.z };
         const V3c e1 = { c.x - a.x, c.y - a.y, c.z - a.z };
         V3c n = { e0.y * e1.z - e0.z * e1.y, e0.z * e1.x - e0.x * e1.z, e0.x * e1.y - e0.y * e1.x };
-        const float nl = std::sqrt(n.x * n.x + n.y * n.y + n.z * n.z);
-        n = V3c{ n.x / nl, n.y / nl, n.z / nl };
+        // P9.47: the engine takes this triangle normal with PxVec3::getNormalized()
+        // (PxVec3.h:286-290) -- m = magnitudeSquared(), then v * PxRecipSqrt(m), i.e.
+        // ONE reciprocal of an exactly specified square root and three multiplies,
+        // with the zero vector for a degenerate triangle.  This mirror used to divide
+        // each component by the magnitude separately, which agreed with the shader
+        // only while the shader spelled the normalisation as the GLSL.std.450
+        // Normalize INTRINSIC -- two wrong readings that happened to match.  It is
+        // also the P9.45 componentwise-divide class, on the host side where
+        // gpuslang.componentDivide cannot see it.
+        {
+            const float nm = n.x * n.x + n.y * n.y + n.z * n.z;
+            if (nm > 0.0f)
+            {
+                const float r = 1.0f / std::sqrt(nm);
+                n = V3c{ n.x * r, n.y * r, n.z * r };
+            }
+            else
+            {
+                n = V3c{ 0.0f, 0.0f, 0.0f };
+            }
+        }
 
         FctCase cs{};
         cs.convexScale = F4{ boxExt.x, boxExt.y, boxExt.z, cdCloth + cdRigid };

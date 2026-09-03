@@ -415,7 +415,7 @@ void sb_sbMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid :
                                     // (PxVec3.h:260) -- and with the m > 0 guard, which is reachable
                                     // for denormal-scale v (dot(v, normal) > 0 while dot(v, v)
                                     // underflows to 0).
-                                    dist = length(v);
+                                    dist = sqrt(dot(v, v));   // P9.47: magnitude(), not Length
                                     if (dist > 0.0f)
                                         v = v * (1.0f / dist);
                                     if (dot(normal, v) > 0.707f)

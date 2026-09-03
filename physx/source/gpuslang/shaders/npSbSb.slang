@@ -369,7 +369,7 @@ void ctSbSbQuery(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
                                 // P9.36: softbodySoftbodyMidPhase.cu:591 is
                                 // `dist = v.normalize();` -- PxVec3::normalize goes through
                                 // operator/= (PxVec3.h:260): ONE reciprocal, three multiplies.
-                                dist = length(v);
+                                dist = sqrt(dot(v, v));   // P9.47: magnitude(), not Length
                                 if (dist > 0.0f) // PxVec3::normalize guards m > 0; returns the length
                                     v = v * (1.0f / dist);
                                 normal = dot(v, normal) < -0.707f ? v : -normal;

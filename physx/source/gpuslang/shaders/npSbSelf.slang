@@ -371,7 +371,7 @@ void ctSbSelfQuery(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
                                 // reachable: for denormal-scale v, dot(v, normal) can be positive
                                 // while dot(v, v) underflows to zero, and the engine then leaves v
                                 // untouched and returns 0 where an unguarded divide gives NaN.
-                                dist = length(v);
+                                dist = sqrt(dot(v, v));   // P9.47: magnitude(), not Length
                                 if (dist > 0.0f)
                                     v = v * (1.0f / dist);
                                 if (dot(normal, v) > 0.707f)

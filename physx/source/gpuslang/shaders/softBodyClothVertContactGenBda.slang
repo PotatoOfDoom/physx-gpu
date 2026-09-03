@@ -273,7 +273,7 @@ void sb_clothVertContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
         float3 v = closestP - p;
         // P9.36: PxVec3::normalize scales through operator/= (PxVec3.h:260) -- ONE
         // reciprocal, three multiplies.
-        const float m = length(v);
+        const float m = sqrt(dot(v, v));   // P9.47: magnitude(), not Length
         if (m > 0.0f)
             v = v * (1.0f / m);
 

@@ -156,7 +156,8 @@ void atomicAdd3(PxgStridedVec3View view, uint i, float3 v)
 // untouched when it is degenerate
 float normalizeSafe(inout float3 v)
 {
-    const float mag = length(v);
+    // P9.47: normalizeSafe's magnitude is PxSqrt(magnitudeSquared()), not GLSL Length.
+    const float mag = sqrt(dot(v, v));
     if (mag < 1e-20f) // PX_NORMALIZATION_EPSILON
         return 0.0f;
     v *= 1.0f / mag;

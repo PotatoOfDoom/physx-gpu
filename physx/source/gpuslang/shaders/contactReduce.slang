@@ -126,7 +126,8 @@ void ctContactReduce(uint3 dtid : SV_DispatchThreadID)
         if (useReduce2)
         {
             distAdj[j] = -sep[j];
-            initCrit[j] = length(point[j]);
+            // P9.47: contactReduction.cuh:185 is `point.magnitude()`.
+            initCrit[j] = sqrt(dot(point[j], point[j]));
         }
         else
         {
@@ -171,7 +172,12 @@ void ctContactReduce(uint3 dtid : SV_DispatchThreadID)
     const uint i0 = lowestArgMax(vals, allMask, v);
     uint mask = 1u << i0;
 
-    for (uint j = 0; j < 32; ++j) vals[j] = length(point[i0] - point[j]) + distAdj[j];
+    // P9.47: contactReduction.cuh:93 is `(shuffle(point, i0) - point).magnitude()`.
+    for (uint j = 0; j < 32; ++j)
+    {
+        const float3 d0 = point[i0] - point[j];
+        vals[j] = sqrt(dot(d0, d0)) + distAdj[j];
+    }
     const uint i1 = lowestArgMax(vals, allMask & ~mask, v);
     mask |= 1u << i1;
 

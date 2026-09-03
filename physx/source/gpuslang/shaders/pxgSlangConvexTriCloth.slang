@@ -547,7 +547,12 @@ uint contactReduce5(float3 ptRaw[32], float sep[32], float3 normal, uint allMask
     const uint i0 = lowestArgMax(vals, allMask, v);
     uint mask = 1u << i0;
 
-    for (uint j = 0; j < 32; ++j) vals[j] = length(point[i0] - point[j]);
+    // P9.47: contactReduction.cuh:93 is `(shuffle(point, i0) - point).magnitude()`.
+    for (uint j = 0; j < 32; ++j)
+    {
+        const float3 d0 = point[i0] - point[j];
+        vals[j] = sqrt(dot(d0, d0));
+    }
     const uint i1 = lowestArgMax(vals, allMask & ~mask, v);
     mask |= 1u << i1;
 
@@ -651,7 +656,8 @@ public uint4 fcClothConvexTriContactGen(FctCase cs, uint64_t hull, FcCtWriter w)
 
                 float3 shapeSpacePlaneNormal =
                     vertex2ShapeNormalVector(polygonf4.xyz, convexScale, convexScaleRot);
-                const float mag = length(shapeSpacePlaneNormal);
+                // P9.47: normalize()'s return value is magnitude() = PxSqrt(msq).
+                const float mag = sqrt(dot(shapeSpacePlaneNormal, shapeSpacePlaneNormal));
                 const float invMagnitude = 1.0f / mag;
                 // P9.36: convexTriangle.cuh:246 is
                 // `const PxReal invMagnitude = 1.0f / shapeSpacePlaneNormal.normalize();`
@@ -839,7 +845,8 @@ public uint4 fcClothConvexTriContactGen(FctCase cs, uint64_t hull, FcCtWriter w)
             float p0d = referencePolygon_plane.w;
             // PxPlane::normalize
             {
-                const float denom = 1.0f / length(p0n);
+                // P9.47: PxPlane::normalize (PxPlane.h:126) divides by n.magnitude().
+                const float denom = 1.0f / sqrt(dot(p0n, p0n));
                 p0n *= denom;
                 p0d *= denom;
             }

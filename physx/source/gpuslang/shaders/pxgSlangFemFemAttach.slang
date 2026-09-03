@@ -148,7 +148,8 @@ public bool isConeLimitedEnabled(float maxAngle, float minDist, float maxDist)
 public float3 computeConeLimitedError(float maxAngle, float minDist, float maxDist,
                                       float3 coneAxis, float3 relPos)
 {
-    float len = length(relPos);
+    // P9.47: attachments.cuh:50 is `relPos.magnitude()` = PxSqrt(magnitudeSquared()).
+    float len = sqrt(dot(relPos, relPos));
 
     float3 dir;
     if (maxAngle == 0.0f)

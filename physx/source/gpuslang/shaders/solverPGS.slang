@@ -1255,8 +1255,10 @@ void writebackBlocks(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : SV_
             angVel -= cross(body0WorldOffset_linBreakImpulse.xyz, linVel);
 
             const uint broken = breakable != 0
-                ? ((length(linVel) > body0WorldOffset_linBreakImpulse.w ||
-                    length(angVel) > jointHeaders[batchIndex].angBreakImpulse[threadIndex]) ? 1u : 0u)
+                // P9.47: solverBlock.cuh:840 compares linVel.magnitude() and
+                // angVel.magnitude(); a last-bit difference flips the break at the limit.
+                ? ((sqrt(dot(linVel, linVel)) > body0WorldOffset_linBreakImpulse.w ||
+                    sqrt(dot(angVel, angVel)) > jointHeaders[batchIndex].angBreakImpulse[threadIndex]) ? 1u : 0u)
                 : 0u;
             constraintWriteBack[forceWritebackOffset].angularImpulse_residual =
                 float4(angVel, constraintErrorSq);

@@ -99,15 +99,30 @@ uint getTriangleActiveMask(float v, float w)
     return mask;
 }
 
+// PxVec3::getNormalized (PxVec3.h:286-290): m = magnitudeSquared(); m > 0 ?
+// v * PxRecipSqrt(m) : zero.  PxRecipSqrt is intrinsics::recipSqrt = 1.0f/sqrtf
+// (PxWindowsMathIntrinsics.h:87), so it is a reciprocal of an exactly specified
+// square root -- NOT GLSL.std.450 Normalize, which the Vulkan environment spec
+// leaves several ULP of room and which is undefined for a zero vector.
+float3 tmGetNormalized(float3 v)
+{
+    const float m = dot(v, v);
+    return m > 0.0f ? v * (1.0f / sqrt(m)) : float3(0, 0, 0);
+}
+
 uint getTriangleActiveMaskFromNormal(float3 v0, float3 v1, float3 v2, float3 n)
 {
-    const float3 e01 = normalize(v1 - v0);
-    const float3 e02 = normalize(v2 - v0);
-    const float3 e12 = normalize(v2 - v1);
+    // P9.47: convexTriangle.cuh:1602-1604 uses getNormalized(), not a Normalize
+    // intrinsic.  The difference is both a last-bit one and a defined-ness one:
+    // getNormalized() returns the ZERO vector for a degenerate edge, while
+    // GLSL.std.450 Normalize of a zero vector is undefined.
+    const float3 e01 = tmGetNormalized(v1 - v0);
+    const float3 e02 = tmGetNormalized(v2 - v0);
+    const float3 e12 = tmGetNormalized(v2 - v1);
     const float d01 = dot(e01, n);
     const float d02 = dot(e02, n);
     const float d12 = dot(e12, n);
-    const float3 tn = normalize(cross(e01, e02));
+    const float3 tn = tmGetNormalized(cross(e01, e02));   // :1608
     const float eps = 0.0174f; // around 89 degrees
 
     if (d01 < -eps && d02 < -eps)
@@ -116,11 +131,11 @@ uint getTriangleActiveMaskFromNormal(float3 v0, float3 v1, float3 v2, float3 n)
         return M_V1;
     if (d02 > eps && d12 > eps)
         return M_V2;
-    if (dot(normalize(cross(tn, e01)), n) < -eps)
+    if (dot(tmGetNormalized(cross(tn, e01)), n) < -eps)   // :1620
         return M_E01;
-    if (dot(normalize(cross(tn, e02)), n) > eps)
+    if (dot(tmGetNormalized(cross(tn, e02)), n) > eps)    // :1623
         return M_E02;
-    if (dot(normalize(cross(tn, e12)), n) < -eps)
+    if (dot(tmGetNormalized(cross(tn, e12)), n) < -eps)   // :1626
         return M_E12;
 
     return 0u;

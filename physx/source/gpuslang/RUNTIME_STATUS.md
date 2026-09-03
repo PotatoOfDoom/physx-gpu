@@ -7,7 +7,19 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **844/844** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **845/845** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.47 added `gpuslang.lengthIntrinsic`, the SEVENTH static checker: GLSL.std.450
+`Length`, `Distance` and `Normalize` are given a precision allowance by the Vulkan
+environment spec, while the engine computes those quantities from operations that
+ARE pinned — `PxVec3::magnitude()` is `PxSqrt(magnitudeSquared())`,
+`getNormalized()` is `v * PxRecipSqrt(m)` where `PxRecipSqrt` is literally
+`1.0f/sqrtf`, `PxVec3::normalize()` is one reciprocal and three multiplies, and
+`PxQuat::getNormalized()` is `1/magnitude()` and four.  The audit behind the rule
+traced all **58** such calls in the corpus back to their .cu and found not one
+whose engine original calls an intrinsic with the same latitude, so the allowlist
+is EMPTY — unlike `gpuslang.componentDivide`, there is nothing faithful to carve
+out.  `InverseSqrt` is deliberately outside the rule (P9.33a measured it) and so
+is `Sqrt` (correctly rounded by the same spec).
 P9.33a added `gpuslang.npFloatIntrinRecipSqrt`, which is not a kernel port but a
 PLATFORM measurement: about forty shaders here spell `PxVec3::getNormalized` as
 `v * rsqrt(m)`, while the engine computes `PxRecipSqrt` = `1.0f/sqrtf` — two exactly
@@ -1773,6 +1785,142 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.47 — `length()` und `normalize()` sind nicht, was die Engine rechnet: 58 Stellen, ein siebter Prüfer und eine leere Ausnahmeliste
+
+**Ergebnis:** kein neuer Manifesteintrag — es wird nichts abgebildet, sondern eine
+Rundungsfreiheit aus dem Korpus entfernt; das Manifest bleibt bei **395/501**. Suite
+**845/845 in beiden Speichermodi** (Modus 2 im ersten Anlauf, 275 s; Modus 1 im zweiten,
+295 s — der erste fiel auf dem bekannten `gpuslang.femClothSim`-Segfault aus). Der Zuwachs
+von 844 ist der **siebte statische Prüfer**, `gpuslang.lengthIntrinsic`. Szenen **36/36 ok, 0 fail, 0 missing**, null `unmapped`-Zeilen. **58 Aufrufstellen in 30 Shadern** umgeschrieben — und eine
+Wirtsspiegelung, die den Fehler mitgetragen hat.
+
+### Was der Vulkan-Standard offen lässt und die Engine nicht
+
+Drei erweiterte GLSL-Anweisungen sind in ihrem letzten Bit **nicht festgelegt**:
+`Length`, `Distance` und `Normalize`. Die Umgebungsspezifikation räumt ihnen mehrere ULP
+ein, und eine Implementierung darf `Normalize` als `v / Length(v)` oder als
+`v * InverseSqrt(dot)` ausführen, wie sie mag. Für den Nullvektor ist `Normalize`
+**undefiniert**.
+
+Die Engine ist an jeder einzelnen dieser Stellen exakt:
+
+| Engine | Ausdruck |
+|---|---|
+| `PxVec3::magnitude()` (PxVec3.h:179) | `PxSqrt(magnitudeSquared())` — IEEE-Wurzel, korrekt gerundet |
+| `cutil_math.h` `length()` | `sqrtf(dot(v,v))` — dasselbe |
+| `PxVec3::getNormalized()` (:286-290) | `m = msq; m > 0 ? v * PxRecipSqrt(m) : 0` |
+| `PxVec3::normalize()` (:295-301) | `m = magnitude(); if (m > 0) *this /= m` — EIN Kehrwert, drei Multiplikationen (:260) |
+| `PxQuat::getNormalized()` (PxQuat.h:211) | `s = 1 / magnitude(); q * s` — vier Multiplikationen |
+
+`PxRecipSqrt` ist `intrinsics::recipSqrt` und das ist wörtlich `1.0f / ::sqrtf(a)`
+(PxWindowsMathIntrinsics.h:87) — der Kehrwert einer exakt festgelegten Wurzel, keine
+Schätzung.
+
+### Der Befund: die Ausnahmeliste ist LEER
+
+Der Korpus hatte **58** solche Aufrufe (36 `Length`, 22 `Normalize`) in 30 Shadern. Jeder
+einzelne wurde auf seine .cu zurückverfolgt, und das Ergebnis hat keine Grauzone:
+**nicht eine Stelle** hatte ein CUDA-Original, das selbst eine Anweisung mit derselben
+Freiheit aufruft. Alle 58 bilden eine der fünf Zeilen der Tabelle oben ab.
+
+Deshalb ist die Ausnahmeliste des neuen Prüfers leer — und das ist die Aussage, nicht
+eine Schwäche. `gpuslang.componentDivide` musste sieben Shader freistellen, weil die
+Engine `calcGridPos` wirklich komponentenweise dividiert. Hier gibt es nichts
+freizustellen.
+
+### Der Korpus wusste es schon — an anderen Stellen
+
+Das Unangenehme an diesem Durchgang ist, dass die richtige Schreibweise seit Langem
+danebensteht:
+
+* `femClothDampingBda.slang:85` trägt wörtlich den Kommentar
+  „`sqrt(dot(v,v))`, NICHT `length(v)`: `PxVec3::magnitude()` ist `PxSqrt` von …".
+* `npArtiConstraintPrep.slang:592` hält sogar die **Messung** fest: „ausgeschrieben, NICHT
+  die `normalize()`-Anweisung (1 ULP daneben auf llvmpipe)". Dieselbe Engine-Zeile
+  (`t0.normalize()`, artiConstraintPrep2.cu:468) stand in `constraintPrepPGS.slang:394`
+  und `constraintPrepTGS.slang:411` als blanke `normalize()`.
+* **Zwanzig** Shader definieren bereits einen `getNormalized`-Helfer mit genau
+  `m > 0 ? v * (1/sqrt(m)) : 0`.
+* Und `npCvxMeshNp.slang` definiert diesen Helfer bei :163, ruft ihn achtmal auf — und
+  benutzte die Anweisung **siebenmal** in einer Funktion zweihundert Zeilen weiter unten.
+
+### Ein zurückgezogenes Argument
+
+Der Kopfkommentar von `npCvxMeshNp.slang` begründete das ausdrücklich:
+`getTriangleActiveMaskFromNormal` behalte „die `normalize()`-Anweisung des
+Tranche-68-Ports, deren 0,0174-Ränder ihr ULP-Verhalten auffangen".
+
+Das ist kein Beweis, sondern eine Wahrscheinlichkeit. Ein Rand macht einen gekippten
+Vergleich unwahrscheinlich, nicht unmöglich — und er sagt nichts über den zweiten
+Unterschied: `getNormalized()` liefert für eine **entartete** (nullflächige) Kante den
+Nullvektor, während `Normalize` dort undefiniert ist. Entartete Dreiecke sind in einem
+Netz keine Hypothese. Der Kommentar ist jetzt korrigiert und benennt beides.
+
+Zwei der 58 Stellen entscheiden ohnehin ein diskretes Ereignis, wo ein letztes Bit reicht:
+`solverBlock.cuh:840` vergleicht `linVel.magnitude()` und `angVel.magnitude()` gegen die
+Bruchgrenzen eines Gelenks — ein Gelenk bricht oder nicht.
+
+### Was die Suite gesehen hat, und warum nur das
+
+Von 845 Tests wurde durch die 58 Änderungen **genau einer** rot:
+`gpuslang.femClothSim` / `femClothSimBoxTriangleContactGen`. Und zwar nicht, weil der
+Shader falsch geworden wäre, sondern weil er **richtig** geworden ist: seine
+Wirtsspiegelung normierte den Dreiecksnormalenvektor mit **drei Divisionen**
+
+```cpp
+const float nl = std::sqrt(n.x*n.x + n.y*n.y + n.z*n.z);
+n = V3c{ n.x / nl, n.y / nl, n.z / nl };
+```
+
+— die P9.45-Klasse, auf der Wirtsseite, wo `gpuslang.componentDivide` nicht hinsieht.
+Zwei falsche Lesarten, die sich gegenseitig bestätigt haben. Die Spiegelung schreibt jetzt
+`getNormalized()` aus, samt Nullfall.
+
+Dass nur ein Test angeschlagen hat, ist der ganze Grund für einen statischen Prüfer: eine
+Vorrichtung vergleicht gegen einen Spiegel, und ein Spiegel aus derselben Lesart stimmt
+mit dem Fehler überein. Ein Mutant hilft auch nicht — er fragt, ob die Vorrichtung eine
+Störung bemerkt, und eine gegen das Original blinde Vorrichtung ist auch gegen den
+Mutanten blind.
+
+### Der siebte Prüfer
+
+`gpuslang.lengthIntrinsic` (`tools/check_length_intrinsic.py`) zählt jede `OpExtInst` des
+Satzes `GLSL.std.450` mit den Nummern 66 (`Length`), 67 (`Distance`) und 69 (`Normalize`)
+und meldet jeden Shader, der mehr davon hat, als seine Ausnahmeliste erlaubt.
+**430 Shader gescannt, null Treffer, null Ausnahmen.**
+
+Nicht in der Regel sind mit Absicht:
+
+* `InverseSqrt` (32) — P9.33a hat sie über 258442 Eingaben gegen `1.0f/sqrtf` gemessen und
+  bitgleich befunden; `gpuslang.npFloatIntrinRecipSqrt` hält diese Messung am Leben. Diese
+  Stelle ruht auf einer Messung, nicht auf dem Wortlaut der Spezifikation, und das ist
+  festgehalten statt verschwiegen.
+* `Sqrt` (31) — von derselben Spezifikation, die `Length` frei lässt, als korrekt gerundet
+  vorgeschrieben. Sie IST die Operation der Engine.
+
+Sein Selbsttest ist ein Negativkontrollsatz aus sechs Fällen: er baut Miniaturmodule und
+verlangt, dass `Length`, `Distance` und `Normalize` gezählt werden, dass `Sqrt` und
+`InverseSqrt` es **nicht** werden, und dass die Nummer 66 eines ANDEREN erweiterten
+Anweisungssatzes nicht als `GLSL.std.450 Length` durchgeht. Fällt der Kontrollsatz, sagt
+der Prüfer das und verweigert sein Urteil.
+
+Was er nicht sehen kann: Wirtsspiegelungen. Der eine Fehler, den dieser Durchgang auf der
+CPU-Seite gefunden hat, wurde von der Suite gefunden, nicht von einer Regel — und nur,
+weil die Shaderseite vorher richtiggestellt wurde.
+
+### Die 58 Stellen
+
+| Familie | Engine | Stellen |
+|---|---|---|
+| `getParticleSpeculativeContactVolume` | `cVolumeOffset.magnitude()` (gridCal.cuh:139) | 9 Shader |
+| Kontaktreduktion | `.magnitude()` (contactReduction.cuh:93/:185) | 5 |
+| `getTriangleActiveMaskFromNormal` | `getNormalized()` ×7 (convexTriangle.cuh:1602-1626) | 2 × 7 |
+| Dreiecksnormalen | `getNormalized()` (convexMesh.cu:280, femClothPrimitives.cu:1887) | 3 |
+| Konvex-Schmalphase | `normalize()` / `PxPlane::normalize` / `.magnitude()` | 4 |
+| Löser + Integration | `magnitude()` ×4, `getNormalized()` ×2, `PxQuat::getNormalized()` | 7 |
+| Reibungstangente | `t0.normalize()` (artiConstraintPrep2.cu:468) | 2 |
+| FEM / Weichkörper | `v.normalize()`, `relPos.magnitude()`, `normalizeSafe()` | 7 |
 
 ## P9.46 — die Reibung, die zurückgestellt war: zwei Materialtabellen, zwei Quellen und ein Klemmglied, das jeden Fehler verschluckt
 

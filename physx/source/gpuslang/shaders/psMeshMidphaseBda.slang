@@ -287,7 +287,10 @@ float getParticleSpeculativeContactVolume(out float3 cVolumePos,
         scaleInv = isTGS ? sScaleInvTGS : sScaleInvPGS;
     const float3 cVolumeOffset = (predictedPos - currentPos) * scaleInv * 0.5f;
     cVolumePos = currentPos + cVolumeOffset;
-    return length(cVolumeOffset) + contactDist;
+    // P9.47: gridCal.cuh:139 is `cVolumeOffset.magnitude() + contactDist`, and
+    // PxVec3::magnitude() is PxSqrt(magnitudeSquared()) -- not GLSL Length, which
+    // the Vulkan environment spec leaves several ULP of room.
+    return sqrt(dot(cVolumeOffset, cVolumeOffset)) + contactDist;
 }
 
 float3 closestPtPointTriangle2(float3 p, float3 a, float3 b, float3 c, float3 ab, float3 ac)

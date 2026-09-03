@@ -1291,7 +1291,10 @@ void clothConvexTriCgBody(uint3 gtid, uint3 gid)
         const float3 t1 = ctQuatRotate(toConvQ, v1) + toConvP;
         const float3 t2 = ctQuatRotate(toConvQ, v2) + toConvP;
 
-        const float3 triN = normalize(cross(t1 - t0, t2 - t0));
+        // P9.47: the engine takes this triangle normal with getNormalized()
+        // (femClothPrimitives.cu:1887 / :3347), which this file already spells
+        // out as stNormalized() -- the only reciprocal-of-sqrt form the engine has.
+        const float3 triN = stNormalized(cross(t1 - t0, t2 - t0));
 
         FctCase cs;
         cs.convexScale = float4(rigidShape.scaleX, rigidShape.scaleY, rigidShape.scaleZ,

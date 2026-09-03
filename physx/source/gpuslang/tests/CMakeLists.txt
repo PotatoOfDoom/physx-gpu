@@ -2395,6 +2395,32 @@ add_test(NAME gpuslang.componentDivide
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_component_divide.py)
 
 # ---------------------------------------------------------------------------
+# A precision-LOOSE GLSL.std.450 instruction must not stand in for an exact
+# engine expression (P9.47).  The SEVENTH static checker.
+#
+# The Vulkan environment spec gives Length, Distance and Normalize a precision
+# allowance and lets an implementation lower them as it pleases.  The engine is
+# exact on both sides of every one of them: PxVec3::magnitude() is
+# PxSqrt(magnitudeSquared()) (PxVec3.h:179), cutil_math's length() is
+# sqrtf(dot(v,v)), PxVec3::getNormalized() is v * PxRecipSqrt(m) where
+# PxRecipSqrt is 1.0f/sqrtf, PxVec3::normalize() is one reciprocal and three
+# multiplies through operator/= (PxVec3.h:260), and PxQuat::getNormalized() is
+# 1/magnitude() and four multiplies.  None of those is a Length or a Normalize.
+#
+# The audit that produced this rule found FIFTY-EIGHT such calls, and every
+# single one of them mapped to one of those exact engine expressions -- not one
+# site in the corpus had a CUDA original that called an intrinsic with the same
+# latitude.  Hence the empty allowlist, which is the finding: unlike
+# gpuslang.componentDivide there is no faithful case to carve out.
+#
+# InverseSqrt is deliberately NOT in this rule: P9.33a measured it against
+# 1.0f/sqrtf over 258442 inputs and gpuslang.npFloatIntrinRecipSqrt keeps that
+# measurement live.  Sqrt is not in it either -- it is correctly rounded by the
+# same spec that leaves Length loose, so it IS the engine's operation.
+add_test(NAME gpuslang.lengthIntrinsic
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_length_intrinsic.py)
+
+# ---------------------------------------------------------------------------
 # Replicated engine helpers must agree (P9.37).
 #
 # This corpus writes the same engine helper out by hand over and over -- 69 copies

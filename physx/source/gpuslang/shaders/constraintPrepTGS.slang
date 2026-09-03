@@ -408,7 +408,13 @@ void setupFinalizeSolverConstraintsBlockTGS(Ptr<PxgBlockContactData> gContactPre
 
         float3 t0 = vrel - normal * dot(normal, vrel);
         t0 = dot(t0, t0) > p1 ? t0 : t0Fallback;
-        t0 = normalize(t0);
+        // P9.47: the TGS twin of artiConstraintPrep2.cu:468 -- PxVec3::normalize,
+        // i.e. PxSqrt(msq) then one reciprocal and three multiplies under m > 0.
+        {
+            const float m = sqrt(dot(t0, t0));
+            if (m > 0.0f)
+                t0 = t0 * (1.0f / m);
+        }
 
         const float3 t1 = cross(normal, t0);
 

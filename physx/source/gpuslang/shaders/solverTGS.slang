@@ -1078,8 +1078,9 @@ void writebackBlocksTGS(uint3 groupThreadId : SV_GroupThreadID, uint3 groupId : 
             angVel -= cross(body0WorldOffset_invMass0.xyz, linVel);
 
             const uint broken = breakable != 0
-                ? ((length(linVel) > jointHeaders[batchIndex].linBreakImpulse[threadIndex] ||
-                    length(angVel) > jointHeaders[batchIndex].angBreakImpulse[threadIndex]) ? 1u : 0u)
+                // P9.47: the TGS twin of solverBlock.cuh:840 -- magnitude(), not Length.
+                ? ((sqrt(dot(linVel, linVel)) > jointHeaders[batchIndex].linBreakImpulse[threadIndex] ||
+                    sqrt(dot(angVel, angVel)) > jointHeaders[batchIndex].angBreakImpulse[threadIndex]) ? 1u : 0u)
                 : 0u;
             constraintWriteBack[forceWritebackOffset].angularImpulse_residual =
                 float4(angVel, constraintErrorSq);
@@ -1434,7 +1435,10 @@ void propagateAverageSolverBodyVelocityTGS(uint3 groupThreadId : SV_GroupThreadI
                 const float4 quatVel = float4(pqr, 0.0f);
                 const float4 result = quatMul(quatVel, q) + q * c;
 
-                q = normalize(result);
+                // P9.47: solverMultiBlockTGS.cu:581 is `result.getNormalized()`, and
+                // PxQuat::getNormalized (PxQuat.h:211-215) is s = 1/magnitude() then
+                // FOUR multiplies -- magnitude() being PxSqrt of the 4-wide square sum.
+                q = result * (1.0f / sqrt(dot(result, result)));
             }
 
             p += deltaPThisStep;

@@ -122,7 +122,9 @@ void ctSatConvexFaceNormals(uint3 dtid : SV_DispatchThreadID)
         const float3 vertexSpacePlaneNormal = planef4.xyz;
 
         float3 shapeSpacePlaneNormal = vertex2ShapeNormalVector(vertexSpacePlaneNormal, scale, rot);
-        const float mag = length(shapeSpacePlaneNormal);
+        // P9.47: convexTriangle.cuh:246 is `shapeSpacePlaneNormal.normalize()`, whose
+        // return value is magnitude() = PxSqrt(magnitudeSquared()).
+        const float mag = sqrt(dot(shapeSpacePlaneNormal, shapeSpacePlaneNormal));
         const float invMagnitude = 1.0f / mag;
         shapeSpacePlaneNormal = shapeSpacePlaneNormal * invMagnitude; // normalize in place
 

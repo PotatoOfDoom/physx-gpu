@@ -78,7 +78,9 @@ void ctReducePoints(uint3 dtid : SV_DispatchThreadID)
     for (uint i = 0u; i < maxPts; ++i)
     {
         if ((mask & (1u << i)) == 0u) continue;
-        const float dist = length(p0 - gPts[base + i].xyz);
+        // P9.47: convexCoreCollision.cu:813 is `(p0 - p).magnitude()`.
+        const float3 d0 = p0 - gPts[base + i].xyz;
+        const float dist = sqrt(dot(d0, d0));
         if (dist > maxDist) { maxDist = dist; pi1 = i; }
     }
     const float3 p1 = gPts[base + pi1].xyz;

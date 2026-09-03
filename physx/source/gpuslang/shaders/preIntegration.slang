@@ -175,8 +175,10 @@ void preIntegrateBodyCompute(PxgBodySim bodySim, uint a, uint nbSolverBodies, fl
         const float3 origMom = localInertia * localAngVel;
         const float3 torque = -cross(localAngVel, origMom);
         float3 newMom = origMom + torque * dt;
-        const float denom = length(newMom);
-        const float ratio = denom > 0.0f ? length(origMom) / denom : 0.0f;
+        // P9.47: preIntegration.cuh:315-316 uses newMom.magnitude() and
+        // origMom.magnitude(), i.e. PxSqrt(magnitudeSquared()).
+        const float denom = sqrt(dot(newMom, newMom));
+        const float ratio = denom > 0.0f ? sqrt(dot(origMom, origMom)) / denom : 0.0f;
         newMom *= ratio;
         const float3 newDeltaAngVel = quatRotate(outBody2World.q, inverseInertia * newMom - localAngVel);
 

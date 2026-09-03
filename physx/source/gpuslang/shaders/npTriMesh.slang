@@ -52,6 +52,17 @@ RWStructuredBuffer<float4> gNormalOut; // binding 2  (xyz normal)
 RWStructuredBuffer<float4> gBaryOut;   // binding 3  (u, v, w, 0)
 
 // columns of PxMat33(quat) (matches PxMat33T(const PxQuatT&))
+// PxVec3::getNormalized (PxVec3.h:286-290): m = magnitudeSquared(); m > 0 ?
+// v * PxRecipSqrt(m) : zero.  PxRecipSqrt is intrinsics::recipSqrt = 1.0f/sqrtf
+// (PxWindowsMathIntrinsics.h:87), a reciprocal of an exactly specified square
+// root -- NOT GLSL.std.450 Normalize, which the Vulkan environment spec leaves
+// several ULP of room and which is undefined for a zero vector.
+float3 tnGetNormalized(float3 v)
+{
+    const float m = dot(v, v);
+    return m > 0.0f ? v * (1.0f / sqrt(m)) : float3(0, 0, 0);
+}
+
 void quatToMat33(float4 q, out float3 c0, out float3 c1, out float3 c2)
 {
     const float x = q.x, y = q.y, z = q.z, w = q.w;
@@ -108,7 +119,8 @@ void ctTriNormal(uint3 dtid : SV_DispatchThreadID)
     const float3 v0 = matTransform(m0, m1, m2, e.v0.xyz);
     const float3 v1 = matTransform(m0, m1, m2, e.v1.xyz);
     const float3 v2 = matTransform(m0, m1, m2, e.v2.xyz);
-    const float3 nrm = normalize(cross(v1 - v0, v2 - v0));
+    // P9.47: convexMesh.cu:280 is `(v1-v0).cross(v2-v0).getNormalized()`.
+    const float3 nrm = tnGetNormalized(cross(v1 - v0, v2 - v0));
     gNormalOut[i] = float4(nrm, 0.0f);
 }
 

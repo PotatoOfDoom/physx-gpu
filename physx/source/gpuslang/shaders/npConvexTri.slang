@@ -33,6 +33,17 @@
 // edge-cross axis, oriented convex->triangle, projected to a separation which
 // updates the running max).
 
+// PxVec3::getNormalized (PxVec3.h:286-290): m = magnitudeSquared(); m > 0 ?
+// v * PxRecipSqrt(m) : zero.  PxRecipSqrt is intrinsics::recipSqrt = 1.0f/sqrtf
+// (PxWindowsMathIntrinsics.h:87), a reciprocal of an exactly specified square
+// root -- NOT GLSL.std.450 Normalize, which the Vulkan environment spec leaves
+// several ULP of room and which is undefined for a zero vector.
+float3 ctGetNormalized(float3 v)
+{
+    const float m = dot(v, v);
+    return m > 0.0f ? v * (1.0f / sqrt(m)) : float3(0, 0, 0);
+}
+
 struct MkIn
 {
     float4 A, B, BxA;   // edge 0: two adjacent normals + the edge (arc)
@@ -93,7 +104,8 @@ bool isEdgePairPassed(float3 convexNormal0, float3 convexNormal1, float3 convexE
     if (abs(normal.x) < eps || abs(normal.y) < eps || abs(normal.z) < eps)
         return true;
 
-    normal = normalize(normal);
+    // P9.47: convexTriangle.cuh:378 is `normal = normal.getNormalized()`.
+    normal = ctGetNormalized(normal);
 
     if (dot(normal, convexVertex - convexCenterOfMass) < 0.0f)
         normal = -normal; // point the normal from the convex hull toward the triangle
