@@ -276,7 +276,10 @@ void sb_psMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid :
         GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
 
         // T7: world space on both sides -- no transform, no scale.
-        const float3 center = sortedPose[particleIndex].xyz;
+        // P9.49: safe ADDRESS for the read this platform issues even when the loop
+        // condition admits no lane.  This is the softbody twin of the cloth site
+        // that faulted (femClothPsMidphaseBda), line for line.
+        const float3 center = sortedPose[min(particleIndex, max(nbParticles, 1u) - 1u)].xyz;
         const float3 qMin = center - cDistance;
         const float3 qMax = center + cDistance;
 

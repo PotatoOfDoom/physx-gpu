@@ -290,8 +290,15 @@ void sb_selfCollisionMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, 
     {
         GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
 
+        // P9.49: safe ADDRESS for every read this body indexes by vertIdx -- this
+        // platform issues them even when the loop condition admits no lane (see
+        // femClothPsMidphaseBda, where it faulted).  Only the ADDRESSES take it;
+        // where vertIdx is a VALUE (the filter key, the written contact) it stays
+        // itself, and for any lane the condition admits the two are equal anyway.
+        const uint safeVert = min(vertIdx, max(numVerts, 1u) - 1u);
+
         // Only SURFACE vertices generate self contacts.
-        if (byteAt(surfaceVertsHint, vertIdx) == 0u)
+        if (byteAt(surfaceVertsHint, safeVert) == 0u)
             continue;
 
         // The vertex-level filter: (softbodyId, vertIdx) against the whole-body wildcard.
@@ -300,8 +307,8 @@ void sb_selfCollisionMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, 
                        pxEncodeSoftBodyIndex(softbodyId, 0xfffffu)))
             continue;
 
-        const float3 point = tetVerts[vertIdx].xyz;
-        const float3 restP = restTetVerts[vertIdx].xyz;
+        const float3 point = tetVerts[safeVert].xyz;
+        const float3 restP = restTetVerts[safeVert].xyz;
 
         // --- SbMeshTreeTraverser per-lane state ---
         float bestDist = PX_MAX_F32;
@@ -498,7 +505,7 @@ void sb_selfCollisionMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, 
             InterlockedAdd(Ptr<uint>(gSc.totalContactCount)[0], 1u, index);
 
             const float pen = bestDist;
-            const uint tetrahedronIdx0 = vertToSurfaceTetRemap[vertIdx];
+            const uint tetrahedronIdx0 = vertToSurfaceTetRemap[safeVert];
             // NOTE the two "barycentric" slots carry the query point and the closest point,
             // not barycentrics — that is what the CUDA writes (softbodySoftbodyMidPhase.cu
             // :503) and sb_fem_contact_remap_to_sim turns them into real barycentrics.

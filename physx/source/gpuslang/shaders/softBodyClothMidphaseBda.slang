@@ -287,11 +287,17 @@ void sb_clothMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
     {
         GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
 
+        // P9.49: safe ADDRESS for the reads this platform issues even when the loop
+        // condition admits no lane (see femClothPsMidphaseBda, where it faulted).
+        // BOTH reads below need it -- the surface hint is read before the `continue`,
+        // so it is the first one out of range, not the index fetch.
+        const uint safeTet = min(tetrahedronIdx, max(nbTets, 1u) - 1u);
+
         // Interior tetrahedra never generate contacts.
-        if (byteAt(surfaceHintBase, tetrahedronIdx) == 0u)
+        if (byteAt(surfaceHintBase, safeTet) == 0u)
             continue;
 
-        const uint4 tetIdx = tetIndices[tetrahedronIdx];
+        const uint4 tetIdx = tetIndices[safeTet];
 
         // World -> cloth local, all four corners (see the header on why this stays).
         const float3 t0 = cmQuatRotateInv(clothQ, tetVerts[tetIdx.x].xyz - clothP);

@@ -228,7 +228,10 @@ void cloth_psContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
 
     for (uint i = globalThreadIdx; i < numPairs; i += PSCG_STRIDE)
     {
-        const uint4 curPair = pairs[i];
+        // P9.49: safe ADDRESS -- this loop starts at a grid-wide id under a
+        // PERSISTENT grid, so its first index can already be past numPairs and
+        // the guard is only a mask here.  Identity for every admitted lane.
+        const uint4 curPair = pairs[min(i, max(numPairs, 1u) - 1u)];
         const uint cmIdx = curPair.x;
         const uint particleIndex = curPair.y;            // C1
         const uint triangleIdx = curPair.z;

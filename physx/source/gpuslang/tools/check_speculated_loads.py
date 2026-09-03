@@ -45,7 +45,9 @@
 #
 #   LOW-loop    the index is the induction variable of a loop whose condition is
 #               the bound: `for (i = tid; i < n; i += stride)`.  The overshoot is
-#               at most one stride.
+#               at most one stride -- BUT ONLY IF THE LOOP STARTS INSIDE ITS OWN
+#               BOUND.  See the P9.49 note below: that assumption was unstated
+#               here for four tranches, and it was false for a whole family.
 #
 #   LOW-launch  the index is assigned IN THIS FUNCTION from a thread-id system
 #               value.  The launch is sized to the data rounded up to a
@@ -65,6 +67,39 @@
 # reach, which on this platform means they land in mapped memory and are
 # invisible.  They are separated so the HIGH list stays something a person can
 # act on -- a list of 349 that cannot be worked through is not a gate.
+#
+# P9.49 -- WHERE THE LOW-loop TIER WAS WRONG, AND WHAT IT COST
+#
+# "Overshoot <= one stride" reads like a fact about the loop.  It is not: it is a
+# fact about the loop TOGETHER WITH an assumption nobody wrote down, that the
+# first index is already inside the bound.  For `for (i = tid; ...)` that holds --
+# tid is block-local.  For the midphase family it does not:
+#
+#     const uint globalWarpIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub;   // [0, 2048)
+#     for (uint vertexIdx = globalWarpIdx; vertexIdx < numVerts; vertexIdx += SM_NB_WARPS)
+#
+# The grid is PERSISTENT -- 1024 blocks, fixed by the kernel, the same whatever
+# the data is -- so a warp whose number exceeds numVerts starts past the end and
+# the loop's first test already fails.  The reach is (start - bound) + k*stride,
+# and with a 2048-warp grid over 1100 vertices that is thousands of elements, not
+# one stride.
+#
+# What made it reachable rather than merely undefined is the BARRIER at the top of
+# those bodies: this platform has to reach it even for a warp with no work, so it
+# runs the body with an all-inactive mask, and the read -- uniform across the
+# (empty) set of active lanes -- is issued as a scalar load at "the first active
+# lane, or lane 0 if there is none".
+#
+# It was measured, not argued.  From the core: `vmovss (%rcx,%rax,1)` with
+# rcx = 3584*16, i.e. index 3584 = 1536 + 2048 against an 1100-element buffer --
+# 39 KB past the end, faulting about one run in twenty.  Two separate sites in one
+# test binary (femClothMeshVertMidphaseBda and femClothPsMidphaseBda), and both
+# had sat in this tier, counted and dismissed, since P9.23.
+#
+# The lesson is narrower than "the tier was wrong": a tier that encodes a DISTANCE
+# argument has to state the premise the distance rests on, or it silently launders
+# an assumption into a clean bill.  persistent_grid_loop() now tests that premise
+# instead of assuming it, and a loop that fails it is HIGH.
 #
 # A read is NOT reported when its index is CLAMPED -- assigned from min/clamp or
 # from a ternary with a constant fallback.  That is what the P9.22 fix does, and
@@ -248,6 +283,70 @@ def loop_induction(header):
     return m.group(1), m.group(3)
 
 
+# A start that grows with the LAUNCH rather than with the block.  These are the
+# names this corpus builds a grid-wide index from.
+GRIDWIDE_START = re.compile(r'\bglobalWarpIdx\b|\bglobalThreadIdx\b|\bgid\b'
+                            r'|\bgroupId\b|\bdtid\b|\bblockIdx\b|\bdispatchThreadId\b')
+# A stride that is sized to the DATA: the engine computed the grid from the count.
+DATA_SIZED_STRIDE = re.compile(r'WorkgroupCount|GroupCount|gridDim|gridStride|numWarps')
+
+
+def const_uint(src, name):
+    m = re.search(r'static\s+const\s+uint\s+%s\s*=\s*([^;]+);' % re.escape(name), src)
+    return m.group(1).strip() if m else None
+
+
+def persistent_grid_loop(src, header):
+    """Does this loop's FIRST index already sit past its own bound?
+
+    P9.49.  LOW-loop's whole claim is "overshoot <= one stride", and that claim
+    silently assumes the loop starts INSIDE the bound.  Two things together break
+    it, and both have to be read off the header:
+
+      * the start is a GRID-WIDE id -- it grows with the launch, not with the
+        workgroup, so it is not bounded by a block size;
+      * the stride is a COMPILE-TIME CONSTANT -- a persistent grid, whose warp
+        count the kernel fixes and the data never enters.
+
+    Then the first index of a warp lies somewhere in [0, gridWarps) while the
+    bound is a data count, the two are unrelated, and the reach is
+    (start - bound) + k*stride.  Measured on the midphase family: index 3584
+    against a 1100-element buffer, 39 KB past the end, faulting about one run in
+    twenty.  A start of `lane` or `tid` cannot exceed the bound by more than a
+    block, and a stride built from WorkgroupCount() means the launch was sized to
+    the data; neither is reported.
+    """
+    m = FOR_PARTS.match(header)
+    if not m:
+        return None
+    init, step = m.group(2).strip(), m.group(4).strip()
+    if not GRIDWIDE_START.search(init):
+        return None
+    # group(4) is the whole increment clause -- `i += STRIDE`, not `STRIDE`.
+    # Reading it as the stride made every site fall through the constant test
+    # below and kept the tier silently unchanged, which is the exact failure this
+    # split exists to end.
+    sm = re.match(r'^\s*[A-Za-z_]\w*\s*\+=\s*(.+)$', step)
+    if not sm:
+        return None            # ++ / -- : the stride is 1, never a persistent grid
+    step = sm.group(1).strip()
+    expanded = step
+    for _ in range(3):
+        nxt = expanded
+        for nm in set(re.findall(r'\b[A-Za-z_]\w*\b', expanded)):
+            val = const_uint(src, nm)
+            if val:
+                nxt = re.sub(r'\b%s\b' % re.escape(nm), '(%s)' % val, nxt)
+        if nxt == expanded:
+            break
+        expanded = nxt
+    if DATA_SIZED_STRIDE.search(expanded):
+        return None
+    if not re.fullmatch(r'[\s\d\(\)\*\+u]+', expanded):
+        return None       # cannot show it is a constant -- do not claim it is
+    return init, step
+
+
 # The system values a launch geometry is derived from.  A variable assigned from
 # one of these IN THIS FUNCTION is bounded by the launch: the dispatch is the
 # data size rounded up to a workgroup, so the index cannot exceed the bound by
@@ -393,8 +492,19 @@ def analyse_shader(sh):
                     kind, cond, root = hit
                     tier, why = 'HIGH', None
                     if kind == 'loop' and loop_induction(cond)[0] == root:
-                        tier, why = 'LOW-loop', ("the index is this loop's own "
-                                                 "induction variable: overshoot <= one stride")
+                        pg = persistent_grid_loop(src, cond)
+                        if pg:
+                            tier = 'HIGH'
+                            why = ("P9.49: this loop STARTS at a grid-wide id (%s) and "
+                                   "strides by a compile-time constant (%s), so its FIRST "
+                                   "index can already be past the bound -- the overshoot is "
+                                   "(start - bound) + k*stride, not one stride.  Clamp the "
+                                   "ADDRESS." % (pg[0], pg[1]))
+                        else:
+                            tier, why = 'LOW-loop', ("the index is this loop's own "
+                                                     "induction variable: overshoot <= one "
+                                                     "stride (the loop starts inside its "
+                                                     "own bound -- see persistent_grid_loop)")
                     elif launch_rooted(body, root):
                         tier, why = 'LOW-launch', ('the index is assigned here from a '
                                                    'thread id: overshoot < one workgroup')
@@ -419,7 +529,10 @@ def analyse_shader(sh):
                                        % (' '.join(ivcond.split()),
                                           CONSTBOUND.search(ivcond + ')').group(1)))
                                 break
-                    if tier == 'HIGH':
+                    if tier == 'HIGH' and why is None:
+                        # `why` is already set for a P9.49 persistent-grid loop, and
+                        # that reason is the specific one -- do not flatten it back
+                        # into the generic "nothing bounds the distance".
                         params = params_of(header)
                         why = ('the index is a PARAMETER (%s) -- the relation to the '
                                'buffer size lives in a caller, so nothing here bounds '
@@ -475,7 +588,49 @@ SELFTEST_TO = """    if (workIndex >= nbBodies)
     return counts[workIndex];"""
 
 
+def selftest_persistent_grid():
+    """Negative control for the P9.49 split.
+
+    Four cases, and each one is a way the split could be wrong rather than merely
+    incomplete.  The first two say it fires where it must; the last two say it
+    stays quiet where the distance argument really does hold -- because a split
+    that promoted every grid-stride loop would move 61 findings into the gate,
+    read as thorough, and mean nothing.
+    """
+    src = ('static const uint STRIDE = 1024u * 2u;\n'
+           'static const uint GRID = 512u;\n'
+           'static const uint BLK = 256u;\n')
+    cases = [
+        # (header, expected-to-fire, what the case is for)
+        ('for (uint v = globalWarpIdx; v < numVerts; v += STRIDE)', True,
+         'the measured shape: grid-wide start, constant stride'),
+        ('for (uint i = globalThreadIdx; i < numPairs; i += GRID * BLK)', True,
+         'the same, with the stride written as a product of two constants'),
+        ('for (uint i = tid; i < n; i += STRIDE)', False,
+         'a BLOCK-LOCAL start cannot exceed the bound by more than a block'),
+        ('for (uint i = idx; i < gNumShapes; i += BLK * WorkgroupCount().x)', False,
+         'a stride built from WorkgroupCount() means the launch was sized to the data'),
+    ]
+    ok = True
+    for header, want, why in cases:
+        got = persistent_grid_loop(src, header) is not None
+        if got != want:
+            print('SELFTEST FAILED (P9.49): %r -> %s, expected %s\n  case: %s'
+                  % (header, got, want, why))
+            ok = False
+    # A stride this checker cannot resolve to a constant must NOT be claimed as
+    # one: an unresolvable name is unknown, not proven fixed.
+    if persistent_grid_loop(src, 'for (uint i = dtid.x; i < n; i += mysteryStride)'):
+        print('SELFTEST FAILED (P9.49): an UNRESOLVED stride was treated as a '
+              'compile-time constant.  The tier would then claim a persistent grid '
+              'it never established.')
+        ok = False
+    return ok
+
+
 def selftest():
+    if not selftest_persistent_grid():
+        return 2
     clean = load_corpus()
     base = {f.key() for f in sum((analyse_shader(s) for s in clean), [])
             if f.tier == 'HIGH'}

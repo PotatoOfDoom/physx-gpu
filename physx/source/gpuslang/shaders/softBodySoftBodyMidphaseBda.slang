@@ -320,8 +320,15 @@ void sb_sbMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid :
     {
         GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
 
+        // P9.49: safe ADDRESS for every read this body indexes by vertIdx -- this
+        // platform issues them even when the loop condition admits no lane (see
+        // femClothPsMidphaseBda, where it faulted).  Only the ADDRESSES take it;
+        // where vertIdx is a VALUE (the filter key, the written contact) it stays
+        // itself, and for any lane the condition admits the two are equal anyway.
+        const uint safeVert = min(vertIdx, max(numVerts, 1u) - 1u);
+
         // Only SURFACE vertices of the query body generate contacts.
-        if (byteAt(surfaceVertsHint0, vertIdx) == 0u)
+        if (byteAt(surfaceVertsHint0, safeVert) == 0u)
             continue;
 
         // The vertex-level filter: this vertex against the OTHER body's "any tet" wildcard.
@@ -330,7 +337,7 @@ void sb_sbMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid :
                        pxEncodeSoftBodyIndex(softbodyId1, PX_MAX_NB_DEFORMABLE_VOLUME_TET)))
             continue;
 
-        const float3 point = queryVerts[vertIdx].xyz;
+        const float3 point = queryVerts[safeVert].xyz;
 
         // --- SbSbMeshTreeTraverser per-lane state ---
         float bestDist = PX_MAX_F32;
@@ -503,7 +510,7 @@ void sb_sbMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid :
             InterlockedAdd(Ptr<uint>(gSs.totalContactCount)[0], 1u, index);
 
             const float pen = bestDist;
-            const uint tetrahedronIdx0 = vertToSurfaceTetRemap0[vertIdx];
+            const uint tetrahedronIdx0 = vertToSurfaceTetRemap0[safeVert];
             // NOTE the two "barycentric" slots carry the query point and the closest point, not
             // barycentrics — that is what the CUDA writes (softbodySoftbodyMidPhase.cu:644) and
             // sb_fem_contact_remap_to_sim turns them into real barycentrics.

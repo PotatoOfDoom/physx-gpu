@@ -249,7 +249,14 @@ void cloth_psMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gi
         GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
 
         // M4: world space on both sides -- no transform, no scale.
-        const float3 center = sortedPose[particleIndex].xyz;
+        // P9.49: this read FAULTED, reproducibly.  See the class note in the
+        // header; the short form is that the barrier above forces this platform to
+        // reach the body with an ALL-INACTIVE mask, the read is then issued as a
+        // scalar one at lane 0, and lane 0's `particleIndex` starts at
+        // `globalWarpIdx` -- a PERSISTENT grid's warp number, which has nothing to
+        // do with nbParticles.  Clamping changes nothing for any lane the loop
+        // condition admits.
+        const float3 center = sortedPose[min(particleIndex, max(nbParticles, 1u) - 1u)].xyz;
         const float3 qMin = center - cDistance;
         const float3 qMax = center + cDistance;
 

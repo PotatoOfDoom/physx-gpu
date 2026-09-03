@@ -364,7 +364,11 @@ void cloth_meshMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 
     {
         GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
 
-        const uint4 vertInds = clothTriIndices[triangleIdx];
+        // P9.49: safe ADDRESS for the read this platform issues even when the loop
+        // condition admits no lane (see femClothPsMidphaseBda, where it faulted).
+        // The three vertex reads below need no clamp of their own: for every index
+        // this one can now yield, the triangle it returns is a real one.
+        const uint4 vertInds = clothTriIndices[min(triangleIdx, max(nbTriangles, 1u) - 1u)];
 
         // World -> mesh local -> mesh VERTEX space, all three corners.
         const float3 a0 = cmShape2Vertex(cmQuatRotateInv(triQ, clothVerts[vertInds.x].xyz - triP),

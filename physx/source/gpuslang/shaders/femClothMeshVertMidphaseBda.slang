@@ -274,7 +274,22 @@ void cloth_midphaseVertexMeshLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
         GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
 
         // World -> mesh local -> mesh VERTEX space.
-        const float3 world = clothVerts[vertexIdx].xyz;
+        // P9.49: one of TWO sites in this binary that were actually faulting (the
+        // other is femClothPsMidphaseBda, which faulted more often of the two).
+        // This platform executes the body of this loop with an
+        // ALL-INACTIVE mask -- the barrier above is inside the loop, so the body has
+        // to be reached even by a warp whose range is exhausted -- and it then issues
+        // this read as a SCALAR one at "the first active lane, or lane 0 if there is
+        // no active lane".  Lane 0 then carries `vertexIdx` PAST the bound the loop
+        // condition just rejected.  Measured, not reasoned: the faulting address was
+        // base + 0xe000 = index 3584 = 1536 + 2048, i.e. globalWarpIdx 1536 (numVerts
+        // is 1100) after one `+= SM_NB_WARPS`.  The value is discarded -- the mask is
+        // empty -- so only the ADDRESS matters, and clamping it changes nothing for
+        // any lane the condition admits.
+        // `max(numVerts, 1u)` and not `numVerts`: at zero the subtraction wraps to
+        // 0xffffffff and the clamp does nothing -- which is exactly the case where
+        // the body runs on an empty mask alone.
+        const float3 world = clothVerts[min(vertexIdx, max(numVerts, 1u) - 1u)].xyz;
         const float3 center = vmShape2Vertex(vmQuatRotateInv(triQ, world - triP),
                                              triScale, triScaleRot);
         // V1: the query is a SPHERE bound around one vertex.

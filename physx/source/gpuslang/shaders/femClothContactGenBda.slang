@@ -1244,7 +1244,10 @@ void clothConvexTriCgBody(uint3 gtid, uint3 gid)
 
     for (uint i = globalWarpIdx; i < numPairs; i += BTRI_GRID * BTRI_WARPS_PER_BLOCK)  // B7
     {
-        const uint4 curPair = pairs[i];
+        // P9.49: safe ADDRESS -- this loop starts at a grid-wide id under a
+        // PERSISTENT grid, so its first index can already be past numPairs and
+        // the guard is only a mask here.  Identity for every admitted lane.
+        const uint4 curPair = pairs[min(i, max(numPairs, 1u) - 1u)];
         const uint cmIdx = curPair.x;
         const uint triangleIdx = curPair.y;
 
@@ -1431,7 +1434,10 @@ void cloth_convexVertexContactGenLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid
 
     for (uint i = globalWarpIdx; i < numPairs; i += BTRI_GRID * BTRI_WARPS_PER_BLOCK)  // W6
     {
-        const uint4 curPair = pairs[i];
+        // P9.49: safe ADDRESS -- this loop starts at a grid-wide id under a
+        // PERSISTENT grid, so its first index can already be past numPairs and
+        // the guard is only a mask here.  Identity for every admitted lane.
+        const uint4 curPair = pairs[min(i, max(numPairs, 1u) - 1u)];
         const uint cmIdx = curPair.x;
         const uint vertexIdx = curPair.y;                                  // W2
 

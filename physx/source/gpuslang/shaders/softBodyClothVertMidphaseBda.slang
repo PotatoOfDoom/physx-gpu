@@ -227,7 +227,9 @@ void sb_clothVertMidphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint
     {
         GroupMemoryBarrierWithGroupSync();   // groupshared scratch is reused per query
 
-        const float3 pos = clothPos[vertIdx].xyz;
+        // P9.49: safe ADDRESS for the read this platform issues even when the loop
+        // condition admits no lane (see femClothPsMidphaseBda, where it faulted).
+        const float3 pos = clothPos[min(vertIdx, max(nbVerts, 1u) - 1u)].xyz;
         // The query volume is a CUBE around the vertex, not a sphere.
         const float3 qMin = pos - float3(cDistance, cDistance, cDistance);
         const float3 qMax = pos + float3(cDistance, cDistance, cDistance);
