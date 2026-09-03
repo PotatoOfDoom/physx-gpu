@@ -1786,6 +1786,72 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.48b — der Anheftungskern, der jede Symmetrie seiner drei Geschwister bricht, und drei Wächter, die man nicht töten kann
+
+**Ergebnis:** Manifest **398 → 399/501**. Suite **845/845 in beiden Speichermodi**, beide im
+ersten Anlauf (279 s bzw. 269 s). Szenen **36/36 ok, 0 fail, 0 missing**, null `unmapped`-Zeilen. Eine neue Vorrichtung,
+**22 Mutanten, 19 getötet**, drei bewiesen redundante Wächter.
+
+### Der vierte Verbraucher desselben Blocks
+
+`PxgFEMFEMAttachmentConstraint` hat vier Kerne. Drei sind abgebildet — P8.19
+(Weichkörper-Weichkörper), P9.32 (Tuch-Tuch) und der Tuch-Geschwisterkern in
+`softBodyClothAttachBda`. Der vierte, `sb_solveOutputParticleAttachmentDeltaVLaunch`
+(softBodyGM.cu:2522, Start PxgSoftBodyCore.cpp:1968), heftet ein **Tetraeder** an ein
+einzelnes **PARTIKEL** — und weicht an sieben Stellen ab, von denen keine kosmetisch ist.
+
+| | Abweichung |
+|---|---|
+| **E1** | **Keine Kegelgrenze.** Alle drei Geschwister verzweigen über `isConeLimitedEnabled`. Dieser nicht: `error` ist bedingungslos `pos1 - pos0`. Der Block TRÄGT `low_high_angles` und `attachmentBarycentric` weiter an ihren Plätzen; der Kern liest sie nie. Den Zweig des Geschwisters hierher zu übernehmen wäre eine plausibel aussehende Ergänzung, die jede konfigurierte Grenze verfälscht. |
+| **E2** | **`barycentric0.x` ist keine baryzentrische Koordinate**, sondern eine Puffer-ID, gelesen als `PxU32(...)` — eine C-Gleitkomma-Umwandlung, also **Abschneiden**, kein Bitmuster. |
+| **E3** | **Der Partikelindex braucht drei Umwege:** Laufsumme über die Pufferindex-Suche, dann `+ PxGetParticleIndex`, dann `mUnsortedToSortedMapping` — und erst das ist der SORTIERTE Index. Jeder ausgelassene Schritt indiziert immer noch ein lebendes Feld. |
+| **E4** | **`findBufferIndexFromUniqueId` ist nicht `dfFindRange`**: eine obere-Schranken-Suche, die `mParticleBufferSortedUniqueIdsOriginalIndex[r-1]` zurückgibt, mit einem frühen 0 für eine leere Tabelle — der Wächter, der `r-1` am Überlaufen hindert. |
+| **E5** | **`wTot0` ist asymmetrisch:** Seite 1 behält die vierstellige baryzentrische Summe, Seite 0 ist schlicht `pos0.w`. Jedes Geschwister rechnet dort eine gewichtete Summe. |
+| **E6** | **Ein Paar mit zwei unendlichen Massen wird mit `continue` übersprungen, nicht mit `return`** — der `workIndex >= numAttachments`-Test darüber IST ein `return`. |
+| **E7** | **Der Partikel-Streuschritt ist das dreikomponentige `AtomicAdd`** (atomic.cuh:54): x, y, z — **`.w` bleibt unberührt**, anders als bei `updateTetPositionDelta`, dessen vierstellige Überladung das Gewicht in `.w` addiert. Dazu ein ZWEITER Wächter, `pos0.w > 0`, innerhalb des `wTot > 0`. |
+
+### Was der Fegedurchgang über die Vorrichtung gesagt hat
+
+Der erste Anlauf tötete 16 von 22. Drei der sechs Überlebenden waren echte Lücken:
+
+* **`N1-bufferid-rounded`** überlebte, weil die eindeutigen Puffer-IDs der Vorrichtung
+  **Lücken** hatten (3, 11, 17, 29). Die Suche liefert die größte ID ≤ der Anfrage, also
+  landen `3,7` abgeschnitten und gerundet **im selben Eimer** — das Abschneiden war
+  unbeobachtbar. Mit **aufeinanderfolgenden** IDs (3, 4, 5, 6) kreuzt jedes Aufrunden eine
+  Eimergrenze. Die Vorrichtung misst das jetzt und verlangt mindestens sechs trennbare
+  Bahnen, statt es der Form der Tabelle zu überlassen.
+* **`N10-empty-table-guard-dropped`** überlebte, weil jedes Partikelsystem der Vorrichtung
+  Puffer hatte. Ein **zweites System mit `mNumParticleBuffers == 0`** und eine Bahn, die es
+  benennt, machen den Wächter erreichbar — ohne ihn läuft `r - 1` auf `0xffffffff` über und
+  der Mutant stürzt ab.
+* **`N13-zero-mass-guard-is-or`** überlebte, weil keine Bahn **genau eine** unendliche Masse
+  hatte. Bahn 8 hat jetzt ein masseloses Tetraeder an einem endlichen Partikel: `&&` lässt
+  sie durch, `||` würde sie überspringen.
+
+Danach: **19 von 22**.
+
+### Drei Wächter, die nicht zu töten sind — mit Beweis
+
+Die verbleibenden drei sind dieselbe Form: **ein Wächter, dessen Bedingung ein späterer
+Wächter bereits impliziert.** Jeder Beweis stützt sich auf eine Invariante, die die Engine
+selbst ausspricht, nicht auf die Zahlen der Vorrichtung:
+
+* **`invMass1 == 0 && invMass0 == 0`.** Anheftungs-Baryzentren werden bei der Konstruktion
+  auf nichtnegativ geklemmt — softBody.cuh:108 sagt das dort, wo es erklärt, warum
+  `updateTetPositionDelta` nur die Produkte prüft. Unter dieser Invariante erzwingt
+  `pos1.w == 0`, dass jede gewichtete Eckmasse 0 ist, also `wTot1 = 0`; und `pos0.w == 0`
+  IST `wTot0 = 0`. Die übersprungene Bahn hat damit immer `wTot == 0`, was `wTot > 0`
+  ohnehin unterdrückt.
+* **`pos0.w > 0`.** Was er unterdrückt, ist `delta * 0` — der Nullvektor, komponentenweise
+  addiert. Er spart drei Atomare, kein Ergebnis.
+* **`wTot > 0`.** `wTot == 0` verlangt `pos0.w == 0` UND jede `b1w`-Komponente 0 — genau der
+  Zustand, in dem die EIGENEN Wächter beider Streuschritte falsch sind. Was `1/0` erzeugt
+  hätte, erreicht keinen Speicher.
+
+Alle drei stehen trotzdem so da, wie die .cu sie schreibt. Ein Wächter, der heute redundant
+ist, hört in dem Augenblick auf es zu sein, in dem eine der Invarianten sich verschiebt —
+und der Beweis steht im Shader, damit der nächste Durchgang nicht noch einmal danach sucht.
+
 ## P9.48a — die drei Kerne, die ein Partikel endlich bewegen: zwei Zwillingsfallen, zwei Upstream-Kandidaten und ein Fegewerkzeug, das gelogen hat
 
 **Ergebnis:** Manifest **395 → 398/501** (79,4 %). Suite **845/845 in beiden Speichermodi**,

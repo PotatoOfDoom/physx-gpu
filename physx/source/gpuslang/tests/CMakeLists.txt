@@ -894,6 +894,10 @@ pxg_compile_shader(softBodySelfSolveBda sb_softbodyContactPrepareLaunch
 # IS in PXG_NOCONTRACT_SHADERS: the barycentric blends, the mass sums and the cone projection
 # are mul-feeding-add chains a fixture compares bit-exactly against a CPU reference.
 pxg_compile_shader(softBodyClothAttachBda sb_solveOutputClothAttachmentDeltaVLaunch)
+# P9.48b: the FOURTH consumer of PxgFEMFEMAttachmentConstraint -- a softbody
+# tetrahedron pinned to a single PARTICLE.  No cone limit, an asymmetric wTot0, a
+# buffer id hiding in barycentric0.x, and a three-indirection particle index.
+pxg_compile_shader(softBodyParticleAttachBda sb_solveOutputParticleAttachmentDeltaVLaunch)
 pxg_compile_shader(softBodyRigidAttachBda sb_rigidAttachmentPrepareLaunch
                    sb_solveRigidSoftAttachmentLaunch
                    sb_solveRigidSoftAttachmentLaunchTGS)

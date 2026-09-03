@@ -12849,4 +12849,387 @@ PXG_TEST(softBodySimClothAttachmentCoverage)
         dev->destroyBuffer(h);
 }
 
+// ---------------------------------------------------------------------------
+// P9.48b: sb_solveOutputParticleAttachmentDeltaVLaunch (softBodyGM.cu:2522, launch
+// PxgSoftBodyCore.cpp:1968) -- a softbody TETRAHEDRON pinned to ONE PARTICLE, the fourth
+// and last consumer of PxgFEMFEMAttachmentConstraint and the one that breaks every
+// symmetry the other three share.  Seven differences, and this fixture exists to make
+// each of them observable; see the shader header for the list.
+// ---------------------------------------------------------------------------
+namespace p948att
+{
+struct ParticleSbAttachSolvePush
+{
+    uint64_t softbodies, particleSystems, attachments;
+    uint32_t numAttachments, pad28;
+};
+static_assert(sizeof(ParticleSbAttachSolvePush) == 32, "particle-sb attach solve blob must be 32 bytes");
+static_assert(offsetof(ParticleSbAttachSolvePush, particleSystems) == 8, "particleSystems @8");
+static_assert(offsetof(ParticleSbAttachSolvePush, attachments) == 16, "attachments @16");
+static_assert(offsetof(ParticleSbAttachSolvePush, numAttachments) == 24, "numAttachments @24");
+} // namespace p948att
+
+PXG_TEST(softBodySimParticleAttachmentSolve)
+{
+    using namespace p819att;
+    using namespace p948att;
+    using p80refit::TetIdx4;
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // Softbody id 2, particle system id 1 -- neither is 0, so a dropped shift lands on a
+    // zeroed descriptor rather than a plausible one.
+    // PS_ID_EMPTY is a SECOND particle system whose mNumParticleBuffers is 0 -- the only
+    // state in which findBufferIndexFromUniqueId's length guard is reachable.  Without it
+    // the guard's mutant (r - 1 wrapping to 0xffffffff) is invisible.
+    const uint32_t SB_ID = 2u, PS_ID = 1u, PS_ID_EMPTY = 3u;
+    const uint32_t NB_ATT = 10u;
+
+    // ---- the softbody: one tetrahedron per attachment, all vertices disjoint ----------
+    std::vector<F4> sbVerts;
+    std::vector<TetIdx4> tets;
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        const float ox = float(a) * 10.0f;
+        // A zero-mass CORNER on attachment 3 exercises updateTetPositionDelta's per-corner
+        // `invMassBary.* > 0` guards.
+        const float m0 = (a == 3u) ? 0.0f : (0.5f + 0.1f * float(a));
+        sbVerts.push_back(F4{ ox + 0.0f, 2.0f, 0.0f, m0 });
+        sbVerts.push_back(F4{ ox + 1.0f, 2.0f, 0.0f, 0.25f + 0.05f * float(a) });
+        sbVerts.push_back(F4{ ox + 0.0f, 3.0f, 0.0f, 0.75f - 0.05f * float(a) });
+        sbVerts.push_back(F4{ ox + 0.0f, 2.0f, 1.0f, 0.40f + 0.03f * float(a) });
+        const uint32_t b = a * 4u;
+        tets.push_back(TetIdx4{ b, b + 1u, b + 2u, b + 3u });
+    }
+    // Attachment 6 is the ZERO-MASS PAIR: every tet corner AND the particle are infinite
+    // mass, so the .cu's `invMass1 == 0 && invMass0 == 0` skip fires.
+    for (uint32_t k = 0; k < 4u; ++k) sbVerts[6u * 4u + k].w = 0.0f;
+    // Attachment 8 is the HALF-ZERO lane: the tet is infinite mass but the particle is not.
+    // `&&` lets it through (and it writes the particle); `||` would skip it.  Without this
+    // lane the two spellings of the guard are indistinguishable.
+    for (uint32_t k = 0; k < 4u; ++k) sbVerts[8u * 4u + k].w = 0.0f;
+
+    const F4 BARY_SB = { 0.2f, 0.3f, 0.35f, 0.15f };
+
+    // ---- the particle system: three indirections between elemId0 and the position -----
+    // E4: FOUR buffers.  The sorted-unique-id table is ascending; the ORIGINAL-INDEX table
+    // is a non-identity permutation, so a port that returned `r - 1` itself (or the sorted
+    // index) picks a different runsum entry.
+    // The ids are CONSECUTIVE on purpose.  The search finds the largest unique id <= the
+    // query, so with a gap (3, 11, 17, 29) the truncation of `id + 0.7` and its rounding
+    // land in the SAME bucket and E2 is unobservable -- measured, not assumed: that is
+    // exactly how the first sweep let the rounding mutant live.
+    const uint32_t NB_BUFFERS = 4u;
+    const std::vector<uint32_t> sortedUniqueIds = { 3u, 4u, 5u, 6u };
+    const std::vector<uint32_t> originalIndex   = { 2u, 0u, 3u, 1u };
+    // E3: the runsum is what turns a per-buffer index into a global unsorted one.
+    const std::vector<uint32_t> bufferRunsum    = { 40u, 10u, 0u, 25u };
+
+    // E3: a non-identity unsorted->sorted mapping.  Deliberately NOT a rotation by a
+    // constant, so an off-by-one or a dropped lookup lands somewhere unrelated.
+    const uint32_t NB_PARTICLES = 64u;
+    std::vector<uint32_t> unsortedToSorted(NB_PARTICLES);
+    for (uint32_t i = 0; i < NB_PARTICLES; ++i)
+        unsortedToSorted[i] = (i * 37u + 11u) % NB_PARTICLES;
+
+    std::vector<F4> partPos(NB_PARTICLES);
+    for (uint32_t i = 0; i < NB_PARTICLES; ++i)
+    {
+        // E5: the particle inverse masses are the ONLY wTot0 there is, so they are all
+        // distinct and none of them equals any barycentric sum on the tet side.
+        partPos[i] = F4{ 100.0f + 0.5f * float(i), -3.0f + 0.25f * float(i),
+                         7.0f - 0.125f * float(i), 0.05f + 0.011f * float(i) };
+    }
+
+    // Which buffer / in-buffer index each attachment names.  Attachment 5 uses a buffer id
+    // that is NOT the smallest, so the binary search has to actually search.
+    // Lane 9 names the EMPTY system, where the buffer id is never looked up at all.
+    const uint32_t attBufferId[10] = { 3u, 4u, 6u, 5u, 3u, 6u, 4u, 5u, 4u, 3u };
+    const uint32_t attInBufIdx[10] = { 1u, 2u, 0u, 3u, 4u, 1u, 5u, 2u, 6u, 3u };
+    const uint32_t attSystem[10]   = { PS_ID, PS_ID, PS_ID, PS_ID, PS_ID,
+                                       PS_ID, PS_ID, PS_ID, PS_ID, PS_ID_EMPTY };
+
+    // The zero-mass pair's particle must also be infinite mass.
+    // The EMPTY system carries its own (single-entry) tables; with mNumParticleBuffers 0
+    // the .cu returns buffer index 0 without touching the id tables at all, so its runsum
+    // slot 0 is what decides the offset.
+    const std::vector<uint32_t> emptyRunsum = { 5u };
+    std::vector<uint32_t> emptyU2S(NB_PARTICLES);
+    for (uint32_t i = 0; i < NB_PARTICLES; ++i) emptyU2S[i] = (NB_PARTICLES - 1u) - i;
+
+    auto resolveParticle = [&](uint32_t a) -> uint32_t {
+        if (attSystem[a] == PS_ID_EMPTY)
+            return emptyU2S[attInBufIdx[a] + emptyRunsum[0]];
+        uint32_t bi = 0u;
+        { // findBufferIndexFromUniqueId, transcribed from particleSystem.cuh:99
+            uint32_t l = 0u, r = NB_BUFFERS;
+            while (l < r)
+            {
+                const uint32_t m = (l + r) / 2u;
+                if (sortedUniqueIds[m] > attBufferId[a]) r = m; else l = m + 1u;
+            }
+            bi = originalIndex[r - 1u];
+        }
+        const uint32_t unsortedId = attInBufIdx[a] + bufferRunsum[bi];
+        return unsortedToSorted[unsortedId];
+    };
+    // The zero-mass PAIR needs an infinite-mass particle too; lane 8's must stay finite.
+    partPos[resolveParticle(6u)].w = 0.0f;
+
+    DevBuf bSbV = makeDev(dev, sbVerts);
+    if (!bSbV.addr) { std::printf("  NOTE: no BDA -> skip\n"); dev->destroyBuffer(bSbV.h); return; }
+    DevBuf bTets = makeDev(dev, tets);
+    DevBuf bPartPos = makeDev(dev, partPos);
+    DevBuf bU2S = makeDev(dev, unsortedToSorted);
+    DevBuf bRunsum = makeDev(dev, bufferRunsum);
+    DevBuf bUids = makeDev(dev, sortedUniqueIds);
+    DevBuf bUidsOrig = makeDev(dev, originalIndex);
+    DevBuf bEmptyRunsum = makeDev(dev, emptyRunsum);
+    DevBuf bEmptyU2S = makeDev(dev, emptyU2S);
+
+    std::vector<F4> sbDelta(sbVerts.size(), F4{ 0, 0, 0, 0 });
+    // E7: mDelta is PRE-SEEDED in .w only.  The particle scatter is the three-component
+    // AtomicAdd, so every .w here must come back untouched; the tet scatter's four-argument
+    // overload does add its weight into .w, which is why the two are checked separately.
+    std::vector<F4> partDelta(NB_PARTICLES);
+    for (uint32_t i = 0; i < NB_PARTICLES; ++i)
+        partDelta[i] = F4{ 0.0f, 0.0f, 0.0f, 55.0f + float(i) };
+    DevBuf bSbD = makeDev(dev, sbDelta), bPartD = makeDev(dev, partDelta);
+
+    std::vector<PxgSoftBody> sbArr(SB_ID + 1u, makeZeroDesc());
+    sbArr[SB_ID].mSimPosition_InvMass = reinterpret_cast<float4*>(size_t(bSbV.addr));
+    sbArr[SB_ID].mSimTetIndices = reinterpret_cast<uint4*>(size_t(bTets.addr));
+    sbArr[SB_ID].mSimDelta = reinterpret_cast<float4*>(size_t(bSbD.addr));
+    DevBuf bSbDesc = makeDev(dev, sbArr);
+
+    std::vector<PxgParticleSystem> psArr(PS_ID_EMPTY + 1u);
+    std::memset(psArr.data(), 0, psArr.size() * sizeof(PxgParticleSystem));
+    psArr[PS_ID].mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bPartPos.addr));
+    psArr[PS_ID].mUnsortedToSortedMapping = reinterpret_cast<PxU32*>(size_t(bU2S.addr));
+    psArr[PS_ID].mDelta = reinterpret_cast<float4*>(size_t(bPartD.addr));
+    psArr[PS_ID].mParticleBufferRunsum = reinterpret_cast<PxU32*>(size_t(bRunsum.addr));
+    psArr[PS_ID].mParticleBufferSortedUniqueIds = reinterpret_cast<PxU32*>(size_t(bUids.addr));
+    psArr[PS_ID].mParticleBufferSortedUniqueIdsOriginalIndex =
+        reinterpret_cast<PxU32*>(size_t(bUidsOrig.addr));
+    psArr[PS_ID].mCommonData.mNumParticles = NB_PARTICLES;
+    psArr[PS_ID].mCommonData.mNumParticleBuffers = NB_BUFFERS;
+    // The EMPTY system shares the position and delta arrays -- what makes it different is
+    // ONLY mNumParticleBuffers == 0, and its id tables are left NULL so a port that dropped
+    // the length guard dereferences nothing plausible.
+    psArr[PS_ID_EMPTY].mSortedPositions_InvMass = reinterpret_cast<float4*>(size_t(bPartPos.addr));
+    psArr[PS_ID_EMPTY].mUnsortedToSortedMapping = reinterpret_cast<PxU32*>(size_t(bEmptyU2S.addr));
+    psArr[PS_ID_EMPTY].mDelta = reinterpret_cast<float4*>(size_t(bPartD.addr));
+    psArr[PS_ID_EMPTY].mParticleBufferRunsum = reinterpret_cast<PxU32*>(size_t(bEmptyRunsum.addr));
+    psArr[PS_ID_EMPTY].mCommonData.mNumParticles = NB_PARTICLES;
+    psArr[PS_ID_EMPTY].mCommonData.mNumParticleBuffers = 0u;
+    DevBuf bPsDesc = makeDev(dev, psArr);
+
+    // ---- the constraint block ---------------------------------------------------------
+    std::vector<uint32_t> con(((NB_ATT + 31u) / 32u) * FAC_STRIDE / 4, 0u);
+    auto putF4 = [&](size_t byteOff, F4 v) {
+        const size_t w = byteOff / 4;
+        con[w] = f2u(v.x); con[w + 1] = f2u(v.y); con[w + 2] = f2u(v.z); con[w + 3] = f2u(v.w);
+    };
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        // E-note: elemId0 is read at the FULL 64 bits (systemId in the high word), while
+        // elemId1 is read as a PxU32.  The high word of elemId1 therefore carries a pattern
+        // that would name a nonexistent softbody if it were ever read.
+        const size_t w0 = (FAC_ELEMID0 + a * 8) / 4;
+        con[w0] = attInBufIdx[a];        // PxGetParticleIndex: the LOW word
+        con[w0 + 1] = attSystem[a];      // PxGetParticleSystemId: the HIGH word
+        const size_t w1 = (FAC_ELEMID1 + a * 8) / 4;
+        con[w1] = encodeSb(SB_ID, a);
+        con[w1 + 1] = 0x5B5B0000u | a;
+        // E2: barycentric0.x is a BUFFER ID reached by float->uint TRUNCATION.  The .7
+        // fraction is what separates a truncation from a rounding, and y/z/w carry values
+        // that would be visible if anything treated them as barycentrics.
+        putF4(FAC_BARYCENTRIC0 + a * 16,
+              F4{ float(attBufferId[a]) + 0.7f, 11.0f, -13.0f, 17.0f });
+        putF4(FAC_BARYCENTRIC1 + a * 16, BARY_SB);
+        // E1: a cone limit that WOULD bind if this kernel had the sibling's branch --
+        // low 0.1, high 0.4, angle 0.5 -- plus a non-zero offset and an attachment
+        // barycentric.  The .cu never reads any of it.
+        putF4(FAC_LOW_HIGH_ANGLES + a * 16, F4{ 0.1f, 0.4f, 0.5f, 0.0f });
+        putF4(FAC_ATT_BARYCENTRIC + a * 16, F4{ 0.0f, 1.0f, 0.0f, 0.0f });
+        con[(FAC_CONSTR_OFFSET + a * 4) / 4] = f2u(0.35f);
+    }
+    DevBuf bCon = makeDev(dev, con);
+
+    ParticleSbAttachSolvePush push = {};
+    push.softbodies = bSbDesc.addr;
+    push.particleSystems = bPsDesc.addr;
+    push.attachments = bCon.addr;
+    push.numAttachments = NB_ATT;
+    Kernel k("softBodyParticleAttachBda.spv", "sb_solveOutputParticleAttachmentDeltaVLaunch",
+             {}, sizeof(ParticleSbAttachSolvePush));
+    PXG_CHECK_MSG(k.isValid(), "the softbody-particle attachment pipeline must build");
+    if (!k.isValid()) return;
+    k.dispatch(1024u, {}, push, 1u, 1u);
+    dev->flush();
+
+    // ---- the mirror, transcribed from softBodyGM.cu:2522-2605 ---------------------------
+    std::vector<F4> refSb(sbVerts.size(), F4{ 0, 0, 0, 0 });
+    std::vector<F4> refPart = partDelta;
+    uint32_t skippedByMass = 0u, particleWrites = 0u, zeroInvMassParticle = 0u, cornerGuards = 0u;
+    uint32_t halfZeroLanes = 0u, emptyBufferLanes = 0u;
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        const uint32_t b = a * 4u;
+        const F4 s0 = sbVerts[b], s1 = sbVerts[b + 1], s2 = sbVerts[b + 2], s3 = sbVerts[b + 3];
+        const F4 w = BARY_SB;
+        const F4 pos1 = { s0.x * w.x + s1.x * w.y + s2.x * w.z + s3.x * w.w,
+                          s0.y * w.x + s1.y * w.y + s2.y * w.z + s3.y * w.w,
+                          s0.z * w.x + s1.z * w.y + s2.z * w.z + s3.z * w.w,
+                          s0.w * w.x + s1.w * w.y + s2.w * w.z + s3.w * w.w };
+        const uint32_t pid = resolveParticle(a);
+        const F4 pos0 = partPos[pid];
+
+        if (attSystem[a] == PS_ID_EMPTY) ++emptyBufferLanes;
+        if (pos1.w == 0.0f && pos0.w != 0.0f) ++halfZeroLanes;
+        if (pos1.w == 0.0f && pos0.w == 0.0f) { ++skippedByMass; continue; }   // E6
+
+        // E1: the error is the raw difference; no cone limit is applied.
+        const float ex = pos1.x - pos0.x, ey = pos1.y - pos0.y, ez = pos1.z - pos0.z;
+
+        const F4 b1w = { w.x * s0.w, w.y * s1.w, w.z * s2.w, w.w * s3.w };
+        const float wTot0 = pos0.w;                                            // E5
+        const float wTot1 = b1w.x * w.x + b1w.y * w.y + b1w.z * w.z + b1w.w * w.w;
+        const float wTot = wTot0 + wTot1;
+
+        if (wTot > 0.0f)
+        {
+            const float r = 1.0f / wTot;
+            const float dx = ex * r, dy = ey * r, dz = ez * r;
+            // updateTetPositionDelta(-delta, b1w, 1.0f): per corner, guarded on b1w.* > 0,
+            // and the FOUR-argument AtomicAdd adds the weight into .w.
+            const uint32_t ti[4] = { b, b + 1u, b + 2u, b + 3u };
+            const float bw[4] = { b1w.x, b1w.y, b1w.z, b1w.w };
+            for (uint32_t c = 0; c < 4u; ++c)
+            {
+                if (bw[c] > 0.0f)
+                {
+                    refSb[ti[c]].x += -dx * bw[c];
+                    refSb[ti[c]].y += -dy * bw[c];
+                    refSb[ti[c]].z += -dz * bw[c];
+                    refSb[ti[c]].w += 1.0f;
+                }
+                else ++cornerGuards;
+            }
+            if (pos0.w > 0.0f)   // E7: the SECOND guard
+            {
+                refPart[pid].x += dx * pos0.w;
+                refPart[pid].y += dy * pos0.w;
+                refPart[pid].z += dz * pos0.w;   // .w deliberately untouched
+                ++particleWrites;
+            }
+            else ++zeroInvMassParticle;
+        }
+    }
+
+    const auto gSb = downloadBuffer<F4>(dev, bSbD.h, uint32_t(sbVerts.size()));
+    const auto gPart = downloadBuffer<F4>(dev, bPartD.h, NB_PARTICLES);
+    size_t mm = 0;
+    auto cmp = [&](const char* nm, uint32_t i, const F4& r, const F4& g) {
+        if (f2u(r.x) != f2u(g.x) || f2u(r.y) != f2u(g.y) ||
+            f2u(r.z) != f2u(g.z) || f2u(r.w) != f2u(g.w))
+        { ++mm; std::printf("  %s[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm, i,
+                            r.x, r.y, r.z, r.w, g.x, g.y, g.z, g.w); }
+    };
+    for (uint32_t i = 0; i < sbVerts.size(); ++i) cmp("sbDelta", i, refSb[i], gSb[i]);
+    for (uint32_t i = 0; i < NB_PARTICLES; ++i) cmp("partDelta", i, refPart[i], gPart[i]);
+    PXG_CHECK_MSG(mm == 0, "sb_solveOutputParticleAttachmentDeltaV bit-exact vs CPU (%zu mismatches)", mm);
+
+    // ---- TEETH: every one of the seven differences must be exercised -------------------
+    PXG_CHECK_MSG(skippedByMass == 1u,
+                  "exactly one attachment must be skipped by the zero-mass PAIR (got %u) -- "
+                  "the half-zero lane must NOT be skipped, which is what separates the "
+                  "`&&` from an `||`", skippedByMass);
+    PXG_CHECK_MSG(halfZeroLanes == 1u,
+                  "exactly one attachment must have a zero-mass TET and a finite particle "
+                  "(got %u)", halfZeroLanes);
+    PXG_CHECK_MSG(emptyBufferLanes == 1u,
+                  "exactly one attachment must name a particle system with ZERO buffers "
+                  "(got %u) -- the length guard is unreachable otherwise", emptyBufferLanes);
+    PXG_CHECK_MSG(particleWrites >= 6u,
+                  "the particle scatter must fire on most lanes (got %u of %u)",
+                  particleWrites, NB_ATT);
+    PXG_CHECK_MSG(cornerGuards >= 1u,
+                  "at least one tet corner must be skipped by updateTetPositionDelta's "
+                  "invMassBary > 0 guard (got %u)", cornerGuards);
+    // E7: every .w of mDelta must come back exactly as seeded -- the particle scatter is
+    // the THREE-component overload.  Checked separately from the bit-exact compare so the
+    // message says which property broke.
+    for (uint32_t i = 0; i < NB_PARTICLES; ++i)
+        PXG_CHECK_MSG(f2u(gPart[i].w) == f2u(55.0f + float(i)),
+                      "particle %u mDelta.w must be untouched (%g, seeded %g)",
+                      i, gPart[i].w, 55.0f + float(i));
+    // E5: wTot0 is the RAW particle inverse mass.  The mutant this guards against is the
+    // sibling's spelling -- a weighted sum over barycentric0 -- and barycentric0 here is
+    // the buffer-id slot, so the two forms coincide only if barycentric0.x happened to be
+    // exactly 1.  It never is: the .7 fraction that proves the truncation also guarantees
+    // it.  Asserted per lane rather than argued.
+    for (uint32_t a = 0; a < NB_ATT; ++a)
+    {
+        const float bary0x = float(attBufferId[a]) + 0.7f;
+        PXG_CHECK_MSG(f2u(bary0x) != f2u(1.0f),
+                      "attachment %u: barycentric0.x must not be 1.0, or a weighted wTot0 "
+                      "would be indistinguishable from the raw one", a);
+    }
+    // E2 again, and this one is the lesson of the first sweep: TRUNCATING `id + 0.7` and
+    // ROUNDING it must land in DIFFERENT buckets.  With a gapped id table they do not --
+    // the search returns the largest id <= the query, so 3.7 and 4 both resolve to 3 --
+    // and the rounding mutant lived.  Consecutive ids are what make the two separable, and
+    // that is asserted here rather than left to the table's shape.
+    {
+        auto bucketOf = [&](uint32_t q) {
+            uint32_t l = 0u, r = NB_BUFFERS;
+            while (l < r) { const uint32_t m = (l + r) / 2u;
+                            if (sortedUniqueIds[m] > q) r = m; else l = m + 1u; }
+            return originalIndex[r - 1u];
+        };
+        uint32_t separable = 0u;
+        for (uint32_t a = 0; a < NB_ATT; ++a)
+            if (attSystem[a] != PS_ID_EMPTY && bucketOf(attBufferId[a]) != bucketOf(attBufferId[a] + 1u))
+                ++separable;
+        PXG_CHECK_MSG(separable >= 6u,
+                      "on at least six lanes the truncated and the rounded buffer id must "
+                      "resolve to DIFFERENT buffers (got %u) -- otherwise E2 is untestable",
+                      separable);
+    }
+    // And the tet weights must not be uniform, or picking the wrong bary1 component is
+    // invisible in wTot1.
+    PXG_CHECK_MSG(f2u(BARY_SB.x) != f2u(BARY_SB.y) && f2u(BARY_SB.y) != f2u(BARY_SB.z) &&
+                  f2u(BARY_SB.z) != f2u(BARY_SB.w),
+                  "the four tet barycentrics must all differ");
+    // E3/E4: the resolved particle indices must be spread out and NOT equal to the raw
+    // in-buffer index, or the three indirections are untested.
+    {
+        uint32_t identityHits = 0u, distinct = 0u;
+        uint32_t seen[10] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+        for (uint32_t a = 0; a < NB_ATT; ++a)
+        {
+            const uint32_t pid = resolveParticle(a);
+            if (pid == attInBufIdx[a]) ++identityHits;
+            bool dup = false;
+            for (uint32_t j = 0; j < distinct; ++j) if (seen[j] == pid) dup = true;
+            if (!dup) seen[distinct++] = pid;
+        }
+        PXG_CHECK_MSG(identityHits == 0u,
+                      "no attachment may resolve to its raw in-buffer index (%u do) -- the "
+                      "runsum and the unsorted->sorted mapping would then be invisible",
+                      identityHits);
+        PXG_CHECK_MSG(distinct == NB_ATT,
+                      "the %u attachments must reach %u DISTINCT particles (got %u)",
+                      NB_ATT, NB_ATT, distinct);
+    }
+    std::printf("  %u attachments: %u particle writes, %u skipped by mass, %u corner guards\n",
+                NB_ATT, particleWrites, skippedByMass, cornerGuards);
+
+    dev->destroyBuffer(bSbV.h); dev->destroyBuffer(bTets.h); dev->destroyBuffer(bPartPos.h);
+    dev->destroyBuffer(bU2S.h); dev->destroyBuffer(bRunsum.h); dev->destroyBuffer(bUids.h);
+    dev->destroyBuffer(bUidsOrig.h); dev->destroyBuffer(bSbD.h); dev->destroyBuffer(bPartD.h);
+    dev->destroyBuffer(bEmptyRunsum.h); dev->destroyBuffer(bEmptyU2S.h);
+    dev->destroyBuffer(bSbDesc.h); dev->destroyBuffer(bPsDesc.h); dev->destroyBuffer(bCon.h);
+}
+
 } // namespace
