@@ -1549,8 +1549,13 @@ namespace physx
 					PX_CUDA_KERNEL_PARAM(pairCountd),
 					PX_CUDA_KERNEL_PARAM(startd),
 					PX_CUDA_KERNEL_PARAM(endd),
-					PX_CUDA_KERNEL_PARAM(deltaVd),
-					PX_CUDA_KERNEL_PARAM(dt)
+					PX_CUDA_KERNEL_PARAM(deltaVd)
+					// ps_accumulateFEMParticleDeltaVLaunch (particlesystem.cu:2761) declares
+					// SIX parameters and never reads a dt.  This site used to pass a seventh;
+					// CUDA silently ignores the surplus bytes of the parameter buffer, so the
+					// mismatch was invisible upstream, but the Vulkan runtime's push-constant
+					// block is a fixed size and its blob check is exact.  The cloth launch of
+					// the very same kernel (PxgFEMClothCore.cpp:2277) already passes six.
 				};
 
 				const PxU32 numThreadsPerBlock = PxgSoftBodyKernelBlockDim::SB_ACCUMULATE_DELTA;

@@ -649,3 +649,113 @@ void ps_accumulateDeltaVParticleLaunch(uint3 groupThreadId : SV_GroupThreadID, u
         accumDeltaP[tParticleId] = acc;
     }
 }
+
+// ===========================================================================
+// 4. ps_accumulateFEMParticleDeltaVLaunch (particlesystem.cu:2761)
+//    The FEM twin of kernel 3.  It reduces the per-CONTACT deltaP the FEM-side
+//    solves wrote (P9.31 for cloth-vs-particle, P9.39c..e for softbody-vs-
+//    particle) onto each particle's mAccumDeltaP, which is what finally MOVES
+//    the particle.  Without it both chains are inert on the particle side: the
+//    cloth or softbody reacts and the particles never receive anything.
+//
+//    CUDA ABI: (PxgParticleSystem* particleSystems, PxgFemOtherContactInfo*
+//    sortedContactInfo, PxU32* totalNumPairs, PxU32* rangeStart, PxU32* rangeEnd,
+//    float4* deltaP) -> 6 pointers = 48-byte blob.
+//
+//    LAUNCH-SITE ASYMMETRY (upstream candidate).  PxgFEMClothCore.cpp:2277 passes
+//    exactly those six.  PxgSoftBodyCore.cpp:1545 passes SEVEN -- a trailing
+//    `dt` the kernel never declares.  CUDA ignores the surplus bytes of the
+//    parameter buffer, so upstream cannot see it; a fixed-size push-constant
+//    block can, and the shim's blob size is an exact match (PxgCudaShim.cpp:232).
+//    The block below is the 48 bytes the kernel READS, and the softbody launch
+//    site drops the stray argument.  DOCUMENTED, NOT REPORTED.
+//
+//    THE TWIN TRAP.  The reciprocal is NOT the one kernel 3 uses:
+//        FEM      recipCount = fcount > 0.f ? 1.f / fcount : 0.f   (:2802)
+//        particle recipCount = 1.f / PxMax(1.f, fcount)            (:2866)
+//    They agree only for fcount >= 1.  For a fractional total the FEM form
+//    AMPLIFIES the sum and the particle form damps it, and for fcount == 0 the
+//    FEM form yields exactly 0 where the particle form yields the raw sum.
+//    Both are reachable: tDelta.w is a per-contact 0/1 scale on the particle
+//    side but a barycentric-weighted count on the FEM side.
+// ===========================================================================
+struct FemOtherContactInfo
+{
+    uint2 pairInd0;                  // @0   systemId<<32 | particleIndex
+    uint pairInd1;                   // @8   FEM id
+    uint rigidMatInd_isInCollision;  // @12 -> 16
+}
+
+struct PcFemAccumParams
+{
+    uint64_t particleSystems;   // @0  output (mAccumDeltaP)
+    uint64_t sortedContactInfo; // @8  input
+    uint64_t totalNumPairs;     // @16 input
+    uint64_t rangeStart;        // @24 input
+    uint64_t rangeEnd;          // @32 input
+    uint64_t deltaP;            // @40 input -> 48
+}
+[[vk::push_constant]]
+ConstantBuffer<PcFemAccumParams> gFAc;
+
+[shader("compute")]
+[numthreads(AD_BLOCK, 1, 1)]
+void ps_accumulateFEMParticleDeltaVLaunch(uint3 groupThreadId : SV_GroupThreadID,
+                                          uint3 groupId : SV_GroupID)
+{
+    const uint numTests = Ptr<uint>(gFAc.totalNumPairs)[0];
+
+    const uint nbBlocksRequired = (numTests + AD_BLOCK - 1u) / AD_BLOCK;
+    const uint nbIterationsPerBlock = (nbBlocksRequired + AD_GRID - 1u) / AD_GRID;
+    const uint idx = groupThreadId.x;
+
+    Ptr<PxgParticleSystemGpu> systems = Ptr<PxgParticleSystemGpu>(gFAc.particleSystems);
+    Ptr<FemOtherContactInfo> infos = Ptr<FemOtherContactInfo>(gFAc.sortedContactInfo);
+    Ptr<uint> rangeStart = Ptr<uint>(gFAc.rangeStart);
+    Ptr<uint> rangeEnd = Ptr<uint>(gFAc.rangeEnd);
+    Ptr<float4> deltaP = Ptr<float4>(gFAc.deltaP);
+
+    for (uint i = 0; i < nbIterationsPerBlock; ++i)
+    {
+        const uint workIndex = i * AD_BLOCK + idx + nbIterationsPerBlock * groupId.x * AD_BLOCK;
+        if (workIndex >= numTests)
+            return;
+
+        const uint startIndex = rangeStart[workIndex];
+        const uint endIndex = rangeEnd[workIndex];
+
+        float4 accumulatedDeltaP = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        float fcount = 0.0f;
+        for (uint j = startIndex; j < endIndex; ++j)
+        {
+            const float4 tDelta = deltaP[j];
+            accumulatedDeltaP.x += tDelta.x;
+            accumulatedDeltaP.y += tDelta.y;
+            accumulatedDeltaP.z += tDelta.z;
+            fcount += tDelta.w;
+        }
+
+        // particlesystem.cu:2802 -- NOT 1/max(1,fcount); see the twin trap above.
+        const float recipCount = fcount > 0.0f ? 1.0f / fcount : 0.0f;
+        accumulatedDeltaP.x *= recipCount;
+        accumulatedDeltaP.y *= recipCount;
+        accumulatedDeltaP.z *= recipCount;
+
+        // PxGetParticleSystemId = id >> 32, PxGetParticleIndex = id & 0xffffffff
+        // (PxgSimulationCoreDesc.h:150/:155) -- the high/low halves of pairInd0.
+        const uint2 pairInd0 = infos[startIndex].pairInd0;
+        const uint tParticleSystemId = pairInd0.y;
+        const uint tParticleId = pairInd0.x;
+
+        // mAccumDeltaP is zeroed by ps_preIntegrateLaunch, so this is a pure
+        // accumulate.  The .cu's `+=` on a float4 adds .w too; accumulatedDeltaP.w
+        // is never assigned after its zero init, so the .w term is a faithful +0.
+        Ptr<float4> accumDeltaP = Ptr<float4>(systems[tParticleSystemId].mAccumDeltaP);
+        float4 acc = accumDeltaP[tParticleId];
+        acc.x += accumulatedDeltaP.x;
+        acc.y += accumulatedDeltaP.y;
+        acc.z += accumulatedDeltaP.z;
+        acc.w += accumulatedDeltaP.w;
+        accumDeltaP[tParticleId] = acc;
+    }
+}

@@ -77,6 +77,7 @@ static uint64_t addrOf(PxgSlangComputeDevice* dev, PxgBufferHandle h)
 static void putU64(std::vector<uint8_t>& b, size_t off, uint64_t v) { std::memcpy(b.data() + off, &v, 8); }
 static void putU32(std::vector<uint8_t>& b, size_t off, uint32_t v) { std::memcpy(b.data() + off, &v, 4); }
 static void putF32(std::vector<uint8_t>& b, size_t off, float v) { std::memcpy(b.data() + off, &v, 4); }
+static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }
 
 // ---------------------------------------------------------------------------
 // CPU transcription of the three .cu kernels for ONE static-floor contact.
@@ -386,6 +387,191 @@ PXG_TEST(psContactSolve_infiniteMassNoResponse)
     // accumulate over the range with scale 0 -> zero correction (recipCount clamps).
     PXG_CHECK_MSG(gpu.accumDeltaP.y == 0.0f,
                   "infinite-mass particle wrongly moved: accumDeltaP.y=%g", gpu.accumDeltaP.y);
+}
+
+// ===========================================================================
+// P9.48a: ps_accumulateFEMParticleDeltaVLaunch (particlesystem.cu:2761).
+//
+// The consumer that finally MOVES a particle a cloth or a softbody pushed.  It
+// is the FEM twin of ps_accumulateDeltaVParticleLaunch (:2828) and differs from
+// it in exactly one line of arithmetic:
+//
+//     FEM      recipCount = fcount > 0.f ? 1.f / fcount : 0.f
+//     particle recipCount = 1.f / PxMax(1.f, fcount)
+//
+// The two agree for fcount >= 1 and disagree everywhere else, so a fixture whose
+// weights all sum to 1 or more cannot tell the twins apart.  The four ranges
+// below are chosen so three of them CAN: 0.5 (the FEM form doubles where the
+// particle form leaves the sum alone), exactly 0 (the FEM form zeroes where the
+// particle form passes the raw sum through), and 1.0 (the boundary, where they
+// must agree).  The fourth is an ordinary 2.5.
+// ===========================================================================
+struct FemAccumPush
+{
+    uint64_t particleSystems, sortedContactInfo, totalNumPairs, rangeStart, rangeEnd, deltaP;
+};
+static_assert(sizeof(FemAccumPush) == 48, "FEM accum push must be 48 bytes -- the six "
+              "parameters the kernel DECLARES; the softbody launch site used to pass a "
+              "seventh (dt) that the kernel never reads");
+
+// PxgFemOtherContactInfo (PxgFEMCore.h:128, 16 bytes).
+struct FemOtherContactInfo { uint32_t pairLo, pairHi, pairInd1, rigidMatInd; };
+static_assert(sizeof(FemOtherContactInfo) == 16, "FemOtherContactInfo stride");
+
+PXG_TEST(psContactSolve_accumulateFemDeltaV)
+{
+    PxgSlangComputeDevice* dev = testDevice();
+
+    // Four ranges over one contact stream.  Ranges 0..2 belong to particle SYSTEM
+    // 0 (particles 3, 7, 11), range 3 to particle SYSTEM 1 (particle 5) -- so a
+    // port that read the two halves of pairInd0 the other way round indexes a
+    // system that does not exist, or the wrong particle.
+    struct Range { uint32_t sysId, partId; std::vector<F4> deltas; };
+    const std::vector<Range> ranges = {
+        // fcount = 0.25 + 0.25 = 0.5  -> FEM doubles, the particle twin does not
+        { 0u, 3u,  { { 1.0f, 2.0f, 3.0f, 0.25f }, { 0.5f, -1.0f, 0.25f, 0.25f } } },
+        // fcount = 0.0 with a NON-ZERO sum -> FEM yields exactly 0, the twin does not
+        { 0u, 7u,  { { 4.0f, -2.0f, 1.5f, 0.0f }, { -1.0f, 3.0f, -0.5f, 0.0f } } },
+        // fcount = 1.0 exactly -> the boundary, where the two forms must agree
+        { 0u, 11u, { { 2.0f, 0.5f, -3.0f, 0.5f }, { 1.0f, 1.5f, 2.0f, 0.5f } } },
+        // fcount = 2.5, an ordinary range, and a SECOND particle system
+        { 1u, 5u,  { { 1.0f, 1.0f, 1.0f, 1.5f }, { 2.0f, -2.0f, 0.5f, 0.75f },
+                     { -0.5f, 0.25f, 3.0f, 0.25f } } },
+    };
+
+    std::vector<FemOtherContactInfo> infos;
+    std::vector<F4> deltaP;
+    std::vector<uint32_t> rStart, rEnd;
+    for (const Range& r : ranges)
+    {
+        rStart.push_back(uint32_t(infos.size()));
+        for (const F4& d : r.deltas)
+        {
+            FemOtherContactInfo ci;
+            ci.pairLo = r.partId;   // PxGetParticleIndex = id & 0xffffffff
+            ci.pairHi = r.sysId;    // PxGetParticleSystemId = id >> 32
+            ci.pairInd1 = 0xA5A5A5A5u;   // decoy: the FEM id, never read here
+            ci.rigidMatInd = 0x5A5A5A5Au;// decoy
+            infos.push_back(ci);
+            deltaP.push_back(d);
+        }
+        rEnd.push_back(uint32_t(infos.size()));
+    }
+    const uint32_t NR = uint32_t(ranges.size());
+
+    // Two particle systems, each with its own mAccumDeltaP.  PRE-SEEDED non-zero
+    // so that an assignment in place of the accumulate dies, and with a non-zero
+    // .w so the faithful `acc.w += 0` stays visible.
+    const uint32_t NP = 16u;
+    std::vector<F4> accum0(NP), accum1(NP);
+    for (uint32_t i = 0; i < NP; ++i)
+    {
+        accum0[i] = { 100.0f + float(i), 200.0f + float(i), 300.0f + float(i), 7.5f + float(i) };
+        accum1[i] = { -100.0f - float(i), -200.0f - float(i), -300.0f - float(i), 9.5f + float(i) };
+    }
+
+    PxgBufferHandle bAcc0 = createBufferFrom(dev, accum0);
+    PxgBufferHandle bAcc1 = createBufferFrom(dev, accum1);
+    PxgBufferHandle bInfos = createBufferFrom(dev, infos);
+    PxgBufferHandle bDelta = createBufferFrom(dev, deltaP);
+    PxgBufferHandle bStart = createBufferFrom(dev, rStart);
+    PxgBufferHandle bEnd = createBufferFrom(dev, rEnd);
+    PxgBufferHandle bPairs = createBufferFrom(dev, std::vector<uint32_t>(1, NR));
+    if (!addrOf(dev, bAcc0)) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    std::vector<uint8_t> systems(2u * SZ_PARTICLE_SYS, 0);
+    {
+        std::vector<uint8_t> s0(SZ_PARTICLE_SYS, 0), s1(SZ_PARTICLE_SYS, 0);
+        putU64(s0, 152, addrOf(dev, bAcc0));   // mAccumDeltaP
+        putU64(s1, 152, addrOf(dev, bAcc1));
+        std::memcpy(systems.data(), s0.data(), SZ_PARTICLE_SYS);
+        std::memcpy(systems.data() + SZ_PARTICLE_SYS, s1.data(), SZ_PARTICLE_SYS);
+    }
+    PxgBufferHandle bSys = createBufferFrom(dev, systems);
+
+    FemAccumPush push = { addrOf(dev, bSys), addrOf(dev, bInfos), addrOf(dev, bPairs),
+                          addrOf(dev, bStart), addrOf(dev, bEnd), addrOf(dev, bDelta) };
+    Kernel k("psContactSolveBda.spv", "ps_accumulateFEMParticleDeltaVLaunch", {}, sizeof(FemAccumPush));
+    PXG_CHECK_MSG(k.isValid(), "the FEM per-particle accumulate pipeline must build");
+    if (!k.isValid()) return;
+    k.dispatch(32u, {}, push);
+    dev->flush();
+
+    // ---- host mirror, written from particlesystem.cu:2761-2822 ----
+    std::vector<F4> ref0 = accum0, ref1 = accum1;
+    float fcountOf[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    for (uint32_t r = 0; r < NR; ++r)
+    {
+        F4 acc = { 0.0f, 0.0f, 0.0f, 0.0f };
+        float fcount = 0.0f;
+        for (uint32_t j = rStart[r]; j < rEnd[r]; ++j)
+        {
+            acc.x += deltaP[j].x; acc.y += deltaP[j].y; acc.z += deltaP[j].z;
+            fcount += deltaP[j].w;
+        }
+        fcountOf[r] = fcount;
+        const float recip = fcount > 0.0f ? 1.0f / fcount : 0.0f;   // :2802, NOT 1/max(1,f)
+        acc.x *= recip; acc.y *= recip; acc.z *= recip;
+        F4& dst = (ranges[r].sysId == 0u) ? ref0[ranges[r].partId] : ref1[ranges[r].partId];
+        dst.x += acc.x; dst.y += acc.y; dst.z += acc.z; dst.w += acc.w;   // acc.w is +0
+    }
+
+    const auto g0 = downloadBuffer<F4>(dev, bAcc0, NP);
+    const auto g1 = downloadBuffer<F4>(dev, bAcc1, NP);
+    size_t mm = 0;
+    auto cmp = [&](const char* nm, uint32_t i, const F4& a, const F4& b2) {
+        if (f2u(a.x) != f2u(b2.x) || f2u(a.y) != f2u(b2.y) ||
+            f2u(a.z) != f2u(b2.z) || f2u(a.w) != f2u(b2.w))
+        { ++mm; std::printf("  %s[%u] MM: ref(%g,%g,%g,%g) got(%g,%g,%g,%g)\n", nm, i,
+                            a.x, a.y, a.z, a.w, b2.x, b2.y, b2.z, b2.w); }
+    };
+    for (uint32_t i = 0; i < NP; ++i) { cmp("accum0", i, ref0[i], g0[i]); cmp("accum1", i, ref1[i], g1[i]); }
+    PXG_CHECK_MSG(mm == 0, "ps_accumulateFEMParticleDeltaV bit-exact vs CPU (%zu mismatches)", mm);
+
+    // TEETH.  Without these the twin's 1/max(1,fcount) would pass unnoticed.
+    PXG_CHECK_MSG(f2u(fcountOf[0]) == f2u(0.5f),
+                  "range 0 must total EXACTLY 0.5 -- below 1 is the only place the FEM "
+                  "reciprocal and the particle twin's differ upward (got %g)", fcountOf[0]);
+    PXG_CHECK_MSG(f2u(fcountOf[1]) == 0u,
+                  "range 1 must total EXACTLY 0 -- the only place the FEM form yields 0 "
+                  "and the twin passes the raw sum (got %g)", fcountOf[1]);
+    PXG_CHECK_MSG(f2u(fcountOf[2]) == f2u(1.0f), "range 2 must sit ON the 1.0 boundary (got %g)",
+                  fcountOf[2]);
+    PXG_CHECK_MSG(fcountOf[3] > 1.0f, "range 3 must exceed 1.0 (got %g)", fcountOf[3]);
+    // The zero-weight range must carry a non-zero raw sum, or "yields 0" is vacuous.
+    {
+        F4 raw = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (uint32_t j = rStart[1]; j < rEnd[1]; ++j)
+        { raw.x += deltaP[j].x; raw.y += deltaP[j].y; raw.z += deltaP[j].z; }
+        PXG_CHECK_MSG(f2u(raw.x) != 0u || f2u(raw.y) != 0u || f2u(raw.z) != 0u,
+                      "the zero-weight range must have a NON-ZERO raw sum, else the FEM "
+                      "reciprocal's 0 is indistinguishable from the twin's pass-through");
+        PXG_CHECK_MSG(f2u(g0[7].x) == f2u(accum0[7].x) && f2u(g0[7].y) == f2u(accum0[7].y) &&
+                      f2u(g0[7].z) == f2u(accum0[7].z),
+                      "particle 7 (the zero-weight range) must be left EXACTLY as seeded");
+    }
+    // Both particle SYSTEMS must be written, or the id halves are untested.
+    PXG_CHECK_MSG(f2u(g1[5].x) != f2u(accum1[5].x),
+                  "particle system 1 must be reached -- pairInd0's HIGH half is the system id");
+    PXG_CHECK_MSG(f2u(g0[3].x) != f2u(accum0[3].x),
+                  "particle system 0 must be reached too");
+    // Untouched particles keep their seed, so a stray write is visible.
+    for (uint32_t i = 0; i < NP; ++i)
+    {
+        const bool touched0 = (i == 3u || i == 7u || i == 11u);
+        if (!touched0)
+            PXG_CHECK_MSG(f2u(g0[i].x) == f2u(accum0[i].x) && f2u(g0[i].w) == f2u(accum0[i].w),
+                          "system 0 particle %u must be untouched", i);
+        if (i != 5u)
+            PXG_CHECK_MSG(f2u(g1[i].x) == f2u(accum1[i].x) && f2u(g1[i].w) == f2u(accum1[i].w),
+                          "system 1 particle %u must be untouched", i);
+    }
+    std::printf("  fcount per range: %g %g %g %g\n",
+                fcountOf[0], fcountOf[1], fcountOf[2], fcountOf[3]);
+
+    dev->destroyBuffer(bAcc0); dev->destroyBuffer(bAcc1); dev->destroyBuffer(bInfos);
+    dev->destroyBuffer(bDelta); dev->destroyBuffer(bStart); dev->destroyBuffer(bEnd);
+    dev->destroyBuffer(bPairs); dev->destroyBuffer(bSys);
 }
 
 } // namespace

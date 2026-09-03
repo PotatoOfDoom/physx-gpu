@@ -1786,6 +1786,111 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.48a — die drei Kerne, die ein Partikel endlich bewegen: zwei Zwillingsfallen, zwei Upstream-Kandidaten und ein Fegewerkzeug, das gelogen hat
+
+**Ergebnis:** Manifest **395 → 398/501** (79,4 %). Suite **845/845 in beiden Speichermodi**,
+beide im ersten Anlauf (288 s bzw. 270 s). Szenen **36/36 ok, 0 fail, 0 missing**, null `unmapped`-Zeilen — unverändert, und das
+ist der ehrliche Befund: keine der 36 Szenen stellt heute FEM gegen Partikel so, dass die
+neu angeschlossene Reaktion sichtbar würde. Die beobachtende Szene ist der nächste Schritt. Zwei neue
+Vorrichtungen, **32 Mutanten, 31 getötet**, ein bewiesen äquivalenter Überlebender. Zwei
+neue Upstream-Kandidaten (44 → 46), und ein Defekt im Fegewerkzeug selbst.
+
+### Was still war
+
+P9.31 hat die Tuch-gegen-Partikel-Seite abgebildet, P9.39c..e die
+Weichkörper-gegen-Partikel-Seite. Beide schreiben ein `deltaP` **pro Kontakt**. Was fehlte,
+war der Verbraucher: `ps_accumulateFEMParticleDeltaVLaunch` (particlesystem.cu:2761) summiert
+diese Beiträge pro PARTIKEL auf `mAccumDeltaP` — das Feld, das das Partikel danach wirklich
+bewegt. Davor bauen `ps_findStartEndFEM{First,Second}Launch` (:2519 / :2644) die
+[start,end)-Bereiche, ohne die die Summe nicht weiß, was sie summieren soll.
+
+Alle drei werden von **beiden** Seiten gestartet — `PxgSoftBodyCore.cpp` (:1543, :2356,
+:2416) und `PxgFEMClothCore.cpp` (:2275, :426, :456) —, also war die Partikelseite BEIDER
+Ketten stumm: das Tuch reagiert, der Weichkörper reagiert, und die Partikel bekommen nichts.
+
+### Zwillinge, und wo sie auseinandergehen
+
+Alle drei Kerne haben einen bereits abgebildeten Partikel-Zwilling im selben Modul
+(`ps_findStartEndParticle{First,Second}Launch`, `ps_accumulateDeltaVParticleLaunch`). Zeile
+für Zeile diffed; die Unterschiede sind fünf, und zwei davon sind echte Fallen.
+
+**Falle 1 — der Kehrwert.** Die einzige arithmetische Abweichung des Akkumulators:
+
+```
+FEM      recipCount = fcount > 0.f ? 1.f / fcount : 0.f     (:2802)
+Partikel recipCount = 1.f / PxMax(1.f, fcount)              (:2866)
+```
+
+Die beiden stimmen für `fcount >= 1` überein und sonst nirgends. Unter 1 **verstärkt** die
+FEM-Form die Summe, wo die Partikel-Form sie unangetastet lässt; bei genau 0 liefert die
+FEM-Form exakt 0, wo die Partikel-Form die rohe Summe durchreicht. Beides ist erreichbar:
+`tDelta.w` ist auf der Partikelseite ein 0/1-Maßstab, auf der FEM-Seite ein
+baryzentrisch gewichteter Zähler. Eine Vorrichtung, deren Gewichte alle ≥ 1 summieren, kann
+die Zwillinge nicht unterscheiden — deshalb hat die neue vier Bereiche mit den Summen
+**0,5 / 0,0 / 1,0 / 2,5**, und die Prüfung verlangt jede dieser Zahlen exakt.
+
+**Falle 2 — der Satz.** `PxgFemOtherContactInfo` ist 16 Byte mit `pairInd0` bei **@0**;
+`PxgParticlePrimitiveContact` ist 32 Byte mit `particleId` bei **@24**. Beide Nachbarfelder
+(`pairInd1` @8, `rigidMatInd_isInCollision` @12) tragen in der Vorrichtung bei jedem Kontakt
+andere Werte, damit ein Lesen am falschen Versatz nicht zufällig dieselben Läufe erzeugt.
+
+### Zwei Upstream-Kandidaten (44 → 46)
+
+**Nr. 45 — die fehlende Sperre.** Der Partikel-Zwilling von Durchgang 2 schließt seine
+Iterationsschleife mit `__syncthreads()` und dem Kommentar „sParticleId (shared memory) is
+read and written in the same loop - read and write must be separated with syncs". Der
+FEM-Zwilling hat diese Sperre **nicht**, bei identischer Schleife: sie liest
+`sParticleId[tid]` und schreibt `sParticleId[tid+1]` im selben Rumpf, also rennt der
+Schreibzugriff von Iteration i+1 gegen den Lesezugriff von Iteration i, sobald
+`numIterationPerBlock > 1`. Das getreu nachzubilden hieße, ein Wettrennen nachzubilden, kein
+Verhalten — der Port behält die Sperre, und die Vorrichtung verlangt ausdrücklich mindestens
+zwei Iterationen pro Block, damit die Stelle überhaupt durchlaufen wird.
+
+**Nr. 46 — der siebte Parameter.** `ps_accumulateFEMParticleDeltaVLaunch` deklariert SECHS
+Parameter. `PxgFEMClothCore.cpp:2277` übergibt sechs. `PxgSoftBodyCore.cpp:1545` übergab
+**sieben** — ein angehängtes `dt`, das der Kern nie liest. CUDA ignoriert die überzähligen
+Bytes des Parameterpuffers, also ist der Fehler upstream unsichtbar; ein
+Push-Konstantenblock hat eine feste Größe und die Prüfung des Laufzeitkerns ist exakt
+(PxgCudaShim.cpp:232). Ohne Korrektur ist der Kern überhaupt nicht abbildbar. Die
+Startstelle übergibt jetzt sechs, wie ihr Tuch-Gegenstück.
+
+Dazu eine dritte, harmlose Abweichung: der FEM-Durchgang 1 lässt `PxU64 particleId`
+**uninitialisiert**, wo der Zwilling `0xffffffffffffffff` setzt. Jeder Lesezugriff steht
+hinter derselben Bedingung, die den Wert auch zuweist, also ist er tot; der Port schreibt
+die definierte Fassung.
+
+### Der Fegedurchgang, und was er über die Vorrichtung gesagt hat
+
+| Durchgang | Ziel | Mutanten | getötet | überlebt |
+|---|---|---|---|---|
+| `sweep48a` | die beiden Bereichssuchen | 16 | 15 | `K15` |
+| `sweep48b` | der Akkumulator | 16 | 16 | — |
+
+Der erste Anlauf hat eine echte Lücke gefunden: **`K4-pass1-low-half-only` überlebte**. Die
+Gruppen-IDs der Vorrichtung waren `(g << 20) | …` und passten damit vollständig in die
+unteren 32 Bit — die HOHE Hälfte von `pairInd0` (die Partikelsystem-ID) unterschied nie
+etwas, also war ein Vergleich, der sie wegließ, nicht zu unterscheiden. Die Vorrichtung
+erzeugt jetzt gezielt Übergänge beider Sorten und misst sie: **801 nur-hoch, 1069
+nur-niedrig** über 4009 Bereiche, beide mit einer Untergrenze in der Prüfung. Danach starben
+`K4` und `K5b`.
+
+`K15-pass1-not-folded-onto-block0` überlebt bewiesenermaßen. Die Schleife indiziert
+`i * AD_BLOCK + tid` ohne `blockId`-Term und der Akkumulator ist arbeitsgruppenlokal, also
+rechnet jeder der 32 Blöcke dieselben Werte in dieselben Plätze. Der frühe Rücksprung spart
+31 Blöcke Doppelarbeit und ändert keine Ausgabe — es gibt dort nichts zu töten. Im Shader
+festgehalten.
+
+### Ein Defekt im Werkzeug selbst
+
+Zweimal meldete das Fegewerkzeug „NOT-RUN (.spv unchanged)" für einen Mutanten, der von Hand
+nachgemessen **sicher stirbt** (`K3`, `L4`). Beide standen an vierter Stelle ihres
+Durchgangs; die Ursache ist der Zeitstempel — die Quelle wird eine Sekunde in die Zukunft
+gestempelt, und wenn der vorige Bau innerhalb dieser Sekunde fertig wird, überspringt `make`
+den Neubau. Ein Fegen, das einen tötenden Mutanten still als „wirkungslos" verbucht, ist
+schlimmer als eines, das gar nicht läuft. `sweep_common.sh` hat jetzt eine sechste Regel:
+**G6 — „keine Änderung" wird mit gelöschtem `.spv` wiederholt**, und erst der zweite
+identische Bau gilt als wirkungslos. Danach lief beides sauber durch.
+
 ## P9.47 — `length()` und `normalize()` sind nicht, was die Engine rechnet: 58 Stellen, ein siebter Prüfer und eine leere Ausnahmeliste
 
 **Ergebnis:** kein neuer Manifesteintrag — es wird nichts abgebildet, sondern eine
@@ -2424,7 +2529,8 @@ TGS-Tangential-Delta (S19).
   (`ps_rigidAttachmentPrepareLaunch`, `ps_solveRigidAttachments{,TGS}Launch`) sind weiter
   unmapped — die Partikel-Starrkörper-Befestigungskette ist damit von hinten nach vorn halb
   geschlossen.
-* Die Zahl der dokumentierten Upstream-Kandidaten bleibt bei 44. Die .cu-Notiz „TODO — need
+* Die Zahl der dokumentierten Upstream-Kandidaten bleibt bei 44.  (P9.48a hat sie auf 46
+  gebracht — siehe dort.) Die .cu-Notiz „TODO — need
   to figure out how to make this work for articulation links!“ vor dem Static-Skip ist keine
   Fehlstelle: ein Gelenkglied ist nicht statisch und läuft durch.
 

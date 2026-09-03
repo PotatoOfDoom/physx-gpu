@@ -1124,8 +1124,11 @@ pxg_compile_shader(psContactGenBda ps_primitivesCollisionLaunch ps_primitivesDif
 # uses portable groupshared scans in place of warp ballots/shuffles, which have no
 # HLSL cs_6_0 lowering, so this shader is deliberately absent from PXG_HLSL_ENTRIES
 # (same precedent as particleSim / psBoundsBda / radixSortDesc).
+# P9.48a adds the FEM twins of the two range-find passes, over
+# PxgFemOtherContactInfo instead of PxgParticlePrimitiveContact.
 pxg_compile_shader(psContactSortBda ps_reorderPrimitiveContactsLaunch
-                   ps_findStartEndParticleFirstLaunch ps_findStartEndParticleSecondLaunch)
+                   ps_findStartEndParticleFirstLaunch ps_findStartEndParticleSecondLaunch
+                   ps_findStartEndFEMFirstLaunch ps_findStartEndFEMSecondLaunch)
 # P6.4b-2: the PBD particle contact SOLVE half on the engine ABI (BDA) — contact
 # constraint prepare + per-contact particle solve + per-particle deltaV accumulate.
 # All three grid-stride via nbIterationsPerBlock (the launch grid is fixed at 1024
@@ -1133,8 +1136,13 @@ pxg_compile_shader(psContactSortBda ps_reorderPrimitiveContactsLaunch
 # through Ptr<> (BDA), which has no HLSL cs_6_0 lowering, so this shader is
 # deliberately absent from PXG_HLSL_ENTRIES (same precedent as particleSim /
 # psContactSortBda / particleSelfCollisionBda).
+# P9.48a adds ps_accumulateFEMParticleDeltaVLaunch, the FEM twin of the
+# per-particle accumulate -- the consumer that finally MOVES a particle a cloth
+# or softbody pushed.  Its reciprocal is fcount>0?1/fcount:0, NOT the particle
+# twin's 1/max(1,fcount).
 pxg_compile_shader(psContactSolveBda ps_contactPrepareLaunch
-                   ps_solvePCOutputParticleDeltaVLaunch ps_accumulateDeltaVParticleLaunch)
+                   ps_solvePCOutputParticleDeltaVLaunch ps_accumulateDeltaVParticleLaunch
+                   ps_accumulateFEMParticleDeltaVLaunch)
 # P6.6: the three TGS-only kernels that finish the PBD particle contact SOLVE loop
 # under the TGS solver — the TGS substep predictor (ps_stepParticlesLaunch), the
 # TGS twin of the particle-side PC solve (ps_solvePCOutputParticleDeltaVTGSLaunch),

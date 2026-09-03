@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 395;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 398;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -271,9 +271,9 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "ps_diffuseParticleCreate", "psDiffuseCreate.spv", "ps_diffuseParticleCreate" },  // PS_DIFFUSE_PARTICLES_CREATE (P9.13d: the spawn itself)
     { "ps_diffuseParticleCopy", "psDiffuseBuffers.spv", "ps_diffuseParticleCopy" },  // PS_DIFFUSE_PARTICLES_COPY (P9.13c: publish the staged count, clear the staging slot)
     { "ps_diffuseParticleSum", "psDiffuseBuffers.spv", "ps_diffuseParticleSum" },  // PS_DIFFUSE_PARTICLES_SUM (P9.13c: sum the per-buffer counts into the system count)
-    { "ps_findStartEndFEMFirstLaunch", nullptr, nullptr },  // PS_FIND_RANGESTARTEND_FEM_FIRST (unmapped)
-    { "ps_findStartEndFEMSecondLaunch", nullptr, nullptr },  // PS_RANGESTARTEND_FEM_SECONE (unmapped)
-    { "ps_accumulateFEMParticleDeltaVLaunch", nullptr, nullptr },  // PS_ACCUMULATE_FEM_PARTICLE_DELTA (unmapped)
+    { "ps_findStartEndFEMFirstLaunch", "psContactSortBda.spv", "ps_findStartEndFEMFirstLaunch" },  // PS_FIND_RANGESTARTEND_FEM_FIRST (P9.48a: the FEM twin of ps_findStartEndParticleFirstLaunch; pass 1 folded onto block 0 so `offsets` is global)
+    { "ps_findStartEndFEMSecondLaunch", "psContactSortBda.spv", "ps_findStartEndFEMSecondLaunch" },  // PS_RANGESTARTEND_FEM_SECONE (P9.48a: per-particle [start,end) over the FEM contact stream + the pair count)
+    { "ps_accumulateFEMParticleDeltaVLaunch", "psContactSolveBda.spv", "ps_accumulateFEMParticleDeltaVLaunch" },  // PS_ACCUMULATE_FEM_PARTICLE_DELTA (P9.48a: reduces the FEM-side per-contact deltaP onto mAccumDeltaP; recip is fcount>0?1/fcount:0, NOT the particle twin 1/max(1,fcount))
     { "ps_stepParticlesLaunch", "psContactSolveTgsBda.spv", "ps_stepParticlesLaunch" },  // PS_STEP_PARTICLES (P6.6 BDA port: TGS substep predictor)
     { "ps_solvePCOutputParticleDeltaVTGSLaunch", "psContactSolveTgsBda.spv", "ps_solvePCOutputParticleDeltaVTGSLaunch" },  // PS_SOLVE_PC_PARTICLE_TGS (P6.6 BDA port: TGS twin of the particle-side PC solve)
     { "ps_solvePCOutputRigidDeltaVTGSLaunch", "psContactSolveRigidBda.spv", "ps_solvePCOutputRigidDeltaVTGSLaunch" },  // PS_SOLVE_PC_RIGID_TGS (P9.44)

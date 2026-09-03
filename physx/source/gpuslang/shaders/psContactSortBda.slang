@@ -41,6 +41,34 @@
 //     count.  Launches: grid ACCUMULATE_DELTA (32), block ACCUMULATE_DELTA (512);
 //     PxgParticleSystemCore.cpp:1648/:1690.
 //
+// P9.48a adds the FEM TWINS of the two range-find passes:
+//
+//   ps_findStartEndFEMFirstLaunch  (particlesystem.cu:2519)
+//   ps_findStartEndFEMSecondLaunch (particlesystem.cu:2644)
+//
+// They build the same per-particle [start,end) ranges over the FEM-vs-particle
+// contact stream instead of the primitive one, and they are launched from BOTH
+// PxgSoftBodyCore.cpp (:2356/:2416) and PxgFEMClothCore.cpp (:426/:456) with the
+// same dims (block SB_ACCUMULATE_DELTA 512, grid 32 — numerically identical to
+// the particle path's ACCUMULATE_DELTA).  Diffed line for line against their
+// twins; the differences are exactly three, and only the first is behavioural:
+//
+//   1. the record read is PxgFemOtherContactInfo (16 B) and the id is its
+//      pairInd0, not PxgParticlePrimitiveContact::particleId (@24 of 32 B).
+//   2. the FEM pass 1 leaves `PxU64 particleId` UNINITIALISED where the particle
+//      pass 1 seeds it with 0xffffffffffffffff.  Dead either way: every read of
+//      it sits inside `if (workIndex < tNumContacts)`, the same guard that
+//      assigns it.  The port keeps the particle twin's sentinel, which is the
+//      defined-behaviour spelling of the same dead value.
+//   3. UPSTREAM CANDIDATE: the FEM pass 2 has NO trailing __syncthreads() at the
+//      end of its iteration loop, while the particle twin has one carrying the
+//      comment "sParticleId (shared memory) is read and written in the same loop
+//      - read and write must be separated with syncs".  The FEM loop reads
+//      sParticleId[tid] and writes sParticleId[tid+1] in the same body, so
+//      iteration i+1's write races iteration i's read across warps whenever
+//      numIterationPerBlock > 1.  Reproducing that would be reproducing a race,
+//      not a behaviour — the port keeps the barrier.  DOCUMENTED, NOT REPORTED.
+//
 // llvmpipe deviations (flagged):
 //   - The CUDA range-find pass uses __ballot_sync + __popc(mask & threadMask) for
 //     the within-warp exclusive rank of the isRangeStart flag, and a per-warp
@@ -92,6 +120,17 @@ struct PsContact
     float4 normal_pen; // @0
     uint2 rigidId;     // @16
     uint2 particleId;  // @24 -> 32
+}
+
+// PxgFemOtherContactInfo (PxgFEMCore.h:128, PX_ALIGN(16), 16 bytes) —
+// PxU64 pairInd0 @0 (the PARTICLE side: systemId<<32 | particleIndex),
+// PxU32 pairInd1 @8 (the FEM id), PxU32 rigidMatInd_isInCollision @12.
+// The range-find reads only pairInd0; the accumulate reads it once more.
+struct FemOtherContactInfo
+{
+    uint2 pairInd0;                  // @0
+    uint pairInd1;                   // @8
+    uint rigidMatInd_isInCollision;  // @12 -> 16
 }
 
 // ===========================================================================
@@ -344,5 +383,218 @@ void ps_findStartEndParticleSecondLaunch(uint3 groupThreadId : SV_GroupThreadID,
         // total pair count = global range index of the last contact + 1.
         const uint totalPairs = (tNumContacts > 0u) ? (offsets[tNumContacts - 1u] + 1u) : 0u;
         Ptr<uint>(gF2.totalNumPairs)[0] = totalPairs;
+    }
+}
+
+// ===========================================================================
+// 4. ps_findStartEndFEMFirstLaunch (particlesystem.cu:2519)
+//    The FEM twin of kernel 2.  CUDA ABI: (PxgParticleSystem* particleSystems,
+//    PxgFemOtherContactInfo* sortedContactsInfo, PxU32* numContacts,
+//    PxU32* blockOffsets, PxU32* offsets) -> 5 pointers = 40-byte blob.
+//    particleSystems is passed for ABI parity but never dereferenced, exactly as
+//    in the particle twin.
+//    Launched from PxgSoftBodyCore.cpp:2356 and PxgFEMClothCore.cpp:426, both
+//    with block SB_ACCUMULATE_DELTA (512) and grid SB_ACCUMULATE_DELTA (32).
+//
+//    The whole restructuring of the particle twin applies unchanged and for the
+//    same reason: pass 1 is folded onto block 0 so that `offsets` comes out
+//    GLOBAL rather than within-block (see the header).  Only the record type and
+//    the field offset differ from ps_findStartEndParticleFirstLaunch.
+// ===========================================================================
+struct PsFindFemFirstParams
+{
+    uint64_t particleSystems;    // @0  (unused, ABI parity)
+    uint64_t sortedContactsInfo; // @8
+    uint64_t numContacts;        // @16
+    uint64_t blockOffsets;       // @24 output
+    uint64_t offsets;            // @32 output -> 40
+}
+
+[[vk::push_constant]]
+ConstantBuffer<PsFindFemFirstParams> gFF1;
+
+groupshared uint2 gsFemPid1[AD_BLOCK + 1];
+groupshared uint gsFemWarpAccum1[WARP];   // CUDA sizes [WARP_SIZE]; only [0..15] used
+groupshared uint gsFemBlockAccum1;
+
+[shader("compute")]
+[numthreads(AD_BLOCK, 1, 1)]
+void ps_findStartEndFEMFirstLaunch(uint3 groupThreadId : SV_GroupThreadID,
+                                   uint3 groupId : SV_GroupID)
+{
+    const uint tid = groupThreadId.x;
+    const uint blockId = groupId.x;
+    const uint lane = tid & (WARP - 1u);
+    const uint warpIndex = tid / WARP;
+
+    const uint tNumContacts = Ptr<uint>(gFF1.numContacts)[0];
+
+    // See kernel 2: the global running range index is folded onto block 0.
+    //
+    // This early return is an efficiency guard, not a correctness one, and the
+    // P9.48a sweep proved it: the loop below indexes `i * AD_BLOCK + tid` with no
+    // blockId term and gsFemBlockAccum1 is per-workgroup, so every block would
+    // compute the SAME values and write them to the SAME slots.  Removing the
+    // return leaves the outputs bit-identical and only burns 31 workgroups of
+    // duplicate work -- the one mutant of this kernel that cannot be killed, and
+    // it cannot be killed because there is nothing there to kill.
+    if (blockId != 0u)
+        return;
+
+    const uint nbTotalChunks = (tNumContacts + AD_BLOCK - 1u) / AD_BLOCK;
+
+    Ptr<FemOtherContactInfo> infos = Ptr<FemOtherContactInfo>(gFF1.sortedContactsInfo);
+    Ptr<uint> offsets = Ptr<uint>(gFF1.offsets);
+    Ptr<uint> blockOffsets = Ptr<uint>(gFF1.blockOffsets);
+
+    if (tid == 0)
+        gsFemBlockAccum1 = 0u;
+
+    GroupMemoryBarrierWithGroupSync();
+
+    for (uint i = 0; i < nbTotalChunks; ++i)
+    {
+        const uint workIndex = i * AD_BLOCK + tid;
+
+        // The .cu leaves this UNINITIALISED here (its particle twin seeds the
+        // 0xffff.. sentinel); every read is behind the same guard that assigns
+        // it, so the sentinel is the defined-behaviour spelling of a dead value.
+        uint2 particleId = uint2(0xffffffffu, 0xffffffffu);
+        if (workIndex < tNumContacts)
+        {
+            particleId = infos[workIndex].pairInd0;
+            gsFemPid1[tid + 1] = particleId;
+            if (workIndex > 0u && tid == 0u)
+                gsFemPid1[0] = infos[workIndex - 1].pairInd0;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        uint isRangeStart = 0u;
+        if (workIndex < tNumContacts)
+        {
+            const uint2 prev = gsFemPid1[tid];
+            if (workIndex == 0u || any(particleId != prev))
+                isRangeStart = 1u;
+        }
+
+        const uint inclusive = warp32InclusiveScan(tid, isRangeStart);
+        const int offset = int(inclusive) - 1;
+
+        if (lane == (WARP - 1u))
+            gsFemWarpAccum1[warpIndex] = inclusive; // popc(mask) = warp total
+
+        const uint prevBlockAccumulator = gsFemBlockAccum1;
+
+        GroupMemoryBarrierWithGroupSync();
+
+        const uint tOffset = (warpIndex == 0u && lane < AD_NUM_WARPS) ? gsFemWarpAccum1[lane] : 0u;
+        const uint incl2 = warp32InclusiveScan(tid, tOffset);
+        const uint output = incl2 - tOffset;
+        if (warpIndex == 0u)
+        {
+            if (lane == (WARP - 1u))
+                gsFemBlockAccum1 += (output + tOffset);
+            gsFemWarpAccum1[lane] = output;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        if (workIndex < tNumContacts)
+            offsets[workIndex] = uint(offset) + prevBlockAccumulator + gsFemWarpAccum1[warpIndex];
+    }
+
+    if (tid == 0)
+        blockOffsets[0] = gsFemBlockAccum1; // global total range-start count
+}
+
+// ===========================================================================
+// 5. ps_findStartEndFEMSecondLaunch (particlesystem.cu:2644)
+//    The FEM twin of kernel 3.  CUDA ABI: (PxgFemOtherContactInfo*
+//    sortedContactInfo, PxU32* numContacts, PxU32* blockOffsets, PxU32* offsets,
+//    PxU32* totalNumPairs, PxU32* rangeStart, PxU32* rangeEnd)
+//    -> 7 pointers = 56-byte blob.
+//    Launched from PxgSoftBodyCore.cpp:2416 and PxgFEMClothCore.cpp:456.
+//
+//    The trailing GroupMemoryBarrierWithGroupSync() below has NO counterpart in
+//    the .cu -- see the header, upstream candidate.  Its particle twin has it and
+//    says why; without it the port's own reuse of gsFemPid2 across iterations is
+//    a race, so it stays.
+// ===========================================================================
+struct PsFindFemSecondParams
+{
+    uint64_t sortedContactInfo; // @0
+    uint64_t numContacts;       // @8
+    uint64_t blockOffsets;      // @16
+    uint64_t offsets;           // @24
+    uint64_t totalNumPairs;     // @32 output
+    uint64_t rangeStart;        // @40 output
+    uint64_t rangeEnd;          // @48 output -> 56
+}
+
+[[vk::push_constant]]
+ConstantBuffer<PsFindFemSecondParams> gFF2;
+
+groupshared uint2 gsFemPid2[AD_BLOCK + 1];
+
+[shader("compute")]
+[numthreads(AD_BLOCK, 1, 1)]
+void ps_findStartEndFEMSecondLaunch(uint3 groupThreadId : SV_GroupThreadID,
+                                    uint3 groupId : SV_GroupID)
+{
+    const uint tid = groupThreadId.x;
+    const uint blockId = groupId.x;
+
+    const uint tNumContacts = Ptr<uint>(gFF2.numContacts)[0];
+
+    Ptr<FemOtherContactInfo> infos = Ptr<FemOtherContactInfo>(gFF2.sortedContactInfo);
+    Ptr<uint> offsets = Ptr<uint>(gFF2.offsets);
+    Ptr<uint> rangeStart = Ptr<uint>(gFF2.rangeStart);
+    Ptr<uint> rangeEnd = Ptr<uint>(gFF2.rangeEnd);
+
+    // `offsets` is already GLOBAL (pass 1 folds the scan onto one workgroup), so
+    // no per-block exclusive scan and no block-boundary correction -- identical
+    // to the particle twin's treatment.
+    const uint totalBlockRequired = (tNumContacts + (AD_BLOCK - 1u)) / AD_BLOCK;
+    const uint numIterationPerBlock = (totalBlockRequired + (AD_GRID - 1u)) / AD_GRID;
+
+    for (uint i = 0; i < numIterationPerBlock; ++i)
+    {
+        const uint workIndex = i * AD_BLOCK + tid + numIterationPerBlock * blockId * AD_BLOCK;
+
+        uint2 particleId = uint2(0u, 0u);
+        if (workIndex < tNumContacts)
+        {
+            particleId = infos[workIndex].pairInd0;
+            gsFemPid2[tid + 1] = particleId;
+            if (workIndex > 0u && tid == 0u)
+                gsFemPid2[0] = infos[workIndex - 1].pairInd0;
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+
+        if (workIndex < tNumContacts)
+        {
+            const uint2 prev = gsFemPid2[tid];
+            if (workIndex == 0u || any(particleId != prev))
+            {
+                rangeStart[offsets[workIndex]] = workIndex;
+
+                if (workIndex > 0u)
+                    rangeEnd[offsets[workIndex - 1u]] = workIndex;
+            }
+
+            if (workIndex == tNumContacts - 1u)
+                rangeEnd[offsets[workIndex]] = workIndex + 1u;
+        }
+
+        // NOT in the .cu (upstream candidate); required here, see the header.
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (blockId == 0u && tid == 0u)
+    {
+        const uint totalPairs = (tNumContacts > 0u) ? (offsets[tNumContacts - 1u] + 1u) : 0u;
+        Ptr<uint>(gFF2.totalNumPairs)[0] = totalPairs;
     }
 }

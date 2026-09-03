@@ -41,10 +41,17 @@
 //  (c) psContactSort_findStartEnd — the 2-pass ps_findStartEndParticle{First,
 //      Second} produces each particle's [start,end) contact range + the pair
 //      count for a known sorted-by-particle contact set; checked bit-exact.
+//  (d) psContactSort_findStartEndFem (P9.48a) — the FEM twins of (c),
+//      ps_findStartEndFEM{First,Second}Launch, over PxgFemOtherContactInfo
+//      (16 B) instead of PxgParticlePrimitiveContact (32 B).  Same reference,
+//      because the CUDA is the same algorithm on a different record: what this
+//      pins is that the port reads pairInd0 at @0 with a 16-byte stride and not
+//      particleId at @24 with a 32-byte one.
 
 #include "pxgTestFramework.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <numeric>
@@ -59,6 +66,11 @@ struct F4 { float x, y, z, w; };
 // PxgParticlePrimitiveContact (PxgParticleSystem.h, 32 bytes).
 struct PsContact { F4 normal_pen; uint32_t rigidLo, rigidHi, particleLo, particleHi; };
 static_assert(sizeof(PsContact) == 32, "PsContact stride");
+// PxgFemOtherContactInfo (PxgFEMCore.h:128, PX_ALIGN(16), 16 bytes).
+struct FemOtherContactInfo { uint32_t pairLo, pairHi, pairInd1, rigidMatInd; };
+static_assert(sizeof(FemOtherContactInfo) == 16, "FemOtherContactInfo stride");
+static_assert(offsetof(FemOtherContactInfo, pairInd1) == 8, "pairInd1 @8");
+static_assert(offsetof(FemOtherContactInfo, rigidMatInd) == 12, "rigidMatInd @12");
 
 static uint64_t addrOf(PxgSlangComputeDevice* dev, PxgBufferHandle h)
 {
@@ -336,6 +348,175 @@ PXG_TEST(psContactSort_findStartEnd)
                   "findStartEnd coverage thin (pairs=%u NC=%u)", totalPairs, NC);
 
     dev->destroyBuffer(bContacts); dev->destroyBuffer(bNum); dev->destroyBuffer(bBlockOff);
+    dev->destroyBuffer(bOffsets); dev->destroyBuffer(bPairCount);
+    dev->destroyBuffer(bStart); dev->destroyBuffer(bEnd);
+}
+
+// ===========================================================================
+// (d) ps_findStartEndFEM{First,Second} — the FEM twins of (c).  P9.48a.
+//
+// The reference is deliberately the SAME one (c) uses, because the CUDA twins
+// are the same algorithm.  What differs, and what this fixture pins, is the
+// RECORD: pairInd0 lives at @0 of a 16-byte PxgFemOtherContactInfo, where the
+// particle twin reads particleId at @24 of a 32-byte contact.  Both of the
+// neighbouring fields (pairInd1 @8, rigidMatInd @12) are seeded with values that
+// look like plausible particle ids, so a port that read the wrong offset or
+// strode the wrong distance produces garbage ranges rather than agreeing by
+// luck.
+// ===========================================================================
+PXG_TEST(psContactSort_findStartEndFem)
+{
+    std::mt19937 rng(0xFE30A1);
+    PxgSlangComputeDevice* dev = testDevice();
+
+    const uint32_t BLOCK = 512u, GRID = 32u;
+
+    std::vector<FemOtherContactInfo> infos;
+    std::uniform_int_distribution<uint32_t> runLen(1u, 9u);
+    uint32_t g = 0;
+    uint64_t prevPid = 0;
+    uint32_t highOnlyTransitions = 0, lowOnlyTransitions = 0;
+    while (infos.size() < 20000)
+    {
+        // The id is a PxU64 and BOTH halves have to separate runs, or a port that
+        // compared only one of them passes.  Every fifth group keeps the LOW half
+        // of its predecessor and bumps the HIGH half (the particle-system id);
+        // every third keeps the HIGH half and bumps the low one (the particle
+        // index).  A comparison on either half alone then merges runs that must
+        // stay apart, which the range check sees at once.
+        uint64_t pid;
+        if (g > 0 && (g % 5u) == 0u)
+        {
+            pid = (prevPid & 0xffffffffull) | (((prevPid >> 32) + 1ull) << 32);
+            ++highOnlyTransitions;
+        }
+        else if (g > 0 && (g % 3u) == 0u)
+        {
+            pid = (prevPid & 0xffffffff00000000ull) | uint64_t(uint32_t(prevPid) + 1u);
+            ++lowOnlyTransitions;
+        }
+        else
+        {
+            pid = (uint64_t(g % 97u) << 32)
+                | uint64_t(0x50000u + g * 2654435761u & 0xffffful);
+        }
+        prevPid = pid;
+        const uint32_t len = runLen(rng);
+        for (uint32_t r = 0; r < len; ++r)
+        {
+            FemOtherContactInfo ci;
+            ci.pairLo = uint32_t(pid & 0xffffffffu);
+            ci.pairHi = uint32_t(pid >> 32);
+            // DECOYS: both neighbours carry values that change every contact, so
+            // a read at @8 or @12 -- or a 32-byte stride -- cannot reproduce the
+            // runs.  A stride of 32 would also skip every other record, which the
+            // range comparison sees immediately.
+            ci.pairInd1 = rng();
+            ci.rigidMatInd = rng();
+            infos.push_back(ci);
+        }
+        ++g;
+    }
+    const uint32_t NC = uint32_t(infos.size());
+
+    // CPU reference, written from particlesystem.cu:2519/:2644: a range starts
+    // wherever pairInd0 differs from the previous contact's.
+    std::vector<uint32_t> refOffsets(NC), refStart, refEnd;
+    {
+        uint32_t gc = 0;
+        for (uint32_t i = 0; i < NC; ++i)
+        {
+            const bool isStart = (i == 0) ||
+                infos[i].pairLo != infos[i - 1].pairLo ||
+                infos[i].pairHi != infos[i - 1].pairHi;
+            if (isStart)
+            {
+                if (gc > 0) refEnd.push_back(i);
+                refStart.push_back(i);
+                ++gc;
+            }
+            refOffsets[i] = gc - 1;
+        }
+        refEnd.push_back(NC);
+    }
+    const uint32_t totalPairs = uint32_t(refStart.size());
+
+    PxgBufferHandle bInfos = createBufferFrom(dev, infos);
+    PxgBufferHandle bNum = createBufferFrom(dev, std::vector<uint32_t>(1, NC));
+    PxgBufferHandle bBlockOff = createBufferFrom(dev, std::vector<uint32_t>(GRID, 0));
+    PxgBufferHandle bOffsets = createBufferFrom(dev, std::vector<uint32_t>(NC, 0xffffffffu));
+    PxgBufferHandle bPairCount = createBufferFrom(dev, std::vector<uint32_t>(1, 0));
+    PxgBufferHandle bStart = createBufferFrom(dev, std::vector<uint32_t>(NC, 0xffffffffu));
+    PxgBufferHandle bEnd = createBufferFrom(dev, std::vector<uint32_t>(NC, 0xffffffffu));
+    if (!addrOf(dev, bInfos)) { std::printf("  NOTE: no BDA -> skip\n"); return; }
+
+    struct Find1Push
+    {
+        uint64_t particleSystems, sortedContactsInfo, numContacts, blockOffsets, offsets;
+    };
+    static_assert(sizeof(Find1Push) == 40, "FEM pass-1 blob must be 40 bytes");
+    Find1Push p1 = { 0ull, addrOf(dev, bInfos), addrOf(dev, bNum),
+                     addrOf(dev, bBlockOff), addrOf(dev, bOffsets) };
+    Kernel k1("psContactSortBda.spv", "ps_findStartEndFEMFirstLaunch", {}, sizeof(Find1Push));
+    PXG_CHECK_MSG(k1.isValid(), "the FEM range-find pass-1 pipeline must build");
+    if (!k1.isValid()) return;
+    k1.dispatch(GRID, {}, p1);
+    dev->flush();
+
+    const auto gOffsets = downloadBuffer<uint32_t>(dev, bOffsets, NC);
+    size_t badOff = 0;
+    for (uint32_t i = 0; i < NC; ++i)
+        if (gOffsets[i] != refOffsets[i]) ++badOff;
+    PXG_CHECK_MSG(badOff == 0, "FEM findStartEnd pass1 offsets bit-exact (%zu mismatches)", badOff);
+
+    struct Find2Push
+    {
+        uint64_t sortedContactInfo, numContacts, blockOffsets, offsets, totalNumPairs,
+            rangeStart, rangeEnd;
+    };
+    static_assert(sizeof(Find2Push) == 56, "FEM pass-2 blob must be 56 bytes");
+    Find2Push p2 = { addrOf(dev, bInfos), addrOf(dev, bNum), addrOf(dev, bBlockOff),
+                     addrOf(dev, bOffsets), addrOf(dev, bPairCount),
+                     addrOf(dev, bStart), addrOf(dev, bEnd) };
+    Kernel k2("psContactSortBda.spv", "ps_findStartEndFEMSecondLaunch", {}, sizeof(Find2Push));
+    PXG_CHECK_MSG(k2.isValid(), "the FEM range-find pass-2 pipeline must build");
+    if (!k2.isValid()) return;
+    k2.dispatch(GRID, {}, p2);
+    dev->flush();
+
+    const uint32_t gPairs = downloadBuffer<uint32_t>(dev, bPairCount, 1)[0];
+    const auto gStart = downloadBuffer<uint32_t>(dev, bStart, NC);
+    const auto gEnd = downloadBuffer<uint32_t>(dev, bEnd, NC);
+    PXG_CHECK_MSG(gPairs == totalPairs, "FEM findStartEnd pair count %u != %u", gPairs, totalPairs);
+    size_t badRange = 0;
+    for (uint32_t p = 0; p < totalPairs; ++p)
+    {
+        if (gStart[p] != refStart[p]) ++badRange;
+        if (gEnd[p] != refEnd[p]) ++badRange;
+    }
+    PXG_CHECK_MSG(badRange == 0, "FEM findStartEnd [start,end) ranges bit-exact (%zu mismatches)",
+                  badRange);
+    // The loop in pass 2 must run more than once per block, or the missing
+    // trailing barrier upstream (and the one this port keeps) is never exercised.
+    const uint32_t totalBlockRequired = (NC + BLOCK - 1u) / BLOCK;
+    const uint32_t iterPerBlock = (totalBlockRequired + GRID - 1u) / GRID;
+    PXG_CHECK_MSG(iterPerBlock >= 2u,
+                  "pass 2 must iterate at least twice per block (got %u) -- otherwise the "
+                  "cross-iteration reuse of the shared id row is never exercised", iterPerBlock);
+    PXG_CHECK_MSG(totalPairs > 1500u, "FEM findStartEnd coverage thin (pairs=%u NC=%u)",
+                  totalPairs, NC);
+    // Teeth for the 64-bit id: without transitions of BOTH kinds, a port that
+    // compared one half of pairInd0 passes.  Measured, not assumed.
+    PXG_CHECK_MSG(highOnlyTransitions > 100u,
+                  "runs separated ONLY by the HIGH half of pairInd0: %u -- too few to "
+                  "kill a low-half-only comparison", highOnlyTransitions);
+    PXG_CHECK_MSG(lowOnlyTransitions > 100u,
+                  "runs separated ONLY by the LOW half of pairInd0: %u -- too few to "
+                  "kill a high-half-only comparison", lowOnlyTransitions);
+    std::printf("  id transitions: %u high-only, %u low-only, %u pairs over %u contacts\n",
+                highOnlyTransitions, lowOnlyTransitions, totalPairs, NC);
+
+    dev->destroyBuffer(bInfos); dev->destroyBuffer(bNum); dev->destroyBuffer(bBlockOff);
     dev->destroyBuffer(bOffsets); dev->destroyBuffer(bPairCount);
     dev->destroyBuffer(bStart); dev->destroyBuffer(bEnd);
 }
