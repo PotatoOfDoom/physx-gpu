@@ -1793,6 +1793,139 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.50 — der blinde Fleck hinter P9.49: ein Lesezugriff, der als Aufruf verkleidet ist, und eine Behauptung, die 55 Befunde entlastet hat
+
+**Ergebnis:** Am Shader-Korpus ändert sich **nichts** — und das ist der Befund, nicht
+sein Ausbleiben. P9.49 hatte vier echte Fehlstellen nur deshalb gefunden, weil ein
+Zufallsgrep nach `byteAt(` gesucht hatte; diese Tranche macht daraus eine Regel mit
+Kontrolle, und misst die Tatsache nach, auf der die ganze Reichweite des Prüfers ruht.
+Suite **847/847 in beiden Speichermodi**, beide im ersten Anlauf (250 s bzw. 253 s;
+**846 → 847**, die neue Sonde), Szenen **37 ok, 0 fail, 0 missing (von 37)**. Manifest
+unverändert **399/501**.
+
+### Was P9.49 nicht mitgeliefert hat
+
+Der Prüfer aus P9.23 sieht `namedPtr[ausdruck]`. Sein eigener Kopf zählt auf, was er
+nicht sieht — und die erste Zeile dieser Liste ist genau die Form, die in der
+Mittelphasen-Familie steht:
+
+```slang
+uint byteAt(uint64_t base, uint idx)
+{
+    const uint64_t addr = base + uint64_t(idx);
+    const uint word = Ptr<uint>(addr & ~uint64_t(3))[0];   // <-- der Lesezugriff
+```
+
+`byteAt(surfaceHintBase, tetrahedronIdx)` ist ein **BDA-Lesezugriff**, und er ist
+**dreifach** unsichtbar: an der Aufrufstelle steht keine eckige Klammer, im Rumpf ist der
+Zeiger die Inline-Form `Ptr<uint>(...)`, und sein Index ist die Konstante `0`. Drei
+Einträge der Lückenliste treffen auf eine Zeile zusammen.
+
+Vier solcher Stellen standen in Dauergitter-Schleifen, als P9.49 untersucht wurde —
+dieselbe Familie, die nachweislich abstürzte. Gefunden hat sie kein Prüfer, sondern ein
+`grep byteAt`. Ein Fund, der von einem Einfall abhängt, ist kein Fund, auf den man sich
+ein zweites Mal verlassen kann.
+
+### Die Regel, und wo sie ausdrücklich schweigt
+
+`analyse_helper_calls()` bestimmt zuerst, welche Funktionen einer Datei überhaupt
+BDA-Leser sind — Parameterliste enthält `uint64_t`, Rumpf enthält `Ptr<` —, und meldet
+dann einen Aufruf mit ungeklemmtem Laufindex **nur innerhalb einer Dauergitter-Schleife**.
+
+Diese Enge ist die Aussage. Außerhalb einer solchen Schleife hält das Distanzargument
+von `LOW-loop` weiterhin, und eine Regel, die überall feuerte, schöbe die gesamte
+`byteAt`-Population ins Gatter, sähe gründlich aus und sagte nichts — dieselbe Lehre wie
+bei P9.20 („je großzügiger die Normalisierung, desto weniger bedeutet der Prüfer").
+
+Das Kontrollstück hat sechs Fälle, **vier davon prüfen das Schweigen**: die P9.49-Klemmung
+selbst, die inline geschriebene Klemmung, ein Helfer ohne `uint64_t`, ein blocklokaler
+Start und eine `WorkgroupCount()`-Schrittweite. Der positive Fall verlangt genau die
+gemessene Form.
+
+**Rückrufprobe an einem Fall mit bekannter Antwort:** gegen den Baum **vor** P9.49
+(Commit 263119f) meldet die Regel exakt die vier `byteAt`-Stellen — in
+`softBodyClothMidphaseBda`, `softBodyMeshMidphaseBda`, `softBodySelfCollisionBda` und
+`softBodySoftBodyMidphaseBda` —, gegen den jetzigen Baum keine. Ein Prüfer, dessen
+Trefferquote nie an einer bekannten Antwort gemessen wurde, ist eine Meinung.
+
+### Die Behauptung, die 55 Befunde entlastet hat
+
+Der Prüfer liest **keine** deskriptorgebundenen Puffer (`RWStructuredBuffer`). Ob diese
+Grenze zulässig ist, hängt an einer Plattform-Tatsache — und das Protokoll behauptet an
+verschiedenen Stellen **beides**:
+
+| Stelle | Aussage |
+|---|---|
+| P9.22, P9.23 | `robustBufferAccess` ist **nicht** aktiviert (in `PxgVulkanComputeDevice.cpp` nachgesehen) |
+| der Fächer-Audit (Aufgabe #66) | ein deskriptorgebundenes SSBO sei „robust bounds-checked" |
+
+Der Beleg der zweiten Zeile war ein `spirv-dis`-Lauf, der zeigte, dass die
+`PhysicalStorageBufferAddresses`-Fähigkeit fehlt. Das belegt **„kein BDA"**. Es belegt
+nicht **„bereichsgeprüft"** — und auf dieser Behauptung wurden 55 von 61 Verdachtsfällen
+verworfen.
+
+Nachgesehen: `enabled2.features` wird genullt, gesetzt werden nur `shaderInt64` und
+`shaderFloat64`. `robustBufferAccess` ist also tatsächlich aus.
+
+### Also gemessen statt argumentiert
+
+`tests/testRobustProbe.cpp` mit `shaders/npRobustProbe.slang` liest ein
+`RWStructuredBuffer<uint>` an einem Index, den die Push-Konstante liefert, und
+veröffentlicht, was zurückkam. Der Index wandert nach außen:
+
+```
+index 63           (in range, die Kontrolle) ... Wert 0x0000ab3f, Marke 0x0000d0de
+index 64           (knapp dahinter)          ... Wert 0x00000000, Marke 0x0000d0de
+index 262144       (+1 MiB)                  ... Wert 0x00000000, Marke 0x0000d0de
+index 4194304      (+16 MiB)                 ... Wert 0x00000000, Marke 0x0000d0de
+index 67108864     (+256 MiB)                ... Wert 0x00000000, Marke 0x0000d0de
+index 268435456    (+1 GiB)                  ... Wert 0x00000000, Marke 0x0000d0de
+```
+
+Deskriptorgebundene Zugriffe **sind** hier bereichsgeprüft: bis 1 GiB hinter der Belegung
+kommt 0 zurück, der Prozess lebt. Die dritte mögliche Antwort — ein Fault — ist damit
+ausgeschlossen, und die Kontrolle beweist, dass die Sonde überhaupt liest. Die
+Behauptung von Aufgabe #66 war **richtig**; neu ist, dass sie jetzt einen Beleg hat, der
+sie trägt.
+
+**Die Sonde ist ausdrücklich abschaltbar, und das ist kein Verstecken.** Sie liest
+absichtlich weit hinter eine Belegung. Wäre die Antwort „ungeprüft" gewesen, wäre ihr
+ehrliches Ergebnis ein SIGSEGV — in einem `ctest`-Lauf ununterscheidbar von genau den
+sporadischen Suite-Fehlern, die diesen Port drei Tranchen gekostet haben, und Gift für
+jede spätere Bisektion. Sie läuft deshalb nur mit `PXG_PROBE_ROBUST=1` und **druckt** ihr
+Urteil, statt eines zu behaupten. Bei jedem Treiberwechsel neu zu fahren; der Prüferkopf
+sagt, wie.
+
+### Was der Fegedurchgang dieser Tranche ist
+
+Keiner — und der Grund gehört hierher statt in eine Auslassung. Diese Tranche ändert
+keinen Shader: das Ergebnis der Prüfung ist, dass die fünf verbleibenden Fundstellen
+(`gExceeded[workIndex - nbPrev]`, `gPrev[workIndex - persistentStart]`,
+`gThresholdStreamWords[i * 10 + lane8]` und zwei Geschwister) allesamt
+**deskriptorgebunden** sind und damit nach der Messung oben nicht faulten können. Ihre
+Subtraktionen laufen zudem nicht unter: `workIndex - nbPrev` steht unter `!lostPair`, also
+`workIndex >= nbPrev`, und `workIndex - persistentStart` im `else` beider Zweige, also
+`workIndex >= persistentStart`. Beides steht in der `.cu` genauso.
+
+Was diese Tranche belegt, ist deshalb nicht eine Reparatur, sondern eine **Reichweite**:
+der Prüfer sieht jetzt eine Form mehr, seine Grenze zu den deskriptorgebundenen Puffern
+ist gemessen statt geerbt, und beide Aussagen haben ein Kontrollstück, das fehlschlägt,
+wenn sie es nicht mehr tun.
+
+### Und derselbe Läuferfehler noch einmal, eine Datei weiter
+
+Der Szenenlauf dieser Tranche lief zunächst gar nicht: `run_scenes.sh` verlangt
+`PXG_SHADER_DIR` und bricht ab, wenn es fehlt. Das ist **genau** der Fehler, den P9.49 in
+`run_suite.sh` behoben hat, eine Datei weiter — mit dem einen Unterschied, dass dieser
+Läufer laut abbricht statt still rot zu werden, was ihn harmlos macht und trotzdem nicht
+richtig.
+
+Dreimal in einer Sitzung dieselbe Ursache ist keine Unachtsamkeit mehr, sondern eine
+Eigenschaft der Werkzeuge. `run_scenes.sh` leitet die Variable jetzt ebenfalls ab —
+`../build-gpuslang/shaders` neben `build-sdk`, sonst `./shaders` —, druckt den benutzten
+Wert und lässt eine gesetzte Variable gewinnen. Was bleibt, ist der Abbruch für den Fall,
+dass wirklich nichts zu finden ist; er nennt jetzt die Orte, an denen gesucht wurde.
+
 ## P9.49 — der Absturz gehört mir doch: eine Distanzaussage, die ihre eigene Voraussetzung verschwiegen hat
 
 **Ergebnis:** Der sporadische `gpuslang.femClothSim`-SIGSEGV ist **weg**: **200 Läufe ohne
