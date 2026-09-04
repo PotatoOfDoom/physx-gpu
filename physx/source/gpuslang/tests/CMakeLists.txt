@@ -417,6 +417,7 @@ pxg_compile_shader(pcmManifoldBda pcmInvalidateLaunch pcmRefreshLaunch)
 # PXG_NOCONTRACT_SHADERS, as every other mesh midphase in this port is: the SAT's
 # AXISTESTs and the plane distance are mul-feeding-add chains.
 pxg_compile_shader(convexTrimeshMidphaseBda midphaseGeneratePairs)
+pxg_compile_shader(convexHfMidphaseBda convexHeightFieldMidphase)
 # P8.29: midphaseAllocate's layout arithmetic (midphaseAllocate.cuh:129), the
 # sub-buffer carve-up every kernel of the convex-trimesh chain re-derives.  Test
 # scaffolding, not an engine kernel, and absent from the manifest.  Pure integer

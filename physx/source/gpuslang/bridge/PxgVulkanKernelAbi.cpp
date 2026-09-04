@@ -2046,6 +2046,10 @@ static const PxgKernelAbiRow kRows[] = {
     { "clampMaxValues", kClampMaxValues, uint32_t(sizeof(kClampMaxValues)) },
     // convexMeshMidphase.cu:378 — the rigid convex-vs-trimesh midphase (P8.27).
     { "midphaseGeneratePairs", kCvxTriMidphase, uint32_t(sizeof(kCvxTriMidphase)) },
+    // convexHFMidphase.cu:350 -- convexHeightFieldMidphase has the SAME fifteen
+    // arguments as midphaseGeneratePairs above, parameter for parameter, so it
+    // shares that row rather than duplicating it (P9.51a).
+    { "convexHeightFieldMidphase", kCvxTriMidphase, uint32_t(sizeof(kCvxTriMidphase)) },
     // pairManagement.cu:150 — the empty-manifold stamp (P8.35).
     { "initializeManifolds", kInitManifolds, uint32_t(sizeof(kInitManifolds)) },
     // pairManagement.cu:45-145 — the contact-manager removal chain (P8.37).
