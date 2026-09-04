@@ -45,7 +45,8 @@
 // slot 0.  That is exactly why `H1-trimesh-swap-added` survives the P9.51a
 // midphase sweep.
 //
-// Pair 6 below presents it anyway, with an input the engine does not produce: a
+// THE SWAP PROBE below presents it anyway, with an input the engine does not
+// produce: a
 // shape whose `type` is eTRIANGLEMESH but whose blob is a VALID HEIGHTFIELD, in
 // slot 0, against a second valid heightfield in slot 1.  The swap decision reads
 // only `type`, so the decision is exercised exactly; and because both blobs are
@@ -317,7 +318,7 @@ PXG_TEST(cvxHfSetupPrologue)
     const uint64_t addrHull = dev->getBufferDeviceAddress(bHull);
 
     // ---- shapes ------------------------------------------------------------
-    std::vector<GpuShape> shapes(6);
+    std::vector<GpuShape> shapes(7);
     auto setShape = [](GpuShape& s, V3 sc, V4 rot, uint64_t ptr, uint32_t type) {
         s.sx = sc.x; s.sy = sc.y; s.sz = sc.z;
         s.rx = rot.x; s.ry = rot.y; s.rz = rot.z; s.rw = rot.w;
@@ -357,6 +358,16 @@ PXG_TEST(cvxHfSetupPrologue)
     }
     // 4: heightfield B, positive scales.
     setShape(shapes[4], { 0.75f, 0.25f, 1.1f }, { 0, 0, 0, 1 }, addrHfB, GEOM_HEIGHTFIELD);
+    // 6: TWO NEGATIVE SCALE COMPONENTS -- row AND column.  The handedness is an
+    //    XOR, so two mirrors compose back to a right-handed frame and
+    //    `wrongHanded` is FALSE here.  An OR agrees with the xor on every other
+    //    input, which is why the first P9.51b sweep of this module reported
+    //    `G1-handedness-is-an-or` as a SURVIVOR: no case carried both signs.  The
+    //    trimesh fixture had the same gap and closed it the same way
+    //    (testCvxTriSetup's `sawNegativePairNoFlip`), which is the reason to state
+    //    the class rather than patch the instance -- a two-sign case belongs in
+    //    every fixture over a sign-parity decision.
+    setShape(shapes[6], { -1.4f, 0.4f, -0.9f }, { 0, 0, 0, 1 }, addrHfB, GEOM_HEIGHTFIELD);
     // 5: THE SYNTHETIC SWAP PROBE -- typed eTRIANGLEMESH, blob a valid heightfield.
     //    See the header: this is the only input that can tell CT_NO_SWAP apart from
     //    the trimesh sibling's CT_GEOM_TRIANGLEMESH.
@@ -395,6 +406,7 @@ PXG_TEST(cvxHfSetupPrologue)
         { 3, 2, 3, 1 },   // the rotated convex vs the NEGATIVE column scale
         { 0, 4, 0, 2 },   // convex vs heightfield B
         { 5, 4, 5, 0 },   // the swap probe: slot 0 is typed eTRIANGLEMESH
+        { 0, 6, 4, 3 },   // TWO negative scales -> the xor says NOT wrongHanded
     };
 
     // ---- ConvexMeshPair, 56 B: startIndex @28, roundedStartIndex @40 -------
@@ -413,6 +425,7 @@ PXG_TEST(cvxHfSetupPrologue)
     setPair(1, 300, 9, 66, 400);
     setPair(2, 500, 3, 77, 600);
     setPair(3, 800, 5, 88, 900);
+    setPair(4, 1300, 4, 99, 1400);
 
     // ---- the pairs to run --------------------------------------------------
     // hfA is 5x4, so its cells are the vertices with row < 4 and column < 3.
@@ -435,6 +448,8 @@ PXG_TEST(cvxHfSetupPrologue)
         { 1, 13, 1, 0 },    // hfB, wrongHanded, second triangle
         { 2, 8, 7, 0 },     // hfB, positive scales -- the same blob, not flipped
         { 3, 2, 4, 0 },     // THE SWAP PROBE
+        { 4, 6, 3, 0 },     // two negative scales: no flip
+        { 4, 15, 5, 0 },    // and its second triangle
     };
 
     const uint32_t n = uint32_t(pairs.size());
@@ -470,6 +485,7 @@ PXG_TEST(cvxHfSetupPrologue)
     size_t sawWrongHanded = 0, sawSharedDiagonal = 0, sawUnsharedDiagonal = 0;
     size_t sawBoundaryAdj = 0, sawAllRealAdj = 0, sawSecondTri = 0;
     size_t sawNegativeHeight = 0, sawTrimeshTypedSlot0 = 0, sawIgnoredHfScaleRot = 0;
+    size_t sawTwoNegativeNoFlip = 0;
     auto sameF = [](float a, float b)
     { uint32_t x, y; std::memcpy(&x, &a, 4); std::memcpy(&y, &b, 4); return x == y; };
 
@@ -503,6 +519,7 @@ PXG_TEST(cvxHfSetupPrologue)
         getTriangle(hf, pr.tri, V3{ hfs.sx, hfs.sy, hfs.sz }, w0, w1, w2, adj, wrongHanded);
 
         if (wrongHanded) ++sawWrongHanded;
+        if (!wrongHanded && (hfs.sx < 0.0f || hfs.sz < 0.0f)) ++sawTwoNegativeNoFlip;
         if (zerothVertexShared(hf, pr.tri >> 1)) ++sawSharedDiagonal; else ++sawUnsharedDiagonal;
         if ((pr.tri & 1u) != 0u) ++sawSecondTri;
         if (adj[0] == HF_BOUNDARY || adj[2] == HF_BOUNDARY) ++sawBoundaryAdj;
@@ -576,6 +593,9 @@ PXG_TEST(cvxHfSetupPrologue)
     PXG_CHECK_MSG(sawTrimeshTypedSlot0 > 0,
                   "no pair has an eTRIANGLEMESH-typed shape in slot 0 (CT_NO_SWAP is untested)");
     PXG_CHECK_MSG(sawWrongHanded > 0, "no pair has a negative scale (wrongHanded is untested)");
+    PXG_CHECK_MSG(sawTwoNegativeNoFlip > 0,
+                  "no pair has BOTH the row and the column scale negative -- the only input on "
+                  "which the handedness XOR differs from an OR");
     PXG_CHECK_MSG(sawSharedDiagonal > 0, "no pair sits on a tessellation-flagged cell");
     PXG_CHECK_MSG(sawUnsharedDiagonal > 0, "no pair sits on an unflagged cell");
     PXG_CHECK_MSG(sawSecondTri > 0, "no pair is a cell's SECOND triangle");

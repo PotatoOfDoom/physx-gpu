@@ -257,12 +257,27 @@ public float3 hf2shapep(float3 v, float3 scale)
 // non-positive row or column scale, so `wrongHanded` is always false in any scene
 // the SDK will accept.  Transcribed anyway, because "unreachable today" is not
 // the same as "not there", and the branch is one xor.
-public void hfGetTriangle(uint64_t samples, uint triangleIndex, float3 scale, uint columns,
-                          out float3 v0, out float3 v1, out float3 v2)
+// The handedness decision, in ONE place.  It was written out twice -- once here
+// and once in hfGetTriangleAdj -- until a P9.51b sweep anchor matched both copies
+// and said so.  Two copies of an xor is two chances to make it an OR, and an OR
+// agrees with the xor on every input EXCEPT the one where both scales are
+// negative, which is precisely the input a fixture is least likely to carry.
+//
+// It is an XOR because each negative scale MIRRORS one axis: two mirrors compose
+// back to a right-handed frame, so the winding is unchanged.
+[ForceInline]
+public bool hfWrongHanded(float3 scale)
 {
     bool wrongHanded = false;
     if (scale.z < 0.0f) wrongHanded = !wrongHanded;
     if (scale.x < 0.0f) wrongHanded = !wrongHanded;
+    return wrongHanded;
+}
+
+public void hfGetTriangle(uint64_t samples, uint triangleIndex, float3 scale, uint columns,
+                          out float3 v0, out float3 v1, out float3 v2)
+{
+    const bool wrongHanded = hfWrongHanded(scale);
 
     uint t0, t1, t2;
     hfTriVertexIndices(samples, triangleIndex, columns, t0, t1, t2);
@@ -295,9 +310,7 @@ public struct HfTriangle
 public HfTriangle hfGetTriangleAdj(uint64_t samples, uint triangleIndex, float3 scale,
                                    uint rows, uint columns)
 {
-    bool wrongHanded = false;
-    if (scale.z < 0.0f) wrongHanded = !wrongHanded;
-    if (scale.x < 0.0f) wrongHanded = !wrongHanded;
+    const bool wrongHanded = hfWrongHanded(scale);
 
     uint t0, t1, t2;
     hfTriVertexIndices(samples, triangleIndex, columns, t0, t1, t2);
