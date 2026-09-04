@@ -444,6 +444,16 @@ PXG_TEST(cvxHfSetupPrologue)
         { 0, 21, 4, 0 },    // cell 10, second
         { 0, 24, 5, 0 },    // cell 12, first
         { 0, 25, 6, 0 },    // cell 12, second
+        // hfA's tessellation flag is set when the sample index % 3 == 1, so cells
+        // 4 and 13 take the SHARED arm -- and they are the two positions where the
+        // shared arm's own guards sit: cell 4 is in COLUMN 0 (`cell % columns != 0`
+        // fails) and cell 13 is in ROW rows-2 (`cell / columns != rows - 2` fails).
+        // Without them the first P9.51b sweep of this module reported
+        // `J3-shared-first-column-guard-dropped` and
+        // `J4-shared-first-row-guard-off-by-one` as survivors: the fixture had
+        // shared cells, but none standing on a guard.
+        { 0, 8, 8, 0 },     // cell 4, SHARED, first -- column 0
+        { 0, 26, 9, 0 },    // cell 13, SHARED, first -- row rows-2
         { 1, 6, 2, 0 },     // hfB, NEGATIVE column scale -> wrongHanded
         { 1, 13, 1, 0 },    // hfB, wrongHanded, second triangle
         { 2, 8, 7, 0 },     // hfB, positive scales -- the same blob, not flipped
@@ -486,6 +496,7 @@ PXG_TEST(cvxHfSetupPrologue)
     size_t sawBoundaryAdj = 0, sawAllRealAdj = 0, sawSecondTri = 0;
     size_t sawNegativeHeight = 0, sawTrimeshTypedSlot0 = 0, sawIgnoredHfScaleRot = 0;
     size_t sawTwoNegativeNoFlip = 0;
+    size_t sawSharedOnColumnGuard = 0, sawSharedOnRowGuard = 0;
     auto sameF = [](float a, float b)
     { uint32_t x, y; std::memcpy(&x, &a, 4); std::memcpy(&y, &b, 4); return x == y; };
 
@@ -520,7 +531,14 @@ PXG_TEST(cvxHfSetupPrologue)
 
         if (wrongHanded) ++sawWrongHanded;
         if (!wrongHanded && (hfs.sx < 0.0f || hfs.sz < 0.0f)) ++sawTwoNegativeNoFlip;
-        if (zerothVertexShared(hf, pr.tri >> 1)) ++sawSharedDiagonal; else ++sawUnsharedDiagonal;
+        if (zerothVertexShared(hf, pr.tri >> 1))
+        {
+            ++sawSharedDiagonal;
+            const uint32_t cell = pr.tri >> 1;
+            if ((pr.tri & 1u) == 0u && cell % hf.cols == 0u) ++sawSharedOnColumnGuard;
+            if ((pr.tri & 1u) == 0u && cell / hf.cols == hf.rows - 2u) ++sawSharedOnRowGuard;
+        }
+        else ++sawUnsharedDiagonal;
         if ((pr.tri & 1u) != 0u) ++sawSecondTri;
         if (adj[0] == HF_BOUNDARY || adj[2] == HF_BOUNDARY) ++sawBoundaryAdj;
         else ++sawAllRealAdj;
@@ -598,6 +616,12 @@ PXG_TEST(cvxHfSetupPrologue)
                   "which the handedness XOR differs from an OR");
     PXG_CHECK_MSG(sawSharedDiagonal > 0, "no pair sits on a tessellation-flagged cell");
     PXG_CHECK_MSG(sawUnsharedDiagonal > 0, "no pair sits on an unflagged cell");
+    PXG_CHECK_MSG(sawSharedOnColumnGuard > 0,
+                  "no pair is a SHARED cell's first triangle in COLUMN 0 -- the shared arm's "
+                  "`cell % columns != 0` guard is then untested");
+    PXG_CHECK_MSG(sawSharedOnRowGuard > 0,
+                  "no pair is a SHARED cell's first triangle in ROW rows-2 -- the shared arm's "
+                  "`cell / columns != rows - 2` guard is then untested");
     PXG_CHECK_MSG(sawSecondTri > 0, "no pair is a cell's SECOND triangle");
     PXG_CHECK_MSG(sawBoundaryAdj > 0, "no pair has a BOUNDARY adjacency");
     PXG_CHECK_MSG(sawAllRealAdj > 0, "no pair has three real adjacencies (an interior cell)");
