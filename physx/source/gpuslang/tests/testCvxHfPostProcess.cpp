@@ -210,11 +210,20 @@ PXG_TEST(cvxHfPostProcess)
     // CM3: triangle 3 is cell 1's SECOND triangle, and cell 1 is outside the cell
     // set a row/column-swapped walk visits from cell 2.
     ordered[CM3.roundedStartIndex + 0] = 3u | FACE;
+    // Padded to a multiple of four with the radix sort's own 0xFFFFFFFF sentinel,
+    // not left on the buffer fill: `C4-search-bounded-by-the-rounded-count` is a
+    // proven equivalence ONLY because every word past `count` is 0xFFFFFFFF, which
+    // is >= every target the searches can form.  A fill value there would make the
+    // argument false for these two slices while leaving the sweep green.
     ordered[CM3.roundedStartIndex + 1] = 0xFFFFFFFFu;
+    ordered[CM3.roundedStartIndex + 2] = 0xFFFFFFFFu;
+    ordered[CM3.roundedStartIndex + 3] = 0xFFFFFFFFu;
     // CM4: triangle 1 holds vertex 7 -- the vertex a wrongHanded eV1 names -- and
     // not vertex 2, which is the one an unpermuted read would pick.
     ordered[CM4.roundedStartIndex + 0] = 1u | FACE;
     ordered[CM4.roundedStartIndex + 1] = 0xFFFFFFFFu;
+    ordered[CM4.roundedStartIndex + 2] = 0xFFFFFFFFu;
+    ordered[CM4.roundedStartIndex + 3] = 0xFFFFFFFFu;
 
     // ---- the cases -----------------------------------------------------------
     //
@@ -327,6 +336,15 @@ PXG_TEST(cvxHfPostProcess)
         { "eV0 on t4 under CM3: only a SECOND triangle matches", 3, 4, EV0, 0, 0, 1, true, false,
           "vertex 2; the walk over cells 1,2,3,7,8,9 reaches triangle 3 -- cell 1's "
           "SECOND -- and cell 1 is outside the set a row/column-swapped walk visits" },
+        { "eV0 on t12 under CM1: vertex 6, and NOT vertex 12", 1, 12, EV0, 0, 1, 1, true, false,
+          "CM1's slice holds triangle 0, which carries vertices (0,1,6).  eV0 names "
+          "tv[0] = 6 and clears; tv[2] = 12 is reached by no listed triangle, so a "
+          "kernel that read eV0 as tv[2] would keep -- this is the case that dies to "
+          "`G2-EV0-and-EV2-swapped`" },
+        { "eV0 on t1 under CM3: the match is one column PAST the cell", 3, 1, EV0, 0, 1, 1, true, false,
+          "vertex 7; triangle 3 lives in cell 1, and the walk from cell 0 reaches it "
+          "only through `endCol = min(col, cols-2) + 1`.  Without the +1 the walk "
+          "never leaves cell 0 and this becomes a keep" },
         { "eV1 on t2 under CM4, wrongHanded", 4, 2, EV1, 1, 0, 1, true, false,
           "the flip makes eV1 name vertex 7, which triangle 1 holds; without it eV1 "
           "would name vertex 2, which triangle 1 does not hold" },
