@@ -95,6 +95,35 @@
 // [numthreads(32,1,1)] group is ONE warp and the block's two are walked serially,
 // exactly as the trimesh sibling and softBodyMeshMidphaseBda do.
 
+// ---------------------------------------------------------------------------
+// THE THREE MUTANTS THAT SURVIVE, AND WHY EACH IS NOT A GAP
+// ---------------------------------------------------------------------------
+// The sweep ran three times: 18/30 killed, then 24/30, then 27/30.  Every jump
+// came from sharpening the FIXTURE, never from changing this file -- and the
+// second round is worth recording, because moving one placement to kill the gate
+// mutants quietly re-hid two others (minRow/minColumn both fell back to zero).
+// A sweep run once at the end would have reported that as success.
+//
+// The three that remain:
+//
+//   H1  "add the trimesh sibling's slot swap".  It never fires, because slot 0 is
+//       never a heightfield on this path -- and that is not an assumption of this
+//       port but of the .cu itself, which is precisely why it does not swap.  On
+//       every input the engine can present, the mutant is equivalent.  A fixture
+//       that fed a heightfield in slot 0 would be testing behaviour upstream does
+//       not define.
+//
+//   F1  "don't materialise the inverse" -- rotInv(q, c - p) instead of
+//       rotInv(q, c) + rotInv(q, -p).
+//   F2  "build the basis with quatRotate(q, e_i)" instead of the PxMat33 columns.
+//
+// F1 and F2 are the P9.37 class: the same value in exact arithmetic, at most a
+// last-bit difference in float.  For either to change an output, a rectangle
+// boundary would have to fall within one ULP of a floor()/ceil() step, which a
+// fixture cannot place on purpose and should not pretend to.  They are kept in
+// the sweep as a tripwire for a future change that makes them observable, and the
+// reason the port spells them the CUDA's way is the transcription, not a mutant.
+
 module convexHfMidphaseBda;
 
 import pxgSlangCommon;
