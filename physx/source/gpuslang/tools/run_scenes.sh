@@ -77,8 +77,15 @@ echo "run_scenes.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR"
 # tranches: P9.44 mapped the five kernels that ACCUMULATE the rigid delta, and the
 # box still fell through to 0.2500 because their producer wrote zeros; P9.45
 # ported that producer (FEMCollision::computeRigidChange) and the box now rests on
-# the net at 2.1015.  The list is 35 named scenes plus the settling bag = 36.
-SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor articulation
+# the net at 2.1015.
+#
+# P9.51c added `hffloor`: meshfloor with the cooked triangle mesh swapped for a
+# cooked heightfield and nothing else changed, so the two are one comparison.  It
+# is the observing scene for the rigid-vs-heightfield narrowphase, which before
+# P9.51 was unmapped end to end and therefore a silent no-op -- the box fell
+# through with no diagnostic.  The list is 36 named scenes plus the settling
+# bag = 37.
+SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor hffloor articulation
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
         particlecloth particleinflatable particlediffuse particleconvex
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth

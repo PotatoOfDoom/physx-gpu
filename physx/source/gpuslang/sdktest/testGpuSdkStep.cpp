@@ -376,6 +376,38 @@ PxRigidStatic* addHeightFieldFloor(PxPhysics* physics, PxScene* scene, PxMateria
     return floor;
 }
 
+// PXG_SCENE=hffloor (P9.51c) -- the rigid-vs-HEIGHTFIELD narrowphase, observed.
+//
+// Deliberately `meshfloor` with the cooked triangle mesh swapped for a cooked
+// heightfield and NOTHING else changed: the same half-0.5 box, the same drop from
+// y = 5, the same rest target of 0.5.  The two scenes are then one comparison, and
+// a difference between them is a difference between the two mesh narrowphases
+// rather than between two experiments.
+//
+// WHAT THIS SCENE IS FOR.  Before P9.51 the chain
+// convexHeightFieldMidphase -> convexHeightfieldNarrowphase ->
+// convexHeightfieldPostProcess was unmapped, and P9.27/P9.40 established what an
+// unmapped kernel on a live path does in Release: nothing, silently.  So the box
+// fell THROUGH the heightfield and no diagnostic said why.  That is exactly the
+// P9.41 shape -- a scene whose only job is to make skipped physics observable --
+// and it is why this scene is worth its own entry rather than a note under
+// meshfloor: with `--strict` (PXG_REQUIRE_MAPPED=1) an unmapped kernel on this
+// path now FAILS the scene instead of quietly changing the answer.
+void buildHfFloorScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                       std::vector<RestTarget>& targets)
+{
+    // The same 10.0 half-extent meshfloor uses.  addHeightFieldFloor places the
+    // actor at (-E, 0, -E) because a heightfield's origin is its (0,0) CORNER, so
+    // the span is symmetric about the origin and the box lands well inside it --
+    // not on the rim, where the boundary adjacency arms would decide the contact.
+    if (!addHeightFieldFloor(physics, scene, material, 10.0f))
+        return;   // addHeightFieldFloor has already printed the FAIL line
+
+    PxRigidDynamic* b = addDynamic(physics, scene, material, PxBoxGeometry(0.5f, 0.5f, 0.5f),
+                                   boxInertia(PxVec3(0.5f), 1000.0f), 5.0f);
+    targets.push_back({ b, 5.0f, 0.5f, "boxOnHeightField" });
+}
+
 // PXG_SCENE=plane: one dynamic box resting on a static infinite PxPlaneGeometry
 // (y=0).  Exercises the convex/box-plane narrowphase path.
 void buildPlaneScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
@@ -7102,6 +7134,7 @@ int main()
     else if (!std::strcmp(sceneName, "convex"))    buildConvexScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "joint"))     buildJointScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "meshfloor")) buildMeshFloorScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "hffloor")) buildHfFloorScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "articulation")) buildArticulationScene(physics, scene, material, targets);
     // The list is spelled out in full deliberately: an out-of-date usage string is
     // what turned a mistyped scene into a silent non-result once already.  This
@@ -7110,7 +7143,7 @@ int main()
     // Note there is no 'particlebag' scene: the settling bag is PXG_SCENE=particle
     // with PXG_PARTICLE_STARTY set (see bagMode above).
     else { std::printf("[ FAIL ] gpu-sdk-step: unknown PXG_SCENE='%s'\n"
-                       "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|articulation\n"
+                       "  scenes: box|stack|plane|sphere|capsule|capsulebox|convex|joint|meshfloor|hffloor|articulation\n"
                        "          particle|particlefluid|particlefluidboundary|particlemeshfloor|particlecloth|particleinflatable\n"
                        "          cloth|clothhang|clothdrape\n"
                        "          clothselfcollide|clothcloth\n"

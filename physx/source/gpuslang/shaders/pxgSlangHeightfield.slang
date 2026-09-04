@@ -182,6 +182,60 @@ public void hfTriVertexIndices(uint64_t samples, uint triangleIndex, uint column
     }
 }
 
+// getTriangleAdjacencyIndices (heightfieldUtil.cuh:167-250): the three
+// edge-adjacent triangle indices, BOUNDARY where the edge is on the grid's rim.
+//
+// The four branches are NOT three-line variations on one formula and must not be
+// folded into one: which neighbour lies across which edge depends both on the
+// tessellation diagonal (isZerothVertexShared) and on which of the cell's two
+// triangles this is, and the two guards differ between them -- `cell % columns`
+// against 0 in one arm and against `columns - 2` in another, `cell / columns`
+// against `rows - 2` in a third, `cell >= columns - 1` in a fourth.  Transcribed
+// arm by arm from the .cu.
+public static const uint HF_BOUNDARY = 0xFFFFFFFFu;
+
+public void hfTriAdjacencyIndices(uint64_t samples, uint triangleIndex,
+                                  uint rows, uint columns,
+                                  out uint a0, out uint a1, out uint a2)
+{
+    const uint cell = triangleIndex >> 1;
+    const bool firstTri = (triangleIndex & 0x1u) == 0u;
+
+    a0 = HF_BOUNDARY;
+    a2 = HF_BOUNDARY;
+
+    if (hfZerothVertexShared(samples, cell))
+    {
+        if (firstTri)
+        {
+            a1 = triangleIndex + 1u;
+            if (cell % columns != 0u)          a0 = triangleIndex - 1u;
+            if (cell / columns != rows - 2u)   a2 = ((cell + columns) * 2u) + 1u;
+        }
+        else
+        {
+            a1 = triangleIndex - 1u;
+            if (cell % columns < columns - 2u) a0 = triangleIndex + 1u;
+            if (cell >= columns - 1u)          a2 = (cell - columns) * 2u;
+        }
+    }
+    else
+    {
+        if (firstTri)
+        {
+            a1 = triangleIndex + 1u;
+            if (cell >= columns - 1u)          a0 = ((cell - columns) * 2u) + 1u;
+            if (cell % columns != 0u)          a2 = triangleIndex - 1u;
+        }
+        else
+        {
+            a1 = triangleIndex - 1u;
+            if (cell / columns != rows - 2u)   a0 = (cell + columns) * 2u;
+            if (cell % columns < columns - 2u) a2 = triangleIndex + 1u;
+        }
+    }
+}
+
 // A vertex in heightfield units: (row, height, column).
 [ForceInline]
 public float3 hfGetVertex(uint64_t samples, uint vertexIndex, uint columns)
@@ -216,6 +270,47 @@ public void hfGetTriangle(uint64_t samples, uint triangleIndex, float3 scale, ui
     v0 = hf2shapep(hfGetVertex(samples, t0, columns), scale);
     v1 = hf2shapep(hfGetVertex(samples, wrongHanded ? t2 : t1, columns), scale);
     v2 = hf2shapep(hfGetVertex(samples, wrongHanded ? t1 : t2, columns), scale);
+}
+
+// The same getTriangle, with the ADJACENCY out-parameter the wrapper above drops
+// (convexHeightfield.cu:83-116, the `adjacencyIndices != NULL` arm).
+//
+// This exists as its own function rather than as an extra out-parameter on
+// hfGetTriangle because `wrongHanded` permutes BOTH results and must be decided
+// once: the .cu computes it at the top of getTriangle and then applies it to the
+// vertex indices as [0, 1+wh, 2-wh] and to the adjacency as [wh?2:0, 1, wh?0:2].
+// Two callers each deriving their own copy of the same xor is how the two halves
+// drift apart.
+//
+// NOTE THE TWO PERMUTATIONS ARE NOT THE SAME ONE.  The vertex permutation swaps
+// slots 1 and 2; the adjacency permutation swaps slots 0 and 2.  They look alike
+// written out and they are different, because an adjacency slot names the edge
+// OPPOSITE a vertex, and reversing the winding maps edges the other way round.
+public struct HfTriangle
+{
+    public float3 v0, v1, v2;
+    public uint3 adj;
+}
+
+public HfTriangle hfGetTriangleAdj(uint64_t samples, uint triangleIndex, float3 scale,
+                                   uint rows, uint columns)
+{
+    bool wrongHanded = false;
+    if (scale.z < 0.0f) wrongHanded = !wrongHanded;
+    if (scale.x < 0.0f) wrongHanded = !wrongHanded;
+
+    uint t0, t1, t2;
+    hfTriVertexIndices(samples, triangleIndex, columns, t0, t1, t2);
+
+    uint a0, a1, a2;
+    hfTriAdjacencyIndices(samples, triangleIndex, rows, columns, a0, a1, a2);
+
+    HfTriangle t;
+    t.v0 = hf2shapep(hfGetVertex(samples, t0, columns), scale);
+    t.v1 = hf2shapep(hfGetVertex(samples, wrongHanded ? t2 : t1, columns), scale);
+    t.v2 = hf2shapep(hfGetVertex(samples, wrongHanded ? t1 : t2, columns), scale);
+    t.adj = uint3(wrongHanded ? a2 : a0, a1, wrongHanded ? a0 : a2);
+    return t;
 }
 
 // ---------------------------------------------------------------------------

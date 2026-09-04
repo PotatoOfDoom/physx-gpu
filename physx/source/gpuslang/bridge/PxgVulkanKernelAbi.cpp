@@ -1434,8 +1434,19 @@ static const uint32_t kCvxTriCoreHostPtrMask = 1u << 18;
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "convexTrimeshNarrowphase", kCvxTriCore, uint32_t(sizeof(kCvxTriCore)), kCvxTriCoreHostPtrMask },
+    // P9.51b: convexHeightfieldNarrowphase (convexHeightfield.cu:273-297) declares
+    // the SAME 21 parameters in the same order with the same types as
+    // convexTrimeshNarrowphase (convexMesh.cu:623-647), so the blob is byte-for-byte
+    // the same 168 bytes and argument 18 is the same pinned host pointer.  Sharing
+    // the row is therefore the accurate description, not a shortcut -- and it means
+    // a future edit to the trimesh signature cannot leave this one behind.
+    { "convexHeightfieldNarrowphase", kCvxTriCore, uint32_t(sizeof(kCvxTriCore)), kCvxTriCoreHostPtrMask },
     { "sortTriangleIndices", kSortTriIndices, uint32_t(sizeof(kSortTriIndices)) },
     { "convexTrimeshPostProcess", kCvxTriPostProcess, uint32_t(sizeof(kCvxTriPostProcess)) },
+    // P9.51c: convexHeightfieldPostProcess (convexMeshPostProcess.cu:585-593)
+    // declares the same eight pointers in the same order as convexTrimeshPostProcess
+    // (:240-248), so the 64-byte blob is identical and the row is shared.
+    { "convexHeightfieldPostProcess", kCvxTriPostProcess, uint32_t(sizeof(kCvxTriPostProcess)) },
     { "convexTrimeshCorrelate", kCvxTriCorrelate, uint32_t(sizeof(kCvxTriCorrelate)) },
     { "convexTrimeshFinishContacts", kCvxTriFinish, uint32_t(sizeof(kCvxTriFinish)) },
     { "translateAABBsLaunch", kTranslateAABBs, uint32_t(sizeof(kTranslateAABBs)) },

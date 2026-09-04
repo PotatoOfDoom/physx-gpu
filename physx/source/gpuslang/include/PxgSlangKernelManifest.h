@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 400;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 402;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -88,11 +88,11 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "convexTrimeshNarrowphase", "convexTrimeshCoreBda.spv", "convexTrimeshNarrowphase" },  // CONVEX_TRIMESH_CORE (P8.46c)
     { "sortTriangleIndices", "sortTriIndicesBda.spv", "sortTriangleIndices" },  // CONVEX_TRIMESH_SORT_TRIANGLES (P8.48)
     { "convexTrimeshPostProcess", "cvxTriPostProcessBda.spv", "convexTrimeshPostProcess" },  // CONVEX_TRIMESH_POST_PROCESS (P8.49)
-    { "convexHeightfieldPostProcess", nullptr, nullptr },  // CONVEX_HEIGHTFIELD_POST_PROCESS (unmapped)
+    { "convexHeightfieldPostProcess", "convexHfPostProcessBda.spv", "convexHeightfieldPostProcess" },  // CONVEX_HEIGHTFIELD_POST_PROCESS (P9.51c)
     { "convexTrimeshCorrelate", "cvxTriCorrelateBda.spv", "convexTrimeshCorrelate" },  // CONVEX_TRIMESH_CORRELATE (P8.50b)
     { "convexTrimeshFinishContacts", "cvxTriFinishBda.spv", "convexTrimeshFinishContacts" },  // CONVEX_TRIMESH_FINISHCONTACTS (P8.51)
     { "convexHeightFieldMidphase", "convexHfMidphaseBda.spv", "convexHeightFieldMidphase" },  // CONVEX_HEIGHTFIELD_MIDPHASE (P9.51a)
-    { "convexHeightfieldNarrowphase", nullptr, nullptr },  // CONVEX_HEIGHTFIELD_CORE (unmapped)
+    { "convexHeightfieldNarrowphase", "convexHfCoreBda.spv", "convexHeightfieldNarrowphase" },  // CONVEX_HEIGHTFIELD_CORE (P9.51b)
     { "sphereTrimeshNarrowphase", nullptr, nullptr },  // SPHERE_TRIMESH_CORE (unmapped)
     { "sphereHeightfieldNarrowphase", nullptr, nullptr },  // SPHERE_HEIGHTFIELD_CORE (unmapped)
     { "trimeshPlaneNarrowphase", nullptr, nullptr },  // TRIMESH_PLANE_CORE (unmapped)
