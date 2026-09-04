@@ -82,6 +82,14 @@ static const uint CT_BV32_STRIDE = 1168u;
 
 public static const uint CT_GEOM_TRIANGLEMESH = 4u;   // PxGeometryType::eTRIANGLEMESH
 
+// P9.51b.  ctCommon takes the geometry type that, IN SLOT 0, means "the operands
+// arrived the other way round -- swap them".  The trimesh path passes
+// CT_GEOM_TRIANGLEMESH because convexMesh.cu:135 swaps on exactly that test.  The
+// HEIGHTFIELD path passes CT_NO_SWAP, because convexHeightfield.cu does not swap
+// at all: it reads slot 0 as the convex unconditionally (:211, :214).  A type no
+// shape can carry says that in the call rather than in a comment.
+public static const uint CT_NO_SWAP = 0xFFFFFFFFu;
+
 // PxgConvexConvexShape.h, 48 B — the same mirror the midphase shader carries.
 public struct CtShape
 {
@@ -157,21 +165,80 @@ public struct CtSetup
     public uint convexTriPairOffsetPadded;
 }
 
-// The whole prologue, warp-uniform: every lane computes the same values.  The
-// CUDA spreads the work over lanes and syncs three times; here each value is
-// cheap enough that computing it redundantly costs less than the barriers would,
-// and it removes three uniformity preconditions from the caller.
+// ---------------------------------------------------------------------------
+// THE HALF BOTH MESH PATHS SHARE (P9.51b)
+// ---------------------------------------------------------------------------
+// Everything up to and including the pair offsets is identical for the cooked
+// TRIANGLE MESH and for the HEIGHTFIELD: the same operand resolution, the same
+// convex-relative transform, the same contact distance, the same hull pointer,
+// the same ConvexMeshPair record.  What differs is only where the TRIANGLE comes
+// from -- an index buffer, or arithmetic on a grid -- and whether slot 0 and slot
+// 1 may arrive swapped.
+//
+// This was split out rather than copied.  Duplicating ~80 lines into the
+// heightfield core would put two copies of the operand resolution in the tree,
+// which is the exact shape P9.21 spent a tranche removing for find(); and the
+// half that would have been copied includes the running-end-offset trap
+// documented at the bottom of this function, which is precisely the kind of thing
+// that gets fixed in one copy and not the other.
+//
+// WHAT THE SPLIT COSTS, MEASURED.  "The tests still pass" is not evidence that a
+// refactor was value-preserving, so the compiled output was compared instead:
+// both modules that call ctSetup grew by EXACTLY 1596 bytes / 83 instructions
+// (convexTrimeshCoreBda 84072 -> 85668, cvxTriSetupBda 15792 -> 17388), and
+// cvxTriPostProcessBda -- which imports this module but never calls ctSetup --
+// is byte-identical.  The identical delta in two otherwise unrelated modules is
+// the point: the whole change lives in this module's contribution.
+//
+// The delta is structural, and only structural.  Slang does NOT inline ctCommon;
+// it emits it as its own function (+1 OpFunction/OpFunctionEnd/OpTypeFunction/
+// OpLabel/OpReturnValue, +1 OpFunctionCall, +7 OpFunctionParameter) returning a
+// struct through a local (+1 OpTypeStruct/OpTypePointer/OpVariable, +11 OpStore,
+// +15 OpCompositeExtract, +12 OpAccessChain -- the fields written here and read
+// back in the caller).  Every arithmetic opcode is unchanged: no OpFAdd, OpFMul,
+// OpFSub, OpFDiv, OpDot or GLSL.std.450 call moved by one, and the constant pool
+// is untouched down to the literal counts (35 -> 35 literals over 29 -> 29
+// distinct values here; 78 -> 78 over 58 -> 58 in the core).  OpDecorate is
+// likewise unchanged, so the NoContraction pass sees the same op set.  The extra
+// stores are a struct round-trip through Function storage that any driver's
+// mem2reg removes before FMA formation -- and the trimesh fixtures stay bit-exact
+// against their CPU mirrors, which a contraction change would have broken first.
+public struct CtCommon
+{
+    public uint64_t hull;             // the cooked convex hull blob
+    public uint64_t meshPtr;          // the mesh / heightfield blob
+    public float3 convexScale;
+    public float4 convexScaleRot;
+    public float3 meshScale;
+    public float4 meshScaleRot;
+    public float4 toCvxQ;             // mesh -> convex, per convexMesh.cu:141
+    public float3 toCvxP;
+    public float contactDist;
+    public uint triangleIdx;
+    public uint convexTriPairOffset;
+    public uint convexTriPairOffsetPadded;
+}
+
+// Warp-uniform: every lane computes the same values.  The CUDA spreads the work
+// over lanes and syncs three times; here each value is cheap enough that
+// computing it redundantly costs less than the barriers would, and it removes
+// three uniformity preconditions from the caller.
 //
 // `curPair` is the midphase's pair record: .x = contact-manager index,
 // .y = triangle index, .z = the pair's offset within that contact manager.
-public CtSetup ctSetup(uint64_t cmInputs, uint64_t transformCache, uint64_t contactDistance,
-                       uint64_t gpuShapes, uint64_t cvxTrimeshPair, uint4 curPair)
+//
+// `swapWhenSlot0Type` is the geometry type that, in slot 0, means the operands
+// arrived reversed.  Pass CT_NO_SWAP for a path whose .cu does not swap.
+public CtCommon ctCommon(uint64_t cmInputs, uint64_t transformCache, uint64_t contactDistance,
+                         uint64_t gpuShapes, uint64_t cvxTrimeshPair, uint4 curPair,
+                         uint swapWhenSlot0Type)
 {
-    CtSetup s;
+    CtCommon s;
 
     const uint cmIdx = curPair.x;
     const uint triangleIdx = curPair.y;
     const uint testOffset = curPair.z;
+    s.triangleIdx = triangleIdx;
 
     const CtContactManagerInput cin = Ptr<CtContactManagerInput>(cmInputs)[cmIdx];
     uint transformCacheRef0 = cin.transformCacheRef0;
@@ -183,7 +250,8 @@ public CtSetup ctSetup(uint64_t cmInputs, uint64_t transformCache, uint64_t cont
 
     // Slot 0 must be the convex and slot 1 the mesh.  The transform refs swap with
     // the shape refs, and the CUDA swaps them BEFORE reading the transforms.
-    if (shapes[shapeRef0].type == CT_GEOM_TRIANGLEMESH)
+    // CT_NO_SWAP matches no shape, so a path that passes it never swaps.
+    if (shapes[shapeRef0].type == swapWhenSlot0Type)
     {
         const uint tc = transformCacheRef0; transformCacheRef0 = transformCacheRef1; transformCacheRef1 = tc;
         const uint sr = shapeRef0;          shapeRef0 = shapeRef1;                   shapeRef1 = sr;
@@ -214,14 +282,66 @@ public CtSetup ctSetup(uint64_t cmInputs, uint64_t transformCache, uint64_t cont
     const float4 toCvxQ = ctQuatMul(ctQuatConjugate(q0), q1);
     const float3 toCvxP = ctQuatRotateInv(q0, p1 - p0);
 
+    s.toCvxQ = toCvxQ;
+    s.toCvxP = toCvxP;
+    s.meshScale = triScale;
+    s.meshScaleRot = triScaleRot;
+
     s.contactDist = Ptr<float>(contactDistance)[transformCacheRef0]
                   + Ptr<float>(contactDistance)[transformCacheRef1];
 
     s.hull = uint64_t(convexShape.hullOrMeshOffset.x) | (uint64_t(convexShape.hullOrMeshOffset.y) << 32);
 
+    s.meshPtr = uint64_t(trimeshShape.hullOrMeshOffset.x)
+              | (uint64_t(trimeshShape.hullOrMeshOffset.y) << 32);
+    // ---- where this pair's records go --------------------------------------
+    // ConvexMeshPair (convexNpCommon.h:70-81), 56-byte stride:
+    //
+    //   @0  PxTransform aToB (PxQuat 16 + PxVec3 12 = 28)
+    //   @28 int startIndex
+    //   @32 int count
+    //   @36 int cmIndex
+    //   @40 int roundedStartIndex
+    //   @44 int pad
+    //   @48 uint2 materialIndices
+    //
+    // THE TRAILING NUMBERS IN THAT DECLARATION ARE RUNNING END OFFSETS, NOT FIELD
+    // OFFSETS.  Reading them as field offsets puts startIndex at 32 and
+    // roundedStartIndex at 36 -- which is `count` and `cmIndex`.  Both are small
+    // non-negative integers, so the pair records would land at plausible-looking
+    // places in the output arrays and nothing would fault.
+    const uint64_t pairAddr = cvxTrimeshPair + uint64_t(cmIdx) * 56UL;
+    s.convexTriPairOffset = Ptr<uint>(pairAddr + 28UL)[0] + testOffset;
+    s.convexTriPairOffsetPadded = Ptr<uint>(pairAddr + 40UL)[0] + testOffset;
+
+    return s;
+}
+
+// ---------------------------------------------------------------------------
+// THE COOKED-TRIANGLE-MESH PATH: the shared half, plus this path's triangle.
+// ---------------------------------------------------------------------------
+public CtSetup ctSetup(uint64_t cmInputs, uint64_t transformCache, uint64_t contactDistance,
+                       uint64_t gpuShapes, uint64_t cvxTrimeshPair, uint4 curPair)
+{
+    const CtCommon c = ctCommon(cmInputs, transformCache, contactDistance, gpuShapes,
+                                cvxTrimeshPair, curPair, CT_GEOM_TRIANGLEMESH);
+
+    CtSetup s;
+    s.hull = c.hull;
+    s.convexScale = c.convexScale;
+    s.convexScaleRot = c.convexScaleRot;
+    s.contactDist = c.contactDist;
+    s.convexTriPairOffset = c.convexTriPairOffset;
+    s.convexTriPairOffsetPadded = c.convexTriPairOffsetPadded;
+
+    const uint triangleIdx = c.triangleIdx;
+    const uint64_t meshPtr = c.meshPtr;
+    const float3 triScale = c.meshScale;
+    const float4 triScaleRot = c.meshScaleRot;
+    const float4 toCvxQ = c.toCvxQ;
+    const float3 toCvxP = c.toCvxP;
+
     // ---- the cooked mesh ---------------------------------------------------
-    const uint64_t meshPtr = uint64_t(trimeshShape.hullOrMeshOffset.x)
-                           | (uint64_t(trimeshShape.hullOrMeshOffset.y) << 32);
     const uint4 meshHeader = Ptr<uint4>(meshPtr)[0];
     const uint numVerts = meshHeader.x;
     const uint numTris = meshHeader.y;
@@ -259,26 +379,6 @@ public CtSetup ctSetup(uint64_t cmInputs, uint64_t transformCache, uint64_t cont
 
     s.triangleLocNormal = ctNormalized(cross(s.triLocVerts1 - s.triLocVerts0,
                                              s.triLocVerts2 - s.triLocVerts0));
-
-    // ---- where this pair's records go --------------------------------------
-    // ConvexMeshPair (convexNpCommon.h:70-81), 56-byte stride:
-    //
-    //   @0  PxTransform aToB (PxQuat 16 + PxVec3 12 = 28)
-    //   @28 int startIndex
-    //   @32 int count
-    //   @36 int cmIndex
-    //   @40 int roundedStartIndex
-    //   @44 int pad
-    //   @48 uint2 materialIndices
-    //
-    // THE TRAILING NUMBERS IN THAT DECLARATION ARE RUNNING END OFFSETS, NOT FIELD
-    // OFFSETS.  Reading them as field offsets puts startIndex at 32 and
-    // roundedStartIndex at 36 — which is `count` and `cmIndex`.  Both are small
-    // non-negative integers, so the pair records would land at plausible-looking
-    // places in the output arrays and nothing would fault.
-    const uint64_t pairAddr = cvxTrimeshPair + uint64_t(cmIdx) * 56UL;
-    s.convexTriPairOffset = Ptr<uint>(pairAddr + 28UL)[0] + testOffset;
-    s.convexTriPairOffsetPadded = Ptr<uint>(pairAddr + 40UL)[0] + testOffset;
 
     return s;
 }
