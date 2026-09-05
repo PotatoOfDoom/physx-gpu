@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **852/852** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **853/853** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.57 added `gpuslang.geomTypeConstants`, the TENTH static checker and the SECOND
 written because its defect had already happened: a constant that names a
 `PxGeometryType` member must carry that member's value, read out of
@@ -1832,6 +1832,82 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.52b-1 — die Kantenklassifikation des Kapsel-Arms, direkt auf dem Abtastgitter
+
+`computeTriangleFlags` (convexHeightfield.cu:565-614) und `selectNormal`
+(capsuleTriangle.cuh:38-98), das einzige, was die Flaggen liest, als Modul
+`pxgSlangHfTriFlags` mit Sonde und Vorrichtung. Beides braucht der Kapsel-Arm, und
+beides braucht auch sein Trimesh-Zwilling (convexMesh.cu:541).
+
+**Warum nicht der Phase-1-Port reicht.** `npHfTriFlags` (Tranche 119) prüft die
+Klassifikation gegen **vorgelesene** Nachbardreiecke. Auf der Engine-ABI ändert
+sich genau das: die Nachbarn kommen aus demselben Abtastgitter wie das aktuelle
+Dreieck, über denselben händigkeitsvertauschenden Zugriff. Eine Vorrichtung, die
+dem Klassifikator ein fertiges Dreieck reicht, lässt Zugriff und Klassifikation
+sich über ein Dreieck einig werden, das keiner von beiden richtig geholt hat — das
+ist die P9.15d-Lehre.
+
+### Vier Kantenausgänge, und was der flache Boden verrät
+
+| Ausgang | Bedingung | Bit |
+|---|---|---|
+| BOUNDARY | Adjazenz `0xFFFFFFFF` | keins |
+| aktive Falte | `projD < 0` **und** `proj < 0.997` | `a+3` |
+| ignorierte Falte | `projD < 0`, aber `proj >= 0.997` | keins |
+| aktive Randkante | `projD >= 0` | `a+3` |
+
+Zwei koplanare Dreiecke liefern `projD` **exakt null**, und `0 < 0` ist falsch —
+auf perfekt flachem Höhenfeld ist deshalb **jede Innenkante aktiv**, und
+`selectNormal` verweigert die Flächennormale für jedes Ecken- und Kantenmerkmal.
+Das ist Upstream-Verhalten, kein Port-Artefakt, und der flache Block in der
+Vorrichtung steht dafür da. Er zahlt sich messbar aus: `A12-projD-non-strict`
+(`< 0` → `<= 0`) stirbt **nur** an ihm; auf jedem gekrümmten Höhenfeld stimmen die
+beiden Schreibweisen überein.
+
+### `boundaryCollisions` ist eine Konstante, und die untere Bit-Hälfte ist doppelt tot
+
+Der Port schreibt `HTF_BOUNDARY_COLLISIONS = true` — die Begründung steht bei
+Upstream-Kandidat 48 weiter oben: der Wert, den die `.cu` liest, ist die untere
+Hälfte einer Geräteadresse, für die es im Vulkan-Adressraum kein Gegenstück gibt,
+und er ist auf jeder Eingabe `true`. Damit ist der `else`-Zweig, der die
+Silhouetten-Bits 0-2 setzt, unerreichbar; `selectNormal` liest ohnehin nur die Bits
+3-5. Die Vorrichtung prüft aktiv, dass nie ein Silhouetten-Bit gesetzt wird — wenn
+das je passiert, sind Modul und Spiegel beide gewandert und die Behauptung ist
+veraltet.
+
+### Der Sweep: 35 Mutanten, 31 tot, und SECHS Lücken in der Vorrichtung
+
+Erster Lauf: **24 tot, 11 überlebend.** Sechs davon lagen an der Vorrichtung, nicht
+am Modul, und fünf hatten dieselbe Ursache: die baryzentrischen Paare waren nur je
+0, 0.25, 0.5 oder 1. Damit ließ sich `zero` von `1e-6` auf `1e-1` und `one` von
+`0.999999` auf `0.99` verschieben, **ohne eine einzige Klassifikation zu ändern** —
+die Konstanten selbst waren also ungeprüft, nur ihre groben Extreme.
+
+Die Paare enthalten jetzt Werte knapp über der Epsilon-Schwelle, knapp unter `one`,
+**exakt auf** der Epsilon-Schwelle (wo `>` und `>=` sich unterscheiden) und eine
+Summe **exakt auf** der 0.9999-Schwelle — letztere durch Subtraktion innerhalb
+derselben Binade konstruiert, damit sie bitgenau trifft.
+
+Die sechste Lücke war Deckung statt Auflösung: die beiden Ecken-Arme wurden nie
+über ein Dreieck befragt, dessen Bits für Kante 12 und Kante 20 sich
+unterscheiden — ihre Masken waren also vertauschbar, ohne dass es auffiel. Die
+Vorrichtung fährt jetzt das volle Kreuzprodukt Dreieck × Paar und hat für diese
+Aufspaltung einen eigenen Wächter.
+
+Zweiter Lauf: **30 tot, 1 durch Absturz tot, 4 überlebend.** Der Absturz ist
+`A3-boundary-guard-dropped` — also die Form, die der Kugel-Arm derselben Datei
+tatsächlich hat (Upstream-Kandidat 49). Die vier Überlebenden sind bewiesene
+Äquivalenzen derselben Familien wie beim Kugel-Kern: eine positive Skalierung eines
+Vorzeichentests (`A9`), eine in exakter Arithmetik identisch verschwindende
+Differenz (`A10`, `av0` gegen `av1` in derselben Nachbarebene) und zwei
+nachweislich tote Zweige (`A19` die Silhouettenmarkierung, `A20` der
+`m2 > 0`-Schutz, der innerhalb von `projD < 0` nie falsch sein kann).
+
+**Keine Szenen.** Diese Tranche fügt ein Modul und eine Sonde hinzu und ändert
+keinen abgebildeten Kernel; `sphereHeightfieldNarrowphase` bleibt bis zum
+vollständigen Kapsel-Arm auf `nullptr`.
+
 
 ## P9.52b-0 — drei Upstream-Kandidaten aus dem Kapsel-Arm (47 → 50), zwei davon durch einen ZWILLING beweisbar
 
