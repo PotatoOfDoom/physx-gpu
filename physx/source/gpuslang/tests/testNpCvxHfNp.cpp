@@ -230,13 +230,21 @@ static float distPointTriRef(V3 p, V3 a, V3 b, V3 c, U4 adj, V3& closestP,
     if (vb < 0.0f && d2 >= 0.0f && d6 <= 0.0f) { mask = eE02; gen = !isEdgeNonconvexRef(adj.z) || vb > -edgeTol; const float w = d2 / (d2 - d6); closestP = add(a, mul(ac, w)); const V3 d = sub(closestP, p); return dot3(d, d); }
     if (va < 0.0f && d4 >= d3 && d5 >= d6)     { mask = eE12; gen = !isEdgeNonconvexRef(adj.y) || va > -edgeTol; const float w = (d4 - d3) / ((d4 - d3) + (d5 - d6)); closestP = add(b, mul(sub(c, b), w)); const V3 d = sub(closestP, p); return dot3(d, d); }
     gen = true; face = true; mask = 0u;
-    // P9.36: GuDistancePointTriangle.h:94-97 scales the two SCALARS by the reciprocal
-    // and only then forms the vector sum.  Summing first and scaling after rounds in a
-    // different place.  Unlike its npCvxMeshNp sibling this fixture's geometry DOES
-    // separate the two -- correcting the shader alone turned it red on 123 cases.
+    // THE MIRROR IS WRITTEN FROM THE CUDA, NOT FROM THE SHADER (P9.53).
+    // sphereTriangle.cuh:138 is
+    //     closestP = a + (ab * vb + ac * vc) / (va + vb + vc);
+    // and PxVec3::operator/(Type f) (PxVec3.h:218-223) is `f = 1/f; return
+    // (x*f, y*f, z*f)`.  So: ONE vector sum, ONE reciprocal, three multiplies,
+    // and ONE add onto `a` -- not two adds, and not two scaled scalars.
+    //
+    // P9.36 rewrote this mirror to GuDistancePointTriangle.h's tail in the same
+    // commit that rewrote the shader, AFTER the shader change turned this fixture
+    // red on 123 cases.  That is the trap the same commit message names: a mirror
+    // written from the Slang by the same hand at the same time proves only that
+    // shader and mirror agree with each other.  Restoring the shader to the CUDA
+    // turns this fixture red on the SAME 123 cases -- measured, not assumed.
     const float denom = 1.0f / (va + vb + vc);
-    // left-to-right, as the engine's `a + ab*v + ac*w` associates in C++.
-    closestP = add(add(a, mul(ab, vb * denom)), mul(ac, vc * denom));
+    closestP = add(a, mul(add(mul(ab, vb), mul(ac, vc)), denom));
     const V3 d = sub(closestP, p); return dot3(d, d);
 }
 

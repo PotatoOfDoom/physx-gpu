@@ -288,11 +288,12 @@ float distancePointTriangleSquared(float3 p, float3 a, float3 b, float3 c, uint4
     generateContact = true;
     faceContact = true;
     mask = 0u;
-    // P9.36: the reciprocal was right and the ASSOCIATION was not -- see the twin
-    // note in npCvxHfNp.slang.  GuDistancePointTriangle.h:94-97 scales the two
-    // SCALARS (v = vb*denom, w = vc*denom) and only then forms a + ab*v + ac*w.
+    // P9.53 WITHDRAWS P9.36's ASSOCIATION CHANGE -- see the twin note in
+    // npCvxHfNp.slang.  This function ports sphereTriangle.cuh:41-140, whose face
+    // region at :138 sums the vectors and scales once; GuDistancePointTriangle.h
+    // is a different function that this translation unit does not even include.
     const float denom = 1.0f / (va + vb + vc);
-    closestP = a + ab * (vb * denom) + ac * (vc * denom);
+    closestP = a + (ab * vb + ac * vc) * denom;
     return dot(closestP - p, closestP - p);
 }
 

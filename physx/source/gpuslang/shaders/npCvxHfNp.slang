@@ -307,17 +307,32 @@ float distancePointTriangleSquared(float3 p, float3 a, float3 b, float3 c, uint4
     generateContact = true;
     faceContact = true;
     mask = 0u;
-    // P9.36: the reciprocal was right and the ASSOCIATION was not.  The engine
-    // (GuDistancePointTriangle.h:94-97) scales the two SCALARS and then forms the
-    // vector sum:
-    //     const float denom = 1.0f / (va + vb + vc);
-    //     const float v = vb * denom;
-    //     const float w = vc * denom;
-    //     return a + ab*v + ac*w;
-    // `(ab*vb + ac*vc) * denom` sums first and scales after, which rounds at a
-    // different place: (ab.x*vb + ac.x*vc)*r != ab.x*(vb*r) + ac.x*(vc*r).
+    // P9.53 WITHDRAWS P9.36's ASSOCIATION CHANGE AT THIS SITE.
+    //
+    // This function ports (A) `distancePointTriangleSquared`, sphereTriangle.cuh
+    // :41-140 -- the NINE-argument hand-written version with the uint4 adjacency,
+    // the Voronoi mask, generateContact/faceContact and edgeTol.  Its face region
+    // (:138) is
+    //     closestP = a + (ab * vb + ac * vc) / (va + vb + vc);
+    // and `PxVec3::operator/(Type f)` (PxVec3.h:218-223) is `f = 1/f; return
+    // (x*f, y*f, z*f)` -- ONE vector sum, ONE reciprocal, three multiplies, and
+    // ONE add onto `a`.
+    //
+    // P9.36 replaced that with (B), the tail of `Gu::closestPtPointTriangle2`
+    // (GuDistancePointTriangle.h:93-97), which scales the two SCALARS first.  Its
+    // recorded warrant was "eighteen of the twenty-one copies in the corpus
+    // already spell it this way" -- a pattern in the Slang, which is exactly what
+    // that same tranche's verification section forbade itself to decide by.  The
+    // eighteen are right about THEMSELVES: they port (B), or the 5-argument
+    // deformableCollision.cuh:223 wrapper that delegates to it.  These three port
+    // (A), and neither convexMesh.cu nor convexHeightfield.cu even includes the
+    // header (B) lives in.  A majority spelling is not evidence about a different
+    // function.
+    //
+    // The reciprocal half of P9.36 stands: `v / s` on a PxVec3 is one reciprocal
+    // and three multiplies, never three divides.
     const float denom = 1.0f / (va + vb + vc);
-    closestP = a + ab * (vb * denom) + ac * (vc * denom);
+    closestP = a + (ab * vb + ac * vc) * denom;
     return dotX(closestP - p, closestP - p);
 }
 

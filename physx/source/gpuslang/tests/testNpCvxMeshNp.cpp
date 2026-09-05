@@ -262,18 +262,19 @@ static float distPointTriRef(V3 p, V3 a, V3 b, V3 c, U4 adj, V3& closestP,
     generateContact = true;
     faceContact = true;
     mask = 0u;
-    // P9.36: GuDistancePointTriangle.h:94-97 scales the two SCALARS by the reciprocal
-    // and only then forms the vector sum.  This mirror used to sum first and scale
-    // after -- `(ab*vb + ac*vc) * (1/denom)` -- which rounds in a different place.
+    // THE MIRROR IS WRITTEN FROM THE CUDA (P9.53) -- see the twin note in
+    // testNpCvxHfNp.cpp.  sphereTriangle.cuh:138 sums the two scaled edge vectors
+    // and scales the sum once, then adds `a` once.
     const float denom = 1.0f / (va + vb + vc);
-    // left-to-right, as the engine's `a + ab*v + ac*w` associates in C++.
-    closestP = add(add(a, mul(ab, vb * denom)), mul(ac, vc * denom));
-    // ...and this counts how many of those cases the OLD spelling would actually have
-    // got wrong, i.e. how much of this branch the fixture is able to police at all.
-    // See gFaceDistinguish's use below: on this fixture's exact dyadic geometry the
-    // answer can be zero, and that is a fact worth asserting rather than assuming.
+    closestP = add(a, mul(add(mul(ab, vb), mul(ac, vc)), denom));
+    // ...and this counts how many of these cases could tell the CUDA's association
+    // apart from the one P9.36 imposed -- i.e. how much of this branch the fixture
+    // is able to police at all.  On this fixture's axis-aligned geometry the answer
+    // is ZERO, and that is asserted below rather than assumed.
     {
-        const V3 oldForm = add(a, mul(add(mul(ab, vb), mul(ac, vc)), denom));  // pre-P9.36
+        // The spelling P9.36 put here and P9.53 removed: GuDistancePointTriangle.h
+        // :93-97, two scaled scalars and two adds.
+        const V3 p936Form = add(add(a, mul(ab, vb * denom)), mul(ac, vc * denom));
         // diagnosis probe: the two spellings coincide IDENTICALLY when, in every
         // component, at most one of ab/ac is non-zero -- then ab.x*vb + ac.x*vc has a
         // single term and (t)*denom == ab.x*(vb*denom) trivially.  Axis-aligned grid
@@ -285,8 +286,8 @@ static float distPointTriRef(V3 p, V3 a, V3 b, V3 c, U4 adj, V3& closestP,
             if (ab.z != 0.0f && ac.z != 0.0f) ++mixed;
             if (mixed > 0) ++gFaceMixedComponent;
         }
-        if (bitsOf(oldForm.x) != bitsOf(closestP.x) || bitsOf(oldForm.y) != bitsOf(closestP.y) ||
-            bitsOf(oldForm.z) != bitsOf(closestP.z))
+        if (bitsOf(p936Form.x) != bitsOf(closestP.x) || bitsOf(p936Form.y) != bitsOf(closestP.y) ||
+            bitsOf(p936Form.z) != bitsOf(closestP.z))
             ++gFaceDistinguish;
     }
     const V3 d = sub(closestP, p);
@@ -958,33 +959,39 @@ static void checkKind(const char* entry, bool capsule, uint32_t seed)
                       "%s boundary probes: ex=%zu in=%zu (want 64/64)", entry, nBoundaryEx, nBoundaryIn);
     // P9.36: the face region must actually be entered, or the barycentric tail of
     // distPointTriRef is dead weight and the fixture proves nothing about it.
-    // P9.36 -- A NAMED LIMITATION, measured rather than assumed.
+    // A NAMED LIMITATION, measured rather than assumed -- AND THE REASON P9.36'S
+    // ASSOCIATION CHANGE SURVIVED HERE FOR TWO TRANCHES.
     //
     // The face region of distPointTriRef is entered often on the sphere path (256 of
-    // 1024) and NEVER on the capsule path.  Yet correcting the barycentric tail of
-    // npCvxMeshNp.slang from `(ab*vb + ac*vc) * denom` to the engine's
-    // `ab*(vb*denom) + ac*(vc*denom)` (GuDistancePointTriangle.h:94-97) left this
-    // fixture green, and the counters say why: in ZERO of those 256 cases does any
-    // component have BOTH ab and ac non-zero.  This mesh's triangles are axis-aligned,
-    // so every component of `ab.c*vb + ac.c*vc` has at most one live term, and the two
-    // associations are then IDENTICAL as expressions -- not close, identical.  No
-    // tolerance and no sample count could change that; it follows from the geometry.
+    // 1024) and NEVER on the capsule path.  Yet swapping the barycentric tail of
+    // npCvxMeshNp.slang between the CUDA's `(ab*vb + ac*vc) * denom`
+    // (sphereTriangle.cuh:138) and the CPU header's `ab*(vb*denom) + ac*(vc*denom)`
+    // (GuDistancePointTriangle.h:93-97) leaves this fixture green EITHER WAY, and the
+    // counters say why: in ZERO of those 256 cases does any component have BOTH ab and
+    // ac non-zero.  This mesh's triangles are axis-aligned, so every component of
+    // `ab.c*vb + ac.c*vc` has at most one live term, and the two associations are then
+    // IDENTICAL as expressions -- not close, identical.  No tolerance and no sample
+    // count could change that; it follows from the geometry.
     //
     // This is a fourth way a fixture goes blind, distinct from a wrong mirror, a loose
     // tolerance and an uncovered path: the exact-arithmetic doctrine that makes
     // bit-exact comparison possible here is the same thing that puts rounding-order
-    // defects out of reach.  Killing this mutant needs a triangle whose two edge
-    // vectors share a non-zero component, which means reshaping the shared mesh that
-    // every other expectation in this file is pinned against.  gpuslang.vectorDivide
-    // covers the divide half; the association half is carried by this note and by the
-    // audit that found it.
+    // defects out of reach.  Separating them needs a triangle whose two edge vectors
+    // share a non-zero component, which means reshaping the shared mesh that every
+    // other expectation in this file is pinned against.
+    //
+    // WHAT ACTUALLY POLICES IT is the sibling: gpuslang.npCvxHfNp ports the SAME
+    // function (sphereTriangle.cuh:41-140) over heightfield triangles, whose two edge
+    // vectors DO share a live y component, and it separates the two spellings on 123
+    // cases -- measured three times now, twice in P9.36 and once in P9.53.
+    // gpuslang.vectorDivide covers the divide half.
     PXG_CHECK_MSG(!capsule || nFaceRegion == 0,
                   "%s: the capsule path now reaches the face region (%zu cases) -- the "
                   "limitation note above is stale, re-measure it", entry, nFaceRegion);
     PXG_CHECK_MSG(capsule || nFaceRegion > 0,
                   "%s: the sphere path no longer reaches the face region", entry);
     std::printf("    [ note ] %s: face region reached in %zu of %zu cases; %zu separate the "
-                "engine's association from sum-then-scale (%zu have a component where both "
+                "CUDA's association from the CPU header's (%zu have a component where both "
                 "edge vectors are non-zero)\n",
                 entry, nFaceRegion, fx.cases.size(), gFaceDistinguish, gFaceMixedComponent);
     PXG_CHECK_MSG(nHit > 300 && nDelay > 100 && nEdgeD > 30 && nVertD > 30 && nZero > 100 && nFlip > 50,

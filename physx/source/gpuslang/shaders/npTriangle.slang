@@ -164,15 +164,15 @@ void triPointDistance(uint3 dtid : SV_DispatchThreadID)
         generateContact = true;
         faceContact = true;
         mask = 0u;
-        // P9.36: BOTH halves were wrong here.  GuDistancePointTriangle.h:94-97 is
-        //     const float denom = 1.0f / (va + vb + vc);
-        //     const float v = vb * denom;  const float w = vc * denom;
-        //     return a + ab*v + ac*w;
-        // -- a reciprocal, not three divides, AND the two scalars scaled before the
-        // vector sum, not after.  The eighteen other copies of this tail in the
-        // corpus already spell it this way; this one and the two convex ones did not.
+        // P9.36 found a REAL defect here and over-corrected it.  This site alone
+        // of the three had three per-component divides, which PxVec3::operator/
+        // (PxVec3.h:218-223) never performs -- that half of the fix stands.  But
+        // P9.36 then also moved the ASSOCIATION to GuDistancePointTriangle.h's,
+        // and this function ports sphereTriangle.cuh:41-140, whose face region
+        // (:138) sums the two scaled edge vectors and scales the sum once.  See
+        // the twin note in npCvxHfNp.slang.  P9.53 restores it.
         const float denom = 1.0f / (va + vb + vc);
-        closestP = a + ab * (vb * denom) + ac * (vc * denom);
+        closestP = a + (ab * vb + ac * vc) * denom;
         distSq = dot(closestP - p, closestP - p);
     }
 
