@@ -90,6 +90,7 @@
 // mirror on the same 123.
 
 import pxgSlangCommon;
+import pxgSlangPointTriangle;   // P9.56: the shared sphereTriangle.cuh:41 primitive
 
 static const float FLT_MAX_LOCAL = 3.402823466e38f;
 static const uint BOUNDARY = 0xffffffffu;
@@ -233,125 +234,21 @@ float3 adjTriV0(uint adjTri, float3 scale)
     return a0;
 }
 
-// ---- primitives (tranche 54) -------------------------------------------------
-// explicit dot/cross (no dotX()/crossX() intrinsic) so the FMA contraction
-// matches the CPU reference bit-for-bit on the exact integer inputs
-float dotX(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-float3 crossX(float3 a, float3 b)
-{
-    return float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
-}
-float3 getNormalizedZ(float3 v)
-{
-    const float m = dotX(v, v);
-    return m > 0.0f ? v * (1.0f / sqrt(m)) : float3(0, 0, 0);
-}
-bool isEdgeNonconvex(uint adjEdgeIndex)
-{
-    return (adjEdgeIndex != BOUNDARY) && ((adjEdgeIndex & NONCONVEX_FLAG) != 0u);
-}
+// ---- the shared point-vs-triangle primitive (P9.56) -------------------------
+// `distancePointTriangleSquared` (sphereTriangle.cuh:41-140), its explicit
+// dot/cross, and `isEdgeNonconvex` now live in `pxgSlangPointTriangle`.  They
+// were transcribed here, in npCvxMeshNp and in npTriangle, and every defect found
+// in them since had to be fixed three times -- see that module's header.
+float dotX(float3 a, float3 b) { return ptDot(a, b); }
+float3 crossX(float3 a, float3 b) { return ptCross(a, b); }
+float3 getNormalizedZ(float3 v) { return ptNormalized(v); }
+bool isEdgeNonconvex(uint i) { return ptIsEdgeNonconvex(i); }
 float distancePointTriangleSquared(float3 p, float3 a, float3 b, float3 c, uint4 adj,
                                    out float3 closestP, out bool generateContact,
                                    out bool faceContact, out uint mask)
 {
-    faceContact = false;
-    const float3 ab = b - a, ac = c - a, ap = p - a;
-    const float d1 = dotX(ab, ap), d2 = dotX(ac, ap);
-    const float3 bp = p - b;
-    const float d3 = dotX(ab, bp), d4 = dotX(ac, bp);
-    const float3 cp = p - c;
-    const float d5 = dotX(ab, cp), d6 = dotX(ac, cp);
-    const float vc = d1 * d4 - d3 * d2;
-    const float vb = d5 * d2 - d1 * d6;
-    const float va = d3 * d6 - d5 * d4;
-    // sphereTriangle.cuh:96 is `const float edgeTol = (va + vb + vc) * 1e-5;` --
-    // the literal carries NO SUFFIX, so in C++ it is a DOUBLE.  The multiply
-    // therefore happens in DOUBLE precision and only the assignment narrows to
-    // float.  `1e-5f` computes the whole thing in float, which lands about 0.4 ULP
-    // away: float(1e-5) is 0x3727c5ac = 9.999999747e-06, the double is
-    // 0x3ee4f8b588e368f1.
-    //
-    // `double(1.0f) / double(100000.0f)` reproduces the C++ literal BIT FOR BIT
-    // (both 0x3ee4f8b588e368f1, checked): 100000 is exact in float and in double
-    // and the division is correctly rounded.  Same idiom, and the same reason, as
-    // npSbExtractRotAPD.slang:125-126.
-    //
-    // This is the ONLY site in the whole GPU CUDA corpus where an unsuffixed
-    // literal meets float arithmetic -- searched, not assumed.  Everywhere else an
-    // unsuffixed literal is assigned straight to a float and narrows immediately,
-    // which is why npSbExtractRotAPD.slang:121 can note "double literal -> same
-    // float" and move on.
-    const double D1E_5 = double(1.0f) / double(100000.0f);
-    const float edgeTol = float(double(va + vb + vc) * D1E_5);
-    if (d1 < 0.0f && d2 < 0.0f)
-    {
-        mask = eV0;
-        generateContact = (!isEdgeNonconvex(adj.x)) || (!isEdgeNonconvex(adj.z));
-        closestP = a; return dotX(ap, ap);
-    }
-    if (d3 > 0.0f && d4 < d3)
-    {
-        mask = eV1;
-        generateContact = (!isEdgeNonconvex(adj.x)) || (!isEdgeNonconvex(adj.y));
-        closestP = b; return dotX(bp, bp);
-    }
-    if (d6 > 0.0f && d5 < d6)
-    {
-        mask = eV2;
-        generateContact = (!isEdgeNonconvex(adj.y)) || (!isEdgeNonconvex(adj.z));
-        closestP = c; return dotX(cp, cp);
-    }
-    if (vc < 0.0f && d1 >= 0.0f && d3 <= 0.0f)
-    {
-        mask = eE01;
-        generateContact = !isEdgeNonconvex(adj.x) || vc > -edgeTol;
-        const float v = d1 / (d1 - d3);
-        closestP = a + v * ab; return dotX(closestP - p, closestP - p);
-    }
-    if (vb < 0.0f && d2 >= 0.0f && d6 <= 0.0f)
-    {
-        mask = eE02;
-        generateContact = !isEdgeNonconvex(adj.z) || vb > -edgeTol;
-        const float w = d2 / (d2 - d6);
-        closestP = a + w * ac; return dotX(closestP - p, closestP - p);
-    }
-    if (va < 0.0f && d4 >= d3 && d5 >= d6)
-    {
-        mask = eE12;
-        generateContact = !isEdgeNonconvex(adj.y) || va > -edgeTol;
-        const float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-        closestP = b + w * (c - b); return dotX(closestP - p, closestP - p);
-    }
-    generateContact = true;
-    faceContact = true;
-    mask = 0u;
-    // P9.53 WITHDRAWS P9.36's ASSOCIATION CHANGE AT THIS SITE.
-    //
-    // This function ports (A) `distancePointTriangleSquared`, sphereTriangle.cuh
-    // :41-140 -- the NINE-argument hand-written version with the uint4 adjacency,
-    // the Voronoi mask, generateContact/faceContact and edgeTol.  Its face region
-    // (:138) is
-    //     closestP = a + (ab * vb + ac * vc) / (va + vb + vc);
-    // and `PxVec3::operator/(Type f)` (PxVec3.h:218-223) is `f = 1/f; return
-    // (x*f, y*f, z*f)` -- ONE vector sum, ONE reciprocal, three multiplies, and
-    // ONE add onto `a`.
-    //
-    // P9.36 replaced that with (B), the tail of `Gu::closestPtPointTriangle2`
-    // (GuDistancePointTriangle.h:93-97), which scales the two SCALARS first.  Its
-    // recorded warrant was "eighteen of the twenty-one copies in the corpus
-    // already spell it this way" -- a pattern in the Slang, which is exactly what
-    // that same tranche's verification section forbade itself to decide by.  The
-    // eighteen are right about THEMSELVES: they port (B), or the 5-argument
-    // deformableCollision.cuh:223 wrapper that delegates to it.  These three port
-    // (A), and neither convexMesh.cu nor convexHeightfield.cu even includes the
-    // header (B) lives in.  A majority spelling is not evidence about a different
-    // function.
-    //
-    // The reciprocal half of P9.36 stands: `v / s` on a PxVec3 is one reciprocal
-    // and three multiplies, never three divides.
-    const float denom = 1.0f / (va + vb + vc);
-    closestP = a + (ab * vb + ac * vc) * denom;
-    return dotX(closestP - p, closestP - p);
+    return ptDistancePointTriangleSquared(p, a, b, c, adj, closestP, generateContact,
+                                          faceContact, mask);
 }
 
 // ---- warp output stage (convexHeightfield.cu :941-994, == trimesh) -----------

@@ -35,6 +35,8 @@
 //     faceContact flags;
 //   - intersectLineTri: the one-sided line-vs-triangle intersection test.
 
+import pxgSlangPointTriangle;   // P9.56: the shared sphereTriangle.cuh:41 primitive
+
 static const uint BOUNDARY = 0xffffffffu;
 static const uint NONCONVEX_FLAG = 0x80000000u;
 static const uint eV0  = 1u << 29;
@@ -89,110 +91,16 @@ void triPointDistance(uint3 dtid : SV_DispatchThreadID)
     const float3 p = inp.p.xyz, a = inp.a.xyz, b = inp.b.xyz, c = inp.c.xyz;
     const uint4 adj = inp.adj;
 
+    // The whole Ericson cascade now lives in `pxgSlangPointTriangle` (P9.56).
+    // It was transcribed here, in npCvxMeshNp and in npCvxHfNp, and P9.36, P9.53
+    // and P9.55 each had to fix the same defect three times -- see that module's
+    // header.  This shader is the scaffolding that drives it against a host mirror.
     bool faceContact = false;
     bool generateContact;
     uint mask;
     float3 closestP;
-    float distSq;
-
-    const float3 ab = b - a;
-    const float3 ac = c - a;
-    const float3 ap = p - a;
-    const float d1 = dot(ab, ap);
-    const float d2 = dot(ac, ap);
-
-    const float3 bp = p - b;
-    const float d3 = dot(ab, bp);
-    const float d4 = dot(ac, bp);
-
-    const float3 cp = p - c;
-    const float d5 = dot(ab, cp);
-    const float d6 = dot(ac, cp);
-
-    const float vc = d1 * d4 - d3 * d2;
-    const float vb = d5 * d2 - d1 * d6;
-    const float va = d3 * d6 - d5 * d4;
-    // sphereTriangle.cuh:96 is `const float edgeTol = (va + vb + vc) * 1e-5;` --
-    // the literal carries NO SUFFIX, so in C++ it is a DOUBLE.  The multiply
-    // therefore happens in DOUBLE precision and only the assignment narrows to
-    // float.  `1e-5f` computes the whole thing in float, which lands about 0.4 ULP
-    // away: float(1e-5) is 0x3727c5ac = 9.999999747e-06, the double is
-    // 0x3ee4f8b588e368f1.
-    //
-    // `double(1.0f) / double(100000.0f)` reproduces the C++ literal BIT FOR BIT
-    // (both 0x3ee4f8b588e368f1, checked): 100000 is exact in float and in double
-    // and the division is correctly rounded.  Same idiom, and the same reason, as
-    // npSbExtractRotAPD.slang:125-126.
-    //
-    // This is the ONLY site in the whole GPU CUDA corpus where an unsuffixed
-    // literal meets float arithmetic -- searched, not assumed.  Everywhere else an
-    // unsuffixed literal is assigned straight to a float and narrows immediately,
-    // which is why npSbExtractRotAPD.slang:121 can note "double literal -> same
-    // float" and move on.
-    const double D1E_5 = double(1.0f) / double(100000.0f);
-    const float edgeTol = float(double(va + vb + vc) * D1E_5);
-
-    if (d1 < 0.0f && d2 < 0.0f)
-    {
-        mask = eV0;
-        generateContact = (!isEdgeNonconvex(adj.x)) || (!isEdgeNonconvex(adj.z));
-        closestP = a;
-        distSq = dot(ap, ap);
-    }
-    else if (d3 > 0.0f && d4 < d3)
-    {
-        mask = eV1;
-        generateContact = (!isEdgeNonconvex(adj.x)) || (!isEdgeNonconvex(adj.y));
-        closestP = b;
-        distSq = dot(bp, bp);
-    }
-    else if (d6 > 0.0f && d5 < d6)
-    {
-        mask = eV2;
-        generateContact = (!isEdgeNonconvex(adj.y)) || (!isEdgeNonconvex(adj.z));
-        closestP = c;
-        distSq = dot(cp, cp);
-    }
-    else if (vc < 0.0f && d1 >= 0.0f && d3 <= 0.0f)
-    {
-        mask = eE01;
-        generateContact = !isEdgeNonconvex(adj.x) || vc > -edgeTol;
-        const float v = d1 / (d1 - d3);
-        closestP = a + v * ab;
-        distSq = dot(closestP - p, closestP - p);
-    }
-    else if (vb < 0.0f && d2 >= 0.0f && d6 <= 0.0f)
-    {
-        mask = eE02;
-        generateContact = !isEdgeNonconvex(adj.z) || vb > -edgeTol;
-        const float w = d2 / (d2 - d6);
-        closestP = a + w * ac;
-        distSq = dot(closestP - p, closestP - p);
-    }
-    else if (va < 0.0f && d4 >= d3 && d5 >= d6)
-    {
-        mask = eE12;
-        generateContact = !isEdgeNonconvex(adj.y) || va > -edgeTol;
-        const float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-        closestP = b + w * (c - b);
-        distSq = dot(closestP - p, closestP - p);
-    }
-    else
-    {
-        generateContact = true;
-        faceContact = true;
-        mask = 0u;
-        // P9.36 found a REAL defect here and over-corrected it.  This site alone
-        // of the three had three per-component divides, which PxVec3::operator/
-        // (PxVec3.h:218-223) never performs -- that half of the fix stands.  But
-        // P9.36 then also moved the ASSOCIATION to GuDistancePointTriangle.h's,
-        // and this function ports sphereTriangle.cuh:41-140, whose face region
-        // (:138) sums the two scaled edge vectors and scales the sum once.  See
-        // the twin note in npCvxHfNp.slang.  P9.53 restores it.
-        const float denom = 1.0f / (va + vb + vc);
-        closestP = a + (ab * vb + ac * vc) * denom;
-        distSq = dot(closestP - p, closestP - p);
-    }
+    const float distSq = ptDistancePointTriangleSquared(p, a, b, c, adj, closestP,
+                                                        generateContact, faceContact, mask);
 
     TriResult r;
     r.closest = float4(closestP, distSq);
