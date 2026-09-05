@@ -15,10 +15,36 @@ the shim's exact blob check refuses every launch, and the kernel never runs —
 while its fixtures, the manifest test, the suite and the scene sweep all pass.
 Four kernels sat in that state for two tranches.  The rule is a RATCHET: the set
 of mapped-but-unwired kernels (54 today) may shrink, never grow.
+**PRÄMISSE, DIE FÜR ALLES DARUNTER GILT (P9.54).** Wenn dieses Dokument „die
+Engine" als Referenz nennt, meint es **den CUDA-QUELLTEXT, gelesen als IEEE-754-
+C++** — nicht das ausgelieferte CUDA-Binär. Das ist nicht dasselbe:
+`physx/source/compiler/cmakegpu/CMakeLists.txt:100` übersetzt die gesamte
+CUDA-Hälfte mit `-use_fast_math -ftz=true -prec-div=false -prec-sqrt=false`, und
+diese Flags landen über `CMAKE_CUDA_FLAGS` (linux/CMakeLists.txt:64) auf jedem
+Kernel. Nach dokumentiertem nvcc-Verhalten heißt das auf einer echten NVIDIA-GPU:
+`sqrtf` ist `sqrt.approx.f32`, `/` ist `div.approx.f32`, Denormale werden auf null
+gespült, und `a*b+c` wird zu einem FMA verschmolzen (`-use_fast_math` impliziert
+`-fmad=true`).
+
+Nichts davon ist hier reproduzierbar — es gibt kein CUDA-Toolkit und keine
+NVIDIA-GPU — und nichts davon ist das, wogegen die Vorrichtungen vergleichen: sie
+vergleichen den Shader gegen einen **C++-Host-Spiegel**, den der Host-Compiler
+unter IEEE-Semantik übersetzt. Das ist das einzige erreichbare und in sich
+konsistente Ziel, und der NoContraction-Stempel ist genau das, was die
+Vulkan-Seite mit der C++-Seite in Deckung hält (seine eigene Begründung nennt
+korrekt „die bitweise CPU-gegen-GPU-Doktrin", nicht das Binär).
+
+**Kein Code ändert sich daran.** Was sich ändert, sind Sätze, die weiter unten
+über „die Engine" mehr behaupten, als der Quelltext hergibt — zwei davon sind
+unten korrigiert. Der Befund ist beim Lesen von `sphereTriangle.cuh` als
+Transkriptionsquelle für P9.52 aufgefallen und gegen die CMake-Datei geprüft; die
+Bedeutung der Flags ist **dokumentiertes** nvcc-Verhalten, hier nicht gemessen.
+
 P9.47 added `gpuslang.lengthIntrinsic`, the SEVENTH static checker: GLSL.std.450
 `Length`, `Distance` and `Normalize` are given a precision allowance by the Vulkan
-environment spec, while the engine computes those quantities from operations that
-ARE pinned — `PxVec3::magnitude()` is `PxSqrt(magnitudeSquared())`,
+environment spec, while the engine SOURCE computes those quantities from
+operations that are exactly specified IN C++ — `PxVec3::magnitude()` is
+`PxSqrt(magnitudeSquared())`,
 `getNormalized()` is `v * PxRecipSqrt(m)` where `PxRecipSqrt` is literally
 `1.0f/sqrtf`, `PxVec3::normalize()` is one reciprocal and three multiplies, and
 `PxQuat::getNormalized()` is `1/magnitude()` and four.  The audit behind the rule
@@ -29,10 +55,16 @@ out.  `InverseSqrt` is deliberately outside the rule (P9.33a measured it) and so
 is `Sqrt` (correctly rounded by the same spec).
 P9.33a added `gpuslang.npFloatIntrinRecipSqrt`, which is not a kernel port but a
 PLATFORM measurement: about forty shaders here spell `PxVec3::getNormalized` as
-`v * rsqrt(m)`, while the engine computes `PxRecipSqrt` = `1.0f/sqrtf` — two exactly
-specified IEEE operations — and SPIR-V's `InverseSqrt` is allowed 2 ULP of slack.  The
-two agree bit for bit on llvmpipe over 258442 inputs, and that is now measured rather
-than inferred from a green suite.
+`v * rsqrt(m)`, while the engine SOURCE computes `PxRecipSqrt` = `1.0f/sqrtf` — two
+operations that are exactly specified in C++ — and SPIR-V's `InverseSqrt` is allowed
+2 ULP of slack.  The two agree bit for bit on llvmpipe over 258442 inputs, and that
+is now measured rather than inferred from a green suite.
+(P9.54 CORRECTS THE WORDING, NOT THE RESULT.  „two exactly specified IEEE
+operations" was false about the shipping BINARY: under `-prec-sqrt=false
+-prec-div=false -use_fast_math` nvcc lowers `1.0f/sqrtf(x)` to `rsqrt.approx.f32`.
+Against a real NVIDIA GPU the `rsqrt` spelling this rule argues against would be
+the CLOSER one.  The measurement stands and the rule stands, because the reference
+is the source under IEEE — see the premise at the top of this file.)
 P9.45 added `gpuslang.componentDivide`, the SIXTH static checker, because the
 FIFTH could not see its own defect class written one component at a time.
 `gpuslang.vectorDivide` keys on an `OpFDiv` whose RESULT TYPE is a vector, which
