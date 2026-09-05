@@ -1833,6 +1833,138 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.52b-0 — drei Upstream-Kandidaten aus dem Kapsel-Arm (47 → 50), zwei davon durch einen ZWILLING beweisbar
+
+Beim Lesen von `capsuleHeightfieldNarrowphaseCore` (convexHeightfield.cu:636-789)
+als Transkriptionsquelle. Zwei der drei sind nicht Argumente, sondern
+Gegenüberstellungen: dieselbe Engine schreibt dieselbe Stelle an anderer Stelle
+richtig.
+
+### Kandidat 48 — der `flags`-Lesezugriff ist zweifach falsch, und die zweite Hälfte rettet die erste
+
+```cpp
+const PxU32* heightfieldGeomPtr = ...(heightfieldShape.hullOrMeshPtr);
+const PxU32 rows    = *heightfieldGeomPtr++;                      // :652
+const PxU32 columns = *heightfieldGeomPtr++;                      // :653
+const PxHeightFieldSample* samples = ...(heightfieldGeomPtr);     // :654
+heightfieldGeomPtr += sizeof(PxU32) * rows * columns;             // :656
+const PxU16 flags = reinterpret_cast<PxU16&>(heightfieldGeomPtr); // :658
+```
+
+Der Blob ist (`PxgGeometryManager.cpp:701-720`) `rows@0, columns@4,
+PxHeightFieldSample[rows*columns]@8, PxU16 flags@8+4*rows*columns`.
+
+* **:656** — `heightfieldGeomPtr` ist ein `const PxU32*`, `+= n` rückt also schon
+  `4n` Byte vor. Die Multiplikation mit `sizeof(PxU32)` rückt **viermal zu weit**.
+* **:658** — `reinterpret_cast<PxU16&>(heightfieldGeomPtr)` deutet den
+  **Zeiger selbst** um, nicht das, worauf er zeigt. Der `*` fehlt. `flags` sind
+  die unteren 16 Bit einer Geräteadresse.
+
+Der zweite Defekt macht den ersten harmlos: der zu weit gerückte Zeiger wird nie
+dereferenziert, also gibt es keinen Lesezugriff außerhalb des Blobs und nichts
+stürzt ab. Deshalb ist das nie als Absturz aufgefallen.
+
+`flags` speist genau eine Entscheidung:
+`boundaryCollisions = !(flags & eNO_BOUNDARY_EDGES)`, und `eNO_BOUNDARY_EDGES` ist
+**Bit 0** (PxHeightFieldFlag.h:140). Der geprüfte Wert ist ein `PxU32*`, der nur
+je aus einer Blob-Basis und ganzen `PxU32`-Schritten entstanden ist, also ein
+Vielfaches von 4 — **Bit 0 ist immer gelöscht**. `boundaryCollisions` ist damit
+auf jeder Eingabe und jedem Gerät `true`. Und genau das sagt der öffentliche
+Header (PxHeightFieldFlag.h:136): *„This flag is ignored in contact generation with
+sphere and capsule shapes."* Zwei Kodierfehler landen per Ausrichtung auf dem
+dokumentierten Vertrag.
+
+**Folge für den Port.** Bitgenaue Transkription ist hier nicht bloß unbequem,
+sondern **unmöglich**: der gelesene Wert ist eine wirtsseitig vergebene
+Geräteadresse, für die es im Vulkan-Adressraum kein Gegenstück gibt. Es gibt kein
+„dieselben Bits". Der Port implementiert `boundaryCollisions = true` und führt
+beide Begründungen — den dokumentierten Vertrag und das Ausrichtungsargument, das
+den Code der Engine mit ihm in Deckung bringt.
+
+**Und der `else`-Zweig ist damit tot.** In `computeTriangleFlags` (:583-608) steht
+
+```cpp
+else if (boundaryCollisions) triFlags |= (1 << (a + 3));  // Randkante aktiv
+else                         triFlags |= (1 << a);        // Silhouettenkante
+```
+
+Mit `boundaryCollisions == true` wird der Silhouetten-Zweig nie erreicht, Bits 0-2
+von `triFlags` werden also nie gesetzt. `selectNormal` (capsuleTriangle.cuh:38-98)
+liest ohnehin nur die Bits 3-5. Die Silhouettenmarkierung ist damit **doppelt**
+tot, und der Port muss sie nicht raten.
+
+### Kandidat 49 — der Kugel-Arm liest die Adjazenz ungeschützt; der Kapsel-Arm DERSELBEN DATEI nicht
+
+`sphereHeightfieldNarrowphaseCore` ruft im Kanten-Schalter (:470, :484, :499)
+
+```cpp
+getTriangle(..., triAdjTriIndices.x, heightfieldShape.scale, rows, columns, samples);
+```
+
+**ohne** den Index gegen `0xFFFFFFFF` zu prüfen. Eine Kugel auf einer Randkante des
+Gitters lässt damit Dreieck 0xFFFFFFFF dekodieren: Zelle 0x7FFFFFFF, Abtastindizes
+weit hinter dem Blob.
+
+Zwanzig Zeilen weiter oben, **in derselben Datei und über dasselbe
+Adjazenz-Array**, tut `computeTriangleFlags` (:583) genau das Richtige:
+
+```cpp
+if (adjTriIndices[a] != 0xFFFFFFFF)
+```
+
+Es fehlt hier also keine Konvention — die Datei hat die Konvention, und der
+Kugel-Arm folgt ihr nicht. Das ist der Grund, warum die Abweichung des Ports
+(P9.52a überspringt den Schalter bei BOUNDARY und behält den Kontakt) keine
+Erfindung ist, sondern die Regel, die der Kapsel-Arm nebenan schon anwendet.
+
+**Gemessen.** Der Mutant `C10-boundary-guard-dropped` — also genau die
+upstream-Form — stürzt im P9.52a-Sweep 4/4 mal mit Segfault ab. Unter CUDA liefert
+derselbe Code plausiblen Müll; unter Vulkan ist der Lesezugriff undefiniert und
+fällt sofort um.
+
+### Kandidat 50 — die Kapsel-Achse bleibt im WELTRAUM, und der Zwilling beweist, was gemeint war
+
+`capsuleHeightfieldNarrowphaseCore` (:679-684):
+
+```cpp
+const PxVec3 tmp = capsuleTransformCached.transform.q.getBasisVector0() * capsuleHalfHeight;
+const PxVec3 capsuleCenterInMesh = trimeshTransformCached.transform.transformInv(capsuleTransformCached.transform.p);
+const PxVec3 capsuleDirInMesh    = trimeshTransformCached.transform.rotateInv(tmp);   // berechnet ...
+const PxVec3 p0 = capsuleCenterInMesh + tmp;                                          // ... und NICHT benutzt
+const PxVec3 p1 = capsuleCenterInMesh - tmp;
+```
+
+`capsuleCenterInMesh` ist im **Netzraum**, `tmp` im **Weltraum**. Die Segmentenden
+mischen also einen netzlokalen Punkt mit einer weltlichen Richtung, und die eigens
+dafür berechnete `capsuleDirInMesh` bleibt unbenutzt.
+
+Der Beweis, dass das nicht Absicht ist, steht im Zwilling.
+`capsuleTrimeshNarrowphaseCore` (convexMesh.cu:446-451) ist dieselbe Passage:
+
+```cpp
+const PxVec3 tmp = capsuleTransformCached.transform.q.getBasisVector0() * capsuleHalfHeight;
+const PxVec3 capsuleCenterInMesh = trimeshTransformCached.transform.transformInv(capsuleTransformCached.transform.p);
+const PxVec3 capsuleDirInMesh    = trimeshTransformCached.transform.rotateInv(tmp);
+const PxVec3 p0 = capsuleCenterInMesh + capsuleDirInMesh;
+const PxVec3 p1 = capsuleCenterInMesh - capsuleDirInMesh;
+```
+
+Die Höhenfeld-Kopie hat die Drehung verloren.
+
+**Wirkung.** Ist der Höhenfeld-Akteur unrotiert — der Normalfall für statisches
+Gelände — ist `rotateInv` die Identität und nichts fällt auf. Mit gedrehtem
+Höhenfeld zeigt die Kapselachse in der Segment-Dreieck-Distanz um genau diese
+Drehung falsch, und zwar sowohl in `sqDist` als auch in den erzeugten
+Kontaktpunkten.
+
+**Folge für den Port (P9.52b).** Anders als bei Kandidat 48 ist die Transkription
+hier möglich, also wird sie gemacht: der Port schreibt `tmp`, wie die `.cu` es
+tut, und dieser Eintrag ist der Ort, an dem steht, warum. Eine „Verbesserung"
+wäre genau der Fehler, den P9.53 eine Tranche lang zurückgenommen hat.
+
+**Damit stehen 50 Upstream-Kandidaten, dokumentiert und keiner gemeldet.**
+
+
 ## P9.57 — zwei falsche Geometrie-Typ-Zahlen auf abgebildeten Kernen, und der ZEHNTE statische Prüfer
 
 Aufgefallen beim Schreiben des P9.52a-Fixtures: `testCvxHfSetup.cpp` deklariert

@@ -134,9 +134,17 @@
 // The port therefore SKIPS the switch on a BOUNDARY adjacency, which keeps the
 // contact -- the reading upstream would have taken if the garbage happened to be
 // negative, and the one the geometry argues for: a rim edge has no neighbouring
-// face to occlude it, so there is nothing to reject.  This is a deliberate,
-// documented divergence, and it is the entry the sweep's `boundary-guard-dropped`
-// mutant exists to pin.  DOCUMENTED, NOT REPORTED, like the other 48.
+// face to occlude it, so there is nothing to reject.
+//
+// AND IT IS NOT THE PORT'S INVENTION.  Twenty lines above this core, in the SAME
+// FILE and over the SAME adjacency array, `computeTriangleFlags` (:583) writes
+// `if (adjTriIndices[a] != 0xFFFFFFFF)` -- the exact test the sphere arm omits.
+// The convention is upstream's; only this one arm does not follow it.  That is
+// UPSTREAM CANDIDATE 49, recorded in RUNTIME_STATUS with the twin as its evidence:
+// DOCUMENTED, NOT REPORTED, like the other 49.
+//
+// The sweep measures what the unguarded form costs here: `C10-boundary-guard-
+// dropped` is the upstream spelling, and it segfaults 4 times out of 4.
 //
 // ===========================================================================
 // `triAdjTriIndices.w` IS UNINITIALISED UPSTREAM
