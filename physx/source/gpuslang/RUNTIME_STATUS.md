@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **846/846** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **850/850** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.48d added `gpuslang.launchAbi`, the EIGHTH static checker and the only one
 written because its defect had already happened: a kernel mapped in the manifest
 still needs a row in the launch-ABI table, or `pushConstantSizeFor()` yields 0,
@@ -1792,6 +1792,201 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.51 — die Kette Starrkörper-gegen-Höhenfeld, und eine Asymmetrie, die kein Zwilling erklärt
+
+**Ergebnis:** Ein Würfel, der auf ein gebackenes Höhenfeld fällt, **bleibt darauf
+liegen** — bei y = 0.5001 gegen ein Ziel von 0.500, |v| = 0.0000. Vorher fiel er
+hindurch. Suite **850/850 in beiden Speichermodi** (128.68 s bzw. 127.39 s;
+847 → 850, die drei neuen Vorrichtungen), Szenen **38 ok, 0 fail, 0 missing (von
+38)** — die 38. ist `hffloor` — Manifest **399 → 402/501**.
+
+Die Kette, die die Engine für dieses Paar startet, besteht aus sechs Kernen. Drei
+waren nicht abgebildet, und P9.27/P9.40 hatten längst festgestellt, was ein nicht
+abgebildeter Kern auf einem lebenden Pfad im Release tut: nichts, und zwar lautlos.
+
+```
+convexHeightFieldMidphase      convexHFMidphase.cu:180       -> convexHfMidphaseBda    (P9.51a)
+convexHeightfieldNarrowphase   convexHeightfield.cu:271-357  -> convexHfCoreBda        (P9.51b)
+convexHeightfieldPostProcess   convexMeshPostProcess.cu:585  -> convexHfPostProcessBda (P9.51c)
+sortTriangleIndices / convexTrimeshCorrelate / convexTrimeshFinishContacts
+                                                              — geteilt, seit P8.48/P8.50b/P8.51
+```
+
+### Die Messung in beide Richtungen
+
+`hffloor` ist absichtlich `meshfloor` mit dem gebackenen Dreiecksnetz gegen ein
+gebackenes Höhenfeld getauscht und **sonst nichts geändert** — derselbe halbe-0.5-
+Würfel, derselbe Fall aus y = 5, dasselbe Ruheziel 0.5. Damit sind die beiden
+Szenen ein Vergleich und kein zweites Experiment.
+
+| Zustand | Endhöhe | \|v\| | Wächter |
+|---|---|---|---|
+| die drei Kerne abgebildet | **0.5001** | 0.0000 | — |
+| die drei Kerne wieder abgehängt | **−73.807** | 39.240 | `[pxg-unmapped]` nennt alle drei, je 8 Starts |
+
+Die zweite Zeile ist der Zustand **vor** dieser Tranche, nachgemessen und nicht
+erinnert. Das ist die P9.41-Form: die Szene scheitert an genau dem, wofür sie da
+ist, und `--strict` (`PXG_REQUIRE_MAPPED=1`) lässt sie dauerhaft scheitern, falls
+einer der drei je wieder abfällt.
+
+### Warum der Kern nichts selbst rechnet
+
+`convexHfCoreBda` hat **keine eigene Unit-Vorrichtung** — sein Trimesh-Geschwister
+auch nicht: beide sind Kompositionen aus Modulen, die einzeln geprüft wurden, und
+ihre Komposition belegt eine Szene. Das trägt nur, solange *jeder* Teil der
+Komposition eines dieser Module IST. Also liegt der einzige neue Teil — das Dreieck
+aus dem Abtastgitter und die Slot-Entscheidung — in `pxgSlangCvxHfSetup`, wo
+`cvxHfSetupBda` ihn gegen einen aus der .cu geschriebenen Host-Spiegel treibt.
+P9.15d ist die Regel dahinter: eine Vorrichtung über einer Kopie misst die Kopie.
+
+Für die geteilte Hälfte wurde `ctSetup` in `ctCommon` aufgetrennt statt kopiert —
+und die Trennung wurde **nicht mit „die Tests sind grün" belegt**, sondern am
+kompilierten Code: beide Aufrufer wuchsen um **exakt 1596 Bytes / 83 Instruktionen**,
+`cvxTriPostProcessBda` (importiert das Modul, ruft `ctSetup` aber nie) blieb
+byteidentisch, und der Zuwachs ist rein strukturell — eine nicht eingebettete
+Funktion plus ein Struct-Umweg. Kein einziger Arithmetik-Opcode bewegte sich, der
+Konstantenpool blieb bis auf die Literalzahlen gleich (35/29 hier, 78/58 im Kern),
+und die NoContraction-Menge blieb bei 236 bzw. 61.
+
+### Der Slot-Tausch, den keine echte Eingabe sehen kann
+
+`convexMesh.cu:135` tauscht die Operanden, wenn Slot 0 ein Dreiecksnetz ist.
+`convexHeightfield.cu` tut das **nicht**: es liest Slot 0 unbedingt als Konvex
+(:211, :214). `chSetup` übergibt darum `CT_NO_SWAP`.
+
+Der naheliegende Portierungsfehler ist, das Geschwister zu kopieren und den Tausch
+stehen zu lassen — und **kein realistisches Paar kann das sehen**, weil ein
+Konvex-gegen-Höhenfeld-Paar nie eine Form vom Typ `eTRIANGLEMESH` in Slot 0 trägt.
+Genau deshalb überlebt `H1-trimesh-swap-added` den P9.51a-Sweep der Mittelphase.
+
+`testCvxHfSetup` legt diese Eingabe trotzdem vor: eine Form, deren `type`
+`eTRIANGLEMESH` ist, deren Blob aber ein **gültiges Höhenfeld** ist, in Slot 0 gegen
+ein zweites gültiges Höhenfeld. Die Tauschentscheidung liest nur `type`, wird also
+exakt getroffen; und weil beide Blobs wohlgeformt sind, liefern **beide** Zweige
+lesbare, in jedem Feld verschiedene Ausgaben — statt dass ein Zweig einen Konvexrumpf
+als Abtastgitter liest und irgendetwas meldet. Eine synthetische Eingabe ist der
+ehrliche Weg, einen Zweig zu prüfen, den das Upstream nie erreicht; die Alternative
+ist, ihn ungeprüft zu lassen und das Abdeckung zu nennen.
+
+### Die Asymmetrie, die kein Zwilling erklärt — Upstream-Kandidat 47
+
+Jeder der drei Kantenarme der **Trimesh**-Nachbearbeitung endet mit
+
+```cpp
+if (triangleIndex == 0xFFFFFFFF)
+    needsProcessing = true;          // :298, :306, :314
+```
+
+Die Arme des **Höhenfeld**-Kerns tun das nicht (:506-516). Die Folge ist nicht
+kosmetisch: eine BOUNDARY-Adjazenz lässt `triangleIndex` auf 0xFFFFFFFF stehen, damit
+werden Kanten- *und* Eckzweig übersprungen, `needsProcessing` bleibt falsch — und der
+Kontakt wird **gelöscht**, wo der Netzpfad ihn behält.
+
+Ein Kantenkontakt am **Rand** eines Höhenfelds fällt also weg. Wortgetreu übernommen,
+weil alles Nachgelagerte gegen dieses Verhalten geeicht ist; sieben Fälle der
+Vorrichtung nageln es fest, und ein eigener Wächter scheitert, falls eine spätere
+Änderung sie nicht mehr erreicht. **Dokumentiert, nicht gemeldet** — wie alle 47.
+
+### Ein Verdrahtungsfehler aus P9.51a, gefunden beim Nachziehen
+
+`convexHfMidphaseBda` stand **nicht** in `PXG_NOCONTRACT_SHADERS`. Der Shader rechnet
+eine Weltschranke über Quaternionendrehungen und skalierte Basisspalten in
+Höhenfeldeinheiten um und schickt das Ergebnis dann durch `floor()`/`ceil()`, um das
+Zeilen-/Spaltenrechteck zu wählen — genau die Kette, für die der Kopf von
+`pxgSlangHeightfield` sagt, dass jeder Importeur gestempelt gehört: ein verschmolzenes
+Multiply-Add verschiebt eine Schranke um ein ULP, ein ULP verschiebt ein `floor()`,
+und damit ändert sich die emittierte Paar-**Menge**, nicht bloß ihre Arithmetik. Der
+Shader trägt jetzt **137** NoContraction-Dekorationen, die er seit P9.51a hätte haben
+müssen.
+
+Der Prüfvorgang, der das fand, war selbst zuerst falsch: `OpDecorate NoContraction`
+ist eine **drei**-Wort-Instruktion, und der Filter fragte nach vier. Er meldete darum
+überall 0 — auch für `convexTrimeshCoreBda`, das nachweislich 236 trägt. Korrigiert;
+die Aussage im Trennungs-Commit hing an der `OpDecorate`-Gesamtzahl, die richtig
+gemessen war.
+
+### Die Mutationssweeps, und was sie über die Vorrichtungen gesagt haben
+
+| Ziel | Mutanten | getötet | überlebt |
+|---|---|---|---|
+| `pxgSlangCvxHfSetup` (chSetup) | 17 | **17** | 0 |
+| `pxgSlangHeightfield` (Adjazenz + getTriangleAdj) | 23 | **22** | 1 |
+| `convexHfPostProcessBda` | 38 | **36** | 2 |
+
+**Drei Überlebende sind Beweise, keine Lücken:**
+
+* `J7-shared-second-row-guard-off-by-one` — `cell >= columns - 1` gegen
+  `cell >= columns` unterscheiden sich bei genau einem Wert, `cell == columns - 1`,
+  also Zeile 0 in der letzten Spalte. Eine Zelle ist ein Eckpunkt mit
+  `row < rows-1` **und** `col < cols-1`; `col == cols-1` erfüllt das nicht. Die
+  Mittelphase zählt zudem nur bis `maxColumn - 1 ≤ cols - 2` auf. Der Wert ist für
+  keine erreichbare Eingabe eine Zelle.
+* `B3-isActiveEdge-dropped` — eine Höhenfeld-Adjazenz ist ein schlichter
+  Dreiecksindex oder BOUNDARY. Das NONCONVEX-Bit setzt nur der **Netz**-Cooker
+  (GuCookingGrbTriangleMesh.h:141), und BOUNDARY fängt die erste Klausel des
+  Prädikats. `isActiveEdge` ist auf diesem Pfad also immer wahr. Der Zweig steht
+  trotzdem im Port: „keine Eingabe erreicht ihn" ist ein Grund, die Tatsache
+  aufzuschreiben, keiner, den Code zu löschen.
+* `C4-search-bounded-by-the-rounded-count` — jedes Wort hinter `count` ist die
+  0xFFFFFFFF-Polsterung des Radix-Sorts, und 0xFFFFFFFF ist größer-gleich jedem Ziel,
+  das die Suchen bilden können (`index | flag`, Flag in den oberen zwei Bits). Ein
+  weiterer Bereich kann also weder einen Treffer hinzufügen noch den Index verschieben,
+  den `binarySearch` zurückgibt. Dieselbe Begründung trägt schon beim
+  Trimesh-Geschwister.
+
+### Zwei eigene Fehler, gefunden weil die Sweeps zweimal liefen
+
+Die Vorrichtungen wurden mitten in der Tranche umgebaut — von einem 5×5- auf ein
+5×6-Gitter, nachdem `J1-rows-columns-swapped` und `I4-walk-cell-row-column-swapped`
+als Überlebende gemeldet worden waren: **bei gleichen Kantenlängen sind beide Mutanten
+buchstäblich wirkungslos.** Eine Vorrichtung, deren Gitter Zeilen nicht von Spalten
+unterscheiden kann, kann keinen Kern prüfen, der es muss.
+
+Der Umbau schloss vier Löcher und riss zwei neue auf: `G2-EV0-and-EV2-swapped` und
+`I1-walk-loses-the-plus-one` waren vorher tot und überlebten danach. Gefunden wurden
+sie nur, weil der Sweep **erneut** lief statt als erledigt gebucht zu werden. Beide
+sind mit gezielt gesuchten Fällen geschlossen.
+
+Beim Nachziehen fiel noch etwas Stilleres auf: `C4` ist nur deshalb eine bewiesene
+Äquivalenz, weil hinter `count` ausschließlich 0xFFFFFFFF steht. In zwei Scheiben der
+Vorrichtung stand dort aber noch der Puffer-Füllwert — und der Sweep wäre trotzdem
+grün geblieben, weil kein Fall diese Scheiben über den Kantenzweig erreicht. **Die
+Rechtfertigung eines Überlebenden muss für die ganze Vorrichtung gelten, nicht nur
+für den Teil, der sie zufällig ausübt.**
+
+Und dieselbe Klasse ein drittes Mal: `G1-handedness-is-an-or` überlebte, weil kein
+Fall Zeilen- *und* Spaltenskala negativ trug — die einzige Eingabe, auf der XOR und
+OR sich unterscheiden. `testCvxTriSetup` hatte genau dieselbe Lücke und schloss sie
+genauso (`sawNegativePairNoFlip`). Ein Zwei-Vorzeichen-Fall gehört in jede Vorrichtung
+über einer Vorzeichenparitäts-Entscheidung. Der Anker traf dabei zweimal, weil der Xor
+doppelt ausgeschrieben war; er existiert jetzt einmal (`hfWrongHanded`).
+
+### Die Decke, die kleiner ist als jede andere in dieser Kette
+
+Beide neuen Kerne erben die Versandform, die `convexTrimeshCoreBda` schon grün
+ausliefert — eine Arbeitsgruppe pro CUDA-Block statt eines Gitterschritt-Laufs, weil
+die Paarzahl ein **Geräte**wert ist (`*nbPairsGlobal`), das Gitter aber auf dem Host
+berechnet wird und der CUDA-Shim nur direkten Versand anbietet. Der verkettete
+BDA-Lesezugriff im Rumpf ist die P8.40-Gefahr, die das ausschließt.
+
+Für die Nachbearbeitung ist die Decke aber **vier Größenordnungen kleiner** als beim
+Geschwister, und das gehört ausgesprochen: die Trimesh-Variante startet mit
+`max(8192, …)` Blöcken (PxgNarrowphaseCore.cpp:2671), also mindestens 524288 Paare im
+ersten Durchlauf; diese hier mit `(numTests*8+1)/2` Blöcken zu 64 Fäden (:2971-2973),
+also 256 Fäden **pro Kontaktmanager**. Ein Kontaktmanager, dessen Würfel in einem Bild
+über mehr als 256 markierte Höhenfelddreiecke reicht, verliert den Überhang — und
+diese Paare behalten Kontakte, die die Engine gelöscht hätte: Doppelkontakte an
+geteilten Kanten, keine fehlenden. Das schließt dasselbe, was die ganze Kette braucht:
+indirekter Versand im Shim oder ein Host-Gitter aus demselben Gerätezähler.
+
+### Was als Nächstes offen daran hängt
+
+`convexHeightfieldPostProcess` startet die Engine mit **derselben Kernel-ID** auch für
+den Kugel-gegen-Höhenfeld-Pfad (PxgNarrowphaseCore.cpp:2367 neben :2975). Die
+Abbildung dieser Tranche bedient also beide. Damit fehlen der Kugel-Kette noch
+`sphereHeightfieldNarrowphase` und ihre Mittelphase — der nächstliegende Kandidat,
+und aus demselben Grund wie hier: unabgebildet heißt lautlos.
 
 ## P9.50 — der blinde Fleck hinter P9.49: ein Lesezugriff, der als Aufruf verkleidet ist, und eine Behauptung, die 55 Befunde entlastet hat
 
