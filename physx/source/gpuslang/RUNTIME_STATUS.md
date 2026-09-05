@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **850/850** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **851/851** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.48d added `gpuslang.launchAbi`, the EIGHTH static checker and the only one
 written because its defect had already happened: a kernel mapped in the manifest
 still needs a row in the launch-ABI table, or `pushConstantSizeFor()` yields 0,
@@ -1824,6 +1824,163 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.52a — der KUGEL-Arm der Kette Kugel-gegen-Höhenfeld, und warum die Manifest-Zeile trotzdem `nullptr` bleibt
+
+Die Kette Kugel-gegen-Höhenfeld besteht aus sechs Stufen. Fünf davon sind seit
+P9.51 abgebildet und grün — `CONVEX_HEIGHTFIELD_MIDPHASE` (P9.51a),
+`CONVEX_TRIMESH_SORT_TRIANGLES` (P8.48), `CONVEX_HEIGHTFIELD_POST_PROCESS`
+(P9.51c, dieselbe Kernel-Id bedient beide Pfade), `CONVEX_TRIMESH_CORRELATE`
+(P8.50b) und `CONVEX_TRIMESH_FINISHCONTACTS` (P8.51). Es fehlt genau ein Kern:
+`sphereHeightfieldNarrowphase`.
+
+Dieser Kernel hat **zwei Arme**. Er verzweigt über den Geometrietyp von Slot 0
+(`convexHeightfield.cu:886-928`): `eSPHERE` erreicht
+`sphereHeightfieldNarrowphaseCore` (:359-562), `eCAPSULE` erreicht
+`capsuleHeightfieldNarrowphaseCore` (:636-789). Diese Tranche liefert den
+KUGEL-Arm als Modul mit Sonde und Vorrichtung.
+
+**Die Manifest-Zeile bleibt `nullptr`.** Ein Kernel, der Kugeln behandelt und
+Kapseln still fallen lässt, wäre exakt der P9.27/P9.40-Defekt, den dieser Port
+eine ganze Tranche lang beseitigt hat. Unabgebildet sagt `[pxg-unmapped]`
+wenigstens die Wahrheit über den ganzen Kernel; halb abgebildet sagt nichts mehr
+etwas. Der Kapsel-Arm braucht `distanceSegmentTriangleSquared`,
+`computeTriangleFlags`, `selectNormal` und die beiden Kontaktgeneratoren aus
+`capsuleTriangle.cuh` — keiner davon existiert auf der BDA-ABI, und er trägt
+zusätzlich den unten notierten Upstream-Verdacht 48.
+
+### Was der Kugel-Arm NICHT mit dem konvexen Pfad teilt, obwohl er so aussieht
+
+1. **Die Dreiecksnormale wird im Höhenfeld-Raum normalisiert, nicht nach einer
+   Rotation.** `chSetup` schreibt `normalize(rotate(toCvxQ, denormCross))`, weil
+   `convexHeightfield.cu:136-137` das tut; dieser Kern schreibt
+   `normalize(denormCross)`, weil `:412` das tut. Es gibt hier nichts zu drehen:
+   alles passiert im lokalen Rahmen des Höhenfelds — bewegt wird der
+   KUGELMITTELPUNKT, nicht das Dreieck.
+2. **Die Transformation setzt andersherum zusammen.** `ctCommon` baut
+   konvex-relativ (`conj(q0)*q1`, `rotInv(q0, p1-p0)`); dieser Kern bildet nur
+   `sphereCenterInTriMesh = rotInv(q1, p0-p1)` (:435) — netz-relativ, und ein
+   PUNKT statt einer Transformation. `ctCommon` hier wiederzuverwenden hätte ein
+   Quaternionenprodukt berechnet, das die CUDA nie bildet. Übernommen werden
+   deshalb nur die DEKODIERER (Formlayout, Kontaktmanager-Layout, die
+   Quaternionen-Helfer) — genau die Teile, an denen ein Defekt sonst zweimal
+   repariert werden müsste.
+3. **Der Radius ist `scale.scale.X` (:428)** — während die Ausgabestufe derselben
+   Kette für dieselbe Kugel `scale.scale.Y` liest (`convexMeshOutput.cu:314`).
+   Beides ist richtig und keiner der beiden ist ein Fehler:
+   `PxgNarrowphaseCore.cpp:7508` füllt die Skala einer Kugel als
+   `PxVec3(radius)` — drei gleiche Komponenten — während eine KAPSEL
+   `(halfHeight, radius, radius)` bekommt und die Ausgabestufe sich beide teilt,
+   also `.y` lesen MUSS. Dieser Kern sieht nur Kugeln.
+4. **Das geordnete Wort hat nur den FLÄCHEN-Arm.** `cteEmitTail` schreibt
+   `faceFlag | triangleIdx`, wobei `faceFlag` auch einen eEDGE_CONTACT-Fall
+   abdeckt; dieser Kern schreibt `(nb && !delay) ? (0x80000000|tri) : tri` (:548)
+   und hat gar keinen Kanten-Arm.
+5. **`index` ist eine ADDITION, kein ODER** (:556) — die Felder sind disjunkt,
+   also stimmen beide Schreibweisen auf jeder Eingabe überein; geschrieben wird
+   sie so, wie die CUDA sie schreibt.
+
+### Die einzige bewusste Abweichung: der BOUNDARY-Schutz im Kanten-Schalter
+
+Für ein eE01/eE12/eE02-Nächstes-Merkmal holt der Schalter (:466-516) das
+NACHBAR-Dreieck und behält den Kontakt nur, wenn der gegenüberliegende Eckpunkt
+des aktuellen Dreiecks unter der Ebene des Nachbarn liegt. Die drei Arme paaren
+verschiedene Eckpunkte mit verschiedenen Adjazenz-Feldern:
+
+    eE01 -> adj.x, prüft triLocV2   (:474)
+    eE12 -> adj.y, prüft triLocV0   (:488)
+    eE02 -> adj.z, prüft triLocV1   (:503)
+
+**Upstream prüft den Index nicht gegen 0xFFFFFFFF.** Eine Kugel, die auf einer
+Kante des Gitterrands liegt, lässt den Schalter Dreieck 0xFFFFFFFF dekodieren:
+Zelle 0x7FFFFFFF, Abtastindizes weit hinter dem Ende des Blobs. Auf einer GPU mit
+groß genug abgebildetem Heap fällt nichts um; `generateContact` entscheidet dann,
+was zufällig dort im Speicher stand. Ein `buffer_reference`-Lesezugriff an dieser
+Stelle ist in Vulkan undefiniert, mit weniger Glück.
+
+Der Port ÜBERSPRINGT den Schalter deshalb bei einer BOUNDARY-Adjazenz und BEHÄLT
+damit den Kontakt — die Lesart, die Upstream genommen hätte, wenn der Müll negativ
+gewesen wäre, und die, für die die Geometrie spricht: eine Randkante hat keinen
+Nachbarn, der sie verdecken könnte. Dokumentiert, nicht gemeldet, wie die anderen
+48.
+
+### Die Vorrichtung: wie man eine Voronoi-Region trifft
+
+Jeder Zweig von `distancePointTriangleSquared` wird über `d1..d6` gewählt, und
+jedes davon ist ein Skalarprodukt mit `ab` oder `ac` — beide IN DER EBENE des
+Dreiecks. Eine Verschiebung des Kugelmittelpunkts entlang der NORMALEN kann die
+Regionswahl also nicht ändern. Jeder Fall nennt eine Region und zwei Zahlen: einen
+Seitwärtsfaktor, der einen Punkt in der Ebene zur Region hinausschiebt, und eine
+Höhe entlang der Normalen. Die Höhe allein entscheidet `dist >= 0` und wie schräg
+die Patch-Normale ausfällt, also auch die 0.996-Zurückstellung.
+
+Der Mittelpunkt wird dann als `meshP + rotate(meshQ, centreLocal)` in den
+Weltraum gelegt, damit `rotInv(meshQ, sphereP - meshP)` im Shader ihn
+reproduziert. Dieser Umweg ist NICHT bitgenau und soll es nicht sein — der
+Spiegel liest dieselbe Weltposition aus demselben Transform-Cache und rundet
+gleich. Was die Konstruktion erkauft, ist, dass ein Fall in der Region landet, die
+er behauptet.
+
+**Zwei synthetische Eingaben**, beide mit demselben Argument wie die
+Tausch-Sonde aus P9.51b: eine ANISOTROPE Kugelskala (x != y), weil drei gleiche
+Komponenten die beiden Lesarten `.x` und `.y` prinzipiell ununterscheidbar machen,
+mit zwei Fällen genau in der Lücke zwischen beiden Radien; und eine NEGATIVE
+Spaltenskala, die `PxHeightFieldGeometry::isValid` ablehnt, deren Wicklungstausch
+aber lebender Code ist.
+
+**Wo die Schreibzugriffe landen, wird mitgeprüft.** Die vier Datensatz-Felder sind
+echte Puffer in Engine-Schrittweite, mit Wächterwerten vorbelegt, und jeder Platz,
+den kein Fall beansprucht, wird hinterher nachgeprüft. Vier der fünf
+Schwanz-Schreibzugriffe sind über `pairOffset` indiziert, der fünfte über
+`pairOffsetPadded`; ein Port, der die beiden verwechselt, schreibt plausible Werte
+an die falsche Stelle, und das sieht eine reine Wertprüfung nicht.
+
+### Der Sweep: 64 Mutanten, 57 tot, sieben Äquivalenzen
+
+Erster Lauf: **53 tot, 11 Überlebende.** Vier davon waren echte Lücken der
+Vorrichtung, nicht Eigenschaften des Shaders:
+
+* der **E12-Arm hat nie „behalten" geantwortet** — jede E12-Kante in der
+  Vorrichtung hatte einen koplanaren oder konkaven Nachbarn. Weil `v2` mit dem
+  Nachbarn über E12 GETEILT wird, ist das Skalarprodukt des Mutanten bis auf
+  Rundung null und stimmt auf jedem „verwerfen" mit der echten Antwort überein.
+  Dreieck 22 von hfA ist die eine E12-Kante des Zeltdachs mit KONVEXEM Nachbarn;
+  damit stirbt `C6-eE12-tests-v2`.
+* **kein Fall hatte genau EIN Adjazenzfeld als Sentinel.** Dreieck 0 (reales
+  adj.y, BOUNDARY adj.z) tötet `C3-eE12-fetches-adj-z`, Dreieck 16 (reales adj.x,
+  BOUNDARY adj.z) tötet `C11-eE02-guard-tests-adj-x` — beide durch Absturz, weil
+  ein Nachbar-Dreieck 0xFFFFFFFF unter Vulkan nicht dekodierbar ist.
+* **kein angenommener Kontakt lag zwischen den Extremen von cosTheta.** Alle
+  zurückgestellten Fälle lagen unter 0.5, alle nicht zurückgestellten über 0.996,
+  also war die Toleranz selbst ungeprüft: `E4-cos-tolerance-half` überlebte. Ein
+  Fall mit cosTheta = 0.6824 schließt das.
+
+Für jede dieser vier Lücken trägt die Vorrichtung jetzt einen **benannten
+Wächter**, damit eine spätere Änderung der Falltabelle sie nicht stillschweigend
+wieder aufreißt — genau der Fehlermodus, an dem P9.51b/c zweimal hängengeblieben
+ist.
+
+Zweiter Lauf: **52 tot, 5 durch ABSTURZ tot, 7 Überlebende.** Die fünf Abstürze
+sind selbst ein Befund: `A3-heightfield-from-slot0`, `C1-eE01-uses-adj-y`,
+`C3-eE12-fetches-adj-z`, `C10-boundary-guard-dropped` und
+`C11-eE02-guard-tests-adj-x` dekodieren alle eine BOUNDARY-Adjazenz oder lesen den
+Nullzeiger einer Kugel als Abtastgitter — und unter Vulkan ist das ein Segfault
+statt des plausiblen Mülls, den derselbe Code in CUDA liefert. Das ist die direkte
+Messung dessen, wogegen der BOUNDARY-Schutz oben steht.
+
+**Alle sieben Überlebenden sind Äquivalenzen**, in vier Familien, jede bewiesen
+statt entschuldigt (die Herleitungen stehen im Modul-Header):
+
+| Familie | Mutanten | Warum äquivalent |
+|---|---|---|
+| exakte Arithmetik | `B4-dist-measured-from-v1`, `C8-eE01-plane-point-is-a1` | beide Differenzen liegen in der Ebene, gegen deren Normale projiziert wird; der Unterschied ist identisch null und in `float` ein ulp gegen eine Entscheidungsgröße von ~1e-2 |
+| positive Skalierung eines Vorzeichentests | `C12-adj-normal-not-normalized` | die Nachbarnormale geht nur in `dot(...) < 0`; Normalisieren ist Multiplikation mit einem positiven Skalar, und der entartete Fall bildet in beiden Schreibweisen auf den Nullvektor ab |
+| disjunkte Bitfelder | `D11-ni-index-is-or`, `E9-outmask-or-is-add` | `+` und `\|` stimmen überein, weil sich die Operanden nie überlappen; ein Paarindex, der Bit 29 erreicht, hieße 2^29 Kontaktmanager-Datensätze |
+| nachweislich tote Eingabe | `B3-adj-w-is-boundary`, `B7-generate-contact-ignored` | `.w` wird nie gelesen; und `generateContact` aus dem Primitiv ist auf einem Höhenfeld IDENTISCH wahr, weil `isEdgeNonconvex` für jeden rohen Gitterindex falsch ist und den BOUNDARY-Sentinel namentlich ausschließt |
+
+Der letzte Eintrag ist die Messung hinter der Behauptung oben, dass hier der
+SCHALTER und nicht das Primitiv über Kantenkonvexität entscheidet.
+
 
 ## P9.51 — die Kette Starrkörper-gegen-Höhenfeld, und eine Asymmetrie, die kein Zwilling erklärt
 
