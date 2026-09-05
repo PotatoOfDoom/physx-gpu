@@ -69,7 +69,11 @@ float refTri(const V3& p, const V3& a, const V3& b, const V3& c, const U4& adj,
     const V3 bp = sub(p, b); const float d3 = dot3(ab, bp), d4 = dot3(ac, bp);
     const V3 cp = sub(p, c); const float d5 = dot3(ab, cp), d6 = dot3(ac, cp);
     const float vc = d1 * d4 - d3 * d2, vb = d5 * d2 - d1 * d6, va = d3 * d6 - d5 * d4;
-    const float edgeTol = (va + vb + vc) * 1e-5f;
+    // sphereTriangle.cuh:96's literal `1e-5` carries NO SUFFIX, so the multiply
+    // happens in DOUBLE and only the assignment narrows -- see the twin note in
+    // the shader.  `double(1.0f)/double(100000.0f)` is the C++ literal bit for bit.
+    const double D1E_5 = double(1.0) / double(100000.0);
+    const float edgeTol = float(double(va + vb + vc) * D1E_5);
 
     // any Voronoi-region decision variable near its boundary -> marginal.  The
     // last three are the generateContact edge-tolerance boundaries (va/vb/vc >

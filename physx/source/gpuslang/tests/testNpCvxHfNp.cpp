@@ -222,7 +222,11 @@ static float distPointTriRef(V3 p, V3 a, V3 b, V3 c, U4 adj, V3& closestP,
     const V3 cp = sub(p, c);
     const float d5 = dot3(ab, cp), d6 = dot3(ac, cp);
     const float vc = d1 * d4 - d3 * d2, vb = d5 * d2 - d1 * d6, va = d3 * d6 - d5 * d4;
-    const float edgeTol = (va + vb + vc) * 1e-5f;
+    // sphereTriangle.cuh:96's literal `1e-5` carries NO SUFFIX, so the multiply
+    // happens in DOUBLE and only the assignment narrows -- see the twin note in
+    // the shader.  `double(1.0f)/double(100000.0f)` is the C++ literal bit for bit.
+    const double D1E_5 = double(1.0) / double(100000.0);
+    const float edgeTol = float(double(va + vb + vc) * D1E_5);
     if (d1 < 0.0f && d2 < 0.0f) { mask = eV0; gen = (!isEdgeNonconvexRef(adj.x)) || (!isEdgeNonconvexRef(adj.z)); closestP = a; return dot3(ap, ap); }
     if (d3 > 0.0f && d4 < d3)   { mask = eV1; gen = (!isEdgeNonconvexRef(adj.x)) || (!isEdgeNonconvexRef(adj.y)); closestP = b; return dot3(bp, bp); }
     if (d6 > 0.0f && d5 < d6)   { mask = eV2; gen = (!isEdgeNonconvexRef(adj.y)) || (!isEdgeNonconvexRef(adj.z)); closestP = c; return dot3(cp, cp); }

@@ -238,7 +238,25 @@ float distancePointTriangleSquared(float3 p, float3 a, float3 b, float3 c, uint4
     const float vc = d1 * d4 - d3 * d2;
     const float vb = d5 * d2 - d1 * d6;
     const float va = d3 * d6 - d5 * d4;
-    const float edgeTol = (va + vb + vc) * 1e-5f;
+    // sphereTriangle.cuh:96 is `const float edgeTol = (va + vb + vc) * 1e-5;` --
+    // the literal carries NO SUFFIX, so in C++ it is a DOUBLE.  The multiply
+    // therefore happens in DOUBLE precision and only the assignment narrows to
+    // float.  `1e-5f` computes the whole thing in float, which lands about 0.4 ULP
+    // away: float(1e-5) is 0x3727c5ac = 9.999999747e-06, the double is
+    // 0x3ee4f8b588e368f1.
+    //
+    // `double(1.0f) / double(100000.0f)` reproduces the C++ literal BIT FOR BIT
+    // (both 0x3ee4f8b588e368f1, checked): 100000 is exact in float and in double
+    // and the division is correctly rounded.  Same idiom, and the same reason, as
+    // npSbExtractRotAPD.slang:125-126.
+    //
+    // This is the ONLY site in the whole GPU CUDA corpus where an unsuffixed
+    // literal meets float arithmetic -- searched, not assumed.  Everywhere else an
+    // unsuffixed literal is assigned straight to a float and narrows immediately,
+    // which is why npSbExtractRotAPD.slang:121 can note "double literal -> same
+    // float" and move on.
+    const double D1E_5 = double(1.0f) / double(100000.0f);
+    const float edgeTol = float(double(va + vb + vc) * D1E_5);
 
     if (d1 < 0.0f && d2 < 0.0f)
     {
