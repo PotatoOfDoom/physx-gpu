@@ -7,8 +7,16 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **851/851** green in both modes (`ctest -N` in `build-gpuslang`).
-P9.48d added `gpuslang.launchAbi`, the EIGHTH static checker and the only one
+Test count: **852/852** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.57 added `gpuslang.geomTypeConstants`, the TENTH static checker and the SECOND
+written because its defect had already happened: a constant that names a
+`PxGeometryType` member must carry that member's value, read out of
+`PxGeometry.h` rather than out of memory.  `eCONVEXCORE` shifted eCONVEXMESH to 5,
+eTRIANGLEMESH to 8 and eHEIGHTFIELD to 9, and two shaders on LIVE MAPPED kernels
+were still on the old numbering — the convex-vs-mesh operand swap never fired, and
+a rigid convex mesh's softbody contact was dropped in silence.  No fixture could
+see either, because the fixtures carried the same number.
+P9.48d added `gpuslang.launchAbi`, the EIGHTH static checker and the FIRST
 written because its defect had already happened: a kernel mapped in the manifest
 still needs a row in the launch-ABI table, or `pushConstantSizeFor()` yields 0,
 the shim's exact blob check refuses every launch, and the kernel never runs —
@@ -1824,6 +1832,119 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.57 — zwei falsche Geometrie-Typ-Zahlen auf abgebildeten Kernen, und der ZEHNTE statische Prüfer
+
+Aufgefallen beim Schreiben des P9.52a-Fixtures: `testCvxHfSetup.cpp` deklariert
+`GEOM_TRIANGLEMESH = 4`, und die echte Aufzählung sagt etwas anderes.
+
+`PxGeometryType::Enum` (`include/geometry/PxGeometry.h:48-64`) ist
+
+    eSPHERE 0, ePLANE 1, eCAPSULE 2, eBOX 3, eCONVEXCORE 4, eCONVEXMESH 5,
+    ePARTICLESYSTEM 6, eTETRAHEDRONMESH 7, eTRIANGLEMESH 8, eHEIGHTFIELD 9,
+    eCUSTOM 10
+
+`eCONVEXCORE` ist ein Zugang der 5.5er-Reihe und hat **alles darüber um eins
+verschoben**. Ein Slang-Shader kann diesen Header nicht einbinden, also trägt der
+Korpus rund fünfzig handgeschriebene Kopien dieser Zahlen — und zwei davon standen
+noch auf der alten Nummerierung, **beide auf lebenden, abgebildeten Kernen**.
+
+### Defekt 1 — `pxgSlangCvxTriSetup.slang:83`, `CT_GEOM_TRIANGLEMESH = 4`
+
+4 ist `eCONVEXCORE`. Die Konstante steuert den Operandentausch in `ctCommon`:
+`convexMesh.cu:721` und `:856` tauschen genau dann, wenn Slot 0 ein
+`eTRIANGLEMESH` ist. Mit 4 tauschte der Port **nie** — ein wirklich netzzuerst
+angeliefertes Paar hätte den Blob des NETZES als konvexe Hülle gelesen — und er
+tauschte für eine `eCONVEXCORE`-Form in Slot 0, die ebenso wenig eine Hülle hat.
+Betroffen sind `convexTrimeshCoreBda` und alles, was `ctSetup` benutzt.
+
+### Defekt 2 — `softBodyContactGenBda.slang:450`, `GEOM_CONVEXMESH = 4`
+
+Der Kommentar darüber zählte die Aufzählung selbst falsch auf („eSPHERE 0,
+ePLANE 1, eCAPSULE 2, eBOX 3, eCONVEXMESH 4") — er ließ `eCONVEXCORE` aus und hat
+den Fehler damit schriftlich festgehalten. Die Folge war **beobachtbar**: die
+GJK-Verteilung am Ende der Datei (`:802`) lässt SPHERE, CAPSULE, BOX und
+CONVEXMESH durch und `continue`t auf allem, was keine PLANE ist. Ein starres
+KONVEXNETZ (Typ 5) fiel durch den Test und sein Softbody-Kontakt wurde **still
+fallen gelassen**.
+
+### Warum weder Vorrichtung noch Mutant das sehen konnte: die Vorrichtung trug DIESELBE Zahl
+
+`testCvxTriSetup.cpp` deklarierte ebenfalls `GEOM_TRIANGLEMESH = 4`, setzte eine
+Form auf diesen Typ und prüfte, dass getauscht wird. Shader und Orakel waren sich
+also exakt einig — über einen Wert, den die Engine nie erzeugt. Eine Mutation an
+einer der beiden Seiten allein fällt auf; das *Paar* ist widerspruchsfrei und
+zusammen falsch, und genau das kann ein Differential nicht sehen.
+
+Der Header von `pxgSlangCvxTriSetup` beschreibt dieses Versagensmuster **sechs
+Zeilen über dem Defekt**, für die BV32-Schrittweite: „That is the failure mode of a
+fixture that DEFINES the layout it is meant to check: mutating the constant moves
+shader and oracle together." Die Abhilfe war dort, die Zahl aus dem Engine-Header
+zu holen. Diese Tranche tut dasselbe für die Aufzählung.
+
+### Gemessen, nicht behauptet
+
+**Defekt 1.** Konstante testweise auf 4 zurückgesetzt, Shader neu übersetzt:
+`gpuslang.cvxTriSetup` meldet **22 Abweichungen** (`scale.x got=1 exp=1.29999995`,
+`v0.x got=-2.75 exp=4.75` — Hülle und Netz vertauscht). Vor dieser Tranche war
+dieselbe Vorrichtung mit demselben Shader **grün**. Der Unterschied ist
+ausschließlich, dass das Orakel jetzt aus dem Header kommt.
+
+**Defekt 2.** Shader auf 5 korrigiert, Vorrichtung noch auf 4:
+`gpuslang.softBodySim` fällt aus mit `n == 3u` (es kamen 2) und `sawConvex` falsch
+— also fehlt genau der Kontakt des konvexen Netzes. Mit beiden Seiten auf 5:
+**66/66 grün**. Das ist der direkte Nachweis, dass der Defekt live war und nicht
+bloß theoretisch.
+
+### Der Prüfer
+
+`tools/check_geom_type_constants.py`, registriert als `gpuslang.geomTypeConstants`
+— der ZEHNTE statische Prüfer und der zweite, der geschrieben wurde, weil sein
+Defekt schon passiert war (der erste war `gpuslang.launchAbi`, P9.48d).
+
+Regel: die Aufzählung wird aus `PxGeometry.h` geparst; dann wird in jedem Shader
+(`shaders/*.slang`) und jeder Vorrichtung (`tests/*.cpp`, `sdktest/*.cpp`) jede
+Konstantendefinition gesucht, deren Bezeichner eines der Wortstücke `GEOM`, `TYPE`
+oder `EGT` enthält **und** auf `_<MITGLIED>` endet — ein kurzes Unterscheidungs-
+suffix (`_H`, `_H2`) zählt mit. Der Literalwert muss dem Mitglied entsprechen.
+
+Die Wortstück-Bedingung ist es, die die Regel ehrlich hält: sie trifft
+`CT_GEOM_SPHERE`, `PXG_GEOM_BOX`, `CF_TYPE_TRIANGLEMESH` und `EGT_PLANE`, und sie
+trifft kein `MAX_SPHERE`. Wer sich Geometrietyp nennt und auf einen Typnamen
+endet, behauptet, dieser Wert zu SEIN; sonst wird nichts markiert.
+
+**Erster Lauf: 938 Dateien, 7 Treffer.** Zwei Shader (oben) und fünf
+Vorrichtungskonstanten (`testCvxHfSetup` zweimal, `testCvxTriSetup`,
+`testConvexHfMidphase`, und die im selben Zug entstandene `testSphereHfCore`).
+Nach der Erweiterung um das `_H`-Suffix ein achter: `testSoftBodySim.cpp:8287`,
+`GEOM_CONVEXMESH_H = 4u` — die Vorrichtungskopie, die Defekt 2 verdeckt hat. Ohne
+diese Erweiterung wäre ausgerechnet sie ungelesen geblieben.
+
+### Was sich sonst geändert hat
+
+Alle Vorrichtungskonstanten in `testCvxTriSetup`, `testCvxHfSetup`,
+`testConvexHfMidphase`, `testConvexTrimeshMidphase`, `testNpCvxCoreSetup`,
+`testSoftBodySim`, `testFemClothSim` und `testSphereHfCore` lauten jetzt
+`uint32_t(physx::PxGeometryType::eX)`. Damit ist auf der C++-Seite der Compiler
+das Orakel, und der Prüfer ist die entsprechende Instanz für die Slang-Seite, wo
+kein `#include` hinreicht.
+
+Nebenbei zwei `printf`-Formatfehler in `testCvxHfSetup` repariert: die
+Fehlermeldung zweier Deckungswächter enthielt ein unmaskiertes `%` (aus
+`cell % columns`), was beim Auslösen des Wächters undefiniertes Verhalten gewesen
+wäre — die Meldung erscheint nur im Fehlerfall, also hätte gerade der Ausfall
+noch einmal ausfallen können.
+
+**Kein Upstream-Verdacht.** Beide Defekte sind Port-Defekte, nicht Engine-Defekte:
+die `.cu` benutzt durchweg die echte Aufzählung.
+
+**Verifikation.** Suite **852/852** in beiden Speichermodi (`gpuslang.sphereHfCore`
+aus P9.52a und `gpuslang.geomTypeConstants` sind die beiden neuen Einträge);
+Szenen **38/38**. Beide korrigierten Konstanten sitzen auf lebenden Pfaden
+(`convexTrimeshCoreBda` über `ctSetup`, `softBodyContactGenBda`), also war der
+Szenenlauf hier keine Formalität — insbesondere `meshfloor`, `softbody`,
+`softbodystack` und `softbodycloth` laufen über genau diese beiden Stellen.
+
 
 ## P9.52a — der KUGEL-Arm der Kette Kugel-gegen-Höhenfeld, und warum die Manifest-Zeile trotzdem `nullptr` bleibt
 

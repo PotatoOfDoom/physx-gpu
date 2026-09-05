@@ -58,6 +58,8 @@
 
 #include "pxgTestFramework.h"
 
+#include "geometry/PxGeometry.h"
+
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -113,9 +115,16 @@ static V3 normalized(V3 v)
     return V3{ v.x * r, v.y * r, v.z * r };
 }
 
-static const uint32_t GEOM_TRIANGLEMESH = 4;   // PxGeometryType::eTRIANGLEMESH
-static const uint32_t GEOM_CONVEXMESH = 5;
-static const uint32_t GEOM_HEIGHTFIELD = 6;
+// P9.57: FROM THE ENGINE ENUM, never a literal.  `PxGeometryType` grew
+// eCONVEXCORE at position 4, which shifted eCONVEXMESH to 5, eTRIANGLEMESH to 8
+// and eHEIGHTFIELD to 9; three fixtures and two shaders still carried the old
+// numbers, and because a fixture and its shader carried the SAME wrong number
+// the differential could not see it.  Taking the value from the header makes
+// the compiler the oracle, exactly as this suite already does for the BV32
+// stride.  tools/check_geom_type_constants.py keeps the Slang side honest.
+static const uint32_t GEOM_TRIANGLEMESH = uint32_t(physx::PxGeometryType::eTRIANGLEMESH);
+static const uint32_t GEOM_CONVEXMESH = uint32_t(physx::PxGeometryType::eCONVEXMESH);
+static const uint32_t GEOM_HEIGHTFIELD = uint32_t(physx::PxGeometryType::eHEIGHTFIELD);
 static const uint32_t HF_BOUNDARY = 0xFFFFFFFFu;
 
 // PxgShape, 48 B
@@ -618,7 +627,7 @@ PXG_TEST(cvxHfSetupPrologue)
     PXG_CHECK_MSG(sawUnsharedDiagonal > 0, "no pair sits on an unflagged cell");
     PXG_CHECK_MSG(sawSharedOnColumnGuard > 0,
                   "no pair is a SHARED cell's first triangle in COLUMN 0 -- the shared arm's "
-                  "`cell % columns != 0` guard is then untested");
+                  "`cell %% columns != 0` guard is then untested");
     PXG_CHECK_MSG(sawSharedOnRowGuard > 0,
                   "no pair is a SHARED cell's first triangle in ROW rows-2 -- the shared arm's "
                   "`cell / columns != rows - 2` guard is then untested");

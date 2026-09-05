@@ -7414,7 +7414,7 @@ struct PxgShapeHost
     uint32_t materialIndex, hullLo, hullHi, type, particleOrSoftbodyId;
 };
 static_assert(sizeof(PxgShapeHost) == 48, "PxgShape mirror must be 48 bytes");
-static const uint32_t GEOM_TRIANGLEMESH_H = 8u;   // PxGeometryType::eTRIANGLEMESH
+static const uint32_t GEOM_TRIANGLEMESH_H = uint32_t(physx::PxGeometryType::eTRIANGLEMESH);   // PxGeometryType::eTRIANGLEMESH
 
 static const uint32_t VALID_H = 1u << 31;         // markValidity(true)
 
@@ -10296,7 +10296,7 @@ PXG_TEST(femClothSimHeightfieldMidphase)
 
     // ---- the pair.  HEIGHTFIELD is shapeRef0 and CLOTH shapeRef1 -- the SWAPPED order,
     // so LoadShapePair has to route by TYPE.
-    const uint32_t GEOM_HEIGHTFIELD_H = 9u;
+    const uint32_t GEOM_HEIGHTFIELD_H = uint32_t(physx::PxGeometryType::eHEIGHTFIELD);
     std::vector<PxgShapeHost> shapes(2);
     std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
     shapes[0].type = GEOM_HEIGHTFIELD_H;  shapes[0].particleOrSoftbodyId = 0xFFFFFFFFu;
@@ -10798,7 +10798,7 @@ PXG_TEST(femClothSimHeightfieldContactGen)
 
     // ---- shapes.  HF run: cloth is shapeRef0 (positional, C1).  Mesh run: SWAPPED,
     // because that kernel routes by body id and the existing fixture proves it.
-    const uint32_t GEOM_HEIGHTFIELD_H = 9u;
+    const uint32_t GEOM_HEIGHTFIELD_H = uint32_t(physx::PxGeometryType::eHEIGHTFIELD);
     std::vector<PxgShapeHost> hfShapes(2), meshShapes(2);
     std::memset(hfShapes.data(), 0, hfShapes.size() * sizeof(PxgShapeHost));
     std::memset(meshShapes.data(), 0, meshShapes.size() * sizeof(PxgShapeHost));
@@ -11187,8 +11187,8 @@ static_assert(offsetof(ClothSphereTriPush, stackSizeNeededOnDevice) == 96, "stac
 static_assert(offsetof(ClothSphereTriPush, wPoint) == 112, "the writer starts @112");
 static_assert(offsetof(ClothSphereTriPush, wMaxContacts) == 184, "maxNumContacts @184");
 
-static const uint32_t GEOM_SPHERE_H = 0u;    // PxGeometryType::eSPHERE
-static const uint32_t GEOM_CAPSULE_H = 2u;   // PxGeometryType::eCAPSULE
+static const uint32_t GEOM_SPHERE_H = uint32_t(physx::PxGeometryType::eSPHERE);    // PxGeometryType::eSPHERE
+static const uint32_t GEOM_CAPSULE_H = uint32_t(physx::PxGeometryType::eCAPSULE);   // PxGeometryType::eCAPSULE
 
 // ---- the host mirror -------------------------------------------------------
 // PxQuat::getBasisVector0.
@@ -11962,7 +11962,7 @@ static_assert(offsetof(ClothPsCgPush, stackSizeNeeded) == 88, "stackSizeNeeded @
 static_assert(offsetof(ClothPsCgPush, wPoint) == 96, "the writer starts @96 -- paramAlign(80) is 16");
 static_assert(offsetof(ClothPsCgPush, wMaxContacts) == 168, "maxNumContacts @168");
 
-static const uint32_t GEOM_PARTICLESYSTEM_H = 6u;   // PxGeometryType::ePARTICLESYSTEM
+static const uint32_t GEOM_PARTICLESYSTEM_H = uint32_t(physx::PxGeometryType::ePARTICLESYSTEM);   // PxGeometryType::ePARTICLESYSTEM
 
 // ---- the contact gen's host mirror ----------------------------------------
 // Gu::closestPtPointTriangle2 (GuDistancePointTriangle.h:44), the ab/ac form.

@@ -2550,3 +2550,32 @@ add_test(NAME gpuslang.launchAbi
 # failed the first.
 add_test(NAME gpuslang.helperUniformity
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_helper_uniformity.py)
+
+# ---------------------------------------------------------------------------
+# A constant that names a PxGeometryType member must carry that member's value
+# (P9.57).  The TENTH static checker, and the second written because the defect
+# had already happened.
+#
+# `PxGeometryType` grew eCONVEXCORE at position 4, which shifted eCONVEXMESH to 5,
+# eTRIANGLEMESH to 8 and eHEIGHTFIELD to 9.  A Slang shader cannot include the
+# header, so the corpus carries fifty-odd hand-written copies of those numbers --
+# and two of them were still on the old numbering, both on LIVE MAPPED kernels:
+#
+#   pxgSlangCvxTriSetup  CT_GEOM_TRIANGLEMESH = 4   -> the convex-vs-mesh operand
+#                                                      swap never fired, so a
+#                                                      mesh-first pair would have
+#                                                      read the MESH blob as a hull
+#   softBodyContactGen   GEOM_CONVEXMESH      = 4   -> a rigid convex mesh failed
+#                                                      the GJK dispatch and its
+#                                                      softbody contact was dropped
+#                                                      in silence
+#
+# No fixture could see either, because THE FIXTURES CARRIED THE SAME NUMBER:
+# testCvxTriSetup declared `GEOM_TRIANGLEMESH = 4`, set a shape's type to it and
+# asserted the swap, so shader and oracle agreed exactly on a value the engine
+# never produces.  That is the failure mode pxgSlangCvxTriSetup's own header
+# describes for the BV32 stride, six lines above the defect.  The fixtures now take
+# the values from `PxGeometry.h`, so the compiler is the oracle on the C++ side;
+# this rule is the same oracle for the Slang side, where no include can reach.
+add_test(NAME gpuslang.geomTypeConstants
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_geom_type_constants.py)

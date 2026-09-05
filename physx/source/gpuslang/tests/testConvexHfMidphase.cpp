@@ -51,6 +51,8 @@
 
 #include "pxgTestFramework.h"
 
+#include "geometry/PxGeometry.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -102,7 +104,15 @@ static_assert(sizeof(ShapeHost) == 48, "PxgShape is 48 bytes");
 
 struct CmInputHost { uint32_t shapeRef0, shapeRef1, transformCacheRef0, transformCacheRef1; };
 
-static const uint32_t GEOM_SPHERE = 0u, GEOM_BOX = 3u, GEOM_HEIGHTFIELD = 6u;
+// P9.57: FROM THE ENGINE ENUM, never a literal.  `PxGeometryType` grew
+// eCONVEXCORE at position 4, which shifted eCONVEXMESH to 5, eTRIANGLEMESH to 8
+// and eHEIGHTFIELD to 9; three fixtures and two shaders still carried the old
+// numbers, and because a fixture and its shader carried the SAME wrong number
+// the differential could not see it.  Taking the value from the header makes
+// the compiler the oracle, exactly as this suite already does for the BV32
+// stride.  tools/check_geom_type_constants.py keeps the Slang side honest.
+static const uint32_t GEOM_SPHERE = uint32_t(physx::PxGeometryType::eSPHERE), GEOM_BOX = uint32_t(physx::PxGeometryType::eBOX),
+                      GEOM_HEIGHTFIELD = uint32_t(physx::PxGeometryType::eHEIGHTFIELD);
 static const uint32_t HF_HOLE = 127u;
 static const int CONVEX_TRIMESH_CACHED = -1;
 

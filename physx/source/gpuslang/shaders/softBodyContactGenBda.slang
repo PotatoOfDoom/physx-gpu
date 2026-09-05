@@ -441,13 +441,22 @@ void sb_midphaseGeneratePairsLaunch(uint3 gtid : SV_GroupThreadID, uint3 gid : S
 // PxgNarrowphaseCore.cpp:4300 — the engine hard-codes this grid for SB_PRIMITIVES_CG.
 static const uint SB_CG_GRID = 512u;
 
-// PxGeometryType::ePLANE (PxGeometry.h:51).
+// PxGeometryType (PxGeometry.h:48-64): eSPHERE 0, ePLANE 1, eCAPSULE 2, eBOX 3,
+// eCONVEXCORE 4, eCONVEXMESH 5, ePARTICLESYSTEM 6, eTETRAHEDRONMESH 7,
+// eTRIANGLEMESH 8, eHEIGHTFIELD 9.
+//
+// P9.57: eCONVEXMESH said 4, which is eCONVEXCORE -- the enumeration written out
+// above it omitted eCONVEXCORE and so shifted everything above eBOX down by one.
+// The consequence was live: the GJK dispatch at the bottom of this file admits
+// SPHERE, CAPSULE, BOX and CONVEXMESH and `continue`s on everything that is not a
+// PLANE, so a rigid CONVEX MESH (type 5) failed the test and its softbody contact
+// was dropped IN SILENCE, while an eCONVEXCORE shape was routed into the hull
+// path and would have read a blob it does not have.
 static const uint GEOM_PLANE = 1u;
-// PxGeometryType (PxGeometry.h:57): eSPHERE 0, ePLANE 1, eCAPSULE 2, eBOX 3, eCONVEXMESH 4.
 static const uint GEOM_SPHERE = 0u;
 static const uint GEOM_CAPSULE = 2u;
 static const uint GEOM_BOX = 3u;
-static const uint GEOM_CONVEXMESH = 4u;
+static const uint GEOM_CONVEXMESH = 5u;
 
 // PxgRigidFilterPair (PxgSimulationCoreDesc.h, 32 B): index0 u64 @0, index1 u64 @8,
 // index2 u32 @16, tail padding.

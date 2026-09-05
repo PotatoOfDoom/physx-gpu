@@ -36,6 +36,8 @@
 
 #include "pxgTestFramework.h"
 
+#include "geometry/PxGeometry.h"
+
 // The BV32 node stride is taken from the ENGINE HEADER, never typed by hand.  It
 // was typed by hand once (160) and the shader carried the same wrong number, so
 // the fixture and the shader agreed with each other and disagreed with the
@@ -106,8 +108,15 @@ static const uint32_t BV32_STRIDE = uint32_t(sizeof(physx::Gu::BV32DataPacked));
 static_assert(sizeof(physx::Gu::BV32DataPacked) == 1168,
               "BV32DataPacked changed size; the cooked-mesh walk in "
               "pxgSlangCvxTriSetup.slang carries this number too");
-static const uint32_t GEOM_TRIANGLEMESH = 4;
-static const uint32_t GEOM_CONVEXMESH = 5;
+// P9.57: FROM THE ENGINE ENUM, never a literal.  `PxGeometryType` grew
+// eCONVEXCORE at position 4, which shifted eCONVEXMESH to 5, eTRIANGLEMESH to 8
+// and eHEIGHTFIELD to 9; three fixtures and two shaders still carried the old
+// numbers, and because a fixture and its shader carried the SAME wrong number
+// the differential could not see it.  Taking the value from the header makes
+// the compiler the oracle, exactly as this suite already does for the BV32
+// stride.  tools/check_geom_type_constants.py keeps the Slang side honest.
+static const uint32_t GEOM_TRIANGLEMESH = uint32_t(physx::PxGeometryType::eTRIANGLEMESH);
+static const uint32_t GEOM_CONVEXMESH = uint32_t(physx::PxGeometryType::eCONVEXMESH);
 
 // PxgShape, 48 B
 struct GpuShape

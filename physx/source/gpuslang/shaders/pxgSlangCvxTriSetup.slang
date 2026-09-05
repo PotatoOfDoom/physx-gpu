@@ -80,7 +80,18 @@ static const uint CT_WARP = 32u;
 // the engine struct itself changes.
 static const uint CT_BV32_STRIDE = 1168u;
 
-public static const uint CT_GEOM_TRIANGLEMESH = 4u;   // PxGeometryType::eTRIANGLEMESH
+// P9.57: this said 4, which is eCONVEXCORE.  PxGeometryType (PxGeometry.h:48-64)
+// is eSPHERE 0, ePLANE 1, eCAPSULE 2, eBOX 3, eCONVEXCORE 4, eCONVEXMESH 5,
+// ePARTICLESYSTEM 6, eTETRAHEDRONMESH 7, eTRIANGLEMESH 8, eHEIGHTFIELD 9 -- and
+// eCONVEXCORE is a 5.5-era addition that shifted every member above it by one.
+// With 4 the swap below NEVER fired for a genuinely mesh-first pair, so the
+// MESH shape's blob would have been read as a convex hull; and it fired for an
+// eCONVEXCORE shape in slot 0, which has no such blob either.  The fixture
+// carried the same 4, which is why nothing saw it -- see the note six lines up
+// about the BV32 stride, which is the identical failure mode.  The tenth static
+// checker (tools/check_geom_type_constants.py) now reads this value against the
+// engine header, for this constant and the fifty-odd others like it.
+public static const uint CT_GEOM_TRIANGLEMESH = 8u;   // PxGeometryType::eTRIANGLEMESH
 
 // P9.51b.  ctCommon takes the geometry type that, IN SLOT 0, means "the operands
 // arrived the other way round -- swap them".  The trimesh path passes

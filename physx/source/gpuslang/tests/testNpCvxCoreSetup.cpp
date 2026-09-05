@@ -37,6 +37,8 @@
 
 #include "pxgTestFramework.h"
 
+#include "geometry/PxGeometry.h"
+
 #include <cstdint>
 #include <cstring>
 #include <random>
@@ -70,8 +72,17 @@ struct CssOut
     CvxModel c0, c1;
 };
 
-const uint32_t GEOM_SPHERE = 0, GEOM_PLANE = 1, GEOM_CAPSULE = 2, GEOM_BOX = 3,
-               GEOM_CONVEXCORE = 4, GEOM_CONVEXMESH = 5;
+// P9.57: FROM THE ENGINE ENUM, never a literal.  `PxGeometryType` grew
+// eCONVEXCORE at position 4, which shifted eCONVEXMESH to 5, eTRIANGLEMESH to 8
+// and eHEIGHTFIELD to 9; three fixtures and two shaders still carried the old
+// numbers, and because a fixture and its shader carried the SAME wrong number
+// the differential could not see it.  Taking the value from the header makes
+// the compiler the oracle, exactly as this suite already does for the BV32
+// stride.  tools/check_geom_type_constants.py keeps the Slang side honest.
+const uint32_t GEOM_SPHERE = uint32_t(physx::PxGeometryType::eSPHERE), GEOM_PLANE = uint32_t(physx::PxGeometryType::ePLANE),
+               GEOM_CAPSULE = uint32_t(physx::PxGeometryType::eCAPSULE), GEOM_BOX = uint32_t(physx::PxGeometryType::eBOX),
+               GEOM_CONVEXCORE = uint32_t(physx::PxGeometryType::eCONVEXCORE),
+               GEOM_CONVEXMESH = uint32_t(physx::PxGeometryType::eCONVEXMESH);
 const uint32_t CORE_POINT = 0, CORE_SEGMENT = 1, CORE_BOX = 2, CORE_POINTS = 6;
 
 static uint32_t f2u(float f) { uint32_t u; std::memcpy(&u, &f, 4); return u; }

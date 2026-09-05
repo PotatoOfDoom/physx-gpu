@@ -41,6 +41,13 @@
 
 #include "pxgTestFramework.h"
 
+// P9.57: FROM THE ENGINE ENUM, never a literal -- `PxGeometryType` grew
+// eCONVEXCORE at position 4 and shifted everything above eBOX by one.  The copy
+// this replaces said eCONVEXMESH was 4, the shader said the same, and the pair
+// agreed on a value the engine never produces: the softbody-vs-convex-mesh
+// contact was dropped in silence and both sides called it correct.
+#include "geometry/PxGeometry.h"
+
 // no-CUDA-toolkit stand-in for the __device__/__align__ qualifiers the engine
 // descriptor header decorates its inline members with; must precede PxgSoftBody.h.
 #include "host_defines.h"
@@ -2215,7 +2222,7 @@ struct PxgShapeHost
     uint32_t materialIndex; uint32_t hullLo, hullHi; uint32_t type, particleOrSoftbodyId;
 };
 static_assert(sizeof(PxgShapeHost) == 48, "PxgShape mirror must be 48 bytes");
-static const uint32_t GEOM_TETRAHEDRONMESH_H = 7u;   // PxGeometryType::eTETRAHEDRONMESH
+static const uint32_t GEOM_TETRAHEDRONMESH_H = uint32_t(physx::PxGeometryType::eTETRAHEDRONMESH);   // PxGeometryType::eTETRAHEDRONMESH
 
 // ===========================================================================
 // P9.39a -- sb_psMidphaseGeneratePairsLaunch, the softbody-vs-PARTICLE midphase.
@@ -2249,7 +2256,7 @@ static_assert(offsetof(SbPsMidphasePush, stackSizeBytes) == 64, "stackSizeBytes 
 static_assert(offsetof(SbPsMidphasePush, stackPtr) == 72, "stackPtr @72");
 static_assert(offsetof(SbPsMidphasePush, midphasePairsNum) == 80, "midphasePairsNum @80");
 
-static const uint32_t GEOM_PARTICLESYSTEM_H2 = 6u;   // PxGeometryType::ePARTICLESYSTEM
+static const uint32_t GEOM_PARTICLESYSTEM_H2 = uint32_t(physx::PxGeometryType::ePARTICLESYSTEM);   // PxGeometryType::ePARTICLESYSTEM
 
 PXG_TEST(softBodySimPsMidphase)
 {
@@ -7963,7 +7970,8 @@ PXG_TEST(softBodySimPrimitiveContactGenGjk)
     DevBuf bDesc = makeDev(dev, descArr);
 
     // shape 0 = the tet mesh; shapes 1..3 = the rigids.
-    const uint32_t GEOM_SPHERE_H = 0u, GEOM_CAPSULE_H = 2u;
+    const uint32_t GEOM_SPHERE_H = uint32_t(physx::PxGeometryType::eSPHERE),
+                   GEOM_CAPSULE_H = uint32_t(physx::PxGeometryType::eCAPSULE);
     std::vector<PxgShapeHost> shapes(4);
     std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
     shapes[0].type = GEOM_TETRAHEDRONMESH_H; shapes[0].particleOrSoftbodyId = 0u;
@@ -8284,7 +8292,8 @@ PXG_TEST(softBodySimPrimitiveContactGenHull)
     DevBuf bBlobBox = makeDev(dev, blobBox);
 
     // ---- the four rigids -----------------------------------------------------
-    const uint32_t GEOM_BOX_H = 3u, GEOM_CONVEXMESH_H = 4u;
+    const uint32_t GEOM_BOX_H = uint32_t(physx::PxGeometryType::eBOX),
+                   GEOM_CONVEXMESH_H = uint32_t(physx::PxGeometryType::eCONVEXMESH);
     const HQ4 identQ = { 0.0f, 0.0f, 0.0f, 1.0f };
     const HQ4 rigidQ0 = qnorm(0.13f, 0.27f, 0.19f, 0.94f);  // generic: one vertex wins
     const HQ4 meshRot2 = qnorm(0.8f, 0.5f, 0.1f, 0.9f);     // generic mesh-scale rotation
@@ -8712,7 +8721,7 @@ PXG_TEST(softBodySimClothMidphase)
 
     // ---- the pair.  The CLOTH is shapeRef0 and the SOFTBODY shapeRef1, i.e. the SWAPPED
     // order, so LoadShapePairWarp has to find the tet mesh by TYPE rather than by position.
-    const uint32_t GEOM_TRIANGLEMESH_H = 8u;
+    const uint32_t GEOM_TRIANGLEMESH_H = uint32_t(physx::PxGeometryType::eTRIANGLEMESH);
     std::vector<PxgShapeHost> shapes(2);
     std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
     shapes[0].type = GEOM_TRIANGLEMESH_H;      shapes[0].particleOrSoftbodyId = 0u; shapes[0].srw = 1.0f;
@@ -8962,7 +8971,7 @@ PXG_TEST(softBodySimClothContactGen)
     DevBuf bDesc = makeDev(dev, descArr);
 
     // Cloth first again, so the pair is found by TYPE.
-    const uint32_t GEOM_TRIANGLEMESH_H = 8u;
+    const uint32_t GEOM_TRIANGLEMESH_H = uint32_t(physx::PxGeometryType::eTRIANGLEMESH);
     std::vector<PxgShapeHost> shapes(2);
     std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
     shapes[0].type = GEOM_TRIANGLEMESH_H;    shapes[0].particleOrSoftbodyId = 0u; shapes[0].srw = 1.0f;
@@ -9277,7 +9286,7 @@ PXG_TEST(softBodySimClothVertMidphase)
     DevBuf bCloth = makeDev(dev, clothArr);
 
     // Cloth first, so the pair is resolved by TYPE.
-    const uint32_t GEOM_TRIANGLEMESH_H = 8u;
+    const uint32_t GEOM_TRIANGLEMESH_H = uint32_t(physx::PxGeometryType::eTRIANGLEMESH);
     std::vector<PxgShapeHost> shapes(2);
     std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
     shapes[0].type = GEOM_TRIANGLEMESH_H;    shapes[0].particleOrSoftbodyId = 0u; shapes[0].srw = 1.0f;
@@ -9573,7 +9582,7 @@ PXG_TEST(softBodySimClothVertContactGen)
     std::vector<PxgFEMCloth> clothArr = { cloth };
     DevBuf bCloth = makeDev(dev, clothArr);
 
-    const uint32_t GEOM_TRIANGLEMESH_H = 8u;
+    const uint32_t GEOM_TRIANGLEMESH_H = uint32_t(physx::PxGeometryType::eTRIANGLEMESH);
     std::vector<PxgShapeHost> shapes(2);
     std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
     shapes[0].type = GEOM_TRIANGLEMESH_H;    shapes[0].particleOrSoftbodyId = 0u; shapes[0].srw = 1.0f;
@@ -10997,7 +11006,7 @@ PXG_TEST(softBodySimMeshMidphase)
 
     // ---- the pair.  The TRIMESH is shapeRef0 and the SOFTBODY shapeRef1, i.e. the SWAPPED
     // order, so LoadShapePairWarp has to find the tet mesh by TYPE rather than by position.
-    const uint32_t GEOM_TRIANGLEMESH_H = 8u;
+    const uint32_t GEOM_TRIANGLEMESH_H = uint32_t(physx::PxGeometryType::eTRIANGLEMESH);
     std::vector<PxgShapeHost> shapes(2);
     std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
     shapes[0].type = GEOM_TRIANGLEMESH_H;    shapes[0].particleOrSoftbodyId = 0xFFFFFFFFu;
@@ -11262,7 +11271,7 @@ PXG_TEST(softBodySimMeshContactGen)
     // ---- the pair.  TRIMESH is shapeRef0 and SOFTBODY shapeRef1, i.e. SWAPPED, so the shape
     // load has to find the tet mesh by TYPE.  materialIndex carries bit 31 so the
     // `& 0x7fffffff` fold in the writer is observable.
-    const uint32_t GEOM_TRIANGLEMESH_H = 8u;
+    const uint32_t GEOM_TRIANGLEMESH_H = uint32_t(physx::PxGeometryType::eTRIANGLEMESH);
     const uint32_t TRI_MATERIAL = 0x8000002Au;    // -> 0x2A = 42 after the fold
     std::vector<PxgShapeHost> shapes(2);
     std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
@@ -11633,7 +11642,7 @@ PXG_TEST(softBodySimHeightfieldMidphase)
     DevBuf bDesc = makeDev(dev, descArr);
 
     // ---- the pair.  HEIGHTFIELD is shapeRef0, SOFTBODY shapeRef1 -- the SWAPPED order.
-    const uint32_t GEOM_HEIGHTFIELD_H = 9u;
+    const uint32_t GEOM_HEIGHTFIELD_H = uint32_t(physx::PxGeometryType::eHEIGHTFIELD);
     std::vector<PxgShapeHost> shapes(2);
     std::memset(shapes.data(), 0, shapes.size() * sizeof(PxgShapeHost));
     shapes[0].type = GEOM_HEIGHTFIELD_H;     shapes[0].particleOrSoftbodyId = 0xFFFFFFFFu;
