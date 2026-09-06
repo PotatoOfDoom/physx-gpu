@@ -7,7 +7,13 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **855/855** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **856/856** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.52b-4 added `gpuslang.capsuleHfCore` and the 53rd upstream candidate: the
+"edge normal" of the capsule-vs-heightfield deferred arm is the NORMALIZED
+ROUNDING RESIDUE of two spellings of one point, because the arm runs only when
+`sqDist == 0` and every path that returns exactly zero makes
+`pointOnSegment` and `pointOnTriangle` the same point.  Measured, not derived:
+the fixture prints the patch normal of every case.
 P9.57 added `gpuslang.geomTypeConstants`, the TENTH static checker and the SECOND
 written because its defect had already happened: a constant that names a
 `PxGeometryType` member must carry that member's value, read out of
@@ -1832,6 +1838,186 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.52b-4 — der Kapsel-Kern; ein zweiter toter Kanal, eine Normale aus reinem Rundungsrest, und zehn Überlebende, die alle dasselbe sagten
+
+`capsuleHeightfieldNarrowphaseCore` (convexHeightfield.cu:636-789) als Modul
+`pxgSlangCapsuleHfCore`, Sonde `capsuleHfCoreBda`, Vorrichtung `gpuslang.capsuleHfCore`
+mit 22 Fällen. Der Kern fügt den vier in P9.52b-0..3 einzeln verifizierten Bausteinen
+nur den Prolog, die Wahl der Patch-Normale und den Datensatz-Schwanz hinzu — und in
+genau diesen drei Dingen steckt alles, was hier zu berichten ist.
+
+### Kandidat 50 wird transkribiert, und der Sweep beweist, dass das gemessen ist
+
+`tmp = capsuleTransformCached.transform.q.getBasisVector0() * capsuleHalfHeight` steht
+im **Weltraum**, wird aber auf `capsuleCenterInMesh` addiert, das im
+**Heightfield-Raum** steht; der eigens dafür gerechnete `capsuleDirInMesh` wird
+verworfen (:682-684). Der Trimesh-Zwilling (convexMesh.cu:446-451) baut p0/p1 aus
+genau diesem verworfenen Vektor — die Absicht ist also belegt, nicht vermutet.
+
+Der Port schreibt `tmp`. Dass das eine **Messung** und keine Behauptung ist, zeigt der
+Mutant `cand50-repaired`, der `ctQuatRotateInv(meshQ, ...)` einsetzt — also den Defekt
+repariert — und **getötet wird**. Möglich ist das nur, weil Fälle einen *rotierten*
+Heightfield-Actor fahren; bei achsenparalleler Terrain ist `rotateInv` die Identität
+und die Transkription wäre zufällig richtig gewesen. `capsuleDirInMesh` wird im Port
+gar nicht erst berechnet: einen toten Store zu transkribieren lädt einen späteren
+Leser nur ein, ihn anzuschließen.
+
+### Kandidat 52 — der zweite tote Kanal desselben Kernels
+
+Die beiden Arme von `sphereHeightfieldNarrowphase` behandeln `deferred` verschieden.
+Der Kugel-Arm macht daraus **drei** Dinge: einen Eintrag in der Zweitpass-Warteschlange
+(`outMask`), Bit 31 des ordered-Worts und Bit 31 des NI-`index` (:556). Der Kapsel-Arm
+hat **überhaupt keinen `outMask`-Ausgabeparameter** und schreibt den NI-Index **ohne**
+Maske (:786). Nur das ordered-Wort trägt hier `deferred`.
+
+Der NI-Unterschied ist **ausgabeäquivalent, und das ist belegt statt gehofft**: ein
+grep über die ganze Engine findet `ConvexTriNormalAndIndex::isDeferred`
+(convexNpCommon.h:100) als **definiert und nirgends aufgerufen** — vier Stellen setzen
+das Bit (convexMesh.cu:387 und :609, convexTriangle.cuh:1876, convexHeightfield.cu:551),
+keine liest es, und `getNbContacts` maskiert es vor dem Schieben ohnehin weg. Der
+Kugel-Arm schreibt also ins Leere; dass der Kapsel-Arm es unterlässt, kostet nichts.
+
+Die **Zweitpass-Warteschlange** ist eine andere Sache — dieser Kanal ist für Kugeln
+lebendig und für Kapseln abwesend —, aber das ist die Konstruktion des Aufrufers, wie
+sie dasteht, und der Port bildet sie ab. Beides ist dokumentiert; gemeldet wird nichts.
+
+### Kandidat 53 — die „Kantennormale" ist der normierte Rundungsrest zweier Schreibweisen desselben Punktes
+
+Der dritte Arm der Patch-Normal-Wahl ist der einzige, der `deferred` setzt, und der
+einzige, der eine andere Normale liefert als `triNormal`. Er rechnet
+
+    pointOnSegment  = p0 + pq * t
+    pointOnTriangle = v0*(1-(u+v)) + v1*u + v2*v
+    patchNormal     = (pointOnSegment - pointOnTriangle).getNormalized()
+
+Er läuft **nur**, wenn `sqDist == 0.0f`. Und `distanceSegmentTriangleSquared` gibt
+exakt null auf genau drei Wegen zurück, die alle dasselbe bedeuten:
+
+* über den Durchstoßpfad (capsuleTriangle.cuh:196-205) — `t` ist der Durchstoßparameter
+  und `(u,v)` die Baryzentren **desselben** Durchstoßpunkts;
+* über `con0 && con1` mit `sqDist3 == 0`, was `dist3 == 0` verlangt, also p0 exakt in
+  der Ebene, dessen Projektion es selbst ist;
+* über `sqDistPE == 0`, also ein Segment, das eine Kante exakt berührt.
+
+In allen drei Fällen sind `pointOnSegment` und `pointOnTriangle` **derselbe Punkt,
+zweimal verschieden geschrieben**. Die Differenz ist also identisch null in exakter
+Arithmetik, und was normiert wird, ist ausschließlich der Rundungsrest.
+
+Das ist keine Ableitung am Schreibtisch, sondern gemessen. Die Vorrichtung gibt die
+Patch-Normale jedes Falls aus; die fünf deferred-Fälle liefern
+`(-1, 0, 0)`, `(0, 0, -1)`, `(0, -1, 0)`, `(0.9884, -0.1521, 0)` und — wo die Differenz
+bitgenau der Nullvektor ist — `(0, 0, 0)`, was `getNormalized()` auf null abbildet.
+Die ersten drei stehen **senkrecht** auf `triNormal`, womit `ideom = planeNormal·normal`
+null wird, `ipt` auf `PX_MAX_F32` fällt und `generateContacts` **nichts** emittiert:
+die zwei Kontakte dieser Fälle kommen sämtlich aus dem Kantengenerator.
+
+Genau das hat im ersten Sweep `gen-normals-swap` — die beiden Normalen-Argumente von
+`generateContacts` vertauscht — überleben lassen: in zwölf von vierzehn Fällen ist
+`patchNormal == triNormal` und der Tausch folgenlos, und in den zwei restlichen war
+`ideom` null, sodass der Generator ohnehin schwieg. Getötet wird der Mutant erst von
+einem deferred-Fall, dessen Rest zufällig **nicht** senkrecht steht (Fall 15:
+`pN·N = 0.74`). Dass so ein Fall existiert, ist Glück; dass er reproduzierbar ist, ist
+Konstruktion.
+
+Gemeldet wird auch das nicht. Aber der Kommentar `//edge normal` neben dieser Stelle
+beschreibt etwas, das der Code nicht tut — die dritte solche Fehlbeschriftung in
+dieser Dateifamilie nach den `bdenom`- und `FSel`-Kommentaren aus P9.52b-2 und -3.
+
+### Die Vorrichtung löst ihre Platzierungen rückwärts
+
+Erste Fassung: zwölf handgesetzte Welt-Transformationen. **Acht davon betraten den
+Rumpf nie.** Bei einem gerippten Heightfield durch einen rotierten Actor landet eine
+von Hand gewählte Kapselpose fast immer irgendwo, nur nicht am Dreieck.
+
+Jetzt benennt jeder Fall einen Punkt auf **seinem** Zieldreieck in Baryzentren plus
+eine Achsenrichtung, und die Kapsel-Transformation wird daraus gelöst. Der Hebel ist
+derselbe wie in P9.52a: eine Verschiebung entlang der Normale kann die Baryzentren
+nicht ändern, also entscheidet `h` allein über `dist` und `(bu, bv)` allein darüber,
+was `selectNormal` gefragt wird. Zwei Fallen, die der eingebaute Wächter selbst gefunden
+hat:
+
+* Der kürzeste Bogen von `+x` nach `dir` hat **exakt** `q.x == 0`, was den Term
+  `q.x*x2` in zwei der drei Komponenten von `getBasisVector0` auslöscht — ein Mutant
+  auf einem der beiden hätte überlebt. Daher ein Twist um die **eigene** Achse, der
+  `basisVector0` unberührt lässt und `q.x` von null wegholt.
+* Heightfield-Kanten laufen achsenparallel und treffen den Antipoden von `+x`
+  **exakt** statt beinahe; der Bogen ist dort undefiniert. Zwei Fälle kamen als NaN
+  heraus — gemeldet vom Wächter, nicht vom Vergleich.
+
+### Der Sweep: 56 Mutanten, zehn Überlebende, und alle zehn sagten dasselbe
+
+Erster Durchgang: **46 getötet, 10 überlebt**. Und alle zehn waren derselbe Befund in
+zehn Verkleidungen — *die geänderte Größe erreicht die Ausgabe von keinem gewöhnlichen
+Eingang aus*:
+
+* `triFlags` erreicht die Ausgabe **ausschließlich** über `selectNormal`, und dessen
+  Antwort **ausschließlich**, wenn `sqDist == 0` — die beiden anderen Arme antworten
+  beide `triNormal`. Damit waren `selnormal-uv` (die Argumente vertauscht) und
+  `rows-cols-swap` (`rows` wird nur als `cell / c != r - 2` gelesen) blind.
+* `dist >= 0` gegen `> 0` trennt nur bei `dist` **exakt** null.
+* `sqInflatedRadius > sqDist` gegen `>=` trennt nur bei bitgenauer Gleichheit.
+* Der ungequadrate Radius im Tor trennt nur, wenn `sqDist` **zwischen** beiden liegt.
+* Der zweite `contactDistance`-Summand fiel nicht auf, weil beide Summanden gleich
+  groß waren.
+
+Die Fälle dagegen sind konstruiert, nicht gesucht — jeder nennt im Quelltext den
+Mutanten, für den er existiert, weil ein Randfall ohne genannten Zweck das Erste ist,
+was ein späterer Leser als willkürlich löscht:
+
+* **`selnormal-uv`**: `bu = 0` legt das nächste Merkmal auf Kante `ac`, wo der
+  Kantenpfad `u` **exakt** null zurückgibt; Dreieck 19 durch die wrongHanded-Skala
+  gelesen hat `ETD_20` gelöscht und `ETD_01` gesetzt, sodass das Original das gelöschte
+  Bit befragt und der Tausch das gesetzte.
+* **`rows-cols-swap`**: Zelle 15 liegt in Reihe 3, und `r-2` ist 4 mit der echten
+  Reihenzahl und 3 mit der Spaltenzahl an ihrer Stelle — was `adj[0]` zu BOUNDARY macht
+  und `ETD_01` löscht. `bv = 0` legt das Merkmal auf Kante `ab`, die genau mit diesem
+  Bit beantwortet wird.
+* **`gate-sq-nonstrict`**: `sqDist` ist keine Zahl, auf die man zielen kann — aber es
+  ist **unabhängig** von der Kontaktdistanz. Also wird der Gleichstand von der anderen
+  Seite gelöst: Spiegel einmal laufen lassen, `sqDist` ablesen, und den
+  `contactDistance`-Slot dieses Falls (jeder Fall hat einen eigenen) durch die Floats
+  um `sqrt(sqDist) - r - meshTerm` laufen lassen, bis `sqInflatedRadius` **bitgenau**
+  gleich ist. Die Summe wird dabei in der Reihenfolge der Engine geschrieben, weil eine
+  anders geklammerte Summe auf einem anderen Float landet.
+
+### Ein Mutant, der auf achsenparalleler Terrain nicht zu töten ist
+
+`dist-from-v1` misst die Ebene von `v1` statt `v0`; die Differenz ist `dot(v0-v1, N)`,
+in exakter Arithmetik identisch null. Über **alle vierzig** Dreiecke beider
+ursprünglicher Heightfields gemessen ist sie auch **bitgenau** null — bei
+Eckkoordinaten, die kleine ganze Zahlen mal einer Zweierpotenz sind, ist jedes Produkt
+in `ab.x*N.x + ab.y*N.y + ab.z*N.z` exakt und die Summe hebt sich sauber auf (Dreieck 18
+liefert sogar `-0.0f`, was nicht `< 0.0f` ist). Auf solcher Terrain sind die beiden
+Schreibweisen **dieselbe Funktion**, und keine Platzierung kann sie trennen.
+
+Ein drittes Heightfield mit den Skalen `(0.7, 0.08125, 0.3)` bricht die Exaktheit: das
+Kreuzprodukt rundet, die Normierung rundet, und der Rest hat ein dreiecksabhängiges
+Vorzeichen. Zwei Dreiecke liefern `-2.98e-08`; auf einem davon, mit dem Mittelpunkt
+**exakt** auf Ecke `a` (was `dist` bitgenau null macht — aber nur durch die
+Identitätstransformation, wo `ctQuatRotate`s `v*(w*w - dot(u,u))` zu `v*1` entartet und
+der Weltraum-Hin-und-Rückweg bitgenau ist), kippt der Mutant das Tor von wahr auf
+falsch. Getötet.
+
+### Der eine echte Überlebende
+
+`ni-add-to-or` — `(nb << 27) + triangleIdx` gegen `| triangleIdx` — überlebt beide
+Durchgänge und ist **exakt äquivalent**, solange `triangleIdx < 2^27`: `nb` ist höchstens
+2 und belegt die Bits 27-28, der Dreiecksindex die Bits 0-26, und über disjunkten
+Bitfeldern sind Addition und Oder dieselbe Operation. Erst ein Heightfield mit mehr als
+134 Millionen Dreiecken träte die beiden auseinander — dort würde die Addition in das
+Zählfeld übertragen und das Oder es abschneiden. Der Header nennt die Voraussetzung, weil
+die beiden Arme dieses Kernels sie **verschieden** schreiben (`+` im Kapsel-Arm, `+` im
+Kugel-Arm nach `delayContactMask`) und ein späterer Leser sonst die Gleichheit für
+Zufall halten muss.
+
+Zweiter Durchgang der zehn gegen die verstärkte Vorrichtung: **9 getötet, 1
+überlebt.** Vollständiger Sweep aller 56 auf der Endfassung: **55 getötet (54 durch
+Fehlschlag, 1 durch Absturz), 1 überlebt** — der äquivalente.
+
+Die Vorrichtung steht bei 22 Fällen: `selected 10, face-fallback 3, deferred 5,
+none 4; contacts 0/5 1/9 2/8`. Alle drei Patch-Normal-Arme, alle drei Kontaktzahlen,
+und jeder Datensatz-Slot, den kein Fall beansprucht, trägt weiter seinen Wächterwert.
 
 ## P9.52b-3 — die beiden Kontaktgeneratoren, und ein Sweep, der eine Behauptung von MIR widerlegt hat
 

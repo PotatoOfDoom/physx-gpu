@@ -29,10 +29,16 @@
 // (:463-474).  P9.52b-3.
 //
 // The mirror is written from the CUDA.  Note in particular that generateContacts
-// emits the SEGMENT ENDPOINT and not the projected point, that its radius test is
-// UNSQUARED while generateEE's is SQUARED, and that generateEEContacts calls its
-// third edge as (a, c) rather than (c, a) -- generateEE is not symmetric in its
-// two vertices, so the direction matters.
+// emits the SEGMENT ENDPOINT and not the projected point, and that its radius test
+// is UNSQUARED while generateEE's is SQUARED.
+//
+// On the edge ORDER: generateEEContacts calls (a,b), (b,c), (a,c).  An earlier
+// version of this header said reversing an edge moves the contact; it does not, in
+// exact arithmetic, and the module header carries the derivation.  What the sweep
+// then showed is that it is not bit-exact either: `d` is `dot(n, firstVertex)` and
+// the two candidate first vertices differ by the edge vector n is orthogonal to,
+// so the two differ by that term's rounding residue -- one to two ulp on the
+// tilted-normal case below.
 //
 // ===========================================================================
 // THE GEOMETRY THE CASES ARE BUILT ON
