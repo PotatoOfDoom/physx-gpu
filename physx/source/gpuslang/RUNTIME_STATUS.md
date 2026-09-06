@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **853/853** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **854/854** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.57 added `gpuslang.geomTypeConstants`, the TENTH static checker and the SECOND
 written because its defect had already happened: a constant that names a
 `PxGeometryType` member must carry that member's value, read out of
@@ -1832,6 +1832,105 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.52b-2 — Segment-gegen-Dreieck als Modul, ein CPU/GPU-Widerspruch (Kandidat 51), und acht Vorrichtungslücken
+
+`distanceSegmentSegmentSquared` (distanceSegmentSegment.cuh:33-88),
+`isValidTriangleBarycentricCoord` und `distanceSegmentTriangleSquared`
+(capsuleTriangle.cuh:102-327) als Modul `pxgSlangSegTriangle` mit zwei
+Einstiegspunkten und Vorrichtung. Das ist der geometrische Kern **jedes**
+Kapsel-gegen-Dreieck-Pfads der Engine: der Höhenfeld-Kapsel-Arm
+(convexHeightfield.cu:700), sein Trimesh-Zwilling (convexMesh.cu:492) und der
+Cloth-Primitivpfad (femClothPrimitives.cu:430) rufen alle dieselbe Funktion.
+
+### Kandidat 51 — die CPU-Fassung derselben Funktion widerspricht der GPU-Fassung
+
+PhysX führt für dieselbe Aufgabe eine zweite Implementierung,
+`physx/source/geomutils/src/distance/GuDistanceSegmentTriangle.cpp`. Zwei
+Entscheidungen unterscheiden sich, und beide ändern den zurückgegebenen Punkt:
+
+| | GPU (`capsuleTriangle.cuh`) | CPU (`GuDistanceSegmentTriangle.cpp`) |
+|---|---|---|
+| `bdenom` bei entartetem Dreieck | `PX_MAX_F32` (:136) | `zero` (:401) |
+| Ebenen-Test | `dMul <= 0` **nicht-strikt** (:151) | `FIsGrtr(zero, dMul)`, also `< 0` **strikt** (:413) |
+
+Die erste ist nicht kosmetisch. Bei entartetem Dreieck (ab parallel zu ac, also
+`tDenom == 0`) macht der CPU-Rückfall `v0 = w0 = 0`, `isValid(0,0)` ist **wahr**,
+und die Funktion liefert **Ecke a** mit Abstand `sqDist3`. Der GPU-Rückfall
+`PX_MAX_F32` schickt die Baryzentren auf ±INF, der Gültigkeitstest schlägt fehl,
+und die Kontrolle fällt in den **Kanten**-Zweig. Gleiche Eingabe, anderer Punkt,
+anderer Abstand.
+
+Bemerkenswert: der abschließende Kommentar der GPU-Zeile dokumentiert die
+**CPU**-Schreibweise (`FSel(FIsGrtr(tDenom, zero), FRecip(tDenom), zero)`) — ein
+stehengebliebener Rest des SIMD-Originals. Wer ihm folgt, importiert stillschweigend
+das CPU-Verhalten. Das Modul portiert die **GPU**-Quelle, denn die ist es, die die
+GPU-Pipeline ausführt und die dieser Port ersetzt.
+
+**Dokumentiert, nicht gemeldet — damit stehen 51.**
+
+Gefunden hat das ein Lese-Workflow; die Gegenprüfungs-Phase desselben Workflows
+fiel dem Sitzungslimit zum Opfer, also sind beide Zeilen **von Hand am Quelltext
+nachgelesen** worden, bevor sie hier stehen. Ein ungeprüfter Agentenbefund ist in
+diesem Port kein Befund.
+
+### Der Sweep: 44 Mutanten, 41 tot — und ACHT Lücken in der Vorrichtung
+
+Erster Lauf: **30 tot, 13 überlebend.** Acht davon lagen an der Vorrichtung, und
+sie sind lehrreicher als die Kills:
+
+* **Das Epsilon-Band.** Jede quadrierte Länge war entweder 0 oder ≥ 1, also ließ
+  sich `eps` von `1e-6` auf `1e-3` schieben, ohne dass sich etwas änderte.
+* **Der Rückfallwert der geschützten Kehrwerte war unbeobachtbar.** Mit `d1`
+  exakt null sind `b` und `c` ebenfalls null, `comp` ist null, gleich welchen Wert
+  `aRecip` hat. Der erste Reparaturversuch scheiterte noch einmal: der Zähler kam
+  negativ heraus und die Klemmung flachte beide Antworten auf null ab. Es braucht
+  `a` unter eps, **nicht null**, **und** einen positiven Zähler.
+* **`bdenom`s Rückfall war mit einem kollinearen Dreieck gar nicht sichtbar**, weil
+  bei `ac ∥ ab` die baryzentrischen **Zähler identisch verschwinden**
+  (`|ac|²(p·ab) - (ab·ac)(p·ac)` ist für jedes p null). Nach Cauchy-Schwarz ist
+  `tDenom` für jedes Dreieck nichtnegativ, der Rückfall ist also nur dort
+  erreichbar, wo die **Rundung** ihn auf null zwingt: `d11 = 4 + 1e-10` ist in
+  `float` exakt 4.0, `tDenom` damit exakt `4 - 4`, während `pD21` das `1e-5`
+  behält, das der Zähler braucht.
+* **Die baryzentrischen Toleranzen wurden nur fern ihrer Grenzen geprüft.** Jetzt
+  liegt `v` **exakt** auf `-1e-6` und `v + w` **exakt** auf `1 + 1e-6` — auf einem
+  achsenparallelen Dreieck bitgenau konstruierbar, weil die Projektion die beiden
+  Koordinaten in der Ebene unverändert lässt.
+* **Alle Ebenen-Schnitte hatten `n·pq` als Zweierpotenz**, wo `nom * (1/d)` und
+  `nom / d` exakt übereinstimmen. Ein gekipptes Dreieck nagelt die
+  Kehrwert-Schreibweise fest.
+* **Das strikte `>` der Kantenauswahl braucht einen exakten Gleichstand** — und der
+  erste konstruierte Gleichstand **trennte die beiden Kanten nicht**: beide
+  nächsten Punkte fielen auf Ecke a, also meldeten Kante AB `(t10, 0) = (0,0)` und
+  Kante AC `(0, t12) = (0,0)`, und die Striktheit war unbeobachtbar. Der Gleichstand,
+  der trennt, legt Dreieck **und** Segment in **eine** Ebene, in der jedes
+  Skalarprodukt eine **zweigliedrige** Summe ist — und eine zweigliedrige Summe ist
+  kommutativ, also stimmen die gespiegelten Kantenrechnungen bitgenau überein,
+  während ihre Parameter es nicht tun: `(0.3, 0.4, 0)` gegen `(0.7, 0, 0.4)`.
+
+Derselbe Fall liefert nebenbei die **koplanare NaN**: der Ebenen-Zweig rechnet
+`+0 * -INF` und verwirft das Ergebnis, weil jeder Vergleich des
+Gültigkeitstests gegen NaN falsch ist. Shader und Host-Spiegel gehen bitgenau
+denselben Weg durch dieses NaN.
+
+Zweiter Lauf: **41 tot, 3 überlebend**, alle drei bewiesene Äquivalenzen —
+`PxClamp` gegen die Bibliotheks-Klemmung (unterscheidbar nur bei NaN, und NaN ist
+an allen drei Stellen nachweislich unerreichbar) und zwei Verschiebungen **entlang
+der Normalen**, die für die einzigen daraus gelesenen Größen — Skalarprodukte mit
+`ab` und `ac`, beide orthogonal zu `n` — unsichtbar sind.
+
+### Unterbrechung durch Container-Neustart, und warum sie nichts gekostet hat
+
+Der Neustart traf den zweiten Sweep mitten im Lauf. Der Trap in
+`run_mutation_sweep.sh` hat gegriffen (`!! interrupted -- restoring pristine source
+and .spv`); danach wurde die `.spv` trotzdem **erzwungen neu gebaut**, statt der
+Wiederherstellung zu glauben — genau der Fehlermodus, den P8.83 und P9.9 zweimal
+bezahlt haben. Alle acht Pristine-Marker des Moduls waren vorhanden, die
+Vorrichtung nach dem Frischbau grün.
+
+**Keine Szenen.** Modul und Sonde; kein abgebildeter Kernel ändert sich.
+
 
 ## P9.52b-1 — die Kantenklassifikation des Kapsel-Arms, direkt auf dem Abtastgitter
 
