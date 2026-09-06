@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **854/854** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **855/855** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.57 added `gpuslang.geomTypeConstants`, the TENTH static checker and the SECOND
 written because its defect had already happened: a constant that names a
 `PxGeometryType` member must carry that member's value, read out of
@@ -1832,6 +1832,118 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.52b-3 — die beiden Kontaktgeneratoren, und ein Sweep, der eine Behauptung von MIR widerlegt hat
+
+`generateContacts` (capsuleTriangle.cuh:329-406), `generateEE` (:408-461) und
+`generateEEContacts` (:463-474) als Modul `pxgSlangCapTriangle` mit drei
+Einstiegspunkten und Vorrichtung. Damit sind alle Bausteine des Kapsel-Arms
+portiert; es fehlt nur noch der Kern selbst.
+
+### Zwei Radiustests, die nicht derselbe Test sind
+
+`generateContacts` vergleicht `inflatedRadius > ipt` — **unquadriert**, gegen eine
+**vorzeichenbehaftete** Durchdringung entlang der Patch-Normale, die negativ sein
+darf. `generateEE` vergleicht `sqInflatedRadius > sqDist` — **quadriert**, gegen
+einen quadrierten Abstand. Wer dem einen den quadrierten und dem anderen den
+einfachen Radius reicht, bekommt Code, der übersetzt, läuft und um eine Quadrierung
+falsch ist. Der Kern hält beide auseinander, indem er beide Werte führt und jedem
+den richtigen gibt (convexHeightfield.cu:770 und :774).
+
+### Was `generateContacts` emittiert: den SEGMENTENDPUNKT
+
+Nicht den projizierten Punkt. `closestP31 = p - normal * ipt` dient
+ausschließlich den Baryzentren; geschrieben wird `p` selbst (:370) mit `ipt` als
+Separation. Der projizierte Punkt sähe grundsätzlicher aus und verschöbe jeden
+Kapselkontakt um die Eindringtiefe.
+
+Auch hier ist der **Kommentar neben dem Code falsch**: er behauptet
+`FSel(FIsGrtr(ideom, FZero()), FDiv(inomp, ideom), FZero())` — ohne Negation und
+mit Null-Rückfall —, während der Code `-(inomp / ideom)` mit `PX_MAX_F32`-Rückfall
+schreibt. Dasselbe Muster wie beim `bdenom`-Kommentar in
+`distanceSegmentTriangleSquared` (Kandidat 51). Den Kommentaren dieser Datei zu
+folgen ist ein verlässlicher Weg, eine andere Funktion zu schreiben.
+
+### Die ungeschützte Division in `generateEE` — und warum sie geschützt ist
+
+`tValue = nom / denom` hat keine Absicherung, und die Zeile darüber ist die
+auskommentierte, geklemmte Fassung. Das sieht nach einer Lücke aus. Ist es nicht:
+
+    npq   = (ab × normal) · pq  = det(ab, normal, pq)
+    denom = (normal × pq) · ab  = det(normal, pq, ab)
+
+Eine Determinante ist invariant unter **zyklischer** Zeilenvertauschung — das sind
+**dieselbe Zahl**, zweimal verschieden gerechnet. Der `npq == 0`-Abbruch drei
+Zeilen darüber schließt den Nulldivisor also bereits aus, nicht weil jemand die
+Division absicherte, sondern weil der scheinbar unbeteiligte Wächter derselbe Test
+ist. Die Vorrichtung prüft die Identität numerisch mit: auf jedem Fall, der beide
+Größen erreicht, stimmen sie auf wenige ULP überein.
+
+### Der Sweep hat zwei Behauptungen von MIR widerlegt — nacheinander
+
+**Erste Fassung des Headers**, von mir geschrieben: *„`generateEE` ist in seinen
+beiden Ecken nicht symmetrisch — Umkehren verschiebt den gemeldeten
+Kontaktpunkt."* Der erste Sweep ließ `G1-third-edge-reversed` und
+`G2-second-edge-reversed` **überleben**, und die Rechnung gab ihnen recht:
+
+* `n' = (a−b) × normal = −n`, also sind `np` und `nq` exakt negiert (das Negieren
+  eines Vektors negiert seine Skalarprodukte in IEEE exakt);
+* `d' = n'·b = −(n·b)`, und `n·b = n·a + n·(b−a)`, wobei der zweite Term
+  **identisch null** ist, weil `n` konstruktionsbedingt auf der Kante senkrecht
+  steht — also `d' = −d`;
+* `temp' = (−signP)(−signQ) = temp`, der Gleichseiten-Abbruch ändert sich nicht;
+* `segTValue' = (−(d−np)) / (−npq) = segTValue`, der emittierte Punkt
+  `localPointA` ist derselbe Punkt;
+* `denom' = −denom`, `nom' = nom − denom`, also `tValue' = 1 − tValue`, was genau
+  dann in `[0,1]` liegt, wenn `tValue` es tut, und `v' = v`.
+
+**Zweite Fassung**, ebenfalls von mir: *„bitgenau symmetrisch"*. Auch falsch. Der
+zweite Sweep — mit den fünf neuen Randfällen — hat `G2` **getötet**, und der
+einzige Term der Herleitung, der nur *mathematisch* null ist, sagt warum: `d` wird
+als `dot(n, ersteEcke)` direkt gerechnet, und die beiden ersten Ecken
+unterscheiden sich um genau den Kantenvektor, auf dem `n` senkrecht steht. Die
+beiden `d` unterscheiden sich also um den **Rundungsrest** von `n·(b−a)`.
+
+Von Hand nachgemessen, um den Mechanismus nicht zu raten: mit `G2` von Hand
+angewandt meldet der Fall mit gekippter Patch-Normale eine Separation von
+`0.490612596` statt `0.490612626` — **ein bis zwei ULP**. `G1` überlebt weiter,
+weil kein Fall der Vorrichtung auf jener Kante scharf genug ist; das ist eine
+Aussage über die Eingaben, nicht über den Code.
+
+Also: **mathematisch symmetrisch, numerisch nicht ganz.** Der Header sagt das
+jetzt samt Messung. Und das ist der Grund, warum ein Sweep mehr ist als eine
+Qualitätskennzahl: er hat hier zweimal nicht den Shader geprüft, sondern **die
+Prosa daneben**.
+
+### 36 Mutanten, sieben Lücken
+
+Erster Lauf: **22 tot, 14 überlebend.** Sieben davon waren die Vorrichtung:
+
+* `bdenom`s Rückfall — dieselbe Falle wie im Segment-Modul: mit `b == a`
+  verschwinden die Zähler identisch, der Rückfall ist nur über eine **Rundung** auf
+  null erreichbar (`d11 = 4 + 1e-10` ist in `float` exakt `4.0`);
+* die Patch-Normale war fast überall `(0,1,0)` und damit orthogonal zu `ab` und
+  `ac` — für die Baryzentren **unsichtbar**. Erst eine stark gekippte Normale mit
+  `p` knapp außerhalb trennt `p − normal·ipt` von `p + normal·ipt` **und** von
+  `p − planeNormal·ipt`; derselbe Fall hat `ipt = 0.384`, also in `[r², r)`, und
+  trennt damit auch den unquadrierten Radiustest von einem quadrierten;
+* ein Endpunkt **exakt** auf der Kantenebene (`temp == 0`) für das strikte
+  `temp > 0`;
+* `sqDist` **exakt** auf dem quadrierten Radius für das strikte `>`;
+* `sqDist = 0.09`, dessen Wurzel `0.3` über dem Radiusquadrat `0.25` liegt — die
+  einzige Bande, in der quadriert und unquadriert auseinandergehen.
+
+Zweiter Lauf: **30 tot, 6 überlebend.** Die sechs sind bewiesene Äquivalenzen:
+`F13` (das Baryzentrum-Prädikat ist in `v` und `w` symmetrisch — bemerkenswert,
+weil der *Aufrufer* die beiden nicht symmetrisch belegt), `E1` und `E7`
+(Vorzeichenwechsel, die sich im Quotienten **exakt** aufheben), `E2` und `G1`
+(Terme, die in exakter Arithmetik identisch verschwinden und deren Rundungsrest
+kein Fall dieser Vorrichtung sieht) und `E5` (ohne den `npq == 0`-Wächter läuft
+eine INF/NaN-Kaskade durch, die am letzten Vergleich `sqInflatedRadius > NaN`
+ohnehin keinen Kontakt emittiert).
+
+**Keine Szenen.** Modul und Sonde; kein abgebildeter Kernel ändert sich.
+
 
 ## P9.52b-2 — Segment-gegen-Dreieck als Modul, ein CPU/GPU-Widerspruch (Kandidat 51), und acht Vorrichtungslücken
 
