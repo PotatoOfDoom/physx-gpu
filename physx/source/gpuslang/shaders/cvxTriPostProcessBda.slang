@@ -172,9 +172,19 @@ bool ppFindWithFlag(uint64_t data, uint count, uint targetIndexWithMask, uint fl
 void convexTrimeshPostProcess(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_GroupID)
 {
     const uint nbTpProcess = Ptr<uint>(gPp.nbSecondPassPairs)[0];
-    const uint globalThreadIdx = gid.x * PP_THREADS_PER_BLOCK + gtid.x;
+    // convexMeshPostProcess.cu:391 / :603 -- the CUDA covers the second-pass queue
+    // with a grid-stride loop, and its trip count `*nbSecondPassPairs` is a DEVICE
+    // value while the grid is computed on the host from a shape count.  Restored in
+    // P9.59.  The trip count `ceil(nbTpProcess / (WorkgroupCount().x * 64))` is
+    // WORKGROUP-UNIFORM; there are no barriers in this entry point, but keeping the
+    // property true costs nothing and the next edit may add one.
+    const uint ppStride = WorkgroupCount().x * PP_THREADS_PER_BLOCK;
+
+    for (uint ppBase = 0u; ppBase < nbTpProcess; ppBase += ppStride)
+    {
+    const uint globalThreadIdx = ppBase + gid.x * PP_THREADS_PER_BLOCK + gtid.x;
     if (globalThreadIdx >= nbTpProcess)
-        return;
+        continue;
 
     const uint64_t secondPassPairs = Ptr<uint64_t>(gPp.cvxTriSecondPassPairsPtr)[0];
     const uint64_t cvxTriNI = Ptr<uint64_t>(gPp.cvxTriNIPtr)[0];
@@ -320,5 +330,6 @@ void convexTrimeshPostProcess(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_Grou
         // engine does and what everything downstream is calibrated against, so it
         // is reproduced exactly rather than "fixed".
         Ptr<uint>(niIndexAddr)[0] = niWord & 0x0ffffffu;
+    }
     }
 }

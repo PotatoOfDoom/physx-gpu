@@ -2631,3 +2631,18 @@ add_test(NAME gpuslang.helperUniformity
 # this rule is the same oracle for the Slang side, where no include can reach.
 add_test(NAME gpuslang.geomTypeConstants
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_geom_type_constants.py)
+
+# P9.59: the ELEVENTH static checker, and the THIRD written because its defect had
+# already happened twice.  A mapped kernel whose CUDA covers its work with a
+# grid-stride loop must have that loop in its Slang port; a port that makes one pass
+# processes only `gridDim.x * groupSize` items and leaves the rest untouched.  That is
+# not graceful: P9.52b-6 measured a SIGSEGV in convexTrimeshCorrelate reading records
+# the uncovered pairs never wrote, and P9.58 measured a box falling straight through a
+# heightfield.  Neither a fixture nor a mutation sweep can see it -- a fixture chooses
+# its own grid, so the ceiling is never approached, and a mutant that removes the loop
+# SURVIVES and reads as an equivalence.  A scene can, but only one whose work exceeds
+# that kernel's own ceiling, and the ceilings differ by four orders of magnitude.
+# The known-omission list is a RATCHET: it may shrink, never grow, and an entry left
+# behind after its port is fixed fails the check too.
+add_test(NAME gpuslang.gridStride
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_grid_stride.py)

@@ -554,6 +554,35 @@ void buildHfBigBoxScene(PxPhysics* physics, PxScene* scene, PxMaterial* material
     targets.push_back({ b, 8.0f, h, "bigBoxOnHeightField" });
 }
 
+// PXG_SCENE=hfhugebox (P9.59) -- the heightfield POST-PROCESS's ceiling, probed.
+//
+// The post process is what removes the duplicate contacts a shared heightfield edge
+// or vertex produces: a pair flagged `delayContacts` goes on a second-pass queue and
+// is revisited.  Its Slang port makes one pass of `256 * numTests` threads
+// (PxgNarrowphaseCore.cpp:2971-2973), while the CUDA covers the rest by iterating,
+// and convexHfPostProcessBda's own header predicts the symptom past that ceiling:
+// "duplicate contacts along shared edges, not missing ones".
+//
+// The terrain is 64x64 samples over 2*halfExtent, so at halfExtent 10 a cell is about
+// 0.317 units and a half-3 box already spans some 19x19 cells -- which is why
+// hfbigbox broke the CORE's 32-pair ceiling so decisively.  Only the flagged pairs
+// reach the second-pass queue, though, and for a box lying flat on flat terrain those
+// are concentrated on its PERIMETER.  A half-8 box has a perimeter of roughly 200
+// cells, so this scene exists to find out whether 256 is reachable at all -- if it is
+// not, the ceiling is theoretical for this kernel and saying so is worth more than a
+// fix nobody can observe.
+void buildHfHugeBoxScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                         std::vector<RestTarget>& targets)
+{
+    if (!addHeightFieldFloor(physics, scene, material, 10.0f))
+        return;   // addHeightFieldFloor has already printed the FAIL line
+
+    const float h = 8.0f;
+    PxRigidDynamic* b = addDynamic(physics, scene, material, PxBoxGeometry(h, h, h),
+                                   boxInertia(PxVec3(h), 1000.0f), 12.0f);
+    targets.push_back({ b, 12.0f, h, "hugeBoxOnHeightField" });
+}
+
 // PXG_SCENE=convex: a dynamic CONVEX MESH (a runtime-cooked cube hull, half
 // 0.5) resting on the static ground BOX.  Box (eBOX=3) vs convex mesh
 // (eCONVEXMESH=5) lands in the GPU_BUCKET_ID::eConvex bucket
@@ -7215,6 +7244,7 @@ int main()
     else if (!std::strcmp(sceneName, "hffloor")) buildHfFloorScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "spherehf")) buildSphereHfScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "hfbigbox")) buildHfBigBoxScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "hfhugebox")) buildHfHugeBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "articulation")) buildArticulationScene(physics, scene, material, targets);
     // The list is spelled out in full deliberately: an out-of-date usage string is
     // what turned a mistyped scene into a silent non-result once already.  This

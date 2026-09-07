@@ -7,7 +7,10 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **856/856** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **857/857** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.59 added `gpuslang.gridStride`, the ELEVENTH static checker: a mapped kernel
+whose CUDA covers its work with a grid-stride loop must have that loop in its
+Slang port.  37 known omissions carried as a RATCHET that may shrink, never grow.
 Manifest: **403/501** kernels mapped (P9.52b-6 filled SPHERE_HEIGHTFIELD_CORE).
 Scenes: **40/40** (P9.58 added `hfbigbox`, which fell through the terrain before
 the convex cores got their grid-stride loop back).
@@ -1841,6 +1844,83 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.59 — der ELFTE Prüfer, und ein Fix, für den ich keine Szene bauen konnte
+
+P9.58 fand zwölf weitere Grid-Stride-Auslassungen und legte sie als Aufgabe ab:
+„jede mit eigener beobachtender Szene". Diese Tranche hat damit angefangen — und die
+erste Messung hat den Plan geändert.
+
+### Die Szene, die es nicht gibt
+
+`convexHeightfieldPostProcess` hat die kleinste Decke der Kette: 256 Threads pro
+Kontaktmanager (PxgNarrowphaseCore.cpp:2971-2973). Sein eigener Header sagt sogar
+das Symptom voraus — *„duplicate contacts along shared edges, not missing ones"*.
+
+Das Terrain der Vorrichtung ist 64×64 Samples über 2·halfExtent, bei halfExtent 10
+also eine Zellgröße von rund 0,317. Eine halb-8-Box — die **grösste, die überhaupt
+aufs Terrain passt** — spannt etwa 50×50 Zellen. `PXG_SCENE=hfhugebox` fährt genau
+das, und sie ruht sauber bei y = 8.0000, |v| = 0. Mit und ohne Schleife.
+
+Die 256er-Decke ist mit dieser Vorrichtung **nicht erreichbar**. Das ist ein Befund,
+kein Fehlschlag — und er ist wichtiger als der Fix: für diesen Kernel gibt es keine
+Szenen-Evidenz, und die Tranche sagt das, statt sie zu suggerieren. Beide
+Postprocess-Kernel haben die Schleife trotzdem bekommen, gerechtfertigt durch
+Treue zum CUDA plus die **gemessene** Folge am Geschwisterkernel, nicht durch eine
+Beobachtung an ihnen selbst.
+
+### Also: die Klasse unwiederholbar machen
+
+Zwölf ungeprüfte Einzelkorrekturen wären genau die Art unbelegter Massenänderung, die
+dieser Port sonst vermeidet. Stattdessen der elfte statische Prüfer,
+`gpuslang.gridStride` — und der **dritte**, der geschrieben wurde, weil sein Defekt
+bereits passiert war.
+
+Er liest jede gemappte Manifest-Zeile, klammert den CUDA-`__global__` aus, entscheidet
+ob dessen Rumpf eine Grid-Stride-Schleife trägt, klammert den benannten Slang-Einstieg
+aus und prüft, ob der Port die Schrittweite reproduziert (`WorkgroupCount()` ist Slangs
+einzige Schreibweise für `gridDim.x`).
+
+**Warum weder Vorrichtung noch Mutant das findet**, und hier ist es besonders scharf:
+eine Vorrichtung wählt ihr Gitter selbst und passt es ihrem Fall an, die Decke wird nie
+angefasst. Ein Mutations-Sweep ist schlechter als blind — er mutiert den Shader gegen
+eine Vorrichtung, die den Unterschied nicht sehen kann, also **überlebt** der Mutant
+und liest sich als Äquivalenz.
+
+### Zwei Schärfungen, die die Erkennung erst brauchbar gemacht haben
+
+Die erste Fassung meldete **43** Auslassungen — gegen die zwölf adversarisch
+bestätigten. Sie feuerte auf jedes `gridDim.x * blockDim.x` irgendwo im Rumpf, und
+dieser Ausdruck steht auch als *Gesamt-Thread-Zahl* in Einzeldurchgangs-Kerneln, die
+danach `if (idx < n)` schreiben. Was ihn zur Schrittweite macht, ist die Position: die
+**Inkrement-Klausel** eines `for`. Danach: 31.
+
+Die zweite ging in die andere Richtung. Bei 31 fehlten **fünf** Kernel, die der Audit
+bestätigt hatte — die Skinning-Kernel in `utility.cu` heben die Schrittweite heraus:
+
+    const PxU32 xDim = gridDim.x * blockDim.x;
+    for (i = blockIdx.x*blockDim.x + threadIdx.x; i < loopEnd; i += xDim)
+
+Benannte Schrittweiten werden jetzt eine Ebene aufgelöst. Danach: **39, und alle zwölf
+bestätigten darunter** — plus 27 in Dateien, die der Audit gar nicht abgedeckt hatte
+(`accumulateThresholdStream.cu`, `softbodyMidPhase.cu` und weitere). Der Prüfer sieht
+also mehr als der Workflow, und der Workflow hat dem Prüfer die Präzisionsgrenze
+gezeigt. Beide waren nötig.
+
+### Die Ratsche, und dass sie in BEIDE Richtungen greift
+
+`grid_stride_known.txt` trägt die 37 verbleibenden. Neue Auslassung → rot. Und ein
+Eintrag, der nach der Reparatur seines Ports **stehen bleibt** → ebenfalls rot; eine
+veraltete Ausnahmeliste ist, wie eine Ratsche leise aufhört zu ratschen. Beides ist
+vorgeführt, nicht behauptet: eine Zeile entfernt → rc=1 mit „NEW GRID-STRIDE
+OMISSION"; `convexHeightfieldPostProcess` wieder eingetragen → rc=1 mit *„the port now
+reproduces the stride; remove the line"*.
+
+Die Datei sagt außerdem ausdrücklich, was ihre Einträge **nicht** sind: geprüft. Zwölf
+davon hat P9.58 adversarisch am Quelltext bestätigt; die übrigen 25 sind Meldungen des
+statischen Prüfers und warten auf dieselbe Behandlung, ein Subsystem nach dem anderen.
+
+Suite **857/857** in beiden Modi (der neue Prüfer ist der 857.).
 
 ## P9.58 — die weggelassene Grid-Stride-Schleife ist eine KLASSE, und eine Box, die durch den Boden fiel, hat sie aufgemacht
 

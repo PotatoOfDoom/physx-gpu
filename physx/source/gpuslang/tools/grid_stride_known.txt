@@ -1,0 +1,69 @@
+# grid_stride_known.txt -- the kernels whose Slang port makes ONE pass over work the
+# CUDA covers with a grid-stride loop.  Read by tools/check_grid_stride.py (P9.59).
+#
+# THIS IS A RATCHET, not a permission slip.  A NEW omission fails the check, and so
+# does an entry left here after its port was fixed -- a stale allowlist is how a
+# ratchet quietly stops ratcheting.  The list may shrink; it may not grow.
+#
+# WHAT AN ENTRY COSTS.  Past its ceiling the port does not degrade gracefully.  On
+# the sphere-vs-heightfield core the uncovered pairs left their records unwritten and
+# convexTrimeshCorrelate dereferenced the uninitialised contact count (P9.52b-6,
+# SIGSEGV).  On the convex heightfield core a half-3 box fell straight through the
+# terrain (P9.58, final y = -70.8).  Both were on this list in spirit before anyone
+# looked.
+#
+# HOW BIG THE CEILING IS decides how reachable each one is, and the ceilings differ by
+# four orders of magnitude -- 32 pairs per contact manager for the core that dropped
+# the box, 256 for the heightfield post process, 524288 for the trimesh one.  A scene
+# tuned to one says nothing about another.
+#
+# THE TWO POST-PROCESS KERNELS ARE NOT HERE any more: P9.59 gave them the loop.  What
+# it could NOT do was prove it with a scene -- the largest box the harness can place
+# on the terrain (PXG_SCENE=hfhugebox, half-8 on a 20x20 heightfield) rests correctly
+# with and without the loop, so the 256 ceiling is out of reach here.  That fix is
+# justified by faithfulness to the CUDA plus the measured consequence on its sibling,
+# and saying so is worth more than implying evidence that does not exist.
+#
+# Each line below is a kernel name.  Removing one means its port now reproduces the
+# stride; the checker verifies that claim rather than taking it.
+#
+# Nothing here has been examined beyond the static check itself.  P9.58's audit
+# adversarially confirmed twelve of them at the source; the rest are reported by
+# check_grid_stride.py and awaiting the same treatment, one subsystem at a time.
+addAggPairsStage1
+aggCopyReports
+cloth_SphereContactGenLaunch
+cloth_boxTriangleContactGenLaunch
+cloth_convexContactGenLaunch
+cloth_convexVertexContactGenLaunch
+cloth_heightfieldContactGenLaunch
+cloth_heightfieldVertexContactGenLaunch
+cloth_meshContactGenLaunch
+cloth_meshVertexContactGenLaunch
+cloth_midphaseGenerateVertexPairsLaunch
+cloth_midphaseVertexMeshLaunch
+cloth_psContactGenLaunch
+cloth_psMidphaseGeneratePairsLaunch
+createForceChangeThresholdElements
+doAggPairCollisions
+initialRanksAndBodyIndexA
+initialRanksAndBodyIndexB
+interpolateSkinnedClothVertices
+interpolateSkinnedSoftBodyVertices
+normalVectorsAreaWeighted
+normalizeNormals
+ps_primitivesCollisionLaunch
+ps_primitivesDiffuseCollisionLaunch
+reorganizeThresholdElements
+sb_clothContactGenLaunch
+sb_clothVertContactGenLaunch
+sb_meshContactGenLaunch
+sb_other_contact_remap_to_simLaunch
+sb_primitiveContactGenLaunch
+sb_psContactGenLaunch
+sb_psMidphaseGeneratePairsLaunch
+setThresholdElementsMask
+updateBodiesLaunchDirectAPI
+updateBodyExternalVelocitiesLaunch
+writeoutAccumulatedForcePerObject
+zeroNormals
