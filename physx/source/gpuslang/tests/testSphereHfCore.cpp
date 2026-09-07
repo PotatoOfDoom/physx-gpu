@@ -84,6 +84,8 @@
 // which a value-only check cannot see.
 
 #include "pxgTestFramework.h"
+#include "pxgHeightfieldRef.h"
+#include "pxgNpRefMath.h"
 
 #include "geometry/PxGeometry.h"
 
@@ -96,46 +98,11 @@ namespace
 {
 using namespace pxgtest;
 
-struct V3 { float x, y, z; };
-struct V4 { float x, y, z, w; };
-
-static V3 sub(V3 a, V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
-static V3 add(V3 a, V3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
-static V3 mul(V3 a, float s) { return { a.x * s, a.y * s, a.z * s }; }
-static V3 neg(V3 a) { return { -a.x, -a.y, -a.z }; }
-static float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-static V3 cross3(V3 a, V3 b)
-{ return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
-
-static V3 quatRotate(V4 q, V3 v)
-{
-    const V3 u = { q.x, q.y, q.z };
-    const float w = q.w;
-    const float uu = dot3(u, u), vu = dot3(v, u);
-    const V3 c = cross3(u, v);
-    return { v.x * (w * w - uu) + u.x * (vu * 2.0f) + c.x * (w * 2.0f),
-             v.y * (w * w - uu) + u.y * (vu * 2.0f) + c.y * (w * 2.0f),
-             v.z * (w * w - uu) + u.z * (vu * 2.0f) + c.z * (w * 2.0f) };
-}
-static V3 quatRotateInv(V4 q, V3 v)
-{
-    const V3 u = { q.x, q.y, q.z };
-    const float w = q.w;
-    const float uu = dot3(u, u), vu = dot3(v, u);
-    const V3 c = cross3(u, v);
-    return { v.x * (w * w - uu) + u.x * (vu * 2.0f) - c.x * (w * 2.0f),
-             v.y * (w * w - uu) + u.y * (vu * 2.0f) - c.y * (w * 2.0f),
-             v.z * (w * w - uu) + u.z * (vu * 2.0f) - c.z * (w * 2.0f) };
-}
-// PxVec3::getNormalized (PxVec3.h:286): v * PxRecipSqrt(magnitudeSquared()), one
-// reciprocal and three multiplies, and the ZERO VECTOR for a zero input.
-static V3 normalized(V3 v)
-{
-    const float m = dot3(v, v);
-    if (!(m > 0.0f)) return V3{ 0, 0, 0 };
-    const float r = 1.0f / std::sqrt(m);
-    return V3{ v.x * r, v.y * r, v.z * r };
-}
+// The mirrors this fixture shares with the other heightfield fixtures live in
+// pxgNpRefMath.h and pxgHeightfieldRef.h.  What stays here is what only this
+// fixture has: the sphere-arm constants and distancePointTriangleSquared.
+using namespace pxgtest::npref;
+using namespace pxgtest::hfref;
 
 // P9.57: FROM THE ENGINE ENUM, never a literal.  `PxGeometryType` grew
 // eCONVEXCORE at position 4, which shifted eCONVEXMESH to 5, eTRIANGLEMESH to 8
@@ -146,14 +113,11 @@ static V3 normalized(V3 v)
 // stride.  tools/check_geom_type_constants.py keeps the Slang side honest.
 static const uint32_t GEOM_SPHERE = uint32_t(physx::PxGeometryType::eSPHERE);
 static const uint32_t GEOM_HEIGHTFIELD = uint32_t(physx::PxGeometryType::eHEIGHTFIELD);
-static const uint32_t HF_BOUNDARY = 0xFFFFFFFFu;
-static const uint32_t NONCONVEX_FLAG = 0x80000000u;
 static const uint32_t eV0 = 1u << 29, eV1 = 2u << 29, eV2 = 3u << 29;
 static const uint32_t eE01 = 4u << 29, eE02 = 5u << 29, eE12 = 6u << 29;
 static const uint32_t DEFERRED_CONTACT_MASK = 0x80000000u;
 static const uint32_t NB_CONTACTS_SHIFT = 27u;
 static const uint32_t FACE_CONTACT_FLAG = 0x80000000u;
-static const float MAX_F32 = 3.4028234663852886e+38f;
 
 // PxgShape, 48 B
 struct GpuShape
@@ -177,131 +141,6 @@ struct CorePush
 };
 
 // ---------------------------------------------------------------------------
-// the heightfield blob and its decoders (heightfieldUtil.cuh)
-// ---------------------------------------------------------------------------
-struct Hf
-{
-    uint32_t rows = 0, cols = 0;
-    std::vector<uint32_t> samples;
-    std::vector<uint32_t> blob;
-};
-
-static uint32_t sampleWord(int16_t height, uint8_t mat0, bool tessellationFlag, uint8_t mat1)
-{
-    return uint32_t(uint16_t(height))
-         | (uint32_t(mat0 & 0x7f) << 16)
-         | (tessellationFlag ? (1u << 23) : 0u)
-         | (uint32_t(mat1 & 0x7f) << 24);
-}
-
-static void buildHf(Hf& h)
-{
-    h.blob.clear();
-    h.blob.push_back(h.rows);
-    h.blob.push_back(h.cols);
-    for (uint32_t s : h.samples) h.blob.push_back(s);
-}
-
-static bool zerothVertexShared(const Hf& h, uint32_t cell)
-{ return (h.samples[cell] & 0x800000u) != 0u; }
-
-static float hfHeight(const Hf& h, uint32_t vi)
-{ return float(int16_t(uint16_t(h.samples[vi] & 0xffffu))); }
-
-static V3 hfGetVertex(const Hf& h, uint32_t vi)
-{ return V3{ float(vi / h.cols), hfHeight(h, vi), float(vi % h.cols) }; }
-
-static void triVertexIndices(const Hf& h, uint32_t t, uint32_t& i0, uint32_t& i1, uint32_t& i2)
-{
-    const uint32_t cell = t >> 1;
-    const bool firstTri = (t & 1u) == 0u;
-    const uint32_t c = h.cols;
-    if (zerothVertexShared(h, cell))
-    {
-        if (firstTri) { i0 = cell + c; i1 = cell; i2 = cell + c + 1u; }
-        else          { i0 = cell + 1u; i1 = cell + c + 1u; i2 = cell; }
-    }
-    else
-    {
-        if (firstTri) { i0 = cell; i1 = cell + 1u; i2 = cell + c; }
-        else          { i0 = cell + c + 1u; i1 = cell + c; i2 = cell + 1u; }
-    }
-}
-
-static void triAdjacency(const Hf& h, uint32_t t, uint32_t& a0, uint32_t& a1, uint32_t& a2)
-{
-    const uint32_t cell = t >> 1;
-    const bool firstTri = (t & 1u) == 0u;
-    const uint32_t c = h.cols, r = h.rows;
-    a0 = HF_BOUNDARY;
-    a2 = HF_BOUNDARY;
-    if (zerothVertexShared(h, cell))
-    {
-        if (firstTri)
-        {
-            a1 = t + 1u;
-            if (cell % c != 0u)        a0 = t - 1u;
-            if (cell / c != r - 2u)    a2 = ((cell + c) * 2u) + 1u;
-        }
-        else
-        {
-            a1 = t - 1u;
-            if (cell % c < c - 2u)     a0 = t + 1u;
-            if (cell >= c - 1u)        a2 = (cell - c) * 2u;
-        }
-    }
-    else
-    {
-        if (firstTri)
-        {
-            a1 = t + 1u;
-            if (cell >= c - 1u)        a0 = ((cell - c) * 2u) + 1u;
-            if (cell % c != 0u)        a2 = t - 1u;
-        }
-        else
-        {
-            a1 = t - 1u;
-            if (cell / c != r - 2u)    a0 = (cell + c) * 2u;
-            if (cell % c < c - 2u)     a2 = t + 1u;
-        }
-    }
-}
-
-// getTriangle (heightfieldUtil.cuh:262).  The vertex permutation swaps slots 1/2,
-// the adjacency permutation swaps slots 0/2 -- two DIFFERENT permutations, both
-// driven by the same xor.  `adjacencyIndices->w` is never assigned upstream.
-static void getTriangle(const Hf& h, uint32_t t, V3 scale,
-                        V3& v0, V3& v1, V3& v2, uint32_t adj[3])
-{
-    bool wrongHanded = false;
-    if (scale.z < 0.0f) wrongHanded = !wrongHanded;
-    if (scale.x < 0.0f) wrongHanded = !wrongHanded;
-
-    uint32_t i0, i1, i2;
-    triVertexIndices(h, t, i0, i1, i2);
-    uint32_t a0, a1, a2;
-    triAdjacency(h, t, a0, a1, a2);
-    adj[0] = wrongHanded ? a2 : a0;
-    adj[1] = a1;
-    adj[2] = wrongHanded ? a0 : a2;
-
-    const uint32_t tv[3] = { i0, wrongHanded ? i2 : i1, wrongHanded ? i1 : i2 };
-    V3* out[3] = { &v0, &v1, &v2 };
-    for (uint32_t k = 0; k < 3; ++k)
-    {
-        const V3 g = hfGetVertex(h, tv[k]);
-        *out[k] = V3{ g.x * scale.x, g.y * scale.y, g.z * scale.z };   // hf2shapep
-    }
-}
-
-// The three-vertex overload the switch calls with a NULL adjacency (:470).
-static void getTriangleNoAdj(const Hf& h, uint32_t t, V3 scale, V3& v0, V3& v1, V3& v2)
-{
-    uint32_t ignored[3];
-    getTriangle(h, t, scale, v0, v1, v2, ignored);
-}
-
-// ---------------------------------------------------------------------------
 // distancePointTriangleSquared (sphereTriangle.cuh:41-140)
 //
 // STRICT comparisons in the three vertex regions and in `vc < 0`, the branch order
@@ -312,9 +151,6 @@ static void getTriangleNoAdj(const Hf& h, uint32_t t, V3 scale, V3& v0, V3& v1, 
 // adjacency indices never carry bit 31 except as the BOUNDARY sentinel, which
 // isEdgeNonconvex excludes -- so the `||` short-circuits before it is reached.
 // ---------------------------------------------------------------------------
-static bool isEdgeNonconvex(uint32_t i)
-{ return (i != HF_BOUNDARY) && ((i & NONCONVEX_FLAG) != 0u); }
-
 static float distancePointTriangleSquared(V3 p, V3 a, V3 b, V3 c, const uint32_t adj[3],
                                           V3& closestP, bool& generateContact,
                                           bool& faceContact, uint32_t& mask)

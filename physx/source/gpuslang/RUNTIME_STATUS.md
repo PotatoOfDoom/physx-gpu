@@ -1839,6 +1839,92 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.52b-5 — fünf Spiegel auf drei Header, und ein Diff, der VOR der Zusammenlegung kommen musste
+
+`testSphereHfCore`, `testHfTriFlagsBda`, `testSegTriangleBda`, `testCapTriangleBda`
+und `testCapsuleHfCore` trugen jeweils eine private Kopie derselben CUDA-Spiegel:
+Vektor- und Quaternionenmathematik, die Heightfield-Dekoder, `computeTriangleFlags`
+und `selectNormal`, `distanceSegmentSegmentSquared` und
+`distanceSegmentTriangleSquared`, und die beiden Kontaktgeneratoren. Jetzt liegen sie
+in `pxgNpRefMath.h`, `pxgHeightfieldRef.h` und `pxgCapsuleTriRef.h` — Präzedenz:
+`pxgArtiRefHelpers.h`, `pxgRefMath.h`, `pxgGridCalRef.h`.
+
+### Der Diff kam zuerst, und das war nicht Zeremonie
+
+Ein Spiegel ist ein **Orakel**: die Vorrichtung vergleicht ihren Shader bitgenau
+gegen ihn. Fünf Kopien zusammenzulegen heißt, vier davon wegzuwerfen — und wenn
+zwei Kopien sich unterscheiden, ist die Wahl, welche bleibt, eine Entscheidung über
+die Wahrheit und keine über den Stil. Also wurde vor jeder Verschiebung jede Kopie
+jeder gemeinsamen Funktion extrahiert und **ausdrucksweise** verglichen. Fließkomma
+ist reihenfolgeempfindlich: `a*b + c*d` gegen `c*d + a*b` wäre bereits eine
+Divergenz, ebenso eine andere Klammerung, ein anderer Strikt-Vergleich, ein anderes
+Epsilon oder ein Wächter, der `!(m > 0)` statt `m <= 0` schreibt (die trennen sich
+bei NaN).
+
+Der erste Versuch war ein Workflow mit acht Agenten — er ist an seinem Ausgabeschema
+gescheitert, alle acht. Das war kein Verlust: **für einen zeichengenauen Vergleich
+ist ein Diff ohnehin das ehrlichere Werkzeug als ein Sprachmodell.** Ein Skript
+extrahiert seither jede Funktion über Klammerbilanz, normalisiert Kommentare,
+Leerraum und Bezeichnernamen weg und vergleicht paarweise.
+
+Ergebnis: **19 Funktionen zeichengleich über alle Kopien, 14 „divergent" — und
+keine einzige der 14 arithmetisch oder im Kontrollfluss.** Jede war Formatierung,
+ein Bezeichner, eine umgestellte Deklarationsreihenfolge oder die
+**Trace-Ausgabeparameter**, die die `*Bda`-Sonden tragen und die Kernvorrichtungen
+nicht. Zwei Fälle, in denen es genau hinzusehen galt:
+
+* `genEE` schreibt in einer Kopie `if (temp > 0.0f)` mit `temp = signP * signQ`,
+  in der anderen `if ((np - d) * (nq - d) > 0.0f)` — dieselbe Klammerung, benannte
+  Zwischenwerte gegen inline. Und die `tValue`-Wächter stehen einmal als zwei
+  Anweisungen, einmal als ein `||`; Kurzschluss macht sie gleich.
+* `segTriSquared` schreibt die drei Kanten-Abstände einmal mit sechs benannten
+  Punkten, einmal mit einem wiederverwendeten `tv` — Ausdruck für Ausdruck dieselbe
+  Rechnung.
+
+Die Rümpfe sind daher **verbatim verschoben**, nicht abgetippt: ein Skript hat die
+Zeilenbereiche aus den Quelldateien gezogen und nur `static` zu `inline` gemacht.
+
+### Was die Zusammenlegung aufgibt, und was nicht
+
+Sie gibt **Redundanz** auf: ein Fehler in einem geteilten Spiegel erreicht jetzt
+fünf Vorrichtungen statt einer. Das ist real und wird hier benannt statt weggeredet.
+Was sie **nicht** aufgibt, ist die Eigenschaft, auf der das ganze Verfahren ruht:
+der Spiegel wird aus dem CUDA geschrieben und der Shader wird aus dem CUDA
+geschrieben, **getrennt**, und jede Vorrichtung vergleicht weiterhin bitgenau. Die
+Unabhängigkeit lag nie zwischen den fünf Kopien — der Diff zeigt, dass sie
+voneinander abgeschrieben waren, bis in die Wahl der Zwischennamen — sondern
+zwischen Spiegel und Shader. Die bleibt unangetastet.
+
+### Die Traces sind der Grund für zwei der Signaturen
+
+`computeTriangleFlags` und `selectNormal` behalten einen Ausgabeparameter, der sagt,
+**welcher Arm** lief, weil die Sonden-Vorrichtungen die Abdeckung des Klassifikators
+prüfen und nicht bloß seine Antwort. Das ist kein Luxus: P9.52b-4 hat gemessen, dass
+`triFlags` die Ausgabe **ausschließlich** über `selectNormal` erreicht und dessen
+Antwort **ausschließlich** bei `sqDist == 0` — die beiden anderen Arme antworten
+beide `triNormal`. Ohne Trace ist der halbe Klassifikator von außen unsichtbar.
+Aufrufer, die nur die Antwort wollen, nehmen die trace-freien Überladungen am
+Dateiende, die eine lokale Senke übergeben.
+
+### Der Beweis, dass der Refactor nichts verschoben hat
+
+Drei Dinge, jedes für sich schwächer als die drei zusammen:
+
+1. Alle fünf Vorrichtungen laufen **unverändert bitgenau** gegen ihre Shader. Die
+   GPU-Seite wurde nicht angefasst; hätte sich im Spiegel ein einziges ULP bewegt,
+   wäre der Vergleich rot.
+2. Die Verzweigungsstatistik von `capsuleHfCore` ist **identisch** zu vorher:
+   `selected 10, face-fallback 3, deferred 5, none 4; contacts 0/5 1/9 2/8`.
+3. Der vollständige 56-Mutanten-Sweep gegen `pxgSlangCapsuleHfCore` läuft mit dem
+   **geteilten** Spiegel als Orakel und tötet weiterhin 55 — ein Orakel, das
+   Unterscheidungskraft verloren hätte, ließe Mutanten durch.
+
+Das Duplikatsmaß selbst: von 33 gemeinsamen Definitionen über fünf Dateien auf
+**null** — dasselbe Skript, das den Diff gemacht hat, findet danach keine doppelte
+Funktion mehr. Netto 205 Zeilen weniger, aber das ist der uninteressante Teil.
+
+Suite **856/856** in beiden Modi.
+
 ## P9.52b-4 — der Kapsel-Kern; ein zweiter toter Kanal, eine Normale aus reinem Rundungsrest, und zehn Überlebende, die alle dasselbe sagten
 
 `capsuleHeightfieldNarrowphaseCore` (convexHeightfield.cu:636-789) als Modul

@@ -51,6 +51,8 @@
 // ON a decision boundary rather than near it.
 
 #include "pxgTestFramework.h"
+#include "pxgCapsuleTriRef.h"
+#include "pxgNpRefMath.h"
 
 #include <cmath>
 #include <cstdint>
@@ -61,174 +63,11 @@ namespace
 {
 using namespace pxgtest;
 
-struct V3 { float x, y, z; };
-
-static V3 sub(V3 a, V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
-static V3 add(V3 a, V3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
-static V3 mul(V3 a, float s) { return { a.x * s, a.y * s, a.z * s }; }
-static V3 neg(V3 a) { return { -a.x, -a.y, -a.z }; }
-static float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-static V3 cross3(V3 a, V3 b)
-{ return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
-
-static const float MAX_F32 = 3.4028234663852886e+38f;
-
-// isValidTriangleBarycentricCoord (capsuleTriangle.cuh:102-110)
-static bool validBarycentric(float v, float w)
-{
-    const float eps = 1e-6f;
-    const float zero = -eps;
-    const float one = 1.0f + eps;
-    return (v >= zero && v <= one) && (w >= zero && w <= one) && ((v + w) <= one);
-}
-
-struct Contacts
-{
-    V3 pt[2];
-    float sep[2];
-    uint32_t n;
-};
-
-static Contacts contactsInit()
-{
-    Contacts o{};
-    o.pt[0] = V3{ 0, 0, 0 }; o.pt[1] = V3{ 0, 0, 0 };
-    o.sep[0] = 0.0f; o.sep[1] = 0.0f;
-    o.n = 0;
-    return o;
-}
-
-// ---------------------------------------------------------------------------
-// generateContacts (capsuleTriangle.cuh:329-406)
-// ---------------------------------------------------------------------------
-struct FaceTrace { bool ideomGuard; bool con0, con1, took0, took1; };
-
-static Contacts genContacts(V3 a, V3 b, V3 c, V3 planeNormal, V3 normal,
-                            V3 p, V3 q, float inflatedRadius, FaceTrace& tr)
-{
-    Contacts o = contactsInit();
-
-    const V3 ab = sub(b, a);
-    const V3 ac = sub(c, a);
-    const V3 ap = sub(p, a);
-    const V3 aq = sub(q, a);
-
-    const float d00 = dot3(ab, ab);
-    const float d01 = dot3(ab, ac);
-    const float d11 = dot3(ac, ac);
-    const float tdenom = (d00 * d11 - d01 * d01);
-    const float bdenom = (tdenom > 0.0f) ? (1.0f / tdenom) : MAX_F32;
-
-    const float inomp = dot3(planeNormal, neg(ap));
-    const float ideom = dot3(planeNormal, normal);
-    tr.ideomGuard = !(ideom > 0.0f);
-
-    const float ipt = ideom > 0.0f ? -(inomp / ideom) : MAX_F32;
-
-    const V3 closestP31 = sub(p, mul(normal, ipt));
-    const V3 pV20 = sub(closestP31, a);
-    const float pD20 = dot3(pV20, ab);
-    const float pD21 = dot3(pV20, ac);
-    const float v0 = (d11 * pD20 - d01 * pD21) * bdenom;
-    const float w0 = (d00 * pD21 - d01 * pD20) * bdenom;
-    const bool con0 = validBarycentric(v0, w0);
-    tr.con0 = con0;
-
-    tr.took0 = false; tr.took1 = false;
-    if (con0 && (inflatedRadius > ipt))
-    {
-        o.pt[o.n] = p; o.sep[o.n] = ipt; o.n++;
-        tr.took0 = true;
-    }
-
-    const float inomq = dot3(planeNormal, neg(aq));
-    const float iqt = ideom > 0.0f ? -(inomq / ideom) : MAX_F32;
-
-    const V3 closestP41 = sub(q, mul(normal, iqt));
-    const V3 qV20 = sub(closestP41, a);
-    const float qD20 = dot3(qV20, ab);
-    const float qD21 = dot3(qV20, ac);
-    const float v1 = (d11 * qD20 - d01 * qD21) * bdenom;
-    const float w1 = (d00 * qD21 - d01 * qD20) * bdenom;
-    const bool con1 = validBarycentric(v1, w1);
-    tr.con1 = con1;
-
-    if (con1 && (inflatedRadius > iqt))
-    {
-        o.pt[o.n] = q; o.sep[o.n] = iqt; o.n++;
-        tr.took1 = true;
-    }
-
-    return o;
-}
-
-// ---------------------------------------------------------------------------
-// generateEE (capsuleTriangle.cuh:408-461)
-// ---------------------------------------------------------------------------
-enum EeExit { EE_SAME_SIDE = 0, EE_PARALLEL, EE_T_HIGH, EE_T_LOW, EE_TOO_FAR, EE_EMIT };
-
-struct EeTrace { EeExit exits[3]; uint32_t nRun; float npq[3], denom[3]; };
-
-static Contacts genEE(V3 p, V3 q, float sqInflatedRadius, V3 normal, V3 a, V3 b,
-                      Contacts o, EeExit& exit, float& npqOut, float& denomOut)
-{
-    const V3 ab = sub(b, a);
-    const V3 n = cross3(ab, normal);
-    const float d = dot3(n, a);
-    const float np = dot3(n, p);
-    const float nq = dot3(n, q);
-    const float signP = np - d;
-    const float signQ = nq - d;
-    const float temp = signP * signQ;
-    npqOut = 0.0f; denomOut = 0.0f;
-    if (temp > 0.0f) { exit = EE_SAME_SIDE; return o; }
-
-    const V3 pq = sub(q, p);
-    const float npq = dot3(n, pq);
-    npqOut = npq;
-    if (npq == 0.0f) { exit = EE_PARALLEL; return o; }
-
-    const float segTValue = (d - np) / npq;
-    const V3 localPointA = add(p, mul(pq, segTValue));
-
-    const V3 perNormal = cross3(normal, pq);
-    const V3 ap = sub(localPointA, a);
-    const float nom = dot3(perNormal, ap);
-    const float denom = dot3(perNormal, ab);
-    denomOut = denom;
-
-    const float tValue = nom / denom;
-    if (tValue > 1.0f) { exit = EE_T_HIGH; return o; }
-    if (tValue < 0.0f) { exit = EE_T_LOW; return o; }
-
-    const V3 v = sub(ap, mul(ab, tValue));
-    const float sqDist = dot3(v, v);
-
-    if (sqInflatedRadius > sqDist)
-    {
-        const float signedDist = dot3(v, normal);
-        o.pt[o.n] = localPointA; o.sep[o.n] = signedDist; o.n++;
-        exit = EE_EMIT;
-        return o;
-    }
-    exit = EE_TOO_FAR;
-    return o;
-}
-
-static Contacts genEEContacts(V3 a, V3 b, V3 c, V3 normal, V3 p, V3 q,
-                              float sqInflatedRadius, Contacts o, EeTrace& tr)
-{
-    tr.nRun = 0;
-    for (uint32_t k = 0; k < 3; ++k) { tr.exits[k] = EE_SAME_SIDE; tr.npq[k] = 0; tr.denom[k] = 0; }
-
-    if (o.n < 2) { o = genEE(p, q, sqInflatedRadius, normal, a, b, o,
-                             tr.exits[0], tr.npq[0], tr.denom[0]); tr.nRun++; }
-    if (o.n < 2) { o = genEE(p, q, sqInflatedRadius, normal, b, c, o,
-                             tr.exits[1], tr.npq[1], tr.denom[1]); tr.nRun++; }
-    if (o.n < 2) { o = genEE(p, q, sqInflatedRadius, normal, a, c, o,
-                             tr.exits[2], tr.npq[2], tr.denom[2]); tr.nRun++; }
-    return o;
-}
+// The mirrors this fixture verifies against live in shared headers -- see
+// pxgNpRefMath.h and pxgCapsuleTriRef.h.  This file keeps only the probe ABI and
+// the cases.
+using namespace pxgtest::npref;
+using namespace pxgtest::captriref;
 
 // ---------------------------------------------------------------------------
 struct CtPush { uint64_t cases, output; uint32_t numCases, pad; };

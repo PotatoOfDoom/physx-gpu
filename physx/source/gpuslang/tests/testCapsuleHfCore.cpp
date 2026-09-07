@@ -29,9 +29,9 @@
 // sphereHeightfieldNarrowphase.  P9.52b-4.
 //
 // The mirror is written from the CUDA and composes the same four pieces the module
-// does.  It is a FOURTH copy of mirror code that now exists in three other
-// fixtures; consolidating all four onto one shared reference header is the next
-// tranche, kept separate so this one's evidence is not entangled with a refactor.
+// does.  Those four pieces now live in pxgNpRefMath.h, pxgHeightfieldRef.h and
+// pxgCapsuleTriRef.h (P9.52b-5); what remains here is `capsuleCore` itself, which is
+// the only thing this fixture verifies that no other fixture does.
 //
 // ===========================================================================
 // WHAT THIS FIXTURE EXISTS TO PIN
@@ -77,6 +77,9 @@
 // aimed; without it they would have been guesses.
 
 #include "pxgTestFramework.h"
+#include "pxgCapsuleTriRef.h"
+#include "pxgHeightfieldRef.h"
+#include "pxgNpRefMath.h"
 
 #include <cmath>
 #include <cstdint>
@@ -88,387 +91,19 @@ namespace
 {
 using namespace pxgtest;
 
-struct V3 { float x, y, z; };
-struct V4 { float x, y, z, w; };
+// The mirrors this fixture composes live in shared headers -- pxgNpRefMath.h,
+// pxgHeightfieldRef.h and pxgCapsuleTriRef.h.  Their headers carry the reasoning;
+// this file keeps the CORE itself, which is the only thing it verifies alone.
+using namespace pxgtest::npref;
+using namespace pxgtest::hfref;
+using namespace pxgtest::captriref;
 
-static V3 sub(V3 a, V3 b) { return { a.x - b.x, a.y - b.y, a.z - b.z }; }
-static V3 add(V3 a, V3 b) { return { a.x + b.x, a.y + b.y, a.z + b.z }; }
-static V3 mul(V3 a, float s) { return { a.x * s, a.y * s, a.z * s }; }
-static V3 neg(V3 a) { return { -a.x, -a.y, -a.z }; }
-static float dot3(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-static V3 cross3(V3 a, V3 b)
-{ return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x }; }
-
-static V3 quatRotate(V4 q, V3 v)
-{
-    const V3 u = { q.x, q.y, q.z };
-    const float w = q.w;
-    const float uu = dot3(u, u), vu = dot3(v, u);
-    const V3 c = cross3(u, v);
-    return { v.x * (w * w - uu) + u.x * (vu * 2.0f) + c.x * (w * 2.0f),
-             v.y * (w * w - uu) + u.y * (vu * 2.0f) + c.y * (w * 2.0f),
-             v.z * (w * w - uu) + u.z * (vu * 2.0f) + c.z * (w * 2.0f) };
-}
-static V3 quatRotateInv(V4 q, V3 v)
-{
-    const V3 u = { q.x, q.y, q.z };
-    const float w = q.w;
-    const float uu = dot3(u, u), vu = dot3(v, u);
-    const V3 c = cross3(u, v);
-    return { v.x * (w * w - uu) + u.x * (vu * 2.0f) - c.x * (w * 2.0f),
-             v.y * (w * w - uu) + u.y * (vu * 2.0f) - c.y * (w * 2.0f),
-             v.z * (w * w - uu) + u.z * (vu * 2.0f) - c.z * (w * 2.0f) };
-}
-static V4 quatMul(V4 a, V4 b)
-{
-    return { a.w * b.x + b.w * a.x + a.y * b.z - a.z * b.y,
-             a.w * b.y + b.w * a.y + a.z * b.x - a.x * b.z,
-             a.w * b.z + b.w * a.z + a.x * b.y - a.y * b.x,
-             a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
-}
-static V4 quatConj(V4 q) { return { -q.x, -q.y, -q.z, q.w }; }
-
-// PxQuat::getBasisVector0 (PxQuat.h:260-265) -- ITS OWN FORMULA, not a rotate.
-static V3 basisVector0(V4 q)
-{
-    const float x2 = q.x * 2.0f;
-    const float w2 = q.w * 2.0f;
-    return V3{ (q.w * w2) - 1.0f + q.x * x2,
-               (q.z * w2) + q.y * x2,
-               (-q.y * w2) + q.z * x2 };
-}
-
-static V3 normalized(V3 v)
-{
-    const float m = dot3(v, v);
-    if (!(m > 0.0f)) return V3{ 0, 0, 0 };
-    const float r = 1.0f / std::sqrt(m);
-    return V3{ v.x * r, v.y * r, v.z * r };
-}
-
-static float pxMax(float a, float b) { return a < b ? b : a; }
-static float pxMin(float a, float b) { return a < b ? a : b; }
-static float pxClamp(float v, float lo, float hi) { return pxMin(hi, pxMax(lo, v)); }
-
-static const float MAX_F32 = 3.4028234663852886e+38f;
-static const uint32_t HF_BOUNDARY = 0xFFFFFFFFu;
-static const uint32_t ETD_01 = 1u << 3, ETD_12 = 1u << 4, ETD_20 = 1u << 5;
+// The flag bit names the shared header spells out in full.
+static const uint32_t ETD_01 = ETD_CONVEX_EDGE_01;
+static const uint32_t ETD_12 = ETD_CONVEX_EDGE_12;
+static const uint32_t ETD_20 = ETD_CONVEX_EDGE_20;
 static const uint32_t NB_CONTACTS_SHIFT = 27u;
 static const uint32_t DEFER_MASK = 0x80000000u;
-
-// ---------------------------------------------------------------------------
-// the heightfield blob (heightfieldUtil.cuh, convexHeightfield.cu:83-116)
-// ---------------------------------------------------------------------------
-struct Hf { uint32_t rows = 0, cols = 0; std::vector<uint32_t> samples, blob; };
-
-static uint32_t sampleWord(int16_t h, uint8_t m0, bool tess, uint8_t m1)
-{
-    return uint32_t(uint16_t(h)) | (uint32_t(m0 & 0x7f) << 16)
-         | (tess ? (1u << 23) : 0u) | (uint32_t(m1 & 0x7f) << 24);
-}
-static void buildHf(Hf& h)
-{ h.blob.clear(); h.blob.push_back(h.rows); h.blob.push_back(h.cols);
-  for (uint32_t s : h.samples) h.blob.push_back(s); }
-static bool zerothShared(const Hf& h, uint32_t cell)
-{ return (h.samples[cell] & 0x800000u) != 0u; }
-static float hfHeight(const Hf& h, uint32_t vi)
-{ return float(int16_t(uint16_t(h.samples[vi] & 0xffffu))); }
-static V3 hfVertex(const Hf& h, uint32_t vi)
-{ return V3{ float(vi / h.cols), hfHeight(h, vi), float(vi % h.cols) }; }
-
-static void triVertexIndices(const Hf& h, uint32_t t, uint32_t& i0, uint32_t& i1, uint32_t& i2)
-{
-    const uint32_t cell = t >> 1, c = h.cols;
-    const bool first = (t & 1u) == 0u;
-    if (zerothShared(h, cell))
-    {
-        if (first) { i0 = cell + c; i1 = cell; i2 = cell + c + 1u; }
-        else       { i0 = cell + 1u; i1 = cell + c + 1u; i2 = cell; }
-    }
-    else
-    {
-        if (first) { i0 = cell; i1 = cell + 1u; i2 = cell + c; }
-        else       { i0 = cell + c + 1u; i1 = cell + c; i2 = cell + 1u; }
-    }
-}
-static void triAdjacency(const Hf& h, uint32_t t, uint32_t& a0, uint32_t& a1, uint32_t& a2)
-{
-    const uint32_t cell = t >> 1, c = h.cols, r = h.rows;
-    const bool first = (t & 1u) == 0u;
-    a0 = HF_BOUNDARY; a2 = HF_BOUNDARY;
-    if (zerothShared(h, cell))
-    {
-        if (first) { a1 = t + 1u;
-                     if (cell % c != 0u) a0 = t - 1u;
-                     if (cell / c != r - 2u) a2 = ((cell + c) * 2u) + 1u; }
-        else       { a1 = t - 1u;
-                     if (cell % c < c - 2u) a0 = t + 1u;
-                     if (cell >= c - 1u) a2 = (cell - c) * 2u; }
-    }
-    else
-    {
-        if (first) { a1 = t + 1u;
-                     if (cell >= c - 1u) a0 = ((cell - c) * 2u) + 1u;
-                     if (cell % c != 0u) a2 = t - 1u; }
-        else       { a1 = t - 1u;
-                     if (cell / c != r - 2u) a0 = (cell + c) * 2u;
-                     if (cell % c < c - 2u) a2 = t + 1u; }
-    }
-}
-static void getTriangle(const Hf& h, uint32_t t, V3 scale,
-                        V3& v0, V3& v1, V3& v2, uint32_t adj[3])
-{
-    bool wh = false;
-    if (scale.z < 0.0f) wh = !wh;
-    if (scale.x < 0.0f) wh = !wh;
-    uint32_t i0, i1, i2, a0, a1, a2;
-    triVertexIndices(h, t, i0, i1, i2);
-    triAdjacency(h, t, a0, a1, a2);
-    adj[0] = wh ? a2 : a0; adj[1] = a1; adj[2] = wh ? a0 : a2;
-    const uint32_t tv[3] = { i0, wh ? i2 : i1, wh ? i1 : i2 };
-    V3* out[3] = { &v0, &v1, &v2 };
-    for (uint32_t k = 0; k < 3; ++k)
-    {
-        const V3 g = hfVertex(h, tv[k]);
-        *out[k] = V3{ g.x * scale.x, g.y * scale.y, g.z * scale.z };
-    }
-}
-
-// computeTriangleFlags (convexHeightfield.cu:565-614), boundaryCollisions == true
-static uint32_t triangleFlags(const Hf& h, const uint32_t adj[3],
-                              V3 c0, V3 c1, V3 c2, V3 triNormal, V3 scale)
-{
-    const uint32_t nextInd[3] = { 2u, 0u, 1u };
-    uint32_t f = 0u;
-    for (uint32_t a = 0; a < 3; ++a)
-    {
-        if (adj[a] == HF_BOUNDARY) continue;
-        V3 av0, av1, av2; uint32_t ig[3];
-        getTriangle(h, adj[a], scale, av0, av1, av2, ig);
-        V3 adjNormal = cross3(sub(av1, av0), sub(av2, av0));
-        const uint32_t oi = nextInd[a];
-        const V3 other = (oi == 0u) ? c0 : ((oi == 1u) ? c1 : c2);
-        const float projD = dot3(adjNormal, sub(other, av0));
-        if (projD < 0.0f)
-        {
-            const float m2 = dot3(adjNormal, adjNormal);
-            if (m2 > 0.0f)
-            { const float r = 1.0f / std::sqrt(m2);
-              adjNormal = V3{ adjNormal.x * r, adjNormal.y * r, adjNormal.z * r }; }
-            if (dot3(adjNormal, triNormal) < 0.997f) f |= (1u << (a + 3u));
-        }
-        else f |= (1u << (a + 3u));
-    }
-    return f;
-}
-
-// selectNormal (capsuleTriangle.cuh:38-98)
-static bool selectNormal(float u, float v, uint32_t f)
-{
-    const float zero = 1e-6f, one = 0.999999f;
-    if (zero > u)
-    {
-        if (zero > v) { if ((f & (ETD_01 | ETD_20)) == 0u) return true; }
-        else if (v > one) { if ((f & (ETD_12 | ETD_20)) == 0u) return true; }
-        else { if ((f & ETD_20) == 0u) return true; }
-    }
-    else if (u > one)
-    {
-        if (zero > v) { if ((f & (ETD_01 | ETD_12)) == 0u) return true; }
-    }
-    else
-    {
-        if (zero > v) { if ((f & ETD_01) == 0u) return true; }
-        else
-        {
-            const float threshold = 0.9999f;
-            if ((u + v) >= threshold) { if ((f & ETD_12) == 0u) return true; }
-            else return true;
-        }
-    }
-    return false;
-}
-
-// ---------------------------------------------------------------------------
-// distanceSegmentSegmentSquared / distanceSegmentTriangleSquared
-// ---------------------------------------------------------------------------
-static bool validBary(float v, float w)
-{
-    const float eps = 1e-6f, zero = -eps, one = 1.0f + eps;
-    return (v >= zero && v <= one) && (w >= zero && w <= one) && ((v + w) <= one);
-}
-
-static void segSeg(V3 p1, V3 d1, V3 p2, V3 d2, float& s, float& t)
-{
-    const float eps = 1e-6f;
-    const V3 r = sub(p1, p2);
-    const float a = dot3(d1, d1), e = dot3(d2, d2);
-    const float b = dot3(d1, d2), c = dot3(d1, r);
-    const float aRecip = a > eps ? (1.0f / a) : 0.0f;
-    const float eRecip = e > eps ? (1.0f / e) : 0.0f;
-    const float f = dot3(d2, r);
-    const float denom = a * e - b * b;
-    const float temp = b * f - c * e;
-    const float s0 = pxClamp(temp / denom, 0.0f, 1.0f);
-    const float sTmp = eps > denom ? 0.5f : s0;
-    const float tTmp = (b * sTmp + f) * eRecip;
-    const float t2 = pxClamp(tTmp, 0.0f, 1.0f);
-    const float comp = (b * t2 - c) * aRecip;
-    s = pxClamp(comp, 0.0f, 1.0f);
-    t = t2;
-}
-
-static float segTri(V3 p, V3 q, V3 a, V3 b, V3 c, float& t, float& u, float& v)
-{
-    const V3 pq = sub(q, p), ab = sub(b, a), ac = sub(c, a), bc = sub(c, b);
-    const V3 ap = sub(p, a), aq = sub(q, a);
-    const float d00 = dot3(ab, ab), d01 = dot3(ab, ac), d11 = dot3(ac, ac);
-    const float tDenom = d00 * d11 - d01 * d01;
-    const float bdenom = tDenom > 0.0f ? 1.0f / tDenom : MAX_F32;
-    const V3 n = normalized(cross3(ab, ac));
-    const float dist3 = dot3(ap, n), sqDist3 = dist3 * dist3;
-    const float dist4 = dot3(aq, n), sqDist4 = dist4 * dist4;
-    const float dMul = dist3 * dist4;
-
-    if (dMul <= 0.0f)
-    {
-        const float nom = -dot3(n, ap);
-        const float denom = 1.0f / dot3(n, pq);
-        const float t0 = nom * denom;
-        const V3 ip = add(p, mul(pq, t0));
-        const V3 v2 = sub(ip, a);
-        const float d20 = dot3(v2, ab), d21 = dot3(v2, ac);
-        const float v00 = (d11 * d20 - d01 * d21) * bdenom;
-        const float w00 = (d00 * d21 - d01 * d20) * bdenom;
-        if (validBary(v00, w00)) { t = t0; u = v00; v = w00; return 0.0f; }
-    }
-
-    const V3 cp31 = sub(p, mul(n, dist3));
-    const V3 pV20 = sub(cp31, a);
-    const float pD20 = dot3(pV20, ab), pD21 = dot3(pV20, ac);
-    const float v0 = (d11 * pD20 - d01 * pD21) * bdenom;
-    const float w0 = (d00 * pD21 - d01 * pD20) * bdenom;
-    const bool con0 = validBary(v0, w0);
-
-    const V3 cp41 = sub(q, mul(n, dist4));
-    const V3 qV20 = sub(cp41, a);
-    const float qD20 = dot3(qV20, ab), qD21 = dot3(qV20, ac);
-    const float v1 = (d11 * qD20 - d01 * qD21) * bdenom;
-    const float w1 = (d00 * qD21 - d01 * qD20) * bdenom;
-    const bool con1 = validBary(v1, w1);
-
-    if (con0 && con1)
-    {
-        if (sqDist4 > sqDist3) { t = 0.0f; u = v0; v = w0; return sqDist3; }
-        t = 1.0f; u = v1; v = w1; return sqDist4;
-    }
-
-    float t00, t01, t02, t10, t11, t12;
-    segSeg(p, pq, a, ab, t00, t10);
-    segSeg(p, pq, b, bc, t01, t11);
-    segSeg(p, pq, a, ac, t02, t12);
-
-    V3 tv = sub(add(p, mul(pq, t00)), add(a, mul(ab, t10)));
-    const float sqDist0 = dot3(tv, tv);
-    tv = sub(add(p, mul(pq, t01)), add(b, mul(bc, t11)));
-    const float sqDist1 = dot3(tv, tv);
-    tv = sub(add(p, mul(pq, t02)), add(a, mul(ac, t12)));
-    const float sqDist2 = dot3(tv, tv);
-
-    const float u10 = t10, v10 = 0.0f;
-    const float u11 = 1.0f - t11, v11 = t11;
-    const float u12 = 0.0f, v12 = t12;
-
-    float sqDistPE, uEdge, vEdge, tSeg;
-    if (sqDist1 > sqDist0 && sqDist2 > sqDist0)
-    { sqDistPE = sqDist0; uEdge = u10; vEdge = v10; tSeg = t00; }
-    else if (sqDist2 > sqDist1)
-    { sqDistPE = sqDist1; uEdge = u11; vEdge = v11; tSeg = t01; }
-    else
-    { sqDistPE = sqDist2; uEdge = u12; vEdge = v12; tSeg = t02; }
-
-    if (con0)
-    {
-        if (sqDistPE > sqDist3) { t = 0.0f; u = v0; v = w0; return sqDist3; }
-        t = tSeg; u = uEdge; v = vEdge; return sqDistPE;
-    }
-    if (con1)
-    {
-        if (sqDistPE > sqDist4) { t = 1.0f; u = v1; v = w1; return sqDist4; }
-        t = tSeg; u = uEdge; v = vEdge; return sqDistPE;
-    }
-    t = tSeg; u = uEdge; v = vEdge; return sqDistPE;
-}
-
-// ---------------------------------------------------------------------------
-// the two contact generators
-// ---------------------------------------------------------------------------
-struct Contacts { V3 pt[2]; float sep[2]; uint32_t n; };
-static Contacts contactsInit()
-{ Contacts o{}; o.pt[0] = V3{0,0,0}; o.pt[1] = V3{0,0,0};
-  o.sep[0] = 0.0f; o.sep[1] = 0.0f; o.n = 0; return o; }
-
-static Contacts genContacts(V3 a, V3 b, V3 c, V3 planeNormal, V3 normal,
-                            V3 p, V3 q, float inflatedRadius)
-{
-    Contacts o = contactsInit();
-    const V3 ab = sub(b, a), ac = sub(c, a), ap = sub(p, a), aq = sub(q, a);
-    const float d00 = dot3(ab, ab), d01 = dot3(ab, ac), d11 = dot3(ac, ac);
-    const float tdenom = (d00 * d11 - d01 * d01);
-    const float bdenom = (tdenom > 0.0f) ? (1.0f / tdenom) : MAX_F32;
-
-    const float inomp = dot3(planeNormal, neg(ap));
-    const float ideom = dot3(planeNormal, normal);
-    const float ipt = ideom > 0.0f ? -(inomp / ideom) : MAX_F32;
-    const V3 cp31 = sub(p, mul(normal, ipt));
-    const V3 pV20 = sub(cp31, a);
-    const float v0 = (d11 * dot3(pV20, ab) - d01 * dot3(pV20, ac)) * bdenom;
-    const float w0 = (d00 * dot3(pV20, ac) - d01 * dot3(pV20, ab)) * bdenom;
-    if (validBary(v0, w0) && (inflatedRadius > ipt))
-    { o.pt[o.n] = p; o.sep[o.n] = ipt; o.n++; }
-
-    const float inomq = dot3(planeNormal, neg(aq));
-    const float iqt = ideom > 0.0f ? -(inomq / ideom) : MAX_F32;
-    const V3 cp41 = sub(q, mul(normal, iqt));
-    const V3 qV20 = sub(cp41, a);
-    const float v1 = (d11 * dot3(qV20, ab) - d01 * dot3(qV20, ac)) * bdenom;
-    const float w1 = (d00 * dot3(qV20, ac) - d01 * dot3(qV20, ab)) * bdenom;
-    if (validBary(v1, w1) && (inflatedRadius > iqt))
-    { o.pt[o.n] = q; o.sep[o.n] = iqt; o.n++; }
-
-    return o;
-}
-
-static Contacts genEE(V3 p, V3 q, float sqR, V3 normal, V3 a, V3 b, Contacts o)
-{
-    const V3 ab = sub(b, a);
-    const V3 n = cross3(ab, normal);
-    const float d = dot3(n, a), np = dot3(n, p), nq = dot3(n, q);
-    if ((np - d) * (nq - d) > 0.0f) return o;
-    const V3 pq = sub(q, p);
-    const float npq = dot3(n, pq);
-    if (npq == 0.0f) return o;
-    const float segT = (d - np) / npq;
-    const V3 L = add(p, mul(pq, segT));
-    const V3 perNormal = cross3(normal, pq);
-    const V3 ap = sub(L, a);
-    const float tValue = dot3(perNormal, ap) / dot3(perNormal, ab);
-    if (tValue > 1.0f || tValue < 0.0f) return o;
-    const V3 v = sub(ap, mul(ab, tValue));
-    const float sqDist = dot3(v, v);
-    if (sqR > sqDist)
-    { o.pt[o.n] = L; o.sep[o.n] = dot3(v, normal); o.n++; }
-    return o;
-}
-
-static Contacts genEEContacts(V3 a, V3 b, V3 c, V3 normal, V3 p, V3 q,
-                              float sqR, Contacts o)
-{
-    if (o.n < 2) o = genEE(p, q, sqR, normal, a, b, o);
-    if (o.n < 2) o = genEE(p, q, sqR, normal, b, c, o);
-    if (o.n < 2) o = genEE(p, q, sqR, normal, a, c, o);
-    return o;
-}
 
 // ---------------------------------------------------------------------------
 // the core itself
@@ -534,7 +169,7 @@ static CoreOut capsuleCore(const Hf& hf, const GpuShape& capsuleShape,
     const float dist = dot3(sub(capsuleCenterInMesh, v0), triNormal);
 
     float tSeg, u, v;
-    const float sqDist = segTri(p0, p1, v0, v1, v2, tSeg, u, v);
+    const float sqDist = segTriSquared(p0, p1, v0, v1, v2, tSeg, u, v);
     const float sqInflatedRadius = inflatedRadius * inflatedRadius;
 
     float separation = MAX_F32;
@@ -548,7 +183,7 @@ static CoreOut capsuleCore(const Hf& hf, const GpuShape& capsuleShape,
     r.dist = dist; r.sqDist = sqDist; r.u = u; r.v = v;
     r.inflatedRadius = inflatedRadius; r.sqInflatedRadius = sqInflatedRadius;
     r.triNormal = triNormal;
-    r.triFlags = triangleFlags(hf, adj, v0, v1, v2, triNormal, hfScale);
+    r.triFlags = computeTriangleFlags(hf, adj, v0, v1, v2, triNormal, hfScale);
 
     if (dist >= 0.0f && sqInflatedRadius > sqDist)
     {
