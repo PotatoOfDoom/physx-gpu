@@ -27,6 +27,7 @@
 #include "PxgCudaShim.h"
 
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 
 namespace physx
@@ -235,6 +236,21 @@ PxgResult PxgCudaShim::launchKernel(PxgKernelId id, uint32_t gridX, uint32_t gri
     const PxgPipelineHandle pipe = pipelineFor(id);
     if (pipe == 0)
         return PxgResult::NotFound;
+
+    // PXG_LAUNCH_TRACE=1: name every dispatch on stderr BEFORE it is recorded.  With
+    // PXG_SYNC_EACH=1 alongside, the last line printed is the kernel that faulted --
+    // which is the only way to attribute a shader-side fault at all, because a
+    // SIGSEGV inside llvmpipe's JIT arrives with no symbols and a garbage backtrace.
+    // P9.52b-6 needed exactly this and had to add it; keeping it is cheaper than
+    // rediscovering the need.
+    static const bool trace = std::getenv("PXG_LAUNCH_TRACE") != nullptr;
+    if (trace)
+    {
+        std::fprintf(stderr, "[pxg-launch] %-40s grid=(%u,%u,%u) blob=%u\n",
+                     mManifest[id].cudaName ? mManifest[id].cudaName : (mManifest[id].entry ? mManifest[id].entry : "?"),
+                     gridX, gridY, gridZ, paramBlobSize);
+        std::fflush(stderr);
+    }
 
     if (numTextures > 0)
         mDevice->dispatchTex(pipe, gridX, gridY, gridZ, nullptr, 0, textures, numTextures,

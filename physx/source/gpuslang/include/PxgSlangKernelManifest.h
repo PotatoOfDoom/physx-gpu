@@ -15,7 +15,7 @@ struct PxgSlangKernelRow
 };
 
 static const unsigned PXG_SLANG_KERNEL_COUNT = 501;
-static const unsigned PXG_SLANG_KERNEL_MAPPED = 402;
+static const unsigned PXG_SLANG_KERNEL_MAPPED = 403;
 
 // Indexed by PxgKernelIds::<ENUM> (enum order matches this array order).
 static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
@@ -94,7 +94,7 @@ static const PxgSlangKernelRow gPxgSlangKernelManifest[] = {
     { "convexHeightFieldMidphase", "convexHfMidphaseBda.spv", "convexHeightFieldMidphase" },  // CONVEX_HEIGHTFIELD_MIDPHASE (P9.51a)
     { "convexHeightfieldNarrowphase", "convexHfCoreBda.spv", "convexHeightfieldNarrowphase" },  // CONVEX_HEIGHTFIELD_CORE (P9.51b)
     { "sphereTrimeshNarrowphase", nullptr, nullptr },  // SPHERE_TRIMESH_CORE (unmapped)
-    { "sphereHeightfieldNarrowphase", nullptr, nullptr },  // SPHERE_HEIGHTFIELD_CORE (unmapped)
+    { "sphereHeightfieldNarrowphase", "sphereHfNpBda.spv", "sphereHeightfieldNarrowphase" },  // SPHERE_HEIGHTFIELD_CORE (P9.52b-6)
     { "trimeshPlaneNarrowphase", nullptr, nullptr },  // TRIMESH_PLANE_CORE (unmapped)
     { "trimeshHeightfieldNarrowphase", nullptr, nullptr },  // TRIMESH_HEIGHTFIELD_CORE (unmapped)
     { "triangleTriangleCollision", nullptr, nullptr },  // TRIMESH_TRIMESH_CORE (unmapped)

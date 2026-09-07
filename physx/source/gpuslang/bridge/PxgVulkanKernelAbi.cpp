@@ -1441,6 +1441,13 @@ static const PxgKernelAbiRow kRows[] = {
     // the row is therefore the accurate description, not a shortcut -- and it means
     // a future edit to the trimesh signature cannot leave this one behind.
     { "convexHeightfieldNarrowphase", kCvxTriCore, uint32_t(sizeof(kCvxTriCore)), kCvxTriCoreHostPtrMask },
+    // P9.52b-6: sphereHeightfieldNarrowphase (convexHeightfield.cu:791-818) declares
+    // the SAME 21 parameters in the same order with the same types as the two rows
+    // above, so the blob is byte-for-byte the same 168 bytes and argument 18 is the
+    // same pinned host pointer.  THREE kernels now share this row, which is the
+    // accurate description rather than a shortcut: a future edit to any one of the
+    // three signatures cannot leave the others behind.
+    { "sphereHeightfieldNarrowphase", kCvxTriCore, uint32_t(sizeof(kCvxTriCore)), kCvxTriCoreHostPtrMask },
     { "sortTriangleIndices", kSortTriIndices, uint32_t(sizeof(kSortTriIndices)) },
     { "convexTrimeshPostProcess", kCvxTriPostProcess, uint32_t(sizeof(kCvxTriPostProcess)) },
     // P9.51c: convexHeightfieldPostProcess (convexMeshPostProcess.cu:585-593)

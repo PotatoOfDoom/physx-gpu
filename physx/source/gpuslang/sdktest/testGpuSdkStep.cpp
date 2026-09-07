@@ -476,6 +476,54 @@ void buildCapsuleBoxScene(PxPhysics* physics, PxScene* scene, PxMaterial* materi
     targets.push_back({ b, 5.0f, r, "capsuleOnBox" });
 }
 
+// PXG_SCENE=spherehf (P9.52b-6) -- the SPHERE/CAPSULE-vs-heightfield narrowphase,
+// observed.  Both arms in one scene, because they are one kernel.
+//
+// `hffloor` drops a BOX, which routes through convexHeightfieldNarrowphase.  Nothing
+// in the scene set reached sphereHeightfieldNarrowphase at all -- so P9.52a through
+// P9.52b-4 built and verified two cores, a kernel and eleven modules against host
+// mirrors, and not one line of it had ever run inside a simulation.  A fixture
+// proves a shader computes what the CUDA computes; it cannot prove the engine ever
+// calls it.  That distinction is the whole of P9.27/P9.40/P9.41: an unmapped kernel
+// on a live path does nothing, silently, and a MAPPED kernel that no scene reaches
+// is the same blind spot wearing a green tick.
+//
+// The heightfield, the drop height and the rest tolerance are `hffloor`'s, so the
+// three heightfield scenes differ only in the shape that falls -- box, sphere,
+// capsule -- and a difference between them is a difference between narrowphase arms
+// rather than between experiments.
+//
+// The capsule lies on its side (axis along local X, PhysX's capsule convention), so
+// its rest centre is at y = radius and BOTH endpoints of the segment sit over the
+// terrain.  That matters here more than it does on a plane: the capsule core's
+// `generateContacts` accepts an endpoint only when it projects inside the triangle,
+// so a capsule balanced over a single triangle's edge would exercise the edge
+// generator alone.  Lying flat across the interior it reaches both.
+void buildSphereHfScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                        std::vector<RestTarget>& targets)
+{
+    if (!addHeightFieldFloor(physics, scene, material, 10.0f))
+        return;   // addHeightFieldFloor has already printed the FAIL line
+
+    const float r = 0.5f;
+    const float sphereI = 0.4f * 1000.0f * r * r;   // solid sphere: 2/5 m r^2
+    PxRigidDynamic* sph = addDynamic(physics, scene, material, PxSphereGeometry(r),
+                                     PxVec3(sphereI, sphereI, sphereI), 5.0f);
+    targets.push_back({ sph, 5.0f, r, "sphereOnHeightField" });
+
+    // Offset in x so the two bodies cannot touch each other and turn this into a
+    // three-body experiment.
+    const float ch = 0.5f;
+    PxRigidDynamic* cap = addDynamic(physics, scene, material, PxCapsuleGeometry(r, ch),
+                                     capsuleInertia(r, ch, 1000.0f), 5.0f);
+    {
+        PxTransform t = cap->getGlobalPose();
+        t.p.x += 3.0f;
+        cap->setGlobalPose(t);
+    }
+    targets.push_back({ cap, 5.0f, r, "capsuleOnHeightField" });
+}
+
 // PXG_SCENE=convex: a dynamic CONVEX MESH (a runtime-cooked cube hull, half
 // 0.5) resting on the static ground BOX.  Box (eBOX=3) vs convex mesh
 // (eCONVEXMESH=5) lands in the GPU_BUCKET_ID::eConvex bucket
@@ -7135,6 +7183,7 @@ int main()
     else if (!std::strcmp(sceneName, "joint"))     buildJointScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "meshfloor")) buildMeshFloorScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "hffloor")) buildHfFloorScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "spherehf")) buildSphereHfScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "articulation")) buildArticulationScene(physics, scene, material, targets);
     // The list is spelled out in full deliberately: an out-of-date usage string is
     // what turned a mistyped scene into a silent non-result once already.  This

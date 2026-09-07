@@ -8,6 +8,7 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
 Test count: **856/856** green in both modes (`ctest -N` in `build-gpuslang`).
+Manifest: **403/501** kernels mapped (P9.52b-6 filled SPHERE_HEIGHTFIELD_CORE).
 P9.52b-4 added `gpuslang.capsuleHfCore` and the 53rd upstream candidate: the
 "edge normal" of the capsule-vs-heightfield deferred arm is the NORMALIZED
 ROUNDING RESIDUE of two spellings of one point, because the arm runs only when
@@ -1838,6 +1839,113 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.52b-6 — der Kernel, und ein Absturz, den nur eine Szene mit ZWEI Körpern zeigen konnte
+
+`sphereHeightfieldNarrowphase` (convexHeightfield.cu:791-996) als `sphereHfNpBda`,
+Manifest-Zeile gefüllt (402 → **403** gemappte Kernel), ABI-Zeile mit `kCvxTriCore`
+geteilt, und eine neue beobachtende Szene `spherehf`. Damit ist die
+Kugel/Kapsel-gegen-Heightfield-Kette von der Midphase bis zum Kontaktstrom
+geschlossen, und P9.52a..b-5 laufen zum ersten Mal **in einer Simulation** statt nur
+in Vorrichtungen.
+
+### Ein Kernel mit ZWEI Armen, und einer davon füllt einen Kanal nicht
+
+Der Dispatch liest den Geometrietyp von Slot 0 und ruft den Kugel- oder den
+Kapselkern. Der Kugel-Arm gibt einen `outMask` zurück, der Kapsel-Arm hat den
+Ausgabeparameter **überhaupt nicht** — für eine Workgroup aus Kapselpaaren ist der
+Ballot konstant null und der ganze Zweitpass-Block tot. Das war in P9.52b-4 als
+Kandidat 52 aus dem Lesen der beiden Kerne notiert; hier ist es **strukturell**
+statt textuell, und deshalb steht es an der Stelle noch einmal, an der es
+Konsequenzen hat.
+
+### Die Barrieren wurden strukturell unbedingt gemacht, nicht per Ausnahme
+
+Der `barrierUniformity`-Prüfer hat zwei `pxgShflSyncU`-Aufrufe unter
+`if (totalContacts != 0u)` gemeldet und die übliche Wahl angeboten: echter Fehler
+oder Ausnahme mit Beweiszeile. Beides wäre hier vertretbar gewesen — `totalContacts`
+ist eine Broadcast von Lane 31 und damit uniform, bei einer Workgroup von genau
+einem Warp also auch workgroup-uniform.
+
+Stattdessen sind die beiden Broadcasts **aus ihren Wächtern herausgezogen**. In CUDA
+stehen sie darin, was dort zulässig ist, weil `__shfl_sync` eine reine Warp-Operation
+ist; auf dem Emulationspfad dieses Ports ist es ein Groupshared-Umweg mit Barrieren,
+und ein bedingter Aufruf ist eine bedingte **Barriere**. Das Herausziehen ist
+ausgabeneutral — bei falschem Wächter ist der übertragene Wert null und ungelesen,
+weil jede *Verwendung* im Wächter bleibt. Der Unterschied zur Ausnahme: „ist
+tatsächlich uniform" ist eine Behauptung, die ein späterer Leser neu herleiten muss,
+eine unbedingte Barriere ist eine Eigenschaft, die er **sehen** kann. Kein
+Waiver-Eintrag.
+
+### Der Absturz, und warum eine Ein-Körper-Szene ihn nicht gezeigt hätte
+
+Die erste Fassung ließ die Grid-Stride-Schleife weg — so wie es der Convex-Zwilling
+tut, dessen Header genau das als bewusste, dokumentierte Lücke beschreibt. **Das war
+falsch, und die Szene hat es bewiesen: SIGSEGV, deterministisch, 3 von 3.**
+
+Der Grund ist eine Asymmetrie im **Host**, nicht im Kernel:
+
+* Der Convex-Kern wird mit einem absichtlich **32-fach überprovisionierten** Gitter
+  gestartet — `PxgNarrowphaseCore.cpp:2898` setzt `coreGridMultiplier = 32` mit dem
+  Kommentar *„Number which defines how we expand grid to try to cover all pairs
+  without repretitions"*. Ein Durchgang reicht dort meistens.
+* Dieser Kern wird mit `numBlocks = (numTests + 63) / 64` gestartet (:2292) — **ohne
+  Multiplikator**, ein Block für eine Zwei-Körper-Szene. Die CUDA deckt den Rest
+  ausschließlich durch **Iterieren** ab (:869).
+
+Ohne die Schleife blieb für jedes Paar jenseits der ersten 32 der Datensatz
+(`ni`, `interm`, `ordered`, `maxDepth`) **unbeschrieben**, und
+`convexTrimeshCorrelate` — das die Kontaktzahl aus `ni.index` liest und dann in den
+Kontaktstrom dereferenziert — las uninitialisierten Speicher und sprang hinein.
+
+Zwei Dinge daran sind die eigentliche Lehre:
+
+1. **Eine Szene mit EINEM Körper hätte bestanden.** Eine einzelne Kugel über dem
+   Heightfield erzeugt weniger als 32 Midphase-Paare; der eine Durchgang deckte
+   alles ab. Erst Kugel **und** Kapsel schoben die Paarzahl über die Decke. Hätte
+   ich die beiden Arme in getrennten Szenen beobachtet — was naheliegender aussieht
+   —, wäre der Defekt durchgegangen.
+2. **Der Fault war nicht zuzuordnen.** Er landet in llvmpipes JIT, ohne Symbole, mit
+   einem Backtrace aus `?? ()`. Ihn zu benennen brauchte eine **Launch-Spur**, die
+   der Shim nicht hatte; sie ist jetzt als `PXG_LAUNCH_TRACE=1` eingebaut und druckt
+   jeden Dispatch mit Namen, Gitter und Blob-Größe, bevor er aufgezeichnet wird.
+   Zusammen mit dem vorhandenen `PXG_SYNC_EACH=1` ist die letzte gedruckte Zeile der
+   Schuldige. Das nachzurüsten war billiger, als den Bedarf ein zweites Mal zu
+   entdecken.
+
+### Was das über den Convex-Zwilling sagt, und was ich damit NICHT gemacht habe
+
+Der Header von `convexHfCoreBda` begründet seine fehlende Schleife damit, das
+Schließen brauche *„entweder indirektes Dispatch im Shim oder ein Host-Gitter aus
+demselben Device-Zähler, und keines von beiden ist in dieser Tranche"*. **Das stimmt
+nicht.** Die Schleife braucht keines von beidem — `WorkgroupCount()` steht in Slang
+zur Verfügung, die Trip-Zahl ist workgroup-uniform, und die drei Zeilen sind genau
+das, was hier eingebaut wurde.
+
+Der Zwilling stürzt heute nicht ab, weil der 32-fache Multiplikator die Lücke
+verdeckt. Ich habe ihn trotzdem **nicht** in dieser Tranche mitgeändert: das wäre
+eine Änderung an einem lebenden Kernel ohne eigene Szenen-Evidenz, mitten in der
+Evidenz eines anderen. Sie steht als eigene Aufgabe, mit dem hier gemessenen Beleg
+dafür, dass die Begründung im Header widerlegt ist.
+
+### Beobachtet, nicht nur getestet
+
+`hffloor` lässt eine **Box** fallen — die läuft durch den Convex-Kern. **Keine
+einzige Szene erreichte den neuen Kernel.** Elf Module, zwei Kerne und ein Kernel
+waren gegen Host-Spiegel verifiziert, und keine Zeile davon war je in einer
+Simulation gelaufen. Eine Vorrichtung beweist, dass ein Shader rechnet, was das CUDA
+rechnet; sie kann nicht beweisen, dass die Engine ihn je aufruft. Genau diese
+Unterscheidung ist P9.27/P9.40/P9.41 — und ein **gemappter** Kernel, den keine Szene
+erreicht, ist derselbe blinde Fleck mit einem grünen Haken davor.
+
+`spherehf` ist deshalb `hffloor` mit derselben Terrain, derselben Fallhöhe und
+derselben Ruhetoleranz, nur mit Kugel und Kapsel statt Box — die drei
+Heightfield-Szenen unterscheiden sich damit **nur** in der fallenden Form. Ergebnis:
+
+    [sphereOnHeightField]  start y=5.000, final y=0.5000 (rest 0.500), |v|=0.0000
+    [capsuleOnHeightField] start y=5.000, final y=0.5000 (rest 0.500), |v|=0.0000
+
+Suite **856/856** in beiden Modi.
 
 ## P9.52b-5 — fünf Spiegel auf drei Header, und ein Diff, der VOR der Zusammenlegung kommen musste
 
