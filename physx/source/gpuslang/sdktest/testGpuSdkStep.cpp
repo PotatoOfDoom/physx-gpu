@@ -524,6 +524,36 @@ void buildSphereHfScene(PxPhysics* physics, PxScene* scene, PxMaterial* material
     targets.push_back({ cap, 5.0f, r, "capsuleOnHeightField" });
 }
 
+// PXG_SCENE=hfbigbox (P9.58) -- the CONVEX heightfield core's grid-stride gap, made
+// observable.
+//
+// `hffloor` drops a half-0.5 box, whose AABB overlaps about four heightfield cells
+// and so produces well under 32 midphase pairs.  The convex core's shader makes ONE
+// pass covering `gridDim.x * 32` pairs, and its host launch over-provisions the grid
+// 32-fold (PxgNarrowphaseCore.cpp:2898), so for one contact manager that is 32 pairs
+// -- comfortably more than hffloor needs.  The gap has therefore never been reached
+// by any scene, which is why its header could describe it as known and accepted for
+// two tranches without anything going wrong.
+//
+// A half-3 box spans roughly 36 cells, hence about 72 candidate triangles, and pushes
+// the pair count past the ceiling.  P9.52b-6 measured what happens beyond it on the
+// SPHERE kernel: records left unwritten, and convexTrimeshCorrelate dereferencing an
+// uninitialised contact count.
+//
+// The box is deliberately the ONLY difference from hffloor -- same heightfield, same
+// drop, same tolerance -- so the two scenes remain one comparison.
+void buildHfBigBoxScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                        std::vector<RestTarget>& targets)
+{
+    if (!addHeightFieldFloor(physics, scene, material, 10.0f))
+        return;   // addHeightFieldFloor has already printed the FAIL line
+
+    const float h = 3.0f;
+    PxRigidDynamic* b = addDynamic(physics, scene, material, PxBoxGeometry(h, h, h),
+                                   boxInertia(PxVec3(h), 1000.0f), 8.0f);
+    targets.push_back({ b, 8.0f, h, "bigBoxOnHeightField" });
+}
+
 // PXG_SCENE=convex: a dynamic CONVEX MESH (a runtime-cooked cube hull, half
 // 0.5) resting on the static ground BOX.  Box (eBOX=3) vs convex mesh
 // (eCONVEXMESH=5) lands in the GPU_BUCKET_ID::eConvex bucket
@@ -7184,6 +7214,7 @@ int main()
     else if (!std::strcmp(sceneName, "meshfloor")) buildMeshFloorScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "hffloor")) buildHfFloorScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "spherehf")) buildSphereHfScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "hfbigbox")) buildHfBigBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "articulation")) buildArticulationScene(physics, scene, material, targets);
     // The list is spelled out in full deliberately: an out-of-date usage string is
     // what turned a mistyped scene into a silent non-result once already.  This

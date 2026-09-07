@@ -79,13 +79,20 @@ echo "run_scenes.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR"
 # ported that producer (FEMCollision::computeRigidChange) and the box now rests on
 # the net at 2.1015.
 #
+# P9.58 added `hfbigbox`: hffloor with a half-3 box instead of a half-0.5 one.  Its
+# only job is to exceed the convex heightfield core's single-pass ceiling -- the host
+# launches that kernel with 32 warps per contact manager, so ~32 midphase pairs, and a
+# half-0.5 box needs about eight.  Before the grid-stride loop was restored this scene
+# dropped the box straight THROUGH the terrain (final y = -70.8, |v| = 39.2); the
+# smaller box never reached the ceiling and every scene passed.
+#
 # P9.51c added `hffloor`: meshfloor with the cooked triangle mesh swapped for a
 # cooked heightfield and nothing else changed, so the two are one comparison.  It
 # is the observing scene for the rigid-vs-heightfield narrowphase, which before
 # P9.51 was unmapped end to end and therefore a silent no-op -- the box fell
 # through with no diagnostic.  The list is 36 named scenes plus the settling
 # bag = 37.
-SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor hffloor spherehf articulation
+SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor hffloor spherehf hfbigbox articulation
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
         particlecloth particleinflatable particlediffuse particleconvex
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth

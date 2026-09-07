@@ -9,6 +9,8 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 
 Test count: **856/856** green in both modes (`ctest -N` in `build-gpuslang`).
 Manifest: **403/501** kernels mapped (P9.52b-6 filled SPHERE_HEIGHTFIELD_CORE).
+Scenes: **40/40** (P9.58 added `hfbigbox`, which fell through the terrain before
+the convex cores got their grid-stride loop back).
 P9.52b-4 added `gpuslang.capsuleHfCore` and the 53rd upstream candidate: the
 "edge normal" of the capsule-vs-heightfield deferred arm is the NORMALIZED
 ROUNDING RESIDUE of two spellings of one point, because the arm runs only when
@@ -1839,6 +1841,99 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.58 — die weggelassene Grid-Stride-Schleife ist eine KLASSE, und eine Box, die durch den Boden fiel, hat sie aufgemacht
+
+P9.52b-6 fand eine fehlende Grid-Stride-Schleife in einem Kernel und notierte, der
+Convex-Zwilling habe dieselbe Lücke, verdeckt durch ein überprovisioniertes Gitter.
+Diese Tranche misst das nach, repariert beide Convex-Kerne — und ein Audit über die
+71 Grid-Stride-Stellen der Engine zeigt, dass es **zwölf weitere** gibt.
+
+### Die Lücke war kein akzeptierter Kompromiss, sondern ein lebender Defekt
+
+Der Header von `convexHfCoreBda` beschrieb sie zwei Tranchen lang als bekannt und
+hingenommen: *„Beyond it, pairs are silently skipped."* **Beides war falsch.**
+
+Die neue Szene `hfbigbox` ist `hffloor` mit einer halb-3-Box statt einer halb-0,5-Box
+— sonst identisch: dieselbe Terrain, dieselbe Fallhöhe, dieselbe Toleranz. Die kleine
+Box überlappt etwa vier Zellen und braucht rund acht Midphase-Paare; der Host startet
+diesen Kernel mit 32 Warps pro Kontaktmanager (`coreGridMultiplier = 32`,
+PxgNarrowphaseCore.cpp:2898), also reichte ein Durchgang immer. Die grosse Box spannt
+etwa 36 Zellen, rund siebzig Paare — über der Decke. Gemessen, vor der Korrektur:
+
+    [bigBoxOnHeightField] start y=8.000, final y=-70.807 (rest 3.000), |v|=39.2401
+    FAIL: below rest band / sank
+    FAIL: not at rest
+
+Die Box fällt **durch die Terrain hindurch** und beschleunigt weiter. Nicht „verliert
+Kontakte ohne Diagnose" — sie kollidiert überhaupt nicht mehr. Nach der Korrektur:
+`final y=3.0000, |v|=0.0000`.
+
+Und der zweite Teil der Behauptung — das Schließen brauche *„entweder indirektes
+Dispatch im Shim oder ein Host-Gitter aus demselben Device-Zähler"* — stimmt ebenfalls
+nicht. `WorkgroupCount()` steht in Slang zur Verfügung, die Trip-Zahl
+`ceil(nbPairs / (WorkgroupCount().x * 2))` ist workgroup-uniform, und die Schleife sind
+drei Zeilen. Beide Header sagen das jetzt.
+
+### Zum P8.40-Risiko, genau
+
+`convexTrimeshCoreBda` begründete das Weglassen zusätzlich damit, ein **verketteter
+BDA-Zugriff innerhalb einer Grid-Stride-Schleife** bringe llvmpipe im JIT zum Absturz
+(P8.40). Das war der ernstzunehmendste Einwand, und er wurde gemessen statt
+weggewischt: die hier eingebaute Form — eine **äußere** Grid-Stride-Schleife um die
+konstante Sub-Warp-Schleife, mit verketteten BDA-Zugriffen darin — reproduziert ihn
+nicht. `hfbigbox`, `hffloor`, `meshfloor`, `spherehf` und `convex` laufen sauber, und
+der Kugel-Kernel aus P9.52b-6 hat dieselbe Form mit denselben Zugriffen.
+
+Das ist eine Messung **dieser Form**, keine Widerlegung dessen, was P8.40 geprüft hat;
+für eine anders geschriebene Pro-Thread-Grid-Stride mag der Befund weiter gelten. Was
+sich sagen lässt: als Begründung dafür, die Schleife wegzulassen, war das Risiko zu
+breit formuliert.
+
+### Das Audit: zwölf weitere, adversarisch verifiziert
+
+Die Engine hat 71 Grid-Stride-Stellen in 19 CUDA-Dateien. Ein Workflow über sieben
+Dateigruppen hat jeden `__global__`-Kernel gelesen, im Manifest nachgeschlagen, ob er
+**gemappt** ist, und bei jedem gemappten den Slang-Port daraufhin geprüft, ob er die
+Schleife reproduziert. Jeder Verdacht ging danach an einen zweiten Agenten mit dem
+Auftrag, ihn zu **widerlegen** — mit der ausdrücklichen Regel, dass ein Header, der
+die Lücke bloß als bekannt bezeichnet, keine Widerlegung ist.
+
+Ergebnis: 21 Agenten, 111 Kandidaten gesichtet, **12 bestätigte Auslassungen in
+gemappten Kerneln**:
+
+| Kernel | Shader |
+|---|---|
+| `convexHeightfieldPostProcess` | `convexHfPostProcessBda.slang` |
+| `convexTrimeshPostProcess` | `cvxTriPostProcessBda.slang` |
+| `cloth_meshVertexContactGenLaunch` | `femClothMeshVertContactGenBda.slang` |
+| `cloth_heightfieldVertexContactGenLaunch` | `femClothHfContactGenBda.slang` |
+| `doAggPairCollisions` | `broadphaseAggPairCollision.slang` |
+| `updateBodiesLaunchDirectAPI` | `bodyUpdate.slang` |
+| `updateBodyExternalVelocitiesLaunch` | `bodyUpdate.slang` |
+| `zeroNormals`, `normalizeNormals`, `normalVectorsAreaWeighted` | `skinning.slang` |
+| `interpolateSkinnedClothVertices`, `interpolateSkinnedSoftBodyVertices` | `skinning.slang` |
+
+Drei Gruppen kamen **sauber** heraus — Partikel, Solver und die dritte
+Narrowphase-Gruppe reproduzieren die Schleife durchweg mit `WorkgroupCount()`.
+
+Die Kopfzahlen der Decken unterscheiden sich um Größenordnungen und entscheiden, wie
+gefährlich die jeweilige Auslassung ist: `convexTrimeshPostProcess` bekommt
+`max(8192, …)` Blöcke à 64 Threads, also mindestens 524288 Slots — dort ist die Lücke
+theoretisch. `convexHeightfieldPostProcess` bekommt 256 Threads pro Kontaktmanager.
+Der Convex-Heightfield-**Kern** bekam 32 Paare, und das war die, die eine Box durch
+den Boden fallen ließ.
+
+### Was diese Tranche NICHT tut
+
+Die zwölf sind **nicht** mitrepariert. Was diese Tranche belastbar macht, ist die
+Szene, die den Defekt vorher zeigt und nachher nicht mehr — und diese Evidenz gibt es
+für die zwölf noch nicht; jede braucht eine Szene, die ihre eigene Decke überschreitet.
+Ungeprüfte Korrekturen in eine geprüfte Tranche zu mischen verwässert genau die
+Eigenschaft, die sie glaubwürdig macht. Sie stehen als eigene Aufgaben, mit der
+verifizierten Evidenz je Kernel.
+
+Suite **856/856** in beiden Modi, Szenen **40/40**.
 
 ## P9.52b-6 — der Kernel, und ein Absturz, den nur eine Szene mit ZWEI Körpern zeigen konnte
 

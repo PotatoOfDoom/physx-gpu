@@ -79,13 +79,37 @@
 // one workgroup per CUDA BLOCK, and a loop of CONSTANT trip count over that
 // block's two warps.
 //
-// **THE COVERAGE THIS GIVES UP IS REAL.**  The CUDA's grid-stride loop makes a
-// second and further pass when there are more pairs than grid slots; this shader
-// makes exactly one.  The ceiling is `NP_TRIMESH_WARPS_PER_BLOCK * gridDim.x`
-// pairs.  Beyond it, pairs are silently skipped -- a dense enough heightfield
-// contact would lose contacts with no diagnostic.  Closing it needs either
-// indirect dispatch in the shim or a host-side grid derived from the same device
-// counter, and neither is in this tranche.
+// **THE GRID-STRIDE LOOP IS BACK, AND A SCENE HAD TO PROVE IT WAS NEEDED.**
+//
+// An earlier version of this header said the missing loop was a known, accepted
+// coverage gap, and that closing it "needs either indirect dispatch in the shim or a
+// host-side grid derived from the same device counter, and neither is in this
+// tranche".  Both halves were wrong.
+//
+// It is not merely a coverage gap.  The host launches this kernel with
+// `numBlocks = (numTests * coreGridMultiplier + warps - 1) / warps`, where
+// `coreGridMultiplier` is 32 (PxgNarrowphaseCore.cpp:2898) -- so for ONE contact
+// manager the single pass covers 32 pairs.  A half-0.5 box on a heightfield needs
+// about eight, which is why every scene passed.  A half-3 box needs about seventy,
+// and PXG_SCENE=hfbigbox measured what happens past the ceiling: the box fell
+// straight THROUGH the terrain, final y = -70.8 and still accelerating at 39 m/s.
+// Records for the uncovered pairs are never written, and the P9.52b-6 measurement on
+// the sphere kernel showed the same condition there ending in a SIGSEGV inside
+// convexTrimeshCorrelate.
+//
+// And it needs neither indirect dispatch nor a host-side grid: `WorkgroupCount()` is
+// available in Slang, the trip count `ceil(nbPairs / (WorkgroupCount().x * 2))` is
+// WORKGROUP-UNIFORM, and the loop is three lines.
+//
+// ON THE P8.40 HAZARD, precisely.  This file previously recorded that a chained
+// buffer-device-address load inside a grid-stride loop segfaults llvmpipe in the JIT.
+// The shape restored here -- an OUTER grid-stride loop wrapping the CONSTANT-trip
+// sub-warp loop, chained BDA loads inside -- does not reproduce it: hfbigbox,
+// hffloor, meshfloor, spherehf and convex all step clean, and the sphere kernel's own
+// grid-stride loop (P9.52b-6) has the same shape and the same chained loads.  That is
+// a measurement of THIS shape, not a refutation of whatever P8.40 tested; the earlier
+// finding may well hold for a per-thread grid-stride written differently.  What can
+// be said is that the hazard as stated was too broad to justify dropping the loop.
 //
 // ONE WARP PER WORKGROUP is not a choice either: `pxgSlangPolyClip` and
 // `pxgSlangContactReduce` both require `[numthreads(32,1,1)]` because their
@@ -196,11 +220,23 @@ void convexHeightfieldNarrowphase(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
     // A CONSTANT trip count, so the barriers inside are reached by the whole group
     // on every iteration.  The guard uses `continue`, not `return`, for the same
     // reason.
+    // convexHeightfield.cu:330 / convexMesh.cu -- the CUDA's loop is
+    //   `for (globalWarpIndex = blockIdx.x*blockDim.y + threadIdx.y;
+    //         globalWarpIndex < nbPairs;
+    //         globalWarpIndex += gridDim.x * blockDim.y)`
+    // with blockDim.y == NP_TRIMESH_WARPS_PER_BLOCK.  The `sub` loop below covers
+    // `threadIdx.y`; THIS loop covers the stride, and it is not optional -- see the
+    // header.  Its trip count, `ceil(nbPairs / (WorkgroupCount().x * 2))`, is
+    // WORKGROUP-UNIFORM, so the barriers inside stay in uniform control flow.
+    const uint gridStride = WorkgroupCount().x * NP_TRIMESH_WARPS_PER_BLOCK;
+
+    for (uint base = 0u; base < nbPairs; base += gridStride)
+    {
     for (uint sub = 0u; sub < NP_TRIMESH_WARPS_PER_BLOCK; ++sub)
     {
         GroupMemoryBarrierWithGroupSync();
 
-        const uint globalWarpIndex = gid.x * NP_TRIMESH_WARPS_PER_BLOCK + sub;
+        const uint globalWarpIndex = base + gid.x * NP_TRIMESH_WARPS_PER_BLOCK + sub;
         if (globalWarpIndex >= nbPairs)
             continue;
 
@@ -307,5 +343,6 @@ void convexHeightfieldNarrowphase(uint3 gtid : SV_GroupThreadID, uint3 gid : SV_
                     a.ni, a.contacts, a.maxDepth, a.interm, a.ordered,
                     a.secondPass, gCh.nbSecondPassPairs,
                     gCh.tempConvexTriContacts, tempContactSize, gCh.pTempContactIndex);
+    }
     }
 }
