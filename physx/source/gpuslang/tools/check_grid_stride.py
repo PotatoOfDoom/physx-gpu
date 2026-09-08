@@ -50,10 +50,18 @@
 #   1. find the CUDA `__global__` of that name and brace-match its body;
 #   2. decide whether that body carries a grid-stride construct;
 #   3. find the named entry point in the named .slang and brace-match its body;
-#   4. decide whether the port reproduces a stride -- `WorkgroupCount()`, which is
-#      the only way to spell `gridDim.x` in Slang, is the marker.
+#   4. decide whether the port reproduces a stride -- see slang_covers() below, which
+#      accepts `WorkgroupCount()`, a named stride in a `for` increment, and either of
+#      those one level down in a same-file helper.
 #
 # A kernel with (1)-(2) but not (4) is a finding.
+#
+# THE MARKER IN (4) WAS WRONG IN THE FIRST VERSION and it mattered: looking only for
+# `WorkgroupCount()` reported 38 omissions of which 26 were ports that loop.  The
+# bridge forwards only gridDim, so the CUDA blockDim has no runtime spelling and the
+# corpus writes the stride as a file-scope constant instead.  slang_covers() carries
+# the full account; it is repeated here because a stale claim at the top of a file is
+# what the next reader believes.
 #
 # THE LIST IS A RATCHET, exactly as gpuslang.launchAbi's is.  The kernels known to
 # omit the loop live in grid_stride_known.txt.  A NEW omission fails the check.  An

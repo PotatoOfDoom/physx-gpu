@@ -7,10 +7,12 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **857/857** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **852/852** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.61 retired five `gpuslang.hlsl.*` twins: the skinning entries now need
+`WorkgroupCount()`, which has no cs_6_0 lowering.
 P9.59 added `gpuslang.gridStride`, the ELEVENTH static checker: a mapped kernel
 whose CUDA covers its work with a grid-stride loop must have that loop in its
-Slang port.  12 known omissions carried as a RATCHET that may shrink, never grow, over
+Slang port.  7 known omissions carried as a RATCHET that may shrink, never grow, over
 403/403 mapped kernels.  P9.60 closed a 52-kernel blind spot in the checker;
 P9.60b corrected its Slang-side marker, which had made 26 of a claimed 38
 "omissions" into noise.
@@ -1847,6 +1849,63 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.61 — die fünf Skinning-Kernel: kein Deckenproblem, sondern drei Viertel der Arbeit, immer
+
+Erster Griff in die Ratsche, und der Befund ist schärfer als die Kategorie, unter der
+er stand. `zeroNormals` und `normalizeNormals` verfehlen nicht erst „jenseits einer
+Decke" Arbeit — sie erledigen **bei jedem Aufruf nur ein Viertel**.
+
+### Die Rechnung
+
+`PxgDeformableSkinning::computeNormalVectors` startet die fünf Kernel mit **zwei**
+Blockgrößen (PxgDeformableSkinning.cpp:52-66): 256 für ComputeNormals und die
+Interpolatoren, und `numThreadsPerBlockSmallKernels = 1024` für `zeroNormals` und
+`normalizeNormals`. Alle fünf Shader deklarieren `[numthreads(256,1,1)]`, und die
+Brücke **verwirft `blockDim`**. Also:
+
+    Host:   numBlocksSmallKernels = ceil(n / 1024)
+    Shader: 256 Threads pro Gruppe
+    ---------------------------------------------
+    erreicht: ceil(n/1024) * 256  ~=  n / 4
+
+Drei Viertel der Guide-Vertices wurden nie genullt und nie normiert. Was die CUDA
+davor bewahrt, ist ihre Grid-Stride-Schleife — die im Port fehlte.
+
+### Warum die Vorrichtung das nicht sehen konnte, gleich zweifach
+
+`testUtilities.cpp` prüft genau diese Kernel. Sie bestand trotzdem, aus zwei
+voneinander unabhängigen Gründen:
+
+1. **Sie dimensionierte ihr Gitter nach dem Shader**, `ceil(maxVerts/256)` statt nach
+   der Engine. Ein Durchgang deckte damit alles ab. Das ist wörtlich der blinde
+   Fleck, den der Header von `check_grid_stride.py` beschreibt — *„a fixture
+   dispatches the grid IT chooses"* — nur diesmal an einem konkreten Fall.
+2. **Ihre Netze hatten 20-50 Vertices.** Unter 256 deckt eine einzige Gruppe alles ab,
+   egal wie das Gitter gerechnet wird; der Ausfall war arithmetisch unmöglich zu
+   beobachten.
+
+Beides geändert — Engine-Divisor für die zwei kleinen Kernel, Netze auf 300-700
+Vertices — ergab **1820 Prüffehler** vor der Korrektur und 0 danach. Das ist die
+Evidenz, die P9.59 für die Postprocess-Kernel nicht bauen konnte, und hier gab es sie.
+
+### Die Schrittweite ist die eigene, nicht die der CUDA
+
+`gridDim.x * blockDim.x` wörtlich zu reproduzieren ist hier unmöglich *und* falsch:
+die Brücke reicht `blockDim` nicht durch, und die Zahl, die der Host annahm, ist
+ohnehin die falsche. `WorkgroupCount().x * BLOCK_SIZE` ist die **tatsächlich
+gestartete** Threadzahl, deckt also alles ab, was der Host auch immer gemeint hat —
+und das ist genau, was die CUDA-Schleife für ihre eigene Threadzahl tut.
+
+### Der Preis, benannt
+
+`WorkgroupCount()` hat keine cs_6_0-Entsprechung, also verlassen die fünf Einträge
+`PXG_HLSL_ENTRIES` — derselbe Präzedenzfall wie `radixSortDesc`, `particleSim` und
+`solveBlockUnified`. Die Schleife wegzulassen, um den HLSL-Zwilling zu behalten,
+hieße einen echten Defekt gegen ein Übersetzungsziel zu tauschen, gegen das dieser
+Port nichts ausliefert. Testzahl dadurch 857 → **852**.
+
+Ratsche **12 → 7**. Suite 852/852 in beiden Modi.
 
 ## P9.60b — KORREKTUR: von den 37 gemeldeten „Auslassungen" waren 26 mein eigenes Rauschen
 

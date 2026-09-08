@@ -223,17 +223,36 @@ void interleaveBuffers(uint3 dispatchThreadId : SV_DispatchThreadID)
 }
 
 // mirrors zeroNormals() in utility.cu
+// THE STRIDE IS THIS SHADER'S OWN THREAD COUNT, NOT THE CUDA'S (P9.61).
+//
+// utility.cu covers each of these with `for (i = blockIdx.x*blockDim.x + threadIdx.x;
+// i < count; i += gridDim.x*blockDim.x)`.  Reproducing `gridDim.x * blockDim.x`
+// literally is impossible here and would be wrong anyway: the bridge forwards only
+// gridDim (PxgVulkanCudaContext::launchKernel drops blockDimX/Y/Z), and the engine
+// launches zeroNormals and normalizeNormals with a block of 1024
+// (PxgDeformableSkinning.cpp:56) while these entries declare 256.  Its `ceil(n/1024)`
+// groups therefore carry 256 threads each and reach a QUARTER of the guide vertices;
+// the other three quarters were never zeroed and never normalised, on every call.
+//
+// `WorkgroupCount().x * BLOCK_SIZE` is the number of threads actually dispatched, so
+// the loop covers every item whatever the host assumed -- which is what the CUDA loop
+// does for the CUDA's own thread count.  Visit order differs from CUDA's; for these
+// kernels that is immaterial (per-vertex writes, and one float atomicAdd whose order
+// is already nondeterministic on either side).
+static uint skinStride() { return WorkgroupCount().x * BLOCK_SIZE; }
+
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
 void zeroNormals(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupId : SV_GroupID)
 {
     const PxgTrimeshSkinningDesc d = loadTrimeshDesc(groupId.y);
 
-    const uint threadIndex = dispatchThreadId.x;
-    if (threadIndex >= d.guideVertices.count)
-        return;
+    for (uint threadIndex = dispatchThreadId.x; threadIndex < d.guideVertices.count;
+         threadIndex += skinStride())
+    {
 
-    viewStore(d.guideNormals, threadIndex, float3(0.0f));
+        viewStore(d.guideNormals, threadIndex, float3(0.0f));
+    }
 }
 
 // mirrors normalVectorsAreaWeighted() in utility.cu
@@ -243,22 +262,23 @@ void normalVectorsAreaWeighted(uint3 dispatchThreadId : SV_DispatchThreadID, uin
 {
     const PxgTrimeshSkinningDesc d = loadTrimeshDesc(groupId.y);
 
-    const uint threadIndex = dispatchThreadId.x;
-    if (threadIndex >= d.nbGuideTriangles)
-        return;
+    for (uint threadIndex = dispatchThreadId.x; threadIndex < d.nbGuideTriangles;
+         threadIndex += skinStride())
+    {
 
-    const uint i0 = loadIndex(d.guideTrianglesOffset, 3 * threadIndex + 0);
-    const uint i1 = loadIndex(d.guideTrianglesOffset, 3 * threadIndex + 1);
-    const uint i2 = loadIndex(d.guideTrianglesOffset, 3 * threadIndex + 2);
+        const uint i0 = loadIndex(d.guideTrianglesOffset, 3 * threadIndex + 0);
+        const uint i1 = loadIndex(d.guideTrianglesOffset, 3 * threadIndex + 1);
+        const uint i2 = loadIndex(d.guideTrianglesOffset, 3 * threadIndex + 2);
 
-    const float3 p0 = viewAt(d.guideVertices, i0);
-    const float3 p1 = viewAt(d.guideVertices, i1);
-    const float3 p2 = viewAt(d.guideVertices, i2);
-    const float3 n = cross(p1 - p0, p2 - p0);
+        const float3 p0 = viewAt(d.guideVertices, i0);
+        const float3 p1 = viewAt(d.guideVertices, i1);
+        const float3 p2 = viewAt(d.guideVertices, i2);
+        const float3 n = cross(p1 - p0, p2 - p0);
 
-    atomicAdd3(d.guideNormals, i0, n);
-    atomicAdd3(d.guideNormals, i1, n);
-    atomicAdd3(d.guideNormals, i2, n);
+        atomicAdd3(d.guideNormals, i0, n);
+        atomicAdd3(d.guideNormals, i1, n);
+        atomicAdd3(d.guideNormals, i2, n);
+    }
 }
 
 // mirrors normalizeNormals() in utility.cu
@@ -268,13 +288,14 @@ void normalizeNormals(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupI
 {
     const PxgTrimeshSkinningDesc d = loadTrimeshDesc(groupId.y);
 
-    const uint threadIndex = dispatchThreadId.x;
-    if (threadIndex >= d.guideVertices.count)
-        return;
+    for (uint threadIndex = dispatchThreadId.x; threadIndex < d.guideVertices.count;
+         threadIndex += skinStride())
+    {
 
-    float3 n = viewAt(d.guideNormals, threadIndex);
-    normalizeSafe(n);
-    viewStore(d.guideNormals, threadIndex, n);
+        float3 n = viewAt(d.guideNormals, threadIndex);
+        normalizeSafe(n);
+        viewStore(d.guideNormals, threadIndex, n);
+    }
 }
 
 // mirrors evaluatePointPhongInterpolation<true>() in utility.cu
@@ -318,48 +339,49 @@ void interpolateSkinnedClothVertices(uint3 dispatchThreadId : SV_DispatchThreadI
 {
     const PxgTrimeshSkinningDesc d = loadTrimeshDesc(groupId.y);
 
-    const uint threadIndex = dispatchThreadId.x;
-    if (threadIndex >= d.skinnedVertices.count)
-        return;
+    for (uint threadIndex = dispatchThreadId.x; threadIndex < d.skinnedVertices.count;
+         threadIndex += skinStride())
+    {
 
-    // PxTriangleMeshEmbeddingInfo: { PxVec2 uv; PxReal offsetAlongInterpolatedNormal; PxU32 guideTriangleId; }
-    const uint infoBase = d.skinningInfoOffset / 4 + threadIndex * 4;
-    const float2 uv = float2(asfloat(gSkinData[infoBase]), asfloat(gSkinData[infoBase + 1]));
-    const float offsetAlongInterpolatedNormal = asfloat(gSkinData[infoBase + 2]);
-    const uint guideTriangleId = gSkinData[infoBase + 3];
+        // PxTriangleMeshEmbeddingInfo: { PxVec2 uv; PxReal offsetAlongInterpolatedNormal; PxU32 guideTriangleId; }
+        const uint infoBase = d.skinningInfoOffset / 4 + threadIndex * 4;
+        const float2 uv = float2(asfloat(gSkinData[infoBase]), asfloat(gSkinData[infoBase + 1]));
+        const float offsetAlongInterpolatedNormal = asfloat(gSkinData[infoBase + 2]);
+        const uint guideTriangleId = gSkinData[infoBase + 3];
 
-    const uint i0 = loadIndex(d.guideTrianglesOffset, 3 * guideTriangleId + 0);
-    const uint i1 = loadIndex(d.guideTrianglesOffset, 3 * guideTriangleId + 1);
-    const uint i2 = loadIndex(d.guideTrianglesOffset, 3 * guideTriangleId + 2);
+        const uint i0 = loadIndex(d.guideTrianglesOffset, 3 * guideTriangleId + 0);
+        const uint i1 = loadIndex(d.guideTrianglesOffset, 3 * guideTriangleId + 1);
+        const uint i2 = loadIndex(d.guideTrianglesOffset, 3 * guideTriangleId + 2);
 
-    const float w = 1.0f - uv.x - uv.y;
+        const float w = 1.0f - uv.x - uv.y;
 
-    const float3 uvw = float3(uv.x, uv.y, w);
-    float3 uvwProj = max(uvw, float3(0.0f));
-    const float sumProj = uvwProj.x + uvwProj.y + uvwProj.z;
-    if (sumProj > 0.0f)
-        uvwProj *= 1.0f / sumProj;
+        const float3 uvw = float3(uv.x, uv.y, w);
+        float3 uvwProj = max(uvw, float3(0.0f));
+        const float sumProj = uvwProj.x + uvwProj.y + uvwProj.z;
+        if (sumProj > 0.0f)
+            uvwProj *= 1.0f / sumProj;
 
-    const float3 nA = viewAt(d.guideNormals, i0);
-    const float3 nB = viewAt(d.guideNormals, i1);
-    const float3 nC = viewAt(d.guideNormals, i2);
+        const float3 nA = viewAt(d.guideNormals, i0);
+        const float3 nB = viewAt(d.guideNormals, i1);
+        const float3 nC = viewAt(d.guideNormals, i2);
 
-    float3 normal = uvwProj.x * nA + uvwProj.y * nB + uvwProj.z * nC;
-    normalizeSafe(normal);
+        float3 normal = uvwProj.x * nA + uvwProj.y * nB + uvwProj.z * nC;
+        normalizeSafe(normal);
 
-    const float3 a = viewAt(d.guideVertices, i0);
-    const float3 b = viewAt(d.guideVertices, i1);
-    const float3 c = viewAt(d.guideVertices, i2);
+        const float3 a = viewAt(d.guideVertices, i0);
+        const float3 b = viewAt(d.guideVertices, i1);
+        const float3 c = viewAt(d.guideVertices, i2);
 
-    const float3 pointPhong = evaluatePointPhongInterpolation(a, b, c, uvwProj, nA, nB, nC,
-                                                              d.halfSurfaceThickness);
+        const float3 pointPhong = evaluatePointPhongInterpolation(a, b, c, uvwProj, nA, nB, nC,
+                                                                  d.halfSurfaceThickness);
 
-    const float3 pointUVW = uvw.x * a + uvw.y * b + uvw.z * c;
-    const float3 pointUVWProj = uvwProj.x * a + uvwProj.y * b + uvwProj.z * c;
+        const float3 pointUVW = uvw.x * a + uvw.y * b + uvw.z * c;
+        const float3 pointUVWProj = uvwProj.x * a + uvwProj.y * b + uvwProj.z * c;
 
-    const float3 offsetPoint = pointPhong + offsetAlongInterpolatedNormal * normal + pointUVW - pointUVWProj;
+        const float3 offsetPoint = pointPhong + offsetAlongInterpolatedNormal * normal + pointUVW - pointUVWProj;
 
-    viewStore(d.skinnedVertices, threadIndex, offsetPoint);
+        viewStore(d.skinnedVertices, threadIndex, offsetPoint);
+    }
 }
 
 // mirrors interpolateSkinnedSoftBodyVertices() in utility.cu
@@ -369,26 +391,27 @@ void interpolateSkinnedSoftBodyVertices(uint3 dispatchThreadId : SV_DispatchThre
 {
     const PxgTetmeshSkinningDesc d = loadTetmeshDesc(groupId.y);
 
-    const uint threadIndex = dispatchThreadId.x;
-    if (threadIndex >= d.skinnedVertices.count)
-        return;
+    for (uint threadIndex = dispatchThreadId.x; threadIndex < d.skinnedVertices.count;
+         threadIndex += skinStride())
+    {
 
-    // Uses linear barycentric interpolation - plenty of room for improvements
-    // PxTetrahedronMeshEmbeddingInfo: { PxVec3 uvw; PxU32 guideTetrahedronId; }
-    const uint infoBase = d.skinningInfoOffset / 4 + threadIndex * 4;
-    const float3 uvw = float3(asfloat(gSkinData[infoBase]), asfloat(gSkinData[infoBase + 1]),
-                              asfloat(gSkinData[infoBase + 2]));
-    const uint guideTetrahedronId = gSkinData[infoBase + 3];
+        // Uses linear barycentric interpolation - plenty of room for improvements
+        // PxTetrahedronMeshEmbeddingInfo: { PxVec3 uvw; PxU32 guideTetrahedronId; }
+        const uint infoBase = d.skinningInfoOffset / 4 + threadIndex * 4;
+        const float3 uvw = float3(asfloat(gSkinData[infoBase]), asfloat(gSkinData[infoBase + 1]),
+                                  asfloat(gSkinData[infoBase + 2]));
+        const uint guideTetrahedronId = gSkinData[infoBase + 3];
 
-    const uint t0 = loadIndex(d.guideTetrahedraOffset, 4 * guideTetrahedronId + 0);
-    const uint t1 = loadIndex(d.guideTetrahedraOffset, 4 * guideTetrahedronId + 1);
-    const uint t2 = loadIndex(d.guideTetrahedraOffset, 4 * guideTetrahedronId + 2);
-    const uint t3 = loadIndex(d.guideTetrahedraOffset, 4 * guideTetrahedronId + 3);
+        const uint t0 = loadIndex(d.guideTetrahedraOffset, 4 * guideTetrahedronId + 0);
+        const uint t1 = loadIndex(d.guideTetrahedraOffset, 4 * guideTetrahedronId + 1);
+        const uint t2 = loadIndex(d.guideTetrahedraOffset, 4 * guideTetrahedronId + 2);
+        const uint t3 = loadIndex(d.guideTetrahedraOffset, 4 * guideTetrahedronId + 3);
 
-    const float s = 1.0f - uvw.x - uvw.y - uvw.z;
+        const float s = 1.0f - uvw.x - uvw.y - uvw.z;
 
-    const float3 point = uvw.x * viewAt(d.guideVertices, t0) + uvw.y * viewAt(d.guideVertices, t1) +
-                         uvw.z * viewAt(d.guideVertices, t2) + s * viewAt(d.guideVertices, t3);
+        const float3 point = uvw.x * viewAt(d.guideVertices, t0) + uvw.y * viewAt(d.guideVertices, t1) +
+                             uvw.z * viewAt(d.guideVertices, t2) + s * viewAt(d.guideVertices, t3);
 
-    viewStore(d.skinnedVertices, threadIndex, point);
+        viewStore(d.skinnedVertices, threadIndex, point);
+    }
 }

@@ -2377,9 +2377,16 @@ set(PXG_HLSL_ENTRIES
     "reorderData:reorderKernel"
     "memCopy:MemCopyBalanced"
     "clampValues:clampMaxValue" "clampValues:clampMaxValues"
-    "skinning:interleaveBuffers" "skinning:zeroNormals" "skinning:normalVectorsAreaWeighted"
-    "skinning:normalizeNormals" "skinning:interpolateSkinnedClothVertices"
-    "skinning:interpolateSkinnedSoftBodyVertices")
+    # P9.61: only `interleaveBuffers` remains.  The other five skinning entries now
+    # carry the CUDA's covering loop, and its stride is `WorkgroupCount().x *
+    # BLOCK_SIZE` -- the thread count actually dispatched.  `WorkgroupCount()` has no
+    # cs_6_0 lowering (slangc: "unavailable features in entry point"), the same reason
+    # radixSortDesc, particleSim, particleContactSortBda and solveBlockUnified are
+    # absent.  Dropping the loop to keep the HLSL twin would trade a real defect --
+    # zeroNormals and normalizeNormals reached a QUARTER of the guide vertices on
+    # every call, see skinning.slang -- for a compile target nothing in this port
+    # ships against.
+    "skinning:interleaveBuffers")
 foreach(spec ${PXG_HLSL_ENTRIES})
     string(REPLACE ":" ";" parts ${spec})
     list(GET parts 0 stem)

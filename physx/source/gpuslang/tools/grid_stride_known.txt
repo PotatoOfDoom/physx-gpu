@@ -42,15 +42,18 @@
 # The 12 below are what the widened check reports AND what P9.58's independent
 # adversarial audit confirmed at the source -- two methods that started from
 # different evidence and converged.  They are real; they are unfixed.
+#
+# P9.61 removed the five skinning entries.  Two of them (zeroNormals,
+# normalizeNormals) were not a ceiling problem at all: the engine launches them
+# with a block of 1024 while the shader declares 256, and the bridge drops
+# blockDim, so they reached a QUARTER of the guide vertices on EVERY call.  The
+# fixture could not see it because it sized its own grid to the shader (ceil(n/256))
+# and used meshes of 20-50 vertices, below one group either way.  Given the engine
+# divisor and meshes above 256, it failed with 1820 mismatches before the fix.
 cloth_heightfieldVertexContactGenLaunch
 cloth_meshVertexContactGenLaunch
 doAggPairCollisions
-interpolateSkinnedClothVertices
-interpolateSkinnedSoftBodyVertices
-normalVectorsAreaWeighted
-normalizeNormals
 ps_primitivesCollisionLaunch
 ps_primitivesDiffuseCollisionLaunch
 updateBodiesLaunchDirectAPI
 updateBodyExternalVelocitiesLaunch
-zeroNormals

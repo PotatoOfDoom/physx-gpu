@@ -294,9 +294,15 @@ PXG_TEST(skinning_clothPipeline)
     for (uint32_t m = 0; m < numDescs; ++m)
     {
         MeshInfo& mesh = meshes[m];
-        mesh.nbVerts = 20 + rng() % 30;
-        mesh.nbTris = 30 + rng() % 40;
-        mesh.nbSkinned = 50 + rng() % 50;
+        // ABOVE 256 GUIDE VERTICES, DELIBERATELY (P9.61).  These counts used to be
+        // 20-50, and at that size a single 256-thread group covers everything however
+        // the grid is computed -- so zeroNormals and normalizeNormals losing three
+        // quarters of their work was arithmetically impossible to observe here.  The
+        // engine's own divisor for those two is 1024 while the shader declares 256,
+        // so the shortfall only appears once the vertex count exceeds one group.
+        mesh.nbVerts = 300 + rng() % 400;
+        mesh.nbTris = 400 + rng() % 400;
+        mesh.nbSkinned = 300 + rng() % 300;
 
         TrimeshDesc& d = descs[m];
 
@@ -373,11 +379,29 @@ PXG_TEST(skinning_clothPipeline)
 
     const std::vector<PxgBufferHandle> bufs = { descBuf, dataBuf, dummyF4a, dummyF4b, dummyOut };
     const SkinningParams params = { 0 };
-    zero.dispatch((maxVerts + 255) / 256, bufs, params, numDescs);
+    // THE GRID IS THE ENGINE'S, NOT A CONVENIENT ONE (P9.61).
+    //
+    // `PxgDeformableSkinning::computeNormalVectors` launches these five kernels with
+    // TWO different block sizes: 256 for ComputeNormals and the interpolators, and
+    // `numThreadsPerBlockSmallKernels = 1024` for zeroNormals and normalizeNormals
+    // (PxgDeformableSkinning.cpp:56-66).  The bridge FORWARDS ONLY gridDim -- 
+    // PxgVulkanCudaContext::launchKernel takes `unsigned int /*blockDimX*/` and drops
+    // it -- while these shaders declare [numthreads(256,1,1)].  So the engine's
+    // `ceil(n/1024)` groups carry 256 threads each and reach n/4 vertices, and the
+    // CUDA's grid-stride loop is what covers the remaining three quarters.
+    //
+    // Dispatching `ceil(n/256)` here, as this fixture did, sizes the grid to the
+    // SHADER and hides that completely: one pass then covers everything and the
+    // missing loop is invisible.  That is the blind spot check_grid_stride.py's own
+    // header names -- "a fixture dispatches the grid IT chooses" -- so the two
+    // small-kernel dispatches now use the engine's divisor instead of a flattering
+    // one.  Before the loop was restored this made the comparison fail on three
+    // quarters of the guide vertices.
+    zero.dispatch((maxVerts + 1023) / 1024, bufs, params, numDescs);
     dev->barrier();
     areaWeighted.dispatch((maxTris + 255) / 256, bufs, params, numDescs);
     dev->barrier();
-    normalizeK.dispatch((maxVerts + 255) / 256, bufs, params, numDescs);
+    normalizeK.dispatch((maxVerts + 1023) / 1024, bufs, params, numDescs);
     dev->barrier();
     interpolate.dispatch((maxSkinned + 255) / 256, bufs, params, numDescs);
     dev->flush();
