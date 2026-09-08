@@ -224,8 +224,63 @@ def cuda_has_stride(body):
         return False
     return any(re.search(r"\+=\s*(" + "|".join(map(re.escape, names)) + r")\b", inc)
                for inc in incs)
-# WorkgroupCount() is Slang's only spelling of gridDim.
+# ---------------------------------------------------------------------------
+# THE SLANG SIDE IS NOT `WorkgroupCount()`, AND ASSUMING IT WAS MADE THIS CHECKER
+# REPORT MOSTLY NOISE (P9.60b)
+# ---------------------------------------------------------------------------
+# The first version looked for `WorkgroupCount(` in the entry body and called
+# anything else a one-pass port.  It reported 38 omissions; a reading of 27 of them
+# found almost all were PORTS THAT DO LOOP.
+#
+# The reason is in the bridge.  `PxgVulkanCudaContext::launchKernel` takes
+# `unsigned int /*blockDimX*/, /*blockDimY*/, /*blockDimZ*/` -- the names are
+# commented out -- and forwards only gridDimX/Y/Z to vkCmdDispatch.  THE CUDA
+# blockDim HAS NO RUNTIME SPELLING ON THIS PORT.  So a shader reproducing
+# `i += gridDim.x * blockDim.y` cannot write it as an expression at all; the corpus
+# idiom is a file-scope `static const` holding the product for the ONE launch site,
+# e.g. `BTRI_GRID * BTRI_WARPS_PER_BLOCK` = 4096*2.  Several shaders say so in their
+# headers and warn that deriving the stride from the group count instead would
+# double-visit or skip.
+#
+# Two further blind spots the same reading exposed:
+#   * the loop is often in a HELPER in the same file, with the entry a two-line
+#     wrapper -- reading only the entry body finds nothing;
+#   * `WorkgroupCount()` is still a legitimate spelling (P9.52b-6 and P9.58 use it,
+#     where the group count and the CUDA grid coincide), so both must be accepted.
+#
+# What is checked now: the entry, or any same-file function it calls, contains a
+# `for` whose increment advances by a NAMED stride or by an expression involving
+# WorkgroupCount.  A loop stepping by 1 does not count.
+#
+# THIS IS DELIBERATELY WEAKER THAN "the stride is correct".  A port looping with the
+# WRONG constant passes.  Deciding that needs the launch site, and the launch site is
+# in C++ the checker does not parse -- so the honest statement is that this finds
+# MISSING loops, not wrong ones, and the file says so rather than implying more.
 SLANG_STRIDE = re.compile(r"WorkgroupCount\s*\(")
+NAMED_INC = re.compile(r"\+=\s*([A-Za-z_]\w*)")
+
+
+def slang_covers(text, body):
+    if SLANG_STRIDE.search(body):
+        return True
+    for inc in for_increments(body):
+        if SLANG_STRIDE.search(inc) or NAMED_INC.search(inc):
+            return True
+    # one level of same-file helper calls
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", body):
+        name = m.group(1)
+        if name in ("if", "for", "while", "switch", "return"):
+            continue
+        fm = re.search(r"\b\w[\w<>,\s\*]*\s" + re.escape(name) + r"\s*\([^;{]*\)\s*\{", text)
+        if fm is None:
+            continue
+        hb = brace_body(text, fm.end() - 1)
+        if hb is None:
+            continue
+        if SLANG_STRIDE.search(hb) or any(
+                SLANG_STRIDE.search(i) or NAMED_INC.search(i) for i in for_increments(hb)):
+            return True
+    return False
 
 
 def main():
@@ -277,7 +332,7 @@ def main():
             findings.append((cuda_name, cuda_file, stem + ".slang",
                              "entry point '%s' has no body" % entry))
             continue
-        if not SLANG_STRIDE.search(ebody):
+        if not slang_covers(stext, ebody):
             findings.append((cuda_name, cuda_file, stem + ".slang",
                              "CUDA loops over the grid; the port makes ONE pass"))
 

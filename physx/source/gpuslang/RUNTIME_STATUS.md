@@ -10,8 +10,10 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 Test count: **857/857** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.59 added `gpuslang.gridStride`, the ELEVENTH static checker: a mapped kernel
 whose CUDA covers its work with a grid-stride loop must have that loop in its
-Slang port.  38 known omissions carried as a RATCHET that may shrink, never grow, over
-403/403 mapped kernels (P9.60 closed a 52-kernel blind spot in the checker).
+Slang port.  12 known omissions carried as a RATCHET that may shrink, never grow, over
+403/403 mapped kernels.  P9.60 closed a 52-kernel blind spot in the checker;
+P9.60b corrected its Slang-side marker, which had made 26 of a claimed 38
+"omissions" into noise.
 Manifest: **403/501** kernels mapped (P9.52b-6 filled SPHERE_HEIGHTFIELD_CORE).
 Scenes: **40/40** (P9.58 added `hfbigbox`, which fell through the terrain before
 the convex cores got their grid-stride loop back).
@@ -1845,6 +1847,66 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.60b — KORREKTUR: von den 37 gemeldeten „Auslassungen" waren 26 mein eigenes Rauschen
+
+**P9.59 hat eine Zahl behauptet, die falsch ist.** Der Eintrag und die Commit-Nachricht
+sprechen von „37 known omissions" und beschreiben sie als Defekte, die auf Bearbeitung
+warten. Nach dem Lesen von 27 davon sind es **12**. Die anderen 26 sind Ports, die sehr
+wohl schleifen — der Fehler lag im Marker meines Prüfers, nicht im Korpus.
+
+### Der Grund steht in der Brücke, und ich hätte ihn nachschlagen müssen
+
+`PxgVulkanCudaContext::launchKernel` nimmt
+
+    unsigned int /*blockDimX*/, unsigned int /*blockDimY*/, unsigned int /*blockDimZ*/
+
+— die Namen sind auskommentiert — und reicht ausschließlich `gridDimX/Y/Z` an
+`vkCmdDispatch` durch. **Die CUDA-`blockDim` hat auf diesem Port keine
+Laufzeit-Schreibweise.** Ein Shader, der `i += gridDim.x * blockDim.y` reproduziert,
+*kann* das nicht als Ausdruck schreiben; das Idiom des Korpus ist eine
+dateiweite `static const`, die das Produkt für die eine Startstelle hält, etwa
+`BTRI_GRID * BTRI_WARPS_PER_BLOCK` = 4096·2. Mehrere dieser Shader warnen in ihren
+eigenen Headern ausdrücklich davor, die Schrittweite stattdessen aus der Gruppenzahl
+abzuleiten — das würde doppelt besuchen oder überspringen.
+
+Mein Prüfer suchte `WorkgroupCount()` und nannte alles andere einen
+Einzeldurchgangs-Port. Zwei weitere Blindstellen kamen aus derselben Lesung: die
+Schleife steht oft in einem **Helfer** derselben Datei, während der Einstieg ein
+Zweizeiler-Wrapper ist; und `WorkgroupCount()` bleibt eine legitime Schreibweise
+(P9.52b-6 und P9.58 benutzen sie, wo Gruppenzahl und CUDA-Gitter zusammenfallen).
+Beide werden jetzt akzeptiert, plus eine Ebene Helferaufrufe.
+
+### Die Zahlen, und eine Konvergenz
+
+    vorher:  ports that reproduce the stride: 26   that do not: 38
+    nachher: ports that reproduce the stride: 52   that do not: 12
+
+Die verbleibenden **12** sind exakt die, die P9.58s unabhängiges adversarisches Audit
+am Quelltext bestätigt hatte (abzüglich der beiden inzwischen reparierten
+Postprocess-Kernel, plus die beiden Partikel-Kontaktgeneratoren). Zwei Verfahren mit
+verschiedener Ausgangsevidenz, dieselbe Menge. Das ist der Beleg, den die erste Fassung
+nicht hatte.
+
+### Was der Prüfer weiterhin NICHT kann, und ein offener Widerspruch
+
+Er findet **fehlende** Schleifen, nicht **falsche**. Ein Port, der mit einer falschen
+Konstante schleift, kommt durch — das zu entscheiden bräuchte die Startstelle, und die
+steht in C++, das der Prüfer nicht liest. Ein konkreter Fall ist offen:
+`writeoutAccumulatedForcePerObject` schleift mit benannter Schrittweite, der Prüfer
+gibt ihn also frei, während die Lesung ihn als echte Auslassung eingestuft hat. Dieser
+Widerspruch ist **nicht aufgelöst** und steht so in der Ratschen-Datei.
+
+### Was ich daraus mitnehme
+
+Ein Prüfer, der 38 meldet und bei 12 richtig liegt, ist schlechter als keiner: er
+erzieht seine Leser dazu, ihn zu überblättern. Die Schwäche lag nicht in der Idee,
+sondern darin, dass ich den Marker aus meinem eigenen Schreibstil genommen habe —
+`WorkgroupCount()` benutze *ich* — statt aus dem Korpus, der ihn aus einem handfesten
+Grund nicht benutzen kann. Zwischen „mein Werkzeug meldet 38" und „es gibt 38
+Defekte" lag eine Lesung, die ich vor der Behauptung hätte machen müssen.
+
+Ratsche damit bei **12**, Abdeckung 403/403, Suite **857/857**.
 
 ## P9.60 — der Prüfer aus P9.59 hat 52 Kernel stillschweigend übersprungen, darunter den, für den er geschrieben wurde
 
