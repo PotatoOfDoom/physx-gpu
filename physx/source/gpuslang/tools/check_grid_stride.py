@@ -93,6 +93,58 @@ def brace_body(text, start):
     return None
 
 
+# Finding the kernels is not the regex it looks like.  PhysX writes the declaration
+# three ways, and the first version of this checker saw only the first:
+#
+#     extern "C" __global__ void name(                      -- plain
+#     extern "C" __global__ __launch_bounds__(...) void name(   -- attribute BEFORE void
+#     extern "C" __global__ void __launch_bounds__(...) name(   -- attribute AFTER void
+#
+# The second shape covers 50 mapped kernels including `convexHeightfieldNarrowphase`,
+# which P9.58 had just given a grid-stride loop -- so the check had been silently
+# skipping the very kernel whose defect motivated it.  A scanner that walks tokens
+# after `__global__` and takes the last identifier before the parameter list handles
+# all three, and cannot be quietly defeated by a fourth.
+def kernel_decls(text):
+    """Yield (kernelName, offsetJustPastTheOpenParen) for every __global__."""
+    for m in re.finditer(r"__global__\b", text):
+        i = m.end()
+        last = None
+        while i < len(text):
+            ch = text[i]
+            if ch.isspace():
+                i += 1
+                continue
+            if ch == "(":
+                depth = 0
+                for j in range(i, len(text)):
+                    if text[j] == "(":
+                        depth += 1
+                    elif text[j] == ")":
+                        depth -= 1
+                        if depth == 0:
+                            break
+                else:
+                    break
+                # A parenthesis right after an identifier that is NOT an attribute
+                # opens the parameter list; after an attribute it belongs to it.
+                if last and not last.startswith("__"):
+                    yield last, j + 1
+                    break
+                i = j + 1
+                continue
+            if ch == "_" or ch.isalnum():
+                k = i
+                while k < len(text) and (text[k] == "_" or text[k].isalnum()):
+                    k += 1
+                word = text[i:k]
+                if word not in ("void", "static", "inline", "const"):
+                    last = word
+                i = k
+                continue
+            break
+
+
 def load_manifest():
     rows = []
     with open(MANIFEST, encoding="utf-8") as f:
@@ -181,10 +233,20 @@ def main():
     bodies = {}
     for path in cuda_sources():
         text = strip_comments(open(path, encoding="utf-8", errors="replace").read())
-        for m in re.finditer(r'__global__\s+void\s+(\w+)\s*\(', text):
-            body = brace_body(text, m.end())
-            if body is not None and m.group(1) not in bodies:
-                bodies[m.group(1)] = (os.path.relpath(path, SRC), body)
+        for name, end in kernel_decls(text):
+            if name in bodies:
+                continue
+            body = brace_body(text, end)
+            if body is None:
+                # The brace scan fails on a handful of kernels -- an asymmetric
+                # `#if` arm, or a brace the comment stripper cannot see -- and
+                # returning None there silently drops the kernel from the check.
+                # Falling back to "everything up to the next kernel" is a coarser
+                # body but a sound one for deciding whether a `for` increments by
+                # the grid stride.
+                nxt = next((e for n2, e in kernel_decls(text) if e > end), len(text))
+                body = text[end:nxt]
+            bodies[name] = (os.path.relpath(path, SRC), body)
 
     findings = []
     checked = strided = 0
@@ -230,6 +292,7 @@ def main():
     new = sorted(found - known)
     stale = sorted(known - found)
 
+    unlocated = [r[0] for r in rows if r[0] not in bodies]
     print("grid-stride check over %d mapped kernels" % len(rows))
     print("  located in CUDA: %d   of those looping over the grid: %d"
           % (checked, strided))
@@ -257,7 +320,19 @@ def main():
             print("  %s -- the port now reproduces the stride; remove the line" % name)
         print("\nA ratchet that keeps fixed kernels on its list stops ratcheting.")
 
-    if new or stale:
+    # A kernel the scanner cannot find is not checked AT ALL, which is the failure
+    # mode that hid 52 of them behind a regex.  The count is reported and ratcheted
+    # so the blind spot cannot grow back in silence.
+    if unlocated:
+        print("\n%d MAPPED KERNEL(S) NOT LOCATED IN CUDA -- these are NOT checked:\n"
+              % len(unlocated))
+        for n in unlocated:
+            print("  %s" % n)
+        print("\nEither the declaration has a shape kernel_decls() does not walk, or")
+        print("the name is not a CUDA __global__ at all.  Both need a look: an")
+        print("unlocated kernel is an unchecked one.")
+
+    if new or stale or unlocated:
         return 1
     print("  known omissions carried: %d" % len(known))
     print("OK")

@@ -10,7 +10,8 @@ gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 Test count: **857/857** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.59 added `gpuslang.gridStride`, the ELEVENTH static checker: a mapped kernel
 whose CUDA covers its work with a grid-stride loop must have that loop in its
-Slang port.  37 known omissions carried as a RATCHET that may shrink, never grow.
+Slang port.  38 known omissions carried as a RATCHET that may shrink, never grow, over
+403/403 mapped kernels (P9.60 closed a 52-kernel blind spot in the checker).
 Manifest: **403/501** kernels mapped (P9.52b-6 filled SPHERE_HEIGHTFIELD_CORE).
 Scenes: **40/40** (P9.58 added `hfbigbox`, which fell through the terrain before
 the convex cores got their grid-stride loop back).
@@ -1844,6 +1845,57 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.60 — der Prüfer aus P9.59 hat 52 Kernel stillschweigend übersprungen, darunter den, für den er geschrieben wurde
+
+Bevor ich die Ratsche verkleinere, war eine Frage an mein eigenes Werkzeug fällig: es
+meldete `located in CUDA: 351` bei 403 gemappten Kerneln. **52 wurden also gar nicht
+geprüft**, und die Zeile stand direkt in der Ausgabe, ohne dass ich sie gelesen hatte.
+
+### Der erste Name auf der Liste war der peinlichste
+
+    convexHeightfieldNarrowphase
+
+Genau der Kernel, dessen Defekt P9.58 gemessen hat — eine Box, die durch die Terrain
+fiel — und dessen Reparatur den Prüfer überhaupt motiviert hat. Er stand nicht im
+Verdacht, er war **unsichtbar**.
+
+Der Grund ist eine Deklarationsform, die ich nicht bedacht hatte. PhysX schreibt sie
+in drei Varianten:
+
+    extern "C" __global__ void name(                          -- schlicht
+    extern "C" __global__ __launch_bounds__(...) void name(   -- Attribut VOR void
+    extern "C" __global__ void __launch_bounds__(...) name(   -- Attribut NACH void
+
+Meine Regex `__global__\s+void\s+(\w+)` sah nur die erste. Die zweite verdeckte 50
+Kernel; die dritte fing `__launch_bounds__` selbst als Kernelnamen ein.
+
+Statt die Regex ein drittes Mal zu flicken steht dort jetzt ein kleiner Scanner, der
+die Token nach `__global__` abläuft und den letzten Bezeichner vor der Parameterliste
+nimmt. Er beherrscht alle drei — und eine vierte Form kann ihn nicht mehr lautlos
+aushebeln.
+
+### Und ein zweites Loch darunter
+
+Nach dem Scanner blieben zwei Kernel übrig, und einer davon lag nicht an der
+Deklaration: bei `sb_fem_contact_remap_to_simLaunch` scheiterte die
+**Klammerbilanz** — ein `#if`-Zweig oder eine Klammer, die der Kommentar-Entferner
+nicht sieht — und mein Code gab dort `None` zurück und ließ den Kernel fallen. Jetzt
+gibt es einen Rückfall auf „bis zum nächsten Kernel", was für die Frage *„inkrementiert
+ein `for` um die Gitterschrittweite"* ausreicht.
+
+Abdeckung damit **403 von 403**. Und die volle Abdeckung hat sofort einen **38.**
+Befund freigelegt: `sb_fem_contact_remap_to_simLaunch` selbst.
+
+### Die Zahl wird jetzt geratscht, nicht nur gedruckt
+
+Der eigentliche Fehler war nicht die Regex, sondern dass „351 von 403" als
+Fließtext durchging. Ein Kernel, den der Prüfer nicht findet, ist ein **ungeprüfter**
+Kernel — dieselbe Klasse Stille, gegen die der Prüfer geschrieben wurde. Die Zahl
+lässt den Lauf jetzt scheitern, mit Namensliste, statt in einer Statistikzeile zu
+verschwinden.
+
+Ratsche damit bei **38** Einträgen, Abdeckung 403/403, Suite **857/857**.
 
 ## P9.59 — der ELFTE Prüfer, und ein Fix, für den ich keine Szene bauen konnte
 
