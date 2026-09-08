@@ -340,66 +340,86 @@ PXG_TEST(bodyUpdate_updateShapesEngineAbi)
     shim.memFree(dPool);
 }
 
+// P9.63 -- THE FIXTURE MUST DISPATCH THE ENGINE'S GRID, NOT ONE SIZED TO ITS DATA.
+// PxgSimulationCore launches updateBodiesLaunchDirectAPI (UPDATE_BODIES_AND_SHAPES)
+// and updateBodyExternalVelocitiesLaunch (UPDATE_BODY_EXTERNAL_VELOCITIES) with a
+// FIXED grid of 64 groups of 256, and the bridge drops blockDim, so a shader that
+// does not loop reaches at most 64*256 records however many the engine hands it.
+// These fixtures used to dispatch ceil(count/256) -- their own divisor, sized so
+// that one thread always existed per record -- which made the grid-stride loop
+// unnecessary and its absence invisible.  Both entries were in fact one-pass ports
+// (fixed in P9.63); each test now runs the engine's grid at two sizes, the second
+// past a full pass, so a record beyond the ceiling is checked like any other.
+static const uint32_t BODY_UPDATE_GRID = 64;
+static const uint32_t BODY_UPDATE_PASS = BODY_UPDATE_GRID * 256; // 16384 records
+
+struct SizePair { uint32_t poolSize; uint32_t count; };
+static const SizePair SIZE_CASES[2] = { { 150u, 60u },
+                                        { BODY_UPDATE_PASS + 3616u, BODY_UPDATE_PASS + 1393u } };
+
 PXG_TEST(bodyUpdate_externalVelocities)
 {
-    std::mt19937 rng(2001);
-    std::uniform_real_distribution<float> sym(-5.f, 5.f);
-
-    const uint32_t poolSize = 150;
-    const uint32_t nbUpdates = 60;
-
-    std::vector<BodySim> pool(poolSize);
-    for (uint32_t i = 0; i < poolSize; ++i)
-        pool[i] = randomBodySim(rng, i);
-
-    std::vector<uint32_t> targets(poolSize);
-    std::iota(targets.begin(), targets.end(), 0u);
-    std::shuffle(targets.begin(), targets.end(), rng);
-
-    // PxgBodySimVelocityUpdate: 4 float4
-    std::vector<Float4> updates(nbUpdates * 4);
-    for (uint32_t i = 0; i < nbUpdates; ++i)
+    for (const SizePair sizes : SIZE_CASES)
     {
-        Float4 lin = { sym(rng), sym(rng), sym(rng), 0.f };
-        std::memcpy(&lin.w, &targets[i], 4);
-        updates[i * 4 + 0] = lin;
-        updates[i * 4 + 1] = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
-        updates[i * 4 + 2] = Float4{ sym(rng), sym(rng), sym(rng), 0.f };
-        updates[i * 4 + 3] = Float4{ sym(rng), sym(rng), sym(rng), 0.f };
+        std::mt19937 rng(2001);
+        std::uniform_real_distribution<float> sym(-5.f, 5.f);
+
+        const uint32_t poolSize = sizes.poolSize;
+        const uint32_t nbUpdates = sizes.count;
+
+        std::vector<BodySim> pool(poolSize);
+        for (uint32_t i = 0; i < poolSize; ++i)
+            pool[i] = randomBodySim(rng, i);
+
+        std::vector<uint32_t> targets(poolSize);
+        std::iota(targets.begin(), targets.end(), 0u);
+        std::shuffle(targets.begin(), targets.end(), rng);
+
+        // PxgBodySimVelocityUpdate: 4 float4
+        std::vector<Float4> updates(nbUpdates * 4);
+        for (uint32_t i = 0; i < nbUpdates; ++i)
+        {
+            Float4 lin = { sym(rng), sym(rng), sym(rng), 0.f };
+            std::memcpy(&lin.w, &targets[i], 4);
+            updates[i * 4 + 0] = lin;
+            updates[i * 4 + 1] = Float4{ sym(rng), sym(rng), sym(rng), sym(rng) };
+            updates[i * 4 + 2] = Float4{ sym(rng), sym(rng), sym(rng), 0.f };
+            updates[i * 4 + 3] = Float4{ sym(rng), sym(rng), sym(rng), 0.f };
+        }
+
+        PxgSlangComputeDevice* dev = testDevice();
+        Kernel kernel("bodyUpdate.spv", "updateBodyExternalVelocitiesLaunch", { 4, 4, 4 },
+                      sizeof(BodyUpdateParams));
+
+        PxgBufferHandle updatesBuf = createBufferFrom(dev, updates);
+        PxgBufferHandle poolBuf = createBufferFrom(dev, pool);
+        PxgBufferHandle dummyShapes = dev->createBuffer(16);
+
+        kernel.dispatch(BODY_UPDATE_GRID, { updatesBuf, poolBuf, dummyShapes },
+                        BodyUpdateParams{ nbUpdates });
+        dev->flush();
+
+        const std::vector<BodySim> gpuPool = downloadBuffer<BodySim>(dev, poolBuf, poolSize);
+
+        std::vector<BodySim> refPool = pool;
+        for (uint32_t i = 0; i < nbUpdates; ++i)
+        {
+            BodySim& b = refPool[targets[i]];
+            Float4 lin = updates[i * 4 + 0];
+            lin.w = b.linearVelocityXYZ_inverseMassW.w;
+            b.linearVelocityXYZ_inverseMassW = lin;
+            b.angularVelocityXYZ_maxPenBiasW = updates[i * 4 + 1];
+            b.externalLinearAcceleration = updates[i * 4 + 2];
+            b.externalAngularAcceleration = updates[i * 4 + 3];
+        }
+
+        PXG_CHECK_MSG(std::memcmp(gpuPool.data(), refPool.data(), poolSize * sizeof(BodySim)) == 0,
+                      "external velocity update mismatch");
+
+        dev->destroyBuffer(updatesBuf);
+        dev->destroyBuffer(poolBuf);
+        dev->destroyBuffer(dummyShapes);
     }
-
-    PxgSlangComputeDevice* dev = testDevice();
-    Kernel kernel("bodyUpdate.spv", "updateBodyExternalVelocitiesLaunch", { 4, 4, 4 },
-                  sizeof(BodyUpdateParams));
-
-    PxgBufferHandle updatesBuf = createBufferFrom(dev, updates);
-    PxgBufferHandle poolBuf = createBufferFrom(dev, pool);
-    PxgBufferHandle dummyShapes = dev->createBuffer(16);
-
-    kernel.dispatch((nbUpdates + 255) / 256, { updatesBuf, poolBuf, dummyShapes },
-                    BodyUpdateParams{ nbUpdates });
-    dev->flush();
-
-    const std::vector<BodySim> gpuPool = downloadBuffer<BodySim>(dev, poolBuf, poolSize);
-
-    std::vector<BodySim> refPool = pool;
-    for (uint32_t i = 0; i < nbUpdates; ++i)
-    {
-        BodySim& b = refPool[targets[i]];
-        Float4 lin = updates[i * 4 + 0];
-        lin.w = b.linearVelocityXYZ_inverseMassW.w;
-        b.linearVelocityXYZ_inverseMassW = lin;
-        b.angularVelocityXYZ_maxPenBiasW = updates[i * 4 + 1];
-        b.externalLinearAcceleration = updates[i * 4 + 2];
-        b.externalAngularAcceleration = updates[i * 4 + 3];
-    }
-
-    PXG_CHECK_MSG(std::memcmp(gpuPool.data(), refPool.data(), poolSize * sizeof(BodySim)) == 0,
-                  "external velocity update mismatch");
-
-    dev->destroyBuffer(updatesBuf);
-    dev->destroyBuffer(poolBuf);
-    dev->destroyBuffer(dummyShapes);
 }
 
 // ---------------------------------------------------------------------------
@@ -408,133 +428,136 @@ PXG_TEST(bodyUpdate_externalVelocities)
 
 PXG_TEST(bodyUpdate_directAPI)
 {
-    std::mt19937 rng(2002);
-    std::uniform_real_distribution<float> unit(0.f, 1.f);
-
-    const uint32_t poolSize = 200;
-    const uint32_t nbNew = 100;
-
-    std::vector<BodySim> pool(poolSize);
-    for (uint32_t i = 0; i < poolSize; ++i)
-        pool[i] = randomBodySim(rng, i);
-
-    std::vector<uint32_t> targets(poolSize);
-    std::iota(targets.begin(), targets.end(), 0u);
-    std::shuffle(targets.begin(), targets.end(), rng);
-
-    std::vector<BodySim> staged(nbNew);
-    for (uint32_t i = 0; i < nbNew; ++i)
+    for (const SizePair sizes : SIZE_CASES)
     {
-        staged[i] = randomBodySim(rng, targets[i]);
-        uint32_t flags = 0;
-        const float r = unit(rng);
-        if (r < 0.3f)
-            flags |= eFIRST_BODY_COPY_GPU;
-        if (unit(rng) < 0.5f)
-            flags |= eVELOCITY_COPY_GPU;
-        staged[i].internalFlags = flags;
-        // half the updates keep the old body2Actor (no pose recompute)
-        if (unit(rng) < 0.5f)
-            staged[i].body2Actor_maxImpulseW = pool[targets[i]].body2Actor_maxImpulseW;
-    }
+        std::mt19937 rng(2002);
+        std::uniform_real_distribution<float> unit(0.f, 1.f);
 
-    PxgSlangComputeDevice* dev = testDevice();
-    Kernel kernel("bodyUpdate.spv", "updateBodiesLaunchDirectAPI", { 4, 4, 4 }, sizeof(BodyUpdateParams));
+        const uint32_t poolSize = sizes.poolSize;
+        const uint32_t nbNew = sizes.count;
 
-    PxgBufferHandle stagedBuf = createBufferFrom(dev, staged);
-    PxgBufferHandle poolBuf = createBufferFrom(dev, pool);
-    PxgBufferHandle dummyShapes = dev->createBuffer(16);
+        std::vector<BodySim> pool(poolSize);
+        for (uint32_t i = 0; i < poolSize; ++i)
+            pool[i] = randomBodySim(rng, i);
 
-    kernel.dispatch((nbNew + 255) / 256, { stagedBuf, poolBuf, dummyShapes }, BodyUpdateParams{ nbNew });
-    dev->flush();
+        std::vector<uint32_t> targets(poolSize);
+        std::iota(targets.begin(), targets.end(), 0u);
+        std::shuffle(targets.begin(), targets.end(), rng);
 
-    const std::vector<BodySim> gpuPool = downloadBuffer<BodySim>(dev, poolBuf, poolSize);
-
-    // ---- reference (transcription of updateBodiesLaunchDirectAPI) ----
-    std::vector<BodySim> refPool = pool;
-    for (uint32_t i = 0; i < nbNew; ++i)
-    {
-        const BodySim& src = staged[i];
-        BodySim& dst = refPool[targets[i]];
-
-        const bool firstTransfer = (src.internalFlags & eFIRST_BODY_COPY_GPU) != 0;
-        const bool copyVel = (src.internalFlags & eVELOCITY_COPY_GPU) != 0;
-
-        if (firstTransfer)
+        std::vector<BodySim> staged(nbNew);
+        for (uint32_t i = 0; i < nbNew; ++i)
         {
-            dst = src;
-            continue;
+            staged[i] = randomBodySim(rng, targets[i]);
+            uint32_t flags = 0;
+            const float r = unit(rng);
+            if (r < 0.3f)
+                flags |= eFIRST_BODY_COPY_GPU;
+            if (unit(rng) < 0.5f)
+                flags |= eVELOCITY_COPY_GPU;
+            staged[i].internalFlags = flags;
+            // half the updates keep the old body2Actor (no pose recompute)
+            if (unit(rng) < 0.5f)
+                staged[i].body2Actor_maxImpulseW = pool[targets[i]].body2Actor_maxImpulseW;
         }
 
-        const AlignedTransform body2WorldOld = dst.body2World;
-        const AlignedTransform oldBody2Actor = dst.body2Actor_maxImpulseW;
+        PxgSlangComputeDevice* dev = testDevice();
+        Kernel kernel("bodyUpdate.spv", "updateBodiesLaunchDirectAPI", { 4, 4, 4 }, sizeof(BodyUpdateParams));
 
-        // copy uint4s [0, 12) with the velocity .w-only rule
-        // (memcpy, not reinterpret_cast word stores: the struct is re-read
-        // through its members below, and type-punned stores would be a
-        // strict-aliasing violation the optimizer is entitled to exploit)
-        const unsigned char* s = reinterpret_cast<const unsigned char*>(&src);
-        unsigned char* d = reinterpret_cast<unsigned char*>(&dst);
-        for (uint32_t u4 = 0; u4 < 12; ++u4)
+        PxgBufferHandle stagedBuf = createBufferFrom(dev, staged);
+        PxgBufferHandle poolBuf = createBufferFrom(dev, pool);
+        PxgBufferHandle dummyShapes = dev->createBuffer(16);
+
+        kernel.dispatch(BODY_UPDATE_GRID, { stagedBuf, poolBuf, dummyShapes }, BodyUpdateParams{ nbNew });
+        dev->flush();
+
+        const std::vector<BodySim> gpuPool = downloadBuffer<BodySim>(dev, poolBuf, poolSize);
+
+        // ---- reference (transcription of updateBodiesLaunchDirectAPI) ----
+        std::vector<BodySim> refPool = pool;
+        for (uint32_t i = 0; i < nbNew; ++i)
         {
-            if (u4 < 2 && !copyVel)
-                std::memcpy(d + u4 * 16 + 12, s + u4 * 16 + 12, 4);
-            else
-                std::memcpy(d + u4 * 16, s + u4 * 16, 16);
-        }
+            const BodySim& src = staged[i];
+            BodySim& dst = refPool[targets[i]];
 
-        const AlignedTransform newBody2Actor = dst.body2Actor_maxImpulseW;
+            const bool firstTransfer = (src.internalFlags & eFIRST_BODY_COPY_GPU) != 0;
+            const bool copyVel = (src.internalFlags & eVELOCITY_COPY_GPU) != 0;
 
-        const bool changed = !(oldBody2Actor.p.x == newBody2Actor.p.x &&
-                               oldBody2Actor.p.y == newBody2Actor.p.y &&
-                               oldBody2Actor.p.z == newBody2Actor.p.z &&
-                               oldBody2Actor.q.x == newBody2Actor.q.x &&
-                               oldBody2Actor.q.y == newBody2Actor.q.y &&
-                               oldBody2Actor.q.z == newBody2Actor.q.z &&
-                               oldBody2Actor.q.w == newBody2Actor.q.w);
-        if (changed)
-        {
-            // PxAlignedTransform math (rotate() zeroes the w lane)
-            const QuatV qW(body2WorldOld.q), qA(oldBody2Actor.q), qN(newBody2Actor.q);
-            const Vec3 pW(body2WorldOld.p.x, body2WorldOld.p.y, body2WorldOld.p.z);
-            const Vec3 pA(oldBody2Actor.p.x, oldBody2Actor.p.y, oldBody2Actor.p.z);
-            const Vec3 pN(newBody2Actor.p.x, newBody2Actor.p.y, newBody2Actor.p.z);
-
-            const QuatV qInv = qA.getConjugate();
-            const Vec3 pInv = qA.rotateInv(-pA);
-
-            const QuatV qA2W = qW * qInv;
-            const Vec3 pA2W = qW.rotate(pInv) + pW;
-
-            const QuatV qNew = qA2W * qN;
-            const Vec3 pNew = qA2W.rotate(pN) + pA2W;
-
-            dst.body2World.q = qNew.toFloat4();
-            dst.body2World.p = Float4{ pNew.x, pNew.y, pNew.z, body2WorldOld.p.w };
-        }
-    }
-
-    size_t mismatches = 0;
-    for (uint32_t n = 0; n < poolSize; ++n)
-    {
-        const float* g = reinterpret_cast<const float*>(&gpuPool[n]);
-        const float* r = reinterpret_cast<const float*>(&refPool[n]);
-        for (uint32_t w = 0; w < sizeof(BodySim) / 4; ++w)
-        {
-            if (!almostEqual(g[w], r[w], 1e-5f, 1e-6f) &&
-                reinterpret_cast<const uint32_t*>(g)[w] != reinterpret_cast<const uint32_t*>(r)[w])
+            if (firstTransfer)
             {
-                if (mismatches < 5)
-                    PXG_CHECK_MSG(false, "directAPI pool[%u] word %u: gpu=%g ref=%g", n, w, g[w], r[w]);
-                ++mismatches;
+                dst = src;
+                continue;
+            }
+
+            const AlignedTransform body2WorldOld = dst.body2World;
+            const AlignedTransform oldBody2Actor = dst.body2Actor_maxImpulseW;
+
+            // copy uint4s [0, 12) with the velocity .w-only rule
+            // (memcpy, not reinterpret_cast word stores: the struct is re-read
+            // through its members below, and type-punned stores would be a
+            // strict-aliasing violation the optimizer is entitled to exploit)
+            const unsigned char* s = reinterpret_cast<const unsigned char*>(&src);
+            unsigned char* d = reinterpret_cast<unsigned char*>(&dst);
+            for (uint32_t u4 = 0; u4 < 12; ++u4)
+            {
+                if (u4 < 2 && !copyVel)
+                    std::memcpy(d + u4 * 16 + 12, s + u4 * 16 + 12, 4);
+                else
+                    std::memcpy(d + u4 * 16, s + u4 * 16, 16);
+            }
+
+            const AlignedTransform newBody2Actor = dst.body2Actor_maxImpulseW;
+
+            const bool changed = !(oldBody2Actor.p.x == newBody2Actor.p.x &&
+                                   oldBody2Actor.p.y == newBody2Actor.p.y &&
+                                   oldBody2Actor.p.z == newBody2Actor.p.z &&
+                                   oldBody2Actor.q.x == newBody2Actor.q.x &&
+                                   oldBody2Actor.q.y == newBody2Actor.q.y &&
+                                   oldBody2Actor.q.z == newBody2Actor.q.z &&
+                                   oldBody2Actor.q.w == newBody2Actor.q.w);
+            if (changed)
+            {
+                // PxAlignedTransform math (rotate() zeroes the w lane)
+                const QuatV qW(body2WorldOld.q), qA(oldBody2Actor.q), qN(newBody2Actor.q);
+                const Vec3 pW(body2WorldOld.p.x, body2WorldOld.p.y, body2WorldOld.p.z);
+                const Vec3 pA(oldBody2Actor.p.x, oldBody2Actor.p.y, oldBody2Actor.p.z);
+                const Vec3 pN(newBody2Actor.p.x, newBody2Actor.p.y, newBody2Actor.p.z);
+
+                const QuatV qInv = qA.getConjugate();
+                const Vec3 pInv = qA.rotateInv(-pA);
+
+                const QuatV qA2W = qW * qInv;
+                const Vec3 pA2W = qW.rotate(pInv) + pW;
+
+                const QuatV qNew = qA2W * qN;
+                const Vec3 pNew = qA2W.rotate(pN) + pA2W;
+
+                dst.body2World.q = qNew.toFloat4();
+                dst.body2World.p = Float4{ pNew.x, pNew.y, pNew.z, body2WorldOld.p.w };
             }
         }
-    }
-    PXG_CHECK_MSG(mismatches == 0, "directAPI: %zu word mismatches", mismatches);
 
-    dev->destroyBuffer(stagedBuf);
-    dev->destroyBuffer(poolBuf);
-    dev->destroyBuffer(dummyShapes);
+        size_t mismatches = 0;
+        for (uint32_t n = 0; n < poolSize; ++n)
+        {
+            const float* g = reinterpret_cast<const float*>(&gpuPool[n]);
+            const float* r = reinterpret_cast<const float*>(&refPool[n]);
+            for (uint32_t w = 0; w < sizeof(BodySim) / 4; ++w)
+            {
+                if (!almostEqual(g[w], r[w], 1e-5f, 1e-6f) &&
+                    reinterpret_cast<const uint32_t*>(g)[w] != reinterpret_cast<const uint32_t*>(r)[w])
+                {
+                    if (mismatches < 5)
+                        PXG_CHECK_MSG(false, "directAPI pool[%u] word %u: gpu=%g ref=%g", n, w, g[w], r[w]);
+                    ++mismatches;
+                }
+            }
+        }
+        PXG_CHECK_MSG(mismatches == 0, "directAPI: %zu word mismatches", mismatches);
+
+        dev->destroyBuffer(stagedBuf);
+        dev->destroyBuffer(poolBuf);
+        dev->destroyBuffer(dummyShapes);
+    }
 }
 
 // ---------------------------------------------------------------------------

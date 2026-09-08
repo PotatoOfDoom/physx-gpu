@@ -63,6 +63,16 @@ struct ThresholdParams
 
 uint32_t idxOf(uint64_t node) { return uint32_t(node & 0xffffffffu); }
 
+// P9.63 -- THE FIXTURE MUST DISPATCH THE ENGINE'S GRID, AND THE ENGINE USES TWO.
+// PxgSolverKernelIndices.h (PxgKernelGridDim) gives 32 groups to the four
+// block-partitioned entries and 64 to the four plain grid-stride ones; this
+// fixture used to dispatch 32 for all eight, which made the shader's stride
+// constant self-consistent with the fixture and unobservable.  Keep these two
+// names in step with the shader's NUM_BLOCKS / NUM_BLOCKS_WIDE.
+static const uint32_t THRESH_GRID = 32;       // COMPUTE/OUTPUT_ACCUMULATED, COMPUTE/OUTPUT_EXCEEDEDFORCE
+static const uint32_t THRESH_GRID_WIDE = 64;  // INITIALIZE_INPUT_AND_RANKS, REORGANIZE, WRITEOUT
+static const uint32_t THRESH_BLOCK = 256;
+
 // ---------------------------------------------------------------------------
 // Test 1: sort-key extraction + reorganize
 // ---------------------------------------------------------------------------
@@ -102,7 +112,7 @@ PXG_TEST(thresholdStream_sortKeysAndReorganize)
 
     // ---- initialRanksAndBodyIndexB ----
     Kernel kB("thresholdStream.spv", "initialRanksAndBodyIndexB", { 40, 4, 4 }, sizeof(ThresholdParams));
-    kB.dispatch(32, { streamBuf, keysBuf, ranksBuf }, p);
+    kB.dispatch(THRESH_GRID_WIDE, { streamBuf, keysBuf, ranksBuf }, p);
     dev->flush();
 
     auto gKeysB = downloadBuffer<uint32_t>(dev, keysBuf, N + padCount);
@@ -133,7 +143,7 @@ PXG_TEST(thresholdStream_sortKeysAndReorganize)
     PxgBufferHandle ranksB2 = createBufferFrom(dev, ranksBinput);
 
     Kernel kA("thresholdStream.spv", "initialRanksAndBodyIndexA", { 40, 4, 4 }, sizeof(ThresholdParams));
-    kA.dispatch(32, { streamBuf, keysBuf, ranksB2 }, p);
+    kA.dispatch(THRESH_GRID_WIDE, { streamBuf, keysBuf, ranksB2 }, p);
     dev->flush();
 
     auto gKeysA = downloadBuffer<uint32_t>(dev, keysBuf, N + padCount);
@@ -162,7 +172,7 @@ PXG_TEST(thresholdStream_sortKeysAndReorganize)
 
     Kernel kR("thresholdStream.spv", "reorganizeThresholdElements", { 4, 4, 4, 40, 40 }, sizeof(ThresholdParams));
     // bindings 2,3,4 -> ranks, destWords, tmpWords (0,1 dummy)
-    kR.dispatch(32, { dummyBuf, dummyBuf, finalRanksBuf, destBuf, tmpBuf }, p);
+    kR.dispatch(THRESH_GRID_WIDE, { dummyBuf, dummyBuf, finalRanksBuf, destBuf, tmpBuf }, p);
     dev->flush();
 
     auto gDest = downloadBuffer<ThresholdStreamElement>(dev, destBuf, N);
@@ -251,19 +261,19 @@ PXG_TEST(thresholdStream_accumulateAndExceeded)
         // computeAccumulate: bindings 0,5,6,7,8,9
         Kernel kAcc("thresholdStream.spv", "computeAccumulateThresholdStream",
                     { 40, 4, 4, 4, 4, 4, 4, 4, 4, 4 }, sizeof(ThresholdParams));
-        kAcc.dispatch(32, { streamBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, accForceBuf, accForceBBBuf,
+        kAcc.dispatch(THRESH_GRID, { streamBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, accForceBuf, accForceBBBuf,
                             writeIdxBuf, writeIdxBBBuf, writeableBuf }, p);
         dev->barrier();
         // outputAccumulate: bindings 5,6,7,8
         Kernel kOut("thresholdStream.spv", "outputAccumulateThresholdStream",
                     { 4, 4, 4, 4, 4, 4, 4, 4, 4 }, sizeof(ThresholdParams));
-        kOut.dispatch(32, { dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, accForceBuf, accForceBBBuf,
+        kOut.dispatch(THRESH_GRID, { dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, accForceBuf, accForceBBBuf,
                             writeIdxBuf, writeIdxBBBuf }, p);
         dev->barrier();
         // writeout: bindings 5,7,9,10
         Kernel kWrite("thresholdStream.spv", "writeoutAccumulatedForcePerObject",
                       { 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4 }, sizeof(ThresholdParams));
-        kWrite.dispatch(32, { dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, accForceBuf, dummyBuf,
+        kWrite.dispatch(THRESH_GRID_WIDE, { dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, accForceBuf, dummyBuf,
                               writeIdxBuf, dummyBuf, writeableBuf, objPairsBuf }, p);
         dev->flush();
 
@@ -307,13 +317,13 @@ PXG_TEST(thresholdStream_accumulateAndExceeded)
         // computeExceeded: bindings 0,7,8,9,10
         Kernel kExc("thresholdStream.spv", "computeExceededForceThresholdElementIndice",
                     { 40, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4 }, sizeof(ThresholdParams));
-        kExc.dispatch(32, { streamBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, writeIdxBuf,
+        kExc.dispatch(THRESH_GRID, { streamBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, writeIdxBuf,
                             writeIdxBBBuf, writeableBuf, objPairsBuf }, p);
         dev->barrier();
         // outputExceeded: bindings 0,7,8,9,11,12
         Kernel kOutExc("thresholdStream.spv", "outputExceededForceThresholdElementIndice",
                        { 40, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 40, 4 }, sizeof(ThresholdParams));
-        kOutExc.dispatch(32, { streamBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, writeIdxBuf,
+        kOutExc.dispatch(THRESH_GRID, { streamBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, dummyBuf, writeIdxBuf,
                                writeIdxBBBuf, writeableBuf, dummyBuf, exceededBuf, nbExcBuf }, p);
         dev->flush();
 
@@ -356,6 +366,140 @@ PXG_TEST(thresholdStream_accumulateAndExceeded)
                                    objPairsBuf, exceededBuf, nbExcBuf, dummyBuf })
             dev->destroyBuffer(h);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: the grid-stride entries at the ENGINE's grid, above one pass
+// ---------------------------------------------------------------------------
+// P9.63.  Tests 1 and 2 run N <= 2001 against 32 x 256 = 8192 threads, so the
+// four grid-stride loops NEVER ITERATE and their stride constant is unobserved.
+// This runs the three that need no scan (both rank kernels and reorganize) with
+// more elements than one engine pass covers.
+//
+// WHAT THIS PROVES, EXACTLY: that no index is SKIPPED at the engine's grid.  It
+// does NOT prove the stride equals the engine's thread count -- a stride BELOW it
+// makes threads revisit indices, and all three bodies are pure gathers whose
+// destination buffer differs from their source, so a revisit rewrites the same
+// bytes and passes.  (That is precisely the state the port was in before P9.63:
+// stride 8192 against 16384 threads, benign but undocumented.)  What it does
+// catch is the failure that is NOT benign -- a stride ABOVE the thread count,
+// which leaves a hole -- and it catches it on the first element past the stride
+// rather than at whatever scene size happens to reach it.
+PXG_TEST(thresholdStream_engineGridCoverage)
+{
+    std::mt19937 rng(6311);
+    // one engine pass is THRESH_GRID_WIDE * THRESH_BLOCK = 16384 elements for the
+    // rank kernels, and an eighth of that in elements for reorganize (8 lanes each)
+    const uint32_t N = THRESH_GRID_WIDE * THRESH_BLOCK + 1777; // 18161: two passes plus a tail
+
+    std::vector<ThresholdStreamElement> stream(N);
+    std::memset(stream.data(), 0, stream.size() * sizeof(ThresholdStreamElement));
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        stream[i].nodeIndexA = rng() % 4000;
+        stream[i].nodeIndexB = rng() % 4000;
+        stream[i].shapeInteraction = (uint64_t(rng()) << 32) | rng();
+        stream[i].normalForce = float(rng() % 1000) * 0.01f;
+        stream[i].threshold = float(rng() % 1000) * 0.01f;
+        stream[i].accumulatedForce = -1.f;
+        stream[i].pad = 0xdeadbeef;
+    }
+
+    PxgSlangComputeDevice* dev = testDevice();
+    const uint32_t padCount = (4 - (N & 3)) & 3;
+
+    // the sentinel is what makes a SKIP visible: an untouched slot keeps it
+    std::vector<uint32_t> keysInit(N + padCount, 0xcdcdcdcdu), ranksInit(N + padCount, 0xcdcdcdcdu);
+    std::vector<uint32_t> dummy(16, 0);
+
+    PxgBufferHandle streamBuf = createBufferFrom(dev, stream);
+    PxgBufferHandle keysBuf = createBufferFrom(dev, keysInit);
+    PxgBufferHandle ranksBuf = createBufferFrom(dev, ranksInit);
+    PxgBufferHandle dummyBuf = createBufferFrom(dev, dummy);
+
+    ThresholdParams p = {};
+    p.nbThresholdElements = N;
+    p.dt = 1.f;
+
+    Kernel kB("thresholdStream.spv", "initialRanksAndBodyIndexB", { 40, 4, 4 }, sizeof(ThresholdParams));
+    kB.dispatch(THRESH_GRID_WIDE, { streamBuf, keysBuf, ranksBuf }, p);
+    dev->flush();
+
+    auto gKeysB = downloadBuffer<uint32_t>(dev, keysBuf, N + padCount);
+    auto gRanksB = downloadBuffer<uint32_t>(dev, ranksBuf, N + padCount);
+    size_t mism = 0, firstBad = N;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        if (gKeysB[i] != idxOf(stream[i].nodeIndexB) || gRanksB[i] != i)
+        {
+            if (mism == 0) firstBad = i;
+            ++mism;
+        }
+    }
+    PXG_CHECK_MSG(mism == 0, "initialRanksAndBodyIndexB N=%u: %zu mismatches, first at %zu (one pass = %u)",
+                  N, mism, firstBad, THRESH_GRID_WIDE * THRESH_BLOCK);
+
+    // initialRanksAndBodyIndexA over the identity permutation: keys[i] = A(ranks[i])
+    std::vector<uint32_t> identity(N + padCount);
+    std::iota(identity.begin(), identity.end(), 0u);
+    PxgBufferHandle idRanksBuf = createBufferFrom(dev, identity);
+    std::vector<uint32_t> keysReset(N + padCount, 0xcdcdcdcdu);
+    PxgBufferHandle keysBuf2 = createBufferFrom(dev, keysReset);
+
+    Kernel kA("thresholdStream.spv", "initialRanksAndBodyIndexA", { 40, 4, 4 }, sizeof(ThresholdParams));
+    kA.dispatch(THRESH_GRID_WIDE, { streamBuf, keysBuf2, idRanksBuf }, p);
+    dev->flush();
+
+    auto gKeysA = downloadBuffer<uint32_t>(dev, keysBuf2, N + padCount);
+    mism = 0; firstBad = N;
+    for (uint32_t i = 0; i < N; ++i)
+        if (gKeysA[i] != idxOf(stream[i].nodeIndexA))
+        {
+            if (mism == 0) firstBad = i;
+            ++mism;
+        }
+    PXG_CHECK_MSG(mism == 0, "initialRanksAndBodyIndexA N=%u: %zu mismatches, first at %zu (one pass = %u)",
+                  N, mism, firstBad, THRESH_GRID_WIDE * THRESH_BLOCK);
+
+    // reorganize with a reversing permutation, so a skipped slot cannot coincide
+    // with the value it would have held under the identity
+    std::vector<uint32_t> revRanks(N + padCount, 0);
+    for (uint32_t i = 0; i < N; ++i)
+        revRanks[i] = N - 1 - i;
+    PxgBufferHandle revRanksBuf = createBufferFrom(dev, revRanks);
+
+    PxgBufferHandle tmpBuf = createBufferFrom(dev, stream);
+    std::vector<ThresholdStreamElement> destInit(N);
+    std::memset(destInit.data(), 0, destInit.size() * sizeof(ThresholdStreamElement));
+    for (auto& e : destInit) e.accumulatedForce = 12345.f;
+    PxgBufferHandle destBuf = createBufferFrom(dev, destInit);
+
+    Kernel kR("thresholdStream.spv", "reorganizeThresholdElements", { 4, 4, 4, 40, 40 }, sizeof(ThresholdParams));
+    kR.dispatch(THRESH_GRID_WIDE, { dummyBuf, dummyBuf, revRanksBuf, destBuf, tmpBuf }, p);
+    dev->flush();
+
+    auto gDest = downloadBuffer<ThresholdStreamElement>(dev, destBuf, N);
+    mism = 0; firstBad = N;
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const ThresholdStreamElement& r = stream[revRanks[i]];
+        const ThresholdStreamElement& g = gDest[i];
+        const bool bad = g.shapeInteraction != r.shapeInteraction || g.normalForce != r.normalForce ||
+                         g.threshold != r.threshold || g.nodeIndexA != r.nodeIndexA ||
+                         g.nodeIndexB != r.nodeIndexB || g.accumulatedForce != 12345.f;
+        if (bad)
+        {
+            if (mism == 0) firstBad = i;
+            ++mism;
+        }
+    }
+    // reorganize spends 8 lanes per element, so one engine pass is 2048 elements
+    PXG_CHECK_MSG(mism == 0, "reorganize N=%u: %zu mismatches, first at %zu (one pass = %u elements)",
+                  N, mism, firstBad, (THRESH_GRID_WIDE * THRESH_BLOCK) / 8);
+
+    for (PxgBufferHandle h : { streamBuf, keysBuf, ranksBuf, dummyBuf, idRanksBuf, keysBuf2,
+                               revRanksBuf, tmpBuf, destBuf })
+        dev->destroyBuffer(h);
 }
 
 } // namespace

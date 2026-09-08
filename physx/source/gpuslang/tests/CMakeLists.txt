@@ -2064,8 +2064,10 @@ set(PXG_HLSL_ENTRIES
     # updateBounds:updateTransformCacheAndBoundArrayLaunch, bodyUpdate:updateBodiesLaunch and
     # bodyUpdate:updateShapesLaunch retired: converted to the BDA engine ABI (P5 Step 4) and
     # grid-stride via WorkgroupCount(), which has no HLSL builtin (P0 policy).
+    # P9.63 retires the last two bodyUpdate entries for the same reason: both were
+    # one-pass ports that stopped at the engine's 64 x 256 = 16384 threads, and
+    # restoring the CUDA's grid-stride loop needs WorkgroupCount().
     "updateBounds:setRigidDynamicGlobalPose"
-    "bodyUpdate:updateBodiesLaunchDirectAPI" "bodyUpdate:updateBodyExternalVelocitiesLaunch"
     "directApi:getRigidDynamicGlobalPose" "directApi:getRigidDynamicLinearAcceleration"
     "directApi:setRigidDynamicLinearVelocity" "directApi:setRigidDynamicTorque"
     # solverPGS:solveBlockPartition retired: converted to the BDA engine ABI

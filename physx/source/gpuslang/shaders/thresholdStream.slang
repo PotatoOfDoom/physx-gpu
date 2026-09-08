@@ -46,13 +46,39 @@
 // (setThresholdElementsMask onward) is left for a later tranche.
 //
 // Portability: the CUDA warp shuffles (warpScan / __ballot_sync+__popc) become
-// groupshared 32-lane Hillis-Steele scans; the fixed 32-block device grid and
+// groupshared 32-lane Hillis-Steele scans; the block-partitioned device grid and
 // its between-block accumulation are preserved (BLOCK = 256 threads, 8 warps).
+//
+// P9.63 -- THIS FILE IS LAUNCHED WITH TWO DIFFERENT GRIDS AND THE PORT HAD ONE
+// CONSTANT.  The CUDA writes its stride as the runtime product
+// `blockDim.x * gridDim.x`, which is right at every launch site by construction.
+// The bridge drops blockDim, so the port must name the product per launch site --
+// and PxgSolverKernelIndices.h gives two distinct grids for the entries here:
+//
+//   grid 32:  COMPUTE_ACCUMULATED_THRESHOLDSTREAM, OUTPUT_ACCUMULATED_THRESHOLDSTREAM,
+//             COMPUTE_EXCEEDEDFORCE_..., OUTPUT_EXCEEDEDFORCE_...   -> NUM_BLOCKS
+//   grid 64:  INITIALIZE_INPUT_AND_RANKS, REORGANIZE_THRESHOLDSTREAM,
+//             WRITEOUT_ACCUMULATEDFORCEPEROBJECT                    -> NUM_BLOCKS_WIDE
+//
+// Before this the four grid-64 entries strided by 256*32 while the engine gave
+// them 256*64 threads, so every index at or above the stride was visited by TWO
+// threads.  That was OUTPUT-EQUIVALENT and not a coverage hole -- all four bodies
+// are pure gathers whose destination is a different buffer from their source, so
+// the duplicate simply stores the same bytes again -- which is why nothing ever
+// failed.  It is corrected anyway: the equivalence rests entirely on the bodies
+// staying idempotent, and nothing in the file said so.  Note also that this is NOT
+// the case the grid-stride checker can decide (it finds missing loops, not wrong
+// constants); it took reading the four launch sites.
+//
+// The fixture must dispatch the ENGINE's grid per entry, and with more elements
+// than one pass covers, or the loop never iterates and the constant is unobserved
+// (it dispatched 32 for all eight, with N <= 2001, and saw nothing).
 
 import pxgSlangCommon;
 
 static const uint BLOCK = 256;
-static const uint NUM_BLOCKS = 32;
+static const uint NUM_BLOCKS = 32;       // PxgKernelGridDim, the block-partitioned entries
+static const uint NUM_BLOCKS_WIDE = 64;  // PxgKernelGridDim, the plain grid-stride entries
 static const uint WARP = 32;
 static const uint WARPS_PER_BLOCK = BLOCK / WARP; // 8
 
@@ -108,7 +134,7 @@ bool nodeEq(uint2 a, uint2 b) { return a.x == b.x && a.y == b.y; }
 void initialRanksAndBodyIndexB(uint3 dtid : SV_DispatchThreadID, uint3 gdim : SV_GroupID)
 {
     const uint n = gParams.nbThresholdElements;
-    const uint stride = BLOCK * NUM_BLOCKS;
+    const uint stride = BLOCK * NUM_BLOCKS_WIDE;
     for (uint i = dtid.x; i < n; i += stride)
     {
         gInputKeys[i] = gThresholdStream[i].nodeIndexB.x; // index()
@@ -130,7 +156,7 @@ void initialRanksAndBodyIndexB(uint3 dtid : SV_DispatchThreadID, uint3 gdim : SV
 void initialRanksAndBodyIndexA(uint3 dtid : SV_DispatchThreadID)
 {
     const uint n = gParams.nbThresholdElements;
-    const uint stride = BLOCK * NUM_BLOCKS;
+    const uint stride = BLOCK * NUM_BLOCKS_WIDE;
     for (uint i = dtid.x; i < n; i += stride)
         gInputKeys[i] = gThresholdStream[gInputRanks[i]].nodeIndexA.x;
     const uint remaining = (4 - (n & 3)) & 3;
@@ -146,7 +172,7 @@ void initialRanksAndBodyIndexA(uint3 dtid : SV_DispatchThreadID)
 void reorganizeThresholdElements(uint3 dtid : SV_DispatchThreadID)
 {
     const uint n = gParams.nbThresholdElements;
-    const uint stride = (BLOCK * NUM_BLOCKS) / 8;
+    const uint stride = (BLOCK * NUM_BLOCKS_WIDE) / 8;
     const uint lane8 = dtid.x & 7;
     for (uint i = dtid.x / 8; i < n; i += stride)
     {
@@ -381,7 +407,7 @@ void outputAccumulateThresholdStream(uint3 gtid : SV_GroupThreadID, uint3 gid : 
 void writeoutAccumulatedForcePerObject(uint3 dtid : SV_DispatchThreadID)
 {
     const uint n = gParams.nbThresholdElements;
-    const uint stride = BLOCK * NUM_BLOCKS;
+    const uint stride = BLOCK * NUM_BLOCKS_WIDE;
     for (uint workIndex = dtid.x; workIndex < n; workIndex += stride)
     {
         if (gWriteable[workIndex] != 0u)

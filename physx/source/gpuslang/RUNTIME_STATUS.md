@@ -7,15 +7,17 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **851/851** green in both modes (`ctest -N` in `build-gpuslang`).
-P9.61 retired five `gpuslang.hlsl.*` twins: the skinning entries now need
-`WorkgroupCount()`, which has no cs_6_0 lowering.
+Test count: **849/849** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.61 retired five `gpuslang.hlsl.*` twins and P9.63 the last two
+(`bodyUpdate:updateBodiesLaunchDirectAPI`, `:updateBodyExternalVelocitiesLaunch`):
+all seven now need `WorkgroupCount()`, which has no cs_6_0 lowering.
 P9.59 added `gpuslang.gridStride`, the ELEVENTH static checker: a mapped kernel
 whose CUDA covers its work with a grid-stride loop must have that loop in its
-Slang port.  6 known omissions carried as a RATCHET that may shrink, never grow, over
+Slang port.  **2** known omissions carried as a RATCHET that may shrink, never grow, over
 403/403 mapped kernels.  P9.60 closed a 52-kernel blind spot in the checker;
 P9.60b corrected its Slang-side marker, which had made 26 of a claimed 38
-"omissions" into noise.
+"omissions" into noise; P9.63 taught it the counted-loop form (`it * stride` with
+`++it`), which had made the last two `ps_*` entries into noise as well.
 Manifest: **403/501** kernels mapped (P9.52b-6 filled SPHERE_HEIGHTFIELD_CORE).
 Scenes: **40/40** (P9.58 added `hfbigbox`, which fell through the terrain before
 the convex cores got their grid-stride loop back).
@@ -1849,6 +1851,125 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.63 — die letzten vier der Liste: zwei waren nie Defekte, zwei waren echt, und ein dritter Fund nebenbei
+
+Vier Einträge der Ratsche waren noch ungemessen. Die Startstelle zu lesen — die Methode aus
+P9.61, inzwischen Routine — hat sie sauber in zwei Hälften geteilt.
+
+### Die zwei, die nie Defekte waren: eine DRITTE Falsch-Positiv-Form
+
+`ps_primitivesCollisionLaunch` und `ps_primitivesDiffuseCollisionLaunch` decken ihre
+Arbeit vollständig ab. `psContactGenBda.slang` zieht die Rundenzahl heraus und zählt die
+Schleife um eins hoch:
+
+```slang
+const uint stride = PS_BLOCK * PS_GRID;
+const uint nbIterations = (totalComparison + stride - 1u) / stride;
+for (uint it = 0u; it < nbIterations; ++it)
+{
+    const uint workIndex = it * stride + gid.x * PS_BLOCK + tid;
+```
+
+Das ist eine Grid-Stride-Schleife, bei der die Multiplikation aus dem Inkrement in den
+Index gewandert ist — jedes Arbeitselement genau einmal besucht. Aber `++it` trifft weder
+`WorkgroupCount()` noch `+= <name>`, also **die dritte Form, die mein Prüfer nicht sehen
+konnte**. `check_grid_stride.py` akzeptiert jetzt eine Zählschleife, deren Variable ein
+benanntes Produkt skaliert (`it * stride`, wobei `stride = A * B`). Beide Bedingungen
+zusammen unterscheiden sie von einer gewöhnlichen inneren Schleife wie
+`for (uint w = 0; w < BODYSIM_WORDS; ++w)`, die nichts skaliert.
+
+Die Widening hat **genau** die zwei bewegt (62 gedeckt statt 60) und sonst nichts
+fälschlich freigegeben — das war die Bedingung, unter der sie zulässig war.
+
+Damit ist die Zählung meiner Prüfer-Präzision vollständig: 43 → 31 → 39 → 38 → 12 → 2,
+und **drei** der Korrekturen waren Marker-Fehler auf meiner Seite, nicht Portierungsfehler.
+
+### Die zwei echten: `bodyUpdate.slang`
+
+| Kernel | CUDA | Slang (vorher) | Engine-Start | Decke |
+|---|---|---|---|---|
+| `updateBodiesLaunchDirectAPI` | `for (i = idx/16; i < n; i += (blockDim.x*gridDim.x)/16)` | `if (i >= count) return;` | Grid 64 × Block 256 | 16384 |
+| `updateBodyExternalVelocitiesLaunch` | `for (i = idx; i < n; i += blockDim.x*gridDim.x)` | `if (i >= count) return;` | Grid 64 × Block 256 | 16384 |
+
+Beide waren buchstäblich Einpass-Portierungen gegen eine CUDA, die schleift. Was jenseits
+der Decke passiert, ist bei beiden **still**: die Geschwindigkeits-DMA lässt ein
+`setLinearVelocity` oder `addForce` des Nutzers einfach fallen — der Körper behält seine
+alte Geschwindigkeit, ohne Fehler irgendwo. Und die Direct-API-DMA lässt einen neuen
+Körper beim ersten Transfer auf einem **uninitialisierten** `PxgBodySim` sitzen.
+
+Genau weil keiner der beiden laut scheitert, hatte keiner eine beobachtende Szene, und
+genau deshalb haben beide bis ans Ende der Liste überlebt. Beide sind repariert und
+mussten `PXG_HLSL_ENTRIES` verlassen (der Stride braucht `WorkgroupCount()`).
+
+### Die Fixture war wieder blind — zum dritten Mal aus demselben Grund
+
+Die beiden Fixtures dispatchten `(count + 255) / 256` — **ihren eigenen Teiler, an die
+Daten angepasst**, so dass immer ein Thread pro Datensatz existierte. Unter dieser
+Geometrie ist die Grid-Stride-Schleife nie nötig und ihr Fehlen unsichtbar. Beide laufen
+jetzt auf dem Gitter der Engine (64) und in zwei Größen, die zweite jenseits eines vollen
+Durchgangs. Mutation (Schleife wieder auf einen Durchgang): **beide Tests fallen**,
+95087 Wort-Abweichungen allein bei `directAPI`. Vorher: grün.
+
+Das ist dieselbe Lektion wie P9.61 und P9.52b-6, zum dritten Mal: *eine Fixture beweist,
+dass ein Shader rechnet, was die CUDA rechnet — nicht, dass er die ganze Arbeit sieht.*
+Sie beweist es nur dann, wenn sie die Arithmetik der ENGINE benutzt statt einer bequemen.
+
+### Der offene Widerspruch aus P9.60 ist aufgelöst — und hat einen echten Fund freigelegt
+
+`writeoutAccumulatedForcePerObject`: Prüfer sagte „deckt ab", P9.60s Lesung sagte
+„echte Auslassung". **Der Prüfer hatte recht** — die Portierung schleift, mit benanntem
+Stride. P9.60s Lesung war falsch und ist hiermit zurückgezogen.
+
+Aber die Untersuchung hat etwas anderes gefunden. `thresholdStream.slang` hatte **eine**
+Stride-Konstante `NUM_BLOCKS = 32` — und die Engine startet die Kernel dieser Datei mit
+**zwei verschiedenen Gittern**:
+
+| Gitter | Einträge |
+|---|---|
+| 32 | `computeAccumulateThresholdStream`, `outputAccumulateThresholdStream`, `compute/outputExceededForceThresholdElementIndice` |
+| 64 | `initialRanksAndBodyIndexA/B`, `reorganizeThresholdElements`, `writeoutAccumulatedForcePerObject` |
+
+Die vier Grid-64-Einträge strideten also mit 256·32, während die Engine ihnen 256·64
+Threads gab: **jeder Index ab dem Stride wurde von ZWEI Threads besucht.** Das war
+ausgabegleich und kein Deckungsloch — alle vier Rümpfe sind reine Gather, deren Ziel ein
+anderer Puffer ist als ihre Quelle, der Doppelbesuch schreibt dieselben Bytes noch
+einmal. Deshalb ist nie etwas ausgefallen.
+
+Trotzdem korrigiert (`NUM_BLOCKS_WIDE = 64`): die Gleichheit hängt vollständig daran,
+dass die Rümpfe idempotent bleiben, und **nichts in der Datei sagte das**. Wer dort
+später eine Akkumulation einbaut, verdoppelt sie still.
+
+Das ist ausdrücklich **nicht** der Fall, den der Grid-Stride-Prüfer entscheiden kann: er
+findet fehlende Schleifen, nicht falsche Konstanten. Dafür braucht es die Startstelle,
+und die ist C++, das der Prüfer nicht liest. Der Prüfer sagt das in seinem eigenen Kopf.
+
+Auch hier war die Fixture blind — sie dispatchte 32 für **alle acht** Einträge bei
+N ≤ 2001, also unter einem einzigen Durchgang: die Schleifen iterierten nie. Neu:
+`thresholdStream_engineGridCoverage`, N = 18161 auf dem Gitter der Engine. Was der Test
+beweist, genau: **dass kein Index übersprungen wird**. Er beweist NICHT, dass der Stride
+der Threadzahl entspricht — ein zu KLEINER Stride ist hier gutartig. Was er fängt, ist
+der Fall, der es nicht ist. Mutation auf `NUM_BLOCKS_WIDE = 128`:
+
+```
+initialRanksAndBodyIndexB N=18161: 1777 mismatches, first at 16384 (one pass = 16384)
+reorganize N=18161: 8192 mismatches, first at 2048 (one pass = 2048 elements)
+```
+
+Die Fehlerzahlen sind exakt die vorhergesagten Löcher. Test 1 (N = 733) blieb dabei grün
+— der Beweis, dass die alte Fixture das nie hätte sehen können.
+
+### Stand
+
+Ratsche **6 → 2**. Die zwei verbliebenen sind die beiden Cloth-Vertex-Contact-Gens; sie
+sind **8× zu kurz bei JEDEM Aufruf** (Host-Block 256 × 512 Blöcke gegen
+`[numthreads(32,1,1)]`), aber beide Manifest-Zeilen sind mit „emits no contacts upstream"
+annotiert und von `check_disabled_kernels.py` bewacht. Eine Reparatur wäre heute
+unbeobachtbar und untestbar. Die Ratschendatei trägt jetzt die Notiz, dass die Schleife
+das Erste ist, was dort hingehört, sobald der Erzeuger wiederbelebt wird.
+
+Suite **849/849 in beiden Speichermodi** (851 − 2 zurückgezogene `gpuslang.hlsl.bodyUpdate:*`),
+Szenen 41/41, Manifest 403/501. Upstream-Kandidaten weiterhin 53 — dokumentiert, nicht gemeldet.
 
 ## P9.62 — die Startstelle zuerst lesen: eine Messtabelle für die sieben, und ein Kernel repariert
 

@@ -50,9 +50,43 @@
 # fixture could not see it because it sized its own grid to the shader (ceil(n/256))
 # and used meshes of 20-50 vertices, below one group either way.  Given the engine
 # divisor and meshes above 256, it failed with 1820 mismatches before the fix.
+#
+# ---------------------------------------------------------------------------
+# P9.63 -- A THIRD FALSE-POSITIVE SHAPE, AND THE LAST TWO REAL ONES
+# ---------------------------------------------------------------------------
+# Reading the four unmeasured entries at their LAUNCH SITES split them cleanly.
+#
+#   ps_primitivesCollisionLaunch          NOT omissions.  psContactGenBda.slang
+#   ps_primitivesDiffuseCollisionLaunch   hoists the trip count and steps by one:
+#       const uint stride = PS_BLOCK * PS_GRID;
+#       const uint nbIterations = (totalComparison + stride - 1u) / stride;
+#       for (uint it = 0u; it < nbIterations; ++it)
+#           const uint workIndex = it * stride + gid.x * PS_BLOCK + tid;
+#   That is a grid-stride loop with the multiply moved out of the increment and
+#   into the index -- every work item visited exactly once -- but `++it` matches
+#   neither of the checker's two markers.  check_grid_stride.py now accepts a
+#   counted loop whose variable scales a named product; both entries are gone.
+#
+#   updateBodiesLaunchDirectAPI           REAL, and now fixed.  Both were literally
+#   updateBodyExternalVelocitiesLaunch    `const uint i = dispatchThreadId.x;
+#                                         if (i >= gParams.count) return;`
+#   against a CUDA that loops.  Engine launch for both: grid 64, block 256, so the
+#   ceiling was 16384 records.  Past it the external-velocity kernel DROPPED user
+#   setLinearVelocity/addForce calls, and the direct-API kernel left new bodies
+#   holding an uninitialised PxgBodySim on their first transfer.  Neither fails
+#   loudly -- which is why neither had an observing scene and both survived to the
+#   end of the list.  Fixed in bodyUpdate.slang; both left PXG_HLSL_ENTRIES because
+#   the stride needs WorkgroupCount().
+#
+# ---------------------------------------------------------------------------
+# The two below are the whole remaining list.  Both are 8x SHORT ON EVERY CALL,
+# not merely capped: the engine launches them with blockDim 256 and numBlocks 512
+# while the shader declares [numthreads(32,1,1)], and the bridge drops blockDim, so
+# they reach an eighth of the cloth vertices whatever the scene size.  They are
+# NOT fixed here because both manifest rows are annotated "emits no contacts
+# upstream" and gated by check_disabled_kernels.py -- the contact gen they feed is
+# itself dead, so a fix would be unobservable and untestable today.  When that
+# upstream is revived the loop is the FIRST thing to add, and this note is the
+# record that it is missing.
 cloth_heightfieldVertexContactGenLaunch
 cloth_meshVertexContactGenLaunch
-ps_primitivesCollisionLaunch
-ps_primitivesDiffuseCollisionLaunch
-updateBodiesLaunchDirectAPI
-updateBodyExternalVelocitiesLaunch

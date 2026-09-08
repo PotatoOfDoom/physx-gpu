@@ -211,59 +211,70 @@ void updateBodiesLaunch(uint3 dispatchThreadId : SV_DispatchThreadID)
 // mirrors updateBodiesLaunchDirectAPI(): first transfer copies everything;
 // subsequent transfers keep the GPU velocities/accelerations and re-derive
 // body2World when the CPU changed body2Actor (CMassLocalPose updates)
+//
+// P9.63 -- GRID-STRIDE.  The CUDA loops
+// `for (i = idx/16; i < totalNbBodies; i += (blockDim.x * gridDim.x) / 16)`;
+// this port maps ONE thread per body rather than sixteen (there is no shuffle to
+// keep a group aligned for -- the broadcast became a re-read), so its stride is
+// the plain thread count `BLOCK_SIZE * WorkgroupCount().x`, not that over 16.
+// Without the loop the port stopped at 64 x 256 = 16384 bodies and every body
+// beyond that kept whatever the pool already held: on the first transfer that is
+// an uninitialised PxgBodySim, and afterwards a body whose body2World silently
+// stops following a CPU-side setCMassLocalPose.  The engine launch is
+// UPDATE_BODIES_AND_SHAPES (grid 64, block 256), and nbNewBodies is unbounded --
+// it is however many bodies were added since the last step.
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
 void updateBodiesLaunchDirectAPI(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
-    const uint i = dispatchThreadId.x;
-    if (i >= gParams.count)
-        return;
-
-    const uint srcBase = i * BODYSIM_WORDS;
-    const uint bodyIndex = gNewData[srcBase + W_BODYSIM_INDEX];
-    const uint dstBase = bodyIndex * BODYSIM_WORDS;
-
-    const uint internalFlags = gNewData[srcBase + W_INTERNAL_FLAGS];
-    const bool firstTransfer = (internalFlags & PXG_BODY_FIRST_BODY_COPY_GPU) != 0;
-    const bool copyVel = (internalFlags & PXG_BODY_VELOCITY_COPY_GPU) != 0;
-
-    if (firstTransfer)
+    for (uint i = dispatchThreadId.x; i < gParams.count; i += BLOCK_SIZE * WorkgroupCount().x)
     {
-        // on the first DMA, we copy the transform data that the user setup on CPU
-        for (uint w = 0; w < BODYSIM_WORDS; ++w)
-            gBodySimPool[dstBase + w] = gNewData[srcBase + w];
-        return;
-    }
+        const uint srcBase = i * BODYSIM_WORDS;
+        const uint bodyIndex = gNewData[srcBase + W_BODYSIM_INDEX];
+        const uint dstBase = bodyIndex * BODYSIM_WORDS;
 
-    // store the old body2world and body2actor
-    const PxgAlignedTransform body2WorldOld = loadAlignedTransform(gBodySimPool, dstBase + W_BODY2WORLD);
-    const PxgAlignedTransform oldBody2Actor = loadAlignedTransform(gBodySimPool, dstBase + W_BODY2ACTOR);
+        const uint internalFlags = gNewData[srcBase + W_INTERNAL_FLAGS];
+        const bool firstTransfer = (internalFlags & PXG_BODY_FIRST_BODY_COPY_GPU) != 0;
+        const bool copyVel = (internalFlags & PXG_BODY_VELOCITY_COPY_GPU) != 0;
 
-    // copy everything below the external accelerations; keep linear and
-    // angular velocity xyz intact (copy only inverseMass / maxPenBias .w)
-    // unless the velocity-copy flag is raised
-    for (uint u4 = 0; u4 < SIZE_WITHOUT_ACCEL_UINT4; ++u4)
-    {
-        const uint w0 = u4 * 4;
-        if (u4 < MAX_LIN_VEL_UINT4 && !copyVel)
+        if (firstTransfer)
         {
-            gBodySimPool[dstBase + w0 + 3] = gNewData[srcBase + w0 + 3];
+            // on the first DMA, we copy the transform data that the user setup on CPU
+            for (uint w = 0; w < BODYSIM_WORDS; ++w)
+                gBodySimPool[dstBase + w] = gNewData[srcBase + w];
+            continue;   // CUDA: `continue` inside the grid-stride loop, not `return`
         }
-        else
+
+        // store the old body2world and body2actor
+        const PxgAlignedTransform body2WorldOld = loadAlignedTransform(gBodySimPool, dstBase + W_BODY2WORLD);
+        const PxgAlignedTransform oldBody2Actor = loadAlignedTransform(gBodySimPool, dstBase + W_BODY2ACTOR);
+
+        // copy everything below the external accelerations; keep linear and
+        // angular velocity xyz intact (copy only inverseMass / maxPenBias .w)
+        // unless the velocity-copy flag is raised
+        for (uint u4 = 0; u4 < SIZE_WITHOUT_ACCEL_UINT4; ++u4)
         {
-            for (uint c = 0; c < 4; ++c)
-                gBodySimPool[dstBase + w0 + c] = gNewData[srcBase + w0 + c];
+            const uint w0 = u4 * 4;
+            if (u4 < MAX_LIN_VEL_UINT4 && !copyVel)
+            {
+                gBodySimPool[dstBase + w0 + 3] = gNewData[srcBase + w0 + 3];
+            }
+            else
+            {
+                for (uint c = 0; c < 4; ++c)
+                    gBodySimPool[dstBase + w0 + c] = gNewData[srcBase + w0 + c];
+            }
         }
-    }
 
-    // recalculate body2world with new body2actor
-    const PxgAlignedTransform newBody2Actor = loadAlignedTransform(gBodySimPool, dstBase + W_BODY2ACTOR);
+        // recalculate body2world with new body2actor
+        const PxgAlignedTransform newBody2Actor = loadAlignedTransform(gBodySimPool, dstBase + W_BODY2ACTOR);
 
-    if (alignedTransformNotEqual(oldBody2Actor, newBody2Actor))
-    {
-        const PxgAlignedTransform actor2World = alignedTransformMul(body2WorldOld, alignedTransformInverse(oldBody2Actor));
-        const PxgAlignedTransform body2World = alignedTransformMul(actor2World, newBody2Actor);
-        storeAlignedTransform(gBodySimPool, dstBase + W_BODY2WORLD, body2World);
+        if (alignedTransformNotEqual(oldBody2Actor, newBody2Actor))
+        {
+            const PxgAlignedTransform actor2World = alignedTransformMul(body2WorldOld, alignedTransformInverse(oldBody2Actor));
+            const PxgAlignedTransform body2World = alignedTransformMul(actor2World, newBody2Actor);
+            storeAlignedTransform(gBodySimPool, dstBase + W_BODY2WORLD, body2World);
+        }
     }
 }
 
@@ -305,29 +316,36 @@ void updateShapesLaunch(uint3 dispatchThreadId : SV_DispatchThreadID)
 // mirrors updateBodyExternalVelocitiesLaunch(): applies user velocity /
 // acceleration updates (PxgBodySimVelocityUpdate, 4 float4 per record) to
 // the body-sim pool, preserving the pooled inverse mass in linVel.w
+//
+// P9.63 -- GRID-STRIDE.  The CUDA is `for (i = idx; i < gNbBodies; i += blockDim.x
+// * gridDim.x)`, one thread per record, and this port maps threads the same way,
+// so the stride is BLOCK_SIZE * WorkgroupCount().x with no divisor.  The engine
+// launch is UPDATE_BODY_EXTERNAL_VELOCITIES (grid 64, block 256): without the loop
+// the port applied the update to the first 16384 records and DROPPED the rest, so
+// past that count a setLinearVelocity / addForce from the user simply did not
+// arrive -- the body kept its previous velocity with no error anywhere.
 [shader("compute")]
 [numthreads(BLOCK_SIZE, 1, 1)]
 void updateBodyExternalVelocitiesLaunch(uint3 dispatchThreadId : SV_DispatchThreadID)
 {
     const uint UPDATE_WORDS = 16; // sizeof(PxgBodySimVelocityUpdate) = 64
 
-    const uint i = dispatchThreadId.x;
-    if (i >= gParams.count)
-        return;
+    for (uint i = dispatchThreadId.x; i < gParams.count; i += BLOCK_SIZE * WorkgroupCount().x)
+    {
+        const uint srcBase = i * UPDATE_WORDS;
 
-    const uint srcBase = i * UPDATE_WORDS;
+        float4 linearVel = loadFloat4(gNewData, srcBase + 0);
+        const uint bodyIndex = asuint(linearVel.w);
+        const uint dstBase = bodyIndex * BODYSIM_WORDS;
 
-    float4 linearVel = loadFloat4(gNewData, srcBase + 0);
-    const uint bodyIndex = asuint(linearVel.w);
-    const uint dstBase = bodyIndex * BODYSIM_WORDS;
+        const float originalInvMass = asfloat(gBodySimPool[dstBase + W_LINVEL + 3]);
+        linearVel.w = originalInvMass;
 
-    const float originalInvMass = asfloat(gBodySimPool[dstBase + W_LINVEL + 3]);
-    linearVel.w = originalInvMass;
-
-    storeFloat4(gBodySimPool, dstBase + W_LINVEL, linearVel);
-    storeFloat4(gBodySimPool, dstBase + W_ANGVEL, loadFloat4(gNewData, srcBase + 4));
-    storeFloat4(gBodySimPool, dstBase + W_EXTERNAL_ACCEL, loadFloat4(gNewData, srcBase + 8));
-    storeFloat4(gBodySimPool, dstBase + W_EXTERNAL_ACCEL + 4, loadFloat4(gNewData, srcBase + 12));
+        storeFloat4(gBodySimPool, dstBase + W_LINVEL, linearVel);
+        storeFloat4(gBodySimPool, dstBase + W_ANGVEL, loadFloat4(gNewData, srcBase + 4));
+        storeFloat4(gBodySimPool, dstBase + W_EXTERNAL_ACCEL, loadFloat4(gNewData, srcBase + 8));
+        storeFloat4(gBodySimPool, dstBase + W_EXTERNAL_ACCEL + 4, loadFloat4(gNewData, srcBase + 12));
+    }
 }
 
 // ---------------------------------------------------------------------------

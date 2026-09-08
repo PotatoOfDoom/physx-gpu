@@ -184,8 +184,8 @@ STRIDE_EXPR = re.compile(r"gridDim\s*\.\s*x\s*\*\s*blockDim\s*\.\s*[xyz]"
                          r"|blockDim\s*\.\s*[xyz]\s*\*\s*gridDim\s*\.\s*x")
 
 
-def for_increments(body):
-    """Yield the third clause of every `for` header in `body`."""
+def for_headers(body):
+    """Yield the three semicolon-separated clauses of every `for` header in `body`."""
     for m in re.finditer(r"\bfor\s*\(", body):
         depth = 0
         for j in range(m.end() - 1, len(body)):
@@ -210,8 +210,14 @@ def for_increments(body):
                             cur.append(ch)
                     parts.append("".join(cur))
                     if len(parts) == 3:
-                        yield parts[2]
+                        yield parts
                     break
+
+
+def for_increments(body):
+    """Yield the third clause of every `for` header in `body`."""
+    for parts in for_headers(body):
+        yield parts[2]
 
 
 # The stride is not always written inline.  utility.cu's skinning kernels hoist it:
@@ -264,8 +270,44 @@ def cuda_has_stride(body):
 # WRONG constant passes.  Deciding that needs the launch site, and the launch site is
 # in C++ the checker does not parse -- so the honest statement is that this finds
 # MISSING loops, not wrong ones, and the file says so rather than implying more.
+#
+# A THIRD SHAPE, AND A THIRD CORRECTION (P9.63)
+# ---------------------------------------------------------------------------
+# Both widenings above still read the increment clause as the place a stride is
+# spelled.  psContactGenBda.slang does not spell it there at all.  It hoists the
+# trip count and steps the loop by ONE:
+#
+#     const uint stride = PS_BLOCK * PS_GRID;
+#     const uint nbIterations = (totalComparison + stride - 1u) / stride;
+#     for (uint it = 0u; it < nbIterations; ++it)
+#     {
+#         const uint workIndex = it * stride + gid.x * PS_BLOCK + tid;
+#
+# That covers every work item exactly once -- it is a grid-stride loop with the
+# multiply moved from the increment into the index -- but `++it` matches neither
+# SLANG_STRIDE nor NAMED_INC, so both `ps_primitivesCollisionLaunch` and
+# `ps_primitivesDiffuseCollisionLaunch` sat on the ratchet as omissions they never
+# were.  A counted loop is accepted when its variable SCALES A NAMED STRIDE that is
+# itself a product: `it * stride` where `stride = A * B`.  The two conditions
+# together are what separate this from an ordinary bounded inner loop such as
+# `for (uint w = 0; w < BODYSIM_WORDS; ++w)`, which scales nothing.
 SLANG_STRIDE = re.compile(r"WorkgroupCount\s*\(")
 NAMED_INC = re.compile(r"\+=\s*([A-Za-z_]\w*)")
+COUNTED_INC = re.compile(r"^\s*(?:\+\+\s*(\w+)|(\w+)\s*\+\+)\s*$")
+
+
+def counted_covers(body):
+    """True if `body` has a step-by-one `for` whose variable scales a named product."""
+    for parts in for_headers(body):
+        m = COUNTED_INC.match(parts[2])
+        if m is None:
+            continue
+        var = m.group(1) or m.group(2)
+        for sm in re.finditer(r"\b" + re.escape(var) + r"\s*\*\s*([A-Za-z_]\w*)", body):
+            stride = sm.group(1)
+            if re.search(r"\b" + re.escape(stride) + r"\s*=\s*[^;]*\*[^;]*;", body):
+                return True
+    return False
 
 
 def slang_covers(text, body):
@@ -274,6 +316,8 @@ def slang_covers(text, body):
     for inc in for_increments(body):
         if SLANG_STRIDE.search(inc) or NAMED_INC.search(inc):
             return True
+    if counted_covers(body):
+        return True
     # one level of same-file helper calls
     for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", body):
         name = m.group(1)
@@ -285,7 +329,7 @@ def slang_covers(text, body):
         hb = brace_body(text, fm.end() - 1)
         if hb is None:
             continue
-        if SLANG_STRIDE.search(hb) or any(
+        if SLANG_STRIDE.search(hb) or counted_covers(hb) or any(
                 SLANG_STRIDE.search(i) or NAMED_INC.search(i) for i in for_increments(hb)):
             return True
     return False
