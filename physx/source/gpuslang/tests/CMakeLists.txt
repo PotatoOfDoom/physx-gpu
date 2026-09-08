@@ -2368,7 +2368,11 @@ set(PXG_HLSL_ENTRIES
     "broadphaseAggregatePairsRemove:removeAggPairsStage1"
     "broadphaseAggregatePairsRemove:removeAggPairsStage2"
     "broadphaseAggregateBoxPruning:aggregateBipartiteBoxPruning"
-    "broadphaseAggPairCollision:doAggPairCollisions"
+    # P9.62 removed "broadphaseAggPairCollision:doAggPairCollisions": it now carries
+    # the CUDA's covering loop, whose stride is WorkgroupCount().x, and that has no
+    # cs_6_0 lowering.  Same trade as the skinning entries in P9.61 -- a real
+    # coverage defect is not worth keeping for a compile target this port ships
+    # nothing against.
     "broadphaseAggSelfCollision:doSelfCollision"
     "broadphaseAggSortProjections:sortAndUpdateAggregateProjections"
     "solverPGS:computeAverageSolverBodyVelocity" "solverPGS:propagateSolverBodyVelocity"

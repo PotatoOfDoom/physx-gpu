@@ -52,7 +52,6 @@
 # divisor and meshes above 256, it failed with 1820 mismatches before the fix.
 cloth_heightfieldVertexContactGenLaunch
 cloth_meshVertexContactGenLaunch
-doAggPairCollisions
 ps_primitivesCollisionLaunch
 ps_primitivesDiffuseCollisionLaunch
 updateBodiesLaunchDirectAPI

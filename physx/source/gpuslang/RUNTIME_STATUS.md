@@ -7,12 +7,12 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **852/852** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **851/851** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.61 retired five `gpuslang.hlsl.*` twins: the skinning entries now need
 `WorkgroupCount()`, which has no cs_6_0 lowering.
 P9.59 added `gpuslang.gridStride`, the ELEVENTH static checker: a mapped kernel
 whose CUDA covers its work with a grid-stride loop must have that loop in its
-Slang port.  7 known omissions carried as a RATCHET that may shrink, never grow, over
+Slang port.  6 known omissions carried as a RATCHET that may shrink, never grow, over
 403/403 mapped kernels.  P9.60 closed a 52-kernel blind spot in the checker;
 P9.60b corrected its Slang-side marker, which had made 26 of a claimed 38
 "omissions" into noise.
@@ -1849,6 +1849,51 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.62 — die Startstelle zuerst lesen: eine Messtabelle für die sieben, und ein Kernel repariert
+
+P9.61 hat die Methode geliefert: **erst die Startstelle**, und dort die `blockDim` des
+Hosts gegen die `numthreads` des Shaders halten. Der Skinning-Defekt war kein
+Deckenproblem, sondern ein Faktor-4-Ausfall aus genau dieser Diskrepanz. Also für alle
+sieben verbliebenen zuerst gemessen, nicht repariert.
+
+| Kernel | Host-Block | Shader | Verhältnis |
+|---|---|---|---|
+| `updateBodyExternalVelocitiesLaunch` | 256 | 256 | **passt** — reine Decke bei 64·256 = 16384 |
+| `doAggPairCollisions` | (32, 2) = 2 Warps | 1 Warp | **2×** zu wenig, plus feste Decke 8192 |
+| `updateBodiesLaunchDirectAPI` | noch nicht gemessen | 256 | — |
+| die zwei Cloth-, die zwei Partikel-Kontaktgeneratoren | noch nicht gemessen | 32 bzw. 256 | — |
+
+Das ist der Punkt der Tabelle: **„fehlende Grid-Stride-Schleife" ist nicht eine
+Diagnose, sondern zwei.** Bei passender Blockgröße ist es eine Decke, die eine große
+Szene erreichen muss. Bei einer Diskrepanz ist es ein Ausfall bei *jedem* Aufruf, und
+der Faktor steht in der Startstelle. Wer nur den Prüferbericht liest, sieht den
+Unterschied nicht.
+
+### `doAggPairCollisions`, repariert
+
+`aggregate.cu:945` läuft `for (i = globalWarpIndex; i < nbAggregatePairs;
+i += blockDim.y * gridDim.x)`. Der CUDA-Block ist zwei Warps, das Gitter **fest 8192**
+(PxgAABBManager.cpp:734 — der abgeleitete Ausdruck darüber ist auskommentiert), ein
+Durchgang deckt also 16384 Paare. Der Shader ist eine Ein-Warp-Gruppe mit
+`const uint i = gid.x;` und **ohne Schleife**: 8192 pro Durchgang, danach nichts. Und
+`nbAggregatePairs` ist `PxMin(*aggDesc->aggPairCount, max_agg_pairs)`, ein
+**Device-Wert** — der Host kann das Gitter gar nicht darauf dimensioniert haben.
+
+Die Umwandlung ist sicher, weil jeder Wächter im Rumpf (`isDead`, `removed`, `isNew`)
+aus `i` und aus Puffer-Lesungen stammt, die jede Lane identisch ausführt — alle
+gruppen-uniform, also bleiben die zwei Barrieren in uniformem Kontrollfluss, und das
+frühe `return` wird zu `continue`.
+
+**Ohne beobachtenden Test.** Ihn zu erreichen bräuchte über 8192 lebende
+Aggregat-Paare in einem Frame; nichts, was diese Vorrichtung baut, kommt in die Nähe.
+Das ist eine Treue-Korrektur auf den Geschwister-Messungen aus P9.58 und P9.61, und
+das steht so da, statt Evidenz zu suggerieren.
+
+Preis wie in P9.61: `WorkgroupCount()` hat keine cs_6_0-Entsprechung, der HLSL-Zwilling
+entfällt. Testzahl 852 → **851**.
+
+Ratsche **7 → 6**.
 
 ## P9.61 — die fünf Skinning-Kernel: kein Deckenproblem, sondern drei Viertel der Arbeit, immer
 

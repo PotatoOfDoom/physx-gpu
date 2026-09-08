@@ -354,11 +354,33 @@ SideRef makeSide(uint lane, uint actorHandle, uint slot, uint frame)
 [numthreads(32, 1, 1)]
 void doAggPairCollisions(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 {
-    const uint i = gid.x;
     const uint lane = gtid.x;
-    if (i >= gParams.nbAggregatePairs)
-        return;
 
+    // aggregate.cu:945 -- `for (i = globalWarpIndex; i < nbAggregatePairs;
+    // i += blockDim.y * gridDim.x)`.  Restored in P9.62.
+    //
+    // The CUDA block is (32, BP_AGGREGATE_SORT/32, 1) = two warps, and its grid is a
+    // FIXED 8192 blocks (PxgAABBManager.cpp:734 -- the derived expression above it is
+    // commented out), so one CUDA pass covers 16384 pairs and the loop covers the
+    // rest.  This group is ONE warp, so a pass here covered 8192 and nothing beyond;
+    // `nbAggregatePairs` is `PxMin(*aggDesc->aggPairCount, max_agg_pairs)`, a DEVICE
+    // value, so the host cannot have sized the grid to it.
+    //
+    // The stride is `WorkgroupCount().x` -- the groups actually dispatched -- for the
+    // reason P9.61 sets out: that is this shader's own coverage per pass, whatever the
+    // host meant by its blockDim, which the bridge drops.
+    //
+    // NO OBSERVING TEST.  Reaching it needs more than 8192 live aggregate pairs in one
+    // frame; nothing this harness builds comes close, and no fixture here dispatches
+    // 8192 groups.  This is a faithfulness fix resting on the sibling measurements
+    // (P9.58, P9.61), and saying so is worth more than implying evidence.
+    //
+    // The `if (removed)` early-out becomes `continue`.  Every guard in this body --
+    // `isDead`, `removed`, `isNew` -- is derived from `i` and from buffer reads every
+    // lane performs identically, so all are GROUP-UNIFORM and the two barriers below
+    // stay in uniform control flow across iterations.
+    for (uint i = gid.x; i < gParams.nbAggregatePairs; i += WorkgroupCount().x)
+    {
     const uint isDead = gAggPairs[i * AP_STRIDE + AP_ISDEAD];
     const uint isNew = gAggPairs[i * AP_STRIDE + AP_ISNEW];
     const uint h0 = gAggPairs[i * AP_STRIDE + AP_H0];
@@ -372,7 +394,7 @@ void doAggPairCollisions(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
         if (removed)
         {
             if (lane == 0u) gAggBitmap[i] = 1u;
-            return;
+            continue;
         }
 
         shouldRemove = aabbIntersects(h0, h1, true) ? 0u : 1u;
@@ -396,4 +418,5 @@ void doAggPairCollisions(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
     }
 
     if (lane == 0u) gAggBitmap[i] = shouldRemove;
+    }
 }
