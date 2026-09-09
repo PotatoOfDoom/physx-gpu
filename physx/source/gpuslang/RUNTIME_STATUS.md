@@ -7,7 +7,7 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **851/851** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **852/852** green in both modes (`ctest -N` in `build-gpuslang`).
 P9.65 added `gpuslang.unmappedReachability`, the THIRTEENTH static checker, and with
 it the correction that matters most for planning: of the 98 unmapped kernels only
 **29 are reachable** from the simulation pipeline.  58 are app-facing features that
@@ -1864,6 +1864,75 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.66c — die eine Sache, die weder die Szenen noch die Phase-1-Fixture prüfen können
+
+P9.66b hat den Kernel gemappt und die Szenen grün gemacht. Der Commit hat aber
+ausdrücklich festgehalten, was damit **nicht** bewiesen war — und genau das schließt
+diese Tranche.
+
+### Die Lücke, präzise
+
+Die Index-Asymmetrie ist der wahrscheinlichste Versandfehler dieses Kernels:
+
+```
+convexMesh.cu:392  (Kugel)  ... + remapCpuTriangleIdx;   Fünf-Argument-readTriangleMesh
+convexMesh.cu:613  (Kapsel) ... + triangleIdx;           Vier-Argument-Überladung
+```
+
+Drei Dinge treffen hier zusammen:
+
+1. **Der Fehler ist still.** `getTriangleIndex()` maskiert auf 27 Bit; beide Kandidaten
+   sind kleine nicht-negative Zahlen. Nichts faultet, keine Bereichsprüfung greift,
+   Kontaktpunkte, Normalen und Separationen sind identisch. Nur die gemeldete
+   Flächenidentität wäre falsch.
+2. **Die Szene kann ihn beweisbar nicht sehen.** `addMeshFloor` kocht ein
+   Zwei-Dreieck-Quad; dessen Face-Remap ist die **Identität**, also
+   `remapCpuTriangleIdx == triangleIdx`, und beide Schreibweisen fallen zusammen.
+   `spheremesh` und `capsulemesh` gehen so oder so durch.
+3. **Die Phase-1-Fixture prüft die Arithmetik, aber nicht diese Datei.**
+   `testNpCvxMeshNp.cpp` erwartet bei :573 `+ remapCpu` und bei :638 `+ triangleIdx` —
+   für `npCvxMeshNp.slang`. `sphereTriNpBda.slang` ist eine **zweite** Transkription
+   derselben CUDA, und es ist die, die ausgeliefert wird.
+
+### Die Testform
+
+Ein Netz, zwei Primitive, **dasselbe Feld, zwei verschiedene erwartete Werte**. Das
+Remap ist `{700}` — teilt sich also keinen Wert mit irgendeinem Dreiecksindex, sodass
+die beiden Erwartungen nicht verwechselbar sind. Ein Port, der den Ausdruck des einen
+Arms für beide benutzt, fällt bei genau einer der beiden Zeilen.
+
+Dazu zwei Nicht-Trivialitäts-Wächter: beide Arme **müssen** einen Kontakt erzeugt
+haben, sonst wäre das Indexfeld für beide der nackte Dreiecksindex und der Vergleich
+wertlos.
+
+### Der Mutations-Sweep, beide Richtungen
+
+```
+Kugelarm auf ROH mutiert (wie es das Heightfield-Modul tut):
+  SPHERE arm must pack the REMAPPED cpu triangle index (convexMesh.cu:392):
+  expected 700, got 0 (niIndex=0x08000000)
+
+Kapselarm auf REMAP mutiert:
+  CAPSULE arm must pack the RAW gpu triangle index (convexMesh.cu:613):
+  expected 0, got 700 (niIndex=0x100002bc)
+```
+
+Beide Richtungen gefangen. `niIndex=0x08000000` ist `1 << 27` — die Kugel hat also
+genau einen echten Flächenkontakt erzeugt, der Wächter greift nicht ins Leere.
+
+### Warum das nicht überflüssig war
+
+`sphereHfNpBda` — der Heightfield-Zwilling aus P9.52b-6 — hat **gar keine** eigene
+Fixture; seine Korrektheit hängt an den Phase-1-Kernfixtures plus den Szenen. Für ihn
+reicht das, weil ein Heightfield keine Remap-Tabelle hat und die Frage dort gar nicht
+existiert. Hier existiert sie, und das Modul, nach dem man zuerst greift, beantwortet
+sie konstruktionsbedingt falsch.
+
+### Stand
+
+Suite **852/852** in beiden Speichermodi, Szenen 43/43, Manifest 404/501, alle
+dreizehn Prüfer grün. Erreichbar-nicht-gemappt: 28.
 
 ## P9.66b — `sphereTrimeshNarrowphase` gemappt: vom SIGSEGV zur richtigen Ruhelage
 
