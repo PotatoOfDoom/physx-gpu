@@ -7,7 +7,12 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **850/850** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **851/851** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.65 added `gpuslang.unmappedReachability`, the THIRTEENTH static checker, and with
+it the correction that matters most for planning: of the 98 unmapped kernels only
+**29 are reachable** from the simulation pipeline.  58 are app-facing features that
+this build cannot construct at all (`PxGpuCreatePhysicsGpu()` returns NULL and
+`physxgpu/src` is never compiled), and 11 are launched by nothing even upstream.
 P9.64 added `gpuslang.fixtureGrid`, the TWELFTH static checker and the THIRD written
 because its defect had already happened: a fixture that dispatches its own group
 count instead of the engine's cannot see a missing grid-stride loop, nor a wrong
@@ -23,6 +28,9 @@ P9.60b corrected its Slang-side marker, which had made 26 of a claimed 38
 "omissions" into noise; P9.63 taught it the counted-loop form (`it * stride` with
 `++it`), which had made the last two `ps_*` entries into noise as well.
 Manifest: **403/501** kernels mapped (P9.52b-6 filled SPHERE_HEIGHTFIELD_CORE).
+Of the 98 unmapped, **29 are engine-reachable** (the real remaining work, ratcheted in
+`tools/engine_reachable_unmapped.txt`), 58 are unreachable app-facing features and 11
+are orphans — so "403/501" understates coverage of what this build can actually run.
 Scenes: **40/40** (P9.58 added `hfbigbox`, which fell through the terrain before
 the convex cores got their grid-stride loop back).
 P9.52b-4 added `gpuslang.capsuleHfCore` and the 53rd upstream candidate: the
@@ -1855,6 +1863,107 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.65 — die Liveness-Frage ZUERST gestellt, und die Tranche daran gestorben: „98 übrig" waren nie 98
+
+Der Plan war, `isosurfaceExtraction.cu` zu portieren — 34 nicht gemappte Kernel, der
+größte verbliebene Einzelblock, und dazu ungewöhnlich gut geformt: 17
+`template<typename T> __device__`-Rümpfe mit je zwei dünnen `extern "C"`-Wrappern, die
+sich **nur** im Gittertyp unterscheiden (dense vs. sparse). Eine Naht, 17 Kerne, 34
+Einträge.
+
+Vor dem ersten Zeichen Code habe ich die Frage gestellt, die ich mir angewöhnt habe
+zuerst zu stellen: **kann eine Szene das überhaupt erreichen?**
+
+### Die Antwort hat die Tranche beendet
+
+Nein — und zwar nicht „noch keine Szene übt es aus", sondern **es lässt sich in diesem
+Build nicht konstruieren**:
+
+- Die Isosurface-Extraktoren entstehen ausschließlich über `PxGetPhysicsGpu()`.
+- Deren Factory liegt in `physxgpu/src/PxgPhysXGpu.cpp`.
+- Diese Datei wird **nicht kompiliert**: das sdktest-Rezept globt
+  `gpucommon/gpubroadphase/gpunarrowphase/gpusimulationcontroller/gpusolver/gpuarticulation`,
+  aber niemals `physxgpu`.
+- Und der Vulkan-Bridge-Ersatz ist:
+  ```cpp
+  physx::PxPhysicsGpu* PxGpuCreatePhysicsGpu()
+  {
+      return NULL;
+  }
+  ```
+
+Selbst eine Anwendung, die es versucht, bekommt hier keinen Extraktor. Beides habe ich
+selbst nachgelesen, nicht nur berichten lassen.
+
+### Dieselbe Klassifikation über alle 98
+
+| Bucket | Anzahl | Bedeutung |
+|---|---|---|
+| ORPHAN | 11 | wird von **nichts** gestartet, auch upstream nicht |
+| STANDALONE | 58 | app-seitige Features, in diesem Build nicht konstruierbar |
+| ENGINE | **29** | wird von der Simulationspipeline gestartet |
+
+Die 58 sind: Isosurface (34), SDF-Builder (18), Sparse-Grid-Provider, Anisotropie,
+Smoothed-Position. Die 11 Orphans stehen bereits vollständig in der ORPHANED-Tabelle
+von `check_disabled_kernels.py` — ich habe es geprüft, es fehlte keiner.
+
+**Die verbliebene erreichbare Arbeit sind 29 Kernel, nicht 98.** Die 58 zu portieren
+würde `PXG_SLANG_KERNEL_MAPPED` von 403 auf 461 heben, während das, was der Port
+KANN, sich um nichts bewegt — und keine Szene könnte eine falsche Antwort von auch nur
+einem davon bemerken. Das ist Manifest-Theater, und ich mache es nicht.
+
+### Der DREIZEHNTE Prüfer, damit die Zahl nicht verrottet
+
+`check_unmapped_reachability.py`. Eine fest verdrahtete „das ist unerreichbar"-Liste
+würde beim ersten Mal still falsch werden, wenn jemand eines dieser Features an die
+Engine hängt — genau der Fehlermodus, gegen den die Datei existiert. Also wird die
+Begründung **bei jedem Lauf neu hergeleitet**, in drei Beinen:
+
+1. jede Owner-Klasse wird **nur** in der App-Factory `PX_NEW`'t;
+2. `PxGpuCreatePhysicsGpu()` in der Bridge gibt NULL zurück;
+3. `physxgpu/src` steht nicht im sdktest-Glob.
+
+Bricht ein Bein, fällt der Check laut, statt weiter eine bequeme Zahl zu melden.
+Selbsttest: die Bridge-Stub-Rückgabe auf etwas anderes geändert →
+*„bridge: PxGpuCreatePhysicsGpu() no longer returns NULL — the app-facing GPU feature
+factory may now be live"*. Wiederhergestellt → OK.
+
+Die 29 sind eine Ratsche (`engine_reachable_unmapped.txt`), die schrumpfen darf und
+nicht wachsen. Ein neuer nicht gemappter Kernel auf einem Live-Pfad fällt sofort auf.
+
+### Was der Understand-Lauf sonst noch gebracht hat
+
+Neun parallele Leser plus ein adversarialer Kritiker. Der Kritiker hat **fünf falsche
+Behauptungen** in den Leserberichten gefunden — darunter ein FACT-Bullet, dessen
+Primärzitat schlicht erfunden war, und einen Manifest-Zeilenbereich, der zwei `sg_`-Zeilen
+verschluckte. Genau dafür war er da; ich habe die entscheidenden Fakten trotzdem selbst
+nachgeprüft, bevor ich danach gehandelt habe.
+
+Zwei Funde sind aufbewahrenswert, falls die 58 je erreichbar werden:
+
+- **`PxSparseIsosurfaceExtractionData` ist 144 Bytes.** Vulkans garantiertes Minimum
+  für `maxPushConstantsSize` ist **128**. Die Sparse-Struktur passt in keinen
+  garantierten Push-Constant-Block, und die CUDA übergibt sie *by value* plus weitere
+  Argumente. Das ist ein struktureller Blocker, kein Detail.
+- **Der eigentliche Korrektheitsinvariant ist nicht die Arithmetik pro Kernel.**
+  `countCellVerts`/`createVerts` und `countTriIds`/`createTriIds` berechnen dieselben
+  Dichte-Fetches und dasselbe Straddle-Prädikat **unabhängig neu** und müssen bitgleich
+  übereinstimmen, weil der erste Pass per exklusivem Scan die Scheibe reserviert, die
+  der zweite füllt. Jede Divergenz desynchronisiert den **ganzen** Indexpuffer. Eine
+  Fixture, die jeden Kernel einzeln gegen ein CPU-Orakel prüft, geht dabei sauber
+  durch — jeder Kernel ist für sich korrekt. Diese Fixture-Form existiert im Korpus
+  noch nicht.
+
+### Stand
+
+Suite **851/851 in beiden Speichermodi** (850 + `gpuslang.unmappedReachability`),
+Szenen 41/41, Manifest 403/501 — davon **29 erreichbar offen**, 58 unerreichbar,
+11 verwaist. Prüfer nun **dreizehn**. Nächste Tranche: die zwölf in
+`PxgNarrowphaseCore.cpp` — die größte kohärente Gruppe und die beobachtbarste
+(Convex-Core gegen jede Geometrie, Sphere/Trimesh, Trimesh/Plane,
+Trimesh/Heightfield, Triangle-Triangle, Softbody/Heightfield). Eine Szene kann jeden
+einzelnen davon ansehen, und genau darauf beruht die Methode dieses Ports.
 
 ## P9.64 — der ZWÖLFTE Prüfer: eine Fixture, die ihr eigenes Gitter wählt, kann eine fehlende Schleife nicht sehen
 

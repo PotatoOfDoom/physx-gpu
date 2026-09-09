@@ -2673,3 +2673,16 @@ add_test(NAME gpuslang.gridStride
 # currently empty.
 add_test(NAME gpuslang.fixtureGrid
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_fixture_grid.py)
+
+# THIRTEENTH static checker (P9.65).  Not every unmapped kernel is remaining work.
+# The isosurface extractors, SDF builder, anisotropy and smoothed-position generators
+# and the particle neighbourhood provider are created only through PxGetPhysicsGpu(),
+# whose factory (physxgpu/src/PxgPhysXGpu.cpp) is not compiled into this build and
+# whose bridge replacement returns NULL -- 58 of the 98 unmapped kernels cannot be
+# reached here at all, and 11 more are launched by nothing even upstream.  The real
+# remaining work is the 29 the simulation pipeline launches, ratcheted in
+# tools/engine_reachable_unmapped.txt.  The checker re-derives the unreachability
+# basis every run rather than trusting a hardcoded list, so wiring one of these
+# features into the engine fails the build instead of silently invalidating the plan.
+add_test(NAME gpuslang.unmappedReachability
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_unmapped_reachability.py)

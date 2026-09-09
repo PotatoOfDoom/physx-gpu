@@ -1,0 +1,82 @@
+# engine_reachable_unmapped.txt -- the unmapped kernels the SIMULATION PIPELINE
+# launches.  Read by tools/check_unmapped_reachability.py.
+#
+# THIS IS A RATCHET, not a permission slip.  A new engine-reachable unmapped kernel
+# fails the check, and so does an entry left here after its port lands -- a stale
+# allowlist is how a ratchet quietly stops ratcheting.  It may shrink; it may not grow.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS FILE EXISTS: "98 TO GO" WAS NEVER 98
+# ---------------------------------------------------------------------------
+# P9.65 set out to port isosurfaceExtraction.cu -- 34 unmapped kernels, the biggest
+# single block left -- and asked the liveness question first.  The answer stopped the
+# tranche: the isosurface extractors are created only through PxGetPhysicsGpu(),
+# whose factory (physxgpu/src/PxgPhysXGpu.cpp) IS NOT COMPILED into this build, and
+# the Vulkan bridge's PxGpuCreatePhysicsGpu() returns NULL.  No scene, and no
+# application, can construct one here.
+#
+# Classifying all 98 the same way gives:
+#
+#     11  ORPHAN      nothing launches them even upstream (already in
+#                     check_disabled_kernels.py's ORPHANED table)
+#     58  STANDALONE  app-facing features -- isosurface (34), SDF builder (18),
+#                     sparse-grid provider (9... see the tool), anisotropy (2),
+#                     smoothed position (2) -- not constructible in this build
+#     29  ENGINE      launched from the simulation pipeline: the list below
+#
+# So the remaining reachable work is 29 kernels, not 98.  Porting the 58 would move
+# PXG_SLANG_KERNEL_MAPPED from 403 to 461 while moving what the port can DO by
+# nothing, and no scene could observe a wrong answer from any of them.  That is
+# manifest theatre, and this file is here so the distinction survives being
+# rediscovered.
+#
+# ---------------------------------------------------------------------------
+# THE 29, GROUPED BY LAUNCHING SUBSYSTEM
+# ---------------------------------------------------------------------------
+# PxgNarrowphaseCore.cpp (12) -- the largest coherent group and the most observable:
+# convex-core collision against every geometry, sphere/trimesh, trimesh/plane,
+# trimesh/heightfield, triangle-triangle, softbody/heightfield.  A scene can watch
+# every one of these, which is what this project's method depends on.
+convexCoreClothmeshNphase_Kernel32
+convexCoreConvexNphase_Kernel
+convexCorePlaneNphase_Kernel
+convexCoreTetmeshNphase_Kernel32
+convexCoreTrimeshNphase_Kernel32
+evaluatePointDistancesSDFBatch
+sb_heightfieldContactGenLaunch
+sphereTrimeshNarrowphase
+triangleTriangleCollision
+triangleTriangleOverlaps
+trimeshHeightfieldNarrowphase
+trimeshPlaneNarrowphase
+
+# PxgSoftBodyCore.cpp (4)
+sb_copyOrApplySoftBodyDataDEPRECATED
+sb_gm_cp_solveTetrahedronsJacobiPartitionLaunch
+sb_plasticDeformLaunch
+sb_plasticDeformLaunch2
+
+# PxgSimulationCore.cpp (3)
+getD6JointForces
+getD6JointTorques
+mergeChangedAABBMgrHandlesLaunch
+
+# PxgPBDParticleSystemCore.cpp (3)
+applyParticleBufferDataDEPRECATED
+ps_solveShapes
+ps_update_volume_bound
+
+# PxgParticleSystemCore.cpp (3)
+ps_rigidAttachmentPrepareLaunch
+ps_solveRigidAttachmentsLaunch
+ps_solveRigidAttachmentsTGSLaunch
+
+# PxgCudaSolverCore.cpp + PxgTGSCudaSolverCore.cpp (2)
+bodyInputAndRanksBlocksLaunch
+bodyInputAndRanksSingleBlockLaunch
+
+# PxgSimulationController.cpp (1)
+mergeTransformCacheAndBoundArrayChanges
+
+# PxgMemCopyDispatcher.cpp (1)
+copyUserData
