@@ -59,13 +59,36 @@
 // the emitted values (persistentMask = !previousMask) are identical.
 //
 // Portability: the CUDA warp shuffles (warpScan / __ballot_sync+__popc) become
-// groupshared 32-lane Hillis-Steele scans; the fixed 32-block device grid and
+// groupshared 32-lane Hillis-Steele scans; the block-partitioned device grid and
 // its between-block accumulation are preserved (BLOCK = 256 threads, 8 warps).
+//
+// P9.64 -- LIKE thresholdStream.slang, THIS FILE IS LAUNCHED WITH TWO GRIDS.
+// Found by tools/check_fixture_grid.py, the twelfth checker, on its first run:
+// PxgSolverKernelIndices.h gives
+//
+//   grid 64:  SET_THRESHOLDELEMENT_MASK          -> setThresholdElementsMask
+//             CREATE_FORCECHANGE_THRESHOLDELEMENTS -> createForceChangeThresholdElements
+//   grid 32:  COMPUTE_/OUTPUT_THRESHOLDELEMENT_MASK_INDICES
+//
+// and `setPersistentForceElementMask` belongs to the grid-32 side: the CUDA has it
+// as a __device__ helper called from computeThresholdElementMaskIndices, whose own
+// body asserts `PxgKernelGridDim::COMPUTE_THRESHOLDELEMENT_MASK_INDICES == 32`.
+// It is a separate entry here only because the original scans a persistent region
+// other blocks are concurrently writing (see above), so the split is about
+// ordering, not about the grid.
+//
+// The two grid-64 entries strided by 256*32 against 256*64 threads, so every index
+// at or above the stride was visited twice.  Both bodies are pure gathers into a
+// buffer other than their source, so this was output-equivalent and no coverage
+// hole -- the same shape, and the same reason nothing failed, as in
+// thresholdStream.slang.  Corrected for the same reason: the equivalence depends
+// on those bodies staying idempotent and nothing said so.
 
 import pxgSlangCommon;
 
 static const uint BLOCK = 256;
-static const uint NUM_BLOCKS = 32;
+static const uint NUM_BLOCKS = 32;       // PxgKernelGridDim, the block-partitioned entries
+static const uint NUM_BLOCKS_WIDE = 64;  // PxgKernelGridDim, the plain grid-stride entries
 static const uint WARP = 32;
 static const uint WARPS_PER_BLOCK = BLOCK / WARP; // 8
 
@@ -139,7 +162,7 @@ void setThresholdElementsMask(uint3 dtid : SV_DispatchThreadID)
 {
     const uint nbExceeded = gParams.nbExceeded;
     const uint nbPrev = gParams.nbPrev;
-    const uint stride = BLOCK * NUM_BLOCKS;
+    const uint stride = BLOCK * NUM_BLOCKS_WIDE;
 
     for (uint workIndex = dtid.x; workIndex < nbExceeded; workIndex += stride)
     {
@@ -339,7 +362,7 @@ void createForceChangeThresholdElements(uint3 dtid : SV_DispatchThreadID)
     const uint nbPrev = gParams.nbPrev;
     const uint total = nbExceeded + nbPrev * 2u;
     const uint persistentStart = nbPrev + nbExceeded;
-    const uint stride = BLOCK * NUM_BLOCKS;
+    const uint stride = BLOCK * NUM_BLOCKS_WIDE;
 
     for (uint workIndex = dtid.x; workIndex < total; workIndex += stride)
     {

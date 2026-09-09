@@ -70,6 +70,22 @@
 
 namespace
 {
+
+// P9.64 -- the FEM constraint-prepare and cloth-cloth entries are launched by the
+// engine with a FIXED grid of 1024 (PxgKernelGridDim), and their shaders partition
+// the work by that constant: each block takes
+// `nbIterationsPerBlock * groupId.x * RC_BLOCK` as its offset, with the grid baked
+// into nbIterationsPerBlock.  A fixture dispatching ONE group therefore reproduces
+// neither the engine's launch nor the partitioning, and -- with 1023 groups absent
+// -- nothing checks that those groups write nothing.
+//
+// Honest limit: at these fixtures' single contact the loop still runs one iteration
+// whatever the grid, so the engine's grid alone does not make the partitioning
+// CONSTANT observable; that needs more contacts than one block's share.  The grid
+// is the floor of the property, not the whole of it.  tools/check_fixture_grid.py
+// checks the floor, which is what it can see.
+static const uint32_t FEM_PREP_GRID = 1024;
+
 using namespace pxgtest;
 using namespace physx;
 
@@ -3987,7 +4003,7 @@ static void runRigidContact(bool isTGS)
     pp.isTGS = isTGS ? 1u : 0u;
 
     Kernel kPrep("femClothRigidContactBda.spv", "cloth_rigidContactPrepareLaunch", {}, sizeof(PrepPush));
-    kPrep.dispatch(1u, {}, pp, 1u, 1u);
+    kPrep.dispatch(FEM_PREP_GRID, {}, pp, 1u, 1u);
     dev->flush();
 
     // ---- CPU reference for the prepared constraint ----
@@ -4538,7 +4554,7 @@ static void runRigidContactDynamic(bool isTGS)
     pp.isTGS = isTGS ? 1u : 0u;
 
     Kernel kPrep("femClothRigidContactBda.spv", "cloth_rigidContactPrepareLaunch", {}, sizeof(PrepPush));
-    kPrep.dispatch(1u, {}, pp, 1u, 1u);
+    kPrep.dispatch(FEM_PREP_GRID, {}, pp, 1u, 1u);
     dev->flush();
 
     RigidContactConstraintHost refC;
@@ -5716,7 +5732,7 @@ static void runClothSelfContactVT()
     pp.clothes = bDesc.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
     pp.maxContacts = MAXC; pp.clothMaterials = 0ull; pp.updateContactPairs = bUpd.addr;
     Kernel kPrep("femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch", {}, sizeof(PrepClothClothPush));
-    kPrep.dispatch(1u, {}, pp, 1u, 1u);
+    kPrep.dispatch(FEM_PREP_GRID, {}, pp, 1u, 1u);
     dev->flush();
     const FemFemContactInfoHost giPrep = downloadBuffer<FemFemContactInfoHost>(dev, bInfos.h, 1)[0];
     PXG_CHECK_MSG((giPrep.auxInd & VALIDITY_FLAG_MASK_H) != 0u,
@@ -5866,7 +5882,7 @@ static void runClothSelfContactEE()
     pp.clothes = bDesc.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
     pp.maxContacts = MAXC; pp.clothMaterials = 0ull; pp.updateContactPairs = bUpd.addr;
     Kernel kPrep("femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch", {}, sizeof(PrepClothClothPush));
-    kPrep.dispatch(1u, {}, pp, 1u, 1u);
+    kPrep.dispatch(FEM_PREP_GRID, {}, pp, 1u, 1u);
     dev->flush();
     const FemFemContactInfoHost giPrep = downloadBuffer<FemFemContactInfoHost>(dev, bInfos.h, 1)[0];
     PXG_CHECK_MSG((giPrep.auxInd & VALIDITY_FLAG_MASK_H) != 0u,
@@ -5876,7 +5892,7 @@ static void runClothSelfContactEE()
     QueryClothClothPush qp = {};
     qp.cloths = bDesc.addr; qp.contactInfos = bInfos.addr; qp.numContacts = bNum.addr;
     Kernel kQuery("femClothClothContactBda.spv", "cloth_queryClothClothContactEECountLaunch", {}, sizeof(QueryClothClothPush));
-    kQuery.dispatch(1u, {}, qp, 1u, 1u);
+    kQuery.dispatch(FEM_PREP_GRID, {}, qp, 1u, 1u);
     dev->flush();
 
     // ---- CPU reference: closestPtLineLine(edge0 = v3->v4, edge1 = v0->v1) -> weights ----
@@ -5914,7 +5930,7 @@ static void runClothSelfContactEE()
     SolveClothClothPush sp = {};
     sp.cloths = bDesc.addr; sp.contactInfos = bInfos.addr; sp.numContacts = bNum.addr; sp.dt = dt;
     Kernel kSolve("femClothClothContactBda.spv", "cloth_solveClothClothDeltaEELaunch", {}, sizeof(SolveClothClothPush));
-    kSolve.dispatch(1u, {}, sp, 1u, 1u);
+    kSolve.dispatch(FEM_PREP_GRID, {}, sp, 1u, 1u);
     dev->flush();
 
     for (int i = 0; i < 4; ++i)
@@ -6053,7 +6069,7 @@ static void runClothSelfContactRedundancy(uint32_t nbContacts)
     pp.clothes = bDesc.addr; pp.contactInfos = bInfos.addr; pp.numContacts = bNum.addr;
     pp.maxContacts = MAXC; pp.clothMaterials = 0ull; pp.updateContactPairs = bUpd.addr;
     Kernel kPrep("femClothClothContactBda.spv", "cloth_clothContactPrepareLaunch", {}, sizeof(PrepClothClothPush));
-    kPrep.dispatch(1u, {}, pp, 1u, 1u);
+    kPrep.dispatch(FEM_PREP_GRID, {}, pp, 1u, 1u);
     dev->flush();
 
     QueryClothClothPush qp = {};

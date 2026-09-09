@@ -1,0 +1,37 @@
+# fixture_grid_known.txt -- kernels whose fixture dispatches a group count other
+# than the one the engine launches them with.  Read by tools/check_fixture_grid.py.
+#
+# THIS IS A RATCHET, not a permission slip.  A new disagreement fails the check, and
+# so does an entry left here after its fixture was fixed -- a stale allowlist is how
+# a ratchet quietly stops ratcheting.  The list may shrink; it may not grow.
+#
+# WHAT AN ENTRY COSTS.  A fixture at its own grid cannot see a missing grid-stride
+# loop, nor a wrong stride constant: it gives itself one thread per work item, and
+# under that geometry the loop is unnecessary.  Every defect this class has hidden
+# was found some other way and only afterwards traced back to the fixture --
+# P9.52b-6 (a quarter of the guide vertices, every call), P9.61 (five skinning
+# entries), P9.63 (two bodyUpdate entries plus four thresholdStream entries).
+#
+# ---------------------------------------------------------------------------
+# EMPTY, and it starts empty.  P9.64 fixed all eight disagreements its first run
+# reported rather than carrying any:
+#
+#   thresholdForceChange (2)  a REAL defect, the same one P9.63 found in the sibling
+#                             file: one NUM_BLOCKS = 32 in a file the engine launches
+#                             with two grids, so setThresholdElementsMask and
+#                             createForceChangeThresholdElements strided at half the
+#                             engine's thread count.  The fixture also had to grow
+#                             from 13000 elements to 35777 -- at the engine's grid
+#                             but under one pass, a wrong stride still passed.
+#
+#   FEM prepare (6)           NOT defects.  Single-contact math fixtures dispatching
+#                             one group where the engine dispatches 1024.  Raised to
+#                             the engine's grid because that is what the engine does
+#                             and because 1023 further groups writing nothing is
+#                             itself untested at one group -- but see the checker's
+#                             own header: at one contact the partitioning constant
+#                             stays unobservable, and this is not claimed otherwise.
+#
+# Eleven further dispatches (ps_heightfieldCollisonLaunch) were EXEMPT, not fixed:
+# psHfMidphaseBda.slang strides by WorkgroupCount(), so it is correct at any grid and
+# its fixture's 64 groups are a documented, asserted choice.

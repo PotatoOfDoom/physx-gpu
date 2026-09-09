@@ -7,7 +7,11 @@ MIGRATION_STATUS.md.  Every item below is committed on
 gpuslang harness on llvmpipe (Vulkan 1.4) in BOTH memory modes — default
 (host-visible) and `PXG_DEVICE_V2=1` (device-local + staged + timeline).
 
-Test count: **849/849** green in both modes (`ctest -N` in `build-gpuslang`).
+Test count: **850/850** green in both modes (`ctest -N` in `build-gpuslang`).
+P9.64 added `gpuslang.fixtureGrid`, the TWELFTH static checker and the THIRD written
+because its defect had already happened: a fixture that dispatches its own group
+count instead of the engine's cannot see a missing grid-stride loop, nor a wrong
+stride constant.  It found a fourth occurrence on its first run.
 P9.61 retired five `gpuslang.hlsl.*` twins and P9.63 the last two
 (`bodyUpdate:updateBodiesLaunchDirectAPI`, `:updateBodyExternalVelocitiesLaunch`):
 all seven now need `WorkgroupCount()`, which has no cs_6_0 lowering.
@@ -1851,6 +1855,108 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.64 — der ZWÖLFTE Prüfer: eine Fixture, die ihr eigenes Gitter wählt, kann eine fehlende Schleife nicht sehen
+
+Dieselbe blinde Stelle hat inzwischen **dreimal** einen echten Defekt verdeckt —
+P9.52b-6 (ein Viertel der Guide-Vertices, bei jedem Aufruf), P9.61 (die fünf
+Skinning-Einträge), P9.63 (beide `bodyUpdate`-Einträge plus vier
+`thresholdStream`-Einträge). Nach dem Präzedenzfall aus P9.57 — ein Prüfer wird
+geschrieben, wenn sein Defekt **bereits passiert ist** — ist drei weit über der
+Schwelle.
+
+### Die Regel
+
+Für jede Fixture-`dispatch()`, deren Kernel die Engine an **allen** Startstellen mit
+einer festen `PxgKernelGridDim`-Konstante startet: die dispatchte Gruppenzahl muss
+dieser Konstante **gleichen**.
+
+Gleichheit, nicht „mindestens". Weniger Gruppen lassen Arbeit auf einem korrekten
+Shader ungedeckt; mehr verstecken einen zu kleinen Stride — genau der Fall aus
+P9.63, wo die Schleife bei halber Threadzahl lief und nur deshalb ausgabegleich war,
+weil ihre Rümpfe zufällig idempotent sind. Nur die Zahl der Engine reproduziert,
+was die Engine tut.
+
+### Die Ausnahme, und warum sie eng ist
+
+`WorkgroupCount()` ist Slangs Laufzeit-Schreibweise von gridDim. Ein Shader, der
+seinen Stride daraus ableitet, ist **bei jedem Gitter korrekt** — es gibt keine
+Konstante, der die Fixture widersprechen könnte. `psHfMidphaseBda.slang` ist der
+Fall, der das gelehrt hat: seine Fixture dispatcht 64 Gruppen gegen die 4096 der
+Engine, sagt im Kommentar warum, **assertiert separat**
+`PxgParticleSystemKernelGridDim::PS_HEIGHTFIELD_COLLISION == HF_GRID` und trägt
+obendrein eine `grid-real-4096`-Variante. Das zu melden hätte geheißen, dass der
+Prüfer sich Arbeit erfindet. 14 Dispatches sind so befreit.
+
+Die Ausnahme deckt **nicht** einen Shader, der nach einer fest verdrahteten
+Gitterkonstante partitioniert, auch wenn sie stimmt.
+
+### Was er beim ERSTEN Lauf gefunden hat
+
+19 Treffer, nach der Ausnahme 8 — und darunter **ein echter Defekt**:
+`thresholdForceChange.slang` hatte genau denselben Fehler wie die Schwesterdatei aus
+P9.63, eine `NUM_BLOCKS = 32` für eine Datei, die die Engine mit zwei Gittern
+startet:
+
+| Gitter | Einträge |
+|---|---|
+| 64 | `setThresholdElementsMask`, `createForceChangeThresholdElements` |
+| 32 | `computeThresholdElementMaskIndices`, `outputThresholdPairsMaskIndices` |
+
+`setPersistentForceElementMask` gehört zur 32er-Seite: die CUDA hat es als
+`__device__`-Helfer in `computeThresholdElementMaskIndices`, dessen eigener Rumpf
+`PxgKernelGridDim::COMPUTE_THRESHOLDELEMENT_MASK_INDICES == 32` assertiert. Dass es
+hier ein eigener Eintrag ist, hat mit Ordnung zu tun, nicht mit dem Gitter.
+
+### Der Prüfer hatte selbst einen Präzisionsfehler, und er war peinlich naheliegend
+
+Der erste Lauf beschuldigte `cloth_clothContactPrepareLaunch` an sechs Stellen —
+eine davon war `cloth_rigidAttachmentPrepareLaunch`. Ursache: ich hatte
+Kernel-Variablennamen über die **ganze Datei** in ein Dict gelegt, und
+`testFemClothSim.cpp` deklariert `kPrep` in fünf verschiedenen Testfunktionen für
+fünf verschiedene Einträge — die letzte Deklaration gewann. Behoben: jede
+`dispatch()` wird mit der **nächstvorherigen** Deklaration ihres Namens gepaart.
+Nach der Korrektur sah die Liste anders aus (5 Kernel statt 4, andere Zeilen).
+
+Das ist der vierte Prüfer-Präzisionsfehler, den ich selbst gefunden und korrigiert
+habe, bevor ich einen Defekt daraus gemacht habe. Die Reihenfolge ist wichtig: erst
+die Zuordnung prüfen, dann den gemeldeten Code.
+
+### Das Gitter ist die UNTERGRENZE der Eigenschaft, nicht die Eigenschaft
+
+Der wichtigste ehrliche Vorbehalt, und er ist gemessen, nicht vermutet. Nachdem ich
+die Fixture auf das Gitter der Engine gehoben hatte, habe ich die Konstante auf 128
+mutiert — **der Test blieb grün**. Grund: bei nbPrev = 4000, nbExceeded = 5000 ist
+das Maskenarray 13000 Elemente groß, unter **einem** Durchgang von 64·256 = 16384.
+Die Schleife iterierte nie.
+
+Erst mit nbExceeded = 17777 und nbPrev = 9000 (total 35777) fällt die Mutation:
+
+```
+nbForceChange: gpu 18558 vs ref 17872
+forceChange elements: 14715 / 17872 mismatches
+```
+
+Der Prüfer prüft also das Gitter, weil er das sehen kann. Ob die Eingabe groß genug
+ist, ist Arbeitsmengen-Rechnung pro Kernel, die er nicht führen kann — und ein
+grüner Lauf ist **keine** Behauptung, dass eine Fixture einen falschen Stride
+fangen würde. Das steht so in seinem Kopf.
+
+### Die sechs FEM-Treffer: keine Defekte, trotzdem geändert
+
+Einzelkontakt-Fixtures, die eine Gruppe dispatchen, wo die Engine 1024 startet. Bei
+einem Kontakt läuft die Schleife bei jedem Gitter genau einmal, die
+Partitionierungskonstante bleibt also **auch danach** unbeobachtbar. Trotzdem auf
+das Gitter der Engine gehoben, aus zwei Gründen: es ist, was die Engine tut, und mit
+1023 fehlenden Gruppen prüft nichts, dass diese Gruppen nichts schreiben. Der
+Ratschendatei ist genau das so notiert — kein Anspruch darüber hinaus.
+
+### Stand
+
+Ratsche `fixture_grid_known.txt` startet **leer**: alle acht Widersprüche repariert,
+keiner getragen. Prüfer nun **zwölf**. Suite **850/850 in beiden Speichermodi**
+(849 + `gpuslang.fixtureGrid`), Szenen 41/41, Manifest 403/501, Grid-Stride-Ratsche 2.
+Upstream-Kandidaten weiterhin 53 — dokumentiert, nicht gemeldet.
 
 ## P9.63 — die letzten vier der Liste: zwei waren nie Defekte, zwei waren echt, und ein dritter Fund nebenbei
 

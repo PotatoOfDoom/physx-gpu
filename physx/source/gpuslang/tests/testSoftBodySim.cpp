@@ -71,6 +71,22 @@
 
 namespace
 {
+
+// P9.64 -- the FEM constraint-prepare and cloth-cloth entries are launched by the
+// engine with a FIXED grid of 1024 (PxgKernelGridDim), and their shaders partition
+// the work by that constant: each block takes
+// `nbIterationsPerBlock * groupId.x * RC_BLOCK` as its offset, with the grid baked
+// into nbIterationsPerBlock.  A fixture dispatching ONE group therefore reproduces
+// neither the engine's launch nor the partitioning, and -- with 1023 groups absent
+// -- nothing checks that those groups write nothing.
+//
+// Honest limit: at these fixtures' single contact the loop still runs one iteration
+// whatever the grid, so the engine's grid alone does not make the partitioning
+// CONSTANT observable; that needs more contacts than one block's share.  The grid
+// is the floor of the property, not the whole of it.  tools/check_fixture_grid.py
+// checks the floor, which is what it can see.
+static const uint32_t FEM_PREP_GRID = 1024;
+
 using namespace pxgtest;
 using namespace physx;
 
@@ -3251,7 +3267,7 @@ PXG_TEST(softBodySimReorderPSContacts)
     push.sortedBarycentrics = bSB.addr; push.sortedContactInfos = bSI.addr;
 
     Kernel k("softBodyContactRemapBda.spv", "sb_reorderPSContactsLaunch", {}, sizeof(SbReorderPush));
-    k.dispatch(1u, {}, push, 1u, 1u);
+    k.dispatch(FEM_PREP_GRID, {}, push, 1u, 1u);
     dev->flush();
 
     const auto gP = downloadBuffer<F4>(dev, bSP.h, N + 2);

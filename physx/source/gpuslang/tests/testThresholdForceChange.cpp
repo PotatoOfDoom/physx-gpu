@@ -82,10 +82,25 @@ uint32_t binarySearch(const std::vector<ThresholdStreamElement>& prev, uint32_t 
 PXG_TEST(thresholdForceChange_pipeline)
 {
     std::mt19937 rng(34010);
-    const uint32_t nbPrev = 4000;
-    const uint32_t nbExceeded = 5000;
+    // P9.64 -- the engine launches this file's five entries with TWO grids
+    // (PxgKernelGridDim in PxgSolverKernelIndices.h), so the fixture needs both.
+    // A single 32 for all five made the shader's stride constant self-consistent
+    // with the fixture, and the two grid-64 entries strided at half the engine's
+    // thread count unobserved.  Keep in step with the shader's NUM_BLOCKS /
+    // NUM_BLOCKS_WIDE.
+    const uint32_t GRID = 32;       // COMPUTE_/OUTPUT_THRESHOLDELEMENT_MASK_INDICES
+    const uint32_t GRID_WIDE = 64;  // SET_THRESHOLDELEMENT_MASK, CREATE_FORCECHANGE_THRESHOLDELEMENTS
+    const uint32_t BLOCK = 256;
+
+    // The engine's grid alone is not enough: at 4000/5000 the whole array was
+    // 13000 elements, still under ONE pass of 64*256 = 16384, so the grid-stride
+    // loops never iterated and a wrong stride constant stayed invisible (a
+    // deliberate mutation to 128 passed).  setThresholdElementsMask loops over
+    // nbExceeded and createForceChangeThresholdElements over the whole mask array,
+    // so BOTH have to clear one pass.
+    const uint32_t nbExceeded = GRID_WIDE * BLOCK + 1393;   // 17777
+    const uint32_t nbPrev = 9000;                            // total = 35777
     const uint32_t total = nbExceeded + nbPrev * 2;
-    const uint32_t GRID = 32;
 
     auto rnd64 = [&]() { return (uint64_t(rng()) << 32) | rng(); };
     // Node indices with both words populated so the 64-bit compare is exercised,
@@ -225,7 +240,7 @@ PXG_TEST(thresholdForceChange_pipeline)
     const std::vector<PxgBufferHandle> binds = { bExceeded, bPrev, bFC, bMask, bBetween, bWriteable, bNb };
 
     Kernel k1("thresholdForceChange.spv", "setThresholdElementsMask", strides, sizeof(ForceChangeParams));
-    k1.dispatch(GRID, binds, p); dev->flush();
+    k1.dispatch(GRID_WIDE, binds, p); dev->flush();
     Kernel k2("thresholdForceChange.spv", "setPersistentForceElementMask", strides, sizeof(ForceChangeParams));
     k2.dispatch(GRID, binds, p); dev->flush();
     Kernel k3("thresholdForceChange.spv", "computeThresholdElementMaskIndices", strides, sizeof(ForceChangeParams));
@@ -233,7 +248,7 @@ PXG_TEST(thresholdForceChange_pipeline)
     Kernel k4("thresholdForceChange.spv", "outputThresholdPairsMaskIndices", strides, sizeof(ForceChangeParams));
     k4.dispatch(GRID, binds, p); dev->flush();
     Kernel k5("thresholdForceChange.spv", "createForceChangeThresholdElements", strides, sizeof(ForceChangeParams));
-    k5.dispatch(GRID, binds, p); dev->flush();
+    k5.dispatch(GRID_WIDE, binds, p); dev->flush();
 
     const auto gNb = downloadBuffer<uint32_t>(dev, bNb, 1);
     const auto gFC = downloadBuffer<ThresholdStreamElement>(dev, bFC, total);

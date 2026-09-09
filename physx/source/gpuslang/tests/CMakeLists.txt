@@ -2659,3 +2659,17 @@ add_test(NAME gpuslang.geomTypeConstants
 # behind after its port is fixed fails the check too.
 add_test(NAME gpuslang.gridStride
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_grid_stride.py)
+
+# TWELFTH static checker (P9.64), and the other half of the sentence above: "a
+# fixture chooses its own grid, so the ceiling is never approached".  gridStride
+# checks that the SHADER loops; this checks that the FIXTURE gives it the engine's
+# grid, without which the loop is never needed and neither its absence nor a wrong
+# stride constant is visible.  Written because the blind spot had already hidden a
+# real defect three times (P9.52b-6, P9.61, P9.63) -- the P9.57 precedent.  It found
+# a fourth on its first run: thresholdForceChange.slang carried one stride constant
+# for a file the engine launches with two different grids.
+# Entries whose shader strides by WorkgroupCount() are EXEMPT: those are correct at
+# any grid, so the fixture's is a free choice.  The known list is a RATCHET and is
+# currently empty.
+add_test(NAME gpuslang.fixtureGrid
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_fixture_grid.py)
