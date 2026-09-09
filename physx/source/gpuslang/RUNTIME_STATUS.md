@@ -31,8 +31,8 @@ Manifest: **403/501** kernels mapped (P9.52b-6 filled SPHERE_HEIGHTFIELD_CORE).
 Of the 98 unmapped, **29 are engine-reachable** (the real remaining work, ratcheted in
 `tools/engine_reachable_unmapped.txt`), 58 are unreachable app-facing features and 11
 are orphans — so "403/501" understates coverage of what this build can actually run.
-Scenes: **40/40** (P9.58 added `hfbigbox`, which fell through the terrain before
-the convex cores got their grid-stride loop back).
+Scenes: **41 ok / 43** -- P9.66a added `spheremesh` and `capsulemesh`, which
+SEGFAULT until sphereTrimeshNarrowphase is mapped and are scored MISSING, not ok.
 P9.52b-4 added `gpuslang.capsuleHfCore` and the 53rd upstream candidate: the
 "edge normal" of the capsule-vs-heightfield deferred arm is the NORMALIZED
 ROUNDING RESIDUE of two spellings of one point, because the arm runs only when
@@ -1863,6 +1863,62 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.66a — die beiden Szenen zuerst: eine Kugel auf einem gekochten Dreiecksnetz STÜRZT ab
+
+P9.65 hat die erreichbare Restarbeit auf 29 Kernel eingegrenzt, davon zwölf in
+`PxgNarrowphaseCore.cpp`. Nach der Methode aus P9.51 wird zuerst die beobachtende
+Szene gebaut und die Lücke **gemessen**, bevor eine Zeile portiert wird.
+
+### Warum `sphereTrimeshNarrowphase` das erste Ziel ist
+
+`PxgNphaseImplementationContext.cpp` leitet **zwei** gewöhnliche Paare an denselben
+Kernel:
+
+```
+cndCaseSphereMesh  (:1047)  ->  GPU_BUCKET_ID::eSphereTrimesh
+cndCaseCapsuleMesh (:1071)  ->  GPU_BUCKET_ID::eSphereTrimesh
+```
+
+Ein Port repariert also Kugel-gegen-Netz **und** Kapsel-gegen-Netz. Deshalb zwei
+Szenen und nicht eine: die Arme erreichen den Kernel über unterschiedliche Geometrie
+— Punkt-gegen-Dreieck bzw. Segment-gegen-Dreieck. Ein Port, der nur den Kugelarm
+richtig hat, käme durch eine Szene, die nur `spheremesh` prüft.
+
+### Was gemessen wurde — und es ist schlimmer als erwartet
+
+Beide Szenen, `spheremesh` und `capsulemesh`, auf demselben gekochten Netzboden, den
+`meshfloor` benutzt (dort mit einer Box, die über die bereits gemappte
+convexTrimesh-Kette läuft und sauber bei y = 0.5000 zur Ruhe kommt):
+
+```
+[PhysX 32] GPU sphereTrimeshCore fail to launch kernel!!
+(PxgNarrowphaseCore.cpp:2027)
+Segmentation fault  (exit 139)
+```
+
+Das ist **kein** stilles Durchfallen wie bei den anderen nicht gemappten Paaren. Der
+verweigerte Kernel lässt die Contact-Manager-Ausgabe uninitialisiert, und ein
+nachgelagerter Konsument dereferenziert sie — dieselbe Form wie der P9.52b-6-Absturz,
+bei dem `convexTrimeshCorrelate` eine uninitialisierte Kontaktzahl gelesen hat.
+
+**Eine Kugel oder Kapsel, die ein gekochtes Dreiecksnetz berührt, reißt die gesamte
+Simulation mit.** Vor P9.66 hat das nichts in diesem Port gesagt.
+
+### Stand dieser Zwischenstufe
+
+Szenen **41 ok, 0 fail, 2 missing (von 43)**. Die zwei fehlenden sind genau die neuen:
+sie stürzen ab, bevor eine Verdict-Zeile gedruckt wird, und `run_scenes.sh` wertet
+das korrekt als MISSING statt als Pass — das ist der Grund, warum es diese dritte
+Kategorie überhaupt gibt.
+
+Die 41 bestehenden Szenen sind unberührt. Das ist derselbe Präzedenzfall wie
+`meshfloor` und `hffloor`, die ebenfalls als „expected to fail" eingecheckt wurden,
+bevor ihre Ketten landeten: die Aufgabe der Szene ist, die Lücke auszusprechen.
+
+Die Portierung des Kernels (Kern ~180 Zeilen ab convexMesh.cu:219, Entry ~210 ab :763)
+folgt als P9.66b. Die `SphereTri*`-Strukturen liegen bereits in `npCvxHfNp.slang` und
+`npCvxMeshNp.slang`.
 
 ## P9.65 — die Liveness-Frage ZUERST gestellt, und die Tranche daran gestorben: „98 übrig" waren nie 98
 

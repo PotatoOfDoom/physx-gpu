@@ -241,6 +241,7 @@ void buildMeshFloorScene(PxPhysics* physics, PxScene* scene, PxMaterial* materia
     targets.push_back({ b, 5.0f, 0.5f, "boxOnMesh" });
 }
 
+
 // A cooked TRIANGLE MESH floor at y = 0: two triangles wound so the normals point
 // up, with buildGPUData so the mesh carries a BV32 tree.  Used by the particle
 // mesh-floor scene (P9.10c), which is the first scene in this port to put
@@ -268,6 +269,7 @@ PxRigidStatic* addMeshFloor(PxPhysics* physics, PxScene* scene, PxMaterial* mate
     fs->release();
     return floor;
 }
+
 
 // A cooked CONVEX floor whose TOP FACE sits at y = 0 (P9.14a): a flat slab of
 // half-extents (halfExtent, 0.5, halfExtent), cooked as a convex hull and
@@ -461,6 +463,57 @@ void buildCapsuleScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
     PxRigidDynamic* b = addDynamic(physics, scene, material, PxCapsuleGeometry(r, h),
                                    capsuleInertia(r, h, 1000.0f), 5.0f);
     targets.push_back({ b, 5.0f, r, "capsuleOnPlane" }); // rests on its side at centre y = radius
+}
+
+// PXG_SCENE=spheremesh / capsulemesh (P9.66): a dynamic SPHERE, and a dynamic
+// CAPSULE, dropped onto the same cooked triangle-mesh floor buildMeshFloorScene
+// uses.  The floor is identical; only the falling shape's type changes, and that
+// type is the whole point.
+//
+// *** BOTH SCENES SEGFAULT UNTIL sphereTrimeshNarrowphase IS MAPPED. ***
+// Measured before the port, both scenes: the launch is refused --
+//   [PhysX 32] GPU sphereTrimeshCore fail to launch kernel!!
+//   (PxgNarrowphaseCore.cpp:2027)
+// -- and the process then dies with SIGSEGV (exit 139) at the first step, before
+// any body has moved.  This is NOT the silent fall-through the other unmapped
+// pairs produce: the refused kernel leaves the contact-manager output
+// uninitialised and a downstream consumer dereferences it, the same shape as the
+// P9.52b-6 crash where convexTrimeshCorrelate read an uninitialised contact count.
+// So a sphere or a capsule touching a cooked triangle mesh takes the whole
+// simulation down today, and no scene said so before P9.66.
+// PxgNphaseImplementationContext.cpp routes BOTH pairs to the same bucket:
+// cndCaseSphereMesh (:1047) and cndCaseCapsuleMesh (:1071) each return
+// GPU_BUCKET_ID::eSphereTrimesh when the mesh is GPU-compatible, and that bucket's
+// only kernel -- sphereTrimeshNarrowphase, launched from
+// PxgGpuNarrowphaseCore::testSDKSphereTriMeshSATGpu (PxgNarrowphaseCore.cpp:1992) --
+// is unmapped.  So a sphere and a capsule both fall straight through a cooked
+// triangle mesh today, and until P9.66 nothing in this port said so.
+//
+// Two scenes rather than one because the two pairs reach the kernel through
+// DIFFERENT geometry: the capsule arm is a segment-vs-triangle test and the sphere
+// arm a point-vs-triangle one.  A port that gets only the sphere arm right passes a
+// spheremesh-only scene.  The box-on-mesh number from PXG_SCENE=meshfloor is the
+// control: it uses the convexTrimesh chain, which is already mapped, over the very
+// same floor.
+void buildSphereMeshScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                          std::vector<RestTarget>& targets)
+{
+    if (!addMeshFloor(physics, scene, material, 10.0f)) return;
+    const float r = 0.5f;
+    const float sphereI = 0.4f * 1000.0f * r * r; // solid sphere: 2/5 m r^2
+    PxRigidDynamic* b = addDynamic(physics, scene, material, PxSphereGeometry(r),
+                                   PxVec3(sphereI, sphereI, sphereI), 5.0f);
+    targets.push_back({ b, 5.0f, r, "sphereOnMesh" });
+}
+
+void buildCapsuleMeshScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                           std::vector<RestTarget>& targets)
+{
+    if (!addMeshFloor(physics, scene, material, 10.0f)) return;
+    const float r = 0.5f, h = 0.5f;
+    PxRigidDynamic* b = addDynamic(physics, scene, material, PxCapsuleGeometry(r, h),
+                                   capsuleInertia(r, h, 1000.0f), 5.0f);
+    targets.push_back({ b, 5.0f, r, "capsuleOnMesh" }); // rests on its side at centre y = radius
 }
 
 // PXG_SCENE=capsulebox: the capsule resting on the static ground BOX — routes
@@ -7241,6 +7294,8 @@ int main()
     else if (!std::strcmp(sceneName, "convex"))    buildConvexScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "joint"))     buildJointScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "meshfloor")) buildMeshFloorScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "spheremesh")) buildSphereMeshScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "capsulemesh")) buildCapsuleMeshScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "hffloor")) buildHfFloorScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "spherehf")) buildSphereHfScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "hfbigbox")) buildHfBigBoxScene(physics, scene, material, targets);
