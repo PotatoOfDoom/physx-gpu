@@ -1865,6 +1865,60 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.67a — die Convex-Core-Familie: eine Szene gebaut, die Lücke gemessen
+
+Fünf der elf verbliebenen Narrowphase-Kernel sind die `convexCore*`-Familie. Sie sind
+nur über eine Form erreichbar, die eine **Anwendung ausdrücklich erzeugt**: nichts in
+der Engine synthetisiert eine `eCONVEXCORE`-Shape, also leitet keine bestehende Szene
+dorthin.
+
+Anders als bei der Isosurface-Familie aus P9.65 ist das aber **kein** Ausschluss:
+`PxConvexCoreGeometry` ist gewöhnliche öffentliche API, `Gu::isGPUCompatible`
+akzeptiert jeden Kerntyp (GuConvexGeometry.cpp:335-353), und der Pfad ist in diesem
+Build kompiliert. Es fehlte schlicht die Szene.
+
+### Die Szene
+
+`PXG_SCENE=convexcoreplane`: ein dynamischer Convex-Core-**Zylinder** auf derselben
+statischen `PxPlaneGeometry`, die `buildPlaneScene` benutzt. Die Zylinderachse ist die
+lokale X-Achse (PxConvexCoreGeometry.h:164-166), er liegt also auf der Seite und ruht
+bei `y = radius` — **exakt wie die Kapsel-Szene**. Das ist der Punkt: dieselbe
+Ruhelage über einen anderen Narrowphase-Kernel.
+
+### Gemessen, vor jeder Portierung
+
+```
+[PhysX 32] GPU convexCorePlaneNphase_Kernel fail to launch!!
+[convexCoreCylinderOnPlane] final y=-73.8070 (rest 0.500), |v|=39.2401
+[pxg-unmapped] convexCorePlaneNphase_Kernel was launched 183 time(s) but has no
+SPIR-V mapping: every launch was SKIPPED, the physics it computes did not happen
+```
+
+Der Zylinder fällt glatt durch. Diesmal **still**, nicht mit SIGSEGV wie bei
+P9.66a — und die `[pxg-unmapped]`-Meldung, die das ausspricht, ist genau das, wofür
+Aufgabe #27 gebaut wurde.
+
+### Was der Umfang tatsächlich ist
+
+Die gesamte Convex-Core-Maschinerie liegt **bereits als Phase-1-Port vor** — zwölf
+Shader: `npCvxCorePlaneGen` (Gu::generateContacts(PxPlane, ConvexShape)),
+`npCvxCoreCvxGen` (die Convex-Convex-Variante), dazu GJK, EPA, Support, Face, Clip,
+Contact, Setup, PtsFace, WarpAcc und `npCvxCoreOut` mit `ccoWriteContacts` — der
+Ausgabestufe, die sich laut ihrem eigenen Kopf **alle fünf** convexCore-Kernel teilen.
+
+Der CUDA-Kernel selbst ist 45 Zeilen (convexCoreCollision.cu:449-494) und delegiert
+alles. Also wieder der P9.15c- / P9.66b-Fall: ein **Lift**, kein neuer Port. Und mit
+`ccoWriteContacts` als gemeinsamer Ausgabestufe ist der Weg für die übrigen vier
+convexCore-Kernel derselbe.
+
+### Anmerkung zum Sweep
+
+Diese Zwischenstufe checkt eine Szene ein, die **fehlschlägt** — derselbe Präzedenzfall
+wie `meshfloor`, `hffloor` und P9.66a: die Aufgabe der Szene ist, die Lücke
+auszusprechen. Der volle Sweep steht beim Port-Commit; diese Szene ist eine reine
+Ergänzung und kann die anderen 43 nicht beeinflussen, und ihr eigenes Ergebnis ist
+oben gemessen und festgehalten.
+
 ## P9.66c — die eine Sache, die weder die Szenen noch die Phase-1-Fixture prüfen können
 
 P9.66b hat den Kernel gemappt und die Szenen grün gemacht. Der Commit hat aber

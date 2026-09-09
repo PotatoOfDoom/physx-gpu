@@ -424,6 +424,7 @@ void buildPlaneScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
     targets.push_back({ b, 5.0f, 0.5f, "boxOnPlane" });
 }
 
+
 // PXG_SCENE=sphere: one dynamic sphere (radius 0.5) resting on the static ground box.
 // Exercises the sphere narrowphase path (sphere-box sub-case).
 void buildSphereScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
@@ -463,6 +464,38 @@ void buildCapsuleScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
     PxRigidDynamic* b = addDynamic(physics, scene, material, PxCapsuleGeometry(r, h),
                                    capsuleInertia(r, h, 1000.0f), 5.0f);
     targets.push_back({ b, 5.0f, r, "capsuleOnPlane" }); // rests on its side at centre y = radius
+}
+
+// PXG_SCENE=convexcoreplane (P9.67): a dynamic CONVEX CORE cylinder resting on the
+// same static infinite PxPlaneGeometry buildPlaneScene uses.  Geometrically this is
+// PXG_SCENE=capsule -- the cylinder's axis is the local X axis
+// (PxConvexCoreGeometry.h:164-166), so it lies on its side and rests at centre
+// y = radius, exactly as the capsule does -- and that is the point: the same rest
+// height reached through a DIFFERENT narrowphase kernel.
+//
+// *** THIS SCENE IS EXPECTED TO FAIL UNTIL convexCorePlaneNphase_Kernel IS MAPPED. ***
+// PxConvexCoreGeometry is ordinary public API and Gu::isGPUCompatible accepts every
+// core type (GuConvexGeometry.cpp:335-353), so unlike the isosurface family of P9.65
+// this path IS constructible here -- it simply has no scene.  Five of the twelve
+// engine-reachable narrowphase kernels are the convexCore family, and they are
+// reachable only through a shape an application explicitly creates: nothing in the
+// engine synthesises an eCONVEXCORE shape, so no existing scene routes to them.
+void buildConvexCorePlaneScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                               std::vector<RestTarget>& targets)
+{
+    PxRigidStatic* ground = physics->createRigidStatic(PxTransformFromPlaneEquation(PxPlane(0.0f, 1.0f, 0.0f, 0.0f)));
+    PxShape* ps = physics->createShape(PxPlaneGeometry(), *material);
+    ground->attachShape(*ps);
+    scene->addActor(*ground);
+
+    const float r = 0.5f, h = 1.0f;
+    // A cylinder core with zero margin: the core IS the shape.
+    PxConvexCoreGeometry geom(PxConvexCore::Cylinder(h, r));
+    // The inertia only has to be positive-definite for a body that comes to rest;
+    // the capsule scene uses the same reasoning (see capsuleInertia).
+    PxRigidDynamic* b = addDynamic(physics, scene, material, geom,
+                                   capsuleInertia(r, h * 0.5f, 1000.0f), 5.0f);
+    targets.push_back({ b, 5.0f, r, "convexCoreCylinderOnPlane" });
 }
 
 // PXG_SCENE=spheremesh / capsulemesh (P9.66): a dynamic SPHERE, and a dynamic
@@ -7296,6 +7329,7 @@ int main()
     else if (!std::strcmp(sceneName, "meshfloor")) buildMeshFloorScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "spheremesh")) buildSphereMeshScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "capsulemesh")) buildCapsuleMeshScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "convexcoreplane")) buildConvexCorePlaneScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "hffloor")) buildHfFloorScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "spherehf")) buildSphereHfScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "hfbigbox")) buildHfBigBoxScene(physics, scene, material, targets);
