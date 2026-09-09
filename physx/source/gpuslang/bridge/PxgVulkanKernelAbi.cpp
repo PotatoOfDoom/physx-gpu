@@ -1448,6 +1448,13 @@ static const PxgKernelAbiRow kRows[] = {
     // accurate description rather than a shortcut: a future edit to any one of the
     // three signatures cannot leave the others behind.
     { "sphereHeightfieldNarrowphase", kCvxTriCore, uint32_t(sizeof(kCvxTriCore)), kCvxTriCoreHostPtrMask },
+    // P9.66b: the FOURTH sharer.  sphereTrimeshNarrowphase (convexMesh.cu:763-788)
+    // declares the same 21 parameters in the same order with the same types as
+    // convexTrimeshNarrowphase (:623-647); only the typedef spellings differ
+    // (SphereMeshPair / ConvexMeshPair are two names for one struct,
+    // convexNpCommon.h:140-143).  Same 168-byte blob, same pinned host pointer at
+    // argument 18.
+    { "sphereTrimeshNarrowphase", kCvxTriCore, uint32_t(sizeof(kCvxTriCore)), kCvxTriCoreHostPtrMask },
     { "sortTriangleIndices", kSortTriIndices, uint32_t(sizeof(kSortTriIndices)) },
     { "convexTrimeshPostProcess", kCvxTriPostProcess, uint32_t(sizeof(kCvxTriPostProcess)) },
     // P9.51c: convexHeightfieldPostProcess (convexMeshPostProcess.cu:585-593)

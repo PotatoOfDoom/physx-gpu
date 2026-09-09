@@ -27,12 +27,13 @@ Slang port.  **2** known omissions carried as a RATCHET that may shrink, never g
 P9.60b corrected its Slang-side marker, which had made 26 of a claimed 38
 "omissions" into noise; P9.63 taught it the counted-loop form (`it * stride` with
 `++it`), which had made the last two `ps_*` entries into noise as well.
-Manifest: **403/501** kernels mapped (P9.52b-6 filled SPHERE_HEIGHTFIELD_CORE).
-Of the 98 unmapped, **29 are engine-reachable** (the real remaining work, ratcheted in
+Manifest: **404/501** kernels mapped (P9.66b filled SPHERE_TRIMESH_CORE).
+Of the 97 unmapped, **28 are engine-reachable** (the real remaining work, ratcheted in
 `tools/engine_reachable_unmapped.txt`), 58 are unreachable app-facing features and 11
 are orphans — so "403/501" understates coverage of what this build can actually run.
-Scenes: **41 ok / 43** -- P9.66a added `spheremesh` and `capsulemesh`, which
-SEGFAULT until sphereTrimeshNarrowphase is mapped and are scored MISSING, not ok.
+Scenes: **43/43** -- P9.66a added `spheremesh` and `capsulemesh`, which SEGFAULTED
+until P9.66b mapped sphereTrimeshNarrowphase; both now rest at y = 0.5000, the same
+number the `meshfloor` box control gives over the same floor.
 P9.52b-4 added `gpuslang.capsuleHfCore` and the 53rd upstream candidate: the
 "edge normal" of the capsule-vs-heightfield deferred arm is the NORMALIZED
 ROUNDING RESIDUE of two spellings of one point, because the arm runs only when
@@ -1863,6 +1864,85 @@ Suite **688/688 in both memory modes**, forced-fresh.  The count is unchanged fr
 this tranche adds an engine kernel, not a test suite, and there is no fixture that can drive
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
+
+## P9.66b — `sphereTrimeshNarrowphase` gemappt: vom SIGSEGV zur richtigen Ruhelage
+
+P9.66a hat gemessen, dass eine Kugel oder Kapsel auf einem gekochten Dreiecksnetz die
+Simulation **abstürzen** lässt. Dieser Tranche portiert den einen fehlenden Kernel.
+
+### Das Ergebnis
+
+```
+[sphereOnMesh]  start y=5.000, final y=0.5000 (rest 0.500), |v|=0.0000   [  OK  ]
+[capsuleOnMesh] start y=5.000, final y=0.5000 (rest 0.500), |v|=0.0000   [  OK  ]
+```
+
+Beide ruhen exakt auf dem Radius — und exakt auf der Zahl, die die Box-Kontrolle aus
+`meshfloor` (0.5000) über **demselben** Boden liefert. Der Boden ist damit
+kontrolliert, nur der Formtyp variiert.
+
+### Warum das kleiner war als gedacht
+
+Der Phase-1-Zahlenport **existierte bereits**: `npCvxMeshNp.slang` mit den Einträgen
+`cmSphereTri` und `cmCapsuleTri` deckt beide Kerne ab, seine Fixture ist grün. Und
+jede schwere Primitive liegt längst als verifiziertes Modul vor —
+`ptDistancePointTriangleSquared`, `stSegmentTriangleSquared`, `capGenerateContacts` /
+`capGenerateEEContacts`, `quatBasisVector0`, `maCompute`.
+
+Also war dies der P9.15c- / P9.52b-6-Fall: ein **Lift** einer bereits verifizierten
+Rechnung auf die BDA-Engine-ABI, nicht das Schreiben einer neuen. Was ich geschrieben
+habe, ist die BDA-Verdrahtung und der Kontrollfluss der beiden Arme. Der Shader hat
+**beim ersten Versuch fehlerfrei kompiliert**, was bei ~630 Zeilen bit-exakter
+Narrowphase nur geht, weil vorher gelesen wurde.
+
+### Die drei Fallen, die das Vorab-Lesen gefunden hat
+
+1. **Die Index-Asymmetrie.** Der Kugelarm packt `remapCpuTriangleIdx`
+   (convexMesh.cu:392, Fünf-Argument-`readTriangleMesh`), der Kapselarm den **rohen**
+   `triangleIdx` (:613, Vier-Argument-Überladung). Und `pxgSlangSphereHfCore` — das
+   Modul, nach dem man zuerst greift — packt roh, völlig zu Recht, weil ein
+   Heightfield gar keine Remap-Tabelle hat. Wiederverwendung wäre konstruktionsbedingt
+   falsch gewesen.
+
+2. **`delayContacts` steht im Kapselarm INNERHALB des `else`** (:508-521), im
+   Kugelarm wird es unbedingt gerechnet. Herausziehen ändert das Verhalten jeder tief
+   eindringenden Kapsel.
+
+3. **Die Grid-Stride-Schleife ist hier zwingender als sonst.** Der Host startet
+   `numBlocks = (numTests + 63) / 64` über die **Contact-Manager**-Zahl, die Schleife
+   läuft aber über **Paare** — eine geräteseitige, viel größere Zahl. Anders als der
+   konvexe Heightfield-Kern, dessen Host das Gitter absichtlich 32-fach
+   überprovisioniert (`coreGridMultiplier`), gibt es hier **keinen** Spielraum.
+
+### Die Ratsche hat sich selbst gefangen
+
+`check_unmapped_reachability.py` aus P9.65 ist bei seinem ersten echten Einsatz
+gefallen:
+
+```
+sphereTrimeshNarrowphase -- no longer an unmapped engine kernel; remove the line
+```
+
+Genau dafür war er gebaut. Erreichbar-nicht-gemappt: **29 → 28**.
+
+### Was NOCH NICHT geprüft ist — ausdrücklich
+
+Die Index-Asymmetrie ist **richtig geschrieben** (verifiziert an :454 und :624 gegen
+die CUDA), aber **nichts testet sie**. Der Fehlermodus ist still: `getTriangleIndex()`
+maskiert auf 27 Bit, beide Kandidaten sind kleine nicht-negative Zahlen, Kontaktpunkte,
+Normalen und Separationen sind identisch — nur die gemeldete Flächenidentität wäre
+falsch. Und der Zwei-Dreieck-Boden von `addMeshFloor` hat eine **identische**
+Face-Remap, die beiden Schreibweisen fallen dort also zusammen.
+
+Die grünen Szenen beweisen das also **nicht**, und ich lasse sie das auch nicht
+implizieren. Der Test dafür gehört in eine Fixture auf einem Netz mit beweisbar
+nicht-identischer Remap, die beide erwarteten Werte aus demselben Feld prüft — P9.66c,
+zusammen mit dem Mutations-Sweep.
+
+### Stand
+
+Suite **851/851**, Manifest-Test eingeschlossen; Manifest **404/501**; alle dreizehn
+Prüfer grün. Erreichbar offen: 28.
 
 ## P9.66a — die beiden Szenen zuerst: eine Kugel auf einem gekochten Dreiecksnetz STÜRZT ab
 
