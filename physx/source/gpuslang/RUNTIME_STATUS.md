@@ -1865,6 +1865,102 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.69c — `convexCoreConvexNphase_Kernel` gemappt, und ein Kontrollmodus, der zweimal die Szene widerlegt hat
+
+Der zweite der fünf convexCore-Kernel. Ein `PxConvexCoreGeometry` ruht jetzt auf
+jedem gewöhnlichen Convex: Kugel, Kapsel, Box, **gekochtem Convex-Mesh** oder
+einem zweiten Convex-Core.
+
+### Der Kernel selbst ist fast nichts Neues
+
+Vier verifizierte Schichten werden zusammengesetzt: `pxgSlangCvxCoreShape` (P9.67b),
+`pxgSlangCvxCoreCvx` (P9.69a: `gjkDistanceQ`/`epaDepthQ`/`faceClipQ`),
+`pxgSlangCvxCoreMake` und `pxgSlangCvxCoreOut` (beide P9.69b). Genuin neu sind die
+Parameterklempnerei, die **Rezentrierung** und die Entscheidung, welche Zeile zu
+welcher Schicht gehört.
+
+Die Rezentrierung ist keine Dekoration:
+
+    shift = (transform0.p + transform1.p) * 0.5f
+    pose0 = transform0.p - shift ; pose1 = transform1.p - shift
+    ...
+    contacts[i] = PxContact({ points[i] + shift, dists[i] })
+
+GJK und EPA akkumulieren Differenzen von Stützpunkten; um den Paarmittelpunkt
+gerechnet werden diese nicht als Differenz zweier großer Weltkoordinaten gebildet.
+Ein Port, der den Shift weglässt, rechnet nahe dem Ursprung dasselbe und verliert
+weit davon Genauigkeit — genau die Defektklasse, die eine ursprungsnahe Szene nicht
+sehen kann.
+
+Die ABI-Zeile ist **geteilt** mit `convexCorePlaneNphase_Kernel`: beide nehmen
+dieselben achtzehn Argumente in derselben Reihenfolge, die Startstellen
+unterscheiden sich nur in der Blockgröße (512 gegen 1024).
+
+Gruppe 64 gegen Engine-Block 512, also eine deckende Schleife mit
+`WorkgroupCount().x * BLOCK` — `check_block_coverage.py` (P9.68) lässt inzwischen
+nichts anderes durch.
+
+### PXG_CPU_CONTROL=1, und warum es diese Tranche gerettet hat
+
+Eine scheiternde Szene hat zwei Lesarten, und die Vorrichtung konnte sie nicht
+trennen: entweder rechnet der Port falsche Kontakte, oder die **Ruhehöhe, die die
+Szene behauptet**, ist gar nicht das, was PhysX für dieses Paar produziert.
+`PXG_CPU_CONTROL=1` baut dieselbe Szene auf der CPU-Pipeline — dieselbe Form wie
+`PXG_PARTICLE_FLUID_CONTROL`: gemeldet, nie gewertet.
+
+Es hat **zwei** meiner Szenen widerlegt, nicht den Port:
+
+1. **Zylinder auf statischem gekochtem Hull** — GPU: `final y = -73.807`. CPU:
+   **`final y = -73.807`, identisch.** Diese Paarung kollidiert in PhysX gar nicht.
+   Die Szene behauptete etwas Unwahres. Umgedreht — gekochter Hull als FALLENDER
+   Körper auf einer statischen Convex-Core-Box — liefern beide **0.5000**, und das
+   ist zugleich die einzige Szene, die den `ePOINTS`-Arm nimmt, den die
+   Zwölf-Punkte-Decke bis P9.69b unschreibbar machte.
+
+2. **Achtzig Zylinder auf EINER 400 × 1 × 100 großen Box** — GPU 122
+   Fehlprüfungen, CPU **98**. Der Grund steht im Algorithmus, nicht in einem der
+   beiden Ports: `Convex<Support>`s `accuracy` ist
+   `max(maxExtent * 0.01, FLT_EPSILON)` (GuConvexSupport.h:49-59) und ist zugleich
+   die GJK-Verschweißungsdistanz. Eine 400-m-Box verschweißt Stützpunkte vier
+   Meter auseinander. Jeder Zylinder bekam daraufhin seinen **eigenen kleinen
+   Boden**, und beide Pipelines sind bei 0 Fehlern.
+
+Ohne den Kontrollmodus hätte ich zweimal an einem Port gesucht, der recht hatte.
+
+### Zwei Knöpfe, weil die Konditionierung die interessante Variable ist
+
+`PXG_CVXCORE_GROUND` (Halbausdehnung des Bodens, Standard 1.2) und
+`PXG_CVXCORE_COUNT` (Paare, Standard 80). Gemessen:
+
+```
+                      GPU        CPU
+Halbausd. 1.2, 1 Paar   0.5000     0.5000
+Halbausd. 8.0, 1 Paar   0.5000     0.5001
+Halbausd. 1.2, 80       0 Fehler   0 Fehler
+Halbausd. 8.0, 80       0 Fehler   0 Fehler
+```
+
+### Ein Messwert, den ich NICHT erklären kann
+
+Während der Entwicklung gab dieselbe Konfiguration (ein Paar, Halbausdehnung 8.0)
+einmal `final y = 0.1194` bei `|v| = 0.207`, während die CPU-Kontrolle 0.5001
+sagte. Er ist **nicht reproduzierbar**: dieselbe Konfiguration liefert heute
+0.5000, und die einzige dazwischenliegende Kernel-Änderung — Wort 6 der Core-Daten
+von der Marge auf 0 — habe ich ausdrücklich gegengetestet und sie ändert nichts
+(der Standard-Margin ist ohnehin 0, PxConvexCoreGeometry.h:243). Ein veraltetes
+`.spv` scheidet aus: `SHADER_MODULE_DEPS` globt `pxgSlang*.slang` mit
+`CONFIGURE_DEPENDS`, jeder Shader baut also neu, wenn ein Include sich ändert.
+
+Ich schreibe das hin statt eine Ursache zu erfinden. Sollte der Wert
+wiederkommen, sind die Instrumente jetzt da, die ihn einkreisen: der
+Kontrollmodus und die beiden Knöpfe.
+
+### Zahlen
+
+Manifest **406/501**. Erreichbar-nicht-gemappt **27 → 26**.
+Suite **853/853 in beiden Speichermodi**. Szenen **46/46** (zwei neue).
+Vierzehn Prüfer grün, `check_block_coverage` bei 330 geprüften Kerneln, 0 zu kurz.
+
 ## P9.69b — die Zwölf-Punkte-Decke in der Convex-Core-Schicht, und ein Kernel, der NICHT ausgeliefert wird
 
 Vorarbeit für `convexCoreConvexNphase_Kernel`. Die Tranche liefert die

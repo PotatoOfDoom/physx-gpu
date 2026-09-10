@@ -532,6 +532,124 @@ void buildConvexCorePlaneScene(PxPhysics* physics, PxScene* scene, PxMaterial* m
     }
 }
 
+// PXG_SCENE=convexcorebox (P9.69c): eighty dynamic CONVEX CORE cylinders, each on
+// its OWN small static box.  The pair (eBOX, eCONVEXCORE) routes to
+// GPU_BUCKET_ID::eConvexCoreConvex (PxgNphaseImplementationContext.cpp gTable), i.e.
+// convexCoreConvexNphase_Kernel -- a different kernel from the plane scene's, on the
+// same cylinder, so the rest height is the same 0.5 and a disagreement is the
+// kernel's.
+//
+// EIGHTY SMALL BOXES AND NOT ONE BIG ONE, and PXG_CPU_CONTROL=1 is why.  The first
+// version put the whole row on a single 400 x 1 x 100 static box, and that scene
+// FAILS ON THE CPU PIPELINE TOO (98 checks, cylinders at y = -2.5).  The reason is
+// in the algorithm rather than in either port: Convex<Support>'s accuracy is
+// `max(maxExtent * 0.01, FLT_EPSILON)` (GuConvexSupport.h:49-59) and it is also the
+// GJK weld distance, so a 400 m box welds support points four metres apart and the
+// contact is meaningless.  Convex cores are meant for shapes of comparable size.
+// Asserting a rest height that PhysX itself does not produce would have been a
+// scene bug wearing a port bug's clothes.
+//
+// SLEEP OFF, for the reason P9.68 measured on the plane scene: the engine launches
+// this kernel with blockDim 512 and numBlocks = ceil(numTests/512)
+// (PxgNarrowphaseCore.cpp:917-921), the bridge forwards gridDim only, and a
+// [numthreads(64,1,1)] group without a covering loop would reach 64 of the pairs.
+// With sleeping on, settled bodies leave the pair list and the starved indices are
+// renumbered below the ceiling within a few frames -- the observation heals itself.
+void buildConvexCoreBoxScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                             std::vector<RestTarget>& targets)
+{
+    const float r = 0.5f, h = 1.0f;
+    PxConvexCoreGeometry geom(PxConvexCore::Cylinder(h, r));
+
+    // PXG_CVXCORE_COUNT reduces the row to N pairs (default 80).  80 is what makes
+    // the block-coverage divisor observable (see the header); a smaller N is for
+    // isolating a single pair when a result needs bisecting.
+    const char* countEnv = std::getenv("PXG_CVXCORE_COUNT");
+    const int PAIR_COUNT = countEnv ? PxMax(1, PxMin(80, atoi(countEnv))) : 80;
+    static char labels[80][40];
+    for (int i = 0; i < PAIR_COUNT; ++i)
+    {
+        const float x = float(i) * 3.0f;
+
+        // PXG_CVXCORE_GROUND overrides the box's half-extent (default 1.2).  It is
+        // here because the conditioning is the interesting variable, not a constant
+        // to be guessed: Convex<Support>'s accuracy IS the GJK weld distance and
+        // scales with the shape's extent, so this one number decides whether the
+        // pair is well conditioned.  See the header on why the row does not share
+        // one large ground.
+        static const float groundHalf = []() {
+            const char* e = std::getenv("PXG_CVXCORE_GROUND");
+            return e ? float(std::atof(e)) : 1.2f;
+        }();
+        PxRigidStatic* ground = physics->createRigidStatic(PxTransform(PxVec3(x, -0.5f, 0.0f)));
+        PxShape* gs = physics->createShape(PxBoxGeometry(groundHalf, 0.5f, groundHalf), *material);
+        ground->attachShape(*gs);
+        scene->addActor(*ground);
+
+        PxRigidDynamic* b = addDynamic(physics, scene, material, geom,
+                                       capsuleInertia(r, h * 0.5f, 1000.0f), 5.0f, x);
+        b->setSleepThreshold(0.0f);
+        b->setWakeCounter(1.0e9f);
+        std::snprintf(labels[i], sizeof(labels[i]), "convexCoreCylinderOnBox[%d]", i);
+        targets.push_back({ b, 5.0f, r, labels[i] });
+    }
+}
+
+// PXG_SCENE=convexcoremesh (P9.69c): a dynamic COOKED CONVEX MESH cube dropped onto
+// a STATIC CONVEX CORE box.  The pair (eCONVEXCORE, eCONVEXMESH) routes to
+// GPU_BUCKET_ID::eConvexCoreConvex, and it is the only scene that takes
+// Gu::makeConvexShape's ePOINTS arm -- the one the twelve-float4 pool made
+// unwritable before P9.69b, because a cooked hull carries up to 255 points and lives
+// in device memory.
+//
+// THE FIRST VERSION OF THIS SCENE HAD IT THE OTHER WAY ROUND and was wrong, which
+// only PXG_CPU_CONTROL=1 could show: a convex core cylinder dropped on a STATIC
+// cooked hull falls straight through on the CPU pipeline too (final y = -73.807,
+// identical to the GPU), so that configuration is not something PhysX collides and
+// the scene was asserting something untrue.  A scene whose CPU control fails is a
+// broken scene, not a broken port -- and telling those two apart is exactly what the
+// control mode exists for.
+void buildConvexCoreMeshScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                              std::vector<RestTarget>& targets)
+{
+    // The static ground is a CONVEX CORE box, 16 x 1 x 16, top face at y = 0.
+    PxRigidStatic* ground = physics->createRigidStatic(PxTransform(PxVec3(0.0f, -0.5f, 0.0f)));
+    PxShape* gs = physics->createShape(
+        PxConvexCoreGeometry(PxConvexCore::Box(PxVec3(16.0f, 1.0f, 16.0f))), *material);
+    ground->attachShape(*gs);
+    scene->addActor(*ground);
+
+    // The faller is the cooked hull, so the ePOINTS arm is the DYNAMIC side.
+    static const PxVec3 cubeVerts[8] = {
+        PxVec3(-0.5f, -0.5f, -0.5f), PxVec3(-0.5f, -0.5f, 0.5f),
+        PxVec3(-0.5f, 0.5f, -0.5f),  PxVec3(-0.5f, 0.5f, 0.5f),
+        PxVec3(0.5f, -0.5f, -0.5f),  PxVec3(0.5f, -0.5f, 0.5f),
+        PxVec3(0.5f, 0.5f, -0.5f),   PxVec3(0.5f, 0.5f, 0.5f),
+    };
+    PxCookingParams cp(physics->getTolerancesScale());
+    cp.buildGPUData = true;
+    PxConvexMeshDesc desc;
+    desc.points.count = 8;
+    desc.points.stride = sizeof(PxVec3);
+    desc.points.data = cubeVerts;
+    desc.flags = PxConvexFlag::eCOMPUTE_CONVEX;
+    PxConvexMeshCookingResult::Enum cond = PxConvexMeshCookingResult::eSUCCESS;
+    PxConvexMesh* mesh = immediateCooking::createConvexMesh(
+        cp, desc, physics->getPhysicsInsertionCallback(), &cond);
+    if (!mesh)
+    {
+        std::printf("FAIL: runtime convex cooking failed (result %d)\n", int(cond));
+        return; // targets stays empty; main() hard-fails on that
+    }
+    std::printf("  cooked convex cube: %u verts, %u polygons (GPU-compatible: %s)\n",
+                mesh->getNbVertices(), mesh->getNbPolygons(),
+                mesh->isGpuCompatible() ? "yes" : "NO");
+
+    PxRigidDynamic* b = addDynamic(physics, scene, material, PxConvexMeshGeometry(mesh),
+                                   boxInertia(PxVec3(0.5f), 1000.0f), 5.0f);
+    targets.push_back({ b, 5.0f, 0.5f, "cookedHullOnConvexCoreBox" });
+}
+
 // PXG_SCENE=spheremesh / capsulemesh (P9.66): a dynamic SPHERE, and a dynamic
 // CAPSULE, dropped onto the same cooked triangle-mesh floor buildMeshFloorScene
 // uses.  The floor is identical; only the falling shape's type changes, and that
@@ -4783,9 +4901,30 @@ int main()
     sceneDesc.gravity = PxVec3(0.0f, -9.81f, 0.0f);
     sceneDesc.cpuDispatcher = &dispatcher;
     sceneDesc.filterShader = stepFilterShader;
+    // PXG_CPU_CONTROL=1 builds THE SAME SCENE on the CPU pipeline (P9.69c).
+    //
+    // It exists because a failing scene has two possible readings and the harness
+    // could not tell them apart: either the GPU port computes the wrong contacts,
+    // or the rest height the scene ASSERTS is not what PhysX itself produces for
+    // that shape pair.  P9.69b's convex-core-on-a-box scene is exactly that
+    // question -- the cylinder settles 0.38 low, and whether that is a defect
+    // depends on what the CPU narrowphase does with the same geometry.
+    //
+    // This is a DIAGNOSTIC, not a scored mode, and it is the same shape as
+    // PXG_PARTICLE_FLUID_CONTROL: it is reported and never counted.  The scene
+    // still gets its cudaContextManager so construction is identical; only the
+    // dynamics and broadphase move back to the CPU.
+    const bool cpuControl = std::getenv("PXG_CPU_CONTROL") != nullptr;
     sceneDesc.cudaContextManager = cudaCtx;
-    sceneDesc.flags |= PxSceneFlag::eENABLE_GPU_DYNAMICS;
-    sceneDesc.broadPhaseType = PxBroadPhaseType::eGPU;
+    if (!cpuControl)
+    {
+        sceneDesc.flags |= PxSceneFlag::eENABLE_GPU_DYNAMICS;
+        sceneDesc.broadPhaseType = PxBroadPhaseType::eGPU;
+    }
+    else
+    {
+        std::printf("  [ control ] PXG_CPU_CONTROL=1: the CPU pipeline, for reference only\n");
+    }
     // PXG_SOLVER=pgs switches the scene to the PGS solver (default TGS): the two
     // GPU solver paths launch DIFFERENT kernel sets (PxgCudaSolverCore vs
     // PxgTGSCudaSolverCore), so each scene can be proven on either.
@@ -7364,6 +7503,8 @@ int main()
     else if (!std::strcmp(sceneName, "spheremesh")) buildSphereMeshScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "capsulemesh")) buildCapsuleMeshScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "convexcoreplane")) buildConvexCorePlaneScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "convexcorebox")) buildConvexCoreBoxScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "convexcoremesh")) buildConvexCoreMeshScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "hffloor")) buildHfFloorScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "spherehf")) buildSphereHfScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "hfbigbox")) buildHfBigBoxScene(physics, scene, material, targets);

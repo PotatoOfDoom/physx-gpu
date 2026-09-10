@@ -1464,6 +1464,10 @@ static const PxgKernelAbiRow kRows[] = {
     // NOT the convex-plane row, which is 144 -- that kernel also takes
     // cmPersistentManifolds and toleranceLength, and this one takes neither.
     { "convexCorePlaneNphase_Kernel", kCvxCorePlane, uint32_t(sizeof(kCvxCorePlane)) },
+    // P9.69c: convexCoreConvexNphase_Kernel takes the SAME eighteen arguments in the
+    // same order (convexCoreCollision.cu:497-516 vs :449-468); the two launch sites
+    // differ only in the block size.  Sharing the row keeps them from drifting.
+    { "convexCoreConvexNphase_Kernel", kCvxCorePlane, uint32_t(sizeof(kCvxCorePlane)) },
     { "sortTriangleIndices", kSortTriIndices, uint32_t(sizeof(kSortTriIndices)) },
     { "convexTrimeshPostProcess", kCvxTriPostProcess, uint32_t(sizeof(kCvxTriPostProcess)) },
     // P9.51c: convexHeightfieldPostProcess (convexMeshPostProcess.cu:585-593)
