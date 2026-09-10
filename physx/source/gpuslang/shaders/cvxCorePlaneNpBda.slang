@@ -91,9 +91,34 @@
 // serially in npCvxPlaneNphase (a mask and a loop, not warp primitives), which is
 // why it transplants rather than needing rework.
 //
-// NO GRID-STRIDE LOOP, and that is faithful: the body is a single
-// `if (testIndex >= numTests) return;` guard (:473-474) with no loop at all, and
-// the host launch covers numTests exactly.
+// THE CUDA HAS NO GRID-STRIDE LOOP.  THE PORT NEEDS ONE ANYWAY (P9.68).
+//
+// The CUDA body really is a single `if (testIndex >= numTests) return;` guard
+// (:473-474) with no loop, and reading only the .cu that reads as "the host
+// launch covers numTests exactly, so a flat port is faithful".  It is not,
+// and the reason is one the .cu cannot show:
+//
+//     host   (PxgNarrowphaseCore.cpp:848-852)
+//              numThreadsPerBlock = 1024
+//              numBlocks          = ceil(numTests / 1024)
+//     bridge (PxgVulkanCudaContext::launchKernel)
+//              forwards gridDim ONLY -- blockDim's parameter names are
+//              commented out -- so numBlocks becomes the workgroup count and
+//              THE SLANG numthreads IS THE BLOCK SIZE.
+//     result   ceil(numTests/1024) * 64 threads, i.e. one sixteenth of the
+//              tests, on EVERY call.  Not a ceiling past which work is lost:
+//              15/16 of the pairs are dropped at any scene size above 64.
+//
+// This is the P9.61 defect verbatim -- zeroNormals/normalizeNormals declared
+// 256 against a host block of 1024 and reached a quarter of the guide vertices
+// forever.  The first version of this shader had it and shipped, because the
+// convexcoreplane scene has ONE pair and no fixture can see a divisor.
+// tools/check_block_coverage.py is the FOURTEENTH checker and exists so that
+// the next one fails at the build instead of at a scene nobody wrote.
+//
+// The stride is the port's own, never the CUDA's: `WorkgroupCount().x * BLOCK`
+// is the number of threads ACTUALLY launched, so it covers whatever the host
+// meant by its own divisor.  `gridDim.x * blockDim.x` has no spelling here.
 //
 // ===========================================================================
 // THE ABI ROW IS ITS OWN -- 136 BYTES, NOT THE CONVEX-PLANE 144
@@ -111,6 +136,12 @@ import pxgSlangNpAbi;           // the struct mirrors and quaternion helpers
 import pxgSlangCvxCoreShape;    // P9.67b: ShapeRef / supportLocalQ / contactFaceQ
 
 static const uint INVALID = 0xFFFFFFFFu;
+
+// The group size, named once so the stride below cannot drift from the
+// [numthreads] that produced it.  Its VALUE is this port's choice; what makes
+// the kernel correct is the stride derived from it, not agreement with the
+// engine's 1024 (see the header).
+static const uint CVXCORE_PLANE_BLOCK = 64u;
 
 // P9.57: FROM THE ENGINE ENUM's numbering, never a remembered literal.
 // tools/check_geom_type_constants.py reads PxGeometry.h and checks these.
@@ -248,15 +279,12 @@ bool makeConvexShape(PxgShapeGpu s, float4 poseQ, float3 poseP,
 // ---------------------------------------------------------------------------
 // the kernel
 // ---------------------------------------------------------------------------
-[shader("compute")]
-[numthreads(64, 1, 1)]
-void convexCorePlaneNphase_Kernel(uint3 dtid : SV_DispatchThreadID)
+// The per-test body, lifted out of the entry point so the covering loop above it
+// stays a two-liner and the single CUDA `return` guard needs no rewriting into a
+// `continue`.  check_grid_stride.py follows one level of same-file helper calls,
+// which is what makes this shape readable to it as well as to a person.
+void convexCorePlaneOneTest(uint testIndex)
 {
-    // `threadIndex / 1; // 1 tread per test` (:470-471), upstream's typo kept.
-    const uint testIndex = dtid.x;
-    if (testIndex >= gParams.numTests)
-        return;
-
     // ---- TestInput (:66-96) + checkTypes (:98-108) --------------------------
     Ptr<PxgContactManagerInputGpu> cmInputsP = Ptr<PxgContactManagerInputGpu>(gParams.cmInputs);
     const PxgContactManagerInputGpu cin = cmInputsP[testIndex];
@@ -519,4 +547,17 @@ void convexCorePlaneNphase_Kernel(uint3 dtid : SV_DispatchThreadID)
         patchBase[12] = (mi0 & 0xFFFFu) << 16u;
         patchBase[13] = (mi1 & 0xFFFFu);
     }
+}
+
+// The engine's block is 1024 and this group is CVXCORE_PLANE_BLOCK, so the loop
+// runs 1024/BLOCK times per test batch; at the sizes the scenes reach it runs
+// once and costs a compare.  `threadIndex / 1; // 1 tread per test` (:470-471) --
+// upstream's typo kept -- is why the index is the flat thread id and not a warp.
+[shader("compute")]
+[numthreads(CVXCORE_PLANE_BLOCK, 1, 1)]
+void convexCorePlaneNphase_Kernel(uint3 dtid : SV_DispatchThreadID)
+{
+    const uint stride = WorkgroupCount().x * CVXCORE_PLANE_BLOCK;
+    for (uint testIndex = dtid.x; testIndex < gParams.numTests; testIndex += stride)
+        convexCorePlaneOneTest(testIndex);
 }

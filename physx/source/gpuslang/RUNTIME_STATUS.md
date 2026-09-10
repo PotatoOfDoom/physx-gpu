@@ -1865,6 +1865,161 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.68 — der VIERZEHNTE Prüfer: der Port erreichte ein Sechzehntel der Arbeit, und nichts sagte es
+
+P9.67c hat einen Defekt ausgeliefert. Suite grün in beiden Modi, 44/44 Szenen, dreizehn
+Prüfer grün, der Zylinder ruhte bei 0.5000 — und `convexCorePlaneNphase_Kernel` bearbeitete
+**ein Sechzehntel seiner Paare**. Nicht jenseits einer Decke. Immer.
+
+### Die Rechnung steht nicht im Kernel, sondern zwischen zwei Blockgrößen
+
+`PxgVulkanCudaContext::launchKernel` nimmt
+
+    unsigned int /*blockDimX*/, unsigned int /*blockDimY*/, unsigned int /*blockDimZ*/
+
+— die Namen sind auskommentiert — und reicht ausschließlich `gridDim` an `vkCmdDispatch`
+durch. Damit gilt auf diesem Port: **das CUDA-Gitter wird wörtlich zur Workgroup-Zahl, die
+CUDA-`blockDim` wird verworfen, und das Slang-`[numthreads]` IST die Blockgröße.**
+
+Die Startstelle (PxgNarrowphaseCore.cpp:848-852) rechnet ihr Gitter aus ihrem Block:
+
+    numThreadsPerBlock = 1024
+    numBlocks          = ceil(numTests / 1024)
+
+Der Shader deklarierte `[numthreads(64,1,1)]`. Also:
+
+    erreicht: ceil(n/1024) * 64  =  n/16
+
+Das ist wortwörtlich der Defekt aus **P9.61** — `zeroNormals`/`normalizeNormals`
+deklarierten 256 gegen einen Host-Block von 1024 und erreichten bei jedem Aufruf ein
+Viertel der Guide-Vertices. Derselbe Fehler, drei Tranchen später, von mir selbst.
+
+### Warum keiner der dreizehn Prüfer ihn sah
+
+`check_grid_stride.py` feuert nur, wenn **die CUDA selbst** eine Grid-Stride-Schleife trägt.
+Diese CUDA hat keine — sie braucht keine, ihr Block ist breit genug. Der Defekt lebt
+vollständig im Abstand der beiden Blockgrößen, und das ist eine Tatsache über die
+**Startstelle**, nicht über einen der beiden Rümpfe. `check_fixture_grid.py` prüft Fixtures
+gegen ein FESTES `PxgKernelGridDim`; dieses Gitter ist gerechnet, nicht fest.
+
+### Warum die Szene ihn nicht sah, zweimal nicht
+
+`PXG_SCENE=convexcoreplane` hatte **einen** Zylinder. Test 0 liegt innerhalb jeder Decke.
+
+Die Szene auf 80 Zylinder zu verbreitern reichte immer noch nicht — und das ist der
+interessante Teil. Der Trace sagt:
+
+```
+39 [pxg-arg0] convexCorePlaneNphase_Kernel arg0=80     grid=(1,1,1)
+ 1 [pxg-arg0] convexCorePlaneNphase_Kernel arg0=53     grid=(1,1,1)
+73 [pxg-arg0] convexCorePlaneNphase_Kernel arg0=16     grid=(1,1,1)
+```
+
+`numTests` erreicht 80 bei einem Gitter von 1 — also bleiben 16 Tests unbearbeitet. Trotzdem
+kamen alle 80 zur Ruhe: sobald die ersten Körper einschlafen, verlassen ihre Paare die Liste,
+`numTests` wandert 80 → 53 → 16, und **jeder bei Index ≥ 64 ausgehungerte Körper wird binnen
+weniger Frames unter die Decke umnummeriert** und holt seine Kontakte dort. Die Beobachtung
+heilte sich selbst weg.
+
+Erst mit `setSleepThreshold(0)` + `setWakeCounter(1e9)` bleibt die Paarzahl eingefroren,
+dieselben 16 Indizes bleiben 240 Schritte lang ausgehungert — und dann:
+
+```
+FAIL: [convexCoreCylinderOnPlane[14]] below rest band / sank (finalY=-73.807)
+FAIL: [convexCoreCylinderOnPlane[14]] not at rest (|v|=39.240)
+[ PARTIAL ] 32 step check(s) failed
+```
+
+**32 Fehlprüfungen = 16 Körper × 2, exakt 80 − 64.** Mit der Schleife: 0.
+
+### Die Korrektur, und warum die Schrittweite die eigene ist
+
+Der Rumpf wandert in `convexCorePlaneOneTest(uint testIndex)`, der Einstieg wird zwei Zeilen:
+
+```slang
+const uint stride = WorkgroupCount().x * CVXCORE_PLANE_BLOCK;
+for (uint testIndex = dtid.x; testIndex < gParams.numTests; testIndex += stride)
+    convexCorePlaneOneTest(testIndex);
+```
+
+`gridDim.x * blockDim.x` wörtlich zu reproduzieren ist hier unmöglich *und* falsch (P9.60b):
+die Brücke reicht `blockDim` nicht durch, und die Zahl, die der Host annahm, ist ohnehin
+die falsche. `WorkgroupCount().x * BLOCK` ist die **tatsächlich gestartete** Threadzahl.
+Der Shader ist ein BDA-Shader und war nie in `PXG_HLSL_ENTRIES` (`Ptr<>` überall), also
+kostet `WorkgroupCount()` hier nichts.
+
+### Der Prüfer, und die vier Ausnahmen, die er sich verdienen musste
+
+`tools/check_block_coverage.py`: für jede GEMAPPTE Zeile mit Startstelle wird die
+`blockDim` der Startstelle gegen das `[numthreads]` gehalten. Kürzer ist ein Befund —
+außer bei einer von vier Bedingungen:
+
+1. **das Gitter ist nicht aus dem Block gerechnet.** `numBlocks = nbActiveSoftBodies` ist
+   ein Block pro Objekt; dort ist die Gruppenbreite Parallelität, nicht Abdeckung.
+   `softBodyRefitBda.slang:246` sagt es selbst („one warp per group here → warpIndex == 0,
+   stride 1").
+2. **der Port schreitet** (`check_grid_stride.slang_covers`).
+3. **der Port teilt den Block seriell auf**, `slangThreads * Trip ≥ cudaBlock`:
+   `for (uint sub = 0u; sub < MIDPHASE_WARPS_PER_BLOCK; ++sub)` mit
+   `cmIdx = gid.x * MIDPHASE_WARPS_PER_BLOCK + sub`. Beide Hälften werden verlangt, sonst
+   spräche eine beliebige innere Schleife über vier Vertices den Kernel frei.
+4. die Gruppe ist ohnehin ≥ dem Block.
+
+**Die Befundzahl ging 35 → 14 → 7 → 0**, und jeder Schritt war eine gelesene
+Falschbefund-Form, keine gelockerte Schwelle. Das ist P9.60b als Verfahren: ein bloß
+plausibler Marker erzeugt eine Liste, die überwiegend Rauschen ist — und eine Liste, die
+überwiegend Rauschen ist, wird geglaubt.
+
+### Vier Fehler im Prüfer, die jeweils eine echte Zahl verfälschten
+
+* **`numThreadsPerBlock` dateiweit aufgelöst.** Der Name ist in `PxgNarrowphaseCore.cpp`
+  dutzendfach mit verschiedenen Werten deklariert. Eine dateiweite Symboltabelle las den
+  falschen und meldete 35 Befunde, von denen 31 meine eigene Arithmetik waren. Jetzt gilt
+  die **nächstvorherige** Deklaration.
+* **`rstrip("uUlL")`** — gedacht für Integer-Suffixe, verstümmelt aber jeden Enum-Namen, der
+  auf `L` endet: `RIGID_DYNAMIC_GET_LINVEL`, `CLOTH_SOLVESHELL`, `INTEGRATE_CORE_PARALLEL`.
+  14 Startstellen blieben unauflösbar und sahen aus wie eine Lücke in den Headern.
+* **Paarung über Nähe.** `check_fixture_grid.py` paart über den nächstvorherigen
+  `getCuFunction` und warnt selbst, dass das eine Heuristik ist; hier erzeugte es einen
+  Falschbefund. `PxgNarrowphaseCore.cpp` holt beide Convex-Convex-Stufen, bevor es eine
+  startet, also paarte der Stage-1-Start mit dem Stage-2-Kernel und meldete dessen Block von
+  128 gegen einen Shader, der Stufe 2 mit 32 korrekt trifft. Jetzt wird über den
+  **Funktionsvariablennamen** gepaart.
+* **Der Name verschwindet beim Expandieren.** `numBlocks` vollständig zu expandieren macht
+  aus `numThreadsPerBlock` eine `1024` — und ein Test, der den Bezeichner im fertigen String
+  sucht, findet nichts. **So bestand der Prüfer genau den Defekt, für den er geschrieben
+  wurde.** Jetzt werden die beim Expandieren berührten NAMEN mitgeführt.
+
+Der Selbsttest ist deshalb Teil der Tranche: mit dem ausgelieferten flachen Shader meldet
+der Prüfer `convexCorePlaneNphase_Kernel … engine block 1024, group 64 → reaches 1/16 of the
+work`; mit der Schleife schweigt er.
+
+### Was er ausdrücklich NICHT entscheidet
+
+* **Threads sind ein Stellvertreter für Arbeitsposten, nicht die Sache selbst.** Ein Port,
+  der die Threads-pro-Posten ändert, könnte mit weniger Threads mehr Posten decken. Kein
+  solcher Fall steht heute im Baum; käme einer, gehört er mit geschriebenem Grund auf die
+  Ratsche, nicht als stille Ausnahme in den Code.
+* **Startstellen mit FESTEM Gitter sind eine andere Klasse.** Dort deckt CUDA
+  `grid*cudaBlock` und der Port `grid*slangThreads`, und der Port braucht eine Schleife mit
+  **seiner eigenen** Threadzahl. Das ist `check_grid_stride.py`s Gebiet, das selbst sagt,
+  dass es fehlende Schleifen findet und nicht falsche. Die beiden Cloth-Vertex-Kontaktgens
+  auf dessen Ratsche (Block 256, festes Gitter 512, `[numthreads(32,1,1)]`) gehören dorthin.
+* **`#if 0` wird übersprungen.** `ps_applyDeltaLaunch`s einzige Startstelle mit Block 256
+  steht in `#if 0` (PxgPBDParticleSystemCore.cpp:757-776); die lebende
+  (PxgParticleSystemCore.cpp:1519) benutzt 64 und trifft den Shader exakt. Ohne diese
+  Ausblendung ein Falschbefund.
+
+### Zahlen
+
+**329 gemappte Kernel mit auflösbarer Startstelle geprüft, 0 unauflösbar, 0 zu kurz.**
+Die Ratsche `block_coverage_known.txt` ist **leer** — der stärkste erreichbare Zustand:
+es gibt nichts zu diskutieren, und das nächste Vorkommen fällt an dem Tag durch, an dem
+es geschrieben wird.
+
+Suite **853/853 in beiden Speichermodi** (852 → 853: `gpuslang.blockCoverage`).
+Szenen 44/44. Manifest 405/501. Vierzehn Prüfer grün.
+
 ## P9.67c — `convexCorePlaneNphase_Kernel` gemappt: von −73.807 auf 0.5000
 
 Der erste der fünf convexCore-Kernel. Die in P9.67a gebaute Szene misst jetzt:
@@ -1921,6 +2076,14 @@ der Grund, hier exakt statt ungefähr zu sein: eine falsche ABI-Zeile ergibt
 Fixtures, grünem Manifest-Test, grüner Suite und grünen Szenen.
 
 ### Kein Grid-Stride-Loop, und das ist treu
+
+> **FALSCH. Widerrufen in P9.68.** Der Satz „der Host-Start deckt `numTests` exakt"
+> stimmt für die CUDA und für niemanden sonst: der Host rechnet
+> `numBlocks = ceil(numTests / 1024)`, die Brücke verwirft `blockDim`, und
+> `[numthreads(64,1,1)]` erreichte damit **ein Sechzehntel der Paare — immer**.
+> Gemessen an 80 schlaflosen Zylindern: 16 fielen durch die Ebene, `finalY = −73.807`.
+> Der Port braucht die Schleife *gerade weil* er ein Port ist. Siehe P9.68 und
+> `tools/check_block_coverage.py`.
 
 Der Rumpf ist eine einzige `if (testIndex >= numTests) return;`-Wache ohne jede
 Schleife, und der Host-Start deckt `numTests` exakt. Ein Port, der hier eine

@@ -466,20 +466,30 @@ void buildCapsuleScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
     targets.push_back({ b, 5.0f, r, "capsuleOnPlane" }); // rests on its side at centre y = radius
 }
 
-// PXG_SCENE=convexcoreplane (P9.67): a dynamic CONVEX CORE cylinder resting on the
-// same static infinite PxPlaneGeometry buildPlaneScene uses.  Geometrically this is
-// PXG_SCENE=capsule -- the cylinder's axis is the local X axis
+// PXG_SCENE=convexcoreplane (P9.67): a ROW of dynamic CONVEX CORE cylinders resting
+// on the same static infinite PxPlaneGeometry buildPlaneScene uses.  Geometrically
+// each one is PXG_SCENE=capsule -- the cylinder's axis is the local X axis
 // (PxConvexCoreGeometry.h:164-166), so it lies on its side and rests at centre
 // y = radius, exactly as the capsule does -- and that is the point: the same rest
 // height reached through a DIFFERENT narrowphase kernel.
 //
-// *** THIS SCENE IS EXPECTED TO FAIL UNTIL convexCorePlaneNphase_Kernel IS MAPPED. ***
 // PxConvexCoreGeometry is ordinary public API and Gu::isGPUCompatible accepts every
 // core type (GuConvexGeometry.cpp:335-353), so unlike the isosurface family of P9.65
-// this path IS constructible here -- it simply has no scene.  Five of the twelve
+// this path IS constructible here -- it simply had no scene.  Five of the twelve
 // engine-reachable narrowphase kernels are the convexCore family, and they are
 // reachable only through a shape an application explicitly creates: nothing in the
-// engine synthesises an eCONVEXCORE shape, so no existing scene routes to them.
+// engine synthesises an eCONVEXCORE shape, so no existing scene routed to them.
+//
+// WHY A ROW AND NOT ONE CYLINDER (P9.68).  The scene shipped with a single body and
+// that single body is why a real defect passed it.  The engine launches
+// convexCorePlaneNphase_Kernel with blockDim 1024 and numBlocks = ceil(numTests/1024)
+// (PxgNarrowphaseCore.cpp:848-852); the bridge forwards gridDim ONLY, so the Slang
+// [numthreads] IS the block size and a 64-wide group reached ONE SIXTEENTH of the
+// tests.  With one pair that is invisible -- test 0 is inside every ceiling there is.
+// PAIR_COUNT is deliberately above the port's 64-thread group so the divisor is
+// observed: with the loop missing, the pairs past 64 get no contacts at all and fall
+// through the plane, which is the same evidence P9.58 produced for the convex
+// heightfield core (final y = -70.8, still accelerating).
 void buildConvexCorePlaneScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
                                std::vector<RestTarget>& targets)
 {
@@ -491,11 +501,35 @@ void buildConvexCorePlaneScene(PxPhysics* physics, PxScene* scene, PxMaterial* m
     const float r = 0.5f, h = 1.0f;
     // A cylinder core with zero margin: the core IS the shape.
     PxConvexCoreGeometry geom(PxConvexCore::Cylinder(h, r));
-    // The inertia only has to be positive-definite for a body that comes to rest;
-    // the capsule scene uses the same reasoning (see capsuleInertia).
-    PxRigidDynamic* b = addDynamic(physics, scene, material, geom,
-                                   capsuleInertia(r, h * 0.5f, 1000.0f), 5.0f);
-    targets.push_back({ b, 5.0f, r, "convexCoreCylinderOnPlane" });
+
+    // 80 > 64, so tests 64..79 are exactly the ones an ungrided port drops.  The
+    // labels need storage that outlives this function because RestTarget holds a
+    // const char*; a function-local static array is the cheapest thing that does.
+    const int PAIR_COUNT = 80;
+    static char labels[80][40];
+    for (int i = 0; i < PAIR_COUNT; ++i)
+    {
+        // The inertia only has to be positive-definite for a body that comes to rest;
+        // the capsule scene uses the same reasoning (see capsuleInertia).
+        PxRigidDynamic* b = addDynamic(physics, scene, material, geom,
+                                       capsuleInertia(r, h * 0.5f, 1000.0f), 5.0f,
+                                       float(i) * 3.0f);
+
+        // SLEEP OFF, and this is the half of the observation that took a measurement
+        // to find.  The row alone does NOT discriminate: with sleeping on, bodies
+        // that settle leave the pair list, `numTests` walks 80 -> 53 -> 16, and every
+        // body that was starved at index >= 64 is renumbered below the ceiling within
+        // a few frames and picks up its contacts there.  The traced counts were
+        // 39 launches at numTests=80, one at 53, 73 at 16 -- all at grid=(1,1,1) --
+        // and the defective shader still brought all 80 to rest.  Freezing the pair
+        // count keeps the same 16 indices starved for all 240 steps, which is what
+        // makes the failure survive to the final check.
+        b->setSleepThreshold(0.0f);
+        b->setWakeCounter(1.0e9f);
+
+        std::snprintf(labels[i], sizeof(labels[i]), "convexCoreCylinderOnPlane[%d]", i);
+        targets.push_back({ b, 5.0f, r, labels[i] });
+    }
 }
 
 // PXG_SCENE=spheremesh / capsulemesh (P9.66): a dynamic SPHERE, and a dynamic

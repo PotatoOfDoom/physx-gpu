@@ -2695,3 +2695,22 @@ add_test(NAME gpuslang.fixtureGrid
 # features into the engine fails the build instead of silently invalidating the plan.
 add_test(NAME gpuslang.unmappedReachability
     COMMAND python3 ${GPUSLANG_ROOT}/tools/check_unmapped_reachability.py)
+
+# FOURTEENTH static checker (P9.68), and the class gridStride structurally cannot see.
+# gridStride fires only when the CUDA ITSELF carries a grid-stride loop.  This one is
+# about the gap between the two BLOCK sizes: the bridge forwards gridDim and DROPS
+# blockDim, so on a launch site that writes `numBlocks = ceil(n / numThreadsPerBlock)`
+# the Slang [numthreads] IS the block, and a narrower group reaches
+# slangThreads/cudaBlock of the work -- a fixed FRACTION, on every call, at every
+# scene size, with no CUDA loop missing anywhere.
+# It has happened twice: P9.61's zeroNormals/normalizeNormals (a quarter of the guide
+# vertices, forever) and P9.67c's convexCorePlaneNphase_Kernel (one sixteenth of the
+# pairs), both found by hand and by accident.  P9.68 measured the second by widening
+# PXG_SCENE=convexcoreplane to 80 sleepless cylinders: exactly 16 fell through the
+# plane, 32 failed checks, 0 after the loop.
+# Four separate PASS conditions exist because the check without each of them reported
+# ports that DO cover their work (35 -> 14 -> 7 -> 0 across four readings): a grid not
+# sized from the block, a covering stride, and a serial partition of the block are all
+# legitimate.  The known list is a RATCHET and is currently EMPTY.
+add_test(NAME gpuslang.blockCoverage
+    COMMAND python3 ${GPUSLANG_ROOT}/tools/check_block_coverage.py)

@@ -1,0 +1,34 @@
+# block_coverage_known.txt -- the kernels whose Slang group is NARROWER than the
+# engine block that sized the grid, and which carry no covering construct.  Read by
+# tools/check_block_coverage.py.
+#
+# THE LIST IS EMPTY, AND THAT IS THE POINT.
+#
+# The bridge forwards gridDim and drops blockDim, so on a launch site that writes
+# `numBlocks = ceil(n / numThreadsPerBlock)` the Slang [numthreads] IS the block size.
+# A narrower group reaches slangThreads/cudaBlock of the work -- not a tail past a
+# ceiling, a fixed FRACTION, on every call, at every scene size.
+#
+# It has happened twice:
+#
+#   P9.61  zeroNormals / normalizeNormals: [numthreads(256,1,1)] against a host block
+#          of 1024.  A QUARTER of the guide vertices zeroed and normalised, forever.
+#          1820 mismatches once the fixture used the engine divisor and meshes above
+#          one group.
+#
+#   P9.67c convexCorePlaneNphase_Kernel: [numthreads(64,1,1)] against a host block of
+#          1024.  ONE SIXTEENTH of the pairs.  Measured in P9.68 by widening
+#          PXG_SCENE=convexcoreplane to 80 cylinders with sleeping disabled: exactly
+#          16 of them fell through the plane (final y = -73.807, |v| = 39.240, 32
+#          failed checks).  With the covering loop, 0.
+#
+# Both were found by hand, late, and by accident.  This file exists so the third one
+# is found by the build.
+#
+# A NEW short port fails the check by name.  A name left here after its port is fixed
+# ALSO fails it -- a stale allowlist is how a ratchet quietly stops ratcheting.
+#
+# Adding a name here is not a permission slip.  It is a claim that the shortfall has
+# been read at its launch site and at both bodies, and the reason belongs in the
+# comment above the name.  There is nothing below this line, and the goal is that
+# there never is.
