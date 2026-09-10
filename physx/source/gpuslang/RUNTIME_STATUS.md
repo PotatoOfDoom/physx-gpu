@@ -1865,6 +1865,88 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.70a — der Akkumulator herausgelöst, und eine Zahl, die ich fast geglaubt hätte
+
+Vorarbeit für `convexCoreTrimeshNphase_Kernel32`. Zwei Befunde, und der zweite ist
+der wertvollere.
+
+### Befund 1: mein Zuschnitt war falsch, weil ich aus der CUDA geplant habe
+
+Ich hatte P9.70 als **dreiteilige Portierung** angelegt: `Gu::Contact`/`Contact32`,
+`TrimeshBvh`, dann der Kernel. Die Inventur des eigenen Korpus sagt etwas anderes:
+
+| als „fehlend" angesetzt | tatsächlich |
+|---|---|
+| `Gu::Contact` | `npCvxCoreContact.slang` + Fixture |
+| `Gu::Contact32` (warp-kooperativ) | `npCvxCoreWarpAcc.slang` + Fixture |
+| zweite `writeOutput`-Überladung | `npCvxCoreOut.slang` trägt **beide** |
+| `TrimeshBvh` / `createConvex` | `npCvxBvhGlue.slang` + Fixture |
+| BV32-Traversierung | seit P8.25, fünf BDA-Shader nutzen sie |
+
+**Alles war schon da.** Das ist die P9.65-Lehre in anderer Tonart: dort hieß sie
+*frag nach Lebendigkeit, bevor du portierst*, hier *frag nach Bestand, bevor du
+zuschneidest*. Beide Male ist der Fehler derselbe — aus der Quelle planen statt aus
+dem, was schon steht.
+
+`convexCoreTrimeshNphase_Kernel32` ist damit eine **Montage** wie P9.69c, keine
+Portierung. Zwei Aufgaben wurden zurückgezogen, statt sie stillschweigend
+umzuwidmen.
+
+### Die Strukturfrage, die echt bleibt
+
+Die CUDA fährt **einen Warp pro Test**: die BVH-Traversierung ist warp-kooperativ,
+ihr Callback ruft den warp-kooperativen Akkumulator. Der bestehende Slang-Port von
+`Contact32` emuliert dagegen **alle 32 Lanes seriell in einem Thread** über
+explizite 32-Bit-Masken — mit den CUDA-Tie-Konventionen (`minIndexQ`/`maxIndexQ`
+liefern den NIEDRIGSTEN Lane-Index des Extremums).
+
+Das passt besser zusammen, als es klingt, weil die CUDA selbst so gebaut ist:
+`copyPoints` stagt erst nach `newPoints[WARP_SIZE * MAX_CONVEX_CONTACTS]`, bevor die
+Reduktion beginnt. Ein Engine-Kernel erzeugt Kontakte lane-parallel, stagt sie, und
+lässt **einen** Thread akkumulieren.
+
+`pxgSlangCvxCoreAcc.slang` macht daraus eine Funktion mit flachen Lane-Arrays —
+die Form, die der Kernel aus `groupshared` füllen kann. Der Zustand
+(`mNumPatches`, `mNumPoints`, `patchNormal`, `patchCount`, `mPoints`) gehört dem
+Aufrufer und akkumuliert über beliebig viele Aufrufe.
+
+### Befund 2: eine 13,5-fache Verlangsamung, die keine war
+
+Der erste Lauf der umgebauten Fixture: **17,71 s**. Vorher: **1,31 s**. Faktor 13,5.
+Die Erklärung lag nahe und war überzeugend — `float4 lanePts[128]` als Wertparameter
+sind 2 KB Kopie pro Aufruf, und der Engine-Kernel ruft das pro BVH-Bündel. Ich war
+im Begriff, die Schnittstelle auf `groupshared`-Staging umzubauen, um sie zu retten.
+
+Dreimal nachgemessen:
+
+```
+Original (inline):    0.89 s   0.92 s   0.91 s
+Extrahiert (Params):  1.02 s   1.00 s   1.01 s
+```
+
+**Rund 10 %.** Die 17,71 s waren ein Kaltstart — Pipeline-Cache und llvmpipe-JIT.
+Die Zahl, die den Umbau motiviert hätte, war Messrauschen, und die Erklärung dafür
+war plausibel genug, dass ich sie ohne Nachmessen geglaubt hätte.
+
+Das ist derselbe Fehler wie P9.60b, nur an einer Laufzeit statt an einer
+Befundzahl: eine plausible Erklärung für eine ungeprüfte Zahl ist keine Diagnose.
+
+### Was diese Tranche NICHT behaupten kann
+
+P9.69a konnte sagen „SPIR-V bitweise identisch". **Hier nicht:** aus einem
+Inline-Rumpf wird ein Funktionsaufruf mit Array-Parametern, 34312 → 35140 Bytes.
+Die Evidenz ist stattdessen die Fixture selbst — `npCvxCoreWarpAcc` vergleicht
+**alle** Ausgaben bitweise gegen einen CPU-Spiegel, über einen UND zwei
+aufeinanderfolgende Aufrufe, und sie ist grün.
+
+**Deckungsgrenze, benannt:** die Fixture fährt höchstens ZWEI Aufrufe
+(`WIn::meta.x` ist auf 2 geklemmt). Eine BVH-Traversierung macht so viele, wie sie
+Blattbündel hat. Der Zustandsautomat ist derselbe, aber „viele Aufrufe" prüft die
+Szene, nicht die bitweise Fixture.
+
+Kein Szenendurchlauf: der einzige neu gebaute Shader ist eine Phase-1-Fixture, die
+im Manifest gar nicht steht. Suite **853/853 in beiden Speichermodi**.
+
 ## P9.69c — `convexCoreConvexNphase_Kernel` gemappt, und ein Kontrollmodus, der zweimal die Szene widerlegt hat
 
 Der zweite der fünf convexCore-Kernel. Ein `PxConvexCoreGeometry` ruht jetzt auf
