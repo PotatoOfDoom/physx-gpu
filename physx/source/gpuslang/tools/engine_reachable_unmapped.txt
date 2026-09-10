@@ -39,7 +39,9 @@
 # every one of these, which is what this project's method depends on.
 convexCoreClothmeshNphase_Kernel32
 convexCoreConvexNphase_Kernel
-convexCorePlaneNphase_Kernel
+# convexCorePlaneNphase_Kernel -- MAPPED in P9.67c (cvxCorePlaneNpBda.spv), the
+# first of the five.  PXG_SCENE=convexcoreplane went from final y=-73.807 to
+# 0.5000, the cylinder's radius and the same number the capsule scene gives.
 convexCoreTetmeshNphase_Kernel32
 convexCoreTrimeshNphase_Kernel32
 evaluatePointDistancesSDFBatch

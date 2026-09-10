@@ -1431,6 +1431,10 @@ static const uint8_t kCvxTriFinish[] = { 8, 8, 8, 8, 8, 8, 4, 8, 8, 8, 8, 1,
                                          8, 8, 8, 8, 8, 8, 4, 4, 4 };
 static const uint32_t kCvxTriCoreHostPtrMask = 1u << 18;
 
+// convexCorePlaneNphase_Kernel: numTests(4), 14 pointers, three PxU32 limits.
+static const uint8_t kCvxCorePlane[] = { 4, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+                                         4, 4, 4 };
+
 static const PxgKernelAbiRow kRows[] = {
     { "MemCopyBalanced", kMemCopyBalanced, uint32_t(sizeof(kMemCopyBalanced)) },
     { "convexTrimeshNarrowphase", kCvxTriCore, uint32_t(sizeof(kCvxTriCore)), kCvxTriCoreHostPtrMask },
@@ -1455,6 +1459,11 @@ static const PxgKernelAbiRow kRows[] = {
     // convexNpCommon.h:140-143).  Same 168-byte blob, same pinned host pointer at
     // argument 18.
     { "sphereTrimeshNarrowphase", kCvxTriCore, uint32_t(sizeof(kCvxTriCore)), kCvxTriCoreHostPtrMask },
+    // P9.67c: convexCorePlaneNphase_Kernel (convexCoreCollision.cu:449-468).
+    // 18 arguments: numTests, 14 device pointers, three PxU32 byte limits = 136 B.
+    // NOT the convex-plane row, which is 144 -- that kernel also takes
+    // cmPersistentManifolds and toleranceLength, and this one takes neither.
+    { "convexCorePlaneNphase_Kernel", kCvxCorePlane, uint32_t(sizeof(kCvxCorePlane)) },
     { "sortTriangleIndices", kSortTriIndices, uint32_t(sizeof(kSortTriIndices)) },
     { "convexTrimeshPostProcess", kCvxTriPostProcess, uint32_t(sizeof(kCvxTriPostProcess)) },
     // P9.51c: convexHeightfieldPostProcess (convexMeshPostProcess.cu:585-593)

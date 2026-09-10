@@ -1865,6 +1865,80 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.67c — `convexCorePlaneNphase_Kernel` gemappt: von −73.807 auf 0.5000
+
+Der erste der fünf convexCore-Kernel. Die in P9.67a gebaute Szene misst jetzt:
+
+```
+[convexCoreCylinderOnPlane] start y=5.000, final y=0.5000 (rest 0.500), |v|=0.0000
+```
+
+Genau der Zylinderradius — und dieselbe Zahl, die die Kapsel-Szene über derselben
+Ebene liefert. Vorher: `final y=-73.8070`, `|v|=39.2401`, 183 stille übersprungene
+Starts.
+
+### Woher der Code kam
+
+Fast nichts an der Arithmetik ist neu. Drei verifizierte Körper wurden
+zusammengesetzt:
+
+| Quelle | Beitrag |
+|---|---|
+| `pxgSlangCvxCoreShape` (P9.67b) | `ShapeRef`, `supportLocalQ` über alle sieben Kerntypen, `contactFaceQ`, `reducePolygonQ` |
+| `npCvxCorePlaneGen` | der Ebenen-Treiber selbst (`Gu::generateContacts(PxPlane, ConvexShape)`) |
+| `npCvxPlaneNphase` | der Contact-/Patch-Ausgabeschwanz — dasselbe `TestOutput::writeOutput`-Skelett, bereits auf der Engine-ABI |
+
+Wirklich neu sind die Parameter-Verrohrung, `makeConvexShape` und die Entscheidung,
+welche Zeile zu welcher der drei Quellen gehört.
+
+### Die Falle: der Kerntyp reist im Zeigerfeld
+
+`convexCoreCollision.cu:115-170` verwandelt eine `PxgShape` in eine
+`Gu::ConvexShape`, und der `eCONVEXCORE`-Fall dereferenziert überhaupt nichts:
+
+```cpp
+convex.coreType = Gu::ConvexCore::Type::Enum(shape.hullOrMeshPtr);
+memcpy(convex.coreData, &shape.scale.scale.x, MAX_CORE_SIZE);
+convex.margin = shape.scale.rotation.w;
+```
+
+Das **64-Bit-Hull-ZEIGERFELD trägt ein kleines Enum**, die Kernparameter liegen in
+den Scale-Bytes der `PxMeshScale`, und der Margin in deren Rotations-w. Ein Port,
+der `hullOrMeshPtr` hier als Adresse liest, dereferenziert eine Zahl zwischen 0
+und 5.
+
+Die anderen Fälle zählen mit, weil Slot 1 ist, was die Paartabelle geschickt hat:
+Kugel → `ePOINT` mit Margin = Radius, Kapsel → `eSEGMENT` mit Länge = 2·halfHeight
+und Margin = Radius, Box → `eBOX` mit Extents = 2·scale und Margin 0.
+
+### Die ABI-Zeile ist NICHT geteilt, so ähnlich die zwei auch aussehen
+
+`convexCorePlaneNphase_Kernel` nimmt 18 Argumente, `convexPlaneNphase_Kernel` 20 —
+die zwei zusätzlichen sind `cmPersistentManifolds` und `toleranceLength`, und dieser
+Kernel nimmt keines von beiden. Also 136 Bytes statt 144, eigene Zeile. P9.48d ist
+der Grund, hier exakt statt ungefähr zu sein: eine falsche ABI-Zeile ergibt
+`pushConstantSizeFor() == 0` und **jeder Start wird still verweigert** — bei grünen
+Fixtures, grünem Manifest-Test, grüner Suite und grünen Szenen.
+
+### Kein Grid-Stride-Loop, und das ist treu
+
+Der Rumpf ist eine einzige `if (testIndex >= numTests) return;`-Wache ohne jede
+Schleife, und der Host-Start deckt `numTests` exakt. Ein Port, der hier eine
+Schleife *hinzufügt*, hört auf, ein Port zu sein — dieselbe Regel wie beim fehlenden
+Bounds-Test in P9.66b, nur in die andere Richtung.
+
+### Die Ratsche hat wieder zugeschlagen
+
+`check_unmapped_reachability.py` ist beim zweiten echten Einsatz erneut gefallen:
+*„convexCorePlaneNphase_Kernel — no longer an unmapped engine kernel; remove the
+line"*. Erreichbar-nicht-gemappt: **28 → 27**.
+
+### Stand
+
+Suite **852/852 in beiden Speichermodi**, Manifest **405/501**, alle dreizehn Prüfer
+grün. Vier convexCore-Kernel bleiben; mit `pxgSlangCvxCoreShape` und diesem
+Ausgabeschwanz als Vorlage ist der Weg für sie derselbe.
+
 ## P9.67a — die Convex-Core-Familie: eine Szene gebaut, die Lücke gemessen
 
 Fünf der elf verbliebenen Narrowphase-Kernel sind die `convexCore*`-Familie. Sie sind
