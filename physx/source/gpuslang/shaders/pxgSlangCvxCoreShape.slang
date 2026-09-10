@@ -68,9 +68,9 @@ public static const uint CORE_CONE = 5u;
 public static const uint CORE_POINTS = 6u;
 public static const uint NOIDX = 0xFFFFFFFFu;
 
-float pxSign(float a) { return (a >= 0.0f) ? 1.0f : -1.0f; }
+public float pxSign(float a) { return (a >= 0.0f) ? 1.0f : -1.0f; }
 public float dot3Q(float3 a, float3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-float dot4Q(float4 a, float4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
+public float dot4Q(float4 a, float4 b) { return a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
 public float3 crossQ(float3 a, float3 b)
 {
     return float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
@@ -82,7 +82,7 @@ public float3 getNormalizedQ(float3 v)
     const float m = magSq(v);
     return m > 0.0f ? v * (1.0f / sqrt(m)) : float3(0, 0, 0);
 }
-float normalizeQ(inout float3 v) // PxVec3::normalize: guarded reciprocal multiply
+public float normalizeQ(inout float3 v) // PxVec3::normalize: guarded reciprocal multiply
 {
     const float m = magQ(v);
     if (m > 0.0f)
@@ -111,23 +111,23 @@ public float3 quatRotInvQ(float4 q, float3 v)
                   vz * w2 - (q.x * vy - q.y * vx) * q.w + q.z * d2);
 }
 // PxQuat::getInvBasisVector0/1/2 (PxQuat.h L298-319)
-float3 invBasis0(float4 q)
+public float3 invBasis0(float4 q)
 {
     const float x2 = q.x * 2.0f, w2 = q.w * 2.0f;
     return float3((q.w * w2) - 1.0f + q.x * x2, (-q.z * w2) + q.y * x2, (q.y * w2) + q.z * x2);
 }
-float3 invBasis1(float4 q)
+public float3 invBasis1(float4 q)
 {
     const float y2 = q.y * 2.0f, w2 = q.w * 2.0f;
     return float3((q.z * w2) + q.x * y2, (q.w * w2) - 1.0f + q.y * y2, (-q.x * w2) + q.z * y2);
 }
-float3 invBasis2(float4 q)
+public float3 invBasis2(float4 q)
 {
     const float z2 = q.z * 2.0f, w2 = q.w * 2.0f;
     return float3((-q.y * w2) + q.x * z2, (q.x * w2) + q.y * z2, (q.w * w2) - 1.0f + q.z * z2);
 }
 // PxComputeBasisVectors (PxMathUtils.h L297-316)
-void computeBasisQ(float3 dir, out float3 right, out float3 up)
+public void computeBasisQ(float3 dir, out float3 right, out float3 up)
 {
     if (abs(dir.y) <= 0.9999f)
     {
@@ -232,15 +232,15 @@ public float3 supportLocalQ(ShapeRef s, float4 ptsPool[12], float3 dir)
 public float3 poseTransform(ShapeRef s, float3 v) { return quatRotQ(s.poseQ, v) + s.poseP; }
 
 public float coreFQ(ShapeRef s, uint word) { return asfloat(s.core[word / 4u][word & 3u]); }
-float compAt(float3 v, uint i) { return i == 0u ? v.x : (i == 1u ? v.y : v.z); }
-float3 withComp(float3 v, uint i, float x)
+public float compAt(float3 v, uint i) { return i == 0u ? v.x : (i == 1u ? v.y : v.z); }
+public float3 withComp(float3 v, uint i, float x)
 {
     if (i == 0u) v.x = x; else if (i == 1u) v.y = x; else v.z = x;
     return v;
 }
 
 // GuConvexSupport.h L1141-1158
-bool rotatePointsQ(float3 center, float3 refp, float3 normal, inout float3 pts[4], uint count)
+public bool rotatePointsQ(float3 center, float3 refp, float3 normal, inout float3 pts[4], uint count)
 {
     float3 dir0 = pts[0] - center;
     if (normalizeQ(dir0) < FLT_EPS)
@@ -262,7 +262,7 @@ bool rotatePointsQ(float3 center, float3 refp, float3 normal, inout float3 pts[4
     return true;
 }
 
-uint reducePolygonQ(const float3 pts[8], uint count, float3 normal, bool keep1st, out uint inds[4])
+public uint reducePolygonQ(const float3 pts[8], uint count, float3 normal, bool keep1st, out uint inds[4])
 {
     inds[0] = NOIDX; inds[1] = NOIDX; inds[2] = NOIDX; inds[3] = NOIDX;
     uint pi0 = NOIDX, pi1 = NOIDX;

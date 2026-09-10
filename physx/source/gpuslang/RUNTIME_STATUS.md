@@ -1865,6 +1865,82 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.69a — die Convex-Convex-Schicht herausgelöst, und ein slangc-Kollaps von 1 Sekunde auf 40 Minuten
+
+Vorarbeit für `convexCoreConvexNphase_Kernel`: der Kernel und die Phase-1-Fixture
+sollen **denselben Text** übersetzen, nicht zwei Kopien. Das ist der P9.67b-Zug für
+den Convex-Arm, und die Richtung ist wieder das Entscheidende — die Fixture, die
+diese Arithmetik bereits bitweise gegen die CPU prüft (`cvgContacts`, mit ihrem
+Mutantenlauf), **importiert die herausgelöste Schicht**. Ein Modul, das nur der neue
+Kernel benutzt, wäre ungeprüfter Code im Gewand einer geprüften Datei.
+
+### 553 Zeilen waren eine Zeichen-für-Zeichen-Kopie
+
+`npCvxCoreCvxGen.slang` trug die komplette Shape-Schicht — `ShapeRef`,
+`supportLocalQ` über alle sieben Core-Typen, `contactFaceQ`, `reducePolygonQ`, die
+Quaternionenhelfer — ein zweites Mal neben `pxgSlangCvxCoreShape`. Nachgewiesen,
+nicht vermutet: beide Regionen normalisiert (Kommentare und `public` entfernt) und
+diffed ergibt **einen einzigen Hunk**, und der ist nur der Konstantenblock. Die
+Kopie ist weg; die Datei importiert jetzt das geteilte Modul.
+
+### Der Kollaps
+
+Der zweite Teil — die GJK/EPA/Clip-Schicht (`ConvexW`, `gjkDistanceQ`, `epaDepthQ`,
+`faceClipQ`, rund 900 Zeilen) — wurde zuerst ebenfalls als `module` geschrieben.
+Ergebnis:
+
+```
+vorher (eine Datei):            real  0m1.068s
+als module:                     >40 min, nicht fertig, RSS 213 MB flach, ein Kern
+```
+
+Isoliert und halbiert: **die Shape-Schicht als Modul kostet 0,75 s.** Es liegt also
+nicht an Modulen überhaupt — `pxgSlangCvxCoreShape` bleibt ein Modul und der
+Plane-Kernel ist unberührt. Es liegt an *dieser* Schicht: Funktionen mit
+`inout ConvexW` (das `float3 verts[32]` trägt) und `float4 pool[12]` als Wert
+bekommt slangc nicht zu vertretbaren Kosten über eine Modulgrenze.
+
+### `#include` ist hier kein Notbehelf, sondern das Korpus-Idiom
+
+Vierzehn Shader benutzen es bereits, und einer trägt genau diese Zwei-Verbraucher-
+Form: `pxgSlangSdfFind.slang` wird von `npSdfFind` (Fixture) **und**
+`femClothSdfMeshCgBda` (Engine-Kernel) eingebunden. `pxgSlangCvxCoreCvx.slang`
+folgt dem: keine `module`-Zeile, kein `public`, der Einbinder importiert vorher
+`pxgSlangCvxCoreShape`.
+
+```
+als #include:                   real  0m0.730s
+```
+
+### Die Evidenz, die diese Tranche eigentlich trägt
+
+```
+$ cmp base.spv inc.spv        # slangc-Rohausgabe vor / nach der Auslösung
+SPIR-V BITWISE IDENTICAL
+
+$ cmp base_nc.spv build-gpuslang/shaders/npCvxCoreCvxGen.spv   # nach spv_nocontract
+SHIPPED ARTIFACT BITWISE IDENTICAL TO PRE-REFACTOR
+```
+
+**Das ausgelieferte Artefakt ist byteweise dasselbe.** Damit ist die Auslösung
+nachweislich eine Umschichtung von Text und keine Änderung an Instruktionen — die
+stärkste Aussage, die ein Refactor haben kann.
+
+Deshalb ist für diese Tranche **kein Szenendurchlauf gelaufen**, und das ist eine
+Aussage, keine Auslassung: die GPU führt dieselben Bytes aus wie beim letzten
+Durchlauf (44/44 in P9.68). Ein erneuter Durchlauf würde dieselben Bytes messen.
+Suite **853/853 in beiden Speichermodi**, `gpuslang.npCvxCoreCvxGen` grün.
+
+### Was als Nächstes fehlt, und warum es nicht hier steht
+
+Der Kernel selbst braucht `makeConvexShape`s **fünften** Arm, den der Plane-Kernel
+weglassen durfte: `eCONVEXMESH` → `ePOINTS`, mit `core.points = hullPtr + 48` und
+`numPoints = (((int4*)(hullPtr+16))->x >> 8) & 0xff`. Die Shape-Schicht liest ihre
+Punkte heute aus einem festen `float4 ptsPool[12]` — der Staging-Puffer der
+Fixture. Ein gekochter Hull hat mehr, und liegt im Gerätespeicher. Das ist eine
+eigene Schnittstellenfrage (Pool gegen BDA-Adresse), und sie gehört nicht in eine
+Tranche, deren ganze Aussage „byteweise identisch" ist.
+
 ## P9.68 — der VIERZEHNTE Prüfer: der Port erreichte ein Sechzehntel der Arbeit, und nichts sagte es
 
 P9.67c hat einen Defekt ausgeliefert. Suite grün in beiden Modi, 44/44 Szenen, dreizehn
