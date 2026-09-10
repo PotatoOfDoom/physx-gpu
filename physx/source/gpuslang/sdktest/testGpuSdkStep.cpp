@@ -532,6 +532,110 @@ void buildConvexCorePlaneScene(PxPhysics* physics, PxScene* scene, PxMaterial* m
     }
 }
 
+// A cooked triangle-mesh floor TESSELLATED into `cell`-sized quads, spanning
+// [xMin, xMax] in x and [-zHalf, zHalf] in z at y = 0 (P9.70).
+//
+// addMeshFloor makes TWO triangles, which is right for a scene that drops one body
+// but wrong for a row of eighty: the convex-core narrowphase turns each TRIANGLE
+// into a convex core, and Convex<Support>'s accuracy -- which is also the GJK weld
+// distance -- is max(maxExtent * 0.01, FLT_EPSILON).  Two triangles spanning the
+// whole row weld support points metres apart, which is the conditioning trap
+// PXG_CPU_CONTROL=1 caught in P9.69c.  Small cells keep every pair well conditioned.
+PxRigidStatic* addTessellatedMeshFloor(PxPhysics* physics, PxScene* scene,
+                                       PxMaterial* material, float xMin, float xMax,
+                                       float zHalf, float cell)
+{
+    const int nx = PxMax(1, int((xMax - xMin) / cell + 0.5f));
+    const int nz = PxMax(1, int((2.0f * zHalf) / cell + 0.5f));
+    std::vector<PxVec3> verts;
+    verts.reserve(size_t(nx + 1) * size_t(nz + 1));
+    for (int iz = 0; iz <= nz; ++iz)
+        for (int ix = 0; ix <= nx; ++ix)
+            verts.push_back(PxVec3(xMin + float(ix) * cell, 0.0f, -zHalf + float(iz) * cell));
+
+    std::vector<PxU32> tris;
+    tris.reserve(size_t(nx) * size_t(nz) * 6u);
+    for (int iz = 0; iz < nz; ++iz)
+        for (int ix = 0; ix < nx; ++ix)
+        {
+            const PxU32 a = PxU32(iz * (nx + 1) + ix), b = a + 1;
+            const PxU32 c = PxU32((iz + 1) * (nx + 1) + ix), d = c + 1;
+            tris.push_back(a); tris.push_back(c); tris.push_back(b);
+            tris.push_back(b); tris.push_back(c); tris.push_back(d);
+        }
+
+    PxTriangleMeshDesc md;
+    md.points.count = PxU32(verts.size()); md.points.stride = sizeof(PxVec3); md.points.data = verts.data();
+    md.triangles.count = PxU32(tris.size() / 3); md.triangles.stride = 3 * sizeof(PxU32); md.triangles.data = tris.data();
+    PxCookingParams ck(physics->getTolerancesScale());
+    ck.buildGPUData = true;   // without this the mesh has no BV32 tree and the GPU pair is inert
+    PxTriangleMesh* meshGeom =
+        immediateCooking::createTriangleMesh(ck, md, physics->getPhysicsInsertionCallback());
+    if (!meshGeom) { std::printf("FAIL: createTriangleMesh (tessellated floor) returned null\n"); return nullptr; }
+    std::printf("  tessellated mesh floor: %u verts, %u triangles (cell %.2f)\n",
+                md.points.count, md.triangles.count, double(cell));
+    PxRigidStatic* floor = physics->createRigidStatic(PxTransform(PxVec3(0.0f, 0.0f, 0.0f)));
+    PxShape* fs = physics->createShape(PxTriangleMeshGeometry(meshGeom), *material);
+    floor->attachShape(*fs);
+    scene->addActor(*floor);
+    fs->release();
+    return floor;
+}
+
+// PXG_SCENE=convexcoretrimesh (P9.70): eighty dynamic CONVEX CORE cylinders on a
+// cooked, tessellated TRIANGLE MESH floor.  The pair (eCONVEXCORE, eTRIANGLEMESH)
+// routes to GPU_BUCKET_ID::eConvexCoreTrimesh, i.e. convexCoreTrimeshNphase_Kernel32
+// -- the third convexCore narrowphase kernel and the first that walks a BVH.
+//
+// Same cylinder and same expected rest height (0.5) as the plane and box scenes, so
+// a disagreement is the kernel's and not the geometry's.  Sleep is off for the
+// reason P9.68 measured: with sleeping on, settled bodies leave the pair list and a
+// starved index is renumbered below the block-coverage ceiling within a few frames,
+// which heals the observation away.
+//
+// *** THIS SCENE IS EXPECTED TO FAIL UNTIL convexCoreTrimeshNphase_Kernel32 IS
+// MAPPED. *** It is deliberately NOT in run_scenes.sh's SCENES list yet, the same
+// order P9.67a used for convexcoreplane: the scene is built and MEASURED first, the
+// sweep entry follows when it passes.
+//
+// Both halves of that measurement are on the record, because a red scene means
+// nothing without them:
+//   PXG_CPU_CONTROL=1  all 80 rest at y = 0.5001, 0 failed checks -- so the rest
+//                      height this scene asserts is what PhysX itself produces, and
+//                      the expectation is not mine to argue with.
+//   GPU                all 80 fall through to y = -73.807, 160 failed checks, and
+//                      [pxg-unmapped] names convexCoreTrimeshNphase_Kernel32 as
+//                      launched 8 time(s) and skipped.
+// That pair is what makes the next tranche's before/after unambiguous.
+//
+// PXG_CVXCORE_CELL overrides the floor's cell size (default 1.5).
+void buildConvexCoreTrimeshScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                                 std::vector<RestTarget>& targets)
+{
+    const int PAIR_COUNT = 80;
+    const float SPACING = 3.0f;
+    const char* cellEnv = std::getenv("PXG_CVXCORE_CELL");
+    const float cell = cellEnv ? float(std::atof(cellEnv)) : 1.5f;
+
+    if (!addTessellatedMeshFloor(physics, scene, material,
+                                 -SPACING, float(PAIR_COUNT) * SPACING, 3.0f, cell))
+        return; // targets stays empty; main() hard-fails on that
+
+    const float r = 0.5f, h = 1.0f;
+    PxConvexCoreGeometry geom(PxConvexCore::Cylinder(h, r));
+    static char labels[80][44];
+    for (int i = 0; i < PAIR_COUNT; ++i)
+    {
+        PxRigidDynamic* b = addDynamic(physics, scene, material, geom,
+                                       capsuleInertia(r, h * 0.5f, 1000.0f), 5.0f,
+                                       float(i) * SPACING);
+        b->setSleepThreshold(0.0f);
+        b->setWakeCounter(1.0e9f);
+        std::snprintf(labels[i], sizeof(labels[i]), "convexCoreCylinderOnTrimesh[%d]", i);
+        targets.push_back({ b, 5.0f, r, labels[i] });
+    }
+}
+
 // PXG_SCENE=convexcorebox (P9.69c): eighty dynamic CONVEX CORE cylinders, each on
 // its OWN small static box.  The pair (eBOX, eCONVEXCORE) routes to
 // GPU_BUCKET_ID::eConvexCoreConvex (PxgNphaseImplementationContext.cpp gTable), i.e.
@@ -7504,6 +7608,7 @@ int main()
     else if (!std::strcmp(sceneName, "capsulemesh")) buildCapsuleMeshScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "convexcoreplane")) buildConvexCorePlaneScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "convexcorebox")) buildConvexCoreBoxScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "convexcoretrimesh")) buildConvexCoreTrimeshScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "convexcoremesh")) buildConvexCoreMeshScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "hffloor")) buildHfFloorScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "spherehf")) buildSphereHfScene(physics, scene, material, targets);

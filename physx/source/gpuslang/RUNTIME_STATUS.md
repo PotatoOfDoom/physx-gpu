@@ -1865,6 +1865,54 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.70b — die Szene zuerst, mit beiden Messungen, bevor der Kernel existiert
+
+`PXG_SCENE=convexcoretrimesh`: achtzig dynamische CONVEX-CORE-Zylinder auf einem
+gekochten, **tessellierten** Dreiecksnetzboden. Das Paar
+(eCONVEXCORE, eTRIANGLEMESH) landet in `GPU_BUCKET_ID::eConvexCoreTrimesh`, also
+bei `convexCoreTrimeshNphase_Kernel32` — dem dritten convexCore-Kernel und dem
+ersten, der einen BVH abläuft.
+
+Die Reihenfolge ist die von P9.67a und sie ist inzwischen zweimal teuer gewesen,
+sie nicht einzuhalten: **erst die Szene, dann der Port.** Die Szene steht
+absichtlich noch NICHT in `run_scenes.sh`s `SCENES`-Liste; der Sweep-Eintrag folgt,
+wenn sie grün ist.
+
+### Beide Hälften der Messung, weil eine rote Szene ohne sie nichts sagt
+
+```
+PXG_CPU_CONTROL=1   alle 80 ruhen bei y = 0.5001, 0 Fehlprüfungen
+GPU                 alle 80 fallen durch auf y = -73.8070, 160 Fehlprüfungen
+                    [pxg-unmapped] convexCoreTrimeshNphase_Kernel32 was launched
+                    8 time(s) ... every launch was SKIPPED
+```
+
+Die CPU-Kontrolle (P9.69c) sagt: die Ruhehöhe, die diese Szene behauptet, ist
+das, was PhysX selbst produziert. Damit ist die Erwartung nicht meine Erfindung,
+und das Rot ist dem fehlenden Kernel zuzuschreiben und nichts anderem. Die
+Unmapped-Meldung nennt ihn beim Namen.
+
+### Warum der Boden tesselliert ist, und nicht zwei Dreiecke
+
+`addMeshFloor` macht ZWEI Dreiecke. Das ist richtig für eine Szene, die einen
+Körper fallen lässt, und falsch für eine Reihe von achtzig: die
+convexCore-Narrowphase macht aus **jedem DREIECK** einen Convex-Core, und
+`Convex<Support>`s `accuracy` — zugleich die GJK-Verschweißungsdistanz — ist
+`max(maxExtent * 0.01, FLT_EPSILON)`. Zwei Dreiecke über die ganze Reihe
+verschweißen Stützpunkte meterweit. Das ist exakt die Konditionierungsfalle, die
+`PXG_CPU_CONTROL=1` in P9.69c an der 400-m-Box gefangen hat, nur eine Geometrie
+weiter — und diesmal vor dem Bau vermieden statt danach diagnostiziert.
+
+`addTessellatedMeshFloor` legt ein Gitter aus `cell`-großen Quads; Standard 1.5
+ergibt 815 Vertices und 1296 Dreiecke. `PXG_CVXCORE_CELL` stellt die Zellgröße,
+denn die Konditionierung ist die interessante Variable und keine zu ratende
+Konstante. Gegenprobe: bei Zelle 1.5 **und** bei Zelle 4.0 ist die CPU-Kontrolle
+bei 0 Fehlern.
+
+Kein Suite-Lauf: `testGpuSdkStep.cpp` wird von keinem ctest-Ziel übersetzt
+(`grep testGpuSdkStep tests/CMakeLists.txt` ist leer), die Szenenharness hängt an
+`build-sdk`. Diese Tranche ändert keinen Shader, kein Manifest und keinen Prüfer.
+
 ## P9.70a — der Akkumulator herausgelöst, und eine Zahl, die ich fast geglaubt hätte
 
 Vorarbeit für `convexCoreTrimeshNphase_Kernel32`. Zwei Befunde, und der zweite ist
