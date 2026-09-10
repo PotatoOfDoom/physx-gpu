@@ -1930,8 +1930,15 @@ struct CvxIn
     U4 coreB[3];
     F4 poseBq, poseBp;   // poseBp.w = margin1
     F4 cfg;              // x = contactDist, yzw = cullDir
-    F4 ptsA[12];
-    F4 ptsB[12];
+    F4 ptsA[12];         // the host reference (and its memcpy into gjkref::GjkIn /
+    F4 ptsB[12];         // eparef::EpaTIn) still reads these directly
+    // P9.69b: the SHADER reads the hulls through Ptr<float4> at these addresses.
+    // A cooked convex hull carries up to 255 points; the inline pool capped every
+    // consumer of the shared shape layer at 12, which is why the engine kernels
+    // could not take the eCONVEXMESH arm at all.  The arrays above stay because
+    // the sibling reference layouts are memcpy'd out of this record.
+    U4 ptsAddrA;      // x = lo, y = hi
+    U4 ptsAddrB;
 };
 struct CvxOut
 {
@@ -2156,6 +2163,24 @@ PXG_TEST(npCvxCoreCvxGen_contacts)
     PxgSlangComputeDevice* dev = testDevice();
     const uint32_t GROUPS = (N + 31) / 32;
     std::vector<CvxOut> outInit(N);
+    // The shader reads hull points by DEVICE ADDRESS (P9.69b), so stage them in
+    // their own buffer: 24 slots per test, A's twelve then B's twelve.
+    std::vector<F4> ptsHost(size_t(N) * 24);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        std::memcpy(&ptsHost[size_t(i) * 24 + 0], in[i].ptsA, sizeof(F4) * 12);
+        std::memcpy(&ptsHost[size_t(i) * 24 + 12], in[i].ptsB, sizeof(F4) * 12);
+    }
+    PxgBufferHandle bPts = createBufferFrom(dev, ptsHost);
+    const uint64_t ptsBase = dev->getBufferDeviceAddress(bPts);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const uint64_t a = ptsBase + uint64_t(i) * 24ull * sizeof(F4);
+        const uint64_t b = a + 12ull * sizeof(F4);
+        in[i].ptsAddrA = U4{ uint32_t(a & 0xffffffffu), uint32_t(a >> 32), 0, 0 };
+        in[i].ptsAddrB = U4{ uint32_t(b & 0xffffffffu), uint32_t(b >> 32), 0, 0 };
+    }
+
     PxgBufferHandle bIn = createBufferFrom(dev, in);
     PxgBufferHandle bOut = createBufferFrom(dev, outInit);
 

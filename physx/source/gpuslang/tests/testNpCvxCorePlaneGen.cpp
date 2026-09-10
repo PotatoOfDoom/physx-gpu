@@ -59,7 +59,13 @@ struct PgIn
     U4 core[3];
     F4 poseQ, poseP;  // poseP.w = margin
     F4 cfg;           // x = contactDist
-    F4 pts[12];
+    F4 pts[12];       // the host reference still reads these directly
+    // P9.69b: the SHADER reads the hull through Ptr<float4> at this address, not
+    // out of the record.  A cooked convex hull carries up to 255 points and the
+    // inline pool capped every consumer of the shared shape layer at 12; the
+    // engine kernels now pass the hull's real device address instead.  The array
+    // above stays because the reference mirrors this record byte-for-byte.
+    U4 ptsAddrPack;   // x = lo, y = hi
 };
 struct PgOut
 {
@@ -802,6 +808,19 @@ PXG_TEST(npCvxCorePlaneGen_contacts)
     PxgSlangComputeDevice* dev = testDevice();
     const uint32_t GROUPS = (N + 63) / 64;
     std::vector<PgOut> outInit(N);
+    // The shader reads hull points by DEVICE ADDRESS (P9.69b), so stage them in
+    // their own buffer and hand each test the address of its own 12 slots.
+    std::vector<F4> ptsHost(size_t(N) * 12);
+    for (uint32_t i = 0; i < N; ++i)
+        std::memcpy(&ptsHost[size_t(i) * 12], in[i].pts, sizeof(F4) * 12);
+    PxgBufferHandle bPts = createBufferFrom(dev, ptsHost);
+    const uint64_t ptsBase = dev->getBufferDeviceAddress(bPts);
+    for (uint32_t i = 0; i < N; ++i)
+    {
+        const uint64_t a = ptsBase + uint64_t(i) * 12ull * sizeof(F4);
+        in[i].ptsAddrPack = U4{ uint32_t(a & 0xffffffffu), uint32_t(a >> 32), 0, 0 };
+    }
+
     PxgBufferHandle bIn = createBufferFrom(dev, in);
     PxgBufferHandle bOut = createBufferFrom(dev, outInit);
 

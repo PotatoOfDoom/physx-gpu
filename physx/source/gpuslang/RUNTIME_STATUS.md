@@ -1865,6 +1865,114 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.69b — die Zwölf-Punkte-Decke in der Convex-Core-Schicht, und ein Kernel, der NICHT ausgeliefert wird
+
+Vorarbeit für `convexCoreConvexNphase_Kernel`. Die Tranche liefert die
+Klempnerei, die dieser Kernel braucht — und liefert den Kernel **nicht**, weil er
+seine Szene noch nicht besteht. Beides steht hier, weil beides eine Aussage ist.
+
+### Der Defekt: eine Decke, die keine Seite sehen konnte
+
+`supportLocalQ` und `contactFaceQ` nahmen die Punkte eines `ePOINTS`-Cores als
+`float4 pool[12]` **als Wert**. Ein gekochter Convex-Hull trägt bis zu **255**
+Punkte:
+
+    core.numPoints = (((const int4*)(hullPtr + 16))->x >> 8) & 0xff;
+
+Der Shader indiziert `pool[(i * stride) / 16]` für `i < numPoints` — jenseits von
+12 also außerhalb des Arrays. Der Host-Spiegel der Fixture hat **dieselbe**
+`F4 ptsA[12]`, und ihr Generator sagt es sogar ausdrücklich:
+
+    const uint32_t np = 3 + rng() % 10; // <= 12: the GjkIn pool is 12 float4s
+
+**Beide Seiten teilen die Grenze, also kann die Fixture sie strukturell nicht
+sehen.** Das ist die P9.57-Form: ein Limit, das kein Vergleich findet, weil es in
+der Referenz genauso steht.
+
+Praktisch schwerer wog: ein Engine-Kernel hat gar keinen Pool, den er füllen
+könnte. Die Hull-Punkte liegen im Gerätespeicher. Deshalb dokumentiert
+`cvxCorePlaneNpBda`, dass sein Slot 1 nie `eCONVEXMESH` ist — was für ihn stimmt
+(Convex gegen Ebene hat einen eigenen Kernel) — und deshalb konnte der
+Convex-Arm gar nicht geschrieben werden.
+
+### Die Korrektur: eine Adresse statt eines Arrays
+
+`supportLocalQ(ShapeRef, uint64_t ptsAddr, float3)` liest über `Ptr<float4>`.
+Keine Decke mehr. Die beiden Fixtures legen ihre Punkte in einen eigenen Puffer
+und übergeben dessen Geräteadresse als **lo/hi-Paar** — nicht als `uint64_t` im
+Record, weil die Auffüllung eines 64-Bit-Feldes in einem `StructuredBuffer` nicht
+garantiert zur C++-Struktur passt; das ist das Idiom, das `testSphereTriNp`
+bereits für `hullLo/hullHi` benutzt.
+
+Nicht-Vakuität, nicht behauptet sondern gemessen: die Adresse um **ein einziges
+float4** verschoben —
+
+```
+FAIL: 115 - gpuslang.npCvxCoreCvxGen
+```
+
+zurückgesetzt, grün. Die Adresse ist tragend.
+
+**Die HLSL-Zwillinge überleben.** Ich hatte eingeplant, `npCvxCorePlaneGen` und
+`npCvxCoreCvxGen` aus `PXG_HLSL_ENTRIES` zu verlieren (P9.61-Präzedenz: einen
+echten Defekt nicht gegen ein Übersetzungsziel tauschen, gegen das dieser Port
+nichts ausliefert). Gemessen: slangc senkt `Ptr<>` nach HLSL,
+`gpuslang.hlsl.cpgContacts` und `gpuslang.hlsl.cvgContacts` bleiben grün, 356
+HLSL-Tests bestehen. Testzahl unverändert **853**.
+
+### Zwei weitere Auslösungen, damit der Convex-Arm keine zweite Abschrift bekommt
+
+* **`pxgSlangCvxCoreMake.slang`** — `Gu::makeConvexShape`, jetzt mit **allen
+  fünf** Armen einschließlich `ePOINTS`. `cvxCorePlaneNpBda` benutzt ihn
+  ebenfalls; sein Slot 1 präsentiert den fünften Arm nie, aber eine Kopie weniger
+  ist eine Kopie weniger.
+* **`pxgSlangCvxCoreOut.slang`** — `TestOutput::writeOutput` samt der Konstanten
+  und `combineScalars`, die nur er braucht. Die dreizehn Adressen kommen als
+  `CvxCoreOutRefs`-Struktur herein und **nicht** über den Namen `gParams`: ein
+  Include, das nach dem Push-Constant-Block des Einbinders greift, würde
+  übersetzen und stillschweigend an das binden, was die Datei zufällig so nennt.
+  P9.37 ist der Grund, überhaupt zu teilen: ein replizierter Engine-Schwanz
+  driftet in der **Assoziation**, nicht nur in den Operatoren.
+
+Beide sind `#include` und keine Module — aus dem in P9.69a gemessenen Grund.
+
+`PXG_SCENE=convexcoreplane` bleibt nach allen drei Auslösungen bei **80/80**.
+
+### Ein Nebenfund beim Zusammenlegen: Wort 6 der Core-Daten
+
+`MAX_CORE_SIZE` ist **sechs Floats** (PxConvexCoreGeometry.h:264), der `memcpy`
+kopiert also die Wörter 0..5 und sonst nichts. P9.67c schrieb `scaleRotW` — die
+MARGE — in Wort 6, wo die CUDA nichts hinkopiert und wo die verifizierte
+`npCvxCoreSetup`-Transkription 0 stehen lässt. Wort 6 liest nur das
+`CORE_POINTS`-Layout, das ein `eCONVEXCORE` nie annimmt, also war der Unterschied
+nicht beobachtbar. Er war trotzdem einer, und er ist weg. Genau diese Sorte
+findet man beim Zusammenlegen zweier Abschriften und sonst nie.
+
+### Warum der Kernel NICHT in diesem Commit steht
+
+`cvxCoreCvxNpBda.slang` ist geschrieben, übersetzt, ABI-Zeile und Manifest waren
+verdrahtet — und die Szenen sagen nein:
+
+```
+convexcoremesh  (Zylinder auf gekochtem Hull)  final y=-73.807, |v|=39.240
+                -> NULL Kontakte, obwohl der Kernel 13x OK gestartet wird
+convexcorebox   (Zylinder auf Box, 8 m)        final y= 0.119,  |v|= 0.207
+                -> Kontakte, aber der Zylinder sinkt 0.38 ein und kommt nicht zur Ruhe
+```
+
+Das Ergebnis **hängt von der Bodengröße ab** (2 m → −0.194, 8 m → +0.119,
+200 m → −33.1), was auf `convexAccuracy = max(maxExtent * 0.01, FLT_EPS)` als
+Verschweißungstoleranz deutet — aber „deutet auf" ist keine Diagnose, und ein
+Kernel, dessen Szene nicht grün ist, wird nicht gemappt ausgeliefert. Das ist
+dieselbe Regel, die P9.67a auf die Szene ZUERST angewandt hat.
+
+Der Kernel, seine beiden Szenen und die Verdrahtung sind aufgehoben und gehören
+zu P9.69c. Was diese Tranche liefert, ist die Schicht darunter, und die ist
+gemessen.
+
+Suite **853/853 in beiden Speichermodi**. Szenen 44/44. Manifest 405/501 —
+unverändert, absichtlich.
+
 ## P9.69a — die Convex-Convex-Schicht herausgelöst, und ein slangc-Kollaps von 1 Sekunde auf 40 Minuten
 
 Vorarbeit für `convexCoreConvexNphase_Kernel`: der Kernel und die Phase-1-Fixture

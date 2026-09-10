@@ -64,8 +64,17 @@ struct CvxIn
     uint4 coreB[3];
     float4 poseBq, poseBp;  // poseBp.w = margin1
     float4 cfg;             // x = contactDist, yzw = cullDir
+    // P9.69b: the ePOINTS hulls reach the shader as DEVICE ADDRESSES now, because
+    // the shared shape layer reads them through Ptr<float4> instead of taking a
+    // float4[12] by value -- a cooked hull carries up to 255 points and the pool
+    // capped it at 12.  The inline arrays stay in the record because the host
+    // mirror memcpy's this struct's leading bytes into gjkref::GjkIn and
+    // eparef::EpaTIn, whose own shaders still take a pool; the addresses point at
+    // a separate device buffer holding the same points.
     float4 ptsA[12];
     float4 ptsB[12];
+    uint4 ptsAddrA;    // lo/hi in (x,y) -- see npCvxCorePlaneGen on why not uint64_t
+    uint4 ptsAddrB;
 }
 
 struct CvxOut
@@ -91,6 +100,10 @@ void cvgContacts(uint3 dtid : SV_DispatchThreadID)
     if (t >= gParams.numTests) return;
     const CvxIn s = gIn[t];
 
+    // lo/hi -> the 64-bit device addresses of this test's two hulls
+    const uint64_t ptsAddrA = (uint64_t(s.ptsAddrA.y) << 32) | uint64_t(s.ptsAddrA.x);
+    const uint64_t ptsAddrB = (uint64_t(s.ptsAddrB.y) << 32) | uint64_t(s.ptsAddrB.x);
+
     ShapeRef shA, shB;
     shA.type = s.metaA.x; shA.core = s.coreA; shA.poseQ = s.poseAq; shA.poseP = s.poseAp.xyz;
     shB.type = s.metaB.x; shB.core = s.coreB; shB.poseQ = s.poseBq; shB.poseP = s.poseBp.xyz;
@@ -103,12 +116,12 @@ void cvgContacts(uint3 dtid : SV_DispatchThreadID)
 
     float dist; uint tagG;
     float3 point0, point1, axis;
-    gjkDistanceQ(shA, shB, s.ptsA, s.ptsB, maxDist, dist, tagG, point0, point1, axis);
+    gjkDistanceQ(shA, shB, ptsAddrA, ptsAddrB, maxDist, dist, tagG, point0, point1, axis);
 
     if (dist < FLT_EPS)
     {
         uint tagE;
-        epaDepthQ(shA, shB, s.ptsA, s.ptsB, dist, tagE, point0, point1, axis);
+        epaDepthQ(shA, shB, ptsAddrA, ptsAddrB, dist, tagE, point0, point1, axis);
     }
 
     uint numPoints = 0u;
@@ -137,13 +150,13 @@ void cvgContacts(uint3 dtid : SV_DispatchThreadID)
         float3 fpl[4];
         float3 wfp0[4], wfp1[4];
 
-        const uint np0 = contactFaceQ(shA, s.ptsA, quatRotInvQ(shA.poseQ, -axis),
+        const uint np0 = contactFaceQ(shA, ptsAddrA, quatRotInvQ(shA.poseQ, -axis),
                                       quatRotInvQ(shA.poseQ, point0 - shA.poseP), fn0, fpl, trig0);
         const float3 wn0 = quatRotQ(shA.poseQ, fn0);
         for (uint i = 0u; i < 4u; ++i)
             wfp0[i] = i < np0 ? (quatRotQ(shA.poseQ, fpl[i]) + shA.poseP) + wn0 * margin0 : float3(0, 0, 0);
 
-        const uint np1 = contactFaceQ(shB, s.ptsB, quatRotInvQ(shB.poseQ, axis),
+        const uint np1 = contactFaceQ(shB, ptsAddrB, quatRotInvQ(shB.poseQ, axis),
                                       quatRotInvQ(shB.poseQ, point1 - shB.poseP), fn1, fpl, trig1);
         const float3 wn1 = quatRotQ(shB.poseQ, fn1);
         for (uint i = 0u; i < 4u; ++i)

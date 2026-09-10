@@ -53,7 +53,15 @@ struct PgIn
     uint4 core[3];
     float4 poseQ, poseP;  // poseP.w = margin
     float4 cfg;       // x = contactDist
-    float4 pts[12];   // ePOINTS pool
+    float4 pts[12];   // kept: the host mirror memcpy's this record into the
+                      // sibling reference layouts (see npCvxCoreCvxGen)
+    uint4 ptsAddrPack; // P9.69b: DEVICE ADDRESS of the same points, as lo/hi
+                       // (x,y) -- the corpus idiom for a 64-bit value in a
+                       // StructuredBuffer record, where a bare uint64_t's
+                       // padding is not guaranteed to match the C++ struct.
+                       // The shared shape layer reads hulls through Ptr<float4>
+                       // now, so a cooked hull's 255 points are no longer
+                       // capped at 12.
 }
 
 struct PgOut
@@ -79,6 +87,9 @@ void cpgContacts(uint3 dtid : SV_DispatchThreadID)
     if (t >= gParams.numTests) return;
     const PgIn s = gIn[t];
 
+    // lo/hi -> the 64-bit device address of this test's hull points
+    const uint64_t ptsAddr = (uint64_t(s.ptsAddrPack.y) << 32) | uint64_t(s.ptsAddrPack.x);
+
     ShapeRef sh;
     sh.type = s.meta.x; sh.core = s.core; sh.poseQ = s.poseQ; sh.poseP = s.poseP.xyz;
     const float margin = s.poseP.w;
@@ -90,7 +101,7 @@ void cpgContacts(uint3 dtid : SV_DispatchThreadID)
     const float3 normal = -pn;
 
     // ConvexShape::support = pose.transform(supportLocal(pose.rotateInv(dir))) + dir * margin
-    const float3 point1 = poseTransform(sh, supportLocalQ(sh, s.pts, quatRotInvQ(sh.poseQ, normal))) + normal * margin;
+    const float3 point1 = poseTransform(sh, supportLocalQ(sh, ptsAddr, quatRotInvQ(sh.poseQ, normal))) + normal * margin;
     const float dist = dot3Q(point1, pn) + pd; // PxPlane::distance
 
     uint numContacts = 0u;
@@ -106,7 +117,7 @@ void cpgContacts(uint3 dtid : SV_DispatchThreadID)
 
         float3 faceNormal;
         float3 fp[4];
-        const uint numPoints = contactFaceQ(sh, s.pts, dirL, refL, faceNormal, fp, trig);
+        const uint numPoints = contactFaceQ(sh, ptsAddr, dirL, refL, faceNormal, fp, trig);
 
         // wrapper epilogue: world rotate + margin push
         const float3 worldNormal = quatRotQ(sh.poseQ, faceNormal);

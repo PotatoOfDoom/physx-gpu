@@ -152,7 +152,7 @@ public struct ShapeRef
 }
 
 // tranche-164 ConvexShape::supportLocal, margin-less, all seven types
-public float3 supportLocalQ(ShapeRef s, float4 ptsPool[12], float3 dir)
+public float3 supportLocalQ(ShapeRef s, uint64_t ptsAddr, float3 dir)
 {
     const uint type = s.type;
     if (type == CORE_SEGMENT)
@@ -214,7 +214,7 @@ public float3 supportLocalQ(ShapeRef s, float4 ptsPool[12], float3 dir)
         float maxDot = -FLT_MAXQ;
         for (uint i = 0u; i < numPoints; ++i)
         {
-            const float3 p = ptsPool[(i * stride) / 16u].xyz;
+            const float3 p = Ptr<float4>(ptsAddr)[(i * stride) / 16u].xyz;
             const float dot = dot3Q(d, p);
             if (dot > maxDot)
             {
@@ -222,7 +222,7 @@ public float3 supportLocalQ(ShapeRef s, float4 ptsPool[12], float3 dir)
                 index = i;
             }
         }
-        const float3 point = ptsPool[(index * stride) / 16u].xyz;
+        const float3 point = Ptr<float4>(ptsAddr)[(index * stride) / 16u].xyz;
         const float3 rp = quatRotQ(R, point);
         return quatRotInvQ(R, float3(S.x * rp.x, S.y * rp.y, S.z * rp.z));
     }
@@ -343,7 +343,7 @@ public uint reducePolygonQ(const float3 pts[8], uint count, float3 normal, bool 
 
 // ConvexShape::contactFace core dispatch (GuConvexSupport.h L95-380 family,
 // tranches 165/166 verbatim): local-frame inputs, local-frame outputs
-public uint contactFaceQ(ShapeRef sh, float4 pool[12], float3 dir, float3 refLocal,
+public uint contactFaceQ(ShapeRef sh, uint64_t ptsAddr, float3 dir, float3 refLocal,
                   out float3 faceNormal, out float3 fp[4], out uint trig)
 {
     uint numPoints = 0u;
@@ -505,7 +505,7 @@ public uint contactFaceQ(ShapeRef sh, float4 pool[12], float3 dir, float3 refLoc
         float maxDot[3] = { -3.402823466e+38f, -3.402823466e+38f, -3.402823466e+38f };
         for (uint i = 0u; i < poolN; ++i)
         {
-            const float3 raw = pool[(i * stride) / 16u].xyz;
+            const float3 raw = Ptr<float4>(ptsAddr)[(i * stride) / 16u].xyz;
             const float3 rp = quatRotQ(R, raw);
             const float3 p = quatRotInvQ(R, float3(S.x * rp.x, S.y * rp.y, S.z * rp.z)); // getPoint(i)
             float dot = dot3Q(dir, p);
@@ -527,14 +527,14 @@ public uint contactFaceQ(ShapeRef sh, float4 pool[12], float3 dir, float3 refLoc
         if (ok)
         {
             {
-                const float3 raw = pool[(index[0] * stride) / 16u].xyz;
+                const float3 raw = Ptr<float4>(ptsAddr)[(index[0] * stride) / 16u].xyz;
                 const float3 rp = quatRotQ(R, raw);
                 p0 = quatRotInvQ(R, float3(S.x * rp.x, S.y * rp.y, S.z * rp.z));
             }
 
             if (index[2] == NOIDX)
             {
-                const float3 raw = pool[(index[1] * stride) / 16u].xyz;
+                const float3 raw = Ptr<float4>(ptsAddr)[(index[1] * stride) / 16u].xyz;
                 const float3 rp = quatRotQ(R, raw);
                 const float3 p1 = quatRotInvQ(R, float3(S.x * rp.x, S.y * rp.y, S.z * rp.z));
                 const float3 n = getNormalizedQ(crossQ(crossQ(dir, p1 - p0), p1 - p0));
@@ -546,10 +546,10 @@ public uint contactFaceQ(ShapeRef sh, float4 pool[12], float3 dir, float3 refLoc
             }
             else
             {
-                const float3 raw1 = pool[(index[1] * stride) / 16u].xyz;
+                const float3 raw1 = Ptr<float4>(ptsAddr)[(index[1] * stride) / 16u].xyz;
                 const float3 rp1 = quatRotQ(R, raw1);
                 const float3 p1 = quatRotInvQ(R, float3(S.x * rp1.x, S.y * rp1.y, S.z * rp1.z));
-                const float3 raw2 = pool[(index[2] * stride) / 16u].xyz;
+                const float3 raw2 = Ptr<float4>(ptsAddr)[(index[2] * stride) / 16u].xyz;
                 const float3 rp2 = quatRotQ(R, raw2);
                 const float3 p2 = quatRotInvQ(R, float3(S.x * rp2.x, S.y * rp2.y, S.z * rp2.z));
 
@@ -583,7 +583,7 @@ public uint contactFaceQ(ShapeRef sh, float4 pool[12], float3 dir, float3 refLoc
             const float maxP = dot3Q(faceNormal, p0);
             for (uint i = 0u; i < poolN; ++i)
             {
-                const float3 raw = pool[(i * stride) / 16u].xyz;
+                const float3 raw = Ptr<float4>(ptsAddr)[(i * stride) / 16u].xyz;
                 const float3 rp = quatRotQ(R, raw);
                 const float3 p = quatRotInvQ(R, float3(S.x * rp.x, S.y * rp.y, S.z * rp.z));
                 const float pP = dot3Q(faceNormal, p);
