@@ -92,7 +92,7 @@ echo "run_scenes.sh: PXG_SHADER_DIR=$PXG_SHADER_DIR"
 # P9.51 was unmapped end to end and therefore a silent no-op -- the box fell
 # through with no diagnostic.  The list is 36 named scenes plus the settling
 # bag = 37.
-SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spheremesh capsulemesh convexcoreplane convexcorebox convexcoremesh convexcoretrimesh hffloor spherehf hfbigbox hfhugebox articulation
+SCENES="box stack plane sphere capsule capsulebox convex joint meshfloor spheremesh capsulemesh convexcoreplane convexcorebox convexcoremesh convexcoretrimesh convexcoretrough hffloor spherehf hfbigbox hfhugebox articulation
         particle particlefluid particlefluidboundary particlemeshfloor particlehffloor
         particlecloth particleinflatable particlediffuse particleconvex
         cloth clothbox clothconvex clothhang clothdamp clothdrape clothselfcollide clothcloth

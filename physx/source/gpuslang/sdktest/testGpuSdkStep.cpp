@@ -651,9 +651,9 @@ PxRigidStatic* addVTroughMeshFloor(PxPhysics* physics, PxScene* scene,
     PxTriangleMesh* meshGeom =
         immediateCooking::createTriangleMesh(ck, md, physics->getPhysicsInsertionCallback());
     if (!meshGeom) { std::printf("FAIL: createTriangleMesh (V-trough floor) returned null\n"); return nullptr; }
-    std::printf("  V-trough mesh floor: %u verts, %u triangles (cell %.2f, wall %.1f deg)\n",
+    std::printf("  V-trough mesh floor: %u verts, %u triangles (cell %.2f, wall %.1f deg, len %.2f)\n",
                 md.points.count, md.triangles.count, double(cell),
-                double(theta * 180.0f / PxPi));
+                double(theta * 180.0f / PxPi), double(wallLen));
     PxRigidStatic* floor = physics->createRigidStatic(PxTransform(PxVec3(0.0f, 0.0f, 0.0f), rot));
     PxShape* fs = physics->createShape(PxTriangleMeshGeometry(meshGeom), *material);
     floor->attachShape(*fs);
@@ -678,23 +678,71 @@ PxRigidStatic* addVTroughMeshFloor(PxPhysics* physics, PxScene* scene,
 // and by symmetry the same for wall B.  theta = 0 recovers y_c = r, the flat floor.
 // For r = 0.5 and theta = 60 degrees that is EXACTLY 1.0.
 //
-// WHY 60 DEGREES.  main()'s rest band is restY +/- 0.75, which is generous on purpose
-// (stacks jitter).  A trough only discriminates if the failure mode moves the body
-// further than that: if the second patch were lost or corrupted, the cylinder sinks
-// toward the apex at y = 0, which is 1.0 below the expected rest -- outside the band.
-// At 30 degrees the same collapse only moves it 0.577 and the band would swallow it.
-// PXG_CVXCORE_TROUGH_DEG overrides the angle; the expected height follows it.
+// WHY 60 DEGREES.  Two independent constraints pin it, and both have exact bounds.
 //
-// THE CELL SIZE IS A CORRECTNESS PARAMETER HERE, NOT A COMFORT KNOB.  The cylinder
-// lies tangent to each wall along a LINE, not at a point -- its axis is parallel to
-// both wall planes, which is also why the rest height does not depend on the
-// cylinder's length.  That 1.0-long contact segment is assembled from however many
-// triangles the tessellation puts under it, so a cell large enough to put ONE
-// triangle under each wall collapses the manifold back toward a single patch and the
-// scene silently stops exercising the thing it exists for.  With the default cell of
-// 1.5 against a cylinder of length 1.0, the segment spans one to two triangles per
-// wall and the two walls' normals (120 degrees apart) guarantee at least two patches.
-// Raising PXG_CVXCORE_CELL past the cylinder length blunts this scene.
+//   DISCRIMINATION.  main()'s rest band is restY +/- 0.75, generous on purpose
+//   (stacks jitter).  A trough only discriminates if the failure moves the body
+//   further than that.  The check is `finalY > restY - 0.75`, so a collapse all the
+//   way to the apex at y = 0 is caught exactly when restY >= 0.75, i.e. when
+//   r/cos(theta) >= 0.75, i.e. theta >= arccos(2/3) = 48.1897 degrees.  Below that
+//   the band swallows it and the scene cannot fail.  What the apex-collapse figure is
+//   NOT is a prediction of where a broken kernel actually settles -- convexcoretrimesh's
+//   own single-patch failure was y = -73.807, far past the apex.  It is a lower bound
+//   on the displacement, which is all the argument needs.  The MEASURED statement is
+//   the one that counts: at 60 degrees all three multi-patch mutants
+//   (patch-reserve-single, startContactIndex-frozen, patchloop-one-patch) die here and
+//   two of them survive on the flat floor.
+//
+//   STABILITY.  The aligned seat competes with the cylinder resting CAP-DOWN against
+//   one wall.  Seat height for axis direction `a` is
+//   [F(|a.n_A|) + F(|a.n_B|)] / (2 cos t) with F(x) = h*x + r*sqrt(1-x^2); F is
+//   concave with F(0) = r and F(1) = h, so the aligned seat is the minimum iff
+//   h >= r.  Cylinder(1.0, 0.5) has h = r = 0.5 EXACTLY on that boundary, and at
+//   theta = 45 degrees the two configurations tie to the last floating-point bit
+//   (both 0.70710678).  At 60 degrees the aligned seat wins by 0.183 (1.000 against
+//   1.183).  So 45 is degenerate, 60 is not, and shortening the cylinder at all would
+//   make the aligned seat lose outright.
+//
+// PXG_CVXCORE_TROUGH_DEG overrides the angle.  It has a DOMAIN, and TWO LENGTHS HAVE
+// TO FOLLOW IT -- which the first version of this scene got wrong by hard-coding both.
+//
+//   THE WALL LENGTH.  The cylinder must sit below the top rim, i.e.
+//   wallLen*sin(t) >= y_c + r, i.e. wallLen >= r(1+cos t)/(sin t cos t).  That is
+//   1.73 at 60 degrees but 2.15 at 30, 5.80 at 10 and 6.26 at 85 -- so a fixed 2.0
+//   only spans roughly 45..65 degrees.  Outside it the trough is too shallow to hold
+//   the cylinder and it rides over the rim.
+//
+//   THE SPAWN HEIGHT.  restY is 5.74 at 85 degrees, above the old hard-coded spawn of
+//   5.0, so the body would start BELOW its own rest height and main()'s
+//   "did not begin falling" check could never pass.
+//
+// Both are now derived, with the constants chosen so the 60-degree default is
+// unchanged: 1.15 * 1.7321 = 1.992 keeps wallLen at 2.0, and restY + 4.0 = 5.0 keeps
+// the spawn where it was.  The clamp to [10, 85] then bounds a domain that actually
+// works, instead of one that merely avoids the 1/cos singularity at 90.
+//
+// This was found by RUNNING the clamp's own upper bound rather than trusting it: at
+// 85 degrees the scene failed 80 bodies, half of them falling through to y = -30.
+//
+// THE CELL SIZE DOES NOT CONTROL THE PATCH COUNT, and the first version of this
+// comment said it did.  The accumulator folds by NORMAL --
+// `dot(minDistNormal, patchNormal[l]) > SAME_NORMAL` with SAME_NORMAL = 0.999f
+// (pxgSlangCvxCoreAcc.slang:236-244) -- so every triangle on one wall is coplanar,
+// every contact normal is identical, every dot is 1.0, and they collapse into ONE
+// patch however finely the wall is tessellated.  The patch count is TWO, one per
+// wall, at any cell size.  What the tessellation does change is how many triangles
+// the traversal feeds through addPoints and therefore how much point reduction runs
+// -- worth knowing, but not what makes this scene discriminate.
+//
+// The claim was taken from a reading pass and written in without checking it against
+// the accumulator, which had already been read in the same pass.  The adversarial
+// verification caught it.  Recorded rather than quietly deleted, because "a plausible
+// sentence from a read, committed unverified" is the failure mode, not the typo.
+//
+// The cylinder does lie tangent to each wall along a LINE rather than at a point --
+// its axis is parallel to both wall planes, which is also why the rest height does
+// not depend on the cylinder's length: in `c.n - h|a.n| - r*sqrt(1-(a.n)^2) >= 0`
+// the axis term drops out when `a.n == 0`.
 //
 // The yaw is P9.70c's, for the same reason recorded there: with transform1.q at
 // identity, four separate mutants are structurally invisible.  Trough and bodies are
@@ -708,16 +756,29 @@ void buildConvexCoreTroughScene(PxPhysics* physics, PxScene* scene, PxMaterial* 
     const char* cellEnv = std::getenv("PXG_CVXCORE_CELL");
     const float cell = cellEnv ? float(std::atof(cellEnv)) : 1.5f;
     const char* degEnv = std::getenv("PXG_CVXCORE_TROUGH_DEG");
-    const float theta = (degEnv ? float(std::atof(degEnv)) : 60.0f) * PxPi / 180.0f;
+    // Clamped to the usable domain (see the header): below 48.19 degrees the rest
+    // band cannot catch a collapse, and at 90 the geometry and 1/cos both degenerate.
+    const float degRaw = degEnv ? float(std::atof(degEnv)) : 60.0f;
+    const float deg = PxClamp(degRaw, 10.0f, 85.0f);
+    if (deg != degRaw)
+        std::printf("  note: PXG_CVXCORE_TROUGH_DEG %.2f clamped to %.2f\n",
+                    double(degRaw), double(deg));
+    const float theta = deg * PxPi / 180.0f;
     const char* yawEnv = std::getenv("PXG_CVXCORE_YAW");
     const float yaw = yawEnv ? float(std::atof(yawEnv)) : 0.6f;
     const PxQuat yawQ(yaw, PxVec3(0.0f, 1.0f, 0.0f));
 
     const float r = 0.5f, h = 1.0f;
     const float restY = r / PxCos(theta);
+    // wallLen >= r(1+cos t)/(sin t cos t) puts the cylinder below the rim; the 1.15
+    // is headroom for the settling transient.  The max() keeps the 60-degree default
+    // at exactly 2.0, so the measured numbers above still describe it.
+    const float wallLen = PxMax(2.0f, 1.15f * r * (1.0f + PxCos(theta))
+                                      / (PxSin(theta) * PxCos(theta)));
+    const float spawnY = restY + 4.0f;   // 5.0 at the 60-degree default
 
     if (!addVTroughMeshFloor(physics, scene, material,
-                             -SPACING, float(PAIR_COUNT) * SPACING, 2.0f, cell, theta, yawQ))
+                             -SPACING, float(PAIR_COUNT) * SPACING, wallLen, cell, theta, yawQ))
         return; // targets stays empty; main() hard-fails on that
 
     PxConvexCoreGeometry geom(PxConvexCore::Cylinder(h, r));
@@ -725,15 +786,15 @@ void buildConvexCoreTroughScene(PxPhysics* physics, PxScene* scene, PxMaterial* 
     for (int i = 0; i < PAIR_COUNT; ++i)
     {
         PxRigidDynamic* b = addDynamic(physics, scene, material, geom,
-                                       capsuleInertia(r, h * 0.5f, 1000.0f), 5.0f,
+                                       capsuleInertia(r, h * 0.5f, 1000.0f), spawnY,
                                        float(i) * SPACING);
         // Into the yawed trough's frame.  The cylinder's axis is local +X and the
         // trough runs along X, so a shared yaw keeps the axis along the groove.
-        b->setGlobalPose(PxTransform(yawQ.rotate(PxVec3(float(i) * SPACING, 5.0f, 0.0f)), yawQ));
+        b->setGlobalPose(PxTransform(yawQ.rotate(PxVec3(float(i) * SPACING, spawnY, 0.0f)), yawQ));
         b->setSleepThreshold(0.0f);
         b->setWakeCounter(1.0e9f);
         std::snprintf(labels[i], sizeof(labels[i]), "convexCoreCylinderInTrough[%d]", i);
-        targets.push_back({ b, 5.0f, restY, labels[i] });
+        targets.push_back({ b, spawnY, restY, labels[i] });
     }
 }
 

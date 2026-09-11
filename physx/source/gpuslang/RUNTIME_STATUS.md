@@ -1865,6 +1865,216 @@ this tranche adds an engine kernel, not a test suite, and there is no fixture th
 it — its inputs are six device-side blobs produced by kernels upstream of it.  What stands
 behind it is the six module tranches, each swept and green on its own.
 
+## P9.71 — die V-Rinne: der Mehr-Patch-Schwanz war zu einem Sechzehntel geprüft
+
+P9.70c hat `pxgSlangCvxCoreOut32.slang` geschrieben — das einzige genuin neue
+Engine-Stück jener Tranche — und im selben Atemzug gemessen, dass die Szene, die es
+prüfen sollte, es fast nicht prüft. Ein flach liegender Zylinder auf einer Ebene
+erzeugt **einen** Kontaktpatch. Der Schwanz verwaltet sechzehn.
+
+Zwei Mutanten überlebten allein daran, und das war kein Randfall, sondern die Mitte
+der Sache: `patch-reserve-single` (`numPatches * 64` → `64`) und
+`startContactIndex-frozen` sind genau die Zeilen, die den Ein-Patch-Schwanz vom
+Mehr-Patch-Schwanz unterscheiden.
+
+### Die Szene
+
+`PXG_SCENE=convexcoretrough`: achtzig Konvexkern-Zylinder in einer gekochten
+**V-Rinne**. Gleicher Kernel, gleicher Zylinder, gleicher Boden-Werkstoff wie
+`convexcoretrimesh` — nur die Form des Bodens ändert sich, und damit die Anzahl der
+Patches.
+
+### Die Ruhehöhe wurde hergeleitet, nicht abgelesen
+
+Scheitel im Ursprung, jede Wand steigt um θ über die Waagerechte. Wand A hat die
+einwärts gerichtete Einheitsnormale `(0, cos θ, sin θ)` und geht durch den Ursprung,
+also ist der Abstand eines Achsenpunkts `(0, y, 0)` zur Ebene genau `y cos θ`. Gleich
+dem Radius gesetzt:
+
+```
+y_c = r / cos θ          θ = 0  →  y_c = r   (der ebene Boden)
+```
+
+Für `r = 0.5`, `θ = 60°` ist das **exakt 1.0**.
+
+```
+CPU-Kontrolle   80 Körper bei y = 1.0001
+GPU-Port        80 Körper bei y = 1.0002
+```
+
+Die Zahl stand vor beiden Läufen fest. Eine unabhängige Nachrechnung — Kraftbilanz
+und noch einmal aus dem 2D-Querschnitt — kam auf dasselbe und lieferte zwei Fakten,
+die ich nicht hergeleitet hatte:
+
+- **Die Sitzhöhe ist längenunabhängig.** Die Nichtdurchdringung gegen eine Ebene mit
+  Normale `n` ist `c·n − h|a·n| − r√(1−(a·n)²) ≥ 0`. Die Achse `a = e_x` steht
+  senkrecht auf beiden Wandnormalen, also ist `a·n = 0` und der `h`-Term fällt ganz
+  weg. Es ist ein **Linienkontakt**, kein Endpunktkontakt.
+- **Der Sitz ist ein Energieminimum erster Ordnung.** Verliert der Zylinder eine Wand
+  und rutscht an der anderen hoch, wächst `U = mg·q·sin θ` linear in `q` — ein Knick,
+  kein flacher Topf. Gilt für jedes θ in (0°, 90°).
+
+### Warum 60° und nicht 30°
+
+`main()`s Ruheband ist `restY ± 0.75` und absichtlich großzügig. Eine Rinne
+unterscheidet nur, wenn der **Fehlermodus weiter trägt als das Band**: Geht der zweite
+Patch verloren, sackt der Zylinder zum Scheitel bei y = 0.
+
+| θ | Ruhehöhe | Absacken | vom Band gefangen |
+|---|---|---|---|
+| 30° | 0.577 | 0.577 | nein |
+| 45° | 0.707 | 0.707 | nein |
+| **60°** | **1.000** | **1.000** | **ja** |
+
+Bei 30° wäre die Szene hübsch und blind — derselbe Fehler eine Ebene tiefer.
+
+### Ein Fehler, den ich committet habe, und wer ihn gefangen hat
+
+In `e4b1541` steht im Kopf der Szene, eine grobe Zellgröße falte das Manifold zurück
+auf einen Patch. **Das ist rückwärts.** Der Akkumulator faltet nach *Normale* —
+`dot(minDistNormal, patchNormal[l]) > SAME_NORMAL` mit `SAME_NORMAL = 0.999f`
+(`pxgSlangCvxCoreAcc.slang:236-244`). Alle Dreiecke einer Wand sind koplanar, alle
+Kontaktnormalen identisch, jeder Dot ist 1.0: sie landen in **einem** Patch, wie fein
+auch tesselliert. Die Patchzahl ist zwei, eine je Wand, bei jeder Zellgröße.
+
+Den Satz hatte ich aus einem Lesebericht übernommen und in die Quelle geschrieben,
+ohne ihn gegen den Akkumulator zu prüfen — den **derselbe Durchlauf bereits gelesen
+hatte**. Gefangen hat ihn die adversarische Stufe desselben Workflows, also genau
+das, wofür sie da ist. Der Fehlermodus ist nicht der Irrtum, sondern „ein plausibler
+Satz aus einem Lesebericht, ungeprüft committet"; deshalb steht er als Korrektur im
+Kommentar statt still gelöscht zu werden.
+
+Was die Tessellierung tatsächlich ändert, ist die Anzahl der Dreiecke, die die
+Traversierung durch `addPoints` schickt, und damit wie viel Punktreduktion läuft —
+wissenswert, aber nicht das, was diese Szene unterscheiden lässt.
+
+### Drei weitere Löcher, alle nachgerechnet
+
+- **Die Unterscheidungsgrenze ist exakt.** Die Prüfung ist `finalY > restY - 0.75`,
+  ein Einsturz bis zum Scheitel bei y = 0 wird also genau dann gefangen, wenn
+  `restY >= 0.75`, also `r / cos θ >= 0.75`, also **θ ≥ arccos(2/3) = 48.1897°**.
+  Darunter kann die Szene nicht fehlschlagen.
+- **`PXG_CVXCORE_TROUGH_DEG` hatte keine Domäne.** Bei 90° unterläuft `cos θ` und
+  `restY` geht gegen 8.2e15 (in float32 sogar negativ, weil `cos(π/2)` dort
+  −4.371e-8 ist), während beide Wände auf z = 0 zusammenfallen. Jetzt auf
+  [10°, 85°] geklammert, mit Hinweis beim Klammern.
+- **Bei 45° ist die Szene degeneriert.** Der ausgerichtete Sitz konkurriert mit dem
+  Zylinder, der **hochkant** an einer Wand liegt. Die Sitzhöhe für Achsenrichtung `a`
+  ist `[F(|a·n_A|) + F(|a·n_B|)] / (2 cos t)` mit `F(x) = h·x + r·√(1−x²)`; F ist
+  konkav mit `F(0) = r` und `F(1) = h`, der ausgerichtete Sitz ist also genau dann das
+  Minimum, wenn `h ≥ r`. `Cylinder(1.0, 0.5)` hat `h = r = 0.5` **exakt auf dieser
+  Grenze**, und bei 45° binden die beiden Lagen auf das letzte Float-Bit
+  (0.70710678). Bei 60° gewinnt der ausgerichtete Sitz um 0.183 (1.000 gegen 1.183).
+  45 wäre also nicht nur stumpf, sondern mehrdeutig.
+
+### Die Klammer war schlimmer als keine Klammer
+
+Der zweite Punkt oben — `PXG_CVXCORE_TROUGH_DEG` auf [10°, 85°] geklammert — war nicht
+die Lösung, sondern ein zweiter Fehler. Ich habe die Klammer dann **ausgeführt** statt
+sie zu glauben, und bei 85° scheiterten **80 von 80** Körpern, die Hälfte davon durch
+den Boden auf y ≈ −30.
+
+Der Grund: zwei Längen standen als Literale in einer variablen Geometrie.
+
+```
+wallLen = 2.0    trägt nur für θ ≈ 45..65°.  Nötig ist r(1+cos θ)/(sin θ cos θ):
+                 1.73 bei 60°, aber 2.15 bei 30°, 5.80 bei 10°, 6.26 bei 85°.
+                 Darüber hinaus ist die Rinne zu flach und der Zylinder reitet
+                 über den Rand.
+
+spawnY = 5.0     liegt bei 85° UNTER der Ruhehöhe 5.737.  Der Körper startet
+                 unterhalb seiner eigenen Ruhelage, und main()s
+                 „did not begin falling" kann nie erfüllt werden.
+```
+
+Beide folgen jetzt aus θ, mit Konstanten so gewählt, dass die 60°-Vorgabe
+**unverändert** bleibt: `1.15 · 1.7321 = 1.992` lässt `wallLen` bei 2.0, `restY + 4.0`
+lässt den Abwurf bei 5.0. Die Vorgabe-Geometrie ist danach byte-identisch — dieselben
+489 Verts, 648 Dreiecke, dasselbe gemessene 1.0002.
+
+Und die Domäne trägt jetzt wirklich, was an vier Winkeln nachgewiesen ist statt an
+einem:
+
+| θ | Wandlänge | `r / cos θ` | gemessen | Fehler |
+|---|---|---|---|---|
+| 10° | 6.67 | 0.5077 | 0.5169 | 0 |
+| 30° | 2.48 | 0.5774 | 0.5775 | 0 |
+| **60°** | **2.00** | **1.0000** | **1.0002** | **0** |
+| 85° | 7.20 | 5.7369 | 5.7483 | 0 |
+
+Der Rest wächst mit θ — 0.0002 bei 60°, 0.011 bei 85° —, was zu erwarten ist: die
+Normalkraft ist `mg / (2 cos θ)` und wächst gegen 90°, also wächst der
+Durchdringungsrest des Solvers mit.
+
+### Und eine Behauptung von mir, die unbelegt war
+
+„Sackt zum Scheitel bei y = 0, also 1.0 unter der Erwartung" — nichts belegt, dass ein
+gebrochener Kernel dort zur Ruhe kommt. `convexcoretrimesh`' eigener
+Ein-Patch-Fehlermodus war **y = −73.807**, weit über den Scheitel hinaus. Die Zahl ist
+eine *untere Schranke* für die Verschiebung, und mehr braucht das Argument nicht — aber
+sie als Vorhersage zu schreiben war falsch. Die belastbare Aussage ist die gemessene.
+
+### Der Sweep: die Szene hat Zähne
+
+| Mutant | Ebene | V-Rinne |
+|---|---|---|
+| `patch-reserve-single` | überlebt | **tot** |
+| `startContactIndex-frozen` | überlebt | **tot** |
+| `patchloop-one-patch` | — | **tot** |
+| `patch-stride-zero` | tot | tot |
+| `stream-not-patch-major` | tot | tot |
+| `transform0in1-no-inverse` | überlebt | **tot** |
+| `cull-inverted` / `addpoints-world-identity` / `trinormal-negated` | tot | tot |
+
+`transform0in1-no-inverse` ist der Lehrreichste: er überlebte auf der Ebene **auch
+nach** P9.70cs Gierung, weil ein Zylinder auf ebenem, gleichförmigem Boden auf
+Radiushöhe ruht, ganz gleich wie er orientiert ist. In einer Rinne entscheidet die
+Orientierung, welche Wände er trifft. Eine Gierung macht die Quaternionen
+nicht-trivial; erst die Rinne macht sie **wirksam**.
+
+### Die vier Überlebenden, jeder mit einer Ursache
+
+- **`touch-on-points`** — `numPatches > 0` gegen `numPoints > 0` in der
+  Touch-Entscheidung. `mNumPoints` wird im Akkumulator ausschließlich über
+  `patchCount` fortgeschrieben (`pxgSlangCvxCoreAcc.slang:310-312`), also ist die eine
+  Zahl genau dann null, wenn es die andere ist. Konstruktionsbedingt unbeobachtbar.
+  Die CUDA hat den Unterschied trotzdem (cu:365 gegen cu:374), und der Port auch.
+- **`cull-removed`** — meine Vorhersage war falsch. Ich hatte angenommen, eine Rinne
+  habe rückseitige Dreiecke in Reichweite. Hat sie nicht: der Zylinder sitzt **in**
+  dem V und sieht nur die zwei einwärts gerichteten Wände. Der Cull-Test feuert erst,
+  wenn die Kontaktachse der Dreiecksnormale entgegensteht — das braucht einen Körper,
+  der eine Fläche durchdringt, etwa eine dünne Schale.
+- **`bounds-getBounds-not-support`** — `PxConvexCoreGeometry(core, margin = 0)`
+  (`PxConvexCoreGeometry.h:243`), der Term ist `+ dir * 0`.
+- **`no-checktypes-swap`** — Paarreihenfolge. Der `flip` bei
+  `PxgNphaseImplementationContext.cpp:1602` ist lokal zur Bucket-Auswahl;
+  `registerContactManagerInternal` bekommt die **ungetauschte** `workUnit`. Der Tausch
+  ist also live, diese Szene erzeugt nur alle Paare kernzuerst.
+
+Über beide Szenen zusammen sterben **20 von 24** Mutanten.
+
+
+### Der gemeinsame Nenner aller drei Fehler
+
+Der Zellgrößen-Kommentar, die Klammer und die beiden Literale sind dieselbe Klasse,
+und jeder wurde durch ein **anderes** Mittel gefunden als das, das ihn hätte finden
+sollen:
+
+- Der Kommentar: gefangen von der adversarischen Stufe. Die Messung war grün.
+- Die Klammer: gefangen dadurch, dass ich ihre eigene Obergrenze ausgeführt habe.
+- Die Literale: sichtbar erst, als die Klammer den Winkel dorthin schob, wo sie nicht
+  mehr trugen.
+
+Alle drei waren zu jedem Zeitpunkt grün an dem einen Punkt, den ich gemessen hatte.
+Das ist derselbe Befund wie über `pxgSlangCvxCoreOut32.slang`, nur auf meine eigene
+Arbeit angewandt: **grün an einem Punkt belegt keine Domäne.**
+
+### Stand
+
+Suite **853/853 in beiden Speichermodi**, Szenen **48/48** (mit der neuen
+`convexcoretrough`), Manifest 407/501, alle vierzehn Prüfer grün.
+Erreichbar-nicht-gemappt: 25.
+
 ## P9.70c — `convexCoreTrimeshNphase_Kernel32`, und was der Sweep über die Szene sagte
 
 Der dritte der fünf `convexCore*Nphase`-Kernel, und der erste, der einen BVH abläuft.
