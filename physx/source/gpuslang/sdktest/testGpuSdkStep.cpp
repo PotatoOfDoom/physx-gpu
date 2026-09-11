@@ -589,6 +589,154 @@ PxRigidStatic* addTessellatedMeshFloor(PxPhysics* physics, PxScene* scene,
     return floor;
 }
 
+// addVTroughMeshFloor (P9.71) -- a cooked triangle mesh shaped like a V-trough
+// running along X, apex line on the X axis at y = 0, z = 0.  Each wall rises at
+// `theta` above the horizontal:
+//
+//     wall A (-z side):  (x,  s*sin(theta), -s*cos(theta)),  s in [0, wallLen]
+//     wall B (+z side):  (x,  s*sin(theta), +s*cos(theta)),  s in [0, wallLen]
+//
+// WHY A TROUGH AND NOT ANOTHER FLAT FLOOR.  P9.70c's mutation sweep measured that
+// `convexcoretrimesh` exercises exactly ONE contact patch, because a cylinder lying
+// flat on a plane produces one -- so pxgSlangCvxCoreOut32.slang, the multi-patch
+// output tail and the only genuinely new engine code in that tranche, was verified
+// at one of its sixteen patches.  Two mutants survived on that alone
+// (`patch-reserve-single`, `startContactIndex-frozen`).
+//
+// A cylinder in a V touches TWO walls with TWO distinct normals, 2*theta apart.  The
+// accumulator's fold test is `dot > SAME_NORMAL` with SAME_NORMAL = 0.999
+// (pxgSlangCvxCoreAcc.slang), so any theta above about 2.6 degrees keeps them as two
+// separate patches -- and the second patch is what makes the multi-patch tail's
+// `numPatches * 64` reservation and its running startContactIndex observable.
+PxRigidStatic* addVTroughMeshFloor(PxPhysics* physics, PxScene* scene,
+                                   PxMaterial* material, float xMin, float xMax,
+                                   float wallLen, float cell, float theta,
+                                   const PxQuat& rot = PxQuat(PxIdentity))
+{
+    const int nx = PxMax(1, int((xMax - xMin) / cell + 0.5f));
+    const int ns = PxMax(1, int(wallLen / cell + 0.5f));   // steps up EACH wall
+    const int nz = 2 * ns;                                 // -z wall, apex, +z wall
+    const float st = PxSin(theta), ct = PxCos(theta);
+
+    // Row j runs from the top of wall A (j = 0) through the apex (j = ns) to the top
+    // of wall B (j = nz).  s is the distance from the apex ALONG the wall, so the
+    // apex row is shared by both walls and the mesh is watertight there.
+    std::vector<PxVec3> verts;
+    verts.reserve(size_t(nx + 1) * size_t(nz + 1));
+    for (int j = 0; j <= nz; ++j)
+    {
+        const float s = float(PxAbs(j - ns)) * (wallLen / float(ns));
+        const float y = s * st;
+        const float z = (j < ns ? -s * ct : s * ct);
+        for (int ix = 0; ix <= nx; ++ix)
+            verts.push_back(PxVec3(xMin + float(ix) * cell, y, z));
+    }
+
+    std::vector<PxU32> tris;
+    tris.reserve(size_t(nx) * size_t(nz) * 6u);
+    for (int j = 0; j < nz; ++j)
+        for (int ix = 0; ix < nx; ++ix)
+        {
+            const PxU32 a = PxU32(j * (nx + 1) + ix), b = a + 1;
+            const PxU32 c = PxU32((j + 1) * (nx + 1) + ix), d = c + 1;
+            tris.push_back(a); tris.push_back(c); tris.push_back(b);
+            tris.push_back(b); tris.push_back(c); tris.push_back(d);
+        }
+
+    PxTriangleMeshDesc md;
+    md.points.count = PxU32(verts.size()); md.points.stride = sizeof(PxVec3); md.points.data = verts.data();
+    md.triangles.count = PxU32(tris.size() / 3); md.triangles.stride = 3 * sizeof(PxU32); md.triangles.data = tris.data();
+    PxCookingParams ck(physics->getTolerancesScale());
+    ck.buildGPUData = true;   // without this the mesh has no BV32 tree and the GPU pair is inert
+    PxTriangleMesh* meshGeom =
+        immediateCooking::createTriangleMesh(ck, md, physics->getPhysicsInsertionCallback());
+    if (!meshGeom) { std::printf("FAIL: createTriangleMesh (V-trough floor) returned null\n"); return nullptr; }
+    std::printf("  V-trough mesh floor: %u verts, %u triangles (cell %.2f, wall %.1f deg)\n",
+                md.points.count, md.triangles.count, double(cell),
+                double(theta * 180.0f / PxPi));
+    PxRigidStatic* floor = physics->createRigidStatic(PxTransform(PxVec3(0.0f, 0.0f, 0.0f), rot));
+    PxShape* fs = physics->createShape(PxTriangleMeshGeometry(meshGeom), *material);
+    floor->attachShape(*fs);
+    scene->addActor(*floor);
+    fs->release();
+    return floor;
+}
+
+// PXG_SCENE=convexcoretrough (P9.71): eighty dynamic CONVEX CORE cylinders lying in
+// a cooked V-TROUGH triangle mesh.  Same kernel as `convexcoretrimesh`
+// (convexCoreTrimeshNphase_Kernel32) and the same cylinder -- what changes is that
+// the contact is now TWO patches instead of one.
+//
+// THE REST HEIGHT IS DERIVED, NOT MEASURED-THEN-ASSERTED.  Put the apex at the
+// origin and let each wall rise at theta.  Wall A's inward unit normal is
+// (0, cos(theta), sin(theta)) and it passes through the origin, so the distance from
+// an axis point (0, y, 0) to that plane is y*cos(theta).  Setting it to the radius r
+// gives
+//
+//     y_c = r / cos(theta)
+//
+// and by symmetry the same for wall B.  theta = 0 recovers y_c = r, the flat floor.
+// For r = 0.5 and theta = 60 degrees that is EXACTLY 1.0.
+//
+// WHY 60 DEGREES.  main()'s rest band is restY +/- 0.75, which is generous on purpose
+// (stacks jitter).  A trough only discriminates if the failure mode moves the body
+// further than that: if the second patch were lost or corrupted, the cylinder sinks
+// toward the apex at y = 0, which is 1.0 below the expected rest -- outside the band.
+// At 30 degrees the same collapse only moves it 0.577 and the band would swallow it.
+// PXG_CVXCORE_TROUGH_DEG overrides the angle; the expected height follows it.
+//
+// THE CELL SIZE IS A CORRECTNESS PARAMETER HERE, NOT A COMFORT KNOB.  The cylinder
+// lies tangent to each wall along a LINE, not at a point -- its axis is parallel to
+// both wall planes, which is also why the rest height does not depend on the
+// cylinder's length.  That 1.0-long contact segment is assembled from however many
+// triangles the tessellation puts under it, so a cell large enough to put ONE
+// triangle under each wall collapses the manifold back toward a single patch and the
+// scene silently stops exercising the thing it exists for.  With the default cell of
+// 1.5 against a cylinder of length 1.0, the segment spans one to two triangles per
+// wall and the two walls' normals (120 degrees apart) guarantee at least two patches.
+// Raising PXG_CVXCORE_CELL past the cylinder length blunts this scene.
+//
+// The yaw is P9.70c's, for the same reason recorded there: with transform1.q at
+// identity, four separate mutants are structurally invisible.  Trough and bodies are
+// yawed together, so the geometry is unchanged and only the quaternions stop being
+// trivial.
+void buildConvexCoreTroughScene(PxPhysics* physics, PxScene* scene, PxMaterial* material,
+                                std::vector<RestTarget>& targets)
+{
+    const int PAIR_COUNT = 80;
+    const float SPACING = 3.0f;
+    const char* cellEnv = std::getenv("PXG_CVXCORE_CELL");
+    const float cell = cellEnv ? float(std::atof(cellEnv)) : 1.5f;
+    const char* degEnv = std::getenv("PXG_CVXCORE_TROUGH_DEG");
+    const float theta = (degEnv ? float(std::atof(degEnv)) : 60.0f) * PxPi / 180.0f;
+    const char* yawEnv = std::getenv("PXG_CVXCORE_YAW");
+    const float yaw = yawEnv ? float(std::atof(yawEnv)) : 0.6f;
+    const PxQuat yawQ(yaw, PxVec3(0.0f, 1.0f, 0.0f));
+
+    const float r = 0.5f, h = 1.0f;
+    const float restY = r / PxCos(theta);
+
+    if (!addVTroughMeshFloor(physics, scene, material,
+                             -SPACING, float(PAIR_COUNT) * SPACING, 2.0f, cell, theta, yawQ))
+        return; // targets stays empty; main() hard-fails on that
+
+    PxConvexCoreGeometry geom(PxConvexCore::Cylinder(h, r));
+    static char labels[80][44];
+    for (int i = 0; i < PAIR_COUNT; ++i)
+    {
+        PxRigidDynamic* b = addDynamic(physics, scene, material, geom,
+                                       capsuleInertia(r, h * 0.5f, 1000.0f), 5.0f,
+                                       float(i) * SPACING);
+        // Into the yawed trough's frame.  The cylinder's axis is local +X and the
+        // trough runs along X, so a shared yaw keeps the axis along the groove.
+        b->setGlobalPose(PxTransform(yawQ.rotate(PxVec3(float(i) * SPACING, 5.0f, 0.0f)), yawQ));
+        b->setSleepThreshold(0.0f);
+        b->setWakeCounter(1.0e9f);
+        std::snprintf(labels[i], sizeof(labels[i]), "convexCoreCylinderInTrough[%d]", i);
+        targets.push_back({ b, 5.0f, restY, labels[i] });
+    }
+}
+
 // PXG_SCENE=convexcoretrimesh (P9.70): eighty dynamic CONVEX CORE cylinders on a
 // cooked, tessellated TRIANGLE MESH floor.  The pair (eCONVEXCORE, eTRIANGLEMESH)
 // routes to GPU_BUCKET_ID::eConvexCoreTrimesh, i.e. convexCoreTrimeshNphase_Kernel32
@@ -7634,6 +7782,7 @@ int main()
     else if (!std::strcmp(sceneName, "convexcoreplane")) buildConvexCorePlaneScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "convexcorebox")) buildConvexCoreBoxScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "convexcoretrimesh")) buildConvexCoreTrimeshScene(physics, scene, material, targets);
+    else if (!std::strcmp(sceneName, "convexcoretrough")) buildConvexCoreTroughScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "convexcoremesh")) buildConvexCoreMeshScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "hffloor")) buildHfFloorScene(physics, scene, material, targets);
     else if (!std::strcmp(sceneName, "spherehf")) buildSphereHfScene(physics, scene, material, targets);
