@@ -2021,12 +2021,28 @@ Deckung   32 × 4 = 128 = Block → exakt
 
 ### Stand
 
-Beide Sweeps grün restauriert, alle vierzehn Prüfer grün, `convexcoretrimesh` ist in
-`run_scenes.sh`s `SCENES`-Liste aufgenommen. Manifest: `convexCoreTrimeshNphase_Kernel32`
-gemappt, erreichbar-nicht-gemappt fällt von 26 auf 25. Die Zahlen der vollen Suite in
-beiden Speichermodi und des Szenen-Sweeps folgen im nächsten Commit — sie liefen noch,
-als dieser geschrieben wurde, und eine Zahl, die ich nicht gemessen habe, schreibe ich
-nicht auf.
+Suite **853/853 in beiden Speichermodi**, Szenen **47/47** (inklusive der neu
+aufgenommenen `convexcoretrimesh`), Manifest **407/501** (81.2 %), alle vierzehn
+Prüfer grün. Erreichbar-nicht-gemappt: **26 → 25**.
+
+### Zwei eigene Fehler, weil sie zum Befund gehören
+
+Der erste Commit dieser Tranche (`d7024cc`) trug eine **rote Suite**: die
+Manifest-Zeile war von Hand eingetragen, `PXG_SLANG_KERNEL_MAPPED` im selben Header
+blieb auf 406 stehen, und `p4Manifest` / `p3KernelWrangler` / `p4Wrangler` fielen in
+beiden Modi. Genau dafür sind sie da. Die Szenen waren auf demselben Baum 47/47 grün
+— es war Buchhaltung im Header, keine Physik im Port.
+
+Committet wurde, **während** Suite und Szenen liefen, mit dem Argument, die Quellen
+seien unversehrt und der Lauf lese nur Binaries. Das stimmt und beantwortet die Frage
+nicht: die Frage ist, ob der Stand grün ist. Die Verifikation gehört vor den Commit.
+
+Und die Nachprüfung lief zuerst als
+`./gpuslang-tests p4Manifest p3KernelWrangler p4Wrangler` und meldete
+„1 test(s) ran" — das Binary nimmt **einen** Namen. Dieselbe Falle, die im Kopf von
+`run_mutation_sweep.sh` aus P9.13f steht, wo ein falsch geschriebener Filter eine
+grüne Baseline und 28 Überlebende meldete, ohne den Shader je auszuführen. In einem
+Werkzeug abgesichert, von Hand hineingelaufen.
 
 ## P9.70b — die Szene zuerst, mit beiden Messungen, bevor der Kernel existiert
 
